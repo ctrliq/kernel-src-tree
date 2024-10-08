@@ -1,0 +1,161 @@
+ALSA: hda - Fix parsing of CMI8888 codec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [alsa] hda: Fix parsing of CMI8888 codec (Jaroslav Kysela) [1112200]
+Rebuild_FUZZ: 87.67%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 875f0dd79987a63f01c07a9994dbe2c457992e41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/875f0dd7.failed
+
+CMI8888 codec chip has a boost amp (only) on the headphone pin, and
+this confuses the generic parser, which tends to pick up the most
+outside amp.  This results in the wrong volume setup, as the driver
+complains like:
+  hda_codec: Mismatching dB step for vmaster slave (-100!=1000)
+
+For avoiding this problem, rule out the amp on NID 0x10 and create
+"Headphone Amp" volume control manually instead.
+
+Note that this patch still doesn't fix all problems yet.  The sound
+output from the line out seems still too low.  It will be fixed in
+another patch (hopefully).
+
+Reported-and-tested-by: Vincent Lejeune <vljn@ovi.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 875f0dd79987a63f01c07a9994dbe2c457992e41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/patch_cmedia.c
+diff --cc sound/pci/hda/patch_cmedia.c
+index d782292b1ba9,c895a8f21192..000000000000
+--- a/sound/pci/hda/patch_cmedia.c
++++ b/sound/pci/hda/patch_cmedia.c
+@@@ -608,77 -75,49 +608,123 @@@ static int cmi_parse_auto_config(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +static int patch_cmi9880(struct hda_codec *codec)
+ +{
+ +	struct cmi_spec *spec;
+ +
+ +	spec = kzalloc(sizeof(*spec), GFP_KERNEL);
+ +	if (spec == NULL)
+ +		return -ENOMEM;
+ +
+ +	codec->spec = spec;
+ +#ifdef ENABLE_CMI_STATIC_QUIRKS
+ +	spec->board_config = snd_hda_check_board_config(codec, CMI_MODELS,
+ +							cmi9880_models,
+ +							cmi9880_cfg_tbl);
+ +	if (spec->board_config < 0) {
+ +		snd_printdd(KERN_INFO "hda_codec: %s: BIOS auto-probing.\n",
+ +			    codec->chip_name);
+ +		spec->board_config = CMI_AUTO; /* try everything */
+ +	}
+ +
+ +	if (spec->board_config == CMI_AUTO)
+ +		return cmi_parse_auto_config(codec);
+ +
+ +	/* copy default DAC NIDs */
+ +	memcpy(spec->dac_nids, cmi9880_dac_nids, sizeof(spec->dac_nids));
+ +	spec->num_dacs = 4;
+ +
+ +	switch (spec->board_config) {
+ +	case CMI_MINIMAL:
+ +	case CMI_MIN_FP:
+ +		spec->channel_modes = cmi9880_channel_modes;
+ +		if (spec->board_config == CMI_MINIMAL)
+ +			spec->num_channel_modes = 2;
+ +		else {
+ +			spec->front_panel = 1;
+ +			spec->num_channel_modes = 3;
+ +		}
+ +		spec->multiout.max_channels = cmi9880_channel_modes[0].channels;
+ +		spec->input_mux = &cmi9880_basic_mux;
+ +		break;
+ +	case CMI_FULL:
+ +	case CMI_FULL_DIG:
+ +		spec->front_panel = 1;
+ +		spec->multiout.max_channels = 8;
+ +		spec->input_mux = &cmi9880_basic_mux;
+ +		if (spec->board_config == CMI_FULL_DIG) {
+ +			spec->multiout.dig_out_nid = CMI_DIG_OUT_NID;
+ +			spec->dig_in_nid = CMI_DIG_IN_NID;
+ +		}
+ +		break;
+ +	case CMI_ALLOUT:
+ +	default:
+ +		spec->front_panel = 1;
+ +		spec->multiout.max_channels = 8;
+ +		spec->no_line_in = 1;
+ +		spec->input_mux = &cmi9880_no_line_mux;
+ +		spec->multiout.dig_out_nid = CMI_DIG_OUT_NID;
+ +		break;
+ +	}
+ +
+ +	spec->multiout.num_dacs = spec->num_dacs;
+ +	spec->multiout.dac_nids = spec->dac_nids;
+ +
+ +	spec->adc_nids = cmi9880_adc_nids;
+ +
+ +	codec->patch_ops = cmi9880_patch_ops;
+ +
+ +	return 0;
+ +#else
+ +	return cmi_parse_auto_config(codec);
+ +#endif
+++=======
++ static int patch_cmi8888(struct hda_codec *codec)
++ {
++ 	struct cmi_spec *spec;
++ 	struct auto_pin_cfg *cfg;
++ 	int err;
++ 
++ 	spec = kzalloc(sizeof(*spec), GFP_KERNEL);
++ 	if (!spec)
++ 		return -ENOMEM;
++ 
++ 	codec->spec = spec;
++ 	cfg = &spec->gen.autocfg;
++ 	snd_hda_gen_spec_init(&spec->gen);
++ 
++ 	/* mask NID 0x10 from the playback volume selection;
++ 	 * it's a headphone boost volume handled manually below
++ 	 */
++ 	spec->gen.out_vol_mask = (1ULL << 0x10);
++ 
++ 	err = snd_hda_parse_pin_defcfg(codec, cfg, NULL, 0);
++ 	if (err < 0)
++ 		goto error;
++ 	err = snd_hda_gen_parse_auto_config(codec, cfg);
++ 	if (err < 0)
++ 		goto error;
++ 
++ 	if (get_defcfg_device(snd_hda_codec_get_pincfg(codec, 0x10)) ==
++ 	    AC_JACK_HP_OUT) {
++ 		static const struct snd_kcontrol_new amp_kctl =
++ 			HDA_CODEC_VOLUME("Headphone Amp Playback Volume",
++ 					 0x10, 0, HDA_OUTPUT);
++ 		if (!snd_hda_gen_add_kctl(&spec->gen, NULL, &amp_kctl)) {
++ 			err = -ENOMEM;
++ 			goto error;
++ 		}
++ 	}
++ 
++ 	codec->patch_ops = cmi_auto_patch_ops;
++ 	return 0;
++ 
++  error:
++ 	snd_hda_gen_free(codec);
++ 	return err;
+++>>>>>>> 875f0dd79987 (ALSA: hda - Fix parsing of CMI8888 codec)
+  }
+  
+  /*
+* Unmerged path sound/pci/hda/patch_cmedia.c
