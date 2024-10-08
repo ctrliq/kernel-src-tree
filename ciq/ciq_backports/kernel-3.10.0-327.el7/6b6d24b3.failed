@@ -1,0 +1,162 @@
+Btrfs, scrub: uninitialized variable in scrub_extent_for_parity()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 6b6d24b38991f72fe974215c96e0fdfe409ea50e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b6d24b3.failed
+
+The only way that "ret" is set is when we call scrub_pages_for_parity()
+so the skip to "if (ret) " test doesn't make sense and causes a static
+checker warning.
+
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit 6b6d24b38991f72fe974215c96e0fdfe409ea50e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/scrub.c
+diff --cc fs/btrfs/scrub.c
+index 5189c8700c82,9e1569ffbf6e..000000000000
+--- a/fs/btrfs/scrub.c
++++ b/fs/btrfs/scrub.c
+@@@ -2228,6 -2491,132 +2228,135 @@@ behind_scrub_pages
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int scrub_pages_for_parity(struct scrub_parity *sparity,
++ 				  u64 logical, u64 len,
++ 				  u64 physical, struct btrfs_device *dev,
++ 				  u64 flags, u64 gen, int mirror_num, u8 *csum)
++ {
++ 	struct scrub_ctx *sctx = sparity->sctx;
++ 	struct scrub_block *sblock;
++ 	int index;
++ 
++ 	sblock = kzalloc(sizeof(*sblock), GFP_NOFS);
++ 	if (!sblock) {
++ 		spin_lock(&sctx->stat_lock);
++ 		sctx->stat.malloc_errors++;
++ 		spin_unlock(&sctx->stat_lock);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* one ref inside this function, plus one for each page added to
++ 	 * a bio later on */
++ 	atomic_set(&sblock->ref_count, 1);
++ 	sblock->sctx = sctx;
++ 	sblock->no_io_error_seen = 1;
++ 	sblock->sparity = sparity;
++ 	scrub_parity_get(sparity);
++ 
++ 	for (index = 0; len > 0; index++) {
++ 		struct scrub_page *spage;
++ 		u64 l = min_t(u64, len, PAGE_SIZE);
++ 
++ 		spage = kzalloc(sizeof(*spage), GFP_NOFS);
++ 		if (!spage) {
++ leave_nomem:
++ 			spin_lock(&sctx->stat_lock);
++ 			sctx->stat.malloc_errors++;
++ 			spin_unlock(&sctx->stat_lock);
++ 			scrub_block_put(sblock);
++ 			return -ENOMEM;
++ 		}
++ 		BUG_ON(index >= SCRUB_MAX_PAGES_PER_BLOCK);
++ 		/* For scrub block */
++ 		scrub_page_get(spage);
++ 		sblock->pagev[index] = spage;
++ 		/* For scrub parity */
++ 		scrub_page_get(spage);
++ 		list_add_tail(&spage->list, &sparity->spages);
++ 		spage->sblock = sblock;
++ 		spage->dev = dev;
++ 		spage->flags = flags;
++ 		spage->generation = gen;
++ 		spage->logical = logical;
++ 		spage->physical = physical;
++ 		spage->mirror_num = mirror_num;
++ 		if (csum) {
++ 			spage->have_csum = 1;
++ 			memcpy(spage->csum, csum, sctx->csum_size);
++ 		} else {
++ 			spage->have_csum = 0;
++ 		}
++ 		sblock->page_count++;
++ 		spage->page = alloc_page(GFP_NOFS);
++ 		if (!spage->page)
++ 			goto leave_nomem;
++ 		len -= l;
++ 		logical += l;
++ 		physical += l;
++ 	}
++ 
++ 	WARN_ON(sblock->page_count == 0);
++ 	for (index = 0; index < sblock->page_count; index++) {
++ 		struct scrub_page *spage = sblock->pagev[index];
++ 		int ret;
++ 
++ 		ret = scrub_add_page_to_rd_bio(sctx, spage);
++ 		if (ret) {
++ 			scrub_block_put(sblock);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* last one frees, either here or in bio completion for last page */
++ 	scrub_block_put(sblock);
++ 	return 0;
++ }
++ 
++ static int scrub_extent_for_parity(struct scrub_parity *sparity,
++ 				   u64 logical, u64 len,
++ 				   u64 physical, struct btrfs_device *dev,
++ 				   u64 flags, u64 gen, int mirror_num)
++ {
++ 	struct scrub_ctx *sctx = sparity->sctx;
++ 	int ret;
++ 	u8 csum[BTRFS_CSUM_SIZE];
++ 	u32 blocksize;
++ 
++ 	if (flags & BTRFS_EXTENT_FLAG_DATA) {
++ 		blocksize = sctx->sectorsize;
++ 	} else if (flags & BTRFS_EXTENT_FLAG_TREE_BLOCK) {
++ 		blocksize = sctx->nodesize;
++ 	} else {
++ 		blocksize = sctx->sectorsize;
++ 		WARN_ON(1);
++ 	}
++ 
++ 	while (len) {
++ 		u64 l = min_t(u64, len, blocksize);
++ 		int have_csum = 0;
++ 
++ 		if (flags & BTRFS_EXTENT_FLAG_DATA) {
++ 			/* push csums to sbio */
++ 			have_csum = scrub_find_csum(sctx, logical, l, csum);
++ 			if (have_csum == 0)
++ 				goto skip;
++ 		}
++ 		ret = scrub_pages_for_parity(sparity, logical, l, physical, dev,
++ 					     flags, gen, mirror_num,
++ 					     have_csum ? csum : NULL);
++ 		if (ret)
++ 			return ret;
++ skip:
++ 		len -= l;
++ 		logical += l;
++ 		physical += l;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> 6b6d24b38991 (Btrfs, scrub: uninitialized variable in scrub_extent_for_parity())
+  /*
+   * Given a physical address, this will calculate it's
+   * logical offset. if this is a parity stripe, it will return
+* Unmerged path fs/btrfs/scrub.c
