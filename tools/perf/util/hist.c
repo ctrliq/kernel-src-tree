@@ -429,8 +429,12 @@ static struct hist_entry *hists__findnew_entry(struct hists *hists,
 		cmp = hist_entry__cmp(he, entry);
 
 		if (!cmp) {
-			if (sample_self)
+			if (sample_self) {
 				he_stat__add_period(&he->stat, period, weight);
+				hists->stats.total_period += period;
+				if (!he->filtered)
+					hists->stats.total_non_filtered_period += period;
+			}
 			if (symbol_conf.cumulate_callchain)
 				he_stat__add_period(he->stat_acc, period, weight);
 
@@ -463,7 +467,10 @@ static struct hist_entry *hists__findnew_entry(struct hists *hists,
 	if (!he)
 		return NULL;
 
-	hists->nr_entries++;
+	if (sample_self)
+		hists__inc_stats(hists, he);
+	else
+		hists->nr_entries++;
 
 	rb_link_node(&he->rb_node_in, parent, p);
 	rb_insert_color(&he->rb_node_in, hists->entries_in);
