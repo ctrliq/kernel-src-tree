@@ -1,0 +1,177 @@
+net/ipv4: Use non-atomic allocation of udp offloads structure instance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [net] ipv4: Use non-atomic allocation of udp offloads structure instance (Thomas Graf) [1051111]
+Rebuild_FUZZ: 97.06%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit b5aaab12b2b4bc4acab7384c17a87f3406e5047d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/b5aaab12.failed
+
+Since udp_add_offload() can be called from non-sleepable context e.g
+under this call tree from the vxlan driver use case:
+
+  vxlan_socket_create() <-- holds the spinlock
+  -> vxlan_notify_add_rx_port()
+     -> udp_add_offload()  <-- schedules
+
+we should allocate the udp_offloads structure in atomic manner.
+
+Fixes: b582ef0 ('net: Add GRO support for UDP encapsulating protocols')
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b5aaab12b2b4bc4acab7384c17a87f3406e5047d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp_offload.c
+diff --cc net/ipv4/udp_offload.c
+index f35eccaa855e,2ffea6f31efc..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -87,6 -98,138 +87,141 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int udp_add_offload(struct udp_offload *uo)
++ {
++ 	struct udp_offload_priv __rcu **head = &udp_offload_base;
++ 	struct udp_offload_priv *new_offload = kzalloc(sizeof(*new_offload), GFP_ATOMIC);
++ 
++ 	if (!new_offload)
++ 		return -ENOMEM;
++ 
++ 	new_offload->offload = uo;
++ 
++ 	spin_lock(&udp_offload_lock);
++ 	rcu_assign_pointer(new_offload->next, rcu_dereference(*head));
++ 	rcu_assign_pointer(*head, new_offload);
++ 	spin_unlock(&udp_offload_lock);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(udp_add_offload);
++ 
++ static void udp_offload_free_routine(struct rcu_head *head)
++ {
++ 	struct udp_offload_priv *ou_priv = container_of(head, struct udp_offload_priv, rcu);
++ 	kfree(ou_priv);
++ }
++ 
++ void udp_del_offload(struct udp_offload *uo)
++ {
++ 	struct udp_offload_priv __rcu **head = &udp_offload_base;
++ 	struct udp_offload_priv *uo_priv;
++ 
++ 	spin_lock(&udp_offload_lock);
++ 
++ 	uo_priv = rcu_dereference(*head);
++ 	for (; uo_priv != NULL;
++ 		uo_priv = rcu_dereference(*head)) {
++ 
++ 		if (uo_priv->offload == uo) {
++ 			rcu_assign_pointer(*head, rcu_dereference(uo_priv->next));
++ 			goto unlock;
++ 		}
++ 		head = &uo_priv->next;
++ 	}
++ 	pr_warn("udp_del_offload: didn't find offload for port %d\n", ntohs(uo->port));
++ unlock:
++ 	spin_unlock(&udp_offload_lock);
++ 	if (uo_priv != NULL)
++ 		call_rcu(&uo_priv->rcu, udp_offload_free_routine);
++ }
++ EXPORT_SYMBOL(udp_del_offload);
++ 
++ static struct sk_buff **udp_gro_receive(struct sk_buff **head, struct sk_buff *skb)
++ {
++ 	struct udp_offload_priv *uo_priv;
++ 	struct sk_buff *p, **pp = NULL;
++ 	struct udphdr *uh, *uh2;
++ 	unsigned int hlen, off;
++ 	int flush = 1;
++ 
++ 	if (NAPI_GRO_CB(skb)->udp_mark ||
++ 	    (!skb->encapsulation && skb->ip_summed != CHECKSUM_COMPLETE))
++ 		goto out;
++ 
++ 	/* mark that this skb passed once through the udp gro layer */
++ 	NAPI_GRO_CB(skb)->udp_mark = 1;
++ 
++ 	off  = skb_gro_offset(skb);
++ 	hlen = off + sizeof(*uh);
++ 	uh   = skb_gro_header_fast(skb, off);
++ 	if (skb_gro_header_hard(skb, hlen)) {
++ 		uh = skb_gro_header_slow(skb, hlen, off);
++ 		if (unlikely(!uh))
++ 			goto out;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	uo_priv = rcu_dereference(udp_offload_base);
++ 	for (; uo_priv != NULL; uo_priv = rcu_dereference(uo_priv->next)) {
++ 		if (uo_priv->offload->port == uh->dest &&
++ 		    uo_priv->offload->callbacks.gro_receive)
++ 			goto unflush;
++ 	}
++ 	goto out_unlock;
++ 
++ unflush:
++ 	flush = 0;
++ 
++ 	for (p = *head; p; p = p->next) {
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		uh2 = (struct udphdr   *)(p->data + off);
++ 		if ((*(u32 *)&uh->source != *(u32 *)&uh2->source)) {
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 			continue;
++ 		}
++ 	}
++ 
++ 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
++ 	pp = uo_priv->offload->callbacks.gro_receive(head, skb);
++ 
++ out_unlock:
++ 	rcu_read_unlock();
++ out:
++ 	NAPI_GRO_CB(skb)->flush |= flush;
++ 	return pp;
++ }
++ 
++ static int udp_gro_complete(struct sk_buff *skb, int nhoff)
++ {
++ 	struct udp_offload_priv *uo_priv;
++ 	__be16 newlen = htons(skb->len - nhoff);
++ 	struct udphdr *uh = (struct udphdr *)(skb->data + nhoff);
++ 	int err = -ENOSYS;
++ 
++ 	uh->len = newlen;
++ 
++ 	rcu_read_lock();
++ 
++ 	uo_priv = rcu_dereference(udp_offload_base);
++ 	for (; uo_priv != NULL; uo_priv = rcu_dereference(uo_priv->next)) {
++ 		if (uo_priv->offload->port == uh->dest &&
++ 		    uo_priv->offload->callbacks.gro_complete)
++ 			break;
++ 	}
++ 
++ 	if (uo_priv != NULL)
++ 		err = uo_priv->offload->callbacks.gro_complete(skb, nhoff + sizeof(struct udphdr));
++ 
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
+++>>>>>>> b5aaab12b2b4 (net/ipv4: Use non-atomic allocation of udp offloads structure instance)
+  static const struct net_offload udpv4_offload = {
+  	.callbacks = {
+  		.gso_send_check = udp4_ufo_send_check,
+* Unmerged path net/ipv4/udp_offload.c
