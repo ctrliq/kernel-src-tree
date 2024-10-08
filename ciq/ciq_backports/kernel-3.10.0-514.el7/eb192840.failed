@@ -1,0 +1,121 @@
+RDS:TCP: Synchronize rds_tcp_accept_one with rds_send_xmit when resetting t_sock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] rds: tcp: Synchronize rds_tcp_accept_one with rds_send_xmit when resetting t_sock (Honggang Li) [1309411 1342604]
+Rebuild_FUZZ: 99.38%
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit eb192840266fab3e3da644018121eed30153355d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/eb192840.failed
+
+There is a race condition between rds_send_xmit -> rds_tcp_xmit
+and the code that deals with resolution of duelling syns added
+by commit 241b271952eb ("RDS-TCP: Reset tcp callbacks if re-using an
+outgoing socket in rds_tcp_accept_one()").
+
+Specifically, we may end up derefencing a null pointer in rds_send_xmit
+if we have the interleaving sequence:
+           rds_tcp_accept_one                  rds_send_xmit
+
+                                             conn is RDS_CONN_UP, so
+    					 invoke rds_tcp_xmit
+
+                                             tc = conn->c_transport_data
+        rds_tcp_restore_callbacks
+            /* reset t_sock */
+    					 null ptr deref from tc->t_sock
+
+The race condition can be avoided without adding the overhead of
+additional locking in the xmit path: have rds_tcp_accept_one wait
+for rds_tcp_xmit threads to complete before resetting callbacks.
+The synchronization can be done in the same manner as rds_conn_shutdown().
+First set the rds_conn_state to something other than RDS_CONN_UP
+(so that new threads cannot get into rds_tcp_xmit()), then wait for
+RDS_IN_XMIT to be cleared in the conn->c_flags indicating that any
+threads in rds_tcp_xmit are done.
+
+Fixes: 241b271952eb ("RDS-TCP: Reset tcp callbacks if re-using an
+outgoing socket in rds_tcp_accept_one()")
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb192840266fab3e3da644018121eed30153355d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/tcp_listen.c
+diff --cc net/rds/tcp_listen.c
+index a90a6e704153,0896187243d6..000000000000
+--- a/net/rds/tcp_listen.c
++++ b/net/rds/tcp_listen.c
+@@@ -124,26 -115,32 +124,53 @@@ static int rds_tcp_accept_one(struct so
+  	 * rds_tcp_state_change() will do that cleanup
+  	 */
+  	rs_tcp = (struct rds_tcp_connection *)conn->c_transport_data;
+++<<<<<<< HEAD
+ +	WARN_ON(!rs_tcp || rs_tcp->t_sock);
+ +
+ +	/*
+ +	 * see the comment above rds_queue_delayed_reconnect()
+ +	 */
+ +	if (!rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING)) {
+ +		if (rds_conn_state(conn) == RDS_CONN_UP)
+ +			rds_tcp_stats_inc(s_tcp_listen_closed_stale);
+ +		else
+ +			rds_tcp_stats_inc(s_tcp_connect_raced);
+ +		rds_conn_drop(conn);
+ +		ret = 0;
+ +		goto out;
+ +	} else if (rs_tcp->t_sock) {
+ +		rds_tcp_restore_callbacks(rs_tcp->t_sock, rs_tcp);
+ +		conn->c_outgoing = 0;
+ +	}
+ +
+++=======
++ 	rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING);
++ 	if (rs_tcp->t_sock) {
++ 		/* Need to resolve a duelling SYN between peers.
++ 		 * We have an outstanding SYN to this peer, which may
++ 		 * potentially have transitioned to the RDS_CONN_UP state,
++ 		 * so we must quiesce any send threads before resetting
++ 		 * c_transport_data.
++ 		 */
++ 		wait_event(conn->c_waitq,
++ 			   !test_bit(RDS_IN_XMIT, &conn->c_flags));
++ 		if (ntohl(inet->inet_saddr) < ntohl(inet->inet_daddr)) {
++ 			struct sock *nsk = new_sock->sk;
++ 
++ 			nsk->sk_user_data = NULL;
++ 			nsk->sk_prot->disconnect(nsk, 0);
++ 			tcp_done(nsk);
++ 			new_sock = NULL;
++ 			ret = 0;
++ 			goto out;
++ 		} else if (rs_tcp->t_sock) {
++ 			rds_tcp_restore_callbacks(rs_tcp->t_sock, rs_tcp);
++ 			conn->c_outgoing = 0;
++ 		}
++ 	}
+++>>>>>>> eb192840266f (RDS:TCP: Synchronize rds_tcp_accept_one with rds_send_xmit when resetting t_sock)
+  	rds_tcp_set_callbacks(new_sock, conn);
+- 	rds_connect_complete(conn);
++ 	rds_connect_complete(conn); /* marks RDS_CONN_UP */
+  	new_sock = NULL;
+  	ret = 0;
+  
+diff --git a/net/rds/tcp.c b/net/rds/tcp.c
+index 0f9cb6d5a317..e7ca46c17dfe 100644
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -107,7 +107,7 @@ void rds_tcp_restore_callbacks(struct socket *sock,
+ 
+ /*
+  * This is the only path that sets tc->t_sock.  Send and receive trust that
+- * it is set.  The RDS_CONN_CONNECTED bit protects those paths from being
++ * it is set.  The RDS_CONN_UP bit protects those paths from being
+  * called while it isn't set.
+  */
+ void rds_tcp_set_callbacks(struct socket *sock, struct rds_connection *conn)
+* Unmerged path net/rds/tcp_listen.c
