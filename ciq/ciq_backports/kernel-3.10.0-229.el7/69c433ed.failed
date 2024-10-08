@@ -1,0 +1,104 @@
+fs: limit filesystem stacking depth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [fs] overlayfs: limit filesystem stacking depth (David Howells) [985875]
+Rebuild_FUZZ: 90.91%
+commit-author Miklos Szeredi <mszeredi@suse.cz>
+commit 69c433ed2ecd2d3264efd7afec4439524b319121
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/69c433ed.failed
+
+Add a simple read-only counter to super_block that indicates how deep this
+is in the stack of filesystems.  Previously ecryptfs was the only stackable
+filesystem and it explicitly disallowed multiple layers of itself.
+
+Overlayfs, however, can be stacked recursively and also may be stacked
+on top of ecryptfs or vice versa.
+
+To limit the kernel stack usage we must limit the depth of the
+filesystem stack.  Initially the limit is set to 2.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+(cherry picked from commit 69c433ed2ecd2d3264efd7afec4439524b319121)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs.h
+diff --cc include/linux/fs.h
+index e139dc65b562,4e41a4a331bb..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1334,12 -1267,25 +1340,32 @@@ struct super_block 
+  
+  	/* Being remounted read-only */
+  	int s_readonly_remount;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* AIO completions deferred from interrupt context */
++ 	struct workqueue_struct *s_dio_done_wq;
++ 	struct hlist_head s_pins;
++ 
++ 	/*
++ 	 * Keep the lru lists last in the structure so they always sit on their
++ 	 * own individual cachelines.
++ 	 */
++ 	struct list_lru		s_dentry_lru ____cacheline_aligned_in_smp;
++ 	struct list_lru		s_inode_lru ____cacheline_aligned_in_smp;
++ 	struct rcu_head		rcu;
++ 
++ 	/*
++ 	 * Indicates how deep in a filesystem stack this SB is
++ 	 */
++ 	int s_stack_depth;
+++>>>>>>> 69c433ed2ecd (fs: limit filesystem stacking depth)
+  };
+  
+ +/* superblock cache pruning functions */
+ +extern void prune_icache_sb(struct super_block *sb, int nr_to_scan);
+ +extern void prune_dcache_sb(struct super_block *sb, int nr_to_scan);
+ +
+  extern struct timespec current_fs_time(struct super_block *sb);
+  
+  /*
+diff --git a/fs/ecryptfs/main.c b/fs/ecryptfs/main.c
+index e924cf45aad9..8b0957e900e5 100644
+--- a/fs/ecryptfs/main.c
++++ b/fs/ecryptfs/main.c
+@@ -567,6 +567,13 @@ static struct dentry *ecryptfs_mount(struct file_system_type *fs_type, int flags
+ 	s->s_maxbytes = path.dentry->d_sb->s_maxbytes;
+ 	s->s_blocksize = path.dentry->d_sb->s_blocksize;
+ 	s->s_magic = ECRYPTFS_SUPER_MAGIC;
++	s->s_stack_depth = path.dentry->d_sb->s_stack_depth + 1;
++
++	rc = -EINVAL;
++	if (s->s_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
++		pr_err("eCryptfs: maximum fs stacking depth exceeded\n");
++		goto out_free;
++	}
+ 
+ 	inode = ecryptfs_get_inode(path.dentry->d_inode, s);
+ 	rc = PTR_ERR(inode);
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index 7dcc24e84417..08b704cebfc4 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -677,6 +677,15 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+ 	}
+ 	ufs->lower_namelen = statfs.f_namelen;
+ 
++	sb->s_stack_depth = max(upperpath.mnt->mnt_sb->s_stack_depth,
++				lowerpath.mnt->mnt_sb->s_stack_depth) + 1;
++
++	err = -EINVAL;
++	if (sb->s_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
++		pr_err("overlayfs: maximum fs stacking depth exceeded\n");
++		goto out_put_workpath;
++	}
++
+ 	ufs->upper_mnt = clone_private_mount(&upperpath);
+ 	err = PTR_ERR(ufs->upper_mnt);
+ 	if (IS_ERR(ufs->upper_mnt)) {
+* Unmerged path include/linux/fs.h
