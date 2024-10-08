@@ -1,0 +1,294 @@
+pnfs/blocklayout: remove read-modify-write handling in bl_write_pagelist
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3a6fd1f004fcaf3dd1c28a7cd16406c8318eb64a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/3a6fd1f0.failed
+
+Use the new PNFS_READ_WHOLE_PAGE flag to offload read-modify-write
+handling to core nfs code, and remove a huge chunk of deadlock prone
+mess from the block layout writeback path.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 3a6fd1f004fcaf3dd1c28a7cd16406c8318eb64a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/blocklayout/blocklayout.c
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index 04db638b8038,cf87254b6cd1..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -386,33 -372,6 +375,36 @@@ static void mark_extents_written(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void bl_end_io_write_zero(struct bio *bio, int err)
+ +{
+ +	struct parallel_io *par = bio->bi_private;
+ +	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+ +
+ +	do {
+ +		struct page *page = bvec->bv_page;
+ +
+ +		if (--bvec >= bio->bi_io_vec)
+ +			prefetchw(&bvec->bv_page->flags);
+ +		/* This is the zeroing page we added */
+ +		end_page_writeback(page);
+ +		page_cache_release(page);
+ +	} while (bvec >= bio->bi_io_vec);
+ +
+ +	if (unlikely(!uptodate)) {
+ +		struct nfs_pgio_header *header = par->data;
+ +
+ +		if (!header->pnfs_error)
+ +			header->pnfs_error = -EIO;
+ +		pnfs_set_lo_fail(header->lseg);
+ +	}
+ +	bio_put(bio);
+ +	put_parallel(par);
+ +}
+ +
+++=======
+++>>>>>>> 3a6fd1f004fc (pnfs/blocklayout: remove read-modify-write handling in bl_write_pagelist)
+  static void bl_end_io_write(struct bio *bio, int err)
+  {
+  	struct parallel_io *par = bio->bi_private;
+@@@ -462,227 -421,6 +454,230 @@@ static void bl_end_par_io_write(void *d
+  	schedule_work(&hdr->task.u.tk_work);
+  }
+  
+++<<<<<<< HEAD
+ +/* FIXME STUB - mark intersection of layout and page as bad, so is not
+ + * used again.
+ + */
+ +static void mark_bad_read(void)
+ +{
+ +	return;
+ +}
+ +
+ +/*
+ + * map_block:  map a requested I/0 block (isect) into an offset in the LVM
+ + * block_device
+ + */
+ +static void
+ +map_block(struct buffer_head *bh, sector_t isect, struct pnfs_block_extent *be)
+ +{
+ +	dprintk("%s enter be=%p\n", __func__, be);
+ +
+ +	set_buffer_mapped(bh);
+ +	bh->b_bdev = be->be_mdev;
+ +	bh->b_blocknr = (isect - be->be_f_offset + be->be_v_offset) >>
+ +	    (be->be_mdev->bd_inode->i_blkbits - SECTOR_SHIFT);
+ +
+ +	dprintk("%s isect %llu, bh->b_blocknr %ld, using bsize %Zd\n",
+ +		__func__, (unsigned long long)isect, (long)bh->b_blocknr,
+ +		bh->b_size);
+ +	return;
+ +}
+ +
+ +static void
+ +bl_read_single_end_io(struct bio *bio, int error)
+ +{
+ +	struct bio_vec *bvec = bio->bi_io_vec + bio->bi_vcnt - 1;
+ +	struct page *page = bvec->bv_page;
+ +
+ +	/* Only one page in bvec */
+ +	unlock_page(page);
+ +}
+ +
+ +static int
+ +bl_do_readpage_sync(struct page *page, struct pnfs_block_extent *be,
+ +		    unsigned int offset, unsigned int len)
+ +{
+ +	struct bio *bio;
+ +	struct page *shadow_page;
+ +	sector_t isect;
+ +	char *kaddr, *kshadow_addr;
+ +	int ret = 0;
+ +
+ +	dprintk("%s: offset %u len %u\n", __func__, offset, len);
+ +
+ +	shadow_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+ +	if (shadow_page == NULL)
+ +		return -ENOMEM;
+ +
+ +	bio = bio_alloc(GFP_NOIO, 1);
+ +	if (bio == NULL)
+ +		return -ENOMEM;
+ +
+ +	isect = (page->index << PAGE_CACHE_SECTOR_SHIFT) +
+ +		(offset / SECTOR_SIZE);
+ +
+ +	bio->bi_sector = isect - be->be_f_offset + be->be_v_offset;
+ +	bio->bi_bdev = be->be_mdev;
+ +	bio->bi_end_io = bl_read_single_end_io;
+ +
+ +	lock_page(shadow_page);
+ +	if (bio_add_page(bio, shadow_page,
+ +			 SECTOR_SIZE, round_down(offset, SECTOR_SIZE)) == 0) {
+ +		unlock_page(shadow_page);
+ +		bio_put(bio);
+ +		return -EIO;
+ +	}
+ +
+ +	submit_bio(READ, bio);
+ +	wait_on_page_locked(shadow_page);
+ +	if (unlikely(!test_bit(BIO_UPTODATE, &bio->bi_flags))) {
+ +		ret = -EIO;
+ +	} else {
+ +		kaddr = kmap_atomic(page);
+ +		kshadow_addr = kmap_atomic(shadow_page);
+ +		memcpy(kaddr + offset, kshadow_addr + offset, len);
+ +		kunmap_atomic(kshadow_addr);
+ +		kunmap_atomic(kaddr);
+ +	}
+ +	__free_page(shadow_page);
+ +	bio_put(bio);
+ +
+ +	return ret;
+ +}
+ +
+ +static int
+ +bl_read_partial_page_sync(struct page *page, struct pnfs_block_extent *be,
+ +			  unsigned int dirty_offset, unsigned int dirty_len,
+ +			  bool full_page)
+ +{
+ +	int ret = 0;
+ +	unsigned int start, end;
+ +
+ +	if (full_page) {
+ +		start = 0;
+ +		end = PAGE_CACHE_SIZE;
+ +	} else {
+ +		start = round_down(dirty_offset, SECTOR_SIZE);
+ +		end = round_up(dirty_offset + dirty_len, SECTOR_SIZE);
+ +	}
+ +
+ +	dprintk("%s: offset %u len %d\n", __func__, dirty_offset, dirty_len);
+ +	if (!be) {
+ +		zero_user_segments(page, start, dirty_offset,
+ +				   dirty_offset + dirty_len, end);
+ +		if (start == 0 && end == PAGE_CACHE_SIZE &&
+ +		    trylock_page(page)) {
+ +			SetPageUptodate(page);
+ +			unlock_page(page);
+ +		}
+ +		return ret;
+ +	}
+ +
+ +	if (start != dirty_offset)
+ +		ret = bl_do_readpage_sync(page, be, start, dirty_offset - start);
+ +
+ +	if (!ret && (dirty_offset + dirty_len < end))
+ +		ret = bl_do_readpage_sync(page, be, dirty_offset + dirty_len,
+ +					  end - dirty_offset - dirty_len);
+ +
+ +	return ret;
+ +}
+ +
+ +/* Given an unmapped page, zero it or read in page for COW, page is locked
+ + * by caller.
+ + */
+ +static int
+ +init_page_for_write(struct page *page, struct pnfs_block_extent *cow_read)
+ +{
+ +	struct buffer_head *bh = NULL;
+ +	int ret = 0;
+ +	sector_t isect;
+ +
+ +	dprintk("%s enter, %p\n", __func__, page);
+ +	BUG_ON(PageUptodate(page));
+ +	if (!cow_read) {
+ +		zero_user_segment(page, 0, PAGE_SIZE);
+ +		SetPageUptodate(page);
+ +		goto cleanup;
+ +	}
+ +
+ +	bh = alloc_page_buffers(page, PAGE_CACHE_SIZE, 0);
+ +	if (!bh) {
+ +		ret = -ENOMEM;
+ +		goto cleanup;
+ +	}
+ +
+ +	isect = (sector_t) page->index << PAGE_CACHE_SECTOR_SHIFT;
+ +	map_block(bh, isect, cow_read);
+ +	if (!bh_uptodate_or_lock(bh))
+ +		ret = bh_submit_read(bh);
+ +	if (ret)
+ +		goto cleanup;
+ +	SetPageUptodate(page);
+ +
+ +cleanup:
+ +	if (bh)
+ +		free_buffer_head(bh);
+ +	if (ret) {
+ +		/* Need to mark layout with bad read...should now
+ +		 * just use nfs4 for reads and writes.
+ +		 */
+ +		mark_bad_read();
+ +	}
+ +	return ret;
+ +}
+ +
+ +/* Find or create a zeroing page marked being writeback.
+ + * Return ERR_PTR on error, NULL to indicate skip this page and page itself
+ + * to indicate write out.
+ + */
+ +static struct page *
+ +bl_find_get_zeroing_page(struct inode *inode, pgoff_t index,
+ +			struct pnfs_block_extent *cow_read)
+ +{
+ +	struct page *page;
+ +	int locked = 0;
+ +	page = find_get_page(inode->i_mapping, index);
+ +	if (page)
+ +		goto check_page;
+ +
+ +	page = find_or_create_page(inode->i_mapping, index, GFP_NOFS);
+ +	if (unlikely(!page)) {
+ +		dprintk("%s oom\n", __func__);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +	locked = 1;
+ +
+ +check_page:
+ +	/* PageDirty: Other will write this out
+ +	 * PageWriteback: Other is writing this out
+ +	 * PageUptodate: It was read before
+ +	 */
+ +	if (PageDirty(page) || PageWriteback(page)) {
+ +		print_page(page);
+ +		if (locked)
+ +			unlock_page(page);
+ +		page_cache_release(page);
+ +		return NULL;
+ +	}
+ +
+ +	if (!locked) {
+ +		lock_page(page);
+ +		locked = 1;
+ +		goto check_page;
+ +	}
+ +	if (!PageUptodate(page)) {
+ +		/* New page, readin or zero it */
+ +		init_page_for_write(page, cow_read);
+ +	}
+ +	set_page_writeback(page);
+ +	unlock_page(page);
+ +
+ +	return page;
+ +}
+ +
+++=======
+++>>>>>>> 3a6fd1f004fc (pnfs/blocklayout: remove read-modify-write handling in bl_write_pagelist)
+  static enum pnfs_try_status
+  bl_write_pagelist(struct nfs_pgio_header *header, int sync)
+  {
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
