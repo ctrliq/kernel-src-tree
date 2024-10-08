@@ -1,0 +1,114 @@
+ixgbe: Handle extended IPv6 headers in Tx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Mark Rustad <mark.d.rustad@intel.com>
+commit 36a92d7190e68e9387347695fe4625eb2c9e7e1c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/36a92d71.failed
+
+Check for and handle IPv6 extended headers so that Tx checksum
+offload can be done. Also use skb_checksum_help for unexpected
+cases. Thanks to Tom Herbert for noticing these problems. Thanks
+to Alexander Duyck for recognizing problems with the first version
+of this patch and recognizing how to coalesce error conditions
+into a single location.
+
+	Reported-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: Mark Rustad <mark.d.rustad@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 36a92d7190e68e9387347695fe4625eb2c9e7e1c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index bb1c8cb736ae,ebd4522e7879..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -6751,24 -7050,53 +6751,70 @@@ static void ixgbe_tx_csum(struct ixgbe_
+  		if (!(first->tx_flags & IXGBE_TX_FLAGS_HW_VLAN) &&
+  		    !(first->tx_flags & IXGBE_TX_FLAGS_CC))
+  			return;
+ -		vlan_macip_lens = skb_network_offset(skb) <<
+ -				  IXGBE_ADVTXD_MACLEN_SHIFT;
+  	} else {
+  		u8 l4_hdr = 0;
+++<<<<<<< HEAD
+ +		switch (first->protocol) {
+ +		case htons(ETH_P_IP):
+ +			vlan_macip_lens |= skb_network_header_len(skb);
+++=======
++ 		union {
++ 			struct iphdr *ipv4;
++ 			struct ipv6hdr *ipv6;
++ 			u8 *raw;
++ 		} network_hdr;
++ 		union {
++ 			struct tcphdr *tcphdr;
++ 			u8 *raw;
++ 		} transport_hdr;
++ 		__be16 frag_off;
++ 
++ 		if (skb->encapsulation) {
++ 			network_hdr.raw = skb_inner_network_header(skb);
++ 			transport_hdr.raw = skb_inner_transport_header(skb);
++ 			vlan_macip_lens = skb_inner_network_offset(skb) <<
++ 					  IXGBE_ADVTXD_MACLEN_SHIFT;
++ 		} else {
++ 			network_hdr.raw = skb_network_header(skb);
++ 			transport_hdr.raw = skb_transport_header(skb);
++ 			vlan_macip_lens = skb_network_offset(skb) <<
++ 					  IXGBE_ADVTXD_MACLEN_SHIFT;
++ 		}
++ 
++ 		/* use first 4 bits to determine IP version */
++ 		switch (network_hdr.ipv4->version) {
++ 		case IPVERSION:
++ 			vlan_macip_lens |= transport_hdr.raw - network_hdr.raw;
+++>>>>>>> 36a92d7190e6 (ixgbe: Handle extended IPv6 headers in Tx path)
+  			type_tucmd |= IXGBE_ADVTXD_TUCMD_IPV4;
+ -			l4_hdr = network_hdr.ipv4->protocol;
+ +			l4_hdr = ip_hdr(skb)->protocol;
+ +			break;
+++<<<<<<< HEAD
+ +		case htons(ETH_P_IPV6):
+ +			vlan_macip_lens |= skb_network_header_len(skb);
+ +			l4_hdr = ipv6_hdr(skb)->nexthdr;
+  			break;
+ +		default:
+ +			if (unlikely(net_ratelimit())) {
+ +				dev_warn(tx_ring->dev,
+ +				 "partial checksum but proto=%x!\n",
+ +				 first->protocol);
+ +			}
+++=======
++ 		case 6:
++ 			vlan_macip_lens |= transport_hdr.raw - network_hdr.raw;
++ 			l4_hdr = network_hdr.ipv6->nexthdr;
++ 			if (likely((transport_hdr.raw - network_hdr.raw) ==
++ 				   sizeof(struct ipv6hdr)))
++ 				break;
++ 			ipv6_skip_exthdr(skb, network_hdr.raw - skb->data +
++ 					      sizeof(struct ipv6hdr),
++ 					 &l4_hdr, &frag_off);
++ 			if (unlikely(frag_off))
++ 				l4_hdr = NEXTHDR_FRAGMENT;
++ 			break;
++ 		default:
+++>>>>>>> 36a92d7190e6 (ixgbe: Handle extended IPv6 headers in Tx path)
+  			break;
+  		}
+  
+@@@ -6800,8 -7129,8 +6847,9 @@@
+  		first->tx_flags |= IXGBE_TX_FLAGS_CSUM;
+  	}
+  
++ no_csum:
+  	/* vlan_macip_lens: MACLEN, VLAN tag */
+ +	vlan_macip_lens |= skb_network_offset(skb) << IXGBE_ADVTXD_MACLEN_SHIFT;
+  	vlan_macip_lens |= first->tx_flags & IXGBE_TX_FLAGS_VLAN_MASK;
+  
+  	ixgbe_tx_ctxtdesc(tx_ring, vlan_macip_lens, 0,
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
