@@ -1,0 +1,119 @@
+blk-mq: add basic round-robin of what CPU to queue workqueue work on
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 506e931f92defdc60c1dc4aa2ff4a19a5dcd8618
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/506e931f.failed
+
+Right now we just pick the first CPU in the mask, but that can
+easily overload that one. Add some basic batching and round-robin
+all the entries in the mask instead.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 506e931f92defdc60c1dc4aa2ff4a19a5dcd8618)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 8cc24e349f65,2410e0cb7aef..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -623,14 -706,8 +647,19 @@@ void blk_mq_run_hw_queue(struct blk_mq_
+  	else {
+  		unsigned int cpu;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * It'd be great if the workqueue API had a way to pass
+ +		 * in a mask and had some smarts for more clever placement
+ +		 * than the first CPU. Or we could round-robin here. For now,
+ +		 * just queue on the first CPU.
+ +		 */
+ +		cpu = cpumask_first(hctx->cpumask);
+ +		kblockd_schedule_delayed_work_on(cpu, &hctx->delayed_work, 0);
+++=======
++ 		cpu = blk_mq_hctx_next_cpu(hctx);
++ 		kblockd_schedule_delayed_work_on(cpu, &hctx->run_work, 0);
+++>>>>>>> 506e931f92de (blk-mq: add basic round-robin of what CPU to queue workqueue work on)
+  	}
+  }
+  
+@@@ -705,6 -794,31 +734,34 @@@ static void blk_mq_work_fn(struct work_
+  	__blk_mq_run_hw_queue(hctx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void blk_mq_delay_work_fn(struct work_struct *work)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	hctx = container_of(work, struct blk_mq_hw_ctx, delay_work.work);
++ 
++ 	if (test_and_clear_bit(BLK_MQ_S_STOPPED, &hctx->state))
++ 		__blk_mq_run_hw_queue(hctx);
++ }
++ 
++ void blk_mq_delay_queue(struct blk_mq_hw_ctx *hctx, unsigned long msecs)
++ {
++ 	unsigned long tmo = msecs_to_jiffies(msecs);
++ 
++ 	if (hctx->queue->nr_hw_queues == 1)
++ 		kblockd_schedule_delayed_work(&hctx->delay_work, tmo);
++ 	else {
++ 		unsigned int cpu;
++ 
++ 		cpu = blk_mq_hctx_next_cpu(hctx);
++ 		kblockd_schedule_delayed_work_on(cpu, &hctx->delay_work, tmo);
++ 	}
++ }
++ EXPORT_SYMBOL(blk_mq_delay_queue);
++ 
+++>>>>>>> 506e931f92de (blk-mq: add basic round-robin of what CPU to queue workqueue work on)
+  static void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx,
+  				    struct request *rq, bool at_head)
+  {
+@@@ -1289,10 -1390,14 +1346,15 @@@ static void blk_mq_map_swqueue(struct r
+  		ctx->index_hw = hctx->nr_ctx;
+  		hctx->ctxs[hctx->nr_ctx++] = ctx;
+  	}
++ 
++ 	queue_for_each_hw_ctx(q, hctx, i) {
++ 		hctx->next_cpu = cpumask_first(hctx->cpumask);
++ 		hctx->next_cpu_batch = BLK_MQ_CPU_WORK_BATCH;
++ 	}
+  }
+  
+ -struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ +struct request_queue *blk_mq_init_queue(struct blk_mq_reg *reg,
+ +					void *driver_data)
+  {
+  	struct blk_mq_hw_ctx **hctxs;
+  	struct blk_mq_ctx *ctx;
+* Unmerged path block/blk-mq.c
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 82a4a8e60c38..bc7025bfeec6 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -20,6 +20,8 @@ struct blk_mq_hw_ctx {
+ 	unsigned long		state;		/* BLK_MQ_S_* flags */
+ 	struct delayed_work	delayed_work;
+ 	cpumask_var_t		cpumask;
++	int			next_cpu;
++	int			next_cpu_batch;
+ 
+ 	unsigned long		flags;		/* BLK_MQ_F_* flags */
+ 
+@@ -112,6 +114,8 @@ enum {
+ 	BLK_MQ_S_STOPPED	= 0,
+ 
+ 	BLK_MQ_MAX_DEPTH	= 2048,
++
++	BLK_MQ_CPU_WORK_BATCH	= 8,
+ };
+ 
+ struct request_queue *blk_mq_init_queue(struct blk_mq_reg *, void *);
