@@ -1,0 +1,146 @@
+tpm: TPM 2.0 FIFO Interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+commit aec04cbdf7231c1b0da76172de82dfa2388a80d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/aec04cbd.failed
+
+Detect TPM 2.0 by sending idempotent TPM 2.x command. Ordinals for
+TPM 2.0 are higher than TPM 1.x commands so this should be fail-safe.
+Using STS3 is unreliable because some chips just report 0xff and not
+what the spec says.
+
+Before TPM family is detected, timeouts are set to the maximum values
+for both TPM 1.x and TPM 2.x. In addition to this, suspend/resume
+functionality is implemented for TPM 2.x.
+
+	Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Signed-off-by: Will Arthur <will.c.arthur@intel.com>
+	Reviewed-by: Jasob Gunthorpe <jason.gunthorpe@obsidianresearch.com>
+	Reviewed-by: Stefan Berger <stefanb@linux.vnet.ibm.com>
+	Reviewed-by: Peter Huewe <peterhuewe@gmx.de>
+	Tested-by: Peter Huewe <peterhuewe@gmx.de>
+	Signed-off-by: Peter Huewe <peterhuewe@gmx.de>
+(cherry picked from commit aec04cbdf7231c1b0da76172de82dfa2388a80d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/tpm/tpm_tis.c
+diff --cc drivers/char/tpm/tpm_tis.c
+index 51350cd0847e,20a61bc98db8..000000000000
+--- a/drivers/char/tpm/tpm_tis.c
++++ b/drivers/char/tpm/tpm_tis.c
+@@@ -583,21 -609,25 +600,27 @@@ static int tpm_tis_init(struct device *
+  	priv = devm_kzalloc(dev, sizeof(struct priv_data), GFP_KERNEL);
+  	if (priv == NULL)
+  		return -ENOMEM;
+ -
+ -	chip = tpmm_chip_alloc(dev, &tpm_tis);
+ -	if (IS_ERR(chip))
+ -		return PTR_ERR(chip);
+ -
+ +	if (!(chip = tpm_register_hardware(dev, &tpm_tis)))
+ +		return -ENODEV;
+  	chip->vendor.priv = priv;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ACPI
++ 	chip->acpi_dev_handle = acpi_dev_handle;
++ #endif
+++>>>>>>> aec04cbdf723 (tpm: TPM 2.0 FIFO Interface)
+  
+ -	chip->vendor.iobase = devm_ioremap(dev, start, len);
+ -	if (!chip->vendor.iobase)
+ -		return -EIO;
+ +	chip->vendor.iobase = ioremap(start, len);
+ +	if (!chip->vendor.iobase) {
+ +		rc = -EIO;
+ +		goto out_err;
+ +	}
+  
+- 	/* Default timeouts */
+- 	chip->vendor.timeout_a = msecs_to_jiffies(TIS_SHORT_TIMEOUT);
+- 	chip->vendor.timeout_b = msecs_to_jiffies(TIS_LONG_TIMEOUT);
+- 	chip->vendor.timeout_c = msecs_to_jiffies(TIS_SHORT_TIMEOUT);
+- 	chip->vendor.timeout_d = msecs_to_jiffies(TIS_SHORT_TIMEOUT);
++ 	/* Maximum timeouts */
++ 	chip->vendor.timeout_a = TIS_TIMEOUT_A_MAX;
++ 	chip->vendor.timeout_b = TIS_TIMEOUT_B_MAX;
++ 	chip->vendor.timeout_c = TIS_TIMEOUT_C_MAX;
++ 	chip->vendor.timeout_d = TIS_TIMEOUT_D_MAX;
+  
+  	if (wait_startup(chip, 0) != 0) {
+  		rc = -ENODEV;
+@@@ -755,29 -794,49 +788,57 @@@
+  		}
+  	}
+  
+- 	if (tpm_get_timeouts(chip)) {
+- 		dev_err(dev, "Could not get TPM timeouts and durations\n");
+- 		rc = -ENODEV;
+- 		goto out_err;
+- 	}
++ 	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
++ 		chip->vendor.timeout_a = msecs_to_jiffies(TPM2_TIMEOUT_A);
++ 		chip->vendor.timeout_b = msecs_to_jiffies(TPM2_TIMEOUT_B);
++ 		chip->vendor.timeout_c = msecs_to_jiffies(TPM2_TIMEOUT_C);
++ 		chip->vendor.timeout_d = msecs_to_jiffies(TPM2_TIMEOUT_D);
++ 		chip->vendor.duration[TPM_SHORT] =
++ 			msecs_to_jiffies(TPM2_DURATION_SHORT);
++ 		chip->vendor.duration[TPM_MEDIUM] =
++ 			msecs_to_jiffies(TPM2_DURATION_MEDIUM);
++ 		chip->vendor.duration[TPM_LONG] =
++ 			msecs_to_jiffies(TPM2_DURATION_LONG);
++ 
++ 		rc = tpm2_do_selftest(chip);
++ 		if (rc == TPM2_RC_INITIALIZE) {
++ 			dev_warn(dev, "Firmware has not started TPM\n");
++ 			rc  = tpm2_startup(chip, TPM2_SU_CLEAR);
++ 			if (!rc)
++ 				rc = tpm2_do_selftest(chip);
++ 		}
+  
+- 	if (tpm_do_selftest(chip)) {
+- 		dev_err(dev, "TPM self test failed\n");
+- 		rc = -ENODEV;
+- 		goto out_err;
++ 		if (rc) {
++ 			dev_err(dev, "TPM self test failed\n");
++ 			if (rc > 0)
++ 				rc = -ENODEV;
++ 			goto out_err;
++ 		}
++ 	} else {
++ 		if (tpm_get_timeouts(chip)) {
++ 			dev_err(dev, "Could not get TPM timeouts and durations\n");
++ 			rc = -ENODEV;
++ 			goto out_err;
++ 		}
++ 
++ 		if (tpm_do_selftest(chip)) {
++ 			dev_err(dev, "TPM self test failed\n");
++ 			rc = -ENODEV;
++ 			goto out_err;
++ 		}
+  	}
+  
+ -	return tpm_chip_register(chip);
+ +	INIT_LIST_HEAD(&chip->vendor.list);
+ +	mutex_lock(&tis_lock);
+ +	list_add(&chip->vendor.list, &tis_chips);
+ +	mutex_unlock(&tis_lock);
+ +
+ +
+ +	return 0;
+  out_err:
+ -	tpm_tis_remove(chip);
+ +	if (chip->vendor.iobase)
+ +		iounmap(chip->vendor.iobase);
+ +	tpm_remove_hardware(chip->dev);
+  	return rc;
+  }
+  
+* Unmerged path drivers/char/tpm/tpm_tis.c
