@@ -1,0 +1,163 @@
+ipv6: support IPV6_PMTU_INTERFACE on sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 93b36cf3425b9bd9c56df7680fb237686b9c82ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/93b36cf3.failed
+
+IPV6_PMTU_INTERFACE is the same as IPV6_PMTU_PROBE for ipv6. Add it
+nontheless for symmetry with IPv4 sockets. Also drop incoming MTU
+information if this mode is enabled.
+
+The additional bit in ipv6_pinfo just eats in the padding behind the
+bitfield. There are no changes to the layout of the struct at all.
+
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 93b36cf3425b9bd9c56df7680fb237686b9c82ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_output.c
+diff --cc net/ipv6/ip6_output.c
+index 67265a1c5199,bc4e1bcdf4c0..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -1299,7 -1270,8 +1299,12 @@@ alloc_new_skb
+  			if (skb == NULL || skb_prev == NULL)
+  				ip6_append_data_mtu(&mtu, &maxfraglen,
+  						    fragheaderlen, skb, rt,
+++<<<<<<< HEAD
+ +						    orig_mtu);
+++=======
++ 						    np->pmtudisc >=
++ 						    IPV6_PMTUDISC_PROBE);
+++>>>>>>> 93b36cf3425b (ipv6: support IPV6_PMTU_INTERFACE on sockets)
+  
+  			skb_prev = skb;
+  
+diff --git a/include/linux/ipv6.h b/include/linux/ipv6.h
+index 71911f61b29d..fa160038cb46 100644
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -189,7 +189,7 @@ struct ipv6_pinfo {
+ 	/* sockopt flags */
+ 	__u16			recverr:1,
+ 	                        sndflow:1,
+-				pmtudisc:2,
++				pmtudisc:3,
+ 				ipv6only:1,
+ 				srcprefs:3,	/* 001: prefer temporary address
+ 						 * 010: prefer public address
+diff --git a/include/net/ip6_route.h b/include/net/ip6_route.h
+index 2b786b7e3585..3594a08fb9fc 100644
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -190,10 +190,15 @@ static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+ {
+ 	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
+ 
+-	return (np && np->pmtudisc == IPV6_PMTUDISC_PROBE) ?
++	return (np && np->pmtudisc >= IPV6_PMTUDISC_PROBE) ?
+ 	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+ }
+ 
++static inline bool ip6_sk_accept_pmtu(const struct sock *sk)
++{
++	return inet6_sk(sk)->pmtudisc != IPV6_PMTUDISC_INTERFACE;
++}
++
+ static inline struct in6_addr *rt6_nexthop(struct rt6_info *rt)
+ {
+ 	return &rt->rt6i_gateway;
+diff --git a/include/uapi/linux/in6.h b/include/uapi/linux/in6.h
+index 53b1d56a6e7f..b37a14c79419 100644
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@ -166,6 +166,10 @@ struct in6_flowlabel_req {
+ #define IPV6_PMTUDISC_WANT		1
+ #define IPV6_PMTUDISC_DO		2
+ #define IPV6_PMTUDISC_PROBE		3
++/* same as IPV6_PMTUDISC_PROBE, provided for symetry with IPv4
++ * also see comments on IP_PMTUDISC_INTERFACE
++ */
++#define IPV6_PMTUDISC_INTERFACE		4
+ 
+ /* Flowlabel */
+ #define IPV6_FLOWLABEL_MGR	32
+diff --git a/net/dccp/ipv6.c b/net/dccp/ipv6.c
+index 4ac71ff7c2e4..b5ad684c6776 100644
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -141,6 +141,9 @@ static void dccp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 	if (type == ICMPV6_PKT_TOOBIG) {
+ 		struct dst_entry *dst = NULL;
+ 
++		if (!ip6_sk_accept_pmtu(sk))
++			goto out;
++
+ 		if (sock_owned_by_user(sk))
+ 			goto out;
+ 		if ((1 << sk->sk_state) & (DCCPF_LISTEN | DCCPF_CLOSED))
+* Unmerged path net/ipv6/ip6_output.c
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index 4919a8e6063e..156955be9eb9 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -722,7 +722,7 @@ done:
+ 	case IPV6_MTU_DISCOVER:
+ 		if (optlen < sizeof(int))
+ 			goto e_inval;
+-		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_PROBE)
++		if (val < IPV6_PMTUDISC_DONT || val > IPV6_PMTUDISC_INTERFACE)
+ 			goto e_inval;
+ 		np->pmtudisc = val;
+ 		retv = 0;
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index d94101e787b7..439f5cc37998 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -398,6 +398,9 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 		if (sk->sk_state == TCP_LISTEN)
+ 			goto out;
+ 
++		if (!ip6_sk_accept_pmtu(sk))
++			goto out;
++
+ 		tp->mtu_info = ntohl(info);
+ 		if (!sock_owned_by_user(sk))
+ 			tcp_v6_mtu_reduced(sk);
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index a3721963b0e9..aa1ed9cbd0b0 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -515,8 +515,11 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 	if (sk == NULL)
+ 		return;
+ 
+-	if (type == ICMPV6_PKT_TOOBIG)
++	if (type == ICMPV6_PKT_TOOBIG) {
++		if (!ip6_sk_accept_pmtu(sk))
++			goto out;
+ 		ip6_sk_update_pmtu(skb, sk, info);
++	}
+ 	if (type == NDISC_REDIRECT) {
+ 		ip6_sk_redirect(skb, sk);
+ 		goto out;
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index cdb16dc016fa..31442914d661 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -400,6 +400,9 @@ void sctp_icmp_frag_needed(struct sock *sk, struct sctp_association *asoc,
+ 	if (!t || (t->pathmtu <= pmtu))
+ 		return;
+ 
++	if (!ip6_sk_accept_pmtu(sk))
++		return;
++
+ 	if (sock_owned_by_user(sk)) {
+ 		asoc->pmtu_pending = 1;
+ 		t->pmtu_pending = 1;
