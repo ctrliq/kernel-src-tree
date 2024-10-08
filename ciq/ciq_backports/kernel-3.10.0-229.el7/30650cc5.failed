@@ -1,0 +1,165 @@
+i40e: quiet complaints when removing default MAC VLAN filter and make set_mac reversible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Shannon Nelson <shannon.nelson@intel.com>
+commit 30650cc552cf9a60fa80a205693c6f76f7a00549
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/30650cc5.failed
+
+Older firmware has an incorrect MAC VLAN filter that needs to be replaced
+at startup, and now newer firmware doesn't have this problem.  With this
+change we no longer complain if the remove fails, and we only add the
+new filter if the remove succeeded.
+
+Setting a new LAA worked the first time, but didn't work well in successive
+operations, including returning to the HW default address.  This simplifies
+the code that was trying to be too smart.
+
+Lastly, this pulls the hardware default mac address out into separate
+handling code and keeps the broadcast filtering from getting munged.
+
+Change-ID: I1f54b002def04ffef2546febb9a4044385452f85
+	Signed-off-by: Shannon Nelson <shannon.nelson@intel.com>
+	Tested-by: Jim Young <jamesx.m.young@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 30650cc552cf9a60fa80a205693c6f76f7a00549)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index ddcf956e6a2a,3216aa5e705e..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1257,11 -1399,12 +1265,15 @@@ static int i40e_set_mac(struct net_devi
+  	if (!is_valid_ether_addr(addr->sa_data))
+  		return -EADDRNOTAVAIL;
+  
+- 	netdev_info(netdev, "set mac address=%pM\n", addr->sa_data);
++ 	if (ether_addr_equal(netdev->dev_addr, addr->sa_data)) {
++ 		netdev_info(netdev, "already using mac address %pM\n",
++ 			    addr->sa_data);
++ 		return 0;
++ 	}
+  
+ +	if (ether_addr_equal(netdev->dev_addr, addr->sa_data))
+ +		return 0;
+ +
+  	if (test_bit(__I40E_DOWN, &vsi->back->state) ||
+  	    test_bit(__I40E_RESET_RECOVERY_PENDING, &vsi->back->state))
+  		return -EADDRNOTAVAIL;
+@@@ -1277,22 -1426,36 +1295,53 @@@
+  				    ret);
+  			return -EADDRNOTAVAIL;
+  		}
+ +
+ +		memcpy(vsi->back->hw.mac.addr, addr->sa_data, netdev->addr_len);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* In order to be sure to not drop any packets, add the new address
+ +	 * then delete the old one.
+ +	 */
+ +	f = i40e_add_filter(vsi, addr->sa_data, I40E_VLAN_ANY, false, false);
+ +	if (!f)
+ +		return -ENOMEM;
+ +
+ +	i40e_sync_vsi_filters(vsi);
+ +	i40e_del_filter(vsi, netdev->dev_addr, I40E_VLAN_ANY, false, false);
+ +	i40e_sync_vsi_filters(vsi);
+ +
+ +	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+++=======
++ 	if (ether_addr_equal(netdev->dev_addr, hw->mac.addr)) {
++ 		struct i40e_aqc_remove_macvlan_element_data element;
++ 
++ 		memset(&element, 0, sizeof(element));
++ 		ether_addr_copy(element.mac_addr, netdev->dev_addr);
++ 		element.flags = I40E_AQC_MACVLAN_DEL_PERFECT_MATCH;
++ 		i40e_aq_remove_macvlan(&pf->hw, vsi->seid, &element, 1, NULL);
++ 	} else {
++ 		i40e_del_filter(vsi, netdev->dev_addr, I40E_VLAN_ANY,
++ 				false, false);
++ 	}
++ 
++ 	if (ether_addr_equal(addr->sa_data, hw->mac.addr)) {
++ 		struct i40e_aqc_add_macvlan_element_data element;
++ 
++ 		memset(&element, 0, sizeof(element));
++ 		ether_addr_copy(element.mac_addr, hw->mac.addr);
++ 		element.flags = cpu_to_le16(I40E_AQC_MACVLAN_ADD_PERFECT_MATCH);
++ 		i40e_aq_add_macvlan(&pf->hw, vsi->seid, &element, 1, NULL);
++ 	} else {
++ 		f = i40e_add_filter(vsi, addr->sa_data, I40E_VLAN_ANY,
++ 				    false, false);
++ 		if (f)
++ 			f->is_laa = true;
++ 	}
++ 
++ 	i40e_sync_vsi_filters(vsi);
++ 	ether_addr_copy(netdev->dev_addr, addr->sa_data);
+++>>>>>>> 30650cc552cf (i40e: quiet complaints when removing default MAC VLAN filter and make set_mac reversible)
+  
+  	return 0;
+  }
+@@@ -7053,15 -7537,15 +7101,24 @@@ static int i40e_config_netdev(struct i4
+  
+  	if (vsi->type == I40E_VSI_MAIN) {
+  		SET_NETDEV_DEV(netdev, &pf->pdev->dev);
+++<<<<<<< HEAD
+ +		memcpy(mac_addr, hw->mac.perm_addr, ETH_ALEN);
+ +		/* The following two steps are necessary to prevent reception
+ +		 * of tagged packets - by default the NVM loads a MAC-VLAN
+ +		 * filter that will accept any tagged packet.  This is to
+ +		 * prevent that during normal operations until a specific
+ +		 * VLAN tag filter has been set.
+++=======
++ 		ether_addr_copy(mac_addr, hw->mac.perm_addr);
++ 		/* The following steps are necessary to prevent reception
++ 		 * of tagged packets - some older NVM configurations load a
++ 		 * default a MAC-VLAN filter that accepts any tagged packet
++ 		 * which must be replaced by a normal filter.
+++>>>>>>> 30650cc552cf (i40e: quiet complaints when removing default MAC VLAN filter and make set_mac reversible)
+  		 */
+- 		i40e_rm_default_mac_filter(vsi, mac_addr);
+- 		i40e_add_filter(vsi, mac_addr, I40E_VLAN_ANY, false, true);
++ 		if (!i40e_rm_default_mac_filter(vsi, mac_addr))
++ 			i40e_add_filter(vsi, mac_addr,
++ 					I40E_VLAN_ANY, false, true);
+  	} else {
+  		/* relate the VSI_VMDQ name to the VSI_MAIN name */
+  		snprintf(netdev->name, IFNAMSIZ, "%sv%%d",
+@@@ -7263,6 -7759,27 +7320,30 @@@ static int i40e_add_vsi(struct i40e_vs
+  	list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+  		f->changed = true;
+  		f_count++;
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (f->is_laa && vsi->type == I40E_VSI_MAIN) {
++ 			struct i40e_aqc_remove_macvlan_element_data element;
++ 
++ 			memset(&element, 0, sizeof(element));
++ 			ether_addr_copy(element.mac_addr, f->macaddr);
++ 			element.flags = I40E_AQC_MACVLAN_DEL_PERFECT_MATCH;
++ 			ret = i40e_aq_remove_macvlan(hw, vsi->seid,
++ 						     &element, 1, NULL);
++ 			if (ret) {
++ 				/* some older FW has a different default */
++ 				element.flags |=
++ 					       I40E_AQC_MACVLAN_DEL_IGNORE_VLAN;
++ 				i40e_aq_remove_macvlan(hw, vsi->seid,
++ 						       &element, 1, NULL);
++ 			}
++ 
++ 			i40e_aq_mac_address_write(hw,
++ 						  I40E_AQC_WRITE_TYPE_LAA_WOL,
++ 						  f->macaddr, NULL);
++ 		}
+++>>>>>>> 30650cc552cf (i40e: quiet complaints when removing default MAC VLAN filter and make set_mac reversible)
+  	}
+  	if (f_count) {
+  		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
