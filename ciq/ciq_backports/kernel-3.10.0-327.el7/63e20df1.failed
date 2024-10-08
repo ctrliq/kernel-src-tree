@@ -1,0 +1,880 @@
+ALSA: line6: Reorganize PCM stream handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [alsa] line6: Reorganize PCM stream handling (Jaroslav Kysela) [1197064]
+Rebuild_FUZZ: 92.50%
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 63e20df1e5b2ef8d871ecbdb6c038d554ed1ca74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/63e20df1.failed
+
+The current code deals with the stream start / stop solely via
+line6_pcm_acquire() and line6_pcm_release().  This was (supposedly)
+intended to avoid the races, but it doesn't work as expected.  The
+concurrent acquire and release calls can be performed without proper
+protections, thus this might result in memory corruption.
+Furthermore, we can't take a mutex to protect the whole function
+because it can be called from the PCM trigger callback that is an
+atomic context.  Also spinlock isn't appropriate because the function
+allocates with kmalloc with GFP_KERNEL.  That is, these function just
+lead to singular problems.
+
+This is an attempt to reduce the existing races.  First off, separate
+both the stream buffer management and the stream URB management.  The
+former is protected via a newly introduced state_mutex while the
+latter is protected via each line6_pcm_stream lock.
+
+Secondly, the stream state are now managed in opened and running bit
+flags of each line6_pcm_stream.  Not only this a bit clearer than
+previous combined bit flags, this also gives a better abstraction.
+These rewrites allows us to make common hw_params and hw_free
+callbacks for both playback and capture directions.
+
+For the monitor and impulse operations, still line6_pcm_acquire() and
+line6_pcm_release() are used.  They call internally the corresponding
+functions for both playback and capture streams with proper lock or
+mutex.  Unlike the previous versions, these function don't take the
+bit masks but the only single type value.  Also they are supposed to
+be applied only as duplex operations.
+
+	Tested-by: Chris Rorvick <chris@rorvick.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 63e20df1e5b2ef8d871ecbdb6c038d554ed1ca74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/line6/capture.c
+#	drivers/staging/line6/capture.h
+#	drivers/staging/line6/pcm.h
+#	drivers/staging/line6/playback.c
+#	drivers/staging/line6/playback.h
+#	drivers/staging/line6/toneport.c
+#	sound/usb/line6/pcm.c
+diff --cc drivers/staging/line6/capture.c
+index 7ed8560f3c0a,7b8186b6c0e4..000000000000
+--- a/drivers/staging/line6/capture.c
++++ b/drivers/staging/line6/capture.c
+@@@ -75,66 -71,15 +76,74 @@@ static int submit_audio_in_urb(struct s
+  */
+  int line6_submit_audio_in_all_urbs(struct snd_line6_pcm *line6pcm)
+  {
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +	int ret, i;
+++=======
++ 	int ret = 0, i;
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.c
+  
+  	for (i = 0; i < LINE6_ISO_BUFFERS; ++i) {
+  		ret = submit_audio_in_urb(line6pcm);
+  		if (ret < 0)
+ -			break;
+ +			return ret;
+ +	}
+ +
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +	return 0;
+ +}
+ +
+ +/*
+ +	Unlink all currently active capture URBs.
+ +*/
+ +void line6_unlink_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = LINE6_ISO_BUFFERS; i--;) {
+ +		if (test_bit(i, &line6pcm->active_urb_in)) {
+ +			if (!test_and_set_bit(i, &line6pcm->unlink_urb_in)) {
+ +				struct urb *u = line6pcm->urb_audio_in[i];
+ +				usb_unlink_urb(u);
+ +			}
+ +		}
+  	}
+ +}
+  
+ +/*
+ +	Wait until unlinking of all currently active capture URBs has been
+ +	finished.
+ +*/
+ +void line6_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	int timeout = HZ;
+ +	unsigned int i;
+ +	int alive;
+ +
+ +	do {
+ +		alive = 0;
+ +		for (i = LINE6_ISO_BUFFERS; i--;) {
+ +			if (test_bit(i, &line6pcm->active_urb_in))
+ +				alive++;
+ +		}
+ +		if (!alive)
+ +			break;
+ +		set_current_state(TASK_UNINTERRUPTIBLE);
+ +		schedule_timeout(1);
+ +	} while (--timeout > 0);
+ +	if (alive)
+ +		snd_printk(KERN_ERR "timeout: still %d active urbs..\n", alive);
+ +}
+ +
+ +/*
+ +	Unlink all currently active capture URBs, and wait for finishing.
+ +*/
+ +void line6_unlink_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	line6_unlink_audio_in_urbs(line6pcm);
+ +	line6_wait_clear_audio_in_urbs(line6pcm);
+++=======
++ 	return ret;
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.c
+  }
+  
+  /*
+@@@ -243,31 -185,26 +252,44 @@@ static void audio_in_callback(struct ur
+  		line6pcm->prev_fbuf = fbuf;
+  		line6pcm->prev_fsize = fsize;
+  
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +		if (!(line6pcm->flags & LINE6_BITS_PCM_IMPULSE))
+ +#endif
+ +			if (test_bit(LINE6_INDEX_PCM_ALSA_CAPTURE_STREAM,
+ +				     &line6pcm->flags) && (fsize > 0))
+ +				line6_capture_copy(line6pcm, fbuf, fsize);
+++=======
++ 		if (!test_bit(LINE6_STREAM_IMPULSE, &line6pcm->in.running) &&
++ 		    test_bit(LINE6_STREAM_PCM, &line6pcm->in.running) &&
++ 		    fsize > 0)
++ 			line6_capture_copy(line6pcm, fbuf, fsize);
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.c
+  	}
+  
+ -	clear_bit(index, &line6pcm->in.active_urbs);
+ +	clear_bit(index, &line6pcm->active_urb_in);
+  
+ -	if (test_and_clear_bit(index, &line6pcm->in.unlink_urbs))
+ +	if (test_and_clear_bit(index, &line6pcm->unlink_urb_in))
+  		shutdown = 1;
+  
+ +	spin_unlock_irqrestore(&line6pcm->lock_audio_in, flags);
+ +
+  	if (!shutdown) {
+  		submit_audio_in_urb(line6pcm);
+  
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +		if (!(line6pcm->flags & LINE6_BITS_PCM_IMPULSE))
+ +#endif
+ +			if (test_bit(LINE6_INDEX_PCM_ALSA_CAPTURE_STREAM,
+ +				     &line6pcm->flags))
+ +				line6_capture_check_period(line6pcm, length);
+++=======
++ 		if (!test_bit(LINE6_STREAM_IMPULSE, &line6pcm->in.running) &&
++ 		    test_bit(LINE6_STREAM_PCM, &line6pcm->in.running))
++ 			line6_capture_check_period(line6pcm, length);
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.c
+  	}
+ -
+ -	spin_unlock_irqrestore(&line6pcm->in.lock, flags);
+  }
+  
+  /* open capture callback */
+@@@ -294,70 -231,6 +316,73 @@@ static int snd_line6_capture_close(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/line6/capture.c
+ +/* hw_params capture callback */
+ +static int snd_line6_capture_hw_params(struct snd_pcm_substream *substream,
+ +				       struct snd_pcm_hw_params *hw_params)
+ +{
+ +	int ret;
+ +	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
+ +
+ +	ret = line6_pcm_acquire(line6pcm, LINE6_BIT_PCM_ALSA_CAPTURE_BUFFER);
+ +
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	ret = snd_pcm_lib_malloc_pages(substream,
+ +				       params_buffer_bytes(hw_params));
+ +	if (ret < 0) {
+ +		line6_pcm_release(line6pcm, LINE6_BIT_PCM_ALSA_CAPTURE_BUFFER);
+ +		return ret;
+ +	}
+ +
+ +	line6pcm->period_in = params_period_bytes(hw_params);
+ +	return 0;
+ +}
+ +
+ +/* hw_free capture callback */
+ +static int snd_line6_capture_hw_free(struct snd_pcm_substream *substream)
+ +{
+ +	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
+ +	line6_pcm_release(line6pcm, LINE6_BIT_PCM_ALSA_CAPTURE_BUFFER);
+ +	return snd_pcm_lib_free_pages(substream);
+ +}
+ +
+ +/* trigger callback */
+ +int snd_line6_capture_trigger(struct snd_line6_pcm *line6pcm, int cmd)
+ +{
+ +	int err;
+ +
+ +	switch (cmd) {
+ +	case SNDRV_PCM_TRIGGER_START:
+ +	case SNDRV_PCM_TRIGGER_RESUME:
+ +		err = line6_pcm_acquire(line6pcm,
+ +					LINE6_BIT_PCM_ALSA_CAPTURE_STREAM);
+ +
+ +		if (err < 0)
+ +			return err;
+ +
+ +		break;
+ +
+ +	case SNDRV_PCM_TRIGGER_STOP:
+ +	case SNDRV_PCM_TRIGGER_SUSPEND:
+ +		err = line6_pcm_release(line6pcm,
+ +					LINE6_BIT_PCM_ALSA_CAPTURE_STREAM);
+ +
+ +		if (err < 0)
+ +			return err;
+ +
+ +		break;
+ +
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.c
+  /* capture pointer callback */
+  static snd_pcm_uframes_t
+  snd_line6_capture_pointer(struct snd_pcm_substream *substream)
+diff --cc drivers/staging/line6/capture.h
+index 4157bcb598a9,890b21bff18c..000000000000
+--- a/drivers/staging/line6/capture.h
++++ b/drivers/staging/line6/capture.h
+@@@ -24,12 -24,6 +24,15 @@@ extern void line6_capture_copy(struct s
+  extern void line6_capture_check_period(struct snd_line6_pcm *line6pcm,
+  				       int length);
+  extern int line6_create_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+ +extern void line6_free_capture_buffer(struct snd_line6_pcm *line6pcm);
+  extern int line6_submit_audio_in_all_urbs(struct snd_line6_pcm *line6pcm);
+++<<<<<<< HEAD:drivers/staging/line6/capture.h
+ +extern void line6_unlink_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+ +extern void line6_unlink_wait_clear_audio_in_urbs(struct snd_line6_pcm
+ +						  *line6pcm);
+ +extern void line6_wait_clear_audio_in_urbs(struct snd_line6_pcm *line6pcm);
+ +extern int snd_line6_capture_trigger(struct snd_line6_pcm *line6pcm, int cmd);
+++=======
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/capture.h
+  
+  #endif
+diff --cc drivers/staging/line6/pcm.h
+index 6aa0d46a2890,66f603dfa34e..000000000000
+--- a/drivers/staging/line6/pcm.h
++++ b/drivers/staging/line6/pcm.h
+@@@ -56,121 -54,33 +56,127 @@@
+  	However, from the device's point of view, there is just a single
+  	capture and playback stream, which must be shared between these
+  	subsystems. It is therefore necessary to maintain the state of the
+- 	subsystems with respect to PCM usage. We define several constants of
+- 	the form LINE6_BIT_PCM_<subsystem>_<direction>_<resource> with the
+- 	following meanings:
+- 	*) <subsystem> is one of
+- 	-) ALSA: PCM playback and capture via ALSA
+- 	-) MONITOR: software monitoring
+- 	-) IMPULSE: optional impulse response measurement
+- 	*) <direction> is one of
+- 	-) PLAYBACK: audio output (from host to device)
+- 	-) CAPTURE: audio input (from device to host)
+- 	*) <resource> is one of
+- 	-) BUFFER: buffer required by PCM data stream
+- 	-) STREAM: actual PCM data stream
+- 
+- 	The subsystems call line6_pcm_acquire() to acquire the (shared)
+- 	resources needed for a particular operation (e.g., allocate the buffer
+- 	for ALSA playback or start the capture stream for software monitoring).
+- 	When a resource is no longer needed, it is released by calling
+- 	line6_pcm_release(). Buffer allocation and stream startup are handled
+- 	separately to allow the ALSA kernel driver to perform them at
+- 	appropriate places (since the callback which starts a PCM stream is not
+- 	allowed to sleep).
++ 	subsystems with respect to PCM usage.
++ 
++ 	We define two bit flags, "opened" and "running", for each playback
++ 	or capture stream.  Both can contain the bit flag corresponding to
++ 	LINE6_STREAM_* type,
++ 	  LINE6_STREAM_PCM = ALSA PCM playback or capture
++ 	  LINE6_STREAM_MONITOR = software monitoring
++ 	  IMPULSE = optional impulse response measurement
++ 	The opened flag indicates whether the buffer is allocated while
++ 	the running flag indicates whether the stream is running.
++ 
++ 	For monitor or impulse operations, the driver needs to call
++ 	snd_line6_duplex_acquire() or snd_line6_duplex_release() with the
++ 	appropriate LINE6_STREAM_* flag.
+  */
++ 
++ /* stream types */
+  enum {
+++<<<<<<< HEAD:drivers/staging/line6/pcm.h
+ +	/* individual bit indices: */
+ +	LINE6_INDEX_PCM_ALSA_PLAYBACK_BUFFER,
+ +	LINE6_INDEX_PCM_ALSA_PLAYBACK_STREAM,
+ +	LINE6_INDEX_PCM_ALSA_CAPTURE_BUFFER,
+ +	LINE6_INDEX_PCM_ALSA_CAPTURE_STREAM,
+ +	LINE6_INDEX_PCM_MONITOR_PLAYBACK_BUFFER,
+ +	LINE6_INDEX_PCM_MONITOR_PLAYBACK_STREAM,
+ +	LINE6_INDEX_PCM_MONITOR_CAPTURE_BUFFER,
+ +	LINE6_INDEX_PCM_MONITOR_CAPTURE_STREAM,
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	LINE6_INDEX_PCM_IMPULSE_PLAYBACK_BUFFER,
+ +	LINE6_INDEX_PCM_IMPULSE_PLAYBACK_STREAM,
+ +	LINE6_INDEX_PCM_IMPULSE_CAPTURE_BUFFER,
+ +	LINE6_INDEX_PCM_IMPULSE_CAPTURE_STREAM,
+ +#endif
+ +	LINE6_INDEX_PAUSE_PLAYBACK,
+ +	LINE6_INDEX_PREPARED,
+ +
+ +	/* individual bit masks: */
+ +	LINE6_BIT(PCM_ALSA_PLAYBACK_BUFFER),
+ +	LINE6_BIT(PCM_ALSA_PLAYBACK_STREAM),
+ +	LINE6_BIT(PCM_ALSA_CAPTURE_BUFFER),
+ +	LINE6_BIT(PCM_ALSA_CAPTURE_STREAM),
+ +	LINE6_BIT(PCM_MONITOR_PLAYBACK_BUFFER),
+ +	LINE6_BIT(PCM_MONITOR_PLAYBACK_STREAM),
+ +	LINE6_BIT(PCM_MONITOR_CAPTURE_BUFFER),
+ +	LINE6_BIT(PCM_MONITOR_CAPTURE_STREAM),
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	LINE6_BIT(PCM_IMPULSE_PLAYBACK_BUFFER),
+ +	LINE6_BIT(PCM_IMPULSE_PLAYBACK_STREAM),
+ +	LINE6_BIT(PCM_IMPULSE_CAPTURE_BUFFER),
+ +	LINE6_BIT(PCM_IMPULSE_CAPTURE_STREAM),
+ +#endif
+ +	LINE6_BIT(PAUSE_PLAYBACK),
+ +	LINE6_BIT(PREPARED),
+ +
+ +	/* combined bit masks (by operation): */
+ +	LINE6_BITS_PCM_ALSA_BUFFER =
+ +	    LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER |
+ +	    LINE6_BIT_PCM_ALSA_CAPTURE_BUFFER,
+ +
+ +	LINE6_BITS_PCM_ALSA_STREAM =
+ +	    LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM |
+ +	    LINE6_BIT_PCM_ALSA_CAPTURE_STREAM,
+ +
+ +	LINE6_BITS_PCM_MONITOR =
+ +	    LINE6_BIT_PCM_MONITOR_PLAYBACK_BUFFER |
+ +	    LINE6_BIT_PCM_MONITOR_PLAYBACK_STREAM |
+ +	    LINE6_BIT_PCM_MONITOR_CAPTURE_BUFFER |
+ +	    LINE6_BIT_PCM_MONITOR_CAPTURE_STREAM,
+ +
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	LINE6_BITS_PCM_IMPULSE =
+ +	    LINE6_BIT_PCM_IMPULSE_PLAYBACK_BUFFER |
+ +	    LINE6_BIT_PCM_IMPULSE_PLAYBACK_STREAM |
+ +	    LINE6_BIT_PCM_IMPULSE_CAPTURE_BUFFER |
+ +	    LINE6_BIT_PCM_IMPULSE_CAPTURE_STREAM,
+ +#endif
+ +
+ +	/* combined bit masks (by direction): */
+ +	LINE6_BITS_PLAYBACK_BUFFER =
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	    LINE6_BIT_PCM_IMPULSE_PLAYBACK_BUFFER |
+ +#endif
+ +	    LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER |
+ +	    LINE6_BIT_PCM_MONITOR_PLAYBACK_BUFFER ,
+ +
+ +	LINE6_BITS_PLAYBACK_STREAM =
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	    LINE6_BIT_PCM_IMPULSE_PLAYBACK_STREAM |
+ +#endif
+ +	    LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM |
+ +	    LINE6_BIT_PCM_MONITOR_PLAYBACK_STREAM ,
+ +
+ +	LINE6_BITS_CAPTURE_BUFFER =
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	    LINE6_BIT_PCM_IMPULSE_CAPTURE_BUFFER |
+ +#endif
+ +	    LINE6_BIT_PCM_ALSA_CAPTURE_BUFFER |
+ +	    LINE6_BIT_PCM_MONITOR_CAPTURE_BUFFER ,
+ +
+ +	LINE6_BITS_CAPTURE_STREAM =
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +	    LINE6_BIT_PCM_IMPULSE_CAPTURE_STREAM |
+ +#endif
+ +	    LINE6_BIT_PCM_ALSA_CAPTURE_STREAM |
+ +	    LINE6_BIT_PCM_MONITOR_CAPTURE_STREAM,
+ +
+ +	LINE6_BITS_STREAM =
+ +	    LINE6_BITS_PLAYBACK_STREAM |
+ +	    LINE6_BITS_CAPTURE_STREAM
+++=======
++ 	LINE6_STREAM_PCM,
++ 	LINE6_STREAM_MONITOR,
++ 	LINE6_STREAM_IMPULSE,
++ };
++ 
++ /* misc bit flags for PCM operation */
++ enum {
++ 	LINE6_FLAG_PAUSE_PLAYBACK,
++ 	LINE6_FLAG_PREPARED,
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/pcm.h
+  };
+  
+  struct line6_pcm_properties {
+@@@ -179,9 -89,58 +185,61 @@@
+  	int bytes_per_frame;
+  };
+  
+++<<<<<<< HEAD:drivers/staging/line6/pcm.h
+++=======
++ struct line6_pcm_stream {
++ 	/* allocated URBs */
++ 	struct urb *urbs[LINE6_ISO_BUFFERS];
++ 
++ 	/* Temporary buffer;
++ 	 * Since the packet size is not known in advance, this buffer is
++ 	 * large enough to store maximum size packets.
++ 	 */
++ 	unsigned char *buffer;
++ 
++ 	/* Free frame position in the buffer. */
++ 	snd_pcm_uframes_t pos;
++ 
++ 	/* Count processed bytes;
++ 	 * This is modulo period size (to determine when a period is finished).
++ 	 */
++ 	unsigned bytes;
++ 
++ 	/* Counter to create desired sample rate */
++ 	unsigned count;
++ 
++ 	/* period size in bytes */
++ 	unsigned period;
++ 
++ 	/* Processed frame position in the buffer;
++ 	 * The contents of the ring buffer have been consumed by the USB
++ 	 * subsystem (i.e., sent to the USB device) up to this position.
++ 	 */
++ 	snd_pcm_uframes_t pos_done;
++ 
++ 	/* Bit mask of active URBs */
++ 	unsigned long active_urbs;
++ 
++ 	/* Bit mask of URBs currently being unlinked */
++ 	unsigned long unlink_urbs;
++ 
++ 	/* Spin lock to protect updates of the buffer positions (not contents)
++ 	 */
++ 	spinlock_t lock;
++ 
++ 	/* Bit flags for operational stream types */
++ 	unsigned long opened;
++ 
++ 	/* Bit flags for running stream types */
++ 	unsigned long running;
++ 
++ 	int last_frame;
++ };
++ 
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/pcm.h
+  struct snd_line6_pcm {
+  	/**
+ -		 Pointer back to the Line 6 driver data structure.
+ +		 Pointer back to the Line6 driver data structure.
+  	*/
+  	struct usb_line6 *line6;
+  
+@@@ -195,29 -154,12 +253,38 @@@
+  	*/
+  	struct snd_pcm *pcm;
+  
+++<<<<<<< HEAD:drivers/staging/line6/pcm.h
+ +	/**
+ +		 URBs for audio playback.
+ +	*/
+ +	struct urb *urb_audio_out[LINE6_ISO_BUFFERS];
+ +
+ +	/**
+ +		 URBs for audio capture.
+ +	*/
+ +	struct urb *urb_audio_in[LINE6_ISO_BUFFERS];
+ +
+ +	/**
+ +		 Temporary buffer for playback.
+ +		 Since the packet size is not known in advance, this buffer is
+ +		 large enough to store maximum size packets.
+ +	*/
+ +	unsigned char *buffer_out;
+ +
+ +	/**
+ +		 Temporary buffer for capture.
+ +		 Since the packet size is not known in advance, this buffer is
+ +		 large enough to store maximum size packets.
+ +	*/
+ +	unsigned char *buffer_in;
+++=======
++ 	/* protection to state changes of in/out streams */
++ 	struct mutex state_mutex;
++ 
++ 	/* Capture and playback streams */
++ 	struct line6_pcm_stream in;
++ 	struct line6_pcm_stream out;
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/pcm.h
+  
+  	/**
+  		 Previously captured frame (for software monitoring).
+@@@ -361,14 -200,11 +428,14 @@@
+  		 Counter for impulse response test signal.
+  	*/
+  	int impulse_count;
+ +#endif
+  
+  	/**
+- 		 Several status bits (see LINE6_BIT_*).
++ 		 Several status bits (see LINE6_FLAG_*).
+  	*/
+  	unsigned long flags;
+ +
+ +	int last_frame_in, last_frame_out;
+  };
+  
+  extern int line6_init_pcm(struct usb_line6 *line6,
+diff --cc drivers/staging/line6/playback.c
+index f97584b88a0d,f8b04e2d36b3..000000000000
+--- a/drivers/staging/line6/playback.c
++++ b/drivers/staging/line6/playback.c
+@@@ -239,28 -237,22 +239,42 @@@ static int submit_audio_out_urb(struct 
+  		       urb_out->transfer_buffer_length);
+  	}
+  
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +	change_volume(urb_out, line6pcm->volume_playback, bytes_per_frame);
+ +
+ +	if (line6pcm->prev_fbuf != NULL) {
+ +#ifdef CONFIG_LINE6_USB_IMPULSE_RESPONSE
+ +		if (line6pcm->flags & LINE6_BITS_PCM_IMPULSE) {
+ +			create_impulse_test_signal(line6pcm, urb_out,
+ +						   bytes_per_frame);
+ +			if (line6pcm->flags & LINE6_BIT_PCM_ALSA_CAPTURE_STREAM) {
+++=======
++ 	spin_lock_nested(&line6pcm->in.lock, SINGLE_DEPTH_NESTING);
++ 	if (line6pcm->prev_fbuf) {
++ 		if (test_bit(LINE6_STREAM_IMPULSE, &line6pcm->out.running)) {
++ 			create_impulse_test_signal(line6pcm, urb_out,
++ 						   bytes_per_frame);
++ 			if (test_bit(LINE6_STREAM_PCM, &line6pcm->in.running)) {
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  				line6_capture_copy(line6pcm,
+  						   urb_out->transfer_buffer,
+  						   urb_out->
+  						   transfer_buffer_length);
+  				line6_capture_check_period(line6pcm,
+ -					urb_out->transfer_buffer_length);
+ +							   urb_out->transfer_buffer_length);
+  			}
+  		} else {
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +#endif
+ +			if (!
+ +			    (line6pcm->line6->
+ +			     properties->capabilities & LINE6_BIT_HWMON)
+ +			    && (line6pcm->flags & LINE6_BITS_PLAYBACK_STREAM)
+ +			    && (line6pcm->flags & LINE6_BITS_CAPTURE_STREAM))
+++=======
++ 			if (!(line6pcm->line6->properties->capabilities & LINE6_CAP_HWMON)
++ 			    && line6pcm->out.running && line6pcm->in.running)
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  				add_monitor_signal(urb_out, line6pcm->prev_fbuf,
+  						   line6pcm->volume_monitor,
+  						   bytes_per_frame);
+@@@ -283,75 -275,19 +297,84 @@@
+  
+  /*
+  	Submit all currently available playback URBs.
+- */
++ 	must be called in line6pcm->out.lock context
++  */
+  int line6_submit_audio_out_all_urbs(struct snd_line6_pcm *line6pcm)
+  {
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +	int ret, i;
+++=======
++ 	int ret = 0, i;
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  
+  	for (i = 0; i < LINE6_ISO_BUFFERS; ++i) {
+  		ret = submit_audio_out_urb(line6pcm);
+  		if (ret < 0)
+ -			break;
+ +			return ret;
+  	}
+  
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +	return 0;
+ +}
+ +
+ +/*
+ +	Unlink all currently active playback URBs.
+ +*/
+ +void line6_unlink_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = LINE6_ISO_BUFFERS; i--;) {
+ +		if (test_bit(i, &line6pcm->active_urb_out)) {
+ +			if (!test_and_set_bit(i, &line6pcm->unlink_urb_out)) {
+ +				struct urb *u = line6pcm->urb_audio_out[i];
+ +				usb_unlink_urb(u);
+ +			}
+ +		}
+ +	}
+ +}
+ +
+ +/*
+ +	Wait until unlinking of all currently active playback URBs has been
+ +	finished.
+ +*/
+ +void line6_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	int timeout = HZ;
+ +	unsigned int i;
+ +	int alive;
+ +
+ +	do {
+ +		alive = 0;
+ +		for (i = LINE6_ISO_BUFFERS; i--;) {
+ +			if (test_bit(i, &line6pcm->active_urb_out))
+ +				alive++;
+ +		}
+ +		if (!alive)
+ +			break;
+ +		set_current_state(TASK_UNINTERRUPTIBLE);
+ +		schedule_timeout(1);
+ +	} while (--timeout > 0);
+ +	if (alive)
+ +		snd_printk(KERN_ERR "timeout: still %d active urbs..\n", alive);
+ +}
+ +
+ +/*
+ +	Unlink all currently active playback URBs, and wait for finishing.
+ +*/
+ +void line6_unlink_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm)
+ +{
+ +	line6_unlink_audio_out_urbs(line6pcm);
+ +	line6_wait_clear_audio_out_urbs(line6pcm);
+ +}
+ +
+ +void line6_free_playback_buffer(struct snd_line6_pcm *line6pcm)
+ +{
+ +	kfree(line6pcm->buffer_out);
+ +	line6pcm->buffer_out = NULL;
+++=======
++ 	return ret;
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  }
+  
+  /*
+@@@ -370,33 -305,34 +393,33 @@@ static void audio_out_callback(struct u
+  	memset(urb->transfer_buffer, 0, urb->transfer_buffer_length);
+  #endif
+  
+ -	line6pcm->out.last_frame = urb->start_frame;
+ +	line6pcm->last_frame_out = urb->start_frame;
+  
+  	/* find index of URB */
+ -	for (index = 0; index < LINE6_ISO_BUFFERS; index++)
+ -		if (urb == line6pcm->out.urbs[index])
+ +	for (index = LINE6_ISO_BUFFERS; index--;)
+ +		if (urb == line6pcm->urb_audio_out[index])
+  			break;
+  
+ -	if (index >= LINE6_ISO_BUFFERS)
+ +	if (index < 0)
+  		return;		/* URB has been unlinked asynchronously */
+  
+ -	for (i = 0; i < LINE6_ISO_PACKETS; i++)
+ +	for (i = LINE6_ISO_PACKETS; i--;)
+  		length += urb->iso_frame_desc[i].length;
+  
+ -	spin_lock_irqsave(&line6pcm->out.lock, flags);
+ +	spin_lock_irqsave(&line6pcm->lock_audio_out, flags);
+  
+- 	if (test_bit(LINE6_INDEX_PCM_ALSA_PLAYBACK_STREAM, &line6pcm->flags)) {
++ 	if (test_bit(LINE6_STREAM_PCM, &line6pcm->out.running)) {
+  		struct snd_pcm_runtime *runtime = substream->runtime;
+ -
+ -		line6pcm->out.pos_done +=
+ +		line6pcm->pos_out_done +=
+  		    length / line6pcm->properties->bytes_per_frame;
+  
+ -		if (line6pcm->out.pos_done >= runtime->buffer_size)
+ -			line6pcm->out.pos_done -= runtime->buffer_size;
+ +		if (line6pcm->pos_out_done >= runtime->buffer_size)
+ +			line6pcm->pos_out_done -= runtime->buffer_size;
+  	}
+  
+ -	clear_bit(index, &line6pcm->out.active_urbs);
+ +	clear_bit(index, &line6pcm->active_urb_out);
+  
+ -	for (i = 0; i < LINE6_ISO_PACKETS; i++)
+ +	for (i = LINE6_ISO_PACKETS; i--;)
+  		if (urb->iso_frame_desc[i].status == -EXDEV) {
+  			shutdown = 1;
+  			break;
+@@@ -410,12 -344,13 +433,20 @@@
+  	if (!shutdown) {
+  		submit_audio_out_urb(line6pcm);
+  
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +		if (test_bit(LINE6_INDEX_PCM_ALSA_PLAYBACK_STREAM,
+ +			     &line6pcm->flags)) {
+ +			line6pcm->bytes_out += length;
+ +			if (line6pcm->bytes_out >= line6pcm->period_out) {
+ +				line6pcm->bytes_out %= line6pcm->period_out;
+++=======
++ 		if (test_bit(LINE6_STREAM_PCM, &line6pcm->out.running)) {
++ 			line6pcm->out.bytes += length;
++ 			if (line6pcm->out.bytes >= line6pcm->out.period) {
++ 				line6pcm->out.bytes %= line6pcm->out.period;
++ 				spin_unlock(&line6pcm->out.lock);
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  				snd_pcm_period_elapsed(substream);
+ -				spin_lock(&line6pcm->out.lock);
+  			}
+  		}
+  	}
+@@@ -444,78 -380,6 +475,81 @@@ static int snd_line6_playback_close(str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/staging/line6/playback.c
+ +/* hw_params playback callback */
+ +static int snd_line6_playback_hw_params(struct snd_pcm_substream *substream,
+ +					struct snd_pcm_hw_params *hw_params)
+ +{
+ +	int ret;
+ +	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
+ +
+ +	ret = line6_pcm_acquire(line6pcm, LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER);
+ +
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	ret = snd_pcm_lib_malloc_pages(substream,
+ +				       params_buffer_bytes(hw_params));
+ +	if (ret < 0) {
+ +		line6_pcm_release(line6pcm, LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER);
+ +		return ret;
+ +	}
+ +
+ +	line6pcm->period_out = params_period_bytes(hw_params);
+ +	return 0;
+ +}
+ +
+ +/* hw_free playback callback */
+ +static int snd_line6_playback_hw_free(struct snd_pcm_substream *substream)
+ +{
+ +	struct snd_line6_pcm *line6pcm = snd_pcm_substream_chip(substream);
+ +	line6_pcm_release(line6pcm, LINE6_BIT_PCM_ALSA_PLAYBACK_BUFFER);
+ +	return snd_pcm_lib_free_pages(substream);
+ +}
+ +
+ +/* trigger playback callback */
+ +int snd_line6_playback_trigger(struct snd_line6_pcm *line6pcm, int cmd)
+ +{
+ +	int err;
+ +
+ +	switch (cmd) {
+ +	case SNDRV_PCM_TRIGGER_START:
+ +	case SNDRV_PCM_TRIGGER_RESUME:
+ +		err = line6_pcm_acquire(line6pcm,
+ +					LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM);
+ +
+ +		if (err < 0)
+ +			return err;
+ +
+ +		break;
+ +
+ +	case SNDRV_PCM_TRIGGER_STOP:
+ +	case SNDRV_PCM_TRIGGER_SUSPEND:
+ +		err = line6_pcm_release(line6pcm,
+ +					LINE6_BIT_PCM_ALSA_PLAYBACK_STREAM);
+ +
+ +		if (err < 0)
+ +			return err;
+ +
+ +		break;
+ +
+ +	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ +		set_bit(LINE6_INDEX_PAUSE_PLAYBACK, &line6pcm->flags);
+ +		break;
+ +
+ +	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ +		clear_bit(LINE6_INDEX_PAUSE_PLAYBACK, &line6pcm->flags);
+ +		break;
+ +
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.c
+  /* playback pointer callback */
+  static snd_pcm_uframes_t
+  snd_line6_playback_pointer(struct snd_pcm_substream *substream)
+diff --cc drivers/staging/line6/playback.h
+index 743bd6f74c57,51fce29e8726..000000000000
+--- a/drivers/staging/line6/playback.h
++++ b/drivers/staging/line6/playback.h
+@@@ -30,12 -30,6 +30,15 @@@
+  extern struct snd_pcm_ops snd_line6_playback_ops;
+  
+  extern int line6_create_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+ +extern void line6_free_playback_buffer(struct snd_line6_pcm *line6pcm);
+  extern int line6_submit_audio_out_all_urbs(struct snd_line6_pcm *line6pcm);
+++<<<<<<< HEAD:drivers/staging/line6/playback.h
+ +extern void line6_unlink_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+ +extern void line6_unlink_wait_clear_audio_out_urbs(struct snd_line6_pcm
+ +						   *line6pcm);
+ +extern void line6_wait_clear_audio_out_urbs(struct snd_line6_pcm *line6pcm);
+ +extern int snd_line6_playback_trigger(struct snd_line6_pcm *line6pcm, int cmd);
+++=======
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/playback.h
+  
+  #endif
+diff --cc drivers/staging/line6/toneport.c
+index 4f8fc09cde1e,61fa6256d7b0..000000000000
+--- a/drivers/staging/line6/toneport.c
++++ b/drivers/staging/line6/toneport.c
+@@@ -252,7 -251,8 +252,12 @@@ static void toneport_start_pcm(unsigne
+  {
+  	struct usb_line6_toneport *toneport = (struct usb_line6_toneport *)arg;
+  	struct usb_line6 *line6 = &toneport->line6;
+++<<<<<<< HEAD:drivers/staging/line6/toneport.c
+ +	line6_pcm_acquire(line6->line6pcm, LINE6_BITS_PCM_MONITOR);
+++=======
++ 
++ 	line6_pcm_acquire(line6->line6pcm, LINE6_STREAM_MONITOR);
+++>>>>>>> 63e20df1e5b2 (ALSA: line6: Reorganize PCM stream handling):sound/usb/line6/toneport.c
+  }
+  
+  /* control definition */
+* Unmerged path sound/usb/line6/pcm.c
+* Unmerged path drivers/staging/line6/capture.c
+* Unmerged path drivers/staging/line6/capture.h
+* Unmerged path drivers/staging/line6/pcm.h
+* Unmerged path drivers/staging/line6/playback.c
+* Unmerged path drivers/staging/line6/playback.h
+* Unmerged path drivers/staging/line6/toneport.c
+* Unmerged path sound/usb/line6/pcm.c
