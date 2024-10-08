@@ -10,8 +10,8 @@
 #include <linux/if_vlan.h>
 #include <linux/filter.h>
 #include <asm/cacheflush.h>
-#include <asm/processor.h>
 #include <asm/facility.h>
+#include <asm/dis.h>
 
 /*
  * Conventions:
