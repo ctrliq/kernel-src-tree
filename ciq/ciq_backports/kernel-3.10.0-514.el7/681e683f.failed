@@ -1,0 +1,147 @@
+geneve: break dependency with netdev drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 681e683ff30ada19f73c17c38a528528dd8824f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/681e683f.failed
+
+Equivalent to "vxlan: break dependency with netdev drivers", don't
+autoload geneve module in case the driver is loaded. Instead make the
+coupling weaker by using netdevice notifiers as proxy.
+
+	Cc: Jesse Gross <jesse@kernel.org>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 681e683ff30ada19f73c17c38a528528dd8824f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+diff --cc include/linux/netdevice.h
+index 95e53059b81a,1f6d5db471a2..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1940,8 -2237,15 +1940,16 @@@ struct pcpu_sw_netstats 
+  #define NETDEV_RELEASE		0x0012
+  #define NETDEV_NOTIFY_PEERS	0x0013
+  #define NETDEV_JOIN		0x0014
+ -#define NETDEV_CHANGEUPPER	0x0015
+  #define NETDEV_RESEND_IGMP	0x0016
+ -#define NETDEV_PRECHANGEMTU	0x0017 /* notify before mtu change happened */
+  #define NETDEV_CHANGEINFODATA	0x0018
+++<<<<<<< HEAD
+++=======
++ #define NETDEV_BONDING_INFO	0x0019
++ #define NETDEV_PRECHANGEUPPER	0x001A
++ #define NETDEV_CHANGELOWERSTATE	0x001B
++ #define NETDEV_OFFLOAD_PUSH_VXLAN	0x001C
++ #define NETDEV_OFFLOAD_PUSH_GENEVE	0x001D
+++>>>>>>> 681e683ff30a (geneve: break dependency with netdev drivers)
+  
+  int register_netdevice_notifier(struct notifier_block *nb);
+  int unregister_netdevice_notifier(struct notifier_block *nb);
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index b60e3a33e381..e229c65ff8c9 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -734,7 +734,7 @@ static struct device_type geneve_type = {
+  * supply the listening GENEVE udp ports. Callers are expected
+  * to implement the ndo_add_geneve_port.
+  */
+-void geneve_get_rx_port(struct net_device *dev)
++static void geneve_push_rx_ports(struct net_device *dev)
+ {
+ 	struct net *net = dev_net(dev);
+ 	struct geneve_net *gn = net_generic(net, geneve_net_id);
+@@ -743,6 +743,9 @@ void geneve_get_rx_port(struct net_device *dev)
+ 	struct sock *sk;
+ 	__be16 port;
+ 
++	if (!dev->netdev_ops->ndo_add_geneve_port)
++		return;
++
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(gs, &gn->sock_list, list) {
+ 		sk = gs->sock->sk;
+@@ -752,7 +755,6 @@ void geneve_get_rx_port(struct net_device *dev)
+ 	}
+ 	rcu_read_unlock();
+ }
+-EXPORT_SYMBOL_GPL(geneve_get_rx_port);
+ 
+ /* Initialize the device structure. */
+ static void geneve_setup(struct net_device *dev)
+@@ -1011,6 +1013,21 @@ struct net_device *geneve_dev_create_fb(struct net *net, const char *name,
+ }
+ EXPORT_SYMBOL_GPL(geneve_dev_create_fb);
+ 
++static int geneve_netdevice_event(struct notifier_block *unused,
++				  unsigned long event, void *ptr)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	if (event == NETDEV_OFFLOAD_PUSH_GENEVE)
++		geneve_push_rx_ports(dev);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block geneve_notifier_block __read_mostly = {
++	.notifier_call = geneve_netdevice_event,
++};
++
+ static __net_init int geneve_init_net(struct net *net)
+ {
+ 	struct geneve_net *gn = net_generic(net, geneve_net_id);
+@@ -1063,11 +1080,18 @@ static int __init geneve_init_module(void)
+ 	if (rc)
+ 		goto out1;
+ 
+-	rc = rtnl_link_register(&geneve_link_ops);
++	rc = register_netdevice_notifier(&geneve_notifier_block);
+ 	if (rc)
+ 		goto out2;
+ 
++	rc = rtnl_link_register(&geneve_link_ops);
++	if (rc)
++		goto out3;
++
+ 	return 0;
++
++out3:
++	unregister_netdevice_notifier(&geneve_notifier_block);
+ out2:
+ 	unregister_pernet_subsys(&geneve_net_ops);
+ out1:
+@@ -1078,6 +1102,7 @@ late_initcall(geneve_init_module);
+ static void __exit geneve_cleanup_module(void)
+ {
+ 	rtnl_link_unregister(&geneve_link_ops);
++	unregister_netdevice_notifier(&geneve_notifier_block);
+ 	unregister_pernet_subsys(&geneve_net_ops);
+ }
+ module_exit(geneve_cleanup_module);
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/geneve.h b/include/net/geneve.h
+index e6c23dc765f7..cb544a530146 100644
+--- a/include/net/geneve.h
++++ b/include/net/geneve.h
+@@ -62,13 +62,11 @@ struct genevehdr {
+ 	struct geneve_opt options[];
+ };
+ 
+-#if IS_ENABLED(CONFIG_GENEVE)
+-void geneve_get_rx_port(struct net_device *netdev);
+-#else
+ static inline void geneve_get_rx_port(struct net_device *netdev)
+ {
++	ASSERT_RTNL();
++	call_netdevice_notifiers(NETDEV_OFFLOAD_PUSH_GENEVE, netdev);
+ }
+-#endif
+ 
+ #ifdef CONFIG_INET
+ struct net_device *geneve_dev_create_fb(struct net *net, const char *name,
