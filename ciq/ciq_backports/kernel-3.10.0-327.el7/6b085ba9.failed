@@ -1,0 +1,243 @@
+be2net: get rid of be_get_initial_config() call from be_probe()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Sathya Perla <sathya.perla@emulex.com>
+commit 6b085ba9271a252b1e3f836ab5df202c51be4f2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b085ba9.failed
+
+Most of the code to fetch the adapter state is in be_setup()->be_get_config().
+So, move the code from be_get_initial_config() to be_get_config().
+
+	Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+	Signed-off-by: Kalesh AP <kalesh.purayil@emulex.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b085ba9271a252b1e3f836ab5df202c51be4f2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/emulex/benet/be_main.c
+diff --cc drivers/net/ethernet/emulex/benet/be_main.c
+index b2184bdb8a43,40c8f85dbd0d..000000000000
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@@ -4967,6 -5012,183 +4977,186 @@@ reschedule
+  	schedule_delayed_work(&adapter->work, msecs_to_jiffies(1000));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void be_unmap_pci_bars(struct be_adapter *adapter)
++ {
++ 	if (adapter->csr)
++ 		pci_iounmap(adapter->pdev, adapter->csr);
++ 	if (adapter->db)
++ 		pci_iounmap(adapter->pdev, adapter->db);
++ }
++ 
++ static int db_bar(struct be_adapter *adapter)
++ {
++ 	if (lancer_chip(adapter) || !be_physfn(adapter))
++ 		return 0;
++ 	else
++ 		return 4;
++ }
++ 
++ static int be_roce_map_pci_bars(struct be_adapter *adapter)
++ {
++ 	if (skyhawk_chip(adapter)) {
++ 		adapter->roce_db.size = 4096;
++ 		adapter->roce_db.io_addr = pci_resource_start(adapter->pdev,
++ 							      db_bar(adapter));
++ 		adapter->roce_db.total_size = pci_resource_len(adapter->pdev,
++ 							       db_bar(adapter));
++ 	}
++ 	return 0;
++ }
++ 
++ static int be_map_pci_bars(struct be_adapter *adapter)
++ {
++ 	u8 __iomem *addr;
++ 	u32 sli_intf;
++ 
++ 	pci_read_config_dword(adapter->pdev, SLI_INTF_REG_OFFSET, &sli_intf);
++ 	adapter->sli_family = (sli_intf & SLI_INTF_FAMILY_MASK) >>
++ 				SLI_INTF_FAMILY_SHIFT;
++ 	adapter->virtfn = (sli_intf & SLI_INTF_FT_MASK) ? 1 : 0;
++ 
++ 	if (BEx_chip(adapter) && be_physfn(adapter)) {
++ 		adapter->csr = pci_iomap(adapter->pdev, 2, 0);
++ 		if (!adapter->csr)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	addr = pci_iomap(adapter->pdev, db_bar(adapter), 0);
++ 	if (!addr)
++ 		goto pci_map_err;
++ 	adapter->db = addr;
++ 
++ 	be_roce_map_pci_bars(adapter);
++ 	return 0;
++ 
++ pci_map_err:
++ 	dev_err(&adapter->pdev->dev, "Error in mapping PCI BARs\n");
++ 	be_unmap_pci_bars(adapter);
++ 	return -ENOMEM;
++ }
++ 
++ static void be_drv_cleanup(struct be_adapter *adapter)
++ {
++ 	struct be_dma_mem *mem = &adapter->mbox_mem_alloced;
++ 	struct device *dev = &adapter->pdev->dev;
++ 
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ 
++ 	mem = &adapter->rx_filter;
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ 
++ 	mem = &adapter->stats_cmd;
++ 	if (mem->va)
++ 		dma_free_coherent(dev, mem->size, mem->va, mem->dma);
++ }
++ 
++ /* Allocate and initialize various fields in be_adapter struct */
++ static int be_drv_init(struct be_adapter *adapter)
++ {
++ 	struct be_dma_mem *mbox_mem_alloc = &adapter->mbox_mem_alloced;
++ 	struct be_dma_mem *mbox_mem_align = &adapter->mbox_mem;
++ 	struct be_dma_mem *rx_filter = &adapter->rx_filter;
++ 	struct be_dma_mem *stats_cmd = &adapter->stats_cmd;
++ 	struct device *dev = &adapter->pdev->dev;
++ 	int status = 0;
++ 
++ 	mbox_mem_alloc->size = sizeof(struct be_mcc_mailbox) + 16;
++ 	mbox_mem_alloc->va = dma_alloc_coherent(dev, mbox_mem_alloc->size,
++ 						&mbox_mem_alloc->dma,
++ 						GFP_KERNEL);
++ 	if (!mbox_mem_alloc->va)
++ 		return -ENOMEM;
++ 
++ 	mbox_mem_align->size = sizeof(struct be_mcc_mailbox);
++ 	mbox_mem_align->va = PTR_ALIGN(mbox_mem_alloc->va, 16);
++ 	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
++ 	memset(mbox_mem_align->va, 0, sizeof(struct be_mcc_mailbox));
++ 
++ 	rx_filter->size = sizeof(struct be_cmd_req_rx_filter);
++ 	rx_filter->va = dma_zalloc_coherent(dev, rx_filter->size,
++ 					    &rx_filter->dma, GFP_KERNEL);
++ 	if (!rx_filter->va) {
++ 		status = -ENOMEM;
++ 		goto free_mbox;
++ 	}
++ 
++ 	if (lancer_chip(adapter))
++ 		stats_cmd->size = sizeof(struct lancer_cmd_req_pport_stats);
++ 	else if (BE2_chip(adapter))
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v0);
++ 	else if (BE3_chip(adapter))
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v1);
++ 	else
++ 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v2);
++ 	stats_cmd->va = dma_zalloc_coherent(dev, stats_cmd->size,
++ 					    &stats_cmd->dma, GFP_KERNEL);
++ 	if (!stats_cmd->va) {
++ 		status = -ENOMEM;
++ 		goto free_rx_filter;
++ 	}
++ 
++ 	mutex_init(&adapter->mbox_lock);
++ 	spin_lock_init(&adapter->mcc_lock);
++ 	spin_lock_init(&adapter->mcc_cq_lock);
++ 	init_completion(&adapter->et_cmd_compl);
++ 
++ 	pci_save_state(adapter->pdev);
++ 
++ 	INIT_DELAYED_WORK(&adapter->work, be_worker);
++ 	INIT_DELAYED_WORK(&adapter->func_recovery_work, be_func_recovery_task);
++ 
++ 	adapter->rx_fc = true;
++ 	adapter->tx_fc = true;
++ 
++ 	/* Must be a power of 2 or else MODULO will BUG_ON */
++ 	adapter->be_get_temp_freq = 64;
++ 	adapter->cfg_num_qs = netif_get_num_default_rss_queues();
++ 
++ 	return 0;
++ 
++ free_rx_filter:
++ 	dma_free_coherent(dev, rx_filter->size, rx_filter->va, rx_filter->dma);
++ free_mbox:
++ 	dma_free_coherent(dev, mbox_mem_alloc->size, mbox_mem_alloc->va,
++ 			  mbox_mem_alloc->dma);
++ 	return status;
++ }
++ 
++ static void be_remove(struct pci_dev *pdev)
++ {
++ 	struct be_adapter *adapter = pci_get_drvdata(pdev);
++ 
++ 	if (!adapter)
++ 		return;
++ 
++ 	be_roce_dev_remove(adapter);
++ 	be_intr_set(adapter, false);
++ 
++ 	cancel_delayed_work_sync(&adapter->func_recovery_work);
++ 
++ 	unregister_netdev(adapter->netdev);
++ 
++ 	be_clear(adapter);
++ 
++ 	/* tell fw we're done with firing cmds */
++ 	be_cmd_fw_clean(adapter);
++ 
++ 	be_unmap_pci_bars(adapter);
++ 	be_drv_cleanup(adapter);
++ 
++ 	pci_disable_pcie_error_reporting(pdev);
++ 
++ 	pci_release_regions(pdev);
++ 	pci_disable_device(pdev);
++ 
++ 	free_netdev(adapter->netdev);
++ }
++ 
+++>>>>>>> 6b085ba9271a (be2net: get rid of be_get_initial_config() call from be_probe())
+  /* If any VFs are already enabled don't FLR the PF */
+  static bool be_reset_required(struct be_adapter *adapter)
+  {
+@@@ -5077,24 -5323,11 +5267,27 @@@ static int be_probe(struct pci_dev *pde
+  	/* tell fw we're ready to fire cmds */
+  	status = be_cmd_fw_init(adapter);
+  	if (status)
+ -		goto drv_cleanup;
+ +		goto ctrl_clean;
+  
+ +	status = be_stats_init(adapter);
+ +	if (status)
+ +		goto ctrl_clean;
+ +
+++<<<<<<< HEAD
+ +	status = be_get_initial_config(adapter);
+ +	if (status)
+ +		goto stats_clean;
+ +
+ +	INIT_DELAYED_WORK(&adapter->work, be_worker);
+ +	INIT_DELAYED_WORK(&adapter->func_recovery_work, be_func_recovery_task);
+ +	adapter->rx_fc = true;
+ +	adapter->tx_fc = true;
+ +
+++=======
+++>>>>>>> 6b085ba9271a (be2net: get rid of be_get_initial_config() call from be_probe())
+  	status = be_setup(adapter);
+  	if (status)
+ -		goto drv_cleanup;
+ +		goto stats_clean;
+  
+  	be_netdev_init(netdev);
+  	status = register_netdev(netdev);
+* Unmerged path drivers/net/ethernet/emulex/benet/be_main.c
