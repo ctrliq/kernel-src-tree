@@ -5422,6 +5422,7 @@ err_out_slab:
 
 static void __exit rbd_exit(void)
 {
+	ida_destroy(&rbd_dev_id_ida);
 	rbd_sysfs_cleanup();
 	rbd_slab_exit();
 }
