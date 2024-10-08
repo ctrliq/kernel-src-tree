@@ -1,0 +1,150 @@
+KVM: x86: set TMR when the interrupt is accepted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit bdaffe1d93e7eddbcc71d074a5d49eba7fe1c765
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bdaffe1d.failed
+
+Do not compute TMR in advance.  Instead, set the TMR just before the interrupt
+is accepted into the IRR.  This limits the coupling between IOAPIC and LAPIC.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit bdaffe1d93e7eddbcc71d074a5d49eba7fe1c765)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/ioapic.c
+#	arch/x86/kvm/lapic.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/ioapic.c
+index a42475afc7c9,eaf4ec38d980..000000000000
+--- a/arch/x86/kvm/ioapic.c
++++ b/arch/x86/kvm/ioapic.c
+@@@ -260,15 -259,9 +259,15 @@@ void kvm_ioapic_scan_entry(struct kvm_v
+  		    kvm_irq_has_notifier(ioapic->kvm, KVM_IRQCHIP_IOAPIC, index) ||
+  		    index == RTC_GSI) {
+  			if (kvm_apic_match_dest(vcpu, NULL, 0,
+++<<<<<<< HEAD
+ +			             e->fields.dest_id, e->fields.dest_mode) ||
+ +			    (e->fields.trig_mode == IOAPIC_EDGE_TRIG &&
+ +			     kvm_apic_pending_eoi(vcpu, e->fields.vector))) {
+++=======
++ 				e->fields.dest_id, e->fields.dest_mode))
+++>>>>>>> bdaffe1d93e7 (KVM: x86: set TMR when the interrupt is accepted)
+  				__set_bit(e->fields.vector,
+  					(unsigned long *)eoi_exit_bitmap);
+- 				if (e->fields.trig_mode == IOAPIC_LEVEL_TRIG)
+- 					__set_bit(e->fields.vector,
+- 						(unsigned long *)tmr);
+- 			}
+  		}
+  	}
+  	spin_unlock(&ioapic->lock);
+diff --cc arch/x86/kvm/lapic.h
+index e5b0fff82952,eb46d6bcaa75..000000000000
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@@ -57,7 -57,7 +57,11 @@@ void kvm_lapic_set_base(struct kvm_vcp
+  u64 kvm_lapic_get_base(struct kvm_vcpu *vcpu);
+  void kvm_apic_set_version(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+ +void kvm_apic_update_tmr(struct kvm_vcpu *vcpu, u32 *tmr);
+++=======
++ void __kvm_apic_update_irr(u32 *pir, void *regs);
+++>>>>>>> bdaffe1d93e7 (KVM: x86: set TMR when the interrupt is accepted)
+  void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
+  int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+  		unsigned long *dest_map);
+diff --cc arch/x86/kvm/x86.c
+index 733894b44f8d,c1ed74ebc502..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -6631,14 -6149,17 +6630,16 @@@ static void vcpu_scan_ioapic(struct kvm
+  		return;
+  
+  	memset(eoi_exit_bitmap, 0, 32);
+- 	memset(tmr, 0, 32);
+  
+++<<<<<<< HEAD
+ +	kvm_x86_ops->sync_pir_to_irr(vcpu);
+ +	kvm_ioapic_scan_entry(vcpu, eoi_exit_bitmap, tmr);
+++=======
++ 	kvm_ioapic_scan_entry(vcpu, eoi_exit_bitmap);
+++>>>>>>> bdaffe1d93e7 (KVM: x86: set TMR when the interrupt is accepted)
+  	kvm_x86_ops->load_eoi_exitmap(vcpu, eoi_exit_bitmap);
+- 	kvm_apic_update_tmr(vcpu, tmr);
+  }
+  
+ -static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu)
+ -{
+ -	++vcpu->stat.tlb_flush;
+ -	kvm_x86_ops->tlb_flush(vcpu);
+ -}
+ -
+  void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+  {
+  	struct page *page = NULL;
+* Unmerged path arch/x86/kvm/ioapic.c
+diff --git a/arch/x86/kvm/ioapic.h b/arch/x86/kvm/ioapic.h
+index 6e265cfcd86a..1695d8cf5af2 100644
+--- a/arch/x86/kvm/ioapic.h
++++ b/arch/x86/kvm/ioapic.h
+@@ -120,7 +120,6 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
+ 		struct kvm_lapic_irq *irq, unsigned long *dest_map);
+ int kvm_get_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
+ int kvm_set_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
+-void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap,
+-			u32 *tmr);
++void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+ 
+ #endif
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1ea3691b454e..d9930f634701 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -546,15 +546,6 @@ static void pv_eoi_clr_pending(struct kvm_vcpu *vcpu)
+ 	__clear_bit(KVM_APIC_PV_EOI_PENDING, &vcpu->arch.apic_attention);
+ }
+ 
+-void kvm_apic_update_tmr(struct kvm_vcpu *vcpu, u32 *tmr)
+-{
+-	struct kvm_lapic *apic = vcpu->arch.apic;
+-	int i;
+-
+-	for (i = 0; i < 8; i++)
+-		apic_set_reg(apic, APIC_TMR + 0x10 * i, tmr[i]);
+-}
+-
+ static void apic_update_ppr(struct kvm_lapic *apic)
+ {
+ 	u32 tpr, isrv, ppr, old_ppr;
+@@ -876,6 +867,9 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 	case APIC_DM_LOWEST:
+ 		vcpu->arch.apic_arb_prio++;
+ 	case APIC_DM_FIXED:
++		if (unlikely(trig_mode && !level))
++			break;
++
+ 		/* FIXME add logic for vcpu on reset */
+ 		if (unlikely(!apic_enabled(apic)))
+ 			break;
+@@ -885,6 +879,13 @@ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 		if (dest_map)
+ 			__set_bit(vcpu->vcpu_id, dest_map);
+ 
++		if (apic_test_vector(vector, apic->regs + APIC_TMR) != !!trig_mode) {
++			if (trig_mode)
++				apic_set_vector(vector, apic->regs + APIC_TMR);
++			else
++				apic_clear_vector(vector, apic->regs + APIC_TMR);
++		}
++
+ 		if (kvm_x86_ops->deliver_posted_interrupt)
+ 			kvm_x86_ops->deliver_posted_interrupt(vcpu, vector);
+ 		else {
+* Unmerged path arch/x86/kvm/lapic.h
+* Unmerged path arch/x86/kvm/x86.c
