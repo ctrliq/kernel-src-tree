@@ -1,0 +1,187 @@
+nfs42: add NFS_IOC_CLONE_RANGE ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Peng Tao <tao.peng@primarydata.com>
+commit a340abcf4173461f688292a6879b4d5bc781c2b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a340abcf.failed
+
+It follows btrfs BTRFS_IOC_CLONE_RANGE lead on ioctl number and
+arguments.
+
+	Signed-off-by: Peng Tao <tao.peng@primarydata.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit a340abcf4173461f688292a6879b4d5bc781c2b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4file.c
+#	include/uapi/linux/nfs.h
+diff --cc fs/nfs/nfs4file.c
+index 75f15320a424,4384a1d00ceb..000000000000
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@@ -165,8 -193,129 +165,134 @@@ static long nfs42_fallocate(struct fil
+  		return nfs42_proc_deallocate(filep, offset, len);
+  	return nfs42_proc_allocate(filep, offset, len);
+  }
+++<<<<<<< HEAD
+ +#endif /* CONFIG_NFS_V4_2 */
+ +
+++=======
++ 
++ static noinline long
++ nfs42_ioctl_clone(struct file *dst_file, unsigned long srcfd,
++ 		  u64 src_off, u64 dst_off, u64 count)
++ {
++ 	struct inode *dst_inode = file_inode(dst_file);
++ 	struct nfs_server *server = NFS_SERVER(dst_inode);
++ 	struct fd src_file;
++ 	struct inode *src_inode;
++ 	unsigned int bs = server->clone_blksize;
++ 	int ret;
++ 
++ 	/* dst file must be opened for writing */
++ 	if (!(dst_file->f_mode & FMODE_WRITE))
++ 		return -EINVAL;
++ 
++ 	ret = mnt_want_write_file(dst_file);
++ 	if (ret)
++ 		return ret;
++ 
++ 	src_file = fdget(srcfd);
++ 	if (!src_file.file) {
++ 		ret = -EBADF;
++ 		goto out_drop_write;
++ 	}
++ 
++ 	src_inode = file_inode(src_file.file);
++ 
++ 	/* src and dst must be different files */
++ 	ret = -EINVAL;
++ 	if (src_inode == dst_inode)
++ 		goto out_fput;
++ 
++ 	/* src file must be opened for reading */
++ 	if (!(src_file.file->f_mode & FMODE_READ))
++ 		goto out_fput;
++ 
++ 	/* src and dst must be regular files */
++ 	ret = -EISDIR;
++ 	if (!S_ISREG(src_inode->i_mode) || !S_ISREG(dst_inode->i_mode))
++ 		goto out_fput;
++ 
++ 	ret = -EXDEV;
++ 	if (src_file.file->f_path.mnt != dst_file->f_path.mnt ||
++ 	    src_inode->i_sb != dst_inode->i_sb)
++ 		goto out_fput;
++ 
++ 	/* check alignment w.r.t. clone_blksize */
++ 	ret = -EINVAL;
++ 	if (bs) {
++ 		if (!IS_ALIGNED(src_off, bs) || !IS_ALIGNED(dst_off, bs))
++ 			goto out_fput;
++ 		if (!IS_ALIGNED(count, bs) && i_size_read(src_inode) != (src_off + count))
++ 			goto out_fput;
++ 	}
++ 
++ 	/* XXX: do we lock at all? what if server needs CB_RECALL_LAYOUT? */
++ 	if (dst_inode < src_inode) {
++ 		mutex_lock_nested(&dst_inode->i_mutex, I_MUTEX_PARENT);
++ 		mutex_lock_nested(&src_inode->i_mutex, I_MUTEX_CHILD);
++ 	} else {
++ 		mutex_lock_nested(&src_inode->i_mutex, I_MUTEX_PARENT);
++ 		mutex_lock_nested(&dst_inode->i_mutex, I_MUTEX_CHILD);
++ 	}
++ 
++ 	/* flush all pending writes on both src and dst so that server
++ 	 * has the latest data */
++ 	ret = nfs_sync_inode(src_inode);
++ 	if (ret)
++ 		goto out_unlock;
++ 	ret = nfs_sync_inode(dst_inode);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	ret = nfs42_proc_clone(src_file.file, dst_file, src_off, dst_off, count);
++ 
++ 	/* truncate inode page cache of the dst range so that future reads can fetch
++ 	 * new data from server */
++ 	if (!ret)
++ 		truncate_inode_pages_range(&dst_inode->i_data, dst_off, dst_off + count - 1);
++ 
++ out_unlock:
++ 	if (dst_inode < src_inode) {
++ 		mutex_unlock(&src_inode->i_mutex);
++ 		mutex_unlock(&dst_inode->i_mutex);
++ 	} else {
++ 		mutex_unlock(&dst_inode->i_mutex);
++ 		mutex_unlock(&src_inode->i_mutex);
++ 	}
++ out_fput:
++ 	fdput(src_file);
++ out_drop_write:
++ 	mnt_drop_write_file(dst_file);
++ 	return ret;
++ }
++ 
++ static long nfs42_ioctl_clone_range(struct file *dst_file, void __user *argp)
++ {
++ 	struct nfs_ioctl_clone_range_args args;
++ 
++ 	if (copy_from_user(&args, argp, sizeof(args)))
++ 		return -EFAULT;
++ 
++ 	return nfs42_ioctl_clone(dst_file, args.src_fd, args.src_off, args.dst_off, args.count);
++ }
++ #endif /* CONFIG_NFS_V4_2 */
++ 
++ long nfs4_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++ {
++ 	void __user *argp = (void __user *)arg;
++ 
++ 	switch (cmd) {
++ #ifdef CONFIG_NFS_V4_2
++ 	case NFS_IOC_CLONE:
++ 		return nfs42_ioctl_clone(file, arg, 0, 0, 0);
++ 	case NFS_IOC_CLONE_RANGE:
++ 		return nfs42_ioctl_clone_range(file, argp);
++ #endif
++ 	}
++ 
++ 	return -ENOTTY;
++ }
++ 
+++>>>>>>> a340abcf4173 (nfs42: add NFS_IOC_CLONE_RANGE ioctl)
+  const struct file_operations nfs4_file_operations = {
+  #ifdef CONFIG_NFS_V4_2
+  	.llseek		= nfs4_file_llseek,
+diff --cc include/uapi/linux/nfs.h
+index 5199a36dd574,c6b86cc404f8..000000000000
+--- a/include/uapi/linux/nfs.h
++++ b/include/uapi/linux/nfs.h
+@@@ -31,6 -31,17 +31,20 @@@
+  
+  #define NFS_PIPE_DIRNAME "nfs"
+  
+++<<<<<<< HEAD
+++=======
++ /* NFS ioctls */
++ /* Let's follow btrfs lead on CLONE to avoid messing userspace */
++ #define NFS_IOC_CLONE		_IOW(0x94, 9, int)
++ #define NFS_IOC_CLONE_RANGE	_IOW(0x94, 13, int)
++ 
++ struct nfs_ioctl_clone_range_args {
++ 	__s64 src_fd;
++ 	__u64 src_off, count;
++ 	__u64 dst_off;
++ };
++ 
+++>>>>>>> a340abcf4173 (nfs42: add NFS_IOC_CLONE_RANGE ioctl)
+  /*
+   * NFS stats. The good thing with these values is that NFSv3 errors are
+   * a superset of NFSv2 errors (with the exception of NFSERR_WFLUSH which
+* Unmerged path fs/nfs/nfs4file.c
+* Unmerged path include/uapi/linux/nfs.h
