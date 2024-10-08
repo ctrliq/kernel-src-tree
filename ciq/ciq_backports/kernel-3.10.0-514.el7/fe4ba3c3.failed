@@ -1,0 +1,408 @@
+watchdog: add watchdog_cpumask sysctl to assist nohz
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Chris Metcalf <cmetcalf@ezchip.com>
+commit fe4ba3c34352b7e8068b7f18eb233444aed17011
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/fe4ba3c3.failed
+
+Change the default behavior of watchdog so it only runs on the
+housekeeping cores when nohz_full is enabled at build and boot time.
+Allow modifying the set of cores the watchdog is currently running on
+with a new kernel.watchdog_cpumask sysctl.
+
+In the current system, the watchdog subsystem runs a periodic timer that
+schedules the watchdog kthread to run.  However, nohz_full cores are
+designed to allow userspace application code running on those cores to
+have 100% access to the CPU.  So the watchdog system prevents the
+nohz_full application code from being able to run the way it wants to,
+thus the motivation to suppress the watchdog on nohz_full cores, which
+this patchset provides by default.
+
+However, if we disable the watchdog globally, then the housekeeping
+cores can't benefit from the watchdog functionality.  So we allow
+disabling it only on some cores.  See Documentation/lockup-watchdogs.txt
+for more information.
+
+[jhubbard@nvidia.com: fix a watchdog crash in some configurations]
+	Signed-off-by: Chris Metcalf <cmetcalf@ezchip.com>
+	Acked-by: Don Zickus <dzickus@redhat.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fe4ba3c34352b7e8068b7f18eb233444aed17011)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/kernel.txt
+#	include/linux/nmi.h
+#	kernel/smpboot.c
+#	kernel/sysctl.c
+#	kernel/watchdog.c
+diff --cc Documentation/sysctl/kernel.txt
+index b27c6b7edd64,e5d528e0c46e..000000000000
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@@ -806,6 -904,46 +806,49 @@@ example.  If a system hangs up, try pre
+  
+  ==============================================================
+  
+++<<<<<<< HEAD
+++=======
++ watchdog:
++ 
++ This parameter can be used to disable or enable the soft lockup detector
++ _and_ the NMI watchdog (i.e. the hard lockup detector) at the same time.
++ 
++    0 - disable both lockup detectors
++    1 - enable both lockup detectors
++ 
++ The soft lockup detector and the NMI watchdog can also be disabled or
++ enabled individually, using the soft_watchdog and nmi_watchdog parameters.
++ If the watchdog parameter is read, for example by executing
++ 
++    cat /proc/sys/kernel/watchdog
++ 
++ the output of this command (0 or 1) shows the logical OR of soft_watchdog
++ and nmi_watchdog.
++ 
++ ==============================================================
++ 
++ watchdog_cpumask:
++ 
++ This value can be used to control on which cpus the watchdog may run.
++ The default cpumask is all possible cores, but if NO_HZ_FULL is
++ enabled in the kernel config, and cores are specified with the
++ nohz_full= boot argument, those cores are excluded by default.
++ Offline cores can be included in this mask, and if the core is later
++ brought online, the watchdog will be started based on the mask value.
++ 
++ Typically this value would only be touched in the nohz_full case
++ to re-enable cores that by default were not running the watchdog,
++ if a kernel lockup was suspected on those cores.
++ 
++ The argument value is the standard cpulist format for cpumasks,
++ so for example to enable the watchdog on cores 0, 2, 3, and 4 you
++ might say:
++ 
++   echo 0,2-4 > /proc/sys/kernel/watchdog_cpumask
++ 
++ ==============================================================
++ 
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  watchdog_thresh:
+  
+  This value can be used to control the frequency of hrtimer and NMI
+diff --cc include/linux/nmi.h
+index 6fe7c9ae7224,f94da0e65dea..000000000000
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@@ -82,8 -78,12 +83,17 @@@ extern int proc_soft_watchdog(struct ct
+  			      void __user *, size_t *, loff_t *);
+  extern int proc_watchdog_thresh(struct ctl_table *, int ,
+  				void __user *, size_t *, loff_t *);
+++<<<<<<< HEAD
+ +extern int proc_dowatchdog(struct ctl_table *, int ,
+ +			   void __user *, size_t *, loff_t *);
+++=======
++ extern int proc_watchdog_cpumask(struct ctl_table *, int,
++ 				 void __user *, size_t *, loff_t *);
++ #endif
++ 
++ #ifdef CONFIG_HAVE_ACPI_APEI_NMI
++ #include <asm/nmi.h>
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  #endif
+  
+  #endif
+diff --cc kernel/smpboot.c
+index c697f73d82d6,7c434c39f02a..000000000000
+--- a/kernel/smpboot.c
++++ b/kernel/smpboot.c
+@@@ -316,6 -330,50 +316,52 @@@ void smpboot_unregister_percpu_thread(s
+  }
+  EXPORT_SYMBOL_GPL(smpboot_unregister_percpu_thread);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * smpboot_update_cpumask_percpu_thread - Adjust which per_cpu hotplug threads stay parked
++  * @plug_thread:	Hotplug thread descriptor
++  * @new:		Revised mask to use
++  *
++  * The cpumask field in the smp_hotplug_thread must not be updated directly
++  * by the client, but only by calling this function.
++  * This function can only be called on a registered smp_hotplug_thread.
++  */
++ int smpboot_update_cpumask_percpu_thread(struct smp_hotplug_thread *plug_thread,
++ 					 const struct cpumask *new)
++ {
++ 	struct cpumask *old = plug_thread->cpumask;
++ 	cpumask_var_t tmp;
++ 	unsigned int cpu;
++ 
++ 	if (!alloc_cpumask_var(&tmp, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	get_online_cpus();
++ 	mutex_lock(&smpboot_threads_lock);
++ 
++ 	/* Park threads that were exclusively enabled on the old mask. */
++ 	cpumask_andnot(tmp, old, new);
++ 	for_each_cpu_and(cpu, tmp, cpu_online_mask)
++ 		smpboot_park_thread(plug_thread, cpu);
++ 
++ 	/* Unpark threads that are exclusively enabled on the new mask. */
++ 	cpumask_andnot(tmp, new, old);
++ 	for_each_cpu_and(cpu, tmp, cpu_online_mask)
++ 		smpboot_unpark_thread(plug_thread, cpu);
++ 
++ 	cpumask_copy(old, new);
++ 
++ 	mutex_unlock(&smpboot_threads_lock);
++ 	put_online_cpus();
++ 
++ 	free_cpumask_var(tmp);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(smpboot_update_cpumask_percpu_thread);
++ 
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  static DEFINE_PER_CPU(atomic_t, cpu_hotplug_state) = ATOMIC_INIT(CPU_POST_DEAD);
+  
+  /*
+diff --cc kernel/sysctl.c
+index 41128551c952,812fcc3fd390..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -845,6 -850,35 +845,38 @@@ static struct ctl_table kern_table[] = 
+  		.extra2		= &sixty,
+  	},
+  	{
+++<<<<<<< HEAD
+++=======
++ 		.procname       = "nmi_watchdog",
++ 		.data           = &nmi_watchdog_enabled,
++ 		.maxlen         = sizeof (int),
++ 		.mode           = 0644,
++ 		.proc_handler   = proc_nmi_watchdog,
++ 		.extra1		= &zero,
++ #if defined(CONFIG_HAVE_NMI_WATCHDOG) || defined(CONFIG_HARDLOCKUP_DETECTOR)
++ 		.extra2		= &one,
++ #else
++ 		.extra2		= &zero,
++ #endif
++ 	},
++ 	{
++ 		.procname       = "soft_watchdog",
++ 		.data           = &soft_watchdog_enabled,
++ 		.maxlen         = sizeof (int),
++ 		.mode           = 0644,
++ 		.proc_handler   = proc_soft_watchdog,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ 	{
++ 		.procname	= "watchdog_cpumask",
++ 		.data		= &watchdog_cpumask_bits,
++ 		.maxlen		= NR_CPUS,
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_watchdog_cpumask,
++ 	},
++ 	{
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  		.procname	= "softlockup_panic",
+  		.data		= &softlockup_panic,
+  		.maxlen		= sizeof(int),
+diff --cc kernel/watchdog.c
+index dcf494ad4e30,a6ffa43f2993..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -711,8 -703,8 +718,13 @@@ static void update_timers_all_cpus(void
+  	int cpu;
+  
+  	get_online_cpus();
+++<<<<<<< HEAD
+ +	for_each_online_cpu(cpu)
+ +		update_timers(cpu);
+++=======
++ 	for_each_watchdog_cpu(cpu)
++ 		update_watchdog(cpu);
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  	put_online_cpus();
+  }
+  
+@@@ -724,10 -716,18 +736,23 @@@ static int watchdog_enable_all_cpus(boo
+  		err = smpboot_register_percpu_thread(&watchdog_threads);
+  		if (err)
+  			pr_err("Failed to create watchdog threads, disabled\n");
+- 		else
++ 		else {
++ 			if (smpboot_update_cpumask_percpu_thread(
++ 				    &watchdog_threads, &watchdog_cpumask))
++ 				pr_err("Failed to set cpumask for watchdog threads\n");
+  			watchdog_running = 1;
+++<<<<<<< HEAD
+ +	} else if (sample_period_changed) {
+ +		update_timers_all_cpus();
+++=======
++ 		}
++ 	} else {
++ 		/*
++ 		 * Enable/disable the lockup detectors or
++ 		 * change the sample period 'on the fly'.
++ 		 */
++ 		update_watchdog_all_cpus();
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  	}
+  
+  	return err;
+@@@ -892,57 -892,56 +917,109 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * proc handler for /proc/sys/kernel/nmi_watchdog,watchdog_thresh
+ + */
+ +
+ +int proc_dowatchdog(struct ctl_table *table, int write,
+ +		    void __user *buffer, size_t *lenp, loff_t *ppos)
+ +{
+ +	int err, old_thresh, old_enabled;
+ +	bool old_hardlockup;
+ +
+ +	mutex_lock(&watchdog_proc_mutex);
+ +	old_thresh = ACCESS_ONCE(watchdog_thresh);
+ +	old_enabled = ACCESS_ONCE(watchdog_user_enabled);
+ +	old_hardlockup = watchdog_hardlockup_detector_is_enabled();
+ +
+ +	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ +	if (err || !write)
+ +		goto out;
+ +
+ +	set_sample_period();
+ +	/*
+ +	 * Watchdog threads shouldn't be enabled if they are
+ +	 * disabled. The 'watchdog_running' variable check in
+ +	 * watchdog_*_all_cpus() function takes care of this.
+ +	 */
+ +	if (watchdog_user_enabled && watchdog_thresh) {
+ +		/*
+ +		 * Prevent a change in watchdog_thresh accidentally overriding
+ +		 * the enablement of the hardlockup detector.
+ +		 */
+ +		if (watchdog_user_enabled != old_enabled)
+ +			watchdog_enable_hardlockup_detector(true);
+ +		err = watchdog_enable_all_cpus(old_thresh != watchdog_thresh);
+ +	} else
+ +		watchdog_disable_all_cpus();
+ +
+ +	/* Restore old values on failure */
+ +	if (err) {
+ +		watchdog_thresh = old_thresh;
+ +		watchdog_user_enabled = old_enabled;
+ +		watchdog_enable_hardlockup_detector(old_hardlockup);
+ +	}
+ +out:
+ +	mutex_unlock(&watchdog_proc_mutex);
+ +	return err;
+ +}
+++=======
++  * The cpumask is the mask of possible cpus that the watchdog can run
++  * on, not the mask of cpus it is actually running on.  This allows the
++  * user to specify a mask that will include cpus that have not yet
++  * been brought online, if desired.
++  */
++ int proc_watchdog_cpumask(struct ctl_table *table, int write,
++ 			  void __user *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int err;
++ 
++ 	mutex_lock(&watchdog_proc_mutex);
++ 	err = proc_do_large_bitmap(table, write, buffer, lenp, ppos);
++ 	if (!err && write) {
++ 		/* Remove impossible cpus to keep sysctl output cleaner. */
++ 		cpumask_and(&watchdog_cpumask, &watchdog_cpumask,
++ 			    cpu_possible_mask);
++ 
++ 		if (watchdog_running) {
++ 			/*
++ 			 * Failure would be due to being unable to allocate
++ 			 * a temporary cpumask, so we are likely not in a
++ 			 * position to do much else to make things better.
++ 			 */
++ 			if (smpboot_update_cpumask_percpu_thread(
++ 				    &watchdog_threads, &watchdog_cpumask) != 0)
++ 				pr_err("cpumask update failed\n");
++ 		}
++ 	}
++ 	mutex_unlock(&watchdog_proc_mutex);
++ 	return err;
++ }
++ 
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  #endif /* CONFIG_SYSCTL */
+  
+  void __init lockup_detector_init(void)
+  {
+  	set_sample_period();
+  
+++<<<<<<< HEAD
+ +	if (watchdog_user_enabled)
+ +		watchdog_enable_all_cpus(false);
+++=======
++ #ifdef CONFIG_NO_HZ_FULL
++ 	if (tick_nohz_full_enabled()) {
++ 		if (!cpumask_empty(tick_nohz_full_mask))
++ 			pr_info("Disabling watchdog on nohz_full cores by default\n");
++ 		cpumask_andnot(&watchdog_cpumask, cpu_possible_mask,
++ 			       tick_nohz_full_mask);
++ 	} else
++ 		cpumask_copy(&watchdog_cpumask, cpu_possible_mask);
++ #else
++ 	cpumask_copy(&watchdog_cpumask, cpu_possible_mask);
++ #endif
++ 
++ 	if (watchdog_enabled)
++ 		watchdog_enable_all_cpus();
+++>>>>>>> fe4ba3c34352 (watchdog: add watchdog_cpumask sysctl to assist nohz)
+  }
+diff --git a/Documentation/lockup-watchdogs.txt b/Documentation/lockup-watchdogs.txt
+index d2a36602ca8d..28f1c45477f3 100644
+--- a/Documentation/lockup-watchdogs.txt
++++ b/Documentation/lockup-watchdogs.txt
+@@ -61,3 +61,21 @@ As explained above, a kernel knob is provided that allows
+ administrators to configure the period of the hrtimer and the perf
+ event. The right value for a particular environment is a trade-off
+ between fast response to lockups and detection overhead.
++
++By default, the watchdog runs on all online cores.  However, on a
++kernel configured with NO_HZ_FULL, by default the watchdog runs only
++on the housekeeping cores, not the cores specified in the "nohz_full"
++boot argument.  If we allowed the watchdog to run by default on
++the "nohz_full" cores, we would have to run timer ticks to activate
++the scheduler, which would prevent the "nohz_full" functionality
++from protecting the user code on those cores from the kernel.
++Of course, disabling it by default on the nohz_full cores means that
++when those cores do enter the kernel, by default we will not be
++able to detect if they lock up.  However, allowing the watchdog
++to continue to run on the housekeeping (non-tickless) cores means
++that we will continue to detect lockups properly on those cores.
++
++In either case, the set of cores excluded from running the watchdog
++may be adjusted via the kernel.watchdog_cpumask sysctl.  For
++nohz_full cores, this may be useful for debugging a case where the
++kernel seems to be hanging on the nohz_full cores.
+* Unmerged path Documentation/sysctl/kernel.txt
+* Unmerged path include/linux/nmi.h
+* Unmerged path kernel/smpboot.c
+* Unmerged path kernel/sysctl.c
+* Unmerged path kernel/watchdog.c
