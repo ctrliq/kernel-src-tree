@@ -1178,7 +1178,6 @@ static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
 	s_h = cb->args[0];
 	s_idx = cb->args[1];
 
-	rcu_read_lock();
 	cb->seq = net->dev_base_seq;
 
 	if (nlmsg_parse(cb->nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX,
@@ -1191,7 +1190,7 @@ static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
 	for (h = s_h; h < NETDEV_HASHENTRIES; h++, s_idx = 0) {
 		idx = 0;
 		head = &net->dev_index_head[h];
-		hlist_for_each_entry_rcu(dev, head, index_hlist) {
+		hlist_for_each_entry(dev, head, index_hlist) {
 			if (idx < s_idx)
 				goto cont;
 			err = rtnl_fill_ifinfo(skb, dev, RTM_NEWLINK,
@@ -1213,7 +1212,6 @@ cont:
 		}
 	}
 out:
-	rcu_read_unlock();
 	cb->args[1] = idx;
 	cb->args[0] = h;
 
