@@ -1,0 +1,159 @@
+xfs: return -E2BIG if hit the maximum size limits of ACLs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Jie Liu <jeff.liu@oracle.com>
+commit 4ae69fea588148360d470ce604714b6d619ea749
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/4ae69fea.failed
+
+We should return -E2BIG rather than -EINVAL if hit the maximum size
+limits of ACLS, as the former is consistent with VFS xattr syscalls.
+
+	Signed-off-by: Jie Liu <jeff.liu@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 4ae69fea588148360d470ce604714b6d619ea749)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_acl.c
+diff --cc fs/xfs/xfs_acl.c
+index ac4bb60a48b1,6888ad886ff6..000000000000
+--- a/fs/xfs/xfs_acl.c
++++ b/fs/xfs/xfs_acl.c
+@@@ -282,124 -273,17 +282,128 @@@ posix_acl_default_exists(struct inode *
+  	return xfs_acl_exists(inode, SGI_ACL_DEFAULT);
+  }
+  
+ +/*
+ + * No need for i_mutex because the inode is not yet exposed to the VFS.
+ + */
+ +int
+ +xfs_inherit_acl(struct inode *inode, struct posix_acl *acl)
+ +{
+ +	umode_t mode = inode->i_mode;
+ +	int error = 0, inherit = 0;
+ +
+ +	if (S_ISDIR(inode->i_mode)) {
+ +		error = xfs_set_acl(inode, ACL_TYPE_DEFAULT, acl);
+ +		if (error)
+ +			goto out;
+ +	}
+ +
+ +	error = posix_acl_create(&acl, GFP_KERNEL, &mode);
+ +	if (error < 0)
+ +		return error;
+ +
+ +	/*
+ +	 * If posix_acl_create returns a positive value we need to
+ +	 * inherit a permission that can't be represented using the Unix
+ +	 * mode bits and we actually need to set an ACL.
+ +	 */
+ +	if (error > 0)
+ +		inherit = 1;
+ +
+ +	error = xfs_set_mode(inode, mode);
+ +	if (error)
+ +		goto out;
+ +
+ +	if (inherit)
+ +		error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +
+ +out:
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+  int
+ -xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ +xfs_acl_chmod(struct inode *inode)
+  {
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	if (S_ISLNK(inode->i_mode))
+ +		return -EOPNOTSUPP;
+ +
+ +	acl = xfs_get_acl(inode, ACL_TYPE_ACCESS);
+ +	if (IS_ERR(acl) || !acl)
+ +		return PTR_ERR(acl);
+ +
+ +	error = posix_acl_chmod(&acl, GFP_KERNEL, inode->i_mode);
+ +	if (error)
+ +		return error;
+ +
+ +	error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_get(struct dentry *dentry, const char *name,
+ +		void *value, size_t size, int type)
+ +{
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	acl = xfs_get_acl(dentry->d_inode, type);
+ +	if (IS_ERR(acl))
+ +		return PTR_ERR(acl);
+ +	if (acl == NULL)
+ +		return -ENODATA;
+ +
+ +	error = posix_acl_to_xattr(&init_user_ns, acl, value, size);
+ +	posix_acl_release(acl);
+ +
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_set(struct dentry *dentry, const char *name,
+ +		const void *value, size_t size, int flags, int type)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct posix_acl *acl = NULL;
+  	int error = 0;
+  
+ -	if (!acl)
+ +	if (flags & XATTR_CREATE)
+ +		return -EINVAL;
+ +	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
+ +		return value ? -EACCES : 0;
+ +	if (!inode_owner_or_capable(inode))
+ +		return -EPERM;
+ +
+ +	if (!value)
+  		goto set_acl;
+  
+++<<<<<<< HEAD
+ +	acl = posix_acl_from_xattr(&init_user_ns, value, size);
+ +	if (!acl) {
+ +		/*
+ +		 * acl_set_file(3) may request that we set default ACLs with
+ +		 * zero length -- defend (gracefully) against that here.
+ +		 */
+ +		goto out;
+ +	}
+ +	if (IS_ERR(acl)) {
+ +		error = PTR_ERR(acl);
+ +		goto out;
+ +	}
+ +
+ +	error = posix_acl_valid(acl);
+ +	if (error)
+ +		goto out_release;
+ +
+ +	error = -EINVAL;
+++=======
++ 	error = -E2BIG;
+++>>>>>>> 4ae69fea5881 (xfs: return -E2BIG if hit the maximum size limits of ACLs)
+  	if (acl->a_count > XFS_ACL_MAX_ENTRIES(XFS_M(inode->i_sb)))
+ -		return error;
+ +		goto out_release;
+  
+  	if (type == ACL_TYPE_ACCESS) {
+  		umode_t mode = inode->i_mode;
+* Unmerged path fs/xfs/xfs_acl.c
