@@ -1,0 +1,105 @@
+iscsi-target: Convert transport drivers to signal rdma_shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit bd027d856d3d7260017d0dc932201ce5fd7561f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/bd027d85.failed
+
+Instead of special casing the handful of callers that check for
+iser-target rdma verbs specific shutdown, use a simple flag at
+iscsit_transport->rdma_shutdown so each driver can signal this.
+
+Also, update iscsi-target/tcp + cxgbit to rdma_shutdown = false.
+
+	Cc: Varun Prakash <varun@chelsio.com>
+	Cc: Hariprasad Shenai <hariprasad@chelsio.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit bd027d856d3d7260017d0dc932201ce5fd7561f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target.c
+diff --cc drivers/target/iscsi/iscsi_target.c
+index 9c89eb0215d7,50f3d3a0dd7b..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -4505,7 -4389,18 +4505,22 @@@ static void iscsit_logout_post_handler_
+  	struct iscsi_conn *conn)
+  {
+  	struct iscsi_session *sess = conn->sess;
+++<<<<<<< HEAD
+ +	int sleep = cmpxchg(&conn->tx_thread_active, true, false);
+++=======
++ 	int sleep = 1;
++ 	/*
++ 	 * Traditional iscsi/tcp will invoke this logic from TX thread
++ 	 * context during session logout, so clear tx_thread_active and
++ 	 * sleep if iscsit_close_connection() has not already occured.
++ 	 *
++ 	 * Since iser-target invokes this logic from it's own workqueue,
++ 	 * always sleep waiting for RX/TX thread shutdown to complete
++ 	 * within iscsit_close_connection().
++ 	 */
++ 	if (!conn->conn_transport->rdma_shutdown)
++ 		sleep = cmpxchg(&conn->tx_thread_active, true, false);
+++>>>>>>> bd027d856d3d (iscsi-target: Convert transport drivers to signal rdma_shutdown)
+  
+  	atomic_set(&conn->conn_logout_remove, 0);
+  	complete(&conn->conn_logout_comp);
+@@@ -4519,7 -4414,10 +4534,14 @@@
+  static void iscsit_logout_post_handler_samecid(
+  	struct iscsi_conn *conn)
+  {
+++<<<<<<< HEAD
+ +	int sleep = cmpxchg(&conn->tx_thread_active, true, false);
+++=======
++ 	int sleep = 1;
++ 
++ 	if (!conn->conn_transport->rdma_shutdown)
++ 		sleep = cmpxchg(&conn->tx_thread_active, true, false);
+++>>>>>>> bd027d856d3d (iscsi-target: Convert transport drivers to signal rdma_shutdown)
+  
+  	atomic_set(&conn->conn_logout_remove, 0);
+  	complete(&conn->conn_logout_comp);
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 3f01dfb53c99..5f168c5779c1 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -3470,6 +3470,7 @@ static void isert_free_conn(struct iscsi_conn *conn)
+ static struct iscsit_transport iser_target_transport = {
+ 	.name			= "IB/iSER",
+ 	.transport_type		= ISCSI_INFINIBAND,
++	.rdma_shutdown		= true,
+ 	.priv_size		= sizeof(struct isert_cmd),
+ 	.owner			= THIS_MODULE,
+ 	.iscsit_setup_np	= isert_setup_np,
+diff --git a/drivers/target/iscsi/cxgbit/cxgbit_main.c b/drivers/target/iscsi/cxgbit/cxgbit_main.c
+index 39162987d009..c25f5313322c 100644
+--- a/drivers/target/iscsi/cxgbit/cxgbit_main.c
++++ b/drivers/target/iscsi/cxgbit/cxgbit_main.c
+@@ -625,6 +625,7 @@ static enum target_prot_op cxgbit_get_sup_prot_ops(struct iscsi_conn *conn)
+ static struct iscsit_transport cxgbit_transport = {
+ 	.name			= DRV_NAME,
+ 	.transport_type		= ISCSI_HW_OFFLOAD,
++	.rdma_shutdown		= false,
+ 	.priv_size		= sizeof(struct cxgbit_cmd),
+ 	.owner			= THIS_MODULE,
+ 	.iscsit_setup_np	= cxgbit_setup_np,
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+diff --git a/include/target/iscsi/iscsi_transport.h b/include/target/iscsi/iscsi_transport.h
+index e6bb166f12c2..392278b21cf3 100644
+--- a/include/target/iscsi/iscsi_transport.h
++++ b/include/target/iscsi/iscsi_transport.h
+@@ -6,6 +6,7 @@ struct iscsit_transport {
+ #define ISCSIT_TRANSPORT_NAME	16
+ 	char name[ISCSIT_TRANSPORT_NAME];
+ 	int transport_type;
++	bool rdma_shutdown;
+ 	int priv_size;
+ 	struct module *owner;
+ 	struct list_head t_node;
