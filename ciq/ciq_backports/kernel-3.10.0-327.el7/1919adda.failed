@@ -1,0 +1,450 @@
+xfs: don't create a slab cache for filestream items
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1919adda0732e661c6163a6505dddb0bc423b8d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/1919adda.failed
+
+We only have very few of these around, and allocation isn't that
+much of a hot path.  Remove the slab cache to simplify the code,
+and to not waste any resources for the usual case of not having
+any inodes that use the filestream allocator.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 1919adda0732e661c6163a6505dddb0bc423b8d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_filestream.c
+#	fs/xfs/xfs_filestream.h
+diff --cc fs/xfs/xfs_filestream.c
+index 12b6e7701985,7b9403690013..000000000000
+--- a/fs/xfs/xfs_filestream.c
++++ b/fs/xfs/xfs_filestream.c
+@@@ -100,28 -36,19 +100,41 @@@ xfs_filestreams_trace
+  #define TRACE_AG_SCAN(mp, ag, ag2)
+  #define TRACE_AG_PICK1(mp, max_ag, maxfree)
+  #define TRACE_AG_PICK2(mp, ag, ag2, cnt, free, scan, flag)
+ +#define TRACE_UPDATE(mp, ip, ag, cnt, ag2, cnt2)
+  #define TRACE_FREE(mp, ip, pip, ag, cnt)
+  #define TRACE_LOOKUP(mp, ip, pip, ag, cnt)
+ +#define TRACE_ASSOCIATE(mp, ip, pip, ag, cnt)
+ +#define TRACE_MOVEAG(mp, ip, pip, oag, ocnt, nag, ncnt)
+ +#define TRACE_ORPHAN(mp, ip, ag)
+ +#endif
+  
+++<<<<<<< HEAD
+ +static kmem_zone_t *item_zone;
+ +
+ +/*
+ + * Structure for associating a file or a directory with an allocation group.
+ + * The parent directory pointer is only needed for files, but since there will
+ + * generally be vastly more files than directories in the cache, using the same
+ + * data structure simplifies the code with very little memory overhead.
+ + */
+ +typedef struct fstrm_item
+ +{
+ +	xfs_agnumber_t	ag;	/* AG currently in use for the file/directory. */
+ +	xfs_inode_t	*ip;	/* inode self-pointer. */
+ +	xfs_inode_t	*pip;	/* Parent directory inode pointer. */
+ +} fstrm_item_t;
+++=======
++ struct xfs_fstrm_item {
++ 	struct xfs_mru_cache_elem	mru;
++ 	struct xfs_inode		*ip;
++ 	xfs_agnumber_t			ag; /* AG in use for this directory */
++ };
++ 
++ enum xfs_fstrm_alloc {
++ 	XFS_PICK_USERDATA = 1,
++ 	XFS_PICK_LOWSPACE = 2,
++ };
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+  
+  /*
+   * Allocation group filestream associations are tracked with per-ag atomic
+@@@ -200,6 -127,21 +213,24 @@@ xfs_filestream_put_ag
+  	xfs_perag_put(pag);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ xfs_fstrm_free_func(
++ 	struct xfs_mru_cache_elem *mru)
++ {
++ 	struct xfs_fstrm_item	*item =
++ 		container_of(mru, struct xfs_fstrm_item, mru);
++ 
++ 	xfs_filestream_put_ag(item->ip->i_mount, item->ag);
++ 
++ 	TRACE_FREE(mp, ip, NULL, item->ag,
++ 		   xfs_filestream_peek_ag(mp, item->ag));
++ 
++ 	kmem_free(item);
++ }
++ 
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+  /*
+   * Scan the AGs starting at startag looking for an AG that isn't in use and has
+   * at least minlen blocks free.
+@@@ -320,194 -266,30 +351,218 @@@ next_ag
+  
+  	TRACE_AG_PICK2(mp, startag, *agp, streams, free, nscan, flags);
+  
+ -	if (*agp == NULLAGNUMBER)
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Set the allocation group number for a file or a directory, updating inode
+ + * references and per-AG references as appropriate.
+ + */
+ +static int
+ +_xfs_filestream_update_ag(
+ +	xfs_inode_t	*ip,
+ +	xfs_inode_t	*pip,
+ +	xfs_agnumber_t	ag)
+ +{
+ +	int		err = 0;
+ +	xfs_mount_t	*mp;
+ +	xfs_mru_cache_t	*cache;
+ +	fstrm_item_t	*item;
+ +	xfs_agnumber_t	old_ag;
+ +	xfs_inode_t	*old_pip;
+ +
+ +	/*
+ +	 * Either ip is a regular file and pip is a directory, or ip is a
+ +	 * directory and pip is NULL.
+ +	 */
+ +	ASSERT(ip && ((S_ISREG(ip->i_d.di_mode) && pip &&
+ +	               S_ISDIR(pip->i_d.di_mode)) ||
+ +	              (S_ISDIR(ip->i_d.di_mode) && !pip)));
+ +
+ +	mp = ip->i_mount;
+ +	cache = mp->m_filestream;
+ +
+ +	item = xfs_mru_cache_lookup(cache, ip->i_ino);
+ +	if (item) {
+ +		ASSERT(item->ip == ip);
+ +		old_ag = item->ag;
+ +		item->ag = ag;
+ +		old_pip = item->pip;
+ +		item->pip = pip;
+ +		xfs_mru_cache_done(cache);
+ +
+ +		/*
+ +		 * If the AG has changed, drop the old ref and take a new one,
+ +		 * effectively transferring the reference from old to new AG.
+ +		 */
+ +		if (ag != old_ag) {
+ +			xfs_filestream_put_ag(mp, old_ag);
+ +			xfs_filestream_get_ag(mp, ag);
+ +		}
+ +
+ +		/*
+ +		 * If ip is a file and its pip has changed, drop the old ref and
+ +		 * take a new one.
+ +		 */
+ +		if (pip && pip != old_pip) {
+ +			IRELE(old_pip);
+ +			IHOLD(pip);
+ +		}
+ +
+ +		TRACE_UPDATE(mp, ip, old_ag, xfs_filestream_peek_ag(mp, old_ag),
+ +				ag, xfs_filestream_peek_ag(mp, ag));
+  		return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ 	err = ENOMEM;
++ 	item = kmem_alloc(sizeof(*item), KM_MAYFAIL);
++ 	if (!item)
++ 		goto out_put_ag;
++ 
++ 	item->ag = *agp;
++ 	item->ip = ip;
++ 
++ 	err = xfs_mru_cache_insert(mp->m_filestream, ip->i_ino, &item->mru);
++ 	if (err) {
++ 		if (err == EEXIST)
++ 			err = 0;
++ 		goto out_free_item;
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+ +	}
+ +
+ +	item = kmem_zone_zalloc(item_zone, KM_MAYFAIL);
+ +	if (!item)
+ +		return ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	item->ag = ag;
+ +	item->ip = ip;
+ +	item->pip = pip;
+ +
+ +	err = xfs_mru_cache_insert(cache, ip->i_ino, item);
+ +	if (err) {
+ +		kmem_zone_free(item_zone, item);
+ +		return err;
+  	}
+  
+ +	/* Take a reference on the AG. */
+ +	xfs_filestream_get_ag(mp, ag);
+ +
+ +	/*
+ +	 * Take a reference on the inode itself regardless of whether it's a
+ +	 * regular file or a directory.
+ +	 */
+ +	IHOLD(ip);
+ +
+ +	/*
+ +	 * In the case of a regular file, take a reference on the parent inode
+ +	 * as well to ensure it remains in-core.
+ +	 */
+ +	if (pip)
+ +		IHOLD(pip);
+ +
+ +	TRACE_UPDATE(mp, ip, ag, xfs_filestream_peek_ag(mp, ag),
+ +			ag, xfs_filestream_peek_ag(mp, ag));
+ +
+ +	return 0;
+ +}
+ +
+ +/* xfs_fstrm_free_func(): callback for freeing cached stream items. */
+ +STATIC void
+ +xfs_fstrm_free_func(
+ +	unsigned long	ino,
+ +	void		*data)
+ +{
+ +	fstrm_item_t	*item  = (fstrm_item_t *)data;
+ +	xfs_inode_t	*ip = item->ip;
+ +
+ +	ASSERT(ip->i_ino == ino);
+ +
+ +	xfs_iflags_clear(ip, XFS_IFILESTREAM);
+ +
+ +	/* Drop the reference taken on the AG when the item was added. */
+ +	xfs_filestream_put_ag(ip->i_mount, item->ag);
+ +
+ +	TRACE_FREE(ip->i_mount, ip, item->pip, item->ag,
+ +		xfs_filestream_peek_ag(ip->i_mount, item->ag));
+ +
+ +	/*
+ +	 * _xfs_filestream_update_ag() always takes a reference on the inode
+ +	 * itself, whether it's a file or a directory.  Release it here.
+ +	 * This can result in the inode being freed and so we must
+ +	 * not hold any inode locks when freeing filesstreams objects
+ +	 * otherwise we can deadlock here.
+ +	 */
+ +	IRELE(ip);
+ +
+ +	/*
+ +	 * In the case of a regular file, _xfs_filestream_update_ag() also
+ +	 * takes a ref on the parent inode to keep it in-core.  Release that
+ +	 * too.
+ +	 */
+ +	if (item->pip)
+ +		IRELE(item->pip);
+ +
+ +	/* Finally, free the memory allocated for the item. */
+ +	kmem_zone_free(item_zone, item);
+ +}
+ +
+ +/*
+ + * xfs_filestream_init() is called at xfs initialisation time to set up the
+ + * memory zone that will be used for filestream data structure allocation.
+ + */
+ +int
+ +xfs_filestream_init(void)
+ +{
+ +	item_zone = kmem_zone_init(sizeof(fstrm_item_t), "fstrm_item");
+ +	if (!item_zone)
+ +		return -ENOMEM;
+ +
+  	return 0;
+ +}
+ +
+ +/*
+ + * xfs_filestream_uninit() is called at xfs termination time to destroy the
+ + * memory zone that was used for filestream data structure allocation.
+ + */
+ +void
+ +xfs_filestream_uninit(void)
+ +{
+ +	kmem_zone_destroy(item_zone);
+ +}
+  
+ +/*
+ + * xfs_filestream_mount() is called when a file system is mounted with the
+ + * filestream option.  It is responsible for allocating the data structures
+ + * needed to track the new file system's file streams.
+ + */
+ +int
+ +xfs_filestream_mount(
+ +	xfs_mount_t	*mp)
+ +{
+ +	int		err;
+ +	unsigned int	lifetime, grp_count;
+ +
+ +	/*
+ +	 * The filestream timer tunable is currently fixed within the range of
+ +	 * one second to four minutes, with five seconds being the default.  The
+ +	 * group count is somewhat arbitrary, but it'd be nice to adhere to the
+ +	 * timer tunable to within about 10 percent.  This requires at least 10
+ +	 * groups.
+ +	 */
+ +	lifetime  = xfs_fstrm_centisecs * 10;
+ +	grp_count = 10;
+ +
+ +	err = xfs_mru_cache_create(&mp->m_filestream, lifetime, grp_count,
+ +	                     xfs_fstrm_free_func);
+ +
+++=======
++ out_free_item:
++ 	kmem_free(item);
++ out_put_ag:
++ 	xfs_filestream_put_ag(mp, *agp);
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+  	return err;
+  }
+  
+@@@ -810,15 -444,31 +865,38 @@@ exit
+  	return err;
+  }
+  
+ +/*
+ + * Remove an association between an inode and a filestream object.
+ + * Typically this is done on last close of an unlinked file.
+ + */
+  void
+  xfs_filestream_deassociate(
+ -	struct xfs_inode	*ip)
+ +	xfs_inode_t	*ip)
+  {
+ -	xfs_mru_cache_delete(ip->i_mount->m_filestream, ip->i_ino);
+ -}
+ +	xfs_mru_cache_t	*cache = ip->i_mount->m_filestream;
+  
+++<<<<<<< HEAD
+ +	xfs_mru_cache_delete(cache, ip->i_ino);
+++=======
++ int
++ xfs_filestream_mount(
++ 	xfs_mount_t	*mp)
++ {
++ 	/*
++ 	 * The filestream timer tunable is currently fixed within the range of
++ 	 * one second to four minutes, with five seconds being the default.  The
++ 	 * group count is somewhat arbitrary, but it'd be nice to adhere to the
++ 	 * timer tunable to within about 10 percent.  This requires at least 10
++ 	 * groups.
++ 	 */
++ 	return xfs_mru_cache_create(&mp->m_filestream, xfs_fstrm_centisecs * 10,
++ 				    10, xfs_fstrm_free_func);
++ }
++ 
++ void
++ xfs_filestream_unmount(
++ 	xfs_mount_t	*mp)
++ {
++ 	xfs_mru_cache_destroy(mp->m_filestream);
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+  }
+diff --cc fs/xfs/xfs_filestream.h
+index 6d61dbee8564,578d49e7cffc..000000000000
+--- a/fs/xfs/xfs_filestream.h
++++ b/fs/xfs/xfs_filestream.h
+@@@ -20,44 -20,15 +20,47 @@@
+  
+  struct xfs_mount;
+  struct xfs_inode;
+ +struct xfs_perag;
+  struct xfs_bmalloca;
+  
+++<<<<<<< HEAD
+ +#ifdef XFS_FILESTREAMS_TRACE
+ +#define XFS_FSTRM_KTRACE_INFO		1
+ +#define XFS_FSTRM_KTRACE_AGSCAN		2
+ +#define XFS_FSTRM_KTRACE_AGPICK1	3
+ +#define XFS_FSTRM_KTRACE_AGPICK2	4
+ +#define XFS_FSTRM_KTRACE_UPDATE		5
+ +#define XFS_FSTRM_KTRACE_FREE		6
+ +#define	XFS_FSTRM_KTRACE_ITEM_LOOKUP	7
+ +#define	XFS_FSTRM_KTRACE_ASSOCIATE	8
+ +#define	XFS_FSTRM_KTRACE_MOVEAG		9
+ +#define	XFS_FSTRM_KTRACE_ORPHAN		10
+ +
+ +#define XFS_FSTRM_KTRACE_SIZE	16384
+ +extern ktrace_t *xfs_filestreams_trace_buf;
+ +
+ +#endif
+ +
+ +/* allocation selection flags */
+ +typedef enum xfs_fstrm_alloc {
+ +	XFS_PICK_USERDATA = 1,
+ +	XFS_PICK_LOWSPACE = 2,
+ +} xfs_fstrm_alloc_t;
+ +
+ +/* prototypes for filestream.c */
+ +int xfs_filestream_init(void);
+ +void xfs_filestream_uninit(void);
+++=======
+++>>>>>>> 1919adda0732 (xfs: don't create a slab cache for filestream items)
+  int xfs_filestream_mount(struct xfs_mount *mp);
+  void xfs_filestream_unmount(struct xfs_mount *mp);
+ -void xfs_filestream_deassociate(struct xfs_inode *ip);
+  xfs_agnumber_t xfs_filestream_lookup_ag(struct xfs_inode *ip);
+ -int xfs_filestream_associate(struct xfs_inode *dip);
+ +int xfs_filestream_associate(struct xfs_inode *dip, struct xfs_inode *ip);
+ +void xfs_filestream_deassociate(struct xfs_inode *ip);
+  int xfs_filestream_new_ag(struct xfs_bmalloca *ap, xfs_agnumber_t *agp);
+  
+ +
+ +/* filestreams for the inode? */
+  static inline int
+  xfs_inode_is_filestream(
+  	struct xfs_inode	*ip)
+* Unmerged path fs/xfs/xfs_filestream.c
+* Unmerged path fs/xfs/xfs_filestream.h
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 86f14eb42642..a372f596a51b 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1763,13 +1763,9 @@ init_xfs_fs(void)
+ 	if (error)
+ 		goto out_destroy_wq;
+ 
+-	error = xfs_filestream_init();
+-	if (error)
+-		goto out_mru_cache_uninit;
+-
+ 	error = xfs_buf_init();
+ 	if (error)
+-		goto out_filestream_uninit;
++		goto out_mru_cache_uninit;
+ 
+ 	error = xfs_init_procfs();
+ 	if (error)
+@@ -1796,8 +1792,6 @@ init_xfs_fs(void)
+ 	xfs_cleanup_procfs();
+  out_buf_terminate:
+ 	xfs_buf_terminate();
+- out_filestream_uninit:
+-	xfs_filestream_uninit();
+  out_mru_cache_uninit:
+ 	xfs_mru_cache_uninit();
+  out_destroy_wq:
+@@ -1816,7 +1810,6 @@ exit_xfs_fs(void)
+ 	xfs_sysctl_unregister();
+ 	xfs_cleanup_procfs();
+ 	xfs_buf_terminate();
+-	xfs_filestream_uninit();
+ 	xfs_mru_cache_uninit();
+ 	xfs_destroy_workqueues();
+ 	xfs_destroy_zones();
