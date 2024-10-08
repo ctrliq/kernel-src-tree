@@ -1,0 +1,644 @@
+drm/vmwgfx: Kill some lockdep warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [drm] vmwgfx: Kill some lockdep warnings (Rob Clark) [1348329 1349064]
+Rebuild_FUZZ: 94.44%
+commit-author Thomas Hellstrom <thellstrom@vmware.com>
+commit 93cd16817ae5ddcfc548784b51c76bf6d7923442
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/93cd1681.failed
+
+Some global KMS state that is elsewhere protected by the mode_config
+mutex here needs to be protected with a local mutex. Remove corresponding
+lockdep checks and introduce a new driver-private global_kms_state_mutex,
+and make sure its locking order is *after* the crtc locks in order to
+avoid having to release those when the new mutex is taken.
+
+	Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+	Reviewed-by: Brian Paul <brianp@vmware.com>
+	Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+	Cc: <stable@vger.kernel.org> # 4.6
+(cherry picked from commit 93cd16817ae5ddcfc548784b51c76bf6d7923442)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+#	drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+#	drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+#	drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index d26a6daa9719,6db358a85b46..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@@ -420,9 -405,14 +420,17 @@@ struct vmw_private 
+  	 */
+  
+  	void *fb_info;
+ -	enum vmw_display_unit_type active_display_unit;
+  	struct vmw_legacy_display *ldu_priv;
+ +	struct vmw_screen_object_display *sou_priv;
+  	struct vmw_overlay *overlay_priv;
+++<<<<<<< HEAD
+++=======
++ 	struct drm_property *hotplug_mode_update_property;
++ 	struct drm_property *implicit_placement_property;
++ 	unsigned num_implicit;
++ 	struct vmw_framebuffer *implicit_fb;
++ 	struct mutex global_kms_state_mutex;
+++>>>>>>> 93cd16817ae5 (drm/vmwgfx: Kill some lockdep warnings)
+  
+  	/*
+  	 * Context and surface management.
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 07cda8cbbddb,55231cce73a0..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@@ -2070,3 -1718,533 +2070,536 @@@ out_free
+  	kfree(rects);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * vmw_kms_helper_dirty - Helper to build commands and perform actions based
++  * on a set of cliprects and a set of display units.
++  *
++  * @dev_priv: Pointer to a device private structure.
++  * @framebuffer: Pointer to the framebuffer on which to perform the actions.
++  * @clips: A set of struct drm_clip_rect. Either this os @vclips must be NULL.
++  * Cliprects are given in framebuffer coordinates.
++  * @vclips: A set of struct drm_vmw_rect cliprects. Either this or @clips must
++  * be NULL. Cliprects are given in source coordinates.
++  * @dest_x: X coordinate offset for the crtc / destination clip rects.
++  * @dest_y: Y coordinate offset for the crtc / destination clip rects.
++  * @num_clips: Number of cliprects in the @clips or @vclips array.
++  * @increment: Integer with which to increment the clip counter when looping.
++  * Used to skip a predetermined number of clip rects.
++  * @dirty: Closure structure. See the description of struct vmw_kms_dirty.
++  */
++ int vmw_kms_helper_dirty(struct vmw_private *dev_priv,
++ 			 struct vmw_framebuffer *framebuffer,
++ 			 const struct drm_clip_rect *clips,
++ 			 const struct drm_vmw_rect *vclips,
++ 			 s32 dest_x, s32 dest_y,
++ 			 int num_clips,
++ 			 int increment,
++ 			 struct vmw_kms_dirty *dirty)
++ {
++ 	struct vmw_display_unit *units[VMWGFX_NUM_DISPLAY_UNITS];
++ 	struct drm_crtc *crtc;
++ 	u32 num_units = 0;
++ 	u32 i, k;
++ 
++ 	dirty->dev_priv = dev_priv;
++ 
++ 	list_for_each_entry(crtc, &dev_priv->dev->mode_config.crtc_list, head) {
++ 		if (crtc->primary->fb != &framebuffer->base)
++ 			continue;
++ 		units[num_units++] = vmw_crtc_to_du(crtc);
++ 	}
++ 
++ 	for (k = 0; k < num_units; k++) {
++ 		struct vmw_display_unit *unit = units[k];
++ 		s32 crtc_x = unit->crtc.x;
++ 		s32 crtc_y = unit->crtc.y;
++ 		s32 crtc_width = unit->crtc.mode.hdisplay;
++ 		s32 crtc_height = unit->crtc.mode.vdisplay;
++ 		const struct drm_clip_rect *clips_ptr = clips;
++ 		const struct drm_vmw_rect *vclips_ptr = vclips;
++ 
++ 		dirty->unit = unit;
++ 		if (dirty->fifo_reserve_size > 0) {
++ 			dirty->cmd = vmw_fifo_reserve(dev_priv,
++ 						      dirty->fifo_reserve_size);
++ 			if (!dirty->cmd) {
++ 				DRM_ERROR("Couldn't reserve fifo space "
++ 					  "for dirty blits.\n");
++ 				return -ENOMEM;
++ 			}
++ 			memset(dirty->cmd, 0, dirty->fifo_reserve_size);
++ 		}
++ 		dirty->num_hits = 0;
++ 		for (i = 0; i < num_clips; i++, clips_ptr += increment,
++ 		       vclips_ptr += increment) {
++ 			s32 clip_left;
++ 			s32 clip_top;
++ 
++ 			/*
++ 			 * Select clip array type. Note that integer type
++ 			 * in @clips is unsigned short, whereas in @vclips
++ 			 * it's 32-bit.
++ 			 */
++ 			if (clips) {
++ 				dirty->fb_x = (s32) clips_ptr->x1;
++ 				dirty->fb_y = (s32) clips_ptr->y1;
++ 				dirty->unit_x2 = (s32) clips_ptr->x2 + dest_x -
++ 					crtc_x;
++ 				dirty->unit_y2 = (s32) clips_ptr->y2 + dest_y -
++ 					crtc_y;
++ 			} else {
++ 				dirty->fb_x = vclips_ptr->x;
++ 				dirty->fb_y = vclips_ptr->y;
++ 				dirty->unit_x2 = dirty->fb_x + vclips_ptr->w +
++ 					dest_x - crtc_x;
++ 				dirty->unit_y2 = dirty->fb_y + vclips_ptr->h +
++ 					dest_y - crtc_y;
++ 			}
++ 
++ 			dirty->unit_x1 = dirty->fb_x + dest_x - crtc_x;
++ 			dirty->unit_y1 = dirty->fb_y + dest_y - crtc_y;
++ 
++ 			/* Skip this clip if it's outside the crtc region */
++ 			if (dirty->unit_x1 >= crtc_width ||
++ 			    dirty->unit_y1 >= crtc_height ||
++ 			    dirty->unit_x2 <= 0 || dirty->unit_y2 <= 0)
++ 				continue;
++ 
++ 			/* Clip right and bottom to crtc limits */
++ 			dirty->unit_x2 = min_t(s32, dirty->unit_x2,
++ 					       crtc_width);
++ 			dirty->unit_y2 = min_t(s32, dirty->unit_y2,
++ 					       crtc_height);
++ 
++ 			/* Clip left and top to crtc limits */
++ 			clip_left = min_t(s32, dirty->unit_x1, 0);
++ 			clip_top = min_t(s32, dirty->unit_y1, 0);
++ 			dirty->unit_x1 -= clip_left;
++ 			dirty->unit_y1 -= clip_top;
++ 			dirty->fb_x -= clip_left;
++ 			dirty->fb_y -= clip_top;
++ 
++ 			dirty->clip(dirty);
++ 		}
++ 
++ 		dirty->fifo_commit(dirty);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * vmw_kms_helper_buffer_prepare - Reserve and validate a buffer object before
++  * command submission.
++  *
++  * @dev_priv. Pointer to a device private structure.
++  * @buf: The buffer object
++  * @interruptible: Whether to perform waits as interruptible.
++  * @validate_as_mob: Whether the buffer should be validated as a MOB. If false,
++  * The buffer will be validated as a GMR. Already pinned buffers will not be
++  * validated.
++  *
++  * Returns 0 on success, negative error code on failure, -ERESTARTSYS if
++  * interrupted by a signal.
++  */
++ int vmw_kms_helper_buffer_prepare(struct vmw_private *dev_priv,
++ 				  struct vmw_dma_buffer *buf,
++ 				  bool interruptible,
++ 				  bool validate_as_mob)
++ {
++ 	struct ttm_buffer_object *bo = &buf->base;
++ 	int ret;
++ 
++ 	ttm_bo_reserve(bo, false, false, NULL);
++ 	ret = vmw_validate_single_buffer(dev_priv, bo, interruptible,
++ 					 validate_as_mob);
++ 	if (ret)
++ 		ttm_bo_unreserve(bo);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * vmw_kms_helper_buffer_revert - Undo the actions of
++  * vmw_kms_helper_buffer_prepare.
++  *
++  * @res: Pointer to the buffer object.
++  *
++  * Helper to be used if an error forces the caller to undo the actions of
++  * vmw_kms_helper_buffer_prepare.
++  */
++ void vmw_kms_helper_buffer_revert(struct vmw_dma_buffer *buf)
++ {
++ 	if (buf)
++ 		ttm_bo_unreserve(&buf->base);
++ }
++ 
++ /**
++  * vmw_kms_helper_buffer_finish - Unreserve and fence a buffer object after
++  * kms command submission.
++  *
++  * @dev_priv: Pointer to a device private structure.
++  * @file_priv: Pointer to a struct drm_file representing the caller's
++  * connection. Must be set to NULL if @user_fence_rep is NULL, and conversely
++  * if non-NULL, @user_fence_rep must be non-NULL.
++  * @buf: The buffer object.
++  * @out_fence:  Optional pointer to a fence pointer. If non-NULL, a
++  * ref-counted fence pointer is returned here.
++  * @user_fence_rep: Optional pointer to a user-space provided struct
++  * drm_vmw_fence_rep. If provided, @file_priv must also be provided and the
++  * function copies fence data to user-space in a fail-safe manner.
++  */
++ void vmw_kms_helper_buffer_finish(struct vmw_private *dev_priv,
++ 				  struct drm_file *file_priv,
++ 				  struct vmw_dma_buffer *buf,
++ 				  struct vmw_fence_obj **out_fence,
++ 				  struct drm_vmw_fence_rep __user *
++ 				  user_fence_rep)
++ {
++ 	struct vmw_fence_obj *fence;
++ 	uint32_t handle;
++ 	int ret;
++ 
++ 	ret = vmw_execbuf_fence_commands(file_priv, dev_priv, &fence,
++ 					 file_priv ? &handle : NULL);
++ 	if (buf)
++ 		vmw_fence_single_bo(&buf->base, fence);
++ 	if (file_priv)
++ 		vmw_execbuf_copy_fence_user(dev_priv, vmw_fpriv(file_priv),
++ 					    ret, user_fence_rep, fence,
++ 					    handle);
++ 	if (out_fence)
++ 		*out_fence = fence;
++ 	else
++ 		vmw_fence_obj_unreference(&fence);
++ 
++ 	vmw_kms_helper_buffer_revert(buf);
++ }
++ 
++ 
++ /**
++  * vmw_kms_helper_resource_revert - Undo the actions of
++  * vmw_kms_helper_resource_prepare.
++  *
++  * @res: Pointer to the resource. Typically a surface.
++  *
++  * Helper to be used if an error forces the caller to undo the actions of
++  * vmw_kms_helper_resource_prepare.
++  */
++ void vmw_kms_helper_resource_revert(struct vmw_resource *res)
++ {
++ 	vmw_kms_helper_buffer_revert(res->backup);
++ 	vmw_resource_unreserve(res, false, NULL, 0);
++ 	mutex_unlock(&res->dev_priv->cmdbuf_mutex);
++ }
++ 
++ /**
++  * vmw_kms_helper_resource_prepare - Reserve and validate a resource before
++  * command submission.
++  *
++  * @res: Pointer to the resource. Typically a surface.
++  * @interruptible: Whether to perform waits as interruptible.
++  *
++  * Reserves and validates also the backup buffer if a guest-backed resource.
++  * Returns 0 on success, negative error code on failure. -ERESTARTSYS if
++  * interrupted by a signal.
++  */
++ int vmw_kms_helper_resource_prepare(struct vmw_resource *res,
++ 				    bool interruptible)
++ {
++ 	int ret = 0;
++ 
++ 	if (interruptible)
++ 		ret = mutex_lock_interruptible(&res->dev_priv->cmdbuf_mutex);
++ 	else
++ 		mutex_lock(&res->dev_priv->cmdbuf_mutex);
++ 
++ 	if (unlikely(ret != 0))
++ 		return -ERESTARTSYS;
++ 
++ 	ret = vmw_resource_reserve(res, interruptible, false);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	if (res->backup) {
++ 		ret = vmw_kms_helper_buffer_prepare(res->dev_priv, res->backup,
++ 						    interruptible,
++ 						    res->dev_priv->has_mob);
++ 		if (ret)
++ 			goto out_unreserve;
++ 	}
++ 	ret = vmw_resource_validate(res);
++ 	if (ret)
++ 		goto out_revert;
++ 	return 0;
++ 
++ out_revert:
++ 	vmw_kms_helper_buffer_revert(res->backup);
++ out_unreserve:
++ 	vmw_resource_unreserve(res, false, NULL, 0);
++ out_unlock:
++ 	mutex_unlock(&res->dev_priv->cmdbuf_mutex);
++ 	return ret;
++ }
++ 
++ /**
++  * vmw_kms_helper_resource_finish - Unreserve and fence a resource after
++  * kms command submission.
++  *
++  * @res: Pointer to the resource. Typically a surface.
++  * @out_fence: Optional pointer to a fence pointer. If non-NULL, a
++  * ref-counted fence pointer is returned here.
++  */
++ void vmw_kms_helper_resource_finish(struct vmw_resource *res,
++ 			     struct vmw_fence_obj **out_fence)
++ {
++ 	if (res->backup || out_fence)
++ 		vmw_kms_helper_buffer_finish(res->dev_priv, NULL, res->backup,
++ 					     out_fence, NULL);
++ 
++ 	vmw_resource_unreserve(res, false, NULL, 0);
++ 	mutex_unlock(&res->dev_priv->cmdbuf_mutex);
++ }
++ 
++ /**
++  * vmw_kms_update_proxy - Helper function to update a proxy surface from
++  * its backing MOB.
++  *
++  * @res: Pointer to the surface resource
++  * @clips: Clip rects in framebuffer (surface) space.
++  * @num_clips: Number of clips in @clips.
++  * @increment: Integer with which to increment the clip counter when looping.
++  * Used to skip a predetermined number of clip rects.
++  *
++  * This function makes sure the proxy surface is updated from its backing MOB
++  * using the region given by @clips. The surface resource @res and its backing
++  * MOB needs to be reserved and validated on call.
++  */
++ int vmw_kms_update_proxy(struct vmw_resource *res,
++ 			 const struct drm_clip_rect *clips,
++ 			 unsigned num_clips,
++ 			 int increment)
++ {
++ 	struct vmw_private *dev_priv = res->dev_priv;
++ 	struct drm_vmw_size *size = &vmw_res_to_srf(res)->base_size;
++ 	struct {
++ 		SVGA3dCmdHeader header;
++ 		SVGA3dCmdUpdateGBImage body;
++ 	} *cmd;
++ 	SVGA3dBox *box;
++ 	size_t copy_size = 0;
++ 	int i;
++ 
++ 	if (!clips)
++ 		return 0;
++ 
++ 	cmd = vmw_fifo_reserve(dev_priv, sizeof(*cmd) * num_clips);
++ 	if (!cmd) {
++ 		DRM_ERROR("Couldn't reserve fifo space for proxy surface "
++ 			  "update.\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for (i = 0; i < num_clips; ++i, clips += increment, ++cmd) {
++ 		box = &cmd->body.box;
++ 
++ 		cmd->header.id = SVGA_3D_CMD_UPDATE_GB_IMAGE;
++ 		cmd->header.size = sizeof(cmd->body);
++ 		cmd->body.image.sid = res->id;
++ 		cmd->body.image.face = 0;
++ 		cmd->body.image.mipmap = 0;
++ 
++ 		if (clips->x1 > size->width || clips->x2 > size->width ||
++ 		    clips->y1 > size->height || clips->y2 > size->height) {
++ 			DRM_ERROR("Invalid clips outsize of framebuffer.\n");
++ 			return -EINVAL;
++ 		}
++ 
++ 		box->x = clips->x1;
++ 		box->y = clips->y1;
++ 		box->z = 0;
++ 		box->w = clips->x2 - clips->x1;
++ 		box->h = clips->y2 - clips->y1;
++ 		box->d = 1;
++ 
++ 		copy_size += sizeof(*cmd);
++ 	}
++ 
++ 	vmw_fifo_commit(dev_priv, copy_size);
++ 
++ 	return 0;
++ }
++ 
++ int vmw_kms_fbdev_init_data(struct vmw_private *dev_priv,
++ 			    unsigned unit,
++ 			    u32 max_width,
++ 			    u32 max_height,
++ 			    struct drm_connector **p_con,
++ 			    struct drm_crtc **p_crtc,
++ 			    struct drm_display_mode **p_mode)
++ {
++ 	struct drm_connector *con;
++ 	struct vmw_display_unit *du;
++ 	struct drm_display_mode *mode;
++ 	int i = 0;
++ 
++ 	list_for_each_entry(con, &dev_priv->dev->mode_config.connector_list,
++ 			    head) {
++ 		if (i == unit)
++ 			break;
++ 
++ 		++i;
++ 	}
++ 
++ 	if (i != unit) {
++ 		DRM_ERROR("Could not find initial display unit.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (list_empty(&con->modes))
++ 		(void) vmw_du_connector_fill_modes(con, max_width, max_height);
++ 
++ 	if (list_empty(&con->modes)) {
++ 		DRM_ERROR("Could not find initial display mode.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	du = vmw_connector_to_du(con);
++ 	*p_con = con;
++ 	*p_crtc = &du->crtc;
++ 
++ 	list_for_each_entry(mode, &con->modes, head) {
++ 		if (mode->type & DRM_MODE_TYPE_PREFERRED)
++ 			break;
++ 	}
++ 
++ 	if (mode->type & DRM_MODE_TYPE_PREFERRED)
++ 		*p_mode = mode;
++ 	else {
++ 		WARN_ONCE(true, "Could not find initial preferred mode.\n");
++ 		*p_mode = list_first_entry(&con->modes,
++ 					   struct drm_display_mode,
++ 					   head);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * vmw_kms_del_active - unregister a crtc binding to the implicit framebuffer
++  *
++  * @dev_priv: Pointer to a device private struct.
++  * @du: The display unit of the crtc.
++  */
++ void vmw_kms_del_active(struct vmw_private *dev_priv,
++ 			struct vmw_display_unit *du)
++ {
++ 	mutex_lock(&dev_priv->global_kms_state_mutex);
++ 	if (du->active_implicit) {
++ 		if (--(dev_priv->num_implicit) == 0)
++ 			dev_priv->implicit_fb = NULL;
++ 		du->active_implicit = false;
++ 	}
++ 	mutex_unlock(&dev_priv->global_kms_state_mutex);
++ }
++ 
++ /**
++  * vmw_kms_add_active - register a crtc binding to an implicit framebuffer
++  *
++  * @vmw_priv: Pointer to a device private struct.
++  * @du: The display unit of the crtc.
++  * @vfb: The implicit framebuffer
++  *
++  * Registers a binding to an implicit framebuffer.
++  */
++ void vmw_kms_add_active(struct vmw_private *dev_priv,
++ 			struct vmw_display_unit *du,
++ 			struct vmw_framebuffer *vfb)
++ {
++ 	mutex_lock(&dev_priv->global_kms_state_mutex);
++ 	WARN_ON_ONCE(!dev_priv->num_implicit && dev_priv->implicit_fb);
++ 
++ 	if (!du->active_implicit && du->is_implicit) {
++ 		dev_priv->implicit_fb = vfb;
++ 		du->active_implicit = true;
++ 		dev_priv->num_implicit++;
++ 	}
++ 	mutex_unlock(&dev_priv->global_kms_state_mutex);
++ }
++ 
++ /**
++  * vmw_kms_screen_object_flippable - Check whether we can page-flip a crtc.
++  *
++  * @dev_priv: Pointer to device-private struct.
++  * @crtc: The crtc we want to flip.
++  *
++  * Returns true or false depending whether it's OK to flip this crtc
++  * based on the criterion that we must not have more than one implicit
++  * frame-buffer at any one time.
++  */
++ bool vmw_kms_crtc_flippable(struct vmw_private *dev_priv,
++ 			    struct drm_crtc *crtc)
++ {
++ 	struct vmw_display_unit *du = vmw_crtc_to_du(crtc);
++ 	bool ret;
++ 
++ 	mutex_lock(&dev_priv->global_kms_state_mutex);
++ 	ret = !du->is_implicit || dev_priv->num_implicit == 1;
++ 	mutex_unlock(&dev_priv->global_kms_state_mutex);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * vmw_kms_update_implicit_fb - Update the implicit fb.
++  *
++  * @dev_priv: Pointer to device-private struct.
++  * @crtc: The crtc the new implicit frame-buffer is bound to.
++  */
++ void vmw_kms_update_implicit_fb(struct vmw_private *dev_priv,
++ 				struct drm_crtc *crtc)
++ {
++ 	struct vmw_display_unit *du = vmw_crtc_to_du(crtc);
++ 	struct vmw_framebuffer *vfb;
++ 
++ 	mutex_lock(&dev_priv->global_kms_state_mutex);
++ 
++ 	if (!du->is_implicit)
++ 		goto out_unlock;
++ 
++ 	vfb = vmw_framebuffer_to_vfb(crtc->primary->fb);
++ 	WARN_ON_ONCE(dev_priv->num_implicit != 1 &&
++ 		     dev_priv->implicit_fb != vfb);
++ 
++ 	dev_priv->implicit_fb = vfb;
++ out_unlock:
++ 	mutex_unlock(&dev_priv->global_kms_state_mutex);
++ }
++ 
++ /**
++  * vmw_kms_create_implicit_placement_proparty - Set up the implicit placement
++  * property.
++  *
++  * @dev_priv: Pointer to a device private struct.
++  * @immutable: Whether the property is immutable.
++  *
++  * Sets up the implicit placement property unless it's already set up.
++  */
++ void
++ vmw_kms_create_implicit_placement_property(struct vmw_private *dev_priv,
++ 					   bool immutable)
++ {
++ 	if (dev_priv->implicit_placement_property)
++ 		return;
++ 
++ 	dev_priv->implicit_placement_property =
++ 		drm_property_create_range(dev_priv->dev,
++ 					  immutable ?
++ 					  DRM_MODE_PROP_IMMUTABLE : 0,
++ 					  "implicit_placement", 0, 1);
++ 
++ }
+++>>>>>>> 93cd16817ae5 (drm/vmwgfx: Kill some lockdep warnings)
+diff --cc drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+index 7dc591d04d9a,b74eae2b8594..000000000000
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+@@@ -285,15 -284,18 +285,28 @@@ static int vmw_sou_crtc_set_config(stru
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* sou only supports one fb active at the time */
+ +	if (sou->base.is_implicit &&
+ +	    dev_priv->sou_priv->implicit_fb && vfb &&
+ +	    !(dev_priv->sou_priv->num_implicit == 1 &&
+ +	      sou->active_implicit) &&
+ +	    dev_priv->sou_priv->implicit_fb != vfb) {
+ +		DRM_ERROR("Multiple framebuffers not supported\n");
+++=======
++ 	/* Only one active implicit frame-buffer at a time. */
++ 	mutex_lock(&dev_priv->global_kms_state_mutex);
++ 	if (sou->base.is_implicit &&
++ 	    dev_priv->implicit_fb && vfb &&
++ 	    !(dev_priv->num_implicit == 1 &&
++ 	      sou->base.active_implicit) &&
++ 	    dev_priv->implicit_fb != vfb) {
++ 		mutex_unlock(&dev_priv->global_kms_state_mutex);
++ 		DRM_ERROR("Multiple implicit framebuffers not supported.\n");
+++>>>>>>> 93cd16817ae5 (drm/vmwgfx: Kill some lockdep warnings)
+  		return -EINVAL;
+  	}
++ 	mutex_unlock(&dev_priv->global_kms_state_mutex);
+  
+  	/* since they always map one to one these are safe */
+  	connector = &sou->base.connector;
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 620bb5cf617c..4955fc3919a4 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -598,6 +598,7 @@ static int vmw_driver_load(struct drm_device *dev, unsigned long chipset)
+ 	mutex_init(&dev_priv->cmdbuf_mutex);
+ 	mutex_init(&dev_priv->release_mutex);
+ 	mutex_init(&dev_priv->binding_mutex);
++	mutex_init(&dev_priv->global_kms_state_mutex);
+ 	rwlock_init(&dev_priv->resource_lock);
+ 	ttm_lock_init(&dev_priv->reservation_sem);
+ 	spin_lock_init(&dev_priv->hw_lock);
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+* Unmerged path drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
