@@ -1,0 +1,589 @@
+nvme: move namespace scanning to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5bae7f73d378a986671a3cad717c721b38f80d9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5bae7f73.failed
+
+The namespace scanning code has been mostly generic already, we just
+need to store a pointer to the tagset in the nvme_ctrl structure, and
+add a method to check if a controller is I/O incapable.  The latter
+will hopefully be replaced by a proper controller state machine soon.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+[Fixed pr conflicts]
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 5bae7f73d378a986671a3cad717c721b38f80d9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/block/nvme-core.c
+index 2a6eb55ad96c,697dc1fb5ef9..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -95,6 -101,42 +91,45 @@@ struct async_cmd_info 
+  };
+  
+  /*
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+++=======
++  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
++  */
++ struct nvme_dev {
++ 	struct list_head node;
++ 	struct nvme_queue **queues;
++ 	struct blk_mq_tag_set tagset;
++ 	struct blk_mq_tag_set admin_tagset;
++ 	u32 __iomem *dbs;
++ 	struct device *dev;
++ 	struct dma_pool *prp_page_pool;
++ 	struct dma_pool *prp_small_pool;
++ 	unsigned queue_count;
++ 	unsigned online_queues;
++ 	unsigned max_qid;
++ 	int q_depth;
++ 	u32 db_stride;
++ 	struct msix_entry *entry;
++ 	void __iomem *bar;
++ 	struct work_struct reset_work;
++ 	struct work_struct probe_work;
++ 	struct work_struct scan_work;
++ 	bool subsystem;
++ 	void __iomem *cmb;
++ 	dma_addr_t cmb_dma_addr;
++ 	u64 cmb_size;
++ 	u32 cmbsz;
++ 
++ 	struct nvme_ctrl ctrl;
++ };
++ 
++ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
++ {
++ 	return container_of(ctrl, struct nvme_dev, ctrl);
++ }
++ 
++ /*
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+   * An NVM Express queue.  Each device has at least two (one for admin
+   * commands and one for I/O commands).
+   */
+@@@ -2105,88 -1555,13 +2140,98 @@@ static int nvme_kthread(void *data
+  	return 0;
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_alloc_ns(struct nvme_dev *dev, unsigned nsid)
+ +{
+ +	struct nvme_ns *ns;
+ +	struct gendisk *disk;
+ +	int node = dev_to_node(&dev->pci_dev->dev);
+ +
+ +	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
+ +	if (!ns)
+ +		return;
+ +
+ +	ns->queue = blk_mq_init_queue(&dev->tagset);
+ +	if (IS_ERR(ns->queue))
+ +		goto out_free_ns;
+ +	queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, ns->queue);
+ +	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, ns->queue);
+ +	queue_flag_set_unlocked(QUEUE_FLAG_SG_GAPS, ns->queue);
+ +	ns->dev = dev;
+ +	ns->queue->queuedata = ns;
+ +
+ +	disk = alloc_disk_node(0, node);
+ +	if (!disk)
+ +		goto out_free_queue;
+ +
+ +	kref_init(&ns->kref);
+ +	ns->ns_id = nsid;
+ +	ns->disk = disk;
+ +	ns->lba_shift = 9; /* set to a default value for 512 until disk is validated */
+ +	list_add_tail(&ns->list, &dev->namespaces);
+ +
+ +	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+ +	if (dev->max_hw_sectors) {
+ +		blk_queue_max_hw_sectors(ns->queue, dev->max_hw_sectors);
+ +		blk_queue_max_segments(ns->queue,
+ +			(dev->max_hw_sectors / (dev->page_size >> 9)) + 1);
+ +	}
+ +	if (dev->stripe_size)
+ +		blk_queue_chunk_sectors(ns->queue, dev->stripe_size >> 9);
+ +	if (dev->vwc & NVME_CTRL_VWC_PRESENT)
+ +		blk_queue_flush(ns->queue, REQ_FLUSH | REQ_FUA);
+ +
+ +	disk->major = nvme_major;
+ +	disk->first_minor = 0;
+ +	disk->fops = &nvme_fops;
+ +	disk->private_data = ns;
+ +	disk->queue = ns->queue;
+ +	disk->driverfs_dev = dev->device;
+ +	disk->flags = GENHD_FL_EXT_DEVT;
+ +	sprintf(disk->disk_name, "nvme%dn%d", dev->instance, nsid);
+ +
+ +	/*
+ +	 * Initialize capacity to 0 until we establish the namespace format and
+ +	 * setup integrity extentions if necessary. The revalidate_disk after
+ +	 * add_disk allows the driver to register with integrity if the format
+ +	 * requires it.
+ +	 */
+ +	set_capacity(disk, 0);
+ +	if (nvme_revalidate_disk(ns->disk))
+ +		goto out_free_disk;
+ +
+ +	kref_get(&dev->kref);
+ +	add_disk(ns->disk);
+ +	if (ns->ms) {
+ +		struct block_device *bd = bdget_disk(ns->disk, 0);
+ +		if (!bd)
+ +			return;
+ +		if (blkdev_get(bd, FMODE_READ, NULL)) {
+ +			bdput(bd);
+ +			return;
+ +		}
+ +		blkdev_reread_part(bd);
+ +		blkdev_put(bd, FMODE_READ);
+ +	}
+ +	return;
+ + out_free_disk:
+ +	kfree(disk);
+ +	list_del(&ns->list);
+ + out_free_queue:
+ +	blk_cleanup_queue(ns->queue);
+ + out_free_ns:
+ +	kfree(ns);
+ +}
+ +
+++=======
++ /*
++  * Create I/O queues.  Failing to create an I/O queue is not an issue,
++  * we can continue with less than the desired amount of queues, and
++  * even a controller without I/O queues an still be used to issue
++  * admin commands.  This might be useful to upgrade a buggy firmware
++  * for example.
++  */
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  static void nvme_create_io_queues(struct nvme_dev *dev)
+  {
+  	unsigned i;
+@@@ -2315,92 -1737,30 +2360,117 @@@ static int nvme_setup_io_queues(struct 
+  	return result;
+  }
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static int ns_cmp(void *priv, struct list_head *a, struct list_head *b)
+ +{
+ +	struct nvme_ns *nsa = container_of(a, struct nvme_ns, list);
+ +	struct nvme_ns *nsb = container_of(b, struct nvme_ns, list);
+ +
+ +	return nsa->ns_id - nsb->ns_id;
+ +}
+ +
+ +static struct nvme_ns *nvme_find_ns(struct nvme_dev *dev, unsigned nsid)
+ +{
+ +	struct nvme_ns *ns;
+ +
+ +	list_for_each_entry(ns, &dev->namespaces, list) {
+ +		if (ns->ns_id == nsid)
+ +			return ns;
+ +		if (ns->ns_id > nsid)
+ +			break;
+ +	}
+ +	return NULL;
+ +}
+ +
+ +static inline bool nvme_io_incapable(struct nvme_dev *dev)
+ +{
+ +	return (!dev->bar || readl(&dev->bar->csts) & NVME_CSTS_CFS ||
+ +							dev->online_queues < 2);
+ +}
+ +
+ +static void nvme_ns_remove(struct nvme_ns *ns)
+ +{
+ +	bool kill = nvme_io_incapable(ns->dev) && !blk_queue_dying(ns->queue);
+ +
+ +	if (kill)
+ +		blk_set_queue_dying(ns->queue);
+ +	if (ns->disk->flags & GENHD_FL_UP) {
+ +		if (blk_get_integrity(ns->disk))
+ +			blk_integrity_unregister(ns->disk);
+ +		del_gendisk(ns->disk);
+ +	}
+ +	if (kill || !blk_queue_dying(ns->queue)) {
+ +		blk_mq_abort_requeue_list(ns->queue);
+ +		blk_cleanup_queue(ns->queue);
+ +	}
+ +	list_del_init(&ns->list);
+ +	kref_put(&ns->kref, nvme_free_ns);
+ +}
+ +
+ +static void nvme_scan_namespaces(struct nvme_dev *dev, unsigned nn)
+ +{
+ +	struct nvme_ns *ns, *next;
+ +	unsigned i;
+ +
+ +	for (i = 1; i <= nn; i++) {
+ +		ns = nvme_find_ns(dev, i);
+ +		if (ns) {
+ +			if (revalidate_disk(ns->disk))
+ +				nvme_ns_remove(ns);
+ +		} else
+ +			nvme_alloc_ns(dev, i);
+ +	}
+ +	list_for_each_entry_safe(ns, next, &dev->namespaces, list) {
+ +		if (ns->ns_id > nn)
+ +			nvme_ns_remove(ns);
+ +	}
+ +	list_sort(NULL, &dev->namespaces, ns_cmp);
+++=======
++ static void nvme_set_irq_hints(struct nvme_dev *dev)
++ {
++ 	struct nvme_queue *nvmeq;
++ 	int i;
++ 
++ 	for (i = 0; i < dev->online_queues; i++) {
++ 		nvmeq = dev->queues[i];
++ 
++ 		if (!nvmeq->tags || !(*nvmeq->tags))
++ 			continue;
++ 
++ 		irq_set_affinity_hint(dev->entry[nvmeq->cq_vector].vector,
++ 					blk_mq_tags_cpumask(*nvmeq->tags));
++ 	}
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  }
+  
+  static void nvme_dev_scan(struct work_struct *work)
+  {
+  	struct nvme_dev *dev = container_of(work, struct nvme_dev, scan_work);
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	struct nvme_id_ctrl *ctrl;
+ +	void *mem;
+ +	dma_addr_t dma_addr;
+ +
+ +	if (!dev->tagset.tags)
+ +		return;
+ +
+ +	mem = dma_alloc_coherent(&dev->pci_dev->dev, 4096, &dma_addr, GFP_KERNEL);
+ +	if (!mem)
+ +		return;
+ +	if (nvme_identify(dev, 0, 1, dma_addr)) {
+ +		dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+ +		return;
+ +	}
+ +	ctrl = mem;
+ +	nvme_scan_namespaces(dev, le32_to_cpup(&ctrl->nn));
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+++=======
++ 
++ 	if (!dev->tagset.tags)
++ 		return;
++ 	nvme_scan_namespaces(&dev->ctrl);
++ 	nvme_set_irq_hints(dev);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  }
+  
+  /*
+@@@ -2411,52 -1771,7 +2481,56 @@@
+   */
+  static int nvme_dev_add(struct nvme_dev *dev)
+  {
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	struct pci_dev *pdev = dev->pci_dev;
+ +	int res;
+ +	unsigned nn;
+ +	struct nvme_id_ctrl *ctrl;
+ +	void *mem;
+ +	dma_addr_t dma_addr;
+ +	int shift = NVME_CAP_MPSMIN(readq(&dev->bar->cap)) + 12;
+ +
+ +	mem = dma_alloc_coherent(&pdev->dev, 4096, &dma_addr, GFP_KERNEL);
+ +	if (!mem)
+ +		return -ENOMEM;
+ +
+ +	res = nvme_identify(dev, 0, 1, dma_addr);
+ +	if (res) {
+ +		dev_err(&pdev->dev, "Identify Controller failed (%d)\n", res);
+ +		dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+ +		return -EIO;
+ +	}
+ +
+ +	ctrl = mem;
+ +	nn = le32_to_cpup(&ctrl->nn);
+ +	dev->oncs = le16_to_cpup(&ctrl->oncs);
+ +	dev->abort_limit = ctrl->acl + 1;
+ +	dev->vwc = ctrl->vwc;
+ +	memcpy(dev->serial, ctrl->sn, sizeof(ctrl->sn));
+ +	memcpy(dev->model, ctrl->mn, sizeof(ctrl->mn));
+ +	memcpy(dev->firmware_rev, ctrl->fr, sizeof(ctrl->fr));
+ +	if (ctrl->mdts)
+ +		dev->max_hw_sectors = 1 << (ctrl->mdts + shift - 9);
+ +	else
+ +		dev->max_hw_sectors = UINT_MAX;
+ +	if ((pdev->vendor == PCI_VENDOR_ID_INTEL) &&
+ +			(pdev->device == 0x0953) && ctrl->vs[3]) {
+ +		unsigned int max_hw_sectors;
+ +
+ +		dev->stripe_size = 1 << (ctrl->vs[3] + shift);
+ +		max_hw_sectors = dev->stripe_size >> (shift - 9);
+ +		if (dev->max_hw_sectors) {
+ +			dev->max_hw_sectors = min(max_hw_sectors,
+ +							dev->max_hw_sectors);
+ +		} else
+ +			dev->max_hw_sectors = max_hw_sectors;
+ +	}
+ +	dma_free_coherent(&dev->pci_dev->dev, 4096, mem, dma_addr);
+ +
+ +	if (!dev->tagset.tags) {
+++=======
++ 	if (!dev->ctrl.tagset) {
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  		dev->tagset.ops = &nvme_mq_ops;
+  		dev->tagset.nr_hw_queues = dev->online_queues - 1;
+  		dev->tagset.timeout = NVME_IO_TIMEOUT;
+@@@ -2466,9 -1781,10 +2540,10 @@@
+  		dev->tagset.cmd_size = nvme_cmd_size(dev);
+  		dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
+  		dev->tagset.driver_data = dev;
+ -
+ +		
+  		if (blk_mq_alloc_tag_set(&dev->tagset))
+  			return 0;
++ 		dev->ctrl.tagset = &dev->tagset;
+  	}
+  	schedule_work(&dev->scan_work);
+  	return 0;
+@@@ -2768,18 -2090,9 +2843,10 @@@ static void nvme_dev_shutdown(struct nv
+  		nvme_clear_queue(dev->queues[i]);
+  }
+  
+- static void nvme_dev_remove(struct nvme_dev *dev)
+- {
+- 	struct nvme_ns *ns, *next;
+- 
+- 	list_for_each_entry_safe(ns, next, &dev->namespaces, list)
+- 		nvme_ns_remove(ns);
+- }
+- 
+  static int nvme_setup_prp_pools(struct nvme_dev *dev)
+  {
+ -	dev->prp_page_pool = dma_pool_create("prp list page", dev->dev,
+ +	struct device *dmadev = &dev->pci_dev->dev;
+ +	dev->prp_page_pool = dma_pool_create("prp list page", dmadev,
+  						PAGE_SIZE, PAGE_SIZE, 0);
+  	if (!dev->prp_page_pool)
+  		return -ENOMEM;
+@@@ -2829,12 -2142,12 +2896,17 @@@ static void nvme_release_instance(struc
+  	spin_unlock(&dev_list_lock);
+  }
+  
+ -static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
+ +static void nvme_free_dev(struct kref *kref)
+  {
+ -	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ +	struct nvme_dev *dev = container_of(kref, struct nvme_dev, kref);
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	pci_dev_put(dev->pci_dev);
+ +	put_device(dev->device);
+++=======
++ 	put_device(dev->dev);
++ 	put_device(ctrl->device);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  	nvme_release_instance(dev);
+  	if (dev->tagset.tags)
+  		blk_mq_free_tag_set(&dev->tagset);
+@@@ -2884,14 -2197,14 +2956,19 @@@ static long nvme_dev_ioctl(struct file 
+  
+  	switch (cmd) {
+  	case NVME_IOCTL_ADMIN_CMD:
+ -		return nvme_user_cmd(&dev->ctrl, NULL, (void __user *)arg);
+ +		return nvme_user_cmd(dev, NULL, (void __user *)arg);
+  	case NVME_IOCTL_IO_CMD:
+- 		if (list_empty(&dev->namespaces))
++ 		if (list_empty(&dev->ctrl.namespaces))
+  			return -ENOTTY;
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +		ns = list_first_entry(&dev->namespaces, struct nvme_ns, list);
+ +		return nvme_user_cmd(dev, ns, (void __user *)arg);
+++=======
++ 		ns = list_first_entry(&dev->ctrl.namespaces, struct nvme_ns, list);
++ 		return nvme_user_cmd(&dev->ctrl, ns, (void __user *)arg);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  	case NVME_IOCTL_RESET:
+ -		dev_warn(dev->dev, "resetting controller\n");
+ +		dev_warn(&dev->pci_dev->dev, "resetting controller\n");
+  		return nvme_reset(dev);
+  	case NVME_IOCTL_SUBSYS_RESET:
+  		return nvme_subsys_reset(dev);
+@@@ -2965,10 -2267,21 +3042,26 @@@ static int nvme_dev_start(struct nvme_d
+  	if (result)
+  		goto free_tags;
+  
+ -	dev->ctrl.event_limit = 1;
+ +	nvme_set_irq_hints(dev);
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	dev->event_limit = 1;
+ +	return result;
+++=======
++ 	/*
++ 	 * Keep the controller around but remove all namespaces if we don't have
++ 	 * any working I/O queue.
++ 	 */
++ 	if (dev->online_queues < 2) {
++ 		dev_warn(dev->dev, "IO queues not created\n");
++ 		nvme_remove_namespaces(&dev->ctrl);
++ 	} else {
++ 		nvme_unfreeze_queues(dev);
++ 		nvme_dev_add(dev);
++ 	}
++ 
++ 	return;
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  
+   free_tags:
+  	nvme_dev_remove_admin(dev);
+@@@ -3100,7 -2387,39 +3193,43 @@@ static ssize_t nvme_sysfs_reset(struct 
+  }
+  static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +static void nvme_async_probe(struct work_struct *work);
+++=======
++ static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
++ {
++ 	*val = readl(to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
++ {
++ 	writel(val, to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
++ {
++ 	*val = readq(to_nvme_dev(ctrl)->bar + off);
++ 	return 0;
++ }
++ 
++ static bool nvme_pci_io_incapable(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_dev *dev = to_nvme_dev(ctrl);
++ 
++ 	return !dev->bar || dev->online_queues < 2;
++ }
++ 
++ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
++ 	.reg_read32		= nvme_pci_reg_read32,
++ 	.reg_write32		= nvme_pci_reg_write32,
++ 	.reg_read64		= nvme_pci_reg_read64,
++ 	.io_incapable		= nvme_pci_io_incapable,
++ 	.free_ctrl		= nvme_pci_free_ctrl,
++ };
++ 
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int node, result = -ENOMEM;
+@@@ -3122,10 -2441,15 +3251,16 @@@
+  	if (!dev->queues)
+  		goto free;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	INIT_LIST_HEAD(&dev->namespaces);
+ +	INIT_WORK(&dev->reset_work, nvme_reset_failed_dev);
+ +	dev->pci_dev = pci_dev_get(pdev);
+++=======
++ 	INIT_LIST_HEAD(&dev->ctrl.namespaces);
++ 	INIT_WORK(&dev->reset_work, nvme_reset_work);
++ 	dev->dev = get_device(&pdev->dev);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  	pci_set_drvdata(pdev, dev);
+ -
+ -	dev->ctrl.ops = &nvme_pci_ctrl_ops;
+ -	dev->ctrl.dev = dev->dev;
+ -	dev->ctrl.quirks = id->driver_data;
+ -
+  	result = nvme_set_instance(dev);
+  	if (result)
+  		goto put_pci;
+@@@ -3134,18 -2458,18 +3269,27 @@@
+  	if (result)
+  		goto release;
+  
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	kref_init(&dev->kref);
+ +	dev->device = device_create(nvme_class, &pdev->dev,
+ +				MKDEV(nvme_char_major, dev->instance),
+ +				dev, "nvme%d", dev->instance);
+ +	if (IS_ERR(dev->device)) {
+ +		result = PTR_ERR(dev->device);
+++=======
++ 	kref_init(&dev->ctrl.kref);
++ 	dev->ctrl.device = device_create(nvme_class, &pdev->dev,
++ 				MKDEV(nvme_char_major, dev->ctrl.instance),
++ 				dev, "nvme%d", dev->ctrl.instance);
++ 	if (IS_ERR(dev->ctrl.device)) {
++ 		result = PTR_ERR(dev->ctrl.device);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+  		goto release_pools;
+  	}
+- 	get_device(dev->device);
+- 	dev_set_drvdata(dev->device, dev);
++ 	get_device(dev->ctrl.device);
++ 	dev_set_drvdata(dev->ctrl.device, dev);
+  
+- 	result = device_create_file(dev->device, &dev_attr_reset_controller);
++ 	result = device_create_file(dev->ctrl.device, &dev_attr_reset_controller);
+  	if (result)
+  		goto put_dev;
+  
+@@@ -3156,8 -2480,8 +3300,13 @@@
+  	return 0;
+  
+   put_dev:
+++<<<<<<< HEAD:drivers/block/nvme-core.c
+ +	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+ +	put_device(dev->device);
+++=======
++ 	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->ctrl.instance));
++ 	put_device(dev->ctrl.device);
+++>>>>>>> 5bae7f73d378 (nvme: move namespace scanning to common code):drivers/nvme/host/pci.c
+   release_pools:
+  	nvme_release_prp_pools(dev);
+   release:
+@@@ -3207,14 -2523,15 +3356,14 @@@ static void nvme_remove(struct pci_dev 
+  	flush_work(&dev->probe_work);
+  	flush_work(&dev->reset_work);
+  	flush_work(&dev->scan_work);
+- 	device_remove_file(dev->device, &dev_attr_reset_controller);
+- 	nvme_dev_remove(dev);
++ 	device_remove_file(dev->ctrl.device, &dev_attr_reset_controller);
++ 	nvme_remove_namespaces(&dev->ctrl);
+  	nvme_dev_shutdown(dev);
+  	nvme_dev_remove_admin(dev);
+ -	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->ctrl.instance));
+ +	device_destroy(nvme_class, MKDEV(nvme_char_major, dev->instance));
+  	nvme_free_queues(dev, 0);
+ -	nvme_release_cmb(dev);
+  	nvme_release_prp_pools(dev);
+ -	nvme_put_ctrl(&dev->ctrl);
+ +	kref_put(&dev->kref, nvme_free_dev);
+  }
+  
+  /* These functions are yet to be implemented */
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/block/nvme-core.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
