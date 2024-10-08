@@ -1,0 +1,161 @@
+KVM: nVMX: Enable nested apic register virtualization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Wincy Van <fanwenyi0529@gmail.com>
+commit 82f0dd4b2749ece2e48509cbd768e9bcf44d2124
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/82f0dd4b.failed
+
+We can reduce apic register virtualization cost with this feature,
+it is also a requirement for virtual interrupt delivery and posted
+interrupt processing.
+
+	Signed-off-by: Wincy Van <fanwenyi0529@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 82f0dd4b2749ece2e48509cbd768e9bcf44d2124)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 8ebb2b95d0d8,ea9b2e938ed1..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1106,6 -1126,22 +1106,25 @@@ static inline int nested_cpu_has_ept(st
+  	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool nested_cpu_has_xsaves(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_XSAVES) &&
++ 		vmx_xsaves_supported();
++ }
++ 
++ static inline bool nested_cpu_has_virt_x2apic_mode(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE);
++ }
++ 
++ static inline bool nested_cpu_has_apic_reg_virt(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_APIC_REGISTER_VIRT);
++ }
++ 
+++>>>>>>> 82f0dd4b2749 (KVM: nVMX: Enable nested apic register virtualization)
+  static inline bool is_exception(u32 intr_info)
+  {
+  	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+@@@ -2389,11 -2429,15 +2408,18 @@@ static __init void nested_vmx_setup_ctl
+  
+  	/* secondary cpu-based controls */
+  	rdmsr(MSR_IA32_VMX_PROCBASED_CTLS2,
+ -		vmx->nested.nested_vmx_secondary_ctls_low,
+ -		vmx->nested.nested_vmx_secondary_ctls_high);
+ -	vmx->nested.nested_vmx_secondary_ctls_low = 0;
+ -	vmx->nested.nested_vmx_secondary_ctls_high &=
+ +		nested_vmx_secondary_ctls_low, nested_vmx_secondary_ctls_high);
+ +	nested_vmx_secondary_ctls_low = 0;
+ +	nested_vmx_secondary_ctls_high &=
+  		SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES |
+++<<<<<<< HEAD
+ +		SECONDARY_EXEC_WBINVD_EXITING;
+++=======
++ 		SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
++ 		SECONDARY_EXEC_APIC_REGISTER_VIRT |
++ 		SECONDARY_EXEC_WBINVD_EXITING |
++ 		SECONDARY_EXEC_XSAVES;
+++>>>>>>> 82f0dd4b2749 (KVM: nVMX: Enable nested apic register virtualization)
+  
+  	if (enable_ept) {
+  		/* nested EPT: emulate EPT also to L1 */
+@@@ -8593,7 -8602,81 +8622,85 @@@ static int nested_vmx_check_msr_bitmap_
+  static inline bool nested_vmx_merge_msr_bitmap(struct kvm_vcpu *vcpu,
+  					       struct vmcs12 *vmcs12)
+  {
+++<<<<<<< HEAD
+ +	return false;
+++=======
++ 	int msr;
++ 	struct page *page;
++ 	unsigned long *msr_bitmap;
++ 
++ 	if (!nested_cpu_has_virt_x2apic_mode(vmcs12))
++ 		return false;
++ 
++ 	page = nested_get_page(vcpu, vmcs12->msr_bitmap);
++ 	if (!page) {
++ 		WARN_ON(1);
++ 		return false;
++ 	}
++ 	msr_bitmap = (unsigned long *)kmap(page);
++ 	if (!msr_bitmap) {
++ 		nested_release_page_clean(page);
++ 		WARN_ON(1);
++ 		return false;
++ 	}
++ 
++ 	if (nested_cpu_has_virt_x2apic_mode(vmcs12)) {
++ 		if (nested_cpu_has_apic_reg_virt(vmcs12))
++ 			for (msr = 0x800; msr <= 0x8ff; msr++)
++ 				nested_vmx_disable_intercept_for_msr(
++ 					msr_bitmap,
++ 					vmx_msr_bitmap_nested,
++ 					msr, MSR_TYPE_R);
++ 		/* TPR is allowed */
++ 		nested_vmx_disable_intercept_for_msr(msr_bitmap,
++ 				vmx_msr_bitmap_nested,
++ 				APIC_BASE_MSR + (APIC_TASKPRI >> 4),
++ 				MSR_TYPE_R | MSR_TYPE_W);
++ 	} else {
++ 		/*
++ 		 * Enable reading intercept of all the x2apic
++ 		 * MSRs. We should not rely on vmcs12 to do any
++ 		 * optimizations here, it may have been modified
++ 		 * by L1.
++ 		 */
++ 		for (msr = 0x800; msr <= 0x8ff; msr++)
++ 			__vmx_enable_intercept_for_msr(
++ 				vmx_msr_bitmap_nested,
++ 				msr,
++ 				MSR_TYPE_R);
++ 
++ 		__vmx_enable_intercept_for_msr(
++ 				vmx_msr_bitmap_nested,
++ 				APIC_BASE_MSR + (APIC_TASKPRI >> 4),
++ 				MSR_TYPE_W);
++ 	}
++ 	kunmap(page);
++ 	nested_release_page_clean(page);
++ 
++ 	return true;
++ }
++ 
++ static int nested_vmx_check_apicv_controls(struct kvm_vcpu *vcpu,
++ 					   struct vmcs12 *vmcs12)
++ {
++ 	if (!nested_cpu_has_virt_x2apic_mode(vmcs12) &&
++ 	    !nested_cpu_has_apic_reg_virt(vmcs12))
++ 		return 0;
++ 
++ 	/*
++ 	 * If virtualize x2apic mode is enabled,
++ 	 * virtualize apic access must be disabled.
++ 	 */
++ 	if (nested_cpu_has_virt_x2apic_mode(vmcs12) &&
++ 	    nested_cpu_has2(vmcs12, SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES))
++ 		return -EINVAL;
++ 
++ 	/* tpr shadow is needed by all apicv features. */
++ 	if (!nested_cpu_has(vmcs12, CPU_BASED_TPR_SHADOW))
++ 		return -EINVAL;
++ 
++ 	return 0;
+++>>>>>>> 82f0dd4b2749 (KVM: nVMX: Enable nested apic register virtualization)
+  }
+  
+  static int nested_vmx_check_msr_switch(struct kvm_vcpu *vcpu,
+* Unmerged path arch/x86/kvm/vmx.c
