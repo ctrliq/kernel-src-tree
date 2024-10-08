@@ -1013,8 +1013,8 @@ void hist_entry__delete(struct hist_entry *he)
  * collapse the histogram
  */
 
-bool hists__collapse_insert_entry(struct hists *hists __maybe_unused,
-				  struct rb_root *root, struct hist_entry *he)
+int hists__collapse_insert_entry(struct hists *hists, struct rb_root *root,
+				 struct hist_entry *he)
 {
 	struct rb_node **p = &root->rb_node;
 	struct rb_node *parent = NULL;
@@ -1028,18 +1028,21 @@ bool hists__collapse_insert_entry(struct hists *hists __maybe_unused,
 		cmp = hist_entry__collapse(iter, he);
 
 		if (!cmp) {
+			int ret = 0;
+
 			he_stat__add_stat(&iter->stat, &he->stat);
 			if (symbol_conf.cumulate_callchain)
 				he_stat__add_stat(iter->stat_acc, he->stat_acc);
 
 			if (symbol_conf.use_callchain) {
 				callchain_cursor_reset(&callchain_cursor);
-				callchain_merge(&callchain_cursor,
-						iter->callchain,
-						he->callchain);
+				if (callchain_merge(&callchain_cursor,
+						    iter->callchain,
+						    he->callchain) < 0)
+					ret = -1;
 			}
 			hist_entry__delete(he);
-			return false;
+			return ret;
 		}
 
 		if (cmp < 0)
@@ -1051,7 +1054,7 @@ bool hists__collapse_insert_entry(struct hists *hists __maybe_unused,
 
 	rb_link_node(&he->rb_node_in, parent, p);
 	rb_insert_color(&he->rb_node_in, root);
-	return true;
+	return 1;
 }
 
 struct rb_root *hists__get_rotate_entries_in(struct hists *hists)
@@ -1076,14 +1079,15 @@ static void hists__apply_filters(struct hists *hists, struct hist_entry *he)
 	hists__filter_entry_by_symbol(hists, he);
 }
 
-void hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
+int hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
 {
 	struct rb_root *root;
 	struct rb_node *next;
 	struct hist_entry *n;
+	int ret;
 
 	if (!sort__need_collapse)
-		return;
+		return 0;
 
 	hists->nr_entries = 0;
 
@@ -1098,7 +1102,11 @@ void hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
 		next = rb_next(&n->rb_node_in);
 
 		rb_erase(&n->rb_node_in, root);
-		if (hists__collapse_insert_entry(hists, &hists->entries_collapsed, n)) {
+		ret = hists__collapse_insert_entry(hists, &hists->entries_collapsed, n);
+		if (ret < 0)
+			return -1;
+
+		if (ret) {
 			/*
 			 * If it wasn't combined with one of the entries already
 			 * collapsed, we need to apply the filters that may have
@@ -1109,6 +1117,7 @@ void hists__collapse_resort(struct hists *hists, struct ui_progress *prog)
 		if (prog)
 			ui_progress__update(prog, 1);
 	}
+	return 0;
 }
 
 static int hist_entry__sort(struct hist_entry *a, struct hist_entry *b)
