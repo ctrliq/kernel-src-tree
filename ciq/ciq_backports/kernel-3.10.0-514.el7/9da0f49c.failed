@@ -1,0 +1,170 @@
+time: Add timekeeping snapshot code capturing system time and counter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Christopher S. Hall <christopher.s.hall@intel.com>
+commit 9da0f49c8767cc0ef6101cb21156cf4380ed50dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9da0f49c.failed
+
+In the current timekeeping code there isn't any interface to
+atomically capture the current relationship between the system counter
+and system time. ktime_get_snapshot() returns this triple (counter,
+monotonic raw, realtime) in the system_time_snapshot struct.
+
+	Cc: Prarit Bhargava <prarit@redhat.com>
+	Cc: Richard Cochran <richardcochran@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: kevin.b.stanton@intel.com
+	Cc: kevin.j.clarke@intel.com
+	Cc: hpa@zytor.com
+	Cc: jeffrey.t.kirsher@intel.com
+	Cc: netdev@vger.kernel.org
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Christopher S. Hall <christopher.s.hall@intel.com>
+[jstultz: Moved structure definitions around to clean things up,
+ fixed cycles_t/cycle_t confusion.]
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+(cherry picked from commit 9da0f49c8767cc0ef6101cb21156cf4380ed50dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/timekeeping.h
+#	kernel/time/timekeeping.c
+diff --cc kernel/time/timekeeping.c
+index 7bb86335a3a9,89b4695bd083..000000000000
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@@ -421,51 -814,96 +421,85 @@@ void ktime_get_ts64(struct timespec64 *
+  }
+  EXPORT_SYMBOL_GPL(ktime_get_ts64);
+  
+ +
+  /**
+ - * ktime_get_seconds - Get the seconds portion of CLOCK_MONOTONIC
+ + * timekeeping_clocktai - Returns the TAI time of day in a timespec
+ + * @ts:		pointer to the timespec to be set
+   *
+ - * Returns the seconds portion of CLOCK_MONOTONIC with a single non
+ - * serialized read. tk->ktime_sec is of type 'unsigned long' so this
+ - * works on both 32 and 64 bit systems. On 32 bit systems the readout
+ - * covers ~136 years of uptime which should be enough to prevent
+ - * premature wrap arounds.
+ + * Returns the time of day in a timespec.
+   */
+ -time64_t ktime_get_seconds(void)
+ +void timekeeping_clocktai(struct timespec *ts)
+  {
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ +	struct timekeeper *tk = &timekeeper;
+ +	struct timespec64 ts64;
+ +	unsigned long seq;
+ +	u64 nsecs;
+  
+  	WARN_ON(timekeeping_suspended);
+ -	return tk->ktime_sec;
+ -}
+ -EXPORT_SYMBOL_GPL(ktime_get_seconds);
+  
+ -/**
+ - * ktime_get_real_seconds - Get the seconds portion of CLOCK_REALTIME
+ - *
+ - * Returns the wall clock seconds since 1970. This replaces the
+ - * get_seconds() interface which is not y2038 safe on 32bit systems.
+ - *
+ - * For 64bit systems the fast access to tk->xtime_sec is preserved. On
+ - * 32bit systems the access must be protected with the sequence
+ - * counter to provide "atomic" access to the 64bit tk->xtime_sec
+ - * value.
+ - */
+ -time64_t ktime_get_real_seconds(void)
+ -{
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ -	time64_t seconds;
+ -	unsigned int seq;
+ +	do {
+ +		seq = read_seqcount_begin(&timekeeper_seq);
+  
+ -	if (IS_ENABLED(CONFIG_64BIT))
+ -		return tk->xtime_sec;
+ +		ts64.tv_sec = tk->xtime_sec + tk->tai_offset;
+ +		nsecs = timekeeping_get_ns(tk);
+  
+ -	do {
+ -		seq = read_seqcount_begin(&tk_core.seq);
+ -		seconds = tk->xtime_sec;
+ +	} while (read_seqcount_retry(&timekeeper_seq, seq));
+  
+ -	} while (read_seqcount_retry(&tk_core.seq, seq));
+ +	ts64.tv_nsec = 0;
+ +	timespec64_add_ns(&ts64, nsecs);
+ +	*ts = timespec64_to_timespec(ts64);
+  
+ -	return seconds;
+  }
+ -EXPORT_SYMBOL_GPL(ktime_get_real_seconds);
+ +EXPORT_SYMBOL(timekeeping_clocktai);
+ +
+  
+  /**
+ - * __ktime_get_real_seconds - The same as ktime_get_real_seconds
+ - * but without the sequence counter protect. This internal function
+ - * is called just when timekeeping lock is already held.
+ + * ktime_get_clocktai - Returns the TAI time of day in a ktime
+ + *
+ + * Returns the time of day in a ktime.
+   */
+ -time64_t __ktime_get_real_seconds(void)
+ +ktime_t ktime_get_clocktai(void)
+  {
+ -	struct timekeeper *tk = &tk_core.timekeeper;
+ +	struct timespec ts;
+  
+ -	return tk->xtime_sec;
+ +	timekeeping_clocktai(&ts);
+ +	return timespec_to_ktime(ts);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(ktime_get_clocktai);
+++=======
++ 
++ /**
++  * ktime_get_snapshot - snapshots the realtime/monotonic raw clocks with counter
++  * @systime_snapshot:	pointer to struct receiving the system time snapshot
++  */
++ void ktime_get_snapshot(struct system_time_snapshot *systime_snapshot)
++ {
++ 	struct timekeeper *tk = &tk_core.timekeeper;
++ 	unsigned long seq;
++ 	ktime_t base_raw;
++ 	ktime_t base_real;
++ 	s64 nsec_raw;
++ 	s64 nsec_real;
++ 	cycle_t now;
++ 
++ 	do {
++ 		seq = read_seqcount_begin(&tk_core.seq);
++ 
++ 		now = tk->tkr_mono.read(tk->tkr_mono.clock);
++ 		base_real = ktime_add(tk->tkr_mono.base,
++ 				      tk_core.timekeeper.offs_real);
++ 		base_raw = tk->tkr_raw.base;
++ 		nsec_real = timekeeping_cycles_to_ns(&tk->tkr_mono, now);
++ 		nsec_raw  = timekeeping_cycles_to_ns(&tk->tkr_raw, now);
++ 	} while (read_seqcount_retry(&tk_core.seq, seq));
++ 
++ 	systime_snapshot->cycles = now;
++ 	systime_snapshot->real = ktime_add_ns(base_real, nsec_real);
++ 	systime_snapshot->raw = ktime_add_ns(base_raw, nsec_raw);
++ }
++ EXPORT_SYMBOL_GPL(ktime_get_snapshot);
+++>>>>>>> 9da0f49c8767 (time: Add timekeeping snapshot code capturing system time and counter)
+  
+  #ifdef CONFIG_NTP_PPS
+  
+* Unmerged path include/linux/timekeeping.h
+* Unmerged path include/linux/timekeeping.h
+* Unmerged path kernel/time/timekeeping.c
