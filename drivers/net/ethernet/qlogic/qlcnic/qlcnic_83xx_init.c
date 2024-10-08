@@ -2191,7 +2191,7 @@ int qlcnic_83xx_init(struct qlcnic_adapter *adapter, int pci_using_dac)
 	struct qlcnic_dcb *dcb;
 	int err = 0;
 
-	adapter->rx_mac_learn = 0;
+	adapter->rx_mac_learn = false;
 	ahw->msix_supported = !!qlcnic_use_msi_x;
 	err = qlcnic_83xx_init_mailbox_work(adapter);
 	if (err)
