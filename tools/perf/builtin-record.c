@@ -49,7 +49,7 @@ struct record {
 	int			realtime_prio;
 	bool			no_buildid;
 	bool			no_buildid_cache;
-	long			samples;
+	unsigned long long	samples;
 };
 
 static int record__write(struct record *rec, void *bf, size_t size)
@@ -594,7 +594,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	}
 
 	for (;;) {
-		int hits = rec->samples;
+		unsigned long long hits = rec->samples;
 
 		if (record__mmap_read_all(rec) < 0) {
 			err = -1;
