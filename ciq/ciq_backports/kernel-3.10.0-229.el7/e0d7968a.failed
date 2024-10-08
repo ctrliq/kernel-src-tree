@@ -1,0 +1,137 @@
+bridge: Prevent insertion of FDB entry with disallowed vlan
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+commit e0d7968ab6c8bce2437b36fa7f04117e333f196d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/e0d7968a.failed
+
+br_handle_local_finish() is allowing us to insert an FDB entry with
+disallowed vlan. For example, when port 1 and 2 are communicating in
+vlan 10, and even if vlan 10 is disallowed on port 3, port 3 can
+interfere with their communication by spoofed src mac address with
+vlan id 10.
+
+Note: Even if it is judged that a frame should not be learned, it should
+not be dropped because it is destined for not forwarding layer but higher
+layer. See IEEE 802.1Q-2011 8.13.10.
+
+	Signed-off-by: Toshiaki Makita <makita.toshiaki@lab.ntt.co.jp>
+	Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e0d7968ab6c8bce2437b36fa7f04117e333f196d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_input.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_input.c
+index fa29179a5382,04d6348fd530..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -146,9 -147,9 +146,15 @@@ static int br_handle_local_finish(struc
+  	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
+  	u16 vid = 0;
+  
+++<<<<<<< HEAD
+ +	br_vlan_get_tag(skb, &vid);
+ +	if (p->flags & BR_LEARNING)
+ +		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid);
+++=======
++ 	/* check if vlan is allowed, to avoid spoofing */
++ 	if (p->flags & BR_LEARNING && br_should_learn(p, skb, &vid))
++ 		br_fdb_update(p->br, p, eth_hdr(skb)->h_source, vid, false);
+++>>>>>>> e0d7968ab6c8 (bridge: Prevent insertion of FDB entry with disallowed vlan)
+  	return 0;	 /* process further */
+  }
+  
+diff --cc net/bridge/br_private.h
+index 10b5654d52ef,59d3a85c5873..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -611,22 -577,23 +611,42 @@@ static inline void br_mdb_uninit(void
+  
+  /* br_vlan.c */
+  #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+++<<<<<<< HEAD
+ +extern bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
+ +			       struct sk_buff *skb, u16 *vid);
+ +extern bool br_allowed_egress(struct net_bridge *br,
+ +			      const struct net_port_vlans *v,
+ +			      const struct sk_buff *skb);
+ +extern struct sk_buff *br_handle_vlan(struct net_bridge *br,
+ +				      const struct net_port_vlans *v,
+ +				      struct sk_buff *skb);
+ +extern int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags);
+ +extern int br_vlan_delete(struct net_bridge *br, u16 vid);
+ +extern void br_vlan_flush(struct net_bridge *br);
+ +extern int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
+ +extern int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags);
+ +extern int nbp_vlan_delete(struct net_bridge_port *port, u16 vid);
+ +extern void nbp_vlan_flush(struct net_bridge_port *port);
+ +extern bool nbp_vlan_find(struct net_bridge_port *port, u16 vid);
+++=======
++ bool br_allowed_ingress(struct net_bridge *br, struct net_port_vlans *v,
++ 			struct sk_buff *skb, u16 *vid);
++ bool br_allowed_egress(struct net_bridge *br, const struct net_port_vlans *v,
++ 		       const struct sk_buff *skb);
++ bool br_should_learn(struct net_bridge_port *p, struct sk_buff *skb, u16 *vid);
++ struct sk_buff *br_handle_vlan(struct net_bridge *br,
++ 			       const struct net_port_vlans *v,
++ 			       struct sk_buff *skb);
++ int br_vlan_add(struct net_bridge *br, u16 vid, u16 flags);
++ int br_vlan_delete(struct net_bridge *br, u16 vid);
++ void br_vlan_flush(struct net_bridge *br);
++ bool br_vlan_find(struct net_bridge *br, u16 vid);
++ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
++ int nbp_vlan_add(struct net_bridge_port *port, u16 vid, u16 flags);
++ int nbp_vlan_delete(struct net_bridge_port *port, u16 vid);
++ void nbp_vlan_flush(struct net_bridge_port *port);
++ bool nbp_vlan_find(struct net_bridge_port *port, u16 vid);
+++>>>>>>> e0d7968ab6c8 (bridge: Prevent insertion of FDB entry with disallowed vlan)
+  
+  static inline struct net_port_vlans *br_get_vlan_info(
+  						const struct net_bridge *br)
+* Unmerged path net/bridge/br_input.c
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index c5c15c7d9539..f900fede24f3 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -227,6 +227,34 @@ bool br_allowed_egress(struct net_bridge *br,
+ 	return false;
+ }
+ 
++/* Called under RCU */
++bool br_should_learn(struct net_bridge_port *p, struct sk_buff *skb, u16 *vid)
++{
++	struct net_bridge *br = p->br;
++	struct net_port_vlans *v;
++
++	if (!br->vlan_enabled)
++		return true;
++
++	v = rcu_dereference(p->vlan_info);
++	if (!v)
++		return false;
++
++	br_vlan_get_tag(skb, vid);
++	if (!*vid) {
++		*vid = br_get_pvid(v);
++		if (*vid == VLAN_N_VID)
++			return false;
++
++		return true;
++	}
++
++	if (test_bit(*vid, v->vlan_bitmap))
++		return true;
++
++	return false;
++}
++
+ /* Must be protected by RTNL.
+  * Must be called with vid in range from 1 to 4094 inclusive.
+  */
