@@ -1,0 +1,402 @@
+Btrfs: add a sanity test for btrfs_split_item
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Josef Bacik <jbacik@fusionio.com>
+commit 06ea65a398a2501e94beee3a425d07e1846ff25a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/06ea65a3.failed
+
+While looking at somebodys corruption I became completely convinced that
+btrfs_split_item was broken, so I wrote this test to verify that it was working
+as it was supposed to.  Thankfully it appears to be working as intended, so just
+add this test to make sure nobody breaks it in the future.  Thanks,
+
+	Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+	Signed-off-by: Chris Mason <chris.mason@fusionio.com>
+(cherry picked from commit 06ea65a398a2501e94beee3a425d07e1846ff25a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/Makefile
+#	fs/btrfs/super.c
+#	fs/btrfs/tests/btrfs-tests.h
+diff --cc fs/btrfs/Makefile
+index a550dfc6c16f,4c7dfbfaa3b3..000000000000
+--- a/fs/btrfs/Makefile
++++ b/fs/btrfs/Makefile
+@@@ -13,3 -13,6 +13,9 @@@ btrfs-y += super.o ctree.o extent-tree.
+  
+  btrfs-$(CONFIG_BTRFS_FS_POSIX_ACL) += acl.o
+  btrfs-$(CONFIG_BTRFS_FS_CHECK_INTEGRITY) += check-integrity.o
+++<<<<<<< HEAD
+++=======
++ 
++ btrfs-$(CONFIG_BTRFS_FS_RUN_SANITY_TESTS) += tests/free-space-tests.o \
++ 	tests/extent-buffer-tests.o
+++>>>>>>> 06ea65a398a2 (Btrfs: add a sanity test for btrfs_split_item)
+diff --cc fs/btrfs/super.c
+index f87070069561,0e398657d759..000000000000
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@@ -1782,6 -1787,16 +1782,19 @@@ static void btrfs_print_info(void
+  			"\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int btrfs_run_sanity_tests(void)
++ {
++ 	int ret;
++ 
++ 	ret = btrfs_test_free_space_cache();
++ 	if (ret)
++ 		return ret;
++ 	return btrfs_test_extent_buffer_operations();
++ }
++ 
+++>>>>>>> 06ea65a398a2 (Btrfs: add a sanity test for btrfs_split_item)
+  static int __init init_btrfs_fs(void)
+  {
+  	int err;
+* Unmerged path fs/btrfs/tests/btrfs-tests.h
+* Unmerged path fs/btrfs/Makefile
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 262cf6d10172..ecc58ebb5f87 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1724,7 +1724,9 @@ struct btrfs_root {
+ 	int ref_cows;
+ 	int track_dirty;
+ 	int in_radix;
+-
++#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
++	int dummy_root;
++#endif
+ 	u64 defrag_trans_start;
+ 	struct btrfs_key defrag_progress;
+ 	struct btrfs_key defrag_max;
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index d5ef06180361..6099126f396e 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1228,14 +1228,18 @@ static void __setup_root(u32 nodesize, u32 leafsize, u32 sectorsize,
+ 	atomic_set(&root->refs, 1);
+ 	root->log_transid = 0;
+ 	root->last_log_commit = 0;
+-	extent_io_tree_init(&root->dirty_log_pages,
+-			     fs_info->btree_inode->i_mapping);
++	if (fs_info)
++		extent_io_tree_init(&root->dirty_log_pages,
++				     fs_info->btree_inode->i_mapping);
+ 
+ 	memset(&root->root_key, 0, sizeof(root->root_key));
+ 	memset(&root->root_item, 0, sizeof(root->root_item));
+ 	memset(&root->defrag_progress, 0, sizeof(root->defrag_progress));
+ 	memset(&root->root_kobj, 0, sizeof(root->root_kobj));
+-	root->defrag_trans_start = fs_info->generation;
++	if (fs_info)
++		root->defrag_trans_start = fs_info->generation;
++	else
++		root->defrag_trans_start = 0;
+ 	init_completion(&root->kobj_unregister);
+ 	root->defrag_running = 0;
+ 	root->root_key.objectid = objectid;
+@@ -1252,6 +1256,22 @@ static struct btrfs_root *btrfs_alloc_root(struct btrfs_fs_info *fs_info)
+ 	return root;
+ }
+ 
++#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
++/* Should only be used by the testing infrastructure */
++struct btrfs_root *btrfs_alloc_dummy_root(void)
++{
++	struct btrfs_root *root;
++
++	root = btrfs_alloc_root(NULL);
++	if (!root)
++		return ERR_PTR(-ENOMEM);
++	__setup_root(4096, 4096, 4096, 4096, root, NULL, 1);
++	root->dummy_root = 1;
++
++	return root;
++}
++#endif
++
+ struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
+ 				     struct btrfs_fs_info *fs_info,
+ 				     u64 objectid)
+@@ -3669,10 +3689,20 @@ int btrfs_set_buffer_uptodate(struct extent_buffer *buf)
+ 
+ void btrfs_mark_buffer_dirty(struct extent_buffer *buf)
+ {
+-	struct btrfs_root *root = BTRFS_I(buf->pages[0]->mapping->host)->root;
++	struct btrfs_root *root;
+ 	u64 transid = btrfs_header_generation(buf);
+ 	int was_dirty;
+ 
++#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
++	/*
++	 * This is a fast path so only do this check if we have sanity tests
++	 * enabled.  Normal people shouldn't be marking dummy buffers as dirty
++	 * outside of the sanity tests.
++	 */
++	if (unlikely(test_bit(EXTENT_BUFFER_DUMMY, &buf->bflags)))
++		return;
++#endif
++	root = BTRFS_I(buf->pages[0]->mapping->host)->root;
+ 	btrfs_assert_tree_locked(buf);
+ 	if (transid != root->fs_info->generation)
+ 		WARN(1, KERN_CRIT "btrfs transid mismatch buffer %llu, "
+diff --git a/fs/btrfs/disk-io.h b/fs/btrfs/disk-io.h
+index 5ce2a7da8b11..53059df350f8 100644
+--- a/fs/btrfs/disk-io.h
++++ b/fs/btrfs/disk-io.h
+@@ -86,6 +86,10 @@ void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
+ 				 struct btrfs_root *root);
+ void btrfs_free_fs_root(struct btrfs_root *root);
+ 
++#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
++struct btrfs_root *btrfs_alloc_dummy_root(void);
++#endif
++
+ /*
+  * This function is used to grab the root, and avoid it is freed when we
+  * access it. But it doesn't ensure that the tree is not dropped.
+* Unmerged path fs/btrfs/super.c
+* Unmerged path fs/btrfs/tests/btrfs-tests.h
+diff --git a/fs/btrfs/tests/extent-buffer-tests.c b/fs/btrfs/tests/extent-buffer-tests.c
+new file mode 100644
+index 000000000000..cc286ce97d1e
+--- /dev/null
++++ b/fs/btrfs/tests/extent-buffer-tests.c
+@@ -0,0 +1,229 @@
++/*
++ * Copyright (C) 2013 Fusion IO.  All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License v2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this program; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 021110-1307, USA.
++ */
++
++#include <linux/slab.h>
++#include "btrfs-tests.h"
++#include "../ctree.h"
++#include "../extent_io.h"
++#include "../disk-io.h"
++
++static int test_btrfs_split_item(void)
++{
++	struct btrfs_path *path;
++	struct btrfs_root *root;
++	struct extent_buffer *eb;
++	struct btrfs_item *item;
++	char *value = "mary had a little lamb";
++	char *split1 = "mary had a little";
++	char *split2 = " lamb";
++	char *split3 = "mary";
++	char *split4 = " had a little";
++	char buf[32];
++	struct btrfs_key key;
++	u32 value_len = strlen(value);
++	int ret = 0;
++
++	test_msg("Running btrfs_split_item tests\n");
++
++	root = btrfs_alloc_dummy_root();
++	if (IS_ERR(root)) {
++		test_msg("Could not allocate root\n");
++		return PTR_ERR(root);
++	}
++
++	path = btrfs_alloc_path();
++	if (!path) {
++		test_msg("Could not allocate path\n");
++		kfree(root);
++		return -ENOMEM;
++	}
++
++	path->nodes[0] = eb = alloc_dummy_extent_buffer(0, 4096);
++	if (!eb) {
++		test_msg("Could not allocate dummy buffer\n");
++		ret = -ENOMEM;
++		goto out;
++	}
++	path->slots[0] = 0;
++
++	key.objectid = 0;
++	key.type = BTRFS_EXTENT_CSUM_KEY;
++	key.offset = 0;
++
++	setup_items_for_insert(root, path, &key, &value_len, value_len,
++			       value_len + sizeof(struct btrfs_item), 1);
++	item = btrfs_item_nr(0);
++	write_extent_buffer(eb, value, btrfs_item_ptr_offset(eb, 0),
++			    value_len);
++
++	key.offset = 3;
++
++	/*
++	 * Passing NULL trans here should be safe because we have plenty of
++	 * space in this leaf to split the item without having to split the
++	 * leaf.
++	 */
++	ret = btrfs_split_item(NULL, root, path, &key, 17);
++	if (ret) {
++		test_msg("Split item failed %d\n", ret);
++		goto out;
++	}
++
++	/*
++	 * Read the first slot, it should have the original key and contain only
++	 * 'mary had a little'
++	 */
++	btrfs_item_key_to_cpu(eb, &key, 0);
++	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
++	    key.offset != 0) {
++		test_msg("Invalid key at slot 0\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	item = btrfs_item_nr(0);
++	if (btrfs_item_size(eb, item) != strlen(split1)) {
++		test_msg("Invalid len in the first split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 0),
++			   strlen(split1));
++	if (memcmp(buf, split1, strlen(split1))) {
++		test_msg("Data in the buffer doesn't match what it should "
++			 "in the first split have='%.*s' want '%s'\n",
++			 (int)strlen(split1), buf, split1);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	btrfs_item_key_to_cpu(eb, &key, 1);
++	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
++	    key.offset != 3) {
++		test_msg("Invalid key at slot 1\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	item = btrfs_item_nr(1);
++	if (btrfs_item_size(eb, item) != strlen(split2)) {
++		test_msg("Invalid len in the second split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 1),
++			   strlen(split2));
++	if (memcmp(buf, split2, strlen(split2))) {
++		test_msg("Data in the buffer doesn't match what it should "
++			 "in the second split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	key.offset = 1;
++	/* Do it again so we test memmoving the other items in the leaf */
++	ret = btrfs_split_item(NULL, root, path, &key, 4);
++	if (ret) {
++		test_msg("Second split item failed %d\n", ret);
++		goto out;
++	}
++
++	btrfs_item_key_to_cpu(eb, &key, 0);
++	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
++	    key.offset != 0) {
++		test_msg("Invalid key at slot 0\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	item = btrfs_item_nr(0);
++	if (btrfs_item_size(eb, item) != strlen(split3)) {
++		test_msg("Invalid len in the first split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 0),
++			   strlen(split3));
++	if (memcmp(buf, split3, strlen(split3))) {
++		test_msg("Data in the buffer doesn't match what it should "
++			 "in the third split");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	btrfs_item_key_to_cpu(eb, &key, 1);
++	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
++	    key.offset != 1) {
++		test_msg("Invalid key at slot 1\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	item = btrfs_item_nr(1);
++	if (btrfs_item_size(eb, item) != strlen(split4)) {
++		test_msg("Invalid len in the second split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 1),
++			   strlen(split4));
++	if (memcmp(buf, split4, strlen(split4))) {
++		test_msg("Data in the buffer doesn't match what it should "
++			 "in the fourth split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	btrfs_item_key_to_cpu(eb, &key, 2);
++	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
++	    key.offset != 3) {
++		test_msg("Invalid key at slot 2\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	item = btrfs_item_nr(2);
++	if (btrfs_item_size(eb, item) != strlen(split2)) {
++		test_msg("Invalid len in the second split\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 2),
++			   strlen(split2));
++	if (memcmp(buf, split2, strlen(split2))) {
++		test_msg("Data in the buffer doesn't match what it should "
++			 "in the last chunk\n");
++		ret = -EINVAL;
++		goto out;
++	}
++out:
++	btrfs_free_path(path);
++	kfree(root);
++	return ret;
++}
++
++int btrfs_test_extent_buffer_operations(void)
++{
++	test_msg("Running extent buffer operation tests");
++	return test_btrfs_split_item();
++}
