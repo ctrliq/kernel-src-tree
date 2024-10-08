@@ -1475,6 +1475,7 @@ void qla4xxx_process_aen(struct scsi_qla_host * ha, uint8_t process_aen)
 int qla4xxx_request_irqs(struct scsi_qla_host *ha)
 {
 	int ret;
+	int rval = QLA_ERROR;
 
 	if (is_qla40XX(ha))
 		goto try_intx;
@@ -1555,9 +1556,10 @@ irq_attached:
 	set_bit(AF_IRQ_ATTACHED, &ha->flags);
 	ha->host->irq = ha->pdev->irq;
 	ql4_printk(KERN_INFO, ha, "%s: irq %d attached\n",
-	    __func__, ha->pdev->irq);
+		   __func__, ha->pdev->irq);
+	rval = QLA_SUCCESS;
 irq_not_attached:
-	return ret;
+	return rval;
 }
 
 void qla4xxx_free_irqs(struct scsi_qla_host *ha)
