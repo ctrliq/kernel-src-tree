@@ -1,0 +1,301 @@
+dax: support dirty DAX entries in radix tree
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit f9fe48bece3af2d60e1bad65db4825f5a025dd36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f9fe48be.failed
+
+Add support for tracking dirty DAX entries in the struct address_space
+radix tree.  This tree is already used for dirty page writeback, and it
+already supports the use of exceptional (non struct page*) entries.
+
+In order to properly track dirty DAX pages we will insert new
+exceptional entries into the radix tree that represent dirty DAX PTE or
+PMD pages.  These exceptional entries will also contain the writeback
+addresses for the PTE or PMD faults that we can use at fsync/msync time.
+
+There are currently two types of exceptional entries (shmem and shadow)
+that can be placed into the radix tree, and this adds a third.  We rely
+on the fact that only one type of exceptional entry can be found in a
+given radix tree based on its usage.  This happens for free with DAX vs
+shmem but we explicitly prevent shadow entries from being added to radix
+trees for DAX mappings.
+
+The only shadow entries that would be generated for DAX radix trees
+would be to track zero page mappings that were created for holes.  These
+pages would receive minimal benefit from having shadow entries, and the
+choice to have only one type of exceptional entry in a given radix tree
+makes the logic simpler both in clear_exceptional_entry() and in the
+rest of DAX.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: "J. Bruce Fields" <bfields@fieldses.org>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Jeff Layton <jlayton@poochiereds.net>
+	Cc: Matthew Wilcox <willy@linux.intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Matthew Wilcox <matthew.r.wilcox@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f9fe48bece3af2d60e1bad65db4825f5a025dd36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dax.h
+#	mm/truncate.c
+#	mm/vmscan.c
+diff --cc mm/truncate.c
+index d445a4e46f9d,e3ee0e27cd17..000000000000
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@@ -34,31 -35,39 +35,67 @@@ static void clear_exceptional_entry(str
+  		return;
+  
+  	spin_lock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ +	/*
+ +	 * Regular page slots are stabilized by the page lock even
+ +	 * without the tree itself locked.  These unlocked entries
+ +	 * need verification under the tree lock.
+ +	 */
+ +	if (!__radix_tree_lookup(&mapping->page_tree, index, &node, &slot))
+ +		goto unlock;
+ +	if (*slot != entry)
+ +		goto unlock;
+ +	radix_tree_replace_slot(slot, NULL);
+ +	mapping->nrshadows--;
+ +	if (!node)
+ +		goto unlock;
+ +	workingset_node_shadows_dec(node);
+ +	/*
+ +	 * Don't track node without shadow entries.
+ +	 *
+ +	 * Avoid acquiring the list_lru lock if already untracked.
+ +	 * The list_empty() test is safe as node->private_list is
+ +	 * protected by mapping->tree_lock.
+ +	 */
+ +	if (!workingset_node_shadows(node) &&
+ +	    !list_empty(&node->private_list))
+ +		workingset_forget_node(node);
+ +	__radix_tree_delete_node(&mapping->page_tree, node);
+++=======
++ 
++ 	if (dax_mapping(mapping)) {
++ 		if (radix_tree_delete_item(&mapping->page_tree, index, entry))
++ 			mapping->nrexceptional--;
++ 	} else {
++ 		/*
++ 		 * Regular page slots are stabilized by the page lock even
++ 		 * without the tree itself locked.  These unlocked entries
++ 		 * need verification under the tree lock.
++ 		 */
++ 		if (!__radix_tree_lookup(&mapping->page_tree, index, &node,
++ 					&slot))
++ 			goto unlock;
++ 		if (*slot != entry)
++ 			goto unlock;
++ 		radix_tree_replace_slot(slot, NULL);
++ 		mapping->nrexceptional--;
++ 		if (!node)
++ 			goto unlock;
++ 		workingset_node_shadows_dec(node);
++ 		/*
++ 		 * Don't track node without shadow entries.
++ 		 *
++ 		 * Avoid acquiring the list_lru lock if already untracked.
++ 		 * The list_empty() test is safe as node->private_list is
++ 		 * protected by mapping->tree_lock.
++ 		 */
++ 		if (!workingset_node_shadows(node) &&
++ 		    !list_empty(&node->private_list))
++ 			list_lru_del(&workingset_shadow_nodes,
++ 					&node->private_list);
++ 		__radix_tree_delete_node(&mapping->page_tree, node);
++ 	}
+++>>>>>>> f9fe48bece3a (dax: support dirty DAX entries in radix tree)
+  unlock:
+  	spin_unlock_irq(&mapping->tree_lock);
+  }
+diff --cc mm/vmscan.c
+index 7592127381db,eb3dd37ccd7c..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -43,6 -45,8 +43,11 @@@
+  #include <linux/sysctl.h>
+  #include <linux/oom.h>
+  #include <linux/prefetch.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/printk.h>
++ #include <linux/dax.h>
+++>>>>>>> f9fe48bece3a (dax: support dirty DAX entries in radix tree)
+  
+  #include <asm/tlbflush.h>
+  #include <asm/div64.h>
+@@@ -529,13 -672,19 +534,19 @@@ static int __remove_mapping(struct addr
+  		 * inode reclaim needs to empty out the radix tree or
+  		 * the nodes are lost.  Don't plant shadows behind its
+  		 * back.
++ 		 *
++ 		 * We also don't store shadows for DAX mappings because the
++ 		 * only page cache pages found in these are zero pages
++ 		 * covering holes, and because we don't want to mix DAX
++ 		 * exceptional entries and shadow exceptional entries in the
++ 		 * same page_tree.
+  		 */
+  		if (reclaimed && page_is_file_cache(page) &&
+- 		    !mapping_exiting(mapping))
++ 		    !mapping_exiting(mapping) && !dax_mapping(mapping))
+  			shadow = workingset_eviction(mapping, page);
+ -		__delete_from_page_cache(page, shadow, memcg);
+ -		spin_unlock_irqrestore(&mapping->tree_lock, flags);
+ -		mem_cgroup_end_page_stat(memcg);
+ +		__delete_from_page_cache(page, shadow);
+ +		spin_unlock_irq(&mapping->tree_lock);
+ +		mem_cgroup_uncharge_cache_page(page);
+  
+  		if (freepage != NULL)
+  			freepage(page);
+* Unmerged path include/linux/dax.h
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 2557803cf68e..217109ec56ef 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -73,7 +73,7 @@ void kill_bdev(struct block_device *bdev)
+ {
+ 	struct address_space *mapping = bdev->bd_inode->i_mapping;
+ 
+-	if (mapping->nrpages == 0 && mapping->nrshadows == 0)
++	if (mapping->nrpages == 0 && mapping->nrexceptional == 0)
+ 		return;
+ 
+ 	invalidate_bh_lrus();
+diff --git a/fs/inode.c b/fs/inode.c
+index 237190a851c4..a68767dc8ac9 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -517,7 +517,7 @@ void clear_inode(struct inode *inode)
+ 	 */
+ 	spin_lock_irq(&inode->i_data.tree_lock);
+ 	BUG_ON(inode->i_data.nrpages);
+-	BUG_ON(inode->i_data.nrshadows);
++	BUG_ON(inode->i_data.nrexceptional);
+ 	spin_unlock_irq(&inode->i_data.tree_lock);
+ 	BUG_ON(!list_empty(&inode->i_data.private_list));
+ 	BUG_ON(!(inode->i_state & I_FREEING));
+* Unmerged path include/linux/dax.h
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 37d4ac39152e..00d9be8cc611 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -444,7 +444,8 @@ struct address_space {
+ 	struct mutex		i_mmap_mutex;	/* protect tree, count, list */
+ 	/* Protected by tree_lock together with the radix tree */
+ 	unsigned long		nrpages;	/* number of total pages */
+-	unsigned long		nrshadows;	/* number of shadow entries */
++	/* number of shadow or DAX exceptional entries */
++	unsigned long		nrexceptional;
+ 	pgoff_t			writeback_index;/* writeback starts here */
+ 	const struct address_space_operations *a_ops;	/* methods */
+ 	unsigned long		flags;		/* error bits/gfp mask */
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index 33170dbd9db4..ba8e0fc8b15b 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -51,6 +51,15 @@
+ #define RADIX_TREE_EXCEPTIONAL_ENTRY	2
+ #define RADIX_TREE_EXCEPTIONAL_SHIFT	2
+ 
++#define RADIX_DAX_MASK	0xf
++#define RADIX_DAX_SHIFT	4
++#define RADIX_DAX_PTE  (0x4 | RADIX_TREE_EXCEPTIONAL_ENTRY)
++#define RADIX_DAX_PMD  (0x8 | RADIX_TREE_EXCEPTIONAL_ENTRY)
++#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_MASK)
++#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
++#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
++		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE)))
++
+ static inline int radix_tree_is_indirect_ptr(void *ptr)
+ {
+ 	return (int)((unsigned long)ptr & RADIX_TREE_INDIRECT_PTR);
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 813fbe54f73b..16a3bc13d719 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -11,6 +11,7 @@
+  */
+ #include <linux/export.h>
+ #include <linux/compiler.h>
++#include <linux/dax.h>
+ #include <linux/fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/aio.h>
+@@ -121,9 +122,9 @@ static void page_cache_tree_delete(struct address_space *mapping,
+ 	__radix_tree_lookup(&mapping->page_tree, page->index, &node, &slot);
+ 
+ 	if (shadow) {
+-		mapping->nrshadows++;
++		mapping->nrexceptional++;
+ 		/*
+-		 * Make sure the nrshadows update is committed before
++		 * Make sure the nrexceptional update is committed before
+ 		 * the nrpages update so that final truncate racing
+ 		 * with reclaim does not see both counters 0 at the
+ 		 * same time and miss a shadow entry.
+@@ -527,9 +528,13 @@ static int page_cache_tree_insert(struct address_space *mapping,
+ 		p = radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
+ 		if (!radix_tree_exceptional_entry(p))
+ 			return -EEXIST;
++
++		if (WARN_ON(dax_mapping(mapping)))
++			return -EINVAL;
++
+ 		if (shadowp)
+ 			*shadowp = p;
+-		mapping->nrshadows--;
++		mapping->nrexceptional--;
+ 		if (node)
+ 			workingset_node_shadows_dec(node);
+ 	}
+@@ -1117,9 +1122,9 @@ repeat:
+ 			if (radix_tree_deref_retry(page))
+ 				goto restart;
+ 			/*
+-			 * A shadow entry of a recently evicted page,
+-			 * or a swap entry from shmem/tmpfs.  Return
+-			 * it without attempting to raise page count.
++			 * A shadow entry of a recently evicted page, a swap
++			 * entry from shmem/tmpfs or a DAX entry.  Return it
++			 * without attempting to raise page count.
+ 			 */
+ 			goto export;
+ 		}
+* Unmerged path mm/truncate.c
+* Unmerged path mm/vmscan.c
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 0c1df2be7b62..69a3283c2741 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -362,8 +362,8 @@ static void shadow_lru_isolate(struct list_head *item,
+ 			node->slots[i] = NULL;
+ 			BUG_ON(node->count < (1U << RADIX_TREE_COUNT_SHIFT));
+ 			node->count -= 1U << RADIX_TREE_COUNT_SHIFT;
+-			BUG_ON(!mapping->nrshadows);
+-			mapping->nrshadows--;
++			BUG_ON(!mapping->nrexceptional);
++			mapping->nrexceptional--;
+ 		}
+ 	}
+ 	BUG_ON(node->count);
