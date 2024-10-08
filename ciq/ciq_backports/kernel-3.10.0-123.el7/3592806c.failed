@@ -1,0 +1,102 @@
+thp: move preallocated PTE page table on move_huge_pmd()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+commit 3592806cfa08b7cca968f793c33f8e9460bab395
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/3592806c.failed
+
+Andrey Wagin reported crash on VM_BUG_ON() in pgtable_pmd_page_dtor() with
+fallowing backtrace:
+
+  free_pgd_range+0x2bf/0x410
+  free_pgtables+0xce/0x120
+  unmap_region+0xe0/0x120
+  do_munmap+0x249/0x360
+  move_vma+0x144/0x270
+  SyS_mremap+0x3b9/0x510
+  system_call_fastpath+0x16/0x1b
+
+The crash can be reproduce with this test case:
+
+  #define _GNU_SOURCE
+  #include <sys/mman.h>
+  #include <stdio.h>
+  #include <unistd.h>
+
+  #define MB (1024 * 1024UL)
+  #define GB (1024 * MB)
+
+  int main(int argc, char **argv)
+  {
+	char *p;
+	int i;
+
+	p = mmap((void *) GB, 10 * MB, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	for (i = 0; i < 10 * MB; i += 4096)
+		p[i] = 1;
+	mremap(p, 10 * MB, 10 * MB, MREMAP_FIXED | MREMAP_MAYMOVE, 2 * GB);
+	return 0;
+  }
+
+Due to split PMD lock, we now store preallocated PTE tables for THP
+pages per-PMD table.  It means we need to move them to other PMD table
+if huge PMD moved there.
+
+	Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Reported-by: Andrey Vagin <avagin@openvz.org>
+	Tested-by: Andrey Vagin <avagin@openvz.org>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3592806cfa08b7cca968f793c33f8e9460bab395)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/huge_memory.c
+diff --cc mm/huge_memory.c
+index 2b345c81f273,33a5dc492810..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -1467,12 -1469,31 +1467,29 @@@ int move_huge_pmd(struct vm_area_struc
+  		goto out;
+  	}
+  
+ -	/*
+ -	 * We don't have to worry about the ordering of src and dst
+ -	 * ptlocks because exclusive mmap_sem prevents deadlock.
+ -	 */
+ -	ret = __pmd_trans_huge_lock(old_pmd, vma, &old_ptl);
+ +	ret = __pmd_trans_huge_lock(old_pmd, vma);
+  	if (ret == 1) {
+ -		new_ptl = pmd_lockptr(mm, new_pmd);
+ -		if (new_ptl != old_ptl)
+ -			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
+  		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+  		VM_BUG_ON(!pmd_none(*new_pmd));
+++<<<<<<< HEAD
+ +		set_pmd_at(mm, new_addr, new_pmd, pmd);
+ +		spin_unlock(&mm->page_table_lock);
+++=======
++ 		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
++ 		if (new_ptl != old_ptl) {
++ 			pgtable_t pgtable;
++ 
++ 			/*
++ 			 * Move preallocated PTE page table if new_pmd is on
++ 			 * different PMD page table.
++ 			 */
++ 			pgtable = pgtable_trans_huge_withdraw(mm, old_pmd);
++ 			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
++ 
++ 			spin_unlock(new_ptl);
++ 		}
++ 		spin_unlock(old_ptl);
+++>>>>>>> 3592806cfa08 (thp: move preallocated PTE page table on move_huge_pmd())
+  	}
+  out:
+  	return ret;
+* Unmerged path mm/huge_memory.c
