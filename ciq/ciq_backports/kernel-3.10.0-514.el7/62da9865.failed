@@ -1,0 +1,178 @@
+netfilter: nf_conntrack: make nf_ct_zone_dflt built-in
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 62da98656b62a5ca57f22263705175af8ded5aa1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/62da9865.failed
+
+Fengguang reported, that some randconfig generated the following linker
+issue with nf_ct_zone_dflt object involved:
+
+  [...]
+  CC      init/version.o
+  LD      init/built-in.o
+  net/built-in.o: In function `ipv4_conntrack_defrag':
+  nf_defrag_ipv4.c:(.text+0x93e95): undefined reference to `nf_ct_zone_dflt'
+  net/built-in.o: In function `ipv6_defrag':
+  nf_defrag_ipv6_hooks.c:(.text+0xe3ffe): undefined reference to `nf_ct_zone_dflt'
+  make: *** [vmlinux] Error 1
+
+Given that configurations exist where we have a built-in part, which is
+accessing nf_ct_zone_dflt such as the two handlers nf_ct_defrag_user()
+and nf_ct6_defrag_user(), and a part that configures nf_conntrack as a
+module, we must move nf_ct_zone_dflt into a fixed, guaranteed built-in
+area when netfilter is configured in general.
+
+Therefore, split the more generic parts into a common header under
+include/linux/netfilter/ and move nf_ct_zone_dflt into the built-in
+section that already holds parts related to CONFIG_NF_CONNTRACK in the
+netfilter core. This fixes the issue on my side.
+
+Fixes: 308ac9143ee2 ("netfilter: nf_conntrack: push zone object into functions")
+	Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 62da98656b62a5ca57f22263705175af8ded5aa1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_conntrack_zones.h
+#	net/netfilter/core.c
+diff --cc include/net/netfilter/nf_conntrack_zones.h
+index 034efe8d45a5,4e32512cef32..000000000000
+--- a/include/net/netfilter/nf_conntrack_zones.h
++++ b/include/net/netfilter/nf_conntrack_zones.h
+@@@ -1,16 -1,50 +1,63 @@@
+  #ifndef _NF_CONNTRACK_ZONES_H
+  #define _NF_CONNTRACK_ZONES_H
+  
+++<<<<<<< HEAD
+ +#define NF_CT_DEFAULT_ZONE	0
+ +
+ +#if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
+ +#include <net/netfilter/nf_conntrack_extend.h>
+ +
+ +struct nf_conntrack_zone {
+ +	u16	id;
+ +};
+ +
+ +static inline u16 nf_ct_zone(const struct nf_conn *ct)
+++=======
++ #include <linux/netfilter/nf_conntrack_zones_common.h>
++ 
++ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
++ #include <net/netfilter/nf_conntrack_extend.h>
++ 
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone(const struct nf_conn *ct)
++ {
++ 	const struct nf_conntrack_zone *nf_ct_zone = NULL;
++ 
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ 	nf_ct_zone = nf_ct_ext_find(ct, NF_CT_EXT_ZONE);
++ #endif
++ 	return nf_ct_zone ? nf_ct_zone : &nf_ct_zone_dflt;
++ }
++ 
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone_init(struct nf_conntrack_zone *zone, u16 id, u8 dir, u8 flags)
++ {
++ 	zone->id = id;
++ 	zone->flags = flags;
++ 	zone->dir = dir;
++ 
++ 	return zone;
++ }
++ 
++ static inline const struct nf_conntrack_zone *
++ nf_ct_zone_tmpl(const struct nf_conn *tmpl, const struct sk_buff *skb,
++ 		struct nf_conntrack_zone *tmp)
++ {
++ 	const struct nf_conntrack_zone *zone;
++ 
++ 	if (!tmpl)
++ 		return &nf_ct_zone_dflt;
++ 
++ 	zone = nf_ct_zone(tmpl);
++ 	if (zone->flags & NF_CT_FLAG_MARK)
++ 		zone = nf_ct_zone_init(tmp, skb->mark, zone->dir, 0);
++ 
++ 	return zone;
++ }
++ 
++ static inline int nf_ct_zone_add(struct nf_conn *ct, gfp_t flags,
++ 				 const struct nf_conntrack_zone *info)
+++>>>>>>> 62da98656b62 (netfilter: nf_conntrack: make nf_ct_zone_dflt built-in)
+  {
+  #ifdef CONFIG_NF_CONNTRACK_ZONES
+  	struct nf_conntrack_zone *nf_ct_zone;
+diff --cc net/netfilter/core.c
+index 267e861d8dd4,8e47f8113495..000000000000
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@@ -264,9 -388,12 +264,18 @@@ EXPORT_SYMBOL(nf_conntrack_destroy)
+  struct nfq_ct_hook __rcu *nfq_ct_hook __read_mostly;
+  EXPORT_SYMBOL_GPL(nfq_ct_hook);
+  
+++<<<<<<< HEAD
+ +struct nfq_ct_nat_hook __rcu *nfq_ct_nat_hook __read_mostly;
+ +EXPORT_SYMBOL_GPL(nfq_ct_nat_hook);
+ +
+++=======
++ /* Built-in default zone used e.g. by modules. */
++ const struct nf_conntrack_zone nf_ct_zone_dflt = {
++ 	.id	= NF_CT_DEFAULT_ZONE_ID,
++ 	.dir	= NF_CT_DEFAULT_ZONE_DIR,
++ };
++ EXPORT_SYMBOL_GPL(nf_ct_zone_dflt);
+++>>>>>>> 62da98656b62 (netfilter: nf_conntrack: make nf_ct_zone_dflt built-in)
+  #endif /* CONFIG_NF_CONNTRACK */
+  
+  #ifdef CONFIG_NF_NAT_NEEDED
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+index 4457b93e6390..2874090ce9e8 100644
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -372,6 +372,8 @@ nf_nat_decode_session(struct sk_buff *skb, struct flowi *fl, u_int8_t family)
+ #endif /*CONFIG_NETFILTER*/
+ 
+ #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
++#include <linux/netfilter/nf_conntrack_zones_common.h>
++
+ extern void (*ip_ct_attach)(struct sk_buff *, const struct sk_buff *) __rcu;
+ void nf_ct_attach(struct sk_buff *, const struct sk_buff *);
+ extern void (*nf_ct_destroy)(struct nf_conntrack *) __rcu;
+diff --git a/include/linux/netfilter/nf_conntrack_zones_common.h b/include/linux/netfilter/nf_conntrack_zones_common.h
+new file mode 100644
+index 000000000000..5d7cf36d4766
+--- /dev/null
++++ b/include/linux/netfilter/nf_conntrack_zones_common.h
+@@ -0,0 +1,23 @@
++#ifndef _NF_CONNTRACK_ZONES_COMMON_H
++#define _NF_CONNTRACK_ZONES_COMMON_H
++
++#include <uapi/linux/netfilter/nf_conntrack_tuple_common.h>
++
++#define NF_CT_DEFAULT_ZONE_ID	0
++
++#define NF_CT_ZONE_DIR_ORIG	(1 << IP_CT_DIR_ORIGINAL)
++#define NF_CT_ZONE_DIR_REPL	(1 << IP_CT_DIR_REPLY)
++
++#define NF_CT_DEFAULT_ZONE_DIR	(NF_CT_ZONE_DIR_ORIG | NF_CT_ZONE_DIR_REPL)
++
++#define NF_CT_FLAG_MARK		1
++
++struct nf_conntrack_zone {
++	u16	id;
++	u8	flags;
++	u8	dir;
++};
++
++extern const struct nf_conntrack_zone nf_ct_zone_dflt;
++
++#endif /* _NF_CONNTRACK_ZONES_COMMON_H */
+* Unmerged path include/net/netfilter/nf_conntrack_zones.h
+* Unmerged path net/netfilter/core.c
