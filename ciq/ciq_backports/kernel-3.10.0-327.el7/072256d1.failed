@@ -1,0 +1,116 @@
+bonding: make slave status notifications GFP_ATOMIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Veaceslav Falico <vfalico@redhat.com>
+commit 072256d1f2b8ba0bbb265d590c703f3d57a39d6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/072256d1.failed
+
+Currently we're using GFP_KERNEL, however there are some path(s) where we
+can hold some spinlocks, specifically bond->curr_slave_lock:
+
+[    4.722916] BUG: sleeping function called from invalid context at mm/slub.c:965
+[    4.724438] in_atomic(): 1, irqs_disabled(): 0, pid: 940, name: ifup-eth
+[    4.726034] 5 locks held by ifup-eth/940:
+...snip...
+[    4.734646]  #4:  (&bond->curr_slave_lock){+...+.}, at: [<ffffffffa00badc6>] bond_enslave+0xda6/0xdd0 [bonding]
+...snip...
+[    4.759081]  [<ffffffffa00b6f11>] bond_change_active_slave+0x191/0x3b0 [bonding]
+[    4.760917]  [<ffffffffa00b7227>] bond_select_active_slave+0xf7/0x1d0 [bonding]
+[    4.762751]  [<ffffffffa00badce>] bond_enslave+0xdae/0xdd0 [bonding]
+...snip...
+
+As it's out of hot path and is a really rare event - change the gfp_t flags
+to GFP_ATOMIC to avoid sleeping under spinlock.
+
+v2: convert new notify calls to GFP_ATOMIC.
+
+CC: Thomas Glanzmann <thomas@glanzmann.de>
+CC: Ding Tianhong <dingtianhong@huawei.com>
+CC: Jay Vosburgh <fubar@us.ibm.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Veaceslav Falico <vfalico@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 072256d1f2b8ba0bbb265d590c703f3d57a39d6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bonding.h
+diff --cc drivers/net/bonding/bonding.h
+index e1ca02f0b074,63ee116adfab..000000000000
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@@ -293,12 -291,62 +293,70 @@@ static inline bool bond_is_lb(const str
+  
+  static inline void bond_set_active_slave(struct slave *slave)
+  {
+++<<<<<<< HEAD
+ +	slave->backup = 0;
+++=======
++ 	if (slave->backup) {
++ 		slave->backup = 0;
++ 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
++ 	}
+++>>>>>>> 072256d1f2b8 (bonding: make slave status notifications GFP_ATOMIC)
+  }
+  
+  static inline void bond_set_backup_slave(struct slave *slave)
+  {
+++<<<<<<< HEAD
+ +	slave->backup = 1;
+++=======
++ 	if (!slave->backup) {
++ 		slave->backup = 1;
++ 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
++ 	}
++ }
++ 
++ static inline void bond_set_slave_state(struct slave *slave,
++ 					int slave_state, bool notify)
++ {
++ 	if (slave->backup == slave_state)
++ 		return;
++ 
++ 	slave->backup = slave_state;
++ 	if (notify) {
++ 		rtmsg_ifinfo(RTM_NEWLINK, slave->dev, 0, GFP_ATOMIC);
++ 		slave->should_notify = 0;
++ 	} else {
++ 		if (slave->should_notify)
++ 			slave->should_notify = 0;
++ 		else
++ 			slave->should_notify = 1;
++ 	}
++ }
++ 
++ static inline void bond_slave_state_change(struct bonding *bond)
++ {
++ 	struct list_head *iter;
++ 	struct slave *tmp;
++ 
++ 	bond_for_each_slave(bond, tmp, iter) {
++ 		if (tmp->link == BOND_LINK_UP)
++ 			bond_set_active_slave(tmp);
++ 		else if (tmp->link == BOND_LINK_DOWN)
++ 			bond_set_backup_slave(tmp);
++ 	}
++ }
++ 
++ static inline void bond_slave_state_notify(struct bonding *bond)
++ {
++ 	struct list_head *iter;
++ 	struct slave *tmp;
++ 
++ 	bond_for_each_slave(bond, tmp, iter) {
++ 		if (tmp->should_notify) {
++ 			rtmsg_ifinfo(RTM_NEWLINK, tmp->dev, 0, GFP_ATOMIC);
++ 			tmp->should_notify = 0;
++ 		}
++ 	}
+++>>>>>>> 072256d1f2b8 (bonding: make slave status notifications GFP_ATOMIC)
+  }
+  
+  static inline int bond_slave_state(struct slave *slave)
+* Unmerged path drivers/net/bonding/bonding.h
