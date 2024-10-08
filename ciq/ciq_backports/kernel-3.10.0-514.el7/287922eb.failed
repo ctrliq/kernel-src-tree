@@ -1,0 +1,190 @@
+block: defer timeouts to a workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [block] defer timeouts to a workqueue (Gustavo Duarte) [1372483]
+Rebuild_FUZZ: 89.23%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 287922eb0b186e2a5bf54fdd04b734c25c90035c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/287922eb.failed
+
+Timer context is not very useful for drivers to perform any meaningful abort
+action from.  So instead of calling the driver from this useless context
+defer it to a workqueue as soon as possible.
+
+Note that while a delayed_work item would seem the right thing here I didn't
+dare to use it due to the magic in blk_add_timer that pokes deep into timer
+internals.  But maybe this encourages Tejun to add a sensible API for that to
+the workqueue API and we'll all be fine in the end :)
+
+Contains a major update from Keith Bush:
+
+"This patch removes synchronizing the timeout work so that the timer can
+ start a freeze on its own queue. The timer enters the queue, so timer
+ context can only start a freeze, but not wait for frozen."
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 287922eb0b186e2a5bf54fdd04b734c25c90035c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+diff --cc block/blk-core.c
+index e5174ec390d0,7e01002dfdde..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -593,6 -630,47 +593,50 @@@ struct request_queue *blk_alloc_queue(g
+  }
+  EXPORT_SYMBOL(blk_alloc_queue);
+  
+++<<<<<<< HEAD
+++=======
++ int blk_queue_enter(struct request_queue *q, bool nowait)
++ {
++ 	while (true) {
++ 		int ret;
++ 
++ 		if (percpu_ref_tryget_live(&q->q_usage_counter))
++ 			return 0;
++ 
++ 		if (nowait)
++ 			return -EBUSY;
++ 
++ 		ret = wait_event_interruptible(q->mq_freeze_wq,
++ 				!atomic_read(&q->mq_freeze_depth) ||
++ 				blk_queue_dying(q));
++ 		if (blk_queue_dying(q))
++ 			return -ENODEV;
++ 		if (ret)
++ 			return ret;
++ 	}
++ }
++ 
++ void blk_queue_exit(struct request_queue *q)
++ {
++ 	percpu_ref_put(&q->q_usage_counter);
++ }
++ 
++ static void blk_queue_usage_counter_release(struct percpu_ref *ref)
++ {
++ 	struct request_queue *q =
++ 		container_of(ref, struct request_queue, q_usage_counter);
++ 
++ 	wake_up_all(&q->mq_freeze_wq);
++ }
++ 
++ static void blk_rq_timed_out_timer(unsigned long data)
++ {
++ 	struct request_queue *q = (struct request_queue *)data;
++ 
++ 	kblockd_schedule_work(&q->timeout_work);
++ }
++ 
+++>>>>>>> 287922eb0b18 (block: defer timeouts to a workqueue)
+  struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+  {
+  	struct request_queue *q;
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e2a26ced568f..4beffa56594e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -636,15 +636,19 @@ static void blk_mq_check_expired(struct blk_mq_hw_ctx *hctx,
+ 	}
+ }
+ 
+-static void blk_mq_rq_timer(unsigned long priv)
++static void blk_mq_timeout_work(struct work_struct *work)
+ {
+-	struct request_queue *q = (struct request_queue *)priv;
++	struct request_queue *q =
++		container_of(work, struct request_queue, timeout_work);
+ 	struct blk_mq_timeout_data data = {
+ 		.next		= 0,
+ 		.next_set	= 0,
+ 	};
+ 	int i;
+ 
++	if (blk_queue_enter(q, true))
++		return;
++
+ 	blk_mq_queue_tag_busy_iter(q, blk_mq_check_expired, &data);
+ 
+ 	if (data.next_set) {
+@@ -659,6 +663,7 @@ static void blk_mq_rq_timer(unsigned long priv)
+ 				blk_mq_tag_idle(hctx);
+ 		}
+ 	}
++	blk_queue_exit(q);
+ }
+ 
+ /*
+@@ -2018,7 +2023,7 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 			    PERCPU_REF_INIT_ATOMIC, GFP_KERNEL))
+ 		goto err_hctxs;
+ 
+-	setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
++	INIT_WORK(&q->timeout_work, blk_mq_timeout_work);
+ 	blk_queue_rq_timeout(q, set->timeout ? set->timeout : 30 * HZ);
+ 
+ 	q->nr_queues = nr_cpu_ids;
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index b73d485b5287..d2d0f02399db 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -126,13 +126,16 @@ static void blk_rq_check_expired(struct request *rq, unsigned long *next_timeout
+ 	}
+ }
+ 
+-void blk_rq_timed_out_timer(unsigned long data)
++void blk_timeout_work(struct work_struct *work)
+ {
+-	struct request_queue *q = (struct request_queue *) data;
++	struct request_queue *q =
++		container_of(work, struct request_queue, timeout_work);
+ 	unsigned long flags, next = 0;
+ 	struct request *rq, *tmp;
+ 	int next_set = 0;
+ 
++	if (blk_queue_enter(q, true))
++		return;
+ 	spin_lock_irqsave(q->queue_lock, flags);
+ 
+ 	list_for_each_entry_safe(rq, tmp, &q->timeout_list, timeout_list)
+@@ -142,6 +145,7 @@ void blk_rq_timed_out_timer(unsigned long data)
+ 		mod_timer(&q->timeout, round_jiffies_up(next));
+ 
+ 	spin_unlock_irqrestore(q->queue_lock, flags);
++	blk_queue_exit(q);
+ }
+ 
+ /**
+diff --git a/block/blk.h b/block/blk.h
+index 9eb83530207b..73aa580b5e11 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -83,7 +83,7 @@ static inline void blk_flush_integrity(void)
+ }
+ #endif
+ 
+-void blk_rq_timed_out_timer(unsigned long data);
++void blk_timeout_work(struct work_struct *work);
+ unsigned long blk_rq_timeout(unsigned long timeout);
+ void blk_add_timer(struct request *req);
+ void blk_delete_timer(struct request *);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 0e72d45d3caf..9d837cdb2c06 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -455,6 +455,7 @@ struct request_queue {
+ 
+ 	unsigned int		rq_timeout;
+ 	struct timer_list	timeout;
++	struct work_struct	timeout_work;
+ 	struct list_head	timeout_list;
+ 
+ 	struct list_head	icq_list;
