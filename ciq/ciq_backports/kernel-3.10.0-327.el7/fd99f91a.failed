@@ -1,0 +1,80 @@
+sched/idle: Avoid spurious wakeup IPIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit fd99f91aa007ba255aac44fe6cf21c1db398243a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/fd99f91a.failed
+
+Because mwait_idle_with_hints() gets called from !idle context it must
+call current_clr_polling(). This however means that resched_task() is
+very likely to send an IPI even when we were polling:
+
+  CPU0					CPU1
+
+  if (current_set_polling_and_test())
+    goto out;
+
+  __monitor(&ti->flags);
+  if (!need_resched())
+    __mwait(eax, ecx);
+					set_tsk_need_resched(p);
+					smp_mb();
+out:
+  current_clr_polling();
+					if (!tsk_is_polling(p))
+					  smp_send_reschedule(cpu);
+
+So while it is correct (extra IPIs aren't a problem, whereas a missed
+IPI would be) it is a performance problem (for some).
+
+Avoid this issue by using fetch_or() to atomically set NEED_RESCHED
+and test if POLLING_NRFLAG is set.
+
+Since a CPU stuck in mwait is unlikely to modify the flags word,
+contention on the cmpxchg is unlikely and thus we should mostly
+succeed in a single go.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Acked-by: Nicolas Pitre <nico@linaro.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/n/tip-kf5suce6njh5xf5d3od13rr0@git.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit fd99f91aa007ba255aac44fe6cf21c1db398243a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 104ddc5bd4aa,4b82622b6252..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -539,15 -554,15 +572,18 @@@ void resched_task(struct task_struct *p
+  	if (test_tsk_need_resched(p))
+  		return;
+  
+- 	set_tsk_need_resched(p);
+- 
+  	cpu = task_cpu(p);
+++<<<<<<< HEAD
+ +	if (cpu == smp_processor_id())
+++=======
++ 
++ 	if (cpu == smp_processor_id()) {
++ 		set_tsk_need_resched(p);
++ 		set_preempt_need_resched();
+++>>>>>>> fd99f91aa007 (sched/idle: Avoid spurious wakeup IPIs)
+  		return;
+ -	}
+  
+- 	/* NEED_RESCHED must be visible before we test polling */
+- 	smp_mb();
+- 	if (!tsk_is_polling(p))
++ 	if (set_nr_and_not_polling(p))
+  		smp_send_reschedule(cpu);
+  }
+  
+* Unmerged path kernel/sched/core.c
