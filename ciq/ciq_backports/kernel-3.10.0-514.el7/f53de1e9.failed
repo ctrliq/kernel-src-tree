@@ -1,0 +1,178 @@
+net: ipv6: use common fib_default_rule_pref
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [net] ipv6: use common fib_default_rule_pref (Paolo Abeni) [1264431]
+Rebuild_FUZZ: 93.83%
+commit-author Phil Sutter <phil@nwl.cc>
+commit f53de1e9a4aaf8cbe08845da6f7ff26a078ac507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/f53de1e9.failed
+
+This switches IPv6 policy routing to use the shared
+fib_default_rule_pref() function of IPv4 and DECnet. It is also used in
+multicast routing for IPv4 as well as IPv6.
+
+The motivation for this patch is a complaint about iproute2 behaving
+inconsistent between IPv4 and IPv6 when adding policy rules: Formerly,
+IPv6 rules were assigned a fixed priority of 0x3FFF whereas for IPv4 the
+assigned priority value was decreased with each rule added.
+
+Since then all users of the default_pref field have been converted to
+assign the generic function fib_default_rule_pref(), fib_nl_newrule()
+may just use it directly instead. Therefore get rid of the function
+pointer altogether and make fib_default_rule_pref() static, as it's not
+used outside fib_rules.c anymore.
+
+	Signed-off-by: Phil Sutter <phil@nwl.cc>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f53de1e9a4aaf8cbe08845da6f7ff26a078ac507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fib_rules.h
+diff --cc include/net/fib_rules.h
+index 5b0bbc779862,59160de702b6..000000000000
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@@ -100,14 -109,12 +99,21 @@@ static inline u32 frh_get_table(struct 
+  	return frh->table;
+  }
+  
+ -struct fib_rules_ops *fib_rules_register(const struct fib_rules_ops *,
+ -					 struct net *);
+ -void fib_rules_unregister(struct fib_rules_ops *);
+ +extern struct fib_rules_ops *fib_rules_register(const struct fib_rules_ops *, struct net *);
+ +extern void fib_rules_unregister(struct fib_rules_ops *);
+  
+++<<<<<<< HEAD
+ +extern int			fib_rules_lookup(struct fib_rules_ops *,
+ +						 struct flowi *, int flags,
+ +						 struct fib_lookup_arg *);
+ +extern int			fib_default_rule_add(struct fib_rules_ops *,
+ +						     u32 pref, u32 table,
+ +						     u32 flags);
+ +extern u32			fib_default_rule_pref(struct fib_rules_ops *ops);
+++=======
++ int fib_rules_lookup(struct fib_rules_ops *, struct flowi *, int flags,
++ 		     struct fib_lookup_arg *);
++ int fib_default_rule_add(struct fib_rules_ops *, u32 pref, u32 table,
++ 			 u32 flags);
+++>>>>>>> f53de1e9a4aa (net: ipv6: use common fib_default_rule_pref)
+  #endif
+* Unmerged path include/net/fib_rules.h
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index 2771bcd5bded..de48040fafe0 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -40,7 +40,7 @@ int fib_default_rule_add(struct fib_rules_ops *ops,
+ }
+ EXPORT_SYMBOL(fib_default_rule_add);
+ 
+-u32 fib_default_rule_pref(struct fib_rules_ops *ops)
++static u32 fib_default_rule_pref(struct fib_rules_ops *ops)
+ {
+ 	struct list_head *pos;
+ 	struct fib_rule *rule;
+@@ -56,7 +56,6 @@ u32 fib_default_rule_pref(struct fib_rules_ops *ops)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(fib_default_rule_pref);
+ 
+ static void notify_rule_change(int event, struct fib_rule *rule,
+ 			       struct fib_rules_ops *ops, struct nlmsghdr *nlh,
+@@ -289,8 +288,8 @@ static int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr* nlh)
+ 	}
+ 	rule->fr_net = net;
+ 
+-	if (tb[FRA_PRIORITY])
+-		rule->pref = nla_get_u32(tb[FRA_PRIORITY]);
++	rule->pref = tb[FRA_PRIORITY] ? nla_get_u32(tb[FRA_PRIORITY])
++	                              : fib_default_rule_pref(ops);
+ 
+ 	if (tb[FRA_IIFNAME]) {
+ 		struct net_device *dev;
+@@ -328,9 +327,6 @@ static int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr* nlh)
+ 	rule->flags = frh->flags;
+ 	rule->table = frh_get_table(frh, tb);
+ 
+-	if (!tb[FRA_PRIORITY] && ops->default_pref)
+-		rule->pref = ops->default_pref(ops);
+-
+ 	err = -EINVAL;
+ 	if (tb[FRA_GOTO]) {
+ 		if (rule->action != FR_ACT_GOTO)
+diff --git a/net/decnet/dn_rules.c b/net/decnet/dn_rules.c
+index faf7cc3483fe..8d638b363821 100644
+--- a/net/decnet/dn_rules.c
++++ b/net/decnet/dn_rules.c
+@@ -229,7 +229,6 @@ static const struct fib_rules_ops __net_initconst dn_fib_rules_ops_template = {
+ 	.configure	= dn_fib_rule_configure,
+ 	.compare	= dn_fib_rule_compare,
+ 	.fill		= dn_fib_rule_fill,
+-	.default_pref	= fib_default_rule_pref,
+ 	.flush_cache	= dn_fib_rule_flush_cache,
+ 	.nlgroup	= RTNLGRP_DECnet_RULE,
+ 	.policy		= dn_fib_rule_policy,
+diff --git a/net/ipv4/fib_rules.c b/net/ipv4/fib_rules.c
+index e1394ffcecff..87cf295c5f91 100644
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@ -274,7 +274,6 @@ static const struct fib_rules_ops __net_initconst fib4_rules_ops_template = {
+ 	.delete		= fib4_rule_delete,
+ 	.compare	= fib4_rule_compare,
+ 	.fill		= fib4_rule_fill,
+-	.default_pref	= fib_default_rule_pref,
+ 	.nlmsg_payload	= fib4_rule_nlmsg_payload,
+ 	.flush_cache	= fib4_rule_flush_cache,
+ 	.nlgroup	= RTNLGRP_IPV4_RULE,
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 824b638c085c..bc749a8abb19 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -230,7 +230,6 @@ static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
+ 	.match		= ipmr_rule_match,
+ 	.configure	= ipmr_rule_configure,
+ 	.compare	= ipmr_rule_compare,
+-	.default_pref	= fib_default_rule_pref,
+ 	.fill		= ipmr_rule_fill,
+ 	.nlgroup	= RTNLGRP_IPV4_RULE,
+ 	.policy		= ipmr_rule_policy,
+diff --git a/net/ipv6/fib6_rules.c b/net/ipv6/fib6_rules.c
+index c8e5ffc1b770..39649e946587 100644
+--- a/net/ipv6/fib6_rules.c
++++ b/net/ipv6/fib6_rules.c
+@@ -223,11 +223,6 @@ nla_put_failure:
+ 	return -ENOBUFS;
+ }
+ 
+-static u32 fib6_rule_default_pref(struct fib_rules_ops *ops)
+-{
+-	return 0x3FFF;
+-}
+-
+ static size_t fib6_rule_nlmsg_payload(struct fib_rule *rule)
+ {
+ 	return nla_total_size(16) /* dst */
+@@ -243,7 +238,6 @@ static const struct fib_rules_ops __net_initconst fib6_rules_ops_template = {
+ 	.configure		= fib6_rule_configure,
+ 	.compare		= fib6_rule_compare,
+ 	.fill			= fib6_rule_fill,
+-	.default_pref		= fib6_rule_default_pref,
+ 	.nlmsg_payload		= fib6_rule_nlmsg_payload,
+ 	.nlgroup		= RTNLGRP_IPV6_RULE,
+ 	.policy			= fib6_rule_policy,
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index fc54dd5e1e38..5eb3562cc60d 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -214,7 +214,6 @@ static const struct fib_rules_ops __net_initconst ip6mr_rules_ops_template = {
+ 	.match		= ip6mr_rule_match,
+ 	.configure	= ip6mr_rule_configure,
+ 	.compare	= ip6mr_rule_compare,
+-	.default_pref	= fib_default_rule_pref,
+ 	.fill		= ip6mr_rule_fill,
+ 	.nlgroup	= RTNLGRP_IPV6_RULE,
+ 	.policy		= ip6mr_rule_policy,
