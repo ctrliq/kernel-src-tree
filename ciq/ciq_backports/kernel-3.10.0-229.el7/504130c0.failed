@@ -1,0 +1,335 @@
+IB/iser: Protect iser state machine with a mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [infiniband] iser: Protect iser state machine with a mutex (Amir Vadai) [1107622]
+Rebuild_FUZZ: 96.77%
+commit-author Ariel Nahum <arieln@mellanox.com>
+commit 504130c039f917aba8b145fe8ea99be95e662fca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/504130c0.failed
+
+The iser connection state lookups and transitions are not fully protected.
+
+Some transitions are protected with a spinlock, and in some cases the
+state is accessed unprotected due to specific assumptions of the flow.
+
+Introduce a new mutex to protect the connection state access. We use a
+mutex since we need to also include a scheduling operations executed
+under the state lock.
+
+Each state transition/condition and its corresponding action will be
+protected with the state mutex.
+
+The rdma_cm events handler acquires the mutex when handling connection
+events. Since iser connection state can transition to DOWN
+concurrently during connection establishment, we bailout from
+addr/route resolution events when the state is not PENDING.
+
+This addresses a scenario where ep_poll retries expire during CMA
+connection establishment. In this case ep_disconnect is invoked while
+CMA events keep coming (address/route resolution, connected, etc...).
+
+	Signed-off-by: Ariel Nahum <arieln@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 504130c039f917aba8b145fe8ea99be95e662fca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/iser/iscsi_iser.c
+#	drivers/infiniband/ulp/iser/iscsi_iser.h
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.c
+index ed0eb50fd5e9,3dc853c9e4bf..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.c
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.c
+@@@ -660,19 -656,25 +663,41 @@@ iscsi_iser_ep_disconnect(struct iscsi_e
+  	struct iser_conn *ib_conn;
+  
+  	ib_conn = ep->dd_data;
+++<<<<<<< HEAD
+ +	if (ib_conn->iser_conn)
+ +		/*
+ +		 * Must suspend xmit path if the ep is bound to the
+ +		 * iscsi_conn, so we know we are not accessing the ib_conn
+ +		 * when we free it.
+ +		 *
+ +		 * This may not be bound if the ep poll failed.
+ +		 */
+ +		iscsi_suspend_tx(ib_conn->iser_conn->iscsi_conn);
+ +
+ +
+ +	iser_info("ib conn %p state %d\n", ib_conn, ib_conn->state);
+ +	iser_conn_terminate(ib_conn);
+++=======
++ 	iser_info("ep %p ib conn %p state %d\n", ep, ib_conn, ib_conn->state);
++ 	mutex_lock(&ib_conn->state_mutex);
++ 	iser_conn_terminate(ib_conn);
++ 
++ 	/*
++ 	 * if iser_conn and iscsi_conn are bound, we must wait iscsi_conn_stop
++ 	 * call and ISER_CONN_DOWN state before freeing the iser resources.
++ 	 * otherwise we are safe to free resources immediately.
++ 	 */
++ 	if (ib_conn->iscsi_conn) {
++ 		INIT_WORK(&ib_conn->release_work, iser_release_work);
++ 		queue_work(release_wq, &ib_conn->release_work);
++ 		mutex_unlock(&ib_conn->state_mutex);
++ 	} else {
++ 		ib_conn->state = ISER_CONN_DOWN;
++ 		mutex_unlock(&ib_conn->state_mutex);
++ 		iser_conn_release(ib_conn);
++ 	}
++ 	iscsi_destroy_endpoint(ep);
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  }
+  
+  static umode_t iser_attr_is_visible(int param_type, int param)
+diff --cc drivers/infiniband/ulp/iser/iscsi_iser.h
+index 4067841520c9,c7efc5a91604..000000000000
+--- a/drivers/infiniband/ulp/iser/iscsi_iser.h
++++ b/drivers/infiniband/ulp/iser/iscsi_iser.h
+@@@ -334,6 -333,9 +334,12 @@@ struct iser_conn 
+  	int                          post_recv_buf_count; /* posted rx count  */
+  	atomic_t                     post_send_buf_count; /* posted tx count   */
+  	char 			     name[ISER_OBJECT_NAME_SIZE];
+++<<<<<<< HEAD
+++=======
++ 	struct work_struct	     release_work;
++ 	struct completion	     stop_completion;
++ 	struct mutex		     state_mutex;
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  	struct list_head	     conn_list;       /* entry in ig conn list */
+  
+  	char  			     *login_buf;
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 51c7dac6fc0a,6e7e54d883ab..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -577,7 -579,26 +579,29 @@@ static int iser_conn_state_comp_exch(st
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void iser_release_work(struct work_struct *work)
++ {
++ 	struct iser_conn *ib_conn;
++ 
++ 	ib_conn = container_of(work, struct iser_conn, release_work);
++ 
++ 	/* wait for .conn_stop callback */
++ 	wait_for_completion(&ib_conn->stop_completion);
++ 
++ 	/* wait for the qp`s post send and post receive buffers to empty */
++ 	wait_event_interruptible(ib_conn->wait,
++ 				 ib_conn->state == ISER_CONN_DOWN);
++ 
++ 	mutex_lock(&ib_conn->state_mutex);
++ 	ib_conn->state = ISER_CONN_DOWN;
++ 	mutex_unlock(&ib_conn->state_mutex);
++ 
++ 	iser_conn_release(ib_conn);
++ }
++ 
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  /**
+   * Frees all conn objects and deallocs conn descriptor
+   */
+@@@ -585,8 -606,6 +609,11 @@@ static void iser_conn_release(struct is
+  {
+  	struct iser_device  *device = ib_conn->device;
+  
+++<<<<<<< HEAD
+ +	BUG_ON(ib_conn->state != ISER_CONN_DOWN);
+ +
+++=======
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  	mutex_lock(&ig.connlist_mutex);
+  	list_del(&ib_conn->conn_list);
+  	mutex_unlock(&ig.connlist_mutex);
+@@@ -596,8 -619,10 +627,10 @@@
+  	/* on EVENT_ADDR_ERROR there's no device yet for this conn */
+  	if (device != NULL)
+  		iser_device_try_release(device);
++ 	mutex_unlock(&ib_conn->state_mutex);
++ 
+  	/* if cma handler context, the caller actually destroy the id */
+ -	if (ib_conn->cma_id != NULL) {
+ +	if (ib_conn->cma_id != NULL && can_destroy_id) {
+  		rdma_destroy_id(ib_conn->cma_id);
+  		ib_conn->cma_id = NULL;
+  	}
+@@@ -635,24 -646,25 +668,38 @@@ void iser_conn_terminate(struct iser_co
+  	if (err)
+  		iser_err("Failed to disconnect, conn: 0x%p err %d\n",
+  			 ib_conn,err);
+ +
+ +	wait_event_interruptible(ib_conn->wait,
+ +				 ib_conn->state == ISER_CONN_DOWN);
+ +
+ +	iser_conn_put(ib_conn, 1); /* deref ib conn deallocate */
+  }
+  
+++<<<<<<< HEAD
+ +static int iser_connect_error(struct rdma_cm_id *cma_id)
+++=======
++ /**
++  * Called with state mutex held
++  **/
++ static void iser_connect_error(struct rdma_cm_id *cma_id)
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  {
+  	struct iser_conn *ib_conn;
+ -
+  	ib_conn = (struct iser_conn *)cma_id->context;
+  
+  	ib_conn->state = ISER_CONN_DOWN;
+  	wake_up_interruptible(&ib_conn->wait);
+ +	return iser_conn_put(ib_conn, 0); /* deref ib conn's cma id */
+  }
+  
+++<<<<<<< HEAD
+ +static int iser_addr_handler(struct rdma_cm_id *cma_id)
+++=======
++ /**
++  * Called with state mutex held
++  **/
++ static void iser_addr_handler(struct rdma_cm_id *cma_id)
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  {
+  	struct iser_device *device;
+  	struct iser_conn   *ib_conn;
+@@@ -661,10 -678,10 +713,9 @@@
+  	device = iser_device_find_by_ib_device(cma_id);
+  	if (!device) {
+  		iser_err("device lookup/creation failed\n");
+ -		iser_connect_error(cma_id);
+ -		return;
+ +		return iser_connect_error(cma_id);
+  	}
+  
+- 	ib_conn = (struct iser_conn *)cma_id->context;
+  	ib_conn->device = device;
+  
+  	/* connection T10-PI support */
+@@@ -683,13 -700,15 +734,20 @@@
+  	ret = rdma_resolve_route(cma_id, 1000);
+  	if (ret) {
+  		iser_err("resolve route failed: %d\n", ret);
+ -		iser_connect_error(cma_id);
+ -		return;
+ +		return iser_connect_error(cma_id);
+  	}
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int iser_route_handler(struct rdma_cm_id *cma_id)
+++=======
++ /**
++  * Called with state mutex held
++  **/
++ static void iser_route_handler(struct rdma_cm_id *cma_id)
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  {
+  	struct rdma_conn_param conn_param;
+  	int    ret;
+@@@ -769,17 -792,19 +836,24 @@@ static int iser_disconnected_handler(st
+  
+  static int iser_cma_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+  {
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +
+++=======
++ 	struct iser_conn *ib_conn;
++ 
++ 	ib_conn = (struct iser_conn *)cma_id->context;
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  	iser_info("event %d status %d conn %p id %p\n",
+  		  event->event, event->status, cma_id->context, cma_id);
+  
++ 	mutex_lock(&ib_conn->state_mutex);
+  	switch (event->event) {
+  	case RDMA_CM_EVENT_ADDR_RESOLVED:
+ -		iser_addr_handler(cma_id);
+ +		ret = iser_addr_handler(cma_id);
+  		break;
+  	case RDMA_CM_EVENT_ROUTE_RESOLVED:
+ -		iser_route_handler(cma_id);
+ +		ret = iser_route_handler(cma_id);
+  		break;
+  	case RDMA_CM_EVENT_ESTABLISHED:
+  		iser_connected_handler(cma_id);
+@@@ -800,7 -826,8 +874,12 @@@
+  		iser_err("Unexpected RDMA CM event (%d)\n", event->event);
+  		break;
+  	}
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	mutex_unlock(&ib_conn->state_mutex);
++ 	return 0;
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  }
+  
+  void iser_conn_init(struct iser_conn *ib_conn)
+@@@ -809,9 -836,10 +888,10 @@@
+  	init_waitqueue_head(&ib_conn->wait);
+  	ib_conn->post_recv_buf_count = 0;
+  	atomic_set(&ib_conn->post_send_buf_count, 0);
+ -	init_completion(&ib_conn->stop_completion);
+ +	atomic_set(&ib_conn->refcount, 1); /* ref ib conn allocation */
+  	INIT_LIST_HEAD(&ib_conn->conn_list);
+  	spin_lock_init(&ib_conn->lock);
++ 	mutex_init(&ib_conn->state_mutex);
+  }
+  
+   /**
+@@@ -869,9 -899,9 +952,14 @@@ id_failure
+  	ib_conn->cma_id = NULL;
+  addr_failure:
+  	ib_conn->state = ISER_CONN_DOWN;
+ +	iser_conn_put(ib_conn, 1); /* deref ib conn's cma id */
+  connect_failure:
+++<<<<<<< HEAD
+ +	iser_conn_put(ib_conn, 1); /* deref ib conn deallocate */
+++=======
++ 	mutex_unlock(&ib_conn->state_mutex);
++ 	iser_conn_release(ib_conn);
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  	return err;
+  }
+  
+@@@ -1055,12 -1085,14 +1143,23 @@@ static void iser_handle_comp_error(stru
+  
+  	if (ib_conn->post_recv_buf_count == 0 &&
+  	    atomic_read(&ib_conn->post_send_buf_count) == 0) {
+++<<<<<<< HEAD
+ +		/* getting here when the state is UP means that the conn is *
+ +		 * being terminated asynchronously from the iSCSI layer's   *
+ +		 * perspective.                                             */
+ +		if (iser_conn_state_comp_exch(ib_conn, ISER_CONN_UP,
+ +		    ISER_CONN_TERMINATING))
+ +			iscsi_conn_failure(ib_conn->iser_conn->iscsi_conn,
+++=======
++ 		/**
++ 		 * getting here when the state is UP means that the conn is
++ 		 * being terminated asynchronously from the iSCSI layer's
++ 		 * perspective. It is safe to peek at the connection state
++ 		 * since iscsi_conn_failure is allowed to be called twice.
++ 		 **/
++ 		if (ib_conn->state == ISER_CONN_UP)
++ 			iscsi_conn_failure(ib_conn->iscsi_conn,
+++>>>>>>> 504130c039f9 (IB/iser: Protect iser state machine with a mutex)
+  					   ISCSI_ERR_CONN_FAILED);
+  
+  		/* no more non completed posts to the QP, complete the
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.c
+* Unmerged path drivers/infiniband/ulp/iser/iscsi_iser.h
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
