@@ -1164,7 +1164,7 @@ static int __perf_session__process_pipe_events(struct perf_session *self,
 	void *buf = NULL;
 	int skip = 0;
 	u64 head;
-	int err;
+	ssize_t err;
 	void *p;
 
 	perf_tool__fill_defaults(tool);
