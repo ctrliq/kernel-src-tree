@@ -1,0 +1,119 @@
+netns: don't allocate an id for dead netns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 576b7cd2f6ff1e90b3fc0a000d2fe74f8a50a4bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/576b7cd2.failed
+
+First, let's explain the problem.
+Suppose you have an ipip interface that stands in the netns foo and its link
+part in the netns bar (so the netns bar has an nsid into the netns foo).
+Now, you remove the netns bar:
+ - the bar nsid into the netns foo is removed
+ - the netns exit method of ipip is called, thus our ipip iface is removed:
+   => a netlink message is built in the netns foo to advertise this deletion
+   => this netlink message requests an nsid for bar, thus a new nsid is
+      allocated for bar and never removed.
+
+This patch adds a check in peernet2id() so that an id cannot be allocated for
+a netns which is currently destroyed.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 576b7cd2f6ff1e90b3fc0a000d2fe74f8a50a4bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/net_namespace.c
+diff --cc net/core/net_namespace.c
+index 4cf6699528f0,70d3450588b2..000000000000
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@@ -144,6 -148,80 +144,83 @@@ static void ops_free_list(const struct 
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int alloc_netid(struct net *net, struct net *peer, int reqid)
++ {
++ 	int min = 0, max = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (reqid >= 0) {
++ 		min = reqid;
++ 		max = reqid + 1;
++ 	}
++ 
++ 	return idr_alloc(&net->netns_ids, peer, min, max, GFP_KERNEL);
++ }
++ 
++ /* This function is used by idr_for_each(). If net is equal to peer, the
++  * function returns the id so that idr_for_each() stops. Because we cannot
++  * returns the id 0 (idr_for_each() will not stop), we return the magic value
++  * NET_ID_ZERO (-1) for it.
++  */
++ #define NET_ID_ZERO -1
++ static int net_eq_idr(int id, void *net, void *peer)
++ {
++ 	if (net_eq(net, peer))
++ 		return id ? : NET_ID_ZERO;
++ 	return 0;
++ }
++ 
++ static int __peernet2id(struct net *net, struct net *peer, bool alloc)
++ {
++ 	int id = idr_for_each(&net->netns_ids, net_eq_idr, peer);
++ 
++ 	ASSERT_RTNL();
++ 
++ 	/* Magic value for id 0. */
++ 	if (id == NET_ID_ZERO)
++ 		return 0;
++ 	if (id > 0)
++ 		return id;
++ 
++ 	if (alloc)
++ 		return alloc_netid(net, peer, -1);
++ 
++ 	return -ENOENT;
++ }
++ 
++ /* This function returns the id of a peer netns. If no id is assigned, one will
++  * be allocated and returned.
++  */
++ int peernet2id(struct net *net, struct net *peer)
++ {
++ 	bool alloc = atomic_read(&peer->count) == 0 ? false : true;
++ 	int id;
++ 
++ 	id = __peernet2id(net, peer, alloc);
++ 	return id >= 0 ? id : NETNSA_NSID_NOT_ASSIGNED;
++ }
++ EXPORT_SYMBOL(peernet2id);
++ 
++ struct net *get_net_ns_by_id(struct net *net, int id)
++ {
++ 	struct net *peer;
++ 
++ 	if (id < 0)
++ 		return NULL;
++ 
++ 	rcu_read_lock();
++ 	peer = idr_find(&net->netns_ids, id);
++ 	if (peer)
++ 		get_net(peer);
++ 	rcu_read_unlock();
++ 
++ 	return peer;
++ }
++ 
+++>>>>>>> 576b7cd2f6ff (netns: don't allocate an id for dead netns)
+  /*
+   * setup_net runs the initializers for the network namespace object.
+   */
+* Unmerged path net/core/net_namespace.c
