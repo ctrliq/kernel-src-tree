@@ -1,0 +1,219 @@
+NVMe: IOCTL path RCU protect queue access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 4f5099af4f3d5f999d8ab7784472d93e810e3912
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/4f5099af.failed
+
+This adds rcu protected access to a queue in the nvme IOCTL path
+to fix potential races between a surprise removal and queue usage in
+nvme_submit_sync_cmd. The fix holds the rcu_read_lock() here to prevent
+the nvme_queue from freeing while this path is executing so it can't
+sleep, and so this path will no longer wait for a available command
+id should they all be in use at the time a passthrough IOCTL request
+is received.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+(cherry picked from commit 4f5099af4f3d5f999d8ab7784472d93e810e3912)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/nvme-core.c
+diff --cc drivers/block/nvme-core.c
+index f1b51fffaafa,04664cadadfa..000000000000
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@@ -262,16 -263,35 +262,38 @@@ static void *cancel_cmdid(struct nvme_q
+  	return ctx;
+  }
+  
+ -static struct nvme_queue *raw_nvmeq(struct nvme_dev *dev, int qid)
+ +struct nvme_queue *get_nvmeq(struct nvme_dev *dev)
+  {
+ -	return rcu_dereference_raw(dev->queues[qid]);
+ +	return dev->queues[get_cpu() + 1];
+  }
+  
+++<<<<<<< HEAD
+ +void put_nvmeq(struct nvme_queue *nvmeq)
+++=======
++ static struct nvme_queue *get_nvmeq(struct nvme_dev *dev) __acquires(RCU)
++ {
++ 	rcu_read_lock();
++ 	return rcu_dereference(dev->queues[get_cpu() + 1]);
++ }
++ 
++ static void put_nvmeq(struct nvme_queue *nvmeq) __releases(RCU)
+++>>>>>>> 4f5099af4f3d (NVMe: IOCTL path RCU protect queue access)
+  {
+  	put_cpu();
+ -	rcu_read_unlock();
+  }
+  
++ static struct nvme_queue *lock_nvmeq(struct nvme_dev *dev, int q_idx)
++ 							__acquires(RCU)
++ {
++ 	rcu_read_lock();
++ 	return rcu_dereference(dev->queues[q_idx]);
++ }
++ 
++ static void unlock_nvmeq(struct nvme_queue *nvmeq) __releases(RCU)
++ {
++ 	rcu_read_unlock();
++ }
++ 
+  /**
+   * nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+   * @nvmeq: The queue to use
+@@@ -934,13 -894,21 +978,24 @@@ int nvme_submit_async_cmd(struct nvme_q
+  int nvme_submit_admin_cmd(struct nvme_dev *dev, struct nvme_command *cmd,
+  								u32 *result)
+  {
+++<<<<<<< HEAD
+ +	return nvme_submit_sync_cmd(dev->queues[0], cmd, result, ADMIN_TIMEOUT);
+++=======
++ 	return nvme_submit_sync_cmd(dev, 0, cmd, result, ADMIN_TIMEOUT);
++ }
++ 
++ int nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_command *cmd,
++ 								u32 *result)
++ {
++ 	return nvme_submit_sync_cmd(dev, smp_processor_id() + 1, cmd, result,
++ 							NVME_IO_TIMEOUT);
+++>>>>>>> 4f5099af4f3d (NVMe: IOCTL path RCU protect queue access)
+  }
+  
+ -static int nvme_submit_admin_cmd_async(struct nvme_dev *dev,
+ -		struct nvme_command *cmd, struct async_cmd_info *cmdinfo)
+ +int nvme_submit_admin_cmd_async(struct nvme_dev *dev, struct nvme_command *cmd,
+ +						struct async_cmd_info *cmdinfo)
+  {
+ -	return nvme_submit_async_cmd(raw_nvmeq(dev, 0), cmd, cmdinfo,
+ -								ADMIN_TIMEOUT);
+ +	return nvme_submit_async_cmd(dev->queues[0], cmd, cmdinfo, ADMIN_TIMEOUT);
+  }
+  
+  static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
+@@@ -1662,8 -1626,7 +1706,12 @@@ static int nvme_user_admin_cmd(struct n
+  	if (length != cmd.data_len)
+  		status = -ENOMEM;
+  	else
+++<<<<<<< HEAD
+ +		status = nvme_submit_sync_cmd(dev->queues[0], &c, &cmd.result,
+ +								timeout);
+++=======
++ 		status = nvme_submit_sync_cmd(dev, 0, &c, &cmd.result, timeout);
+++>>>>>>> 4f5099af4f3d (NVMe: IOCTL path RCU protect queue access)
+  
+  	if (cmd.data_len) {
+  		nvme_unmap_user_pages(dev, cmd.opcode & 1, iod);
+* Unmerged path drivers/block/nvme-core.c
+diff --git a/drivers/block/nvme-scsi.c b/drivers/block/nvme-scsi.c
+index 4a0ceb64e269..e157e85bb5d7 100644
+--- a/drivers/block/nvme-scsi.c
++++ b/drivers/block/nvme-scsi.c
+@@ -2033,7 +2033,6 @@ static int nvme_trans_do_nvme_io(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 	int res = SNTI_TRANSLATION_SUCCESS;
+ 	int nvme_sc;
+ 	struct nvme_dev *dev = ns->dev;
+-	struct nvme_queue *nvmeq;
+ 	u32 num_cmds;
+ 	struct nvme_iod *iod;
+ 	u64 unit_len;
+@@ -2106,18 +2105,7 @@ static int nvme_trans_do_nvme_io(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 
+ 		nvme_offset += unit_num_blocks;
+ 
+-		nvmeq = get_nvmeq(dev);
+-		/*
+-		 * Since nvme_submit_sync_cmd sleeps, we can't keep
+-		 * preemption disabled.  We may be preempted at any
+-		 * point, and be rescheduled to a different CPU.  That
+-		 * will cause cacheline bouncing, but no additional
+-		 * races since q_lock already protects against other
+-		 * CPUs.
+-		 */
+-		put_nvmeq(nvmeq);
+-		nvme_sc = nvme_submit_sync_cmd(nvmeq, &c, NULL,
+-						NVME_IO_TIMEOUT);
++		nvme_sc = nvme_submit_io_cmd(dev, &c, NULL);
+ 		if (nvme_sc != NVME_SC_SUCCESS) {
+ 			nvme_unmap_user_pages(dev,
+ 				(is_write) ? DMA_TO_DEVICE : DMA_FROM_DEVICE,
+@@ -2644,7 +2632,6 @@ static int nvme_trans_start_stop(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ {
+ 	int res = SNTI_TRANSLATION_SUCCESS;
+ 	int nvme_sc;
+-	struct nvme_queue *nvmeq;
+ 	struct nvme_command c;
+ 	u8 immed, pcmod, pc, no_flush, start;
+ 
+@@ -2671,10 +2658,7 @@ static int nvme_trans_start_stop(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 			c.common.opcode = nvme_cmd_flush;
+ 			c.common.nsid = cpu_to_le32(ns->ns_id);
+ 
+-			nvmeq = get_nvmeq(ns->dev);
+-			put_nvmeq(nvmeq);
+-			nvme_sc = nvme_submit_sync_cmd(nvmeq, &c, NULL, NVME_IO_TIMEOUT);
+-
++			nvme_sc = nvme_submit_io_cmd(ns->dev, &c, NULL);
+ 			res = nvme_trans_status_code(hdr, nvme_sc);
+ 			if (res)
+ 				goto out;
+@@ -2697,15 +2681,12 @@ static int nvme_trans_synchronize_cache(struct nvme_ns *ns,
+ 	int res = SNTI_TRANSLATION_SUCCESS;
+ 	int nvme_sc;
+ 	struct nvme_command c;
+-	struct nvme_queue *nvmeq;
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.common.opcode = nvme_cmd_flush;
+ 	c.common.nsid = cpu_to_le32(ns->ns_id);
+ 
+-	nvmeq = get_nvmeq(ns->dev);
+-	put_nvmeq(nvmeq);
+-	nvme_sc = nvme_submit_sync_cmd(nvmeq, &c, NULL, NVME_IO_TIMEOUT);
++	nvme_sc = nvme_submit_io_cmd(ns->dev, &c, NULL);
+ 
+ 	res = nvme_trans_status_code(hdr, nvme_sc);
+ 	if (res)
+@@ -2872,7 +2853,6 @@ static int nvme_trans_unmap(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 	struct nvme_dev *dev = ns->dev;
+ 	struct scsi_unmap_parm_list *plist;
+ 	struct nvme_dsm_range *range;
+-	struct nvme_queue *nvmeq;
+ 	struct nvme_command c;
+ 	int i, nvme_sc, res = -ENOMEM;
+ 	u16 ndesc, list_len;
+@@ -2914,10 +2894,7 @@ static int nvme_trans_unmap(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 	c.dsm.nr = cpu_to_le32(ndesc - 1);
+ 	c.dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
+ 
+-	nvmeq = get_nvmeq(dev);
+-	put_nvmeq(nvmeq);
+-
+-	nvme_sc = nvme_submit_sync_cmd(nvmeq, &c, NULL, NVME_IO_TIMEOUT);
++	nvme_sc = nvme_submit_io_cmd(dev, &c, NULL);
+ 	res = nvme_trans_status_code(hdr, nvme_sc);
+ 
+ 	dma_free_coherent(&dev->pci_dev->dev, ndesc * sizeof(*range),
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index 69ae03f6eb15..479c4ff2e5d3 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -151,10 +151,7 @@ struct nvme_iod *nvme_map_user_pages(struct nvme_dev *dev, int write,
+ 				unsigned long addr, unsigned length);
+ void nvme_unmap_user_pages(struct nvme_dev *dev, int write,
+ 			struct nvme_iod *iod);
+-struct nvme_queue *get_nvmeq(struct nvme_dev *dev);
+-void put_nvmeq(struct nvme_queue *nvmeq);
+-int nvme_submit_sync_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+-						u32 *result, unsigned timeout);
++int nvme_submit_io_cmd(struct nvme_dev *, struct nvme_command *, u32 *);
+ int nvme_submit_flush_data(struct nvme_queue *nvmeq, struct nvme_ns *ns);
+ int nvme_submit_admin_cmd(struct nvme_dev *, struct nvme_command *,
+ 							u32 *result);
