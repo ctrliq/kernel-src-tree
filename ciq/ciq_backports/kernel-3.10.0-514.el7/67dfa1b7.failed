@@ -1,0 +1,144 @@
+sched/deadline: Implement cancel_dl_timer() to use in switched_from_dl()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Kirill Tkhai <ktkhai@parallels.com>
+commit 67dfa1b756f250972bde31d65e3f8fde6aeddc5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/67dfa1b7.failed
+
+Currently used hrtimer_try_to_cancel() is racy:
+
+raw_spin_lock(&rq->lock)
+...                            dl_task_timer                 raw_spin_lock(&rq->lock)
+...                               raw_spin_lock(&rq->lock)   ...
+   switched_from_dl()             ...                        ...
+      hrtimer_try_to_cancel()     ...                        ...
+   switched_to_fair()             ...                        ...
+...                               ...                        ...
+...                               ...                        ...
+raw_spin_unlock(&rq->lock)        ...                        (asquired)
+...                               ...                        ...
+...                               ...                        ...
+do_exit()                         ...                        ...
+   schedule()                     ...                        ...
+      raw_spin_lock(&rq->lock)    ...                        raw_spin_unlock(&rq->lock)
+      ...                         ...                        ...
+      raw_spin_unlock(&rq->lock)  ...                        raw_spin_lock(&rq->lock)
+      ...                         ...                        (asquired)
+      put_task_struct()           ...                        ...
+          free_task_struct()      ...                        ...
+      ...                         ...                        raw_spin_unlock(&rq->lock)
+...                               (asquired)                 ...
+...                               ...                        ...
+...                               (use after free)           ...
+
+So, let's implement 100% guaranteed way to cancel the timer and let's
+be sure we are safe even in very unlikely situations.
+
+rq unlocking does not limit the area of switched_from_dl() use, because
+this has already been possible in pull_dl_task() below.
+
+Let's consider the safety of of this unlocking. New code in the patch
+is working when hrtimer_try_to_cancel() fails. This means the callback
+is running. In this case hrtimer_cancel() is just waiting till the
+callback is finished. Two
+
+1) Since we are in switched_from_dl(), new class is not dl_sched_class and
+new prio is not less MAX_DL_PRIO. So, the callback returns early; it's
+right after !dl_task() check. After that hrtimer_cancel() returns back too.
+
+The above is:
+
+raw_spin_lock(rq->lock);                  ...
+...                                       dl_task_timer()
+...                                          raw_spin_lock(rq->lock);
+   switched_from_dl()                        ...
+       hrtimer_try_to_cancel()               ...
+          raw_spin_unlock(rq->lock);         ...
+          hrtimer_cancel()                   ...
+          ...                                raw_spin_unlock(rq->lock);
+          ...                                return HRTIMER_NORESTART;
+          ...                             ...
+          raw_spin_lock(rq->lock);        ...
+
+2) But the below is also possible:
+                                   dl_task_timer()
+                                      raw_spin_lock(rq->lock);
+                                      ...
+                                      raw_spin_unlock(rq->lock);
+raw_spin_lock(rq->lock);              ...
+   switched_from_dl()                 ...
+       hrtimer_try_to_cancel()        ...
+       ...                            return HRTIMER_NORESTART;
+       raw_spin_unlock(rq->lock);  ...
+       hrtimer_cancel();           ...
+       raw_spin_lock(rq->lock);    ...
+
+In this case hrtimer_cancel() returns immediately. Very unlikely case,
+just to mention.
+
+Nobody can manipulate the task, because check_class_changed() is
+always called with pi_lock locked. Nobody can force the task to
+participate in (concurrent) priority inheritance schemes (the same reason).
+
+All concurrent task operations require pi_lock, which is held by us.
+No deadlocks with dl_task_timer() are possible, because it returns
+right after !dl_task() check (it does nothing).
+
+If we receive a new dl_task during the time of unlocked rq, we just
+don't have to do pull_dl_task() in switched_from_dl() further.
+
+	Signed-off-by: Kirill Tkhai <ktkhai@parallels.com>
+[ Added comments]
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Juri Lelli <juri.lelli@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1414420852.19914.186.camel@tkhai
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 67dfa1b756f250972bde31d65e3f8fde6aeddc5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f8654b1100de..298e8b8b28a8 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1033,6 +1033,9 @@ inline int task_curr(const struct task_struct *p)
+ 	return cpu_curr(task_cpu(p)) == p;
+ }
+ 
++/*
++ * Can drop rq->lock because from sched_class::switched_from() methods drop it.
++ */
+ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
+ 				       const struct sched_class *prev_class,
+ 				       int oldprio)
+@@ -1040,6 +1043,7 @@ static inline void check_class_changed(struct rq *rq, struct task_struct *p,
+ 	if (prev_class != p->sched_class) {
+ 		if (prev_class->switched_from)
+ 			prev_class->switched_from(rq, p);
++		/* Possble rq->lock 'hole'.  */
+ 		p->sched_class->switched_to(rq, p);
+ 	} else if (oldprio != p->prio)
+ 		p->sched_class->prio_changed(rq, p, oldprio);
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b976abe32e72..78349bb0dcd5 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1049,6 +1049,11 @@ struct sched_class {
+ 	void (*task_fork) (struct task_struct *p);
+ 	void (*task_dead) (struct task_struct *p);
+ 
++	/*
++	 * The switched_from() call is allowed to drop rq->lock, therefore we
++	 * cannot assume the switched_from/switched_to pair is serliazed by
++	 * rq->lock. They are however serialized by p->pi_lock.
++	 */
+ 	void (*switched_from) (struct rq *this_rq, struct task_struct *task);
+ 	void (*switched_to) (struct rq *this_rq, struct task_struct *task);
+ 	void (*prio_changed) (struct rq *this_rq, struct task_struct *task,
