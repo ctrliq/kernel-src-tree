@@ -1,0 +1,338 @@
+VFS: Put a small type field into struct dentry::d_flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author David Howells <dhowells@redhat.com>
+commit b18825a7c8e37a7cf6abb97a12a6ad71af160de7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/b18825a7.failed
+
+Put a type field into struct dentry::d_flags to indicate if the dentry is one
+of the following types that relate particularly to pathwalk:
+
+	Miss (negative dentry)
+	Directory
+	"Automount" directory (defective - no i_op->lookup())
+	Symlink
+	Other (regular, socket, fifo, device)
+
+The type field is set to one of the first five types on a dentry by calls to
+__d_instantiate() and d_obtain_alias() from information in the inode (if one is
+given).
+
+The type is cleared by dentry_unlink_inode() when it reconstitutes an existing
+dentry as a negative dentry.
+
+Accessors provided are:
+
+	d_set_type(dentry, type)
+	d_is_directory(dentry)
+	d_is_autodir(dentry)
+	d_is_symlink(dentry)
+	d_is_file(dentry)
+	d_is_negative(dentry)
+	d_is_positive(dentry)
+
+A bunch of checks in pathname resolution switched to those.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit b18825a7c8e37a7cf6abb97a12a6ad71af160de7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+diff --cc fs/namei.c
+index d87d2e09b208,e1fa43346c61..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -3070,14 -3010,14 +3045,15 @@@ finish_lookup
+  		path_put(&save_parent);
+  		return error;
+  	}
+ -	audit_inode(name, nd->path.dentry, 0);
+  	error = -EISDIR;
+- 	if ((open_flag & O_CREAT) && S_ISDIR(nd->inode->i_mode))
++ 	if ((open_flag & O_CREAT) &&
++ 	    (d_is_directory(nd->path.dentry) || d_is_autodir(nd->path.dentry)))
+  		goto out;
+  	error = -ENOTDIR;
+- 	if ((nd->flags & LOOKUP_DIRECTORY) && !can_lookup(nd->inode))
++ 	if ((nd->flags & LOOKUP_DIRECTORY) && !d_is_directory(nd->path.dentry))
+  		goto out;
+ +	audit_inode(name, nd->path.dentry, 0);
+ +finish_open:
+  	if (!S_ISREG(nd->inode->i_mode))
+  		will_truncate = false;
+  
+@@@ -3234,9 -3242,7 +3210,13 @@@ struct file *do_file_open_root(struct d
+  	nd.root.mnt = mnt;
+  	nd.root.dentry = dentry;
+  
+++<<<<<<< HEAD
+ +	flags |= LOOKUP_ROOT;
+ +
+ +	if (dentry->d_inode->i_op->follow_link && op->intent & LOOKUP_OPEN)
+++=======
++ 	if (d_is_symlink(dentry) && op->intent & LOOKUP_OPEN)
+++>>>>>>> b18825a7c8e3 (VFS: Put a small type field into struct dentry::d_flags)
+  		return ERR_PTR(-ELOOP);
+  
+  	file = path_openat(-1, &filename, &nd, op, flags | LOOKUP_RCU);
+@@@ -4076,33 -4023,11 +4061,33 @@@ out
+  	return error;
+  }
+  
+ +/**
+ + * vfs_rename - rename a filesystem object
+ + * @old_dir:	parent of source
+ + * @old_dentry:	source
+ + * @new_dir:	parent of destination
+ + * @new_dentry:	destination
+ + * @delegated_inode: returns an inode needing a delegation break
+ + *
+ + * The caller must hold multiple mutexes--see lock_rename()).
+ + *
+ + * If vfs_rename discovers a delegation in need of breaking at either
+ + * the source or destination, it will return -EWOULDBLOCK and return a
+ + * reference to the inode in delegated_inode.  The caller should then
+ + * break the delegation and retry.  Because breaking a delegation may
+ + * take a long time, the caller should drop all locks before doing
+ + * so.
+ + *
+ + * Alternatively, a caller may pass NULL for delegated_inode.  This may
+ + * be appropriate for callers that expect the underlying filesystem not
+ + * to be NFS exported.
+ + */
+  int vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ -	       struct inode *new_dir, struct dentry *new_dentry)
+ +	       struct inode *new_dir, struct dentry *new_dentry,
+ +	       struct inode **delegated_inode)
+  {
+  	int error;
+- 	int is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
++ 	int is_dir = d_is_directory(old_dentry) || d_is_autodir(old_dentry);
+  	const unsigned char *old_name;
+  
+  	if (old_dentry->d_inode == new_dentry->d_inode)
+diff --git a/fs/dcache.c b/fs/dcache.c
+index cb811980d831..f9e407e80f07 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -290,6 +290,7 @@ static void dentry_unlink_inode(struct dentry * dentry)
+ 	__releases(dentry->d_inode->i_lock)
+ {
+ 	struct inode *inode = dentry->d_inode;
++	__d_clear_type(dentry);
+ 	dentry->d_inode = NULL;
+ 	hlist_del_init(&dentry->d_alias);
+ 	dentry_rcuwalk_barrier(dentry);
+@@ -1493,14 +1494,42 @@ void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op)
+ }
+ EXPORT_SYMBOL(d_set_d_op);
+ 
++static unsigned d_flags_for_inode(struct inode *inode)
++{
++	unsigned add_flags = DCACHE_FILE_TYPE;
++
++	if (!inode)
++		return DCACHE_MISS_TYPE;
++
++	if (S_ISDIR(inode->i_mode)) {
++		add_flags = DCACHE_DIRECTORY_TYPE;
++		if (unlikely(!(inode->i_opflags & IOP_LOOKUP))) {
++			if (unlikely(!inode->i_op->lookup))
++				add_flags = DCACHE_AUTODIR_TYPE;
++			else
++				inode->i_opflags |= IOP_LOOKUP;
++		}
++	} else if (unlikely(!(inode->i_opflags & IOP_NOFOLLOW))) {
++		if (unlikely(inode->i_op->follow_link))
++			add_flags = DCACHE_SYMLINK_TYPE;
++		else
++			inode->i_opflags |= IOP_NOFOLLOW;
++	}
++
++	if (unlikely(IS_AUTOMOUNT(inode)))
++		add_flags |= DCACHE_NEED_AUTOMOUNT;
++	return add_flags;
++}
++
+ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+ {
++	unsigned add_flags = d_flags_for_inode(inode);
++
+ 	spin_lock(&dentry->d_lock);
+-	if (inode) {
+-		if (unlikely(IS_AUTOMOUNT(inode)))
+-			dentry->d_flags |= DCACHE_NEED_AUTOMOUNT;
++	dentry->d_flags &= ~DCACHE_ENTRY_TYPE;
++	dentry->d_flags |= add_flags;
++	if (inode)
+ 		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+-	}
+ 	dentry->d_inode = inode;
+ 	dentry_rcuwalk_barrier(dentry);
+ 	spin_unlock(&dentry->d_lock);
+@@ -1678,6 +1707,7 @@ struct dentry *d_obtain_alias(struct inode *inode)
+ 	static const struct qstr anonstring = QSTR_INIT("/", 1);
+ 	struct dentry *tmp;
+ 	struct dentry *res;
++	unsigned add_flags;
+ 
+ 	if (!inode)
+ 		return ERR_PTR(-ESTALE);
+@@ -1703,9 +1733,11 @@ struct dentry *d_obtain_alias(struct inode *inode)
+ 	}
+ 
+ 	/* attach a disconnected dentry */
++	add_flags = d_flags_for_inode(inode) | DCACHE_DISCONNECTED;
++
+ 	spin_lock(&tmp->d_lock);
+ 	tmp->d_inode = inode;
+-	tmp->d_flags |= DCACHE_DISCONNECTED;
++	tmp->d_flags |= add_flags;
+ 	hlist_add_head(&tmp->d_alias, &inode->i_dentry);
+ 	hlist_bl_lock(&tmp->d_sb->s_anon);
+ 	hlist_bl_add_head(&tmp->d_hash, &tmp->d_sb->s_anon);
+* Unmerged path fs/namei.c
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 472a2e1eab0f..8bd80c88bcc8 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -169,13 +169,13 @@ struct dentry_operations {
+  */
+ 
+ /* d_flags entries */
+-#define DCACHE_OP_HASH		0x0001
+-#define DCACHE_OP_COMPARE	0x0002
+-#define DCACHE_OP_REVALIDATE	0x0004
+-#define DCACHE_OP_DELETE	0x0008
+-#define DCACHE_OP_PRUNE         0x0010
++#define DCACHE_OP_HASH			0x00000001
++#define DCACHE_OP_COMPARE		0x00000002
++#define DCACHE_OP_REVALIDATE		0x00000004
++#define DCACHE_OP_DELETE		0x00000008
++#define DCACHE_OP_PRUNE			0x00000010
+ 
+-#define	DCACHE_DISCONNECTED	0x0020
++#define	DCACHE_DISCONNECTED		0x00000020
+      /* This dentry is possibly not currently connected to the dcache tree, in
+       * which case its parent will either be itself, or will have this flag as
+       * well.  nfsd will not use a dentry with this bit set, but will first
+@@ -186,30 +186,38 @@ struct dentry_operations {
+       * dentry into place and return that dentry rather than the passed one,
+       * typically using d_splice_alias. */
+ 
+-#define DCACHE_REFERENCED	0x0040  /* Recently used, don't discard. */
+-#define DCACHE_RCUACCESS	0x0080	/* Entry has ever been RCU-visible */
++#define DCACHE_REFERENCED		0x00000040 /* Recently used, don't discard. */
++#define DCACHE_RCUACCESS		0x00000080 /* Entry has ever been RCU-visible */
+ 
+-#define DCACHE_CANT_MOUNT	0x0100
+-#define DCACHE_GENOCIDE		0x0200
+-#define DCACHE_SHRINK_LIST	0x0400
++#define DCACHE_CANT_MOUNT		0x00000100
++#define DCACHE_GENOCIDE			0x00000200
++#define DCACHE_SHRINK_LIST		0x00000400
+ 
+-#define DCACHE_OP_WEAK_REVALIDATE	0x0800
++#define DCACHE_OP_WEAK_REVALIDATE	0x00000800
+ 
+-#define DCACHE_NFSFS_RENAMED	0x1000
++#define DCACHE_NFSFS_RENAMED		0x00001000
+      /* this dentry has been "silly renamed" and has to be deleted on the last
+       * dput() */
+-#define DCACHE_COOKIE		0x2000	/* For use by dcookie subsystem */
+-#define DCACHE_FSNOTIFY_PARENT_WATCHED 0x4000
++#define DCACHE_COOKIE			0x00002000 /* For use by dcookie subsystem */
++#define DCACHE_FSNOTIFY_PARENT_WATCHED	0x00004000
+      /* Parent inode is watched by some fsnotify listener */
+ 
+-#define DCACHE_MOUNTED		0x10000	/* is a mountpoint */
+-#define DCACHE_NEED_AUTOMOUNT	0x20000	/* handle automount on this dir */
+-#define DCACHE_MANAGE_TRANSIT	0x40000	/* manage transit from this dirent */
++#define DCACHE_DENTRY_KILLED		0x00008000
++
++#define DCACHE_MOUNTED			0x00010000 /* is a mountpoint */
++#define DCACHE_NEED_AUTOMOUNT		0x00020000 /* handle automount on this dir */
++#define DCACHE_MANAGE_TRANSIT		0x00040000 /* manage transit from this dirent */
+ #define DCACHE_MANAGED_DENTRY \
+ 	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
+ 
+-#define DCACHE_LRU_LIST		0x80000
+-#define DCACHE_DENTRY_KILLED	0x100000
++#define DCACHE_LRU_LIST			0x00080000
++
++#define DCACHE_ENTRY_TYPE		0x00700000
++#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry */
++#define DCACHE_DIRECTORY_TYPE		0x00100000 /* Normal directory */
++#define DCACHE_AUTODIR_TYPE		0x00200000 /* Lookupless directory (presumed automount) */
++#define DCACHE_SYMLINK_TYPE		0x00300000 /* Symlink */
++#define DCACHE_FILE_TYPE		0x00400000 /* Other file type */
+ 
+ extern seqlock_t rename_lock;
+ 
+@@ -391,6 +399,61 @@ static inline bool d_mountpoint(struct dentry *dentry)
+ 	return dentry->d_flags & DCACHE_MOUNTED;
+ }
+ 
++/*
++ * Directory cache entry type accessor functions.
++ */
++static inline void __d_set_type(struct dentry *dentry, unsigned type)
++{
++	dentry->d_flags = (dentry->d_flags & ~DCACHE_ENTRY_TYPE) | type;
++}
++
++static inline void __d_clear_type(struct dentry *dentry)
++{
++	__d_set_type(dentry, DCACHE_MISS_TYPE);
++}
++
++static inline void d_set_type(struct dentry *dentry, unsigned type)
++{
++	spin_lock(&dentry->d_lock);
++	__d_set_type(dentry, type);
++	spin_unlock(&dentry->d_lock);
++}
++
++static inline unsigned __d_entry_type(const struct dentry *dentry)
++{
++	return dentry->d_flags & DCACHE_ENTRY_TYPE;
++}
++
++static inline bool d_is_directory(const struct dentry *dentry)
++{
++	return __d_entry_type(dentry) == DCACHE_DIRECTORY_TYPE;
++}
++
++static inline bool d_is_autodir(const struct dentry *dentry)
++{
++	return __d_entry_type(dentry) == DCACHE_AUTODIR_TYPE;
++}
++
++static inline bool d_is_symlink(const struct dentry *dentry)
++{
++	return __d_entry_type(dentry) == DCACHE_SYMLINK_TYPE;
++}
++
++static inline bool d_is_file(const struct dentry *dentry)
++{
++	return __d_entry_type(dentry) == DCACHE_FILE_TYPE;
++}
++
++static inline bool d_is_negative(const struct dentry *dentry)
++{
++	return __d_entry_type(dentry) == DCACHE_MISS_TYPE;
++}
++
++static inline bool d_is_positive(const struct dentry *dentry)
++{
++	return !d_is_negative(dentry);
++}
++
+ extern int sysctl_vfs_cache_pressure;
+ 
+ #endif	/* __LINUX_DCACHE_H */
