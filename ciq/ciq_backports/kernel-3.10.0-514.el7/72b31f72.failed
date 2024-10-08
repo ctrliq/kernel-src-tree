@@ -1,0 +1,283 @@
+netfilter: bridge: detect NAT66 correctly and change MAC address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Bernhard Thaler <bernhard.thaler@wvnet.at>
+commit 72b31f7271df34c6aab36c01305287924826678f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/72b31f72.failed
+
+IPv4 iptables allows to REDIRECT/DNAT/SNAT any traffic over a bridge.
+
+e.g. REDIRECT
+$ sysctl -w net.bridge.bridge-nf-call-iptables=1
+$ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 8080 \
+  -j REDIRECT --to-ports 81
+
+This does not work with ip6tables on a bridge in NAT66 scenario
+because the REDIRECT/DNAT/SNAT is not correctly detected.
+
+The bridge pre-routing (finish) netfilter hook has to check for a possible
+redirect and then fix the destination mac address. This allows to use the
+ip6tables rules for local REDIRECT/DNAT/SNAT REDIRECT similar to the IPv4
+iptables version.
+
+e.g. REDIRECT
+$ sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+$ ip6tables -t nat -A PREROUTING -p tcp -m tcp --dport 8080 \
+  -j REDIRECT --to-ports 81
+
+This patch makes it possible to use IPv6 NAT66 on a bridge. It was tested
+on a bridge with two interfaces using SNAT/DNAT NAT66 rules.
+
+	Reported-by: Artie Hamilton <artiemhamilton@yahoo.com>
+	Signed-off-by: Sven Eckelmann <sven@open-mesh.com>
+[bernhard.thaler@wvnet.at: rebased, add indirect call to ip6_route_input()]
+[bernhard.thaler@wvnet.at: rebased, split into separate patches]
+	Signed-off-by: Bernhard Thaler <bernhard.thaler@wvnet.at>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 72b31f7271df34c6aab36c01305287924826678f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/bridge/br_netfilter.c
+diff --cc include/linux/skbuff.h
+index 2e271768b46a,f70fc0e6bf7b..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -33,9 -34,9 +33,15 @@@
+  #include <linux/dma-mapping.h>
+  #include <linux/netdev_features.h>
+  #include <linux/sched.h>
+++<<<<<<< HEAD
+ +#include <net/flow_keys.h>
+ +
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <net/flow_dissector.h>
++ #include <linux/splice.h>
++ #include <linux/in6.h>
+++>>>>>>> 72b31f7271df (netfilter: bridge: detect NAT66 correctly and change MAC address)
+  
+  /* A. Checksumming of received packets by device.
+   *
+@@@ -163,13 -165,25 +169,24 @@@ struct nf_conntrack 
+  };
+  #endif
+  
+ -#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +#ifdef CONFIG_BRIDGE_NETFILTER
+  struct nf_bridge_info {
+  	atomic_t		use;
+ -	enum {
+ -		BRNF_PROTO_UNCHANGED,
+ -		BRNF_PROTO_8021Q,
+ -		BRNF_PROTO_PPPOE
+ -	} orig_proto:8;
+ -	bool			pkt_otherhost;
+  	unsigned int		mask;
+  	struct net_device	*physindev;
+++<<<<<<< HEAD
+ +	struct net_device	*physoutdev;
+ +	unsigned long		data[32 / sizeof(unsigned long)];
+++=======
++ 	union {
++ 		struct net_device *physoutdev;
++ 		char neigh_header[8];
++ 	};
++ 	union {
++ 		__be32          ipv4_daddr;
++ 		struct in6_addr ipv6_daddr;
++ 	};
+++>>>>>>> 72b31f7271df (netfilter: bridge: detect NAT66 correctly and change MAC address)
+  };
+  #endif
+  
+diff --cc net/bridge/br_netfilter.c
+index bfa28cea8c79,9ac0c6417c77..000000000000
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@@ -297,26 -264,125 +297,135 @@@ drop
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+ +/* PF_BRIDGE/PRE_ROUTING *********************************************/
+ +/* Undo the changes made for ip6tables PREROUTING and continue the
+ + * bridge PRE_ROUTING hook. */
+++=======
++ static void nf_bridge_update_protocol(struct sk_buff *skb)
++ {
++ 	switch (skb->nf_bridge->orig_proto) {
++ 	case BRNF_PROTO_8021Q:
++ 		skb->protocol = htons(ETH_P_8021Q);
++ 		break;
++ 	case BRNF_PROTO_PPPOE:
++ 		skb->protocol = htons(ETH_P_PPP_SES);
++ 		break;
++ 	case BRNF_PROTO_UNCHANGED:
++ 		break;
++ 	}
++ }
++ 
++ /* Obtain the correct destination MAC address, while preserving the original
++  * source MAC address. If we already know this address, we just copy it. If we
++  * don't, we use the neighbour framework to find out. In both cases, we make
++  * sure that br_handle_frame_finish() is called afterwards.
++  */
++ static int br_nf_pre_routing_finish_bridge(struct sock *sk, struct sk_buff *skb)
++ {
++ 	struct neighbour *neigh;
++ 	struct dst_entry *dst;
++ 
++ 	skb->dev = bridge_parent(skb->dev);
++ 	if (!skb->dev)
++ 		goto free_skb;
++ 	dst = skb_dst(skb);
++ 	neigh = dst_neigh_lookup_skb(dst, skb);
++ 	if (neigh) {
++ 		struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
++ 		int ret;
++ 
++ 		if (neigh->hh.hh_len) {
++ 			neigh_hh_bridge(&neigh->hh, skb);
++ 			skb->dev = nf_bridge->physindev;
++ 			ret = br_handle_frame_finish(sk, skb);
++ 		} else {
++ 			/* the neighbour function below overwrites the complete
++ 			 * MAC header, so we save the Ethernet source address and
++ 			 * protocol number.
++ 			 */
++ 			skb_copy_from_linear_data_offset(skb,
++ 							 -(ETH_HLEN-ETH_ALEN),
++ 							 nf_bridge->neigh_header,
++ 							 ETH_HLEN-ETH_ALEN);
++ 			/* tell br_dev_xmit to continue with forwarding */
++ 			nf_bridge->mask |= BRNF_BRIDGED_DNAT;
++ 			/* FIXME Need to refragment */
++ 			ret = neigh->output(neigh, skb);
++ 		}
++ 		neigh_release(neigh);
++ 		return ret;
++ 	}
++ free_skb:
++ 	kfree_skb(skb);
++ 	return 0;
++ }
++ 
++ static bool daddr_was_changed(const struct sk_buff *skb,
++ 			      const struct nf_bridge_info *nf_bridge)
++ {
++ 	switch (skb->protocol) {
++ 	case htons(ETH_P_IP):
++ 		return ip_hdr(skb)->daddr != nf_bridge->ipv4_daddr;
++ 	case htons(ETH_P_IPV6):
++ 		return memcmp(&nf_bridge->ipv6_daddr, &ipv6_hdr(skb)->daddr,
++ 			      sizeof(ipv6_hdr(skb)->daddr)) != 0;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ /* PF_BRIDGE/PRE_ROUTING: Undo the changes made for ip6tables
++  * PREROUTING and continue the bridge PRE_ROUTING hook. See comment
++  * for br_nf_pre_routing_finish(), same logic is used here but
++  * equivalent IPv6 function ip6_route_input() called indirectly.
++  */
+++>>>>>>> 72b31f7271df (netfilter: bridge: detect NAT66 correctly and change MAC address)
+  static int br_nf_pre_routing_finish_ipv6(struct sock *sk, struct sk_buff *skb)
+  {
+ -	struct nf_bridge_info *nf_bridge = nf_bridge_info_get(skb);
+ +	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
+  	struct rtable *rt;
++ 	struct net_device *dev = skb->dev;
++ 	const struct nf_ipv6_ops *v6ops = nf_get_ipv6_ops();
+  
+ -	if (nf_bridge->pkt_otherhost) {
+ +	if (nf_bridge->mask & BRNF_PKT_TYPE) {
+  		skb->pkt_type = PACKET_OTHERHOST;
+ -		nf_bridge->pkt_otherhost = false;
+ +		nf_bridge->mask ^= BRNF_PKT_TYPE;
+  	}
+++<<<<<<< HEAD
+ +	nf_bridge->mask ^= BRNF_NF_BRIDGE_PREROUTING;
+++=======
++ 	nf_bridge->mask &= ~BRNF_NF_BRIDGE_PREROUTING;
++ 	if (daddr_was_changed(skb, nf_bridge)) {
++ 		skb_dst_drop(skb);
++ 		v6ops->route_input(skb);
+++>>>>>>> 72b31f7271df (netfilter: bridge: detect NAT66 correctly and change MAC address)
++ 
++ 		if (skb_dst(skb)->error) {
++ 			kfree_skb(skb);
++ 			return 0;
++ 		}
+  
+- 	rt = bridge_parent_rtable(nf_bridge->physindev);
+- 	if (!rt) {
+- 		kfree_skb(skb);
+- 		return 0;
++ 		if (skb_dst(skb)->dev == dev) {
++ 			skb->dev = nf_bridge->physindev;
++ 			nf_bridge_update_protocol(skb);
++ 			nf_bridge_push_encap_header(skb);
++ 			NF_HOOK_THRESH(NFPROTO_BRIDGE, NF_BR_PRE_ROUTING,
++ 				       sk, skb, skb->dev, NULL,
++ 				       br_nf_pre_routing_finish_bridge,
++ 				       1);
++ 			return 0;
++ 		}
++ 		ether_addr_copy(eth_hdr(skb)->h_dest, dev->dev_addr);
++ 		skb->pkt_type = PACKET_HOST;
++ 	} else {
++ 		rt = bridge_parent_rtable(nf_bridge->physindev);
++ 		if (!rt) {
++ 			kfree_skb(skb);
++ 			return 0;
++ 		}
++ 		skb_dst_set_noref(skb, &rt->dst);
+  	}
+- 	skb_dst_set_noref(skb, &rt->dst);
+  
+  	skb->dev = nf_bridge->physindev;
+  	nf_bridge_update_protocol(skb);
+@@@ -598,10 -610,9 +707,11 @@@ bad
+   * to ip6tables, which doesn't support NAT, so things are fairly simple. */
+  static unsigned int br_nf_pre_routing_ipv6(const struct nf_hook_ops *ops,
+  					   struct sk_buff *skb,
+ +					   const struct net_device *in,
+ +					   const struct net_device *out,
+  					   const struct nf_hook_state *state)
+  {
++ 	struct nf_bridge_info *nf_bridge;
+  	const struct ipv6hdr *hdr;
+  	u32 pkt_len;
+  
+diff --git a/include/linux/netfilter_ipv6.h b/include/linux/netfilter_ipv6.h
+index 868a47c719f5..1f1df7b21b42 100644
+--- a/include/linux/netfilter_ipv6.h
++++ b/include/linux/netfilter_ipv6.h
+@@ -16,6 +16,7 @@
+ struct nf_ipv6_ops {
+ 	int (*chk_addr)(struct net *net, const struct in6_addr *addr,
+ 			const struct net_device *dev, int strict);
++	void (*route_input)(struct sk_buff *skb);
+ };
+ 
+ #ifdef CONFIG_NETFILTER
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/bridge/br_netfilter.c
+diff --git a/net/ipv6/netfilter.c b/net/ipv6/netfilter.c
+index 2f3f82728364..d83557bda52a 100644
+--- a/net/ipv6/netfilter.c
++++ b/net/ipv6/netfilter.c
+@@ -189,6 +189,7 @@ static __sum16 nf_ip6_checksum_partial(struct sk_buff *skb, unsigned int hook,
+ 
+ static const struct nf_ipv6_ops ipv6ops = {
+ 	.chk_addr	= ipv6_chk_addr,
++	.route_input    = ip6_route_input
+ };
+ 
+ static const struct nf_afinfo nf_ip6_afinfo = {
