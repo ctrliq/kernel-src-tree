@@ -381,7 +381,8 @@ int parse_events_add_cache(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint(struct list_head *list, int *idx,
-			  char *sys_name, char *evt_name)
+			  char *sys_name, char *evt_name,
+			  struct parse_events_error *error __maybe_unused)
 {
 	struct perf_evsel *evsel;
 
@@ -395,7 +396,8 @@ static int add_tracepoint(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint_multi_event(struct list_head *list, int *idx,
-				      char *sys_name, char *evt_name)
+				      char *sys_name, char *evt_name,
+				      struct parse_events_error *error)
 {
 	char evt_path[MAXPATHLEN];
 	struct dirent *evt_ent;
@@ -419,7 +421,7 @@ static int add_tracepoint_multi_event(struct list_head *list, int *idx,
 		if (!strglobmatch(evt_ent->d_name, evt_name))
 			continue;
 
-		ret = add_tracepoint(list, idx, sys_name, evt_ent->d_name);
+		ret = add_tracepoint(list, idx, sys_name, evt_ent->d_name, error);
 	}
 
 	closedir(evt_dir);
@@ -427,15 +429,17 @@ static int add_tracepoint_multi_event(struct list_head *list, int *idx,
 }
 
 static int add_tracepoint_event(struct list_head *list, int *idx,
-				char *sys_name, char *evt_name)
+				char *sys_name, char *evt_name,
+				struct parse_events_error *error)
 {
 	return strpbrk(evt_name, "*?") ?
-	       add_tracepoint_multi_event(list, idx, sys_name, evt_name) :
-	       add_tracepoint(list, idx, sys_name, evt_name);
+	       add_tracepoint_multi_event(list, idx, sys_name, evt_name, error) :
+	       add_tracepoint(list, idx, sys_name, evt_name, error);
 }
 
 static int add_tracepoint_multi_sys(struct list_head *list, int *idx,
-				    char *sys_name, char *evt_name)
+				    char *sys_name, char *evt_name,
+				    struct parse_events_error *error)
 {
 	struct dirent *events_ent;
 	DIR *events_dir;
@@ -459,7 +463,7 @@ static int add_tracepoint_multi_sys(struct list_head *list, int *idx,
 			continue;
 
 		ret = add_tracepoint_event(list, idx, events_ent->d_name,
-					   evt_name);
+					   evt_name, error);
 	}
 
 	closedir(events_dir);
@@ -467,12 +471,13 @@ static int add_tracepoint_multi_sys(struct list_head *list, int *idx,
 }
 
 int parse_events_add_tracepoint(struct list_head *list, int *idx,
-				char *sys, char *event)
+				char *sys, char *event,
+				struct parse_events_error *error)
 {
 	if (strpbrk(sys, "*?"))
-		return add_tracepoint_multi_sys(list, idx, sys, event);
+		return add_tracepoint_multi_sys(list, idx, sys, event, error);
 	else
-		return add_tracepoint_event(list, idx, sys, event);
+		return add_tracepoint_event(list, idx, sys, event, error);
 }
 
 static int
