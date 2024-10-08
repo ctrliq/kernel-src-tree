@@ -57,7 +57,7 @@
 #define BOND_MODE(bond) ((bond)->params.mode)
 
 /* slave list primitives */
-#define bond_has_slaves(bond) !list_empty(&(bond)->slave_list)
+#define bond_has_slaves(bond) !list_empty(&(bond)->dev->adj_list.lower)
 
 #define bond_to_slave(ptr) list_entry(ptr, struct slave, list)
 
