@@ -1,0 +1,234 @@
+vxlan: allow setting ipv6 traffic class
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 1400615d64cf5afee533aff8234c837da465841b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1400615d.failed
+
+We can already do that for IPv4, but IPv6 support was missing. Add
+it for vxlan, so it can be used with collect metadata frontends.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1400615d64cf5afee533aff8234c837da465841b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 000e4c57a81e,2399099e68cf..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1816,12 -1749,85 +1816,92 @@@ int vxlan_xmit_skb(struct rtable *rt, s
+  		vxlan_build_gbp_hdr(vxh, vxflags, md);
+  
+  	skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ -	return 0;
+ +
+ +	return udp_tunnel_xmit_skb(rt, sk, skb, src, dst, tos,
+ +				   ttl, df, src_port, dst_port, xnet,
+ +				   !(vxflags & VXLAN_F_UDP_CSUM));
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(vxlan_xmit_skb);
+++=======
++ 
++ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
++ 				      struct sk_buff *skb, int oif, u8 tos,
++ 				      __be32 daddr, __be32 *saddr,
++ 				      struct dst_cache *dst_cache,
++ 				      const struct ip_tunnel_info *info)
++ {
++ 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
++ 	struct rtable *rt = NULL;
++ 	struct flowi4 fl4;
++ 
++ 	if (tos && !info)
++ 		use_cache = false;
++ 	if (use_cache) {
++ 		rt = dst_cache_get_ip4(dst_cache, saddr);
++ 		if (rt)
++ 			return rt;
++ 	}
++ 
++ 	memset(&fl4, 0, sizeof(fl4));
++ 	fl4.flowi4_oif = oif;
++ 	fl4.flowi4_tos = RT_TOS(tos);
++ 	fl4.flowi4_mark = skb->mark;
++ 	fl4.flowi4_proto = IPPROTO_UDP;
++ 	fl4.daddr = daddr;
++ 	fl4.saddr = vxlan->cfg.saddr.sin.sin_addr.s_addr;
++ 
++ 	rt = ip_route_output_key(vxlan->net, &fl4);
++ 	if (!IS_ERR(rt)) {
++ 		*saddr = fl4.saddr;
++ 		if (use_cache)
++ 			dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
++ 	}
++ 	return rt;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
++ 					  struct sk_buff *skb, int oif, u8 tos,
++ 					  const struct in6_addr *daddr,
++ 					  struct in6_addr *saddr,
++ 					  struct dst_cache *dst_cache,
++ 					  const struct ip_tunnel_info *info)
++ {
++ 	bool use_cache = ip_tunnel_dst_cache_usable(skb, info);
++ 	struct dst_entry *ndst;
++ 	struct flowi6 fl6;
++ 	int err;
++ 
++ 	if (tos && !info)
++ 		use_cache = false;
++ 	if (use_cache) {
++ 		ndst = dst_cache_get_ip6(dst_cache, saddr);
++ 		if (ndst)
++ 			return ndst;
++ 	}
++ 
++ 	memset(&fl6, 0, sizeof(fl6));
++ 	fl6.flowi6_oif = oif;
++ 	fl6.flowi6_tos = RT_TOS(tos);
++ 	fl6.daddr = *daddr;
++ 	fl6.saddr = vxlan->cfg.saddr.sin6.sin6_addr;
++ 	fl6.flowi6_mark = skb->mark;
++ 	fl6.flowi6_proto = IPPROTO_UDP;
++ 
++ 	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
++ 					 vxlan->vn6_sock->sock->sk,
++ 					 &ndst, &fl6);
++ 	if (err < 0)
++ 		return ERR_PTR(err);
++ 
++ 	*saddr = fl6.saddr;
++ 	if (use_cache)
++ 		dst_cache_set_ip6(dst_cache, ndst, saddr);
++ 	return ndst;
++ }
++ #endif
+++>>>>>>> 1400615d64cf (vxlan: allow setting ipv6 traffic class)
+  
+  /* Bypass encapsulation if the destination is local */
+  static void vxlan_encap_bypass(struct sk_buff *skb, struct vxlan_dev *src_vxlan,
+@@@ -1969,17 -2011,18 +2049,25 @@@ static void vxlan_xmit_one(struct sk_bu
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+  		struct dst_entry *ndst;
+ -		struct in6_addr saddr;
+ +		struct flowi6 fl6;
+  		u32 rt6i_flags;
+  
+ -		if (!vxlan->vn6_sock)
+ -			goto drop;
+ -		sk = vxlan->vn6_sock->sock->sk;
+ +		memset(&fl6, 0, sizeof(fl6));
+ +		fl6.flowi6_oif = rdst->remote_ifindex;
+ +		fl6.daddr = dst->sin6.sin6_addr;
+ +		fl6.saddr = vxlan->saddr.sin6.sin6_addr;
+ +		fl6.flowi6_mark = skb->mark;
+ +		fl6.flowi6_proto = IPPROTO_UDP;
+  
+++<<<<<<< HEAD
+ +		if (ipv6_stub->ipv6_dst_lookup(sk, &ndst, &fl6)) {
+++=======
++ 		ndst = vxlan6_get_route(vxlan, skb,
++ 					rdst ? rdst->remote_ifindex : 0, tos,
++ 					&dst->sin6.sin6_addr, &saddr,
++ 					dst_cache, info);
++ 		if (IS_ERR(ndst)) {
+++>>>>>>> 1400615d64cf (vxlan: allow setting ipv6 traffic class)
+  			netdev_dbg(dev, "no route to %pI6\n",
+  				   &dst->sin6.sin6_addr);
+  			dev->stats.tx_carrier_errors++;
+@@@ -2010,14 -2053,21 +2098,32 @@@
+  			return;
+  		}
+  
+++<<<<<<< HEAD
+ +		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+ +		md.vni = htonl(vni << 8);
+ +		md.gbp = skb->mark;
+ +
+ +		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &fl6.saddr, &fl6.daddr,
+ +				      0, ttl, src_port, dst_port, &md,
+ +				      !net_eq(vxlan->net, dev_net(vxlan->dev)),
+ +				      vxlan->flags);
+++=======
++ 		if (!info)
++ 			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
++ 
++ 		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
++ 		ttl = ttl ? : ip6_dst_hoplimit(ndst);
++ 		skb_scrub_packet(skb, xnet);
++ 		err = vxlan_build_skb(skb, ndst, sizeof(struct ipv6hdr),
++ 				      vni, md, flags, udp_sum);
++ 		if (err < 0) {
++ 			dst_release(ndst);
++ 			return;
++ 		}
++ 		udp_tunnel6_xmit_skb(ndst, sk, skb, dev,
++ 				     &saddr, &dst->sin6.sin6_addr, tos, ttl,
++ 				     src_port, dst_port, !udp_sum);
+++>>>>>>> 1400615d64cf (vxlan: allow setting ipv6 traffic class)
+  #endif
+  	}
+  
+@@@ -2304,6 -2362,48 +2410,51 @@@ static int vxlan_change_mtu(struct net_
+  	return __vxlan_change_mtu(dev, lowerdev, dst, new_mtu, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 	struct ip_tunnel_info *info = skb_tunnel_info(skb);
++ 	__be16 sport, dport;
++ 
++ 	sport = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
++ 				  vxlan->cfg.port_max, true);
++ 	dport = info->key.tp_dst ? : vxlan->cfg.dst_port;
++ 
++ 	if (ip_tunnel_info_af(info) == AF_INET) {
++ 		struct rtable *rt;
++ 
++ 		if (!vxlan->vn4_sock)
++ 			return -EINVAL;
++ 		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
++ 				     info->key.u.ipv4.dst,
++ 				     &info->key.u.ipv4.src, NULL, info);
++ 		if (IS_ERR(rt))
++ 			return PTR_ERR(rt);
++ 		ip_rt_put(rt);
++ 	} else {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		struct dst_entry *ndst;
++ 
++ 		if (!vxlan->vn6_sock)
++ 			return -EINVAL;
++ 		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
++ 					&info->key.u.ipv6.dst,
++ 					&info->key.u.ipv6.src, NULL, info);
++ 		if (IS_ERR(ndst))
++ 			return PTR_ERR(ndst);
++ 		dst_release(ndst);
++ #else /* !CONFIG_IPV6 */
++ 		return -EPFNOSUPPORT;
++ #endif
++ 	}
++ 	info->key.tp_src = sport;
++ 	info->key.tp_dst = dport;
++ 	return 0;
++ }
++ 
+++>>>>>>> 1400615d64cf (vxlan: allow setting ipv6 traffic class)
+  static const struct net_device_ops vxlan_netdev_ops = {
+  	.ndo_init		= vxlan_init,
+  	.ndo_uninit		= vxlan_uninit,
+* Unmerged path drivers/net/vxlan.c
