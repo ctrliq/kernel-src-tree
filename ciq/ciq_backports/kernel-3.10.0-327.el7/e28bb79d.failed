@@ -1,0 +1,232 @@
+s390/perf,oprofile: Share sampling facility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [s390] perf, oprofile: Share sampling facility (Hendrik Brueckner) [1182189]
+Rebuild_FUZZ: 92.68%
+commit-author Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+commit e28bb79d9935293a8eea5f3c771fde89db645ba7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/e28bb79d.failed
+
+Introduce reserve/release functions to share the sampling facility
+between perf and oprofile.
+Also improve error handling for the sampling facility support in perf.
+
+	Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit e28bb79d9935293a8eea5f3c771fde89db645ba7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/oprofile/hwsampler.c
+diff --cc arch/s390/oprofile/hwsampler.c
+index 8bc0df055863,eb095874540d..000000000000
+--- a/arch/s390/oprofile/hwsampler.c
++++ b/arch/s390/oprofile/hwsampler.c
+@@@ -940,7 -944,8 +944,12 @@@ int hwsampler_deallocate(void
+  	if (hws_state != HWS_STOPPED)
+  		goto deallocate_exit;
+  
+++<<<<<<< HEAD
+ +	measurement_alert_subclass_unregister();
+++=======
++ 	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
++ 	hws_alert = 0;
+++>>>>>>> e28bb79d9935 (s390/perf,oprofile: Share sampling facility)
+  	deallocate_sdbt();
+  
+  	hws_state = HWS_DEALLOCATED;
+@@@ -1054,7 -1059,8 +1063,12 @@@ int hwsampler_shutdown(void
+  		mutex_lock(&hws_sem);
+  
+  		if (hws_state == HWS_STOPPED) {
+++<<<<<<< HEAD
+ +			measurement_alert_subclass_unregister();
+++=======
++ 			irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
++ 			hws_alert = 0;
+++>>>>>>> e28bb79d9935 (s390/perf,oprofile: Share sampling facility)
+  			deallocate_sdbt();
+  		}
+  		if (hws_wq) {
+@@@ -1129,7 -1135,8 +1143,12 @@@ start_all_exit
+  	hws_oom = 1;
+  	hws_flush_all = 0;
+  	/* now let them in, 1407 CPUMF external interrupts */
+++<<<<<<< HEAD
+ +	measurement_alert_subclass_register();
+++=======
++ 	hws_alert = 1;
++ 	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+++>>>>>>> e28bb79d9935 (s390/perf,oprofile: Share sampling facility)
+  
+  	return 0;
+  }
+diff --git a/arch/s390/include/asm/perf_event.h b/arch/s390/include/asm/perf_event.h
+index b4eea25f379e..23d2dfa8201d 100644
+--- a/arch/s390/include/asm/perf_event.h
++++ b/arch/s390/include/asm/perf_event.h
+@@ -52,5 +52,9 @@ extern unsigned long perf_misc_flags(struct pt_regs *regs);
+ #define TEAR_REG(hwc)		((hwc)->last_tag)
+ #define SAMPL_RATE(hwc)		((hwc)->event_base)
+ 
++/* Perf hardware reserve and release functions */
++int perf_reserve_sampling(void);
++void perf_release_sampling(void);
++
+ #endif /* CONFIG_64BIT */
+ #endif /* _ASM_S390_PERF_EVENT_H */
+diff --git a/arch/s390/kernel/perf_cpum_sf.c b/arch/s390/kernel/perf_cpum_sf.c
+index 52bf36ee91aa..ae5e0192160d 100644
+--- a/arch/s390/kernel/perf_cpum_sf.c
++++ b/arch/s390/kernel/perf_cpum_sf.c
+@@ -260,16 +260,12 @@ static int sf_disable(void)
+ 
+ #define PMC_INIT      0
+ #define PMC_RELEASE   1
++#define PMC_FAILURE   2
+ static void setup_pmc_cpu(void *flags)
+ {
+ 	int err;
+ 	struct cpu_hw_sf *cpusf = &__get_cpu_var(cpu_hw_sf);
+ 
+-	/* XXX Improve error handling and pass a flag in the *flags
+-	 *     variable to indicate failures.  Alternatively, ignore
+-	 *     (print) errors here and let the PMU functions fail if
+-	 *     the per-cpu PMU_F_RESERVED flag is not.
+-	 */
+ 	err = 0;
+ 	switch (*((int *) flags)) {
+ 	case PMC_INIT:
+@@ -299,6 +295,8 @@ static void setup_pmc_cpu(void *flags)
+ 				    "setup_pmc_cpu: released: cpuhw=%p\n", cpusf);
+ 		break;
+ 	}
++	if (err)
++		*((int *) flags) |= PMC_FAILURE;
+ }
+ 
+ static void release_pmc_hardware(void)
+@@ -307,13 +305,22 @@ static void release_pmc_hardware(void)
+ 
+ 	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 	on_each_cpu(setup_pmc_cpu, &flags, 1);
++	perf_release_sampling();
+ }
+ 
+ static int reserve_pmc_hardware(void)
+ {
+ 	int flags = PMC_INIT;
++	int err;
+ 
++	err = perf_reserve_sampling();
++	if (err)
++		return err;
+ 	on_each_cpu(setup_pmc_cpu, &flags, 1);
++	if (flags & PMC_FAILURE) {
++		release_pmc_hardware();
++		return -ENODEV;
++	}
+ 	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+ 
+ 	return 0;
+diff --git a/arch/s390/kernel/perf_event.c b/arch/s390/kernel/perf_event.c
+index b9843ba9829f..4edcdfa4894e 100644
+--- a/arch/s390/kernel/perf_event.c
++++ b/arch/s390/kernel/perf_event.c
+@@ -208,3 +208,33 @@ ssize_t cpumf_events_sysfs_show(struct device *dev,
+ 	return sprintf(page, "event=0x%04llx,name=%s\n",
+ 		       pmu_attr->id, attr->attr.name);
+ }
++
++/* Reserve/release functions for sharing perf hardware */
++static DEFINE_SPINLOCK(perf_hw_owner_lock);
++static void *perf_sampling_owner;
++
++int perf_reserve_sampling(void)
++{
++	int err;
++
++	err = 0;
++	spin_lock(&perf_hw_owner_lock);
++	if (perf_sampling_owner) {
++		pr_warn("The sampling facility is already reserved by %p\n",
++			perf_sampling_owner);
++		err = -EBUSY;
++	} else
++		perf_sampling_owner = __builtin_return_address(0);
++	spin_unlock(&perf_hw_owner_lock);
++	return err;
++}
++EXPORT_SYMBOL(perf_reserve_sampling);
++
++void perf_release_sampling(void)
++{
++	spin_lock(&perf_hw_owner_lock);
++	WARN_ON(!perf_sampling_owner);
++	perf_sampling_owner = NULL;
++	spin_unlock(&perf_hw_owner_lock);
++}
++EXPORT_SYMBOL(perf_release_sampling);
+* Unmerged path arch/s390/oprofile/hwsampler.c
+diff --git a/arch/s390/oprofile/init.c b/arch/s390/oprofile/init.c
+index 930783d2c99b..fe0952227058 100644
+--- a/arch/s390/oprofile/init.c
++++ b/arch/s390/oprofile/init.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/oprofile.h>
++#include <linux/perf_event.h>
+ #include <linux/init.h>
+ #include <linux/errno.h>
+ #include <linux/fs.h>
+@@ -67,6 +68,21 @@ module_param_call(cpu_type, set_cpu_type, NULL, NULL, 0);
+ MODULE_PARM_DESC(cpu_type, "Force legacy basic mode sampling"
+ 		           "(report cpu_type \"timer\"");
+ 
++static int __oprofile_hwsampler_start(void)
++{
++	int retval;
++
++	retval = hwsampler_allocate(oprofile_sdbt_blocks, oprofile_sdb_blocks);
++	if (retval)
++		return retval;
++
++	retval = hwsampler_start_all(oprofile_hw_interval);
++	if (retval)
++		hwsampler_deallocate();
++
++	return retval;
++}
++
+ static int oprofile_hwsampler_start(void)
+ {
+ 	int retval;
+@@ -76,13 +92,13 @@ static int oprofile_hwsampler_start(void)
+ 	if (!hwsampler_running)
+ 		return timer_ops.start();
+ 
+-	retval = hwsampler_allocate(oprofile_sdbt_blocks, oprofile_sdb_blocks);
++	retval = perf_reserve_sampling();
+ 	if (retval)
+ 		return retval;
+ 
+-	retval = hwsampler_start_all(oprofile_hw_interval);
++	retval = __oprofile_hwsampler_start();
+ 	if (retval)
+-		hwsampler_deallocate();
++		perf_release_sampling();
+ 
+ 	return retval;
+ }
+@@ -96,6 +112,7 @@ static void oprofile_hwsampler_stop(void)
+ 
+ 	hwsampler_stop_all();
+ 	hwsampler_deallocate();
++	perf_release_sampling();
+ 	return;
+ }
+ 
