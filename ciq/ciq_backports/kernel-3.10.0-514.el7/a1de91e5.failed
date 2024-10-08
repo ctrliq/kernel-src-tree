@@ -1,0 +1,313 @@
+drm/i915/gen9: Cache plane data rates in CRTC state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Matt Roper <matthew.d.roper@intel.com>
+commit a1de91e5f3039dfc32ac2b77ffb280a68646cbc7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a1de91e5.failed
+
+This will be important when we start calculating CRTC data rates for
+in-flight CRTC states since it will allow us to calculate the total data
+rate without needing to grab the plane state for any planes that aren't
+updated by the transaction.
+
+	Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1463061971-19638-4-git-send-email-matthew.d.roper@intel.com
+(cherry picked from commit a1de91e5f3039dfc32ac2b77ffb280a68646cbc7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_drv.h
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 640e923ced09,423355f1b4f7..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -262,6 -344,105 +262,108 @@@ struct intel_initial_plane_config 
+  	u32 base;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define SKL_MIN_SRC_W 8
++ #define SKL_MAX_SRC_W 4096
++ #define SKL_MIN_SRC_H 8
++ #define SKL_MAX_SRC_H 4096
++ #define SKL_MIN_DST_W 8
++ #define SKL_MAX_DST_W 4096
++ #define SKL_MIN_DST_H 8
++ #define SKL_MAX_DST_H 4096
++ 
++ struct intel_scaler {
++ 	int in_use;
++ 	uint32_t mode;
++ };
++ 
++ struct intel_crtc_scaler_state {
++ #define SKL_NUM_SCALERS 2
++ 	struct intel_scaler scalers[SKL_NUM_SCALERS];
++ 
++ 	/*
++ 	 * scaler_users: keeps track of users requesting scalers on this crtc.
++ 	 *
++ 	 *     If a bit is set, a user is using a scaler.
++ 	 *     Here user can be a plane or crtc as defined below:
++ 	 *       bits 0-30 - plane (bit position is index from drm_plane_index)
++ 	 *       bit 31    - crtc
++ 	 *
++ 	 * Instead of creating a new index to cover planes and crtc, using
++ 	 * existing drm_plane_index for planes which is well less than 31
++ 	 * planes and bit 31 for crtc. This should be fine to cover all
++ 	 * our platforms.
++ 	 *
++ 	 * intel_atomic_setup_scalers will setup available scalers to users
++ 	 * requesting scalers. It will gracefully fail if request exceeds
++ 	 * avilability.
++ 	 */
++ #define SKL_CRTC_INDEX 31
++ 	unsigned scaler_users;
++ 
++ 	/* scaler used by crtc for panel fitting purpose */
++ 	int scaler_id;
++ };
++ 
++ /* drm_mode->private_flags */
++ #define I915_MODE_FLAG_INHERITED 1
++ 
++ struct intel_pipe_wm {
++ 	struct intel_wm_level wm[5];
++ 	struct intel_wm_level raw_wm[5];
++ 	uint32_t linetime;
++ 	bool fbc_wm_enabled;
++ 	bool pipe_enabled;
++ 	bool sprites_enabled;
++ 	bool sprites_scaled;
++ };
++ 
++ struct skl_pipe_wm {
++ 	struct skl_wm_level wm[8];
++ 	struct skl_wm_level trans_wm;
++ 	uint32_t linetime;
++ };
++ 
++ struct intel_crtc_wm_state {
++ 	union {
++ 		struct {
++ 			/*
++ 			 * Intermediate watermarks; these can be
++ 			 * programmed immediately since they satisfy
++ 			 * both the current configuration we're
++ 			 * switching away from and the new
++ 			 * configuration we're switching to.
++ 			 */
++ 			struct intel_pipe_wm intermediate;
++ 
++ 			/*
++ 			 * Optimal watermarks, programmed post-vblank
++ 			 * when this state is committed.
++ 			 */
++ 			struct intel_pipe_wm optimal;
++ 		} ilk;
++ 
++ 		struct {
++ 			/* gen9+ only needs 1-step wm programming */
++ 			struct skl_pipe_wm optimal;
++ 
++ 			/* cached plane data rate */
++ 			unsigned plane_data_rate[I915_MAX_PLANES];
++ 			unsigned plane_y_data_rate[I915_MAX_PLANES];
++ 		} skl;
++ 	};
++ 
++ 	/*
++ 	 * Platforms with two-step watermark programming will need to
++ 	 * update watermark programming post-vblank to switch from the
++ 	 * safe intermediate watermarks to the optimal final
++ 	 * watermarks.
++ 	 */
++ 	bool need_postvbl_update;
++ };
++ 
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  struct intel_crtc_state {
+  	struct drm_crtc_state base;
+  
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index cca54888a5ac,88cc1e219a13..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -2610,9 -2933,40 +2610,42 @@@ void skl_ddb_get_hw_state(struct drm_i9
+  }
+  
+  static unsigned int
+ -skl_plane_relative_data_rate(const struct intel_crtc_state *cstate,
+ -			     const struct drm_plane_state *pstate,
+ -			     int y)
+ +skl_plane_relative_data_rate(const struct intel_plane_wm_parameters *p)
+  {
+++<<<<<<< HEAD
+ +	return p->horiz_pixels * p->vert_pixels * p->bytes_per_pixel;
+++=======
++ 	struct intel_plane_state *intel_pstate = to_intel_plane_state(pstate);
++ 	struct drm_framebuffer *fb = pstate->fb;
++ 	uint32_t width = 0, height = 0;
++ 	unsigned format = fb ? fb->pixel_format : DRM_FORMAT_XRGB8888;
++ 
++ 	if (!intel_pstate->visible)
++ 		return 0;
++ 	if (pstate->plane->type == DRM_PLANE_TYPE_CURSOR)
++ 		return 0;
++ 	if (y && format != DRM_FORMAT_NV12)
++ 		return 0;
++ 
++ 	width = drm_rect_width(&intel_pstate->src) >> 16;
++ 	height = drm_rect_height(&intel_pstate->src) >> 16;
++ 
++ 	if (intel_rotation_90_or_270(pstate->rotation))
++ 		swap(width, height);
++ 
++ 	/* for planar format */
++ 	if (format == DRM_FORMAT_NV12) {
++ 		if (y)  /* y-plane data rate */
++ 			return width * height *
++ 				drm_format_plane_cpp(format, 0);
++ 		else    /* uv-plane data rate */
++ 			return (width / 2) * (height / 2) *
++ 				drm_format_plane_cpp(format, 1);
++ 	}
++ 
++ 	/* for packed formats */
++ 	return width * height * drm_format_plane_cpp(format, 0);
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  }
+  
+  /*
+@@@ -2621,20 -2975,34 +2654,51 @@@
+   *   3 * 4096 * 8192  * 4 < 2^32
+   */
+  static unsigned int
+++<<<<<<< HEAD
+ +skl_get_total_relative_data_rate(struct intel_crtc *intel_crtc,
+ +				 const struct skl_pipe_wm_parameters *params)
+ +{
+ +	unsigned int total_data_rate = 0;
+ +	int plane;
+ +
+ +	for (plane = 0; plane < intel_num_planes(intel_crtc); plane++) {
+ +		const struct intel_plane_wm_parameters *p;
+ +
+ +		p = &params->plane[plane];
+ +		if (!p->enabled)
+ +			continue;
+ +
+ +		total_data_rate += skl_plane_relative_data_rate(p);
+++=======
++ skl_get_total_relative_data_rate(struct intel_crtc_state *cstate)
++ {
++ 	struct intel_crtc *intel_crtc = to_intel_crtc(cstate->base.crtc);
++ 	struct drm_device *dev = intel_crtc->base.dev;
++ 	const struct intel_plane *intel_plane;
++ 	unsigned int rate, total_data_rate = 0;
++ 
++ 	/* Calculate and cache data rate for each plane */
++ 	for_each_intel_plane_on_crtc(dev, intel_crtc, intel_plane) {
++ 		const struct drm_plane_state *pstate = intel_plane->base.state;
++ 		int id = skl_wm_plane_id(intel_plane);
++ 
++ 		/* packed/uv */
++ 		rate = skl_plane_relative_data_rate(cstate, pstate, 0);
++ 		cstate->wm.skl.plane_data_rate[id] = rate;
++ 
++ 		/* y-plane */
++ 		rate = skl_plane_relative_data_rate(cstate, pstate, 1);
++ 		cstate->wm.skl.plane_y_data_rate[id] = rate;
++ 	}
++ 
++ 	/* Calculate CRTC's total data rate from cached values */
++ 	for_each_intel_plane_on_crtc(dev, intel_crtc, intel_plane) {
++ 		int id = skl_wm_plane_id(intel_plane);
++ 
++ 		/* packed/uv */
++ 		total_data_rate += cstate->wm.skl.plane_data_rate[id];
++ 		total_data_rate += cstate->wm.skl.plane_y_data_rate[id];
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  	}
+  
+  	return total_data_rate;
+@@@ -2689,21 -3065,27 +2753,31 @@@ skl_allocate_pipe_ddb(struct drm_crtc *
+  	 *
+  	 * FIXME: we may not allocate every single block here.
+  	 */
+++<<<<<<< HEAD
+ +	total_data_rate = skl_get_total_relative_data_rate(intel_crtc, params);
+++=======
++ 	total_data_rate = skl_get_total_relative_data_rate(cstate);
++ 	if (total_data_rate == 0)
++ 		return;
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  
+  	start = alloc->start;
+ -	for_each_intel_plane_on_crtc(dev, intel_crtc, intel_plane) {
+ -		struct drm_plane *plane = &intel_plane->base;
+ -		struct drm_plane_state *pstate = intel_plane->base.state;
+ -		unsigned int data_rate, y_data_rate;
+ -		uint16_t plane_blocks, y_plane_blocks = 0;
+ -		int id = skl_wm_plane_id(intel_plane);
+ +	for (plane = 0; plane < intel_num_planes(intel_crtc); plane++) {
+ +		const struct intel_plane_wm_parameters *p;
+ +		unsigned int data_rate;
+ +		uint16_t plane_blocks;
+  
+ -		if (!to_intel_plane_state(pstate)->visible)
+ -			continue;
+ -		if (plane->type == DRM_PLANE_TYPE_CURSOR)
+ +		p = &params->plane[plane];
+ +		if (!p->enabled)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		data_rate = skl_plane_relative_data_rate(p);
+++=======
++ 		data_rate = cstate->wm.skl.plane_data_rate[id];
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  
+  		/*
+ -		 * allocation for (packed formats) or (uv-plane part of planar format):
+  		 * promote the expression to 64 bits to avoid overflowing, the
+  		 * result is < available as data_rate / total_data_rate < 1
+  		 */
+@@@ -2711,10 -3093,24 +2785,27 @@@
+  		plane_blocks += div_u64((uint64_t)alloc_size * data_rate,
+  					total_data_rate);
+  
+ -		ddb->plane[pipe][id].start = start;
+ -		ddb->plane[pipe][id].end = start + plane_blocks;
+ +		ddb->plane[pipe][plane].start = start;
+ +		ddb->plane[pipe][plane].end = start + plane_blocks;
+  
+  		start += plane_blocks;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * allocation for y_plane part of planar format:
++ 		 */
++ 		y_data_rate = cstate->wm.skl.plane_y_data_rate[id];
++ 
++ 		y_plane_blocks = y_minimum[id];
++ 		y_plane_blocks += div_u64((uint64_t)alloc_size * y_data_rate,
++ 					total_data_rate);
++ 
++ 		ddb->y_plane[pipe][id].start = start;
++ 		ddb->y_plane[pipe][id].end = start + y_plane_blocks;
++ 
++ 		start += y_plane_blocks;
+++>>>>>>> a1de91e5f303 (drm/i915/gen9: Cache plane data rates in CRTC state)
+  	}
+  
+  }
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
