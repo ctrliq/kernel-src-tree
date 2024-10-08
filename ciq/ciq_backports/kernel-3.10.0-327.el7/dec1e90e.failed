@@ -1,0 +1,769 @@
+bonding: convert to list API and replace bond's custom list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author nikolay@redhat.com <nikolay@redhat.com>
+commit dec1e90e8c7157a527faad95023d96dbc114fbac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/dec1e90e.failed
+
+This patch aims to remove struct bonding's first_slave and struct
+slave's next and prev pointers, and replace them with the standard Linux
+list API. The old macros are converted to list API as well and some new
+primitives are available now. The checks if there're slaves that used
+slave_cnt have been replaced by the list_empty macro.
+Also a few small style fixes, changing longest -> shortest line in local
+variable declarations, leaving an empty line before return and removing
+unnecessary brackets.
+This is the first step to gradual RCU conversion.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dec1e90e8c7157a527faad95023d96dbc114fbac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index f98015f6b32a,2e8ec8b79f05..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -1320,7 -1239,12 +1291,15 @@@ static netdev_features_t bond_fix_featu
+  
+  	read_lock(&bond->lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (list_empty(&bond->slave_list)) {
++ 		/* Disable adding VLANs to empty bond. But why? --mq */
++ 		features |= NETIF_F_VLAN_CHALLENGED;
++ 		goto out;
++ 	}
++ 
+++>>>>>>> dec1e90e8c71 (bonding: convert to list API and replace bond's custom list)
+  	mask = features;
+  	features &= ~NETIF_F_ONE_FOR_ALL;
+  	features |= NETIF_F_ALL_FOR_ALL;
+@@@ -2046,9 -1969,16 +2028,9 @@@ static int __bond_release_one(struct ne
+  		write_lock_bh(&bond->lock);
+  	}
+  
+- 	if (bond->slave_cnt == 0) {
++ 	if (list_empty(&bond->slave_list)) {
+  		bond_set_carrier(bond);
+  		eth_hw_addr_random(bond_dev);
+ -
+ -		if (bond_vlan_used(bond)) {
+ -			pr_warning("%s: Warning: clearing HW address of %s while it still has VLANs.\n",
+ -				   bond_dev->name, bond_dev->name);
+ -			pr_warning("%s: When re-adding slaves, make sure the bond's HW address matches its VLANs'.\n",
+ -				   bond_dev->name);
+ -		}
+  	}
+  
+  	write_unlock_bh(&bond->lock);
+@@@ -3672,35 -3571,28 +3646,55 @@@ static void bond_change_rx_flags(struc
+  				  bond_dev->flags & IFF_ALLMULTI ? 1 : -1);
+  }
+  
+ -static void bond_set_rx_mode(struct net_device *bond_dev)
+ +static void bond_set_multicast_list(struct net_device *bond_dev)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+++<<<<<<< HEAD
+ +	struct netdev_hw_addr *ha;
+ +	bool found;
+ +
+ +	read_lock(&bond->lock);
+ +
+ +	/* looking for addresses to add to slaves' mc list */
+ +	netdev_for_each_mc_addr(ha, bond_dev) {
+ +		found = bond_addr_in_mc_list(ha->addr, &bond->mc_list,
+ +					     bond_dev->addr_len);
+ +		if (!found)
+ +			bond_mc_add(bond, ha->addr);
+++=======
++ 	struct slave *slave;
++ 
++ 	read_lock(&bond->lock);
++ 
++ 	if (USES_PRIMARY(bond->params.mode)) {
++ 		read_lock(&bond->curr_slave_lock);
++ 		slave = bond->curr_active_slave;
++ 		if (slave) {
++ 			dev_uc_sync(slave->dev, bond_dev);
++ 			dev_mc_sync(slave->dev, bond_dev);
++ 		}
++ 		read_unlock(&bond->curr_slave_lock);
++ 	} else {
++ 		bond_for_each_slave(bond, slave) {
++ 			dev_uc_sync_multiple(slave->dev, bond_dev);
++ 			dev_mc_sync_multiple(slave->dev, bond_dev);
++ 		}
+++>>>>>>> dec1e90e8c71 (bonding: convert to list API and replace bond's custom list)
+  	}
+  
+ +	/* looking for addresses to delete from slaves' list */
+ +	netdev_hw_addr_list_for_each(ha, &bond->mc_list) {
+ +		found = bond_addr_in_mc_list(ha->addr, &bond_dev->mc,
+ +					     bond_dev->addr_len);
+ +		if (!found)
+ +			bond_mc_del(bond, ha->addr);
+ +	}
+ +
+ +	/* save master's multicast list */
+ +	__hw_addr_flush(&bond->mc_list);
+ +	__hw_addr_add_multiple(&bond->mc_list, &bond_dev->mc,
+ +			       bond_dev->addr_len, NETDEV_HW_ADDR_T_MULTICAST);
+ +
+  	read_unlock(&bond->lock);
+  }
+  
+diff --git a/drivers/net/bonding/bond_3ad.c b/drivers/net/bonding/bond_3ad.c
+index 390061d09693..7d46fa832c1f 100644
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@ -143,10 +143,9 @@ static inline struct bonding *__get_bond_by_port(struct port *port)
+  */
+ static inline struct port *__get_first_port(struct bonding *bond)
+ {
+-	if (bond->slave_cnt == 0)
+-		return NULL;
++	struct slave *first_slave = bond_first_slave(bond);
+ 
+-	return &(SLAVE_AD_INFO(bond->first_slave).port);
++	return first_slave ? &(SLAVE_AD_INFO(first_slave).port) : NULL;
+ }
+ 
+ /**
+@@ -159,13 +158,16 @@ static inline struct port *__get_first_port(struct bonding *bond)
+ static inline struct port *__get_next_port(struct port *port)
+ {
+ 	struct bonding *bond = __get_bond_by_port(port);
+-	struct slave *slave = port->slave;
++	struct slave *slave = port->slave, *slave_next;
+ 
+ 	// If there's no bond for this port, or this is the last slave
+-	if ((bond == NULL) || (slave->next == bond->first_slave))
++	if (bond == NULL)
++		return NULL;
++	slave_next = bond_next_slave(bond, slave);
++	if (!slave_next || bond_is_first_slave(bond, slave_next))
+ 		return NULL;
+ 
+-	return &(SLAVE_AD_INFO(slave->next).port);
++	return &(SLAVE_AD_INFO(slave_next).port);
+ }
+ 
+ /**
+@@ -178,12 +180,14 @@ static inline struct port *__get_next_port(struct port *port)
+ static inline struct aggregator *__get_first_agg(struct port *port)
+ {
+ 	struct bonding *bond = __get_bond_by_port(port);
++	struct slave *first_slave;
+ 
+ 	// If there's no bond for this port, or bond has no slaves
+-	if ((bond == NULL) || (bond->slave_cnt == 0))
++	if (bond == NULL)
+ 		return NULL;
++	first_slave = bond_first_slave(bond);
+ 
+-	return &(SLAVE_AD_INFO(bond->first_slave).aggregator);
++	return first_slave ? &(SLAVE_AD_INFO(first_slave).aggregator) : NULL;
+ }
+ 
+ /**
+@@ -195,14 +199,17 @@ static inline struct aggregator *__get_first_agg(struct port *port)
+  */
+ static inline struct aggregator *__get_next_agg(struct aggregator *aggregator)
+ {
+-	struct slave *slave = aggregator->slave;
++	struct slave *slave = aggregator->slave, *slave_next;
+ 	struct bonding *bond = bond_get_bond_by_slave(slave);
+ 
+ 	// If there's no bond for this aggregator, or this is the last slave
+-	if ((bond == NULL) || (slave->next == bond->first_slave))
++	if (bond == NULL)
++		return NULL;
++	slave_next = bond_next_slave(bond, slave);
++	if (!slave_next || bond_is_first_slave(bond, slave_next))
+ 		return NULL;
+ 
+-	return &(SLAVE_AD_INFO(slave->next).aggregator);
++	return &(SLAVE_AD_INFO(slave_next).aggregator);
+ }
+ 
+ /*
+@@ -2110,7 +2117,7 @@ void bond_3ad_state_machine_handler(struct work_struct *work)
+ 	read_lock(&bond->lock);
+ 
+ 	//check if there are any slaves
+-	if (bond->slave_cnt == 0)
++	if (list_empty(&bond->slave_list))
+ 		goto re_arm;
+ 
+ 	// check if agg_select_timer timer after initialize is timed out
+@@ -2336,8 +2343,12 @@ void bond_3ad_handle_link_change(struct slave *slave, char link)
+ int bond_3ad_set_carrier(struct bonding *bond)
+ {
+ 	struct aggregator *active;
++	struct slave *first_slave;
+ 
+-	active = __get_active_agg(&(SLAVE_AD_INFO(bond->first_slave).aggregator));
++	first_slave = bond_first_slave(bond);
++	if (!first_slave)
++		return 0;
++	active = __get_active_agg(&(SLAVE_AD_INFO(first_slave).aggregator));
+ 	if (active) {
+ 		/* are enough slaves available to consider link up? */
+ 		if (active->num_of_ports < bond->params.min_links) {
+@@ -2432,7 +2443,7 @@ int bond_3ad_xmit_xor(struct sk_buff *skb, struct net_device *dev)
+ 
+ 	slave_agg_no = bond->xmit_hash_policy(skb, slaves_in_agg);
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		struct aggregator *agg = SLAVE_AD_INFO(slave).port.aggregator;
+ 
+ 		if (agg && (agg->aggregator_identifier == agg_id)) {
+@@ -2501,7 +2512,6 @@ int bond_3ad_lacpdu_recv(const struct sk_buff *skb, struct bonding *bond,
+  */
+ void bond_3ad_update_lacp_rate(struct bonding *bond)
+ {
+-	int i;
+ 	struct slave *slave;
+ 	struct port *port = NULL;
+ 	int lacp_fast;
+@@ -2509,7 +2519,7 @@ void bond_3ad_update_lacp_rate(struct bonding *bond)
+ 	write_lock_bh(&bond->lock);
+ 	lacp_fast = bond->params.lacp_fast;
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		port = &(SLAVE_AD_INFO(slave).port);
+ 		if (port->slave == NULL)
+ 			continue;
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index 03b70088d85c..b6ecdad08b08 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -224,13 +224,12 @@ static struct slave *tlb_get_least_loaded_slave(struct bonding *bond)
+ {
+ 	struct slave *slave, *least_loaded;
+ 	long long max_gap;
+-	int i;
+ 
+ 	least_loaded = NULL;
+ 	max_gap = LLONG_MIN;
+ 
+ 	/* Find the slave with the largest gap */
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (SLAVE_IS_OK(slave)) {
+ 			long long gap = compute_gap(slave);
+ 
+@@ -386,11 +385,10 @@ static struct slave *rlb_next_rx_slave(struct bonding *bond)
+ 	struct slave *rx_slave, *slave, *start_at;
+ 	int i = 0;
+ 
+-	if (bond_info->next_rx_slave) {
++	if (bond_info->next_rx_slave)
+ 		start_at = bond_info->next_rx_slave;
+-	} else {
+-		start_at = bond->first_slave;
+-	}
++	else
++		start_at = bond_first_slave(bond);
+ 
+ 	rx_slave = NULL;
+ 
+@@ -405,7 +403,8 @@ static struct slave *rlb_next_rx_slave(struct bonding *bond)
+ 	}
+ 
+ 	if (rx_slave) {
+-		bond_info->next_rx_slave = rx_slave->next;
++		slave = bond_next_slave(bond, rx_slave);
++		bond_info->next_rx_slave = slave;
+ 	}
+ 
+ 	return rx_slave;
+@@ -1173,9 +1172,8 @@ static int alb_handle_addr_collision_on_attach(struct bonding *bond, struct slav
+ {
+ 	struct slave *tmp_slave1, *free_mac_slave = NULL;
+ 	struct slave *has_bond_addr = bond->curr_active_slave;
+-	int i;
+ 
+-	if (bond->slave_cnt == 0) {
++	if (list_empty(&bond->slave_list)) {
+ 		/* this is the first slave */
+ 		return 0;
+ 	}
+@@ -1196,7 +1194,7 @@ static int alb_handle_addr_collision_on_attach(struct bonding *bond, struct slav
+ 	/* The slave's address is equal to the address of the bond.
+ 	 * Search for a spare address in the bond for this slave.
+ 	 */
+-	bond_for_each_slave(bond, tmp_slave1, i) {
++	bond_for_each_slave(bond, tmp_slave1) {
+ 		if (!bond_slave_has_mac(bond, tmp_slave1->perm_hwaddr)) {
+ 			/* no slave has tmp_slave1's perm addr
+ 			 * as its curr addr
+@@ -1246,17 +1244,15 @@ static int alb_handle_addr_collision_on_attach(struct bonding *bond, struct slav
+  */
+ static int alb_set_mac_address(struct bonding *bond, void *addr)
+ {
+-	struct sockaddr sa;
+-	struct slave *slave, *stop_at;
+ 	char tmp_addr[ETH_ALEN];
++	struct slave *slave;
++	struct sockaddr sa;
+ 	int res;
+-	int i;
+ 
+-	if (bond->alb_info.rlb_enabled) {
++	if (bond->alb_info.rlb_enabled)
+ 		return 0;
+-	}
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		/* save net_device's current hw address */
+ 		memcpy(tmp_addr, slave->dev->dev_addr, ETH_ALEN);
+ 
+@@ -1276,8 +1272,7 @@ unwind:
+ 	sa.sa_family = bond->dev->type;
+ 
+ 	/* unwind from head to the slave that failed */
+-	stop_at = slave;
+-	bond_for_each_slave_from_to(bond, slave, i, bond->first_slave, stop_at) {
++	bond_for_each_slave_continue_reverse(bond, slave) {
+ 		memcpy(tmp_addr, slave->dev->dev_addr, ETH_ALEN);
+ 		dev_set_mac_address(slave->dev, &sa);
+ 		memcpy(slave->dev->dev_addr, tmp_addr, ETH_ALEN);
+@@ -1460,11 +1455,10 @@ void bond_alb_monitor(struct work_struct *work)
+ 					    alb_work.work);
+ 	struct alb_bond_info *bond_info = &(BOND_ALB_INFO(bond));
+ 	struct slave *slave;
+-	int i;
+ 
+ 	read_lock(&bond->lock);
+ 
+-	if (bond->slave_cnt == 0) {
++	if (list_empty(&bond->slave_list)) {
+ 		bond_info->tx_rebalance_counter = 0;
+ 		bond_info->lp_counter = 0;
+ 		goto re_arm;
+@@ -1482,9 +1476,8 @@ void bond_alb_monitor(struct work_struct *work)
+ 		 */
+ 		read_lock(&bond->curr_slave_lock);
+ 
+-		bond_for_each_slave(bond, slave, i) {
++		bond_for_each_slave(bond, slave)
+ 			alb_send_learning_packets(slave, slave->dev->dev_addr);
+-		}
+ 
+ 		read_unlock(&bond->curr_slave_lock);
+ 
+@@ -1496,7 +1489,7 @@ void bond_alb_monitor(struct work_struct *work)
+ 
+ 		read_lock(&bond->curr_slave_lock);
+ 
+-		bond_for_each_slave(bond, slave, i) {
++		bond_for_each_slave(bond, slave) {
+ 			tlb_clear_slave(bond, slave, 1);
+ 			if (slave == bond->curr_active_slave) {
+ 				SLAVE_TLB_INFO(slave).load =
+@@ -1602,9 +1595,8 @@ int bond_alb_init_slave(struct bonding *bond, struct slave *slave)
+  */
+ void bond_alb_deinit_slave(struct bonding *bond, struct slave *slave)
+ {
+-	if (bond->slave_cnt > 1) {
++	if (!list_empty(&bond->slave_list))
+ 		alb_change_hw_addr_on_detach(bond, slave);
+-	}
+ 
+ 	tlb_clear_slave(bond, slave, 0);
+ 
+@@ -1661,9 +1653,8 @@ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave
+ {
+ 	struct slave *swap_slave;
+ 
+-	if (bond->curr_active_slave == new_slave) {
++	if (bond->curr_active_slave == new_slave)
+ 		return;
+-	}
+ 
+ 	if (bond->curr_active_slave && bond->alb_info.primary_is_promisc) {
+ 		dev_set_promiscuity(bond->curr_active_slave->dev, -1);
+@@ -1674,9 +1665,8 @@ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave
+ 	swap_slave = bond->curr_active_slave;
+ 	bond->curr_active_slave = new_slave;
+ 
+-	if (!new_slave || (bond->slave_cnt == 0)) {
++	if (!new_slave || list_empty(&bond->slave_list))
+ 		return;
+-	}
+ 
+ 	/* set the new curr_active_slave to the bonds mac address
+ 	 * i.e. swap mac addresses of old curr_active_slave and new curr_active_slave
+@@ -1689,9 +1679,8 @@ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave
+ 	 * ignored so we can mess with their MAC addresses without
+ 	 * fear of interference from transmit activity.
+ 	 */
+-	if (swap_slave) {
++	if (swap_slave)
+ 		tlb_clear_slave(bond, swap_slave, 1);
+-	}
+ 	tlb_clear_slave(bond, new_slave, 1);
+ 
+ 	write_unlock_bh(&bond->curr_slave_lock);
+* Unmerged path drivers/net/bonding/bond_main.c
+diff --git a/drivers/net/bonding/bond_procfs.c b/drivers/net/bonding/bond_procfs.c
+index 4060d41f0ee7..20a6ee25bb63 100644
+--- a/drivers/net/bonding/bond_procfs.c
++++ b/drivers/net/bonding/bond_procfs.c
+@@ -12,7 +12,6 @@ static void *bond_info_seq_start(struct seq_file *seq, loff_t *pos)
+ 	struct bonding *bond = seq->private;
+ 	loff_t off = 0;
+ 	struct slave *slave;
+-	int i;
+ 
+ 	/* make sure the bond won't be taken away */
+ 	rcu_read_lock();
+@@ -21,10 +20,9 @@ static void *bond_info_seq_start(struct seq_file *seq, loff_t *pos)
+ 	if (*pos == 0)
+ 		return SEQ_START_TOKEN;
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave)
+ 		if (++off == *pos)
+ 			return slave;
+-	}
+ 
+ 	return NULL;
+ }
+@@ -36,11 +34,13 @@ static void *bond_info_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+ 
+ 	++*pos;
+ 	if (v == SEQ_START_TOKEN)
+-		return bond->first_slave;
++		return bond_first_slave(bond);
+ 
+-	slave = slave->next;
++	if (bond_is_last_slave(bond, slave))
++		return NULL;
++	slave = bond_next_slave(bond, slave);
+ 
+-	return (slave == bond->first_slave) ? NULL : slave;
++	return slave;
+ }
+ 
+ static void bond_info_seq_stop(struct seq_file *seq, void *v)
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index c0344ce23f37..73c080bb2fba 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -209,12 +209,12 @@ void bond_destroy_slave_symlinks(struct net_device *master,
+ static ssize_t bonding_show_slaves(struct device *d,
+ 				   struct device_attribute *attr, char *buf)
+ {
+-	struct slave *slave;
+-	int i, res = 0;
+ 	struct bonding *bond = to_bond(d);
++	struct slave *slave;
++	int res = 0;
+ 
+ 	read_lock(&bond->lock);
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (res > (PAGE_SIZE - IFNAMSIZ)) {
+ 			/* not enough space for another interface name */
+ 			if ((PAGE_SIZE - res) > 10)
+@@ -227,6 +227,7 @@ static ssize_t bonding_show_slaves(struct device *d,
+ 	read_unlock(&bond->lock);
+ 	if (res)
+ 		buf[res-1] = '\n'; /* eat the leftover space */
++
+ 	return res;
+ }
+ 
+@@ -325,7 +326,7 @@ static ssize_t bonding_store_mode(struct device *d,
+ 		goto out;
+ 	}
+ 
+-	if (bond->slave_cnt > 0) {
++	if (!list_empty(&bond->slave_list)) {
+ 		pr_err("unable to update mode of %s because it has slaves.\n",
+ 			bond->dev->name);
+ 		ret = -EPERM;
+@@ -507,7 +508,7 @@ static ssize_t bonding_store_fail_over_mac(struct device *d,
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+ 
+-	if (bond->slave_cnt != 0) {
++	if (!list_empty(&bond->slave_list)) {
+ 		pr_err("%s: Can't alter fail_over_mac with slaves in bond.\n",
+ 		       bond->dev->name);
+ 		ret = -EPERM;
+@@ -669,7 +670,7 @@ static ssize_t bonding_store_arp_targets(struct device *d,
+ 			 &newtarget);
+ 		/* not to race with bond_arp_rcv */
+ 		write_lock_bh(&bond->lock);
+-		bond_for_each_slave(bond, slave, i)
++		bond_for_each_slave(bond, slave)
+ 			slave->target_last_arp_rx[ind] = jiffies;
+ 		targets[ind] = newtarget;
+ 		write_unlock_bh(&bond->lock);
+@@ -695,7 +696,7 @@ static ssize_t bonding_store_arp_targets(struct device *d,
+ 			&newtarget);
+ 
+ 		write_lock_bh(&bond->lock);
+-		bond_for_each_slave(bond, slave, i) {
++		bond_for_each_slave(bond, slave) {
+ 			targets_rx = slave->target_last_arp_rx;
+ 			j = ind;
+ 			for (; (j < BOND_MAX_ARP_TARGETS-1) && targets[j+1]; j++)
+@@ -1092,10 +1093,9 @@ static ssize_t bonding_store_primary(struct device *d,
+ 				     struct device_attribute *attr,
+ 				     const char *buf, size_t count)
+ {
+-	int i;
+-	struct slave *slave;
+ 	struct bonding *bond = to_bond(d);
+ 	char ifname[IFNAMSIZ];
++	struct slave *slave;
+ 
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+@@ -1121,7 +1121,7 @@ static ssize_t bonding_store_primary(struct device *d,
+ 		goto out;
+ 	}
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (strncmp(slave->dev->name, ifname, IFNAMSIZ) == 0) {
+ 			pr_info("%s: Setting %s as primary slave.\n",
+ 				bond->dev->name, slave->dev->name);
+@@ -1267,16 +1267,14 @@ static ssize_t bonding_store_active_slave(struct device *d,
+ 					  struct device_attribute *attr,
+ 					  const char *buf, size_t count)
+ {
+-	int i;
+-	struct slave *slave;
+-	struct slave *old_active = NULL;
+-	struct slave *new_active = NULL;
++	struct slave *slave, *old_active, *new_active;
+ 	struct bonding *bond = to_bond(d);
+ 	char ifname[IFNAMSIZ];
+ 
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+ 
++	old_active = new_active = NULL;
+ 	block_netpoll_tx();
+ 	read_lock(&bond->lock);
+ 	write_lock_bh(&bond->curr_slave_lock);
+@@ -1298,7 +1296,7 @@ static ssize_t bonding_store_active_slave(struct device *d,
+ 		goto out;
+ 	}
+ 
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (strncmp(slave->dev->name, ifname, IFNAMSIZ) == 0) {
+ 			old_active = bond->curr_active_slave;
+ 			new_active = slave;
+@@ -1482,15 +1480,15 @@ static ssize_t bonding_show_queue_id(struct device *d,
+ 				     struct device_attribute *attr,
+ 				     char *buf)
+ {
+-	struct slave *slave;
+-	int i, res = 0;
+ 	struct bonding *bond = to_bond(d);
++	struct slave *slave;
++	int res = 0;
+ 
+ 	if (!rtnl_trylock())
+ 		return restart_syscall();
+ 
+ 	read_lock(&bond->lock);
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (res > (PAGE_SIZE - IFNAMSIZ - 6)) {
+ 			/* not enough space for another interface_name:queue_id pair */
+ 			if ((PAGE_SIZE - res) > 10)
+@@ -1505,6 +1503,7 @@ static ssize_t bonding_show_queue_id(struct device *d,
+ 	if (res)
+ 		buf[res-1] = '\n'; /* eat the leftover space */
+ 	rtnl_unlock();
++
+ 	return res;
+ }
+ 
+@@ -1519,7 +1518,7 @@ static ssize_t bonding_store_queue_id(struct device *d,
+ 	struct slave *slave, *update_slave;
+ 	struct bonding *bond = to_bond(d);
+ 	u16 qid;
+-	int i, ret = count;
++	int ret = count;
+ 	char *delim;
+ 	struct net_device *sdev = NULL;
+ 
+@@ -1554,7 +1553,7 @@ static ssize_t bonding_store_queue_id(struct device *d,
+ 
+ 	/* Search for thes slave and check for duplicate qids */
+ 	update_slave = NULL;
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (sdev == slave->dev)
+ 			/*
+ 			 * We don't need to check the matching
+@@ -1606,8 +1605,8 @@ static ssize_t bonding_store_slaves_active(struct device *d,
+ 					   struct device_attribute *attr,
+ 					   const char *buf, size_t count)
+ {
+-	int i, new_value, ret = count;
+ 	struct bonding *bond = to_bond(d);
++	int new_value, ret = count;
+ 	struct slave *slave;
+ 
+ 	if (sscanf(buf, "%d", &new_value) != 1) {
+@@ -1630,7 +1629,7 @@ static ssize_t bonding_store_slaves_active(struct device *d,
+ 	}
+ 
+ 	read_lock(&bond->lock);
+-	bond_for_each_slave(bond, slave, i) {
++	bond_for_each_slave(bond, slave) {
+ 		if (!bond_is_active_slave(slave)) {
+ 			if (new_value)
+ 				slave->inactive = 0;
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index 4bb1446618e2..f2b5faaf4fb1 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -71,6 +71,28 @@
+ 	set_fs(fs);			\
+ 	res; })
+ 
++/* slave list primitives */
++#define bond_to_slave(ptr) list_entry(ptr, struct slave, list)
++
++/* IMPORTANT: bond_first/last_slave can return NULL in case of an empty list */
++#define bond_first_slave(bond) \
++	list_first_entry_or_null(&(bond)->slave_list, struct slave, list)
++#define bond_last_slave(bond) \
++	(list_empty(&(bond)->slave_list) ? NULL : \
++					   bond_to_slave((bond)->slave_list.prev))
++
++#define bond_is_first_slave(bond, pos) ((pos)->list.prev == &(bond)->slave_list)
++#define bond_is_last_slave(bond, pos) ((pos)->list.next == &(bond)->slave_list)
++
++/* Since bond_first/last_slave can return NULL, these can return NULL too */
++#define bond_next_slave(bond, pos) \
++	(bond_is_last_slave(bond, pos) ? bond_first_slave(bond) : \
++					 bond_to_slave((pos)->list.next))
++
++#define bond_prev_slave(bond, pos) \
++	(bond_is_first_slave(bond, pos) ? bond_last_slave(bond) : \
++					  bond_to_slave((pos)->list.prev))
++
+ /**
+  * bond_for_each_slave_from - iterate the slaves list from a starting point
+  * @bond:	the bond holding this list.
+@@ -80,37 +102,29 @@
+  *
+  * Caller must hold bond->lock
+  */
+-#define bond_for_each_slave_from(bond, pos, cnt, start)	\
+-	for (cnt = 0, pos = start;				\
+-	     cnt < (bond)->slave_cnt;				\
+-             cnt++, pos = (pos)->next)
++#define bond_for_each_slave_from(bond, pos, cnt, start) \
++	for (cnt = 0, pos = start; pos && cnt < (bond)->slave_cnt; \
++	     cnt++, pos = bond_next_slave(bond, pos))
+ 
+ /**
+- * bond_for_each_slave_from_to - iterate the slaves list from start point to stop point
+- * @bond:	the bond holding this list.
+- * @pos:	current slave.
+- * @cnt:	counter for number max of moves
+- * @start:	start point.
+- * @stop:	stop point.
++ * bond_for_each_slave - iterate over all slaves
++ * @bond:	the bond holding this list
++ * @pos:	current slave
+  *
+  * Caller must hold bond->lock
+  */
+-#define bond_for_each_slave_from_to(bond, pos, cnt, start, stop)	\
+-	for (cnt = 0, pos = start;					\
+-	     ((cnt < (bond)->slave_cnt) && (pos != (stop)->next));	\
+-             cnt++, pos = (pos)->next)
++#define bond_for_each_slave(bond, pos) \
++	list_for_each_entry(pos, &(bond)->slave_list, list)
+ 
+ /**
+- * bond_for_each_slave - iterate the slaves list from head
+- * @bond:	the bond holding this list.
+- * @pos:	current slave.
+- * @cnt:	counter for max number of moves
++ * bond_for_each_slave_reverse - iterate in reverse from a given position
++ * @bond:	the bond holding this list
++ * @pos:	slave to continue from
+  *
+  * Caller must hold bond->lock
+  */
+-#define bond_for_each_slave(bond, pos, cnt)	\
+-		bond_for_each_slave_from(bond, pos, cnt, (bond)->first_slave)
+-
++#define bond_for_each_slave_continue_reverse(bond, pos) \
++	list_for_each_entry_continue_reverse(pos, &(bond)->slave_list, list)
+ 
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ extern atomic_t netpoll_block_tx;
+@@ -174,8 +188,7 @@ struct vlan_entry {
+ 
+ struct slave {
+ 	struct net_device *dev; /* first - useful for panic debug */
+-	struct slave *next;
+-	struct slave *prev;
++	struct list_head list;
+ 	struct bonding *bond; /* our master */
+ 	int    delay;
+ 	unsigned long jiffies;
+@@ -215,7 +228,7 @@ struct slave {
+  */
+ struct bonding {
+ 	struct   net_device *dev; /* first - useful for panic debug */
+-	struct   slave *first_slave;
++	struct   list_head slave_list;
+ 	struct   slave *curr_active_slave;
+ 	struct   slave *current_arp_slave;
+ 	struct   slave *primary_slave;
+@@ -271,13 +284,10 @@ static inline struct slave *bond_get_slave_by_dev(struct bonding *bond,
+ 						  struct net_device *slave_dev)
+ {
+ 	struct slave *slave = NULL;
+-	int i;
+ 
+-	bond_for_each_slave(bond, slave, i) {
+-		if (slave->dev == slave_dev) {
++	bond_for_each_slave(bond, slave)
++		if (slave->dev == slave_dev)
+ 			return slave;
+-		}
+-	}
+ 
+ 	return NULL;
+ }
+@@ -478,10 +488,9 @@ static inline void bond_destroy_proc_dir(struct bond_net *bn)
+ static inline struct slave *bond_slave_has_mac(struct bonding *bond,
+ 					       const u8 *mac)
+ {
+-	int i = 0;
+ 	struct slave *tmp;
+ 
+-	bond_for_each_slave(bond, tmp, i)
++	bond_for_each_slave(bond, tmp)
+ 		if (ether_addr_equal_64bits(mac, tmp->dev->dev_addr))
+ 			return tmp;
+ 
