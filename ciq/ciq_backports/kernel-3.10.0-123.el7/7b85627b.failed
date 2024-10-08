@@ -1,0 +1,176 @@
+IB/cma: IBoE (RoCE) IP-based GID addressing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+Rebuild_CHGLOG: - [infiniband] cma: IBoE (RoCE) IP based GID addressing (Doug Ledford) [1051187]
+Rebuild_FUZZ: 93.98%
+commit-author Moni Shoua <monis@mellanox.com>
+commit 7b85627b9f02f9b0fb2ef5f021807f4251135857
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/7b85627b.failed
+
+Currently, the IB core and specifically the RDMA-CM assumes that IBoE
+(RoCE) gids encode related Ethernet netdevice interface MAC address
+and possibly VLAN id.
+
+Change GIDs to be treated as they encode interface IP address.
+
+Since Ethernet layer 2 address parameters are not longer encoded
+within gids, we have to extend the Infiniband address structures (e.g.
+ib_ah_attr) with layer 2 address parameters, namely mac and vlan.
+
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Roland Dreier <roland@purestorage.com>
+(cherry picked from commit 7b85627b9f02f9b0fb2ef5f021807f4251135857)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+#	include/rdma/ib_addr.h
+diff --cc drivers/infiniband/core/cma.c
+index 7fff706b114d,907f3d3f1172..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -1897,10 -1941,14 +1899,17 @@@ static int cma_resolve_iboe_route(struc
+  		goto err2;
+  	}
+  
+ -	route->path_rec->vlan_id = rdma_vlan_dev_vlan_id(ndev);
+ -	memcpy(route->path_rec->dmac, addr->dev_addr.dst_dev_addr, ETH_ALEN);
+ -	memcpy(route->path_rec->smac, ndev->dev_addr, ndev->addr_len);
+ +	vid = rdma_vlan_dev_vlan_id(ndev);
+  
+++<<<<<<< HEAD
+ +	iboe_mac_vlan_to_ll(&route->path_rec->sgid, addr->dev_addr.src_dev_addr, vid);
+ +	iboe_mac_vlan_to_ll(&route->path_rec->dgid, addr->dev_addr.dst_dev_addr, vid);
+++=======
++ 	rdma_ip2gid((struct sockaddr *)&id_priv->id.route.addr.src_addr,
++ 		    &route->path_rec->sgid);
++ 	rdma_ip2gid((struct sockaddr *)&id_priv->id.route.addr.dst_addr,
++ 		    &route->path_rec->dgid);
+++>>>>>>> 7b85627b9f02 (IB/cma: IBoE (RoCE) IP-based GID addressing)
+  
+  	route->path_rec->hop_limit = 1;
+  	route->path_rec->reversible = 1;
+diff --cc include/rdma/ib_addr.h
+index f3ac0f2c4c66,ce55906b54a0..000000000000
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@@ -38,10 -38,15 +38,14 @@@
+  #include <linux/in6.h>
+  #include <linux/if_arp.h>
+  #include <linux/netdevice.h>
++ #include <linux/inetdevice.h>
+  #include <linux/socket.h>
+  #include <linux/if_vlan.h>
++ #include <net/ipv6.h>
++ #include <net/if_inet6.h>
++ #include <net/ip.h>
+  #include <rdma/ib_verbs.h>
+  #include <rdma/ib_pack.h>
+ -#include <net/ipv6.h>
+  
+  struct rdma_addr_client {
+  	atomic_t refcount;
+@@@ -126,26 -136,44 +130,51 @@@ static inline int rdma_addr_gid_offset(
+  	return dev_addr->dev_type == ARPHRD_INFINIBAND ? 4 : 0;
+  }
+  
+- static inline void iboe_mac_vlan_to_ll(union ib_gid *gid, u8 *mac, u16 vid)
++ static inline u16 rdma_vlan_dev_vlan_id(const struct net_device *dev)
+  {
+- 	memset(gid->raw, 0, 16);
+- 	*((__be32 *) gid->raw) = cpu_to_be32(0xfe800000);
+- 	if (vid < 0x1000) {
+- 		gid->raw[12] = vid & 0xff;
+- 		gid->raw[11] = vid >> 8;
+- 	} else {
+- 		gid->raw[12] = 0xfe;
+- 		gid->raw[11] = 0xff;
+- 	}
+- 	memcpy(gid->raw + 13, mac + 3, 3);
+- 	memcpy(gid->raw + 8, mac, 3);
+- 	gid->raw[8] ^= 2;
++ 	return dev->priv_flags & IFF_802_1Q_VLAN ?
++ 		vlan_dev_vlan_id(dev) : 0xffff;
+  }
+  
+++<<<<<<< HEAD
+ +static inline u16 rdma_vlan_dev_vlan_id(const struct net_device *dev)
+ +{
+ +	return dev->priv_flags & IFF_802_1Q_VLAN ?
+ +		vlan_dev_vlan_id(dev) : 0xffff;
+++=======
++ static inline int rdma_ip2gid(struct sockaddr *addr, union ib_gid *gid)
++ {
++ 	switch (addr->sa_family) {
++ 	case AF_INET:
++ 		ipv6_addr_set_v4mapped(((struct sockaddr_in *)
++ 					addr)->sin_addr.s_addr,
++ 				       (struct in6_addr *)gid);
++ 		break;
++ 	case AF_INET6:
++ 		memcpy(gid->raw, &((struct sockaddr_in6 *)addr)->sin6_addr, 16);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ /* Important - sockaddr should be a union of sockaddr_in and sockaddr_in6 */
++ static inline int rdma_gid2ip(struct sockaddr *out, union ib_gid *gid)
++ {
++ 	if (ipv6_addr_v4mapped((struct in6_addr *)gid)) {
++ 		struct sockaddr_in *out_in = (struct sockaddr_in *)out;
++ 		memset(out_in, 0, sizeof(*out_in));
++ 		out_in->sin_family = AF_INET;
++ 		memcpy(&out_in->sin_addr.s_addr, gid->raw + 12, 4);
++ 	} else {
++ 		struct sockaddr_in6 *out_in = (struct sockaddr_in6 *)out;
++ 		memset(out_in, 0, sizeof(*out_in));
++ 		out_in->sin6_family = AF_INET6;
++ 		memcpy(&out_in->sin6_addr.s6_addr, gid->raw, 16);
++ 	}
++ 	return 0;
+++>>>>>>> 7b85627b9f02 (IB/cma: IBoE (RoCE) IP-based GID addressing)
+  }
+  
+  static inline void iboe_addr_get_sgid(struct rdma_dev_addr *dev_addr,
+* Unmerged path drivers/infiniband/core/cma.c
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index ab8b1c30b36b..56a4b7ca7ee3 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -655,24 +655,14 @@ static void ucma_copy_ib_route(struct rdma_ucm_query_route_resp *resp,
+ static void ucma_copy_iboe_route(struct rdma_ucm_query_route_resp *resp,
+ 				 struct rdma_route *route)
+ {
+-	struct rdma_dev_addr *dev_addr;
+-	struct net_device *dev;
+-	u16 vid = 0;
+ 
+ 	resp->num_paths = route->num_paths;
+ 	switch (route->num_paths) {
+ 	case 0:
+-		dev_addr = &route->addr.dev_addr;
+-		dev = dev_get_by_index(&init_net, dev_addr->bound_dev_if);
+-			if (dev) {
+-				vid = rdma_vlan_dev_vlan_id(dev);
+-				dev_put(dev);
+-			}
+-
+-		iboe_mac_vlan_to_ll((union ib_gid *) &resp->ib_route[0].dgid,
+-				    dev_addr->dst_dev_addr, vid);
+-		iboe_addr_get_sgid(dev_addr,
+-				   (union ib_gid *) &resp->ib_route[0].sgid);
++		rdma_ip2gid((struct sockaddr *)&route->addr.dst_addr,
++			    (union ib_gid *)&resp->ib_route[0].dgid);
++		rdma_ip2gid((struct sockaddr *)&route->addr.src_addr,
++			    (union ib_gid *)&resp->ib_route[0].sgid);
+ 		resp->ib_route[0].pkey = cpu_to_be16(0xffff);
+ 		break;
+ 	case 2:
+* Unmerged path include/rdma/ib_addr.h
