@@ -1,0 +1,171 @@
+dm crypt: don't allocate pages for a partial request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [md] dm-crypt: don't allocate pages for a partial request (Mike Snitzer) [1205955 752438]
+Rebuild_FUZZ: 98.08%
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit cf2f1abfbd0dba701f7f16ef619e4d2485de3366
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/cf2f1abf.failed
+
+Change crypt_alloc_buffer so that it only ever allocates pages for a
+full request.  This is a prerequisite for the commit "dm crypt: offload
+writes to thread".
+
+This change simplifies the dm-crypt code at the expense of reduced
+throughput in low memory conditions (where allocation for a partial
+request is most useful).
+
+Note: the next commit ("dm crypt: avoid deadlock in mempools") is needed
+to fix a theoretical deadlock.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit cf2f1abfbd0dba701f7f16ef619e4d2485de3366)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index e3eca8135e5f,6199245ea6a6..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -1011,11 -981,6 +999,14 @@@ static struct bio *crypt_alloc_buffer(s
+  		size -= len;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!clone->bi_size) {
+ +		bio_put(clone);
+ +		return NULL;
+ +	}
+ +
+++=======
+++>>>>>>> cf2f1abfbd0d (dm crypt: don't allocate pages for a partial request)
+  	return clone;
+  }
+  
+@@@ -1210,10 -1166,7 +1192,12 @@@ static void kcryptd_crypt_write_convert
+  {
+  	struct crypt_config *cc = io->cc;
+  	struct bio *clone;
+- 	struct dm_crypt_io *new_io;
+  	int crypt_finished;
+++<<<<<<< HEAD
+ +	unsigned out_of_pages = 0;
+ +	unsigned remaining = io->base_bio->bi_size;
+++=======
+++>>>>>>> cf2f1abfbd0d (dm crypt: don't allocate pages for a partial request)
+  	sector_t sector = io->sector;
+  	int r;
+  
+@@@ -1223,81 -1176,30 +1207,106 @@@
+  	crypt_inc_pending(io);
+  	crypt_convert_init(cc, &io->ctx, NULL, io->base_bio, sector);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The allocated buffers can be smaller than the whole bio,
+ +	 * so repeat the whole process until all the data can be handled.
+ +	 */
+ +	while (remaining) {
+ +		clone = crypt_alloc_buffer(io, remaining, &out_of_pages);
+ +		if (unlikely(!clone)) {
+ +			io->error = -ENOMEM;
+ +			break;
+ +		}
+ +
+ +		io->ctx.bio_out = clone;
+ +		io->ctx.idx_out = 0;
+ +
+ +		remaining -= clone->bi_size;
+ +		sector += bio_sectors(clone);
+ +
+ +		crypt_inc_pending(io);
+ +
+ +		r = crypt_convert(cc, &io->ctx);
+ +		if (r < 0)
+ +			io->error = -EIO;
+ +
+ +		crypt_finished = atomic_dec_and_test(&io->ctx.cc_pending);
+ +
+ +		/* Encryption was already finished, submit io now */
+ +		if (crypt_finished) {
+ +			kcryptd_crypt_write_io_submit(io, 0);
+ +
+ +			/*
+ +			 * If there was an error, do not try next fragments.
+ +			 * For async, error is processed in async handler.
+ +			 */
+ +			if (unlikely(r < 0))
+ +				break;
+ +
+ +			io->sector = sector;
+ +		}
+ +
+ +		/*
+ +		 * Out of memory -> run queues
+ +		 * But don't wait if split was due to the io size restriction
+ +		 */
+ +		if (unlikely(out_of_pages))
+ +			congestion_wait(BLK_RW_ASYNC, HZ/100);
+ +
+ +		/*
+ +		 * With async crypto it is unsafe to share the crypto context
+ +		 * between fragments, so switch to a new dm_crypt_io structure.
+ +		 */
+ +		if (unlikely(!crypt_finished && remaining)) {
+ +			new_io = mempool_alloc(cc->io_pool, GFP_NOIO);
+ +			crypt_io_init(new_io, io->cc, io->base_bio, sector);
+ +			crypt_inc_pending(new_io);
+ +			crypt_convert_init(cc, &new_io->ctx, NULL,
+ +					   io->base_bio, sector);
+ +			new_io->ctx.idx_in = io->ctx.idx_in;
+ +			new_io->ctx.offset_in = io->ctx.offset_in;
+ +
+ +			/*
+ +			 * Fragments after the first use the base_io
+ +			 * pending count.
+ +			 */
+ +			if (!io->base_io)
+ +				new_io->base_io = io;
+ +			else {
+ +				new_io->base_io = io->base_io;
+ +				crypt_inc_pending(io->base_io);
+ +				crypt_dec_pending(io);
+ +			}
+ +
+ +			io = new_io;
+ +		}
+++=======
++ 	clone = crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
++ 	if (unlikely(!clone)) {
++ 		io->error = -EIO;
++ 		goto dec;
+++>>>>>>> cf2f1abfbd0d (dm crypt: don't allocate pages for a partial request)
++ 	}
++ 
++ 	io->ctx.bio_out = clone;
++ 	io->ctx.iter_out = clone->bi_iter;
++ 
++ 	sector += bio_sectors(clone);
++ 
++ 	crypt_inc_pending(io);
++ 	r = crypt_convert(cc, &io->ctx);
++ 	if (r)
++ 		io->error = -EIO;
++ 	crypt_finished = atomic_dec_and_test(&io->ctx.cc_pending);
++ 
++ 	/* Encryption was already finished, submit io now */
++ 	if (crypt_finished) {
++ 		kcryptd_crypt_write_io_submit(io, 0);
++ 		io->sector = sector;
+  	}
+  
++ dec:
+  	crypt_dec_pending(io);
+  }
+  
+* Unmerged path drivers/md/dm-crypt.c
