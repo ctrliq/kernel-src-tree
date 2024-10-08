@@ -1,0 +1,99 @@
+intel-iommu: fix off-by-one in pagetable freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-123.el7
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 08336fd218e087cc4fcc458e6b6dcafe8702b098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-123.el7/08336fd2.failed
+
+dma_pte_free_level() has an off-by-one error when checking whether a pte
+is completely covered by a range.  Take for example the case of
+attempting to free pfn 0x0 - 0x1ff, ie.  512 entries covering the first
+2M superpage.
+
+The level_size() is 0x200 and we test:
+
+  static void dma_pte_free_level(...
+	...
+
+	if (!(0 > 0 || 0x1ff < 0 + 0x200)) {
+		...
+	}
+
+Clearly the 2nd test is true, which means we fail to take the branch to
+clear and free the pagetable entry.  As a result, we're leaking
+pagetables and failing to install new pages over the range.
+
+This was found with a PCI device assigned to a QEMU guest using vfio-pci
+without a VGA device present.  The first 1M of guest address space is
+mapped with various combinations of 4K pages, but eventually the range
+is entirely freed and replaced with a 2M contiguous mapping.
+intel-iommu errors out with something like:
+
+  ERROR: DMA PTE for vPFN 0x0 already set (to 5c2b8003 not 849c00083)
+
+In this case 5c2b8003 is the pointer to the previous leaf page that was
+neither freed nor cleared and 849c00083 is the superpage entry that
+we're trying to replace it with.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 08336fd218e087cc4fcc458e6b6dcafe8702b098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index eec0d3e04bf5,59779e19315e..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -890,6 -894,39 +890,42 @@@ static int dma_pte_clear_range(struct d
+  	return order;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dma_pte_free_level(struct dmar_domain *domain, int level,
++ 			       struct dma_pte *pte, unsigned long pfn,
++ 			       unsigned long start_pfn, unsigned long last_pfn)
++ {
++ 	pfn = max(start_pfn, pfn);
++ 	pte = &pte[pfn_level_offset(pfn, level)];
++ 
++ 	do {
++ 		unsigned long level_pfn;
++ 		struct dma_pte *level_pte;
++ 
++ 		if (!dma_pte_present(pte) || dma_pte_superpage(pte))
++ 			goto next;
++ 
++ 		level_pfn = pfn & level_mask(level - 1);
++ 		level_pte = phys_to_virt(dma_pte_addr(pte));
++ 
++ 		if (level > 2)
++ 			dma_pte_free_level(domain, level - 1, level_pte,
++ 					   level_pfn, start_pfn, last_pfn);
++ 
++ 		/* If range covers entire pagetable, free it */
++ 		if (!(start_pfn > level_pfn ||
++ 		      last_pfn < level_pfn + level_size(level) - 1)) {
++ 			dma_clear_pte(pte);
++ 			domain_flush_cache(domain, pte, sizeof(*pte));
++ 			free_pgtable_page(level_pte);
++ 		}
++ next:
++ 		pfn += level_size(level);
++ 	} while (!first_pte_in_page(++pte) && pfn <= last_pfn);
++ }
++ 
+++>>>>>>> 08336fd218e0 (intel-iommu: fix off-by-one in pagetable freeing)
+  /* free page table pages. last level pte should already be cleared */
+  static void dma_pte_free_pagetable(struct dmar_domain *domain,
+  				   unsigned long start_pfn,
+* Unmerged path drivers/iommu/intel-iommu.c
