@@ -1,0 +1,254 @@
+iscsi-target: Move sendtargets parsing into iscsit_process_text_cmd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [iscsi-target] Move sendtargets parsing into iscsit_process_text_cmd (Andy Grover) [1058736]
+Rebuild_FUZZ: 88.33%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 9864ca9d27f75d2716d09dd02b3d62d241194576
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/9864ca9d.failed
+
+This patch moves ISCSI_OP_TEXT PDU buffer sanity checks to
+iscsit_process_text_cmd() code, so that it can be shared
+with iser-target code.
+
+It adds IFC_SENDTARGETS_ALL + iscsi_cmd->text_in_ptr in order
+to save text payload for ISCSI_OP_TEXT_RSP, and updates
+iscsit_release_cmd() to assigned memory.
+
+	Cc: Or Gerlitz <ogerlitz@mellanox.com>
+	Cc: Mike Christie <michaelc@cs.wisc.edu>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9864ca9d27f75d2716d09dd02b3d62d241194576)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/iscsi/iscsi_target.c
+#	drivers/target/iscsi/iscsi_target_core.h
+diff --cc drivers/target/iscsi/iscsi_target.c
+index fe777581f025,30ca1887516b..000000000000
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@@ -1983,14 -1978,99 +1983,105 @@@ static int iscsit_handle_text_cmd
+  		" ExpStatSN: 0x%08x, Length: %u\n", hdr->itt, hdr->cmdsn,
+  		hdr->exp_statsn, payload_length);
+  
+++<<<<<<< HEAD
+ +	rx_size = text_length = payload_length;
+ +	if (text_length) {
+ +		text_in = kzalloc(text_length, GFP_KERNEL);
+++=======
++ 	cmd->iscsi_opcode	= ISCSI_OP_TEXT;
++ 	cmd->i_state		= ISTATE_SEND_TEXTRSP;
++ 	cmd->immediate_cmd	= ((hdr->opcode & ISCSI_OP_IMMEDIATE) ? 1 : 0);
++ 	conn->sess->init_task_tag = cmd->init_task_tag  = hdr->itt;
++ 	cmd->targ_xfer_tag	= 0xFFFFFFFF;
++ 	cmd->cmd_sn		= be32_to_cpu(hdr->cmdsn);
++ 	cmd->exp_stat_sn	= be32_to_cpu(hdr->exp_statsn);
++ 	cmd->data_direction	= DMA_NONE;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(iscsit_setup_text_cmd);
++ 
++ int
++ iscsit_process_text_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
++ 			struct iscsi_text *hdr)
++ {
++ 	unsigned char *text_in = cmd->text_in_ptr, *text_ptr;
++ 	int cmdsn_ret;
++ 
++ 	if (!text_in) {
++ 		pr_err("Unable to locate text_in buffer for sendtargets"
++ 		       " discovery\n");
++ 		goto reject;
++ 	}
++ 	if (strncmp("SendTargets", text_in, 11) != 0) {
++ 		pr_err("Received Text Data that is not"
++ 			" SendTargets, cannot continue.\n");
++ 		goto reject;
++ 	}
++ 	text_ptr = strchr(text_in, '=');
++ 	if (!text_ptr) {
++ 		pr_err("No \"=\" separator found in Text Data,"
++ 			"  cannot continue.\n");
++ 		goto reject;
++ 	}
++ 	if (!strncmp("=All", text_ptr, 4)) {
++ 		cmd->cmd_flags |= IFC_SENDTARGETS_ALL;
++ 	} else {
++ 		pr_err("Unable to locate valid SendTargets=%s value\n", text_ptr);
++ 		goto reject;
++ 	}
++ 
++ 	spin_lock_bh(&conn->cmd_lock);
++ 	list_add_tail(&cmd->i_conn_node, &conn->conn_cmd_list);
++ 	spin_unlock_bh(&conn->cmd_lock);
++ 
++ 	iscsit_ack_from_expstatsn(conn, be32_to_cpu(hdr->exp_statsn));
++ 
++ 	if (!(hdr->opcode & ISCSI_OP_IMMEDIATE)) {
++ 		cmdsn_ret = iscsit_sequence_cmd(conn, cmd, hdr->cmdsn);
++ 		if (cmdsn_ret == CMDSN_ERROR_CANNOT_RECOVER)
++ 			return iscsit_add_reject_from_cmd(
++ 					ISCSI_REASON_PROTOCOL_ERROR,
++ 					1, 0, (unsigned char *)hdr, cmd);
++ 		return 0;
++ 	}
++ 
++ 	return iscsit_execute_cmd(cmd, 0);
++ 
++ reject:
++ 	return iscsit_add_reject_from_cmd(ISCSI_REASON_PROTOCOL_ERROR,
++ 					  0, 0, (unsigned char *)hdr, cmd);
++ }
++ EXPORT_SYMBOL(iscsit_process_text_cmd);
++ 
++ static int
++ iscsit_handle_text_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
++ 		       unsigned char *buf)
++ {
++ 	struct iscsi_text *hdr = (struct iscsi_text *)buf;
++ 	char *text_in = NULL;
++ 	u32 payload_length = ntoh24(hdr->dlength);
++ 	int rx_size, rc;
++ 
++ 	rc = iscsit_setup_text_cmd(conn, cmd, hdr);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	rx_size = payload_length;
++ 	if (payload_length) {
++ 		u32 checksum = 0, data_crc = 0;
++ 		u32 padding = 0, pad_bytes = 0;
++ 		int niov = 0, rx_got;
++ 		struct kvec iov[3];
++ 
++ 		text_in = kzalloc(payload_length, GFP_KERNEL);
+++>>>>>>> 9864ca9d27f7 (iscsi-target: Move sendtargets parsing into iscsit_process_text_cmd)
+  		if (!text_in) {
+  			pr_err("Unable to allocate memory for"
+  				" incoming text parameters\n");
+ -			goto reject;
+ +			return -1;
+  		}
++ 		cmd->text_in_ptr = text_in;
+  
+  		memset(iov, 0, 3 * sizeof(struct kvec));
+  		iov[niov].iov_base	= text_in;
+@@@ -2046,67 -2123,23 +2137,79 @@@
+  			} else {
+  				pr_debug("Got CRC32C DataDigest"
+  					" 0x%08x for %u bytes of text data.\n",
+ -						checksum, payload_length);
+ +						checksum, text_length);
+  			}
+  		}
+ -		text_in[payload_length - 1] = '\0';
+ +		text_in[text_length - 1] = '\0';
+  		pr_debug("Successfully read %d bytes of text"
+++<<<<<<< HEAD
+ +				" data.\n", text_length);
+ +
+ +		if (strncmp("SendTargets", text_in, 11) != 0) {
+ +			pr_err("Received Text Data that is not"
+ +				" SendTargets, cannot continue.\n");
+ +			kfree(text_in);
+ +			return -1;
+ +		}
+ +		text_ptr = strchr(text_in, '=');
+ +		if (!text_ptr) {
+ +			pr_err("No \"=\" separator found in Text Data,"
+ +				"  cannot continue.\n");
+ +			kfree(text_in);
+ +			return -1;
+ +		}
+ +		if (strncmp("=All", text_ptr, 4) != 0) {
+ +			pr_err("Unable to locate All value for"
+ +				" SendTargets key,  cannot continue.\n");
+ +			kfree(text_in);
+ +			return -1;
+ +		}
+ +/*#warning Support SendTargets=(iSCSI Target Name/Nothing) values. */
+ +		kfree(text_in);
+++=======
++ 				" data.\n", payload_length);
+++>>>>>>> 9864ca9d27f7 (iscsi-target: Move sendtargets parsing into iscsit_process_text_cmd)
+  	}
+  
+ -	return iscsit_process_text_cmd(conn, cmd, hdr);
+ +	cmd = iscsit_allocate_cmd(conn, GFP_KERNEL);
+ +	if (!cmd)
+ +		return iscsit_add_reject(conn,
+ +					 ISCSI_REASON_BOOKMARK_NO_RESOURCES, buf);
+  
+++<<<<<<< HEAD
+ +	cmd->iscsi_opcode	= ISCSI_OP_TEXT;
+ +	cmd->i_state		= ISTATE_SEND_TEXTRSP;
+ +	cmd->immediate_cmd	= ((hdr->opcode & ISCSI_OP_IMMEDIATE) ? 1 : 0);
+ +	conn->sess->init_task_tag = cmd->init_task_tag	= hdr->itt;
+ +	cmd->targ_xfer_tag	= 0xFFFFFFFF;
+ +	cmd->cmd_sn		= be32_to_cpu(hdr->cmdsn);
+ +	cmd->exp_stat_sn	= be32_to_cpu(hdr->exp_statsn);
+ +	cmd->data_direction	= DMA_NONE;
+ +
+ +	spin_lock_bh(&conn->cmd_lock);
+ +	list_add_tail(&cmd->i_conn_node, &conn->conn_cmd_list);
+ +	spin_unlock_bh(&conn->cmd_lock);
+ +
+ +	iscsit_ack_from_expstatsn(conn, be32_to_cpu(hdr->exp_statsn));
+ +
+ +	if (!(hdr->opcode & ISCSI_OP_IMMEDIATE)) {
+ +		cmdsn_ret = iscsit_sequence_cmd(conn, cmd,
+ +				(unsigned char *)hdr, hdr->cmdsn);
+ +		if (cmdsn_ret == CMDSN_ERROR_CANNOT_RECOVER)
+ +			return -1;
+ +
+ +		return 0;
+ +	}
+ +
+ +	return iscsit_execute_cmd(cmd, 0);
+++=======
++ reject:
++ 	kfree(cmd->text_in_ptr);
++ 	cmd->text_in_ptr = NULL;
++ 	return iscsit_add_reject_from_cmd(ISCSI_REASON_PROTOCOL_ERROR,
++ 					  0, 0, buf, cmd);
+++>>>>>>> 9864ca9d27f7 (iscsi-target: Move sendtargets parsing into iscsit_process_text_cmd)
+  }
+ -EXPORT_SYMBOL(iscsit_handle_text_cmd);
+  
+  int iscsit_logout_closesession(struct iscsi_cmd *cmd, struct iscsi_conn *conn)
+  {
+diff --cc drivers/target/iscsi/iscsi_target_core.h
+index 9ea9e799ba4f,ad46e73dab4c..000000000000
+--- a/drivers/target/iscsi/iscsi_target_core.h
++++ b/drivers/target/iscsi/iscsi_target_core.h
+@@@ -132,6 -132,8 +132,11 @@@ enum cmd_flags_table 
+  	ICF_CONTIG_MEMORY			= 0x00000020,
+  	ICF_ATTACHED_TO_RQUEUE			= 0x00000040,
+  	ICF_OOO_CMDSN				= 0x00000080,
+++<<<<<<< HEAD
+++=======
++ 	ICF_REJECT_FAIL_CONN			= 0x00000100,
++ 	IFC_SENDTARGETS_ALL			= 0x00000200,
+++>>>>>>> 9864ca9d27f7 (iscsi-target: Move sendtargets parsing into iscsit_process_text_cmd)
+  };
+  
+  /* struct iscsi_cmd->i_state */
+* Unmerged path drivers/target/iscsi/iscsi_target.c
+* Unmerged path drivers/target/iscsi/iscsi_target_core.h
+diff --git a/drivers/target/iscsi/iscsi_target_util.c b/drivers/target/iscsi/iscsi_target_util.c
+index c9790f6fdd89..5763073ebd48 100644
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@ -694,6 +694,7 @@ void iscsit_release_cmd(struct iscsi_cmd *cmd)
+ 	kfree(cmd->seq_list);
+ 	kfree(cmd->tmr_req);
+ 	kfree(cmd->iov_data);
++	kfree(cmd->text_in_ptr);
+ 
+ 	kmem_cache_free(lio_cmd_cache, cmd);
+ }
