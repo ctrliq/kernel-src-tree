@@ -1,0 +1,299 @@
+x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+Rebuild_CHGLOG: - [x86] acpi, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number (Steve Best) [1231358]
+Rebuild_FUZZ: 96.60%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 6b9fb7082409cd4a2c7caf43e3c023ad82dad0d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/6b9fb708.failed
+
+Currently ACPI and ioapic both implement algorithms to map (ioapic, pin)
+to IRQ number. So consolidate the common part into one place, which is
+also preparing for irqdomain support.
+
+It introduces mp_map_gsi_to_irq(), which will be used to allocate IRQ
+number IOAPIC pins when irqdomain is enabled.
+
+Also rename gsi_to_irq() to map_gsi_to_irq(), later we will introduce
+unmap_gsi_to_irq() when enabling IOAPIC hotplug.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Pavel Machek <pavel@ucw.cz>
+Link: http://lkml.kernel.org/r/1402380812-32446-1-git-send-email-jiang.liu@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 6b9fb7082409cd4a2c7caf43e3c023ad82dad0d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/acpi/boot.c
+#	arch/x86/kernel/apic/io_apic.c
+diff --cc arch/x86/kernel/acpi/boot.c
+index e90087442d73,9965afbd71ca..000000000000
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@@ -102,27 -98,17 +102,40 @@@ static u32 isa_irq_to_gsi[NR_IRQS_LEGAC
+  	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+  };
+  
+++<<<<<<< HEAD
+ +static unsigned int gsi_to_irq(unsigned int gsi)
+ +{
+ +	unsigned int irq = gsi + NR_IRQS_LEGACY;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < NR_IRQS_LEGACY; i++) {
+ +		if (isa_irq_to_gsi[i] == gsi) {
+++=======
++ #define	ACPI_INVALID_GSI		INT_MIN
++ 
++ static int map_gsi_to_irq(unsigned int gsi)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < nr_legacy_irqs(); i++)
++ 		if (isa_irq_to_gsi[i] == gsi)
+++>>>>>>> 6b9fb7082409 (x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number)
+  			return i;
+- 		}
+- 	}
+  
+++<<<<<<< HEAD
+ +	/* Provide an identity mapping of gsi == irq
+ +	 * except on truly weird platforms that have
+ +	 * non isa irqs in the first 16 gsis.
+ +	 */
+ +	if (gsi >= NR_IRQS_LEGACY)
+ +		irq = gsi;
+ +	else
+ +		irq = gsi_top + gsi;
+ +
+ +	return irq;
+++=======
++ 	return mp_map_gsi_to_irq(gsi);
+++>>>>>>> 6b9fb7082409 (x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number)
+  }
+  
+  /*
+@@@ -334,6 -320,135 +347,138 @@@ acpi_parse_lapic_nmi(struct acpi_subtab
+  #endif				/*CONFIG_X86_LOCAL_APIC */
+  
+  #ifdef CONFIG_X86_IO_APIC
+++<<<<<<< HEAD
+++=======
++ #define MP_ISA_BUS		0
++ 
++ static void __init mp_override_legacy_irq(u8 bus_irq, u8 polarity, u8 trigger,
++ 					  u32 gsi)
++ {
++ 	int ioapic;
++ 	int pin;
++ 	struct mpc_intsrc mp_irq;
++ 
++ 	/*
++ 	 * Convert 'gsi' to 'ioapic.pin'.
++ 	 */
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0)
++ 		return;
++ 	pin = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	/*
++ 	 * TBD: This check is for faulty timer entries, where the override
++ 	 *      erroneously sets the trigger to level, resulting in a HUGE
++ 	 *      increase of timer interrupts!
++ 	 */
++ 	if ((bus_irq == 0) && (trigger == 3))
++ 		trigger = 1;
++ 
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger << 2) | polarity;
++ 	mp_irq.srcbus = MP_ISA_BUS;
++ 	mp_irq.srcbusirq = bus_irq;	/* IRQ */
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic); /* APIC ID */
++ 	mp_irq.dstirq = pin;	/* INTIN# */
++ 
++ 	mp_save_irq(&mp_irq);
++ 
++ 	/*
++ 	 * Reset default identity mapping if gsi is also an legacy IRQ,
++ 	 * otherwise there will be more than one entry with the same GSI
++ 	 * and acpi_isa_irq_to_gsi() may give wrong result.
++ 	 */
++ 	if (gsi < nr_legacy_irqs() && isa_irq_to_gsi[gsi] == gsi)
++ 		isa_irq_to_gsi[gsi] = ACPI_INVALID_GSI;
++ 	isa_irq_to_gsi[bus_irq] = gsi;
++ }
++ 
++ static int mp_config_acpi_gsi(struct device *dev, u32 gsi, int trigger,
++ 			int polarity)
++ {
++ #ifdef CONFIG_X86_MPPARSE
++ 	struct mpc_intsrc mp_irq;
++ 	struct pci_dev *pdev;
++ 	unsigned char number;
++ 	unsigned int devfn;
++ 	int ioapic;
++ 	u8 pin;
++ 
++ 	if (!acpi_ioapic)
++ 		return 0;
++ 	if (!dev || !dev_is_pci(dev))
++ 		return 0;
++ 
++ 	pdev = to_pci_dev(dev);
++ 	number = pdev->bus->number;
++ 	devfn = pdev->devfn;
++ 	pin = pdev->pin;
++ 	/* print the entry should happen on mptable identically */
++ 	mp_irq.type = MP_INTSRC;
++ 	mp_irq.irqtype = mp_INT;
++ 	mp_irq.irqflag = (trigger == ACPI_EDGE_SENSITIVE ? 4 : 0x0c) |
++ 				(polarity == ACPI_ACTIVE_HIGH ? 1 : 3);
++ 	mp_irq.srcbus = number;
++ 	mp_irq.srcbusirq = (((devfn >> 3) & 0x1f) << 2) | ((pin - 1) & 3);
++ 	ioapic = mp_find_ioapic(gsi);
++ 	mp_irq.dstapic = mpc_ioapic_id(ioapic);
++ 	mp_irq.dstirq = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	mp_save_irq(&mp_irq);
++ #endif
++ 	return 0;
++ }
++ 
++ static int mp_register_gsi(struct device *dev, u32 gsi, int trigger,
++ 			   int polarity)
++ {
++ 	int irq;
++ 	int ioapic;
++ 	int ioapic_pin;
++ 	struct io_apic_irq_attr irq_attr;
++ 	int ret;
++ 
++ 	if (acpi_irq_model != ACPI_IRQ_MODEL_IOAPIC)
++ 		return gsi;
++ 
++ 	/* Don't set up the ACPI SCI because it's already set up */
++ 	if (acpi_gbl_FADT.sci_interrupt == gsi)
++ 		return gsi;
++ 
++ 	irq = map_gsi_to_irq(gsi);
++ 	if (irq < 0)
++ 		return ACPI_INVALID_GSI;
++ 
++ 	ioapic = mp_find_ioapic(gsi);
++ 	if (ioapic < 0) {
++ 		printk(KERN_WARNING "No IOAPIC for GSI %u\n", gsi);
++ 		return gsi;
++ 	}
++ 
++ 	ioapic_pin = mp_find_ioapic_pin(ioapic, gsi);
++ 
++ 	if (ioapic_pin > MP_MAX_IOAPIC_PIN) {
++ 		printk(KERN_ERR "Invalid reference to IOAPIC pin "
++ 		       "%d-%d\n", mpc_ioapic_id(ioapic),
++ 		       ioapic_pin);
++ 		return gsi;
++ 	}
++ 
++ 	if (enable_update_mptable)
++ 		mp_config_acpi_gsi(dev, gsi, trigger, polarity);
++ 
++ 	set_io_apic_irq_attr(&irq_attr, ioapic, ioapic_pin,
++ 			     trigger == ACPI_EDGE_SENSITIVE ? 0 : 1,
++ 			     polarity == ACPI_ACTIVE_HIGH ? 0 : 1);
++ 	ret = io_apic_set_pci_routing(dev, irq, &irq_attr);
++ 	if (ret < 0)
++ 		gsi = ACPI_INVALID_GSI;
++ 
++ 	return gsi;
++ }
++ 
+++>>>>>>> 6b9fb7082409 (x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number)
+  
+  static int __init
+  acpi_parse_ioapic(struct acpi_subtable_header * header, const unsigned long end)
+@@@ -554,13 -674,13 +703,19 @@@ int (*acpi_suspend_lowlevel)(void)
+   */
+  int acpi_register_gsi(struct device *dev, u32 gsi, int trigger, int polarity)
+  {
+ -	unsigned int plat_gsi;
+ +	unsigned int irq;
+ +	unsigned int plat_gsi = gsi;
+  
+++<<<<<<< HEAD
+ +	plat_gsi = (*__acpi_register_gsi)(dev, gsi, trigger, polarity);
+ +	irq = gsi_to_irq(plat_gsi);
+++=======
++ 	plat_gsi = __acpi_register_gsi(dev, gsi, trigger, polarity);
++ 	if (plat_gsi != ACPI_INVALID_GSI)
++ 		return map_gsi_to_irq(plat_gsi);
+++>>>>>>> 6b9fb7082409 (x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number)
+  
+ -	return -1;
+ +	return irq;
+  }
+  EXPORT_SYMBOL_GPL(acpi_register_gsi);
+  
+diff --cc arch/x86/kernel/apic/io_apic.c
+index 07a33b81b46c,7fd9f1befe0b..000000000000
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@@ -996,17 -979,6 +1004,20 @@@ static int pin_2_irq(int idx, int apic
+  	if (mp_irqs[idx].dstirq != pin)
+  		pr_err("broken BIOS or MPTABLE parser, ayiee!!\n");
+  
+++<<<<<<< HEAD
+ +	if (test_bit(bus, mp_bus_not_pci)) {
+ +		irq = mp_irqs[idx].srcbusirq;
+ +	} else {
+ +		u32 gsi = gsi_cfg->gsi_base + pin;
+ +
+ +		if (gsi >= NR_IRQS_LEGACY)
+ +			irq = gsi;
+ +		else
+ +			irq = gsi_top + gsi;
+ +	}
+ +
+++=======
+++>>>>>>> 6b9fb7082409 (x86, ACPI, irq: Consolidate algorithm of mapping (ioapic, pin) to IRQ number)
+  #ifdef CONFIG_X86_32
+  	/*
+  	 * PCI IRQ command line redirection. Yes, limits are hardcoded.
+diff --git a/arch/x86/include/asm/io_apic.h b/arch/x86/include/asm/io_apic.h
+index 7eb3755fee9a..dead1e1e79e6 100644
+--- a/arch/x86/include/asm/io_apic.h
++++ b/arch/x86/include/asm/io_apic.h
+@@ -177,6 +177,7 @@ extern u32 gsi_top;
+ extern int mp_find_ioapic(u32 gsi);
+ extern int mp_find_ioapic_pin(int ioapic, u32 gsi);
+ extern u32 mp_pin_to_gsi(int ioapic, int pin);
++extern int mp_map_gsi_to_irq(u32 gsi);
+ extern void __init mp_register_ioapic(int id, u32 address, u32 gsi_base);
+ extern void __init pre_init_apic_IRQ0(void);
+ 
+@@ -219,6 +220,7 @@ static inline void ioapic_insert_resources(void) { }
+ #define gsi_top (NR_IRQS_LEGACY)
+ static inline int mp_find_ioapic(u32 gsi) { return 0; }
+ static inline u32 mp_pin_to_gsi(int ioapic, int pin) { return UINT_MAX; }
++static inline int mp_map_gsi_to_irq(u32 gsi) { return gsi; }
+ 
+ struct io_apic_irq_attr;
+ static inline int io_apic_set_pci_routing(struct device *dev, int irq,
+* Unmerged path arch/x86/kernel/acpi/boot.c
+* Unmerged path arch/x86/kernel/apic/io_apic.c
