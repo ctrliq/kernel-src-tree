@@ -1,0 +1,201 @@
+IB/qib: Implement qib support for AH notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Harish Chegondi <harish.chegondi@intel.com>
+commit 5418a5abc96f908d31bfecee143fbf330ded60c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/5418a5ab.failed
+
+Additional work is required to create an AH. This patch adds support to
+set the VL correctly.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 5418a5abc96f908d31bfecee143fbf330ded60c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qib/qib_verbs.c
+diff --cc drivers/infiniband/hw/qib/qib_verbs.c
+index c4417a1f33be,96e34f476af6..000000000000
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@@ -1751,131 -1769,30 +1751,150 @@@ static int qib_query_gid(struct ib_devi
+  	return ret;
+  }
+  
+ +static struct ib_pd *qib_alloc_pd(struct ib_device *ibdev,
+ +				  struct ib_ucontext *context,
+ +				  struct ib_udata *udata)
+ +{
+ +	struct qib_ibdev *dev = to_idev(ibdev);
+ +	struct qib_pd *pd;
+ +	struct ib_pd *ret;
+ +
+ +	/*
+ +	 * This is actually totally arbitrary.  Some correctness tests
+ +	 * assume there's a maximum number of PDs that can be allocated.
+ +	 * We don't actually have this limit, but we fail the test if
+ +	 * we allow allocations of more than we report for this value.
+ +	 */
+ +
+ +	pd = kmalloc(sizeof(*pd), GFP_KERNEL);
+ +	if (!pd) {
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto bail;
+ +	}
+ +
+ +	spin_lock(&dev->n_pds_lock);
+ +	if (dev->n_pds_allocated == ib_qib_max_pds) {
+ +		spin_unlock(&dev->n_pds_lock);
+ +		kfree(pd);
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto bail;
+ +	}
+ +
+ +	dev->n_pds_allocated++;
+ +	spin_unlock(&dev->n_pds_lock);
+ +
+ +	/* ib_alloc_pd() will initialize pd->ibpd. */
+ +	pd->user = udata != NULL;
+ +
+ +	ret = &pd->ibpd;
+ +
+ +bail:
+ +	return ret;
+ +}
+ +
+ +static int qib_dealloc_pd(struct ib_pd *ibpd)
+ +{
+ +	struct qib_pd *pd = to_ipd(ibpd);
+ +	struct qib_ibdev *dev = to_idev(ibpd->device);
+ +
+ +	spin_lock(&dev->n_pds_lock);
+ +	dev->n_pds_allocated--;
+ +	spin_unlock(&dev->n_pds_lock);
+ +
+ +	kfree(pd);
+ +
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+  int qib_check_ah(struct ib_device *ibdev, struct ib_ah_attr *ah_attr)
+  {
+ +	/* A multicast address requires a GRH (see ch. 8.4.1). */
+ +	if (ah_attr->dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE) &&
+ +	    ah_attr->dlid != be16_to_cpu(IB_LID_PERMISSIVE) &&
+ +	    !(ah_attr->ah_flags & IB_AH_GRH))
+ +		goto bail;
+ +	if ((ah_attr->ah_flags & IB_AH_GRH) &&
+ +	    ah_attr->grh.sgid_index >= QIB_GUIDS_PER_PORT)
+ +		goto bail;
+ +	if (ah_attr->dlid == 0)
+ +		goto bail;
+ +	if (ah_attr->port_num < 1 ||
+ +	    ah_attr->port_num > ibdev->phys_port_cnt)
+ +		goto bail;
+ +	if (ah_attr->static_rate != IB_RATE_PORT_CURRENT &&
+ +	    ib_rate_to_mult(ah_attr->static_rate) < 0)
+ +		goto bail;
+  	if (ah_attr->sl > 15)
+ -		return -EINVAL;
+ -
+ +		goto bail;
+  	return 0;
+ +bail:
+ +	return -EINVAL;
+  }
+  
+ +/**
+ + * qib_create_ah - create an address handle
+ + * @pd: the protection domain
+ + * @ah_attr: the attributes of the AH
+ + *
+ + * This may be called from interrupt context.
+ + */
+ +static struct ib_ah *qib_create_ah(struct ib_pd *pd,
+ +				   struct ib_ah_attr *ah_attr)
+ +{
+ +	struct qib_ah *ah;
+ +	struct ib_ah *ret;
+ +	struct qib_ibdev *dev = to_idev(pd->device);
+ +	unsigned long flags;
+ +
+ +	if (qib_check_ah(pd->device, ah_attr)) {
+ +		ret = ERR_PTR(-EINVAL);
+ +		goto bail;
+ +	}
+ +
+ +	ah = kmalloc(sizeof(*ah), GFP_ATOMIC);
+ +	if (!ah) {
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto bail;
+ +	}
+ +
+ +	spin_lock_irqsave(&dev->n_ahs_lock, flags);
+ +	if (dev->n_ahs_allocated == ib_qib_max_ahs) {
+ +		spin_unlock_irqrestore(&dev->n_ahs_lock, flags);
+ +		kfree(ah);
+ +		ret = ERR_PTR(-ENOMEM);
+ +		goto bail;
+ +	}
+ +
+ +	dev->n_ahs_allocated++;
+ +	spin_unlock_irqrestore(&dev->n_ahs_lock, flags);
+ +
+ +	/* ib_create_ah() will initialize ah->ibah. */
+ +	ah->attr = *ah_attr;
+ +	atomic_set(&ah->refcount, 0);
+ +
+ +	ret = &ah->ibah;
+ +
+ +bail:
+ +	return ret;
+++=======
++ static void qib_notify_new_ah(struct ib_device *ibdev,
++ 			      struct ib_ah_attr *ah_attr,
++ 			      struct rvt_ah *ah)
++ {
++ 	struct qib_ibport *ibp;
++ 	struct qib_pportdata *ppd;
++ 
++ 	/*
++ 	 * Do not trust reading anything from rvt_ah at this point as it is not
++ 	 * done being setup. We can however modify things which we need to set.
++ 	 */
++ 
++ 	ibp = to_iport(ibdev, ah_attr->port_num);
++ 	ppd = ppd_from_ibp(ibp);
++ 	ah->vl = ibp->sl_to_vl[ah->attr.sl];
++ 	ah->log_pmtu = ilog2(ppd->ibmtu);
+++>>>>>>> 5418a5abc96f (IB/qib: Implement qib support for AH notification)
+  }
+  
+  struct ib_ah *qib_create_qp0_ah(struct qib_ibport *ibp, u16 dlid)
+@@@ -2283,11 -2128,13 +2302,16 @@@ int qib_register_ib_device(struct qib_d
+  	dd->verbs_dev.rdi.driver_f.port_callback = qib_create_port_files;
+  	dd->verbs_dev.rdi.driver_f.get_card_name = qib_get_card_name;
+  	dd->verbs_dev.rdi.driver_f.get_pci_dev = qib_get_pci_dev;
+++<<<<<<< HEAD
+++=======
++ 	dd->verbs_dev.rdi.driver_f.check_ah = qib_check_ah;
++ 	dd->verbs_dev.rdi.driver_f.notify_new_ah = qib_notify_new_ah;
+++>>>>>>> 5418a5abc96f (IB/qib: Implement qib support for AH notification)
+  	dd->verbs_dev.rdi.dparms.props.max_pd = ib_qib_max_pds;
+ -	dd->verbs_dev.rdi.dparms.props.max_ah = ib_qib_max_ahs;
+ -	dd->verbs_dev.rdi.flags = (RVT_FLAG_QP_INIT_DRIVER |
+ +	dd->verbs_dev.rdi.flags = (RVT_FLAG_MR_INIT_DRIVER |
+ +				   RVT_FLAG_QP_INIT_DRIVER |
+  				   RVT_FLAG_CQ_INIT_DRIVER);
+ -	dd->verbs_dev.rdi.dparms.lkey_table_size = qib_lkey_table_size;
+ +
+  
+  	ret = rvt_register_device(&dd->verbs_dev.rdi);
+  	if (ret)
+* Unmerged path drivers/infiniband/hw/qib/qib_verbs.c
