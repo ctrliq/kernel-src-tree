@@ -1,0 +1,169 @@
+staging/rdma/hfi1: Add active and optical cable support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi1: Add active and optical cable support (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 92.16%
+commit-author Easwar Hariharan <easwar.hariharan@intel.com>
+commit 8ebd4cf1852afb56773ce8818da22157bfffa900
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/8ebd4cf1.failed
+
+This patch qualifies and tunes active and optical cables for optimal
+bit error rate and signal integrity settings. These settings are
+fetched from the platform configuration data.
+
+Based on attributes of the QSFP cable as read from the SFF-8636
+compliant memory map, we select the appropriate settings from the
+platform configuration data (examples: TX/RX equalization, enabling
+cable high power, enabling TX/RX clock data recovery mechanisms, and RX
+amplitude control) and apply them to the SERDES and QSFP cable.
+
+The platform configuration data also contains system parameters such
+as maximum power dissipation supported, and the cables are qualified
+based on these parameters. As part of qualifying the cables, the
+correct OfflineDisabledReasons are set for the appropriate scenarios.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Brent R Rothermel <brent.r.rothermel@intel.com>
+	Signed-off-by: Easwar Hariharan <easwar.hariharan@intel.com>
+	Signed-off-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8ebd4cf1852afb56773ce8818da22157bfffa900)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/chip.c
+#	drivers/staging/hfi1/platform.c
+#	drivers/staging/hfi1/platform.h
+#	drivers/staging/hfi1/platform_config.h
+#	drivers/staging/rdma/hfi1/Makefile
+#	drivers/staging/rdma/hfi1/platform_config.h
+diff --cc drivers/staging/hfi1/chip.c
+index 14e892e493d4,4d70a960ff54..000000000000
+--- a/drivers/staging/hfi1/chip.c
++++ b/drivers/staging/hfi1/chip.c
+@@@ -63,6 -63,8 +63,11 @@@
+  #include "pio.h"
+  #include "sdma.h"
+  #include "eprom.h"
+++<<<<<<< HEAD:drivers/staging/hfi1/chip.c
+++=======
++ #include "efivar.h"
++ #include "platform.h"
+++>>>>>>> 8ebd4cf1852a (staging/rdma/hfi1: Add active and optical cable support):drivers/staging/rdma/hfi1/chip.c
+  
+  #define NUM_IB_PORTS 1
+  
+* Unmerged path drivers/staging/hfi1/platform.c
+* Unmerged path drivers/staging/hfi1/platform.h
+* Unmerged path drivers/staging/hfi1/platform_config.h
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
+* Unmerged path drivers/staging/rdma/hfi1/platform_config.h
+* Unmerged path drivers/staging/hfi1/chip.c
+diff --git a/drivers/staging/hfi1/chip.h b/drivers/staging/hfi1/chip.h
+index ba515bd0f585..eaca26d59212 100644
+--- a/drivers/staging/hfi1/chip.h
++++ b/drivers/staging/hfi1/chip.h
+@@ -371,6 +371,9 @@
+ #define NUM_LANE_FIELDS    0x8
+ 
+ /* 8051 general register Field IDs */
++#define LINK_OPTIMIZATION_SETTINGS   0x00
++#define LINK_TUNING_PARAMETERS	     0x02
++#define DC_HOST_COMM_SETTINGS	     0x03
+ #define TX_SETTINGS		     0x06
+ #define VERIFY_CAP_LOCAL_PHY	     0x07
+ #define VERIFY_CAP_LOCAL_FABRIC	     0x08
+@@ -647,10 +650,13 @@ void handle_link_down(struct work_struct *work);
+ void handle_link_downgrade(struct work_struct *work);
+ void handle_link_bounce(struct work_struct *work);
+ void handle_sma_message(struct work_struct *work);
++void reset_qsfp(struct hfi1_pportdata *ppd);
++void qsfp_event(struct work_struct *work);
+ void start_freeze_handling(struct hfi1_pportdata *ppd, int flags);
+ int send_idle_sma(struct hfi1_devdata *dd, u64 message);
++int load_8051_config(struct hfi1_devdata *, u8, u8, u32);
++int read_8051_config(struct hfi1_devdata *, u8, u8, u32 *);
+ int start_link(struct hfi1_pportdata *ppd);
+-void init_qsfp(struct hfi1_pportdata *ppd);
+ int bringup_serdes(struct hfi1_pportdata *ppd);
+ void set_intr_state(struct hfi1_devdata *dd, u32 enable);
+ void apply_link_downgrade_policy(struct hfi1_pportdata *ppd,
+diff --git a/drivers/staging/hfi1/hfi.h b/drivers/staging/hfi1/hfi.h
+index 0d97adeeed76..a7cc9772037a 100644
+--- a/drivers/staging/hfi1/hfi.h
++++ b/drivers/staging/hfi1/hfi.h
+@@ -73,7 +73,7 @@
+ #include "chip.h"
+ #include "mad.h"
+ #include "qsfp.h"
+-#include "platform_config.h"
++#include "platform.h"
+ 
+ /* bumped 1 from s/w major version of TrueScale */
+ #define HFI1_CHIP_VERS_MAJ 3U
+@@ -574,7 +574,8 @@ struct hfi1_pportdata {
+ 	struct kobject sl2sc_kobj;
+ 	struct kobject vl2mtu_kobj;
+ 
+-	/* QSFP support */
++	/* PHY support */
++	u32 port_type;
+ 	struct qsfp_data qsfp_info;
+ 
+ 	/* GUID for this interface, in host order */
+diff --git a/drivers/staging/hfi1/init.c b/drivers/staging/hfi1/init.c
+index 3407ba4affd3..01c90db19cf9 100644
+--- a/drivers/staging/hfi1/init.c
++++ b/drivers/staging/hfi1/init.c
+@@ -499,10 +499,13 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
+ 	INIT_WORK(&ppd->sma_message_work, handle_sma_message);
+ 	INIT_WORK(&ppd->link_bounce_work, handle_link_bounce);
+ 	INIT_WORK(&ppd->linkstate_active_work, receive_interrupt_work);
++	INIT_WORK(&ppd->qsfp_info.qsfp_work, qsfp_event);
++
+ 	mutex_init(&ppd->hls_lock);
+ 	spin_lock_init(&ppd->sdma_alllock);
+ 	spin_lock_init(&ppd->qsfp_info.qsfp_lock);
+ 
++	ppd->qsfp_info.ppd = ppd;
+ 	ppd->sm_trap_qp = 0x0;
+ 	ppd->sa_qp = 0x1;
+ 
+@@ -781,13 +784,6 @@ done:
+ 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+ 			ppd = dd->pport + pidx;
+ 
+-			/* initialize the qsfp if it exists
+-			 * Requires interrupts to be enabled so we are notified
+-			 * when the QSFP completes reset, and has
+-			 * to be done before bringing up the SERDES
+-			 */
+-			init_qsfp(ppd);
+-
+ 			/* start the serdes - must be after interrupts are
+ 			   enabled so we are notified when the link goes up */
+ 			lastfail = bringup_serdes(ppd);
+* Unmerged path drivers/staging/hfi1/platform.c
+* Unmerged path drivers/staging/hfi1/platform.h
+* Unmerged path drivers/staging/hfi1/platform_config.h
+diff --git a/drivers/staging/hfi1/qsfp.h b/drivers/staging/hfi1/qsfp.h
+index 2befe79876a0..a7c86f04f8ee 100644
+--- a/drivers/staging/hfi1/qsfp.h
++++ b/drivers/staging/hfi1/qsfp.h
+@@ -213,7 +213,8 @@ struct qsfp_data {
+ 	u8 cache[QSFP_MAX_NUM_PAGES*128];
+ 	spinlock_t qsfp_lock;
+ 	u8 check_interrupt_flags;
+-	u8 qsfp_interrupt_functional;
++	u8 reset_needed;
++	u8 limiting_active;
+ 	u8 cache_valid;
+ 	u8 cache_refresh_required;
+ };
+* Unmerged path drivers/staging/rdma/hfi1/Makefile
+* Unmerged path drivers/staging/rdma/hfi1/platform_config.h
