@@ -1,0 +1,248 @@
+IB/core: Support for CMA multicast join flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alex Vesker <valex@mellanox.com>
+commit ab15c95a17b3fe8c0e01bb7ce1dd0b657598eb61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/ab15c95a.failed
+
+Added UCMA and CMA support for multicast join flags. Flags are
+passed using UCMA CM join command previously reserved fields.
+Currently supporting two join flags indicating two different
+multicast JoinStates:
+
+1. Full Member:
+   The initiator creates the Multicast group(MCG) if it wasn't
+   previously created, can send Multicast messages to the group
+   and receive messages from the MCG.
+
+2. Send Only Full Member:
+   The initiator creates the Multicast group(MCG) if it wasn't
+   previously created, can send Multicast messages to the group
+   but doesn't receive any messages from the MCG.
+
+   IB: Send Only Full Member requires a query of ClassPortInfo
+       to determine if SM/SA supports this option. If SM/SA
+       doesn't support Send-Only there will be no join request
+       sent and an error will be returned.
+
+   ETH: When Send Only Full Member is requested no IGMP join
+	will be sent.
+
+	Signed-off-by: Alex Vesker <valex@mellanox.com>
+Reviewed by: Hal Rosenstock <hal@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ab15c95a17b3fe8c0e01bb7ce1dd0b657598eb61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+diff --cc drivers/infiniband/core/cma.c
+index 8f362db59ba6,0451307bea18..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -246,6 -314,8 +255,11 @@@ struct cma_multicast 
+  	void			*context;
+  	struct sockaddr_storage	addr;
+  	struct kref		mcref;
+++<<<<<<< HEAD
+++=======
++ 	bool			igmp_joined;
++ 	u8			join_state;
+++>>>>>>> ab15c95a17b3 (IB/core: Support for CMA multicast join flags)
+  };
+  
+  struct cma_work {
+@@@ -3657,9 -3921,13 +3741,16 @@@ static int cma_iboe_join_multicast(stru
+  {
+  	struct iboe_mcast_work *work;
+  	struct rdma_dev_addr *dev_addr = &id_priv->id.route.addr.dev_addr;
+ -	int err = 0;
+ +	int err;
+  	struct sockaddr *addr = (struct sockaddr *)&mc->addr;
+  	struct net_device *ndev = NULL;
+++<<<<<<< HEAD
+++=======
++ 	enum ib_gid_type gid_type;
++ 	bool send_only;
++ 
++ 	send_only = mc->join_state == BIT(SENDONLY_FULLMEMBER_JOIN);
+++>>>>>>> ab15c95a17b3 (IB/core: Support for CMA multicast join flags)
+  
+  	if (cma_zero_addr((struct sockaddr *)&mc->addr))
+  		return -EINVAL;
+@@@ -3689,9 -3957,27 +3780,29 @@@
+  	mc->multicast.ib->rec.rate = iboe_get_rate(ndev);
+  	mc->multicast.ib->rec.hop_limit = 1;
+  	mc->multicast.ib->rec.mtu = iboe_get_mtu(ndev->mtu);
+++<<<<<<< HEAD
+++=======
++ 
++ 	gid_type = id_priv->cma_dev->default_gid_type[id_priv->id.port_num -
++ 		   rdma_start_port(id_priv->cma_dev->device)];
++ 	if (addr->sa_family == AF_INET) {
++ 		if (gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP) {
++ 			mc->multicast.ib->rec.hop_limit = IPV6_DEFAULT_HOPLIMIT;
++ 			if (!send_only) {
++ 				err = cma_igmp_send(ndev, &mc->multicast.ib->rec.mgid,
++ 						    true);
++ 				if (!err)
++ 					mc->igmp_joined = true;
++ 			}
++ 		}
++ 	} else {
++ 		if (gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP)
++ 			err = -ENOTSUPP;
++ 	}
+++>>>>>>> ab15c95a17b3 (IB/core: Support for CMA multicast join flags)
+  	dev_put(ndev);
+ -	if (err || !mc->multicast.ib->rec.mtu) {
+ -		if (!err)
+ -			err = -EINVAL;
+ +	if (!mc->multicast.ib->rec.mtu) {
+ +		err = -EINVAL;
+  		goto out2;
+  	}
+  	rdma_ip2gid((struct sockaddr *)&id_priv->id.route.addr.src_addr,
+@@@ -3730,7 -4016,8 +3841,12 @@@ int rdma_join_multicast(struct rdma_cm_
+  	memcpy(&mc->addr, addr, rdma_addr_size(addr));
+  	mc->context = context;
+  	mc->id_priv = id_priv;
+++<<<<<<< HEAD
+ +
+++=======
++ 	mc->igmp_joined = false;
++ 	mc->join_state = join_state;
+++>>>>>>> ab15c95a17b3 (IB/core: Support for CMA multicast join flags)
+  	spin_lock(&id_priv->lock);
+  	list_add(&mc->list, &id_priv->mc_list);
+  	spin_unlock(&id_priv->lock);
+* Unmerged path drivers/infiniband/core/cma.c
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index 3a342dfaac15..a013f1f9eeb6 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -105,6 +105,7 @@ struct ucma_multicast {
+ 	int			events_reported;
+ 
+ 	u64			uid;
++	u8			join_state;
+ 	struct list_head	list;
+ 	struct sockaddr_storage	addr;
+ };
+@@ -1315,12 +1316,20 @@ static ssize_t ucma_process_join(struct ucma_file *file,
+ 	struct ucma_multicast *mc;
+ 	struct sockaddr *addr;
+ 	int ret;
++	u8 join_state;
+ 
+ 	if (out_len < sizeof(resp))
+ 		return -ENOSPC;
+ 
+ 	addr = (struct sockaddr *) &cmd->addr;
+-	if (cmd->reserved || !cmd->addr_size || (cmd->addr_size != rdma_addr_size(addr)))
++	if (!cmd->addr_size || (cmd->addr_size != rdma_addr_size(addr)))
++		return -EINVAL;
++
++	if (cmd->join_flags == RDMA_MC_JOIN_FLAG_FULLMEMBER)
++		join_state = BIT(FULLMEMBER_JOIN);
++	else if (cmd->join_flags == RDMA_MC_JOIN_FLAG_SENDONLY_FULLMEMBER)
++		join_state = BIT(SENDONLY_FULLMEMBER_JOIN);
++	else
+ 		return -EINVAL;
+ 
+ 	ctx = ucma_get_ctx(file, cmd->id);
+@@ -1333,10 +1342,11 @@ static ssize_t ucma_process_join(struct ucma_file *file,
+ 		ret = -ENOMEM;
+ 		goto err1;
+ 	}
+-
++	mc->join_state = join_state;
+ 	mc->uid = cmd->uid;
+ 	memcpy(&mc->addr, addr, cmd->addr_size);
+-	ret = rdma_join_multicast(ctx->cm_id, (struct sockaddr *) &mc->addr, mc);
++	ret = rdma_join_multicast(ctx->cm_id, (struct sockaddr *)&mc->addr,
++				  join_state, mc);
+ 	if (ret)
+ 		goto err2;
+ 
+@@ -1380,7 +1390,7 @@ static ssize_t ucma_join_ip_multicast(struct ucma_file *file,
+ 	join_cmd.uid = cmd.uid;
+ 	join_cmd.id = cmd.id;
+ 	join_cmd.addr_size = rdma_addr_size((struct sockaddr *) &cmd.addr);
+-	join_cmd.reserved = 0;
++	join_cmd.join_flags = RDMA_MC_JOIN_FLAG_FULLMEMBER;
+ 	memcpy(&join_cmd.addr, &cmd.addr, join_cmd.addr_size);
+ 
+ 	return ucma_process_join(file, &join_cmd, out_len);
+diff --git a/include/rdma/ib_sa.h b/include/rdma/ib_sa.h
+index a8966fa045d1..4d325d79fe8d 100644
+--- a/include/rdma/ib_sa.h
++++ b/include/rdma/ib_sa.h
+@@ -93,6 +93,19 @@ enum ib_sa_selector {
+ 	IB_SA_BEST = 3
+ };
+ 
++/*
++ * There are 4 types of join states:
++ * FullMember, NonMember, SendOnlyNonMember, SendOnlyFullMember.
++ * The order corresponds to JoinState bits in MCMemberRecord.
++ */
++enum ib_sa_mc_join_states {
++	FULLMEMBER_JOIN,
++	NONMEMBER_JOIN,
++	SENDONLY_NONMEBER_JOIN,
++	SENDONLY_FULLMEMBER_JOIN,
++	NUM_JOIN_MEMBERSHIP_TYPES,
++};
++
+ #define IB_SA_CAP_MASK2_SENDONLY_FULL_MEM_SUPPORT	BIT(12)
+ 
+ /*
+diff --git a/include/rdma/rdma_cm.h b/include/rdma/rdma_cm.h
+index 31afb5cdcfb1..ff455e30d9f1 100644
+--- a/include/rdma/rdma_cm.h
++++ b/include/rdma/rdma_cm.h
+@@ -329,11 +329,13 @@ int rdma_disconnect(struct rdma_cm_id *id);
+  *   address.
+  * @id: Communication identifier associated with the request.
+  * @addr: Multicast address identifying the group to join.
++ * @join_state: Multicast JoinState bitmap requested by port.
++ *		Bitmap is based on IB_SA_MCMEMBER_REC_JOIN_STATE bits.
+  * @context: User-defined context associated with the join request, returned
+  * to the user through the private_data pointer in multicast events.
+  */
+ int rdma_join_multicast(struct rdma_cm_id *id, struct sockaddr *addr,
+-			void *context);
++			u8 join_state, void *context);
+ 
+ /**
+  * rdma_leave_multicast - Leave the multicast group specified by the given
+diff --git a/include/uapi/rdma/rdma_user_cm.h b/include/uapi/rdma/rdma_user_cm.h
+index 3066718eb120..01923d463673 100644
+--- a/include/uapi/rdma/rdma_user_cm.h
++++ b/include/uapi/rdma/rdma_user_cm.h
+@@ -244,12 +244,19 @@ struct rdma_ucm_join_ip_mcast {
+ 	__u32 id;
+ };
+ 
++/* Multicast join flags */
++enum {
++	RDMA_MC_JOIN_FLAG_FULLMEMBER,
++	RDMA_MC_JOIN_FLAG_SENDONLY_FULLMEMBER,
++	RDMA_MC_JOIN_FLAG_RESERVED,
++};
++
+ struct rdma_ucm_join_mcast {
+ 	__u64 response;		/* rdma_ucma_create_id_resp */
+ 	__u64 uid;
+ 	__u32 id;
+ 	__u16 addr_size;
+-	__u16 reserved;
++	__u16 join_flags;
+ 	struct sockaddr_storage addr;
+ };
+ 
