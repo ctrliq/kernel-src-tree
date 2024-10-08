@@ -1,0 +1,135 @@
+Target/iscsi,iser: Avoid accepting transport connections during stop stage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+Rebuild_CHGLOG: - [target] iscsi, iser: Avoid accepting transport connections during stop stage (Andy Grover) [1129387]
+Rebuild_FUZZ: 94.37%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 14f4b54fe38f3a8f8392a50b951c8aa43b63687a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/14f4b54f.failed
+
+When the target is in stop stage, iSER transport initiates RDMA disconnects.
+The iSER initiator may wish to establish a new connection over the
+still existing network portal. In this case iSER transport should not
+accept and resume new RDMA connections. In order to learn that, iscsi_np
+is added with enabled flag so the iSER transport can check when deciding
+weather to accept and resume a new connection request.
+
+The iscsi_np is enabled after successful transport setup, and disabled
+before iscsi_np login threads are cleaned up.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Cc: stable@vger.kernel.org # 3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 14f4b54fe38f3a8f8392a50b951c8aa43b63687a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/isert/ib_isert.c
+#	drivers/target/iscsi/iscsi_target_tpg.c
+diff --cc drivers/infiniband/ulp/isert/ib_isert.c
+index 3d8fe41643f4,a1710465faaf..000000000000
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@@ -385,6 -562,15 +385,18 @@@ isert_connect_request(struct rdma_cm_i
+  	struct isert_device *device;
+  	struct ib_device *ib_dev = cma_id->device;
+  	int ret = 0;
+++<<<<<<< HEAD
+++=======
++ 	u8 pi_support;
++ 
++ 	spin_lock_bh(&np->np_thread_lock);
++ 	if (!np->enabled) {
++ 		spin_unlock_bh(&np->np_thread_lock);
++ 		pr_debug("iscsi_np is not enabled, reject connect request\n");
++ 		return rdma_reject(cma_id, NULL, 0);
++ 	}
++ 	spin_unlock_bh(&np->np_thread_lock);
+++>>>>>>> 14f4b54fe38f (Target/iscsi,iser: Avoid accepting transport connections during stop stage)
+  
+  	pr_debug("Entering isert_connect_request cma_id: %p, context: %p\n",
+  		 cma_id, cma_id->context);
+@@@ -456,10 -644,31 +468,30 @@@
+  	}
+  
+  	isert_conn->conn_device = device;
+ -	isert_conn->conn_pd = ib_alloc_pd(isert_conn->conn_device->ib_device);
+ -	if (IS_ERR(isert_conn->conn_pd)) {
+ -		ret = PTR_ERR(isert_conn->conn_pd);
+ -		pr_err("ib_alloc_pd failed for conn %p: ret=%d\n",
+ -		       isert_conn, ret);
+ -		goto out_pd;
+ -	}
+ +	isert_conn->conn_pd = device->dev_pd;
+ +	isert_conn->conn_mr = device->dev_mr;
+  
+++<<<<<<< HEAD
+ +	ret = isert_conn_setup_qp(isert_conn, cma_id);
+++=======
++ 	isert_conn->conn_mr = ib_get_dma_mr(isert_conn->conn_pd,
++ 					   IB_ACCESS_LOCAL_WRITE);
++ 	if (IS_ERR(isert_conn->conn_mr)) {
++ 		ret = PTR_ERR(isert_conn->conn_mr);
++ 		pr_err("ib_get_dma_mr failed for conn %p: ret=%d\n",
++ 		       isert_conn, ret);
++ 		goto out_mr;
++ 	}
++ 
++ 	pi_support = np->tpg_np->tpg->tpg_attrib.t10_pi;
++ 	if (pi_support && !device->pi_capable) {
++ 		pr_err("Protection information requested but not supported\n");
++ 		ret = -EINVAL;
++ 		goto out_mr;
++ 	}
++ 
++ 	ret = isert_conn_setup_qp(isert_conn, cma_id, pi_support);
+++>>>>>>> 14f4b54fe38f (Target/iscsi,iser: Avoid accepting transport connections during stop stage)
+  	if (ret)
+  		goto out_conn_dev;
+  
+diff --cc drivers/target/iscsi/iscsi_target_tpg.c
+index 439260b7d87f,ca1811858afd..000000000000
+--- a/drivers/target/iscsi/iscsi_target_tpg.c
++++ b/drivers/target/iscsi/iscsi_target_tpg.c
+@@@ -182,7 -184,8 +182,12 @@@ static void iscsit_clear_tpg_np_login_t
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	iscsit_reset_np_thread(tpg_np->tpg_np, tpg_np, tpg);
+++=======
++ 	tpg_np->tpg_np->enabled = false;
++ 	iscsit_reset_np_thread(tpg_np->tpg_np, tpg_np, tpg, shutdown);
+++>>>>>>> 14f4b54fe38f (Target/iscsi,iser: Avoid accepting transport connections during stop stage)
+  }
+  
+  void iscsit_clear_tpg_np_login_threads(
+* Unmerged path drivers/infiniband/ulp/isert/ib_isert.c
+diff --git a/drivers/target/iscsi/iscsi_target_core.h b/drivers/target/iscsi/iscsi_target_core.h
+index 9ea9e799ba4f..4245a376cffd 100644
+--- a/drivers/target/iscsi/iscsi_target_core.h
++++ b/drivers/target/iscsi/iscsi_target_core.h
+@@ -760,6 +760,7 @@ struct iscsi_np {
+ 	int			np_ip_proto;
+ 	int			np_sock_type;
+ 	enum np_thread_state_table np_thread_state;
++	bool                    enabled;
+ 	enum iscsi_timer_flags_table np_login_timer_flags;
+ 	u32			np_exports;
+ 	enum np_flags_table	np_flags;
+diff --git a/drivers/target/iscsi/iscsi_target_login.c b/drivers/target/iscsi/iscsi_target_login.c
+index 75c270765182..d806607ff692 100644
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -984,6 +984,7 @@ int iscsi_target_setup_login_socket(
+ 	}
+ 
+ 	np->np_transport = t;
++	np->enabled = true;
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/target/iscsi/iscsi_target_tpg.c
