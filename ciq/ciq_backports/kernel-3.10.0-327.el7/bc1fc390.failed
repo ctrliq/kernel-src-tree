@@ -1,0 +1,170 @@
+ip_tunnel: Add GUE support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-327.el7
+commit-author Tom Herbert <therbert@google.com>
+commit bc1fc390e1728672b5b343b85185fcc1fe41043b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-327.el7/bc1fc390.failed
+
+This patch allows configuring IPIP, sit, and GRE tunnels to use GUE.
+This is very similar to fou excpet that we need to insert the GUE header
+in addition to the UDP header on transmit.
+
+	Signed-off-by: Tom Herbert <therbert@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bc1fc390e1728672b5b343b85185fcc1fe41043b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_tunnel.h
+#	net/ipv4/ip_tunnel.c
+diff --cc include/uapi/linux/if_tunnel.h
+index aee73d0611fb,280d9e092283..000000000000
+--- a/include/uapi/linux/if_tunnel.h
++++ b/include/uapi/linux/if_tunnel.h
+@@@ -57,6 -61,15 +57,18 @@@ enum 
+  };
+  #define IFLA_IPTUN_MAX	(__IFLA_IPTUN_MAX - 1)
+  
+++<<<<<<< HEAD
+++=======
++ enum tunnel_encap_types {
++ 	TUNNEL_ENCAP_NONE,
++ 	TUNNEL_ENCAP_FOU,
++ 	TUNNEL_ENCAP_GUE,
++ };
++ 
++ #define TUNNEL_ENCAP_FLAG_CSUM		(1<<0)
++ #define TUNNEL_ENCAP_FLAG_CSUM6		(1<<1)
++ 
+++>>>>>>> bc1fc390e172 (ip_tunnel: Add GUE support)
+  /* SIT-mode i_flags */
+  #define	SIT_ISATAP	0x0001
+  
+diff --cc net/ipv4/ip_tunnel.c
+index 1129aec53c2c,0bb8e141eacc..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -54,6 -55,8 +54,11 @@@
+  #include <net/net_namespace.h>
+  #include <net/netns/generic.h>
+  #include <net/rtnetlink.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/udp.h>
++ #include <net/gue.h>
+++>>>>>>> bc1fc390e172 (ip_tunnel: Add GUE support)
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+  #include <net/ipv6.h>
+@@@ -479,6 -489,103 +484,106 @@@ drop
+  }
+  EXPORT_SYMBOL_GPL(ip_tunnel_rcv);
+  
+++<<<<<<< HEAD
+++=======
++ static int ip_encap_hlen(struct ip_tunnel_encap *e)
++ {
++ 	switch (e->type) {
++ 	case TUNNEL_ENCAP_NONE:
++ 		return 0;
++ 	case TUNNEL_ENCAP_FOU:
++ 		return sizeof(struct udphdr);
++ 	case TUNNEL_ENCAP_GUE:
++ 		return sizeof(struct udphdr) + sizeof(struct guehdr);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ int ip_tunnel_encap_setup(struct ip_tunnel *t,
++ 			  struct ip_tunnel_encap *ipencap)
++ {
++ 	int hlen;
++ 
++ 	memset(&t->encap, 0, sizeof(t->encap));
++ 
++ 	hlen = ip_encap_hlen(ipencap);
++ 	if (hlen < 0)
++ 		return hlen;
++ 
++ 	t->encap.type = ipencap->type;
++ 	t->encap.sport = ipencap->sport;
++ 	t->encap.dport = ipencap->dport;
++ 	t->encap.flags = ipencap->flags;
++ 
++ 	t->encap_hlen = hlen;
++ 	t->hlen = t->encap_hlen + t->tun_hlen;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(ip_tunnel_encap_setup);
++ 
++ static int fou_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
++ 			    size_t hdr_len, u8 *protocol, struct flowi4 *fl4)
++ {
++ 	struct udphdr *uh;
++ 	__be16 sport;
++ 	bool csum = !!(e->flags & TUNNEL_ENCAP_FLAG_CSUM);
++ 	int type = csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
++ 
++ 	skb = iptunnel_handle_offloads(skb, csum, type);
++ 
++ 	if (IS_ERR(skb))
++ 		return PTR_ERR(skb);
++ 
++ 	/* Get length and hash before making space in skb */
++ 
++ 	sport = e->sport ? : udp_flow_src_port(dev_net(skb->dev),
++ 					       skb, 0, 0, false);
++ 
++ 	skb_push(skb, hdr_len);
++ 
++ 	skb_reset_transport_header(skb);
++ 	uh = udp_hdr(skb);
++ 
++ 	if (e->type == TUNNEL_ENCAP_GUE) {
++ 		struct guehdr *guehdr = (struct guehdr *)&uh[1];
++ 
++ 		guehdr->version = 0;
++ 		guehdr->hlen = 0;
++ 		guehdr->flags = 0;
++ 		guehdr->next_hdr = *protocol;
++ 	}
++ 
++ 	uh->dest = e->dport;
++ 	uh->source = sport;
++ 	uh->len = htons(skb->len);
++ 	uh->check = 0;
++ 	udp_set_csum(!(e->flags & TUNNEL_ENCAP_FLAG_CSUM), skb,
++ 		     fl4->saddr, fl4->daddr, skb->len);
++ 
++ 	*protocol = IPPROTO_UDP;
++ 
++ 	return 0;
++ }
++ 
++ int ip_tunnel_encap(struct sk_buff *skb, struct ip_tunnel *t,
++ 		    u8 *protocol, struct flowi4 *fl4)
++ {
++ 	switch (t->encap.type) {
++ 	case TUNNEL_ENCAP_NONE:
++ 		return 0;
++ 	case TUNNEL_ENCAP_FOU:
++ 	case TUNNEL_ENCAP_GUE:
++ 		return fou_build_header(skb, &t->encap, t->encap_hlen,
++ 					protocol, fl4);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ EXPORT_SYMBOL(ip_tunnel_encap);
++ 
+++>>>>>>> bc1fc390e172 (ip_tunnel: Add GUE support)
+  static int tnl_update_pmtu(struct net_device *dev, struct sk_buff *skb,
+  			    struct rtable *rt, __be16 df)
+  {
+* Unmerged path include/uapi/linux/if_tunnel.h
+* Unmerged path net/ipv4/ip_tunnel.c
