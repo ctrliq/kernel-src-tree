@@ -1,0 +1,625 @@
+mei: disconnect on connection request timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit 18901357e70ae29e3fd1c58712a6847c2ae52eae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/18901357.failed
+
+For the FW with  HBM version >= 2.0 we don't need to reset the whole
+device in case of a particular client failing to connect, it is enough
+to send disconnect a request to bring the device to the stable state.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 18901357e70ae29e3fd1c58712a6847c2ae52eae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/client.c
+#	drivers/misc/mei/debugfs.c
+#	drivers/misc/mei/hbm.c
+#	drivers/misc/mei/hw.h
+#	drivers/misc/mei/interrupt.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/client.c
+index 3c539de435ba,40285e02b612..000000000000
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@@ -448,83 -725,217 +448,256 @@@ bool mei_hbuf_acquire(struct mei_devic
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * mei_cl_disconnect - disconnect host client from the me one
+ + *
+ + * @cl: host client
+ + *
+ + * Locking: called under "dev->device_lock" lock
+ + *
+ + * returns 0 on success, <0 on failure.
+++=======
++  * mei_cl_set_disconnected - set disconnected state and clear
++  *   associated states and resources
++  *
++  * @cl: host client
+   */
+- int mei_cl_disconnect(struct mei_cl *cl)
++ void mei_cl_set_disconnected(struct mei_cl *cl)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 
++ 	if (cl->state == MEI_FILE_DISCONNECTED ||
++ 	    cl->state == MEI_FILE_INITIALIZING)
++ 		return;
++ 
++ 	cl->state = MEI_FILE_DISCONNECTED;
++ 	mei_io_list_flush(&dev->ctrl_rd_list, cl);
++ 	mei_io_list_flush(&dev->ctrl_wr_list, cl);
++ 	cl->mei_flow_ctrl_creds = 0;
++ 	cl->timer_count = 0;
++ 
++ 	if (!cl->me_cl)
++ 		return;
++ 
++ 	if (!WARN_ON(cl->me_cl->connect_count == 0))
++ 		cl->me_cl->connect_count--;
++ 
++ 	if (cl->me_cl->connect_count == 0)
++ 		cl->me_cl->mei_flow_ctrl_creds = 0;
++ 
++ 	mei_me_cl_put(cl->me_cl);
++ 	cl->me_cl = NULL;
++ }
++ 
++ static int mei_cl_set_connecting(struct mei_cl *cl, struct mei_me_client *me_cl)
++ {
++ 	if (!mei_me_cl_get(me_cl))
++ 		return -ENOENT;
++ 
++ 	/* only one connection is allowed for fixed address clients */
++ 	if (me_cl->props.fixed_address) {
++ 		if (me_cl->connect_count) {
++ 			mei_me_cl_put(me_cl);
++ 			return -EBUSY;
++ 		}
++ 	}
++ 
++ 	cl->me_cl = me_cl;
++ 	cl->state = MEI_FILE_CONNECTING;
++ 	cl->me_cl->connect_count++;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * mei_cl_send_disconnect - send disconnect request
++  *
++  * @cl: host client
++  * @cb: callback block
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ static int mei_cl_send_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb)
++ {
++ 	struct mei_device *dev;
++ 	int ret;
++ 
++ 	dev = cl->dev;
++ 
++ 	ret = mei_hbm_cl_disconnect_req(dev, cl);
++ 	cl->status = ret;
++ 	if (ret) {
++ 		cl->state = MEI_FILE_DISCONNECT_REPLY;
++ 		return ret;
++ 	}
++ 
++ 	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
++ 	cl->timer_count = MEI_CONNECT_TIMEOUT;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * mei_cl_irq_disconnect - processes close related operation from
++  *	interrupt thread context - send disconnect request
++  *
++  * @cl: client
++  * @cb: callback block.
++  * @cmpl_list: complete list.
++  *
++  * Return: 0, OK; otherwise, error.
++  */
++ int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
++ 			    struct mei_cl_cb *cmpl_list)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 	u32 msg_slots;
++ 	int slots;
++ 	int ret;
++ 
++ 	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
++ 	slots = mei_hbuf_empty_slots(dev);
++ 
++ 	if (slots < msg_slots)
++ 		return -EMSGSIZE;
++ 
++ 	ret = mei_cl_send_disconnect(cl, cb);
++ 	if (ret)
++ 		list_move_tail(&cb->list, &cmpl_list->list);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * __mei_cl_disconnect - disconnect host client from the me one
++  *     internal function runtime pm has to be already acquired
++  *
++  * @cl: host client
++  *
++  * Return: 0 on success, <0 on failure.
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
++  */
++ static int __mei_cl_disconnect(struct mei_cl *cl)
+  {
+  	struct mei_device *dev;
+  	struct mei_cl_cb *cb;
+  	int rets;
+  
+- 	if (WARN_ON(!cl || !cl->dev))
+- 		return -ENODEV;
+- 
+  	dev = cl->dev;
+  
+++<<<<<<< HEAD
+ +	cl_dbg(dev, cl, "disconnecting");
+ +
+ +	if (cl->state != MEI_FILE_DISCONNECTING)
+ +		return 0;
+ +
+ +	rets = pm_runtime_get(&dev->pdev->dev);
+ +	if (rets < 0 && rets != -EINPROGRESS) {
+ +		pm_runtime_put_noidle(&dev->pdev->dev);
+ +		cl_err(dev, cl, "rpm: get failed %d\n", rets);
+ +		return rets;
+ +	}
+++=======
++ 	if (WARN_ON(!pm_runtime_active(dev->dev)))
++ 		return -EFAULT;
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  
+ -	cl->state = MEI_FILE_DISCONNECTING;
+ -
+ -	cb = mei_io_cb_init(cl, MEI_FOP_DISCONNECT, NULL);
+ -	rets = cb ? 0 : -ENOMEM;
+ -	if (rets)
+ -		goto out;
+ +	cb = mei_io_cb_init(cl, NULL);
+ +	if (!cb) {
+ +		rets = -ENOMEM;
+ +		goto free;
+ +	}
+  
+ -	cl_dbg(dev, cl, "add disconnect cb to control write list\n");
+ -	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+ +	cb->fop_type = MEI_FOP_DISCONNECT;
+  
+  	if (mei_hbuf_acquire(dev)) {
+ -		rets = mei_cl_send_disconnect(cl, cb);
+ -		if (rets) {
+ +		if (mei_hbm_cl_disconnect_req(dev, cl)) {
+ +			rets = -ENODEV;
+  			cl_err(dev, cl, "failed to disconnect.\n");
+ -			goto out;
+ +			goto free;
+  		}
+ -	}
+ +		cl->timer_count = MEI_CONNECT_TIMEOUT;
+ +		mdelay(10); /* Wait for hardware disconnection ready */
+ +		list_add_tail(&cb->list, &dev->ctrl_rd_list.list);
+ +	} else {
+ +		cl_dbg(dev, cl, "add disconnect cb to control write list\n");
+ +		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+  
+ +	}
+  	mutex_unlock(&dev->device_lock);
+ -	wait_event_timeout(cl->wait, cl->state == MEI_FILE_DISCONNECT_REPLY,
+ -			   mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+ +
+ +	wait_event_timeout(cl->wait,
+ +			MEI_FILE_DISCONNECTED == cl->state,
+ +			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+ +
+  	mutex_lock(&dev->device_lock);
+  
+ -	rets = cl->status;
+ -	if (cl->state != MEI_FILE_DISCONNECT_REPLY) {
+ +	if (MEI_FILE_DISCONNECTED == cl->state) {
+ +		rets = 0;
+ +		cl_dbg(dev, cl, "successfully disconnected from FW client.\n");
+ +	} else {
+  		cl_dbg(dev, cl, "timeout on disconnect from FW client.\n");
+  		rets = -ETIME;
+  	}
+  
+++<<<<<<< HEAD
+ +	mei_io_list_flush(&dev->ctrl_rd_list, cl);
+ +	mei_io_list_flush(&dev->ctrl_wr_list, cl);
+ +free:
+++=======
++ out:
++ 	/* we disconnect also on error */
++ 	mei_cl_set_disconnected(cl);
++ 	if (!rets)
++ 		cl_dbg(dev, cl, "successfully disconnected from FW client.\n");
++ 
++ 	mei_io_cb_free(cb);
++ 	return rets;
++ }
++ 
++ /**
++  * mei_cl_disconnect - disconnect host client from the me one
++  *
++  * @cl: host client
++  *
++  * Locking: called under "dev->device_lock" lock
++  *
++  * Return: 0 on success, <0 on failure.
++  */
++ int mei_cl_disconnect(struct mei_cl *cl)
++ {
++ 	struct mei_device *dev;
++ 	int rets;
++ 
++ 	if (WARN_ON(!cl || !cl->dev))
++ 		return -ENODEV;
++ 
++ 	dev = cl->dev;
++ 
++ 	cl_dbg(dev, cl, "disconnecting");
++ 
++ 	if (!mei_cl_is_connected(cl))
++ 		return 0;
++ 
++ 	if (mei_cl_is_fixed_address(cl)) {
++ 		mei_cl_set_disconnected(cl);
++ 		return 0;
++ 	}
++ 
++ 	rets = pm_runtime_get(dev->dev);
++ 	if (rets < 0 && rets != -EINPROGRESS) {
++ 		pm_runtime_put_noidle(dev->dev);
++ 		cl_err(dev, cl, "rpm: get failed %d\n", rets);
++ 		return rets;
++ 	}
++ 
++ 	rets = __mei_cl_disconnect(cl);
++ 
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  	cl_dbg(dev, cl, "rpm: autosuspend\n");
+ -	pm_runtime_mark_last_busy(dev->dev);
+ -	pm_runtime_put_autosuspend(dev->dev);
+ +	pm_runtime_mark_last_busy(&dev->pdev->dev);
+ +	pm_runtime_put_autosuspend(&dev->pdev->dev);
+  
+- 	mei_io_cb_free(cb);
+  	return rets;
+  }
+  
+@@@ -610,18 -1080,26 +783,39 @@@ int mei_cl_connect(struct mei_cl *cl, s
+  	mutex_unlock(&dev->device_lock);
+  	wait_event_timeout(cl->wait,
+  			(cl->state == MEI_FILE_CONNECTED ||
+++<<<<<<< HEAD
+ +			 cl->state == MEI_FILE_DISCONNECTED),
+ +			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+ +	mutex_lock(&dev->device_lock);
+ +
+ +	if (cl->state != MEI_FILE_CONNECTED) {
+ +		cl->state = MEI_FILE_DISCONNECTED;
+ +		/* something went really wrong */
+++=======
++ 			 cl->state == MEI_FILE_DISCONNECT_REQUIRED ||
++ 			 cl->state == MEI_FILE_DISCONNECT_REPLY),
++ 			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
++ 	mutex_lock(&dev->device_lock);
++ 
++ 	if (!mei_cl_is_connected(cl)) {
++ 		if (cl->state == MEI_FILE_DISCONNECT_REQUIRED) {
++ 			mei_io_list_flush(&dev->ctrl_rd_list, cl);
++ 			mei_io_list_flush(&dev->ctrl_wr_list, cl);
++ 			 /* ignore disconnect return valuue;
++ 			  * in case of failure reset will be invoked
++ 			  */
++ 			__mei_cl_disconnect(cl);
++ 			rets = -EFAULT;
++ 			goto out;
++ 		}
++ 
++ 		/* timeout or something went really wrong */
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  		if (!cl->status)
+  			cl->status = -EFAULT;
+ +
+ +		mei_io_list_flush(&dev->ctrl_rd_list, cl);
+ +		mei_io_list_flush(&dev->ctrl_wr_list, cl);
+  	}
+  
+  	rets = cl->status;
+diff --cc drivers/misc/mei/debugfs.c
+index 15554a224d0c,e39cfe6bc5bc..000000000000
+--- a/drivers/misc/mei/debugfs.c
++++ b/drivers/misc/mei/debugfs.c
+@@@ -144,6 -154,10 +144,13 @@@ static ssize_t mei_dbgfs_read_devstate(
+  		pos += scnprintf(buf + pos, bufsz - pos, "hbm features:\n");
+  		pos += scnprintf(buf + pos, bufsz - pos, "\tPG: %01d\n",
+  				 dev->hbm_f_pg_supported);
+++<<<<<<< HEAD
+++=======
++ 		pos += scnprintf(buf + pos, bufsz - pos, "\tDC: %01d\n",
++ 				 dev->hbm_f_dc_supported);
++ 		pos += scnprintf(buf + pos, bufsz - pos, "\tDOT: %01d\n",
++ 				 dev->hbm_f_dot_supported);
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  	}
+  
+  	pos += scnprintf(buf + pos, bufsz - pos, "pg:  %s, %s\n",
+diff --cc drivers/misc/mei/hbm.c
+index 3cb8e1000d69,07a8ea8362a3..000000000000
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@@ -673,6 -771,13 +673,16 @@@ static void mei_hbm_config_features(str
+  	if (dev->version.major_version == HBM_MAJOR_VERSION_PGI &&
+  	    dev->version.minor_version >= HBM_MINOR_VERSION_PGI)
+  		dev->hbm_f_pg_supported = 1;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (dev->version.major_version >= HBM_MAJOR_VERSION_DC)
++ 		dev->hbm_f_dc_supported = 1;
++ 
++ 	/* disconnect on connect timeout instead of link reset */
++ 	if (dev->version.major_version >= HBM_MAJOR_VERSION_DOT)
++ 		dev->hbm_f_dot_supported = 1;
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  }
+  
+  /**
+diff --cc drivers/misc/mei/hw.h
+index 50526f92f092,e961be392fae..000000000000
+--- a/drivers/misc/mei/hw.h
++++ b/drivers/misc/mei/hw.h
+@@@ -46,6 -46,18 +46,21 @@@
+  #define HBM_MINOR_VERSION_PGI               1
+  #define HBM_MAJOR_VERSION_PGI               1
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * MEI version with Dynamic clients support
++  */
++ #define HBM_MINOR_VERSION_DC               0
++ #define HBM_MAJOR_VERSION_DC               2
++ 
++ /*
++  * MEI version with disconnect on connection timeout support
++  */
++ #define HBM_MINOR_VERSION_DOT              0
++ #define HBM_MAJOR_VERSION_DOT              2
++ 
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  /* Host bus message command opcode */
+  #define MEI_HBM_CMD_OP_MSK                  0x7f
+  /* Host bus message command RESPONSE */
+diff --cc drivers/misc/mei/interrupt.c
+index b8d9cfee3e87,89d8e1304077..000000000000
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@@ -583,8 -481,8 +601,13 @@@ void mei_timer(struct work_struct *work
+  	list_for_each_entry(cl, &dev->file_list, link) {
+  		if (cl->timer_count) {
+  			if (--cl->timer_count == 0) {
+++<<<<<<< HEAD
+ +				dev_err(&dev->pdev->dev, "timer: connect/disconnect timeout.\n");
+ +				mei_reset(dev);
+++=======
++ 				dev_err(dev->dev, "timer: connect/disconnect timeout.\n");
++ 				mei_connect_timeout(cl);
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  				goto out;
+  			}
+  		}
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,8bd46cd95b7a..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -93,7 -88,9 +93,13 @@@ enum file_state 
+  	MEI_FILE_CONNECTING,
+  	MEI_FILE_CONNECTED,
+  	MEI_FILE_DISCONNECTING,
+++<<<<<<< HEAD
+ +	MEI_FILE_DISCONNECTED
+++=======
++ 	MEI_FILE_DISCONNECT_REPLY,
++ 	MEI_FILE_DISCONNECT_REQUIRED,
++ 	MEI_FILE_DISCONNECTED,
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  };
+  
+  /* MEI device states */
+@@@ -382,55 -367,97 +388,131 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported  : hbm feature pgi protocol
++  * @hbm_f_dc_supported  : hbm feature dynamic clients
++  * @hbm_f_dot_supported : hbm feature disconnect on timeout
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @allow_fixed_address: allow user space to connect a fixed client
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  * @cl_bus_lock : client bus list lock
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+   */
+  struct mei_device {
+ -	struct device *dev;
+ -	struct cdev cdev;
+ -	int minor;
+ -
+ -	struct mei_cl_cb write_list;
+ -	struct mei_cl_cb write_waiting_list;
+ -	struct mei_cl_cb ctrl_wr_list;
+ -	struct mei_cl_cb ctrl_rd_list;
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+@@@ -477,14 -504,17 +559,19 @@@
+  
+  	struct hbm_version version;
+  	unsigned int hbm_f_pg_supported:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int hbm_f_dc_supported:1;
++ 	unsigned int hbm_f_dot_supported:1;
+++>>>>>>> 18901357e70a (mei: disconnect on connection request timeout)
+  
+ -	struct rw_semaphore me_clients_rwsem;
+ -	struct list_head me_clients;
+ +	struct mei_me_client *me_clients; /* Note: memory has to be allocated */
+  	DECLARE_BITMAP(me_clients_map, MEI_CLIENTS_MAX);
+  	DECLARE_BITMAP(host_clients_map, MEI_CLIENTS_MAX);
+ +	unsigned long me_clients_num;
+ +	unsigned long me_client_presentation_num;
+  	unsigned long me_client_index;
+  
+ -	u32 allow_fixed_address;
+ -
+  	struct mei_cl wd_cl;
+  	enum mei_wd_states wd_state;
+  	bool wd_pending;
+* Unmerged path drivers/misc/mei/client.c
+* Unmerged path drivers/misc/mei/debugfs.c
+* Unmerged path drivers/misc/mei/hbm.c
+* Unmerged path drivers/misc/mei/hw.h
+* Unmerged path drivers/misc/mei/interrupt.c
+* Unmerged path drivers/misc/mei/mei_dev.h
