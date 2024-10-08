@@ -1,0 +1,795 @@
+mm: change invalidatepage prototype to accept length
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-229.el7
+commit-author Lukas Czerner <lczerner@redhat.com>
+commit d47992f86b307985b3215bcf141d56d1849d71df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-229.el7/d47992f8.failed
+
+Currently there is no way to truncate partial page where the end
+truncate point is not at the end of the page. This is because it was not
+needed and the functionality was enough for file system truncate
+operation to work properly. However more file systems now support punch
+hole feature and it can benefit from mm supporting truncating page just
+up to the certain point.
+
+Specifically, with this functionality truncate_inode_pages_range() can
+be changed so it supports truncating partial page at the end of the
+range (currently it will BUG_ON() if 'end' is not at the end of the
+page).
+
+This commit changes the invalidatepage() address space operation
+prototype to accept range to be invalidated and update all the instances
+for it.
+
+We also change the block_invalidatepage() in the same way and actually
+make a use of the new length argument implementing range invalidation.
+
+Actual file system implementations will follow except the file systems
+where the changes are really simple and should not change the behaviour
+in any way .Implementation for truncate_page_range() which will be able
+to accept page unaligned ranges will follow as well.
+
+	Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Hugh Dickins <hughd@google.com>
+(cherry picked from commit d47992f86b307985b3215bcf141d56d1849d71df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/aops.c
+diff --cc fs/gfs2/aops.c
+index 1854901a11de,db0d39f9fba4..000000000000
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@@ -300,57 -282,33 +300,67 @@@ continue_unlock
+  			continue;
+  		}
+  
+ -		if (!wbc->range_cyclic && page->index > end) {
+ -			ret = 1;
+ -			unlock_page(page);
+ -			continue;
+ +		if (!PageDirty(page)) {
+ +			/* someone wrote it for us */
+ +			goto continue_unlock;
+  		}
+  
+ -		if (wbc->sync_mode != WB_SYNC_NONE)
+ -			wait_on_page_writeback(page);
+ -
+ -		if (PageWriteback(page) ||
+ -		    !clear_page_dirty_for_io(page)) {
+ -			unlock_page(page);
+ -			continue;
+ +		if (PageWriteback(page)) {
+ +			if (wbc->sync_mode != WB_SYNC_NONE)
+ +				wait_on_page_writeback(page);
+ +			else
+ +				goto continue_unlock;
+  		}
+  
+++<<<<<<< HEAD
+ +		BUG_ON(PageWriteback(page));
+ +		if (!clear_page_dirty_for_io(page))
+ +			goto continue_unlock;
+ +
+ +		trace_wbc_writepage(wbc, mapping->backing_dev_info);
+++=======
++ 		/* Is the page fully outside i_size? (truncate in progress) */
++ 		if (page->index > end_index || (page->index == end_index && !offset)) {
++ 			page->mapping->a_ops->invalidatepage(page, 0,
++ 							     PAGE_CACHE_SIZE);
++ 			unlock_page(page);
++ 			continue;
++ 		}
+++>>>>>>> d47992f86b30 (mm: change invalidatepage prototype to accept length)
+  
+  		ret = __gfs2_jdata_writepage(page, wbc);
+ +		if (unlikely(ret)) {
+ +			if (ret == AOP_WRITEPAGE_ACTIVATE) {
+ +				unlock_page(page);
+ +				ret = 0;
+ +			} else {
+ +
+ +				/*
+ +				 * done_index is set past this page,
+ +				 * so media errors will not choke
+ +				 * background writeout for the entire
+ +				 * file. This has consequences for
+ +				 * range_cyclic semantics (ie. it may
+ +				 * not be suitable for data integrity
+ +				 * writeout).
+ +				 */
+ +				*done_index = page->index + 1;
+ +				ret = 1;
+ +				break;
+ +			}
+ +		}
+  
+ -		if (ret || (--(wbc->nr_to_write) <= 0))
+ +		/*
+ +		 * We stop writing back only if we are not doing
+ +		 * integrity sync. In case of integrity sync we have to
+ +		 * keep going until we have written all the pages
+ +		 * we tagged for writeback prior to entering this loop.
+ +		 */
+ +		if (--wbc->nr_to_write <= 0 && wbc->sync_mode == WB_SYNC_NONE) {
+  			ret = 1;
+ +			break;
+ +		}
+ +
+  	}
+  	gfs2_trans_end(sdp);
+  	return ret;
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index ad6a5a7a678c..a2eb086f3029 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -187,7 +187,7 @@ prototypes:
+ 				loff_t pos, unsigned len, unsigned copied,
+ 				struct page *page, void *fsdata);
+ 	sector_t (*bmap)(struct address_space *, sector_t);
+-	int (*invalidatepage) (struct page *, unsigned long);
++	void (*invalidatepage) (struct page *, unsigned int, unsigned int);
+ 	int (*releasepage) (struct page *, int);
+ 	void (*freepage)(struct page *);
+ 	int (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
+@@ -308,8 +308,8 @@ filesystems and by the swapper. The latter will eventually go away.  Please,
+ keep it that way and don't breed new callers.
+ 
+ 	->invalidatepage() is called when the filesystem must attempt to drop
+-some or all of the buffers from the page when it is being truncated.  It
+-returns zero on success.  If ->invalidatepage is zero, the kernel uses
++some or all of the buffers from the page when it is being truncated. It
++returns zero on success. If ->invalidatepage is zero, the kernel uses
+ block_invalidatepage() instead.
+ 
+ 	->releasepage() is called when the kernel is about to try to drop the
+diff --git a/Documentation/filesystems/vfs.txt b/Documentation/filesystems/vfs.txt
+index 17a310f1b313..49ad88d6f897 100644
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@ -550,7 +550,7 @@ struct address_space_operations
+ -------------------------------
+ 
+ This describes how the VFS can manipulate mapping of a file to page cache in
+-your filesystem. As of kernel 2.6.22, the following members are defined:
++your filesystem. The following members are defined:
+ 
+ struct address_space_operations {
+ 	int (*writepage)(struct page *page, struct writeback_control *wbc);
+@@ -567,7 +567,7 @@ struct address_space_operations {
+ 				loff_t pos, unsigned len, unsigned copied,
+ 				struct page *page, void *fsdata);
+ 	sector_t (*bmap)(struct address_space *, sector_t);
+-	int (*invalidatepage) (struct page *, unsigned long);
++	void (*invalidatepage) (struct page *, unsigned int, unsigned int);
+ 	int (*releasepage) (struct page *, int);
+ 	void (*freepage)(struct page *);
+ 	ssize_t (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
+@@ -686,14 +686,14 @@ struct address_space_operations {
+   invalidatepage: If a page has PagePrivate set, then invalidatepage
+         will be called when part or all of the page is to be removed
+ 	from the address space.  This generally corresponds to either a
+-	truncation or a complete invalidation of the address space
+-	(in the latter case 'offset' will always be 0).
+-	Any private data associated with the page should be updated
+-	to reflect this truncation.  If offset is 0, then
+-	the private data should be released, because the page
+-	must be able to be completely discarded.  This may be done by
+-        calling the ->releasepage function, but in this case the
+-        release MUST succeed.
++	truncation, punch hole  or a complete invalidation of the address
++	space (in the latter case 'offset' will always be 0 and 'length'
++	will be PAGE_CACHE_SIZE). Any private data associated with the page
++	should be updated to reflect this truncation.  If offset is 0 and
++	length is PAGE_CACHE_SIZE, then the private data should be released,
++	because the page must be able to be completely discarded.  This may
++	be done by calling the ->releasepage function, but in this case the
++	release MUST succeed.
+ 
+   releasepage: releasepage is called on PagePrivate pages to indicate
+         that the page should be freed if possible.  ->releasepage
+diff --git a/fs/9p/vfs_addr.c b/fs/9p/vfs_addr.c
+index 055562c580b4..9ff073f4090a 100644
+--- a/fs/9p/vfs_addr.c
++++ b/fs/9p/vfs_addr.c
+@@ -148,13 +148,14 @@ static int v9fs_release_page(struct page *page, gfp_t gfp)
+  * @offset: offset in the page
+  */
+ 
+-static void v9fs_invalidate_page(struct page *page, unsigned long offset)
++static void v9fs_invalidate_page(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	/*
+ 	 * If called with zero offset, we should release
+ 	 * the private state assocated with the page
+ 	 */
+-	if (offset == 0)
++	if (offset == 0 && length == PAGE_CACHE_SIZE)
+ 		v9fs_fscache_invalidate_page(page);
+ }
+ 
+diff --git a/fs/afs/file.c b/fs/afs/file.c
+index 8f6e9234d565..66d50fe2ee45 100644
+--- a/fs/afs/file.c
++++ b/fs/afs/file.c
+@@ -19,7 +19,8 @@
+ #include "internal.h"
+ 
+ static int afs_readpage(struct file *file, struct page *page);
+-static void afs_invalidatepage(struct page *page, unsigned long offset);
++static void afs_invalidatepage(struct page *page, unsigned int offset,
++			       unsigned int length);
+ static int afs_releasepage(struct page *page, gfp_t gfp_flags);
+ static int afs_launder_page(struct page *page);
+ 
+@@ -310,16 +311,17 @@ static int afs_launder_page(struct page *page)
+  * - release a page and clean up its private data if offset is 0 (indicating
+  *   the entire page)
+  */
+-static void afs_invalidatepage(struct page *page, unsigned long offset)
++static void afs_invalidatepage(struct page *page, unsigned int offset,
++			       unsigned int length)
+ {
+ 	struct afs_writeback *wb = (struct afs_writeback *) page_private(page);
+ 
+-	_enter("{%lu},%lu", page->index, offset);
++	_enter("{%lu},%u,%u", page->index, offset, length);
+ 
+ 	BUG_ON(!PageLocked(page));
+ 
+ 	/* we clean up only if the entire page is being invalidated */
+-	if (offset == 0) {
++	if (offset == 0 && length == PAGE_CACHE_SIZE) {
+ #ifdef CONFIG_AFS_FSCACHE
+ 		if (PageFsCache(page)) {
+ 			struct afs_vnode *vnode = AFS_FS_I(page->mapping->host);
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 91a3ae91302d..c1e726d16e73 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1014,7 +1014,8 @@ static int btree_releasepage(struct page *page, gfp_t gfp_flags)
+ 	return try_release_extent_buffer(page);
+ }
+ 
+-static void btree_invalidatepage(struct page *page, unsigned long offset)
++static void btree_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	struct extent_io_tree *tree;
+ 	tree = &BTRFS_I(page->mapping->host)->io_tree;
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 2138a56bf5a0..fb0d7fde6c32 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -3159,7 +3159,7 @@ static int __extent_writepage(struct page *page, struct writeback_control *wbc,
+ 	pg_offset = i_size & (PAGE_CACHE_SIZE - 1);
+ 	if (page->index > end_index ||
+ 	   (page->index == end_index && !pg_offset)) {
+-		page->mapping->a_ops->invalidatepage(page, 0);
++		page->mapping->a_ops->invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 		unlock_page(page);
+ 		return 0;
+ 	}
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 92e4f137d9eb..d58f22376c47 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -7591,7 +7591,8 @@ static int btrfs_releasepage(struct page *page, gfp_t gfp_flags)
+ 	return __btrfs_releasepage(page, gfp_flags & GFP_NOFS);
+ }
+ 
+-static void btrfs_invalidatepage(struct page *page, unsigned long offset)
++static void btrfs_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	struct inode *inode = page->mapping->host;
+ 	struct extent_io_tree *tree;
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 4ac5f28f5861..943c0bdb9fb1 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -1490,7 +1490,8 @@ static void discard_buffer(struct buffer_head * bh)
+  * block_invalidatepage - invalidate part or all of a buffer-backed page
+  *
+  * @page: the page which is affected
+- * @offset: the index of the truncation point
++ * @offset: start of the range to invalidate
++ * @length: length of the range to invalidate
+  *
+  * block_invalidatepage() is called when all or part of the page has become
+  * invalidated by a truncate operation.
+@@ -1501,21 +1502,34 @@ static void discard_buffer(struct buffer_head * bh)
+  * point.  Because the caller is about to free (and possibly reuse) those
+  * blocks on-disk.
+  */
+-void block_invalidatepage(struct page *page, unsigned long offset)
++void block_invalidatepage(struct page *page, unsigned int offset,
++			  unsigned int length)
+ {
+ 	struct buffer_head *head, *bh, *next;
+ 	unsigned int curr_off = 0;
++	unsigned int stop = length + offset;
+ 
+ 	BUG_ON(!PageLocked(page));
+ 	if (!page_has_buffers(page))
+ 		goto out;
+ 
++	/*
++	 * Check for overflow
++	 */
++	BUG_ON(stop > PAGE_CACHE_SIZE || stop < length);
++
+ 	head = page_buffers(page);
+ 	bh = head;
+ 	do {
+ 		unsigned int next_off = curr_off + bh->b_size;
+ 		next = bh->b_this_page;
+ 
++		/*
++		 * Are we still fully in range ?
++		 */
++		if (next_off > stop)
++			goto out;
++
+ 		/*
+ 		 * is this block fully invalidated?
+ 		 */
+@@ -1537,6 +1551,7 @@ out:
+ }
+ EXPORT_SYMBOL(block_invalidatepage);
+ 
++
+ /*
+  * We attach and possibly dirty the buffers atomically wrt
+  * __set_page_dirty_buffers() via private_lock.  try_to_free_buffers
+@@ -2880,7 +2895,7 @@ int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+ 		 * they may have been added in ext3_writepage().  Make them
+ 		 * freeable here, so the page does not leak.
+ 		 */
+-		do_invalidatepage(page, 0);
++		do_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 		unlock_page(page);
+ 		return 0; /* don't care */
+ 	}
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index c869a056c6e6..83906864a545 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -128,7 +128,8 @@ static int ceph_set_page_dirty(struct page *page)
+  * dirty page counters appropriately.  Only called if there is private
+  * data on the page.
+  */
+-static void ceph_invalidatepage(struct page *page, unsigned long offset)
++static void ceph_invalidatepage(struct page *page, unsigned int offset,
++				unsigned int length)
+ {
+ 	struct inode *inode;
+ 	struct ceph_inode_info *ci;
+@@ -149,7 +150,7 @@ static void ceph_invalidatepage(struct page *page, unsigned long offset)
+ 
+ 	ci = ceph_inode(inode);
+ 	if (offset == 0) {
+-		dout("%p invalidatepage %p idx %lu full dirty page %lu\n",
++		dout("%p invalidatepage %p idx %lu full dirty page %u\n",
+ 		     inode, page, page->index, offset);
+ 		ceph_put_wrbuffer_cap_refs(ci, 1, snapc);
+ 		ceph_put_snap_context(snapc);
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index fc9c89fa56b7..7e567873c7f4 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -3636,11 +3636,12 @@ static int cifs_release_page(struct page *page, gfp_t gfp)
+ 	return cifs_fscache_release_page(page, gfp);
+ }
+ 
+-static void cifs_invalidate_page(struct page *page, unsigned long offset)
++static void cifs_invalidate_page(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	struct cifsInodeInfo *cifsi = CIFS_I(page->mapping->host);
+ 
+-	if (offset == 0)
++	if (offset == 0 && length == PAGE_CACHE_SIZE)
+ 		cifs_fscache_invalidate_page(page, &cifsi->vfs_inode);
+ }
+ 
+diff --git a/fs/exofs/inode.c b/fs/exofs/inode.c
+index 3bc143b92bc8..d9ff4d304b41 100644
+--- a/fs/exofs/inode.c
++++ b/fs/exofs/inode.c
+@@ -953,9 +953,11 @@ static int exofs_releasepage(struct page *page, gfp_t gfp)
+ 	return 0;
+ }
+ 
+-static void exofs_invalidatepage(struct page *page, unsigned long offset)
++static void exofs_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+-	EXOFS_DBGMSG("page 0x%lx offset 0x%lx\n", page->index, offset);
++	EXOFS_DBGMSG("page 0x%lx offset 0x%x length 0x%x\n",
++		     page->index, offset, length);
+ 	WARN_ON(1);
+ }
+ 
+diff --git a/fs/ext3/inode.c b/fs/ext3/inode.c
+index 4a9deb6bb224..1a3178ab3338 100644
+--- a/fs/ext3/inode.c
++++ b/fs/ext3/inode.c
+@@ -1825,7 +1825,8 @@ ext3_readpages(struct file *file, struct address_space *mapping,
+ 	return mpage_readpages(mapping, pages, nr_pages, ext3_get_block);
+ }
+ 
+-static void ext3_invalidatepage(struct page *page, unsigned long offset)
++static void ext3_invalidatepage(struct page *page, unsigned int offset,
++				unsigned int length)
+ {
+ 	journal_t *journal = EXT3_JOURNAL(page->mapping->host);
+ 
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 6f7d8149591c..3959b6d66784 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -130,7 +130,8 @@ static inline int ext4_begin_ordered_truncate(struct inode *inode,
+ 						   new_size);
+ }
+ 
+-static void ext4_invalidatepage(struct page *page, unsigned long offset);
++static void ext4_invalidatepage(struct page *page, unsigned int offset,
++				unsigned int length);
+ static int __ext4_journalled_writepage(struct page *page, unsigned int len);
+ static int ext4_bh_delay_or_unwritten(handle_t *handle, struct buffer_head *bh);
+ static int ext4_meta_trans_blocks(struct inode *inode, int lblocks,
+@@ -1448,7 +1449,7 @@ static void ext4_da_block_invalidatepages(struct mpage_da_data *mpd)
+ 				break;
+ 			BUG_ON(!PageLocked(page));
+ 			BUG_ON(PageWriteback(page));
+-			block_invalidatepage(page, 0);
++			block_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 			ClearPageUptodate(page);
+ 			unlock_page(page);
+ 		}
+@@ -2640,7 +2641,8 @@ static int ext4_da_write_end(struct file *file,
+ 	return ret ? ret : copied;
+ }
+ 
+-static void ext4_da_invalidatepage(struct page *page, unsigned long offset)
++static void ext4_da_invalidatepage(struct page *page, unsigned int offset,
++				   unsigned int length)
+ {
+ 	/*
+ 	 * Drop reserved blocks
+@@ -2652,7 +2654,7 @@ static void ext4_da_invalidatepage(struct page *page, unsigned long offset)
+ 	ext4_da_page_release_reservation(page, offset);
+ 
+ out:
+-	ext4_invalidatepage(page, offset);
++	ext4_invalidatepage(page, offset, length);
+ 
+ 	return;
+ }
+@@ -2799,14 +2801,15 @@ ext4_readpages(struct file *file, struct address_space *mapping,
+ 	return mpage_readpages(mapping, pages, nr_pages, ext4_get_block);
+ }
+ 
+-static void ext4_invalidatepage(struct page *page, unsigned long offset)
++static void ext4_invalidatepage(struct page *page, unsigned int offset,
++				unsigned int length)
+ {
+ 	trace_ext4_invalidatepage(page, offset);
+ 
+ 	/* No journalling happens on data buffers when this function is used */
+ 	WARN_ON(page_has_buffers(page) && buffer_jbd(page_buffers(page)));
+ 
+-	block_invalidatepage(page, offset);
++	block_invalidatepage(page, offset, PAGE_CACHE_SIZE - offset);
+ }
+ 
+ static int __ext4_journalled_invalidatepage(struct page *page,
+@@ -2828,7 +2831,8 @@ static int __ext4_journalled_invalidatepage(struct page *page,
+ 
+ /* Wrapper for aops... */
+ static void ext4_journalled_invalidatepage(struct page *page,
+-					   unsigned long offset)
++					   unsigned int offset,
++					   unsigned int length)
+ {
+ 	WARN_ON(__ext4_journalled_invalidatepage(page, offset) < 0);
+ }
+diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+index 91ff93b0b0f4..ce11d9a92aed 100644
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -698,7 +698,8 @@ static ssize_t f2fs_direct_IO(int rw, struct kiocb *iocb,
+ 						  get_data_block_ro);
+ }
+ 
+-static void f2fs_invalidate_data_page(struct page *page, unsigned long offset)
++static void f2fs_invalidate_data_page(struct page *page, unsigned int offset,
++				      unsigned int length)
+ {
+ 	struct inode *inode = page->mapping->host;
+ 	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
+diff --git a/fs/f2fs/node.c b/fs/f2fs/node.c
+index 3df43b4efd89..74f3c7b03eb2 100644
+--- a/fs/f2fs/node.c
++++ b/fs/f2fs/node.c
+@@ -1205,7 +1205,8 @@ static int f2fs_set_node_page_dirty(struct page *page)
+ 	return 0;
+ }
+ 
+-static void f2fs_invalidate_node_page(struct page *page, unsigned long offset)
++static void f2fs_invalidate_node_page(struct page *page, unsigned int offset,
++				      unsigned int length)
+ {
+ 	struct inode *inode = page->mapping->host;
+ 	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
+* Unmerged path fs/gfs2/aops.c
+diff --git a/fs/jfs/jfs_metapage.c b/fs/jfs/jfs_metapage.c
+index 6740d34cd82b..9e3aaff11f89 100644
+--- a/fs/jfs/jfs_metapage.c
++++ b/fs/jfs/jfs_metapage.c
+@@ -571,9 +571,10 @@ static int metapage_releasepage(struct page *page, gfp_t gfp_mask)
+ 	return ret;
+ }
+ 
+-static void metapage_invalidatepage(struct page *page, unsigned long offset)
++static void metapage_invalidatepage(struct page *page, unsigned int offset,
++				    unsigned int length)
+ {
+-	BUG_ON(offset);
++	BUG_ON(offset || length < PAGE_CACHE_SIZE);
+ 
+ 	BUG_ON(PageWriteback(page));
+ 
+diff --git a/fs/logfs/file.c b/fs/logfs/file.c
+index c2219a6dd3c8..57914fc32b62 100644
+--- a/fs/logfs/file.c
++++ b/fs/logfs/file.c
+@@ -159,7 +159,8 @@ static int logfs_writepage(struct page *page, struct writeback_control *wbc)
+ 	return __logfs_writepage(page);
+ }
+ 
+-static void logfs_invalidatepage(struct page *page, unsigned long offset)
++static void logfs_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	struct logfs_block *block = logfs_block(page);
+ 
+diff --git a/fs/logfs/segment.c b/fs/logfs/segment.c
+index 038da0991794..d448a777166b 100644
+--- a/fs/logfs/segment.c
++++ b/fs/logfs/segment.c
+@@ -884,7 +884,8 @@ static struct logfs_area *alloc_area(struct super_block *sb)
+ 	return area;
+ }
+ 
+-static void map_invalidatepage(struct page *page, unsigned long l)
++static void map_invalidatepage(struct page *page, unsigned int o,
++			       unsigned int l)
+ {
+ 	return;
+ }
+diff --git a/fs/nfs/file.c b/fs/nfs/file.c
+index a84a541af4ec..5bb790a69c71 100644
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -443,11 +443,13 @@ static int nfs_write_end(struct file *file, struct address_space *mapping,
+  * - Called if either PG_private or PG_fscache is set on the page
+  * - Caller holds page lock
+  */
+-static void nfs_invalidate_page(struct page *page, unsigned long offset)
++static void nfs_invalidate_page(struct page *page, unsigned int offset,
++				unsigned int length)
+ {
+-	dfprintk(PAGECACHE, "NFS: invalidate_page(%p, %lu)\n", page, offset);
++	dfprintk(PAGECACHE, "NFS: invalidate_page(%p, %u, %u)\n",
++		 page, offset, length);
+ 
+-	if (offset != 0)
++	if (offset != 0 || length < PAGE_CACHE_SIZE)
+ 		return;
+ 	/* Cancel any unstarted writes on this page */
+ 	nfs_wb_page_cancel(page_file_mapping(page)->host, page);
+diff --git a/fs/ntfs/aops.c b/fs/ntfs/aops.c
+index fa9c05f97af4..d267ea6aa1a0 100644
+--- a/fs/ntfs/aops.c
++++ b/fs/ntfs/aops.c
+@@ -1372,7 +1372,7 @@ retry_writepage:
+ 		 * The page may have dirty, unmapped buffers.  Make them
+ 		 * freeable here, so the page does not leak.
+ 		 */
+-		block_invalidatepage(page, 0);
++		block_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 		unlock_page(page);
+ 		ntfs_debug("Write outside i_size - truncated?");
+ 		return 0;
+diff --git a/fs/ocfs2/aops.c b/fs/ocfs2/aops.c
+index 7fee7b2e1225..7c477559f38e 100644
+--- a/fs/ocfs2/aops.c
++++ b/fs/ocfs2/aops.c
+@@ -603,7 +603,8 @@ static void ocfs2_dio_end_io(struct kiocb *iocb,
+  * from ext3.  PageChecked() bits have been removed as OCFS2 does not
+  * do journalled data.
+  */
+-static void ocfs2_invalidatepage(struct page *page, unsigned long offset)
++static void ocfs2_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	journal_t *journal = OCFS2_SB(page->mapping->host->i_sb)->journal->j_journal;
+ 
+diff --git a/fs/reiserfs/inode.c b/fs/reiserfs/inode.c
+index a3aae8634a3e..586561ab5b39 100644
+--- a/fs/reiserfs/inode.c
++++ b/fs/reiserfs/inode.c
+@@ -2975,7 +2975,8 @@ static int invalidatepage_can_drop(struct inode *inode, struct buffer_head *bh)
+ }
+ 
+ /* clm -- taken from fs/buffer.c:block_invalidate_page */
+-static void reiserfs_invalidatepage(struct page *page, unsigned long offset)
++static void reiserfs_invalidatepage(struct page *page, unsigned int offset,
++				    unsigned int length)
+ {
+ 	struct buffer_head *head, *bh, *next;
+ 	struct inode *inode = page->mapping->host;
+diff --git a/fs/ubifs/file.c b/fs/ubifs/file.c
+index 14374530784c..123c79b7261e 100644
+--- a/fs/ubifs/file.c
++++ b/fs/ubifs/file.c
+@@ -1277,13 +1277,14 @@ int ubifs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	return err;
+ }
+ 
+-static void ubifs_invalidatepage(struct page *page, unsigned long offset)
++static void ubifs_invalidatepage(struct page *page, unsigned int offset,
++				 unsigned int length)
+ {
+ 	struct inode *inode = page->mapping->host;
+ 	struct ubifs_info *c = inode->i_sb->s_fs_info;
+ 
+ 	ubifs_assert(PagePrivate(page));
+-	if (offset)
++	if (offset || length < PAGE_CACHE_SIZE)
+ 		/* Partial page remains dirty */
+ 		return;
+ 
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index a509bce7d47e..1cde5ac6bf8a 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -872,10 +872,11 @@ xfs_cluster_write(
+ STATIC void
+ xfs_vm_invalidatepage(
+ 	struct page		*page,
+-	unsigned long		offset)
++	unsigned int		offset,
++	unsigned int		length)
+ {
+ 	trace_xfs_invalidatepage(page->mapping->host, page, offset);
+-	block_invalidatepage(page, offset);
++	block_invalidatepage(page, offset, PAGE_CACHE_SIZE - offset);
+ }
+ 
+ /*
+@@ -939,7 +940,7 @@ next_buffer:
+ 
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ out_invalidate:
+-	xfs_vm_invalidatepage(page, 0);
++	xfs_vm_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 	return;
+ }
+ 
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index f45511e6d2c9..91fa9a94ae92 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -201,7 +201,8 @@ extern int buffer_heads_over_limit;
+  * Generic address_space_operations implementations for buffer_head-backed
+  * address_spaces.
+  */
+-void block_invalidatepage(struct page *page, unsigned long offset);
++void block_invalidatepage(struct page *page, unsigned int offset,
++			  unsigned int length);
+ int block_write_full_page(struct page *page, get_block_t *get_block,
+ 				struct writeback_control *wbc);
+ int block_write_full_page_endio(struct page *page, get_block_t *get_block,
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8171b14c718b..55c572725c76 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -364,7 +364,7 @@ struct address_space_operations {
+ 
+ 	/* Unfortunately this kludge is needed for FIBMAP. Don't use it */
+ 	sector_t (*bmap)(struct address_space *, sector_t);
+-	void (*invalidatepage) (struct page *, unsigned long);
++	void (*invalidatepage) (struct page *, unsigned int, unsigned int);
+ 	int (*releasepage) (struct page *, gfp_t);
+ 	void (*freepage)(struct page *);
+ 	ssize_t (*direct_IO)(int, struct kiocb *, const struct iovec *iov,
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 28efdd22e5c5..d5872a0e54f7 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1151,7 +1151,8 @@ int get_kernel_page(unsigned long start, int write, struct page **pages);
+ struct page *get_dump_page(unsigned long addr);
+ 
+ extern int try_to_release_page(struct page * page, gfp_t gfp_mask);
+-extern void do_invalidatepage(struct page *page, unsigned long offset);
++extern void do_invalidatepage(struct page *page, unsigned int offset,
++			      unsigned int length);
+ 
+ int __set_page_dirty_nobuffers(struct page *page);
+ int __set_page_dirty_no_writeback(struct page *page);
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 6c167419ad04..5c2bbfe232f7 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -48,7 +48,7 @@ static void read_cache_pages_invalidate_page(struct address_space *mapping,
+ 		if (!trylock_page(page))
+ 			BUG();
+ 		page->mapping = mapping;
+-		do_invalidatepage(page, 0);
++		do_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 		page->mapping = NULL;
+ 		unlock_page(page);
+ 	}
+diff --git a/mm/truncate.c b/mm/truncate.c
+index fd8a1ba6db45..472ca56d601a 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -66,7 +66,8 @@ unlock:
+ /**
+  * do_invalidatepage - invalidate part or all of a page
+  * @page: the page which is affected
+- * @offset: the index of the truncation point
++ * @offset: start of the range to invalidate
++ * @length: length of the range to invalidate
+  *
+  * do_invalidatepage() is called when all or part of the page has become
+  * invalidated by a truncate operation.
+@@ -77,16 +78,18 @@ unlock:
+  * point.  Because the caller is about to free (and possibly reuse) those
+  * blocks on-disk.
+  */
+-void do_invalidatepage(struct page *page, unsigned long offset)
++void do_invalidatepage(struct page *page, unsigned int offset,
++		       unsigned int length)
+ {
+-	void (*invalidatepage)(struct page *, unsigned long);
++	void (*invalidatepage)(struct page *, unsigned int, unsigned int);
++
+ 	invalidatepage = page->mapping->a_ops->invalidatepage;
+ #ifdef CONFIG_BLOCK
+ 	if (!invalidatepage)
+ 		invalidatepage = block_invalidatepage;
+ #endif
+ 	if (invalidatepage)
+-		(*invalidatepage)(page, offset);
++		(*invalidatepage)(page, offset, length);
+ }
+ 
+ static inline void truncate_partial_page(struct page *page, unsigned partial)
+@@ -94,7 +97,7 @@ static inline void truncate_partial_page(struct page *page, unsigned partial)
+ 	zero_user_segment(page, partial, PAGE_CACHE_SIZE);
+ 	cleancache_invalidate_page(page->mapping, page);
+ 	if (page_has_private(page))
+-		do_invalidatepage(page, partial);
++		do_invalidatepage(page, partial, PAGE_CACHE_SIZE - partial);
+ }
+ 
+ /*
+@@ -143,7 +146,7 @@ truncate_complete_page(struct address_space *mapping, struct page *page)
+ 		return -EIO;
+ 
+ 	if (page_has_private(page))
+-		do_invalidatepage(page, 0);
++		do_invalidatepage(page, 0, PAGE_CACHE_SIZE);
+ 
+ 	cancel_dirty_page(page, PAGE_CACHE_SIZE);
+ 
