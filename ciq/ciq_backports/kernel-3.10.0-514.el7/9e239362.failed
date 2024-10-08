@@ -1,0 +1,298 @@
+mei: drop iamthif_mtu from device structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Alexander Usyskin <alexander.usyskin@intel.com>
+commit 9e23936279ad339bb1eeb73d298d95b4d986459e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/9e239362.failed
+
+We can receive mtu with one call now, no need to store it.
+
+	Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+	Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9e23936279ad339bb1eeb73d298d95b4d986459e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/misc/mei/amthif.c
+#	drivers/misc/mei/mei_dev.h
+diff --cc drivers/misc/mei/amthif.c
+index a11128c1997f,1e42781592d8..000000000000
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@@ -76,37 -72,9 +76,40 @@@ int mei_amthif_host_init(struct mei_dev
+  
+  	mei_cl_init(cl, dev);
+  
+++<<<<<<< HEAD
+ +	i = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
+ +	if (i < 0) {
+ +		dev_info(&dev->pdev->dev,
+ +			"amthif: failed to find the client %d\n", i);
+ +		return -ENOTTY;
+ +	}
+ +
+ +	cl->me_client_id = dev->me_clients[i].client_id;
+ +
+ +	/* Assign iamthif_mtu to the value received from ME  */
+ +
+ +	dev->iamthif_mtu = dev->me_clients[i].props.max_msg_length;
+ +	dev_dbg(&dev->pdev->dev, "IAMTHIF_MTU = %d\n",
+ +			dev->me_clients[i].props.max_msg_length);
+ +
+ +	kfree(dev->iamthif_msg_buf);
+ +	dev->iamthif_msg_buf = NULL;
+ +
+ +	/* allocate storage for ME message buffer */
+ +	msg_buf = kcalloc(dev->iamthif_mtu,
+ +			sizeof(unsigned char), GFP_KERNEL);
+ +	if (!msg_buf)
+ +		return -ENOMEM;
+ +
+ +	dev->iamthif_msg_buf = msg_buf;
+ +
+++=======
+++>>>>>>> 9e23936279ad (mei: drop iamthif_mtu from device structure)
+  	ret = mei_cl_link(cl, MEI_IAMTHIF_HOST_CLIENT_ID);
+ +
+  	if (ret < 0) {
+ -		dev_err(dev->dev, "amthif: failed cl_link %d\n", ret);
+ +		dev_err(&dev->pdev->dev,
+ +			"amthif: failed link client %d\n", ret);
+  		return ret;
+  	}
+  
+@@@ -257,23 -222,58 +260,62 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * mei_amthif_read_start - queue message for sending read credential
++  *
++  * @cl: host client
++  * @file: file pointer of message recipient
++  *
++  * Return: 0 on success, <0 on failure.
++  */
++ static int mei_amthif_read_start(struct mei_cl *cl, struct file *file)
++ {
++ 	struct mei_device *dev = cl->dev;
++ 	struct mei_cl_cb *cb;
++ 	int rets;
++ 
++ 	cb = mei_io_cb_init(cl, MEI_FOP_READ, file);
++ 	if (!cb) {
++ 		rets = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	rets = mei_io_cb_alloc_buf(cb, mei_cl_mtu(cl));
++ 	if (rets)
++ 		goto err;
++ 
++ 	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
++ 
++ 	dev->iamthif_state = MEI_IAMTHIF_READING;
++ 	dev->iamthif_file_object = cb->file_object;
++ 	dev->iamthif_current_cb = cb;
++ 
++ 	return 0;
++ err:
++ 	mei_io_cb_free(cb);
++ 	return rets;
++ }
++ 
++ /**
+++>>>>>>> 9e23936279ad (mei: drop iamthif_mtu from device structure)
+   * mei_amthif_send_cmd - send amthif command to the ME
+   *
+ - * @cl: the host client
+ + * @dev: the device structure
+   * @cb: mei call back struct
+   *
+ - * Return: 0 on success, <0 on failure.
+ + * returns 0 on success, <0 on failure.
+ + *
+   */
+ -static int mei_amthif_send_cmd(struct mei_cl *cl, struct mei_cl_cb *cb)
+ +static int mei_amthif_send_cmd(struct mei_device *dev, struct mei_cl_cb *cb)
+  {
+ -	struct mei_device *dev;
+ +	struct mei_msg_hdr mei_hdr;
+  	int ret;
+  
+ -	if (!cl->dev || !cb)
+ +	if (!dev || !cb)
+  		return -ENODEV;
+  
+ -	dev = cl->dev;
+ +	dev_dbg(&dev->pdev->dev, "write data to amthif client.\n");
+  
+  	dev->iamthif_state = MEI_IAMTHIF_WRITING;
+  	dev->iamthif_current_cb = cb;
+diff --cc drivers/misc/mei/mei_dev.h
+index 1b981b70f5aa,79ab78184523..000000000000
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@@ -382,55 -427,94 +382,128 @@@ enum mei_pg_state 
+  
+  const char *mei_pg_state_str(enum mei_pg_state state);
+  
+ +/*
+ + * mei_cfg
+ + *
+ + * @fw_status - FW status
+ + * @quirk_probe - device exclusion quirk
+ + */
+ +struct mei_cfg {
+ +	const struct mei_fw_status fw_status;
+ +	bool (*quirk_probe)(struct pci_dev *pdev);
+ +};
+ +
+ +
+ +#define MEI_PCI_DEVICE(dev, cfg) \
+ +	.vendor = PCI_VENDOR_ID_INTEL, .device = (dev), \
+ +	.subvendor = PCI_ANY_ID, .subdevice = PCI_ANY_ID, \
+ +	.driver_data = (kernel_ulong_t)&(cfg)
+ +
+ +
+  /**
+   * struct mei_device -  MEI private device struct
+ +
+ + * @reset_count - limits the number of consecutive resets
+ + * @hbm_state - state of host bus message protocol
+   *
+ - * @dev         : device on a bus
+ - * @cdev        : character device
+ - * @minor       : minor number allocated for device
+ + * @hbm_f_pg_supported - hbm feature pgi protocol
+   *
+++<<<<<<< HEAD
+ + * @pg_event - power gating event
+ + * @mem_addr - mem mapped base register address
+ +
+ + * @hbuf_depth - depth of hardware host/write buffer is slots
+ + * @hbuf_is_ready - query if the host host/write buffer is ready
+ + * @wr_msg - the buffer for hbm control messages
+ + * @cfg - per device generation config and ops
+++=======
++  * @write_list  : write pending list
++  * @write_waiting_list : write completion list
++  * @ctrl_wr_list : pending control write list
++  * @ctrl_rd_list : pending control read list
++  *
++  * @file_list   : list of opened handles
++  * @open_handle_count: number of opened handles
++  *
++  * @device_lock : big device lock
++  * @timer_work  : MEI timer delayed work (timeouts)
++  *
++  * @recvd_hw_ready : hw ready message received flag
++  *
++  * @wait_hw_ready : wait queue for receive HW ready message form FW
++  * @wait_pg     : wait queue for receive PG message from FW
++  * @wait_hbm_start : wait queue for receive HBM start message from FW
++  * @wait_stop_wd : wait queue for receive WD stop message from FW
++  *
++  * @reset_count : number of consecutive resets
++  * @dev_state   : device state
++  * @hbm_state   : state of host bus message protocol
++  * @init_clients_timer : HBM init handshake timeout
++  *
++  * @pg_event    : power gating event
++  * @pg_domain   : runtime PM domain
++  *
++  * @rd_msg_buf  : control messages buffer
++  * @rd_msg_hdr  : read message header storage
++  *
++  * @hbuf_depth  : depth of hardware host/write buffer is slots
++  * @hbuf_is_ready : query if the host host/write buffer is ready
++  * @wr_msg      : the buffer for hbm control messages
++  *
++  * @version     : HBM protocol version in use
++  * @hbm_f_pg_supported : hbm feature pgi protocol
++  *
++  * @me_clients_rwsem: rw lock over me_clients list
++  * @me_clients  : list of FW clients
++  * @me_clients_map : FW clients bit map
++  * @host_clients_map : host clients id pool
++  * @me_client_index : last FW client index in enumeration
++  *
++  * @allow_fixed_address: allow user space to connect a fixed client
++  *
++  * @wd_cl       : watchdog client
++  * @wd_state    : watchdog client state
++  * @wd_pending  : watchdog command is pending
++  * @wd_timeout  : watchdog expiration timeout
++  * @wd_data     : watchdog message buffer
++  *
++  * @amthif_cmd_list : amthif list for cmd waiting
++  * @amthif_rd_complete_list : amthif list for reading completed cmd data
++  * @iamthif_file_object : file for current amthif operation
++  * @iamthif_cl  : amthif host client
++  * @iamthif_current_cb : amthif current operation callback
++  * @iamthif_open_count : number of opened amthif connections
++  * @iamthif_timer : time stamp of current amthif command completion
++  * @iamthif_stall_timer : timer to detect amthif hang
++  * @iamthif_state : amthif processor state
++  * @iamthif_canceled : current amthif command is canceled
++  *
++  * @init_work   : work item for the device init
++  * @reset_work  : work item for the device reset
++  *
++  * @device_list : mei client bus list
++  *
++  * @dbgfs_dir   : debugfs mei root directory
++  *
++  * @ops:        : hw specific operations
++  * @hw          : hw specific data
+++>>>>>>> 9e23936279ad (mei: drop iamthif_mtu from device structure)
+   */
+  struct mei_device {
+ -	struct device *dev;
+ -	struct cdev cdev;
+ -	int minor;
+ -
+ -	struct mei_cl_cb write_list;
+ -	struct mei_cl_cb write_waiting_list;
+ -	struct mei_cl_cb ctrl_wr_list;
+ -	struct mei_cl_cb ctrl_rd_list;
+ +	struct pci_dev *pdev;	/* pointer to pci device struct */
+ +	/*
+ +	 * lists of queues
+ +	 */
+ +	/* array of pointers to aio lists */
+ +	struct mei_cl_cb read_list;		/* driver read queue */
+ +	struct mei_cl_cb write_list;		/* driver write queue */
+ +	struct mei_cl_cb write_waiting_list;	/* write waiting queue */
+ +	struct mei_cl_cb ctrl_wr_list;		/* managed write IOCTL list */
+ +	struct mei_cl_cb ctrl_rd_list;		/* managed read IOCTL list */
+  
+ +	/*
+ +	 * list of files
+ +	 */
+  	struct list_head file_list;
+  	long open_handle_count;
+  
+@@@ -500,15 -585,9 +573,14 @@@
+  	struct mei_cl iamthif_cl;
+  	struct mei_cl_cb *iamthif_current_cb;
+  	long iamthif_open_count;
+- 	int iamthif_mtu;
+  	unsigned long iamthif_timer;
+  	u32 iamthif_stall_timer;
+ +	unsigned char *iamthif_msg_buf; /* Note: memory has to be allocated */
+ +	u32 iamthif_msg_buf_size;
+ +	u32 iamthif_msg_buf_index;
+  	enum iamthif_states iamthif_state;
+ +	bool iamthif_flow_control_pending;
+ +	bool iamthif_ioctl;
+  	bool iamthif_canceled;
+  
+  	struct work_struct init_work;
+* Unmerged path drivers/misc/mei/amthif.c
+* Unmerged path drivers/misc/mei/mei_dev.h
