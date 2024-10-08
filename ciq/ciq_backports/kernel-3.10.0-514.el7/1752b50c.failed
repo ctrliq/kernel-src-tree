@@ -1,0 +1,200 @@
+libceph: introduce and switch to reopen_session()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 1752b50ca240a7f722f57e81ba04496eb15c466f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/1752b50c.failed
+
+hunting is now set in __open_session() and cleared in finish_hunting(),
+instead of all around.  The "session lost" message is printed not only
+on connection resets, but also on keepalive timeouts.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 1752b50ca240a7f722f57e81ba04496eb15c466f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/mon_client.c
+diff --cc net/ceph/mon_client.c
+index 4a66c44fabbd,816fb813a336..000000000000
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@@ -128,43 -128,87 +128,61 @@@ static void __close_session(struct ceph
+  }
+  
+  /*
+ - * Pick a new monitor at random and set cur_mon.  If we are repicking
+ - * (i.e. cur_mon is already set), be sure to pick a different one.
+ + * Open a session with a (new) monitor.
+   */
+ -static void pick_new_mon(struct ceph_mon_client *monc)
+ -{
+ -	int old_mon = monc->cur_mon;
+ -
+ -	BUG_ON(monc->monmap->num_mon < 1);
+ -
+ -	if (monc->monmap->num_mon == 1) {
+ -		monc->cur_mon = 0;
+ -	} else {
+ -		int max = monc->monmap->num_mon;
+ -		int o = -1;
+ -		int n;
+ -
+ -		if (monc->cur_mon >= 0) {
+ -			if (monc->cur_mon < monc->monmap->num_mon)
+ -				o = monc->cur_mon;
+ -			if (o >= 0)
+ -				max--;
+ -		}
+ -
+ -		n = prandom_u32() % max;
+ -		if (o >= 0 && n >= o)
+ -			n++;
+ -
+ -		monc->cur_mon = n;
+ -	}
+ -
+ -	dout("%s mon%d -> mon%d out of %d mons\n", __func__, old_mon,
+ -	     monc->cur_mon, monc->monmap->num_mon);
+ -}
+ -
+ -/*
+ - * Open a session with a new monitor.
+ - */
+ -static void __open_session(struct ceph_mon_client *monc)
+ +static int __open_session(struct ceph_mon_client *monc)
+  {
+ +	char r;
+  	int ret;
+  
+ -	pick_new_mon(monc);
+ -
+ +	if (monc->cur_mon < 0) {
+ +		get_random_bytes(&r, 1);
+ +		monc->cur_mon = r % monc->monmap->num_mon;
+ +		dout("open_session num=%d r=%d -> mon%d\n",
+ +		     monc->monmap->num_mon, r, monc->cur_mon);
+ +		monc->sub_sent = 0;
+ +		monc->sub_renew_after = jiffies;  /* i.e., expired */
+ +		monc->want_next_osdmap = !!monc->want_next_osdmap;
+ +
+++<<<<<<< HEAD
+ +		dout("open_session mon%d opening\n", monc->cur_mon);
+ +		ceph_con_open(&monc->con,
+ +			      CEPH_ENTITY_TYPE_MON, monc->cur_mon,
+ +			      &monc->monmap->mon_inst[monc->cur_mon].addr);
+ +
+ +		/* initiatiate authentication handshake */
+ +		ret = ceph_auth_build_hello(monc->auth,
+ +					    monc->m_auth->front.iov_base,
+ +					    monc->m_auth->front_alloc_len);
+ +		__send_prepared_auth_request(monc, ret);
+ +	} else {
+ +		dout("open_session mon%d already open\n", monc->cur_mon);
+++=======
++ 	monc->hunting = true;
++ 	if (monc->had_a_connection) {
++ 		monc->hunt_mult *= CEPH_MONC_HUNT_BACKOFF;
++ 		if (monc->hunt_mult > CEPH_MONC_HUNT_MAX_MULT)
++ 			monc->hunt_mult = CEPH_MONC_HUNT_MAX_MULT;
+++>>>>>>> 1752b50ca240 (libceph: introduce and switch to reopen_session())
+  	}
+ +	return 0;
+ +}
+  
+ -	monc->sub_renew_after = jiffies; /* i.e., expired */
+ -	monc->sub_renew_sent = 0;
+ -
+ -	dout("%s opening mon%d\n", __func__, monc->cur_mon);
+ -	ceph_con_open(&monc->con, CEPH_ENTITY_TYPE_MON, monc->cur_mon,
+ -		      &monc->monmap->mon_inst[monc->cur_mon].addr);
+ -
+ -	/*
+ -	 * send an initial keepalive to ensure our timestamp is valid
+ -	 * by the time we are in an OPENED state
+ -	 */
+ -	ceph_con_keepalive(&monc->con);
+ -
+ -	/* initiate authentication handshake */
+ -	ret = ceph_auth_build_hello(monc->auth,
+ -				    monc->m_auth->front.iov_base,
+ -				    monc->m_auth->front_alloc_len);
+ -	BUG_ON(ret <= 0);
+ -	__send_prepared_auth_request(monc, ret);
+ +static bool __sub_expired(struct ceph_mon_client *monc)
+ +{
+ +	return time_after_eq(jiffies, monc->sub_renew_after);
+  }
+  
++ static void reopen_session(struct ceph_mon_client *monc)
++ {
++ 	if (!monc->hunting)
++ 		pr_info("mon%d %s session lost, hunting for new mon\n",
++ 		    monc->cur_mon, ceph_pr_addr(&monc->con.peer_addr.in_addr));
++ 
++ 	__close_session(monc);
++ 	__open_session(monc);
++ }
++ 
+  /*
+   * Reschedule delayed work timer.
+   */
+@@@ -690,15 -799,30 +708,25 @@@ static void delayed_work(struct work_st
+  	dout("monc delayed_work\n");
+  	mutex_lock(&monc->mutex);
+  	if (monc->hunting) {
+- 		__close_session(monc);
+- 		__open_session(monc);  /* continue hunting */
++ 		dout("%s continuing hunt\n", __func__);
++ 		reopen_session(monc);
+  	} else {
+++<<<<<<< HEAD
+ +		ceph_con_keepalive(&monc->con);
+++=======
++ 		int is_auth = ceph_auth_is_authenticated(monc->auth);
++ 		if (ceph_con_keepalive_expired(&monc->con,
++ 					       CEPH_MONC_PING_TIMEOUT)) {
++ 			dout("monc keepalive timeout\n");
++ 			is_auth = 0;
++ 			reopen_session(monc);
++ 		}
+++>>>>>>> 1752b50ca240 (libceph: introduce and switch to reopen_session())
+  
+ -		if (!monc->hunting) {
+ -			ceph_con_keepalive(&monc->con);
+ -			__validate_auth(monc);
+ -		}
+ -
+ -		if (is_auth) {
+ -			unsigned long now = jiffies;
+ +		__validate_auth(monc);
+  
+ -			dout("%s renew subs? now %lu renew after %lu\n",
+ -			     __func__, now, monc->sub_renew_after);
+ -			if (time_after_eq(now, monc->sub_renew_after))
+ -				__send_subscribe(monc);
+ -		}
+ +		if (ceph_auth_is_authenticated(monc->auth))
+ +			__send_subscribe(monc);
+  	}
+  	__schedule_delayed(monc);
+  	mutex_unlock(&monc->mutex);
+@@@ -785,9 -909,8 +813,14 @@@ int ceph_monc_init(struct ceph_mon_clie
+  		      &monc->client->msgr);
+  
+  	monc->cur_mon = -1;
+++<<<<<<< HEAD
+ +	monc->hunting = true;
+ +	monc->sub_renew_after = jiffies;
+ +	monc->sub_sent = 0;
+++=======
++ 	monc->had_a_connection = false;
++ 	monc->hunt_mult = 1;
+++>>>>>>> 1752b50ca240 (libceph: introduce and switch to reopen_session())
+  
+  	INIT_DELAYED_WORK(&monc->delayed_work, delayed_work);
+  	monc->generic_request_tree = RB_ROOT;
+* Unmerged path net/ceph/mon_client.c
