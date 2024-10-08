@@ -1,0 +1,319 @@
+staging/rdma/hfi: fix CQ completion order issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [infiniband] rdma/hfi: fix CQ completion order issue (Alex Estrin) [1272062 1273170]
+Rebuild_FUZZ: 90.70%
+commit-author Mike Marciniszyn <mike.marciniszyn@intel.com>
+commit a545f5308b6cf476def8a9326f7e82f89623bb03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/a545f530.failed
+
+The current implementation of the sdma_wait variable
+has a timing hole that can cause a completion Q entry
+to be returned from a pio send prior to an older
+sdma packets completion queue entry.
+
+The sdma_wait variable used to be decremented prior to
+calling the packet complete routine.  The hole is between decrement
+and the verbs completion where send engine using pio could return
+a out of order completion in that window.
+
+This patch closes the hole by allowing an API option to
+specify an sdma_drained callback.   The atomic dec
+is positioned after the complete callback to avoid the
+window as long as the pio path doesn't execute when
+there is a non-zero sdma count.
+
+	Reviewed-by: Jubin John <jubin.john@intel.com>
+	Signed-off-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit a545f5308b6cf476def8a9326f7e82f89623bb03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/hfi1/iowait.h
+#	drivers/staging/hfi1/sdma.c
+#	drivers/staging/hfi1/verbs.c
+#	drivers/staging/rdma/hfi1/qp.c
+#	drivers/staging/rdma/hfi1/sdma_txreq.h
+diff --cc drivers/staging/hfi1/iowait.h
+index e8ba5606d08d,2cb3f0422752..000000000000
+--- a/drivers/staging/hfi1/iowait.h
++++ b/drivers/staging/hfi1/iowait.h
+@@@ -67,9 -69,11 +67,10 @@@ struct sdma_engine
+   * @list: used to add/insert into QP/PQ wait lists
+   * @tx_head: overflow list of sdma_txreq's
+   * @sleep: no space callback
+-  * @wakeup: space callback
++  * @wakeup: space callback wakeup
++  * @sdma_drained: sdma count drained
+   * @iowork: workqueue overhead
+   * @wait_dma: wait for sdma_busy == 0
+ - * @wait_pio: wait for pio_busy == 0
+   * @sdma_busy: # of packets in flight
+   * @count: total number of descriptors in tx_head'ed list
+   * @tx_limit: limit for overflow queuing
+@@@ -101,9 -105,12 +102,10 @@@ struct iowait 
+  		struct sdma_txreq *tx,
+  		unsigned seq);
+  	void (*wakeup)(struct iowait *wait, int reason);
++ 	void (*sdma_drained)(struct iowait *wait);
+  	struct work_struct iowork;
+  	wait_queue_head_t wait_dma;
+ -	wait_queue_head_t wait_pio;
+  	atomic_t sdma_busy;
+ -	atomic_t pio_busy;
+  	u32 count;
+  	u32 tx_limit;
+  	u32 tx_count;
+@@@ -183,6 -276,28 +187,31 @@@ static inline void iowait_sdma_drain(st
+  static inline void iowait_drain_wakeup(struct iowait *wait)
+  {
+  	wake_up(&wait->wait_dma);
+++<<<<<<< HEAD:drivers/staging/hfi1/iowait.h
+++=======
++ 	wake_up(&wait->wait_pio);
++ 	if (wait->sdma_drained)
++ 		wait->sdma_drained(wait);
++ }
++ 
++ /**
++  * iowait_get_txhead() - get packet off of iowait list
++  *
++  * @wait wait struture
++  */
++ static inline struct sdma_txreq *iowait_get_txhead(struct iowait *wait)
++ {
++ 	struct sdma_txreq *tx = NULL;
++ 
++ 	if (!list_empty(&wait->tx_head)) {
++ 		tx = list_first_entry(
++ 			&wait->tx_head,
++ 			struct sdma_txreq,
++ 			list);
++ 		list_del_init(&tx->list);
++ 	}
++ 	return tx;
+++>>>>>>> a545f5308b6c (staging/rdma/hfi: fix CQ completion order issue):drivers/staging/rdma/hfi1/iowait.h
+  }
+  
+  #endif
+diff --cc drivers/staging/hfi1/sdma.c
+index 8a57bc183ce2,e79f931d06ce..000000000000
+--- a/drivers/staging/hfi1/sdma.c
++++ b/drivers/staging/hfi1/sdma.c
+@@@ -395,27 -417,8 +417,32 @@@ static void sdma_flush(struct sdma_engi
+  	}
+  	spin_unlock_irqrestore(&sde->flushlist_lock, flags);
+  	/* flush from flush list */
+++<<<<<<< HEAD:drivers/staging/hfi1/sdma.c
+ +	list_for_each_entry_safe(txp, txp_next, &flushlist, list) {
+ +		int drained = 0;
+ +		/* protect against complete modifying */
+ +		struct iowait *wait = txp->wait;
+ +
+ +		list_del_init(&txp->list);
+ +#ifdef CONFIG_HFI1_DEBUG_SDMA_ORDER
+ +		trace_hfi1_sdma_out_sn(sde, txp->sn);
+ +		if (WARN_ON_ONCE(sde->head_sn != txp->sn))
+ +			dd_dev_err(sde->dd, "expected %llu got %llu\n",
+ +				sde->head_sn, txp->sn);
+ +		sde->head_sn++;
+ +#endif
+ +		sdma_txclean(sde->dd, txp);
+ +		if (wait)
+ +			drained = atomic_dec_and_test(&wait->sdma_busy);
+ +		if (txp->complete)
+ +			(*txp->complete)(txp, SDMA_TXREQ_S_ABORTED, drained);
+ +		if (wait && drained)
+ +			iowait_drain_wakeup(wait);
+ +	}
+++=======
++ 	list_for_each_entry_safe(txp, txp_next, &flushlist, list)
++ 		complete_tx(sde, txp, SDMA_TXREQ_S_ABORTED);
+++>>>>>>> a545f5308b6c (staging/rdma/hfi: fix CQ completion order issue):drivers/staging/rdma/hfi1/sdma.c
+  }
+  
+  /*
+@@@ -577,31 -580,10 +604,23 @@@ static void sdma_flush_descq(struct sdm
+  		head = ++sde->descq_head & sde->sdma_mask;
+  		/* if now past this txp's descs, do the callback */
+  		if (txp && txp->next_descq_idx == head) {
+- 			int drained = 0;
+- 			/* protect against complete modifying */
+- 			struct iowait *wait = txp->wait;
+- 
+  			/* remove from list */
+  			sde->tx_ring[sde->tx_head++ & sde->sdma_mask] = NULL;
+++<<<<<<< HEAD:drivers/staging/hfi1/sdma.c
+ +			if (wait)
+ +				drained = atomic_dec_and_test(&wait->sdma_busy);
+ +#ifdef CONFIG_HFI1_DEBUG_SDMA_ORDER
+ +			trace_hfi1_sdma_out_sn(sde, txp->sn);
+ +			if (WARN_ON_ONCE(sde->head_sn != txp->sn))
+ +				dd_dev_err(sde->dd, "expected %llu got %llu\n",
+ +					sde->head_sn, txp->sn);
+ +			sde->head_sn++;
+ +#endif
+ +			sdma_txclean(sde->dd, txp);
+++=======
++ 			complete_tx(sde, txp, SDMA_TXREQ_S_ABORTED);
+++>>>>>>> a545f5308b6c (staging/rdma/hfi: fix CQ completion order issue):drivers/staging/rdma/hfi1/sdma.c
+  			trace_hfi1_sdma_progress(sde, head, tail, txp);
+- 			if (txp->complete)
+- 				(*txp->complete)(
+- 					txp,
+- 					SDMA_TXREQ_S_ABORTED,
+- 					drained);
+- 			if (wait && drained)
+- 				iowait_drain_wakeup(wait);
+- 			/* see if there is another txp */
+  			txp = get_txhead(sde);
+  		}
+  		progress++;
+@@@ -1493,29 -1473,9 +1512,29 @@@ retry
+  
+  		/* if now past this txp's descs, do the callback */
+  		if (txp && txp->next_descq_idx == swhead) {
+- 			int drained = 0;
+- 			/* protect against complete modifying */
+- 			struct iowait *wait = txp->wait;
+- 
+  			/* remove from list */
+  			sde->tx_ring[sde->tx_head++ & sde->sdma_mask] = NULL;
+++<<<<<<< HEAD:drivers/staging/hfi1/sdma.c
+ +			if (wait)
+ +				drained = atomic_dec_and_test(&wait->sdma_busy);
+ +#ifdef CONFIG_HFI1_DEBUG_SDMA_ORDER
+ +			trace_hfi1_sdma_out_sn(sde, txp->sn);
+ +			if (WARN_ON_ONCE(sde->head_sn != txp->sn))
+ +				dd_dev_err(sde->dd, "expected %llu got %llu\n",
+ +					sde->head_sn, txp->sn);
+ +			sde->head_sn++;
+ +#endif
+ +			sdma_txclean(sde->dd, txp);
+ +			if (txp->complete)
+ +				(*txp->complete)(
+ +					txp,
+ +					SDMA_TXREQ_S_OK,
+ +					drained);
+ +			if (wait && drained)
+ +				iowait_drain_wakeup(wait);
+++=======
++ 			complete_tx(sde, txp, SDMA_TXREQ_S_OK);
+++>>>>>>> a545f5308b6c (staging/rdma/hfi: fix CQ completion order issue):drivers/staging/rdma/hfi1/sdma.c
+  			/* see if there is another txp */
+  			txp = get_txhead(sde);
+  		}
+diff --cc drivers/staging/hfi1/verbs.c
+index d228eb7fc4f0,31419666cc69..000000000000
+--- a/drivers/staging/hfi1/verbs.c
++++ b/drivers/staging/hfi1/verbs.c
+@@@ -124,11 -124,19 +124,10 @@@ unsigned int hfi1_max_srq_wrs = 0x1FFFF
+  module_param_named(max_srq_wrs, hfi1_max_srq_wrs, uint, S_IRUGO);
+  MODULE_PARM_DESC(max_srq_wrs, "Maximum number of SRQ WRs support");
+  
+ -unsigned short piothreshold;
+ -module_param(piothreshold, ushort, S_IRUGO);
+ -MODULE_PARM_DESC(piothreshold, "size used to determine sdma vs. pio");
+ -
+  static void verbs_sdma_complete(
+  	struct sdma_txreq *cookie,
+- 	int status,
+- 	int drained);
++ 	int status);
+  
+ -static int pio_wait(struct rvt_qp *qp,
+ -		    struct send_context *sc,
+ -		    struct hfi1_pkt_state *ps,
+ -		    u32 flag);
+ -
+  /* Length of buffer to create verbs txreq cache name */
+  #define TXREQ_NAME_LEN 24
+  
+@@@ -831,18 -537,6 +829,21 @@@ static void verbs_sdma_complete
+  		hdr = &tx->phdr.hdr;
+  		hfi1_rc_send_complete(qp, hdr);
+  	}
+++<<<<<<< HEAD:drivers/staging/hfi1/verbs.c
+ +	if (drained) {
+ +		/*
+ +		 * This happens when the send engine notes
+ +		 * a QP in the error state and cannot
+ +		 * do the flush work until that QP's
+ +		 * sdma work has finished.
+ +		 */
+ +		if (qp->s_flags & HFI1_S_WAIT_DMA) {
+ +			qp->s_flags &= ~HFI1_S_WAIT_DMA;
+ +			hfi1_schedule_send(qp);
+ +		}
+ +	}
+++=======
+++>>>>>>> a545f5308b6c (staging/rdma/hfi: fix CQ completion order issue):drivers/staging/rdma/hfi1/verbs.c
+  	spin_unlock(&qp->s_lock);
+  
+  	hfi1_put_txreq(tx);
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
+* Unmerged path drivers/staging/rdma/hfi1/sdma_txreq.h
+* Unmerged path drivers/staging/hfi1/iowait.h
+* Unmerged path drivers/staging/hfi1/sdma.c
+diff --git a/drivers/staging/hfi1/sdma.h b/drivers/staging/hfi1/sdma.h
+index 94364cf6e6da..1dded2886a87 100644
+--- a/drivers/staging/hfi1/sdma.h
++++ b/drivers/staging/hfi1/sdma.h
+@@ -633,7 +633,7 @@ static inline int sdma_txinit_ahg(
+ 	u8 num_ahg,
+ 	u32 *ahg,
+ 	u8 ahg_hlen,
+-	void (*cb)(struct sdma_txreq *, int, int))
++	void (*cb)(struct sdma_txreq *, int))
+ {
+ 	if (tlen == 0)
+ 		return -ENODATA;
+@@ -696,7 +696,7 @@ static inline int sdma_txinit(
+ 	struct sdma_txreq *tx,
+ 	u16 flags,
+ 	u16 tlen,
+-	void (*cb)(struct sdma_txreq *, int, int))
++	void (*cb)(struct sdma_txreq *, int))
+ {
+ 	return sdma_txinit_ahg(tx, flags, tlen, 0, 0, NULL, 0, cb);
+ }
+diff --git a/drivers/staging/hfi1/user_sdma.c b/drivers/staging/hfi1/user_sdma.c
+index 512387cf7039..9f1fc9d06cf8 100644
+--- a/drivers/staging/hfi1/user_sdma.c
++++ b/drivers/staging/hfi1/user_sdma.c
+@@ -273,7 +273,7 @@ struct user_sdma_txreq {
+ 
+ static int user_sdma_send_pkts(struct user_sdma_request *, unsigned);
+ static int num_user_pages(const struct iovec *);
+-static void user_sdma_txreq_cb(struct sdma_txreq *, int, int);
++static void user_sdma_txreq_cb(struct sdma_txreq *, int);
+ static inline void pq_update(struct hfi1_user_sdma_pkt_q *);
+ static void user_sdma_free_request(struct user_sdma_request *, bool);
+ static int pin_vector_pages(struct user_sdma_request *,
+@@ -388,7 +388,7 @@ int hfi1_user_sdma_alloc_queues(struct hfi1_ctxtdata *uctxt, struct file *fp)
+ 	init_waitqueue_head(&pq->wait);
+ 
+ 	iowait_init(&pq->busy, 0, NULL, defer_packet_queue,
+-		    activate_packet_queue);
++		    activate_packet_queue, NULL);
+ 	pq->reqidx = 0;
+ 	snprintf(buf, 64, "txreq-kmem-cache-%u-%u-%u", dd->unit, uctxt->ctxt,
+ 		 fd->subctxt);
+@@ -1340,8 +1340,7 @@ static int set_txreq_header_ahg(struct user_sdma_request *req,
+  * tx request have been processed by the DMA engine. Called in
+  * interrupt context.
+  */
+-static void user_sdma_txreq_cb(struct sdma_txreq *txreq, int status,
+-			       int drain)
++static void user_sdma_txreq_cb(struct sdma_txreq *txreq, int status)
+ {
+ 	struct user_sdma_txreq *tx =
+ 		container_of(txreq, struct user_sdma_txreq, txreq);
+* Unmerged path drivers/staging/hfi1/verbs.c
+* Unmerged path drivers/staging/rdma/hfi1/qp.c
+* Unmerged path drivers/staging/rdma/hfi1/sdma_txreq.h
