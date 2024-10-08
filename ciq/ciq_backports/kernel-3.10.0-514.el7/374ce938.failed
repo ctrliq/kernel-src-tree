@@ -1,0 +1,534 @@
+perf tools: Enable pre-event inherit setting by config terms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 374ce938aaeb481114b2a8fdedd261f9b2ff9b2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/374ce938.failed
+
+This patch allows perf record setting event's attr.inherit bit by
+config terms like:
+
+  # perf record -e cycles/no-inherit/ ...
+  # perf record -e cycles/inherit/ ...
+
+So user can control inherit bit for each event separately.
+
+In following example, a.out fork()s in main then do some complex
+CPU intensive computations in both of its children.
+
+Basic result with and without inherit:
+
+  # perf record -e cycles -e instructions ./a.out
+  [ perf record: Woken up 9 times to write data ]
+  [ perf record: Captured and wrote 2.205 MB perf.data (47920 samples) ]
+  # perf report --stdio
+  # ...
+  # Samples: 23K of event 'cycles'
+  # Event count (approx.): 23641752891
+  ...
+  # Samples: 24K of event 'instructions'
+  # Event count (approx.): 30428312415
+
+  # perf record -i -e cycles -e instructions ./a.out
+  [ perf record: Woken up 5 times to write data ]
+  [ perf record: Captured and wrote 1.111 MB perf.data (24019 samples) ]
+  ...
+  # Samples: 12K of event 'cycles'
+  # Event count (approx.): 11699501775
+  ...
+  # Samples: 12K of event 'instructions'
+  # Event count (approx.): 15058023559
+
+Cancel inherit for one event when globally enable:
+
+  # perf record -e cycles/no-inherit/ -e instructions ./a.out
+  [ perf record: Woken up 7 times to write data ]
+  [ perf record: Captured and wrote 1.660 MB perf.data (36004 samples) ]
+  ...
+  # Samples: 12K of event 'cycles/no-inherit/'
+  # Event count (approx.): 11895759282
+ ...
+  # Samples: 24K of event 'instructions'
+  # Event count (approx.): 30668000441
+
+Enable inherit for one event when globally disable:
+
+  # perf record -i -e cycles/inherit/ -e instructions ./a.out
+  [ perf record: Woken up 7 times to write data ]
+  [ perf record: Captured and wrote 1.654 MB perf.data (35868 samples) ]
+  ...
+  # Samples: 23K of event 'cycles/inherit/'
+  # Event count (approx.): 23285400229
+  ...
+  # Samples: 11K of event 'instructions'
+  # Event count (approx.): 14969050259
+
+Committer note:
+
+One can check if the bit was set, in addition to seeing the result in
+the perf.data file size as above by doing one of:
+
+  # perf record -e cycles -e instructions -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.911 MB perf.data (63 samples) ]
+  # perf evlist -v
+  cycles: size: 112, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, inherit: 1, mmap: 1, comm: 1, freq: 1, task: 1, sample_id_all: 1, exclude_guest: 1, mmap2: 1, comm_exec: 1
+  instructions: size: 112, config: 0x1, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, inherit: 1, freq: 1, sample_id_all: 1, exclude_guest: 1
+  #
+
+So, the inherit bit was set in both, now, if we disable it globally using
+--no-inherit:
+
+  # perf record --no-inherit -e cycles -e instructions -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.910 MB perf.data (56 samples) ]
+  # perf evlist -v
+  cycles: size: 112, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, mmap: 1, comm: 1, freq: 1, task: 1, sample_id_all: 1, exclude_guest: 1, mmap2: 1, comm_exec: 1
+  instructions: size: 112, config: 0x1, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, freq: 1, sample_id_all: 1, exclude_guest: 1
+
+No inherit bit set, then disabling it and setting just on the cycles event:
+
+  # perf record --no-inherit -e cycles/inherit/ -e instructions -a usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.909 MB perf.data (48 samples) ]
+  # perf evlist -v
+  cycles/inherit/: size: 112, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, inherit: 1, mmap: 1, comm: 1, freq: 1, task: 1, sample_id_all: 1, exclude_guest: 1, mmap2: 1, comm_exec: 1
+  instructions: size: 112, config: 0x1, { sample_period, sample_freq }: 4000, sample_type: IP|TID|TIME|ID|CPU|PERIOD, read_format: ID, disabled: 1, freq: 1, sample_id_all: 1, exclude_guest: 1
+  #
+
+We can see it as well in by using a more verbose level of debug messages in
+the tool that sets up the perf_event_attr, 'perf record' in this case:
+
+  [root@zoo ~]# perf record -vv --no-inherit -e cycles/inherit/ -e instructions -a usleep 1
+  ------------------------------------------------------------
+  perf_event_attr:
+    size                             112
+    { sample_period, sample_freq }   4000
+    sample_type                      IP|TID|TIME|ID|CPU|PERIOD
+    read_format                      ID
+    disabled                         1
+    inherit                          1
+    mmap                             1
+    comm                             1
+    freq                             1
+    task                             1
+    sample_id_all                    1
+    exclude_guest                    1
+    mmap2                            1
+    comm_exec                        1
+  ------------------------------------------------------------
+  sys_perf_event_open: pid -1  cpu 0  group_fd -1  flags 0x8
+  sys_perf_event_open: pid -1  cpu 1  group_fd -1  flags 0x8
+  sys_perf_event_open: pid -1  cpu 2  group_fd -1  flags 0x8
+  sys_perf_event_open: pid -1  cpu 3  group_fd -1  flags 0x8
+  ------------------------------------------------------------
+  perf_event_attr:
+    size                             112
+    config                           0x1
+    { sample_period, sample_freq }   4000
+    sample_type                      IP|TID|TIME|ID|CPU|PERIOD
+    read_format                      ID
+    disabled                         1
+    freq                             1
+    sample_id_all                    1
+    exclude_guest                    1
+  ------------------------------------------------------------
+  sys_perf_event_open: pid -1  cpu 0  group_fd -1  flags 0x8
+
+<SNIP>
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexei Starovoitov <ast@plumgrid.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: David S. Miller <davem@davemloft.net>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1446029705-199659-2-git-send-email-wangnan0@huawei.com
+[ s/u64/bool/ for the perf_evsel_config_term inherit field - jolsa]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 374ce938aaeb481114b2a8fdedd261f9b2ff9b2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+#	tools/perf/util/parse-events.c
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.l
+diff --cc tools/perf/util/evsel.c
+index ff56cebf0bb7,3ac4ee9c6a6e..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -594,6 -599,106 +594,109 @@@ perf_evsel__config_callgraph(struct per
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ perf_evsel__reset_callgraph(struct perf_evsel *evsel,
++ 			    struct callchain_param *param)
++ {
++ 	struct perf_event_attr *attr = &evsel->attr;
++ 
++ 	perf_evsel__reset_sample_bit(evsel, CALLCHAIN);
++ 	if (param->record_mode == CALLCHAIN_LBR) {
++ 		perf_evsel__reset_sample_bit(evsel, BRANCH_STACK);
++ 		attr->branch_sample_type &= ~(PERF_SAMPLE_BRANCH_USER |
++ 					      PERF_SAMPLE_BRANCH_CALL_STACK);
++ 	}
++ 	if (param->record_mode == CALLCHAIN_DWARF) {
++ 		perf_evsel__reset_sample_bit(evsel, REGS_USER);
++ 		perf_evsel__reset_sample_bit(evsel, STACK_USER);
++ 	}
++ }
++ 
++ static void apply_config_terms(struct perf_evsel *evsel,
++ 			       struct record_opts *opts)
++ {
++ 	struct perf_evsel_config_term *term;
++ 	struct list_head *config_terms = &evsel->config_terms;
++ 	struct perf_event_attr *attr = &evsel->attr;
++ 	struct callchain_param param;
++ 	u32 dump_size = 0;
++ 	char *callgraph_buf = NULL;
++ 
++ 	/* callgraph default */
++ 	param.record_mode = callchain_param.record_mode;
++ 
++ 	list_for_each_entry(term, config_terms, list) {
++ 		switch (term->type) {
++ 		case PERF_EVSEL__CONFIG_TERM_PERIOD:
++ 			attr->sample_period = term->val.period;
++ 			attr->freq = 0;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_FREQ:
++ 			attr->sample_freq = term->val.freq;
++ 			attr->freq = 1;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_TIME:
++ 			if (term->val.time)
++ 				perf_evsel__set_sample_bit(evsel, TIME);
++ 			else
++ 				perf_evsel__reset_sample_bit(evsel, TIME);
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_CALLGRAPH:
++ 			callgraph_buf = term->val.callgraph;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
++ 			dump_size = term->val.stack_user;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_INHERIT:
++ 			/*
++ 			 * attr->inherit should has already been set by
++ 			 * perf_evsel__config. If user explicitly set
++ 			 * inherit using config terms, override global
++ 			 * opt->no_inherit setting.
++ 			 */
++ 			attr->inherit = term->val.inherit ? 1 : 0;
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* User explicitly set per-event callgraph, clear the old setting and reset. */
++ 	if ((callgraph_buf != NULL) || (dump_size > 0)) {
++ 
++ 		/* parse callgraph parameters */
++ 		if (callgraph_buf != NULL) {
++ 			if (!strcmp(callgraph_buf, "no")) {
++ 				param.enabled = false;
++ 				param.record_mode = CALLCHAIN_NONE;
++ 			} else {
++ 				param.enabled = true;
++ 				if (parse_callchain_record(callgraph_buf, &param)) {
++ 					pr_err("per-event callgraph setting for %s failed. "
++ 					       "Apply callgraph global setting for it\n",
++ 					       evsel->name);
++ 					return;
++ 				}
++ 			}
++ 		}
++ 		if (dump_size > 0) {
++ 			dump_size = round_up(dump_size, sizeof(u64));
++ 			param.dump_size = dump_size;
++ 		}
++ 
++ 		/* If global callgraph set, clear it */
++ 		if (callchain_param.enabled)
++ 			perf_evsel__reset_callgraph(evsel, &callchain_param);
++ 
++ 		/* set perf-event callgraph */
++ 		if (param.enabled)
++ 			perf_evsel__config_callgraph(evsel, opts, &param);
++ 	}
++ }
++ 
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  /*
+   * The enable_on_exec/disabled value strategy:
+   *
+diff --cc tools/perf/util/evsel.h
+index 8a9d996efd40,1e8ff1906f71..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -31,6 -31,35 +31,38 @@@ struct perf_sample_id 
+  
+  struct cgroup_sel;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The 'struct perf_evsel_config_term' is used to pass event
++  * specific configuration data to perf_evsel__config routine.
++  * It is allocated within event parsing and attached to
++  * perf_evsel::config_terms list head.
++ */
++ enum {
++ 	PERF_EVSEL__CONFIG_TERM_PERIOD,
++ 	PERF_EVSEL__CONFIG_TERM_FREQ,
++ 	PERF_EVSEL__CONFIG_TERM_TIME,
++ 	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
++ 	PERF_EVSEL__CONFIG_TERM_STACK_USER,
++ 	PERF_EVSEL__CONFIG_TERM_INHERIT,
++ 	PERF_EVSEL__CONFIG_TERM_MAX,
++ };
++ 
++ struct perf_evsel_config_term {
++ 	struct list_head	list;
++ 	int	type;
++ 	union {
++ 		u64	period;
++ 		u64	freq;
++ 		bool	time;
++ 		char	*callgraph;
++ 		u64	stack_user;
++ 		bool	inherit;
++ 	} val;
++ };
++ 
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  /** struct perf_evsel - event selector
+   *
+   * @evlist - evlist this evsel is in, if it is in one.
+diff --cc tools/perf/util/parse-events.c
+index 18175a8e7c74,72abcf254ccb..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -632,6 -652,26 +632,29 @@@ do {									   
+  		 * attr->branch_sample_type = term->val.num;
+  		 */
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case PARSE_EVENTS__TERM_TYPE_TIME:
++ 		CHECK_TYPE_VAL(NUM);
++ 		if (term->val.num > 1) {
++ 			err->str = strdup("expected 0 or 1");
++ 			err->idx = term->err_val;
++ 			return -EINVAL;
++ 		}
++ 		break;
++ 	case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
++ 		CHECK_TYPE_VAL(STR);
++ 		break;
++ 	case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
++ 		CHECK_TYPE_VAL(NUM);
++ 		break;
++ 	case PARSE_EVENTS__TERM_TYPE_INHERIT:
++ 		CHECK_TYPE_VAL(NUM);
++ 		break;
++ 	case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
++ 		CHECK_TYPE_VAL(NUM);
++ 		break;
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  	case PARSE_EVENTS__TERM_TYPE_NAME:
+  		CHECK_TYPE_VAL(STR);
+  		break;
+@@@ -643,9 -686,46 +666,48 @@@
+  #undef CHECK_TYPE_VAL
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int config_term_pmu(struct perf_event_attr *attr,
++ 			   struct parse_events_term *term,
++ 			   struct parse_events_error *err)
++ {
++ 	if (term->type_term == PARSE_EVENTS__TERM_TYPE_USER)
++ 		/*
++ 		 * Always succeed for sysfs terms, as we dont know
++ 		 * at this point what type they need to have.
++ 		 */
++ 		return 0;
++ 	else
++ 		return config_term_common(attr, term, err);
++ }
++ 
++ static int config_term_tracepoint(struct perf_event_attr *attr,
++ 				  struct parse_events_term *term,
++ 				  struct parse_events_error *err)
++ {
++ 	switch (term->type_term) {
++ 	case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
++ 	case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
++ 	case PARSE_EVENTS__TERM_TYPE_INHERIT:
++ 	case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
++ 		return config_term_common(attr, term, err);
++ 	default:
++ 		if (err) {
++ 			err->idx = term->err_term;
++ 			err->str = strdup("unknown term");
++ 			err->help = strdup("valid terms: call-graph,stack-size\n");
++ 		}
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  static int config_attr(struct perf_event_attr *attr,
+  		       struct list_head *head,
+ -		       struct parse_events_error *err,
+ -		       config_term_func_t config_term)
+ +		       struct parse_events_error *err)
+  {
+  	struct parse_events_term *term;
+  
+@@@ -656,6 -736,77 +718,80 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int get_config_terms(struct list_head *head_config,
++ 			    struct list_head *head_terms __maybe_unused)
++ {
++ #define ADD_CONFIG_TERM(__type, __name, __val)			\
++ do {								\
++ 	struct perf_evsel_config_term *__t;			\
++ 								\
++ 	__t = zalloc(sizeof(*__t));				\
++ 	if (!__t)						\
++ 		return -ENOMEM;					\
++ 								\
++ 	INIT_LIST_HEAD(&__t->list);				\
++ 	__t->type       = PERF_EVSEL__CONFIG_TERM_ ## __type;	\
++ 	__t->val.__name = __val;				\
++ 	list_add_tail(&__t->list, head_terms);			\
++ } while (0)
++ 
++ 	struct parse_events_term *term;
++ 
++ 	list_for_each_entry(term, head_config, list) {
++ 		switch (term->type_term) {
++ 		case PARSE_EVENTS__TERM_TYPE_SAMPLE_PERIOD:
++ 			ADD_CONFIG_TERM(PERIOD, period, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_SAMPLE_FREQ:
++ 			ADD_CONFIG_TERM(FREQ, freq, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_TIME:
++ 			ADD_CONFIG_TERM(TIME, time, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
++ 			ADD_CONFIG_TERM(CALLGRAPH, callgraph, term->val.str);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
++ 			ADD_CONFIG_TERM(STACK_USER, stack_user, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_INHERIT:
++ 			ADD_CONFIG_TERM(INHERIT, inherit, term->val.num ? 1 : 0);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
++ 			ADD_CONFIG_TERM(INHERIT, inherit, term->val.num ? 0 : 1);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ #undef ADD_EVSEL_CONFIG
++ 	return 0;
++ }
++ 
++ int parse_events_add_tracepoint(struct list_head *list, int *idx,
++ 				char *sys, char *event,
++ 				struct parse_events_error *err,
++ 				struct list_head *head_config)
++ {
++ 	if (head_config) {
++ 		struct perf_event_attr attr;
++ 
++ 		if (config_attr(&attr, head_config, err,
++ 				config_term_tracepoint))
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (strpbrk(sys, "*?"))
++ 		return add_tracepoint_multi_sys(list, idx, sys, event,
++ 						err, head_config);
++ 	else
++ 		return add_tracepoint_event(list, idx, sys, event,
++ 					    err, head_config);
++ }
++ 
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  int parse_events_add_numeric(struct parse_events_evlist *data,
+  			     struct list_head *list,
+  			     u32 type, u64 config,
+diff --cc tools/perf/util/parse-events.h
+index 3500437920bb,13c9063513eb..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -62,7 -62,13 +62,15 @@@ enum 
+  	PARSE_EVENTS__TERM_TYPE_CONFIG2,
+  	PARSE_EVENTS__TERM_TYPE_NAME,
+  	PARSE_EVENTS__TERM_TYPE_SAMPLE_PERIOD,
+ -	PARSE_EVENTS__TERM_TYPE_SAMPLE_FREQ,
+  	PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE,
+++<<<<<<< HEAD
+++=======
++ 	PARSE_EVENTS__TERM_TYPE_TIME,
++ 	PARSE_EVENTS__TERM_TYPE_CALLGRAPH,
++ 	PARSE_EVENTS__TERM_TYPE_STACKSIZE,
++ 	PARSE_EVENTS__TERM_TYPE_NOINHERIT,
++ 	PARSE_EVENTS__TERM_TYPE_INHERIT
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  };
+  
+  struct parse_events_term {
+diff --cc tools/perf/util/parse-events.l
+index 13cef3c65565,8d0de5b2991d..000000000000
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@@ -182,7 -182,13 +182,15 @@@ config1			{ return term(yyscanner, PARS
+  config2			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CONFIG2); }
+  name			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NAME); }
+  period			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_SAMPLE_PERIOD); }
+ -freq			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_SAMPLE_FREQ); }
+  branch_type		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE); }
+++<<<<<<< HEAD
+++=======
++ time			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_TIME); }
++ call-graph		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CALLGRAPH); }
++ stack-size		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_STACKSIZE); }
++ inherit			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_INHERIT); }
++ no-inherit		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOINHERIT); }
+++>>>>>>> 374ce938aaeb (perf tools: Enable pre-event inherit setting by config terms)
+  ,			{ return ','; }
+  "/"			{ BEGIN(INITIAL); return '/'; }
+  {name_minus}		{ return str(yyscanner, PE_NAME); }
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/parse-events.c
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.l
