@@ -1,0 +1,215 @@
+drivers:hv: Move MMIO range picking from hyper_fb to hv_vmbus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-514.el7
+Rebuild_CHGLOG: - [hv] Move MMIO range picking from hyper_fb to hv_vmbus (Vitaly Kuznetsov) [1321073]
+Rebuild_FUZZ: 89.09%
+commit-author Jake Oshins <jakeo@microsoft.com>
+commit 3546448338e76a52d4f86eb3680cb2934e22d89b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-514.el7/35464483.failed
+
+This patch deletes the logic from hyperv_fb which picked a range of MMIO space
+for the frame buffer and adds new logic to hv_vmbus which picks ranges for
+child drivers.  The new logic isn't quite the same as the old, as it considers
+more possible ranges.
+
+	Signed-off-by: Jake Oshins <jakeo@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3546448338e76a52d4f86eb3680cb2934e22d89b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+#	drivers/video/hyperv_fb.c
+#	include/linux/hyperv.h
+diff --cc drivers/hv/vmbus_drv.c
+index 42f61fe233fb,8c3eaee8c54c..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -103,16 -103,7 +104,20 @@@ static struct notifier_block hyperv_pan
+  	.notifier_call = hyperv_panic_event,
+  };
+  
+++<<<<<<< HEAD
+ +struct resource hyperv_mmio = {
+ +	.name  = "hyperv mmio",
+ +	.flags = IORESOURCE_MEM,
+ +};
+ +EXPORT_SYMBOL_GPL(hyperv_mmio);
+++=======
++ struct resource *hyperv_mmio;
+++>>>>>>> 3546448338e7 (drivers:hv: Move MMIO range picking from hyper_fb to hv_vmbus)
+ +
+ +struct hv_device_info {
+ +	struct hv_ring_buffer_debug_info inbound;
+ +	struct hv_ring_buffer_debug_info outbound;
+ +};
+  
+  static int vmbus_exists(void)
+  {
+@@@ -1007,6 -1090,100 +1013,103 @@@ static acpi_status vmbus_walk_resources
+  	return AE_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vmbus_acpi_remove(struct acpi_device *device)
++ {
++ 	struct resource *cur_res;
++ 	struct resource *next_res;
++ 
++ 	if (hyperv_mmio) {
++ 		for (cur_res = hyperv_mmio; cur_res; cur_res = next_res) {
++ 			next_res = cur_res->sibling;
++ 			kfree(cur_res);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * vmbus_allocate_mmio() - Pick a memory-mapped I/O range.
++  * @new:		If successful, supplied a pointer to the
++  *			allocated MMIO space.
++  * @device_obj:		Identifies the caller
++  * @min:		Minimum guest physical address of the
++  *			allocation
++  * @max:		Maximum guest physical address
++  * @size:		Size of the range to be allocated
++  * @align:		Alignment of the range to be allocated
++  * @fb_overlap_ok:	Whether this allocation can be allowed
++  *			to overlap the video frame buffer.
++  *
++  * This function walks the resources granted to VMBus by the
++  * _CRS object in the ACPI namespace underneath the parent
++  * "bridge" whether that's a root PCI bus in the Generation 1
++  * case or a Module Device in the Generation 2 case.  It then
++  * attempts to allocate from the global MMIO pool in a way that
++  * matches the constraints supplied in these parameters and by
++  * that _CRS.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ int vmbus_allocate_mmio(struct resource **new, struct hv_device *device_obj,
++ 			resource_size_t min, resource_size_t max,
++ 			resource_size_t size, resource_size_t align,
++ 			bool fb_overlap_ok)
++ {
++ 	struct resource *iter;
++ 	resource_size_t range_min, range_max, start, local_min, local_max;
++ 	const char *dev_n = dev_name(&device_obj->device);
++ 	u32 fb_end = screen_info.lfb_base + (screen_info.lfb_size << 1);
++ 	int i;
++ 
++ 	for (iter = hyperv_mmio; iter; iter = iter->sibling) {
++ 		if ((iter->start >= max) || (iter->end <= min))
++ 			continue;
++ 
++ 		range_min = iter->start;
++ 		range_max = iter->end;
++ 
++ 		/* If this range overlaps the frame buffer, split it into
++ 		   two tries. */
++ 		for (i = 0; i < 2; i++) {
++ 			local_min = range_min;
++ 			local_max = range_max;
++ 			if (fb_overlap_ok || (range_min >= fb_end) ||
++ 			    (range_max <= screen_info.lfb_base)) {
++ 				i++;
++ 			} else {
++ 				if ((range_min <= screen_info.lfb_base) &&
++ 				    (range_max >= screen_info.lfb_base)) {
++ 					/*
++ 					 * The frame buffer is in this window,
++ 					 * so trim this into the part that
++ 					 * preceeds the frame buffer.
++ 					 */
++ 					local_max = screen_info.lfb_base - 1;
++ 					range_min = fb_end;
++ 				} else {
++ 					range_min = fb_end;
++ 					continue;
++ 				}
++ 			}
++ 
++ 			start = (local_min + align - 1) & ~(align - 1);
++ 			for (; start + size - 1 <= local_max; start += align) {
++ 				*new = request_mem_region_exclusive(start, size,
++ 								    dev_n);
++ 				if (*new)
++ 					return 0;
++ 			}
++ 		}
++ 	}
++ 
++ 	return -ENXIO;
++ }
++ EXPORT_SYMBOL_GPL(vmbus_allocate_mmio);
++ 
+++>>>>>>> 3546448338e7 (drivers:hv: Move MMIO range picking from hyper_fb to hv_vmbus)
+  static int vmbus_acpi_add(struct acpi_device *device)
+  {
+  	acpi_status result;
+diff --cc drivers/video/hyperv_fb.c
+index 807ee22ef229,e2451bdb4525..000000000000
+--- a/drivers/video/hyperv_fb.c
++++ b/drivers/video/hyperv_fb.c
+@@@ -683,20 -683,12 +683,24 @@@ static int hvfb_getmem(struct hv_devic
+  	struct pci_dev *pdev  = NULL;
+  	void __iomem *fb_virt;
+  	int gen2vm = efi_enabled(EFI_BOOT);
++ 	resource_size_t pot_start, pot_end;
+  	int ret;
+  
+- 	par->mem.name = KBUILD_MODNAME;
+- 	par->mem.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+  	if (gen2vm) {
+++<<<<<<< HEAD:drivers/video/hyperv_fb.c
+ +		ret = allocate_resource(&hyperv_mmio, &par->mem,
+ +					screen_fb_size,
+ +					0, -1,
+ +					screen_fb_size,
+ +					NULL, NULL);
+ +		if (ret != 0) {
+ +			pr_err("Unable to allocate framebuffer memory\n");
+ +			return -ENODEV;
+ +		}
+++=======
++ 		pot_start = 0;
++ 		pot_end = -1;
+++>>>>>>> 3546448338e7 (drivers:hv: Move MMIO range picking from hyper_fb to hv_vmbus):drivers/video/fbdev/hyperv_fb.c
+  	} else {
+  		pdev = pci_get_device(PCI_VENDOR_ID_MICROSOFT,
+  			      PCI_DEVICE_ID_HYPERV_VIDEO, NULL);
+diff --cc include/linux/hyperv.h
+index 5538109db318,54733d5b503e..000000000000
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@@ -1205,17 -1236,8 +1210,20 @@@ extern bool vmbus_prep_negotiate_resp(s
+  					struct icmsg_negotiate *, u8 *, int,
+  					int);
+  
+ +int hv_kvp_init(struct hv_util_service *);
+ +void hv_kvp_deinit(void);
+ +void hv_kvp_onchannelcallback(void *);
+ +
+ +int hv_vss_init(struct hv_util_service *);
+ +void hv_vss_deinit(void);
+ +void hv_vss_onchannelcallback(void *);
+  void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid);
+  
+++<<<<<<< HEAD
+ +extern struct resource hyperv_mmio;
+ +
+++=======
+++>>>>>>> 3546448338e7 (drivers:hv: Move MMIO range picking from hyper_fb to hv_vmbus)
+  /*
+   * Negotiated version with the Host.
+   */
+* Unmerged path drivers/hv/vmbus_drv.c
+* Unmerged path drivers/video/hyperv_fb.c
+* Unmerged path include/linux/hyperv.h
