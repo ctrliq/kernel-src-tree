@@ -109,6 +109,12 @@ obj-$(CONFIG_PERF_EVENTS)		+= perf_regs.o
 obj-$(CONFIG_TRACING)			+= tracepoint.o
 obj-$(CONFIG_IOSF_MBI)			+= iosf_mbi.o
 
+ifdef CONFIG_FRAME_POINTER
+obj-y					+= unwind_frame.o
+else
+obj-y					+= unwind_guess.o
+endif
+
 ###
 # 64 bit specific files
 ifeq ($(CONFIG_X86_64),y)
