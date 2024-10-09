@@ -2505,6 +2505,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		return -EINVAL;
 
 	attr->in_rep = rpriv->rep;
+	attr->in_mdev = priv->mdev;
 
 	tcf_exts_to_list(exts, &actions);
 	list_for_each_entry(a, &actions, list) {
