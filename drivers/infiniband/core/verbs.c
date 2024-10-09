@@ -466,6 +466,8 @@ int ib_init_ah_from_wc(struct ib_device *device, u8 port_num,
 	union ib_gid dgid;
 	union ib_gid sgid;
 
+	might_sleep();
+
 	memset(ah_attr, 0, sizeof *ah_attr);
 	if (rdma_cap_eth_ah(device, port_num)) {
 		if (wc->wc_flags & IB_WC_WITH_NETWORK_HDR_TYPE)
