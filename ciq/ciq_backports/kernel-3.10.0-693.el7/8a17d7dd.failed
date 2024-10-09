@@ -1,0 +1,104 @@
+xfs: mark reclaimed inodes invalid earlier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8a17d7ddedb4d9031f046ae0e97c40b46aa69db5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8a17d7dd.failed
+
+The last thing we do before using call_rcu() on an xfs_inode to be
+freed is mark it as invalid. This means there is a window between
+when we know for certain that the inode is going to be freed and
+when we do actually mark it as "freed".
+
+This is important in the context of RCU lookups - we can look up the
+inode, find that it is valid, and then use it as such not realising
+that it is in the final stages of being freed.
+
+As such, mark the inode as being invalid the moment we know it is
+going to be reclaimed. This can be done while we still hold the
+XFS_ILOCK_EXCL and the flush lock in xfs_inode_reclaim, meaning that
+it occurs well before we remove it from the radix tree, and that
+the i_flags_lock, the XFS_ILOCK and the inode flush lock all act as
+synchronisation points for detecting that an inode is about to go
+away.
+
+For defensive purposes, this allows us to add a further check to
+xfs_iflush_cluster to ensure we skip inodes that are being freed
+after we grab the XFS_ILOCK_SHARED and the flush lock - we know that
+if the inode number if valid while we have these locks held we know
+that it has not progressed through reclaim to the point where it is
+clean and is about to be freed.
+
+[bfoster: fixed __xfs_inode_clear_reclaim() using ip->i_ino after it
+	  had already been zeroed.]
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 8a17d7ddedb4d9031f046ae0e97c40b46aa69db5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index 68b891ef61bd,57fcd5917a66..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -115,6 -111,25 +115,28 @@@ xfs_inode_free
+  		ip->i_itemp = NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	kmem_zone_free(xfs_inode_zone, ip);
++ }
++ 
++ static void
++ __xfs_inode_free(
++ 	struct xfs_inode	*ip)
++ {
++ 	/* asserts to verify all state is correct here */
++ 	ASSERT(atomic_read(&ip->i_pincount) == 0);
++ 	ASSERT(!xfs_isiflocked(ip));
++ 	XFS_STATS_DEC(ip->i_mount, vn_active);
++ 
++ 	call_rcu(&VFS_I(ip)->i_rcu, xfs_inode_free_callback);
++ }
++ 
++ void
++ xfs_inode_free(
++ 	struct xfs_inode	*ip)
++ {
+++>>>>>>> 8a17d7ddedb4 (xfs: mark reclaimed inodes invalid earlier)
+  	/*
+  	 * Because we use RCU freeing we need to ensure the inode always
+  	 * appears to be reclaimed with an invalid inode number when in the
+* Unmerged path fs/xfs/xfs_icache.c
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 5b3e9932514b..35d9cc39ec7f 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3242,6 +3242,19 @@ xfs_iflush_cluster(
+ 			continue;
+ 		}
+ 
++
++		/*
++		 * Check the inode number again, just to be certain we are not
++		 * racing with freeing in xfs_reclaim_inode(). See the comments
++		 * in that function for more information as to why the initial
++		 * check is not sufficient.
++		 */
++		if (!iq->i_ino) {
++			xfs_ifunlock(iq);
++			xfs_iunlock(iq, XFS_ILOCK_SHARED);
++			continue;
++		}
++
+ 		/*
+ 		 * arriving here means that this inode can be flushed.  First
+ 		 * re-check that it's dirty before flushing.
