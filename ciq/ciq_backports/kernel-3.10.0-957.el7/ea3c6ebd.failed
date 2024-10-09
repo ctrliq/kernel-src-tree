@@ -1,0 +1,156 @@
+USB: serial: visor: clean up treo endpoint hack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [usb] serial: visor: clean up treo endpoint hack (Torez Smith) [1540721]
+Rebuild_FUZZ: 94.38%
+commit-author Johan Hovold <johan@kernel.org>
+commit ea3c6ebdcb4e6f9e1b16d9ced983a8f9131abd01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ea3c6ebd.failed
+
+Use the new endpoint-remap functionality to configure the ports for
+treo devices instead of poking around in the port structures after the
+ports have been setup.
+
+	Signed-off-by: Johan Hovold <johan@kernel.org>
+(cherry picked from commit ea3c6ebdcb4e6f9e1b16d9ced983a8f9131abd01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/serial/visor.c
+diff --cc drivers/usb/serial/visor.c
+index 479e5181b057,9f3317a940ef..000000000000
+--- a/drivers/usb/serial/visor.c
++++ b/drivers/usb/serial/visor.c
+@@@ -40,11 -40,12 +40,14 @@@ static int  visor_open(struct tty_struc
+  static void visor_close(struct usb_serial_port *port);
+  static int  visor_probe(struct usb_serial *serial,
+  					const struct usb_device_id *id);
+ -static int  visor_calc_num_ports(struct usb_serial *serial,
+ -					struct usb_serial_endpoints *epds);
+ -static int  clie_5_calc_num_ports(struct usb_serial *serial,
+ -					struct usb_serial_endpoints *epds);
+ +static int  visor_calc_num_ports(struct usb_serial *serial);
+  static void visor_read_int_callback(struct urb *urb);
+  static int  clie_3_5_startup(struct usb_serial *serial);
+++<<<<<<< HEAD
+ +static int  treo_attach(struct usb_serial *serial);
+ +static int clie_5_attach(struct usb_serial *serial);
+++=======
+++>>>>>>> ea3c6ebdcb4e (USB: serial: visor: clean up treo endpoint hack)
+  static int palm_os_3_probe(struct usb_serial *serial,
+  					const struct usb_device_id *id);
+  static int palm_os_4_probe(struct usb_serial *serial,
+@@@ -465,8 -466,10 +467,9 @@@ static int visor_probe(struct usb_seria
+  	return retval;
+  }
+  
+ -static int visor_calc_num_ports(struct usb_serial *serial,
+ -					struct usb_serial_endpoints *epds)
+ +static int visor_calc_num_ports(struct usb_serial *serial)
+  {
++ 	unsigned int vid = le16_to_cpu(serial->dev->descriptor.idVendor);
+  	int num_ports = (int)(long)(usb_get_serial_data(serial));
+  
+  	if (num_ports)
+@@@ -530,94 -575,6 +556,97 @@@ out
+  	return result;
+  }
+  
+++<<<<<<< HEAD
+ +static int treo_attach(struct usb_serial *serial)
+ +{
+ +	struct usb_serial_port *swap_port;
+ +
+ +	/* Only do this endpoint hack for the Handspring devices with
+ +	 * interrupt in endpoints, which for now are the Treo devices. */
+ +	if (!((le16_to_cpu(serial->dev->descriptor.idVendor)
+ +						== HANDSPRING_VENDOR_ID) ||
+ +		(le16_to_cpu(serial->dev->descriptor.idVendor)
+ +						== KYOCERA_VENDOR_ID)) ||
+ +		(serial->num_interrupt_in == 0))
+ +		return 0;
+ +
+ +	if (serial->num_bulk_in < 2 || serial->num_interrupt_in < 2) {
+ +		dev_err(&serial->interface->dev, "missing endpoints\n");
+ +		return -ENODEV;
+ +	}
+ +
+ +	/*
+ +	* It appears that Treos and Kyoceras want to use the
+ +	* 1st bulk in endpoint to communicate with the 2nd bulk out endpoint,
+ +	* so let's swap the 1st and 2nd bulk in and interrupt endpoints.
+ +	* Note that swapping the bulk out endpoints would break lots of
+ +	* apps that want to communicate on the second port.
+ +	*/
+ +#define COPY_PORT(dest, src)						\
+ +	do { \
+ +		int i;							\
+ +									\
+ +		for (i = 0; i < ARRAY_SIZE(src->read_urbs); ++i) {	\
+ +			dest->read_urbs[i] = src->read_urbs[i];		\
+ +			dest->read_urbs[i]->context = dest;		\
+ +			dest->bulk_in_buffers[i] = src->bulk_in_buffers[i]; \
+ +		}							\
+ +		dest->read_urb = src->read_urb;				\
+ +		dest->bulk_in_endpointAddress = src->bulk_in_endpointAddress;\
+ +		dest->bulk_in_buffer = src->bulk_in_buffer;		\
+ +		dest->bulk_in_size = src->bulk_in_size;			\
+ +		dest->interrupt_in_urb = src->interrupt_in_urb;		\
+ +		dest->interrupt_in_urb->context = dest;			\
+ +		dest->interrupt_in_endpointAddress = \
+ +					src->interrupt_in_endpointAddress;\
+ +		dest->interrupt_in_buffer = src->interrupt_in_buffer;	\
+ +	} while (0);
+ +
+ +	swap_port = kmalloc(sizeof(*swap_port), GFP_KERNEL);
+ +	if (!swap_port)
+ +		return -ENOMEM;
+ +	COPY_PORT(swap_port, serial->port[0]);
+ +	COPY_PORT(serial->port[0], serial->port[1]);
+ +	COPY_PORT(serial->port[1], swap_port);
+ +	kfree(swap_port);
+ +
+ +	return 0;
+ +}
+ +
+ +static int clie_5_attach(struct usb_serial *serial)
+ +{
+ +	struct usb_serial_port *port;
+ +	unsigned int pipe;
+ +	int j;
+ +
+ +	/* TH55 registers 2 ports.
+ +	   Communication in from the UX50/TH55 uses bulk_in_endpointAddress
+ +	   from port 0. Communication out to the UX50/TH55 uses
+ +	   bulk_out_endpointAddress from port 1
+ +
+ +	   Lets do a quick and dirty mapping
+ +	 */
+ +
+ +	/* some sanity check */
+ +	if (serial->num_bulk_out < 2) {
+ +		dev_err(&serial->interface->dev, "missing bulk out endpoints\n");
+ +		return -ENODEV;
+ +	}
+ +
+ +	/* port 0 now uses the modified endpoint Address */
+ +	port = serial->port[0];
+ +	port->bulk_out_endpointAddress =
+ +				serial->port[1]->bulk_out_endpointAddress;
+ +
+ +	pipe = usb_sndbulkpipe(serial->dev, port->bulk_out_endpointAddress);
+ +	for (j = 0; j < ARRAY_SIZE(port->write_urbs); ++j)
+ +		port->write_urbs[j]->pipe = pipe;
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> ea3c6ebdcb4e (USB: serial: visor: clean up treo endpoint hack)
+  module_usb_serial_driver(serial_drivers, id_table_combined);
+  
+  MODULE_AUTHOR(DRIVER_AUTHOR);
+* Unmerged path drivers/usb/serial/visor.c
