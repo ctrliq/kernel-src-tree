@@ -1,0 +1,179 @@
+lib/dma-virt: Add dma_virt_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [lib] dma-virt: Add dma_virt_ops (Don Dutile) [1494648]
+Rebuild_FUZZ: 92.86%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 551199aca1c3102ebed390566d681cc1290284ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/551199ac.failed
+
+Several RDMA drivers (hfi1, qib and rxe) expect that ib_sge.addr
+is a virtual address. Provide DMA mapping operations that are
+suitable for these drivers.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Joerg Roedel <jroedel@suse.de>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 551199aca1c3102ebed390566d681cc1290284ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dma-mapping.h
+#	lib/Kconfig
+#	lib/Makefile
+diff --cc include/linux/dma-mapping.h
+index fe4bb5f6dd29,426c43d4fdbf..000000000000
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@@ -67,7 -127,8 +67,12 @@@ struct dma_map_ops 
+  	int is_phys;
+  };
+  
+++<<<<<<< HEAD
+ +extern struct dma_map_ops dma_noop_ops;
+++=======
++ extern const struct dma_map_ops dma_noop_ops;
++ extern const struct dma_map_ops dma_virt_ops;
+++>>>>>>> 551199aca1c3 (lib/dma-virt: Add dma_virt_ops)
+  
+  #define DMA_BIT_MASK(n)	(((n) == 64) ? ~0ULL : ((1ULL<<(n))-1))
+  
+diff --cc lib/Kconfig
+index fbd6fb868614,97af23b26f33..000000000000
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@@ -366,6 -395,16 +366,19 @@@ config HAS_DM
+  	depends on !NO_DMA
+  	default y
+  
+++<<<<<<< HEAD
+++=======
++ config DMA_NOOP_OPS
++ 	bool
++ 	depends on HAS_DMA && (!64BIT || ARCH_DMA_ADDR_T_64BIT)
++ 	default n
++ 
++ config DMA_VIRT_OPS
++ 	bool
++ 	depends on HAS_DMA && (!64BIT || ARCH_DMA_ADDR_T_64BIT)
++ 	default n
++ 
+++>>>>>>> 551199aca1c3 (lib/dma-virt: Add dma_virt_ops)
+  config CHECK_SIGNATURE
+  	bool
+  
+diff --cc lib/Makefile
+index c09f5df6637c,b97e9a814854..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -10,15 -10,24 +10,20 @@@ endi
+  lib-y := ctype.o string.o vsprintf.o cmdline.o \
+  	 rbtree.o radix-tree.o dump_stack.o timerqueue.o\
+  	 idr.o int_sqrt.o extable.o \
+ -	 sha1.o chacha20.o md5.o irq_regs.o argv_split.o \
+ -	 flex_proportions.o ratelimit.o show_mem.o \
+ +	 sha1.o chacha20.o md5.o irq_regs.o reciprocal_div.o argv_split.o \
+ +	 proportions.o flex_proportions.o prio_heap.o ratelimit.o show_mem.o \
+  	 is_single_threaded.o plist.o decompress.o kobject_uevent.o \
+ -	 earlycpio.o seq_buf.o nmi_backtrace.o nodemask.o win_minmax.o
+ +	 earlycpio.o percpu-refcount.o percpu_ida.o seq_buf.o
+  
+ +obj-$(CONFIG_ARCH_HAS_DEBUG_STRICT_USER_COPY_CHECKS) += usercopy.o
+  lib-$(CONFIG_MMU) += ioremap.o
+  lib-$(CONFIG_SMP) += cpumask.o
+++<<<<<<< HEAD
+ +lib-$(CONFIG_HAS_DMA) += dma-noop.o
+++=======
++ lib-$(CONFIG_DMA_NOOP_OPS) += dma-noop.o
++ lib-$(CONFIG_DMA_VIRT_OPS) += dma-virt.o
+++>>>>>>> 551199aca1c3 (lib/dma-virt: Add dma_virt_ops)
+  
+  lib-y	+= kobject.o klist.o
+  obj-y	+= lockref.o
+* Unmerged path include/linux/dma-mapping.h
+* Unmerged path lib/Kconfig
+* Unmerged path lib/Makefile
+diff --git a/lib/dma-virt.c b/lib/dma-virt.c
+new file mode 100644
+index 000000000000..dcd4df1f7174
+--- /dev/null
++++ b/lib/dma-virt.c
+@@ -0,0 +1,72 @@
++/*
++ *	lib/dma-virt.c
++ *
++ * DMA operations that map to virtual addresses without flushing memory.
++ */
++#include <linux/export.h>
++#include <linux/mm.h>
++#include <linux/dma-mapping.h>
++#include <linux/scatterlist.h>
++
++static void *dma_virt_alloc(struct device *dev, size_t size,
++			    dma_addr_t *dma_handle, gfp_t gfp,
++			    unsigned long attrs)
++{
++	void *ret;
++
++	ret = (void *)__get_free_pages(gfp, get_order(size));
++	if (ret)
++		*dma_handle = (uintptr_t)ret;
++	return ret;
++}
++
++static void dma_virt_free(struct device *dev, size_t size,
++			  void *cpu_addr, dma_addr_t dma_addr,
++			  unsigned long attrs)
++{
++	free_pages((unsigned long)cpu_addr, get_order(size));
++}
++
++static dma_addr_t dma_virt_map_page(struct device *dev, struct page *page,
++				    unsigned long offset, size_t size,
++				    enum dma_data_direction dir,
++				    unsigned long attrs)
++{
++	return (uintptr_t)(page_address(page) + offset);
++}
++
++static int dma_virt_map_sg(struct device *dev, struct scatterlist *sgl,
++			   int nents, enum dma_data_direction dir,
++			   unsigned long attrs)
++{
++	int i;
++	struct scatterlist *sg;
++
++	for_each_sg(sgl, sg, nents, i) {
++		BUG_ON(!sg_page(sg));
++		sg_dma_address(sg) = (uintptr_t)sg_virt(sg);
++		sg_dma_len(sg) = sg->length;
++	}
++
++	return nents;
++}
++
++static int dma_virt_mapping_error(struct device *dev, dma_addr_t dma_addr)
++{
++	return false;
++}
++
++static int dma_virt_supported(struct device *dev, u64 mask)
++{
++	return true;
++}
++
++const struct dma_map_ops dma_virt_ops = {
++	.alloc			= dma_virt_alloc,
++	.free			= dma_virt_free,
++	.map_page		= dma_virt_map_page,
++	.map_sg			= dma_virt_map_sg,
++	.mapping_error		= dma_virt_mapping_error,
++	.dma_supported		= dma_virt_supported,
++};
++EXPORT_SYMBOL(dma_virt_ops);
