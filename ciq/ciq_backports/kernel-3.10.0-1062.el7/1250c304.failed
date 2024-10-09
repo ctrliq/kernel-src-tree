@@ -1,0 +1,373 @@
+IB/uverbs: Handle IDR and FD types without truncation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 1250c3048cf1632f5dbb99a0242410baff67955d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1250c304.failed
+
+Our ABI for write() uses a s32 for FDs and a u32 for IDRs, but internally
+we ended up implicitly casting these ABI values into an 'int'. For ioctl()
+we use a s64 for FDs and a u64 for IDRs, again casting to an int.
+
+The various casts to int are all missing range checks which can cause
+userspace values that should be considered invalid to be accepted.
+
+Fix this by making the generic lookup routine accept a s64, which does not
+truncate the write API's u32/s32 or the ioctl API's s64. Then push the
+detailed range checking down to the actual type implementations to be
+shared by both interfaces.
+
+Finally, change the copy of the uobj->id to sign extend into a s64, so eg,
+if we ever wish to return a negative value for a FD it is carried
+properly.
+
+This ensures that userspace values are never weirdly interpreted due to
+the various trunctations and everything that is really out of range gets
+an EINVAL.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 1250c3048cf1632f5dbb99a0242410baff67955d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_cmd.c
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	include/rdma/uverbs_std_types.h
+#	include/rdma/uverbs_types.h
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,c63583dbc6b9..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -209,15 -210,19 +209,29 @@@ static void uverbs_idr_remove_uobj(stru
+  }
+  
+  /* Returns the ib_uobject or an error. The caller should check for IS_ERR. */
+++<<<<<<< HEAD
+ +static struct ib_uobject *lookup_get_idr_uobject(const struct uverbs_obj_type *type,
+ +						 struct ib_ucontext *ucontext,
+ +						 int id, bool exclusive)
+++=======
++ static struct ib_uobject *
++ lookup_get_idr_uobject(const struct uverbs_obj_type *type,
++ 		       struct ib_uverbs_file *ufile, s64 id, bool exclusive)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  {
+  	struct ib_uobject *uobj;
++ 	unsigned long idrno = id;
++ 
++ 	if (id < 0 || id > ULONG_MAX)
++ 		return ERR_PTR(-EINVAL);
+  
+  	rcu_read_lock();
+  	/* object won't be released as we're protected in rcu */
+++<<<<<<< HEAD
+ +	uobj = idr_find(&ucontext->ufile->idr, id);
+++=======
++ 	uobj = idr_find(&ufile->idr, idrno);
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  	if (!uobj) {
+  		uobj = ERR_PTR(-ENOENT);
+  		goto free;
+@@@ -238,8 -243,8 +252,13 @@@ free
+  }
+  
+  static struct ib_uobject *lookup_get_fd_uobject(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +						struct ib_ucontext *ucontext,
+ +						int id, bool exclusive)
+++=======
++ 						struct ib_uverbs_file *ufile,
++ 						s64 id, bool exclusive)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  {
+  	struct file *f;
+  	struct ib_uobject *uobject;
+@@@ -269,8 -278,8 +292,13 @@@
+  }
+  
+  struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					   struct ib_ucontext *ucontext,
+ +					   int id, bool exclusive)
+++=======
++ 					   struct ib_uverbs_file *ufile, s64 id,
++ 					   bool exclusive)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  {
+  	struct ib_uobject *uobj;
+  	int ret;
+@@@ -731,11 -728,12 +759,20 @@@ const struct uverbs_obj_type_class uver
+  	.remove_commit = remove_commit_fd_uobject,
+  	.needs_kfree_rcu = false,
+  };
+++<<<<<<< HEAD
+ + 
+ +struct ib_uobject *uverbs_get_uobject_from_context(const struct uverbs_obj_type *type_attrs,
+ +						   struct ib_ucontext *ucontext,
+ +						   enum uverbs_obj_access access,
+ +						   int id)
+++=======
++ EXPORT_SYMBOL(uverbs_fd_class);
++ 
++ struct ib_uobject *
++ uverbs_get_uobject_from_file(const struct uverbs_obj_type *type_attrs,
++ 			     struct ib_uverbs_file *ufile,
++ 			     enum uverbs_obj_access access, s64 id)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  {
+  	switch (access) {
+  	case UVERBS_ACCESS_READ:
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,db2339330f6f..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -90,10 -83,11 +90,18 @@@ void uverbs_close_fd(struct file *f)
+   * The action will be finalized only when uverbs_finalize_object or
+   * uverbs_finalize_objects are called.
+   */
+++<<<<<<< HEAD
+ +struct ib_uobject *uverbs_get_uobject_from_context(const struct uverbs_obj_type *type_attrs,
+ +						   struct ib_ucontext *ucontext,
+ +						   enum uverbs_obj_access access,
+ +						   int id);
+++=======
++ struct ib_uobject *
++ uverbs_get_uobject_from_file(const struct uverbs_obj_type *type_attrs,
++ 			     struct ib_uverbs_file *ufile,
++ 			     enum uverbs_obj_access access, s64 id);
++ 
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  /*
+   * Note that certain finalize stages could return a status:
+   *   (a) alloc_commit could return a failure if the object is committed at the
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index f1558e6f86c4,409fd46a2a99..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -48,11 -48,10 +48,18 @@@
+  #include "core_priv.h"
+  
+  static struct ib_uverbs_completion_event_file *
+++<<<<<<< HEAD
+ +ib_uverbs_lookup_comp_file(int fd, struct ib_ucontext *context)
+ +{
+ +	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ +						fd, context);
+ +	struct ib_uobject_file *uobj_file;
+++=======
++ _ib_uverbs_lookup_comp_file(s32 fd, struct ib_uverbs_file *ufile)
++ {
++ 	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
++ 					       fd, ufile);
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  
+  	if (IS_ERR(uobj))
+  		return (void *)uobj;
+@@@ -60,10 -59,11 +67,12 @@@
+  	uverbs_uobject_get(uobj);
+  	uobj_put_read(uobj);
+  
+ -	return container_of(uobj, struct ib_uverbs_completion_event_file,
+ -			    uobj);
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+ +	return container_of(uobj_file, struct ib_uverbs_completion_event_file,
+ +			    uobj_file);
+  }
++ #define ib_uverbs_lookup_comp_file(_fd, _ufile)                                \
++ 	_ib_uverbs_lookup_comp_file((_fd)*typecheck(s32, _fd), _ufile)
+  
+  ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+  			      struct ib_device *ib_dev,
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,26ddc5cadcdb..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -127,7 -140,7 +124,11 @@@ static int uverbs_process_attr(struct i
+  		if (uattr->attr_data.reserved)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		if (uattr->len != 0 || !ucontext || uattr->data > INT_MAX)
+++=======
++ 		if (uattr->len != 0 || !ufile->ucontext)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  			return -EINVAL;
+  
+  		o_attr = &e->obj_attr;
+@@@ -135,17 -148,23 +136,36 @@@
+  		if (!object)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		o_attr->uobject = uverbs_get_uobject_from_context(
+ +					object->type_attrs,
+ +					ucontext,
+ +					spec->obj.access,
+ +					(int)uattr->data);
+++=======
++ 		/*
++ 		 * The type of uattr->data is u64 for UVERBS_ATTR_TYPE_IDR and
++ 		 * s64 for UVERBS_ATTR_TYPE_FD. We can cast the u64 to s64
++ 		 * here without caring about truncation as we know that the
++ 		 * IDR implementation today rejects negative IDs
++ 		 */
++ 		o_attr->uobject = uverbs_get_uobject_from_file(
++ 					object->type_attrs,
++ 					ufile,
++ 					spec->u.obj.access,
++ 					uattr->data_s64);
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  
+  		if (IS_ERR(o_attr->uobject))
+  			return PTR_ERR(o_attr->uobject);
+  
+++<<<<<<< HEAD
+ +		if (spec->obj.access == UVERBS_ACCESS_NEW) {
+ +			u64 id = o_attr->uobject->id;
+++=======
++ 		if (spec->u.obj.access == UVERBS_ACCESS_NEW) {
++ 			s64 id = o_attr->uobject->id;
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  
+  			/* Copy the allocated id to the user-space */
+  			if (put_user(id, &e->uattr->data)) {
+diff --cc include/rdma/uverbs_std_types.h
+index 6e389a6b0382,4f32eab8b7a4..000000000000
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@@ -46,35 -46,43 +46,70 @@@ static inline const struct uverbs_objec
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline struct ib_uobject *__uobj_get(const struct uverbs_obj_type *type,
+ +					    bool write,
+ +					    struct ib_ucontext *ucontext,
+ +					    int id)
+ +{
+ +	return rdma_lookup_get_uobject(type, ucontext, id, write);
+ +}
+ +
+ +#define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
+ +
+ +#define uobj_get_read(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), false, _ucontext, _id)
+ +
+ +#define uobj_get_obj_read(_object, _type, _id, _ucontext)		\
+ +({									\
+ +	struct ib_uobject *__uobj =					\
+ +		__uobj_get(uobj_get_type(_type),			\
+ +			   false, _ucontext, _id);			\
+ +									\
+ +	(struct ib_##_object *)(IS_ERR(__uobj) ? NULL : __uobj->object);\
+ +})
+ +
+ +#define uobj_get_write(_type, _id, _ucontext)				\
+ +	 __uobj_get(uobj_get_type(_type), true, _ucontext, _id)
+++=======
++ /* Returns _id, or causes a compile error if _id is not a u32.
++  *
++  * The uobj APIs should only be used with the write based uAPI to access
++  * object IDs. The write API must use a u32 for the object handle, which is
++  * checked by this macro.
++  */
++ #define _uobj_check_id(_id) ((_id) * typecheck(u32, _id))
++ 
++ #define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
++ 
++ #define uobj_get_read(_type, _id, _ufile)                                      \
++ 	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++ 				_uobj_check_id(_id), false)
++ 
++ #define ufd_get_read(_type, _fdnum, _ufile)                                    \
++ 	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++ 				(_fdnum)*typecheck(s32, _fdnum), false)
++ 
++ static inline void *_uobj_get_obj_read(struct ib_uobject *uobj)
++ {
++ 	if (IS_ERR(uobj))
++ 		return NULL;
++ 	return uobj->object;
++ }
++ #define uobj_get_obj_read(_object, _type, _id, _ufile)                         \
++ 	((struct ib_##_object *)_uobj_get_obj_read(                            \
++ 		uobj_get_read(_type, _id, _ufile)))
++ 
++ #define uobj_get_write(_type, _id, _ufile)                                     \
++ 	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++ 				_uobj_check_id(_id), true)
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  
+- int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
++ int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+  			   struct ib_uverbs_file *ufile, int success_res);
+  #define uobj_perform_destroy(_type, _id, _ufile, _success_res)                 \
+- 	__uobj_perform_destroy(uobj_get_type(_type), _id, _ufile, _success_res)
++ 	__uobj_perform_destroy(uobj_get_type(_type), _uobj_check_id(_id),      \
++ 			       _ufile, _success_res)
+  
+  static inline void uobj_put_read(struct ib_uobject *uobj)
+  {
+diff --cc include/rdma/uverbs_types.h
+index cc04ec65588d,2f50cc6def3c..000000000000
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@@ -77,7 -77,7 +77,11 @@@ struct uverbs_obj_type_class 
+  	void (*alloc_abort)(struct ib_uobject *uobj);
+  
+  	struct ib_uobject *(*lookup_get)(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					 struct ib_ucontext *ucontext, int id,
+++=======
++ 					 struct ib_uverbs_file *ufile, s64 id,
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  					 bool exclusive);
+  	void (*lookup_put)(struct ib_uobject *uobj, bool exclusive);
+  	/*
+@@@ -121,11 -120,11 +125,16 @@@ struct uverbs_obj_idr_type 
+  };
+  
+  struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					   struct ib_ucontext *ucontext,
+ +					   int id, bool exclusive);
+++=======
++ 					   struct ib_uverbs_file *ufile,
++ 					   s64 id, bool exclusive);
+++>>>>>>> 1250c3048cf1 (IB/uverbs: Handle IDR and FD types without truncation)
+  void rdma_lookup_put_uobject(struct ib_uobject *uobj, bool exclusive);
+  struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ -					    struct ib_uverbs_file *ufile);
+ +					    struct ib_ucontext *ucontext);
+  void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+  int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj);
+  int rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+* Unmerged path drivers/infiniband/core/rdma_core.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path include/rdma/uverbs_std_types.h
+* Unmerged path include/rdma/uverbs_types.h
+diff --git a/include/uapi/rdma/rdma_user_ioctl_cmds.h b/include/uapi/rdma/rdma_user_ioctl_cmds.h
+index e39b37a830e2..2f882edc13f0 100644
+--- a/include/uapi/rdma/rdma_user_ioctl_cmds.h
++++ b/include/uapi/rdma/rdma_user_ioctl_cmds.h
+@@ -62,7 +62,12 @@ struct ib_uverbs_attr {
+ 		} enum_data;
+ 		__u16 reserved;
+ 	} attr_data;
+-	__aligned_u64 data;	/* ptr to command, inline data or idr/fd */
++	union {
++		/* Used by PTR_IN/OUT, ENUM_IN and IDR */
++		__aligned_u64 data;
++		/* Used by FD_IN and FD_OUT */
++		__s64 data_s64;
++	};
+ };
+ 
+ struct ib_uverbs_ioctl_hdr {
