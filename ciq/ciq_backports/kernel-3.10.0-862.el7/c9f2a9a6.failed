@@ -1,0 +1,277 @@
+x86/efi: Hoist page table switching code into efi_call_virt()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] efi: Hoist page table switching code into efi_call_virt() (Bhupesh Sharma) [1102454]
+Rebuild_FUZZ: 96.61%
+commit-author Matt Fleming <matt@codeblueprint.co.uk>
+commit c9f2a9a65e4855b74d92cdad688f6ee4a1a323ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c9f2a9a6.failed
+
+This change is a prerequisite for pending patches that switch to
+a dedicated EFI page table, instead of using 'trampoline_pgd'
+which shares PGD entries with 'swapper_pg_dir'. The pending
+patches make it impossible to dereference the runtime service
+function pointer without first switching %cr3.
+
+It's true that we now have duplicated switching code in
+efi_call_virt() and efi_call_phys_{prolog,epilog}() but we are
+sacrificing code duplication for a little more clarity and the
+ease of writing the page table switching code in C instead of
+asm.
+
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Jones <davej@codemonkey.org.uk>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Cc: Stephen Smalley <sds@tycho.nsa.gov>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Toshi Kani <toshi.kani@hp.com>
+	Cc: linux-efi@vger.kernel.org
+Link: http://lkml.kernel.org/r/1448658575-17029-5-git-send-email-matt@codeblueprint.co.uk
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c9f2a9a65e4855b74d92cdad688f6ee4a1a323ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/include/asm/efi.h
+index d1a2aa8edaf2,347eeacb06a8..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -1,6 -1,10 +1,13 @@@
+  #ifndef _ASM_X86_EFI_H
+  #define _ASM_X86_EFI_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/fpu/api.h>
++ #include <asm/pgtable.h>
++ #include <asm/tlb.h>
++ 
+++>>>>>>> c9f2a9a65e48 (x86/efi: Hoist page table switching code into efi_call_virt())
+  /*
+   * We map the EFI regions needed for runtime services non-contiguously,
+   * with preserved alignment on virtual addresses starting from -4G down
+@@@ -54,7 -82,22 +72,26 @@@ struct efi_scratch 
+  									\
+  	efi_sync_low_kernel_mappings();					\
+  	preempt_disable();						\
+++<<<<<<< HEAD
+ +	__s = efi_call((void *)efi.systab->runtime->f, __VA_ARGS__);	\
+++=======
++ 	__kernel_fpu_begin();						\
++ 									\
++ 	if (efi_scratch.use_pgd) {					\
++ 		efi_scratch.prev_cr3 = read_cr3();			\
++ 		write_cr3((unsigned long)efi_scratch.efi_pgt);		\
++ 		__flush_tlb_all();					\
++ 	}								\
++ 									\
++ 	__s = efi_call((void *)efi.systab->runtime->f, __VA_ARGS__);	\
++ 									\
++ 	if (efi_scratch.use_pgd) {					\
++ 		write_cr3(efi_scratch.prev_cr3);			\
++ 		__flush_tlb_all();					\
++ 	}								\
++ 									\
++ 	__kernel_fpu_end();						\
+++>>>>>>> c9f2a9a65e48 (x86/efi: Hoist page table switching code into efi_call_virt())
+  	preempt_enable();						\
+  	__s;								\
+  })
+diff --cc arch/x86/platform/efi/efi_64.c
+index 967c09f5fd5d,b19cdac959b2..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -78,79 -66,57 +69,95 @@@ static void __init early_code_mapping_s
+  	}
+  }
+  
+ -pgd_t * __init efi_call_phys_prolog(void)
+ +void __init efi_call_phys_prolog(void)
+  {
+ -	unsigned long vaddress;
+ -	pgd_t *save_pgd;
+ +	unsigned long vaddr, addr_pgd, addr_pud;
+ +	pgd_t *pgd_k, *pgd_efi;
+ +	pud_t *pud;
+  
+  	int pgd;
+ -	int n_pgds;
+ +	int n_pgds, j;
+  
+++<<<<<<< HEAD
+ +	if (!efi_enabled(EFI_OLD_MEMMAP))
+ +		return;
+++=======
++ 	if (!efi_enabled(EFI_OLD_MEMMAP)) {
++ 		save_pgd = (pgd_t *)read_cr3();
++ 		write_cr3((unsigned long)efi_scratch.efi_pgt);
++ 		goto out;
++ 	}
+++>>>>>>> c9f2a9a65e48 (x86/efi: Hoist page table switching code into efi_call_virt())
+  
+  	early_code_mapping_set_exec(1);
+  
+  	n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT), PGDIR_SIZE);
+  	save_pgd = kmalloc(n_pgds * sizeof(pgd_t), GFP_KERNEL);
+  
+ +	/*
+ +	 * Build 1:1 ident mapping for old_map usage. It needs to be noticed
+ +	 * that PAGE_OFFSET is PGDIR_SIZE aligned with KASLR disabled, while
+ +	 * PUD_SIZE ALIGNED with KASLR enabled. So for a given physical
+ +	 * address X, the pud_index(X) != pud_index(__va(X)), we can only copy
+ +	 * pud entry of __va(X) to fill in pud entry of X to build 1:1 mapping
+ +	 * . Means here we can only reuse pmd table of direct mapping.
+ +	 */
+  	for (pgd = 0; pgd < n_pgds; pgd++) {
+ -		save_pgd[pgd] = *pgd_offset_k(pgd * PGDIR_SIZE);
+ -		vaddress = (unsigned long)__va(pgd * PGDIR_SIZE);
+ -		set_pgd(pgd_offset_k(pgd * PGDIR_SIZE), *pgd_offset_k(vaddress));
+ +		addr_pgd = (unsigned long)(pgd * PGDIR_SIZE);
+ +		vaddr = (unsigned long)__va(pgd * PGDIR_SIZE);
+ +		pgd_efi = pgd_offset_k(addr_pgd);
+ +		save_pgd[pgd] = *pgd_efi;
+ +
+ +		pud = pud_alloc(&init_mm, pgd_efi, addr_pgd);
+ +		if (!pud) {
+ +			pr_err("Failed to allocate pud table!\n");
+ +			break;
+ +		}
+ +		for (j = 0; j < PTRS_PER_PUD; j++) {
+ +			addr_pud = addr_pgd + j * PUD_SIZE;
+ +			if (addr_pud > (max_pfn << PAGE_SHIFT))
+ +				break;
+ +			vaddr = (unsigned long)__va(addr_pud);
+ +
+ +			pgd_k = pgd_offset_k(vaddr);
+ +			pud[j] = *pud_offset(pgd_k, vaddr);
+ +		}
+  	}
++ out:
+  	__flush_tlb_all();
+ -
+ -	return save_pgd;
+  }
+  
+ -void __init efi_call_phys_epilog(pgd_t *save_pgd)
+ +void __init efi_call_phys_epilog(void)
+  {
+  	/*
+  	 * After the lock is released, the original page table is restored.
+  	 */
+  	int pgd_idx;
+ -	int nr_pgds;
+ +	int n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
+ +	pgd_t *pgd;
+ +	pud_t *pud;
+  
+++<<<<<<< HEAD
+ +	if (!efi_enabled(EFI_OLD_MEMMAP))
+++=======
++ 	if (!efi_enabled(EFI_OLD_MEMMAP)) {
++ 		write_cr3((unsigned long)save_pgd);
++ 		__flush_tlb_all();
+++>>>>>>> c9f2a9a65e48 (x86/efi: Hoist page table switching code into efi_call_virt())
+  		return;
++ 	}
+  
+ -	nr_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
+ -
+ -	for (pgd_idx = 0; pgd_idx < nr_pgds; pgd_idx++)
+ +	for (pgd_idx = 0; pgd_idx < n_pgds; pgd_idx++) {
+ +		pgd = pgd_offset_k(pgd_idx * PGDIR_SIZE);
+  		set_pgd(pgd_offset_k(pgd_idx * PGDIR_SIZE), save_pgd[pgd_idx]);
+  
+ -	kfree(save_pgd);
+ +		if (!(pgd_val(*pgd) & _PAGE_PRESENT))
+ +			continue;
+  
+ +		pud = (pud_t *)pgd_page_vaddr(*pgd);
+ +		pud_free(&init_mm, pud);
+ +	}
+ +	kfree(save_pgd);
+  	__flush_tlb_all();
+  	early_code_mapping_set_exec(0);
+  }
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path arch/x86/platform/efi/efi_64.c
+diff --git a/arch/x86/platform/efi/efi_stub_64.S b/arch/x86/platform/efi/efi_stub_64.S
+index 75e8a5ef2658..cd95075944ab 100644
+--- a/arch/x86/platform/efi/efi_stub_64.S
++++ b/arch/x86/platform/efi/efi_stub_64.S
+@@ -38,41 +38,6 @@
+ 	mov %rsi, %cr0;			\
+ 	mov (%rsp), %rsp
+ 
+-	/* stolen from gcc */
+-	.macro FLUSH_TLB_ALL
+-	movq %r15, efi_scratch(%rip)
+-	movq %r14, efi_scratch+8(%rip)
+-	movq %cr4, %r15
+-	movq %r15, %r14
+-	andb $0x7f, %r14b
+-	movq %r14, %cr4
+-	movq %r15, %cr4
+-	movq efi_scratch+8(%rip), %r14
+-	movq efi_scratch(%rip), %r15
+-	.endm
+-
+-	.macro SWITCH_PGT
+-	cmpb $0, efi_scratch+24(%rip)
+-	je 1f
+-	movq %r15, efi_scratch(%rip)		# r15
+-	# save previous CR3
+-	movq %cr3, %r15
+-	movq %r15, efi_scratch+8(%rip)		# prev_cr3
+-	movq efi_scratch+16(%rip), %r15		# EFI pgt
+-	movq %r15, %cr3
+-	1:
+-	.endm
+-
+-	.macro RESTORE_PGT
+-	cmpb $0, efi_scratch+24(%rip)
+-	je 2f
+-	movq efi_scratch+8(%rip), %r15
+-	movq %r15, %cr3
+-	movq efi_scratch(%rip), %r15
+-	FLUSH_TLB_ALL
+-	2:
+-	.endm
+-
+ ENTRY(efi_call)
+ 	pushq %rbp
+ 	movq %rsp, %rbp
+@@ -84,17 +49,9 @@ ENTRY(efi_call)
+ 	mov %r8, %r9
+ 	mov %rcx, %r8
+ 	mov %rsi, %rcx
+-	SWITCH_PGT
+ 	call *%rdi
+-	RESTORE_PGT
+ 	addq $48, %rsp
+ 	RESTORE_XMM
+ 	popq %rbp
+ 	ret
+ ENDPROC(efi_call)
+-
+-	.data
+-ENTRY(efi_scratch)
+-	.fill 3,8,0
+-	.byte 0
+-	.quad 0
