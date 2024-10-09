@@ -1,0 +1,324 @@
+IB/mlx5: Set uid as part of TIR commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 443c1cf9d6c845d0dc389469b78cefec842d5868
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/443c1cf9.failed
+
+Set uid as part of TIR commands so that the firmware can manage the
+TIR object in a secured way.
+
+That will enable using a TIR that was created by verbs application to
+be used by the DEVX flow in case the uid is equal.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 443c1cf9d6c845d0dc389469b78cefec842d5868)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/cmd.c
+#	drivers/infiniband/hw/mlx5/cmd.h
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/cmd.c
+index 20fa395e65e0,9834cd4d1e45..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@@ -81,3 -81,171 +81,174 @@@ int mlx5_cmd_modify_cong_params(struct 
+  
+  	return mlx5_cmd_exec(dev, in, in_size, out, sizeof(out));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++ 			  u64 length, u32 alignment)
++ {
++ 	struct mlx5_core_dev *dev = memic->dev;
++ 	u64 num_memic_hw_pages = MLX5_CAP_DEV_MEM(dev, memic_bar_size)
++ 					>> PAGE_SHIFT;
++ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++ 	u32 max_alignment = MLX5_CAP_DEV_MEM(dev, log_max_memic_addr_alignment);
++ 	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++ 	u32 out[MLX5_ST_SZ_DW(alloc_memic_out)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(alloc_memic_in)] = {};
++ 	u32 mlx5_alignment;
++ 	u64 page_idx = 0;
++ 	int ret = 0;
++ 
++ 	if (!length || (length & MLX5_MEMIC_ALLOC_SIZE_MASK))
++ 		return -EINVAL;
++ 
++ 	/* mlx5 device sets alignment as 64*2^driver_value
++ 	 * so normalizing is needed.
++ 	 */
++ 	mlx5_alignment = (alignment < MLX5_MEMIC_BASE_ALIGN) ? 0 :
++ 			 alignment - MLX5_MEMIC_BASE_ALIGN;
++ 	if (mlx5_alignment > max_alignment)
++ 		return -EINVAL;
++ 
++ 	MLX5_SET(alloc_memic_in, in, opcode, MLX5_CMD_OP_ALLOC_MEMIC);
++ 	MLX5_SET(alloc_memic_in, in, range_size, num_pages * PAGE_SIZE);
++ 	MLX5_SET(alloc_memic_in, in, memic_size, length);
++ 	MLX5_SET(alloc_memic_in, in, log_memic_addr_alignment,
++ 		 mlx5_alignment);
++ 
++ 	while (page_idx < num_memic_hw_pages) {
++ 		spin_lock(&memic->memic_lock);
++ 		page_idx = bitmap_find_next_zero_area(memic->memic_alloc_pages,
++ 						      num_memic_hw_pages,
++ 						      page_idx,
++ 						      num_pages, 0);
++ 
++ 		if (page_idx < num_memic_hw_pages)
++ 			bitmap_set(memic->memic_alloc_pages,
++ 				   page_idx, num_pages);
++ 
++ 		spin_unlock(&memic->memic_lock);
++ 
++ 		if (page_idx >= num_memic_hw_pages)
++ 			break;
++ 
++ 		MLX5_SET64(alloc_memic_in, in, range_start_addr,
++ 			   hw_start_addr + (page_idx * PAGE_SIZE));
++ 
++ 		ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 		if (ret) {
++ 			spin_lock(&memic->memic_lock);
++ 			bitmap_clear(memic->memic_alloc_pages,
++ 				     page_idx, num_pages);
++ 			spin_unlock(&memic->memic_lock);
++ 
++ 			if (ret == -EAGAIN) {
++ 				page_idx++;
++ 				continue;
++ 			}
++ 
++ 			return ret;
++ 		}
++ 
++ 		*addr = pci_resource_start(dev->pdev, 0) +
++ 			MLX5_GET64(alloc_memic_out, out, memic_start_addr);
++ 
++ 		return 0;
++ 	}
++ 
++ 	return -ENOMEM;
++ }
++ 
++ int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
++ {
++ 	struct mlx5_core_dev *dev = memic->dev;
++ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++ 	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++ 	u32 out[MLX5_ST_SZ_DW(dealloc_memic_out)] = {0};
++ 	u32 in[MLX5_ST_SZ_DW(dealloc_memic_in)] = {0};
++ 	u64 start_page_idx;
++ 	int err;
++ 
++ 	addr -= pci_resource_start(dev->pdev, 0);
++ 	start_page_idx = (addr - hw_start_addr) >> PAGE_SHIFT;
++ 
++ 	MLX5_SET(dealloc_memic_in, in, opcode, MLX5_CMD_OP_DEALLOC_MEMIC);
++ 	MLX5_SET64(dealloc_memic_in, in, memic_start_addr, addr);
++ 	MLX5_SET(dealloc_memic_in, in, memic_size, length);
++ 
++ 	err =  mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 
++ 	if (!err) {
++ 		spin_lock(&memic->memic_lock);
++ 		bitmap_clear(memic->memic_alloc_pages,
++ 			     start_page_idx, num_pages);
++ 		spin_unlock(&memic->memic_lock);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(ppcnt_reg)] = {};
++ 	int sz = MLX5_ST_SZ_BYTES(ppcnt_reg);
++ 
++ 	MLX5_SET(ppcnt_reg, in, local_port, 1);
++ 
++ 	MLX5_SET(ppcnt_reg, in, grp, MLX5_ETHERNET_EXTENDED_COUNTERS_GROUP);
++ 	return  mlx5_core_access_reg(dev, in, sz, out, sz, MLX5_REG_PPCNT,
++ 				     0, 0);
++ }
++ 
++ void mlx5_cmd_destroy_tir(struct mlx5_core_dev *dev, u32 tirn, u16 uid)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(destroy_tir_in)]   = {};
++ 	u32 out[MLX5_ST_SZ_DW(destroy_tir_out)] = {};
++ 
++ 	MLX5_SET(destroy_tir_in, in, opcode, MLX5_CMD_OP_DESTROY_TIR);
++ 	MLX5_SET(destroy_tir_in, in, tirn, tirn);
++ 	MLX5_SET(destroy_tir_in, in, uid, uid);
++ 	mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
++ 
++ void mlx5_cmd_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn, u16 uid)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(dealloc_pd_out)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(dealloc_pd_in)]   = {};
++ 
++ 	MLX5_SET(dealloc_pd_in, in, opcode, MLX5_CMD_OP_DEALLOC_PD);
++ 	MLX5_SET(dealloc_pd_in, in, pd, pdn);
++ 	MLX5_SET(dealloc_pd_in, in, uid, uid);
++ 	mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
++ 
++ int mlx5_cmd_attach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid,
++ 			u32 qpn, u16 uid)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(attach_to_mcg_out)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(attach_to_mcg_in)]   = {};
++ 	void *gid;
++ 
++ 	MLX5_SET(attach_to_mcg_in, in, opcode, MLX5_CMD_OP_ATTACH_TO_MCG);
++ 	MLX5_SET(attach_to_mcg_in, in, qpn, qpn);
++ 	MLX5_SET(attach_to_mcg_in, in, uid, uid);
++ 	gid = MLX5_ADDR_OF(attach_to_mcg_in, in, multicast_gid);
++ 	memcpy(gid, mgid, sizeof(*mgid));
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
++ 
++ int mlx5_cmd_detach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid,
++ 			u32 qpn, u16 uid)
++ {
++ 	u32 out[MLX5_ST_SZ_DW(detach_from_mcg_out)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(detach_from_mcg_in)]   = {};
++ 	void *gid;
++ 
++ 	MLX5_SET(detach_from_mcg_in, in, opcode, MLX5_CMD_OP_DETACH_FROM_MCG);
++ 	MLX5_SET(detach_from_mcg_in, in, qpn, qpn);
++ 	MLX5_SET(detach_from_mcg_in, in, uid, uid);
++ 	gid = MLX5_ADDR_OF(detach_from_mcg_in, in, multicast_gid);
++ 	memcpy(gid, mgid, sizeof(*mgid));
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ }
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+diff --cc drivers/infiniband/hw/mlx5/cmd.h
+index 802f939e52b9,feab7682bfbd..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.h
++++ b/drivers/infiniband/hw/mlx5/cmd.h
+@@@ -40,6 -41,16 +40,18 @@@ int mlx5_cmd_dump_fill_mkey(struct mlx5
+  int mlx5_cmd_null_mkey(struct mlx5_core_dev *dev, u32 *null_mkey);
+  int mlx5_cmd_query_cong_params(struct mlx5_core_dev *dev, int cong_point,
+  			       void *out, int out_size);
+ -int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out);
+  int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *mdev,
+  				void *in, int in_size);
+++<<<<<<< HEAD
+++=======
++ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++ 			 u64 length, u32 alignment);
++ int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length);
++ void mlx5_cmd_dealloc_pd(struct mlx5_core_dev *dev, u32 pdn, u16 uid);
++ void mlx5_cmd_destroy_tir(struct mlx5_core_dev *dev, u32 tirn, u16 uid);
++ int mlx5_cmd_attach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid,
++ 			u32 qpn, u16 uid);
++ int mlx5_cmd_detach_mcg(struct mlx5_core_dev *dev, union ib_gid *mgid,
++ 			u32 qpn, u16 uid);
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  #endif /* MLX5_IB_CMD_H */
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 2f4c89bb2628,2b2d26fa071d..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -1255,9 -1260,21 +1256,24 @@@ static bool tunnel_offload_supported(st
+  		 MLX5_CAP_ETH(dev, tunnel_stateless_geneve_rx));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void destroy_raw_packet_qp_tir(struct mlx5_ib_dev *dev,
++ 				      struct mlx5_ib_rq *rq,
++ 				      u32 qp_flags_en,
++ 				      struct ib_pd *pd)
++ {
++ 	if (qp_flags_en & (MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_UC |
++ 			   MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_MC))
++ 		mlx5_ib_disable_lb(dev, false, true);
++ 	mlx5_cmd_destroy_tir(dev->mdev, rq->tirn, to_mpd(pd)->uid);
++ }
++ 
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  static int create_raw_packet_qp_tir(struct mlx5_ib_dev *dev,
+  				    struct mlx5_ib_rq *rq, u32 tdn,
+- 				    u32 *qp_flags_en)
++ 				    u32 *qp_flags_en,
++ 				    struct ib_pd *pd)
+  {
+  	u8 lb_flag = 0;
+  	u32 *in;
+@@@ -1292,6 -1310,12 +1309,15 @@@
+  
+  	err = mlx5_core_create_tir(dev->mdev, in, inlen, &rq->tirn);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!err && MLX5_GET(tirc, tirc, self_lb_block)) {
++ 		err = mlx5_ib_enable_lb(dev, false, true);
++ 
++ 		if (err)
++ 			destroy_raw_packet_qp_tir(dev, rq, 0, pd);
++ 	}
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  	kvfree(in);
+  
+  	return err;
+@@@ -1371,7 -1388,7 +1396,11 @@@ static void destroy_raw_packet_qp(struc
+  	struct mlx5_ib_rq *rq = &raw_packet_qp->rq;
+  
+  	if (qp->rq.wqe_cnt) {
+++<<<<<<< HEAD
+ +		destroy_raw_packet_qp_tir(dev, rq);
+++=======
++ 		destroy_raw_packet_qp_tir(dev, rq, qp->flags_en, qp->ibqp.pd);
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  		destroy_raw_packet_qp_rq(dev, rq);
+  	}
+  
+@@@ -1395,7 -1412,11 +1424,15 @@@ static void raw_packet_qp_copy_info(str
+  
+  static void destroy_rss_raw_qp_tir(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp)
+  {
+++<<<<<<< HEAD
+ +	mlx5_core_destroy_tir(dev->mdev, qp->rss_qp.tirn);
+++=======
++ 	if (qp->flags_en & (MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_UC |
++ 			    MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_MC))
++ 		mlx5_ib_disable_lb(dev, false, true);
++ 	mlx5_cmd_destroy_tir(dev->mdev, qp->rss_qp.tirn,
++ 			     to_mpd(qp->ibqp.pd)->uid);
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  }
+  
+  static int create_rss_raw_qp_tir(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+@@@ -1605,6 -1627,14 +1643,17 @@@
+  create_tir:
+  	err = mlx5_core_create_tir(dev->mdev, in, inlen, &qp->rss_qp.tirn);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!err && MLX5_GET(tirc, tirc, self_lb_block)) {
++ 		err = mlx5_ib_enable_lb(dev, false, true);
++ 
++ 		if (err)
++ 			mlx5_cmd_destroy_tir(dev->mdev, qp->rss_qp.tirn,
++ 					     to_mpd(pd)->uid);
++ 	}
++ 
+++>>>>>>> 443c1cf9d6c8 (IB/mlx5: Set uid as part of TIR commands)
+  	if (err)
+  		goto err;
+  
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.c
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.h
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
