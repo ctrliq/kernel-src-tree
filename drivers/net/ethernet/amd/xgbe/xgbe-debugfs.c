@@ -331,6 +331,7 @@ void xgbe_debugfs_init(struct xgbe_prv_data *pdata)
 	pdata->xgbe_debugfs = debugfs_create_dir(buf, NULL);
 	if (pdata->xgbe_debugfs == NULL) {
 		netdev_err(pdata->netdev, "debugfs_create_dir failed\n");
+		kfree(buf);
 		return;
 	}
 
