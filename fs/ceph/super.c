@@ -822,6 +822,8 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
 		err = ceph_fs_debugfs_init(fsc);
 		if (err < 0)
 			goto fail;
+	} else {
+		root = dget(fsc->sb->s_root);
 	}
 
 	if (!fsc->mount_options->server_path) {
