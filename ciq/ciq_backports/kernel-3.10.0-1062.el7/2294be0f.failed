@@ -1,0 +1,770 @@
+net: use skb_sec_path helper in more places
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] intel: use secpath helpers in more places (Ken Cox) [1637723]
+Rebuild_FUZZ: 88.10%
+commit-author Florian Westphal <fw@strlen.de>
+commit 2294be0f11e22b6197d025e5d3ab42888879ec4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2294be0f.failed
+
+skb_sec_path gains 'const' qualifier to avoid
+xt_policy.c: 'skb_sec_path' discards 'const' qualifier from pointer target type
+
+same reasoning as previous conversions: Won't need to touch these
+spots anymore when skb->sp is removed.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2294be0f11e22b6197d025e5d3ab42888879ec4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	include/net/xfrm.h
+#	net/ipv4/esp4.c
+#	net/ipv4/esp4_offload.c
+#	net/ipv6/esp6.c
+#	net/ipv6/esp6_offload.c
+#	net/netfilter/nft_xfrm.c
+#	net/xfrm/xfrm_device.c
+#	net/xfrm/xfrm_input.c
+#	net/xfrm/xfrm_policy.c
+#	security/selinux/xfrm.c
+diff --cc include/linux/skbuff.h
+index 58515be85153,d0f254a016bf..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -3721,17 -4124,14 +3721,21 @@@ static inline bool skb_get_dst_pending_
+  	return skb->dst_pending_confirm != 0;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_XFRM
+ +static inline struct sec_path *skb_sec_path(struct sk_buff *skb)
+++=======
++ static inline struct sec_path *skb_sec_path(const struct sk_buff *skb)
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  {
+ -#ifdef CONFIG_XFRM
+  	return skb->sp;
+ +}
+  #else
+ +static inline struct sec_path *skb_sec_path(struct sk_buff *skb)
+ +{
+  	return NULL;
+ -#endif
+  }
+ +#endif
+  
+  /* Keeps track of mac header offset relative to skb->head.
+   * It is useful for TSO of Tunneling protocol. e.g. GRE.
+diff --cc include/net/xfrm.h
+index 115e337c1c4f,af723448c972..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -1776,10 -1896,124 +1776,127 @@@ static inline void xfrm_states_delete(s
+  #ifdef CONFIG_XFRM
+  static inline struct xfrm_state *xfrm_input_state(struct sk_buff *skb)
+  {
+- 	return skb->sp->xvec[skb->sp->len - 1];
++ 	struct sec_path *sp = skb_sec_path(skb);
++ 
++ 	return sp->xvec[sp->len - 1];
++ }
++ #endif
++ 
+++<<<<<<< HEAD
+++=======
++ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_XFRM
++ 	struct sec_path *sp = skb_sec_path(skb);
++ 
++ 	if (!sp || !sp->olen || sp->len != sp->olen)
++ 		return NULL;
++ 
++ 	return &sp->ovec[sp->olen - 1];
++ #else
++ 	return NULL;
++ #endif
++ }
++ 
++ void __init xfrm_dev_init(void);
++ 
++ #ifdef CONFIG_XFRM_OFFLOAD
++ void xfrm_dev_resume(struct sk_buff *skb);
++ void xfrm_dev_backlog(struct softnet_data *sd);
++ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again);
++ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
++ 		       struct xfrm_user_offload *xuo);
++ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x);
++ 
++ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
++ {
++ 	struct xfrm_state_offload *xso = &x->xso;
++ 
++ 	if (xso->dev && xso->dev->xfrmdev_ops->xdo_dev_state_advance_esn)
++ 		xso->dev->xfrmdev_ops->xdo_dev_state_advance_esn(x);
++ }
++ 
++ static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
++ {
++ 	struct xfrm_state *x = dst->xfrm;
++ 	struct xfrm_dst *xdst;
++ 
++ 	if (!x || !x->type_offload)
++ 		return false;
++ 
++ 	xdst = (struct xfrm_dst *) dst;
++ 	if (!x->xso.offload_handle && !xdst->child->xfrm)
++ 		return true;
++ 	if (x->xso.offload_handle && (x->xso.dev == xfrm_dst_path(dst)->dev) &&
++ 	    !xdst->child->xfrm)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static inline void xfrm_dev_state_delete(struct xfrm_state *x)
++ {
++ 	struct xfrm_state_offload *xso = &x->xso;
++ 
++ 	if (xso->dev)
++ 		xso->dev->xfrmdev_ops->xdo_dev_state_delete(x);
++ }
++ 
++ static inline void xfrm_dev_state_free(struct xfrm_state *x)
++ {
++ 	struct xfrm_state_offload *xso = &x->xso;
++ 	struct net_device *dev = xso->dev;
++ 
++ 	if (dev && dev->xfrmdev_ops) {
++ 		if (dev->xfrmdev_ops->xdo_dev_state_free)
++ 			dev->xfrmdev_ops->xdo_dev_state_free(x);
++ 		xso->dev = NULL;
++ 		dev_put(dev);
++ 	}
++ }
++ #else
++ static inline void xfrm_dev_resume(struct sk_buff *skb)
++ {
++ }
++ 
++ static inline void xfrm_dev_backlog(struct softnet_data *sd)
++ {
++ }
++ 
++ static inline struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
++ {
++ 	return skb;
++ }
++ 
++ static inline int xfrm_dev_state_add(struct net *net, struct xfrm_state *x, struct xfrm_user_offload *xuo)
++ {
++ 	return 0;
++ }
++ 
++ static inline void xfrm_dev_state_delete(struct xfrm_state *x)
++ {
++ }
++ 
++ static inline void xfrm_dev_state_free(struct xfrm_state *x)
++ {
++ }
++ 
++ static inline bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
++ {
++ 	return false;
++ }
++ 
++ static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
++ {
++ }
++ 
++ static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
++ {
++ 	return false;
+  }
+  #endif
+  
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  static inline int xfrm_mark_get(struct nlattr **attrs, struct xfrm_mark *m)
+  {
+  	if (attrs[XFRMA_MARK])
+diff --cc net/ipv4/esp4.c
+index 9cf3f9a29479,5459f41fc26f..000000000000
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@@ -108,85 -121,98 +108,95 @@@ static inline struct scatterlist *esp_g
+  static void esp_output_done(struct crypto_async_request *base, int err)
+  {
+  	struct sk_buff *skb = base->data;
+ -	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	kfree(ESP_SKB_CB(skb)->tmp);
+ +	xfrm_output_resume(skb, err);
+ +}
+ +
+ +static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	int err;
+ +	struct ip_esp_hdr *esph;
+ +	struct crypto_aead *aead;
+ +	struct aead_givcrypt_request *req;
+ +	struct scatterlist *sg;
+ +	struct scatterlist *asg;
+ +	struct esp_data *esp;
+ +	struct sk_buff *trailer;
+  	void *tmp;
+ -	struct xfrm_state *x;
+ +	u8 *iv;
+ +	u8 *tail;
+ +	int blksize;
+ +	int clen;
+ +	int alen;
+ +	int plen;
+ +	int tfclen;
+ +	int nfrags;
+ +	int assoclen;
+ +	int sglists;
+ +	int seqhilen;
+ +	__be32 *seqhi;
+  
+++<<<<<<< HEAD
+ +	/* skb is pure payload to encrypt */
+++=======
++ 	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
++ 		struct sec_path *sp = skb_sec_path(skb);
++ 
++ 		x = sp->xvec[sp->len - 1];
++ 	} else {
++ 		x = skb_dst(skb)->xfrm;
++ 	}
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  
+ -	tmp = ESP_SKB_CB(skb)->tmp;
+ -	esp_ssg_unref(x, tmp);
+ -	kfree(tmp);
+ +	esp = x->data;
+ +	aead = esp->aead;
+ +	alen = crypto_aead_authsize(aead);
+  
+ -	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
+ -		if (err) {
+ -			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ -			kfree_skb(skb);
+ -			return;
+ -		}
+ +	tfclen = 0;
+ +	if (x->tfcpad) {
+ +		struct xfrm_dst *dst = (struct xfrm_dst *)skb_dst(skb);
+ +		u32 padto;
+  
+ -		skb_push(skb, skb->data - skb_mac_header(skb));
+ -		secpath_reset(skb);
+ -		xfrm_dev_resume(skb);
+ -	} else {
+ -		xfrm_output_resume(skb, err);
+ +		padto = min(x->tfcpad, esp4_get_mtu(x, dst->child_mtu_cached));
+ +		if (skb->len < padto)
+ +			tfclen = padto - skb->len;
+  	}
+ -}
+ -
+ -/* Move ESP header back into place. */
+ -static void esp_restore_header(struct sk_buff *skb, unsigned int offset)
+ -{
+ -	struct ip_esp_hdr *esph = (void *)(skb->data + offset);
+ -	void *tmp = ESP_SKB_CB(skb)->tmp;
+ -	__be32 *seqhi = esp_tmp_extra(tmp);
+ -
+ -	esph->seq_no = esph->spi;
+ -	esph->spi = *seqhi;
+ -}
+ +	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+ +	clen = ALIGN(skb->len + 2 + tfclen, blksize);
+ +	if (esp->padlen)
+ +		clen = ALIGN(clen, esp->padlen);
+ +	plen = clen - skb->len - tfclen;
+  
+ -static void esp_output_restore_header(struct sk_buff *skb)
+ -{
+ -	void *tmp = ESP_SKB_CB(skb)->tmp;
+ -	struct esp_output_extra *extra = esp_tmp_extra(tmp);
+ +	err = skb_cow_data(skb, tfclen + plen + alen, &trailer);
+ +	if (err < 0)
+ +		goto error;
+ +	nfrags = err;
+  
+ -	esp_restore_header(skb, skb_transport_offset(skb) + extra->esphoff -
+ -				sizeof(__be32));
+ -}
+ +	assoclen = sizeof(*esph);
+ +	sglists = 1;
+ +	seqhilen = 0;
+  
+ -static struct ip_esp_hdr *esp_output_set_extra(struct sk_buff *skb,
+ -					       struct xfrm_state *x,
+ -					       struct ip_esp_hdr *esph,
+ -					       struct esp_output_extra *extra)
+ -{
+ -	/* For ESN we move the header forward by 4 bytes to
+ -	 * accomodate the high bits.  We will move it back after
+ -	 * encryption.
+ -	 */
+ -	if ((x->props.flags & XFRM_STATE_ESN)) {
+ -		__u32 seqhi;
+ -		struct xfrm_offload *xo = xfrm_offload(skb);
+ -
+ -		if (xo)
+ -			seqhi = xo->seq.hi;
+ -		else
+ -			seqhi = XFRM_SKB_CB(skb)->seq.output.hi;
+ -
+ -		extra->esphoff = (unsigned char *)esph -
+ -				 skb_transport_header(skb);
+ -		esph = (struct ip_esp_hdr *)((unsigned char *)esph - 4);
+ -		extra->seqhi = esph->spi;
+ -		esph->seq_no = htonl(seqhi);
+ +	if (x->props.flags & XFRM_STATE_ESN) {
+ +		sglists += 2;
+ +		seqhilen += sizeof(__be32);
+ +		assoclen += seqhilen;
+  	}
+  
+ -	esph->spi = x->id.spi;
+ -
+ -	return esph;
+ -}
+ -
+ -static void esp_output_done_esn(struct crypto_async_request *base, int err)
+ -{
+ -	struct sk_buff *skb = base->data;
+ +	tmp = esp_alloc_tmp(aead, nfrags + sglists, seqhilen);
+ +	if (!tmp) {
+ +		err = -ENOMEM;
+ +		goto error;
+ +	}
+  
+ -	esp_output_restore_header(skb);
+ -	esp_output_done(base, err);
+ -}
+ +	seqhi = esp_tmp_seqhi(tmp);
+ +	iv = esp_tmp_iv(aead, tmp, seqhilen);
+ +	req = esp_tmp_givreq(aead, iv);
+ +	asg = esp_givreq_sg(aead, req);
+ +	sg = asg + sglists;
+  
+ -static void esp_output_fill_trailer(u8 *tail, int tfclen, int plen, __u8 proto)
+ -{
+  	/* Fill padding... */
+ +	tail = skb_tail_pointer(trailer);
+  	if (tfclen) {
+  		memset(tail, 0, tfclen);
+  		tail += tfclen;
+diff --cc net/ipv6/esp6.c
+index 1824a6cf9bf2,5afe9f83374d..000000000000
+--- a/net/ipv6/esp6.c
++++ b/net/ipv6/esp6.c
+@@@ -137,83 -141,89 +137,93 @@@ static inline struct scatterlist *esp_g
+  static void esp_output_done(struct crypto_async_request *base, int err)
+  {
+  	struct sk_buff *skb = base->data;
+ -	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	kfree(ESP_SKB_CB(skb)->tmp);
+ +	xfrm_output_resume(skb, err);
+ +}
+ +
+ +static int esp6_output(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	int err;
+ +	struct ip_esp_hdr *esph;
+ +	struct crypto_aead *aead;
+ +	struct aead_givcrypt_request *req;
+ +	struct scatterlist *sg;
+ +	struct scatterlist *asg;
+ +	struct sk_buff *trailer;
+  	void *tmp;
+ -	struct xfrm_state *x;
+ +	int blksize;
+ +	int clen;
+ +	int alen;
+ +	int plen;
+ +	int tfclen;
+ +	int nfrags;
+ +	int assoclen;
+ +	int sglists;
+ +	int seqhilen;
+ +	u8 *iv;
+ +	u8 *tail;
+ +	__be32 *seqhi;
+ +	struct esp_data *esp = x->data;
+  
+++<<<<<<< HEAD
+ +	/* skb is pure payload to encrypt */
+ +	aead = esp->aead;
+ +	alen = crypto_aead_authsize(aead);
+++=======
++ 	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
++ 		struct sec_path *sp = skb_sec_path(skb);
++ 
++ 		x = sp->xvec[sp->len - 1];
++ 	} else {
++ 		x = skb_dst(skb)->xfrm;
++ 	}
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  
+ -	tmp = ESP_SKB_CB(skb)->tmp;
+ -	esp_ssg_unref(x, tmp);
+ -	kfree(tmp);
+ -
+ -	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
+ -		if (err) {
+ -			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ -			kfree_skb(skb);
+ -			return;
+ -		}
+ +	tfclen = 0;
+ +	if (x->tfcpad) {
+ +		struct xfrm_dst *dst = (struct xfrm_dst *)skb_dst(skb);
+ +		u32 padto;
+  
+ -		skb_push(skb, skb->data - skb_mac_header(skb));
+ -		secpath_reset(skb);
+ -		xfrm_dev_resume(skb);
+ -	} else {
+ -		xfrm_output_resume(skb, err);
+ +		padto = min(x->tfcpad, esp6_get_mtu(x, dst->child_mtu_cached));
+ +		if (skb->len < padto)
+ +			tfclen = padto - skb->len;
+  	}
+ -}
+ -
+ -/* Move ESP header back into place. */
+ -static void esp_restore_header(struct sk_buff *skb, unsigned int offset)
+ -{
+ -	struct ip_esp_hdr *esph = (void *)(skb->data + offset);
+ -	void *tmp = ESP_SKB_CB(skb)->tmp;
+ -	__be32 *seqhi = esp_tmp_seqhi(tmp);
+ +	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
+ +	clen = ALIGN(skb->len + 2 + tfclen, blksize);
+ +	if (esp->padlen)
+ +		clen = ALIGN(clen, esp->padlen);
+ +	plen = clen - skb->len - tfclen;
+  
+ -	esph->seq_no = esph->spi;
+ -	esph->spi = *seqhi;
+ -}
+ +	err = skb_cow_data(skb, tfclen + plen + alen, &trailer);
+ +	if (err < 0)
+ +		goto error;
+ +	nfrags = err;
+  
+ -static void esp_output_restore_header(struct sk_buff *skb)
+ -{
+ -	esp_restore_header(skb, skb_transport_offset(skb) - sizeof(__be32));
+ -}
+ +	assoclen = sizeof(*esph);
+ +	sglists = 1;
+ +	seqhilen = 0;
+  
+ -static struct ip_esp_hdr *esp_output_set_esn(struct sk_buff *skb,
+ -					     struct xfrm_state *x,
+ -					     struct ip_esp_hdr *esph,
+ -					     __be32 *seqhi)
+ -{
+ -	/* For ESN we move the header forward by 4 bytes to
+ -	 * accomodate the high bits.  We will move it back after
+ -	 * encryption.
+ -	 */
+ -	if ((x->props.flags & XFRM_STATE_ESN)) {
+ -		struct xfrm_offload *xo = xfrm_offload(skb);
+ -
+ -		esph = (void *)(skb_transport_header(skb) - sizeof(__be32));
+ -		*seqhi = esph->spi;
+ -		if (xo)
+ -			esph->seq_no = htonl(xo->seq.hi);
+ -		else
+ -			esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.hi);
+ +	if (x->props.flags & XFRM_STATE_ESN) {
+ +		sglists += 2;
+ +		seqhilen += sizeof(__be32);
+ +		assoclen += seqhilen;
+  	}
+  
+ -	esph->spi = x->id.spi;
+ -
+ -	return esph;
+ -}
+ -
+ -static void esp_output_done_esn(struct crypto_async_request *base, int err)
+ -{
+ -	struct sk_buff *skb = base->data;
+ +	tmp = esp_alloc_tmp(aead, nfrags + sglists, seqhilen);
+ +	if (!tmp) {
+ +		err = -ENOMEM;
+ +		goto error;
+ +	}
+  
+ -	esp_output_restore_header(skb);
+ -	esp_output_done(base, err);
+ -}
+ +	seqhi = esp_tmp_seqhi(tmp);
+ +	iv = esp_tmp_iv(aead, tmp, seqhilen);
+ +	req = esp_tmp_givreq(aead, iv);
+ +	asg = esp_givreq_sg(aead, req);
+ +	sg = asg + sglists;
+  
+ -static void esp_output_fill_trailer(u8 *tail, int tfclen, int plen, __u8 proto)
+ -{
+  	/* Fill padding... */
+ +	tail = skb_tail_pointer(trailer);
+  	if (tfclen) {
+  		memset(tail, 0, tfclen);
+  		tail += tfclen;
+diff --cc net/xfrm/xfrm_input.c
+index f7368e09f8ad,b4db25b244fa..000000000000
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@@ -238,8 -327,13 +238,15 @@@ int xfrm_input(struct sk_buff *skb, in
+  		goto drop;
+  	}
+  
+ -	daddr = (xfrm_address_t *)(skb_network_header(skb) +
+ -				   XFRM_SPI_SKB_CB(skb)->daddroff);
+  	do {
+++<<<<<<< HEAD
+ +		if (skb->sp->len == XFRM_MAX_DEPTH) {
+++=======
++ 		sp = skb_sec_path(skb);
++ 
++ 		if (sp->len == XFRM_MAX_DEPTH) {
++ 			secpath_reset(skb);
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  			XFRM_INC_STATS(net, LINUX_MIB_XFRMINBUFFERERROR);
+  			goto drop;
+  		}
+@@@ -251,11 -346,19 +258,17 @@@
+  			goto drop;
+  		}
+  
+++<<<<<<< HEAD
+ +		skb->sp->xvec[skb->sp->len++] = x;
+++=======
++ 		skb->mark = xfrm_smark_get(skb->mark, x);
++ 
++ 		sp->xvec[sp->len++] = x;
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  
+ -lock:
+  		spin_lock(&x->lock);
+ -
+  		if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+ -			if (x->km.state == XFRM_STATE_ACQ)
+ -				XFRM_INC_STATS(net, LINUX_MIB_XFRMACQUIREERROR);
+ -			else
+ -				XFRM_INC_STATS(net,
+ -					       LINUX_MIB_XFRMINSTATEINVALID);
+ +			XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEINVALID);
+  			goto drop_unlock;
+  		}
+  
+@@@ -365,11 -472,28 +378,35 @@@ resume
+  	nf_reset(skb);
+  
+  	if (decaps) {
+++<<<<<<< HEAD
+++=======
++ 		sp = skb_sec_path(skb);
++ 		if (sp)
++ 			sp->olen = 0;
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  		skb_dst_drop(skb);
+ -		gro_cells_receive(&gro_cells, skb);
+ +		netif_rx(skb);
+  		return 0;
+  	} else {
+++<<<<<<< HEAD
+ +		return x->inner_mode->afinfo->transport_finish(skb, async);
+++=======
++ 		xo = xfrm_offload(skb);
++ 		if (xo)
++ 			xfrm_gro = xo->flags & XFRM_GRO;
++ 
++ 		err = x->inner_mode->afinfo->transport_finish(skb, xfrm_gro || async);
++ 		if (xfrm_gro) {
++ 			sp = skb_sec_path(skb);
++ 			if (sp)
++ 				sp->olen = 0;
++ 			skb_dst_drop(skb);
++ 			gro_cells_receive(&gro_cells, skb);
++ 			return err;
++ 		}
++ 
++ 		return err;
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  	}
+  
+  drop_unlock:
+diff --cc net/xfrm/xfrm_policy.c
+index ea07a18efdad,d6acba07bdc9..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -2403,8 -3303,21 +2404,25 @@@ int __xfrm_policy_check(struct sock *sk
+  	int pi;
+  	int reverse;
+  	struct flowi fl;
+ +	u8 fl_dir;
+  	int xerr_idx = -1;
+++<<<<<<< HEAD
+++=======
++ 	const struct xfrm_if_cb *ifcb;
++ 	struct sec_path *sp;
++ 	struct xfrm_if *xi;
++ 	u32 if_id = 0;
++ 
++ 	rcu_read_lock();
++ 	ifcb = xfrm_if_get_cb();
++ 
++ 	if (ifcb) {
++ 		xi = ifcb->decode_session(skb);
++ 		if (xi)
++ 			if_id = xi->p.if_id;
++ 	}
++ 	rcu_read_unlock();
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  
+  	reverse = dir & ~XFRM_POLICY_MASK;
+  	dir &= XFRM_POLICY_MASK;
+@@@ -2418,11 -3330,12 +2436,17 @@@
+  	nf_nat_decode_session(skb, &fl, family);
+  
+  	/* First, check used SA against their selectors. */
+- 	if (skb->sp) {
++ 	sp = skb_sec_path(skb);
++ 	if (sp) {
+  		int i;
+  
+++<<<<<<< HEAD
+ +		for (i=skb->sp->len-1; i>=0; i--) {
+ +			struct xfrm_state *x = skb->sp->xvec[i];
+++=======
++ 		for (i = sp->len - 1; i >= 0; i--) {
++ 			struct xfrm_state *x = sp->xvec[i];
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  			if (!xfrm_selector_match(&x->sel, &fl, family)) {
+  				XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEMISMATCH);
+  				return 0;
+diff --cc security/selinux/xfrm.c
+index 78504a18958a,bd7d18bdb147..000000000000
+--- a/security/selinux/xfrm.c
++++ b/security/selinux/xfrm.c
+@@@ -196,6 -226,37 +196,40 @@@ static u32 selinux_xfrm_skb_sid_egress(
+  	return x->security->ctx_sid;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int selinux_xfrm_skb_sid_ingress(struct sk_buff *skb,
++ 					u32 *sid, int ckall)
++ {
++ 	u32 sid_session = SECSID_NULL;
++ 	struct sec_path *sp = skb_sec_path(skb);
++ 
++ 	if (sp) {
++ 		int i;
++ 
++ 		for (i = sp->len - 1; i >= 0; i--) {
++ 			struct xfrm_state *x = sp->xvec[i];
++ 			if (selinux_authorizable_xfrm(x)) {
++ 				struct xfrm_sec_ctx *ctx = x->security;
++ 
++ 				if (sid_session == SECSID_NULL) {
++ 					sid_session = ctx->ctx_sid;
++ 					if (!ckall)
++ 						goto out;
++ 				} else if (sid_session != ctx->ctx_sid) {
++ 					*sid = SECSID_NULL;
++ 					return -EINVAL;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ out:
++ 	*sid = sid_session;
++ 	return 0;
++ }
++ 
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  /*
+   * LSM hook implementation that checks and/or returns the xfrm sid for the
+   * incoming packet.
+@@@ -426,14 -404,12 +460,20 @@@ int selinux_xfrm_state_delete(struct xf
+   * we need to check for unlabelled access since this may not have
+   * gone thru the IPSec process.
+   */
+ -int selinux_xfrm_sock_rcv_skb(u32 sk_sid, struct sk_buff *skb,
+ -			      struct common_audit_data *ad)
+ +int selinux_xfrm_sock_rcv_skb(u32 isec_sid, struct sk_buff *skb,
+ +				struct common_audit_data *ad)
+  {
+++<<<<<<< HEAD
+ +	int i, rc = 0;
+ +	struct sec_path *sp;
+ +	u32 sel_sid = SECINITSID_UNLABELED;
+ +
+ +	sp = skb->sp;
+++=======
++ 	int i;
++ 	struct sec_path *sp = skb_sec_path(skb);
++ 	u32 peer_sid = SECINITSID_UNLABELED;
+++>>>>>>> 2294be0f11e2 (net: use skb_sec_path helper in more places)
+  
+  	if (sp) {
+  		for (i = 0; i < sp->len; i++) {
+* Unmerged path net/ipv4/esp4_offload.c
+* Unmerged path net/ipv6/esp6_offload.c
+* Unmerged path net/netfilter/nft_xfrm.c
+* Unmerged path net/xfrm/xfrm_device.c
+* Unmerged path include/linux/skbuff.h
+* Unmerged path include/net/xfrm.h
+* Unmerged path net/ipv4/esp4.c
+* Unmerged path net/ipv4/esp4_offload.c
+* Unmerged path net/ipv6/esp6.c
+* Unmerged path net/ipv6/esp6_offload.c
+diff --git a/net/ipv6/xfrm6_input.c b/net/ipv6/xfrm6_input.c
+index f2fde0617787..1c2b3fd57989 100644
+--- a/net/ipv6/xfrm6_input.c
++++ b/net/ipv6/xfrm6_input.c
+@@ -135,7 +135,7 @@ int xfrm6_input_addr(struct sk_buff *skb, xfrm_address_t *daddr,
+ 		goto drop;
+ 	}
+ 
+-	skb->sp->xvec[skb->sp->len++] = x;
++	sp->xvec[sp->len++] = x;
+ 
+ 	spin_lock(&x->lock);
+ 
+* Unmerged path net/netfilter/nft_xfrm.c
+diff --git a/net/netfilter/xt_policy.c b/net/netfilter/xt_policy.c
+index f23e97bb42d7..72f58ac70860 100644
+--- a/net/netfilter/xt_policy.c
++++ b/net/netfilter/xt_policy.c
+@@ -56,7 +56,7 @@ match_policy_in(const struct sk_buff *skb, const struct xt_policy_info *info,
+ 		unsigned short family)
+ {
+ 	const struct xt_policy_elem *e;
+-	const struct sec_path *sp = skb->sp;
++	const struct sec_path *sp = skb_sec_path(skb);
+ 	int strict = info->flags & XT_POLICY_MATCH_STRICT;
+ 	int i, pos;
+ 
+* Unmerged path net/xfrm/xfrm_device.c
+* Unmerged path net/xfrm/xfrm_input.c
+* Unmerged path net/xfrm/xfrm_policy.c
+* Unmerged path security/selinux/xfrm.c
