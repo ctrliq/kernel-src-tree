@@ -1,0 +1,155 @@
+perf/core: Fix sideband list-iteration vs. event ordering NULL pointer deference crash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0b8f1e2e26bfc6b9abe3f0f3faba2cb0eecb9fb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0b8f1e2e.failed
+
+Vegard Nossum reported that perf fuzzing generates a NULL
+pointer dereference crash:
+
+> Digging a bit deeper into this, it seems the event itself is getting
+> created by perf_event_open() and it gets added to the pmu_event_list
+> through:
+>
+> perf_event_open()
+>  - perf_event_alloc()
+>     - account_event()
+>        - account_pmu_sb_event()
+>           - attach_sb_event()
+>
+> so at this point the event is being attached but its ->ctx is still
+> NULL. It seems like ->ctx is set just a bit later in
+> perf_event_open(), though.
+>
+> But before that, __schedule() comes along and creates a stack trace
+> similar to the one above:
+>
+> __schedule()
+>  - __perf_event_task_sched_out()
+>    - perf_iterate_sb()
+>      - perf_iterate_sb_cpu()
+>         - event_filter_match()
+>           - perf_cgroup_match()
+>             - __get_cpu_context()
+>               - (dereference ctx which is NULL)
+>
+> So I guess the question is... should the event be attached (= put on
+> the list) before ->ctx gets set? Or should the cgroup code check for a
+> NULL ->ctx?
+
+The latter seems like the simplest solution. Moving the list-add later
+creates a bit of a mess.
+
+	Reported-by: Vegard Nossum <vegard.nossum@gmail.com>
+	Tested-by: Vegard Nossum <vegard.nossum@gmail.com>
+	Tested-by: Vince Weaver <vincent.weaver@maine.edu>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: David Carrillo-Cisneros <davidcc@google.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: f2fb6bef9251 ("perf/core: Optimize side-band event delivery")
+Link: http://lkml.kernel.org/r/20160804123724.GN6862@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0b8f1e2e26bfc6b9abe3f0f3faba2cb0eecb9fb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index f07e2f43b012,87d02b8cb87e..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -1713,8 -1689,35 +1713,13 @@@ static bool is_orphaned_event(struct pe
+  static inline int
+  event_filter_match(struct perf_event *event)
+  {
+++<<<<<<< HEAD
+ +	return (event->cpu == -1 || event->cpu == smp_processor_id())
+ +	    && perf_cgroup_match(event);
+++=======
++ 	return (event->cpu == -1 || event->cpu == smp_processor_id()) &&
++ 	       perf_cgroup_match(event) && pmu_filter_match(event);
+++>>>>>>> 0b8f1e2e26bf (perf/core: Fix sideband list-iteration vs. event ordering NULL pointer deference crash)
+  }
+  
+  static void
+@@@ -5770,13 -5968,62 +5780,44 @@@ perf_event_aux_ctx(struct perf_event_co
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void perf_iterate_sb_cpu(perf_iterate_f output, void *data)
++ {
++ 	struct pmu_event_list *pel = this_cpu_ptr(&pmu_sb_events);
++ 	struct perf_event *event;
++ 
++ 	list_for_each_entry_rcu(event, &pel->list, sb_list) {
++ 		/*
++ 		 * Skip events that are not fully formed yet; ensure that
++ 		 * if we observe event->ctx, both event and ctx will be
++ 		 * complete enough. See perf_install_in_context().
++ 		 */
++ 		if (!smp_load_acquire(&event->ctx))
++ 			continue;
++ 
++ 		if (event->state < PERF_EVENT_STATE_INACTIVE)
++ 			continue;
++ 		if (!event_filter_match(event))
++ 			continue;
++ 		output(event, data);
++ 	}
++ }
++ 
++ /*
++  * Iterate all events that need to receive side-band events.
++  *
++  * For new callers; ensure that account_pmu_sb_event() includes
++  * your event, otherwise it might not get delivered.
++  */
+++>>>>>>> 0b8f1e2e26bf (perf/core: Fix sideband list-iteration vs. event ordering NULL pointer deference crash)
+  static void
+ -perf_iterate_sb(perf_iterate_f output, void *data,
+ -	       struct perf_event_context *task_ctx)
+ +perf_event_aux_task_ctx(perf_event_aux_output_cb output, void *data,
+ +			struct perf_event_context *task_ctx)
+  {
+ -	struct perf_event_context *ctx;
+ -	int ctxn;
+ -
+  	rcu_read_lock();
+  	preempt_disable();
+ -
+ -	/*
+ -	 * If we have task_ctx != NULL we only notify the task context itself.
+ -	 * The task_ctx is set only for EXIT events before releasing task
+ -	 * context.
+ -	 */
+ -	if (task_ctx) {
+ -		perf_iterate_ctx(task_ctx, output, data, false);
+ -		goto done;
+ -	}
+ -
+ -	perf_iterate_sb_cpu(output, data);
+ -
+ -	for_each_task_context_nr(ctxn) {
+ -		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
+ -		if (ctx)
+ -			perf_iterate_ctx(ctx, output, data, false);
+ -	}
+ -done:
+ +	perf_event_aux_ctx(task_ctx, output, data, false);
+  	preempt_enable();
+  	rcu_read_unlock();
+  }
+* Unmerged path kernel/events/core.c
