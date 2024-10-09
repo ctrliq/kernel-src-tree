@@ -4379,6 +4379,7 @@ long kvm_arch_vm_ioctl(struct file *filp,
 		now_ns = get_kvmclock_ns(kvm);
 		user_ns.clock = now_ns;
 		user_ns.flags = kvm->arch.use_master_clock ? KVM_CLOCK_TSC_STABLE : 0;
+		user_ns.flags |= KVM_CLOCK_CORRECT_TSC_SHIFT;
 		memset(&user_ns.pad, 0, sizeof(user_ns.pad));
 
 		r = -EFAULT;

@@ -348,10 +348,9 @@ int reserve_memtype(u64 start, u64 end, enum page_cache_mode req_type,
 	int err = 0;
 
 	start = sanitize_phys(start);
-
 	/*
-	 * The end address passed into this function is exclusive, but
-	 * sanitize_phys() expects an inclusive address.
+	 * end is exclusive.  However, sanitize_phys will return 0 if
+	 * end falls at the end of the physical address space.
 	 */
 	end = sanitize_phys(end - 1) + 1;
 	if (start >= end) {
