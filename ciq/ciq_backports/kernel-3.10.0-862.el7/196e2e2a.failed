@@ -1,0 +1,212 @@
+target: Remove TARGET_MAX_LUNS_PER_TRANSPORT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Remove TARGET_MAX_LUNS_PER_TRANSPORT (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 90.00%
+commit-author Hannes Reinecke <hare@suse.de>
+commit 196e2e2aa362850bf45bcb14b9517124b23b921e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/196e2e2a.failed
+
+LUN allocation is now fully dynamic, so there is no need to
+artificially restrain the number of exported LUNs.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 196e2e2aa362850bf45bcb14b9517124b23b921e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_fabric_configfs.c
+#	drivers/target/target_core_tpg.c
+#	drivers/xen/xen-scsiback.c
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,ed084023e7d4..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -59,18 -60,13 +59,25 @@@ transport_lookup_cmd_lun(struct se_cmd 
+  {
+  	struct se_lun *se_lun = NULL;
+  	struct se_session *se_sess = se_cmd->se_sess;
+ -	struct se_node_acl *nacl = se_sess->se_node_acl;
+ -	struct se_dev_entry *deve;
+ +	struct se_device *dev;
+ +	unsigned long flags;
+ +
+++<<<<<<< HEAD
+ +	if (unpacked_lun >= TRANSPORT_MAX_LUNS_PER_TPG)
+ +		return TCM_NON_EXISTENT_LUN;
+  
+ +	spin_lock_irqsave(&se_sess->se_node_acl->device_list_lock, flags);
+ +	se_cmd->se_deve = se_sess->se_node_acl->device_list[unpacked_lun];
+ +	if (se_cmd->se_deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		struct se_dev_entry *deve = se_cmd->se_deve;
+ +
+ +		deve->total_cmds++;
+++=======
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(nacl, unpacked_lun);
++ 	if (deve) {
++ 		atomic_long_inc(&deve->total_cmds);
+++>>>>>>> 196e2e2aa362 (target: Remove TARGET_MAX_LUNS_PER_TRANSPORT)
+  
+  		if ((se_cmd->data_direction == DMA_TO_DEVICE) &&
+  		    (deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY)) {
+@@@ -149,17 -152,13 +156,26 @@@ int transport_lookup_tmr_lun(struct se_
+  	struct se_tmr_req *se_tmr = se_cmd->se_tmr_req;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	if (unpacked_lun >= TRANSPORT_MAX_LUNS_PER_TPG)
+ +		return -ENODEV;
+ +
+ +	spin_lock_irqsave(&se_sess->se_node_acl->device_list_lock, flags);
+ +	se_cmd->se_deve = se_sess->se_node_acl->device_list[unpacked_lun];
+ +	deve = se_cmd->se_deve;
+ +
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		se_tmr->tmr_lun = deve->se_lun;
+ +		se_cmd->se_lun = deve->se_lun;
+ +		se_lun = deve->se_lun;
+++=======
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(nacl, unpacked_lun);
++ 	if (deve) {
++ 		se_tmr->tmr_lun = rcu_dereference(deve->se_lun);
++ 		se_cmd->se_lun = rcu_dereference(deve->se_lun);
++ 		se_lun = rcu_dereference(deve->se_lun);
+++>>>>>>> 196e2e2aa362 (target: Remove TARGET_MAX_LUNS_PER_TRANSPORT)
+  		se_cmd->pr_res_key = deve->pr_res_key;
+  		se_cmd->orig_fe_lun = unpacked_lun;
+  	}
+@@@ -185,9 -185,24 +201,27 @@@
+  }
+  EXPORT_SYMBOL(transport_lookup_tmr_lun);
+  
+++<<<<<<< HEAD
+++=======
++ bool target_lun_is_rdonly(struct se_cmd *cmd)
++ {
++ 	struct se_session *se_sess = cmd->se_sess;
++ 	struct se_dev_entry *deve;
++ 	bool ret;
++ 
++ 	rcu_read_lock();
++ 	deve = target_nacl_find_deve(se_sess->se_node_acl, cmd->orig_fe_lun);
++ 	ret = (deve && deve->lun_flags & TRANSPORT_LUNFLAGS_READ_ONLY);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(target_lun_is_rdonly);
++ 
+++>>>>>>> 196e2e2aa362 (target: Remove TARGET_MAX_LUNS_PER_TRANSPORT)
+  /*
+   * This function is called from core_scsi3_emulate_pro_register_and_move()
+ - * and core_scsi3_decode_spec_i_port(), and will increment &deve->pr_kref
+ + * and core_scsi3_decode_spec_i_port(), and will increment &deve->pr_ref_count
+   * when a matching rtpi is found.
+   */
+  struct se_dev_entry *core_get_se_deve_from_rtpi(
+diff --cc drivers/target/target_core_fabric_configfs.c
+index 0c3f90130b7d,6cfee595f3f2..000000000000
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@@ -352,21 -350,9 +352,24 @@@ static struct config_group *target_fabr
+  	 * Determine the Mapped LUN value.  This is what the SCSI Initiator
+  	 * Port will actually see.
+  	 */
+ -	ret = kstrtoull(buf + 4, 0, &mapped_lun);
+ +	ret = kstrtoul(buf + 4, 0, &mapped_lun);
+  	if (ret)
+  		goto out;
+++<<<<<<< HEAD
+ +	if (mapped_lun > UINT_MAX) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	if (mapped_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
+ +		pr_err("Mapped LUN: %lu exceeds TRANSPORT_MAX_LUNS_PER_TPG"
+ +			"-1: %u for Target Portal Group: %u\n", mapped_lun,
+ +			TRANSPORT_MAX_LUNS_PER_TPG-1,
+ +			se_tpg->se_tpg_tfo->tpg_get_tag(se_tpg));
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+++=======
+++>>>>>>> 196e2e2aa362 (target: Remove TARGET_MAX_LUNS_PER_TRANSPORT)
+  
+  	lacl = core_dev_init_initiator_node_lun_acl(se_tpg, se_nacl,
+  			mapped_lun, &ret);
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,aa39bc89227b..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -788,26 -602,23 +788,33 @@@ struct se_lun *core_tpg_alloc_lun
+  {
+  	struct se_lun *lun;
+  
+++<<<<<<< HEAD
+ +	if (unpacked_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
+ +		pr_err("%s LUN: %u exceeds TRANSPORT_MAX_LUNS_PER_TPG"
+ +			"-1: %u for Target Portal Group: %u\n",
+ +			tpg->se_tpg_tfo->get_fabric_name(),
+ +			unpacked_lun, TRANSPORT_MAX_LUNS_PER_TPG-1,
+ +			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		return ERR_PTR(-EOVERFLOW);
+ +	}
+ +
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun = tpg->tpg_lun_list[unpacked_lun];
+ +	if (lun->lun_status == TRANSPORT_LUN_STATUS_ACTIVE) {
+ +		pr_err("TPG Logical Unit Number: %u is already active"
+ +			" on %s Target Portal Group: %u, ignoring request.\n",
+ +			unpacked_lun, tpg->se_tpg_tfo->get_fabric_name(),
+ +			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		spin_unlock(&tpg->tpg_lun_lock);
+ +		return ERR_PTR(-EINVAL);
+++=======
++ 	lun = kzalloc(sizeof(*lun), GFP_KERNEL);
++ 	if (!lun) {
++ 		pr_err("Unable to allocate se_lun memory\n");
++ 		return ERR_PTR(-ENOMEM);
+++>>>>>>> 196e2e2aa362 (target: Remove TARGET_MAX_LUNS_PER_TRANSPORT)
+  	}
+ -	lun->unpacked_lun = unpacked_lun;
+ -	lun->lun_link_magic = SE_LUN_LINK_MAGIC;
+ -	atomic_set(&lun->lun_acl_count, 0);
+ -	init_completion(&lun->lun_ref_comp);
+ -	INIT_LIST_HEAD(&lun->lun_deve_list);
+ -	INIT_LIST_HEAD(&lun->lun_dev_link);
+ -	atomic_set(&lun->lun_tg_pt_secondary_offline, 0);
+ -	spin_lock_init(&lun->lun_deve_lock);
+ -	mutex_init(&lun->lun_tg_pt_md_mutex);
+ -	INIT_LIST_HEAD(&lun->lun_tg_pt_gp_link);
+ -	spin_lock_init(&lun->lun_tg_pt_gp_lock);
+ -	lun->lun_tpg = tpg;
+ +	spin_unlock(&tpg->tpg_lun_lock);
+  
+  	return lun;
+  }
+* Unmerged path drivers/xen/xen-scsiback.c
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_fabric_configfs.c
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 7bcf92529421..47862c1cb8f4 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -13,9 +13,6 @@
+ #define TARGET_CORE_MOD_VERSION		"v4.1.0"
+ #define TARGET_CORE_VERSION		TARGET_CORE_MOD_VERSION
+ 
+-/* Maximum Number of LUNs per Target Portal Group */
+-/* Don't raise above 511 or REPORT_LUNS needs to handle >1 page */
+-#define TRANSPORT_MAX_LUNS_PER_TPG		256
+ /*
+  * By default we use 32-byte CDBs in TCM Core and subsystem plugin code.
+  *
