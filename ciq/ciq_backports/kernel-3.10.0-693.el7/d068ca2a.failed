@@ -1,0 +1,611 @@
+codel: split into multiple files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Michal Kazior <michal.kazior@tieto.com>
+commit d068ca2ae2e614b9a418fb3b5f1fd4cf996ff032
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d068ca2a.failed
+
+It was impossible to include codel.h for the
+purpose of having access to codel_params or
+codel_vars structure definitions and using them
+for embedding in other more complex structures.
+
+This splits allows codel.h itself to be treated
+like any other header file while codel_qdisc.h and
+codel_impl.h contain function definitions with
+logic that was previously in codel.h.
+
+This copies over copyrights and doesn't involve
+code changes other than adding a few additional
+include directives to net/sched/sch*codel.c.
+
+	Signed-off-by: Michal Kazior <michal.kazior@tieto.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d068ca2ae2e614b9a418fb3b5f1fd4cf996ff032)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/codel.h
+diff --cc include/net/codel.h
+index 1e18005f7f65,a6e428f80135..000000000000
+--- a/include/net/codel.h
++++ b/include/net/codel.h
+@@@ -165,195 -148,17 +144,206 @@@ struct codel_vars 
+  struct codel_stats {
+  	u32		maxpacket;
+  	u32		drop_count;
+ -	u32		drop_len;
+  	u32		ecn_mark;
+ -	u32		ce_mark;
+  };
+  
+++<<<<<<< HEAD
+ +static void codel_params_init(struct codel_params *params,
+ +			      const struct Qdisc *sch)
+ +{
+ +	params->interval = MS2TIME(100);
+ +	params->target = MS2TIME(5);
+ +	params->mtu = psched_mtu(qdisc_dev(sch));
+ +	params->ecn = false;
+ +}
+ +
+ +static void codel_vars_init(struct codel_vars *vars)
+ +{
+ +	memset(vars, 0, sizeof(*vars));
+ +}
+ +
+ +static void codel_stats_init(struct codel_stats *stats)
+ +{
+ +	stats->maxpacket = 0;
+ +}
+ +
+ +/*
+ + * http://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Iterative_methods_for_reciprocal_square_roots
+ + * new_invsqrt = (invsqrt / 2) * (3 - count * invsqrt^2)
+ + *
+ + * Here, invsqrt is a fixed point number (< 1.0), 32bit mantissa, aka Q0.32
+ + */
+ +static void codel_Newton_step(struct codel_vars *vars)
+ +{
+ +	u32 invsqrt = ((u32)vars->rec_inv_sqrt) << REC_INV_SQRT_SHIFT;
+ +	u32 invsqrt2 = ((u64)invsqrt * invsqrt) >> 32;
+ +	u64 val = (3LL << 32) - ((u64)vars->count * invsqrt2);
+ +
+ +	val >>= 2; /* avoid overflow in following multiply */
+ +	val = (val * invsqrt) >> (32 - 2 + 1);
+ +
+ +	vars->rec_inv_sqrt = val >> REC_INV_SQRT_SHIFT;
+ +}
+ +
+ +/*
+ + * CoDel control_law is t + interval/sqrt(count)
+ + * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
+ + * both sqrt() and divide operation.
+ + */
+ +static codel_time_t codel_control_law(codel_time_t t,
+ +				      codel_time_t interval,
+ +				      u32 rec_inv_sqrt)
+ +{
+ +	return t + reciprocal_scale(interval, rec_inv_sqrt << REC_INV_SQRT_SHIFT);
+ +}
+ +
+ +static bool codel_should_drop(const struct sk_buff *skb,
+ +			      struct Qdisc *sch,
+ +			      struct codel_vars *vars,
+ +			      struct codel_params *params,
+ +			      struct codel_stats *stats,
+ +			      codel_time_t now)
+ +{
+ +	bool ok_to_drop;
+ +
+ +	if (!skb) {
+ +		vars->first_above_time = 0;
+ +		return false;
+ +	}
+ +
+ +	vars->ldelay = now - codel_get_enqueue_time(skb);
+ +	sch->qstats.backlog -= qdisc_pkt_len(skb);
+ +
+ +	if (unlikely(qdisc_pkt_len(skb) > stats->maxpacket))
+ +		stats->maxpacket = qdisc_pkt_len(skb);
+ +
+ +	if (codel_time_before(vars->ldelay, params->target) ||
+ +	    sch->qstats.backlog <= params->mtu) {
+ +		/* went below - stay below for at least interval */
+ +		vars->first_above_time = 0;
+ +		return false;
+ +	}
+ +	ok_to_drop = false;
+ +	if (vars->first_above_time == 0) {
+ +		/* just went above from below. If we stay above
+ +		 * for at least interval we'll say it's ok to drop
+ +		 */
+ +		vars->first_above_time = now + params->interval;
+ +	} else if (codel_time_after(now, vars->first_above_time)) {
+ +		ok_to_drop = true;
+ +	}
+ +	return ok_to_drop;
+ +}
+ +
+ +typedef struct sk_buff * (*codel_skb_dequeue_t)(struct codel_vars *vars,
+ +						struct Qdisc *sch);
+ +
+ +static struct sk_buff *codel_dequeue(struct Qdisc *sch,
+ +				     struct codel_params *params,
+ +				     struct codel_vars *vars,
+ +				     struct codel_stats *stats,
+ +				     codel_skb_dequeue_t dequeue_func)
+ +{
+ +	struct sk_buff *skb = dequeue_func(vars, sch);
+ +	codel_time_t now;
+ +	bool drop;
+ +
+ +	if (!skb) {
+ +		vars->dropping = false;
+ +		return skb;
+ +	}
+ +	now = codel_get_time();
+ +	drop = codel_should_drop(skb, sch, vars, params, stats, now);
+ +	if (vars->dropping) {
+ +		if (!drop) {
+ +			/* sojourn time below target - leave dropping state */
+ +			vars->dropping = false;
+ +		} else if (codel_time_after_eq(now, vars->drop_next)) {
+ +			/* It's time for the next drop. Drop the current
+ +			 * packet and dequeue the next. The dequeue might
+ +			 * take us out of dropping state.
+ +			 * If not, schedule the next drop.
+ +			 * A large backlog might result in drop rates so high
+ +			 * that the next drop should happen now,
+ +			 * hence the while loop.
+ +			 */
+ +			while (vars->dropping &&
+ +			       codel_time_after_eq(now, vars->drop_next)) {
+ +				vars->count++; /* dont care of possible wrap
+ +						* since there is no more divide
+ +						*/
+ +				codel_Newton_step(vars);
+ +				if (params->ecn && INET_ECN_set_ce(skb)) {
+ +					stats->ecn_mark++;
+ +					vars->drop_next =
+ +						codel_control_law(vars->drop_next,
+ +								  params->interval,
+ +								  vars->rec_inv_sqrt);
+ +					goto end;
+ +				}
+ +				qdisc_drop(skb, sch);
+ +				stats->drop_count++;
+ +				skb = dequeue_func(vars, sch);
+ +				if (!codel_should_drop(skb, sch,
+ +						       vars, params, stats, now)) {
+ +					/* leave dropping state */
+ +					vars->dropping = false;
+ +				} else {
+ +					/* and schedule the next drop */
+ +					vars->drop_next =
+ +						codel_control_law(vars->drop_next,
+ +								  params->interval,
+ +								  vars->rec_inv_sqrt);
+ +				}
+ +			}
+ +		}
+ +	} else if (drop) {
+ +		u32 delta;
+ +
+ +		if (params->ecn && INET_ECN_set_ce(skb)) {
+ +			stats->ecn_mark++;
+ +		} else {
+ +			qdisc_drop(skb, sch);
+ +			stats->drop_count++;
+ +
+ +			skb = dequeue_func(vars, sch);
+ +			drop = codel_should_drop(skb, sch, vars, params,
+ +						 stats, now);
+ +		}
+ +		vars->dropping = true;
+ +		/* if min went above target close to when we last went below it
+ +		 * assume that the drop rate that controlled the queue on the
+ +		 * last cycle is a good starting point to control it now.
+ +		 */
+ +		delta = vars->count - vars->lastcount;
+ +		if (delta > 1 &&
+ +		    codel_time_before(now - vars->drop_next,
+ +				      16 * params->interval)) {
+ +			vars->count = delta;
+ +			/* we dont care if rec_inv_sqrt approximation
+ +			 * is not very precise :
+ +			 * Next Newton steps will correct it quadratically.
+ +			 */
+ +			codel_Newton_step(vars);
+ +		} else {
+ +			vars->count = 1;
+ +			vars->rec_inv_sqrt = ~0U >> REC_INV_SQRT_SHIFT;
+ +		}
+ +		vars->lastcount = vars->count;
+ +		vars->drop_next = codel_control_law(now, params->interval,
+ +						    vars->rec_inv_sqrt);
+ +	}
+ +end:
+ +	return skb;
+ +}
+++=======
++ #define CODEL_DISABLED_THRESHOLD INT_MAX
++ 
++ typedef u32 (*codel_skb_len_t)(const struct sk_buff *skb);
++ typedef codel_time_t (*codel_skb_time_t)(const struct sk_buff *skb);
++ typedef void (*codel_skb_drop_t)(struct sk_buff *skb, void *ctx);
++ typedef struct sk_buff * (*codel_skb_dequeue_t)(struct codel_vars *vars,
++ 						void *ctx);
++ 
+++>>>>>>> d068ca2ae2e6 (codel: split into multiple files)
+  #endif
+* Unmerged path include/net/codel.h
+diff --git a/include/net/codel_impl.h b/include/net/codel_impl.h
+new file mode 100644
+index 000000000000..d289b91dcd65
+--- /dev/null
++++ b/include/net/codel_impl.h
+@@ -0,0 +1,255 @@
++#ifndef __NET_SCHED_CODEL_IMPL_H
++#define __NET_SCHED_CODEL_IMPL_H
++
++/*
++ * Codel - The Controlled-Delay Active Queue Management algorithm
++ *
++ *  Copyright (C) 2011-2012 Kathleen Nichols <nichols@pollere.com>
++ *  Copyright (C) 2011-2012 Van Jacobson <van@pollere.net>
++ *  Copyright (C) 2012 Michael D. Taht <dave.taht@bufferbloat.net>
++ *  Copyright (C) 2012,2015 Eric Dumazet <edumazet@google.com>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the authors may not be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * Alternatively, provided that this notice is retained in full, this
++ * software may be distributed under the terms of the GNU General
++ * Public License ("GPL") version 2, in which case the provisions of the
++ * GPL apply INSTEAD OF those given above.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
++ * DAMAGE.
++ *
++ */
++
++/* Controlling Queue Delay (CoDel) algorithm
++ * =========================================
++ * Source : Kathleen Nichols and Van Jacobson
++ * http://queue.acm.org/detail.cfm?id=2209336
++ *
++ * Implemented on linux by Dave Taht and Eric Dumazet
++ */
++
++static void codel_params_init(struct codel_params *params)
++{
++	params->interval = MS2TIME(100);
++	params->target = MS2TIME(5);
++	params->ce_threshold = CODEL_DISABLED_THRESHOLD;
++	params->ecn = false;
++}
++
++static void codel_vars_init(struct codel_vars *vars)
++{
++	memset(vars, 0, sizeof(*vars));
++}
++
++static void codel_stats_init(struct codel_stats *stats)
++{
++	stats->maxpacket = 0;
++}
++
++/*
++ * http://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Iterative_methods_for_reciprocal_square_roots
++ * new_invsqrt = (invsqrt / 2) * (3 - count * invsqrt^2)
++ *
++ * Here, invsqrt is a fixed point number (< 1.0), 32bit mantissa, aka Q0.32
++ */
++static void codel_Newton_step(struct codel_vars *vars)
++{
++	u32 invsqrt = ((u32)vars->rec_inv_sqrt) << REC_INV_SQRT_SHIFT;
++	u32 invsqrt2 = ((u64)invsqrt * invsqrt) >> 32;
++	u64 val = (3LL << 32) - ((u64)vars->count * invsqrt2);
++
++	val >>= 2; /* avoid overflow in following multiply */
++	val = (val * invsqrt) >> (32 - 2 + 1);
++
++	vars->rec_inv_sqrt = val >> REC_INV_SQRT_SHIFT;
++}
++
++/*
++ * CoDel control_law is t + interval/sqrt(count)
++ * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
++ * both sqrt() and divide operation.
++ */
++static codel_time_t codel_control_law(codel_time_t t,
++				      codel_time_t interval,
++				      u32 rec_inv_sqrt)
++{
++	return t + reciprocal_scale(interval, rec_inv_sqrt << REC_INV_SQRT_SHIFT);
++}
++
++static bool codel_should_drop(const struct sk_buff *skb,
++			      void *ctx,
++			      struct codel_vars *vars,
++			      struct codel_params *params,
++			      struct codel_stats *stats,
++			      codel_skb_len_t skb_len_func,
++			      codel_skb_time_t skb_time_func,
++			      u32 *backlog,
++			      codel_time_t now)
++{
++	bool ok_to_drop;
++	u32 skb_len;
++
++	if (!skb) {
++		vars->first_above_time = 0;
++		return false;
++	}
++
++	skb_len = skb_len_func(skb);
++	vars->ldelay = now - skb_time_func(skb);
++
++	if (unlikely(skb_len > stats->maxpacket))
++		stats->maxpacket = skb_len;
++
++	if (codel_time_before(vars->ldelay, params->target) ||
++	    *backlog <= params->mtu) {
++		/* went below - stay below for at least interval */
++		vars->first_above_time = 0;
++		return false;
++	}
++	ok_to_drop = false;
++	if (vars->first_above_time == 0) {
++		/* just went above from below. If we stay above
++		 * for at least interval we'll say it's ok to drop
++		 */
++		vars->first_above_time = now + params->interval;
++	} else if (codel_time_after(now, vars->first_above_time)) {
++		ok_to_drop = true;
++	}
++	return ok_to_drop;
++}
++
++static struct sk_buff *codel_dequeue(void *ctx,
++				     u32 *backlog,
++				     struct codel_params *params,
++				     struct codel_vars *vars,
++				     struct codel_stats *stats,
++				     codel_skb_len_t skb_len_func,
++				     codel_skb_time_t skb_time_func,
++				     codel_skb_drop_t drop_func,
++				     codel_skb_dequeue_t dequeue_func)
++{
++	struct sk_buff *skb = dequeue_func(vars, ctx);
++	codel_time_t now;
++	bool drop;
++
++	if (!skb) {
++		vars->dropping = false;
++		return skb;
++	}
++	now = codel_get_time();
++	drop = codel_should_drop(skb, ctx, vars, params, stats,
++				 skb_len_func, skb_time_func, backlog, now);
++	if (vars->dropping) {
++		if (!drop) {
++			/* sojourn time below target - leave dropping state */
++			vars->dropping = false;
++		} else if (codel_time_after_eq(now, vars->drop_next)) {
++			/* It's time for the next drop. Drop the current
++			 * packet and dequeue the next. The dequeue might
++			 * take us out of dropping state.
++			 * If not, schedule the next drop.
++			 * A large backlog might result in drop rates so high
++			 * that the next drop should happen now,
++			 * hence the while loop.
++			 */
++			while (vars->dropping &&
++			       codel_time_after_eq(now, vars->drop_next)) {
++				vars->count++; /* dont care of possible wrap
++						* since there is no more divide
++						*/
++				codel_Newton_step(vars);
++				if (params->ecn && INET_ECN_set_ce(skb)) {
++					stats->ecn_mark++;
++					vars->drop_next =
++						codel_control_law(vars->drop_next,
++								  params->interval,
++								  vars->rec_inv_sqrt);
++					goto end;
++				}
++				stats->drop_len += skb_len_func(skb);
++				drop_func(skb, ctx);
++				stats->drop_count++;
++				skb = dequeue_func(vars, ctx);
++				if (!codel_should_drop(skb, ctx,
++						       vars, params, stats,
++						       skb_len_func,
++						       skb_time_func,
++						       backlog, now)) {
++					/* leave dropping state */
++					vars->dropping = false;
++				} else {
++					/* and schedule the next drop */
++					vars->drop_next =
++						codel_control_law(vars->drop_next,
++								  params->interval,
++								  vars->rec_inv_sqrt);
++				}
++			}
++		}
++	} else if (drop) {
++		u32 delta;
++
++		if (params->ecn && INET_ECN_set_ce(skb)) {
++			stats->ecn_mark++;
++		} else {
++			stats->drop_len += skb_len_func(skb);
++			drop_func(skb, ctx);
++			stats->drop_count++;
++
++			skb = dequeue_func(vars, ctx);
++			drop = codel_should_drop(skb, ctx, vars, params,
++						 stats, skb_len_func,
++						 skb_time_func, backlog, now);
++		}
++		vars->dropping = true;
++		/* if min went above target close to when we last went below it
++		 * assume that the drop rate that controlled the queue on the
++		 * last cycle is a good starting point to control it now.
++		 */
++		delta = vars->count - vars->lastcount;
++		if (delta > 1 &&
++		    codel_time_before(now - vars->drop_next,
++				      16 * params->interval)) {
++			vars->count = delta;
++			/* we dont care if rec_inv_sqrt approximation
++			 * is not very precise :
++			 * Next Newton steps will correct it quadratically.
++			 */
++			codel_Newton_step(vars);
++		} else {
++			vars->count = 1;
++			vars->rec_inv_sqrt = ~0U >> REC_INV_SQRT_SHIFT;
++		}
++		vars->lastcount = vars->count;
++		vars->drop_next = codel_control_law(now, params->interval,
++						    vars->rec_inv_sqrt);
++	}
++end:
++	if (skb && codel_time_after(vars->ldelay, params->ce_threshold) &&
++	    INET_ECN_set_ce(skb))
++		stats->ce_mark++;
++	return skb;
++}
++
++#endif
+diff --git a/include/net/codel_qdisc.h b/include/net/codel_qdisc.h
+new file mode 100644
+index 000000000000..8144d9cd2908
+--- /dev/null
++++ b/include/net/codel_qdisc.h
+@@ -0,0 +1,73 @@
++#ifndef __NET_SCHED_CODEL_QDISC_H
++#define __NET_SCHED_CODEL_QDISC_H
++
++/*
++ * Codel - The Controlled-Delay Active Queue Management algorithm
++ *
++ *  Copyright (C) 2011-2012 Kathleen Nichols <nichols@pollere.com>
++ *  Copyright (C) 2011-2012 Van Jacobson <van@pollere.net>
++ *  Copyright (C) 2012 Michael D. Taht <dave.taht@bufferbloat.net>
++ *  Copyright (C) 2012,2015 Eric Dumazet <edumazet@google.com>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions, and the following disclaimer,
++ *    without modification.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The names of the authors may not be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * Alternatively, provided that this notice is retained in full, this
++ * software may be distributed under the terms of the GNU General
++ * Public License ("GPL") version 2, in which case the provisions of the
++ * GPL apply INSTEAD OF those given above.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
++ * DAMAGE.
++ *
++ */
++
++/* Controlling Queue Delay (CoDel) algorithm
++ * =========================================
++ * Source : Kathleen Nichols and Van Jacobson
++ * http://queue.acm.org/detail.cfm?id=2209336
++ *
++ * Implemented on linux by Dave Taht and Eric Dumazet
++ */
++
++/* Qdiscs using codel plugin must use codel_skb_cb in their own cb[] */
++struct codel_skb_cb {
++	codel_time_t enqueue_time;
++};
++
++static struct codel_skb_cb *get_codel_cb(const struct sk_buff *skb)
++{
++	qdisc_cb_private_validate(skb, sizeof(struct codel_skb_cb));
++	return (struct codel_skb_cb *)qdisc_skb_cb(skb)->data;
++}
++
++static codel_time_t codel_get_enqueue_time(const struct sk_buff *skb)
++{
++	return get_codel_cb(skb)->enqueue_time;
++}
++
++static void codel_set_enqueue_time(struct sk_buff *skb)
++{
++	get_codel_cb(skb)->enqueue_time = codel_get_time();
++}
++
++#endif
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 7a0bdb16ac92..f1f2a91cce63 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -49,6 +49,8 @@
+ #include <linux/prefetch.h>
+ #include <net/pkt_sched.h>
+ #include <net/codel.h>
++#include <net/codel_impl.h>
++#include <net/codel_qdisc.h>
+ 
+ 
+ #define DEFAULT_CODEL_LIMIT 1000
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 03125323e5e3..bf8c410bbfce 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -25,6 +25,8 @@
+ #include <net/pkt_sched.h>
+ #include <net/flow_keys.h>
+ #include <net/codel.h>
++#include <net/codel_impl.h>
++#include <net/codel_qdisc.h>
+ 
+ /*	Fair Queue CoDel.
+  *
