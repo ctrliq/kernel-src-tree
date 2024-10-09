@@ -1,0 +1,197 @@
+scsi: lpfc: Fix defects reported by Coverity Scan
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix defects reported by Coverity Scan (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 93.48%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 78e1d2009f1c539a23f470728e530a3ce1d527e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/78e1d200.failed
+
+Addressed the following reported defects:
+
+** CID 1411552:  Control flow issues  (MISSING_BREAK)
+/drivers/scsi/lpfc/lpfc_sli.c: 13259 in lpfc_sli4_nvmet_handle_rcqe()
+
+** CID 1411553:  Memory - illegal accesses  (OVERRUN)
+/drivers/scsi/lpfc/lpfc_sli.c: 16218 in lpfc_fc_frame_check()
+
+** CID 1411553:  Memory - illegal accesses  (OVERRUN)
+   Overrunning array "lpfc_rctl_names" of 202 8-byte elements at element
+   index 244 (byte offset 1952) using index "fc_hdr->fh_r_ctl" (which
+   evaluates to 244).
+
+** CID 1411554:  Null pointer dereferences  (REVERSE_INULL)
+/drivers/scsi/lpfc/lpfc_nvmet.c: 2131 in lpfc_nvmet_unsol_fcp_abort_cmp()
+
+** CID 1411555:  Memory - illegal accesses  (UNINIT)
+/drivers/scsi/lpfc/lpfc_nvmet.c: 180 in lpfc_nvmet_ctxbuf_post()
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 78e1d2009f1c539a23f470728e530a3ce1d527e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_nvmet.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index 8324e9337564,f60c9e3e37d7..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -12447,7 -13219,114 +12447,118 @@@ lpfc_sli4_fp_handle_rel_wcqe(struct lpf
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * lpfc_sli4_fp_handle_wcqe - Process fast-path work queue completion entry
+++=======
++  * lpfc_sli4_nvmet_handle_rcqe - Process a receive-queue completion queue entry
++  * @phba: Pointer to HBA context object.
++  * @rcqe: Pointer to receive-queue completion queue entry.
++  *
++  * This routine process a receive-queue completion queue entry.
++  *
++  * Return: true if work posted to worker thread, otherwise false.
++  **/
++ static bool
++ lpfc_sli4_nvmet_handle_rcqe(struct lpfc_hba *phba, struct lpfc_queue *cq,
++ 			    struct lpfc_rcqe *rcqe)
++ {
++ 	bool workposted = false;
++ 	struct lpfc_queue *hrq;
++ 	struct lpfc_queue *drq;
++ 	struct rqb_dmabuf *dma_buf;
++ 	struct fc_frame_header *fc_hdr;
++ 	struct lpfc_nvmet_tgtport *tgtp;
++ 	uint32_t status, rq_id;
++ 	unsigned long iflags;
++ 	uint32_t fctl, idx;
++ 
++ 	if ((phba->nvmet_support == 0) ||
++ 	    (phba->sli4_hba.nvmet_cqset == NULL))
++ 		return workposted;
++ 
++ 	idx = cq->queue_id - phba->sli4_hba.nvmet_cqset[0]->queue_id;
++ 	hrq = phba->sli4_hba.nvmet_mrq_hdr[idx];
++ 	drq = phba->sli4_hba.nvmet_mrq_data[idx];
++ 
++ 	/* sanity check on queue memory */
++ 	if (unlikely(!hrq) || unlikely(!drq))
++ 		return workposted;
++ 
++ 	if (bf_get(lpfc_cqe_code, rcqe) == CQE_CODE_RECEIVE_V1)
++ 		rq_id = bf_get(lpfc_rcqe_rq_id_v1, rcqe);
++ 	else
++ 		rq_id = bf_get(lpfc_rcqe_rq_id, rcqe);
++ 
++ 	if ((phba->nvmet_support == 0) ||
++ 	    (rq_id != hrq->queue_id))
++ 		return workposted;
++ 
++ 	status = bf_get(lpfc_rcqe_status, rcqe);
++ 	switch (status) {
++ 	case FC_STATUS_RQ_BUF_LEN_EXCEEDED:
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 				"6126 Receive Frame Truncated!!\n");
++ 		/* Drop thru */
++ 	case FC_STATUS_RQ_SUCCESS:
++ 		lpfc_sli4_rq_release(hrq, drq);
++ 		spin_lock_irqsave(&phba->hbalock, iflags);
++ 		dma_buf = lpfc_sli_rqbuf_get(phba, hrq);
++ 		if (!dma_buf) {
++ 			hrq->RQ_no_buf_found++;
++ 			spin_unlock_irqrestore(&phba->hbalock, iflags);
++ 			goto out;
++ 		}
++ 		spin_unlock_irqrestore(&phba->hbalock, iflags);
++ 		hrq->RQ_rcv_buf++;
++ 		hrq->RQ_buf_posted--;
++ 		fc_hdr = (struct fc_frame_header *)dma_buf->hbuf.virt;
++ 
++ 		/* Just some basic sanity checks on FCP Command frame */
++ 		fctl = (fc_hdr->fh_f_ctl[0] << 16 |
++ 		fc_hdr->fh_f_ctl[1] << 8 |
++ 		fc_hdr->fh_f_ctl[2]);
++ 		if (((fctl &
++ 		    (FC_FC_FIRST_SEQ | FC_FC_END_SEQ | FC_FC_SEQ_INIT)) !=
++ 		    (FC_FC_FIRST_SEQ | FC_FC_END_SEQ | FC_FC_SEQ_INIT)) ||
++ 		    (fc_hdr->fh_seq_cnt != 0)) /* 0 byte swapped is still 0 */
++ 			goto drop;
++ 
++ 		if (fc_hdr->fh_type == FC_TYPE_FCP) {
++ 			dma_buf->bytes_recv = bf_get(lpfc_rcqe_length,  rcqe);
++ 			lpfc_nvmet_unsol_fcp_event(
++ 				phba, phba->sli4_hba.els_wq->pring, dma_buf,
++ 				cq->assoc_qp->isr_timestamp);
++ 			return false;
++ 		}
++ drop:
++ 		lpfc_in_buf_free(phba, &dma_buf->dbuf);
++ 		break;
++ 	case FC_STATUS_INSUFF_BUF_FRM_DISC:
++ 		if (phba->nvmet_support) {
++ 			tgtp = phba->targetport->private;
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI | LOG_NVME,
++ 					"6401 RQE Error x%x, posted %d err_cnt "
++ 					"%d: %x %x %x\n",
++ 					status, hrq->RQ_buf_posted,
++ 					hrq->RQ_no_posted_buf,
++ 					atomic_read(&tgtp->rcv_fcp_cmd_in),
++ 					atomic_read(&tgtp->rcv_fcp_cmd_out),
++ 					atomic_read(&tgtp->xmt_fcp_release));
++ 		}
++ 		/* fallthrough */
++ 
++ 	case FC_STATUS_INSUFF_BUF_NEED_BUF:
++ 		hrq->RQ_no_posted_buf++;
++ 		/* Post more buffers if possible */
++ 		break;
++ 	}
++ out:
++ 	return workposted;
++ }
++ 
++ /**
++  * lpfc_sli4_fp_handle_cqe - Process fast-path work queue completion entry
+++>>>>>>> 78e1d2009f1c (scsi: lpfc: Fix defects reported by Coverity Scan)
+   * @cq: Pointer to the completion queue.
+   * @eqe: Pointer to fast-path completion queue entry.
+   *
+@@@ -14863,10 -16212,9 +14974,14 @@@ lpfc_fc_frame_check(struct lpfc_hba *ph
+  	}
+  
+  	lpfc_printf_log(phba, KERN_INFO, LOG_ELS,
+- 			"2538 Received frame rctl:%s (x%x), type:%s (x%x), "
++ 			"2538 Received frame rctl:x%x, type:x%x, "
+  			"frame Data:%08x %08x %08x %08x %08x %08x %08x\n",
+++<<<<<<< HEAD
+ +			rctl_names[fc_hdr->fh_r_ctl], fc_hdr->fh_r_ctl,
+ +			type_names[fc_hdr->fh_type], fc_hdr->fh_type,
+++=======
++ 			fc_hdr->fh_r_ctl, fc_hdr->fh_type,
+++>>>>>>> 78e1d2009f1c (scsi: lpfc: Fix defects reported by Coverity Scan)
+  			be32_to_cpu(header[0]), be32_to_cpu(header[1]),
+  			be32_to_cpu(header[2]), be32_to_cpu(header[3]),
+  			be32_to_cpu(header[4]), be32_to_cpu(header[5]),
+@@@ -14874,9 -16222,8 +14989,14 @@@
+  	return 0;
+  drop:
+  	lpfc_printf_log(phba, KERN_WARNING, LOG_ELS,
+++<<<<<<< HEAD
+ +			"2539 Dropped frame rctl:%s type:%s\n",
+ +			rctl_names[fc_hdr->fh_r_ctl],
+ +			type_names[fc_hdr->fh_type]);
+++=======
++ 			"2539 Dropped frame rctl:x%x type:x%x\n",
++ 			fc_hdr->fh_r_ctl, fc_hdr->fh_type);
+++>>>>>>> 78e1d2009f1c (scsi: lpfc: Fix defects reported by Coverity Scan)
+  	return 1;
+  }
+  
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvmet.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
