@@ -1,0 +1,287 @@
+target: Fix PR registration + APTPL RCU conversion regression
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix PR registration + APTPL RCU conversion regression (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.98%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 3ccd6e83df8a0d4a664edeecc453c4fa046395fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3ccd6e83.failed
+
+This patch fixes a v4.2+ regression introduced by commit 79dc9c9e86
+where lookup of t10_pr_registration->pr_reg_deve and associated
+->pr_kref get was missing from __core_scsi3_do_alloc_registration(),
+which is responsible for setting DEF_PR_REG_ACTIVE.
+
+This would result in REGISTER operations completing successfully,
+but subsequent core_scsi3_pr_seq_non_holder() checking would fail
+with !DEF_PR_REG_ACTIVE -> RESERVATION CONFLICT status.
+
+Update __core_scsi3_add_registration() to drop ->pr_kref reference
+after registration and any optional ALL_TG_PT=1 processing has
+completed.  Update core_scsi3_decode_spec_i_port() to release
+the new parent local_pr_reg->pr_kref as well.
+
+Also, update __core_scsi3_check_aptpl_registration() to perform
+the same target_nacl_find_deve() lookup + ->pr_kref get, now that
+__core_scsi3_add_registration() expects to drop the reference.
+
+Finally, since there are cases when se_dev_entry->se_lun_acl can
+still be dereferenced in core_scsi3_lunacl_undepend_item() while
+holding ->pr_kref, go ahead and move explicit rcu_assign_pointer()
+NULL assignments within core_disable_device_list_for_node() until
+after orig->pr_comp finishes.
+
+	Reported-by: Scott L. Lykens <scott@lykens.org>
+	Tested-by: Scott L. Lykens <scott@lykens.org>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Lee Duncan <lduncan@suse.com>
+	Cc: <stable@vger.kernel.org> # v4.2+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 3ccd6e83df8a0d4a664edeecc453c4fa046395fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_pr.c
+diff --cc drivers/target/target_core_device.c
+index 1e65ea95d7f2,abf20763b0b6..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -397,30 -417,33 +397,52 @@@ int core_disable_device_list_for_node
+  	 * NodeACL context specific PR metadata for demo-mode
+  	 * MappedLUN *deve will be released below..
+  	 */
+ -	spin_lock(&lun->lun_deve_lock);
+ -	list_del(&orig->lun_link);
+ -	spin_unlock(&lun->lun_deve_lock);
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_del(&deve->alua_port_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+  	/*
+ -	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
+ +	 * PR operation to complete.
+  	 */
+ -	core_scsi3_ua_release_all(orig);
+ +	while (atomic_read(&deve->pr_ref_count) != 0)
+ +		cpu_relax();
+  
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	/*
+ +	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 */
+ +	core_scsi3_ua_release_all(deve);
+ +	deve->se_lun = NULL;
+ +	deve->se_lun_acl = NULL;
+ +	deve->lun_flags = 0;
+ +	deve->creation_time = 0;
+ +	deve->attach_count--;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+ +
+++<<<<<<< HEAD
+ +	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+ +	return 0;
+++=======
++ 	hlist_del_rcu(&orig->link);
++ 	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
++ 	orig->lun_flags = 0;
++ 	orig->creation_time = 0;
++ 	orig->attach_count--;
++ 	/*
++ 	 * Before firing off RCU callback, wait for any in process SPEC_I_PT=1
++ 	 * or REGISTER_AND_MOVE PR operation to complete.
++ 	 */
++ 	kref_put(&orig->pr_kref, target_pr_kref_release);
++ 	wait_for_completion(&orig->pr_comp);
++ 
++ 	rcu_assign_pointer(orig->se_lun, NULL);
++ 	rcu_assign_pointer(orig->se_lun_acl, NULL);
++ 
++ 	kfree_rcu(orig, rcu_head);
++ 
++ 	core_scsi3_free_pr_reg_from_nacl(dev, nacl);
++ 	target_luns_data_has_changed(nacl, NULL, false);
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  }
+  
+  /*      core_clear_lun_from_tpg():
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,e7933115087a..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -620,7 -617,9 +620,13 @@@ static u32 core_scsi3_pr_generation(str
+  static struct t10_pr_registration *__core_scsi3_do_alloc_registration(
+  	struct se_device *dev,
+  	struct se_node_acl *nacl,
+++<<<<<<< HEAD
+ +	struct se_dev_entry *deve,
+++=======
++ 	struct se_lun *lun,
++ 	struct se_dev_entry *dest_deve,
++ 	u64 mapped_lun,
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  	unsigned char *isid,
+  	u64 sa_res_key,
+  	int all_tg_pt,
+@@@ -641,9 -640,32 +647,38 @@@
+  	INIT_LIST_HEAD(&pr_reg->pr_reg_atp_mem_list);
+  	atomic_set(&pr_reg->pr_res_holders, 0);
+  	pr_reg->pr_reg_nacl = nacl;
+++<<<<<<< HEAD
+ +	pr_reg->pr_reg_deve = deve;
+ +	pr_reg->pr_res_mapped_lun = deve->mapped_lun;
+ +	pr_reg->pr_aptpl_target_lun = deve->se_lun->unpacked_lun;
+++=======
++ 	/*
++ 	 * For destination registrations for ALL_TG_PT=1 and SPEC_I_PT=1,
++ 	 * the se_dev_entry->pr_ref will have been already obtained by
++ 	 * core_get_se_deve_from_rtpi() or __core_scsi3_alloc_registration().
++ 	 *
++ 	 * Otherwise, locate se_dev_entry now and obtain a reference until
++ 	 * registration completes in __core_scsi3_add_registration().
++ 	 */
++ 	if (dest_deve) {
++ 		pr_reg->pr_reg_deve = dest_deve;
++ 	} else {
++ 		rcu_read_lock();
++ 		pr_reg->pr_reg_deve = target_nacl_find_deve(nacl, mapped_lun);
++ 		if (!pr_reg->pr_reg_deve) {
++ 			rcu_read_unlock();
++ 			pr_err("Unable to locate PR deve %s mapped_lun: %llu\n",
++ 				nacl->initiatorname, mapped_lun);
++ 			kmem_cache_free(t10_pr_reg_cache, pr_reg);
++ 			return NULL;
++ 		}
++ 		kref_get(&pr_reg->pr_reg_deve->pr_kref);
++ 		rcu_read_unlock();
++ 	}
++ 	pr_reg->pr_res_mapped_lun = mapped_lun;
++ 	pr_reg->pr_aptpl_target_lun = lun->unpacked_lun;
++ 	pr_reg->tg_pt_sep_rtpi = lun->lun_rtpi;
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  	pr_reg->pr_res_key = sa_res_key;
+  	pr_reg->pr_reg_all_tg_pt = all_tg_pt;
+  	pr_reg->pr_reg_aptpl = aptpl;
+@@@ -929,11 -958,23 +964,29 @@@ static int __core_scsi3_check_aptpl_reg
+  		    !(strcmp(pr_reg->pr_tport, t_port)) &&
+  		     (pr_reg->pr_reg_tpgt == tpgt) &&
+  		     (pr_reg->pr_aptpl_target_lun == target_lun)) {
++ 			/*
++ 			 * Obtain the ->pr_reg_deve pointer + reference, that
++ 			 * is released by __core_scsi3_add_registration() below.
++ 			 */
++ 			rcu_read_lock();
++ 			pr_reg->pr_reg_deve = target_nacl_find_deve(nacl, mapped_lun);
++ 			if (!pr_reg->pr_reg_deve) {
++ 				pr_err("Unable to locate PR APTPL %s mapped_lun:"
++ 					" %llu\n", nacl->initiatorname, mapped_lun);
++ 				rcu_read_unlock();
++ 				continue;
++ 			}
++ 			kref_get(&pr_reg->pr_reg_deve->pr_kref);
++ 			rcu_read_unlock();
+  
+  			pr_reg->pr_reg_nacl = nacl;
+++<<<<<<< HEAD
+ +			pr_reg->pr_reg_deve = deve;
+ +			pr_reg->pr_reg_tg_pt_lun = lun;
+ +
+++=======
++ 			pr_reg->tg_pt_sep_rtpi = lun->lun_rtpi;
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  			list_del(&pr_reg->pr_reg_aptpl_list);
+  			spin_unlock(&pr_tmpl->aptpl_reg_lock);
+  			/*
+@@@ -1061,18 -1098,35 +1113,44 @@@ static void __core_scsi3_add_registrati
+  		spin_lock(&pr_tmpl->registration_lock);
+  		list_add_tail(&pr_reg_tmp->pr_reg_list,
+  			      &pr_tmpl->registration_list);
+ +		pr_reg_tmp->pr_reg_deve->def_pr_registered = 1;
+  
+ -		__core_scsi3_dump_registration(tfo, dev, nacl_tmp, pr_reg_tmp,
+ -					       register_type);
+ +		__core_scsi3_dump_registration(tfo, dev,
+ +				pr_reg_tmp->pr_reg_nacl, pr_reg_tmp,
+ +				register_type);
+  		spin_unlock(&pr_tmpl->registration_lock);
+  		/*
+++<<<<<<< HEAD
+ +		 * Drop configfs group dependency reference from
+ +		 * __core_scsi3_alloc_registration()
+ +		 */
+ +		core_scsi3_lunacl_undepend_item(pr_reg_tmp->pr_reg_deve);
+++=======
++ 		 * Drop configfs group dependency reference and deve->pr_kref
++ 		 * obtained from  __core_scsi3_alloc_registration() code.
++ 		 */
++ 		rcu_read_lock();
++ 		deve = pr_reg_tmp->pr_reg_deve;
++ 		if (deve) {
++ 			set_bit(DEF_PR_REG_ACTIVE, &deve->deve_flags);
++ 			core_scsi3_lunacl_undepend_item(deve);
++ 			pr_reg_tmp->pr_reg_deve = NULL;
++ 		}
++ 		rcu_read_unlock();
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
++ 	}
++ out:
++ 	/*
++ 	 * Drop deve->pr_kref obtained in __core_scsi3_do_alloc_registration()
++ 	 */
++ 	rcu_read_lock();
++ 	deve = pr_reg->pr_reg_deve;
++ 	if (deve) {
++ 		set_bit(DEF_PR_REG_ACTIVE, &deve->deve_flags);
++ 		kref_put(&deve->pr_kref, target_pr_kref_release);
++ 		pr_reg->pr_reg_deve = NULL;
+  	}
++ 	rcu_read_unlock();
+  }
+  
+  static int core_scsi3_alloc_registration(
+@@@ -1777,12 -1820,15 +1855,18 @@@ core_scsi3_decode_spec_i_port
+  
+  		pr_debug("SPC-3 PR [%s] SPEC_I_PT: Successfully"
+  			" registered Transport ID for Node: %s%s Mapped LUN:"
+ -			" %llu\n", dest_tpg->se_tpg_tfo->get_fabric_name(),
+ -			dest_node_acl->initiatorname, i_buf, (dest_se_deve) ?
+ -			dest_se_deve->mapped_lun : 0);
+ +			" %u\n", dest_tpg->se_tpg_tfo->get_fabric_name(),
+ +			dest_node_acl->initiatorname, i_buf, dest_se_deve->mapped_lun);
+  
+++<<<<<<< HEAD
+ +		if (dest_local_nexus)
+++=======
++ 		if (!dest_se_deve) {
++ 			kref_put(&local_pr_reg->pr_reg_deve->pr_kref,
++ 				 target_pr_kref_release);
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  			continue;
+- 
++ 		}
+  		core_scsi3_lunacl_undepend_item(dest_se_deve);
+  		core_scsi3_nodeacl_undepend_item(dest_node_acl);
+  		core_scsi3_tpg_undepend_item(dest_tpg);
+@@@ -1819,9 -1864,11 +1903,15 @@@ out
+  
+  		kmem_cache_free(t10_pr_reg_cache, dest_pr_reg);
+  
+++<<<<<<< HEAD
+ +		if (dest_local_nexus)
+++=======
++ 		if (!dest_se_deve) {
++ 			kref_put(&local_pr_reg->pr_reg_deve->pr_kref,
++ 				 target_pr_kref_release);
+++>>>>>>> 3ccd6e83df8a (target: Fix PR registration + APTPL RCU conversion regression)
+  			continue;
+- 
++ 		}
+  		core_scsi3_lunacl_undepend_item(dest_se_deve);
+  		core_scsi3_nodeacl_undepend_item(dest_node_acl);
+  		core_scsi3_tpg_undepend_item(dest_tpg);
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_pr.c
