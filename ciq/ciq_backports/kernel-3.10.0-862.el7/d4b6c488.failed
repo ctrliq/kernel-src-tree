@@ -1,0 +1,174 @@
+net/mlx5e: Distribute RSS table among all RX rings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Distribute RSS table among all RX rings (Kamal Heib) [1456694]
+Rebuild_FUZZ: 95.83%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit d4b6c48800dda97f5a0824305d7c8175a127d414
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d4b6c488.failed
+
+In default, uniformly distribute the RSS indirection table entries
+among all RX rings, rather than restricting this only to the rings
+on the close NUMA node. irqbalancer would anyway dynamically override
+the default affinities set to the RX rings.
+This gives better multi-stream performance and CPU util.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d4b6c48800dda97f5a0824305d7c8175a127d414)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 54fbcbad0e6e,8b7d83bcc11a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -799,8 -910,22 +799,27 @@@ void mlx5e_build_indir_tir_ctx_hash(str
+  
+  int mlx5e_open_locked(struct net_device *netdev);
+  int mlx5e_close_locked(struct net_device *netdev);
+++<<<<<<< HEAD
+ +void mlx5e_build_default_indir_rqt(struct mlx5_core_dev *mdev,
+ +				   u32 *indirection_rqt, int len,
+++=======
++ 
++ int mlx5e_open_channels(struct mlx5e_priv *priv,
++ 			struct mlx5e_channels *chs);
++ void mlx5e_close_channels(struct mlx5e_channels *chs);
++ 
++ /* Function pointer to be used to modify WH settings while
++  * switching channels
++  */
++ typedef int (*mlx5e_fp_hw_modify)(struct mlx5e_priv *priv);
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify);
++ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv);
++ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv);
++ 
++ void mlx5e_build_default_indir_rqt(u32 *indirection_rqt, int len,
+++>>>>>>> d4b6c48800dd (net/mlx5e: Distribute RSS table among all RX rings)
+  				   int num_channels);
+  int mlx5e_get_max_linkspeed(struct mlx5_core_dev *mdev, u32 *speed);
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index a12add73652e,d12e9fc0d76b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -599,11 -660,23 +599,19 @@@ static int mlx5e_set_channels(struct ne
+  
+  	mutex_lock(&priv->state_lock);
+  
+++<<<<<<< HEAD
+ +	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (was_opened)
+ +		mlx5e_close_locked(dev);
+++=======
++ 	new_channels.params = priv->channels.params;
++ 	new_channels.params.num_channels = count;
++ 	if (!netif_is_rxfh_configured(priv->netdev))
++ 		mlx5e_build_default_indir_rqt(new_channels.params.indirection_rqt,
++ 					      MLX5E_INDIR_RQT_SIZE, count);
+++>>>>>>> d4b6c48800dd (net/mlx5e: Distribute RSS table among all RX rings)
+  
+ -	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ -		priv->channels.params = new_channels.params;
+ -		goto out;
+ -	}
+ -
+ -	/* Create fresh channels with new parameters */
+ -	err = mlx5e_open_channels(priv, &new_channels);
+ -	if (err)
+ -		goto out;
+ -
+ -	arfs_enabled = priv->netdev->features & NETIF_F_NTUPLE;
+ +	arfs_enabled = dev->features & NETIF_F_NTUPLE;
+  	if (arfs_enabled)
+  		mlx5e_arfs_disable(priv);
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d8b64a5a33e7,77068609a153..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3312,6 -3917,69 +3311,72 @@@ u32 mlx5e_choose_lro_timeout(struct mlx
+  	return MLX5_CAP_ETH(mdev, lro_timer_supported_periods[i]);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
++ 			    struct mlx5e_params *params,
++ 			    u16 max_channels)
++ {
++ 	u8 cq_period_mode = 0;
++ 	u32 link_speed = 0;
++ 	u32 pci_bw = 0;
++ 
++ 	params->num_channels = max_channels;
++ 	params->num_tc       = 1;
++ 
++ 	mlx5e_get_max_linkspeed(mdev, &link_speed);
++ 	mlx5e_get_pci_bw(mdev, &pci_bw);
++ 	mlx5_core_dbg(mdev, "Max link speed = %d, PCI BW = %d\n",
++ 		      link_speed, pci_bw);
++ 
++ 	/* SQ */
++ 	params->log_sq_size = is_kdump_kernel() ?
++ 		MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE :
++ 		MLX5E_PARAMS_DEFAULT_LOG_SQ_SIZE;
++ 
++ 	/* set CQE compression */
++ 	params->rx_cqe_compress_def = false;
++ 	if (MLX5_CAP_GEN(mdev, cqe_compression) &&
++ 	    MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		params->rx_cqe_compress_def = cqe_compress_heuristic(link_speed, pci_bw);
++ 
++ 	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS, params->rx_cqe_compress_def);
++ 
++ 	/* RQ */
++ 	mlx5e_set_rq_params(mdev, params);
++ 
++ 	/* HW LRO */
++ 
++ 	/* TODO: && MLX5_CAP_ETH(mdev, lro_cap) */
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ)
++ 		params->lro_en = hw_lro_heuristic(link_speed, pci_bw);
++ 	params->lro_timeout = mlx5e_choose_lro_timeout(mdev, MLX5E_DEFAULT_LRO_TIMEOUT);
++ 
++ 	/* CQ moderation params */
++ 	cq_period_mode = MLX5_CAP_GEN(mdev, cq_period_start_from_cqe) ?
++ 			MLX5_CQ_PERIOD_MODE_START_FROM_CQE :
++ 			MLX5_CQ_PERIOD_MODE_START_FROM_EQE;
++ 	params->rx_am_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
++ 	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
++ 
++ 	params->tx_cq_moderation.usec = MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC;
++ 	params->tx_cq_moderation.pkts = MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_PKTS;
++ 
++ 	/* TX inline */
++ 	params->tx_max_inline = mlx5e_get_max_inline_cap(mdev);
++ 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
++ 	if (params->tx_min_inline_mode == MLX5_INLINE_MODE_NONE &&
++ 	    !MLX5_CAP_ETH(mdev, wqe_vlan_insert))
++ 		params->tx_min_inline_mode = MLX5_INLINE_MODE_L2;
++ 
++ 	/* RSS */
++ 	params->rss_hfunc = ETH_RSS_HASH_XOR;
++ 	netdev_rss_key_fill(params->toeplitz_hash_key, sizeof(params->toeplitz_hash_key));
++ 	mlx5e_build_default_indir_rqt(params->indirection_rqt,
++ 				      MLX5E_INDIR_RQT_SIZE, max_channels);
++ }
++ 
+++>>>>>>> d4b6c48800dd (net/mlx5e: Distribute RSS table among all RX rings)
+  static void mlx5e_build_nic_netdev_priv(struct mlx5_core_dev *mdev,
+  					struct net_device *netdev,
+  					const struct mlx5e_profile *profile,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
