@@ -1,0 +1,261 @@
+mlxsw: spectrum_router: Align RIF index allocation with existing code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit de5ed99e9777a487da4ad9c58e409ed26b640d9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/de5ed99e.failed
+
+The way we usually allocate an index is by letting the allocation
+function return an error instead of an invalid index.
+
+Do the same for RIF index.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit de5ed99e9777a487da4ad9c58e409ed26b640d9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index f8e7036e3f4a,20061058801e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -2682,90 -2960,74 +2682,124 @@@ static bool mlxsw_sp_rif_should_config(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +#define MLXSW_SP_INVALID_RIF 0xffff
+ +static int mlxsw_sp_avail_rif_get(struct mlxsw_sp *mlxsw_sp)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
+ +		if (!mlxsw_sp->rifs[i])
+ +			return i;
+ +
+ +	return MLXSW_SP_INVALID_RIF;
+++=======
++ static enum mlxsw_sp_rif_type
++ mlxsw_sp_dev_rif_type(const struct mlxsw_sp *mlxsw_sp,
++ 		      const struct net_device *dev)
++ {
++ 	enum mlxsw_sp_fid_type type;
++ 
++ 	/* RIF type is derived from the type of the underlying FID */
++ 	if (is_vlan_dev(dev) && netif_is_bridge_master(vlan_dev_real_dev(dev)))
++ 		type = MLXSW_SP_FID_TYPE_8021Q;
++ 	else if (netif_is_bridge_master(dev) && br_vlan_enabled(dev))
++ 		type = MLXSW_SP_FID_TYPE_8021Q;
++ 	else if (netif_is_bridge_master(dev))
++ 		type = MLXSW_SP_FID_TYPE_8021D;
++ 	else
++ 		type = MLXSW_SP_FID_TYPE_RFID;
++ 
++ 	return mlxsw_sp_fid_type_rif_type(mlxsw_sp, type);
++ }
++ 
++ static int mlxsw_sp_rif_index_alloc(struct mlxsw_sp *mlxsw_sp, u16 *p_rif_index)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++) {
++ 		if (!mlxsw_sp->router->rifs[i]) {
++ 			*p_rif_index = i;
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	return -ENOBUFS;
+++>>>>>>> de5ed99e9777 (mlxsw: spectrum_router: Align RIF index allocation with existing code)
+  }
+  
+ -static struct mlxsw_sp_rif *mlxsw_sp_rif_alloc(size_t rif_size, u16 rif_index,
+ -					       u16 vr_id,
+ -					       struct net_device *l3_dev)
+ +static void mlxsw_sp_vport_rif_sp_attr_get(struct mlxsw_sp_port *mlxsw_sp_vport,
+ +					   bool *p_lagged, u16 *p_system_port)
+  {
+ -	struct mlxsw_sp_rif *rif;
+ +	u8 local_port = mlxsw_sp_vport->local_port;
+  
+ -	rif = kzalloc(rif_size, GFP_KERNEL);
+ -	if (!rif)
+ -		return NULL;
+ +	*p_lagged = mlxsw_sp_vport->lagged;
+ +	*p_system_port = *p_lagged ? mlxsw_sp_vport->lag_id : local_port;
+ +}
+  
+ -	INIT_LIST_HEAD(&rif->nexthop_list);
+ -	INIT_LIST_HEAD(&rif->neigh_list);
+ -	ether_addr_copy(rif->addr, l3_dev->dev_addr);
+ -	rif->mtu = l3_dev->mtu;
+ -	rif->vr_id = vr_id;
+ -	rif->dev = l3_dev;
+ -	rif->rif_index = rif_index;
+ +static int mlxsw_sp_vport_rif_sp_op(struct mlxsw_sp_port *mlxsw_sp_vport,
+ +				    u16 vr_id, struct net_device *l3_dev,
+ +				    u16 rif, bool create)
+ +{
+ +	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_vport->mlxsw_sp;
+ +	bool lagged = mlxsw_sp_vport->lagged;
+ +	char ritr_pl[MLXSW_REG_RITR_LEN];
+ +	u16 system_port;
+ +
+ +	mlxsw_reg_ritr_pack(ritr_pl, create, MLXSW_REG_RITR_SP_IF, rif, vr_id,
+ +			    l3_dev->mtu, l3_dev->dev_addr);
+  
+ -	return rif;
+ +	mlxsw_sp_vport_rif_sp_attr_get(mlxsw_sp_vport, &lagged, &system_port);
+ +	mlxsw_reg_ritr_sp_if_pack(ritr_pl, lagged, system_port,
+ +				  mlxsw_sp_vport_vid_get(mlxsw_sp_vport));
+ +
+ +	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ritr), ritr_pl);
+  }
+  
+ -struct mlxsw_sp_rif *mlxsw_sp_rif_by_index(const struct mlxsw_sp *mlxsw_sp,
+ -					   u16 rif_index)
+ +static void mlxsw_sp_vport_rif_sp_leave(struct mlxsw_sp_port *mlxsw_sp_vport);
+ +
+ +static u16 mlxsw_sp_rif_sp_to_fid(u16 rif)
+  {
+ -	return mlxsw_sp->router->rifs[rif_index];
+ +	return MLXSW_SP_RFID_BASE + rif;
+  }
+  
+ -u16 mlxsw_sp_rif_index(const struct mlxsw_sp_rif *rif)
+ +static struct mlxsw_sp_fid *
+ +mlxsw_sp_rfid_alloc(u16 fid, struct net_device *l3_dev)
+  {
+ -	return rif->rif_index;
+ +	struct mlxsw_sp_fid *f;
+ +
+ +	f = kzalloc(sizeof(*f), GFP_KERNEL);
+ +	if (!f)
+ +		return NULL;
+ +
+ +	f->leave = mlxsw_sp_vport_rif_sp_leave;
+ +	f->ref_count = 0;
+ +	f->dev = l3_dev;
+ +	f->fid = fid;
+ +
+ +	return f;
+  }
+  
+ -int mlxsw_sp_rif_dev_ifindex(const struct mlxsw_sp_rif *rif)
+ +static struct mlxsw_sp_rif *
+ +mlxsw_sp_rif_alloc(u16 rif, u16 vr_id, struct net_device *l3_dev,
+ +		   struct mlxsw_sp_fid *f)
+  {
+ -	return rif->dev->ifindex;
+ +	struct mlxsw_sp_rif *r;
+ +
+ +	r = kzalloc(sizeof(*r), GFP_KERNEL);
+ +	if (!r)
+ +		return NULL;
+ +
+ +	INIT_LIST_HEAD(&r->nexthop_list);
+ +	INIT_LIST_HEAD(&r->neigh_list);
+ +	ether_addr_copy(r->addr, l3_dev->dev_addr);
+ +	r->mtu = l3_dev->mtu;
+ +	r->vr_id = vr_id;
+ +	r->dev = l3_dev;
+ +	r->rif = rif;
+ +	r->f = f;
+ +
+ +	return r;
+  }
+  
+  static struct mlxsw_sp_rif *
+@@@ -2787,41 -3050,52 +2821,71 @@@ mlxsw_sp_vport_rif_sp_create(struct mlx
+  	if (IS_ERR(vr))
+  		return ERR_CAST(vr);
+  
+++<<<<<<< HEAD
+ +	err = mlxsw_sp_vport_rif_sp_op(mlxsw_sp_vport, vr->id, l3_dev, rif,
+ +				       true);
+++=======
++ 	err = mlxsw_sp_rif_index_alloc(mlxsw_sp, &rif_index);
++ 	if (err)
++ 		goto err_rif_index_alloc;
++ 
++ 	rif = mlxsw_sp_rif_alloc(ops->rif_size, rif_index, vr->id, params->dev);
++ 	if (!rif) {
++ 		err = -ENOMEM;
++ 		goto err_rif_alloc;
++ 	}
++ 	rif->mlxsw_sp = mlxsw_sp;
++ 	rif->ops = ops;
++ 
++ 	fid = ops->fid_get(rif);
++ 	if (IS_ERR(fid)) {
++ 		err = PTR_ERR(fid);
++ 		goto err_fid_get;
++ 	}
++ 	rif->fid = fid;
++ 
++ 	if (ops->setup)
++ 		ops->setup(rif, params);
++ 
++ 	err = ops->configure(rif);
+++>>>>>>> de5ed99e9777 (mlxsw: spectrum_router: Align RIF index allocation with existing code)
+  	if (err)
+ -		goto err_configure;
+ +		goto err_vport_rif_sp_op;
+  
+ -	err = mlxsw_sp_rif_fdb_op(mlxsw_sp, params->dev->dev_addr,
+ -				  mlxsw_sp_fid_index(fid), true);
+ +	fid = mlxsw_sp_rif_sp_to_fid(rif);
+ +	err = mlxsw_sp_rif_fdb_op(mlxsw_sp, l3_dev->dev_addr, fid, true);
+  	if (err)
+  		goto err_rif_fdb_op;
+  
+ -	mlxsw_sp_rif_counters_alloc(rif);
+ -	mlxsw_sp_fid_rif_set(fid, rif);
+ -	mlxsw_sp->router->rifs[rif_index] = rif;
+ +	f = mlxsw_sp_rfid_alloc(fid, l3_dev);
+ +	if (!f) {
+ +		err = -ENOMEM;
+ +		goto err_rfid_alloc;
+ +	}
+ +
+ +	r = mlxsw_sp_rif_alloc(rif, vr->id, l3_dev, f);
+ +	if (!r) {
+ +		err = -ENOMEM;
+ +		goto err_rif_alloc;
+ +	}
+ +
+ +	f->r = r;
+ +	mlxsw_sp->rifs[rif] = r;
+  	vr->rif_count++;
+  
+ -	return rif;
+ +	return r;
+  
+ -err_rif_fdb_op:
+ -	ops->deconfigure(rif);
+ -err_configure:
+ -	mlxsw_sp_fid_put(fid);
+ -err_fid_get:
+ -	kfree(rif);
+  err_rif_alloc:
+++<<<<<<< HEAD
+ +	kfree(f);
+ +err_rfid_alloc:
+ +	mlxsw_sp_rif_fdb_op(mlxsw_sp, l3_dev->dev_addr, fid, false);
+ +err_rif_fdb_op:
+ +	mlxsw_sp_vport_rif_sp_op(mlxsw_sp_vport, vr->id, l3_dev, rif, false);
+ +err_vport_rif_sp_op:
+++=======
++ err_rif_index_alloc:
+++>>>>>>> de5ed99e9777 (mlxsw: spectrum_router: Align RIF index allocation with existing code)
+  	mlxsw_sp_vr_put(vr);
+  	return ERR_PTR(err);
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
