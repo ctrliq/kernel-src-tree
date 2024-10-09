@@ -1,0 +1,178 @@
+block: add QUEUE_FLAG_DAX for devices to advertise their DAX support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Toshi Kani <toshi.kani@hpe.com>
+commit 163d4baaebe39c0e56d9c08597eab7b3ae0bf334
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/163d4baa.failed
+
+Currently, presence of direct_access() in block_device_operations
+indicates support of DAX on its block device.  Because
+block_device_operations is instantiated with 'const', this DAX
+capablity may not be enabled conditinally.
+
+In preparation for supporting DAX to device-mapper devices, add
+QUEUE_FLAG_DAX to request_queue flags to advertise their DAX
+support.  This will allow to set the DAX capability based on how
+mapped device is composed.
+
+	Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+	Acked-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: <linux-s390@vger.kernel.org>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 163d4baaebe39c0e56d9c08597eab7b3ae0bf334)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/brd.c
+#	fs/block_dev.c
+#	include/linux/blkdev.h
+diff --cc drivers/block/brd.c
+index 1f3a382ffd5b,dd96a935fba0..000000000000
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@@ -487,12 -497,22 +487,19 @@@ static struct brd_device *brd_alloc(in
+  	blk_queue_max_hw_sectors(brd->brd_queue, 1024);
+  	blk_queue_bounce_limit(brd->brd_queue, BLK_BOUNCE_ANY);
+  
+ -	/* This is so fdisk will align partitions on 4k, because of
+ -	 * direct_access API needing 4k alignment, returning a PFN
+ -	 * (This is only a problem on very small devices <= 4M,
+ -	 *  otherwise fdisk will align on 1M. Regardless this call
+ -	 *  is harmless)
+ -	 */
+ -	blk_queue_physical_block_size(brd->brd_queue, PAGE_SIZE);
+ -
+  	brd->brd_queue->limits.discard_granularity = PAGE_SIZE;
+ -	blk_queue_max_discard_sectors(brd->brd_queue, UINT_MAX);
+ +	brd->brd_queue->limits.max_discard_sectors = UINT_MAX;
+  	brd->brd_queue->limits.discard_zeroes_data = 1;
+  	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, brd->brd_queue);
+++<<<<<<< HEAD
+ +
+ +	disk = brd->brd_disk = alloc_disk(1 << part_shift);
+++=======
++ #ifdef CONFIG_BLK_DEV_RAM_DAX
++ 	queue_flag_set_unlocked(QUEUE_FLAG_DAX, brd->brd_queue);
++ #endif
++ 	disk = brd->brd_disk = alloc_disk(max_part);
+++>>>>>>> 163d4baaebe3 (block: add QUEUE_FLAG_DAX for devices to advertise their DAX support)
+  	if (!disk)
+  		goto out_free_queue;
+  	disk->major		= RAMDISK_MAJOR;
+diff --cc fs/block_dev.c
+index 7d6ea6f10f58,d012be4ab977..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -534,6 -466,51 +534,54 @@@ int bdev_write_page(struct block_devic
+  EXPORT_SYMBOL_GPL(bdev_write_page);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * bdev_direct_access() - Get the address for directly-accessibly memory
++  * @bdev: The device containing the memory
++  * @dax: control and output parameters for ->direct_access
++  *
++  * If a block device is made up of directly addressable memory, this function
++  * will tell the caller the PFN and the address of the memory.  The address
++  * may be directly dereferenced within the kernel without the need to call
++  * ioremap(), kmap() or similar.  The PFN is suitable for inserting into
++  * page tables.
++  *
++  * Return: negative errno if an error occurs, otherwise the number of bytes
++  * accessible at this address.
++  */
++ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
++ {
++ 	sector_t sector = dax->sector;
++ 	long avail, size = dax->size;
++ 	const struct block_device_operations *ops = bdev->bd_disk->fops;
++ 
++ 	/*
++ 	 * The device driver is allowed to sleep, in order to make the
++ 	 * memory directly accessible.
++ 	 */
++ 	might_sleep();
++ 
++ 	if (size < 0)
++ 		return size;
++ 	if (!blk_queue_dax(bdev_get_queue(bdev)) || !ops->direct_access)
++ 		return -EOPNOTSUPP;
++ 	if ((sector + DIV_ROUND_UP(size, 512)) >
++ 					part_nr_sects_read(bdev->bd_part))
++ 		return -ERANGE;
++ 	sector += get_start_sect(bdev);
++ 	if (sector % (PAGE_SIZE / 512))
++ 		return -EINVAL;
++ 	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn, size);
++ 	if (!avail)
++ 		return -ERANGE;
++ 	if (avail > 0 && avail & ~PAGE_MASK)
++ 		return -ENXIO;
++ 	return min(avail, size);
++ }
++ EXPORT_SYMBOL_GPL(bdev_direct_access);
++ 
++ /**
+++>>>>>>> 163d4baaebe3 (block: add QUEUE_FLAG_DAX for devices to advertise their DAX support)
+   * bdev_dax_supported() - Check if the device supports dax for filesystem
+   * @sb: The superblock of the device
+   * @blocksize: The block size of the device
+diff --cc include/linux/blkdev.h
+index d0c02b856b7c,9d84c98b5c79..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -554,9 -500,12 +554,18 @@@ struct request_queue 
+  #define QUEUE_FLAG_SAME_FORCE  18	/* force complete on same CPU */
+  #define QUEUE_FLAG_DEAD        19	/* queue tear-down finished */
+  #define QUEUE_FLAG_INIT_DONE   20	/* queue is initialized */
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
+ +#define QUEUE_FLAG_NO_SG_MERGE 22	/* don't attempt to merge SG segments*/
+ +#define QUEUE_FLAG_SG_GAPS     23	/* queue doesn't support SG gaps */
+++=======
++ #define QUEUE_FLAG_NO_SG_MERGE 21	/* don't attempt to merge SG segments*/
++ #define QUEUE_FLAG_POLL	       22	/* IO polling enabled if set */
++ #define QUEUE_FLAG_WC	       23	/* Write back caching */
++ #define QUEUE_FLAG_FUA	       24	/* device supports FUA writes */
++ #define QUEUE_FLAG_FLUSH_NQ    25	/* flush not queueuable */
++ #define QUEUE_FLAG_DAX         26	/* device supports DAX */
+++>>>>>>> 163d4baaebe3 (block: add QUEUE_FLAG_DAX for devices to advertise their DAX support)
+  
+  #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_STACKABLE)	|	\
+* Unmerged path drivers/block/brd.c
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index e53dfc8b1585..11116ca2d90a 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -280,6 +280,7 @@ static int pmem_attach_disk(struct device *dev,
+ 	blk_queue_max_hw_sectors(q, UINT_MAX);
+ 	blk_queue_bounce_limit(q, BLK_BOUNCE_ANY);
+ 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
++	queue_flag_set_unlocked(QUEUE_FLAG_DAX, q);
+ 	q->queuedata = pmem;
+ 
+ 	disk = alloc_disk_node(0, nid);
+diff --git a/drivers/s390/block/dcssblk.c b/drivers/s390/block/dcssblk.c
+index 05c383625868..a75a78b9e810 100644
+--- a/drivers/s390/block/dcssblk.c
++++ b/drivers/s390/block/dcssblk.c
+@@ -611,6 +611,7 @@ dcssblk_add_store(struct device *dev, struct device_attribute *attr, const char
+ 	dev_info->gd->driverfs_dev = &dev_info->dev;
+ 	blk_queue_make_request(dev_info->dcssblk_queue, dcssblk_make_request);
+ 	blk_queue_logical_block_size(dev_info->dcssblk_queue, 4096);
++	queue_flag_set_unlocked(QUEUE_FLAG_DAX, dev_info->dcssblk_queue);
+ 
+ 	seg_byte_size = (dev_info->end - dev_info->start + 1);
+ 	set_capacity(dev_info->gd, seg_byte_size >> 9); // size in sectors
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/blkdev.h
