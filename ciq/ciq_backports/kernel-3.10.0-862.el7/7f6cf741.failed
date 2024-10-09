@@ -1,0 +1,173 @@
+iio: hid-sensors: use asynchronous resume
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 7f6cf7414538181f4091b06e905d19a23a451108
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7f6cf741.failed
+
+Some platforms power off sensor hubs during S3 suspend, which will require
+longer time to resume. This hurts system resume time, so resume
+asynchronously.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 7f6cf7414538181f4091b06e905d19a23a451108)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+diff --cc drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+index 5cc9e5190684,5264ed6e03e5..000000000000
+--- a/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
++++ b/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+@@@ -74,10 -87,54 +74,54 @@@ static int hid_sensor_data_rdy_trigger_
+  	}
+  
+  	sensor_hub_get_feature(st->hsdev, st->power_state.report_id,
+ -			       st->power_state.index,
+ -			       sizeof(state_val), &state_val);
+ -	if (state && poll_value)
+ -		msleep_interruptible(poll_value * 2);
+ -
+ +					st->power_state.index,
+ +					&state_val);
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(hid_sensor_power_state);
++ 
++ int hid_sensor_power_state(struct hid_sensor_common *st, bool state)
++ {
++ 
++ #ifdef CONFIG_PM
++ 	int ret;
++ 
++ 	atomic_set(&st->user_requested_state, state);
++ 	if (state)
++ 		ret = pm_runtime_get_sync(&st->pdev->dev);
++ 	else {
++ 		pm_runtime_mark_last_busy(&st->pdev->dev);
++ 		ret = pm_runtime_put_autosuspend(&st->pdev->dev);
++ 	}
++ 	if (ret < 0) {
++ 		if (state)
++ 			pm_runtime_put_noidle(&st->pdev->dev);
++ 		return ret;
++ 	}
++ 
++ 	return 0;
++ #else
++ 	atomic_set(&st->user_requested_state, state);
++ 	return _hid_sensor_power_state(st, state);
++ #endif
++ }
++ 
++ static void hid_sensor_set_power_work(struct work_struct *work)
++ {
++ 	struct hid_sensor_common *attrb = container_of(work,
++ 						       struct hid_sensor_common,
++ 						       work);
++ 	_hid_sensor_power_state(attrb, true);
++ }
++ 
++ static int hid_sensor_data_rdy_trigger_set_state(struct iio_trigger *trig,
++ 						bool state)
++ {
++ 	return hid_sensor_power_state(iio_trigger_get_drvdata(trig), state);
++ }
+++>>>>>>> 7f6cf7414538 (iio: hid-sensors: use asynchronous resume)
+  
+  void hid_sensor_remove_trigger(struct hid_sensor_common *attrb)
+  {
+@@@ -116,8 -174,24 +161,26 @@@ int hid_sensor_setup_trigger(struct iio
+  	attrb->trigger = trig;
+  	indio_dev->trig = iio_trigger_get(trig);
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = pm_runtime_set_active(&indio_dev->dev);
++ 	if (ret)
++ 		goto error_unreg_trigger;
++ 
++ 	iio_device_set_drvdata(indio_dev, attrb);
++ 
++ 	INIT_WORK(&attrb->work, hid_sensor_set_power_work);
++ 
++ 	pm_suspend_ignore_children(&attrb->pdev->dev, true);
++ 	pm_runtime_enable(&attrb->pdev->dev);
++ 	/* Default to 3 seconds, but can be changed from sysfs */
++ 	pm_runtime_set_autosuspend_delay(&attrb->pdev->dev,
++ 					 3000);
++ 	pm_runtime_use_autosuspend(&attrb->pdev->dev);
++ 
+++>>>>>>> 7f6cf7414538 (iio: hid-sensors: use asynchronous resume)
+  	return ret;
+ -error_unreg_trigger:
+ -	iio_trigger_unregister(trig);
+ +
+  error_free_trig:
+  	iio_trigger_free(trig);
+  error_ret:
+@@@ -125,6 -199,42 +188,45 @@@
+  }
+  EXPORT_SYMBOL(hid_sensor_setup_trigger);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM
++ static int hid_sensor_suspend(struct device *dev)
++ {
++ 	struct platform_device *pdev = to_platform_device(dev);
++ 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++ 	struct hid_sensor_common *attrb = iio_device_get_drvdata(indio_dev);
++ 
++ 	return _hid_sensor_power_state(attrb, false);
++ }
++ 
++ static int hid_sensor_resume(struct device *dev)
++ {
++ 	struct platform_device *pdev = to_platform_device(dev);
++ 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++ 	struct hid_sensor_common *attrb = iio_device_get_drvdata(indio_dev);
++ 	schedule_work(&attrb->work);
++ 	return 0;
++ }
++ 
++ static int hid_sensor_runtime_resume(struct device *dev)
++ {
++ 	struct platform_device *pdev = to_platform_device(dev);
++ 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
++ 	struct hid_sensor_common *attrb = iio_device_get_drvdata(indio_dev);
++ 	return _hid_sensor_power_state(attrb, true);
++ }
++ 
++ #endif
++ 
++ const struct dev_pm_ops hid_sensor_pm_ops = {
++ 	SET_SYSTEM_SLEEP_PM_OPS(hid_sensor_suspend, hid_sensor_resume)
++ 	SET_RUNTIME_PM_OPS(hid_sensor_suspend,
++ 			   hid_sensor_runtime_resume, NULL)
++ };
++ EXPORT_SYMBOL(hid_sensor_pm_ops);
++ 
+++>>>>>>> 7f6cf7414538 (iio: hid-sensors: use asynchronous resume)
+  MODULE_AUTHOR("Srinivas Pandruvada <srinivas.pandruvada@intel.com>");
+  MODULE_DESCRIPTION("HID Sensor trigger processing");
+  MODULE_LICENSE("GPL");
+* Unmerged path drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+diff --git a/include/linux/hid-sensor-hub.h b/include/linux/hid-sensor-hub.h
+index 05fe6c21f3e2..7fef2787adab 100644
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@ -173,6 +173,7 @@ struct hid_sensor_common {
+ 	struct hid_sensor_hub_attribute_info report_state;
+ 	struct hid_sensor_hub_attribute_info power_state;
+ 	struct hid_sensor_hub_attribute_info sensitivity;
++	struct work_struct work;
+ };
+ 
+ /*Convert from hid unit expo to regular exponent*/
