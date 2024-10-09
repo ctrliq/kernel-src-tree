@@ -1,0 +1,158 @@
+ext4: don't update checksum of new initialized bitmaps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit 044e6e3d74a3d7103a0c8a9305dfd94d64000660
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/044e6e3d.failed
+
+When reading the inode or block allocation bitmap, if the bitmap needs
+to be initialized, do not update the checksum in the block group
+descriptor.  That's because we're not set up to journal those changes.
+Instead, just set the verified bit on the bitmap block, so that it's
+not necessary to validate the checksum.
+
+When a block or inode allocation actually happens, at that point the
+checksum will be calculated, and update of the bg descriptor block
+will be properly journalled.
+
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: stable@vger.kernel.org
+
+(cherry picked from commit 044e6e3d74a3d7103a0c8a9305dfd94d64000660)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/ialloc.c
+diff --cc fs/ext4/ialloc.c
+index f21709f3c045,3fa93665b4a3..000000000000
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@@ -64,53 -66,50 +64,56 @@@ void ext4_mark_bitmap_end(int start_bit
+  		memset(bitmap + (i >> 3), 0xff, (end_bit - i) >> 3);
+  }
+  
+ -void ext4_end_bitmap_read(struct buffer_head *bh, int uptodate)
+++<<<<<<< HEAD
+ +/* Initializes an uninitialized inode bitmap */
+ +static unsigned ext4_init_inode_bitmap(struct super_block *sb,
+ +				       struct buffer_head *bh,
+ +				       ext4_group_t block_group,
+ +				       struct ext4_group_desc *gdp)
+  {
+ -	if (uptodate) {
+ -		set_buffer_uptodate(bh);
+ -		set_bitmap_uptodate(bh);
+ -	}
+ -	unlock_buffer(bh);
+ -	put_bh(bh);
+ -}
+ -
+ -static int ext4_validate_inode_bitmap(struct super_block *sb,
+ -				      struct ext4_group_desc *desc,
+ -				      ext4_group_t block_group,
+ -				      struct buffer_head *bh)
+ -{
+ -	ext4_fsblk_t	blk;
+ -	struct ext4_group_info *grp = ext4_get_group_info(sb, block_group);
+ +	struct ext4_group_info *grp;
+  	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ +	J_ASSERT_BH(bh, buffer_locked(bh));
+  
+ -	if (buffer_verified(bh))
+ -		return 0;
+ -	if (EXT4_MB_GRP_IBITMAP_CORRUPT(grp))
+ -		return -EFSCORRUPTED;
+ -
+ -	ext4_lock_group(sb, block_group);
+ -	blk = ext4_inode_bitmap(sb, desc);
+ -	if (!ext4_inode_bitmap_csum_verify(sb, block_group, desc, bh,
+ -					   EXT4_INODES_PER_GROUP(sb) / 8)) {
+ -		ext4_unlock_group(sb, block_group);
+ -		ext4_error(sb, "Corrupt inode bitmap - block_group = %u, "
+ -			   "inode_bitmap = %llu", block_group, blk);
+ +	/* If checksum is bad mark all blocks and inodes use to prevent
+ +	 * allocation, essentially implementing a per-group read-only flag. */
+ +	if (!ext4_group_desc_csum_verify(sb, block_group, gdp)) {
+ +		ext4_error(sb, "Checksum bad for group %u", block_group);
+  		grp = ext4_get_group_info(sb, block_group);
+ +		if (!EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
+ +			percpu_counter_sub(&sbi->s_freeclusters_counter,
+ +					   grp->bb_free);
+ +		set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT, &grp->bb_state);
+  		if (!EXT4_MB_GRP_IBITMAP_CORRUPT(grp)) {
+  			int count;
+ -			count = ext4_free_inodes_count(sb, desc);
+ +			count = ext4_free_inodes_count(sb, gdp);
+  			percpu_counter_sub(&sbi->s_freeinodes_counter,
+  					   count);
+  		}
+  		set_bit(EXT4_GROUP_INFO_IBITMAP_CORRUPT_BIT, &grp->bb_state);
+ -		return -EFSBADCRC;
+ +		return 0;
+  	}
+ -	set_buffer_verified(bh);
+ -	ext4_unlock_group(sb, block_group);
+ -	return 0;
+ +
+ +	memset(bh->b_data, 0, (EXT4_INODES_PER_GROUP(sb) + 7) / 8);
+ +	ext4_mark_bitmap_end(EXT4_INODES_PER_GROUP(sb), sb->s_blocksize * 8,
+ +			bh->b_data);
+ +	ext4_inode_bitmap_csum_set(sb, block_group, gdp, bh,
+ +				   EXT4_INODES_PER_GROUP(sb) / 8);
+ +	ext4_group_desc_csum_set(sb, block_group, gdp);
+ +
+ +	return EXT4_INODES_PER_GROUP(sb);
+ +}
+ +
+++=======
+++>>>>>>> 044e6e3d74a3 (ext4: don't update checksum of new initialized bitmaps)
+ +void ext4_end_bitmap_read(struct buffer_head *bh, int uptodate)
+ +{
+ +	if (uptodate) {
+ +		set_buffer_uptodate(bh);
+ +		set_bitmap_uptodate(bh);
+ +	}
+ +	unlock_buffer(bh);
+ +	put_bh(bh);
+  }
+  
+  /*
+@@@ -158,7 -149,9 +161,13 @@@ ext4_read_inode_bitmap(struct super_blo
+  
+  	ext4_lock_group(sb, block_group);
+  	if (desc->bg_flags & cpu_to_le16(EXT4_BG_INODE_UNINIT)) {
+++<<<<<<< HEAD
+ +		ext4_init_inode_bitmap(sb, bh, block_group, desc);
+++=======
++ 		memset(bh->b_data, 0, (EXT4_INODES_PER_GROUP(sb) + 7) / 8);
++ 		ext4_mark_bitmap_end(EXT4_INODES_PER_GROUP(sb),
++ 				     sb->s_blocksize * 8, bh->b_data);
+++>>>>>>> 044e6e3d74a3 (ext4: don't update checksum of new initialized bitmaps)
+  		set_bitmap_uptodate(bh);
+  		set_buffer_uptodate(bh);
+  		set_buffer_verified(bh);
+diff --git a/fs/ext4/balloc.c b/fs/ext4/balloc.c
+index c2b7a4cd09cb..bda66e9e0e82 100644
+--- a/fs/ext4/balloc.c
++++ b/fs/ext4/balloc.c
+@@ -243,8 +243,6 @@ static int ext4_init_block_bitmap(struct super_block *sb,
+ 	 */
+ 	ext4_mark_bitmap_end(num_clusters_in_group(sb, block_group),
+ 			     sb->s_blocksize * 8, bh->b_data);
+-	ext4_block_bitmap_csum_set(sb, block_group, gdp, bh);
+-	ext4_group_desc_csum_set(sb, block_group, gdp);
+ 	return 0;
+ }
+ 
+@@ -458,6 +456,7 @@ ext4_read_block_bitmap_nowait(struct super_block *sb, ext4_group_t block_group)
+ 		err = ext4_init_block_bitmap(sb, bh, block_group, desc);
+ 		set_bitmap_uptodate(bh);
+ 		set_buffer_uptodate(bh);
++		set_buffer_verified(bh);
+ 		ext4_unlock_group(sb, block_group);
+ 		unlock_buffer(bh);
+ 		if (err)
+* Unmerged path fs/ext4/ialloc.c
