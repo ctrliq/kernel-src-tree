@@ -1,0 +1,216 @@
+sched: Add struct rq::cpu_capacity_orig
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vincent Guittot <vincent.guittot@linaro.org>
+commit ca6d75e6908efbc350d536e0b496ebdac36b20d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ca6d75e6.failed
+
+This new field 'cpu_capacity_orig' reflects the original capacity of a CPU
+before being altered by rt tasks and/or IRQ
+
+The cpu_capacity_orig will be used:
+
+  - to detect when the capacity of a CPU has been noticeably reduced so we can
+    trig load balance to look for a CPU with better capacity. As an example, we
+    can detect when a CPU handles a significant amount of irq
+    (with CONFIG_IRQ_TIME_ACCOUNTING) but this CPU is seen as an idle CPU by
+    scheduler whereas CPUs, which are really idle, are available.
+
+  - evaluate the available capacity for CFS tasks
+
+	Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Kamalesh Babulal <kamalesh@linux.vnet.ibm.com>
+	Acked-by: Morten Rasmussen <morten.rasmussen@arm.com>
+	Cc: Morten.Rasmussen@arm.com
+	Cc: dietmar.eggemann@arm.com
+	Cc: efault@gmx.de
+	Cc: linaro-kernel@lists.linaro.org
+	Cc: nicolas.pitre@linaro.org
+	Cc: preeti@linux.vnet.ibm.com
+	Cc: riel@redhat.com
+Link: http://lkml.kernel.org/r/1425052454-25797-7-git-send-email-vincent.guittot@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ca6d75e6908efbc350d536e0b496ebdac36b20d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/fair.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index 108629661cfb,7022e9084624..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -8257,7 -7216,7 +8257,11 @@@ void __init sched_init(void
+  #ifdef CONFIG_SMP
+  		rq->sd = NULL;
+  		rq->rd = NULL;
+++<<<<<<< HEAD
+ +		rq->cpu_power = SCHED_POWER_SCALE;
+++=======
++ 		rq->cpu_capacity = rq->cpu_capacity_orig = SCHED_CAPACITY_SCALE;
+++>>>>>>> ca6d75e6908e (sched: Add struct rq::cpu_capacity_orig)
+  		rq->post_schedule = 0;
+  		rq->active_balance = 0;
+  		rq->next_balance = jiffies;
+diff --cc kernel/sched/fair.c
+index 38afc41c3538,10f84c3c6769..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4062,11 -4358,16 +4062,16 @@@ static unsigned long target_load(int cp
+  	return max(rq->cpu_load[type-1], total);
+  }
+  
+ -static unsigned long capacity_of(int cpu)
+ +static unsigned long power_of(int cpu)
+  {
+ -	return cpu_rq(cpu)->cpu_capacity;
+ +	return cpu_rq(cpu)->cpu_power;
+  }
+  
++ static unsigned long capacity_orig_of(int cpu)
++ {
++ 	return cpu_rq(cpu)->cpu_capacity_orig;
++ }
++ 
+  static unsigned long cpu_avg_load_per_task(int cpu)
+  {
+  	struct rq *rq = cpu_rq(cpu);
+@@@ -5579,59 -6018,47 +5584,64 @@@ static unsigned long scale_rt_power(in
+  	 */
+  	age_stamp = ACCESS_ONCE(rq->age_stamp);
+  	avg = ACCESS_ONCE(rq->rt_avg);
+ -	delta = __rq_clock_broken(rq) - age_stamp;
+  
+ -	if (unlikely(delta < 0))
+ -		delta = 0;
+ +	total = sched_avg_period() + (rq_clock(rq) - age_stamp);
+  
+ -	total = sched_avg_period() + delta;
+ +	if (unlikely(total < avg)) {
+ +		/* Ensures that power won't end up being negative */
+ +		available = 0;
+ +	} else {
+ +		available = total - avg;
+ +	}
+  
+ -	used = div_u64(avg, total);
+ +	if (unlikely((s64)total < SCHED_POWER_SCALE))
+ +		total = SCHED_POWER_SCALE;
+  
+ -	if (likely(used < SCHED_CAPACITY_SCALE))
+ -		return SCHED_CAPACITY_SCALE - used;
+ +	total >>= SCHED_POWER_SHIFT;
+  
+ -	return 1;
+ +	return div_u64(available, total);
+  }
+  
+ -static void update_cpu_capacity(struct sched_domain *sd, int cpu)
+ +static void update_cpu_power(struct sched_domain *sd, int cpu)
+  {
+ -	unsigned long capacity = SCHED_CAPACITY_SCALE;
+ +	unsigned long weight = sd->span_weight;
+ +	unsigned long power = SCHED_POWER_SCALE;
+  	struct sched_group *sdg = sd->groups;
+  
+ -	if (sched_feat(ARCH_CAPACITY))
+ -		capacity *= arch_scale_cpu_capacity(sd, cpu);
+ +	if ((sd->flags & SD_SHARE_CPUPOWER) && weight > 1) {
+ +		if (sched_feat(ARCH_POWER))
+ +			power *= arch_scale_smt_power(sd, cpu);
+ +		else
+ +			power *= default_scale_smt_power(sd, cpu);
+ +
+ +		power >>= SCHED_POWER_SHIFT;
+ +	}
+ +
+ +	sdg->sgp->power_orig = power;
+ +
+ +	if (sched_feat(ARCH_POWER))
+ +		power *= arch_scale_freq_power(sd, cpu);
+  	else
+ -		capacity *= default_scale_cpu_capacity(sd, cpu);
+ +		power *= default_scale_freq_power(sd, cpu);
+  
+ -	capacity >>= SCHED_CAPACITY_SHIFT;
+ +	power >>= SCHED_POWER_SHIFT;
+  
+++<<<<<<< HEAD
+ +	power *= scale_rt_power(cpu);
+ +	power >>= SCHED_POWER_SHIFT;
+++=======
++ 	cpu_rq(cpu)->cpu_capacity_orig = capacity;
++ 	sdg->sgc->capacity_orig = capacity;
+++>>>>>>> ca6d75e6908e (sched: Add struct rq::cpu_capacity_orig)
+  
+ -	capacity *= scale_rt_capacity(cpu);
+ -	capacity >>= SCHED_CAPACITY_SHIFT;
+ +	if (!power)
+ +		power = 1;
+  
+ -	if (!capacity)
+ -		capacity = 1;
+ -
+ -	cpu_rq(cpu)->cpu_capacity = capacity;
+ -	sdg->sgc->capacity = capacity;
+ +	cpu_rq(cpu)->cpu_power = power;
+ +	sdg->sgp->power = power;
+  }
+  
+ -void update_group_capacity(struct sched_domain *sd, int cpu)
+ +void update_group_power(struct sched_domain *sd, int cpu)
+  {
+  	struct sched_domain *child = sd->child;
+  	struct sched_group *group, *sdg = sd->groups;
+@@@ -5664,17 -6091,17 +5674,22 @@@
+  			 * gets here before we've attached the domains to the
+  			 * runqueues.
+  			 *
+ -			 * Use capacity_of(), which is set irrespective of domains
+ -			 * in update_cpu_capacity().
+ +			 * Use power_of(), which is set irrespective of domains
+ +			 * in update_cpu_power().
+  			 *
+ -			 * This avoids capacity/capacity_orig from being 0 and
+ +			 * This avoids power/power_orig from being 0 and
+  			 * causing divide-by-zero issues on boot.
+  			 *
+ -			 * Runtime updates will correct capacity_orig.
+ +			 * Runtime updates will correct power_orig.
+  			 */
+  			if (unlikely(!rq->sd)) {
+++<<<<<<< HEAD
+ +				power_orig += power_of(cpu);
+ +				power += power_of(cpu);
+++=======
++ 				capacity_orig += capacity_orig_of(cpu);
++ 				capacity += capacity_of(cpu);
+++>>>>>>> ca6d75e6908e (sched: Add struct rq::cpu_capacity_orig)
+  				continue;
+  			}
+  
+diff --cc kernel/sched/sched.h
+index 3e0ea93b25ef,be56dfd645b2..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -613,7 -614,8 +613,12 @@@ struct rq 
+  	struct root_domain *rd;
+  	struct sched_domain *sd;
+  
+++<<<<<<< HEAD
+ +	unsigned long cpu_power;
+++=======
++ 	unsigned long cpu_capacity;
++ 	unsigned long cpu_capacity_orig;
+++>>>>>>> ca6d75e6908e (sched: Add struct rq::cpu_capacity_orig)
+  
+  	unsigned char idle_balance;
+  	/* For active balancing */
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/sched.h
