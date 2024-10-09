@@ -1,0 +1,97 @@
+acpi, nfit: fix module unload vs workqueue shutdown race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit fbabd829fe76a72a6444f64361cf8b2a9848639d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fbabd829.failed
+
+The workqueue may still be running when the devres callbacks start
+firing to deallocate an acpi_nfit_desc instance. Stop and flush the
+workqueue before letting any other devres de-allocations proceed.
+
+	Reported-by: Linda Knippers <linda.knippers@hpe.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit fbabd829fe76a72a6444f64361cf8b2a9848639d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit/core.c
+diff --cc drivers/acpi/nfit/core.c
+index 2b569941567e,261eea1d2906..000000000000
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@@ -2878,6 -2865,40 +2862,43 @@@ void acpi_nfit_desc_init(struct acpi_nf
+  }
+  EXPORT_SYMBOL_GPL(acpi_nfit_desc_init);
+  
+++<<<<<<< HEAD
+++=======
++ static void acpi_nfit_put_table(void *table)
++ {
++ 	acpi_put_table(table);
++ }
++ 
++ void acpi_nfit_shutdown(void *data)
++ {
++ 	struct acpi_nfit_desc *acpi_desc = data;
++ 	struct device *bus_dev = to_nvdimm_bus_dev(acpi_desc->nvdimm_bus);
++ 
++ 	/*
++ 	 * Destruct under acpi_desc_lock so that nfit_handle_mce does not
++ 	 * race teardown
++ 	 */
++ 	mutex_lock(&acpi_desc_lock);
++ 	list_del(&acpi_desc->list);
++ 	mutex_unlock(&acpi_desc_lock);
++ 
++ 	mutex_lock(&acpi_desc->init_mutex);
++ 	acpi_desc->cancel = 1;
++ 	mutex_unlock(&acpi_desc->init_mutex);
++ 
++ 	/*
++ 	 * Bounce the nvdimm bus lock to make sure any in-flight
++ 	 * acpi_nfit_ars_rescan() submissions have had a chance to
++ 	 * either submit or see ->cancel set.
++ 	 */
++ 	device_lock(bus_dev);
++ 	device_unlock(bus_dev);
++ 
++ 	flush_workqueue(nfit_wq);
++ }
++ EXPORT_SYMBOL_GPL(acpi_nfit_shutdown);
++ 
+++>>>>>>> fbabd829fe76 (acpi, nfit: fix module unload vs workqueue shutdown race)
+  static int acpi_nfit_add(struct acpi_device *adev)
+  {
+  	struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER, NULL };
+* Unmerged path drivers/acpi/nfit/core.c
+diff --git a/drivers/acpi/nfit/nfit.h b/drivers/acpi/nfit/nfit.h
+index 9d115eaae223..30481564b6c3 100644
+--- a/drivers/acpi/nfit/nfit.h
++++ b/drivers/acpi/nfit/nfit.h
+@@ -239,6 +239,7 @@ static inline struct acpi_nfit_desc *to_acpi_desc(
+ 
+ const u8 *to_nfit_uuid(enum nfit_uuids id);
+ int acpi_nfit_init(struct acpi_nfit_desc *acpi_desc, void *nfit, acpi_size sz);
++void acpi_nfit_shutdown(void *data);
+ void __acpi_nfit_notify(struct device *dev, acpi_handle handle, u32 event);
+ void __acpi_nvdimm_notify(struct device *dev, u32 event);
+ int acpi_nfit_ctl(struct nvdimm_bus_descriptor *nd_desc, struct nvdimm *nvdimm,
+diff --git a/tools/testing/nvdimm/test/nfit.c b/tools/testing/nvdimm/test/nfit.c
+index ff231c85d170..67b6c5dfc913 100644
+--- a/tools/testing/nvdimm/test/nfit.c
++++ b/tools/testing/nvdimm/test/nfit.c
+@@ -1853,6 +1853,10 @@ static int nfit_test_probe(struct platform_device *pdev)
+ 	if (rc)
+ 		return rc;
+ 
++	rc = devm_add_action_or_reset(&pdev->dev, acpi_nfit_shutdown, acpi_desc);
++	if (rc)
++		return rc;
++
+ 	if (nfit_test->setup != nfit_test0_setup)
+ 		return 0;
+ 
