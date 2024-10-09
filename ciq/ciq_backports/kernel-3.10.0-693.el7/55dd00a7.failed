@@ -1,0 +1,216 @@
+KVM: x86: add KVM_HC_CLOCK_PAIRING hypercall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Marcelo Tosatti <mtosatti@redhat.com>
+commit 55dd00a73a518281bc846dc5de1a718349431eb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/55dd00a7.failed
+
+Add a hypercall to retrieve the host realtime clock and the TSC value
+used to calculate that clock read.
+
+Used to implement clock synchronization between host and guest.
+
+	Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 55dd00a73a518281bc846dc5de1a718349431eb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm_para.h
+diff --cc include/uapi/linux/kvm_para.h
+index 2841f86eae0b,fed506aeff62..000000000000
+--- a/include/uapi/linux/kvm_para.h
++++ b/include/uapi/linux/kvm_para.h
+@@@ -20,6 -21,10 +21,13 @@@
+  #define KVM_HC_FEATURES			3
+  #define KVM_HC_PPC_MAP_MAGIC_PAGE	4
+  #define KVM_HC_KICK_CPU			5
+++<<<<<<< HEAD
+++=======
++ #define KVM_HC_MIPS_GET_CLOCK_FREQ	6
++ #define KVM_HC_MIPS_EXIT_VM		7
++ #define KVM_HC_MIPS_CONSOLE_OUTPUT	8
++ #define KVM_HC_CLOCK_PAIRING		9
+++>>>>>>> 55dd00a73a51 (KVM: x86: add KVM_HC_CLOCK_PAIRING hypercall)
+  
+  /*
+   * hypercalls use architecture specific
+diff --git a/Documentation/virtual/kvm/hypercalls.txt b/Documentation/virtual/kvm/hypercalls.txt
+index 26c84616bdfc..6b6dc988094b 100644
+--- a/Documentation/virtual/kvm/hypercalls.txt
++++ b/Documentation/virtual/kvm/hypercalls.txt
+@@ -78,3 +78,38 @@ the vcpu to sleep until occurrence of an appropriate event. Another vcpu of the
+ same guest can wakeup the sleeping vcpu by issuing KVM_HC_KICK_CPU hypercall,
+ specifying APIC ID (a1) of the vcpu to be woken up. An additional argument (a0)
+ is used in the hypercall for future use.
++
++
++6. KVM_HC_CLOCK_PAIRING
++------------------------
++Architecture: x86
++Status: active
++Purpose: Hypercall used to synchronize host and guest clocks.
++Usage:
++
++a0: guest physical address where host copies
++"struct kvm_clock_offset" structure.
++
++a1: clock_type, ATM only KVM_CLOCK_PAIRING_WALLCLOCK (0)
++is supported (corresponding to the host's CLOCK_REALTIME clock).
++
++		struct kvm_clock_pairing {
++			__s64 sec;
++			__s64 nsec;
++			__u64 tsc;
++			__u32 flags;
++			__u32 pad[9];
++		};
++
++       Where:
++               * sec: seconds from clock_type clock.
++               * nsec: nanoseconds from clock_type clock.
++               * tsc: guest TSC value used to calculate sec/nsec pair
++               * flags: flags, unused (0) at the moment.
++
++The hypercall lets a guest compute a precise timestamp across
++host and guest.  The guest can use the returned TSC value to
++compute the CLOCK_REALTIME for its clock, at the same instant.
++
++Returns KVM_EOPNOTSUPP if the host does not use TSC clocksource,
++or if clock type is different than KVM_CLOCK_PAIRING_WALLCLOCK.
+diff --git a/arch/x86/include/uapi/asm/kvm_para.h b/arch/x86/include/uapi/asm/kvm_para.h
+index 94dc8ca434e0..23f966fe7c1a 100644
+--- a/arch/x86/include/uapi/asm/kvm_para.h
++++ b/arch/x86/include/uapi/asm/kvm_para.h
+@@ -48,6 +48,15 @@ struct kvm_steal_time {
+ 	__u32 pad[12];
+ };
+ 
++#define KVM_CLOCK_PAIRING_WALLCLOCK 0
++struct kvm_clock_pairing {
++	__s64 sec;
++	__s64 nsec;
++	__u64 tsc;
++	__u32 flags;
++	__u32 pad[9];
++};
++
+ #define KVM_STEAL_ALIGNMENT_BITS 5
+ #define KVM_STEAL_VALID_BITS ((-1ULL << (KVM_STEAL_ALIGNMENT_BITS + 1)))
+ #define KVM_STEAL_RESERVED_MASK (((1 << KVM_STEAL_ALIGNMENT_BITS) - 1 ) << 1)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 5adefe6db615..e01db77af219 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1112,6 +1112,7 @@ struct pvclock_gtod_data {
+ 
+ 	u64		boot_ns;
+ 	u64		nsec_base;
++	u64		wall_time_sec;
+ };
+ 
+ static struct pvclock_gtod_data pvclock_gtod_data;
+@@ -1138,6 +1139,8 @@ static void update_pvclock_gtod(struct timekeeper *tk)
+ 	vdata->boot_ns                  = boot_ns;
+ 	vdata->nsec_base		= tk->tkr_mono.xtime_nsec;
+ 
++	vdata->wall_time_sec            = tk->xtime_sec;
++
+ 	write_seqcount_end(&vdata->seq);
+ }
+ #endif
+@@ -1601,6 +1604,28 @@ static int do_monotonic_boot(s64 *t, cycle_t *cycle_now)
+ 	return mode;
+ }
+ 
++static int do_realtime(struct timespec *ts, u64 *cycle_now)
++{
++	struct pvclock_gtod_data *gtod = &pvclock_gtod_data;
++	unsigned long seq;
++	int mode;
++	u64 ns;
++
++	do {
++		seq = read_seqcount_begin(&gtod->seq);
++		mode = gtod->clock.vclock_mode;
++		ts->tv_sec = gtod->wall_time_sec;
++		ns = gtod->nsec_base;
++		ns += vgettsc(cycle_now);
++		ns >>= gtod->clock.shift;
++	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
++
++	ts->tv_sec += __iter_div_u64_rem(ns, NSEC_PER_SEC, &ns);
++	ts->tv_nsec = ns;
++
++	return mode;
++}
++
+ /* returns true if host is using tsc clocksource */
+ static bool kvm_get_time_and_clockread(s64 *kernel_ns, cycle_t *cycle_now)
+ {
+@@ -1610,6 +1635,17 @@ static bool kvm_get_time_and_clockread(s64 *kernel_ns, cycle_t *cycle_now)
+ 
+ 	return do_monotonic_boot(kernel_ns, cycle_now) == VCLOCK_TSC;
+ }
++
++/* returns true if host is using tsc clocksource */
++static bool kvm_get_walltime_and_clockread(struct timespec *ts,
++					   u64 *cycle_now)
++{
++	/* checked again under seqlock below */
++	if (pvclock_gtod_data.clock.vclock_mode != VCLOCK_TSC)
++		return false;
++
++	return do_realtime(ts, cycle_now) == VCLOCK_TSC;
++}
+ #endif
+ 
+ /*
+@@ -6102,6 +6138,33 @@ int kvm_emulate_halt(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_emulate_halt);
+ 
++static int kvm_pv_clock_pairing(struct kvm_vcpu *vcpu, gpa_t paddr,
++			        unsigned long clock_type)
++{
++	struct kvm_clock_pairing clock_pairing;
++	struct timespec ts;
++	cycle_t cycle;
++	int ret;
++
++	if (clock_type != KVM_CLOCK_PAIRING_WALLCLOCK)
++		return -KVM_EOPNOTSUPP;
++
++	if (kvm_get_walltime_and_clockread(&ts, &cycle) == false)
++		return -KVM_EOPNOTSUPP;
++
++	clock_pairing.sec = ts.tv_sec;
++	clock_pairing.nsec = ts.tv_nsec;
++	clock_pairing.tsc = kvm_read_l1_tsc(vcpu, cycle);
++	clock_pairing.flags = 0;
++
++	ret = 0;
++	if (kvm_write_guest(vcpu->kvm, paddr, &clock_pairing,
++			    sizeof(struct kvm_clock_pairing)))
++		ret = -KVM_EFAULT;
++
++	return ret;
++}
++
+ /*
+  * kvm_pv_kick_cpu_op:  Kick a vcpu.
+  *
+@@ -6160,6 +6223,9 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 		kvm_pv_kick_cpu_op(vcpu->kvm, a0, a1);
+ 		ret = 0;
+ 		break;
++	case KVM_HC_CLOCK_PAIRING:
++		ret = kvm_pv_clock_pairing(vcpu, a0, a1);
++		break;
+ 	default:
+ 		ret = -KVM_ENOSYS;
+ 		break;
+* Unmerged path include/uapi/linux/kvm_para.h
