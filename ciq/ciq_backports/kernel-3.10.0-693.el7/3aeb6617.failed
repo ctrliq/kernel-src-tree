@@ -1,0 +1,354 @@
+net: replace br_fdb_external_learn_* calls with switchdev notifier events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: replace br_fdb_external_learn_* calls with switchdev notifier events (Ivan Vecera) [1275772 1297841 1331748]
+Rebuild_FUZZ: 95.30%
+commit-author Jiri Pirko <jiri@resnulli.us>
+commit 3aeb66176ffa8fefd7a9f7d37bda1d8adcf469a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3aeb6617.failed
+
+This patch benefits from newly introduced switchdev notifier and uses it
+to propagate fdb learn events from rocker driver to bridge. That avoids
+direct function calls and possible use by other listeners (ovs).
+
+	Suggested-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3aeb66176ffa8fefd7a9f7d37bda1d8adcf469a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/linux/if_bridge.h
+#	include/net/switchdev.h
+#	net/bridge/br.c
+#	net/bridge/br_fdb.c
+diff --cc include/linux/if_bridge.h
+index 38a04e1bb6e7,a57bca2ea97e..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -49,9 -49,28 +49,14 @@@ extern void brioctl_set(int (*ioctl_hoo
+  
+  typedef int br_should_route_hook_t(struct sk_buff *skb);
+  extern br_should_route_hook_t __rcu *br_should_route_hook;
+++<<<<<<< HEAD
+ +#if 0
+ +/* RHEL: not yet fully supported */
+++=======
++ 
++ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
+++>>>>>>> 3aeb66176ffa (net: replace br_fdb_external_learn_* calls with switchdev notifier events)
+  int br_multicast_list_adjacent(struct net_device *dev,
+  			       struct list_head *br_ip_list);
+ -bool br_multicast_has_querier_anywhere(struct net_device *dev, int proto);
+ -bool br_multicast_has_querier_adjacent(struct net_device *dev, int proto);
+ -#else
+ -static inline int br_multicast_list_adjacent(struct net_device *dev,
+ -					     struct list_head *br_ip_list)
+ -{
+ -	return 0;
+ -}
+ -static inline bool br_multicast_has_querier_anywhere(struct net_device *dev,
+ -						     int proto)
+ -{
+ -	return false;
+ -}
+ -static inline bool br_multicast_has_querier_adjacent(struct net_device *dev,
+ -						     int proto)
+ -{
+ -	return false;
+ -}
+  #endif
+ -
+  #endif
+diff --cc net/bridge/br.c
+index 8a1ecd1e7f96,fb57ab6b24f9..000000000000
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@@ -22,10 -23,161 +23,70 @@@
+  
+  #include "br_private.h"
+  
+ -/*
+ - * Handle changes in state of network devices enslaved to a bridge.
+ - *
+ - * Note: don't care about up/down if bridge itself is down, because
+ - *     port state is checked when bridge is brought up.
+ - */
+ -static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr)
+ -{
+ -	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ -	struct net_bridge_port *p;
+ -	struct net_bridge *br;
+ -	bool changed_addr;
+ -	int err;
+ -
+ -	/* register of bridge completed, add sysfs entries */
+ -	if ((dev->priv_flags & IFF_EBRIDGE) && event == NETDEV_REGISTER) {
+ -		br_sysfs_addbr(dev);
+ -		return NOTIFY_DONE;
+ -	}
+ -
+ -	/* not a port of a bridge */
+ -	p = br_port_get_rtnl(dev);
+ -	if (!p)
+ -		return NOTIFY_DONE;
+ -
+ -	br = p->br;
+ -
+ -	switch (event) {
+ -	case NETDEV_CHANGEMTU:
+ -		dev_set_mtu(br->dev, br_min_mtu(br));
+ -		break;
+ -
+ -	case NETDEV_CHANGEADDR:
+ -		spin_lock_bh(&br->lock);
+ -		br_fdb_changeaddr(p, dev->dev_addr);
+ -		changed_addr = br_stp_recalculate_bridge_id(br);
+ -		spin_unlock_bh(&br->lock);
+ -
+ -		if (changed_addr)
+ -			call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
+ -
+ -		break;
+ -
+ -	case NETDEV_CHANGE:
+ -		br_port_carrier_check(p);
+ -		break;
+ -
+ -	case NETDEV_FEAT_CHANGE:
+ -		netdev_update_features(br->dev);
+ -		break;
+ -
+ -	case NETDEV_DOWN:
+ -		spin_lock_bh(&br->lock);
+ -		if (br->dev->flags & IFF_UP)
+ -			br_stp_disable_port(p);
+ -		spin_unlock_bh(&br->lock);
+ -		break;
+ -
+ -	case NETDEV_UP:
+ -		if (netif_running(br->dev) && netif_oper_up(dev)) {
+ -			spin_lock_bh(&br->lock);
+ -			br_stp_enable_port(p);
+ -			spin_unlock_bh(&br->lock);
+ -		}
+ -		break;
+ -
+ -	case NETDEV_UNREGISTER:
+ -		br_del_if(br, dev);
+ -		break;
+ -
+ -	case NETDEV_CHANGENAME:
+ -		err = br_sysfs_renameif(p);
+ -		if (err)
+ -			return notifier_from_errno(err);
+ -		break;
+ -
+ -	case NETDEV_PRE_TYPE_CHANGE:
+ -		/* Forbid underlaying device to change its type. */
+ -		return NOTIFY_BAD;
+ -
+ -	case NETDEV_RESEND_IGMP:
+ -		/* Propagate to master device */
+ -		call_netdevice_notifiers(event, br->dev);
+ -		break;
+ -	}
+ -
+ -	/* Events that may cause spanning tree to refresh */
+ -	if (event == NETDEV_CHANGEADDR || event == NETDEV_UP ||
+ -	    event == NETDEV_CHANGE || event == NETDEV_DOWN)
+ -		br_ifinfo_notify(RTM_NEWLINK, p);
+ -
+ -	return NOTIFY_DONE;
+ -}
+ -
+ -static struct notifier_block br_device_notifier = {
+ -	.notifier_call = br_device_event
+ +static const struct stp_proto br_stp_proto = {
+ +	.rcv	= br_stp_rcv,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int br_netdev_switch_event(struct notifier_block *unused,
++ 				  unsigned long event, void *ptr)
++ {
++ 	struct net_device *dev = netdev_switch_notifier_info_to_dev(ptr);
++ 	struct net_bridge_port *p;
++ 	struct net_bridge *br;
++ 	struct netdev_switch_notifier_fdb_info *fdb_info;
++ 	int err = NOTIFY_DONE;
++ 
++ 	rtnl_lock();
++ 	p = br_port_get_rtnl(dev);
++ 	if (!p)
++ 		goto out;
++ 
++ 	br = p->br;
++ 
++ 	switch (event) {
++ 	case NETDEV_SWITCH_FDB_ADD:
++ 		fdb_info = ptr;
++ 		err = br_fdb_external_learn_add(br, p, fdb_info->addr,
++ 						fdb_info->vid);
++ 		if (err)
++ 			err = notifier_from_errno(err);
++ 		break;
++ 	case NETDEV_SWITCH_FDB_DEL:
++ 		fdb_info = ptr;
++ 		err = br_fdb_external_learn_del(br, p, fdb_info->addr,
++ 						fdb_info->vid);
++ 		if (err)
++ 			err = notifier_from_errno(err);
++ 		break;
++ 	}
++ 
++ out:
++ 	rtnl_unlock();
++ 	return err;
++ }
++ 
++ static struct notifier_block br_netdev_switch_notifier = {
++ 	.notifier_call = br_netdev_switch_event,
++ };
++ 
++ static void __net_exit br_net_exit(struct net *net)
++ {
++ 	struct net_device *dev;
++ 	LIST_HEAD(list);
++ 
++ 	rtnl_lock();
++ 	for_each_netdev(net, dev)
++ 		if (dev->priv_flags & IFF_EBRIDGE)
++ 			br_dev_delete(dev, &list);
++ 
++ 	unregister_netdevice_many(&list);
++ 	rtnl_unlock();
++ 
++ }
++ 
+++>>>>>>> 3aeb66176ffa (net: replace br_fdb_external_learn_* calls with switchdev notifier events)
+  static struct pernet_operations br_net_ops = {
+  	.exit	= br_net_exit,
+  };
+@@@ -72,8 -232,10 +137,10 @@@ static int __init br_init(void
+  
+  	return 0;
+  
++ err_out5:
++ 	unregister_netdev_switch_notifier(&br_netdev_switch_notifier);
+  err_out4:
+ -	unregister_netdevice_notifier(&br_device_notifier);
+ +	unregister_netdevice_notifier_rh(&br_device_notifier);
+  err_out3:
+  	br_nf_core_fini();
+  err_out2:
+@@@ -89,7 -251,8 +156,12 @@@ static void __exit br_deinit(void
+  {
+  	stp_proto_unregister(&br_stp_proto);
+  	br_netlink_fini();
+++<<<<<<< HEAD
+ +	unregister_netdevice_notifier_rh(&br_device_notifier);
+++=======
++ 	unregister_netdev_switch_notifier(&br_netdev_switch_notifier);
++ 	unregister_netdevice_notifier(&br_device_notifier);
+++>>>>>>> 3aeb66176ffa (net: replace br_fdb_external_learn_* calls with switchdev notifier events)
+  	brioctl_set(NULL);
+  	unregister_pernet_subsys(&br_net_ops);
+  
+diff --cc net/bridge/br_fdb.c
+index b30545c7ced8,03667e65cc29..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -983,3 -989,61 +983,64 @@@ void br_fdb_unsync_static(struct net_br
+  		}
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
++ 			      const unsigned char *addr, u16 vid)
++ {
++ 	struct hlist_head *head;
++ 	struct net_bridge_fdb_entry *fdb;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 	spin_lock_bh(&br->hash_lock);
++ 
++ 	head = &br->hash[br_mac_hash(addr, vid)];
++ 	fdb = fdb_find(head, addr, vid);
++ 	if (!fdb) {
++ 		fdb = fdb_create(head, p, addr, vid);
++ 		if (!fdb) {
++ 			err = -ENOMEM;
++ 			goto err_unlock;
++ 		}
++ 		fdb->added_by_external_learn = 1;
++ 		fdb_notify(br, fdb, RTM_NEWNEIGH);
++ 	} else if (fdb->added_by_external_learn) {
++ 		/* Refresh entry */
++ 		fdb->updated = fdb->used = jiffies;
++ 	} else if (!fdb->added_by_user) {
++ 		/* Take over SW learned entry */
++ 		fdb->added_by_external_learn = 1;
++ 		fdb->updated = jiffies;
++ 		fdb_notify(br, fdb, RTM_NEWNEIGH);
++ 	}
++ 
++ err_unlock:
++ 	spin_unlock_bh(&br->hash_lock);
++ 
++ 	return err;
++ }
++ 
++ int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
++ 			      const unsigned char *addr, u16 vid)
++ {
++ 	struct hlist_head *head;
++ 	struct net_bridge_fdb_entry *fdb;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 	spin_lock_bh(&br->hash_lock);
++ 
++ 	head = &br->hash[br_mac_hash(addr, vid)];
++ 	fdb = fdb_find(head, addr, vid);
++ 	if (fdb && fdb->added_by_external_learn)
++ 		fdb_delete(br, fdb);
++ 	else
++ 		err = -ENOENT;
++ 
++ 	spin_unlock_bh(&br->hash_lock);
++ 
++ 	return err;
++ }
+++>>>>>>> 3aeb66176ffa (net: replace br_fdb_external_learn_* calls with switchdev notifier events)
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/linux/if_bridge.h
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br.c
+* Unmerged path net/bridge/br_fdb.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 40e90db9226f..ca7ce3bce752 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -404,6 +404,10 @@ int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ 		struct net_device *dev, struct net_device *fdev, int idx);
+ int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p);
+ void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
++int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
++			      const unsigned char *addr, u16 vid);
++int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
++			      const unsigned char *addr, u16 vid);
+ 
+ /* br_forward.c */
+ void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
