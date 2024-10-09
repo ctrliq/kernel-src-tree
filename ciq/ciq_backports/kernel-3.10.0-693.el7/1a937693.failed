@@ -1,0 +1,156 @@
+virtio: new feature to detect IOMMU device quirk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Michael S. Tsirkin <mst@redhat.com>
+commit 1a937693993ff10d7e80cca6ddd55f3000aa6376
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1a937693.failed
+
+The interaction between virtio and IOMMUs is messy.
+
+On most systems with virtio, physical addresses match bus addresses,
+and it doesn't particularly matter which one we use to program
+the device.
+
+On some systems, including Xen and any system with a physical device
+that speaks virtio behind a physical IOMMU, we must program the IOMMU
+for virtio DMA to work at all.
+
+On other systems, including SPARC and PPC64, virtio-pci devices are
+enumerated as though they are behind an IOMMU, but the virtio host
+ignores the IOMMU, so we must either pretend that the IOMMU isn't
+there or somehow map everything as the identity.
+
+Add a feature bit to detect that quirk: VIRTIO_F_IOMMU_PLATFORM.
+
+Any device with this feature bit set to 0 needs a quirk and has to be
+passed physical addresses (as opposed to bus addresses) even though
+the device is behind an IOMMU.
+
+Note: it has to be a per-device quirk because for example, there could
+be a mix of passed-through and virtual virtio devices. As another
+example, some devices could be implemented by an out of process
+hypervisor backend (in case of qemu vhost, or vhost-user) and so support
+for an IOMMU needs to be coded up separately.
+
+It would be cleanest to handle this in IOMMU core code, but that needs
+per-device DMA ops. While we are waiting for that to be implemented, use
+a work-around in virtio core.
+
+Note: a "noiommu" feature is a quirk - add a wrapper to make
+that clear.
+
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 1a937693993ff10d7e80cca6ddd55f3000aa6376)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio_ring.c
+#	include/linux/virtio_config.h
+diff --cc drivers/virtio/virtio_ring.c
+index 6a6bfb78a2f2,114a0c88afb8..000000000000
+--- a/drivers/virtio/virtio_ring.c
++++ b/drivers/virtio/virtio_ring.c
+@@@ -130,6 -144,21 +137,24 @@@ struct vring_virtqueue 
+  
+  static bool vring_use_dma_api(struct virtio_device *vdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (!virtio_has_iommu_quirk(vdev))
++ 		return true;
++ 
++ 	/* Otherwise, we are left to guess. */
++ 	/*
++ 	 * In theory, it's possible to have a buggy QEMU-supposed
++ 	 * emulated Q35 IOMMU and Xen enabled at the same time.  On
++ 	 * such a configuration, virtio has never worked and will
++ 	 * not work without an even larger kludge.  Instead, enable
++ 	 * the DMA API if we're a Xen guest, which at least allows
++ 	 * all of the sensible Xen configurations to work correctly.
++ 	 */
++ 	if (xen_domain())
++ 		return true;
++ 
+++>>>>>>> 1a937693993f (virtio: new feature to detect IOMMU device quirk)
+  	return false;
+  }
+  
+diff --cc include/linux/virtio_config.h
+index d80dcf8951ad,26c155bb639b..000000000000
+--- a/include/linux/virtio_config.h
++++ b/include/linux/virtio_config.h
+@@@ -150,30 -150,16 +150,43 @@@ static inline bool virtio_has_feature(c
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * virtio_config_val - look for a feature and get a virtio config entry.
+ + * @vdev: the virtio device
+ + * @fbit: the feature bit
+ + * @offset: the type to search for.
+ + * @v: a pointer to the value to fill in.
+ + *
+ + * The return value is -ENOENT if the feature doesn't exist.  Otherwise
+ + * the config value is copied into whatever is pointed to by v. */
+ +#define virtio_config_val(vdev, fbit, offset, v) \
+ +	virtio_config_buf((vdev), (fbit), (offset), (v), sizeof(*v))
+ +
+ +#define virtio_config_val_len(vdev, fbit, offset, v, len) \
+ +	virtio_config_buf((vdev), (fbit), (offset), (v), (len))
+ +
+ +static inline int virtio_config_buf(struct virtio_device *vdev,
+ +				    unsigned int fbit,
+ +				    unsigned int offset,
+ +				    void *buf, unsigned len)
+ +{
+ +	if (!virtio_has_feature(vdev, fbit))
+ +		return -ENOENT;
+ +
+ +	vdev->config->get(vdev, offset, buf, len);
+ +	return 0;
+++=======
++  * virtio_has_iommu_quirk - determine whether this device has the iommu quirk
++  * @vdev: the device
++  */
++ static inline bool virtio_has_iommu_quirk(const struct virtio_device *vdev)
++ {
++ 	/*
++ 	 * Note the reverse polarity of the quirk feature (compared to most
++ 	 * other features), this is for compatibility with legacy systems.
++ 	 */
++ 	return !virtio_has_feature(vdev, VIRTIO_F_IOMMU_PLATFORM);
+++>>>>>>> 1a937693993f (virtio: new feature to detect IOMMU device quirk)
+  }
+  
+  static inline
+* Unmerged path drivers/virtio/virtio_ring.c
+* Unmerged path include/linux/virtio_config.h
+diff --git a/include/uapi/linux/virtio_config.h b/include/uapi/linux/virtio_config.h
+index c18264df9504..cf49c7e2cfdb 100644
+--- a/include/uapi/linux/virtio_config.h
++++ b/include/uapi/linux/virtio_config.h
+@@ -47,7 +47,7 @@
+  * transport being used (eg. virtio_ring), the rest are per-device feature
+  * bits. */
+ #define VIRTIO_TRANSPORT_F_START	28
+-#define VIRTIO_TRANSPORT_F_END		33
++#define VIRTIO_TRANSPORT_F_END		34
+ 
+ #ifndef VIRTIO_CONFIG_NO_LEGACY
+ /* Do we get callbacks when the ring is completely used, even if we've
+@@ -61,4 +61,12 @@
+ /* v1.0 compliant. */
+ #define VIRTIO_F_VERSION_1		32
+ 
++/*
++ * If clear - device has the IOMMU bypass quirk feature.
++ * If set - use platform tools to detect the IOMMU.
++ *
++ * Note the reverse polarity (compared to most other features),
++ * this is for compatibility with legacy systems.
++ */
++#define VIRTIO_F_IOMMU_PLATFORM		33
+ #endif /* _UAPI_LINUX_VIRTIO_CONFIG_H */
