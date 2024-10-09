@@ -1344,7 +1344,7 @@ static int parse_scriptname(const struct option *opt __maybe_unused,
 static int parse_output_fields(const struct option *opt __maybe_unused,
 			    const char *arg, int unset __maybe_unused)
 {
-	char *tok;
+	char *tok, *strtok_saveptr = NULL;
 	int i, imax = ARRAY_SIZE(all_output_options);
 	int j;
 	int rc = 0;
@@ -1405,7 +1405,7 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 		}
 	}
 
-	for (tok = strtok(tok, ","); tok; tok = strtok(NULL, ",")) {
+	for (tok = strtok_r(tok, ",", &strtok_saveptr); tok; tok = strtok_r(NULL, ",", &strtok_saveptr)) {
 		for (i = 0; i < imax; ++i) {
 			if (strcmp(tok, all_output_options[i].str) == 0)
 				break;
