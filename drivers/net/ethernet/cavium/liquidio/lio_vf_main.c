@@ -524,7 +524,7 @@ static void update_link_status(struct net_device *netdev,
 
 		if (lio->linfo.link.s.link_up) {
 			netif_carrier_on(netdev);
-			txqs_wake(netdev);
+			wake_txqs(netdev);
 		} else {
 			netif_carrier_off(netdev);
 			txqs_stop(netdev);
@@ -1882,7 +1882,7 @@ static void liquidio_tx_timeout(struct net_device *netdev)
 		   "Transmit timeout tx_dropped:%ld, waking up queues now!!\n",
 		   netdev->stats.tx_dropped);
 	netif_trans_update(netdev);
-	txqs_wake(netdev);
+	wake_txqs(netdev);
 }
 
 static int
