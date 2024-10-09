@@ -1,0 +1,301 @@
+mm/hugetlb: fix huge page reservation leak in private mapping error paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb: fix huge page reservation leak in private mapping error paths (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.90%
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 96b96a96ddee4ba08ce4aeb8a558a3271fd4a7a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/96b96a96.failed
+
+Error paths in hugetlb_cow() and hugetlb_no_page() may free a newly
+allocated huge page.
+
+If a reservation was associated with the huge page, alloc_huge_page()
+consumed the reservation while allocating.  When the newly allocated
+page is freed in free_huge_page(), it will increment the global
+reservation count.  However, the reservation entry in the reserve map
+will remain.
+
+This is not an issue for shared mappings as the entry in the reserve map
+indicates a reservation exists.  But, an entry in a private mapping
+reserve map indicates the reservation was consumed and no longer exists.
+This results in an inconsistency between the reserve map and the global
+reservation count.  This 'leaks' a reserved huge page.
+
+Create a new routine restore_reserve_on_error() to restore the reserve
+entry in these specific error paths.  This routine makes use of a new
+function vma_add_reservation() which will add a reserve entry for a
+specific address/page.
+
+In general, these error paths were rarely (if ever) taken on most
+architectures.  However, powerpc contained arch specific code that that
+resulted in an extra fault and execution of these error paths on all
+private mappings.
+
+Fixes: 67961f9db8c4 ("mm/hugetlb: fix huge page reserve accounting for private mappings)
+Link: http://lkml.kernel.org/r/1476933077-23091-2-git-send-email-mike.kravetz@oracle.com
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reported-by: Jan Stancek <jstancek@redhat.com>
+	Tested-by: Jan Stancek <jstancek@redhat.com>
+	Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Kirill A . Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 96b96a96ddee4ba08ce4aeb8a558a3271fd4a7a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 2c12fc3891a9,418bf01a50ed..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1520,63 -1807,166 +1520,206 @@@ static void return_unused_surplus_pages
+  	}
+  }
+  
+ -
+  /*
+++<<<<<<< HEAD
+ + * Determine if the huge page at addr within the vma has an associated
+ + * reservation.  Where it does not we will need to logically increase
+ + * reservation and actually increase subpool usage before an allocation
+ + * can occur.  Where any new reservation would be required the
+ + * reservation change is prepared, but not committed.  Once the page
+ + * has been allocated from the subpool and instantiated the change should
+ + * be committed via vma_commit_reservation.  No action is required on
+ + * failure.
+ + */
+++=======
++  * vma_needs_reservation, vma_commit_reservation and vma_end_reservation
++  * are used by the huge page allocation routines to manage reservations.
++  *
++  * vma_needs_reservation is called to determine if the huge page at addr
++  * within the vma has an associated reservation.  If a reservation is
++  * needed, the value 1 is returned.  The caller is then responsible for
++  * managing the global reservation and subpool usage counts.  After
++  * the huge page has been allocated, vma_commit_reservation is called
++  * to add the page to the reservation map.  If the page allocation fails,
++  * the reservation must be ended instead of committed.  vma_end_reservation
++  * is called in such cases.
++  *
++  * In the normal case, vma_commit_reservation returns the same value
++  * as the preceding vma_needs_reservation call.  The only time this
++  * is not the case is if a reserve map was changed between calls.  It
++  * is the responsibility of the caller to notice the difference and
++  * take appropriate action.
++  *
++  * vma_add_reservation is used in error paths where a reservation must
++  * be restored when a newly allocated huge page must be freed.  It is
++  * to be called after calling vma_needs_reservation to determine if a
++  * reservation exists.
++  */
++ enum vma_resv_mode {
++ 	VMA_NEEDS_RESV,
++ 	VMA_COMMIT_RESV,
++ 	VMA_END_RESV,
++ 	VMA_ADD_RESV,
++ };
++ static long __vma_reservation_common(struct hstate *h,
++ 				struct vm_area_struct *vma, unsigned long addr,
++ 				enum vma_resv_mode mode)
++ {
++ 	struct resv_map *resv;
++ 	pgoff_t idx;
++ 	long ret;
++ 
++ 	resv = vma_resv_map(vma);
++ 	if (!resv)
++ 		return 1;
++ 
++ 	idx = vma_hugecache_offset(h, vma, addr);
++ 	switch (mode) {
++ 	case VMA_NEEDS_RESV:
++ 		ret = region_chg(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_COMMIT_RESV:
++ 		ret = region_add(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_END_RESV:
++ 		region_abort(resv, idx, idx + 1);
++ 		ret = 0;
++ 		break;
++ 	case VMA_ADD_RESV:
++ 		if (vma->vm_flags & VM_MAYSHARE)
++ 			ret = region_add(resv, idx, idx + 1);
++ 		else {
++ 			region_abort(resv, idx, idx + 1);
++ 			ret = region_del(resv, idx, idx + 1);
++ 		}
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	if (vma->vm_flags & VM_MAYSHARE)
++ 		return ret;
++ 	else if (is_vma_resv_set(vma, HPAGE_RESV_OWNER) && ret >= 0) {
++ 		/*
++ 		 * In most cases, reserves always exist for private mappings.
++ 		 * However, a file associated with mapping could have been
++ 		 * hole punched or truncated after reserves were consumed.
++ 		 * As subsequent fault on such a range will not use reserves.
++ 		 * Subtle - The reserve map for private mappings has the
++ 		 * opposite meaning than that of shared mappings.  If NO
++ 		 * entry is in the reserve map, it means a reservation exists.
++ 		 * If an entry exists in the reserve map, it means the
++ 		 * reservation has already been consumed.  As a result, the
++ 		 * return value of this routine is the opposite of the
++ 		 * value returned from reserve map manipulation routines above.
++ 		 */
++ 		if (ret)
++ 			return 0;
++ 		else
++ 			return 1;
++ 	}
++ 	else
++ 		return ret < 0 ? ret : 0;
++ }
++ 
+++>>>>>>> 96b96a96ddee (mm/hugetlb: fix huge page reservation leak in private mapping error paths)
+  static long vma_needs_reservation(struct hstate *h,
+  			struct vm_area_struct *vma, unsigned long addr)
+  {
+ -	return __vma_reservation_common(h, vma, addr, VMA_NEEDS_RESV);
+ -}
+ +	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	struct inode *inode = mapping->host;
+  
+ -static long vma_commit_reservation(struct hstate *h,
+ -			struct vm_area_struct *vma, unsigned long addr)
+ -{
+ -	return __vma_reservation_common(h, vma, addr, VMA_COMMIT_RESV);
+ -}
+ +	if (vma->vm_flags & VM_MAYSHARE) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *resv = inode->i_mapping->private_data;
+  
+ -static void vma_end_reservation(struct hstate *h,
+ +		return region_chg(resv, idx, idx + 1);
+ +
+ +	} else if (!is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
+ +		return 1;
+ +
+ +	} else  {
+ +		long err;
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *reservations = vma_resv_map(vma);
+ +
+ +		err = region_chg(reservations, idx, idx + 1);
+ +		if (err < 0)
+ +			return err;
+ +		return 0;
+ +	}
+ +}
+ +static void vma_commit_reservation(struct hstate *h,
+  			struct vm_area_struct *vma, unsigned long addr)
+  {
+ -	(void)__vma_reservation_common(h, vma, addr, VMA_END_RESV);
+ +	struct address_space *mapping = vma->vm_file->f_mapping;
+ +	struct inode *inode = mapping->host;
+ +
+ +	if (vma->vm_flags & VM_MAYSHARE) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *resv = inode->i_mapping->private_data;
+ +
+ +		region_add(resv, idx, idx + 1);
+ +
+ +	} else if (is_vma_resv_set(vma, HPAGE_RESV_OWNER)) {
+ +		pgoff_t idx = vma_hugecache_offset(h, vma, addr);
+ +		struct resv_map *reservations = vma_resv_map(vma);
+ +
+ +		/* Mark this page used in the map. */
+ +		region_add(reservations, idx, idx + 1);
+ +	}
+  }
+  
++ static long vma_add_reservation(struct hstate *h,
++ 			struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	return __vma_reservation_common(h, vma, addr, VMA_ADD_RESV);
++ }
++ 
++ /*
++  * This routine is called to restore a reservation on error paths.  In the
++  * specific error paths, a huge page was allocated (via alloc_huge_page)
++  * and is about to be freed.  If a reservation for the page existed,
++  * alloc_huge_page would have consumed the reservation and set PagePrivate
++  * in the newly allocated page.  When the page is freed via free_huge_page,
++  * the global reservation count will be incremented if PagePrivate is set.
++  * However, free_huge_page can not adjust the reserve map.  Adjust the
++  * reserve map here to be consistent with global reserve count adjustments
++  * to be made by free_huge_page.
++  */
++ static void restore_reserve_on_error(struct hstate *h,
++ 			struct vm_area_struct *vma, unsigned long address,
++ 			struct page *page)
++ {
++ 	if (unlikely(PagePrivate(page))) {
++ 		long rc = vma_needs_reservation(h, vma, address);
++ 
++ 		if (unlikely(rc < 0)) {
++ 			/*
++ 			 * Rare out of memory condition in reserve map
++ 			 * manipulation.  Clear PagePrivate so that
++ 			 * global reserve count will not be incremented
++ 			 * by free_huge_page.  This will make it appear
++ 			 * as though the reservation for this page was
++ 			 * consumed.  This may prevent the task from
++ 			 * faulting in the page at a later time.  This
++ 			 * is better than inconsistent global huge page
++ 			 * accounting of reserve counts.
++ 			 */
++ 			ClearPagePrivate(page);
++ 		} else if (rc) {
++ 			rc = vma_add_reservation(h, vma, address);
++ 			if (unlikely(rc < 0))
++ 				/*
++ 				 * See above comment about rare out of
++ 				 * memory condition.
++ 				 */
++ 				ClearPagePrivate(page);
++ 		} else
++ 			vma_end_reservation(h, vma, address);
++ 	}
++ }
++ 
+  struct page *alloc_huge_page(struct vm_area_struct *vma,
+  				    unsigned long addr, int avoid_reserve)
+  {
+@@@ -3187,12 -3561,14 +3330,20 @@@ retry_avoidcopy
+  	}
+  	spin_unlock(ptl);
+  	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+++<<<<<<< HEAD
+ +	page_cache_release(new_page);
+ +	page_cache_release(old_page);
+++=======
++ out_release_all:
++ 	restore_reserve_on_error(h, vma, address, new_page);
++ 	put_page(new_page);
++ out_release_old:
++ 	put_page(old_page);
+++>>>>>>> 96b96a96ddee (mm/hugetlb: fix huge page reservation leak in private mapping error paths)
+  
+ -	spin_lock(ptl); /* Caller expects lock to be held */
+ -	return ret;
+ +	/* Caller expects lock to be held */
+ +	spin_lock(ptl);
+ +	return 0;
+  }
+  
+  /* Return the pagecache page at a given address within a VMA */
+* Unmerged path mm/hugetlb.c
