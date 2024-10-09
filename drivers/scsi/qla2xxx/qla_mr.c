@@ -2211,7 +2211,7 @@ qlafx00_ioctl_iosb_entry(scsi_qla_host_t *vha, struct req_que *req,
 	srb_t *sp;
 	struct fc_bsg_job *bsg_job;
 	struct srb_iocb *iocb_job;
-	int res;
+	int res = 0;
 	struct qla_mt_iocb_rsp_fx00 fstatus;
 	uint8_t	*fw_sts_ptr;
 
