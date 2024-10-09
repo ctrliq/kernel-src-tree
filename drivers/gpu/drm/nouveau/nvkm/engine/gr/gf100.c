@@ -1978,6 +1978,9 @@ gf100_gr_init(struct gf100_gr *gr)
 	nvkm_mask(device, 0x419cc0, 0x00000008, 0x00000008);
 	nvkm_mask(device, 0x419eb4, 0x00001000, 0x00001000);
 
+	if (gr->func->init_ppc_exceptions)
+		gr->func->init_ppc_exceptions(gr);
+
 	for (gpc = 0; gpc < gr->gpc_nr; gpc++) {
 		nvkm_wr32(device, GPC_UNIT(gpc, 0x0420), 0xc0000000);
 		nvkm_wr32(device, GPC_UNIT(gpc, 0x0900), 0xc0000000);
