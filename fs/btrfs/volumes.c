@@ -2925,7 +2925,7 @@ static int btrfs_relocate_chunk(struct btrfs_root *root, u64 chunk_offset)
 	 * chunk tree entries
 	 */
 	ret = btrfs_remove_chunk(trans, root, chunk_offset);
-	btrfs_end_transaction(trans, root);
+	btrfs_end_transaction(trans, extent_root);
 	return ret;
 }
 
