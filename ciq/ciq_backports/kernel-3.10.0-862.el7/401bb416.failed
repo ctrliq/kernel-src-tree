@@ -1,0 +1,135 @@
+scsi: lpfc: fix pci hot plug crash in list_add call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: fix pci hot plug crash in list_add call (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 93.75%
+commit-author Dick Kennedy <dick.kennedy@broadcom.com>
+commit 401bb4169da655f3e5d28d0b208182e1ab60bf2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/401bb416.failed
+
+During pci hot plug, the kernel crashes in a list_add_call
+
+The lookup by tag function will return null if the IOCB is out of range
+or does not have the on txcmplq flag set.
+
+Fix: Check for null return from lookup by tag.
+
+	Cc: <stable@vger.kernel.org> # 4.12+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 401bb4169da655f3e5d28d0b208182e1ab60bf2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index afe166ddbf5a,95937ee53b78..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -15676,6 -17050,97 +15678,100 @@@ lpfc_sli4_send_seq_to_ulp(struct lpfc_v
+  	lpfc_sli_release_iocbq(phba, iocbq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ lpfc_sli4_mds_loopback_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
++ 			    struct lpfc_iocbq *rspiocb)
++ {
++ 	struct lpfc_dmabuf *pcmd = cmdiocb->context2;
++ 
++ 	if (pcmd && pcmd->virt)
++ 		dma_pool_free(phba->lpfc_drb_pool, pcmd->virt, pcmd->phys);
++ 	kfree(pcmd);
++ 	lpfc_sli_release_iocbq(phba, cmdiocb);
++ }
++ 
++ static void
++ lpfc_sli4_handle_mds_loopback(struct lpfc_vport *vport,
++ 			      struct hbq_dmabuf *dmabuf)
++ {
++ 	struct fc_frame_header *fc_hdr;
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_iocbq *iocbq = NULL;
++ 	union  lpfc_wqe *wqe;
++ 	struct lpfc_dmabuf *pcmd = NULL;
++ 	uint32_t frame_len;
++ 	int rc;
++ 
++ 	fc_hdr = (struct fc_frame_header *)dmabuf->hbuf.virt;
++ 	frame_len = bf_get(lpfc_rcqe_length, &dmabuf->cq_event.cqe.rcqe_cmpl);
++ 
++ 	/* Send the received frame back */
++ 	iocbq = lpfc_sli_get_iocbq(phba);
++ 	if (!iocbq)
++ 		goto exit;
++ 
++ 	/* Allocate buffer for command payload */
++ 	pcmd = kmalloc(sizeof(struct lpfc_dmabuf), GFP_KERNEL);
++ 	if (pcmd)
++ 		pcmd->virt = dma_pool_alloc(phba->lpfc_drb_pool, GFP_KERNEL,
++ 					    &pcmd->phys);
++ 	if (!pcmd || !pcmd->virt)
++ 		goto exit;
++ 
++ 	INIT_LIST_HEAD(&pcmd->list);
++ 
++ 	/* copyin the payload */
++ 	memcpy(pcmd->virt, dmabuf->dbuf.virt, frame_len);
++ 
++ 	/* fill in BDE's for command */
++ 	iocbq->iocb.un.xseq64.bdl.addrHigh = putPaddrHigh(pcmd->phys);
++ 	iocbq->iocb.un.xseq64.bdl.addrLow = putPaddrLow(pcmd->phys);
++ 	iocbq->iocb.un.xseq64.bdl.bdeFlags = BUFF_TYPE_BDE_64;
++ 	iocbq->iocb.un.xseq64.bdl.bdeSize = frame_len;
++ 
++ 	iocbq->context2 = pcmd;
++ 	iocbq->vport = vport;
++ 	iocbq->iocb_flag &= ~LPFC_FIP_ELS_ID_MASK;
++ 	iocbq->iocb_flag |= LPFC_USE_FCPWQIDX;
++ 
++ 	/*
++ 	 * Setup rest of the iocb as though it were a WQE
++ 	 * Build the SEND_FRAME WQE
++ 	 */
++ 	wqe = (union lpfc_wqe *)&iocbq->iocb;
++ 
++ 	wqe->send_frame.frame_len = frame_len;
++ 	wqe->send_frame.fc_hdr_wd0 = be32_to_cpu(*((uint32_t *)fc_hdr));
++ 	wqe->send_frame.fc_hdr_wd1 = be32_to_cpu(*((uint32_t *)fc_hdr + 1));
++ 	wqe->send_frame.fc_hdr_wd2 = be32_to_cpu(*((uint32_t *)fc_hdr + 2));
++ 	wqe->send_frame.fc_hdr_wd3 = be32_to_cpu(*((uint32_t *)fc_hdr + 3));
++ 	wqe->send_frame.fc_hdr_wd4 = be32_to_cpu(*((uint32_t *)fc_hdr + 4));
++ 	wqe->send_frame.fc_hdr_wd5 = be32_to_cpu(*((uint32_t *)fc_hdr + 5));
++ 
++ 	iocbq->iocb.ulpCommand = CMD_SEND_FRAME;
++ 	iocbq->iocb.ulpLe = 1;
++ 	iocbq->iocb_cmpl = lpfc_sli4_mds_loopback_cmpl;
++ 	rc = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, iocbq, 0);
++ 	if (rc == IOCB_ERROR)
++ 		goto exit;
++ 
++ 	lpfc_in_buf_free(phba, &dmabuf->dbuf);
++ 	return;
++ 
++ exit:
++ 	lpfc_printf_log(phba, KERN_WARNING, LOG_SLI,
++ 			"2023 Unable to process MDS loopback frame\n");
++ 	if (pcmd && pcmd->virt)
++ 		dma_pool_free(phba->lpfc_drb_pool, pcmd->virt, pcmd->phys);
++ 	kfree(pcmd);
++ 	if (iocbq)
++ 		lpfc_sli_release_iocbq(phba, iocbq);
++ 	lpfc_in_buf_free(phba, &dmabuf->dbuf);
++ }
++ 
+++>>>>>>> 401bb4169da6 (scsi: lpfc: fix pci hot plug crash in list_add call)
+  /**
+   * lpfc_sli4_handle_received_buffer - Handle received buffers from firmware
+   * @phba: Pointer to HBA context object.
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
