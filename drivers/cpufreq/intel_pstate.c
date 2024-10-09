@@ -1052,6 +1052,12 @@ static inline void intel_pstate_set_sample_time(struct cpudata *cpu)
 	mod_timer_pinned(&cpu->timer, jiffies + delay);
 }
 
+static inline int32_t get_avg_pstate(struct cpudata *cpu)
+{
+	return div64_u64(cpu->pstate.max_pstate_physical * cpu->sample.aperf,
+			 cpu->sample.mperf);
+}
+
 static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
 {
 	struct sample *sample = &cpu->sample;
@@ -1084,7 +1090,7 @@ static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
 	cpu_load = div64_u64(int_tofp(100) * mperf, sample->tsc);
 	cpu->sample.busy_scaled = cpu_load;
 
-	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, cpu_load);
+	return get_avg_pstate(cpu) - pid_calc(&cpu->pid, cpu_load);
 }
 
 static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu)
