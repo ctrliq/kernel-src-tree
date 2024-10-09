@@ -123,7 +123,43 @@ out:
 static volatile int done;
 static volatile int signr = -1;
 static volatile int child_finished;
-static volatile int auxtrace_snapshot_enabled;
+
+static volatile enum {
+	AUXTRACE_SNAPSHOT_OFF = -1,
+	AUXTRACE_SNAPSHOT_DISABLED = 0,
+	AUXTRACE_SNAPSHOT_ENABLED = 1,
+} auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_OFF;
+
+static inline void
+auxtrace_snapshot_on(void)
+{
+	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_DISABLED;
+}
+
+static inline void
+auxtrace_snapshot_enable(void)
+{
+	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
+		return;
+	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_ENABLED;
+}
+
+static inline void
+auxtrace_snapshot_disable(void)
+{
+	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
+		return;
+	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_DISABLED;
+}
+
+static inline bool
+auxtrace_snapshot_is_enabled(void)
+{
+	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
+		return false;
+	return auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_ENABLED;
+}
+
 static volatile int auxtrace_snapshot_err;
 static volatile int auxtrace_record__snapshot_started;
 
@@ -247,7 +283,7 @@ static void record__read_auxtrace_snapshot(struct record *rec)
 	} else {
 		auxtrace_snapshot_err = auxtrace_record__snapshot_finish(rec->itr);
 		if (!auxtrace_snapshot_err)
-			auxtrace_snapshot_enabled = 1;
+			auxtrace_snapshot_enable();
 	}
 }
 
@@ -613,10 +649,13 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	signal(SIGCHLD, sig_handler);
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
-	if (rec->opts.auxtrace_snapshot_mode)
+
+	if (rec->opts.auxtrace_snapshot_mode) {
 		signal(SIGUSR2, snapshot_sig_handler);
-	else
+		auxtrace_snapshot_on();
+	} else {
 		signal(SIGUSR2, SIG_IGN);
+	}
 
 	session = perf_session__new(file, false, tool);
 	if (session == NULL) {
@@ -732,12 +771,12 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		perf_evlist__enable(rec->evlist);
 	}
 
-	auxtrace_snapshot_enabled = 1;
+	auxtrace_snapshot_enable();
 	for (;;) {
 		unsigned long long hits = rec->samples;
 
 		if (record__mmap_read_all(rec) < 0) {
-			auxtrace_snapshot_enabled = 0;
+			auxtrace_snapshot_disable();
 			err = -1;
 			goto out_child;
 		}
@@ -775,12 +814,12 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		 * disable events in this case.
 		 */
 		if (done && !disabled && !target__none(&opts->target)) {
-			auxtrace_snapshot_enabled = 0;
+			auxtrace_snapshot_disable();
 			perf_evlist__disable(rec->evlist);
 			disabled = true;
 		}
 	}
-	auxtrace_snapshot_enabled = 0;
+	auxtrace_snapshot_disable();
 
 	if (forks && workload_exec_errno) {
 		char msg[STRERR_BUFSIZE];
@@ -1231,9 +1270,9 @@ out_symbol_exit:
 
 static void snapshot_sig_handler(int sig __maybe_unused)
 {
-	if (!auxtrace_snapshot_enabled)
+	if (!auxtrace_snapshot_is_enabled())
 		return;
-	auxtrace_snapshot_enabled = 0;
+	auxtrace_snapshot_disable();
 	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr);
 	auxtrace_record__snapshot_started = 1;
 }
