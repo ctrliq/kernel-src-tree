@@ -1,0 +1,187 @@
+net/mlx5e: Introduce API for RX mapped pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Introduce API for RX mapped pages (Don Dutile) [1385310 1385330 1417285]
+Rebuild_FUZZ: 95.24%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit a5a0c590166e39fa399940775e7bfd8e1a9356da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a5a0c590.failed
+
+Manage the allocation and deallocation of mapped RX pages only
+through dedicated API functions.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5a0c590166e39fa399940775e7bfd8e1a9356da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d795e95774bc,0c34daa04c43..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -385,23 -305,11 +385,31 @@@ static void mlx5e_post_umr_wqe(struct m
+  	mlx5e_tx_notify_hw(sq, &wqe->ctrl, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static inline int mlx5e_get_wqe_mtt_sz(void)
+ +{
+ +	/* UMR copies MTTs in units of MLX5_UMR_MTT_ALIGNMENT bytes.
+ +	 * To avoid copying garbage after the mtt array, we allocate
+ +	 * a little more.
+ +	 */
+ +	return ALIGN(MLX5_MPWRQ_PAGES_PER_WQE * sizeof(__be64),
+ +		     MLX5_UMR_MTT_ALIGNMENT);
+ +}
+ +
+ +static int mlx5e_alloc_and_map_page(struct mlx5e_rq *rq,
+ +				    struct mlx5e_mpw_info *wi,
+ +				    int i)
+ +{
+ +	struct page *page;
+ +
+ +	page = dev_alloc_page();
+++=======
++ static inline int mlx5e_page_alloc_mapped(struct mlx5e_rq *rq,
++ 					  struct mlx5e_dma_info *dma_info)
++ {
++ 	struct page *page = dev_alloc_page();
++ 
+++>>>>>>> a5a0c590166e (net/mlx5e: Introduce API for RX mapped pages)
+  	if (unlikely(!page))
+  		return -ENOMEM;
+  
+@@@ -417,38 -324,31 +424,61 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5e_alloc_rx_fragmented_mpwqe(struct mlx5e_rq *rq,
+ +					   struct mlx5e_rx_wqe *wqe,
+ +					   u16 ix)
+++=======
++ static inline void mlx5e_page_release(struct mlx5e_rq *rq,
++ 				      struct mlx5e_dma_info *dma_info)
++ {
++ 	dma_unmap_page(rq->pdev, dma_info->addr, PAGE_SIZE, DMA_FROM_DEVICE);
++ 	put_page(dma_info->page);
++ }
++ 
++ static int mlx5e_alloc_rx_umr_mpwqe(struct mlx5e_rq *rq,
++ 				    struct mlx5e_rx_wqe *wqe,
++ 				    u16 ix)
+++>>>>>>> a5a0c590166e (net/mlx5e: Introduce API for RX mapped pages)
+  {
+  	struct mlx5e_mpw_info *wi = &rq->wqe_info[ix];
+ -	u64 dma_offset = (u64)mlx5e_get_wqe_mtt_offset(rq, ix) << PAGE_SHIFT;
+ -	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ -	int err;
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	u32 dma_offset = mlx5e_get_wqe_mtt_offset(rq->ix, ix) << PAGE_SHIFT;
+  	int i;
+  
+ +	wi->umr.dma_info = kmalloc(sizeof(*wi->umr.dma_info) *
+ +				   MLX5_MPWRQ_PAGES_PER_WQE,
+ +				   GFP_ATOMIC);
+ +	if (unlikely(!wi->umr.dma_info))
+ +		goto err_out;
+ +
+ +	/* We allocate more than mtt_sz as we will align the pointer */
+ +	wi->umr.mtt_no_align = kzalloc(mtt_sz + MLX5_UMR_ALIGN - 1,
+ +				       GFP_ATOMIC);
+ +	if (unlikely(!wi->umr.mtt_no_align))
+ +		goto err_free_umr;
+ +
+ +	wi->umr.mtt = PTR_ALIGN(wi->umr.mtt_no_align, MLX5_UMR_ALIGN);
+ +	wi->umr.mtt_addr = dma_map_single(rq->pdev, wi->umr.mtt, mtt_sz,
+ +					  PCI_DMA_TODEVICE);
+ +	if (unlikely(dma_mapping_error(rq->pdev, wi->umr.mtt_addr)))
+ +		goto err_free_mtt;
+ +
+  	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++) {
+++<<<<<<< HEAD
+ +		if (unlikely(mlx5e_alloc_and_map_page(rq, wi, i)))
+ +			goto err_unmap;
+ +		atomic_add(mlx5e_mpwqe_strides_per_page(rq),
+ +			   &wi->umr.dma_info[i].page->_count);
+++=======
++ 		struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[i];
++ 
++ 		err = mlx5e_page_alloc_mapped(rq, dma_info);
++ 		if (unlikely(err))
++ 			goto err_unmap;
++ 		wi->umr.mtt[i] = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
++ 		page_ref_add(dma_info->page, pg_strides);
+++>>>>>>> a5a0c590166e (net/mlx5e: Introduce API for RX mapped pages)
+  		wi->skbs_frags[i] = 0;
+  	}
+  
+@@@ -464,43 -359,29 +494,57 @@@
+  
+  err_unmap:
+  	while (--i >= 0) {
+++<<<<<<< HEAD
+ +		dma_unmap_page(rq->pdev, wi->umr.dma_info[i].addr, PAGE_SIZE,
+ +			       PCI_DMA_FROMDEVICE);
+ +		atomic_sub(mlx5e_mpwqe_strides_per_page(rq),
+ +			   &wi->umr.dma_info[i].page->_count);
+ +		put_page(wi->umr.dma_info[i].page);
+++=======
++ 		struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[i];
++ 
++ 		page_ref_sub(dma_info->page, pg_strides);
++ 		mlx5e_page_release(rq, dma_info);
+++>>>>>>> a5a0c590166e (net/mlx5e: Introduce API for RX mapped pages)
+  	}
+ +	dma_unmap_single(rq->pdev, wi->umr.mtt_addr, mtt_sz, PCI_DMA_TODEVICE);
+ +
+ +err_free_mtt:
+ +	kfree(wi->umr.mtt_no_align);
+  
+ -	return err;
+ +err_free_umr:
+ +	kfree(wi->umr.dma_info);
+ +
+ +err_out:
+ +	return -ENOMEM;
+  }
+  
+ -void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi)
+ +void mlx5e_free_rx_fragmented_mpwqe(struct mlx5e_rq *rq,
+ +				    struct mlx5e_mpw_info *wi)
+  {
+ -	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+  	int i;
+  
+  	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++) {
+++<<<<<<< HEAD
+ +		dma_unmap_page(rq->pdev, wi->umr.dma_info[i].addr, PAGE_SIZE,
+ +			       PCI_DMA_FROMDEVICE);
+ +		atomic_sub(mlx5e_mpwqe_strides_per_page(rq) - wi->skbs_frags[i],
+ +			   &wi->umr.dma_info[i].page->_count);
+ +		put_page(wi->umr.dma_info[i].page);
+++=======
++ 		struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[i];
++ 
++ 		page_ref_sub(dma_info->page, pg_strides - wi->skbs_frags[i]);
++ 		mlx5e_page_release(rq, dma_info);
+++>>>>>>> a5a0c590166e (net/mlx5e: Introduce API for RX mapped pages)
+  	}
+ +	dma_unmap_single(rq->pdev, wi->umr.mtt_addr, mtt_sz, PCI_DMA_TODEVICE);
+ +	kfree(wi->umr.mtt_no_align);
+ +	kfree(wi->umr.dma_info);
+  }
+  
+ -void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq)
+ +void mlx5e_post_rx_fragmented_mpwqe(struct mlx5e_rq *rq)
+  {
+  	struct mlx5_wq_ll *wq = &rq->wq;
+  	struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
