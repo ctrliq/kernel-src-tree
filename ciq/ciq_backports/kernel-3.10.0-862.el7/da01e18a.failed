@@ -1,0 +1,237 @@
+x86: avoid avoid passing around 'thread_info' in stack dumping code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit da01e18a37a57f360222d3a123b8f6994aa1ad14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/da01e18a.failed
+
+None of the code actually wants a thread_info, it all wants a
+task_struct, and it's just converting to a thread_info pointer much too
+early.
+
+No semantic change.
+
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit da01e18a37a57f360222d3a123b8f6994aa1ad14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/dumpstack_32.c
+diff --cc arch/x86/kernel/dumpstack_32.c
+index ac92114d305f,fef917e79b9d..000000000000
+--- a/arch/x86/kernel/dumpstack_32.c
++++ b/arch/x86/kernel/dumpstack_32.c
+@@@ -38,15 -61,25 +38,32 @@@ void dump_trace(struct task_struct *tas
+  		bp = stack_frame(task, regs);
+  
+  	for (;;) {
+++<<<<<<< HEAD
+ +		struct thread_info *context;
+++=======
++ 		void *end_stack;
+++>>>>>>> da01e18a37a5 (x86: avoid avoid passing around 'thread_info' in stack dumping code)
+  
+ -		end_stack = is_hardirq_stack(stack, cpu);
+ -		if (!end_stack)
+ -			end_stack = is_softirq_stack(stack, cpu);
+ +		context = (struct thread_info *)
+ +			((unsigned long)stack & (~(THREAD_SIZE - 1)));
+ +		bp = ops->walk_stack(context, stack, bp, ops, data, NULL, &graph);
+  
+++<<<<<<< HEAD
+ +		stack = (unsigned long *)context->previous_esp;
+++=======
++ 		bp = ops->walk_stack(task, stack, bp, ops, data,
++ 				     end_stack, &graph);
++ 
++ 		/* Stop if not on irq stack */
++ 		if (!end_stack)
++ 			break;
++ 
++ 		/* The previous esp is saved on the bottom of the stack */
++ 		prev_esp = (u32 *)(end_stack - THREAD_SIZE);
++ 		stack = (unsigned long *)*prev_esp;
+++>>>>>>> da01e18a37a5 (x86: avoid avoid passing around 'thread_info' in stack dumping code)
+  		if (!stack)
+  			break;
+ -
+  		if (ops->stack(data, "IRQ") < 0)
+  			break;
+  		touch_nmi_watchdog();
+diff --git a/arch/x86/include/asm/stacktrace.h b/arch/x86/include/asm/stacktrace.h
+index 7c247e7404be..0944218af9e2 100644
+--- a/arch/x86/include/asm/stacktrace.h
++++ b/arch/x86/include/asm/stacktrace.h
+@@ -14,7 +14,7 @@ extern int kstack_depth_to_print;
+ struct thread_info;
+ struct stacktrace_ops;
+ 
+-typedef unsigned long (*walk_stack_t)(struct thread_info *tinfo,
++typedef unsigned long (*walk_stack_t)(struct task_struct *task,
+ 				      unsigned long *stack,
+ 				      unsigned long bp,
+ 				      const struct stacktrace_ops *ops,
+@@ -23,13 +23,13 @@ typedef unsigned long (*walk_stack_t)(struct thread_info *tinfo,
+ 				      int *graph);
+ 
+ extern unsigned long
+-print_context_stack(struct thread_info *tinfo,
++print_context_stack(struct task_struct *task,
+ 		    unsigned long *stack, unsigned long bp,
+ 		    const struct stacktrace_ops *ops, void *data,
+ 		    unsigned long *end, int *graph);
+ 
+ extern unsigned long
+-print_context_stack_bp(struct thread_info *tinfo,
++print_context_stack_bp(struct task_struct *task,
+ 		       unsigned long *stack, unsigned long bp,
+ 		       const struct stacktrace_ops *ops, void *data,
+ 		       unsigned long *end, int *graph);
+diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
+index 519aaf41a253..d0d8dfbbc059 100644
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@ -42,16 +42,14 @@ void printk_address(unsigned long address)
+ static void
+ print_ftrace_graph_addr(unsigned long addr, void *data,
+ 			const struct stacktrace_ops *ops,
+-			struct thread_info *tinfo, int *graph)
++			struct task_struct *task, int *graph)
+ {
+-	struct task_struct *task;
+ 	unsigned long ret_addr;
+ 	int index;
+ 
+ 	if (addr != (unsigned long)return_to_handler)
+ 		return;
+ 
+-	task = tinfo->task;
+ 	index = task->curr_ret_stack;
+ 
+ 	if (!task->ret_stack || index < *graph)
+@@ -68,7 +66,7 @@ print_ftrace_graph_addr(unsigned long addr, void *data,
+ static inline void
+ print_ftrace_graph_addr(unsigned long addr, void *data,
+ 			const struct stacktrace_ops *ops,
+-			struct thread_info *tinfo, int *graph)
++			struct task_struct *task, int *graph)
+ { }
+ #endif
+ 
+@@ -79,10 +77,10 @@ print_ftrace_graph_addr(unsigned long addr, void *data,
+  * severe exception (double fault, nmi, stack fault, debug, mce) hardware stack
+  */
+ 
+-static inline int valid_stack_ptr(struct thread_info *tinfo,
++static inline int valid_stack_ptr(struct task_struct *task,
+ 			void *p, unsigned int size, void *end)
+ {
+-	void *t = tinfo;
++	void *t = task_thread_info(task);
+ 	if (end) {
+ 		if (p < end && p >= (end-THREAD_SIZE))
+ 			return 1;
+@@ -93,14 +91,14 @@ static inline int valid_stack_ptr(struct thread_info *tinfo,
+ }
+ 
+ unsigned long
+-print_context_stack(struct thread_info *tinfo,
++print_context_stack(struct task_struct *task,
+ 		unsigned long *stack, unsigned long bp,
+ 		const struct stacktrace_ops *ops, void *data,
+ 		unsigned long *end, int *graph)
+ {
+ 	struct stack_frame *frame = (struct stack_frame *)bp;
+ 
+-	while (valid_stack_ptr(tinfo, stack, sizeof(*stack), end)) {
++	while (valid_stack_ptr(task, stack, sizeof(*stack), end)) {
+ 		unsigned long addr;
+ 
+ 		addr = *stack;
+@@ -112,7 +110,7 @@ print_context_stack(struct thread_info *tinfo,
+ 			} else {
+ 				ops->address(data, addr, 0);
+ 			}
+-			print_ftrace_graph_addr(addr, data, ops, tinfo, graph);
++			print_ftrace_graph_addr(addr, data, ops, task, graph);
+ 		}
+ 		stack++;
+ 	}
+@@ -121,7 +119,7 @@ print_context_stack(struct thread_info *tinfo,
+ EXPORT_SYMBOL_GPL(print_context_stack);
+ 
+ unsigned long
+-print_context_stack_bp(struct thread_info *tinfo,
++print_context_stack_bp(struct task_struct *task,
+ 		       unsigned long *stack, unsigned long bp,
+ 		       const struct stacktrace_ops *ops, void *data,
+ 		       unsigned long *end, int *graph)
+@@ -129,7 +127,7 @@ print_context_stack_bp(struct thread_info *tinfo,
+ 	struct stack_frame *frame = (struct stack_frame *)bp;
+ 	unsigned long *ret_addr = &frame->return_address;
+ 
+-	while (valid_stack_ptr(tinfo, ret_addr, sizeof(*ret_addr), end)) {
++	while (valid_stack_ptr(task, ret_addr, sizeof(*ret_addr), end)) {
+ 		unsigned long addr = *ret_addr;
+ 
+ 		if (!__kernel_text_address(addr))
+@@ -139,7 +137,7 @@ print_context_stack_bp(struct thread_info *tinfo,
+ 			break;
+ 		frame = frame->next_frame;
+ 		ret_addr = &frame->return_address;
+-		print_ftrace_graph_addr(addr, data, ops, tinfo, graph);
++		print_ftrace_graph_addr(addr, data, ops, task, graph);
+ 	}
+ 
+ 	return (unsigned long)frame;
+* Unmerged path arch/x86/kernel/dumpstack_32.c
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index 553573bcf0ee..68cae9786a44 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -153,7 +153,6 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 		const struct stacktrace_ops *ops, void *data)
+ {
+ 	const unsigned cpu = get_cpu();
+-	struct thread_info *tinfo;
+ 	unsigned long *irq_stack = (unsigned long *)per_cpu(irq_stack_ptr, cpu);
+ 	unsigned long dummy;
+ 	unsigned used = 0;
+@@ -179,7 +178,6 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 	 * current stack address. If the stacks consist of nested
+ 	 * exceptions
+ 	 */
+-	tinfo = task_thread_info(task);
+ 	while (!done) {
+ 		unsigned long *stack_end;
+ 		enum stack_type stype;
+@@ -202,7 +200,7 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 			if (ops->stack(data, id) < 0)
+ 				break;
+ 
+-			bp = ops->walk_stack(tinfo, stack, bp, ops,
++			bp = ops->walk_stack(task, stack, bp, ops,
+ 					     data, stack_end, &graph);
+ 			ops->stack(data, "<EOE>");
+ 			/*
+@@ -218,7 +216,7 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 
+ 			if (ops->stack(data, "IRQ") < 0)
+ 				break;
+-			bp = ops->walk_stack(tinfo, stack, bp,
++			bp = ops->walk_stack(task, stack, bp,
+ 				     ops, data, stack_end, &graph);
+ 			/*
+ 			 * We link to the next stack (which would be
+@@ -240,7 +238,7 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 	/*
+ 	 * This handles the process stack:
+ 	 */
+-	bp = ops->walk_stack(tinfo, stack, bp, ops, data, NULL, &graph);
++	bp = ops->walk_stack(task, stack, bp, ops, data, NULL, &graph);
+ 	put_cpu();
+ }
+ EXPORT_SYMBOL(dump_trace);
