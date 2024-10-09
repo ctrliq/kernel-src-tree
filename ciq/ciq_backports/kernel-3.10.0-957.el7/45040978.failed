@@ -1,0 +1,413 @@
+netfilter: ipset: Fix set:list type crash when flush/dump set in parallel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit 45040978c8994d1401baf5cc5ac71c1495d4e120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/45040978.failed
+
+Flushing/listing entries was not RCU safe, so parallel flush/dump
+could lead to kernel crash. Bug reported by Deniz Eren.
+
+Fixes netfilter bugzilla id #1050.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit 45040978c8994d1401baf5cc5ac71c1495d4e120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_list_set.c
+diff --cc net/netfilter/ipset/ip_set_list_set.c
+index a9a97c07ecb4,24c6c1962aea..000000000000
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@@ -25,30 -28,11 +25,36 @@@ MODULE_ALIAS("ip_set_list:set")
+  
+  /* Member elements  */
+  struct set_elem {
+++<<<<<<< HEAD
+++=======
++ 	struct rcu_head rcu;
++ 	struct list_head list;
++ 	struct ip_set *set;	/* Sigh, in order to cleanup reference */
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  	ip_set_id_t id;
+ -} __aligned(__alignof__(u64));
+ +};
+ +
+ +struct sett_elem {
+ +	struct {
+ +		ip_set_id_t id;
+ +	} __attribute__ ((aligned));
+ +	unsigned long timeout;
+ +};
+ +
+ +struct setc_elem {
+ +	struct {
+ +		ip_set_id_t id;
+ +	} __attribute__ ((aligned));
+ +	struct ip_set_counter counter;
+ +};
+ +
+ +struct setct_elem {
+ +	struct {
+ +		ip_set_id_t id;
+ +	} __attribute__ ((aligned));
+ +	struct ip_set_counter counter;
+ +	unsigned long timeout;
+ +};
+  
+  struct set_adt_elem {
+  	ip_set_id_t id;
+@@@ -177,70 -144,37 +183,96 @@@ list_set_kadt(struct ip_set *set, cons
+  	default:
+  		break;
+  	}
+ -	rcu_read_unlock();
+ -
+ -	return ret;
+ +	return -EINVAL;
+  }
+  
+ -/* Userspace interfaces: we are protected by the nfnl mutex */
+ +static bool
+ +id_eq(const struct ip_set *set, u32 i, ip_set_id_t id)
+ +{
+ +	const struct list_set *map = set->data;
+ +	const struct set_elem *e;
+  
+++<<<<<<< HEAD
+ +	if (i >= map->size)
+ +		return 0;
+ +
+ +	e = list_set_elem(map, i);
+ +	return !!(e->id == id &&
+ +		 !(SET_WITH_TIMEOUT(set) &&
+ +		   ip_set_timeout_expired(ext_timeout(e, map))));
+ +}
+ +
+ +static int
+ +list_set_add(struct ip_set *set, u32 i, struct set_adt_elem *d,
+ +	     const struct ip_set_ext *ext)
+++=======
++ static void
++ __list_set_del_rcu(struct rcu_head * rcu)
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  {
++ 	struct set_elem *e = container_of(rcu, struct set_elem, rcu);
++ 	struct ip_set *set = e->set;
+  	struct list_set *map = set->data;
+ +	struct set_elem *e = list_set_elem(map, i);
+ +
+ +	if (e->id != IPSET_INVALID_ID) {
+ +		if (i == map->size - 1)
+ +			/* Last element replaced: e.g. add new,before,last */
+ +			ip_set_put_byindex(map->net, e->id);
+ +		else {
+ +			struct set_elem *x = list_set_elem(map, map->size - 1);
+ +
+ +			/* Last element pushed off */
+ +			if (x->id != IPSET_INVALID_ID)
+ +				ip_set_put_byindex(map->net, x->id);
+ +			memmove(list_set_elem(map, i + 1), e,
+ +				map->dsize * (map->size - (i + 1)));
+ +		}
+ +	}
+ +
+ +	e->id = d->id;
+ +	if (SET_WITH_TIMEOUT(set))
+ +		ip_set_timeout_set(ext_timeout(e, map), ext->timeout);
+ +	if (SET_WITH_COUNTER(set))
+ +		ip_set_init_counter(ext_counter(e, map), ext);
+ +	return 0;
+ +}
+ +
+ +static int
+ +list_set_del(struct ip_set *set, u32 i)
+ +{
+ +	struct list_set *map = set->data;
+ +	struct set_elem *e = list_set_elem(map, i);
+  
+  	ip_set_put_byindex(map->net, e->id);
+++<<<<<<< HEAD
+ +
+ +	if (i < map->size - 1)
+ +		memmove(e, list_set_elem(map, i + 1),
+ +			map->dsize * (map->size - (i + 1)));
+ +
+ +	/* Last element */
+ +	e = list_set_elem(map, map->size - 1);
+ +	e->id = IPSET_INVALID_ID;
+ +	return 0;
+++=======
++ 	ip_set_ext_destroy(set, e);
++ 	kfree(e);
++ }
++ 
++ static inline void
++ list_set_del(struct ip_set *set, struct set_elem *e)
++ {
++ 	list_del_rcu(&e->list);
++ 	call_rcu(&e->rcu, __list_set_del_rcu);
++ }
++ 
++ static inline void
++ list_set_replace(struct set_elem *e, struct set_elem *old)
++ {
++ 	list_replace_rcu(&old->list, &e->list);
++ 	call_rcu(&old->rcu, __list_set_del_rcu);
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  }
+  
+  static void
+@@@ -296,54 -241,76 +328,96 @@@ list_set_uadd(struct ip_set *set, void 
+  {
+  	struct list_set *map = set->data;
+  	struct set_adt_elem *d = value;
+ -	struct set_elem *e, *n, *prev, *next;
+ +	struct set_elem *e;
+  	bool flag_exist = flags & IPSET_FLAG_EXIST;
+ +	u32 i, ret = 0;
+ +
+++<<<<<<< HEAD
+ +	/* Check already added element */
+ +	for (i = 0; i < map->size; i++) {
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			goto insert;
+ +		else if (SET_WITH_TIMEOUT(set) &&
+ +			 ip_set_timeout_expired(ext_timeout(e, map)))
+ +			continue;
+ +		else if (e->id != d->id)
+ +			continue;
+  
+ +		if ((d->before > 1 && !id_eq(set, i + 1, d->refid)) ||
+ +		    (d->before < 0 &&
+ +		     (i == 0 || !id_eq(set, i - 1, d->refid))))
+ +			/* Before/after doesn't match */
+++=======
++ 	/* Find where to add the new entry */
++ 	n = prev = next = NULL;
++ 	list_for_each_entry(e, &map->members, list) {
++ 		if (SET_WITH_TIMEOUT(set) &&
++ 		    ip_set_timeout_expired(ext_timeout(e, set)))
++ 			continue;
++ 		else if (d->id == e->id)
++ 			n = e;
++ 		else if (d->before == 0 || e->id != d->refid)
++ 			continue;
++ 		else if (d->before > 0)
++ 			next = e;
++ 		else
++ 			prev = e;
++ 	}
++ 	/* Re-add already existing element */
++ 	if (n) {
++ 		if ((d->before > 0 && !next) ||
++ 		    (d->before < 0 && !prev))
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  			return -IPSET_ERR_REF_EXIST;
+  		if (!flag_exist)
+ +			/* Can't re-add */
+  			return -IPSET_ERR_EXIST;
+  		/* Update extensions */
+ -		ip_set_ext_destroy(set, n);
+ -		list_set_init_extensions(set, ext, n);
+ -
+ +		if (SET_WITH_TIMEOUT(set))
+ +			ip_set_timeout_set(ext_timeout(e, map), ext->timeout);
+ +		if (SET_WITH_COUNTER(set))
+ +			ip_set_init_counter(ext_counter(e, map), ext);
+  		/* Set is already added to the list */
+  		ip_set_put_byindex(map->net, d->id);
+  		return 0;
+  	}
+ -	/* Add new entry */
+ -	if (d->before == 0) {
+ -		/* Append  */
+ -		n = list_empty(&map->members) ? NULL :
+ -		    list_last_entry(&map->members, struct set_elem, list);
+ -	} else if (d->before > 0) {
+ -		/* Insert after next element */
+ -		if (!list_is_last(&next->list, &map->members))
+ -			n = list_next_entry(next, list);
+ -	} else {
+ -		/* Insert before prev element */
+ -		if (prev->list.prev != &map->members)
+ -			n = list_prev_entry(prev, list);
+ +insert:
+ +	ret = -IPSET_ERR_LIST_FULL;
+ +	for (i = 0; i < map->size && ret == -IPSET_ERR_LIST_FULL; i++) {
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			ret = d->before != 0 ? -IPSET_ERR_REF_EXIST
+ +				: list_set_add(set, i, d, ext);
+ +		else if (e->id != d->refid)
+ +			continue;
+ +		else if (d->before > 0)
+ +			ret = list_set_add(set, i, d, ext);
+ +		else if (i + 1 < map->size)
+ +			ret = list_set_add(set, i + 1, d, ext);
+  	}
+ -	/* Can we replace a timed out entry? */
+ -	if (n &&
+ -	    !(SET_WITH_TIMEOUT(set) &&
+ -	      ip_set_timeout_expired(ext_timeout(n, set))))
+ -		n =  NULL;
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	e = kzalloc(set->dsize, GFP_ATOMIC);
++ 	if (!e)
++ 		return -ENOMEM;
++ 	e->id = d->id;
++ 	e->set = set;
++ 	INIT_LIST_HEAD(&e->list);
++ 	list_set_init_extensions(set, ext, e);
++ 	if (n)
++ 		list_set_replace(e, n);
++ 	else if (next)
++ 		list_add_tail_rcu(&e->list, &next->list);
++ 	else if (prev)
++ 		list_add_rcu(&e->list, &prev->list);
++ 	else
++ 		list_add_tail_rcu(&e->list, &map->members);
++ 
++ 	return 0;
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  }
+  
+  static int
+@@@ -471,7 -428,14 +545,17 @@@ list_set_destroy(struct ip_set *set
+  
+  	if (SET_WITH_TIMEOUT(set))
+  		del_timer_sync(&map->gc);
+++<<<<<<< HEAD
+ +	list_set_flush(set);
+++=======
++ 
++ 	list_for_each_entry_safe(e, n, &map->members, list) {
++ 		list_del(&e->list);
++ 		ip_set_put_byindex(map->net, e->id);
++ 		ip_set_ext_destroy(set, e);
++ 		kfree(e);
++ 	}
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  	kfree(map);
+  
+  	set->data = NULL;
+@@@ -482,6 -446,13 +566,16 @@@ list_set_head(struct ip_set *set, struc
+  {
+  	const struct list_set *map = set->data;
+  	struct nlattr *nested;
+++<<<<<<< HEAD
+++=======
++ 	struct set_elem *e;
++ 	u32 n = 0;
++ 
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(e, &map->members, list)
++ 		n++;
++ 	rcu_read_unlock();
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  
+  	nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+  	if (!nested)
+@@@ -515,49 -484,45 +609,72 @@@ list_set_list(const struct ip_set *set
+  	atd = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!atd)
+  		return -EMSGSIZE;
+++<<<<<<< HEAD
+ +	for (; cb->args[2] < map->size; cb->args[2]++) {
+ +		i = cb->args[2];
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			goto finish;
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    ip_set_timeout_expired(ext_timeout(e, map)))
+ +			continue;
+ +		nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+ +		if (!nested) {
+ +			if (i == first) {
+ +				nla_nest_cancel(skb, atd);
+ +				return -EMSGSIZE;
+ +			} else
+ +				goto nla_put_failure;
+++=======
++ 
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(e, &map->members, list) {
++ 		if (i < first ||
++ 		    (SET_WITH_TIMEOUT(set) &&
++ 		     ip_set_timeout_expired(ext_timeout(e, set)))) {
++ 			i++;
++ 			continue;
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  		}
++ 		nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
++ 		if (!nested)
++ 			goto nla_put_failure;
+  		if (nla_put_string(skb, IPSET_ATTR_NAME,
+  				   ip_set_name_byindex(map->net, e->id)))
+  			goto nla_put_failure;
+ -		if (ip_set_put_extensions(skb, set, e, true))
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
+ +				  htonl(ip_set_timeout_get(
+ +						ext_timeout(e, map)))))
+ +			goto nla_put_failure;
+ +		if (SET_WITH_COUNTER(set) &&
+ +		    ip_set_put_counter(skb, ext_counter(e, map)))
+  			goto nla_put_failure;
+  		ipset_nest_end(skb, nested);
++ 		i++;
+  	}
+ -
+ +finish:
+  	ipset_nest_end(skb, atd);
+  	/* Set listing finished */
+ -	cb->args[IPSET_CB_ARG0] = 0;
+ -	goto out;
+ +	cb->args[2] = 0;
+ +	return 0;
+  
+  nla_put_failure:
+  	nla_nest_cancel(skb, nested);
+  	if (unlikely(i == first)) {
+++<<<<<<< HEAD
+ +		cb->args[2] = 0;
+ +		return -EMSGSIZE;
+++=======
++ 		nla_nest_cancel(skb, atd);
++ 		cb->args[IPSET_CB_ARG0] = 0;
++ 		ret = -EMSGSIZE;
++ 	} else {
++ 		cb->args[IPSET_CB_ARG0] = i;
+++>>>>>>> 45040978c899 (netfilter: ipset: Fix set:list type crash when flush/dump set in parallel)
+  	}
+  	ipset_nest_end(skb, atd);
+ -out:
+ -	rcu_read_unlock();
+ -	return ret;
+ +	return 0;
+  }
+  
+  static bool
+diff --git a/net/netfilter/ipset/ip_set_core.c b/net/netfilter/ipset/ip_set_core.c
+index 1b9673fde81c..e898cfa9dc7b 100644
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@ -904,6 +904,9 @@ ip_set_destroy(struct sock *ctnl, struct sk_buff *skb,
+ 	if (unlikely(protocol_failed(attr)))
+ 		return -IPSET_ERR_PROTOCOL;
+ 
++	/* Must wait for flush to be really finished in list:set */
++	rcu_barrier();
++
+ 	/* Commands are serialized and references are
+ 	 * protected by the ip_set_ref_lock.
+ 	 * External systems (i.e. xt_set) must call
+* Unmerged path net/netfilter/ipset/ip_set_list_set.c
