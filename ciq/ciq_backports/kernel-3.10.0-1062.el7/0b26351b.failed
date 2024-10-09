@@ -1,0 +1,134 @@
+stop_machine, sched: Fix migrate_swap() vs. active_balance() deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0b26351b910fb8fe6a056f8a1bbccabe50c0e19f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0b26351b.failed
+
+Matt reported the following deadlock:
+
+CPU0					CPU1
+
+schedule(.prev=migrate/0)		<fault>
+  pick_next_task()			  ...
+    idle_balance()			    migrate_swap()
+      active_balance()			      stop_two_cpus()
+						spin_lock(stopper0->lock)
+						spin_lock(stopper1->lock)
+						ttwu(migrate/0)
+						  smp_cond_load_acquire() -- waits for schedule()
+        stop_one_cpu(1)
+	  spin_lock(stopper1->lock) -- waits for stopper lock
+
+Fix this deadlock by taking the wakeups out from under stopper->lock.
+This allows the active_balance() to queue the stop work and finish the
+context switch, which in turn allows the wakeup from migrate_swap() to
+observe the context and complete the wakeup.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reported-by: Matt Fleming <matt@codeblueprint.co.uk>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20180420095005.GH4064@hirez.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0b26351b910fb8fe6a056f8a1bbccabe50c0e19f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/stop_machine.c
+diff --cc kernel/stop_machine.c
+index bfd90d7f3d08,64c0291b579c..000000000000
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@@ -20,8 -20,8 +20,9 @@@
+  #include <linux/kallsyms.h>
+  #include <linux/smpboot.h>
+  #include <linux/atomic.h>
+ +#include <linux/lglock.h>
+  #include <linux/nmi.h>
++ #include <linux/sched/wake_q.h>
+  
+  /*
+   * Structure to determine completion condition and record errors.  May
+@@@ -91,11 -84,13 +94,19 @@@ static bool cpu_stop_queue_work(unsigne
+  	spin_lock_irqsave(&stopper->lock, flags);
+  	enabled = stopper->enabled;
+  	if (enabled)
+++<<<<<<< HEAD
+ +		__cpu_stop_queue_work(stopper, work);
+ +	else
+ +		cpu_stop_signal_done(work->done, false);
+++=======
++ 		__cpu_stop_queue_work(stopper, work, &wakeq);
++ 	else if (work->done)
++ 		cpu_stop_signal_done(work->done);
+++>>>>>>> 0b26351b910f (stop_machine, sched: Fix migrate_swap() vs. active_balance() deadlock)
+  	spin_unlock_irqrestore(&stopper->lock, flags);
+  
++ 	wake_up_q(&wakeq);
++ 
+  	return enabled;
+  }
+  
+@@@ -233,24 -234,44 +244,36 @@@ static int cpu_stop_queue_two_works(in
+  {
+  	struct cpu_stopper *stopper1 = per_cpu_ptr(&cpu_stopper, cpu1);
+  	struct cpu_stopper *stopper2 = per_cpu_ptr(&cpu_stopper, cpu2);
++ 	DEFINE_WAKE_Q(wakeq);
+  	int err;
+ -retry:
+ +
+ +	lg_double_lock(&stop_cpus_lock, cpu1, cpu2);
+  	spin_lock_irq(&stopper1->lock);
+  	spin_lock_nested(&stopper2->lock, SINGLE_DEPTH_NESTING);
+  
+  	err = -ENOENT;
+  	if (!stopper1->enabled || !stopper2->enabled)
+  		goto unlock;
+ -	/*
+ -	 * Ensure that if we race with __stop_cpus() the stoppers won't get
+ -	 * queued up in reverse order leading to system deadlock.
+ -	 *
+ -	 * We can't miss stop_cpus_in_progress if queue_stop_cpus_work() has
+ -	 * queued a work on cpu1 but not on cpu2, we hold both locks.
+ -	 *
+ -	 * It can be falsely true but it is safe to spin until it is cleared,
+ -	 * queue_stop_cpus_work() does everything under preempt_disable().
+ -	 */
+ -	err = -EDEADLK;
+ -	if (unlikely(stop_cpus_in_progress))
+ -			goto unlock;
+  
+  	err = 0;
+- 	__cpu_stop_queue_work(stopper1, work1);
+- 	__cpu_stop_queue_work(stopper2, work2);
++ 	__cpu_stop_queue_work(stopper1, work1, &wakeq);
++ 	__cpu_stop_queue_work(stopper2, work2, &wakeq);
+  unlock:
+  	spin_unlock(&stopper2->lock);
+  	spin_unlock_irq(&stopper1->lock);
+ +	lg_double_unlock(&stop_cpus_lock, cpu1, cpu2);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(err == -EDEADLK)) {
++ 		while (stop_cpus_in_progress)
++ 			cpu_relax();
++ 		goto retry;
++ 	}
++ 
++ 	wake_up_q(&wakeq);
++ 
+++>>>>>>> 0b26351b910f (stop_machine, sched: Fix migrate_swap() vs. active_balance() deadlock)
+  	return err;
+  }
+  /**
+* Unmerged path kernel/stop_machine.c
