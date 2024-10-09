@@ -1,0 +1,165 @@
+mm/mempolicy.c: merge alloc_hugepage_vma to alloc_pages_vma
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] mempolicy.c: merge alloc_hugepage_vma to alloc_pages_vma (Aaron Tomlin) [1425895]
+Rebuild_FUZZ: 97.39%
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit be97a41b291e495d6cb767b3ee0f84ed05804892
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/be97a41b.failed
+
+The previous commit ("mm/thp: Allocate transparent hugepages on local
+node") introduced alloc_hugepage_vma() to mm/mempolicy.c to perform a
+special policy for THP allocations.  The function has the same interface
+as alloc_pages_vma(), shares a lot of boilerplate code and a long
+comment.
+
+This patch merges the hugepage special case into alloc_pages_vma.  The
+extra if condition should be cheap enough price to pay.  We also prevent
+a (however unlikely) race with parallel mems_allowed update, which could
+make hugepage allocation restart only within the fallback call to
+alloc_hugepage_vma() and not reconsider the special rule in
+alloc_hugepage_vma().
+
+Also by making sure mpol_cond_put(pol) is always called before actual
+allocation attempt, we can use a single exit path within the function.
+
+Also update the comment for missing node parameter and obsolete reference
+to mm_sem.
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit be97a41b291e495d6cb767b3ee0f84ed05804892)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/gfp.h
+diff --cc include/linux/gfp.h
+index 47776f9f1c83,51bd1e72a917..000000000000
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@@ -352,19 -334,27 +352,25 @@@ alloc_pages(gfp_t gfp_mask, unsigned in
+  }
+  extern struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
+  			struct vm_area_struct *vma, unsigned long addr,
+++<<<<<<< HEAD
+ +			int node);
+++=======
++ 			int node, bool hugepage);
++ #define alloc_hugepage_vma(gfp_mask, vma, addr, order)	\
++ 	alloc_pages_vma(gfp_mask, order, vma, addr, numa_node_id(), true)
+++>>>>>>> be97a41b291e (mm/mempolicy.c: merge alloc_hugepage_vma to alloc_pages_vma)
+  #else
+  #define alloc_pages(gfp_mask, order) \
+  		alloc_pages_node(numa_node_id(), gfp_mask, order)
+- #define alloc_pages_vma(gfp_mask, order, vma, addr, node)	\
++ #define alloc_pages_vma(gfp_mask, order, vma, addr, node, false)\
+  	alloc_pages(gfp_mask, order)
+ -#define alloc_hugepage_vma(gfp_mask, vma, addr, order)	\
+ -	alloc_pages(gfp_mask, order)
+  #endif
+  #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
+  #define alloc_page_vma(gfp_mask, vma, addr)			\
+- 	alloc_pages_vma(gfp_mask, 0, vma, addr, numa_node_id())
++ 	alloc_pages_vma(gfp_mask, 0, vma, addr, numa_node_id(), false)
+  #define alloc_page_vma_node(gfp_mask, vma, addr, node)		\
+- 	alloc_pages_vma(gfp_mask, 0, vma, addr, node)
++ 	alloc_pages_vma(gfp_mask, 0, vma, addr, node, false)
+  
+ -extern struct page *alloc_kmem_pages(gfp_t gfp_mask, unsigned int order);
+ -extern struct page *alloc_kmem_pages_node(int nid, gfp_t gfp_mask,
+ -					  unsigned int order);
+ -
+  extern unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
+  extern unsigned long get_zeroed_page(gfp_t gfp_mask);
+  
+* Unmerged path include/linux/gfp.h
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index b7e8a843647a..4f9a0760e7f2 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2036,43 +2036,63 @@ static struct page *alloc_page_interleave(gfp_t gfp, unsigned order,
+  *	@order:Order of the GFP allocation.
+  * 	@vma:  Pointer to VMA or NULL if not available.
+  *	@addr: Virtual Address of the allocation. Must be inside the VMA.
++ *	@node: Which node to prefer for allocation (modulo policy).
++ *	@hugepage: for hugepages try only the preferred node if possible
+  *
+  * 	This function allocates a page from the kernel page pool and applies
+  *	a NUMA policy associated with the VMA or the current process.
+  *	When VMA is not NULL caller must hold down_read on the mmap_sem of the
+  *	mm_struct of the VMA to prevent it from going away. Should be used for
+- *	all allocations for pages that will be mapped into
+- * 	user space. Returns NULL when no page can be allocated.
+- *
+- *	Should be called with the mm_sem of the vma hold.
++ *	all allocations for pages that will be mapped into user space. Returns
++ *	NULL when no page can be allocated.
+  */
+ struct page *
+ alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+-		unsigned long addr, int node)
++		unsigned long addr, int node, bool hugepage)
+ {
+ 	struct mempolicy *pol;
+ 	struct page *page;
+ 	unsigned int cpuset_mems_cookie;
++	struct zonelist *zl;
++	nodemask_t *nmask;
+ 
+ retry_cpuset:
+ 	pol = get_vma_policy(current, vma, addr);
+ 	cpuset_mems_cookie = read_mems_allowed_begin();
+ 
+-	if (unlikely(pol->mode == MPOL_INTERLEAVE)) {
++	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage &&
++					pol->mode != MPOL_INTERLEAVE)) {
++		/*
++		 * For hugepage allocation and non-interleave policy which
++		 * allows the current node, we only try to allocate from the
++		 * current node and don't fall back to other nodes, as the
++		 * cost of remote accesses would likely offset THP benefits.
++		 *
++		 * If the policy is interleave, or does not allow the current
++		 * node in its nodemask, we allocate the standard way.
++		 */
++		nmask = policy_nodemask(gfp, pol);
++		if (!nmask || node_isset(node, *nmask)) {
++			mpol_cond_put(pol);
++			page = alloc_pages_exact_node(node, gfp, order);
++			goto out;
++		}
++	}
++
++	if (pol->mode == MPOL_INTERLEAVE) {
+ 		unsigned nid;
+ 
+ 		nid = interleave_nid(pol, vma, addr, PAGE_SHIFT + order);
+ 		mpol_cond_put(pol);
+ 		page = alloc_page_interleave(gfp, order, nid);
+-		if (unlikely(!page && read_mems_allowed_retry(cpuset_mems_cookie)))
+-			goto retry_cpuset;
+-
+-		return page;
++		goto out;
+ 	}
+-	page = __alloc_pages_nodemask(gfp, order,
+-				      policy_zonelist(gfp, pol, node),
+-				      policy_nodemask(gfp, pol));
++
++	nmask = policy_nodemask(gfp, pol);
++	zl = policy_zonelist(gfp, pol, node);
+ 	mpol_cond_put(pol);
++	page = __alloc_pages_nodemask(gfp, order, zl, nmask);
++out:
+ 	if (unlikely(!page && read_mems_allowed_retry(cpuset_mems_cookie)))
+ 		goto retry_cpuset;
+ 	return page;
