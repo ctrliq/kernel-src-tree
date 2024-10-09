@@ -1,0 +1,95 @@
+IB/mlx4: Take source GID by index from HW GID table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Talat Batheesh <talatb@mellanox.com>
+commit a748d60df32ec5da31626a140be1795eefa04282
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a748d60d.failed
+
+Previously, we used the HW GID index in order to search the source GID
+in the software GID cached table. In some cases, for example when
+the MAC Address of the network interface is changed, the GID cached table
+saves the old-IPv6-link-local GID at the end of the table.
+
+When returning the old MAC address, the software GID cached table tries
+to add the new IPv6-link-local GID, and when it identifies that the GID
+already exists, the software GID cached does not add it. Thus a mismatch
+occurs between the HW and the SW GID tables.
+
+It resulted with sending traffic with the wrong source GID.
+
+This commit fixes the issue by taking both from the HW table.
+
+The problem can be reproduced with the following scenario:
+Client:
+    # ifconfig ens6 2.2.2.5
+    # ifconfig ens6 inet6 add 2001:0db8:0:f101::5/64
+    # ifconfig ens6 hw ether f4:52:14:61:a0:71
+    # ifconfig ens6 inet6 del 2001:0db8:0:f101::5/64
+    # ifconfig ens6 inet6 add 2001:0db8:0:f101::5/64
+    # ucmatose -f ipv6 -b 2001:0db8:0:f101::5 -s 2001:0db8:0:f101::6 -p 20156
+Server:
+    # ucmatose -f ipv6 -b 2001:0db8:0:f101::6 -p 20156
+
+Fixes: 4c3eb3ca1396 ('IB/mlx4: Add VLAN support for IBoE')
+	Signed-off-by: Talat Batheesh <talatb@mellanox.com>
+	Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit a748d60df32ec5da31626a140be1795eefa04282)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx4/qp.c
+diff --cc drivers/infiniband/hw/mlx4/qp.c
+index 2eeb6545050a,4f50b96fe605..000000000000
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@@ -2408,6 -2408,41 +2408,44 @@@ static int build_sriov_qp0_header(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 sl_to_vl(struct mlx4_ib_dev *dev, u8 sl, int port_num)
++ {
++ 	union sl2vl_tbl_to_u64 tmp_vltab;
++ 	u8 vl;
++ 
++ 	if (sl > 15)
++ 		return 0xf;
++ 	tmp_vltab.sl64 = atomic64_read(&dev->sl2vl[port_num - 1]);
++ 	vl = tmp_vltab.sl8[sl >> 1];
++ 	if (sl & 1)
++ 		vl &= 0x0f;
++ 	else
++ 		vl >>= 4;
++ 	return vl;
++ }
++ 
++ static int fill_gid_by_hw_index(struct mlx4_ib_dev *ibdev, u8 port_num,
++ 				int index, union ib_gid *gid,
++ 				enum ib_gid_type *gid_type)
++ {
++ 	struct mlx4_ib_iboe *iboe = &ibdev->iboe;
++ 	struct mlx4_port_gid_table *port_gid_table;
++ 	unsigned long flags;
++ 
++ 	port_gid_table = &iboe->gids[port_num - 1];
++ 	spin_lock_irqsave(&iboe->lock, flags);
++ 	memcpy(gid, &port_gid_table->gids[index].gid, sizeof(*gid));
++ 	*gid_type = port_gid_table->gids[index].gid_type;
++ 	spin_unlock_irqrestore(&iboe->lock, flags);
++ 	if (!memcmp(gid, &zgid, sizeof(*gid)))
++ 		return -ENOENT;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> a748d60df32e (IB/mlx4: Take source GID by index from HW GID table)
+  #define MLX4_ROCEV2_QP1_SPORT 0xC000
+  static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_ud_wr *wr,
+  			    void *wqe, unsigned *mlx_seg_len)
+* Unmerged path drivers/infiniband/hw/mlx4/qp.c
