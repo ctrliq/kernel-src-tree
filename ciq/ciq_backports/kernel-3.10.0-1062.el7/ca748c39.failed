@@ -1,0 +1,377 @@
+RDMA/umem: Get rid of per_mm->notifier_count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit ca748c39ea3f3c755295d64d69ba0b4375e34b5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ca748c39.failed
+
+This is intrinsically racy and the scheme is simply unnecessary. New MR
+registration can wait for any on going invalidation to fully complete.
+
+      CPU0                              CPU1
+                                  if (atomic_read())
+ if (atomic_dec_and_test() &&
+     !list_empty())
+  { /* not taken */ }
+                                       list_add()
+
+Putting the new UMEM into some kind of purgatory until another invalidate
+rolls through..
+
+Instead hold the read side of the umem_rwsem across the pair'd start/end
+and get rid of the racy 'deferred add' approach.
+
+Since all umem's in the rbt are always ready to go, also get rid of the
+mn_counters_active stuff.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ca748c39ea3f3c755295d64d69ba0b4375e34b5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+#	include/rdma/ib_umem_odp.h
+diff --cc drivers/infiniband/core/umem_odp.c
+index 505862826f1c,1c0c4a431218..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -112,48 -103,6 +101,51 @@@ static void ib_umem_notifier_end_accoun
+  	mutex_unlock(&umem_odp->umem_mutex);
+  }
+  
+++<<<<<<< HEAD
+ +/* Account for a new mmu notifier in an ib_ucontext. */
+ +static void ib_ucontext_notifier_start_account(struct ib_ucontext *context)
+ +{
+ +	atomic_inc(&context->notifier_count);
+ +}
+ +
+ +/* Account for a terminating mmu notifier in an ib_ucontext.
+ + *
+ + * Must be called with the ib_ucontext->umem_rwsem semaphore unlocked, since
+ + * the function takes the semaphore itself. */
+ +static void ib_ucontext_notifier_end_account(struct ib_ucontext *context)
+ +{
+ +	int zero_notifiers = atomic_dec_and_test(&context->notifier_count);
+ +
+ +	if (zero_notifiers &&
+ +	    !list_empty(&context->no_private_counters)) {
+ +		/* No currently running mmu notifiers. Now is the chance to
+ +		 * add private accounting to all previously added umems. */
+ +		struct ib_umem_odp *odp_data, *next;
+ +
+ +		/* Prevent concurrent mmu notifiers from working on the
+ +		 * no_private_counters list. */
+ +		down_write(&context->umem_rwsem);
+ +
+ +		/* Read the notifier_count again, with the umem_rwsem
+ +		 * semaphore taken for write. */
+ +		if (!atomic_read(&context->notifier_count)) {
+ +			list_for_each_entry_safe(odp_data, next,
+ +						 &context->no_private_counters,
+ +						 no_private_counters) {
+ +				mutex_lock(&odp_data->umem_mutex);
+ +				odp_data->mn_counters_active = true;
+ +				list_del(&odp_data->no_private_counters);
+ +				complete_all(&odp_data->notifier_completion);
+ +				mutex_unlock(&odp_data->umem_mutex);
+ +			}
+ +		}
+ +
+ +		up_write(&context->umem_rwsem);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  static int ib_umem_notifier_release_trampoline(struct ib_umem_odp *umem_odp,
+  					       u64 start, u64 end, void *cookie)
+  {
+@@@ -177,18 -126,19 +169,23 @@@
+  static void ib_umem_notifier_release(struct mmu_notifier *mn,
+  				     struct mm_struct *mm)
+  {
+ -	struct ib_ucontext_per_mm *per_mm =
+ -		container_of(mn, struct ib_ucontext_per_mm, mn);
+ +	struct ib_ucontext *context = container_of(mn, struct ib_ucontext, mn);
+  
+ -	if (!per_mm->context->invalidate_range)
+ +	if (!context->invalidate_range)
+  		return;
+  
+++<<<<<<< HEAD
+ +	ib_ucontext_notifier_start_account(context);
+ +	down_read(&context->umem_rwsem);
+ +	rbt_ib_umem_for_each_in_range(&context->umem_tree, 0,
+++=======
++ 	down_read(&per_mm->umem_rwsem);
++ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, 0,
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  				      ULLONG_MAX,
+  				      ib_umem_notifier_release_trampoline,
+ -				      true,
+  				      NULL);
+ -	up_read(&per_mm->umem_rwsem);
+ +	up_read(&context->umem_rwsem);
+  }
+  
+  static int invalidate_page_trampoline(struct ib_umem_odp *item, u64 start,
+@@@ -208,22 -158,27 +205,33 @@@ static int invalidate_range_start_tramp
+  	return 0;
+  }
+  
+ -static int ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +static void ib_umem_notifier_invalidate_range_start(struct mmu_notifier *mn,
+  						    struct mm_struct *mm,
+  						    unsigned long start,
+ -						    unsigned long end,
+ -						    bool blockable)
+ +						    unsigned long end)
+  {
+ -	struct ib_ucontext_per_mm *per_mm =
+ -		container_of(mn, struct ib_ucontext_per_mm, mn);
+ -	int ret;
+ +	struct ib_ucontext *context = container_of(mn, struct ib_ucontext, mn);
+  
+ -	if (!per_mm->context->invalidate_range)
+ -		return 0;
+ +	if (!context->invalidate_range)
+ +		return;
+  
+++<<<<<<< HEAD
+ +	ib_ucontext_notifier_start_account(context);
+ +	down_read(&context->umem_rwsem);
+ +	rbt_ib_umem_for_each_in_range(&context->umem_tree, start,
+ +				      end,
+ +				      invalidate_range_start_trampoline, NULL);
+ +	up_read(&context->umem_rwsem);
+++=======
++ 	if (blockable)
++ 		down_read(&per_mm->umem_rwsem);
++ 	else if (!down_read_trylock(&per_mm->umem_rwsem))
++ 		return -EAGAIN;
++ 
++ 	return rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start, end,
++ 					     invalidate_range_start_trampoline,
++ 					     blockable, NULL);
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  }
+  
+  static int invalidate_range_end_trampoline(struct ib_umem_odp *item, u64 start,
+@@@ -238,17 -193,16 +246,24 @@@ static void ib_umem_notifier_invalidate
+  						  unsigned long start,
+  						  unsigned long end)
+  {
+ -	struct ib_ucontext_per_mm *per_mm =
+ -		container_of(mn, struct ib_ucontext_per_mm, mn);
+ +	struct ib_ucontext *context = container_of(mn, struct ib_ucontext, mn);
+  
+ -	if (!per_mm->context->invalidate_range)
+ +	if (!context->invalidate_range)
+  		return;
+  
+++<<<<<<< HEAD
+ +	down_read(&context->umem_rwsem);
+ +	rbt_ib_umem_for_each_in_range(&context->umem_tree, start,
+ +				      end,
+ +				      invalidate_range_end_trampoline, NULL);
+ +	up_read(&context->umem_rwsem);
+ +	ib_ucontext_notifier_end_account(context);
+++=======
++ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
++ 				      end,
++ 				      invalidate_range_end_trampoline, true, NULL);
++ 	up_read(&per_mm->umem_rwsem);
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  }
+  
+  static const struct mmu_notifier_ops ib_umem_notifiers = {
+@@@ -257,11 -211,127 +272,130 @@@
+  	.invalidate_range_end       = ib_umem_notifier_invalidate_range_end,
+  };
+  
+++<<<<<<< HEAD
+ +struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext *context,
+++=======
++ static void add_umem_to_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_umem *umem = &umem_odp->umem;
++ 
++ 	down_write(&per_mm->umem_rwsem);
++ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
++ 		rbt_ib_umem_insert(&umem_odp->interval_tree,
++ 				   &per_mm->umem_tree);
++ 	up_write(&per_mm->umem_rwsem);
++ }
++ 
++ static void remove_umem_from_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_umem *umem = &umem_odp->umem;
++ 
++ 	down_write(&per_mm->umem_rwsem);
++ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
++ 		rbt_ib_umem_remove(&umem_odp->interval_tree,
++ 				   &per_mm->umem_tree);
++ 	complete_all(&umem_odp->notifier_completion);
++ 
++ 	up_write(&per_mm->umem_rwsem);
++ }
++ 
++ static struct ib_ucontext_per_mm *alloc_per_mm(struct ib_ucontext *ctx,
++ 					       struct mm_struct *mm)
++ {
++ 	struct ib_ucontext_per_mm *per_mm;
++ 	int ret;
++ 
++ 	per_mm = kzalloc(sizeof(*per_mm), GFP_KERNEL);
++ 	if (!per_mm)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	per_mm->context = ctx;
++ 	per_mm->mm = mm;
++ 	per_mm->umem_tree = RB_ROOT_CACHED;
++ 	init_rwsem(&per_mm->umem_rwsem);
++ 
++ 	rcu_read_lock();
++ 	per_mm->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
++ 	rcu_read_unlock();
++ 
++ 	WARN_ON(mm != current->mm);
++ 
++ 	per_mm->mn.ops = &ib_umem_notifiers;
++ 	ret = mmu_notifier_register(&per_mm->mn, per_mm->mm);
++ 	if (ret) {
++ 		dev_err(&ctx->device->dev,
++ 			"Failed to register mmu_notifier %d\n", ret);
++ 		goto out_pid;
++ 	}
++ 
++ 	list_add(&per_mm->ucontext_list, &ctx->per_mm_list);
++ 	return per_mm;
++ 
++ out_pid:
++ 	put_pid(per_mm->tgid);
++ 	kfree(per_mm);
++ 	return ERR_PTR(ret);
++ }
++ 
++ static int get_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext *ctx = umem_odp->umem.context;
++ 	struct ib_ucontext_per_mm *per_mm;
++ 
++ 	/*
++ 	 * Generally speaking we expect only one or two per_mm in this list,
++ 	 * so no reason to optimize this search today.
++ 	 */
++ 	mutex_lock(&ctx->per_mm_list_lock);
++ 	list_for_each_entry(per_mm, &ctx->per_mm_list, ucontext_list) {
++ 		if (per_mm->mm == umem_odp->umem.owning_mm)
++ 			goto found;
++ 	}
++ 
++ 	per_mm = alloc_per_mm(ctx, umem_odp->umem.owning_mm);
++ 	if (IS_ERR(per_mm)) {
++ 		mutex_unlock(&ctx->per_mm_list_lock);
++ 		return PTR_ERR(per_mm);
++ 	}
++ 
++ found:
++ 	umem_odp->per_mm = per_mm;
++ 	per_mm->odp_mrs_count++;
++ 	mutex_unlock(&ctx->per_mm_list_lock);
++ 
++ 	return 0;
++ }
++ 
++ void put_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_ucontext *ctx = umem_odp->umem.context;
++ 	bool need_free;
++ 
++ 	mutex_lock(&ctx->per_mm_list_lock);
++ 	umem_odp->per_mm = NULL;
++ 	per_mm->odp_mrs_count--;
++ 	need_free = per_mm->odp_mrs_count == 0;
++ 	if (need_free)
++ 		list_del(&per_mm->ucontext_list);
++ 	mutex_unlock(&ctx->per_mm_list_lock);
++ 
++ 	if (!need_free)
++ 		return;
++ 
++ 	mmu_notifier_unregister(&per_mm->mn, per_mm->mm);
++ 	put_pid(per_mm->tgid);
++ 	kfree(per_mm);
++ }
++ 
++ struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext_per_mm *per_mm,
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  				      unsigned long addr, size_t size)
+  {
+ -	struct ib_ucontext *ctx = per_mm->context;
+ -	struct ib_umem_odp *odp_data;
+  	struct ib_umem *umem;
+ +	struct ib_umem_odp *odp_data;
+  	int pages = size >> PAGE_SHIFT;
+  	int ret;
+  
+diff --cc include/rdma/ib_umem_odp.h
+index cbe16c505673,ce9502545903..000000000000
+--- a/include/rdma/ib_umem_odp.h
++++ b/include/rdma/ib_umem_odp.h
+@@@ -67,13 -70,6 +67,14 @@@ struct ib_umem_odp 
+  	int notifiers_seq;
+  	int notifiers_count;
+  
+++<<<<<<< HEAD
+ +	/* A linked list of umems that don't have private mmu notifier
+ +	 * counters yet. */
+ +	struct list_head no_private_counters;
+ +	struct ib_umem		*umem;
+ +
+++=======
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  	/* Tree tracking */
+  	struct umem_odp_node	interval_tree;
+  
+@@@ -89,9 -85,23 +90,29 @@@ static inline struct ib_umem_odp *to_ib
+  
+  #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+  
+++<<<<<<< HEAD
+ +int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem,
+ +		    int access);
+ +struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext *context,
+++=======
++ struct ib_ucontext_per_mm {
++ 	struct ib_ucontext *context;
++ 	struct mm_struct *mm;
++ 	struct pid *tgid;
++ 
++ 	struct rb_root_cached umem_tree;
++ 	/* Protects umem_tree */
++ 	struct rw_semaphore umem_rwsem;
++ 
++ 	struct mmu_notifier mn;
++ 	unsigned int odp_mrs_count;
++ 
++ 	struct list_head ucontext_list;
++ };
++ 
++ int ib_umem_odp_get(struct ib_umem_odp *umem_odp, int access);
++ struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext_per_mm *per_mm,
+++>>>>>>> ca748c39ea3f (RDMA/umem: Get rid of per_mm->notifier_count)
+  				      unsigned long addr, size_t size);
+  void ib_umem_odp_release(struct ib_umem_odp *umem_odp);
+  
+* Unmerged path drivers/infiniband/core/umem_odp.c
+* Unmerged path include/rdma/ib_umem_odp.h
