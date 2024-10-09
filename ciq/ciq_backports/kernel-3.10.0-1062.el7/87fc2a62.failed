@@ -1,0 +1,279 @@
+RDMA/uverbs: Store the specs_root in the struct ib_uverbs_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 87fc2a620a398e970872064841b0db7cc6d0149f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/87fc2a62.failed
+
+The specs are required to operate the uverbs file, so they belong inside
+the ib_uverbs_device, not inside the ib_device. The spec passed in the
+ib_device is just a communication from the driver and should not be used
+during runtime.
+
+This also changes the lifetime of the spec memory to match the
+ib_uverbs_device, however at this time the spec_root can still contain
+driver pointers after disassociation, so it cannot be used if ib_dev is
+NULL. This is preparation for another series.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 87fc2a620a398e970872064841b0db7cc6d0149f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,785975a4e3dd..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -341,7 -362,10 +339,14 @@@ static long ib_uverbs_cmd_verbs(struct 
+  	size_t ctx_size;
+  	uintptr_t data[UVERBS_OPTIMIZE_USING_STACK_SZ / sizeof(uintptr_t)];
+  
+++<<<<<<< HEAD
+ +	object_spec = uverbs_get_object(ib_dev, hdr->object_id);
+++=======
++ 	if (hdr->driver_id != ib_dev->driver_id)
++ 		return -EINVAL;
++ 
++ 	object_spec = uverbs_get_object(file, hdr->object_id);
+++>>>>>>> 87fc2a620a39 (RDMA/uverbs: Store the specs_root in the struct ib_uverbs_device)
+  	if (!object_spec)
+  		return -EPROTONOSUPPORT;
+  
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index caab7cc36fbe,0fb80777aade..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4475,7 -5315,123 +4475,127 @@@ static void mlx5_ib_cleanup_multiport_m
+  	mlx5_nic_vport_disable_roce(dev->mdev);
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+++=======
++ ADD_UVERBS_ATTRIBUTES_SIMPLE(mlx5_ib_dm, UVERBS_OBJECT_DM,
++ 			     UVERBS_METHOD_DM_ALLOC,
++ 			     &UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET,
++ 						  UVERBS_ATTR_TYPE(u64),
++ 						  UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
++ 			     &UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_PAGE_INDEX,
++ 						  UVERBS_ATTR_TYPE(u16),
++ 						  UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
++ 
++ ADD_UVERBS_ATTRIBUTES_SIMPLE(mlx5_ib_flow_action, UVERBS_OBJECT_FLOW_ACTION,
++ 			     UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
++ 			     &UVERBS_ATTR_PTR_IN(MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS,
++ 						 UVERBS_ATTR_TYPE(u64),
++ 						 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
++ 
++ #define NUM_TREES	3
++ static int populate_specs_root(struct mlx5_ib_dev *dev)
++ {
++ 	const struct uverbs_object_tree_def *default_root[NUM_TREES + 1] = {
++ 		uverbs_default_get_objects()};
++ 	size_t num_trees = 1;
++ 
++ 	if (mlx5_accel_ipsec_device_caps(dev->mdev) & MLX5_ACCEL_IPSEC_CAP_DEVICE &&
++ 	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++ 		default_root[num_trees++] = &mlx5_ib_flow_action;
++ 
++ 	if (MLX5_CAP_DEV_MEM(dev->mdev, memic) &&
++ 	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++ 		default_root[num_trees++] = &mlx5_ib_dm;
++ 
++ 	if (MLX5_CAP_GEN_64(dev->mdev, general_obj_types) &
++ 			    MLX5_GENERAL_OBJ_TYPES_CAP_UCTX &&
++ 	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++ 		default_root[num_trees++] = mlx5_ib_get_devx_tree();
++ 
++ 	dev->ib_dev.driver_specs_root =
++ 		uverbs_alloc_spec_tree(num_trees, default_root);
++ 
++ 	return PTR_ERR_OR_ZERO(dev->ib_dev.driver_specs_root);
++ }
++ 
++ static void depopulate_specs_root(struct mlx5_ib_dev *dev)
++ {
++ 	uverbs_free_spec_tree(dev->ib_dev.driver_specs_root);
++ }
++ 
++ static int mlx5_ib_read_counters(struct ib_counters *counters,
++ 				 struct ib_counters_read_attr *read_attr,
++ 				 struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_mcounters *mcounters = to_mcounters(counters);
++ 	struct mlx5_read_counters_attr mread_attr = {};
++ 	struct mlx5_ib_flow_counters_desc *desc;
++ 	int ret, i;
++ 
++ 	mutex_lock(&mcounters->mcntrs_mutex);
++ 	if (mcounters->cntrs_max_index > read_attr->ncounters) {
++ 		ret = -EINVAL;
++ 		goto err_bound;
++ 	}
++ 
++ 	mread_attr.out = kcalloc(mcounters->counters_num, sizeof(u64),
++ 				 GFP_KERNEL);
++ 	if (!mread_attr.out) {
++ 		ret = -ENOMEM;
++ 		goto err_bound;
++ 	}
++ 
++ 	mread_attr.hw_cntrs_hndl = mcounters->hw_cntrs_hndl;
++ 	mread_attr.flags = read_attr->flags;
++ 	ret = mcounters->read_counters(counters->device, &mread_attr);
++ 	if (ret)
++ 		goto err_read;
++ 
++ 	/* do the pass over the counters data array to assign according to the
++ 	 * descriptions and indexing pairs
++ 	 */
++ 	desc = mcounters->counters_data;
++ 	for (i = 0; i < mcounters->ncounters; i++)
++ 		read_attr->counters_buff[desc[i].index] += mread_attr.out[desc[i].description];
++ 
++ err_read:
++ 	kfree(mread_attr.out);
++ err_bound:
++ 	mutex_unlock(&mcounters->mcntrs_mutex);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_destroy_counters(struct ib_counters *counters)
++ {
++ 	struct mlx5_ib_mcounters *mcounters = to_mcounters(counters);
++ 
++ 	counters_clear_description(counters);
++ 	if (mcounters->hw_cntrs_hndl)
++ 		mlx5_fc_destroy(to_mdev(counters->device)->mdev,
++ 				mcounters->hw_cntrs_hndl);
++ 
++ 	kfree(mcounters);
++ 
++ 	return 0;
++ }
++ 
++ static struct ib_counters *mlx5_ib_create_counters(struct ib_device *device,
++ 						   struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_mcounters *mcounters;
++ 
++ 	mcounters = kzalloc(sizeof(*mcounters), GFP_KERNEL);
++ 	if (!mcounters)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	mutex_init(&mcounters->mcntrs_mutex);
++ 
++ 	return &mcounters->ibcntrs;
++ }
++ 
++ void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+++>>>>>>> 87fc2a620a39 (RDMA/uverbs: Store the specs_root in the struct ib_uverbs_device)
+  {
+  	mlx5_ib_cleanup_multiport_master(dev);
+  #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+diff --cc include/rdma/ib_verbs.h
+index d90947756c9b,8784d5bfc252..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2492,7 -2602,8 +2492,12 @@@ struct ib_device 
+  	const struct cpumask *(*get_vector_affinity)(struct ib_device *ibdev,
+  						     int comp_vector);
+  
+++<<<<<<< HEAD
+ +	struct uverbs_root_spec		*specs_root;
+++=======
++ 	struct uverbs_root_spec		*driver_specs_root;
++ 	enum rdma_driver_id		driver_id;
+++>>>>>>> 87fc2a620a39 (RDMA/uverbs: Store the specs_root in the struct ib_uverbs_device)
+  };
+  
+  struct ib_client {
+diff --git a/drivers/infiniband/core/rdma_core.c b/drivers/infiniband/core/rdma_core.c
+index 1cd838e607bd..347f90c02c9d 100644
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -52,10 +52,10 @@ int uverbs_ns_idx(u16 *id, unsigned int ns_count)
+ 	return ret;
+ }
+ 
+-const struct uverbs_object_spec *uverbs_get_object(const struct ib_device *ibdev,
++const struct uverbs_object_spec *uverbs_get_object(struct ib_uverbs_file *ufile,
+ 						   uint16_t object)
+ {
+-	const struct uverbs_root_spec *object_hash = ibdev->specs_root;
++	const struct uverbs_root_spec *object_hash = ufile->device->specs_root;
+ 	const struct uverbs_object_spec_hash *objects;
+ 	int ret = uverbs_ns_idx(&object, object_hash->num_buckets);
+ 
+diff --git a/drivers/infiniband/core/rdma_core.h b/drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7..8cede4546b25 100644
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -44,7 +44,7 @@
+ #include <linux/mutex.h>
+ 
+ int uverbs_ns_idx(u16 *id, unsigned int ns_count);
+-const struct uverbs_object_spec *uverbs_get_object(const struct ib_device *ibdev,
++const struct uverbs_object_spec *uverbs_get_object(struct ib_uverbs_file *ufile,
+ 						   uint16_t object);
+ const struct uverbs_method_spec *uverbs_get_method(const struct uverbs_object_spec *object,
+ 						   uint16_t method);
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 9b53f7b4a4a8..4b76a72a78ef 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -161,6 +161,7 @@ static void ib_uverbs_release_dev(struct kobject *kobj)
+ 		container_of(kobj, struct ib_uverbs_device, kobj);
+ 
+ 	cleanup_srcu_struct(&dev->disassociate_srcu);
++	uverbs_free_spec_tree(dev->specs_root);
+ 	kfree(dev);
+ }
+ 
+@@ -1070,7 +1071,7 @@ static void ib_uverbs_add_one(struct ib_device *device)
+ 	if (device_create_file(uverbs_dev->dev, &dev_attr_abi_version))
+ 		goto err_class;
+ 
+-	if (!device->specs_root) {
++	if (!device->driver_specs_root) {
+ 		const struct uverbs_object_tree_def *default_root[] = {
+ 			uverbs_default_get_objects()};
+ 
+@@ -1078,8 +1079,13 @@ static void ib_uverbs_add_one(struct ib_device *device)
+ 								default_root);
+ 		if (IS_ERR(uverbs_dev->specs_root))
+ 			goto err_class;
+-
+-		device->specs_root = uverbs_dev->specs_root;
++	} else {
++		uverbs_dev->specs_root = device->driver_specs_root;
++		/*
++		 * Take responsibility to free the specs allocated by the
++		 * driver.
++		 */
++		device->driver_specs_root = NULL;
+ 	}
+ 
+ 	ib_set_client_data(device, &uverbs_client, uverbs_dev);
+@@ -1244,10 +1250,6 @@ static void ib_uverbs_remove_one(struct ib_device *device, void *client_data)
+ 		ib_uverbs_comp_dev(uverbs_dev);
+ 	if (wait_clients)
+ 		wait_for_completion(&uverbs_dev->comp);
+-	if (uverbs_dev->specs_root) {
+-		uverbs_free_spec_tree(uverbs_dev->specs_root);
+-		device->specs_root = NULL;
+-	}
+ 
+ 	kobject_put(&uverbs_dev->kobj);
+ }
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path include/rdma/ib_verbs.h
