@@ -1,0 +1,153 @@
+drm/i915/bxt+: Enable IPC support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kumar, Mahesh <mahesh1.kumar@intel.com>
+commit 2503a0fef214ddadfdf5844d62453591de35586f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2503a0fe.failed
+
+This patch adds IPC support. This patch also enables IPC in all supported
+platforms based on has_ipc flag.
+IPC (Isochronous Priority Control) is the hardware feature, which
+dynamically controls the memory read priority of Display.
+
+When IPC is enabled, plane read requests are sent at high priority until
+filling above the transition watermark, then the requests are sent at
+lower priority until dropping below the level 0 watermark.
+The lower priority requests allow other memory clients to have better
+memory access. When IPC is disabled, all plane read requests are sent at
+high priority.
+
+Changes since V1:
+ - Remove commandline parameter to disable ipc
+ - Address Paulo's comments
+Changes since V2:
+ - Address review comments
+ - Set ipc_enabled flag
+Changes since V3:
+ - move ipc_enabled flag assignment inside intel_ipc_enable function
+Changes since V4:
+ - Re-enable IPC after suspend/resume
+Changes since V5:
+ - Enable IPC for all gen >=9 except SKL
+Changes since V6:
+ - fix commit msg
+ - after resume program IPC based on SW state.
+Changes since V7:
+ - Modify IPC support check based on HAS_IPC macro (suggested by Chris)
+
+	Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170817134529.2839-8-mahesh1.kumar@intel.com
+(cherry picked from commit 2503a0fef214ddadfdf5844d62453591de35586f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_drv.c
+#	drivers/gpu/drm/i915/intel_drv.h
+diff --cc drivers/gpu/drm/i915/i915_drv.c
+index dced530a65ff,5c111ea96e80..000000000000
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@@ -1256,10 -1341,8 +1256,15 @@@ int i915_driver_load(struct pci_dev *pd
+  
+  	intel_runtime_pm_enable(dev_priv);
+  
+++<<<<<<< HEAD
+ +	/* Everything is in place, we can now relax! */
+ +	DRM_INFO("Initialized %s %d.%d.%d %s for %s on minor %d\n",
+ +		 driver.name, driver.major, driver.minor, driver.patchlevel,
+ +		 driver.date, pci_name(pdev), dev_priv->drm.primary->index);
+++=======
++ 	intel_init_ipc(dev_priv);
++ 
+++>>>>>>> 2503a0fef214 (drm/i915/bxt+: Enable IPC support)
+  	if (IS_ENABLED(CONFIG_DRM_I915_DEBUG))
+  		DRM_INFO("DRM_I915_DEBUG enabled\n");
+  	if (IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM))
+diff --cc drivers/gpu/drm/i915/intel_drv.h
+index 4b4b6889e2f0,307807672896..000000000000
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@@ -1750,9 -1894,12 +1750,16 @@@ bool skl_wm_level_equals(const struct s
+  bool skl_ddb_allocation_overlaps(const struct skl_ddb_entry **entries,
+  				 const struct skl_ddb_entry *ddb,
+  				 int ignore);
+ +uint32_t ilk_pipe_pixel_rate(const struct intel_crtc_state *pipe_config);
+  bool ilk_disable_lp_wm(struct drm_device *dev);
+  int sanitize_rc6_option(struct drm_i915_private *dev_priv, int enable_rc6);
+++<<<<<<< HEAD
+++=======
++ int skl_check_pipe_max_pixel_rate(struct intel_crtc *intel_crtc,
++ 				  struct intel_crtc_state *cstate);
++ void intel_init_ipc(struct drm_i915_private *dev_priv);
++ void intel_enable_ipc(struct drm_i915_private *dev_priv);
+++>>>>>>> 2503a0fef214 (drm/i915/bxt+: Enable IPC support)
+  static inline int intel_enable_rc6(void)
+  {
+  	return i915.enable_rc6;
+* Unmerged path drivers/gpu/drm/i915/i915_drv.c
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 0f3d05f6e549..b07a5fbad23b 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -6094,6 +6094,7 @@ enum {
+ #define  DISP_FBC_WM_DIS		(1<<15)
+ #define DISP_ARB_CTL2	_MMIO(0x45004)
+ #define  DISP_DATA_PARTITION_5_6	(1<<6)
++#define  DISP_IPC_ENABLE		(1<<3)
+ #define DBUF_CTL	_MMIO(0x45008)
+ #define  DBUF_POWER_REQUEST		(1<<31)
+ #define  DBUF_POWER_STATE		(1<<30)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index e6cdc82fc02a..19ee543028a3 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -17062,6 +17062,7 @@ void intel_display_resume(struct drm_device *dev)
+ 	if (!ret)
+ 		ret = __intel_display_resume(dev, state);
+ 
++	intel_enable_ipc(dev_priv);
+ 	drm_modeset_drop_locks(&ctx);
+ 	drm_modeset_acquire_fini(&ctx);
+ 	mutex_unlock(&dev->mode_config.mutex);
+* Unmerged path drivers/gpu/drm/i915/intel_drv.h
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 52c3abe82e2f..c426eb689ffb 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -4643,6 +4643,30 @@ void intel_update_watermarks(struct intel_crtc *crtc)
+ 		dev_priv->display.update_wm(crtc);
+ }
+ 
++void intel_enable_ipc(struct drm_i915_private *dev_priv)
++{
++	u32 val;
++
++	val = I915_READ(DISP_ARB_CTL2);
++
++	if (dev_priv->ipc_enabled)
++		val |= DISP_IPC_ENABLE;
++	else
++		val &= ~DISP_IPC_ENABLE;
++
++	I915_WRITE(DISP_ARB_CTL2, val);
++}
++
++void intel_init_ipc(struct drm_i915_private *dev_priv)
++{
++	dev_priv->ipc_enabled = false;
++	if (!HAS_IPC(dev_priv))
++		return;
++
++	dev_priv->ipc_enabled = true;
++	intel_enable_ipc(dev_priv);
++}
++
+ /*
+  * Lock protecting IPS related data structures
+  */
