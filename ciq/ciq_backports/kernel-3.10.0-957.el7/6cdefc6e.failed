@@ -1,0 +1,247 @@
+nvme: if_ready checks to fail io to deleting controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] if_ready checks to fail io to deleting controller (Ewan Milne) [1598017]
+Rebuild_FUZZ: 94.23%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 6cdefc6e2ad52170f89a8d0e8b1a1339f91834dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6cdefc6e.failed
+
+The revised if_ready checks skipped over the case of returning error when
+the controller is being deleted.  Instead it was returning BUSY, which
+caused the ios to retry, which caused the ns delete to hang waiting for
+the ios to drain.
+
+Stack trace of hang looks like:
+ kworker/u64:2   D    0    74      2 0x80000000
+ Workqueue: nvme-delete-wq nvme_delete_ctrl_work [nvme_core]
+ Call Trace:
+  ? __schedule+0x26d/0x820
+  schedule+0x32/0x80
+  blk_mq_freeze_queue_wait+0x36/0x80
+  ? remove_wait_queue+0x60/0x60
+  blk_cleanup_queue+0x72/0x160
+  nvme_ns_remove+0x106/0x140 [nvme_core]
+  nvme_remove_namespaces+0x7e/0xa0 [nvme_core]
+  nvme_delete_ctrl_work+0x4d/0x80 [nvme_core]
+  process_one_work+0x160/0x350
+  worker_thread+0x1c3/0x3d0
+  kthread+0xf5/0x130
+  ? process_one_work+0x350/0x350
+  ? kthread_bind+0x10/0x10
+  ret_from_fork+0x1f/0x30
+
+Extend nvmf_fail_nonready_command() to supply the controller pointer so
+that the controller state can be looked at. Fail any io to a controller
+that is deleting.
+
+Fixes: 3bc32bb1186c ("nvme-fabrics: refactor queue ready check")
+Fixes: 35897b920c8a ("nvme-fabrics: fix and refine state checks in __nvmf_check_ready")
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Ewan D. Milne <emilne@redhat.com>
+	Reviewed-by: Ewan D. Milne <emilne@redhat.com>
+(cherry picked from commit 6cdefc6e2ad52170f89a8d0e8b1a1339f91834dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fabrics.c
+#	drivers/nvme/host/fabrics.h
+#	drivers/nvme/host/fc.c
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/host/fabrics.c
+index a4c054fbefbd,f7efe5a58cc7..000000000000
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@@ -536,6 -536,60 +536,63 @@@ static struct nvmf_transport_ops *nvmf_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * For something we're not in a state to send to the device the default action
++  * is to busy it and retry it after the controller state is recovered.  However,
++  * if the controller is deleting or if anything is marked for failfast or
++  * nvme multipath it is immediately failed.
++  *
++  * Note: commands used to initialize the controller will be marked for failfast.
++  * Note: nvme cli/ioctl commands are marked for failfast.
++  */
++ blk_status_t nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
++ 		struct request *rq)
++ {
++ 	if (ctrl->state != NVME_CTRL_DELETING &&
++ 	    ctrl->state != NVME_CTRL_DEAD &&
++ 	    !blk_noretry_request(rq) && !(rq->cmd_flags & REQ_NVME_MPATH))
++ 		return BLK_STS_RESOURCE;
++ 	nvme_req(rq)->status = NVME_SC_ABORT_REQ;
++ 	return BLK_STS_IOERR;
++ }
++ EXPORT_SYMBOL_GPL(nvmf_fail_nonready_command);
++ 
++ bool __nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++ 		bool queue_live)
++ {
++ 	struct nvme_request *req = nvme_req(rq);
++ 
++ 	/*
++ 	 * If we are in some state of setup or teardown only allow
++ 	 * internally generated commands.
++ 	 */
++ 	if (!blk_rq_is_passthrough(rq) || (req->flags & NVME_REQ_USERCMD))
++ 		return false;
++ 
++ 	/*
++ 	 * Only allow commands on a live queue, except for the connect command,
++ 	 * which is require to set the queue live in the appropinquate states.
++ 	 */
++ 	switch (ctrl->state) {
++ 	case NVME_CTRL_NEW:
++ 	case NVME_CTRL_CONNECTING:
++ 		if (req->cmd->common.opcode == nvme_fabrics_command &&
++ 		    req->cmd->fabrics.fctype == nvme_fabrics_type_connect)
++ 			return true;
++ 		break;
++ 	default:
++ 		break;
++ 	case NVME_CTRL_DEAD:
++ 		return false;
++ 	}
++ 
++ 	return queue_live;
++ }
++ EXPORT_SYMBOL_GPL(__nvmf_check_ready);
++ 
+++>>>>>>> 6cdefc6e2ad5 (nvme: if_ready checks to fail io to deleting controller)
+  static const match_table_t opt_tokens = {
+  	{ NVMF_OPT_TRANSPORT,		"transport=%s"		},
+  	{ NVMF_OPT_TRADDR,		"traddr=%s"		},
+diff --cc drivers/nvme/host/fabrics.h
+index a8a5714322b0,aa2fdb2a2e8f..000000000000
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@@ -157,5 -162,18 +157,21 @@@ void nvmf_unregister_transport(struct n
+  void nvmf_free_options(struct nvmf_ctrl_options *opts);
+  int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size);
+  bool nvmf_should_reconnect(struct nvme_ctrl *ctrl);
+++<<<<<<< HEAD
+++=======
++ blk_status_t nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
++ 		struct request *rq);
++ bool __nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++ 		bool queue_live);
++ 
++ static inline bool nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
++ 		bool queue_live)
++ {
++ 	if (likely(ctrl->state == NVME_CTRL_LIVE ||
++ 		   ctrl->state == NVME_CTRL_ADMIN_ONLY))
++ 		return true;
++ 	return __nvmf_check_ready(ctrl, rq, queue_live);
++ }
+++>>>>>>> 6cdefc6e2ad5 (nvme: if_ready checks to fail io to deleting controller)
+  
+  #endif /* _NVME_FABRICS_H */
+diff --cc drivers/nvme/host/fc.c
+index d165c0527376,9bac912173ba..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -2353,8 -2266,13 +2353,16 @@@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *
+  	struct nvme_fc_cmd_iu *cmdiu = &op->cmd_iu;
+  	struct nvme_command *sqe = &cmdiu->sqe;
+  	enum nvmefc_fcp_datadir	io_dir;
+ -	bool queue_ready = test_bit(NVME_FC_Q_LIVE, &queue->flags);
+  	u32 data_len;
+++<<<<<<< HEAD
+ +	int ret;
+++=======
++ 	blk_status_t ret;
++ 
++ 	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE ||
++ 	    !nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
++ 		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
+++>>>>>>> 6cdefc6e2ad5 (nvme: if_ready checks to fail io to deleting controller)
+  
+  	ret = nvme_setup_cmd(ns, rq, sqe);
+  	if (ret)
+diff --cc drivers/nvme/host/rdma.c
+index 215f7f62fdfb,66ec5985c9f3..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -1497,9 -1638,8 +1497,14 @@@ static int nvme_rdma_queue_rq(struct bl
+  
+  	WARN_ON_ONCE(rq->tag < 0);
+  
+++<<<<<<< HEAD
+ +	ret = nvme_rdma_queue_is_ready(queue, rq);
+ +	if (unlikely(ret))
+ +		goto err;
+++=======
++ 	if (!nvmf_check_ready(&queue->ctrl->ctrl, rq, queue_ready))
++ 		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, rq);
+++>>>>>>> 6cdefc6e2ad5 (nvme: if_ready checks to fail io to deleting controller)
+  
+  	dev = queue->device->dev;
+  	ib_dma_sync_single_for_cpu(dev, sqe->dma,
+diff --cc drivers/nvme/target/loop.c
+index 0bc9fd83b7e3,ae7586b8be07..000000000000
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@@ -160,29 -158,29 +160,37 @@@ static int nvme_loop_queue_rq(struct bl
+  	struct nvme_loop_queue *queue = hctx->driver_data;
+  	struct request *req = bd->rq;
+  	struct nvme_loop_iod *iod = blk_mq_rq_to_pdu(req);
+++<<<<<<< HEAD
+ +	int ret;
+++=======
++ 	bool queue_ready = test_bit(NVME_LOOP_Q_LIVE, &queue->flags);
++ 	blk_status_t ret;
++ 
++ 	if (!nvmf_check_ready(&queue->ctrl->ctrl, req, queue_ready))
++ 		return nvmf_fail_nonready_command(&queue->ctrl->ctrl, req);
+++>>>>>>> 6cdefc6e2ad5 (nvme: if_ready checks to fail io to deleting controller)
+  
+  	ret = nvme_setup_cmd(ns, req, &iod->cmd);
+ -	if (ret)
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+  		return ret;
+  
+ -	blk_mq_start_request(req);
+  	iod->cmd.common.flags |= NVME_CMD_SGL_METABUF;
+ -	iod->req.port = queue->ctrl->port;
+ +	iod->req.port = nvmet_loop_port;
+  	if (!nvmet_req_init(&iod->req, &queue->nvme_cq,
+ -			&queue->nvme_sq, &nvme_loop_ops))
+ -		return BLK_STS_OK;
+ +			&queue->nvme_sq, &nvme_loop_ops)) {
+ +		nvme_cleanup_cmd(req);
+ +		blk_mq_start_request(req);
+ +		nvme_loop_queue_response(&iod->req);
+ +		return BLK_MQ_RQ_QUEUE_OK;
+ +	}
+  
+ -	if (blk_rq_nr_phys_segments(req)) {
+ +	if (blk_rq_bytes(req)) {
+  		iod->sg_table.sgl = iod->first_sgl;
+ -		if (sg_alloc_table_chained(&iod->sg_table,
+ -				blk_rq_nr_phys_segments(req),
+ -				iod->sg_table.sgl))
+ -			return BLK_STS_RESOURCE;
+ +		ret = sg_alloc_table_chained(&iod->sg_table,
+ +					     req->nr_phys_segments, GFP_ATOMIC, 
+ +					     iod->sg_table.sgl);
+ +		if (ret)
+ +			return BLK_MQ_RQ_QUEUE_BUSY;
+  
+  		iod->req.sg = iod->sg_table.sgl;
+  		iod->req.sg_cnt = blk_rq_map_sg(req->q, req, iod->sg_table.sgl);
+* Unmerged path drivers/nvme/host/fabrics.c
+* Unmerged path drivers/nvme/host/fabrics.h
+* Unmerged path drivers/nvme/host/fc.c
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/target/loop.c
