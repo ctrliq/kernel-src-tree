@@ -1,0 +1,132 @@
+qed: Add missing device config for RoCE EDPM in UFP mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] qed: Add missing device config for RoCE EDPM in UFP mode (Chad Dupuis) [1631593]
+Rebuild_FUZZ: 99.12%
+commit-author Sudarsana Reddy Kalluru <sudarsana.kalluru@cavium.com>
+commit 7e3e375ceede8fba5218362d14db7de25fa83f12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7e3e375c.failed
+
+This patch adds support to configure the DORQ to use vlan-id/priority for
+roce EDPM.
+
+Fixes: cac6f691 ("qed: Add support for Unified Fabric Port")
+	Signed-off-by: Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+	Signed-off-by: Tomer Tayar <Tomer.Tayar@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7e3e375ceede8fba5218362d14db7de25fa83f12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_dcbx.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dcbx.c
+index 6b9473d400bf,f5459de6d60a..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dcbx.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dcbx.c
+@@@ -213,21 -210,26 +210,32 @@@ qed_dcbx_set_params(struct qed_dcbx_res
+  		p_data->arr[type].dont_add_vlan0 = true;
+  
+  	/* QM reconf data */
+++<<<<<<< HEAD
+ +	if (p_info->personality == personality)
+ +		p_info->offload_tc = tc;
+++=======
++ 	if (p_hwfn->hw_info.personality == personality)
++ 		qed_hw_info_set_offload_tc(&p_hwfn->hw_info, tc);
++ 
++ 	/* Configure dcbx vlan priority in doorbell block for roce EDPM */
++ 	if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits) &&
++ 	    type == DCBX_PROTOCOL_ROCE) {
++ 		qed_wr(p_hwfn, p_ptt, DORQ_REG_TAG1_OVRD_MODE, 1);
++ 		qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_PCP_BB_K2, prio << 1);
++ 	}
+++>>>>>>> 7e3e375ceede (qed: Add missing device config for RoCE EDPM in UFP mode.)
+  }
+  
+  /* Update app protocol data and hw_info fields with the TLV info */
+  static void
+  qed_dcbx_update_app_info(struct qed_dcbx_results *p_data,
+- 			 struct qed_hwfn *p_hwfn,
+- 			 bool enable,
+- 			 u8 prio, u8 tc, enum dcbx_protocol_type type)
++ 			 struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
++ 			 bool enable, u8 prio, u8 tc,
++ 			 enum dcbx_protocol_type type)
+  {
+- 	struct qed_hw_info *p_info = &p_hwfn->hw_info;
+  	enum qed_pci_personality personality;
+  	enum dcbx_protocol_type id;
+ +	char *name;
+  	int i;
+  
+  	for (i = 0; i < ARRAY_SIZE(qed_dcbx_app_update); i++) {
+@@@ -237,9 -239,8 +245,9 @@@
+  			continue;
+  
+  		personality = qed_dcbx_app_update[i].personality;
+ +		name = qed_dcbx_app_update[i].name;
+  
+- 		qed_dcbx_set_params(p_data, p_hwfn, p_info, enable,
++ 		qed_dcbx_set_params(p_data, p_hwfn, p_ptt, enable,
+  				    prio, tc, type, personality);
+  	}
+  }
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dcbx.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.c b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index cace28365189..206910794fb1 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1484,13 +1484,29 @@ static void qed_mcp_update_stag(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ 	p_hwfn->mcp_info->func_info.ovlan = (u16)shmem_info.ovlan_stag &
+ 						 FUNC_MF_CFG_OV_STAG_MASK;
+ 	p_hwfn->hw_info.ovlan = p_hwfn->mcp_info->func_info.ovlan;
+-	if ((p_hwfn->hw_info.hw_mode & BIT(MODE_MF_SD)) &&
+-	    (p_hwfn->hw_info.ovlan != QED_MCP_VLAN_UNSET)) {
+-		qed_wr(p_hwfn, p_ptt,
+-		       NIG_REG_LLH_FUNC_TAG_VALUE, p_hwfn->hw_info.ovlan);
++	if (test_bit(QED_MF_OVLAN_CLSS, &p_hwfn->cdev->mf_bits)) {
++		if (p_hwfn->hw_info.ovlan != QED_MCP_VLAN_UNSET) {
++			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_VALUE,
++			       p_hwfn->hw_info.ovlan);
++			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_EN, 1);
++
++			/* Configure DB to add external vlan to EDPM packets */
++			qed_wr(p_hwfn, p_ptt, DORQ_REG_TAG1_OVRD_MODE, 1);
++			qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_EXT_VID_BB_K2,
++			       p_hwfn->hw_info.ovlan);
++		} else {
++			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_EN, 0);
++			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_VALUE, 0);
++			qed_wr(p_hwfn, p_ptt, DORQ_REG_TAG1_OVRD_MODE, 0);
++			qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_EXT_VID_BB_K2, 0);
++		}
++
+ 		qed_sp_pf_update_stag(p_hwfn);
+ 	}
+ 
++	DP_VERBOSE(p_hwfn, QED_MSG_SP, "ovlan  = %d hw_mode = 0x%x\n",
++		   p_hwfn->mcp_info->func_info.ovlan, p_hwfn->hw_info.hw_mode);
++
+ 	/* Acknowledge the MFW */
+ 	qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_S_TAG_UPDATE_ACK, 0,
+ 		    &resp, &param);
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+index f7122059b6b5..b5c848ffc37e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+@@ -216,6 +216,12 @@
+ 	0x00c000UL
+ #define  DORQ_REG_IFEN \
+ 	0x100040UL
++#define DORQ_REG_TAG1_OVRD_MODE \
++	0x1008b4UL
++#define DORQ_REG_PF_PCP_BB_K2 \
++	0x1008c4UL
++#define DORQ_REG_PF_EXT_VID_BB_K2 \
++	0x1008c8UL
+ #define DORQ_REG_DB_DROP_REASON \
+ 	0x100a2cUL
+ #define DORQ_REG_DB_DROP_DETAILS \
