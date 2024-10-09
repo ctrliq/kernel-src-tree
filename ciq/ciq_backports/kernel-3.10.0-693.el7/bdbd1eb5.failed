@@ -1,0 +1,130 @@
+bnxt_en: Handle no aggregation ring gracefully.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Handle no aggregation ring gracefully (Jonathan Toppins) [1382378]
+Rebuild_FUZZ: 98.92%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit bdbd1eb59c565c56a74d21076e2ae8706de00ecd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bdbd1eb5.failed
+
+The current code assumes that we will always have at least 2 rx rings, 1
+will be used as an aggregation ring for TPA and jumbo page placements.
+However, it is possible, especially on a VF, that there is only 1 rx
+ring available.  In this scenario, the current code will fail to initialize.
+To handle it, we need to properly set up only 1 ring without aggregation.
+Set a new flag BNXT_FLAG_NO_AGG_RINGS for this condition and add logic to
+set up the chip to place RX data linearly into a single buffer per packet.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bdbd1eb59c565c56a74d21076e2ae8706de00ecd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index f29714ec118c,98e948489700..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -6811,6 -7037,48 +6814,51 @@@ int bnxt_get_max_rings(struct bnxt *bp
+  	return bnxt_trim_rings(bp, max_rx, max_tx, cp, shared);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_get_dflt_rings(struct bnxt *bp, int *max_rx, int *max_tx,
++ 			       bool shared)
++ {
++ 	int rc;
++ 
++ 	rc = bnxt_get_max_rings(bp, max_rx, max_tx, shared);
++ 	if (rc && (bp->flags & BNXT_FLAG_AGG_RINGS)) {
++ 		/* Not enough rings, try disabling agg rings. */
++ 		bp->flags &= ~BNXT_FLAG_AGG_RINGS;
++ 		rc = bnxt_get_max_rings(bp, max_rx, max_tx, shared);
++ 		if (rc)
++ 			return rc;
++ 		bp->flags |= BNXT_FLAG_NO_AGG_RINGS;
++ 		bp->dev->hw_features &= ~NETIF_F_LRO;
++ 		bp->dev->features &= ~NETIF_F_LRO;
++ 		bnxt_set_ring_params(bp);
++ 	}
++ 
++ 	if (bp->flags & BNXT_FLAG_ROCE_CAP) {
++ 		int max_cp, max_stat, max_irq;
++ 
++ 		/* Reserve minimum resources for RoCE */
++ 		max_cp = bnxt_get_max_func_cp_rings(bp);
++ 		max_stat = bnxt_get_max_func_stat_ctxs(bp);
++ 		max_irq = bnxt_get_max_func_irqs(bp);
++ 		if (max_cp <= BNXT_MIN_ROCE_CP_RINGS ||
++ 		    max_irq <= BNXT_MIN_ROCE_CP_RINGS ||
++ 		    max_stat <= BNXT_MIN_ROCE_STAT_CTXS)
++ 			return 0;
++ 
++ 		max_cp -= BNXT_MIN_ROCE_CP_RINGS;
++ 		max_irq -= BNXT_MIN_ROCE_CP_RINGS;
++ 		max_stat -= BNXT_MIN_ROCE_STAT_CTXS;
++ 		max_cp = min_t(int, max_cp, max_irq);
++ 		max_cp = min_t(int, max_cp, max_stat);
++ 		rc = bnxt_trim_rings(bp, max_rx, max_tx, max_cp, shared);
++ 		if (rc)
++ 			rc = 0;
++ 	}
++ 	return rc;
++ }
++ 
+++>>>>>>> bdbd1eb59c56 (bnxt_en: Handle no aggregation ring gracefully.)
+  static int bnxt_set_dflt_rings(struct bnxt *bp)
+  {
+  	int dflt_rings, max_rx_rings, max_tx_rings, rc;
+@@@ -6957,13 -7247,13 +7005,23 @@@ static int bnxt_init_one(struct pci_de
+  
+  	bnxt_set_tpa_flags(bp);
+  	bnxt_set_ring_params(bp);
+++<<<<<<< HEAD
+ +	if (BNXT_PF(bp))
+ +		bp->pf.max_irqs = max_irqs;
+ +#if defined(CONFIG_BNXT_SRIOV)
+ +	else
+ +		bp->vf.max_irqs = max_irqs;
+ +#endif
+ +	bnxt_set_dflt_rings(bp);
+++=======
++ 	bnxt_set_max_func_irqs(bp, max_irqs);
++ 	rc = bnxt_set_dflt_rings(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Not enough rings available.\n");
++ 		rc = -ENOMEM;
++ 		goto init_err;
++ 	}
+++>>>>>>> bdbd1eb59c56 (bnxt_en: Handle no aggregation ring gracefully.)
+  
+  	/* Default RSS hash cfg. */
+  	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index c1ee716cd1ac,f6b9b1c530fe..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -951,6 -945,12 +951,15 @@@ struct bnxt 
+  	#define BNXT_FLAG_PORT_STATS	0x400
+  	#define BNXT_FLAG_UDP_RSS_CAP	0x800
+  	#define BNXT_FLAG_EEE_CAP	0x1000
+++<<<<<<< HEAD
+++=======
++ 	#define BNXT_FLAG_NEW_RSS_CAP	0x2000
++ 	#define BNXT_FLAG_ROCEV1_CAP	0x8000
++ 	#define BNXT_FLAG_ROCEV2_CAP	0x10000
++ 	#define BNXT_FLAG_ROCE_CAP	(BNXT_FLAG_ROCEV1_CAP |	\
++ 					 BNXT_FLAG_ROCEV2_CAP)
++ 	#define BNXT_FLAG_NO_AGG_RINGS	0x20000
+++>>>>>>> bdbd1eb59c56 (bnxt_en: Handle no aggregation ring gracefully.)
+  	#define BNXT_FLAG_CHIP_NITRO_A0	0x1000000
+  
+  	#define BNXT_FLAG_ALL_CONFIG_FEATS (BNXT_FLAG_TPA |		\
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
