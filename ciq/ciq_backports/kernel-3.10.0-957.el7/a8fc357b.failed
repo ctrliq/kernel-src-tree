@@ -1,0 +1,126 @@
+mm: split altmap memory map allocation from normal case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] split altmap memory map allocation from normal case (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 96.23%
+commit-author Christoph Hellwig <hch@lst.de>
+commit a8fc357b2875da8732c91eb085862a0648d82767
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a8fc357b.failed
+
+No functional changes, just untangling the call chain and document
+why the altmap is passed around the hotplug code.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit a8fc357b2875da8732c91eb085862a0648d82767)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/init_64.c
+diff --cc arch/powerpc/mm/init_64.c
+index bc11f9ce7444,7a2251d99ed3..000000000000
+--- a/arch/powerpc/mm/init_64.c
++++ b/arch/powerpc/mm/init_64.c
+@@@ -315,7 -200,10 +315,14 @@@ int __meminit vmemmap_populate(unsigne
+  		if (vmemmap_populated(start, page_size))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		p = vmemmap_alloc_block(page_size, node);
+++=======
++ 		if (altmap)
++ 			p = altmap_alloc_block_buf(page_size, altmap);
++ 		else
++ 			p = vmemmap_alloc_block_buf(page_size, node);
+++>>>>>>> a8fc357b2875 (mm: split altmap memory map allocation from normal case)
+  		if (!p)
+  			return -ENOMEM;
+  
+* Unmerged path arch/powerpc/mm/init_64.c
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 25c65b6af83e..bad8aab526d8 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -1265,7 +1265,10 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 		if (pmd_none(*pmd)) {
+ 			void *p;
+ 
+-			p = __vmemmap_alloc_block_buf(PMD_SIZE, node, altmap);
++			if (altmap)
++				p = altmap_alloc_block_buf(PMD_SIZE, altmap);
++			else
++				p = vmemmap_alloc_block_buf(PMD_SIZE, node);
+ 			if (p) {
+ 				pte_t entry;
+ 
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a228f1a787bf..8355254d2c7f 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2368,13 +2368,8 @@ pmd_t *vmemmap_pmd_populate(pud_t *pud, unsigned long addr, int node);
+ pte_t *vmemmap_pte_populate(pmd_t *pmd, unsigned long addr, int node);
+ void *vmemmap_alloc_block(unsigned long size, int node);
+ struct vmem_altmap;
+-void *__vmemmap_alloc_block_buf(unsigned long size, int node,
+-		struct vmem_altmap *altmap);
+-static inline void *vmemmap_alloc_block_buf(unsigned long size, int node)
+-{
+-	return __vmemmap_alloc_block_buf(size, node, NULL);
+-}
+-
++void *vmemmap_alloc_block_buf(unsigned long size, int node);
++void *altmap_alloc_block_buf(unsigned long size, struct vmem_altmap *altmap);
+ void vmemmap_verify(pte_t *, int, unsigned long, unsigned long);
+ int vmemmap_populate_basepages(unsigned long start, unsigned long end,
+ 			       int node);
+diff --git a/mm/sparse-vmemmap.c b/mm/sparse-vmemmap.c
+index b60802b3e5ea..b58671888202 100644
+--- a/mm/sparse-vmemmap.c
++++ b/mm/sparse-vmemmap.c
+@@ -71,7 +71,7 @@ void * __meminit vmemmap_alloc_block(unsigned long size, int node)
+ }
+ 
+ /* need to make sure size is all the same during early stage */
+-static void * __meminit alloc_block_buf(unsigned long size, int node)
++void * __meminit vmemmap_alloc_block_buf(unsigned long size, int node)
+ {
+ 	void *ptr;
+ 
+@@ -126,7 +126,7 @@ static unsigned long __meminit vmem_altmap_alloc(struct vmem_altmap *altmap,
+ 	return pfn + nr_align;
+ }
+ 
+-static void * __meminit altmap_alloc_block_buf(unsigned long size,
++void * __meminit altmap_alloc_block_buf(unsigned long size,
+ 		struct vmem_altmap *altmap)
+ {
+ 	unsigned long pfn, nr_pfns;
+@@ -150,15 +150,6 @@ static void * __meminit altmap_alloc_block_buf(unsigned long size,
+ 	return ptr;
+ }
+ 
+-/* need to make sure size is all the same during early stage */
+-void * __meminit __vmemmap_alloc_block_buf(unsigned long size, int node,
+-		struct vmem_altmap *altmap)
+-{
+-	if (altmap)
+-		return altmap_alloc_block_buf(size, altmap);
+-	return alloc_block_buf(size, node);
+-}
+-
+ void __meminit vmemmap_verify(pte_t *pte, int node,
+ 				unsigned long start, unsigned long end)
+ {
+@@ -175,7 +166,7 @@ pte_t * __meminit vmemmap_pte_populate(pmd_t *pmd, unsigned long addr, int node)
+ 	pte_t *pte = pte_offset_kernel(pmd, addr);
+ 	if (pte_none(*pte)) {
+ 		pte_t entry;
+-		void *p = alloc_block_buf(PAGE_SIZE, node);
++		void *p = vmemmap_alloc_block_buf(PAGE_SIZE, node);
+ 		if (!p)
+ 			return NULL;
+ 		entry = pfn_pte(__pa(p) >> PAGE_SHIFT, PAGE_KERNEL);
