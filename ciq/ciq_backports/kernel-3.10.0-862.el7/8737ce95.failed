@@ -1,0 +1,451 @@
+IB/hfi1: Fix an assign/ordering issue with shared context IDs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 8737ce95c463c6d8c4307ab3d6858cbf71cd4fc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8737ce95.failed
+
+The current algorithm for generating sub-context IDs is FILO.  If the
+contexts are not closed in that order, the uniqueness of the ID will be
+compromised. I.e. logging the creation/deletion of context IDs with an
+application that assigns and closes in a FIFO order reveals:
+
+cache_id: assign: uctxt: 3    sub_ctxt: 0
+cache_id: assign: uctxt: 3    sub_ctxt: 1
+cache_id: assign: uctxt: 3    sub_ctxt: 2
+cache_id: close:  uctxt: 3    sub_ctxt: 0
+cache_id: assign: uctxt: 3    sub_ctxt: 2 <<<
+
+The sub_ctxt ID 2 is reused incorrectly.
+
+Update the sub-context ID assign algorithm to use a bitmask of in_use
+contexts.  The new algorithm will allow the contexts to be closed in any
+order, and will only re-use unused contexts.
+
+Size subctxt and subctxt_cnt to match the user API size.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8737ce95c463c6d8c4307ab3d6858cbf71cd4fc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	drivers/infiniband/hw/hfi1/hfi.h
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494,9c177ef79db5..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -48,7 -48,8 +48,12 @@@
+  #include <linux/cdev.h>
+  #include <linux/vmalloc.h>
+  #include <linux/io.h>
+++<<<<<<< HEAD
+ +#include <linux/aio.h>
+++=======
++ #include <linux/sched/mm.h>
++ #include <linux/bitmap.h>
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  
+  #include <rdma/ib.h>
+  
+@@@ -70,31 -71,37 +75,59 @@@
+  /*
+   * File operation functions
+   */
+ -static int hfi1_file_open(struct inode *inode, struct file *fp);
+ -static int hfi1_file_close(struct inode *inode, struct file *fp);
+ -static ssize_t hfi1_write_iter(struct kiocb *kiocb, struct iov_iter *from);
+ -static unsigned int hfi1_poll(struct file *fp, struct poll_table_struct *pt);
+ -static int hfi1_file_mmap(struct file *fp, struct vm_area_struct *vma);
+ -
+ +static int hfi1_file_open(struct inode *, struct file *);
+ +static int hfi1_file_close(struct inode *, struct file *);
+ +static ssize_t hfi1_aio_write(struct kiocb *, const struct iovec *,
+ +			      unsigned long, loff_t);
+ +static unsigned int hfi1_poll(struct file *, struct poll_table_struct *);
+ +static int hfi1_file_mmap(struct file *, struct vm_area_struct *);
+ +
+++<<<<<<< HEAD
+ +static u64 kvirt_to_phys(void *);
+ +static int assign_ctxt(struct file *, struct hfi1_user_info *);
+ +static int init_subctxts(struct hfi1_ctxtdata *, const struct hfi1_user_info *);
+ +static int user_init(struct file *);
+ +static int get_ctxt_info(struct file *, void __user *, __u32);
+ +static int get_base_info(struct file *, void __user *, __u32);
+ +static int setup_ctxt(struct file *);
+ +static int setup_subctxt(struct hfi1_ctxtdata *);
+ +static int get_user_context(struct file *, struct hfi1_user_info *, int);
+ +static int find_shared_ctxt(struct file *, const struct hfi1_user_info *);
+ +static int allocate_ctxt(struct file *, struct hfi1_devdata *,
+ +			 struct hfi1_user_info *);
+ +static unsigned int poll_urgent(struct file *, struct poll_table_struct *);
+ +static unsigned int poll_next(struct file *, struct poll_table_struct *);
+ +static int user_event_ack(struct hfi1_ctxtdata *, int, unsigned long);
+ +static int set_ctxt_pkey(struct hfi1_ctxtdata *, unsigned, u16);
+ +static int manage_rcvq(struct hfi1_ctxtdata *, unsigned, int);
+ +static int vma_fault(struct vm_area_struct *, struct vm_fault *);
+++=======
++ static u64 kvirt_to_phys(void *addr);
++ static int assign_ctxt(struct hfi1_filedata *fd, struct hfi1_user_info *uinfo);
++ static int init_subctxts(struct hfi1_ctxtdata *uctxt,
++ 			 const struct hfi1_user_info *uinfo);
++ static int init_user_ctxt(struct hfi1_filedata *fd);
++ static int user_init(struct hfi1_ctxtdata *uctxt);
++ static int get_ctxt_info(struct hfi1_filedata *fd, void __user *ubase,
++ 			 __u32 len);
++ static int get_base_info(struct hfi1_filedata *fd, void __user *ubase,
++ 			 __u32 len);
++ static int setup_base_ctxt(struct hfi1_filedata *fd);
++ static int setup_subctxt(struct hfi1_ctxtdata *uctxt);
++ 
++ static int find_sub_ctxt(struct hfi1_filedata *fd,
++ 			 const struct hfi1_user_info *uinfo);
++ static int allocate_ctxt(struct hfi1_filedata *fd, struct hfi1_devdata *dd,
++ 			 struct hfi1_user_info *uinfo);
++ static unsigned int poll_urgent(struct file *fp, struct poll_table_struct *pt);
++ static unsigned int poll_next(struct file *fp, struct poll_table_struct *pt);
++ static int user_event_ack(struct hfi1_ctxtdata *uctxt, u16 subctxt,
++ 			  unsigned long events);
++ static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, u16 subctxt, u16 pkey);
++ static int manage_rcvq(struct hfi1_ctxtdata *uctxt, u16 subctxt,
++ 		       int start_stop);
++ static int vma_fault(struct vm_fault *vmf);
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  static long hfi1_file_ioctl(struct file *fp, unsigned int cmd,
+  			    unsigned long arg);
+  
+@@@ -868,99 -868,100 +901,154 @@@ static int assign_ctxt(struct file *fp
+  	}
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * We execute the following block if we couldn't find a
+ +	 * shared context or if context sharing is not required.
+++=======
++ 	 * Allocate a base context if context sharing is not required or we
++ 	 * couldn't find a sub context.
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  	 */
+ -	if (!ret)
+ -		ret = allocate_ctxt(fd, fd->dd, uinfo);
+ -
+ -	mutex_unlock(&hfi1_mutex);
+ -
+ -	/* Depending on the context type, do the appropriate init */
+ -	if (ret > 0) {
+ -		/*
+ -		 * sub-context info can only be set up after the base
+ -		 * context has been completed.
+ -		 */
+ -		ret = wait_event_interruptible(fd->uctxt->wait, !test_bit(
+ -					       HFI1_CTXT_BASE_UNINIT,
+ -					       &fd->uctxt->event_flags));
+ -		/* The only thing a sub context needs is the user_xxx stuff */
+ -		if (!ret)
+ -			init_user_ctxt(fd);
+ -	} else if (!ret) {
+ -		ret = setup_base_ctxt(fd);
+ -
+ -		/*
+ -		 * Base context is done, notify anybody using a sub-context
+ -		 * that is waiting for this completion
+ -		 */
+ -		if (!ret && fd->uctxt->subctxt_cnt) {
+ -			clear_bit(HFI1_CTXT_BASE_UNINIT,
+ -				  &fd->uctxt->event_flags);
+ -			wake_up(&fd->uctxt->wait);
+ -		}
+ +	if (!ret) {
+ +		i_minor = iminor(file_inode(fp)) - HFI1_USER_MINOR_BASE;
+ +		ret = get_user_context(fp, uinfo, i_minor);
+  	}
+ -
+ +done_unlock:
+ +	mutex_unlock(&hfi1_mutex);
+ +done:
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int get_user_context(struct file *fp, struct hfi1_user_info *uinfo,
+ +			    int devno)
+ +{
+ +	struct hfi1_devdata *dd = NULL;
+ +	int devmax, npresent, nup;
+++=======
++ /*
++  * The hfi1_mutex must be held when this function is called.  It is
++  * necessary to ensure serialized access to the bitmask in_use_ctxts.
++  */
++ static int find_sub_ctxt(struct hfi1_filedata *fd,
++ 			 const struct hfi1_user_info *uinfo)
++ {
++ 	int i;
++ 	struct hfi1_devdata *dd = fd->dd;
++ 	u16 subctxt;
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  
+ -	for (i = dd->first_dyn_alloc_ctxt; i < dd->num_rcv_contexts; i++) {
+ -		struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ +	devmax = hfi1_count_units(&npresent, &nup);
+ +	if (!npresent)
+ +		return -ENXIO;
+  
+++<<<<<<< HEAD
+ +	if (!nup)
+ +		return -ENETDOWN;
+++=======
++ 		/* Skip ctxts which are not yet open */
++ 		if (!uctxt ||
++ 		    bitmap_empty(uctxt->in_use_ctxts,
++ 				 HFI1_MAX_SHARED_CTXTS))
++ 			continue;
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  
+ -		/* Skip dynamically allocted kernel contexts */
+ -		if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ -			continue;
+ +	dd = hfi1_lookup(devno);
+ +	if (!dd)
+ +		return -ENODEV;
+ +	else if (!dd->freectxts)
+ +		return -EBUSY;
+  
+++<<<<<<< HEAD
+ +	return allocate_ctxt(fp, dd, uinfo);
+++=======
++ 		/* Skip ctxt if it doesn't match the requested one */
++ 		if (memcmp(uctxt->uuid, uinfo->uuid,
++ 			   sizeof(uctxt->uuid)) ||
++ 		    uctxt->jkey != generate_jkey(current_uid()) ||
++ 		    uctxt->subctxt_id != uinfo->subctxt_id ||
++ 		    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
++ 			continue;
++ 
++ 		/* Verify the sharing process matches the master */
++ 		if (uctxt->userversion != uinfo->userversion)
++ 			return -EINVAL;
++ 
++ 		/* Find an unused context */
++ 		subctxt = find_first_zero_bit(uctxt->in_use_ctxts,
++ 					      HFI1_MAX_SHARED_CTXTS);
++ 		if (subctxt >= uctxt->subctxt_cnt)
++ 			return -EINVAL;
++ 
++ 		fd->uctxt = uctxt;
++ 		fd->subctxt = subctxt;
++ 		__set_bit(fd->subctxt, uctxt->in_use_ctxts);
++ 
++ 		return 1;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  }
+  
+ -static int allocate_ctxt(struct hfi1_filedata *fd, struct hfi1_devdata *dd,
+ +static int find_shared_ctxt(struct file *fp,
+ +			    const struct hfi1_user_info *uinfo)
+ +{
+ +	int devmax, ndev, i;
+ +	int ret = 0;
+ +	struct hfi1_filedata *fd = fp->private_data;
+ +
+ +	devmax = hfi1_count_units(NULL, NULL);
+ +
+ +	for (ndev = 0; ndev < devmax; ndev++) {
+ +		struct hfi1_devdata *dd = hfi1_lookup(ndev);
+ +
+ +		if (!(dd && (dd->flags & HFI1_PRESENT) && dd->kregbase))
+ +			continue;
+ +		for (i = dd->first_dyn_alloc_ctxt;
+ +		     i < dd->num_rcv_contexts; i++) {
+ +			struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ +
+ +			/* Skip ctxts which are not yet open */
+ +			if (!uctxt || !uctxt->cnt)
+ +				continue;
+ +
+ +			/* Skip dynamically allocted kernel contexts */
+ +			if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ +				continue;
+ +
+ +			/* Skip ctxt if it doesn't match the requested one */
+ +			if (memcmp(uctxt->uuid, uinfo->uuid,
+ +				   sizeof(uctxt->uuid)) ||
+ +			    uctxt->jkey != generate_jkey(current_uid()) ||
+ +			    uctxt->subctxt_id != uinfo->subctxt_id ||
+ +			    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
+ +				continue;
+ +
+ +			/* Verify the sharing process matches the master */
+ +			if (uctxt->userversion != uinfo->userversion ||
+ +			    uctxt->cnt >= uctxt->subctxt_cnt) {
+ +				ret = -EINVAL;
+ +				goto done;
+ +			}
+ +			fd->uctxt = uctxt;
+ +			fd->subctxt  = uctxt->cnt++;
+ +			uctxt->active_slaves |= 1 << fd->subctxt;
+ +			ret = 1;
+ +			goto done;
+ +		}
+ +	}
+ +
+ +done:
+ +	return ret;
+ +}
+ +
+ +static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+  			 struct hfi1_user_info *uinfo)
+  {
+ +	struct hfi1_filedata *fd = fp->private_data;
+  	struct hfi1_ctxtdata *uctxt;
+ -	unsigned int ctxt;
+ +	unsigned ctxt;
+  	int ret, numa;
+  
+  	if (dd->flags & HFI1_FROZEN) {
+@@@ -1067,9 -1076,8 +1155,8 @@@ static int init_subctxts(struct hfi1_ct
+  
+  	uctxt->subctxt_cnt = uinfo->subctxt_cnt;
+  	uctxt->subctxt_id = uinfo->subctxt_id;
+- 	uctxt->active_slaves = 1;
+  	uctxt->redirect_seq_cnt = 1;
+ -	set_bit(HFI1_CTXT_BASE_UNINIT, &uctxt->event_flags);
+ +	set_bit(HFI1_CTXT_MASTER_UNINIT, &uctxt->event_flags);
+  
+  	return 0;
+  }
+@@@ -1077,13 -1085,12 +1164,13 @@@
+  static int setup_subctxt(struct hfi1_ctxtdata *uctxt)
+  {
+  	int ret = 0;
+- 	unsigned num_subctxts = uctxt->subctxt_cnt;
++ 	u16 num_subctxts = uctxt->subctxt_cnt;
+  
+  	uctxt->subctxt_uregbase = vmalloc_user(PAGE_SIZE);
+ -	if (!uctxt->subctxt_uregbase)
+ -		return -ENOMEM;
+ -
+ +	if (!uctxt->subctxt_uregbase) {
+ +		ret = -ENOMEM;
+ +		goto bail;
+ +	}
+  	/* We can take the size of the RcvHdr Queue from the master */
+  	uctxt->subctxt_rcvhdr_base = vmalloc_user(uctxt->rcvhdrq_size *
+  						  num_subctxts);
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index b1aefd5ddffe,f3d75fcd5f07..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -224,13 -224,12 +224,18 @@@ struct hfi1_ctxtdata 
+  	 * (ignoring forks, dup, etc. for now)
+  	 */
+  	int cnt;
+ -	/* Device context index */
+ -	unsigned ctxt;
+  	/*
+++<<<<<<< HEAD
+ +	 * how much space to leave at start of eager TID entries for
+ +	 * protocol use, on each TID
+++=======
++ 	 * non-zero if ctxt can be shared, and defines the maximum number of
++ 	 * sub-contexts for this device context.
+++>>>>>>> 8737ce95c463 (IB/hfi1: Fix an assign/ordering issue with shared context IDs)
+  	 */
+ +	/* instead of calculating it */
+ +	unsigned ctxt;
+ +	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_cnt;
+  	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_id;
+@@@ -1246,10 -1237,11 +1251,10 @@@ struct mmu_rb_handler
+  
+  /* Private data for file operations */
+  struct hfi1_filedata {
+ -	struct hfi1_devdata *dd;
+  	struct hfi1_ctxtdata *uctxt;
+- 	unsigned subctxt;
+  	struct hfi1_user_sdma_comp_q *cq;
+  	struct hfi1_user_sdma_pkt_q *pq;
++ 	u16 subctxt;
+  	/* for cpu affinity; -1 if none */
+  	int rec_cpu_num;
+  	u32 tid_n_pinned;
+diff --git a/drivers/infiniband/hw/hfi1/driver.c b/drivers/infiniband/hw/hfi1/driver.c
+index 500b129ed565..2ff79450e7c7 100644
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -1325,7 +1325,7 @@ int hfi1_reset_device(int unit)
+ 	if (dd->rcd)
+ 		for (i = dd->first_dyn_alloc_ctxt;
+ 		     i < dd->num_rcv_contexts; i++) {
+-			if (!dd->rcd[i] || !dd->rcd[i]->cnt)
++			if (!dd->rcd[i])
+ 				continue;
+ 			spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+ 			ret = -EBUSY;
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index d1e1227c533d..9242ef46e2cf 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -53,6 +53,7 @@
+ #include <linux/module.h>
+ #include <linux/printk.h>
+ #include <linux/hrtimer.h>
++#include <linux/bitmap.h>
+ #include <rdma/rdma_vt.h>
+ 
+ #include "hfi.h"
+@@ -228,7 +229,7 @@ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
+ 		INIT_LIST_HEAD(&rcd->qp_wait_list);
+ 		rcd->ppd = ppd;
+ 		rcd->dd = dd;
+-		rcd->cnt = 1;
++		__set_bit(0, rcd->in_use_ctxts);
+ 		rcd->ctxt = ctxt;
+ 		dd->rcd[ctxt] = rcd;
+ 		rcd->numa_id = numa;
+diff --git a/drivers/infiniband/hw/hfi1/intr.c b/drivers/infiniband/hw/hfi1/intr.c
+index 57bb88377b24..04a5082d5ac5 100644
+--- a/drivers/infiniband/hw/hfi1/intr.c
++++ b/drivers/infiniband/hw/hfi1/intr.c
+@@ -47,6 +47,7 @@
+ 
+ #include <linux/pci.h>
+ #include <linux/delay.h>
++#include <linux/bitmap.h>
+ 
+ #include "hfi.h"
+ #include "common.h"
+@@ -190,7 +191,7 @@ void handle_user_interrupt(struct hfi1_ctxtdata *rcd)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dd->uctxt_lock, flags);
+-	if (!rcd->cnt)
++	if (bitmap_empty(rcd->in_use_ctxts, HFI1_MAX_SHARED_CTXTS))
+ 		goto done;
+ 
+ 	if (test_and_clear_bit(HFI1_CTXT_WAITING_RCV, &rcd->event_flags)) {
+diff --git a/drivers/infiniband/hw/hfi1/user_sdma.h b/drivers/infiniband/hw/hfi1/user_sdma.h
+index 39001714f551..c9d7a1a632ea 100644
+--- a/drivers/infiniband/hw/hfi1/user_sdma.h
++++ b/drivers/infiniband/hw/hfi1/user_sdma.h
+@@ -56,7 +56,7 @@ extern uint extended_psn;
+ struct hfi1_user_sdma_pkt_q {
+ 	struct list_head list;
+ 	unsigned ctxt;
+-	unsigned subctxt;
++	u16 subctxt;
+ 	u16 n_max_reqs;
+ 	atomic_t n_reqs;
+ 	u16 reqidx;
