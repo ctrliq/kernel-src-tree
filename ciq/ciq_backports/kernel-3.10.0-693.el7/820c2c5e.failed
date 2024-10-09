@@ -1,0 +1,594 @@
+net/mlx5e: Read ETS settings directly from firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Read ETS settings directly from firmware (Don Dutile) [1386547 1385330 1417286]
+Rebuild_FUZZ: 95.92%
+commit-author Huy Nguyen <huyn@mellanox.com>
+commit 820c2c5e773d283ab102f1b64618e2ddfbb975ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/820c2c5e.failed
+
+Issue description:
+Current implementation saves the ETS settings from user in
+a temporal soft copy and returns this settings when user
+queries the ETS settings.
+
+With the new DCBX firmware, the ETS settings can be changed
+by firmware when the DCBX is in firmware controlled mode. Therefore,
+user will obtain wrong values from the temporal soft copy.
+
+Solution:
+1. Read the ETS settings directly from firmware.
+2. For tc_tsa:
+   a. Initialize tc_tsa to vendor IEEE_8021QAZ_TSA_VENDOR at netdev
+      creation.
+   b. When reading ETS setting from FW, if the traffic class bandwidth
+      is less than 100, set tc_tsa to IEEE_8021QAZ_TSA_ETS. This
+      implementation solves the scenarios when the DCBX is in FW control
+      and willing bit is on which means the ETS setting is dictated
+      by remote switch.
+
+Also check ETS capability where needed.
+
+	Signed-off-by: Huy Nguyen <huyn@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 820c2c5e773d283ab102f1b64618e2ddfbb975ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index b01f5bb32ed7,60aa13b2b21f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -187,11 -214,33 +187,41 @@@ struct mlx5e_params 
+  	u8  toeplitz_hash_key[40];
+  	u32 indirection_rqt[MLX5E_INDIR_RQT_SIZE];
+  	bool vlan_strip_disable;
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MLX5_CORE_EN_DCB
+ +	struct ieee_ets ets;
+ +#endif
+ +};
+ +
+++=======
++ 	bool rx_am_enabled;
++ 	u32 lro_timeout;
++ };
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ struct mlx5e_cee_config {
++ 	/* bw pct for priority group */
++ 	u8                         pg_bw_pct[CEE_DCBX_MAX_PGS];
++ 	u8                         prio_to_pg_map[CEE_DCBX_MAX_PRIO];
++ 	bool                       pfc_setting[CEE_DCBX_MAX_PRIO];
++ 	bool                       pfc_enable;
++ };
++ 
++ enum {
++ 	MLX5_DCB_CHG_RESET,
++ 	MLX5_DCB_NO_CHG,
++ 	MLX5_DCB_CHG_NO_RESET,
++ };
++ 
++ struct mlx5e_dcbx {
++ 	struct mlx5e_cee_config    cee_cfg; /* pending configuration */
++ 
++ 	/* The only setting that cannot be read from FW */
++ 	u8                         tc_tsa[IEEE_8021QAZ_MAX_TCS];
++ };
++ #endif
++ 
+++>>>>>>> 820c2c5e773d (net/mlx5e: Read ETS settings directly from firmware)
+  struct mlx5e_tstamp {
+  	rwlock_t                   lock;
+  	struct cyclecounter        cycles;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+index 762af16ed021,35e90d16cc66..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+@@@ -304,6 -332,284 +327,287 @@@ static int mlx5e_dcbnl_ieee_setmaxrate(
+  	return mlx5_modify_port_ets_rate_limit(mdev, max_bw_value, max_bw_unit);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 mlx5e_dcbnl_setall(struct net_device *netdev)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_cee_config *cee_cfg = &priv->dcbx.cee_cfg;
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct ieee_ets ets;
++ 	struct ieee_pfc pfc;
++ 	int err = -ENOTSUPP;
++ 	int i;
++ 
++ 	if (!MLX5_CAP_GEN(mdev, ets))
++ 		goto out;
++ 
++ 	memset(&ets, 0, sizeof(ets));
++ 	memset(&pfc, 0, sizeof(pfc));
++ 
++ 	ets.ets_cap = IEEE_8021QAZ_MAX_TCS;
++ 	for (i = 0; i < CEE_DCBX_MAX_PGS; i++) {
++ 		ets.tc_tx_bw[i] = cee_cfg->pg_bw_pct[i];
++ 		ets.tc_rx_bw[i] = cee_cfg->pg_bw_pct[i];
++ 		ets.tc_tsa[i]   = IEEE_8021QAZ_TSA_ETS;
++ 		ets.prio_tc[i]  = cee_cfg->prio_to_pg_map[i];
++ 	}
++ 
++ 	err = mlx5e_dbcnl_validate_ets(netdev, &ets);
++ 	if (err) {
++ 		netdev_err(netdev,
++ 			   "%s, Failed to validate ETS: %d\n", __func__, err);
++ 		goto out;
++ 	}
++ 
++ 	err = mlx5e_dcbnl_ieee_setets_core(priv, &ets);
++ 	if (err) {
++ 		netdev_err(netdev,
++ 			   "%s, Failed to set ETS: %d\n", __func__, err);
++ 		goto out;
++ 	}
++ 
++ 	/* Set PFC */
++ 	pfc.pfc_cap = mlx5_max_tc(mdev) + 1;
++ 	if (!cee_cfg->pfc_enable)
++ 		pfc.pfc_en = 0;
++ 	else
++ 		for (i = 0; i < CEE_DCBX_MAX_PRIO; i++)
++ 			pfc.pfc_en |= cee_cfg->pfc_setting[i] << i;
++ 
++ 	err = mlx5e_dcbnl_ieee_setpfc(netdev, &pfc);
++ 	if (err) {
++ 		netdev_err(netdev,
++ 			   "%s, Failed to set PFC: %d\n", __func__, err);
++ 		goto out;
++ 	}
++ out:
++ 	return err ? MLX5_DCB_NO_CHG : MLX5_DCB_CHG_RESET;
++ }
++ 
++ static u8 mlx5e_dcbnl_getstate(struct net_device *netdev)
++ {
++ 	return MLX5E_CEE_STATE_UP;
++ }
++ 
++ static void mlx5e_dcbnl_getpermhwaddr(struct net_device *netdev,
++ 				      u8 *perm_addr)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	if (!perm_addr)
++ 		return;
++ 
++ 	mlx5_query_nic_vport_mac_address(priv->mdev, 0, perm_addr);
++ }
++ 
++ static void mlx5e_dcbnl_setpgtccfgtx(struct net_device *netdev,
++ 				     int priority, u8 prio_type,
++ 				     u8 pgid, u8 bw_pct, u8 up_map)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_cee_config *cee_cfg = &priv->dcbx.cee_cfg;
++ 
++ 	if (priority >= CEE_DCBX_MAX_PRIO) {
++ 		netdev_err(netdev,
++ 			   "%s, priority is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	if (pgid >= CEE_DCBX_MAX_PGS) {
++ 		netdev_err(netdev,
++ 			   "%s, priority group is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	cee_cfg->prio_to_pg_map[priority] = pgid;
++ }
++ 
++ static void mlx5e_dcbnl_setpgbwgcfgtx(struct net_device *netdev,
++ 				      int pgid, u8 bw_pct)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_cee_config *cee_cfg = &priv->dcbx.cee_cfg;
++ 
++ 	if (pgid >= CEE_DCBX_MAX_PGS) {
++ 		netdev_err(netdev,
++ 			   "%s, priority group is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	cee_cfg->pg_bw_pct[pgid] = bw_pct;
++ }
++ 
++ static void mlx5e_dcbnl_getpgtccfgtx(struct net_device *netdev,
++ 				     int priority, u8 *prio_type,
++ 				     u8 *pgid, u8 *bw_pct, u8 *up_map)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	if (priority >= CEE_DCBX_MAX_PRIO) {
++ 		netdev_err(netdev,
++ 			   "%s, priority is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	*prio_type = 0;
++ 	*bw_pct = 0;
++ 	*up_map = 0;
++ 
++ 	if (mlx5_query_port_prio_tc(mdev, priority, pgid))
++ 		*pgid = 0;
++ }
++ 
++ static void mlx5e_dcbnl_getpgbwgcfgtx(struct net_device *netdev,
++ 				      int pgid, u8 *bw_pct)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	if (pgid >= CEE_DCBX_MAX_PGS) {
++ 		netdev_err(netdev,
++ 			   "%s, priority group is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	if (mlx5_query_port_tc_bw_alloc(mdev, pgid, bw_pct))
++ 		*bw_pct = 0;
++ }
++ 
++ static void mlx5e_dcbnl_setpfccfg(struct net_device *netdev,
++ 				  int priority, u8 setting)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_cee_config *cee_cfg = &priv->dcbx.cee_cfg;
++ 
++ 	if (priority >= CEE_DCBX_MAX_PRIO) {
++ 		netdev_err(netdev,
++ 			   "%s, priority is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	if (setting > 1)
++ 		return;
++ 
++ 	cee_cfg->pfc_setting[priority] = setting;
++ }
++ 
++ static int
++ mlx5e_dcbnl_get_priority_pfc(struct net_device *netdev,
++ 			     int priority, u8 *setting)
++ {
++ 	struct ieee_pfc pfc;
++ 	int err;
++ 
++ 	err = mlx5e_dcbnl_ieee_getpfc(netdev, &pfc);
++ 
++ 	if (err)
++ 		*setting = 0;
++ 	else
++ 		*setting = (pfc.pfc_en >> priority) & 0x01;
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_dcbnl_getpfccfg(struct net_device *netdev,
++ 				  int priority, u8 *setting)
++ {
++ 	if (priority >= CEE_DCBX_MAX_PRIO) {
++ 		netdev_err(netdev,
++ 			   "%s, priority is out of range\n", __func__);
++ 		return;
++ 	}
++ 
++ 	if (!setting)
++ 		return;
++ 
++ 	mlx5e_dcbnl_get_priority_pfc(netdev, priority, setting);
++ }
++ 
++ static u8 mlx5e_dcbnl_getcap(struct net_device *netdev,
++ 			     int capid, u8 *cap)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	u8 rval = 0;
++ 
++ 	switch (capid) {
++ 	case DCB_CAP_ATTR_PG:
++ 		*cap = true;
++ 		break;
++ 	case DCB_CAP_ATTR_PFC:
++ 		*cap = true;
++ 		break;
++ 	case DCB_CAP_ATTR_UP2TC:
++ 		*cap = false;
++ 		break;
++ 	case DCB_CAP_ATTR_PG_TCS:
++ 		*cap = 1 << mlx5_max_tc(mdev);
++ 		break;
++ 	case DCB_CAP_ATTR_PFC_TCS:
++ 		*cap = 1 << mlx5_max_tc(mdev);
++ 		break;
++ 	case DCB_CAP_ATTR_GSP:
++ 		*cap = false;
++ 		break;
++ 	case DCB_CAP_ATTR_BCN:
++ 		*cap = false;
++ 		break;
++ 	case DCB_CAP_ATTR_DCBX:
++ 		*cap = (DCB_CAP_DCBX_LLD_MANAGED |
++ 			DCB_CAP_DCBX_VER_CEE |
++ 			DCB_CAP_DCBX_STATIC);
++ 		break;
++ 	default:
++ 		*cap = 0;
++ 		rval = 1;
++ 		break;
++ 	}
++ 
++ 	return rval;
++ }
++ 
++ static int mlx5e_dcbnl_getnumtcs(struct net_device *netdev,
++ 				 int tcs_id, u8 *num)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	switch (tcs_id) {
++ 	case DCB_NUMTCS_ATTR_PG:
++ 	case DCB_NUMTCS_ATTR_PFC:
++ 		*num = mlx5_max_tc(mdev) + 1;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static u8 mlx5e_dcbnl_getpfcstate(struct net_device *netdev)
++ {
++ 	struct ieee_pfc pfc;
++ 
++ 	if (mlx5e_dcbnl_ieee_getpfc(netdev, &pfc))
++ 		return MLX5E_CEE_STATE_DOWN;
++ 
++ 	return pfc.pfc_en ? MLX5E_CEE_STATE_UP : MLX5E_CEE_STATE_DOWN;
++ }
++ 
++ static void mlx5e_dcbnl_setpfcstate(struct net_device *netdev, u8 state)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_cee_config *cee_cfg = &priv->dcbx.cee_cfg;
++ 
++ 	if ((state != MLX5E_CEE_STATE_UP) && (state != MLX5E_CEE_STATE_DOWN))
++ 		return;
++ 
++ 	cee_cfg->pfc_enable = state;
++ }
++ 
+++>>>>>>> 820c2c5e773d (net/mlx5e: Read ETS settings directly from firmware)
+  const struct dcbnl_rtnl_ops mlx5e_dcbnl_ops = {
+  	.ieee_getets	= mlx5e_dcbnl_ieee_getets,
+  	.ieee_setets	= mlx5e_dcbnl_ieee_setets,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index cc20a22c48b8,b1e8ec545e79..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2823,14 -3518,6 +2832,17 @@@ static void mlx5e_build_netdev_priv(str
+  	MLX5E_SET_PRIV_FLAG(priv, MLX5E_PFLAG_RX_CQE_BASED_MODER,
+  			    priv->params.rx_cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE);
+  
+++<<<<<<< HEAD
+ +	priv->mdev                         = mdev;
+ +	priv->netdev                       = netdev;
+ +	priv->params.num_channels          = num_channels;
+ +
+ +#ifdef CONFIG_MLX5_CORE_EN_DCB
+ +	mlx5e_ets_init(priv);
+ +#endif
+ +
+++=======
+++>>>>>>> 820c2c5e773d (net/mlx5e: Read ETS settings directly from firmware)
+  	mutex_init(&priv->state_lock);
+  
+  	INIT_WORK(&priv->update_carrier_work, mlx5e_update_carrier_work);
+@@@ -3003,18 -3688,176 +3015,181 @@@ static int mlx5e_create_umr_mkey(struc
+  	return err;
+  }
+  
+ -static void mlx5e_nic_init(struct mlx5_core_dev *mdev,
+ -			   struct net_device *netdev,
+ -			   const struct mlx5e_profile *profile,
+ -			   void *ppriv)
+ +static void *mlx5e_create_netdev(struct mlx5_core_dev *mdev)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	mlx5e_build_nic_netdev_priv(mdev, netdev, profile, ppriv);
++ 	mlx5e_build_nic_netdev(netdev);
++ 	mlx5e_vxlan_init(priv);
++ }
++ 
++ static void mlx5e_nic_cleanup(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	mlx5e_vxlan_cleanup(priv);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		mlx5_eswitch_unregister_vport_rep(esw, 0);
++ 
++ 	if (priv->xdp_prog)
++ 		bpf_prog_put(priv->xdp_prog);
++ }
++ 
++ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	int err;
++ 	int i;
++ 
++ 	err = mlx5e_create_indirect_rqts(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create indirect rqts failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	err = mlx5e_create_direct_rqts(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create direct rqts failed, %d\n", err);
++ 		goto err_destroy_indirect_rqts;
++ 	}
++ 
++ 	err = mlx5e_create_indirect_tirs(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create indirect tirs failed, %d\n", err);
++ 		goto err_destroy_direct_rqts;
++ 	}
++ 
++ 	err = mlx5e_create_direct_tirs(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create direct tirs failed, %d\n", err);
++ 		goto err_destroy_indirect_tirs;
++ 	}
++ 
++ 	err = mlx5e_create_flow_steering(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
++ 		goto err_destroy_direct_tirs;
++ 	}
++ 
++ 	err = mlx5e_tc_init(priv);
++ 	if (err)
++ 		goto err_destroy_flow_steering;
++ 
++ 	return 0;
++ 
++ err_destroy_flow_steering:
++ 	mlx5e_destroy_flow_steering(priv);
++ err_destroy_direct_tirs:
++ 	mlx5e_destroy_direct_tirs(priv);
++ err_destroy_indirect_tirs:
++ 	mlx5e_destroy_indirect_tirs(priv);
++ err_destroy_direct_rqts:
++ 	for (i = 0; i < priv->profile->max_nch(mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
++ err_destroy_indirect_rqts:
++ 	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
++ 	return err;
++ }
++ 
++ static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
++ {
++ 	int i;
++ 
++ 	mlx5e_tc_cleanup(priv);
++ 	mlx5e_destroy_flow_steering(priv);
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
++ 	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
++ }
++ 
++ static int mlx5e_init_nic_tx(struct mlx5e_priv *priv)
++ {
++ 	int err;
++ 
++ 	err = mlx5e_create_tises(priv);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "create tises failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	mlx5e_ets_init(priv);
++ #endif
++ 	return 0;
++ }
++ 
++ static void mlx5e_nic_enable(struct mlx5e_priv *priv)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 	struct mlx5_eswitch_rep rep;
++ 
++ 	mlx5_lag_add(mdev, netdev);
++ 
++ 	if (mlx5e_vxlan_allowed(mdev)) {
++ 		rtnl_lock();
++ 		udp_tunnel_get_rx_info(netdev);
++ 		rtnl_unlock();
++ 	}
++ 
++ 	mlx5e_enable_async_events(priv);
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager)) {
++ 		mlx5_query_nic_vport_mac_address(mdev, 0, rep.hw_id);
++ 		rep.load = mlx5e_nic_rep_load;
++ 		rep.unload = mlx5e_nic_rep_unload;
++ 		rep.vport = FDB_UPLINK_VPORT;
++ 		rep.priv_data = priv;
++ 		mlx5_eswitch_register_vport_rep(esw, 0, &rep);
++ 	}
++ }
++ 
++ static void mlx5e_nic_disable(struct mlx5e_priv *priv)
++ {
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ 	mlx5e_disable_async_events(priv);
++ 	mlx5_lag_remove(priv->mdev);
++ }
++ 
++ static const struct mlx5e_profile mlx5e_nic_profile = {
++ 	.init		   = mlx5e_nic_init,
++ 	.cleanup	   = mlx5e_nic_cleanup,
++ 	.init_rx	   = mlx5e_init_nic_rx,
++ 	.cleanup_rx	   = mlx5e_cleanup_nic_rx,
++ 	.init_tx	   = mlx5e_init_nic_tx,
++ 	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
++ 	.enable		   = mlx5e_nic_enable,
++ 	.disable	   = mlx5e_nic_disable,
++ 	.update_stats	   = mlx5e_update_stats,
++ 	.max_nch	   = mlx5e_get_max_num_channels,
++ 	.max_tc		   = MLX5E_MAX_NUM_TC,
++ };
++ 
++ struct net_device *mlx5e_create_netdev(struct mlx5_core_dev *mdev,
++ 				       const struct mlx5e_profile *profile,
++ 				       void *ppriv)
++ {
++ 	int nch = profile->max_nch(mdev);
+++>>>>>>> 820c2c5e773d (net/mlx5e: Read ETS settings directly from firmware)
+  	struct net_device *netdev;
+  	struct mlx5e_priv *priv;
+ +	int nch = mlx5e_get_max_num_channels(mdev);
+ +	int err;
+ +
+ +	if (mlx5e_check_required_hca_cap(mdev))
+ +		return NULL;
+  
+  	netdev = alloc_etherdev_mqs(sizeof(struct mlx5e_priv),
+ -				    nch * profile->max_tc,
+ +				    nch * MLX5E_MAX_NUM_TC,
+  				    nch);
+  	if (!netdev) {
+  		mlx5_core_err(mdev, "alloc_etherdev_mqs() failed\n");
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_dcbnl.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
