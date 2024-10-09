@@ -642,7 +642,10 @@ static int dlpar_memory_remove_by_index(u32 drc_index, struct property *prop)
 {
 	return -EOPNOTSUPP;
 }
-
+static int dlpar_memory_readd_by_index(u32 drc_index, struct property *prop)
+{
+	return -EOPNOTSUPP;
+}
 #endif /* CONFIG_MEMORY_HOTREMOVE */
 
 static int dlpar_add_lmb_memory(struct of_drconf_cell *lmb)
