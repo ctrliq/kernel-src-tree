@@ -1,0 +1,236 @@
+mm/hugetlbfs: unmap pages if page fault raced with hole punch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 4aae8d1c051ea00b456da6811bc36d1f69de5445
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4aae8d1c.failed
+
+Page faults can race with fallocate hole punch.  If a page fault happens
+between the unmap and remove operations, the page is not removed and
+remains within the hole.  This is not the desired behavior.  The race is
+difficult to detect in user level code as even in the non-race case, a
+page within the hole could be faulted back in before fallocate returns.
+If userfaultfd is expanded to support hugetlbfs in the future, this race
+will be easier to observe.
+
+If this race is detected and a page is mapped, the remove operation
+(remove_inode_hugepages) will unmap the page before removing.  The unmap
+within remove_inode_hugepages occurs with the hugetlb_fault_mutex held
+so that no other faults will be processed until the page is removed.
+
+The (unmodified) routine hugetlb_vmdelete_list was moved ahead of
+remove_inode_hugepages to satisfy the new reference.
+
+[akpm@linux-foundation.org: move hugetlb_vmdelete_list()]
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4aae8d1c051ea00b456da6811bc36d1f69de5445)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/hugetlbfs/inode.c
+diff --cc fs/hugetlbfs/inode.c
+index bf25a49de3ab,8bbf7f3e2a27..000000000000
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@@ -354,7 -324,67 +354,71 @@@ static void truncate_huge_page(struct p
+  	delete_from_page_cache(page);
+  }
+  
+++<<<<<<< HEAD
+ +static void truncate_hugepages(struct inode *inode, loff_t lstart)
+++=======
++ static void
++ hugetlb_vmdelete_list(struct rb_root *root, pgoff_t start, pgoff_t end)
++ {
++ 	struct vm_area_struct *vma;
++ 
++ 	/*
++ 	 * end == 0 indicates that the entire range after
++ 	 * start should be unmapped.
++ 	 */
++ 	vma_interval_tree_foreach(vma, root, start, end ? end : ULONG_MAX) {
++ 		unsigned long v_offset;
++ 		unsigned long v_end;
++ 
++ 		/*
++ 		 * Can the expression below overflow on 32-bit arches?
++ 		 * No, because the interval tree returns us only those vmas
++ 		 * which overlap the truncated area starting at pgoff,
++ 		 * and no vma on a 32-bit arch can span beyond the 4GB.
++ 		 */
++ 		if (vma->vm_pgoff < start)
++ 			v_offset = (start - vma->vm_pgoff) << PAGE_SHIFT;
++ 		else
++ 			v_offset = 0;
++ 
++ 		if (!end)
++ 			v_end = vma->vm_end;
++ 		else {
++ 			v_end = ((end - vma->vm_pgoff) << PAGE_SHIFT)
++ 							+ vma->vm_start;
++ 			if (v_end > vma->vm_end)
++ 				v_end = vma->vm_end;
++ 		}
++ 
++ 		unmap_hugepage_range(vma, vma->vm_start + v_offset, v_end,
++ 									NULL);
++ 	}
++ }
++ 
++ /*
++  * remove_inode_hugepages handles two distinct cases: truncation and hole
++  * punch.  There are subtle differences in operation for each case.
++  *
++  * truncation is indicated by end of range being LLONG_MAX
++  *	In this case, we first scan the range and release found pages.
++  *	After releasing pages, hugetlb_unreserve_pages cleans up region/reserv
++  *	maps and global counts.  Page faults can not race with truncation
++  *	in this routine.  hugetlb_no_page() prevents page faults in the
++  *	truncated range.  It checks i_size before allocation, and again after
++  *	with the page table lock for the page held.  The same lock must be
++  *	acquired to unmap a page.
++  * hole punch is indicated if end is not LLONG_MAX
++  *	In the hole punch case we scan the range and release found pages.
++  *	Only when releasing a page is the associated region/reserv map
++  *	deleted.  The region/reserv map for ranges without associated
++  *	pages are not modified.  Page faults can race with hole punch.
++  *	This is indicated if we find a mapped page.
++  * Note: If the passed end of range value is beyond the end of file, but
++  * not LLONG_MAX this routine still performs a hole punch operation.
++  */
++ static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
++ 				   loff_t lend)
+++>>>>>>> 4aae8d1c051e (mm/hugetlbfs: unmap pages if page fault raced with hole punch)
+  {
+  	struct hstate *h = hstate_inode(inode);
+  	struct address_space *mapping = &inode->i_data;
+@@@ -375,19 -416,72 +439,78 @@@
+  
+  		for (i = 0; i < pagevec_count(&pvec); ++i) {
+  			struct page *page = pvec.pages[i];
+++<<<<<<< HEAD
+ +
+ +			lock_page(page);
+ +			if (page->index > next)
+ +				next = page->index;
+ +			++next;
+ +			truncate_huge_page(page);
+++=======
++ 			bool rsv_on_error;
++ 			u32 hash;
++ 
++ 			/*
++ 			 * The page (index) could be beyond end.  This is
++ 			 * only possible in the punch hole case as end is
++ 			 * max page offset in the truncate case.
++ 			 */
++ 			next = page->index;
++ 			if (next >= end)
++ 				break;
++ 
++ 			hash = hugetlb_fault_mutex_hash(h, current->mm,
++ 							&pseudo_vma,
++ 							mapping, next, 0);
++ 			mutex_lock(&hugetlb_fault_mutex_table[hash]);
++ 
++ 			/*
++ 			 * If page is mapped, it was faulted in after being
++ 			 * unmapped in caller.  Unmap (again) now after taking
++ 			 * the fault mutex.  The mutex will prevent faults
++ 			 * until we finish removing the page.
++ 			 *
++ 			 * This race can only happen in the hole punch case.
++ 			 * Getting here in a truncate operation is a bug.
++ 			 */
++ 			if (unlikely(page_mapped(page))) {
++ 				BUG_ON(truncate_op);
++ 
++ 				i_mmap_lock_write(mapping);
++ 				hugetlb_vmdelete_list(&mapping->i_mmap,
++ 					next * pages_per_huge_page(h),
++ 					(next + 1) * pages_per_huge_page(h));
++ 				i_mmap_unlock_write(mapping);
++ 			}
++ 
++ 			lock_page(page);
++ 			/*
++ 			 * We must free the huge page and remove from page
++ 			 * cache (remove_huge_page) BEFORE removing the
++ 			 * region/reserve map (hugetlb_unreserve_pages).  In
++ 			 * rare out of memory conditions, removal of the
++ 			 * region/reserve map could fail.  Before free'ing
++ 			 * the page, note PagePrivate which is used in case
++ 			 * of error.
++ 			 */
++ 			rsv_on_error = !PagePrivate(page);
++ 			remove_huge_page(page);
++ 			freed++;
++ 			if (!truncate_op) {
++ 				if (unlikely(hugetlb_unreserve_pages(inode,
++ 							next, next + 1, 1)))
++ 					hugetlb_fix_reserve_counts(inode,
++ 								rsv_on_error);
++ 			}
++ 
+++>>>>>>> 4aae8d1c051e (mm/hugetlbfs: unmap pages if page fault raced with hole punch)
+  			unlock_page(page);
+ -			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+ +			freed++;
+  		}
+ -		++next;
+  		huge_pagevec_release(&pvec);
+ -		cond_resched();
+  	}
+ -
+ -	if (truncate_op)
+ -		(void)hugetlb_unreserve_pages(inode, start, LONG_MAX, freed);
+ +	BUG_ON(!lstart && mapping->nrpages);
+ +	hugetlb_unreserve_pages(inode, start, freed);
+  }
+  
+  static void hugetlbfs_evict_inode(struct inode *inode)
+@@@ -402,30 -496,6 +525,33 @@@
+  	clear_inode(inode);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void
+ +hugetlb_vmtruncate_list(struct rb_root *root, pgoff_t pgoff)
+ +{
+ +	struct vm_area_struct *vma;
+ +
+ +	vma_interval_tree_foreach(vma, root, pgoff, ULONG_MAX) {
+ +		unsigned long v_offset;
+ +
+ +		/*
+ +		 * Can the expression below overflow on 32-bit arches?
+ +		 * No, because the interval tree returns us only those vmas
+ +		 * which overlap the truncated area starting at pgoff,
+ +		 * and no vma on a 32-bit arch can span beyond the 4GB.
+ +		 */
+ +		if (vma->vm_pgoff < pgoff)
+ +			v_offset = (pgoff - vma->vm_pgoff) << PAGE_SHIFT;
+ +		else
+ +			v_offset = 0;
+ +
+ +		unmap_hugepage_range(vma, vma->vm_start + v_offset,
+ +				     vma->vm_end, NULL);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 4aae8d1c051e (mm/hugetlbfs: unmap pages if page fault raced with hole punch)
+  static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
+  {
+  	pgoff_t pgoff;
+* Unmerged path fs/hugetlbfs/inode.c
