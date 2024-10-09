@@ -1,0 +1,182 @@
+kvm/x86: Export MDS_NO=0 to guests when TSX is enabled
+
+jira LE-1907
+cve CVE-2019-19338
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+commit e1d38b63acd843cfdd4222bf19a26700fd5c699e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/e1d38b63.failed
+
+Export the IA32_ARCH_CAPABILITIES MSR bit MDS_NO=0 to guests on TSX
+Async Abort(TAA) affected hosts that have TSX enabled and updated
+microcode. This is required so that the guests don't complain,
+
+  "Vulnerable: Clear CPU buffers attempted, no microcode"
+
+when the host has the updated microcode to clear CPU buffers.
+
+Microcode update also adds support for MSR_IA32_TSX_CTRL which is
+enumerated by the ARCH_CAP_TSX_CTRL bit in IA32_ARCH_CAPABILITIES MSR.
+Guests can't do this check themselves when the ARCH_CAP_TSX_CTRL bit is
+not exported to the guests.
+
+In this case export MDS_NO=0 to the guests. When guests have
+CPUID.MD_CLEAR=1, they deploy MDS mitigation which also mitigates TAA.
+
+	Signed-off-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Neelima Krishnan <neelima.krishnan@intel.com>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+(cherry picked from commit e1d38b63acd843cfdd4222bf19a26700fd5c699e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 69feb8491cac,32d70ca2a7fd..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1039,6 -1241,134 +1039,137 @@@ static u32 emulated_msrs[] = 
+  
+  static unsigned num_emulated_msrs;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * List of msr numbers which are used to expose MSR-based features that
++  * can be used by a hypervisor to validate requested CPU features.
++  */
++ static u32 msr_based_features[] = {
++ 	MSR_IA32_VMX_BASIC,
++ 	MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++ 	MSR_IA32_VMX_PINBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_EXIT_CTLS,
++ 	MSR_IA32_VMX_EXIT_CTLS,
++ 	MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++ 	MSR_IA32_VMX_ENTRY_CTLS,
++ 	MSR_IA32_VMX_MISC,
++ 	MSR_IA32_VMX_CR0_FIXED0,
++ 	MSR_IA32_VMX_CR0_FIXED1,
++ 	MSR_IA32_VMX_CR4_FIXED0,
++ 	MSR_IA32_VMX_CR4_FIXED1,
++ 	MSR_IA32_VMX_VMCS_ENUM,
++ 	MSR_IA32_VMX_PROCBASED_CTLS2,
++ 	MSR_IA32_VMX_EPT_VPID_CAP,
++ 	MSR_IA32_VMX_VMFUNC,
++ 
++ 	MSR_F10H_DECFG,
++ 	MSR_IA32_UCODE_REV,
++ 	MSR_IA32_ARCH_CAPABILITIES,
++ };
++ 
++ static unsigned int num_msr_based_features;
++ 
++ static u64 kvm_get_arch_capabilities(void)
++ {
++ 	u64 data = 0;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
++ 		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, data);
++ 
++ 	/*
++ 	 * If we're doing cache flushes (either "always" or "cond")
++ 	 * we will do one whenever the guest does a vmlaunch/vmresume.
++ 	 * If an outer hypervisor is doing the cache flush for us
++ 	 * (VMENTER_L1D_FLUSH_NESTED_VM), we can safely pass that
++ 	 * capability to the guest too, and if EPT is disabled we're not
++ 	 * vulnerable.  Overall, only VMENTER_L1D_FLUSH_NEVER will
++ 	 * require a nested hypervisor to do a flush of its own.
++ 	 */
++ 	if (l1tf_vmx_mitigation != VMENTER_L1D_FLUSH_NEVER)
++ 		data |= ARCH_CAP_SKIP_VMENTRY_L1DFLUSH;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
++ 		data |= ARCH_CAP_RDCL_NO;
++ 	if (!boot_cpu_has_bug(X86_BUG_SPEC_STORE_BYPASS))
++ 		data |= ARCH_CAP_SSB_NO;
++ 	if (!boot_cpu_has_bug(X86_BUG_MDS))
++ 		data |= ARCH_CAP_MDS_NO;
++ 
++ 	/*
++ 	 * On TAA affected systems, export MDS_NO=0 when:
++ 	 *	- TSX is enabled on the host, i.e. X86_FEATURE_RTM=1.
++ 	 *	- Updated microcode is present. This is detected by
++ 	 *	  the presence of ARCH_CAP_TSX_CTRL_MSR and ensures
++ 	 *	  that VERW clears CPU buffers.
++ 	 *
++ 	 * When MDS_NO=0 is exported, guests deploy clear CPU buffer
++ 	 * mitigation and don't complain:
++ 	 *
++ 	 *	"Vulnerable: Clear CPU buffers attempted, no microcode"
++ 	 *
++ 	 * If TSX is disabled on the system, guests are also mitigated against
++ 	 * TAA and clear CPU buffer mitigation is not required for guests.
++ 	 */
++ 	if (boot_cpu_has_bug(X86_BUG_TAA) && boot_cpu_has(X86_FEATURE_RTM) &&
++ 	    (data & ARCH_CAP_TSX_CTRL_MSR))
++ 		data &= ~ARCH_CAP_MDS_NO;
++ 
++ 	return data;
++ }
++ 
++ static int kvm_get_msr_feature(struct kvm_msr_entry *msr)
++ {
++ 	switch (msr->index) {
++ 	case MSR_IA32_ARCH_CAPABILITIES:
++ 		msr->data = kvm_get_arch_capabilities();
++ 		break;
++ 	case MSR_IA32_UCODE_REV:
++ 		rdmsrl_safe(msr->index, &msr->data);
++ 		break;
++ 	default:
++ 		if (kvm_x86_ops->get_msr_feature(msr))
++ 			return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static int do_get_msr_feature(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
++ {
++ 	struct kvm_msr_entry msr;
++ 	int r;
++ 
++ 	msr.index = index;
++ 	r = kvm_get_msr_feature(&msr);
++ 	if (r)
++ 		return r;
++ 
++ 	*data = msr.data;
++ 
++ 	return 0;
++ }
++ 
++ static bool __kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
++ {
++ 	if (efer & EFER_FFXSR && !guest_cpuid_has(vcpu, X86_FEATURE_FXSR_OPT))
++ 		return false;
++ 
++ 	if (efer & EFER_SVME && !guest_cpuid_has(vcpu, X86_FEATURE_SVM))
++ 		return false;
++ 
++ 	if (efer & (EFER_LME | EFER_LMA) &&
++ 	    !guest_cpuid_has(vcpu, X86_FEATURE_LM))
++ 		return false;
++ 
++ 	if (efer & EFER_NX && !guest_cpuid_has(vcpu, X86_FEATURE_NX))
++ 		return false;
++ 
++ 	return true;
++ 
++ }
+++>>>>>>> e1d38b63acd8 (kvm/x86: Export MDS_NO=0 to guests when TSX is enabled)
+  bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
+  {
+  	if (efer & efer_reserved_bits)
+* Unmerged path arch/x86/kvm/x86.c
