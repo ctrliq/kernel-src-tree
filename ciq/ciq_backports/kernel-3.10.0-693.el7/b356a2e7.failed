@@ -1,0 +1,246 @@
+bnxt_en: Remove busy poll logic in the driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Remove busy poll logic in the driver (Jonathan Toppins) [1382378]
+Rebuild_FUZZ: 98.90%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit b356a2e729cec145a648d22ba5686357c009da25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b356a2e7.failed
+
+Use native NAPI polling instead.  The next patch will complete the work
+by switching to use napi_complete_done()
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b356a2e729cec145a648d22ba5686357c009da25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 124426f5374f,fddc316170b2..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1115,92 -1122,12 +1103,101 @@@ struct bnxt 
+  	u32			lpi_tmr_hi;
+  };
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_RX_BUSY_POLL
+ +static inline void bnxt_enable_poll(struct bnxt_napi *bnapi)
+ +{
+ +	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
+ +}
+ +
+ +/* called from the NAPI poll routine to get ownership of a bnapi */
+ +static inline bool bnxt_lock_napi(struct bnxt_napi *bnapi)
+ +{
+ +	int rc = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
+ +				BNXT_STATE_NAPI);
+ +
+ +	return rc == BNXT_STATE_IDLE;
+ +}
+ +
+ +static inline void bnxt_unlock_napi(struct bnxt_napi *bnapi)
+ +{
+ +	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
+ +}
+ +
+ +/* called from the busy poll routine to get ownership of a bnapi */
+ +static inline bool bnxt_lock_poll(struct bnxt_napi *bnapi)
+ +{
+ +	int rc = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
+ +				BNXT_STATE_POLL);
+ +
+ +	return rc == BNXT_STATE_IDLE;
+ +}
+ +
+ +static inline void bnxt_unlock_poll(struct bnxt_napi *bnapi)
+ +{
+ +	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
+ +}
+ +
+ +static inline bool bnxt_busy_polling(struct bnxt_napi *bnapi)
+ +{
+ +	return atomic_read(&bnapi->poll_state) == BNXT_STATE_POLL;
+ +}
+ +
+ +static inline void bnxt_disable_poll(struct bnxt_napi *bnapi)
+ +{
+ +	int old;
+ +
+ +	while (1) {
+ +		old = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
+ +				     BNXT_STATE_DISABLE);
+ +		if (old == BNXT_STATE_IDLE)
+ +			break;
+ +		usleep_range(500, 5000);
+ +	}
+ +}
+ +
+ +#else
+ +
+ +static inline void bnxt_enable_poll(struct bnxt_napi *bnapi)
+ +{
+ +}
+ +
+ +static inline bool bnxt_lock_napi(struct bnxt_napi *bnapi)
+ +{
+ +	return true;
+ +}
+ +
+ +static inline void bnxt_unlock_napi(struct bnxt_napi *bnapi)
+ +{
+ +}
+ +
+ +static inline bool bnxt_lock_poll(struct bnxt_napi *bnapi)
+ +{
+ +	return false;
+ +}
+ +
+ +static inline void bnxt_unlock_poll(struct bnxt_napi *bnapi)
+ +{
+ +}
+ +
+ +static inline bool bnxt_busy_polling(struct bnxt_napi *bnapi)
+ +{
+ +	return false;
+ +}
+ +
+ +static inline void bnxt_disable_poll(struct bnxt_napi *bnapi)
+ +{
+ +}
+ +
+ +#endif
+++=======
++ #define BNXT_RX_STATS_OFFSET(counter)			\
++ 	(offsetof(struct rx_port_stats, counter) / 8)
++ 
++ #define BNXT_TX_STATS_OFFSET(counter)			\
++ 	((offsetof(struct tx_port_stats, counter) +	\
++ 	  sizeof(struct rx_port_stats) + 512) / 8)
+++>>>>>>> b356a2e729ce (bnxt_en: Remove busy poll logic in the driver.)
+  
+  #define I2C_DEV_ADDR_A0				0xa0
+  #define I2C_DEV_ADDR_A2				0xa2
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 9c937f6fd3af..53db83717f49 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -39,9 +39,6 @@
+ #include <net/checksum.h>
+ #include <net/ip6_checksum.h>
+ #include <net/udp_tunnel.h>
+-#ifdef CONFIG_NET_RX_BUSY_POLL
+-#include <net/busy_poll.h>
+-#endif
+ #include <linux/workqueue.h>
+ #include <linux/prefetch.h>
+ #include <linux/cache.h>
+@@ -1347,11 +1344,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
+ 		rc = -ENOMEM;
+ 		if (likely(skb)) {
+ 			skb_record_rx_queue(skb, bnapi->index);
+-			skb_mark_napi_id(skb, &bnapi->napi);
+-			if (bnxt_busy_polling(bnapi))
+-				netif_receive_skb(skb);
+-			else
+-				napi_gro_receive(&bnapi->napi, skb);
++			napi_gro_receive(&bnapi->napi, skb);
+ 			rc = 1;
+ 		}
+ 		goto next_rx_no_prod;
+@@ -1451,11 +1444,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
+ 	}
+ 
+ 	skb_record_rx_queue(skb, bnapi->index);
+-	skb_mark_napi_id(skb, &bnapi->napi);
+-	if (bnxt_busy_polling(bnapi))
+-		netif_receive_skb(skb);
+-	else
+-		napi_gro_receive(&bnapi->napi, skb);
++	napi_gro_receive(&bnapi->napi, skb);
+ 	rc = 1;
+ 
+ next_rx:
+@@ -1774,9 +1763,6 @@ static int bnxt_poll(struct napi_struct *napi, int budget)
+ 	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+ 	int work_done = 0;
+ 
+-	if (!bnxt_lock_napi(bnapi))
+-		return budget;
+-
+ 	while (1) {
+ 		work_done += bnxt_poll_work(bp, bnapi, budget - work_done);
+ 
+@@ -1790,36 +1776,9 @@ static int bnxt_poll(struct napi_struct *napi, int budget)
+ 		}
+ 	}
+ 	mmiowb();
+-	bnxt_unlock_napi(bnapi);
+ 	return work_done;
+ }
+ 
+-#ifdef CONFIG_NET_RX_BUSY_POLL
+-static int bnxt_busy_poll(struct napi_struct *napi)
+-{
+-	struct bnxt_napi *bnapi = container_of(napi, struct bnxt_napi, napi);
+-	struct bnxt *bp = bnapi->bp;
+-	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+-	int rx_work, budget = 4;
+-
+-	if (atomic_read(&bp->intr_sem) != 0)
+-		return LL_FLUSH_FAILED;
+-
+-	if (!bp->link_info.link_up)
+-		return LL_FLUSH_FAILED;
+-
+-	if (!bnxt_lock_poll(bnapi))
+-		return LL_FLUSH_BUSY;
+-
+-	rx_work = bnxt_poll_work(bp, bnapi, budget);
+-
+-	BNXT_CP_DB_REARM(cpr->cp_doorbell, cpr->cp_raw_cons);
+-
+-	bnxt_unlock_poll(bnapi);
+-	return rx_work;
+-}
+-#endif
+-
+ static void bnxt_free_tx_skbs(struct bnxt *bp)
+ {
+ 	int i, max_idx;
+@@ -4983,10 +4942,8 @@ static void bnxt_disable_napi(struct bnxt *bp)
+ 	if (!bp->bnapi)
+ 		return;
+ 
+-	for (i = 0; i < bp->cp_nr_rings; i++) {
++	for (i = 0; i < bp->cp_nr_rings; i++)
+ 		napi_disable(&bp->bnapi[i]->napi);
+-		bnxt_disable_poll(bp->bnapi[i]);
+-	}
+ }
+ 
+ static void bnxt_enable_napi(struct bnxt *bp)
+@@ -4995,7 +4952,6 @@ static void bnxt_enable_napi(struct bnxt *bp)
+ 
+ 	for (i = 0; i < bp->cp_nr_rings; i++) {
+ 		bp->bnapi[i]->in_reset = false;
+-		bnxt_enable_poll(bp->bnapi[i]);
+ 		napi_enable(&bp->bnapi[i]->napi);
+ 	}
+ }
+@@ -6646,9 +6602,6 @@ static const struct net_device_ops bnxt_netdev_ops = {
+ #endif
+ 	.ndo_udp_tunnel_add	= bnxt_udp_tunnel_add,
+ 	.ndo_udp_tunnel_del	= bnxt_udp_tunnel_del,
+-#ifdef CONFIG_NET_RX_BUSY_POLL
+-	.ndo_busy_poll		= bnxt_busy_poll,
+-#endif
+ };
+ 
+ static void bnxt_remove_one(struct pci_dev *pdev)
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
