@@ -1,0 +1,159 @@
+ext4: update i_disksize if direct write past ondisk size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Eryu Guan <guaneryu@gmail.com>
+commit 45d8ec4d9fd5468c08f2ef0b2b132bb62dc81a3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/45d8ec4d.failed
+
+Currently in ext4 direct write path, we update i_disksize only when
+new eof is greater than i_size, and don't update it even when new
+eof is greater than i_disksize but less than i_size. This doesn't
+work well with delalloc buffer write, which updates i_size and
+i_disksize only when delalloc blocks are resolved (at writeback
+time), the i_disksize from direct write can be lost if a previous
+buffer write succeeded at write time but failed at writeback time,
+then results in corrupted ondisk inode size.
+
+Consider this case, first buffer write 4k data to a new file at
+offset 16k with delayed allocation, then direct write 4k data to the
+same file at offset 4k before delalloc blocks are resolved, which
+doesn't update i_disksize because it writes within i_size(20k), but
+the extent tree metadata has been committed in journal. Then
+writeback of the delalloc blocks fails (due to device error etc.),
+and i_size/i_disksize from buffer write can't be written to disk
+(still zero). A subsequent umount/mount cycle recovers journal and
+writes extent tree metadata from direct write to disk, but with
+i_disksize being zero.
+
+Fix it by updating i_disksize too in direct write path when new eof
+is greater than i_disksize but less than i_size, so i_disksize is
+always consistent with direct write.
+
+This fixes occasional i_size corruption in fstests generic/475.
+
+	Signed-off-by: Eryu Guan <guaneryu@gmail.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 45d8ec4d9fd5468c08f2ef0b2b132bb62dc81a3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/inode.c
+diff --cc fs/ext4/inode.c
+index 83725648daac,9acac476c15c..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3294,17 -3658,33 +3294,37 @@@ static ssize_t ext4_ext_direct_IO(int r
+  {
+  	struct file *file = iocb->ki_filp;
+  	struct inode *inode = file->f_mapping->host;
++ 	struct ext4_inode_info *ei = EXT4_I(inode);
+  	ssize_t ret;
+ -	loff_t offset = iocb->ki_pos;
+ -	size_t count = iov_iter_count(iter);
+ +	size_t count = iov_length(iov, nr_segs);
+  	int overwrite = 0;
+  	get_block_t *get_block_func = NULL;
+  	int dio_flags = 0;
+  	loff_t final_size = offset + count;
+ -	int orphan = 0;
+ -	handle_t *handle;
+ +	ext4_io_end_t *io_end = NULL;
+  
+++<<<<<<< HEAD
+ +	/* Use the old path for reads and writes beyond i_size. */
+ +	if (rw != WRITE || final_size > inode->i_size)
+ +		return ext4_ind_direct_IO(rw, iocb, iov, offset, nr_segs);
+++=======
++ 	if (final_size > inode->i_size || final_size > ei->i_disksize) {
++ 		/* Credits for sb + inode write */
++ 		handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 		if (IS_ERR(handle)) {
++ 			ret = PTR_ERR(handle);
++ 			goto out;
++ 		}
++ 		ret = ext4_orphan_add(handle, inode);
++ 		if (ret) {
++ 			ext4_journal_stop(handle);
++ 			goto out;
++ 		}
++ 		orphan = 1;
++ 		ext4_update_i_disksize(inode, inode->i_size);
++ 		ext4_journal_stop(handle);
++ 	}
+++>>>>>>> 45d8ec4d9fd5 (ext4: update i_disksize if direct write past ondisk size)
+  
+  	BUG_ON(iocb->private == NULL);
+  
+@@@ -3408,13 -3753,61 +3428,66 @@@
+  		ext4_clear_inode_state(inode, EXT4_STATE_DIO_UNWRITTEN);
+  	}
+  
+ -	inode_dio_end(inode);
+ +retake_lock:
+ +	if (rw == WRITE)
+ +		inode_dio_end(inode);
+  	/* take i_mutex locking again if we do a ovewrite dio */
+  	if (overwrite)
+ -		inode_lock(inode);
+ +		mutex_lock(&inode->i_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ret < 0 && final_size > inode->i_size)
++ 		ext4_truncate_failed_write(inode);
++ 
++ 	/* Handle extending of i_size after direct IO write */
++ 	if (orphan) {
++ 		int err;
++ 
++ 		/* Credits for sb + inode write */
++ 		handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 		if (IS_ERR(handle)) {
++ 			/*
++ 			 * We wrote the data but cannot extend
++ 			 * i_size. Bail out. In async io case, we do
++ 			 * not return error here because we have
++ 			 * already submmitted the corresponding
++ 			 * bio. Returning error here makes the caller
++ 			 * think that this IO is done and failed
++ 			 * resulting in race with bio's completion
++ 			 * handler.
++ 			 */
++ 			if (!ret)
++ 				ret = PTR_ERR(handle);
++ 			if (inode->i_nlink)
++ 				ext4_orphan_del(NULL, inode);
++ 
++ 			goto out;
++ 		}
++ 		if (inode->i_nlink)
++ 			ext4_orphan_del(handle, inode);
++ 		if (ret > 0) {
++ 			loff_t end = offset + ret;
++ 			if (end > inode->i_size || end > ei->i_disksize) {
++ 				ext4_update_i_disksize(inode, end);
++ 				if (end > inode->i_size)
++ 					i_size_write(inode, end);
++ 				/*
++ 				 * We're going to return a positive `ret'
++ 				 * here due to non-zero-length I/O, so there's
++ 				 * no way of reporting error returns from
++ 				 * ext4_mark_inode_dirty() to userspace.  So
++ 				 * ignore it.
++ 				 */
++ 				ext4_mark_inode_dirty(handle, inode);
++ 			}
++ 		}
++ 		err = ext4_journal_stop(handle);
++ 		if (ret == 0)
++ 			ret = err;
++ 	}
++ out:
+++>>>>>>> 45d8ec4d9fd5 (ext4: update i_disksize if direct write past ondisk size)
+  	return ret;
+  }
+  
+* Unmerged path fs/ext4/inode.c
