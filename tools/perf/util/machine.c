@@ -1644,6 +1644,11 @@ struct mem_info *sample__resolve_mem(struct perf_sample *sample,
 	return mi;
 }
 
+struct iterations {
+	int nr_loop_iter;
+	u64 cycles;
+};
+
 static int add_callchain_ip(struct thread *thread,
 			    struct callchain_cursor *cursor,
 			    struct symbol **parent,
@@ -1652,11 +1657,12 @@ static int add_callchain_ip(struct thread *thread,
 			    u64 ip,
 			    bool branch,
 			    struct branch_flags *flags,
-			    int nr_loop_iter,
-			    int samples,
+			    struct iterations *iter,
 			    u64 branch_from)
 {
 	struct addr_location al;
+	int nr_loop_iter = 0;
+	u64 iter_cycles = 0;
 
 	al.filtered = 0;
 	al.sym = NULL;
@@ -1706,9 +1712,15 @@ static int add_callchain_ip(struct thread *thread,
 
 	if (symbol_conf.hide_unresolved && al.sym == NULL)
 		return 0;
+
+	if (iter) {
+		nr_loop_iter = iter->nr_loop_iter;
+		iter_cycles = iter->cycles;
+	}
+
 	return callchain_cursor_append(cursor, al.addr, al.map, al.sym,
-				       branch, flags, nr_loop_iter, samples,
-				       branch_from);
+				       branch, flags, nr_loop_iter,
+				       iter_cycles, branch_from);
 }
 
 struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
@@ -1729,6 +1741,18 @@ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
 	return bi;
 }
 
+static void save_iterations(struct iterations *iter,
+			    struct branch_entry *be, int nr)
+{
+	int i;
+
+	iter->nr_loop_iter = nr;
+	iter->cycles = 0;
+
+	for (i = 0; i < nr; i++)
+		iter->cycles += be[i].flags.cycles;
+}
+
 #define CHASHSZ 127
 #define CHASHBITS 7
 #define NO_ENTRY 0xff
@@ -1736,7 +1760,8 @@ struct branch_info *sample__resolve_bstack(struct perf_sample *sample,
 #define PERF_MAX_BRANCH_DEPTH 127
 
 /* Remove loops. */
-static int remove_loops(struct branch_entry *l, int nr)
+static int remove_loops(struct branch_entry *l, int nr,
+			struct iterations *iter)
 {
 	int i, j, off;
 	unsigned char chash[CHASHSZ];
@@ -1761,8 +1786,18 @@ static int remove_loops(struct branch_entry *l, int nr)
 					break;
 				}
 			if (is_loop) {
-				memmove(l + i, l + i + off,
-					(nr - (i + off)) * sizeof(*l));
+				j = nr - (i + off);
+				if (j > 0) {
+					save_iterations(iter + i + off,
+						l + i, off);
+
+					memmove(iter + i, iter + i + off,
+						j * sizeof(*iter));
+
+					memmove(l + i, l + i + off,
+						j * sizeof(*l));
+				}
+
 				nr -= off;
 			}
 		}
@@ -1857,7 +1892,7 @@ static int resolve_lbr_callchain_sample(struct thread *thread,
 
 			err = add_callchain_ip(thread, cursor, parent,
 					       root_al, &cpumode, ip,
-					       branch, flags, 0, 0,
+					       branch, flags, NULL,
 					       branch_from);
 			if (err)
 				return (err < 0) ? err : 0;
@@ -1883,7 +1918,6 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 	int i, j, err;
 	int skip_idx = -1;
 	int first_call = 0;
-	int nr_loop_iter;
 
 	if (perf_evsel__has_branch_callstack(evsel)) {
 		err = resolve_lbr_callchain_sample(thread, cursor, sample, parent,
@@ -1914,6 +1948,7 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 	if (branch && callchain_param.branch_callstack) {
 		int nr = min(max_stack, (int)branch->nr);
 		struct branch_entry be[nr];
+		struct iterations iter[nr];
 
 		if (branch->nr > PERF_MAX_BRANCH_DEPTH) {
 			pr_warning("corrupted branch chain. skipping...\n");
@@ -1940,38 +1975,21 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 				be[i] = branch->entries[branch->nr - i - 1];
 		}
 
-		nr_loop_iter = nr;
-		nr = remove_loops(be, nr);
-
-		/*
-		 * Get the number of iterations.
-		 * It's only approximation, but good enough in practice.
-		 */
-		if (nr_loop_iter > nr)
-			nr_loop_iter = nr_loop_iter - nr + 1;
-		else
-			nr_loop_iter = 0;
+		memset(iter, 0, sizeof(struct iterations) * nr);
+		nr = remove_loops(be, nr, iter);
 
 		for (i = 0; i < nr; i++) {
-			if (i == nr - 1)
-				err = add_callchain_ip(thread, cursor, parent,
-						       root_al,
-						       NULL, be[i].to,
-						       true, &be[i].flags,
-						       nr_loop_iter, 1,
-						       be[i].from);
-			else
-				err = add_callchain_ip(thread, cursor, parent,
-						       root_al,
-						       NULL, be[i].to,
-						       true, &be[i].flags,
-						       0, 0, be[i].from);
+			err = add_callchain_ip(thread, cursor, parent,
+					       root_al,
+					       NULL, be[i].to,
+					       true, &be[i].flags,
+					       NULL, be[i].from);
 
 			if (!err)
 				err = add_callchain_ip(thread, cursor, parent, root_al,
 						       NULL, be[i].from,
 						       true, &be[i].flags,
-						       0, 0, 0);
+						       &iter[i], 0);
 			if (err == -EINVAL)
 				break;
 			if (err)
@@ -2002,7 +2020,7 @@ check_calls:
 
 		err = add_callchain_ip(thread, cursor, parent,
 				       root_al, &cpumode, ip,
-				       false, NULL, 0, 0, 0);
+				       false, NULL, NULL, 0);
 
 		if (err)
 			return (err < 0) ? err : 0;
