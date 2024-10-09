@@ -1,0 +1,101 @@
+sctp: use the pmtu from the icmp packet to update transport pathmtu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit d805397c3822d57ca3884d4bea37b2291fc40992
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d805397c.failed
+
+Other than asoc pmtu sync from all transports, sctp_assoc_sync_pmtu
+is also processing transport pmtu_pending by icmp packets. But it's
+meaningless to use sctp_dst_mtu(t->dst) as new pmtu for a transport.
+
+The right pmtu value should come from the icmp packet, and it would
+be saved into transport->mtu_info in this patch and used later when
+the pmtu sync happens in sctp_sendmsg_to_asoc or sctp_packet_config.
+
+Besides, without this patch, as pmtu can only be updated correctly
+when receiving a icmp packet and no place is holding sock lock, it
+will take long time if the sock is busy with sending packets.
+
+Note that it doesn't process transport->mtu_info in .release_cb(),
+as there is no enough information for pmtu update, like for which
+asoc or transport. It is not worth traversing all asocs to check
+pmtu_pending. So unlike tcp, sctp does this in tx path, for which
+mtu_info needs to be atomic_t.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d805397c3822d57ca3884d4bea37b2291fc40992)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/associola.c
+diff --cc net/sctp/associola.c
+index dbb4cd1cc493,a827a1f562bf..000000000000
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@@ -1419,11 -1448,10 +1419,16 @@@ void sctp_assoc_sync_pmtu(struct sctp_a
+  		return;
+  
+  	/* Get the lowest pmtu of all the transports. */
+ -	list_for_each_entry(t, &asoc->peer.transport_addr_list, transports) {
+ +	list_for_each_entry(t, &asoc->peer.transport_addr_list,
+ +				transports) {
+  		if (t->pmtu_pending && t->dst) {
+++<<<<<<< HEAD
+ +			sctp_transport_update_pmtu(
+ +					t, SCTP_TRUNC4(dst_mtu(t->dst)));
+++=======
++ 			sctp_transport_update_pmtu(t,
++ 						   atomic_read(&t->mtu_info));
+++>>>>>>> d805397c3822 (sctp: use the pmtu from the icmp packet to update transport pathmtu)
+  			t->pmtu_pending = 0;
+  		}
+  		if (!pmtu || (t->pathmtu < pmtu))
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index b10b64a7d8df..6001d55fc10e 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -861,6 +861,8 @@ struct sctp_transport {
+ 	unsigned long sackdelay;
+ 	__u32 sackfreq;
+ 
++	atomic_t mtu_info;
++
+ 	/* When was the last time that we heard from this transport? We use
+ 	 * this to pick new active and retran paths.
+ 	 */
+* Unmerged path net/sctp/associola.c
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index d41711742a26..41dcccf5622c 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -398,6 +398,7 @@ void sctp_icmp_frag_needed(struct sock *sk, struct sctp_association *asoc,
+ 		return;
+ 
+ 	if (sock_owned_by_user(sk)) {
++		atomic_set(&t->mtu_info, pmtu);
+ 		asoc->pmtu_pending = 1;
+ 		t->pmtu_pending = 1;
+ 		return;
+diff --git a/net/sctp/output.c b/net/sctp/output.c
+index ab7dd143f8a2..2a3b0ac64380 100644
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -118,6 +118,12 @@ void sctp_packet_config(struct sctp_packet *packet, __u32 vtag,
+ 			sctp_assoc_sync_pmtu(asoc);
+ 	}
+ 
++	if (asoc->pmtu_pending) {
++		if (asoc->param_flags & SPP_PMTUD_ENABLE)
++			sctp_assoc_sync_pmtu(asoc);
++		asoc->pmtu_pending = 0;
++	}
++
+ 	/* If there a is a prepend chunk stick it on the list before
+ 	 * any other chunks get appended.
+ 	 */
