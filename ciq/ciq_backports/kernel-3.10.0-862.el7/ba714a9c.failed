@@ -1,0 +1,149 @@
+pinctrl/amd: Use regular interrupt instead of chained
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit ba714a9c1dea85e0bf2899d02dfeb9c70040427c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ba714a9c.failed
+
+The AMD pinctrl driver uses a chained interrupt to demultiplex the GPIO
+interrupts. Kevin Vandeventer reported, that his new AMD Ryzen locks up
+hard on boot when the AMD pinctrl driver is initialized. The reason is an
+interrupt storm. It's not clear whether that's caused by hardware or
+firmware or both.
+
+Using chained interrupts on X86 is a dangerous endavour. If a system is
+misconfigured or the hardware buggy there is no safety net to catch an
+interrupt storm.
+
+Convert the driver to use a regular interrupt for the demultiplex
+handler. This allows the interrupt storm detector to catch the malfunction
+and lets the system boot up.
+
+This should be backported to stable because it's likely that more users run
+into this problem as the AMD Ryzen machines are spreading.
+
+	Reported-by: Kevin Vandeventer
+Link: https://bugzilla.suse.com/show_bug.cgi?id=1034261
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit ba714a9c1dea85e0bf2899d02dfeb9c70040427c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pinctrl/pinctrl-amd.c
+diff --cc drivers/pinctrl/pinctrl-amd.c
+index 7cba37e8bb6d,e432ec887479..000000000000
+--- a/drivers/pinctrl/pinctrl-amd.c
++++ b/drivers/pinctrl/pinctrl-amd.c
+@@@ -490,63 -495,54 +490,75 @@@ static struct irq_chip amd_gpio_irqchi
+  	.flags        = IRQCHIP_SKIP_SET_WAKE,
+  };
+  
+++<<<<<<< HEAD
+ +static void amd_gpio_irq_handler(unsigned int irq, struct irq_desc *desc)
+ +{
+ +	u32 i;
+ +	u32 off;
+ +	u32 reg;
+ +	u32 pin_reg;
+ +	u64 reg64;
+ +	int handled = 0;
+ +	unsigned long flags;
+ +	struct irq_chip *chip = irq_desc_get_chip(desc);
+ +	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
+ +	struct amd_gpio *gpio_dev = to_amd_gpio(gc);
+++=======
++ #define PIN_IRQ_PENDING	(BIT(INTERRUPT_STS_OFF) | BIT(WAKE_STS_OFF))
+  
+- 	chained_irq_enter(chip, desc);
+- 	/*enable GPIO interrupt again*/
+- 	raw_spin_lock_irqsave(&gpio_dev->lock, flags);
+- 	reg = readl(gpio_dev->base + WAKE_INT_STATUS_REG1);
+- 	reg64 = reg;
+- 	reg64 = reg64 << 32;
++ static irqreturn_t amd_gpio_irq_handler(int irq, void *dev_id)
++ {
++ 	struct amd_gpio *gpio_dev = dev_id;
++ 	struct gpio_chip *gc = &gpio_dev->gc;
++ 	irqreturn_t ret = IRQ_NONE;
++ 	unsigned int i, irqnr;
++ 	unsigned long flags;
++ 	u32 *regs, regval;
++ 	u64 status, mask;
+++>>>>>>> ba714a9c1dea (pinctrl/amd: Use regular interrupt instead of chained)
+  
+- 	reg = readl(gpio_dev->base + WAKE_INT_STATUS_REG0);
+- 	reg64 |= reg;
++ 	/* Read the wake status */
++ 	raw_spin_lock_irqsave(&gpio_dev->lock, flags);
++ 	status = readl(gpio_dev->base + WAKE_INT_STATUS_REG1);
++ 	status <<= 32;
++ 	status |= readl(gpio_dev->base + WAKE_INT_STATUS_REG0);
+  	raw_spin_unlock_irqrestore(&gpio_dev->lock, flags);
+  
+- 	/*
+- 	 * first 46 bits indicates interrupt status.
+- 	 * one bit represents four interrupt sources.
+- 	*/
+- 	for (off = 0; off < 46 ; off++) {
+- 		if (reg64 & BIT(off)) {
+- 			for (i = 0; i < 4; i++) {
+- 				pin_reg = readl(gpio_dev->base +
+- 						(off * 4 + i) * 4);
+- 				if ((pin_reg & BIT(INTERRUPT_STS_OFF)) ||
+- 					(pin_reg & BIT(WAKE_STS_OFF))) {
+- 					irq = irq_find_mapping(gc->irqdomain,
+- 								off * 4 + i);
+- 					generic_handle_irq(irq);
+- 					writel(pin_reg,
+- 						gpio_dev->base
+- 						+ (off * 4 + i) * 4);
+- 					handled++;
+- 				}
+- 			}
++ 	/* Bit 0-45 contain the relevant status bits */
++ 	status &= (1ULL << 46) - 1;
++ 	regs = gpio_dev->base;
++ 	for (mask = 1, irqnr = 0; status; mask <<= 1, regs += 4, irqnr += 4) {
++ 		if (!(status & mask))
++ 			continue;
++ 		status &= ~mask;
++ 
++ 		/* Each status bit covers four pins */
++ 		for (i = 0; i < 4; i++) {
++ 			regval = readl(regs + i);
++ 			if (!(regval & PIN_IRQ_PENDING))
++ 				continue;
++ 			irq = irq_find_mapping(gc->irqdomain, irqnr + i);
++ 			generic_handle_irq(irq);
++ 			/* Clear interrupt */
++ 			writel(regval, regs + i);
++ 			ret = IRQ_HANDLED;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (handled == 0)
+ +		handle_bad_irq(irq, desc);
+ +
+++=======
++ 	/* Signal EOI to the GPIO unit */
+++>>>>>>> ba714a9c1dea (pinctrl/amd: Use regular interrupt instead of chained)
+  	raw_spin_lock_irqsave(&gpio_dev->lock, flags);
+- 	reg = readl(gpio_dev->base + WAKE_INT_MASTER_REG);
+- 	reg |= EOI_MASK;
+- 	writel(reg, gpio_dev->base + WAKE_INT_MASTER_REG);
++ 	regval = readl(gpio_dev->base + WAKE_INT_MASTER_REG);
++ 	regval |= EOI_MASK;
++ 	writel(regval, gpio_dev->base + WAKE_INT_MASTER_REG);
+  	raw_spin_unlock_irqrestore(&gpio_dev->lock, flags);
+  
+- 	chained_irq_exit(chip, desc);
++ 	return ret;
+  }
+  
+  static int amd_get_groups_count(struct pinctrl_dev *pctldev)
+* Unmerged path drivers/pinctrl/pinctrl-amd.c
