@@ -1,0 +1,93 @@
+sched/deadline: Fix missing clock update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Juri Lelli <juri.lelli@redhat.com>
+commit ecda2b66e263dfd6c1d6113add19150f4e235bb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ecda2b66.failed
+
+A missing clock update is causing the following warning:
+
+ rq->clock_update_flags < RQCF_ACT_SKIP
+ WARNING: CPU: 10 PID: 0 at kernel/sched/sched.h:963 inactive_task_timer+0x5d6/0x720
+ Call Trace:
+  <IRQ>
+  __hrtimer_run_queues+0x10f/0x530
+  hrtimer_interrupt+0xe5/0x240
+  smp_apic_timer_interrupt+0x79/0x2b0
+  apic_timer_interrupt+0xf/0x20
+  </IRQ>
+  do_idle+0x203/0x280
+  cpu_startup_entry+0x6f/0x80
+  start_secondary+0x1b0/0x200
+  secondary_startup_64+0xa5/0xb0
+ hardirqs last  enabled at (793919): [<ffffffffa27c5f6e>] cpuidle_enter_state+0x9e/0x360
+ hardirqs last disabled at (793920): [<ffffffffa2a0096e>] interrupt_entry+0xce/0xe0
+ softirqs last  enabled at (793922): [<ffffffffa20bef78>] irq_enter+0x68/0x70
+ softirqs last disabled at (793921): [<ffffffffa20bef5d>] irq_enter+0x4d/0x70
+
+This happens because inactive_task_timer() calls sub_running_bw() (if
+TASK_DEAD and non_contending) that might trigger a schedutil update,
+which might access the clock. Clock is however currently updated only
+later in inactive_task_timer() function.
+
+Fix the problem by updating the clock right after task_rq_lock().
+
+	Reported-by: kernel test robot <xiaolong.ye@intel.com>
+	Signed-off-by: Juri Lelli <juri.lelli@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Claudio Scordino <claudio@evidence.eu.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Luca Abeni <luca.abeni@santannapisa.it>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20180530160809.9074-1-juri.lelli@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ecda2b66e263dfd6c1d6113add19150f4e235bb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+diff --cc kernel/sched/deadline.c
+index 162a8d64d022,fbfc3f1d368a..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -1124,11 -1254,14 +1124,14 @@@ static enum hrtimer_restart inactive_ta
+  						     struct sched_dl_entity,
+  						     inactive_timer);
+  	struct task_struct *p = dl_task_of(dl_se);
+ -	struct rq_flags rf;
+ +	unsigned long flags;
+  	struct rq *rq;
+  
+ -	rq = task_rq_lock(p, &rf);
+ +	rq = task_rq_lock(p, &flags);
+  
++ 	sched_clock_tick();
++ 	update_rq_clock(rq);
++ 
+  	if (!dl_task(p) || p->state == TASK_DEAD) {
+  		struct dl_bw *dl_b = dl_bw_of(task_cpu(p));
+  
+@@@ -1148,13 -1281,10 +1151,17 @@@
+  	if (dl_se->dl_non_contending == 0)
+  		goto unlock;
+  
+++<<<<<<< HEAD
+ +	sched_clock_tick();
+ +	update_rq_clock(rq);
+ +
+ +	sub_running_bw(dl_se->dl_bw, &rq->dl);
+++=======
++ 	sub_running_bw(dl_se, &rq->dl);
+++>>>>>>> ecda2b66e263 (sched/deadline: Fix missing clock update)
+  	dl_se->dl_non_contending = 0;
+  unlock:
+ -	task_rq_unlock(rq, p, &rf);
+ +	task_rq_unlock(rq, p, &flags);
+  	put_task_struct(p);
+  
+  	return HRTIMER_NORESTART;
+* Unmerged path kernel/sched/deadline.c
