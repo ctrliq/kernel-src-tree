@@ -1,0 +1,424 @@
+scsi: tcmu: use lio core se_device configuration helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 63d5be0f6a8053ba0c084dd6e2d5538e9376e7da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/63d5be0f.failed
+
+Use the lio core helper to check if the device is configured.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 63d5be0f6a8053ba0c084dd6e2d5538e9376e7da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,bc8121f97d65..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1291,66 -1908,103 +1291,75 @@@ err_kmalloc
+  	return ret;
+  }
+  
+ -static void tcmu_free_device(struct se_device *dev)
+++<<<<<<< HEAD
+ +static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
+  {
+ -	struct tcmu_dev *udev = TCMU_DEV(dev);
+ -
+ -	/* release ref from init */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
+ +		tcmu_free_cmd(cmd);
+ +		return 0;
+ +	}
+ +	return -EINVAL;
+  }
+  
+ -static void tcmu_destroy_device(struct se_device *dev)
+ +static void tcmu_dev_call_rcu(struct rcu_head *p)
+  {
+ +	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+  	struct tcmu_dev *udev = TCMU_DEV(dev);
+  
+ -	del_timer_sync(&udev->cmd_timer);
+ -	del_timer_sync(&udev->qfull_timer);
+ -
+ -	mutex_lock(&root_udev_mutex);
+ -	list_del(&udev->node);
+ -	mutex_unlock(&root_udev_mutex);
+ -
+ -	tcmu_send_dev_remove_event(udev);
+ -
+ -	uio_unregister_device(&udev->uio_info);
+ -
+ -	/* release ref from configure */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +	kfree(udev);
+  }
+  
+ -static void tcmu_unblock_dev(struct tcmu_dev *udev)
+ +static void tcmu_free_device(struct se_device *dev)
+  {
+ -	mutex_lock(&udev->cmdr_lock);
+ -	clear_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags);
+ -	mutex_unlock(&udev->cmdr_lock);
+ +	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
+  }
+  
+ -static void tcmu_block_dev(struct tcmu_dev *udev)
+ +static bool tcmu_dev_configured(struct tcmu_dev *udev)
+  {
+ -	mutex_lock(&udev->cmdr_lock);
+ -
+ -	if (test_and_set_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags))
+ -		goto unlock;
+ -
+ -	/* complete IO that has executed successfully */
+ -	tcmu_handle_completions(udev);
+ -	/* fail IO waiting to be queued */
+ -	run_cmdr_queue(udev, true);
+ +	return udev->uio_info.uio_dev ? true : false;
+++=======
+++static void tcmu_free_device(struct se_device *dev)
+++{
+++	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
+ -unlock:
+ -	mutex_unlock(&udev->cmdr_lock);
+++	/* release ref from init */
+++	kref_put(&udev->kref, tcmu_dev_kref_release);
+++>>>>>>> 63d5be0f6a80 (scsi: tcmu: use lio core se_device configuration helper)
+  }
+  
+ -static void tcmu_reset_ring(struct tcmu_dev *udev, u8 err_level)
+ +static void tcmu_destroy_device(struct se_device *dev)
+  {
+ -	struct tcmu_mailbox *mb;
+ +	struct tcmu_dev *udev = TCMU_DEV(dev);
+  	struct tcmu_cmd *cmd;
+ +	bool all_expired = true;
+  	int i;
+  
+ -	mutex_lock(&udev->cmdr_lock);
+ -
+ -	idr_for_each_entry(&udev->commands, cmd, i) {
+ -		if (!list_empty(&cmd->cmdr_queue_entry))
+ -			continue;
+ +	del_timer_sync(&udev->timeout);
+  
+ -		pr_debug("removing cmd %u on dev %s from ring (is expired %d)\n",
+ -			  cmd->cmd_id, udev->name,
+ -			  test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags));
+ -
+ -		idr_remove(&udev->commands, i);
+ -		if (!test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
+ -			if (err_level == 1) {
+ -				/*
+ -				 * Userspace was not able to start the
+ -				 * command or it is retryable.
+ -				 */
+ -				target_complete_cmd(cmd->se_cmd, SAM_STAT_BUSY);
+ -			} else {
+ -				/* hard failure */
+ -				target_complete_cmd(cmd->se_cmd,
+ -						    SAM_STAT_CHECK_CONDITION);
+ -			}
+ -		}
+ -		tcmu_cmd_free_data(cmd, cmd->dbi_cnt);
+ -		tcmu_free_cmd(cmd);
+ -	}
+ +	if (tcmu_dev_configured(udev)) {
+ +		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE, 0, NULL);
+  
+ -	mb = udev->mb_addr;
+ -	tcmu_flush_dcache_range(mb, sizeof(*mb));
+ -	pr_debug("mb last %u head %u tail %u\n", udev->cmdr_last_cleaned,
+ -		 mb->cmd_tail, mb->cmd_head);
+ +		uio_unregister_device(&udev->uio_info);
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+  
+ -	udev->cmdr_last_cleaned = 0;
+ -	mb->cmd_tail = 0;
+ -	mb->cmd_head = 0;
+ -	tcmu_flush_dcache_range(mb, sizeof(*mb));
+ +		mutex_lock(&device_mutex);
+ +		idr_remove(&devices_idr, udev->dev_index);
+ +		mutex_unlock(&device_mutex);
+ +	}
+  
+ -	del_timer(&udev->cmd_timer);
+ +	vfree(udev->mb_addr);
+  
+ -	mutex_unlock(&udev->cmdr_lock);
+ +	/* Upper layer should drain all requests before calling this */
+ +	spin_lock_irq(&udev->commands_lock);
+ +	idr_for_each_entry(&udev->commands, cmd, i) {
+ +		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
+ +			all_expired = false;
+ +	}
+ +	idr_destroy(&udev->commands);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	WARN_ON(!all_expired);
+ +	kfree(udev->data_bitmap);
+  }
+  
+  enum {
+@@@ -1580,6 -2246,79 +1589,82 @@@ static ssize_t tcmu_qfull_time_out_stor
+  }
+  CONFIGFS_ATTR(tcmu_, qfull_time_out);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t tcmu_max_data_area_mb_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%u\n",
++ 			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
++ }
++ CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
++ 
++ static ssize_t tcmu_dev_config_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%s\n", udev->dev_config);
++ }
++ 
++ static int tcmu_send_dev_config_event(struct tcmu_dev *udev,
++ 				      const char *reconfig_data)
++ {
++ 	struct sk_buff *skb = NULL;
++ 	void *msg_header = NULL;
++ 	int ret = 0;
++ 
++ 	ret = tcmu_netlink_event_init(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				      &skb, &msg_header);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret = nla_put_string(skb, TCMU_ATTR_DEV_CFG, reconfig_data);
++ 	if (ret < 0) {
++ 		nlmsg_free(skb);
++ 		return ret;
++ 	}
++ 	return tcmu_netlink_event_send(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				       skb, msg_header);
++ }
++ 
++ 
++ static ssize_t tcmu_dev_config_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	int ret, len;
++ 
++ 	len = strlen(page);
++ 	if (!len || len > TCMU_CONFIG_LEN - 1)
++ 		return -EINVAL;
++ 
++ 	/* Check if device has been configured before */
++ 	if (target_dev_configured(&udev->se_dev)) {
++ 		ret = tcmu_send_dev_config_event(udev, page);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 		strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 		ret = tcmu_update_uio_info(udev);
++ 		if (ret)
++ 			return ret;
++ 		return count;
++ 	}
++ 	strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_config);
++ 
+++>>>>>>> 63d5be0f6a80 (scsi: tcmu: use lio core se_device configuration helper)
+  static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
+  {
+  	struct se_dev_attrib *da = container_of(to_config_group(item),
+@@@ -1603,9 -2362,8 +1688,14 @@@ static ssize_t tcmu_dev_size_store(stru
+  		return ret;
+  
+  	/* Check if device has been configured before */
+++<<<<<<< HEAD
+ +	if (tcmu_dev_configured(udev)) {
+ +		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
+ +					 TCMU_ATTR_DEV_SIZE, &val);
+++=======
++ 	if (target_dev_configured(&udev->se_dev)) {
++ 		ret = tcmu_send_dev_size_event(udev, val);
+++>>>>>>> 63d5be0f6a80 (scsi: tcmu: use lio core se_device configuration helper)
+  		if (ret) {
+  			pr_err("Unable to reconfigure device\n");
+  			return ret;
+@@@ -1623,10 -2381,145 +1713,150 @@@ static ssize_t tcmu_max_data_area_mb_sh
+  						struct se_dev_attrib, da_group);
+  	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+  
+ -	return snprintf(page, PAGE_SIZE, "%d\n", udev->nl_reply_supported);
+ +	return snprintf(page, PAGE_SIZE, "%u\n",
+ +			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
+  }
+++<<<<<<< HEAD
+ +CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
+++=======
++ 
++ static ssize_t tcmu_nl_reply_supported_store(struct config_item *item,
++ 		const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	s8 val;
++ 	int ret;
++ 
++ 	ret = kstrtos8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	udev->nl_reply_supported = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, nl_reply_supported);
++ 
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static int tcmu_send_emulate_write_cache(struct tcmu_dev *udev, u8 val)
++ {
++ 	struct sk_buff *skb = NULL;
++ 	void *msg_header = NULL;
++ 	int ret = 0;
++ 
++ 	ret = tcmu_netlink_event_init(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				      &skb, &msg_header);
++ 	if (ret < 0)
++ 		return ret;
++ 	ret = nla_put_u8(skb, TCMU_ATTR_WRITECACHE, val);
++ 	if (ret < 0) {
++ 		nlmsg_free(skb);
++ 		return ret;
++ 	}
++ 	return tcmu_netlink_event_send(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 				       skb, msg_header);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (target_dev_configured(&udev->se_dev)) {
++ 		ret = tcmu_send_emulate_write_cache(udev, val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
++ 
++ static ssize_t tcmu_block_dev_show(struct config_item *item, char *page)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BLOCKED, &udev->flags))
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "blocked");
++ 	else
++ 		return snprintf(page, PAGE_SIZE, "%s\n", "unblocked");
++ }
++ 
++ static ssize_t tcmu_block_dev_store(struct config_item *item, const char *page,
++ 				    size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val > 1) {
++ 		pr_err("Invalid block value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!val)
++ 		tcmu_unblock_dev(udev);
++ 	else
++ 		tcmu_block_dev(udev);
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, block_dev);
++ 
++ static ssize_t tcmu_reset_ring_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_device *se_dev = container_of(to_config_group(item),
++ 						struct se_device,
++ 						dev_action_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(se_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val != 1 && val != 2) {
++ 		pr_err("Invalid reset ring value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 
++ 	tcmu_reset_ring(udev, val);
++ 	return count;
++ }
++ CONFIGFS_ATTR_WO(tcmu_, reset_ring);
+++>>>>>>> 63d5be0f6a80 (scsi: tcmu: use lio core se_device configuration helper)
+  
+  static struct configfs_attribute *tcmu_attrib_attrs[] = {
+  	&tcmu_attr_cmd_time_out,
+* Unmerged path drivers/target/target_core_user.c
