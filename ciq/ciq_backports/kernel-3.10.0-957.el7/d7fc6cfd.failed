@@ -1,0 +1,223 @@
+crypto: chelsio - remove redundant assignments to reqctx and dst_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [crypto] chelsio - remove redundant assignments to reqctx and dst_size (Arjun Vynipadath) [1523191]
+Rebuild_FUZZ: 93.85%
+commit-author Colin Ian King <colin.king@canonical.com>
+commit d7fc6cfdf1efaafbd708c08f0be44d71bb9f7fde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d7fc6cfd.failed
+
+Pointer reqctx is assigned the same value twice, once on initialization
+and again a few statements later, remove the second redundant assignment.
+Variable dst_size is assigned but it is never read, so the variable is
+redundant and can be removed. Cleans up clang warnings:
+
+drivers/crypto/chelsio/chcr_algo.c:156:29: warning: Value stored to
+'reqctx' during its initialization is never read
+drivers/crypto/chelsio/chcr_algo.c:2020:2: warning: Value stored to
+'dst_size' is never read
+
+	Signed-off-by: Colin Ian King <colin.king@canonical.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit d7fc6cfdf1efaafbd708c08f0be44d71bb9f7fde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index 32747a50ffb7,300e66fe8a3c..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -116,6 -120,91 +116,94 @@@ static inline unsigned int sgl_len(unsi
+  	return (3 * n) / 2 + (n & 1) + 2;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sg_nents_xlen(struct scatterlist *sg, unsigned int reqlen,
++ 			 unsigned int entlen,
++ 			 unsigned int skip)
++ {
++ 	int nents = 0;
++ 	unsigned int less;
++ 	unsigned int skip_len = 0;
++ 
++ 	while (sg && skip) {
++ 		if (sg_dma_len(sg) <= skip) {
++ 			skip -= sg_dma_len(sg);
++ 			skip_len = 0;
++ 			sg = sg_next(sg);
++ 		} else {
++ 			skip_len = skip;
++ 			skip = 0;
++ 		}
++ 	}
++ 
++ 	while (sg && reqlen) {
++ 		less = min(reqlen, sg_dma_len(sg) - skip_len);
++ 		nents += DIV_ROUND_UP(less, entlen);
++ 		reqlen -= less;
++ 		skip_len = 0;
++ 		sg = sg_next(sg);
++ 	}
++ 	return nents;
++ }
++ 
++ static inline void chcr_handle_ahash_resp(struct ahash_request *req,
++ 					  unsigned char *input,
++ 					  int err)
++ {
++ 	struct chcr_ahash_req_ctx *reqctx = ahash_request_ctx(req);
++ 	int digestsize, updated_digestsize;
++ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
++ 	struct uld_ctx *u_ctx = ULD_CTX(h_ctx(tfm));
++ 
++ 	if (input == NULL)
++ 		goto out;
++ 	digestsize = crypto_ahash_digestsize(crypto_ahash_reqtfm(req));
++ 	if (reqctx->is_sg_map)
++ 		chcr_hash_dma_unmap(&u_ctx->lldi.pdev->dev, req);
++ 	if (reqctx->dma_addr)
++ 		dma_unmap_single(&u_ctx->lldi.pdev->dev, reqctx->dma_addr,
++ 				 reqctx->dma_len, DMA_TO_DEVICE);
++ 	reqctx->dma_addr = 0;
++ 	updated_digestsize = digestsize;
++ 	if (digestsize == SHA224_DIGEST_SIZE)
++ 		updated_digestsize = SHA256_DIGEST_SIZE;
++ 	else if (digestsize == SHA384_DIGEST_SIZE)
++ 		updated_digestsize = SHA512_DIGEST_SIZE;
++ 	if (reqctx->result == 1) {
++ 		reqctx->result = 0;
++ 		memcpy(req->result, input + sizeof(struct cpl_fw6_pld),
++ 		       digestsize);
++ 	} else {
++ 		memcpy(reqctx->partial_hash, input + sizeof(struct cpl_fw6_pld),
++ 		       updated_digestsize);
++ 	}
++ out:
++ 	req->base.complete(&req->base, err);
++ 
++ 	}
++ 
++ static inline void chcr_handle_aead_resp(struct aead_request *req,
++ 					 unsigned char *input,
++ 					 int err)
++ {
++ 	struct chcr_aead_reqctx *reqctx = aead_request_ctx(req);
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	struct uld_ctx *u_ctx = ULD_CTX(a_ctx(tfm));
++ 
++ 
++ 	chcr_aead_dma_unmap(&u_ctx->lldi.pdev->dev, req, reqctx->op);
++ 	if (reqctx->b0_dma)
++ 		dma_unmap_single(&u_ctx->lldi.pdev->dev, reqctx->b0_dma,
++ 				 reqctx->b0_len, DMA_BIDIRECTIONAL);
++ 	if (reqctx->verify == VERIFY_SW) {
++ 		chcr_verify_tag(req, input, &err);
++ 		reqctx->verify = VERIFY_HW;
++ }
++ 	req->base.complete(&req->base, err);
++ 
++ }
+++>>>>>>> d7fc6cfdf1ef (crypto: chelsio - remove redundant assignments to reqctx and dst_size)
+  static void chcr_verify_tag(struct aead_request *req, u8 *input, int *err)
+  {
+  	u8 temp[SHA512_DIGEST_SIZE];
+@@@ -1830,64 -2006,36 +1918,83 @@@ static void chcr_hmac_cra_exit(struct c
+  	}
+  }
+  
+ -static int chcr_aead_common_init(struct aead_request *req,
+ -				 unsigned short op_type)
+ +static int is_newsg(struct scatterlist *sgl, unsigned int *newents)
+  {
+++<<<<<<< HEAD
+ +	int nents = 0;
+ +	int ret = 0;
+ +
+ +	while (sgl) {
+ +		if (sgl->length > CHCR_SG_SIZE)
+ +			ret = 1;
+ +		nents += DIV_ROUND_UP(sgl->length, CHCR_SG_SIZE);
+ +		sgl = sg_next(sgl);
+++=======
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 	int error = -EINVAL;
++ 	unsigned int authsize = crypto_aead_authsize(tfm);
++ 
++ 	/* validate key size */
++ 	if (aeadctx->enckey_len == 0)
++ 		goto err;
++ 	if (op_type && req->cryptlen < authsize)
++ 		goto err;
++ 	error = chcr_aead_dma_map(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 				  op_type);
++ 	if (error) {
++ 		error = -ENOMEM;
++ 		goto err;
+++>>>>>>> d7fc6cfdf1ef (crypto: chelsio - remove redundant assignments to reqctx and dst_size)
+  	}
+ -	reqctx->aad_nents = sg_nents_xlen(req->src, req->assoclen,
+ -					  CHCR_SRC_SG_SIZE, 0);
+ -	reqctx->src_nents = sg_nents_xlen(req->src, req->cryptlen,
+ -					  CHCR_SRC_SG_SIZE, req->assoclen);
+ -	return 0;
+ -err:
+ -	return error;
+ +	*newents = nents;
+ +	return ret;
+  }
+  
+ -static int chcr_aead_need_fallback(struct aead_request *req, int dst_nents,
+ +static inline void free_new_sg(struct scatterlist *sgl)
+ +{
+ +	kfree(sgl);
+ +}
+ +
+ +static struct scatterlist *alloc_new_sg(struct scatterlist *sgl,
+ +				       unsigned int nents)
+ +{
+ +	struct scatterlist *newsg, *sg;
+ +	int i, len, processed = 0;
+ +	struct page *spage;
+ +	int offset;
+ +
+ +	newsg = kmalloc_array(nents, sizeof(struct scatterlist), GFP_KERNEL);
+ +	if (!newsg)
+ +		return ERR_PTR(-ENOMEM);
+ +	sg = newsg;
+ +	sg_init_table(sg, nents);
+ +	offset = sgl->offset;
+ +	spage = sg_page(sgl);
+ +	for (i = 0; i < nents; i++) {
+ +		len = min_t(u32, sgl->length - processed, CHCR_SG_SIZE);
+ +		sg_set_page(sg, spage, len, offset);
+ +		processed += len;
+ +		offset += len;
+ +		if (offset >= PAGE_SIZE) {
+ +			offset = offset % PAGE_SIZE;
+ +			spage++;
+ +		}
+ +		if (processed == sgl->length) {
+ +			processed = 0;
+ +			sgl = sg_next(sgl);
+ +			if (!sgl)
+ +				break;
+ +			spage = sg_page(sgl);
+ +			offset = sgl->offset;
+ +		}
+ +		sg = sg_next(sg);
+ +	}
+ +	return newsg;
+ +}
+ +
+ +static int chcr_aead_need_fallback(struct aead_request *req, int src_nent,
+  				   int aadmax, int wrlen,
+  				   unsigned short op_type)
+  {
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
