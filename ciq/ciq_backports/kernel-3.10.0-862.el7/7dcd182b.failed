@@ -1,0 +1,243 @@
+ftrace/module: remove ftrace module notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jessica Yu <jeyu@redhat.com>
+commit 7dcd182bec271ab341b05b66b6006995795fc0e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7dcd182b.failed
+
+Remove the ftrace module notifier in favor of directly calling
+ftrace_module_enable() and ftrace_release_mod() in the module loader.
+Hard-coding the function calls directly in the module loader removes
+dependence on the module notifier call chain and provides better
+visibility and control over what gets called when, which is important
+to kernel utilities such as livepatch.
+
+This fixes a notifier ordering issue in which the ftrace module notifier
+(and hence ftrace_module_enable()) for coming modules was being called
+after klp_module_notify(), which caused livepatch modules to initialize
+incorrectly. This patch removes dependence on the module notifier call
+chain in favor of hard coding the corresponding function calls in the
+module loader. This ensures that ftrace and livepatch code get called in
+the correct order on patch module load and unload.
+
+Fixes: 5156dca34a3e ("ftrace: Fix the race between ftrace and insmod")
+	Signed-off-by: Jessica Yu <jeyu@redhat.com>
+	Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+	Reviewed-by: Petr Mladek <pmladek@suse.cz>
+	Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Reviewed-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 7dcd182bec271ab341b05b66b6006995795fc0e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/module.c
+#	kernel/trace/ftrace.c
+diff --cc kernel/module.c
+index 65af51b1c60d,b05d466cfa02..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -3276,6 -3287,20 +3278,23 @@@ static int do_init_module(struct modul
+  	wake_up_all(&module_wq);
+  
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ fail_free_freeinit:
++ 	kfree(freeinit);
++ fail:
++ 	/* Try to protect us from buggy refcounters. */
++ 	mod->state = MODULE_STATE_GOING;
++ 	synchronize_sched();
++ 	module_put(mod);
++ 	blocking_notifier_call_chain(&module_notify_list,
++ 				     MODULE_STATE_GOING, mod);
++ 	ftrace_release_mod(mod);
++ 	free_module(mod);
++ 	wake_up_all(&module_wq);
++ 	return ret;
+++>>>>>>> 7dcd182bec27 (ftrace/module: remove ftrace module notifier)
+  }
+  
+  static int may_init_module(void)
+diff --cc kernel/trace/ftrace.c
+index 0146600e951a,57a6eea84694..000000000000
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@@ -4337,56 -4961,85 +4337,65 @@@ void ftrace_release_mod(struct module *
+  	mutex_unlock(&ftrace_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static void ftrace_init_module(struct module *mod,
+ +			       unsigned long *start, unsigned long *end)
+++=======
++ void ftrace_module_enable(struct module *mod)
+++>>>>>>> 7dcd182bec27 (ftrace/module: remove ftrace module notifier)
+  {
+ -	struct dyn_ftrace *rec;
+ -	struct ftrace_page *pg;
+ -
+ -	mutex_lock(&ftrace_lock);
+ -
+ -	if (ftrace_disabled)
+ -		goto out_unlock;
+ -
+ -	/*
+ -	 * If the tracing is enabled, go ahead and enable the record.
+ -	 *
+ -	 * The reason not to enable the record immediatelly is the
+ -	 * inherent check of ftrace_make_nop/ftrace_make_call for
+ -	 * correct previous instructions.  Making first the NOP
+ -	 * conversion puts the module to the correct state, thus
+ -	 * passing the ftrace_make_call check.
+ -	 *
+ -	 * We also delay this to after the module code already set the
+ -	 * text to read-only, as we now need to set it back to read-write
+ -	 * so that we can modify the text.
+ -	 */
+ -	if (ftrace_start_up)
+ -		ftrace_arch_code_modify_prepare();
+ -
+ -	do_for_each_ftrace_rec(pg, rec) {
+ -		int cnt;
+ -		/*
+ -		 * do_for_each_ftrace_rec() is a double loop.
+ -		 * module text shares the pg. If a record is
+ -		 * not part of this module, then skip this pg,
+ -		 * which the "break" will do.
+ -		 */
+ -		if (!within_module_core(rec->ip, mod))
+ -			break;
+ -
+ -		cnt = 0;
+ +	if (ftrace_disabled || start == end)
+ +		return;
+ +	ftrace_process_locs(mod, start, end);
+ +}
+  
+ -		/*
+ -		 * When adding a module, we need to check if tracers are
+ -		 * currently enabled and if they are, and can trace this record,
+ -		 * we need to enable the module functions as well as update the
+ -		 * reference counts for those function records.
+ -		 */
+ -		if (ftrace_start_up)
+ -			cnt += referenced_filters(rec);
+ +void ftrace_module_init(struct module *mod)
+ +{
+ +#ifdef CONFIG_S390
+ +	struct module_ext *mod_ext;
+  
+ -		/* This clears FTRACE_FL_DISABLED */
+ -		rec->flags = cnt;
+ +	mutex_lock(&module_ext_mutex);
+ +	mod_ext = find_module_ext(mod);
+ +	mutex_unlock(&module_ext_mutex);
+  
+ -		if (ftrace_start_up && cnt) {
+ -			int failed = __ftrace_replace_code(rec, 1);
+ -			if (failed) {
+ -				ftrace_bug(failed, rec);
+ -				goto out_loop;
+ -			}
+ -		}
+ +	ftrace_init_module(mod, mod_ext->ftrace_callsites,
+ +			   mod_ext->ftrace_callsites +
+ +			   mod_ext->num_ftrace_callsites);
+ +#else
+ +	ftrace_init_module(mod, mod->ftrace_callsites,
+ +			   mod->ftrace_callsites +
+ +			   mod->num_ftrace_callsites);
+ +#endif
+ +}
+++<<<<<<< HEAD
+  
+ -	} while_for_each_ftrace_rec();
+ +static int ftrace_module_notify_exit(struct notifier_block *self,
+ +				     unsigned long val, void *data)
+ +{
+ +	struct module *mod = data;
+  
+ - out_loop:
+ -	if (ftrace_start_up)
+ -		ftrace_arch_code_modify_post_process();
+ +	if (val == MODULE_STATE_GOING)
+ +		ftrace_release_mod(mod);
+  
+ - out_unlock:
+ -	mutex_unlock(&ftrace_lock);
+ +	return 0;
+  }
+ -
+ -void ftrace_module_init(struct module *mod)
+ +#else
+ +static int ftrace_module_notify_exit(struct notifier_block *self,
+ +				     unsigned long val, void *data)
+  {
+ -	if (ftrace_disabled || !mod->num_ftrace_callsites)
+ -		return;
+ -
+ -	ftrace_process_locs(mod, mod->ftrace_callsites,
+ -			    mod->ftrace_callsites + mod->num_ftrace_callsites);
+ +	return 0;
+  }
+  #endif /* CONFIG_MODULES */
+  
+ +struct notifier_block ftrace_module_exit_nb = {
+ +	.notifier_call = ftrace_module_notify_exit,
+ +	.priority = INT_MIN,	/* Run after anything that can remove kprobes */
+ +};
+ +
+++=======
+++#endif /* CONFIG_MODULES */
+++
+++>>>>>>> 7dcd182bec27 (ftrace/module: remove ftrace module notifier)
+  void __init ftrace_init(void)
+  {
+  	extern unsigned long __start_mcount_loc[];
+@@@ -4417,10 -5068,6 +4426,13 @@@
+  				  __start_mcount_loc,
+  				  __stop_mcount_loc);
+  
+++<<<<<<< HEAD
+ +	ret = register_module_notifier(&ftrace_module_exit_nb);
+ +	if (ret)
+ +		pr_warning("Failed to register trace ftrace module exit notifier\n");
+ +
+++=======
+++>>>>>>> 7dcd182bec27 (ftrace/module: remove ftrace module notifier)
+  	set_ftrace_early_filters();
+  
+  	return;
+diff --git a/include/linux/ftrace.h b/include/linux/ftrace.h
+index 5e2f30c5d3de..4f2f13b77cdd 100644
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -509,6 +509,7 @@ extern int ftrace_arch_read_dyn_info(char *buf, int size);
+ 
+ extern int skip_trace(unsigned long ip);
+ extern void ftrace_module_init(struct module *mod);
++extern void ftrace_module_enable(struct module *mod);
+ extern void ftrace_release_mod(struct module *mod);
+ 
+ extern void ftrace_disable_daemon(void);
+@@ -518,8 +519,9 @@ static inline int skip_trace(unsigned long ip) { return 0; }
+ static inline int ftrace_force_update(void) { return 0; }
+ static inline void ftrace_disable_daemon(void) { }
+ static inline void ftrace_enable_daemon(void) { }
+-static inline void ftrace_release_mod(struct module *mod) {}
+-static inline void ftrace_module_init(struct module *mod) {}
++static inline void ftrace_module_init(struct module *mod) { }
++static inline void ftrace_module_enable(struct module *mod) { }
++static inline void ftrace_release_mod(struct module *mod) { }
+ static inline __init int register_ftrace_command(struct ftrace_func_command *cmd)
+ {
+ 	return -EINVAL;
+* Unmerged path kernel/module.c
+* Unmerged path kernel/trace/ftrace.c
