@@ -1,0 +1,395 @@
+mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] vma_merge: fix race vm_page_prot race condition against rmap_walk (Andrea Arcangeli) [1374548]
+Rebuild_FUZZ: 90.23%
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit e86f15ee64d8ee46255d964d55f74f5ba9af8c36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e86f15ee.failed
+
+The rmap_walk can access vm_page_prot (and potentially vm_flags in the
+pte/pmd manipulations).  So it's not safe to wait the caller to update
+the vm_page_prot/vm_flags after vma_merge returned potentially removing
+the "next" vma and extending the "current" vma over the
+next->vm_start,vm_end range, but still with the "current" vma
+vm_page_prot, after releasing the rmap locks.
+
+The vm_page_prot/vm_flags must be transferred from the "next" vma to the
+current vma while vma_merge still holds the rmap locks.
+
+The side effect of this race condition is pte corruption during migrate
+as remove_migration_ptes when run on a address of the "next" vma that
+got removed, used the vm_page_prot of the current vma.
+
+  migrate   	      	        mprotect
+  ------------			-------------
+  migrating in "next" vma
+				vma_merge() # removes "next" vma and
+			        	    # extends "current" vma
+					    # current vma is not with
+					    # vm_page_prot updated
+  remove_migration_ptes
+  read vm_page_prot of current "vma"
+  establish pte with wrong permissions
+				vm_set_page_prot(vma) # too late!
+				change_protection in the old vma range
+				only, next range is not updated
+
+This caused segmentation faults and potentially memory corruption in
+heavy mprotect loads with some light page migration caused by compaction
+in the background.
+
+Hugh Dickins pointed out the comment about the Odd case 8 in vma_merge
+which confirms the case 8 is only buggy one where the race can trigger,
+in all other vma_merge cases the above cannot happen.
+
+This fix removes the oddness factor from case 8 and it converts it from:
+
+      AAAA
+  PPPPNNNNXXXX -> PPPPNNNNNNNN
+
+to:
+
+      AAAA
+  PPPPNNNNXXXX -> PPPPXXXXXXXX
+
+XXXX has the right vma properties for the whole merged vma returned by
+vma_adjust, so it solves the problem fully.  It has the added benefits
+that the callers could stop updating vma properties when vma_merge
+succeeds however the callers are not updated by this patch (there are
+bits like VM_SOFTDIRTY that still need special care for the whole range,
+as the vma merging ignores them, but as long as they're not processed by
+rmap walks and instead they're accessed with the mmap_sem at least for
+reading, they are fine not to be updated within vma_adjust before
+releasing the rmap_locks).
+
+Link: http://lkml.kernel.org/r/1474309513-20313-1-git-send-email-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Reported-by: Aditya Mandaleeka <adityam@microsoft.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Jan Vorlicek <janvorli@microsoft.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e86f15ee64d8ee46255d964d55f74f5ba9af8c36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mmap.c
+diff --cc mm/mmap.c
+index 2cc2556c0b9f,e53637f8ac42..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -698,13 -609,36 +699,35 @@@ static __always_inline void __vma_unlin
+  	struct vm_area_struct *next;
+  
+  	vma_rb_erase(vma, &mm->mm_rb);
+- 	prev->vm_next = next = vma->vm_next;
++ 	next = vma->vm_next;
++ 	if (has_prev)
++ 		prev->vm_next = next;
++ 	else {
++ 		prev = vma->vm_prev;
++ 		if (prev)
++ 			prev->vm_next = next;
++ 		else
++ 			mm->mmap = next;
++ 	}
+  	if (next)
+  		next->vm_prev = prev;
+ -
+ -	/* Kill the cache */
+ -	vmacache_invalidate(mm);
+ +	if (mm->mmap_cache == vma)
+ +		mm->mmap_cache = prev;
+  }
+  
++ static inline void __vma_unlink_prev(struct mm_struct *mm,
++ 				     struct vm_area_struct *vma,
++ 				     struct vm_area_struct *prev)
++ {
++ 	__vma_unlink_common(mm, vma, prev, true);
++ }
++ 
++ static inline void __vma_unlink(struct mm_struct *mm,
++ 				struct vm_area_struct *vma)
++ {
++ 	__vma_unlink_common(mm, vma, NULL, false);
++ }
++ 
+  /*
+   * We cannot adjust vm_start, vm_end, vm_pgoff fields of a vma that
+   * is already present in an i_mmap tree without adjusting the tree.
+@@@ -712,12 -646,12 +735,17 @@@
+   * are necessary.  The "insert" vma (if any) is to be inserted
+   * before we drop the necessary locks.
+   */
+- int vma_adjust(struct vm_area_struct *vma, unsigned long start,
+- 	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert)
++ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
++ 	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
++ 	struct vm_area_struct *expand)
+  {
+  	struct mm_struct *mm = vma->vm_mm;
+++<<<<<<< HEAD
+ +	struct vm_area_struct *next = vma->vm_next;
+ +	struct vm_area_struct *importer = NULL;
+++=======
++ 	struct vm_area_struct *next = vma->vm_next, *orig_vma = vma;
+++>>>>>>> e86f15ee64d8 (mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk)
+  	struct address_space *mapping = NULL;
+  	struct rb_root *root = NULL;
+  	struct anon_vma *anon_vma = NULL;
+@@@ -733,11 -667,48 +761,45 @@@
+  			/*
+  			 * vma expands, overlapping all the next, and
+  			 * perhaps the one after too (mprotect case 6).
++ 			 * The only two other cases that gets here are
++ 			 * case 1, case 7 and case 8.
+  			 */
+++<<<<<<< HEAD
+ +again:			remove_next = 1 + (end > next->vm_end);
+ +			end = next->vm_end;
+++=======
++ 			if (next == expand) {
++ 				/*
++ 				 * The only case where we don't expand "vma"
++ 				 * and we expand "next" instead is case 8.
++ 				 */
++ 				VM_WARN_ON(end != next->vm_end);
++ 				/*
++ 				 * remove_next == 3 means we're
++ 				 * removing "vma" and that to do so we
++ 				 * swapped "vma" and "next".
++ 				 */
++ 				remove_next = 3;
++ 				VM_WARN_ON(file != next->vm_file);
++ 				swap(vma, next);
++ 			} else {
++ 				VM_WARN_ON(expand != vma);
++ 				/*
++ 				 * case 1, 6, 7, remove_next == 2 is case 6,
++ 				 * remove_next == 1 is case 1 or 7.
++ 				 */
++ 				remove_next = 1 + (end > next->vm_end);
++ 				VM_WARN_ON(remove_next == 2 &&
++ 					   end != next->vm_next->vm_end);
++ 				VM_WARN_ON(remove_next == 1 &&
++ 					   end != next->vm_end);
++ 				/* trim end to next, for case 6 first pass */
++ 				end = next->vm_end;
++ 			}
++ 
+++>>>>>>> e86f15ee64d8 (mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk)
+  			exporter = next;
+  			importer = vma;
+ -
+ -			/*
+ -			 * If next doesn't have anon_vma, import from vma after
+ -			 * next, if the vma overlaps with it.
+ -			 */
+ -			if (remove_next == 2 && next && !next->anon_vma)
+ -				exporter = next->vm_next;
+ -
+  		} else if (end > next->vm_start) {
+  			/*
+  			 * vma expands, overlapping part of the next:
+@@@ -752,9 -724,10 +815,10 @@@
+  			 * split_vma inserting another: so it must be
+  			 * mprotect case 4 shifting the boundary down.
+  			 */
+ -			adjust_next = -((vma->vm_end - end) >> PAGE_SHIFT);
+ +			adjust_next = - ((vma->vm_end - end) >> PAGE_SHIFT);
+  			exporter = vma;
+  			importer = next;
++ 			VM_WARN_ON(expand != importer);
+  		}
+  
+  		/*
+@@@ -763,11 -736,16 +827,16 @@@
+  		 * shrinking vma had, to cover any anon pages imported.
+  		 */
+  		if (exporter && exporter->anon_vma && !importer->anon_vma) {
+ -			int error;
+ -
+  			importer->anon_vma = exporter->anon_vma;
+ -			error = anon_vma_clone(importer, exporter);
+ -			if (error)
+ -				return error;
+ +			if (anon_vma_clone(importer, exporter))
+ +				return -ENOMEM;
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ again:
++ 	vma_adjust_trans_huge(orig_vma, start, end, adjust_next);
+++>>>>>>> e86f15ee64d8 (mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk)
+  
+  	if (file) {
+  		mapping = file->f_mapping;
+@@@ -798,8 -771,8 +867,13 @@@
+  	if (!anon_vma && adjust_next)
+  		anon_vma = next->anon_vma;
+  	if (anon_vma) {
+++<<<<<<< HEAD
+ +		VM_BUG_ON(adjust_next && next->anon_vma &&
+ +			  anon_vma != next->anon_vma);
+++=======
++ 		VM_WARN_ON(adjust_next && next->anon_vma &&
++ 			   anon_vma != next->anon_vma);
+++>>>>>>> e86f15ee64d8 (mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk)
+  		anon_vma_lock_write(anon_vma);
+  		anon_vma_interval_tree_pre_update_vma(vma);
+  		if (adjust_next)
+@@@ -891,13 -868,56 +969,40 @@@
+  		 * we must remove another next too. It would clutter
+  		 * up the code too much to do both in one go.
+  		 */
+++<<<<<<< HEAD
+ +		next = vma->vm_next;
+ +		if (remove_next == 2)
+++=======
++ 		if (remove_next != 3) {
++ 			/*
++ 			 * If "next" was removed and vma->vm_end was
++ 			 * expanded (up) over it, in turn
++ 			 * "next->vm_prev->vm_end" changed and the
++ 			 * "vma->vm_next" gap must be updated.
++ 			 */
++ 			next = vma->vm_next;
++ 		} else {
++ 			/*
++ 			 * For the scope of the comment "next" and
++ 			 * "vma" considered pre-swap(): if "vma" was
++ 			 * removed, next->vm_start was expanded (down)
++ 			 * over it and the "next" gap must be updated.
++ 			 * Because of the swap() the post-swap() "vma"
++ 			 * actually points to pre-swap() "next"
++ 			 * (post-swap() "next" as opposed is now a
++ 			 * dangling pointer).
++ 			 */
++ 			next = vma;
++ 		}
++ 		if (remove_next == 2) {
++ 			remove_next = 1;
++ 			end = next->vm_end;
+++>>>>>>> e86f15ee64d8 (mm: vma_merge: fix vm_page_prot SMP race condition against rmap_walk)
+  			goto again;
+ -		}
+  		else if (next)
+  			vma_gap_update(next);
+ -		else {
+ -			/*
+ -			 * If remove_next == 2 we obviously can't
+ -			 * reach this path.
+ -			 *
+ -			 * If remove_next == 3 we can't reach this
+ -			 * path because pre-swap() next is always not
+ -			 * NULL. pre-swap() "next" is not being
+ -			 * removed and its next->vm_end is not altered
+ -			 * (and furthermore "end" already matches
+ -			 * next->vm_end in remove_next == 3).
+ -			 *
+ -			 * We reach this only in the remove_next == 1
+ -			 * case if the "next" vma that was removed was
+ -			 * the highest vma of the mm. However in such
+ -			 * case next->vm_end == "end" and the extended
+ -			 * "vma" has vma->vm_end == next->vm_end so
+ -			 * mm->highest_vm_end doesn't need any update
+ -			 * in remove_next == 1 case.
+ -			 */
+ -			VM_WARN_ON(mm->highest_vm_end != end);
+ -		}
+ +		else
+ +			mm->highest_vm_end = end;
+  	}
+  	if (insert && file)
+  		uprobe_mmap(insert);
+@@@ -1071,14 -1107,15 +1192,15 @@@ struct vm_area_struct *vma_merge(struc
+  				is_mergeable_anon_vma(prev->anon_vma,
+  						      next->anon_vma, NULL)) {
+  							/* cases 1, 6 */
+- 			err = vma_adjust(prev, prev->vm_start,
+- 				next->vm_end, prev->vm_pgoff, NULL);
++ 			err = __vma_adjust(prev, prev->vm_start,
++ 					 next->vm_end, prev->vm_pgoff, NULL,
++ 					 prev);
+  		} else					/* cases 2, 5, 7 */
+- 			err = vma_adjust(prev, prev->vm_start,
+- 				end, prev->vm_pgoff, NULL);
++ 			err = __vma_adjust(prev, prev->vm_start,
++ 					 end, prev->vm_pgoff, NULL, prev);
+  		if (err)
+  			return NULL;
+ -		khugepaged_enter_vma_merge(prev, vm_flags);
+ +		khugepaged_enter_vma_merge(prev);
+  		return prev;
+  	}
+  
+@@@ -1091,14 -1128,21 +1213,21 @@@
+  					     anon_vma, file, pgoff+pglen,
+  					     vm_userfaultfd_ctx)) {
+  		if (prev && addr < prev->vm_end)	/* case 4 */
+- 			err = vma_adjust(prev, prev->vm_start,
+- 				addr, prev->vm_pgoff, NULL);
+- 		else					/* cases 3, 8 */
+- 			err = vma_adjust(area, addr, next->vm_end,
+- 				next->vm_pgoff - pglen, NULL);
++ 			err = __vma_adjust(prev, prev->vm_start,
++ 					 addr, prev->vm_pgoff, NULL, next);
++ 		else {					/* cases 3, 8 */
++ 			err = __vma_adjust(area, addr, next->vm_end,
++ 					 next->vm_pgoff - pglen, NULL, next);
++ 			/*
++ 			 * In case 3 area is already equal to next and
++ 			 * this is a noop, but in case 8 "area" has
++ 			 * been removed and next was expanded over it.
++ 			 */
++ 			area = next;
++ 		}
+  		if (err)
+  			return NULL;
+ -		khugepaged_enter_vma_merge(area, vm_flags);
+ +		khugepaged_enter_vma_merge(area);
+  		return area;
+  	}
+  
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index e7edaaec02da..fdcb4b268c72 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1865,8 +1865,14 @@ void anon_vma_interval_tree_verify(struct anon_vma_chain *node);
+ 
+ /* mmap.c */
+ extern int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin);
+-extern int vma_adjust(struct vm_area_struct *vma, unsigned long start,
+-	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert);
++extern int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
++	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
++	struct vm_area_struct *expand);
++static inline int vma_adjust(struct vm_area_struct *vma, unsigned long start,
++	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert)
++{
++	return __vma_adjust(vma, start, end, pgoff, insert, NULL);
++}
+ extern struct vm_area_struct *vma_merge(struct mm_struct *,
+ 	struct vm_area_struct *prev, unsigned long addr, unsigned long end,
+ 	unsigned long vm_flags, struct anon_vma *, struct file *, pgoff_t,
+* Unmerged path mm/mmap.c
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 0dae9119c9ad..531e160342d1 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -296,6 +296,7 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 			   vma->vm_userfaultfd_ctx);
+ 	if (*pprev) {
+ 		vma = *pprev;
++		VM_WARN_ON((vma->vm_flags ^ newflags) & ~VM_SOFTDIRTY);
+ 		goto success;
+ 	}
+ 
