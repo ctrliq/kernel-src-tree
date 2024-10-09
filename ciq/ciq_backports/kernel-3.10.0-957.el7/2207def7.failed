@@ -1,0 +1,350 @@
+x86/apic: Ignore secondary threads if nosmt=force
+
+jira LE-1907
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] apic: ignore secondary threads if nosmt=force (Christoph von Recklinghausen) [1593384] {CVE-2018-3620}
+Rebuild_FUZZ: 95.74%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2207def700f902f169fc237b717252c326f9e464
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2207def7.failed
+
+nosmt on the kernel command line merely prevents the onlining of the
+secondary SMT siblings.
+
+nosmt=force makes the APIC detection code ignore the secondary SMT siblings
+completely, so they even do not show up as possible CPUs. That reduces the
+amount of memory allocations for per cpu variables and saves other
+resources from being allocated too large.
+
+This is not fully equivalent to disabling SMT in the BIOS because the low
+level SMT enabling in the BIOS can result in partitioning of resources
+between the siblings, which is not undone by just ignoring them. Some CPUs
+can use the full resources when their sibling is not onlined, but this is
+depending on the CPU family and model and it's not well documented whether
+this applies to all partitioned resources. That means depending on the
+workload disabling SMT in the BIOS might result in better performance.
+
+Linus analysis of the Intel manual:
+
+  The intel optimization manual is not very clear on what the partitioning
+  rules are.
+
+  I find:
+
+    "In general, the buffers for staging instructions between major pipe
+     stages  are partitioned. These buffers include µop queues after the
+     execution trace cache, the queues after the register rename stage, the
+     reorder buffer which stages instructions for retirement, and the load
+     and store buffers.
+
+     In the case of load and store buffers, partitioning also provided an
+     easier implementation to maintain memory ordering for each logical
+     processor and detect memory ordering violations"
+
+  but some of that partitioning may be relaxed if the HT thread is "not
+  active":
+
+    "In Intel microarchitecture code name Sandy Bridge, the micro-op queue
+     is statically partitioned to provide 28 entries for each logical
+     processor,  irrespective of software executing in single thread or
+     multiple threads. If one logical processor is not active in Intel
+     microarchitecture code name Ivy Bridge, then a single thread executing
+     on that processor  core can use the 56 entries in the micro-op queue"
+
+  but I do not know what "not active" means, and how dynamic it is. Some of
+  that partitioning may be entirely static and depend on the early BIOS
+  disabling of HT, and even if we park the cores, the resources will just be
+  wasted.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2207def700f902f169fc237b717252c326f9e464)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/apic.h
+#	arch/x86/kernel/apic/apic.c
+diff --cc arch/x86/include/asm/apic.h
+index 83a199eb0bee,ef40e4acd7c2..000000000000
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@@ -561,137 -488,28 +561,146 @@@ static inline unsigned int read_apic_id
+  	return apic->get_apic_id(reg);
+  }
+  
+ -extern int default_apic_id_valid(u32 apicid);
+ +static inline int default_apic_id_valid(int apicid)
+ +{
+ +	return (apicid < 255);
+ +}
+ +
+  extern int default_acpi_madt_oem_check(char *, char *);
+ +
+  extern void default_setup_apic_routing(void);
+  
+ -extern u32 apic_default_calc_apicid(unsigned int cpu);
+ -extern u32 apic_flat_calc_apicid(unsigned int cpu);
+ +extern struct apic apic_noop;
+ +
+ +#ifdef CONFIG_X86_32
+  
+ -extern bool default_check_apicid_used(physid_mask_t *map, int apicid);
+ -extern void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap);
+ -extern int default_cpu_present_to_apicid(int mps_cpu);
+ -extern int default_check_phys_apicid_present(int phys_apicid);
+ +static inline int noop_x86_32_early_logical_apicid(int cpu)
+ +{
+ +	return BAD_APICID;
+ +}
+  
+ -#endif /* CONFIG_X86_LOCAL_APIC */
+ +/*
+ + * Set up the logical destination ID.
+ + *
+ + * Intel recommends to set DFR, LDR and TPR before enabling
+ + * an APIC.  See e.g. "AP-388 82489DX User's Manual" (Intel
+ + * document number 292116).  So here it goes...
+ + */
+ +extern void default_init_apic_ldr(void);
+  
+ +static inline int default_apic_id_registered(void)
+ +{
+ +	return physid_isset(read_apic_id(), phys_cpu_present_map);
+ +}
+ +
+ +static inline int default_phys_pkg_id(int cpuid_apic, int index_msb)
+ +{
+ +	return cpuid_apic >> index_msb;
+ +}
+ +
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_SMP
++ bool apic_id_is_primary_thread(unsigned int id);
++ bool apic_id_disabled(unsigned int id);
++ #else
++ static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
++ static inline bool apic_id_disabled(unsigned int id) { return false; }
+++>>>>>>> 2207def700f9 (x86/apic: Ignore secondary threads if nosmt=force)
+  #endif
+  
+ +static inline int
+ +flat_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			    const struct cpumask *andmask,
+ +			    unsigned int *apicid)
+ +{
+ +	unsigned long cpu_mask = cpumask_bits(cpumask)[0] &
+ +				 cpumask_bits(andmask)[0] &
+ +				 cpumask_bits(cpu_online_mask)[0] &
+ +				 APIC_ALL_CPUS;
+ +
+ +	if (likely(cpu_mask)) {
+ +		*apicid = (unsigned int)cpu_mask;
+ +		return 0;
+ +	} else {
+ +		return -EINVAL;
+ +	}
+ +}
+ +
+ +extern int
+ +default_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			       const struct cpumask *andmask,
+ +			       unsigned int *apicid);
+ +
+ +static inline void
+ +flat_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +			      const struct cpumask *mask)
+ +{
+ +	/* Careful. Some cpus do not strictly honor the set of cpus
+ +	 * specified in the interrupt destination when using lowest
+ +	 * priority interrupt delivery mode.
+ +	 *
+ +	 * In particular there was a hyperthreading cpu observed to
+ +	 * deliver interrupts to the wrong hyperthread when only one
+ +	 * hyperthread was specified in the interrupt desitination.
+ +	 */
+ +	cpumask_clear(retmask);
+ +	cpumask_bits(retmask)[0] = APIC_ALL_CPUS;
+ +}
+ +
+ +static inline void
+ +default_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +				 const struct cpumask *mask)
+ +{
+ +	cpumask_copy(retmask, cpumask_of(cpu));
+ +}
+ +
+ +static inline unsigned long default_check_apicid_used(physid_mask_t *map, int apicid)
+ +{
+ +	return physid_isset(apicid, *map);
+ +}
+ +
+ +static inline unsigned long default_check_apicid_present(int bit)
+ +{
+ +	return physid_isset(bit, phys_cpu_present_map);
+ +}
+ +
+ +static inline void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap)
+ +{
+ +	*retmap = *phys_map;
+ +}
+ +
+ +static inline int __default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	if (mps_cpu < nr_cpu_ids && cpu_present(mps_cpu))
+ +		return (int)per_cpu(x86_bios_cpu_apicid, mps_cpu);
+ +	else
+ +		return BAD_APICID;
+ +}
+ +
+ +static inline int
+ +__default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return physid_isset(phys_apicid, phys_cpu_present_map);
+ +}
+ +
+ +#ifdef CONFIG_X86_32
+ +static inline int default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	return __default_cpu_present_to_apicid(mps_cpu);
+ +}
+ +
+ +static inline int
+ +default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return __default_check_phys_apicid_present(phys_apicid);
+ +}
+ +#else
+ +extern int default_cpu_present_to_apicid(int mps_cpu);
+ +extern int default_check_phys_apicid_present(int phys_apicid);
+ +#endif
+ +
+ +#endif /* CONFIG_X86_LOCAL_APIC */
+  extern void irq_enter(void);
+  extern void irq_exit(void);
+  
+diff --cc arch/x86/kernel/apic/apic.c
+index 3cb4ee28fa8c,b86091add294..000000000000
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@@ -2230,6 -2172,77 +2230,80 @@@ void disconnect_bsp_APIC(int virt_wire_
+  	apic_write(APIC_LVT1, value);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The number of allocated logical CPU IDs. Since logical CPU IDs are allocated
++  * contiguously, it equals to current allocated max logical CPU ID plus 1.
++  * All allocated CPU IDs should be in the [0, nr_logical_cpuids) range,
++  * so the maximum of nr_logical_cpuids is nr_cpu_ids.
++  *
++  * NOTE: Reserve 0 for BSP.
++  */
++ static int nr_logical_cpuids = 1;
++ 
++ /*
++  * Used to store mapping between logical CPU IDs and APIC IDs.
++  */
++ static int cpuid_to_apicid[] = {
++ 	[0 ... NR_CPUS - 1] = -1,
++ };
++ 
++ /**
++  * apic_id_is_primary_thread - Check whether APIC ID belongs to a primary thread
++  * @id:	APIC ID to check
++  */
++ bool apic_id_is_primary_thread(unsigned int apicid)
++ {
++ 	u32 mask;
++ 
++ 	if (smp_num_siblings == 1)
++ 		return true;
++ 	/* Isolate the SMT bit(s) in the APICID and check for 0 */
++ 	mask = (1U << (fls(smp_num_siblings) - 1)) - 1;
++ 	return !(apicid & mask);
++ }
++ 
++ /**
++  * apic_id_disabled - Check whether APIC ID is disabled via SMT control
++  * @id:	APIC ID to check
++  */
++ bool apic_id_disabled(unsigned int id)
++ {
++ 	return (cpu_smt_control == CPU_SMT_FORCE_DISABLED &&
++ 		!apic_id_is_primary_thread(id));
++ }
++ 
++ /*
++  * Should use this API to allocate logical CPU IDs to keep nr_logical_cpuids
++  * and cpuid_to_apicid[] synchronized.
++  */
++ static int allocate_logical_cpuid(int apicid)
++ {
++ 	int i;
++ 
++ 	/*
++ 	 * cpuid <-> apicid mapping is persistent, so when a cpu is up,
++ 	 * check if the kernel has allocated a cpuid for it.
++ 	 */
++ 	for (i = 0; i < nr_logical_cpuids; i++) {
++ 		if (cpuid_to_apicid[i] == apicid)
++ 			return i;
++ 	}
++ 
++ 	/* Allocate a new cpuid. */
++ 	if (nr_logical_cpuids >= nr_cpu_ids) {
++ 		WARN_ONCE(1, "APIC: NR_CPUS/possible_cpus limit of %u reached. "
++ 			     "Processor %d/0x%x and the rest are ignored.\n",
++ 			     nr_cpu_ids, nr_logical_cpuids, apicid);
++ 		return -EINVAL;
++ 	}
++ 
++ 	cpuid_to_apicid[nr_logical_cpuids] = apicid;
++ 	return nr_logical_cpuids++;
++ }
++ 
+++>>>>>>> 2207def700f9 (x86/apic: Ignore secondary threads if nosmt=force)
+  int generic_processor_info(int apicid, int version)
+  {
+  	int cpu, max = nr_cpu_ids;
+@@@ -2297,7 -2309,15 +2371,19 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	num_processors++;
+++=======
++ 	/*
++ 	 * If SMT is force disabled and the APIC ID belongs to
++ 	 * a secondary thread, ignore it.
++ 	 */
++ 	if (apic_id_disabled(apicid)) {
++ 		pr_info_once("Ignoring secondary SMT threads\n");
++ 		return -EINVAL;
++ 	}
++ 
+++>>>>>>> 2207def700f9 (x86/apic: Ignore secondary threads if nosmt=force)
+  	if (apicid == boot_cpu_physical_apicid) {
+  		/*
+  		 * x86_bios_cpu_apicid is required to have processors listed
+* Unmerged path arch/x86/include/asm/apic.h
+diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
+index 77c5e247d1b6..13453c28dffb 100644
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@ -179,7 +179,8 @@ static int acpi_register_lapic(int id, u32 acpiid, u8 enabled)
+ 	}
+ 
+ 	if (!enabled) {
+-		++disabled_cpus;
++		if (!apic_id_disabled(id))
++			++disabled_cpus;
+ 		return -EINVAL;
+ 	}
+ 
+* Unmerged path arch/x86/kernel/apic/apic.c
