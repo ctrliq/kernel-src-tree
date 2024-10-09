@@ -1,0 +1,205 @@
+kvm: svm: Use the hardware provided GPA instead of page walk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 0f89b207b04a1a399e19d35293658e3a571da3d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0f89b207.failed
+
+When a guest causes a NPF which requires emulation, KVM sometimes walks
+the guest page tables to translate the GVA to a GPA. This is unnecessary
+most of the time on AMD hardware since the hardware provides the GPA in
+EXITINFO2.
+
+The only exception cases involve string operations involving rep or
+operations that use two memory locations. With rep, the GPA will only be
+the value of the initial NPF and with dual memory locations we won't know
+which memory address was translated into EXITINFO2.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0f89b207b04a1a399e19d35293658e3a571da3d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index fabc5ea96a82,0419e114f27b..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -626,8 -676,8 +626,13 @@@ struct kvm_vcpu_arch 
+  	int pending_ioapic_eoi;
+  	int pending_external_vector;
+  
+++<<<<<<< HEAD
+ +	/* Flush the L1 Data cache for L1TF mitigation on VMENTER */
+ +	bool l1tf_flush_l1d;
+++=======
++ 	/* GPA available (AMD only) */
++ 	bool gpa_available;
+++>>>>>>> 0f89b207b04a (kvm: svm: Use the hardware provided GPA instead of page walk)
+  };
+  
+  struct kvm_lpage_info {
+diff --git a/arch/x86/include/asm/kvm_emulate.h b/arch/x86/include/asm/kvm_emulate.h
+index 74d8b1afca6a..7e7d94715836 100644
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -446,5 +446,6 @@ int emulator_task_switch(struct x86_emulate_ctxt *ctxt,
+ int emulate_int_real(struct x86_emulate_ctxt *ctxt, int irq);
+ void emulator_invalidate_register_cache(struct x86_emulate_ctxt *ctxt);
+ void emulator_writeback_register_cache(struct x86_emulate_ctxt *ctxt);
++bool emulator_can_use_gpa(struct x86_emulate_ctxt *ctxt);
+ 
+ #endif /* _ASM_X86_KVM_X86_EMULATE_H */
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 05d389ffb09d..a2474a6f5d24 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -175,6 +175,7 @@
+ #define NearBranch  ((u64)1 << 52)  /* Near branches */
+ #define No16	    ((u64)1 << 53)  /* No 16 bit operand */
+ #define IncSP       ((u64)1 << 54)  /* SP is incremented before ModRM calc */
++#define TwoMemOp    ((u64)1 << 55)  /* Instruction has two memory operand */
+ 
+ #define DstXacc     (DstAccLo | SrcAccHi | SrcWrite)
+ 
+@@ -4357,7 +4358,7 @@ static const struct opcode group1[] = {
+ };
+ 
+ static const struct opcode group1A[] = {
+-	I(DstMem | SrcNone | Mov | Stack | IncSP, em_pop), N, N, N, N, N, N, N,
++	I(DstMem | SrcNone | Mov | Stack | IncSP | TwoMemOp, em_pop), N, N, N, N, N, N, N,
+ };
+ 
+ static const struct opcode group2[] = {
+@@ -4395,7 +4396,7 @@ static const struct opcode group5[] = {
+ 	I(SrcMemFAddr | ImplicitOps,		em_call_far),
+ 	I(SrcMem | NearBranch,			em_jmp_abs),
+ 	I(SrcMemFAddr | ImplicitOps,		em_jmp_far),
+-	I(SrcMem | Stack,			em_push), D(Undefined),
++	I(SrcMem | Stack | TwoMemOp,		em_push), D(Undefined),
+ };
+ 
+ static const struct opcode group6[] = {
+@@ -4615,8 +4616,8 @@ static const struct opcode opcode_table[256] = {
+ 	/* 0xA0 - 0xA7 */
+ 	I2bv(DstAcc | SrcMem | Mov | MemAbs, em_mov),
+ 	I2bv(DstMem | SrcAcc | Mov | MemAbs | PageTable, em_mov),
+-	I2bv(SrcSI | DstDI | Mov | String, em_mov),
+-	F2bv(SrcSI | DstDI | String | NoWrite, em_cmp_r),
++	I2bv(SrcSI | DstDI | Mov | String | TwoMemOp, em_mov),
++	F2bv(SrcSI | DstDI | String | NoWrite | TwoMemOp, em_cmp_r),
+ 	/* 0xA8 - 0xAF */
+ 	F2bv(DstAcc | SrcImm | NoWrite, em_test),
+ 	I2bv(SrcAcc | DstDI | Mov | String, em_mov),
+@@ -5732,3 +5733,14 @@ void emulator_writeback_register_cache(struct x86_emulate_ctxt *ctxt)
+ {
+ 	writeback_registers(ctxt);
+ }
++
++bool emulator_can_use_gpa(struct x86_emulate_ctxt *ctxt)
++{
++	if (ctxt->rep_prefix && (ctxt->d & String))
++		return false;
++
++	if (ctxt->d & TwoMemOp)
++		return false;
++
++	return true;
++}
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 851f91a948f6..bf6528d7a202 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -4476,6 +4476,8 @@ static int handle_exit(struct kvm_vcpu *vcpu)
+ 
+ 	trace_kvm_exit(exit_code, vcpu, KVM_ISA_SVM);
+ 
++	vcpu->arch.gpa_available = (exit_code == SVM_EXIT_NPF);
++
+ 	if (!is_cr_intercept(svm, INTERCEPT_CR0_WRITE))
+ 		vcpu->arch.cr0 = svm->vmcb->save.cr0;
+ 	if (npt_enabled)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4fe46876c6e7..9abb8d007249 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4400,6 +4400,21 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(kvm_write_guest_virt_system);
+ 
++static int vcpu_is_mmio_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
++			    gpa_t gpa, bool write)
++{
++	/* For APIC access vmexit */
++	if ((gpa & PAGE_MASK) == APIC_DEFAULT_PHYS_BASE)
++		return 1;
++
++	if (vcpu_match_mmio_gpa(vcpu, gpa)) {
++		trace_vcpu_match_mmio(gva, gpa, write, true);
++		return 1;
++	}
++
++	return 0;
++}
++
+ static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ 				gpa_t *gpa, struct x86_exception *exception,
+ 				bool write)
+@@ -4426,16 +4441,7 @@ static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ 	if (*gpa == UNMAPPED_GVA)
+ 		return -1;
+ 
+-	/* For APIC access vmexit */
+-	if ((*gpa & PAGE_MASK) == APIC_DEFAULT_PHYS_BASE)
+-		return 1;
+-
+-	if (vcpu_match_mmio_gpa(vcpu, *gpa)) {
+-		trace_vcpu_match_mmio(gva, *gpa, write, true);
+-		return 1;
+-	}
+-
+-	return 0;
++	return vcpu_is_mmio_gpa(vcpu, gva, *gpa, write);
+ }
+ 
+ int emulator_write_phys(struct kvm_vcpu *vcpu, gpa_t gpa,
+@@ -4532,6 +4538,22 @@ static int emulator_read_write_onepage(unsigned long addr, void *val,
+ 	int handled, ret;
+ 	bool write = ops->write;
+ 	struct kvm_mmio_fragment *frag;
++	struct x86_emulate_ctxt *ctxt = &vcpu->arch.emulate_ctxt;
++
++	/*
++	 * If the exit was due to a NPF we may already have a GPA.
++	 * If the GPA is present, use it to avoid the GVA to GPA table walk.
++	 * Note, this cannot be used on string operations since string
++	 * operation using rep will only have the initial GPA from the NPF
++	 * occurred.
++	 */
++	if (vcpu->arch.gpa_available &&
++	    emulator_can_use_gpa(ctxt) &&
++	    vcpu_is_mmio_gpa(vcpu, addr, exception->address, write) &&
++	    (addr & ~PAGE_MASK) == (exception->address & ~PAGE_MASK)) {
++		gpa = exception->address;
++		goto mmio;
++	}
+ 
+ 	ret = vcpu_mmio_gva_to_gpa(vcpu, addr, &gpa, exception, write);
+ 
+@@ -5553,6 +5575,9 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu,
+ 	}
+ 
+ restart:
++	/* Save the faulting GPA (cr2) in the address field */
++	ctxt->exception.address = cr2;
++
+ 	r = x86_emulate_insn(ctxt);
+ 
+ 	if (r == EMULATION_INTERCEPTED)
