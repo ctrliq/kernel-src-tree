@@ -1,0 +1,106 @@
+md/raid1: don't clear bitmap bits on interrupted recovery.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [md] raid1: don't clear bitmap bits on interrupted recovery (Xiao Ni) [1677312]
+Rebuild_FUZZ: 96.43%
+commit-author Nate Dailey <nate.dailey@stratus.com>
+commit dfcc34c99f3ebc16b787b118763bf9cb6b1efc7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dfcc34c9.failed
+
+sync_request_write no longer submits writes to a Faulty device. This has
+the unfortunate side effect that bitmap bits can be incorrectly cleared
+if a recovery is interrupted (previously, end_sync_write would have
+prevented this). This means the next recovery may not copy everything
+it should, potentially corrupting data.
+
+Add a function for doing the proper md_bitmap_end_sync, called from
+end_sync_write and the Faulty case in sync_request_write.
+
+backport note to 4.14: s/md_bitmap_end_sync/bitmap_end_sync
+	Cc: stable@vger.kernel.org 4.14+
+Fixes: 0c9d5b127f69 ("md/raid1: avoid reusing a resync bio after error handling.")
+	Reviewed-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+	Tested-by: Jack Wang <jinpu.wang@cloud.ionos.com>
+	Signed-off-by: Nate Dailey <nate.dailey@stratus.com>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+(cherry picked from commit dfcc34c99f3ebc16b787b118763bf9cb6b1efc7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index 9643c43d8d42,fa47249fa3e4..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1889,9 -1863,23 +1889,27 @@@ static void end_sync_read(struct bio *b
+  		reschedule_retry(r1_bio);
+  }
+  
+++<<<<<<< HEAD
+ +static void end_sync_write(struct bio *bio, int error)
+++=======
++ static void abort_sync_write(struct mddev *mddev, struct r1bio *r1_bio)
++ {
++ 	sector_t sync_blocks = 0;
++ 	sector_t s = r1_bio->sector;
++ 	long sectors_to_go = r1_bio->sectors;
++ 
++ 	/* make sure these bits don't get cleared. */
++ 	do {
++ 		md_bitmap_end_sync(mddev->bitmap, s, &sync_blocks, 1);
++ 		s += sync_blocks;
++ 		sectors_to_go -= sync_blocks;
++ 	} while (sectors_to_go > 0);
++ }
++ 
++ static void end_sync_write(struct bio *bio)
+++>>>>>>> dfcc34c99f3e (md/raid1: don't clear bitmap bits on interrupted recovery.)
+  {
+ -	int uptodate = !bio->bi_status;
+ +	int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+  	struct r1bio *r1_bio = get_resync_r1bio(bio);
+  	struct mddev *mddev = r1_bio->mddev;
+  	struct r1conf *conf = mddev->private;
+@@@ -1900,16 -1888,7 +1918,20 @@@
+  	struct md_rdev *rdev = conf->mirrors[find_bio_disk(r1_bio, bio)].rdev;
+  
+  	if (!uptodate) {
+++<<<<<<< HEAD
+ +		sector_t sync_blocks = 0;
+ +		sector_t s = r1_bio->sector;
+ +		long sectors_to_go = r1_bio->sectors;
+ +		/* make sure these bits doesn't get cleared. */
+ +		do {
+ +			bitmap_end_sync(mddev->bitmap, s,
+ +					&sync_blocks, 1);
+ +			s += sync_blocks;
+ +			sectors_to_go -= sync_blocks;
+ +		} while (sectors_to_go > 0);
+++=======
++ 		abort_sync_write(mddev, r1_bio);
+++>>>>>>> dfcc34c99f3e (md/raid1: don't clear bitmap bits on interrupted recovery.)
+  		set_bit(WriteErrorSeen, &rdev->flags);
+  		if (!test_and_set_bit(WantReplacement, &rdev->flags))
+  			set_bit(MD_RECOVERY_NEEDED, &
+@@@ -2213,12 -2178,14 +2235,14 @@@ static void sync_request_write(struct m
+  		     (i == r1_bio->read_disk ||
+  		      !test_bit(MD_RECOVERY_SYNC, &mddev->recovery))))
+  			continue;
+- 		if (test_bit(Faulty, &conf->mirrors[i].rdev->flags))
++ 		if (test_bit(Faulty, &conf->mirrors[i].rdev->flags)) {
++ 			abort_sync_write(mddev, r1_bio);
+  			continue;
++ 		}
+  
+ -		bio_set_op_attrs(wbio, REQ_OP_WRITE, 0);
+ +		wbio->bi_rw = WRITE;
+  		if (test_bit(FailFast, &conf->mirrors[i].rdev->flags))
+ -			wbio->bi_opf |= MD_FAILFAST;
+ +			wbio->bi_rw |= MD_FAILFAST;
+  
+  		wbio->bi_end_io = end_sync_write;
+  		atomic_inc(&r1_bio->remaining);
+* Unmerged path drivers/md/raid1.c
