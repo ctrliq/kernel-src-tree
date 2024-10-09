@@ -1,0 +1,191 @@
+xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit fcdfb968a706b0e80b12832bc30387ee9e0a759e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fcdfb968.failed
+
+The use of a scatterlist for handling DMA mapping and unmapping
+was recently introduced in frwr_ops.c in commit 4143f34e01e9
+("xprtrdma: Port to new memory registration API"). That commit did
+not make a similar update to xprtrdma's FMR support because the
+core ib_map_phys_fmr() and ib_unmap_fmr() APIs have not been changed
+to take a scatterlist argument.
+
+However, FMR still needs to do DMA mapping and unmapping. It appears
+that RDS, for example, uses a scatterlist for this, then builds the
+DMA addr array for the ib_map_phys_fmr call separately. I see that
+SRP also utilizes a scatterlist for DMA mapping. xprtrdma can do
+something similar.
+
+This modernization is used immediately to properly defer DMA
+unmapping during fmr_unmap_safe (a FIXME). It separates the DMA
+unmapping coordinates from the rl_segments array. This array, being
+part of an rpcrdma_req, is always re-used immediately when an RPC
+exits. A scatterlist is allocated in memory independent of the
+rl_segments array, so it can be preserved indefinitely (ie, until
+the MR invalidation and DMA unmapping can actually be done by a
+worker thread).
+
+The FRWR and FMR DMA mapping code are slightly different from each
+other now, and will diverge further when the "Check for holes" logic
+can be removed from FRWR (support for SG_GAP MRs). So I chose not to
+create helpers for the common-looking code.
+
+Fixes: ead3f26e359e ("xprtrdma: Add ro_unmap_safe memreg method")
+	Suggested-by: Sagi Grimberg <sagi@lightbits.io>
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit fcdfb968a706b0e80b12832bc30387ee9e0a759e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,df5fe1786105..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -71,6 -115,45 +71,48 @@@ __fmr_unmap(struct rpcrdma_mw *mw
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __fmr_dma_unmap(struct rpcrdma_mw *mw)
++ {
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 
++ 	ib_dma_unmap_sg(r_xprt->rx_ia.ri_device,
++ 			mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	rpcrdma_put_mw(r_xprt, mw);
++ }
++ 
++ static void
++ __fmr_reset_and_unmap(struct rpcrdma_mw *mw)
++ {
++ 	int rc;
++ 
++ 	/* ORDER */
++ 	rc = __fmr_unmap(mw);
++ 	if (rc) {
++ 		pr_warn("rpcrdma: ib_unmap_fmr status %d, fmr %p orphaned\n",
++ 			rc, mw);
++ 		return;
++ 	}
++ 	__fmr_dma_unmap(mw);
++ }
++ 
++ static void
++ __fmr_release(struct rpcrdma_mw *r)
++ {
++ 	int rc;
++ 
++ 	kfree(r->fmr.fm_physaddrs);
++ 	kfree(r->mw_sg);
++ 
++ 	rc = ib_dealloc_fmr(r->fmr.fm_mr);
++ 	if (rc)
++ 		pr_err("rpcrdma: final ib_dealloc_fmr for %p returned %i\n",
++ 		       r, rc);
++ }
++ 
+++>>>>>>> fcdfb968a706 (xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR)
+  /* Deferred reset of a single FMR. Generate a fresh rkey by
+   * replacing the MR. There's no recovery if this fails.
+   */
+@@@ -203,8 -263,14 +241,19 @@@ fmr_op_map(struct rpcrdma_xprt *r_xprt
+  	if (nsegs > RPCRDMA_MAX_FMR_SGES)
+  		nsegs = RPCRDMA_MAX_FMR_SGES;
+  	for (i = 0; i < nsegs;) {
+++<<<<<<< HEAD
+ +		rpcrdma_map_one(device, seg, direction);
+ +		mw->fmr.physaddrs[i] = seg->mr_dma;
+++=======
++ 		if (seg->mr_page)
++ 			sg_set_page(&mw->mw_sg[i],
++ 				    seg->mr_page,
++ 				    seg->mr_len,
++ 				    offset_in_page(seg->mr_offset));
++ 		else
++ 			sg_set_buf(&mw->mw_sg[i], seg->mr_offset,
++ 				   seg->mr_len);
+++>>>>>>> fcdfb968a706 (xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR)
+  		len += seg->mr_len;
+  		++seg;
+  		++i;
+@@@ -213,25 -279,37 +262,48 @@@
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+  			break;
+  	}
++ 	mw->mw_nents = i;
++ 	mw->mw_dir = rpcrdma_data_dir(writing);
+  
+++<<<<<<< HEAD
+ +	rc = ib_map_phys_fmr(mw->fmr.fmr, mw->fmr.physaddrs,
+ +			     i, seg1->mr_dma);
+++=======
++ 	if (!ib_dma_map_sg(r_xprt->rx_ia.ri_device,
++ 			   mw->mw_sg, mw->mw_nents, mw->mw_dir))
++ 		goto out_dmamap_err;
++ 
++ 	for (i = 0, dma_pages = mw->fmr.fm_physaddrs; i < mw->mw_nents; i++)
++ 		dma_pages[i] = sg_dma_address(&mw->mw_sg[i]);
++ 	rc = ib_map_phys_fmr(mw->fmr.fm_mr, dma_pages, mw->mw_nents,
++ 			     dma_pages[0]);
+++>>>>>>> fcdfb968a706 (xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR)
+  	if (rc)
+  		goto out_maperr;
+  
+  	seg1->rl_mw = mw;
+++<<<<<<< HEAD
+ +	seg1->mr_rkey = mw->fmr.fmr->rkey;
+ +	seg1->mr_base = seg1->mr_dma + pageoff;
+ +	seg1->mr_nsegs = i;
+++=======
++ 	seg1->mr_rkey = mw->fmr.fm_mr->rkey;
++ 	seg1->mr_base = dma_pages[0] + pageoff;
++ 	seg1->mr_nsegs = mw->mw_nents;
+++>>>>>>> fcdfb968a706 (xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR)
+  	seg1->mr_len = len;
+- 	return i;
++ 	return mw->mw_nents;
++ 
++ out_dmamap_err:
++ 	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
++ 	       mw->mw_sg, mw->mw_nents);
++ 	return -ENOMEM;
+  
+  out_maperr:
+- 	dprintk("RPC:       %s: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
+- 		__func__, len, (unsigned long long)seg1->mr_dma,
+- 		pageoff, i, rc);
+- 	while (i--)
+- 		rpcrdma_unmap_one(device, --seg);
++ 	pr_err("rpcrdma: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
++ 	       len, (unsigned long long)dma_pages[0],
++ 	       pageoff, mw->mw_nents, rc);
++ 	__fmr_dma_unmap(mw);
+  	return rc;
+  }
+  
+@@@ -285,9 -353,8 +357,14 @@@ fmr_op_unmap_sync(struct rpcrdma_xprt *
+  		seg = &req->rl_segments[i];
+  		mw = seg->rl_mw;
+  
+++<<<<<<< HEAD
+ +		list_del_init(&mw->fmr.fmr->list);
+ +		__fmr_dma_unmap(r_xprt, seg);
+ +		rpcrdma_put_mw(r_xprt, seg->rl_mw);
+++=======
++ 		list_del_init(&mw->fmr.fm_mr->list);
++ 		__fmr_dma_unmap(mw);
+++>>>>>>> fcdfb968a706 (xprtrdma: Use scatterlist for DMA mapping and unmapping under FMR)
+  
+  		i += seg->mr_nsegs;
+  		seg->mr_nsegs = 0;
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
