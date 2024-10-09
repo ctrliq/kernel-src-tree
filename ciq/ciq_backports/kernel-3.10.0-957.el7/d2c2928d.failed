@@ -1,0 +1,218 @@
+nfp: flower: implement the PORT_REIFY message
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit d2c2928d861e26cdbffec72e7451d25977d5e783
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d2c2928d.failed
+
+The PORT_REIFY message indicates whether reprs have been created or
+when they are about to be destroyed. This is necessary so firmware
+can know which state the driver is in, e.g. the firmware will not send
+any control messages related to ports when the reprs are destroyed.
+
+This prevents nuisance warning messages printed whenever the firmware
+sends updates for non-existent reprs.
+
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d2c2928d861e26cdbffec72e7451d25977d5e783)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index eb91dc71da8d,67c406815365..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -123,6 -170,39 +170,42 @@@ nfp_flower_repr_netdev_stop(struct nfp_
+  	return nfp_flower_cmsg_portmod(repr, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_flower_repr_netdev_init(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	return tc_setup_cb_egdev_register(netdev,
++ 					  nfp_flower_setup_tc_egress_cb,
++ 					  netdev_priv(netdev));
++ }
++ 
++ static void
++ nfp_flower_repr_netdev_clean(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	tc_setup_cb_egdev_unregister(netdev, nfp_flower_setup_tc_egress_cb,
++ 				     netdev_priv(netdev));
++ }
++ 
++ static void
++ nfp_flower_repr_netdev_preclean(struct nfp_app *app, struct net_device *netdev)
++ {
++ 	struct nfp_repr *repr = netdev_priv(netdev);
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	atomic_t *replies = &priv->reify_replies;
++ 	int err;
++ 
++ 	atomic_set(replies, 0);
++ 	err = nfp_flower_cmsg_portreify(repr, false);
++ 	if (err) {
++ 		nfp_warn(app->cpp, "Failed to notify firmware about repr destruction\n");
++ 		return;
++ 	}
++ 
++ 	nfp_flower_wait_repr_reify(app, replies, 1);
++ }
++ 
+++>>>>>>> d2c2928d861e (nfp: flower: implement the PORT_REIFY message)
+  static void nfp_flower_sriov_disable(struct nfp_app *app)
+  {
+  	struct nfp_flower_priv *priv = app->priv;
+@@@ -458,6 -569,10 +572,13 @@@ const struct nfp_app_type app_flower = 
+  	.vnic_init	= nfp_flower_vnic_init,
+  	.vnic_clean	= nfp_flower_vnic_clean,
+  
+++<<<<<<< HEAD
+++=======
++ 	.repr_init	= nfp_flower_repr_netdev_init,
++ 	.repr_preclean	= nfp_flower_repr_netdev_preclean,
++ 	.repr_clean	= nfp_flower_repr_netdev_clean,
++ 
+++>>>>>>> d2c2928d861e (nfp: flower: implement the PORT_REIFY message)
+  	.repr_open	= nfp_flower_repr_netdev_open,
+  	.repr_stop	= nfp_flower_repr_netdev_stop,
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+index 44008782eb74..baaea6f1a9d8 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+@@ -125,6 +125,27 @@ int nfp_flower_cmsg_portmod(struct nfp_repr *repr, bool carrier_ok)
+ 	return 0;
+ }
+ 
++int nfp_flower_cmsg_portreify(struct nfp_repr *repr, bool exists)
++{
++	struct nfp_flower_cmsg_portreify *msg;
++	struct sk_buff *skb;
++
++	skb = nfp_flower_cmsg_alloc(repr->app, sizeof(*msg),
++				    NFP_FLOWER_CMSG_TYPE_PORT_REIFY,
++				    GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
++
++	msg = nfp_flower_cmsg_get_data(skb);
++	msg->portnum = cpu_to_be32(repr->dst->u.port_info.port_id);
++	msg->reserved = 0;
++	msg->info = cpu_to_be16(exists);
++
++	nfp_ctrl_tx(repr->app->ctrl, skb);
++
++	return 0;
++}
++
+ static void
+ nfp_flower_cmsg_portmod_rx(struct nfp_app *app, struct sk_buff *skb)
+ {
+@@ -160,6 +181,28 @@ nfp_flower_cmsg_portmod_rx(struct nfp_app *app, struct sk_buff *skb)
+ 	rtnl_unlock();
+ }
+ 
++static void
++nfp_flower_cmsg_portreify_rx(struct nfp_app *app, struct sk_buff *skb)
++{
++	struct nfp_flower_priv *priv = app->priv;
++	struct nfp_flower_cmsg_portreify *msg;
++	bool exists;
++
++	msg = nfp_flower_cmsg_get_data(skb);
++
++	rcu_read_lock();
++	exists = !!nfp_app_repr_get(app, be32_to_cpu(msg->portnum));
++	rcu_read_unlock();
++	if (!exists) {
++		nfp_flower_cmsg_warn(app, "ctrl msg for unknown port 0x%08x\n",
++				     be32_to_cpu(msg->portnum));
++		return;
++	}
++
++	atomic_inc(&priv->reify_replies);
++	wake_up_interruptible(&priv->reify_wait_queue);
++}
++
+ static void
+ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
+ {
+@@ -170,6 +213,9 @@ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
+ 
+ 	type = cmsg_hdr->type;
+ 	switch (type) {
++	case NFP_FLOWER_CMSG_TYPE_PORT_REIFY:
++		nfp_flower_cmsg_portreify_rx(app, skb);
++		break;
+ 	case NFP_FLOWER_CMSG_TYPE_PORT_MOD:
+ 		nfp_flower_cmsg_portmod_rx(app, skb);
+ 		break;
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 957966d94939..aa30c6d4000a 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -340,6 +340,7 @@ struct nfp_flower_cmsg_hdr {
+ enum nfp_flower_cmsg_type_port {
+ 	NFP_FLOWER_CMSG_TYPE_FLOW_ADD =		0,
+ 	NFP_FLOWER_CMSG_TYPE_FLOW_DEL =		2,
++	NFP_FLOWER_CMSG_TYPE_PORT_REIFY =	6,
+ 	NFP_FLOWER_CMSG_TYPE_MAC_REPR =		7,
+ 	NFP_FLOWER_CMSG_TYPE_PORT_MOD =		8,
+ 	NFP_FLOWER_CMSG_TYPE_NO_NEIGH =		10,
+@@ -376,6 +377,15 @@ struct nfp_flower_cmsg_portmod {
+ 
+ #define NFP_FLOWER_CMSG_PORTMOD_INFO_LINK	BIT(0)
+ 
++/* NFP_FLOWER_CMSG_TYPE_PORT_REIFY */
++struct nfp_flower_cmsg_portreify {
++	__be32 portnum;
++	u16 reserved;
++	__be16 info;
++};
++
++#define NFP_FLOWER_CMSG_PORTREIFY_INFO_EXIST	BIT(0)
++
+ enum nfp_flower_cmsg_port_type {
+ 	NFP_FLOWER_CMSG_PORT_TYPE_UNSPEC =	0x0,
+ 	NFP_FLOWER_CMSG_PORT_TYPE_PHYS_PORT =	0x1,
+@@ -434,6 +444,7 @@ nfp_flower_cmsg_mac_repr_add(struct sk_buff *skb, unsigned int idx,
+ 			     unsigned int nbi, unsigned int nbi_port,
+ 			     unsigned int phys_port);
+ int nfp_flower_cmsg_portmod(struct nfp_repr *repr, bool carrier_ok);
++int nfp_flower_cmsg_portreify(struct nfp_repr *repr, bool exists);
+ void nfp_flower_cmsg_process_rx(struct work_struct *work);
+ void nfp_flower_cmsg_rx(struct nfp_app *app, struct sk_buff *skb);
+ struct sk_buff *
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 32991a7474ad..3ef6bbc1ad24 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -100,6 +100,9 @@ struct nfp_fl_stats_id {
+  * @nfp_mac_off_count:	Number of MACs in address list
+  * @nfp_tun_mac_nb:	Notifier to monitor link state
+  * @nfp_tun_neigh_nb:	Notifier to monitor neighbour state
++ * @reify_replies:	atomically stores the number of replies received
++ *			from firmware for repr reify
++ * @reify_wait_queue:	wait queue for repr reify response counting
+  */
+ struct nfp_flower_priv {
+ 	struct nfp_app *app;
+@@ -125,6 +128,8 @@ struct nfp_flower_priv {
+ 	int nfp_mac_off_count;
+ 	struct notifier_block nfp_tun_mac_nb;
+ 	struct notifier_block nfp_tun_neigh_nb;
++	atomic_t reify_replies;
++	wait_queue_head_t reify_wait_queue;
+ };
+ 
+ struct nfp_fl_key_ls {
