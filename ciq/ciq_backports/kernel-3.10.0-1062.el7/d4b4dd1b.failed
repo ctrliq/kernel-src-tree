@@ -1,0 +1,172 @@
+RDMA/umem: Do not use current->tgid to track the mm_struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit d4b4dd1b9706e48c370f88d3adfe713e43423cc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d4b4dd1b.failed
+
+This is just wrong, the process that calls into the reg_mr is the process
+associated with the umem, and that does not have to be the same process
+that created the context.
+
+When this code was first written mmgrab() didn't exist, however these days
+we can just directly hold the mm_struct pointer in the umem and have no
+ambiguity when it comes to releasing the umem as to which mm it was
+associated with.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d4b4dd1b9706e48c370f88d3adfe713e43423cc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem.c
+diff --cc drivers/infiniband/core/umem.c
+index 92842b803b18,c32a3e27a896..000000000000
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@@ -84,9 -84,9 +84,10 @@@ struct ib_umem *ib_umem_get(struct ib_u
+  	struct ib_umem *umem;
+  	struct page **page_list;
+  	struct vm_area_struct **vma_list;
+ +	unsigned long locked;
+  	unsigned long lock_limit;
+  	unsigned long cur_base;
++ 	struct mm_struct *mm;
+  	unsigned long npages;
+  	int ret;
+  	int i;
+@@@ -134,8 -134,8 +137,13 @@@
+  
+  	page_list = (struct page **) __get_free_page(GFP_KERNEL);
+  	if (!page_list) {
+++<<<<<<< HEAD
+ +		kfree(umem);
+ +		return ERR_PTR(-ENOMEM);
+++=======
++ 		ret = -ENOMEM;
++ 		goto umem_kfree_drop;
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  	}
+  
+  	/*
+@@@ -148,15 -148,16 +156,26 @@@
+  
+  	npages = ib_umem_num_pages(umem);
+  
+ +	down_write(&current->mm->mmap_sem);
+ +
+ +	locked     = npages + current->mm->pinned_vm;
+  	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+  
+++<<<<<<< HEAD
+ +	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
+++=======
++ 	down_write(&mm->mmap_sem);
++ 	mm->pinned_vm += npages;
++ 	if ((mm->pinned_vm > lock_limit) && !capable(CAP_IPC_LOCK)) {
++ 		up_write(&mm->mmap_sem);
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  		ret = -ENOMEM;
+ -		goto vma;
+ +		goto out;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	up_write(&mm->mmap_sem);
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  
+  	cur_base = addr & PAGE_MASK;
+  
+@@@ -167,19 -168,23 +186,32 @@@
+  
+  	ret = sg_alloc_table(&umem->sg_head, npages, GFP_KERNEL);
+  	if (ret)
+ -		goto vma;
+ -
+ -	if (!umem->writable)
+ -		gup_flags |= FOLL_FORCE;
+ +		goto out;
+  
+ +	need_release = 1;
+  	sg_list_start = umem->sg_head.sgl;
+  
+++<<<<<<< HEAD
+ +	while (npages) {
+ +		ret = get_user_pages_longterm(cur_base,
+ +				min_t(unsigned long, npages,
+ +				      PAGE_SIZE / sizeof (struct page *)),
+ +				1, !umem->writable, page_list, vma_list);
+ +
+ +		if (ret < 0)
+ +			goto out;
+++=======
++ 	down_read(&mm->mmap_sem);
++ 	while (npages) {
++ 		ret = get_user_pages_longterm(cur_base,
++ 				     min_t(unsigned long, npages,
++ 					   PAGE_SIZE / sizeof (struct page *)),
++ 				     gup_flags, page_list, vma_list);
++ 		if (ret < 0) {
++ 			up_read(&mm->mmap_sem);
++ 			goto umem_release;
++ 		}
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  
+  		umem->npages += ret;
+  		cur_base += ret * PAGE_SIZE;
+@@@ -195,6 -200,7 +227,10 @@@
+  		/* preparing for next loop */
+  		sg_list_start = sg;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	up_read(&mm->mmap_sem);
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  
+  	umem->nmap = ib_dma_map_sg_attrs(context->device,
+  				  umem->sg_head.sgl,
+@@@ -221,8 -226,13 +257,18 @@@ out
+  	if (vma_list)
+  		free_page((unsigned long) vma_list);
+  	free_page((unsigned long) page_list);
+++<<<<<<< HEAD
+ +
+ +	return ret < 0 ? ERR_PTR(ret) : umem;
+++=======
++ umem_kfree_drop:
++ 	if (ret)
++ 		mmdrop(umem->owning_mm);
++ umem_kfree:
++ 	if (ret)
++ 		kfree(umem);
++ 	return ret ? ERR_PTR(ret) : umem;
+++>>>>>>> d4b4dd1b9706 (RDMA/umem: Do not use current->tgid to track the mm_struct)
+  }
+  EXPORT_SYMBOL(ib_umem_get);
+  
+* Unmerged path drivers/infiniband/core/umem.c
+diff --git a/include/rdma/ib_umem.h b/include/rdma/ib_umem.h
+index e58b679102d1..0af5f3195770 100644
+--- a/include/rdma/ib_umem.h
++++ b/include/rdma/ib_umem.h
+@@ -42,14 +42,13 @@ struct ib_umem_odp;
+ 
+ struct ib_umem {
+ 	struct ib_ucontext     *context;
++	struct mm_struct       *owning_mm;
+ 	size_t			length;
+ 	unsigned long		address;
+ 	int			page_shift;
+ 	int                     writable;
+ 	int                     hugetlb;
+ 	struct work_struct	work;
+-	struct mm_struct       *mm;
+-	unsigned long		diff;
+ 	struct ib_umem_odp     *odp_data;
+ 	struct sg_table sg_head;
+ 	int             nmap;
