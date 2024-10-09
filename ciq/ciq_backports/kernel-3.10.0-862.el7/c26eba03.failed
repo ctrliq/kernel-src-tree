@@ -1,0 +1,1135 @@
+ibmvnic: Update reset infrastructure to support tunable parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author John Allen <jallen@linux.vnet.ibm.com>
+commit c26eba03e4073bd32ef6c0ea2ba2a3ff5eed11da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c26eba03.failed
+
+Update ibmvnic reset infrastructure to include a new reset option that will
+allow changing of tunable parameters. There currently is no way to request
+different capabilities from the vnic server on the fly so this patch
+achieves this by resetting the driver and attempting to log in with the
+requested changes. If the reset operation fails, the old values of the
+tunable parameters are stored in the "fallback" struct and we attempt to
+login with the fallback values.
+
+	Signed-off-by: John Allen <jallen@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c26eba03e4073bd32ef6c0ea2ba2a3ff5eed11da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+#	drivers/net/ethernet/ibm/ibmvnic.h
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 372983d733ad,3d0280196fdc..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -111,6 -109,13 +111,16 @@@ static int ibmvnic_poll(struct napi_str
+  static void send_map_query(struct ibmvnic_adapter *adapter);
+  static void send_request_map(struct ibmvnic_adapter *, dma_addr_t, __be32, u8);
+  static void send_request_unmap(struct ibmvnic_adapter *, u8);
+++<<<<<<< HEAD
+++=======
++ static void send_login(struct ibmvnic_adapter *adapter);
++ static void send_cap_queries(struct ibmvnic_adapter *adapter);
++ static int init_sub_crqs(struct ibmvnic_adapter *);
++ static int init_sub_crq_irqs(struct ibmvnic_adapter *adapter);
++ static int ibmvnic_init(struct ibmvnic_adapter *);
++ static void release_crq_queue(struct ibmvnic_adapter *);
++ static int __ibmvnic_set_mac(struct net_device *netdev, struct sockaddr *p);
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  
+  struct ibmvnic_stat {
+  	char name[ETH_GSTRING_LEN];
+@@@ -393,149 -923,82 +403,186 @@@ static void free_rx_pool(struct ibmvnic
+  static int ibmvnic_open(struct net_device *netdev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct device *dev = &adapter->vdev->dev;
+++=======
++ 	int rc;
++ 
++ 	mutex_lock(&adapter->reset_lock);
++ 
++ 	if (adapter->mac_change_pending) {
++ 		__ibmvnic_set_mac(netdev, &adapter->desired.mac);
++ 		adapter->mac_change_pending = false;
++ 	}
++ 
++ 	if (adapter->state != VNIC_CLOSED) {
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			mutex_unlock(&adapter->reset_lock);
++ 			return rc;
++ 		}
++ 
++ 		rc = init_resources(adapter);
++ 		if (rc) {
++ 			netdev_err(netdev, "failed to initialize resources\n");
++ 			release_resources(adapter);
++ 			mutex_unlock(&adapter->reset_lock);
++ 			return rc;
++ 		}
++ 	}
++ 
++ 	rc = __ibmvnic_open(netdev);
++ 	netif_carrier_on(netdev);
++ 	mutex_unlock(&adapter->reset_lock);
++ 
++ 	return rc;
++ }
++ 
++ static void clean_tx_pools(struct ibmvnic_adapter *adapter)
++ {
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  	struct ibmvnic_tx_pool *tx_pool;
+ -	u64 tx_entries;
+ -	int tx_scrqs;
+ +	union ibmvnic_crq crq;
+ +	int rxadd_subcrqs;
+ +	u64 *size_array;
+ +	int tx_subcrqs;
+  	int i, j;
+  
+ -	if (!adapter->tx_pool)
+ -		return;
+ +	rxadd_subcrqs =
+ +	    be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+ +	tx_subcrqs =
+ +	    be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
+ +	size_array = (u64 *)((u8 *)(adapter->login_rsp_buf) +
+ +				  be32_to_cpu(adapter->login_rsp_buf->
+ +					      off_rxadd_buff_size));
+ +	adapter->map_id = 1;
+ +	adapter->napi = kcalloc(adapter->req_rx_queues,
+ +				sizeof(struct napi_struct), GFP_KERNEL);
+ +	if (!adapter->napi)
+ +		goto alloc_napi_failed;
+ +	for (i = 0; i < adapter->req_rx_queues; i++) {
+ +		netif_napi_add(netdev, &adapter->napi[i], ibmvnic_poll,
+ +			       NAPI_POLL_WEIGHT);
+ +		napi_enable(&adapter->napi[i]);
+ +	}
+ +	adapter->rx_pool =
+ +	    kcalloc(rxadd_subcrqs, sizeof(struct ibmvnic_rx_pool), GFP_KERNEL);
+  
+ -	tx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
+ -	tx_entries = adapter->req_tx_entries_per_subcrq;
+ +	if (!adapter->rx_pool)
+ +		goto rx_pool_arr_alloc_failed;
+ +	send_map_query(adapter);
+ +	for (i = 0; i < rxadd_subcrqs; i++) {
+ +		init_rx_pool(adapter, &adapter->rx_pool[i],
+ +			     adapter->req_rx_add_entries_per_subcrq, i,
+ +			     be64_to_cpu(size_array[i]), 1);
+ +		if (alloc_rx_pool(adapter, &adapter->rx_pool[i])) {
+ +			dev_err(dev, "Couldn't alloc rx pool\n");
+ +			goto rx_pool_alloc_failed;
+ +		}
+ +	}
+ +	adapter->tx_pool =
+ +	    kcalloc(tx_subcrqs, sizeof(struct ibmvnic_tx_pool), GFP_KERNEL);
+  
+ -	/* Free any remaining skbs in the tx buffer pools */
+ -	for (i = 0; i < tx_scrqs; i++) {
+ +	if (!adapter->tx_pool)
+ +		goto tx_pool_arr_alloc_failed;
+ +	for (i = 0; i < tx_subcrqs; i++) {
+  		tx_pool = &adapter->tx_pool[i];
+ -		if (!tx_pool)
+ -			continue;
+ +		tx_pool->tx_buff =
+ +		    kcalloc(adapter->req_tx_entries_per_subcrq,
+ +			    sizeof(struct ibmvnic_tx_buff), GFP_KERNEL);
+ +		if (!tx_pool->tx_buff)
+ +			goto tx_pool_alloc_failed;
+  
+ -		netdev_dbg(adapter->netdev, "Cleaning tx_pool[%d]\n", i);
+ -		for (j = 0; j < tx_entries; j++) {
+ -			if (tx_pool->tx_buff[j].skb) {
+ -				dev_kfree_skb_any(tx_pool->tx_buff[j].skb);
+ -				tx_pool->tx_buff[j].skb = NULL;
+ -			}
+ -		}
+ +		if (alloc_long_term_buff(adapter, &tx_pool->long_term_buff,
+ +					 adapter->req_tx_entries_per_subcrq *
+ +					 adapter->req_mtu))
+ +			goto tx_ltb_alloc_failed;
+ +
+ +		tx_pool->free_map =
+ +		    kcalloc(adapter->req_tx_entries_per_subcrq,
+ +			    sizeof(int), GFP_KERNEL);
+ +		if (!tx_pool->free_map)
+ +			goto tx_fm_alloc_failed;
+ +
+ +		for (j = 0; j < adapter->req_tx_entries_per_subcrq; j++)
+ +			tx_pool->free_map[j] = j;
+ +
+ +		tx_pool->consumer_index = 0;
+ +		tx_pool->producer_index = 0;
+  	}
+ -}
+ +	adapter->bounce_buffer_size =
+ +	    (netdev->mtu + ETH_HLEN - 1) / PAGE_SIZE + 1;
+ +	adapter->bounce_buffer = kmalloc(adapter->bounce_buffer_size,
+ +					 GFP_KERNEL);
+ +	if (!adapter->bounce_buffer)
+ +		goto bounce_alloc_failed;
+  
+ -static int __ibmvnic_close(struct net_device *netdev)
+ -{
+ -	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ -	int rc = 0;
+ -	int i;
+ +	adapter->bounce_buffer_dma = dma_map_single(dev, adapter->bounce_buffer,
+ +						    adapter->bounce_buffer_size,
+ +						    DMA_TO_DEVICE);
+ +	if (dma_mapping_error(dev, adapter->bounce_buffer_dma)) {
+ +		dev_err(dev, "Couldn't map tx bounce buffer\n");
+ +		goto bounce_map_failed;
+ +	}
+ +	replenish_pools(adapter);
+  
+ -	adapter->state = VNIC_CLOSING;
+ +	/* We're ready to receive frames, enable the sub-crq interrupts and
+ +	 * set the logical link state to up
+ +	 */
+ +	for (i = 0; i < adapter->req_rx_queues; i++)
+ +		enable_scrq_irq(adapter, adapter->rx_scrq[i]);
+  
+ -	/* ensure that transmissions are stopped if called by do_reset */
+ -	if (adapter->resetting)
+ -		netif_tx_disable(netdev);
+ -	else
+ -		netif_tx_stop_all_queues(netdev);
+ +	for (i = 0; i < adapter->req_tx_queues; i++)
+ +		enable_scrq_irq(adapter, adapter->tx_scrq[i]);
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.logical_link_state.first = IBMVNIC_CRQ_CMD;
+ +	crq.logical_link_state.cmd = LOGICAL_LINK_STATE;
+ +	crq.logical_link_state.link_state = IBMVNIC_LOGICAL_LNK_UP;
+ +	ibmvnic_send_crq(adapter, &crq);
+ +
+ +	netif_tx_start_all_queues(netdev);
+ +
+ +	return 0;
+ +
+ +bounce_map_failed:
+ +	kfree(adapter->bounce_buffer);
+ +bounce_alloc_failed:
+ +	i = tx_subcrqs - 1;
+ +	kfree(adapter->tx_pool[i].free_map);
+ +tx_fm_alloc_failed:
+ +	free_long_term_buff(adapter, &adapter->tx_pool[i].long_term_buff);
+ +tx_ltb_alloc_failed:
+ +	kfree(adapter->tx_pool[i].tx_buff);
+ +tx_pool_alloc_failed:
+ +	for (j = 0; j < i; j++) {
+ +		kfree(adapter->tx_pool[j].tx_buff);
+ +		free_long_term_buff(adapter,
+ +				    &adapter->tx_pool[j].long_term_buff);
+ +		kfree(adapter->tx_pool[j].free_map);
+ +	}
+ +	kfree(adapter->tx_pool);
+ +	adapter->tx_pool = NULL;
+ +tx_pool_arr_alloc_failed:
+ +	i = rxadd_subcrqs;
+ +rx_pool_alloc_failed:
+ +	for (j = 0; j < i; j++) {
+ +		free_rx_pool(adapter, &adapter->rx_pool[j]);
+ +		free_long_term_buff(adapter,
+ +				    &adapter->rx_pool[j].long_term_buff);
+ +	}
+ +	kfree(adapter->rx_pool);
+ +	adapter->rx_pool = NULL;
+ +rx_pool_arr_alloc_failed:
+ +	for (i = 0; i < adapter->req_rx_queues; i++)
+ +		napi_disable(&adapter->napi[i]);
+ +alloc_napi_failed:
+ +	return -ENOMEM;
+ +}
+  
+ -	ibmvnic_napi_disable(adapter);
+ +static void disable_sub_crqs(struct ibmvnic_adapter *adapter)
+ +{
+ +	int i;
+  
+  	if (adapter->tx_scrq) {
+  		for (i = 0; i < adapter->req_tx_queues; i++)
+@@@ -990,17 -1450,234 +1037,246 @@@ static int __ibmvnic_set_mac(struct net
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int ibmvnic_change_mtu(struct net_device *netdev, int new_mtu)
+++=======
++ static int ibmvnic_set_mac(struct net_device *netdev, void *p)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct sockaddr *addr = p;
++ 
++ 	if (adapter->state != VNIC_OPEN) {
++ 		memcpy(&adapter->desired.mac, addr, sizeof(struct sockaddr));
++ 		adapter->mac_change_pending = true;
++ 		return 0;
++ 	}
++ 
++ 	__ibmvnic_set_mac(netdev, addr);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * do_reset returns zero if we are able to keep processing reset events, or
++  * non-zero if we hit a fatal error and must halt.
++  */
++ static int do_reset(struct ibmvnic_adapter *adapter,
++ 		    struct ibmvnic_rwi *rwi, u32 reset_state)
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int i, rc;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  
+++<<<<<<< HEAD
+ +	if (new_mtu > adapter->req_mtu || new_mtu < adapter->min_mtu)
+ +		return -EINVAL;
+++=======
++ 	netdev_dbg(adapter->netdev, "Re-setting driver (%d)\n",
++ 		   rwi->reset_reason);
++ 
++ 	netif_carrier_off(netdev);
++ 	adapter->reset_reason = rwi->reset_reason;
++ 
++ 	if (rwi->reset_reason == VNIC_RESET_MOBILITY) {
++ 		rc = ibmvnic_reenable_crq_queue(adapter);
++ 		if (rc)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_close(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (adapter->reset_reason == VNIC_RESET_CHANGE_PARAM ||
++ 	    adapter->wait_for_reset) {
++ 		release_resources(adapter);
++ 		release_sub_crqs(adapter);
++ 		release_crq_queue(adapter);
++ 	}
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_NON_FATAL) {
++ 		/* remove the closed state so when we call open it appears
++ 		 * we are coming from the probed state.
++ 		 */
++ 		adapter->state = VNIC_PROBED;
++ 
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return 0;
++ 
++ 		/* If the adapter was in PROBE state prior to the reset,
++ 		 * exit here.
++ 		 */
++ 		if (reset_state == VNIC_PROBED)
++ 			return 0;
++ 
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			adapter->state = VNIC_PROBED;
++ 			return 0;
++ 		}
++ 
++ 		if (adapter->reset_reason == VNIC_RESET_CHANGE_PARAM ||
++ 		    adapter->wait_for_reset) {
++ 			rc = init_resources(adapter);
++ 			if (rc)
++ 				return rc;
++ 		} else {
++ 			rc = reset_tx_pools(adapter);
++ 			if (rc)
++ 				return rc;
++ 
++ 			rc = reset_rx_pools(adapter);
++ 			if (rc)
++ 				return rc;
++ 
++ 			if (reset_state == VNIC_CLOSED)
++ 				return 0;
++ 		}
++ 	}
++ 
++ 	rc = __ibmvnic_open(netdev);
++ 	if (rc) {
++ 		if (list_empty(&adapter->rwi_list))
++ 			adapter->state = VNIC_CLOSED;
++ 		else
++ 			adapter->state = reset_state;
++ 
++ 		return 0;
++ 	}
++ 
++ 	netif_carrier_on(netdev);
++ 
++ 	/* kick napi */
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_schedule(&adapter->napi[i]);
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_FAILOVER)
++ 		netdev_notify_peers(netdev);
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  
+ +	netdev->mtu = new_mtu;
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ibmvnic_rwi *get_next_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	if (!list_empty(&adapter->rwi_list)) {
++ 		rwi = list_first_entry(&adapter->rwi_list, struct ibmvnic_rwi,
++ 				       list);
++ 		list_del(&rwi->list);
++ 	} else {
++ 		rwi = NULL;
++ 	}
++ 
++ 	mutex_unlock(&adapter->rwi_lock);
++ 	return rwi;
++ }
++ 
++ static void free_all_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		kfree(rwi);
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ }
++ 
++ static void __ibmvnic_reset(struct work_struct *work)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 	struct ibmvnic_adapter *adapter;
++ 	struct net_device *netdev;
++ 	u32 reset_state;
++ 	int rc = 0;
++ 
++ 	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
++ 	netdev = adapter->netdev;
++ 
++ 	mutex_lock(&adapter->reset_lock);
++ 	adapter->resetting = true;
++ 	reset_state = adapter->state;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		rc = do_reset(adapter, rwi, reset_state);
++ 		kfree(rwi);
++ 		if (rc)
++ 			break;
++ 
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ 
++ 	if (adapter->wait_for_reset) {
++ 		adapter->wait_for_reset = false;
++ 		adapter->reset_done_rc = rc;
++ 		complete(&adapter->reset_done);
++ 	}
++ 
++ 	if (rc) {
++ 		netdev_dbg(adapter->netdev, "Reset failed\n");
++ 		free_all_rwi(adapter);
++ 		mutex_unlock(&adapter->reset_lock);
++ 		return;
++ 	}
++ 
++ 	adapter->resetting = false;
++ 	mutex_unlock(&adapter->reset_lock);
++ }
++ 
++ static void ibmvnic_reset(struct ibmvnic_adapter *adapter,
++ 			  enum ibmvnic_reset_reason reason)
++ {
++ 	struct ibmvnic_rwi *rwi, *tmp;
++ 	struct net_device *netdev = adapter->netdev;
++ 	struct list_head *entry;
++ 
++ 	if (adapter->state == VNIC_REMOVING ||
++ 	    adapter->state == VNIC_REMOVED) {
++ 		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
++ 		return;
++ 	}
++ 
++ 	if (adapter->state == VNIC_PROBING) {
++ 		netdev_warn(netdev, "Adapter reset during probe\n");
++ 		adapter->init_done_rc = EAGAIN;
++ 		return;
++ 	}
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	list_for_each(entry, &adapter->rwi_list) {
++ 		tmp = list_entry(entry, struct ibmvnic_rwi, list);
++ 		if (tmp->reset_reason == reason) {
++ 			netdev_dbg(netdev, "Skipping matching reset\n");
++ 			mutex_unlock(&adapter->rwi_lock);
++ 			return;
++ 		}
++ 	}
++ 
++ 	rwi = kzalloc(sizeof(*rwi), GFP_KERNEL);
++ 	if (!rwi) {
++ 		mutex_unlock(&adapter->rwi_lock);
++ 		ibmvnic_close(netdev);
++ 		return;
++ 	}
++ 
++ 	rwi->reset_reason = reason;
++ 	list_add_tail(&rwi->list, &adapter->rwi_list);
++ 	mutex_unlock(&adapter->rwi_lock);
++ 
++ 	netdev_dbg(adapter->netdev, "Scheduling reset (reason %d)\n", reason);
++ 	schedule_work(&adapter->ibmvnic_reset);
++ }
++ 
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  static void ibmvnic_tx_timeout(struct net_device *dev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(dev);
+@@@ -1230,8 -1960,20 +1560,19 @@@ static void ibmvnic_get_channels(struc
+  	channels->combined_count = 0;
+  }
+  
++ static int ibmvnic_set_channels(struct net_device *netdev,
++ 				struct ethtool_channels *channels)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 
++ 	adapter->desired.rx_queues = channels->rx_count;
++ 	adapter->desired.tx_queues = channels->tx_count;
++ 
++ 	return wait_for_reset(adapter);
++ }
++ 
+  static void ibmvnic_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+  {
+ -	struct ibmvnic_adapter *adapter = netdev_priv(dev);
+  	int i;
+  
+  	if (stringset != ETH_SS_STATS)
+@@@ -1275,19 -2062,61 +1616,21 @@@ static void ibmvnic_get_ethtool_stats(s
+  }
+  
+  static const struct ethtool_ops ibmvnic_ethtool_ops = {
+ +	.get_settings		= ibmvnic_get_settings,
+  	.get_drvinfo		= ibmvnic_get_drvinfo,
+ -	.get_msglevel		= ibmvnic_get_msglevel,
+ -	.set_msglevel		= ibmvnic_set_msglevel,
+ -	.get_link		= ibmvnic_get_link,
+ -	.get_ringparam		= ibmvnic_get_ringparam,
+ -	.set_ringparam		= ibmvnic_set_ringparam,
+ -	.get_channels		= ibmvnic_get_channels,
+ -	.set_channels		= ibmvnic_set_channels,
+ -	.get_strings            = ibmvnic_get_strings,
+ -	.get_sset_count         = ibmvnic_get_sset_count,
+ -	.get_ethtool_stats	= ibmvnic_get_ethtool_stats,
+ -	.get_link_ksettings	= ibmvnic_get_link_ksettings,
+ -};
+ -
+ -/* Routines for managing CRQs/sCRQs  */
+ -
+ -static int reset_one_sub_crq_queue(struct ibmvnic_adapter *adapter,
+ -				   struct ibmvnic_sub_crq_queue *scrq)
+ -{
+ -	int rc;
+ -
+ -	if (scrq->irq) {
+ -		free_irq(scrq->irq, scrq);
+ -		irq_dispose_mapping(scrq->irq);
+ -		scrq->irq = 0;
+ -	}
+ -
+ -	memset(scrq->msgs, 0, 4 * PAGE_SIZE);
+ -	scrq->cur = 0;
+ -
+ -	rc = h_reg_sub_crq(adapter->vdev->unit_address, scrq->msg_token,
+ -			   4 * PAGE_SIZE, &scrq->crq_num, &scrq->hw_irq);
+ -	return rc;
+ -}
+ -
+ -static int reset_sub_crq_queues(struct ibmvnic_adapter *adapter)
+ -{
+ -	int i, rc;
+ -
+ -	for (i = 0; i < adapter->req_tx_queues; i++) {
+ -		netdev_dbg(adapter->netdev, "Re-setting tx_scrq[%d]\n", i);
+ -		rc = reset_one_sub_crq_queue(adapter, adapter->tx_scrq[i]);
+ -		if (rc)
+ -			return rc;
+ -	}
+ -
+ -	for (i = 0; i < adapter->req_rx_queues; i++) {
+ -		netdev_dbg(adapter->netdev, "Re-setting rx_scrq[%d]\n", i);
+ -		rc = reset_one_sub_crq_queue(adapter, adapter->rx_scrq[i]);
+ -		if (rc)
+ -			return rc;
+ -	}
+ +	.get_msglevel		= ibmvnic_get_msglevel,
+ +	.set_msglevel		= ibmvnic_set_msglevel,
+ +	.get_link		= ibmvnic_get_link,
+ +	.get_ringparam		= ibmvnic_get_ringparam,
+++	.set_ringparam		= ibmvnic_set_ringparam,
+ +	.get_channels		= ibmvnic_get_channels,
+++	.set_channels		= ibmvnic_set_channels,
+ +	.get_strings            = ibmvnic_get_strings,
+ +	.get_sset_count         = ibmvnic_get_sset_count,
+ +	.get_ethtool_stats	= ibmvnic_get_ethtool_stats,
+ +};
+  
+ -	return rc;
+ -}
+ +/* Routines for managing CRQs/sCRQs  */
+  
+  static void release_sub_crq_queue(struct ibmvnic_adapter *adapter,
+  				  struct ibmvnic_sub_crq_queue *scrq)
+@@@ -1717,6 -2518,91 +2060,94 @@@ static void init_sub_crqs(struct ibmvni
+  		adapter->rx_scrq[i]->scrq_num = i;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	kfree(allqueues);
++ 	return 0;
++ 
++ rx_failed:
++ 	kfree(adapter->tx_scrq);
++ 	adapter->tx_scrq = NULL;
++ tx_failed:
++ 	for (i = 0; i < registered_queues; i++)
++ 		release_sub_crq_queue(adapter, allqueues[i]);
++ 	kfree(allqueues);
++ 	return -1;
++ }
++ 
++ static void ibmvnic_send_req_caps(struct ibmvnic_adapter *adapter, int retry)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	union ibmvnic_crq crq;
++ 	int max_entries;
++ 
++ 	if (!retry) {
++ 		/* Sub-CRQ entries are 32 byte long */
++ 		int entries_page = 4 * PAGE_SIZE / (sizeof(u64) * 4);
++ 
++ 		if (adapter->min_tx_entries_per_subcrq > entries_page ||
++ 		    adapter->min_rx_add_entries_per_subcrq > entries_page) {
++ 			dev_err(dev, "Fatal, invalid entries per sub-crq\n");
++ 			return;
++ 		}
++ 
++ 		if (adapter->desired.mtu)
++ 			adapter->req_mtu = adapter->desired.mtu;
++ 		else
++ 			adapter->req_mtu = adapter->netdev->mtu + ETH_HLEN;
++ 
++ 		if (!adapter->desired.tx_entries)
++ 			adapter->desired.tx_entries =
++ 					adapter->max_tx_entries_per_subcrq;
++ 		if (!adapter->desired.rx_entries)
++ 			adapter->desired.rx_entries =
++ 					adapter->max_rx_add_entries_per_subcrq;
++ 
++ 		max_entries = IBMVNIC_MAX_LTB_SIZE /
++ 			      (adapter->req_mtu + IBMVNIC_BUFFER_HLEN);
++ 
++ 		if ((adapter->req_mtu + IBMVNIC_BUFFER_HLEN) *
++ 			adapter->desired.tx_entries > IBMVNIC_MAX_LTB_SIZE) {
++ 			adapter->desired.tx_entries = max_entries;
++ 		}
++ 
++ 		if ((adapter->req_mtu + IBMVNIC_BUFFER_HLEN) *
++ 			adapter->desired.rx_entries > IBMVNIC_MAX_LTB_SIZE) {
++ 			adapter->desired.rx_entries = max_entries;
++ 		}
++ 
++ 		if (adapter->desired.tx_entries)
++ 			adapter->req_tx_entries_per_subcrq =
++ 					adapter->desired.tx_entries;
++ 		else
++ 			adapter->req_tx_entries_per_subcrq =
++ 					adapter->max_tx_entries_per_subcrq;
++ 
++ 		if (adapter->desired.rx_entries)
++ 			adapter->req_rx_add_entries_per_subcrq =
++ 					adapter->desired.rx_entries;
++ 		else
++ 			adapter->req_rx_add_entries_per_subcrq =
++ 					adapter->max_rx_add_entries_per_subcrq;
++ 
++ 		if (adapter->desired.tx_queues)
++ 			adapter->req_tx_queues =
++ 					adapter->desired.tx_queues;
++ 		else
++ 			adapter->req_tx_queues =
++ 					adapter->opt_tx_comp_sub_queues;
++ 
++ 		if (adapter->desired.rx_queues)
++ 			adapter->req_rx_queues =
++ 					adapter->desired.rx_queues;
++ 		else
++ 			adapter->req_rx_queues =
++ 					adapter->opt_rx_comp_queues;
++ 
++ 		adapter->req_rx_add_queues = adapter->max_rx_add_queues;
++ 	}
++ 
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  	memset(&crq, 0, sizeof(crq));
+  	crq.request_capability.first = IBMVNIC_CRQ_CMD;
+  	crq.request_capability.cmd = REQUEST_CAPABILITY;
+@@@ -2603,9 -3421,9 +3034,10 @@@ static int handle_login_rsp(union ibmvn
+  			    struct ibmvnic_adapter *adapter)
+  {
+  	struct device *dev = &adapter->vdev->dev;
++ 	struct net_device *netdev = adapter->netdev;
+  	struct ibmvnic_login_rsp_buffer *login_rsp = adapter->login_rsp_buf;
+  	struct ibmvnic_login_buffer *login = adapter->login_buf;
+ +	union ibmvnic_crq crq;
+  	int i;
+  
+  	dma_unmap_single(dev, adapter->login_buf_token, adapter->login_buf_sz,
+@@@ -3760,122 -3991,67 +4194,158 @@@ map_failed
+  	return retrc;
+  }
+  
+ -static int ibmvnic_init(struct ibmvnic_adapter *adapter)
+ +/* debugfs for dump */
+ +static int ibmvnic_dump_show(struct seq_file *seq, void *v)
+  {
+ +	struct net_device *netdev = seq->private;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  	struct device *dev = &adapter->vdev->dev;
+ -	unsigned long timeout = msecs_to_jiffies(30000);
+ -	int rc;
+ +	union ibmvnic_crq crq;
+  
+++<<<<<<< HEAD
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.request_dump_size.first = IBMVNIC_CRQ_CMD;
+ +	crq.request_dump_size.cmd = REQUEST_DUMP_SIZE;
+++=======
++ 	if (adapter->resetting && !adapter->wait_for_reset) {
++ 		rc = ibmvnic_reset_crq(adapter);
++ 		if (!rc)
++ 			rc = vio_enable_interrupts(adapter->vdev);
++ 	} else {
++ 		rc = init_crq_queue(adapter);
++ 	}
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  
+ -	if (rc) {
+ -		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
+ -		return rc;
+ -	}
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+  
+ -	adapter->from_passive_init = false;
+ +	seq_write(seq, adapter->dump_data, adapter->dump_data_size);
+  
+ -	init_completion(&adapter->init_done);
+ -	adapter->init_done_rc = 0;
+ -	ibmvnic_send_crq_init(adapter);
+ -	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ -		dev_err(dev, "Initialization sequence timed out\n");
+ -		return -1;
+ -	}
+ +	dma_unmap_single(dev, adapter->dump_data_token, adapter->dump_data_size,
+ +			 DMA_BIDIRECTIONAL);
+  
+ -	if (adapter->init_done_rc) {
+ -		release_crq_queue(adapter);
+ -		return adapter->init_done_rc;
+ -	}
+ +	kfree(adapter->dump_data);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	if (adapter->from_passive_init) {
++ 		adapter->state = VNIC_OPEN;
++ 		adapter->from_passive_init = false;
++ 		return -1;
++ 	}
++ 
++ 	if (adapter->resetting && !adapter->wait_for_reset)
++ 		rc = reset_sub_crq_queues(adapter);
++ 	else
++ 		rc = init_sub_crqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "Initialization of sub crqs failed\n");
++ 		release_crq_queue(adapter);
++ 		return rc;
++ 	}
++ 
++ 	rc = init_sub_crq_irqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "Failed to initialize sub crq irqs\n");
++ 		release_crq_queue(adapter);
++ 	}
++ 
++ 	return rc;
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+ +}
+ +
+ +static int ibmvnic_dump_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, ibmvnic_dump_show, inode->i_private);
+  }
+  
+ -static struct device_attribute dev_attr_failover;
+ +static const struct file_operations ibmvnic_dump_ops = {
+ +	.owner          = THIS_MODULE,
+ +	.open           = ibmvnic_dump_open,
+ +	.read           = seq_read,
+ +	.llseek         = seq_lseek,
+ +	.release        = single_release,
+ +};
+ +
+ +static void handle_crq_init_rsp(struct work_struct *work)
+ +{
+ +	struct ibmvnic_adapter *adapter = container_of(work,
+ +						       struct ibmvnic_adapter,
+ +						       vnic_crq_init);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	struct net_device *netdev = adapter->netdev;
+ +	unsigned long timeout = msecs_to_jiffies(30000);
+ +	bool restart = false;
+ +	int rc;
+ +
+ +	if (adapter->failover) {
+ +		release_sub_crqs(adapter);
+ +		if (netif_running(netdev)) {
+ +			netif_tx_disable(netdev);
+ +			ibmvnic_close(netdev);
+ +			restart = true;
+ +		}
+ +	}
+ +
+ +	reinit_completion(&adapter->init_done);
+ +	send_version_xchg(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ +		dev_err(dev, "Passive init timeout\n");
+ +		goto task_failed;
+ +	}
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout)) {
+ +				dev_err(dev, "Passive init timeout\n");
+ +				goto task_failed;
+ +			}
+ +		}
+ +	} while (adapter->renegotiate);
+ +	rc = init_sub_crq_irqs(adapter);
+ +
+ +	if (rc)
+ +		goto task_failed;
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+ +	if (adapter->failover) {
+ +		adapter->failover = false;
+ +		if (restart) {
+ +			rc = ibmvnic_open(netdev);
+ +			if (rc)
+ +				goto restart_failed;
+ +		}
+ +		netif_carrier_on(netdev);
+ +		return;
+ +	}
+ +
+ +	rc = register_netdev(netdev);
+ +	if (rc) {
+ +		dev_err(dev,
+ +			"failed to register netdev rc=%d\n", rc);
+ +		goto register_failed;
+ +	}
+ +	dev_info(dev, "ibmvnic registered\n");
+ +
+ +	return;
+ +
+ +restart_failed:
+ +	dev_err(dev, "Failed to restart ibmvnic, rc=%d\n", rc);
+ +register_failed:
+ +	release_sub_crqs(adapter);
+ +task_failed:
+ +	dev_err(dev, "Passive initialization was not successful\n");
+ +}
+  
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+  {
+@@@ -3917,77 -4090,34 +4387,85 @@@
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+  
+ -	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
+ -	INIT_LIST_HEAD(&adapter->rwi_list);
+ -	mutex_init(&adapter->reset_lock);
+ -	mutex_init(&adapter->rwi_lock);
+ -	adapter->resetting = false;
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+  
++ 	adapter->mac_change_pending = false;
++ 
+  	do {
+ -		rc = ibmvnic_init(adapter);
+ -		if (rc && rc != EAGAIN)
+ -			goto ibmvnic_init_fail;
+ -	} while (rc == EAGAIN);
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+  
+++<<<<<<< HEAD
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+++=======
++ 	netdev->mtu = adapter->req_mtu - ETH_HLEN;
++ 	netdev->min_mtu = adapter->min_mtu - ETH_HLEN;
++ 	netdev->max_mtu = adapter->max_mtu - ETH_HLEN;
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  
+ -	rc = device_create_file(&dev->dev, &dev_attr_failover);
+ -	if (rc)
+ -		goto ibmvnic_init_fail;
+ +	rc = init_sub_crq_irqs(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+ +	}
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+  
+ -	netif_carrier_off(netdev);
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+@@@ -3995,17 -4125,20 +4473,24 @@@
+  	}
+  	dev_info(&dev->dev, "ibmvnic registered\n");
+  
+++<<<<<<< HEAD
+++=======
++ 	adapter->state = VNIC_PROBED;
++ 
++ 	adapter->wait_for_reset = false;
++ 
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  	return 0;
+  
+ -ibmvnic_register_fail:
+ -	device_remove_file(&dev->dev, &dev_attr_failover);
+ -
+ -ibmvnic_init_fail:
+ +free_sub_crqs:
+  	release_sub_crqs(adapter);
+ -	release_crq_queue(adapter);
+ +free_debugfs:
+ +	if (adapter->debugfs_dir && !IS_ERR(adapter->debugfs_dir))
+ +		debugfs_remove_recursive(adapter->debugfs_dir);
+ +free_crq:
+ +	ibmvnic_release_crq_queue(adapter);
+ +free_netdev:
+  	free_netdev(netdev);
+ -
+  	return rc;
+  }
+  
+diff --cc drivers/net/ethernet/ibm/ibmvnic.h
+index 082a339df814,27107f33755b..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@@ -39,6 -39,12 +39,15 @@@
+  #define IBMVNIC_BUFFS_PER_POOL	100
+  #define IBMVNIC_MAX_TX_QUEUES	5
+  
+++<<<<<<< HEAD
+++=======
++ #define IBMVNIC_TSO_BUF_SZ	65536
++ #define IBMVNIC_TSO_BUFS	64
++ 
++ #define IBMVNIC_MAX_LTB_SIZE ((1 << (MAX_ORDER - 1)) * PAGE_SIZE)
++ #define IBMVNIC_BUFFER_HLEN 500
++ 
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  struct ibmvnic_login_buffer {
+  	__be32 len;
+  	__be32 version;
+@@@ -926,15 -935,24 +935,27 @@@ struct ibmvnic_error_buff 
+  	__be32 error_id;
+  };
+  
+ -enum vnic_state {VNIC_PROBING = 1,
+ -		 VNIC_PROBED,
+ -		 VNIC_OPENING,
+ -		 VNIC_OPEN,
+ -		 VNIC_CLOSING,
+ -		 VNIC_CLOSED,
+ -		 VNIC_REMOVING,
+ -		 VNIC_REMOVED};
+ +struct ibmvnic_fw_comp_internal {
+ +	struct ibmvnic_adapter *adapter;
+ +	int num;
+ +	struct debugfs_blob_wrapper desc_blob;
+ +	int paused;
+ +};
+  
+++<<<<<<< HEAD
+ +struct ibmvnic_inflight_cmd {
+ +	union ibmvnic_crq crq;
+++=======
++ enum ibmvnic_reset_reason {VNIC_RESET_FAILOVER = 1,
++ 			   VNIC_RESET_MOBILITY,
++ 			   VNIC_RESET_FATAL,
++ 			   VNIC_RESET_NON_FATAL,
++ 			   VNIC_RESET_TIMEOUT,
++ 			   VNIC_RESET_CHANGE_PARAM};
++ 
++ struct ibmvnic_rwi {
++ 	enum ibmvnic_reset_reason reset_reason;
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  	struct list_head list;
+  };
+  
+@@@ -996,23 -1022,13 +1026,27 @@@ struct ibmvnic_adapter 
+  	struct list_head errors;
+  	spinlock_t error_list_lock;
+  
+ +	/* debugfs */
+ +	struct dentry *debugfs_dir;
+ +	struct dentry *debugfs_dump;
+  	struct completion fw_done;
+ -	int fw_done_rc;
+ +	char *dump_data;
+ +	dma_addr_t dump_data_token;
+ +	int dump_data_size;
+ +	int ras_comp_num;
+ +	struct ibmvnic_fw_component *ras_comps;
+ +	struct ibmvnic_fw_comp_internal *ras_comp_int;
+ +	dma_addr_t ras_comps_tok;
+ +	struct dentry *ras_comps_ent;
+ +
+ +	/* in-flight commands that allocate and/or map memory*/
+ +	struct list_head inflight;
+ +	spinlock_t inflight_lock;
+  
++ 	struct completion reset_done;
++ 	int reset_done_rc;
++ 	bool wait_for_reset;
++ 
+  	/* partner capabilities */
+  	u64 min_tx_queues;
+  	u64 min_rx_queues;
+@@@ -1049,8 -1065,17 +1083,23 @@@
+  	__be64 tx_rx_desc_req;
+  	u8 map_id;
+  
+ +	struct work_struct vnic_crq_init;
+ +	struct work_struct ibmvnic_xport;
+  	struct tasklet_struct tasklet;
+++<<<<<<< HEAD
+ +	bool failover;
+++=======
++ 	enum vnic_state state;
++ 	enum ibmvnic_reset_reason reset_reason;
++ 	struct mutex reset_lock, rwi_lock;
++ 	struct list_head rwi_list;
++ 	struct work_struct ibmvnic_reset;
++ 	bool resetting;
++ 	bool napi_enabled, from_passive_init;
++ 
++ 	bool mac_change_pending;
++ 
++ 	struct ibmvnic_tunables desired;
++ 	struct ibmvnic_tunables fallback;
+++>>>>>>> c26eba03e407 (ibmvnic: Update reset infrastructure to support tunable parameters)
+  };
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.h
