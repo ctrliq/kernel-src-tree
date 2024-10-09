@@ -1,0 +1,166 @@
+sched, dl: Convert switched_{from, to}_dl() / prio_changed_dl() to balance callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 9916e214998a4a363b152b637245e5c958067350
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/9916e214.failed
+
+Remove the direct {push,pull} balancing operations from
+switched_{from,to}_dl() / prio_changed_dl() and use the balance
+callback queue.
+
+Again, err on the side of too many reschedules; since too few is a
+hard bug while too many is just annoying.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: ktkhai@parallels.com
+	Cc: rostedt@goodmis.org
+	Cc: juri.lelli@gmail.com
+	Cc: pang.xunlei@linaro.org
+	Cc: oleg@redhat.com
+	Cc: wanpeng.li@linux.intel.com
+	Cc: umgwanakikbuti@gmail.com
+Link: http://lkml.kernel.org/r/20150611124742.968262663@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 9916e214998a4a363b152b637245e5c958067350)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+diff --cc kernel/sched/deadline.c
+index 75f9634980d1,69d9f509a582..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -434,9 -208,33 +434,36 @@@ static inline int has_pushable_dl_tasks
+  
+  static int push_dl_task(struct rq *rq);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_dl_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return dl_task(prev);
++ }
++ 
++ static DEFINE_PER_CPU(struct callback_head, dl_push_head);
++ static DEFINE_PER_CPU(struct callback_head, dl_pull_head);
++ 
++ static void push_dl_tasks(struct rq *);
++ static void pull_dl_task(struct rq *);
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ 	if (!has_pushable_dl_tasks(rq))
++ 		return;
++ 
++ 	queue_balance_callback(rq, &per_cpu(dl_push_head, rq->cpu), push_dl_tasks);
++ }
++ 
++ static inline void queue_pull_task(struct rq *rq)
++ {
++ 	queue_balance_callback(rq, &per_cpu(dl_pull_head, rq->cpu), pull_dl_task);
++ }
++ 
+++>>>>>>> 9916e214998a (sched, dl: Convert switched_{from, to}_dl() / prio_changed_dl() to balance callbacks)
+  static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq);
+  
+ -static void dl_task_offline_migration(struct rq *rq, struct task_struct *p)
+ +static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p)
+  {
+  	struct rq *later_rq = NULL;
+  	bool fallback = false;
+@@@ -507,6 -300,22 +534,25 @@@ void dec_dl_migration(struct sched_dl_e
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_dl_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return false;
++ }
++ 
++ static inline void pull_dl_task(struct rq *rq)
++ {
++ }
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ }
++ 
++ static inline void queue_pull_task(struct rq *rq)
++ {
++ }
+++>>>>>>> 9916e214998a (sched, dl: Convert switched_{from, to}_dl() / prio_changed_dl() to balance callbacks)
+  #endif /* CONFIG_SMP */
+  
+  static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
+@@@ -2188,8 -1714,7 +2234,12 @@@ static void switched_from_dl(struct rq 
+  	if (!task_on_rq_queued(p) || rq->dl.dl_nr_running)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (pull_dl_task(rq))
+ +		resched_curr(rq);
+++=======
++ 	queue_pull_task(rq);
+++>>>>>>> 9916e214998a (sched, dl: Convert switched_{from, to}_dl() / prio_changed_dl() to balance callbacks)
+  }
+  
+  /*
+@@@ -2198,38 -1723,16 +2248,51 @@@
+   */
+  static void switched_to_dl(struct rq *rq, struct task_struct *p)
+  {
+++<<<<<<< HEAD
+ +	int check_resched = 1;
+ +
+ +	if (hrtimer_try_to_cancel(&p->dl.inactive_timer) == 1)
+ +		put_task_struct(p);
+ +
+ +	/* If p is not queued we will update its parameters at next wakeup. */
+ +	if (!task_on_rq_queued(p)) {
+ +		add_rq_bw(p->dl.dl_bw, &rq->dl);
+ +
+ +		return;
+ +	}
+ +	/*
+ +	 * If p is boosted we already updated its params in
+ +	 * rt_mutex_setprio()->enqueue_task(..., ENQUEUE_REPLENISH),
+ +	 * p's deadline being now already after rq_clock(rq).
+ +	 */
+ +	if (dl_time_before(p->dl.deadline, rq_clock(rq)))
+ +		setup_new_dl_entity(&p->dl);
+ +
+ +	if (rq->curr != p) {
+ +#ifdef CONFIG_SMP
+ +		if (p->nr_cpus_allowed > 1 && rq->dl.overloaded &&
+ +		    push_dl_task(rq) && rq != task_rq(p))
+ +			/* Only reschedule if pushing failed */
+ +			check_resched = 0;
+ +#endif /* CONFIG_SMP */
+ +		if (check_resched) {
+ +			if (dl_task(rq->curr))
+ +				check_preempt_curr_dl(rq, p, 0);
+ +			else
+ +				resched_curr(rq);
+ +		}
+++=======
++ 	if (task_on_rq_queued(p) && rq->curr != p) {
++ #ifdef CONFIG_SMP
++ 		if (p->nr_cpus_allowed > 1 && rq->dl.overloaded)
++ 			queue_push_tasks(rq);
++ #else
++ 		if (dl_task(rq->curr))
++ 			check_preempt_curr_dl(rq, p, 0);
++ 		else
++ 			resched_curr(rq);
++ #endif
+++>>>>>>> 9916e214998a (sched, dl: Convert switched_{from, to}_dl() / prio_changed_dl() to balance callbacks)
+  	}
+  }
+  
+* Unmerged path kernel/sched/deadline.c
