@@ -1,0 +1,332 @@
+IB/mlx5: Fix cleanup order on unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mark Bloch <markb@mellanox.com>
+commit 42cea83f952499f31e2671c4917be8627617db81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/42cea83f.failed
+
+On load we create private CQ/QP/PD in order to be used by UMR, we create
+those resources after we register ourself as an IB device, and we destroy
+them after we unregister as an IB device. This was changed by commit
+16c1975f1032 ("IB/mlx5: Create profile infrastructure to add and remove
+stages") which moved the destruction before we unregistration. This
+allowed to trigger an invalid memory access when unloading mlx5_ib while
+there are open resources:
+
+BUG: unable to handle kernel paging request at 00000001002c012c
+...
+Call Trace:
+ mlx5_ib_post_send_wait+0x75/0x110 [mlx5_ib]
+ __slab_free+0x9a/0x2d0
+ delay_time_func+0x10/0x10 [mlx5_ib]
+ unreg_umr.isra.15+0x4b/0x50 [mlx5_ib]
+ mlx5_mr_cache_free+0x46/0x150 [mlx5_ib]
+ clean_mr+0xc9/0x190 [mlx5_ib]
+ dereg_mr+0xba/0xf0 [mlx5_ib]
+ ib_dereg_mr+0x13/0x20 [ib_core]
+ remove_commit_idr_uobject+0x16/0x70 [ib_uverbs]
+ uverbs_cleanup_ucontext+0xe8/0x1a0 [ib_uverbs]
+ ib_uverbs_cleanup_ucontext.isra.9+0x19/0x40 [ib_uverbs]
+ ib_uverbs_remove_one+0x162/0x2e0 [ib_uverbs]
+ ib_unregister_device+0xd4/0x190 [ib_core]
+ __mlx5_ib_remove+0x2e/0x40 [mlx5_ib]
+ mlx5_remove_device+0xf5/0x120 [mlx5_core]
+ mlx5_unregister_interface+0x37/0x90 [mlx5_core]
+ mlx5_ib_cleanup+0xc/0x225 [mlx5_ib]
+ SyS_delete_module+0x153/0x230
+ do_syscall_64+0x62/0x110
+ entry_SYSCALL_64_after_hwframe+0x21/0x86
+...
+
+We restore the original behavior by breaking the UMR stage into two parts,
+pre and post IB registration stages, this way we can restore the original
+functionality and maintain clean separation of logic between stages.
+
+Fixes: 16c1975f1032 ("IB/mlx5: Create profile infrastructure to add and remove stages")
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 42cea83f952499f31e2671c4917be8627617db81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index a4d7e9c37555,da091de4e69d..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4413,18 -4844,54 +4413,43 @@@ static void *mlx5_ib_add(struct mlx5_co
+  
+  	err = mlx5_alloc_bfreg(dev->mdev, &dev->fp_bfreg, false, true);
+  	if (err)
+ -		mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
+ +		goto err_bfreg;
+  
+ -	return err;
+ -}
+ +	err = ib_register_device(&dev->ib_dev, NULL);
+ +	if (err)
+ +		goto err_fp_bfreg;
+  
+ -static void mlx5_ib_stage_bfrag_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
+ -	mlx5_free_bfreg(dev->mdev, &dev->bfreg);
+ -}
+ +	err = create_umr_res(dev);
+ +	if (err)
+ +		goto err_dev;
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_ib_stage_ib_reg_init(struct mlx5_ib_dev *dev)
++ {
++ 	return ib_register_device(&dev->ib_dev, NULL);
++ }
++ 
++ static void mlx5_ib_stage_pre_ib_reg_umr_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	destroy_umrc_res(dev);
++ }
++ 
++ static void mlx5_ib_stage_ib_reg_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	ib_unregister_device(&dev->ib_dev);
++ }
++ 
++ static int mlx5_ib_stage_post_ib_reg_umr_init(struct mlx5_ib_dev *dev)
++ {
++ 	return create_umr_res(dev);
++ }
++ 
++ static int mlx5_ib_stage_delay_drop_init(struct mlx5_ib_dev *dev)
++ {
+++>>>>>>> 42cea83f9524 (IB/mlx5: Fix cleanup order on unload)
+  	init_delay_drop(dev);
+  
+ -	return 0;
+ -}
+ -
+ -static void mlx5_ib_stage_delay_drop_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	cancel_delay_drop(dev);
+ -}
+ -
+ -static int mlx5_ib_stage_class_attr_init(struct mlx5_ib_dev *dev)
+ -{
+ -	int err;
+ -	int i;
+ -
+  	for (i = 0; i < ARRAY_SIZE(mlx5_class_attributes); i++) {
+  		err = device_create_file(&dev->ib_dev.dev,
+  					 mlx5_class_attributes[i]);
+@@@ -4484,27 -4954,127 +4509,134 @@@ err_dealloc
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct mlx5_ib_profile pf_profile = {
++ 	STAGE_CREATE(MLX5_IB_STAGE_INIT,
++ 		     mlx5_ib_stage_init_init,
++ 		     mlx5_ib_stage_init_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CAPS,
++ 		     mlx5_ib_stage_caps_init,
++ 		     NULL),
++ 	STAGE_CREATE(MLX5_IB_STAGE_ROCE,
++ 		     mlx5_ib_stage_roce_init,
++ 		     mlx5_ib_stage_roce_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_DEVICE_RESOURCES,
++ 		     mlx5_ib_stage_dev_res_init,
++ 		     mlx5_ib_stage_dev_res_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_ODP,
++ 		     mlx5_ib_stage_odp_init,
++ 		     NULL),
++ 	STAGE_CREATE(MLX5_IB_STAGE_COUNTERS,
++ 		     mlx5_ib_stage_counters_init,
++ 		     mlx5_ib_stage_counters_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CONG_DEBUGFS,
++ 		     mlx5_ib_stage_cong_debugfs_init,
++ 		     mlx5_ib_stage_cong_debugfs_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_UAR,
++ 		     mlx5_ib_stage_uar_init,
++ 		     mlx5_ib_stage_uar_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_BFREG,
++ 		     mlx5_ib_stage_bfrag_init,
++ 		     mlx5_ib_stage_bfrag_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_PRE_IB_REG_UMR,
++ 		     NULL,
++ 		     mlx5_ib_stage_pre_ib_reg_umr_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_IB_REG,
++ 		     mlx5_ib_stage_ib_reg_init,
++ 		     mlx5_ib_stage_ib_reg_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
++ 		     mlx5_ib_stage_post_ib_reg_umr_init,
++ 		     NULL),
++ 	STAGE_CREATE(MLX5_IB_STAGE_DELAY_DROP,
++ 		     mlx5_ib_stage_delay_drop_init,
++ 		     mlx5_ib_stage_delay_drop_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CLASS_ATTR,
++ 		     mlx5_ib_stage_class_attr_init,
++ 		     NULL),
++ };
++ 
++ static void *mlx5_ib_add_slave_port(struct mlx5_core_dev *mdev, u8 port_num)
++ {
++ 	struct mlx5_ib_multiport_info *mpi;
++ 	struct mlx5_ib_dev *dev;
++ 	bool bound = false;
++ 	int err;
++ 
++ 	mpi = kzalloc(sizeof(*mpi), GFP_KERNEL);
++ 	if (!mpi)
++ 		return NULL;
++ 
++ 	mpi->mdev = mdev;
++ 
++ 	err = mlx5_query_nic_vport_system_image_guid(mdev,
++ 						     &mpi->sys_image_guid);
++ 	if (err) {
++ 		kfree(mpi);
++ 		return NULL;
++ 	}
++ 
++ 	mutex_lock(&mlx5_ib_multiport_mutex);
++ 	list_for_each_entry(dev, &mlx5_ib_dev_list, ib_dev_list) {
++ 		if (dev->sys_image_guid == mpi->sys_image_guid)
++ 			bound = mlx5_ib_bind_slave_port(dev, mpi);
++ 
++ 		if (bound) {
++ 			rdma_roce_rescan_device(&dev->ib_dev);
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!bound) {
++ 		list_add_tail(&mpi->list, &mlx5_ib_unaffiliated_port_list);
++ 		dev_dbg(&mdev->pdev->dev, "no suitable IB device found to bind to, added to unaffiliated list.\n");
++ 	} else {
++ 		mlx5_ib_dbg(dev, "bound port %u\n", port_num + 1);
++ 	}
++ 	mutex_unlock(&mlx5_ib_multiport_mutex);
++ 
++ 	return mpi;
++ }
++ 
++ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
++ {
++ 	enum rdma_link_layer ll;
++ 	int port_type_cap;
++ 
++ 	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
++ 	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
++ 
++ 	if (mlx5_core_is_mp_slave(mdev) && ll == IB_LINK_LAYER_ETHERNET) {
++ 		u8 port_num = mlx5_core_native_port_num(mdev) - 1;
++ 
++ 		return mlx5_ib_add_slave_port(mdev, port_num);
++ 	}
++ 
++ 	return __mlx5_ib_add(mdev, &pf_profile);
++ }
++ 
+++>>>>>>> 42cea83f9524 (IB/mlx5: Fix cleanup order on unload)
+  static void mlx5_ib_remove(struct mlx5_core_dev *mdev, void *context)
+  {
+ -	struct mlx5_ib_multiport_info *mpi;
+ -	struct mlx5_ib_dev *dev;
+ -
+ -	if (mlx5_core_is_mp_slave(mdev)) {
+ -		mpi = context;
+ -		mutex_lock(&mlx5_ib_multiport_mutex);
+ -		if (mpi->ibdev)
+ -			mlx5_ib_unbind_slave_port(mpi->ibdev, mpi);
+ -		list_del(&mpi->list);
+ -		mutex_unlock(&mlx5_ib_multiport_mutex);
+ -		return;
+ -	}
+ +	struct mlx5_ib_dev *dev = context;
+ +	enum rdma_link_layer ll = mlx5_ib_port_link_layer(&dev->ib_dev, 1);
+  
+ -	dev = context;
+ -	__mlx5_ib_remove(dev, dev->profile, MLX5_IB_STAGE_MAX);
+ +	cancel_delay_drop(dev);
+ +	mlx5_remove_netdev_notifier(dev);
+ +	ib_unregister_device(&dev->ib_dev);
+ +	mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
+ +	mlx5_free_bfreg(dev->mdev, &dev->bfreg);
+ +	mlx5_put_uars_page(dev->mdev, mdev->priv.uar);
+ +	mlx5_ib_cleanup_cong_debugfs(dev);
+ +	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+ +		mlx5_ib_dealloc_counters(dev);
+ +	destroy_umrc_res(dev);
+ +	mlx5_ib_odp_remove_one(dev);
+ +	destroy_dev_resources(&dev->devr);
+ +	if (ll == IB_LINK_LAYER_ETHERNET)
+ +		mlx5_disable_eth(dev);
+ +	kfree(dev->port);
+ +	ib_dealloc_device(&dev->ib_dev);
+  }
+  
+  static struct mlx5_interface mlx5_ib_interface = {
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 89f9fc631af6,a5272499b600..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -716,6 -729,47 +716,50 @@@ struct mlx5_ib_delay_drop 
+  	struct mlx5_ib_dbg_delay_drop *dbg;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum mlx5_ib_stages {
++ 	MLX5_IB_STAGE_INIT,
++ 	MLX5_IB_STAGE_CAPS,
++ 	MLX5_IB_STAGE_ROCE,
++ 	MLX5_IB_STAGE_DEVICE_RESOURCES,
++ 	MLX5_IB_STAGE_ODP,
++ 	MLX5_IB_STAGE_COUNTERS,
++ 	MLX5_IB_STAGE_CONG_DEBUGFS,
++ 	MLX5_IB_STAGE_UAR,
++ 	MLX5_IB_STAGE_BFREG,
++ 	MLX5_IB_STAGE_PRE_IB_REG_UMR,
++ 	MLX5_IB_STAGE_IB_REG,
++ 	MLX5_IB_STAGE_POST_IB_REG_UMR,
++ 	MLX5_IB_STAGE_DELAY_DROP,
++ 	MLX5_IB_STAGE_CLASS_ATTR,
++ 	MLX5_IB_STAGE_MAX,
++ };
++ 
++ struct mlx5_ib_stage {
++ 	int (*init)(struct mlx5_ib_dev *dev);
++ 	void (*cleanup)(struct mlx5_ib_dev *dev);
++ };
++ 
++ #define STAGE_CREATE(_stage, _init, _cleanup) \
++ 	.stage[_stage] = {.init = _init, .cleanup = _cleanup}
++ 
++ struct mlx5_ib_profile {
++ 	struct mlx5_ib_stage stage[MLX5_IB_STAGE_MAX];
++ };
++ 
++ struct mlx5_ib_multiport_info {
++ 	struct list_head list;
++ 	struct mlx5_ib_dev *ibdev;
++ 	struct mlx5_core_dev *mdev;
++ 	struct completion unref_comp;
++ 	u64 sys_image_guid;
++ 	u32 mdev_refcnt;
++ 	bool is_master;
++ 	bool unaffiliate;
++ };
++ 
+++>>>>>>> 42cea83f9524 (IB/mlx5: Fix cleanup order on unload)
+  struct mlx5_ib_dev {
+  	struct ib_device		ib_dev;
+  	struct mlx5_core_dev		*mdev;
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
