@@ -1,0 +1,107 @@
+PCI: hv: Fix a race condition when removing the device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.49.1.el7
+commit-author Long Li <longli@microsoft.com>
+commit 94d22763207ac6633612b8d8e0ca4fba0f7aa139
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.49.1.el7/94d22763.failed
+
+On removing the device, any work item (hv_pci_devices_present() or
+hv_pci_eject_device()) scheduled on workqueue hbus->wq may still be running
+and race with hv_pci_remove().
+
+This can happen because the host may send PCI_EJECT or PCI_BUS_RELATIONS(2)
+and decide to rescind the channel immediately after that.
+
+Fix this by flushing/destroying the workqueue of hbus before doing hbus remove.
+
+Link: https://lore.kernel.org/r/1620806800-30983-1-git-send-email-longli@linuxonhyperv.com
+	Signed-off-by: Long Li <longli@microsoft.com>
+	Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+(cherry picked from commit 94d22763207ac6633612b8d8e0ca4fba0f7aa139)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-hyperv.c
+diff --cc drivers/pci/pci-hyperv.c
+index 15ab10058bb9,272c63ac49f9..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -458,7 -443,7 +458,11 @@@ enum hv_pcibus_state 
+  	hv_pcibus_init = 0,
+  	hv_pcibus_probed,
+  	hv_pcibus_installed,
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	hv_pcibus_removed,
+++=======
++ 	hv_pcibus_removing,
+++>>>>>>> 94d22763207a (PCI: hv: Fix a race condition when removing the device):drivers/pci/controller/pci-hyperv.c
+  	hv_pcibus_maximum
+  };
+  
+@@@ -2844,17 -3252,28 +2849,33 @@@ static void hv_pci_bus_exit(struct hv_d
+  	 * access the per-channel ringbuffer any longer.
+  	 */
+  	if (hdev->channel->rescind)
+ -		return 0;
+ +		return;
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	/* Delete any children which might still exist. */
+ +	dr = kzalloc(sizeof(*dr), GFP_KERNEL);
+ +	if (dr && hv_pci_start_relations_work(hbus, dr))
+ +		kfree(dr);
+++=======
++ 	if (!keep_devs) {
++ 		/* Delete any children which might still exist. */
++ 		spin_lock_irqsave(&hbus->device_list_lock, flags);
++ 		list_for_each_entry_safe(hpdev, tmp, &hbus->children, list_entry) {
++ 			list_del(&hpdev->list_entry);
++ 			if (hpdev->pci_slot)
++ 				pci_destroy_slot(hpdev->pci_slot);
++ 			/* For the two refs got in new_pcichild_device() */
++ 			put_pcichild(hpdev);
++ 			put_pcichild(hpdev);
++ 		}
++ 		spin_unlock_irqrestore(&hbus->device_list_lock, flags);
++ 	}
+++>>>>>>> 94d22763207a (PCI: hv: Fix a race condition when removing the device):drivers/pci/controller/pci-hyperv.c
+  
+  	ret = hv_send_resources_released(hdev);
+ -	if (ret) {
+ +	if (ret)
+  		dev_err(&hdev->device,
+  			"Couldn't send resources released packet(s)\n");
+ -		return ret;
+ -	}
+  
+  	memset(&pkt.teardown_packet, 0, sizeof(pkt.teardown_packet));
+  	init_completion(&comp_pkt.host_event);
+@@@ -2889,10 -3325,9 +2921,9 @@@ static int hv_pci_remove(struct hv_devi
+  		hv_pci_remove_slots(hbus);
+  		pci_remove_root_bus(hbus->pci_bus);
+  		pci_unlock_rescan_remove();
+- 		hbus->state = hv_pcibus_removed;
+  	}
+  
+ -	ret = hv_pci_bus_exit(hdev, false);
+ +	hv_pci_bus_exit(hdev);
+  
+  	vmbus_close(hdev->channel);
+  
+@@@ -2900,9 -3335,10 +2931,8 @@@
+  	hv_free_config_window(hbus);
+  	pci_free_resource_list(&hbus->resources_for_children);
+  	hv_pci_free_bridge_windows(hbus);
+ -	irq_domain_remove(hbus->irq_domain);
+ -	irq_domain_free_fwnode(hbus->sysdata.fwnode);
+  	put_hvpcibus(hbus);
+  	wait_for_completion(&hbus->remove_event);
+- 	destroy_workqueue(hbus->wq);
+  
+  	hv_put_dom_num(hbus->sysdata.domain);
+  
+* Unmerged path drivers/pci/pci-hyperv.c
