@@ -1,0 +1,618 @@
+s390/zcrypt: Fix zcrypt suspend/resume behavior
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Fix zcrypt suspend/resume behavior (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.38%
+commit-author Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+commit d6d86c57d77d466df2096b134e5f54463d3f0fb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d6d86c57.failed
+
+The device suspend call triggers all ap devices to fetch potentially
+available response messages from the queues. Therefore the
+corresponding zcrypt device, that is allocated asynchronously after
+ap device probing, needs to be fully prepared. This race condition
+could lead to uninitialized response buffers while trying to read
+from the queues.
+
+Introduce a new callback within the ap layer to get noticed when a
+zcrypt device is fully prepared. Additional checks prevent reading
+from devices that are not fully prepared.
+
+	Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit d6d86c57d77d466df2096b134e5f54463d3f0fb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,03e4d6246d87..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -562,8 -528,208 +564,176 @@@ static int ap_query_queue(ap_qid_t qid
+  	}
+  }
+  
+ -/* State machine definitions and helpers */
+ -
+ -static void ap_sm_wait(enum ap_wait wait)
+ -{
+ -	ktime_t hr_time;
+ -
+ -	switch (wait) {
+ -	case AP_WAIT_AGAIN:
+ -	case AP_WAIT_INTERRUPT:
+ -		if (ap_using_interrupts())
+ -			break;
+ -		if (ap_poll_kthread) {
+ -			wake_up(&ap_poll_wait);
+ -			break;
+ -		}
+ -		/* Fall through */
+ -	case AP_WAIT_TIMEOUT:
+ -		spin_lock_bh(&ap_poll_timer_lock);
+ -		if (!hrtimer_is_queued(&ap_poll_timer)) {
+ -			hr_time = ktime_set(0, poll_timeout);
+ -			hrtimer_forward_now(&ap_poll_timer, hr_time);
+ -			hrtimer_restart(&ap_poll_timer);
+ -		}
+ -		spin_unlock_bh(&ap_poll_timer_lock);
+ -		break;
+ -	case AP_WAIT_NONE:
+ -	default:
+ -		break;
+ -	}
+ -}
+ -
+ -static enum ap_wait ap_sm_nop(struct ap_device *ap_dev)
+ -{
+ -	return AP_WAIT_NONE;
+ -}
+ -
+  /**
+++<<<<<<< HEAD
+ + * ap_init_queue(): Reset an AP queue.
+++=======
++  * ap_sm_recv(): Receive pending reply messages from an AP device but do
++  *	not change the state of the device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static struct ap_queue_status ap_sm_recv(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	struct ap_message *ap_msg;
++ 
++ 	status = __ap_recv(ap_dev->qid, &ap_dev->reply->psmid,
++ 			   ap_dev->reply->message, ap_dev->reply->length);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		atomic_dec(&ap_poll_requests);
++ 		ap_dev->queue_count--;
++ 		if (ap_dev->queue_count > 0)
++ 			mod_timer(&ap_dev->timeout,
++ 				  jiffies + ap_dev->drv->request_timeout);
++ 		list_for_each_entry(ap_msg, &ap_dev->pendingq, list) {
++ 			if (ap_msg->psmid != ap_dev->reply->psmid)
++ 				continue;
++ 			list_del_init(&ap_msg->list);
++ 			ap_dev->pendingq_count--;
++ 			ap_msg->receive(ap_dev, ap_msg, ap_dev->reply);
++ 			break;
++ 		}
++ 	case AP_RESPONSE_NO_PENDING_REPLY:
++ 		if (!status.queue_empty || ap_dev->queue_count <= 0)
++ 			break;
++ 		/* The card shouldn't forget requests but who knows. */
++ 		atomic_sub(ap_dev->queue_count, &ap_poll_requests);
++ 		ap_dev->queue_count = 0;
++ 		list_splice_init(&ap_dev->pendingq, &ap_dev->requestq);
++ 		ap_dev->requestq_count += ap_dev->pendingq_count;
++ 		ap_dev->pendingq_count = 0;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return status;
++ }
++ 
++ /**
++  * ap_sm_read(): Receive pending reply messages from an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_read(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 
++ 	if (!ap_dev->reply)
++ 		return AP_WAIT_NONE;
++ 	status = ap_sm_recv(ap_dev);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		if (ap_dev->queue_count > 0) {
++ 			ap_dev->state = AP_STATE_WORKING;
++ 			return AP_WAIT_AGAIN;
++ 		}
++ 		ap_dev->state = AP_STATE_IDLE;
++ 		return AP_WAIT_NONE;
++ 	case AP_RESPONSE_NO_PENDING_REPLY:
++ 		if (ap_dev->queue_count > 0)
++ 			return AP_WAIT_INTERRUPT;
++ 		ap_dev->state = AP_STATE_IDLE;
++ 		return AP_WAIT_NONE;
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_suspend_read(): Receive pending reply messages from an AP device
++  * without changing the device state in between. In suspend mode we don't
++  * allow sending new requests, therefore just fetch pending replies.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE or AP_WAIT_AGAIN
++  */
++ static enum ap_wait ap_sm_suspend_read(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 
++ 	if (!ap_dev->reply)
++ 		return AP_WAIT_NONE;
++ 	status = ap_sm_recv(ap_dev);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		if (ap_dev->queue_count > 0)
++ 			return AP_WAIT_AGAIN;
++ 		/* fall through */
++ 	default:
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_write(): Send messages from the request queue to an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_write(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	struct ap_message *ap_msg;
++ 
++ 	if (ap_dev->requestq_count <= 0)
++ 		return AP_WAIT_NONE;
++ 	/* Start the next request on the queue. */
++ 	ap_msg = list_entry(ap_dev->requestq.next, struct ap_message, list);
++ 	status = __ap_send(ap_dev->qid, ap_msg->psmid,
++ 			   ap_msg->message, ap_msg->length, ap_msg->special);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		atomic_inc(&ap_poll_requests);
++ 		ap_dev->queue_count++;
++ 		if (ap_dev->queue_count == 1)
++ 			mod_timer(&ap_dev->timeout,
++ 				  jiffies + ap_dev->drv->request_timeout);
++ 		list_move_tail(&ap_msg->list, &ap_dev->pendingq);
++ 		ap_dev->requestq_count--;
++ 		ap_dev->pendingq_count++;
++ 		if (ap_dev->queue_count < ap_dev->queue_depth) {
++ 			ap_dev->state = AP_STATE_WORKING;
++ 			return AP_WAIT_AGAIN;
++ 		}
++ 		/* fall through */
++ 	case AP_RESPONSE_Q_FULL:
++ 		ap_dev->state = AP_STATE_QUEUE_FULL;
++ 		return AP_WAIT_INTERRUPT;
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 		ap_dev->state = AP_STATE_RESET_WAIT;
++ 		return AP_WAIT_TIMEOUT;
++ 	case AP_RESPONSE_MESSAGE_TOO_BIG:
++ 	case AP_RESPONSE_REQ_FAC_NOT_INST:
++ 		list_del_init(&ap_msg->list);
++ 		ap_dev->requestq_count--;
++ 		ap_msg->rc = -EINVAL;
++ 		ap_msg->receive(ap_dev, ap_msg, NULL);
++ 		return AP_WAIT_AGAIN;
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_read_write(): Send and receive messages to/from an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_read_write(struct ap_device *ap_dev)
++ {
++ 	return min(ap_sm_read(ap_dev), ap_sm_write(ap_dev));
++ }
++ 
++ /**
++  * ap_sm_reset(): Reset an AP queue.
+++>>>>>>> d6d86c57d77d (s390/zcrypt: Fix zcrypt suspend/resume behavior)
+   * @qid: The AP queue number
+   *
+   * Submit the Reset command to an AP queue.
+@@@ -577,18 -741,281 +747,275 @@@ static int ap_init_queue(struct ap_devi
+  	status = ap_reset_queue(ap_dev->qid);
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+ -	case AP_RESPONSE_RESET_IN_PROGRESS:
+ -		ap_dev->state = AP_STATE_RESET_WAIT;
+  		ap_dev->interrupt = AP_INTR_DISABLED;
+++<<<<<<< HEAD
+ +		ap_dev->reset = AP_RESET_IN_PROGRESS;
+++=======
++ 		return AP_WAIT_TIMEOUT;
++ 	case AP_RESPONSE_BUSY:
++ 		return AP_WAIT_TIMEOUT;
++ 	case AP_RESPONSE_Q_NOT_AVAIL:
++ 	case AP_RESPONSE_DECONFIGURED:
++ 	case AP_RESPONSE_CHECKSTOPPED:
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_reset_wait(): Test queue for completion of the reset operation
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_POLL_IMMEDIATELY, AP_POLL_AFTER_TIMEROUT or 0.
++  */
++ static enum ap_wait ap_sm_reset_wait(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	unsigned long info;
++ 
++ 	if (ap_dev->queue_count > 0 && ap_dev->reply)
++ 		/* Try to read a completed message and get the status */
++ 		status = ap_sm_recv(ap_dev);
++ 	else
++ 		/* Get the status with TAPQ */
++ 		status = ap_test_queue(ap_dev->qid, &info);
++ 
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		if (ap_using_interrupts() &&
++ 		    ap_queue_enable_interruption(ap_dev,
++ 						 ap_airq.lsi_ptr) == 0)
++ 			ap_dev->state = AP_STATE_SETIRQ_WAIT;
++ 		else
++ 			ap_dev->state = (ap_dev->queue_count > 0) ?
++ 				AP_STATE_WORKING : AP_STATE_IDLE;
++ 		return AP_WAIT_AGAIN;
++ 	case AP_RESPONSE_BUSY:
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 		return AP_WAIT_TIMEOUT;
++ 	case AP_RESPONSE_Q_NOT_AVAIL:
++ 	case AP_RESPONSE_DECONFIGURED:
++ 	case AP_RESPONSE_CHECKSTOPPED:
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_setirq_wait(): Test queue for completion of the irq enablement
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_POLL_IMMEDIATELY, AP_POLL_AFTER_TIMEROUT or 0.
++  */
++ static enum ap_wait ap_sm_setirq_wait(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	unsigned long info;
++ 
++ 	if (ap_dev->queue_count > 0 && ap_dev->reply)
++ 		/* Try to read a completed message and get the status */
++ 		status = ap_sm_recv(ap_dev);
++ 	else
++ 		/* Get the status with TAPQ */
++ 		status = ap_test_queue(ap_dev->qid, &info);
++ 
++ 	if (status.int_enabled == 1) {
++ 		/* Irqs are now enabled */
++ 		ap_dev->interrupt = AP_INTR_ENABLED;
++ 		ap_dev->state = (ap_dev->queue_count > 0) ?
++ 			AP_STATE_WORKING : AP_STATE_IDLE;
++ 	}
++ 
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		if (ap_dev->queue_count > 0)
++ 			return AP_WAIT_AGAIN;
++ 		/* fallthrough */
++ 	case AP_RESPONSE_NO_PENDING_REPLY:
++ 		return AP_WAIT_TIMEOUT;
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /*
++  * AP state machine jump table
++  */
++ static ap_func_t *ap_jumptable[NR_AP_STATES][NR_AP_EVENTS] = {
++ 	[AP_STATE_RESET_START] = {
++ 		[AP_EVENT_POLL] = ap_sm_reset,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ 	[AP_STATE_RESET_WAIT] = {
++ 		[AP_EVENT_POLL] = ap_sm_reset_wait,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ 	[AP_STATE_SETIRQ_WAIT] = {
++ 		[AP_EVENT_POLL] = ap_sm_setirq_wait,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ 	[AP_STATE_IDLE] = {
++ 		[AP_EVENT_POLL] = ap_sm_write,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ 	[AP_STATE_WORKING] = {
++ 		[AP_EVENT_POLL] = ap_sm_read_write,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_reset,
++ 	},
++ 	[AP_STATE_QUEUE_FULL] = {
++ 		[AP_EVENT_POLL] = ap_sm_read,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_reset,
++ 	},
++ 	[AP_STATE_SUSPEND_WAIT] = {
++ 		[AP_EVENT_POLL] = ap_sm_suspend_read,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ 	[AP_STATE_BORKED] = {
++ 		[AP_EVENT_POLL] = ap_sm_nop,
++ 		[AP_EVENT_TIMEOUT] = ap_sm_nop,
++ 	},
++ };
++ 
++ static inline enum ap_wait ap_sm_event(struct ap_device *ap_dev,
++ 				       enum ap_event event)
++ {
++ 	return ap_jumptable[ap_dev->state][event](ap_dev);
++ }
++ 
++ static inline enum ap_wait ap_sm_event_loop(struct ap_device *ap_dev,
++ 					    enum ap_event event)
++ {
++ 	enum ap_wait wait;
++ 
++ 	while ((wait = ap_sm_event(ap_dev, event)) == AP_WAIT_AGAIN)
++ 		;
++ 	return wait;
++ }
++ 
++ /**
++  * ap_request_timeout(): Handling of request timeouts
++  * @data: Holds the AP device.
++  *
++  * Handles request timeouts.
++  */
++ static void ap_request_timeout(unsigned long data)
++ {
++ 	struct ap_device *ap_dev = (struct ap_device *) data;
++ 
++ 	if (ap_suspend_flag)
++ 		return;
++ 	spin_lock_bh(&ap_dev->lock);
++ 	ap_sm_wait(ap_sm_event(ap_dev, AP_EVENT_TIMEOUT));
++ 	spin_unlock_bh(&ap_dev->lock);
++ }
++ 
++ /**
++  * ap_poll_timeout(): AP receive polling for finished AP requests.
++  * @unused: Unused pointer.
++  *
++  * Schedules the AP tasklet using a high resolution timer.
++  */
++ static enum hrtimer_restart ap_poll_timeout(struct hrtimer *unused)
++ {
++ 	if (!ap_suspend_flag)
++ 		tasklet_schedule(&ap_tasklet);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ /**
++  * ap_interrupt_handler() - Schedule ap_tasklet on interrupt
++  * @airq: pointer to adapter interrupt descriptor
++  */
++ static void ap_interrupt_handler(struct airq_struct *airq)
++ {
++ 	inc_irq_stat(IRQIO_APB);
++ 	if (!ap_suspend_flag)
++ 		tasklet_schedule(&ap_tasklet);
++ }
++ 
++ /**
++  * ap_tasklet_fn(): Tasklet to poll all AP devices.
++  * @dummy: Unused variable
++  *
++  * Poll all AP devices on the bus.
++  */
++ static void ap_tasklet_fn(unsigned long dummy)
++ {
++ 	struct ap_device *ap_dev;
++ 	enum ap_wait wait = AP_WAIT_NONE;
++ 
++ 	/* Reset the indicator if interrupts are used. Thus new interrupts can
++ 	 * be received. Doing it in the beginning of the tasklet is therefor
++ 	 * important that no requests on any AP get lost.
++ 	 */
++ 	if (ap_using_interrupts())
++ 		xchg(ap_airq.lsi_ptr, 0);
++ 
++ 	spin_lock(&ap_device_list_lock);
++ 	list_for_each_entry(ap_dev, &ap_device_list, list) {
++ 		spin_lock_bh(&ap_dev->lock);
++ 		wait = min(wait, ap_sm_event_loop(ap_dev, AP_EVENT_POLL));
++ 		spin_unlock_bh(&ap_dev->lock);
++ 	}
++ 	spin_unlock(&ap_device_list_lock);
++ 	ap_sm_wait(wait);
++ }
++ 
++ /**
++  * ap_poll_thread(): Thread that polls for finished requests.
++  * @data: Unused pointer
++  *
++  * AP bus poll thread. The purpose of this thread is to poll for
++  * finished requests in a loop if there is a "free" cpu - that is
++  * a cpu that doesn't have anything better to do. The polling stops
++  * as soon as there is another task or if all messages have been
++  * delivered.
++  */
++ static int ap_poll_thread(void *data)
++ {
++ 	DECLARE_WAITQUEUE(wait, current);
++ 
++ 	set_user_nice(current, MAX_NICE);
++ 	set_freezable();
++ 	while (!kthread_should_stop()) {
++ 		add_wait_queue(&ap_poll_wait, &wait);
++ 		set_current_state(TASK_INTERRUPTIBLE);
++ 		if (ap_suspend_flag ||
++ 		    atomic_read(&ap_poll_requests) <= 0) {
++ 			schedule();
++ 			try_to_freeze();
++ 		}
++ 		set_current_state(TASK_RUNNING);
++ 		remove_wait_queue(&ap_poll_wait, &wait);
++ 		if (need_resched()) {
++ 			schedule();
++ 			try_to_freeze();
++ 			continue;
++ 		}
++ 		ap_tasklet_fn(0);
++ 	} while (!kthread_should_stop());
++ 	return 0;
++ }
++ 
++ static int ap_poll_thread_start(void)
++ {
++ 	int rc;
++ 
++ 	if (ap_using_interrupts() || ap_poll_kthread)
+++>>>>>>> d6d86c57d77d (s390/zcrypt: Fix zcrypt suspend/resume behavior)
+  		return 0;
+ -	mutex_lock(&ap_poll_thread_mutex);
+ -	ap_poll_kthread = kthread_run(ap_poll_thread, NULL, "appoll");
+ -	rc = PTR_RET(ap_poll_kthread);
+ -	if (rc)
+ -		ap_poll_kthread = NULL;
+ -	mutex_unlock(&ap_poll_thread_mutex);
+ -	return rc;
+ -}
+ -
+ -static void ap_poll_thread_stop(void)
+ -{
+ -	if (!ap_poll_kthread)
+ -		return;
+ -	mutex_lock(&ap_poll_thread_mutex);
+ -	kthread_stop(ap_poll_kthread);
+ -	ap_poll_kthread = NULL;
+ -	mutex_unlock(&ap_poll_thread_mutex);
+ +	case AP_RESPONSE_RESET_IN_PROGRESS:
+ +	case AP_RESPONSE_BUSY:
+ +		return -EBUSY;
+ +	case AP_RESPONSE_Q_NOT_AVAIL:
+ +	case AP_RESPONSE_DECONFIGURED:
+ +	case AP_RESPONSE_CHECKSTOPPED:
+ +	default:
+ +		return -ENODEV;
+ +	}
+  }
+  
+  /**
+@@@ -935,10 -1360,21 +1362,21 @@@ static struct bus_type ap_bus_type = 
+  	.name = "ap",
+  	.match = &ap_bus_match,
+  	.uevent = &ap_uevent,
+ -	.suspend = ap_dev_suspend,
+ -	.resume = ap_dev_resume,
+ +	.suspend = ap_bus_suspend,
+ +	.resume = ap_bus_resume
+  };
+  
++ void ap_device_init_reply(struct ap_device *ap_dev,
++ 			  struct ap_message *reply)
++ {
++ 	ap_dev->reply = reply;
++ 
++ 	spin_lock_bh(&ap_dev->lock);
++ 	ap_sm_wait(ap_sm_event(ap_dev, AP_EVENT_POLL));
++ 	spin_unlock_bh(&ap_dev->lock);
++ }
++ EXPORT_SYMBOL(ap_device_init_reply);
++ 
+  static int ap_device_probe(struct device *dev)
+  {
+  	struct ap_device *ap_dev = to_ap_dev(dev);
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 2da8ecdc7a5f..772eb21b827b 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -256,6 +256,7 @@ void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg);
+ void ap_cancel_message(struct ap_device *ap_dev, struct ap_message *ap_msg);
+ void ap_flush_queue(struct ap_device *ap_dev);
+ void ap_bus_force_rescan(void);
++void ap_device_init_reply(struct ap_device *ap_dev, struct ap_message *ap_msg);
+ 
+ int ap_module_init(void);
+ void ap_module_exit(void);
+diff --git a/drivers/s390/crypto/zcrypt_cex2a.c b/drivers/s390/crypto/zcrypt_cex2a.c
+index 1e849d6e1dfe..15104aaa075a 100644
+--- a/drivers/s390/crypto/zcrypt_cex2a.c
++++ b/drivers/s390/crypto/zcrypt_cex2a.c
+@@ -126,7 +126,7 @@ static int zcrypt_cex2a_probe(struct ap_device *ap_dev)
+ 					   MSGTYPE50_VARIANT_DEFAULT);
+ 	zdev->ap_dev = ap_dev;
+ 	zdev->online = 1;
+-	ap_dev->reply = &zdev->reply;
++	ap_device_init_reply(ap_dev, &zdev->reply);
+ 	ap_dev->private = zdev;
+ 	rc = zcrypt_device_register(zdev);
+ 	if (rc) {
+diff --git a/drivers/s390/crypto/zcrypt_cex4.c b/drivers/s390/crypto/zcrypt_cex4.c
+index bb3908818505..ccb2e78ebf0e 100644
+--- a/drivers/s390/crypto/zcrypt_cex4.c
++++ b/drivers/s390/crypto/zcrypt_cex4.c
+@@ -147,7 +147,7 @@ static int zcrypt_cex4_probe(struct ap_device *ap_dev)
+ 		return -ENODEV;
+ 	zdev->ap_dev = ap_dev;
+ 	zdev->online = 1;
+-	ap_dev->reply = &zdev->reply;
++	ap_device_init_reply(ap_dev, &zdev->reply);
+ 	ap_dev->private = zdev;
+ 	rc = zcrypt_device_register(zdev);
+ 	if (rc) {
+diff --git a/drivers/s390/crypto/zcrypt_pcixcc.c b/drivers/s390/crypto/zcrypt_pcixcc.c
+index 899ffa19f5ec..452b2e2c7aca 100644
+--- a/drivers/s390/crypto/zcrypt_pcixcc.c
++++ b/drivers/s390/crypto/zcrypt_pcixcc.c
+@@ -327,7 +327,7 @@ static int zcrypt_pcixcc_probe(struct ap_device *ap_dev)
+ 	else
+ 		zdev->ops = zcrypt_msgtype_request(MSGTYPE06_NAME,
+ 						   MSGTYPE06_VARIANT_NORNG);
+-	ap_dev->reply = &zdev->reply;
++	ap_device_init_reply(ap_dev, &zdev->reply);
+ 	ap_dev->private = zdev;
+ 	rc = zcrypt_device_register(zdev);
+ 	if (rc)
