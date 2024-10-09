@@ -1,0 +1,274 @@
+dm: teach dm-targets to use a dax_device + dax_operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 817bf40265459578abc36c6bd53e27775b5c7ec4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/817bf402.failed
+
+Arrange for dm to lookup the dax services available from member devices.
+Update the dax-capable targets, linear and stripe, to route dax
+operations to the underlying device. Changes the target-internal
+->direct_access() method to more closely align with the dax_operations
+->direct_access() calling convention.
+
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 817bf40265459578abc36c6bd53e27775b5c7ec4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-stripe.c
+#	drivers/md/dm.c
+#	include/linux/device-mapper.h
+diff --cc drivers/md/dm-stripe.c
+index 41c6bb910fac,cb4b1e9e16ab..000000000000
+--- a/drivers/md/dm-stripe.c
++++ b/drivers/md/dm-stripe.c
+@@@ -465,8 -447,7 +464,12 @@@ static struct target_type stripe_targe
+  	.status = stripe_status,
+  	.iterate_devices = stripe_iterate_devices,
+  	.io_hints = stripe_io_hints,
+++<<<<<<< HEAD
+ +	.merge  = stripe_merge,
+ +	.direct_access = stripe_direct_access,
+++=======
++ 	.direct_access = stripe_dax_direct_access,
+++>>>>>>> 817bf4026545 (dm: teach dm-targets to use a dax_device + dax_operations)
+  };
+  
+  int __init dm_stripe_init(void)
+diff --cc drivers/md/dm.c
+index 3a3e56a9c437,ef4c6f8cad47..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -916,18 -924,91 +919,31 @@@ static long dm_blk_direct_access(struc
+  
+  	ti = dm_table_find_target(map, sector);
+  	if (!dm_target_is_valid(ti))
+ -		return NULL;
+ -
+ -	return ti;
+ -}
+ -
+ -static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+ -		long nr_pages, void **kaddr, pfn_t *pfn)
+ -{
+ -	struct mapped_device *md = dax_get_private(dax_dev);
+ -	sector_t sector = pgoff * PAGE_SECTORS;
+ -	struct dm_target *ti;
+ -	long len, ret = -EIO;
+ -	int srcu_idx;
+ +		goto out;
+++<<<<<<< HEAD
+  
+ -	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
+ +	len = max_io_len(sector, ti) << SECTOR_SHIFT;
+ +	size = min(len, size);
+  
+ -	if (!ti)
+ -		goto out;
+ +	if (ti->type->direct_access)
+ +		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
+ +out:
+++=======
++ 	if (!ti->type->direct_access)
++ 		goto out;
++ 	len = max_io_len(sector, ti) / PAGE_SECTORS;
++ 	if (len < 1)
++ 		goto out;
++ 	nr_pages = min(len, nr_pages);
++ 	if (ti->type->direct_access)
++ 		ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
++ 
++  out:
+++>>>>>>> 817bf4026545 (dm: teach dm-targets to use a dax_device + dax_operations)
+  	dm_put_live_table(md, srcu_idx);
+ -
+ -	return ret;
+ -}
+ -
+ -static long dm_blk_direct_access(struct block_device *bdev, sector_t sector,
+ -		void **kaddr, pfn_t *pfn, long size)
+ -{
+ -	struct mapped_device *md = bdev->bd_disk->private_data;
+ -	struct dax_device *dax_dev = md->dax_dev;
+ -	long nr_pages = size / PAGE_SIZE;
+ -
+ -	nr_pages = dm_dax_direct_access(dax_dev, sector / PAGE_SECTORS,
+ -			nr_pages, kaddr, pfn);
+ -	return nr_pages < 0 ? nr_pages : nr_pages * PAGE_SIZE;
+ +	return min(ret, size);
+  }
+  
+ -/*
+ - * A target may call dm_accept_partial_bio only from the map routine.  It is
+ - * allowed for all bio types except REQ_PREFLUSH.
+ - *
+ - * dm_accept_partial_bio informs the dm that the target only wants to process
+ - * additional n_sectors sectors of the bio and the rest of the data should be
+ - * sent in a next bio.
+ - *
+ - * A diagram that explains the arithmetics:
+ - * +--------------------+---------------+-------+
+ - * |         1          |       2       |   3   |
+ - * +--------------------+---------------+-------+
+ - *
+ - * <-------------- *tio->len_ptr --------------->
+ - *                      <------- bi_size ------->
+ - *                      <-- n_sectors -->
+ - *
+ - * Region 1 was already iterated over with bio_advance or similar function.
+ - *	(it may be empty if the target doesn't use bio_advance)
+ - * Region 2 is the remaining bio size that the target wants to process.
+ - *	(it may be empty if region 1 is non-empty, although there is no reason
+ - *	 to make it empty)
+ - * The target requires that region 3 is to be sent in the next bio.
+ - *
+ - * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
+ - * the partially processed part (the sum of regions 1+2) must be the same for all
+ - * copies of the bio.
+ - */
+ -void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+ -{
+ -	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ -	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+ -	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
+ -	BUG_ON(bi_size > *tio->len_ptr);
+ -	BUG_ON(n_sectors > bi_size);
+ -	*tio->len_ptr -= bi_size - n_sectors;
+ -	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
+ -}
+ -EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+ -
+  /*
+   * Flush current->bio_list when the target map method blocks.
+   * This fixes deadlocks in snapshot and possibly in other targets.
+diff --cc include/linux/device-mapper.h
+index d1f62607e00c,df830d167892..000000000000
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@@ -135,8 -128,9 +135,14 @@@ typedef int (*dm_busy_fn) (struct dm_ta
+   *  < 0 : error
+   * >= 0 : the number of bytes accessible at the address
+   */
+++<<<<<<< HEAD
+ +typedef long (*dm_direct_access_fn) (struct dm_target *ti, sector_t sector,
+ +				     void **kaddr, pfn_t *pfn, long size);
+++=======
++ typedef long (*dm_dax_direct_access_fn) (struct dm_target *ti, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn);
++ #define PAGE_SECTORS (PAGE_SIZE / 512)
+++>>>>>>> 817bf4026545 (dm: teach dm-targets to use a dax_device + dax_operations)
+  
+  void dm_error(const char *message);
+  
+diff --git a/drivers/md/dm-linear.c b/drivers/md/dm-linear.c
+index 4299ea83e8a0..d40e867fe4c7 100644
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@ -9,6 +9,7 @@
+ #include <linux/init.h>
+ #include <linux/blkdev.h>
+ #include <linux/bio.h>
++#include <linux/dax.h>
+ #include <linux/slab.h>
+ #include <linux/device-mapper.h>
+ 
+@@ -155,22 +156,20 @@ static int linear_iterate_devices(struct dm_target *ti,
+ 	return fn(ti, lc->dev, lc->start, ti->len, data);
+ }
+ 
+-static long linear_direct_access(struct dm_target *ti, sector_t sector,
+-				 void **kaddr, pfn_t *pfn, long size)
++static long linear_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
++		long nr_pages, void **kaddr, pfn_t *pfn)
+ {
++	long ret;
+ 	struct linear_c *lc = ti->private;
+ 	struct block_device *bdev = lc->dev->bdev;
+-	struct blk_dax_ctl dax = {
+-		.sector = linear_map_sector(ti, sector),
+-		.size = size,
+-	};
+-	long ret;
+-
+-	ret = bdev_direct_access(bdev, &dax);
+-	*kaddr = dax.addr;
+-	*pfn = dax.pfn;
+-
+-	return ret;
++	struct dax_device *dax_dev = lc->dev->dax_dev;
++	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++
++	dev_sector = linear_map_sector(ti, sector);
++	ret = bdev_dax_pgoff(bdev, dev_sector, nr_pages * PAGE_SIZE, &pgoff);
++	if (ret)
++		return ret;
++	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+ }
+ 
+ static struct target_type linear_target = {
+@@ -184,7 +183,7 @@ static struct target_type linear_target = {
+ 	.prepare_ioctl = linear_prepare_ioctl,
+ 	.merge  = linear_merge,
+ 	.iterate_devices = linear_iterate_devices,
+-	.direct_access = linear_direct_access,
++	.direct_access = linear_dax_direct_access,
+ };
+ 
+ int __init dm_linear_init(void)
+diff --git a/drivers/md/dm-snap.c b/drivers/md/dm-snap.c
+index 31173dd3ee10..2cc2e2ca8766 100644
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -2289,8 +2289,8 @@ static int origin_map(struct dm_target *ti, struct bio *bio)
+ 	return (bio_rw(bio) == WRITE) ? do_origin(o->dev, bio) : DM_MAPIO_REMAPPED;
+ }
+ 
+-static long origin_direct_access(struct dm_target *ti, sector_t sector,
+-		void **kaddr, pfn_t *pfn, long size)
++static long origin_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
++		long nr_pages, void **kaddr, pfn_t *pfn)
+ {
+ 	DMWARN("device does not support dax.");
+ 	return -EIO;
+@@ -2370,7 +2370,7 @@ static struct target_type origin_target = {
+ 	.status  = origin_status,
+ 	.merge	 = origin_merge,
+ 	.iterate_devices = origin_iterate_devices,
+-	.direct_access = origin_direct_access,
++	.direct_access = origin_dax_direct_access,
+ };
+ 
+ static struct target_type snapshot_target = {
+* Unmerged path drivers/md/dm-stripe.c
+diff --git a/drivers/md/dm-target.c b/drivers/md/dm-target.c
+index 710ae28fd618..96fd0c559d35 100644
+--- a/drivers/md/dm-target.c
++++ b/drivers/md/dm-target.c
+@@ -148,8 +148,8 @@ static void io_err_release_clone_rq(struct request *clone)
+ {
+ }
+ 
+-static long io_err_direct_access(struct dm_target *ti, sector_t sector,
+-				 void **kaddr, pfn_t *pfn, long size)
++static long io_err_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
++		long nr_pages, void **kaddr, pfn_t *pfn)
+ {
+ 	return -EIO;
+ }
+@@ -164,7 +164,7 @@ static struct target_type error_target = {
+ 	.map_rq = io_err_map_rq,
+ 	.clone_and_map_rq = io_err_clone_and_map_rq,
+ 	.release_clone_rq = io_err_release_clone_rq,
+-	.direct_access = io_err_direct_access,
++	.direct_access = io_err_dax_direct_access,
+ };
+ 
+ int __init dm_target_init(void)
+* Unmerged path drivers/md/dm.c
+* Unmerged path include/linux/device-mapper.h
