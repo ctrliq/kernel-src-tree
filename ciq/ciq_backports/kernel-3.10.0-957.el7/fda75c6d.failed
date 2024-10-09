@@ -1,0 +1,244 @@
+netfilter: ipset: Support comments in hash-type ipsets.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] netfilter: ipset: Support comments in hash-type ipsets (Stefano Brivio) [1557599]
+Rebuild_FUZZ: 99.08%
+commit-author Oliver Smith <oliver@8.c.9.b.0.7.4.0.1.0.0.2.ip6.arpa>
+commit fda75c6d9e31a901e25b922e86c8fd505c899873
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fda75c6d.failed
+
+This provides kernel support for creating ipsets with comment support.
+
+This does incur a penalty to flushing/destroying an ipset since all
+entries are walked in order to free the allocated strings, this penalty
+is of course less expensive than the operation of listing an ipset to
+userspace, so for general-purpose usage the overall impact is expected
+to be little to none.
+
+	Signed-off-by: Oliver Smith <oliver@8.c.9.b.0.7.4.0.1.0.0.2.ip6.arpa>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit fda75c6d9e31a901e25b922e86c8fd505c899873)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_hash_gen.h
+#	net/netfilter/ipset/ip_set_hash_netnet.c
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index acd02e6a3233,6efb65569e88..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -664,9 -698,11 +664,15 @@@ reuse_slot
+  	mtype_data_set_flags(data, flags);
+  #endif
+  	if (SET_WITH_TIMEOUT(set))
+ -		ip_set_timeout_set(ext_timeout(data, set), ext->timeout);
+ +		ip_set_timeout_set(ext_timeout(data, h), ext->timeout);
+  	if (SET_WITH_COUNTER(set))
+++<<<<<<< HEAD
+ +		ip_set_init_counter(ext_counter(data, h), ext);
+++=======
++ 		ip_set_init_counter(ext_counter(data, set), ext);
++ 	if (SET_WITH_COMMENT(set))
++ 		ip_set_init_comment(ext_comment(data, set), ext);
+++>>>>>>> fda75c6d9e31 (netfilter: ipset: Support comments in hash-type ipsets.)
+  
+  out:
+  	rcu_read_unlock_bh();
+@@@ -834,13 -909,10 +840,20 @@@ mtype_head(struct ip_set *set, struct s
+  	    nla_put_u8(skb, IPSET_ATTR_NETMASK, h->netmask))
+  		goto nla_put_failure;
+  #endif
+++<<<<<<< HEAD
+ +	if (nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref)) ||
+ +	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE, htonl(memsize)) ||
+ +	    ((set->extensions & IPSET_EXT_TIMEOUT) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_TIMEOUT, htonl(h->timeout))) ||
+ +	    ((set->extensions & IPSET_EXT_COUNTER) &&
+ +	     nla_put_net32(skb, IPSET_ATTR_CADT_FLAGS,
+ +			   htonl(IPSET_FLAG_WITH_COUNTERS))))
+++=======
++ 	if (nla_put_net32(skb, IPSET_ATTR_REFERENCES, htonl(set->ref - 1)) ||
++ 	    nla_put_net32(skb, IPSET_ATTR_MEMSIZE, htonl(memsize)))
++ 		goto nla_put_failure;
++ 	if (unlikely(ip_set_put_flags(skb, set)))
+++>>>>>>> fda75c6d9e31 (netfilter: ipset: Support comments in hash-type ipsets.)
+  		goto nla_put_failure;
+  	ipset_nest_end(skb, nested);
+  
+@@@ -892,11 -964,14 +905,14 @@@ mtype_list(const struct ip_set *set
+  			if (SET_WITH_TIMEOUT(set) &&
+  			    nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
+  					  htonl(ip_set_timeout_get(
+ -						ext_timeout(e, set)))))
+ +						ext_timeout(e, h)))))
+  				goto nla_put_failure;
+  			if (SET_WITH_COUNTER(set) &&
+ -			    ip_set_put_counter(skb, ext_counter(e, set)))
+ +			    ip_set_put_counter(skb, ext_counter(e, h)))
+  				goto nla_put_failure;
++ 			if (SET_WITH_COMMENT(set) &&
++ 			    ip_set_put_comment(skb, ext_comment(e, set)))
++ 				goto nla_put_failure;
+  			ipset_nest_end(skb, nested);
+  		}
+  	}
+* Unmerged path net/netfilter/ipset/ip_set_hash_netnet.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
+diff --git a/net/netfilter/ipset/ip_set_hash_ip.c b/net/netfilter/ipset/ip_set_hash_ip.c
+index 260c9a80d8a5..b15366090c61 100644
+--- a/net/netfilter/ipset/ip_set_hash_ip.c
++++ b/net/netfilter/ipset/ip_set_hash_ip.c
+@@ -24,7 +24,8 @@
+ #include <linux/netfilter/ipset/ip_set_hash.h>
+ 
+ #define IPSET_TYPE_REV_MIN	0
+-#define IPSET_TYPE_REV_MAX	1	/* Counters support */
++/*				1	   Counters support */
++#define IPSET_TYPE_REV_MAX	2	/* Comments support */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -324,6 +325,7 @@ static struct ip_set_type hash_ip_type __read_mostly = {
+ 		[IPSET_ATTR_LINENO]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+diff --git a/net/netfilter/ipset/ip_set_hash_ipport.c b/net/netfilter/ipset/ip_set_hash_ipport.c
+index 64caad35a391..40ddf6d8d47c 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipport.c
++++ b/net/netfilter/ipset/ip_set_hash_ipport.c
+@@ -26,7 +26,8 @@
+ 
+ #define IPSET_TYPE_REV_MIN	0
+ /*				1    SCTP and UDPLITE support added */
+-#define IPSET_TYPE_REV_MAX	2 /* Counters support added */
++/*				2    Counters support added */
++#define IPSET_TYPE_REV_MAX	3 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -419,6 +420,7 @@ static struct ip_set_type hash_ipport_type __read_mostly = {
+ 		[IPSET_ATTR_LINENO]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+diff --git a/net/netfilter/ipset/ip_set_hash_ipportip.c b/net/netfilter/ipset/ip_set_hash_ipportip.c
+index 2873bbc20d7a..53b022f48ac5 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipportip.c
++++ b/net/netfilter/ipset/ip_set_hash_ipportip.c
+@@ -26,7 +26,8 @@
+ 
+ #define IPSET_TYPE_REV_MIN	0
+ /*				1    SCTP and UDPLITE support added */
+-#define IPSET_TYPE_REV_MAX	2 /* Counters support added */
++/*				2    Counters support added */
++#define IPSET_TYPE_REV_MAX	3 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -437,6 +438,7 @@ static struct ip_set_type hash_ipportip_type __read_mostly = {
+ 		[IPSET_ATTR_LINENO]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+diff --git a/net/netfilter/ipset/ip_set_hash_ipportnet.c b/net/netfilter/ipset/ip_set_hash_ipportnet.c
+index f111558c4597..3b0b343adec3 100644
+--- a/net/netfilter/ipset/ip_set_hash_ipportnet.c
++++ b/net/netfilter/ipset/ip_set_hash_ipportnet.c
+@@ -28,7 +28,8 @@
+ /*				1    SCTP and UDPLITE support added */
+ /*				2    Range as input support for IPv4 added */
+ /*				3    nomatch flag support added */
+-#define IPSET_TYPE_REV_MAX	4 /* Counters support added */
++/*				4    Counters support added */
++#define IPSET_TYPE_REV_MAX	5 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -600,6 +601,7 @@ static struct ip_set_type hash_ipportnet_type __read_mostly = {
+ 		[IPSET_ATTR_LINENO]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+diff --git a/net/netfilter/ipset/ip_set_hash_net.c b/net/netfilter/ipset/ip_set_hash_net.c
+index 0a64dad156d9..35b046fc4cee 100644
+--- a/net/netfilter/ipset/ip_set_hash_net.c
++++ b/net/netfilter/ipset/ip_set_hash_net.c
+@@ -25,7 +25,8 @@
+ #define IPSET_TYPE_REV_MIN	0
+ /*				1    Range as input support for IPv4 added */
+ /*				2    nomatch flag support added */
+-#define IPSET_TYPE_REV_MAX	3 /* Counters support added */
++/*				3    Counters support added */
++#define IPSET_TYPE_REV_MAX	4 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -425,6 +426,7 @@ static struct ip_set_type hash_net_type __read_mostly = {
+ 		[IPSET_ATTR_CADT_FLAGS]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+diff --git a/net/netfilter/ipset/ip_set_hash_netiface.c b/net/netfilter/ipset/ip_set_hash_netiface.c
+index 8bdeb0791689..4b3540ed4a83 100644
+--- a/net/netfilter/ipset/ip_set_hash_netiface.c
++++ b/net/netfilter/ipset/ip_set_hash_netiface.c
+@@ -27,7 +27,8 @@
+ #define IPSET_TYPE_REV_MIN	0
+ /*				1    nomatch flag support added */
+ /*				2    /0 support added */
+-#define IPSET_TYPE_REV_MAX	3 /* Counters support added */
++/*				3    Counters support added */
++#define IPSET_TYPE_REV_MAX	4 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -684,6 +685,7 @@ static struct ip_set_type hash_netiface_type __read_mostly = {
+ 		[IPSET_ATTR_LINENO]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
+* Unmerged path net/netfilter/ipset/ip_set_hash_netnet.c
+diff --git a/net/netfilter/ipset/ip_set_hash_netport.c b/net/netfilter/ipset/ip_set_hash_netport.c
+index d98a685cd916..88a8200ea6d0 100644
+--- a/net/netfilter/ipset/ip_set_hash_netport.c
++++ b/net/netfilter/ipset/ip_set_hash_netport.c
+@@ -27,7 +27,8 @@
+ /*				1    SCTP and UDPLITE support added */
+ /*				2    Range as input support for IPv4 added */
+ /*				3    nomatch flag support added */
+-#define IPSET_TYPE_REV_MAX	4 /* Counters support added */
++/*				4    Counters support added */
++#define IPSET_TYPE_REV_MAX	5 /* Comments support added */
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>");
+@@ -542,6 +543,7 @@ static struct ip_set_type hash_netport_type __read_mostly = {
+ 		[IPSET_ATTR_CADT_FLAGS]	= { .type = NLA_U32 },
+ 		[IPSET_ATTR_BYTES]	= { .type = NLA_U64 },
+ 		[IPSET_ATTR_PACKETS]	= { .type = NLA_U64 },
++		[IPSET_ATTR_COMMENT]	= { .type = NLA_NUL_STRING },
+ 	},
+ 	.me		= THIS_MODULE,
+ };
