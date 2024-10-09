@@ -1,0 +1,229 @@
+net: sched: use block index as a handle instead of qdisc when block is shared
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: use block index as a handle instead of qdisc when block is shared (Ivan Vecera) [1584592]
+Rebuild_FUZZ: 96.64%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 7960d1daf278cbe23bb48974fe6ae6a1e44c3c15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7960d1da.failed
+
+As the tcm_ifindex with value TCM_IFINDEX_MAGIC_BLOCK is invalid ifindex,
+use it to indicate that we work with block, instead of qdisc.
+So if tcm_ifindex is set to TCM_IFINDEX_MAGIC_BLOCK, tcm_parent is used
+to carry block_index.
+
+If the block is set to be shared between at least 2 qdiscs, it is
+forbidden to use the qdisc handle to add/delete filters. In that case,
+userspace has to pass block_index.
+
+Also, for dump of the filters, in case the block is shared in between at
+least 2 qdiscs, the each filter is dumped with tcm_ifindex value
+TCM_IFINDEX_MAGIC_BLOCK and tcm_parent set to block_index. That gives
+the user clear indication, that the filter belongs to a shared block
+and not only to one qdisc under which it is dumped.
+
+	Suggested-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7960d1daf278cbe23bb48974fe6ae6a1e44c3c15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index a56916c8abe9,e500d11da9cd..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -593,41 -1041,58 +598,73 @@@ replay
+  
+  	/* Find head of filter chain. */
+  
+- 	/* Find link */
+- 	dev = __dev_get_by_index(net, t->tcm_ifindex);
+- 	if (dev == NULL)
+- 		return -ENODEV;
+- 
+- 	/* Find qdisc */
+- 	if (!parent) {
+- 		q = dev->qdisc;
+- 		parent = q->handle;
++ 	if (t->tcm_ifindex == TCM_IFINDEX_MAGIC_BLOCK) {
++ 		block = tcf_block_lookup(net, t->tcm_block_index);
++ 		if (!block) {
++ 			NL_SET_ERR_MSG(extack, "Block of given index was not found");
++ 			err = -EINVAL;
++ 			goto errout;
++ 		}
+  	} else {
+- 		q = qdisc_lookup(dev, TC_H_MAJ(t->tcm_parent));
+- 		if (q == NULL)
++ 		const struct Qdisc_class_ops *cops;
++ 		struct net_device *dev;
++ 
++ 		/* Find link */
++ 		dev = __dev_get_by_index(net, t->tcm_ifindex);
++ 		if (!dev)
++ 			return -ENODEV;
++ 
++ 		/* Find qdisc */
++ 		if (!parent) {
++ 			q = dev->qdisc;
++ 			parent = q->handle;
++ 		} else {
++ 			q = qdisc_lookup(dev, TC_H_MAJ(t->tcm_parent));
++ 			if (!q)
++ 				return -EINVAL;
++ 		}
++ 
++ 		/* Is it classful? */
++ 		cops = q->ops->cl_ops;
++ 		if (!cops)
+  			return -EINVAL;
+- 	}
+  
+- 	/* Is it classful? */
+- 	cops = q->ops->cl_ops;
+- 	if (!cops)
+- 		return -EINVAL;
++ 		if (!cops->tcf_block)
++ 			return -EOPNOTSUPP;
+  
+- 	if (!cops->tcf_block)
+- 		return -EOPNOTSUPP;
++ 		/* Do we search for filter, attached to class? */
++ 		if (TC_H_MIN(parent)) {
++ 			cl = cops->find(q, parent);
++ 			if (cl == 0)
++ 				return -ENOENT;
++ 		}
+  
+++<<<<<<< HEAD
+ +	/* Do we search for filter, attached to class? */
+ +	if (TC_H_MIN(parent)) {
+ +		cl = cops->find(q, parent);
+ +		if (cl == 0)
+ +			return -ENOENT;
+ +	}
+ +
+ +	/* And the last stroke */
+ +	block = cops->tcf_block(q, cl);
+ +	if (!block) {
+ +		err = -EINVAL;
+ +		goto errout;
+++=======
++ 		/* And the last stroke */
++ 		block = cops->tcf_block(q, cl, extack);
++ 		if (!block) {
++ 			err = -EINVAL;
++ 			goto errout;
++ 		}
++ 		if (tcf_block_shared(block)) {
++ 			NL_SET_ERR_MSG(extack, "This filter block is shared. Please use the block index to manipulate the filters");
++ 			err = -EOPNOTSUPP;
++ 			goto errout;
++ 		}
+++>>>>>>> 7960d1daf278 (net: sched: use block index as a handle instead of qdisc when block is shared)
+  	}
+  
+  	chain_index = tca[TCA_CHAIN] ? nla_get_u32(tca[TCA_CHAIN]) : 0;
+@@@ -848,32 -1313,44 +885,50 @@@ static int tc_dump_tfilter(struct sk_bu
+  	if (err)
+  		return err;
+  
+- 	dev = __dev_get_by_index(net, tcm->tcm_ifindex);
+- 	if (!dev)
+- 		return skb->len;
+- 
+- 	parent = tcm->tcm_parent;
+- 	if (!parent) {
+- 		q = dev->qdisc;
+- 		parent = q->handle;
++ 	if (tcm->tcm_ifindex == TCM_IFINDEX_MAGIC_BLOCK) {
++ 		block = tcf_block_lookup(net, tcm->tcm_block_index);
++ 		if (!block)
++ 			goto out;
+  	} else {
+- 		q = qdisc_lookup(dev, TC_H_MAJ(tcm->tcm_parent));
+- 	}
+- 	if (!q)
+- 		goto out;
+- 	cops = q->ops->cl_ops;
+- 	if (!cops)
+- 		goto out;
+- 	if (!cops->tcf_block)
+- 		goto out;
+- 	if (TC_H_MIN(tcm->tcm_parent)) {
+- 		cl = cops->find(q, tcm->tcm_parent);
+- 		if (cl == 0)
++ 		const struct Qdisc_class_ops *cops;
++ 		struct net_device *dev;
++ 		unsigned long cl = 0;
++ 
++ 		dev = __dev_get_by_index(net, tcm->tcm_ifindex);
++ 		if (!dev)
++ 			return skb->len;
++ 
++ 		parent = tcm->tcm_parent;
++ 		if (!parent) {
++ 			q = dev->qdisc;
++ 			parent = q->handle;
++ 		} else {
++ 			q = qdisc_lookup(dev, TC_H_MAJ(tcm->tcm_parent));
++ 		}
++ 		if (!q)
++ 			goto out;
++ 		cops = q->ops->cl_ops;
++ 		if (!cops)
++ 			goto out;
++ 		if (!cops->tcf_block)
++ 			goto out;
++ 		if (TC_H_MIN(tcm->tcm_parent)) {
++ 			cl = cops->find(q, tcm->tcm_parent);
++ 			if (cl == 0)
++ 				goto out;
++ 		}
++ 		block = cops->tcf_block(q, cl, NULL);
++ 		if (!block)
+  			goto out;
++ 		if (tcf_block_shared(block))
++ 			q = NULL;
+  	}
+++<<<<<<< HEAD
+ +	block = cops->tcf_block(q, cl);
+ +	if (!block)
+ +		goto out;
+++=======
+++>>>>>>> 7960d1daf278 (net: sched: use block index as a handle instead of qdisc when block is shared)
+  
+  	index_start = cb->args[0];
+  	index = 0;
+diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
+index 05d76fbc2010..443de7a1ea63 100644
+--- a/include/uapi/linux/rtnetlink.h
++++ b/include/uapi/linux/rtnetlink.h
+@@ -525,9 +525,19 @@ struct tcmsg {
+ 	int		tcm_ifindex;
+ 	__u32		tcm_handle;
+ 	__u32		tcm_parent;
++/* tcm_block_index is used instead of tcm_parent
++ * in case tcm_ifindex == TCM_IFINDEX_MAGIC_BLOCK
++ */
++#define tcm_block_index tcm_parent
+ 	__u32		tcm_info;
+ };
+ 
++/* For manipulation of filters in shared block, tcm_ifindex is set to
++ * TCM_IFINDEX_MAGIC_BLOCK, and tcm_parent is aliased to tcm_block_index
++ * which is the block index.
++ */
++#define TCM_IFINDEX_MAGIC_BLOCK (0xFFFFFFFFU)
++
+ enum {
+ 	TCA_UNSPEC,
+ 	TCA_KIND,
+* Unmerged path net/sched/cls_api.c
