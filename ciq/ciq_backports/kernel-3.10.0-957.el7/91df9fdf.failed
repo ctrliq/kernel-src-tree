@@ -1,0 +1,148 @@
+x86/microcode/intel: Writeback and invalidate caches before updating microcode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] microcode/intel: Writeback and invalidate caches before updating microcode (Prarit Bhargava) [1568249]
+Rebuild_FUZZ: 97.37%
+commit-author Ashok Raj <ashok.raj@intel.com>
+commit 91df9fdf51492aec9fed6b4cbd33160886740f47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/91df9fdf.failed
+
+Updating microcode is less error prone when caches have been flushed and
+depending on what exactly the microcode is updating. For example, some
+of the issues around certain Broadwell parts can be addressed by doing a
+full cache flush.
+
+[ Borislav: Massage it and use native_wbinvd() in both cases. ]
+
+	Signed-off-by: Ashok Raj <ashok.raj@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Tested-by: Ashok Raj <ashok.raj@intel.com>
+	Cc: Arjan Van De Ven <arjan.van.de.ven@intel.com>
+Link: http://lkml.kernel.org/r/1519352533-15992-3-git-send-email-ashok.raj@intel.com
+Link: https://lkml.kernel.org/r/20180228102846.13447-4-bp@alien8.de
+
+(cherry picked from commit 91df9fdf51492aec9fed6b4cbd33160886740f47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/intel.c
+diff --cc arch/x86/kernel/cpu/microcode/intel.c
+index c7e50a8f4783,e2864bc2d575..000000000000
+--- a/arch/x86/kernel/cpu/microcode/intel.c
++++ b/arch/x86/kernel/cpu/microcode/intel.c
+@@@ -623,23 -589,31 +623,43 @@@ static int apply_microcode_early(struc
+  	if (!mc)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Save us the MSR write below - which is a particular expensive
++ 	 * operation - when the other hyperthread has updated the microcode
++ 	 * already.
++ 	 */
++ 	rev = intel_get_microcode_revision();
++ 	if (rev >= mc->hdr.rev) {
++ 		uci->cpu_sig.rev = rev;
++ 		return UCODE_OK;
++ 	}
++ 
++ 	/*
++ 	 * Writeback and invalidate caches before updating microcode to avoid
++ 	 * internal issues depending on what the microcode is updating.
++ 	 */
++ 	native_wbinvd();
++ 
+++>>>>>>> 91df9fdf5149 (x86/microcode/intel: Writeback and invalidate caches before updating microcode)
+  	/* write microcode via MSR 0x79 */
+  	native_wrmsrl(MSR_IA32_UCODE_WRITE, (unsigned long)mc->bits);
+ +	native_wrmsrl(MSR_IA32_UCODE_REV, 0);
+  
+ -	rev = intel_get_microcode_revision();
+ -	if (rev != mc->hdr.rev)
+ +	/* As documented in the SDM: Do a CPUID 1 here */
+ +	sync_core();
+ +
+ +	/* get the current revision from MSR 0x8B */
+ +	native_rdmsr(MSR_IA32_UCODE_REV, val[0], val[1]);
+ +	if (val[1] != mc->hdr.rev)
+  		return -1;
+  
+ -	uci->cpu_sig.rev = rev;
+ +#ifdef CONFIG_X86_64
+ +	/* Flush global tlb. This is precaution. */
+ +	flush_tlb_early();
+ +#endif
+ +	uci->cpu_sig.rev = val[1];
+  
+  	if (early)
+  		print_ucode(uci);
+@@@ -915,36 -803,45 +935,42 @@@ static int apply_microcode_intel(int cp
+  
+  	uci = ucode_cpu_info + cpu;
+  	mc = uci->mc;
+ -	if (!mc) {
+ -		/* Look for a newer patch in our cache: */
+ -		mc = find_patch(uci);
+ -		if (!mc)
+ -			return UCODE_NFOUND;
+ -	}
+ +	if (!mc)
+ +		return 0;
+  
+  	/*
+ -	 * Save us the MSR write below - which is a particular expensive
+ -	 * operation - when the other hyperthread has updated the microcode
+ -	 * already.
+ +	 * Microcode on this CPU could be updated earlier. Only apply the
+ +	 * microcode patch in mc when it is newer than the one on this
+ +	 * CPU.
+  	 */
+ -	rev = intel_get_microcode_revision();
+ -	if (rev >= mc->hdr.rev) {
+ -		uci->cpu_sig.rev = rev;
+ -		c->microcode = rev;
+ -		return UCODE_OK;
+ -	}
+ +	if (!get_matching_mc(mc, cpu))
+ +		return 0;
+  
++ 	/*
++ 	 * Writeback and invalidate caches before updating microcode to avoid
++ 	 * internal issues depending on what the microcode is updating.
++ 	 */
++ 	native_wbinvd();
++ 
+  	/* write microcode via MSR 0x79 */
+  	wrmsrl(MSR_IA32_UCODE_WRITE, (unsigned long)mc->bits);
+ +	wrmsrl(MSR_IA32_UCODE_REV, 0);
+  
+ -	rev = intel_get_microcode_revision();
+ +	/* As documented in the SDM: Do a CPUID 1 here */
+ +	sync_core();
+  
+ -	if (rev != mc->hdr.rev) {
+ +	/* get the current revision from MSR 0x8B */
+ +	rdmsr(MSR_IA32_UCODE_REV, val[0], val[1]);
+ +
+ +	if (val[1] != mc->hdr.rev) {
+  		pr_err("CPU%d update to revision 0x%x failed\n",
+  		       cpu, mc->hdr.rev);
+ -		return UCODE_ERROR;
+ +		return -1;
+  	}
+  
+ -	if (rev != prev_rev) {
+ +	if (val[1] != prev_rev) {
+  		pr_info("updated to revision 0x%x, date = %04x-%02x-%02x\n",
+ -			rev,
+ +			val[1],
+  			mc->hdr.date & 0xffff,
+  			mc->hdr.date >> 24,
+  			(mc->hdr.date >> 16) & 0xff);
+* Unmerged path arch/x86/kernel/cpu/microcode/intel.c
