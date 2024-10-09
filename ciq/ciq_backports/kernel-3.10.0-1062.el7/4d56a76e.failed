@@ -1,0 +1,152 @@
+bpf: fix multi-function JITed dump obtained via syscall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sandipan Das <sandipan@linux.vnet.ibm.com>
+commit 4d56a76ead2fcd856e677cdc9445ad331a409b8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4d56a76e.failed
+
+Currently, for multi-function programs, we cannot get the JITed
+instructions using the bpf system call's BPF_OBJ_GET_INFO_BY_FD
+command. Because of this, userspace tools such as bpftool fail
+to identify a multi-function program as being JITed or not.
+
+With the JIT enabled and the test program running, this can be
+verified as follows:
+
+  # cat /proc/sys/net/core/bpf_jit_enable
+  1
+
+Before applying this patch:
+
+  # bpftool prog list
+  1: kprobe  name foo  tag b811aab41a39ad3d  gpl
+          loaded_at 2018-05-16T11:43:38+0530  uid 0
+          xlated 216B  not jited  memlock 65536B
+  ...
+
+  # bpftool prog dump jited id 1
+  no instructions returned
+
+After applying this patch:
+
+  # bpftool prog list
+  1: kprobe  name foo  tag b811aab41a39ad3d  gpl
+          loaded_at 2018-05-16T12:13:01+0530  uid 0
+          xlated 216B  jited 308B  memlock 65536B
+  ...
+
+  # bpftool prog dump jited id 1
+     0:   nop
+     4:   nop
+     8:   mflr    r0
+     c:   std     r0,16(r1)
+    10:   stdu    r1,-112(r1)
+    14:   std     r31,104(r1)
+    18:   addi    r31,r1,48
+    1c:   li      r3,10
+  ...
+
+	Signed-off-by: Sandipan Das <sandipan@linux.vnet.ibm.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 4d56a76ead2fcd856e677cdc9445ad331a409b8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/syscall.c
+diff --cc kernel/bpf/syscall.c
+index f8f3ed8bef67,c8e987a612b5..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1625,6 -1958,85 +1625,88 @@@ static int bpf_prog_get_info_by_fd(stru
+  			return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (bpf_prog_is_dev_bound(prog->aux)) {
++ 		err = bpf_prog_offload_info_fill(&info, prog);
++ 		if (err)
++ 			return err;
++ 		goto done;
++ 	}
++ 
++ 	/* NOTE: the following code is supposed to be skipped for offload.
++ 	 * bpf_prog_offload_info_fill() is the place to fill similar fields
++ 	 * for offload.
++ 	 */
++ 	ulen = info.jited_prog_len;
++ 	if (prog->aux->func_cnt) {
++ 		u32 i;
++ 
++ 		info.jited_prog_len = 0;
++ 		for (i = 0; i < prog->aux->func_cnt; i++)
++ 			info.jited_prog_len += prog->aux->func[i]->jited_len;
++ 	} else {
++ 		info.jited_prog_len = prog->jited_len;
++ 	}
++ 
++ 	if (info.jited_prog_len && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			uinsns = u64_to_user_ptr(info.jited_prog_insns);
++ 			ulen = min_t(u32, info.jited_prog_len, ulen);
++ 
++ 			/* for multi-function programs, copy the JITed
++ 			 * instructions for all the functions
++ 			 */
++ 			if (prog->aux->func_cnt) {
++ 				u32 len, free, i;
++ 				u8 *img;
++ 
++ 				free = ulen;
++ 				for (i = 0; i < prog->aux->func_cnt; i++) {
++ 					len = prog->aux->func[i]->jited_len;
++ 					len = min_t(u32, len, free);
++ 					img = (u8 *) prog->aux->func[i]->bpf_func;
++ 					if (copy_to_user(uinsns, img, len))
++ 						return -EFAULT;
++ 					uinsns += len;
++ 					free -= len;
++ 					if (!free)
++ 						break;
++ 				}
++ 			} else {
++ 				if (copy_to_user(uinsns, prog->bpf_func, ulen))
++ 					return -EFAULT;
++ 			}
++ 		} else {
++ 			info.jited_prog_insns = 0;
++ 		}
++ 	}
++ 
++ 	ulen = info.nr_jited_ksyms;
++ 	info.nr_jited_ksyms = prog->aux->func_cnt;
++ 	if (info.nr_jited_ksyms && ulen) {
++ 		if (bpf_dump_raw_ok()) {
++ 			u64 __user *user_ksyms;
++ 			ulong ksym_addr;
++ 			u32 i;
++ 
++ 			/* copy the address of the kernel symbol
++ 			 * corresponding to each function
++ 			 */
++ 			ulen = min_t(u32, info.nr_jited_ksyms, ulen);
++ 			user_ksyms = u64_to_user_ptr(info.jited_ksyms);
++ 			for (i = 0; i < ulen; i++) {
++ 				ksym_addr = (ulong) prog->aux->func[i]->bpf_func;
++ 				ksym_addr &= PAGE_MASK;
++ 				if (put_user((u64) ksym_addr, &user_ksyms[i]))
++ 					return -EFAULT;
++ 			}
++ 		} else {
++ 			info.jited_ksyms = 0;
++ 		}
++ 	}
++ 
+++>>>>>>> 4d56a76ead2f (bpf: fix multi-function JITed dump obtained via syscall)
+  done:
+  	if (copy_to_user(uinfo, &info, info_len) ||
+  	    put_user(info_len, &uattr->info.info_len))
+* Unmerged path kernel/bpf/syscall.c
