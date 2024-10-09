@@ -147,6 +147,8 @@ struct ceph_osd_request_target {
 	unsigned int flags;                /* CEPH_OSD_FLAG_* */
 	bool paused;
 
+	u32 last_force_resend;
+
 	int osd;
 };
 
@@ -192,7 +194,6 @@ struct ceph_osd_request {
 	unsigned long r_stamp;                /* jiffies, send or check time */
 	unsigned long r_start_stamp;          /* jiffies */
 	int r_attempts;
-	u32 r_last_force_resend;
 	u32 r_map_dne_bound;
 
 	struct ceph_osd_req_op r_ops[];
@@ -220,7 +221,6 @@ struct ceph_osd_linger_request {
 	struct list_head pending_lworks;
 
 	struct ceph_osd_request_target t;
-	u32 last_force_resend;
 	u32 map_dne_bound;
 
 	struct timespec mtime;
