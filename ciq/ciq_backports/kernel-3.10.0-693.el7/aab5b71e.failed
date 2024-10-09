@@ -1,0 +1,319 @@
+perf/core: Rename the perf_event_aux*() APIs to perf_event_sb*(), to separate them from AUX ring-buffer records
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit aab5b71ef2b5c62323b9abe397e2db57b18e1f78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aab5b71e.failed
+
+There are now two different things called AUX in perf, the
+infrastructure to deliver the mmap/comm/task records and the
+AUX part in the mmap buffer (with associated AUX_RECORD).
+
+Since the former is internal, rename it to side-band to reduce
+the confusion factor.
+
+No change in functionality.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit aab5b71ef2b5c62323b9abe397e2db57b18e1f78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 1e40002e26ef,f54454ea5f31..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -5703,51 -5900,105 +5703,138 @@@ perf_iterate_ctx(struct perf_event_cont
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +perf_event_aux_task_ctx(perf_event_aux_output_cb output, void *data,
+ +			struct perf_event_context *task_ctx)
+ +{
+ +	rcu_read_lock();
+ +	preempt_disable();
+ +	perf_event_aux_ctx(task_ctx, output, data, false);
+ +	preempt_enable();
+ +	rcu_read_unlock();
+ +}
+ +
+++=======
++ static void perf_iterate_sb_cpu(perf_iterate_f output, void *data)
++ {
++ 	struct pmu_event_list *pel = this_cpu_ptr(&pmu_sb_events);
++ 	struct perf_event *event;
++ 
++ 	list_for_each_entry_rcu(event, &pel->list, sb_list) {
++ 		if (event->state < PERF_EVENT_STATE_INACTIVE)
++ 			continue;
++ 		if (!event_filter_match(event))
++ 			continue;
++ 		output(event, data);
++ 	}
++ }
++ 
++ /*
++  * Iterate all events that need to receive side-band events.
++  *
++  * For new callers; ensure that account_pmu_sb_event() includes
++  * your event, otherwise it might not get delivered.
++  */
+++>>>>>>> aab5b71ef2b5 (perf/core: Rename the perf_event_aux*() APIs to perf_event_sb*(), to separate them from AUX ring-buffer records)
+  static void
+- perf_event_aux(perf_event_aux_output_cb output, void *data,
++ perf_iterate_sb(perf_iterate_f output, void *data,
+  	       struct perf_event_context *task_ctx)
+  {
+ +	struct perf_cpu_context *cpuctx;
+  	struct perf_event_context *ctx;
+ +	struct pmu *pmu;
+  	int ctxn;
+  
++ 	rcu_read_lock();
++ 	preempt_disable();
++ 
+  	/*
+- 	 * If we have task_ctx != NULL we only notify
+- 	 * the task context itself. The task_ctx is set
+- 	 * only for EXIT events before releasing task
++ 	 * If we have task_ctx != NULL we only notify the task context itself.
++ 	 * The task_ctx is set only for EXIT events before releasing task
+  	 * context.
+  	 */
+  	if (task_ctx) {
+- 		perf_event_aux_task_ctx(output, data, task_ctx);
+- 		return;
++ 		perf_iterate_ctx(task_ctx, output, data, false);
++ 		goto done;
+  	}
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	list_for_each_entry_rcu(pmu, &pmus, entry) {
+ +		cpuctx = get_cpu_ptr(pmu->pmu_cpu_context);
+ +		if (cpuctx->unique_pmu != pmu)
+ +			goto next;
+ +		perf_event_aux_ctx(&cpuctx->ctx, output, data, false);
+ +		ctxn = pmu->task_ctx_nr;
+ +		if (ctxn < 0)
+ +			goto next;
+ +		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
+ +		if (ctx)
+ +			perf_event_aux_ctx(ctx, output, data, false);
+ +next:
+ +		put_cpu_ptr(pmu->pmu_cpu_context);
+++=======
++ 	perf_iterate_sb_cpu(output, data);
++ 
++ 	for_each_task_context_nr(ctxn) {
++ 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
++ 		if (ctx)
++ 			perf_iterate_ctx(ctx, output, data, false);
++ 	}
++ done:
++ 	preempt_enable();
++ 	rcu_read_unlock();
++ }
++ 
++ /*
++  * Clear all file-based filters at exec, they'll have to be
++  * re-instated when/if these objects are mmapped again.
++  */
++ static void perf_event_addr_filters_exec(struct perf_event *event, void *data)
++ {
++ 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
++ 	struct perf_addr_filter *filter;
++ 	unsigned int restart = 0, count = 0;
++ 	unsigned long flags;
++ 
++ 	if (!has_addr_filter(event))
++ 		return;
++ 
++ 	raw_spin_lock_irqsave(&ifh->lock, flags);
++ 	list_for_each_entry(filter, &ifh->list, entry) {
++ 		if (filter->inode) {
++ 			event->addr_filters_offs[count] = 0;
++ 			restart++;
++ 		}
++ 
++ 		count++;
++ 	}
++ 
++ 	if (restart)
++ 		event->addr_filters_gen++;
++ 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
++ 
++ 	if (restart)
++ 		perf_event_restart(event);
++ }
++ 
++ void perf_event_exec(void)
++ {
++ 	struct perf_event_context *ctx;
++ 	int ctxn;
++ 
++ 	rcu_read_lock();
++ 	for_each_task_context_nr(ctxn) {
++ 		ctx = current->perf_event_ctxp[ctxn];
++ 		if (!ctx)
++ 			continue;
++ 
++ 		perf_event_enable_on_exec(ctxn);
++ 
++ 		perf_iterate_ctx(ctx, perf_event_addr_filters_exec, NULL,
++ 				   true);
+++>>>>>>> aab5b71ef2b5 (perf/core: Rename the perf_event_aux*() APIs to perf_event_sb*(), to separate them from AUX ring-buffer records)
+  	}
+  	rcu_read_unlock();
+  }
+@@@ -6227,6 -6489,87 +6314,90 @@@ got_name
+  	kfree(buf);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Whether this @filter depends on a dynamic object which is not loaded
++  * yet or its load addresses are not known.
++  */
++ static bool perf_addr_filter_needs_mmap(struct perf_addr_filter *filter)
++ {
++ 	return filter->filter && filter->inode;
++ }
++ 
++ /*
++  * Check whether inode and address range match filter criteria.
++  */
++ static bool perf_addr_filter_match(struct perf_addr_filter *filter,
++ 				     struct file *file, unsigned long offset,
++ 				     unsigned long size)
++ {
++ 	if (filter->inode != file->f_inode)
++ 		return false;
++ 
++ 	if (filter->offset > offset + size)
++ 		return false;
++ 
++ 	if (filter->offset + filter->size < offset)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void __perf_addr_filters_adjust(struct perf_event *event, void *data)
++ {
++ 	struct perf_addr_filters_head *ifh = perf_event_addr_filters(event);
++ 	struct vm_area_struct *vma = data;
++ 	unsigned long off = vma->vm_pgoff << PAGE_SHIFT, flags;
++ 	struct file *file = vma->vm_file;
++ 	struct perf_addr_filter *filter;
++ 	unsigned int restart = 0, count = 0;
++ 
++ 	if (!has_addr_filter(event))
++ 		return;
++ 
++ 	if (!file)
++ 		return;
++ 
++ 	raw_spin_lock_irqsave(&ifh->lock, flags);
++ 	list_for_each_entry(filter, &ifh->list, entry) {
++ 		if (perf_addr_filter_match(filter, file, off,
++ 					     vma->vm_end - vma->vm_start)) {
++ 			event->addr_filters_offs[count] = vma->vm_start;
++ 			restart++;
++ 		}
++ 
++ 		count++;
++ 	}
++ 
++ 	if (restart)
++ 		event->addr_filters_gen++;
++ 	raw_spin_unlock_irqrestore(&ifh->lock, flags);
++ 
++ 	if (restart)
++ 		perf_event_restart(event);
++ }
++ 
++ /*
++  * Adjust all task's events' filters to the new vma
++  */
++ static void perf_addr_filters_adjust(struct vm_area_struct *vma)
++ {
++ 	struct perf_event_context *ctx;
++ 	int ctxn;
++ 
++ 	rcu_read_lock();
++ 	for_each_task_context_nr(ctxn) {
++ 		ctx = rcu_dereference(current->perf_event_ctxp[ctxn]);
++ 		if (!ctx)
++ 			continue;
++ 
++ 		perf_iterate_ctx(ctx, __perf_addr_filters_adjust, vma, true);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
+++>>>>>>> aab5b71ef2b5 (perf/core: Rename the perf_event_aux*() APIs to perf_event_sb*(), to separate them from AUX ring-buffer records)
+  void perf_event_mmap(struct vm_area_struct *vma)
+  {
+  	struct perf_mmap_event mmap_event;
+@@@ -7873,6 -8641,39 +8044,42 @@@ unlock
+  	return pmu;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void attach_sb_event(struct perf_event *event)
++ {
++ 	struct pmu_event_list *pel = per_cpu_ptr(&pmu_sb_events, event->cpu);
++ 
++ 	raw_spin_lock(&pel->lock);
++ 	list_add_rcu(&event->sb_list, &pel->list);
++ 	raw_spin_unlock(&pel->lock);
++ }
++ 
++ /*
++  * We keep a list of all !task (and therefore per-cpu) events
++  * that need to receive side-band records.
++  *
++  * This avoids having to scan all the various PMU per-cpu contexts
++  * looking for them.
++  */
++ static void account_pmu_sb_event(struct perf_event *event)
++ {
++ 	struct perf_event_attr *attr = &event->attr;
++ 
++ 	if (event->parent)
++ 		return;
++ 
++ 	if (event->attach_state & PERF_ATTACH_TASK)
++ 		return;
++ 
++ 	if (attr->mmap || attr->mmap_data || attr->mmap2 ||
++ 	    attr->comm || attr->comm_exec ||
++ 	    attr->task ||
++ 	    attr->context_switch)
++ 		attach_sb_event(event);
++ }
++ 
+++>>>>>>> aab5b71ef2b5 (perf/core: Rename the perf_event_aux*() APIs to perf_event_sb*(), to separate them from AUX ring-buffer records)
+  static void account_event_cpu(struct perf_event *event, int cpu)
+  {
+  	if (event->parent)
+* Unmerged path kernel/events/core.c
