@@ -1,0 +1,244 @@
+ibmvnic: Correct crq and resource releasing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 3748905599cbbb37bf90f818109151809de5241c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/37489055.failed
+
+We should not be releasing the crq's when calling close for the
+adapter, these need to remain open to facilitate operations such
+as updating the mac address. The crq's should be released in the
+adpaters remove routine.
+
+Additionally, we need to call release_reources from remove. This
+corrects the scenario of trying to remove an adapter that has only
+been probed.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3748905599cbbb37bf90f818109151809de5241c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index a3af32d0c439,a8b3c5741258..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -441,20 -498,168 +441,168 @@@ static int ibmvnic_open(struct net_devi
+  		tx_pool->consumer_index = 0;
+  		tx_pool->producer_index = 0;
+  	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void release_bounce_buffer(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct device *dev = &adapter->vdev->dev;
+ -
+ +	adapter->bounce_buffer_size =
+ +	    (netdev->mtu + ETH_HLEN - 1) / PAGE_SIZE + 1;
+ +	adapter->bounce_buffer = kmalloc(adapter->bounce_buffer_size,
+ +					 GFP_KERNEL);
+  	if (!adapter->bounce_buffer)
+ -		return;
+ +		goto bounce_alloc_failed;
+  
+ -	if (!dma_mapping_error(dev, adapter->bounce_buffer_dma)) {
+ -		dma_unmap_single(dev, adapter->bounce_buffer_dma,
+ -				 adapter->bounce_buffer_size,
+ -				 DMA_BIDIRECTIONAL);
+ -		adapter->bounce_buffer_dma = DMA_ERROR_CODE;
+ +	adapter->bounce_buffer_dma = dma_map_single(dev, adapter->bounce_buffer,
+ +						    adapter->bounce_buffer_size,
+ +						    DMA_TO_DEVICE);
+ +	if (dma_mapping_error(dev, adapter->bounce_buffer_dma)) {
+ +		dev_err(dev, "Couldn't map tx bounce buffer\n");
+ +		goto bounce_map_failed;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	kfree(adapter->bounce_buffer);
++ 	adapter->bounce_buffer = NULL;
++ }
++ 
++ static int init_bounce_buffer(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct device *dev = &adapter->vdev->dev;
++ 	char *buf;
++ 	int buf_sz;
++ 	dma_addr_t map_addr;
++ 
++ 	buf_sz = (netdev->mtu + ETH_HLEN - 1) / PAGE_SIZE + 1;
++ 	buf = kmalloc(adapter->bounce_buffer_size, GFP_KERNEL);
++ 	if (!buf)
++ 		return -1;
++ 
++ 	map_addr = dma_map_single(dev, buf, buf_sz, DMA_TO_DEVICE);
++ 	if (dma_mapping_error(dev, map_addr)) {
++ 		dev_err(dev, "Couldn't map bounce buffer\n");
++ 		kfree(buf);
++ 		return -1;
++ 	}
++ 
++ 	adapter->bounce_buffer = buf;
++ 	adapter->bounce_buffer_size = buf_sz;
++ 	adapter->bounce_buffer_dma = map_addr;
++ 	return 0;
++ }
++ 
++ static void release_error_buffers(struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	struct ibmvnic_error_buff *error_buff, *tmp;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&adapter->error_list_lock, flags);
++ 	list_for_each_entry_safe(error_buff, tmp, &adapter->errors, list) {
++ 		list_del(&error_buff->list);
++ 		dma_unmap_single(dev, error_buff->dma, error_buff->len,
++ 				 DMA_FROM_DEVICE);
++ 		kfree(error_buff->buff);
++ 		kfree(error_buff);
++ 	}
++ 	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
++ }
++ 
++ static int ibmvnic_login(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	struct device *dev = &adapter->vdev->dev;
++ 
++ 	do {
++ 		if (adapter->renegotiate) {
++ 			adapter->renegotiate = false;
++ 			release_sub_crqs(adapter);
++ 
++ 			reinit_completion(&adapter->init_done);
++ 			send_cap_queries(adapter);
++ 			if (!wait_for_completion_timeout(&adapter->init_done,
++ 							 timeout)) {
++ 				dev_err(dev, "Capabilities query timeout\n");
++ 				return -1;
++ 			}
++ 		}
++ 
++ 		reinit_completion(&adapter->init_done);
++ 		send_login(adapter);
++ 		if (!wait_for_completion_timeout(&adapter->init_done,
++ 						 timeout)) {
++ 			dev_err(dev, "Login timeout\n");
++ 			return -1;
++ 		}
++ 	} while (adapter->renegotiate);
++ 
++ 	return 0;
++ }
++ 
++ static void release_resources(struct ibmvnic_adapter *adapter)
++ {
++ 	release_bounce_buffer(adapter);
++ 	release_tx_pools(adapter);
++ 	release_rx_pools(adapter);
++ 
++ 	release_stats_token(adapter);
++ 	release_error_buffers(adapter);
++ }
++ 
++ static int ibmvnic_open(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct device *dev = &adapter->vdev->dev;
++ 	union ibmvnic_crq crq;
++ 	int rc = 0;
++ 	int i;
++ 
++ 	if (adapter->is_closed) {
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = ibmvnic_login(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = netif_set_real_num_tx_queues(netdev, adapter->req_tx_queues);
++ 	if (rc) {
++ 		dev_err(dev, "failed to set the number of tx queues\n");
++ 		return -1;
++ 	}
++ 
++ 	rc = init_sub_crq_irqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "failed to initialize sub crq irqs\n");
++ 		return -1;
++ 	}
++ 
++ 	adapter->map_id = 1;
++ 	adapter->napi = kcalloc(adapter->req_rx_queues,
++ 				sizeof(struct napi_struct), GFP_KERNEL);
++ 	if (!adapter->napi)
++ 		goto ibmvnic_open_fail;
++ 	for (i = 0; i < adapter->req_rx_queues; i++) {
++ 		netif_napi_add(netdev, &adapter->napi[i], ibmvnic_poll,
++ 			       NAPI_POLL_WEIGHT);
++ 		napi_enable(&adapter->napi[i]);
++ 	}
++ 
++ 	send_map_query(adapter);
++ 
++ 	rc = init_rx_pools(netdev);
++ 	if (rc)
++ 		goto ibmvnic_open_fail;
++ 
++ 	rc = init_tx_pools(netdev);
++ 	if (rc)
++ 		goto ibmvnic_open_fail;
++ 
++ 	rc = init_bounce_buffer(netdev);
++ 	if (rc)
++ 		goto ibmvnic_open_fail;
++ 
+++>>>>>>> 3748905599cb (ibmvnic: Correct crq and resource releasing)
+  	replenish_pools(adapter);
+  
+  	/* We're ready to receive frames, enable the sub-crq interrupts and
+@@@ -3889,23 -3301,9 +4037,29 @@@ static int ibmvnic_remove(struct vio_de
+  
+  	unregister_netdev(netdev);
+  
+++<<<<<<< HEAD
+ +	release_sub_crqs(adapter);
+ +
+ +	ibmvnic_release_crq_queue(adapter);
+ +
+ +	if (adapter->debugfs_dir && !IS_ERR(adapter->debugfs_dir))
+ +		debugfs_remove_recursive(adapter->debugfs_dir);
+ +
+ +	dma_unmap_single(&dev->dev, adapter->stats_token,
+ +			 sizeof(struct ibmvnic_statistics), DMA_FROM_DEVICE);
+ +
+ +	if (adapter->ras_comps)
+ +		dma_free_coherent(&dev->dev,
+ +				  adapter->ras_comp_num *
+ +				  sizeof(struct ibmvnic_fw_component),
+ +				  adapter->ras_comps, adapter->ras_comps_tok);
+ +
+ +	kfree(adapter->ras_comp_int);
+++=======
++ 	release_resources(adapter);
++ 	release_sub_crqs(adapter);
++ 	release_crq_queue(adapter);
+++>>>>>>> 3748905599cb (ibmvnic: Correct crq and resource releasing)
+  
+  	free_netdev(netdev);
+  	dev_set_drvdata(&dev->dev, NULL);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
