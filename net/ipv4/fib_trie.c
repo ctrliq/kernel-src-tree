@@ -1698,8 +1698,7 @@ int fib_table_flush(struct net *net, struct fib_table *tb)
 }
 
 static void fib_leaf_notify(struct net *net, struct key_vector *l,
-			    struct fib_table *tb, struct notifier_block *nb,
-			    enum fib_event_type event_type)
+			    struct fib_table *tb, struct notifier_block *nb)
 {
 	struct fib_alias *fa;
 
@@ -1722,22 +1721,21 @@ static void fib_leaf_notify(struct net *net, struct key_vector *l,
 			continue;
 #endif
 
-		call_fib_entry_notifier(nb, net, event_type, l->key,
+		call_fib_entry_notifier(nb, net, FIB_EVENT_ENTRY_ADD, l->key,
 					KEYLENGTH - fa->fa_slen, fi, fa->fa_tos,
 					fa->fa_type, tb->tb_id);
 	}
 }
 
 static void fib_table_notify(struct net *net, struct fib_table *tb,
-			     struct notifier_block *nb,
-			     enum fib_event_type event_type)
+			     struct notifier_block *nb)
 {
 	struct trie *t = (struct trie *)tb->tb_data;
 	struct key_vector *l, *tp = t->kv;
 	t_key key = 0;
 
 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
-		fib_leaf_notify(net, l, tb, nb, event_type);
+		fib_leaf_notify(net, l, tb, nb);
 
 		key = l->key + 1;
 		/* stop in case of wrap around */
@@ -1746,8 +1744,7 @@ static void fib_table_notify(struct net *net, struct fib_table *tb,
 	}
 }
 
-void fib_notify(struct net *net, struct notifier_block *nb,
-		enum fib_event_type event_type)
+void fib_notify(struct net *net, struct notifier_block *nb)
 {
 	unsigned int h;
 
@@ -1756,7 +1753,7 @@ void fib_notify(struct net *net, struct notifier_block *nb,
 		struct fib_table *tb;
 
 		hlist_for_each_entry_rcu(tb, head, tb_hlist)
-			fib_table_notify(net, tb, nb, event_type);
+			fib_table_notify(net, tb, nb);
 	}
 }
 
