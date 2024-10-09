@@ -1,0 +1,735 @@
+net: Remove usage of net_device last_rx member
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] Remove usage of net_device last_rx member (Ivan Vecera) [1476348]
+Rebuild_FUZZ: 94.25%
+commit-author Tobias Klauser <tklauser@distanz.ch>
+commit 4a7c972644c1151f6dd34ff4b5f7eacb239e22ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4a7c9726.failed
+
+The network stack no longer uses the last_rx member of struct net_device
+since the bonding driver switched to use its own private last_rx in
+commit 9f242738376d ("bonding: use last_arp_rx in slave_last_rx()").
+
+However, some drivers still (ab)use the field for their own purposes and
+some driver just update it without actually using it.
+
+Previously, there was an accompanying comment for the last_rx member
+added in commit 4dc89133f49b ("net: add a comment on netdev->last_rx")
+which asked drivers not to update is, unless really needed. However,
+this commend was removed in commit f8ff080dacec ("bonding: remove
+useless updating of slave->dev->last_rx"), so some drivers added later
+on still did update last_rx.
+
+Remove all usage of last_rx and switch three drivers (sky2, atp and
+smc91c92_cs) which actually read and write it to use their own private
+copy in netdev_priv.
+
+Compile-tested with allyesconfig and allmodconfig on x86 and arm.
+
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: Jay Vosburgh <j.vosburgh@gmail.com>
+	Cc: Veaceslav Falico <vfalico@gmail.com>
+	Cc: Andy Gospodarek <andy@greyhouse.net>
+	Cc: Mirko Lindner <mlindner@marvell.com>
+	Cc: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: Tobias Klauser <tklauser@distanz.ch>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Jay Vosburgh <jay.vosburgh@canonical.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4a7c972644c1151f6dd34ff4b5f7eacb239e22ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/liquidio/lio_main.c
+#	drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+#	drivers/net/ethernet/hisilicon/hns/hns_enet.c
+#	drivers/net/ethernet/qualcomm/emac/emac-mac.c
+#	drivers/staging/ks7010/ks_hostif.c
+#	drivers/staging/wlan-ng/p80211netdev.c
+#	include/linux/netdevice.h
+#	net/batman-adv/distributed-arp-table.c
+diff --cc drivers/staging/wlan-ng/p80211netdev.c
+index f4c7a828814c,53dbbd69e552..000000000000
+--- a/drivers/staging/wlan-ng/p80211netdev.c
++++ b/drivers/staging/wlan-ng/p80211netdev.c
+@@@ -243,26 -219,59 +243,77 @@@ void p80211netdev_rx(wlandevice_t *wlan
+  	tasklet_schedule(&wlandev->rx_bh);
+  }
+  
+++<<<<<<< HEAD
+ +/*----------------------------------------------------------------
+ +* p80211netdev_rx_bh
+ +*
+ +* Deferred processing of all received frames.
+ +*
+ +* Arguments:
+ +*	wlandev		WLAN network device structure
+ +*	skb		skbuff containing a full 802.11 frame.
+ +* Returns:
+ +*	nothing
+ +* Side effects:
+ +*
+ +----------------------------------------------------------------*/
+++=======
++ #define CONV_TO_ETHER_SKIPPED	0x01
++ #define CONV_TO_ETHER_FAILED	0x02
++ 
++ /**
++  * p80211_convert_to_ether - conversion from 802.11 frame to ethernet frame
++  * @wlandev: pointer to WLAN device
++  * @skb: pointer to socket buffer
++  *
++  * Returns: 0 if conversion succeeded
++  *	    CONV_TO_ETHER_FAILED if conversion failed
++  *	    CONV_TO_ETHER_SKIPPED if frame is ignored
++  */
++ static int p80211_convert_to_ether(struct wlandevice *wlandev,
++ 				   struct sk_buff *skb)
++ {
++ 	struct p80211_hdr_a3 *hdr;
++ 
++ 	hdr = (struct p80211_hdr_a3 *)skb->data;
++ 	if (p80211_rx_typedrop(wlandev, hdr->fc))
++ 		return CONV_TO_ETHER_SKIPPED;
++ 
++ 	/* perform mcast filtering: allow my local address through but reject
++ 	 * anything else that isn't multicast
++ 	 */
++ 	if (wlandev->netdev->flags & IFF_ALLMULTI) {
++ 		if (!ether_addr_equal_unaligned(wlandev->netdev->dev_addr,
++ 						hdr->a1)) {
++ 			if (!is_multicast_ether_addr(hdr->a1))
++ 				return CONV_TO_ETHER_SKIPPED;
++ 		}
++ 	}
++ 
++ 	if (skb_p80211_to_ether(wlandev, wlandev->ethconv, skb) == 0) {
++ 		wlandev->netdev->stats.rx_packets++;
++ 		wlandev->netdev->stats.rx_bytes += skb->len;
++ 		netif_rx_ni(skb);
++ 		return 0;
++ 	}
++ 
++ 	netdev_dbg(wlandev->netdev, "p80211_convert_to_ether failed.\n");
++ 	return CONV_TO_ETHER_FAILED;
++ }
++ 
++ /**
++  * p80211netdev_rx_bh - deferred processing of all received frames
++  *
++  * @arg: pointer to WLAN network device structure (cast to unsigned long)
++  */
+++>>>>>>> 4a7c972644c1 (net: Remove usage of net_device last_rx member)
+  static void p80211netdev_rx_bh(unsigned long arg)
+  {
+ -	struct wlandevice *wlandev = (struct wlandevice *)arg;
+ +	wlandevice_t *wlandev = (wlandevice_t *) arg;
+  	struct sk_buff *skb = NULL;
+ -	struct net_device *dev = wlandev->netdev;
+ +	netdevice_t *dev = wlandev->netdev;
+ +	struct p80211_hdr_a3 *hdr;
+ +	u16 fc;
+  
+  	/* Let's empty our our queue */
+  	while ((skb = skb_dequeue(&wlandev->nsd_rxq))) {
+@@@ -278,10 -286,9 +329,9 @@@
+  				skb->ip_summed = CHECKSUM_NONE;
+  				skb->pkt_type = PACKET_OTHERHOST;
+  				skb->protocol = htons(ETH_P_80211_RAW);
+- 				dev->last_rx = jiffies;
+  
+ -				dev->stats.rx_packets++;
+ -				dev->stats.rx_bytes += skb->len;
+ +				wlandev->linux_stats.rx_packets++;
+ +				wlandev->linux_stats.rx_bytes += skb->len;
+  				netif_rx_ni(skb);
+  				continue;
+  			} else {
+diff --cc include/linux/netdevice.h
+index f2e995a93118,3868c32d98af..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1524,11 -1428,208 +1524,216 @@@ enum netdev_priv_flags 
+  #define IFF_RXFH_CONFIGURED		IFF_RXFH_CONFIGURED
+  #define IFF_MACSEC			IFF_MACSEC
+  
+++<<<<<<< HEAD
+ +/*
+ + *	The DEVICE structure.
+ + *	Actually, this whole structure is a big mistake.  It mixes I/O
+ + *	data with strictly "high-level" data, and it has to know about
+ + *	almost every data structure used in the INET module.
+++=======
++ /**
++  *	struct net_device - The DEVICE structure.
++  *		Actually, this whole structure is a big mistake.  It mixes I/O
++  *		data with strictly "high-level" data, and it has to know about
++  *		almost every data structure used in the INET module.
++  *
++  *	@name:	This is the first field of the "visible" part of this structure
++  *		(i.e. as seen by users in the "Space.c" file).  It is the name
++  *	 	of the interface.
++  *
++  *	@name_hlist: 	Device name hash chain, please keep it close to name[]
++  *	@ifalias:	SNMP alias
++  *	@mem_end:	Shared memory end
++  *	@mem_start:	Shared memory start
++  *	@base_addr:	Device I/O address
++  *	@irq:		Device IRQ number
++  *
++  *	@carrier_changes:	Stats to monitor carrier on<->off transitions
++  *
++  *	@state:		Generic network queuing layer state, see netdev_state_t
++  *	@dev_list:	The global list of network devices
++  *	@napi_list:	List entry used for polling NAPI devices
++  *	@unreg_list:	List entry  when we are unregistering the
++  *			device; see the function unregister_netdev
++  *	@close_list:	List entry used when we are closing the device
++  *	@ptype_all:     Device-specific packet handlers for all protocols
++  *	@ptype_specific: Device-specific, protocol-specific packet handlers
++  *
++  *	@adj_list:	Directly linked devices, like slaves for bonding
++  *	@features:	Currently active device features
++  *	@hw_features:	User-changeable features
++  *
++  *	@wanted_features:	User-requested features
++  *	@vlan_features:		Mask of features inheritable by VLAN devices
++  *
++  *	@hw_enc_features:	Mask of features inherited by encapsulating devices
++  *				This field indicates what encapsulation
++  *				offloads the hardware is capable of doing,
++  *				and drivers will need to set them appropriately.
++  *
++  *	@mpls_features:	Mask of features inheritable by MPLS
++  *
++  *	@ifindex:	interface index
++  *	@group:		The group the device belongs to
++  *
++  *	@stats:		Statistics struct, which was left as a legacy, use
++  *			rtnl_link_stats64 instead
++  *
++  *	@rx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@tx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@rx_nohandler:	nohandler dropped packets by core network on
++  *			inactive devices, do not use this in drivers
++  *
++  *	@wireless_handlers:	List of functions to handle Wireless Extensions,
++  *				instead of ioctl,
++  *				see <net/iw_handler.h> for details.
++  *	@wireless_data:	Instance data managed by the core of wireless extensions
++  *
++  *	@netdev_ops:	Includes several pointers to callbacks,
++  *			if one wants to override the ndo_*() functions
++  *	@ethtool_ops:	Management operations
++  *	@ndisc_ops:	Includes callbacks for different IPv6 neighbour
++  *			discovery handling. Necessary for e.g. 6LoWPAN.
++  *	@header_ops:	Includes callbacks for creating,parsing,caching,etc
++  *			of Layer 2 headers.
++  *
++  *	@flags:		Interface flags (a la BSD)
++  *	@priv_flags:	Like 'flags' but invisible to userspace,
++  *			see if.h for the definitions
++  *	@gflags:	Global flags ( kept as legacy )
++  *	@padded:	How much padding added by alloc_netdev()
++  *	@operstate:	RFC2863 operstate
++  *	@link_mode:	Mapping policy to operstate
++  *	@if_port:	Selectable AUI, TP, ...
++  *	@dma:		DMA channel
++  *	@mtu:		Interface MTU value
++  *	@min_mtu:	Interface Minimum MTU value
++  *	@max_mtu:	Interface Maximum MTU value
++  *	@type:		Interface hardware type
++  *	@hard_header_len: Maximum hardware header length.
++  *
++  *	@needed_headroom: Extra headroom the hardware may need, but not in all
++  *			  cases can this be guaranteed
++  *	@needed_tailroom: Extra tailroom the hardware may need, but not in all
++  *			  cases can this be guaranteed. Some cases also use
++  *			  LL_MAX_HEADER instead to allocate the skb
++  *
++  *	interface address info:
++  *
++  * 	@perm_addr:		Permanent hw address
++  * 	@addr_assign_type:	Hw address assignment type
++  * 	@addr_len:		Hardware address length
++  *	@neigh_priv_len:	Used in neigh_alloc()
++  * 	@dev_id:		Used to differentiate devices that share
++  * 				the same link layer address
++  * 	@dev_port:		Used to differentiate devices that share
++  * 				the same function
++  *	@addr_list_lock:	XXX: need comments on this one
++  *	@uc_promisc:		Counter that indicates promiscuous mode
++  *				has been enabled due to the need to listen to
++  *				additional unicast addresses in a device that
++  *				does not implement ndo_set_rx_mode()
++  *	@uc:			unicast mac addresses
++  *	@mc:			multicast mac addresses
++  *	@dev_addrs:		list of device hw addresses
++  *	@queues_kset:		Group of all Kobjects in the Tx and RX queues
++  *	@promiscuity:		Number of times the NIC is told to work in
++  *				promiscuous mode; if it becomes 0 the NIC will
++  *				exit promiscuous mode
++  *	@allmulti:		Counter, enables or disables allmulticast mode
++  *
++  *	@vlan_info:	VLAN info
++  *	@dsa_ptr:	dsa specific data
++  *	@tipc_ptr:	TIPC specific data
++  *	@atalk_ptr:	AppleTalk link
++  *	@ip_ptr:	IPv4 specific data
++  *	@dn_ptr:	DECnet specific data
++  *	@ip6_ptr:	IPv6 specific data
++  *	@ax25_ptr:	AX.25 specific data
++  *	@ieee80211_ptr:	IEEE 802.11 specific data, assign before registering
++  *
++  *	@dev_addr:	Hw address (before bcast,
++  *			because most packets are unicast)
++  *
++  *	@_rx:			Array of RX queues
++  *	@num_rx_queues:		Number of RX queues
++  *				allocated at register_netdev() time
++  *	@real_num_rx_queues: 	Number of RX queues currently active in device
++  *
++  *	@rx_handler:		handler for received packets
++  *	@rx_handler_data: 	XXX: need comments on this one
++  *	@ingress_queue:		XXX: need comments on this one
++  *	@broadcast:		hw bcast address
++  *
++  *	@rx_cpu_rmap:	CPU reverse-mapping for RX completion interrupts,
++  *			indexed by RX queue number. Assigned by driver.
++  *			This must only be set if the ndo_rx_flow_steer
++  *			operation is defined
++  *	@index_hlist:		Device index hash chain
++  *
++  *	@_tx:			Array of TX queues
++  *	@num_tx_queues:		Number of TX queues allocated at alloc_netdev_mq() time
++  *	@real_num_tx_queues: 	Number of TX queues currently active in device
++  *	@qdisc:			Root qdisc from userspace point of view
++  *	@tx_queue_len:		Max frames per queue allowed
++  *	@tx_global_lock: 	XXX: need comments on this one
++  *
++  *	@xps_maps:	XXX: need comments on this one
++  *
++  *	@watchdog_timeo:	Represents the timeout that is used by
++  *				the watchdog (see dev_watchdog())
++  *	@watchdog_timer:	List of timers
++  *
++  *	@pcpu_refcnt:		Number of references to this device
++  *	@todo_list:		Delayed register/unregister
++  *	@link_watch_list:	XXX: need comments on this one
++  *
++  *	@reg_state:		Register/unregister state machine
++  *	@dismantle:		Device is going to be freed
++  *	@rtnl_link_state:	This enum represents the phases of creating
++  *				a new link
++  *
++  *	@destructor:		Called from unregister,
++  *				can be used to call free_netdev
++  *	@npinfo:		XXX: need comments on this one
++  * 	@nd_net:		Network namespace this network device is inside
++  *
++  * 	@ml_priv:	Mid-layer private
++  * 	@lstats:	Loopback statistics
++  * 	@tstats:	Tunnel statistics
++  * 	@dstats:	Dummy statistics
++  * 	@vstats:	Virtual ethernet statistics
++  *
++  *	@garp_port:	GARP
++  *	@mrp_port:	MRP
++  *
++  *	@dev:		Class/net/name entry
++  *	@sysfs_groups:	Space for optional device, statistics and wireless
++  *			sysfs groups
++  *
++  *	@sysfs_rx_queue_group:	Space for optional per-rx queue attributes
++  *	@rtnl_link_ops:	Rtnl_link_ops
++  *
++  *	@gso_max_size:	Maximum size of generic segmentation offload
++  *	@gso_max_segs:	Maximum number of segments that can be passed to the
++  *			NIC for GSO
++  *
++  *	@dcbnl_ops:	Data Center Bridging netlink ops
++  *	@num_tc:	Number of traffic classes in the net device
++  *	@tc_to_txq:	XXX: need comments on this one
++  *	@prio_tc_map:	XXX: need comments on this one
++  *
++  *	@fcoe_ddp_xid:	Max exchange id for FCoE LRO by ddp
++  *
++  *	@priomap:	XXX: need comments on this one
++  *	@phydev:	Physical device may attach itself
++  *			for hardware timestamping
++  *
++  *	@qdisc_tx_busylock: lockdep class annotating Qdisc->busylock spinlock
++  *	@qdisc_running_key: lockdep class annotating Qdisc->running seqcount
+++>>>>>>> 4a7c972644c1 (net: Remove usage of net_device last_rx member)
+   *
+   *	@proto_down:	protocol port state information can be sent to the
+   *			switch driver and used to set the phys state of the
+@@@ -1687,25 -1776,17 +1892,28 @@@ struct net_device 
+  /*
+   * Cache lines mostly used on receive path (including eth_type_trans())
+   */
+++<<<<<<< HEAD
+ +	unsigned long		last_rx;	/* Time of last Rx */
+ +
+++=======
+++>>>>>>> 4a7c972644c1 (net: Remove usage of net_device last_rx member)
+  	/* Interface address info used in eth_type_trans() */
+ -	unsigned char		*dev_addr;
+ +	unsigned char		*dev_addr;	/* hw address, (before bcast
+ +						   because most packets are
+ +						   unicast) */
+  
+ -#ifdef CONFIG_SYSFS
+ +
+ +#ifdef CONFIG_RPS
+  	struct netdev_rx_queue	*_rx;
+  
+ +	/* Number of RX queues allocated at register_netdev() time */
+  	unsigned int		num_rx_queues;
+ +
+ +	/* Number of RX queues currently active in device */
+  	unsigned int		real_num_rx_queues;
+ +
+  #endif
+  
+ -	unsigned long		gro_flush_timeout;
+  	rx_handler_func_t __rcu	*rx_handler;
+  	void __rcu		*rx_handler_data;
+  
+diff --cc net/batman-adv/distributed-arp-table.c
+index 239992021b1d,6394206bfcae..000000000000
+--- a/net/batman-adv/distributed-arp-table.c
++++ b/net/batman-adv/distributed-arp-table.c
+@@@ -860,8 -1049,7 +860,12 @@@ bool batadv_dat_snoop_outgoing_arp_requ
+  		skb_new->protocol = eth_type_trans(skb_new,
+  						   bat_priv->soft_iface);
+  		bat_priv->stats.rx_packets++;
+++<<<<<<< HEAD
+ +		bat_priv->stats.rx_bytes += skb->len + ETH_HLEN;
+ +		bat_priv->soft_iface->last_rx = jiffies;
+++=======
++ 		bat_priv->stats.rx_bytes += skb->len + ETH_HLEN + hdr_size;
+++>>>>>>> 4a7c972644c1 (net: Remove usage of net_device last_rx member)
+  
+  		netif_rx(skb_new);
+  		batadv_dbg(BATADV_DBG_DAT, bat_priv, "ARP request replied locally\n");
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_main.c
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns/hns_enet.c
+* Unmerged path drivers/net/ethernet/qualcomm/emac/emac-mac.c
+* Unmerged path drivers/staging/ks7010/ks_hostif.c
+diff --git a/arch/m68k/emu/nfeth.c b/arch/m68k/emu/nfeth.c
+index 695cd737a42e..495c1c4bc56b 100644
+--- a/arch/m68k/emu/nfeth.c
++++ b/arch/m68k/emu/nfeth.c
+@@ -124,7 +124,6 @@ static inline void recv_packet(struct net_device *dev)
+ 
+ 	skb->protocol = eth_type_trans(skb, dev);
+ 	netif_rx(skb);
+-	dev->last_rx = jiffies;
+ 	dev->stats.rx_packets++;
+ 	dev->stats.rx_bytes += pktlen;
+ 
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_main.c
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns/hns_enet.c
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index f7604e894ff1..a2f790824cb4 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -241,9 +241,9 @@ static void e1000e_dump(struct e1000_adapter *adapter)
+ 	/* Print netdevice Info */
+ 	if (netdev) {
+ 		dev_info(&adapter->pdev->dev, "Net device Info\n");
+-		pr_info("Device Name     state            trans_start      last_rx\n");
+-		pr_info("%-15s %016lX %016lX %016lX\n", netdev->name,
+-			netdev->state, dev_trans_start(netdev), netdev->last_rx);
++		pr_info("Device Name     state            trans_start\n");
++		pr_info("%-15s %016lX %016lX\n", netdev->name,
++			netdev->state, dev_trans_start(netdev));
+ 	}
+ 
+ 	/* Print Registers */
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index b3c4c956fa51..34a3d91f5681 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -383,9 +383,9 @@ static void igb_dump(struct igb_adapter *adapter)
+ 	/* Print netdevice Info */
+ 	if (netdev) {
+ 		dev_info(&adapter->pdev->dev, "Net device Info\n");
+-		pr_info("Device Name     state            trans_start      last_rx\n");
+-		pr_info("%-15s %016lX %016lX %016lX\n", netdev->name,
+-			netdev->state, dev_trans_start(netdev), netdev->last_rx);
++		pr_info("Device Name     state            trans_start\n");
++		pr_info("%-15s %016lX %016lX\n", netdev->name,
++			netdev->state, dev_trans_start(netdev));
+ 	}
+ 
+ 	/* Print Registers */
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 0afaf44ddea2..2cb85273549d 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -609,12 +609,11 @@ static void ixgbe_dump(struct ixgbe_adapter *adapter)
+ 	if (netdev) {
+ 		dev_info(&adapter->pdev->dev, "Net device Info\n");
+ 		pr_info("Device Name     state            "
+-			"trans_start      last_rx\n");
+-		pr_info("%-15s %016lX %016lX %016lX\n",
++			"trans_start\n");
++		pr_info("%-15s %016lX %016lX\n",
+ 			netdev->name,
+ 			netdev->state,
+-			dev_trans_start(netdev),
+-			netdev->last_rx);
++			dev_trans_start(netdev));
+ 	}
+ 
+ 	/* Print Registers */
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index e43efefa8acd..b22590e27846 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -2677,7 +2677,7 @@ static inline void sky2_rx_done(struct sky2_hw *hw, unsigned port,
+ 	sky2->rx_stats.bytes += bytes;
+ 	u64_stats_update_end(&sky2->rx_stats.syncp);
+ 
+-	dev->last_rx = jiffies;
++	sky2->last_rx = jiffies;
+ 	sky2_rx_update(netdev_priv(dev), rxqaddr[port]);
+ }
+ 
+@@ -2961,7 +2961,7 @@ static int sky2_rx_hung(struct net_device *dev)
+ 	u8 fifo_lev = sky2_read8(hw, Q_ADDR(rxq, Q_RL));
+ 
+ 	/* If idle and MAC or PCI is stuck */
+-	if (sky2->check.last == dev->last_rx &&
++	if (sky2->check.last == sky2->last_rx &&
+ 	    ((mac_rp == sky2->check.mac_rp &&
+ 	      mac_lev != 0 && mac_lev >= sky2->check.mac_lev) ||
+ 	     /* Check if the PCI RX hang */
+@@ -2973,7 +2973,7 @@ static int sky2_rx_hung(struct net_device *dev)
+ 			      fifo_rp, sky2_read8(hw, Q_ADDR(rxq, Q_WP)));
+ 		return 1;
+ 	} else {
+-		sky2->check.last = dev->last_rx;
++		sky2->check.last = sky2->last_rx;
+ 		sky2->check.mac_rp = mac_rp;
+ 		sky2->check.mac_lev = mac_lev;
+ 		sky2->check.fifo_rp = fifo_rp;
+diff --git a/drivers/net/ethernet/marvell/sky2.h b/drivers/net/ethernet/marvell/sky2.h
+index ec6dcd80152b..0fe160796842 100644
+--- a/drivers/net/ethernet/marvell/sky2.h
++++ b/drivers/net/ethernet/marvell/sky2.h
+@@ -2247,6 +2247,7 @@ struct sky2_port {
+ 	u16		     rx_data_size;
+ 	u16		     rx_nfrags;
+ 
++	unsigned long	     last_rx;
+ 	struct {
+ 		unsigned long last;
+ 		u32	mac_rp;
+* Unmerged path drivers/net/ethernet/qualcomm/emac/emac-mac.c
+diff --git a/drivers/net/ethernet/realtek/atp.c b/drivers/net/ethernet/realtek/atp.c
+index 5cb96785fb63..ff14ed7a08ef 100644
+--- a/drivers/net/ethernet/realtek/atp.c
++++ b/drivers/net/ethernet/realtek/atp.c
+@@ -170,7 +170,7 @@ struct net_local {
+     spinlock_t lock;
+     struct net_device *next_module;
+     struct timer_list timer;	/* Media selection timer. */
+-    long last_rx_time;		/* Last Rx, in jiffies, to handle Rx hang. */
++    unsigned long last_rx_time;	/* Last Rx, in jiffies, to handle Rx hang. */
+     int saved_tx_size;
+     unsigned int tx_unit_busy:1;
+     unsigned char re_tx,	/* Number of packet retransmissions. */
+@@ -669,11 +669,11 @@ static irqreturn_t atp_interrupt(int irq, void *dev_instance)
+ 			}
+ 			num_tx_since_rx++;
+ 		} else if (num_tx_since_rx > 8 &&
+-			   time_after(jiffies, dev->last_rx + HZ)) {
++			   time_after(jiffies, lp->last_rx_time + HZ)) {
+ 			if (net_debug > 2)
+ 				printk(KERN_DEBUG "%s: Missed packet? No Rx after %d Tx and "
+ 					   "%ld jiffies status %02x  CMR1 %02x.\n", dev->name,
+-					   num_tx_since_rx, jiffies - dev->last_rx, status,
++					   num_tx_since_rx, jiffies - lp->last_rx_time, status,
+ 					   (read_nibble(ioaddr, CMR1) >> 3) & 15);
+ 			dev->stats.rx_missed_errors++;
+ 			hardware_init(dev);
+@@ -790,7 +790,6 @@ static void net_rx(struct net_device *dev)
+ 		read_block(ioaddr, pkt_len, skb_put(skb,pkt_len), dev->if_port);
+ 		skb->protocol = eth_type_trans(skb, dev);
+ 		netif_rx(skb);
+-		dev->last_rx = jiffies;
+ 		dev->stats.rx_packets++;
+ 		dev->stats.rx_bytes += pkt_len;
+ 	}
+diff --git a/drivers/net/ethernet/smsc/smc91c92_cs.c b/drivers/net/ethernet/smsc/smc91c92_cs.c
+index 320366689630..a273cfefaf38 100644
+--- a/drivers/net/ethernet/smsc/smc91c92_cs.c
++++ b/drivers/net/ethernet/smsc/smc91c92_cs.c
+@@ -114,6 +114,7 @@ struct smc_private {
+     struct mii_if_info		mii_if;
+     int				duplex;
+     int				rx_ovrn;
++    unsigned long		last_rx;
+ };
+ 
+ /* Special definitions for Megahertz multifunction cards */
+@@ -1497,6 +1498,7 @@ static void smc_rx(struct net_device *dev)
+     if (!(rx_status & RS_ERRORS)) {		
+ 	/* do stuff to make a new packet */
+ 	struct sk_buff *skb;
++	struct smc_private *smc = netdev_priv(dev);
+ 	
+ 	/* Note: packet_length adds 5 or 6 extra bytes here! */
+ 	skb = netdev_alloc_skb(dev, packet_length+2);
+@@ -1515,7 +1517,7 @@ static void smc_rx(struct net_device *dev)
+ 	skb->protocol = eth_type_trans(skb, dev);
+ 	
+ 	netif_rx(skb);
+-	dev->last_rx = jiffies;
++	smc->last_rx = jiffies;
+ 	dev->stats.rx_packets++;
+ 	dev->stats.rx_bytes += packet_length;
+ 	if (rx_status & RS_MULTICAST)
+@@ -1796,7 +1798,7 @@ static void media_check(u_long arg)
+     }
+ 
+     /* Ignore collisions unless we've had no rx's recently */
+-    if (time_after(jiffies, dev->last_rx + HZ)) {
++    if (time_after(jiffies, smc->last_rx + HZ)) {
+ 	if (smc->tx_err || (smc->media_status & EPH_16COL))
+ 	    media |= EPH_16COL;
+     }
+diff --git a/drivers/net/irda/bfin_sir.c b/drivers/net/irda/bfin_sir.c
+index fca4bb2fa1fa..44d1ca18caff 100644
+--- a/drivers/net/irda/bfin_sir.c
++++ b/drivers/net/irda/bfin_sir.c
+@@ -22,7 +22,7 @@ static int max_rate = 57600;
+ static int max_rate = 115200;
+ #endif
+ 
+-static void turnaround_delay(unsigned long last_jif, int mtt)
++static void turnaround_delay(int mtt)
+ {
+ 	long ticks;
+ 
+@@ -209,7 +209,6 @@ static void bfin_sir_rx_chars(struct net_device *dev)
+ 	UART_CLEAR_LSR(port);
+ 	ch = UART_GET_CHAR(port);
+ 	async_unwrap_char(dev, &self->stats, &self->rx_buff, ch);
+-	dev->last_rx = jiffies;
+ }
+ 
+ static irqreturn_t bfin_sir_rx_int(int irq, void *dev_id)
+@@ -510,7 +509,7 @@ static void bfin_sir_send_work(struct work_struct *work)
+ 	int tx_cnt = 10;
+ 
+ 	while (bfin_sir_is_receiving(dev) && --tx_cnt)
+-		turnaround_delay(dev->last_rx, self->mtt);
++		turnaround_delay(self->mtt);
+ 
+ 	bfin_sir_stop_rx(port);
+ 
+diff --git a/drivers/net/irda/sh_sir.c b/drivers/net/irda/sh_sir.c
+index 24aefcd84065..86341e04bc06 100644
+--- a/drivers/net/irda/sh_sir.c
++++ b/drivers/net/irda/sh_sir.c
+@@ -551,7 +551,6 @@ static void sh_sir_rx(struct sh_sir_self *self)
+ 
+ 		async_unwrap_char(self->ndev, &self->ndev->stats,
+ 				  &self->rx_buff, (u8)data);
+-		self->ndev->last_rx = jiffies;
+ 
+ 		if (EOFD & sh_sir_read(self, IRIF_SIR_FRM))
+ 			continue;
+* Unmerged path drivers/staging/ks7010/ks_hostif.c
+diff --git a/drivers/staging/netlogic/xlr_net.c b/drivers/staging/netlogic/xlr_net.c
+index 15df90d3dfaa..6dae9a492cfe 100644
+--- a/drivers/staging/netlogic/xlr_net.c
++++ b/drivers/staging/netlogic/xlr_net.c
+@@ -176,7 +176,6 @@ static void xlr_net_fmn_handler(int bkt, int src_stnid, int size,
+ 		skb_reserve(skb, BYTE_OFFSET);
+ 		skb_put(skb, length);
+ 		skb->protocol = eth_type_trans(skb, skb->dev);
+-		skb->dev->last_rx = jiffies;
+ 		netif_rx(skb);
+ 		/* Fill rx ring */
+ 		skb_new = xlr_alloc_skb();
+diff --git a/drivers/staging/rtl8192e/rtllib_rx.c b/drivers/staging/rtl8192e/rtllib_rx.c
+index 8b8a5c661a26..a8425d885efb 100644
+--- a/drivers/staging/rtl8192e/rtllib_rx.c
++++ b/drivers/staging/rtl8192e/rtllib_rx.c
+@@ -1311,7 +1311,6 @@ static int rtllib_rx_InfraAdhoc(struct rtllib_device *ieee, struct sk_buff *skb,
+ 		ieee->LinkDetectInfo.NumRecvDataInPeriod++;
+ 		ieee->LinkDetectInfo.NumRxOkInPeriod++;
+ 	}
+-	dev->last_rx = jiffies;
+ 
+ 	/* Data frame - extract src/dst addresses */
+ 	rtllib_rx_extract_addr(ieee, hdr, dst, src, bssid);
+diff --git a/drivers/staging/rtl8192u/ieee80211/ieee80211_rx.c b/drivers/staging/rtl8192u/ieee80211/ieee80211_rx.c
+index ee7ce5fca462..efcaf2007a93 100644
+--- a/drivers/staging/rtl8192u/ieee80211/ieee80211_rx.c
++++ b/drivers/staging/rtl8192u/ieee80211/ieee80211_rx.c
+@@ -1114,11 +1114,7 @@ int ieee80211_rx(struct ieee80211_device *ieee, struct sk_buff *skb,
+ 		stats = hostap_get_stats(dev);
+ 		from_assoc_ap = 1;
+ 	}
+-#endif
+-
+-	dev->last_rx = jiffies;
+ 
+-#ifdef NOT_YET
+ 	if ((ieee->iw_mode == IW_MODE_MASTER ||
+ 	     ieee->iw_mode == IW_MODE_REPEAT) &&
+ 	    !from_assoc_ap) {
+diff --git a/drivers/staging/wlan-ng/hfa384x_usb.c b/drivers/staging/wlan-ng/hfa384x_usb.c
+index c1a8cb625154..df2956f2ba5a 100644
+--- a/drivers/staging/wlan-ng/hfa384x_usb.c
++++ b/drivers/staging/wlan-ng/hfa384x_usb.c
+@@ -3501,7 +3501,6 @@ static void hfa384x_usbin_rx(wlandevice_t *wlandev, struct sk_buff *skb)
+ 			&usbin->rxfrm.desc.frame_control, hdrlen);
+ 
+ 		skb->dev = wlandev->netdev;
+-		skb->dev->last_rx = jiffies;
+ 
+ 		/* And set the frame length properly */
+ 		skb_trim(skb, data_len + hdrlen);
+* Unmerged path drivers/staging/wlan-ng/p80211netdev.c
+* Unmerged path include/linux/netdevice.h
+diff --git a/net/batman-adv/bridge_loop_avoidance.c b/net/batman-adv/bridge_loop_avoidance.c
+index de27b3175cfd..c08de87e6487 100644
+--- a/net/batman-adv/bridge_loop_avoidance.c
++++ b/net/batman-adv/bridge_loop_avoidance.c
+@@ -348,7 +348,6 @@ static void batadv_bla_send_claim(struct batadv_priv *bat_priv, uint8_t *mac,
+ 	batadv_inc_counter(bat_priv, BATADV_CNT_RX);
+ 	batadv_add_counter(bat_priv, BATADV_CNT_RX_BYTES,
+ 			   skb->len + ETH_HLEN);
+-	soft_iface->last_rx = jiffies;
+ 
+ 	netif_rx(skb);
+ out:
+* Unmerged path net/batman-adv/distributed-arp-table.c
+diff --git a/net/batman-adv/soft-interface.c b/net/batman-adv/soft-interface.c
+index 819dfb006cdf..158f81031472 100644
+--- a/net/batman-adv/soft-interface.c
++++ b/net/batman-adv/soft-interface.c
+@@ -347,8 +347,6 @@ void batadv_interface_rx(struct net_device *soft_iface,
+ 	batadv_add_counter(bat_priv, BATADV_CNT_RX_BYTES,
+ 			   skb->len + ETH_HLEN);
+ 
+-	soft_iface->last_rx = jiffies;
+-
+ 	/* Let the bridge loop avoidance check the packet. If will
+ 	 * not handle it, we can safely push it up.
+ 	 */
