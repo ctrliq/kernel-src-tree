@@ -1,0 +1,894 @@
+membarrier: Document scheduler barrier requirements
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+commit 306e060435d7a3aef8f6f033e43b0f581638adce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/306e0604.failed
+
+Document the membarrier requirement on having a full memory barrier in
+__schedule() after coming from user-space, before storing to rq->curr.
+It is provided by smp_mb__after_spinlock() in __schedule().
+
+Document that membarrier requires a full barrier on transition from
+kernel thread to userspace thread. We currently have an implicit barrier
+from atomic_dec_and_test() in mmdrop() that ensures this.
+
+The x86 switch_mm_irqs_off() full barrier is currently provided by many
+cpumask update operations as well as write_cr3(). Document that
+write_cr3() provides this barrier.
+
+	Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrea Parri <parri.andrea@gmail.com>
+	Cc: Andrew Hunter <ahh@google.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Avi Kivity <avi@scylladb.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Boqun Feng <boqun.feng@gmail.com>
+	Cc: Dave Watson <davejwatson@fb.com>
+	Cc: David Sehr <sehr@google.com>
+	Cc: Greg Hackmann <ghackmann@google.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Maged Michael <maged.michael@gmail.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: linux-api@vger.kernel.org
+Link: http://lkml.kernel.org/r/20180129202020.8515-4-mathieu.desnoyers@efficios.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 306e060435d7a3aef8f6f033e43b0f581638adce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/tlb.c
+#	include/linux/sched/mm.h
+#	kernel/sched/core.c
+diff --cc arch/x86/mm/tlb.c
+index bbb1a2b21ef2,9fa7d2e0e15e..000000000000
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@@ -53,72 -141,388 +53,238 @@@ void leave_mm(int cpu
+  }
+  EXPORT_SYMBOL_GPL(leave_mm);
+  
+++<<<<<<< HEAD
+ +/*
+ + * The flush IPI assumes that a thread switch happens in this order:
+ + * [cpu0: the cpu that switches]
+ + * 1) switch_mm() either 1a) or 1b)
+ + * 1a) thread switch to a different mm
+ + * 1a1) set cpu_tlbstate to TLBSTATE_OK
+ + *	Now the tlb flush NMI handler flush_tlb_func won't call leave_mm
+ + *	if cpu0 was in lazy tlb mode.
+ + * 1a2) update cpu active_mm
+ + *	Now cpu0 accepts tlb flushes for the new mm.
+ + * 1a3) cpu_set(cpu, new_mm->cpu_vm_mask);
+ + *	Now the other cpus will send tlb flush ipis.
+ + * 1a4) change cr3.
+ + * 1a5) cpu_clear(cpu, old_mm->cpu_vm_mask);
+ + *	Stop ipi delivery for the old mm. This is not synchronized with
+ + *	the other cpus, but flush_tlb_func ignore flush ipis for the wrong
+ + *	mm, and in the worst case we perform a superfluous tlb flush.
+ + * 1b) thread switch without mm change
+ + *	cpu active_mm is correct, cpu0 already handles flush ipis.
+ + * 1b1) set cpu_tlbstate to TLBSTATE_OK
+ + * 1b2) test_and_set the cpu bit in cpu_vm_mask.
+ + *	Atomically set the bit [other cpus will start sending flush ipis],
+ + *	and test the bit.
+ + * 1b3) if the bit was 0: leave_mm was called, flush the tlb.
+ + * 2) switch %%esp, ie current
+ + *
+ + * The interrupt must handle 2 special cases:
+ + * - cr3 is changed before %%esp, ie. it cannot use current->{active_,}mm.
+ + * - the cpu performs speculative tlb reads, i.e. even if the cpu only
+ + *   runs in kernel space, the cpu could load tlb entries for user space
+ + *   pages.
+ + *
+ + * The good news is that cpu_tlbstate is local to each cpu, no
+ + * write/read ordering problems.
+ + */
+++=======
++ void switch_mm(struct mm_struct *prev, struct mm_struct *next,
++ 	       struct task_struct *tsk)
++ {
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	switch_mm_irqs_off(prev, next, tsk);
++ 	local_irq_restore(flags);
++ }
++ 
++ static void sync_current_stack_to_mm(struct mm_struct *mm)
++ {
++ 	unsigned long sp = current_stack_pointer;
++ 	pgd_t *pgd = pgd_offset(mm, sp);
++ 
++ 	if (CONFIG_PGTABLE_LEVELS > 4) {
++ 		if (unlikely(pgd_none(*pgd))) {
++ 			pgd_t *pgd_ref = pgd_offset_k(sp);
++ 
++ 			set_pgd(pgd, *pgd_ref);
++ 		}
++ 	} else {
++ 		/*
++ 		 * "pgd" is faked.  The top level entries are "p4d"s, so sync
++ 		 * the p4d.  This compiles to approximately the same code as
++ 		 * the 5-level case.
++ 		 */
++ 		p4d_t *p4d = p4d_offset(pgd, sp);
++ 
++ 		if (unlikely(p4d_none(*p4d))) {
++ 			pgd_t *pgd_ref = pgd_offset_k(sp);
++ 			p4d_t *p4d_ref = p4d_offset(pgd_ref, sp);
++ 
++ 			set_p4d(p4d, *p4d_ref);
++ 		}
++ 	}
++ }
++ 
++ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
++ 			struct task_struct *tsk)
++ {
++ 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
++ 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
++ 	unsigned cpu = smp_processor_id();
++ 	u64 next_tlb_gen;
++ 
++ 	/*
++ 	 * NB: The scheduler will call us with prev == next when switching
++ 	 * from lazy TLB mode to normal mode if active_mm isn't changing.
++ 	 * When this happens, we don't assume that CR3 (and hence
++ 	 * cpu_tlbstate.loaded_mm) matches next.
++ 	 *
++ 	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
++ 	 */
++ 
++ 	/* We don't want flush_tlb_func_* to run concurrently with us. */
++ 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
++ 		WARN_ON_ONCE(!irqs_disabled());
++ 
++ 	/*
++ 	 * Verify that CR3 is what we think it is.  This will catch
++ 	 * hypothetical buggy code that directly switches to swapper_pg_dir
++ 	 * without going through leave_mm() / switch_mm_irqs_off() or that
++ 	 * does something like write_cr3(read_cr3_pa()).
++ 	 *
++ 	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
++ 	 * isn't free.
++ 	 */
++ #ifdef CONFIG_DEBUG_VM
++ 	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid))) {
++ 		/*
++ 		 * If we were to BUG here, we'd be very likely to kill
++ 		 * the system so hard that we don't see the call trace.
++ 		 * Try to recover instead by ignoring the error and doing
++ 		 * a global flush to minimize the chance of corruption.
++ 		 *
++ 		 * (This is far from being a fully correct recovery.
++ 		 *  Architecturally, the CPU could prefetch something
++ 		 *  back into an incorrect ASID slot and leave it there
++ 		 *  to cause trouble down the road.  It's better than
++ 		 *  nothing, though.)
++ 		 */
++ 		__flush_tlb_all();
++ 	}
++ #endif
++ 	this_cpu_write(cpu_tlbstate.is_lazy, false);
++ 
++ 	/*
++ 	 * The membarrier system call requires a full memory barrier
++ 	 * before returning to user-space, after storing to rq->curr.
++ 	 * Writing to CR3 provides that full memory barrier.
++ 	 */
++ 	if (real_prev == next) {
++ 		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
++ 			   next->context.ctx_id);
++ 
++ 		/*
++ 		 * We don't currently support having a real mm loaded without
++ 		 * our cpu set in mm_cpumask().  We have all the bookkeeping
++ 		 * in place to figure out whether we would need to flush
++ 		 * if our cpu were cleared in mm_cpumask(), but we don't
++ 		 * currently use it.
++ 		 */
++ 		if (WARN_ON_ONCE(real_prev != &init_mm &&
++ 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
++ 			cpumask_set_cpu(cpu, mm_cpumask(next));
++ 
++ 		return;
++ 	} else {
++ 		u16 new_asid;
++ 		bool need_flush;
++ 
++ 		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
++ 			/*
++ 			 * If our current stack is in vmalloc space and isn't
++ 			 * mapped in the new pgd, we'll double-fault.  Forcibly
++ 			 * map it.
++ 			 */
++ 			sync_current_stack_to_mm(next);
++ 		}
++ 
++ 		/* Stop remote flushes for the previous mm */
++ 		VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu, mm_cpumask(real_prev)) &&
++ 				real_prev != &init_mm);
++ 		cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
++ 
++ 		/*
++ 		 * Start remote flushes and then read tlb_gen.
++ 		 */
++ 		cpumask_set_cpu(cpu, mm_cpumask(next));
++ 		next_tlb_gen = atomic64_read(&next->context.tlb_gen);
++ 
++ 		choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
++ 
++ 		if (need_flush) {
++ 			this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
++ 			this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
++ 			load_new_mm_cr3(next->pgd, new_asid, true);
++ 
++ 			/*
++ 			 * NB: This gets called via leave_mm() in the idle path
++ 			 * where RCU functions differently.  Tracing normally
++ 			 * uses RCU, so we need to use the _rcuidle variant.
++ 			 *
++ 			 * (There is no good reason for this.  The idle code should
++ 			 *  be rearranged to call this before rcu_idle_enter().)
++ 			 */
++ 			trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++ 		} else {
++ 			/* The new ASID is already up to date. */
++ 			load_new_mm_cr3(next->pgd, new_asid, false);
++ 
++ 			/* See above wrt _rcuidle. */
++ 			trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, 0);
++ 		}
++ 
++ 		this_cpu_write(cpu_tlbstate.loaded_mm, next);
++ 		this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
++ 	}
++ 
++ 	load_mm_cr4(next);
++ 	switch_ldt(real_prev, next);
++ }
+++>>>>>>> 306e060435d7 (membarrier: Document scheduler barrier requirements)
+  
+  /*
+ - * Please ignore the name of this function.  It should be called
+ - * switch_to_kernel_thread().
+ - *
+ - * enter_lazy_tlb() is a hint from the scheduler that we are entering a
+ - * kernel thread or other context without an mm.  Acceptable implementations
+ - * include doing nothing whatsoever, switching to init_mm, or various clever
+ - * lazy tricks to try to minimize TLB flushes.
+ - *
+ - * The scheduler reserves the right to call enter_lazy_tlb() several times
+ - * in a row.  It will notify us that we're going back to a real mm by
+ - * calling switch_mm_irqs_off().
+ + * TLB flush funcation:
+ + * 1) Flush the tlb entries if the cpu uses the mm that's being flushed.
+ + * 2) Leave the mm if we are in the lazy tlb mode.
+   */
+ -void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ +static void flush_tlb_func(void *info)
+  {
+ -	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
+ -		return;
+ -
+ -	if (tlb_defer_switch_to_init_mm()) {
+ -		/*
+ -		 * There's a significant optimization that may be possible
+ -		 * here.  We have accurate enough TLB flush tracking that we
+ -		 * don't need to maintain coherence of TLB per se when we're
+ -		 * lazy.  We do, however, need to maintain coherence of
+ -		 * paging-structure caches.  We could, in principle, leave our
+ -		 * old mm loaded and only switch to init_mm when
+ -		 * tlb_remove_page() happens.
+ -		 */
+ -		this_cpu_write(cpu_tlbstate.is_lazy, true);
+ -	} else {
+ -		switch_mm(NULL, &init_mm, NULL);
+ -	}
+ -}
+ -
+ -/*
+ - * Call this when reinitializing a CPU.  It fixes the following potential
+ - * problems:
+ - *
+ - * - The ASID changed from what cpu_tlbstate thinks it is (most likely
+ - *   because the CPU was taken down and came back up with CR3's PCID
+ - *   bits clear.  CPU hotplug can do this.
+ - *
+ - * - The TLB contains junk in slots corresponding to inactive ASIDs.
+ - *
+ - * - The CPU went so far out to lunch that it may have missed a TLB
+ - *   flush.
+ - */
+ -void initialize_tlbstate_and_flush(void)
+ -{
+ -	int i;
+ -	struct mm_struct *mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+ -	u64 tlb_gen = atomic64_read(&init_mm.context.tlb_gen);
+ -	unsigned long cr3 = __read_cr3();
+ -
+ -	/* Assert that CR3 already references the right mm. */
+ -	WARN_ON((cr3 & CR3_ADDR_MASK) != __pa(mm->pgd));
+ -
+ -	/*
+ -	 * Assert that CR4.PCIDE is set if needed.  (CR4.PCIDE initialization
+ -	 * doesn't work like other CR4 bits because it can only be set from
+ -	 * long mode.)
+ -	 */
+ -	WARN_ON(boot_cpu_has(X86_FEATURE_PCID) &&
+ -		!(cr4_read_shadow() & X86_CR4_PCIDE));
+ -
+ -	/* Force ASID 0 and force a TLB flush. */
+ -	write_cr3(build_cr3(mm->pgd, 0));
+ -
+ -	/* Reinitialize tlbstate. */
+ -	this_cpu_write(cpu_tlbstate.loaded_mm_asid, 0);
+ -	this_cpu_write(cpu_tlbstate.next_asid, 1);
+ -	this_cpu_write(cpu_tlbstate.ctxs[0].ctx_id, mm->context.ctx_id);
+ -	this_cpu_write(cpu_tlbstate.ctxs[0].tlb_gen, tlb_gen);
+ -
+ -	for (i = 1; i < TLB_NR_DYN_ASIDS; i++)
+ -		this_cpu_write(cpu_tlbstate.ctxs[i].ctx_id, 0);
+ -}
+ -
+ -/*
+ - * flush_tlb_func_common()'s memory ordering requirement is that any
+ - * TLB fills that happen after we flush the TLB are ordered after we
+ - * read active_mm's tlb_gen.  We don't need any explicit barriers
+ - * because all x86 flush operations are serializing and the
+ - * atomic64_read operation won't be reordered by the compiler.
+ - */
+ -static void flush_tlb_func_common(const struct flush_tlb_info *f,
+ -				  bool local, enum tlb_flush_reason reason)
+ -{
+ -	/*
+ -	 * We have three different tlb_gen values in here.  They are:
+ -	 *
+ -	 * - mm_tlb_gen:     the latest generation.
+ -	 * - local_tlb_gen:  the generation that this CPU has already caught
+ -	 *                   up to.
+ -	 * - f->new_tlb_gen: the generation that the requester of the flush
+ -	 *                   wants us to catch up to.
+ -	 */
+ -	struct mm_struct *loaded_mm = this_cpu_read(cpu_tlbstate.loaded_mm);
+ -	u32 loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+ -	u64 mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
+ -	u64 local_tlb_gen = this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen);
+ +	struct flush_tlb_info *f = info;
+  
+ -	/* This code cannot presently handle being reentered. */
+ -	VM_WARN_ON(!irqs_disabled());
+ +	inc_irq_stat(irq_tlb_count);
+  
+ -	if (unlikely(loaded_mm == &init_mm))
+ +	if (f->flush_mm != this_cpu_read(cpu_tlbstate.active_mm))
+  		return;
+  
+ -	VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[loaded_mm_asid].ctx_id) !=
+ -		   loaded_mm->context.ctx_id);
+ -
+ -	if (this_cpu_read(cpu_tlbstate.is_lazy)) {
+ -		/*
+ -		 * We're in lazy mode.  We need to at least flush our
+ -		 * paging-structure cache to avoid speculatively reading
+ -		 * garbage into our TLB.  Since switching to init_mm is barely
+ -		 * slower than a minimal flush, just switch to init_mm.
+ -		 */
+ -		switch_mm_irqs_off(NULL, &init_mm, NULL);
+ -		return;
+ -	}
+ -
+ -	if (unlikely(local_tlb_gen == mm_tlb_gen)) {
+ -		/*
+ -		 * There's nothing to do: we're already up to date.  This can
+ -		 * happen if two concurrent flushes happen -- the first flush to
+ -		 * be handled can catch us all the way up, leaving no work for
+ -		 * the second flush.
+ -		 */
+ -		trace_tlb_flush(reason, 0);
+ -		return;
+ -	}
+ -
+ -	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
+ -	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
+ -
+ -	/*
+ -	 * If we get to this point, we know that our TLB is out of date.
+ -	 * This does not strictly imply that we need to flush (it's
+ -	 * possible that f->new_tlb_gen <= local_tlb_gen), but we're
+ -	 * going to need to flush in the very near future, so we might
+ -	 * as well get it over with.
+ -	 *
+ -	 * The only question is whether to do a full or partial flush.
+ -	 *
+ -	 * We do a partial flush if requested and two extra conditions
+ -	 * are met:
+ -	 *
+ -	 * 1. f->new_tlb_gen == local_tlb_gen + 1.  We have an invariant that
+ -	 *    we've always done all needed flushes to catch up to
+ -	 *    local_tlb_gen.  If, for example, local_tlb_gen == 2 and
+ -	 *    f->new_tlb_gen == 3, then we know that the flush needed to bring
+ -	 *    us up to date for tlb_gen 3 is the partial flush we're
+ -	 *    processing.
+ -	 *
+ -	 *    As an example of why this check is needed, suppose that there
+ -	 *    are two concurrent flushes.  The first is a full flush that
+ -	 *    changes context.tlb_gen from 1 to 2.  The second is a partial
+ -	 *    flush that changes context.tlb_gen from 2 to 3.  If they get
+ -	 *    processed on this CPU in reverse order, we'll see
+ -	 *     local_tlb_gen == 1, mm_tlb_gen == 3, and end != TLB_FLUSH_ALL.
+ -	 *    If we were to use __flush_tlb_single() and set local_tlb_gen to
+ -	 *    3, we'd be break the invariant: we'd update local_tlb_gen above
+ -	 *    1 without the full flush that's needed for tlb_gen 2.
+ -	 *
+ -	 * 2. f->new_tlb_gen == mm_tlb_gen.  This is purely an optimiation.
+ -	 *    Partial TLB flushes are not all that much cheaper than full TLB
+ -	 *    flushes, so it seems unlikely that it would be a performance win
+ -	 *    to do a partial flush if that won't bring our TLB fully up to
+ -	 *    date.  By doing a full flush instead, we can increase
+ -	 *    local_tlb_gen all the way to mm_tlb_gen and we can probably
+ -	 *    avoid another flush in the very near future.
+ -	 */
+ -	if (f->end != TLB_FLUSH_ALL &&
+ -	    f->new_tlb_gen == local_tlb_gen + 1 &&
+ -	    f->new_tlb_gen == mm_tlb_gen) {
+ -		/* Partial flush */
+ -		unsigned long addr;
+ -		unsigned long nr_pages = (f->end - f->start) >> PAGE_SHIFT;
+ -
+ -		addr = f->start;
+ -		while (addr < f->end) {
+ -			__flush_tlb_single(addr);
+ -			addr += PAGE_SIZE;
+ +	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK) {
+ +		if (f->flush_end == TLB_FLUSH_ALL)
+ +			local_flush_tlb();
+ +		else if (!f->flush_end)
+ +			__flush_tlb_single(f->flush_start);
+ +		else {
+ +			unsigned long addr;
+ +			addr = f->flush_start;
+ +			while (addr < f->flush_end) {
+ +				__flush_tlb_single(addr);
+ +				addr += PAGE_SIZE;
+ +			}
+  		}
+ -		if (local)
+ -			count_vm_tlb_events(NR_TLB_LOCAL_FLUSH_ONE, nr_pages);
+ -		trace_tlb_flush(reason, nr_pages);
+ -	} else {
+ -		/* Full flush. */
+ -		local_flush_tlb();
+ -		if (local)
+ -			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+ -		trace_tlb_flush(reason, TLB_FLUSH_ALL);
+ -	}
+ +	} else
+ +		leave_mm(smp_processor_id());
+  
+ -	/* Both paths above update our state to mm_tlb_gen. */
+ -	this_cpu_write(cpu_tlbstate.ctxs[loaded_mm_asid].tlb_gen, mm_tlb_gen);
+ -}
+ -
+ -static void flush_tlb_func_local(void *info, enum tlb_flush_reason reason)
+ -{
+ -	const struct flush_tlb_info *f = info;
+ -
+ -	flush_tlb_func_common(f, true, reason);
+ -}
+ -
+ -static void flush_tlb_func_remote(void *info)
+ -{
+ -	const struct flush_tlb_info *f = info;
+ -
+ -	inc_irq_stat(irq_tlb_count);
+ -
+ -	if (f->mm && f->mm != this_cpu_read(cpu_tlbstate.loaded_mm))
+ -		return;
+ -
+ -	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
+ -	flush_tlb_func_common(f, false, TLB_REMOTE_SHOOTDOWN);
+  }
+  
+  void native_flush_tlb_others(const struct cpumask *cpumask,
+diff --cc include/linux/sched/mm.h
+index a7adba1cd0a9,b84e0fde1d72..000000000000
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@@ -1,6 -1,247 +1,247 @@@
+  #ifndef _LINUX_SCHED_MM_H
+  #define _LINUX_SCHED_MM_H
+  
+ -#include <linux/kernel.h>
+ -#include <linux/atomic.h>
+  #include <linux/sched.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/mm_types.h>
++ #include <linux/gfp.h>
++ 
++ /*
++  * Routines for handling mm_structs
++  */
++ extern struct mm_struct * mm_alloc(void);
++ 
++ /**
++  * mmgrab() - Pin a &struct mm_struct.
++  * @mm: The &struct mm_struct to pin.
++  *
++  * Make sure that @mm will not get freed even after the owning task
++  * exits. This doesn't guarantee that the associated address space
++  * will still exist later on and mmget_not_zero() has to be used before
++  * accessing it.
++  *
++  * This is a preferred way to to pin @mm for a longer/unbounded amount
++  * of time.
++  *
++  * Use mmdrop() to release the reference acquired by mmgrab().
++  *
++  * See also <Documentation/vm/active_mm.txt> for an in-depth explanation
++  * of &mm_struct.mm_count vs &mm_struct.mm_users.
++  */
++ static inline void mmgrab(struct mm_struct *mm)
++ {
++ 	atomic_inc(&mm->mm_count);
++ }
++ 
++ /* mmdrop drops the mm and the page tables */
++ extern void __mmdrop(struct mm_struct *);
++ static inline void mmdrop(struct mm_struct *mm)
++ {
++ 	/*
++ 	 * The implicit full barrier implied by atomic_dec_and_test() is
++ 	 * required by the membarrier system call before returning to
++ 	 * user-space, after storing to rq->curr.
++ 	 */
++ 	if (unlikely(atomic_dec_and_test(&mm->mm_count)))
++ 		__mmdrop(mm);
++ }
++ 
++ static inline void mmdrop_async_fn(struct work_struct *work)
++ {
++ 	struct mm_struct *mm = container_of(work, struct mm_struct, async_put_work);
++ 	__mmdrop(mm);
++ }
++ 
++ static inline void mmdrop_async(struct mm_struct *mm)
++ {
++ 	if (unlikely(atomic_dec_and_test(&mm->mm_count))) {
++ 		INIT_WORK(&mm->async_put_work, mmdrop_async_fn);
++ 		schedule_work(&mm->async_put_work);
++ 	}
++ }
++ 
++ /**
++  * mmget() - Pin the address space associated with a &struct mm_struct.
++  * @mm: The address space to pin.
++  *
++  * Make sure that the address space of the given &struct mm_struct doesn't
++  * go away. This does not protect against parts of the address space being
++  * modified or freed, however.
++  *
++  * Never use this function to pin this address space for an
++  * unbounded/indefinite amount of time.
++  *
++  * Use mmput() to release the reference acquired by mmget().
++  *
++  * See also <Documentation/vm/active_mm.txt> for an in-depth explanation
++  * of &mm_struct.mm_count vs &mm_struct.mm_users.
++  */
++ static inline void mmget(struct mm_struct *mm)
++ {
++ 	atomic_inc(&mm->mm_users);
++ }
++ 
++ static inline bool mmget_not_zero(struct mm_struct *mm)
++ {
++ 	return atomic_inc_not_zero(&mm->mm_users);
++ }
++ 
++ /* mmput gets rid of the mappings and all user-space */
++ extern void mmput(struct mm_struct *);
++ #ifdef CONFIG_MMU
++ /* same as above but performs the slow path from the async context. Can
++  * be called from the atomic context as well
++  */
++ void mmput_async(struct mm_struct *);
++ #endif
++ 
++ /* Grab a reference to a task's mm, if it is not already going away */
++ extern struct mm_struct *get_task_mm(struct task_struct *task);
++ /*
++  * Grab a reference to a task's mm, if it is not already going away
++  * and ptrace_may_access with the mode parameter passed to it
++  * succeeds.
++  */
++ extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
++ /* Remove the current tasks stale references to the old mm_struct */
++ extern void mm_release(struct task_struct *, struct mm_struct *);
++ 
++ #ifdef CONFIG_MEMCG
++ extern void mm_update_next_owner(struct mm_struct *mm);
++ #else
++ static inline void mm_update_next_owner(struct mm_struct *mm)
++ {
++ }
++ #endif /* CONFIG_MEMCG */
++ 
++ #ifdef CONFIG_MMU
++ extern void arch_pick_mmap_layout(struct mm_struct *mm);
++ extern unsigned long
++ arch_get_unmapped_area(struct file *, unsigned long, unsigned long,
++ 		       unsigned long, unsigned long);
++ extern unsigned long
++ arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
++ 			  unsigned long len, unsigned long pgoff,
++ 			  unsigned long flags);
++ #else
++ static inline void arch_pick_mmap_layout(struct mm_struct *mm) {}
++ #endif
++ 
++ static inline bool in_vfork(struct task_struct *tsk)
++ {
++ 	bool ret;
++ 
++ 	/*
++ 	 * need RCU to access ->real_parent if CLONE_VM was used along with
++ 	 * CLONE_PARENT.
++ 	 *
++ 	 * We check real_parent->mm == tsk->mm because CLONE_VFORK does not
++ 	 * imply CLONE_VM
++ 	 *
++ 	 * CLONE_VFORK can be used with CLONE_PARENT/CLONE_THREAD and thus
++ 	 * ->real_parent is not necessarily the task doing vfork(), so in
++ 	 * theory we can't rely on task_lock() if we want to dereference it.
++ 	 *
++ 	 * And in this case we can't trust the real_parent->mm == tsk->mm
++ 	 * check, it can be false negative. But we do not care, if init or
++ 	 * another oom-unkillable task does this it should blame itself.
++ 	 */
++ 	rcu_read_lock();
++ 	ret = tsk->vfork_done && tsk->real_parent->mm == tsk->mm;
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Applies per-task gfp context to the given allocation flags.
++  * PF_MEMALLOC_NOIO implies GFP_NOIO
++  * PF_MEMALLOC_NOFS implies GFP_NOFS
++  */
++ static inline gfp_t current_gfp_context(gfp_t flags)
++ {
++ 	/*
++ 	 * NOIO implies both NOIO and NOFS and it is a weaker context
++ 	 * so always make sure it makes precendence
++ 	 */
++ 	if (unlikely(current->flags & PF_MEMALLOC_NOIO))
++ 		flags &= ~(__GFP_IO | __GFP_FS);
++ 	else if (unlikely(current->flags & PF_MEMALLOC_NOFS))
++ 		flags &= ~__GFP_FS;
++ 	return flags;
++ }
++ 
++ #ifdef CONFIG_LOCKDEP
++ extern void fs_reclaim_acquire(gfp_t gfp_mask);
++ extern void fs_reclaim_release(gfp_t gfp_mask);
++ #else
++ static inline void fs_reclaim_acquire(gfp_t gfp_mask) { }
++ static inline void fs_reclaim_release(gfp_t gfp_mask) { }
++ #endif
++ 
++ static inline unsigned int memalloc_noio_save(void)
++ {
++ 	unsigned int flags = current->flags & PF_MEMALLOC_NOIO;
++ 	current->flags |= PF_MEMALLOC_NOIO;
++ 	return flags;
++ }
++ 
++ static inline void memalloc_noio_restore(unsigned int flags)
++ {
++ 	current->flags = (current->flags & ~PF_MEMALLOC_NOIO) | flags;
++ }
++ 
++ static inline unsigned int memalloc_nofs_save(void)
++ {
++ 	unsigned int flags = current->flags & PF_MEMALLOC_NOFS;
++ 	current->flags |= PF_MEMALLOC_NOFS;
++ 	return flags;
++ }
++ 
++ static inline void memalloc_nofs_restore(unsigned int flags)
++ {
++ 	current->flags = (current->flags & ~PF_MEMALLOC_NOFS) | flags;
++ }
++ 
++ static inline unsigned int memalloc_noreclaim_save(void)
++ {
++ 	unsigned int flags = current->flags & PF_MEMALLOC;
++ 	current->flags |= PF_MEMALLOC;
++ 	return flags;
++ }
++ 
++ static inline void memalloc_noreclaim_restore(unsigned int flags)
++ {
++ 	current->flags = (current->flags & ~PF_MEMALLOC) | flags;
++ }
++ 
++ #ifdef CONFIG_MEMBARRIER
++ enum {
++ 	MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY	= (1U << 0),
++ 	MEMBARRIER_STATE_PRIVATE_EXPEDITED		= (1U << 1),
++ };
++ 
++ #ifdef CONFIG_ARCH_HAS_MEMBARRIER_CALLBACKS
++ #include <asm/membarrier.h>
++ #endif
++ 
++ static inline void membarrier_execve(struct task_struct *t)
++ {
++ 	atomic_set(&t->mm->membarrier_state, 0);
++ }
++ #else
++ #ifdef CONFIG_ARCH_HAS_MEMBARRIER_CALLBACKS
++ static inline void membarrier_arch_switch_mm(struct mm_struct *prev,
++ 					     struct mm_struct *next,
++ 					     struct task_struct *tsk)
++ {
++ }
++ #endif
++ static inline void membarrier_execve(struct task_struct *t)
++ {
++ }
++ #endif
+++>>>>>>> 306e060435d7 (membarrier: Document scheduler barrier requirements)
+  
+  #endif /* _LINUX_SCHED_MM_H */
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,11bf4d48d2d3..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2501,12 -2814,19 +2507,19 @@@ context_switch(struct rq *rq, struct ta
+  	 */
+  	arch_start_context_switch(prev);
+  
++ 	/*
++ 	 * If mm is non-NULL, we pass through switch_mm(). If mm is
++ 	 * NULL, we will pass through mmdrop() in finish_task_switch().
++ 	 * Both of these contain the full memory barrier required by
++ 	 * membarrier after storing to rq->curr, before returning to
++ 	 * user-space.
++ 	 */
+  	if (!mm) {
+  		next->active_mm = oldmm;
+ -		mmgrab(oldmm);
+ +		atomic_inc(&oldmm->mm_count);
+  		enter_lazy_tlb(oldmm, next);
+  	} else
+ -		switch_mm_irqs_off(oldmm, mm, next);
+ +		switch_mm(oldmm, mm, next);
+  
+  	if (!prev->mm) {
+  		prev->active_mm = NULL;
+@@@ -3494,12 -3357,19 +3507,15 @@@ need_resched
+  	 * Make sure that signal_pending_state()->signal_pending() below
+  	 * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+  	 * done by the caller to avoid the race with signal_wake_up().
++ 	 *
++ 	 * The membarrier system call requires a full memory barrier
++ 	 * after coming from user-space, before storing to rq->curr.
+  	 */
+ -	rq_lock(rq, &rf);
+ -	smp_mb__after_spinlock();
+ -
+ -	/* Promote REQ to ACT */
+ -	rq->clock_update_flags <<= 1;
+ -	update_rq_clock(rq);
+ +	smp_mb__before_spinlock();
+ +	raw_spin_lock_irq(&rq->lock);
+  
+  	switch_count = &prev->nivcsw;
+ -	if (!preempt && prev->state) {
+ +	if (prev->state && !(preempt_count() & PREEMPT_ACTIVE)) {
+  		if (unlikely(signal_pending_state(prev->state, prev))) {
+  			prev->state = TASK_RUNNING;
+  		} else {
+@@@ -3535,27 -3404,64 +3551,44 @@@
+  	if (likely(prev != next)) {
+  		rq->nr_switches++;
+  		rq->curr = next;
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * The membarrier system call requires each architecture
++ 		 * to have a full memory barrier after updating
++ 		 * rq->curr, before returning to user-space.
++ 		 *
++ 		 * Here are the schemes providing that barrier on the
++ 		 * various architectures:
++ 		 * - mm ? switch_mm() : mmdrop() for x86, s390, sparc, PowerPC.
++ 		 *   switch_mm() rely on membarrier_arch_switch_mm() on PowerPC.
++ 		 * - finish_lock_switch() for weakly-ordered
++ 		 *   architectures where spin_unlock is a full barrier,
++ 		 * - switch_to() for arm64 (weakly-ordered, spin_unlock
++ 		 *   is a RELEASE barrier),
++ 		 */
+++>>>>>>> 306e060435d7 (membarrier: Document scheduler barrier requirements)
+  		++*switch_count;
+  
+ -		trace_sched_switch(preempt, prev, next);
+ -
+ -		/* Also unlocks the rq: */
+ -		rq = context_switch(rq, prev, next, &rf);
+ -	} else {
+ -		rq->clock_update_flags &= ~(RQCF_ACT_SKIP|RQCF_REQ_SKIP);
+ -		rq_unlock_irq(rq, &rf);
+ -	}
+ -
+ -	balance_callback(rq);
+ -}
+ -
+ -void __noreturn do_task_dead(void)
+ -{
+ -	/*
+ -	 * The setting of TASK_RUNNING by try_to_wake_up() may be delayed
+ -	 * when the following two conditions become true.
+ -	 *   - There is race condition of mmap_sem (It is acquired by
+ -	 *     exit_mm()), and
+ -	 *   - SMI occurs before setting TASK_RUNINNG.
+ -	 *     (or hypervisor of virtual machine switches to other guest)
+ -	 *  As a result, we may become TASK_RUNNING after becoming TASK_DEAD
+ -	 *
+ -	 * To avoid it, we have to wait for releasing tsk->pi_lock which
+ -	 * is held by try_to_wake_up()
+ -	 */
+ -	raw_spin_lock_irq(&current->pi_lock);
+ -	raw_spin_unlock_irq(&current->pi_lock);
+ -
+ -	/* Causes final put_task_struct in finish_task_switch(): */
+ -	__set_current_state(TASK_DEAD);
+ -
+ -	/* Tell freezer to ignore us: */
+ -	current->flags |= PF_NOFREEZE;
+ +		context_switch(rq, prev, next); /* unlocks the rq */
+ +		/*
+ +		 * The context switch have flipped the stack from under us
+ +		 * and restored the local variables which were saved when
+ +		 * this task called schedule() in the past. prev == current
+ +		 * is still correct, but it can be moved to another cpu/rq.
+ +		 */
+ +		cpu = smp_processor_id();
+ +		rq = cpu_rq(cpu);
+ +	} else
+ +		raw_spin_unlock_irq(&rq->lock);
+  
+ -	__schedule(false);
+ -	BUG();
+ +	post_schedule(rq);
+  
+ -	/* Avoid "noreturn function does return" - but don't continue if BUG() is a NOP: */
+ -	for (;;)
+ -		cpu_relax();
+ +	sched_preempt_enable_no_resched();
+ +	if (need_resched())
+ +		goto need_resched;
+  }
+ +STACK_FRAME_NON_STANDARD(__schedule); /* switch_to() */
+  
+  static inline void sched_submit_work(struct task_struct *tsk)
+  {
+* Unmerged path arch/x86/mm/tlb.c
+* Unmerged path include/linux/sched/mm.h
+* Unmerged path kernel/sched/core.c
