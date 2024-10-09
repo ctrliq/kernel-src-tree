@@ -1,0 +1,155 @@
+ibmvnic: Clean up resources on probe failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 7c1885ae9aba0d6b3f854dfee099a3c1c796755f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c1885ae.failed
+
+Ensure that any resources allocated during probe are released if the
+probe of the driver fails.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7c1885ae9aba0d6b3f854dfee099a3c1c796755f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index eea4fcf576ec,cf3cf921eb35..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -3898,95 -3828,47 +3898,123 @@@ static int ibmvnic_probe(struct vio_de
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+  
+ -	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
+ -	INIT_LIST_HEAD(&adapter->rwi_list);
+ -	mutex_init(&adapter->reset_lock);
+ -	mutex_init(&adapter->rwi_lock);
+ -	adapter->resetting = false;
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+  
+  	do {
+++<<<<<<< HEAD
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+ +
+ +	rc = init_sub_crq_irqs(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+ +	}
+++=======
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc && rc != EAGAIN)
++ 			goto ibmvnic_init_fail;
++ 	} while (rc == EAGAIN);
++ 
++ 	netdev->mtu = adapter->req_mtu - ETH_HLEN;
++ 
++ 	rc = device_create_file(&dev->dev, &dev_attr_failover);
++ 	if (rc)
++ 		goto ibmvnic_init_fail;
+++>>>>>>> 7c1885ae9aba (ibmvnic: Clean up resources on probe failure)
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+  
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+++<<<<<<< HEAD
+ +		goto free_sub_crqs;
+++=======
++ 		goto ibmvnic_register_fail;
+++>>>>>>> 7c1885ae9aba (ibmvnic: Clean up resources on probe failure)
+  	}
+  	dev_info(&dev->dev, "ibmvnic registered\n");
+  
+ -	adapter->state = VNIC_PROBED;
+  	return 0;
+  
+++<<<<<<< HEAD
+ +free_sub_crqs:
+ +	release_sub_crqs(adapter);
+ +free_debugfs:
+ +	if (adapter->debugfs_dir && !IS_ERR(adapter->debugfs_dir))
+ +		debugfs_remove_recursive(adapter->debugfs_dir);
+ +free_crq:
+ +	ibmvnic_release_crq_queue(adapter);
+ +free_netdev:
+ +	free_netdev(netdev);
+++=======
++ ibmvnic_register_fail:
++ 	device_remove_file(&dev->dev, &dev_attr_failover);
++ 
++ ibmvnic_init_fail:
++ 	release_sub_crqs(adapter);
++ 	release_crq_queue(adapter);
++ 	free_netdev(netdev);
++ 
+++>>>>>>> 7c1885ae9aba (ibmvnic: Clean up resources on probe failure)
+  	return rc;
+  }
+  
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
