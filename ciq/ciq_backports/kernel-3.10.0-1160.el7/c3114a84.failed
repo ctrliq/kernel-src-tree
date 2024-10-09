@@ -1,0 +1,253 @@
+mm: hugetlb: soft-offline: dissolve source hugepage after successful migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Anshuman Khandual <khandual@linux.vnet.ibm.com>
+commit c3114a84f7f96c9d5c73c8bfa7e21ff42fda97e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/c3114a84.failed
+
+Currently hugepage migrated by soft-offline (i.e.  due to correctable
+memory errors) is contained as a hugepage, which means many non-error
+pages in it are unreusable, i.e.  wasted.
+
+This patch solves this issue by dissolving source hugepages into buddy.
+As done in previous patch, PageHWPoison is set only on a head page of
+the error hugepage.  Then in dissoliving we move the PageHWPoison flag
+to the raw error page so that all healthy subpages return back to buddy.
+
+[arnd@arndb.de: fix warnings: replace some macros with inline functions]
+  Link: http://lkml.kernel.org/r/20170609102544.2947326-1-arnd@arndb.de
+Link: http://lkml.kernel.org/r/1496305019-5493-5-git-send-email-n-horiguchi@ah.jp.nec.com
+	Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c3114a84f7f96c9d5c73c8bfa7e21ff42fda97e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+#	mm/memory-failure.c
+#	mm/migrate.c
+diff --cc include/linux/hugetlb.h
+index 5d492812e4ac,668ab1742ef6..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -429,14 -472,19 +429,15 @@@ static inline pgoff_t basepage_index(st
+  	return __basepage_index(page);
+  }
+  
++ extern int dissolve_free_huge_page(struct page *page);
+  extern int dissolve_free_huge_pages(unsigned long start_pfn,
+  				    unsigned long end_pfn);
+ -static inline bool hugepage_migration_supported(struct hstate *h)
+ +static inline int hugepage_migration_supported(struct hstate *h)
+  {
+  #ifdef CONFIG_ARCH_ENABLE_HUGEPAGE_MIGRATION
+ -	if ((huge_page_shift(h) == PMD_SHIFT) ||
+ -		(huge_page_shift(h) == PGDIR_SHIFT))
+ -		return true;
+ -	else
+ -		return false;
+ +	return huge_page_shift(h) == PMD_SHIFT;
+  #else
+ -	return false;
+ +	return 0;
+  #endif
+  }
+  
+@@@ -487,8 -566,22 +496,27 @@@ static inline pgoff_t basepage_index(st
+  {
+  	return page->index;
+  }
+++<<<<<<< HEAD
+ +#define dissolve_free_huge_pages(s, e)	0
+ +#define hugepage_migration_supported(h)	0
+++=======
++ 
++ static inline int dissolve_free_huge_page(struct page *page)
++ {
++ 	return 0;
++ }
++ 
++ static inline int dissolve_free_huge_pages(unsigned long start_pfn,
++ 					   unsigned long end_pfn)
++ {
++ 	return 0;
++ }
++ 
++ static inline bool hugepage_migration_supported(struct hstate *h)
++ {
++ 	return false;
++ }
+++>>>>>>> c3114a84f7f9 (mm: hugetlb: soft-offline: dissolve source hugepage after successful migration)
+  
+  static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
+  					   struct mm_struct *mm, pte_t *pte)
+diff --cc mm/memory-failure.c
+index 989a662e69f7,42c5803e6275..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1725,16 -1575,88 +1725,97 @@@ static int soft_offline_huge_page(struc
+  		if (ret > 0)
+  			ret = -EIO;
+  	} else {
+++<<<<<<< HEAD
+ +		/* overcommit hugetlb page will be freed to buddy */
+ +		if (PageHuge(page)) {
+ +			set_page_hwpoison_huge_page(hpage);
+ +			dequeue_hwpoisoned_huge_page(hpage);
+ +			atomic_long_add(1 << compound_order(hpage),
+ +					&num_poisoned_pages);
+ +		} else {
+ +			SetPageHWPoison(page);
+ +			atomic_long_inc(&num_poisoned_pages);
+++=======
++ 		if (PageHuge(page))
++ 			dissolve_free_huge_page(page);
++ 	}
++ 	return ret;
++ }
++ 
++ static int __soft_offline_page(struct page *page, int flags)
++ {
++ 	int ret;
++ 	unsigned long pfn = page_to_pfn(page);
++ 
++ 	/*
++ 	 * Check PageHWPoison again inside page lock because PageHWPoison
++ 	 * is set by memory_failure() outside page lock. Note that
++ 	 * memory_failure() also double-checks PageHWPoison inside page lock,
++ 	 * so there's no race between soft_offline_page() and memory_failure().
++ 	 */
++ 	lock_page(page);
++ 	wait_on_page_writeback(page);
++ 	if (PageHWPoison(page)) {
++ 		unlock_page(page);
++ 		put_hwpoison_page(page);
++ 		pr_info("soft offline: %#lx page already poisoned\n", pfn);
++ 		return -EBUSY;
++ 	}
++ 	/*
++ 	 * Try to invalidate first. This should work for
++ 	 * non dirty unmapped page cache pages.
++ 	 */
++ 	ret = invalidate_inode_page(page);
++ 	unlock_page(page);
++ 	/*
++ 	 * RED-PEN would be better to keep it isolated here, but we
++ 	 * would need to fix isolation locking first.
++ 	 */
++ 	if (ret == 1) {
++ 		put_hwpoison_page(page);
++ 		pr_info("soft_offline: %#lx: invalidated\n", pfn);
++ 		SetPageHWPoison(page);
++ 		num_poisoned_pages_inc();
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Simple invalidation didn't work.
++ 	 * Try to migrate to a new page instead. migrate.c
++ 	 * handles a large number of cases for us.
++ 	 */
++ 	if (PageLRU(page))
++ 		ret = isolate_lru_page(page);
++ 	else
++ 		ret = isolate_movable_page(page, ISOLATE_UNEVICTABLE);
++ 	/*
++ 	 * Drop page reference which is came from get_any_page()
++ 	 * successful isolate_lru_page() already took another one.
++ 	 */
++ 	put_hwpoison_page(page);
++ 	if (!ret) {
++ 		LIST_HEAD(pagelist);
++ 		/*
++ 		 * After isolated lru page, the PageLRU will be cleared,
++ 		 * so use !__PageMovable instead for LRU page's mapping
++ 		 * cannot have PAGE_MAPPING_MOVABLE.
++ 		 */
++ 		if (!__PageMovable(page))
++ 			inc_node_page_state(page, NR_ISOLATED_ANON +
++ 						page_is_file_cache(page));
++ 		list_add(&page->lru, &pagelist);
++ 		ret = migrate_pages(&pagelist, new_page, NULL, MPOL_MF_MOVE_ALL,
++ 					MIGRATE_SYNC, MR_MEMORY_FAILURE);
++ 		if (ret) {
++ 			if (!list_empty(&pagelist))
++ 				putback_movable_pages(&pagelist);
++ 
++ 			pr_info("soft offline: %#lx: migration failed %d, type %lx (%pGp)\n",
++ 				pfn, ret, page->flags, &page->flags);
++ 			if (ret > 0)
++ 				ret = -EIO;
+++>>>>>>> c3114a84f7f9 (mm: hugetlb: soft-offline: dissolve source hugepage after successful migration)
+  		}
+ -	} else {
+ -		pr_info("soft offline: %#lx: isolation failed: %d, page count %d, type %lx (%pGp)\n",
+ -			pfn, ret, page_count(page), page->flags, &page->flags);
+  	}
+  	return ret;
+  }
+diff --cc mm/migrate.c
+index 345768880fe2,8935cbe362ce..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1132,7 -1252,19 +1132,23 @@@ out_unlock
+  out:
+  	if (rc != -EAGAIN)
+  		putback_active_hugepage(hpage);
+++<<<<<<< HEAD
+ +	putback_active_hugepage(new_hpage);
+++=======
++ 	if (reason == MR_MEMORY_FAILURE && !test_set_page_hwpoison(hpage))
++ 		num_poisoned_pages_inc();
++ 
++ 	/*
++ 	 * If migration was not successful and there's a freeing callback, use
++ 	 * it.  Otherwise, put_page() will drop the reference grabbed during
++ 	 * isolation.
++ 	 */
++ 	if (put_new_page)
++ 		put_new_page(new_hpage, private);
++ 	else
++ 		putback_active_hugepage(new_hpage);
++ 
+++>>>>>>> c3114a84f7f9 (mm: hugetlb: soft-offline: dissolve source hugepage after successful migration)
+  	if (result) {
+  		if (rc)
+  			*result = rc;
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 8cfad70b01fc..f26e97f0c816 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1485,7 +1485,7 @@ static int free_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
+  * number of free hugepages would be reduced below the number of reserved
+  * hugepages.
+  */
+-static int dissolve_free_huge_page(struct page *page)
++int dissolve_free_huge_page(struct page *page)
+ {
+ 	int rc = 0;
+ 
+@@ -1498,6 +1498,14 @@ static int dissolve_free_huge_page(struct page *page)
+ 			rc = -EBUSY;
+ 			goto out;
+ 		}
++		/*
++		 * Move PageHWPoison flag from head page to the raw error page,
++		 * which makes any subpages rather than the error page reusable.
++		 */
++		if (PageHWPoison(head) && page != head) {
++			SetPageHWPoison(page);
++			ClearPageHWPoison(head);
++		}
+ 		list_del(&head->lru);
+ 		h->free_huge_pages--;
+ 		h->free_huge_pages_node[nid]--;
+* Unmerged path mm/memory-failure.c
+* Unmerged path mm/migrate.c
