@@ -4027,12 +4027,11 @@ xfs_bmapi_read(
 	struct xfs_mount	*mp = ip->i_mount;
 	struct xfs_ifork	*ifp;
 	struct xfs_bmbt_irec	got;
-	struct xfs_bmbt_irec	prev;
 	xfs_fileoff_t		obno;
 	xfs_fileoff_t		end;
-	xfs_extnum_t		lastx;
+	xfs_extnum_t		idx;
 	int			error;
-	int			eof;
+	bool			eof = false;
 	int			n = 0;
 	int			whichfork = (flags & XFS_BMAPI_ATTRFORK) ?
 						XFS_ATTR_FORK : XFS_DATA_FORK;
@@ -4062,7 +4061,8 @@ xfs_bmapi_read(
 			return error;
 	}
 
-	xfs_bmap_search_extents(ip, bno, whichfork, &eof, &lastx, &got, &prev);
+	if (!xfs_iext_lookup_extent(ip, ifp, bno, &idx, &got))
+		eof = true;
 	end = bno + len;
 	obno = bno;
 
@@ -4093,10 +4093,8 @@ xfs_bmapi_read(
 			break;
 
 		/* Else go on to the next record. */
-		if (++lastx < xfs_iext_count(ifp))
-			xfs_bmbt_get_all(xfs_iext_get_ext(ifp, lastx), &got);
-		else
-			eof = 1;
+		if (!xfs_iext_get_extent(ifp, ++idx, &got))
+			eof = true;
 	}
 	*nmap = n;
 	return 0;
