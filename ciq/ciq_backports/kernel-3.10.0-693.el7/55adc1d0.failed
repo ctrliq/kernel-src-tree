@@ -1,0 +1,247 @@
+mm: add private lock to serialize memory hotplug operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] add private lock to serialize memory hotplug operations (Jeff Moyer) [1438579]
+Rebuild_FUZZ: 96.49%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 55adc1d05dca9e949cdf46c747cb1e91c0e9143d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/55adc1d0.failed
+
+Commit bfc8c90139eb ("mem-hotplug: implement get/put_online_mems")
+introduced new functions get/put_online_mems() and mem_hotplug_begin/end()
+in order to allow similar semantics for memory hotplug like for cpu
+hotplug.
+
+The corresponding functions for cpu hotplug are get/put_online_cpus()
+and cpu_hotplug_begin/done() for cpu hotplug.
+
+The commit however missed to introduce functions that would serialize
+memory hotplug operations like they are done for cpu hotplug with
+cpu_maps_update_begin/done().
+
+This basically leaves mem_hotplug.active_writer unprotected and allows
+concurrent writers to modify it, which may lead to problems as outlined
+by commit f931ab479dd2 ("mm: fix devm_memremap_pages crash, use
+mem_hotplug_{begin, done}").
+
+That commit was extended again with commit b5d24fda9c3d ("mm,
+devm_memremap_pages: hold device_hotplug lock over mem_hotplug_{begin,
+done}") which serializes memory hotplug operations for some call sites
+by using the device_hotplug lock.
+
+In addition with commit 3fc21924100b ("mm: validate device_hotplug is held
+for memory hotplug") a sanity check was added to mem_hotplug_begin() to
+verify that the device_hotplug lock is held.
+
+This in turn triggers the following warning on s390:
+
+WARNING: CPU: 6 PID: 1 at drivers/base/core.c:643 assert_held_device_hotplug+0x4a/0x58
+ Call Trace:
+  assert_held_device_hotplug+0x40/0x58)
+  mem_hotplug_begin+0x34/0xc8
+  add_memory_resource+0x7e/0x1f8
+  add_memory+0xda/0x130
+  add_memory_merged+0x15c/0x178
+  sclp_detect_standby_memory+0x2ae/0x2f8
+  do_one_initcall+0xa2/0x150
+  kernel_init_freeable+0x228/0x2d8
+  kernel_init+0x2a/0x140
+  kernel_thread_starter+0x6/0xc
+
+One possible fix would be to add more lock_device_hotplug() and
+unlock_device_hotplug() calls around each call site of
+mem_hotplug_begin/end().  But that would give the device_hotplug lock
+additional semantics it better should not have (serialize memory hotplug
+operations).
+
+Instead add a new memory_add_remove_lock which has the similar semantics
+like cpu_add_remove_lock for cpu hotplug.
+
+To keep things hopefully a bit easier the lock will be locked and unlocked
+within the mem_hotplug_begin/end() functions.
+
+Link: http://lkml.kernel.org/r/20170314125226.16779-2-heiko.carstens@de.ibm.com
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Reported-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Acked-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Ben Hutchings <ben@decadent.org.uk>
+	Cc: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 55adc1d05dca9e949cdf46c747cb1e91c0e9143d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/memremap.c
+#	mm/memory_hotplug.c
+diff --cc kernel/memremap.c
+index 8e338960b262,07e85e5229da..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -229,7 -246,12 +229,16 @@@ static void devm_memremap_pages_release
+  	/* pages are dead and unused, undo the arch mapping */
+  	align_start = res->start & ~(SECTION_SIZE - 1);
+  	align_size = ALIGN(resource_size(res), SECTION_SIZE);
+++<<<<<<< HEAD
+ +	arch_remove_memory(align_start, align_size);
+++=======
++ 
++ 	mem_hotplug_begin();
++ 	arch_remove_memory(align_start, align_size);
++ 	mem_hotplug_done();
++ 
++ 	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+++>>>>>>> 55adc1d05dca (mm: add private lock to serialize memory hotplug operations)
+  	pgmap_radix_release(res);
+  	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
+  			"%s: failed to free all reserved pages\n", __func__);
+@@@ -339,7 -357,14 +348,18 @@@ void *devm_memremap_pages(struct devic
+  	if (nid < 0)
+  		nid = numa_mem_id();
+  
+++<<<<<<< HEAD
+++	error = arch_add_memory(nid, align_start, align_size, true);
+++=======
++ 	error = track_pfn_remap(NULL, &pgprot, PHYS_PFN(align_start), 0,
++ 			align_size);
++ 	if (error)
++ 		goto err_pfn_remap;
++ 
++ 	mem_hotplug_begin();
+  	error = arch_add_memory(nid, align_start, align_size, true);
++ 	mem_hotplug_done();
+++>>>>>>> 55adc1d05dca (mm: add private lock to serialize memory hotplug operations)
+  	if (error)
+  		goto err_add_memory;
+  
+diff --cc mm/memory_hotplug.c
+index 53747167957f,6fa7208bcd56..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -49,19 -50,108 +49,49 @@@
+  static void generic_online_page(struct page *page);
+  
+  static online_page_callback_t online_page_callback = generic_online_page;
+ -static DEFINE_MUTEX(online_page_callback_lock);
+ -
+ -/* The same as the cpu_hotplug lock, but for memory hotplug. */
+ -static struct {
+ -	struct task_struct *active_writer;
+ -	struct mutex lock; /* Synchronizes accesses to refcount, */
+ -	/*
+ -	 * Also blocks the new readers during
+ -	 * an ongoing mem hotplug operation.
+ -	 */
+ -	int refcount;
+  
+ -#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ -	struct lockdep_map dep_map;
+ -#endif
+ -} mem_hotplug = {
+ -	.active_writer = NULL,
+ -	.lock = __MUTEX_INITIALIZER(mem_hotplug.lock),
+ -	.refcount = 0,
+ -#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ -	.dep_map = {.name = "mem_hotplug.lock" },
+ -#endif
+ -};
+ -
+ -/* Lockdep annotations for get/put_online_mems() and mem_hotplug_begin/end() */
+ -#define memhp_lock_acquire_read() lock_map_acquire_read(&mem_hotplug.dep_map)
+ -#define memhp_lock_acquire()      lock_map_acquire(&mem_hotplug.dep_map)
+ -#define memhp_lock_release()      lock_map_release(&mem_hotplug.dep_map)
+ -
+ -#ifndef CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE
+ -bool memhp_auto_online;
+ -#else
+ -bool memhp_auto_online = true;
+ -#endif
+ -EXPORT_SYMBOL_GPL(memhp_auto_online);
+ +DEFINE_MUTEX(mem_hotplug_mutex);
+  
+ -static int __init setup_memhp_default_state(char *str)
+ +void lock_memory_hotplug(void)
+  {
+ -	if (!strcmp(str, "online"))
+ -		memhp_auto_online = true;
+ -	else if (!strcmp(str, "offline"))
+ -		memhp_auto_online = false;
+ -
+ -	return 1;
+ +	mutex_lock(&mem_hotplug_mutex);
+  }
+ -__setup("memhp_default_state=", setup_memhp_default_state);
+  
+ -void get_online_mems(void)
+ +void unlock_memory_hotplug(void)
+  {
+ -	might_sleep();
+ -	if (mem_hotplug.active_writer == current)
+ -		return;
+ -	memhp_lock_acquire_read();
+ -	mutex_lock(&mem_hotplug.lock);
+ -	mem_hotplug.refcount++;
+ -	mutex_unlock(&mem_hotplug.lock);
+ -
+ -}
+ -
+ -void put_online_mems(void)
+ -{
+ -	if (mem_hotplug.active_writer == current)
+ -		return;
+ -	mutex_lock(&mem_hotplug.lock);
+ -
+ -	if (WARN_ON(!mem_hotplug.refcount))
+ -		mem_hotplug.refcount++; /* try to fix things up */
+ -
+ -	if (!--mem_hotplug.refcount && unlikely(mem_hotplug.active_writer))
+ -		wake_up_process(mem_hotplug.active_writer);
+ -	mutex_unlock(&mem_hotplug.lock);
+ -	memhp_lock_release();
+ -
+ +	mutex_unlock(&mem_hotplug_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Serializes write accesses to mem_hotplug.active_writer. */
++ static DEFINE_MUTEX(memory_add_remove_lock);
++ 
++ void mem_hotplug_begin(void)
++ {
++ 	mutex_lock(&memory_add_remove_lock);
++ 
++ 	mem_hotplug.active_writer = current;
++ 
++ 	memhp_lock_acquire();
++ 	for (;;) {
++ 		mutex_lock(&mem_hotplug.lock);
++ 		if (likely(!mem_hotplug.refcount))
++ 			break;
++ 		__set_current_state(TASK_UNINTERRUPTIBLE);
++ 		mutex_unlock(&mem_hotplug.lock);
++ 		schedule();
++ 	}
++ }
++ 
++ void mem_hotplug_done(void)
++ {
++ 	mem_hotplug.active_writer = NULL;
++ 	mutex_unlock(&mem_hotplug.lock);
++ 	memhp_lock_release();
++ 	mutex_unlock(&memory_add_remove_lock);
++ }
+++>>>>>>> 55adc1d05dca (mm: add private lock to serialize memory hotplug operations)
+  
+  /* add this memory to iomem resource */
+  static struct resource *register_memory_resource(u64 start, u64 size)
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/memory_hotplug.c
