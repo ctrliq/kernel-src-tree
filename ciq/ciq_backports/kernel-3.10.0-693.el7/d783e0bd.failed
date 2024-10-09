@@ -1,0 +1,110 @@
+nvme: avoid cqe corruption when update at the same time as read
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] avoid cqe corruption when update at the same time as read (David Milburn) [1384066]
+Rebuild_FUZZ: 95.00%
+commit-author Marta Rybczynska <mrybczyn@kalray.eu>
+commit d783e0bd02e700e7a893ef4fa71c69438ac1c276
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d783e0bd.failed
+
+Make sure the CQE phase (validity) is read before the rest of the
+structure. The phase bit is the highest address and the CQE
+read will happen on most platforms from lower to upper addresses
+and will be done by multiple non-atomic loads. If the structure
+is updated by PCI during the reads from the processor, the
+processor may get a corrupted copy.
+
+The addition of the new nvme_cqe_valid function that verifies
+the validity bit also allows refactoring of the other CQE read
+sequences.
+
+	Signed-off-by: Marta Rybczynska <marta.rybczynska@kalray.eu>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit d783e0bd02e700e7a893ef4fa71c69438ac1c276)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index ee79751469a7,24ccda303efb..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -650,7 -723,14 +650,18 @@@ static void nvme_complete_rq(struct req
+  	blk_mq_end_request(req, error);
+  }
+  
+++<<<<<<< HEAD
+ +static int nvme_process_cq(struct nvme_queue *nvmeq)
+++=======
++ /* We read the CQE phase first to check if the rest of the entry is valid */
++ static inline bool nvme_cqe_valid(struct nvme_queue *nvmeq, u16 head,
++ 		u16 phase)
++ {
++ 	return (le16_to_cpu(nvmeq->cqes[head].status) & 1) == phase;
++ }
++ 
++ static void __nvme_process_cq(struct nvme_queue *nvmeq, unsigned int *tag)
+++>>>>>>> d783e0bd02e7 (nvme: avoid cqe corruption when update at the same time as read)
+  {
+  	u16 head, phase;
+  
+@@@ -690,11 -769,9 +698,17 @@@
+  		}
+  
+  		req = blk_mq_tag_to_rq(*nvmeq->tags, cqe.command_id);
+++<<<<<<< HEAD
+ +		if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
+ +			u32 result = le32_to_cpu(cqe.result);
+ +			req->special = (void *)(uintptr_t)result;
+ +		}
+ +		blk_mq_complete_request(req, status >> 1);
+++=======
++ 		if (req->cmd_type == REQ_TYPE_DRV_PRIV && req->special)
++ 			memcpy(req->special, &cqe, sizeof(cqe));
++ 		blk_mq_complete_request(req, le16_to_cpu(cqe.status) >> 1);
+++>>>>>>> d783e0bd02e7 (nvme: avoid cqe corruption when update at the same time as read)
+  
+  	}
+  
+@@@ -731,12 -812,27 +745,30 @@@ static irqreturn_t nvme_irq(int irq, vo
+  static irqreturn_t nvme_irq_check(int irq, void *data)
+  {
+  	struct nvme_queue *nvmeq = data;
+- 	struct nvme_completion cqe = nvmeq->cqes[nvmeq->cq_head];
+- 	if ((le16_to_cpu(cqe.status) & 1) != nvmeq->cq_phase)
+- 		return IRQ_NONE;
+- 	return IRQ_WAKE_THREAD;
++ 	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase))
++ 		return IRQ_WAKE_THREAD;
++ 	return IRQ_NONE;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static int nvme_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
++ {
++ 	struct nvme_queue *nvmeq = hctx->driver_data;
++ 
++ 	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase)) {
++ 		spin_lock_irq(&nvmeq->q_lock);
++ 		__nvme_process_cq(nvmeq, &tag);
++ 		spin_unlock_irq(&nvmeq->q_lock);
++ 
++ 		if (tag == -1)
++ 			return 1;
++ 	}
++ 
++ 	return 0;
+  }
+  
+++>>>>>>> d783e0bd02e7 (nvme: avoid cqe corruption when update at the same time as read)
+  static void nvme_async_event_work(struct work_struct *work)
+  {
+  	struct nvme_dev *dev = container_of(work, struct nvme_dev, async_work);
+* Unmerged path drivers/nvme/host/pci.c
