@@ -1,0 +1,101 @@
+mmc: block: Initialize ret in mmc_blk_issue_drv_op() for MMC_DRV_OP_IOCTL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Initialize ret in mmc_blk_issue_drv_op() for MMC_DRV_OP_IOCTL (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 96.45%
+commit-author Geert Uytterhoeven <geert@linux-m68k.org>
+commit 7432b49b54cd931743f0b6e9f652bc329e4a242a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7432b49b.failed
+
+With gcc 4.1.2:
+
+    drivers/mmc/core/block.c: In function ‘mmc_blk_issue_drv_op’:
+    drivers/mmc/core/block.c:1178: warning: ‘ret’ may be used uninitialized in this function
+
+Indeed, for MMC_DRV_OP_IOCTL, if mq_rq->ioc_count is zero, an
+uninitialized value will be stored in mq_rq->drv_op_result and passed to
+blk_end_request_all().
+
+Can mq_rq->ioc_count be zero?
+  - mmc_blk_ioctl_cmd() sets ioc_count to 1, so this is safe,
+  - mmc_blk_ioctl_multi_cmd() obtains ioc_count from user space in
+    response to the MMC_IOC_MULTI_CMD ioctl, and does allow zero.
+
+Initialize ret to zero to fix this for current and future callers.
+
+Fixes: 0493f6fe5bdee8ac ("mmc: block: Move boot partition locking into a driver op")
+	Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 7432b49b54cd931743f0b6e9f652bc329e4a242a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index ca0854db04c5,4920ea1ece38..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1147,7 -1165,55 +1147,59 @@@ int mmc_access_rpmb(struct mmc_queue *m
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++=======
++ /*
++  * The non-block commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	int ret;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 
++ 	switch (mq_rq->drv_op) {
++ 	case MMC_DRV_OP_IOCTL:
++ 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
++ 			ret = __mmc_blk_ioctl_cmd(card, md, mq_rq->idata[i]);
++ 			if (ret)
++ 				break;
++ 		}
++ 		/* Always switch back to main area after RPMB access */
++ 		if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++ 			mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
++ 		break;
++ 	case MMC_DRV_OP_BOOT_WP:
++ 		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
++ 				 card->ext_csd.boot_ro_lock |
++ 				 EXT_CSD_BOOT_WP_B_PWR_WP_EN,
++ 				 card->ext_csd.part_time);
++ 		if (ret)
++ 			pr_err("%s: Locking boot partition ro until next power on failed: %d\n",
++ 			       md->disk->disk_name, ret);
++ 		else
++ 			card->ext_csd.boot_ro_lock |=
++ 				EXT_CSD_BOOT_WP_B_PWR_WP_EN;
++ 		break;
++ 	default:
++ 		pr_err("%s: unknown driver specific operation\n",
++ 		       md->disk->disk_name);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mq_rq->drv_op_result = ret;
++ 	blk_end_request_all(req, ret);
++ }
++ 
++ static void mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++>>>>>>> 7432b49b54cd (mmc: block: Initialize ret in mmc_blk_issue_drv_op() for MMC_DRV_OP_IOCTL)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+* Unmerged path drivers/mmc/core/block.c
