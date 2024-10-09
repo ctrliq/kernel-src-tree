@@ -1,0 +1,362 @@
+vmcore: add API to collect hardware dump in second kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+commit 2724273e8fd00b512596a77ee063f49b25f36507
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2724273e.failed
+
+The sequence of actions done by device drivers to append their device
+specific hardware/firmware logs to /proc/vmcore are as follows:
+
+1. During probe (before hardware is initialized), device drivers
+register to the vmcore module (via vmcore_add_device_dump()), with
+callback function, along with buffer size and log name needed for
+firmware/hardware log collection.
+
+2. vmcore module allocates the buffer with requested size. It adds
+an Elf note and invokes the device driver's registered callback
+function.
+
+3. Device driver collects all hardware/firmware logs into the buffer
+and returns control back to vmcore module.
+
+Ensure that the device dump buffer size is always aligned to page size
+so that it can be mmaped.
+
+Also, rename alloc_elfnotes_buf() to vmcore_alloc_buf() to make it more
+generic and reserve NT_VMCOREDD note type to indicate vmcore device
+dump.
+
+	Suggested-by: Eric Biederman <ebiederm@xmission.com>.
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2724273e8fd00b512596a77ee063f49b25f36507)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/elf.h
+diff --cc include/uapi/linux/elf.h
+index a82fab732ebd,4e12c423b9fe..000000000000
+--- a/include/uapi/linux/elf.h
++++ b/include/uapi/linux/elf.h
+@@@ -414,10 -418,10 +414,17 @@@ typedef struct elf64_shdr 
+  #define NT_ARM_TLS	0x401		/* ARM TLS register */
+  #define NT_ARM_HW_BREAK	0x402		/* ARM hardware breakpoint registers */
+  #define NT_ARM_HW_WATCH	0x403		/* ARM hardware watchpoint registers */
+++<<<<<<< HEAD
+ +#define NT_METAG_CBUF	0x500		/* Metag catch buffer registers */
+ +#define NT_METAG_RPIPE	0x501		/* Metag read pipeline state */
+ +#define NT_METAG_TLS	0x502		/* Metag TLS pointer */
+ +
+++=======
++ #define NT_ARM_SYSTEM_CALL	0x404	/* ARM system call number */
++ #define NT_ARM_SVE	0x405		/* ARM Scalable Vector Extension registers */
++ #define NT_ARC_V2	0x600		/* ARCv2 accumulator/extra registers */
++ #define NT_VMCOREDD	0x700		/* Vmcore Device Dump Note */
+++>>>>>>> 2724273e8fd0 (vmcore: add API to collect hardware dump in second kernel)
+  
+  /* Note header in a PT_NOTE section */
+  typedef struct elf32_note {
+diff --git a/fs/proc/Kconfig b/fs/proc/Kconfig
+index 15af6222f8a4..072e4841e70f 100644
+--- a/fs/proc/Kconfig
++++ b/fs/proc/Kconfig
+@@ -39,6 +39,21 @@ config PROC_VMCORE
+         help
+         Exports the dump image of crashed kernel in ELF format.
+ 
++config PROC_VMCORE_DEVICE_DUMP
++	bool "Device Hardware/Firmware Log Collection"
++	depends on PROC_VMCORE
++	default n
++	help
++	  After kernel panic, device drivers can collect the device
++	  specific snapshot of their hardware or firmware before the
++	  underlying devices are initialized in crash recovery kernel.
++	  Note that the device driver must be present in the crash
++	  recovery kernel's initramfs to collect its underlying device
++	  snapshot.
++
++	  If you say Y here, the collected device dumps will be added
++	  as ELF notes to /proc/vmcore.
++
+ config PROC_SYSCTL
+ 	bool "Sysctl support (/proc/sys)" if EXPERT
+ 	depends on PROC_FS
+diff --git a/fs/proc/vmcore.c b/fs/proc/vmcore.c
+index 662a93a80c88..160b9a6576c1 100644
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@ -20,6 +20,7 @@
+ #include <linux/init.h>
+ #include <linux/crash_dump.h>
+ #include <linux/list.h>
++#include <linux/mutex.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pagemap.h>
+ #include <asm/uaccess.h>
+@@ -44,6 +45,12 @@ static u64 vmcore_size;
+ 
+ static struct proc_dir_entry *proc_vmcore = NULL;
+ 
++#ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++/* Device Dump list and mutex to synchronize access to list */
++static LIST_HEAD(vmcoredd_list);
++static DEFINE_MUTEX(vmcoredd_mutex);
++#endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++
+ /*
+  * Returns > 0 for RAM pages, 0 for non-RAM pages, < 0 on error
+  * The called function has to take care of module refcounting.
+@@ -300,10 +307,8 @@ static const struct vm_operations_struct vmcore_mmap_ops = {
+ };
+ 
+ /**
+- * alloc_elfnotes_buf - allocate buffer for ELF note segment in
+- *                      vmalloc memory
+- *
+- * @notes_sz: size of buffer
++ * vmcore_alloc_buf - allocate buffer in vmalloc memory
++ * @sizez: size of buffer
+  *
+  * If CONFIG_MMU is defined, use vmalloc_user() to allow users to mmap
+  * the buffer to user-space by means of remap_vmalloc_range().
+@@ -311,12 +316,12 @@ static const struct vm_operations_struct vmcore_mmap_ops = {
+  * If CONFIG_MMU is not defined, use vzalloc() since mmap_vmcore() is
+  * disabled and there's no need to allow users to mmap the buffer.
+  */
+-static inline char *alloc_elfnotes_buf(size_t notes_sz)
++static inline char *vmcore_alloc_buf(size_t size)
+ {
+ #ifdef CONFIG_MMU
+-	return vmalloc_user(notes_sz);
++	return vmalloc_user(size);
+ #else
+-	return vzalloc(notes_sz);
++	return vzalloc(size);
+ #endif
+ }
+ 
+@@ -586,7 +591,7 @@ static int __init merge_note_headers_elf64(char *elfptr, size_t *elfsz,
+ 		return rc;
+ 
+ 	*notes_sz = roundup(phdr_sz, PAGE_SIZE);
+-	*notes_buf = alloc_elfnotes_buf(*notes_sz);
++	*notes_buf = vmcore_alloc_buf(*notes_sz);
+ 	if (!*notes_buf)
+ 		return -ENOMEM;
+ 
+@@ -772,7 +777,7 @@ static int __init merge_note_headers_elf32(char *elfptr, size_t *elfsz,
+ 		return rc;
+ 
+ 	*notes_sz = roundup(phdr_sz, PAGE_SIZE);
+-	*notes_buf = alloc_elfnotes_buf(*notes_sz);
++	*notes_buf = vmcore_alloc_buf(*notes_sz);
+ 	if (!*notes_buf)
+ 		return -ENOMEM;
+ 
+@@ -1066,6 +1071,115 @@ static int __init parse_crash_elf_headers(void)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++/**
++ * vmcoredd_write_header - Write vmcore device dump header at the
++ * beginning of the dump's buffer.
++ * @buf: Output buffer where the note is written
++ * @data: Dump info
++ * @size: Size of the dump
++ *
++ * Fills beginning of the dump's buffer with vmcore device dump header.
++ */
++static void vmcoredd_write_header(void *buf, struct vmcoredd_data *data,
++				  u32 size)
++{
++	struct vmcoredd_header *vdd_hdr = (struct vmcoredd_header *)buf;
++
++	vdd_hdr->n_namesz = sizeof(vdd_hdr->name);
++	vdd_hdr->n_descsz = size + sizeof(vdd_hdr->dump_name);
++	vdd_hdr->n_type = NT_VMCOREDD;
++
++	strncpy((char *)vdd_hdr->name, VMCOREDD_NOTE_NAME,
++		sizeof(vdd_hdr->name));
++	memcpy(vdd_hdr->dump_name, data->dump_name, sizeof(vdd_hdr->dump_name));
++}
++
++/**
++ * vmcore_add_device_dump - Add a buffer containing device dump to vmcore
++ * @data: dump info.
++ *
++ * Allocate a buffer and invoke the calling driver's dump collect routine.
++ * Write Elf note at the beginning of the buffer to indicate vmcore device
++ * dump and add the dump to global list.
++ */
++int vmcore_add_device_dump(struct vmcoredd_data *data)
++{
++	struct vmcoredd_node *dump;
++	void *buf = NULL;
++	size_t data_size;
++	int ret;
++
++	if (!data || !strlen(data->dump_name) ||
++	    !data->vmcoredd_callback || !data->size)
++		return -EINVAL;
++
++	dump = vzalloc(sizeof(*dump));
++	if (!dump) {
++		ret = -ENOMEM;
++		goto out_err;
++	}
++
++	/* Keep size of the buffer page aligned so that it can be mmaped */
++	data_size = roundup(sizeof(struct vmcoredd_header) + data->size,
++			    PAGE_SIZE);
++
++	/* Allocate buffer for driver's to write their dumps */
++	buf = vmcore_alloc_buf(data_size);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto out_err;
++	}
++
++	vmcoredd_write_header(buf, data, data_size -
++			      sizeof(struct vmcoredd_header));
++
++	/* Invoke the driver's dump collection routing */
++	ret = data->vmcoredd_callback(data, buf +
++				      sizeof(struct vmcoredd_header));
++	if (ret)
++		goto out_err;
++
++	dump->buf = buf;
++	dump->size = data_size;
++
++	/* Add the dump to driver sysfs list */
++	mutex_lock(&vmcoredd_mutex);
++	list_add_tail(&dump->list, &vmcoredd_list);
++	mutex_unlock(&vmcoredd_mutex);
++
++	return 0;
++
++out_err:
++	if (buf)
++		vfree(buf);
++
++	if (dump)
++		vfree(dump);
++
++	return ret;
++}
++EXPORT_SYMBOL(vmcore_add_device_dump);
++#endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++
++/* Free all dumps in vmcore device dump list */
++static void vmcore_free_device_dumps(void)
++{
++#ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++	mutex_lock(&vmcoredd_mutex);
++	while (!list_empty(&vmcoredd_list)) {
++		struct vmcoredd_node *dump;
++
++		dump = list_first_entry(&vmcoredd_list, struct vmcoredd_node,
++					list);
++		list_del(&dump->list);
++		vfree(dump->buf);
++		vfree(dump);
++	}
++	mutex_unlock(&vmcoredd_mutex);
++#endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
++}
++
+ /* Init function for vmcore module. */
+ static int __init vmcore_init(void)
+ {
+@@ -1115,5 +1229,8 @@ void vmcore_cleanup(void)
+ 		kfree(m);
+ 	}
+ 	free_elfcorebuf();
++
++	/* clear vmcore device dump list */
++	vmcore_free_device_dumps();
+ }
+ EXPORT_SYMBOL_GPL(vmcore_cleanup);
+diff --git a/include/linux/crash_dump.h b/include/linux/crash_dump.h
+index fe68a5a98583..ddf2c9971be5 100644
+--- a/include/linux/crash_dump.h
++++ b/include/linux/crash_dump.h
+@@ -5,6 +5,7 @@
+ #include <linux/kexec.h>
+ #include <linux/proc_fs.h>
+ #include <linux/elf.h>
++#include <uapi/linux/vmcore.h>
+ 
+ #define ELFCORE_ADDR_MAX	(-1ULL)
+ #define ELFCORE_ADDR_ERR	(-2ULL)
+@@ -86,4 +87,21 @@ static inline int is_kdump_kernel(void) { return 0; }
+ #endif /* CONFIG_CRASH_DUMP */
+ 
+ extern unsigned long saved_max_pfn;
++
++/* Device Dump information to be filled by drivers */
++struct vmcoredd_data {
++	char dump_name[VMCOREDD_MAX_NAME_BYTES]; /* Unique name of the dump */
++	unsigned int size;                       /* Size of the dump */
++	/* Driver's registered callback to be invoked to collect dump */
++	int (*vmcoredd_callback)(struct vmcoredd_data *data, void *buf);
++};
++
++#ifdef CONFIG_PROC_VMCORE_DEVICE_DUMP
++int vmcore_add_device_dump(struct vmcoredd_data *data);
++#else
++static inline int vmcore_add_device_dump(struct vmcoredd_data *data)
++{
++	return -EOPNOTSUPP;
++}
++#endif /* CONFIG_PROC_VMCORE_DEVICE_DUMP */
+ #endif /* LINUX_CRASHDUMP_H */
+diff --git a/include/linux/kcore.h b/include/linux/kcore.h
+index 3ffade4f2798..fc60c51e5058 100644
+--- a/include/linux/kcore.h
++++ b/include/linux/kcore.h
+@@ -27,6 +27,12 @@ struct vmcore {
+ 	loff_t offset;
+ };
+ 
++struct vmcoredd_node {
++	struct list_head list;	/* List of dumps */
++	void *buf;		/* Buffer containing device's dump */
++	unsigned int size;	/* Size of the buffer */
++};
++
+ #ifdef CONFIG_PROC_KCORE
+ extern void kclist_add(struct kcore_list *, void *, size_t, int type);
+ #else
+* Unmerged path include/uapi/linux/elf.h
+diff --git a/include/uapi/linux/vmcore.h b/include/uapi/linux/vmcore.h
+new file mode 100644
+index 000000000000..022619668e0e
+--- /dev/null
++++ b/include/uapi/linux/vmcore.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _UAPI_VMCORE_H
++#define _UAPI_VMCORE_H
++
++#include <linux/types.h>
++
++#define VMCOREDD_NOTE_NAME "LINUX"
++#define VMCOREDD_MAX_NAME_BYTES 44
++
++struct vmcoredd_header {
++	__u32 n_namesz; /* Name size */
++	__u32 n_descsz; /* Content size */
++	__u32 n_type;   /* NT_VMCOREDD */
++	__u8 name[8];   /* LINUX\0\0\0 */
++	__u8 dump_name[VMCOREDD_MAX_NAME_BYTES]; /* Device dump's name */
++};
++
++#endif /* _UAPI_VMCORE_H */
