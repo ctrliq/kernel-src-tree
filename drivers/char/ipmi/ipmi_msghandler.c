@@ -245,7 +245,9 @@ struct seq_table {
 struct ipmi_channel {
 	unsigned char medium;
 	unsigned char protocol;
+};
 
+struct ipmi_my_addrinfo {
 	/*
 	 * My slave address.  This is initialized to IPMI_BMC_SLAVE_ADDR,
 	 * but may be changed by the user.
@@ -521,6 +523,7 @@ struct ipmi_smi {
 
 	/* Channel information */
 	struct ipmi_channel channels[IPMI_MAX_CHANNELS];
+	struct ipmi_my_addrinfo addrinfo[IPMI_MAX_CHANNELS];
 
 	/* Proc FS stuff. */
 	struct proc_dir_entry *proc_dir;
@@ -1252,7 +1255,7 @@ int ipmi_set_my_address(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
-	user->intf->channels[channel].address = address;
+	user->intf->addrinfo[channel].address = address;
 	return 0;
 }
 EXPORT_SYMBOL(ipmi_set_my_address);
@@ -1263,7 +1266,7 @@ int ipmi_get_my_address(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
-	*address = user->intf->channels[channel].address;
+	*address = user->intf->addrinfo[channel].address;
 	return 0;
 }
 EXPORT_SYMBOL(ipmi_get_my_address);
@@ -1274,7 +1277,7 @@ int ipmi_set_my_LUN(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
-	user->intf->channels[channel].lun = LUN & 0x3;
+	user->intf->addrinfo[channel].lun = LUN & 0x3;
 	return 0;
 }
 EXPORT_SYMBOL(ipmi_set_my_LUN);
@@ -1285,7 +1288,7 @@ int ipmi_get_my_LUN(ipmi_user_t   user,
 {
 	if (channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
-	*address = user->intf->channels[channel].lun;
+	*address = user->intf->addrinfo[channel].lun;
 	return 0;
 }
 EXPORT_SYMBOL(ipmi_get_my_LUN);
@@ -2048,8 +2051,8 @@ static int check_addr(ipmi_smi_t       intf,
 {
 	if (addr->channel >= IPMI_MAX_CHANNELS)
 		return -EINVAL;
-	*lun = intf->channels[addr->channel].lun;
-	*saddr = intf->channels[addr->channel].address;
+	*lun = intf->addrinfo[addr->channel].lun;
+	*saddr = intf->addrinfo[addr->channel].address;
 	return 0;
 }
 
@@ -2170,8 +2173,8 @@ send_get_device_id_cmd(ipmi_smi_t intf)
 			      NULL,
 			      NULL,
 			      0,
-			      intf->channels[0].address,
-			      intf->channels[0].lun,
+			      intf->addrinfo[0].address,
+			      intf->addrinfo[0].lun,
 			      -1, 0);
 }
 
@@ -2284,9 +2287,9 @@ static int smi_ipmb_proc_show(struct seq_file *m, void *v)
 	ipmi_smi_t intf = m->private;
 	int        i;
 
-	seq_printf(m, "%x", intf->channels[0].address);
+	seq_printf(m, "%x", intf->addrinfo[0].address);
 	for (i = 1; i < IPMI_MAX_CHANNELS; i++)
-		seq_printf(m, " %x", intf->channels[i].address);
+		seq_printf(m, " %x", intf->addrinfo[i].address);
 	seq_putc(m, '\n');
 
 	return 0;
@@ -3015,8 +3018,8 @@ send_guid_cmd(ipmi_smi_t intf, int chan)
 			      NULL,
 			      NULL,
 			      0,
-			      intf->channels[0].address,
-			      intf->channels[0].lun,
+			      intf->addrinfo[0].address,
+			      intf->addrinfo[0].lun,
 			      -1, 0);
 }
 
@@ -3091,8 +3094,8 @@ send_channel_info_cmd(ipmi_smi_t intf, int chan)
 			      NULL,
 			      NULL,
 			      0,
-			      intf->channels[0].address,
-			      intf->channels[0].lun,
+			      intf->addrinfo[0].address,
+			      intf->addrinfo[0].lun,
 			      -1, 0);
 }
 
@@ -3214,11 +3217,11 @@ int ipmi_register_smi(struct ipmi_smi_handlers *handlers,
 	kref_init(&intf->refcount);
 	intf->si_dev = si_dev;
 	for (j = 0; j < IPMI_MAX_CHANNELS; j++) {
-		intf->channels[j].address = IPMI_BMC_SLAVE_ADDR;
-		intf->channels[j].lun = 2;
+		intf->addrinfo[j].address = IPMI_BMC_SLAVE_ADDR;
+		intf->addrinfo[j].lun = 2;
 	}
 	if (slave_addr != 0)
-		intf->channels[0].address = slave_addr;
+		intf->addrinfo[0].address = slave_addr;
 	INIT_LIST_HEAD(&intf->users);
 	intf->handlers = handlers;
 	intf->send_info = send_info;
@@ -3548,7 +3551,7 @@ static int handle_ipmb_get_msg_cmd(ipmi_smi_t          intf,
 		msg->data[3] = msg->rsp[6];
 		msg->data[4] = ((netfn + 1) << 2) | (msg->rsp[7] & 0x3);
 		msg->data[5] = ipmb_checksum(&(msg->data[3]), 2);
-		msg->data[6] = intf->channels[msg->rsp[3] & 0xf].address;
+		msg->data[6] = intf->addrinfo[msg->rsp[3] & 0xf].address;
 		/* rqseq/lun */
 		msg->data[7] = (msg->rsp[7] & 0xfc) | (msg->rsp[4] & 0x3);
 		msg->data[8] = msg->rsp[8]; /* cmd */
@@ -4727,8 +4730,8 @@ static void ipmi_panic_request_and_wait(ipmi_smi_t           intf,
 			    &smi_msg,
 			    &recv_msg,
 			    0,
-			    intf->channels[0].address,
-			    intf->channels[0].lun,
+			    intf->addrinfo[0].address,
+			    intf->addrinfo[0].lun,
 			    0, 1); /* Don't retry, and don't wait. */
 	if (rv)
 		atomic_sub(2, &panic_done_count);
@@ -4877,7 +4880,7 @@ static void send_panic_events(char *str)
 		 */
 		if (((intf->event_receiver & 1) == 0)
 		    && (intf->event_receiver != 0)
-		    && (intf->event_receiver != intf->channels[0].address)) {
+		    && (intf->event_receiver != intf->addrinfo[0].address)) {
 			/*
 			 * The event receiver is valid, send an IPMB
 			 * message.
@@ -4914,7 +4917,7 @@ static void send_panic_events(char *str)
 			data[0] = 0;
 			data[1] = 0;
 			data[2] = 0xf0; /* OEM event without timestamp. */
-			data[3] = intf->channels[0].address;
+			data[3] = intf->addrinfo[0].address;
 			data[4] = j++; /* sequence # */
 			/*
 			 * Always give 11 bytes, so strncpy will fill
