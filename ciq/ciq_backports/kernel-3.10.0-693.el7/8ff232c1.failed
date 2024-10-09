@@ -1,0 +1,121 @@
+dm mpath: always return reservation conflict without failing over
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hannes Reinecke <hare@suse.de>
+commit 8ff232c1a819c2e98d85974a3bff0b7b8e2970ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8ff232c1.failed
+
+If dm-mpath encounters an reservation conflict it should not fail the
+path (as communication with the target is not affected) but should
+rather retry on another path.  However, in doing so we might be inducing
+a ping-pong between paths, with no guarantee of any forward progress.
+And arguably a reservation conflict is an unexpected error, so we should
+be passing it upwards to allow the application to take appropriate
+steps.
+
+This change resolves a show-stopper problem seen with the pNFS SCSI
+layout because it is trivial to hit reservation conflict based failover
+loops without it.
+
+Doubts were raised about the implications of this change relative to
+products like IBM's SVC.  But there is little point withholding a fix
+for Linux because a proprietary product may or may not have some issues
+in its implementation of how it interfaces with Linux.  In the future,
+if there is glaring evidence that this change is certainly problematic
+we can revisit it.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Acked-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com> # tweaked header
+(cherry picked from commit 8ff232c1a819c2e98d85974a3bff0b7b8e2970ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index 18be29ec3a10,e477af8596e2..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -1365,11 -1580,8 +1373,8 @@@ static int do_end_io(struct multipath *
+  
+  	if (!atomic_read(&m->nr_valid_paths)) {
+  		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
+ -			if (!must_push_back_rq(m))
+ +			if (!must_push_back(m))
+  				r = -EIO;
+- 		} else {
+- 			if (error == -EBADE)
+- 				r = error;
+  		}
+  	}
+  
+@@@ -1399,6 -1611,61 +1404,64 @@@ static int multipath_end_io(struct dm_t
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int do_end_io_bio(struct multipath *m, struct bio *clone,
++ 			 int error, struct dm_mpath_io *mpio)
++ {
++ 	unsigned long flags;
++ 
++ 	if (!error)
++ 		return 0;	/* I/O complete */
++ 
++ 	if (noretry_error(error))
++ 		return error;
++ 
++ 	if (mpio->pgpath)
++ 		fail_path(mpio->pgpath);
++ 
++ 	if (!atomic_read(&m->nr_valid_paths)) {
++ 		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
++ 			if (!must_push_back_bio(m))
++ 				return -EIO;
++ 			return DM_ENDIO_REQUEUE;
++ 		}
++ 	}
++ 
++ 	/* Queue for the daemon to resubmit */
++ 	dm_bio_restore(get_bio_details_from_bio(clone), clone);
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 	bio_list_add(&m->queued_bios, clone);
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 	if (!test_bit(MPATHF_QUEUE_IO, &m->flags))
++ 		queue_work(kmultipathd, &m->process_queued_bios);
++ 
++ 	return DM_ENDIO_INCOMPLETE;
++ }
++ 
++ static int multipath_end_io_bio(struct dm_target *ti, struct bio *clone, int error)
++ {
++ 	struct multipath *m = ti->private;
++ 	struct dm_mpath_io *mpio = get_mpio_from_bio(clone);
++ 	struct pgpath *pgpath;
++ 	struct path_selector *ps;
++ 	int r;
++ 
++ 	BUG_ON(!mpio);
++ 
++ 	r = do_end_io_bio(m, clone, error, mpio);
++ 	pgpath = mpio->pgpath;
++ 	if (pgpath) {
++ 		ps = &pgpath->pg->ps;
++ 		if (ps->type->end_io)
++ 			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes);
++ 	}
++ 
++ 	return r;
++ }
++ 
+++>>>>>>> 8ff232c1a819 (dm mpath: always return reservation conflict without failing over)
+  /*
+   * Suspend can't complete until all the I/O is processed so if
+   * the last path fails we must error any remaining I/O.
+* Unmerged path drivers/md/dm-mpath.c
