@@ -1,0 +1,751 @@
+kvm: mmu: ITLB_MULTIHIT mitigation
+
+jira LE-1907
+cve CVE-2018-12207
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit b8e8c8303ff28c61046a4d0f6ea99aea609a7dc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/b8e8c830.failed
+
+With some Intel processors, putting the same virtual address in the TLB
+as both a 4 KiB and 2 MiB page can confuse the instruction fetch unit
+and cause the processor to issue a machine check resulting in a CPU lockup.
+
+Unfortunately when EPT page tables use huge pages, it is possible for a
+malicious guest to cause this situation.
+
+Add a knob to mark huge pages as non-executable. When the nx_huge_pages
+parameter is enabled (and we are using EPT), all huge pages are marked as
+NX. If the guest attempts to execute in one of those pages, the page is
+broken down into 4K pages, which are then marked executable.
+
+This is not an issue for shadow paging (except nested EPT), because then
+the host is in control of TLB flushes and the problematic situation cannot
+happen.  With nested EPT, again the nested guest can cause problems shadow
+and direct EPT is treated in the same way.
+
+[ tglx: Fixup default to auto and massage wording a bit ]
+
+Originally-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit b8e8c8303ff28c61046a4d0f6ea99aea609a7dc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/paging_tmpl.h
+#	arch/x86/kvm/x86.c
+diff --cc Documentation/kernel-parameters.txt
+index 4ee8a23b1fd1,9d5f123cc218..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -2035,12 -2640,22 +2048,22 @@@ bytes respectively. Such letter suffixe
+  				improves system performance, but it may also
+  				expose users to several CPU vulnerabilities.
+  				Equivalent to: nopti [X86,PPC]
+ -					       kpti=0 [ARM64]
+ -					       nospectre_v1 [X86,PPC]
+ +					       nospectre_v1 [PPC]
+  					       nobp=0 [S390]
+ -					       nospectre_v2 [X86,PPC,S390,ARM64]
+ -					       spectre_v2_user=off [X86]
+ +					       nospectre_v2 [X86,PPC,S390]
+  					       spec_store_bypass_disable=off [X86,PPC]
+ -					       ssbd=force-off [ARM64]
+  					       l1tf=off [X86]
+  					       mds=off [X86]
+++<<<<<<< HEAD:Documentation/kernel-parameters.txt
+++=======
++ 					       tsx_async_abort=off [X86]
++ 					       kvm.nx_huge_pages=off [X86]
++ 
++ 				Exceptions:
++ 					       This does not have any effect on
++ 					       kvm.nx_huge_pages when
++ 					       kvm.nx_huge_pages=force.
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation):Documentation/admin-guide/kernel-parameters.txt
+  
+  			auto (default)
+  				Mitigate all CPU vulnerabilities, but leave SMT
+diff --cc arch/x86/include/asm/kvm_host.h
+index 35f22ae3e497,a37b03483b66..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -283,6 -312,10 +283,13 @@@ struct kvm_rmap_head 
+  struct kvm_mmu_page {
+  	struct list_head link;
+  	struct hlist_node hash_link;
+++<<<<<<< HEAD
+++=======
++ 	bool unsync;
++ 	u8 mmu_valid_gen;
++ 	bool mmio_cached;
++ 	bool lpage_disallowed; /* Can't be replaced by an equiv large page */
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  
+  	/*
+  	 * The following two entries are used to key the shadow page in the
+@@@ -862,6 -947,8 +869,11 @@@ struct kvm_vm_stat 
+  	ulong mmu_unsync;
+  	ulong remote_tlb_flush;
+  	ulong lpages;
+++<<<<<<< HEAD
+++=======
++ 	ulong nx_lpage_splits;
++ 	ulong max_mmu_page_hash_collisions;
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  };
+  
+  struct kvm_vcpu_stat {
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 9ec6cfa4f503,850005590167..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -724,6 -1248,18 +724,21 @@@ int arch_prctl_spec_ctrl_get(struct tas
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void x86_spec_ctrl_setup_ap(void)
++ {
++ 	if (boot_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++ 
++ 	if (ssb_mode == SPEC_STORE_BYPASS_DISABLE)
++ 		x86_amd_ssb_disable();
++ }
++ 
++ bool itlb_multihit_kvm_mitigation;
++ EXPORT_SYMBOL_GPL(itlb_multihit_kvm_mitigation);
++ 
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  #undef pr_fmt
+  #define pr_fmt(fmt)	"L1TF: " fmt
+  
+@@@ -880,11 -1428,16 +903,19 @@@ static ssize_t l1tf_show_state(char *bu
+  {
+  	return sprintf(buf, "%s\n", L1TF_DEFAULT_MSG);
+  }
++ 
+++<<<<<<< HEAD
+++=======
++ static ssize_t itlb_multihit_show_state(char *buf)
++ {
++ 	return sprintf(buf, "Processor vulnerable\n");
++ }
+  #endif
+  
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  static ssize_t mds_show_state(char *buf)
+  {
+ -	if (boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
+ +	if (x86_hyper) {
+  		return sprintf(buf, "%s; SMT Host state unknown\n",
+  			       mds_strings[mds_mitigation]);
+  	}
+diff --cc arch/x86/kvm/mmu.c
+index 9724e772f5d0,bedf6864b092..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -253,15 -343,37 +267,20 @@@ static inline bool sp_ad_disabled(struc
+  	return sp->role.ad_disabled;
+  }
+  
+ -static inline bool kvm_vcpu_ad_need_write_protect(struct kvm_vcpu *vcpu)
+ -{
+ -	/*
+ -	 * When using the EPT page-modification log, the GPAs in the log
+ -	 * would come from L2 rather than L1.  Therefore, we need to rely
+ -	 * on write protection to record dirty pages.  This also bypasses
+ -	 * PML, since writes now result in a vmexit.
+ -	 */
+ -	return vcpu->arch.mmu == &vcpu->arch.guest_mmu;
+ -}
+ -
+  static inline bool spte_ad_enabled(u64 spte)
+  {
+ -	MMU_WARN_ON(is_mmio_spte(spte));
+ -	return (spte & SPTE_SPECIAL_MASK) != SPTE_AD_DISABLED_MASK;
+ -}
+ -
+ -static inline bool spte_ad_need_write_protect(u64 spte)
+ -{
+ -	MMU_WARN_ON(is_mmio_spte(spte));
+ -	return (spte & SPTE_SPECIAL_MASK) != SPTE_AD_ENABLED_MASK;
+ +	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
+ +	return !(spte & shadow_acc_track_value);
+  }
+  
++ static bool is_nx_huge_page_enabled(void)
++ {
++ 	return READ_ONCE(nx_huge_pages);
++ }
++ 
+  static inline u64 spte_shadow_accessed_mask(u64 spte)
+  {
+ -	MMU_WARN_ON(is_mmio_spte(spte));
+ +	MMU_WARN_ON((spte & shadow_mmio_mask) == shadow_mmio_value);
+  	return spte_ad_enabled(spte) ? shadow_accessed_mask : 0;
+  }
+  
+@@@ -2625,8 -2826,20 +2659,11 @@@ static int kvm_mmu_prepare_zap_page(str
+  			kvm_reload_remote_mmus(kvm);
+  	}
+  
++ 	if (sp->lpage_disallowed)
++ 		unaccount_huge_nx_page(kvm, sp);
++ 
+  	sp->role.invalid = 1;
+ -	return list_unstable;
+ -}
+ -
+ -static bool kvm_mmu_prepare_zap_page(struct kvm *kvm, struct kvm_mmu_page *sp,
+ -				     struct list_head *invalid_list)
+ -{
+ -	int nr_zapped;
+ -
+ -	__kvm_mmu_prepare_zap_page(kvm, sp, invalid_list, &nr_zapped);
+ -	return nr_zapped;
+ +	return ret;
+  }
+  
+  static void kvm_mmu_commit_zap_page(struct kvm *kvm,
+@@@ -3055,41 -3275,71 +3097,89 @@@ static void direct_pte_prefetch(struct 
+  	__direct_pte_prefetch(vcpu, sp, sptep);
+  }
+  
+++<<<<<<< HEAD
+ +static int __direct_map(struct kvm_vcpu *vcpu, gpa_t v, int write,
+ +			int map_writable, int level, gfn_t gfn, kvm_pfn_t pfn,
+ +			bool prefault)
+++=======
++ static void disallowed_hugepage_adjust(struct kvm_shadow_walk_iterator it,
++ 				       gfn_t gfn, kvm_pfn_t *pfnp, int *levelp)
++ {
++ 	int level = *levelp;
++ 	u64 spte = *it.sptep;
++ 
++ 	if (it.level == level && level > PT_PAGE_TABLE_LEVEL &&
++ 	    is_nx_huge_page_enabled() &&
++ 	    is_shadow_present_pte(spte) &&
++ 	    !is_large_pte(spte)) {
++ 		/*
++ 		 * A small SPTE exists for this pfn, but FNAME(fetch)
++ 		 * and __direct_map would like to create a large PTE
++ 		 * instead: just force them to go down another level,
++ 		 * patching back for them into pfn the next 9 bits of
++ 		 * the address.
++ 		 */
++ 		u64 page_mask = KVM_PAGES_PER_HPAGE(level) - KVM_PAGES_PER_HPAGE(level - 1);
++ 		*pfnp |= gfn & page_mask;
++ 		(*levelp)--;
++ 	}
++ }
++ 
++ static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
++ 			int map_writable, int level, kvm_pfn_t pfn,
++ 			bool prefault, bool lpage_disallowed)
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  {
+ -	struct kvm_shadow_walk_iterator it;
+ +	struct kvm_shadow_walk_iterator iterator;
+  	struct kvm_mmu_page *sp;
+ -	int ret;
+ -	gfn_t gfn = gpa >> PAGE_SHIFT;
+ -	gfn_t base_gfn = gfn;
+ +	int emulate = 0;
+ +	gfn_t pseudo_gfn;
+  
+  	if (!VALID_PAGE(vcpu->arch.mmu->root_hpa))
+ -		return RET_PF_RETRY;
+ +		return 0;
+  
+++<<<<<<< HEAD
+ +	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
+ +		if (iterator.level == level) {
+ +			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
+ +					       write, level, gfn, pfn, prefault,
+ +					       map_writable);
+ +			direct_pte_prefetch(vcpu, iterator.sptep);
+ +			++vcpu->stat.pf_fixed;
+++=======
++ 	trace_kvm_mmu_spte_requested(gpa, level, pfn);
++ 	for_each_shadow_entry(vcpu, gpa, it) {
++ 		/*
++ 		 * We cannot overwrite existing page tables with an NX
++ 		 * large page, as the leaf could be executable.
++ 		 */
++ 		disallowed_hugepage_adjust(it, gfn, &pfn, &level);
++ 
++ 		base_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
++ 		if (it.level == level)
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  			break;
+ +		}
+ +
+ +		drop_large_spte(vcpu, iterator.sptep);
+ +		if (!is_shadow_present_pte(*iterator.sptep)) {
+ +			u64 base_addr = iterator.addr;
+  
+ -		drop_large_spte(vcpu, it.sptep);
+ -		if (!is_shadow_present_pte(*it.sptep)) {
+ -			sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
+ -					      it.level - 1, true, ACC_ALL);
+++<<<<<<< HEAD
+ +			base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
+ +			pseudo_gfn = base_addr >> PAGE_SHIFT;
+ +			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
+ +					      iterator.level - 1, 1, ACC_ALL);
+  
+ +			link_shadow_page(vcpu, iterator.sptep, sp);
+++=======
++ 			link_shadow_page(vcpu, it.sptep, sp);
++ 			if (lpage_disallowed)
++ 				account_huge_nx_page(vcpu->kvm, sp);
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  		}
+  	}
+ -
+ -	ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
+ -			   write, level, base_gfn, pfn, prefault,
+ -			   map_writable);
+ -	direct_pte_prefetch(vcpu, it.sptep);
+ -	++vcpu->stat.pf_fixed;
+ -	return ret;
+ +	return emulate;
+  }
+  
+  static void kvm_send_hwpoison_signal(unsigned long address, struct task_struct *tsk)
+@@@ -3423,14 -3663,9 +3516,20 @@@ static int nonpaging_map(struct kvm_vcp
+  	if (make_mmu_pages_available(vcpu) < 0)
+  		goto out_unlock;
+  	if (likely(!force_pt_level))
+++<<<<<<< HEAD
+ +		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+ +	r = __direct_map(vcpu, v, write, map_writable, level, gfn, pfn,
+ +			 prefault);
+ +	spin_unlock(&vcpu->kvm->mmu_lock);
+ +
+ +
+ +	return r;
+ +
+++=======
++ 		transparent_hugepage_adjust(vcpu, gfn, &pfn, &level);
++ 	r = __direct_map(vcpu, v, write, map_writable, level, pfn,
++ 			 prefault, false);
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+  	kvm_release_pfn_clean(pfn);
+@@@ -4068,13 -4293,9 +4170,19 @@@ static int tdp_page_fault(struct kvm_vc
+  	if (make_mmu_pages_available(vcpu) < 0)
+  		goto out_unlock;
+  	if (likely(!force_pt_level))
+++<<<<<<< HEAD
+ +		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+ +	r = __direct_map(vcpu, gpa, write, map_writable,
+ +			 level, gfn, pfn, prefault);
+ +	spin_unlock(&vcpu->kvm->mmu_lock);
+ +
+ +	return r;
+ +
+++=======
++ 		transparent_hugepage_adjust(vcpu, gfn, &pfn, &level);
++ 	r = __direct_map(vcpu, gpa, write, map_writable, level, pfn,
++ 			 prefault, lpage_disallowed);
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+  	kvm_release_pfn_clean(pfn);
+@@@ -5822,8 -6208,86 +5930,91 @@@ static void mmu_destroy_caches(void
+  	kmem_cache_destroy(mmu_page_header_cache);
+  }
+  
+++<<<<<<< HEAD
+ +int kvm_mmu_module_init(void)
+ +{
+++=======
++ static void kvm_set_mmio_spte_mask(void)
++ {
++ 	u64 mask;
++ 
++ 	/*
++ 	 * Set the reserved bits and the present bit of an paging-structure
++ 	 * entry to generate page fault with PFER.RSV = 1.
++ 	 */
++ 
++ 	/*
++ 	 * Mask the uppermost physical address bit, which would be reserved as
++ 	 * long as the supported physical address width is less than 52.
++ 	 */
++ 	mask = 1ull << 51;
++ 
++ 	/* Set the present bit. */
++ 	mask |= 1ull;
++ 
++ 	/*
++ 	 * If reserved bit is not supported, clear the present bit to disable
++ 	 * mmio page fault.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_X86_64) && shadow_phys_bits == 52)
++ 		mask &= ~1ull;
++ 
++ 	kvm_mmu_set_mmio_spte_mask(mask, mask, ACC_WRITE_MASK | ACC_USER_MASK);
++ }
++ 
++ static bool get_nx_auto_mode(void)
++ {
++ 	/* Return true when CPU has the bug, and mitigations are ON */
++ 	return boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT) && !cpu_mitigations_off();
++ }
++ 
++ static void __set_nx_huge_pages(bool val)
++ {
++ 	nx_huge_pages = itlb_multihit_kvm_mitigation = val;
++ }
++ 
++ static int set_nx_huge_pages(const char *val, const struct kernel_param *kp)
++ {
++ 	bool old_val = nx_huge_pages;
++ 	bool new_val;
++ 
++ 	/* In "auto" mode deploy workaround only if CPU has the bug. */
++ 	if (sysfs_streq(val, "off"))
++ 		new_val = 0;
++ 	else if (sysfs_streq(val, "force"))
++ 		new_val = 1;
++ 	else if (sysfs_streq(val, "auto"))
++ 		new_val = get_nx_auto_mode();
++ 	else if (strtobool(val, &new_val) < 0)
++ 		return -EINVAL;
++ 
++ 	__set_nx_huge_pages(new_val);
++ 
++ 	if (new_val != old_val) {
++ 		struct kvm *kvm;
++ 		int idx;
++ 
++ 		mutex_lock(&kvm_lock);
++ 
++ 		list_for_each_entry(kvm, &vm_list, vm_list) {
++ 			idx = srcu_read_lock(&kvm->srcu);
++ 			kvm_mmu_zap_all_fast(kvm);
++ 			srcu_read_unlock(&kvm->srcu, idx);
++ 		}
++ 		mutex_unlock(&kvm_lock);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int kvm_mmu_module_init(void)
++ {
++ 	int ret = -ENOMEM;
++ 
++ 	if (nx_huge_pages == -1)
++ 		__set_nx_huge_pages(get_nx_auto_mode());
++ 
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  	/*
+  	 * MMU roles use union aliasing which is, generally speaking, an
+  	 * undefined behavior. However, we supposedly know how compilers behave
+diff --cc arch/x86/kvm/paging_tmpl.h
+index 0da31d8cbf16,97b21e7fd013..000000000000
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@@ -602,6 -621,7 +603,10 @@@ static int FNAME(fetch)(struct kvm_vcp
+  	struct kvm_shadow_walk_iterator it;
+  	unsigned direct_access, access = gw->pt_access;
+  	int top_level, ret;
+++<<<<<<< HEAD
+++=======
++ 	gfn_t gfn, base_gfn;
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  
+  	direct_access = gw->pte_access;
+  
+@@@ -646,31 -666,45 +651,64 @@@
+  			link_shadow_page(vcpu, it.sptep, sp);
+  	}
+  
+++<<<<<<< HEAD
+ +	for (;
+ +	     shadow_walk_okay(&it) && it.level > hlevel;
+ +	     shadow_walk_next(&it)) {
+ +		gfn_t direct_gfn;
+++=======
++ 	/*
++ 	 * FNAME(page_fault) might have clobbered the bottom bits of
++ 	 * gw->gfn, restore them from the virtual address.
++ 	 */
++ 	gfn = gw->gfn | ((addr & PT_LVL_OFFSET_MASK(gw->level)) >> PAGE_SHIFT);
++ 	base_gfn = gfn;
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  
+ -	trace_kvm_mmu_spte_requested(addr, gw->level, pfn);
+ -
+ -	for (; shadow_walk_okay(&it); shadow_walk_next(&it)) {
+  		clear_sp_write_flooding_count(it.sptep);
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * We cannot overwrite existing page tables with an NX
++ 		 * large page, as the leaf could be executable.
++ 		 */
++ 		disallowed_hugepage_adjust(it, gfn, &pfn, &hlevel);
++ 
++ 		base_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
++ 		if (it.level == hlevel)
++ 			break;
++ 
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  		validate_direct_spte(vcpu, it.sptep, direct_access);
+  
+  		drop_large_spte(vcpu, it.sptep);
+  
+++<<<<<<< HEAD
+ +		if (is_shadow_present_pte(*it.sptep))
+ +			continue;
+ +
+ +		direct_gfn = gw->gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
+ +
+ +		sp = kvm_mmu_get_page(vcpu, direct_gfn, addr, it.level-1,
+ +				      true, direct_access);
+ +		link_shadow_page(vcpu, it.sptep, sp);
+++=======
++ 		if (!is_shadow_present_pte(*it.sptep)) {
++ 			sp = kvm_mmu_get_page(vcpu, base_gfn, addr,
++ 					      it.level - 1, true, direct_access);
++ 			link_shadow_page(vcpu, it.sptep, sp);
++ 			if (lpage_disallowed)
++ 				account_huge_nx_page(vcpu->kvm, sp);
++ 		}
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  	}
+  
+ +	clear_sp_write_flooding_count(it.sptep);
+  	ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access, write_fault,
+ -			   it.level, base_gfn, pfn, prefault, map_writable);
+ +			   it.level, gw->gfn, pfn, prefault, map_writable);
+  	FNAME(pte_prefetch)(vcpu, gw, it.sptep);
+ -	++vcpu->stat.pf_fixed;
+ +
+  	return ret;
+  
+  out_gpte_changed:
+@@@ -741,9 -774,11 +779,15 @@@ static int FNAME(page_fault)(struct kvm
+  	int r;
+  	kvm_pfn_t pfn;
+  	int level = PT_PAGE_TABLE_LEVEL;
+++<<<<<<< HEAD
+ +	bool force_pt_level;
+++=======
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  	unsigned long mmu_seq;
+  	bool map_writable, is_self_change_mapping;
++ 	bool lpage_disallowed = (error_code & PFERR_FETCH_MASK) &&
++ 				is_nx_huge_page_enabled();
++ 	bool force_pt_level = lpage_disallowed;
+  
+  	pgprintk("%s: addr %lx err %x\n", __func__, addr, error_code);
+  
+@@@ -830,14 -866,10 +874,18 @@@
+  	if (make_mmu_pages_available(vcpu) < 0)
+  		goto out_unlock;
+  	if (!force_pt_level)
+ -		transparent_hugepage_adjust(vcpu, walker.gfn, &pfn, &level);
+ +		transparent_hugepage_adjust(vcpu, &walker.gfn, &pfn, &level);
+  	r = FNAME(fetch)(vcpu, addr, &walker, write_fault,
+++<<<<<<< HEAD
+ +			 level, pfn, map_writable, prefault);
+ +	++vcpu->stat.pf_fixed;
+++=======
++ 			 level, pfn, map_writable, prefault, lpage_disallowed);
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+ +	spin_unlock(&vcpu->kvm->mmu_lock);
+ +
+ +	return r;
+  
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+diff --cc arch/x86/kvm/x86.c
+index 69feb8491cac,b087d178a774..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -189,7 -212,10 +189,14 @@@ struct kvm_stats_debugfs_item debugfs_e
+  	{ "mmu_cache_miss", VM_STAT(mmu_cache_miss) },
+  	{ "mmu_unsync", VM_STAT(mmu_unsync) },
+  	{ "remote_tlb_flush", VM_STAT(remote_tlb_flush) },
+++<<<<<<< HEAD
+ +	{ "largepages", VM_STAT(lpages) },
+++=======
++ 	{ "largepages", VM_STAT(lpages, .mode = 0444) },
++ 	{ "nx_largepages_splitted", VM_STAT(nx_lpage_splits, .mode = 0444) },
++ 	{ "max_mmu_page_hash_collisions",
++ 		VM_STAT(max_mmu_page_hash_collisions) },
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  	{ NULL }
+  };
+  
+@@@ -1039,6 -1242,142 +1046,145 @@@ static u32 emulated_msrs[] = 
+  
+  static unsigned num_emulated_msrs;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * List of msr numbers which are used to expose MSR-based features that
++  * can be used by a hypervisor to validate requested CPU features.
++  */
++ static u32 msr_based_features[] = {
++ 	MSR_IA32_VMX_BASIC,
++ 	MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++ 	MSR_IA32_VMX_PINBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_EXIT_CTLS,
++ 	MSR_IA32_VMX_EXIT_CTLS,
++ 	MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++ 	MSR_IA32_VMX_ENTRY_CTLS,
++ 	MSR_IA32_VMX_MISC,
++ 	MSR_IA32_VMX_CR0_FIXED0,
++ 	MSR_IA32_VMX_CR0_FIXED1,
++ 	MSR_IA32_VMX_CR4_FIXED0,
++ 	MSR_IA32_VMX_CR4_FIXED1,
++ 	MSR_IA32_VMX_VMCS_ENUM,
++ 	MSR_IA32_VMX_PROCBASED_CTLS2,
++ 	MSR_IA32_VMX_EPT_VPID_CAP,
++ 	MSR_IA32_VMX_VMFUNC,
++ 
++ 	MSR_F10H_DECFG,
++ 	MSR_IA32_UCODE_REV,
++ 	MSR_IA32_ARCH_CAPABILITIES,
++ };
++ 
++ static unsigned int num_msr_based_features;
++ 
++ static u64 kvm_get_arch_capabilities(void)
++ {
++ 	u64 data = 0;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
++ 		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, data);
++ 
++ 	/*
++ 	 * If nx_huge_pages is enabled, KVM's shadow paging will ensure that
++ 	 * the nested hypervisor runs with NX huge pages.  If it is not,
++ 	 * L1 is anyway vulnerable to ITLB_MULTIHIT explots from other
++ 	 * L1 guests, so it need not worry about its own (L2) guests.
++ 	 */
++ 	data |= ARCH_CAP_PSCHANGE_MC_NO;
++ 
++ 	/*
++ 	 * If we're doing cache flushes (either "always" or "cond")
++ 	 * we will do one whenever the guest does a vmlaunch/vmresume.
++ 	 * If an outer hypervisor is doing the cache flush for us
++ 	 * (VMENTER_L1D_FLUSH_NESTED_VM), we can safely pass that
++ 	 * capability to the guest too, and if EPT is disabled we're not
++ 	 * vulnerable.  Overall, only VMENTER_L1D_FLUSH_NEVER will
++ 	 * require a nested hypervisor to do a flush of its own.
++ 	 */
++ 	if (l1tf_vmx_mitigation != VMENTER_L1D_FLUSH_NEVER)
++ 		data |= ARCH_CAP_SKIP_VMENTRY_L1DFLUSH;
++ 
++ 	if (!boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
++ 		data |= ARCH_CAP_RDCL_NO;
++ 	if (!boot_cpu_has_bug(X86_BUG_SPEC_STORE_BYPASS))
++ 		data |= ARCH_CAP_SSB_NO;
++ 	if (!boot_cpu_has_bug(X86_BUG_MDS))
++ 		data |= ARCH_CAP_MDS_NO;
++ 
++ 	/*
++ 	 * On TAA affected systems, export MDS_NO=0 when:
++ 	 *	- TSX is enabled on the host, i.e. X86_FEATURE_RTM=1.
++ 	 *	- Updated microcode is present. This is detected by
++ 	 *	  the presence of ARCH_CAP_TSX_CTRL_MSR and ensures
++ 	 *	  that VERW clears CPU buffers.
++ 	 *
++ 	 * When MDS_NO=0 is exported, guests deploy clear CPU buffer
++ 	 * mitigation and don't complain:
++ 	 *
++ 	 *	"Vulnerable: Clear CPU buffers attempted, no microcode"
++ 	 *
++ 	 * If TSX is disabled on the system, guests are also mitigated against
++ 	 * TAA and clear CPU buffer mitigation is not required for guests.
++ 	 */
++ 	if (boot_cpu_has_bug(X86_BUG_TAA) && boot_cpu_has(X86_FEATURE_RTM) &&
++ 	    (data & ARCH_CAP_TSX_CTRL_MSR))
++ 		data &= ~ARCH_CAP_MDS_NO;
++ 
++ 	return data;
++ }
++ 
++ static int kvm_get_msr_feature(struct kvm_msr_entry *msr)
++ {
++ 	switch (msr->index) {
++ 	case MSR_IA32_ARCH_CAPABILITIES:
++ 		msr->data = kvm_get_arch_capabilities();
++ 		break;
++ 	case MSR_IA32_UCODE_REV:
++ 		rdmsrl_safe(msr->index, &msr->data);
++ 		break;
++ 	default:
++ 		if (kvm_x86_ops->get_msr_feature(msr))
++ 			return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static int do_get_msr_feature(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
++ {
++ 	struct kvm_msr_entry msr;
++ 	int r;
++ 
++ 	msr.index = index;
++ 	r = kvm_get_msr_feature(&msr);
++ 	if (r)
++ 		return r;
++ 
++ 	*data = msr.data;
++ 
++ 	return 0;
++ }
++ 
++ static bool __kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
++ {
++ 	if (efer & EFER_FFXSR && !guest_cpuid_has(vcpu, X86_FEATURE_FXSR_OPT))
++ 		return false;
++ 
++ 	if (efer & EFER_SVME && !guest_cpuid_has(vcpu, X86_FEATURE_SVM))
++ 		return false;
++ 
++ 	if (efer & (EFER_LME | EFER_LMA) &&
++ 	    !guest_cpuid_has(vcpu, X86_FEATURE_LM))
++ 		return false;
++ 
++ 	if (efer & EFER_NX && !guest_cpuid_has(vcpu, X86_FEATURE_NX))
++ 		return false;
++ 
++ 	return true;
++ 
++ }
+++>>>>>>> b8e8c8303ff2 (kvm: mmu: ITLB_MULTIHIT mitigation)
+  bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
+  {
+  	if (efer & efer_reserved_bits)
+* Unmerged path Documentation/kernel-parameters.txt
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/paging_tmpl.h
+* Unmerged path arch/x86/kvm/x86.c
