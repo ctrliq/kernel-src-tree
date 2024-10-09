@@ -1,0 +1,180 @@
+ipv6: rate-limit probes for neighbourless routes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit f547fac624be53ad8b07e9ebca7654a7827ba61b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f547fac6.failed
+
+When commit 270972554c91 ("[IPV6]: ROUTE: Add Router Reachability
+Probing (RFC4191).") introduced router probing, the rt6_probe() function
+required that a neighbour entry existed. This neighbour entry is used to
+record the timestamp of the last probe via the ->updated field.
+
+Later, commit 2152caea7196 ("ipv6: Do not depend on rt->n in rt6_probe().")
+removed the requirement for a neighbour entry. Neighbourless routes skip
+the interval check and are not rate-limited.
+
+This patch adds rate-limiting for neighbourless routes, by recording the
+timestamp of the last probe in the fib6_info itself.
+
+Fixes: 2152caea7196 ("ipv6: Do not depend on rt->n in rt6_probe().")
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f547fac624be53ad8b07e9ebca7654a7827ba61b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip6_fib.h
+#	net/ipv6/route.c
+diff --cc include/net/ip6_fib.h
+index 703a70450aee,2d31e22babd8..000000000000
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@@ -116,24 -143,53 +116,56 @@@ struct rt6_info 
+  	 * destination, but not the same gateway. nsiblings is just a cache
+  	 * to speed up lookup.
+  	 */
+ -	struct list_head		fib6_siblings;
+ -	unsigned int			fib6_nsiblings;
+ +	struct list_head		rt6i_siblings;
+ +	unsigned int			rt6i_nsiblings;
+  
+ -	atomic_t			fib6_ref;
+ -	unsigned long			expires;
+ -	struct dst_metrics		*fib6_metrics;
+ -#define fib6_pmtu		fib6_metrics->metrics[RTAX_MTU-1]
+ +	atomic_t			rt6i_ref;
+  
+ -	struct rt6key			fib6_dst;
+ -	u32				fib6_flags;
+ -	struct rt6key			fib6_src;
+ -	struct rt6key			fib6_prefsrc;
+ +	RH_KABI_FILL_HOLE(unsigned int	rt6i_nh_flags)
+ +	/* RHEL: Hole - 28 bytes remain */
+  
+++<<<<<<< HEAD
+ +	/* These are in a separate cache line. */
+ +	struct rt6key			rt6i_dst ____cacheline_aligned_in_smp;
+++=======
++ 	struct rt6_info * __percpu	*rt6i_pcpu;
++ 	struct rt6_exception_bucket __rcu *rt6i_exception_bucket;
++ 
++ #ifdef CONFIG_IPV6_ROUTER_PREF
++ 	unsigned long			last_probe;
++ #endif
++ 
++ 	u32				fib6_metric;
++ 	u8				fib6_protocol;
++ 	u8				fib6_type;
++ 	u8				exception_bucket_flushed:1,
++ 					should_flush:1,
++ 					dst_nocount:1,
++ 					dst_nopolicy:1,
++ 					dst_host:1,
++ 					unused:3;
++ 
++ 	struct fib6_nh			fib6_nh;
++ 	struct rcu_head			rcu;
++ };
++ 
++ struct rt6_info {
++ 	struct dst_entry		dst;
++ 	struct fib6_info __rcu		*from;
++ 
++ 	struct rt6key			rt6i_dst;
++ 	struct rt6key			rt6i_src;
++ 	struct in6_addr			rt6i_gateway;
++ 	struct inet6_dev		*rt6i_idev;
+++>>>>>>> f547fac624be (ipv6: rate-limit probes for neighbourless routes)
+  	u32				rt6i_flags;
+ +	struct rt6key			rt6i_src;
+  	struct rt6key			rt6i_prefsrc;
+ +	u32				rt6i_metric;
+  
+ -	struct list_head		rt6i_uncached;
+ -	struct uncached_list		*rt6i_uncached_list;
+ +	struct inet6_dev		*rt6i_idev;
+ +	RH_KABI_DEPRECATE(unsigned long,	_rt6i_peer)
+ +	RH_KABI_DEPRECATE(u32,			rt6i_genid)
+  
+  	/* more non-fragment space at head required */
+  	unsigned short			rt6i_nfheader_len;
+diff --cc net/ipv6/route.c
+index 9ee2312eaf73,abcb5ae77319..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -545,15 -513,19 +545,24 @@@ static void rt6_probe_deferred(struct w
+  		container_of(w, struct __rt6_probe_work, work);
+  
+  	addrconf_addr_solict_mult(&work->target, &mcaddr);
+ -	ndisc_send_ns(work->dev, &work->target, &mcaddr, NULL, 0);
+ +	ndisc_send_ns(work->dev, NULL, &work->target, &mcaddr, NULL, 0);
+  	dev_put(work->dev);
+ -	kfree(work);
+ +	kfree(w);
+  }
+  
+ -static void rt6_probe(struct fib6_info *rt)
+ +static void rt6_probe(struct rt6_info *rt)
+  {
+++<<<<<<< HEAD
+ +	struct __rt6_probe_work *work;
+ +	struct neighbour *neigh;
+++=======
++ 	struct __rt6_probe_work *work = NULL;
++ 	const struct in6_addr *nh_gw;
++ 	struct neighbour *neigh;
++ 	struct net_device *dev;
++ 	struct inet6_dev *idev;
++ 
+++>>>>>>> f547fac624be (ipv6: rate-limit probes for neighbourless routes)
+  	/*
+  	 * Okay, this does not seem to be appropriate
+  	 * for now, however, we need to check if it
+@@@ -562,12 -534,18 +571,21 @@@
+  	 * Router Reachability Probe MUST be rate-limited
+  	 * to no more than one per minute.
+  	 */
+ -	if (!rt || !(rt->fib6_flags & RTF_GATEWAY))
+ +	if (!rt || !(rt->rt6i_flags & RTF_GATEWAY))
+  		return;
+ -
+ -	nh_gw = &rt->fib6_nh.nh_gw;
+ -	dev = rt->fib6_nh.nh_dev;
+  	rcu_read_lock_bh();
+++<<<<<<< HEAD
+ +	neigh = __ipv6_neigh_lookup_noref(rt->dst.dev, &rt->rt6i_gateway);
+ +	if (neigh) {
+ +		work = NULL;
+++=======
++ 	idev = __in6_dev_get(dev);
++ 	neigh = __ipv6_neigh_lookup_noref(dev, nh_gw);
++ 	if (neigh) {
++ 		if (neigh->nud_state & NUD_VALID)
++ 			goto out;
++ 
+++>>>>>>> f547fac624be (ipv6: rate-limit probes for neighbourless routes)
+  		write_lock(&neigh->lock);
+  		if (!(neigh->nud_state & NUD_VALID) &&
+  		    time_after(jiffies,
+@@@ -583,10 -561,11 +602,11 @@@
+  	}
+  
+  	if (work) {
++ 		rt->last_probe = jiffies;
+  		INIT_WORK(&work->work, rt6_probe_deferred);
+ -		work->target = *nh_gw;
+ -		dev_hold(dev);
+ -		work->dev = dev;
+ +		work->target = rt->rt6i_gateway;
+ +		dev_hold(rt->dst.dev);
+ +		work->dev = rt->dst.dev;
+  		schedule_work(&work->work);
+  	}
+  
+* Unmerged path include/net/ip6_fib.h
+* Unmerged path net/ipv6/route.c
