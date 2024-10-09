@@ -1,0 +1,228 @@
+jbd2: fix deadlock while checkpoint thread waits commit thread to finish
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 53cf978457325d8fb2cdecd7981b31a8229e446e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/53cf9784.failed
+
+This issue was found when I tried to put checkpoint work in a separate thread,
+the deadlock below happened:
+         Thread1                                |   Thread2
+__jbd2_log_wait_for_space                       |
+jbd2_log_do_checkpoint (hold j_checkpoint_mutex)|
+  if (jh->b_transaction != NULL)                |
+    ...                                         |
+    jbd2_log_start_commit(journal, tid);        |jbd2_update_log_tail
+                                                |  will lock j_checkpoint_mutex,
+                                                |  but will be blocked here.
+                                                |
+    jbd2_log_wait_commit(journal, tid);         |
+    wait_event(journal->j_wait_done_commit,     |
+     !tid_gt(tid, journal->j_commit_sequence)); |
+     ...                                        |wake_up(j_wait_done_commit)
+  }                                             |
+
+then deadlock occurs, Thread1 will never be waken up.
+
+To fix this issue, drop j_checkpoint_mutex in jbd2_log_do_checkpoint()
+when we are going to wait for transaction commit.
+
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 53cf978457325d8fb2cdecd7981b31a8229e446e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/jbd2/checkpoint.c
+#	fs/jbd2/journal.c
+diff --cc fs/jbd2/checkpoint.c
+index e3ab462b03cd,02e0b79753e7..000000000000
+--- a/fs/jbd2/checkpoint.c
++++ b/fs/jbd2/checkpoint.c
+@@@ -376,45 -241,130 +376,77 @@@ restart
+  	 * done (maybe it's a new transaction, but it fell at the same
+  	 * address).
+  	 */
+ -	if (journal->j_checkpoint_transactions != transaction ||
+ -	    transaction->t_tid != this_tid)
+ -		goto out;
+ -
+ -	/* checkpoint all of the transaction's buffers */
+ -	while (transaction->t_checkpoint_list) {
+ -		jh = transaction->t_checkpoint_list;
+ -		bh = jh2bh(jh);
+ +	if (journal->j_checkpoint_transactions == transaction &&
+ +			transaction->t_tid == this_tid) {
+ +		int batch_count = 0;
+ +		struct journal_head *jh;
+ +		int retry = 0, err;
+  
+ -		if (buffer_locked(bh)) {
+ -			get_bh(bh);
+ -			spin_unlock(&journal->j_list_lock);
+ -			wait_on_buffer(bh);
+ -			/* the journal_head may have gone by now */
+ -			BUFFER_TRACE(bh, "brelse");
+ -			__brelse(bh);
+ -			goto retry;
+ +		while (!retry && transaction->t_checkpoint_list) {
+ +			jh = transaction->t_checkpoint_list;
+ +			retry = __process_buffer(journal, jh, &batch_count,
+ +						 transaction);
+ +			if (retry < 0 && !result)
+ +				result = retry;
+ +			if (!retry && (need_resched() ||
+ +				spin_needbreak(&journal->j_list_lock))) {
+ +				spin_unlock(&journal->j_list_lock);
+ +				retry = 1;
+ +				break;
+ +			}
+  		}
+ -		if (jh->b_transaction != NULL) {
+ -			transaction_t *t = jh->b_transaction;
+ -			tid_t tid = t->t_tid;
+  
+++<<<<<<< HEAD
+ +		if (batch_count) {
+ +			if (!retry) {
+ +				spin_unlock(&journal->j_list_lock);
+ +				retry = 1;
+ +			}
+ +			__flush_batch(journal, &batch_count);
+++=======
++ 			transaction->t_chp_stats.cs_forced_to_close++;
++ 			spin_unlock(&journal->j_list_lock);
++ 			if (unlikely(journal->j_flags & JBD2_UNMOUNT))
++ 				/*
++ 				 * The journal thread is dead; so
++ 				 * starting and waiting for a commit
++ 				 * to finish will cause us to wait for
++ 				 * a _very_ long time.
++ 				 */
++ 				printk(KERN_ERR
++ 		"JBD2: %s: Waiting for Godot: block %llu\n",
++ 		journal->j_devname, (unsigned long long) bh->b_blocknr);
++ 
++ 			if (batch_count)
++ 				__flush_batch(journal, &batch_count);
++ 			jbd2_log_start_commit(journal, tid);
++ 			/*
++ 			 * jbd2_journal_commit_transaction() may want
++ 			 * to take the checkpoint_mutex if JBD2_FLUSHED
++ 			 * is set, jbd2_update_log_tail() called by
++ 			 * jbd2_journal_commit_transaction() may also take
++ 			 * checkpoint_mutex.  So we need to temporarily
++ 			 * drop it.
++ 			 */
++ 			mutex_unlock(&journal->j_checkpoint_mutex);
++ 			jbd2_log_wait_commit(journal, tid);
++ 			mutex_lock_io(&journal->j_checkpoint_mutex);
++ 			spin_lock(&journal->j_list_lock);
++ 			goto restart;
+++>>>>>>> 53cf97845732 (jbd2: fix deadlock while checkpoint thread waits commit thread to finish)
+  		}
+ -		if (!buffer_dirty(bh)) {
+ -			if (unlikely(buffer_write_io_error(bh)) && !result)
+ -				result = -EIO;
+ -			BUFFER_TRACE(bh, "remove from checkpoint");
+ -			if (__jbd2_journal_remove_checkpoint(jh))
+ -				/* The transaction was released; we're done */
+ -				goto out;
+ -			continue;
+ -		}
+ -		/*
+ -		 * Important: we are about to write the buffer, and
+ -		 * possibly block, while still holding the journal
+ -		 * lock.  We cannot afford to let the transaction
+ -		 * logic start messing around with this buffer before
+ -		 * we write it to disk, as that would break
+ -		 * recoverability.
+ -		 */
+ -		BUFFER_TRACE(bh, "queue");
+ -		get_bh(bh);
+ -		J_ASSERT_BH(bh, !buffer_jwrite(bh));
+ -		journal->j_chkpt_bhs[batch_count++] = bh;
+ -		__buffer_relink_io(jh);
+ -		transaction->t_chp_stats.cs_written++;
+ -		if ((batch_count == JBD2_NR_BATCH) ||
+ -		    need_resched() ||
+ -		    spin_needbreak(&journal->j_list_lock))
+ -			goto unlock_and_flush;
+ -	}
+  
+ -	if (batch_count) {
+ -		unlock_and_flush:
+ -			spin_unlock(&journal->j_list_lock);
+ -		retry:
+ -			if (batch_count)
+ -				__flush_batch(journal, &batch_count);
+ +		if (retry) {
+  			spin_lock(&journal->j_list_lock);
+  			goto restart;
+ -	}
+ -
+ -	/*
+ -	 * Now we issued all of the transaction's buffers, let's deal
+ -	 * with the buffers that are out for I/O.
+ -	 */
+ -restart2:
+ -	/* Did somebody clean up the transaction in the meanwhile? */
+ -	if (journal->j_checkpoint_transactions != transaction ||
+ -	    transaction->t_tid != this_tid)
+ -		goto out;
+ -
+ -	while (transaction->t_checkpoint_io_list) {
+ -		jh = transaction->t_checkpoint_io_list;
+ -		bh = jh2bh(jh);
+ -		if (buffer_locked(bh)) {
+ -			get_bh(bh);
+ -			spin_unlock(&journal->j_list_lock);
+ -			wait_on_buffer(bh);
+ -			/* the journal_head may have gone by now */
+ -			BUFFER_TRACE(bh, "brelse");
+ -			__brelse(bh);
+ -			spin_lock(&journal->j_list_lock);
+ -			goto restart2;
+  		}
+ -		if (unlikely(buffer_write_io_error(bh)) && !result)
+ -			result = -EIO;
+ -
+  		/*
+ -		 * Now in whatever state the buffer currently is, we
+ -		 * know that it has been written out and so we can
+ -		 * drop it from the list
+ +		 * Now we have cleaned up the first transaction's checkpoint
+ +		 * list. Let's clean up the second one
+  		 */
+ -		if (__jbd2_journal_remove_checkpoint(jh))
+ -			break;
+ +		err = __wait_cp_io(journal, transaction);
+ +		if (!result)
+ +			result = err;
+  	}
+  out:
+  	spin_unlock(&journal->j_list_lock);
+diff --cc fs/jbd2/journal.c
+index 6aa7507dace9,88d8f22d2cba..000000000000
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@@ -2061,8 -2067,8 +2061,13 @@@ int jbd2_journal_wipe(journal_t *journa
+  	err = jbd2_journal_skip_recovery(journal);
+  	if (write) {
+  		/* Lock to make assertions happy... */
+++<<<<<<< HEAD
+ +		mutex_lock(&journal->j_checkpoint_mutex);
+ +		jbd2_mark_journal_empty(journal, WRITE_FUA);
+++=======
++ 		mutex_lock_io(&journal->j_checkpoint_mutex);
++ 		jbd2_mark_journal_empty(journal, REQ_SYNC | REQ_FUA);
+++>>>>>>> 53cf97845732 (jbd2: fix deadlock while checkpoint thread waits commit thread to finish)
+  		mutex_unlock(&journal->j_checkpoint_mutex);
+  	}
+  
+* Unmerged path fs/jbd2/checkpoint.c
+* Unmerged path fs/jbd2/journal.c
