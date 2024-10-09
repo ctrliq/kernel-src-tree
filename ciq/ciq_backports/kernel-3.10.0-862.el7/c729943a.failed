@@ -1,0 +1,176 @@
+RDMA/netlink: Reduce indirection access to cb_table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit c729943a77c108253c46b2d50c8a15a888facf4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c729943a.failed
+
+Introduce intermediate variable to store access to fields
+of cb_table.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+(cherry picked from commit c729943a77c108253c46b2d50c8a15a888facf4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/netlink.c
+diff --cc drivers/infiniband/core/netlink.c
+index 66c3e82b1b77,e36c39e3cc2b..000000000000
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@@ -131,71 -147,93 +131,104 @@@ int ibnl_put_attr(struct sk_buff *skb, 
+  }
+  EXPORT_SYMBOL(ibnl_put_attr);
+  
+ -static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ -			   struct netlink_ext_ack *extack)
+ +static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+  {
+ +	struct ibnl_client *client;
+  	int type = nlh->nlmsg_type;
+ -	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ +	int index = RDMA_NL_GET_CLIENT(type);
+  	unsigned int op = RDMA_NL_GET_OP(type);
+++<<<<<<< HEAD
+++=======
++ 	struct netlink_callback cb = {};
++ 	struct netlink_dump_control c = {};
++ 	const struct rdma_nl_cbs *cb_table;
++ 	int ret;
+ -
+ -	if (!is_nl_valid(index, op))
+ -		return -EINVAL;
+ -
+++>>>>>>> c729943a77c1 (RDMA/netlink: Reduce indirection access to cb_table)
+ +
+ +	list_for_each_entry(client, &client_list, list) {
+ +		if (client->index == index) {
+ +			if (op >= client->nops || !client->cb_table[op].dump)
+ +				return -EINVAL;
+ +
+++<<<<<<< HEAD
+ +			/*
+ +			 * For response or local service set_timeout request,
+ +			 * there is no need to use netlink_dump_start.
+ +			 */
+ +			if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+ +			    (index == RDMA_NL_LS &&
+ +			     op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+ +				struct netlink_callback cb = {
+ +					.skb = skb,
+ +					.nlh = nlh,
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +
+ +				return cb.dump(skb, &cb);
+ +			}
+ +
+ +			{
+ +				struct netlink_dump_control c = {
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +				return netlink_dump_start(nls, skb, nlh, &c);
+ +			}
+ +		}
+ +	}
+++=======
++ 	cb_table = rdma_nl_types[type].cb_table;
++ 
++ 	if ((cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
++ 	    !netlink_capable(skb, CAP_NET_ADMIN))
++ 		return -EPERM;
++ 
++ 	/*
++ 	 * For response or local service set_timeout request,
++ 	 * there is no need to use netlink_dump_start.
++ 	 */
++ 	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
++ 	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
++ 		cb.skb = skb;
++ 		cb.nlh = nlh;
++ 		cb.dump = cb_table[op].dump;
++ 		return cb.dump(skb, &cb);
++ 	} else {
++ 		c.dump = cb_table[op].dump;
++ 		return netlink_dump_start(nls, skb, nlh, &c);
++ 	}
++ 	if (cb_table[op].doit)
++ 		ret = cb_table[op].doit(skb, nlh, extack);
++ 	return ret;
+++>>>>>>> c729943a77c1 (RDMA/netlink: Reduce indirection access to cb_table)
+  
+ +	pr_info("Index %d wasn't found in client list\n", index);
+ +	return -EINVAL;
+  }
+  
+ -/*
+ - * This function is similar to netlink_rcv_skb with one exception:
+ - * It calls to the callback for the netlink messages without NLM_F_REQUEST
+ - * flag. These messages are intended for RDMA_NL_LS consumer, so it is allowed
+ - * for that consumer only.
+ - */
+ -static int rdma_nl_rcv_skb(struct sk_buff *skb, int (*cb)(struct sk_buff *,
+ -						   struct nlmsghdr *,
+ -						   struct netlink_ext_ack *))
+ +static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+  {
+ -	struct netlink_ext_ack extack = {};
+  	struct nlmsghdr *nlh;
+ -	int err;
+ +	int msglen;
+  
+ +	/*
+ +	 * Process responses until there is no more message or the first
+ +	 * request. Generally speaking, it is not recommended to mix responses
+ +	 * with requests.
+ +	 */
+  	while (skb->len >= nlmsg_total_size(0)) {
+ -		int msglen;
+ -
+  		nlh = nlmsg_hdr(skb);
+ -		err = 0;
+  
+  		if (nlh->nlmsg_len < NLMSG_HDRLEN || skb->len < nlh->nlmsg_len)
+ -			return 0;
+ +			return;
+ +
+ +		/* Handle response only */
+ +		if (nlh->nlmsg_flags & NLM_F_REQUEST)
+ +			return;
+ +
+ +		ibnl_rcv_msg(skb, nlh);
+  
+ -		/*
+ -		 * Generally speaking, the only requests are handled
+ -		 * by the kernel, but RDMA_NL_LS is different, because it
+ -		 * runs backward netlink scheme. Kernel initiates messages
+ -		 * and waits for reply with data to keep pathrecord cache
+ -		 * in sync.
+ -		 */
+ -		if (!(nlh->nlmsg_flags & NLM_F_REQUEST) &&
+ -		    (RDMA_NL_GET_CLIENT(nlh->nlmsg_type) != RDMA_NL_LS))
+ -			goto ack;
+ -
+ -		/* Skip control messages */
+ -		if (nlh->nlmsg_type < NLMSG_MIN_TYPE)
+ -			goto ack;
+ -
+ -		err = cb(skb, nlh, &extack);
+ -		if (err == -EINTR)
+ -			goto skip;
+ -
+ -ack:
+ -		if (nlh->nlmsg_flags & NLM_F_ACK || err)
+ -			netlink_ack(skb, nlh, err, &extack);
+ -
+ -skip:
+  		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
+  		if (msglen > skb->len)
+  			msglen = skb->len;
+* Unmerged path drivers/infiniband/core/netlink.c
