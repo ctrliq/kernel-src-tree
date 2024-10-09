@@ -1,0 +1,107 @@
+kvm: x86: Do not release the page inside mmu_set_spte()
+
+jira LE-1907
+cve CVE-2018-12207
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [x86] kvm: mmu: Do not release the page inside mmu_set_spte() (Paolo Bonzini) [1690343] {CVE-2018-12207}
+Rebuild_FUZZ: 94.55%
+commit-author Junaid Shahid <junaids@google.com>
+commit 43fdcda96e2550c6d1c46fb8a78801aa2f7276ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/43fdcda9.failed
+
+Release the page at the call-site where it was originally acquired.
+This makes the exit code cleaner for most call sites, since they
+do not need to duplicate code between success and the failure
+label.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 43fdcda96e2550c6d1c46fb8a78801aa2f7276ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index 24ebfb6e8f2e,6fc5c389f5a1..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3418,12 -3538,7 +3419,16 @@@ static int nonpaging_map(struct kvm_vcp
+  		goto out_unlock;
+  	if (likely(!force_pt_level))
+  		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+++<<<<<<< HEAD
+ +	r = __direct_map(vcpu, v, write, map_writable, level, gfn, pfn,
+ +			 prefault);
+ +	spin_unlock(&vcpu->kvm->mmu_lock);
+ +
+ +
+ +	return r;
+++=======
++ 	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
+++>>>>>>> 43fdcda96e25 (kvm: x86: Do not release the page inside mmu_set_spte())
+  
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+@@@ -4063,11 -4165,7 +4069,15 @@@ static int tdp_page_fault(struct kvm_vc
+  		goto out_unlock;
+  	if (likely(!force_pt_level))
+  		transparent_hugepage_adjust(vcpu, &gfn, &pfn, &level);
+++<<<<<<< HEAD
+ +	r = __direct_map(vcpu, gpa, write, map_writable,
+ +			 level, gfn, pfn, prefault);
+ +	spin_unlock(&vcpu->kvm->mmu_lock);
+ +
+ +	return r;
+++=======
++ 	r = __direct_map(vcpu, write, map_writable, level, gfn, pfn, prefault);
+++>>>>>>> 43fdcda96e25 (kvm: x86: Do not release the page inside mmu_set_spte())
+  
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index 0da31d8cbf16..369e0a208dfb 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -523,6 +523,7 @@ FNAME(prefetch_gpte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	mmu_set_spte(vcpu, spte, pte_access, 0, PT_PAGE_TABLE_LEVEL, gfn, pfn,
+ 		     true, true);
+ 
++	kvm_release_pfn_clean(pfn);
+ 	return true;
+ }
+ 
+@@ -674,7 +675,6 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, gva_t addr,
+ 	return ret;
+ 
+ out_gpte_changed:
+-	kvm_release_pfn_clean(pfn);
+ 	return RET_PF_RETRY;
+ }
+ 
+@@ -822,6 +822,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr, u32 error_code,
+ 			walker.pte_access &= ~ACC_EXEC_MASK;
+ 	}
+ 
++	r = RET_PF_RETRY;
+ 	spin_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+@@ -835,14 +836,11 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gva_t addr, u32 error_code,
+ 			 level, pfn, map_writable, prefault);
+ 	++vcpu->stat.pf_fixed;
+ 	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
+-
+-	return r;
+ 
+ out_unlock:
+ 	spin_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+-	return RET_PF_RETRY;
++	return r;
+ }
+ 
+ static gpa_t FNAME(get_level1_sp_gpa)(struct kvm_mmu_page *sp)
