@@ -1,0 +1,200 @@
+bpf: introduce function calls (function boundaries)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit cc8b0b92a1699bc32f7fec71daa2bfc90de43a4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cc8b0b92.failed
+
+Allow arbitrary function calls from bpf function to another bpf function.
+
+Since the beginning of bpf all bpf programs were represented as a single function
+and program authors were forced to use always_inline for all functions
+in their C code. That was causing llvm to unnecessary inflate the code size
+and forcing developers to move code to header files with little code reuse.
+
+With a bit of additional complexity teach verifier to recognize
+arbitrary function calls from one bpf function to another as long as
+all of functions are presented to the verifier as a single bpf program.
+New program layout:
+r6 = r1    // some code
+..
+r1 = ..    // arg1
+r2 = ..    // arg2
+call pc+1  // function call pc-relative
+exit
+.. = r1    // access arg1
+.. = r2    // access arg2
+..
+call pc+20 // second level of function call
+...
+
+It allows for better optimized code and finally allows to introduce
+the core bpf libraries that can be reused in different projects,
+since programs are no longer limited by single elf file.
+With function calls bpf can be compiled into multiple .o files.
+
+This patch is the first step. It detects programs that contain
+multiple functions and checks that calls between them are valid.
+It splits the sequence of bpf instructions (one program) into a set
+of bpf functions that call each other. Calls to only known
+functions are allowed. In the future the verifier may allow
+calls to unresolved functions and will do dynamic linking.
+This logic supports statically linked bpf functions only.
+
+Such function boundary detection could have been done as part of
+control flow graph building in check_cfg(), but it's cleaner to
+separate function boundary detection vs control flow checks within
+a subprogram (function) into logically indepedent steps.
+Follow up patches may split check_cfg() further, but not check_subprogs().
+
+Only allow bpf-to-bpf calls for root only and for non-hw-offloaded programs.
+These restrictions can be relaxed in the future.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit cc8b0b92a1699bc32f7fec71daa2bfc90de43a4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_verifier.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/disasm.c
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,d01f1cb3cfc0..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -115,8 -118,119 +115,107 @@@ enum bpf_map_type 
+  
+  enum bpf_prog_type {
+  	BPF_PROG_TYPE_UNSPEC,
+ -	BPF_PROG_TYPE_SOCKET_FILTER,
+ -	BPF_PROG_TYPE_KPROBE,
+ -	BPF_PROG_TYPE_SCHED_CLS,
+ -	BPF_PROG_TYPE_SCHED_ACT,
+ -	BPF_PROG_TYPE_TRACEPOINT,
+ -	BPF_PROG_TYPE_XDP,
+ -	BPF_PROG_TYPE_PERF_EVENT,
+ -	BPF_PROG_TYPE_CGROUP_SKB,
+ -	BPF_PROG_TYPE_CGROUP_SOCK,
+ -	BPF_PROG_TYPE_LWT_IN,
+ -	BPF_PROG_TYPE_LWT_OUT,
+ -	BPF_PROG_TYPE_LWT_XMIT,
+ -	BPF_PROG_TYPE_SOCK_OPS,
+ -	BPF_PROG_TYPE_SK_SKB,
+ -	BPF_PROG_TYPE_CGROUP_DEVICE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum bpf_attach_type {
++ 	BPF_CGROUP_INET_INGRESS,
++ 	BPF_CGROUP_INET_EGRESS,
++ 	BPF_CGROUP_INET_SOCK_CREATE,
++ 	BPF_CGROUP_SOCK_OPS,
++ 	BPF_SK_SKB_STREAM_PARSER,
++ 	BPF_SK_SKB_STREAM_VERDICT,
++ 	BPF_CGROUP_DEVICE,
++ 	__MAX_BPF_ATTACH_TYPE
++ };
++ 
++ #define MAX_BPF_ATTACH_TYPE __MAX_BPF_ATTACH_TYPE
++ 
++ /* cgroup-bpf attach flags used in BPF_PROG_ATTACH command
++  *
++  * NONE(default): No further bpf programs allowed in the subtree.
++  *
++  * BPF_F_ALLOW_OVERRIDE: If a sub-cgroup installs some bpf program,
++  * the program in this cgroup yields to sub-cgroup program.
++  *
++  * BPF_F_ALLOW_MULTI: If a sub-cgroup installs some bpf program,
++  * that cgroup program gets run in addition to the program in this cgroup.
++  *
++  * Only one program is allowed to be attached to a cgroup with
++  * NONE or BPF_F_ALLOW_OVERRIDE flag.
++  * Attaching another program on top of NONE or BPF_F_ALLOW_OVERRIDE will
++  * release old program and attach the new one. Attach flags has to match.
++  *
++  * Multiple programs are allowed to be attached to a cgroup with
++  * BPF_F_ALLOW_MULTI flag. They are executed in FIFO order
++  * (those that were attached first, run first)
++  * The programs of sub-cgroup are executed first, then programs of
++  * this cgroup and then programs of parent cgroup.
++  * When children program makes decision (like picking TCP CA or sock bind)
++  * parent program has a chance to override it.
++  *
++  * A cgroup with MULTI or OVERRIDE flag allows any attach flags in sub-cgroups.
++  * A cgroup with NONE doesn't allow any programs in sub-cgroups.
++  * Ex1:
++  * cgrp1 (MULTI progs A, B) ->
++  *    cgrp2 (OVERRIDE prog C) ->
++  *      cgrp3 (MULTI prog D) ->
++  *        cgrp4 (OVERRIDE prog E) ->
++  *          cgrp5 (NONE prog F)
++  * the event in cgrp5 triggers execution of F,D,A,B in that order.
++  * if prog F is detached, the execution is E,D,A,B
++  * if prog F and D are detached, the execution is E,A,B
++  * if prog F, E and D are detached, the execution is C,A,B
++  *
++  * All eligible programs are executed regardless of return code from
++  * earlier programs.
++  */
++ #define BPF_F_ALLOW_OVERRIDE	(1U << 0)
++ #define BPF_F_ALLOW_MULTI	(1U << 1)
++ 
++ /* If BPF_F_STRICT_ALIGNMENT is used in BPF_PROG_LOAD command, the
++  * verifier will perform strict alignment checking as if the kernel
++  * has been built with CONFIG_EFFICIENT_UNALIGNED_ACCESS not set,
++  * and NET_IP_ALIGN defined to 2.
++  */
++ #define BPF_F_STRICT_ALIGNMENT	(1U << 0)
++ 
++ /* when bpf_ldimm64->src_reg == BPF_PSEUDO_MAP_FD, bpf_ldimm64->imm == fd */
++ #define BPF_PSEUDO_MAP_FD	1
++ 
++ /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
++  * offset to another bpf function
++  */
++ #define BPF_PSEUDO_CALL		1
++ 
++ /* flags for BPF_MAP_UPDATE_ELEM command */
++ #define BPF_ANY		0 /* create new element or update existing */
++ #define BPF_NOEXIST	1 /* create new element if it didn't exist */
++ #define BPF_EXIST	2 /* update existing element */
++ 
++ /* flags for BPF_MAP_CREATE command */
++ #define BPF_F_NO_PREALLOC	(1U << 0)
++ /* Instead of having one common LRU list in the
++  * BPF_MAP_TYPE_LRU_[PERCPU_]HASH map, use a percpu LRU list
++  * which can scale and perform better.
++  * Note, the LRU nodes (including free nodes) cannot be moved
++  * across different LRU lists.
++  */
++ #define BPF_F_NO_COMMON_LRU	(1U << 1)
++ /* Specify numa node during map creation */
++ #define BPF_F_NUMA_NODE		(1U << 2)
++ 
++ /* flags for BPF_PROG_QUERY */
++ #define BPF_F_QUERY_EFFECTIVE	(1U << 0)
++ 
++ #define BPF_OBJ_NAME_LEN 16U
++ 
++ /* Flags for accessing BPF object */
++ #define BPF_F_RDONLY		(1U << 3)
++ #define BPF_F_WRONLY		(1U << 4)
++ 
+++>>>>>>> cc8b0b92a169 (bpf: introduce function calls (function boundaries))
+  union bpf_attr {
+  	struct { /* anonymous struct used by BPF_MAP_CREATE command */
+  		__u32	map_type;	/* one of enum bpf_map_type */
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/disasm.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/disasm.c
+* Unmerged path kernel/bpf/verifier.c
