@@ -1,0 +1,180 @@
+i2c: i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [i2c] i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR (David Arcari) [1464196]
+Rebuild_FUZZ: 95.93%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit a7ae81952cdab56a1277bd2f9ed7284c0f575120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a7ae8195.failed
+
+Many Intel systems the BIOS declares a SystemIO OpRegion below the SMBus
+PCI device as can be seen in ACPI DSDT table from Lenovo Yoga 900:
+
+  Device (SBUS)
+  {
+      OperationRegion (SMBI, SystemIO, (SBAR << 0x05), 0x10)
+      Field (SMBI, ByteAcc, NoLock, Preserve)
+      {
+          HSTS,   8,
+          Offset (0x02),
+          HCON,   8,
+          HCOM,   8,
+          TXSA,   8,
+          DAT0,   8,
+          DAT1,   8,
+          HBDR,   8,
+          PECR,   8,
+          RXSA,   8,
+          SDAT,   16
+      }
+
+There are also bunch of AML methods that that the BIOS can use to access
+these fields. Most of the systems in question AML methods accessing the
+SMBI OpRegion are never used.
+
+Now, because of this SMBI OpRegion many systems fail to load the SMBus
+driver with an error looking like one below:
+
+  ACPI Warning: SystemIO range 0x0000000000003040-0x000000000000305F
+       conflicts with OpRegion 0x0000000000003040-0x000000000000304F
+       (\_SB.PCI0.SBUS.SMBI) (20160108/utaddress-255)
+  ACPI: If an ACPI driver is available for this device, you should use
+       it instead of the native driver
+
+The reason is that this SMBI OpRegion conflicts with the PCI BAR used by
+the SMBus driver.
+
+It turns out that we can install a custom SystemIO address space handler
+for the SMBus device to intercept all accesses through that OpRegion. This
+allows us to share the PCI BAR with the AML code if it for some reason is
+using it. We do not expect that this OpRegion handler will ever be called
+but if it is we print a warning and prevent all access from the SMBus
+driver itself.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=110041
+	Reported-by: Andy Lutomirski <luto@kernel.org>
+	Reported-by: Pali Rohár <pali.rohar@gmail.com>
+	Suggested-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Jean Delvare <jdelvare@suse.de>
+	Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Tested-by: Pali Rohár <pali.rohar@gmail.com>
+	Tested-by: Jean Delvare <jdelvare@suse.de>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit a7ae81952cdab56a1277bd2f9ed7284c0f575120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/busses/i2c-i801.c
+diff --cc drivers/i2c/busses/i2c-i801.c
+index 2ce2612fd557,4a60ad214747..000000000000
+--- a/drivers/i2c/busses/i2c-i801.c
++++ b/drivers/i2c/busses/i2c-i801.c
+@@@ -241,10 -245,15 +241,17 @@@ struct i801_priv 
+  	struct platform_device *mux_pdev;
+  #endif
+  	struct platform_device *tco_pdev;
++ 
++ 	/*
++ 	 * If set to true the host controller registers are reserved for
++ 	 * ACPI AML use. Protected by acpi_lock.
++ 	 */
++ 	bool acpi_reserved;
++ 	struct mutex acpi_lock;
+  };
+  
+ +static struct pci_driver i801_driver;
+ +
+  #define FEATURE_SMBUS_PEC	(1 << 0)
+  #define FEATURE_BLOCK_BUFFER	(1 << 1)
+  #define FEATURE_BLOCK_PROC	(1 << 2)
+@@@ -1271,9 -1363,9 +1362,10 @@@ static int i801_probe(struct pci_dev *d
+  	priv->adapter.class = i801_get_adapter_class(priv);
+  	priv->adapter.algo = &smbus_algorithm;
+  	priv->adapter.dev.parent = &dev->dev;
+ +	device_rh_alloc(&priv->adapter.dev);
+  	ACPI_COMPANION_SET(&priv->adapter.dev, ACPI_COMPANION(&dev->dev));
+  	priv->adapter.retries = 3;
++ 	mutex_init(&priv->acpi_lock);
+  
+  	priv->pci_dev = dev;
+  	switch (dev->device) {
+@@@ -1331,24 -1423,23 +1423,34 @@@
+  	/* Determine the address of the SMBus area */
+  	priv->smba = pci_resource_start(dev, SMBBAR);
+  	if (!priv->smba) {
+ -		dev_err(&dev->dev,
+ -			"SMBus base address uninitialized, upgrade BIOS\n");
+ -		return -ENODEV;
+ +		dev_err(&dev->dev, "SMBus base address uninitialized, "
+ +			"upgrade BIOS\n");
+ +		err = -ENODEV;
+ +		goto exit;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = acpi_check_resource_conflict(&dev->resource[SMBBAR]);
+ +	if (err) {
+ +		err = -ENODEV;
+ +		goto exit;
+ +	}
+++=======
++ 	if (i801_acpi_probe(priv))
++ 		return -ENODEV;
+++>>>>>>> a7ae81952cda (i2c: i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR)
+  
+ -	err = pcim_iomap_regions(dev, 1 << SMBBAR,
+ -				 dev_driver_string(&dev->dev));
+ +	err = pci_request_region(dev, SMBBAR, i801_driver.name);
+  	if (err) {
+ -		dev_err(&dev->dev,
+ -			"Failed to request SMBus region 0x%lx-0x%Lx\n",
+ -			priv->smba,
+ +		dev_err(&dev->dev, "Failed to request SMBus region "
+ +			"0x%lx-0x%Lx\n", priv->smba,
+  			(unsigned long long)pci_resource_end(dev, SMBBAR));
+++<<<<<<< HEAD
+ +		goto exit;
+++=======
++ 		i801_acpi_remove(priv);
++ 		return err;
+++>>>>>>> a7ae81952cda (i2c: i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR)
+  	}
+  
+  	pci_read_config_byte(priv->pci_dev, SMBHSTCFG, &temp);
+@@@ -1411,7 -1503,8 +1513,12 @@@
+  	err = i2c_add_adapter(&priv->adapter);
+  	if (err) {
+  		dev_err(&dev->dev, "Failed to add SMBus adapter\n");
+++<<<<<<< HEAD
+ +		goto exit_free_irq;
+++=======
++ 		i801_acpi_remove(priv);
++ 		return err;
+++>>>>>>> a7ae81952cda (i2c: i801: Allow ACPI SystemIO OpRegion to conflict with PCI BAR)
+  	}
+  
+  	i801_probe_optional_slaves(priv);
+@@@ -1445,15 -1530,11 +1552,16 @@@ static void i801_remove(struct pci_dev 
+  
+  	i801_del_mux(priv);
+  	i2c_del_adapter(&priv->adapter);
++ 	i801_acpi_remove(priv);
+  	pci_write_config_byte(dev, SMBHSTCFG, priv->original_hstcfg);
+  
+ +	if (priv->features & FEATURE_IRQ)
+ +		free_irq(dev->irq, priv);
+ +	pci_release_region(dev, SMBBAR);
+ +
+  	platform_device_unregister(priv->tco_pdev);
+  
+ +	kfree(priv);
+  	/*
+  	 * do not call pci_disable_device(dev) since it can cause hard hangs on
+  	 * some systems during power-off (eg. Fujitsu-Siemens Lifebook E8010)
+* Unmerged path drivers/i2c/busses/i2c-i801.c
