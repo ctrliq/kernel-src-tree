@@ -1,0 +1,311 @@
+target: Send UA when changing LUN inventory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Send UA when changing LUN inventory (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 89.74%
+commit-author Hannes Reinecke <hare@suse.de>
+commit 7c0d0d51d26497866d2951a35f1736fc765e4fcf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c0d0d51.failed
+
+When changind the LUN inventory via core_enable_device_list_for_node()
+or core_disable_device_list_for_node() a REPORTED LUNS DATA HAS CHANGED
+UA should be send.
+
+(Convert to target_luns_data_has_changed helper usage - hch)
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7c0d0d51d26497866d2951a35f1736fc765e4fcf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_ua.h
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,52448483ed9b..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -280,22 -257,58 +280,34 @@@ void core_update_device_list_access
+  {
+  	struct se_dev_entry *deve;
+  
+ -	mutex_lock(&nacl->lun_entry_mutex);
+ -	deve = target_nacl_find_deve(nacl, mapped_lun);
+ -	if (deve) {
+ -		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ -			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ -			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ -		} else {
+ -			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ -			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ -		}
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	deve = nacl->device_list[mapped_lun];
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+  	}
+ -	mutex_unlock(&nacl->lun_entry_mutex);
+ -}
+ -
+ -/*
+ - * Called with rcu_read_lock or nacl->device_list_lock held.
+ - */
+ -struct se_dev_entry *target_nacl_find_deve(struct se_node_acl *nacl, u64 mapped_lun)
+ -{
+ -	struct se_dev_entry *deve;
+ -
+ -	hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link)
+ -		if (deve->mapped_lun == mapped_lun)
+ -			return deve;
+ -
+ -	return NULL;
+ -}
+ -EXPORT_SYMBOL(target_nacl_find_deve);
+ -
+ -void target_pr_kref_release(struct kref *kref)
+ -{
+ -	struct se_dev_entry *deve = container_of(kref, struct se_dev_entry,
+ -						 pr_kref);
+ -	complete(&deve->pr_comp);
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  }
+  
+- /*      core_enable_device_list_for_node():
+-  *
+-  *
+-  */
++ static void
++ target_luns_data_has_changed(struct se_node_acl *nacl, struct se_dev_entry *new,
++ 			     bool skip_new)
++ {
++ 	struct se_dev_entry *tmp;
++ 
++ 	rcu_read_lock();
++ 	hlist_for_each_entry_rcu(tmp, &nacl->lun_entry_hlist, link) {
++ 		if (skip_new && tmp == new)
++ 			continue;
++ 		core_scsi3_ua_allocate(tmp, 0x3F,
++ 				       ASCQ_3FH_REPORTED_LUNS_DATA_HAS_CHANGED);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
+  int core_enable_device_list_for_node(
+  	struct se_lun *lun,
+  	struct se_lun_acl *lun_acl,
+@@@ -304,68 -317,76 +316,82 @@@
+  	struct se_node_acl *nacl,
+  	struct se_portal_group *tpg)
+  {
+ -	struct se_dev_entry *orig, *new;
+ -
+ -	new = kzalloc(sizeof(*new), GFP_KERNEL);
+ -	if (!new) {
+ -		pr_err("Unable to allocate se_dev_entry memory\n");
+ -		return -ENOMEM;
+ -	}
+ -
+ -	atomic_set(&new->ua_count, 0);
+ -	spin_lock_init(&new->ua_lock);
+ -	INIT_LIST_HEAD(&new->ua_list);
+ -	INIT_LIST_HEAD(&new->lun_link);
+ -
+ -	new->mapped_lun = mapped_lun;
+ -	kref_init(&new->pr_kref);
+ -	init_completion(&new->pr_comp);
+ -
+ -	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE)
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ -	else
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ -
+ -	new->creation_time = get_jiffies_64();
+ -	new->attach_count++;
+ -
+ -	mutex_lock(&nacl->lun_entry_mutex);
+ -	orig = target_nacl_find_deve(nacl, mapped_lun);
+ -	if (orig && orig->se_lun) {
+ -		struct se_lun *orig_lun = rcu_dereference_check(orig->se_lun,
+ -					lockdep_is_held(&nacl->lun_entry_mutex));
+ -
+ -		if (orig_lun != lun) {
+ -			pr_err("Existing orig->se_lun doesn't match new lun"
+ -			       " for dynamic -> explicit NodeACL conversion:"
+ -				" %s\n", nacl->initiatorname);
+ -			mutex_unlock(&nacl->lun_entry_mutex);
+ -			kfree(new);
+ +	struct se_port *port = lun->lun_sep;
+ +	struct se_dev_entry *deve;
+ +
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +
+ +	deve = nacl->device_list[mapped_lun];
+ +
+ +	/*
+ +	 * Check if the call is handling demo mode -> explicit LUN ACL
+ +	 * transition.  This transition must be for the same struct se_lun
+ +	 * + mapped_lun that was setup in demo mode..
+ +	 */
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		if (deve->se_lun_acl != NULL) {
+ +			pr_err("struct se_dev_entry->se_lun_acl"
+ +			       " already set for demo mode -> explicit"
+ +			       " LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+ +			return -EINVAL;
+ +		}
+ +		if (deve->se_lun != lun) {
+ +			pr_err("struct se_dev_entry->se_lun does"
+ +			       " match passed struct se_lun for demo mode"
+ +			       " -> explicit LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+  			return -EINVAL;
+  		}
+ -		BUG_ON(orig->se_lun_acl != NULL);
+ +		deve->se_lun_acl = lun_acl;
+  
+ -		rcu_assign_pointer(new->se_lun, lun);
+ -		rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -		hlist_del_rcu(&orig->link);
+ -		hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -		mutex_unlock(&nacl->lun_entry_mutex);
+ +		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		} else {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		}
+  
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&nacl->device_list_lock);
+++=======
++ 		spin_lock(&lun->lun_deve_lock);
++ 		list_del(&orig->lun_link);
++ 		list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 		spin_unlock(&lun->lun_deve_lock);
++ 
++ 		kref_put(&orig->pr_kref, target_pr_kref_release);
++ 		wait_for_completion(&orig->pr_comp);
++ 
++ 		target_luns_data_has_changed(nacl, new, true);
++ 		kfree_rcu(orig, rcu_head);
+++>>>>>>> 7c0d0d51d264 (target: Send UA when changing LUN inventory)
+  		return 0;
+  	}
+  
+ -	rcu_assign_pointer(new->se_lun, lun);
+ -	rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -	hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -	mutex_unlock(&nacl->lun_entry_mutex);
+ +	deve->se_lun = lun;
+ +	deve->se_lun_acl = lun_acl;
+ +	deve->mapped_lun = mapped_lun;
+ +	deve->lun_flags |= TRANSPORT_LUNFLAGS_INITIATOR_ACCESS;
+ +
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +	}
+ +
+ +	deve->creation_time = get_jiffies_64();
+ +	deve->attach_count++;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  
+ -	spin_lock(&lun->lun_deve_lock);
+ -	list_add_tail(&new->lun_link, &lun->lun_deve_list);
+ -	spin_unlock(&lun->lun_deve_lock);
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+  
++ 	target_luns_data_has_changed(nacl, new, true);
+  	return 0;
+  }
+  
+@@@ -397,30 -417,32 +423,51 @@@ int core_disable_device_list_for_node
+  	 * NodeACL context specific PR metadata for demo-mode
+  	 * MappedLUN *deve will be released below..
+  	 */
+ -	spin_lock(&lun->lun_deve_lock);
+ -	list_del(&orig->lun_link);
+ -	spin_unlock(&lun->lun_deve_lock);
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_del(&deve->alua_port_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+  	/*
+ -	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
+ +	 * PR operation to complete.
+  	 */
+ -	core_scsi3_ua_release_all(orig);
+ +	while (atomic_read(&deve->pr_ref_count) != 0)
+ +		cpu_relax();
+  
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	/*
+ +	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 */
+ +	core_scsi3_ua_release_all(deve);
+ +	deve->se_lun = NULL;
+ +	deve->se_lun_acl = NULL;
+ +	deve->lun_flags = 0;
+ +	deve->creation_time = 0;
+ +	deve->attach_count--;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+ +
+++<<<<<<< HEAD
+ +	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+ +	return 0;
+++=======
++ 	hlist_del_rcu(&orig->link);
++ 	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
++ 	rcu_assign_pointer(orig->se_lun, NULL);
++ 	rcu_assign_pointer(orig->se_lun_acl, NULL);
++ 	orig->lun_flags = 0;
++ 	orig->creation_time = 0;
++ 	orig->attach_count--;
++ 	/*
++ 	 * Before firing off RCU callback, wait for any in process SPEC_I_PT=1
++ 	 * or REGISTER_AND_MOVE PR operation to complete.
++ 	 */
++ 	kref_put(&orig->pr_kref, target_pr_kref_release);
++ 	wait_for_completion(&orig->pr_comp);
++ 
++ 	kfree_rcu(orig, rcu_head);
++ 
++ 	core_scsi3_free_pr_reg_from_nacl(dev, nacl);
++ 	target_luns_data_has_changed(nacl, NULL, false);
+++>>>>>>> 7c0d0d51d264 (target: Send UA when changing LUN inventory)
+  }
+  
+  /*      core_clear_lun_from_tpg():
+diff --cc drivers/target/target_core_ua.h
+index a6b56b364e7a,bd6e78ba153d..000000000000
+--- a/drivers/target/target_core_ua.h
++++ b/drivers/target/target_core_ua.h
+@@@ -25,6 -25,9 +25,12 @@@
+  
+  #define ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS		0x09
+  
+++<<<<<<< HEAD
+++=======
++ #define ASCQ_3FH_INQUIRY_DATA_HAS_CHANGED			0x03
++ #define ASCQ_3FH_REPORTED_LUNS_DATA_HAS_CHANGED			0x0E
++ 
+++>>>>>>> 7c0d0d51d264 (target: Send UA when changing LUN inventory)
+  extern struct kmem_cache *se_ua_cache;
+  
+  extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_ua.h
