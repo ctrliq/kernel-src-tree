@@ -1,0 +1,125 @@
+mmc: queue: turn queue flags into bools
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] queue: turn queue flags into bools (Gopal Tiwari) [1549495]
+Rebuild_FUZZ: 93.15%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 9491be5ff06ff08d61e6a8d767382ea0037a6f38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9491be5f.failed
+
+Instead of masking and setting two bits in the "flags" field
+for the mmc_queue, just use two bools named "suspended" and
+"new_request".
+
+The masking and setting would likely have race conditions
+anyways, it is better to use a simple member like this.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 9491be5ff06ff08d61e6a8d767382ea0037a6f38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index d7cc8dd6684d,7f0b9af8229c..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1628,8 -1663,8 +1628,13 @@@ static int mmc_blk_issue_rw_rq(struct m
+  			 * complete.
+  			 */
+  			if (status == MMC_BLK_NEW_REQUEST)
+++<<<<<<< HEAD
+ +				mq->flags |= MMC_QUEUE_NEW_REQUEST;
+ +			return 0;
+++=======
++ 				mq->new_request = true;
++ 			return;
+++>>>>>>> 9491be5ff06f (mmc: queue: turn queue flags into bools)
+  		}
+  
+  		/*
+@@@ -1775,8 -1802,8 +1780,13 @@@ int mmc_blk_issue_rq(struct mmc_queue *
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
+ +	if (cmd_flags & REQ_DISCARD) {
+++=======
++ 	mq->new_request = false;
++ 	if (req && req_op(req) == REQ_OP_DISCARD) {
+++>>>>>>> 9491be5ff06f (mmc: queue: turn queue flags into bools)
+  		/* complete ongoing async transfer before issuing discard */
+  		if (card->host->areq)
+  			mmc_blk_issue_rw_rq(mq, NULL);
+@@@ -1794,8 -1823,7 +1804,12 @@@
+  	}
+  
+  out:
+++<<<<<<< HEAD
+ +	if ((!req && !(mq->flags & MMC_QUEUE_NEW_REQUEST)) ||
+ +	     (cmd_flags & MMC_REQ_SPECIAL_MASK))
+++=======
++ 	if ((!req && !mq->new_request) || req_is_special)
+++>>>>>>> 9491be5ff06f (mmc: queue: turn queue flags into bools)
+  		/*
+  		 * Release host when there are no more requests
+  		 * and after special request(discard, flush) is done.
+* Unmerged path drivers/mmc/core/block.c
+diff --git a/drivers/mmc/core/queue.c b/drivers/mmc/core/queue.c
+index 1837b2962f9d..4794bc0d2747 100644
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@ -84,8 +84,8 @@ static int mmc_queue_thread(void *d)
+ 			cmd_flags = req ? req->cmd_flags : 0;
+ 			mmc_blk_issue_rq(mq, req);
+ 			cond_resched();
+-			if (mq->flags & MMC_QUEUE_NEW_REQUEST) {
+-				mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
++			if (mq->new_request) {
++				mq->new_request = false;
+ 				continue; /* fetch again */
+ 			}
+ 
+@@ -399,8 +399,8 @@ void mmc_queue_suspend(struct mmc_queue *mq)
+ 	struct request_queue *q = mq->queue;
+ 	unsigned long flags;
+ 
+-	if (!(mq->flags & MMC_QUEUE_SUSPENDED)) {
+-		mq->flags |= MMC_QUEUE_SUSPENDED;
++	if (!mq->suspended) {
++		mq->suspended |= true;
+ 
+ 		spin_lock_irqsave(q->queue_lock, flags);
+ 		blk_stop_queue(q);
+@@ -419,8 +419,8 @@ void mmc_queue_resume(struct mmc_queue *mq)
+ 	struct request_queue *q = mq->queue;
+ 	unsigned long flags;
+ 
+-	if (mq->flags & MMC_QUEUE_SUSPENDED) {
+-		mq->flags &= ~MMC_QUEUE_SUSPENDED;
++	if (mq->suspended) {
++		mq->suspended = false;
+ 
+ 		up(&mq->thread_sem);
+ 
+diff --git a/drivers/mmc/core/queue.h b/drivers/mmc/core/queue.h
+index a61f88199573..22158bb7295e 100644
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@ -30,9 +30,8 @@ struct mmc_queue {
+ 	struct mmc_card		*card;
+ 	struct task_struct	*thread;
+ 	struct semaphore	thread_sem;
+-	unsigned int		flags;
+-#define MMC_QUEUE_SUSPENDED	(1 << 0)
+-#define MMC_QUEUE_NEW_REQUEST	(1 << 1)
++	bool			new_request;
++	bool			suspended;
+ 	bool			asleep;
+ 	struct mmc_blk_data	*blkdata;
+ 	struct request_queue	*queue;
