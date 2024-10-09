@@ -1,0 +1,330 @@
+futex: Ensure the correct return value from futex_lock_pi()
+
+jira LE-1907
+cve CVE-2021-3347
+Rebuild_History Non-Buildable kernel-3.10.0-1160.31.1.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 12bb3f7f1b03d5913b3f9d4236a488aa7774dfe9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.31.1.el7/12bb3f7f.failed
+
+In case that futex_lock_pi() was aborted by a signal or a timeout and the
+task returned without acquiring the rtmutex, but is the designated owner of
+the futex due to a concurrent futex_unlock_pi() fixup_owner() is invoked to
+establish consistent state. In that case it invokes fixup_pi_state_owner()
+which in turn tries to acquire the rtmutex again. If that succeeds then it
+does not propagate this success to fixup_owner() and futex_lock_pi()
+returns -EINTR or -ETIMEOUT despite having the futex locked.
+
+Return success from fixup_pi_state_owner() in all cases where the current
+task owns the rtmutex and therefore the futex and propagate it correctly
+through fixup_owner(). Fixup the other callsite which does not expect a
+positive return value.
+
+Fixes: c1e2f0eaf015 ("futex: Avoid violating the 10th rule of futex")
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 12bb3f7f1b03d5913b3f9d4236a488aa7774dfe9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 877831775d7a,d5e61c2e865e..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -1929,21 -2356,74 +1929,70 @@@ static int fixup_pi_state_owner(u32 __u
+  	 * because we can fault here. Imagine swapped out pages or a fork
+  	 * that marked all the anonymous memory readonly for cow.
+  	 *
+ -	 * Modifying pi_state _before_ the user space value would leave the
+ -	 * pi_state in an inconsistent state when we fault here, because we
+ -	 * need to drop the locks to handle the fault. This might be observed
+ -	 * in the PID check in lookup_pi_state.
+ +	 * Modifying pi_state _before_ the user space value would
+ +	 * leave the pi_state in an inconsistent state when we fault
+ +	 * here, because we need to drop the hash bucket lock to
+ +	 * handle the fault. This might be observed in the PID check
+ +	 * in lookup_pi_state.
+  	 */
+  retry:
+ -	if (!argowner) {
+ -		if (oldowner != current) {
+ -			/*
+ -			 * We raced against a concurrent self; things are
+ -			 * already fixed up. Nothing to do.
+ -			 */
+ -			ret = 0;
+ -			goto out_unlock;
+ -		}
+ +	if (get_futex_value_locked(&uval, uaddr))
+ +		goto handle_fault;
+  
+++<<<<<<< HEAD
+ +	while (1) {
+++=======
++ 		if (__rt_mutex_futex_trylock(&pi_state->pi_mutex)) {
++ 			/* We got the lock. pi_state is correct. Tell caller. */
++ 			ret = 1;
++ 			goto out_unlock;
++ 		}
++ 
++ 		/*
++ 		 * The trylock just failed, so either there is an owner or
++ 		 * there is a higher priority waiter than this one.
++ 		 */
++ 		newowner = rt_mutex_owner(&pi_state->pi_mutex);
++ 		/*
++ 		 * If the higher priority waiter has not yet taken over the
++ 		 * rtmutex then newowner is NULL. We can't return here with
++ 		 * that state because it's inconsistent vs. the user space
++ 		 * state. So drop the locks and try again. It's a valid
++ 		 * situation and not any different from the other retry
++ 		 * conditions.
++ 		 */
++ 		if (unlikely(!newowner)) {
++ 			err = -EAGAIN;
++ 			goto handle_err;
++ 		}
++ 	} else {
++ 		WARN_ON_ONCE(argowner != current);
++ 		if (oldowner == current) {
++ 			/*
++ 			 * We raced against a concurrent self; things are
++ 			 * already fixed up. Nothing to do.
++ 			 */
++ 			ret = 1;
++ 			goto out_unlock;
++ 		}
++ 		newowner = argowner;
++ 	}
++ 
++ 	newtid = task_pid_vnr(newowner) | FUTEX_WAITERS;
++ 	/* Owner died? */
++ 	if (!pi_state->owner)
++ 		newtid |= FUTEX_OWNER_DIED;
++ 
++ 	err = get_futex_value_locked(&uval, uaddr);
++ 	if (err)
++ 		goto handle_err;
++ 
++ 	for (;;) {
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  		newval = (uval & FUTEX_OWNER_DIED) | newtid;
+  
+ -		err = cmpxchg_futex_value_locked(&curval, uaddr, uval, newval);
+ -		if (err)
+ -			goto handle_err;
+ -
+ +		if (cmpxchg_futex_value_locked(&curval, uaddr, uval, newval))
+ +			goto handle_fault;
+  		if (curval == uval)
+  			break;
+  		uval = curval;
+@@@ -1962,39 -2442,66 +2011,53 @@@
+  
+  	pi_state->owner = newowner;
+  
+ -	raw_spin_lock(&newowner->pi_lock);
+ +	raw_spin_lock_irq(&newowner->pi_lock);
+  	WARN_ON(!list_empty(&pi_state->list));
+  	list_add(&pi_state->list, &newowner->pi_state_list);
+++<<<<<<< HEAD
+ +	raw_spin_unlock_irq(&newowner->pi_lock);
+ +	return 0;
+++=======
++ 	raw_spin_unlock(&newowner->pi_lock);
++ 	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
++ 
++ 	return argowner == current;
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  
+  	/*
+ -	 * In order to reschedule or handle a page fault, we need to drop the
+ -	 * locks here. In the case of a fault, this gives the other task
+ -	 * (either the highest priority waiter itself or the task which stole
+ -	 * the rtmutex) the chance to try the fixup of the pi_state. So once we
+ -	 * are back from handling the fault we need to check the pi_state after
+ -	 * reacquiring the locks and before trying to do another fixup. When
+ -	 * the fixup has been done already we simply return.
+ -	 *
+ -	 * Note: we hold both hb->lock and pi_mutex->wait_lock. We can safely
+ -	 * drop hb->lock since the caller owns the hb -> futex_q relation.
+ -	 * Dropping the pi_mutex->wait_lock requires the state revalidate.
+ +	 * To handle the page fault we need to drop the hash bucket
+ +	 * lock here. That gives the other task (either the highest priority
+ +	 * waiter itself or the task which stole the rtmutex) the
+ +	 * chance to try the fixup of the pi_state. So once we are
+ +	 * back from handling the fault we need to check the pi_state
+ +	 * after reacquiring the hash bucket lock and before trying to
+ +	 * do another fixup. When the fixup has been done already we
+ +	 * simply return.
+  	 */
+ -handle_err:
+ -	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ +handle_fault:
+  	spin_unlock(q->lock_ptr);
+  
+ -	switch (err) {
+ -	case -EFAULT:
+ -		ret = fault_in_user_writeable(uaddr);
+ -		break;
+ -
+ -	case -EAGAIN:
+ -		cond_resched();
+ -		ret = 0;
+ -		break;
+ -
+ -	default:
+ -		WARN_ON_ONCE(1);
+ -		ret = err;
+ -		break;
+ -	}
+ +	ret = fault_in_user_writeable(uaddr);
+  
+  	spin_lock(q->lock_ptr);
+ -	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
+  
+  	/*
+  	 * Check if someone else fixed it for us:
+  	 */
+++<<<<<<< HEAD
+ +	if (pi_state->owner != oldowner)
+ +		return 0;
+++=======
++ 	if (pi_state->owner != oldowner) {
++ 		ret = argowner == current;
++ 		goto out_unlock;
++ 	}
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  
+  	if (ret)
+ -		goto out_unlock;
+ +		return ret;
+  
+  	goto retry;
+ -
+ -out_unlock:
+ -	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ -	return ret;
+  }
+  
+  static long futex_wait_restart(struct restart_block *restart);
+@@@ -2016,47 -2523,30 +2079,60 @@@
+   */
+  static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
+  {
+++<<<<<<< HEAD
+ +	struct task_struct *owner;
+ +	int ret = 0;
+ +
+++=======
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  	if (locked) {
+  		/*
+  		 * Got the lock. We might not be the anticipated owner if we
+  		 * did a lock-steal - fix up the PI-state in that case:
+ -		 *
+ -		 * Speculative pi_state->owner read (we don't hold wait_lock);
+ -		 * since we own the lock pi_state->owner == current is the
+ -		 * stable state, anything else needs more attention.
+  		 */
+  		if (q->pi_state->owner != current)
+++<<<<<<< HEAD
+ +			ret = fixup_pi_state_owner(uaddr, q, current);
+ +		goto out;
+++=======
++ 			return fixup_pi_state_owner(uaddr, q, current);
++ 		return 1;
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  	}
+  
+  	/*
+ -	 * If we didn't get the lock; check if anybody stole it from us. In
+ -	 * that case, we need to fix up the uval to point to them instead of
+ -	 * us, otherwise bad things happen. [10]
+ -	 *
+ -	 * Another speculative read; pi_state->owner == current is unstable
+ -	 * but needs our attention.
+ +	 * Catch the rare case, where the lock was released when we were on the
+ +	 * way back before we locked the hash bucket.
+  	 */
+++<<<<<<< HEAD
+ +	if (q->pi_state->owner == current) {
+ +		/*
+ +		 * Try to get the rt_mutex now. This might fail as some other
+ +		 * task acquired the rt_mutex after we removed ourself from the
+ +		 * rt_mutex waiters list.
+ +		 */
+ +		if (rt_mutex_trylock(&q->pi_state->pi_mutex)) {
+ +			locked = 1;
+ +			goto out;
+ +		}
+ +
+ +		/*
+ +		 * pi_state is incorrect, some other task did a lock steal and
+ +		 * we returned due to timeout or signal without taking the
+ +		 * rt_mutex. Too late.
+ +		 */
+ +		raw_spin_lock(&q->pi_state->pi_mutex.wait_lock);
+ +		owner = rt_mutex_owner(&q->pi_state->pi_mutex);
+ +		if (!owner)
+ +			owner = rt_mutex_next_owner(&q->pi_state->pi_mutex);
+ +		raw_spin_unlock(&q->pi_state->pi_mutex.wait_lock);
+ +		ret = fixup_pi_state_owner(uaddr, q, owner);
+ +		goto out;
+ +	}
+++=======
++ 	if (q->pi_state->owner == current)
++ 		return fixup_pi_state_owner(uaddr, q, NULL);
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  
+  	/*
+  	 * Paranoia check. If we did not take the lock, then we should not be
+@@@ -2067,9 -2557,9 +2143,13 @@@
+  				"pi-state %p\n", ret,
+  				q->pi_state->pi_mutex.owner,
+  				q->pi_state->owner);
+ -	}
+  
+++<<<<<<< HEAD
+ +out:
+ +	return ret ? ret : locked;
+++=======
++ 	return 0;
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  }
+  
+  /**
+@@@ -2665,9 -3257,25 +2745,26 @@@ static int futex_wait_requeue_pi(u32 __
+  		if (q.pi_state && (q.pi_state->owner != current)) {
+  			spin_lock(q.lock_ptr);
+  			ret = fixup_pi_state_owner(uaddr2, &q, current);
+++<<<<<<< HEAD
+++=======
++ 			if (ret < 0 && rt_mutex_owner(&q.pi_state->pi_mutex) == current) {
++ 				pi_state = q.pi_state;
++ 				get_pi_state(pi_state);
++ 			}
++ 			/*
++ 			 * Drop the reference to the pi state which
++ 			 * the requeue_pi() code acquired for us.
++ 			 */
++ 			put_pi_state(q.pi_state);
+++>>>>>>> 12bb3f7f1b03 (futex: Ensure the correct return value from futex_lock_pi())
+  			spin_unlock(q.lock_ptr);
++ 			/*
++ 			 * Adjust the return value. It's either -EFAULT or
++ 			 * success (1) but the caller expects 0 for success.
++ 			 */
++ 			ret = ret < 0 ? ret : 0;
+  		}
+  	} else {
+ -		struct rt_mutex *pi_mutex;
+ -
+  		/*
+  		 * We have been woken up by futex_unlock_pi(), a timeout, or a
+  		 * signal.  futex_unlock_pi() will not destroy the lock_ptr nor
+* Unmerged path kernel/futex.c
