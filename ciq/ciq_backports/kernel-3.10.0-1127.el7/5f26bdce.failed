@@ -1,0 +1,160 @@
+cpuidle: menu: Fix wakeup statistics updates for polling state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 5f26bdceb9c0a5e6c696aa2899d077cd3ae93413
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5f26bdce.failed
+
+If the CPU exits the "polling" state due to the time limit in the
+loop in poll_idle(), this is not a real wakeup and it just means
+that the "polling" state selection was not adequate.  The governor
+mispredicted short idle duration, but had a more suitable state been
+selected, the CPU might have spent more time in it.  In fact, there
+is no reason to expect that there would have been a wakeup event
+earlier than the next timer in that case.
+
+Handling such cases as regular wakeups in menu_update() may cause the
+menu governor to make suboptimal decisions going forward, but ignoring
+them altogether would not be correct either, because every time
+menu_select() is invoked, it makes a separate new attempt to predict
+the idle duration taking distinct time to the closest timer event as
+input and the outcomes of all those attempts should be recorded.
+
+For this reason, make menu_update() always assume that if the
+"polling" state was exited due to the time limit, the next proper
+wakeup event for the CPU would be the next timer event (not
+including the tick).
+
+Fixes: a37b969a61c1 "cpuidle: poll_state: Add time limit to poll_idle()"
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+(cherry picked from commit 5f26bdceb9c0a5e6c696aa2899d077cd3ae93413)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpuidle/governors/menu.c
+#	drivers/cpuidle/poll_state.c
+#	include/linux/cpuidle.h
+diff --cc drivers/cpuidle/governors/menu.c
+index c99fee9880b7,8b3f9c7bf221..000000000000
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@@ -359,39 -479,69 +359,66 @@@ static void menu_reflect(struct cpuidle
+   */
+  static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+  {
+ -	struct menu_device *data = this_cpu_ptr(&menu_devices);
+ +	struct menu_device *data = &__get_cpu_var(menu_devices);
+  	int last_idx = data->last_state_idx;
+ +	unsigned int last_idle_us = cpuidle_get_last_residency(dev);
+  	struct cpuidle_state *target = &drv->states[last_idx];
+  	unsigned int measured_us;
+ -	unsigned int new_factor;
+ +	u64 new_factor;
+  
+  	/*
+ -	 * Try to figure out how much time passed between entry to low
+ -	 * power state and occurrence of the wakeup event.
+ -	 *
+ -	 * If the entered idle state didn't support residency measurements,
+ -	 * we use them anyway if they are short, and if long,
+ -	 * truncate to the whole expected time.
+ -	 *
+ -	 * Any measured amount of time will include the exit latency.
+ -	 * Since we are interested in when the wakeup begun, not when it
+ -	 * was completed, we must subtract the exit latency. However, if
+ -	 * the measured amount of time is less than the exit latency,
+ -	 * assume the state was never reached and the exit latency is 0.
+ +	 * Ugh, this idle state doesn't support residency measurements, so we
+ +	 * are basically lost in the dark.  As a compromise, assume we slept
+ +	 * for the whole expected time.
+  	 */
+ +	if (unlikely(target->flags & CPUIDLE_FLAG_TIME_INVALID))
+ +		last_idle_us = data->expected_us;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (data->tick_wakeup && data->next_timer_us > TICK_USEC) {
++ 		/*
++ 		 * The nohz code said that there wouldn't be any events within
++ 		 * the tick boundary (if the tick was stopped), but the idle
++ 		 * duration predictor had a differing opinion.  Since the CPU
++ 		 * was woken up by a tick (that wasn't stopped after all), the
++ 		 * predictor was not quite right, so assume that the CPU could
++ 		 * have been idle long (but not forever) to help the idle
++ 		 * duration predictor do a better job next time.
++ 		 */
++ 		measured_us = 9 * MAX_INTERESTING / 10;
++ 	} else if ((drv->states[last_idx].flags & CPUIDLE_FLAG_POLLING) &&
++ 		   dev->poll_time_limit) {
++ 		/*
++ 		 * The CPU exited the "polling" state due to a time limit, so
++ 		 * the idle duration prediction leading to the selection of that
++ 		 * state was inaccurate.  If a better prediction had been made,
++ 		 * the CPU might have been woken up from idle by the next timer.
++ 		 * Assume that to be the case.
++ 		 */
++ 		measured_us = data->next_timer_us;
++ 	} else {
++ 		/* measured value */
++ 		measured_us = dev->last_residency;
+++>>>>>>> 5f26bdceb9c0 (cpuidle: menu: Fix wakeup statistics updates for polling state)
+  
+ -		/* Deduct exit latency */
+ -		if (measured_us > 2 * target->exit_latency)
+ -			measured_us -= target->exit_latency;
+ -		else
+ -			measured_us /= 2;
+ -	}
+ +	measured_us = last_idle_us;
+ +
+ +	/*
+ +	 * We correct for the exit latency; we are assuming here that the
+ +	 * exit latency happens after the event that we're interested in.
+ +	 */
+ +	if (measured_us > data->exit_us)
+ +		measured_us -= data->exit_us;
+  
+ -	/* Make sure our coefficients do not exceed unity */
+ -	if (measured_us > data->next_timer_us)
+ -		measured_us = data->next_timer_us;
+  
+ -	/* Update our correction ratio */
+ -	new_factor = data->correction_factor[data->bucket];
+ -	new_factor -= new_factor / DECAY;
+ +	/* update our correction ratio */
+  
+ -	if (data->next_timer_us > 0 && measured_us < MAX_INTERESTING)
+ -		new_factor += RESOLUTION * measured_us / data->next_timer_us;
+ +	new_factor = data->correction_factor[data->bucket]
+ +			* (DECAY - 1) / DECAY;
+ +
+ +	if (data->expected_us > 0 && measured_us < MAX_INTERESTING)
+ +		new_factor += RESOLUTION * measured_us / data->expected_us;
+  	else
+  		/*
+  		 * we were idle so long that we count it as a perfect
+diff --cc include/linux/cpuidle.h
+index 9bd9bae0c305,faed7a8977e8..000000000000
+--- a/include/linux/cpuidle.h
++++ b/include/linux/cpuidle.h
+@@@ -64,6 -76,12 +64,11 @@@ struct cpuidle_state 
+  struct cpuidle_device {
+  	unsigned int		registered:1;
+  	unsigned int		enabled:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int		use_deepest_state:1;
++ 	unsigned int		poll_time_limit:1;
+++>>>>>>> 5f26bdceb9c0 (cpuidle: menu: Fix wakeup statistics updates for polling state)
+  	unsigned int		cpu;
+  
+  	int			last_residency;
+* Unmerged path drivers/cpuidle/poll_state.c
+* Unmerged path drivers/cpuidle/governors/menu.c
+* Unmerged path drivers/cpuidle/poll_state.c
+* Unmerged path include/linux/cpuidle.h
