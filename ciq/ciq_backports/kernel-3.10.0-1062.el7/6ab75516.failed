@@ -1,0 +1,124 @@
+net/mlx5e: Move phy link down events counter out of SW stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Move phy link down events counter out of SW stats (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.55%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 6ab75516cf35c4789ca8baa206b21fdbc03c7870
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6ab75516.failed
+
+PHY link down events counter belongs to phy_counters group.
+although it has special handling, it doesn't mean it can't be there.
+
+Move it to phy_counters_grp handler.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 6ab75516cf35c4789ca8baa206b21fdbc03c7870)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 43dc808684c9,39ced559929a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@@ -92,8 -93,10 +92,15 @@@ struct mlx5e_sw_stats 
+  	u64 rx_cache_waive;
+  	u64 ch_eq_rearm;
+  
+++<<<<<<< HEAD
+ +	/* Special handling counters */
+ +	u64 link_down_events_phy;
+++=======
++ #ifdef CONFIG_MLX5_EN_TLS
++ 	u64 tx_tls_ooo;
++ 	u64 tx_tls_resync_bytes;
++ #endif
+++>>>>>>> 6ab75516cf35 (net/mlx5e: Move phy link down events counter out of SW stats)
+  };
+  
+  struct mlx5e_qcounter_stats {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 8721ed97ba96..a9ea6cc04baa 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -73,7 +73,6 @@ static const struct counter_desc sw_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_busy) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_waive) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, ch_eq_rearm) },
+-	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, link_down_events_phy) },
+ };
+ 
+ #define NUM_SW_COUNTERS			ARRAY_SIZE(sw_stats_desc)
+@@ -160,9 +159,6 @@ static void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
+ 		}
+ 	}
+ 
+-	s->link_down_events_phy = MLX5_GET(ppcnt_reg,
+-				priv->stats.pport.phy_counters,
+-				counter_set.phys_layer_cntrs.link_down_events);
+ 	memcpy(&priv->stats.sw, s, sizeof(*s));
+ }
+ 
+@@ -565,12 +561,13 @@ static const struct counter_desc pport_phy_statistical_stats_desc[] = {
+ 	{ "rx_corrected_bits_phy", PPORT_PHY_STATISTICAL_OFF(phy_corrected_bits) },
+ };
+ 
+-#define NUM_PPORT_PHY_COUNTERS		ARRAY_SIZE(pport_phy_statistical_stats_desc)
++#define NUM_PPORT_PHY_STATISTICAL_COUNTERS ARRAY_SIZE(pport_phy_statistical_stats_desc)
+ 
+ static int mlx5e_grp_phy_get_num_stats(struct mlx5e_priv *priv)
+ {
++	/* "1" for link_down_events special counter */
+ 	return MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group) ?
+-		NUM_PPORT_PHY_COUNTERS : 0;
++		NUM_PPORT_PHY_STATISTICAL_COUNTERS + 1 : 1;
+ }
+ 
+ static int mlx5e_grp_phy_fill_strings(struct mlx5e_priv *priv, u8 *data,
+@@ -578,10 +575,14 @@ static int mlx5e_grp_phy_fill_strings(struct mlx5e_priv *priv, u8 *data,
+ {
+ 	int i;
+ 
+-	if (MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group))
+-		for (i = 0; i < NUM_PPORT_PHY_COUNTERS; i++)
+-			strcpy(data + (idx++) * ETH_GSTRING_LEN,
+-			       pport_phy_statistical_stats_desc[i].format);
++	strcpy(data + (idx++) * ETH_GSTRING_LEN, "link_down_events_phy");
++
++	if (!MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group))
++		return idx;
++
++	for (i = 0; i < NUM_PPORT_PHY_STATISTICAL_COUNTERS; i++)
++		strcpy(data + (idx++) * ETH_GSTRING_LEN,
++		       pport_phy_statistical_stats_desc[i].format);
+ 	return idx;
+ }
+ 
+@@ -589,11 +590,17 @@ static int mlx5e_grp_phy_fill_stats(struct mlx5e_priv *priv, u64 *data, int idx)
+ {
+ 	int i;
+ 
+-	if (MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group))
+-		for (i = 0; i < NUM_PPORT_PHY_COUNTERS; i++)
+-			data[idx++] =
+-				MLX5E_READ_CTR64_BE(&priv->stats.pport.phy_statistical_counters,
+-						    pport_phy_statistical_stats_desc, i);
++	/* link_down_events_phy has special handling since it is not stored in __be64 format */
++	data[idx++] = MLX5_GET(ppcnt_reg, priv->stats.pport.phy_counters,
++			       counter_set.phys_layer_cntrs.link_down_events);
++
++	if (!MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group))
++		return idx;
++
++	for (i = 0; i < NUM_PPORT_PHY_STATISTICAL_COUNTERS; i++)
++		data[idx++] =
++			MLX5E_READ_CTR64_BE(&priv->stats.pport.phy_statistical_counters,
++					    pport_phy_statistical_stats_desc, i);
+ 	return idx;
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
