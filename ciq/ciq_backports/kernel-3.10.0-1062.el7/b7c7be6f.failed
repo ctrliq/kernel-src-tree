@@ -1,0 +1,153 @@
+nvme-fabrics: move controller options matching to fabrics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit b7c7be6f6bd28ffea7f608ac2d806b8a4bdc82fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b7c7be6f.failed
+
+IP transports will most likely use the same controller options
+matching when detecting a duplicate connect. Move it to
+fabrics.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b7c7be6f6bd28ffea7f608ac2d806b8a4bdc82fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index f692db6210d1,d181cafedc58..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -1801,69 -1856,6 +1801,72 @@@ static const struct nvme_ctrl_ops nvme_
+  	.stop_ctrl		= nvme_rdma_stop_ctrl,
+  };
+  
+++<<<<<<< HEAD
+ +static int nvme_rdma_parse_ipaddr(struct sockaddr_in *in_addr, char *p)
+ +{
+ +	u8 *addr = (u8 *)&in_addr->sin_addr.s_addr;
+ +	size_t buflen = strlen(p);
+ +
+ +	/* XXX: handle IPv6 addresses */
+ +
+ +	if (buflen > INET_ADDRSTRLEN)
+ +		return -EINVAL;
+ +	if (in4_pton(p, buflen, addr, '\0', NULL) == 0)
+ +		return -EINVAL;
+ +	in_addr->sin_family = AF_INET;
+ +	return 0;
+ +}
+ +
+ +static inline bool
+ +__nvme_rdma_options_match(struct nvme_rdma_ctrl *ctrl,
+ +	struct nvmf_ctrl_options *opts)
+ +{
+ +	char *stdport = __stringify(NVME_RDMA_IP_PORT);
+ +
+ +
+ +	if (!nvmf_ctlr_matches_baseopts(&ctrl->ctrl, opts) ||
+ +	    strcmp(opts->traddr, ctrl->ctrl.opts->traddr))
+ +		return false;
+ +
+ +	if (opts->mask & NVMF_OPT_TRSVCID &&
+ +	    ctrl->ctrl.opts->mask & NVMF_OPT_TRSVCID) {
+ +		if (strcmp(opts->trsvcid, ctrl->ctrl.opts->trsvcid))
+ +			return false;
+ +	} else if (opts->mask & NVMF_OPT_TRSVCID) {
+ +		if (strcmp(opts->trsvcid, stdport))
+ +			return false;
+ +	} else if (ctrl->ctrl.opts->mask & NVMF_OPT_TRSVCID) {
+ +		if (strcmp(stdport, ctrl->ctrl.opts->trsvcid))
+ +			return false;
+ +	}
+ +	/* else, it's a match as both have stdport. Fall to next checks */
+ +
+ +	/*
+ +	 * checking the local address is rough. In most cases, one
+ +	 * is not specified and the host port is selected by the stack.
+ +	 *
+ +	 * Assume no match if:
+ +	 *  local address is specified and address is not the same
+ +	 *  local address is not specified but remote is, or vice versa
+ +	 *    (admin using specific host_traddr when it matters).
+ +	 */
+ +	if (opts->mask & NVMF_OPT_HOST_TRADDR &&
+ +	    ctrl->ctrl.opts->mask & NVMF_OPT_HOST_TRADDR) {
+ +		if (strcmp(opts->host_traddr, ctrl->ctrl.opts->host_traddr))
+ +			return false;
+ +	} else if (opts->mask & NVMF_OPT_HOST_TRADDR ||
+ +		   ctrl->ctrl.opts->mask & NVMF_OPT_HOST_TRADDR)
+ +		return false;
+ +	/*
+ +	 * if neither controller had an host port specified, assume it's
+ +	 * a match as everything else matched.
+ +	 */
+ +
+ +	return true;
+ +}
+ +
+++=======
+++>>>>>>> b7c7be6f6bd2 (nvme-fabrics: move controller options matching to fabrics)
+  /*
+   * Fails a connection request if it matches an existing controller
+   * (association) with the same tuple:
+diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
+index 2297b29940ec..926f89ac2eb5 100644
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@ -866,6 +866,36 @@ static int nvmf_check_required_opts(struct nvmf_ctrl_options *opts,
+ 	return 0;
+ }
+ 
++bool nvmf_ip_options_match(struct nvme_ctrl *ctrl,
++		struct nvmf_ctrl_options *opts)
++{
++	if (!nvmf_ctlr_matches_baseopts(ctrl, opts) ||
++	    strcmp(opts->traddr, ctrl->opts->traddr) ||
++	    strcmp(opts->trsvcid, ctrl->opts->trsvcid))
++		return false;
++
++	/*
++	 * Checking the local address is rough. In most cases, none is specified
++	 * and the host port is selected by the stack.
++	 *
++	 * Assume no match if:
++	 * -  local address is specified and address is not the same
++	 * -  local address is not specified but remote is, or vice versa
++	 *    (admin using specific host_traddr when it matters).
++	 */
++	if ((opts->mask & NVMF_OPT_HOST_TRADDR) &&
++	    (ctrl->opts->mask & NVMF_OPT_HOST_TRADDR)) {
++		if (strcmp(opts->host_traddr, ctrl->opts->host_traddr))
++			return false;
++	} else if ((opts->mask & NVMF_OPT_HOST_TRADDR) ||
++		   (ctrl->opts->mask & NVMF_OPT_HOST_TRADDR)) {
++		return false;
++	}
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(nvmf_ip_options_match);
++
+ static int nvmf_check_allowed_opts(struct nvmf_ctrl_options *opts,
+ 		unsigned int allowed_opts)
+ {
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index 697fe709cacd..a098f268d247 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -166,6 +166,8 @@ int nvmf_fail_nonready_command(struct nvme_ctrl *ctrl,
+ 		struct request *rq);
+ bool __nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+ 		bool queue_live);
++bool nvmf_ip_options_match(struct nvme_ctrl *ctrl,
++		struct nvmf_ctrl_options *opts);
+ 
+ static inline bool nvmf_check_ready(struct nvme_ctrl *ctrl, struct request *rq,
+ 		bool queue_live)
+* Unmerged path drivers/nvme/host/rdma.c
