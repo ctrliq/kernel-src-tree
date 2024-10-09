@@ -1,0 +1,224 @@
+i40e: remove code to handle dev_addr specially
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 3c7cbd45bca8ad34c66327c919fc76e0dfee90fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3c7cbd45.failed
+
+The netdev->dev_addr MAC filter already exists in the
+MAC/VLAN hash table, as it is added when we configure
+the netdev in i40e_configure_netdev. Because we already
+know that this address will be updated in the
+hash_for_each loops, we do not need to handle it
+specially. This removes duplicate code and simplifies
+the i40e_vsi_add_vlan and i40e_vsi_kill_vlan functions.
+Because we know these filters must be part of the
+MAC/VLAN hash table, this should not have any functional
+impact on what filters are included and is merely a code
+simplification.
+
+Change-ID: I5e648302dbdd7cc29efc6d203b7019c11f0b5705
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 3c7cbd45bca8ad34c66327c919fc76e0dfee90fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index beeec4f78000,ae4a2b2ddc97..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -2326,29 -2508,17 +2326,36 @@@ static void i40e_vlan_rx_register(struc
+   **/
+  int i40e_vsi_add_vlan(struct i40e_vsi *vsi, s16 vid)
+  {
+ -	struct i40e_mac_filter *f, *add_f, *del_f;
+ -	struct hlist_node *h;
+ -	int bkt;
+ +	struct i40e_mac_filter *f, *ftmp, *add_f;
+ +	bool is_netdev, is_vf;
+ +
+ +	is_vf = (vsi->type == I40E_VSI_SRIOV);
+ +	is_netdev = !!(vsi->netdev);
+  
+  	/* Locked once because all functions invoked below iterates list*/
+ -	spin_lock_bh(&vsi->mac_filter_hash_lock);
+ +	spin_lock_bh(&vsi->mac_filter_list_lock);
+ +
+++<<<<<<< HEAD
+ +	if (is_netdev) {
+ +		add_f = i40e_add_filter(vsi, vsi->netdev->dev_addr, vid,
+ +					is_vf, is_netdev);
+ +		if (!add_f) {
+ +			dev_info(&vsi->back->pdev->dev,
+ +				 "Could not add vlan filter %d for %pM\n",
+ +				 vid, vsi->netdev->dev_addr);
+ +			spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +			return -ENOMEM;
+ +		}
+ +	}
+  
+ +	list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+ +		add_f = i40e_add_filter(vsi, f->macaddr, vid, is_vf, is_netdev);
+++=======
++ 	hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
++ 		if (f->state == I40E_FILTER_REMOVE)
++ 			continue;
++ 		add_f = i40e_add_filter(vsi, f->macaddr, vid);
+++>>>>>>> 3c7cbd45bca8 (i40e: remove code to handle dev_addr specially)
+  		if (!add_f) {
+  			dev_info(&vsi->back->pdev->dev,
+  				 "Could not add vlan filter %d for %pM\n",
+@@@ -2358,39 -2528,24 +2365,45 @@@
+  		}
+  	}
+  
+- 	/* Now if we add a vlan tag, make sure to check if it is the first
+- 	 * tag (i.e. a "tag" -1 does exist) and if so replace the -1 "tag"
+- 	 * with 0, so we now accept untagged and specified tagged traffic
+- 	 * (and not all tags along with untagged)
++ 	/* When we add a new VLAN filter, we need to make sure that all existing
++ 	 * filters which are marked as vid=-1 (I40E_VLAN_ANY) are converted to
++ 	 * vid=0. The simplest way is just search for all filters marked as
++ 	 * vid=-1 and replace them with vid=0. This converts all filters that
++ 	 * were marked to receive all traffic (tagged or untagged) into
++ 	 * filters to receive only untagged traffic, so that we don't receive
++ 	 * tagged traffic for VLANs which we have not configured.
+  	 */
+++<<<<<<< HEAD
+ +	if (vid > 0) {
+ +		if (is_netdev && i40e_find_filter(vsi, vsi->netdev->dev_addr,
+ +						  I40E_VLAN_ANY,
+ +						  is_vf, is_netdev)) {
+ +			i40e_del_filter(vsi, vsi->netdev->dev_addr,
+ +					I40E_VLAN_ANY, is_vf, is_netdev);
+ +			add_f = i40e_add_filter(vsi, vsi->netdev->dev_addr, 0,
+ +						is_vf, is_netdev);
+ +			if (!add_f) {
+ +				dev_info(&vsi->back->pdev->dev,
+ +					 "Could not add filter 0 for %pM\n",
+ +					 vsi->netdev->dev_addr);
+ +				spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +				return -ENOMEM;
+ +			}
+ +		}
+ +	}
+ +
+ +	/* Do not assume that I40E_VLAN_ANY should be reset to VLAN 0 */
+++=======
+++>>>>>>> 3c7cbd45bca8 (i40e: remove code to handle dev_addr specially)
+  	if (vid > 0 && !vsi->info.pvid) {
+ -		hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
+ -			if (f->state == I40E_FILTER_REMOVE)
+ -				continue;
+ -			del_f = i40e_find_filter(vsi, f->macaddr,
+ -						 I40E_VLAN_ANY);
+ -			if (!del_f)
+ +		list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+ +			if (!i40e_find_filter(vsi, f->macaddr, I40E_VLAN_ANY,
+ +					      is_vf, is_netdev))
+  				continue;
+ -			__i40e_del_filter(vsi, del_f);
+ -			add_f = i40e_add_filter(vsi, f->macaddr, 0);
+ +			i40e_del_filter(vsi, f->macaddr, I40E_VLAN_ANY,
+ +					is_vf, is_netdev);
+ +			add_f = i40e_add_filter(vsi, f->macaddr,
+ +						0, is_vf, is_netdev);
+  			if (!add_f) {
+  				dev_info(&vsi->back->pdev->dev,
+  					 "Could not add filter 0 for %pM\n",
+@@@ -2417,73 -2569,22 +2430,85 @@@
+   * i40e_vsi_kill_vlan - Remove vsi membership for given vlan
+   * @vsi: the vsi being configured
+   * @vid: vlan id to be removed (0 = untagged only , -1 = any)
+ + *
+ + * Return: 0 on success or negative otherwise
+   **/
+ -void i40e_vsi_kill_vlan(struct i40e_vsi *vsi, s16 vid)
+ +int i40e_vsi_kill_vlan(struct i40e_vsi *vsi, s16 vid)
+  {
+++<<<<<<< HEAD
+ +	struct net_device *netdev = vsi->netdev;
+ +	struct i40e_mac_filter *f, *ftmp, *add_f;
+ +	bool is_vf, is_netdev;
+ +	int filter_count = 0;
+ +
+ +	is_vf = (vsi->type == I40E_VSI_SRIOV);
+ +	is_netdev = !!(netdev);
+++=======
++ 	struct i40e_mac_filter *f;
++ 	struct hlist_node *h;
++ 	int bkt;
+++>>>>>>> 3c7cbd45bca8 (i40e: remove code to handle dev_addr specially)
+  
+  	/* Locked once because all functions invoked below iterates list */
+ -	spin_lock_bh(&vsi->mac_filter_hash_lock);
+ +	spin_lock_bh(&vsi->mac_filter_list_lock);
+ +
+++<<<<<<< HEAD
+ +	if (is_netdev)
+ +		i40e_del_filter(vsi, netdev->dev_addr, vid, is_vf, is_netdev);
+ +
+ +	list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list)
+ +		i40e_del_filter(vsi, f->macaddr, vid, is_vf, is_netdev);
+ +
+ +	/* go through all the filters for this VSI and if there is only
+ +	 * vid == 0 it means there are no other filters, so vid 0 must
+ +	 * be replaced with -1. This signifies that we should from now
+ +	 * on accept any traffic (with any tag present, or untagged)
+ +	 */
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (is_netdev) {
+ +			if (f->vlan &&
+ +			    ether_addr_equal(netdev->dev_addr, f->macaddr))
+ +				filter_count++;
+ +		}
+  
+ +		if (f->vlan)
+ +			filter_count++;
+++=======
++ 	hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
++ 		if (f->vlan == vid)
++ 			__i40e_del_filter(vsi, f);
+++>>>>>>> 3c7cbd45bca8 (i40e: remove code to handle dev_addr specially)
+ +	}
+ +
+ +	if (!filter_count && is_netdev) {
+ +		i40e_del_filter(vsi, netdev->dev_addr, 0, is_vf, is_netdev);
+ +		f = i40e_add_filter(vsi, netdev->dev_addr, I40E_VLAN_ANY,
+ +				    is_vf, is_netdev);
+ +		if (!f) {
+ +			dev_info(&vsi->back->pdev->dev,
+ +				 "Could not add filter %d for %pM\n",
+ +				 I40E_VLAN_ANY, netdev->dev_addr);
+ +			spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +			return -ENOMEM;
+ +		}
+  	}
+  
+ -	spin_unlock_bh(&vsi->mac_filter_hash_lock);
+ +	if (!filter_count) {
+ +		list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+ +			i40e_del_filter(vsi, f->macaddr, 0, is_vf, is_netdev);
+ +			add_f = i40e_add_filter(vsi, f->macaddr, I40E_VLAN_ANY,
+ +						is_vf, is_netdev);
+ +			if (!add_f) {
+ +				dev_info(&vsi->back->pdev->dev,
+ +					 "Could not add filter %d for %pM\n",
+ +					 I40E_VLAN_ANY, f->macaddr);
+ +				spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +				return -ENOMEM;
+ +			}
+ +		}
+ +	}
+ +
+ +	spin_unlock_bh(&vsi->mac_filter_list_lock);
+  
+  	/* schedule our worker thread which will take care of
+  	 * applying the new filter changes
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
