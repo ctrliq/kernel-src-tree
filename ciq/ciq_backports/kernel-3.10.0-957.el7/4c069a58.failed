@@ -1,0 +1,253 @@
+ceph: add newline to end of debug message format
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Chengguang Xu <cgxu519@icloud.com>
+commit 4c069a5821ddc568e9509f49fcc9481c8a43712f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4c069a58.failed
+
+Some of dout format do not include newline in the end,
+fix for the files which are in fs/ceph and net/ceph directories,
+and changing printk to dout for printing debug info in super.c
+
+	Signed-off-by: Chengguang Xu <cgxu519@icloud.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 4c069a5821ddc568e9509f49fcc9481c8a43712f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/cache.c
+#	fs/ceph/locks.c
+diff --cc fs/ceph/locks.c
+index 1476ec99d7fa,9dae2ec7e1fa..000000000000
+--- a/fs/ceph/locks.c
++++ b/fs/ceph/locks.c
+@@@ -91,13 -92,10 +91,13 @@@ static int ceph_lock_message(u8 lock_ty
+  	else
+  		length = fl->fl_end - fl->fl_start + 1;
+  
+ -	owner = secure_addr(fl->fl_owner);
+ +	if (lock_type == CEPH_LOCK_FCNTL)
+ +		owner = secure_addr(fl->fl_owner);
+ +	else
+ +		owner = secure_addr(fl->fl_file);
+  
+  	dout("ceph_lock_message: rule: %d, op: %d, owner: %llx, pid: %llu, "
+- 	     "start: %llu, length: %llu, wait: %d, type: %d", (int)lock_type,
++ 	     "start: %llu, length: %llu, wait: %d, type: %d\n", (int)lock_type,
+  	     (int)operation, owner, (u64)fl->fl_pid, fl->fl_start, length,
+  	     wait, fl->fl_type);
+  
+@@@ -349,18 -347,50 +349,56 @@@ void ceph_count_locks(struct inode *ino
+  	*fcntl_count = 0;
+  	*flock_count = 0;
+  
+ -	ctx = inode->i_flctx;
+ -	if (ctx) {
+ -		spin_lock(&ctx->flc_lock);
+ -		list_for_each_entry(lock, &ctx->flc_posix, fl_list)
+ +	spin_lock(&inode->i_lock);
+ +	for (lock = inode->i_flock; lock != NULL; lock = lock->fl_next) {
+ +		if (lock->fl_flags & FL_POSIX)
+  			++(*fcntl_count);
+ -		list_for_each_entry(lock, &ctx->flc_flock, fl_list)
+ +		else if (lock->fl_flags & FL_FLOCK)
+  			++(*flock_count);
+ -		spin_unlock(&ctx->flc_lock);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&inode->i_lock);
+ +	dout("counted %d flock locks and %d fcntl locks",
+ +	     *flock_count, *fcntl_count);
+ +}
+ +
+++=======
++ 	dout("counted %d flock locks and %d fcntl locks\n",
++ 	     *flock_count, *fcntl_count);
++ }
++ 
++ /*
++  * Given a pointer to a lock, convert it to a ceph filelock
++  */
++ static int lock_to_ceph_filelock(struct file_lock *lock,
++ 				 struct ceph_filelock *cephlock)
++ {
++ 	int err = 0;
++ 	cephlock->start = cpu_to_le64(lock->fl_start);
++ 	cephlock->length = cpu_to_le64(lock->fl_end - lock->fl_start + 1);
++ 	cephlock->client = cpu_to_le64(0);
++ 	cephlock->pid = cpu_to_le64((u64)lock->fl_pid);
++ 	cephlock->owner = cpu_to_le64(secure_addr(lock->fl_owner));
++ 
++ 	switch (lock->fl_type) {
++ 	case F_RDLCK:
++ 		cephlock->type = CEPH_LOCK_SHARED;
++ 		break;
++ 	case F_WRLCK:
++ 		cephlock->type = CEPH_LOCK_EXCL;
++ 		break;
++ 	case F_UNLCK:
++ 		cephlock->type = CEPH_LOCK_UNLOCK;
++ 		break;
++ 	default:
++ 		dout("Have unknown lock type %d\n", lock->fl_type);
++ 		err = -EINVAL;
++ 	}
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 4c069a5821dd (ceph: add newline to end of debug message format)
+  /**
+   * Encode the flock and fcntl locks for the given inode into the ceph_filelock
+   * array. Must be called with inode->i_lock already held.
+@@@ -376,38 -407,37 +414,38 @@@ int ceph_encode_locks_to_buffer(struct 
+  	int seen_flock = 0;
+  	int l = 0;
+  
+- 	dout("encoding %d flock and %d fcntl locks", num_flock_locks,
++ 	dout("encoding %d flock and %d fcntl locks\n", num_flock_locks,
+  	     num_fcntl_locks);
+  
+ -	if (!ctx)
+ -		return 0;
+ -
+ -	spin_lock(&ctx->flc_lock);
+ -	list_for_each_entry(lock, &ctx->flc_posix, fl_list) {
+ -		++seen_fcntl;
+ -		if (seen_fcntl > num_fcntl_locks) {
+ -			err = -ENOSPC;
+ -			goto fail;
+ +	spin_lock(&inode->i_lock);
+ +	for (lock = inode->i_flock; lock != NULL; lock = lock->fl_next) {
+ +		if (lock->fl_flags & FL_POSIX) {
+ +			++seen_fcntl;
+ +			if (seen_fcntl > num_fcntl_locks) {
+ +				err = -ENOSPC;
+ +				goto fail;
+ +			}
+ +			err = lock_to_ceph_filelock(lock, &flocks[l]);
+ +			if (err)
+ +				goto fail;
+ +			++l;
+  		}
+ -		err = lock_to_ceph_filelock(lock, &flocks[l]);
+ -		if (err)
+ -			goto fail;
+ -		++l;
+  	}
+ -	list_for_each_entry(lock, &ctx->flc_flock, fl_list) {
+ -		++seen_flock;
+ -		if (seen_flock > num_flock_locks) {
+ -			err = -ENOSPC;
+ -			goto fail;
+ +	for (lock = inode->i_flock; lock != NULL; lock = lock->fl_next) {
+ +		if (lock->fl_flags & FL_FLOCK) {
+ +			++seen_flock;
+ +			if (seen_flock > num_flock_locks) {
+ +				err = -ENOSPC;
+ +				goto fail;
+ +			}
+ +			err = lock_to_ceph_filelock(lock, &flocks[l]);
+ +			if (err)
+ +				goto fail;
+ +			++l;
+  		}
+ -		err = lock_to_ceph_filelock(lock, &flocks[l]);
+ -		if (err)
+ -			goto fail;
+ -		++l;
+  	}
+  fail:
+ -	spin_unlock(&ctx->flc_lock);
+ +	spin_unlock(&inode->i_lock);
+  	return err;
+  }
+  
+* Unmerged path fs/ceph/cache.c
+* Unmerged path fs/ceph/cache.c
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index 83040cdc8671..1808513fda30 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -467,7 +467,7 @@ more:
+ 				fi->dir_ordered_count = req->r_dir_ordered_cnt;
+ 			}
+ 		} else {
+-			dout("readdir !did_prepopulate");
++			dout("readdir !did_prepopulate\n");
+ 			/* disable readdir cache */
+ 			fi->readdir_cache_idx = -1;
+ 			/* preclude from marking dir complete */
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 4be6ff2c3e9e..253c7d999bd0 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -40,7 +40,7 @@ static __le32 ceph_flags_sys2wire(u32 flags)
+ #undef ceph_sys2wire
+ 
+ 	if (flags)
+-		dout("unused open flags: %x", flags);
++		dout("unused open flags: %x\n", flags);
+ 
+ 	return cpu_to_le32(wire_flags);
+ }
+* Unmerged path fs/ceph/locks.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 9ad9aa520d51..45cb16236976 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -380,7 +380,7 @@ static struct ceph_mds_session *get_session(struct ceph_mds_session *s)
+ 		     atomic_read(&s->s_ref)-1, atomic_read(&s->s_ref));
+ 		return s;
+ 	} else {
+-		dout("mdsc get_session %p 0 -- FAIL", s);
++		dout("mdsc get_session %p 0 -- FAIL\n", s);
+ 		return NULL;
+ 	}
+ }
+@@ -2535,10 +2535,10 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 	 * Otherwise we just have to return an ESTALE
+ 	 */
+ 	if (result == -ESTALE) {
+-		dout("got ESTALE on request %llu", req->r_tid);
++		dout("got ESTALE on request %llu\n", req->r_tid);
+ 		req->r_resend_mds = -1;
+ 		if (req->r_direct_mode != USE_AUTH_MDS) {
+-			dout("not using auth, setting for that now");
++			dout("not using auth, setting for that now\n");
+ 			req->r_direct_mode = USE_AUTH_MDS;
+ 			__do_request(mdsc, req);
+ 			mutex_unlock(&mdsc->mutex);
+@@ -2546,13 +2546,13 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
+ 		} else  {
+ 			int mds = __choose_mds(mdsc, req);
+ 			if (mds >= 0 && mds != req->r_session->s_mds) {
+-				dout("but auth changed, so resending");
++				dout("but auth changed, so resending\n");
+ 				__do_request(mdsc, req);
+ 				mutex_unlock(&mdsc->mutex);
+ 				goto out;
+ 			}
+ 		}
+-		dout("have to return ESTALE on request %llu", req->r_tid);
++		dout("have to return ESTALE on request %llu\n", req->r_tid);
+ 	}
+ 
+ 
+diff --git a/net/ceph/ceph_common.c b/net/ceph/ceph_common.c
+index f36a80f8646f..f3547546f708 100644
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@ -217,7 +217,7 @@ static int parse_fsid(const char *str, struct ceph_fsid *fsid)
+ 
+ 	if (i == 16)
+ 		err = 0;
+-	dout("parse_fsid ret %d got fsid %pU", err, fsid);
++	dout("parse_fsid ret %d got fsid %pU\n", err, fsid);
+ 	return err;
+ }
+ 
