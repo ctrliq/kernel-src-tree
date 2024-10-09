@@ -1,0 +1,130 @@
+flow_dissector: For stripped vlan, get vlan info from skb->vlan_tci
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hadar Hen Zion <hadarh@mellanox.com>
+commit d5709f7ab77679d407a7687fc5ad7cc7442cc651
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d5709f7a.failed
+
+Early in the datapath skb_vlan_untag function is called, stripped
+the vlan from the skb and set skb->vlan_tci and skb->vlan_proto fields.
+
+The current dissection doesn't handle stripped vlan packets correctly.
+In some flows, vlan doesn't exist in skb->data anymore when applying
+flow dissection on the skb, fix that.
+
+In case vlan info wasn't stripped before applying flow_dissector (RPS
+flow for example), or in case of skb with multiple vlans (e.g. 802.1ad),
+get the vlan info from skb->data. The flow_dissector correctly skips
+any number of vlans and stores only the first level vlan.
+
+Fixes: 0744dd00c1b1 ('net: introduce skb_flow_dissect()')
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d5709f7ab77679d407a7687fc5ad7cc7442cc651)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,362d693c003f..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -116,13 -101,27 +116,25 @@@ EXPORT_SYMBOL(__skb_flow_get_ports)
+   * @nhoff: network header offset, if @data is NULL use skb_network_offset(skb)
+   * @hlen: packet header length, if @data is NULL use skb_headlen(skb)
+   *
+ - * The function will try to retrieve individual keys into target specified
+ - * by flow_dissector from either the skbuff or a raw buffer specified by the
+ - * rest parameters.
+ - *
+ - * Caller must take care of zeroing target container memory.
+ + * The function will try to retrieve the struct flow_keys from either the skbuff
+ + * or a raw buffer specified by the rest parameters
+   */
+ -bool __skb_flow_dissect(const struct sk_buff *skb,
+ -			struct flow_dissector *flow_dissector,
+ -			void *target_container,
+ -			void *data, __be16 proto, int nhoff, int hlen,
+ -			unsigned int flags)
+ +bool __skb_flow_dissect(const struct sk_buff *skb, struct flow_keys *flow,
+ +			void *data, __be16 proto, int nhoff, int hlen)
+  {
+++<<<<<<< HEAD
+ +	u8 ip_proto;
+++=======
++ 	struct flow_dissector_key_control *key_control;
++ 	struct flow_dissector_key_basic *key_basic;
++ 	struct flow_dissector_key_addrs *key_addrs;
++ 	struct flow_dissector_key_ports *key_ports;
++ 	struct flow_dissector_key_tags *key_tags;
++ 	struct flow_dissector_key_keyid *key_keyid;
++ 	bool skip_vlan = false;
++ 	u8 ip_proto = 0;
++ 	bool ret = false;
+++>>>>>>> d5709f7ab776 (flow_dissector: For stripped vlan, get vlan info from skb->vlan_tci)
+  
+  	if (!data) {
+  		data = skb->data;
+@@@ -173,20 -242,45 +186,51 @@@ ipv6
+  
+  		break;
+  	}
+ -	case htons(ETH_P_8021AD):
+ -	case htons(ETH_P_8021Q): {
+ +	case __constant_htons(ETH_P_8021AD):
+ +	case __constant_htons(ETH_P_8021Q): {
+  		const struct vlan_hdr *vlan;
+- 		struct vlan_hdr _vlan;
+  
+++<<<<<<< HEAD
+ +		vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan), data, hlen, &_vlan);
+ +		if (!vlan)
+ +			return false;
+++=======
++ 		if (skb_vlan_tag_present(skb))
++ 			proto = skb->protocol;
++ 
++ 		if (!skb_vlan_tag_present(skb) ||
++ 		    proto == cpu_to_be16(ETH_P_8021Q) ||
++ 		    proto == cpu_to_be16(ETH_P_8021AD)) {
++ 			struct vlan_hdr _vlan;
++ 
++ 			vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan),
++ 						    data, hlen, &_vlan);
++ 			if (!vlan)
++ 				goto out_bad;
++ 			proto = vlan->h_vlan_encapsulated_proto;
++ 			nhoff += sizeof(*vlan);
++ 			if (skip_vlan)
++ 				goto again;
++ 		}
++ 
++ 		skip_vlan = true;
++ 		if (dissector_uses_key(flow_dissector,
++ 				       FLOW_DISSECTOR_KEY_VLANID)) {
++ 			key_tags = skb_flow_dissector_target(flow_dissector,
++ 							     FLOW_DISSECTOR_KEY_VLANID,
++ 							     target_container);
++ 
++ 			if (skb_vlan_tag_present(skb))
++ 				key_tags->vlan_id = skb_vlan_tag_get_id(skb);
++ 			else
++ 				key_tags->vlan_id = ntohs(vlan->h_vlan_TCI) &
++ 					VLAN_VID_MASK;
++ 		}
+++>>>>>>> d5709f7ab776 (flow_dissector: For stripped vlan, get vlan info from skb->vlan_tci)
+  
+- 		proto = vlan->h_vlan_encapsulated_proto;
+- 		nhoff += sizeof(*vlan);
+  		goto again;
+  	}
+ -	case htons(ETH_P_PPP_SES): {
+ +	case __constant_htons(ETH_P_PPP_SES): {
+  		struct {
+  			struct pppoe_hdr hdr;
+  			__be16 proto;
+* Unmerged path net/core/flow_dissector.c
