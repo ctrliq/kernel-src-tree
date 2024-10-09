@@ -1,0 +1,180 @@
+x86/mm: Refactor KASLR entropy functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Thomas Garnier <thgarnie@google.com>
+commit d899a7d146a2ed8a7e6c2f61bcd232908bcbaabc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d899a7d1.failed
+
+Move the KASLR entropy functions into arch/x86/lib to be used in early
+kernel boot for KASLR memory randomization.
+
+	Signed-off-by: Thomas Garnier <thgarnie@google.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Cc: Alexander Kuleshov <kuleshovmail@gmail.com>
+	Cc: Alexander Popov <alpopov@ptsecurity.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Jan Beulich <JBeulich@suse.com>
+	Cc: Joerg Roedel <jroedel@suse.de>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Lv Zheng <lv.zheng@intel.com>
+	Cc: Mark Salter <msalter@redhat.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephen Smalley <sds@tycho.nsa.gov>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Cc: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: kernel-hardening@lists.openwall.com
+	Cc: linux-doc@vger.kernel.org
+Link: http://lkml.kernel.org/r/1466556426-32664-2-git-send-email-keescook@chromium.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d899a7d146a2ed8a7e6c2f61bcd232908bcbaabc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+diff --git a/arch/x86/include/asm/kaslr.h b/arch/x86/include/asm/kaslr.h
+new file mode 100644
+index 000000000000..5547438db5ea
+--- /dev/null
++++ b/arch/x86/include/asm/kaslr.h
+@@ -0,0 +1,6 @@
++#ifndef _ASM_KASLR_H_
++#define _ASM_KASLR_H_
++
++unsigned long kaslr_get_random_long(const char *purpose);
++
++#endif
+diff --git a/arch/x86/lib/Makefile b/arch/x86/lib/Makefile
+index 31331041fe5d..502faf0d9880 100644
+--- a/arch/x86/lib/Makefile
++++ b/arch/x86/lib/Makefile
+@@ -32,6 +32,7 @@ lib-y += memcpy_$(BITS).o
+ lib-$(CONFIG_SMP) += rwlock.o
+ lib-$(CONFIG_RWSEM_XCHGADD_ALGORITHM) += rwsem.o
+ lib-$(CONFIG_INSTRUCTION_DECODER) += insn.o inat.o
++lib-$(CONFIG_RANDOMIZE_BASE) += kaslr.o
+ 
+ obj-y += msr.o msr-reg.o msr-reg-export.o
+ 
+diff --git a/arch/x86/lib/kaslr.c b/arch/x86/lib/kaslr.c
+new file mode 100644
+index 000000000000..f7dfeda83e5c
+--- /dev/null
++++ b/arch/x86/lib/kaslr.c
+@@ -0,0 +1,90 @@
++/*
++ * Entropy functions used on early boot for KASLR base and memory
++ * randomization. The base randomization is done in the compressed
++ * kernel and memory randomization is done early when the regular
++ * kernel starts. This file is included in the compressed kernel and
++ * normally linked in the regular.
++ */
++#include <asm/kaslr.h>
++#include <asm/msr.h>
++#include <asm/archrandom.h>
++#include <asm/e820.h>
++#include <asm/io.h>
++
++/*
++ * When built for the regular kernel, several functions need to be stubbed out
++ * or changed to their regular kernel equivalent.
++ */
++#ifndef KASLR_COMPRESSED_BOOT
++#include <asm/cpufeature.h>
++#include <asm/setup.h>
++
++#define debug_putstr(v) early_printk(v)
++#define has_cpuflag(f) boot_cpu_has(f)
++#define get_boot_seed() kaslr_offset()
++#endif
++
++#define I8254_PORT_CONTROL	0x43
++#define I8254_PORT_COUNTER0	0x40
++#define I8254_CMD_READBACK	0xC0
++#define I8254_SELECT_COUNTER0	0x02
++#define I8254_STATUS_NOTREADY	0x40
++static inline u16 i8254(void)
++{
++	u16 status, timer;
++
++	do {
++		outb(I8254_PORT_CONTROL,
++		     I8254_CMD_READBACK | I8254_SELECT_COUNTER0);
++		status = inb(I8254_PORT_COUNTER0);
++		timer  = inb(I8254_PORT_COUNTER0);
++		timer |= inb(I8254_PORT_COUNTER0) << 8;
++	} while (status & I8254_STATUS_NOTREADY);
++
++	return timer;
++}
++
++unsigned long kaslr_get_random_long(const char *purpose)
++{
++#ifdef CONFIG_X86_64
++	const unsigned long mix_const = 0x5d6008cbf3848dd3UL;
++#else
++	const unsigned long mix_const = 0x3f39e593UL;
++#endif
++	unsigned long raw, random = get_boot_seed();
++	bool use_i8254 = true;
++
++	debug_putstr(purpose);
++	debug_putstr(" KASLR using");
++
++	if (has_cpuflag(X86_FEATURE_RDRAND)) {
++		debug_putstr(" RDRAND");
++		if (rdrand_long(&raw)) {
++			random ^= raw;
++			use_i8254 = false;
++		}
++	}
++
++	if (has_cpuflag(X86_FEATURE_TSC)) {
++		debug_putstr(" RDTSC");
++		raw = rdtsc();
++
++		random ^= raw;
++		use_i8254 = false;
++	}
++
++	if (use_i8254) {
++		debug_putstr(" i8254");
++		random ^= i8254();
++	}
++
++	/* Circular multiply for better bit diffusion */
++	asm("mul %3"
++	    : "=a" (random), "=d" (raw)
++	    : "a" (random), "rm" (mix_const));
++	random += raw;
++
++	debug_putstr("...\n");
++
++	return random;
++}
