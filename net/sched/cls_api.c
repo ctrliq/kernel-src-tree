@@ -142,6 +142,7 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
 	struct Qdisc  *q;
 	struct tcf_proto __rcu **back;
 	struct tcf_proto __rcu **chain;
+	struct tcf_proto *next;
 	struct tcf_proto *tp;
 	const struct tcf_proto_ops *tp_ops;
 	const struct Qdisc_class_ops *cops;
@@ -316,10 +317,8 @@ replay:
 
 	if (fh == 0) {
 		if (n->nlmsg_type == RTM_DELTFILTER && t->tcm_handle == 0) {
-			struct tcf_proto *next = rtnl_dereference(tp->next);
-
+			next = rtnl_dereference(tp->next);
 			RCU_INIT_POINTER(*back, next);
-
 			tfilter_notify(net, skb, n, tp, fh,
 				       RTM_DELTFILTER, false);
 			tcf_proto_destroy(tp, true);
@@ -343,16 +342,13 @@ replay:
 			break;
 		case RTM_DELTFILTER:
 			err = tp->ops->delete(tp, fh);
-			if (err == 0) {
-				struct tcf_proto *next = rtnl_dereference(tp->next);
-
-				tfilter_notify(net, skb, n, tp,
-					       t->tcm_handle,
-					       RTM_DELTFILTER, false);
-				if (tcf_proto_destroy(tp, false))
-					RCU_INIT_POINTER(*back, next);
-			}
-			goto errout;
+			if (err)
+				goto errout;
+			next = rtnl_dereference(tp->next);
+			tfilter_notify(net, skb, n, tp, t->tcm_handle,
+				       RTM_DELTFILTER, false);
+			if (tcf_proto_destroy(tp, false))
+				RCU_INIT_POINTER(*back, next);
 		case RTM_GETTFILTER:
 			err = tfilter_notify(net, skb, n, tp, fh,
 					     RTM_NEWTFILTER, true);
