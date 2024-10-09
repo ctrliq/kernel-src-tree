@@ -1,0 +1,304 @@
+amd-xgbe: Use the new DMA memory barriers where appropriate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit ceb8f6be7e5a254cb5b894be7a032170ec34607b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ceb8f6be.failed
+
+Use the new lighter weight memory barriers when working with the device
+descriptors.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ceb8f6be7e5a254cb5b894be7a032170ec34607b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index ec5481f846ee,e165d069d6b0..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -779,6 -1066,9 +779,12 @@@ static void xgbe_tx_desc_reset(struct x
+  	rdesc->desc1 = 0;
+  	rdesc->desc2 = 0;
+  	rdesc->desc3 = 0;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Make sure ownership is written to the descriptor */
++ 	dma_wmb();
+++>>>>>>> ceb8f6be7e5a (amd-xgbe: Use the new DMA memory barriers where appropriate)
+  }
+  
+  static void xgbe_tx_desc_init(struct xgbe_channel *channel)
+@@@ -923,7 -1178,207 +929,211 @@@ static void xgbe_rx_desc_init(struct xg
+  	DBGPR("<--rx_desc_init\n");
+  }
+  
+++<<<<<<< HEAD
+ +static void xgbe_pre_xmit(struct xgbe_channel *channel)
+++=======
++ static void xgbe_update_tstamp_addend(struct xgbe_prv_data *pdata,
++ 				      unsigned int addend)
++ {
++ 	/* Set the addend register value and tell the device */
++ 	XGMAC_IOWRITE(pdata, MAC_TSAR, addend);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_TSCR, TSADDREG, 1);
++ 
++ 	/* Wait for addend update to complete */
++ 	while (XGMAC_IOREAD_BITS(pdata, MAC_TSCR, TSADDREG))
++ 		udelay(5);
++ }
++ 
++ static void xgbe_set_tstamp_time(struct xgbe_prv_data *pdata, unsigned int sec,
++ 				 unsigned int nsec)
++ {
++ 	/* Set the time values and tell the device */
++ 	XGMAC_IOWRITE(pdata, MAC_STSUR, sec);
++ 	XGMAC_IOWRITE(pdata, MAC_STNUR, nsec);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_TSCR, TSINIT, 1);
++ 
++ 	/* Wait for time update to complete */
++ 	while (XGMAC_IOREAD_BITS(pdata, MAC_TSCR, TSINIT))
++ 		udelay(5);
++ }
++ 
++ static u64 xgbe_get_tstamp_time(struct xgbe_prv_data *pdata)
++ {
++ 	u64 nsec;
++ 
++ 	nsec = XGMAC_IOREAD(pdata, MAC_STSR);
++ 	nsec *= NSEC_PER_SEC;
++ 	nsec += XGMAC_IOREAD(pdata, MAC_STNR);
++ 
++ 	return nsec;
++ }
++ 
++ static u64 xgbe_get_tx_tstamp(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int tx_snr;
++ 	u64 nsec;
++ 
++ 	tx_snr = XGMAC_IOREAD(pdata, MAC_TXSNR);
++ 	if (XGMAC_GET_BITS(tx_snr, MAC_TXSNR, TXTSSTSMIS))
++ 		return 0;
++ 
++ 	nsec = XGMAC_IOREAD(pdata, MAC_TXSSR);
++ 	nsec *= NSEC_PER_SEC;
++ 	nsec += tx_snr;
++ 
++ 	return nsec;
++ }
++ 
++ static void xgbe_get_rx_tstamp(struct xgbe_packet_data *packet,
++ 			       struct xgbe_ring_desc *rdesc)
++ {
++ 	u64 nsec;
++ 
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_CONTEXT_DESC3, TSA) &&
++ 	    !XGMAC_GET_BITS_LE(rdesc->desc3, RX_CONTEXT_DESC3, TSD)) {
++ 		nsec = le32_to_cpu(rdesc->desc1);
++ 		nsec <<= 32;
++ 		nsec |= le32_to_cpu(rdesc->desc0);
++ 		if (nsec != 0xffffffffffffffffULL) {
++ 			packet->rx_tstamp = nsec;
++ 			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 				       RX_TSTAMP, 1);
++ 		}
++ 	}
++ }
++ 
++ static int xgbe_config_tstamp(struct xgbe_prv_data *pdata,
++ 			      unsigned int mac_tscr)
++ {
++ 	/* Set one nano-second accuracy */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSCTRLSSR, 1);
++ 
++ 	/* Set fine timestamp update */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSCFUPDT, 1);
++ 
++ 	/* Overwrite earlier timestamps */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TXTSSTSM, 1);
++ 
++ 	XGMAC_IOWRITE(pdata, MAC_TSCR, mac_tscr);
++ 
++ 	/* Exit if timestamping is not enabled */
++ 	if (!XGMAC_GET_BITS(mac_tscr, MAC_TSCR, TSENA))
++ 		return 0;
++ 
++ 	/* Initialize time registers */
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_SSIR, SSINC, XGBE_TSTAMP_SSINC);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_SSIR, SNSINC, XGBE_TSTAMP_SNSINC);
++ 	xgbe_update_tstamp_addend(pdata, pdata->tstamp_addend);
++ 	xgbe_set_tstamp_time(pdata, 0, 0);
++ 
++ 	/* Initialize the timecounter */
++ 	timecounter_init(&pdata->tstamp_tc, &pdata->tstamp_cc,
++ 			 ktime_to_ns(ktime_get_real()));
++ 
++ 	return 0;
++ }
++ 
++ static void xgbe_config_dcb_tc(struct xgbe_prv_data *pdata)
++ {
++ 	struct ieee_ets *ets = pdata->ets;
++ 	unsigned int total_weight, min_weight, weight;
++ 	unsigned int i;
++ 
++ 	if (!ets)
++ 		return;
++ 
++ 	/* Set Tx to deficit weighted round robin scheduling algorithm (when
++ 	 * traffic class is using ETS algorithm)
++ 	 */
++ 	XGMAC_IOWRITE_BITS(pdata, MTL_OMR, ETSALG, MTL_ETSALG_DWRR);
++ 
++ 	/* Set Traffic Class algorithms */
++ 	total_weight = pdata->netdev->mtu * pdata->hw_feat.tc_cnt;
++ 	min_weight = total_weight / 100;
++ 	if (!min_weight)
++ 		min_weight = 1;
++ 
++ 	for (i = 0; i < pdata->hw_feat.tc_cnt; i++) {
++ 		switch (ets->tc_tsa[i]) {
++ 		case IEEE_8021QAZ_TSA_STRICT:
++ 			DBGPR("  TC%u using SP\n", i);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_ETSCR, TSA,
++ 					       MTL_TSA_SP);
++ 			break;
++ 		case IEEE_8021QAZ_TSA_ETS:
++ 			weight = total_weight * ets->tc_tx_bw[i] / 100;
++ 			weight = clamp(weight, min_weight, total_weight);
++ 
++ 			DBGPR("  TC%u using DWRR (weight %u)\n", i, weight);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_ETSCR, TSA,
++ 					       MTL_TSA_ETS);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_QWR, QW,
++ 					       weight);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ static void xgbe_config_dcb_pfc(struct xgbe_prv_data *pdata)
++ {
++ 	struct ieee_pfc *pfc = pdata->pfc;
++ 	struct ieee_ets *ets = pdata->ets;
++ 	unsigned int mask, reg, reg_val;
++ 	unsigned int tc, prio;
++ 
++ 	if (!pfc || !ets)
++ 		return;
++ 
++ 	for (tc = 0; tc < pdata->hw_feat.tc_cnt; tc++) {
++ 		mask = 0;
++ 		for (prio = 0; prio < IEEE_8021QAZ_MAX_TCS; prio++) {
++ 			if ((pfc->pfc_en & (1 << prio)) &&
++ 			    (ets->prio_tc[prio] == tc))
++ 				mask |= (1 << prio);
++ 		}
++ 		mask &= 0xff;
++ 
++ 		DBGPR("  TC%u PFC mask=%#x\n", tc, mask);
++ 		reg = MTL_TCPM0R + (MTL_TCPM_INC * (tc / MTL_TCPM_TC_PER_REG));
++ 		reg_val = XGMAC_IOREAD(pdata, reg);
++ 
++ 		reg_val &= ~(0xff << ((tc % MTL_TCPM_TC_PER_REG) << 3));
++ 		reg_val |= (mask << ((tc % MTL_TCPM_TC_PER_REG) << 3));
++ 
++ 		XGMAC_IOWRITE(pdata, reg, reg_val);
++ 	}
++ 
++ 	xgbe_config_flow_control(pdata);
++ }
++ 
++ static void xgbe_tx_start_xmit(struct xgbe_channel *channel,
++ 			       struct xgbe_ring *ring)
++ {
++ 	struct xgbe_prv_data *pdata = channel->pdata;
++ 	struct xgbe_ring_data *rdata;
++ 
++ 	/* Make sure everything is written before the register write */
++ 	wmb();
++ 
++ 	/* Issue a poll command to Tx DMA by writing address
++ 	 * of next immediate free descriptor */
++ 	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDTR_LO,
++ 			  lower_32_bits(rdata->rdesc_dma));
++ 
++ 	/* Start the Tx coalescing timer */
++ 	if (pdata->tx_usecs && !channel->tx_timer_active) {
++ 		channel->tx_timer_active = 1;
++ 		hrtimer_start(&channel->tx_timer,
++ 			      ktime_set(0, pdata->tx_usecs * NSEC_PER_USEC),
++ 			      HRTIMER_MODE_REL);
++ 	}
++ 
++ 	ring->tx.xmit_more = 0;
++ }
++ 
++ static void xgbe_dev_xmit(struct xgbe_channel *channel)
+++>>>>>>> ceb8f6be7e5a (amd-xgbe: Use the new DMA memory barriers where appropriate)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+  	struct xgbe_ring *ring = channel->tx_ring;
+@@@ -1110,22 -1580,15 +1320,22 @@@
+  #endif
+  
+  	/* Make sure ownership is written to the descriptor */
+- 	wmb();
++ 	dma_wmb();
+  
+ -	ring->cur = cur_index + 1;
+ -	if (!packet->skb->xmit_more ||
+ -	    netif_xmit_stopped(netdev_get_tx_queue(pdata->netdev,
+ -						   channel->queue_index)))
+ -		xgbe_tx_start_xmit(channel, ring);
+ -	else
+ -		ring->tx.xmit_more = 1;
+ +	/* Issue a poll command to Tx DMA by writing address
+ +	 * of next immediate free descriptor */
+ +	ring->cur++;
+ +	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ +	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDTR_LO,
+ +			  lower_32_bits(rdata->rdesc_dma));
+ +
+ +	/* Start the Tx coalescing timer */
+ +	if (tx_coalesce && !channel->tx_timer_active) {
+ +		channel->tx_timer_active = 1;
+ +		hrtimer_start(&channel->tx_timer,
+ +			      ktime_set(0, pdata->tx_usecs * NSEC_PER_USEC),
+ +			      HRTIMER_MODE_REL);
+ +	}
+  
+  	DBGPR("  %s: descriptors %u to %u written\n",
+  	      channel->name, start_index & (ring->rdesc_count - 1),
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index add1b5ac7b5d..07ac7e1f7b58 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -1090,6 +1090,9 @@ static void xgbe_rx_refresh(struct xgbe_channel *channel)
+ 
+ 	desc_if->realloc_skb(channel);
+ 
++	/* Make sure everything is written before the register write */
++	wmb();
++
+ 	/* Update the Rx Tail Pointer Register with address of
+ 	 * the last cleaned entry */
+ 	rdata = XGBE_GET_DESC_DATA(ring, ring->rx.realloc_index - 1);
+@@ -1127,7 +1130,7 @@ static int xgbe_tx_poll(struct xgbe_channel *channel)
+ 
+ 		/* Make sure descriptor fields are read after reading the OWN
+ 		 * bit */
+-		rmb();
++		dma_rmb();
+ 
+ #ifdef XGMAC_ENABLE_TX_DESC_DUMP
+ 		xgbe_dump_tx_desc(ring, ring->dirty, 1, 0);
