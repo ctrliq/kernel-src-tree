@@ -1,0 +1,112 @@
+net: vlan: add support for tunnel offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] vlan: add support for tunnel offload (Davide Caratti) [1626213]
+Rebuild_FUZZ: 93.51%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit 7dad9937e064a6411cc3427f3f5870fa72132ad8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7dad9937.failed
+
+GSO tunneled packets are always segmented in software before they are
+transmitted by a VLAN, even when the lower device can offload tunnel
+encapsulation and VLAN together (i.e., some bits in NETIF_F_GSO_ENCAP_ALL
+mask are set in the lower device 'vlan_features'). If we let VLANs have
+the same tunnel offload capabilities as their lower device, throughput
+can improve significantly when CPU is limited on the transmitter side.
+
+ - set NETIF_F_GSO_ENCAP_ALL bits in the VLAN 'hw_features', to ensure
+ that 'features' will have those bits zeroed only when the lower device
+ has no hardware support for tunnel encapsulation.
+ - for the same reason, copy GSO-related bits of 'hw_enc_features' from
+ lower device to VLAN, and ensure to update that value when the lower
+ device changes its features.
+ - set NETIF_F_HW_CSUM bit in the VLAN 'hw_enc_features' if 'real_dev'
+ is able to compute checksums at least for a kind of packets, like done
+ with commit 8403debeead8 ("vlan: Keep NETIF_F_HW_CSUM similar to other
+ software devices"). This avoids software segmentation due to mismatching
+ checksum capabilities between VLAN's 'features' and 'hw_enc_features'.
+
+	Reported-by: Flavio Leitner <fbl@redhat.com>
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7dad9937e064a6411cc3427f3f5870fa72132ad8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/8021q/vlan.c
+#	net/8021q/vlan_dev.c
+diff --cc net/8021q/vlan.c
+index 48df0b1f605f,1b7a375c6616..000000000000
+--- a/net/8021q/vlan.c
++++ b/net/8021q/vlan.c
+@@@ -324,6 -328,10 +324,13 @@@ static void vlan_transfer_features(stru
+  	vlandev->fcoe_ddp_xid = dev->fcoe_ddp_xid;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	vlandev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
++ 	vlandev->priv_flags |= (vlan->real_dev->priv_flags & IFF_XMIT_DST_RELEASE);
++ 	vlandev->hw_enc_features = vlan_tnl_features(vlan->real_dev);
++ 
+++>>>>>>> 7dad9937e064 (net: vlan: add support for tunnel offload)
+  	netdev_update_features(vlandev);
+  }
+  
+diff --cc net/8021q/vlan_dev.c
+index 965619d9001c,b2d9c8f27cd7..000000000000
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@@ -589,14 -561,19 +589,20 @@@ static int vlan_dev_init(struct net_dev
+  		      (1<<__LINK_STATE_PRESENT);
+  
+  	dev->hw_features = NETIF_F_HW_CSUM | NETIF_F_SG |
+++<<<<<<< HEAD
+ +			   NETIF_F_FRAGLIST | NETIF_F_ALL_TSO |
+++=======
++ 			   NETIF_F_FRAGLIST | NETIF_F_GSO_SOFTWARE |
++ 			   NETIF_F_GSO_ENCAP_ALL |
+++>>>>>>> 7dad9937e064 (net: vlan: add support for tunnel offload)
+  			   NETIF_F_HIGHDMA | NETIF_F_SCTP_CRC |
+  			   NETIF_F_ALL_FCOE;
+  
+ -	dev->features |= dev->hw_features | NETIF_F_LLTX;
+ +	dev->features |= real_dev->vlan_features | NETIF_F_LLTX;
+  	dev->gso_max_size = real_dev->gso_max_size;
+ -	dev->gso_max_segs = real_dev->gso_max_segs;
+ -	if (dev->features & NETIF_F_VLAN_FEATURES)
+ -		netdev_warn(real_dev, "VLAN features are set incorrectly.  Q-in-Q configurations may not work correctly.\n");
+  
+  	dev->vlan_features = real_dev->vlan_features & ~NETIF_F_ALL_FCOE;
++ 	dev->hw_enc_features = vlan_tnl_features(real_dev);
+  
+  	/* ipv6 shared card related stuff */
+  	dev->dev_id = real_dev->dev_id;
+* Unmerged path net/8021q/vlan.c
+diff --git a/net/8021q/vlan.h b/net/8021q/vlan.h
+index 2475d5e5c2ea..7979148612f0 100644
+--- a/net/8021q/vlan.h
++++ b/net/8021q/vlan.h
+@@ -91,6 +91,18 @@ static inline struct net_device *vlan_find_dev(struct net_device *real_dev,
+ 	return NULL;
+ }
+ 
++static inline netdev_features_t vlan_tnl_features(struct net_device *real_dev)
++{
++	netdev_features_t ret;
++
++	ret = real_dev->hw_enc_features &
++	      (NETIF_F_CSUM_MASK | NETIF_F_ALL_TSO | NETIF_F_GSO_ENCAP_ALL);
++
++	if ((ret & NETIF_F_GSO_ENCAP_ALL) && (ret & NETIF_F_CSUM_MASK))
++		return (ret & ~NETIF_F_CSUM_MASK) | NETIF_F_HW_CSUM;
++	return 0;
++}
++
+ #define vlan_group_for_each_dev(grp, i, dev) \
+ 	for ((i) = 0; i < VLAN_PROTO_NUM * VLAN_N_VID; i++) \
+ 		if (((dev) = __vlan_group_get_device((grp), (i) / VLAN_N_VID, \
+* Unmerged path net/8021q/vlan_dev.c
