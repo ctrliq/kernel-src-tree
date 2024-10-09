@@ -1,0 +1,268 @@
+KVM: nVMX: fix SMI injection in guest mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ladi Prosek <lprosek@redhat.com>
+commit 72e9cbdb43384ceacc49e2fb6b8c8fb7c5988778
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/72e9cbdb.failed
+
+Entering SMM while running in guest mode wasn't working very well because several
+pieces of the vcpu state were left set up for nested operation.
+
+Some of the issues observed:
+
+* L1 was getting unexpected VM exits (using L1 interception controls but running
+  in SMM execution environment)
+* SMM handler couldn't write to vmx_set_cr4 because of incorrect validity checks
+  predicated on nested.vmxon
+* MMU was confused (walk_mmu was still set to nested_mmu)
+
+Intel SDM actually prescribes the logical processor to "leave VMX operation" upon
+entering SMM in 34.14.1 Default Treatment of SMI Delivery. What we need to do is
+basically get out of guest mode and set nested.vmxon to false for the duration of
+SMM. All this completely transparent to L1, i.e. L1 is not given control and no
+L1 observable state changes.
+
+To avoid code duplication this commit takes advantage of the existing nested
+vmexit and run functionality, perhaps at the cost of efficiency. To get out of
+guest mode, nested_vmx_vmexit with exit_reason == -1 is called, a trick already
+used in vmx_leave_nested. Re-entering is cleaner, using enter_vmx_non_root_mode.
+
+This commit fixes running Windows Server 2016 with Hyper-V enabled in a VM with
+OVMF firmware (OVMF_CODE-need-smm.fd).
+
+	Signed-off-by: Ladi Prosek <lprosek@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 72e9cbdb43384ceacc49e2fb6b8c8fb7c5988778)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 92bd20f62d5c,c460b0b439d3..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -456,6 -479,21 +456,24 @@@ struct nested_vmx 
+  	u32 nested_vmx_misc_high;
+  	u32 nested_vmx_ept_caps;
+  	u32 nested_vmx_vpid_caps;
+++<<<<<<< HEAD
+++=======
++ 	u64 nested_vmx_basic;
++ 	u64 nested_vmx_cr0_fixed0;
++ 	u64 nested_vmx_cr0_fixed1;
++ 	u64 nested_vmx_cr4_fixed0;
++ 	u64 nested_vmx_cr4_fixed1;
++ 	u64 nested_vmx_vmcs_enum;
++ 	u64 nested_vmx_vmfunc_controls;
++ 
++ 	/* SMM related state */
++ 	struct {
++ 		/* in VMX operation on SMM entry? */
++ 		bool vmxon;
++ 		/* in guest mode on SMM entry? */
++ 		bool guest_mode;
++ 	} smm;
+++>>>>>>> 72e9cbdb4338 (KVM: nVMX: fix SMI injection in guest mode)
+  };
+  
+  #define POSTED_INTR_ON  0
+@@@ -10626,38 -11398,29 +10644,47 @@@ static void nested_vmx_vmexit(struct kv
+  	/* trying to cancel vmlaunch/vmresume is a bug */
+  	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+  
+ -	/*
+ -	 * The only expected VM-instruction error is "VM entry with
+ -	 * invalid control field(s)." Anything else indicates a
+ -	 * problem with L0.
+ -	 */
+ -	WARN_ON_ONCE(vmx->fail && (vmcs_read32(VM_INSTRUCTION_ERROR) !=
+ -				   VMXERR_ENTRY_INVALID_CONTROL_FIELD));
+ -
+  	leave_guest_mode(vcpu);
+ -
+ +	prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
+ +		       exit_qualification);
+ +
+++<<<<<<< HEAD
+ +	if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
+ +				 vmcs12->vm_exit_msr_store_count))
+ +		nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
+++=======
++ 	if (likely(!vmx->fail)) {
++ 		if (exit_reason == -1)
++ 			sync_vmcs12(vcpu, vmcs12);
++ 		else
++ 			prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
++ 				       exit_qualification);
+++>>>>>>> 72e9cbdb4338 (KVM: nVMX: fix SMI injection in guest mode)
+  
+ -		if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
+ -					 vmcs12->vm_exit_msr_store_count))
+ -			nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
+ -	}
+ +	vmx_load_vmcs01(vcpu);
+ +
+ +	/*
+ +	 * TODO: SDM says that with acknowledge interrupt on exit, bit 31 of
+ +	 * the VM-exit interrupt information (valid interrupt) is always set to
+ +	 * 1 on EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't need
+ +	 * kvm_cpu_has_interrupt().  See the commit message for details.
+ +	 */
+ +	if (nested_exit_intr_ack_set(vcpu) &&
+ +	    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
+ +	    kvm_cpu_has_interrupt(vcpu)) {
+ +		int irq = kvm_cpu_get_interrupt(vcpu);
+ +		WARN_ON(irq < 0);
+ +		vmcs12->vm_exit_intr_info = irq |
+ +			INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+ +	}
+ +
+ +	trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
+ +				       vmcs12->exit_qualification,
+ +				       vmcs12->idt_vectoring_info_field,
+ +				       vmcs12->vm_exit_intr_info,
+ +				       vmcs12->vm_exit_intr_error_code,
+ +				       KVM_ISA_VMX);
+  
+ -	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+  	vm_entry_controls_reset_shadow(vmx);
+  	vm_exit_controls_reset_shadow(vmx);
+  	vmx_segment_cache_clear(vmx);
+@@@ -10703,23 -11475,60 +10730,77 @@@
+  	 * We are now running in L2, mmu_notifier will force to reload the
+  	 * page's hpa for L2 vmcs. Need to reload it for L1 before entering L1.
+  	 */
+ -	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+ +	kvm_vcpu_reload_apic_access_page(vcpu);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Exiting from L2 to L1, we're now back to L1 which thinks it just
+ +	 * finished a VMLAUNCH or VMRESUME instruction, so we need to set the
+ +	 * success or failure flag accordingly.
+ +	 */
+ +	if (unlikely(vmx->fail)) {
+ +		vmx->fail = 0;
+ +		nested_vmx_failValid(vcpu, vmcs_read32(VM_INSTRUCTION_ERROR));
+ +	} else
+ +		nested_vmx_succeed(vcpu);
+ +	if (enable_shadow_vmcs)
+++=======
++ 	if (enable_shadow_vmcs && exit_reason != -1)
+++>>>>>>> 72e9cbdb4338 (KVM: nVMX: fix SMI injection in guest mode)
+  		vmx->nested.sync_shadow_vmcs = true;
+  
+  	/* in case we halted in L2 */
+  	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (likely(!vmx->fail)) {
++ 		/*
++ 		 * TODO: SDM says that with acknowledge interrupt on
++ 		 * exit, bit 31 of the VM-exit interrupt information
++ 		 * (valid interrupt) is always set to 1 on
++ 		 * EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't
++ 		 * need kvm_cpu_has_interrupt().  See the commit
++ 		 * message for details.
++ 		 */
++ 		if (nested_exit_intr_ack_set(vcpu) &&
++ 		    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
++ 		    kvm_cpu_has_interrupt(vcpu)) {
++ 			int irq = kvm_cpu_get_interrupt(vcpu);
++ 			WARN_ON(irq < 0);
++ 			vmcs12->vm_exit_intr_info = irq |
++ 				INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
++ 		}
++ 
++ 		if (exit_reason != -1)
++ 			trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
++ 						       vmcs12->exit_qualification,
++ 						       vmcs12->idt_vectoring_info_field,
++ 						       vmcs12->vm_exit_intr_info,
++ 						       vmcs12->vm_exit_intr_error_code,
++ 						       KVM_ISA_VMX);
++ 
++ 		load_vmcs12_host_state(vcpu, vmcs12);
++ 
++ 		return;
++ 	}
++ 	
++ 	/*
++ 	 * After an early L2 VM-entry failure, we're now back
++ 	 * in L1 which thinks it just finished a VMLAUNCH or
++ 	 * VMRESUME instruction, so we need to set the failure
++ 	 * flag and the VM-instruction error field of the VMCS
++ 	 * accordingly.
++ 	 */
++ 	nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
++ 	/*
++ 	 * The emulated instruction was already skipped in
++ 	 * nested_vmx_run, but the updated RIP was never
++ 	 * written back to the vmcs01.
++ 	 */
++ 	skip_emulated_instruction(vcpu);
++ 	vmx->fail = 0;
+++>>>>>>> 72e9cbdb4338 (KVM: nVMX: fix SMI injection in guest mode)
+  }
+  
+  /*
+@@@ -11016,7 -11930,50 +11097,54 @@@ static void vmx_setup_mce(struct kvm_vc
+  			~FEATURE_CONTROL_LMCE;
+  }
+  
+++<<<<<<< HEAD
+ +static struct kvm_x86_ops vmx_x86_ops = {
+++=======
++ static int vmx_smi_allowed(struct kvm_vcpu *vcpu)
++ {
++ 	/* we need a nested vmexit to enter SMM, postpone if run is pending */
++ 	if (to_vmx(vcpu)->nested.nested_run_pending)
++ 		return 0;
++ 	return 1;
++ }
++ 
++ static int vmx_pre_enter_smm(struct kvm_vcpu *vcpu, char *smstate)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	vmx->nested.smm.guest_mode = is_guest_mode(vcpu);
++ 	if (vmx->nested.smm.guest_mode)
++ 		nested_vmx_vmexit(vcpu, -1, 0, 0);
++ 
++ 	vmx->nested.smm.vmxon = vmx->nested.vmxon;
++ 	vmx->nested.vmxon = false;
++ 	return 0;
++ }
++ 
++ static int vmx_pre_leave_smm(struct kvm_vcpu *vcpu, u64 smbase)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	int ret;
++ 
++ 	if (vmx->nested.smm.vmxon) {
++ 		vmx->nested.vmxon = true;
++ 		vmx->nested.smm.vmxon = false;
++ 	}
++ 
++ 	if (vmx->nested.smm.guest_mode) {
++ 		vcpu->arch.hflags &= ~HF_SMM_MASK;
++ 		ret = enter_vmx_non_root_mode(vcpu, false);
++ 		vcpu->arch.hflags |= HF_SMM_MASK;
++ 		if (ret)
++ 			return ret;
++ 
++ 		vmx->nested.smm.guest_mode = false;
++ 	}
++ 	return 0;
++ }
++ 
++ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+++>>>>>>> 72e9cbdb4338 (KVM: nVMX: fix SMI injection in guest mode)
+  	.cpu_has_kvm_support = cpu_has_kvm_support,
+  	.disabled_by_bios = vmx_disabled_by_bios,
+  	.hardware_setup = hardware_setup,
+* Unmerged path arch/x86/kvm/vmx.c
