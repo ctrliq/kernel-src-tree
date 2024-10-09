@@ -1,0 +1,218 @@
+nvme: Modify and export sync command submission for fabrics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Modify and export sync command submission for fabrics (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 94.64%
+commit-author Christoph Hellwig <hch@lst.de>
+commit eb71f435579ff61f342114ffaa662af163676753
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/eb71f435.failed
+
+NVMe over fabrics will use __nvme_submit_sync_cmd in the the
+transport and require a few tweaks to it.  For that we export it
+and add a few more paramters:
+
+1. allow passing a queue ID to the block layer
+
+   For the NVMe over Fabrics connect command we need to able to specify a
+   queue ID that we want to send the command on.  Add a qid parameter to
+   the relevant functions to enable this behavior.
+
+2. allow submitting at_head commands
+
+   In cases where we want to (re)connect to a controller
+   where we have inflight queued commands we want to first
+   connect and only then allow the other queued commands to
+   be kicked. This will prevents failures in controller resets
+   and reconnects.
+
+3. allow passing flags to blk_mq_allocate_request
+
+   Both for Fabrics connect the the keep-alive feature in NVMe 1.2.1 we
+   want to be able to use reserved requests.
+
+	Reviewed-by: Jay Freyensee <james.p.freyensee@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Tested-by: Ming Lin <ming.l@ssi.samsung.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit eb71f435579ff61f342114ffaa662af163676753)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index 63f6b5f40b5c,bd04ec6acc9c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -108,14 -189,19 +108,23 @@@ void nvme_requeue_req(struct request *r
+  		blk_mq_kick_requeue_list(req->q);
+  	spin_unlock_irqrestore(req->q->queue_lock, flags);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_requeue_req);
+  
+  struct request *nvme_alloc_request(struct request_queue *q,
+- 		struct nvme_command *cmd, unsigned int flags)
++ 		struct nvme_command *cmd, unsigned int flags, int qid)
+  {
+ +	bool write = cmd->common.opcode & 1;
+  	struct request *req;
+  
+++<<<<<<< HEAD
+ +	req = blk_mq_alloc_request(q, write, GFP_KERNEL, false);
+++=======
++ 	if (qid == NVME_QID_ANY) {
++ 		req = blk_mq_alloc_request(q, nvme_is_write(cmd), flags);
++ 	} else {
++ 		req = blk_mq_alloc_request_hctx(q, nvme_is_write(cmd), flags,
++ 				qid ? qid - 1 : 0);
++ 	}
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  	if (IS_ERR(req))
+  		return req;
+  
+@@@ -137,7 -328,8 +146,12 @@@
+   * if the result is positive, it's an NVM Express status code
+   */
+  int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+++<<<<<<< HEAD
+ +		void *buffer, unsigned bufflen, u32 *result, unsigned timeout)
+++=======
++ 		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++ 		unsigned timeout, int qid, int at_head, int flags)
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  {
+  	struct request *req;
+  	int ret;
+@@@ -154,9 -347,7 +168,13 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	blk_execute_rq(req->q, NULL, req, 0);
+ +	if (result)
+ +		*result = (u32)(uintptr_t)req->special;
+++=======
++ 	blk_execute_rq(req->q, NULL, req, at_head);
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  	ret = req->errors;
+   out:
+  	blk_mq_free_request(req);
+@@@ -166,8 -358,10 +185,13 @@@ EXPORT_SYMBOL_GPL(__nvme_submit_sync_cm
+  int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+  		void *buffer, unsigned bufflen)
+  {
+++<<<<<<< HEAD
+ +	return __nvme_submit_sync_cmd(q, cmd, buffer, bufflen, NULL, 0);
+++=======
++ 	return __nvme_submit_sync_cmd(q, cmd, NULL, buffer, bufflen, 0,
++ 			NVME_QID_ANY, 0, 0);
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  }
+ -EXPORT_SYMBOL_GPL(nvme_submit_sync_cmd);
+  
+  int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+  		void __user *ubuffer, unsigned bufflen,
+@@@ -326,7 -527,11 +350,15 @@@ int nvme_get_features(struct nvme_ctrl 
+  	c.features.prp1 = cpu_to_le64(dma_addr);
+  	c.features.fid = cpu_to_le32(fid);
+  
+++<<<<<<< HEAD
+ +	return __nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0, result, 0);
+++=======
++ 	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe, NULL, 0, 0,
++ 			NVME_QID_ANY, 0, 0);
++ 	if (ret >= 0)
++ 		*result = le32_to_cpu(cqe.result);
++ 	return ret;
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  }
+  
+  int nvme_set_features(struct nvme_ctrl *dev, unsigned fid, unsigned dword11,
+@@@ -340,7 -547,11 +372,15 @@@
+  	c.features.fid = cpu_to_le32(fid);
+  	c.features.dword11 = cpu_to_le32(dword11);
+  
+++<<<<<<< HEAD
+ +	return __nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0, result, 0);
+++=======
++ 	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe, NULL, 0, 0,
++ 			NVME_QID_ANY, 0, 0);
++ 	if (ret >= 0)
++ 		*result = le32_to_cpu(cqe.result);
++ 	return ret;
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  }
+  
+  int nvme_get_log_page(struct nvme_ctrl *dev, struct nvme_smart_log **log)
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,68a67ac1f69b..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -245,13 -231,17 +245,19 @@@ void nvme_stop_queues(struct nvme_ctrl 
+  void nvme_start_queues(struct nvme_ctrl *ctrl);
+  void nvme_kill_queues(struct nvme_ctrl *ctrl);
+  
++ #define NVME_QID_ANY -1
+  struct request *nvme_alloc_request(struct request_queue *q,
+- 		struct nvme_command *cmd, unsigned int flags);
++ 		struct nvme_command *cmd, unsigned int flags, int qid);
+  void nvme_requeue_req(struct request *req);
+ -int nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ -		struct nvme_command *cmd);
+  int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+  		void *buf, unsigned bufflen);
+  int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+++<<<<<<< HEAD
+ +		void *buffer, unsigned bufflen,  u32 *result, unsigned timeout);
+++=======
++ 		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++ 		unsigned timeout, int qid, int at_head, int flags);
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+  		void __user *ubuffer, unsigned bufflen, u32 *result,
+  		unsigned timeout);
+diff --cc drivers/nvme/host/pci.c
+index 6cf19a97b3a4,db6fdee05e2c..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -895,11 -896,12 +895,16 @@@ static enum blk_eh_timer_return nvme_ti
+  	cmd.abort.cid = req->tag;
+  	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+  
+ -	dev_warn(nvmeq->dev->ctrl.device,
+ -		"I/O %d QID %d timeout, aborting\n",
+ -		 req->tag, nvmeq->qid);
+ +	dev_warn(nvmeq->q_dmadev, "I/O %d QID %d timeout, aborting\n",
+ +				 req->tag, nvmeq->qid);
+  
+++<<<<<<< HEAD
+ +	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+++=======
++ 	abort_req = nvme_alloc_request(dev->ctrl.admin_q, &cmd,
++ 			BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  	if (IS_ERR(abort_req)) {
+  		atomic_inc(&dev->ctrl.abort_limit);
+  		return BLK_EH_RESET_TIMER;
+@@@ -1552,7 -1512,7 +1557,11 @@@ static int nvme_delete_queue(struct nvm
+  	cmd.delete_queue.opcode = opcode;
+  	cmd.delete_queue.qid = cpu_to_le16(nvmeq->qid);
+  
+++<<<<<<< HEAD
+ +	req = nvme_alloc_request(nvmeq->dev->ctrl.admin_q, &cmd, 0);
+++=======
++ 	req = nvme_alloc_request(q, &cmd, BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
+++>>>>>>> eb71f435579f (nvme: Modify and export sync command submission for fabrics)
+  	if (IS_ERR(req))
+  		return PTR_ERR(req);
+  
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/nvme/host/pci.c
