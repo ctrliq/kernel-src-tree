@@ -1,0 +1,480 @@
+dax: coordinate locking for offsets in PMD range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 63e95b5c4f16e156b98adcf2f7d820ba941c82a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/63e95b5c.failed
+
+DAX radix tree locking currently locks entries based on the unique
+combination of the 'mapping' pointer and the pgoff_t 'index' for the entry.
+This works for PTEs, but as we move to PMDs we will need to have all the
+offsets within the range covered by the PMD to map to the same bit lock.
+To accomplish this, for ranges covered by a PMD entry we will instead lock
+based on the page offset of the beginning of the PMD entry.  The 'mapping'
+pointer is still used in the same way.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 63e95b5c4f16e156b98adcf2f7d820ba941c82a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+#	mm/filemap.c
+diff --cc fs/dax.c
+index 3ad95e9ec809,72387023545e..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -32,6 -31,38 +32,41 @@@
+  #include <linux/vmstat.h>
+  #include <linux/pfn_t.h>
+  #include <linux/sizes.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/iomap.h>
++ #include "internal.h"
++ 
++ /*
++  * We use lowest available bit in exceptional entry for locking, other two
++  * bits to determine entry type. In total 3 special bits.
++  */
++ #define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
++ #define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
++ #define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
++ #define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
++ #define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
++ #define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
++ #define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
++ 		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
++ 		RADIX_TREE_EXCEPTIONAL_ENTRY))
++ 
++ /* We choose 4096 entries - same as per-zone page wait tables */
++ #define DAX_WAIT_TABLE_BITS 12
++ #define DAX_WAIT_TABLE_ENTRIES (1 << DAX_WAIT_TABLE_BITS)
++ 
++ static wait_queue_head_t wait_table[DAX_WAIT_TABLE_ENTRIES];
++ 
++ static int __init init_dax_wait_table(void)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < DAX_WAIT_TABLE_ENTRIES; i++)
++ 		init_waitqueue_head(wait_table + i);
++ 	return 0;
++ }
++ fs_initcall(init_dax_wait_table);
+++>>>>>>> 63e95b5c4f16 (dax: coordinate locking for offsets in PMD range)
+  
+  static long dax_map_atomic(struct block_device *bdev, struct blk_dax_ctl *dax)
+  {
+@@@ -323,6 -273,288 +358,291 @@@ ssize_t dax_do_io(int rw, struct kiocb 
+  EXPORT_SYMBOL_GPL(dax_do_io);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * DAX radix tree locking
++  */
++ struct exceptional_entry_key {
++ 	struct address_space *mapping;
++ 	pgoff_t entry_start;
++ };
++ 
++ struct wait_exceptional_entry_queue {
++ 	wait_queue_t wait;
++ 	struct exceptional_entry_key key;
++ };
++ 
++ static wait_queue_head_t *dax_entry_waitqueue(struct address_space *mapping,
++ 		pgoff_t index, void *entry, struct exceptional_entry_key *key)
++ {
++ 	unsigned long hash;
++ 
++ 	/*
++ 	 * If 'entry' is a PMD, align the 'index' that we use for the wait
++ 	 * queue to the start of that PMD.  This ensures that all offsets in
++ 	 * the range covered by the PMD map to the same bit lock.
++ 	 */
++ 	if (RADIX_DAX_TYPE(entry) == RADIX_DAX_PMD)
++ 		index &= ~((1UL << (PMD_SHIFT - PAGE_SHIFT)) - 1);
++ 
++ 	key->mapping = mapping;
++ 	key->entry_start = index;
++ 
++ 	hash = hash_long((unsigned long)mapping ^ index, DAX_WAIT_TABLE_BITS);
++ 	return wait_table + hash;
++ }
++ 
++ static int wake_exceptional_entry_func(wait_queue_t *wait, unsigned int mode,
++ 				       int sync, void *keyp)
++ {
++ 	struct exceptional_entry_key *key = keyp;
++ 	struct wait_exceptional_entry_queue *ewait =
++ 		container_of(wait, struct wait_exceptional_entry_queue, wait);
++ 
++ 	if (key->mapping != ewait->key.mapping ||
++ 	    key->entry_start != ewait->key.entry_start)
++ 		return 0;
++ 	return autoremove_wake_function(wait, mode, sync, NULL);
++ }
++ 
++ /*
++  * Check whether the given slot is locked. The function must be called with
++  * mapping->tree_lock held
++  */
++ static inline int slot_locked(struct address_space *mapping, void **slot)
++ {
++ 	unsigned long entry = (unsigned long)
++ 		radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
++ 	return entry & RADIX_DAX_ENTRY_LOCK;
++ }
++ 
++ /*
++  * Mark the given slot is locked. The function must be called with
++  * mapping->tree_lock held
++  */
++ static inline void *lock_slot(struct address_space *mapping, void **slot)
++ {
++ 	unsigned long entry = (unsigned long)
++ 		radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
++ 
++ 	entry |= RADIX_DAX_ENTRY_LOCK;
++ 	radix_tree_replace_slot(slot, (void *)entry);
++ 	return (void *)entry;
++ }
++ 
++ /*
++  * Mark the given slot is unlocked. The function must be called with
++  * mapping->tree_lock held
++  */
++ static inline void *unlock_slot(struct address_space *mapping, void **slot)
++ {
++ 	unsigned long entry = (unsigned long)
++ 		radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
++ 
++ 	entry &= ~(unsigned long)RADIX_DAX_ENTRY_LOCK;
++ 	radix_tree_replace_slot(slot, (void *)entry);
++ 	return (void *)entry;
++ }
++ 
++ /*
++  * Lookup entry in radix tree, wait for it to become unlocked if it is
++  * exceptional entry and return it. The caller must call
++  * put_unlocked_mapping_entry() when he decided not to lock the entry or
++  * put_locked_mapping_entry() when he locked the entry and now wants to
++  * unlock it.
++  *
++  * The function must be called with mapping->tree_lock held.
++  */
++ static void *get_unlocked_mapping_entry(struct address_space *mapping,
++ 					pgoff_t index, void ***slotp)
++ {
++ 	void *entry, **slot;
++ 	struct wait_exceptional_entry_queue ewait;
++ 	wait_queue_head_t *wq;
++ 
++ 	init_wait(&ewait.wait);
++ 	ewait.wait.func = wake_exceptional_entry_func;
++ 
++ 	for (;;) {
++ 		entry = __radix_tree_lookup(&mapping->page_tree, index, NULL,
++ 					  &slot);
++ 		if (!entry || !radix_tree_exceptional_entry(entry) ||
++ 		    !slot_locked(mapping, slot)) {
++ 			if (slotp)
++ 				*slotp = slot;
++ 			return entry;
++ 		}
++ 
++ 		wq = dax_entry_waitqueue(mapping, index, entry, &ewait.key);
++ 		prepare_to_wait_exclusive(wq, &ewait.wait,
++ 					  TASK_UNINTERRUPTIBLE);
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		schedule();
++ 		finish_wait(wq, &ewait.wait);
++ 		spin_lock_irq(&mapping->tree_lock);
++ 	}
++ }
++ 
++ /*
++  * Find radix tree entry at given index. If it points to a page, return with
++  * the page locked. If it points to the exceptional entry, return with the
++  * radix tree entry locked. If the radix tree doesn't contain given index,
++  * create empty exceptional entry for the index and return with it locked.
++  *
++  * Note: Unlike filemap_fault() we don't honor FAULT_FLAG_RETRY flags. For
++  * persistent memory the benefit is doubtful. We can add that later if we can
++  * show it helps.
++  */
++ static void *grab_mapping_entry(struct address_space *mapping, pgoff_t index)
++ {
++ 	void *entry, **slot;
++ 
++ restart:
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	entry = get_unlocked_mapping_entry(mapping, index, &slot);
++ 	/* No entry for given index? Make sure radix tree is big enough. */
++ 	if (!entry) {
++ 		int err;
++ 
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		err = radix_tree_preload(
++ 				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
++ 		if (err)
++ 			return ERR_PTR(err);
++ 		entry = (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY |
++ 			       RADIX_DAX_ENTRY_LOCK);
++ 		spin_lock_irq(&mapping->tree_lock);
++ 		err = radix_tree_insert(&mapping->page_tree, index, entry);
++ 		radix_tree_preload_end();
++ 		if (err) {
++ 			spin_unlock_irq(&mapping->tree_lock);
++ 			/* Someone already created the entry? */
++ 			if (err == -EEXIST)
++ 				goto restart;
++ 			return ERR_PTR(err);
++ 		}
++ 		/* Good, we have inserted empty locked entry into the tree. */
++ 		mapping->nrexceptional++;
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		return entry;
++ 	}
++ 	/* Normal page in radix tree? */
++ 	if (!radix_tree_exceptional_entry(entry)) {
++ 		struct page *page = entry;
++ 
++ 		get_page(page);
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		lock_page(page);
++ 		/* Page got truncated? Retry... */
++ 		if (unlikely(page->mapping != mapping)) {
++ 			unlock_page(page);
++ 			put_page(page);
++ 			goto restart;
++ 		}
++ 		return page;
++ 	}
++ 	entry = lock_slot(mapping, slot);
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	return entry;
++ }
++ 
++ /*
++  * We do not necessarily hold the mapping->tree_lock when we call this
++  * function so it is possible that 'entry' is no longer a valid item in the
++  * radix tree.  This is okay, though, because all we really need to do is to
++  * find the correct waitqueue where tasks might be sleeping waiting for that
++  * old 'entry' and wake them.
++  */
++ void dax_wake_mapping_entry_waiter(struct address_space *mapping,
++ 		pgoff_t index, void *entry, bool wake_all)
++ {
++ 	struct exceptional_entry_key key;
++ 	wait_queue_head_t *wq;
++ 
++ 	wq = dax_entry_waitqueue(mapping, index, entry, &key);
++ 
++ 	/*
++ 	 * Checking for locked entry and prepare_to_wait_exclusive() happens
++ 	 * under mapping->tree_lock, ditto for entry handling in our callers.
++ 	 * So at this point all tasks that could have seen our entry locked
++ 	 * must be in the waitqueue and the following check will see them.
++ 	 */
++ 	if (waitqueue_active(wq))
++ 		__wake_up(wq, TASK_NORMAL, wake_all ? 0 : 1, &key);
++ }
++ 
++ void dax_unlock_mapping_entry(struct address_space *mapping, pgoff_t index)
++ {
++ 	void *entry, **slot;
++ 
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	entry = __radix_tree_lookup(&mapping->page_tree, index, NULL, &slot);
++ 	if (WARN_ON_ONCE(!entry || !radix_tree_exceptional_entry(entry) ||
++ 			 !slot_locked(mapping, slot))) {
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		return;
++ 	}
++ 	unlock_slot(mapping, slot);
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	dax_wake_mapping_entry_waiter(mapping, index, entry, false);
++ }
++ 
++ static void put_locked_mapping_entry(struct address_space *mapping,
++ 				     pgoff_t index, void *entry)
++ {
++ 	if (!radix_tree_exceptional_entry(entry)) {
++ 		unlock_page(entry);
++ 		put_page(entry);
++ 	} else {
++ 		dax_unlock_mapping_entry(mapping, index);
++ 	}
++ }
++ 
++ /*
++  * Called when we are done with radix tree entry we looked up via
++  * get_unlocked_mapping_entry() and which we didn't lock in the end.
++  */
++ static void put_unlocked_mapping_entry(struct address_space *mapping,
++ 				       pgoff_t index, void *entry)
++ {
++ 	if (!radix_tree_exceptional_entry(entry))
++ 		return;
++ 
++ 	/* We have to wake up next waiter for the radix tree entry lock */
++ 	dax_wake_mapping_entry_waiter(mapping, index, entry, false);
++ }
++ 
++ /*
++  * Delete exceptional DAX entry at @index from @mapping. Wait for radix tree
++  * entry to get unlocked before deleting it.
++  */
++ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index)
++ {
++ 	void *entry;
++ 
++ 	spin_lock_irq(&mapping->tree_lock);
++ 	entry = get_unlocked_mapping_entry(mapping, index, NULL);
++ 	/*
++ 	 * This gets called from truncate / punch_hole path. As such, the caller
++ 	 * must hold locks protecting against concurrent modifications of the
++ 	 * radix tree (usually fs-private i_mmap_sem for writing). Since the
++ 	 * caller has seen exceptional entry for this index, we better find it
++ 	 * at that index as well...
++ 	 */
++ 	if (WARN_ON_ONCE(!entry || !radix_tree_exceptional_entry(entry))) {
++ 		spin_unlock_irq(&mapping->tree_lock);
++ 		return 0;
++ 	}
++ 	radix_tree_delete(&mapping->page_tree, index);
++ 	mapping->nrexceptional--;
++ 	spin_unlock_irq(&mapping->tree_lock);
++ 	dax_wake_mapping_entry_waiter(mapping, index, entry, true);
++ 
++ 	return 1;
++ }
++ 
++ /*
+++>>>>>>> 63e95b5c4f16 (dax: coordinate locking for offsets in PMD range)
+   * The user has performed a load from a hole in the file.  Allocating
+   * a new page in the file would cause excessive storage usage for
+   * workloads with sparse files.  We allocate a page cache page instead.
+diff --cc include/linux/dax.h
+index 7ccafd8f7b0c,a41a747d6112..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,16 -6,23 +6,25 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+ -struct iomap_ops;
+ -
+ -/* We use lowest available exceptional entry bit for locking */
+ -#define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -
+ -ssize_t iomap_dax_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		struct iomap_ops *ops);
+ -ssize_t dax_do_io(struct kiocb *, struct inode *, struct iov_iter *,
+ -		  get_block_t, dio_iodone_t, int flags);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_clear_sectors(struct block_device *bdev, sector_t _sector, long _size);
+  int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+  int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+++<<<<<<< HEAD
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+ +int __dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t,
+ +		dax_iodone_t);
+++=======
++ int iomap_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
++ 			struct iomap_ops *ops);
++ int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
++ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
++ void dax_wake_mapping_entry_waiter(struct address_space *mapping,
++ 		pgoff_t index, void *entry, bool wake_all);
+++>>>>>>> 63e95b5c4f16 (dax: coordinate locking for offsets in PMD range)
+  
+  #ifdef CONFIG_FS_DAX
+  struct page *read_dax_sector(struct block_device *bdev, sector_t n);
+diff --cc mm/filemap.c
+index 786c44f9a3cd,1ffb7dcd1b5d..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -108,6 -110,62 +108,65 @@@
+   *   ->tasklist_lock            (memory_failure, collect_procs_ao)
+   */
+  
+++<<<<<<< HEAD
+++=======
++ static int page_cache_tree_insert(struct address_space *mapping,
++ 				  struct page *page, void **shadowp)
++ {
++ 	struct radix_tree_node *node;
++ 	void **slot;
++ 	int error;
++ 
++ 	error = __radix_tree_create(&mapping->page_tree, page->index, 0,
++ 				    &node, &slot);
++ 	if (error)
++ 		return error;
++ 	if (*slot) {
++ 		void *p;
++ 
++ 		p = radix_tree_deref_slot_protected(slot, &mapping->tree_lock);
++ 		if (!radix_tree_exceptional_entry(p))
++ 			return -EEXIST;
++ 
++ 		mapping->nrexceptional--;
++ 		if (!dax_mapping(mapping)) {
++ 			if (shadowp)
++ 				*shadowp = p;
++ 			if (node)
++ 				workingset_node_shadows_dec(node);
++ 		} else {
++ 			/* DAX can replace empty locked entry with a hole */
++ 			WARN_ON_ONCE(p !=
++ 				(void *)(RADIX_TREE_EXCEPTIONAL_ENTRY |
++ 					 RADIX_DAX_ENTRY_LOCK));
++ 			/* DAX accounts exceptional entries as normal pages */
++ 			if (node)
++ 				workingset_node_pages_dec(node);
++ 			/* Wakeup waiters for exceptional entry lock */
++ 			dax_wake_mapping_entry_waiter(mapping, page->index, p,
++ 						      false);
++ 		}
++ 	}
++ 	radix_tree_replace_slot(slot, page);
++ 	mapping->nrpages++;
++ 	if (node) {
++ 		workingset_node_pages_inc(node);
++ 		/*
++ 		 * Don't track node that contains actual pages.
++ 		 *
++ 		 * Avoid acquiring the list_lru lock if already
++ 		 * untracked.  The list_empty() test is safe as
++ 		 * node->private_list is protected by
++ 		 * mapping->tree_lock.
++ 		 */
++ 		if (!list_empty(&node->private_list))
++ 			list_lru_del(&workingset_shadow_nodes,
++ 				     &node->private_list);
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> 63e95b5c4f16 (dax: coordinate locking for offsets in PMD range)
+  static void page_cache_tree_delete(struct address_space *mapping,
+  				   struct page *page, void *shadow)
+  {
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
+* Unmerged path mm/filemap.c
