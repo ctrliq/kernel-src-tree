@@ -375,15 +375,12 @@ static int xgbe_get_coalesce(struct net_device *netdev,
 			     struct ethtool_coalesce *ec)
 {
 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
-	struct xgbe_hw_if *hw_if = &pdata->hw_if;
-	unsigned int riwt;
 
 	DBGPR("-->xgbe_get_coalesce\n");
 
 	memset(ec, 0, sizeof(struct ethtool_coalesce));
 
-	riwt = pdata->rx_riwt;
-	ec->rx_coalesce_usecs = hw_if->riwt_to_usec(pdata, riwt);
+	ec->rx_coalesce_usecs = pdata->rx_usecs;
 	ec->rx_max_coalesced_frames = pdata->rx_frames;
 
 	ec->tx_coalesce_usecs = pdata->tx_usecs;
@@ -436,17 +433,17 @@ static int xgbe_set_coalesce(struct net_device *netdev,
 	}
 
 	rx_riwt = hw_if->usec_to_riwt(pdata, ec->rx_coalesce_usecs);
+	rx_usecs = ec->rx_coalesce_usecs;
 	rx_frames = ec->rx_max_coalesced_frames;
 
 	/* Use smallest possible value if conversion resulted in zero */
-	if (ec->rx_coalesce_usecs && !rx_riwt)
+	if (rx_usecs && !rx_riwt)
 		rx_riwt = 1;
 
 	/* Check the bounds of values for Rx */
 	if (rx_riwt > XGMAC_MAX_DMA_RIWT) {
-		rx_usecs = hw_if->riwt_to_usec(pdata, XGMAC_MAX_DMA_RIWT);
 		netdev_alert(netdev, "rx-usec is limited to %d usecs\n",
-			     rx_usecs);
+			     hw_if->riwt_to_usec(pdata, XGMAC_MAX_DMA_RIWT));
 		return -EINVAL;
 	}
 	if (rx_frames > pdata->channel->rx_ring->rdesc_count) {
@@ -466,6 +463,7 @@ static int xgbe_set_coalesce(struct net_device *netdev,
 	}
 
 	pdata->rx_riwt = rx_riwt;
+	pdata->rx_usecs = rx_usecs;
 	pdata->rx_frames = rx_frames;
 	hw_if->config_rx_coalesce(pdata);
 
