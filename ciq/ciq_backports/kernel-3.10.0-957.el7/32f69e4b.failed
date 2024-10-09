@@ -1,0 +1,1174 @@
+{net, IB}/mlx5: Manage port association for multiport RoCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [rdma] net, ib/mlx5: Manage port association for multiport RoCE (Alaa Hleihel) [1520297]
+Rebuild_FUZZ: 98.25%
+commit-author Daniel Jurgens <danielj@mellanox.com>
+commit 32f69e4be269739c3850cd20f1a3322e95c1145f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/32f69e4b.failed
+
+When mlx5_ib_add is called determine if the mlx5 core device being
+added is capable of dual port RoCE operation. If it is, determine
+whether it is a master device or a slave device using the
+num_vhca_ports and affiliate_nic_vport_criteria capabilities.
+
+If the device is a slave, attempt to find a master device to affiliate it
+with. Devices that can be affiliated will share a system image guid. If
+none are found place it on a list of unaffiliated ports. If a master is
+found bind the port to it by configuring the port affiliation in the NIC
+vport context.
+
+Similarly when mlx5_ib_remove is called determine the port type. If it's
+a slave port, unaffiliate it from the master device, otherwise just
+remove it from the unaffiliated port list.
+
+The IB device is registered as a multiport device, even if a 2nd port is
+not available for affiliation. When the 2nd port is affiliated later the
+GID cache must be refreshed in order to get the default GIDs for the 2nd
+port in the cache. Export roce_rescan_device to provide a mechanism to
+refresh the cache after a new port is bound.
+
+In a multiport configuration all IB object (QP, MR, PD, etc) related
+commands should flow through the master mlx5_core_dev, other commands
+must be sent to the slave port mlx5_core_mdev, an interface is provide
+to get the correct mdev for non IB object commands.
+
+	Signed-off-by: Daniel Jurgens <danielj@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 32f69e4be269739c3850cd20f1a3322e95c1145f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	include/linux/mlx5/driver.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 0f4f1df8ee11,4fbbe4c7a99b..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -113,9 -130,16 +130,20 @@@ static int get_port_state(struct ib_dev
+  static int mlx5_netdev_event(struct notifier_block *this,
+  			     unsigned long event, void *ptr)
+  {
+ -	struct mlx5_roce *roce = container_of(this, struct mlx5_roce, nb);
+  	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
+++<<<<<<< HEAD
+ +	struct mlx5_ib_dev *ibdev = container_of(this, struct mlx5_ib_dev,
+ +						 roce.nb);
+++=======
++ 	u8 port_num = roce->native_port_num;
++ 	struct mlx5_core_dev *mdev;
++ 	struct mlx5_ib_dev *ibdev;
++ 
++ 	ibdev = roce->dev;
++ 	mdev = mlx5_ib_get_native_port_mdev(ibdev, port_num, NULL);
++ 	if (!mdev)
++ 		return NOTIFY_DONE;
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  
+  	switch (event) {
+  	case NETDEV_REGISTER:
+@@@ -167,7 -193,8 +195,12 @@@
+  	default:
+  		break;
+  	}
+++<<<<<<< HEAD
+ +
+++=======
++ done:
++ 	mlx5_ib_put_native_port_mdev(ibdev, port_num);
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	return NOTIFY_DONE;
+  }
+  
+@@@ -183,12 -215,14 +221,14 @@@ static struct net_device *mlx5_ib_get_n
+  
+  	/* Ensure ndev does not disappear before we invoke dev_hold()
+  	 */
+ -	read_lock(&ibdev->roce[port_num - 1].netdev_lock);
+ -	ndev = ibdev->roce[port_num - 1].netdev;
+ +	read_lock(&ibdev->roce.netdev_lock);
+ +	ndev = ibdev->roce.netdev;
+  	if (ndev)
+  		dev_hold(ndev);
+ -	read_unlock(&ibdev->roce[port_num - 1].netdev_lock);
+ +	read_unlock(&ibdev->roce.netdev_lock);
+  
++ out:
++ 	mlx5_ib_put_native_port_mdev(ibdev, port_num);
+  	return ndev;
+  }
+  
+@@@ -3184,22 -3271,21 +3282,38 @@@ static int get_port_caps(struct mlx5_ib
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (port = 1; port <= MLX5_CAP_GEN(dev->mdev, num_ports); port++) {
+ +		memset(pprops, 0, sizeof(*pprops));
+ +		err = mlx5_ib_query_port(&dev->ib_dev, port, pprops);
+ +		if (err) {
+ +			mlx5_ib_warn(dev, "query_port %d failed %d\n",
+ +				     port, err);
+ +			break;
+ +		}
+ +		dev->mdev->port_caps[port - 1].pkey_table_len =
+ +						dprops->max_pkeys;
+ +		dev->mdev->port_caps[port - 1].gid_table_len =
+ +						pprops->gid_tbl_len;
+ +		mlx5_ib_dbg(dev, "pkey_table_len %d, gid_table_len %d\n",
+ +			    dprops->max_pkeys, pprops->gid_tbl_len);
+++=======
++ 	memset(pprops, 0, sizeof(*pprops));
++ 	err = mlx5_ib_query_port(&dev->ib_dev, port, pprops);
++ 	if (err) {
++ 		mlx5_ib_warn(dev, "query_port %d failed %d\n",
++ 			     port, err);
++ 		goto out;
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	}
+  
++ 	dev->mdev->port_caps[port - 1].pkey_table_len =
++ 					dprops->max_pkeys;
++ 	dev->mdev->port_caps[port - 1].gid_table_len =
++ 					pprops->gid_tbl_len;
++ 	mlx5_ib_dbg(dev, "port %d: pkey_table_len %d, gid_table_len %d\n",
++ 		    port, dprops->max_pkeys, pprops->gid_tbl_len);
++ 
+  out:
+  	kfree(pprops);
+  	kfree(dprops);
+@@@ -4052,33 -4138,227 +4166,251 @@@ mlx5_ib_get_vector_affinity(struct ib_d
+  	return mlx5_get_vector_affinity(dev->mdev, comp_vector);
+  }
+  
+++<<<<<<< HEAD
+ +static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+ +{
+ +	struct mlx5_ib_dev *dev;
+ +	enum rdma_link_layer ll;
+ +	int port_type_cap;
+++=======
++ /* The mlx5_ib_multiport_mutex should be held when calling this function */
++ static void mlx5_ib_unbind_slave_port(struct mlx5_ib_dev *ibdev,
++ 				      struct mlx5_ib_multiport_info *mpi)
++ {
++ 	u8 port_num = mlx5_core_native_port_num(mpi->mdev) - 1;
++ 	struct mlx5_ib_port *port = &ibdev->port[port_num];
++ 	int comps;
++ 	int err;
++ 	int i;
++ 
++ 	spin_lock(&port->mp.mpi_lock);
++ 	if (!mpi->ibdev) {
++ 		spin_unlock(&port->mp.mpi_lock);
++ 		return;
++ 	}
++ 	mpi->ibdev = NULL;
++ 
++ 	spin_unlock(&port->mp.mpi_lock);
++ 	mlx5_remove_netdev_notifier(ibdev, port_num);
++ 	spin_lock(&port->mp.mpi_lock);
++ 
++ 	comps = mpi->mdev_refcnt;
++ 	if (comps) {
++ 		mpi->unaffiliate = true;
++ 		init_completion(&mpi->unref_comp);
++ 		spin_unlock(&port->mp.mpi_lock);
++ 
++ 		for (i = 0; i < comps; i++)
++ 			wait_for_completion(&mpi->unref_comp);
++ 
++ 		spin_lock(&port->mp.mpi_lock);
++ 		mpi->unaffiliate = false;
++ 	}
++ 
++ 	port->mp.mpi = NULL;
++ 
++ 	list_add_tail(&mpi->list, &mlx5_ib_unaffiliated_port_list);
++ 
++ 	spin_unlock(&port->mp.mpi_lock);
++ 
++ 	err = mlx5_nic_vport_unaffiliate_multiport(mpi->mdev);
++ 
++ 	mlx5_ib_dbg(ibdev, "unaffiliated port %d\n", port_num + 1);
++ 	/* Log an error, still needed to cleanup the pointers and add
++ 	 * it back to the list.
++ 	 */
++ 	if (err)
++ 		mlx5_ib_err(ibdev, "Failed to unaffiliate port %u\n",
++ 			    port_num + 1);
++ 
++ 	ibdev->roce[port_num].last_port_state = IB_PORT_DOWN;
++ }
++ 
++ /* The mlx5_ib_multiport_mutex should be held when calling this function */
++ static bool mlx5_ib_bind_slave_port(struct mlx5_ib_dev *ibdev,
++ 				    struct mlx5_ib_multiport_info *mpi)
++ {
++ 	u8 port_num = mlx5_core_native_port_num(mpi->mdev) - 1;
++ 	int err;
++ 
++ 	spin_lock(&ibdev->port[port_num].mp.mpi_lock);
++ 	if (ibdev->port[port_num].mp.mpi) {
++ 		mlx5_ib_warn(ibdev, "port %d already affiliated.\n",
++ 			     port_num + 1);
++ 		spin_unlock(&ibdev->port[port_num].mp.mpi_lock);
++ 		return false;
++ 	}
++ 
++ 	ibdev->port[port_num].mp.mpi = mpi;
++ 	mpi->ibdev = ibdev;
++ 	spin_unlock(&ibdev->port[port_num].mp.mpi_lock);
++ 
++ 	err = mlx5_nic_vport_affiliate_multiport(ibdev->mdev, mpi->mdev);
++ 	if (err)
++ 		goto unbind;
++ 
++ 	err = get_port_caps(ibdev, mlx5_core_native_port_num(mpi->mdev));
++ 	if (err)
++ 		goto unbind;
++ 
++ 	err = mlx5_add_netdev_notifier(ibdev, port_num);
++ 	if (err) {
++ 		mlx5_ib_err(ibdev, "failed adding netdev notifier for port %u\n",
++ 			    port_num + 1);
++ 		goto unbind;
++ 	}
++ 
++ 	return true;
++ 
++ unbind:
++ 	mlx5_ib_unbind_slave_port(ibdev, mpi);
++ 	return false;
++ }
++ 
++ static int mlx5_ib_init_multiport_master(struct mlx5_ib_dev *dev)
++ {
++ 	int port_num = mlx5_core_native_port_num(dev->mdev) - 1;
++ 	enum rdma_link_layer ll = mlx5_ib_port_link_layer(&dev->ib_dev,
++ 							  port_num + 1);
++ 	struct mlx5_ib_multiport_info *mpi;
++ 	int err;
++ 	int i;
++ 
++ 	if (!mlx5_core_is_mp_master(dev->mdev) || ll != IB_LINK_LAYER_ETHERNET)
++ 		return 0;
++ 
++ 	err = mlx5_query_nic_vport_system_image_guid(dev->mdev,
++ 						     &dev->sys_image_guid);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5_nic_vport_enable_roce(dev->mdev);
++ 	if (err)
++ 		return err;
++ 
++ 	mutex_lock(&mlx5_ib_multiport_mutex);
++ 	for (i = 0; i < dev->num_ports; i++) {
++ 		bool bound = false;
++ 
++ 		/* build a stub multiport info struct for the native port. */
++ 		if (i == port_num) {
++ 			mpi = kzalloc(sizeof(*mpi), GFP_KERNEL);
++ 			if (!mpi) {
++ 				mutex_unlock(&mlx5_ib_multiport_mutex);
++ 				mlx5_nic_vport_disable_roce(dev->mdev);
++ 				return -ENOMEM;
++ 			}
++ 
++ 			mpi->is_master = true;
++ 			mpi->mdev = dev->mdev;
++ 			mpi->sys_image_guid = dev->sys_image_guid;
++ 			dev->port[i].mp.mpi = mpi;
++ 			mpi->ibdev = dev;
++ 			mpi = NULL;
++ 			continue;
++ 		}
++ 
++ 		list_for_each_entry(mpi, &mlx5_ib_unaffiliated_port_list,
++ 				    list) {
++ 			if (dev->sys_image_guid == mpi->sys_image_guid &&
++ 			    (mlx5_core_native_port_num(mpi->mdev) - 1) == i) {
++ 				bound = mlx5_ib_bind_slave_port(dev, mpi);
++ 			}
++ 
++ 			if (bound) {
++ 				dev_dbg(&mpi->mdev->pdev->dev, "removing port from unaffiliated list.\n");
++ 				mlx5_ib_dbg(dev, "port %d bound\n", i + 1);
++ 				list_del(&mpi->list);
++ 				break;
++ 			}
++ 		}
++ 		if (!bound) {
++ 			get_port_caps(dev, i + 1);
++ 			mlx5_ib_dbg(dev, "no free port found for port %d\n",
++ 				    i + 1);
++ 		}
++ 	}
++ 
++ 	list_add_tail(&dev->ib_dev_list, &mlx5_ib_dev_list);
++ 	mutex_unlock(&mlx5_ib_multiport_mutex);
++ 	return err;
++ }
++ 
++ static void mlx5_ib_cleanup_multiport_master(struct mlx5_ib_dev *dev)
++ {
++ 	int port_num = mlx5_core_native_port_num(dev->mdev) - 1;
++ 	enum rdma_link_layer ll = mlx5_ib_port_link_layer(&dev->ib_dev,
++ 							  port_num + 1);
++ 	int i;
++ 
++ 	if (!mlx5_core_is_mp_master(dev->mdev) || ll != IB_LINK_LAYER_ETHERNET)
++ 		return;
++ 
++ 	mutex_lock(&mlx5_ib_multiport_mutex);
++ 	for (i = 0; i < dev->num_ports; i++) {
++ 		if (dev->port[i].mp.mpi) {
++ 			/* Destroy the native port stub */
++ 			if (i == port_num) {
++ 				kfree(dev->port[i].mp.mpi);
++ 				dev->port[i].mp.mpi = NULL;
++ 			} else {
++ 				mlx5_ib_dbg(dev, "unbinding port_num: %d\n", i + 1);
++ 				mlx5_ib_unbind_slave_port(dev, dev->port[i].mp.mpi);
++ 			}
++ 		}
++ 	}
++ 
++ 	mlx5_ib_dbg(dev, "removing from devlist\n");
++ 	list_del(&dev->ib_dev_list);
++ 	mutex_unlock(&mlx5_ib_multiport_mutex);
++ 
++ 	mlx5_nic_vport_disable_roce(dev->mdev);
++ }
++ 
++ static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	mlx5_ib_cleanup_multiport_master(dev);
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 	cleanup_srcu_struct(&dev->mr_srcu);
++ #endif
++ 	kfree(dev->port);
++ }
++ 
++ static int mlx5_ib_stage_init_init(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	const char *name;
+  	int err;
+  	int i;
+  
+ -	dev->port = kcalloc(dev->num_ports, sizeof(*dev->port),
+ +	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
+ +	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
+ +
+ +	printk_once(KERN_INFO "%s", mlx5_version);
+ +
+ +	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
+ +	if (!dev)
+ +		return NULL;
+ +
+ +	dev->mdev = mdev;
+ +
+ +	dev->port = kcalloc(MLX5_CAP_GEN(mdev, num_ports), sizeof(*dev->port),
+  			    GFP_KERNEL);
+  	if (!dev->port)
+ -		return -ENOMEM;
+ +		goto err_dealloc;
+  
+++<<<<<<< HEAD
+ +	rwlock_init(&dev->roce.netdev_lock);
+ +	err = get_port_caps(dev);
+++=======
++ 	for (i = 0; i < dev->num_ports; i++) {
++ 		spin_lock_init(&dev->port[i].mp.mpi_lock);
++ 		rwlock_init(&dev->roce[i].netdev_lock);
++ 	}
++ 
++ 	err = mlx5_ib_init_multiport_master(dev);
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	if (err)
+  		goto err_free_port;
+  
+@@@ -4100,6 -4393,32 +4446,35 @@@
+  		dev->mdev->priv.eq_table.num_comp_vectors;
+  	dev->ib_dev.dev.parent		= &mdev->pdev->dev;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_init(&dev->flow_db.lock);
++ 	mutex_init(&dev->cap_mask_mutex);
++ 	INIT_LIST_HEAD(&dev->qp_list);
++ 	spin_lock_init(&dev->reset_flow_resource_lock);
++ 
++ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
++ 	err = init_srcu_struct(&dev->mr_srcu);
++ 	if (err)
++ 		goto err_free_port;
++ #endif
++ 
++ 	return 0;
++ err_mp:
++ 	mlx5_ib_cleanup_multiport_master(dev);
++ 
++ err_free_port:
++ 	kfree(dev->port);
++ 
++ 	return -ENOMEM;
++ }
++ 
++ static int mlx5_ib_stage_caps_init(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	int err;
++ 
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	dev->ib_dev.uverbs_abi_ver	= MLX5_IB_UVERBS_ABI_VERSION;
+  	dev->ib_dev.uverbs_cmd_mask	=
+  		(1ull << IB_USER_VERBS_CMD_GET_CONTEXT)		|
+@@@ -4227,8 -4537,38 +4602,43 @@@
+  			(1ull << IB_USER_VERBS_EX_CMD_CREATE_FLOW) |
+  			(1ull << IB_USER_VERBS_EX_CMD_DESTROY_FLOW);
+  
+++<<<<<<< HEAD
+ +	if (mlx5_ib_port_link_layer(&dev->ib_dev, 1) ==
+ +	    IB_LINK_LAYER_ETHERNET) {
+++=======
++ 	err = init_node_data(dev);
++ 	if (err)
++ 		return err;
++ 
++ 	if ((MLX5_CAP_GEN(dev->mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
++ 	    MLX5_CAP_GEN(dev->mdev, disable_local_lb))
++ 		mutex_init(&dev->lb_mutex);
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5_ib_stage_roce_init(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	enum rdma_link_layer ll;
++ 	int port_type_cap;
++ 	u8 port_num;
++ 	int err;
++ 	int i;
++ 
++ 	port_num = mlx5_core_native_port_num(dev->mdev) - 1;
++ 	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
++ 	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
++ 
++ 	if (ll == IB_LINK_LAYER_ETHERNET) {
++ 		for (i = 0; i < dev->num_ports; i++) {
++ 			dev->roce[i].dev = dev;
++ 			dev->roce[i].native_port_num = i + 1;
++ 			dev->roce[i].last_port_state = IB_PORT_DOWN;
++ 		}
++ 
++ 		dev->ib_dev.get_netdev	= mlx5_ib_get_netdev;
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  		dev->ib_dev.create_wq	 = mlx5_ib_create_wq;
+  		dev->ib_dev.modify_wq	 = mlx5_ib_modify_wq;
+  		dev->ib_dev.destroy_wq	 = mlx5_ib_destroy_wq;
+@@@ -4240,44 -4580,92 +4650,60 @@@
+  			(1ull << IB_USER_VERBS_EX_CMD_DESTROY_WQ) |
+  			(1ull << IB_USER_VERBS_EX_CMD_CREATE_RWQ_IND_TBL) |
+  			(1ull << IB_USER_VERBS_EX_CMD_DESTROY_RWQ_IND_TBL);
+ -		err = mlx5_enable_eth(dev, port_num);
+ -		if (err)
+ -			return err;
+  	}
+ +	err = init_node_data(dev);
+ +	if (err)
+ +		goto err_free_port;
+  
+++<<<<<<< HEAD
+ +	mutex_init(&dev->flow_db.lock);
+ +	mutex_init(&dev->cap_mask_mutex);
+ +	INIT_LIST_HEAD(&dev->qp_list);
+ +	spin_lock_init(&dev->reset_flow_resource_lock);
+++=======
++ 	return 0;
++ }
++ 
++ static void mlx5_ib_stage_roce_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	enum rdma_link_layer ll;
++ 	int port_type_cap;
++ 	u8 port_num;
++ 
++ 	port_num = mlx5_core_native_port_num(dev->mdev) - 1;
++ 	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
++ 	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  
+  	if (ll == IB_LINK_LAYER_ETHERNET) {
+ -		mlx5_disable_eth(dev);
+ -		mlx5_remove_netdev_notifier(dev, port_num);
+ +		err = mlx5_enable_eth(dev);
+ +		if (err)
+ +			goto err_free_port;
+ +		dev->roce.last_port_state = IB_PORT_DOWN;
+  	}
+ -}
+  
+ -static int mlx5_ib_stage_dev_res_init(struct mlx5_ib_dev *dev)
+ -{
+ -	return create_dev_resources(&dev->devr);
+ -}
+ -
+ -static void mlx5_ib_stage_dev_res_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	destroy_dev_resources(&dev->devr);
+ -}
+ -
+ -static int mlx5_ib_stage_odp_init(struct mlx5_ib_dev *dev)
+ -{
+ -	mlx5_ib_internal_fill_odp_caps(dev);
+ +	err = create_dev_resources(&dev->devr);
+ +	if (err)
+ +		goto err_disable_eth;
+  
+ -	return mlx5_ib_odp_init_one(dev);
+ -}
+ +	err = mlx5_ib_odp_init_one(dev);
+ +	if (err)
+ +		goto err_rsrc;
+  
+ -static int mlx5_ib_stage_counters_init(struct mlx5_ib_dev *dev)
+ -{
+  	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt)) {
+ -		dev->ib_dev.get_hw_stats	= mlx5_ib_get_hw_stats;
+ -		dev->ib_dev.alloc_hw_stats	= mlx5_ib_alloc_hw_stats;
+ -
+ -		return mlx5_ib_alloc_counters(dev);
+ +		err = mlx5_ib_alloc_counters(dev);
+ +		if (err)
+ +			goto err_odp;
+  	}
+  
+ -	return 0;
+ -}
+ -
+ -static void mlx5_ib_stage_counters_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+ -		mlx5_ib_dealloc_counters(dev);
+ -}
+ -
+ -static int mlx5_ib_stage_cong_debugfs_init(struct mlx5_ib_dev *dev)
+ -{
+ -	return mlx5_ib_init_cong_debugfs(dev);
+ -}
+ -
+ -static void mlx5_ib_stage_cong_debugfs_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	mlx5_ib_cleanup_cong_debugfs(dev);
+ -}
+ +	err = mlx5_ib_init_cong_debugfs(dev);
+ +	if (err)
+ +		goto err_cnt;
+  
+ -static int mlx5_ib_stage_uar_init(struct mlx5_ib_dev *dev)
+ -{
+  	dev->mdev->priv.uar = mlx5_get_uars_page(dev->mdev);
+ -	if (!dev->mdev->priv.uar)
+ -		return -ENOMEM;
+ -	return 0;
+ -}
+ -
+ -static void mlx5_ib_stage_uar_cleanup(struct mlx5_ib_dev *dev)
+ -{
+ -	mlx5_put_uars_page(dev->mdev, dev->mdev->priv.uar);
+ -}
+ -
+ -static int mlx5_ib_stage_bfrag_init(struct mlx5_ib_dev *dev)
+ -{
+ -	int err;
+ +	if (IS_ERR(dev->mdev->priv.uar))
+ +		goto err_cong;
+  
+  	err = mlx5_alloc_bfreg(dev->mdev, &dev->bfreg, false, false);
+  	if (err)
+@@@ -4301,14 -4725,54 +4727,59 @@@
+  		err = device_create_file(&dev->ib_dev.dev,
+  					 mlx5_class_attributes[i]);
+  		if (err)
+ -			return err;
+ +			goto err_delay_drop;
+  	}
+  
+ -	return 0;
+ -}
+ +	if ((MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
+ +	    (MLX5_CAP_GEN(mdev, disable_local_lb_uc) ||
+ +	     MLX5_CAP_GEN(mdev, disable_local_lb_mc)))
+ +		mutex_init(&dev->lb_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ static void __mlx5_ib_remove(struct mlx5_ib_dev *dev,
++ 			     const struct mlx5_ib_profile *profile,
++ 			     int stage)
++ {
++ 	/* Number of stages to cleanup */
++ 	while (stage) {
++ 		stage--;
++ 		if (profile->stage[stage].cleanup)
++ 			profile->stage[stage].cleanup(dev);
++ 	}
++ 
++ 	ib_dealloc_device((struct ib_device *)dev);
++ }
++ 
++ static void *mlx5_ib_add_slave_port(struct mlx5_core_dev *mdev, u8 port_num);
++ 
++ static void *__mlx5_ib_add(struct mlx5_core_dev *mdev,
++ 			   const struct mlx5_ib_profile *profile)
++ {
++ 	struct mlx5_ib_dev *dev;
++ 	int err;
++ 	int i;
++ 
++ 	printk_once(KERN_INFO "%s", mlx5_version);
++ 
++ 	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
++ 	if (!dev)
++ 		return NULL;
++ 
++ 	dev->mdev = mdev;
++ 	dev->num_ports = max(MLX5_CAP_GEN(mdev, num_ports),
++ 			     MLX5_CAP_GEN(mdev, num_vhca_ports));
++ 
++ 	for (i = 0; i < MLX5_IB_STAGE_MAX; i++) {
++ 		if (profile->stage[i].init) {
++ 			err = profile->stage[i].init(dev);
++ 			if (err)
++ 				goto err_out;
++ 		}
++ 	}
++ 
++ 	dev->profile = profile;
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  	dev->ib_active = true;
+  
+  	return dev;
+@@@ -4356,27 -4783,124 +4827,148 @@@ err_dealloc
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5_ib_remove(struct mlx5_core_dev *mdev, void *context)
+ +{
+ +	struct mlx5_ib_dev *dev = context;
+ +	enum rdma_link_layer ll = mlx5_ib_port_link_layer(&dev->ib_dev, 1);
+ +
+ +	cancel_delay_drop(dev);
+ +	mlx5_remove_netdev_notifier(dev);
+ +	ib_unregister_device(&dev->ib_dev);
+ +	mlx5_free_bfreg(dev->mdev, &dev->fp_bfreg);
+ +	mlx5_free_bfreg(dev->mdev, &dev->bfreg);
+ +	mlx5_put_uars_page(dev->mdev, mdev->priv.uar);
+ +	mlx5_ib_cleanup_cong_debugfs(dev);
+ +	if (MLX5_CAP_GEN(dev->mdev, max_qp_cnt))
+ +		mlx5_ib_dealloc_counters(dev);
+ +	destroy_umrc_res(dev);
+ +	mlx5_ib_odp_remove_one(dev);
+ +	destroy_dev_resources(&dev->devr);
+ +	if (ll == IB_LINK_LAYER_ETHERNET)
+ +		mlx5_disable_eth(dev);
+ +	kfree(dev->port);
+ +	ib_dealloc_device(&dev->ib_dev);
+++=======
++ static const struct mlx5_ib_profile pf_profile = {
++ 	STAGE_CREATE(MLX5_IB_STAGE_INIT,
++ 		     mlx5_ib_stage_init_init,
++ 		     mlx5_ib_stage_init_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CAPS,
++ 		     mlx5_ib_stage_caps_init,
++ 		     NULL),
++ 	STAGE_CREATE(MLX5_IB_STAGE_ROCE,
++ 		     mlx5_ib_stage_roce_init,
++ 		     mlx5_ib_stage_roce_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_DEVICE_RESOURCES,
++ 		     mlx5_ib_stage_dev_res_init,
++ 		     mlx5_ib_stage_dev_res_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_ODP,
++ 		     mlx5_ib_stage_odp_init,
++ 		     NULL),
++ 	STAGE_CREATE(MLX5_IB_STAGE_COUNTERS,
++ 		     mlx5_ib_stage_counters_init,
++ 		     mlx5_ib_stage_counters_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CONG_DEBUGFS,
++ 		     mlx5_ib_stage_cong_debugfs_init,
++ 		     mlx5_ib_stage_cong_debugfs_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_UAR,
++ 		     mlx5_ib_stage_uar_init,
++ 		     mlx5_ib_stage_uar_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_BFREG,
++ 		     mlx5_ib_stage_bfrag_init,
++ 		     mlx5_ib_stage_bfrag_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_IB_REG,
++ 		     mlx5_ib_stage_ib_reg_init,
++ 		     mlx5_ib_stage_ib_reg_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_UMR_RESOURCES,
++ 		     mlx5_ib_stage_umr_res_init,
++ 		     mlx5_ib_stage_umr_res_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_DELAY_DROP,
++ 		     mlx5_ib_stage_delay_drop_init,
++ 		     mlx5_ib_stage_delay_drop_cleanup),
++ 	STAGE_CREATE(MLX5_IB_STAGE_CLASS_ATTR,
++ 		     mlx5_ib_stage_class_attr_init,
++ 		     NULL),
++ };
++ 
++ static void *mlx5_ib_add_slave_port(struct mlx5_core_dev *mdev, u8 port_num)
++ {
++ 	struct mlx5_ib_multiport_info *mpi;
++ 	struct mlx5_ib_dev *dev;
++ 	bool bound = false;
++ 	int err;
++ 
++ 	mpi = kzalloc(sizeof(*mpi), GFP_KERNEL);
++ 	if (!mpi)
++ 		return NULL;
++ 
++ 	mpi->mdev = mdev;
++ 
++ 	err = mlx5_query_nic_vport_system_image_guid(mdev,
++ 						     &mpi->sys_image_guid);
++ 	if (err) {
++ 		kfree(mpi);
++ 		return NULL;
++ 	}
++ 
++ 	mutex_lock(&mlx5_ib_multiport_mutex);
++ 	list_for_each_entry(dev, &mlx5_ib_dev_list, ib_dev_list) {
++ 		if (dev->sys_image_guid == mpi->sys_image_guid)
++ 			bound = mlx5_ib_bind_slave_port(dev, mpi);
++ 
++ 		if (bound) {
++ 			rdma_roce_rescan_device(&dev->ib_dev);
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!bound) {
++ 		list_add_tail(&mpi->list, &mlx5_ib_unaffiliated_port_list);
++ 		dev_dbg(&mdev->pdev->dev, "no suitable IB device found to bind to, added to unaffiliated list.\n");
++ 	} else {
++ 		mlx5_ib_dbg(dev, "bound port %u\n", port_num + 1);
++ 	}
++ 	mutex_unlock(&mlx5_ib_multiport_mutex);
++ 
++ 	return mpi;
++ }
++ 
++ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
++ {
++ 	enum rdma_link_layer ll;
++ 	int port_type_cap;
++ 
++ 	port_type_cap = MLX5_CAP_GEN(mdev, port_type);
++ 	ll = mlx5_port_type_cap_to_rdma_ll(port_type_cap);
++ 
++ 	if (mlx5_core_is_mp_slave(mdev) && ll == IB_LINK_LAYER_ETHERNET) {
++ 		u8 port_num = mlx5_core_native_port_num(mdev) - 1;
++ 
++ 		return mlx5_ib_add_slave_port(mdev, port_num);
++ 	}
++ 
++ 	return __mlx5_ib_add(mdev, &pf_profile);
++ }
++ 
++ static void mlx5_ib_remove(struct mlx5_core_dev *mdev, void *context)
++ {
++ 	struct mlx5_ib_multiport_info *mpi;
++ 	struct mlx5_ib_dev *dev;
++ 
++ 	if (mlx5_core_is_mp_slave(mdev)) {
++ 		mpi = context;
++ 		mutex_lock(&mlx5_ib_multiport_mutex);
++ 		if (mpi->ibdev)
++ 			mlx5_ib_unbind_slave_port(mpi->ibdev, mpi);
++ 		list_del(&mpi->list);
++ 		mutex_unlock(&mlx5_ib_multiport_mutex);
++ 		return;
++ 	}
++ 
++ 	dev = context;
++ 	__mlx5_ib_remove(dev, dev->profile, MLX5_IB_STAGE_MAX);
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  }
+  
+  static struct mlx5_interface mlx5_ib_interface = {
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 11ef2d2f4974,a70a4c02e396..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -725,6 -736,46 +734,49 @@@ struct mlx5_ib_delay_drop 
+  	struct mlx5_ib_dbg_delay_drop *dbg;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum mlx5_ib_stages {
++ 	MLX5_IB_STAGE_INIT,
++ 	MLX5_IB_STAGE_CAPS,
++ 	MLX5_IB_STAGE_ROCE,
++ 	MLX5_IB_STAGE_DEVICE_RESOURCES,
++ 	MLX5_IB_STAGE_ODP,
++ 	MLX5_IB_STAGE_COUNTERS,
++ 	MLX5_IB_STAGE_CONG_DEBUGFS,
++ 	MLX5_IB_STAGE_UAR,
++ 	MLX5_IB_STAGE_BFREG,
++ 	MLX5_IB_STAGE_IB_REG,
++ 	MLX5_IB_STAGE_UMR_RESOURCES,
++ 	MLX5_IB_STAGE_DELAY_DROP,
++ 	MLX5_IB_STAGE_CLASS_ATTR,
++ 	MLX5_IB_STAGE_MAX,
++ };
++ 
++ struct mlx5_ib_stage {
++ 	int (*init)(struct mlx5_ib_dev *dev);
++ 	void (*cleanup)(struct mlx5_ib_dev *dev);
++ };
++ 
++ #define STAGE_CREATE(_stage, _init, _cleanup) \
++ 	.stage[_stage] = {.init = _init, .cleanup = _cleanup}
++ 
++ struct mlx5_ib_profile {
++ 	struct mlx5_ib_stage stage[MLX5_IB_STAGE_MAX];
++ };
++ 
++ struct mlx5_ib_multiport_info {
++ 	struct list_head list;
++ 	struct mlx5_ib_dev *ibdev;
++ 	struct mlx5_core_dev *mdev;
++ 	struct completion unref_comp;
++ 	u64 sys_image_guid;
++ 	u32 mdev_refcnt;
++ 	bool is_master;
++ 	bool unaffiliate;
++ };
++ 
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  struct mlx5_ib_dev {
+  	struct ib_device		ib_dev;
+  	struct mlx5_core_dev		*mdev;
+diff --cc include/linux/mlx5/driver.h
+index eb5400f89ba1,d5c787519e06..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -1233,6 -1234,31 +1233,34 @@@ static inline bool mlx5_rl_is_supported
+  	return !!(dev->priv.rl_table.max_size);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int mlx5_core_is_mp_slave(struct mlx5_core_dev *dev)
++ {
++ 	return MLX5_CAP_GEN(dev, affiliate_nic_vport_criteria) &&
++ 	       MLX5_CAP_GEN(dev, num_vhca_ports) <= 1;
++ }
++ 
++ static inline int mlx5_core_is_mp_master(struct mlx5_core_dev *dev)
++ {
++ 	return MLX5_CAP_GEN(dev, num_vhca_ports) > 1;
++ }
++ 
++ static inline int mlx5_core_mp_enabled(struct mlx5_core_dev *dev)
++ {
++ 	return mlx5_core_is_mp_slave(dev) ||
++ 	       mlx5_core_is_mp_master(dev);
++ }
++ 
++ static inline int mlx5_core_native_port_num(struct mlx5_core_dev *dev)
++ {
++ 	if (!mlx5_core_mp_enabled(dev))
++ 		return 1;
++ 
++ 	return MLX5_CAP_GEN(dev, native_port_num);
++ }
++ 
+++>>>>>>> 32f69e4be269 ({net, IB}/mlx5: Manage port association for multiport RoCE)
+  enum {
+  	MLX5_TRIGGERED_CMD_COMP = (u64)1 << 32,
+  };
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index fc4022884dbb..e9a409d7f4e2 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -821,7 +821,7 @@ static int gid_table_setup_one(struct ib_device *ib_dev)
+ 	if (err)
+ 		return err;
+ 
+-	roce_rescan_device(ib_dev);
++	rdma_roce_rescan_device(ib_dev);
+ 
+ 	return err;
+ }
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 0314ffb9b4d2..422e9fb94290 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -139,7 +139,6 @@ int ib_cache_gid_del_all_netdev_gids(struct ib_device *ib_dev, u8 port,
+ int roce_gid_mgmt_init(void);
+ void roce_gid_mgmt_cleanup(void);
+ 
+-void roce_rescan_device(struct ib_device *ib_dev);
+ unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port);
+ 
+ int ib_cache_setup_one(struct ib_device *device);
+diff --git a/drivers/infiniband/core/roce_gid_mgmt.c b/drivers/infiniband/core/roce_gid_mgmt.c
+index fe6d7d21e27a..4a6590276977 100644
+--- a/drivers/infiniband/core/roce_gid_mgmt.c
++++ b/drivers/infiniband/core/roce_gid_mgmt.c
+@@ -410,13 +410,18 @@ static void enum_all_gids_of_dev_cb(struct ib_device *ib_dev,
+ 	rtnl_unlock();
+ }
+ 
+-/* This function will rescan all of the network devices in the system
+- * and add their gids, as needed, to the relevant RoCE devices. */
+-void roce_rescan_device(struct ib_device *ib_dev)
++/**
++ * rdma_roce_rescan_device - Rescan all of the network devices in the system
++ * and add their gids, as needed, to the relevant RoCE devices.
++ *
++ * @device:         the rdma device
++ */
++void rdma_roce_rescan_device(struct ib_device *ib_dev)
+ {
+ 	ib_enum_roce_netdev(ib_dev, pass_all_filter, NULL,
+ 			    enum_all_gids_of_dev_cb, NULL);
+ }
++EXPORT_SYMBOL(rdma_roce_rescan_device);
+ 
+ static void callback_for_addr_gid_device_scan(struct ib_device *device,
+ 					      u8 port,
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+index c4392f741c5f..c841b03c3e48 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+@@ -688,7 +688,7 @@ static inline int mlx5_fpga_conn_init_qp(struct mlx5_fpga_conn *conn)
+ 	MLX5_SET(qpc, qpc, st, MLX5_QP_ST_RC);
+ 	MLX5_SET(qpc, qpc, pm_state, MLX5_QP_PM_MIGRATED);
+ 	MLX5_SET(qpc, qpc, primary_address_path.pkey_index, MLX5_FPGA_PKEY_INDEX);
+-	MLX5_SET(qpc, qpc, primary_address_path.port, MLX5_FPGA_PORT_NUM);
++	MLX5_SET(qpc, qpc, primary_address_path.vhca_port_num, MLX5_FPGA_PORT_NUM);
+ 	MLX5_SET(qpc, qpc, pd, conn->fdev->conn_res.pdn);
+ 	MLX5_SET(qpc, qpc, cqn_snd, conn->cq.mcq.cqn);
+ 	MLX5_SET(qpc, qpc, cqn_rcv, conn->cq.mcq.cqn);
+@@ -727,7 +727,7 @@ static inline int mlx5_fpga_conn_rtr_qp(struct mlx5_fpga_conn *conn)
+ 	MLX5_SET(qpc, qpc, next_rcv_psn,
+ 		 MLX5_GET(fpga_qpc, conn->fpga_qpc, next_send_psn));
+ 	MLX5_SET(qpc, qpc, primary_address_path.pkey_index, MLX5_FPGA_PKEY_INDEX);
+-	MLX5_SET(qpc, qpc, primary_address_path.port, MLX5_FPGA_PORT_NUM);
++	MLX5_SET(qpc, qpc, primary_address_path.vhca_port_num, MLX5_FPGA_PORT_NUM);
+ 	ether_addr_copy(MLX5_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32),
+ 			MLX5_ADDR_OF(fpga_qpc, conn->fpga_qpc, fpga_mac_47_32));
+ 	MLX5_SET(qpc, qpc, primary_address_path.udp_sport,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index fcb72758697c..facde971415e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -190,7 +190,7 @@ int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp
+ 		 MLX5_QP_ENHANCED_ULP_STATELESS_MODE);
+ 
+ 	addr_path = MLX5_ADDR_OF(qpc, qpc, primary_address_path);
+-	MLX5_SET(ads, addr_path, port, 1);
++	MLX5_SET(ads, addr_path, vhca_port_num, 1);
+ 	MLX5_SET(ads, addr_path, grh, 1);
+ 
+ 	ret = mlx5_core_create_qp(mdev, qp, in, inlen);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/vport.c b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+index 78d62514fc77..ac9f46083899 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vport.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+@@ -1134,3 +1134,61 @@ ex:
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(mlx5_core_modify_hca_vport_context);
++
++int mlx5_nic_vport_affiliate_multiport(struct mlx5_core_dev *master_mdev,
++				       struct mlx5_core_dev *port_mdev)
++{
++	int inlen = MLX5_ST_SZ_BYTES(modify_nic_vport_context_in);
++	void *in;
++	int err;
++
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
++		return -ENOMEM;
++
++	err = mlx5_nic_vport_enable_roce(port_mdev);
++	if (err)
++		goto free;
++
++	MLX5_SET(modify_nic_vport_context_in, in, field_select.affiliation, 1);
++	MLX5_SET(modify_nic_vport_context_in, in,
++		 nic_vport_context.affiliated_vhca_id,
++		 MLX5_CAP_GEN(master_mdev, vhca_id));
++	MLX5_SET(modify_nic_vport_context_in, in,
++		 nic_vport_context.affiliation_criteria,
++		 MLX5_CAP_GEN(port_mdev, affiliate_nic_vport_criteria));
++
++	err = mlx5_modify_nic_vport_context(port_mdev, in, inlen);
++	if (err)
++		mlx5_nic_vport_disable_roce(port_mdev);
++
++free:
++	kvfree(in);
++	return err;
++}
++EXPORT_SYMBOL_GPL(mlx5_nic_vport_affiliate_multiport);
++
++int mlx5_nic_vport_unaffiliate_multiport(struct mlx5_core_dev *port_mdev)
++{
++	int inlen = MLX5_ST_SZ_BYTES(modify_nic_vport_context_in);
++	void *in;
++	int err;
++
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
++		return -ENOMEM;
++
++	MLX5_SET(modify_nic_vport_context_in, in, field_select.affiliation, 1);
++	MLX5_SET(modify_nic_vport_context_in, in,
++		 nic_vport_context.affiliated_vhca_id, 0);
++	MLX5_SET(modify_nic_vport_context_in, in,
++		 nic_vport_context.affiliation_criteria, 0);
++
++	err = mlx5_modify_nic_vport_context(port_mdev, in, inlen);
++	if (!err)
++		mlx5_nic_vport_disable_roce(port_mdev);
++
++	kvfree(in);
++	return err;
++}
++EXPORT_SYMBOL_GPL(mlx5_nic_vport_unaffiliate_multiport);
+* Unmerged path include/linux/mlx5/driver.h
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index 23651f969e9d..36989603d6dd 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -502,7 +502,7 @@ struct mlx5_ifc_ads_bits {
+ 	u8         dei_cfi[0x1];
+ 	u8         eth_prio[0x3];
+ 	u8         sl[0x4];
+-	u8         port[0x8];
++	u8         vhca_port_num[0x8];
+ 	u8         rmac_47_32[0x10];
+ 
+ 	u8         rmac_31_0[0x20];
+@@ -794,7 +794,10 @@ enum {
+ };
+ 
+ struct mlx5_ifc_cmd_hca_cap_bits {
+-	u8         reserved_at_0[0x80];
++	u8         reserved_at_0[0x30];
++	u8         vhca_id[0x10];
++
++	u8         reserved_at_40[0x40];
+ 
+ 	u8         log_max_srq_sz[0x8];
+ 	u8         log_max_qp_sz[0x8];
+@@ -1066,8 +1069,11 @@ struct mlx5_ifc_cmd_hca_cap_bits {
+ 	u8         reserved_at_5f8[0x3];
+ 	u8         log_max_xrq[0x5];
+ 
+-	u8         reserved_at_600[0x1e];
+-	u8	   sw_owner_id;
++	u8	   affiliate_nic_vport_criteria[0x8];
++	u8	   native_port_num[0x8];
++	u8	   num_vhca_ports[0x8];
++	u8	   reserved_at_618[0x6];
++	u8	   sw_owner_id[0x1];
+ 	u8	   reserved_at_61f[0x1e1];
+ };
+ 
+@@ -2617,7 +2623,12 @@ struct mlx5_ifc_nic_vport_context_bits {
+ 	u8         event_on_mc_address_change[0x1];
+ 	u8         event_on_uc_address_change[0x1];
+ 
+-	u8         reserved_at_40[0xf0];
++	u8         reserved_at_40[0xc];
++
++	u8	   affiliation_criteria[0x4];
++	u8	   affiliated_vhca_id[0x10];
++
++	u8	   reserved_at_60[0xd0];
+ 
+ 	u8         mtu[0x10];
+ 
+@@ -3253,7 +3264,8 @@ struct mlx5_ifc_set_roce_address_in_bits {
+ 	u8         op_mod[0x10];
+ 
+ 	u8         roce_address_index[0x10];
+-	u8         reserved_at_50[0x10];
++	u8         reserved_at_50[0xc];
++	u8	   vhca_port_num[0x4];
+ 
+ 	u8         reserved_at_60[0x20];
+ 
+@@ -3873,7 +3885,8 @@ struct mlx5_ifc_query_roce_address_in_bits {
+ 	u8         op_mod[0x10];
+ 
+ 	u8         roce_address_index[0x10];
+-	u8         reserved_at_50[0x10];
++	u8         reserved_at_50[0xc];
++	u8	   vhca_port_num[0x4];
+ 
+ 	u8         reserved_at_60[0x20];
+ };
+@@ -5305,7 +5318,9 @@ struct mlx5_ifc_modify_nic_vport_context_out_bits {
+ };
+ 
+ struct mlx5_ifc_modify_nic_vport_field_select_bits {
+-	u8         reserved_at_0[0x14];
++	u8         reserved_at_0[0x12];
++	u8	   affiliation[0x1];
++	u8	   reserved_at_e[0x1];
+ 	u8         disable_uc_local_lb[0x1];
+ 	u8         disable_mc_local_lb[0x1];
+ 	u8         node_guid[0x1];
+diff --git a/include/linux/mlx5/vport.h b/include/linux/mlx5/vport.h
+index aaa0bb9e7655..64e193e87394 100644
+--- a/include/linux/mlx5/vport.h
++++ b/include/linux/mlx5/vport.h
+@@ -116,4 +116,8 @@ int mlx5_core_modify_hca_vport_context(struct mlx5_core_dev *dev,
+ 				       struct mlx5_hca_vport_context *req);
+ int mlx5_nic_vport_update_local_lb(struct mlx5_core_dev *mdev, bool enable);
+ int mlx5_nic_vport_query_local_lb(struct mlx5_core_dev *mdev, bool *status);
++
++int mlx5_nic_vport_affiliate_multiport(struct mlx5_core_dev *master_mdev,
++				       struct mlx5_core_dev *port_mdev);
++int mlx5_nic_vport_unaffiliate_multiport(struct mlx5_core_dev *port_mdev);
+ #endif /* __MLX5_VPORT_H__ */
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 7f5a241d3d3a..bfc13a7dcbc2 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -3929,4 +3929,12 @@ ib_get_vector_affinity(struct ib_device *device, int comp_vector)
+ 
+ }
+ 
++/**
++ * rdma_roce_rescan_device - Rescan all of the network devices in the system
++ * and add their gids, as needed, to the relevant RoCE devices.
++ *
++ * @device:         the rdma device
++ */
++void rdma_roce_rescan_device(struct ib_device *ibdev);
++
+ #endif /* IB_VERBS_H */
