@@ -1,0 +1,257 @@
+hwmon/coretemp: Support multi-die/package
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Zhang Rui <rui.zhang@intel.com>
+commit cfcd82e632882372db960b50782a439a8ba56c09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/cfcd82e6.failed
+
+Package temperature sensors are actually implemented in hardware per-die.
+
+Update coretemp to be "die-aware", so it can expose mulitple sensors per
+package, instead of just one.  No change to single-die/package systems.
+
+	Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+	Signed-off-by: Len Brown <len.brown@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Guenter Roeck <linux@roeck-us.net>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: linux-pm@vger.kernel.org
+	Cc: linux-hwmon@vger.kernel.org
+Link: https://lkml.kernel.org/r/ec2868f35113a01ff72d9041e0b97fc6a1c7df84.1557769318.git.len.brown@intel.com
+
+(cherry picked from commit cfcd82e632882372db960b50782a439a8ba56c09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hwmon/coretemp.c
+diff --cc drivers/hwmon/coretemp.c
+index d609abab9ae1,c64ce32d3214..000000000000
+--- a/drivers/hwmon/coretemp.c
++++ b/drivers/hwmon/coretemp.c
+@@@ -434,18 -435,10 +434,22 @@@ static int chk_ucode_version(unsigned i
+  
+  static struct platform_device *coretemp_get_pdev(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	int pkgid = topology_logical_package_id(cpu);
+ +	struct pdev_entry *p;
+++=======
++ 	int pkgid = topology_logical_die_id(cpu);
+++>>>>>>> cfcd82e63288 (hwmon/coretemp: Support multi-die/package)
+ +
+ +	mutex_lock(&pdev_list_mutex);
+  
+ -	if (pkgid >= 0 && pkgid < max_packages)
+ -		return pkg_devices[pkgid];
+ +	list_for_each_entry(p, &pdev_list, list)
+ +		if (p->pkg_id == pkgid) {
+ +			mutex_unlock(&pdev_list_mutex);
+ +			return p->pdev;
+ +		}
+ +
+ +	mutex_unlock(&pdev_list_mutex);
+  	return NULL;
+  }
+  
+@@@ -602,29 -577,17 +606,29 @@@ static struct platform_driver coretemp_
+  	.remove = coretemp_remove,
+  };
+  
+ -static struct platform_device *coretemp_device_add(unsigned int cpu)
+ +static int coretemp_device_add(unsigned int cpu)
+  {
+- 	int err, pkgid = topology_logical_package_id(cpu);
++ 	int err, pkgid = topology_logical_die_id(cpu);
+  	struct platform_device *pdev;
+ +	struct pdev_entry *pdev_entry;
+  
+  	if (pkgid < 0)
+ -		return ERR_PTR(-ENOMEM);
+ +		return -ENOMEM;
+ +
+ +	mutex_lock(&pdev_list_mutex);
+  
+  	pdev = platform_device_alloc(DRVNAME, pkgid);
+ -	if (!pdev)
+ -		return ERR_PTR(-ENOMEM);
+ +	if (!pdev) {
+ +		err = -ENOMEM;
+ +		pr_err("Device allocation failed\n");
+ +		goto exit;
+ +	}
+ +
+ +	pdev_entry = kzalloc(sizeof(struct pdev_entry), GFP_KERNEL);
+ +	if (!pdev_entry) {
+ +		err = -ENOMEM;
+ +		goto exit_device_put;
+ +	}
+  
+  	err = platform_device_add(pdev);
+  	if (err) {
+@@@ -729,67 -661,66 +733,88 @@@ static void put_core_offline(unsigned i
+  
+  	/* If the physical CPU device does not exist, just return */
+  	if (!pdev)
+ -		return 0;
+ +		return;
+ +
+ +	pdata = platform_get_drvdata(pdev);
+  
+ -	/* The core id is too big, just return */
+  	indx = TO_ATTR_NO(cpu);
+ -	if (indx > MAX_CORE_DATA - 1)
+ -		return 0;
+  
+ -	pd = platform_get_drvdata(pdev);
+ -	tdata = pd->core_data[indx];
+ +	/* The core id is too big, just return */
+ +	if (indx > MAX_CORE_DATA - 1)
+ +		return;
+  
+ -	cpumask_clear_cpu(cpu, &pd->cpumask);
+ +	if (pdata->core_data[indx] && pdata->core_data[indx]->cpu == cpu)
+ +		coretemp_remove_core(pdata, indx);
+  
+  	/*
+ -	 * If this is the last thread sibling, remove the CPU core
+ -	 * interface, If there is still a sibling online, transfer the
+ -	 * target cpu of that core interface to it.
+ +	 * If a HT sibling of a core is taken offline, but another HT sibling
+ +	 * of the same core is still online, register the alternate sibling.
+ +	 * This ensures that exactly one set of attributes is provided as long
+ +	 * as at least one HT sibling of a core is online.
+  	 */
+ -	target = cpumask_any_and(&pd->cpumask, topology_sibling_cpumask(cpu));
+ -	if (target >= nr_cpu_ids) {
+ -		coretemp_remove_core(pd, indx);
+ -	} else if (tdata && tdata->cpu == cpu) {
+ -		mutex_lock(&tdata->update_lock);
+ -		tdata->cpu = target;
+ -		mutex_unlock(&tdata->update_lock);
+ +	for_each_sibling(i, cpu) {
+ +		if (i != cpu) {
+ +			get_core_online(i);
+ +			/*
+ +			 * Display temperature sensor data for one HT sibling
+ +			 * per core only, so abort the loop after one such
+ +			 * sibling has been found.
+ +			 */
+ +			break;
+ +		}
+  	}
+ -
+  	/*
+ -	 * If all cores in this pkg are offline, remove the device. This
+ -	 * will invoke the platform driver remove function, which cleans up
+ -	 * the rest.
+ +	 * If all cores in this pkg are offline, remove the device.
+ +	 * coretemp_device_remove calls unregister_platform_device,
+ +	 * which in turn calls coretemp_remove. This removes the
+ +	 * pkgtemp entry and does other clean ups.
+  	 */
+++<<<<<<< HEAD
+ +	if (!is_any_core_online(pdata))
+ +		coretemp_device_remove(cpu);
+++=======
++ 	if (cpumask_empty(&pd->cpumask)) {
++ 		pkg_devices[topology_logical_die_id(cpu)] = NULL;
++ 		platform_device_unregister(pdev);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Check whether this core is the target for the package
++ 	 * interface. We need to assign it to some other cpu.
++ 	 */
++ 	tdata = pd->core_data[PKG_SYSFS_ATTR_NO];
++ 	if (tdata && tdata->cpu == cpu) {
++ 		target = cpumask_first(&pd->cpumask);
++ 		mutex_lock(&tdata->update_lock);
++ 		tdata->cpu = target;
++ 		mutex_unlock(&tdata->update_lock);
++ 	}
++ 	return 0;
+++>>>>>>> cfcd82e63288 (hwmon/coretemp: Support multi-die/package)
+ +}
+ +
+ +static int coretemp_cpu_callback(struct notifier_block *nfb,
+ +				 unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (unsigned long) hcpu;
+ +
+ +	switch (action) {
+ +	case CPU_ONLINE:
+ +	case CPU_DOWN_FAILED:
+ +		get_core_online(cpu);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		put_core_offline(cpu);
+ +		break;
+ +	}
+ +	return NOTIFY_OK;
+  }
+ +
+ +static struct notifier_block coretemp_cpu_notifier __refdata = {
+ +	.notifier_call = coretemp_cpu_callback,
+ +};
+ +
+  static const struct x86_cpu_id __initconst coretemp_ids[] = {
+  	{ X86_VENDOR_INTEL, X86_FAMILY_ANY, X86_MODEL_ANY, X86_FEATURE_DTHERM },
+  	{}
+@@@ -808,33 -741,29 +833,42 @@@ static int __init coretemp_init(void
+  	if (!x86_match_cpu(coretemp_ids))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+++=======
++ 	max_packages = topology_max_packages() * topology_max_die_per_package();
++ 	pkg_devices = kcalloc(max_packages, sizeof(struct platform_device *),
++ 			      GFP_KERNEL);
++ 	if (!pkg_devices)
++ 		return -ENOMEM;
++ 
+++>>>>>>> cfcd82e63288 (hwmon/coretemp: Support multi-die/package)
+  	err = platform_driver_register(&coretemp_driver);
+  	if (err)
+ -		return err;
+ +		goto exit;
+ +
+ +	cpu_notifier_register_begin();
+ +	for_each_online_cpu(i)
+ +		get_core_online(i);
+ +
+ +#ifndef CONFIG_HOTPLUG_CPU
+ +	if (list_empty(&pdev_list)) {
+ +		cpu_notifier_register_done();
+ +		err = -ENODEV;
+ +		goto exit_driver_unreg;
+ +	}
+ +#endif
+  
+ -	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "hwmon/coretemp:online",
+ -				coretemp_cpu_online, coretemp_cpu_offline);
+ -	if (err < 0)
+ -		goto outdrv;
+ -	coretemp_hp_online = err;
+ +	__register_hotcpu_notifier(&coretemp_cpu_notifier);
+ +	cpu_notifier_register_done();
+  	return 0;
+  
+ -outdrv:
+ +#ifndef CONFIG_HOTPLUG_CPU
+ +exit_driver_unreg:
+  	platform_driver_unregister(&coretemp_driver);
+ -	kfree(pkg_devices);
+ +#endif
+ +exit:
+  	return err;
+  }
+ -module_init(coretemp_init)
+  
+  static void __exit coretemp_exit(void)
+  {
+* Unmerged path drivers/hwmon/coretemp.c
