@@ -1,0 +1,172 @@
+s390/qeth: use diag26c to get MAC address on L2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] qeth: use diag26c to get MAC address on L2 (Hendrik Brueckner) [1479463]
+Rebuild_FUZZ: 94.38%
+commit-author Julian Wiedmann <jwi@linux.vnet.ibm.com>
+commit ec61bd2fd2a27bf7368261b230ef54fe34d1cce3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ec61bd2f.failed
+
+When a s390 guest runs on a z/VM host that's part of a SSI cluster,
+it can be migrated to a different host. In this case, the MAC address
+it originally obtained on the old host may be re-assigned to a new
+guest. This would result in address conflicts between the two guests.
+
+When running as z/VM guest, use the diag26c MAC Service to obtain
+a hypervisor-managed MAC address. The MAC Service is SSI-aware, and
+won't re-assign the address after the guest is migrated to a new host.
+
+This patch adds support for the z/VM MAC Service on L2 devices.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+	Acked-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ec61bd2fd2a27bf7368261b230ef54fe34d1cce3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index f5e46b80b5b6,7a0ffc71b25d..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -992,8 -978,15 +992,20 @@@ int qeth_send_setassparms(struct qeth_c
+  			  int (*reply_cb)(struct qeth_card *,
+  					  struct qeth_reply *, unsigned long),
+  			  void *);
+++<<<<<<< HEAD
+ +int qeth_start_ipa_tx_checksum(struct qeth_card *);
+ +int qeth_set_rx_csum(struct qeth_card *, int);
+++=======
++ int qeth_setassparms_cb(struct qeth_card *, struct qeth_reply *, unsigned long);
++ struct qeth_cmd_buffer *qeth_get_setassparms_cmd(struct qeth_card *,
++ 						 enum qeth_ipa_funcs,
++ 						 __u16, __u16,
++ 						 enum qeth_prot_versions);
++ int qeth_set_features(struct net_device *, netdev_features_t);
++ int qeth_recover_features(struct net_device *);
++ netdev_features_t qeth_fix_features(struct net_device *, netdev_features_t);
++ int qeth_vm_request_mac(struct qeth_card *card);
+++>>>>>>> ec61bd2fd2a2 (s390/qeth: use diag26c to get MAC address on L2)
+  
+  /* exports for OSN */
+  int qeth_osn_assist(struct net_device *, void *, int);
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 106233e4f578,ad110abfdd47..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -16,10 -16,12 +16,17 @@@
+  #include <linux/kernel.h>
+  #include <linux/slab.h>
+  #include <linux/etherdevice.h>
+ +#include <linux/mii.h>
+  #include <linux/ip.h>
+  #include <linux/list.h>
+++<<<<<<< HEAD
+ +
+++=======
++ #include <linux/hash.h>
++ #include <linux/hashtable.h>
++ #include <linux/string.h>
++ #include <asm/setup.h>
+++>>>>>>> ec61bd2fd2a2 (s390/qeth: use diag26c to get MAC address on L2)
+  #include "qeth_core.h"
+  #include "qeth_l2.h"
+  
+@@@ -708,10 -536,9 +725,9 @@@ static int qeth_l2_request_initial_mac(
+  		if (rc) {
+  			QETH_DBF_MESSAGE(2, "couldn't get MAC address on "
+  				"device %s: x%x\n", CARD_BUS_ID(card), rc);
+ -			QETH_DBF_TEXT_(SETUP, 2, "1err%04x", rc);
+ +			QETH_DBF_TEXT_(SETUP, 2, "1err%d", rc);
+  			return rc;
+  		}
+- 		QETH_DBF_HEX(SETUP, 2, card->dev->dev_addr, OSA_ADDR_LEN);
+  	} else {
+  		eth_random_addr(card->dev->dev_addr);
+  		memcpy(card->dev->dev_addr, vendor_pre, 3);
+* Unmerged path drivers/s390/net/qeth_core.h
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index 7c83942eca8d..38ea9edf17c0 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -27,6 +27,9 @@
+ #include <asm/io.h>
+ #include <asm/sysinfo.h>
+ #include <asm/compat.h>
++#include <asm/diag.h>
++#include <asm/cio.h>
++#include <asm/ccwdev.h>
+ 
+ #include "qeth_core.h"
+ 
+@@ -4703,6 +4706,64 @@ int qeth_query_card_info(struct qeth_card *card,
+ }
+ EXPORT_SYMBOL_GPL(qeth_query_card_info);
+ 
++/**
++ * qeth_vm_request_mac() - Request a hypervisor-managed MAC address
++ * @card: pointer to a qeth_card
++ *
++ * Returns
++ *	0, if a MAC address has been set for the card's netdevice
++ *	a return code, for various error conditions
++ */
++int qeth_vm_request_mac(struct qeth_card *card)
++{
++	struct diag26c_mac_resp *response;
++	struct diag26c_mac_req *request;
++	struct ccw_dev_id id;
++	int rc;
++
++	QETH_DBF_TEXT(SETUP, 2, "vmreqmac");
++
++	if (!card->dev)
++		return -ENODEV;
++
++	request = kzalloc(sizeof(*request), GFP_KERNEL | GFP_DMA);
++	response = kzalloc(sizeof(*response), GFP_KERNEL | GFP_DMA);
++	if (!request || !response) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	ccw_device_get_id(CARD_DDEV(card), &id);
++	request->resp_buf_len = sizeof(*response);
++	request->resp_version = DIAG26C_VERSION2;
++	request->op_code = DIAG26C_GET_MAC;
++	request->devno = id.devno;
++
++	rc = diag26c(request, response, DIAG26C_MAC_SERVICES);
++	if (rc)
++		goto out;
++
++	if (request->resp_buf_len < sizeof(*response) ||
++	    response->version != request->resp_version) {
++		rc = -EIO;
++		QETH_DBF_TEXT(SETUP, 2, "badresp");
++		QETH_DBF_HEX(SETUP, 2, &request->resp_buf_len,
++			     sizeof(request->resp_buf_len));
++	} else if (!is_valid_ether_addr(response->mac)) {
++		rc = -EINVAL;
++		QETH_DBF_TEXT(SETUP, 2, "badmac");
++		QETH_DBF_HEX(SETUP, 2, response->mac, ETH_ALEN);
++	} else {
++		ether_addr_copy(card->dev->dev_addr, response->mac);
++	}
++
++out:
++	kfree(response);
++	kfree(request);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(qeth_vm_request_mac);
++
+ static inline int qeth_get_qdio_q_format(struct qeth_card *card)
+ {
+ 	switch (card->info.type) {
+* Unmerged path drivers/s390/net/qeth_l2_main.c
