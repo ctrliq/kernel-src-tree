@@ -1,0 +1,136 @@
+nvme: Prevent controller state invalid transition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Prevent controller state invalid transition (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 93.48%
+commit-author Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
+commit f6b6a28e2dbc401416ff12f775d75281c9b41918
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f6b6a28e.failed
+
+Acquiring the nvme_ctrl lock before reading ctrl->state in
+nvme_change_ctrl_state() should prevent a theoretical invalid state
+transition, in the event of two threads racing inside that function.
+
+I haven't been able to observe this happening with the current code, and
+the current state machine seems to be simple enough to not be
+affected by these invalid transitions, but future modifications could
+make it more likely to happen.
+
+	Signed-off-by: Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
+	Reviewed-by: Sagi Grimberg <sag@grimberg.me>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f6b6a28e2dbc401416ff12f775d75281c9b41918)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 63f6b5f40b5c,7f75d661237f..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -56,6 -61,97 +56,100 @@@ DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ void nvme_cancel_request(struct request *req, void *data, bool reserved)
++ {
++ 	int status;
++ 
++ 	if (!blk_mq_request_started(req))
++ 		return;
++ 
++ 	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
++ 				"Cancelling I/O %d", req->tag);
++ 
++ 	status = NVME_SC_ABORT_REQ;
++ 	if (blk_queue_dying(req->q))
++ 		status |= NVME_SC_DNR;
++ 	blk_mq_complete_request(req, status);
++ }
++ EXPORT_SYMBOL_GPL(nvme_cancel_request);
++ 
++ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
++ 		enum nvme_ctrl_state new_state)
++ {
++ 	enum nvme_ctrl_state old_state;
++ 	bool changed = false;
++ 
++ 	spin_lock_irq(&ctrl->lock);
++ 
++ 	old_state = ctrl->state;
++ 	switch (new_state) {
++ 	case NVME_CTRL_LIVE:
++ 		switch (old_state) {
++ 		case NVME_CTRL_NEW:
++ 		case NVME_CTRL_RESETTING:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_RESETTING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_NEW:
++ 		case NVME_CTRL_LIVE:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_RECONNECTING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_LIVE:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DELETING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_LIVE:
++ 		case NVME_CTRL_RESETTING:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DEAD:
++ 		switch (old_state) {
++ 		case NVME_CTRL_DELETING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (changed)
++ 		ctrl->state = new_state;
++ 
++ 	spin_unlock_irq(&ctrl->lock);
++ 
++ 	return changed;
++ }
++ EXPORT_SYMBOL_GPL(nvme_change_ctrl_state);
++ 
+++>>>>>>> f6b6a28e2dbc (nvme: Prevent controller state invalid transition)
+  static void nvme_free_ns(struct kref *kref)
+  {
+  	struct nvme_ns *ns = container_of(kref, struct nvme_ns, kref);
+* Unmerged path drivers/nvme/host/core.c
