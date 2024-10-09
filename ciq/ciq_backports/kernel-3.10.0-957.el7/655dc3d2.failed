@@ -1,0 +1,245 @@
+net/mlx5e: Use shared table for offloaded TC eswitch flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Use shared table for offloaded TC eswitch flows (Alaa Hleihel) [1591249]
+Rebuild_FUZZ: 96.43%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 655dc3d2b91bf241f5baca5eb2bc2b1e22a561ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/655dc3d2.failed
+
+Currently, each representor netdev use their own hash table to keep
+the mapping from TC flow (f->cookie) to the driver offloaded instance.
+The table is the one which originally was added for offloading TC NIC
+(not eswitch) rules.
+
+This scheme breaks when the core TC code calls us to add the same flow
+twice, (e.g under egdev use case) since we don't spot that and offload
+a 2nd flow into the HW with the wrong source vport.
+
+As a pre-step to solve that, we move to use a single table which keeps
+all offloaded TC eswitch flows. The table is located at the eswitch
+uplink representor object.
+
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 655dc3d2b91bf241f5baca5eb2bc2b1e22a561ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 1f6b50ed685e,aa32592a54cb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -970,16 -979,10 +970,15 @@@ static int mlx5e_init_rep_rx(struct mlx
+  		err = PTR_ERR(flow_rule);
+  		goto err_destroy_direct_tirs;
+  	}
+ -	rpriv->vport_rx_rule = flow_rule;
+ +	rep->vport_rx_rule = flow_rule;
+  
+- 	err = mlx5e_tc_init(priv);
+- 	if (err)
+- 		goto err_del_flow_rule;
+- 
+  	return 0;
+  
+++<<<<<<< HEAD
+ +err_del_flow_rule:
+ +	mlx5_del_flow_rules(rep->vport_rx_rule);
+++=======
+++>>>>>>> 655dc3d2b91b (net/mlx5e: Use shared table for offloaded TC eswitch flows)
+  err_destroy_direct_tirs:
+  	mlx5e_destroy_direct_tirs(priv);
+  err_destroy_direct_rqts:
+@@@ -990,10 -993,8 +989,14 @@@
+  static void mlx5e_cleanup_rep_rx(struct mlx5e_priv *priv)
+  {
+  	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+ +	struct mlx5_eswitch_rep *rep = rpriv->rep;
+  
+++<<<<<<< HEAD
+ +	mlx5e_tc_cleanup(priv);
+ +	mlx5_del_flow_rules(rep->vport_rx_rule);
+++=======
++ 	mlx5_del_flow_rules(rpriv->vport_rx_rule);
+++>>>>>>> 655dc3d2b91b (net/mlx5e: Use shared table for offloaded TC eswitch flows)
+  	mlx5e_destroy_direct_tirs(priv);
+  	mlx5e_destroy_direct_rqts(priv);
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 5659ed9f51e6,844d32d5c29f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@@ -56,8 -56,18 +56,15 @@@ struct mlx5e_neigh_update_table 
+  struct mlx5e_rep_priv {
+  	struct mlx5_eswitch_rep *rep;
+  	struct mlx5e_neigh_update_table neigh_update;
+++<<<<<<< HEAD
+++=======
++ 	struct net_device      *netdev;
++ 	struct mlx5_flow_handle *vport_rx_rule;
++ 	struct list_head       vport_sqs_list;
++ 	struct rhashtable      tc_ht; /* valid for uplink rep */
+++>>>>>>> 655dc3d2b91b (net/mlx5e: Use shared table for offloaded TC eswitch flows)
+  };
+  
+ -static inline
+ -struct mlx5e_rep_priv *mlx5e_rep_to_rep_priv(struct mlx5_eswitch_rep *rep)
+ -{
+ -	return (struct mlx5e_rep_priv *)rep->rep_if[REP_ETH].priv;
+ -}
+ -
+  struct mlx5e_neigh {
+  	struct net_device *dev;
+  	union {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index c14c263a739b,59e52b845beb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@@ -38,16 -38,26 +38,31 @@@
+  #define MLX5E_TC_FLOW_ID_MASK 0x0000ffff
+  
+  #ifdef CONFIG_MLX5_ESWITCH
+++<<<<<<< HEAD
+ +int mlx5e_tc_init(struct mlx5e_priv *priv);
+ +void mlx5e_tc_cleanup(struct mlx5e_priv *priv);
+++=======
++ 
++ enum {
++ 	MLX5E_TC_INGRESS = BIT(0),
++ 	MLX5E_TC_EGRESS  = BIT(1),
++ 	MLX5E_TC_LAST_EXPORTED_BIT = 1,
++ };
++ 
++ int mlx5e_tc_nic_init(struct mlx5e_priv *priv);
++ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv);
++ 
++ int mlx5e_tc_esw_init(struct rhashtable *tc_ht);
++ void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht);
+++>>>>>>> 655dc3d2b91b (net/mlx5e: Use shared table for offloaded TC eswitch flows)
+  
+  int mlx5e_configure_flower(struct mlx5e_priv *priv,
+ -			   struct tc_cls_flower_offload *f, int flags);
+ +			   struct tc_cls_flower_offload *f);
+  int mlx5e_delete_flower(struct mlx5e_priv *priv,
+ -			struct tc_cls_flower_offload *f, int flags);
+ +			struct tc_cls_flower_offload *f);
+  
+  int mlx5e_stats_flower(struct mlx5e_priv *priv,
+ -		       struct tc_cls_flower_offload *f, int flags);
+ +		       struct tc_cls_flower_offload *f);
+  
+  struct mlx5e_encap_entry;
+  void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f9f9996c2b9e..eddbcec6d9e5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -4051,7 +4051,7 @@ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+ 		goto err_destroy_direct_tirs;
+ 	}
+ 
+-	err = mlx5e_tc_init(priv);
++	err = mlx5e_tc_nic_init(priv);
+ 	if (err)
+ 		goto err_destroy_flow_steering;
+ 
+@@ -4072,7 +4072,7 @@ err_destroy_indirect_rqts:
+ 
+ static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
+ {
+-	mlx5e_tc_cleanup(priv);
++	mlx5e_tc_nic_cleanup(priv);
+ 	mlx5e_destroy_flow_steering(priv);
+ 	mlx5e_destroy_direct_tirs(priv);
+ 	mlx5e_destroy_indirect_tirs(priv);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 6d96a2447540..be9004603930 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -71,6 +71,7 @@ enum {
+ 
+ struct mlx5e_tc_flow {
+ 	struct rhash_head	node;
++	struct mlx5e_priv	*priv;
+ 	u64			cookie;
+ 	u8			flags;
+ 	struct mlx5_flow_handle *rule;
+@@ -2566,7 +2567,14 @@ static const struct rhashtable_params tc_ht_params = {
+ 
+ static struct rhashtable *get_tc_ht(struct mlx5e_priv *priv)
+ {
+-	return &priv->fs.tc.ht;
++	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++	struct mlx5e_rep_priv *uplink_rpriv;
++
++	if (MLX5_VPORT_MANAGER(priv->mdev) && esw->mode == SRIOV_OFFLOADS) {
++		uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
++		return &uplink_rpriv->tc_ht;
++	} else
++		return &priv->fs.tc.ht;
+ }
+ 
+ int mlx5e_configure_flower(struct mlx5e_priv *priv,
+@@ -2596,6 +2604,7 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
+ 
+ 	flow->cookie = f->cookie;
+ 	flow->flags = flow_flags;
++	flow->priv = priv;
+ 
+ 	err = parse_cls_flower(priv, flow, &parse_attr->spec, f);
+ 	if (err < 0)
+@@ -2687,7 +2696,7 @@ int mlx5e_stats_flower(struct mlx5e_priv *priv,
+ 	return 0;
+ }
+ 
+-int mlx5e_tc_init(struct mlx5e_priv *priv)
++int mlx5e_tc_nic_init(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_tc_table *tc = &priv->fs.tc;
+ 
+@@ -2700,20 +2709,30 @@ int mlx5e_tc_init(struct mlx5e_priv *priv)
+ static void _mlx5e_tc_del_flow(void *ptr, void *arg)
+ {
+ 	struct mlx5e_tc_flow *flow = ptr;
+-	struct mlx5e_priv *priv = arg;
++	struct mlx5e_priv *priv = flow->priv;
+ 
+ 	mlx5e_tc_del_flow(priv, flow);
+ 	kfree(flow);
+ }
+ 
+-void mlx5e_tc_cleanup(struct mlx5e_priv *priv)
++void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5e_tc_table *tc = &priv->fs.tc;
+ 
+-	rhashtable_free_and_destroy(&tc->ht, _mlx5e_tc_del_flow, priv);
++	rhashtable_free_and_destroy(&tc->ht, _mlx5e_tc_del_flow, NULL);
+ 
+ 	if (!IS_ERR_OR_NULL(tc->t)) {
+ 		mlx5_destroy_flow_table(tc->t);
+ 		tc->t = NULL;
+ 	}
+ }
++
++int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
++{
++	return rhashtable_init(tc_ht, &tc_ht_params);
++}
++
++void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht)
++{
++	rhashtable_free_and_destroy(tc_ht, _mlx5e_tc_del_flow, NULL);
++}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
