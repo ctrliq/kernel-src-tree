@@ -1,0 +1,250 @@
+xfs: direct calls in the direct I/O path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit fa8d972d055c723cc427e14d4d7919640f418730
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fa8d972d.failed
+
+We control both the callers and callees of ->direct_IO, so remove the
+indirect calls.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit fa8d972d055c723cc427e14d4d7919640f418730)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_aops.c
+index acf6c4a54883,3ba0809e0be8..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1582,39 -1325,40 +1582,56 @@@ xfs_get_blocks_dax_fault
+  	return __xfs_get_blocks(inode, iblock, bh_result, create, true, true);
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +__xfs_end_io_direct_write(
+ +	struct inode		*inode,
+ +	struct xfs_ioend	*ioend,
+++=======
++ /*
++  * Complete a direct I/O write request.
++  *
++  * xfs_map_direct passes us some flags in the private data to tell us what to
++  * do.  If no flags are set, then the write IO is an overwrite wholly within
++  * the existing allocated file size and so there is nothing for us to do.
++  *
++  * Note that in this case the completion can be called in interrupt context,
++  * whereas if we have flags set we will always be called in task context
++  * (i.e. from a workqueue).
++  */
++ int
++ xfs_end_io_direct_write(
++ 	struct kiocb		*iocb,
+++>>>>>>> fa8d972d055c (xfs: direct calls in the direct I/O path)
+  	loff_t			offset,
+ -	ssize_t			size,
+ -	void			*private)
+ +	ssize_t			size)
+  {
+ -	struct inode		*inode = file_inode(iocb->ki_filp);
+ -	struct xfs_inode	*ip = XFS_I(inode);
+ -	struct xfs_mount	*mp = ip->i_mount;
+ -	uintptr_t		flags = (uintptr_t)private;
+ -	int			error = 0;
+ +	struct xfs_mount	*mp = XFS_I(inode)->i_mount;
+ +	unsigned long		flags;
+  
+ -	trace_xfs_end_io_direct_write(ip, offset, size);
+ +	if (XFS_FORCED_SHUTDOWN(mp) || ioend->io_error)
+ +		goto out_end_io;
+  
+ -	if (XFS_FORCED_SHUTDOWN(mp))
+ -		return -EIO;
+ +	/*
+ +	 * dio completion end_io functions are only called on writes if more
+ +	 * than 0 bytes was written.
+ +	 */
+ +	ASSERT(size > 0);
+  
+ -	if (size <= 0)
+ -		return size;
+ +	/*
+ +	 * The ioend only maps whole blocks, while the IO may be sector aligned.
+ +	 * Hence the ioend offset/size may not match the IO offset/size exactly.
+ +	 * Because we don't map overwrites within EOF into the ioend, the offset
+ +	 * may not match, but only if the endio spans EOF.  Either way, write
+ +	 * the IO sizes into the ioend so that completion processing does the
+ +	 * right thing.
+ +	 */
+ +	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
+ +	ioend->io_size = size;
+ +	ioend->io_offset = offset;
+  
+  	/*
+ -	 * The flags tell us whether we are doing unwritten extent conversions
+ +	 * The ioend tells us whether we are doing unwritten extent conversion
+  	 * or an append transaction that updates the on-disk file size. These
+  	 * cases are the only cases where we should *potentially* be needing
+  	 * to update the VFS inode size.
+@@@ -1710,18 -1404,13 +1727,25 @@@ xfs_vm_do_dio
+  
+  STATIC ssize_t
+  xfs_vm_direct_IO(
+ +	int			rw,
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*iter)
+ +	const struct iovec	*iov,
+ +	loff_t			offset,
+ +	unsigned long		nr_segs)
+  {
+++<<<<<<< HEAD
+ +
+ +	if (rw & WRITE)
+ +		return xfs_vm_do_dio(rw, iocb, iov, offset, nr_segs,
+ +				     xfs_end_io_direct_write, DIO_ASYNC_EXTEND);
+ +
+ +	return xfs_vm_do_dio(rw, iocb, iov, offset, nr_segs, NULL, 0);
+++=======
++ 	/*
++ 	 * We just need the method present so that open/fcntl allow direct I/O.
++ 	 */
++ 	return -EINVAL;
+++>>>>>>> fa8d972d055c (xfs: direct calls in the direct I/O path)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,dd5185dafc9f..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -380,13 -359,61 +380,68 @@@ xfs_file_aio_read
+  		xfs_rw_ilock_demote(ip, XFS_IOLOCK_EXCL);
+  	}
+  
+++<<<<<<< HEAD
+ +	trace_xfs_file_read(ip, size, pos, ioflags);
+++=======
++ 	data = *to;
++ 	if (IS_DAX(inode)) {
++ 		ret = dax_do_io(iocb, inode, &data, xfs_get_blocks_direct,
++ 				NULL, 0);
++ 	} else {
++ 		ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data,
++ 				xfs_get_blocks_direct, NULL, NULL, 0);
++ 	}
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(to, ret);
++ 	}
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	file_accessed(iocb->ki_filp);
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_buffered_aio_read(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct xfs_inode	*ip = XFS_I(file_inode(iocb->ki_filp));
++ 	ssize_t			ret;
++ 
++ 	trace_xfs_file_buffered_read(ip, iov_iter_count(to), iocb->ki_pos);
++ 
++ 	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
++ 	ret = generic_file_read_iter(iocb, to);
++ 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
++ 
++ 	return ret;
++ }
++ 
++ STATIC ssize_t
++ xfs_file_read_iter(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*to)
++ {
++ 	struct xfs_mount	*mp = XFS_I(file_inode(iocb->ki_filp))->i_mount;
++ 	ssize_t			ret = 0;
++ 
++ 	XFS_STATS_INC(mp, xs_read_calls);
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	if (iocb->ki_flags & IOCB_DIRECT)
++ 		ret = xfs_file_dio_aio_read(iocb, to);
++ 	else
++ 		ret = xfs_file_buffered_aio_read(iocb, to);
+++>>>>>>> fa8d972d055c (xfs: direct calls in the direct I/O path)
+  
+ +	ret = generic_file_aio_read(iocb, iovp, nr_segs, pos);
+  	if (ret > 0)
+  		XFS_STATS_ADD(mp, xs_read_bytes, ret);
+ +
+ +	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+  	return ret;
+  }
+  
+@@@ -861,10 -822,29 +916,34 @@@ xfs_file_dio_aio_write
+  		iolock = XFS_IOLOCK_SHARED;
+  	}
+  
+ -	trace_xfs_file_direct_write(ip, count, iocb->ki_pos);
+ +	trace_xfs_file_direct_write(ip, count, iocb->ki_pos, 0);
+ +	ret = generic_file_direct_write(iocb, iovp,
+ +			&nr_segs, pos, &iocb->ki_pos, count, ocount);
+  
+++<<<<<<< HEAD
+++=======
++ 	data = *from;
++ 	if (IS_DAX(inode)) {
++ 		ret = dax_do_io(iocb, inode, &data, xfs_get_blocks_direct,
++ 				xfs_end_io_direct_write, 0);
++ 	} else {
++ 		ret = __blockdev_direct_IO(iocb, inode, target->bt_bdev, &data,
++ 				xfs_get_blocks_direct, xfs_end_io_direct_write,
++ 				NULL, DIO_ASYNC_EXTEND);
++ 	}
++ 
++ 	/* see generic_file_direct_write() for why this is necessary */
++ 	if (mapping->nrpages) {
++ 		invalidate_inode_pages2_range(mapping,
++ 					      iocb->ki_pos >> PAGE_SHIFT,
++ 					      end >> PAGE_SHIFT);
++ 	}
++ 
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(from, ret);
++ 	}
+++>>>>>>> fa8d972d055c (xfs: direct calls in the direct I/O path)
+  out:
+  	xfs_rw_iunlock(ip, iolock);
+  
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index a4343c63fb38..a32bee1c0fd3 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -61,6 +61,9 @@ int	xfs_get_blocks_direct(struct inode *inode, sector_t offset,
+ int	xfs_get_blocks_dax_fault(struct inode *inode, sector_t offset,
+ 			         struct buffer_head *map_bh, int create);
+ 
++int	xfs_end_io_direct_write(struct kiocb *iocb, loff_t offset,
++		ssize_t size, void *private);
++
+ extern void xfs_count_page_state(struct page *, int *, int *);
+ extern struct block_device *xfs_find_bdev_for_inode(struct inode *);
+ 
+* Unmerged path fs/xfs/xfs_file.c
