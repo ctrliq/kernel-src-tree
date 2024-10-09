@@ -1,0 +1,481 @@
+switchdev: push object ID back to object structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 9e8f4a548ab4710002c23c94c4b1bbde91b5e335
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9e8f4a54.failed
+
+	Suggested-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Scott Feldman <sfeldma@gmail.com>
+	Reviewed-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9e8f4a548ab4710002c23c94c4b1bbde91b5e335)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/net/switchdev.h
+#	net/bridge/br_fdb.c
+#	net/bridge/br_vlan.c
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/bridge/br_fdb.c
+index 46b89ee4408e,7f7d55132dd5..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -130,6 -131,17 +130,20 @@@ static void fdb_del_hw_addr(struct net_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fdb_del_external_learn(struct net_bridge_fdb_entry *f)
++ {
++ 	struct switchdev_obj_port_fdb fdb = {
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_FDB,
++ 		.addr = f->addr.addr,
++ 		.vid = f->vlan_id,
++ 	};
++ 
++ 	switchdev_port_obj_del(f->dst->dev, &fdb.obj);
++ }
++ 
+++>>>>>>> 9e8f4a548ab4 (switchdev: push object ID back to object structure)
+  static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+  {
+  	if (f->is_static)
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,1a79e199ca3b..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -20,45 -46,140 +20,136 @@@ static void __vlan_delete_pvid(struct n
+  		return;
+  
+  	smp_wmb();
+ -	vg->pvid = 0;
+ +	v->pvid = 0;
+  }
+  
+ -static void __vlan_add_flags(struct net_bridge_vlan *v, u16 flags)
+ +static void __vlan_add_flags(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	if (br_vlan_is_master(v))
+ -		vg = v->br->vlgrp;
+ -	else
+ -		vg = v->port->vlgrp;
+ -
+  	if (flags & BRIDGE_VLAN_INFO_PVID)
+ -		__vlan_add_pvid(vg, v->vid);
+ +		__vlan_add_pvid(v, vid);
+  	else
+ -		__vlan_delete_pvid(vg, v->vid);
+ +		__vlan_delete_pvid(v, vid);
+  
+  	if (flags & BRIDGE_VLAN_INFO_UNTAGGED)
+ -		v->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+ +		set_bit(vid, v->untagged_bitmap);
+  	else
+ -		v->flags &= ~BRIDGE_VLAN_INFO_UNTAGGED;
+ +		clear_bit(vid, v->untagged_bitmap);
+  }
+  
+ -static int __vlan_vid_add(struct net_device *dev, struct net_bridge *br,
+ -			  u16 vid, u16 flags)
+ +static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int err;
++ 
++ 	/* If driver uses VLAN ndo ops, use 8021q to install vid
++ 	 * on device, otherwise try switchdev ops to install vid.
++ 	 */
++ 
++ 	if (ops->ndo_vlan_rx_add_vid) {
++ 		err = vlan_vid_add(dev, br->vlan_proto, vid);
++ 	} else {
++ 		struct switchdev_obj_port_vlan v = {
++ 			.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 			.flags = flags,
++ 			.vid_begin = vid,
++ 			.vid_end = vid,
++ 		};
++ 
++ 		err = switchdev_port_obj_add(dev, &v.obj);
++ 		if (err == -EOPNOTSUPP)
++ 			err = 0;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static void __vlan_add_list(struct net_bridge_vlan *v)
++ {
++ 	struct list_head *headp, *hpos;
++ 	struct net_bridge_vlan *vent;
++ 
++ 	headp = br_vlan_is_master(v) ? &v->br->vlgrp->vlan_list :
++ 				       &v->port->vlgrp->vlan_list;
++ 	list_for_each_prev(hpos, headp) {
++ 		vent = list_entry(hpos, struct net_bridge_vlan, vlist);
++ 		if (v->vid < vent->vid)
++ 			continue;
++ 		else
++ 			break;
++ 	}
++ 	list_add(&v->vlist, hpos);
++ }
++ 
++ static void __vlan_del_list(struct net_bridge_vlan *v)
++ {
++ 	list_del(&v->vlist);
++ }
++ 
++ static int __vlan_vid_del(struct net_device *dev, struct net_bridge *br,
++ 			  u16 vid)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int err = 0;
++ 
++ 	/* If driver uses VLAN ndo ops, use 8021q to delete vid
++ 	 * on device, otherwise try switchdev ops to delete vid.
++ 	 */
++ 
++ 	if (ops->ndo_vlan_rx_kill_vid) {
++ 		vlan_vid_del(dev, br->vlan_proto, vid);
++ 	} else {
++ 		struct switchdev_obj_port_vlan v = {
++ 			.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 			.vid_begin = vid,
++ 			.vid_end = vid,
++ 		};
++ 
++ 		err = switchdev_port_obj_del(dev, &v.obj);
++ 		if (err == -EOPNOTSUPP)
++ 			err = 0;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ /* This is the shared VLAN add function which works for both ports and bridge
++  * devices. There are four possible calls to this function in terms of the
++  * vlan entry type:
++  * 1. vlan is being added on a port (no master flags, global entry exists)
++  * 2. vlan is being added on a bridge (both master and brvlan flags)
++  * 3. vlan is being added on a port, but a global entry didn't exist which
++  *    is being created right now (master flag set, brvlan flag unset), the
++  *    global entry is used for global per-vlan features, but not for filtering
++  * 4. same as 3 but with both master and brvlan flags set so the entry
++  *    will be used for filtering in both the port and the bridge
++  */
++ static int __vlan_add(struct net_bridge_vlan *v, u16 flags)
++ {
++ 	struct net_bridge_vlan *masterv = NULL;
+++>>>>>>> 9e8f4a548ab4 (switchdev: push object ID back to object structure)
+  	struct net_bridge_port *p = NULL;
+ -	struct rhashtable *tbl;
+ -	struct net_device *dev;
+  	struct net_bridge *br;
+ +	struct net_device *dev;
+  	int err;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		br = v->br;
+ -		dev = br->dev;
+ -		tbl = &br->vlgrp->vlan_hash;
+ -	} else {
+ -		p = v->port;
+ +	if (test_bit(vid, v->vlan_bitmap)) {
+ +		__vlan_add_flags(v, vid, flags);
+ +		return 0;
+ +	}
+ +
+ +	if (v->port_idx) {
+ +		p = v->parent.port;
+  		br = p->br;
+  		dev = p->dev;
+ -		tbl = &p->vlgrp->vlan_hash;
+ +	} else {
+ +		br = v->parent.br;
+ +		dev = br->dev;
+  	}
+  
+ -	if (p) {
+ -		u16 master_flags = flags;
+ -
+ +	/* Toggle HW filters when filtering is enabled */
+ +	if (p && p->br->vlan_enabled) {
+  		/* Add VLAN to the device filter if it is supported.
+  		 * This ensures tagged traffic enters the bridge when
+  		 * promiscuous mode is disabled by br_manage_promisc().
+diff --cc net/dsa/slave.c
+index 6ebd8fbd9285,5f65f929902e..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -171,6 -412,246 +171,249 @@@ static int dsa_slave_ioctl(struct net_d
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return a bitmask of all ports being currently bridged within a given bridge
++  * device. Note that on leave, the mask will still return the bitmask of ports
++  * currently bridged, prior to port removal, and this is exactly what we want.
++  */
++ static u32 dsa_slave_br_port_mask(struct dsa_switch *ds,
++ 				  struct net_device *bridge)
++ {
++ 	struct dsa_slave_priv *p;
++ 	unsigned int port;
++ 	u32 mask = 0;
++ 
++ 	for (port = 0; port < DSA_MAX_PORTS; port++) {
++ 		if (!dsa_is_port_initialized(ds, port))
++ 			continue;
++ 
++ 		p = netdev_priv(ds->ports[port]);
++ 
++ 		if (ds->ports[port]->priv_flags & IFF_BRIDGE_PORT &&
++ 		    p->bridge_dev == bridge)
++ 			mask |= 1 << port;
++ 	}
++ 
++ 	return mask;
++ }
++ 
++ static int dsa_slave_stp_update(struct net_device *dev, u8 state)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->drv->port_stp_update)
++ 		ret = ds->drv->port_stp_update(ds, p->port, state);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_attr_set(struct net_device *dev,
++ 				   struct switchdev_attr *attr,
++ 				   struct switchdev_trans *trans)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret;
++ 
++ 	switch (attr->id) {
++ 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
++ 		if (switchdev_trans_ph_prepare(trans))
++ 			ret = ds->drv->port_stp_update ? 0 : -EOPNOTSUPP;
++ 		else
++ 			ret = ds->drv->port_stp_update(ds, p->port,
++ 						       attr->u.stp_state);
++ 		break;
++ 	default:
++ 		ret = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_obj_add(struct net_device *dev,
++ 				  const struct switchdev_obj *obj,
++ 				  struct switchdev_trans *trans)
++ {
++ 	int err;
++ 
++ 	/* For the prepare phase, ensure the full set of changes is feasable in
++ 	 * one go in order to signal a failure properly. If an operation is not
++ 	 * supported, return -EOPNOTSUPP.
++ 	 */
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_ID_PORT_FDB:
++ 		err = dsa_slave_port_fdb_add(dev,
++ 					     SWITCHDEV_OBJ_PORT_FDB(obj),
++ 					     trans);
++ 		break;
++ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_add(dev,
++ 					      SWITCHDEV_OBJ_PORT_VLAN(obj),
++ 					      trans);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_port_obj_del(struct net_device *dev,
++ 				  const struct switchdev_obj *obj)
++ {
++ 	int err;
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_ID_PORT_FDB:
++ 		err = dsa_slave_port_fdb_del(dev,
++ 					     SWITCHDEV_OBJ_PORT_FDB(obj));
++ 		break;
++ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_del(dev,
++ 					      SWITCHDEV_OBJ_PORT_VLAN(obj));
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_port_obj_dump(struct net_device *dev,
++ 				   struct switchdev_obj *obj,
++ 				   switchdev_obj_dump_cb_t *cb)
++ {
++ 	int err;
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_ID_PORT_FDB:
++ 		err = dsa_slave_port_fdb_dump(dev,
++ 					      SWITCHDEV_OBJ_PORT_FDB(obj),
++ 					      cb);
++ 		break;
++ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_dump(dev,
++ 					       SWITCHDEV_OBJ_PORT_VLAN(obj),
++ 					       cb);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_bridge_port_join(struct net_device *dev,
++ 				      struct net_device *br)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	p->bridge_dev = br;
++ 
++ 	if (ds->drv->port_join_bridge)
++ 		ret = ds->drv->port_join_bridge(ds, p->port,
++ 						dsa_slave_br_port_mask(ds, br));
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_bridge_port_leave(struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 
++ 	if (ds->drv->port_leave_bridge)
++ 		ret = ds->drv->port_leave_bridge(ds, p->port,
++ 						 dsa_slave_br_port_mask(ds, p->bridge_dev));
++ 
++ 	p->bridge_dev = NULL;
++ 
++ 	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
++ 	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
++ 	 */
++ 	dsa_slave_stp_update(dev, BR_STATE_FORWARDING);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_attr_get(struct net_device *dev,
++ 				   struct switchdev_attr *attr)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 
++ 	switch (attr->id) {
++ 	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
++ 		attr->u.ppid.id_len = sizeof(ds->index);
++ 		memcpy(&attr->u.ppid.id, &ds->index, attr->u.ppid.id_len);
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline netdev_tx_t dsa_netpoll_send_skb(struct dsa_slave_priv *p,
++ 					       struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ 	if (p->netpoll)
++ 		netpoll_send_skb(p->netpoll, skb);
++ #else
++ 	BUG();
++ #endif
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static netdev_tx_t dsa_slave_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct sk_buff *nskb;
++ 
++ 	dev->stats.tx_packets++;
++ 	dev->stats.tx_bytes += skb->len;
++ 
++ 	/* Transmit function may have to reallocate the original SKB */
++ 	nskb = p->xmit(skb, dev);
++ 	if (!nskb)
++ 		return NETDEV_TX_OK;
++ 
++ 	/* SKB for netpoll still need to be mangled with the protocol-specific
++ 	 * tag to be successfully transmitted
++ 	 */
++ 	if (unlikely(netpoll_tx_running(dev)))
++ 		return dsa_netpoll_send_skb(p, nskb);
++ 
++ 	/* Queue the SKB for transmission on the parent interface, but
++ 	 * do not modify its EtherType
++ 	 */
++ 	nskb->dev = p->parent->dst->master_netdev;
++ 	dev_queue_xmit(nskb);
++ 
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static struct sk_buff *dsa_slave_notag_xmit(struct sk_buff *skb,
++ 					    struct net_device *dev)
++ {
++ 	/* Just return the original SKB */
++ 	return skb;
++ }
++ 
+++>>>>>>> 9e8f4a548ab4 (switchdev: push object ID back to object structure)
+  
+  /* ethtool operations *******************************************************/
+  static int
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br_fdb.c
+* Unmerged path net/bridge/br_vlan.c
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
