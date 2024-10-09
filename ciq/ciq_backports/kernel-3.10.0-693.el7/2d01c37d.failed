@@ -1,0 +1,298 @@
+IB/hfi1: Add irq affinity notification handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tadeusz Struk <tadeusz.struk@intel.com>
+commit 2d01c37d7501decfdcee2ff7ef32a017b7276a34
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2d01c37d.failed
+
+This patch adds an irq affinity notification handler.
+When a user changes interrupt affinity settings for an sdma engine,
+the driver needs to make changes to its internal sde structures and
+also update the affinity_hint.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Reviewed-by: Jianxin Xiong <jianxin.xiong@intel.com>
+	Signed-off-by: Tadeusz Struk <tadeusz.struk@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 2d01c37d7501decfdcee2ff7ef32a017b7276a34)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/affinity.c
+diff --cc drivers/infiniband/hw/hfi1/affinity.c
+index 1ca2154de24c,a26a9a0bfc41..000000000000
+--- a/drivers/infiniband/hw/hfi1/affinity.c
++++ b/drivers/infiniband/hw/hfi1/affinity.c
+@@@ -141,43 -233,183 +142,147 @@@ void hfi1_dev_affinity_init(struct hfi1
+  	local_mask = cpumask_of_node(dd->node);
+  	if (cpumask_first(local_mask) >= nr_cpu_ids)
+  		local_mask = topology_core_cpumask(0);
+ -
+ -	mutex_lock(&node_affinity.lock);
+ -	entry = node_affinity_lookup(dd->node);
+ -
+ -	/*
+ -	 * If this is the first time this NUMA node's affinity is used,
+ -	 * create an entry in the global affinity structure and initialize it.
+ -	 */
+ -	if (!entry) {
+ -		entry = node_affinity_allocate(node);
+ -		if (!entry) {
+ -			dd_dev_err(dd,
+ -				   "Unable to allocate global affinity node\n");
+ -			mutex_unlock(&node_affinity.lock);
+ -			return -ENOMEM;
+ +	/* Use the "real" cpu mask of this node as the default */
+ +	cpumask_and(&info->def_intr.mask, &info->real_cpu_mask, local_mask);
+ +
+ +	/*  fill in the receive list */
+ +	possible = cpumask_weight(&info->def_intr.mask);
+ +	curr_cpu = cpumask_first(&info->def_intr.mask);
+ +	if (possible == 1) {
+ +		/*  only one CPU, everyone will use it */
+ +		cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +	} else {
+ +		/*
+ +		 * Retain the first CPU in the default list for the control
+ +		 * context.
+ +		 */
+ +		curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +		/*
+ +		 * Remove the remaining kernel receive queues from
+ +		 * the default list and add them to the receive list.
+ +		 */
+ +		for (i = 0; i < dd->n_krcv_queues - 1; i++) {
+ +			cpumask_clear_cpu(curr_cpu, &info->def_intr.mask);
+ +			cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +			curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +			if (curr_cpu >= nr_cpu_ids)
+ +				break;
+  		}
+ -		init_cpu_mask_set(&entry->def_intr);
+ -		init_cpu_mask_set(&entry->rcv_intr);
+ -		cpumask_clear(&entry->general_intr_mask);
+ -		/* Use the "real" cpu mask of this node as the default */
+ -		cpumask_and(&entry->def_intr.mask, &node_affinity.real_cpu_mask,
+ -			    local_mask);
+ -
+ -		/* fill in the receive list */
+ -		possible = cpumask_weight(&entry->def_intr.mask);
+ -		curr_cpu = cpumask_first(&entry->def_intr.mask);
+ -
+ -		if (possible == 1) {
+ -			/* only one CPU, everyone will use it */
+ -			cpumask_set_cpu(curr_cpu, &entry->rcv_intr.mask);
+ -			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
+ -		} else {
+ -			/*
+ -			 * The general/control context will be the first CPU in
+ -			 * the default list, so it is removed from the default
+ -			 * list and added to the general interrupt list.
+ -			 */
+ -			cpumask_clear_cpu(curr_cpu, &entry->def_intr.mask);
+ -			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
+ -			curr_cpu = cpumask_next(curr_cpu,
+ -						&entry->def_intr.mask);
+ -
+ -			/*
+ -			 * Remove the remaining kernel receive queues from
+ -			 * the default list and add them to the receive list.
+ -			 */
+ -			for (i = 0;
+ -			     i < (dd->n_krcv_queues - 1) *
+ -				  hfi1_per_node_cntr[dd->node];
+ -			     i++) {
+ -				cpumask_clear_cpu(curr_cpu,
+ -						  &entry->def_intr.mask);
+ -				cpumask_set_cpu(curr_cpu,
+ -						&entry->rcv_intr.mask);
+ -				curr_cpu = cpumask_next(curr_cpu,
+ -							&entry->def_intr.mask);
+ -				if (curr_cpu >= nr_cpu_ids)
+ -					break;
+ -			}
+ +	}
+  
+ -			/*
+ -			 * If there ends up being 0 CPU cores leftover for SDMA
+ -			 * engines, use the same CPU cores as general/control
+ -			 * context.
+ -			 */
+ -			if (cpumask_weight(&entry->def_intr.mask) == 0)
+ -				cpumask_copy(&entry->def_intr.mask,
+ -					     &entry->general_intr_mask);
+ -		}
+ +	cpumask_copy(&info->proc.mask, cpu_online_mask);
+ +}
+  
+ -		node_affinity_add_tail(entry);
+ -	}
+ -	mutex_unlock(&node_affinity.lock);
+ -	return 0;
+++<<<<<<< HEAD
+ +void hfi1_dev_affinity_free(struct hfi1_devdata *dd)
+ +{
+ +	kfree(dd->affinity);
+  }
+  
+ +int hfi1_get_irq_affinity(struct hfi1_devdata *dd, struct hfi1_msix_entry *msix)
+++=======
++ /*
++  * Function updates the irq affinity hint for msix after it has been changed
++  * by the user using the /proc/irq interface. This function only accepts
++  * one cpu in the mask.
++  */
++ static void hfi1_update_sdma_affinity(struct hfi1_msix_entry *msix, int cpu)
++ {
++ 	struct sdma_engine *sde = msix->arg;
++ 	struct hfi1_devdata *dd = sde->dd;
++ 	struct hfi1_affinity_node *entry;
++ 	struct cpu_mask_set *set;
++ 	int i, old_cpu;
++ 
++ 	if (cpu > num_online_cpus() || cpu == sde->cpu)
++ 		return;
++ 
++ 	mutex_lock(&node_affinity.lock);
++ 	entry = node_affinity_lookup(dd->node);
++ 	if (!entry)
++ 		goto unlock;
++ 
++ 	old_cpu = sde->cpu;
++ 	sde->cpu = cpu;
++ 	cpumask_clear(&msix->mask);
++ 	cpumask_set_cpu(cpu, &msix->mask);
++ 	dd_dev_dbg(dd, "IRQ vector: %u, type %s engine %u -> cpu: %d\n",
++ 		   msix->msix.vector, irq_type_names[msix->type],
++ 		   sde->this_idx, cpu);
++ 	irq_set_affinity_hint(msix->msix.vector, &msix->mask);
++ 
++ 	/*
++ 	 * Set the new cpu in the hfi1_affinity_node and clean
++ 	 * the old cpu if it is not used by any other IRQ
++ 	 */
++ 	set = &entry->def_intr;
++ 	cpumask_set_cpu(cpu, &set->mask);
++ 	cpumask_set_cpu(cpu, &set->used);
++ 	for (i = 0; i < dd->num_msix_entries; i++) {
++ 		struct hfi1_msix_entry *other_msix;
++ 
++ 		other_msix = &dd->msix_entries[i];
++ 		if (other_msix->type != IRQ_SDMA || other_msix == msix)
++ 			continue;
++ 
++ 		if (cpumask_test_cpu(old_cpu, &other_msix->mask))
++ 			goto unlock;
++ 	}
++ 	cpumask_clear_cpu(old_cpu, &set->mask);
++ 	cpumask_clear_cpu(old_cpu, &set->used);
++ unlock:
++ 	mutex_unlock(&node_affinity.lock);
++ }
++ 
++ static void hfi1_irq_notifier_notify(struct irq_affinity_notify *notify,
++ 				     const cpumask_t *mask)
++ {
++ 	int cpu = cpumask_first(mask);
++ 	struct hfi1_msix_entry *msix = container_of(notify,
++ 						    struct hfi1_msix_entry,
++ 						    notify);
++ 
++ 	/* Only one CPU configuration supported currently */
++ 	hfi1_update_sdma_affinity(msix, cpu);
++ }
++ 
++ static void hfi1_irq_notifier_release(struct kref *ref)
++ {
++ 	/*
++ 	 * This is required by affinity notifier. We don't have anything to
++ 	 * free here.
++ 	 */
++ }
++ 
++ static void hfi1_setup_sdma_notifier(struct hfi1_msix_entry *msix)
++ {
++ 	struct irq_affinity_notify *notify = &msix->notify;
++ 
++ 	notify->irq = msix->msix.vector;
++ 	notify->notify = hfi1_irq_notifier_notify;
++ 	notify->release = hfi1_irq_notifier_release;
++ 
++ 	if (irq_set_affinity_notifier(notify->irq, notify))
++ 		pr_err("Failed to register sdma irq affinity notifier for irq %d\n",
++ 		       notify->irq);
++ }
++ 
++ static void hfi1_cleanup_sdma_notifier(struct hfi1_msix_entry *msix)
++ {
++ 	struct irq_affinity_notify *notify = &msix->notify;
++ 
++ 	if (irq_set_affinity_notifier(notify->irq, NULL))
++ 		pr_err("Failed to cleanup sdma irq affinity notifier for irq %d\n",
++ 		       notify->irq);
++ }
++ 
++ /*
++  * Function sets the irq affinity for msix.
++  * It *must* be called with node_affinity.lock held.
++  */
++ static int get_irq_affinity(struct hfi1_devdata *dd,
++ 			    struct hfi1_msix_entry *msix)
+++>>>>>>> 2d01c37d7501 (IB/hfi1: Add irq affinity notification handler)
+  {
+  	int ret;
+  	cpumask_var_t diff;
+@@@ -235,19 -468,8 +340,9 @@@
+  		cpumask_andnot(diff, &set->mask, &set->used);
+  		cpu = cpumask_first(diff);
+  		cpumask_set_cpu(cpu, &set->used);
+ +		spin_unlock(&dd->affinity->lock);
+  	}
+  
+- 	switch (msix->type) {
+- 	case IRQ_SDMA:
+- 		sde->cpu = cpu;
+- 		break;
+- 	case IRQ_GENERAL:
+- 	case IRQ_RCVCTXT:
+- 	case IRQ_OTHER:
+- 		break;
+- 	}
+- 
+  	cpumask_set_cpu(cpu, &msix->mask);
+  	dd_dev_info(dd, "IRQ vector: %u, type %s %s -> cpu: %d\n",
+  		    msix->msix.vector, irq_type_names[msix->type],
+@@@ -266,8 -503,15 +366,14 @@@ void hfi1_put_irq_affinity(struct hfi1_
+  
+  	switch (msix->type) {
+  	case IRQ_SDMA:
+++<<<<<<< HEAD
+++=======
++ 		set = &entry->def_intr;
++ 		hfi1_cleanup_sdma_notifier(msix);
++ 		break;
+++>>>>>>> 2d01c37d7501 (IB/hfi1: Add irq affinity notification handler)
+  	case IRQ_GENERAL:
+ -		/* Don't do accounting for general contexts */
+ +		set = &dd->affinity->def_intr;
+  		break;
+  	case IRQ_RCVCTXT:
+  		rcd = (struct hfi1_ctxtdata *)msix->arg;
+* Unmerged path drivers/infiniband/hw/hfi1/affinity.c
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 28b0920204a0..0d650c638267 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -531,6 +531,7 @@ struct hfi1_msix_entry {
+ 	void *arg;
+ 	char name[MAX_NAME_SIZE];
+ 	cpumask_t mask;
++	struct irq_affinity_notify notify;
+ };
+ 
+ /* per-SL CCA information */
