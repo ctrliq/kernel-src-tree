@@ -1,0 +1,217 @@
+netvsc: avoid race with callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 6de38af611ca81a970965c06231cd2d5f30b2566
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6de38af6.failed
+
+Change the argument to channel callback from the channel pointer
+to the internal data structure containing per-channel info.
+This avoids any possible races when callback happens during
+initialization and makes IRQ code simpler.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6de38af611ca81a970965c06231cd2d5f30b2566)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/netvsc.c
+index 2adfe0ec4fe2,0a2e9bd98d2c..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -1237,98 -1198,64 +1237,107 @@@ static void netvsc_process_raw_pkt(stru
+  			   desc->type, request_id);
+  		break;
+  	}
+ -
+ -	return 0;
+ -}
+ -
+ -static struct hv_device *netvsc_channel_to_device(struct vmbus_channel *channel)
+ -{
+ -	struct vmbus_channel *primary = channel->primary_channel;
+ -
+ -	return primary ? primary->device_obj : channel->device_obj;
+  }
+  
+ -int netvsc_poll(struct napi_struct *napi, int budget)
+ +void netvsc_channel_cb(void *context)
+  {
+ -	struct netvsc_channel *nvchan
+ -		= container_of(napi, struct netvsc_channel, napi);
+ -	struct vmbus_channel *channel = nvchan->channel;
+ -	struct hv_device *device = netvsc_channel_to_device(channel);
+++<<<<<<< HEAD
+ +	int ret;
+ +	struct vmbus_channel *channel = (struct vmbus_channel *)context;
+  	u16 q_idx = channel->offermsg.offer.sub_channel_index;
+ -	struct net_device *ndev = hv_get_drvdata(device);
+ -	struct netvsc_device *net_device = net_device_to_netvsc_device(ndev);
+ -	const struct vmpacket_descriptor *desc;
+ -	int work_done = 0;
+ +	struct hv_device *device;
+ +	struct netvsc_device *net_device;
+ +	u32 bytes_recvd;
+ +	u64 request_id;
+ +	struct vmpacket_descriptor *desc;
+ +	unsigned char *buffer;
+ +	int bufferlen = NETVSC_PACKET_SIZE;
+ +	struct net_device *ndev;
+ +	bool need_to_commit = false;
+  
+ -	desc = hv_pkt_iter_first(channel);
+ -	while (desc) {
+ -		int count;
+ +	if (channel->primary_channel != NULL)
+ +		device = channel->primary_channel->device_obj;
+ +	else
+ +		device = channel->device_obj;
+  
+ -		count = netvsc_process_raw_pkt(device, channel, net_device,
+ -					       ndev, desc->trans_id, desc);
+ -		work_done += count;
+ -		desc = __hv_pkt_iter_next(channel, desc);
+ +	net_device = get_inbound_net_device(device);
+ +	if (!net_device)
+ +		return;
+ +	ndev = hv_get_drvdata(device);
+ +	buffer = get_per_channel_state(channel);
+ +
+ +	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+ +	init_cached_read_index(channel);
+ +
+ +	do {
+ +		desc = get_next_pkt_raw(channel);
+ +		if (desc != NULL) {
+ +			netvsc_process_raw_pkt(device,
+ +					       channel,
+ +					       net_device,
+ +					       ndev,
+ +					       desc->trans_id,
+ +					       desc);
+ +
+ +			put_pkt_raw(channel, desc);
+ +			need_to_commit = true;
+ +			continue;
+ +		}
+ +		if (need_to_commit) {
+ +			need_to_commit = false;
+ +			commit_rd_index(channel);
+ +		}
+  
+ -		/* If receive packet budget is exhausted, reschedule */
+ -		if (work_done >= budget) {
+ -			work_done = budget;
+ -			break;
+ +		ret = vmbus_recvpacket_raw(channel, buffer, bufferlen,
+ +					   &bytes_recvd, &request_id);
+ +		if (ret == 0) {
+ +			if (bytes_recvd > 0) {
+ +				desc = (struct vmpacket_descriptor *)buffer;
+ +				netvsc_process_raw_pkt(device,
+ +						       channel,
+ +						       net_device,
+ +						       ndev,
+ +						       request_id,
+ +						       desc);
+ +			} else {
+ +				/*
+ +				 * We are done for this pass.
+ +				 */
+ +				break;
+ +			}
+ +
+ +		} else if (ret == -ENOBUFS) {
+ +			if (bufferlen > NETVSC_PACKET_SIZE)
+ +				kfree(buffer);
+ +			/* Handle large packet */
+ +			buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+ +			if (buffer == NULL) {
+ +				/* Try again next time around */
+ +				netdev_err(ndev,
+ +					   "unable to allocate buffer of size "
+ +					   "(%d)!!\n", bytes_recvd);
+ +				break;
+ +			}
+ +
+ +			bufferlen = bytes_recvd;
+  		}
+ -	}
+ -	hv_pkt_iter_close(channel);
+  
+ -	/* If ring is empty and NAPI is not doing polling */
+ -	if (work_done < budget &&
+ -	    napi_complete_done(napi, work_done) &&
+ -	    hv_end_read(&channel->inbound) != 0)
+ -		napi_reschedule(napi);
+ +		init_cached_read_index(channel);
+  
+ -	netvsc_chk_recv_comp(net_device, channel, q_idx);
+ -	return work_done;
+ -}
+ +	} while (1);
+  
+ -void netvsc_channel_cb(void *context)
+ -{
+ +	if (bufferlen > NETVSC_PACKET_SIZE)
+ +		kfree(buffer);
+ +
+ +	netvsc_chk_recv_comp(net_device, channel, q_idx);
+++=======
++ 	struct netvsc_channel *nvchan = context;
++ 
++ 	/* disable interupts from host */
++ 	hv_begin_read(&nvchan->channel->inbound);
++ 
++ 	napi_schedule(&nvchan->napi);
+++>>>>>>> 6de38af611ca (netvsc: avoid race with callback)
+  }
+  
+  /*
+diff --cc drivers/net/hyperv/rndis_filter.c
+index ba9979a91e02,382b9a62e3c4..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -921,18 -1003,21 +922,33 @@@ static void netvsc_sc_open(struct vmbus
+  	if (chn_index >= nvscdev->num_chn)
+  		return;
+  
+++<<<<<<< HEAD
+ +	set_per_channel_state(new_sc, nvscdev->sub_cb_buf + (chn_index - 1) *
+ +			      NETVSC_PACKET_SIZE);
+ +
+ +	nvscdev->mrc[chn_index].buf = vzalloc(NETVSC_RECVSLOT_MAX *
+ +					      sizeof(struct recv_comp_data));
+++=======
++ 	nvchan = nvscdev->chan_table + chn_index;
++ 	nvchan->mrc.buf
++ 		= vzalloc(NETVSC_RECVSLOT_MAX * sizeof(struct recv_comp_data));
+++>>>>>>> 6de38af611ca (netvsc: avoid race with callback)
++ 
++ 	if (!nvchan->mrc.buf)
++ 		return;
+  
+  	ret = vmbus_open(new_sc, nvscdev->ring_size * PAGE_SIZE,
+  			 nvscdev->ring_size * PAGE_SIZE, NULL, 0,
+- 			 netvsc_channel_cb, new_sc);
++ 			 netvsc_channel_cb, nvchan);
+  
+  	if (ret == 0)
+++<<<<<<< HEAD
+ +		nvscdev->chn_table[chn_index] = new_sc;
+++=======
++ 		nvchan->channel = new_sc;
++ 
++ 	napi_enable(&nvchan->napi);
+++>>>>>>> 6de38af611ca (netvsc: avoid race with callback)
+  
+  	spin_lock_irqsave(&nvscdev->sc_lock, flags);
+  	nvscdev->num_sc_offered--;
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/rndis_filter.c
