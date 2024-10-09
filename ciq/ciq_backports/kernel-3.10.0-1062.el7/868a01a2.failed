@@ -1,0 +1,194 @@
+net/mlx5e: Introducing new statistics rwlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Introducing new statistics rwlock (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.24%
+commit-author Shalom Lagziel <shaloml@mellanox.com>
+commit 868a01a27d80a59e719f0c369d1b26b923fc7674
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/868a01a2.failed
+
+Introduce a new read/write lock that will protect statistics gathering from
+netdev channels configuration changes.
+e.g. when channels are being replaced (increase/decrease number of rings)
+prevent statistic gathering (ndo_get_stats64) to read the statistics of
+in-active channels (channels that are being closed).
+
+Plus update channels software statistics on the fly when calling
+ndo_get_stats64, and remove it from stats periodic work.
+
+Fixes: 9218b44dcc05 ("net/mlx5e: Statistics handling refactoring")
+	Signed-off-by: Shalom Lagziel <shaloml@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 868a01a27d80a59e719f0c369d1b26b923fc7674)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 8721ed97ba96,323f2af4200b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@@ -101,18 -108,23 +101,29 @@@ static int mlx5e_grp_sw_fill_stats(stru
+  	return idx;
+  }
+  
+- static void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
++ void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
+  {
+  	struct mlx5e_sw_stats temp, *s = &temp;
+ -	struct mlx5e_rq_stats *rq_stats;
+ -	struct mlx5e_sq_stats *sq_stats;
+ -	struct mlx5e_ch_stats *ch_stats;
+ -	int i, j;
+ +	int i;
+  
+  	memset(s, 0, sizeof(*s));
+++<<<<<<< HEAD
+ +	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++) {
+ +		struct mlx5e_channel_stats *channel_stats =
+ +			&priv->channel_stats[i];
+ +		struct mlx5e_rq_stats *rq_stats = &channel_stats->rq;
+ +		struct mlx5e_ch_stats *ch_stats = &channel_stats->ch;
+ +		int j;
+++=======
++ 	read_lock(&priv->stats_lock);
++ 	if (!priv->channels_active)
++ 		goto out;
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		struct mlx5e_channel *c = priv->channels.c[i];
++ 
++ 		rq_stats = &c->rq.stats;
++ 		ch_stats = &c->stats;
+++>>>>>>> 868a01a27d80 (net/mlx5e: Introducing new statistics rwlock)
+  
+  		s->rx_packets	+= rq_stats->packets;
+  		s->rx_bytes	+= rq_stats->bytes;
+@@@ -160,10 -173,13 +171,12 @@@
+  		}
+  	}
+  
+ +	s->link_down_events_phy = MLX5_GET(ppcnt_reg,
+ +				priv->stats.pport.phy_counters,
+ +				counter_set.phys_layer_cntrs.link_down_events);
+  	memcpy(&priv->stats.sw, s, sizeof(*s));
++ out:
++ 	read_unlock(&priv->stats_lock);
+  }
+  
+  static const struct counter_desc q_stats_desc[] = {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883..c4c8eb275861 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -764,6 +764,8 @@ struct mlx5e_priv {
+ 	struct mutex               state_lock; /* Protects Interface state */
+ 	struct mlx5e_rq            drop_rq;
+ 
++	rwlock_t                   stats_lock; /* Protects channels SW stats updates */
++	bool                       channels_active;
+ 	struct mlx5e_channels      channels;
+ 	u32                        tisn[MLX5E_MAX_NUM_TC];
+ 	struct mlx5e_rqt           indir_rqt;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a11f70af9727..499bb7e847bc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2512,6 +2512,9 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
+ 
+ 	mlx5e_build_tx2sq_maps(priv);
+ 	mlx5e_activate_channels(&priv->channels);
++	write_lock(&priv->stats_lock);
++	priv->channels_active = true;
++	write_unlock(&priv->stats_lock);
+ 	netif_tx_start_all_queues(priv->netdev);
+ 
+ 	if (MLX5_ESWITCH_MANAGER(priv->mdev))
+@@ -2533,6 +2536,9 @@ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
+ 	 */
+ 	netif_tx_stop_all_queues(priv->netdev);
+ 	netif_tx_disable(priv->netdev);
++	write_lock(&priv->stats_lock);
++	priv->channels_active = false;
++	write_unlock(&priv->stats_lock);
+ 	mlx5e_deactivate_channels(&priv->channels);
+ }
+ 
+@@ -3077,6 +3083,7 @@ mlx5e_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ 		stats->tx_packets = PPORT_802_3_GET(pstats, a_frames_transmitted_ok);
+ 		stats->tx_bytes   = PPORT_802_3_GET(pstats, a_octets_transmitted_ok);
+ 	} else {
++		mlx5e_grp_sw_update_stats(priv);
+ 		stats->rx_packets = sstats->rx_packets;
+ 		stats->rx_bytes   = sstats->rx_bytes;
+ 		stats->tx_packets = sstats->tx_packets;
+@@ -4113,6 +4120,7 @@ static void mlx5e_build_nic_netdev_priv(struct mlx5_core_dev *mdev,
+ 			       profile->max_nch(mdev), netdev->mtu);
+ 
+ 	mutex_init(&priv->state_lock);
++	rwlock_init(&priv->stats_lock);
+ 
+ 	INIT_WORK(&priv->update_carrier_work, mlx5e_update_carrier_work);
+ 	INIT_WORK(&priv->set_rx_mode_work, mlx5e_set_rx_mode_work);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 7aafa931adf7..cde6425dcec5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -130,6 +130,10 @@ static void mlx5e_rep_update_sw_counters(struct mlx5e_priv *priv)
+ 	struct mlx5e_sq_stats *sq_stats;
+ 	int i, j;
+ 
++	read_lock(&priv->stats_lock);
++	if (!priv->channels_active)
++	        goto out;
++
+ 	memset(s, 0, sizeof(*s));
+ 	for (i = 0; i < priv->channels.num; i++) {
+ 		struct mlx5e_channel *c = priv->channels.c[i];
+@@ -146,12 +150,8 @@ static void mlx5e_rep_update_sw_counters(struct mlx5e_priv *priv)
+ 			s->tx_bytes		+= sq_stats->bytes;
+ 		}
+ 	}
+-}
+-
+-static void mlx5e_rep_update_stats(struct mlx5e_priv *priv)
+-{
+-	mlx5e_rep_update_sw_counters(priv);
+-	mlx5e_rep_update_hw_counters(priv);
++out:
++	read_unlock(&priv->stats_lock);
+ }
+ 
+ static void mlx5e_rep_get_ethtool_stats(struct net_device *dev,
+@@ -875,6 +875,8 @@ mlx5e_get_sw_stats64(const struct net_device *dev,
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 	struct mlx5e_sw_stats *sstats = &priv->stats.sw;
+ 
++	mlx5e_rep_update_sw_counters(priv);
++
+ 	stats->rx_packets = sstats->rx_packets;
+ 	stats->rx_bytes   = sstats->rx_bytes;
+ 	stats->tx_packets = sstats->tx_packets;
+@@ -1065,7 +1067,7 @@ static const struct mlx5e_profile mlx5e_rep_profile = {
+ 	.cleanup_rx		= mlx5e_cleanup_rep_rx,
+ 	.init_tx		= mlx5e_init_rep_tx,
+ 	.cleanup_tx		= mlx5e_cleanup_nic_tx,
+-	.update_stats           = mlx5e_rep_update_stats,
++	.update_stats           = mlx5e_rep_update_hw_counters,
+ 	.max_nch		= mlx5e_get_rep_max_num_channels,
+ 	.update_carrier		= NULL,
+ 	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 43dc808684c9..105e8a26b7f7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -231,4 +231,6 @@ struct mlx5e_stats_grp {
+ extern const struct mlx5e_stats_grp mlx5e_stats_grps[];
+ extern const int mlx5e_num_stats_grps;
+ 
++void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv);
++
+ #endif /* __MLX5_EN_STATS_H__ */
