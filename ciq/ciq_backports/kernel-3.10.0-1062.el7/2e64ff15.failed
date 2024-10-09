@@ -1,0 +1,220 @@
+fuse: continue to send FUSE_RELEASEDIR when FUSE_OPEN returns ENOSYS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Chad Austin <chadaustin@fb.com>
+commit 2e64ff154ce6ce9a8dc0f9556463916efa6ff460
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2e64ff15.failed
+
+When FUSE_OPEN returns ENOSYS, the no_open bit is set on the connection.
+
+Because the FUSE_RELEASE and FUSE_RELEASEDIR paths share code, this
+incorrectly caused the FUSE_RELEASEDIR request to be dropped and never sent
+to userspace.
+
+Pass an isdir bool to distinguish between FUSE_RELEASE and FUSE_RELEASEDIR
+inside of fuse_file_put.
+
+Fixes: 7678ac50615d ("fuse: support clients that don't implement 'open'")
+	Cc: <stable@vger.kernel.org> # v3.14
+	Signed-off-by: Chad Austin <chadaustin@fb.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 2e64ff154ce6ce9a8dc0f9556463916efa6ff460)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/file.c
+diff --cc fs/fuse/file.c
+index d851e606d416,ffaffe18352a..000000000000
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@@ -89,45 -84,17 +89,45 @@@ struct fuse_file *fuse_file_get(struct 
+  	return ff;
+  }
+  
+ +static void fuse_release_async(struct work_struct *work)
+ +{
+ +	struct fuse_req *req;
+ +	struct fuse_conn *fc;
+ +	struct path path;
+ +
+ +	req = container_of(work, struct fuse_req, misc.release.work);
+ +	path = req->misc.release.path;
+ +	fc = get_fuse_conn(path.dentry->d_inode);
+ +
+ +	fuse_put_request(fc, req);
+ +	path_put(&path);
+ +}
+ +
+  static void fuse_release_end(struct fuse_conn *fc, struct fuse_req *req)
+  {
+ -	iput(req->misc.release.inode);
+ +	if (fc->destroy_req) {
+ +		/*
+ +		 * If this is a fuseblk mount, then it's possible that
+ +		 * releasing the path will result in releasing the
+ +		 * super block and sending the DESTROY request.  If
+ +		 * the server is single threaded, this would hang.
+ +		 * For this reason do the path_put() in a separate
+ +		 * thread.
+ +		 */
+ +		atomic_inc(&req->count);
+ +		INIT_WORK(&req->misc.release.work, fuse_release_async);
+ +		schedule_work(&req->misc.release.work);
+ +	} else {
+ +		path_put(&req->misc.release.path);
+ +	}
+  }
+  
+- static void fuse_file_put(struct fuse_file *ff, bool sync)
++ static void fuse_file_put(struct fuse_file *ff, bool sync, bool isdir)
+  {
+ -	if (refcount_dec_and_test(&ff->count)) {
+ +	if (atomic_dec_and_test(&ff->count)) {
+  		struct fuse_req *req = ff->reserved_req;
+  
+- 		if (ff->fc->no_open) {
++ 		if (ff->fc->no_open && !isdir) {
+  			/*
+  			 * Drop the release request when client does not
+  			 * implement 'open'
+@@@ -277,16 -247,12 +277,22 @@@ static void fuse_prepare_release(struc
+  	req->in.args[0].value = inarg;
+  }
+  
+- void fuse_release_common(struct file *file, int opcode)
++ void fuse_release_common(struct file *file, bool isdir)
+  {
+++<<<<<<< HEAD
+ +	struct fuse_file *ff;
+ +	struct fuse_req *req;
+++=======
++ 	struct fuse_file *ff = file->private_data;
++ 	struct fuse_req *req = ff->reserved_req;
++ 	int opcode = isdir ? FUSE_RELEASEDIR : FUSE_RELEASE;
+++>>>>>>> 2e64ff154ce6 (fuse: continue to send FUSE_RELEASEDIR when FUSE_OPEN returns ENOSYS)
+ +
+ +	ff = file->private_data;
+ +	if (unlikely(!ff))
+ +		return;
+  
+ +	req = ff->reserved_req;
+  	fuse_prepare_release(ff, file->f_flags, opcode);
+  
+  	if (ff->flock) {
+@@@ -318,7 -283,13 +324,17 @@@ static int fuse_open(struct inode *inod
+  
+  static int fuse_release(struct inode *inode, struct file *file)
+  {
+++<<<<<<< HEAD
+ +	fuse_release_common(file, FUSE_RELEASE);
+++=======
++ 	struct fuse_conn *fc = get_fuse_conn(inode);
++ 
++ 	/* see fuse_vma_close() for !writeback_cache case */
++ 	if (fc->writeback_cache)
++ 		write_inode_now(inode, 1);
++ 
++ 	fuse_release_common(file, false);
+++>>>>>>> 2e64ff154ce6 (fuse: continue to send FUSE_RELEASEDIR when FUSE_OPEN returns ENOSYS)
+  
+  	/* return value is ignored by VFS */
+  	return 0;
+@@@ -326,13 -297,13 +342,21 @@@
+  
+  void fuse_sync_release(struct fuse_file *ff, int flags)
+  {
+ -	WARN_ON(refcount_read(&ff->count) > 1);
+ +	WARN_ON(atomic_read(&ff->count) > 1);
+  	fuse_prepare_release(ff, flags, FUSE_RELEASE);
+++<<<<<<< HEAD
+ +	ff->reserved_req->force = 1;
+ +	ff->reserved_req->background = 0;
+ +	fuse_request_send(ff->fc, ff->reserved_req);
+ +	fuse_put_request(ff->fc, ff->reserved_req);
+ +	kfree(ff);
+++=======
++ 	/*
++ 	 * iput(NULL) is a no-op and since the refcount is 1 and everything's
++ 	 * synchronous, we are fine with not doing igrab() here"
++ 	 */
++ 	fuse_file_put(ff, true, false);
+++>>>>>>> 2e64ff154ce6 (fuse: continue to send FUSE_RELEASEDIR when FUSE_OPEN returns ENOSYS)
+  }
+  EXPORT_SYMBOL_GPL(fuse_sync_release);
+  
+@@@ -823,10 -806,10 +847,10 @@@ static void fuse_readpages_end(struct f
+  		else
+  			SetPageError(page);
+  		unlock_page(page);
+ -		put_page(page);
+ +		page_cache_release(page);
+  	}
+  	if (req->ff)
+- 		fuse_file_put(req->ff, false);
++ 		fuse_file_put(req->ff, false, false);
+  }
+  
+  static void fuse_send_readpages(struct fuse_req *req, struct file *file)
+@@@ -1665,6 -1603,29 +1689,32 @@@ static struct fuse_file *fuse_write_fil
+  	return ff;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct fuse_file *fuse_write_file_get(struct fuse_conn *fc,
++ 					     struct fuse_inode *fi)
++ {
++ 	struct fuse_file *ff = __fuse_write_file_get(fc, fi);
++ 	WARN_ON(!ff);
++ 	return ff;
++ }
++ 
++ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
++ {
++ 	struct fuse_conn *fc = get_fuse_conn(inode);
++ 	struct fuse_inode *fi = get_fuse_inode(inode);
++ 	struct fuse_file *ff;
++ 	int err;
++ 
++ 	ff = __fuse_write_file_get(fc, fi);
++ 	err = fuse_flush_times(inode, ff);
++ 	if (ff)
++ 		fuse_file_put(ff, false, false);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 2e64ff154ce6 (fuse: continue to send FUSE_RELEASEDIR when FUSE_OPEN returns ENOSYS)
+  static int fuse_writepage_locked(struct page *page)
+  {
+  	struct address_space *mapping = page->mapping;
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 93d96ab5773a..8a42cb5b6b51 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1524,7 +1524,7 @@ static int fuse_dir_open(struct inode *inode, struct file *file)
+ 
+ static int fuse_dir_release(struct inode *inode, struct file *file)
+ {
+-	fuse_release_common(file, FUSE_RELEASEDIR);
++	fuse_release_common(file, true);
+ 
+ 	return 0;
+ }
+* Unmerged path fs/fuse/file.c
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index a6fe9fdc6997..062a588a1135 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -682,7 +682,7 @@ void fuse_sync_release(struct fuse_file *ff, int flags);
+ /**
+  * Send RELEASE or RELEASEDIR request
+  */
+-void fuse_release_common(struct file *file, int opcode);
++void fuse_release_common(struct file *file, bool isdir);
+ 
+ /**
+  * Send FSYNC or FSYNCDIR request
