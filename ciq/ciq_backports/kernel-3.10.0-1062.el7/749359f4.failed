@@ -1,0 +1,132 @@
+net/mlx5e: Change VF representors' RQ type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Change VF representors' RQ type (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.00%
+commit-author Gavi Teitz <gavi@mellanox.com>
+commit 749359f4aae624ed8fe7aed80e6b011b6e3db2ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/749359f4.failed
+
+The representors' RQ size was not large enough for them to achieve
+high enough performance, and therefore needed to be enlarged, while
+suffering a minimum hit to its memory usage. To achieve this the
+representors RQ size was increased, and its type was changed to be a
+striding RQ if it is supported.
+
+Towards that goal the following changes were made:
+
+* Extracted the sequence for setting the standard netdev's RQ parmas
+  into a function
+
+* Replaced the sequence for setting the representor's RQ params with
+  the standard sequence
+
+The impact of this change can be seen in the following measurements
+taken on a setup of a VM over a VF, connected to OVS via the VF
+representor, to an external host:
+
+Before current change:
+                     TCP Throughput [Gb/s]
+VM to external host         ~  7.2
+
+With the current change (measured with a striding RQ):
+                     TCP Throughput [Gb/s]
+VM to external host         ~ 23.5
+
+Each representor now consumes 2 [MB] of memory for its packet
+buffers.
+
+	Signed-off-by: Gavi Teitz <gavi@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 749359f4aae624ed8fe7aed80e6b011b6e3db2ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 9485092299df,fc4433e93846..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -936,9 -932,11 +934,16 @@@ static void mlx5e_build_rep_params(stru
+  	params->hard_mtu    = MLX5E_ETH_HARD_MTU;
+  	params->sw_mtu      = mtu;
+  	params->log_sq_size = MLX5E_REP_PARAMS_LOG_SQ_SIZE;
+++<<<<<<< HEAD
+ +	params->rq_wq_type  = MLX5_WQ_TYPE_LINKED_LIST;
+ +	params->log_rq_size = MLX5E_REP_PARAMS_LOG_RQ_SIZE;
+++=======
+++>>>>>>> 749359f4aae6 (net/mlx5e: Change VF representors' RQ type)
+  
++ 	/* RQ */
++ 	mlx5e_build_rq_params(mdev, params);
++ 
++ 	/* CQ moderation params */
+  	params->rx_dim_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+  	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 5ca9e1fb9630..0b55fb539052 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -1110,6 +1110,8 @@ void mlx5e_destroy_netdev(struct mlx5e_priv *priv);
+ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 			    struct mlx5e_params *params,
+ 			    u16 max_channels, u16 mtu);
++void mlx5e_build_rq_params(struct mlx5_core_dev *mdev,
++			   struct mlx5e_params *params);
+ u8 mlx5e_params_calculate_tx_min_inline(struct mlx5_core_dev *mdev);
+ void mlx5e_rx_dim_work(struct work_struct *work);
+ #endif /* __MLX5_EN_H__ */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 8552492a403a..e54142612111 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -4100,6 +4100,23 @@ static u32 mlx5e_choose_lro_timeout(struct mlx5_core_dev *mdev, u32 wanted_timeo
+ 	return MLX5_CAP_ETH(mdev, lro_timer_supported_periods[i]);
+ }
+ 
++void mlx5e_build_rq_params(struct mlx5_core_dev *mdev,
++			   struct mlx5e_params *params)
++{
++	/* Prefer Striding RQ, unless any of the following holds:
++	 * - Striding RQ configuration is not possible/supported.
++	 * - Slow PCI heuristic.
++	 * - Legacy RQ would use linear SKB while Striding RQ would use non-linear.
++	 */
++	if (!slow_pci_heuristic(mdev) &&
++	    mlx5e_striding_rq_possible(mdev, params) &&
++	    (mlx5e_rx_mpwqe_is_linear_skb(mdev, params) ||
++	     !mlx5e_rx_is_linear_skb(mdev, params)))
++		MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_STRIDING_RQ, true);
++	mlx5e_set_rq_type(mdev, params);
++	mlx5e_init_rq_type_params(mdev, params);
++}
++
+ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 			    struct mlx5e_params *params,
+ 			    u16 max_channels, u16 mtu)
+@@ -4126,18 +4143,7 @@ void mlx5e_build_nic_params(struct mlx5_core_dev *mdev,
+ 	MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS, params->rx_cqe_compress_def);
+ 
+ 	/* RQ */
+-	/* Prefer Striding RQ, unless any of the following holds:
+-	 * - Striding RQ configuration is not possible/supported.
+-	 * - Slow PCI heuristic.
+-	 * - Legacy RQ would use linear SKB while Striding RQ would use non-linear.
+-	 */
+-	if (!slow_pci_heuristic(mdev) &&
+-	    mlx5e_striding_rq_possible(mdev, params) &&
+-	    (mlx5e_rx_mpwqe_is_linear_skb(mdev, params) ||
+-	     !mlx5e_rx_is_linear_skb(mdev, params)))
+-		MLX5E_SET_PFLAG(params, MLX5E_PFLAG_RX_STRIDING_RQ, true);
+-	mlx5e_set_rq_type(mdev, params);
+-	mlx5e_init_rq_type_params(mdev, params);
++	mlx5e_build_rq_params(mdev, params);
+ 
+ 	/* HW LRO */
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
