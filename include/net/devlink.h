@@ -224,7 +224,6 @@ struct devlink_dpipe_headers {
 };
 
 struct devlink_ops {
-	size_t priv_size;
 	int (*port_type_set)(struct devlink_port *devlink_port,
 			     enum devlink_port_type port_type);
 	int (*port_split)(struct devlink *devlink, unsigned int port_index,
