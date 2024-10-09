@@ -1,0 +1,204 @@
+vfs: Don't modify inodes with a uid or gid unknown to the vfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 0bd23d09b874e53bd1a2fe2296030aa2720d7b08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0bd23d09.failed
+
+When a filesystem outside of init_user_ns is mounted it could have
+uids and gids stored in it that do not map to init_user_ns.
+
+The plan is to allow those filesystems to set i_uid to INVALID_UID and
+i_gid to INVALID_GID for unmapped uids and gids and then to handle
+that strange case in the vfs to ensure there is consistent robust
+handling of the weirdness.
+
+Upon a careful review of the vfs and filesystems about the only case
+where there is any possibility of confusion or trouble is when the
+inode is written back to disk.  In that case filesystems typically
+read the inode->i_uid and inode->i_gid and write them to disk even
+when just an inode timestamp is being updated.
+
+Which leads to a rule that is very simple to implement and understand
+inodes whose i_uid or i_gid is not valid may not be written.
+
+In dealing with access times this means treat those inodes as if the
+inode flag S_NOATIME was set.  Reads of the inodes appear safe and
+useful, but any write or modification is disallowed.  The only inode
+write that is allowed is a chown that sets the uid and gid on the
+inode to valid values.  After such a chown the inode is normal and may
+be treated as such.
+
+Denying all writes to inodes with uids or gids unknown to the vfs also
+prevents several oddball cases where corruption would have occurred
+because the vfs does not have complete information.
+
+One problem case that is prevented is attempting to use the gid of a
+directory for new inodes where the directories sgid bit is set but the
+directories gid is not mapped.
+
+Another problem case avoided is attempting to update the evm hash
+after setxattr, removexattr, and setattr.  As the evm hash includeds
+the inode->i_uid or inode->i_gid not knowning the uid or gid prevents
+a correct evm hash from being computed.  evm hash verification also
+fails when i_uid or i_gid is unknown but that is essentially harmless
+as it does not cause filesystem corruption.
+
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 0bd23d09b874e53bd1a2fe2296030aa2720d7b08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+diff --cc fs/inode.c
+index dd2c6a392a82,c0ebb97fb085..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -1662,16 -1616,23 +1662,27 @@@ void touch_atime(struct path *path
+  	struct timespec now;
+  
+  	if (inode->i_flags & S_NOATIME)
+++<<<<<<< HEAD
+ +		return;
+++=======
++ 		return false;
++ 
++ 	/* Atime updates will likely cause i_uid and i_gid to be written
++ 	 * back improprely if their true value is unknown to the vfs.
++ 	 */
++ 	if (HAS_UNMAPPED_ID(inode))
++ 		return false;
++ 
+++>>>>>>> 0bd23d09b874 (vfs: Don't modify inodes with a uid or gid unknown to the vfs)
+  	if (IS_NOATIME(inode))
+ -		return false;
+ +		return;
+  	if ((inode->i_sb->s_flags & MS_NODIRATIME) && S_ISDIR(inode->i_mode))
+ -		return false;
+ +		return;
+  
+  	if (mnt->mnt_flags & MNT_NOATIME)
+ -		return false;
+ +		return;
+  	if ((mnt->mnt_flags & MNT_NODIRATIME) && S_ISDIR(inode->i_mode))
+ -		return false;
+ +		return;
+  
+  	now = current_fs_time(inode->i_sb);
+  
+diff --git a/fs/attr.c b/fs/attr.c
+index 653e66061a36..63b5f8e8cae9 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -306,6 +306,14 @@ int notify_change(struct dentry * dentry, struct iattr * attr, struct inode **de
+ 	    !kgid_has_mapping(inode->i_sb->s_user_ns, attr->ia_gid))
+ 		return -EOVERFLOW;
+ 
++	/* Don't allow modifications of files with invalid uids or
++	 * gids unless those uids & gids are being made valid.
++	 */
++	if (!(ia_valid & ATTR_UID) && !uid_valid(inode->i_uid))
++		return -EOVERFLOW;
++	if (!(ia_valid & ATTR_GID) && !gid_valid(inode->i_gid))
++		return -EOVERFLOW;
++
+ 	error = security_inode_setattr(dentry, attr);
+ 	if (error)
+ 		return error;
+* Unmerged path fs/inode.c
+diff --git a/fs/namei.c b/fs/namei.c
+index 1abfe17bf78e..3c1dbdae5586 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -408,6 +408,14 @@ int __inode_permission(struct inode *inode, int mask)
+ 		 */
+ 		if (IS_IMMUTABLE(inode))
+ 			return -EACCES;
++
++		/*
++		 * Updating mtime will likely cause i_uid and i_gid to be
++		 * written back improperly if their true value is unknown
++		 * to the vfs.
++		 */
++		if (HAS_UNMAPPED_ID(inode))
++			return -EACCES;
+ 	}
+ 
+ 	retval = do_inode_permission(inode, mask);
+@@ -2552,10 +2560,11 @@ EXPORT_SYMBOL(__check_sticky);
+  *	c. have CAP_FOWNER capability
+  *  6. If the victim is append-only or immutable we can't do antyhing with
+  *     links pointing to it.
+- *  7. If we were asked to remove a directory and victim isn't one - ENOTDIR.
+- *  8. If we were asked to remove a non-directory and victim isn't one - EISDIR.
+- *  9. We can't remove a root or mountpoint.
+- * 10. We don't allow removal of NFS sillyrenamed files; it's handled by
++ *  7. If the victim has an unknown uid or gid we can't change the inode.
++ *  8. If we were asked to remove a directory and victim isn't one - ENOTDIR.
++ *  9. If we were asked to remove a non-directory and victim isn't one - EISDIR.
++ * 10. We can't remove a root or mountpoint.
++ * 11. We don't allow removal of NFS sillyrenamed files; it's handled by
+  *     nfs_async_unlink().
+  */
+ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
+@@ -2582,7 +2591,7 @@ static int may_delete(struct inode *dir, struct dentry *victim, bool isdir)
+ 		return -EPERM;
+ 
+ 	if (check_sticky(dir, inode) || IS_APPEND(inode) ||
+-	    IS_IMMUTABLE(inode) || IS_SWAPFILE(inode))
++	    IS_IMMUTABLE(inode) || IS_SWAPFILE(inode) || HAS_UNMAPPED_ID(inode))
+ 		return -EPERM;
+ 	if (isdir) {
+ 		if (!d_is_dir(victim))
+@@ -4108,6 +4117,13 @@ int vfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_de
+ 	 */
+ 	if (IS_APPEND(inode) || IS_IMMUTABLE(inode))
+ 		return -EPERM;
++	/*
++	 * Updating the link count will likely cause i_uid and i_gid to
++	 * be writen back improperly if their true value is unknown to
++	 * the vfs.
++	 */
++	if (HAS_UNMAPPED_ID(inode))
++		return -EPERM;
+ 	if (!dir->i_op->link)
+ 		return -EPERM;
+ 	if (S_ISDIR(inode->i_mode))
+diff --git a/fs/xattr.c b/fs/xattr.c
+index e202ad26ee33..b0137645db2c 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -39,6 +39,13 @@ xattr_permission(struct inode *inode, const char *name, int mask)
+ 	if (mask & MAY_WRITE) {
+ 		if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+ 			return -EPERM;
++		/*
++		 * Updating an xattr will likely cause i_uid and i_gid
++		 * to be writen back improperly if their true value is
++		 * unknown to the vfs.
++		 */
++		if (HAS_UNMAPPED_ID(inode))
++			return -EPERM;
+ 	}
+ 
+ 	/*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index f4c0e7616f02..817e32467170 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2019,6 +2019,11 @@ struct super_operations {
+ #define IS_WHITEOUT(inode)	(S_ISCHR(inode->i_mode) && \
+ 				 (inode)->i_rdev == WHITEOUT_DEV)
+ 
++static inline bool HAS_UNMAPPED_ID(struct inode *inode)
++{
++	return !uid_valid(inode->i_uid) || !gid_valid(inode->i_gid);
++}
++
+ /*
+  * Inode state bits.  Protected by inode->i_lock
+  *
