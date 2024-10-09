@@ -1077,6 +1077,10 @@ void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 	/* Initially, a command has no error */
 	cmd->error = 0;
 
+	if ((host->quirks2 & SDHCI_QUIRK2_STOP_WITH_TC) &&
+	    cmd->opcode == MMC_STOP_TRANSMISSION)
+		cmd->flags |= MMC_RSP_BUSY;
+
 	/* Wait max 10 ms */
 	timeout = 10;
 
@@ -2388,7 +2392,7 @@ static void sdhci_timeout_data_timer(unsigned long data)
  *                                                                           *
 \*****************************************************************************/
 
-static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask, u32 *mask)
+static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask)
 {
 	if (!host->cmd) {
 		/*
@@ -2431,11 +2435,6 @@ static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask, u32 *mask)
 		sdhci_finish_mrq(host, host->cmd->mrq);
 		return;
 	}
-
-	if ((host->quirks2 & SDHCI_QUIRK2_STOP_WITH_TC) &&
-	    !(host->cmd->flags & MMC_RSP_BUSY) && !host->data &&
-	    host->cmd->opcode == MMC_STOP_TRANSMISSION)
-		*mask &= ~SDHCI_INT_DATA_END;
 
 	if (intmask & SDHCI_INT_RESPONSE)
 		sdhci_finish_command(host);
@@ -2659,8 +2658,7 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 		}
 
 		if (intmask & SDHCI_INT_CMD_MASK)
-			sdhci_cmd_irq(host, intmask & SDHCI_INT_CMD_MASK,
-				      &intmask);
+			sdhci_cmd_irq(host, intmask & SDHCI_INT_CMD_MASK);
 
 		if (intmask & SDHCI_INT_DATA_MASK)
 			sdhci_data_irq(host, intmask & SDHCI_INT_DATA_MASK);
