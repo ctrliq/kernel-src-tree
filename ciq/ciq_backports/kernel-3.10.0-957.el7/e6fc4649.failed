@@ -1,0 +1,156 @@
+blk-mq: avoid starving tag allocation after allocating process migrates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit e6fc46498784e799d3eb95d83079180e413c4e7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e6fc4649.failed
+
+When the allocation process is scheduled back and the mapped hw queue is
+changed, fake one extra wake up on previous queue for compensating wake
+up miss, so other allocations on the previous queue won't be starved.
+
+This patch fixes one request allocation hang issue, which can be
+triggered easily in case of very low nr_request.
+
+The race is as follows:
+
+1) 2 hw queues, nr_requests are 2, and wake_batch is one
+
+2) there are 3 waiters on hw queue 0
+
+3) two in-flight requests in hw queue 0 are completed, and only two
+   waiters of 3 are waken up because of wake_batch, but both the two
+   waiters can be scheduled to another CPU and cause to switch to hw
+   queue 1
+
+4) then the 3rd waiter will wait for ever, since no in-flight request
+   is in hw queue 0 any more.
+
+5) this patch fixes it by the fake wakeup when waiter is scheduled to
+   another hw queue
+
+	Cc: <stable@vger.kernel.org>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+
+Modified commit message to make it clearer, and make it apply on
+top of the 4.18 branch.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e6fc46498784e799d3eb95d83079180e413c4e7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+#	lib/sbitmap.c
+diff --cc block/blk-mq-tag.c
+index ba3b5f08b69a,a4e58fc28a06..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -134,11 -134,7 +134,15 @@@ unsigned int blk_mq_get_tag(struct blk_
+  	ws = bt_wait_ptr(bt, data->hctx);
+  	drop_ctx = data->ctx == NULL;
+  	do {
+++<<<<<<< HEAD
+ +		prepare_to_wait(&ws->wait, &wait, TASK_UNINTERRUPTIBLE);
+ +
+ +		tag = __blk_mq_get_tag(data, bt);
+ +		if (tag != -1)
+ +			break;
+++=======
++ 		struct sbitmap_queue *bt_prev;
+++>>>>>>> e6fc46498784 (blk-mq: avoid starving tag allocation after allocating process migrates)
+  
+  		/*
+  		 * We're out of tags on this hardware queue, kick any
+diff --cc lib/sbitmap.c
+index 172c691674db,6fdc6267f4a8..000000000000
+--- a/lib/sbitmap.c
++++ b/lib/sbitmap.c
+@@@ -430,18 -464,9 +431,9 @@@ static void sbq_wake_up(struct sbitmap_
+  	unsigned int wake_batch;
+  	int wait_cnt;
+  
+- 	/*
+- 	 * Pairs with the memory barrier in set_current_state() to ensure the
+- 	 * proper ordering of clear_bit()/waitqueue_active() in the waker and
+- 	 * test_and_set_bit_lock()/prepare_to_wait()/finish_wait() in the
+- 	 * waiter. See the comment on waitqueue_active(). This is __after_atomic
+- 	 * because we just did clear_bit_unlock() in the caller.
+- 	 */
+- 	smp_mb__after_atomic();
+- 
+  	ws = sbq_wake_ptr(sbq);
+  	if (!ws)
+ -		return false;
+ +		return;
+  
+  	wait_cnt = atomic_dec_return(&ws->wait_cnt);
+  	if (wait_cnt <= 0) {
+@@@ -452,19 -480,32 +444,31 @@@
+  		 * count is reset.
+  		 */
+  		smp_mb__before_atomic();
+ -
+  		/*
+ -		 * For concurrent callers of this, the one that failed the
+ -		 * atomic_cmpxhcg() race should call this function again
+ -		 * to wakeup a new batch on a different 'ws'.
+ +		 * If there are concurrent callers to sbq_wake_up(), the last
+ +		 * one to decrement the wait count below zero will bump it back
+ +		 * up. If there is a concurrent resize, the count reset will
+ +		 * either cause the cmpxchg to fail or overwrite after the
+ +		 * cmpxchg.
+  		 */
+ -		ret = atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wake_batch);
+ -		if (ret == wait_cnt) {
+ -			sbq_index_atomic_inc(&sbq->wake_index);
+ -			wake_up_nr(&ws->wait, wake_batch);
+ -			return false;
+ -		}
+ -
+ -		return true;
+ +		atomic_cmpxchg(&ws->wait_cnt, wait_cnt, wait_cnt + wake_batch);
+ +		sbq_index_atomic_inc(&sbq->wake_index);
+ +		wake_up(&ws->wait);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	return false;
+  }
+  
++ void sbitmap_queue_wake_up(struct sbitmap_queue *sbq)
++ {
++ 	while (__sbq_wake_up(sbq))
++ 		;
+++>>>>>>> e6fc46498784 (blk-mq: avoid starving tag allocation after allocating process migrates)
++ }
++ EXPORT_SYMBOL_GPL(sbitmap_queue_wake_up);
++ 
+  void sbitmap_queue_clear(struct sbitmap_queue *sbq, unsigned int nr,
+  			 unsigned int cpu)
+  {
+* Unmerged path block/blk-mq-tag.c
+diff --git a/include/linux/sbitmap.h b/include/linux/sbitmap.h
+index 1ffa2029e4d6..e7265fea86db 100644
+--- a/include/linux/sbitmap.h
++++ b/include/linux/sbitmap.h
+@@ -484,6 +484,13 @@ static inline struct sbq_wait_state *sbq_wait_ptr(struct sbitmap_queue *sbq,
+  */
+ void sbitmap_queue_wake_all(struct sbitmap_queue *sbq);
+ 
++/**
++ * sbitmap_queue_wake_up() - Wake up some of waiters in one waitqueue
++ * on a &struct sbitmap_queue.
++ * @sbq: Bitmap queue to wake up.
++ */
++void sbitmap_queue_wake_up(struct sbitmap_queue *sbq);
++
+ /**
+  * sbitmap_queue_show() - Dump &struct sbitmap_queue information to a &struct
+  * seq_file.
+* Unmerged path lib/sbitmap.c
