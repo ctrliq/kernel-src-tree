@@ -1,0 +1,570 @@
+nfp: use dp to carry fl_bufsz at reconfig time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 2195c2637f90e97ef8cd8f8e0fe11c1829e7f1f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2195c263.failed
+
+Use fl_bufsz member of data path struct to carry desired size of
+free list entries.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2195c2637f90e97ef8cd8f8e0fe11c1829e7f1f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index e0a7eb1db7a9,92d4c2991a85..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -81,19 -86,19 +81,35 @@@ void nfp_net_get_fw_version(struct nfp_
+  }
+  
+  static dma_addr_t
+++<<<<<<< HEAD
+ +nfp_net_dma_map_rx(struct nfp_net *nn, void *frag, unsigned int bufsz,
+ +		   int direction)
+ +{
+ +	return dma_map_single(&nn->pdev->dev, frag + NFP_NET_RX_BUF_HEADROOM,
+ +			      bufsz - NFP_NET_RX_BUF_NON_DATA, direction);
+ +}
+ +
+ +static void
+ +nfp_net_dma_unmap_rx(struct nfp_net *nn, dma_addr_t dma_addr,
+ +		     unsigned int bufsz, int direction)
+ +{
+ +	dma_unmap_single(&nn->pdev->dev, dma_addr,
+ +			 bufsz - NFP_NET_RX_BUF_NON_DATA, direction);
+++=======
++ nfp_net_dma_map_rx(struct nfp_net_dp *dp, void *frag, int direction)
++ {
++ 	return dma_map_single(dp->dev, frag + NFP_NET_RX_BUF_HEADROOM,
++ 			      dp->fl_bufsz - NFP_NET_RX_BUF_NON_DATA,
++ 			      direction);
++ }
++ 
++ static void
++ nfp_net_dma_unmap_rx(struct nfp_net_dp *dp, dma_addr_t dma_addr,
++ 		     int direction)
++ {
++ 	dma_unmap_single(dp->dev, dma_addr,
++ 			 dp->fl_bufsz - NFP_NET_RX_BUF_NON_DATA, direction);
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  }
+  
+  /* Firmware reconfig
+@@@ -957,49 -965,106 +973,109 @@@ static void nfp_net_tx_complete(struct 
+  		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nfp_net_xdp_complete(struct nfp_net_tx_ring *tx_ring)
++ {
++ 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
++ 	struct nfp_net_dp *dp = &r_vec->nfp_net->dp;
++ 	u32 done_pkts = 0, done_bytes = 0;
++ 	int idx, todo;
++ 	u32 qcp_rd_p;
++ 
++ 	/* Work out how many descriptors have been transmitted */
++ 	qcp_rd_p = nfp_qcp_rd_ptr_read(tx_ring->qcp_q);
++ 
++ 	if (qcp_rd_p == tx_ring->qcp_rd_p)
++ 		return;
++ 
++ 	if (qcp_rd_p > tx_ring->qcp_rd_p)
++ 		todo = qcp_rd_p - tx_ring->qcp_rd_p;
++ 	else
++ 		todo = qcp_rd_p + tx_ring->cnt - tx_ring->qcp_rd_p;
++ 
++ 	while (todo--) {
++ 		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
++ 		tx_ring->rd_p++;
++ 
++ 		if (!tx_ring->txbufs[idx].frag)
++ 			continue;
++ 
++ 		nfp_net_dma_unmap_rx(dp, tx_ring->txbufs[idx].dma_addr,
++ 				     DMA_BIDIRECTIONAL);
++ 		__free_page(virt_to_page(tx_ring->txbufs[idx].frag));
++ 
++ 		done_pkts++;
++ 		done_bytes += tx_ring->txbufs[idx].real_len;
++ 
++ 		tx_ring->txbufs[idx].dma_addr = 0;
++ 		tx_ring->txbufs[idx].frag = NULL;
++ 		tx_ring->txbufs[idx].fidx = -2;
++ 	}
++ 
++ 	tx_ring->qcp_rd_p = qcp_rd_p;
++ 
++ 	u64_stats_update_begin(&r_vec->tx_sync);
++ 	r_vec->tx_bytes += done_bytes;
++ 	r_vec->tx_pkts += done_pkts;
++ 	u64_stats_update_end(&r_vec->tx_sync);
++ 
++ 	WARN_ONCE(tx_ring->wr_p - tx_ring->rd_p > tx_ring->cnt,
++ 		  "TX ring corruption rd_p=%u wr_p=%u cnt=%u\n",
++ 		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
++ }
++ 
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  /**
+   * nfp_net_tx_ring_reset() - Free any untransmitted buffers and reset pointers
+ - * @dp:		NFP Net data path struct
+ + * @nn:		NFP Net device
+   * @tx_ring:	TX ring structure
+   *
+   * Assumes that the device is stopped
+   */
+  static void
+ -nfp_net_tx_ring_reset(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
+ +nfp_net_tx_ring_reset(struct nfp_net *nn, struct nfp_net_tx_ring *tx_ring)
+  {
+ -	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
+  	const struct skb_frag_struct *frag;
+  	struct netdev_queue *nd_q;
+ +	struct pci_dev *pdev = nn->pdev;
+  
+  	while (tx_ring->rd_p != tx_ring->wr_p) {
+ -		struct nfp_net_tx_buf *tx_buf;
+ -		int idx;
+ +		int nr_frags, fidx, idx;
+ +		struct sk_buff *skb;
+  
+  		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
+ -		tx_buf = &tx_ring->txbufs[idx];
+ +		skb = tx_ring->txbufs[idx].skb;
+ +		nr_frags = skb_shinfo(skb)->nr_frags;
+ +		fidx = tx_ring->txbufs[idx].fidx;
+  
+++<<<<<<< HEAD
+ +		if (fidx == -1) {
+ +			/* unmap head */
+ +			dma_unmap_single(&pdev->dev,
+ +					 tx_ring->txbufs[idx].dma_addr,
+ +					 skb_headlen(skb), DMA_TO_DEVICE);
+++=======
++ 		if (tx_ring == r_vec->xdp_ring) {
++ 			nfp_net_dma_unmap_rx(dp, tx_buf->dma_addr,
++ 					     DMA_BIDIRECTIONAL);
++ 			__free_page(virt_to_page(tx_ring->txbufs[idx].frag));
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		} else {
+ -			struct sk_buff *skb = tx_ring->txbufs[idx].skb;
+ -			int nr_frags = skb_shinfo(skb)->nr_frags;
+ -
+ -			if (tx_buf->fidx == -1) {
+ -				/* unmap head */
+ -				dma_unmap_single(dp->dev, tx_buf->dma_addr,
+ -						 skb_headlen(skb),
+ -						 DMA_TO_DEVICE);
+ -			} else {
+ -				/* unmap fragment */
+ -				frag = &skb_shinfo(skb)->frags[tx_buf->fidx];
+ -				dma_unmap_page(dp->dev, tx_buf->dma_addr,
+ -					       skb_frag_size(frag),
+ -					       DMA_TO_DEVICE);
+ -			}
+ -
+ -			/* check for last gather fragment */
+ -			if (tx_buf->fidx == nr_frags - 1)
+ -				dev_kfree_skb_any(skb);
+ +			/* unmap fragment */
+ +			frag = &skb_shinfo(skb)->frags[fidx];
+ +			dma_unmap_page(&pdev->dev,
+ +				       tx_ring->txbufs[idx].dma_addr,
+ +				       skb_frag_size(frag), DMA_TO_DEVICE);
+  		}
+  
+ -		tx_buf->dma_addr = 0;
+ -		tx_buf->skb = NULL;
+ -		tx_buf->fidx = -2;
+ +		/* check for last gather fragment */
+ +		if (fidx == nr_frags - 1)
+ +			dev_kfree_skb_any(skb);
+ +
+ +		tx_ring->txbufs[idx].dma_addr = 0;
+ +		tx_ring->txbufs[idx].skb = NULL;
+ +		tx_ring->txbufs[idx].fidx = -2;
+  
+  		tx_ring->qcp_rd_p++;
+  		tx_ring->rd_p++;
+@@@ -1048,33 -1116,49 +1124,59 @@@ nfp_net_calc_fl_bufsz(struct nfp_net *n
+  	return fl_bufsz;
+  }
+  
+ -static void
+ -nfp_net_free_frag(void *frag, bool xdp)
+ -{
+ -	if (!xdp)
+ -		skb_free_frag(frag);
+ -	else
+ -		__free_page(virt_to_page(frag));
+ -}
+ -
+  /**
+   * nfp_net_rx_alloc_one() - Allocate and map page frag for RX
+ - * @dp:		NFP Net data path struct
+   * @rx_ring:	RX ring structure of the skb
+   * @dma_addr:	Pointer to storage for DMA address (output param)
+++<<<<<<< HEAD
+ + * @fl_bufsz:	size of freelist buffers
+++=======
++  * @xdp:	Whether XDP is enabled
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+   *
+   * This function will allcate a new page frag, map it for DMA.
+   *
+   * Return: allocated page frag or NULL on failure.
+   */
+  static void *
+++<<<<<<< HEAD
+ +nfp_net_rx_alloc_one(struct nfp_net_rx_ring *rx_ring, dma_addr_t *dma_addr,
+ +		     unsigned int fl_bufsz)
+++=======
++ nfp_net_rx_alloc_one(struct nfp_net_dp *dp,
++ 		     struct nfp_net_rx_ring *rx_ring, dma_addr_t *dma_addr,
++ 		     bool xdp)
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  {
+ -	int direction;
+ +	struct nfp_net *nn = rx_ring->r_vec->nfp_net;
+  	void *frag;
+  
+++<<<<<<< HEAD
+ +	frag = netdev_alloc_frag(fl_bufsz);
+++=======
++ 	if (!xdp)
++ 		frag = netdev_alloc_frag(dp->fl_bufsz);
++ 	else
++ 		frag = page_address(alloc_page(GFP_KERNEL | __GFP_COLD));
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  	if (!frag) {
+ -		nn_dp_warn(dp, "Failed to alloc receive page frag\n");
+ +		nn_warn_ratelimit(nn, "Failed to alloc receive page frag\n");
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	*dma_addr = nfp_net_dma_map_rx(nn, frag, fl_bufsz, DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&nn->pdev->dev, *dma_addr)) {
+ +		skb_free_frag(frag);
+ +		nn_warn_ratelimit(nn, "Failed to map DMA RX buffer\n");
+++=======
++ 	direction = xdp ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
++ 
++ 	*dma_addr = nfp_net_dma_map_rx(dp, frag, direction);
++ 	if (dma_mapping_error(dp->dev, *dma_addr)) {
++ 		nfp_net_free_frag(frag, xdp);
++ 		nn_dp_warn(dp, "Failed to map DMA RX buffer\n");
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		return NULL;
+  	}
+  
+@@@ -1091,10 -1180,10 +1193,17 @@@ static void *nfp_net_napi_alloc_one(str
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	*dma_addr = nfp_net_dma_map_rx(nn, frag, nn->fl_bufsz, DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&nn->pdev->dev, *dma_addr)) {
+ +		skb_free_frag(frag);
+ +		nn_warn_ratelimit(nn, "Failed to map DMA RX buffer\n");
+++=======
++ 	*dma_addr = nfp_net_dma_map_rx(dp, frag, direction);
++ 	if (dma_mapping_error(dp->dev, *dma_addr)) {
++ 		nfp_net_free_frag(frag, dp->xdp_prog);
++ 		nn_dp_warn(dp, "Failed to map DMA RX buffer\n");
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		return NULL;
+  	}
+  
+@@@ -1182,9 -1274,9 +1291,15 @@@ nfp_net_rx_ring_bufs_free(struct nfp_ne
+  		if (!rx_ring->rxbufs[i].frag)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[i].dma_addr,
+ +				     rx_ring->bufsz, DMA_FROM_DEVICE);
+ +		skb_free_frag(rx_ring->rxbufs[i].frag);
+++=======
++ 		nfp_net_dma_unmap_rx(dp, rx_ring->rxbufs[i].dma_addr,
++ 				     direction);
++ 		nfp_net_free_frag(rx_ring->rxbufs[i].frag, xdp);
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		rx_ring->rxbufs[i].dma_addr = 0;
+  		rx_ring->rxbufs[i].frag = NULL;
+  	}
+@@@ -1205,10 -1299,10 +1320,15 @@@ nfp_net_rx_ring_bufs_alloc(struct nfp_n
+  
+  	for (i = 0; i < rx_ring->cnt - 1; i++) {
+  		rxbufs[i].frag =
+++<<<<<<< HEAD
+ +			nfp_net_rx_alloc_one(rx_ring, &rxbufs[i].dma_addr,
+ +					     rx_ring->bufsz);
+++=======
++ 			nfp_net_rx_alloc_one(dp, rx_ring, &rxbufs[i].dma_addr,
++ 					     xdp);
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		if (!rxbufs[i].frag) {
+ -			nfp_net_rx_ring_bufs_free(dp, rx_ring, xdp);
+ +			nfp_net_rx_ring_bufs_free(nn, rx_ring);
+  			return -ENOMEM;
+  		}
+  	}
+@@@ -1434,8 -1651,7 +1554,12 @@@ static int nfp_net_rx(struct nfp_net_rx
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+++=======
++ 		nfp_net_dma_unmap_rx(dp, rxbuf->dma_addr, rx_dma_map_dir);
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  
+  		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+  
+@@@ -1634,19 -1870,14 +1758,20 @@@ static void nfp_net_rx_ring_free(struc
+   * Return: 0 on success, negative errno otherwise.
+   */
+  static int
+- nfp_net_rx_ring_alloc(struct nfp_net_rx_ring *rx_ring, unsigned int fl_bufsz,
++ nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
+  		      u32 cnt)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
+ +	struct nfp_net *nn = r_vec->nfp_net;
+ +	struct pci_dev *pdev = nn->pdev;
+++=======
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  	int sz;
+  
+  	rx_ring->cnt = cnt;
+- 	rx_ring->bufsz = fl_bufsz;
+- 
+  	rx_ring->size = sizeof(*rx_ring->rxds) * rx_ring->cnt;
+ -	rx_ring->rxds = dma_zalloc_coherent(dp->dev, rx_ring->size,
+ +	rx_ring->rxds = dma_zalloc_coherent(&pdev->dev, rx_ring->size,
+  					    &rx_ring->dma, GFP_KERNEL);
+  	if (!rx_ring->rxds)
+  		goto err_alloc;
+@@@ -1668,9 -1895,9 +1793,12 @@@ err_alloc
+  }
+  
+  static struct nfp_net_rx_ring *
+ -nfp_net_rx_ring_set_prepare(struct nfp_net *nn, struct nfp_net_dp *dp,
+ -			    struct nfp_net_ring_set *s, bool xdp)
+ +nfp_net_rx_ring_set_prepare(struct nfp_net *nn, struct nfp_net_ring_set *s)
+  {
+++<<<<<<< HEAD
+ +	unsigned int fl_bufsz =	nfp_net_calc_fl_bufsz(nn, s->mtu);
+++=======
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  	struct nfp_net_rx_ring *rings;
+  	unsigned int r;
+  
+@@@ -1681,10 -1908,10 +1809,10 @@@
+  	for (r = 0; r < s->n_rings; r++) {
+  		nfp_net_rx_ring_init(&rings[r], &nn->r_vecs[r], r);
+  
+- 		if (nfp_net_rx_ring_alloc(&rings[r], fl_bufsz, s->dcnt))
++ 		if (nfp_net_rx_ring_alloc(dp, &rings[r], s->dcnt))
+  			goto err_free_prev;
+  
+ -		if (nfp_net_rx_ring_bufs_alloc(dp, &rings[r], xdp))
+ +		if (nfp_net_rx_ring_bufs_alloc(nn, &rings[r]))
+  			goto err_free_ring;
+  	}
+  
+@@@ -1701,20 -1928,23 +1829,36 @@@ err_free_ring
+  }
+  
+  static void
+- nfp_net_rx_ring_set_swap(struct nfp_net *nn, struct nfp_net_ring_set *s)
++ nfp_net_rx_ring_set_swap(struct nfp_net *nn, struct nfp_net_dp *dp,
++ 			 struct nfp_net_ring_set *s)
+  {
+  	struct nfp_net_ring_set new = *s;
++ 	struct nfp_net_dp new_dp = *dp;
+  
+++<<<<<<< HEAD
+ +	s->mtu = nn->netdev->mtu;
+ +	s->dcnt = nn->rxd_cnt;
+ +	s->rings = nn->rx_rings;
+ +	s->n_rings = nn->num_rx_rings;
+ +
+ +	nn->netdev->mtu = new.mtu;
+ +	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, new.mtu);
+ +	nn->rxd_cnt = new.dcnt;
+ +	nn->rx_rings = new.rings;
+ +	nn->num_rx_rings = new.n_rings;
+++=======
++ 	dp->fl_bufsz = nn->dp.fl_bufsz;
++ 	s->mtu = nn->dp.netdev->mtu;
++ 	s->dcnt = nn->dp.rxd_cnt;
++ 	s->rings = nn->dp.rx_rings;
++ 	s->n_rings = nn->dp.num_rx_rings;
++ 
++ 	nn->dp.netdev->mtu = new.mtu;
++ 	nn->dp.fl_bufsz = new_dp.fl_bufsz;
++ 	nn->dp.rxd_cnt = new.dcnt;
++ 	nn->dp.rx_rings = new.rings;
++ 	nn->dp.num_rx_rings = new.n_rings;
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  }
+  
+  static void
+@@@ -2259,37 -2506,91 +2403,100 @@@ nfp_net_ring_swap_enable(struct nfp_ne
+  	return __nfp_net_set_config_and_enable(nn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct nfp_net_dp *nfp_net_clone_dp(struct nfp_net *nn)
++ {
++ 	struct nfp_net_dp *new;
++ 
++ 	new = kmalloc(sizeof(*new), GFP_KERNEL);
++ 	if (!new)
++ 		return NULL;
++ 
++ 	*new = nn->dp;
++ 
++ 	/* Clear things which need to be recomputed */
++ 	new->fl_bufsz = 0;
++ 	new->tx_rings = NULL;
++ 	new->rx_rings = NULL;
++ 	new->num_r_vecs = 0;
++ 	new->num_stack_tx_rings = 0;
++ 
++ 	return new;
++ }
++ 
++ static int
++ nfp_net_check_config(struct nfp_net *nn, struct nfp_net_dp *dp,
++ 		     struct bpf_prog *xdp_prog,
++ 		     struct nfp_net_ring_set *rx, struct nfp_net_ring_set *tx)
++ {
++ 	/* XDP-enabled tests */
++ 	if (!xdp_prog)
++ 		return 0;
++ 	if (dp->fl_bufsz > PAGE_SIZE) {
++ 		nn_warn(nn, "MTU too large w/ XDP enabled\n");
++ 		return -EINVAL;
++ 	}
++ 	if (tx && tx->n_rings > nn->max_tx_rings) {
++ 		nn_warn(nn, "Insufficient number of TX rings w/ XDP enabled\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  static void
+ -nfp_net_ring_reconfig_down(struct nfp_net *nn, struct nfp_net_dp *dp,
+ -			   struct bpf_prog **xdp_prog,
+ +nfp_net_ring_reconfig_down(struct nfp_net *nn,
+  			   struct nfp_net_ring_set *rx,
+ -			   struct nfp_net_ring_set *tx)
+ -{
+ -	nfp_net_dp_swap(nn, dp);
+ -
+ +			   struct nfp_net_ring_set *tx,
+ +			   unsigned int num_vecs)
+ +{
+ +	nn->netdev->mtu = rx ? rx->mtu : nn->netdev->mtu;
+ +	nn->fl_bufsz = nfp_net_calc_fl_bufsz(nn, nn->netdev->mtu);
+ +	nn->rxd_cnt = rx ? rx->dcnt : nn->rxd_cnt;
+ +	nn->txd_cnt = tx ? tx->dcnt : nn->txd_cnt;
+ +	nn->num_rx_rings = rx ? rx->n_rings : nn->num_rx_rings;
+ +	nn->num_tx_rings = tx ? tx->n_rings : nn->num_tx_rings;
+ +	nn->num_r_vecs = num_vecs;
+ +
+++<<<<<<< HEAD
+ +	if (!netif_is_rxfh_configured(nn->netdev))
+++=======
++ 	nn->dp.netdev->mtu = rx ? rx->mtu : nn->dp.netdev->mtu;
++ 	nn->dp.rxd_cnt = rx ? rx->dcnt : nn->dp.rxd_cnt;
++ 	nn->dp.txd_cnt = tx ? tx->dcnt : nn->dp.txd_cnt;
++ 	nn->dp.num_rx_rings = rx ? rx->n_rings : nn->dp.num_rx_rings;
++ 	nn->dp.num_tx_rings = tx ? tx->n_rings : nn->dp.num_tx_rings;
++ 	*xdp_prog = xchg(&nn->dp.xdp_prog, *xdp_prog);
++ 
++ 	if (!netif_is_rxfh_configured(nn->dp.netdev))
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  		nfp_net_rss_init_itbl(nn);
+  }
+  
+  int
+ -nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_dp *dp,
+ -		      struct bpf_prog **xdp_prog,
+ -		      struct nfp_net_ring_set *rx, struct nfp_net_ring_set *tx)
+ +nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+ +		      struct nfp_net_ring_set *tx)
+  {
+ -	int r, err;
+ +	unsigned int num_vecs, r;
+ +	int err;
+  
+++<<<<<<< HEAD
+ +	num_vecs = max(rx ? rx->n_rings : nn->num_rx_rings,
+ +		       tx ? tx->n_rings : nn->num_tx_rings);
+++=======
++ 	dp->fl_bufsz = nfp_net_calc_fl_bufsz(dp,
++ 					     rx ? rx->mtu : nn->dp.netdev->mtu);
++ 
++ 	dp->num_stack_tx_rings = tx ? tx->n_rings : dp->num_tx_rings;
++ 	if (*xdp_prog)
++ 		dp->num_stack_tx_rings -= rx ? rx->n_rings : dp->num_rx_rings;
+++>>>>>>> 2195c2637f90 (nfp: use dp to carry fl_bufsz at reconfig time)
+  
+ -	dp->num_r_vecs = max(rx ? rx->n_rings : dp->num_rx_rings,
+ -			     dp->num_stack_tx_rings);
+ -
+ -	err = nfp_net_check_config(nn, dp, *xdp_prog, rx, tx);
+ -	if (err)
+ -		goto exit_free_dp;
+ -
+ -	if (!netif_running(dp->netdev)) {
+ -		nfp_net_ring_reconfig_down(nn, dp, xdp_prog, rx, tx);
+ -
+ -		err = 0;
+ -		goto exit_free_dp;
+ +	if (!netif_running(nn->netdev)) {
+ +		nfp_net_ring_reconfig_down(nn, rx, tx, num_vecs);
+ +		return 0;
+  	}
+  
+  	/* Prepare new rings */
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da..1577023f6976 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -307,8 +307,6 @@ struct nfp_net_rx_buf {
+  * @rxds:       Virtual address of FL/RX ring in host memory
+  * @dma:        DMA address of the FL/RX ring
+  * @size:       Size, in bytes, of the FL/RX ring (needed to free)
+- * @bufsz:	Buffer allocation size for convenience of management routines
+- *		(NOTE: this is in second cache line, do not use on fast path!)
+  */
+ struct nfp_net_rx_ring {
+ 	struct nfp_net_r_vector *r_vec;
+@@ -330,7 +328,6 @@ struct nfp_net_rx_ring {
+ 
+ 	dma_addr_t dma;
+ 	unsigned int size;
+-	unsigned int bufsz;
+ } ____cacheline_aligned;
+ 
+ /**
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
