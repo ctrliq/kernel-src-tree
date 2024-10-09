@@ -64,7 +64,7 @@ static int pmem_clear_poison(struct pmem_device *pmem, phys_addr_t offset,
 		rc = -EIO;
 	if (cleared > 0 && cleared / 512) {
 		cleared /= 512;
-		dev_dbg(dev, "%s: %#llx clear %ld sector%s\n", __func__,
+		dev_dbg(dev, "%#llx clear %ld sector%s\n",
 				(unsigned long long) sector, cleared,
 				cleared > 1 ? "s" : "");
 		badblocks_clear(&pmem->bb, sector, cleared);
