@@ -1,0 +1,127 @@
+net: sched: cls_matchall: call block callbacks for offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: cls_matchall: call block callbacks for offload (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 95.50%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 2447a96f88ee3c082603c2dd38ae51f66977c11d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2447a96f.failed
+
+Use the newly introduced callbacks infrastructure and call block
+callbacks alongside with the existing per-netdev ndo_setup_tc.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2447a96f88ee3c082603c2dd38ae51f66977c11d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_matchall.c
+diff --cc net/sched/cls_matchall.c
+index f0adbab7f7c3,5278534c7e87..000000000000
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@@ -65,10 -46,28 +65,28 @@@ static void mall_destroy_rcu(struct rcu
+  	struct cls_mall_head *head = container_of(rcu, struct cls_mall_head,
+  						  rcu);
+  
+ -	tcf_exts_destroy(&head->exts);
+ -	kfree(head);
+ +	INIT_WORK(&head->work, mall_destroy_work);
+ +	tcf_queue_work(&head->work);
+  }
+  
++ static void mall_destroy_hw_filter(struct tcf_proto *tp,
++ 				   struct cls_mall_head *head,
++ 				   unsigned long cookie)
++ {
++ 	struct net_device *dev = tp->q->dev_queue->dev;
++ 	struct tc_cls_matchall_offload cls_mall = {};
++ 	struct tcf_block *block = tp->chain->block;
++ 
++ 	tc_cls_common_offload_init(&cls_mall.common, tp);
++ 	cls_mall.command = TC_CLSMATCHALL_DESTROY;
++ 	cls_mall.cookie = cookie;
++ 
++ 	if (tc_can_offload(dev))
++ 		dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL,
++ 					      &cls_mall);
++ 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL, &cls_mall, false);
++ }
++ 
+  static int mall_replace_hw_filter(struct tcf_proto *tp,
+  				  struct cls_mall_head *head,
+  				  unsigned long cookie)
+@@@ -82,25 -83,30 +102,50 @@@
+  	cls_mall.exts = &head->exts;
+  	cls_mall.cookie = cookie;
+  
+++<<<<<<< HEAD
+ +	err = __rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
+ +	if (!err)
+++=======
++ 	if (tc_can_offload(dev)) {
++ 		err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL,
++ 						    &cls_mall);
++ 		if (err) {
++ 			if (skip_sw)
++ 				return err;
++ 		} else {
++ 			head->flags |= TCA_CLS_FLAGS_IN_HW;
++ 		}
++ 	}
++ 
++ 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL,
++ 			       &cls_mall, skip_sw);
++ 	if (err < 0) {
++ 		mall_destroy_hw_filter(tp, head, cookie);
++ 		return err;
++ 	} else if (err > 0) {
+++>>>>>>> 2447a96f88ee (net: sched: cls_matchall: call block callbacks for offload)
+  		head->flags |= TCA_CLS_FLAGS_IN_HW;
++ 	}
+  
+- 	return err;
+- }
++ 	if (skip_sw && !(head->flags & TCA_CLS_FLAGS_IN_HW))
++ 		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +static void mall_destroy_hw_filter(struct tcf_proto *tp,
+ +				   struct cls_mall_head *head,
+ +				   unsigned long cookie)
+ +{
+ +	struct net_device *dev = tp->q->dev_queue->dev;
+ +	struct tc_cls_matchall_offload cls_mall = {};
+ +
+ +	tc_cls_common_offload_init(&cls_mall.common, tp);
+ +	cls_mall.command = TC_CLSMATCHALL_DESTROY;
+ +	cls_mall.cookie = cookie;
+ +
+ +	__rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
+++=======
++ 	return 0;
+++>>>>>>> 2447a96f88ee (net: sched: cls_matchall: call block callbacks for offload)
+  }
+  
+  static void mall_destroy(struct tcf_proto *tp)
+@@@ -111,13 -116,10 +155,13 @@@
+  	if (!head)
+  		return;
+  
+- 	if (tc_should_offload(dev, head->flags))
++ 	if (!tc_skip_hw(head->flags))
+  		mall_destroy_hw_filter(tp, head, (unsigned long) head);
+  
+ -	call_rcu(&head->rcu, mall_destroy_rcu);
+ +	if (tcf_exts_get_net(&head->exts))
+ +		call_rcu(&head->rcu, mall_destroy_rcu);
+ +	else
+ +		__mall_destroy(head);
+  }
+  
+  static void *mall_get(struct tcf_proto *tp, u32 handle)
+* Unmerged path net/sched/cls_matchall.c
