@@ -85,8 +85,8 @@ static int hist_entry__thread_snprintf(struct hist_entry *he, char *bf,
 {
 	const char *comm = thread__comm_str(he->thread);
 
-	width = max(7U, width) - 6;
-	return repsep_snprintf(bf, size, "%5d:%-*.*s", he->thread->tid,
+	width = max(7U, width) - 8;
+	return repsep_snprintf(bf, size, "%7d:%-*.*s", he->thread->tid,
 			       width, width, comm ?: "");
 }
 
@@ -101,7 +101,7 @@ static int hist_entry__thread_filter(struct hist_entry *he, int type, const void
 }
 
 struct sort_entry sort_thread = {
-	.se_header	= "  Pid:Command",
+	.se_header	= "    Pid:Command",
 	.se_cmp		= sort__thread_cmp,
 	.se_snprintf	= hist_entry__thread_snprintf,
 	.se_filter	= hist_entry__thread_filter,
