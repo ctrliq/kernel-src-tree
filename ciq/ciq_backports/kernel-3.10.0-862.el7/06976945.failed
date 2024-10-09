@@ -1,0 +1,159 @@
+x86/mm/pkeys: Actually enable Memory Protection Keys in the CPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm/pkeys: Actually enable Memory Protection Keys in the CPU (Rui Wang) [1272615]
+Rebuild_FUZZ: 96.72%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 0697694564c84f4c9320e5d103d0191297a20023
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/06976945.failed
+
+This sets the bit in 'cr4' to actually enable the protection
+keys feature.  We also include a boot-time disable for the
+feature "nopku".
+
+Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE cpuid
+bit to appear set.  At this point in boot, identify_cpu()
+has already run the actual CPUID instructions and populated
+the "cpu features" structures.  We need to go back and
+re-run identify_cpu() to make sure it gets updated values.
+
+We *could* simply re-populate the 11th word of the cpuid
+data, but this is probably quick enough.
+
+Also note that with the cpu_has() check and X86_FEATURE_PKU
+present in disabled-features.h, we do not need an #ifdef
+for setup_pku().
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/20160212210229.6708027C@viggo.jf.intel.com
+[ Small readability edits. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0697694564c84f4c9320e5d103d0191297a20023)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+diff --cc Documentation/kernel-parameters.txt
+index cbd5f28e2ade,acf467d44e39..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -835,7 -972,39 +835,31 @@@ bytes respectively. Such letter suffixe
+  			Enable debug messages at boot time.  See
+  			Documentation/dynamic-debug-howto.txt for details.
+  
+++<<<<<<< HEAD
+++=======
++ 	nompx		[X86] Disables Intel Memory Protection Extensions.
++ 			See Documentation/x86/intel_mpx.txt for more
++ 			information about the feature.
++ 
++ 	nopku		[X86] Disable Memory Protection Keys CPU feature found
++ 			in some Intel CPUs.
++ 
++ 	eagerfpu=	[X86]
++ 			on	enable eager fpu restore
++ 			off	disable eager fpu restore
++ 			auto	selects the default scheme, which automatically
++ 				enables eagerfpu restore for xsaveopt.
++ 
++ 	module.async_probe [KNL]
++ 			Enable asynchronous probe on this module.
++ 
++ 	early_ioremap_debug [KNL]
++ 			Enable debug messages in early_ioremap support. This
++ 			is useful for tracking down temporary early mappings
++ 			which are not unmapped.
++ 
+++>>>>>>> 0697694564c8 (x86/mm/pkeys: Actually enable Memory Protection Keys in the CPU)
+  	earlycon=	[KNL] Output early console device and options.
+ -
+ -			When used with no options, the early console is
+ -			determined by the stdout-path property in device
+ -			tree's chosen node.
+ -
+ -		cdns,<addr>
+ -			Start an early, polled-mode console on a cadence serial
+ -			port at the specified address. The cadence serial port
+ -			must already be setup and configured. Options are not
+ -			yet supported.
+ -
+  		uart[8250],io,<addr>[,options]
+  		uart[8250],mmio,<addr>[,options]
+  		uart[8250],mmio32,<addr>[,options]
+* Unmerged path Documentation/kernel-parameters.txt
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 59edb62b6a2b..77823631c718 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -333,6 +333,48 @@ static __always_inline void setup_smap(struct cpuinfo_x86 *c)
+ 		set_in_cr4(X86_CR4_SMAP);
+ }
+ 
++/*
++ * Protection Keys are not available in 32-bit mode.
++ */
++static bool pku_disabled;
++
++static __always_inline void setup_pku(struct cpuinfo_x86 *c)
++{
++	if (!cpu_has(c, X86_FEATURE_PKU))
++		return;
++	if (pku_disabled)
++		return;
++
++	cr4_set_bits(X86_CR4_PKE);
++	/*
++	 * Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE
++	 * cpuid bit to be set.  We need to ensure that we
++	 * update that bit in this CPU's "cpu_info".
++	 */
++	get_cpu_cap(c);
++}
++
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++static __init int setup_disable_pku(char *arg)
++{
++	/*
++	 * Do not clear the X86_FEATURE_PKU bit.  All of the
++	 * runtime checks are against OSPKE so clearing the
++	 * bit does nothing.
++	 *
++	 * This way, we will see "pku" in cpuinfo, but not
++	 * "ospke", which is exactly what we want.  It shows
++	 * that the CPU has PKU, but the OS has not enabled it.
++	 * This happens to be exactly how a system would look
++	 * if we disabled the config option.
++	 */
++	pr_info("x86: 'nopku' specified, disabling Memory Protection Keys\n");
++	pku_disabled = true;
++	return 1;
++}
++__setup("nopku", setup_disable_pku);
++#endif /* CONFIG_X86_64 */
++
+ /*
+  * Some CPU features depend on higher CPUID levels, which may not always
+  * be available due to CPUID level capping or broken virtualization
+@@ -1028,6 +1070,7 @@ static void identify_cpu(struct cpuinfo_x86 *c)
+ 	init_hypervisor(c);
+ 	x86_init_rdrand(c);
+ 	x86_init_cache_qos(c);
++	setup_pku(c);
+ 
+ 	/*
+ 	 * Clear/Set all flags overriden by options, need do it
