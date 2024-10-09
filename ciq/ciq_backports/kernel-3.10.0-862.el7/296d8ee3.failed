@@ -1,0 +1,106 @@
+net: add infrastructure to un-offload UDP tunnel port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] add infrastructure to un-offload UDP tunnel port (Jiri Benc) [1308630 1467280]
+Rebuild_FUZZ: 95.05%
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit 296d8ee37c50f139d934bdefbab85509b2e4a525
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/296d8ee3.failed
+
+This adds a new NETDEV_UDP_TUNNEL_DROP_INFO event, similar to
+NETDEV_UDP_TUNNEL_PUSH_INFO, to signal to un-offload ports.
+
+This also adds udp_tunnel_drop_rx_port(), which calls
+ndo_udp_tunnel_del.
+
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 296d8ee37c50f139d934bdefbab85509b2e4a525)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+diff --cc include/linux/netdevice.h
+index f2e995a93118,3a3cdc1b1f31..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -2344,14 -2316,10 +2344,20 @@@ struct netdev_lag_lower_state_info 
+  #define NETDEV_BONDING_INFO	0x0019
+  #define NETDEV_PRECHANGEUPPER	0x001A
+  #define NETDEV_CHANGELOWERSTATE	0x001B
+++<<<<<<< HEAD
+ +#define NETDEV_OFFLOAD_PUSH_VXLAN	0x001C
+ +#define NETDEV_OFFLOAD_PUSH_GENEVE	0x001D
+ +#define NETDEV_UDP_TUNNEL_PUSH_INFO	0x001E
+ +#define NETDEV_CHANGE_TX_QUEUE_LEN	0x001F
+++=======
++ #define NETDEV_UDP_TUNNEL_PUSH_INFO	0x001C
++ #define NETDEV_UDP_TUNNEL_DROP_INFO	0x001D
++ #define NETDEV_CHANGE_TX_QUEUE_LEN	0x001E
+++>>>>>>> 296d8ee37c50 (net: add infrastructure to un-offload UDP tunnel port)
+  
+ +/* (Un)registration functions for the notifiers that takes
+ + * 'struct net_device *' as parameter
+ + */
+  int register_netdevice_notifier(struct notifier_block *nb);
+  int unregister_netdevice_notifier(struct notifier_block *nb);
+  
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/net/udp_tunnel.h b/include/net/udp_tunnel.h
+index 02c5be037451..10cce0dd4450 100644
+--- a/include/net/udp_tunnel.h
++++ b/include/net/udp_tunnel.h
+@@ -115,6 +115,8 @@ struct udp_tunnel_info {
+ /* Notify network devices of offloadable types */
+ void udp_tunnel_push_rx_port(struct net_device *dev, struct socket *sock,
+ 			     unsigned short type);
++void udp_tunnel_drop_rx_port(struct net_device *dev, struct socket *sock,
++			     unsigned short type);
+ void udp_tunnel_notify_add_rx_port(struct socket *sock, unsigned short type);
+ void udp_tunnel_notify_del_rx_port(struct socket *sock, unsigned short type);
+ 
+@@ -124,6 +126,12 @@ static inline void udp_tunnel_get_rx_info(struct net_device *dev)
+ 	call_netdevice_notifiers(NETDEV_UDP_TUNNEL_PUSH_INFO, dev);
+ }
+ 
++static inline void udp_tunnel_drop_rx_info(struct net_device *dev)
++{
++	ASSERT_RTNL();
++	call_netdevice_notifiers(NETDEV_UDP_TUNNEL_DROP_INFO, dev);
++}
++
+ /* Transmit the skb using UDP encapsulation. */
+ void udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
+ 			 __be32 src, __be32 dst, __u8 tos, __u8 ttl,
+diff --git a/net/ipv4/udp_tunnel.c b/net/ipv4/udp_tunnel.c
+index 6e94af27d34c..9f7400959e77 100644
+--- a/net/ipv4/udp_tunnel.c
++++ b/net/ipv4/udp_tunnel.c
+@@ -122,6 +122,24 @@ void udp_tunnel_push_rx_port(struct net_device *dev, struct socket *sock,
+ }
+ EXPORT_SYMBOL_GPL(udp_tunnel_push_rx_port);
+ 
++void udp_tunnel_drop_rx_port(struct net_device *dev, struct socket *sock,
++			     unsigned short type)
++{
++	struct sock *sk = sock->sk;
++	struct udp_tunnel_info ti;
++
++	if (!dev->netdev_ops->ndo_udp_tunnel_del ||
++	    !(dev->features & NETIF_F_RX_UDP_TUNNEL_PORT))
++		return;
++
++	ti.type = type;
++	ti.sa_family = sk->sk_family;
++	ti.port = inet_sk(sk)->inet_sport;
++
++	dev->netdev_ops->ndo_udp_tunnel_del(dev, &ti);
++}
++EXPORT_SYMBOL_GPL(udp_tunnel_drop_rx_port);
++
+ /* Notify netdevs that UDP port started listening */
+ void udp_tunnel_notify_add_rx_port(struct socket *sock, unsigned short type)
+ {
