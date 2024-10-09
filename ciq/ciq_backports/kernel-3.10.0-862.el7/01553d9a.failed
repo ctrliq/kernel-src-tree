@@ -1,0 +1,138 @@
+s390/pci: fix handling of PEC 306
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] pci: fix handling of PEC 306 (Hendrik Brueckner) [1486403]
+Rebuild_FUZZ: 91.80%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 01553d9a2ba7c658bf9e9e5c65466508c1bd6db5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/01553d9a.failed
+
+In contrast to other hotplug events PEC 0x306 isn't about a single
+but multiple devices. Also there's no information on what happened
+to these devices. We correctly handled hotplug that way but failed
+to handle hot-unplug. This patch addresses that and implements
+hot-unplug of multiple devices via PEC 306.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 01553d9a2ba7c658bf9e9e5c65466508c1bd6db5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 833b01424c9d,114b390d80f9..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -958,20 -864,23 +977,24 @@@ out
+  	return rc;
+  }
+  
+ -void zpci_remove_device(struct zpci_dev *zdev)
+++<<<<<<< HEAD
+ +void zpci_stop_device(struct zpci_dev *zdev)
+  {
+ -	if (!zdev->bus)
+ -		return;
+ -
+ -	pci_stop_root_bus(zdev->bus);
+ -	pci_remove_root_bus(zdev->bus);
+ +	zpci_dma_exit_device(zdev);
+ +	/*
+ +	 * Note: SCLP disables fh via set-pci-fn so don't
+ +	 * do that here.
+ +	 */
+  }
+ +EXPORT_SYMBOL_GPL(zpci_stop_device);
+  
+ -int zpci_report_error(struct pci_dev *pdev,
+ -		      struct zpci_report_error_header *report)
+ +static inline int barsize(u8 size)
+++=======
+++void zpci_remove_device(struct zpci_dev *zdev)
+++>>>>>>> 01553d9a2ba7 (s390/pci: fix handling of PEC 306)
+  {
+ -	struct zpci_dev *zdev = to_zpci(pdev);
+ -
+ -	return sclp_pci_report(report, zdev->fh, zdev->fid);
+ +	return (size) ? (1 << size) >> 10 : 0;
+  }
+ -EXPORT_SYMBOL(zpci_report_error);
+  
+  static int zpci_mem_init(void)
+  {
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index e484e6910e9d..442777a37609 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -164,9 +164,9 @@ extern const struct attribute_group *zpci_attr_groups[];
+ int zpci_create_device(struct zpci_dev *);
+ int zpci_enable_device(struct zpci_dev *);
+ int zpci_disable_device(struct zpci_dev *);
+-void zpci_stop_device(struct zpci_dev *);
+ int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
+ int zpci_unregister_ioat(struct zpci_dev *, u8);
++void zpci_remove_reserved_devices(void);
+ 
+ /* CLP */
+ int clp_scan_pci_devices(void);
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_clp.c b/arch/s390/pci/pci_clp.c
+index b8e9f66a3c41..be8166f072cb 100644
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -306,14 +306,6 @@ out:
+ }
+ 
+ static void __clp_add(struct clp_fh_list_entry *entry, void *data)
+-{
+-	if (!entry->vendor_id)
+-		return;
+-
+-	clp_add_pci_device(entry->fid, entry->fh, entry->config_state);
+-}
+-
+-static void __clp_rescan(struct clp_fh_list_entry *entry, void *data)
+ {
+ 	struct zpci_dev *zdev;
+ 
+@@ -321,19 +313,8 @@ static void __clp_rescan(struct clp_fh_list_entry *entry, void *data)
+ 		return;
+ 
+ 	zdev = get_zdev_by_fid(entry->fid);
+-	if (!zdev) {
++	if (!zdev)
+ 		clp_add_pci_device(entry->fid, entry->fh, entry->config_state);
+-		return;
+-	}
+-
+-	if (!entry->config_state) {
+-		/*
+-		 * The handle is already disabled, that means no iota/irq freeing via
+-		 * the firmware interfaces anymore. Need to free resources manually
+-		 * (DMA memory, debug, sysfs)...
+-		 */
+-		zpci_stop_device(zdev);
+-	}
+ }
+ 
+ static void __clp_update(struct clp_fh_list_entry *entry, void *data)
+@@ -370,11 +351,13 @@ int clp_rescan_pci_devices(void)
+ 	struct clp_req_rsp_list_pci *rrb;
+ 	int rc;
+ 
++	zpci_remove_reserved_devices();
++
+ 	rrb = clp_alloc_block(GFP_KERNEL);
+ 	if (!rrb)
+ 		return -ENOMEM;
+ 
+-	rc = clp_list_pci(rrb, NULL, __clp_rescan);
++	rc = clp_list_pci(rrb, NULL, __clp_add);
+ 
+ 	clp_free_block(rrb);
+ 	return rc;
