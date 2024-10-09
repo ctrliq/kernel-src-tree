@@ -1,0 +1,424 @@
+net: dsa: reduce number of protocol hooks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] dsa: reduce number of protocol hooks (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 93.51%
+commit-author Florian Fainelli <f.fainelli@gmail.com>
+commit 3e8a72d1dae374cf6fc1dba97cec663585845ff9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3e8a72d1.failed
+
+DSA is currently registering one packet_type function per EtherType it
+needs to intercept in the receive path of a DSA-enabled Ethernet device.
+Right now we have three of them: trailer, DSA and eDSA, and there might
+be more in the future, this will not scale to the addition of new
+protocols.
+
+This patch proceeds with adding a new layer of abstraction and two new
+functions:
+
+dsa_switch_rcv() which will dispatch into the tag-protocol specific
+receive function implemented by net/dsa/tag_*.c
+
+dsa_slave_xmit() which will dispatch into the tag-protocol specific
+transmit function implemented by net/dsa/tag_*.c
+
+When we do create the per-port slave network devices, we iterate over
+the switch protocol to assign the DSA-specific receive and transmit
+operations.
+
+A new fake ethertype value is used: ETH_P_XDSA to illustrate the fact
+that this is no longer going to look like ETH_P_DSA or ETH_P_TRAILER
+like it used to be.
+
+This allows us to greatly simplify the check in eth_type_trans() and
+always override the skb->protocol with ETH_P_XDSA for Ethernet switches
+tagged protocol, while also reducing the number repetitive slave
+netdevice_ops assignments.
+
+	Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3e8a72d1dae374cf6fc1dba97cec663585845ff9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/dsa.h
+diff --cc include/linux/netdevice.h
+index f1dbb3a4ae20,1875dc71422a..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1925,27 -1775,19 +1925,16 @@@ struct net *dev_net(const struct net_de
+  static inline
+  void dev_net_set(struct net_device *dev, struct net *net)
+  {
+ -#ifdef CONFIG_NET_NS
+ -	release_net(dev->nd_net);
+ -	dev->nd_net = hold_net(net);
+ -#endif
+ +	write_pnet(&dev->nd_net, net);
+  }
+  
+- static inline bool netdev_uses_dsa_tags(struct net_device *dev)
++ static inline bool netdev_uses_dsa(struct net_device *dev)
+  {
+- #ifdef CONFIG_NET_DSA_TAG_DSA
+- 	if (dev->dsa_ptr != NULL)
+- 		return dsa_uses_dsa_tags(dev->dsa_ptr);
+- #endif
+- 
+- 	return 0;
+- }
+- 
+- static inline bool netdev_uses_trailer_tags(struct net_device *dev)
+- {
+- #ifdef CONFIG_NET_DSA_TAG_TRAILER
+- 	if (dev->dsa_ptr != NULL)
+- 		return dsa_uses_trailer_tags(dev->dsa_ptr);
++ #ifdef CONFIG_NET_DSA
++ 	return dev->dsa_ptr != NULL;
++ #else
++ 	return false;
+  #endif
+- 
+- 	return 0;
+  }
+  
+  /**
+@@@ -2146,6 -1917,18 +2135,21 @@@ struct packet_offload 
+  	struct list_head	 list;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct udp_offload {
++ 	__be16			 port;
++ 	struct offload_callbacks callbacks;
++ };
++ 
++ struct dsa_device_ops {
++ 	netdev_tx_t (*xmit)(struct sk_buff *skb, struct net_device *dev);
++ 	int (*rcv)(struct sk_buff *skb, struct net_device *dev,
++ 		   struct packet_type *pt, struct net_device *orig_dev);
++ };
++ 
++ 
+++>>>>>>> 3e8a72d1dae3 (net: dsa: reduce number of protocol hooks)
+  /* often modified stats are per cpu, other are shared (netdev->stats) */
+  struct pcpu_sw_netstats {
+  	u64     rx_packets;
+diff --cc include/net/dsa.h
+index 7828ebf99ee1,6e26f1e4d8ce..000000000000
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@@ -181,21 -184,9 +184,27 @@@ struct dsa_switch_driver 
+  void register_switch_driver(struct dsa_switch_driver *type);
+  void unregister_switch_driver(struct dsa_switch_driver *type);
+  
+++<<<<<<< HEAD
+ +/*
+ + * The original DSA tag format and some other tag formats have no
+ + * ethertype, which means that we need to add a little hack to the
+ + * networking receive path to make sure that received frames get
+ + * the right ->protocol assigned to them when one of those tag
+ + * formats is in use.
+ + */
+ +static inline bool dsa_uses_dsa_tags(struct dsa_switch_tree *dst)
+ +{
+ +	return !!(dst->tag_protocol == htons(ETH_P_DSA));
+ +}
+ +
+ +static inline bool dsa_uses_trailer_tags(struct dsa_switch_tree *dst)
+ +{
+ +	return !!(dst->tag_protocol == htons(ETH_P_TRAILER));
+++=======
++ static inline void *ds_to_priv(struct dsa_switch *ds)
++ {
++ 	return (void *)(ds + 1);
+++>>>>>>> 3e8a72d1dae3 (net: dsa: reduce number of protocol hooks)
+  }
+  
+  #endif
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/net/dsa.h
+diff --git a/include/uapi/linux/if_ether.h b/include/uapi/linux/if_ether.h
+index 22d6e04e78f5..01db53bec08e 100644
+--- a/include/uapi/linux/if_ether.h
++++ b/include/uapi/linux/if_ether.h
+@@ -128,6 +128,7 @@
+ #define ETH_P_PHONET	0x00F5		/* Nokia Phonet frames          */
+ #define ETH_P_IEEE802154 0x00F6		/* IEEE802.15.4 frame		*/
+ #define ETH_P_CAIF	0x00F7		/* ST-Ericsson CAIF protocol	*/
++#define ETH_P_XDSA	0x00F8		/* Multiplexed DSA protocol	*/
+ 
+ /*
+  *	This is an Ethernet frame header.
+diff --git a/net/dsa/dsa.c b/net/dsa/dsa.c
+index 0eb5d5e76dfb..7a57da66c0a5 100644
+--- a/net/dsa/dsa.c
++++ b/net/dsa/dsa.c
+@@ -608,6 +608,24 @@ static void dsa_shutdown(struct platform_device *pdev)
+ {
+ }
+ 
++static int dsa_switch_rcv(struct sk_buff *skb, struct net_device *dev,
++			  struct packet_type *pt, struct net_device *orig_dev)
++{
++	struct dsa_switch_tree *dst = dev->dsa_ptr;
++
++	if (unlikely(dst == NULL)) {
++		kfree_skb(skb);
++		return 0;
++	}
++
++	return dst->ops->rcv(skb, dev, pt, orig_dev);
++}
++
++struct packet_type dsa_pack_type __read_mostly = {
++	.type	= cpu_to_be16(ETH_P_XDSA),
++	.func	= dsa_switch_rcv,
++};
++
+ static const struct of_device_id dsa_of_match_table[] = {
+ 	{ .compatible = "marvell,dsa", },
+ 	{}
+@@ -633,30 +651,15 @@ static int __init dsa_init_module(void)
+ 	if (rc)
+ 		return rc;
+ 
+-#ifdef CONFIG_NET_DSA_TAG_DSA
+-	dev_add_pack(&dsa_packet_type);
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_EDSA
+-	dev_add_pack(&edsa_packet_type);
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_TRAILER
+-	dev_add_pack(&trailer_packet_type);
+-#endif
++	dev_add_pack(&dsa_pack_type);
++
+ 	return 0;
+ }
+ module_init(dsa_init_module);
+ 
+ static void __exit dsa_cleanup_module(void)
+ {
+-#ifdef CONFIG_NET_DSA_TAG_TRAILER
+-	dev_remove_pack(&trailer_packet_type);
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_EDSA
+-	dev_remove_pack(&edsa_packet_type);
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_DSA
+-	dev_remove_pack(&dsa_packet_type);
+-#endif
++	dev_remove_pack(&dsa_pack_type);
+ 	platform_driver_unregister(&dsa_driver);
+ }
+ module_exit(dsa_cleanup_module);
+diff --git a/net/dsa/dsa_priv.h b/net/dsa/dsa_priv.h
+index d4cf5cc747e3..218d75d16f6f 100644
+--- a/net/dsa/dsa_priv.h
++++ b/net/dsa/dsa_priv.h
+@@ -45,16 +45,13 @@ struct net_device *dsa_slave_create(struct dsa_switch *ds,
+ 				    int port, char *name);
+ 
+ /* tag_dsa.c */
+-netdev_tx_t dsa_xmit(struct sk_buff *skb, struct net_device *dev);
+-extern struct packet_type dsa_packet_type;
++extern const struct dsa_device_ops dsa_netdev_ops;
+ 
+ /* tag_edsa.c */
+-netdev_tx_t edsa_xmit(struct sk_buff *skb, struct net_device *dev);
+-extern struct packet_type edsa_packet_type;
++extern const struct dsa_device_ops edsa_netdev_ops;
+ 
+ /* tag_trailer.c */
+-netdev_tx_t trailer_xmit(struct sk_buff *skb, struct net_device *dev);
+-extern struct packet_type trailer_packet_type;
++extern const struct dsa_device_ops trailer_netdev_ops;
+ 
+ 
+ #endif
+diff --git a/net/dsa/slave.c b/net/dsa/slave.c
+index 6ebd8fbd9285..f3efc3546e20 100644
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@ -171,6 +171,14 @@ static int dsa_slave_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static netdev_tx_t dsa_slave_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct dsa_slave_priv *p = netdev_priv(dev);
++	struct dsa_switch_tree *dst = p->parent->dst;
++
++	return dst->ops->xmit(skb, dev);
++}
++
+ 
+ /* ethtool operations *******************************************************/
+ static int
+@@ -293,42 +301,16 @@ static const struct ethtool_ops dsa_slave_ethtool_ops = {
+ 	.get_sset_count		= dsa_slave_get_sset_count,
+ };
+ 
+-#ifdef CONFIG_NET_DSA_TAG_DSA
+-static const struct net_device_ops dsa_netdev_ops = {
++static const struct net_device_ops dsa_slave_netdev_ops = {
+ 	.ndo_init		= dsa_slave_init,
+ 	.ndo_open	 	= dsa_slave_open,
+ 	.ndo_stop		= dsa_slave_close,
+-	.ndo_start_xmit		= dsa_xmit,
++	.ndo_start_xmit		= dsa_slave_xmit,
+ 	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+ 	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+ 	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+ 	.ndo_do_ioctl		= dsa_slave_ioctl,
+ };
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_EDSA
+-static const struct net_device_ops edsa_netdev_ops = {
+-	.ndo_init		= dsa_slave_init,
+-	.ndo_open	 	= dsa_slave_open,
+-	.ndo_stop		= dsa_slave_close,
+-	.ndo_start_xmit		= edsa_xmit,
+-	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+-	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+-	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+-	.ndo_do_ioctl		= dsa_slave_ioctl,
+-};
+-#endif
+-#ifdef CONFIG_NET_DSA_TAG_TRAILER
+-static const struct net_device_ops trailer_netdev_ops = {
+-	.ndo_init		= dsa_slave_init,
+-	.ndo_open	 	= dsa_slave_open,
+-	.ndo_stop		= dsa_slave_close,
+-	.ndo_start_xmit		= trailer_xmit,
+-	.ndo_change_rx_flags	= dsa_slave_change_rx_flags,
+-	.ndo_set_rx_mode	= dsa_slave_set_rx_mode,
+-	.ndo_set_mac_address	= dsa_slave_set_mac_address,
+-	.ndo_do_ioctl		= dsa_slave_ioctl,
+-};
+-#endif
+ 
+ /* slave device setup *******************************************************/
+ struct net_device *
+@@ -349,21 +331,22 @@ dsa_slave_create(struct dsa_switch *ds, struct device *parent,
+ 	SET_ETHTOOL_OPS(slave_dev, &dsa_slave_ethtool_ops);
+ 	memcpy(slave_dev->dev_addr, master->dev_addr, ETH_ALEN);
+ 	slave_dev->tx_queue_len = 0;
++	slave_dev->netdev_ops = &dsa_slave_netdev_ops;
+ 
+ 	switch (ds->dst->tag_protocol) {
+ #ifdef CONFIG_NET_DSA_TAG_DSA
+ 	case htons(ETH_P_DSA):
+-		slave_dev->netdev_ops = &dsa_netdev_ops;
++		ds->dst->ops = &dsa_netdev_ops;
+ 		break;
+ #endif
+ #ifdef CONFIG_NET_DSA_TAG_EDSA
+ 	case htons(ETH_P_EDSA):
+-		slave_dev->netdev_ops = &edsa_netdev_ops;
++		ds->dst->ops = &edsa_netdev_ops;
+ 		break;
+ #endif
+ #ifdef CONFIG_NET_DSA_TAG_TRAILER
+ 	case htons(ETH_P_TRAILER):
+-		slave_dev->netdev_ops = &trailer_netdev_ops;
++		ds->dst->ops = &trailer_netdev_ops;
+ 		break;
+ #endif
+ 	default:
+diff --git a/net/dsa/tag_dsa.c b/net/dsa/tag_dsa.c
+index cacce1e22f9c..d7dbc5bda5c0 100644
+--- a/net/dsa/tag_dsa.c
++++ b/net/dsa/tag_dsa.c
+@@ -16,7 +16,7 @@
+ 
+ #define DSA_HLEN	4
+ 
+-netdev_tx_t dsa_xmit(struct sk_buff *skb, struct net_device *dev)
++static netdev_tx_t dsa_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct dsa_slave_priv *p = netdev_priv(dev);
+ 	u8 *dsa_header;
+@@ -186,7 +186,7 @@ out:
+ 	return 0;
+ }
+ 
+-struct packet_type dsa_packet_type __read_mostly = {
+-	.type	= cpu_to_be16(ETH_P_DSA),
+-	.func	= dsa_rcv,
++const struct dsa_device_ops dsa_netdev_ops = {
++	.xmit	= dsa_xmit,
++	.rcv	= dsa_rcv,
+ };
+diff --git a/net/dsa/tag_edsa.c b/net/dsa/tag_edsa.c
+index e70c43c25e64..6b30abe89183 100644
+--- a/net/dsa/tag_edsa.c
++++ b/net/dsa/tag_edsa.c
+@@ -17,7 +17,7 @@
+ #define DSA_HLEN	4
+ #define EDSA_HLEN	8
+ 
+-netdev_tx_t edsa_xmit(struct sk_buff *skb, struct net_device *dev)
++static netdev_tx_t edsa_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct dsa_slave_priv *p = netdev_priv(dev);
+ 	u8 *edsa_header;
+@@ -205,7 +205,7 @@ out:
+ 	return 0;
+ }
+ 
+-struct packet_type edsa_packet_type __read_mostly = {
+-	.type	= cpu_to_be16(ETH_P_EDSA),
+-	.func	= edsa_rcv,
++const struct dsa_device_ops edsa_netdev_ops = {
++	.xmit	= edsa_xmit,
++	.rcv	= edsa_rcv,
+ };
+diff --git a/net/dsa/tag_trailer.c b/net/dsa/tag_trailer.c
+index 94bc260d015d..5fe9444842c5 100644
+--- a/net/dsa/tag_trailer.c
++++ b/net/dsa/tag_trailer.c
+@@ -14,7 +14,7 @@
+ #include <linux/slab.h>
+ #include "dsa_priv.h"
+ 
+-netdev_tx_t trailer_xmit(struct sk_buff *skb, struct net_device *dev)
++static netdev_tx_t trailer_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct dsa_slave_priv *p = netdev_priv(dev);
+ 	struct sk_buff *nskb;
+@@ -114,7 +114,7 @@ out:
+ 	return 0;
+ }
+ 
+-struct packet_type trailer_packet_type __read_mostly = {
+-	.type	= cpu_to_be16(ETH_P_TRAILER),
+-	.func	= trailer_rcv,
++const struct dsa_device_ops trailer_netdev_ops = {
++	.xmit	= trailer_xmit,
++	.rcv	= trailer_rcv,
+ };
+diff --git a/net/ethernet/eth.c b/net/ethernet/eth.c
+index de86b55317f9..e9109c134cc9 100644
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -221,11 +221,8 @@ __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
+ 	 * variants has been configured on the receiving interface,
+ 	 * and if so, set skb->protocol without looking at the packet.
+ 	 */
+-	if (unlikely(netdev_uses_dsa_tags(dev)))
+-		return htons(ETH_P_DSA);
+-
+-	if (unlikely(netdev_uses_trailer_tags(dev)))
+-		return htons(ETH_P_TRAILER);
++	if (unlikely(netdev_uses_dsa(dev)))
++		return htons(ETH_P_XDSA);
+ 
+ 	if (likely(eth_proto_is_802_3(eth->h_proto)))
+ 		return eth->h_proto;
