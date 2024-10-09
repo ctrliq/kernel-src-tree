@@ -1,0 +1,145 @@
+ALSA: x86: Minor cleanup of reset buffer procedure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit f4566aa112b86649b74f3d64c21ec2c8a84d5c1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f4566aa1.failed
+
+The procedure to reset buffer pointers is performed in two places and
+still open-coded.  Simplify the helper function and use it
+consistently.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit f4566aa112b86649b74f3d64c21ec2c8a84d5c1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+diff --cc sound/x86/intel_hdmi_audio.c
+index 063e2be94d05,0a9c82aca05f..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -255,32 -225,41 +255,37 @@@ static int had_read_modify_aud_config_v
+  	 * If substream is NULL, there is no active stream.
+  	 * In this case just set channels to 2
+  	 */
+ -	channels = substream ? substream->runtime->channels : 2;
+ -	dev_dbg(intelhaddata->dev, "enable %d, ch=%d\n", enable, channels);
+ -
+ -	cfg_val.regx.num_ch = channels - 2;
+ -	if (enable)
+ -		cfg_val.regx.aud_en = 1;
+ -	mask = AUD_CONFIG_CH_MASK | 1;
+ -
+ -	had_read_register(intelhaddata, AUD_CONFIG, &val);
+ -	val &= ~mask;
+ -	val |= cfg_val.regval;
+ -	had_write_register(intelhaddata, AUD_CONFIG, val);
+ +	if (substream)
+ +		channels = substream->runtime->channels;
+ +	else
+ +		channels = 2;
+ +	cfg_val.cfg_regx_v2.num_ch = channels - 2;
+ +
+ +	data = data | cfg_val.cfg_regval;
+ +	mask = mask | AUD_CONFIG_CH_MASK_V2;
+ +
+ +	pr_debug("%s : data = %x, mask =%x\n", __func__, data, mask);
+ +
+ +	return had_read_modify(intelhaddata, AUD_CONFIG, data, mask);
+  }
+  
+ -/* enable / disable the audio interface */
+ -static void snd_intelhad_enable_audio_int(struct snd_intelhad *ctx, bool enable)
+ +void snd_intelhad_enable_audio(struct snd_pcm_substream *substream, u8 enable)
+  {
+ -	u32 status_reg;
+ -
+ -	if (enable) {
+ -		had_read_register(ctx, AUD_HDMI_STATUS, &status_reg);
+ -		status_reg |= HDMI_AUDIO_BUFFER_DONE | HDMI_AUDIO_UNDERRUN;
+ -		had_write_register(ctx, AUD_HDMI_STATUS, status_reg);
+ -		had_read_register(ctx, AUD_HDMI_STATUS, &status_reg);
+ -	}
+ +	had_read_modify_aud_config_v2(substream, enable, BIT(0));
+  }
+  
+- static void snd_intelhad_reset_audio(struct snd_intelhad *intelhaddata,
+- 				     u8 reset)
++ /* Reset buffer pointers */
++ static void had_reset_audio(struct snd_intelhad *intelhaddata)
+  {
+++<<<<<<< HEAD
+ +	had_write_register(intelhaddata, AUD_HDMI_STATUS_v2, reset);
+++=======
++ 	had_write_register(intelhaddata, AUD_HDMI_STATUS, 1);
++ 	had_write_register(intelhaddata, AUD_HDMI_STATUS, 0);
+++>>>>>>> f4566aa112b8 (ALSA: x86: Minor cleanup of reset buffer procedure)
+  }
+  
+ -/*
+ +/**
+   * initialize audio channel status registers
+   * This function is called in the prepare callback
+   */
+@@@ -924,9 -894,8 +929,14 @@@ void snd_intelhad_handle_underrun(struc
+  	/* Handle Underrun interrupt within Audio Unit */
+  	had_write_register(intelhaddata, AUD_CONFIG, 0);
+  	/* Reset buffer pointers */
+++<<<<<<< HEAD
+ +	had_write_register(intelhaddata, AUD_HDMI_STATUS_v2, 1);
+ +	had_write_register(intelhaddata, AUD_HDMI_STATUS_v2, 0);
+ +	/**
+++=======
++ 	had_reset_audio(intelhaddata);
++ 	/*
+++>>>>>>> f4566aa112b8 (ALSA: x86: Minor cleanup of reset buffer procedure)
+  	 * The interrupt status 'sticky' bits might not be cleared by
+  	 * setting '1' to that bit once...
+  	 */
+@@@ -1213,28 -1073,20 +1223,33 @@@ static int snd_intelhad_pcm_trigger(str
+  		break;
+  
+  	case SNDRV_PCM_TRIGGER_STOP:
+ -	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ -	case SNDRV_PCM_TRIGGER_SUSPEND:
+ -		spin_lock(&intelhaddata->had_spinlock);
+ +		pr_debug("Trigger Stop\n");
+ +		spin_lock_irqsave(&intelhaddata->had_spinlock, flag_irq);
+ +		intelhaddata->stream_info.str_id = 0;
+ +		intelhaddata->curr_buf = 0;
+  
+ -		/* Stop reporting BUFFER_DONE/UNDERRUN to above layers */
+ +		/* Stop reporting BUFFER_DONE/UNDERRUN to above layers*/
+  
+ -		intelhaddata->stream_info.running = false;
+ -		spin_unlock(&intelhaddata->had_spinlock);
+ +		had_stream->stream_type = HAD_INIT;
+ +		spin_unlock_irqrestore(&intelhaddata->had_spinlock, flag_irq);
+  		/* Disable Audio */
+ -		snd_intelhad_enable_audio_int(intelhaddata, false);
+ -		snd_intelhad_enable_audio(substream, intelhaddata, false);
+ +		/*
+ +		 * ToDo: Need to disable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		had_set_caps(intelhaddata, HAD_SET_DISABLE_AUDIO_INT, &caps);
+ +		snd_intelhad_enable_audio(substream, 0);
+  		/* Reset buffer pointers */
+++<<<<<<< HEAD
+ +		snd_intelhad_reset_audio(intelhaddata, 1);
+ +		snd_intelhad_reset_audio(intelhaddata, 0);
+ +		stream->stream_status = STREAM_DROPPED;
+ +		had_set_caps(intelhaddata, HAD_SET_DISABLE_AUDIO, NULL);
+++=======
++ 		had_reset_audio(intelhaddata);
++ 		snd_intelhad_enable_audio_int(intelhaddata, false);
+++>>>>>>> f4566aa112b8 (ALSA: x86: Minor cleanup of reset buffer procedure)
+  		break;
+  
+  	default:
+* Unmerged path sound/x86/intel_hdmi_audio.c
