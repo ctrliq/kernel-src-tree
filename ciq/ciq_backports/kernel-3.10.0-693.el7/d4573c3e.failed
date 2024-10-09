@@ -1,0 +1,112 @@
+sched: Improve load balancing in the presence of idle CPUs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Preeti U Murthy <preeti@linux.vnet.ibm.com>
+commit d4573c3e1c992668f5dcd57d1c2ced56ae9650b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d4573c3e.failed
+
+When a CPU is kicked to do nohz idle balancing, it wakes up to do load
+balancing on itself, followed by load balancing on behalf of idle CPUs.
+But it may end up with load after the load balancing attempt on itself.
+This aborts nohz idle balancing. As a result several idle CPUs are left
+without tasks till such a time that an ILB CPU finds it unfavorable to
+pull tasks upon itself. This delays spreading of load across idle CPUs
+and worse, clutters only a few CPUs with tasks.
+
+The effect of the above problem was observed on an SMT8 POWER server
+with 2 levels of numa domains. Busy loops equal to number of cores were
+spawned. Since load balancing on fork/exec is discouraged across numa
+domains, all busy loops would start on one of the numa domains. However
+it was expected that eventually one busy loop would run per core across
+all domains due to nohz idle load balancing. But it was observed that it
+took as long as 10 seconds to spread the load across numa domains.
+
+Further investigation showed that this was a consequence of the
+following:
+
+ 1. An ILB CPU was chosen from the first numa domain to trigger nohz idle
+    load balancing [Given the experiment, upto 6 CPUs per core could be
+    potentially idle in this domain.]
+
+ 2. However the ILB CPU would call load_balance() on itself before
+    initiating nohz idle load balancing.
+
+ 3. Given cores are SMT8, the ILB CPU had enough opportunities to pull
+    tasks from its sibling cores to even out load.
+
+ 4. Now that the ILB CPU was no longer idle, it would abort nohz idle
+    load balancing
+
+As a result the opportunities to spread load across numa domains were
+lost until such a time that the cores within the first numa domain had
+equal number of tasks among themselves.  This is a pretty bad scenario,
+since the cores within the first numa domain would have as many as 4
+tasks each, while cores in the neighbouring numa domains would all
+remain idle.
+
+Fix this, by checking if a CPU was woken up to do nohz idle load
+balancing, before it does load balancing upon itself. This way we allow
+idle CPUs across the system to do load balancing which results in
+quicker spread of load, instead of performing load balancing within the
+local sched domain hierarchy of the ILB CPU alone under circumstances
+such as above.
+
+	Signed-off-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Jason Low <jason.low2@hp.com>
+	Cc: benh@kernel.crashing.org
+	Cc: daniel.lezcano@linaro.org
+	Cc: efault@gmx.de
+	Cc: iamjoonsoo.kim@lge.com
+	Cc: morten.rasmussen@arm.com
+	Cc: pjt@google.com
+	Cc: riel@redhat.com
+	Cc: srikar@linux.vnet.ibm.com
+	Cc: svaidy@linux.vnet.ibm.com
+	Cc: tim.c.chen@linux.intel.com
+	Cc: vincent.guittot@linaro.org
+Link: http://lkml.kernel.org/r/20150326130014.21532.17158.stgit@preeti.in.ibm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d4573c3e1c992668f5dcd57d1c2ced56ae9650b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 4ce2561fad38,46855d06666a..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -7215,21 -7753,18 +7215,28 @@@ static void run_rebalance_domains(struc
+  	enum cpu_idle_type idle = this_rq->idle_balance ?
+  						CPU_IDLE : CPU_NOT_IDLE;
+  
+++<<<<<<< HEAD
+ +	rebalance_domains(this_cpu, idle);
+ +
+++=======
+++>>>>>>> d4573c3e1c99 (sched: Improve load balancing in the presence of idle CPUs)
+  	/*
+  	 * If this cpu has a pending nohz_balance_kick, then do the
+  	 * balancing on behalf of the other idle cpus whose ticks are
+- 	 * stopped.
++ 	 * stopped. Do nohz_idle_balance *before* rebalance_domains to
++ 	 * give the idle cpus a chance to load balance. Else we may
++ 	 * load balance only within the local sched_domain hierarchy
++ 	 * and abort nohz_idle_balance altogether if we pull some load.
+  	 */
+  	nohz_idle_balance(this_rq, idle);
++ 	rebalance_domains(this_rq, idle);
+  }
+  
+ +static inline int on_null_domain(int cpu)
+ +{
+ +	return !rcu_dereference_sched(cpu_rq(cpu)->sd);
+ +}
+ +
+  /*
+   * Trigger the SCHED_SOFTIRQ if it is time to do periodic load balancing.
+   */
+* Unmerged path kernel/sched/fair.c
