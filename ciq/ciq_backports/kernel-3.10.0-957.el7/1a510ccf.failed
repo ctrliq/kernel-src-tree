@@ -1,0 +1,466 @@
+amd-xgbe: Add support for VXLAN offload capabilities
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 1a510ccf5869a95c0ff324c61518e42e95712844
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1a510ccf.failed
+
+The hardware has the capability to perform checksum offload support
+(both Tx and Rx) and TSO support for VXLAN packets. Add the support
+required to enable this.
+
+The hardware can only support a single VXLAN port for offload. If more
+than one VXLAN port is added then the offload capabilities have to be
+disabled and can no longer be advertised.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a510ccf5869a95c0ff324c61518e42e95712844)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index ebb2a46a2654,608693d11bd7..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -2059,8 -2335,112 +2302,113 @@@ static int xgbe_set_features(struct net
+  	return 0;
+  }
+  
++ static void xgbe_udp_tunnel_add(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++ 	struct xgbe_vxlan_data *vdata;
++ 
++ 	if (!pdata->hw_feat.vxn)
++ 		return;
++ 
++ 	if (ti->type != UDP_TUNNEL_TYPE_VXLAN)
++ 		return;
++ 
++ 	pdata->vxlan_port_count++;
++ 
++ 	netif_dbg(pdata, drv, netdev,
++ 		  "adding VXLAN tunnel, family=%hx/port=%hx\n",
++ 		  ti->sa_family, be16_to_cpu(ti->port));
++ 
++ 	if (pdata->vxlan_force_disable)
++ 		return;
++ 
++ 	vdata = kzalloc(sizeof(*vdata), GFP_ATOMIC);
++ 	if (!vdata) {
++ 		/* Can no longer properly track VXLAN ports */
++ 		pdata->vxlan_force_disable = 1;
++ 		netif_dbg(pdata, drv, netdev,
++ 			  "internal error, disabling VXLAN accelerations\n");
++ 
++ 		xgbe_disable_vxlan_accel(pdata);
++ 
++ 		return;
++ 	}
++ 	vdata->sa_family = ti->sa_family;
++ 	vdata->port = ti->port;
++ 
++ 	list_add_tail(&vdata->list, &pdata->vxlan_ports);
++ 
++ 	/* First port added? */
++ 	if (pdata->vxlan_port_count == 1) {
++ 		xgbe_enable_vxlan_accel(pdata);
++ 
++ 		return;
++ 	}
++ }
++ 
++ static void xgbe_udp_tunnel_del(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++ 	struct xgbe_vxlan_data *vdata;
++ 
++ 	if (!pdata->hw_feat.vxn)
++ 		return;
++ 
++ 	if (ti->type != UDP_TUNNEL_TYPE_VXLAN)
++ 		return;
++ 
++ 	netif_dbg(pdata, drv, netdev,
++ 		  "deleting VXLAN tunnel, family=%hx/port=%hx\n",
++ 		  ti->sa_family, be16_to_cpu(ti->port));
++ 
++ 	/* Don't need safe version since loop terminates with deletion */
++ 	list_for_each_entry(vdata, &pdata->vxlan_ports, list) {
++ 		if (vdata->sa_family != ti->sa_family)
++ 			continue;
++ 
++ 		if (vdata->port != ti->port)
++ 			continue;
++ 
++ 		list_del(&vdata->list);
++ 		kfree(vdata);
++ 
++ 		break;
++ 	}
++ 
++ 	pdata->vxlan_port_count--;
++ 	if (!pdata->vxlan_port_count) {
++ 		xgbe_reset_vxlan_accel(pdata);
++ 
++ 		return;
++ 	}
++ 
++ 	if (pdata->vxlan_force_disable)
++ 		return;
++ 
++ 	/* See if VXLAN tunnel id needs to be changed */
++ 	vdata = list_first_entry(&pdata->vxlan_ports,
++ 				 struct xgbe_vxlan_data, list);
++ 	if (pdata->vxlan_port == be16_to_cpu(vdata->port))
++ 		return;
++ 
++ 	pdata->vxlan_port = be16_to_cpu(vdata->port);
++ 	pdata->hw_if.set_vxlan_id(pdata);
++ }
++ 
++ static netdev_features_t xgbe_features_check(struct sk_buff *skb,
++ 					     struct net_device *netdev,
++ 					     netdev_features_t features)
++ {
++ 	features = vlan_features_check(skb, features);
++ 	features = vxlan_features_check(skb, features);
++ 
++ 	return features;
++ }
++ 
+  static const struct net_device_ops xgbe_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= xgbe_open,
+  	.ndo_stop		= xgbe_close,
+  	.ndo_start_xmit		= xgbe_xmit,
+@@@ -2076,8 -2456,12 +2424,16 @@@
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller	= xgbe_poll_controller,
+  #endif
+++<<<<<<< HEAD
+ +	.extended.ndo_setup_tc_rh = xgbe_setup_tc,
+++=======
++ 	.ndo_setup_tc		= xgbe_setup_tc,
++ 	.ndo_fix_features	= xgbe_fix_features,
+++>>>>>>> 1a510ccf5869 (amd-xgbe: Add support for VXLAN offload capabilities)
+  	.ndo_set_features	= xgbe_set_features,
++ 	.ndo_udp_tunnel_add	= xgbe_udp_tunnel_add,
++ 	.ndo_udp_tunnel_del	= xgbe_udp_tunnel_del,
++ 	.ndo_features_check	= xgbe_features_check,
+  };
+  
+  const struct net_device_ops *xgbe_get_netdev_ops(void)
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index a907c98e68fb,db155fe7f74d..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -129,6 -129,10 +129,13 @@@
+  #include <net/dcbnl.h>
+  #include <linux/completion.h>
+  #include <linux/cpumask.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/interrupt.h>
++ #include <linux/dcache.h>
++ #include <linux/ethtool.h>
++ #include <linux/list.h>
+++>>>>>>> 1a510ccf5869 (amd-xgbe: Add support for VXLAN offload capabilities)
+  
+  #define XGBE_DRV_NAME		"amd-xgbe"
+  #define XGBE_DRV_VERSION	"1.0.3"
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-common.h b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index d07edf9eaa69..943133034879 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@ -298,6 +298,7 @@
+ #define MAC_RWKPFR			0x00c4
+ #define MAC_LPICSR			0x00d0
+ #define MAC_LPITCR			0x00d4
++#define MAC_TIR				0x00e0
+ #define MAC_VR				0x0110
+ #define MAC_DR				0x0114
+ #define MAC_HWF0R			0x011c
+@@ -364,6 +365,8 @@
+ #define MAC_HWF0R_TXCOESEL_WIDTH	1
+ #define MAC_HWF0R_VLHASH_INDEX		4
+ #define MAC_HWF0R_VLHASH_WIDTH		1
++#define MAC_HWF0R_VXN_INDEX		29
++#define MAC_HWF0R_VXN_WIDTH		1
+ #define MAC_HWF1R_ADDR64_INDEX		14
+ #define MAC_HWF1R_ADDR64_WIDTH		2
+ #define MAC_HWF1R_ADVTHWORD_INDEX	13
+@@ -448,6 +451,8 @@
+ #define MAC_PFR_PR_WIDTH		1
+ #define MAC_PFR_VTFE_INDEX		16
+ #define MAC_PFR_VTFE_WIDTH		1
++#define MAC_PFR_VUCC_INDEX		22
++#define MAC_PFR_VUCC_WIDTH		1
+ #define MAC_PMTCSR_MGKPKTEN_INDEX	1
+ #define MAC_PMTCSR_MGKPKTEN_WIDTH	1
+ #define MAC_PMTCSR_PWRDWN_INDEX		0
+@@ -510,6 +515,12 @@
+ #define MAC_TCR_SS_WIDTH		2
+ #define MAC_TCR_TE_INDEX		0
+ #define MAC_TCR_TE_WIDTH		1
++#define MAC_TCR_VNE_INDEX		24
++#define MAC_TCR_VNE_WIDTH		1
++#define MAC_TCR_VNM_INDEX		25
++#define MAC_TCR_VNM_WIDTH		1
++#define MAC_TIR_TNID_INDEX		0
++#define MAC_TIR_TNID_WIDTH		16
+ #define MAC_TSCR_AV8021ASMEN_INDEX	28
+ #define MAC_TSCR_AV8021ASMEN_WIDTH	1
+ #define MAC_TSCR_SNAPTYPSEL_INDEX	16
+@@ -1153,11 +1164,17 @@
+ #define RX_PACKET_ATTRIBUTES_RSS_HASH_WIDTH	1
+ #define RX_PACKET_ATTRIBUTES_FIRST_INDEX	7
+ #define RX_PACKET_ATTRIBUTES_FIRST_WIDTH	1
++#define RX_PACKET_ATTRIBUTES_TNP_INDEX		8
++#define RX_PACKET_ATTRIBUTES_TNP_WIDTH		1
++#define RX_PACKET_ATTRIBUTES_TNPCSUM_DONE_INDEX	9
++#define RX_PACKET_ATTRIBUTES_TNPCSUM_DONE_WIDTH	1
+ 
+ #define RX_NORMAL_DESC0_OVT_INDEX		0
+ #define RX_NORMAL_DESC0_OVT_WIDTH		16
+ #define RX_NORMAL_DESC2_HL_INDEX		0
+ #define RX_NORMAL_DESC2_HL_WIDTH		10
++#define RX_NORMAL_DESC2_TNP_INDEX		11
++#define RX_NORMAL_DESC2_TNP_WIDTH		1
+ #define RX_NORMAL_DESC3_CDA_INDEX		27
+ #define RX_NORMAL_DESC3_CDA_WIDTH		1
+ #define RX_NORMAL_DESC3_CTXT_INDEX		30
+@@ -1184,9 +1201,11 @@
+ #define RX_DESC3_L34T_IPV4_TCP			1
+ #define RX_DESC3_L34T_IPV4_UDP			2
+ #define RX_DESC3_L34T_IPV4_ICMP			3
++#define RX_DESC3_L34T_IPV4_UNKNOWN		7
+ #define RX_DESC3_L34T_IPV6_TCP			9
+ #define RX_DESC3_L34T_IPV6_UDP			10
+ #define RX_DESC3_L34T_IPV6_ICMP			11
++#define RX_DESC3_L34T_IPV6_UNKNOWN		15
+ 
+ #define RX_CONTEXT_DESC3_TSA_INDEX		4
+ #define RX_CONTEXT_DESC3_TSA_WIDTH		1
+@@ -1201,6 +1220,8 @@
+ #define TX_PACKET_ATTRIBUTES_VLAN_CTAG_WIDTH	1
+ #define TX_PACKET_ATTRIBUTES_PTP_INDEX		3
+ #define TX_PACKET_ATTRIBUTES_PTP_WIDTH		1
++#define TX_PACKET_ATTRIBUTES_VXLAN_INDEX	4
++#define TX_PACKET_ATTRIBUTES_VXLAN_WIDTH	1
+ 
+ #define TX_CONTEXT_DESC2_MSS_INDEX		0
+ #define TX_CONTEXT_DESC2_MSS_WIDTH		15
+@@ -1241,8 +1262,11 @@
+ #define TX_NORMAL_DESC3_TCPPL_WIDTH		18
+ #define TX_NORMAL_DESC3_TSE_INDEX		18
+ #define TX_NORMAL_DESC3_TSE_WIDTH		1
++#define TX_NORMAL_DESC3_VNP_INDEX		23
++#define TX_NORMAL_DESC3_VNP_WIDTH		3
+ 
+ #define TX_NORMAL_DESC2_VLAN_INSERT		0x2
++#define TX_NORMAL_DESC3_VXLAN_PACKET		0x3
+ 
+ /* MDIO undefined or vendor specific registers */
+ #ifndef MDIO_PMA_10GBR_PMD_CTRL
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index a9784084202a..1bf671e02c0a 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -479,6 +479,50 @@ static bool xgbe_is_pfc_queue(struct xgbe_prv_data *pdata,
+ 	return false;
+ }
+ 
++static void xgbe_set_vxlan_id(struct xgbe_prv_data *pdata)
++{
++	/* Program the VXLAN port */
++	XGMAC_IOWRITE_BITS(pdata, MAC_TIR, TNID, pdata->vxlan_port);
++
++	netif_dbg(pdata, drv, pdata->netdev, "VXLAN tunnel id set to %hx\n",
++		  pdata->vxlan_port);
++}
++
++static void xgbe_enable_vxlan(struct xgbe_prv_data *pdata)
++{
++	if (!pdata->hw_feat.vxn)
++		return;
++
++	/* Program the VXLAN port */
++	xgbe_set_vxlan_id(pdata);
++
++	/* Allow for IPv6/UDP zero-checksum VXLAN packets */
++	XGMAC_IOWRITE_BITS(pdata, MAC_PFR, VUCC, 1);
++
++	/* Enable VXLAN tunneling mode */
++	XGMAC_IOWRITE_BITS(pdata, MAC_TCR, VNM, 0);
++	XGMAC_IOWRITE_BITS(pdata, MAC_TCR, VNE, 1);
++
++	netif_dbg(pdata, drv, pdata->netdev, "VXLAN acceleration enabled\n");
++}
++
++static void xgbe_disable_vxlan(struct xgbe_prv_data *pdata)
++{
++	if (!pdata->hw_feat.vxn)
++		return;
++
++	/* Disable tunneling mode */
++	XGMAC_IOWRITE_BITS(pdata, MAC_TCR, VNE, 0);
++
++	/* Clear IPv6/UDP zero-checksum VXLAN packets setting */
++	XGMAC_IOWRITE_BITS(pdata, MAC_PFR, VUCC, 0);
++
++	/* Clear the VXLAN port */
++	XGMAC_IOWRITE_BITS(pdata, MAC_TIR, TNID, 0);
++
++	netif_dbg(pdata, drv, pdata->netdev, "VXLAN acceleration disabled\n");
++}
++
+ static int xgbe_disable_tx_flow_control(struct xgbe_prv_data *pdata)
+ {
+ 	unsigned int max_q_count, q_count;
+@@ -1610,7 +1654,7 @@ static void xgbe_dev_xmit(struct xgbe_channel *channel)
+ 	struct xgbe_ring_desc *rdesc;
+ 	struct xgbe_packet_data *packet = &ring->packet_data;
+ 	unsigned int tx_packets, tx_bytes;
+-	unsigned int csum, tso, vlan;
++	unsigned int csum, tso, vlan, vxlan;
+ 	unsigned int tso_context, vlan_context;
+ 	unsigned int tx_set_ic;
+ 	int start_index = ring->cur;
+@@ -1628,6 +1672,8 @@ static void xgbe_dev_xmit(struct xgbe_channel *channel)
+ 			     TSO_ENABLE);
+ 	vlan = XGMAC_GET_BITS(packet->attributes, TX_PACKET_ATTRIBUTES,
+ 			      VLAN_CTAG);
++	vxlan = XGMAC_GET_BITS(packet->attributes, TX_PACKET_ATTRIBUTES,
++			       VXLAN);
+ 
+ 	if (tso && (packet->mss != ring->tx.cur_mss))
+ 		tso_context = 1;
+@@ -1759,6 +1805,10 @@ static void xgbe_dev_xmit(struct xgbe_channel *channel)
+ 				  packet->length);
+ 	}
+ 
++	if (vxlan)
++		XGMAC_SET_BITS_LE(rdesc->desc3, TX_NORMAL_DESC3, VNP,
++				  TX_NORMAL_DESC3_VXLAN_PACKET);
++
+ 	for (i = cur_index - start_index + 1; i < packet->rdesc_count; i++) {
+ 		cur_index++;
+ 		rdata = XGBE_GET_DESC_DATA(ring, cur_index);
+@@ -1920,9 +1970,27 @@ static int xgbe_dev_read(struct xgbe_channel *channel)
+ 	rdata->rx.len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
+ 
+ 	/* Set checksum done indicator as appropriate */
+-	if (netdev->features & NETIF_F_RXCSUM)
++	if (netdev->features & NETIF_F_RXCSUM) {
+ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
+ 			       CSUM_DONE, 1);
++		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++			       TNPCSUM_DONE, 1);
++	}
++
++	/* Set the tunneled packet indicator */
++	if (XGMAC_GET_BITS_LE(rdesc->desc2, RX_NORMAL_DESC2, TNP)) {
++		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++			       TNP, 1);
++
++		l34t = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, L34T);
++		switch (l34t) {
++		case RX_DESC3_L34T_IPV4_UNKNOWN:
++		case RX_DESC3_L34T_IPV6_UNKNOWN:
++			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++				       TNPCSUM_DONE, 0);
++			break;
++		}
++	}
+ 
+ 	/* Check for errors (only valid in last descriptor) */
+ 	err = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, ES);
+@@ -1942,12 +2010,23 @@ static int xgbe_dev_read(struct xgbe_channel *channel)
+ 				  packet->vlan_ctag);
+ 		}
+ 	} else {
+-		if ((etlt == 0x05) || (etlt == 0x06))
++		unsigned int tnp = XGMAC_GET_BITS(packet->attributes,
++						  RX_PACKET_ATTRIBUTES, TNP);
++
++		if ((etlt == 0x05) || (etlt == 0x06)) {
+ 			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
+ 				       CSUM_DONE, 0);
+-		else
++			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++				       TNPCSUM_DONE, 0);
++		} else if (tnp && ((etlt == 0x09) || (etlt == 0x0a))) {
++			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++				       CSUM_DONE, 0);
++			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++				       TNPCSUM_DONE, 0);
++		} else {
+ 			XGMAC_SET_BITS(packet->errors, RX_PACKET_ERRORS,
+ 				       FRAME, 1);
++		}
+ 	}
+ 
+ 	pdata->ext_stats.rxq_packets[channel->queue_index]++;
+@@ -3536,5 +3615,10 @@ void xgbe_init_function_ptrs_dev(struct xgbe_hw_if *hw_if)
+ 	hw_if->disable_ecc_ded = xgbe_disable_ecc_ded;
+ 	hw_if->disable_ecc_sec = xgbe_disable_ecc_sec;
+ 
++	/* For VXLAN */
++	hw_if->enable_vxlan = xgbe_enable_vxlan;
++	hw_if->disable_vxlan = xgbe_disable_vxlan;
++	hw_if->set_vxlan_id = xgbe_set_vxlan_id;
++
+ 	DBGPR("<--xgbe_init_function_ptrs\n");
+ }
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-main.c b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index 9f75f57abbe7..6c10328b252d 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@ -192,6 +192,7 @@ struct xgbe_prv_data *xgbe_alloc_pdata(struct device *dev)
+ 	mutex_init(&pdata->i2c_mutex);
+ 	init_completion(&pdata->i2c_complete);
+ 	init_completion(&pdata->mdio_complete);
++	INIT_LIST_HEAD(&pdata->vxlan_ports);
+ 
+ 	pdata->msg_enable = netif_msg_init(debug, default_msg_level);
+ 
+@@ -373,6 +374,28 @@ int xgbe_config_netdev(struct xgbe_prv_data *pdata)
+ 	if (pdata->hw_feat.rss)
+ 		netdev->hw_features |= NETIF_F_RXHASH;
+ 
++	if (pdata->hw_feat.vxn) {
++		netdev->hw_enc_features = NETIF_F_SG |
++					  NETIF_F_IP_CSUM |
++					  NETIF_F_IPV6_CSUM |
++					  NETIF_F_RXCSUM |
++					  NETIF_F_TSO |
++					  NETIF_F_TSO6 |
++					  NETIF_F_GRO |
++					  NETIF_F_GSO_UDP_TUNNEL |
++					  NETIF_F_GSO_UDP_TUNNEL_CSUM |
++					  NETIF_F_RX_UDP_TUNNEL_PORT;
++
++		netdev->hw_features |= NETIF_F_GSO_UDP_TUNNEL |
++				       NETIF_F_GSO_UDP_TUNNEL_CSUM |
++				       NETIF_F_RX_UDP_TUNNEL_PORT;
++
++		pdata->vxlan_offloads_set = 1;
++		pdata->vxlan_features = NETIF_F_GSO_UDP_TUNNEL |
++					NETIF_F_GSO_UDP_TUNNEL_CSUM |
++					NETIF_F_RX_UDP_TUNNEL_PORT;
++	}
++
+ 	netdev->vlan_features |= NETIF_F_SG |
+ 				 NETIF_F_IP_CSUM |
+ 				 NETIF_F_IPV6_CSUM |
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
