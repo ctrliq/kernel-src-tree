@@ -1,0 +1,94 @@
+dcache: use IS_ROOT to decide where dentry is hashed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author J. Bruce Fields <bfields@redhat.com>
+commit 7632e465feb182cadc3c9aa1282a057201818a8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7632e465.failed
+
+Every hashed dentry is either hashed in the dentry_hashtable, or a
+superblock's s_anon list.
+
+__d_drop() assumes it can determine which is the case by checking
+DCACHE_DISCONNECTED; this is not true.
+
+It is true that when DCACHE_DISCONNECTED is cleared, the dentry is not
+only hashed on dentry_hashtable, but is fully connected to its parents
+back to the root.
+
+But the converse is *not* true: fs/exportfs/expfs.c:reconnect_path()
+attempts to connect a directory (found by filehandle lookup) back to
+root by ascending to parents and performing lookups one at a time.  It
+does not clear DCACHE_DISCONNECTED until it's done, and that is not at
+all an atomic process.
+
+In particular, it is possible for DCACHE_DISCONNECTED to be set on a
+dentry which is hashed on the dentry_hashtable.
+
+Instead, use IS_ROOT() to check which hash chain a dentry is on.  This
+*does* work:
+
+Dentries are hashed only by:
+
+	- d_obtain_alias, which adds an IS_ROOT() dentry to sb_anon.
+
+	- __d_rehash, called by _d_rehash: hashes to the dentry's
+	  parent, and all callers of _d_rehash appear to have d_parent
+	  set to a "real" parent.
+	- __d_rehash, called by __d_move: rehashes the moved dentry to
+	  hash chain determined by target, and assigns target's d_parent
+	  to its d_parent, before dropping the dentry's d_lock.
+
+Therefore I believe it's safe for a holder of a dentry's d_lock to
+assume that it is hashed on sb_anon if and only if IS_ROOT(dentry) is
+true.
+
+I believe the incorrect assumption about DCACHE_DISCONNECTED was
+originally introduced by ceb5bdc2d246 "fs: dcache per-bucket dcache hash
+locking".
+
+Also add a comment while we're here.
+
+	Cc: Nick Piggin <npiggin@kernel.dk>
+	Acked-by: Christoph Hellwig <hch@infradead.org>
+	Reviewed-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 7632e465feb182cadc3c9aa1282a057201818a8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 8a8672610f2d,c2add37082b6..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -434,7 -502,21 +434,25 @@@ static void __d_shrink(struct dentry *d
+  void __d_drop(struct dentry *dentry)
+  {
+  	if (!d_unhashed(dentry)) {
+++<<<<<<< HEAD
+ +		__d_shrink(dentry);
+++=======
++ 		struct hlist_bl_head *b;
++ 		/*
++ 		 * Hashed dentries are normally on the dentry hashtable,
++ 		 * with the exception of those newly allocated by
++ 		 * d_obtain_alias, which are always IS_ROOT:
++ 		 */
++ 		if (unlikely(IS_ROOT(dentry)))
++ 			b = &dentry->d_sb->s_anon;
++ 		else
++ 			b = d_hash(dentry->d_parent, dentry->d_name.hash);
++ 
++ 		hlist_bl_lock(b);
++ 		__hlist_bl_del(&dentry->d_hash);
++ 		dentry->d_hash.pprev = NULL;
++ 		hlist_bl_unlock(b);
+++>>>>>>> 7632e465feb1 (dcache: use IS_ROOT to decide where dentry is hashed)
+  		dentry_rcuwalk_barrier(dentry);
+  	}
+  }
+* Unmerged path fs/dcache.c
