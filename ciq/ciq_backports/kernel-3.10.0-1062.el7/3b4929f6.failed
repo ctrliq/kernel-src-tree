@@ -1,0 +1,228 @@
+tcp: limit payload size of sacked skbs
+
+jira LE-1907
+cve CVE-2019-11477
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 3b4929f65b0d8249f19a50245cd88ed1a2f78cff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3b4929f6.failed
+
+Jonathan Looney reported that TCP can trigger the following crash
+in tcp_shifted_skb() :
+
+	BUG_ON(tcp_skb_pcount(skb) < pcount);
+
+This can happen if the remote peer has advertized the smallest
+MSS that linux TCP accepts : 48
+
+An skb can hold 17 fragments, and each fragment can hold 32KB
+on x86, or 64KB on PowerPC.
+
+This means that the 16bit witdh of TCP_SKB_CB(skb)->tcp_gso_segs
+can overflow.
+
+Note that tcp_sendmsg() builds skbs with less than 64KB
+of payload, so this problem needs SACK to be enabled.
+SACK blocks allow TCP to coalesce multiple skbs in the retransmit
+queue, thus filling the 17 fragments to maximal capacity.
+
+CVE-2019-11477 -- u16 overflow of TCP_SKB_CB(skb)->tcp_gso_segs
+
+Fixes: 832d11c5cd07 ("tcp: Try to restore large SKBs while SACK processing")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Jonathan Looney <jtl@netflix.com>
+	Acked-by: Neal Cardwell <ncardwell@google.com>
+	Reviewed-by: Tyler Hicks <tyhicks@canonical.com>
+	Cc: Yuchung Cheng <ycheng@google.com>
+	Cc: Bruce Curtis <brucec@netflix.com>
+	Cc: Jonathan Lemon <jonathan.lemon@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b4929f65b0d8249f19a50245cd88ed1a2f78cff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tcp.h
+#	net/ipv4/tcp.c
+#	net/ipv4/tcp_input.c
+#	net/ipv4/tcp_output.c
+diff --cc include/linux/tcp.h
+index 73910552195e,9a478a0cd3a2..000000000000
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@@ -392,25 -452,40 +392,56 @@@ static inline bool tcp_passive_fastopen
+  		tcp_sk(sk)->fastopen_rsk != NULL);
+  }
+  
+ -static inline void fastopen_queue_tune(struct sock *sk, int backlog)
+ -{
+ -	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
+ -	int somaxconn = READ_ONCE(sock_net(sk)->core.sysctl_somaxconn);
+ +extern void tcp_sock_destruct(struct sock *sk);
+  
+ -	queue->fastopenq.max_qlen = min_t(unsigned int, backlog, somaxconn);
+ +static inline int fastopen_init_queue(struct sock *sk, int backlog)
+ +{
+ +	struct request_sock_queue *queue =
+ +	    &inet_csk(sk)->icsk_accept_queue;
+ +
+ +	if (queue->fastopenq == NULL) {
+ +		queue->fastopenq = kzalloc(
+ +		    sizeof(struct fastopen_queue),
+ +		    sk->sk_allocation);
+ +		if (queue->fastopenq == NULL)
+ +			return -ENOMEM;
+ +
+ +		sk->sk_destruct = tcp_sock_destruct;
+ +		spin_lock_init(&queue->fastopenq->lock);
+ +	}
+ +	queue->fastopenq->max_qlen = backlog;
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void tcp_move_syn(struct tcp_sock *tp,
++ 				struct request_sock *req)
++ {
++ 	tp->saved_syn = req->saved_syn;
++ 	req->saved_syn = NULL;
++ }
++ 
++ static inline void tcp_saved_syn_free(struct tcp_sock *tp)
++ {
++ 	kfree(tp->saved_syn);
++ 	tp->saved_syn = NULL;
++ }
++ 
++ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk);
++ 
++ static inline u16 tcp_mss_clamp(const struct tcp_sock *tp, u16 mss)
++ {
++ 	/* We use READ_ONCE() here because socket might not be locked.
++ 	 * This happens for listeners.
++ 	 */
++ 	u16 user_mss = READ_ONCE(tp->rx_opt.user_mss);
++ 
++ 	return (user_mss && user_mss < mss) ? user_mss : mss;
++ }
++ 
++ int tcp_skb_shift(struct sk_buff *to, struct sk_buff *from, int pcount,
++ 		  int shiftlen);
++ 
+++>>>>>>> 3b4929f65b0d (tcp: limit payload size of sacked skbs)
+  #endif	/* _LINUX_TCP_H */
+diff --cc net/ipv4/tcp.c
+index 61d6a0e7d049,79666ef8c2e2..000000000000
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@@ -3097,12 -3864,13 +3097,18 @@@ void tcp_init_mem(struct net *net
+  
+  void __init tcp_init(void)
+  {
+ -	int max_rshare, max_wshare, cnt;
+ +	struct sk_buff *skb = NULL;
+  	unsigned long limit;
+ +	int max_rshare, max_wshare, cnt;
+  	unsigned int i;
+  
+++<<<<<<< HEAD
+ +	BUILD_BUG_ON(sizeof(struct tcp_skb_cb) > sizeof(skb->cb));
+++=======
++ 	BUILD_BUG_ON(TCP_MIN_SND_MSS <= MAX_TCP_OPTION_SPACE);
++ 	BUILD_BUG_ON(sizeof(struct tcp_skb_cb) >
++ 		     FIELD_SIZEOF(struct sk_buff, cb));
+++>>>>>>> 3b4929f65b0d (tcp: limit payload size of sacked skbs)
+  
+  	percpu_counter_init(&tcp_sockets_allocated, 0, GFP_KERNEL);
+  	percpu_counter_init(&tcp_orphan_count, 0, GFP_KERNEL);
+diff --cc net/ipv4/tcp_input.c
+index 19a671aa8e5e,d95ee40df6c2..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -1328,9 -1301,9 +1328,15 @@@ static bool tcp_shifted_skb(struct soc
+  	TCP_SKB_CB(prev)->end_seq += shifted;
+  	TCP_SKB_CB(skb)->seq += shifted;
+  
+++<<<<<<< HEAD
+ +	skb_shinfo(prev)->gso_segs += pcount;
+ +	BUG_ON(skb_shinfo(skb)->gso_segs < pcount);
+ +	skb_shinfo(skb)->gso_segs -= pcount;
+++=======
++ 	tcp_skb_pcount_add(prev, pcount);
++ 	WARN_ON_ONCE(tcp_skb_pcount(skb) < pcount);
++ 	tcp_skb_pcount_add(skb, -pcount);
+++>>>>>>> 3b4929f65b0d (tcp: limit payload size of sacked skbs)
+  
+  	/* When we're adding to gso_segs == 1, gso_size will be zero,
+  	 * in theory this shouldn't be necessary but as long as DSACK
+@@@ -1519,14 -1506,12 +1540,13 @@@ static struct sk_buff *tcp_shift_skb_da
+  		goto out;
+  
+  	len = skb->len;
+- 	if (skb_shift(prev, skb, len)) {
+- 		pcount += tcp_skb_pcount(skb);
+- 		tcp_shifted_skb(sk, prev, skb, state, tcp_skb_pcount(skb),
++ 	pcount = tcp_skb_pcount(skb);
++ 	if (tcp_skb_shift(prev, skb, pcount, len))
++ 		tcp_shifted_skb(sk, prev, skb, state, pcount,
+  				len, mss, 0);
+- 	}
+  
+  out:
+ +	state->fack_count += pcount;
+  	return prev;
+  
+  noop:
+diff --cc net/ipv4/tcp_output.c
+index 52f0e3183733,b8e3bbb85211..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -2389,18 -2743,14 +2389,29 @@@ static void tcp_collapse_retrans(struc
+  
+  	BUG_ON(tcp_skb_pcount(skb) != 1 || tcp_skb_pcount(next_skb) != 1);
+  
+++<<<<<<< HEAD
+ +	tcp_highest_sack_combine(sk, next_skb, skb);
+ +
+ +	tcp_unlink_write_queue(next_skb, sk);
+ +
+ +	skb_copy_from_linear_data(next_skb, skb_put(skb, next_skb_size),
+ +				  next_skb_size);
+ +
+ +	if (next_skb->ip_summed == CHECKSUM_PARTIAL)
+ +		skb->ip_summed = CHECKSUM_PARTIAL;
+ +
+ +	if (skb->ip_summed != CHECKSUM_PARTIAL)
+ +		skb->csum = csum_block_add(skb->csum, next_skb->csum, skb_size);
+++=======
++ 	if (next_skb_size) {
++ 		if (next_skb_size <= skb_availroom(skb))
++ 			skb_copy_bits(next_skb, 0, skb_put(skb, next_skb_size),
++ 				      next_skb_size);
++ 		else if (!tcp_skb_shift(skb, next_skb, 1, next_skb_size))
++ 			return false;
++ 	}
++ 	tcp_highest_sack_replace(sk, next_skb, skb);
+++>>>>>>> 3b4929f65b0d (tcp: limit payload size of sacked skbs)
+  
+  	/* Update sequence range on original skb. */
+  	TCP_SKB_CB(skb)->end_seq = TCP_SKB_CB(next_skb)->end_seq;
+* Unmerged path include/linux/tcp.h
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index a8a2278295ca..c7e4629e72f0 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -54,6 +54,8 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
+ 
+ #define MAX_TCP_HEADER	(128 + MAX_HEADER)
+ #define MAX_TCP_OPTION_SPACE 40
++#define TCP_MIN_SND_MSS		48
++#define TCP_MIN_GSO_SIZE	(TCP_MIN_SND_MSS - MAX_TCP_OPTION_SPACE)
+ 
+ /* 
+  * Never offer a window over 32767 without using window scaling. Some
+* Unmerged path net/ipv4/tcp.c
+* Unmerged path net/ipv4/tcp_input.c
+* Unmerged path net/ipv4/tcp_output.c
