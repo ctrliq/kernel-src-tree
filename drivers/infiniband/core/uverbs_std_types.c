@@ -206,10 +206,10 @@ static int uverbs_hot_unplug_completion_event_file(struct ib_uobject_file *uobj_
  * spec.
  */
 const struct uverbs_attr_def uverbs_uhw_compat_in =
-	UVERBS_ATTR_PTR_IN_SZ(UVERBS_ATTR_UHW_IN, UVERBS_ATTR_SIZE(0, USHRT_MAX),
+	UVERBS_ATTR_PTR_IN_SZ(UVERBS_ATTR_UHW_IN, UVERBS_ATTR_MIN_SIZE(0),
 			      UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
 const struct uverbs_attr_def uverbs_uhw_compat_out =
-	UVERBS_ATTR_PTR_OUT_SZ(UVERBS_ATTR_UHW_OUT, UVERBS_ATTR_SIZE(0, USHRT_MAX),
+	UVERBS_ATTR_PTR_OUT_SZ(UVERBS_ATTR_UHW_OUT, UVERBS_ATTR_MIN_SIZE(0),
 			       UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
 
 void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
