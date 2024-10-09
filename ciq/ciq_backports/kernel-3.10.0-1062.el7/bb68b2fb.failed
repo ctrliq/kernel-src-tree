@@ -1,0 +1,102 @@
+iommu/iova: Add rbtree anchor node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [iommu] iova: Add rbtree anchor node (Jerry Snitselaar) [1615865]
+Rebuild_FUZZ: 90.32%
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit bb68b2fbfbd643d4407541f9c7a16a2c9b3a57c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bb68b2fb.failed
+
+Add a permanent dummy IOVA reservation to the rbtree, such that we can
+always access the top of the address space instantly. The immediate
+benefit is that we remove the overhead of the rb_last() traversal when
+not using the cached node, but it also paves the way for further
+simplifications.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit bb68b2fbfbd643d4407541f9c7a16a2c9b3a57c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iova.c
+diff --cc drivers/iommu/iova.c
+index 1a0166896ba6,9e04c1f3e740..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -22,7 -22,11 +22,10 @@@
+  #include <linux/slab.h>
+  #include <linux/smp.h>
+  #include <linux/bitops.h>
+ -#include <linux/cpu.h>
+  
++ /* The anchor node sits above the top of the usable address space */
++ #define IOVA_ANCHOR	~0UL
++ 
+  static bool iova_rcache_insert(struct iova_domain *iovad,
+  			       unsigned long pfn,
+  			       unsigned long size);
+@@@ -50,9 -54,13 +53,12 @@@ init_iova_domain(struct iova_domain *io
+  	iovad->cached32_node = NULL;
+  	iovad->granule = granule;
+  	iovad->start_pfn = start_pfn;
+ -	iovad->dma_32bit_pfn = 1UL << (32 - iova_shift(iovad));
+ +	iovad->dma_32bit_pfn = pfn_32bit + 1;
+  	iovad->flush_cb = NULL;
+  	iovad->fq = NULL;
++ 	iovad->anchor.pfn_lo = iovad->anchor.pfn_hi = IOVA_ANCHOR;
++ 	rb_link_node(&iovad->anchor.node, NULL, &iovad->rbroot.rb_node);
++ 	rb_insert_color(&iovad->anchor.node, &iovad->rbroot);
+  	init_iova_rcaches(iovad);
+  }
+  EXPORT_SYMBOL_GPL(init_iova_domain);
+@@@ -109,16 -117,20 +115,33 @@@ EXPORT_SYMBOL_GPL(init_iova_flush_queue
+  static struct rb_node *
+  __get_cached_rbnode(struct iova_domain *iovad, unsigned long *limit_pfn)
+  {
+++<<<<<<< HEAD
+ +	if ((*limit_pfn > iovad->dma_32bit_pfn) ||
+ +		(iovad->cached32_node == NULL))
+ +		return rb_last(&iovad->rbroot);
+ +	else {
+ +		struct rb_node *prev_node = rb_prev(iovad->cached32_node);
+ +		struct iova *curr_iova =
+ +			container_of(iovad->cached32_node, struct iova, node);
+ +		*limit_pfn = curr_iova->pfn_lo;
+ +		return prev_node;
+ +	}
+++=======
++ 	struct rb_node *cached_node = NULL;
++ 	struct iova *curr_iova;
++ 
++ 	if (*limit_pfn <= iovad->dma_32bit_pfn)
++ 		cached_node = iovad->cached32_node;
++ 	if (!cached_node)
++ 		cached_node = iovad->cached_node;
++ 	if (!cached_node)
++ 		return rb_prev(&iovad->anchor.node);
++ 
++ 	curr_iova = rb_entry(cached_node, struct iova, node);
++ 	*limit_pfn = min(*limit_pfn, curr_iova->pfn_lo);
++ 
++ 	return rb_prev(cached_node);
+++>>>>>>> bb68b2fbfbd6 (iommu/iova: Add rbtree anchor node)
+  }
+  
+  static void
+* Unmerged path drivers/iommu/iova.c
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index 09ce7dfe55b2..e01db636fbe9 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -74,6 +74,7 @@ struct iova_domain {
+ 	unsigned long	granule;	/* pfn granularity for this domain */
+ 	unsigned long	start_pfn;	/* Lower limit for this domain */
+ 	unsigned long	dma_32bit_pfn;
++	struct iova	anchor;		/* rbtree lookup anchor */
+ 	struct iova_rcache rcaches[IOVA_RANGE_CACHE_MAX_SIZE];	/* IOVA range caches */
+ 
+ 	iova_flush_cb	flush_cb;	/* Call-Back function to flush IOMMU
