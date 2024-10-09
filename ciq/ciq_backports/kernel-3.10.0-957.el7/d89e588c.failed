@@ -1,0 +1,182 @@
+locking: Introduce smp_mb__after_spinlock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit d89e588ca4081615216cc25f2489b0281ac0bfe9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d89e588c.failed
+
+Since its inception, our understanding of ACQUIRE, esp. as applied to
+spinlocks, has changed somewhat. Also, I wonder if, with a simple
+change, we cannot make it provide more.
+
+The problem with the comment is that the STORE done by spin_lock isn't
+itself ordered by the ACQUIRE, and therefore a later LOAD can pass over
+it and cross with any prior STORE, rendering the default WMB
+insufficient (pointed out by Alan).
+
+Now, this is only really a problem on PowerPC and ARM64, both of
+which already defined smp_mb__before_spinlock() as a smp_mb().
+
+At the same time, we can get a much stronger construct if we place
+that same barrier _inside_ the spin_lock(). In that case we upgrade
+the RCpc spinlock to an RCsc.  That would make all schedule() calls
+fully transitive against one another.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Cc: Alan Stern <stern@rowland.harvard.edu>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d89e588ca4081615216cc25f2489b0281ac0bfe9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/spinlock.h
+#	include/linux/atomic.h
+#	kernel/sched/core.c
+diff --cc arch/arm64/include/asm/spinlock.h
+index 7065e920149d,b103888b694a..000000000000
+--- a/arch/arm64/include/asm/spinlock.h
++++ b/arch/arm64/include/asm/spinlock.h
+@@@ -199,4 -358,16 +199,19 @@@ static inline int arch_read_trylock(arc
+  #define arch_read_relax(lock)	cpu_relax()
+  #define arch_write_relax(lock)	cpu_relax()
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Accesses appearing in program order before a spin_lock() operation
++  * can be reordered with accesses inside the critical section, by virtue
++  * of arch_spin_lock being constructed using acquire semantics.
++  *
++  * In cases where this is problematic (e.g. try_to_wake_up), an
++  * smp_mb__before_spinlock() can restore the required ordering.
++  */
++ #define smp_mb__before_spinlock()	smp_mb()
++ /* See include/linux/spinlock.h */
++ #define smp_mb__after_spinlock()	smp_mb()
++ 
+++>>>>>>> d89e588ca408 (locking: Introduce smp_mb__after_spinlock())
+  #endif /* __ASM_SPINLOCK_H */
+diff --cc include/linux/atomic.h
+index 8e5f36dc5a6c,40d6bfec0e0d..000000000000
+--- a/include/linux/atomic.h
++++ b/include/linux/atomic.h
+@@@ -34,7 -34,15 +34,17 @@@
+   * The idea here is to build acquire/release variants by adding explicit
+   * barriers on top of the relaxed variant. In the case where the relaxed
+   * variant is already fully ordered, no additional barriers are needed.
+++<<<<<<< HEAD
+++=======
++  *
++  * Besides, if an arch has a special barrier for acquire/release, it could
++  * implement its own __atomic_op_* and use the same framework for building
++  * variants
++  *
++  * If an architecture overrides __atomic_op_acquire() it will probably want
++  * to define smp_mb__after_spinlock().
+++>>>>>>> d89e588ca408 (locking: Introduce smp_mb__after_spinlock())
+   */
+ -#ifndef __atomic_op_acquire
+  #define __atomic_op_acquire(op, args...)				\
+  ({									\
+  	typeof(op##_relaxed(args)) __ret  = op##_relaxed(args);		\
+diff --cc kernel/sched/core.c
+index 0268f967b362,9fece583a1f0..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -3495,11 -3281,15 +3495,20 @@@ need_resched
+  	 * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+  	 * done by the caller to avoid the race with signal_wake_up().
+  	 */
+++<<<<<<< HEAD
+ +	smp_mb__before_spinlock();
+ +	raw_spin_lock_irq(&rq->lock);
+++=======
++ 	rq_lock(rq, &rf);
++ 	smp_mb__after_spinlock();
++ 
++ 	/* Promote REQ to ACT */
++ 	rq->clock_update_flags <<= 1;
++ 	update_rq_clock(rq);
+++>>>>>>> d89e588ca408 (locking: Introduce smp_mb__after_spinlock())
+  
+  	switch_count = &prev->nivcsw;
+ -	if (!preempt && prev->state) {
+ +	if (prev->state && !(preempt_count() & PREEMPT_ACTIVE)) {
+  		if (unlikely(signal_pending_state(prev->state, prev))) {
+  			prev->state = TASK_RUNNING;
+  		} else {
+* Unmerged path arch/arm64/include/asm/spinlock.h
+diff --git a/arch/powerpc/include/asm/spinlock.h b/arch/powerpc/include/asm/spinlock.h
+index 4dbe072eecbe..8300f9bfb7aa 100644
+--- a/arch/powerpc/include/asm/spinlock.h
++++ b/arch/powerpc/include/asm/spinlock.h
+@@ -310,5 +310,8 @@ static inline void arch_write_unlock(arch_rwlock_t *rw)
+ #define arch_read_relax(lock)	__rw_yield(lock)
+ #define arch_write_relax(lock)	__rw_yield(lock)
+ 
++/* See include/linux/spinlock.h */
++#define smp_mb__after_spinlock()   smp_mb()
++
+ #endif /* __KERNEL__ */
+ #endif /* __ASM_SPINLOCK_H */
+* Unmerged path include/linux/atomic.h
+diff --git a/include/linux/spinlock.h b/include/linux/spinlock.h
+index 7cd920029682..7db668934b88 100644
+--- a/include/linux/spinlock.h
++++ b/include/linux/spinlock.h
+@@ -130,6 +130,42 @@ do {								\
+ #define smp_mb__before_spinlock()	smp_wmb()
+ #endif
+ 
++/*
++ * This barrier must provide two things:
++ *
++ *   - it must guarantee a STORE before the spin_lock() is ordered against a
++ *     LOAD after it, see the comments at its two usage sites.
++ *
++ *   - it must ensure the critical section is RCsc.
++ *
++ * The latter is important for cases where we observe values written by other
++ * CPUs in spin-loops, without barriers, while being subject to scheduling.
++ *
++ * CPU0			CPU1			CPU2
++ *
++ *			for (;;) {
++ *			  if (READ_ONCE(X))
++ *			    break;
++ *			}
++ * X=1
++ *			<sched-out>
++ *						<sched-in>
++ *						r = X;
++ *
++ * without transitivity it could be that CPU1 observes X!=0 breaks the loop,
++ * we get migrated and CPU2 sees X==0.
++ *
++ * Since most load-store architectures implement ACQUIRE with an smp_mb() after
++ * the LL/SC loop, they need no further barriers. Similarly all our TSO
++ * architectures imply an smp_mb() for each atomic instruction and equally don't
++ * need more.
++ *
++ * Architectures that can implement ACQUIRE better need to take care.
++ */
++#ifndef smp_mb__after_spinlock
++#define smp_mb__after_spinlock()	do { } while (0)
++#endif
++
+ /**
+  * raw_spin_unlock_wait - wait until the spinlock gets unlocked
+  * @lock: the spinlock in question.
+* Unmerged path kernel/sched/core.c
