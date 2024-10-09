@@ -252,6 +252,7 @@ struct ipoib_cm_tx {
 	unsigned	     tx_tail;
 	unsigned long	     flags;
 	u32		     mtu;
+	unsigned             max_send_sge;
 };
 
 struct ipoib_cm_rx_buf {
@@ -398,6 +399,7 @@ struct ipoib_dev_priv {
 	u64	hca_caps;
 	struct ipoib_ethtool_st ethtool;
 	struct timer_list poll_timer;
+	unsigned max_send_sge;
 };
 
 struct ipoib_ah {
