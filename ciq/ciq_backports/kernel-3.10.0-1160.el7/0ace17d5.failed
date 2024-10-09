@@ -1,0 +1,136 @@
+can, slip: Protect tty->disc_data in write_wakeup and close with RCU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Richard Palethorpe <rpalethorpe@suse.com>
+commit 0ace17d56824165c7f4c68785d6b58971db954dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/0ace17d5.failed
+
+write_wakeup can happen in parallel with close/hangup where tty->disc_data
+is set to NULL and the netdevice is freed thus also freeing
+disc_data. write_wakeup accesses disc_data so we must prevent close from
+freeing the netdev while write_wakeup has a non-NULL view of
+tty->disc_data.
+
+We also need to make sure that accesses to disc_data are atomic. Which can
+all be done with RCU.
+
+This problem was found by Syzkaller on SLCAN, but the same issue is
+reproducible with the SLIP line discipline using an LTP test based on the
+Syzkaller reproducer.
+
+A fix which didn't use RCU was posted by Hillf Danton.
+
+Fixes: 661f7fda21b1 ("slip: Fix deadlock in write_wakeup")
+Fixes: a8e83b17536a ("slcan: Port write_wakeup deadlock fix from slip")
+	Reported-by: syzbot+017e491ae13c0068598a@syzkaller.appspotmail.com
+	Signed-off-by: Richard Palethorpe <rpalethorpe@suse.com>
+	Cc: Wolfgang Grandegger <wg@grandegger.com>
+	Cc: Marc Kleine-Budde <mkl@pengutronix.de>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Tyler Hall <tylerwhall@gmail.com>
+	Cc: linux-can@vger.kernel.org
+	Cc: netdev@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Cc: syzkaller@googlegroups.com
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ace17d56824165c7f4c68785d6b58971db954dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/can/slcan.c
+diff --cc drivers/net/can/slcan.c
+index 92bc87cbf3e3,2f5c287eac95..000000000000
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@@ -298,10 -332,28 +298,32 @@@ static void slcan_write_wakeup(struct t
+  		return;
+  	}
+  
+ -	actual = sl->tty->ops->write(sl->tty, sl->xhead, sl->xleft);
+ +	actual = tty->ops->write(tty, sl->xhead, sl->xleft);
+  	sl->xleft -= actual;
+  	sl->xhead += actual;
+++<<<<<<< HEAD
+ +	spin_unlock(&sl->lock);
+++=======
++ 	spin_unlock_bh(&sl->lock);
++ }
++ 
++ /*
++  * Called by the driver when there's room for more data.
++  * Schedule the transmit.
++  */
++ static void slcan_write_wakeup(struct tty_struct *tty)
++ {
++ 	struct slcan *sl;
++ 
++ 	rcu_read_lock();
++ 	sl = rcu_dereference(tty->disc_data);
++ 	if (!sl)
++ 		goto out;
++ 
++ 	schedule_work(&sl->tx_work);
++ out:
++ 	rcu_read_unlock();
+++>>>>>>> 0ace17d56824 (can, slip: Protect tty->disc_data in write_wakeup and close with RCU)
+  }
+  
+  /* Send a can_frame to a TTY queue. */
+@@@ -586,8 -650,13 +608,18 @@@ static void slcan_close(struct tty_stru
+  	if (!sl || sl->magic != SLCAN_MAGIC || sl->tty != tty)
+  		return;
+  
+++<<<<<<< HEAD
+ +	tty->disc_data = NULL;
+ +	sl->tty = NULL;
+++=======
++ 	spin_lock_bh(&sl->lock);
++ 	rcu_assign_pointer(tty->disc_data, NULL);
++ 	sl->tty = NULL;
++ 	spin_unlock_bh(&sl->lock);
++ 
++ 	synchronize_rcu();
++ 	flush_work(&sl->tx_work);
+++>>>>>>> 0ace17d56824 (can, slip: Protect tty->disc_data in write_wakeup and close with RCU)
+  
+  	/* Flush network side */
+  	unregister_netdev(sl->dev);
+* Unmerged path drivers/net/can/slcan.c
+diff --git a/drivers/net/slip/slip.c b/drivers/net/slip/slip.c
+index 3a65fc0cbfe5..748e68fa2e34 100644
+--- a/drivers/net/slip/slip.c
++++ b/drivers/net/slip/slip.c
+@@ -452,9 +452,16 @@ static void slip_transmit(struct work_struct *work)
+  */
+ static void slip_write_wakeup(struct tty_struct *tty)
+ {
+-	struct slip *sl = tty->disc_data;
++	struct slip *sl;
++
++	rcu_read_lock();
++	sl = rcu_dereference(tty->disc_data);
++	if (!sl)
++		goto out;
+ 
+ 	schedule_work(&sl->tx_work);
++out:
++	rcu_read_unlock();
+ }
+ 
+ static void sl_tx_timeout(struct net_device *dev)
+@@ -885,10 +892,11 @@ static void slip_close(struct tty_struct *tty)
+ 		return;
+ 
+ 	spin_lock_bh(&sl->lock);
+-	tty->disc_data = NULL;
++	rcu_assign_pointer(tty->disc_data, NULL);
+ 	sl->tty = NULL;
+ 	spin_unlock_bh(&sl->lock);
+ 
++	synchronize_rcu();
+ 	flush_work(&sl->tx_work);
+ 
+ 	/* VSV = very important to remove timers */
