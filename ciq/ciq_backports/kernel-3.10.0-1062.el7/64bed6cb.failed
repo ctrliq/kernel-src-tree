@@ -1,0 +1,182 @@
+nfsd: fix leaked file lock with nfs exported overlayfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 64bed6cbe38bc95689fb9399872d9ce250192f90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/64bed6cb.failed
+
+nfsd and lockd call vfs_lock_file() to lock/unlock the inode
+returned by locks_inode(file).
+
+Many places in nfsd/lockd code use the inode returned by
+file_inode(file) for lock manipulation. With Overlayfs, file_inode()
+(the underlying inode) is not the same object as locks_inode() (the
+overlay inode). This can result in "Leaked POSIX lock" messages
+and eventually to a kernel crash as reported by Eddie Horng:
+https://marc.info/?l=linux-unionfs&m=153086643202072&w=2
+
+Fix all the call sites in nfsd/lockd that should use locks_inode().
+This is a correctness bug that manifested when overlayfs gained
+NFS export support in v4.16.
+
+	Reported-by: Eddie Horng <eddiehorng.tw@gmail.com>
+	Tested-by: Eddie Horng <eddiehorng.tw@gmail.com>
+	Cc: Jeff Layton <jlayton@kernel.org>
+Fixes: 8383f1748829 ("ovl: wire up NFS export operations")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 64bed6cbe38bc95689fb9399872d9ce250192f90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/lockd/svcsubs.c
+#	fs/nfsd/nfs4state.c
+#	include/linux/lockd/lockd.h
+diff --cc fs/lockd/svcsubs.c
+index 8036ba6724b9,899360ba3b84..000000000000
+--- a/fs/lockd/svcsubs.c
++++ b/fs/lockd/svcsubs.c
+@@@ -408,7 -414,7 +408,11 @@@ nlmsvc_match_sb(void *datap, struct nlm
+  {
+  	struct super_block *sb = datap;
+  
+++<<<<<<< HEAD
+ +	return sb == file->f_file->f_path.dentry->d_sb;
+++=======
++ 	return sb == locks_inode(file->f_file)->i_sb;
+++>>>>>>> 64bed6cbe38b (nfsd: fix leaked file lock with nfs exported overlayfs)
+  }
+  
+  /**
+diff --cc fs/nfsd/nfs4state.c
+index 13023d60dc0a,c8e4a8f42bbe..000000000000
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@@ -6170,16 -6322,19 +6170,21 @@@ check_for_locks(struct nfs4_file *fp, s
+  		return status;
+  	}
+  
+++<<<<<<< HEAD
+ +	inode = file_inode(filp);
+++=======
++ 	inode = locks_inode(filp);
++ 	flctx = inode->i_flctx;
+++>>>>>>> 64bed6cbe38b (nfsd: fix leaked file lock with nfs exported overlayfs)
+  
+ -	if (flctx && !list_empty_careful(&flctx->flc_posix)) {
+ -		spin_lock(&flctx->flc_lock);
+ -		list_for_each_entry(fl, &flctx->flc_posix, fl_list) {
+ -			if (fl->fl_owner == (fl_owner_t)lowner) {
+ -				status = true;
+ -				break;
+ -			}
+ +	spin_lock(&inode->i_lock);
+ +	for (flpp = &inode->i_flock; *flpp != NULL; flpp = &(*flpp)->fl_next) {
+ +		if ((*flpp)->fl_owner == (fl_owner_t)lowner) {
+ +			status = true;
+ +			break;
+  		}
+ -		spin_unlock(&flctx->flc_lock);
+  	}
+ +	spin_unlock(&inode->i_lock);
+  	fput(filp);
+  	return status;
+  }
+diff --cc include/linux/lockd/lockd.h
+index bdf75c1fbbda,b065ef406770..000000000000
+--- a/include/linux/lockd/lockd.h
++++ b/include/linux/lockd/lockd.h
+@@@ -357,7 -359,8 +357,12 @@@ static inline int nlm_privileged_reques
+  static inline int nlm_compare_locks(const struct file_lock *fl1,
+  				    const struct file_lock *fl2)
+  {
+++<<<<<<< HEAD
+ +	return	fl1->fl_pid   == fl2->fl_pid
+++=======
++ 	return locks_inode(fl1->fl_file) == locks_inode(fl2->fl_file)
++ 	     && fl1->fl_pid   == fl2->fl_pid
+++>>>>>>> 64bed6cbe38b (nfsd: fix leaked file lock with nfs exported overlayfs)
+  	     && fl1->fl_owner == fl2->fl_owner
+  	     && fl1->fl_start == fl2->fl_start
+  	     && fl1->fl_end   == fl2->fl_end
+diff --git a/fs/lockd/clntlock.c b/fs/lockd/clntlock.c
+index 27d577dbe51a..b83bf4991172 100644
+--- a/fs/lockd/clntlock.c
++++ b/fs/lockd/clntlock.c
+@@ -187,7 +187,7 @@ __be32 nlmclnt_grant(const struct sockaddr *addr, const struct nlm_lock *lock)
+ 			continue;
+ 		if (!rpc_cmp_addr(nlm_addr(block->b_host), addr))
+ 			continue;
+-		if (nfs_compare_fh(NFS_FH(file_inode(fl_blocked->fl_file)) ,fh) != 0)
++		if (nfs_compare_fh(NFS_FH(locks_inode(fl_blocked->fl_file)), fh) != 0)
+ 			continue;
+ 		/* Alright, we found a lock. Set the return status
+ 		 * and wake up the caller
+diff --git a/fs/lockd/clntproc.c b/fs/lockd/clntproc.c
+index 84857ffd2bb8..01a26034ad02 100644
+--- a/fs/lockd/clntproc.c
++++ b/fs/lockd/clntproc.c
+@@ -128,7 +128,7 @@ static void nlmclnt_setlockargs(struct nlm_rqst *req, struct file_lock *fl)
+ 	char *nodename = req->a_host->h_rpcclnt->cl_nodename;
+ 
+ 	nlmclnt_next_cookie(&argp->cookie);
+-	memcpy(&lock->fh, NFS_FH(file_inode(fl->fl_file)), sizeof(struct nfs_fh));
++	memcpy(&lock->fh, NFS_FH(locks_inode(fl->fl_file)), sizeof(struct nfs_fh));
+ 	lock->caller  = nodename;
+ 	lock->oh.data = req->a_owner;
+ 	lock->oh.len  = snprintf(req->a_owner, sizeof(req->a_owner), "%u@%s",
+diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
+index da0f475837e0..8f7801b49061 100644
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@ -406,8 +406,8 @@ nlmsvc_lock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 	__be32			ret;
+ 
+ 	dprintk("lockd: nlmsvc_lock(%s/%ld, ty=%d, pi=%d, %Ld-%Ld, bl=%d)\n",
+-				file_inode(file->f_file)->i_sb->s_id,
+-				file_inode(file->f_file)->i_ino,
++				locks_inode(file->f_file)->i_sb->s_id,
++				locks_inode(file->f_file)->i_ino,
+ 				lock->fl.fl_type, lock->fl.fl_pid,
+ 				(long long)lock->fl.fl_start,
+ 				(long long)lock->fl.fl_end,
+@@ -513,8 +513,8 @@ nlmsvc_testlock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 	__be32			ret;
+ 
+ 	dprintk("lockd: nlmsvc_testlock(%s/%ld, ty=%d, %Ld-%Ld)\n",
+-				file_inode(file->f_file)->i_sb->s_id,
+-				file_inode(file->f_file)->i_ino,
++				locks_inode(file->f_file)->i_sb->s_id,
++				locks_inode(file->f_file)->i_ino,
+ 				lock->fl.fl_type,
+ 				(long long)lock->fl.fl_start,
+ 				(long long)lock->fl.fl_end);
+@@ -607,8 +607,8 @@ nlmsvc_unlock(struct net *net, struct nlm_file *file, struct nlm_lock *lock)
+ 	int	error;
+ 
+ 	dprintk("lockd: nlmsvc_unlock(%s/%ld, pi=%d, %Ld-%Ld)\n",
+-				file_inode(file->f_file)->i_sb->s_id,
+-				file_inode(file->f_file)->i_ino,
++				locks_inode(file->f_file)->i_sb->s_id,
++				locks_inode(file->f_file)->i_ino,
+ 				lock->fl.fl_pid,
+ 				(long long)lock->fl.fl_start,
+ 				(long long)lock->fl.fl_end);
+@@ -636,8 +636,8 @@ nlmsvc_cancel_blocked(struct net *net, struct nlm_file *file, struct nlm_lock *l
+ 	int status = 0;
+ 
+ 	dprintk("lockd: nlmsvc_cancel(%s/%ld, pi=%d, %Ld-%Ld)\n",
+-				file_inode(file->f_file)->i_sb->s_id,
+-				file_inode(file->f_file)->i_ino,
++				locks_inode(file->f_file)->i_sb->s_id,
++				locks_inode(file->f_file)->i_ino,
+ 				lock->fl.fl_pid,
+ 				(long long)lock->fl.fl_start,
+ 				(long long)lock->fl.fl_end);
+* Unmerged path fs/lockd/svcsubs.c
+* Unmerged path fs/nfsd/nfs4state.c
+* Unmerged path include/linux/lockd/lockd.h
