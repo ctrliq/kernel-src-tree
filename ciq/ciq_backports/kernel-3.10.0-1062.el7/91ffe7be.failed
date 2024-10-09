@@ -1,0 +1,121 @@
+ovl: factor out ovl_get_index_fh() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 91ffe7beb31e7e1e689a59f5ef56acea0811d81c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/91ffe7be.failed
+
+The helper is needed to lookup an index by file handle for NFS export.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 91ffe7beb31e7e1e689a59f5ef56acea0811d81c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/namei.c
+diff --cc fs/overlayfs/namei.c
+index 0afb8ae29e9b,49984c9f3689..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -448,8 -576,30 +448,23 @@@ fail
+  	pr_warn_ratelimited("overlayfs: failed to verify index (%pd2, ftype=%x, err=%i)\n",
+  			    index, d_inode(index)->i_mode & S_IFMT, err);
+  	goto out;
+ -
+ -orphan:
+ -	pr_warn_ratelimited("overlayfs: orphan index entry (%pd2, ftype=%x, nlink=%u)\n",
+ -			    index, d_inode(index)->i_mode & S_IFMT,
+ -			    d_inode(index)->i_nlink);
+ -	err = -ENOENT;
+ -	goto out;
+  }
+  
++ static int ovl_get_index_name_fh(struct ovl_fh *fh, struct qstr *name)
++ {
++ 	char *n, *s;
++ 
++ 	n = kzalloc(fh->len * 2, GFP_KERNEL);
++ 	if (!n)
++ 		return -ENOMEM;
++ 
++ 	s  = bin2hex(n, fh, fh->len);
++ 	*name = (struct qstr) QSTR_INIT(n, s - n);
++ 
++ 	return 0;
++ 
++ }
++ 
+  /*
+   * Lookup in indexdir for the index entry of a lower real inode or a copy up
+   * origin inode. The index entry name is the hex representation of the lower
+@@@ -475,17 -624,42 +489,52 @@@ int ovl_get_index_name(struct dentry *o
+  	if (IS_ERR(fh))
+  		return PTR_ERR(fh);
+  
+++<<<<<<< HEAD
+ +	err = -ENOMEM;
+ +	n = kzalloc(fh->len * 2, GFP_TEMPORARY);
+ +	if (n) {
+ +		s  = bin2hex(n, fh, fh->len);
+ +		*name = (struct qstr) QSTR_INIT(n, s - n);
+ +		err = 0;
+ +	}
+- 	kfree(fh);
+++=======
++ 	err = ovl_get_index_name_fh(fh, name);
+  
+++>>>>>>> 91ffe7beb31e (ovl: factor out ovl_get_index_fh() helper)
++ 	kfree(fh);
+  	return err;
++ }
++ 
++ /* Lookup index by file handle for NFS export */
++ struct dentry *ovl_get_index_fh(struct ovl_fs *ofs, struct ovl_fh *fh)
++ {
++ 	struct dentry *index;
++ 	struct qstr name;
++ 	int err;
++ 
++ 	err = ovl_get_index_name_fh(fh, &name);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	index = lookup_one_len_unlocked(name.name, ofs->indexdir, name.len);
++ 	kfree(name.name);
++ 	if (IS_ERR(index)) {
++ 		if (PTR_ERR(index) == -ENOENT)
++ 			index = NULL;
++ 		return index;
++ 	}
++ 
++ 	if (d_is_negative(index))
++ 		err = 0;
++ 	else if (ovl_is_whiteout(index))
++ 		err = -ESTALE;
++ 	else if (ovl_dentry_weird(index))
++ 		err = -EIO;
++ 	else
++ 		return index;
+  
++ 	dput(index);
++ 	return ERR_PTR(err);
+  }
+  
+  static struct dentry *ovl_lookup_index(struct dentry *dentry,
+* Unmerged path fs/overlayfs/namei.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 72e18429a1f5..ec80b6125b07 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -252,6 +252,7 @@ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
+ int ovl_verify_index(struct dentry *index, struct path *lowerstack,
+ 		     unsigned int numlower);
+ int ovl_get_index_name(struct dentry *origin, struct qstr *name);
++struct dentry *ovl_get_index_fh(struct ovl_fs *ofs, struct ovl_fh *fh);
+ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
+ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+ bool ovl_lower_positive(struct dentry *dentry);
