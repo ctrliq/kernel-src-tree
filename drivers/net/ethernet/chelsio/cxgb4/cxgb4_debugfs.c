@@ -2868,12 +2868,6 @@ static void add_debugfs_mem(struct adapter *adap, const char *name,
 		de->d_inode->i_size = size_mb << 20;
 }
 
-static int blocked_fl_open(struct inode *inode, struct file *file)
-{
-	file->private_data = inode->i_private;
-	return 0;
-}
-
 static ssize_t blocked_fl_read(struct file *filp, char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
@@ -2917,7 +2911,7 @@ static ssize_t blocked_fl_write(struct file *filp, const char __user *ubuf,
 
 static const struct file_operations blocked_fl_fops = {
 	.owner   = THIS_MODULE,
-	.open    = blocked_fl_open,
+	.open    = simple_open,
 	.read    = blocked_fl_read,
 	.write   = blocked_fl_write,
 	.llseek  = generic_file_llseek,
