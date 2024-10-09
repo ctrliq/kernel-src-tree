@@ -1,0 +1,202 @@
+IB/SA: Introduce path record specific types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+commit dfa834e1d97e24c7d6b7c5b102728d69d6361501
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dfa834e1.failed
+
+struct sa_path_rec has a gid_type field. This patch introduces a more
+generic path record specific type 'rec_type' which is either IB, ROCE v1
+or ROCE v2. The patch also provides conversion functions to get
+a gid type from a path record type and vice versa
+
+	Reviewed-by: Don Hiatt <don.hiatt@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Dasaratharaman Chandramouli <dasaratharaman.chandramouli@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit dfa834e1d97e24c7d6b7c5b102728d69d6361501)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sa_query.c
+diff --cc drivers/infiniband/core/sa_query.c
+index 17b24d8a34e1,e16536b31422..000000000000
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@@ -1073,12 -1175,10 +1073,19 @@@ int ib_init_ah_from_path(struct ib_devi
+  	}
+  
+  	if (rec->hop_limit > 0 || use_roce) {
+++<<<<<<< HEAD
+ +		ah_attr->ah_flags = IB_AH_GRH;
+ +		ah_attr->grh.dgid = rec->dgid;
+ +
+ +		ret = ib_find_cached_gid_by_port(device, &rec->sgid,
+ +						 rec->gid_type, port_num, ndev,
+ +						 &gid_index);
+++=======
++ 		enum ib_gid_type type = sa_conv_pathrec_to_gid_type(rec);
++ 
++ 		ret = ib_find_cached_gid_by_port(device, &rec->sgid, type,
++ 						 port_num, ndev, &gid_index);
+++>>>>>>> dfa834e1d97e (IB/SA: Introduce path record specific types)
+  		if (ret) {
+  			if (ndev)
+  				dev_put(ndev);
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index 70c24aef631d..544a29352fa1 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -453,7 +453,8 @@ static int cm_init_av_by_path(struct ib_sa_path_rec *path, struct cm_av *av,
+ 	read_lock_irqsave(&cm.device_lock, flags);
+ 	list_for_each_entry(cm_dev, &cm.device_list, list) {
+ 		if (!ib_find_cached_gid(cm_dev->ib_device, &path->sgid,
+-					path->gid_type, ndev, &p, NULL)) {
++					sa_conv_pathrec_to_gid_type(path),
++					ndev, &p, NULL)) {
+ 			port = cm_dev->port[p-1];
+ 			break;
+ 		}
+@@ -1771,8 +1772,11 @@ static int cm_req_handler(struct cm_work *work)
+ 			work->path[0].ifindex = gid_attr.ndev->ifindex;
+ 			work->path[0].net = dev_net(gid_attr.ndev);
+ 			dev_put(gid_attr.ndev);
++			work->path[0].rec_type =
++				sa_conv_gid_to_pathrec_type(gid_attr.gid_type);
++		} else {
++			work->path[0].rec_type = SA_PATH_REC_TYPE_IB;
+ 		}
+-		work->path[0].gid_type = gid_attr.gid_type;
+ 		ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av,
+ 					 cm_id_priv);
+ 	}
+@@ -1785,8 +1789,13 @@ static int cm_req_handler(struct cm_work *work)
+ 			work->path[0].ifindex = gid_attr.ndev->ifindex;
+ 			work->path[0].net = dev_net(gid_attr.ndev);
+ 			dev_put(gid_attr.ndev);
++			work->path[0].rec_type =
++				sa_conv_gid_to_pathrec_type(gid_attr.gid_type);
++		} else {
++			work->path[0].rec_type = SA_PATH_REC_TYPE_IB;
+ 		}
+-		work->path[0].gid_type = gid_attr.gid_type;
++		if (req_msg->alt_local_lid)
++			work->path[1].rec_type = work->path[0].rec_type;
+ 		ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_GID,
+ 			       &work->path[0].sgid, sizeof work->path[0].sgid,
+ 			       NULL, 0);
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 2584e562abad..46e3b5fb96cf 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -2533,6 +2533,7 @@ static int cma_resolve_iboe_route(struct rdma_id_private *id_priv)
+ 	struct cma_work *work;
+ 	int ret;
+ 	struct net_device *ndev = NULL;
++	enum ib_gid_type gid_type = IB_GID_TYPE_IB;
+ 	u8 default_roce_tos = id_priv->cma_dev->default_roce_tos[id_priv->id.port_num -
+ 					rdma_start_port(id_priv->cma_dev->device)];
+ 	u8 tos = id_priv->tos_set ? id_priv->tos : default_roce_tos;
+@@ -2581,10 +2582,11 @@ static int cma_resolve_iboe_route(struct rdma_id_private *id_priv)
+ 		route->path_rec->ifindex = ndev->ifindex;
+ 		supported_gids = roce_gid_type_mask_support(id_priv->id.device,
+ 							    id_priv->id.port_num);
+-		route->path_rec->gid_type =
+-			cma_route_gid_type(addr->dev_addr.network,
+-					   supported_gids,
+-					   id_priv->gid_type);
++		gid_type = cma_route_gid_type(addr->dev_addr.network,
++					      supported_gids,
++					      id_priv->gid_type);
++		route->path_rec->rec_type =
++			sa_conv_gid_to_pathrec_type(gid_type);
+ 	}
+ 	if (!ndev) {
+ 		ret = -ENODEV;
+@@ -2599,8 +2601,10 @@ static int cma_resolve_iboe_route(struct rdma_id_private *id_priv)
+ 		    &route->path_rec->dgid);
+ 
+ 	/* Use the hint from IP Stack to select GID Type */
+-	if (route->path_rec->gid_type < ib_network_to_gid_type(addr->dev_addr.network))
+-		route->path_rec->gid_type = ib_network_to_gid_type(addr->dev_addr.network);
++	if (gid_type < ib_network_to_gid_type(addr->dev_addr.network))
++		gid_type = ib_network_to_gid_type(addr->dev_addr.network);
++	route->path_rec->rec_type = sa_conv_gid_to_pathrec_type(gid_type);
++
+ 	if (((struct sockaddr *)&id_priv->id.route.addr.dst_addr)->sa_family != AF_IB)
+ 		/* TODO: get the hoplimit from the inet/inet6 device */
+ 		route->path_rec->hop_limit = addr->dev_addr.hoplimit;
+* Unmerged path drivers/infiniband/core/sa_query.c
+diff --git a/drivers/infiniband/core/uverbs_marshall.c b/drivers/infiniband/core/uverbs_marshall.c
+index a9739f334562..017b2eb2c7a5 100644
+--- a/drivers/infiniband/core/uverbs_marshall.c
++++ b/drivers/infiniband/core/uverbs_marshall.c
+@@ -146,6 +146,6 @@ void ib_copy_path_rec_from_user(struct ib_sa_path_rec *dst,
+ 	memset(dst->dmac, 0, sizeof(dst->dmac));
+ 	dst->net = NULL;
+ 	dst->ifindex = 0;
+-	dst->gid_type = IB_GID_TYPE_IB;
++	dst->rec_type = SA_PATH_REC_TYPE_IB;
+ }
+ EXPORT_SYMBOL(ib_copy_path_rec_from_user);
+diff --git a/include/rdma/ib_sa.h b/include/rdma/ib_sa.h
+index fd0e53219f93..22f66e0ea3c7 100644
+--- a/include/rdma/ib_sa.h
++++ b/include/rdma/ib_sa.h
+@@ -146,6 +146,11 @@ enum ib_sa_mc_join_states {
+ #define IB_SA_PATH_REC_PACKET_LIFE_TIME_SELECTOR	IB_SA_COMP_MASK(20)
+ #define IB_SA_PATH_REC_PACKET_LIFE_TIME			IB_SA_COMP_MASK(21)
+ #define IB_SA_PATH_REC_PREFERENCE			IB_SA_COMP_MASK(22)
++enum sa_path_rec_type {
++	SA_PATH_REC_TYPE_IB,
++	SA_PATH_REC_TYPE_ROCE_V1,
++	SA_PATH_REC_TYPE_ROCE_V2
++};
+ 
+ struct ib_sa_path_rec {
+ 	__be64       service_id;
+@@ -175,7 +180,7 @@ struct ib_sa_path_rec {
+ 	int	     ifindex;
+ 	/* ignored in IB */
+ 	struct net  *net;
+-	enum ib_gid_type gid_type;
++	enum sa_path_rec_type rec_type;
+ };
+ 
+ static inline struct net_device *ib_get_ndev_from_path(struct ib_sa_path_rec *rec)
+@@ -183,6 +188,32 @@ static inline struct net_device *ib_get_ndev_from_path(struct ib_sa_path_rec *re
+ 	return rec->net ? dev_get_by_index(rec->net, rec->ifindex) : NULL;
+ }
+ 
++static inline enum ib_gid_type
++		sa_conv_pathrec_to_gid_type(struct sa_path_rec *rec)
++{
++	switch (rec->rec_type) {
++	case SA_PATH_REC_TYPE_ROCE_V1:
++		return IB_GID_TYPE_ROCE;
++	case SA_PATH_REC_TYPE_ROCE_V2:
++		return IB_GID_TYPE_ROCE_UDP_ENCAP;
++	default:
++		return IB_GID_TYPE_IB;
++	}
++}
++
++static inline enum sa_path_rec_type
++		sa_conv_gid_to_pathrec_type(enum ib_gid_type type)
++{
++	switch (type) {
++	case IB_GID_TYPE_ROCE:
++		return SA_PATH_REC_TYPE_ROCE_V1;
++	case IB_GID_TYPE_ROCE_UDP_ENCAP:
++		return SA_PATH_REC_TYPE_ROCE_V2;
++	default:
++		return SA_PATH_REC_TYPE_IB;
++	}
++}
++
+ #define IB_SA_MCMEMBER_REC_MGID				IB_SA_COMP_MASK( 0)
+ #define IB_SA_MCMEMBER_REC_PORT_GID			IB_SA_COMP_MASK( 1)
+ #define IB_SA_MCMEMBER_REC_QKEY				IB_SA_COMP_MASK( 2)
