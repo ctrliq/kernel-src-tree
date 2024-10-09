@@ -1,0 +1,228 @@
+net: for rate-limited ICMP replies save one atomic operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] for rate-limited ICMP replies save one atomic operation (Sabrina Dubroca) [1428684]
+Rebuild_FUZZ: 95.65%
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 7ba91ecb16824f74ba4fcbc4e88cd4d24a839b25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7ba91ecb.failed
+
+It is possible to avoid the atomic operation in icmp{v6,}_xmit_lock,
+by checking the sysctl_icmp_msgs_per_sec ratelimit before these calls,
+as pointed out by Eric Dumazet, but the BH disabled state must be correct.
+
+The icmp_global_allow() call states it must be called with BH
+disabled.  This protection was given by the calls icmp_xmit_lock and
+icmpv6_xmit_lock.  Thus, split out local_bh_disable/enable from these
+functions and maintain it explicitly at callers.
+
+	Suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ba91ecb16824f74ba4fcbc4e88cd4d24a839b25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/icmp.c
+#	net/ipv6/icmp.c
+diff --cc net/ipv4/icmp.c
+index 6988f500f6f0,fc310db2708b..000000000000
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@@ -205,9 -206,10 +205,10 @@@ static const struct icmp_control icmp_p
+   */
+  static struct sock *icmp_sk(struct net *net)
+  {
+ -	return *this_cpu_ptr(net->ipv4.icmp_sk);
+ +	return net->ipv4.icmp_sk[smp_processor_id()];
+  }
+  
++ /* Called with BH disabled */
+  static inline struct sock *icmp_xmit_lock(struct net *net)
+  {
+  	struct sock *sk;
+@@@ -228,9 -227,86 +226,9 @@@
+  
+  static inline void icmp_xmit_unlock(struct sock *sk)
+  {
+- 	spin_unlock_bh(&sk->sk_lock.slock);
++ 	spin_unlock(&sk->sk_lock.slock);
+  }
+  
+ -int sysctl_icmp_msgs_per_sec __read_mostly = 1000;
+ -int sysctl_icmp_msgs_burst __read_mostly = 50;
+ -
+ -static struct {
+ -	spinlock_t	lock;
+ -	u32		credit;
+ -	u32		stamp;
+ -} icmp_global = {
+ -	.lock		= __SPIN_LOCK_UNLOCKED(icmp_global.lock),
+ -};
+ -
+ -/**
+ - * icmp_global_allow - Are we allowed to send one more ICMP message ?
+ - *
+ - * Uses a token bucket to limit our ICMP messages to sysctl_icmp_msgs_per_sec.
+ - * Returns false if we reached the limit and can not send another packet.
+ - * Note: called with BH disabled
+ - */
+ -bool icmp_global_allow(void)
+ -{
+ -	u32 credit, delta, incr = 0, now = (u32)jiffies;
+ -	bool rc = false;
+ -
+ -	/* Check if token bucket is empty and cannot be refilled
+ -	 * without taking the spinlock.
+ -	 */
+ -	if (!icmp_global.credit) {
+ -		delta = min_t(u32, now - icmp_global.stamp, HZ);
+ -		if (delta < HZ / 50)
+ -			return false;
+ -	}
+ -
+ -	spin_lock(&icmp_global.lock);
+ -	delta = min_t(u32, now - icmp_global.stamp, HZ);
+ -	if (delta >= HZ / 50) {
+ -		incr = sysctl_icmp_msgs_per_sec * delta / HZ ;
+ -		if (incr)
+ -			icmp_global.stamp = now;
+ -	}
+ -	credit = min_t(u32, icmp_global.credit + incr, sysctl_icmp_msgs_burst);
+ -	if (credit) {
+ -		credit--;
+ -		rc = true;
+ -	}
+ -	icmp_global.credit = credit;
+ -	spin_unlock(&icmp_global.lock);
+ -	return rc;
+ -}
+ -EXPORT_SYMBOL(icmp_global_allow);
+ -
+ -static bool icmpv4_mask_allow(struct net *net, int type, int code)
+ -{
+ -	if (type > NR_ICMP_TYPES)
+ -		return true;
+ -
+ -	/* Don't limit PMTU discovery. */
+ -	if (type == ICMP_DEST_UNREACH && code == ICMP_FRAG_NEEDED)
+ -		return true;
+ -
+ -	/* Limit if icmp type is enabled in ratemask. */
+ -	if (!((1 << type) & net->ipv4.sysctl_icmp_ratemask))
+ -		return true;
+ -
+ -	return false;
+ -}
+ -
+ -static bool icmpv4_global_allow(struct net *net, int type, int code)
+ -{
+ -	if (icmpv4_mask_allow(net, type, code))
+ -		return true;
+ -
+ -	if (icmp_global_allow())
+ -		return true;
+ -
+ -	return false;
+ -}
+ -
+  /*
+   *	Send an ICMP frame.
+   */
+@@@ -341,11 -415,18 +339,26 @@@ static void icmp_reply(struct icmp_bxm 
+  	if (ip_options_echo(&icmp_param->replyopts.opt.opt, skb))
+  		return;
+  
+++<<<<<<< HEAD
+ +	sk = icmp_xmit_lock(net);
+ +	if (sk == NULL)
+ +		return;
+ +	inet = inet_sk(sk);
+ +
+++=======
++ 	/* Needed by both icmp_global_allow and icmp_xmit_lock */
++ 	local_bh_disable();
++ 
++ 	/* global icmp_msgs_per_sec */
++ 	if (!icmpv4_global_allow(net, type, code))
++ 		goto out_bh_enable;
++ 
++ 	sk = icmp_xmit_lock(net);
++ 	if (!sk)
++ 		goto out_bh_enable;
++ 	inet = inet_sk(sk);
++ 
+++>>>>>>> 7ba91ecb1682 (net: for rate-limited ICMP replies save one atomic operation)
+  	icmp_param->data.icmph.checksum = 0;
+  
+  	inet->tos = ip_hdr(skb)->tos;
+@@@ -579,9 -671,16 +594,22 @@@ void icmp_send(struct sk_buff *skb_in, 
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	sk = icmp_xmit_lock(net);
+ +	if (sk == NULL)
+ +		return;
+++=======
++ 	/* Needed by both icmp_global_allow and icmp_xmit_lock */
++ 	local_bh_disable();
++ 
++ 	/* Check global sysctl_icmp_msgs_per_sec ratelimit */
++ 	if (!icmpv4_global_allow(net, type, code))
++ 		goto out_bh_enable;
++ 
++ 	sk = icmp_xmit_lock(net);
++ 	if (!sk)
++ 		goto out_bh_enable;
+++>>>>>>> 7ba91ecb1682 (net: for rate-limited ICMP replies save one atomic operation)
+  
+  	/*
+  	 *	Construct source address and options.
+diff --cc net/ipv6/icmp.c
+index 6afaf8b3b1a1,230b5aac9f03..000000000000
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@@ -462,8 -510,11 +467,15 @@@ static void icmp6_send(struct sk_buff *
+  	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
+  
+  	sk = icmpv6_xmit_lock(net);
+++<<<<<<< HEAD
+ +	if (sk == NULL)
+ +		return;
+++=======
++ 	if (!sk)
++ 		goto out_bh_enable;
++ 
++ 	sk->sk_mark = mark;
+++>>>>>>> 7ba91ecb1682 (net: for rate-limited ICMP replies save one atomic operation)
+  	np = inet6_sk(sk);
+  
+  	if (!icmpv6_xrlim_allow(sk, type, &fl6))
+@@@ -563,11 -684,15 +577,18 @@@ static void icmpv6_echo_reply(struct sk
+  		fl6.saddr = *saddr;
+  	fl6.flowi6_oif = skb->dev->ifindex;
+  	fl6.fl6_icmp_type = ICMPV6_ECHO_REPLY;
+ -	fl6.flowi6_mark = mark;
+ -	fl6.flowi6_uid = sock_net_uid(net, NULL);
+  	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
+  
++ 	local_bh_disable();
+  	sk = icmpv6_xmit_lock(net);
+++<<<<<<< HEAD
+ +	if (sk == NULL)
+ +		return;
+++=======
++ 	if (!sk)
++ 		goto out_bh_enable;
++ 	sk->sk_mark = mark;
+++>>>>>>> 7ba91ecb1682 (net: for rate-limited ICMP replies save one atomic operation)
+  	np = inet6_sk(sk);
+  
+  	if (!fl6.flowi6_oif && ipv6_addr_is_multicast(&fl6.daddr))
+* Unmerged path net/ipv4/icmp.c
+* Unmerged path net/ipv6/icmp.c
