@@ -1,0 +1,298 @@
+net: bridge: change unicast boolean to exact pkt_type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: change unicast boolean to exact pkt_type (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 95.05%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 8addd5e7d3a5c118a214a7794ae299787198aa25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8addd5e7.failed
+
+Remove the unicast flag and introduce an exact pkt_type. That would help us
+for the upcoming per-port multicast flood flag and also slightly reduce the
+tests in the input fast path.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8addd5e7d3a5c118a214a7794ae299787198aa25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_device.c
+#	net/bridge/br_forward.c
+#	net/bridge/br_input.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_device.c
+index 59112a1972e0,89a687f3c0a3..000000000000
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@@ -58,14 -58,14 +58,22 @@@ netdev_tx_t br_dev_xmit(struct sk_buff 
+  	skb_reset_mac_header(skb);
+  	skb_pull(skb, ETH_HLEN);
+  
+ -	if (!br_allowed_ingress(br, br_vlan_group_rcu(br), skb, &vid))
+ +	if (!br_allowed_ingress(br, br_get_vlan_info(br), skb, &vid))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (is_broadcast_ether_addr(dest))
+ +		br_flood_deliver(br, skb, false);
+ +	else if (is_multicast_ether_addr(dest)) {
+ +		if (unlikely(netpoll_tx_running(dev))) {
+ +			br_flood_deliver(br, skb, false);
+++=======
++ 	if (is_broadcast_ether_addr(dest)) {
++ 		br_flood(br, skb, BR_PKT_BROADCAST, false, true);
++ 	} else if (is_multicast_ether_addr(dest)) {
++ 		if (unlikely(netpoll_tx_running(dev))) {
++ 			br_flood(br, skb, BR_PKT_MULTICAST, false, true);
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  			goto out;
+  		}
+  		if (br_multicast_rcv(br, NULL, skb, vid)) {
+@@@ -76,14 -76,14 +84,23 @@@
+  		mdst = br_mdb_get(br, skb, vid);
+  		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+  		    br_multicast_querier_exists(br, eth_hdr(skb)))
+ -			br_multicast_flood(mdst, skb, false, true);
+ +			br_multicast_deliver(mdst, skb);
+  		else
+++<<<<<<< HEAD
+ +			br_flood_deliver(br, skb, false);
+ +	} else if ((dst = __br_fdb_get(br, dest, vid)) != NULL)
+ +		br_deliver(dst->dst, skb);
+ +	else
+ +		br_flood_deliver(br, skb, true);
+ +
+++=======
++ 			br_flood(br, skb, BR_PKT_MULTICAST, false, true);
++ 	} else if ((dst = __br_fdb_get(br, dest, vid)) != NULL) {
++ 		br_forward(dst->dst, skb, false, true);
++ 	} else {
++ 		br_flood(br, skb, BR_PKT_UNICAST, false, true);
++ 	}
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  out:
+  	rcu_read_unlock();
+  	return NETDEV_TX_OK;
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,5de854ed3340..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -189,25 -174,32 +189,31 @@@ out
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+ +/* called under bridge lock */
+ +static void br_flood(struct net_bridge *br, struct sk_buff *skb,
+ +		     struct sk_buff *skb0,
+ +		     void (*__packet_hook)(const struct net_bridge_port *p,
+ +					   struct sk_buff *skb),
+ +		     bool unicast)
+++=======
++ /* called under rcu_read_lock */
++ void br_flood(struct net_bridge *br, struct sk_buff *skb,
++ 	      enum br_pkt_type pkt_type, bool local_rcv, bool local_orig)
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  {
+ -	u8 igmp_type = br_multicast_igmp_type(skb);
+ -	struct net_bridge_port *prev = NULL;
+  	struct net_bridge_port *p;
+ +	struct net_bridge_port *prev;
+ +
+ +	prev = NULL;
+  
+  	list_for_each_entry_rcu(p, &br->port_list, list) {
+  		/* Do not flood unicast traffic to ports that turn it off */
+- 		if (unicast && !(p->flags & BR_FLOOD))
++ 		if (pkt_type == BR_PKT_UNICAST && !(p->flags & BR_FLOOD))
+  			continue;
+ -
+ -		/* Do not flood to ports that enable proxy ARP */
+ -		if (p->flags & BR_PROXYARP)
+ -			continue;
+ -		if ((p->flags & BR_PROXYARP_WIFI) &&
+ -		    BR_INPUT_SKB_CB(skb)->proxyarp_replied)
+ -			continue;
+ -
+ -		prev = maybe_deliver(prev, p, skb, local_orig);
+ +		prev = maybe_deliver(prev, p, skb, __packet_hook);
+  		if (IS_ERR(prev))
+  			goto out;
+ -		if (prev == p)
+ -			br_multicast_count(p->br, p, skb, igmp_type,
+ -					   BR_MCAST_DIR_TX);
+  	}
+  
+  	if (!prev)
+diff --cc net/bridge/br_input.c
+index ca978d06eb18,8a4368461fb0..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -59,15 -129,15 +59,24 @@@ static int br_pass_frame_up(struct sk_b
+  }
+  
+  /* note: already called with rcu_read_lock */
+ -int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ +int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	const unsigned char *dest = eth_hdr(skb)->h_dest;
+ +	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
+++=======
++ 	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
++ 	const unsigned char *dest = eth_hdr(skb)->h_dest;
++ 	enum br_pkt_type pkt_type = BR_PKT_UNICAST;
++ 	struct net_bridge_fdb_entry *dst = NULL;
++ 	struct net_bridge_mdb_entry *mdst;
++ 	bool local_rcv, mcast_hit = false;
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  	struct net_bridge *br;
+ +	struct net_bridge_fdb_entry *dst;
+ +	struct net_bridge_mdb_entry *mdst;
+ +	struct sk_buff *skb2;
+ +	bool unicast = true;
+  	u16 vid = 0;
+  
+  	if (!p || p->state == BR_STATE_DISABLED)
+@@@ -90,50 -171,46 +108,88 @@@
+  
+  	BR_INPUT_SKB_CB(skb)->brdev = br->dev;
+  
+++<<<<<<< HEAD
+ +	/* The packet skb2 goes to the local host (NULL to skip). */
+ +	skb2 = NULL;
+ +
+ +	if (br->dev->flags & IFF_PROMISC)
+ +		skb2 = skb;
+ +
+ +	dst = NULL;
+ +
+ +	if (is_broadcast_ether_addr(dest)) {
+ +		skb2 = skb;
+ +		unicast = false;
+ +	} else if (is_multicast_ether_addr(dest)) {
+++=======
++ 	if (IS_ENABLED(CONFIG_INET) && skb->protocol == htons(ETH_P_ARP))
++ 		br_do_proxy_arp(skb, br, vid, p);
++ 
++ 	switch (pkt_type) {
++ 	case BR_PKT_MULTICAST:
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  		mdst = br_mdb_get(br, skb, vid);
+  		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+  		    br_multicast_querier_exists(br, eth_hdr(skb))) {
+  			if ((mdst && mdst->mglist) ||
+++<<<<<<< HEAD
+ +			    br_multicast_is_router(br))
+ +				skb2 = skb;
+ +			br_multicast_forward(mdst, skb, skb2);
+ +			skb = NULL;
+ +			if (!skb2)
+ +				goto out;
+ +		} else
+ +			skb2 = skb;
+ +
+ +		unicast = false;
+ +		br->dev->stats.multicast++;
+ +	} else if ((dst = __br_fdb_get(br, dest, vid)) &&
+ +			dst->is_local) {
+ +		skb2 = skb;
+ +		/* Do not forward the packet since it's local. */
+ +		skb = NULL;
+ +	}
+ +
+ +	if (skb) {
+ +		if (dst) {
+ +			dst->used = jiffies;
+ +			br_forward(dst->dst, skb, skb2);
+ +		} else
+ +			br_flood_forward(br, skb, skb2, unicast);
+++=======
++ 			    br_multicast_is_router(br)) {
++ 				local_rcv = true;
++ 				br->dev->stats.multicast++;
++ 			}
++ 			mcast_hit = true;
++ 		} else {
++ 			local_rcv = true;
++ 			br->dev->stats.multicast++;
++ 		}
++ 		break;
++ 	case BR_PKT_UNICAST:
++ 		dst = __br_fdb_get(br, dest, vid);
++ 	default:
++ 		break;
++ 	}
++ 
++ 	if (dst) {
++ 		if (dst->is_local)
++ 			return br_pass_frame_up(skb);
++ 
++ 		dst->used = jiffies;
++ 		br_forward(dst->dst, skb, local_rcv, false);
++ 	} else {
++ 		if (!mcast_hit)
++ 			br_flood(br, skb, pkt_type, local_rcv, false);
++ 		else
++ 			br_multicast_flood(mdst, skb, local_rcv, false);
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  	}
+  
+ -	if (local_rcv)
+ -		return br_pass_frame_up(skb);
+ +	if (skb2)
+ +		return br_pass_frame_up(skb2);
+  
+  out:
+  	return 0;
+diff --cc net/bridge/br_private.h
+index 1e1daa30e106,1b63177e0ccd..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -392,19 -508,26 +392,33 @@@ int br_fdb_delete(struct ndmsg *ndm, st
+  int br_fdb_add(struct ndmsg *nlh, struct nlattr *tb[], struct net_device *dev,
+  	       const unsigned char *addr, u16 vid, u16 nlh_flags);
+  int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ -		struct net_device *dev, struct net_device *fdev, int *idx);
+ +		struct net_device *dev, struct net_device *fdev, int idx);
+  int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p);
+  void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
+ -int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ -			      const unsigned char *addr, u16 vid);
+ -int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
+ -			      const unsigned char *addr, u16 vid);
+  
+  /* br_forward.c */
+++<<<<<<< HEAD
+ +void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
+ +int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb);
+ +void br_forward(const struct net_bridge_port *to,
+ +		struct sk_buff *skb, struct sk_buff *skb0);
+ +int br_forward_finish(struct sock *sk, struct sk_buff *skb);
+ +void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast);
+ +void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ +		      struct sk_buff *skb2, bool unicast);
+++=======
++ enum br_pkt_type {
++ 	BR_PKT_UNICAST,
++ 	BR_PKT_MULTICAST,
++ 	BR_PKT_BROADCAST
++ };
++ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb);
++ void br_forward(const struct net_bridge_port *to, struct sk_buff *skb,
++ 		bool local_rcv, bool local_orig);
++ int br_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb);
++ void br_flood(struct net_bridge *br, struct sk_buff *skb,
++ 	      enum br_pkt_type pkt_type, bool local_rcv, bool local_orig);
+++>>>>>>> 8addd5e7d3a5 (net: bridge: change unicast boolean to exact pkt_type)
+  
+  /* br_if.c */
+  void br_port_carrier_check(struct net_bridge_port *p);
+* Unmerged path net/bridge/br_device.c
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_input.c
+* Unmerged path net/bridge/br_private.h
