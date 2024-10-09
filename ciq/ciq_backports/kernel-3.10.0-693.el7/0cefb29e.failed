@@ -1,0 +1,130 @@
+xfs: using generic_file_direct_write() is unnecessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 0cefb29e6a63727bc7606c47fc538467594ef112
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0cefb29e.failed
+
+generic_file_direct_write() does all sorts of things to make DIO
+work "sorta ok" with mixed buffered IO workloads. We already do
+most of this work in xfs_file_aio_dio_write() because of the locking
+requirements, so there's only a couple of things it does for us.
+
+The first thing is that it does a page cache invalidation after the
+->direct_IO callout. This can easily be added to the XFS code.
+
+The second thing it does is that if data was written, it updates the
+iov_iter structure to reflect the data written, and then does EOF
+size updates if necessary. For XFS, these EOF size updates are now
+not necessary, as we do them safely and race-free in IO completion
+context. That leaves just the iov_iter update, and that's also moved
+to the XFS code.
+
+Therefore we don't need to call generic_file_direct_write() and in
+doing so remove redundant buffered writeback and page cache
+invalidation calls from the DIO submission path. We also remove a
+racy EOF size update, and make the DIO submission code in XFS much
+easier to follow. Wins all round, really.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 0cefb29e6a63727bc7606c47fc538467594ef112)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,79ffb3e74f49..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -791,9 -655,12 +791,16 @@@ xfs_file_dio_aio_write
+  	struct xfs_inode	*ip = XFS_I(inode);
+  	struct xfs_mount	*mp = ip->i_mount;
+  	ssize_t			ret = 0;
+ +	size_t			count = ocount;
+  	int			unaligned_io = 0;
+  	int			iolock;
+++<<<<<<< HEAD
+++=======
++ 	size_t			count = iov_iter_count(from);
++ 	loff_t			pos = iocb->ki_pos;
++ 	loff_t			end;
++ 	struct iov_iter		data;
+++>>>>>>> 0cefb29e6a63 (xfs: using generic_file_direct_write() is unnecessary)
+  	struct xfs_buftarg	*target = XFS_IS_REALTIME_INODE(ip) ?
+  					mp->m_rtdev_targp : mp->m_ddev_targp;
+  
+@@@ -832,20 -699,22 +839,36 @@@
+  	ret = xfs_file_aio_write_checks(file, &pos, &count, &iolock);
+  	if (ret)
+  		goto out;
+++<<<<<<< HEAD
+++=======
++ 	iov_iter_truncate(from, count);
++ 	end = pos + count - 1;
+++>>>>>>> 0cefb29e6a63 (xfs: using generic_file_direct_write() is unnecessary)
+  
+ +	/*
+ +	 * See xfs_file_aio_read() for why we do a full-file flush here.
+ +	 */
+  	if (mapping->nrpages) {
+++<<<<<<< HEAD
+ +		ret = filemap_write_and_wait(VFS_I(ip)->i_mapping);
+++=======
++ 		ret = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
++ 						   pos, end);
+++>>>>>>> 0cefb29e6a63 (xfs: using generic_file_direct_write() is unnecessary)
+  		if (ret)
+  			goto out;
+  		/*
+ -		 * Invalidate whole pages. This can return an error if
+ -		 * we fail to invalidate a page, but this should never
+ -		 * happen on XFS. Warn if it does fail.
+ +		 * Invalidate whole pages. This can return an error if we fail
+ +		 * to invalidate a page, but this should never happen on XFS.
+ +		 * Warn if it does fail.
+  		 */
+++<<<<<<< HEAD
+ +		ret = invalidate_inode_pages2(VFS_I(ip)->i_mapping);
+++=======
++ 		ret = invalidate_inode_pages2_range(VFS_I(ip)->i_mapping,
++ 					pos >> PAGE_CACHE_SHIFT,
++ 					end >> PAGE_CACHE_SHIFT);
+++>>>>>>> 0cefb29e6a63 (xfs: using generic_file_direct_write() is unnecessary)
+  		WARN_ON_ONCE(ret);
+  		ret = 0;
+  	}
+@@@ -862,9 -731,22 +885,27 @@@
+  	}
+  
+  	trace_xfs_file_direct_write(ip, count, iocb->ki_pos, 0);
+++<<<<<<< HEAD
+ +	ret = generic_file_direct_write(iocb, iovp,
+ +			&nr_segs, pos, &iocb->ki_pos, count, ocount);
+++=======
+++>>>>>>> 0cefb29e6a63 (xfs: using generic_file_direct_write() is unnecessary)
+  
++ 	data = *from;
++ 	ret = mapping->a_ops->direct_IO(WRITE, iocb, &data, pos);
++ 
++ 	/* see generic_file_direct_write() for why this is necessary */
++ 	if (mapping->nrpages) {
++ 		invalidate_inode_pages2_range(mapping,
++ 					      pos >> PAGE_CACHE_SHIFT,
++ 					      end >> PAGE_CACHE_SHIFT);
++ 	}
++ 
++ 	if (ret > 0) {
++ 		pos += ret;
++ 		iov_iter_advance(from, ret);
++ 		iocb->ki_pos = pos;
++ 	}
+  out:
+  	xfs_rw_iunlock(ip, iolock);
+  
+* Unmerged path fs/xfs/xfs_file.c
