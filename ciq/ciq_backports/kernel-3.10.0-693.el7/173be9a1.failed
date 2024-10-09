@@ -1,0 +1,129 @@
+sched/cputime: Fix NO_HZ_FULL getrusage() monotonicity regression
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 173be9a14f7b2e901cf77c18b1aafd4d672e9d9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/173be9a1.failed
+
+Mike reports:
+
+ Roughly 10% of the time, ltp testcase getrusage04 fails:
+ getrusage04    0  TINFO  :  Expected timers granularity is 4000 us
+ getrusage04    0  TINFO  :  Using 1 as multiply factor for max [us]time increment (1000+4000us)!
+ getrusage04    0  TINFO  :  utime:           0us; stime:         179us
+ getrusage04    0  TINFO  :  utime:        3751us; stime:           0us
+ getrusage04    1  TFAIL  :  getrusage04.c:133: stime increased > 5000us:
+
+And tracked it down to the case where the task simply doesn't get
+_any_ [us]time ticks.
+
+Update the code to assume all rtime is utime when we lack information,
+thus ensuring a task that elides the tick gets time accounted.
+
+	Reported-by: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Tested-by: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Fredrik Markstrom <fredrik.markstrom@gmail.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: Wanpeng Li <wanpeng.li@hotmail.com>
+	Cc: stable@vger.kernel.org # 4.3+
+Fixes: 9d7fb0427648 ("sched/cputime: Guarantee stime + utime == rtime")
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 173be9a14f7b2e901cf77c18b1aafd4d672e9d9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/cputime.c
+diff --cc kernel/sched/cputime.c
+index cebed7e6f9b8,2ee83b200504..000000000000
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@@ -586,29 -613,50 +586,66 @@@ static void cputime_adjust(struct task_
+  
+  	stime = curr->stime;
+  	utime = curr->utime;
+++<<<<<<< HEAD
+ +	if (utime == 0) {
+ +		stime = rtime;
+ +	} else if (stime == 0) {
+ +		utime = rtime;
+ +	} else {
+ +		cputime_t total = stime + utime;
+ +
+ +		stime = scale_stime((__force u64)stime,
+ +				    (__force u64)rtime, (__force u64)total);
+ +		utime = rtime - stime;
+ +	}
+ +
+++=======
++ 
++ 	/*
++ 	 * If either stime or both stime and utime are 0, assume all runtime is
++ 	 * userspace. Once a task gets some ticks, the monotonicy code at
++ 	 * 'update' will ensure things converge to the observed ratio.
++ 	 */
++ 	if (stime == 0) {
++ 		utime = rtime;
++ 		goto update;
++ 	}
++ 
++ 	if (utime == 0) {
++ 		stime = rtime;
++ 		goto update;
++ 	}
++ 
++ 	stime = scale_stime((__force u64)stime, (__force u64)rtime,
++ 			    (__force u64)(stime + utime));
++ 
++ update:
+++>>>>>>> 173be9a14f7b (sched/cputime: Fix NO_HZ_FULL getrusage() monotonicity regression)
+  	/*
+ -	 * Make sure stime doesn't go backwards; this preserves monotonicity
+ -	 * for utime because rtime is monotonic.
+ -	 *
+ -	 *  utime_i+1 = rtime_i+1 - stime_i
+ -	 *            = rtime_i+1 - (rtime_i - utime_i)
+ -	 *            = (rtime_i+1 - rtime_i) + utime_i
+ -	 *            >= utime_i
+ +	 * If the tick based count grows faster than the scheduler one,
+ +	 * the result of the scaling may go backward.
+ +	 * Let's enforce monotonicity.
+ +	 * Atomic exchange protects against concurrent cputime_adjust.
+  	 */
+ -	if (stime < prev->stime)
+ -		stime = prev->stime;
+ -	utime = rtime - stime;
+ +	while (stime > (rtime = ACCESS_ONCE(prev->stime)))
+ +		cmpxchg(&prev->stime, rtime, stime);
+ +	while (utime > (rtime = ACCESS_ONCE(prev->utime)))
+ +		cmpxchg(&prev->utime, rtime, utime);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Make sure utime doesn't go backwards; this still preserves
++ 	 * monotonicity for stime, analogous argument to above.
++ 	 */
++ 	if (utime < prev->utime) {
++ 		utime = prev->utime;
++ 		stime = rtime - utime;
++ 	}
++ 
++ 	prev->stime = stime;
++ 	prev->utime = utime;
+++>>>>>>> 173be9a14f7b (sched/cputime: Fix NO_HZ_FULL getrusage() monotonicity regression)
+  out:
+  	*ut = prev->utime;
+  	*st = prev->stime;
+* Unmerged path kernel/sched/cputime.c
