@@ -1,0 +1,202 @@
+nvme: Remove RCU namespace protection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Remove RCU namespace protection (David Milburn) [1384066]
+Rebuild_FUZZ: 91.18%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 32f0c4afb4363e31dad49202f1554ba591d649f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/32f0c4af.failed
+
+We can't sleep with RCU read lock held, but we need to do potentially
+blocking stuff to namespace queues when iterating the list. This patch
+removes the RCU locking and holds a mutex instead.
+
+To prevent deadlocks, this patch removes holding the mutex during
+namespace scanning and removal. The unlocked namespace scanning is made
+safe by holding a reference to the namespace being scanned.
+
+List iteration that does IO has to be unlocked to allow error recovery.
+The caller must ensure the list can not be manipulated during such an
+event, so this patch adds a comment explaining this requirement to the
+only function that iterates an unlocked list. All callers currently
+meet this requirement, so no further changes required.
+
+List iterations that do not do IO can safely use the lock since it couldn't
+block recovery from missing forced IO completions.
+
+	Reported-by: Ming Lin <mlin at kernel.org>
+[fixes 0bf77e9 nvme: switch to RCU freeing the namespace]
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 32f0c4afb4363e31dad49202f1554ba591d649f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index b10275d9cb61,d5fb55c0a9d9..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1254,8 -1458,13 +1255,11 @@@ static void nvme_alloc_ns(struct nvme_c
+  	if (nvme_revalidate_disk(ns->disk))
+  		goto out_free_disk;
+  
+- 	list_add_tail_rcu(&ns->list, &ctrl->namespaces);
++ 	mutex_lock(&ctrl->namespaces_mutex);
++ 	list_add_tail(&ns->list, &ctrl->namespaces);
++ 	mutex_unlock(&ctrl->namespaces_mutex);
++ 
+  	kref_get(&ctrl->kref);
+ -	if (ns->type == NVME_NS_LIGHTNVM)
+ -		return;
+  
+  	add_disk(ns->disk);
+  	if (sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+@@@ -1373,22 -1588,98 +1378,53 @@@ void nvme_scan_namespaces(struct nvme_c
+  		if (!nvme_scan_ns_list(ctrl, nn))
+  			goto done;
+  	}
+ -	nvme_scan_ns_sequential(ctrl, nn);
+ +	__nvme_scan_namespaces(ctrl, le32_to_cpup(&id->nn));
+   done:
++ 	mutex_lock(&ctrl->namespaces_mutex);
+  	list_sort(NULL, &ctrl->namespaces, ns_cmp);
+  	mutex_unlock(&ctrl->namespaces_mutex);
+  	kfree(id);
+ -
+ -	if (ctrl->ops->post_scan)
+ -		ctrl->ops->post_scan(ctrl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void nvme_queue_scan(struct nvme_ctrl *ctrl)
++ {
++ 	/*
++ 	 * Do not queue new scan work when a controller is reset during
++ 	 * removal.
++ 	 */
++ 	if (ctrl->state == NVME_CTRL_LIVE)
++ 		schedule_work(&ctrl->scan_work);
++ }
++ EXPORT_SYMBOL_GPL(nvme_queue_scan);
++ 
++ /*
++  * This function iterates the namespace list unlocked to allow recovery from
++  * controller failure. It is up to the caller to ensure the namespace list is
++  * not modified by scan work while this function is executing.
++  */
+++>>>>>>> 32f0c4afb436 (nvme: Remove RCU namespace protection)
+  void nvme_remove_namespaces(struct nvme_ctrl *ctrl)
+  {
+  	struct nvme_ns *ns, *next;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ctrl->namespaces_mutex);
+++=======
++ 	/*
++ 	 * The dead states indicates the controller was not gracefully
++ 	 * disconnected. In that case, we won't be able to flush any data while
++ 	 * removing the namespaces' disks; fail all the queues now to avoid
++ 	 * potentially having to clean up the failed sync later.
++ 	 */
++ 	if (ctrl->state == NVME_CTRL_DEAD)
++ 		nvme_kill_queues(ctrl);
++ 
+++>>>>>>> 32f0c4afb436 (nvme: Remove RCU namespace protection)
+  	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+  		nvme_ns_remove(ns);
+- 	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
+ -
+ -static void nvme_async_event_work(struct work_struct *work)
+ -{
+ -	struct nvme_ctrl *ctrl =
+ -		container_of(work, struct nvme_ctrl, async_event_work);
+ -
+ -	spin_lock_irq(&ctrl->lock);
+ -	while (ctrl->event_limit > 0) {
+ -		int aer_idx = --ctrl->event_limit;
+ -
+ -		spin_unlock_irq(&ctrl->lock);
+ -		ctrl->ops->submit_async_event(ctrl, aer_idx);
+ -		spin_lock_irq(&ctrl->lock);
+ -	}
+ -	spin_unlock_irq(&ctrl->lock);
+ -}
+ -
+ -void nvme_complete_async_event(struct nvme_ctrl *ctrl,
+ -		struct nvme_completion *cqe)
+ -{
+ -	u16 status = le16_to_cpu(cqe->status) >> 1;
+ -	u32 result = le32_to_cpu(cqe->result);
+ -
+ -	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
+ -		++ctrl->event_limit;
+ -		schedule_work(&ctrl->async_event_work);
+ -	}
+ -
+ -	if (status != NVME_SC_SUCCESS)
+ -		return;
+ -
+ -	switch (result & 0xff07) {
+ -	case NVME_AER_NOTICE_NS_CHANGED:
+ -		dev_info(ctrl->device, "rescanning\n");
+ -		nvme_queue_scan(ctrl);
+ -		break;
+ -	default:
+ -		dev_warn(ctrl->device, "async event result %08x\n", result);
+ -	}
+ -}
+ -EXPORT_SYMBOL_GPL(nvme_complete_async_event);
+ -
+ -void nvme_queue_async_events(struct nvme_ctrl *ctrl)
+ -{
+ -	ctrl->event_limit = NVME_NR_AERS;
+ -	schedule_work(&ctrl->async_event_work);
+ -}
+ -EXPORT_SYMBOL_GPL(nvme_queue_async_events);
+  
+  static DEFINE_IDA(nvme_instance_ida);
+  
+@@@ -1514,11 -1812,10 +1547,9 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  		blk_set_queue_dying(ns->queue);
+  		blk_mq_abort_requeue_list(ns->queue);
+  		blk_mq_start_stopped_hw_queues(ns->queue, true);
+- 
+- 		nvme_put_ns(ns);
+  	}
+- 	rcu_read_unlock();
++ 	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_kill_queues);
+  
+  void nvme_stop_queues(struct nvme_ctrl *ctrl)
+  {
+@@@ -1533,8 -1830,9 +1564,8 @@@
+  		blk_mq_cancel_requeue_work(ns->queue);
+  		blk_mq_stop_hw_queues(ns->queue);
+  	}
+- 	rcu_read_unlock();
++ 	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_stop_queues);
+  
+  void nvme_start_queues(struct nvme_ctrl *ctrl)
+  {
+@@@ -1546,8 -1844,9 +1577,8 @@@
+  		blk_mq_start_stopped_hw_queues(ns->queue, true);
+  		blk_mq_kick_requeue_list(ns->queue);
+  	}
+- 	rcu_read_unlock();
++ 	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_start_queues);
+  
+  int __init nvme_core_init(void)
+  {
+* Unmerged path drivers/nvme/host/core.c
