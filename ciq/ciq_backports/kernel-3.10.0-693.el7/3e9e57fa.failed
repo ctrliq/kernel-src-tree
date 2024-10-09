@@ -1,0 +1,182 @@
+x86/acpi: store ACPI ids from MADT for future usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] acpi: store ACPI ids from MADT for future usage (Vitaly Kuznetsov) [1396554]
+Rebuild_FUZZ: 95.92%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 3e9e57fad3d8530aa30787f861c710f598ddc4e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3e9e57fa.failed
+
+Currently we don't save ACPI ids (unlike LAPIC ids which go to
+x86_cpu_to_apicid) from MADT and we may need this information later.
+Particularly, ACPI ids is the only existent way for a PVHVM Xen guest
+to figure out Xen's idea of its vCPUs ids before these CPUs boot and
+in some cases these ids diverge from Linux's cpu ids.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+(cherry picked from commit 3e9e57fad3d8530aa30787f861c710f598ddc4e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/acpi/boot.c
+diff --cc arch/x86/kernel/acpi/boot.c
+index 677e7c384661,6738e5c82cca..000000000000
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@@ -161,13 -158,22 +161,26 @@@ static int __init acpi_parse_madt(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void acpi_register_lapic(int id, u8 enabled)
+++=======
++ /**
++  * acpi_register_lapic - register a local apic and generates a logic cpu number
++  * @id: local apic id to register
++  * @acpiid: ACPI id to register
++  * @enabled: this cpu is enabled or not
++  *
++  * Returns the logic cpu number which maps to the local apic
++  */
++ static int acpi_register_lapic(int id, u32 acpiid, u8 enabled)
+++>>>>>>> 3e9e57fad3d8 (x86/acpi: store ACPI ids from MADT for future usage)
+  {
+  	unsigned int ver = 0;
++ 	int cpu;
+  
+ -	if (id >= MAX_LOCAL_APIC) {
+ +	if (id >= (MAX_LOCAL_APIC-1)) {
+  		printk(KERN_INFO PREFIX "skipped apicid that is too big\n");
+ -		return -EINVAL;
+ +		return;
+  	}
+  
+  	if (!enabled) {
+@@@ -178,7 -184,11 +191,15 @@@
+  	if (boot_cpu_physical_apicid != -1U)
+  		ver = apic_version[boot_cpu_physical_apicid];
+  
+++<<<<<<< HEAD
+ +	generic_processor_info(id, ver);
+++=======
++ 	cpu = generic_processor_info(id, ver);
++ 	if (cpu >= 0)
++ 		early_per_cpu(x86_cpu_to_acpiid, cpu) = acpiid;
++ 
++ 	return cpu;
+++>>>>>>> 3e9e57fad3d8 (x86/acpi: store ACPI ids from MADT for future usage)
+  }
+  
+  static int __init
+@@@ -722,30 -718,14 +745,37 @@@ static void acpi_map_cpu2node(acpi_hand
+  #endif
+  }
+  
+ -int acpi_map_cpu(acpi_handle handle, phys_cpuid_t physid, int *pcpu)
+ +static int _acpi_map_lsapic(acpi_handle handle, int physid, int *pcpu)
+  {
+ +	cpumask_var_t tmp_map, new_map;
+  	int cpu;
+ +	int retval = -ENOMEM;
+ +
+++<<<<<<< HEAD
+ +	if (!alloc_cpumask_var(&tmp_map, GFP_KERNEL))
+ +		goto out;
+  
+ +	if (!alloc_cpumask_var(&new_map, GFP_KERNEL))
+ +		goto free_tmp_map;
+ +
+ +	cpumask_copy(tmp_map, cpu_present_mask);
+ +	acpi_register_lapic(physid, ACPI_MADT_ENABLED);
+ +
+ +	/*
+ +	 * If acpi_register_lapic successfully generates a new logical cpu
+ +	 * number, then the following will get us exactly what was mapped
+ +	 */
+ +	cpumask_andnot(new_map, cpu_present_mask, tmp_map);
+ +	if (cpumask_empty(new_map)) {
+ +		printk ("Unable to map lapic to logical cpu number\n");
+ +		retval = -EINVAL;
+ +		goto free_new_map;
+++=======
++ 	cpu = acpi_register_lapic(physid, U32_MAX, ACPI_MADT_ENABLED);
++ 	if (cpu < 0) {
++ 		pr_info(PREFIX "Unable to map lapic to logical cpu number\n");
++ 		return cpu;
+++>>>>>>> 3e9e57fad3d8 (x86/acpi: store ACPI ids from MADT for future usage)
+  	}
+  
+  	acpi_processor_set_pdc(handle);
+diff --git a/arch/x86/include/asm/cpu.h b/arch/x86/include/asm/cpu.h
+index 2117cf82ace7..d064599b0daf 100644
+--- a/arch/x86/include/asm/cpu.h
++++ b/arch/x86/include/asm/cpu.h
+@@ -16,6 +16,7 @@ extern void prefill_possible_map(void);
+ static inline void prefill_possible_map(void) {}
+ 
+ #define cpu_physical_id(cpu)			boot_cpu_physical_apicid
++#define cpu_acpi_id(cpu)			0
+ #define safe_smp_processor_id()			0
+ #define stack_smp_processor_id()		0
+ 
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index c6a624d1c2ca..d191662a29c5 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -53,6 +53,7 @@ static inline struct cpumask *cpu_llc_shared_mask(int cpu)
+ }
+ 
+ DECLARE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_cpu_to_apicid);
++DECLARE_EARLY_PER_CPU_READ_MOSTLY(u32, x86_cpu_to_acpiid);
+ DECLARE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_bios_cpu_apicid);
+ #if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_X86_32)
+ DECLARE_EARLY_PER_CPU_READ_MOSTLY(int, x86_cpu_to_logical_apicid);
+@@ -169,6 +170,7 @@ void x86_idle_thread_init(unsigned int cpu, struct task_struct *idle);
+ void smp_store_boot_cpu_info(void);
+ void smp_store_cpu_info(int id);
+ #define cpu_physical_id(cpu)	per_cpu(x86_cpu_to_apicid, cpu)
++#define cpu_acpi_id(cpu)	per_cpu(x86_cpu_to_acpiid, cpu)
+ 
+ #else /* !CONFIG_SMP */
+ #define wbinvd_on_cpu(cpu)     wbinvd()
+* Unmerged path arch/x86/kernel/acpi/boot.c
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index e678ff8fb4f1..0e4b080e0569 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -92,8 +92,10 @@ static int apic_extnmi = APIC_EXTNMI_BSP;
+  */
+ DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_cpu_to_apicid, BAD_APICID);
+ DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_bios_cpu_apicid, BAD_APICID);
++DEFINE_EARLY_PER_CPU_READ_MOSTLY(u32, x86_cpu_to_acpiid, U32_MAX);
+ EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_apicid);
+ EXPORT_EARLY_PER_CPU_SYMBOL(x86_bios_cpu_apicid);
++EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_acpiid);
+ 
+ #ifdef CONFIG_X86_32
+ 
+diff --git a/arch/x86/kernel/setup_percpu.c b/arch/x86/kernel/setup_percpu.c
+index 5cdff0357746..9e10b5548032 100644
+--- a/arch/x86/kernel/setup_percpu.c
++++ b/arch/x86/kernel/setup_percpu.c
+@@ -236,6 +236,8 @@ void __init setup_per_cpu_areas(void)
+ 			early_per_cpu_map(x86_cpu_to_apicid, cpu);
+ 		per_cpu(x86_bios_cpu_apicid, cpu) =
+ 			early_per_cpu_map(x86_bios_cpu_apicid, cpu);
++		per_cpu(x86_cpu_to_acpiid, cpu) =
++			early_per_cpu_map(x86_cpu_to_acpiid, cpu);
+ #endif
+ #ifdef CONFIG_X86_32
+ 		per_cpu(x86_cpu_to_logical_apicid, cpu) =
+@@ -271,6 +273,7 @@ void __init setup_per_cpu_areas(void)
+ #ifdef CONFIG_X86_LOCAL_APIC
+ 	early_per_cpu_ptr(x86_cpu_to_apicid) = NULL;
+ 	early_per_cpu_ptr(x86_bios_cpu_apicid) = NULL;
++	early_per_cpu_ptr(x86_cpu_to_acpiid) = NULL;
+ #endif
+ #ifdef CONFIG_X86_32
+ 	early_per_cpu_ptr(x86_cpu_to_logical_apicid) = NULL;
