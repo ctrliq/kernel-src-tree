@@ -1,0 +1,154 @@
+scsi: aacraid: Skip IOP reset on controller panic(SMART Family)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] aacraid: Skip IOP reset on controller panic (SMART Family) (Scott Benesh) [1384213]
+Rebuild_FUZZ: 94.21%
+commit-author Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+commit 146aa1786d4978795cab5347d810e00236dea1c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/146aa178.failed
+
+When the SMART family of controller panic (KERNEL_PANIC) , they do not
+honor IOP resets. So better to skip it and directly perform a IWBR reset.
+
+	Signed-off-by: Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+	Reviewed-by: David Carroll <David.Carroll@microsemi.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 146aa1786d4978795cab5347d810e00236dea1c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/src.c
+diff --cc drivers/scsi/aacraid/src.c
+index d48e0ad56e25,9b11e1a6cc75..000000000000
+--- a/drivers/scsi/aacraid/src.c
++++ b/drivers/scsi/aacraid/src.c
+@@@ -578,39 -670,92 +578,71 @@@ static int aac_src_restart_adapter(stru
+  {
+  	u32 var, reset_mask;
+  
+ -	bled = aac_adapter_sync_cmd(dev, IOP_RESET_ALWAYS,
+ -				    0, 0, 0, 0, 0, 0, &var,
+ -				    &reset_mask, NULL, NULL, NULL);
+ -
+ -	if ((bled || var != 0x00000001) && !dev->doorbell_mask)
+ -		bled = -EINVAL;
+ -	else if (dev->doorbell_mask) {
+ -		reset_mask = dev->doorbell_mask;
+ -		bled = 0;
+ -		var = 0x00000001;
+ -	}
+ -
+ -	aac_set_intx_mode(dev);
+ -
+ -	if (!bled && (dev->supplement_adapter_info.supported_options2 &
+ -	    AAC_OPTION_DOORBELL_RESET)) {
+ -		src_writel(dev, MUnit.IDR, reset_mask);
+ -	} else {
+ -		src_writel(dev, MUnit.IDR, 0x100);
+ -	}
+ -	msleep(30000);
+ -}
+ -
+ -static void aac_send_hardware_soft_reset(struct aac_dev *dev)
+ -{
+ -	u_int32_t val;
+ -
+ -	val = readl(((char *)(dev->base) + IBW_SWR_OFFSET));
+ -	val |= 0x01;
+ -	writel(val, ((char *)(dev->base) + IBW_SWR_OFFSET));
+ -	msleep_interruptible(20000);
+ -}
+ -
+ -static int aac_src_restart_adapter(struct aac_dev *dev, int bled, u8 reset_type)
+ -{
+ -	unsigned long status, start;
+ -
+ -	if (bled < 0)
+ -		goto invalid_out;
+ -
+ -	if (bled)
+ -		pr_err("%s%d: adapter kernel panic'd %x.\n",
+ +	if (bled >= 0) {
+ +		if (bled)
+ +			printk(KERN_ERR "%s%d: adapter kernel panic'd %x.\n",
+  				dev->name, dev->id, bled);
+++<<<<<<< HEAD
+ +		dev->a_ops.adapter_enable_int = aac_src_disable_interrupt;
+ +		bled = aac_adapter_sync_cmd(dev, IOP_RESET_ALWAYS,
+ +			0, 0, 0, 0, 0, 0, &var, &reset_mask, NULL, NULL, NULL);
+ +		if ((bled || (var != 0x00000001)) &&
+ +		    !dev->doorbell_mask)
+ +			return -EINVAL;
+ +		else if (dev->doorbell_mask) {
+ +			reset_mask = dev->doorbell_mask;
+ +			bled = 0;
+ +			var = 0x00000001;
+++=======
++ 
++ 	/*
++ 	 * When there is a BlinkLED, IOP_RESET has not effect
++ 	 */
++ 	if (bled >= 2 && dev->sa_firmware && reset_type & HW_IOP_RESET)
++ 		reset_type &= ~HW_IOP_RESET;
++ 
++ 	dev->a_ops.adapter_enable_int = aac_src_disable_interrupt;
++ 
++ 	switch (reset_type) {
++ 	case IOP_HWSOFT_RESET:
++ 		aac_send_iop_reset(dev, bled);
++ 		/*
++ 		 * Check to see if KERNEL_UP_AND_RUNNING
++ 		 * Wait for the adapter to be up and running.
++ 		 * If !KERNEL_UP_AND_RUNNING issue HW Soft Reset
++ 		 */
++ 		status = src_readl(dev, MUnit.OMR);
++ 		if (dev->sa_firmware
++ 		 && !(status & KERNEL_UP_AND_RUNNING)) {
++ 			start = jiffies;
++ 			do {
++ 				status = src_readl(dev, MUnit.OMR);
++ 				if (time_after(jiffies,
++ 				 start+HZ*SOFT_RESET_TIME)) {
++ 					aac_send_hardware_soft_reset(dev);
++ 					start = jiffies;
++ 				}
++ 			} while (!(status & KERNEL_UP_AND_RUNNING));
+++>>>>>>> 146aa1786d49 (scsi: aacraid: Skip IOP reset on controller panic(SMART Family))
+  		}
+ -		break;
+ -	case HW_SOFT_RESET:
+ -		if (dev->sa_firmware) {
+ -			aac_send_hardware_soft_reset(dev);
+ -			aac_set_intx_mode(dev);
+ +
+ +		if ((dev->pdev->device == PMC_DEVICE_S7 ||
+ +		    dev->pdev->device == PMC_DEVICE_S8 ||
+ +		    dev->pdev->device == PMC_DEVICE_S9) && dev->msi_enabled) {
+ +			aac_src_access_devreg(dev, AAC_ENABLE_INTX);
+ +			dev->msi_enabled = 0;
+ +			msleep(5000); /* Delay 5 seconds */
+  		}
+ -		break;
+ -	default:
+ -		aac_send_iop_reset(dev, bled);
+ -		break;
+ -	}
+  
+ -invalid_out:
+ +		if (!bled && (dev->supplement_adapter_info.SupportedOptions2 &
+ +		    AAC_OPTION_DOORBELL_RESET)) {
+ +			src_writel(dev, MUnit.IDR, reset_mask);
+ +			ssleep(45);
+ +		} else {
+ +			src_writel(dev, MUnit.IDR, 0x100);
+ +			ssleep(45);
+ +		}
+ +	}
+  
+  	if (src_readl(dev, MUnit.OMR) & KERNEL_PANIC)
+  		return -ENODEV;
+* Unmerged path drivers/scsi/aacraid/src.c
