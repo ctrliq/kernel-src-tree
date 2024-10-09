@@ -1,0 +1,538 @@
+ipmi_si: Move the hotmod handling to another file.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [char] ipmi_si: Move the hotmod handling to another file (Tony Camuso) [1541533]
+Rebuild_FUZZ: 98.99%
+commit-author Corey Minyard <cminyard@mvista.com>
+commit 44814ec982d2905d50fe4d0cdaf693b76afe7f64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/44814ec9.failed
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+(cherry picked from commit 44814ec982d2905d50fe4d0cdaf693b76afe7f64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si.h
+#	drivers/char/ipmi/ipmi_si_intf.c
+diff --cc drivers/char/ipmi/ipmi_si.h
+index a4d993b1fe66,4ceb5ac3ad98..000000000000
+--- a/drivers/char/ipmi/ipmi_si.h
++++ b/drivers/char/ipmi/ipmi_si.h
+@@@ -13,6 -14,11 +13,17 @@@
+  #define DEFAULT_REGSPACING	1
+  #define DEFAULT_REGSIZE		1
+  
+++<<<<<<< HEAD
+ +struct smi_info;
+ +
+ +int ipmi_si_add_smi(struct smi_info *info);
+++=======
++ int ipmi_si_add_smi(struct si_sm_io *io);
++ irqreturn_t ipmi_si_irq_handler(int irq, void *data);
++ void ipmi_irq_start_cleanup(struct si_sm_io *io);
++ int ipmi_std_irq_setup(struct si_sm_io *io);
++ void ipmi_irq_finish_setup(struct si_sm_io *io);
++ int ipmi_si_remove_by_dev(struct device *dev);
++ void ipmi_si_remove_by_data(int addr_space, enum si_type si_type,
++ 			    unsigned long addr);
+++>>>>>>> 44814ec982d2 (ipmi_si: Move the hotmod handling to another file.)
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index 72982bfaeaf1,02e263b2152a..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -1799,179 -1691,6 +1712,182 @@@ static struct smi_info *smi_info_alloc(
+  	return info;
+  }
+  
+++<<<<<<< HEAD
+ +static int hotmod_handler(const char *val, struct kernel_param *kp)
+ +{
+ +	char *str = kstrdup(val, GFP_KERNEL);
+ +	int  rv;
+ +	char *next, *curr, *s, *n, *o;
+ +	enum hotmod_op op;
+ +	enum si_type si_type;
+ +	int  addr_space;
+ +	unsigned long addr;
+ +	int regspacing;
+ +	int regsize;
+ +	int regshift;
+ +	int irq;
+ +	int ipmb;
+ +	int ival;
+ +	int len;
+ +	struct smi_info *info;
+ +
+ +	if (!str)
+ +		return -ENOMEM;
+ +
+ +	/* Kill any trailing spaces, as we can get a "\n" from echo. */
+ +	len = strlen(str);
+ +	ival = len - 1;
+ +	while ((ival >= 0) && isspace(str[ival])) {
+ +		str[ival] = '\0';
+ +		ival--;
+ +	}
+ +
+ +	for (curr = str; curr; curr = next) {
+ +		regspacing = 1;
+ +		regsize = 1;
+ +		regshift = 0;
+ +		irq = 0;
+ +		ipmb = 0; /* Choose the default if not specified */
+ +
+ +		next = strchr(curr, ':');
+ +		if (next) {
+ +			*next = '\0';
+ +			next++;
+ +		}
+ +
+ +		rv = parse_str(hotmod_ops, &ival, "operation", &curr);
+ +		if (rv)
+ +			break;
+ +		op = ival;
+ +
+ +		rv = parse_str(hotmod_si, &ival, "interface type", &curr);
+ +		if (rv)
+ +			break;
+ +		si_type = ival;
+ +
+ +		rv = parse_str(hotmod_as, &addr_space, "address space", &curr);
+ +		if (rv)
+ +			break;
+ +
+ +		s = strchr(curr, ',');
+ +		if (s) {
+ +			*s = '\0';
+ +			s++;
+ +		}
+ +		addr = simple_strtoul(curr, &n, 0);
+ +		if ((*n != '\0') || (*curr == '\0')) {
+ +			pr_warn(PFX "Invalid hotmod address '%s'\n", curr);
+ +			break;
+ +		}
+ +
+ +		while (s) {
+ +			curr = s;
+ +			s = strchr(curr, ',');
+ +			if (s) {
+ +				*s = '\0';
+ +				s++;
+ +			}
+ +			o = strchr(curr, '=');
+ +			if (o) {
+ +				*o = '\0';
+ +				o++;
+ +			}
+ +			rv = check_hotmod_int_op(curr, o, "rsp", &regspacing);
+ +			if (rv < 0)
+ +				goto out;
+ +			else if (rv)
+ +				continue;
+ +			rv = check_hotmod_int_op(curr, o, "rsi", &regsize);
+ +			if (rv < 0)
+ +				goto out;
+ +			else if (rv)
+ +				continue;
+ +			rv = check_hotmod_int_op(curr, o, "rsh", &regshift);
+ +			if (rv < 0)
+ +				goto out;
+ +			else if (rv)
+ +				continue;
+ +			rv = check_hotmod_int_op(curr, o, "irq", &irq);
+ +			if (rv < 0)
+ +				goto out;
+ +			else if (rv)
+ +				continue;
+ +			rv = check_hotmod_int_op(curr, o, "ipmb", &ipmb);
+ +			if (rv < 0)
+ +				goto out;
+ +			else if (rv)
+ +				continue;
+ +
+ +			rv = -EINVAL;
+ +			pr_warn(PFX "Invalid hotmod option '%s'\n", curr);
+ +			goto out;
+ +		}
+ +
+ +		if (op == HM_ADD) {
+ +			info = smi_info_alloc();
+ +			if (!info) {
+ +				rv = -ENOMEM;
+ +				goto out;
+ +			}
+ +
+ +			info->addr_source = SI_HOTMOD;
+ +			info->si_type = si_type;
+ +			info->io.addr_data = addr;
+ +			info->io.addr_type = addr_space;
+ +			if (addr_space == IPMI_MEM_ADDR_SPACE)
+ +				info->io_setup = mem_setup;
+ +			else
+ +				info->io_setup = port_setup;
+ +
+ +			info->io.addr = NULL;
+ +			info->io.regspacing = regspacing;
+ +			if (!info->io.regspacing)
+ +				info->io.regspacing = DEFAULT_REGSPACING;
+ +			info->io.regsize = regsize;
+ +			if (!info->io.regsize)
+ +				info->io.regsize = DEFAULT_REGSIZE;
+ +			info->io.regshift = regshift;
+ +			info->irq = irq;
+ +			if (info->irq)
+ +				info->irq_setup = std_irq_setup;
+ +			info->slave_addr = ipmb;
+ +
+ +			rv = ipmi_si_add_smi(info);
+ +			if (rv) {
+ +				kfree(info);
+ +				goto out;
+ +			}
+ +			mutex_lock(&smi_infos_lock);
+ +			rv = try_smi_init(info);
+ +			mutex_unlock(&smi_infos_lock);
+ +			if (rv) {
+ +				cleanup_one_si(info);
+ +				goto out;
+ +			}
+ +		} else {
+ +			/* remove */
+ +			struct smi_info *e, *tmp_e;
+ +
+ +			mutex_lock(&smi_infos_lock);
+ +			list_for_each_entry_safe(e, tmp_e, &smi_infos, link) {
+ +				if (e->io.addr_type != addr_space)
+ +					continue;
+ +				if (e->si_type != si_type)
+ +					continue;
+ +				if (e->io.addr_data == addr)
+ +					cleanup_one_si(e);
+ +			}
+ +			mutex_unlock(&smi_infos_lock);
+ +		}
+ +	}
+ +	rv = len;
+ +out:
+ +	kfree(str);
+ +	return rv;
+ +}
+ +
+++=======
+++>>>>>>> 44814ec982d2 (ipmi_si: Move the hotmod handling to another file.)
+  static int hardcode_find_bmc(void)
+  {
+  	int ret = -ENODEV;
+@@@ -3905,6 -3518,42 +3821,45 @@@ static void cleanup_one_si(struct smi_i
+  	kfree(to_clean);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int ipmi_si_remove_by_dev(struct device *dev)
++ {
++ 	struct smi_info *e;
++ 	int rv = -ENOENT;
++ 
++ 	mutex_lock(&smi_infos_lock);
++ 	list_for_each_entry(e, &smi_infos, link) {
++ 		if (e->io.dev == dev) {
++ 			cleanup_one_si(e);
++ 			rv = 0;
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&smi_infos_lock);
++ 
++ 	return rv;
++ }
++ 
++ void ipmi_si_remove_by_data(int addr_space, enum si_type si_type,
++ 			    unsigned long addr)
++ {
++ 	/* remove */
++ 	struct smi_info *e, *tmp_e;
++ 
++ 	mutex_lock(&smi_infos_lock);
++ 	list_for_each_entry_safe(e, tmp_e, &smi_infos, link) {
++ 		if (e->io.addr_type != addr_space)
++ 			continue;
++ 		if (e->io.si_type != si_type)
++ 			continue;
++ 		if (e->io.addr_data == addr)
++ 			cleanup_one_si(e);
++ 	}
++ 	mutex_unlock(&smi_infos_lock);
++ }
++ 
+++>>>>>>> 44814ec982d2 (ipmi_si: Move the hotmod handling to another file.)
+  static void cleanup_ipmi_si(void)
+  {
+  	struct smi_info *e, *tmp_e;
+diff --git a/drivers/char/ipmi/Makefile b/drivers/char/ipmi/Makefile
+index eefb0b301e83..61c7d5d32f4a 100644
+--- a/drivers/char/ipmi/Makefile
++++ b/drivers/char/ipmi/Makefile
+@@ -2,7 +2,8 @@
+ # Makefile for the ipmi drivers.
+ #
+ 
+-ipmi_si-y := ipmi_si_intf.o ipmi_kcs_sm.o ipmi_smic_sm.o ipmi_bt_sm.o
++ipmi_si-y := ipmi_si_intf.o ipmi_kcs_sm.o ipmi_smic_sm.o ipmi_bt_sm.o \
++	ipmi_si_hotmod.o
+ 
+ obj-$(CONFIG_IPMI_HANDLER) += ipmi_msghandler.o
+ obj-$(CONFIG_IPMI_DEVICE_INTERFACE) += ipmi_devintf.o
+* Unmerged path drivers/char/ipmi/ipmi_si.h
+diff --git a/drivers/char/ipmi/ipmi_si_hotmod.c b/drivers/char/ipmi/ipmi_si_hotmod.c
+new file mode 100644
+index 000000000000..da5716159974
+--- /dev/null
++++ b/drivers/char/ipmi/ipmi_si_hotmod.c
+@@ -0,0 +1,242 @@
++/*
++ * ipmi_si_hotmod.c
++ *
++ * Handling for dynamically adding/removing IPMI devices through
++ * a module parameter (and thus sysfs).
++ */
++#include <linux/moduleparam.h>
++#include <linux/ipmi.h>
++#include "ipmi_si.h"
++
++#define PFX "ipmi_hotmod: "
++
++static int hotmod_handler(const char *val, struct kernel_param *kp);
++
++module_param_call(hotmod, hotmod_handler, NULL, NULL, 0200);
++MODULE_PARM_DESC(hotmod, "Add and remove interfaces.  See"
++		 " Documentation/IPMI.txt in the kernel sources for the"
++		 " gory details.");
++
++/*
++ * Parms come in as <op1>[:op2[:op3...]].  ops are:
++ *   add|remove,kcs|bt|smic,mem|i/o,<address>[,<opt1>[,<opt2>[,...]]]
++ * Options are:
++ *   rsp=<regspacing>
++ *   rsi=<regsize>
++ *   rsh=<regshift>
++ *   irq=<irq>
++ *   ipmb=<ipmb addr>
++ */
++enum hotmod_op { HM_ADD, HM_REMOVE };
++struct hotmod_vals {
++	const char *name;
++	const int  val;
++};
++
++static const struct hotmod_vals hotmod_ops[] = {
++	{ "add",	HM_ADD },
++	{ "remove",	HM_REMOVE },
++	{ NULL }
++};
++
++static const struct hotmod_vals hotmod_si[] = {
++	{ "kcs",	SI_KCS },
++	{ "smic",	SI_SMIC },
++	{ "bt",		SI_BT },
++	{ NULL }
++};
++
++static const struct hotmod_vals hotmod_as[] = {
++	{ "mem",	IPMI_MEM_ADDR_SPACE },
++	{ "i/o",	IPMI_IO_ADDR_SPACE },
++	{ NULL }
++};
++
++static int parse_str(const struct hotmod_vals *v, int *val, char *name,
++		     char **curr)
++{
++	char *s;
++	int  i;
++
++	s = strchr(*curr, ',');
++	if (!s) {
++		pr_warn(PFX "No hotmod %s given.\n", name);
++		return -EINVAL;
++	}
++	*s = '\0';
++	s++;
++	for (i = 0; v[i].name; i++) {
++		if (strcmp(*curr, v[i].name) == 0) {
++			*val = v[i].val;
++			*curr = s;
++			return 0;
++		}
++	}
++
++	pr_warn(PFX "Invalid hotmod %s '%s'\n", name, *curr);
++	return -EINVAL;
++}
++
++static int check_hotmod_int_op(const char *curr, const char *option,
++			       const char *name, int *val)
++{
++	char *n;
++
++	if (strcmp(curr, name) == 0) {
++		if (!option) {
++			pr_warn(PFX "No option given for '%s'\n", curr);
++			return -EINVAL;
++		}
++		*val = simple_strtoul(option, &n, 0);
++		if ((*n != '\0') || (*option == '\0')) {
++			pr_warn(PFX "Bad option given for '%s'\n", curr);
++			return -EINVAL;
++		}
++		return 1;
++	}
++	return 0;
++}
++
++static int hotmod_handler(const char *val, struct kernel_param *kp)
++{
++	char *str = kstrdup(val, GFP_KERNEL);
++	int  rv;
++	char *next, *curr, *s, *n, *o;
++	enum hotmod_op op;
++	enum si_type si_type;
++	int  addr_space;
++	unsigned long addr;
++	int regspacing;
++	int regsize;
++	int regshift;
++	int irq;
++	int ipmb;
++	int ival;
++	int len;
++
++	if (!str)
++		return -ENOMEM;
++
++	/* Kill any trailing spaces, as we can get a "\n" from echo. */
++	len = strlen(str);
++	ival = len - 1;
++	while ((ival >= 0) && isspace(str[ival])) {
++		str[ival] = '\0';
++		ival--;
++	}
++
++	for (curr = str; curr; curr = next) {
++		regspacing = 1;
++		regsize = 1;
++		regshift = 0;
++		irq = 0;
++		ipmb = 0; /* Choose the default if not specified */
++
++		next = strchr(curr, ':');
++		if (next) {
++			*next = '\0';
++			next++;
++		}
++
++		rv = parse_str(hotmod_ops, &ival, "operation", &curr);
++		if (rv)
++			break;
++		op = ival;
++
++		rv = parse_str(hotmod_si, &ival, "interface type", &curr);
++		if (rv)
++			break;
++		si_type = ival;
++
++		rv = parse_str(hotmod_as, &addr_space, "address space", &curr);
++		if (rv)
++			break;
++
++		s = strchr(curr, ',');
++		if (s) {
++			*s = '\0';
++			s++;
++		}
++		addr = simple_strtoul(curr, &n, 0);
++		if ((*n != '\0') || (*curr == '\0')) {
++			pr_warn(PFX "Invalid hotmod address '%s'\n", curr);
++			break;
++		}
++
++		while (s) {
++			curr = s;
++			s = strchr(curr, ',');
++			if (s) {
++				*s = '\0';
++				s++;
++			}
++			o = strchr(curr, '=');
++			if (o) {
++				*o = '\0';
++				o++;
++			}
++			rv = check_hotmod_int_op(curr, o, "rsp", &regspacing);
++			if (rv < 0)
++				goto out;
++			else if (rv)
++				continue;
++			rv = check_hotmod_int_op(curr, o, "rsi", &regsize);
++			if (rv < 0)
++				goto out;
++			else if (rv)
++				continue;
++			rv = check_hotmod_int_op(curr, o, "rsh", &regshift);
++			if (rv < 0)
++				goto out;
++			else if (rv)
++				continue;
++			rv = check_hotmod_int_op(curr, o, "irq", &irq);
++			if (rv < 0)
++				goto out;
++			else if (rv)
++				continue;
++			rv = check_hotmod_int_op(curr, o, "ipmb", &ipmb);
++			if (rv < 0)
++				goto out;
++			else if (rv)
++				continue;
++
++			rv = -EINVAL;
++			pr_warn(PFX "Invalid hotmod option '%s'\n", curr);
++			goto out;
++		}
++
++		if (op == HM_ADD) {
++			struct si_sm_io io;
++
++			memset(&io, 0, sizeof(io));
++			io.addr_source = SI_HOTMOD;
++			io.si_type = si_type;
++			io.addr_data = addr;
++			io.addr_type = addr_space;
++
++			io.addr = NULL;
++			io.regspacing = regspacing;
++			if (!io.regspacing)
++				io.regspacing = DEFAULT_REGSPACING;
++			io.regsize = regsize;
++			if (!io.regsize)
++				io.regsize = DEFAULT_REGSIZE;
++			io.regshift = regshift;
++			io.irq = irq;
++			if (io.irq)
++				io.irq_setup = ipmi_std_irq_setup;
++			io.slave_addr = ipmb;
++
++			rv = ipmi_si_add_smi(&io);
++			if (rv)
++				goto out;
++		} else {
++			ipmi_si_remove_by_data(addr_space, si_type, addr);
++		}
++	}
++	rv = len;
++out:
++	kfree(str);
++	return rv;
++}
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
