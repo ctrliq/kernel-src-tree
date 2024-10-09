@@ -1,0 +1,117 @@
+netvsc: handle select_queue when device is being removed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 7ce101246655935b014b11d81f815342921f5654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7ce10124.failed
+
+Move the send indirection table from the inner device (netvsc)
+to the network device context.
+
+It is possible that netvsc_device is not present (remove in progress).
+This solves potential use after free issues when packet is being
+created during MTU change, shutdown, or queue count changes.
+
+Fixes: d8e18ee0fa96 ("netvsc: enhance transmit select_queue")
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ce101246655935b014b11d81f815342921f5654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 2fcad1f01688,f9f3dba7a588..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -695,9 -698,10 +695,11 @@@ struct net_device_context 
+  	struct work_struct work;
+  	u32 msg_enable; /* debug level */
+  
+ -	u32 tx_checksum_mask;
+ +	struct netvsc_stats __percpu *tx_stats;
+ +	struct netvsc_stats __percpu *rx_stats;
+  
++ 	u32 tx_send_table[VRSS_SEND_TAB_SIZE];
++ 
+  	/* Ethtool settings */
+  	u8 duplex;
+  	u32 speed;
+@@@ -745,8 -759,6 +747,11 @@@ struct netvsc_device 
+  
+  	struct nvsp_message revoke_packet;
+  
+++<<<<<<< HEAD
+ +	struct vmbus_channel *chn_table[VRSS_CHANNEL_MAX];
+ +	u32 send_table[VRSS_SEND_TAB_SIZE];
+++=======
+++>>>>>>> 7ce101246655 (netvsc: handle select_queue when device is being removed)
+  	u32 max_chn;
+  	u32 num_chn;
+  	spinlock_t sc_lock; /* Protects num_sc_offered variable */
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 1f2fdf8f9b74,5ede87f30463..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -214,10 -203,10 +214,10 @@@ static void *init_ppi_data(struct rndis
+   * TODO support XPS - but get_xps_queue not exported
+   */
+  static u16 netvsc_select_queue(struct net_device *ndev, struct sk_buff *skb,
+ -			void *accel_priv, select_queue_fallback_t fallback)
+ +		       void *accel_priv, select_queue_fallback_t fallback)
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(ndev);
+- 	struct netvsc_device *nvsc_dev = net_device_ctx->nvdev;
++ 	unsigned int num_tx_queues = ndev->real_num_tx_queues;
+  	struct sock *sk = skb->sk;
+  	int q_idx = sk_tx_queue_get(sk);
+  
+@@@ -236,9 -223,6 +234,12 @@@
+  		q_idx = new_idx;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!nvsc_dev->chn_table[q_idx]))
+ +		q_idx = 0;
+ +
+++=======
+++>>>>>>> 7ce101246655 (netvsc: handle select_queue when device is being removed)
+  	return q_idx;
+  }
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 2adfe0ec4fe2..373a67a3dcc1 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -1160,15 +1160,11 @@ static void netvsc_receive(struct net_device *ndev,
+ static void netvsc_send_table(struct hv_device *hdev,
+ 			      struct nvsp_message *nvmsg)
+ {
+-	struct netvsc_device *nvscdev;
+ 	struct net_device *ndev = hv_get_drvdata(hdev);
++	struct net_device_context *net_device_ctx = netdev_priv(ndev);
+ 	int i;
+ 	u32 count, *tab;
+ 
+-	nvscdev = get_outbound_net_device(hdev);
+-	if (!nvscdev)
+-		return;
+-
+ 	count = nvmsg->msg.v5_msg.send_table.count;
+ 	if (count != VRSS_SEND_TAB_SIZE) {
+ 		netdev_err(ndev, "Received wrong send-table size:%u\n", count);
+@@ -1179,7 +1175,7 @@ static void netvsc_send_table(struct hv_device *hdev,
+ 		      nvmsg->msg.v5_msg.send_table.offset);
+ 
+ 	for (i = 0; i < count; i++)
+-		nvscdev->send_table[i] = tab[i];
++		net_device_ctx->tx_send_table[i] = tab[i];
+ }
+ 
+ static void netvsc_send_vf(struct net_device_context *net_device_ctx,
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
