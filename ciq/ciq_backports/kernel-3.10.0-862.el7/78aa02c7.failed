@@ -1,0 +1,226 @@
+drm/amdgpu: Potential uninitialized variable in amdgpu_vm_update_directories()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 78aa02c713fcf19e9bc8511ab61a5fd6c877cc01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/78aa02c7.failed
+
+After commit ea09729c9302 ("drm/amdgpu: rework page directory filling
+v2") then it becomes a lot harder to verify that "r" is initialized.  My
+static checker complains and so I've reviewed the code.  It does look
+like it might be buggy... Anyway, it doesn't hurt to set "r" to zero
+at the start.
+
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 78aa02c713fcf19e9bc8511ab61a5fd6c877cc01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index 1dda9321bd5a,c8c26f21993c..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@@ -697,6 -1201,192 +697,195 @@@ error_free
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * amdgpu_vm_invalidate_level - mark all PD levels as invalid
++  *
++  * @parent: parent PD
++  *
++  * Mark all PD level as invalid after an error.
++  */
++ static void amdgpu_vm_invalidate_level(struct amdgpu_vm *vm,
++ 				       struct amdgpu_vm_pt *parent)
++ {
++ 	unsigned pt_idx;
++ 
++ 	/*
++ 	 * Recurse into the subdirectories. This recursion is harmless because
++ 	 * we only have a maximum of 5 layers.
++ 	 */
++ 	for (pt_idx = 0; pt_idx <= parent->last_entry_used; ++pt_idx) {
++ 		struct amdgpu_vm_pt *entry = &parent->entries[pt_idx];
++ 
++ 		if (!entry->base.bo)
++ 			continue;
++ 
++ 		entry->addr = ~0ULL;
++ 		spin_lock(&vm->status_lock);
++ 		if (list_empty(&entry->base.vm_status))
++ 			list_add(&entry->base.vm_status, &vm->relocated);
++ 		spin_unlock(&vm->status_lock);
++ 		amdgpu_vm_invalidate_level(vm, entry);
++ 	}
++ }
++ 
++ /*
++  * amdgpu_vm_update_directories - make sure that all directories are valid
++  *
++  * @adev: amdgpu_device pointer
++  * @vm: requested vm
++  *
++  * Makes sure all directories are up to date.
++  * Returns 0 for success, error for failure.
++  */
++ int amdgpu_vm_update_directories(struct amdgpu_device *adev,
++ 				 struct amdgpu_vm *vm)
++ {
++ 	int r = 0;
++ 
++ 	spin_lock(&vm->status_lock);
++ 	while (!list_empty(&vm->relocated)) {
++ 		struct amdgpu_vm_bo_base *bo_base;
++ 		struct amdgpu_bo *bo;
++ 
++ 		bo_base = list_first_entry(&vm->relocated,
++ 					   struct amdgpu_vm_bo_base,
++ 					   vm_status);
++ 		spin_unlock(&vm->status_lock);
++ 
++ 		bo = bo_base->bo->parent;
++ 		if (bo) {
++ 			struct amdgpu_vm_bo_base *parent;
++ 			struct amdgpu_vm_pt *pt;
++ 
++ 			parent = list_first_entry(&bo->va,
++ 						  struct amdgpu_vm_bo_base,
++ 						  bo_list);
++ 			pt = container_of(parent, struct amdgpu_vm_pt, base);
++ 
++ 			r = amdgpu_vm_update_level(adev, vm, pt);
++ 			if (r) {
++ 				amdgpu_vm_invalidate_level(vm, &vm->root);
++ 				return r;
++ 			}
++ 			spin_lock(&vm->status_lock);
++ 		} else {
++ 			spin_lock(&vm->status_lock);
++ 			list_del_init(&bo_base->vm_status);
++ 		}
++ 	}
++ 	spin_unlock(&vm->status_lock);
++ 
++ 	if (vm->use_cpu_for_update) {
++ 		/* Flush HDP */
++ 		mb();
++ 		amdgpu_gart_flush_gpu_tlb(adev, 0);
++ 	}
++ 
++ 	return r;
++ }
++ 
++ /**
++  * amdgpu_vm_find_entry - find the entry for an address
++  *
++  * @p: see amdgpu_pte_update_params definition
++  * @addr: virtual address in question
++  * @entry: resulting entry or NULL
++  * @parent: parent entry
++  *
++  * Find the vm_pt entry and it's parent for the given address.
++  */
++ void amdgpu_vm_get_entry(struct amdgpu_pte_update_params *p, uint64_t addr,
++ 			 struct amdgpu_vm_pt **entry,
++ 			 struct amdgpu_vm_pt **parent)
++ {
++ 	unsigned idx, level = p->adev->vm_manager.num_level;
++ 
++ 	*parent = NULL;
++ 	*entry = &p->vm->root;
++ 	while ((*entry)->entries) {
++ 		idx = addr >> (p->adev->vm_manager.block_size * level--);
++ 		idx %= amdgpu_bo_size((*entry)->base.bo) / 8;
++ 		*parent = *entry;
++ 		*entry = &(*entry)->entries[idx];
++ 	}
++ 
++ 	if (level)
++ 		*entry = NULL;
++ }
++ 
++ /**
++  * amdgpu_vm_handle_huge_pages - handle updating the PD with huge pages
++  *
++  * @p: see amdgpu_pte_update_params definition
++  * @entry: vm_pt entry to check
++  * @parent: parent entry
++  * @nptes: number of PTEs updated with this operation
++  * @dst: destination address where the PTEs should point to
++  * @flags: access flags fro the PTEs
++  *
++  * Check if we can update the PD with a huge page.
++  */
++ static void amdgpu_vm_handle_huge_pages(struct amdgpu_pte_update_params *p,
++ 					struct amdgpu_vm_pt *entry,
++ 					struct amdgpu_vm_pt *parent,
++ 					unsigned nptes, uint64_t dst,
++ 					uint64_t flags)
++ {
++ 	bool use_cpu_update = (p->func == amdgpu_vm_cpu_set_ptes);
++ 	uint64_t pd_addr, pde;
++ 
++ 	/* In the case of a mixed PT the PDE must point to it*/
++ 	if (p->adev->asic_type < CHIP_VEGA10 ||
++ 	    nptes != AMDGPU_VM_PTE_COUNT(p->adev) ||
++ 	    p->src ||
++ 	    !(flags & AMDGPU_PTE_VALID)) {
++ 
++ 		dst = amdgpu_bo_gpu_offset(entry->base.bo);
++ 		dst = amdgpu_gart_get_vm_pde(p->adev, dst);
++ 		flags = AMDGPU_PTE_VALID;
++ 	} else {
++ 		/* Set the huge page flag to stop scanning at this PDE */
++ 		flags |= AMDGPU_PDE_PTE;
++ 	}
++ 
++ 	if (entry->addr == (dst | flags))
++ 		return;
++ 
++ 	entry->addr = (dst | flags);
++ 
++ 	if (use_cpu_update) {
++ 		/* In case a huge page is replaced with a system
++ 		 * memory mapping, p->pages_addr != NULL and
++ 		 * amdgpu_vm_cpu_set_ptes would try to translate dst
++ 		 * through amdgpu_vm_map_gart. But dst is already a
++ 		 * GPU address (of the page table). Disable
++ 		 * amdgpu_vm_map_gart temporarily.
++ 		 */
++ 		dma_addr_t *tmp;
++ 
++ 		tmp = p->pages_addr;
++ 		p->pages_addr = NULL;
++ 
++ 		pd_addr = (unsigned long)amdgpu_bo_kptr(parent->base.bo);
++ 		pde = pd_addr + (entry - parent->entries) * 8;
++ 		amdgpu_vm_cpu_set_ptes(p, pde, dst, 1, 0, flags);
++ 
++ 		p->pages_addr = tmp;
++ 	} else {
++ 		if (parent->base.bo->shadow) {
++ 			pd_addr = amdgpu_bo_gpu_offset(parent->base.bo->shadow);
++ 			pde = pd_addr + (entry - parent->entries) * 8;
++ 			amdgpu_vm_do_set_ptes(p, pde, dst, 1, 0, flags);
++ 		}
++ 		pd_addr = amdgpu_bo_gpu_offset(parent->base.bo);
++ 		pde = pd_addr + (entry - parent->entries) * 8;
++ 		amdgpu_vm_do_set_ptes(p, pde, dst, 1, 0, flags);
++ 	}
++ }
++ 
+++>>>>>>> 78aa02c713fc (drm/amdgpu: Potential uninitialized variable in amdgpu_vm_update_directories())
+  /**
+   * amdgpu_vm_update_ptes - make sure that page tables are valid
+   *
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
