@@ -1,0 +1,218 @@
+usb: typec: Register a device for every mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [usb] typec: Register a device for every mode (Torez Smith) [1657401]
+Rebuild_FUZZ: 93.98%
+commit-author Heikki Krogerus <heikki.krogerus@linux.intel.com>
+commit 4ab8c18d4d67321cc7b660559de17511d4fc0237
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4ab8c18d.failed
+
+Before a device was created for every discovered SVID, but
+this will create a device for every discovered mode of every
+SVID. The idea is to make it easier to create mode specific
+drivers once a bus for the alternate mode is added.
+
+	Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+	Tested-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4ab8c18d4d67321cc7b660559de17511d4fc0237)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/typec.c
+diff --cc drivers/usb/typec/typec.c
+index a0a95ac4685a,96dc9c4f73f0..000000000000
+--- a/drivers/usb/typec/typec.c
++++ b/drivers/usb/typec/typec.c
+@@@ -11,12 -11,13 +11,15 @@@
+  #include <linux/mutex.h>
+  #include <linux/slab.h>
+  #include <linux/usb/typec.h>
+ -#include <linux/usb/typec_mux.h>
+ +#include <linux/idr.h>
+ +#include <linux/string.h>
+ +
+  
+- struct typec_mode {
+- 	int				index;
++ struct typec_altmode {
++ 	struct device			dev;
++ 	u16				svid;
++ 	u8				mode;
++ 
+  	u32				vdo;
+  	char				*desc;
+  	enum typec_port_type		roles;
+@@@ -269,20 -252,20 +249,25 @@@ static ssize_t active_store(struct devi
+  
+  	return size;
+  }
++ static DEVICE_ATTR_RW(active);
+  
+  static ssize_t
+- typec_altmode_roles_show(struct device *dev, struct device_attribute *attr,
+- 			 char *buf)
++ supported_roles_show(struct device *dev, struct device_attribute *attr,
++ 		     char *buf)
+  {
+- 	struct typec_mode *mode = container_of(attr, struct typec_mode,
+- 					       roles_attr);
++ 	struct typec_altmode *alt = to_altmode(dev);
+  	ssize_t ret;
+  
+++<<<<<<< HEAD:drivers/usb/typec/typec.c
+ +	switch (mode->roles) {
+ +	case TYPEC_PORT_DFP:
+++=======
++ 	switch (alt->roles) {
++ 	case TYPEC_PORT_SRC:
+++>>>>>>> 4ab8c18d4d67 (usb: typec: Register a device for every mode):drivers/usb/typec/class.c
+  		ret = sprintf(buf, "source\n");
+  		break;
+ -	case TYPEC_PORT_SNK:
+ +	case TYPEC_PORT_UFP:
+  		ret = sprintf(buf, "sink\n");
+  		break;
+  	case TYPEC_PORT_DRP:
+diff --git a/drivers/usb/typec/tcpm.c b/drivers/usb/typec/tcpm.c
+index 886ffe125ddf..0b417c0ec306 100644
+--- a/drivers/usb/typec/tcpm.c
++++ b/drivers/usb/typec/tcpm.c
+@@ -310,8 +310,8 @@ struct tcpm_port {
+ 
+ 	/* Alternate mode data */
+ 	struct pd_mode_data mode_data;
+-	struct typec_altmode *partner_altmode[SVID_DISCOVERY_MAX];
+-	struct typec_altmode *port_altmode[SVID_DISCOVERY_MAX];
++	struct typec_altmode *partner_altmode[SVID_DISCOVERY_MAX * 6];
++	struct typec_altmode *port_altmode[SVID_DISCOVERY_MAX * 6];
+ 
+ 	/* Deadline in jiffies to exit src_try_wait state */
+ 	unsigned long max_wait;
+@@ -998,7 +998,6 @@ static void svdm_consume_modes(struct tcpm_port *port, const __le32 *payload,
+ {
+ 	struct pd_mode_data *pmdata = &port->mode_data;
+ 	struct typec_altmode_desc *paltmode;
+-	struct typec_mode_desc *pmode;
+ 	int i;
+ 
+ 	if (pmdata->altmodes >= ARRAY_SIZE(port->partner_altmode)) {
+@@ -1006,32 +1005,28 @@ static void svdm_consume_modes(struct tcpm_port *port, const __le32 *payload,
+ 		return;
+ 	}
+ 
+-	paltmode = &pmdata->altmode_desc[pmdata->altmodes];
+-	memset(paltmode, 0, sizeof(*paltmode));
++	for (i = 1; i < cnt; i++) {
++		paltmode = &pmdata->altmode_desc[pmdata->altmodes];
++		memset(paltmode, 0, sizeof(*paltmode));
+ 
+-	paltmode->svid = pmdata->svids[pmdata->svid_index];
++		paltmode->svid = pmdata->svids[pmdata->svid_index];
++		paltmode->mode = i;
++		paltmode->vdo = le32_to_cpu(payload[i]);
+ 
+-	tcpm_log(port, " Alternate mode %d: SVID 0x%04x",
+-		 pmdata->altmodes, paltmode->svid);
++		tcpm_log(port, " Alternate mode %d: SVID 0x%04x, VDO %d: 0x%08x",
++			 pmdata->altmodes, paltmode->svid,
++			 paltmode->mode, paltmode->vdo);
+ 
+-	for (i = 1; i < cnt && paltmode->n_modes < ALTMODE_MAX_MODES; i++) {
+-		pmode = &paltmode->modes[paltmode->n_modes];
+-		memset(pmode, 0, sizeof(*pmode));
+-		pmode->vdo = le32_to_cpu(payload[i]);
+-		pmode->index = i - 1;
+-		paltmode->n_modes++;
+-		tcpm_log(port, "  VDO %d: 0x%08x",
+-			 pmode->index, pmode->vdo);
+-	}
+-	port->partner_altmode[pmdata->altmodes] =
+-		typec_partner_register_altmode(port->partner, paltmode);
+-	if (!port->partner_altmode[pmdata->altmodes]) {
+-		tcpm_log(port,
+-			 "Failed to register alternate modes for SVID 0x%04x",
+-			 paltmode->svid);
+-		return;
++		port->partner_altmode[pmdata->altmodes] =
++			typec_partner_register_altmode(port->partner, paltmode);
++		if (!port->partner_altmode[pmdata->altmodes]) {
++			tcpm_log(port,
++				 "Failed to register modes for SVID 0x%04x",
++				 paltmode->svid);
++			return;
++		}
++		pmdata->altmodes++;
+ 	}
+-	pmdata->altmodes++;
+ }
+ 
+ #define supports_modal(port)	PD_IDH_MODAL_SUPP((port)->partner_ident.id_header)
+* Unmerged path drivers/usb/typec/typec.c
+diff --git a/include/linux/usb/typec.h b/include/linux/usb/typec.h
+index 0d44ce6af08f..43c6ad13b138 100644
+--- a/include/linux/usb/typec.h
++++ b/include/linux/usb/typec.h
+@@ -81,41 +81,23 @@ int typec_partner_set_identity(struct typec_partner *partner);
+ int typec_cable_set_identity(struct typec_cable *cable);
+ 
+ /*
+- * struct typec_mode_desc - Individual Mode of an Alternate Mode
+- * @index: Index of the Mode within the SVID
++ * struct typec_altmode_desc - USB Type-C Alternate Mode Descriptor
++ * @svid: Standard or Vendor ID
++ * @mode: Index of the Mode
+  * @vdo: VDO returned by Discover Modes USB PD command
+- * @desc: Optional human readable description of the mode
+  * @roles: Only for ports. DRP if the mode is available in both roles
+  *
+- * Description of a mode of an Alternate Mode which a connector, cable plug or
+- * partner supports. Every mode will have it's own sysfs group. The details are
+- * the VDO returned by discover modes command, description for the mode and
+- * active flag telling has the mode being entered or not.
++ * Description of an Alternate Mode which a connector, cable plug or partner
++ * supports.
+  */
+-struct typec_mode_desc {
+-	int			index;
++struct typec_altmode_desc {
++	u16			svid;
++	u8			mode;
+ 	u32			vdo;
+-	char			*desc;
+ 	/* Only used with ports */
+ 	enum typec_port_type	roles;
+ };
+ 
+-/*
+- * struct typec_altmode_desc - USB Type-C Alternate Mode Descriptor
+- * @svid: Standard or Vendor ID
+- * @n_modes: Number of modes
+- * @modes: Array of modes supported by the Alternate Mode
+- *
+- * Representation of an Alternate Mode that has SVID assigned by USB-IF. The
+- * array of modes will list the modes of a particular SVID that are supported by
+- * a connector, partner of a cable plug.
+- */
+-struct typec_altmode_desc {
+-	u16			svid;
+-	int			n_modes;
+-	struct typec_mode_desc	modes[ALTMODE_MAX_MODES];
+-};
+-
+ struct typec_altmode
+ *typec_partner_register_altmode(struct typec_partner *partner,
+ 				const struct typec_altmode_desc *desc);
+@@ -129,8 +111,7 @@ void typec_unregister_altmode(struct typec_altmode *altmode);
+ 
+ struct typec_port *typec_altmode2port(struct typec_altmode *alt);
+ 
+-void typec_altmode_update_active(struct typec_altmode *alt, int mode,
+-				 bool active);
++void typec_altmode_update_active(struct typec_altmode *alt, bool active);
+ 
+ enum typec_plug_index {
+ 	TYPEC_PLUG_SOP_P,
