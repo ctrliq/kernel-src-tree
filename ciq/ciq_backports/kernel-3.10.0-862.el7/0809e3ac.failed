@@ -1,0 +1,112 @@
+block: fix plug list flushing for nomerge queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] fix plug list flushing for nomerge queues (Ming Lei) [1389540 1458104]
+Rebuild_FUZZ: 92.13%
+commit-author Jeff Moyer <jmoyer@redhat.com>
+commit 0809e3ac62319dc7534b64f95ac37e230d740e8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0809e3ac.failed
+
+Request queues with merging disabled will not flush the plug list after
+BLK_MAX_REQUEST_COUNT requests have been queued, since the code relies
+on blk_attempt_plug_merge to compute the request_count.  Fix this by
+computing the number of queued requests even for nomerge queues.
+
+	Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0809e3ac62319dc7534b64f95ac37e230d740e8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 49418900af65,9683a561efcd..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1396,9 -1266,14 +1396,20 @@@ static void blk_mq_make_request(struct 
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
+ +		return;
+++=======
++ 	blk_queue_split(q, &bio, q->bio_split);
++ 
++ 	if (!is_flush_fua && !blk_queue_nomerges(q)) {
++ 		if (blk_attempt_plug_merge(q, bio, &request_count,
++ 					   &same_queue_rq))
++ 			return;
++ 	} else
++ 		request_count = blk_plug_queued_count(q);
+++>>>>>>> 0809e3ac6231 (block: fix plug list flushing for nomerge queues)
+  
+  	rq = blk_mq_map_request(q, bio, &data);
+  	if (unlikely(!rq))
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9db4ccd0b9a5..89af82207da4 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1654,6 +1654,30 @@ out:
+ 	return ret;
+ }
+ 
++unsigned int blk_plug_queued_count(struct request_queue *q)
++{
++	struct blk_plug *plug;
++	struct request *rq;
++	struct list_head *plug_list;
++	unsigned int ret = 0;
++
++	plug = current->plug;
++	if (!plug)
++		goto out;
++
++	if (q->mq_ops)
++		plug_list = &plug->mq_list;
++	else
++		plug_list = &plug->list;
++
++	list_for_each_entry(rq, plug_list, queuelist) {
++		if (rq->q == q)
++			ret++;
++	}
++out:
++	return ret;
++}
++
+ void init_request_from_bio(struct request *req, struct bio *bio)
+ {
+ 	req->cmd_type = REQ_TYPE_FS;
+@@ -1698,9 +1722,11 @@ void blk_queue_bio(struct request_queue *q, struct bio *bio)
+ 	 * Check if we can merge with the plugged list before grabbing
+ 	 * any locks.
+ 	 */
+-	if (!blk_queue_nomerges(q) &&
+-	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+-		return;
++	if (!blk_queue_nomerges(q)) {
++		if (blk_attempt_plug_merge(q, bio, &request_count, NULL))
++			return;
++	} else
++		request_count = blk_plug_queued_count(q);
+ 
+ 	spin_lock_irq(q->queue_lock);
+ 
+* Unmerged path block/blk-mq.c
+diff --git a/block/blk.h b/block/blk.h
+index 4d1760d40372..0b77672b8c88 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -108,6 +108,7 @@ bool bio_attempt_back_merge(struct request_queue *q, struct request *req,
+ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+ 			    unsigned int *request_count,
+ 			    struct request **same_queue_rq);
++unsigned int blk_plug_queued_count(struct request_queue *q);
+ 
+ void blk_account_io_start(struct request *req, bool new_io);
+ void blk_account_io_completion(struct request *req, unsigned int bytes);
