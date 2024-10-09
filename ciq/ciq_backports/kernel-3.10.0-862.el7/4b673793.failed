@@ -1,0 +1,318 @@
+net/mlx5: Make get_cqe routine not ethernet-specific
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Make get_cqe routine not ethernet-specific (Kamal Heib) [1456677 1456694]
+Rebuild_FUZZ: 96.00%
+commit-author Ilan Tayari <ilant@mellanox.com>
+commit 4b67379376b3674c069477aa48fe8923f735247e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4b673793.failed
+
+Move mlx5e_get_cqe routine to wq.h and rename it to
+mlx5_cqwq_get_cqe.
+
+This allows it to be used by other CQ users outside of the
+ethernet driver code.
+
+A later patch in this patchset will make use of it from
+FPGA code for the FPGA high-speed connection.
+
+	Signed-off-by: Ilan Tayari <ilant@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 4b67379376b3674c069477aa48fe8923f735247e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 8b4b5a3808c1,574a96279340..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -853,3 -1025,161 +853,164 @@@ int mlx5e_poll_rx_cq(struct mlx5e_cq *c
+  
+  	return work_done;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
++ {
++ 	struct mlx5e_xdpsq *sq;
++ 	struct mlx5e_rq *rq;
++ 	u16 sqcc;
++ 	int i;
++ 
++ 	sq = container_of(cq, struct mlx5e_xdpsq, cq);
++ 
++ 	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++ 		return false;
++ 
++ 	rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 
++ 	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++ 	 * otherwise a cq overrun may occur
++ 	 */
++ 	sqcc = sq->cc;
++ 
++ 	for (i = 0; i < MLX5E_TX_CQ_POLL_BUDGET; i++) {
++ 		struct mlx5_cqe64 *cqe;
++ 		u16 wqe_counter;
++ 		bool last_wqe;
++ 
++ 		cqe = mlx5_cqwq_get_cqe(&cq->wq);
++ 		if (!cqe)
++ 			break;
++ 
++ 		mlx5_cqwq_pop(&cq->wq);
++ 
++ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++ 
++ 		do {
++ 			struct mlx5e_dma_info *di;
++ 			u16 ci;
++ 
++ 			last_wqe = (sqcc == wqe_counter);
++ 
++ 			ci = sqcc & sq->wq.sz_m1;
++ 			di = &sq->db.di[ci];
++ 
++ 			sqcc++;
++ 			/* Recycle RX page */
++ 			mlx5e_page_release(rq, di, true);
++ 		} while (!last_wqe);
++ 	}
++ 
++ 	mlx5_cqwq_update_db_record(&cq->wq);
++ 
++ 	/* ensure cq space is freed before enabling more cqes */
++ 	wmb();
++ 
++ 	sq->cc = sqcc;
++ 	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++ }
++ 
++ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 	struct mlx5e_dma_info *di;
++ 	u16 ci;
++ 
++ 	while (sq->cc != sq->pc) {
++ 		ci = sq->cc & sq->wq.sz_m1;
++ 		di = &sq->db.di[ci];
++ 		sq->cc++;
++ 
++ 		mlx5e_page_release(rq, di, false);
++ 	}
++ }
++ 
++ #ifdef CONFIG_MLX5_CORE_IPOIB
++ 
++ #define MLX5_IB_GRH_DGID_OFFSET 24
++ #define MLX5_GID_SIZE           16
++ 
++ static inline void mlx5i_complete_rx_cqe(struct mlx5e_rq *rq,
++ 					 struct mlx5_cqe64 *cqe,
++ 					 u32 cqe_bcnt,
++ 					 struct sk_buff *skb)
++ {
++ 	struct net_device *netdev = rq->netdev;
++ 	struct mlx5e_tstamp *tstamp = rq->tstamp;
++ 	char *pseudo_header;
++ 	u8 *dgid;
++ 	u8 g;
++ 
++ 	g = (be32_to_cpu(cqe->flags_rqpn) >> 28) & 3;
++ 	dgid = skb->data + MLX5_IB_GRH_DGID_OFFSET;
++ 	if ((!g) || dgid[0] != 0xff)
++ 		skb->pkt_type = PACKET_HOST;
++ 	else if (memcmp(dgid, netdev->broadcast + 4, MLX5_GID_SIZE) == 0)
++ 		skb->pkt_type = PACKET_BROADCAST;
++ 	else
++ 		skb->pkt_type = PACKET_MULTICAST;
++ 
++ 	/* TODO: IB/ipoib: Allow mcast packets from other VFs
++ 	 * 68996a6e760e5c74654723eeb57bf65628ae87f4
++ 	 */
++ 
++ 	skb_pull(skb, MLX5_IB_GRH_BYTES);
++ 
++ 	skb->protocol = *((__be16 *)(skb->data));
++ 
++ 	skb->ip_summed = CHECKSUM_COMPLETE;
++ 	skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
++ 
++ 	if (unlikely(mlx5e_rx_hw_stamp(tstamp)))
++ 		mlx5e_fill_hwstamp(tstamp, get_cqe_ts(cqe), skb_hwtstamps(skb));
++ 
++ 	skb_record_rx_queue(skb, rq->ix);
++ 
++ 	if (likely(netdev->features & NETIF_F_RXHASH))
++ 		mlx5e_skb_set_hash(cqe, skb);
++ 
++ 	/* 20 bytes of ipoib header and 4 for encap existing */
++ 	pseudo_header = skb_push(skb, MLX5_IPOIB_PSEUDO_LEN);
++ 	memset(pseudo_header, 0, MLX5_IPOIB_PSEUDO_LEN);
++ 	skb_reset_mac_header(skb);
++ 	skb_pull(skb, MLX5_IPOIB_HARD_LEN);
++ 
++ 	skb->dev = netdev;
++ 
++ 	rq->stats.csum_complete++;
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += cqe_bcnt;
++ }
++ 
++ void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_wqe_frag_info *wi;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	wi             = &rq->wqe.frag_info[wqe_counter];
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
++ 	if (!skb)
++ 		goto wq_free_wqe;
++ 
++ 	mlx5i_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ wq_free_wqe:
++ 	mlx5e_free_rx_wqe_reuse(rq, wi);
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_CORE_IPOIB */
+++>>>>>>> 4b67379376b3 (net/mlx5: Make get_cqe routine not ethernet-specific)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index a75c0268e502,92db28a9ed43..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@@ -32,21 -32,35 +32,53 @@@
+  
+  #include "en.h"
+  
+++<<<<<<< HEAD
+ +struct mlx5_cqe64 *mlx5e_get_cqe(struct mlx5e_cq *cq)
+ +{
+ +	struct mlx5_cqwq *wq = &cq->wq;
+ +	u32 ci = mlx5_cqwq_get_ci(wq);
+ +	struct mlx5_cqe64 *cqe = mlx5_cqwq_get_wqe(wq, ci);
+ +	u8 cqe_ownership_bit = cqe->op_own & MLX5_CQE_OWNER_MASK;
+ +	u8 sw_ownership_val = mlx5_cqwq_get_wrap_cnt(wq) & 1;
+ +
+ +	if (cqe_ownership_bit != sw_ownership_val)
+ +		return NULL;
+ +
+ +	/* ensure cqe content is read after cqe ownership bit */
+ +	dma_rmb();
+ +
+ +	return cqe;
+++=======
++ static inline void mlx5e_poll_ico_single_cqe(struct mlx5e_cq *cq,
++ 					     struct mlx5e_icosq *sq,
++ 					     struct mlx5_cqe64 *cqe,
++ 					     u16 *sqcc)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	u16 ci = be16_to_cpu(cqe->wqe_counter) & wq->sz_m1;
++ 	struct mlx5e_sq_wqe_info *icowi = &sq->db.ico_wqe[ci];
++ 	struct mlx5e_rq *rq = &sq->channel->rq;
++ 
++ 	prefetch(rq);
++ 	mlx5_cqwq_pop(&cq->wq);
++ 	*sqcc += icowi->num_wqebbs;
++ 
++ 	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_REQ)) {
++ 		WARN_ONCE(true, "mlx5e: Bad OP in ICOSQ CQE: 0x%x\n",
++ 			  cqe->op_own);
++ 		return;
++ 	}
++ 
++ 	if (likely(icowi->opcode == MLX5_OPCODE_UMR)) {
++ 		mlx5e_post_rx_mpwqe(rq);
++ 		return;
++ 	}
++ 
++ 	if (unlikely(icowi->opcode != MLX5_OPCODE_NOP))
++ 		WARN_ONCE(true,
++ 			  "mlx5e: Bad OPCODE in ICOSQ WQE info: 0x%x\n",
++ 			  icowi->opcode);
+++>>>>>>> 4b67379376b3 (net/mlx5: Make get_cqe routine not ethernet-specific)
+  }
+  
+  static void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 08e121a5e7e2..ed6faebc9865 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -746,7 +746,6 @@ void mlx5e_dealloc_rx_wqe(struct mlx5e_rq *rq, u16 ix);
+ void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix);
+ void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq);
+ void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi);
+-struct mlx5_cqe64 *mlx5e_get_cqe(struct mlx5e_cq *cq);
+ 
+ void mlx5e_rx_am(struct mlx5e_rq *rq);
+ void mlx5e_rx_am_work(struct work_struct *work);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 1faf0998da5b..710212cfbd78 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -430,7 +430,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+ 		u16 wqe_counter;
+ 		bool last_wqe;
+ 
+-		cqe = mlx5e_get_cqe(cq);
++		cqe = mlx5_cqwq_get_cqe(&cq->wq);
+ 		if (!cqe)
+ 			break;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/wq.h b/drivers/net/ethernet/mellanox/mlx5/core/wq.h
+index d8afed898c31..9ded5d40ce6b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.h
+@@ -34,6 +34,7 @@
+ #define __MLX5_WQ_H__
+ 
+ #include <linux/mlx5/mlx5_ifc.h>
++#include <linux/mlx5/cq.h>
+ 
+ struct mlx5_wq_param {
+ 	int		linear;
+@@ -146,6 +147,22 @@ static inline void mlx5_cqwq_update_db_record(struct mlx5_cqwq *wq)
+ 	*wq->db = cpu_to_be32(wq->cc & 0xffffff);
+ }
+ 
++static inline struct mlx5_cqe64 *mlx5_cqwq_get_cqe(struct mlx5_cqwq *wq)
++{
++	u32 ci = mlx5_cqwq_get_ci(wq);
++	struct mlx5_cqe64 *cqe = mlx5_cqwq_get_wqe(wq, ci);
++	u8 cqe_ownership_bit = cqe->op_own & MLX5_CQE_OWNER_MASK;
++	u8 sw_ownership_val = mlx5_cqwq_get_wrap_cnt(wq) & 1;
++
++	if (cqe_ownership_bit != sw_ownership_val)
++		return NULL;
++
++	/* ensure cqe content is read after cqe ownership bit */
++	dma_rmb();
++
++	return cqe;
++}
++
+ static inline int mlx5_wq_ll_is_full(struct mlx5_wq_ll *wq)
+ {
+ 	return wq->cur_sz == wq->sz_m1;
