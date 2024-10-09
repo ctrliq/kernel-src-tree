@@ -1,0 +1,273 @@
+md: Use REQ_FAILFAST_* on metadata writes where appropriate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] Use REQ_FAILFAST_* on metadata writes where appropriate (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 96.49%
+commit-author NeilBrown <neilb@suse.com>
+commit 46533ff7fefb7e9e3539494f5873b00091caa8eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/46533ff7.failed
+
+This can only be supported on personalities which ensure
+that md_error() never causes an array to enter the 'failed'
+state.  i.e. if marking a device Faulty would cause some
+data to be inaccessible, the device is status is left as
+non-Faulty.  This is true for RAID1 and RAID10.
+
+If we get a failure writing metadata but the device doesn't
+fail, it must be the last device so we re-write without
+FAILFAST to improve chance of success.  We also flag the
+device as LastDev so that future metadata updates don't
+waste time on failfast writes.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 46533ff7fefb7e9e3539494f5873b00091caa8eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+diff --cc drivers/md/md.c
+index 6cf58b727bcf,62f3fb948b3e..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -722,12 -724,16 +722,18 @@@ static void super_written(struct bio *b
+  	struct md_rdev *rdev = bio->bi_private;
+  	struct mddev *mddev = rdev->mddev;
+  
+ -	if (bio->bi_error) {
+ -		pr_err("md: super_written gets error=%d\n", bio->bi_error);
+ +	if (error || !test_bit(BIO_UPTODATE, &bio->bi_flags)) {
+ +		printk("md: super_written gets error=%d, uptodate=%d\n",
+ +		       error, test_bit(BIO_UPTODATE, &bio->bi_flags));
+ +		WARN_ON(test_bit(BIO_UPTODATE, &bio->bi_flags));
+  		md_error(mddev, rdev);
+- 	}
++ 		if (!test_bit(Faulty, &rdev->flags)
++ 		    && (bio->bi_opf & MD_FAILFAST)) {
++ 			set_bit(MD_NEED_REWRITE, &mddev->flags);
++ 			set_bit(LastDev, &rdev->flags);
++ 		}
++ 	} else
++ 		clear_bit(LastDev, &rdev->flags);
+  
+  	if (atomic_dec_and_test(&mddev->pending_writes))
+  		wake_up(&mddev->sb_wait);
+@@@ -753,12 -765,18 +765,21 @@@ void md_super_write(struct mddev *mddev
+  	bio_add_page(bio, page, size, 0);
+  	bio->bi_private = rdev;
+  	bio->bi_end_io = super_written;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (test_bit(MD_FAILFAST_SUPPORTED, &mddev->flags) &&
++ 	    test_bit(FailFast, &rdev->flags) &&
++ 	    !test_bit(LastDev, &rdev->flags))
++ 		ff = MD_FAILFAST;
++ 	bio_set_op_attrs(bio, REQ_OP_WRITE, WRITE_FLUSH_FUA | ff);
+++>>>>>>> 46533ff7fefb (md: Use REQ_FAILFAST_* on metadata writes where appropriate)
+  
+  	atomic_inc(&mddev->pending_writes);
+ -	submit_bio(bio);
+ +	submit_bio(WRITE_FLUSH_FUA, bio);
+  }
+  
+- void md_super_wait(struct mddev *mddev)
++ int md_super_wait(struct mddev *mddev)
+  {
+  	/* wait for all superblock writes that were scheduled to complete */
+  	wait_event(mddev->sb_wait, atomic_read(&mddev->pending_writes)==0);
+@@@ -2353,6 -2436,9 +2379,12 @@@ repeat
+  	pr_debug("md: updating %s RAID superblock on device (in sync %d)\n",
+  		 mdname(mddev), mddev->in_sync);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (mddev->queue)
++ 		blk_add_trace_msg(mddev->queue, "md md_update_sb");
++ rewrite:
+++>>>>>>> 46533ff7fefb (md: Use REQ_FAILFAST_* on metadata writes where appropriate)
+  	bitmap_update_sb(mddev->bitmap);
+  	rdev_for_each(rdev, mddev) {
+  		char b[BDEVNAME_SIZE];
+@@@ -2384,18 -2470,18 +2416,19 @@@
+  			/* only need to write one superblock... */
+  			break;
+  	}
+- 	md_super_wait(mddev);
++ 	if (md_super_wait(mddev) < 0)
++ 		goto rewrite;
+  	/* if there was a failure, MD_CHANGE_DEVS was set, and we re-write super */
+  
+ -	if (mddev_is_clustered(mddev) && ret == 0)
+ -		md_cluster_ops->metadata_update_finish(mddev);
+ -
+ +	spin_lock(&mddev->lock);
+  	if (mddev->in_sync != sync_req ||
+ -	    !bit_clear_unless(&mddev->flags, BIT(MD_CHANGE_PENDING),
+ -			       BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_CLEAN)))
+ +	    test_bit(MD_CHANGE_DEVS, &mddev->flags)) {
+  		/* have to write it out again */
+ +		spin_unlock(&mddev->lock);
+  		goto repeat;
+ +	}
+ +	clear_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +	spin_unlock(&mddev->lock);
+  	wake_up(&mddev->sb_wait);
+  	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+  		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+diff --cc drivers/md/md.h
+index 07747899ac17,5c08f84101fa..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -163,6 -172,25 +173,28 @@@ enum flag_bits 
+  				 * Usually, this device should be faster
+  				 * than other devices in the array
+  				 */
+++<<<<<<< HEAD
+++=======
++ 	ClusterRemove,
++ 	RemoveSynchronized,	/* synchronize_rcu() was called after
++ 				 * this device was known to be faulty,
++ 				 * so it is safe to remove without
++ 				 * another synchronize_rcu() call.
++ 				 */
++ 	ExternalBbl,            /* External metadata provides bad
++ 				 * block management for a disk
++ 				 */
++ 	FailFast,		/* Minimal retries should be attempted on
++ 				 * this device, so use REQ_FAILFAST_DEV.
++ 				 * Also don't try to repair failed reads.
++ 				 * It is expects that no bad block log
++ 				 * is present.
++ 				 */
++ 	LastDev,		/* Seems to be the last working dev as
++ 				 * it didn't fail, so don't use FailFast
++ 				 * any more for metadata
++ 				 */
+++>>>>>>> 46533ff7fefb (md: Use REQ_FAILFAST_* on metadata writes where appropriate)
+  };
+  
+  static inline int is_badblock(struct md_rdev *rdev, sector_t s, int sectors,
+@@@ -182,7 -210,32 +214,34 @@@ extern int rdev_set_badblocks(struct md
+  			      int is_new);
+  extern int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+  				int is_new);
+ -struct md_cluster_info;
+  
+++<<<<<<< HEAD
+++=======
++ enum mddev_flags {
++ 	MD_CHANGE_DEVS,		/* Some device status has changed */
++ 	MD_CHANGE_CLEAN,	/* transition to or from 'clean' */
++ 	MD_CHANGE_PENDING,	/* switch from 'clean' to 'active' in progress */
++ 	MD_ARRAY_FIRST_USE,	/* First use of array, needs initialization */
++ 	MD_CLOSING,		/* If set, we are closing the array, do not open
++ 				 * it then */
++ 	MD_JOURNAL_CLEAN,	/* A raid with journal is already clean */
++ 	MD_HAS_JOURNAL,		/* The raid array has journal feature set */
++ 	MD_RELOAD_SB,		/* Reload the superblock because another node
++ 				 * updated it.
++ 				 */
++ 	MD_CLUSTER_RESYNC_LOCKED, /* cluster raid only, which means node
++ 				   * already took resync lock, need to
++ 				   * release the lock */
++ 	MD_FAILFAST_SUPPORTED,	/* Using MD_FAILFAST on metadata writes is
++ 				 * supported as calls to md_error() will
++ 				 * never cause the array to become failed.
++ 				 */
++ 	MD_NEED_REWRITE,	/* metadata write needs to be repeated */
++ };
++ #define MD_UPDATE_SB_FLAGS (BIT(MD_CHANGE_DEVS) | \
++ 			    BIT(MD_CHANGE_CLEAN) | \
++ 			    BIT(MD_CHANGE_PENDING))	/* If these are set, md_update_sb needed */
+++>>>>>>> 46533ff7fefb (md: Use REQ_FAILFAST_* on metadata writes where appropriate)
+  struct mddev {
+  	void				*private;
+  	struct md_personality		*pers;
+@@@ -610,9 -647,10 +669,9 @@@ extern int mddev_congested(struct mdde
+  extern void md_flush_request(struct mddev *mddev, struct bio *bio);
+  extern void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
+  			   sector_t sector, int size, struct page *page);
+- extern void md_super_wait(struct mddev *mddev);
++ extern int md_super_wait(struct mddev *mddev);
+  extern int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
+ -			struct page *page, int op, int op_flags,
+ -			bool metadata_op);
+ +			struct page *page, int rw, bool metadata_op);
+  extern void md_do_sync(struct md_thread *thread);
+  extern void md_new_event(struct mddev *mddev);
+  extern int md_allow_write(struct mddev *mddev);
+diff --git a/drivers/md/bitmap.c b/drivers/md/bitmap.c
+index b2cd760b2877..3ea4be4ed53e 100644
+--- a/drivers/md/bitmap.c
++++ b/drivers/md/bitmap.c
+@@ -192,11 +192,13 @@ static struct md_rdev *next_active_rdev(struct md_rdev *rdev, struct mddev *mdde
+ 
+ static int write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
+ {
+-	struct md_rdev *rdev = NULL;
++	struct md_rdev *rdev;
+ 	struct block_device *bdev;
+ 	struct mddev *mddev = bitmap->mddev;
+ 	struct bitmap_storage *store = &bitmap->storage;
+ 
++restart:
++	rdev = NULL;
+ 	while ((rdev = next_active_rdev(rdev, mddev)) != NULL) {
+ 		int size = PAGE_SIZE;
+ 		loff_t offset = mddev->bitmap_info.offset;
+@@ -252,8 +254,8 @@ static int write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
+ 			       page);
+ 	}
+ 
+-	if (wait)
+-		md_super_wait(mddev);
++	if (wait && md_super_wait(mddev) < 0)
++		goto restart;
+ 	return 0;
+ 
+  bad_alignment:
+@@ -411,6 +413,13 @@ static void bitmap_wait_writes(struct bitmap *bitmap)
+ 		wait_event(bitmap->write_wait,
+ 			   atomic_read(&bitmap->pending_writes)==0);
+ 	else
++		/* Note that we ignore the return value.  The writes
++		 * might have failed, but that would just mean that
++		 * some bits which should be cleared haven't been,
++		 * which is safe.  The relevant bitmap blocks will
++		 * probably get written again, but there is no great
++		 * loss if they aren't.
++		 */
+ 		md_super_wait(bitmap->mddev);
+ }
+ 
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 61555b115942..7a7055239b14 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -2976,6 +2976,7 @@ static int raid1_run(struct mddev *mddev)
+ 	mddev->thread = conf->thread;
+ 	conf->thread = NULL;
+ 	mddev->private = conf;
++	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+ 
+ 	md_set_array_sectors(mddev, raid1_size(mddev, 0, 0));
+ 
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 9848c5d0edf0..de0146ea8d6e 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3788,6 +3788,7 @@ static int raid10_run(struct mddev *mddev)
+ 	size = raid10_size(mddev, 0, 0);
+ 	md_set_array_sectors(mddev, size);
+ 	mddev->resync_max_sectors = size;
++	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+ 
+ 	if (mddev->queue) {
+ 		int stripe = conf->geo.raid_disks *
