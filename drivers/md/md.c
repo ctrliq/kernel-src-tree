@@ -293,7 +293,7 @@ static void md_make_request(struct request_queue *q, struct bio *bio)
  */
 void mddev_suspend(struct mddev *mddev)
 {
-	WARN_ON_ONCE(current == mddev->thread->tsk);
+	WARN_ON_ONCE(mddev->thread && current == mddev->thread->tsk);
 	if (mddev->suspended++)
 		return;
 	synchronize_rcu();
