@@ -1,0 +1,244 @@
+mm: use macros from compiler.h instead of __attribute__((...))
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [kernel] use macros from compiler.h instead of __attribute__((...)) (Xunlei Pang) [1415443]
+Rebuild_FUZZ: 96.67%
+commit-author Gideon Israel Dsouza <gidisrael@gmail.com>
+commit 3b32123d734cb414e366b35a3b2142a995f9d1a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3b32123d.failed
+
+To increase compiler portability there is <linux/compiler.h> which
+provides convenience macros for various gcc constructs.  Eg: __weak for
+__attribute__((weak)).  I've replaced all instances of gcc attributes with
+the right macro in the memory management (/mm) subsystem.
+
+[akpm@linux-foundation.org: while-we're-there consistency tweaks]
+	Signed-off-by: Gideon Israel Dsouza <gidisrael@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3b32123d734cb414e366b35a3b2142a995f9d1a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+#	mm/vmalloc.c
+diff --cc mm/hugetlb.c
+index 7cfa031212e3,c5aa43993364..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3869,66 -3495,59 +3870,104 @@@ pte_t *huge_pte_offset(struct mm_struc
+  	return (pte_t *) pmd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct page *
++ follow_huge_pmd(struct mm_struct *mm, unsigned long address,
++ 		pmd_t *pmd, int write)
++ {
++ 	struct page *page;
++ 
++ 	page = pte_page(*(pte_t *)pmd);
++ 	if (page)
++ 		page += ((address & ~PMD_MASK) >> PAGE_SHIFT);
++ 	return page;
++ }
++ 
++ struct page *
++ follow_huge_pud(struct mm_struct *mm, unsigned long address,
++ 		pud_t *pud, int write)
++ {
++ 	struct page *page;
++ 
++ 	page = pte_page(*(pte_t *)pud);
++ 	if (page)
++ 		page += ((address & ~PUD_MASK) >> PAGE_SHIFT);
++ 	return page;
++ }
++ 
++ #else /* !CONFIG_ARCH_WANT_GENERAL_HUGETLB */
++ 
++ /* Can be overriden by architectures */
++ struct page * __weak
++ follow_huge_pud(struct mm_struct *mm, unsigned long address,
++ 	       pud_t *pud, int write)
++ {
++ 	BUG();
++ 	return NULL;
++ }
++ 
+++>>>>>>> 3b32123d734c (mm: use macros from compiler.h instead of __attribute__((...)))
+  #endif /* CONFIG_ARCH_WANT_GENERAL_HUGETLB */
+  
+ -#ifdef CONFIG_MEMORY_FAILURE
+ +/*
+ + * These functions are overwritable if your architecture needs its own
+ + * behavior.
+ + */
+ +struct page * __weak
+ +follow_huge_addr(struct mm_struct *mm, unsigned long address,
+ +			      int write)
+ +{
+ +	return ERR_PTR(-EINVAL);
+ +}
+  
+ -/* Should be called in hugetlb_lock */
+ -static int is_hugepage_on_freelist(struct page *hpage)
+ +struct page * __weak
+ +follow_huge_pmd(struct mm_struct *mm, unsigned long address,
+ +		pmd_t *pmd, int flags)
+  {
+ -	struct page *page;
+ -	struct page *tmp;
+ -	struct hstate *h = page_hstate(hpage);
+ -	int nid = page_to_nid(hpage);
+ +	struct page *page = NULL;
+ +	spinlock_t *ptl;
+ +retry:
+ +	ptl = pmd_lockptr(mm, pmd);
+ +	spin_lock(ptl);
+ +	/*
+ +	 * make sure that the address range covered by this pmd is not
+ +	 * unmapped from other threads.
+ +	 */
+ +	if (!pmd_huge(*pmd))
+ +		goto out;
+ +	if (pmd_present(*pmd)) {
+ +		page = pmd_page(*pmd) + ((address & ~PMD_MASK) >> PAGE_SHIFT);
+ +		if (flags & FOLL_GET)
+ +			get_page(page);
+ +	} else {
+ +		if (is_hugetlb_entry_migration(huge_ptep_get((pte_t *)pmd))) {
+ +			spin_unlock(ptl);
+ +			__migration_entry_wait(mm, (pte_t *)pmd, ptl);
+ +			goto retry;
+ +		}
+ +		/*
+ +		 * hwpoisoned entry is treated as no_page_table in
+ +		 * follow_page_mask().
+ +		 */
+ +	}
+ +out:
+ +	spin_unlock(ptl);
+ +	return page;
+ +}
+  
+ -	list_for_each_entry_safe(page, tmp, &h->hugepage_freelists[nid], lru)
+ -		if (page == hpage)
+ -			return 1;
+ -	return 0;
+ +struct page * __weak
+ +follow_huge_pud(struct mm_struct *mm, unsigned long address,
+ +		pud_t *pud, int flags)
+ +{
+ +	if (flags & FOLL_GET)
+ +		return NULL;
+ +
+ +	return pte_page(*(pte_t *)pud) + ((address & ~PUD_MASK) >> PAGE_SHIFT);
+  }
+  
+ +#ifdef CONFIG_MEMORY_FAILURE
+ +
+  /*
+   * This function is called from memory failure code.
+   * Assume the caller holds page lock of the head page.
+diff --cc mm/vmalloc.c
+index 7451febbaf6d,a7b522f4851d..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -27,8 -27,9 +27,13 @@@
+  #include <linux/pfn.h>
+  #include <linux/kmemleak.h>
+  #include <linux/atomic.h>
++ #include <linux/compiler.h>
+  #include <linux/llist.h>
+++<<<<<<< HEAD
+ +#include <linux/bitops.h>
+++=======
++ 
+++>>>>>>> 3b32123d734c (mm: use macros from compiler.h instead of __attribute__((...)))
+  #include <asm/uaccess.h>
+  #include <asm/tlbflush.h>
+  #include <asm/shmparam.h>
+* Unmerged path mm/hugetlb.c
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 33d45217ae7b..13e1dd408142 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -24,6 +24,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/blkdev.h>
+ #include <linux/backing-dev.h>
++#include <linux/compiler.h>
+ #include <linux/mount.h>
+ #include <linux/personality.h>
+ #include <linux/security.h>
+@@ -490,7 +491,7 @@ EXPORT_SYMBOL_GPL(vm_unmap_aliases);
+  * Implement a stub for vmalloc_sync_all() if the architecture chose not to
+  * have one.
+  */
+-void  __attribute__((weak)) vmalloc_sync_all(void)
++void __weak vmalloc_sync_all(void)
+ {
+ }
+ 
+diff --git a/mm/sparse.c b/mm/sparse.c
+index ceb7968b0ae1..6b03c5f56546 100644
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@ -5,10 +5,12 @@
+ #include <linux/slab.h>
+ #include <linux/mmzone.h>
+ #include <linux/bootmem.h>
++#include <linux/compiler.h>
+ #include <linux/highmem.h>
+ #include <linux/export.h>
+ #include <linux/spinlock.h>
+ #include <linux/vmalloc.h>
++
+ #include "internal.h"
+ #include <asm/dma.h>
+ #include <asm/pgalloc.h>
+@@ -460,7 +462,7 @@ static struct page __init *sparse_early_mem_map_alloc(unsigned long pnum)
+ }
+ #endif
+ 
+-void __attribute__((weak)) __meminit vmemmap_populate_print_last(void)
++void __weak __meminit vmemmap_populate_print_last(void)
+ {
+ }
+ 
+diff --git a/mm/util.c b/mm/util.c
+index c13190fa2ed4..600d5cfc1b4a 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -1,6 +1,7 @@
+ #include <linux/mm.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
++#include <linux/compiler.h>
+ #include <linux/export.h>
+ #include <linux/err.h>
+ #include <linux/sched.h>
+@@ -375,7 +376,7 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
+  * If the architecture not support this function, simply return with no
+  * page pinned
+  */
+-int __attribute__((weak)) __get_user_pages_fast(unsigned long start,
++int __weak __get_user_pages_fast(unsigned long start,
+ 				 int nr_pages, int write, struct page **pages)
+ {
+ 	return 0;
+@@ -406,7 +407,7 @@ EXPORT_SYMBOL_GPL(__get_user_pages_fast);
+  * callers need to carefully consider what to use. On many architectures,
+  * get_user_pages_fast simply falls back to get_user_pages.
+  */
+-int __attribute__((weak)) get_user_pages_fast(unsigned long start,
++int __weak get_user_pages_fast(unsigned long start,
+ 				int nr_pages, int write, struct page **pages)
+ {
+ 	struct mm_struct *mm = current->mm;
+* Unmerged path mm/vmalloc.c
