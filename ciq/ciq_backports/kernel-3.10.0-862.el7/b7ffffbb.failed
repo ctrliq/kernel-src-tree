@@ -1,0 +1,258 @@
+ftrace: Add infrastructure for delayed enabling of module functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit b7ffffbb46f205e7727a18bcc7a46c3c2b534f7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b7ffffbb.failed
+
+Qiu Peiyang pointed out that there's a race when enabling function tracing
+and loading a module. In order to make the modifications of converting nops
+in the prologue of functions into callbacks, the text needs to be converted
+from read-only to read-write. When enabling function tracing, the text
+permission is updated, the functions are modified, and then they are put
+back.
+
+When loading a module, the updates to convert function calls to mcount is
+done before the module text is set to read-only. But after it is done, the
+module text is visible by the function tracer. Thus we have the following
+race:
+
+	CPU 0			CPU 1
+	-----			-----
+   start function tracing
+   set text to read-write
+			     load_module
+			     add functions to ftrace
+			     set module text read-only
+
+   update all functions to callbacks
+   modify module functions too
+   < Can't it's read-only >
+
+When this happens, ftrace detects the issue and disables itself till the
+next reboot.
+
+To fix this, a new DISABLED flag is added for ftrace records, which all
+module functions get when they are added. Then later, after the module code
+is all set, the records will have the DISABLED flag cleared, and they will
+be enabled if any callback wants all functions to be traced.
+
+Note, this doesn't add the delay to later. It simply changes the
+ftrace_module_init() to do both the setting of DISABLED records, and then
+immediately calls the enable code. This helps with testing this new code as
+it has the same behavior as previously. Another change will come after this
+to have the ftrace_module_enable() called after the text is set to
+read-only.
+
+	Cc: Qiu Peiyang <peiyangx.qiu@intel.com>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit b7ffffbb46f205e7727a18bcc7a46c3c2b534f7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ftrace.h
+#	kernel/trace/ftrace.c
+diff --cc include/linux/ftrace.h
+index bc85733d8eb6,660e7c698f3b..000000000000
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@@ -290,11 -369,14 +291,22 @@@ enum 
+  	FTRACE_FL_ENABLED	= (1UL << 31),
+  	FTRACE_FL_REGS		= (1UL << 30),
+  	FTRACE_FL_REGS_EN	= (1UL << 29),
+++<<<<<<< HEAD
+ +	FTRACE_FL_IPMODIFY	= (1UL << 28),
+ +};
+ +
+ +#define FTRACE_REF_MAX_SHIFT	28
+ +#define FTRACE_FL_BITS		4
+++=======
++ 	FTRACE_FL_TRAMP		= (1UL << 28),
++ 	FTRACE_FL_TRAMP_EN	= (1UL << 27),
++ 	FTRACE_FL_IPMODIFY	= (1UL << 26),
++ 	FTRACE_FL_DISABLED	= (1UL << 25),
++ };
++ 
++ #define FTRACE_REF_MAX_SHIFT	25
++ #define FTRACE_FL_BITS		7
+++>>>>>>> b7ffffbb46f2 (ftrace: Add infrastructure for delayed enabling of module functions)
+  #define FTRACE_FL_MASKED_BITS	((1UL << FTRACE_FL_BITS) - 1)
+  #define FTRACE_FL_MASK		(FTRACE_FL_MASKED_BITS << FTRACE_REF_MAX_SHIFT)
+  #define FTRACE_REF_MAX		((1UL << FTRACE_REF_MAX_SHIFT) - 1)
+diff --cc kernel/trace/ftrace.c
+index 0146600e951a,23683b06b18c..000000000000
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@@ -1852,6 -2024,11 +1855,14 @@@ static int ftrace_check_record(struct d
+  {
+  	unsigned long flag = 0UL;
+  
+++<<<<<<< HEAD
+++=======
++ 	ftrace_bug_type = FTRACE_BUG_UNKNOWN;
++ 
++ 	if (rec->flags & FTRACE_FL_DISABLED)
++ 		return FTRACE_UPDATE_IGNORE;
++ 
+++>>>>>>> b7ffffbb46f2 (ftrace: Add infrastructure for delayed enabling of module functions)
+  	/*
+  	 * If we are updating calls:
+  	 *
+@@@ -2382,13 -2839,13 +2393,13 @@@ ops_references_rec(struct ftrace_ops *o
+  	if (!(ops->flags & FTRACE_OPS_FL_ENABLED))
+  		return 0;
+  
+- 	/* If ops traces all mods, we already accounted for it */
++ 	/* If ops traces all then it includes this function */
+  	if (ops_traces_mod(ops))
+- 		return 0;
++ 		return 1;
+  
+  	/* The function must be in the filter */
+ -	if (!ftrace_hash_empty(ops->func_hash->filter_hash) &&
+ -	    !ftrace_lookup_ip(ops->func_hash->filter_hash, rec->ip))
+ +	if (!ftrace_hash_empty(ops->filter_hash) &&
+ +	    !ftrace_lookup_ip(ops->filter_hash, rec->ip))
+  		return 0;
+  
+  	/* If in notrace hash, we ignore it too */
+@@@ -2465,21 -2899,6 +2453,24 @@@ static int ftrace_update_code(struct mo
+  				break;
+  
+  			update_cnt++;
+++<<<<<<< HEAD
+ +
+ +			/*
+ +			 * If the tracing is enabled, go ahead and enable the record.
+ +			 *
+ +			 * The reason not to enable the record immediatelly is the
+ +			 * inherent check of ftrace_make_nop/ftrace_make_call for
+ +			 * correct previous instructions.  Making first the NOP
+ +			 * conversion puts the module to the correct state, thus
+ +			 * passing the ftrace_make_call check.
+ +			 */
+ +			if (ftrace_start_up && cnt) {
+ +				int failed = __ftrace_replace_code(p, 1);
+ +				if (failed)
+ +					ftrace_bug(failed, p->ip);
+ +			}
+++=======
+++>>>>>>> b7ffffbb46f2 (ftrace: Add infrastructure for delayed enabling of module functions)
+  		}
+  	}
+  
+@@@ -4337,31 -4961,83 +4341,107 @@@ void ftrace_release_mod(struct module *
+  	mutex_unlock(&ftrace_lock);
+  }
+  
+++<<<<<<< HEAD
+ +static void ftrace_init_module(struct module *mod,
+ +			       unsigned long *start, unsigned long *end)
+ +{
+ +	if (ftrace_disabled || start == end)
+ +		return;
+ +	ftrace_process_locs(mod, start, end);
+++=======
++ static void ftrace_module_enable(struct module *mod)
++ {
++ 	struct dyn_ftrace *rec;
++ 	struct ftrace_page *pg;
++ 
++ 	mutex_lock(&ftrace_lock);
++ 
++ 	if (ftrace_disabled)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * If the tracing is enabled, go ahead and enable the record.
++ 	 *
++ 	 * The reason not to enable the record immediatelly is the
++ 	 * inherent check of ftrace_make_nop/ftrace_make_call for
++ 	 * correct previous instructions.  Making first the NOP
++ 	 * conversion puts the module to the correct state, thus
++ 	 * passing the ftrace_make_call check.
++ 	 *
++ 	 * We also delay this to after the module code already set the
++ 	 * text to read-only, as we now need to set it back to read-write
++ 	 * so that we can modify the text.
++ 	 */
++ 	if (ftrace_start_up)
++ 		ftrace_arch_code_modify_prepare();
++ 
++ 	do_for_each_ftrace_rec(pg, rec) {
++ 		int cnt;
++ 		/*
++ 		 * do_for_each_ftrace_rec() is a double loop.
++ 		 * module text shares the pg. If a record is
++ 		 * not part of this module, then skip this pg,
++ 		 * which the "break" will do.
++ 		 */
++ 		if (!within_module_core(rec->ip, mod))
++ 			break;
++ 
++ 		cnt = 0;
++ 
++ 		/*
++ 		 * When adding a module, we need to check if tracers are
++ 		 * currently enabled and if they are, and can trace this record,
++ 		 * we need to enable the module functions as well as update the
++ 		 * reference counts for those function records.
++ 		 */
++ 		if (ftrace_start_up)
++ 			cnt += referenced_filters(rec);
++ 
++ 		/* This clears FTRACE_FL_DISABLED */
++ 		rec->flags = cnt;
++ 
++ 		if (ftrace_start_up && cnt) {
++ 			int failed = __ftrace_replace_code(rec, 1);
++ 			if (failed) {
++ 				ftrace_bug(failed, rec);
++ 				goto out_loop;
++ 			}
++ 		}
++ 
++ 	} while_for_each_ftrace_rec();
++ 
++  out_loop:
++ 	if (ftrace_start_up)
++ 		ftrace_arch_code_modify_post_process();
++ 
++  out_unlock:
++ 	mutex_unlock(&ftrace_lock);
+++>>>>>>> b7ffffbb46f2 (ftrace: Add infrastructure for delayed enabling of module functions)
+  }
+  
+  void ftrace_module_init(struct module *mod)
+  {
+ -	if (ftrace_disabled || !mod->num_ftrace_callsites)
+ -		return;
+ +#ifdef CONFIG_S390
+ +	struct module_ext *mod_ext;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&module_ext_mutex);
+ +	mod_ext = find_module_ext(mod);
+ +	mutex_unlock(&module_ext_mutex);
+ +
+ +	ftrace_init_module(mod, mod_ext->ftrace_callsites,
+ +			   mod_ext->ftrace_callsites +
+ +			   mod_ext->num_ftrace_callsites);
+ +#else
+ +	ftrace_init_module(mod, mod->ftrace_callsites,
+ +			   mod->ftrace_callsites +
+ +			   mod->num_ftrace_callsites);
+ +#endif
+++=======
++ 	ftrace_process_locs(mod, mod->ftrace_callsites,
++ 			    mod->ftrace_callsites + mod->num_ftrace_callsites);
++ 	ftrace_module_enable(mod);
+++>>>>>>> b7ffffbb46f2 (ftrace: Add infrastructure for delayed enabling of module functions)
+  }
+  
+  static int ftrace_module_notify_exit(struct notifier_block *self,
+* Unmerged path include/linux/ftrace.h
+* Unmerged path kernel/trace/ftrace.c
