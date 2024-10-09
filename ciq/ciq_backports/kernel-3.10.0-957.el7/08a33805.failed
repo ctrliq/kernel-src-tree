@@ -1,0 +1,165 @@
+iio: core: implement iio_device_{claim|release}_direct_mode()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] core: implement iio_device_(claim|release)_direct_mode() (Tony Camuso) [1559170]
+Rebuild_FUZZ: 92.31%
+commit-author Alison Schofield <amsfield22@gmail.com>
+commit 08a33805518e7845486f88287e8aace6f8439391
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/08a33805.failed
+
+It is often the case that the driver wants to be sure a device stays
+in direct mode while it is executing a task or series of tasks.  To
+accomplish this today, the driver performs this sequence: 1) take the
+device state lock, 2) verify it is not in a buffered mode, 3) execute
+some tasks, and 4) release that lock.
+
+This patch introduces a pair of helper functions that simplify these
+steps and make it more semantically expressive.
+
+iio_device_claim_direct_mode()
+        If the device is not in any buffered mode it is guaranteed
+        to stay that way until iio_release_direct_mode() is called.
+
+iio_device_release_direct_mode()
+        Release the claim. Device is no longer guaranteed to stay
+        in direct mode.
+
+	Signed-off-by: Alison Schofield <amsfield22@gmail.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 08a33805518e7845486f88287e8aace6f8439391)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/industrialio-core.c
+diff --cc drivers/iio/industrialio-core.c
+index 87201424abaf,2e768bc99f05..000000000000
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@@ -1162,8 -1313,107 +1163,108 @@@ void iio_device_unregister(struct iio_d
+  	iio_buffer_wakeup_poll(indio_dev);
+  
+  	mutex_unlock(&indio_dev->info_exist_lock);
+ -
+ -	iio_buffer_free_sysfs_and_mask(indio_dev);
+  }
+  EXPORT_SYMBOL(iio_device_unregister);
+++<<<<<<< HEAD
+++=======
++ 
++ static void devm_iio_device_unreg(struct device *dev, void *res)
++ {
++ 	iio_device_unregister(*(struct iio_dev **)res);
++ }
++ 
++ /**
++  * devm_iio_device_register - Resource-managed iio_device_register()
++  * @dev:	Device to allocate iio_dev for
++  * @indio_dev:	Device structure filled by the device driver
++  *
++  * Managed iio_device_register.  The IIO device registered with this
++  * function is automatically unregistered on driver detach. This function
++  * calls iio_device_register() internally. Refer to that function for more
++  * information.
++  *
++  * If an iio_dev registered with this function needs to be unregistered
++  * separately, devm_iio_device_unregister() must be used.
++  *
++  * RETURNS:
++  * 0 on success, negative error number on failure.
++  */
++ int devm_iio_device_register(struct device *dev, struct iio_dev *indio_dev)
++ {
++ 	struct iio_dev **ptr;
++ 	int ret;
++ 
++ 	ptr = devres_alloc(devm_iio_device_unreg, sizeof(*ptr), GFP_KERNEL);
++ 	if (!ptr)
++ 		return -ENOMEM;
++ 
++ 	*ptr = indio_dev;
++ 	ret = iio_device_register(indio_dev);
++ 	if (!ret)
++ 		devres_add(dev, ptr);
++ 	else
++ 		devres_free(ptr);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(devm_iio_device_register);
++ 
++ /**
++  * devm_iio_device_unregister - Resource-managed iio_device_unregister()
++  * @dev:	Device this iio_dev belongs to
++  * @indio_dev:	the iio_dev associated with the device
++  *
++  * Unregister iio_dev registered with devm_iio_device_register().
++  */
++ void devm_iio_device_unregister(struct device *dev, struct iio_dev *indio_dev)
++ {
++ 	int rc;
++ 
++ 	rc = devres_release(dev, devm_iio_device_unreg,
++ 			    devm_iio_device_match, indio_dev);
++ 	WARN_ON(rc);
++ }
++ EXPORT_SYMBOL_GPL(devm_iio_device_unregister);
++ 
++ /**
++  * iio_device_claim_direct_mode - Keep device in direct mode
++  * @indio_dev:	the iio_dev associated with the device
++  *
++  * If the device is in direct mode it is guaranteed to stay
++  * that way until iio_device_release_direct_mode() is called.
++  *
++  * Use with iio_device_release_direct_mode()
++  *
++  * Returns: 0 on success, -EBUSY on failure
++  */
++ int iio_device_claim_direct_mode(struct iio_dev *indio_dev)
++ {
++ 	mutex_lock(&indio_dev->mlock);
++ 
++ 	if (iio_buffer_enabled(indio_dev)) {
++ 		mutex_unlock(&indio_dev->mlock);
++ 		return -EBUSY;
++ 	}
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(iio_device_claim_direct_mode);
++ 
++ /**
++  * iio_device_release_direct_mode - releases claim on direct mode
++  * @indio_dev:	the iio_dev associated with the device
++  *
++  * Release the claim. Device is no longer guaranteed to stay
++  * in direct mode.
++  *
++  * Use with iio_device_claim_direct_mode()
++  */
++ void iio_device_release_direct_mode(struct iio_dev *indio_dev)
++ {
++ 	mutex_unlock(&indio_dev->mlock);
++ }
++ EXPORT_SYMBOL_GPL(iio_device_release_direct_mode);
++ 
+++>>>>>>> 08a33805518e (iio: core: implement iio_device_{claim|release}_direct_mode())
+  subsys_initcall(iio_init);
+  module_exit(iio_exit);
+  
+* Unmerged path drivers/iio/industrialio-core.c
+diff --git a/include/linux/iio/iio.h b/include/linux/iio/iio.h
+index 95115dd384d0..e5625aec5963 100644
+--- a/include/linux/iio/iio.h
++++ b/include/linux/iio/iio.h
+@@ -511,6 +511,8 @@ void iio_device_unregister(struct iio_dev *indio_dev);
+  * @timestamp:		When the event occurred
+  **/
+ int iio_push_event(struct iio_dev *indio_dev, u64 ev_code, s64 timestamp);
++int iio_device_claim_direct_mode(struct iio_dev *indio_dev);
++void iio_device_release_direct_mode(struct iio_dev *indio_dev);
+ 
+ extern struct bus_type iio_bus_type;
+ 
