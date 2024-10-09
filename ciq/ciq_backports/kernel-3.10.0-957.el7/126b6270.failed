@@ -1,0 +1,593 @@
+mmc: core: Remove code no longer needed after the switch to blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] core: Remove code no longer needed after the switch to blk-mq (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 96.06%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit 126b62700386da782f83579e9b0431ea76c2da3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/126b6270.failed
+
+Remove code no longer needed after the switch to blk-mq.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Tested-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 126b62700386da782f83579e9b0431ea76c2da3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/core.c
+#	drivers/mmc/core/core.h
+#	drivers/mmc/core/host.h
+diff --cc drivers/mmc/core/core.c
+index 78b80934af32,fd64e6d425e5..000000000000
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@@ -361,88 -361,8 +361,74 @@@ static int mmc_start_request(struct mmc
+  
+  	return 0;
+  }
+ -EXPORT_SYMBOL(mmc_start_request);
+ +
+ +/**
+ + *	mmc_start_bkops - start BKOPS for supported cards
+ + *	@card: MMC card to start BKOPS
+ + *	@form_exception: A flag to indicate if this function was
+ + *			 called due to an exception raised by the card
+ + *
+ + *	Start background operations whenever requested.
+ + *	When the urgent BKOPS bit is set in a R1 command response
+ + *	then background operations should be started immediately.
+ +*/
+ +void mmc_start_bkops(struct mmc_card *card, bool from_exception)
+ +{
+ +	int err;
+ +	int timeout;
+ +	bool use_busy_signal;
+ +
+ +	if (!card->ext_csd.man_bkops_en || mmc_card_doing_bkops(card))
+ +		return;
+ +
+ +	err = mmc_read_bkops_status(card);
+ +	if (err) {
+ +		pr_err("%s: Failed to read bkops status: %d\n",
+ +		       mmc_hostname(card->host), err);
+ +		return;
+ +	}
+ +
+ +	if (!card->ext_csd.raw_bkops_status)
+ +		return;
+ +
+ +	if (card->ext_csd.raw_bkops_status < EXT_CSD_BKOPS_LEVEL_2 &&
+ +	    from_exception)
+ +		return;
+ +
+ +	mmc_claim_host(card->host);
+ +	if (card->ext_csd.raw_bkops_status >= EXT_CSD_BKOPS_LEVEL_2) {
+ +		timeout = MMC_BKOPS_MAX_TIMEOUT;
+ +		use_busy_signal = true;
+ +	} else {
+ +		timeout = 0;
+ +		use_busy_signal = false;
+ +	}
+ +
+ +	mmc_retune_hold(card->host);
+ +
+ +	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+ +			EXT_CSD_BKOPS_START, 1, timeout, 0,
+ +			use_busy_signal, true, false);
+ +	if (err) {
+ +		pr_warn("%s: Error %d starting bkops\n",
+ +			mmc_hostname(card->host), err);
+ +		mmc_retune_release(card->host);
+ +		goto out;
+ +	}
+ +
+ +	/*
+ +	 * For urgent bkops status (LEVEL_2 and more)
+ +	 * bkops executed synchronously, otherwise
+ +	 * the operation is in progress
+ +	 */
+ +	if (!use_busy_signal)
+ +		mmc_card_set_doing_bkops(card);
+ +	else
+ +		mmc_retune_release(card->host);
+ +out:
+ +	mmc_release_host(card->host);
+ +}
+  
+- /*
+-  * mmc_wait_data_done() - done callback for data request
+-  * @mrq: done data request
+-  *
+-  * Wakes up mmc context, passed as a callback to host controller driver
+-  */
+- static void mmc_wait_data_done(struct mmc_request *mrq)
+- {
+- 	struct mmc_context_info *context_info = &mrq->host->context_info;
+- 
+- 	context_info->is_done_rcv = true;
+- 	wake_up_interruptible(&context_info->wait);
+- }
+- 
+  static void mmc_wait_done(struct mmc_request *mrq)
+  {
+  	complete(&mrq->completion);
+@@@ -601,139 -442,174 +558,139 @@@ void mmc_wait_for_req_done(struct mmc_h
+  }
+  EXPORT_SYMBOL(mmc_wait_for_req_done);
+  
+ -/*
+ - * mmc_cqe_start_req - Start a CQE request.
+ - * @host: MMC host to start the request
+ - * @mrq: request to start
+ +/**
+ + *	mmc_is_req_done - Determine if a 'cap_cmd_during_tfr' request is done
+ + *	@host: MMC host
+ + *	@mrq: MMC request
+   *
+ - * Start the request, re-tuning if needed and it is possible. Returns an error
+ - * code if the request fails to start or -EBUSY if CQE is busy.
+ + *	mmc_is_req_done() is used with requests that have
+ + *	mrq->cap_cmd_during_tfr = true. mmc_is_req_done() must be called after
+ + *	starting a request and before waiting for it to complete. That is,
+ + *	either in between calls to mmc_start_req(), or after mmc_wait_for_req()
+ + *	and before mmc_wait_for_req_done(). If it is called at other times the
+ + *	result is not meaningful.
+   */
+ -int mmc_cqe_start_req(struct mmc_host *host, struct mmc_request *mrq)
+ +bool mmc_is_req_done(struct mmc_host *host, struct mmc_request *mrq)
+  {
+- 	if (host->areq)
+- 		return host->context_info.is_done_rcv;
+- 	else
+- 		return completion_done(&mrq->completion);
+ -	int err;
+ -
+ -	/*
+ -	 * CQE cannot process re-tuning commands. Caller must hold retuning
+ -	 * while CQE is in use.  Re-tuning can happen here only when CQE has no
+ -	 * active requests i.e. this is the first.  Note, re-tuning will call
+ -	 * ->cqe_off().
+ -	 */
+ -	err = mmc_retune(host);
+ -	if (err)
+ -		goto out_err;
+ -
+ -	mrq->host = host;
+ -
+ -	mmc_mrq_pr_debug(host, mrq, true);
+ -
+ -	err = mmc_mrq_prep(host, mrq);
+ -	if (err)
+ -		goto out_err;
+ -
+ -	err = host->cqe_ops->cqe_request(host, mrq);
+ -	if (err)
+ -		goto out_err;
+ -
+ -	trace_mmc_request_start(host, mrq);
+ -
+ -	return 0;
+ -
+ -out_err:
+ -	if (mrq->cmd) {
+ -		pr_debug("%s: failed to start CQE direct CMD%u, error %d\n",
+ -			 mmc_hostname(host), mrq->cmd->opcode, err);
+ -	} else {
+ -		pr_debug("%s: failed to start CQE transfer for tag %d, error %d\n",
+ -			 mmc_hostname(host), mrq->tag, err);
+ -	}
+ -	return err;
+++	return completion_done(&mrq->completion);
+  }
+ -EXPORT_SYMBOL(mmc_cqe_start_req);
+ +EXPORT_SYMBOL(mmc_is_req_done);
+  
+  /**
+ - *	mmc_cqe_request_done - CQE has finished processing an MMC request
+ - *	@host: MMC host which completed request
+ - *	@mrq: MMC request which completed
+++<<<<<<< HEAD
+ + *	mmc_pre_req - Prepare for a new request
+ + *	@host: MMC host to prepare command
+ + *	@mrq: MMC request to prepare for
+   *
+ - *	CQE drivers should call this function when they have completed
+ - *	their processing of a request.
+ + *	mmc_pre_req() is called in prior to mmc_start_req() to let
+ + *	host prepare for the new request. Preparation of a request may be
+ + *	performed while another request is running on the host.
+   */
+ -void mmc_cqe_request_done(struct mmc_host *host, struct mmc_request *mrq)
+ +static void mmc_pre_req(struct mmc_host *host, struct mmc_request *mrq)
+  {
+ -	mmc_should_fail_request(host, mrq);
+ -
+ -	/* Flag re-tuning needed on CRC errors */
+ -	if ((mrq->cmd && mrq->cmd->error == -EILSEQ) ||
+ -	    (mrq->data && mrq->data->error == -EILSEQ))
+ -		mmc_retune_needed(host);
+ -
+ -	trace_mmc_request_done(host, mrq);
+ -
+ -	if (mrq->cmd) {
+ -		pr_debug("%s: CQE req done (direct CMD%u): %d\n",
+ -			 mmc_hostname(host), mrq->cmd->opcode, mrq->cmd->error);
+ -	} else {
+ -		pr_debug("%s: CQE transfer done tag %d\n",
+ -			 mmc_hostname(host), mrq->tag);
+ -	}
+ -
+ -	if (mrq->data) {
+ -		pr_debug("%s:     %d bytes transferred: %d\n",
+ -			 mmc_hostname(host),
+ -			 mrq->data->bytes_xfered, mrq->data->error);
+ -	}
+ -
+ -	mrq->done(mrq);
+ +	if (host->ops->pre_req)
+ +		host->ops->pre_req(host, mrq);
+  }
+ -EXPORT_SYMBOL(mmc_cqe_request_done);
+  
+  /**
+ - *	mmc_cqe_post_req - CQE post process of a completed MMC request
+ - *	@host: MMC host
+ - *	@mrq: MMC request to be processed
+ + *	mmc_post_req - Post process a completed request
+ + *	@host: MMC host to post process command
+ + *	@mrq: MMC request to post process for
+ + *	@err: Error, if non zero, clean up any resources made in pre_req
+ + *
+ + *	Let the host post process a completed request. Post processing of
+ + *	a request may be performed while another reuqest is running.
+   */
+ -void mmc_cqe_post_req(struct mmc_host *host, struct mmc_request *mrq)
+ +static void mmc_post_req(struct mmc_host *host, struct mmc_request *mrq,
+ +			 int err)
+  {
+ -	if (host->cqe_ops->cqe_post_req)
+ -		host->cqe_ops->cqe_post_req(host, mrq);
+ +	if (host->ops->post_req)
+ +		host->ops->post_req(host, mrq, err);
+  }
+ -EXPORT_SYMBOL(mmc_cqe_post_req);
+ -
+ -/* Arbitrary 1 second timeout */
+ -#define MMC_CQE_RECOVERY_TIMEOUT	1000
+  
+ -/*
+ - * mmc_cqe_recovery - Recover from CQE errors.
+ - * @host: MMC host to recover
+ +/**
+ + *	mmc_start_req - start a non-blocking request
+ + *	@host: MMC host to start command
+ + *	@areq: async request to start
+ + *	@error: out parameter returns 0 for success, otherwise non zero
+ + *
+ + *	Start a new MMC custom command request for a host.
+ + *	If there is on ongoing async request wait for completion
+ + *	of that request and start the new one and return.
+ + *	Does not wait for the new request to complete.
+   *
+ - * Recovery consists of stopping CQE, stopping eMMC, discarding the queue in
+ - * in eMMC, and discarding the queue in CQE. CQE must call
+ - * mmc_cqe_request_done() on all requests. An error is returned if the eMMC
+ - * fails to discard its queue.
+ + *      Returns the completed request, NULL in case of none completed.
+ + *	Wait for the an ongoing request (previoulsy started) to complete and
+ + *	return the completed request. If there is no ongoing request, NULL
+ + *	is returned without waiting. NULL is not an error condition.
+   */
+ -int mmc_cqe_recovery(struct mmc_host *host)
+ -{
+ -	struct mmc_command cmd;
+ -	int err;
+ +struct mmc_async_req *mmc_start_req(struct mmc_host *host,
+ +				    struct mmc_async_req *areq,
+ +				    enum mmc_blk_status *ret_stat)
+ +{
+ +	enum mmc_blk_status status = MMC_BLK_SUCCESS;
+ +	int start_err = 0;
+ +	struct mmc_async_req *data = host->areq;
+ +
+ +	/* Prepare a new request */
+ +	if (areq)
+ +		mmc_pre_req(host, areq->mrq);
+ +
+ +	if (host->areq) {
+ +		status = mmc_wait_for_data_req_done(host, host->areq->mrq);
+ +		if (status == MMC_BLK_NEW_REQUEST) {
+ +			if (ret_stat)
+ +				*ret_stat = status;
+ +			/*
+ +			 * The previous request was not completed,
+ +			 * nothing to return
+ +			 */
+ +			return NULL;
+ +		}
+ +		/*
+ +		 * Check BKOPS urgency for each R1 response
+ +		 */
+ +		if (host->card && mmc_card_mmc(host->card) &&
+ +		    ((mmc_resp_type(host->areq->mrq->cmd) == MMC_RSP_R1) ||
+ +		     (mmc_resp_type(host->areq->mrq->cmd) == MMC_RSP_R1B)) &&
+ +		    (host->areq->mrq->cmd->resp[0] & R1_EXCEPTION_EVENT)) {
+  
+ -	mmc_retune_hold_now(host);
+ +			/* Cancel the prepared request */
+ +			if (areq)
+ +				mmc_post_req(host, areq->mrq, -EINVAL);
+  
+ -	/*
+ -	 * Recovery is expected seldom, if at all, but it reduces performance,
+ -	 * so make sure it is not completely silent.
+ -	 */
+ -	pr_warn("%s: running CQE recovery\n", mmc_hostname(host));
+ -
+ -	host->cqe_ops->cqe_recovery_start(host);
+ -
+ -	memset(&cmd, 0, sizeof(cmd));
+ -	cmd.opcode       = MMC_STOP_TRANSMISSION,
+ -	cmd.flags        = MMC_RSP_R1B | MMC_CMD_AC,
+ -	cmd.flags       &= ~MMC_RSP_CRC; /* Ignore CRC */
+ -	cmd.busy_timeout = MMC_CQE_RECOVERY_TIMEOUT,
+ -	mmc_wait_for_cmd(host, &cmd, 0);
+ -
+ -	memset(&cmd, 0, sizeof(cmd));
+ -	cmd.opcode       = MMC_CMDQ_TASK_MGMT;
+ -	cmd.arg          = 1; /* Discard entire queue */
+ -	cmd.flags        = MMC_RSP_R1B | MMC_CMD_AC;
+ -	cmd.flags       &= ~MMC_RSP_CRC; /* Ignore CRC */
+ -	cmd.busy_timeout = MMC_CQE_RECOVERY_TIMEOUT,
+ -	err = mmc_wait_for_cmd(host, &cmd, 0);
+ +			mmc_start_bkops(host->card, true);
+  
+ -	host->cqe_ops->cqe_recovery_finish(host);
+ +			/* prepare the request again */
+ +			if (areq)
+ +				mmc_pre_req(host, areq->mrq);
+ +		}
+ +	}
+  
+ -	mmc_retune_release(host);
+ +	if (status == MMC_BLK_SUCCESS && areq)
+ +		start_err = __mmc_start_data_req(host, areq->mrq);
+  
+ -	return err;
+ -}
+ -EXPORT_SYMBOL(mmc_cqe_recovery);
+ +	if (host->areq)
+ +		mmc_post_req(host, host->areq->mrq, 0);
+  
+ -/**
+ - *	mmc_is_req_done - Determine if a 'cap_cmd_during_tfr' request is done
+ - *	@host: MMC host
+ - *	@mrq: MMC request
+ - *
+ - *	mmc_is_req_done() is used with requests that have
+ - *	mrq->cap_cmd_during_tfr = true. mmc_is_req_done() must be called after
+ - *	starting a request and before waiting for it to complete. That is,
+ - *	either in between calls to mmc_start_req(), or after mmc_wait_for_req()
+ - *	and before mmc_wait_for_req_done(). If it is called at other times the
+ - *	result is not meaningful.
+ - */
+ -bool mmc_is_req_done(struct mmc_host *host, struct mmc_request *mrq)
+ -{
+ -	return completion_done(&mrq->completion);
+ +	 /* Cancel a prepared request if it was not started. */
+ +	if ((status != MMC_BLK_SUCCESS || start_err) && areq)
+ +		mmc_post_req(host, areq->mrq, -EINVAL);
+ +
+ +	if (status != MMC_BLK_SUCCESS)
+ +		host->areq = NULL;
+ +	else
+ +		host->areq = areq;
+ +
+ +	if (ret_stat)
+ +		*ret_stat = status;
+ +	return data;
+  }
+ -EXPORT_SYMBOL(mmc_is_req_done);
+ +EXPORT_SYMBOL(mmc_start_req);
+  
+  /**
+++=======
+++>>>>>>> 126b62700386 (mmc: core: Remove code no longer needed after the switch to blk-mq)
+   *	mmc_wait_for_req - start a request and wait for completion
+   *	@host: MMC host to start command
+   *	@mrq: MMC request to start
+diff --cc drivers/mmc/core/core.h
+index 5ee561264292,d6303d69071b..000000000000
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@@ -97,5 -101,76 +95,80 @@@ static inline void mmc_register_pm_noti
+  static inline void mmc_unregister_pm_notifier(struct mmc_host *host) { }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ void mmc_wait_for_req_done(struct mmc_host *host, struct mmc_request *mrq);
++ bool mmc_is_req_done(struct mmc_host *host, struct mmc_request *mrq);
++ 
++ int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq);
++ 
++ int mmc_erase(struct mmc_card *card, unsigned int from, unsigned int nr,
++ 		unsigned int arg);
++ int mmc_can_erase(struct mmc_card *card);
++ int mmc_can_trim(struct mmc_card *card);
++ int mmc_can_discard(struct mmc_card *card);
++ int mmc_can_sanitize(struct mmc_card *card);
++ int mmc_can_secure_erase_trim(struct mmc_card *card);
++ int mmc_erase_group_aligned(struct mmc_card *card, unsigned int from,
++ 			unsigned int nr);
++ unsigned int mmc_calc_max_discard(struct mmc_card *card);
++ 
++ int mmc_set_blocklen(struct mmc_card *card, unsigned int blocklen);
++ int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
++ 			bool is_rel_write);
++ 
++ int __mmc_claim_host(struct mmc_host *host, struct mmc_ctx *ctx,
++ 		     atomic_t *abort);
++ void mmc_release_host(struct mmc_host *host);
++ void mmc_get_card(struct mmc_card *card, struct mmc_ctx *ctx);
++ void mmc_put_card(struct mmc_card *card, struct mmc_ctx *ctx);
++ 
++ /**
++  *	mmc_claim_host - exclusively claim a host
++  *	@host: mmc host to claim
++  *
++  *	Claim a host for a set of operations.
++  */
++ static inline void mmc_claim_host(struct mmc_host *host)
++ {
++ 	__mmc_claim_host(host, NULL, NULL);
++ }
++ 
++ int mmc_cqe_start_req(struct mmc_host *host, struct mmc_request *mrq);
++ void mmc_cqe_post_req(struct mmc_host *host, struct mmc_request *mrq);
++ int mmc_cqe_recovery(struct mmc_host *host);
++ 
++ /**
++  *	mmc_pre_req - Prepare for a new request
++  *	@host: MMC host to prepare command
++  *	@mrq: MMC request to prepare for
++  *
++  *	mmc_pre_req() is called in prior to mmc_start_req() to let
++  *	host prepare for the new request. Preparation of a request may be
++  *	performed while another request is running on the host.
++  */
++ static inline void mmc_pre_req(struct mmc_host *host, struct mmc_request *mrq)
++ {
++ 	if (host->ops->pre_req)
++ 		host->ops->pre_req(host, mrq);
++ }
++ 
++ /**
++  *	mmc_post_req - Post process a completed request
++  *	@host: MMC host to post process command
++  *	@mrq: MMC request to post process for
++  *	@err: Error, if non zero, clean up any resources made in pre_req
++  *
++  *	Let the host post process a completed request. Post processing of
++  *	a request may be performed while another request is running.
++  */
++ static inline void mmc_post_req(struct mmc_host *host, struct mmc_request *mrq,
++ 				int err)
++ {
++ 	if (host->ops->post_req)
++ 		host->ops->post_req(host, mrq, err);
++ }
++ 
+++>>>>>>> 126b62700386 (mmc: core: Remove code no longer needed after the switch to blk-mq)
+  #endif
+ +
+diff --cc drivers/mmc/core/host.h
+index 5e9a1293091b,06ec19b5bf9f..000000000000
+--- a/drivers/mmc/core/host.h
++++ b/drivers/mmc/core/host.h
+@@@ -18,9 -19,65 +18,69 @@@ void mmc_unregister_host_class(void)
+  void mmc_retune_enable(struct mmc_host *host);
+  void mmc_retune_disable(struct mmc_host *host);
+  void mmc_retune_hold(struct mmc_host *host);
+ +void mmc_retune_hold_now(struct mmc_host *host);
+  void mmc_retune_release(struct mmc_host *host);
+  int mmc_retune(struct mmc_host *host);
+++<<<<<<< HEAD
+++=======
++ void mmc_retune_pause(struct mmc_host *host);
++ void mmc_retune_unpause(struct mmc_host *host);
++ 
++ static inline void mmc_retune_hold_now(struct mmc_host *host)
++ {
++ 	host->retune_now = 0;
++ 	host->hold_retune += 1;
++ }
++ 
++ static inline void mmc_retune_recheck(struct mmc_host *host)
++ {
++ 	if (host->hold_retune <= 1)
++ 		host->retune_now = 1;
++ }
++ 
++ static inline int mmc_host_cmd23(struct mmc_host *host)
++ {
++ 	return host->caps & MMC_CAP_CMD23;
++ }
++ 
++ static inline bool mmc_host_done_complete(struct mmc_host *host)
++ {
++ 	return host->caps & MMC_CAP_DONE_COMPLETE;
++ }
++ 
++ static inline int mmc_boot_partition_access(struct mmc_host *host)
++ {
++ 	return !(host->caps2 & MMC_CAP2_BOOTPART_NOACC);
++ }
++ 
++ static inline int mmc_host_uhs(struct mmc_host *host)
++ {
++ 	return host->caps &
++ 		(MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25 |
++ 		 MMC_CAP_UHS_SDR50 | MMC_CAP_UHS_SDR104 |
++ 		 MMC_CAP_UHS_DDR50);
++ }
++ 
++ static inline bool mmc_card_hs200(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS200;
++ }
++ 
++ static inline bool mmc_card_ddr52(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_DDR52;
++ }
++ 
++ static inline bool mmc_card_hs400(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS400;
++ }
++ 
++ static inline bool mmc_card_hs400es(struct mmc_card *card)
++ {
++ 	return card->host->ios.enhanced_strobe;
++ }
+++>>>>>>> 126b62700386 (mmc: core: Remove code no longer needed after the switch to blk-mq)
+  
+  #endif
+  
+diff --git a/drivers/mmc/core/bus.c b/drivers/mmc/core/bus.c
+index 60ebe5b4500b..19cfbd6fd857 100644
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -349,8 +349,6 @@ int mmc_add_card(struct mmc_card *card)
+ #ifdef CONFIG_DEBUG_FS
+ 	mmc_add_card_debugfs(card);
+ #endif
+-	mmc_init_context_info(card->host);
+-
+ 	card->dev.of_node = mmc_of_find_child_device(card->host, 0);
+ 
+ 	device_enable_async_suspend(&card->dev);
+* Unmerged path drivers/mmc/core/core.c
+* Unmerged path drivers/mmc/core/core.h
+* Unmerged path drivers/mmc/core/host.h
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 3d6f7a820ea1..1e8511b85150 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -372,9 +372,6 @@ struct mmc_host {
+ 
+ 	struct dentry		*debugfs_root;
+ 
+-	struct mmc_async_req	*areq;		/* active async req */
+-	struct mmc_context_info	context_info;	/* async synchronization info */
+-
+ 	/* Ongoing data transfer that allows commands during transfer */
+ 	struct mmc_request	*ongoing_mrq;
+ 
