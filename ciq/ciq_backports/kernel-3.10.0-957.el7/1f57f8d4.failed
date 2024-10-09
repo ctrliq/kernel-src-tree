@@ -1,0 +1,136 @@
+blk-mq: don't queue more if we get a busy return
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 1f57f8d442f8017587eeebd8617913bfc3661d3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1f57f8d4.failed
+
+Some devices have different queue limits depending on the type of IO. A
+classic case is SATA NCQ, where some commands can queue, but others
+cannot. If we have NCQ commands inflight and encounter a non-queueable
+command, the driver returns busy. Currently we attempt to dispatch more
+from the scheduler, if we were able to queue some commands. But for the
+case where we ended up stopping due to BUSY, we should not attempt to
+retrieve more from the scheduler. If we do, we can get into a situation
+where we attempt to queue a non-queueable command, get BUSY, then
+successfully retrieve more commands from that scheduler and queue those.
+This can repeat forever, starving the non-queuable command indefinitely.
+
+Fix this by NOT attempting to pull more commands from the scheduler, if
+we get a BUSY return. This should also be more optimal in terms of
+letting requests stay in the scheduler for as long as possible, if we
+get a BUSY due to the regular out-of-tags condition.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1f57f8d442f8017587eeebd8617913bfc3661d3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index a8e551c0c631,d394cdd8d8c6..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -978,31 -1056,28 +978,39 @@@ static bool blk_mq_mark_tag_wait(struc
+  	 * queue.
+  	 */
+  	ret = blk_mq_get_driver_tag(rq, hctx, false);
+ -	if (!ret) {
+ -		spin_unlock(&this_hctx->lock);
+ -		return false;
+ -	}
+  
+ -	/*
+ -	 * We got a tag, remove ourselves from the wait queue to ensure
+ -	 * someone else gets the wakeup.
+ -	 */
+ -	spin_lock_irq(&ws->wait.lock);
+ -	list_del_init(&wait->entry);
+ -	spin_unlock_irq(&ws->wait.lock);
+ -	spin_unlock(&this_hctx->lock);
+ +	if (!shared_tags) {
+ +		/*
+ +		 * Don't clear RESTART here, someone else could have set it.
+ +		 * At most this will cost an extra queue run.
+ +		 */
+ +		return ret;
+ +	} else {
+ +		if (!ret) {
+ +			spin_unlock(&this_hctx->lock);
+ +			return false;
+ +		}
+  
+ -	return true;
+ +		/*
+ +		 * We got a tag, remove ourselves from the wait queue to ensure
+ +		 * someone else gets the wakeup.
+ +		 */
+ +		spin_lock_irq(&ws->wait.lock);
+ +		list_del_init(&wait->task_list);
+ +		spin_unlock_irq(&ws->wait.lock);
+ +		spin_unlock(&this_hctx->lock);
+ +		return true;
+ +	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define BLK_MQ_RESOURCE_DELAY	3		/* ms units */
++ 
++ /*
++  * Returns true if we did some work AND can potentially do more.
++  */
+++>>>>>>> 1f57f8d442f8 (blk-mq: don't queue more if we get a busy return)
+  bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+  			     bool got_budget)
+  {
+@@@ -1137,12 -1187,38 +1145,26 @@@
+  		 * a driver tag with an I/O scheduler attached. If our dispatch
+  		 * waitqueue is no longer active, ensure that we run the queue
+  		 * AFTER adding our entries back to the list.
+ -		 *
+ -		 * If no I/O scheduler has been configured it is possible that
+ -		 * the hardware queue got stopped and restarted before requests
+ -		 * were pushed back onto the dispatch list. Rerun the queue to
+ -		 * avoid starvation. Notes:
+ -		 * - blk_mq_run_hw_queue() checks whether or not a queue has
+ -		 *   been stopped before rerunning a queue.
+ -		 * - Some but not all block drivers stop a queue before
+ -		 *   returning BLK_STS_RESOURCE. Two exceptions are scsi-mq
+ -		 *   and dm-rq.
+ -		 *
+ -		 * If driver returns BLK_STS_RESOURCE and SCHED_RESTART
+ -		 * bit is set, run queue after a delay to avoid IO stalls
+ -		 * that could otherwise occur if the queue is idle.
+  		 */
+ -		needs_restart = blk_mq_sched_needs_restart(hctx);
+ -		if (!needs_restart ||
+ -		    (no_tag && list_empty_careful(&hctx->dispatch_wait.entry)))
+ +		if (!blk_mq_sched_needs_restart(hctx) ||
+ +		    (no_tag && list_empty_careful(&hctx->dispatch_wait.task_list)))
+  			blk_mq_run_hw_queue(hctx, true);
+++<<<<<<< HEAD
+++=======
++ 		else if (needs_restart && (ret == BLK_STS_RESOURCE))
++ 			blk_mq_delay_run_hw_queue(hctx, BLK_MQ_RESOURCE_DELAY);
++ 
++ 		return false;
+++>>>>>>> 1f57f8d442f8 (blk-mq: don't queue more if we get a busy return)
+  	}
+  
++ 	/*
++ 	 * If the host/device is unable to accept more work, inform the
++ 	 * caller of that.
++ 	 */
++ 	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
++ 		return false;
++ 
+  	return (queued + errors) != 0;
+  }
+  
+* Unmerged path block/blk-mq.c
