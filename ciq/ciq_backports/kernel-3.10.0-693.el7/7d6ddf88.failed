@@ -1,0 +1,138 @@
+NFS: Add an iocounter wait function for async RPC tasks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit 7d6ddf88c4db372689c8aa65ea652d0514d66c06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7d6ddf88.failed
+
+By sleeping on a new NFS Unlock-On-Close waitqueue, rpc tasks may wait for
+a lock context's iocounter to reach zero.  The rpc waitqueue is only woken
+when the open_context has the NFS_CONTEXT_UNLOCK flag set in order to
+mitigate spurious wake-ups for any iocounter reaching zero.
+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 7d6ddf88c4db372689c8aa65ea652d0514d66c06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pagelist.c
+diff --cc fs/nfs/pagelist.c
+index 959268ff943a,ad92b401326c..000000000000
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@@ -143,13 -96,41 +143,42 @@@ __nfs_iocounter_wait(struct nfs_io_coun
+   * Otherwise returns 0 once the io_count hits 0.
+   */
+  int
+ -nfs_iocounter_wait(struct nfs_lock_context *l_ctx)
+ +nfs_iocounter_wait(struct nfs_io_counter *c)
+  {
+ -	return wait_on_atomic_t(&l_ctx->io_count, nfs_wait_atomic_killable,
+ -			TASK_KILLABLE);
+ +	if (atomic_read(&c->io_count) == 0)
+ +		return 0;
+ +	return __nfs_iocounter_wait(c);
+  }
+  
++ /**
++  * nfs_async_iocounter_wait - wait on a rpc_waitqueue for I/O
++  * to complete
++  * @task: the rpc_task that should wait
++  * @l_ctx: nfs_lock_context with io_counter to check
++  *
++  * Returns true if there is outstanding I/O to wait on and the
++  * task has been put to sleep.
++  */
++ bool
++ nfs_async_iocounter_wait(struct rpc_task *task, struct nfs_lock_context *l_ctx)
++ {
++ 	struct inode *inode = d_inode(l_ctx->open_context->dentry);
++ 	bool ret = false;
++ 
++ 	if (atomic_read(&l_ctx->io_count) > 0) {
++ 		rpc_sleep_on(&NFS_SERVER(inode)->uoc_rpcwaitq, task, NULL);
++ 		ret = true;
++ 	}
++ 
++ 	if (atomic_read(&l_ctx->io_count) == 0) {
++ 		rpc_wake_up_queued_task(&NFS_SERVER(inode)->uoc_rpcwaitq, task);
++ 		ret = false;
++ 	}
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nfs_async_iocounter_wait);
++ 
+  /*
+   * nfs_page_group_lock - lock the head of the page group
+   * @req - request in group that is to be locked
+@@@ -431,7 -414,11 +460,15 @@@ static void nfs_clear_request(struct nf
+  		req->wb_page = NULL;
+  	}
+  	if (l_ctx != NULL) {
+++<<<<<<< HEAD
+ +		nfs_iocounter_dec(&l_ctx->io_count);
+++=======
++ 		if (atomic_dec_and_test(&l_ctx->io_count)) {
++ 			wake_up_atomic_t(&l_ctx->io_count);
++ 			if (test_bit(NFS_CONTEXT_UNLOCK, &ctx->flags))
++ 				rpc_wake_up(&NFS_SERVER(d_inode(ctx->dentry))->uoc_rpcwaitq);
++ 		}
+++>>>>>>> 7d6ddf88c4db (NFS: Add an iocounter wait function for async RPC tasks)
+  		nfs_put_lock_context(l_ctx);
+  		req->wb_lock_context = NULL;
+  	}
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 9560533d36c6..f94bcdf7438e 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -218,6 +218,7 @@ static void nfs_cb_idr_remove_locked(struct nfs_client *clp)
+ static void pnfs_init_server(struct nfs_server *server)
+ {
+ 	rpc_init_wait_queue(&server->roc_rpcwaitq, "pNFS ROC");
++	rpc_init_wait_queue(&server->uoc_rpcwaitq, "NFS UOC");
+ }
+ 
+ #else
+* Unmerged path fs/nfs/pagelist.c
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 50c488e64add..81604165bf1b 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -86,6 +86,7 @@ struct nfs_open_context {
+ #define NFS_CONTEXT_ERROR_WRITE		(0)
+ #define NFS_CONTEXT_RESEND_WRITES	(1)
+ #define NFS_CONTEXT_BAD			(2)
++#define NFS_CONTEXT_UNLOCK	(3)
+ 	int error;
+ 
+ 	struct list_head list;
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index 2469ab0bb3a1..2ce25e80367f 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -218,6 +218,7 @@ struct nfs_server {
+ 	u32			mountd_version;
+ 	unsigned short		mountd_port;
+ 	unsigned short		mountd_protocol;
++	struct rpc_wait_queue	uoc_rpcwaitq;
+ };
+ 
+ /* Server capabilities */
+diff --git a/include/linux/nfs_page.h b/include/linux/nfs_page.h
+index f2f650f136ee..d31c561b1ae1 100644
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@ -141,6 +141,7 @@ extern int nfs_page_group_lock(struct nfs_page *, bool);
+ extern void nfs_page_group_lock_wait(struct nfs_page *);
+ extern void nfs_page_group_unlock(struct nfs_page *);
+ extern bool nfs_page_group_sync_on_bit(struct nfs_page *, unsigned int);
++extern bool nfs_async_iocounter_wait(struct rpc_task *, struct nfs_lock_context *);
+ 
+ /*
+  * Lock the page of an asynchronous request
