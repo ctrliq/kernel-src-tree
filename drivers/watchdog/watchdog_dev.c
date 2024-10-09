@@ -407,6 +407,7 @@ static ssize_t watchdog_write(struct file *file, const char __user *data,
 	struct watchdog_device *wdd = file->private_data;
 	size_t i;
 	char c;
+	int err;
 
 	if (len == 0)
 		return 0;
@@ -426,7 +427,9 @@ static ssize_t watchdog_write(struct file *file, const char __user *data,
 	}
 
 	/* someone wrote to us, so we send the watchdog a keepalive ping */
-	watchdog_ping(wdd);
+	err = watchdog_ping(wdd);
+	if (err < 0)
+		return err;
 
 	return len;
 }
@@ -482,8 +485,7 @@ static long watchdog_ioctl(struct file *file, unsigned int cmd,
 	case WDIOC_KEEPALIVE:
 		if (!(wdd->info->options & WDIOF_KEEPALIVEPING))
 			return -EOPNOTSUPP;
-		watchdog_ping(wdd);
-		return 0;
+		return watchdog_ping(wdd);
 	case WDIOC_SETTIMEOUT:
 		if (get_user(val, p))
 			return -EFAULT;
@@ -493,7 +495,9 @@ static long watchdog_ioctl(struct file *file, unsigned int cmd,
 		/* If the watchdog is active then we send a keepalive ping
 		 * to make sure that the watchdog keep's running (and if
 		 * possible that it takes the new timeout) */
-		watchdog_ping(wdd);
+		err = watchdog_ping(wdd);
+		if (err < 0)
+			return err;
 		/* Fall */
 	case WDIOC_GETTIMEOUT:
 		/* timeout == 0 means that we don't know the timeout */
