@@ -1,0 +1,128 @@
+nvme-loop: init nvmet_ctrl fatal_err_work when allocate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Yufen Yu <yuyufen@huawei.com>
+commit d11de63f2b519f0a162b834013b6d3a46dbf3886
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/d11de63f.failed
+
+After commit 4d43d395fe (workqueue: Try to catch flush_work() without
+INIT_WORK()), it can cause warning when delete nvme-loop device, trace
+like:
+
+[   76.601272] Call Trace:
+[   76.601646]  ? del_timer+0x72/0xa0
+[   76.602156]  __cancel_work_timer+0x1ae/0x270
+[   76.602791]  cancel_work_sync+0x14/0x20
+[   76.603407]  nvmet_ctrl_free+0x1b7/0x2f0 [nvmet]
+[   76.604091]  ? free_percpu+0x168/0x300
+[   76.604652]  nvmet_sq_destroy+0x106/0x240 [nvmet]
+[   76.605346]  nvme_loop_destroy_admin_queue+0x30/0x60 [nvme_loop]
+[   76.606220]  nvme_loop_shutdown_ctrl+0xc3/0xf0 [nvme_loop]
+[   76.607026]  nvme_loop_delete_ctrl_host+0x19/0x30 [nvme_loop]
+[   76.607871]  nvme_do_delete_ctrl+0x75/0xb0
+[   76.608477]  nvme_sysfs_delete+0x7d/0xc0
+[   76.609057]  dev_attr_store+0x24/0x40
+[   76.609603]  sysfs_kf_write+0x4c/0x60
+[   76.610144]  kernfs_fop_write+0x19a/0x260
+[   76.610742]  __vfs_write+0x1c/0x60
+[   76.611246]  vfs_write+0xfa/0x280
+[   76.611739]  ksys_write+0x6e/0x120
+[   76.612238]  __x64_sys_write+0x1e/0x30
+[   76.612787]  do_syscall_64+0xbf/0x3a0
+[   76.613329]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+We fix it by moving fatal_err_work init to nvmet_alloc_ctrl(), which may
+more reasonable.
+
+	Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d11de63f2b519f0a162b834013b6d3a46dbf3886)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/core.c
+diff --cc drivers/nvme/target/core.c
+index 49ac5c94123e,2d73b66e3686..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -792,30 -1132,46 +792,39 @@@ static bool __nvmet_host_allowed(struc
+  	return false;
+  }
+  
+ -/*
+ - * Note: ctrl->subsys->lock should be held when calling this function
+ - */
+ -static void nvmet_setup_p2p_ns_map(struct nvmet_ctrl *ctrl,
+ -		struct nvmet_req *req)
+ +static bool nvmet_host_discovery_allowed(struct nvmet_req *req,
+ +		const char *hostnqn)
+  {
+ -	struct nvmet_ns *ns;
+ +	struct nvmet_subsys_link *s;
+  
+ -	if (!req->p2p_client)
+ -		return;
+ -
+ -	ctrl->p2p_client = get_device(req->p2p_client);
+ +	list_for_each_entry(s, &req->port->subsystems, entry) {
+ +		if (__nvmet_host_allowed(s->subsys, hostnqn))
+ +			return true;
+ +	}
+  
+ -	list_for_each_entry_rcu(ns, &ctrl->subsys->namespaces, dev_link)
+ -		nvmet_p2pmem_ns_add_p2p(ctrl, ns);
+ +	return false;
+  }
+  
+ -/*
+ - * Note: ctrl->subsys->lock should be held when calling this function
+ - */
+ -static void nvmet_release_p2p_ns_map(struct nvmet_ctrl *ctrl)
+ +bool nvmet_host_allowed(struct nvmet_req *req, struct nvmet_subsys *subsys,
+ +		const char *hostnqn)
+  {
+ -	struct radix_tree_iter iter;
+ -	void __rcu **slot;
+ -
+ -	radix_tree_for_each_slot(slot, &ctrl->p2p_ns_map, &iter, 0)
+ -		pci_dev_put(radix_tree_deref_slot(slot));
+ +	lockdep_assert_held(&nvmet_config_sem);
+  
+ -	put_device(ctrl->p2p_client);
+ +	if (subsys->type == NVME_NQN_DISC)
+ +		return nvmet_host_discovery_allowed(req, hostnqn);
+ +	else
+ +		return __nvmet_host_allowed(subsys, hostnqn);
+  }
+  
++ static void nvmet_fatal_error_handler(struct work_struct *work)
++ {
++ 	struct nvmet_ctrl *ctrl =
++ 			container_of(work, struct nvmet_ctrl, fatal_err_work);
++ 
++ 	pr_err("ctrl %d fatal error occurred!\n", ctrl->cntlid);
++ 	ctrl->ops->delete_ctrl(ctrl);
++ }
++ 
+  u16 nvmet_alloc_ctrl(const char *subsysnqn, const char *hostnqn,
+  		struct nvmet_req *req, u32 kato, struct nvmet_ctrl **ctrlp)
+  {
+@@@ -857,6 -1213,8 +866,11 @@@
+  
+  	INIT_WORK(&ctrl->async_event_work, nvmet_async_event_work);
+  	INIT_LIST_HEAD(&ctrl->async_events);
+++<<<<<<< HEAD
+++=======
++ 	INIT_RADIX_TREE(&ctrl->p2p_ns_map, GFP_KERNEL);
++ 	INIT_WORK(&ctrl->fatal_err_work, nvmet_fatal_error_handler);
+++>>>>>>> d11de63f2b51 (nvme-loop: init nvmet_ctrl fatal_err_work when allocate)
+  
+  	memcpy(ctrl->subsysnqn, subsysnqn, NVMF_NQN_SIZE);
+  	memcpy(ctrl->hostnqn, hostnqn, NVMF_NQN_SIZE);
+* Unmerged path drivers/nvme/target/core.c
