@@ -1,0 +1,228 @@
+ixgbe: add AF_XDP zero-copy Tx support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit 8221c5eba8c13831d80860f6e0016d5c075695fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8221c5eb.failed
+
+This patch adds zero-copy Tx support for AF_XDP sockets. It implements
+the ndo_xsk_async_xmit netdev ndo and performs all the Tx logic from a
+NAPI context. This means pulling egress packets from the Tx ring,
+placing the frames on the NIC HW descriptor ring and completing sent
+frames back to the application via the completion ring.
+
+The regular XDP Tx ring is used for AF_XDP as well. This rationale for
+this is as follows: XDP_REDIRECT guarantees mutual exclusion between
+different NAPI contexts based on CPU id. In other words, a netdev can
+XDP_REDIRECT to another netdev with a different NAPI context, since
+the operation is bound to a specific core and each core has its own
+hardware ring.
+
+As the AF_XDP Tx action is running in the same NAPI context and using
+the same ring, it will also be protected from XDP_REDIRECT actions
+with the exact same mechanism.
+
+As with AF_XDP Rx, all AF_XDP Tx specific functions are added to
+ixgbe_xsk.c.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Tested-by: William Tu <u9012063@gmail.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 8221c5eba8c13831d80860f6e0016d5c075695fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_txrx_common.h
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 7dcb8ca7aac8,45fd670d35a6..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -10199,14 -10355,169 +10213,20 @@@ static const struct net_device_ops ixgb
+  	.ndo_fdb_add		= ixgbe_ndo_fdb_add,
+  	.ndo_bridge_setlink	= ixgbe_ndo_bridge_setlink,
+  	.ndo_bridge_getlink	= ixgbe_ndo_bridge_getlink,
+ -	.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ -	.ndo_dfwd_del_station	= ixgbe_fwd_del,
+ -	.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ -	.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_add	= ixgbe_add_udp_tunnel_port,
+ +	.extended.ndo_udp_tunnel_del	= ixgbe_del_udp_tunnel_port,
+  	.ndo_features_check	= ixgbe_features_check,
+++<<<<<<< HEAD
+ +	.extended.ndo_dfwd_add_station	= ixgbe_fwd_add,
+ +	.extended.ndo_dfwd_del_station	= ixgbe_fwd_del,
+ +	.extended.ndo_bpf	= ixgbe_xdp,
+++=======
++ 	.ndo_bpf		= ixgbe_xdp,
++ 	.ndo_xdp_xmit		= ixgbe_xdp_xmit,
++ 	.ndo_xsk_async_xmit	= ixgbe_xsk_async_xmit,
+++>>>>>>> 8221c5eba8c1 (ixgbe: add AF_XDP zero-copy Tx support)
+  };
+  
+ -static void ixgbe_disable_txr_hw(struct ixgbe_adapter *adapter,
+ -				 struct ixgbe_ring *tx_ring)
+ -{
+ -	unsigned long wait_delay, delay_interval;
+ -	struct ixgbe_hw *hw = &adapter->hw;
+ -	u8 reg_idx = tx_ring->reg_idx;
+ -	int wait_loop;
+ -	u32 txdctl;
+ -
+ -	IXGBE_WRITE_REG(hw, IXGBE_TXDCTL(reg_idx), IXGBE_TXDCTL_SWFLSH);
+ -
+ -	/* delay mechanism from ixgbe_disable_tx */
+ -	delay_interval = ixgbe_get_completion_timeout(adapter) / 100;
+ -
+ -	wait_loop = IXGBE_MAX_RX_DESC_POLL;
+ -	wait_delay = delay_interval;
+ -
+ -	while (wait_loop--) {
+ -		usleep_range(wait_delay, wait_delay + 10);
+ -		wait_delay += delay_interval * 2;
+ -		txdctl = IXGBE_READ_REG(hw, IXGBE_TXDCTL(reg_idx));
+ -
+ -		if (!(txdctl & IXGBE_TXDCTL_ENABLE))
+ -			return;
+ -	}
+ -
+ -	e_err(drv, "TXDCTL.ENABLE not cleared within the polling period\n");
+ -}
+ -
+ -static void ixgbe_disable_txr(struct ixgbe_adapter *adapter,
+ -			      struct ixgbe_ring *tx_ring)
+ -{
+ -	set_bit(__IXGBE_TX_DISABLED, &tx_ring->state);
+ -	ixgbe_disable_txr_hw(adapter, tx_ring);
+ -}
+ -
+ -static void ixgbe_disable_rxr_hw(struct ixgbe_adapter *adapter,
+ -				 struct ixgbe_ring *rx_ring)
+ -{
+ -	unsigned long wait_delay, delay_interval;
+ -	struct ixgbe_hw *hw = &adapter->hw;
+ -	u8 reg_idx = rx_ring->reg_idx;
+ -	int wait_loop;
+ -	u32 rxdctl;
+ -
+ -	rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg_idx));
+ -	rxdctl &= ~IXGBE_RXDCTL_ENABLE;
+ -	rxdctl |= IXGBE_RXDCTL_SWFLSH;
+ -
+ -	/* write value back with RXDCTL.ENABLE bit cleared */
+ -	IXGBE_WRITE_REG(hw, IXGBE_RXDCTL(reg_idx), rxdctl);
+ -
+ -	/* RXDCTL.EN may not change on 82598 if link is down, so skip it */
+ -	if (hw->mac.type == ixgbe_mac_82598EB &&
+ -	    !(IXGBE_READ_REG(hw, IXGBE_LINKS) & IXGBE_LINKS_UP))
+ -		return;
+ -
+ -	/* delay mechanism from ixgbe_disable_rx */
+ -	delay_interval = ixgbe_get_completion_timeout(adapter) / 100;
+ -
+ -	wait_loop = IXGBE_MAX_RX_DESC_POLL;
+ -	wait_delay = delay_interval;
+ -
+ -	while (wait_loop--) {
+ -		usleep_range(wait_delay, wait_delay + 10);
+ -		wait_delay += delay_interval * 2;
+ -		rxdctl = IXGBE_READ_REG(hw, IXGBE_RXDCTL(reg_idx));
+ -
+ -		if (!(rxdctl & IXGBE_RXDCTL_ENABLE))
+ -			return;
+ -	}
+ -
+ -	e_err(drv, "RXDCTL.ENABLE not cleared within the polling period\n");
+ -}
+ -
+ -static void ixgbe_reset_txr_stats(struct ixgbe_ring *tx_ring)
+ -{
+ -	memset(&tx_ring->stats, 0, sizeof(tx_ring->stats));
+ -	memset(&tx_ring->tx_stats, 0, sizeof(tx_ring->tx_stats));
+ -}
+ -
+ -static void ixgbe_reset_rxr_stats(struct ixgbe_ring *rx_ring)
+ -{
+ -	memset(&rx_ring->stats, 0, sizeof(rx_ring->stats));
+ -	memset(&rx_ring->rx_stats, 0, sizeof(rx_ring->rx_stats));
+ -}
+ -
+ -/**
+ - * ixgbe_txrx_ring_disable - Disable Rx/Tx/XDP Tx rings
+ - * @adapter: adapter structure
+ - * @ring: ring index
+ - *
+ - * This function disables a certain Rx/Tx/XDP Tx ring. The function
+ - * assumes that the netdev is running.
+ - **/
+ -void ixgbe_txrx_ring_disable(struct ixgbe_adapter *adapter, int ring)
+ -{
+ -	struct ixgbe_ring *rx_ring, *tx_ring, *xdp_ring;
+ -
+ -	rx_ring = adapter->rx_ring[ring];
+ -	tx_ring = adapter->tx_ring[ring];
+ -	xdp_ring = adapter->xdp_ring[ring];
+ -
+ -	ixgbe_disable_txr(adapter, tx_ring);
+ -	if (xdp_ring)
+ -		ixgbe_disable_txr(adapter, xdp_ring);
+ -	ixgbe_disable_rxr_hw(adapter, rx_ring);
+ -
+ -	if (xdp_ring)
+ -		synchronize_sched();
+ -
+ -	/* Rx/Tx/XDP Tx share the same napi context. */
+ -	napi_disable(&rx_ring->q_vector->napi);
+ -
+ -	ixgbe_clean_tx_ring(tx_ring);
+ -	if (xdp_ring)
+ -		ixgbe_clean_tx_ring(xdp_ring);
+ -	ixgbe_clean_rx_ring(rx_ring);
+ -
+ -	ixgbe_reset_txr_stats(tx_ring);
+ -	if (xdp_ring)
+ -		ixgbe_reset_txr_stats(xdp_ring);
+ -	ixgbe_reset_rxr_stats(rx_ring);
+ -}
+ -
+ -/**
+ - * ixgbe_txrx_ring_enable - Enable Rx/Tx/XDP Tx rings
+ - * @adapter: adapter structure
+ - * @ring: ring index
+ - *
+ - * This function enables a certain Rx/Tx/XDP Tx ring. The function
+ - * assumes that the netdev is running.
+ - **/
+ -void ixgbe_txrx_ring_enable(struct ixgbe_adapter *adapter, int ring)
+ -{
+ -	struct ixgbe_ring *rx_ring, *tx_ring, *xdp_ring;
+ -
+ -	rx_ring = adapter->rx_ring[ring];
+ -	tx_ring = adapter->tx_ring[ring];
+ -	xdp_ring = adapter->xdp_ring[ring];
+ -
+ -	/* Rx/Tx/XDP Tx share the same napi context. */
+ -	napi_enable(&rx_ring->q_vector->napi);
+ -
+ -	ixgbe_configure_tx_ring(adapter, tx_ring);
+ -	if (xdp_ring)
+ -		ixgbe_configure_tx_ring(adapter, xdp_ring);
+ -	ixgbe_configure_rx_ring(adapter, rx_ring);
+ -
+ -	clear_bit(__IXGBE_TX_DISABLED, &tx_ring->state);
+ -	clear_bit(__IXGBE_TX_DISABLED, &xdp_ring->state);
+ -}
+ -
+  /**
+   * ixgbe_enumerate_functions - Get the number of ports this device has
+   * @adapter: adapter structure
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_txrx_common.h
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_txrx_common.h
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
