@@ -1,0 +1,144 @@
+dax: remove DAX code from page_cache_tree_insert()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit d01ad197ac3b50a99ea668697acefe12e73c5fea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d01ad197.failed
+
+Now that we no longer insert struct page pointers in DAX radix trees we
+can remove the special casing for DAX in page_cache_tree_insert().
+
+This also allows us to make dax_wake_mapping_entry_waiter() local to
+fs/dax.c, removing it from dax.h.
+
+Link: http://lkml.kernel.org/r/20170724170616.25810-5-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Suggested-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d01ad197ac3b50a99ea668697acefe12e73c5fea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	mm/filemap.c
+diff --cc fs/dax.c
+index 679214f8898b,8f70e3b59b91..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -141,6 -121,31 +141,34 @@@ static int wake_exceptional_entry_func(
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * We do not necessarily hold the mapping->tree_lock when we call this
++  * function so it is possible that 'entry' is no longer a valid item in the
++  * radix tree.  This is okay because all we really need to do is to find the
++  * correct waitqueue where tasks might be waiting for that old 'entry' and
++  * wake them.
++  */
++ static void dax_wake_mapping_entry_waiter(struct address_space *mapping,
++ 		pgoff_t index, void *entry, bool wake_all)
++ {
++ 	struct exceptional_entry_key key;
++ 	wait_queue_head_t *wq;
++ 
++ 	wq = dax_entry_waitqueue(mapping, index, entry, &key);
++ 
++ 	/*
++ 	 * Checking for locked entry and prepare_to_wait_exclusive() happens
++ 	 * under mapping->tree_lock, ditto for entry handling in our callers.
++ 	 * So at this point all tasks that could have seen our entry locked
++ 	 * must be in the waitqueue and the following check will see them.
++ 	 */
++ 	if (waitqueue_active(wq))
++ 		__wake_up(wq, TASK_NORMAL, wake_all ? 0 : 1, &key);
++ }
++ 
++ /*
+++>>>>>>> d01ad197ac3b (dax: remove DAX code from page_cache_tree_insert())
+   * Check whether the given slot is locked. The function must be called with
+   * mapping->tree_lock held
+   */
+diff --cc mm/filemap.c
+index da33af546761,dad935769055..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -127,38 -130,12 +127,43 @@@ static int page_cache_tree_insert(struc
+  			return -EEXIST;
+  
+  		mapping->nrexceptional--;
+++<<<<<<< HEAD
+ +		if (!dax_mapping(mapping)) {
+ +			if (shadowp)
+ +				*shadowp = p;
+ +			if (node)
+ +				workingset_node_shadows_dec(node);
+ +		} else {
+ +			/* DAX can replace empty locked entry with a hole */
+ +			WARN_ON_ONCE(p !=
+ +				dax_radix_locked_entry(0, RADIX_DAX_EMPTY));
+ +			/* DAX accounts exceptional entries as normal pages */
+ +			if (node)
+ +				workingset_node_pages_dec(node);
+ +			/* Wakeup waiters for exceptional entry lock */
+ +			dax_wake_mapping_entry_waiter(mapping, page->index, p,
+ +						      true);
+ +		}
+++=======
++ 		if (shadowp)
++ 			*shadowp = p;
+++>>>>>>> d01ad197ac3b (dax: remove DAX code from page_cache_tree_insert())
+  	}
+ -	__radix_tree_replace(&mapping->page_tree, node, slot, page,
+ -			     workingset_update_node, mapping);
+ +	radix_tree_replace_slot(slot, page);
+  	mapping->nrpages++;
+ +	if (node) {
+ +		workingset_node_pages_inc(node);
+ +		/*
+ +		 * Don't track node that contains actual pages.
+ +		 *
+ +		 * Avoid acquiring the list_lru lock if already
+ +		 * untracked.  The list_empty() test is safe as
+ +		 * node->private_list is protected by
+ +		 * mapping->tree_lock.
+ +		 */
+ +		if (!list_empty(&node->private_list))
+ +			workingset_forget_node(node);
+ +	}
+  	return 0;
+  }
+  
+* Unmerged path fs/dax.c
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index b7b81d6cc271..8bed1d1be688 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -95,8 +95,6 @@ int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ 				      pgoff_t index);
+-void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+-		pgoff_t index, void *entry, bool wake_all);
+ 
+ #ifdef CONFIG_FS_DAX
+ int __dax_zero_page_range(struct block_device *bdev,
+* Unmerged path mm/filemap.c
