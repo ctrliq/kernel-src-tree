@@ -1,0 +1,228 @@
+RDMA/rdma_cm: Delete rdma_addr_client
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit ee6548d1d98df7df3b9c8103a42cf68b31c29417
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ee6548d1.failed
+
+The only thing it does is block module unload while work is posted from
+rdma_resolve_ip().
+
+However, this is not the right place to do this. The users of
+rdma_resolve_ip() must ensure their own module does not unload until
+rdma_resolve_ip() calls the callback, or until rdma_addr_cancel() is
+called.
+
+Similarly callers to rdma_addr_find_l2_eth_by_grh() must ensure their
+module does not unload while they are calling code.
+
+The only two users are already safe, so there is no need for this.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit ee6548d1d98df7df3b9c8103a42cf68b31c29417)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+diff --cc drivers/infiniband/core/cma.c
+index 0ec7b04eb29b,48300838e354..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -4552,8 -4546,7 +4551,12 @@@ static int __init cma_init(void
+  		goto err_wq;
+  
+  	ib_sa_register_client(&sa_client);
+++<<<<<<< HEAD
+ +	rdma_addr_register_client(&addr_client);
+ +	register_netdevice_notifier_rh(&cma_nb);
+++=======
++ 	register_netdevice_notifier(&cma_nb);
+++>>>>>>> ee6548d1d98d (RDMA/rdma_cm: Delete rdma_addr_client)
+  
+  	ret = ib_register_client(&cma_client);
+  	if (ret)
+@@@ -4565,8 -4558,7 +4568,12 @@@
+  	return 0;
+  
+  err:
+++<<<<<<< HEAD
+ +	unregister_netdevice_notifier_rh(&cma_nb);
+ +	rdma_addr_unregister_client(&addr_client);
+++=======
++ 	unregister_netdevice_notifier(&cma_nb);
+++>>>>>>> ee6548d1d98d (RDMA/rdma_cm: Delete rdma_addr_client)
+  	ib_sa_unregister_client(&sa_client);
+  err_wq:
+  	destroy_workqueue(cma_wq);
+@@@ -4578,8 -4570,7 +4585,12 @@@ static void __exit cma_cleanup(void
+  	cma_configfs_exit();
+  	rdma_nl_unregister(RDMA_NL_RDMA_CM);
+  	ib_unregister_client(&cma_client);
+++<<<<<<< HEAD
+ +	unregister_netdevice_notifier_rh(&cma_nb);
+ +	rdma_addr_unregister_client(&addr_client);
+++=======
++ 	unregister_netdevice_notifier(&cma_nb);
+++>>>>>>> ee6548d1d98d (RDMA/rdma_cm: Delete rdma_addr_client)
+  	ib_sa_unregister_client(&sa_client);
+  	unregister_pernet_subsys(&cma_pernet_operations);
+  	destroy_workqueue(cma_wq);
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index c4f7ec52bc05..be074e5aba11 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -56,7 +56,6 @@ struct addr_req {
+ 	struct sockaddr_storage src_addr;
+ 	struct sockaddr_storage dst_addr;
+ 	struct rdma_dev_addr *addr;
+-	struct rdma_addr_client *client;
+ 	void *context;
+ 	void (*callback)(int status, struct sockaddr *src_addr,
+ 			 struct rdma_dev_addr *addr, void *context);
+@@ -220,28 +219,6 @@ int rdma_addr_size_kss(struct __kernel_sockaddr_storage *addr)
+ }
+ EXPORT_SYMBOL(rdma_addr_size_kss);
+ 
+-static struct rdma_addr_client self;
+-
+-void rdma_addr_register_client(struct rdma_addr_client *client)
+-{
+-	atomic_set(&client->refcount, 1);
+-	init_completion(&client->comp);
+-}
+-EXPORT_SYMBOL(rdma_addr_register_client);
+-
+-static inline void put_client(struct rdma_addr_client *client)
+-{
+-	if (atomic_dec_and_test(&client->refcount))
+-		complete(&client->comp);
+-}
+-
+-void rdma_addr_unregister_client(struct rdma_addr_client *client)
+-{
+-	put_client(client);
+-	wait_for_completion(&client->comp);
+-}
+-EXPORT_SYMBOL(rdma_addr_unregister_client);
+-
+ void rdma_copy_addr(struct rdma_dev_addr *dev_addr,
+ 		    const struct net_device *dev,
+ 		    const unsigned char *dst_dev_addr)
+@@ -605,14 +582,12 @@ static void process_one_req(struct work_struct *_work)
+ 		 */
+ 		cancel_delayed_work(&req->work);
+ 		list_del_init(&req->list);
+-		put_client(req->client);
+ 		kfree(req);
+ 	}
+ 	spin_unlock_bh(&lock);
+ }
+ 
+-int rdma_resolve_ip(struct rdma_addr_client *client,
+-		    struct sockaddr *src_addr, struct sockaddr *dst_addr,
++int rdma_resolve_ip(struct sockaddr *src_addr, struct sockaddr *dst_addr,
+ 		    struct rdma_dev_addr *addr, int timeout_ms,
+ 		    void (*callback)(int status, struct sockaddr *src_addr,
+ 				     struct rdma_dev_addr *addr, void *context),
+@@ -644,8 +619,6 @@ int rdma_resolve_ip(struct rdma_addr_client *client,
+ 	req->addr = addr;
+ 	req->callback = callback;
+ 	req->context = context;
+-	req->client = client;
+-	atomic_inc(&client->refcount);
+ 	INIT_DELAYED_WORK(&req->work, process_one_req);
+ 	req->seq = (u32)atomic_inc_return(&ib_nl_addr_request_seq);
+ 
+@@ -661,7 +634,6 @@ int rdma_resolve_ip(struct rdma_addr_client *client,
+ 		break;
+ 	default:
+ 		ret = req->status;
+-		atomic_dec(&client->refcount);
+ 		goto err;
+ 	}
+ 	return ret;
+@@ -722,7 +694,6 @@ void rdma_addr_cancel(struct rdma_dev_addr *addr)
+ 		found->callback(-ECANCELED, (struct sockaddr *)&found->src_addr,
+ 			      found->addr, found->context);
+ 
+-	put_client(found->client);
+ 	kfree(found);
+ }
+ EXPORT_SYMBOL(rdma_addr_cancel);
+@@ -761,8 +732,8 @@ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
+ 	dev_addr.net = &init_net;
+ 
+ 	init_completion(&ctx.comp);
+-	ret = rdma_resolve_ip(&self, &sgid_addr._sockaddr, &dgid_addr._sockaddr,
+-			&dev_addr, 1000, resolve_cb, &ctx);
++	ret = rdma_resolve_ip(&sgid_addr._sockaddr, &dgid_addr._sockaddr,
++			      &dev_addr, 1000, resolve_cb, &ctx);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -806,14 +777,13 @@ int addr_init(void)
+ 		return -ENOMEM;
+ 
+ 	register_netevent_notifier(&nb);
+-	rdma_addr_register_client(&self);
+ 
+ 	return 0;
+ }
+ 
+ void addr_cleanup(void)
+ {
+-	rdma_addr_unregister_client(&self);
+ 	unregister_netevent_notifier(&nb);
+ 	destroy_workqueue(addr_wq);
++	WARN_ON(!list_empty(&req_list));
+ }
+* Unmerged path drivers/infiniband/core/cma.c
+diff --git a/include/rdma/ib_addr.h b/include/rdma/ib_addr.h
+index a08cc7278980..c2c8b1fdeead 100644
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@ -49,22 +49,6 @@
+ #include <net/ipv6.h>
+ #include <net/net_namespace.h>
+ 
+-struct rdma_addr_client {
+-	atomic_t refcount;
+-	struct completion comp;
+-};
+-
+-/**
+- * rdma_addr_register_client - Register an address client.
+- */
+-void rdma_addr_register_client(struct rdma_addr_client *client);
+-
+-/**
+- * rdma_addr_unregister_client - Deregister an address client.
+- * @client: Client object to deregister.
+- */
+-void rdma_addr_unregister_client(struct rdma_addr_client *client);
+-
+ /**
+  * struct rdma_dev_addr - Contains resolved RDMA hardware addresses
+  * @src_dev_addr:	Source MAC address.
+@@ -99,7 +83,6 @@ int rdma_translate_ip(const struct sockaddr *addr,
+ /**
+  * rdma_resolve_ip - Resolve source and destination IP addresses to
+  *   RDMA hardware addresses.
+- * @client: Address client associated with request.
+  * @src_addr: An optional source address to use in the resolution.  If a
+  *   source address is not provided, a usable address will be returned via
+  *   the callback.
+@@ -112,8 +95,7 @@ int rdma_translate_ip(const struct sockaddr *addr,
+  *   or been canceled.  A status of 0 indicates success.
+  * @context: User-specified context associated with the call.
+  */
+-int rdma_resolve_ip(struct rdma_addr_client *client,
+-		    struct sockaddr *src_addr, struct sockaddr *dst_addr,
++int rdma_resolve_ip(struct sockaddr *src_addr, struct sockaddr *dst_addr,
+ 		    struct rdma_dev_addr *addr, int timeout_ms,
+ 		    void (*callback)(int status, struct sockaddr *src_addr,
+ 				     struct rdma_dev_addr *addr, void *context),
