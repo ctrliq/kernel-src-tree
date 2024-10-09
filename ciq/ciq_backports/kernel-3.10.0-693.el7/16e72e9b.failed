@@ -1,0 +1,413 @@
+powerpc: do not make the entire heap executable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] do not make the entire heap executable (Denys Vlasenko) [1330064]
+Rebuild_FUZZ: 89.41%
+commit-author Denys Vlasenko <dvlasenk@redhat.com>
+commit 16e72e9b30986ee15f17fbb68189ca842c32af58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/16e72e9b.failed
+
+On 32-bit powerpc the ELF PLT sections of binaries (built with
+--bss-plt, or with a toolchain which defaults to it) look like this:
+
+  [17] .sbss             NOBITS          0002aff8 01aff8 000014 00  WA  0   0  4
+  [18] .plt              NOBITS          0002b00c 01aff8 000084 00 WAX  0   0  4
+  [19] .bss              NOBITS          0002b090 01aff8 0000a4 00  WA  0   0  4
+
+Which results in an ELF load header:
+
+  Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align
+  LOAD           0x019c70 0x00029c70 0x00029c70 0x01388 0x014c4 RWE 0x10000
+
+This is all correct, the load region containing the PLT is marked as
+executable.  Note that the PLT starts at 0002b00c but the file mapping
+ends at 0002aff8, so the PLT falls in the 0 fill section described by
+the load header, and after a page boundary.
+
+Unfortunately the generic ELF loader ignores the X bit in the load
+headers when it creates the 0 filled non-file backed mappings.  It
+assumes all of these mappings are RW BSS sections, which is not the case
+for PPC.
+
+gcc/ld has an option (--secure-plt) to not do this, this is said to
+incur a small performance penalty.
+
+Currently, to support 32-bit binaries with PLT in BSS kernel maps
+*entire brk area* with executable rights for all binaries, even
+--secure-plt ones.
+
+Stop doing that.
+
+Teach the ELF loader to check the X bit in the relevant load header and
+create 0 filled anonymous mappings that are executable if the load
+header requests that.
+
+Test program showing the difference in /proc/$PID/maps:
+
+int main() {
+	char buf[16*1024];
+	char *p = malloc(123); /* make "[heap]" mapping appear */
+	int fd = open("/proc/self/maps", O_RDONLY);
+	int len = read(fd, buf, sizeof(buf));
+	write(1, buf, len);
+	printf("%p\n", p);
+	return 0;
+}
+
+Compiled using: gcc -mbss-plt -m32 -Os test.c -otest
+
+Unpatched ppc64 kernel:
+00100000-00120000 r-xp 00000000 00:00 0                                  [vdso]
+0fe10000-0ffd0000 r-xp 00000000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffd0000-0ffe0000 r--p 001b0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffe0000-0fff0000 rw-p 001c0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+10000000-10010000 r-xp 00000000 fd:00 100674505                          /home/user/test
+10010000-10020000 r--p 00000000 fd:00 100674505                          /home/user/test
+10020000-10030000 rw-p 00010000 fd:00 100674505                          /home/user/test
+10690000-106c0000 rwxp 00000000 00:00 0                                  [heap]
+f7f70000-f7fa0000 r-xp 00000000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7fa0000-f7fb0000 r--p 00020000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7fb0000-f7fc0000 rw-p 00030000 fd:00 67898089                           /usr/lib/ld-2.17.so
+ffa90000-ffac0000 rw-p 00000000 00:00 0                                  [stack]
+0x10690008
+
+Patched ppc64 kernel:
+00100000-00120000 r-xp 00000000 00:00 0                                  [vdso]
+0fe10000-0ffd0000 r-xp 00000000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffd0000-0ffe0000 r--p 001b0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+0ffe0000-0fff0000 rw-p 001c0000 fd:00 67898094                           /usr/lib/libc-2.17.so
+10000000-10010000 r-xp 00000000 fd:00 100674505                          /home/user/test
+10010000-10020000 r--p 00000000 fd:00 100674505                          /home/user/test
+10020000-10030000 rw-p 00010000 fd:00 100674505                          /home/user/test
+10180000-101b0000 rw-p 00000000 00:00 0                                  [heap]
+                  ^^^^ this has changed
+f7c60000-f7c90000 r-xp 00000000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7c90000-f7ca0000 r--p 00020000 fd:00 67898089                           /usr/lib/ld-2.17.so
+f7ca0000-f7cb0000 rw-p 00030000 fd:00 67898089                           /usr/lib/ld-2.17.so
+ff860000-ff890000 rw-p 00000000 00:00 0                                  [stack]
+0x10180008
+
+The patch was originally posted in 2012 by Jason Gunthorpe
+and apparently ignored:
+
+https://lkml.org/lkml/2012/9/30/138
+
+Lightly run-tested.
+
+Link: http://lkml.kernel.org/r/20161215131950.23054-1-dvlasenk@redhat.com
+	Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Signed-off-by: Denys Vlasenko <dvlasenk@redhat.com>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+	Tested-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Florian Weimer <fweimer@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 16e72e9b30986ee15f17fbb68189ca842c32af58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/binfmt_elf.c
+#	include/linux/mm.h
+#	mm/mmap.c
+diff --cc fs/binfmt_elf.c
+index 4b775dc44a97,443a6f537d56..000000000000
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@@ -90,10 -96,15 +90,22 @@@ static int set_brk(unsigned long start
+  	start = ELF_PAGEALIGN(start);
+  	end = ELF_PAGEALIGN(end);
+  	if (end > start) {
+++<<<<<<< HEAD
+ +		unsigned long addr;
+ +		addr = vm_brk(start, end - start);
+ +		if (BAD_ADDR(addr))
+ +			return addr;
+++=======
++ 		/*
++ 		 * Map the last of the bss segment.
++ 		 * If the header is requesting these pages to be
++ 		 * executable, honour that (ppc32 needs this).
++ 		 */
++ 		int error = vm_brk_flags(start, end - start,
++ 				prot & PROT_EXEC ? VM_EXEC : 0);
++ 		if (error)
++ 			return error;
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  	}
+  	current->mm->start_brk = current->mm->brk = end;
+  	return 0;
+@@@ -397,9 -530,10 +409,10 @@@ static unsigned long load_elf_interp(st
+  	unsigned long load_addr = 0;
+  	int load_addr_set = 0;
+  	unsigned long last_bss = 0, elf_bss = 0;
++ 	int bss_prot = 0;
+  	unsigned long error = ~0UL;
+  	unsigned long total_size;
+ -	int i;
+ +	int retval, i, size;
+  
+  	/* First of all, some simple consistency checks */
+  	if (interp_elf_ex->e_type != ET_EXEC &&
+@@@ -504,31 -612,36 +517,63 @@@
+  			 * Do the same thing for the memory mapping - between
+  			 * elf_bss and last_bss is the bss section.
+  			 */
+++<<<<<<< HEAD
+ +			k = load_addr + eppnt->p_memsz + eppnt->p_vaddr;
+ +			if (k > last_bss)
+++=======
++ 			k = load_addr + eppnt->p_vaddr + eppnt->p_memsz;
++ 			if (k > last_bss) {
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  				last_bss = k;
++ 				bss_prot = elf_prot;
++ 			}
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (last_bss > elf_bss) {
+ +		/*
+ +		 * Now fill out the bss section.  First pad the last page up
+ +		 * to the page boundary, and then perform a mmap to make sure
+ +		 * that there are zero-mapped pages up to and including the
+ +		 * last bss page.
+ +		 */
+ +		if (padzero(elf_bss)) {
+ +			error = -EFAULT;
+ +			goto out_close;
+ +		}
+ +
+ +		/* What we have mapped so far */
+ +		elf_bss = ELF_PAGESTART(elf_bss + ELF_MIN_ALIGN - 1);
+ +
+ +		/* Map the last of the bss segment */
+ +		error = vm_brk(elf_bss, last_bss - elf_bss);
+ +		if (BAD_ADDR(error))
+ +			goto out_close;
+++=======
++ 	/*
++ 	 * Now fill out the bss section: first pad the last page from
++ 	 * the file up to the page boundary, and zero it from elf_bss
++ 	 * up to the end of the page.
++ 	 */
++ 	if (padzero(elf_bss)) {
++ 		error = -EFAULT;
++ 		goto out;
++ 	}
++ 	/*
++ 	 * Next, align both the file and mem bss up to the page size,
++ 	 * since this is where elf_bss was just zeroed up to, and where
++ 	 * last_bss will end after the vm_brk_flags() below.
++ 	 */
++ 	elf_bss = ELF_PAGEALIGN(elf_bss);
++ 	last_bss = ELF_PAGEALIGN(last_bss);
++ 	/* Finally, if there is still more bss to allocate, do it. */
++ 	if (last_bss > elf_bss) {
++ 		error = vm_brk_flags(elf_bss, last_bss - elf_bss,
++ 				bss_prot & PROT_EXEC ? VM_EXEC : 0);
++ 		if (error)
++ 			goto out;
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  	}
+  
+  	error = load_addr;
+@@@ -575,10 -682,10 +620,11 @@@ static int load_elf_binary(struct linux
+  	int load_addr_set = 0;
+  	char * elf_interpreter = NULL;
+  	unsigned long error;
+ -	struct elf_phdr *elf_ppnt, *elf_phdata, *interp_elf_phdata = NULL;
+ +	struct elf_phdr *elf_ppnt, *elf_phdata;
+  	unsigned long elf_bss, elf_brk;
++ 	int bss_prot = 0;
+  	int retval, i;
+ +	unsigned int size;
+  	unsigned long elf_entry;
+  	unsigned long interp_load_addr = 0;
+  	unsigned long start_code, end_code, start_data, end_data;
+@@@ -765,11 -893,10 +811,17 @@@
+  			   before this one. Map anonymous pages, if needed,
+  			   and clear the area.  */
+  			retval = set_brk(elf_bss + load_bias,
+++<<<<<<< HEAD
+ +					 elf_brk + load_bias);
+ +			if (retval) {
+ +				send_sig(SIGKILL, current, 0);
+++=======
++ 					 elf_brk + load_bias,
++ 					 bss_prot);
++ 			if (retval)
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  				goto out_free_dentry;
+ +			}
+  			nbyte = ELF_PAGEOFFSET(elf_bss);
+  			if (nbyte) {
+  				nbyte = ELF_MIN_ALIGN - nbyte;
+@@@ -891,13 -1007,10 +945,18 @@@
+  	 * mapping in the interpreter, to make sure it doesn't wind
+  	 * up getting placed where the bss needs to go.
+  	 */
+++<<<<<<< HEAD
+ +	retval = set_brk(elf_bss, elf_brk);
+ +	if (retval) {
+ +		send_sig(SIGKILL, current, 0);
+++=======
++ 	retval = set_brk(elf_bss, elf_brk, bss_prot);
++ 	if (retval)
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  		goto out_free_dentry;
+ +	}
+  	if (likely(elf_bss != elf_brk) && unlikely(padzero(elf_bss))) {
+ +		send_sig(SIGSEGV, current, 0);
+  		retval = -EFAULT; /* Nobody gets to see this, but.. */
+  		goto out_free_dentry;
+  	}
+diff --cc include/linux/mm.h
+index 3c07f00eda8e,dae6f58d67c8..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -1932,9 -2082,10 +1932,14 @@@ static inline void mm_populate(unsigne
+  #endif
+  
+  /* These take the mm semaphore themselves */
+++<<<<<<< HEAD
+ +extern unsigned long vm_brk(unsigned long, unsigned long);
+++=======
++ extern int __must_check vm_brk(unsigned long, unsigned long);
++ extern int __must_check vm_brk_flags(unsigned long, unsigned long, unsigned long);
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  extern int vm_munmap(unsigned long, size_t);
+ -extern unsigned long __must_check vm_mmap(struct file *, unsigned long,
+ +extern unsigned long vm_mmap(struct file *, unsigned long,
+          unsigned long, unsigned long,
+          unsigned long, unsigned long);
+  
+diff --cc mm/mmap.c
+index 2cc2556c0b9f,b729084eea90..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -2663,37 -2806,33 +2663,49 @@@ static inline void verify_mm_writelocke
+   *  anonymous maps.  eventually we may be able to do some
+   *  brk-specific accounting here.
+   */
+++<<<<<<< HEAD
+ +static unsigned long do_brk(unsigned long addr, unsigned long len)
+ +{
+ +	struct mm_struct * mm = current->mm;
+ +	struct vm_area_struct * vma, * prev;
+ +	unsigned long flags;
+ +	struct rb_node ** rb_link, * rb_parent;
+++=======
++ static int do_brk_flags(unsigned long addr, unsigned long request, unsigned long flags)
++ {
++ 	struct mm_struct *mm = current->mm;
++ 	struct vm_area_struct *vma, *prev;
++ 	unsigned long len;
++ 	struct rb_node **rb_link, *rb_parent;
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  	pgoff_t pgoff = addr >> PAGE_SHIFT;
+  	int error;
+  
+ -	len = PAGE_ALIGN(request);
+ -	if (len < request)
+ -		return -ENOMEM;
+ +	len = PAGE_ALIGN(len);
+  	if (!len)
+ -		return 0;
+ +		return addr;
+  
+- 	flags = VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
++ 	/* Until we need other flags, refuse anything except VM_EXEC. */
++ 	if ((flags & (~VM_EXEC)) != 0)
++ 		return -EINVAL;
++ 	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+  
+  	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+ -	if (offset_in_page(error))
+ +	if (error & ~PAGE_MASK)
+  		return error;
+  
+ -	error = mlock_future_check(mm, mm->def_flags, len);
+ -	if (error)
+ -		return error;
+ +	/*
+ +	 * mlock MCL_FUTURE?
+ +	 */
+ +	if (mm->def_flags & VM_LOCKED) {
+ +		unsigned long locked, lock_limit;
+ +		locked = len >> PAGE_SHIFT;
+ +		locked += mm->locked_vm;
+ +		lock_limit = rlimit(RLIMIT_MEMLOCK);
+ +		lock_limit >>= PAGE_SHIFT;
+ +		if (locked > lock_limit && !capable(CAP_IPC_LOCK))
+ +			return -EAGAIN;
+ +	}
+  
+  	/*
+  	 * mm->mmap_sem is required to protect against another thread
+@@@ -2750,20 -2888,28 +2762,36 @@@ out
+  	if (flags & VM_LOCKED)
+  		mm->locked_vm += (len >> PAGE_SHIFT);
+  	vma->vm_flags |= VM_SOFTDIRTY;
+ -	return 0;
+ +	return addr;
+  }
+  
+++<<<<<<< HEAD
+ +unsigned long vm_brk(unsigned long addr, unsigned long len)
+++=======
++ static int do_brk(unsigned long addr, unsigned long len)
++ {
++ 	return do_brk_flags(addr, len, 0);
++ }
++ 
++ int vm_brk_flags(unsigned long addr, unsigned long len, unsigned long flags)
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  {
+  	struct mm_struct *mm = current->mm;
+ -	int ret;
+ +	unsigned long ret;
+  	bool populate;
+  
+++<<<<<<< HEAD
+ +	down_write(&mm->mmap_sem);
+ +	ret = do_brk(addr, len);
+++=======
++ 	if (down_write_killable(&mm->mmap_sem))
++ 		return -EINTR;
++ 
++ 	ret = do_brk_flags(addr, len, flags);
+++>>>>>>> 16e72e9b3098 (powerpc: do not make the entire heap executable)
+  	populate = ((mm->def_flags & VM_LOCKED) != 0);
+  	up_write(&mm->mmap_sem);
+ -	if (populate && !ret)
+ +	if (populate)
+  		mm_populate(addr, len);
+  	return ret;
+  }
+diff --git a/arch/powerpc/include/asm/page.h b/arch/powerpc/include/asm/page.h
+index 753c66206a15..f9c23c24f9f1 100644
+--- a/arch/powerpc/include/asm/page.h
++++ b/arch/powerpc/include/asm/page.h
+@@ -230,7 +230,9 @@ extern long long virt_phys_offset;
+  * and needs to be executable.  This means the whole heap ends
+  * up being executable.
+  */
+-#define VM_DATA_DEFAULT_FLAGS32	(VM_READ | VM_WRITE | VM_EXEC | \
++#define VM_DATA_DEFAULT_FLAGS32 \
++	(((current->personality & READ_IMPLIES_EXEC) ? VM_EXEC : 0) | \
++				 VM_READ | VM_WRITE | \
+ 				 VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
+ 
+ #define VM_DATA_DEFAULT_FLAGS64	(VM_READ | VM_WRITE | \
+* Unmerged path fs/binfmt_elf.c
+* Unmerged path include/linux/mm.h
+* Unmerged path mm/mmap.c
