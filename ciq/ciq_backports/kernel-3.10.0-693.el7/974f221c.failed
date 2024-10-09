@@ -1,0 +1,311 @@
+x86/boot: Move compressed kernel to the end of the decompression buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] boot: Move compressed kernel to the end of the decompression buffer (Baoquan He) [1290840]
+Rebuild_FUZZ: 97.10%
+commit-author Yinghai Lu <yinghai@kernel.org>
+commit 974f221c84b05b1dc2f5ea50dc16d2a9d1e95eda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/974f221c.failed
+
+This change makes later calculations about where the kernel is located
+easier to reason about. To better understand this change, we must first
+clarify what 'VO' and 'ZO' are. These values were introduced in commits
+by hpa:
+
+  77d1a4999502 ("x86, boot: make symbols from the main vmlinux available")
+  37ba7ab5e33c ("x86, boot: make kernel_alignment adjustable; new bzImage fields")
+
+Specifically:
+
+All names prefixed with 'VO_':
+
+ - relate to the uncompressed kernel image
+
+ - the size of the VO image is: VO__end-VO__text ("VO_INIT_SIZE" define)
+
+All names prefixed with 'ZO_':
+
+ - relate to the bootable compressed kernel image (boot/compressed/vmlinux),
+   which is composed of the following memory areas:
+     - head text
+     - compressed kernel (VO image and relocs table)
+     - decompressor code
+
+ - the size of the ZO image is: ZO__end - ZO_startup_32 ("ZO_INIT_SIZE" define, though see below)
+
+The 'INIT_SIZE' value is used to find the larger of the two image sizes:
+
+ #define ZO_INIT_SIZE    (ZO__end - ZO_startup_32 + ZO_z_extract_offset)
+ #define VO_INIT_SIZE    (VO__end - VO__text)
+
+ #if ZO_INIT_SIZE > VO_INIT_SIZE
+ # define INIT_SIZE ZO_INIT_SIZE
+ #else
+ # define INIT_SIZE VO_INIT_SIZE
+ #endif
+
+The current code uses extract_offset to decide where to position the
+copied ZO (i.e. ZO starts at extract_offset). (This is why ZO_INIT_SIZE
+currently includes the extract_offset.)
+
+Why does z_extract_offset exist? It's needed because we are trying to minimize
+the amount of RAM used for the whole act of creating an uncompressed, executable,
+properly relocation-linked kernel image in system memory. We do this so that
+kernels can be booted on even very small systems.
+
+To achieve the goal of minimal memory consumption we have implemented an in-place
+decompression strategy: instead of cleanly separating the VO and ZO images and
+also allocating some memory for the decompression code's runtime needs, we instead
+create this elaborate layout of memory buffers where the output (decompressed)
+stream, as it progresses, overlaps with and destroys the input (compressed)
+stream. This can only be done safely if the ZO image is placed to the end of the
+VO range, plus a certain amount of safety distance to make sure that when the last
+bytes of the VO range are decompressed, the compressed stream pointer is safely
+beyond the end of the VO range.
+
+z_extract_offset is calculated in arch/x86/boot/compressed/mkpiggy.c during
+the build process, at a point when we know the exact compressed and
+uncompressed size of the kernel images and can calculate this safe minimum
+offset value. (Note that the mkpiggy.c calculation is not perfect, because
+we don't know the decompressor used at that stage, so the z_extract_offset
+calculation is necessarily imprecise and is mostly based on gzip internals -
+we'll improve that in the next patch.)
+
+When INIT_SIZE is bigger than VO_INIT_SIZE (uncommon but possible),
+the copied ZO occupies the memory from extract_offset to the end of
+decompression buffer. It overlaps with the soon-to-be-uncompressed kernel
+like this:
+
+                            |-----compressed kernel image------|
+                            V                                  V
+0                       extract_offset                      +INIT_SIZE
+|-----------|---------------|-------------------------|--------|
+            |               |                         |        |
+          VO__text      startup_32 of ZO          VO__end    ZO__end
+            ^                                         ^
+            |-------uncompressed kernel image---------|
+
+When INIT_SIZE is equal to VO_INIT_SIZE (likely) there's still space
+left from end of ZO to the end of decompressing buffer, like below.
+
+                            |-compressed kernel image-|
+                            V                         V
+0                       extract_offset                      +INIT_SIZE
+|-----------|---------------|-------------------------|--------|
+            |               |                         |        |
+          VO__text      startup_32 of ZO          ZO__end    VO__end
+            ^                                                  ^
+            |------------uncompressed kernel image-------------|
+
+To simplify calculations and avoid special cases, it is cleaner to
+always place the compressed kernel image in memory so that ZO__end
+is at the end of the decompression buffer, instead of placing t at
+the start of extract_offset as is currently done.
+
+This patch adds BP_init_size (which is the INIT_SIZE as passed in from
+the boot_params) into asm-offsets.c to make it visible to the assembly
+code.
+
+Then when moving the ZO, it calculates the starting position of
+the copied ZO (via BP_init_size and the ZO run size) so that the VO__end
+will be at the end of the decompression buffer. To make the position
+calculation safe, the end of ZO is page aligned (and a comment is added
+to the existing VO alignment for good measure).
+
+	Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+[ Rewrote changelog and comments. ]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vivek Goyal <vgoyal@redhat.com>
+	Cc: lasse.collin@tukaani.org
+Link: http://lkml.kernel.org/r/1461888548-32439-3-git-send-email-keescook@chromium.org
+[ Rewrote the changelog some more. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 974f221c84b05b1dc2f5ea50dc16d2a9d1e95eda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/head_32.S
+#	arch/x86/boot/compressed/misc.c
+#	arch/x86/boot/compressed/mkpiggy.c
+diff --cc arch/x86/boot/compressed/head_32.S
+index fe4cda99cc30,8a95e2f845aa..000000000000
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@@ -141,12 -169,16 +141,14 @@@ preferred_addr
+  	addl    %eax, %ebx
+  	notl	%eax
+  	andl    %eax, %ebx
+ -	cmpl	$LOAD_PHYSICAL_ADDR, %ebx
+ -	jge	1f
+ -#endif
+ +#else
+  	movl	$LOAD_PHYSICAL_ADDR, %ebx
+ -1:
+ +#endif
+  
+  	/* Target address to relocate to for decompression */
+- 	addl	$z_extract_offset, %ebx
++ 	movl    BP_init_size(%esi), %eax
++ 	subl    $_end, %eax
++ 	addl    %eax, %ebx
+  
+  	/* Set up the stack */
+  	leal	boot_stack_end(%ebx), %esp
+@@@ -203,12 -235,18 +205,24 @@@ relocated
+  2:
+  
+  /*
+ - * Do the extraction, and jump to the new kernel..
+ + * Do the decompression, and jump to the new kernel..
+   */
+++<<<<<<< HEAD
+ +				/* push arguments for decompress_kernel: */
+ +	pushl	$z_output_len	/* decompressed length */
+ +	leal	z_extract_offset_negative(%ebx), %ebp
+++=======
++ 				/* push arguments for extract_kernel: */
++ 	pushl	$z_run_size	/* size of kernel with .bss and .brk */
++ 	pushl	$z_output_len	/* decompressed length, end of relocs */
++ 
++ 	movl    BP_init_size(%esi), %eax
++ 	subl    $_end, %eax
++ 	movl    %ebx, %ebp
++ 	subl    %eax, %ebp
+++>>>>>>> 974f221c84b0 (x86/boot: Move compressed kernel to the end of the decompression buffer)
+  	pushl	%ebp		/* output address */
++ 
+  	pushl	$z_input_len	/* input_len */
+  	leal	input_data(%ebx), %eax
+  	pushl	%eax		/* input_data */
+diff --cc arch/x86/boot/compressed/misc.c
+index 243fb14b38e2,4b4605e94b3c..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -368,7 -318,24 +368,28 @@@ static void parse_elf(void *output
+  	free(phdrs);
+  }
+  
+++<<<<<<< HEAD
+ +asmlinkage void decompress_kernel(void *rmode, memptr heap,
+++=======
++ /*
++  * The compressed kernel image (ZO), has been moved so that its position
++  * is against the end of the buffer used to hold the uncompressed kernel
++  * image (VO) and the execution environment (.bss, .brk), which makes sure
++  * there is room to do the in-place decompression. (See header.S for the
++  * calculations.)
++  *
++  *                             |-----compressed kernel image------|
++  *                             V                                  V
++  * 0                       extract_offset                      +INIT_SIZE
++  * |-----------|---------------|-------------------------|--------|
++  *             |               |                         |        |
++  *           VO__text      startup_32 of ZO          VO__end    ZO__end
++  *             ^                                         ^
++  *             |-------uncompressed kernel image---------|
++  *
++  */
++ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+++>>>>>>> 974f221c84b0 (x86/boot: Move compressed kernel to the end of the decompression buffer)
+  				  unsigned char *input_data,
+  				  unsigned long input_len,
+  				  unsigned char *output,
+diff --cc arch/x86/boot/compressed/mkpiggy.c
+index b669ab65bf6c,b980046c3329..000000000000
+--- a/arch/x86/boot/compressed/mkpiggy.c
++++ b/arch/x86/boot/compressed/mkpiggy.c
+@@@ -82,9 -85,8 +82,14 @@@ int main(int argc, char *argv[]
+  	printf("z_output_len = %lu\n", (unsigned long)olen);
+  	printf(".globl z_extract_offset\n");
+  	printf("z_extract_offset = 0x%lx\n", offs);
+++<<<<<<< HEAD
+ +	/* z_extract_offset_negative allows simplification of head_32.S */
+ +	printf(".globl z_extract_offset_negative\n");
+ +	printf("z_extract_offset_negative = -0x%lx\n", offs);
+++=======
++ 	printf(".globl z_run_size\n");
++ 	printf("z_run_size = %lu\n", run_size);
+++>>>>>>> 974f221c84b0 (x86/boot: Move compressed kernel to the end of the decompression buffer)
+  
+  	printf(".globl input_data, input_data_end\n");
+  	printf("input_data:\n");
+* Unmerged path arch/x86/boot/compressed/head_32.S
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index 8b77c1f2c468..74a0b86a677b 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -102,7 +102,9 @@ ENTRY(startup_32)
+ #endif
+ 
+ 	/* Target address to relocate to for decompression */
+-	addl	$z_extract_offset, %ebx
++	movl	BP_init_size(%esi), %eax
++	subl	$_end, %eax
++	addl	%eax, %ebx
+ 
+ /*
+  * Prepare for entering 64 bit mode
+@@ -328,7 +330,9 @@ preferred_addr:
+ #endif
+ 
+ 	/* Target address to relocate to for decompression */
+-	leaq	z_extract_offset(%rbp), %rbx
++	movl	BP_init_size(%rsi), %ebx
++	subl	$_end, %ebx
++	addq	%rbp, %rbx
+ 
+ 	/* Set up the stack */
+ 	leaq	boot_stack_end(%rbx), %rsp
+* Unmerged path arch/x86/boot/compressed/misc.c
+* Unmerged path arch/x86/boot/compressed/mkpiggy.c
+diff --git a/arch/x86/boot/compressed/vmlinux.lds.S b/arch/x86/boot/compressed/vmlinux.lds.S
+index 34d047c98284..e24e0a0c90c9 100644
+--- a/arch/x86/boot/compressed/vmlinux.lds.S
++++ b/arch/x86/boot/compressed/vmlinux.lds.S
+@@ -70,5 +70,6 @@ SECTIONS
+ 		_epgtable = . ;
+ 	}
+ #endif
++	. = ALIGN(PAGE_SIZE);	/* keep ZO size page aligned */
+ 	_end = .;
+ }
+diff --git a/arch/x86/kernel/asm-offsets.c b/arch/x86/kernel/asm-offsets.c
+index 28610822fb3c..604d012f0e9e 100644
+--- a/arch/x86/kernel/asm-offsets.c
++++ b/arch/x86/kernel/asm-offsets.c
+@@ -67,6 +67,7 @@ void common(void) {
+ 	OFFSET(BP_hardware_subarch, boot_params, hdr.hardware_subarch);
+ 	OFFSET(BP_version, boot_params, hdr.version);
+ 	OFFSET(BP_kernel_alignment, boot_params, hdr.kernel_alignment);
++	OFFSET(BP_init_size, boot_params, hdr.init_size);
+ 	OFFSET(BP_pref_address, boot_params, hdr.pref_address);
+ 	OFFSET(BP_code32_start, boot_params, hdr.code32_start);
+ 
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index 1db1dea92917..e16096069291 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -312,7 +312,7 @@ SECTIONS
+ 		__brk_limit = .;
+ 	}
+ 
+-	. = ALIGN(PAGE_SIZE);
++	. = ALIGN(PAGE_SIZE);		/* keep VO_INIT_SIZE page aligned */
+ 	_end = .;
+ 
+         STABS_DEBUG
