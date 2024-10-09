@@ -1,0 +1,197 @@
+sched: Cleanup bandwidth timers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.76.1.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 77a4d1a1b9a122ca1fa3507bd30aec1520d7a8a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.76.1.el7/77a4d1a1.failed
+
+Roman reported a 3 cpu lockup scenario involving __start_cfs_bandwidth().
+
+The more I look at that code the more I'm convinced its crack, that
+entire __start_cfs_bandwidth() thing is brain melting, we don't need to
+cancel a timer before starting it, *hrtimer_start*() will happily remove
+the timer for you if its still enqueued.
+
+Removing that, removes a big part of the problem, no more ugly cancel
+loop to get stuck in.
+
+So now, if I understand things right, the entire reason you have this
+cfs_b->lock guarded ->timer_active nonsense is to make sure we don't
+accidentally lose the timer.
+
+It appears to me that it should be possible to guarantee that same by
+unconditionally (re)starting the timer when !queued. Because regardless
+what hrtimer::function will return, if we beat it to (re)enqueue the
+timer, it doesn't matter.
+
+Now, because hrtimers don't come with any serialization guarantees we
+must ensure both handler and (re)start loop serialize their access to
+the hrtimer to avoid both trying to forward the timer at the same
+time.
+
+Update the rt bandwidth timer to match.
+
+This effectively reverts: 09dc4ab03936 ("sched/fair: Fix
+tg_set_cfs_bandwidth() deadlock on rq->lock").
+
+	Reported-by: Roman Gushchin <klamm@yandex-team.ru>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Ben Segall <bsegall@google.com>
+	Cc: Paul Turner <pjt@google.com>
+Link: http://lkml.kernel.org/r/20150415095011.804589208@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 77a4d1a1b9a122ca1fa3507bd30aec1520d7a8a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/fair.c
+index b64cbd08ab1b,e3b32ebfe421..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -3461,17 -3655,21 +3453,31 @@@ static void throttle_cfs_rq(struct cfs_
+  	cfs_rq->throttled = 1;
+  	cfs_rq->throttled_clock = rq_clock(rq);
+  	raw_spin_lock(&cfs_b->lock);
++ 	empty = list_empty(&cfs_rq->throttled_list);
++ 
+  	/*
+  	 * Add to the _head_ of the list, so that an already-started
+ -	 * distribute_cfs_runtime will not see us
+ +	 * distribute_cfs_runtime will not see us. If disribute_cfs_runtime is
+ +	 * not running add to the tail so that later runqueues don't get starved.
+  	 */
+++<<<<<<< HEAD
+ +	if (cfs_b->distribute_running)
+ +		list_add_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+ +	else
+ +		list_add_tail_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
+ +	if (!cfs_b->timer_active)
+ +		__start_cfs_bandwidth(cfs_b, false);
+++=======
++ 	list_add_rcu(&cfs_rq->throttled_list, &cfs_b->throttled_cfs_rq);
++ 
++ 	/*
++ 	 * If we're the first throttled task, make sure the bandwidth
++ 	 * timer is running.
++ 	 */
++ 	if (empty)
++ 		start_cfs_bandwidth(cfs_b);
++ 
+++>>>>>>> 77a4d1a1b9a1 (sched: Cleanup bandwidth timers)
+  	raw_spin_unlock(&cfs_b->lock);
+  }
+  
+@@@ -3833,10 -4001,8 +3832,9 @@@ static enum hrtimer_restart sched_cfs_p
+  {
+  	struct cfs_bandwidth *cfs_b =
+  		container_of(timer, struct cfs_bandwidth, period_timer);
+- 	ktime_t now;
+  	int overrun;
+  	int idle = 0;
+ +	int count = 0;
+  
+  	raw_spin_lock(&cfs_b->lock);
+  	for (;;) {
+diff --cc kernel/sched/sched.h
+index 1e3dd7ba098b,08606a1f8c4d..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -231,11 -212,10 +231,15 @@@ struct cfs_bandwidth 
+  	raw_spinlock_t lock;
+  	ktime_t period;
+  	u64 quota, runtime;
+ -	s64 hierarchical_quota;
+ -	u64 runtime_expires;
+ +	s64 hierarchal_quota;
+  
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(u64, runtime_expires)
+ +	int idle, timer_active;
+ +
+++=======
++ 	int idle;
+++>>>>>>> 77a4d1a1b9a1 (sched: Cleanup bandwidth timers)
+  	struct hrtimer period_timer, slack_timer;
+  	struct list_head throttled_cfs_rq;
+  
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 493c223f0ae0..8b1a54d1679d 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -110,10 +110,13 @@ EXPORT_SYMBOL(__smp_mb__after_atomic);
+ 
+ void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
+ {
+-	if (hrtimer_active(period_timer))
+-		return;
++	/*
++	 * Do not forward the expiration time of active timers;
++	 * we do not want to loose an overrun.
++	 */
++	if (!hrtimer_active(period_timer))
++		hrtimer_forward_now(period_timer, period);
+ 
+-	hrtimer_forward_now(period_timer, period);
+ 	hrtimer_start_expires(period_timer, HRTIMER_MODE_ABS_PINNED);
+ }
+ 
+@@ -9583,10 +9586,8 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ 
+ 	__refill_cfs_bandwidth_runtime(cfs_b);
+ 	/* restart the period timer (if active) to handle new period expiry */
+-	if (runtime_enabled && cfs_b->timer_active) {
+-		/* force a reprogram */
+-		__start_cfs_bandwidth(cfs_b, true);
+-	}
++	if (runtime_enabled)
++		start_cfs_bandwidth(cfs_b);
+ 	raw_spin_unlock_irq(&cfs_b->lock);
+ 
+ 	for_each_possible_cpu(i) {
+* Unmerged path kernel/sched/fair.c
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 9877967288fc..3a2ea017807b 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -17,19 +17,20 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
+ {
+ 	struct rt_bandwidth *rt_b =
+ 		container_of(timer, struct rt_bandwidth, rt_period_timer);
+-	ktime_t now;
+-	int overrun;
+ 	int idle = 0;
++	int overrun;
+ 
++	raw_spin_lock(&rt_b->rt_runtime_lock);
+ 	for (;;) {
+-		now = hrtimer_cb_get_time(timer);
+-		overrun = hrtimer_forward(timer, now, rt_b->rt_period);
+-
++		overrun = hrtimer_forward_now(timer, rt_b->rt_period);
+ 		if (!overrun)
+ 			break;
+ 
++		raw_spin_unlock(&rt_b->rt_runtime_lock);
+ 		idle = do_sched_rt_period_timer(rt_b, overrun);
++		raw_spin_lock(&rt_b->rt_runtime_lock);
+ 	}
++	raw_spin_unlock(&rt_b->rt_runtime_lock);
+ 
+ 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
+ }
+@@ -51,9 +52,6 @@ static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
+ 	if (!rt_bandwidth_enabled() || rt_b->rt_runtime == RUNTIME_INF)
+ 		return;
+ 
+-	if (hrtimer_active(&rt_b->rt_period_timer))
+-		return;
+-
+ 	raw_spin_lock(&rt_b->rt_runtime_lock);
+ 	start_bandwidth_timer(&rt_b->rt_period_timer, rt_b->rt_period);
+ 	raw_spin_unlock(&rt_b->rt_runtime_lock);
+* Unmerged path kernel/sched/sched.h
