@@ -1,0 +1,231 @@
+blk-mq: merge mq and sq make_request instances
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 254d259da0c3cb77f03a2adb8959c293f638a3d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/254d259d.failed
+
+They are mostly the same code anyway - this just one small conditional
+for the plug case that is different for both variants.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 254d259da0c3cb77f03a2adb8959c293f638a3d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index f1314e27e331,5a1ff4894285..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1381,19 -1472,14 +1381,23 @@@ static void blk_mq_try_issue_directly(s
+  	}
+  
+  insert:
+ -	blk_mq_sched_insert_request(rq, false, true, false, may_sleep);
+ +	blk_mq_insert_request(rq, false, true, true);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Multiple hardware queue variant. This will not use per-process plugs,
+ + * but will attempt to bypass the hctx queueing if we can go straight to
+ + * hardware for SYNC IO.
+ + */
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+++=======
++ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+++>>>>>>> 254d259da0c3 (blk-mq: merge mq and sq make_request instances)
+  {
+ -	const int is_sync = op_is_sync(bio->bi_opf);
+ -	const int is_flush_fua = op_is_flush(bio->bi_opf);
+ -	struct blk_mq_alloc_data data = { .flags = 0 };
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_map_ctx data;
+  	struct request *rq;
+  	unsigned int request_count = 0, srcu_idx;
+  	struct blk_plug *plug;
+@@@ -1421,13 -1526,36 +1425,46 @@@
+  	}
+  
+  	plug = current->plug;
+++<<<<<<< HEAD
+ +	/*
+ +	 * If the driver supports defer issued based on 'last', then
+ +	 * queue it up like normal since we can potentially save some
+ +	 * CPU this way.
+ +	 */
+ +	if (((plug && !blk_queue_nomerges(q)) || is_sync) &&
+ +	    !(data.hctx->flags & BLK_MQ_F_DEFER_ISSUE)) {
+++=======
++ 	if (plug && q->nr_hw_queues == 1) {
++ 		struct request *last = NULL;
++ 
++ 		blk_mq_bio_to_request(rq, bio);
++ 
++ 		/*
++ 		 * @request_count may become stale because of schedule
++ 		 * out, so check the list again.
++ 		 */
++ 		if (list_empty(&plug->mq_list))
++ 			request_count = 0;
++ 		else if (blk_queue_nomerges(q))
++ 			request_count = blk_plug_queued_count(q);
++ 
++ 		if (!request_count)
++ 			trace_block_plug(q);
++ 		else
++ 			last = list_entry_rq(plug->mq_list.prev);
++ 
++ 		blk_mq_put_ctx(data.ctx);
++ 
++ 		if (request_count >= BLK_MAX_REQUEST_COUNT || (last &&
++ 		    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
++ 			blk_flush_plug_list(plug, false);
++ 			trace_block_plug(q);
++ 		}
++ 
++ 		list_add_tail(&rq->queuelist, &plug->mq_list);
++ 		goto done;
++ 	} else if (((plug && !blk_queue_nomerges(q)) || is_sync)) {
+++>>>>>>> 254d259da0c3 (blk-mq: merge mq and sq make_request instances)
+  		struct request *old_rq = NULL;
+  
+  		blk_mq_bio_to_request(rq, bio);
+@@@ -1460,93 -1588,20 +1497,94 @@@
+  			rcu_read_unlock();
+  		} else {
+  			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
+ -			blk_mq_try_issue_directly(old_rq, &cookie, true);
+ +			blk_mq_try_issue_directly(old_rq);
+  			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
+  		}
+ -		goto done;
+ +		return;
+  	}
+  
+ -	if (q->elevator) {
+ -elv_insert:
+ -		blk_mq_put_ctx(data.ctx);
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ +		/*
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+ +		 */
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ +	}
+ +	blk_mq_put_ctx(data.ctx);
+ +}
+ +
+++<<<<<<< HEAD
+ +/*
+ + * Single hardware queue variant. This will attempt to use any per-process
+ + * plug for merging and IO deferral.
+ + */
+ +static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ +{
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_plug *plug;
+ +	unsigned int request_count = 0;
+ +	struct blk_map_ctx data;
+ +	struct request *rq;
+ +
+ +	blk_queue_bounce(q, &bio);
+ +
+ +	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ +		bio_endio(bio, -EIO);
+ +		return;
+ +	}
+ +
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ +		return;
+ +
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+ +
+ +	if (unlikely(is_flush_fua)) {
+  		blk_mq_bio_to_request(rq, bio);
+ -		blk_mq_sched_insert_request(rq, false, true,
+ -						!is_sync || is_flush_fua, true);
+ -		goto done;
+ +		blk_insert_flush(rq);
+ +		goto run_queue;
+  	}
+ +
+ +	/*
+ +	 * A task plug currently exists. Since this is completely lockless,
+ +	 * utilize that to temporarily store requests until the task is
+ +	 * either done or scheduled away.
+ +	 */
+ +	plug = current->plug;
+ +	if (plug) {
+ +		struct request *last = NULL;
+ +
+ +		blk_mq_bio_to_request(rq, bio);
+ +
+ +		/*
+ +		 * @request_count may become stale because of schedule
+ +		 * out, so check the list again.
+ +		 */
+ +		if (list_empty(&plug->mq_list))
+ +			request_count = 0;
+ +		if (!request_count)
+ +			trace_block_plug(q);
+ +		else
+ +			last = list_entry_rq(plug->mq_list.prev);
+ +
+ +		blk_mq_put_ctx(data.ctx);
+ +
+ +		if (request_count >= BLK_MAX_REQUEST_COUNT || (last &&
+ +		    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
+ +			blk_flush_plug_list(plug, false);
+ +			trace_block_plug(q);
+ +		}
+ +
+ +		list_add_tail(&rq->queuelist, &plug->mq_list);
+ +		return;
+ +	}
+ +
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+  		 * For a SYNC request, send it to the hardware immediately. For
+@@@ -1557,21 -1612,13 +1595,25 @@@
+  run_queue:
+  		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+  	}
+ +
+  	blk_mq_put_ctx(data.ctx);
+ -done:
+ -	return cookie;
+  }
+  
+ +/*
+ + * Default mapping to a software queue, since we use one per CPU.
+ + */
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ +{
+ +	return q->queue_hw_ctx[q->mq_map[cpu]];
+ +}
+ +EXPORT_SYMBOL(blk_mq_map_queue);
+ +
+ +static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ +		struct blk_mq_tags *tags, unsigned int hctx_idx)
+++=======
++ void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
++ 		     unsigned int hctx_idx)
+++>>>>>>> 254d259da0c3 (blk-mq: merge mq and sq make_request instances)
+  {
+  	struct page *page;
+  
+* Unmerged path block/blk-mq.c
