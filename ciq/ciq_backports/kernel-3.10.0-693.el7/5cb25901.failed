@@ -1,0 +1,160 @@
+i40e: properly convert le16 value to CPU format
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 5cb259016b4258d7ac53588a01d17da1ceda84b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5cb25901.failed
+
+This ensures that the pvid which is stored in __le16 format is converted
+to the CPU format. This will fix comparison issues on Big Endian
+platforms.
+
+Change-ID: I92c80d1315dc2a0f9f095d5a0c48d461beb052ed
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 5cb259016b4258d7ac53588a01d17da1ceda84b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 9beded34c059,df78271bdce5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1223,30 -1221,107 +1223,101 @@@ bool i40e_is_vsi_in_vlan(struct i40e_vs
+  }
+  
+  /**
+ - * i40e_correct_mac_vlan_filters - Correct non-VLAN filters if necessary
+ - * @vsi: the VSI to configure
+ - * @tmp_add_list: list of filters ready to be added
+ - * @tmp_del_list: list of filters ready to be deleted
+ - * @vlan_filters: the number of active VLAN filters
+ - *
+ - * Update VLAN=0 and VLAN=-1 (I40E_VLAN_ANY) filters properly so that they
+ - * behave as expected. If we have any active VLAN filters remaining or about
+ - * to be added then we need to update non-VLAN filters to be marked as VLAN=0
+ - * so that they only match against untagged traffic. If we no longer have any
+ - * active VLAN filters, we need to make all non-VLAN filters marked as VLAN=-1
+ - * so that they match against both tagged and untagged traffic. In this way,
+ - * we ensure that we correctly receive the desired traffic. This ensures that
+ - * when we have an active VLAN we will receive only untagged traffic and
+ - * traffic matching active VLANs. If we have no active VLANs then we will
+ - * operate in non-VLAN mode and receive all traffic, tagged or untagged.
+ - *
+ - * Finally, in a similar fashion, this function also corrects filters when
+ - * there is an active PVID assigned to this VSI.
+ - *
+ - * In case of memory allocation failure return -ENOMEM. Otherwise, return 0.
+ + * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be filtered
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+   *
+ - * This function is only expected to be called from within
+ - * i40e_sync_vsi_filters.
+ + * Goes through all the macvlan filters and adds a
+ + * macvlan filter for each unique vlan that already exists
+   *
+ - * NOTE: This function expects to be called while under the
+ - * mac_filter_hash_lock
+ - */
+ -static int i40e_correct_mac_vlan_filters(struct i40e_vsi *vsi,
+ -					 struct hlist_head *tmp_add_list,
+ -					 struct hlist_head *tmp_del_list,
+ -					 int vlan_filters)
+ + * Returns first filter found on success, else NULL
+ + **/
+ +struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +					     bool is_vf, bool is_netdev)
+  {
+++<<<<<<< HEAD
+ +	struct i40e_mac_filter *f;
+ +
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (vsi->info.pvid)
+ +			f->vlan = le16_to_cpu(vsi->info.pvid);
+ +		if (!i40e_find_filter(vsi, macaddr, f->vlan,
+ +				      is_vf, is_netdev)) {
+ +			if (!i40e_add_filter(vsi, macaddr, f->vlan,
+ +					     is_vf, is_netdev))
+ +				return NULL;
+++=======
++ 	s16 pvid = le16_to_cpu(vsi->info.pvid);
++ 	struct i40e_mac_filter *f, *add_head;
++ 	struct i40e_new_mac_filter *new;
++ 	struct hlist_node *h;
++ 	int bkt, new_vlan;
++ 
++ 	/* To determine if a particular filter needs to be replaced we
++ 	 * have the three following conditions:
++ 	 *
++ 	 * a) if we have a PVID assigned, then all filters which are
++ 	 *    not marked as VLAN=PVID must be replaced with filters that
++ 	 *    are.
++ 	 * b) otherwise, if we have any active VLANS, all filters
++ 	 *    which are marked as VLAN=-1 must be replaced with
++ 	 *    filters marked as VLAN=0
++ 	 * c) finally, if we do not have any active VLANS, all filters
++ 	 *    which are marked as VLAN=0 must be replaced with filters
++ 	 *    marked as VLAN=-1
++ 	 */
++ 
++ 	/* Update the filters about to be added in place */
++ 	hlist_for_each_entry(new, tmp_add_list, hlist) {
++ 		if (pvid && new->f->vlan != pvid)
++ 			new->f->vlan = pvid;
++ 		else if (vlan_filters && new->f->vlan == I40E_VLAN_ANY)
++ 			new->f->vlan = 0;
++ 		else if (!vlan_filters && new->f->vlan == 0)
++ 			new->f->vlan = I40E_VLAN_ANY;
++ 	}
++ 
++ 	/* Update the remaining active filters */
++ 	hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
++ 		/* Combine the checks for whether a filter needs to be changed
++ 		 * and then determine the new VLAN inside the if block, in
++ 		 * order to avoid duplicating code for adding the new filter
++ 		 * then deleting the old filter.
++ 		 */
++ 		if ((pvid && f->vlan != pvid) ||
++ 		    (vlan_filters && f->vlan == I40E_VLAN_ANY) ||
++ 		    (!vlan_filters && f->vlan == 0)) {
++ 			/* Determine the new vlan we will be adding */
++ 			if (pvid)
++ 				new_vlan = pvid;
++ 			else if (vlan_filters)
++ 				new_vlan = 0;
++ 			else
++ 				new_vlan = I40E_VLAN_ANY;
++ 
++ 			/* Create the new filter */
++ 			add_head = i40e_add_filter(vsi, f->macaddr, new_vlan);
++ 			if (!add_head)
++ 				return -ENOMEM;
++ 
++ 			/* Create a temporary i40e_new_mac_filter */
++ 			new = kzalloc(sizeof(*new), GFP_ATOMIC);
++ 			if (!new)
++ 				return -ENOMEM;
++ 
++ 			new->f = add_head;
++ 			new->state = add_head->state;
++ 
++ 			/* Add the new filter to the tmp list */
++ 			hlist_add_head(&new->hlist, tmp_add_list);
++ 
++ 			/* Put the original filter into the delete list */
++ 			f->state = I40E_FILTER_REMOVE;
++ 			hash_del(&f->hlist);
++ 			hlist_add_head(&f->hlist, tmp_del_list);
+++>>>>>>> 5cb259016b42 (i40e: properly convert le16 value to CPU format)
+  		}
+  	}
+  
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
