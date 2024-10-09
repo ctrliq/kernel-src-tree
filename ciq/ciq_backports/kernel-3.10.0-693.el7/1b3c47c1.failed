@@ -1,0 +1,261 @@
+nvme: Log the ctrl device name instead of the underlying pci device name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Log the ctrl device name instead of the underlying pci device name (David Milburn) [1384066]
+Rebuild_FUZZ: 95.65%
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 1b3c47c182aac70c4487105d2e22a17f0193525f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1b3c47c1.failed
+
+Having the ctrl name "nvmeX" seems much more friendly than
+the underlying device name. Also, with other nvme transports
+such as the soon to come nvme-loop we don't have an underlying
+device so it doesn't makes sense to make up one.
+
+In order to help matching an instance name to a pci function,
+we add a info print in nvme_probe.
+
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Acked-by: Keith Busch <keith.busch@intel.com>
+
+Manually fixed up the hunk in nvme_cancel_queue_ios().
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 1b3c47c182aac70c4487105d2e22a17f0193525f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index c49b97f390d6,a7c29f24976c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -559,12 -556,9 +559,17 @@@ static int nvme_revalidate_disk(struct 
+  	u16 old_ms;
+  	unsigned short bs;
+  
+ +	if (test_bit(NVME_NS_DEAD, &ns->flags)) {
+ +		set_capacity(disk, 0);
+ +		return -ENODEV;
+ +	}
+  	if (nvme_identify_ns(ns->ctrl, ns->ns_id, &id)) {
+++<<<<<<< HEAD
+ +		dev_warn(ns->ctrl->dev, "%s: Identify failure\n", __func__);
+++=======
++ 		dev_warn(disk_to_dev(ns->disk), "%s: Identify failure\n",
++ 				__func__);
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  		return -ENODEV;
+  	}
+  	if (id->ncap == 0) {
+@@@ -572,6 -566,16 +577,19 @@@
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (nvme_nvm_ns_supported(ns, id) && ns->type != NVME_NS_LIGHTNVM) {
++ 		if (nvme_nvm_register(ns->queue, disk->disk_name)) {
++ 			dev_warn(disk_to_dev(ns->disk),
++ 				"%s: LightNVM init failure\n", __func__);
++ 			kfree(id);
++ 			return -ENODEV;
++ 		}
++ 		ns->type = NVME_NS_LIGHTNVM;
++ 	}
++ 
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  	if (ns->ctrl->vs >= NVME_VS(1, 1))
+  		memcpy(ns->eui, id->eui64, sizeof(ns->eui));
+  	if (ns->ctrl->vs >= NVME_VS(1, 2))
+diff --cc drivers/nvme/host/pci.c
+index 87fe9f7857a4,f2f55b504cf2..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -310,10 -299,10 +310,15 @@@ static void nvme_complete_async_event(s
+  
+  	switch (result & 0xff07) {
+  	case NVME_AER_NOTICE_NS_CHANGED:
+++<<<<<<< HEAD
+ +		dev_info(dev->dev, "rescanning\n");
+ +		nvme_queue_scan(dev);
+++=======
++ 		dev_info(dev->ctrl.device, "rescanning\n");
++ 		queue_work(nvme_workq, &dev->scan_work);
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  	default:
+- 		dev_warn(dev->dev, "async event result %08x\n", result);
++ 		dev_warn(dev->ctrl.device, "async event result %08x\n", result);
+  	}
+  }
+  
+@@@ -683,9 -736,11 +688,9 @@@ static int nvme_process_cq(struct nvme_
+  			phase = !phase;
+  		}
+  
+ -		if (tag && *tag == cqe.command_id)
+ -			*tag = -1;
+  
+  		if (unlikely(cqe.command_id >= nvmeq->q_depth)) {
+- 			dev_warn(nvmeq->q_dmadev,
++ 			dev_warn(nvmeq->dev->ctrl.device,
+  				"invalid id %d completed on queue %d\n",
+  				cqe.command_id, le16_to_cpu(cqe.sq_id));
+  			continue;
+@@@ -900,11 -970,12 +906,12 @@@ static enum blk_eh_timer_return nvme_ti
+  	cmd.abort.cid = req->tag;
+  	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
+  
+- 	dev_warn(nvmeq->q_dmadev, "I/O %d QID %d timeout, aborting\n",
+- 				 req->tag, nvmeq->qid);
++ 	dev_warn(nvmeq->dev->ctrl.device,
++ 		"I/O %d QID %d timeout, aborting\n",
++ 		 req->tag, nvmeq->qid);
+  
+ -	abort_req = nvme_alloc_request(dev->ctrl.admin_q, &cmd,
+ -			BLK_MQ_REQ_NOWAIT);
+ +	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE, GFP_ATOMIC,
+ +									false);
+  	if (IS_ERR(abort_req)) {
+  		atomic_inc(&dev->ctrl.abort_limit);
+  		return BLK_EH_RESET_TIMER;
+@@@ -930,7 -1001,7 +937,11 @@@ static void nvme_cancel_queue_ios(struc
+  	if (!blk_mq_request_started(req))
+  		return;
+  
+++<<<<<<< HEAD
+ +	dev_dbg_ratelimited(nvmeq->q_dmadev,
+++=======
++ 	dev_warn(nvmeq->dev->ctrl.device,
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  		 "Cancelling I/O %d QID %d\n", req->tag, nvmeq->qid);
+  
+  	status = NVME_SC_ABORT_REQ;
+@@@ -1270,48 -1337,48 +1281,66 @@@ static int nvme_configure_admin_queue(s
+  	return result;
+  }
+  
+ -static int nvme_kthread(void *data)
+ +static bool nvme_should_reset(struct nvme_dev *dev, u32 csts)
+  {
+ -	struct nvme_dev *dev, *next;
+  
+ -	while (!kthread_should_stop()) {
+ -		set_current_state(TASK_INTERRUPTIBLE);
+ -		spin_lock(&dev_list_lock);
+ -		list_for_each_entry_safe(dev, next, &dev_list, node) {
+ -			int i;
+ -			u32 csts = readl(dev->bar + NVME_REG_CSTS);
+ +	/* If true, indicates loss of adapter communication, possibly by a
+ +	 * NVMe Subsystem reset.
+ +	 */
+ +	bool nssro = dev->subsystem && (csts & NVME_CSTS_NSSRO);
+  
+ -			/*
+ -			 * Skip controllers currently under reset.
+ -			 */
+ -			if (work_pending(&dev->reset_work) || work_busy(&dev->reset_work))
+ -				continue;
+ +	/* If there is a reset ongoing, we shouldn't reset again. */
+ +	if (work_busy(&dev->reset_work))
+ +		return false;
+  
+++<<<<<<< HEAD
+ +	/* We shouldn't reset unless the controller is on fatal error state
+ +	 * _or_ if we lost the communication with it.
+ +	 */
+ +	if (!(csts & NVME_CSTS_CFS) && !nssro)
+ +		return false;
+++=======
++ 			if ((dev->subsystem && (csts & NVME_CSTS_NSSRO)) ||
++ 							csts & NVME_CSTS_CFS) {
++ 				if (queue_work(nvme_workq, &dev->reset_work)) {
++ 					dev_warn(dev->ctrl.device,
++ 						"Failed status: %x, reset controller\n",
++ 						readl(dev->bar + NVME_REG_CSTS));
++ 				}
++ 				continue;
++ 			}
++ 			for (i = 0; i < dev->queue_count; i++) {
++ 				struct nvme_queue *nvmeq = dev->queues[i];
++ 				if (!nvmeq)
++ 					continue;
++ 				spin_lock_irq(&nvmeq->q_lock);
++ 				nvme_process_cq(nvmeq);
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  
+ -				while (i == 0 && dev->ctrl.event_limit > 0)
+ -					nvme_submit_async_event(dev);
+ -				spin_unlock_irq(&nvmeq->q_lock);
+ -			}
+ -		}
+ -		spin_unlock(&dev_list_lock);
+ -		schedule_timeout(round_jiffies_relative(HZ));
+ +	/* If PCI error recovery process is happening, we cannot reset or
+ +	 * the recovery mechanism will surely fail.
+ +	 */
+ +	if (pci_channel_offline(to_pci_dev(dev->dev)))
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +static void nvme_watchdog_timer(unsigned long data)
+ +{
+ +	struct nvme_dev *dev = (struct nvme_dev *)data;
+ +	u32 csts = readl(dev->bar + NVME_REG_CSTS);
+ +
+ +	/* Skip controllers under certain specific conditions. */
+ +	if (nvme_should_reset(dev, csts)) {
+ +		if (queue_work(nvme_workq, &dev->reset_work))
+ +			dev_warn(dev->dev,
+ +				"Failed status: 0x%x, reset controller.\n",
+ +				csts);
+ +		return;
+  	}
+ -	return 0;
+ +
+ +	mod_timer(&dev->watchdog_timer, round_jiffies(jiffies + HZ));
+  }
+  
+  static int nvme_create_io_queues(struct nvme_dev *dev)
+@@@ -1418,8 -1485,10 +1447,15 @@@ static int nvme_setup_io_queues(struct 
+  	 * access to the admin queue, as that might be only way to fix them up.
+  	 */
+  	if (result > 0) {
+++<<<<<<< HEAD
+ +		dev_err(dev->dev, "Could not set queue count (%d)\n", result);
+ +		return 0;
+++=======
++ 		dev_err(dev->ctrl.device,
++ 			"Could not set queue count (%d)\n", result);
++ 		nr_io_queues = 0;
++ 		result = 0;
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  	}
+  
+  	if (dev->cmb && NVME_CMB_SQS(dev->cmbsz)) {
+@@@ -1861,6 -1985,14 +1897,17 @@@ static void nvme_remove_dead_ctrl_work(
+  	nvme_put_ctrl(&dev->ctrl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_remove_dead_ctrl(struct nvme_dev *dev)
++ {
++ 	dev_warn(dev->ctrl.device, "Removing after probe failure\n");
++ 	kref_get(&dev->ctrl.kref);
++ 	if (!schedule_work(&dev->remove_work))
++ 		nvme_put_ctrl(&dev->ctrl);
++ }
++ 
+++>>>>>>> 1b3c47c182aa (nvme: Log the ctrl device name instead of the underlying pci device name)
+  static int nvme_reset(struct nvme_dev *dev)
+  {
+  	if (!dev->ctrl.admin_q || blk_queue_dying(dev->ctrl.admin_q))
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/pci.c
