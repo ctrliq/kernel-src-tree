@@ -1,0 +1,154 @@
+ibmvnic: Ensure that TX queues are disabled in __ibmvnic_close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+commit 4c2687a512b9a6737e86d72f23ad0a1097d56bd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4c2687a5.failed
+
+Use netif_tx_disable to guarantee that TX queues are disabled
+when __ibmvnic_close is called by the device reset routine.
+
+	Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4c2687a512b9a6737e86d72f23ad0a1097d56bd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index e51abefcc89d,134ab295c1d6..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -496,50 -813,91 +496,63 @@@ static int ibmvnic_open(struct net_devi
+  
+  	netif_tx_start_all_queues(netdev);
+  
+ -	if (prev_state == VNIC_CLOSED) {
+ -		for (i = 0; i < adapter->req_rx_queues; i++)
+ -			napi_schedule(&adapter->napi[i]);
+ -	}
+ -
+ -	adapter->state = VNIC_OPEN;
+ -	return rc;
+ -}
+ -
+ -static int ibmvnic_open(struct net_device *netdev)
+ -{
+ -	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ -	int rc;
+ -
+ -	mutex_lock(&adapter->reset_lock);
+ -
+ -	if (adapter->state != VNIC_CLOSED) {
+ -		rc = ibmvnic_login(netdev);
+ -		if (rc) {
+ -			mutex_unlock(&adapter->reset_lock);
+ -			return rc;
+ -		}
+ +	return 0;
+  
+ -		rc = init_resources(adapter);
+ -		if (rc) {
+ -			netdev_err(netdev, "failed to initialize resources\n");
+ -			release_resources(adapter);
+ -			mutex_unlock(&adapter->reset_lock);
+ -			return rc;
+ -		}
+ +bounce_map_failed:
+ +	kfree(adapter->bounce_buffer);
+ +bounce_alloc_failed:
+ +	i = tx_subcrqs - 1;
+ +	kfree(adapter->tx_pool[i].free_map);
+ +tx_fm_alloc_failed:
+ +	free_long_term_buff(adapter, &adapter->tx_pool[i].long_term_buff);
+ +tx_ltb_alloc_failed:
+ +	kfree(adapter->tx_pool[i].tx_buff);
+ +tx_pool_alloc_failed:
+ +	for (j = 0; j < i; j++) {
+ +		kfree(adapter->tx_pool[j].tx_buff);
+ +		free_long_term_buff(adapter,
+ +				    &adapter->tx_pool[j].long_term_buff);
+ +		kfree(adapter->tx_pool[j].free_map);
+  	}
+ -
+ -	rc = __ibmvnic_open(netdev);
+ -	mutex_unlock(&adapter->reset_lock);
+ -
+ -	return rc;
+ -}
+ -
+ -static void clean_tx_pools(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_tx_pool *tx_pool;
+ -	u64 tx_entries;
+ -	int tx_scrqs;
+ -	int i, j;
+ -
+ -	if (!adapter->tx_pool)
+ -		return;
+ -
+ -	tx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
+ -	tx_entries = adapter->req_tx_entries_per_subcrq;
+ -
+ -	/* Free any remaining skbs in the tx buffer pools */
+ -	for (i = 0; i < tx_scrqs; i++) {
+ -		tx_pool = &adapter->tx_pool[i];
+ -		if (!tx_pool)
+ -			continue;
+ -
+ -		for (j = 0; j < tx_entries; j++) {
+ -			if (tx_pool->tx_buff[j].skb) {
+ -				dev_kfree_skb_any(tx_pool->tx_buff[j].skb);
+ -				tx_pool->tx_buff[j].skb = NULL;
+ -			}
+ -		}
+ +	kfree(adapter->tx_pool);
+ +	adapter->tx_pool = NULL;
+ +tx_pool_arr_alloc_failed:
+ +	i = rxadd_subcrqs;
+ +rx_pool_alloc_failed:
+ +	for (j = 0; j < i; j++) {
+ +		free_rx_pool(adapter, &adapter->rx_pool[j]);
+ +		free_long_term_buff(adapter,
+ +				    &adapter->rx_pool[j].long_term_buff);
+  	}
+ +	kfree(adapter->rx_pool);
+ +	adapter->rx_pool = NULL;
+ +rx_pool_arr_alloc_failed:
+ +	for (i = 0; i < adapter->req_rx_queues; i++)
+ +		napi_disable(&adapter->napi[i]);
+ +alloc_napi_failed:
+ +	return -ENOMEM;
+  }
+  
+ -static int __ibmvnic_close(struct net_device *netdev)
+ +static void disable_sub_crqs(struct ibmvnic_adapter *adapter)
+  {
+ -	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ -	int rc = 0;
+  	int i;
+  
+++<<<<<<< HEAD
+++=======
++ 	adapter->state = VNIC_CLOSING;
++ 
++ 	/* ensure that transmissions are stopped if called by do_reset */
++ 	if (adapter->resetting)
++ 		netif_tx_disable(netdev);
++ 	else
++ 		netif_tx_stop_all_queues(netdev);
++ 
++ 	ibmvnic_napi_disable(adapter);
++ 
+++>>>>>>> 4c2687a512b9 (ibmvnic: Ensure that TX queues are disabled in __ibmvnic_close)
+  	if (adapter->tx_scrq) {
+  		for (i = 0; i < adapter->req_tx_queues; i++)
+ -			if (adapter->tx_scrq[i]->irq)
+ +			if (adapter->tx_scrq[i])
+  				disable_irq(adapter->tx_scrq[i]->irq);
+  	}
+  
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
