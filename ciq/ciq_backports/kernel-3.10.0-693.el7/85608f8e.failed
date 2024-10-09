@@ -1,0 +1,160 @@
+random: remove unneeded hash of a portion of the entropy pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit 85608f8e16c28f818f6bb9918958d231afa8bec2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/85608f8e.failed
+
+We previously extracted a portion of the entropy pool in
+mix_pool_bytes() and hashed it in to avoid racing CPU's from returning
+duplicate random values.  Now that we are using a spinlock to prevent
+this from happening, this is no longer necessary.  So remove it, to
+simplify the code a bit.
+
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: George Spelvin <linux@horizon.com>
+(cherry picked from commit 85608f8e16c28f818f6bb9918958d231afa8bec2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/random.c
+diff --cc drivers/char/random.c
+index dd02db5d6935,bc0de22f31f4..000000000000
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@@ -919,26 -930,45 +915,56 @@@ static void xfer_secondary_pool(struct 
+  	}
+  	if (r->pull &&
+  	    r->entropy_count < (nbytes << (ENTROPY_SHIFT + 3)) &&
+ -	    r->entropy_count < r->poolinfo->poolfracbits)
+ -		_xfer_secondary_pool(r, nbytes);
+ -}
+ -
+ -static void _xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
+ -{
+ -	__u32	tmp[OUTPUT_POOL_WORDS];
+ -
+ -	/* For /dev/random's pool, always leave two wakeups' worth */
+ -	int rsvd_bytes = r->limit ? 0 : random_read_wakeup_bits / 4;
+ -	int bytes = nbytes;
+ -
+ +	    r->entropy_count < r->poolinfo->poolfracbits) {
+ +		/* If we're limited, always leave two wakeup worth's BITS */
+ +		int rsvd = r->limit ? 0 : random_read_wakeup_thresh/4;
+ +		int bytes = nbytes;
+ +
+ +		/* pull at least as many as BYTES as wakeup BITS */
+ +		bytes = max_t(int, bytes, random_read_wakeup_thresh / 8);
+ +		/* but never more than the buffer size */
+ +		bytes = min_t(int, bytes, sizeof(tmp));
+ +
+ +		DEBUG_ENT("going to reseed %s with %d bits "
+ +			  "(%zu of %d requested)\n",
+ +			  r->name, bytes * 8, nbytes * 8,
+ +			  r->entropy_count >> ENTROPY_SHIFT);
+ +
+++<<<<<<< HEAD
+ +		bytes = extract_entropy(r->pull, tmp, bytes,
+ +					random_read_wakeup_thresh / 8, rsvd);
+ +		mix_pool_bytes(r, tmp, bytes, NULL);
+ +		credit_entropy_bits(r, bytes*8);
+ +	}
+++=======
++ 	/* pull at least as much as a wakeup */
++ 	bytes = max_t(int, bytes, random_read_wakeup_bits / 8);
++ 	/* but never more than the buffer size */
++ 	bytes = min_t(int, bytes, sizeof(tmp));
++ 
++ 	trace_xfer_secondary_pool(r->name, bytes * 8, nbytes * 8,
++ 				  ENTROPY_BITS(r), ENTROPY_BITS(r->pull));
++ 	bytes = extract_entropy(r->pull, tmp, bytes,
++ 				random_read_wakeup_bits / 8, rsvd_bytes);
++ 	mix_pool_bytes(r, tmp, bytes);
++ 	credit_entropy_bits(r, bytes*8);
++ }
++ 
++ /*
++  * Used as a workqueue function so that when the input pool is getting
++  * full, we can "spill over" some entropy to the output pools.  That
++  * way the output pools can store some of the excess entropy instead
++  * of letting it go to waste.
++  */
++ static void push_to_pool(struct work_struct *work)
++ {
++ 	struct entropy_store *r = container_of(work, struct entropy_store,
++ 					      push_work);
++ 	BUG_ON(!r);
++ 	_xfer_secondary_pool(r, random_read_wakeup_bits/8);
++ 	trace_push_to_pool(r->name, r->entropy_count >> ENTROPY_SHIFT,
++ 			   r->pull->entropy_count >> ENTROPY_SHIFT);
+++>>>>>>> 85608f8e16c2 (random: remove unneeded hash of a portion of the entropy pool)
+  }
+  
+  /*
+@@@ -1038,16 -1055,10 +1063,20 @@@ static void extract_buf(struct entropy_
+  	 * brute-forcing the feedback as hard as brute-forcing the
+  	 * hash.
+  	 */
+- 	__mix_pool_bytes(r, hash.w, sizeof(hash.w), extract);
++ 	__mix_pool_bytes(r, hash.w, sizeof(hash.w));
+  	spin_unlock_irqrestore(&r->lock, flags);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * To avoid duplicates, we atomically extract a portion of the
+ +	 * pool while mixing, and hash one final time.
+ +	 */
+ +	sha_transform(hash.w, extract, workspace);
+ +	memzero_explicit(extract, sizeof(extract));
+ +	memzero_explicit(workspace, sizeof(workspace));
+++=======
++ 	memset(workspace, 0, sizeof(workspace));
+++>>>>>>> 85608f8e16c2 (random: remove unneeded hash of a portion of the entropy pool)
+  
+  	/*
+  	 * In case the hash function has some recognizable output
+@@@ -1279,6 -1290,37 +1308,40 @@@ void rand_initialize_disk(struct gendis
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Attempt an emergency refill using arch_get_random_seed_long().
++  *
++  * As with add_interrupt_randomness() be paranoid and only
++  * credit the output as 50% entropic.
++  */
++ static int arch_random_refill(void)
++ {
++ 	const unsigned int nlongs = 64;	/* Arbitrary number */
++ 	unsigned int n = 0;
++ 	unsigned int i;
++ 	unsigned long buf[nlongs];
++ 
++ 	if (!arch_has_random_seed())
++ 		return 0;
++ 
++ 	for (i = 0; i < nlongs; i++) {
++ 		if (arch_get_random_seed_long(&buf[n]))
++ 			n++;
++ 	}
++ 
++ 	if (n) {
++ 		unsigned int rand_bytes = n * sizeof(unsigned long);
++ 
++ 		mix_pool_bytes(&input_pool, buf, rand_bytes);
++ 		credit_entropy_bits(&input_pool, rand_bytes*4);
++ 	}
++ 
++ 	return n;
++ }
++ 
+++>>>>>>> 85608f8e16c2 (random: remove unneeded hash of a portion of the entropy pool)
+  static ssize_t
+  random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+  {
+* Unmerged path drivers/char/random.c
