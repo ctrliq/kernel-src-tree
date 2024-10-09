@@ -225,7 +225,7 @@ static void pmem_release_queue(void *q)
 	blk_cleanup_queue(q);
 }
 
-void pmem_release_disk(void *disk)
+static void pmem_release_disk(void *disk)
 {
 	del_gendisk(disk);
 	put_disk(disk);
@@ -300,10 +300,8 @@ static int pmem_attach_disk(struct device *dev,
 	 * At release time the queue must be dead before
 	 * devm_memremap_pages is unwound
 	 */
-	if (devm_add_action(dev, pmem_release_queue, q)) {
-		blk_cleanup_queue(q);
+	if (devm_add_action_or_reset(dev, pmem_release_queue, q))
 		return -ENOMEM;
-	}
 
 	if (IS_ERR(addr))
 		return PTR_ERR(addr);
@@ -321,10 +319,6 @@ static int pmem_attach_disk(struct device *dev,
 	disk = alloc_disk_node(0, nid);
 	if (!disk)
 		return -ENOMEM;
-	if (devm_add_action(dev, pmem_release_disk, disk)) {
-		put_disk(disk);
-		return -ENOMEM;
-	}
 
 	disk->fops		= &pmem_fops;
 	disk->queue		= q;
@@ -338,6 +332,10 @@ static int pmem_attach_disk(struct device *dev,
 	nvdimm_badblocks_populate(nd_region, &pmem->bb, res);
 	disk->bb = &pmem->bb;
 	add_disk(disk);
+
+	if (devm_add_action_or_reset(dev, pmem_release_disk, disk))
+		return -ENOMEM;
+
 	revalidate_disk(disk);
 
 	return 0;
