@@ -2139,9 +2139,11 @@ lpfc_nvmet_prep_fcp_wqe(struct lpfc_hba *phba,
 	struct lpfc_iocbq *nvmewqe;
 	struct scatterlist *sgel;
 	union lpfc_wqe128 *wqe;
+	struct ulp_bde64 *bde;
 	uint32_t *txrdy;
 	dma_addr_t physaddr;
 	int i, cnt;
+	int do_pbde;
 	int xc = 1;
 
 	if (!lpfc_is_link_up(phba)) {
@@ -2232,6 +2234,7 @@ lpfc_nvmet_prep_fcp_wqe(struct lpfc_hba *phba,
 		/* Word 7 */
 		bf_set(wqe_pu, &wqe->fcp_tsend.wqe_com, 1);
 		bf_set(wqe_cmnd, &wqe->fcp_tsend.wqe_com, CMD_FCP_TSEND64_WQE);
+		do_pbde = 0;
 
 		/* Word 8 */
 		wqe->fcp_tsend.wqe_com.abort_tag = nvmewqe->iotag;
@@ -2344,6 +2347,10 @@ lpfc_nvmet_prep_fcp_wqe(struct lpfc_hba *phba,
 		bf_set(wqe_ar, &wqe->fcp_treceive.wqe_com, 0);
 		bf_set(wqe_cmnd, &wqe->fcp_treceive.wqe_com,
 		       CMD_FCP_TRECEIVE64_WQE);
+		if (phba->nvme_embed_pbde)
+			do_pbde = 1;
+		else
+			do_pbde = 0;
 
 		/* Word 8 */
 		wqe->fcp_treceive.wqe_com.abort_tag = nvmewqe->iotag;
@@ -2427,6 +2434,7 @@ lpfc_nvmet_prep_fcp_wqe(struct lpfc_hba *phba,
 		bf_set(wqe_pu, &wqe->fcp_trsp.wqe_com, 0);
 		bf_set(wqe_ag, &wqe->fcp_trsp.wqe_com, 1);
 		bf_set(wqe_cmnd, &wqe->fcp_trsp.wqe_com, CMD_FCP_TRSP64_WQE);
+		do_pbde = 0;
 
 		/* Word 8 */
 		wqe->fcp_trsp.wqe_com.abort_tag = nvmewqe->iotag;
@@ -2497,9 +2505,25 @@ lpfc_nvmet_prep_fcp_wqe(struct lpfc_hba *phba,
 			bf_set(lpfc_sli4_sge_last, sgl, 1);
 		sgl->word2 = cpu_to_le32(sgl->word2);
 		sgl->sge_len = cpu_to_le32(cnt);
+		if (do_pbde && i == 0) {
+			bde = (struct ulp_bde64 *)&wqe->words[13];
+			memset(bde, 0, sizeof(struct ulp_bde64));
+			/* Words 13-15  (PBDE)*/
+			bde->addrLow = sgl->addr_lo;
+			bde->addrHigh = sgl->addr_hi;
+			bde->tus.f.bdeSize =
+				le32_to_cpu(sgl->sge_len);
+			bde->tus.f.bdeFlags = BUFF_TYPE_BDE_64;
+			bde->tus.w = cpu_to_le32(bde->tus.w);
+		}
 		sgl++;
 		ctxp->offset += cnt;
 	}
+
+	if (do_pbde)
+		bf_set(wqe_pbde, &wqe->generic.wqe_com, 1);
+	else
+		bf_set(wqe_pbde, &wqe->generic.wqe_com, 0);
 	ctxp->state = LPFC_NVMET_STE_DATA;
 	ctxp->entry_cnt++;
 	return nvmewqe;
