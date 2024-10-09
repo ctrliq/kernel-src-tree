@@ -1,0 +1,234 @@
+x86/dumpstack: Add get_stack_pointer() and get_frame_pointer()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] dumpstack: Add get_stack_pointer() and get_frame_pointer() (Josh Poimboeuf) [1430637]
+Rebuild_FUZZ: 96.67%
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 4b8afafbe743be1a81c96ddcd75b19c534d5e262
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4b8afafb.failed
+
+The various functions involved in dumping the stack all do similar
+things with regard to getting the stack pointer and the frame pointer
+based on the regs and task arguments.  Create helper functions to
+do that instead.
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Reviewed-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Byungchul Park <byungchul.park@lge.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/f448914885a35f333fe04da1b97a6c2cc1f80974.1472057064.git.jpoimboe@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4b8afafbe743be1a81c96ddcd75b19c534d5e262)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/stacktrace.h
+#	arch/x86/kernel/dumpstack_32.c
+diff --cc arch/x86/include/asm/stacktrace.h
+index 7c247e7404be,3552f5e7189e..000000000000
+--- a/arch/x86/include/asm/stacktrace.h
++++ b/arch/x86/include/asm/stacktrace.h
+@@@ -55,31 -55,36 +54,41 @@@ void dump_trace(struct task_struct *tsk
+  #endif
+  
+  #ifdef CONFIG_FRAME_POINTER
+- static inline unsigned long
+- stack_frame(struct task_struct *task, struct pt_regs *regs)
++ static inline unsigned long *
++ get_frame_pointer(struct task_struct *task, struct pt_regs *regs)
+  {
+- 	unsigned long bp;
+- 
+  	if (regs)
+- 		return regs->bp;
++ 		return (unsigned long *)regs->bp;
+  
+- 	if (task == current) {
+- 		/* Grab bp right from our regs */
+- 		get_bp(bp);
+- 		return bp;
+- 	}
++ 	if (!task || task == current)
++ 		return __builtin_frame_address(0);
+  
+++<<<<<<< HEAD
+ +	/* bp is the last reg pushed by switch_to */
+ +	return *(unsigned long *)task->thread.sp;
+++=======
++ 	return (unsigned long *)((struct inactive_task_frame *)task->thread.sp)->bp;
+++>>>>>>> 4b8afafbe743 (x86/dumpstack: Add get_stack_pointer() and get_frame_pointer())
+  }
+  #else
+- static inline unsigned long
+- stack_frame(struct task_struct *task, struct pt_regs *regs)
++ static inline unsigned long *
++ get_frame_pointer(struct task_struct *task, struct pt_regs *regs)
+  {
+- 	return 0;
++ 	return NULL;
++ }
++ #endif /* CONFIG_FRAME_POINTER */
++ 
++ static inline unsigned long *
++ get_stack_pointer(struct task_struct *task, struct pt_regs *regs)
++ {
++ 	if (regs)
++ 		return (unsigned long *)kernel_stack_pointer(regs);
++ 
++ 	if (!task || task == current)
++ 		return __builtin_frame_address(0);
++ 
++ 	return (unsigned long *)task->thread.sp;
+  }
+- #endif
+  
+  extern void
+  show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+diff --cc arch/x86/kernel/dumpstack_32.c
+index c90b53d2857e,358fe1cd4e5b..000000000000
+--- a/arch/x86/kernel/dumpstack_32.c
++++ b/arch/x86/kernel/dumpstack_32.c
+@@@ -21,32 -42,34 +21,38 @@@ void dump_trace(struct task_struct *tas
+  		unsigned long *stack, unsigned long bp,
+  		const struct stacktrace_ops *ops, void *data)
+  {
+ -	const unsigned cpu = get_cpu();
+  	int graph = 0;
+ -	u32 *prev_esp;
+  
+++<<<<<<< HEAD
+ +	if (!task)
+ +		task = current;
+ +
+ +	if (!stack) {
+ +		unsigned long dummy;
+ +
+ +		stack = &dummy;
+ +		if (task && task != current)
+ +			stack = (unsigned long *)task->thread.sp;
+ +	}
+ +
+ +	if (!bp)
+ +		bp = stack_frame(task, regs);
+++=======
++ 	task = task ? : current;
++ 	stack = stack ? : get_stack_pointer(task, regs);
++ 	bp = bp ? : (unsigned long)get_frame_pointer(task, regs);
+++>>>>>>> 4b8afafbe743 (x86/dumpstack: Add get_stack_pointer() and get_frame_pointer())
+  
+  	for (;;) {
+ -		void *end_stack;
+ +		struct thread_info *context;
+  
+ -		end_stack = is_hardirq_stack(stack, cpu);
+ -		if (!end_stack)
+ -			end_stack = is_softirq_stack(stack, cpu);
+ +		context = (struct thread_info *)
+ +			((unsigned long)stack & (~(THREAD_SIZE - 1)));
+ +		bp = ops->walk_stack(context, stack, bp, ops, data, NULL, &graph);
+  
+ -		bp = ops->walk_stack(task, stack, bp, ops, data,
+ -				     end_stack, &graph);
+ -
+ -		/* Stop if not on irq stack */
+ -		if (!end_stack)
+ -			break;
+ -
+ -		/* The previous esp is saved on the bottom of the stack */
+ -		prev_esp = (u32 *)(end_stack - THREAD_SIZE);
+ -		stack = (unsigned long *)*prev_esp;
+ +		stack = (unsigned long *)context->previous_esp;
+  		if (!stack)
+  			break;
+ -
+  		if (ops->stack(data, "IRQ") < 0)
+  			break;
+  		touch_nmi_watchdog();
+* Unmerged path arch/x86/include/asm/stacktrace.h
+diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
+index 08594671b59f..3da3930bded2 100644
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@ -185,15 +185,14 @@ void show_trace(struct task_struct *task, struct pt_regs *regs,
+ void show_stack(struct task_struct *task, unsigned long *sp)
+ {
+ 	unsigned long bp = 0;
+-	unsigned long stack;
+ 
+ 	/*
+ 	 * Stack frames below this one aren't interesting.  Don't show them
+ 	 * if we're printing for %current.
+ 	 */
+ 	if (!sp && (!task || task == current)) {
+-		sp = &stack;
+-		bp = stack_frame(current, NULL);
++		sp = get_stack_pointer(current, NULL);
++		bp = (unsigned long)get_frame_pointer(current, NULL);
+ 	}
+ 
+ 	show_stack_log_lvl(task, NULL, sp, bp, "");
+* Unmerged path arch/x86/kernel/dumpstack_32.c
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index 101e30243d5b..61ff642752cc 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -152,25 +152,14 @@ void dump_trace(struct task_struct *task, struct pt_regs *regs,
+ 	const unsigned cpu = get_cpu();
+ 	struct thread_info *tinfo;
+ 	unsigned long *irq_stack = (unsigned long *)per_cpu(irq_stack_ptr, cpu);
+-	unsigned long dummy;
+ 	unsigned used = 0;
+ 	int graph = 0;
+ 	int done = 0;
+ 
+-	if (!task)
+-		task = current;
++	task = task ? : current;
++	stack = stack ? : get_stack_pointer(task, regs);
++	bp = bp ? : (unsigned long)get_frame_pointer(task, regs);
+ 
+-	if (!stack) {
+-		if (regs)
+-			stack = (unsigned long *)regs->sp;
+-		else if (task != current)
+-			stack = (unsigned long *)task->thread.sp;
+-		else
+-			stack = &dummy;
+-	}
+-
+-	if (!bp)
+-		bp = stack_frame(task, regs);
+ 	/*
+ 	 * Print function call entries in all stacks, starting at the
+ 	 * current stack address. If the stacks consist of nested
+@@ -258,18 +247,7 @@ show_stack_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 	irq_stack_end = (unsigned long *)(per_cpu(irq_stack_ptr, cpu));
+ 	irq_stack     = irq_stack_end - (IRQ_STACK_SIZE / sizeof(long));
+ 
+-	/*
+-	 * Debugging aid: "show_stack(NULL, NULL);" prints the
+-	 * back trace for this cpu:
+-	 */
+-	if (sp == NULL) {
+-		if (regs)
+-			sp = (unsigned long *)regs->sp;
+-		else if (task)
+-			sp = (unsigned long *)task->thread.sp;
+-		else
+-			sp = (unsigned long *)&sp;
+-	}
++	sp = sp ? : get_stack_pointer(task, regs);
+ 
+ 	stack = sp;
+ 	for (i = 0; i < kstack_depth_to_print; i++) {
