@@ -1,0 +1,256 @@
+mm: pass the vmem_altmap to arch_remove_memory and __remove_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] pass the vmem_altmap to arch_remove_memory and __remove_pages (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 96.83%
+commit-author Christoph Hellwig <hch@lst.de>
+commit da024512a1fa5c979257e442130ee1d468285057
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/da024512.failed
+
+We can just pass this on instead of having to do a radix tree lookup
+without proper locking 2 levels into the callchain.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit da024512a1fa5c979257e442130ee1d468285057)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mem.c
+#	kernel/memremap.c
+#	mm/hmm.c
+diff --cc arch/powerpc/mm/mem.c
+index 7bbac9df162a,22aa528b78a2..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -142,11 -153,18 +142,26 @@@ int arch_remove_memory(u64 start, u64 s
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct zone *zone;
+ +	int ret;
+ +
+ +	zone = page_zone(pfn_to_page(start_pfn));
+ +	ret = __remove_pages(zone, start_pfn, nr_pages);
+++=======
++ 	struct page *page;
++ 	int ret;
++ 
++ 	/*
++ 	 * If we have an altmap then we need to skip over any reserved PFNs
++ 	 * when querying the zone.
++ 	 */
++ 	page = pfn_to_page(start_pfn);
++ 	if (altmap)
++ 		page += vmem_altmap_offset(altmap);
++ 
++ 	ret = __remove_pages(page_zone(page), start_pfn, nr_pages, altmap);
+++>>>>>>> da024512a1fa (mm: pass the vmem_altmap to arch_remove_memory and __remove_pages)
+  	if (ret)
+  		return ret;
+  
+diff --cc kernel/memremap.c
+index 00f3d3b53574,380fca1c4a02..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -325,9 -304,10 +325,15 @@@ static void devm_memremap_pages_release
+  	align_size = ALIGN(resource_size(res), SECTION_SIZE);
+  
+  	mem_hotplug_begin();
+++<<<<<<< HEAD
+ +	arch_remove_memory(align_start, align_size);
+++=======
++ 	arch_remove_memory(align_start, align_size, pgmap->altmap);
++ 	mem_hotplug_done();
++ 
+++>>>>>>> da024512a1fa (mm: pass the vmem_altmap to arch_remove_memory and __remove_pages)
+  	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+ +	mem_hotplug_done();
+  	pgmap_radix_release(res);
+  	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
+  			"%s: failed to free all reserved pages\n", __func__);
+diff --cc mm/hmm.c
+index 125cbd4521ca,5d17ba89062f..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -827,7 -836,13 +827,17 @@@ static void hmm_devmem_release(struct d
+  	page = pfn_to_page(start_pfn);
+  	zone = page_zone(page);
+  
+++<<<<<<< HEAD
+ +	__remove_pages(zone, start_pfn, npages);
+++=======
++ 	mem_hotplug_begin();
++ 	if (resource->desc == IORES_DESC_DEVICE_PRIVATE_MEMORY)
++ 		__remove_pages(zone, start_pfn, npages, NULL);
++ 	else
++ 		arch_remove_memory(start_pfn << PAGE_SHIFT,
++ 				   npages << PAGE_SHIFT, NULL);
++ 	mem_hotplug_done();
+++>>>>>>> da024512a1fa (mm: pass the vmem_altmap to arch_remove_memory and __remove_pages)
+  
+  	hmm_devmem_radix_release(resource);
+  }
+diff --git a/arch/ia64/mm/init.c b/arch/ia64/mm/init.c
+index d1fe4b402601..3c697f719196 100644
+--- a/arch/ia64/mm/init.c
++++ b/arch/ia64/mm/init.c
+@@ -675,7 +675,7 @@ int arch_add_memory(int nid, u64 start, u64 size)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-int arch_remove_memory(u64 start, u64 size)
++int arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+@@ -683,7 +683,7 @@ int arch_remove_memory(u64 start, u64 size)
+ 	int ret;
+ 
+ 	zone = page_zone(pfn_to_page(start_pfn));
+-	ret = __remove_pages(zone, start_pfn, nr_pages);
++	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ 	if (ret)
+ 		pr_warn("%s: Problem encountered in __remove_pages() as"
+ 			" ret=%d\n", __func__,  ret);
+* Unmerged path arch/powerpc/mm/mem.c
+diff --git a/arch/s390/mm/init.c b/arch/s390/mm/init.c
+index e383ffc4ecb6..9054023bdb95 100644
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@ -241,7 +241,7 @@ unsigned long memory_block_size_bytes(void)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-int arch_remove_memory(u64 start, u64 size)
++int arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ {
+ 	/*
+ 	 * There is no hardware or firmware interface which could trigger a
+diff --git a/arch/sh/mm/init.c b/arch/sh/mm/init.c
+index 20f9ead650d3..816a3dad1af3 100644
+--- a/arch/sh/mm/init.c
++++ b/arch/sh/mm/init.c
+@@ -539,7 +539,7 @@ EXPORT_SYMBOL_GPL(memory_add_physaddr_to_nid);
+ #endif
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-int arch_remove_memory(u64 start, u64 size)
++int arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+@@ -547,7 +547,7 @@ int arch_remove_memory(u64 start, u64 size)
+ 	int ret;
+ 
+ 	zone = page_zone(pfn_to_page(start_pfn));
+-	ret = __remove_pages(zone, start_pfn, nr_pages);
++	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ 	if (unlikely(ret))
+ 		pr_warn("%s: Failed, __remove_pages() == %d\n", __func__,
+ 			ret);
+diff --git a/arch/x86/mm/init_32.c b/arch/x86/mm/init_32.c
+index 0b994ce85c46..23f6c02d1374 100644
+--- a/arch/x86/mm/init_32.c
++++ b/arch/x86/mm/init_32.c
+@@ -855,14 +855,14 @@ int arch_add_memory(int nid, u64 start, u64 size)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+-int arch_remove_memory(u64 start, u64 size)
++int arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	struct zone *zone;
+ 
+ 	zone = page_zone(pfn_to_page(start_pfn));
+-	return __remove_pages(zone, start_pfn, nr_pages);
++	return __remove_pages(zone, start_pfn, nr_pages, altmap);
+ }
+ #endif
+ #endif
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 25c65b6af83e..c7a0f9568169 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -980,21 +980,19 @@ kernel_physical_mapping_remove(unsigned long start, unsigned long end)
+ 	remove_pagetable(start, end, true);
+ }
+ 
+-int __ref arch_remove_memory(u64 start, u64 size)
++int __ref arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	struct page *page = pfn_to_page(start_pfn);
+-	struct vmem_altmap *altmap;
+ 	struct zone *zone;
+ 	int ret;
+ 
+ 	/* With altmap the first mapped page is offset from @start */
+-	altmap = to_vmem_altmap((unsigned long) page);
+ 	if (altmap)
+ 		page += vmem_altmap_offset(altmap);
+ 	zone = page_zone(page);
+-	ret = __remove_pages(zone, start_pfn, nr_pages);
++	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ 	WARN_ON_ONCE(ret);
+ 	kernel_physical_mapping_remove(start, start + size);
+ 
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index d0cd6c1954bf..039fa0e427af 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -98,9 +98,10 @@ extern int try_online_node(int nid);
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+ extern bool is_pageblock_removable_nolock(struct page *page);
+-extern int arch_remove_memory(u64 start, u64 size);
++extern int arch_remove_memory(u64 start, u64 size,
++		struct vmem_altmap *altmap);
+ extern int __remove_pages(struct zone *zone, unsigned long start_pfn,
+-	unsigned long nr_pages);
++	unsigned long nr_pages, struct vmem_altmap *altmap);
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
+ 
+ /* reasonably generic interface to expand the physical pages in a zone  */
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/hmm.c
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 4ad6525f2bd5..d19cdb3b5fdf 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -798,7 +798,7 @@ static int __remove_section(struct zone *zone, struct mem_section *ms,
+  * calling offline_pages().
+  */
+ int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
+-		 unsigned long nr_pages)
++		 unsigned long nr_pages, struct vmem_altmap *altmap)
+ {
+ 	unsigned long i;
+ 	unsigned long map_offset = 0;
+@@ -806,10 +806,6 @@ int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
+ 
+ 	/* In the ZONE_DEVICE case device driver owns the memory region */
+ 	if (is_dev_zone(zone)) {
+-		struct page *page = pfn_to_page(phys_start_pfn);
+-		struct vmem_altmap *altmap;
+-
+-		altmap = to_vmem_altmap((unsigned long) page);
+ 		if (altmap)
+ 			map_offset = vmem_altmap_offset(altmap);
+ 	} else {
+@@ -2068,7 +2064,7 @@ void __ref remove_memory(int nid, u64 start, u64 size)
+ 	memblock_free(start, size);
+ 	memblock_remove(start, size);
+ 
+-	arch_remove_memory(start, size);
++	arch_remove_memory(start, size, NULL);
+ 
+ 	try_offline_node(nid);
+ 
