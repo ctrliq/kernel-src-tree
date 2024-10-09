@@ -1,0 +1,150 @@
+netvsc: use refcount_t for keeping track of sub channels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 43c7bd1ffcd1621c64cedf1be52156e2f95bba9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/43c7bd1f.failed
+
+Rather than a lock and variable, use a refcount_t to keep track
+of the number of sub channels.  Don't need to wait for subchannels
+on device removal since wait was already done in device_add.
+
+Also fix the error handling; don't wait forever in case of
+an error on request to create sub channels.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 43c7bd1ffcd1621c64cedf1be52156e2f95bba9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 34a80d16df32,4747ad48b3cc..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -745,13 -759,10 +745,18 @@@ struct netvsc_device 
+  
+  	struct nvsp_message revoke_packet;
+  
+ +	struct vmbus_channel *chn_table[VRSS_CHANNEL_MAX];
+ +	u32 send_table[VRSS_SEND_TAB_SIZE];
+  	u32 max_chn;
+  	u32 num_chn;
+++<<<<<<< HEAD
+ +	spinlock_t sc_lock; /* Protects num_sc_offered variable */
+ +	u32 num_sc_offered;
+ +	atomic_t queue_sends[VRSS_CHANNEL_MAX];
+++=======
++ 
++ 	refcount_t sc_offered;
+++>>>>>>> 43c7bd1ffcd1 (netvsc: use refcount_t for keeping track of sub channels)
+  
+  	/* Holds rndis device info */
+  	void *extension;
+diff --cc drivers/net/hyperv/rndis_filter.c
+index 5f837393f27a,3bd5447277ad..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -914,8 -996,8 +914,12 @@@ static void netvsc_sc_open(struct vmbus
+  		hv_get_drvdata(new_sc->primary_channel->device_obj);
+  	struct netvsc_device *nvscdev = net_device_to_netvsc_device(ndev);
+  	u16 chn_index = new_sc->offermsg.offer.sub_channel_index;
+++<<<<<<< HEAD
+++=======
++ 	struct netvsc_channel *nvchan;
+++>>>>>>> 43c7bd1ffcd1 (netvsc: use refcount_t for keeping track of sub channels)
+  	int ret;
+ +	unsigned long flags;
+  
+  	if (chn_index >= nvscdev->num_chn)
+  		return;
+@@@ -928,15 -1011,14 +932,12 @@@
+  
+  	ret = vmbus_open(new_sc, nvscdev->ring_size * PAGE_SIZE,
+  			 nvscdev->ring_size * PAGE_SIZE, NULL, 0,
+ -			 netvsc_channel_cb, nvchan);
+ +			 netvsc_channel_cb, new_sc);
+  
+  	if (ret == 0)
+ -		nvchan->channel = new_sc;
+ -
+ -	napi_enable(&nvchan->napi);
+ +		nvscdev->chn_table[chn_index] = new_sc;
+  
+- 	spin_lock_irqsave(&nvscdev->sc_lock, flags);
+- 	nvscdev->num_sc_offered--;
+- 	spin_unlock_irqrestore(&nvscdev->sc_lock, flags);
+- 	if (nvscdev->num_sc_offered == 0)
++ 	if (refcount_dec_and_test(&nvscdev->sc_offered))
+  		complete(&nvscdev->channel_init_wait);
+  }
+  
+@@@ -952,12 -1034,10 +953,16 @@@ int rndis_filter_device_add(struct hv_d
+  	struct nvsp_message *init_packet;
+  	struct ndis_recv_scale_cap rsscap;
+  	u32 rsscap_size = sizeof(struct ndis_recv_scale_cap);
+++<<<<<<< HEAD
+ +	u32 mtu, size;
+ +	u32 num_rss_qs;
+ +	u32 sc_delta;
+++=======
++ 	unsigned int gso_max_size = GSO_MAX_SIZE;
++ 	u32 mtu, size, num_rss_qs;
+++>>>>>>> 43c7bd1ffcd1 (netvsc: use refcount_t for keeping track of sub channels)
+  	const struct cpumask *node_cpu_mask;
+  	u32 num_possible_rss_qs;
+- 	unsigned long flags;
+  	int i, ret;
+  
+  	rndis_device = get_rndis_device();
+@@@ -1071,19 -1193,11 +1076,20 @@@
+  		rndis_device->ind_table[i] = ethtool_rxfh_indir_default(i,
+  							net_device->num_chn);
+  
+ -	num_rss_qs = net_device->num_chn - 1;
+ -	if (num_rss_qs == 0)
+ -		return 0;
+ +	net_device->num_sc_offered = num_rss_qs;
+ +
+ +	if (net_device->num_chn == 1)
+ +		goto out;
+ +
+ +	net_device->sub_cb_buf = vzalloc((net_device->num_chn - 1) *
+ +					 NETVSC_PACKET_SIZE);
+ +	if (!net_device->sub_cb_buf) {
+ +		net_device->num_chn = 1;
+ +		dev_info(&dev->device, "No memory for subchannels.\n");
+ +		goto out;
+ +	}
+  
++ 	refcount_set(&net_device->sc_offered, num_rss_qs);
+  	vmbus_set_sc_create_callback(dev->channel, netvsc_sc_open);
+  
+  	init_packet = &net_device->channel_init_pkt;
+@@@ -1134,17 -1239,11 +1131,11 @@@ err_dev_remv
+  	return ret;
+  }
+  
+ -void rndis_filter_device_remove(struct hv_device *dev,
+ -				struct netvsc_device *net_dev)
+ +void rndis_filter_device_remove(struct hv_device *dev)
+  {
+ +	struct netvsc_device *net_dev = hv_device_to_netvsc_device(dev);
+  	struct rndis_device *rndis_dev = net_dev->extension;
+  
+- 	/* If not all subchannel offers are complete, wait for them until
+- 	 * completion to avoid race.
+- 	 */
+- 	if (net_dev->num_sc_offered > 0)
+- 		wait_for_completion(&net_dev->channel_init_wait);
+- 
+  	/* Halt and release the rndis device */
+  	rndis_filter_halt_device(rndis_dev);
+  
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/rndis_filter.c
