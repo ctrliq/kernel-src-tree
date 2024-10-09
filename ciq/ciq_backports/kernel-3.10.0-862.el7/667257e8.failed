@@ -1,0 +1,141 @@
+block: properly protect the 'queue' kobj in blk_unregister_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] properly protect the 'queue' kobj in blk_unregister_queue (Mike Snitzer) [1517771]
+Rebuild_FUZZ: 94.21%
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 667257e8b2988c0183ba23e2bcd6900e87961606
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/667257e8.failed
+
+The original commit e9a823fb34a8b (block: fix warning when I/O elevator
+is changed as request_queue is being removed) is pretty conflated.
+"conflated" because the resource being protected by q->sysfs_lock isn't
+the queue_flags (it is the 'queue' kobj).
+
+q->sysfs_lock serializes __elevator_change() (via elv_iosched_store)
+from racing with blk_unregister_queue():
+1) By holding q->sysfs_lock first, __elevator_change() can complete
+before a racing blk_unregister_queue().
+2) Conversely, __elevator_change() is testing for QUEUE_FLAG_REGISTERED
+in case elv_iosched_store() loses the race with blk_unregister_queue(),
+it needs a way to know the 'queue' kobj isn't there.
+
+Expand the scope of blk_unregister_queue()'s q->sysfs_lock use so it is
+held until after the 'queue' kobj is removed.
+
+To do so blk_mq_unregister_dev() must not also take q->sysfs_lock.  So
+rename __blk_mq_unregister_dev() to blk_mq_unregister_dev().
+
+Also, blk_unregister_queue() should use q->queue_lock to protect against
+any concurrent writes to q->queue_flags -- even though chances are the
+queue is being cleaned up so no concurrent writes are likely.
+
+Fixes: e9a823fb34a8b ("block: fix warning when I/O elevator is changed as request_queue is being removed")
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 667257e8b2988c0183ba23e2bcd6900e87961606)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sysfs.c
+#	block/blk-sysfs.c
+diff --cc block/blk-mq-sysfs.c
+index 44799e473f05,a54b4b070f1c..000000000000
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@@ -372,43 -248,41 +372,46 @@@ static int blk_mq_register_hctx(struct 
+  	return ret;
+  }
+  
+- static void __blk_mq_unregister_dev(struct device *dev, struct request_queue *q)
++ void blk_mq_unregister_dev(struct device *dev, struct request_queue *q)
+  {
+  	struct blk_mq_hw_ctx *hctx;
+ -	int i;
+ -
+ -	lockdep_assert_held(&q->sysfs_lock);
+ +	struct blk_mq_ctx *ctx;
+ +	int i, j;
+  
+ -	queue_for_each_hw_ctx(q, hctx, i)
+ +	queue_for_each_hw_ctx(q, hctx, i) {
+  		blk_mq_unregister_hctx(hctx);
+  
+ +		hctx_for_each_ctx(hctx, ctx, j)
+ +			kobject_put(&ctx->kobj);
+ +
+ +		kobject_put(&hctx->kobj);
+ +	}
+ +
+  	kobject_uevent(&q->mq_kobj, KOBJ_REMOVE);
+  	kobject_del(&q->mq_kobj);
+ +	kobject_put(&q->mq_kobj);
+ +
+  	kobject_put(&dev->kobj);
+  
+  	q->mq_sysfs_init_done = false;
+  }
+  
+ -void blk_mq_hctx_kobj_init(struct blk_mq_hw_ctx *hctx)
+++<<<<<<< HEAD
+ +void blk_mq_unregister_dev(struct device *dev, struct request_queue *q)
+  {
+ -	kobject_init(&hctx->kobj, &blk_mq_hw_ktype);
+ +	blk_mq_disable_hotplug();
+ +	__blk_mq_unregister_dev(dev, q);
+ +	blk_mq_enable_hotplug();
+  }
+  
+ -void blk_mq_sysfs_deinit(struct request_queue *q)
+++=======
+++>>>>>>> 667257e8b298 (block: properly protect the 'queue' kobj in blk_unregister_queue)
+ +void blk_mq_hctx_kobj_init(struct blk_mq_hw_ctx *hctx)
+  {
+ -	struct blk_mq_ctx *ctx;
+ -	int cpu;
+ -
+ -	for_each_possible_cpu(cpu) {
+ -		ctx = per_cpu_ptr(q->queue_ctx, cpu);
+ -		kobject_put(&ctx->kobj);
+ -	}
+ -	kobject_put(&q->mq_kobj);
+ +	kobject_init(&hctx->kobj, &blk_mq_hw_ktype);
+  }
+  
+ -void blk_mq_sysfs_init(struct request_queue *q)
+ +static void blk_mq_sysfs_init(struct request_queue *q)
+  {
+  	struct blk_mq_ctx *ctx;
+  	int cpu;
+diff --cc block/blk-sysfs.c
+index 28651fcb101c,9272452ff456..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -642,6 -929,18 +642,21 @@@ void blk_unregister_queue(struct gendis
+  	if (WARN_ON(!q))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Protect against the 'queue' kobj being accessed
++ 	 * while/after it is removed.
++ 	 */
++ 	mutex_lock(&q->sysfs_lock);
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	queue_flag_clear(QUEUE_FLAG_REGISTERED, q);
++ 	spin_unlock_irq(q->queue_lock);
++ 
++ 	wbt_exit(q);
++ 
+++>>>>>>> 667257e8b298 (block: properly protect the 'queue' kobj in blk_unregister_queue)
+  	if (q->mq_ops)
+  		blk_mq_unregister_dev(disk_to_dev(disk), q);
+  
+* Unmerged path block/blk-mq-sysfs.c
+* Unmerged path block/blk-sysfs.c
