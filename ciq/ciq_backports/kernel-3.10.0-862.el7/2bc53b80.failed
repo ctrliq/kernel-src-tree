@@ -1,0 +1,218 @@
+s390/zcrypt: Fix AP queue handling if queue is full
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Fix AP queue handling if queue is full (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.85%
+commit-author Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+commit 2bc53b8046ce9a1543204b6c6da1ab95e4caac76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2bc53b80.failed
+
+When the AP queue depth of requests was reached additional requests
+have been ignored. These request are stuck in the request queue.
+
+The AP queue handling now push the next waiting request into the
+queue after fetching a previous serviced and finished reply.
+
+	Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Acked-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Acked-by: Harald Freudenberger <freude@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 2bc53b8046ce9a1543204b6c6da1ab95e4caac76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,24ec282e15d8..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -562,8 -505,181 +562,149 @@@ static int ap_query_queue(ap_qid_t qid
+  	}
+  }
+  
+ -/* State machine definitions and helpers */
+ -
+ -static void ap_sm_wait(enum ap_wait wait)
+ -{
+ -	ktime_t hr_time;
+ -
+ -	switch (wait) {
+ -	case AP_WAIT_AGAIN:
+ -	case AP_WAIT_INTERRUPT:
+ -		if (ap_using_interrupts())
+ -			break;
+ -		if (ap_poll_kthread) {
+ -			wake_up(&ap_poll_wait);
+ -			break;
+ -		}
+ -		/* Fall through */
+ -	case AP_WAIT_TIMEOUT:
+ -		spin_lock_bh(&ap_poll_timer_lock);
+ -		if (!hrtimer_is_queued(&ap_poll_timer)) {
+ -			hr_time = ktime_set(0, poll_timeout);
+ -			hrtimer_forward_now(&ap_poll_timer, hr_time);
+ -			hrtimer_restart(&ap_poll_timer);
+ -		}
+ -		spin_unlock_bh(&ap_poll_timer_lock);
+ -		break;
+ -	case AP_WAIT_NONE:
+ -	default:
+ -		break;
+ -	}
+ -}
+ -
+ -static enum ap_wait ap_sm_nop(struct ap_device *ap_dev)
+ -{
+ -	return AP_WAIT_NONE;
+ -}
+ -
+  /**
+++<<<<<<< HEAD
+ + * ap_init_queue(): Reset an AP queue.
+++=======
++  * ap_sm_recv(): Receive pending reply messages from an AP device but do
++  *	not change the state of the device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static struct ap_queue_status ap_sm_recv(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	struct ap_message *ap_msg;
++ 
++ 	status = __ap_recv(ap_dev->qid, &ap_dev->reply->psmid,
++ 			   ap_dev->reply->message, ap_dev->reply->length);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		atomic_dec(&ap_poll_requests);
++ 		ap_dev->queue_count--;
++ 		if (ap_dev->queue_count > 0)
++ 			mod_timer(&ap_dev->timeout,
++ 				  jiffies + ap_dev->drv->request_timeout);
++ 		list_for_each_entry(ap_msg, &ap_dev->pendingq, list) {
++ 			if (ap_msg->psmid != ap_dev->reply->psmid)
++ 				continue;
++ 			list_del_init(&ap_msg->list);
++ 			ap_dev->pendingq_count--;
++ 			ap_msg->receive(ap_dev, ap_msg, ap_dev->reply);
++ 			break;
++ 		}
++ 	case AP_RESPONSE_NO_PENDING_REPLY:
++ 		if (!status.queue_empty || ap_dev->queue_count <= 0)
++ 			break;
++ 		/* The card shouldn't forget requests but who knows. */
++ 		atomic_sub(ap_dev->queue_count, &ap_poll_requests);
++ 		ap_dev->queue_count = 0;
++ 		list_splice_init(&ap_dev->pendingq, &ap_dev->requestq);
++ 		ap_dev->requestq_count += ap_dev->pendingq_count;
++ 		ap_dev->pendingq_count = 0;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	return status;
++ }
++ 
++ /**
++  * ap_sm_read(): Receive pending reply messages from an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_read(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 
++ 	status = ap_sm_recv(ap_dev);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		if (ap_dev->queue_count > 0) {
++ 			ap_dev->state = AP_STATE_WORKING;
++ 			return AP_WAIT_AGAIN;
++ 		}
++ 		ap_dev->state = AP_STATE_IDLE;
++ 		return AP_WAIT_NONE;
++ 	case AP_RESPONSE_NO_PENDING_REPLY:
++ 		if (ap_dev->queue_count > 0)
++ 			return AP_WAIT_INTERRUPT;
++ 		ap_dev->state = AP_STATE_IDLE;
++ 		return AP_WAIT_NONE;
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_write(): Send messages from the request queue to an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_write(struct ap_device *ap_dev)
++ {
++ 	struct ap_queue_status status;
++ 	struct ap_message *ap_msg;
++ 
++ 	if (ap_dev->requestq_count <= 0)
++ 		return AP_WAIT_NONE;
++ 	/* Start the next request on the queue. */
++ 	ap_msg = list_entry(ap_dev->requestq.next, struct ap_message, list);
++ 	status = __ap_send(ap_dev->qid, ap_msg->psmid,
++ 			   ap_msg->message, ap_msg->length, ap_msg->special);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 		atomic_inc(&ap_poll_requests);
++ 		ap_dev->queue_count++;
++ 		if (ap_dev->queue_count == 1)
++ 			mod_timer(&ap_dev->timeout,
++ 				  jiffies + ap_dev->drv->request_timeout);
++ 		list_move_tail(&ap_msg->list, &ap_dev->pendingq);
++ 		ap_dev->requestq_count--;
++ 		ap_dev->pendingq_count++;
++ 		if (ap_dev->queue_count < ap_dev->queue_depth) {
++ 			ap_dev->state = AP_STATE_WORKING;
++ 			return AP_WAIT_AGAIN;
++ 		}
++ 		/* fall through */
++ 	case AP_RESPONSE_Q_FULL:
++ 		ap_dev->state = AP_STATE_QUEUE_FULL;
++ 		return AP_WAIT_INTERRUPT;
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 		ap_dev->state = AP_STATE_RESET_WAIT;
++ 		return AP_WAIT_TIMEOUT;
++ 	case AP_RESPONSE_MESSAGE_TOO_BIG:
++ 	case AP_RESPONSE_REQ_FAC_NOT_INST:
++ 		list_del_init(&ap_msg->list);
++ 		ap_dev->requestq_count--;
++ 		ap_msg->rc = -EINVAL;
++ 		ap_msg->receive(ap_dev, ap_msg, NULL);
++ 		return AP_WAIT_AGAIN;
++ 	default:
++ 		ap_dev->state = AP_STATE_BORKED;
++ 		return AP_WAIT_NONE;
++ 	}
++ }
++ 
++ /**
++  * ap_sm_read_write(): Send and receive messages to/from an AP device.
++  * @ap_dev: pointer to the AP device
++  *
++  * Returns AP_WAIT_NONE, AP_WAIT_AGAIN, or AP_WAIT_INTERRUPT
++  */
++ static enum ap_wait ap_sm_read_write(struct ap_device *ap_dev)
++ {
++ 	return min(ap_sm_read(ap_dev), ap_sm_write(ap_dev));
++ }
++ 
++ /**
++  * ap_sm_reset(): Reset an AP queue.
+++>>>>>>> 2bc53b8046ce (s390/zcrypt: Fix AP queue handling if queue is full)
+   * @qid: The AP queue number
+   *
+   * Submit the Reset command to an AP queue.
+* Unmerged path drivers/s390/crypto/ap_bus.c
