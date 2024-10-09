@@ -1,0 +1,166 @@
+gfs2: move check_journal_clean to util.c for future use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 0d91061a372671aec1af729686ad9241a59fc328
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/0d91061a.failed
+
+Before this patch function check_journal_clean was in ops_fstype.c.
+This patch moves it to util.c so we can make use of it elsewhere
+in a future patch.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 0d91061a372671aec1af729686ad9241a59fc328)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/util.c
+index 33a5f6d866e6,86965e6089c6..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -31,11 -33,68 +34,73 @@@ mempool_t *gfs2_page_pool __read_mostly
+  
+  void gfs2_assert_i(struct gfs2_sbd *sdp)
+  {
+ -	fs_emerg(sdp, "fatal assertion failed\n");
+ +	printk(KERN_EMERG "GFS2: fsid=%s: fatal assertion failed\n",
+ +	       sdp->sd_fsname);
+  }
+  
+++<<<<<<< HEAD
+ +int gfs2_lm_withdraw(struct gfs2_sbd *sdp, char *fmt, ...)
+++=======
++ /**
++  * check_journal_clean - Make sure a journal is clean for a spectator mount
++  * @sdp: The GFS2 superblock
++  * @jd: The journal descriptor
++  *
++  * Returns: 0 if the journal is clean or locked, else an error
++  */
++ int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd)
++ {
++ 	int error;
++ 	struct gfs2_holder j_gh;
++ 	struct gfs2_log_header_host head;
++ 	struct gfs2_inode *ip;
++ 
++ 	ip = GFS2_I(jd->jd_inode);
++ 	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED, LM_FLAG_NOEXP |
++ 				   GL_EXACT | GL_NOCACHE, &j_gh);
++ 	if (error) {
++ 		fs_err(sdp, "Error locking journal for spectator mount.\n");
++ 		return -EPERM;
++ 	}
++ 	error = gfs2_jdesc_check(jd);
++ 	if (error) {
++ 		fs_err(sdp, "Error checking journal for spectator mount.\n");
++ 		goto out_unlock;
++ 	}
++ 	error = gfs2_find_jhead(jd, &head, false);
++ 	if (error) {
++ 		fs_err(sdp, "Error parsing journal for spectator mount.\n");
++ 		goto out_unlock;
++ 	}
++ 	if (!(head.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
++ 		error = -EPERM;
++ 		fs_err(sdp, "jid=%u: Journal is dirty, so the first mounter "
++ 		       "must not be a spectator.\n", jd->jd_jid);
++ 	}
++ 
++ out_unlock:
++ 	gfs2_glock_dq_uninit(&j_gh);
++ 	return error;
++ }
++ 
++ void gfs2_lm(struct gfs2_sbd *sdp, const char *fmt, ...)
++ {
++ 	struct va_format vaf;
++ 	va_list args;
++ 
++ 	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW &&
++ 	    test_bit(SDF_WITHDRAWN, &sdp->sd_flags))
++ 		return;
++ 
++ 	va_start(args, fmt);
++ 	vaf.fmt = fmt;
++ 	vaf.va = &args;
++ 	fs_err(sdp, "%pV", &vaf);
++ 	va_end(args);
++ }
++ 
++ int gfs2_withdraw(struct gfs2_sbd *sdp)
+++>>>>>>> 0d91061a3726 (gfs2: move check_journal_clean to util.c for future use)
+  {
+  	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+  	const struct lm_lockops *lm = ls->ls_ops;
+diff --git a/fs/gfs2/ops_fstype.c b/fs/gfs2/ops_fstype.c
+index cc0fc48b4376..d7644d8872a9 100644
+--- a/fs/gfs2/ops_fstype.c
++++ b/fs/gfs2/ops_fstype.c
+@@ -580,48 +580,6 @@ static int gfs2_jindex_hold(struct gfs2_sbd *sdp, struct gfs2_holder *ji_gh)
+ 	return error;
+ }
+ 
+-/**
+- * check_journal_clean - Make sure a journal is clean for a spectator mount
+- * @sdp: The GFS2 superblock
+- * @jd: The journal descriptor
+- *
+- * Returns: 0 if the journal is clean or locked, else an error
+- */
+-static int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd)
+-{
+-	int error;
+-	struct gfs2_holder j_gh;
+-	struct gfs2_log_header_host head;
+-	struct gfs2_inode *ip;
+-
+-	ip = GFS2_I(jd->jd_inode);
+-	error = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED, LM_FLAG_NOEXP |
+-				   GL_EXACT | GL_NOCACHE, &j_gh);
+-	if (error) {
+-		fs_err(sdp, "Error locking journal for spectator mount.\n");
+-		return -EPERM;
+-	}
+-	error = gfs2_jdesc_check(jd);
+-	if (error) {
+-		fs_err(sdp, "Error checking journal for spectator mount.\n");
+-		goto out_unlock;
+-	}
+-	error = gfs2_find_jhead(jd, &head, false);
+-	if (error) {
+-		fs_err(sdp, "Error parsing journal for spectator mount.\n");
+-		goto out_unlock;
+-	}
+-	if (!(head.lh_flags & GFS2_LOG_HEAD_UNMOUNT)) {
+-		error = -EPERM;
+-		fs_err(sdp, "jid=%u: Journal is dirty, so the first mounter "
+-		       "must not be a spectator.\n", jd->jd_jid);
+-	}
+-
+-out_unlock:
+-	gfs2_glock_dq_uninit(&j_gh);
+-	return error;
+-}
+-
+ static int init_journal(struct gfs2_sbd *sdp, int undo)
+ {
+ 	struct inode *master = sdp->sd_master_dir->d_inode;
+* Unmerged path fs/gfs2/util.c
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index 44242f56811a..b2a1999a4338 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -130,6 +130,7 @@ static inline void gfs2_metatype_set(struct buffer_head *bh, u16 type,
+ 
+ int gfs2_io_error_i(struct gfs2_sbd *sdp, const char *function,
+ 		    char *file, unsigned int line);
++int check_journal_clean(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd);
+ 
+ #define gfs2_io_error(sdp) \
+ gfs2_io_error_i((sdp), __func__, __FILE__, __LINE__);
