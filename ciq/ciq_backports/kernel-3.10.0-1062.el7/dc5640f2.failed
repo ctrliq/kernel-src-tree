@@ -1,0 +1,269 @@
+IB/core: Fix deleting default GIDs when changing mac adddress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit dc5640f294e4ff6b89047cb4a0dfa931d5f0cd1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dc5640f2.failed
+
+Before [1], When MAC address of the netdevice is changed, default GID is
+supposed to get deleted and added back which affects the node and/or port
+GUID in below sequence.
+
+netdevice_event()
+-> NETDEV_CHANGEADDR
+   default_del_cmd()
+      del_netdev_default_ips()
+          bond_delete_netdev_default_gids()
+              ib_cache_gid_set_default_gid()
+                  ib_cache_gid_del()
+   add_cmd()
+   [..]
+
+However, ib_cache_gid_del() was not getting invoked in non bonding
+scenarios because event_ndev and rdma_ndev are same.
+Therefore, fix such condition to ignore checking upper device when event
+ndev and rdma_dev are same; similar to bond_set_netdev_default_gids().
+
+Which this fix ib_cache_gid_del() is invoked correctly; however
+ib_cache_gid_del() doesn't find the default GID for deletion because
+find_gid() was given default_gid = false with
+GID_ATTR_FIND_MASK_DEFAULT set.
+But it was getting overwritten by ib_cache_gid_set_default_gid() later
+on as part of add_cmd().
+Therefore, mac address change used to work for default GID.
+
+With refactor series [1], this incorrect behavior is detected.
+
+Therefore,
+when deleting default GID, set default_gid and set MASK flag.
+when deleting IP based GID, clear default_gid and set MASK flag.
+
+[1] https://patchwork.kernel.org/patch/10319151/
+
+Fixes: 238fdf48f2b5 ("IB/core: Add RoCE table bonding support")
+Fixes: 598ff6bae689 ("IB/core: Refactor GID modify code for RoCE")
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit dc5640f294e4ff6b89047cb4a0dfa931d5f0cd1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 8ce9acd96a1f,fb2d347f760f..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -340,17 -416,30 +340,45 @@@ int ib_cache_gid_add(struct ib_device *
+  			dev_put(idev);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	mask = GID_ATTR_FIND_MASK_GID |
++ 	       GID_ATTR_FIND_MASK_GID_TYPE |
++ 	       GID_ATTR_FIND_MASK_NETDEV;
++ 
++ 	ret = __ib_cache_gid_add(ib_dev, port, gid, attr, mask, false);
++ 	return ret;
++ }
++ 
++ static int
++ _ib_cache_gid_del(struct ib_device *ib_dev, u8 port,
++ 		  union ib_gid *gid, struct ib_gid_attr *attr,
++ 		  unsigned long mask, bool default_gid)
++ {
++ 	struct ib_gid_table *table;
++ 	int ret = 0;
++ 	int ix;
++ 
++ 	table = ib_dev->cache.ports[port - rdma_start_port(ib_dev)].gid;
++ 
+++>>>>>>> dc5640f294e4 (IB/core: Fix deleting default GIDs when changing mac adddress)
+  	mutex_lock(&table->lock);
+ +	write_lock_irq(&table->rwlock);
+ +
+++<<<<<<< HEAD
+ +	ix = find_gid(table, gid, attr, false, GID_ATTR_FIND_MASK_GID |
+ +		      GID_ATTR_FIND_MASK_GID_TYPE |
+ +		      GID_ATTR_FIND_MASK_NETDEV, &empty);
+ +	if (ix >= 0)
+ +		goto out_unlock;
+  
+ +	if (empty < 0) {
+ +		ret = -ENOSPC;
+++=======
++ 	ix = find_gid(table, gid, attr, default_gid, mask, NULL);
++ 	if (ix < 0) {
++ 		ret = -EINVAL;
+++>>>>>>> dc5640f294e4 (IB/core: Fix deleting default GIDs when changing mac adddress)
+  		goto out_unlock;
+  	}
+  
+@@@ -367,30 -457,12 +395,39 @@@ out_unlock
+  int ib_cache_gid_del(struct ib_device *ib_dev, u8 port,
+  		     union ib_gid *gid, struct ib_gid_attr *attr)
+  {
+++<<<<<<< HEAD
+ +	struct ib_gid_table *table;
+ +	int ix;
+ +
+ +	table = ib_dev->cache.ports[port - rdma_start_port(ib_dev)].gid;
+ +
+ +	mutex_lock(&table->lock);
+ +	write_lock_irq(&table->rwlock);
+ +
+ +	ix = find_gid(table, gid, attr, false,
+ +		      GID_ATTR_FIND_MASK_GID	  |
+ +		      GID_ATTR_FIND_MASK_GID_TYPE |
+ +		      GID_ATTR_FIND_MASK_NETDEV	  |
+ +		      GID_ATTR_FIND_MASK_DEFAULT,
+ +		      NULL);
+ +	if (ix < 0)
+ +		goto out_unlock;
+ +
+ +	if (!del_gid(ib_dev, port, table, ix, false))
+ +		dispatch_gid_change_event(ib_dev, port);
+ +
+ +out_unlock:
+ +	write_unlock_irq(&table->rwlock);
+ +	mutex_unlock(&table->lock);
+ +	return 0;
+++=======
++ 	unsigned long mask = GID_ATTR_FIND_MASK_GID	  |
++ 			     GID_ATTR_FIND_MASK_GID_TYPE |
++ 			     GID_ATTR_FIND_MASK_DEFAULT  |
++ 			     GID_ATTR_FIND_MASK_NETDEV;
++ 
++ 	return _ib_cache_gid_del(ib_dev, port, gid, attr, mask, false);
+++>>>>>>> dc5640f294e4 (IB/core: Fix deleting default GIDs when changing mac adddress)
+  }
+  
+  int ib_cache_gid_del_all_netdev_gids(struct ib_device *ib_dev, u8 port,
+@@@ -666,11 -741,11 +703,11 @@@ void ib_cache_gid_set_default_gid(struc
+  				  unsigned long gid_type_mask,
+  				  enum ib_cache_gid_default_mode mode)
+  {
+- 	union ib_gid gid;
++ 	union ib_gid gid = { };
+  	struct ib_gid_attr gid_attr;
+ +	struct ib_gid_attr zattr_type = zattr;
+  	struct ib_gid_table *table;
+  	unsigned int gid_type;
+ -	unsigned long mask;
+  
+  	table = ib_dev->cache.ports[port - rdma_start_port(ib_dev)].gid;
+  
+@@@ -688,51 -761,14 +727,61 @@@
+  
+  		gid_attr.gid_type = gid_type;
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&table->lock);
+ +		write_lock_irq(&table->rwlock);
+ +		ix = find_gid(table, NULL, &gid_attr, true,
+ +			      GID_ATTR_FIND_MASK_GID_TYPE |
+ +			      GID_ATTR_FIND_MASK_DEFAULT,
+ +			      NULL);
+ +
+ +		/* Coudn't find default GID location */
+ +		if (WARN_ON(ix < 0))
+ +			goto release;
+ +
+ +		zattr_type.gid_type = gid_type;
+ +
+ +		if (!__ib_cache_gid_get(ib_dev, port, ix,
+ +					&current_gid, &current_gid_attr) &&
+ +		    mode == IB_CACHE_GID_DEFAULT_MODE_SET &&
+ +		    !memcmp(&gid, &current_gid, sizeof(gid)) &&
+ +		    !memcmp(&gid_attr, &current_gid_attr, sizeof(gid_attr)))
+ +			goto release;
+ +
+ +		if (memcmp(&current_gid, &zgid, sizeof(current_gid)) ||
+ +		    memcmp(&current_gid_attr, &zattr_type,
+ +			   sizeof(current_gid_attr))) {
+ +			if (del_gid(ib_dev, port, table, ix, true)) {
+ +				pr_warn("ib_cache_gid: can't delete index %d for default gid %pI6\n",
+ +					ix, gid.raw);
+ +				goto release;
+ +			} else {
+ +				dispatch_gid_change_event(ib_dev, port);
+ +			}
+++=======
++ 		if (mode == IB_CACHE_GID_DEFAULT_MODE_SET) {
++ 			make_default_gid(ndev, &gid);
++ 			__ib_cache_gid_add(ib_dev, port, &gid,
++ 					   &gid_attr, mask, true);
++ 		} else if (mode == IB_CACHE_GID_DEFAULT_MODE_DELETE) {
++ 			_ib_cache_gid_del(ib_dev, port, &gid,
++ 					  &gid_attr, mask, true);
+++>>>>>>> dc5640f294e4 (IB/core: Fix deleting default GIDs when changing mac adddress)
+ +		}
+ +
+ +		if (mode == IB_CACHE_GID_DEFAULT_MODE_SET) {
+ +			if (add_gid(ib_dev, port, table, ix, &gid, &gid_attr, true))
+ +				pr_warn("ib_cache_gid: unable to add default gid %pI6\n",
+ +					gid.raw);
+ +			else
+ +				dispatch_gid_change_event(ib_dev, port);
+  		}
+ +
+ +release:
+ +		if (current_gid_attr.ndev)
+ +			dev_put(current_gid_attr.ndev);
+ +		write_unlock_irq(&table->rwlock);
+ +		mutex_unlock(&table->lock);
+  	}
+  }
+  
+* Unmerged path drivers/infiniband/core/cache.c
+diff --git a/drivers/infiniband/core/roce_gid_mgmt.c b/drivers/infiniband/core/roce_gid_mgmt.c
+index 4a6590276977..edd4d3ef8ab4 100644
+--- a/drivers/infiniband/core/roce_gid_mgmt.c
++++ b/drivers/infiniband/core/roce_gid_mgmt.c
+@@ -255,6 +255,7 @@ static void bond_delete_netdev_default_gids(struct ib_device *ib_dev,
+ 					    struct net_device *rdma_ndev)
+ {
+ 	struct net_device *real_dev = rdma_vlan_dev_real_dev(event_ndev);
++	unsigned long gid_type_mask;
+ 
+ 	if (!rdma_ndev)
+ 		return;
+@@ -264,21 +265,22 @@ static void bond_delete_netdev_default_gids(struct ib_device *ib_dev,
+ 
+ 	rcu_read_lock();
+ 
+-	if (rdma_is_upper_dev_rcu(rdma_ndev, event_ndev) &&
+-	    is_eth_active_slave_of_bonding_rcu(rdma_ndev, real_dev) ==
+-	    BONDING_SLAVE_STATE_INACTIVE) {
+-		unsigned long gid_type_mask;
+-
++	if (((rdma_ndev != event_ndev &&
++	      !rdma_is_upper_dev_rcu(rdma_ndev, event_ndev)) ||
++	     is_eth_active_slave_of_bonding_rcu(rdma_ndev, real_dev)
++						 ==
++	     BONDING_SLAVE_STATE_INACTIVE)) {
+ 		rcu_read_unlock();
++		return;
++	}
+ 
+-		gid_type_mask = roce_gid_type_mask_support(ib_dev, port);
++	rcu_read_unlock();
+ 
+-		ib_cache_gid_set_default_gid(ib_dev, port, rdma_ndev,
+-					     gid_type_mask,
+-					     IB_CACHE_GID_DEFAULT_MODE_DELETE);
+-	} else {
+-		rcu_read_unlock();
+-	}
++	gid_type_mask = roce_gid_type_mask_support(ib_dev, port);
++
++	ib_cache_gid_set_default_gid(ib_dev, port, rdma_ndev,
++				     gid_type_mask,
++				     IB_CACHE_GID_DEFAULT_MODE_DELETE);
+ }
+ 
+ static void enum_netdev_ipv4_ips(struct ib_device *ib_dev,
