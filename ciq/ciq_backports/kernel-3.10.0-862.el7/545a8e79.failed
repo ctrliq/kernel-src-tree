@@ -1,0 +1,323 @@
+netvsc: use RCU to protect inner device structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 545a8e79bd1cc8774877a26275171a2ec8881c9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/545a8e79.failed
+
+The netvsc driver has an internal structure (netvsc_device) which
+is created when device is opened and released when device is closed.
+And also opened/released when MTU or number of channels change.
+
+Since this is referenced in the receive and transmit path, it is
+safer to use RCU to protect/prevent use after free problems.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 545a8e79bd1cc8774877a26275171a2ec8881c9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index 34a80d16df32,0ade21f95d71..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -771,6 -778,10 +771,13 @@@ struct netvsc_device 
+  	atomic_t num_outstanding_recvs;
+  
+  	atomic_t open_cnt;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct netvsc_channel chan_table[VRSS_CHANNEL_MAX];
++ 
++ 	struct rcu_head rcu;
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  };
+  
+  static inline struct netvsc_device *
+diff --cc drivers/net/hyperv/netvsc.c
+index 2adfe0ec4fe2,ab9118d620ab..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -97,6 -92,11 +99,14 @@@ static void free_netvsc_device(struct r
+  	kfree(nvdev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void free_netvsc_device_rcu(struct netvsc_device *nvdev)
++ {
++ 	call_rcu(&nvdev->rcu, free_netvsc_device);
++ }
++ 
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  static struct netvsc_device *get_outbound_net_device(struct hv_device *device)
+  {
+  	struct netvsc_device *net_device = hv_device_to_netvsc_device(device);
+@@@ -583,9 -568,11 +593,13 @@@ void netvsc_device_remove(struct hv_dev
+  	/* Now, we can close the channel safely */
+  	vmbus_close(device->channel);
+  
+ -	for (i = 0; i < net_device->num_chn; i++)
+ -		napi_disable(&net_device->chan_table[i].napi);
+ -
+  	/* Release all resources */
+++<<<<<<< HEAD
+ +	vfree(net_device->sub_cb_buf);
+ +	free_netvsc_device(net_device);
+++=======
++ 	free_netvsc_device_rcu(net_device);
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  }
+  
+  #define RING_AVAIL_PERCENT_HIWATER 20
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 1f2fdf8f9b74,d8a70d07eeec..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -659,6 -637,9 +659,12 @@@ int netvsc_recv_callback(struct net_dev
+  			 const struct ndis_pkt_8021q_info *vlan)
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+++<<<<<<< HEAD
+++=======
++ 	struct netvsc_device *net_device;
++ 	u16 q_idx = channel->offermsg.offer.sub_channel_index;
++ 	struct netvsc_channel *nvchan;
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  	struct net_device *vf_netdev;
+  	struct sk_buff *skb;
+  	struct netvsc_stats *rx_stats;
+@@@ -742,12 -747,18 +754,27 @@@ static int netvsc_set_channels(struct n
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+  	struct hv_device *dev = net_device_ctx->device_ctx;
+++<<<<<<< HEAD
+ +	struct netvsc_device *nvdev = net_device_ctx->nvdev;
+ +	struct netvsc_device_info device_info;
+ +	u32 num_chn;
+ +	u32 max_chn;
+ +	int ret = 0;
+ +	bool recovering = false;
+++=======
++ 	struct netvsc_device *nvdev = rtnl_dereference(net_device_ctx->nvdev);
++ 	unsigned int count = channels->combined_count;
++ 	bool was_running;
++ 	int ret;
++ 
++ 	/* We do not support separate count for rx, tx, or other */
++ 	if (count == 0 ||
++ 	    channels->rx_count || channels->tx_count || channels->other_count)
++ 		return -EINVAL;
++ 
++ 	if (count > net->num_tx_queues || count > net->num_rx_queues)
++ 		return -EINVAL;
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  
+  	if (net_device_ctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+@@@ -893,12 -854,11 +920,12 @@@ static int netvsc_set_link_ksettings(st
+  static int netvsc_change_mtu(struct net_device *ndev, int mtu)
+  {
+  	struct net_device_context *ndevctx = netdev_priv(ndev);
+- 	struct netvsc_device *nvdev = ndevctx->nvdev;
++ 	struct netvsc_device *nvdev = rtnl_dereference(ndevctx->nvdev);
+  	struct hv_device *hdev = ndevctx->device_ctx;
+  	struct netvsc_device_info device_info;
+ -	bool was_running;
+ -	int ret;
+ +	int limit = ETH_DATA_LEN;
+ +	u32 num_chn;
+ +	int ret = 0;
+  
+  	if (ndevctx->start_remove || !nvdev || nvdev->destroy)
+  		return -ENODEV;
+@@@ -936,38 -899,43 +963,43 @@@ out
+  	return ret;
+  }
+  
+ -static void netvsc_get_stats64(struct net_device *net,
+ -			       struct rtnl_link_stats64 *t)
+ +static struct rtnl_link_stats64 *netvsc_get_stats64(struct net_device *net,
+ +						    struct rtnl_link_stats64 *t)
+  {
+  	struct net_device_context *ndev_ctx = netdev_priv(net);
+++<<<<<<< HEAD
+ +	int cpu;
+++=======
++ 	struct netvsc_device *nvdev = rcu_dereference(ndev_ctx->nvdev);
++ 	int i;
+ -
+ -	if (!nvdev)
+ -		return;
+ -
+ -	for (i = 0; i < nvdev->num_chn; i++) {
+ -		const struct netvsc_channel *nvchan = &nvdev->chan_table[i];
+ -		const struct netvsc_stats *stats;
+ -		u64 packets, bytes, multicast;
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+ +
+ +	for_each_possible_cpu(cpu) {
+ +		struct netvsc_stats *tx_stats = per_cpu_ptr(ndev_ctx->tx_stats,
+ +							    cpu);
+ +		struct netvsc_stats *rx_stats = per_cpu_ptr(ndev_ctx->rx_stats,
+ +							    cpu);
+ +		u64 tx_packets, tx_bytes, rx_packets, rx_bytes, rx_multicast;
+  		unsigned int start;
+  
+ -		stats = &nvchan->tx_stats;
+  		do {
+ -			start = u64_stats_fetch_begin_irq(&stats->syncp);
+ -			packets = stats->packets;
+ -			bytes = stats->bytes;
+ -		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+ +			start = u64_stats_fetch_begin_irq(&tx_stats->syncp);
+ +			tx_packets = tx_stats->packets;
+ +			tx_bytes = tx_stats->bytes;
+ +		} while (u64_stats_fetch_retry_irq(&tx_stats->syncp, start));
+  
+ -		t->tx_bytes	+= bytes;
+ -		t->tx_packets	+= packets;
+ -
+ -		stats = &nvchan->rx_stats;
+  		do {
+ -			start = u64_stats_fetch_begin_irq(&stats->syncp);
+ -			packets = stats->packets;
+ -			bytes = stats->bytes;
+ -			multicast = stats->multicast + stats->broadcast;
+ -		} while (u64_stats_fetch_retry_irq(&stats->syncp, start));
+ -
+ -		t->rx_bytes	+= bytes;
+ -		t->rx_packets	+= packets;
+ -		t->multicast	+= multicast;
+ +			start = u64_stats_fetch_begin_irq(&rx_stats->syncp);
+ +			rx_packets = rx_stats->packets;
+ +			rx_bytes = rx_stats->bytes;
+ +			rx_multicast = rx_stats->multicast + rx_stats->broadcast;
+ +		} while (u64_stats_fetch_retry_irq(&rx_stats->syncp, start));
+ +
+ +		t->tx_bytes	+= tx_bytes;
+ +		t->tx_packets	+= tx_packets;
+ +		t->rx_bytes	+= rx_bytes;
+ +		t->rx_packets	+= rx_packets;
+ +		t->multicast	+= rx_multicast;
+  	}
+  
+  	t->tx_dropped	= net->stats.tx_dropped;
+@@@ -1014,11 -980,22 +1046,20 @@@ static const struct 
+  	{ "tx_busy",	  offsetof(struct netvsc_ethtool_stats, tx_busy) },
+  };
+  
+ -#define NETVSC_GLOBAL_STATS_LEN	ARRAY_SIZE(netvsc_stats)
+ -
+ -/* 4 statistics per queue (rx/tx packets/bytes) */
+ -#define NETVSC_QUEUE_STATS_LEN(dev) ((dev)->num_chn * 4)
+ -
+  static int netvsc_get_sset_count(struct net_device *dev, int string_set)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 	struct netvsc_device *nvdev = rcu_dereference(ndc->nvdev);
++ 
++ 	if (!nvdev)
++ 		return -ENODEV;
++ 
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  	switch (string_set) {
+  	case ETH_SS_STATS:
+ -		return NETVSC_GLOBAL_STATS_LEN + NETVSC_QUEUE_STATS_LEN(nvdev);
+ +		return ARRAY_SIZE(netvsc_stats);
+  	default:
+  		return -EINVAL;
+  	}
+@@@ -1028,17 -1005,51 +1069,37 @@@ static void netvsc_get_ethtool_stats(st
+  				     struct ethtool_stats *stats, u64 *data)
+  {
+  	struct net_device_context *ndc = netdev_priv(dev);
+++<<<<<<< HEAD
+++=======
++ 	struct netvsc_device *nvdev = rcu_dereference(ndc->nvdev);
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  	const void *nds = &ndc->eth_stats;
+ -	const struct netvsc_stats *qstats;
+ -	unsigned int start;
+ -	u64 packets, bytes;
+ -	int i, j;
+ +	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < ARRAY_SIZE(netvsc_stats); i++)
+++=======
++ 	if (!nvdev)
++ 		return;
++ 
++ 	for (i = 0; i < NETVSC_GLOBAL_STATS_LEN; i++)
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  		data[i] = *(unsigned long *)(nds + netvsc_stats[i].offset);
+ -
+ -	for (j = 0; j < nvdev->num_chn; j++) {
+ -		qstats = &nvdev->chan_table[j].tx_stats;
+ -
+ -		do {
+ -			start = u64_stats_fetch_begin_irq(&qstats->syncp);
+ -			packets = qstats->packets;
+ -			bytes = qstats->bytes;
+ -		} while (u64_stats_fetch_retry_irq(&qstats->syncp, start));
+ -		data[i++] = packets;
+ -		data[i++] = bytes;
+ -
+ -		qstats = &nvdev->chan_table[j].rx_stats;
+ -		do {
+ -			start = u64_stats_fetch_begin_irq(&qstats->syncp);
+ -			packets = qstats->packets;
+ -			bytes = qstats->bytes;
+ -		} while (u64_stats_fetch_retry_irq(&qstats->syncp, start));
+ -		data[i++] = packets;
+ -		data[i++] = bytes;
+ -	}
+  }
+  
+  static void netvsc_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct net_device_context *ndc = netdev_priv(dev);
++ 	struct netvsc_device *nvdev = rcu_dereference(ndc->nvdev);
++ 	u8 *p = data;
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  	int i;
+  
++ 	if (!nvdev)
++ 		return;
++ 
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+  		for (i = 0; i < ARRAY_SIZE(netvsc_stats); i++)
+@@@ -1529,6 -1537,13 +1599,16 @@@ static int netvsc_probe(struct hv_devic
+  	}
+  	memcpy(net->dev_addr, device_info.mac_adr, ETH_ALEN);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* hw_features computed in rndis_filter_device_add */
++ 	net->features = net->hw_features |
++ 		NETIF_F_HIGHDMA | NETIF_F_SG |
++ 		NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
++ 	net->vlan_features = net->features;
++ 
++ 	/* RCU not necessary here, device not registered */
+++>>>>>>> 545a8e79bd1c (netvsc: use RCU to protect inner device structure)
+  	nvdev = net_device_ctx->nvdev;
+  	netif_set_real_num_tx_queues(net, nvdev->num_chn);
+  	netif_set_real_num_rx_queues(net, nvdev->num_chn);
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
