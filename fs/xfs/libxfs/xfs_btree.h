@@ -494,4 +494,9 @@ void xfs_btree_get_node_keys(struct xfs_btree_cur *cur,
 		struct xfs_btree_block *block, union xfs_btree_key *key);
 int xfs_btree_update_keys(struct xfs_btree_cur *cur, int level);
 
+typedef int (*xfs_btree_visit_blocks_fn)(struct xfs_btree_cur *cur, int level,
+		void *data);
+int xfs_btree_visit_blocks(struct xfs_btree_cur *cur,
+		xfs_btree_visit_blocks_fn fn, void *data);
+
 #endif	/* __XFS_BTREE_H__ */
