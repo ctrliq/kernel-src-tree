@@ -1,0 +1,115 @@
+net/sched: fix memory leak in act_tunnel_key_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] sched: fix memory leak in act_tunnel_key_init() (Ivan Vecera) [1656312]
+Rebuild_FUZZ: 95.92%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit ee28bb56ac5b4c0c08ef10d33cc7adb749bbf4c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ee28bb56.failed
+
+If users try to install act_tunnel_key 'set' rules with duplicate values
+of 'index', the tunnel metadata are allocated, but never released. Then,
+kmemleak complains as follows:
+
+ # tc a a a tunnel_key set src_ip 1.1.1.1 dst_ip 2.2.2.2 id 42 index 111
+ # echo clear > /sys/kernel/debug/kmemleak
+ # tc a a a tunnel_key set src_ip 1.1.1.1 dst_ip 2.2.2.2 id 42 index 111
+ Error: TC IDR already exists.
+ We have an error talking to the kernel
+ # echo scan > /sys/kernel/debug/kmemleak
+ # cat /sys/kernel/debug/kmemleak
+ unreferenced object 0xffff8800574e6c80 (size 256):
+   comm "tc", pid 5617, jiffies 4298118009 (age 57.990s)
+   hex dump (first 32 bytes):
+     00 00 00 00 00 00 00 00 00 1c e8 b0 ff ff ff ff  ................
+     81 24 c2 ad ff ff ff ff 00 00 00 00 00 00 00 00  .$..............
+   backtrace:
+     [<00000000b7afbf4e>] tunnel_key_init+0x8a5/0x1800 [act_tunnel_key]
+     [<000000007d98fccd>] tcf_action_init_1+0x698/0xac0
+     [<0000000099b8f7cc>] tcf_action_init+0x15c/0x590
+     [<00000000dc60eebe>] tc_ctl_action+0x336/0x5c2
+     [<000000002f5a2f7d>] rtnetlink_rcv_msg+0x357/0x8e0
+     [<000000000bfe7575>] netlink_rcv_skb+0x124/0x350
+     [<00000000edab656f>] netlink_unicast+0x40f/0x5d0
+     [<00000000b322cdcb>] netlink_sendmsg+0x6e8/0xba0
+     [<0000000063d9d490>] sock_sendmsg+0xb3/0xf0
+     [<00000000f0d3315a>] ___sys_sendmsg+0x654/0x960
+     [<00000000c06cbd42>] __sys_sendmsg+0xd3/0x170
+     [<00000000ce72e4b0>] do_syscall_64+0xa5/0x470
+     [<000000005caa2d97>] entry_SYSCALL_64_after_hwframe+0x49/0xbe
+     [<00000000fac1b476>] 0xffffffffffffffff
+
+This problem theoretically happens also in case users attempt to setup a
+geneve rule having wrong configuration data, or when the kernel fails to
+allocate 'params_new'. Ensure that tunnel_key_init() releases the tunnel
+metadata also in the above conditions.
+
+Addresses-Coverity-ID: 1373974 ("Resource leak")
+Fixes: d0f6dd8a914f4 ("net/sched: Introduce act_tunnel_key")
+Fixes: 0ed5269f9e41f ("net/sched: add tunnel option support to act_tunnel_key")
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee28bb56ac5b4c0c08ef10d33cc7adb749bbf4c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_tunnel_key.c
+diff --cc net/sched/act_tunnel_key.c
+index 7ba31c814489,28d58bbc953e..000000000000
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@@ -311,29 -331,27 +311,49 @@@ static int tunnel_key_init(struct net *
+  	if (!exists) {
+  		ret = tcf_idr_create(tn, parm->index, est, a,
+  				     &act_tunnel_key_ops, bind, true);
+++<<<<<<< HEAD
+ +		if (ret)
+ +			return ret;
+ +
+ +		ret = ACT_P_CREATED;
+ +	} else {
+ +		tcf_idr_release(*a, bind);
+ +		if (!ovr)
+ +			return -EEXIST;
+++=======
++ 		if (ret) {
++ 			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
++ 			goto release_tun_meta;
++ 		}
++ 
++ 		ret = ACT_P_CREATED;
++ 	} else if (!ovr) {
++ 		NL_SET_ERR_MSG(extack, "TC IDR already exists");
++ 		ret = -EEXIST;
++ 		goto release_tun_meta;
+++>>>>>>> ee28bb56ac5b (net/sched: fix memory leak in act_tunnel_key_init())
+  	}
+  
+  	t = to_tunnel_key(*a);
+  
+ +	ASSERT_RTNL();
+  	params_new = kzalloc(sizeof(*params_new), GFP_KERNEL);
+  	if (unlikely(!params_new)) {
+++<<<<<<< HEAD
+ +		if (ret == ACT_P_CREATED)
+ +			tcf_idr_release(*a, bind);
+ +		return -ENOMEM;
+++=======
++ 		NL_SET_ERR_MSG(extack, "Cannot allocate tunnel key parameters");
++ 		ret = -ENOMEM;
++ 		exists = true;
++ 		goto release_tun_meta;
+++>>>>>>> ee28bb56ac5b (net/sched: fix memory leak in act_tunnel_key_init())
+  	}
+ +
+ +	params_old = rtnl_dereference(t->params);
+ +
+ +	params_new->action = parm->action;
+  	params_new->tcft_action = parm->t_action;
+  	params_new->tcft_enc_metadata = metadata;
+  
+* Unmerged path net/sched/act_tunnel_key.c
