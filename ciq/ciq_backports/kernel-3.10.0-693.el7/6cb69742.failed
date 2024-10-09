@@ -1,0 +1,243 @@
+net: Do not call ndo_dflt_fdb_dump if ndo_fdb_dump is defined
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: Do not call ndo_dflt_fdb_dump if ndo_fdb_dump is defined (Ivan Vecera) [1275772 1297841 1331748]
+Rebuild_FUZZ: 94.40%
+commit-author Hubert Sokolowski <hubert.sokolowski@intel.com>
+commit 6cb69742daa1770fe1ce54cf45f8951376518176
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6cb69742.failed
+
+Add checking whether the call to ndo_dflt_fdb_dump is needed.
+It is not expected to call ndo_dflt_fdb_dump unconditionally
+by some drivers (i.e. qlcnic or macvlan) that defines
+own ndo_fdb_dump. Other drivers define own ndo_fdb_dump
+and don't want ndo_dflt_fdb_dump to be called at all.
+At the same time it is desirable to call the default dump
+function on a bridge device.
+Fix attributes that are passed to dev->netdev_ops->ndo_fdb_dump.
+Add extra checking in br_fdb_dump to avoid duplicate entries
+as now filter_dev can be NULL.
+
+Following tests for filtering have been performed before
+the change and after the patch was applied to make sure
+they are the same and it doesn't break the filtering algorithm.
+
+[root@localhost ~]# cd /root/iproute2-3.18.0/bridge
+[root@localhost bridge]# modprobe dummy
+[root@localhost bridge]# ./bridge fdb add f1:f2:f3:f4:f5:f6 dev dummy0
+[root@localhost bridge]# brctl addbr br0
+[root@localhost bridge]# brctl addif  br0 dummy0
+[root@localhost bridge]# ip link set dev br0 address 02:00:00:12:01:04
+[root@localhost bridge]# # show all
+[root@localhost bridge]# ./bridge fdb show
+33:33:00:00:00:01 dev p2p1 self permanent
+01:00:5e:00:00:01 dev p2p1 self permanent
+33:33:ff:ac:ce:32 dev p2p1 self permanent
+33:33:00:00:02:02 dev p2p1 self permanent
+01:00:5e:00:00:fb dev p2p1 self permanent
+33:33:00:00:00:01 dev p7p1 self permanent
+01:00:5e:00:00:01 dev p7p1 self permanent
+33:33:ff:79:50:53 dev p7p1 self permanent
+33:33:00:00:02:02 dev p7p1 self permanent
+01:00:5e:00:00:fb dev p7p1 self permanent
+f2:46:50:85:6d:d9 dev dummy0 master br0 permanent
+f2:46:50:85:6d:d9 dev dummy0 vlan 1 master br0 permanent
+33:33:00:00:00:01 dev dummy0 self permanent
+f1:f2:f3:f4:f5:f6 dev dummy0 self permanent
+33:33:00:00:00:01 dev br0 self permanent
+02:00:00:12:01:04 dev br0 vlan 1 master br0 permanent
+02:00:00:12:01:04 dev br0 master br0 permanent
+[root@localhost bridge]# # filter by bridge
+[root@localhost bridge]# ./bridge fdb show br br0
+f2:46:50:85:6d:d9 dev dummy0 master br0 permanent
+f2:46:50:85:6d:d9 dev dummy0 vlan 1 master br0 permanent
+33:33:00:00:00:01 dev dummy0 self permanent
+f1:f2:f3:f4:f5:f6 dev dummy0 self permanent
+33:33:00:00:00:01 dev br0 self permanent
+02:00:00:12:01:04 dev br0 vlan 1 master br0 permanent
+02:00:00:12:01:04 dev br0 master br0 permanent
+[root@localhost bridge]# # filter by port
+[root@localhost bridge]# ./bridge fdb show brport dummy0
+f2:46:50:85:6d:d9 master br0 permanent
+f2:46:50:85:6d:d9 vlan 1 master br0 permanent
+33:33:00:00:00:01 self permanent
+f1:f2:f3:f4:f5:f6 self permanent
+[root@localhost bridge]# # filter by port + bridge
+[root@localhost bridge]# ./bridge fdb show br br0 brport dummy0
+f2:46:50:85:6d:d9 master br0 permanent
+f2:46:50:85:6d:d9 vlan 1 master br0 permanent
+33:33:00:00:00:01 self permanent
+f1:f2:f3:f4:f5:f6 self permanent
+[root@localhost bridge]#
+
+	Signed-off-by: Hubert Sokolowski <hubert.sokolowski@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6cb69742daa1770fe1ce54cf45f8951376518176)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+#	net/core/rtnetlink.c
+diff --cc net/bridge/br_fdb.c
+index b30545c7ced8,e6e0372bc3cd..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -696,19 -696,27 +699,35 @@@ int br_fdb_dump(struct sk_buff *skb
+  			if (idx < cb->args[0])
+  				goto skip;
+  
+++<<<<<<< HEAD
+ +			if (filter_dev && (!f->dst || !f->dst->dev ||
+ +					   f->dst->dev != filter_dev))
+++=======
++ 			if (filter_dev &&
++ 			    (!f->dst || f->dst->dev != filter_dev)) {
++ 				if (filter_dev != dev)
++ 					goto skip;
++ 				/* !f->dst is a special case for bridge
++ 				 * It means the MAC belongs to the bridge
++ 				 * Therefore need a little more filtering
++ 				 * we only want to dump the !f->dst case
++ 				 */
++ 				if (f->dst)
++ 					goto skip;
++ 			}
++ 			if (!filter_dev && f->dst)
+++>>>>>>> 6cb69742daa1 (net: Do not call ndo_dflt_fdb_dump if ndo_fdb_dump is defined)
+  				goto skip;
+  
+ -			if (fdb_fill_info(skb, br, f,
+ -					  NETLINK_CB(cb->skb).portid,
+ -					  cb->nlh->nlmsg_seq,
+ -					  RTM_NEWNEIGH,
+ -					  NLM_F_MULTI) < 0)
+ +			err = fdb_fill_info(skb, br, f,
+ +					    NETLINK_CB(cb->skb).portid,
+ +					    cb->nlh->nlmsg_seq,
+ +					    RTM_NEWNEIGH,
+ +					    NLM_F_MULTI);
+ +			if (err < 0) {
+ +				cb->args[1] = err;
+  				break;
+ +			}
+  skip:
+  			++idx;
+  		}
+diff --cc net/core/rtnetlink.c
+index 590c29aca2b6,da983d4bac02..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -2841,44 -2639,73 +2841,54 @@@ EXPORT_SYMBOL(ndo_dflt_fdb_dump)
+  
+  static int rtnl_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+ -	struct net_device *dev;
+ -	struct nlattr *tb[IFLA_MAX+1];
+ -	struct net_device *bdev = NULL;
+ -	struct net_device *br_dev = NULL;
+ -	const struct net_device_ops *ops = NULL;
+ -	const struct net_device_ops *cops = NULL;
+ -	struct ifinfomsg *ifm = nlmsg_data(cb->nlh);
+ -	struct net *net = sock_net(skb->sk);
+ -	int brport_idx = 0;
+ -	int br_idx = 0;
+  	int idx = 0;
+ +	struct net *net = sock_net(skb->sk);
+ +	struct net_device *dev;
+  
+ -	if (nlmsg_parse(cb->nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX,
+ -			ifla_policy) == 0) {
+ -		if (tb[IFLA_MASTER])
+ -			br_idx = nla_get_u32(tb[IFLA_MASTER]);
+ -	}
+ -
+ -	brport_idx = ifm->ifi_index;
+ -
+ -	if (br_idx) {
+ -		br_dev = __dev_get_by_index(net, br_idx);
+ -		if (!br_dev)
+ -			return -ENODEV;
+ -
+ -		ops = br_dev->netdev_ops;
+ -		bdev = br_dev;
+ -	}
+ -
+ -	for_each_netdev(net, dev) {
+ -		if (brport_idx && (dev->ifindex != brport_idx))
+ -			continue;
+ -
+ -		if (!br_idx) { /* user did not specify a specific bridge */
+ -			if (dev->priv_flags & IFF_BRIDGE_PORT) {
+ -				br_dev = netdev_master_upper_dev_get(dev);
+ -				cops = br_dev->netdev_ops;
+ -			}
+ -
+ -			bdev = dev;
+ -		} else {
+ -			if (dev != br_dev &&
+ -			    !(dev->priv_flags & IFF_BRIDGE_PORT))
+ -				continue;
+ -
+ -			if (br_dev != netdev_master_upper_dev_get(dev) &&
+ -			    !(dev->priv_flags & IFF_EBRIDGE))
+ -				continue;
+ -
+ -			bdev = br_dev;
+ -			cops = ops;
+ -		}
+ -
+ +	rcu_read_lock();
+ +	cb->args[1] = 0;
+ +	for_each_netdev_rcu(net, dev) {
+  		if (dev->priv_flags & IFF_BRIDGE_PORT) {
+ -			if (cops && cops->ndo_fdb_dump)
+ -				idx = cops->ndo_fdb_dump(skb, cb, br_dev, dev,
+ -							 idx);
+ +			struct net_device *br_dev;
+ +			const struct net_device_ops *ops;
+ +
+ +			br_dev = netdev_master_upper_dev_get(dev);
+ +			ops = br_dev->netdev_ops;
+ +			if (get_ndo_ext(ops, ndo_fdb_dump))
+ +				idx = get_ndo_ext(ops, ndo_fdb_dump)(skb, cb,
+ +								     dev, NULL,
+ +								     idx);
+ +			else if (ops->ndo_fdb_dump_rh72)
+ +				idx = ops->ndo_fdb_dump_rh72(skb, cb, dev, idx);
+  		}
+ +		if (cb->args[1] == -EMSGSIZE)
+ +			break;
+  
+++<<<<<<< HEAD
+ +		if (get_ndo_ext(dev->netdev_ops, ndo_fdb_dump))
+ +			idx = get_ndo_ext(dev->netdev_ops, ndo_fdb_dump)(skb,
+ +									 cb,
+ +									 dev,
+ +									 NULL,
+ +									 idx);
+ +		else if (dev->netdev_ops->ndo_fdb_dump_rh72)
+ +			idx = dev->netdev_ops->ndo_fdb_dump_rh72(skb, cb, dev,
+ +								 idx);
+ +		else
+ +			idx = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
+ +		if (cb->args[1] == -EMSGSIZE)
+ +			break;
+++=======
++ 		if (dev->netdev_ops->ndo_fdb_dump)
++ 			idx = dev->netdev_ops->ndo_fdb_dump(skb, cb, dev, NULL,
++ 							    idx);
++ 		else
++ 			idx = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
++ 
++ 		cops = NULL;
+++>>>>>>> 6cb69742daa1 (net: Do not call ndo_dflt_fdb_dump if ndo_fdb_dump is defined)
+  	}
+ +	rcu_read_unlock();
+  
+  	cb->args[0] = idx;
+  	return skb->len;
+* Unmerged path net/bridge/br_fdb.c
+* Unmerged path net/core/rtnetlink.c
