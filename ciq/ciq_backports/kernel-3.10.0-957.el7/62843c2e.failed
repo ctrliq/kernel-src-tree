@@ -1,0 +1,113 @@
+nvme: Use admin command effects for admin commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] Use admin command effects for admin commands (David Milburn) [1515584]
+Rebuild_FUZZ: 93.62%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 62843c2e4226057c83f520c74fe9c81a1891c331
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/62843c2e.failed
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 62843c2e4226057c83f520c74fe9c81a1891c331)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index d0c03595e82f,aac3c1d2b2a2..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -902,6 -1072,85 +902,88 @@@ static int nvme_submit_io(struct nvme_n
+  			metadata, meta_len, io.slba, NULL, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 nvme_known_admin_effects(u8 opcode)
++ {
++ 	switch (opcode) {
++ 	case nvme_admin_format_nvm:
++ 		return NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC |
++ 					NVME_CMD_EFFECTS_CSE_MASK;
++ 	case nvme_admin_sanitize_nvm:
++ 		return NVME_CMD_EFFECTS_CSE_MASK;
++ 	default:
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++ 								u8 opcode)
++ {
++ 	u32 effects = 0;
++ 
++ 	if (ns) {
++ 		if (ctrl->effects)
++ 			effects = le32_to_cpu(ctrl->effects->iocs[opcode]);
++ 		if (effects & ~NVME_CMD_EFFECTS_CSUPP)
++ 			dev_warn(ctrl->device,
++ 				 "IO command:%02x has unhandled effects:%08x\n",
++ 				 opcode, effects);
++ 		return 0;
++ 	}
++ 
++ 	if (ctrl->effects)
++ 		effects = le32_to_cpu(ctrl->effects->acs[opcode]);
++ 	else
++ 		effects = nvme_known_admin_effects(opcode);
++ 
++ 	/*
++ 	 * For simplicity, IO to all namespaces is quiesced even if the command
++ 	 * effects say only one namespace is affected.
++ 	 */
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
++ 		nvme_start_freeze(ctrl);
++ 		nvme_wait_freeze(ctrl);
++ 	}
++ 	return effects;
++ }
++ 
++ static void nvme_update_formats(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_ns *ns, *next;
++ 	LIST_HEAD(rm_list);
++ 
++ 	down_write(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list) {
++ 		if (ns->disk && nvme_revalidate_disk(ns->disk)) {
++ 			list_move_tail(&ns->list, &rm_list);
++ 		}
++ 	}
++ 	up_write(&ctrl->namespaces_rwsem);
++ 
++ 	list_for_each_entry_safe(ns, next, &rm_list, list)
++ 		nvme_ns_remove(ns);
++ }
++ 
++ static void nvme_passthru_end(struct nvme_ctrl *ctrl, u32 effects)
++ {
++ 	/*
++ 	 * Revalidate LBA changes prior to unfreezing. This is necessary to
++ 	 * prevent memory corruption if a logical block size was changed by
++ 	 * this command.
++ 	 */
++ 	if (effects & NVME_CMD_EFFECTS_LBCC)
++ 		nvme_update_formats(ctrl);
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK))
++ 		nvme_unfreeze(ctrl);
++ 	if (effects & NVME_CMD_EFFECTS_CCC)
++ 		nvme_init_identify(ctrl);
++ 	if (effects & (NVME_CMD_EFFECTS_NIC | NVME_CMD_EFFECTS_NCC))
++ 		nvme_queue_scan(ctrl);
++ }
++ 
+++>>>>>>> 62843c2e4226 (nvme: Use admin command effects for admin commands)
+  static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+  			struct nvme_passthru_cmd __user *ucmd)
+  {
+* Unmerged path drivers/nvme/host/core.c
