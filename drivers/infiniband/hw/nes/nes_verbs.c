@@ -1303,8 +1303,7 @@ static struct ib_qp *nes_create_qp(struct ib_pd *ibpd,
 	init_completion(&nesqp->rq_drained);
 
 	nesqp->sig_all = (init_attr->sq_sig_type == IB_SIGNAL_ALL_WR);
-	setup_timer(&nesqp->terminate_timer, nes_terminate_timeout,
-		    (unsigned long)nesqp);
+	timer_setup(&nesqp->terminate_timer, nes_terminate_timeout, 0);
 
 	/* update the QP table */
 	nesdev->nesadapter->qp_table[nesqp->hwqp.qp_id-NES_FIRST_QPN] = nesqp;
@@ -3790,9 +3789,9 @@ struct nes_ib_device *nes_init_ofa_device(struct net_device *netdev)
 /**
  * nes_handle_delayed_event
  */
-static void nes_handle_delayed_event(unsigned long data)
+static void nes_handle_delayed_event(struct timer_list *t)
 {
-	struct nes_vnic *nesvnic = (void *) data;
+	struct nes_vnic *nesvnic = from_timer(nesvnic, t, event_timer);
 
 	if (nesvnic->delayed_event != nesvnic->last_dispatched_event) {
 		struct ib_event event;
@@ -3822,8 +3821,7 @@ void  nes_port_ibevent(struct nes_vnic *nesvnic)
 	if (!nesvnic->event_timer.function) {
 		ib_dispatch_event(&event);
 		nesvnic->last_dispatched_event = event.event;
-		nesvnic->event_timer.function = nes_handle_delayed_event;
-		nesvnic->event_timer.data = (unsigned long) nesvnic;
+		nesvnic->event_timer.function = (TIMER_FUNC_TYPE)nes_handle_delayed_event;
 		nesvnic->event_timer.expires = jiffies + NES_EVENT_DELAY;
 		add_timer(&nesvnic->event_timer);
 	} else {
