@@ -1,0 +1,125 @@
+net/mlx5e: Move to use common phys port names for vport representors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Move to use common phys port names for vport representors (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.97%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit c12ecc2305648822970002871230979359edb2c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c12ecc23.failed
+
+With VF LAG commit 491c37e49b48 "net/mlx5e: In case of LAG, one switch
+parent id is used for all representors", both uplinks and all the VFs
+(on both of them) get the same switchdev id.
+
+This cause the provisioning system method to identify the rep of a given
+VF from the parent PF PCI device using switchev id and physical port
+name to break, since VFm of PF0 will have the (id, name) as VFm of PF1.
+
+To fix that, we align to use the framework agreed upstream and set by
+nfp commit 168c478e107e "nfp: wire get_phys_port_name on representors":
+
+$ cat /sys/class/net/eth4_*/phys_port_name
+p0
+pf0vf0
+pf0vf1
+
+Now, the names will be different, e.g. pf0vf0 vs. pf1vf0.
+
+Fixes: 491c37e49b48 ("net/mlx5e: In case of LAG, one switch parent id is used for all representors")
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reported-by: Waleed Musa <waleedm@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c12ecc2305648822970002871230979359edb2c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 2ac07968015d,5300b0b6d836..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -203,8 -187,18 +203,12 @@@ static inline int mlx5_lag_is_lacp_owne
+  		    MLX5_CAP_GEN(dev, lag_master);
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5_lag_allow(struct mlx5_core_dev *dev);
+ +int mlx5_lag_forbid(struct mlx5_core_dev *dev);
+++=======
++ int mlx5_lag_get_pf_num(struct mlx5_core_dev *dev, int *pf_num);
+++>>>>>>> c12ecc230564 (net/mlx5e: Move to use common phys port names for vport representors)
+  
+  void mlx5_reload_interface(struct mlx5_core_dev *mdev, int protocol);
+ -void mlx5_lag_update(struct mlx5_core_dev *dev);
+ -
+ -enum {
+ -	MLX5_NIC_IFC_FULL		= 0,
+ -	MLX5_NIC_IFC_DISABLED		= 1,
+ -	MLX5_NIC_IFC_NO_DRAM_NIC	= 2,
+ -	MLX5_NIC_IFC_INVALID		= 3
+ -};
+ -
+ -u8 mlx5_get_nic_state(struct mlx5_core_dev *dev);
+ -void mlx5_set_nic_state(struct mlx5_core_dev *dev, u8 state);
+  #endif /* __MLX5_CORE_H__ */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index f72c1fb5c81b..42c8f3b3889a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -905,9 +905,17 @@ static int mlx5e_rep_get_phys_port_name(struct net_device *dev,
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+ 	struct mlx5_eswitch_rep *rep = rpriv->rep;
+-	int ret;
++	int ret, pf_num;
++
++	ret = mlx5_lag_get_pf_num(priv->mdev, &pf_num);
++	if (ret)
++		return ret;
++
++	if (rep->vport == FDB_UPLINK_VPORT)
++		ret = snprintf(buf, len, "p%d", pf_num);
++	else
++		ret = snprintf(buf, len, "pf%dvf%d", pf_num, rep->vport - 1);
+ 
+-	ret = snprintf(buf, len, "%d", rep->vport - 1);
+ 	if (ret >= len)
+ 		return -EOPNOTSUPP;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lag.c b/drivers/net/ethernet/mellanox/mlx5/core/lag.c
+index 10a4532b7144..5ca15271a6a0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lag.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lag.c
+@@ -552,6 +552,27 @@ void mlx5_lag_add(struct mlx5_core_dev *dev, struct net_device *netdev)
+ 	}
+ }
+ 
++int mlx5_lag_get_pf_num(struct mlx5_core_dev *dev, int *pf_num)
++{
++	struct mlx5_lag *ldev;
++	int n;
++
++	ldev = mlx5_lag_dev_get(dev);
++	if (!ldev) {
++		mlx5_core_warn(dev, "no lag device, can't get pf num\n");
++		return -EINVAL;
++	}
++
++	for (n = 0; n < MLX5_MAX_PORTS; n++)
++		if (ldev->pf[n].dev == dev) {
++			*pf_num = n;
++			return 0;
++		}
++
++	mlx5_core_warn(dev, "wasn't able to locate pf in the lag device\n");
++	return -EINVAL;
++}
++
+ /* Must be called with intf_mutex held */
+ void mlx5_lag_remove(struct mlx5_core_dev *dev)
+ {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
