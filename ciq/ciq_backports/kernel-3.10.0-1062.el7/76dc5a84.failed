@@ -1,0 +1,201 @@
+IB/mlx5: Manage device uid for DEVX white list commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 76dc5a8406bffabf3f466e331a3e9515ddf93954
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/76dc5a84.failed
+
+Manage device uid for DEVX white list commands.  The created device uid
+will be used on white list commands if the user didn't supply its own uid.
+
+This will enable the firmware to filter out non privileged functionality
+as of the recognition of the uid.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 76dc5a8406bffabf3f466e331a3e9515ddf93954)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index b529cb4f76e1,10e59923e95b..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -1744,9 -1758,23 +1744,27 @@@ static struct ib_ucontext *mlx5_ib_allo
+  	context->ibucontext.invalidate_range = &mlx5_ib_invalidate_range;
+  #endif
+  
+++<<<<<<< HEAD
+ +	err = mlx5_ib_alloc_transport_domain(dev, &context->tdn);
+++=======
++ 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
++ 		/* Block DEVX on Infiniband as of SELinux */
++ 		if (mlx5_ib_port_link_layer(ibdev, 1) != IB_LINK_LAYER_ETHERNET) {
++ 			err = -EPERM;
++ 			goto out_uars;
++ 		}
++ 
++ 		err = mlx5_ib_devx_create(dev);
++ 		if (err < 0)
++ 			goto out_uars;
++ 		context->devx_uid = err;
++ 	}
++ 
++ 	err = mlx5_ib_alloc_transport_domain(dev, &context->tdn,
++ 					     context->devx_uid);
+++>>>>>>> 76dc5a8406bf (IB/mlx5: Manage device uid for DEVX white list commands)
+  	if (err)
+ -		goto out_devx;
+ +		goto out_uars;
+  
+  	if (MLX5_CAP_GEN(dev->mdev, dump_fill_mkey)) {
+  		err = mlx5_cmd_dump_fill_mkey(dev->mdev, &dump_fill_mkey);
+@@@ -1831,10 -1857,21 +1849,18 @@@
+  	context->lib_caps = req.lib_caps;
+  	print_lib_caps(dev, context->lib_caps);
+  
+ -	if (mlx5_lag_is_active(dev->mdev)) {
+ -		u8 port = mlx5_core_native_port_num(dev->mdev);
+ -
+ -		atomic_set(&context->tx_port_affinity,
+ -			   atomic_add_return(
+ -				   1, &dev->roce[port].tx_port_affinity));
+ -	}
+ -
+  	return &context->ibucontext;
+  
+++<<<<<<< HEAD
+ +out_td:
+ +	mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+++=======
++ out_mdev:
++ 	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->devx_uid);
++ out_devx:
++ 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX)
++ 		mlx5_ib_devx_destroy(dev, context->devx_uid);
+++>>>>>>> 76dc5a8406bf (IB/mlx5: Manage device uid for DEVX white list commands)
+  
+  out_uars:
+  	deallocate_uars(dev, context);
+@@@ -1857,8 -1894,18 +1883,15 @@@ static int mlx5_ib_dealloc_ucontext(str
+  	struct mlx5_ib_dev *dev = to_mdev(ibcontext->device);
+  	struct mlx5_bfreg_info *bfregi;
+  
+ -#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ -	/* All umem's must be destroyed before destroying the ucontext. */
+ -	mutex_lock(&ibcontext->per_mm_list_lock);
+ -	WARN_ON(!list_empty(&ibcontext->per_mm_list));
+ -	mutex_unlock(&ibcontext->per_mm_list_lock);
+ -#endif
+ -
+  	bfregi = &context->bfregi;
+++<<<<<<< HEAD
+ +	mlx5_ib_dealloc_transport_domain(dev, context->tdn);
+++=======
++ 	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->devx_uid);
++ 
++ 	if (context->devx_uid)
++ 		mlx5_ib_devx_destroy(dev, context->devx_uid);
+++>>>>>>> 76dc5a8406bf (IB/mlx5: Manage device uid for DEVX white list commands)
+  
+  	deallocate_uars(dev, context);
+  	kfree(bfregi->sys_pages);
+@@@ -5296,25 -6195,13 +5331,26 @@@ static void __mlx5_ib_remove(struct mlx
+  	ib_dealloc_device((struct ib_device *)dev);
+  }
+  
+ -void *__mlx5_ib_add(struct mlx5_ib_dev *dev,
+ -		    const struct mlx5_ib_profile *profile)
+ +static void *mlx5_ib_add_slave_port(struct mlx5_core_dev *mdev, u8 port_num);
+ +
+ +static void *__mlx5_ib_add(struct mlx5_core_dev *mdev,
+ +			   const struct mlx5_ib_profile *profile)
+  {
+ +	struct mlx5_ib_dev *dev;
+  	int err;
+  	int i;
++ 	int uid;
+  
+ +	printk_once(KERN_INFO "%s", mlx5_version);
+ +
+ +	dev = (struct mlx5_ib_dev *)ib_alloc_device(sizeof(*dev));
+ +	if (!dev)
+ +		return NULL;
+ +
+ +	dev->mdev = mdev;
+ +	dev->num_ports = max(MLX5_CAP_GEN(mdev, num_ports),
+ +			     MLX5_CAP_GEN(mdev, num_vhca_ports));
+ +
+  	for (i = 0; i < MLX5_IB_STAGE_MAX; i++) {
+  		if (profile->stage[i].init) {
+  			err = profile->stage[i].init(dev);
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 4d12ef8ba98b,e5ec3fdaa4d5..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -812,6 -924,8 +812,11 @@@ struct mlx5_ib_dev 
+  	u8			umr_fence;
+  	struct list_head	ib_dev_list;
+  	u64			sys_image_guid;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_memic	memic;
++ 	u16			devx_whitelist_uid;
+++>>>>>>> 76dc5a8406bf (IB/mlx5: Manage device uid for DEVX white list commands)
+  };
+  
+  static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
+@@@ -1092,6 -1249,39 +1097,42 @@@ struct mlx5_core_dev *mlx5_ib_get_nativ
+  void mlx5_ib_put_native_port_mdev(struct mlx5_ib_dev *dev,
+  				  u8 port_num);
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
++ int mlx5_ib_devx_create(struct mlx5_ib_dev *dev);
++ void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev, u16 uid);
++ const struct uverbs_object_tree_def *mlx5_ib_get_devx_tree(void);
++ struct mlx5_ib_flow_handler *mlx5_ib_raw_fs_rule_add(
++ 	struct mlx5_ib_dev *dev, struct mlx5_ib_flow_matcher *fs_matcher,
++ 	struct mlx5_flow_act *flow_act, void *cmd_in, int inlen,
++ 	int dest_id, int dest_type);
++ bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id, int *dest_type);
++ int mlx5_ib_get_flow_trees(const struct uverbs_object_tree_def **root);
++ void mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction);
++ #else
++ static inline int
++ mlx5_ib_devx_create(struct mlx5_ib_dev *dev) { return -EOPNOTSUPP; };
++ static inline void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev, u16 uid) {}
++ static inline const struct uverbs_object_tree_def *
++ mlx5_ib_get_devx_tree(void) { return NULL; }
++ static inline bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id,
++ 					     int *dest_type)
++ {
++ 	return false;
++ }
++ static inline int
++ mlx5_ib_get_flow_trees(const struct uverbs_object_tree_def **root)
++ {
++ 	return 0;
++ }
++ static inline void
++ mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction)
++ {
++ 	return;
++ };
++ #endif
+++>>>>>>> 76dc5a8406bf (IB/mlx5: Manage device uid for DEVX white list commands)
+  static inline void init_query_mad(struct ib_smp *mad)
+  {
+  	mad->base_version  = 1;
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
