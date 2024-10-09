@@ -1,0 +1,185 @@
+s390/time: LPAR offset handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] time: LPAR offset handling (Hendrik Brueckner) [1391531]
+Rebuild_FUZZ: 91.23%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 4027789192d149678262ad606b2d7e2a61bed0f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/40277891.failed
+
+It is possible to specify a user offset for the TOD clock, e.g. +2 hours.
+The TOD clock will carry this offset even if the clock is synchronized
+with STP. This makes the time stamps acquired with get_sync_clock()
+useless as another LPAR migth use a different TOD offset.
+
+Use the PTFF instrution to get the TOD epoch difference and subtract
+it from the TOD clock value to get a physical timestamp. As the epoch
+difference contains the sync check delta as well the LPAR offset value
+to the physical clock needs to be refreshed after each clock
+synchronization.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 4027789192d149678262ad606b2d7e2a61bed0f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/time.c
+diff --cc arch/s390/kernel/time.c
+index 6b673925b403,d71623639997..000000000000
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@@ -58,6 -59,28 +59,31 @@@ EXPORT_SYMBOL_GPL(sched_clock_base_cc)
+  
+  static DEFINE_PER_CPU(struct clock_event_device, comparators);
+  
+++<<<<<<< HEAD
+++=======
++ ATOMIC_NOTIFIER_HEAD(s390_epoch_delta_notifier);
++ EXPORT_SYMBOL(s390_epoch_delta_notifier);
++ 
++ unsigned char ptff_function_mask[16];
++ unsigned long lpar_offset;
++ 
++ /*
++  * Get time offsets with PTFF
++  */
++ void __init ptff_init(void)
++ {
++ 	struct ptff_qto qto;
++ 
++ 	if (!test_facility(28))
++ 		return;
++ 	ptff(&ptff_function_mask, sizeof(ptff_function_mask), PTFF_QAF);
++ 
++ 	/* get LPAR offset */
++ 	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
++ 		lpar_offset = qto.tod_epoch_difference;
++ }
++ 
+++>>>>>>> 4027789192d1 (s390/time: LPAR offset handling)
+  /*
+   * Scheduler clock - returns current time in nanosec units.
+   */
+@@@ -738,9 -775,10 +764,10 @@@ static void clock_sync_cpu(struct clock
+  static int etr_sync_clock(void *data)
+  {
+  	static int first;
+ -	unsigned long long clock, old_clock, clock_delta, delay, delta;
+ +	unsigned long long clock, old_clock, delay, delta;
+  	struct clock_sync_data *etr_sync;
+  	struct etr_aib *sync_port, *aib;
++ 	struct ptff_qto qto;
+  	int port;
+  	int rc;
+  
+@@@ -1512,8 -1556,9 +1543,9 @@@ void stp_island_check(void
+  static int stp_sync_clock(void *data)
+  {
+  	static int first;
+ -	unsigned long long old_clock, delta, new_clock, clock_delta;
+ +	unsigned long long old_clock, delta;
+  	struct clock_sync_data *stp_sync;
++ 	struct ptff_qto qto;
+  	int rc;
+  
+  	stp_sync = data;
+@@@ -1535,9 -1580,16 +1567,20 @@@
+  	    stp_info.todoff[2] || stp_info.todoff[3] ||
+  	    stp_info.tmd != 2) {
+  		old_clock = get_tod_clock();
+ -		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0, &clock_delta);
+ +		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0);
+  		if (rc == 0) {
+++<<<<<<< HEAD
+ +			delta = adjust_time(old_clock, get_tod_clock(), 0);
+++=======
++ 			new_clock = old_clock + clock_delta;
++ 			delta = adjust_time(old_clock, new_clock, 0);
++ 			if (ptff_query(PTFF_QTO) &&
++ 			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
++ 				/* Update LPAR offset */
++ 				lpar_offset = qto.tod_epoch_difference;
++ 			atomic_notifier_call_chain(&s390_epoch_delta_notifier,
++ 						   0, &clock_delta);
+++>>>>>>> 4027789192d1 (s390/time: LPAR offset handling)
+  			fixup_clock_comparator(delta);
+  			rc = chsc_sstpi(stp_page, &stp_info,
+  					sizeof(struct stp_sstpi));
+diff --git a/arch/s390/include/asm/timex.h b/arch/s390/include/asm/timex.h
+index fd9e0b307954..68bbd4620345 100644
+--- a/arch/s390/include/asm/timex.h
++++ b/arch/s390/include/asm/timex.h
+@@ -51,6 +51,11 @@ static inline void store_clock_comparator(__u64 *time)
+ 
+ void clock_comparator_work(void);
+ 
++void __init ptff_init(void);
++
++extern unsigned char ptff_function_mask[16];
++extern unsigned long lpar_offset;
++
+ /* Function codes for the ptff instruction. */
+ #define PTFF_QAF	0x00	/* query available functions */
+ #define PTFF_QTO	0x01	/* query tod offset */
+@@ -68,6 +73,14 @@ struct ptff_qto {
+ 	unsigned long long tod_epoch_difference;
+ } __packed;
+ 
++static inline int ptff_query(unsigned int nr)
++{
++	unsigned char *ptr;
++
++	ptr = ptff_function_mask + (nr >> 3);
++	return (*ptr & (0x80 >> (nr & 7))) != 0;
++}
++
+ static inline int ptff(void *ptff_block, size_t len, unsigned int func)
+ {
+ 	typedef struct { char _[len]; } addrtype;
+@@ -135,7 +148,7 @@ static inline cycles_t get_cycles(void)
+ 	return (cycles_t) get_tod_clock() >> 2;
+ }
+ 
+-int get_sync_clock(unsigned long long *clock);
++int get_phys_clock(unsigned long long *clock);
+ void init_cpu_timer(void);
+ unsigned long long monotonic_clock(void);
+ 
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index 9b62ad34ba44..205828171666 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -467,6 +467,7 @@ void __init startup_init(void)
+ 	ipl_save_parameters();
+ 	rescue_initrd();
+ 	clear_bss_section();
++	ptff_init();
+ 	init_kernel_storage_key();
+ 	lockdep_init();
+ 	lockdep_off();
+* Unmerged path arch/s390/kernel/time.c
+diff --git a/drivers/s390/block/dasd_eckd.c b/drivers/s390/block/dasd_eckd.c
+index d5740c400937..5c682563409e 100644
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -213,7 +213,7 @@ check_XRC (struct ccw1         *de_ccw,
+ 	data->ga_extended |= 0x08; /* switch on 'Time Stamp Valid'   */
+ 	data->ga_extended |= 0x02; /* switch on 'Extended Parameter' */
+ 
+-	rc = get_sync_clock(&data->ep_sys_time);
++	rc = get_phys_clock(&data->ep_sys_time);
+ 	/* Ignore return code if sync clock is switched off. */
+ 	if (rc == -EOPNOTSUPP || rc == -EACCES)
+ 		rc = 0;
+@@ -324,7 +324,7 @@ static int check_XRC_on_prefix(struct PFX_eckd_data *pfxdata,
+ 	pfxdata->define_extent.ga_extended |= 0x02; /* 'Extended Parameter' */
+ 	pfxdata->validity.time_stamp = 1;	    /* 'Time Stamp Valid'   */
+ 
+-	rc = get_sync_clock(&pfxdata->define_extent.ep_sys_time);
++	rc = get_phys_clock(&pfxdata->define_extent.ep_sys_time);
+ 	/* Ignore return code if sync clock is switched off. */
+ 	if (rc == -EOPNOTSUPP || rc == -EACCES)
+ 		rc = 0;
