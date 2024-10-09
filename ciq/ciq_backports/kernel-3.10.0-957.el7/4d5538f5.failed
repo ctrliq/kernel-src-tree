@@ -1,0 +1,357 @@
+i2c: use an IRQ to report Host Notify events, not alert
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [i2c] use an IRQ to report Host Notify events, not alert (Benjamin Tissoires) [1554926]
+Rebuild_FUZZ: 95.24%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit 4d5538f5882a6b67eefbab0f0a3a67ce811621aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4d5538f5.failed
+
+The current SMBus Host Notify implementation relies on .alert() to
+relay its notifications. However, the use cases where SMBus Host
+Notify is needed currently is to signal data ready on touchpads.
+
+This is closer to an IRQ than a custom API through .alert().
+Given that the 2 touchpad manufacturers (Synaptics and Elan) that
+use SMBus Host Notify don't put any data in the SMBus payload, the
+concept actually matches one to one.
+
+Benefits are multiple:
+- simpler code and API: the client will just have an IRQ, and
+  nothing needs to be added in the adapter beside internally
+  enabling it.
+- no more specific workqueue, the threading is handled by IRQ core
+  directly (when required)
+- no more races when removing the device (the drivers are already
+  required to disable irq on remove)
+- simpler handling for drivers: use plain regular IRQs
+- no more dependency on i2c-smbus for i2c-i801 (and any other adapter)
+- the IRQ domain is created automatically when the adapter exports
+  the Host Notify capability
+- the IRQ are assign only if ACPI, OF and the caller did not assign
+  one already
+- the domain is automatically destroyed on remove
+- fewer lines of code (minus 20, yeah!)
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+(cherry picked from commit 4d5538f5882a6b67eefbab0f0a3a67ce811621aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/i2c/smbus-protocol
+#	drivers/i2c/busses/i2c-i801.c
+#	drivers/i2c/i2c-core.c
+diff --cc Documentation/i2c/smbus-protocol
+index 6012b12b3510,092d474f5843..000000000000
+--- a/Documentation/i2c/smbus-protocol
++++ b/Documentation/i2c/smbus-protocol
+@@@ -199,6 -199,16 +199,19 @@@ alerting device's address
+  
+  [S] [HostAddr] [Wr] A [DevAddr] A [DataLow] A [DataHigh] A [P]
+  
+++<<<<<<< HEAD
+++=======
++ This is implemented in the following way in the Linux kernel:
++ * I2C bus drivers which support SMBus Host Notify should report
++   I2C_FUNC_SMBUS_HOST_NOTIFY.
++ * I2C bus drivers trigger SMBus Host Notify by a call to
++   i2c_handle_smbus_host_notify().
++ * I2C drivers for devices which can trigger SMBus Host Notify will have
++   client->irq assigned to a Host Notify IRQ if noone else specified an other.
++ 
++ There is currently no way to retrieve the data parameter from the client.
++ 
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  
+  Packet Error Checking (PEC)
+  ===========================
+diff --cc drivers/i2c/busses/i2c-i801.c
+index cb34b050a17d,e242db43774b..000000000000
+--- a/drivers/i2c/busses/i2c-i801.c
++++ b/drivers/i2c/busses/i2c-i801.c
+@@@ -518,8 -576,26 +518,29 @@@ static void i801_isr_byte_done(struct i
+  	outb_p(SMBHSTSTS_BYTE_DONE, SMBHSTSTS(priv));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static irqreturn_t i801_host_notify_isr(struct i801_priv *priv)
++ {
++ 	unsigned short addr;
++ 
++ 	addr = inb_p(SMBNTFDADD(priv)) >> 1;
++ 
++ 	/*
++ 	 * With the tested platforms, reading SMBNTFDDAT (22 + (p)->smba)
++ 	 * always returns 0. Our current implementation doesn't provide
++ 	 * data, so we just ignore it.
++ 	 */
++ 	i2c_handle_smbus_host_notify(&priv->adapter, addr);
++ 
++ 	/* clear Host Notify bit and return */
++ 	outb_p(SMBSLVSTS_HST_NTFY_STS, SMBSLVSTS(priv));
++ 	return IRQ_HANDLED;
++ }
++ 
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  /*
+ - * There are three kinds of interrupts:
+ + * There are two kinds of interrupts:
+   *
+   * 1) i801 signals transaction completion with one of these interrupts:
+   *      INTR - Success
+@@@ -857,7 -945,34 +878,38 @@@ static u32 i801_func(struct i2c_adapte
+  	       I2C_FUNC_SMBUS_BLOCK_DATA | I2C_FUNC_SMBUS_WRITE_I2C_BLOCK |
+  	       ((priv->features & FEATURE_SMBUS_PEC) ? I2C_FUNC_SMBUS_PEC : 0) |
+  	       ((priv->features & FEATURE_I2C_BLOCK_READ) ?
+++<<<<<<< HEAD
+ +		I2C_FUNC_SMBUS_READ_I2C_BLOCK : 0);
+++=======
++ 		I2C_FUNC_SMBUS_READ_I2C_BLOCK : 0) |
++ 	       ((priv->features & FEATURE_HOST_NOTIFY) ?
++ 		I2C_FUNC_SMBUS_HOST_NOTIFY : 0);
++ }
++ 
++ static void i801_enable_host_notify(struct i2c_adapter *adapter)
++ {
++ 	struct i801_priv *priv = i2c_get_adapdata(adapter);
++ 
++ 	if (!(priv->features & FEATURE_HOST_NOTIFY))
++ 		return;
++ 
++ 	priv->original_slvcmd = inb_p(SMBSLVCMD(priv));
++ 
++ 	if (!(SMBSLVCMD_HST_NTFY_INTREN & priv->original_slvcmd))
++ 		outb_p(SMBSLVCMD_HST_NTFY_INTREN | priv->original_slvcmd,
++ 		       SMBSLVCMD(priv));
++ 
++ 	/* clear Host Notify bit to allow a new notification */
++ 	outb_p(SMBSLVSTS_HST_NTFY_STS, SMBSLVSTS(priv));
++ }
++ 
++ static void i801_disable_host_notify(struct i801_priv *priv)
++ {
++ 	if (!(priv->features & FEATURE_HOST_NOTIFY))
++ 		return;
++ 
++ 	outb_p(priv->original_slvcmd, SMBSLVCMD(priv));
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  }
+  
+  static const struct i2c_algorithm smbus_algorithm = {
+@@@ -1516,11 -1635,12 +1568,16 @@@ static int i801_probe(struct pci_dev *d
+  		"SMBus I801 adapter at %04lx", priv->smba);
+  	err = i2c_add_adapter(&priv->adapter);
+  	if (err) {
+ +		dev_err(&dev->dev, "Failed to add SMBus adapter\n");
+  		i801_acpi_remove(priv);
+ -		return err;
+ +		goto exit_free_irq;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	i801_enable_host_notify(&priv->adapter);
++ 
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  	i801_probe_optional_slaves(priv);
+  	/* We ignore errors - multiplexing is optional */
+  	i801_add_mux(priv);
+@@@ -1579,17 -1686,20 +1636,26 @@@ static int i801_suspend(struct pci_dev 
+  	return 0;
+  }
+  
+ -static int i801_resume(struct device *dev)
+ +static int i801_resume(struct pci_dev *dev)
+  {
+++<<<<<<< HEAD
+ +	pci_set_power_state(dev, PCI_D0);
+ +	pci_restore_state(dev);
+ +	return pci_enable_device(dev);
+++=======
++ 	struct pci_dev *pci_dev = to_pci_dev(dev);
++ 	struct i801_priv *priv = pci_get_drvdata(pci_dev);
++ 
++ 	i801_enable_host_notify(&priv->adapter);
++ 
++ 	return 0;
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  }
+ +#else
+ +#define i801_suspend NULL
+ +#define i801_resume NULL
+  #endif
+  
+ -static UNIVERSAL_DEV_PM_OPS(i801_pm_ops, i801_suspend,
+ -			    i801_resume, NULL);
+ -
+  static struct pci_driver i801_driver = {
+  	.name		= "i801_smbus",
+  	.id_table	= i801_ids,
+diff --cc drivers/i2c/i2c-core.c
+index ef9500aced53,3a1bc9c4efc7..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -885,11 -930,23 +907,19 @@@ static int i2c_device_probe(struct devi
+  	if (!client->irq) {
+  		int irq = -ENOENT;
+  
+ -		if (dev->of_node) {
+ -			irq = of_irq_get_byname(dev->of_node, "irq");
+ -			if (irq == -EINVAL || irq == -ENODATA)
+ -				irq = of_irq_get(dev->of_node, 0);
+ -		} else if (ACPI_COMPANION(dev)) {
+ +		if (ACPI_COMPANION(dev))
+  			irq = acpi_dev_gpio_irq_get(ACPI_COMPANION(dev), 0);
+ -		}
+ +
+  		if (irq == -EPROBE_DEFER)
+  			return irq;
++ 		/*
++ 		 * ACPI and OF did not find any useful IRQ, try to see
++ 		 * if Host Notify can be used.
++ 		 */
++ 		if (irq < 0) {
++ 			dev_dbg(dev, "Using Host Notify IRQ\n");
++ 			irq = i2c_smbus_host_notify_to_irq(client);
++ 		}
+  		if (irq < 0)
+  			irq = 0;
+  
+@@@ -1709,6 -1890,85 +1739,88 @@@ static int __process_new_adapter(struc
+  	return i2c_do_add_adapter(to_i2c_driver(d), data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct i2c_lock_operations i2c_adapter_lock_ops = {
++ 	.lock_bus =    i2c_adapter_lock_bus,
++ 	.trylock_bus = i2c_adapter_trylock_bus,
++ 	.unlock_bus =  i2c_adapter_unlock_bus,
++ };
++ 
++ static void i2c_host_notify_irq_teardown(struct i2c_adapter *adap)
++ {
++ 	struct irq_domain *domain = adap->host_notify_domain;
++ 	irq_hw_number_t hwirq;
++ 
++ 	if (!domain)
++ 		return;
++ 
++ 	for (hwirq = 0 ; hwirq < I2C_ADDR_7BITS_COUNT ; hwirq++)
++ 		irq_dispose_mapping(irq_find_mapping(domain, hwirq));
++ 
++ 	irq_domain_remove(domain);
++ 	adap->host_notify_domain = NULL;
++ }
++ 
++ static int i2c_host_notify_irq_map(struct irq_domain *h,
++ 					  unsigned int virq,
++ 					  irq_hw_number_t hw_irq_num)
++ {
++ 	irq_set_chip_and_handler(virq, &dummy_irq_chip, handle_simple_irq);
++ 
++ 	return 0;
++ }
++ 
++ static const struct irq_domain_ops i2c_host_notify_irq_ops = {
++ 	.map = i2c_host_notify_irq_map,
++ };
++ 
++ static int i2c_setup_host_notify_irq_domain(struct i2c_adapter *adap)
++ {
++ 	struct irq_domain *domain;
++ 
++ 	if (!i2c_check_functionality(adap, I2C_FUNC_SMBUS_HOST_NOTIFY))
++ 		return 0;
++ 
++ 	domain = irq_domain_create_linear(adap->dev.fwnode,
++ 					  I2C_ADDR_7BITS_COUNT,
++ 					  &i2c_host_notify_irq_ops, adap);
++ 	if (!domain)
++ 		return -ENOMEM;
++ 
++ 	adap->host_notify_domain = domain;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * i2c_handle_smbus_host_notify - Forward a Host Notify event to the correct
++  * I2C client.
++  * @adap: the adapter
++  * @addr: the I2C address of the notifying device
++  * Context: can't sleep
++  *
++  * Helper function to be called from an I2C bus driver's interrupt
++  * handler. It will schedule the Host Notify IRQ.
++  */
++ int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr)
++ {
++ 	int irq;
++ 
++ 	if (!adap)
++ 		return -EINVAL;
++ 
++ 	irq = irq_find_mapping(adap->host_notify_domain, addr);
++ 	if (irq <= 0)
++ 		return -ENXIO;
++ 
++ 	generic_handle_irq(irq);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(i2c_handle_smbus_host_notify);
++ 
+++>>>>>>> 4d5538f5882a (i2c: use an IRQ to report Host Notify events, not alert)
+  static int i2c_register_adapter(struct i2c_adapter *adap)
+  {
+  	int res = -EINVAL;
+* Unmerged path Documentation/i2c/smbus-protocol
+diff --git a/drivers/i2c/Kconfig b/drivers/i2c/Kconfig
+index 2ea2146588d4..86004b17e6a9 100644
+--- a/drivers/i2c/Kconfig
++++ b/drivers/i2c/Kconfig
+@@ -7,6 +7,7 @@ menu "I2C support"
+ config I2C
+ 	tristate "I2C support"
+ 	select RT_MUTEXES
++	select IRQ_DOMAIN
+ 	---help---
+ 	  I2C (pronounce: I-squared-C) is a slow serial bus protocol used in
+ 	  many micro controller applications and developed by Philips.  SMBus,
+* Unmerged path drivers/i2c/busses/i2c-i801.c
+* Unmerged path drivers/i2c/i2c-core.c
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index 299c7e878502..705dafb8c0c5 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -30,6 +30,7 @@
+ #include <linux/device.h>	/* for struct device */
+ #include <linux/sched.h>	/* for completion */
+ #include <linux/mutex.h>
++#include <linux/irqdomain.h>		/* for Host Notify IRQ */
+ #include <linux/of.h>		/* for struct device_node */
+ #include <linux/swab.h>		/* for swab16 */
+ #include <uapi/linux/i2c.h>
+@@ -512,6 +513,8 @@ struct i2c_adapter {
+ 
+ 	struct i2c_bus_recovery_info *bus_recovery_info;
+ 	const struct i2c_adapter_quirks *quirks;
++
++	struct irq_domain *host_notify_domain;
+ };
+ #define to_i2c_adapter(d) container_of(d, struct i2c_adapter, dev)
+ 
+@@ -616,6 +619,7 @@ static inline u8 i2c_8bit_addr_from_msg(const struct i2c_msg *msg)
+ 	return (msg->addr << 1) | (msg->flags & I2C_M_RD ? 1 : 0);
+ }
+ 
++int i2c_handle_smbus_host_notify(struct i2c_adapter *adap, unsigned short addr);
+ /**
+  * module_i2c_driver() - Helper macro for registering a I2C driver
+  * @__i2c_driver: i2c_driver struct
