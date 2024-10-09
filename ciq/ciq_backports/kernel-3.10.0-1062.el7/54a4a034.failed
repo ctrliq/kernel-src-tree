@@ -1,0 +1,186 @@
+nfp: flower: support offloading multiple rules with same cookie
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 54a4a03439305f701834cef1e4bd108548388d83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/54a4a034.failed
+
+When multiple netdevs are attached to a tc offload block and register for
+callbacks, a rule added to the block will be propogated to all netdevs.
+Previously these were detected as duplicates (based on cookie) and
+rejected. Modify the rule nfp lookup function to optionally include an
+ingress netdev and a host context along with the cookie value when
+searching for a rule. When a new rule is passed to the driver, the netdev
+the rule is to be attached to is considered when searching for dublicates.
+When a stats update is received from HW, the host context is used
+alongside the cookie to map to the correct host rule.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 54a4a03439305f701834cef1e4bd108548388d83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/metadata.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/metadata.c
+index bb425b17c6a7,21668aa435e8..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/metadata.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+@@@ -99,15 -99,18 +99,24 @@@ static int nfp_get_stats_entry(struct n
+  
+  /* Must be called with either RTNL or rcu_read_lock */
+  struct nfp_fl_payload *
+- nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie)
++ nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie,
++ 			   struct net_device *netdev, __be32 host_ctx)
+  {
+ +	unsigned long fl_key = nfp_flower_fl_key(tc_flower_cookie);
+  	struct nfp_flower_priv *priv = app->priv;
+  	struct nfp_fl_payload *flower_entry;
+  
+  	hash_for_each_possible_rcu(priv->flow_table, flower_entry, link,
+++<<<<<<< HEAD
+ +				   fl_key)
+ +		if (flower_entry->tc_flower_cookie == tc_flower_cookie)
+++=======
++ 				   tc_flower_cookie)
++ 		if (flower_entry->tc_flower_cookie == tc_flower_cookie &&
++ 		    (!netdev || flower_entry->ingress_dev == netdev) &&
++ 		    (host_ctx == NFP_FL_STATS_CTX_DONT_CARE ||
++ 		     flower_entry->meta.host_ctx_id == host_ctx))
+++>>>>>>> 54a4a0343930 (nfp: flower: support offloading multiple rules with same cookie)
+  			return flower_entry;
+  
+  	return NULL;
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 4906612ceb9a..6ddab2d9fd4c 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -48,6 +48,7 @@ struct tc_to_netdev;
+ struct net_device;
+ struct nfp_app;
+ 
++#define NFP_FL_STATS_CTX_DONT_CARE	cpu_to_be32(0xffffffff)
+ #define NFP_FL_STATS_ENTRY_RS		BIT(20)
+ #define NFP_FL_STATS_ELEM_RS		4
+ #define NFP_FL_REPEATED_HASH_MAX	BIT(17)
+@@ -193,6 +194,7 @@ struct nfp_fl_payload {
+ 	spinlock_t lock; /* lock stats */
+ 	struct nfp_fl_stats stats;
+ 	__be32 nfp_tun_ipv4_addr;
++	struct net_device *ingress_dev;
+ 	char *unmasked_data;
+ 	char *mask_data;
+ 	char *action_data;
+@@ -229,12 +231,14 @@ int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
+ 			      struct nfp_fl_payload *nfp_flow);
+ int nfp_compile_flow_metadata(struct nfp_app *app,
+ 			      struct tc_cls_flower_offload *flow,
+-			      struct nfp_fl_payload *nfp_flow);
++			      struct nfp_fl_payload *nfp_flow,
++			      struct net_device *netdev);
+ int nfp_modify_flow_metadata(struct nfp_app *app,
+ 			     struct nfp_fl_payload *nfp_flow);
+ 
+ struct nfp_fl_payload *
+-nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie);
++nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie,
++			   struct net_device *netdev, __be32 host_ctx);
+ struct nfp_fl_payload *
+ nfp_flower_remove_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie);
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/metadata.c
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/offload.c b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+index a384628b25b8..ddab19cd6221 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -420,6 +420,8 @@ nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
+ 		goto err_free_key_ls;
+ 	}
+ 
++	flow_pay->ingress_dev = egress ? NULL : netdev;
++
+ 	err = nfp_flower_compile_flow_match(flow, key_layer, netdev, flow_pay,
+ 					    tun_type);
+ 	if (err)
+@@ -429,7 +431,8 @@ nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
+ 	if (err)
+ 		goto err_destroy_flow;
+ 
+-	err = nfp_compile_flow_metadata(app, flow, flow_pay);
++	err = nfp_compile_flow_metadata(app, flow, flow_pay,
++					flow_pay->ingress_dev);
+ 	if (err)
+ 		goto err_destroy_flow;
+ 
+@@ -464,6 +467,7 @@ err_free_key_ls:
+  * @app:	Pointer to the APP handle
+  * @netdev:	netdev structure.
+  * @flow:	TC flower classifier offload structure
++ * @egress:	Netdev is the egress dev.
+  *
+  * Removes a flow from the repeated hash structure and clears the
+  * action payload.
+@@ -472,13 +476,16 @@ err_free_key_ls:
+  */
+ static int
+ nfp_flower_del_offload(struct nfp_app *app, struct net_device *netdev,
+-		       struct tc_cls_flower_offload *flow)
++		       struct tc_cls_flower_offload *flow, bool egress)
+ {
+ 	struct nfp_port *port = nfp_port_from_netdev(netdev);
+ 	struct nfp_fl_payload *nfp_flow;
++	struct net_device *ingr_dev;
+ 	int err;
+ 
+-	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie);
++	ingr_dev = egress ? NULL : netdev;
++	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
++					      NFP_FL_STATS_CTX_DONT_CARE);
+ 	if (!nfp_flow)
+ 		return -ENOENT;
+ 
+@@ -507,7 +514,9 @@ err_free_flow:
+ /**
+  * nfp_flower_get_stats() - Populates flow stats obtained from hardware.
+  * @app:	Pointer to the APP handle
++ * @netdev:	Netdev structure.
+  * @flow:	TC flower classifier offload structure
++ * @egress:	Netdev is the egress dev.
+  *
+  * Populates a flow statistics structure which which corresponds to a
+  * specific flow.
+@@ -515,11 +524,15 @@ err_free_flow:
+  * Return: negative value on error, 0 if stats populated successfully.
+  */
+ static int
+-nfp_flower_get_stats(struct nfp_app *app, struct tc_cls_flower_offload *flow)
++nfp_flower_get_stats(struct nfp_app *app, struct net_device *netdev,
++		     struct tc_cls_flower_offload *flow, bool egress)
+ {
+ 	struct nfp_fl_payload *nfp_flow;
++	struct net_device *ingr_dev;
+ 
+-	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie);
++	ingr_dev = egress ? NULL : netdev;
++	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
++					      NFP_FL_STATS_CTX_DONT_CARE);
+ 	if (!nfp_flow)
+ 		return -EINVAL;
+ 
+@@ -545,9 +558,9 @@ nfp_flower_repr_offload(struct nfp_app *app, struct net_device *netdev,
+ 	case TC_CLSFLOWER_REPLACE:
+ 		return nfp_flower_add_offload(app, netdev, flower, egress);
+ 	case TC_CLSFLOWER_DESTROY:
+-		return nfp_flower_del_offload(app, netdev, flower);
++		return nfp_flower_del_offload(app, netdev, flower, egress);
+ 	case TC_CLSFLOWER_STATS:
+-		return nfp_flower_get_stats(app, flower);
++		return nfp_flower_get_stats(app, netdev, flower, egress);
+ 	}
+ 
+ 	return -EOPNOTSUPP;
