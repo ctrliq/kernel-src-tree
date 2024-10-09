@@ -1,0 +1,113 @@
+nvme-fabrics: protect against module unload during create_ctrl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Roy Shterman <roys@lightbitslabs.com>
+commit 0de5cd367c6aa2a31a1c931628f778f79f8ef22e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0de5cd36.failed
+
+NVMe transport driver module unload may (and usually does) trigger
+iteration over the active controllers and delete them all (sometimes
+under a mutex).  However, a controller can be created concurrently with
+module unload which can lead to leakage of resources (most important char
+device node leakage) in case the controller creation occured after the
+unload delete and drain sequence.  To protect against this, we take a
+module reference to guarantee that the nvme transport driver is not
+unloaded while creating a controller.
+
+	Signed-off-by: Roy Shterman <roys@lightbitslabs.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 0de5cd367c6aa2a31a1c931628f778f79f8ef22e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fabrics.c
+diff --cc drivers/nvme/host/fabrics.c
+index 4ef418568e4b,2f68befd31bf..000000000000
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@@ -879,15 -884,16 +884,20 @@@ nvmf_create_ctrl(struct device *dev, co
+  	ctrl = ops->create_ctrl(dev, opts);
+  	if (IS_ERR(ctrl)) {
+  		ret = PTR_ERR(ctrl);
+- 		goto out_unlock;
++ 		goto out_module_put;
+  	}
+  
+ -	if (strcmp(ctrl->subsys->subnqn, opts->subsysnqn)) {
+ +	if (strcmp(ctrl->subnqn, opts->subsysnqn)) {
+  		dev_warn(ctrl->device,
+  			"controller returned incorrect NQN: \"%s\".\n",
+++<<<<<<< HEAD
+ +			ctrl->subnqn);
+++=======
++ 			ctrl->subsys->subnqn);
++ 		module_put(ops->module);
+++>>>>>>> 0de5cd367c6a (nvme-fabrics: protect against module unload during create_ctrl)
+  		up_read(&nvmf_transports_rwsem);
+ -		nvme_delete_ctrl_sync(ctrl);
+ +		ctrl->ops->delete_ctrl(ctrl);
+  		return ERR_PTR(-EINVAL);
+  	}
+  
+* Unmerged path drivers/nvme/host/fabrics.c
+diff --git a/drivers/nvme/host/fabrics.h b/drivers/nvme/host/fabrics.h
+index 5a20948e5609..693366954752 100644
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -108,6 +108,7 @@ struct nvmf_ctrl_options {
+  *			       fabric implementation of NVMe fabrics.
+  * @entry:		Used by the fabrics library to add the new
+  *			registration entry to its linked-list internal tree.
++ * @module:             Transport module reference
+  * @name:		Name of the NVMe fabric driver implementation.
+  * @required_opts:	sysfs command-line options that must be specified
+  *			when adding a new NVMe controller.
+@@ -126,6 +127,7 @@ struct nvmf_ctrl_options {
+  */
+ struct nvmf_transport_ops {
+ 	struct list_head	entry;
++	struct module		*module;
+ 	const char		*name;
+ 	int			required_opts;
+ 	int			allowed_opts;
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 6e7bb75ba7ba..35c7fb843e27 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -3412,6 +3412,7 @@ nvme_fc_create_ctrl(struct device *dev, struct nvmf_ctrl_options *opts)
+ 
+ static struct nvmf_transport_ops nvme_fc_transport = {
+ 	.name		= "fc",
++	.module		= THIS_MODULE,
+ 	.required_opts	= NVMF_OPT_TRADDR | NVMF_OPT_HOST_TRADDR,
+ 	.allowed_opts	= NVMF_OPT_RECONNECT_DELAY | NVMF_OPT_CTRL_LOSS_TMO,
+ 	.create_ctrl	= nvme_fc_create_ctrl,
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 2e9ce2cbb1eb..706ba5af4d20 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -2103,6 +2103,7 @@ out_free_ctrl:
+ 
+ static struct nvmf_transport_ops nvme_rdma_transport = {
+ 	.name		= "rdma",
++	.module		= THIS_MODULE,
+ 	.required_opts	= NVMF_OPT_TRADDR,
+ 	.allowed_opts	= NVMF_OPT_TRSVCID | NVMF_OPT_RECONNECT_DELAY |
+ 			  NVMF_OPT_HOST_TRADDR | NVMF_OPT_CTRL_LOSS_TMO,
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 21dcbdab74e4..75b98f15f1e0 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -708,6 +708,7 @@ static struct nvmet_fabrics_ops nvme_loop_ops = {
+ 
+ static struct nvmf_transport_ops nvme_loop_transport = {
+ 	.name		= "loop",
++	.module		= THIS_MODULE,
+ 	.create_ctrl	= nvme_loop_create_ctrl,
+ };
+ 
