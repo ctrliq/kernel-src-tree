@@ -1,0 +1,517 @@
+drm/i915: Check incoming alignment for unfenced buffers (on i915gm)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 1d033beb20d6d5885587a02a393b6598d766a382
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1d033beb.failed
+
+In case the object has changed tiling between calls to execbuf, we need
+to check if the existing offset inside the GTT matches the new tiling
+constraint. We even need to do this for "unfenced" tiled objects, where
+the 3D commands use an implied fence and so the object still needs to
+match the physical fence restrictions on alignment (only required for
+gen2 and early gen3).
+
+In commit 2889caa92321 ("drm/i915: Eliminate lots of iterations over
+the execobjects array"), the idea was to remove the second guessing and
+only set the NEEDS_MAP flag when required. However, the entire check
+for an unusable offset for fencing was removed and not just the
+secondary check. I.e.
+
+	/* avoid costly ping-pong once a batch bo ended up non-mappable */
+        if (entry->flags & __EXEC_OBJECT_NEEDS_MAP &&
+            !i915_vma_is_map_and_fenceable(vma))
+                return !only_mappable_for_reloc(entry->flags);
+
+was entirely removed as the ping-pong between execbuf passes was fixed,
+but its primary purpose in forcing unaligned unfenced access to be
+rebound was forgotten.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=103502
+Fixes: 2889caa92321 ("drm/i915: Eliminate lots of iterations over the execobjects array")
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171031103607.17836-1-chris@chris-wilson.co.uk
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+(cherry picked from commit 1d033beb20d6d5885587a02a393b6598d766a382)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_execbuffer.c
+diff --cc drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 3d37a15531ad,5b8213b1a8c7..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@@ -48,86 -63,400 +48,112 @@@
+  
+  #define BATCH_OFFSET_BIAS (256*1024)
+  
+ -#define __I915_EXEC_ILLEGAL_FLAGS \
+ -	(__I915_EXEC_UNKNOWN_FLAGS | I915_EXEC_CONSTANTS_MASK)
+ -
+ -/**
+ - * DOC: User command execution
+ - *
+ - * Userspace submits commands to be executed on the GPU as an instruction
+ - * stream within a GEM object we call a batchbuffer. This instructions may
+ - * refer to other GEM objects containing auxiliary state such as kernels,
+ - * samplers, render targets and even secondary batchbuffers. Userspace does
+ - * not know where in the GPU memory these objects reside and so before the
+ - * batchbuffer is passed to the GPU for execution, those addresses in the
+ - * batchbuffer and auxiliary objects are updated. This is known as relocation,
+ - * or patching. To try and avoid having to relocate each object on the next
+ - * execution, userspace is told the location of those objects in this pass,
+ - * but this remains just a hint as the kernel may choose a new location for
+ - * any object in the future.
+ - *
+ - * Processing an execbuf ioctl is conceptually split up into a few phases.
+ - *
+ - * 1. Validation - Ensure all the pointers, handles and flags are valid.
+ - * 2. Reservation - Assign GPU address space for every object
+ - * 3. Relocation - Update any addresses to point to the final locations
+ - * 4. Serialisation - Order the request with respect to its dependencies
+ - * 5. Construction - Construct a request to execute the batchbuffer
+ - * 6. Submission (at some point in the future execution)
+ - *
+ - * Reserving resources for the execbuf is the most complicated phase. We
+ - * neither want to have to migrate the object in the address space, nor do
+ - * we want to have to update any relocations pointing to this object. Ideally,
+ - * we want to leave the object where it is and for all the existing relocations
+ - * to match. If the object is given a new address, or if userspace thinks the
+ - * object is elsewhere, we have to parse all the relocation entries and update
+ - * the addresses. Userspace can set the I915_EXEC_NORELOC flag to hint that
+ - * all the target addresses in all of its objects match the value in the
+ - * relocation entries and that they all match the presumed offsets given by the
+ - * list of execbuffer objects. Using this knowledge, we know that if we haven't
+ - * moved any buffers, all the relocation entries are valid and we can skip
+ - * the update. (If userspace is wrong, the likely outcome is an impromptu GPU
+ - * hang.) The requirement for using I915_EXEC_NO_RELOC are:
+ - *
+ - *      The addresses written in the objects must match the corresponding
+ - *      reloc.presumed_offset which in turn must match the corresponding
+ - *      execobject.offset.
+ - *
+ - *      Any render targets written to in the batch must be flagged with
+ - *      EXEC_OBJECT_WRITE.
+ - *
+ - *      To avoid stalling, execobject.offset should match the current
+ - *      address of that object within the active context.
+ - *
+ - * The reservation is done is multiple phases. First we try and keep any
+ - * object already bound in its current location - so as long as meets the
+ - * constraints imposed by the new execbuffer. Any object left unbound after the
+ - * first pass is then fitted into any available idle space. If an object does
+ - * not fit, all objects are removed from the reservation and the process rerun
+ - * after sorting the objects into a priority order (more difficult to fit
+ - * objects are tried first). Failing that, the entire VM is cleared and we try
+ - * to fit the execbuf once last time before concluding that it simply will not
+ - * fit.
+ - *
+ - * A small complication to all of this is that we allow userspace not only to
+ - * specify an alignment and a size for the object in the address space, but
+ - * we also allow userspace to specify the exact offset. This objects are
+ - * simpler to place (the location is known a priori) all we have to do is make
+ - * sure the space is available.
+ - *
+ - * Once all the objects are in place, patching up the buried pointers to point
+ - * to the final locations is a fairly simple job of walking over the relocation
+ - * entry arrays, looking up the right address and rewriting the value into
+ - * the object. Simple! ... The relocation entries are stored in user memory
+ - * and so to access them we have to copy them into a local buffer. That copy
+ - * has to avoid taking any pagefaults as they may lead back to a GEM object
+ - * requiring the struct_mutex (i.e. recursive deadlock). So once again we split
+ - * the relocation into multiple passes. First we try to do everything within an
+ - * atomic context (avoid the pagefaults) which requires that we never wait. If
+ - * we detect that we may wait, or if we need to fault, then we have to fallback
+ - * to a slower path. The slowpath has to drop the mutex. (Can you hear alarm
+ - * bells yet?) Dropping the mutex means that we lose all the state we have
+ - * built up so far for the execbuf and we must reset any global data. However,
+ - * we do leave the objects pinned in their final locations - which is a
+ - * potential issue for concurrent execbufs. Once we have left the mutex, we can
+ - * allocate and copy all the relocation entries into a large array at our
+ - * leisure, reacquire the mutex, reclaim all the objects and other state and
+ - * then proceed to update any incorrect addresses with the objects.
+ - *
+ - * As we process the relocation entries, we maintain a record of whether the
+ - * object is being written to. Using NORELOC, we expect userspace to provide
+ - * this information instead. We also check whether we can skip the relocation
+ - * by comparing the expected value inside the relocation entry with the target's
+ - * final address. If they differ, we have to map the current object and rewrite
+ - * the 4 or 8 byte pointer within.
+ - *
+ - * Serialising an execbuf is quite simple according to the rules of the GEM
+ - * ABI. Execution within each context is ordered by the order of submission.
+ - * Writes to any GEM object are in order of submission and are exclusive. Reads
+ - * from a GEM object are unordered with respect to other reads, but ordered by
+ - * writes. A write submitted after a read cannot occur before the read, and
+ - * similarly any read submitted after a write cannot occur before the write.
+ - * Writes are ordered between engines such that only one write occurs at any
+ - * time (completing any reads beforehand) - using semaphores where available
+ - * and CPU serialisation otherwise. Other GEM access obey the same rules, any
+ - * write (either via mmaps using set-domain, or via pwrite) must flush all GPU
+ - * reads before starting, and any read (either using set-domain or pread) must
+ - * flush all GPU writes before starting. (Note we only employ a barrier before,
+ - * we currently rely on userspace not concurrently starting a new execution
+ - * whilst reading or writing to an object. This may be an advantage or not
+ - * depending on how much you trust userspace not to shoot themselves in the
+ - * foot.) Serialisation may just result in the request being inserted into
+ - * a DAG awaiting its turn, but most simple is to wait on the CPU until
+ - * all dependencies are resolved.
+ - *
+ - * After all of that, is just a matter of closing the request and handing it to
+ - * the hardware (well, leaving it in a queue to be executed). However, we also
+ - * offer the ability for batchbuffers to be run with elevated privileges so
+ - * that they access otherwise hidden registers. (Used to adjust L3 cache etc.)
+ - * Before any batch is given extra privileges we first must check that it
+ - * contains no nefarious instructions, we check that each instruction is from
+ - * our whitelist and all registers are also from an allowed list. We first
+ - * copy the user's batchbuffer to a shadow (so that the user doesn't have
+ - * access to it, either by the CPU or GPU as we scan it) and then parse each
+ - * instruction. If everything is ok, we set a flag telling the hardware to run
+ - * the batchbuffer in trusted mode, otherwise the ioctl is rejected.
+ - */
+ -
+ -struct i915_execbuffer {
+ -	struct drm_i915_private *i915; /** i915 backpointer */
+ -	struct drm_file *file; /** per-file lookup tables and limits */
+ -	struct drm_i915_gem_execbuffer2 *args; /** ioctl parameters */
+ -	struct drm_i915_gem_exec_object2 *exec; /** ioctl execobj[] */
+ -	struct i915_vma **vma;
+ -	unsigned int *flags;
+ -
+ -	struct intel_engine_cs *engine; /** engine to queue the request to */
+ -	struct i915_gem_context *ctx; /** context for building the request */
+ -	struct i915_address_space *vm; /** GTT and vma for the request */
+ -
+ -	struct drm_i915_gem_request *request; /** our request to build */
+ -	struct i915_vma *batch; /** identity of the batch obj/vma */
+ -
+ -	/** actual size of execobj[] as we may extend it for the cmdparser */
+ -	unsigned int buffer_count;
+ -
+ -	/** list of vma not yet bound during reservation phase */
+ -	struct list_head unbound;
+ -
+ -	/** list of vma that have execobj.relocation_count */
+ -	struct list_head relocs;
+ -
+ -	/**
+ -	 * Track the most recently used object for relocations, as we
+ -	 * frequently have to perform multiple relocations within the same
+ -	 * obj/page
+ -	 */
+ -	struct reloc_cache {
+ -		struct drm_mm_node node; /** temporary GTT binding */
+ -		unsigned long vaddr; /** Current kmap address */
+ -		unsigned long page; /** Currently mapped page index */
+ -		unsigned int gen; /** Cached value of INTEL_GEN */
+ -		bool use_64bit_reloc : 1;
+ -		bool has_llc : 1;
+ -		bool has_fence : 1;
+ -		bool needs_unfenced : 1;
+ -
+ -		struct drm_i915_gem_request *rq;
+ -		u32 *rq_cmd;
+ -		unsigned int rq_size;
+ -	} reloc_cache;
+ -
+ -	u64 invalid_flags; /** Set of execobj.flags that are invalid */
+ -	u32 context_flags; /** Set of execobj.flags to insert from the ctx */
+ -
+ -	u32 batch_start_offset; /** Location within object of batch */
+ -	u32 batch_len; /** Length of batch within object */
+ -	u32 batch_flags; /** Flags composed for emit_bb_start() */
+ -
+ -	/**
+ -	 * Indicate either the size of the hastable used to resolve
+ -	 * relocation handles, or if negative that we are using a direct
+ -	 * index into the execobj[].
+ -	 */
+ -	int lut_size;
+ -	struct hlist_head *buckets; /** ht for relocation handles */
+ +struct i915_execbuffer_params {
+ +	struct drm_device               *dev;
+ +	struct drm_file                 *file;
+ +	struct i915_vma			*batch;
+ +	u32				dispatch_flags;
+ +	u32				args_batch_start_offset;
+ +	struct intel_engine_cs          *engine;
+ +	struct i915_gem_context         *ctx;
+ +	struct drm_i915_gem_request     *request;
+  };
+  
+ -#define exec_entry(EB, VMA) (&(EB)->exec[(VMA)->exec_flags - (EB)->flags])
+ -
+ -/*
+ - * Used to convert any address to canonical form.
+ - * Starting from gen8, some commands (e.g. STATE_BASE_ADDRESS,
+ - * MI_LOAD_REGISTER_MEM and others, see Broadwell PRM Vol2a) require the
+ - * addresses to be in a canonical form:
+ - * "GraphicsAddress[63:48] are ignored by the HW and assumed to be in correct
+ - * canonical form [63:48] == [47]."
+ - */
+ -#define GEN8_HIGH_ADDRESS_BIT 47
+ -static inline u64 gen8_canonical_addr(u64 address)
+ -{
+ -	return sign_extend64(address, GEN8_HIGH_ADDRESS_BIT);
+ -}
+ -
+ -static inline u64 gen8_noncanonical_addr(u64 address)
+ -{
+ -	return address & GENMASK_ULL(GEN8_HIGH_ADDRESS_BIT, 0);
+ -}
+ -
+ -static inline bool eb_use_cmdparser(const struct i915_execbuffer *eb)
+ -{
+ -	return eb->engine->needs_cmd_parser && eb->batch_len;
+ -}
+ +struct eb_vmas {
+ +	struct drm_i915_private *i915;
+ +	struct list_head vmas;
+ +	int and;
+ +	union {
+ +		struct i915_vma *lut[0];
+ +		struct hlist_head buckets[0];
+ +	};
+ +};
+  
+ -static int eb_create(struct i915_execbuffer *eb)
+ +static struct eb_vmas *
+ +eb_create(struct drm_i915_private *i915,
+ +	  struct drm_i915_gem_execbuffer2 *args)
+  {
+ -	if (!(eb->args->flags & I915_EXEC_HANDLE_LUT)) {
+ -		unsigned int size = 1 + ilog2(eb->buffer_count);
+ -
+ -		/*
+ -		 * Without a 1:1 association between relocation handles and
+ -		 * the execobject[] index, we instead create a hashtable.
+ -		 * We size it dynamically based on available memory, starting
+ -		 * first with 1:1 assocative hash and scaling back until
+ -		 * the allocation succeeds.
+ -		 *
+ -		 * Later on we use a positive lut_size to indicate we are
+ -		 * using this hashtable, and a negative value to indicate a
+ -		 * direct lookup.
+ -		 */
+ -		do {
+ -			gfp_t flags;
+ -
+ -			/* While we can still reduce the allocation size, don't
+ -			 * raise a warning and allow the allocation to fail.
+ -			 * On the last pass though, we want to try as hard
+ -			 * as possible to perform the allocation and warn
+ -			 * if it fails.
+ -			 */
+ -			flags = GFP_KERNEL;
+ -			if (size > 1)
+ -				flags |= __GFP_NORETRY | __GFP_NOWARN;
+ -
+ -			eb->buckets = kzalloc(sizeof(struct hlist_head) << size,
+ -					      flags);
+ -			if (eb->buckets)
+ -				break;
+ -		} while (--size);
+ -
+ -		if (unlikely(!size))
+ -			return -ENOMEM;
+ -
+ -		eb->lut_size = size;
+ -	} else {
+ -		eb->lut_size = -eb->buffer_count;
+ -	}
+ +	struct eb_vmas *eb = NULL;
+ +
+ +	if (args->flags & I915_EXEC_HANDLE_LUT) {
+ +		unsigned size = args->buffer_count;
+ +		size *= sizeof(struct i915_vma *);
+ +		size += sizeof(struct eb_vmas);
+ +		eb = kmalloc(size, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+ +	}
+ +
+ +	if (eb == NULL) {
+ +		unsigned size = args->buffer_count;
+ +		unsigned count = PAGE_SIZE / sizeof(struct hlist_head) / 2;
+ +		BUILD_BUG_ON_NOT_POWER_OF_2(PAGE_SIZE / sizeof(struct hlist_head));
+ +		while (count > 2*size)
+ +			count >>= 1;
+ +		eb = kzalloc(count*sizeof(struct hlist_head) +
+ +			     sizeof(struct eb_vmas),
+ +			     GFP_TEMPORARY);
+ +		if (eb == NULL)
+ +			return eb;
+ +
+ +		eb->and = count - 1;
+ +	} else
+ +		eb->and = -args->buffer_count;
+  
+ -	return 0;
+ +	eb->i915 = i915;
+ +	INIT_LIST_HEAD(&eb->vmas);
+ +	return eb;
+  }
+  
+ -static bool
+ -eb_vma_misplaced(const struct drm_i915_gem_exec_object2 *entry,
+ -		 const struct i915_vma *vma,
+ -		 unsigned int flags)
+ +static void
+ +eb_reset(struct eb_vmas *eb)
+  {
+++<<<<<<< HEAD
+ +	if (eb->and >= 0)
+ +		memset(eb->buckets, 0, (eb->and+1)*sizeof(struct hlist_head));
+++=======
++ 	if (vma->node.size < entry->pad_to_size)
++ 		return true;
++ 
++ 	if (entry->alignment && !IS_ALIGNED(vma->node.start, entry->alignment))
++ 		return true;
++ 
++ 	if (flags & EXEC_OBJECT_PINNED &&
++ 	    vma->node.start != entry->offset)
++ 		return true;
++ 
++ 	if (flags & __EXEC_OBJECT_NEEDS_BIAS &&
++ 	    vma->node.start < BATCH_OFFSET_BIAS)
++ 		return true;
++ 
++ 	if (!(flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS) &&
++ 	    (vma->node.start + vma->node.size - 1) >> 32)
++ 		return true;
++ 
++ 	if (flags & __EXEC_OBJECT_NEEDS_MAP &&
++ 	    !i915_vma_is_map_and_fenceable(vma))
++ 		return true;
++ 
++ 	return false;
+++>>>>>>> 1d033beb20d6 (drm/i915: Check incoming alignment for unfenced buffers (on i915gm))
+  }
+  
+ -static inline bool
+ -eb_pin_vma(struct i915_execbuffer *eb,
+ -	   const struct drm_i915_gem_exec_object2 *entry,
+ -	   struct i915_vma *vma)
+ -{
+ -	unsigned int exec_flags = *vma->exec_flags;
+ -	u64 pin_flags;
+ -
+ -	if (vma->node.size)
+ -		pin_flags = vma->node.start;
+ -	else
+ -		pin_flags = entry->offset & PIN_OFFSET_MASK;
+ -
+ -	pin_flags |= PIN_USER | PIN_NOEVICT | PIN_OFFSET_FIXED;
+ -	if (unlikely(exec_flags & EXEC_OBJECT_NEEDS_GTT))
+ -		pin_flags |= PIN_GLOBAL;
+ -
+ -	if (unlikely(i915_vma_pin(vma, 0, 0, pin_flags)))
+ -		return false;
+ -
+ -	if (unlikely(exec_flags & EXEC_OBJECT_NEEDS_FENCE)) {
+ -		if (unlikely(i915_vma_pin_fence(vma))) {
+ -			i915_vma_unpin(vma);
+ -			return false;
+ -		}
+ -
+ -		if (vma->fence)
+ -			exec_flags |= __EXEC_OBJECT_HAS_FENCE;
+ -	}
+ -
+ -	*vma->exec_flags = exec_flags | __EXEC_OBJECT_HAS_PIN;
+ -	return !eb_vma_misplaced(entry, vma, exec_flags);
+ -}
+ -
+ -static inline void __eb_unreserve_vma(struct i915_vma *vma, unsigned int flags)
+ -{
+ -	GEM_BUG_ON(!(flags & __EXEC_OBJECT_HAS_PIN));
+ -
+ -	if (unlikely(flags & __EXEC_OBJECT_HAS_FENCE))
+ -		__i915_vma_unpin_fence(vma);
+ -
+ -	__i915_vma_unpin(vma);
+ -}
+ -
+ -static inline void
+ -eb_unreserve_vma(struct i915_vma *vma, unsigned int *flags)
+ -{
+ -	if (!(*flags & __EXEC_OBJECT_HAS_PIN))
+ -		return;
+ -
+ -	__eb_unreserve_vma(vma, *flags);
+ -	*flags &= ~__EXEC_OBJECT_RESERVED;
+ -}
+ -
+ -static int
+ -eb_validate_vma(struct i915_execbuffer *eb,
+ -		struct drm_i915_gem_exec_object2 *entry,
+ -		struct i915_vma *vma)
+ +static struct i915_vma *
+ +eb_get_batch(struct eb_vmas *eb)
+  {
+ -	if (unlikely(entry->flags & eb->invalid_flags))
+ -		return -EINVAL;
+ -
+ -	if (unlikely(entry->alignment && !is_power_of_2(entry->alignment)))
+ -		return -EINVAL;
+ +	struct i915_vma *vma = list_entry(eb->vmas.prev, typeof(*vma), exec_list);
+  
+  	/*
+ -	 * Offset can be used as input (EXEC_OBJECT_PINNED), reject
+ -	 * any non-page-aligned or non-canonical addresses.
+ -	 */
+ -	if (unlikely(entry->flags & EXEC_OBJECT_PINNED &&
+ -		     entry->offset != gen8_canonical_addr(entry->offset & PAGE_MASK)))
+ -		return -EINVAL;
+ -
+ -	/* pad_to_size was once a reserved field, so sanitize it */
+ -	if (entry->flags & EXEC_OBJECT_PAD_TO_SIZE) {
+ -		if (unlikely(offset_in_page(entry->pad_to_size)))
+ -			return -EINVAL;
+ -	} else {
+ -		entry->pad_to_size = 0;
+ -	}
+ -
+ -	if (unlikely(vma->exec_flags)) {
+ -		DRM_DEBUG("Object [handle %d, index %d] appears more than once in object list\n",
+ -			  entry->handle, (int)(entry - eb->exec));
+ -		return -EINVAL;
+ -	}
+ -
+ -	/*
+ -	 * From drm_mm perspective address space is continuous,
+ -	 * so from this point we're always using non-canonical
+ -	 * form internally.
+ +	 * SNA is doing fancy tricks with compressing batch buffers, which leads
+ +	 * to negative relocation deltas. Usually that works out ok since the
+ +	 * relocate address is still positive, except when the batch is placed
+ +	 * very low in the GTT. Ensure this doesn't happen.
+ +	 *
+ +	 * Note that actual hangs have only been observed on gen7, but for
+ +	 * paranoia do it everywhere.
+  	 */
+ -	entry->offset = gen8_noncanonical_addr(entry->offset);
+ -
+ -	if (!eb->reloc_cache.has_fence) {
+ -		entry->flags &= ~EXEC_OBJECT_NEEDS_FENCE;
+ -	} else {
+ -		if ((entry->flags & EXEC_OBJECT_NEEDS_FENCE ||
+ -		     eb->reloc_cache.needs_unfenced) &&
+ -		    i915_gem_object_is_tiled(vma->obj))
+ -			entry->flags |= EXEC_OBJECT_NEEDS_GTT | __EXEC_OBJECT_NEEDS_MAP;
+ -	}
+ -
+ -	if (!(entry->flags & EXEC_OBJECT_PINNED))
+ -		entry->flags |= eb->context_flags;
+ +	if ((vma->exec_entry->flags & EXEC_OBJECT_PINNED) == 0)
+ +		vma->exec_entry->flags |= __EXEC_OBJECT_NEEDS_BIAS;
+  
+ -	return 0;
+ +	return vma;
+  }
+  
+  static int
+* Unmerged path drivers/gpu/drm/i915/i915_gem_execbuffer.c
