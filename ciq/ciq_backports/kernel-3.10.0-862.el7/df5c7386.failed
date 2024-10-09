@@ -1,0 +1,125 @@
+dmaengine: dw: some Intel devices has no memcpy support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [sound] alsa: dmaengine: dw: some Intel devices has no memcpy support (Jaroslav Kysela) [1463624]
+Rebuild_FUZZ: 94.83%
+commit-author Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+commit df5c7386f62d2db95ca48005087195e9a15e2b1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df5c7386.failed
+
+Provide a flag to choose if the device does support memory-to-memory transfers.
+At least this is not true for iDMA32 controller that might be supported in the
+future. Besides that Intel BayTrail and Braswell users should not try this
+feature due to HW specific behaviour.
+
+	Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+(cherry picked from commit df5c7386f62d2db95ca48005087195e9a15e2b1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/dw_dmac.c
+diff --cc drivers/dma/dw_dmac.c
+index e4409f73fad7,41e9554b884d..000000000000
+--- a/drivers/dma/dw_dmac.c
++++ b/drivers/dma/dw_dmac.c
+@@@ -1702,44 -1541,28 +1702,45 @@@ static int dw_probe(struct platform_dev
+  
+  		/* Fill platform data with the default values */
+  		pdata->is_private = true;
++ 		pdata->is_memcpy = true;
+  		pdata->chan_allocation_order = CHAN_ALLOCATION_ASCENDING;
+  		pdata->chan_priority = CHAN_PRIORITY_ASCENDING;
+ -	} else if (pdata->nr_channels > DW_DMA_MAX_NR_CHANNELS) {
+ -		err = -EINVAL;
+ -		goto err_pdata;
+ -	}
+ +	} else if (!pdata || pdata->nr_channels > DW_DMA_MAX_NR_CHANNELS)
+ +		return -EINVAL;
+  
+ -	dw->chan = devm_kcalloc(chip->dev, pdata->nr_channels, sizeof(*dw->chan),
+ -				GFP_KERNEL);
+ -	if (!dw->chan) {
+ -		err = -ENOMEM;
+ -		goto err_pdata;
+ -	}
+ +	if (autocfg)
+ +		nr_channels = (dw_params >> DW_PARAMS_NR_CHAN & 0x7) + 1;
+ +	else
+ +		nr_channels = pdata->nr_channels;
+ +
+ +	size = sizeof(struct dw_dma) + nr_channels * sizeof(struct dw_dma_chan);
+ +	dw = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
+ +	if (!dw)
+ +		return -ENOMEM;
+ +
+ +	dw->clk = devm_clk_get(&pdev->dev, "hclk");
+ +	if (IS_ERR(dw->clk))
+ +		return PTR_ERR(dw->clk);
+ +	clk_prepare_enable(dw->clk);
+ +
+ +	dw->regs = regs;
+  
+  	/* Get hardware configuration parameters */
+ -	dw->nr_masters = pdata->nr_masters;
+ -	for (i = 0; i < dw->nr_masters; i++)
+ -		dw->data_width[i] = pdata->data_width[i];
+ +	if (autocfg) {
+ +		max_blk_size = dma_readl(dw, MAX_BLK_SIZE);
+ +
+ +		dw->nr_masters = (dw_params >> DW_PARAMS_NR_MASTER & 3) + 1;
+ +		for (i = 0; i < dw->nr_masters; i++) {
+ +			dw->data_width[i] =
+ +				(dw_params >> DW_PARAMS_DATA_WIDTH(i) & 3) + 2;
+ +		}
+ +	} else {
+ +		dw->nr_masters = pdata->nr_masters;
+ +		memcpy(dw->data_width, pdata->data_width, 4);
+ +	}
+  
+  	/* Calculate all channel mask before DMA setup */
+ -	dw->all_chan_mask = (1 << pdata->nr_channels) - 1;
+ +	dw->all_chan_mask = (1 << nr_channels) - 1;
+  
+  	/* Force dma off, just in case */
+  	dw_dma_off(dw);
+@@@ -1837,7 -1658,10 +1838,14 @@@
+  	dma_cap_set(DMA_SLAVE, dw->dma.cap_mask);
+  	if (pdata->is_private)
+  		dma_cap_set(DMA_PRIVATE, dw->dma.cap_mask);
+++<<<<<<< HEAD:drivers/dma/dw_dmac.c
+ +	dw->dma.dev = &pdev->dev;
+++=======
++ 	if (pdata->is_memcpy)
++ 		dma_cap_set(DMA_MEMCPY, dw->dma.cap_mask);
++ 
++ 	dw->dma.dev = chip->dev;
+++>>>>>>> df5c7386f62d (dmaengine: dw: some Intel devices has no memcpy support):drivers/dma/dw/core.c
+  	dw->dma.device_alloc_chan_resources = dwc_alloc_chan_resources;
+  	dw->dma.device_free_chan_resources = dwc_free_chan_resources;
+  
+* Unmerged path drivers/dma/dw_dmac.c
+diff --git a/include/linux/dw_dmac.h b/include/linux/dw_dmac.h
+index 2d6d4e3d24d3..2d17d8f03c2f 100644
+--- a/include/linux/dw_dmac.h
++++ b/include/linux/dw_dmac.h
+@@ -35,6 +35,7 @@ struct dw_dma_slave {
+  * @nr_channels: Number of channels supported by hardware (max 8)
+  * @is_private: The device channels should be marked as private and not for
+  *	by the general purpose DMA channel allocator.
++ * @is_memcpy: The device channels do support memory-to-memory transfers.
+  * @chan_allocation_order: Allocate channels starting from 0 or 7
+  * @chan_priority: Set channel priority increasing from 0 to 7 or 7 to 0.
+  * @block_size: Maximum block size supported by the controller
+@@ -45,6 +46,7 @@ struct dw_dma_slave {
+ struct dw_dma_platform_data {
+ 	unsigned int	nr_channels;
+ 	bool		is_private;
++	bool		is_memcpy;
+ #define CHAN_ALLOCATION_ASCENDING	0	/* zero to seven */
+ #define CHAN_ALLOCATION_DESCENDING	1	/* seven to zero */
+ 	unsigned char	chan_allocation_order;
