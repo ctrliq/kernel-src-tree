@@ -1,0 +1,182 @@
+[readdir] introduce ->iterate(), ctx->pos, dir_emit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] introduce ->iterate(), ctx->pos, dir_emit() ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 89.58%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit bb6f619b3a49f940d7478112500da312d70866eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bb6f619b.failed
+
+New method - ->iterate(file, ctx).  That's the replacement for ->readdir();
+it takes callback from ctx->actor, uses ctx->pos instead of file->f_pos and
+calls dir_emit(ctx, ...) instead of filldir(data, ...).  It does *not*
+update file->f_pos (or look at it, for that matter); iterate_dir() does the
+update.
+
+Note that dir_emit() takes the offset from ctx->pos (and eventually
+filldir_t will lose that argument).
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit bb6f619b3a49f940d7478112500da312d70866eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4recover.c
+#	fs/readdir.c
+#	include/linux/fs.h
+diff --cc fs/nfsd/nfs4recover.c
+index cdb8e1753ca6,2fa2e2eb190b..000000000000
+--- a/fs/nfsd/nfs4recover.c
++++ b/fs/nfsd/nfs4recover.c
+@@@ -262,8 -268,7 +267,12 @@@ nfsd4_list_rec_dir(recdir_func *f, stru
+  {
+  	const struct cred *original_cred;
+  	struct dentry *dir = nn->rec_file->f_path.dentry;
+++<<<<<<< HEAD
+ +	LIST_HEAD(names);
+ +	struct name_list *entry, *tmp;
+++=======
++ 	struct nfs4_dir_ctx ctx;
+++>>>>>>> bb6f619b3a49 ([readdir] introduce ->iterate(), ctx->pos, dir_emit())
+  	int status;
+  
+  	status = nfs4_save_creds(&original_cred);
+diff --cc fs/readdir.c
+index fee38e04fae4,5d6578affbbf..000000000000
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@@ -37,7 -37,14 +37,18 @@@ int vfs_readdir(struct file *file, fill
+  
+  	res = -ENOENT;
+  	if (!IS_DEADDIR(inode)) {
+++<<<<<<< HEAD
+ +		res = file->f_op->readdir(file, buf, filler);
+++=======
++ 		if (file->f_op->iterate) {
++ 			ctx->pos = file->f_pos;
++ 			res = file->f_op->iterate(file, ctx);
++ 			file->f_pos = ctx->pos;
++ 		} else {
++ 			res = file->f_op->readdir(file, ctx, ctx->actor);
++ 			ctx->pos = file->f_pos;
++ 		}
+++>>>>>>> bb6f619b3a49 ([readdir] introduce ->iterate(), ctx->pos, dir_emit())
+  		file_accessed(file);
+  	}
+  	mutex_unlock(&inode->i_mutex);
+diff --cc include/linux/fs.h
+index 4086333a0708,b9641ae68da8..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1741,6 -1506,17 +1741,20 @@@ int fiemap_check_flags(struct fiemap_ex
+   * to have different dirent layouts depending on the binary type.
+   */
+  typedef int (*filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
+++<<<<<<< HEAD
+++=======
++ struct dir_context {
++ 	filldir_t actor;
++ 	loff_t pos;
++ };
++ 
++ static inline bool dir_emit(struct dir_context *ctx,
++ 			    const char *name, int namelen,
++ 			    u64 ino, unsigned type)
++ {
++ 	return ctx->actor(ctx, name, namelen, ctx->pos, ino, type) == 0;
++ }
+++>>>>>>> bb6f619b3a49 ([readdir] introduce ->iterate(), ctx->pos, dir_emit())
+  struct block_device_operations;
+  
+  /* These macros are for out of kernel modules to test that
+diff --git a/arch/parisc/hpux/fs.c b/arch/parisc/hpux/fs.c
+index 47f0103bdb96..3e4a072ee34a 100644
+--- a/arch/parisc/hpux/fs.c
++++ b/arch/parisc/hpux/fs.c
+@@ -114,7 +114,7 @@ int hpux_getdents(unsigned int fd, struct hpux_dirent __user *dirent, unsigned i
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+ 	if (lastdirent) {
+-		if (put_user(arg.file->f_pos, &lastdirent->d_off))
++		if (put_user(buf.ctx.pos, &lastdirent->d_off))
+ 			error = -EFAULT;
+ 		else
+ 			error = count - buf.count;
+diff --git a/fs/coda/dir.c b/fs/coda/dir.c
+index c424e27b42f9..9fbea840cb0a 100644
+--- a/fs/coda/dir.c
++++ b/fs/coda/dir.c
+@@ -391,8 +391,7 @@ static int coda_readdir(struct file *coda_file, void *buf, filldir_t filldir)
+ 	if (!host_file->f_op)
+ 		return -ENOTDIR;
+ 
+-	if (host_file->f_op->readdir)
+-	{
++	if (host_file->f_op->readdir) {
+ 		/* potemkin case: we were handed a directory inode.
+ 		 * We can't use vfs_readdir because we have to keep the file
+ 		 * position in sync between the coda_file and the host_file.
+@@ -410,8 +409,20 @@ static int coda_readdir(struct file *coda_file, void *buf, filldir_t filldir)
+ 
+ 		coda_file->f_pos = host_file->f_pos;
+ 		mutex_unlock(&host_inode->i_mutex);
+-	}
+-	else /* Venus: we must read Venus dirents from a file */
++	} else if (host_file->f_op->iterate) {
++		struct inode *host_inode = file_inode(host_file);
++		struct dir_context *ctx = buf;
++
++		mutex_lock(&host_inode->i_mutex);
++		ret = -ENOENT;
++		if (!IS_DEADDIR(host_inode)) {
++			ret = host_file->f_op->iterate(host_file, ctx);
++			file_accessed(host_file);
++		}
++		mutex_unlock(&host_inode->i_mutex);
++
++		coda_file->f_pos = ctx->pos;
++	} else /* Venus: we must read Venus dirents from a file */
+ 		ret = coda_venus_readdir(coda_file, buf, filldir);
+ 
+ 	return ret;
+diff --git a/fs/compat.c b/fs/compat.c
+index ce28ea16eb65..6773236f6d88 100644
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -971,7 +971,7 @@ asmlinkage long compat_sys_getdents(unsigned int fd,
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+ 	if (lastdirent) {
+-		if (put_user(f.file->f_pos, &lastdirent->d_off))
++		if (put_user(buf.ctx.pos, &lastdirent->d_off))
+ 			error = -EFAULT;
+ 		else
+ 			error = count - buf.count;
+@@ -1056,7 +1056,7 @@ asmlinkage long compat_sys_getdents64(unsigned int fd,
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+ 	if (lastdirent) {
+-		typeof(lastdirent->d_off) d_off = f.file->f_pos;
++		typeof(lastdirent->d_off) d_off = buf.ctx.pos;
+ 		if (__put_user_unaligned(d_off, &lastdirent->d_off))
+ 			error = -EFAULT;
+ 		else
+diff --git a/fs/exportfs/expfs.c b/fs/exportfs/expfs.c
+index 262fc9940982..a3db13e3b770 100644
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -271,7 +271,7 @@ static int get_name(const struct path *path, char *name, struct dentry *child)
+ 		goto out;
+ 
+ 	error = -EINVAL;
+-	if (!file->f_op->readdir)
++	if (!file->f_op->readdir && !file->f_op->iterate)
+ 		goto out_close;
+ 
+ 	buffer.name = name;
+* Unmerged path fs/nfsd/nfs4recover.c
+* Unmerged path fs/readdir.c
+* Unmerged path include/linux/fs.h
