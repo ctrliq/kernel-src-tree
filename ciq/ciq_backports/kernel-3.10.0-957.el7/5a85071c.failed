@@ -1,0 +1,102 @@
+md: use a separate bio_set for synchronous IO.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] use a separate bio_set for synchronous IO. (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 95.45%
+commit-author NeilBrown <neilb@suse.com>
+commit 5a85071c2cbcc7d8d8f764b33bf64c76e47d268d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5a85071c.failed
+
+md devices allocate a bio_set and use it for two
+distinct purposes.
+mddev->bio_set is used to clone bios as part of sending
+upper level requests down to lower level devices,
+and it is also use for synchronous IO such as superblock
+and bitmap updates, and for correcting read errors.
+
+This multiple usage can lead to deadlocks.  It is likely
+that cloned bios might be queued for write and to be
+waiting for a metadata update before the write can be permitted.
+If the cloning exhausted mddev->bio_set, the metadata update
+may not be able to proceed.
+
+This scenario has been seen during heavy testing, with lots of IO and
+lots of memory pressure.
+
+Address this by adding a new bio_set specifically for synchronous IO.
+All synchronous IO goes directly to the underlying device and is not
+queued at the md level, so request using entries from the new
+mddev->sync_set will complete in a timely fashion.
+Requests that use mddev->bio_set will sometimes need to wait
+for synchronous IO, but will no longer risk deadlocking that iO.
+
+Also: small simplification in mddev_put(): there is no need to
+wait until the spinlock is released before calling bioset_free().
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 5a85071c2cbcc7d8d8f764b33bf64c76e47d268d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 803a9346c3dc,65ad837aeb54..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -195,15 -203,13 +195,25 @@@ struct bio *bio_alloc_mddev(gfp_t gfp_m
+  }
+  EXPORT_SYMBOL_GPL(bio_alloc_mddev);
+  
+++<<<<<<< HEAD
+ +struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
+ +			    struct mddev *mddev)
+ +{
+ +	if (!mddev || !mddev->bio_set)
+ +		return bio_clone(bio, gfp_mask);
+ +
+ +	return bio_clone_bioset(bio, gfp_mask, mddev->bio_set);
+ +}
+ +EXPORT_SYMBOL_GPL(bio_clone_mddev);
+++=======
++ static struct bio *md_bio_alloc_sync(struct mddev *mddev)
++ {
++ 	if (!mddev->sync_set)
++ 		return bio_alloc(GFP_NOIO, 1);
++ 
++ 	return bio_alloc_bioset(GFP_NOIO, 1, mddev->sync_set);
++ }
+++>>>>>>> 5a85071c2cbc (md: use a separate bio_set for synchronous IO.)
+  
+  /*
+   * We have a system wide 'event count' that is incremented
+@@@ -847,9 -794,9 +857,9 @@@ int md_super_wait(struct mddev *mddev
+  }
+  
+  int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
+ -		 struct page *page, int op, int op_flags, bool metadata_op)
+ +		 struct page *page, int rw, bool metadata_op)
+  {
+- 	struct bio *bio = bio_alloc_mddev(GFP_NOIO, 1, rdev->mddev);
++ 	struct bio *bio = md_bio_alloc_sync(rdev->mddev);
+  	int ret;
+  
+  	bio->bi_bdev = (metadata_op && rdev->meta_bdev) ?
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 629c80ea88dd..d7c0fbd437f1 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -474,6 +474,9 @@ struct mddev {
+ 	struct attribute_group		*to_remove;
+ 
+ 	struct bio_set			*bio_set;
++	struct bio_set			*sync_set; /* for sync operations like
++						   * metadata and bitmap writes
++						   */
+ 
+ 	/* Generic flush handling.
+ 	 * The last to finish preflush schedules a worker to submit
