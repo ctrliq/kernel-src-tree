@@ -1,0 +1,325 @@
+target: Convert se_lun->lun_deve_lock to normal spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Convert se_lun->lun_deve_lock to normal spinlock (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.31%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 1adff1b3a7f75a1c255b7fcab5676edf29d4a5d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1adff1b3.failed
+
+This patch converts se_lun->lun_deve_lock acquire/release access
+to use a normal, non bottom-half spin_lock_t for protecting
+se_lun->lun_deve_list access.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 1adff1b3a7f75a1c255b7fcab5676edf29d4a5d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_alua.c
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_pr.c
+diff --cc drivers/target/target_core_alua.c
+index a73542598e96,c56ae024c42e..000000000000
+--- a/drivers/target/target_core_alua.c
++++ b/drivers/target/target_core_alua.c
+@@@ -993,36 -964,46 +993,64 @@@ static void core_alua_do_transition_ua(
+  		 * every I_T nexus other than the I_T nexus on which the SET
+  		 * TARGET PORT GROUPS command
+  		 */
+ -		if (!percpu_ref_tryget_live(&lun->lun_ref))
+ -			continue;
+ +		atomic_inc_mb(&mem->tg_pt_gp_mem_ref_cnt);
+  		spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  
+++<<<<<<< HEAD
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(se_deve, &port->sep_alua_list,
+ +					alua_port_list) {
+ +			lacl = se_deve->se_lun_acl;
+++=======
++ 		spin_lock(&lun->lun_deve_lock);
++ 		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link) {
++ 			lacl = rcu_dereference_check(se_deve->se_lun_acl,
++ 					lockdep_is_held(&lun->lun_deve_lock));
++ 
++ 			/*
++ 			 * spc4r37 p.242:
++ 			 * After an explicit target port asymmetric access
++ 			 * state change, a device server shall establish a
++ 			 * unit attention condition with the additional sense
++ 			 * code set to ASYMMETRIC ACCESS STATE CHANGED for
++ 			 * the initiator port associated with every I_T nexus
++ 			 * other than the I_T nexus on which the SET TARGET
++ 			 * PORT GROUPS command was received.
++ 			 */
++ 			if ((tg_pt_gp->tg_pt_gp_alua_access_status ==
++ 			     ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG) &&
++ 			   (tg_pt_gp->tg_pt_gp_alua_lun != NULL) &&
++ 			    (tg_pt_gp->tg_pt_gp_alua_lun == lun))
++ 				continue;
++ 
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  			/*
+  			 * se_deve->se_lun_acl pointer may be NULL for a
+  			 * entry created without explicit Node+MappedLUN ACLs
+  			 */
+ -			if (lacl && (tg_pt_gp->tg_pt_gp_alua_nacl != NULL) &&
+ -			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl))
+ +			if (!lacl)
+  				continue;
+  
+ -			core_scsi3_ua_allocate(se_deve, 0x2A,
+ +			if ((tg_pt_gp->tg_pt_gp_alua_access_status ==
+ +			     ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG) &&
+ +			   (tg_pt_gp->tg_pt_gp_alua_nacl != NULL) &&
+ +			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl) &&
+ +			   (tg_pt_gp->tg_pt_gp_alua_port != NULL) &&
+ +			    (tg_pt_gp->tg_pt_gp_alua_port == port))
+ +				continue;
+ +
+ +			core_scsi3_ua_allocate(lacl->se_lun_nacl,
+ +				se_deve->mapped_lun, 0x2A,
+  				ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED);
+  		}
+++<<<<<<< HEAD
+ +		spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 		spin_unlock(&lun->lun_deve_lock);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  
+  		spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+ -		percpu_ref_put(&lun->lun_ref);
+ +		atomic_dec_mb(&mem->tg_pt_gp_mem_ref_cnt);
+  	}
+  	spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  }
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,b6df5b9a6890..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -304,67 -305,73 +304,85 @@@ int core_enable_device_list_for_node
+  	struct se_node_acl *nacl,
+  	struct se_portal_group *tpg)
+  {
+ -	struct se_dev_entry *orig, *new;
+ -
+ -	new = kzalloc(sizeof(*new), GFP_KERNEL);
+ -	if (!new) {
+ -		pr_err("Unable to allocate se_dev_entry memory\n");
+ -		return -ENOMEM;
+ -	}
+ -
+ -	atomic_set(&new->ua_count, 0);
+ -	spin_lock_init(&new->ua_lock);
+ -	INIT_LIST_HEAD(&new->ua_list);
+ -	INIT_LIST_HEAD(&new->lun_link);
+ -
+ -	new->mapped_lun = mapped_lun;
+ -	kref_init(&new->pr_kref);
+ -	init_completion(&new->pr_comp);
+ -
+ -	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE)
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ -	else
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ -
+ -	new->creation_time = get_jiffies_64();
+ -	new->attach_count++;
+ -
+ -	mutex_lock(&nacl->lun_entry_mutex);
+ -	orig = target_nacl_find_deve(nacl, mapped_lun);
+ -	if (orig && orig->se_lun) {
+ -		struct se_lun *orig_lun = rcu_dereference_check(orig->se_lun,
+ -					lockdep_is_held(&nacl->lun_entry_mutex));
+ -
+ -		if (orig_lun != lun) {
+ -			pr_err("Existing orig->se_lun doesn't match new lun"
+ -			       " for dynamic -> explicit NodeACL conversion:"
+ -				" %s\n", nacl->initiatorname);
+ -			mutex_unlock(&nacl->lun_entry_mutex);
+ -			kfree(new);
+ +	struct se_port *port = lun->lun_sep;
+ +	struct se_dev_entry *deve;
+ +
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +
+ +	deve = nacl->device_list[mapped_lun];
+ +
+ +	/*
+ +	 * Check if the call is handling demo mode -> explicit LUN ACL
+ +	 * transition.  This transition must be for the same struct se_lun
+ +	 * + mapped_lun that was setup in demo mode..
+ +	 */
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		if (deve->se_lun_acl != NULL) {
+ +			pr_err("struct se_dev_entry->se_lun_acl"
+ +			       " already set for demo mode -> explicit"
+ +			       " LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+ +			return -EINVAL;
+ +		}
+ +		if (deve->se_lun != lun) {
+ +			pr_err("struct se_dev_entry->se_lun does"
+ +			       " match passed struct se_lun for demo mode"
+ +			       " -> explicit LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+  			return -EINVAL;
+  		}
+ -		BUG_ON(orig->se_lun_acl != NULL);
+ +		deve->se_lun_acl = lun_acl;
+  
+ -		rcu_assign_pointer(new->se_lun, lun);
+ -		rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -		hlist_del_rcu(&orig->link);
+ -		hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -		mutex_unlock(&nacl->lun_entry_mutex);
+ +		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		} else {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		}
+  
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&nacl->device_list_lock);
+++=======
++ 		spin_lock(&lun->lun_deve_lock);
++ 		list_del(&orig->lun_link);
++ 		list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 		spin_unlock(&lun->lun_deve_lock);
++ 
++ 		kref_put(&orig->pr_kref, target_pr_kref_release);
++ 		wait_for_completion(&orig->pr_comp);
++ 
++ 		kfree_rcu(orig, rcu_head);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  		return 0;
+  	}
+  
+ -	rcu_assign_pointer(new->se_lun, lun);
+ -	rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -	hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -	mutex_unlock(&nacl->lun_entry_mutex);
+ +	deve->se_lun = lun;
+ +	deve->se_lun_acl = lun_acl;
+ +	deve->mapped_lun = mapped_lun;
+ +	deve->lun_flags |= TRANSPORT_LUNFLAGS_INITIATOR_ACCESS;
+ +
+++<<<<<<< HEAD
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +	}
+ +
+ +	deve->creation_time = get_jiffies_64();
+ +	deve->attach_count++;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 	spin_lock(&lun->lun_deve_lock);
++ 	list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 	spin_unlock(&lun->lun_deve_lock);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  
+  	return 0;
+  }
+@@@ -397,17 -403,9 +415,23 @@@ int core_disable_device_list_for_node
+  	 * NodeACL context specific PR metadata for demo-mode
+  	 * MappedLUN *deve will be released below..
+  	 */
+++<<<<<<< HEAD
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_del(&deve->alua_port_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+ +	/*
+ +	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
+ +	 * PR operation to complete.
+ +	 */
+ +	while (atomic_read(&deve->pr_ref_count) != 0)
+ +		cpu_relax();
+ +
+ +	spin_lock_irq(&nacl->device_list_lock);
+++=======
++ 	spin_lock(&lun->lun_deve_lock);
++ 	list_del(&orig->lun_link);
++ 	spin_unlock(&lun->lun_deve_lock);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  	/*
+  	 * Disable struct se_dev_entry LUN ACL mapping
+  	 */
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,7403b03d428f..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -701,13 -704,13 +701,18 @@@ static struct t10_pr_registration *__co
+  	 * for ALL_TG_PT=1
+  	 */
+  	spin_lock(&dev->se_port_lock);
+ -	list_for_each_entry_safe(lun_tmp, next, &dev->dev_sep_list, lun_dev_link) {
+ -		if (!percpu_ref_tryget_live(&lun_tmp->lun_ref))
+ -			continue;
+ +	list_for_each_entry_safe(port, port_tmp, &dev->dev_sep_list, sep_list) {
+ +		atomic_inc_mb(&port->sep_tg_pt_ref_cnt);
+  		spin_unlock(&dev->se_port_lock);
+  
+++<<<<<<< HEAD
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(deve_tmp, &port->sep_alua_list,
+ +					alua_port_list) {
+++=======
++ 		spin_lock(&lun_tmp->lun_deve_lock);
++ 		list_for_each_entry(deve_tmp, &lun_tmp->lun_deve_list, lun_link) {
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  			/*
+  			 * This pointer will be NULL for demo mode MappedLUNs
+  			 * that have not been make explicit via a ConfigFS
+@@@ -736,8 -741,8 +741,13 @@@
+  			if (strcmp(nacl->initiatorname, nacl_tmp->initiatorname))
+  				continue;
+  
+++<<<<<<< HEAD
+ +			atomic_inc_mb(&deve_tmp->pr_ref_count);
+ +			spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 			kref_get(&deve_tmp->pr_kref);
++ 			spin_unlock(&lun_tmp->lun_deve_lock);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  			/*
+  			 * Grab a configfs group dependency that is released
+  			 * for the exception path at label out: below, or upon
+@@@ -771,12 -779,12 +781,18 @@@
+  
+  			list_add_tail(&pr_reg_atp->pr_reg_atp_mem_list,
+  				      &pr_reg->pr_reg_atp_list);
+++<<<<<<< HEAD
+ +			spin_lock_bh(&port->sep_alua_lock);
+ +		}
+ +		spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 			spin_lock(&lun_tmp->lun_deve_lock);
++ 		}
++ 		spin_unlock(&lun_tmp->lun_deve_lock);
+++>>>>>>> 1adff1b3a7f7 (target: Convert se_lun->lun_deve_lock to normal spinlock)
+  
+  		spin_lock(&dev->se_port_lock);
+ -		percpu_ref_put(&lun_tmp->lun_ref);
+ +		atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+  	}
+  	spin_unlock(&dev->se_port_lock);
+  
+* Unmerged path drivers/target/target_core_alua.c
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_pr.c
