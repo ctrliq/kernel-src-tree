@@ -3153,6 +3153,7 @@ static int srp_parse_options(const char *buf, struct srp_target_port *target)
 	char *options, *sep_opt;
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
+	unsigned long long ull;
 	int opt_mask = 0;
 	int token;
 	int ret = -EINVAL;
@@ -3177,7 +3178,13 @@ static int srp_parse_options(const char *buf, struct srp_target_port *target)
 				ret = -ENOMEM;
 				goto out;
 			}
-			target->id_ext = cpu_to_be64(simple_strtoull(p, NULL, 16));
+			ret = kstrtoull(p, 16, &ull);
+			if (ret) {
+				pr_warn("invalid id_ext parameter '%s'\n", p);
+				kfree(p);
+				goto out;
+			}
+			target->id_ext = cpu_to_be64(ull);
 			kfree(p);
 			break;
 
@@ -3187,7 +3194,13 @@ static int srp_parse_options(const char *buf, struct srp_target_port *target)
 				ret = -ENOMEM;
 				goto out;
 			}
-			target->ioc_guid = cpu_to_be64(simple_strtoull(p, NULL, 16));
+			ret = kstrtoull(p, 16, &ull);
+			if (ret) {
+				pr_warn("invalid ioc_guid parameter '%s'\n", p);
+				kfree(p);
+				goto out;
+			}
+			target->ioc_guid = cpu_to_be64(ull);
 			kfree(p);
 			break;
 
@@ -3223,7 +3236,13 @@ static int srp_parse_options(const char *buf, struct srp_target_port *target)
 				ret = -ENOMEM;
 				goto out;
 			}
-			target->service_id = cpu_to_be64(simple_strtoull(p, NULL, 16));
+			ret = kstrtoull(p, 16, &ull);
+			if (ret) {
+				pr_warn("bad service_id parameter '%s'\n", p);
+				kfree(p);
+				goto out;
+			}
+			target->service_id = cpu_to_be64(ull);
 			kfree(p);
 			break;
 
@@ -3277,7 +3296,13 @@ static int srp_parse_options(const char *buf, struct srp_target_port *target)
 				ret = -ENOMEM;
 				goto out;
 			}
-			target->initiator_ext = cpu_to_be64(simple_strtoull(p, NULL, 16));
+			ret = kstrtoull(p, 16, &ull);
+			if (ret) {
+				pr_warn("bad initiator_ext value '%s'\n", p);
+				kfree(p);
+				goto out;
+			}
+			target->initiator_ext = cpu_to_be64(ull);
 			kfree(p);
 			break;
 
