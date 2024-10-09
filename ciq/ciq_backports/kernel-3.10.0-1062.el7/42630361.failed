@@ -1,0 +1,325 @@
+xfs: treat idx as a cursor in xfs_bmap_collapse_extents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 42630361003461edd7607c1d459ab9d66ef97813
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/42630361.failed
+
+Stop poking before and after the index and just increment or decrement
+it while doing our operations on it to prepare for a new extent list
+implementation.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 42630361003461edd7607c1d459ab9d66ef97813)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 905742f2f1f9,62270b871d06..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5418,14 -5517,14 +5418,20 @@@ xfs_bmse_merge
+  	struct xfs_inode		*ip,
+  	int				whichfork,
+  	xfs_fileoff_t			shift,		/* shift fsb */
+++<<<<<<< HEAD
+ +	int				current_ext,	/* idx of gotp */
+ +	struct xfs_bmbt_rec_host	*gotp,		/* extent to shift */
+ +	struct xfs_bmbt_rec_host	*leftp,		/* preceding extent */
+++=======
++ 	int				*current_ext,	/* idx of gotp */
++ 	struct xfs_bmbt_irec		*got,		/* extent to shift */
++ 	struct xfs_bmbt_irec		*left,		/* preceding extent */
+++>>>>>>> 426303610034 (xfs: treat idx as a cursor in xfs_bmap_collapse_extents)
+  	struct xfs_btree_cur		*cur,
+ -	int				*logflags,	/* output */
+ -	struct xfs_defer_ops		*dfops)
+ +	int				*logflags)	/* output */
+  {
+ -	struct xfs_bmbt_irec		new;
+ +	struct xfs_bmbt_irec		got;
+ +	struct xfs_bmbt_irec		left;
+  	xfs_filblks_t			blockcount;
+  	int				error, i;
+  	struct xfs_mount		*mp = ip->i_mount;
+@@@ -5477,10 -5567,266 +5483,269 @@@
+  		return error;
+  	XFS_WANT_CORRUPTED_RETURN(mp, i == 1);
+  
+ -	error = xfs_bmbt_update(cur, &new);
+ -	if (error)
+ -		return error;
+ +	left.br_blockcount = blockcount;
+  
+++<<<<<<< HEAD
+ +	return xfs_bmbt_update(cur, left.br_startoff, left.br_startblock,
+ +			       left.br_blockcount, left.br_state);
+++=======
++ done:
++ 	xfs_iext_remove(ip, *current_ext, 1, 0);
++ 	--*current_ext;
++ 	xfs_iext_update_extent(ip, xfs_bmap_fork_to_state(whichfork),
++ 			*current_ext, &new);
++ 
++ 	/* update reverse mapping. rmap functions merge the rmaps for us */
++ 	error = xfs_rmap_unmap_extent(mp, dfops, ip, whichfork, got);
++ 	if (error)
++ 		return error;
++ 	memcpy(&new, got, sizeof(new));
++ 	new.br_startoff = left->br_startoff + left->br_blockcount;
++ 	return xfs_rmap_map_extent(mp, dfops, ip, whichfork, &new);
++ }
++ 
++ static int
++ xfs_bmap_shift_update_extent(
++ 	struct xfs_inode	*ip,
++ 	int			whichfork,
++ 	xfs_extnum_t		idx,
++ 	struct xfs_bmbt_irec	*got,
++ 	struct xfs_btree_cur	*cur,
++ 	int			*logflags,
++ 	struct xfs_defer_ops	*dfops,
++ 	xfs_fileoff_t		startoff)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_bmbt_irec	prev = *got;
++ 	int			error, i;
++ 
++ 	*logflags |= XFS_ILOG_CORE;
++ 
++ 	got->br_startoff = startoff;
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, &prev, &i);
++ 		if (error)
++ 			return error;
++ 		XFS_WANT_CORRUPTED_RETURN(mp, i == 1);
++ 
++ 		error = xfs_bmbt_update(cur, got);
++ 		if (error)
++ 			return error;
++ 	} else {
++ 		*logflags |= XFS_ILOG_DEXT;
++ 	}
++ 
++ 	xfs_iext_update_extent(ip, xfs_bmap_fork_to_state(whichfork), idx, got);
++ 
++ 	/* update reverse mapping */
++ 	error = xfs_rmap_unmap_extent(mp, dfops, ip, whichfork, &prev);
++ 	if (error)
++ 		return error;
++ 	return xfs_rmap_map_extent(mp, dfops, ip, whichfork, got);
++ }
++ 
++ int
++ xfs_bmap_collapse_extents(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		*next_fsb,
++ 	xfs_fileoff_t		offset_shift_fsb,
++ 	bool			*done,
++ 	xfs_fileoff_t		stop_fsb,
++ 	xfs_fsblock_t		*firstblock,
++ 	struct xfs_defer_ops	*dfops)
++ {
++ 	int			whichfork = XFS_DATA_FORK;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	struct xfs_btree_cur	*cur = NULL;
++ 	struct xfs_bmbt_irec	got, prev;
++ 	xfs_extnum_t		current_ext;
++ 	xfs_fileoff_t		new_startoff;
++ 	int			error = 0;
++ 	int			logflags = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL | XFS_ILOCK_EXCL));
++ 
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstblock;
++ 		cur->bc_private.b.dfops = dfops;
++ 		cur->bc_private.b.flags = 0;
++ 	}
++ 
++ 	if (!xfs_iext_lookup_extent(ip, ifp, *next_fsb, &current_ext, &got)) {
++ 		*done = true;
++ 		goto del_cursor;
++ 	}
++ 	XFS_WANT_CORRUPTED_RETURN(mp, !isnullstartblock(got.br_startblock));
++ 
++ 	new_startoff = got.br_startoff - offset_shift_fsb;
++ 	if (xfs_iext_get_extent(ifp, current_ext - 1, &prev)) {
++ 		if (new_startoff < prev.br_startoff + prev.br_blockcount) {
++ 			error = -EINVAL;
++ 			goto del_cursor;
++ 		}
++ 
++ 		if (xfs_bmse_can_merge(&prev, &got, offset_shift_fsb)) {
++ 			error = xfs_bmse_merge(ip, whichfork, offset_shift_fsb,
++ 					&current_ext, &got, &prev, cur,
++ 					&logflags, dfops);
++ 			if (error)
++ 				goto del_cursor;
++ 			goto done;
++ 		}
++ 	} else {
++ 		if (got.br_startoff < offset_shift_fsb) {
++ 			error = -EINVAL;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	error = xfs_bmap_shift_update_extent(ip, whichfork, current_ext, &got,
++ 			cur, &logflags, dfops, new_startoff);
++ 	if (error)
++ 		goto del_cursor;
++ 
++ done:
++ 	if (!xfs_iext_get_extent(ifp, ++current_ext, &got)) {
++ 		 *done = true;
++ 		 goto del_cursor;
++ 	}
++ 
++ 	*next_fsb = got.br_startoff;
++ del_cursor:
++ 	if (cur)
++ 		xfs_btree_del_cursor(cur,
++ 			error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_insert_extents(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		*next_fsb,
++ 	xfs_fileoff_t		offset_shift_fsb,
++ 	bool			*done,
++ 	xfs_fileoff_t		stop_fsb,
++ 	xfs_fsblock_t		*firstblock,
++ 	struct xfs_defer_ops	*dfops)
++ {
++ 	int			whichfork = XFS_DATA_FORK;
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	struct xfs_btree_cur	*cur = NULL;
++ 	struct xfs_bmbt_irec	got, next;
++ 	xfs_extnum_t		current_ext;
++ 	xfs_fileoff_t		new_startoff;
++ 	int			error = 0;
++ 	int			logflags = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL | XFS_ILOCK_EXCL));
++ 
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstblock;
++ 		cur->bc_private.b.dfops = dfops;
++ 		cur->bc_private.b.flags = 0;
++ 	}
++ 
++ 	if (*next_fsb == NULLFSBLOCK) {
++ 		current_ext = xfs_iext_count(ifp) - 1;
++ 		if (!xfs_iext_get_extent(ifp, current_ext, &got) ||
++ 		    stop_fsb > got.br_startoff) {
++ 			*done = true;
++ 			goto del_cursor;
++ 		}
++ 	} else {
++ 		if (!xfs_iext_lookup_extent(ip, ifp, *next_fsb, &current_ext,
++ 				&got)) {
++ 			*done = true;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 	XFS_WANT_CORRUPTED_RETURN(mp, !isnullstartblock(got.br_startblock));
++ 
++ 	if (stop_fsb >= got.br_startoff + got.br_blockcount) {
++ 		error = -EIO;
++ 		goto del_cursor;
++ 	}
++ 
++ 	new_startoff = got.br_startoff + offset_shift_fsb;
++ 	if (xfs_iext_get_extent(ifp, current_ext + 1, &next)) {
++ 		if (new_startoff + got.br_blockcount > next.br_startoff) {
++ 			error = -EINVAL;
++ 			goto del_cursor;
++ 		}
++ 
++ 		/*
++ 		 * Unlike a left shift (which involves a hole punch), a right
++ 		 * shift does not modify extent neighbors in any way.  We should
++ 		 * never find mergeable extents in this scenario.  Check anyways
++ 		 * and warn if we encounter two extents that could be one.
++ 		 */
++ 		if (xfs_bmse_can_merge(&got, &next, offset_shift_fsb))
++ 			WARN_ON_ONCE(1);
++ 	}
++ 
++ 	error = xfs_bmap_shift_update_extent(ip, whichfork, current_ext, &got,
++ 			cur, &logflags, dfops, new_startoff);
++ 	if (error)
++ 		goto del_cursor;
++ 
++ 	if (!xfs_iext_get_extent(ifp, --current_ext, &got) ||
++ 	    stop_fsb >= got.br_startoff + got.br_blockcount) {
++ 		*done = true;
++ 		goto del_cursor;
++ 	}
++ 
++ 	*next_fsb = got.br_startoff;
++ del_cursor:
++ 	if (cur)
++ 		xfs_btree_del_cursor(cur,
++ 			error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
+++>>>>>>> 426303610034 (xfs: treat idx as a cursor in xfs_bmap_collapse_extents)
+  }
+  
+  /*
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
