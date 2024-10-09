@@ -79,10 +79,9 @@ EXPORT_SYMBOL_GPL(xfrm6_mode_tunnel_input_deregister);
 
 static inline void ipip6_ecn_decapsulate(struct sk_buff *skb)
 {
-	const struct ipv6hdr *outer_iph = ipv6_hdr(skb);
 	struct ipv6hdr *inner_iph = ipipv6_hdr(skb);
 
-	if (INET_ECN_is_ce(ipv6_get_dsfield(outer_iph)))
+	if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
 		IP6_ECN_set_ce(inner_iph);
 }
 
