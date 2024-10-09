@@ -1,0 +1,91 @@
+mm/oom_kill.c: avoid attempting to kill init sharing same memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+Rebuild_CHGLOG: - [mm] mm: oom: avoid attempting to kill init sharing same memory (Rafael Aquini) [1261799]
+Rebuild_FUZZ: 91.80%
+commit-author Chen Jie <chenjie6@huawei.com>
+commit a2b829d95958da2025ef844c0f53ac15ad720fac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/a2b829d9.failed
+
+It's possible that an oom killed victim shares an ->mm with the init
+process and thus oom_kill_process() would end up trying to kill init as
+well.
+
+This has been shown in practice:
+
+	Out of memory: Kill process 9134 (init) score 3 or sacrifice child
+	Killed process 9134 (init) total-vm:1868kB, anon-rss:84kB, file-rss:572kB
+	Kill process 1 (init) sharing same memory
+	...
+	Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000009
+
+And this will result in a kernel panic.
+
+If a process is forked by init and selected for oom kill while still
+sharing init_mm, then it's likely this system is in a recoverable state.
+However, it's better not to try to kill init and allow the machine to
+panic due to unkillable processes.
+
+[rientjes@google.com: rewrote changelog]
+[akpm@linux-foundation.org: fix inverted test, per Ben]
+	Signed-off-by: Chen Jie <chenjie6@huawei.com>
+	Signed-off-by: David Rientjes <rientjes@google.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Ben Hutchings <ben@decadent.org.uk>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a2b829d95958da2025ef844c0f53ac15ad720fac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/oom_kill.c
+diff --cc mm/oom_kill.c
+index cb09e6224089,c12680993ff3..000000000000
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@@ -516,22 -601,23 +516,36 @@@ void oom_kill_process(struct task_struc
+  	 * pending fatal signal.
+  	 */
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	for_each_process(p)
+ +		if (p->mm == mm && !same_thread_group(p, victim) &&
+ +		    !(p->flags & PF_KTHREAD)) {
+ +			if (p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN)
+ +				continue;
+++=======
++ 	for_each_process(p) {
++ 		if (!process_shares_mm(p, mm))
++ 			continue;
++ 		if (same_thread_group(p, victim))
++ 			continue;
++ 		if (unlikely(p->flags & PF_KTHREAD))
++ 			continue;
++ 		if (is_global_init(p))
++ 			continue;
++ 		if (p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN)
++ 			continue;
+++>>>>>>> a2b829d95958 (mm/oom_kill.c: avoid attempting to kill init sharing same memory)
+  
+ -		do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
+ -	}
+ +			task_lock(p);	/* Protect ->comm from prctl() */
+ +			pr_err("Kill process %d (%s) sharing same memory\n",
+ +				task_pid_nr(p), p->comm);
+ +			task_unlock(p);
+ +			do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
+ +		}
+  	rcu_read_unlock();
+  
+ -	mmdrop(mm);
+ +	set_tsk_thread_flag(victim, TIF_MEMDIE);
+ +	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
+  	put_task_struct(victim);
+  }
+  #undef K
+* Unmerged path mm/oom_kill.c
