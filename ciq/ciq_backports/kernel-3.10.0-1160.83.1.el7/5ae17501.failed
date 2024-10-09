@@ -1,0 +1,377 @@
+scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.83.1.el7
+commit-author Ewan D. Milne <emilne@redhat.com>
+commit 5ae17501bc62a49b0b193dcce003f16375f16654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.83.1.el7/5ae17501.failed
+
+The changes to issue the abort from the scmd->abort_work instead of the EH
+thread introduced a problem if eh_deadline is used.  If aborting the
+command(s) is successful, and there are never any scmds added to the
+shost->eh_cmd_q, there is no code path which will reset the ->last_reset
+value back to zero.
+
+The effect of this is that after a successful abort with no EH thread
+activity, a subsequent timeout, perhaps a long time later, might
+immediately be considered past a user-set eh_deadline time, and the host
+will be reset with no attempt at recovery.
+
+Fix this by resetting ->last_reset back to zero in scmd_eh_abort_handler()
+if it is determined that the EH thread will not run to do this.
+
+Thanks to Gopinath Marappan for investigating this problem.
+
+Link: https://lore.kernel.org/r/20211029194311.17504-2-emilne@redhat.com
+Fixes: e494f6a72839 ("[SCSI] improved eh timeout handler")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5ae17501bc62a49b0b193dcce003f16375f16654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_error.c
+#	drivers/scsi/scsi_lib.c
+#	include/scsi/scsi_cmnd.h
+diff --cc drivers/scsi/scsi_error.c
+index 3183377f9515,bdf782d9cb86..000000000000
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@@ -108,6 -114,42 +108,45 @@@ static int scsi_host_eh_past_deadline(s
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool scsi_cmd_retry_allowed(struct scsi_cmnd *cmd)
++ {
++ 	if (cmd->allowed == SCSI_CMD_RETRIES_NO_LIMIT)
++ 		return true;
++ 
++ 	return ++cmd->retries <= cmd->allowed;
++ }
++ 
++ static bool scsi_eh_should_retry_cmd(struct scsi_cmnd *cmd)
++ {
++ 	struct scsi_device *sdev = cmd->device;
++ 	struct Scsi_Host *host = sdev->host;
++ 
++ 	if (host->hostt->eh_should_retry_cmd)
++ 		return  host->hostt->eh_should_retry_cmd(cmd);
++ 
++ 	return true;
++ }
++ 
++ static void scsi_eh_complete_abort(struct scsi_cmnd *scmd, struct Scsi_Host *shost)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(shost->host_lock, flags);
++ 	list_del_init(&scmd->eh_entry);
++ 	/*
++ 	 * If the abort succeeds, and there is no further
++ 	 * EH action, clear the ->last_reset time.
++ 	 */
++ 	if (list_empty(&shost->eh_abort_list) &&
++ 	    list_empty(&shost->eh_cmd_q))
++ 		if (shost->eh_deadline != -1)
++ 			shost->last_reset = 0;
++ 	spin_unlock_irqrestore(shost->host_lock, flags);
++ }
++ 
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  /**
+   * scmd_eh_abort_handler - Handle command aborts
+   * @work:	command to be aborted.
+@@@ -118,7 -166,8 +157,12 @@@ scmd_eh_abort_handler(struct work_struc
+  	struct scsi_cmnd *scmd =
+  		container_of(work, struct scsi_cmnd, abort_work.work);
+  	struct scsi_device *sdev = scmd->device;
+++<<<<<<< HEAD
+ +	int rtn;
+++=======
++ 	enum scsi_disposition rtn;
++ 	unsigned long flags;
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  
+  	if (scsi_host_eh_past_deadline(sdev->host)) {
+  		SCSI_LOG_ERROR_RECOVERY(3,
+@@@ -159,13 -211,10 +205,20 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!scsi_eh_scmd_add(scmd, 0)) {
+ +		SCSI_LOG_ERROR_RECOVERY(3,
+ +			scmd_printk(KERN_WARNING, scmd,
+ +				    "terminate aborted command\n"));
+ +		set_host_byte(scmd, DID_TIME_OUT);
+ +		scsi_finish_command(scmd);
+ +	}
+++=======
++ 	spin_lock_irqsave(sdev->host->host_lock, flags);
++ 	list_del_init(&scmd->eh_entry);
++ 	spin_unlock_irqrestore(sdev->host->host_lock, flags);
++ 	scsi_eh_scmd_add(scmd);
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  }
+  
+  /**
+@@@ -193,21 -241,11 +246,23 @@@ scsi_abort_command(struct scsi_cmnd *sc
+  		return FAILED;
+  	}
+  
+ +	/*
+ +	 * Do not try a command abort if
+ +	 * SCSI EH has already started.
+ +	 */
+  	spin_lock_irqsave(shost->host_lock, flags);
+ +	if (scsi_host_in_recovery(shost)) {
+ +		spin_unlock_irqrestore(shost->host_lock, flags);
+ +		SCSI_LOG_ERROR_RECOVERY(3,
+ +			scmd_printk(KERN_INFO, scmd,
+ +				    "not aborting, host in recovery\n"));
+ +		return FAILED;
+ +	}
+ +
+  	if (shost->eh_deadline != -1 && !shost->last_reset)
+  		shost->last_reset = jiffies;
++ 	BUG_ON(!list_empty(&scmd->eh_entry));
++ 	list_add_tail(&scmd->eh_entry, &shost->eh_abort_list);
+  	spin_unlock_irqrestore(shost->host_lock, flags);
+  
+  	scmd->eh_eflags |= SCSI_EH_ABORT_SCHEDULED;
+diff --cc drivers/scsi/scsi_lib.c
+index 14a49b32779f,c851c05d6091..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1157,56 -1064,102 +1157,104 @@@ int scsi_init_io(struct scsi_cmnd *cmd
+  		cmd->prot_sdb->table.nents = count;
+  	}
+  
+ -	return BLK_STS_OK;
+ -out_free_sgtables:
+ -	scsi_free_sgtables(cmd);
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL(scsi_alloc_sgtables);
+ -
+ -/**
+ - * scsi_initialize_rq - initialize struct scsi_cmnd partially
+ - * @rq: Request associated with the SCSI command to be initialized.
+ - *
+ - * This function initializes the members of struct scsi_cmnd that must be
+ - * initialized before request processing starts and that won't be
+ - * reinitialized if a SCSI command is requeued.
+ - *
+ - * Called from inside blk_get_request() for pass-through requests and from
+ - * inside scsi_init_command() for filesystem requests.
+ - */
+ -static void scsi_initialize_rq(struct request *rq)
+ -{
+ -	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+ -	struct scsi_request *req = &cmd->req;
+ -
+ -	memset(req->__cmd, 0, sizeof(req->__cmd));
+ -	req->cmd = req->__cmd;
+ -	req->cmd_len = BLK_MAX_CDB;
+ -	req->sense_len = 0;
+ -
+ -	init_rcu_head(&cmd->rcu);
+ -	cmd->jiffies_at_alloc = jiffies;
+ -	cmd->retries = 0;
+ -}
+ -
+ -/*
+ - * Only called when the request isn't completed by SCSI, and not freed by
+ - * SCSI
+ - */
+ -static void scsi_cleanup_rq(struct request *rq)
+ -{
+ -	if (rq->rq_flags & RQF_DONTPREP) {
+ -		scsi_mq_uninit_cmd(blk_mq_rq_to_pdu(rq));
+ -		rq->rq_flags &= ~RQF_DONTPREP;
+ +	return BLKPREP_OK;
+ +err_exit:
+ +	if (is_mq) {
+ +		scsi_mq_free_sgtables(cmd);
+ +	} else {
+ +		scsi_release_buffers(cmd);
+ +		cmd->request->special = NULL;
+ +		scsi_put_command(cmd);
+ +		put_device(&sdev->sdev_gendev);
+  	}
+ +	return error;
+  }
+ +EXPORT_SYMBOL(scsi_init_io);
+  
+++<<<<<<< HEAD
+ +static struct scsi_cmnd *scsi_get_cmd_from_req(struct scsi_device *sdev,
+++=======
++ /* Called before a request is prepared. See also scsi_mq_prep_fn(). */
++ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
++ {
++ 	void *buf = cmd->sense_buffer;
++ 	void *prot = cmd->prot_sdb;
++ 	struct request *rq = scsi_cmd_to_rq(cmd);
++ 	unsigned int flags = cmd->flags & SCMD_PRESERVED_FLAGS;
++ 	unsigned long jiffies_at_alloc;
++ 	int retries, to_clear;
++ 	bool in_flight;
++ 	int budget_token = cmd->budget_token;
++ 
++ 	if (!blk_rq_is_passthrough(rq) && !(flags & SCMD_INITIALIZED)) {
++ 		flags |= SCMD_INITIALIZED;
++ 		scsi_initialize_rq(rq);
++ 	}
++ 
++ 	jiffies_at_alloc = cmd->jiffies_at_alloc;
++ 	retries = cmd->retries;
++ 	in_flight = test_bit(SCMD_STATE_INFLIGHT, &cmd->state);
++ 	/*
++ 	 * Zero out the cmd, except for the embedded scsi_request. Only clear
++ 	 * the driver-private command data if the LLD does not supply a
++ 	 * function to initialize that data.
++ 	 */
++ 	to_clear = sizeof(*cmd) - sizeof(cmd->req);
++ 	if (!dev->host->hostt->init_cmd_priv)
++ 		to_clear += dev->host->hostt->cmd_size;
++ 	memset((char *)cmd + sizeof(cmd->req), 0, to_clear);
++ 
++ 	cmd->device = dev;
++ 	cmd->sense_buffer = buf;
++ 	cmd->prot_sdb = prot;
++ 	cmd->flags = flags;
++ 	INIT_LIST_HEAD(&cmd->eh_entry);
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies_at_alloc;
++ 	cmd->retries = retries;
++ 	if (in_flight)
++ 		__set_bit(SCMD_STATE_INFLIGHT, &cmd->state);
++ 	cmd->budget_token = budget_token;
++ 
++ }
++ 
++ static blk_status_t scsi_setup_scsi_cmnd(struct scsi_device *sdev,
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  		struct request *req)
+  {
+ -	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
+ +	struct scsi_cmnd *cmd;
+ +
+ +	if (!req->special) {
+ +		/* Bail if we can't get a reference to the device */
+ +		if (!get_device(&sdev->sdev_gendev))
+ +			return NULL;
+ +
+ +		cmd = scsi_get_command(sdev, GFP_ATOMIC);
+ +		if (unlikely(!cmd)) {
+ +			put_device(&sdev->sdev_gendev);
+ +			return NULL;
+ +		}
+ +		req->special = cmd;
+ +	} else {
+ +		cmd = req->special;
+ +	}
+ +
+ +	/* pull a tag out of the request if we have one */
+ +	cmd->tag = req->tag;
+ +	cmd->request = req;
+ +
+ +	cmd->cmnd = req->cmd;
+ +	cmd->prot_op = SCSI_PROT_NORMAL;
+ +
+ +	return cmd;
+ +}
+ +
+ +static int scsi_setup_blk_pc_cmnd(struct scsi_device *sdev, struct request *req)
+ +{
+ +	struct scsi_cmnd *cmd = req->special;
+  
+  	/*
+ -	 * Passthrough requests may transfer data, in which case they must
+ +	 * BLOCK_PC requests may transfer data, in which case they must
+  	 * a bio attached to them.  Or they might contain a SCSI command
+  	 * that does not transfer data, in which case they may optionally
+  	 * submit a request without an attached bio.
+diff --cc include/scsi/scsi_cmnd.h
+index 02c43dbba2e0,29ac40cf1aae..000000000000
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@@ -56,23 -55,32 +56,27 @@@ struct scsi_pointer 
+  
+  /* for scmd->flags */
+  #define SCMD_TAGGED		(1 << 0)
+ -#define SCMD_INITIALIZED	(1 << 1)
+ -#define SCMD_LAST		(1 << 2)
+ -/* flags preserved across unprep / reprep */
+ -#define SCMD_PRESERVED_FLAGS	(SCMD_INITIALIZED)
+ -
+ -/* for scmd->state */
+ -#define SCMD_STATE_COMPLETE	0
+ -#define SCMD_STATE_INFLIGHT	1
+ -
+ -enum scsi_cmnd_submitter {
+ -	SUBMITTED_BY_BLOCK_LAYER = 0,
+ -	SUBMITTED_BY_SCSI_ERROR_HANDLER = 1,
+ -	SUBMITTED_BY_SCSI_RESET_IOCTL = 2,
+ -} __packed;
+  
+  struct scsi_cmnd {
+ -	struct scsi_request req;
+  	struct scsi_device *device;
+++<<<<<<< HEAD
+ +	struct list_head list;  /* scsi_cmnd participates in queue lists */
+ +	struct list_head eh_entry; /* entry for the host eh_cmd_q */
+++=======
++ 	struct list_head eh_entry; /* entry for the host eh_abort_list/eh_cmd_q */
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  	struct delayed_work abort_work;
+ -
+ -	struct rcu_head rcu;
+ -
+  	int eh_eflags;		/* Used by error handlr */
+  
+ -	int budget_token;
+ +	/*
+ +	 * A SCSI Command is assigned a nonzero serial_number before passed
+ +	 * to the driver's queue command function.  The serial_number is
+ +	 * cleared when scsi_done is entered indicating that the command
+ +	 * has been completed.  It is a bug for LLDDs to use this number
+ +	 * for purposes other than printk (and even that is only useful
+ +	 * for debugging).
+ +	 */
+ +	unsigned long serial_number;
+  
+  	/*
+  	 * This is set to jiffies as it was when the command was first
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index 53d68906568a..ac1be7b12041 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -405,6 +405,7 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
+ 	shost->shost_state = SHOST_CREATED;
+ 	INIT_LIST_HEAD(&shost->__devices);
+ 	INIT_LIST_HEAD(&shost->__targets);
++	INIT_LIST_HEAD(&shost->eh_abort_list);
+ 	INIT_LIST_HEAD(&shost->eh_cmd_q);
+ 	INIT_LIST_HEAD(&shost->starved_list);
+ 	init_waitqueue_head(&shost->host_wait);
+* Unmerged path drivers/scsi/scsi_error.c
+* Unmerged path drivers/scsi/scsi_lib.c
+* Unmerged path include/scsi/scsi_cmnd.h
+diff --git a/include/scsi/scsi_host.h b/include/scsi/scsi_host.h
+index 8efd7d92c550..67de1dfe4fbd 100644
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -616,6 +616,7 @@ struct Scsi_Host {
+ 
+ 	struct mutex		scan_mutex;/* serialize scanning activity */
+ 
++	struct list_head	eh_abort_list;
+ 	struct list_head	eh_cmd_q;
+ 	struct task_struct    * ehandler;  /* Error recovery thread. */
+ 	struct completion     * eh_action; /* Wait for specific actions on the
