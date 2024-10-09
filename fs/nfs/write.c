@@ -1731,7 +1731,8 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 			(long long)req_offset(req));
 		if (status < 0) {
 			nfs_context_set_write_error(req->wb_context, status);
-			nfs_inode_remove_request(req);
+			if (req->wb_page)
+				nfs_inode_remove_request(req);
 			dprintk_cont(", error = %d\n", status);
 			goto next;
 		}
@@ -1740,7 +1741,8 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 		 * returned by the server against all stored verfs. */
 		if (!memcmp(&req->wb_verf, &data->verf.verifier, sizeof(req->wb_verf))) {
 			/* We have a match */
-			nfs_inode_remove_request(req);
+			if (req->wb_page)
+				nfs_inode_remove_request(req);
 			dprintk_cont(" OK\n");
 			goto next;
 		}
