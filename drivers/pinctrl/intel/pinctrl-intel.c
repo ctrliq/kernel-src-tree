@@ -813,11 +813,14 @@ static int intel_gpio_irq_wake(struct irq_data *d, unsigned int on)
 	const struct intel_community *community;
 	unsigned pin = irqd_to_hwirq(d);
 	unsigned padno, gpp, gpp_offset;
+	unsigned long flags;
 	u32 gpe_en;
 
 	community = intel_get_community(pctrl, pin);
 	if (!community)
 		return -EINVAL;
+
+	raw_spin_lock_irqsave(&pctrl->lock, flags);
 
 	padno = pin_to_padno(community, pin);
 	gpp = padno / NPADS_IN_GPP;
@@ -837,6 +840,8 @@ static int intel_gpio_irq_wake(struct irq_data *d, unsigned int on)
 	else
 		gpe_en &= ~BIT(gpp_offset);
 	writel(gpe_en, community->regs + GPI_GPE_EN + gpp * 4);
+
+	raw_spin_unlock_irqrestore(&pctrl->lock, flags);
 
 	dev_dbg(pctrl->dev, "%sable wake for pin %u\n", on ? "en" : "dis", pin);
 	return 0;
