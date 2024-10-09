@@ -1,0 +1,100 @@
+igbvf: add lock around mailbox ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Greg Edwards <gedwards@ddn.com>
+commit 32652c2ac2f330d2c159d8259f359da0ee2b0aa3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/32652c2a.failed
+
+The PF driver assumes the VF will not send another mailbox message until
+the PF has written its reply to the previous message.  If the VF does,
+that message will be silently dropped by the PF before it writes its
+reply to the mailbox.  This results in a VF mailbox timeout for posted
+messages waiting for an ACK, and the VF is reset by the
+igbvf_watchdog_task in the VM.
+
+Add a lock around the VF mailbox ops to prevent the VF from sending
+another message while the PF is still processing the previous one.
+
+	Signed-off-by: Greg Edwards <gedwards@ddn.com>
+	Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 32652c2ac2f330d2c159d8259f359da0ee2b0aa3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igbvf/netdev.c
+diff --cc drivers/net/ethernet/intel/igbvf/netdev.c
+index 801b90ca7b26,1ed556911b14..000000000000
+--- a/drivers/net/ethernet/intel/igbvf/netdev.c
++++ b/drivers/net/ethernet/intel/igbvf/netdev.c
+@@@ -2813,6 -2847,12 +2856,15 @@@ static int igbvf_probe(struct pci_dev *
+  			    NETIF_F_HW_VLAN_CTAG_RX |
+  			    NETIF_F_HW_VLAN_CTAG_TX;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* MTU range: 68 - 9216 */
++ 	netdev->min_mtu = ETH_MIN_MTU;
++ 	netdev->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
++ 
++ 	spin_lock_bh(&hw->mbx_lock);
++ 
+++>>>>>>> 32652c2ac2f3 (igbvf: add lock around mailbox ops)
+  	/*reset the controller to put the device in a known good state */
+  	err = hw->mac.ops.reset_hw(hw);
+  	if (err) {
+diff --git a/drivers/net/ethernet/intel/igbvf/ethtool.c b/drivers/net/ethernet/intel/igbvf/ethtool.c
+index 8dea1b1367ef..6ec094e13008 100644
+--- a/drivers/net/ethernet/intel/igbvf/ethtool.c
++++ b/drivers/net/ethernet/intel/igbvf/ethtool.c
+@@ -296,8 +296,12 @@ static int igbvf_link_test(struct igbvf_adapter *adapter, u64 *data)
+ 	struct e1000_hw *hw = &adapter->hw;
+ 	*data = 0;
+ 
++	spin_lock_bh(&hw->mbx_lock);
++
+ 	hw->mac.ops.check_for_link(hw);
+ 
++	spin_unlock_bh(&hw->mbx_lock);
++
+ 	if (!(er32(STATUS) & E1000_STATUS_LU))
+ 		*data = 1;
+ 
+diff --git a/drivers/net/ethernet/intel/igbvf/mbx.c b/drivers/net/ethernet/intel/igbvf/mbx.c
+index 01752f44ace2..c9a441632e9f 100644
+--- a/drivers/net/ethernet/intel/igbvf/mbx.c
++++ b/drivers/net/ethernet/intel/igbvf/mbx.c
+@@ -264,6 +264,8 @@ static s32 e1000_write_mbx_vf(struct e1000_hw *hw, u32 *msg, u16 size)
+ 	s32 err;
+ 	u16 i;
+ 
++	WARN_ON_ONCE(!spin_is_locked(&hw->mbx_lock));
++
+ 	/* lock the mailbox to prevent pf/vf race condition */
+ 	err = e1000_obtain_mbx_lock_vf(hw);
+ 	if (err)
+@@ -300,6 +302,8 @@ static s32 e1000_read_mbx_vf(struct e1000_hw *hw, u32 *msg, u16 size)
+ 	s32 err;
+ 	u16 i;
+ 
++	WARN_ON_ONCE(!spin_is_locked(&hw->mbx_lock));
++
+ 	/* lock the mailbox to prevent pf/vf race condition */
+ 	err = e1000_obtain_mbx_lock_vf(hw);
+ 	if (err)
+* Unmerged path drivers/net/ethernet/intel/igbvf/netdev.c
+diff --git a/drivers/net/ethernet/intel/igbvf/vf.h b/drivers/net/ethernet/intel/igbvf/vf.h
+index 4cf78b0dec50..d213eefb6169 100644
+--- a/drivers/net/ethernet/intel/igbvf/vf.h
++++ b/drivers/net/ethernet/intel/igbvf/vf.h
+@@ -245,6 +245,7 @@ struct e1000_hw {
+ 
+ 	struct e1000_mac_info  mac;
+ 	struct e1000_mbx_info mbx;
++	spinlock_t mbx_lock;		/* serializes mailbox ops */
+ 
+ 	union {
+ 		struct e1000_dev_spec_vf vf;
