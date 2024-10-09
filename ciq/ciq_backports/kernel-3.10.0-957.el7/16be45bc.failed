@@ -1,0 +1,198 @@
+ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexander Duyck <alexander.h.duyck@intel.com>
+commit 16be45bca8d10ba2f9400bbc97958a437c3439de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/16be45bc.failed
+
+We should not be stopping/starting the upper devices Tx queues when
+handling a macvlan offload. Instead we should be stopping and starting
+traffic on our own queues.
+
+In order to prevent us from doing this I am updating the code so that we no
+longer change the queue configuration on the upper device, nor do we update
+the queue_index on our own device. Instead we can just use the queue index
+for our local device and not update the netdev in the case of the transmit
+rings.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 16be45bca8d10ba2f9400bbc97958a437c3439de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 3a2d2dafece1,89f7b16c47b7..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -5238,45 -5368,28 +5230,47 @@@ static int ixgbe_fwd_ring_up(struct net
+  			     struct ixgbe_fwd_adapter *accel)
+  {
+  	struct ixgbe_adapter *adapter = accel->real_adapter;
+- 	unsigned int rxbase, txbase, queues;
+- 	int i, baseq, err = 0;
++ 	int i, baseq, err;
+  
+ -	if (!test_bit(accel->pool, adapter->fwd_bitmask))
+ +	if (!test_bit(accel->pool, &adapter->fwd_bitmask))
+  		return 0;
+  
+  	baseq = accel->pool * adapter->num_rx_queues_per_pool;
+ -	netdev_dbg(vdev, "pool %i:%i queues %i:%i\n",
+ +	netdev_dbg(vdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
+  		   accel->pool, adapter->num_rx_pools,
+ -		   baseq, baseq + adapter->num_rx_queues_per_pool);
+ +		   baseq, baseq + adapter->num_rx_queues_per_pool,
+ +		   adapter->fwd_bitmask);
+  
+  	accel->netdev = vdev;
+- 	accel->rx_base_queue = rxbase = baseq;
+- 	accel->tx_base_queue = txbase = baseq;
++ 	accel->rx_base_queue = baseq;
++ 	accel->tx_base_queue = baseq;
+  
+  	for (i = 0; i < adapter->num_rx_queues_per_pool; i++)
+- 		ixgbe_disable_fwd_ring(accel, adapter->rx_ring[rxbase + i]);
++ 		ixgbe_disable_fwd_ring(accel, adapter->rx_ring[baseq + i]);
+  
+  	for (i = 0; i < adapter->num_rx_queues_per_pool; i++) {
+- 		adapter->rx_ring[rxbase + i]->netdev = vdev;
+- 		ixgbe_configure_rx_ring(adapter, adapter->rx_ring[rxbase + i]);
++ 		adapter->rx_ring[baseq + i]->netdev = vdev;
++ 		ixgbe_configure_rx_ring(adapter, adapter->rx_ring[baseq + i]);
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < adapter->num_rx_queues_per_pool; i++)
+ +		adapter->tx_ring[txbase + i]->netdev = vdev;
+ +
+ +	queues = min_t(unsigned int,
+ +		       adapter->num_rx_queues_per_pool, vdev->num_tx_queues);
+ +	err = netif_set_real_num_tx_queues(vdev, queues);
+ +	if (err)
+ +		goto fwd_queue_err;
+ +
+ +	queues = min_t(unsigned int,
+ +		       adapter->num_rx_queues_per_pool, vdev->num_rx_queues);
+ +	err = netif_set_real_num_rx_queues(vdev, queues);
+ +	if (err)
+ +		goto fwd_queue_err;
+ +
+++=======
+++>>>>>>> 16be45bca8d1 (ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload)
+  	/* ixgbe_add_mac_filter will return an index if it succeeds, so we
+  	 * need to only treat it as an error value if it is negative.
+  	 */
+@@@ -8134,19 -8260,20 +8091,33 @@@ static void ixgbe_atr(struct ixgbe_rin
+  static u16 ixgbe_select_queue(struct net_device *dev, struct sk_buff *skb,
+  			      void *accel_priv, select_queue_fallback_t fallback)
+  {
+ +#if 0 /* RHEL - ixgbe_fwd_adapter not defined now */
+  	struct ixgbe_fwd_adapter *fwd_adapter = accel_priv;
+++<<<<<<< HEAD
+ +#endif
+ +#ifdef IXGBE_FCOE
+++=======
+++>>>>>>> 16be45bca8d1 (ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload)
+  	struct ixgbe_adapter *adapter;
+- 	struct ixgbe_ring_feature *f;
+  	int txq;
++ #ifdef IXGBE_FCOE
++ 	struct ixgbe_ring_feature *f;
+  #endif
+  
+++<<<<<<< HEAD
+ +#if 0 /* RHEL - ixgbe_fwd_adapter not defined now */
+ +	if (fwd_adapter)
+ +		return skb->queue_mapping + fwd_adapter->tx_base_queue;
+ +#endif
+++=======
++ 	if (fwd_adapter) {
++ 		adapter = netdev_priv(dev);
++ 		txq = reciprocal_scale(skb_get_hash(skb),
++ 				       adapter->num_rx_queues_per_pool);
++ 
++ 		return txq + fwd_adapter->tx_base_queue;
++ 	}
+++>>>>>>> 16be45bca8d1 (ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload)
+  
+  #ifdef IXGBE_FCOE
+  
+@@@ -9565,18 -9762,8 +9536,21 @@@ static void *ixgbe_fwd_add(struct net_d
+  	if (used_pools >= IXGBE_MAX_VF_FUNCTIONS)
+  		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	/* Check for hardware restriction on number of rx/tx queues */
+ +	if (vdev->num_rx_queues != vdev->num_tx_queues ||
+ +	    vdev->num_tx_queues > IXGBE_MAX_L2A_QUEUES ||
+ +	    vdev->num_tx_queues == IXGBE_BAD_L2A_QUEUE) {
+ +		netdev_info(pdev,
+ +			    "%s: Supports RX/TX Queue counts 1,2, and 4\n",
+ +			    pdev->name);
+ +		return ERR_PTR(-EINVAL);
+ +	}
+ +
+++=======
+++>>>>>>> 16be45bca8d1 (ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload)
+  	if (((adapter->flags & IXGBE_FLAG_DCB_ENABLED) &&
+ -	      adapter->num_rx_pools >= (MAX_TX_QUEUES / tcs)) ||
+ +	      adapter->num_rx_pools > IXGBE_MAX_DCBMACVLANS - 1) ||
+  	    (adapter->num_rx_pools > IXGBE_MAX_MACVLANS))
+  		return ERR_PTR(-EBUSY);
+  
+@@@ -9590,13 -9777,8 +9564,18 @@@
+  
+  	/* Enable VMDq flag so device will be set in VM mode */
+  	adapter->flags |= IXGBE_FLAG_VMDQ_ENABLED | IXGBE_FLAG_SRIOV_ENABLED;
+++<<<<<<< HEAD
+ +	adapter->ring_feature[RING_F_VMDQ].limit = adapter->num_rx_pools;
+ +	adapter->ring_feature[RING_F_RSS].limit = vdev->num_rx_queues;
+ +
+ +	/* Force reinit of ring allocation with VMDQ enabled */
+ +	err = ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
+ +	if (err)
+ +		goto fwd_add_err;
+++=======
++ 	adapter->ring_feature[RING_F_VMDQ].limit = limit + 1;
++ 
+++>>>>>>> 16be45bca8d1 (ixgbe: Do not manipulate macvlan Tx queues when performing macvlan offload)
+  	fwd_adapter->pool = pool;
+  	fwd_adapter->real_adapter = adapter;
+  
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+index 35c1fe8a4430..d8c40287857a 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+@@ -899,11 +899,7 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
+ 
+ 		/* apply Tx specific ring traits */
+ 		ring->count = adapter->tx_ring_count;
+-		if (adapter->num_rx_pools > 1)
+-			ring->queue_index =
+-				txr_idx % adapter->num_rx_queues_per_pool;
+-		else
+-			ring->queue_index = txr_idx;
++		ring->queue_index = txr_idx;
+ 
+ 		/* assign ring to adapter */
+ 		adapter->tx_ring[txr_idx] = ring;
+@@ -946,11 +942,7 @@ static int ixgbe_alloc_q_vector(struct ixgbe_adapter *adapter,
+ #endif /* IXGBE_FCOE */
+ 		/* apply Rx specific ring traits */
+ 		ring->count = adapter->rx_ring_count;
+-		if (adapter->num_rx_pools > 1)
+-			ring->queue_index =
+-				rxr_idx % adapter->num_rx_queues_per_pool;
+-		else
+-			ring->queue_index = rxr_idx;
++		ring->queue_index = rxr_idx;
+ 
+ 		/* assign ring to adapter */
+ 		adapter->rx_ring[rxr_idx] = ring;
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
