@@ -1,0 +1,159 @@
+iommu/amd: Make use of the per-domain flush queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Make use of the per-domain flush queue (Suravee Suthikulpanit) [1508644]
+Rebuild_FUZZ: 93.48%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit fd62190a67d6bdf9b93dea056adfcd7fd29b0f92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fd62190a.failed
+
+Fill the flush-queue on unmap and only flush the IOMMU and
+device TLBs when a per-cpu queue gets full.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit fd62190a67d6bdf9b93dea056adfcd7fd29b0f92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index e80343c1de99,9fafc3026865..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -1972,6 -1756,111 +1972,114 @@@ static void free_gcr3_table(struct prot
+  	free_page((unsigned long)domain->gcr3_tbl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dma_ops_domain_free_flush_queue(struct dma_ops_domain *dom)
++ {
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		kfree(queue->entries);
++ 	}
++ 
++ 	free_percpu(dom->flush_queue);
++ 
++ 	dom->flush_queue = NULL;
++ }
++ 
++ static int dma_ops_domain_alloc_flush_queue(struct dma_ops_domain *dom)
++ {
++ 	int cpu;
++ 
++ 	dom->flush_queue = alloc_percpu(struct flush_queue);
++ 	if (!dom->flush_queue)
++ 		return -ENOMEM;
++ 
++ 	/* First make sure everything is cleared */
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		queue->head    = 0;
++ 		queue->tail    = 0;
++ 		queue->entries = NULL;
++ 	}
++ 
++ 	/* Now start doing the allocation */
++ 	for_each_possible_cpu(cpu) {
++ 		struct flush_queue *queue;
++ 
++ 		queue = per_cpu_ptr(dom->flush_queue, cpu);
++ 		queue->entries = kzalloc(FLUSH_QUEUE_SIZE * sizeof(*queue->entries),
++ 					 GFP_KERNEL);
++ 		if (!queue->entries) {
++ 			dma_ops_domain_free_flush_queue(dom);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline bool queue_ring_full(struct flush_queue *queue)
++ {
++ 	return (((queue->tail + 1) % FLUSH_QUEUE_SIZE) == queue->head);
++ }
++ 
++ #define queue_ring_for_each(i, q) \
++ 	for (i = (q)->head; i != (q)->tail; i = (i + 1) % FLUSH_QUEUE_SIZE)
++ 
++ static void queue_release(struct dma_ops_domain *dom,
++ 			  struct flush_queue *queue)
++ {
++ 	unsigned i;
++ 
++ 	queue_ring_for_each(i, queue)
++ 		free_iova_fast(&dom->iovad,
++ 			       queue->entries[i].iova_pfn,
++ 			       queue->entries[i].pages);
++ 
++ 	queue->head = queue->tail = 0;
++ }
++ 
++ static inline unsigned queue_ring_add(struct flush_queue *queue)
++ {
++ 	unsigned idx = queue->tail;
++ 
++ 	queue->tail = (idx + 1) % FLUSH_QUEUE_SIZE;
++ 
++ 	return idx;
++ }
++ 
++ static void queue_add(struct dma_ops_domain *dom,
++ 		      unsigned long address, unsigned long pages)
++ {
++ 	struct flush_queue *queue;
++ 	int idx;
++ 
++ 	pages     = __roundup_pow_of_two(pages);
++ 	address >>= PAGE_SHIFT;
++ 
++ 	queue = get_cpu_ptr(dom->flush_queue);
++ 
++ 	if (queue_ring_full(queue)) {
++ 		domain_flush_tlb(&dom->domain);
++ 		domain_flush_complete(&dom->domain);
++ 		queue_release(dom, queue);
++ 	}
++ 
++ 	idx = queue_ring_add(queue);
++ 
++ 	queue->entries[idx].iova_pfn = address;
++ 	queue->entries[idx].pages    = pages;
++ 
++ 	put_cpu_ptr(dom->flush_queue);
++ }
++ 
+++>>>>>>> fd62190a67d6 (iommu/amd: Make use of the per-domain flush queue)
+  /*
+   * Free a domain, only used if something went wrong in the
+   * allocation path and we need to free an already allocated page table
+@@@ -2626,7 -2504,13 +2734,17 @@@ static void __unmap_single(struct dma_o
+  		start += PAGE_SIZE;
+  	}
+  
+++<<<<<<< HEAD
+ +	dma_ops_free_addresses(dma_dom, dma_addr, pages);
+++=======
++ 	if (amd_iommu_unmap_flush) {
++ 		dma_ops_free_iova(dma_dom, dma_addr, pages);
++ 		domain_flush_tlb(&dma_dom->domain);
++ 		domain_flush_complete(&dma_dom->domain);
++ 	} else {
++ 		queue_add(dma_dom, dma_addr, pages);
++ 	}
+++>>>>>>> fd62190a67d6 (iommu/amd: Make use of the per-domain flush queue)
+  }
+  
+  /*
+* Unmerged path drivers/iommu/amd_iommu.c
