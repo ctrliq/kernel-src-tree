@@ -1,0 +1,513 @@
+mm: split page_type out from _mapcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] revert "mm: split page_type out from _mapcount" (David Hildenbrand) [1723689]
+Rebuild_FUZZ: 89.41%
+commit-author Matthew Wilcox <mawilcox@microsoft.com>
+commit 6e292b9be7f4358985ce33ae1f59ab30a8c09e08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6e292b9b.failed
+
+We're already using a union of many fields here, so stop abusing the
+_mapcount and make page_type its own field.  That implies renaming some of
+the machinery that creates PageBuddy, PageBalloon and PageKmemcg; bring
+back the PG_buddy, PG_balloon and PG_kmemcg names.
+
+As suggested by Kirill, make page_type a bitmask.  Because it starts out
+life as -1 (thanks to sharing the storage with _mapcount), setting a page
+flag means clearing the appropriate bit.  This gives us space for probably
+twenty or so extra bits (depending how paranoid we want to be about
+_mapcount underflow).
+
+Link: http://lkml.kernel.org/r/20180518194519.3820-3-willy@infradead.org
+	Signed-off-by: Matthew Wilcox <mawilcox@microsoft.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6e292b9be7f4358985ce33ae1f59ab30a8c09e08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm_types.h
+#	include/linux/page-flags.h
+#	mm/page_alloc.c
+#	scripts/tags.sh
+diff --cc include/linux/mm_types.h
+index ff35333d8d6c,3a554fdf45c2..000000000000
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@@ -46,80 -79,52 +46,109 @@@ struct page 
+  	/* First double word block */
+  	unsigned long flags;		/* Atomic flags, some possibly
+  					 * updated asynchronously */
+ -	union {
+ -		/* See page-flags.h for the definition of PAGE_MAPPING_FLAGS */
+ -		struct address_space *mapping;
+ -
+ -		void *s_mem;			/* slab first object */
+ -		atomic_t compound_mapcount;	/* first tail page */
+ -		/* page_deferred_list().next	 -- second tail page */
+ -	};
+ -
+ +	struct address_space *mapping;	/* If low bit clear, points to
+ +					 * inode address_space, or NULL.
+ +					 * If page mapped as anonymous
+ +					 * memory, low bit is set, and
+ +					 * it points to anon_vma object:
+ +					 * see PAGE_MAPPING_ANON below.
+ +					 */
+  	/* Second double word */
+++<<<<<<< HEAD
+ +	struct {
+ +		union {
+ +			pgoff_t index;		/* Our offset within mapping. */
+ +			void *freelist;		/* slub/slob first free object */
+ +			RH_KABI_DEPRECATE(bool, pfmemalloc)
+ +						/* If set by the page allocator,
+ +						 * ALLOC_NO_WATERMARKS was set
+ +						 * and the low watermark was not
+ +						 * met implying that the system
+ +						 * is under some pressure. The
+ +						 * caller should try ensure
+ +						 * this page is only used to
+ +						 * free other pages.
+ +						 */
+ +#ifndef __GENKSYMS__ /* kABI bypass, the size of the union didn't change */
+ +			atomic_t thp_mmu_gather; /* in first tailpage of THP */
+ +#endif
+ +#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && USE_SPLIT_PMD_PTLOCKS
+ +		pgtable_t pmd_huge_pte; /* protected by page->ptl */
+ +#endif
+++=======
++ 	union {
++ 		pgoff_t index;		/* Our offset within mapping. */
++ 		void *freelist;		/* sl[aou]b first free object */
++ 		/* page_deferred_list().prev	-- second tail page */
++ 	};
++ 
++ 	union {
++ 		/*
++ 		 * If the page is neither PageSlab nor mappable to userspace,
++ 		 * the value stored here may help determine what this page
++ 		 * is used for.  See page-flags.h for a list of page types
++ 		 * which are currently stored here.
++ 		 */
++ 		unsigned int page_type;
++ 
++ 		_slub_counter_t counters;
++ 		unsigned int active;		/* SLAB */
++ 		struct {			/* SLUB */
++ 			unsigned inuse:16;
++ 			unsigned objects:15;
++ 			unsigned frozen:1;
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+  		};
+ -		int units;			/* SLOB */
+  
+ -		struct {			/* Page cache */
+ +		union {
+ +#if defined(CONFIG_HAVE_CMPXCHG_DOUBLE) && \
+ +	defined(CONFIG_HAVE_ALIGNED_STRUCT_PAGE)
+ +			/* Used for cmpxchg_double in slub */
+ +			unsigned long counters;
+ +#else
+  			/*
+++<<<<<<< HEAD
+ +			 * Keep _count separate from slub cmpxchg_double data.
+ +			 * As the rest of the double word is protected by
+ +			 * slab_lock but _count is not.
+++=======
++ 			 * Count of ptes mapped in mms, to show when
++ 			 * page is mapped & limit reverse map searches.
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+  			 */
+ -			atomic_t _mapcount;
+ +			unsigned counters;
+ +#endif
+  
+ -			/*
+ -			 * Usage count, *USE WRAPPER FUNCTION* when manual
+ -			 * accounting. See page_ref.h
+ -			 */
+ -			atomic_t _refcount;
+ +			struct {
+ +
+ +				union {
+ +					/*
+ +					 * Count of ptes mapped in
+ +					 * mms, to show when page is
+ +					 * mapped & limit reverse map
+ +					 * searches.
+ +					 *
+ +					 * Used also for tail pages
+ +					 * refcounting instead of
+ +					 * _count. Tail pages cannot
+ +					 * be mapped and keeping the
+ +					 * tail page _count zero at
+ +					 * all times guarantees
+ +					 * get_page_unless_zero() will
+ +					 * never succeed on tail
+ +					 * pages.
+ +					 */
+ +					atomic_t _mapcount;
+ +
+ +					struct { /* SLUB */
+ +						unsigned inuse:16;
+ +						unsigned objects:15;
+ +						unsigned frozen:1;
+ +					};
+ +					int units;	/* SLOB */
+ +				};
+ +				atomic_t _count;		/* Usage count, see below. */
+ +			};
+  		};
+  	};
+  
+diff --cc include/linux/page-flags.h
+index a12b531c03b4,8c25b28a35aa..000000000000
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@@ -455,23 -590,112 +455,81 @@@ static inline int PageTransTail(struct 
+  	return PageTail(page);
+  }
+  
+ -/*
+ - * PageDoubleMap indicates that the compound page is mapped with PTEs as well
+ - * as PMDs.
+ - *
+ - * This is required for optimization of rmap operations for THP: we can postpone
+ - * per small page mapcount accounting (and its overhead from atomic operations)
+ - * until the first PMD split.
+ - *
+ - * For the page PageDoubleMap means ->_mapcount in all sub-pages is offset up
+ - * by one. This reference will go away with last compound_mapcount.
+ - *
+ - * See also __split_huge_pmd_locked() and page_remove_anon_compound_rmap().
+ - */
+ -static inline int PageDoubleMap(struct page *page)
+ -{
+ -	return PageHead(page) && test_bit(PG_double_map, &page[1].flags);
+ -}
+ +#else
+  
+ -static inline void SetPageDoubleMap(struct page *page)
+++<<<<<<< HEAD
+ +static inline int PageTransHuge(struct page *page)
+  {
+ -	VM_BUG_ON_PAGE(!PageHead(page), page);
+ -	set_bit(PG_double_map, &page[1].flags);
+ +	return 0;
+  }
+  
+ -static inline void ClearPageDoubleMap(struct page *page)
+ -{
+ -	VM_BUG_ON_PAGE(!PageHead(page), page);
+ -	clear_bit(PG_double_map, &page[1].flags);
+ -}
+ -static inline int TestSetPageDoubleMap(struct page *page)
+ +static inline int PageTransCompound(struct page *page)
+  {
+ -	VM_BUG_ON_PAGE(!PageHead(page), page);
+ -	return test_and_set_bit(PG_double_map, &page[1].flags);
+ +	return 0;
+  }
+  
+ -static inline int TestClearPageDoubleMap(struct page *page)
+ +static inline int PageTransTail(struct page *page)
+  {
+ -	VM_BUG_ON_PAGE(!PageHead(page), page);
+ -	return test_and_clear_bit(PG_double_map, &page[1].flags);
+ +	return 0;
+  }
+ -
+ -#else
+ -TESTPAGEFLAG_FALSE(TransHuge)
+ -TESTPAGEFLAG_FALSE(TransCompound)
+ -TESTPAGEFLAG_FALSE(TransCompoundMap)
+ -TESTPAGEFLAG_FALSE(TransTail)
+ -PAGEFLAG_FALSE(DoubleMap)
+ -	TESTSETFLAG_FALSE(DoubleMap)
+ -	TESTCLEARFLAG_FALSE(DoubleMap)
+  #endif
+ -
+++=======
++ /*
++  * For pages that are never mapped to userspace (and aren't PageSlab),
++  * page_type may be used.  Because it is initialised to -1, we invert the
++  * sense of the bit, so __SetPageFoo *clears* the bit used for PageFoo, and
++  * __ClearPageFoo *sets* the bit used for PageFoo.  We reserve a few high and
++  * low bits so that an underflow or overflow of page_mapcount() won't be
++  * mistaken for a page type value.
++  */
++ 
++ #define PAGE_TYPE_BASE	0xf0000000
++ /* Reserve		0x0000007f to catch underflows of page_mapcount */
++ #define PG_buddy	0x00000080
++ #define PG_balloon	0x00000100
++ #define PG_kmemcg	0x00000200
++ 
++ #define PageType(page, flag)						\
++ 	((page->page_type & (PAGE_TYPE_BASE | flag)) == PAGE_TYPE_BASE)
++ 
++ #define PAGE_TYPE_OPS(uname, lname)					\
++ static __always_inline int Page##uname(struct page *page)		\
++ {									\
++ 	return PageType(page, PG_##lname);				\
++ }									\
++ static __always_inline void __SetPage##uname(struct page *page)		\
++ {									\
++ 	VM_BUG_ON_PAGE(!PageType(page, 0), page);			\
++ 	page->page_type &= ~PG_##lname;					\
++ }									\
++ static __always_inline void __ClearPage##uname(struct page *page)	\
++ {									\
++ 	VM_BUG_ON_PAGE(!Page##uname(page), page);			\
++ 	page->page_type |= PG_##lname;					\
++ }
++ 
++ /*
++  * PageBuddy() indicates that the page is free and in the buddy system
++  * (see mm/page_alloc.c).
++  */
++ PAGE_TYPE_OPS(Buddy, buddy)
++ 
++ /*
++  * PageBalloon() is true for pages that are on the balloon page list
++  * (see mm/balloon_compaction.c).
++  */
++ PAGE_TYPE_OPS(Balloon, balloon)
++ 
++ /*
++  * If kmemcg is enabled, the buddy allocator will set PageKmemcg() on
++  * pages allocated with __GFP_ACCOUNT. It gets cleared on page free.
++  */
++ PAGE_TYPE_OPS(Kmemcg, kmemcg)
++ 
++ extern bool is_free_buddy_page(struct page *page);
++ 
++ __PAGEFLAG(Isolated, isolated, PF_ANY);
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+  
+  /*
+   * If network-based swap is enabled, sl*b must keep track of whether pages
+diff --cc mm/page_alloc.c
+index f67d72bc4ce5,5afdf495c374..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -629,39 -703,16 +629,49 @@@ static inline void rmv_page_order(struc
+  	set_page_private(page, 0);
+  }
+  
+ +/*
+ + * Locate the struct page for both the matching buddy in our
+ + * pair (buddy1) and the combined O(n+1) page they form (page).
+ + *
+ + * 1) Any buddy B1 will have an order O twin B2 which satisfies
+ + * the following equation:
+ + *     B2 = B1 ^ (1 << O)
+ + * For example, if the starting buddy (buddy2) is #8 its order
+ + * 1 buddy is #10:
+ + *     B2 = 8 ^ (1 << 1) = 8 ^ 2 = 10
+ + *
+ + * 2) Any buddy B will have an order O+1 parent P which
+ + * satisfies the following equation:
+ + *     P = B & ~(1 << O)
+ + *
+ + * Assumption: *_mem_map is contiguous at least up to MAX_ORDER
+ + */
+ +static inline unsigned long
+ +__find_buddy_index(unsigned long page_idx, unsigned int order)
+ +{
+ +	return page_idx ^ (1 << order);
+ +}
+ +
+  /*
+   * This function checks whether a page is free && is the buddy
+++<<<<<<< HEAD
+ + * we can do coalesce a page and its buddy if
+ + * (a) the buddy is not in a hole &&
+++=======
++  * we can coalesce a page and its buddy if
++  * (a) the buddy is not in a hole (check before calling!) &&
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+   * (b) the buddy is in the buddy system &&
+   * (c) a page and its buddy have the same order &&
+   * (d) a page and its buddy are in the same zone.
+   *
+++<<<<<<< HEAD
+ + * For recording whether a page is in the buddy system, we set ->_mapcount -2.
+ + * Setting, clearing, and testing _mapcount -2 is serialized by zone->lock.
+++=======
++  * For recording whether a page is in the buddy system, we set PageBuddy.
++  * Setting, clearing, and testing PageBuddy is serialized by zone->lock.
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+   *
+   * For recording page's order, we use page_private(page).
+   */
+@@@ -699,8 -757,8 +709,13 @@@ static inline int page_is_buddy(struct 
+   * as necessary, plus some accounting needed to play nicely with other
+   * parts of the VM system.
+   * At each level, we keep a list of pages, which are heads of continuous
+++<<<<<<< HEAD
+ + * free pages of length of (1 << order) and marked with _mapcount -2. Page's
+ + * order is recorded in page_private(page) field.
+++=======
++  * free pages of length of (1 << order) and marked with PageBuddy.
++  * Page's order is recorded in page_private(page) field.
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+   * So when we are allocating or freeing one, we can derive the state of the
+   * other.  That is, if we allocate a small block, and both were
+   * free, the remainder of the region must be split into blocks.
+diff --cc scripts/tags.sh
+index 8dd288c0fd25,66f08bb1cce9..000000000000
+--- a/scripts/tags.sh
++++ b/scripts/tags.sh
+@@@ -147,12 -139,115 +147,117 @@@ dogtags(
+  	all_target_sources | gtags -i -f -
+  }
+  
+++<<<<<<< HEAD
+++=======
++ # Basic regular expressions with an optional /kind-spec/ for ctags and
++ # the following limitations:
++ # - No regex modifiers
++ # - Use \{0,1\} instead of \?, because etags expects an unescaped ?
++ # - \s is not working with etags, use a space or [ \t]
++ # - \w works, but does not match underscores in etags
++ # - etags regular expressions have to match at the start of a line;
++ #   a ^[^#] is prepended by setup_regex unless an anchor is already present
++ regex_asm=(
++ 	'/^\(ENTRY\|_GLOBAL\)(\([[:alnum:]_\\]*\)).*/\2/'
++ )
++ regex_c=(
++ 	'/^SYSCALL_DEFINE[0-9](\([[:alnum:]_]*\).*/sys_\1/'
++ 	'/^COMPAT_SYSCALL_DEFINE[0-9](\([[:alnum:]_]*\).*/compat_sys_\1/'
++ 	'/^TRACE_EVENT(\([[:alnum:]_]*\).*/trace_\1/'
++ 	'/^TRACE_EVENT(\([[:alnum:]_]*\).*/trace_\1_rcuidle/'
++ 	'/^DEFINE_EVENT([^,)]*, *\([[:alnum:]_]*\).*/trace_\1/'
++ 	'/^DEFINE_EVENT([^,)]*, *\([[:alnum:]_]*\).*/trace_\1_rcuidle/'
++ 	'/^DEFINE_INSN_CACHE_OPS(\([[:alnum:]_]*\).*/get_\1_slot/'
++ 	'/^DEFINE_INSN_CACHE_OPS(\([[:alnum:]_]*\).*/free_\1_slot/'
++ 	'/^PAGEFLAG(\([[:alnum:]_]*\).*/Page\1/'
++ 	'/^PAGEFLAG(\([[:alnum:]_]*\).*/SetPage\1/'
++ 	'/^PAGEFLAG(\([[:alnum:]_]*\).*/ClearPage\1/'
++ 	'/^TESTSETFLAG(\([[:alnum:]_]*\).*/TestSetPage\1/'
++ 	'/^TESTPAGEFLAG(\([[:alnum:]_]*\).*/Page\1/'
++ 	'/^SETPAGEFLAG(\([[:alnum:]_]*\).*/SetPage\1/'
++ 	'/\<__SETPAGEFLAG(\([[:alnum:]_]*\).*/__SetPage\1/'
++ 	'/\<TESTCLEARFLAG(\([[:alnum:]_]*\).*/TestClearPage\1/'
++ 	'/\<__TESTCLEARFLAG(\([[:alnum:]_]*\).*/TestClearPage\1/'
++ 	'/\<CLEARPAGEFLAG(\([[:alnum:]_]*\).*/ClearPage\1/'
++ 	'/\<__CLEARPAGEFLAG(\([[:alnum:]_]*\).*/__ClearPage\1/'
++ 	'/^__PAGEFLAG(\([[:alnum:]_]*\).*/__SetPage\1/'
++ 	'/^__PAGEFLAG(\([[:alnum:]_]*\).*/__ClearPage\1/'
++ 	'/^PAGEFLAG_FALSE(\([[:alnum:]_]*\).*/Page\1/'
++ 	'/\<TESTSCFLAG(\([[:alnum:]_]*\).*/TestSetPage\1/'
++ 	'/\<TESTSCFLAG(\([[:alnum:]_]*\).*/TestClearPage\1/'
++ 	'/\<SETPAGEFLAG_NOOP(\([[:alnum:]_]*\).*/SetPage\1/'
++ 	'/\<CLEARPAGEFLAG_NOOP(\([[:alnum:]_]*\).*/ClearPage\1/'
++ 	'/\<__CLEARPAGEFLAG_NOOP(\([[:alnum:]_]*\).*/__ClearPage\1/'
++ 	'/\<TESTCLEARFLAG_FALSE(\([[:alnum:]_]*\).*/TestClearPage\1/'
++ 	'/^PAGE_TYPE_OPS(\([[:alnum:]_]*\).*/Page\1/'
++ 	'/^PAGE_TYPE_OPS(\([[:alnum:]_]*\).*/__SetPage\1/'
++ 	'/^PAGE_TYPE_OPS(\([[:alnum:]_]*\).*/__ClearPage\1/'
++ 	'/^TASK_PFA_TEST([^,]*, *\([[:alnum:]_]*\))/task_\1/'
++ 	'/^TASK_PFA_SET([^,]*, *\([[:alnum:]_]*\))/task_set_\1/'
++ 	'/^TASK_PFA_CLEAR([^,]*, *\([[:alnum:]_]*\))/task_clear_\1/'
++ 	'/^DEF_MMIO_\(IN\|OUT\)_[XD](\([[:alnum:]_]*\),[^)]*)/\2/'
++ 	'/^DEBUGGER_BOILERPLATE(\([[:alnum:]_]*\))/\1/'
++ 	'/^DEF_PCI_AC_\(\|NO\)RET(\([[:alnum:]_]*\).*/\2/'
++ 	'/^PCI_OP_READ(\(\w*\).*[1-4])/pci_bus_read_config_\1/'
++ 	'/^PCI_OP_WRITE(\(\w*\).*[1-4])/pci_bus_write_config_\1/'
++ 	'/\<DEFINE_\(MUTEX\|SEMAPHORE\|SPINLOCK\)(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\<DEFINE_\(RAW_SPINLOCK\|RWLOCK\|SEQLOCK\)(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\<DECLARE_\(RWSEM\|COMPLETION\)(\([[:alnum:]_]\+\)/\2/v/'
++ 	'/\<DECLARE_BITMAP(\([[:alnum:]_]*\)/\1/v/'
++ 	'/\(^\|\s\)\(\|L\|H\)LIST_HEAD(\([[:alnum:]_]*\)/\3/v/'
++ 	'/\(^\|\s\)RADIX_TREE(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\<DEFINE_PER_CPU([^,]*, *\([[:alnum:]_]*\)/\1/v/'
++ 	'/\<DEFINE_PER_CPU_SHARED_ALIGNED([^,]*, *\([[:alnum:]_]*\)/\1/v/'
++ 	'/\<DECLARE_WAIT_QUEUE_HEAD(\([[:alnum:]_]*\)/\1/v/'
++ 	'/\<DECLARE_\(TASKLET\|WORK\|DELAYED_WORK\)(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\(^\s\)OFFSET(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\(^\s\)DEFINE(\([[:alnum:]_]*\)/\2/v/'
++ 	'/\<DEFINE_HASHTABLE(\([[:alnum:]_]*\)/\1/v/'
++ )
++ regex_kconfig=(
++ 	'/^[[:blank:]]*\(menu\|\)config[[:blank:]]\+\([[:alnum:]_]\+\)/\2/'
++ 	'/^[[:blank:]]*\(menu\|\)config[[:blank:]]\+\([[:alnum:]_]\+\)/CONFIG_\2/'
++ )
++ setup_regex()
++ {
++ 	local mode=$1 lang tmp=() r
++ 	shift
++ 
++ 	regex=()
++ 	for lang; do
++ 		case "$lang" in
++ 		asm)       tmp=("${regex_asm[@]}") ;;
++ 		c)         tmp=("${regex_c[@]}") ;;
++ 		kconfig)   tmp=("${regex_kconfig[@]}") ;;
++ 		esac
++ 		for r in "${tmp[@]}"; do
++ 			if test "$mode" = "exuberant"; then
++ 				regex[${#regex[@]}]="--regex-$lang=${r}b"
++ 			else
++ 				# Remove ctags /kind-spec/
++ 				case "$r" in
++ 				/*/*/?/)
++ 					r=${r%?/}
++ 				esac
++ 				# Prepend ^[^#] unless already anchored
++ 				case "$r" in
++ 				/^*) ;;
++ 				*)
++ 					r="/^[^#]*${r#/}"
++ 				esac
++ 				regex[${#regex[@]}]="--regex=$r"
++ 			fi
++ 		done
++ 	done
++ }
++ 
+++>>>>>>> 6e292b9be7f4 (mm: split page_type out from _mapcount)
+  exuberant()
+  {
+ -	setup_regex exuberant asm c
+  	all_target_sources | xargs $1 -a                        \
+ -	-I __initdata,__exitdata,__initconst,			\
+ -	-I __initdata_memblock					\
+ -	-I __refdata,__attribute,__maybe_unused,__always_unused \
+ +	-I __initdata,__exitdata,__initconst,__devinitdata	\
+ +	-I __devinitconst,__cpuinitdata,__initdata_memblock	\
+ +	-I __refdata,__attribute				\
+  	-I __acquires,__releases,__deprecated			\
+  	-I __read_mostly,__aligned,____cacheline_aligned        \
+  	-I ____cacheline_aligned_in_smp                         \
+* Unmerged path include/linux/mm_types.h
+* Unmerged path include/linux/page-flags.h
+diff --git a/kernel/crash_core.c b/kernel/crash_core.c
+index 824347219a46..2c4c921feb4c 100644
+--- a/kernel/crash_core.c
++++ b/kernel/crash_core.c
+@@ -480,6 +480,7 @@ static int __init crash_save_vmcoreinfo_init(void)
+ 	VMCOREINFO_NUMBER(PG_hwpoison);
+ #endif
+ 	VMCOREINFO_NUMBER(PG_head_mask);
++#define PAGE_BUDDY_MAPCOUNT_VALUE	(~PG_buddy)
+ 	VMCOREINFO_NUMBER(PAGE_BUDDY_MAPCOUNT_VALUE);
+ #ifdef CONFIG_HUGETLBFS
+ 	VMCOREINFO_SYMBOL(free_huge_page);
+* Unmerged path mm/page_alloc.c
+* Unmerged path scripts/tags.sh
