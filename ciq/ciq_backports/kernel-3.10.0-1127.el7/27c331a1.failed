@@ -1,0 +1,941 @@
+ipc/util.c: further variable name cleanups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [ipc] util.c: further variable name cleanups (Waiman Long) [1373519]
+Rebuild_FUZZ: 95.00%
+commit-author Manfred Spraul <manfred@colorfullife.com>
+commit 27c331a174614208d0b539019583990967ad9479
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/27c331a1.failed
+
+The varable names got a mess, thus standardize them again:
+
+id: user space id. Called semid, shmid, msgid if the type is known.
+    Most functions use "id" already.
+idx: "index" for the idr lookup
+    Right now, some functions use lid, ipc_addid() already uses idx as
+    the variable name.
+seq: sequence number, to avoid quick collisions of the user space id
+key: user space key, used for the rhash tree
+
+Link: http://lkml.kernel.org/r/20180712185241.4017-12-manfred@colorfullife.com
+	Signed-off-by: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Herbert Xu <herbert@gondor.apana.org.au>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 27c331a174614208d0b539019583990967ad9479)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ipc_namespace.h
+#	ipc/msg.c
+#	ipc/sem.c
+#	ipc/shm.c
+#	ipc/util.c
+#	ipc/util.h
+diff --cc include/linux/ipc_namespace.h
+index 3077f12384f0,6ab8c1bada3f..000000000000
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@@ -21,10 -16,13 +21,15 @@@ struct user_namespace
+  struct ipc_ids {
+  	int in_use;
+  	unsigned short seq;
+ +	unsigned short seq_max;
+  	struct rw_semaphore rwsem;
+  	struct idr ipcs_idr;
+++<<<<<<< HEAD
+++=======
++ 	int max_idx;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  	int next_id;
+ -#endif
+ -	struct rhashtable key_ht;
+  };
+  
+  struct ipc_namespace {
+diff --cc ipc/msg.c
+index f7b262dd9f68,883642cf2b27..000000000000
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@@ -469,117 -452,116 +469,155 @@@ out_up
+  	return err;
+  }
+  
+ -static int msgctl_info(struct ipc_namespace *ns, int msqid,
+ -			 int cmd, struct msginfo *msginfo)
+ +static int msgctl_nolock(struct ipc_namespace *ns, int msqid,
+ +			 int cmd, int version, void __user *buf)
+  {
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	int max_idx;
++ 
++ 	/*
++ 	 * We must not return kernel stack data.
++ 	 * due to padding, it's not enough
++ 	 * to set all member fields.
++ 	 */
++ 	err = security_msg_queue_msgctl(NULL, cmd);
++ 	if (err)
++ 		return err;
++ 
++ 	memset(msginfo, 0, sizeof(*msginfo));
++ 	msginfo->msgmni = ns->msg_ctlmni;
++ 	msginfo->msgmax = ns->msg_ctlmax;
++ 	msginfo->msgmnb = ns->msg_ctlmnb;
++ 	msginfo->msgssz = MSGSSZ;
++ 	msginfo->msgseg = MSGSEG;
++ 	down_read(&msg_ids(ns).rwsem);
++ 	if (cmd == MSG_INFO) {
++ 		msginfo->msgpool = msg_ids(ns).in_use;
++ 		msginfo->msgmap = atomic_read(&ns->msg_hdrs);
++ 		msginfo->msgtql = atomic_read(&ns->msg_bytes);
++ 	} else {
++ 		msginfo->msgmap = MSGMAP;
++ 		msginfo->msgpool = MSGPOOL;
++ 		msginfo->msgtql = MSGTQL;
++ 	}
++ 	max_idx = ipc_get_maxidx(&msg_ids(ns));
++ 	up_read(&msg_ids(ns).rwsem);
++ 	return (max_idx < 0) ? 0 : max_idx;
++ }
++ 
++ static int msgctl_stat(struct ipc_namespace *ns, int msqid,
++ 			 int cmd, struct msqid64_ds *p)
++ {
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  	struct msg_queue *msq;
+ -	int err;
+  
+ -	memset(p, 0, sizeof(*p));
+ +	switch (cmd) {
+ +	case IPC_INFO:
+ +	case MSG_INFO:
+ +	{
+ +		struct msginfo msginfo;
+ +		int max_id;
+  
+ -	rcu_read_lock();
+ -	if (cmd == MSG_STAT || cmd == MSG_STAT_ANY) {
+ -		msq = msq_obtain_object(ns, msqid);
+ -		if (IS_ERR(msq)) {
+ -			err = PTR_ERR(msq);
+ -			goto out_unlock;
+ -		}
+ -	} else { /* IPC_STAT */
+ -		msq = msq_obtain_object_check(ns, msqid);
+ -		if (IS_ERR(msq)) {
+ -			err = PTR_ERR(msq);
+ -			goto out_unlock;
+ +		if (!buf)
+ +			return -EFAULT;
+ +
+ +		/*
+ +		 * We must not return kernel stack data.
+ +		 * due to padding, it's not enough
+ +		 * to set all member fields.
+ +		 */
+ +		err = security_msg_queue_msgctl(NULL, cmd);
+ +		if (err)
+ +			return err;
+ +
+ +		memset(&msginfo, 0, sizeof(msginfo));
+ +		msginfo.msgmni = ns->msg_ctlmni;
+ +		msginfo.msgmax = ns->msg_ctlmax;
+ +		msginfo.msgmnb = ns->msg_ctlmnb;
+ +		msginfo.msgssz = MSGSSZ;
+ +		msginfo.msgseg = MSGSEG;
+ +		down_read(&msg_ids(ns).rwsem);
+ +		if (cmd == MSG_INFO) {
+ +			msginfo.msgpool = msg_ids(ns).in_use;
+ +			msginfo.msgmap = atomic_read(&ns->msg_hdrs);
+ +			msginfo.msgtql = atomic_read(&ns->msg_bytes);
+ +		} else {
+ +			msginfo.msgmap = MSGMAP;
+ +			msginfo.msgpool = MSGPOOL;
+ +			msginfo.msgtql = MSGTQL;
+  		}
+ +		max_id = ipc_get_maxid(&msg_ids(ns));
+ +		up_read(&msg_ids(ns).rwsem);
+ +		if (copy_to_user(buf, &msginfo, sizeof(struct msginfo)))
+ +			return -EFAULT;
+ +		return (max_id < 0) ? 0 : max_id;
+  	}
+  
+ -	/* see comment for SHM_STAT_ANY */
+ -	if (cmd == MSG_STAT_ANY)
+ -		audit_ipc_obj(&msq->q_perm);
+ -	else {
+ -		err = -EACCES;
+ -		if (ipcperms(ns, &msq->q_perm, S_IRUGO))
+ -			goto out_unlock;
+ -	}
+ +	case MSG_STAT:
+ +	case MSG_STAT_ANY:
+ +	case IPC_STAT:
+ +	{
+ +		struct msqid64_ds tbuf;
+ +		int success_return;
+  
+ -	err = security_msg_queue_msgctl(&msq->q_perm, cmd);
+ -	if (err)
+ -		goto out_unlock;
+ +		if (!buf)
+ +			return -EFAULT;
+  
+ -	ipc_lock_object(&msq->q_perm);
+ +		memset(&tbuf, 0, sizeof(tbuf));
+  
+ -	if (!ipc_valid_object(&msq->q_perm)) {
+ -		ipc_unlock_object(&msq->q_perm);
+ -		err = -EIDRM;
+ -		goto out_unlock;
+ -	}
+ +		rcu_read_lock();
+ +		if (cmd == MSG_STAT || cmd == MSG_STAT_ANY) {
+ +			msq = msq_obtain_object(ns, msqid);
+ +			if (IS_ERR(msq)) {
+ +				err = PTR_ERR(msq);
+ +				goto out_unlock;
+ +			}
+ +			success_return = msq->q_perm.id;
+ +		} else { /* IPC_STAT */
+ +			msq = msq_obtain_object_check(ns, msqid);
+ +			if (IS_ERR(msq)) {
+ +				err = PTR_ERR(msq);
+ +				goto out_unlock;
+ +			}
+ +			success_return = 0;
+ +		}
+  
+ -	kernel_to_ipc64_perm(&msq->q_perm, &p->msg_perm);
+ -	p->msg_stime  = msq->q_stime;
+ -	p->msg_rtime  = msq->q_rtime;
+ -	p->msg_ctime  = msq->q_ctime;
+ -#ifndef CONFIG_64BIT
+ -	p->msg_stime_high = msq->q_stime >> 32;
+ -	p->msg_rtime_high = msq->q_rtime >> 32;
+ -	p->msg_ctime_high = msq->q_ctime >> 32;
+ -#endif
+ -	p->msg_cbytes = msq->q_cbytes;
+ -	p->msg_qnum   = msq->q_qnum;
+ -	p->msg_qbytes = msq->q_qbytes;
+ -	p->msg_lspid  = pid_vnr(msq->q_lspid);
+ -	p->msg_lrpid  = pid_vnr(msq->q_lrpid);
+ +		/* see comment for SHM_STAT_ANY */
+ +		if (cmd == MSG_STAT_ANY)
+ +			audit_ipc_obj(&msq->q_perm);
+ +		else {
+ +			err = -EACCES;
+ +			if (ipcperms(ns, &msq->q_perm, S_IRUGO))
+ +				goto out_unlock;
+ +		}
+  
+ -	if (cmd == IPC_STAT) {
+ -		/*
+ -		 * As defined in SUS:
+ -		 * Return 0 on success
+ -		 */
+ -		err = 0;
+ -	} else {
+ -		/*
+ -		 * MSG_STAT and MSG_STAT_ANY (both Linux specific)
+ -		 * Return the full id, including the sequence number
+ -		 */
+ -		err = msq->q_perm.id;
+ +		err = security_msg_queue_msgctl(msq, cmd);
+ +		if (err)
+ +			goto out_unlock;
+ +
+ +		kernel_to_ipc64_perm(&msq->q_perm, &tbuf.msg_perm);
+ +		tbuf.msg_stime  = msq->q_stime;
+ +		tbuf.msg_rtime  = msq->q_rtime;
+ +		tbuf.msg_ctime  = msq->q_ctime;
+ +		tbuf.msg_cbytes = msq->q_cbytes;
+ +		tbuf.msg_qnum   = msq->q_qnum;
+ +		tbuf.msg_qbytes = msq->q_qbytes;
+ +		tbuf.msg_lspid  = msq->q_lspid;
+ +		tbuf.msg_lrpid  = msq->q_lrpid;
+ +		rcu_read_unlock();
+ +
+ +		if (copy_msqid_to_user(buf, &tbuf, version))
+ +			return -EFAULT;
+ +		return success_return;
+  	}
+  
+ -	ipc_unlock_object(&msq->q_perm);
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +
+ +	return err;
+  out_unlock:
+  	rcu_read_unlock();
+  	return err;
+diff --cc ipc/sem.c
+index b95cbc887889,26f8e37fcdcb..000000000000
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@@ -1245,8 -1290,43 +1245,46 @@@ out_unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int semctl_info(struct ipc_namespace *ns, int semid,
++ 			 int cmd, void __user *p)
++ {
++ 	struct seminfo seminfo;
++ 	int max_idx;
++ 	int err;
++ 
++ 	err = security_sem_semctl(NULL, cmd);
++ 	if (err)
++ 		return err;
++ 
++ 	memset(&seminfo, 0, sizeof(seminfo));
++ 	seminfo.semmni = ns->sc_semmni;
++ 	seminfo.semmns = ns->sc_semmns;
++ 	seminfo.semmsl = ns->sc_semmsl;
++ 	seminfo.semopm = ns->sc_semopm;
++ 	seminfo.semvmx = SEMVMX;
++ 	seminfo.semmnu = SEMMNU;
++ 	seminfo.semmap = SEMMAP;
++ 	seminfo.semume = SEMUME;
++ 	down_read(&sem_ids(ns).rwsem);
++ 	if (cmd == SEM_INFO) {
++ 		seminfo.semusz = sem_ids(ns).in_use;
++ 		seminfo.semaem = ns->used_sems;
++ 	} else {
++ 		seminfo.semusz = SEMUSZ;
++ 		seminfo.semaem = SEMAEM;
++ 	}
++ 	max_idx = ipc_get_maxidx(&sem_ids(ns));
++ 	up_read(&sem_ids(ns).rwsem);
++ 	if (copy_to_user(p, &seminfo, sizeof(struct seminfo)))
++ 		return -EFAULT;
++ 	return (max_idx < 0) ? 0 : max_idx;
++ }
++ 
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  static int semctl_setval(struct ipc_namespace *ns, int semid, int semnum,
+ -		int val)
+ +		unsigned long arg)
+  {
+  	struct sem_undo *un;
+  	struct sem_array *sma;
+diff --cc ipc/shm.c
+index 6801069fa93d,b0eb3757ab89..000000000000
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@@ -846,129 -937,202 +846,172 @@@ out_up
+  	return err;
+  }
+  
+ -static int shmctl_ipc_info(struct ipc_namespace *ns,
+ -			   struct shminfo64 *shminfo)
+ +static int shmctl_nolock(struct ipc_namespace *ns, int shmid,
+ +			 int cmd, int version, void __user *buf)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int err = security_shm_shmctl(NULL, IPC_INFO);
++ 	if (!err) {
++ 		memset(shminfo, 0, sizeof(*shminfo));
++ 		shminfo->shmmni = shminfo->shmseg = ns->shm_ctlmni;
++ 		shminfo->shmmax = ns->shm_ctlmax;
++ 		shminfo->shmall = ns->shm_ctlall;
++ 		shminfo->shmmin = SHMMIN;
++ 		down_read(&shm_ids(ns).rwsem);
++ 		err = ipc_get_maxidx(&shm_ids(ns));
++ 		up_read(&shm_ids(ns).rwsem);
++ 		if (err < 0)
++ 			err = 0;
++ 	}
++ 	return err;
++ }
++ 
++ static int shmctl_shm_info(struct ipc_namespace *ns,
++ 			   struct shm_info *shm_info)
++ {
++ 	int err = security_shm_shmctl(NULL, SHM_INFO);
++ 	if (!err) {
++ 		memset(shm_info, 0, sizeof(*shm_info));
++ 		down_read(&shm_ids(ns).rwsem);
++ 		shm_info->used_ids = shm_ids(ns).in_use;
++ 		shm_get_stat(ns, &shm_info->shm_rss, &shm_info->shm_swp);
++ 		shm_info->shm_tot = ns->shm_tot;
++ 		shm_info->swap_attempts = 0;
++ 		shm_info->swap_successes = 0;
++ 		err = ipc_get_maxidx(&shm_ids(ns));
++ 		up_read(&shm_ids(ns).rwsem);
++ 		if (err < 0)
++ 			err = 0;
++ 	}
++ 	return err;
++ }
++ 
++ static int shmctl_stat(struct ipc_namespace *ns, int shmid,
++ 			int cmd, struct shmid64_ds *tbuf)
++ {
++ 	struct shmid_kernel *shp;
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  	int err;
+ +	struct shmid_kernel *shp;
+  
+ -	memset(tbuf, 0, sizeof(*tbuf));
+ -
+ -	rcu_read_lock();
+ -	if (cmd == SHM_STAT || cmd == SHM_STAT_ANY) {
+ -		shp = shm_obtain_object(ns, shmid);
+ -		if (IS_ERR(shp)) {
+ -			err = PTR_ERR(shp);
+ -			goto out_unlock;
+ -		}
+ -	} else { /* IPC_STAT */
+ -		shp = shm_obtain_object_check(ns, shmid);
+ -		if (IS_ERR(shp)) {
+ -			err = PTR_ERR(shp);
+ -			goto out_unlock;
+ -		}
+ -	}
+ -
+ -	/*
+ -	 * Semantically SHM_STAT_ANY ought to be identical to
+ -	 * that functionality provided by the /proc/sysvipc/
+ -	 * interface. As such, only audit these calls and
+ -	 * do not do traditional S_IRUGO permission checks on
+ -	 * the ipc object.
+ -	 */
+ -	if (cmd == SHM_STAT_ANY)
+ -		audit_ipc_obj(&shp->shm_perm);
+ -	else {
+ -		err = -EACCES;
+ -		if (ipcperms(ns, &shp->shm_perm, S_IRUGO))
+ -			goto out_unlock;
+ -	}
+ -
+ -	err = security_shm_shmctl(&shp->shm_perm, cmd);
+ -	if (err)
+ -		goto out_unlock;
+ -
+ -	ipc_lock_object(&shp->shm_perm);
+ -
+ -	if (!ipc_valid_object(&shp->shm_perm)) {
+ -		ipc_unlock_object(&shp->shm_perm);
+ -		err = -EIDRM;
+ -		goto out_unlock;
+ +	/* preliminary security checks for *_INFO */
+ +	if (cmd == IPC_INFO || cmd == SHM_INFO) {
+ +		err = security_shm_shmctl(NULL, cmd);
+ +		if (err)
+ +			return err;
+  	}
+  
+ -	kernel_to_ipc64_perm(&shp->shm_perm, &tbuf->shm_perm);
+ -	tbuf->shm_segsz	= shp->shm_segsz;
+ -	tbuf->shm_atime	= shp->shm_atim;
+ -	tbuf->shm_dtime	= shp->shm_dtim;
+ -	tbuf->shm_ctime	= shp->shm_ctim;
+ -#ifndef CONFIG_64BIT
+ -	tbuf->shm_atime_high = shp->shm_atim >> 32;
+ -	tbuf->shm_dtime_high = shp->shm_dtim >> 32;
+ -	tbuf->shm_ctime_high = shp->shm_ctim >> 32;
+ -#endif
+ -	tbuf->shm_cpid	= pid_vnr(shp->shm_cprid);
+ -	tbuf->shm_lpid	= pid_vnr(shp->shm_lprid);
+ -	tbuf->shm_nattch = shp->shm_nattch;
+ +	switch (cmd) {
+ +	case IPC_INFO:
+ +	{
+ +		struct shminfo64 shminfo;
+  
+ -	if (cmd == IPC_STAT) {
+ -		/*
+ -		 * As defined in SUS:
+ -		 * Return 0 on success
+ -		 */
+ -		err = 0;
+ -	} else {
+ -		/*
+ -		 * SHM_STAT and SHM_STAT_ANY (both Linux specific)
+ -		 * Return the full id, including the sequence number
+ -		 */
+ -		err = shp->shm_perm.id;
+ -	}
+ +		memset(&shminfo, 0, sizeof(shminfo));
+ +		shminfo.shmmni = shminfo.shmseg = ns->shm_ctlmni;
+ +		shminfo.shmmax = ns->shm_ctlmax;
+ +		shminfo.shmall = ns->shm_ctlall;
+  
+ -	ipc_unlock_object(&shp->shm_perm);
+ -out_unlock:
+ -	rcu_read_unlock();
+ -	return err;
+ -}
+ +		shminfo.shmmin = SHMMIN;
+ +		if(copy_shminfo_to_user (buf, &shminfo, version))
+ +			return -EFAULT;
+  
+ -static int shmctl_do_lock(struct ipc_namespace *ns, int shmid, int cmd)
+ -{
+ -	struct shmid_kernel *shp;
+ -	struct file *shm_file;
+ -	int err;
+ +		down_read(&shm_ids(ns).rwsem);
+ +		err = ipc_get_maxid(&shm_ids(ns));
+ +		up_read(&shm_ids(ns).rwsem);
+  
+ -	rcu_read_lock();
+ -	shp = shm_obtain_object_check(ns, shmid);
+ -	if (IS_ERR(shp)) {
+ -		err = PTR_ERR(shp);
+ -		goto out_unlock1;
+ +		if(err<0)
+ +			err = 0;
+ +		goto out;
+  	}
+ +	case SHM_INFO:
+ +	{
+ +		struct shm_info shm_info;
+  
+ -	audit_ipc_obj(&(shp->shm_perm));
+ -	err = security_shm_shmctl(&shp->shm_perm, cmd);
+ -	if (err)
+ -		goto out_unlock1;
+ -
+ -	ipc_lock_object(&shp->shm_perm);
+ +		memset(&shm_info, 0, sizeof(shm_info));
+ +		down_read(&shm_ids(ns).rwsem);
+ +		shm_info.used_ids = shm_ids(ns).in_use;
+ +		shm_get_stat (ns, &shm_info.shm_rss, &shm_info.shm_swp);
+ +		shm_info.shm_tot = ns->shm_tot;
+ +		shm_info.swap_attempts = 0;
+ +		shm_info.swap_successes = 0;
+ +		err = ipc_get_maxid(&shm_ids(ns));
+ +		up_read(&shm_ids(ns).rwsem);
+ +		if (copy_to_user(buf, &shm_info, sizeof(shm_info))) {
+ +			err = -EFAULT;
+ +			goto out;
+ +		}
+  
+ -	/* check if shm_destroy() is tearing down shp */
+ -	if (!ipc_valid_object(&shp->shm_perm)) {
+ -		err = -EIDRM;
+ -		goto out_unlock0;
+ +		err = err < 0 ? 0 : err;
+ +		goto out;
+  	}
+ -
+ -	if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+ -		kuid_t euid = current_euid();
+ -
+ -		if (!uid_eq(euid, shp->shm_perm.uid) &&
+ -		    !uid_eq(euid, shp->shm_perm.cuid)) {
+ -			err = -EPERM;
+ -			goto out_unlock0;
+ -		}
+ -		if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) {
+ -			err = -EPERM;
+ -			goto out_unlock0;
+ +	case SHM_STAT:
+ +	case SHM_STAT_ANY:
+ +	case IPC_STAT:
+ +	{
+ +		struct shmid64_ds tbuf;
+ +		int result;
+ +
+ +		rcu_read_lock();
+ +		if (cmd == SHM_STAT || cmd == SHM_STAT_ANY) {
+ +			shp = shm_obtain_object(ns, shmid);
+ +			if (IS_ERR(shp)) {
+ +				err = PTR_ERR(shp);
+ +				goto out_unlock;
+ +			}
+ +			result = shp->shm_perm.id;
+ +		} else { /* IPC_STAT */
+ +			shp = shm_obtain_object_check(ns, shmid);
+ +			if (IS_ERR(shp)) {
+ +				err = PTR_ERR(shp);
+ +				goto out_unlock;
+ +			}
+ +			result = 0;
+  		}
+ -	}
+ -
+ -	shm_file = shp->shm_file;
+ -	if (is_file_hugepages(shm_file))
+ -		goto out_unlock0;
+ -
+ -	if (cmd == SHM_LOCK) {
+ -		struct user_struct *user = current_user();
+  
+ -		err = shmem_lock(shm_file, 1, user);
+ -		if (!err && !(shp->shm_perm.mode & SHM_LOCKED)) {
+ -			shp->shm_perm.mode |= SHM_LOCKED;
+ -			shp->mlock_user = user;
+ +		/*
+ +		 * Semantically SHM_STAT_ANY ought to be identical to
+ +		 * that functionality provided by the /proc/sysvipc/
+ +		 * interface. As such, only audit these calls and
+ +		 * do not do traditional S_IRUGO permission checks on
+ +		 * the ipc object.
+ +		 */
+ +		if (cmd == SHM_STAT_ANY)
+ +			audit_ipc_obj(&shp->shm_perm);
+ +		else {
+ +			err = -EACCES;
+ +			if (ipcperms(ns, &shp->shm_perm, S_IRUGO))
+ +				goto out_unlock;
+  		}
+ -		goto out_unlock0;
+ -	}
+  
+ -	/* SHM_UNLOCK */
+ -	if (!(shp->shm_perm.mode & SHM_LOCKED))
+ -		goto out_unlock0;
+ -	shmem_lock(shm_file, 0, shp->mlock_user);
+ -	shp->shm_perm.mode &= ~SHM_LOCKED;
+ -	shp->mlock_user = NULL;
+ -	get_file(shm_file);
+ -	ipc_unlock_object(&shp->shm_perm);
+ -	rcu_read_unlock();
+ -	shmem_unlock_mapping(shm_file->f_mapping);
+ +		err = security_shm_shmctl(shp, cmd);
+ +		if (err)
+ +			goto out_unlock;
+  
+ -	fput(shm_file);
+ -	return err;
+ +		memset(&tbuf, 0, sizeof(tbuf));
+ +		kernel_to_ipc64_perm(&shp->shm_perm, &tbuf.shm_perm);
+ +		tbuf.shm_segsz	= shp->shm_segsz;
+ +		tbuf.shm_atime	= shp->shm_atim;
+ +		tbuf.shm_dtime	= shp->shm_dtim;
+ +		tbuf.shm_ctime	= shp->shm_ctim;
+ +		tbuf.shm_cpid	= shp->shm_cprid;
+ +		tbuf.shm_lpid	= shp->shm_lprid;
+ +		tbuf.shm_nattch	= shp->shm_nattch;
+ +		rcu_read_unlock();
+ +
+ +		if (copy_shmid_to_user(buf, &tbuf, version))
+ +			err = -EFAULT;
+ +		else
+ +			err = result;
+ +		goto out;
+ +	}
+ +	default:
+ +		return -EINVAL;
+ +	}
+  
+ -out_unlock0:
+ -	ipc_unlock_object(&shp->shm_perm);
+ -out_unlock1:
+ +out_unlock:
+  	rcu_read_unlock();
+ +out:
+  	return err;
+  }
+  
+diff --cc ipc/util.c
+index 1df75a61612b,6f30ba80ca15..000000000000
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@@ -130,30 -97,32 +130,38 @@@ static int __init ipc_init(void
+  }
+  device_initcall(ipc_init);
+  
+ -static const struct rhashtable_params ipc_kht_params = {
+ -	.head_offset		= offsetof(struct kern_ipc_perm, khtnode),
+ -	.key_offset		= offsetof(struct kern_ipc_perm, key),
+ -	.key_len		= FIELD_SIZEOF(struct kern_ipc_perm, key),
+ -	.locks_mul		= 1,
+ -	.automatic_shrinking	= true,
+ -};
+ -
+  /**
+ - * ipc_init_ids	- initialise ipc identifiers
+ - * @ids: ipc identifier set
+ + *	ipc_init_ids		-	initialise IPC identifiers
+ + *	@ids: Identifier set
+   *
+ - * Set up the sequence range to use for the ipc identifier range (limited
+ - * below IPCMNI) then initialise the keys hashtable and ids idr.
+ + *	Set up the sequence range to use for the ipc identifier range (limited
+ + *	below IPCMNI) then initialise the ids idr.
+   */
+ + 
+  void ipc_init_ids(struct ipc_ids *ids)
+  {
+ +	init_rwsem(&ids->rwsem);
+ +
+  	ids->in_use = 0;
+  	ids->seq = 0;
+++<<<<<<< HEAD
+++=======
++ 	init_rwsem(&ids->rwsem);
++ 	rhashtable_init(&ids->key_ht, &ipc_kht_params);
++ 	idr_init(&ids->ipcs_idr);
++ 	ids->max_idx = -1;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  	ids->next_id = -1;
+ -#endif
+ +	{
+ +		int seq_limit = INT_MAX/SEQ_MULTIPLIER;
+ +		if (seq_limit > USHRT_MAX)
+ +			ids->seq_max = USHRT_MAX;
+ +		 else
+ +		 	ids->seq_max = seq_limit;
+ +	}
+ +
+ +	idr_init(&ids->ipcs_idr);
+  }
+  
+  #ifdef CONFIG_PROC_FS
+@@@ -227,50 -231,21 +235,61 @@@ static struct kern_ipc_perm *ipc_findke
+  }
+  
+  /**
+ - * ipc_addid - add an ipc identifier
+ - * @ids: ipc identifier set
+ - * @new: new ipc permission set
+ - * @limit: limit for the number of used ids
+ + *	ipc_get_maxid 	-	get the last assigned id
+ + *	@ids: IPC identifier set
+   *
+++<<<<<<< HEAD
+ + *	Called with ipc_ids.rwsem held.
+++=======
++  * Add an entry 'new' to the ipc ids idr. The permissions object is
++  * initialised and the first free entry is set up and the index assigned
++  * is returned. The 'new' entry is returned in a locked state on success.
++  *
++  * On failure the entry is not locked and a negative err-code is returned.
++  * The caller must use ipc_rcu_putref() to free the identifier.
++  *
++  * Called with writer ipc_ids.rwsem held.
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+   */
+ -int ipc_addid(struct ipc_ids *ids, struct kern_ipc_perm *new, int limit)
+ +
+ +int ipc_get_maxid(struct ipc_ids *ids)
+ +{
+ +	struct kern_ipc_perm *ipc;
+ +	int max_id = -1;
+ +	int total, id;
+ +
+ +	if (ids->in_use == 0)
+ +		return -1;
+ +
+ +	if (ids->in_use == IPCMNI)
+ +		return IPCMNI - 1;
+ +
+ +	/* Look for the last assigned id */
+ +	total = 0;
+ +	for (id = 0; id < IPCMNI && total < ids->in_use; id++) {
+ +		ipc = idr_find(&ids->ipcs_idr, id);
+ +		if (ipc != NULL) {
+ +			max_id = id;
+ +			total++;
+ +		}
+ +	}
+ +	return max_id;
+ +}
+ +
+ +/**
+ + *	ipc_addid 	-	add an IPC identifier
+ + *	@ids: IPC identifier set
+ + *	@new: new IPC permission set
+ + *	@size: limit for the number of used ids
+ + *
+ + *	Add an entry 'new' to the IPC ids idr. The permissions object is
+ + *	initialised and the first free entry is set up and the id assigned
+ + *	is returned. The 'new' entry is returned in a locked state on success.
+ + *	On failure the entry is not locked and a negative err-code is returned.
+ + *
+ + *	Called with writer ipc_ids.rwsem held.
+ + */
+ +int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+  {
+  	kuid_t euid;
+  	kgid_t egid;
+@@@ -305,18 -291,9 +324,24 @@@
+  	}
+  
+  	ids->in_use++;
+++<<<<<<< HEAD
+ +
+ +	if (next_id < 0) {
+ +		new->seq = ids->seq++;
+ +		if (ids->seq > ids->seq_max)
+ +			ids->seq = 0;
+ +	} else {
+ +		new->seq = ipcid_to_seqx(next_id);
+ +		ids->next_id = -1;
+ +	}
+ +
+ +	new->id = ipc_buildid(id, new->seq);
+ +	return id;
+++=======
++ 	if (idx > ids->max_idx)
++ 		ids->max_idx = idx;
++ 	return idx;
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  }
+  
+  /**
+@@@ -429,27 -406,46 +454,43 @@@ static int ipcget_public(struct ipc_nam
+  	return err;
+  }
+  
+ -/**
+ - * ipc_kht_remove - remove an ipc from the key hashtable
+ - * @ids: ipc identifier set
+ - * @ipcp: ipc perm structure containing the key to remove
+ - *
+ - * ipc_ids.rwsem (as a writer) and the spinlock for this ID are held
+ - * before this function is called, and remain locked on the exit.
+ - */
+ -static void ipc_kht_remove(struct ipc_ids *ids, struct kern_ipc_perm *ipcp)
+ -{
+ -	if (ipcp->key != IPC_PRIVATE)
+ -		rhashtable_remove_fast(&ids->key_ht, &ipcp->khtnode,
+ -				       ipc_kht_params);
+ -}
+  
+  /**
+ - * ipc_rmid - remove an ipc identifier
+ - * @ids: ipc identifier set
+ - * @ipcp: ipc perm structure containing the identifier to remove
+ + *	ipc_rmid	-	remove an IPC identifier
+ + *	@ids: IPC identifier set
+ + *	@ipcp: ipc perm structure containing the identifier to remove
+   *
+ - * ipc_ids.rwsem (as a writer) and the spinlock for this ID are held
+ - * before this function is called, and remain locked on the exit.
+ + *	ipc_ids.rwsem (as a writer) and the spinlock for this ID are held
+ + *	before this function is called, and remain locked on the exit.
+   */
+ + 
+  void ipc_rmid(struct ipc_ids *ids, struct kern_ipc_perm *ipcp)
+  {
+- 	int lid = ipcid_to_idx(ipcp->id);
++ 	int idx = ipcid_to_idx(ipcp->id);
+  
+++<<<<<<< HEAD
+ +	idr_remove(&ids->ipcs_idr, lid);
+ +
+++=======
++ 	idr_remove(&ids->ipcs_idr, idx);
++ 	ipc_kht_remove(ids, ipcp);
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  	ids->in_use--;
+ +
+  	ipcp->deleted = true;
+  
+++<<<<<<< HEAD
+ +	return;
+++=======
++ 	if (unlikely(idx == ids->max_idx)) {
++ 		do {
++ 			idx--;
++ 			if (idx == -1)
++ 				break;
++ 		} while (!idr_find(&ids->ipcs_idr, idx));
++ 		ids->max_idx = idx;
++ 	}
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  }
+  
+  /**
+@@@ -617,12 -561,12 +658,12 @@@ void ipc64_perm_to_ipc_perm (struct ipc
+   * Call inside the RCU critical section.
+   * The ipc object is *not* locked on exit.
+   */
+ -struct kern_ipc_perm *ipc_obtain_object_idr(struct ipc_ids *ids, int id)
+ +struct kern_ipc_perm *ipc_obtain_object(struct ipc_ids *ids, int id)
+  {
+  	struct kern_ipc_perm *out;
+- 	int lid = ipcid_to_idx(id);
++ 	int idx = ipcid_to_idx(id);
+  
+- 	out = idr_find(&ids->ipcs_idr, lid);
++ 	out = idr_find(&ids->ipcs_idr, idx);
+  	if (!out)
+  		return ERR_PTR(-EINVAL);
+  
+diff --cc ipc/util.h
+index 778c12c8c204,e74564fe3375..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -114,11 -112,22 +114,30 @@@ void ipc_rmid(struct ipc_ids *, struct 
+  /* must be called with ipcp locked */
+  int ipcperms(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp, short flg);
+  
+++<<<<<<< HEAD
+ +/* for rare, potentially huge allocations.
+ + * both function can sleep
+ + */
+ +void* ipc_alloc(int size);
+ +void ipc_free(void* ptr, int size);
+++=======
++ /**
++  * ipc_get_maxidx - get the highest assigned index
++  * @ids: ipc identifier set
++  *
++  * Called with ipc_ids.rwsem held for reading.
++  */
++ static inline int ipc_get_maxidx(struct ipc_ids *ids)
++ {
++ 	if (ids->in_use == 0)
++ 		return -1;
++ 
++ 	if (ids->in_use == IPCMNI)
++ 		return IPCMNI - 1;
++ 
++ 	return ids->max_idx;
++ }
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  
+  /*
+   * For allocation that need to be freed by RCU.
+@@@ -153,16 -172,9 +172,20 @@@ extern struct msg_msg *load_msg(const v
+  extern struct msg_msg *copy_msg(struct msg_msg *src, struct msg_msg *dst);
+  extern int store_msg(void __user *dest, struct msg_msg *msg, size_t len);
+  
+++<<<<<<< HEAD
+ +extern void recompute_msgmni(struct ipc_namespace *);
+ +
+ +static inline int ipc_buildid(int id, int seq)
+ +{
+ +	return SEQ_MULTIPLIER * seq + id;
+ +}
+ +
+ +static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int uid)
+++=======
++ static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int id)
+++>>>>>>> 27c331a17461 (ipc/util.c: further variable name cleanups)
+  {
+- 	return uid / SEQ_MULTIPLIER != ipcp->seq;
++ 	return ipcid_to_seqx(id) != ipcp->seq;
+  }
+  
+  static inline void ipc_lock_object(struct kern_ipc_perm *perm)
+* Unmerged path include/linux/ipc_namespace.h
+* Unmerged path ipc/msg.c
+* Unmerged path ipc/sem.c
+* Unmerged path ipc/shm.c
+* Unmerged path ipc/util.c
+* Unmerged path ipc/util.h
