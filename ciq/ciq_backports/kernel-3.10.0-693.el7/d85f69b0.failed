@@ -1,0 +1,147 @@
+mm/hugetlb: alloc_huge_page handle areas hole punched by fallocate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb: alloc_huge_page handle areas hole punched by fallocate (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.67%
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit d85f69b0b533ec6d7ac8c21db958c44c6d957c90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d85f69b0.failed
+
+Areas hole punched by fallocate will not have entries in the
+region/reserve map.  However, shared mappings with min_size subpool
+reservations may still have reserved pages.  alloc_huge_page needs to
+handle this special case and do the proper accounting.
+
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d85f69b0b533ec6d7ac8c21db958c44c6d957c90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 7d476c571b34,114ad6ce7030..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1585,43 -1740,57 +1586,72 @@@ static struct page *alloc_huge_page(str
+  
+  	idx = hstate_index(h);
+  	/*
+- 	 * Processes that did not create the mapping will have no
+- 	 * reserves and will not have accounted against subpool
+- 	 * limit. Check that the subpool limit can be made before
+- 	 * satisfying the allocation MAP_NORESERVE mappings may also
+- 	 * need pages and subpool limit allocated allocated if no reserve
+- 	 * mapping overlaps.
++ 	 * Examine the region/reserve map to determine if the process
++ 	 * has a reservation for the page to be allocated.  A return
++ 	 * code of zero indicates a reservation exists (no change).
+  	 */
+- 	chg = vma_needs_reservation(h, vma, addr);
+- 	if (chg < 0)
++ 	map_chg = gbl_chg = vma_needs_reservation(h, vma, addr);
++ 	if (map_chg < 0)
+  		return ERR_PTR(-ENOMEM);
+++<<<<<<< HEAD
+ +	if (chg || avoid_reserve)
+ +		if (hugepage_subpool_get_pages(spool, 1))
+++=======
++ 
++ 	/*
++ 	 * Processes that did not create the mapping will have no
++ 	 * reserves as indicated by the region/reserve map. Check
++ 	 * that the allocation will not exceed the subpool limit.
++ 	 * Allocations for MAP_NORESERVE mappings also need to be
++ 	 * checked against any subpool limit.
++ 	 */
++ 	if (map_chg || avoid_reserve) {
++ 		gbl_chg = hugepage_subpool_get_pages(spool, 1);
++ 		if (gbl_chg < 0) {
++ 			vma_end_reservation(h, vma, addr);
+++>>>>>>> d85f69b0b533 (mm/hugetlb: alloc_huge_page handle areas hole punched by fallocate)
+  			return ERR_PTR(-ENOSPC);
+ -		}
+  
++ 		/*
++ 		 * Even though there was no reservation in the region/reserve
++ 		 * map, there could be reservations associated with the
++ 		 * subpool that can be used.  This would be indicated if the
++ 		 * return value of hugepage_subpool_get_pages() is zero.
++ 		 * However, if avoid_reserve is specified we still avoid even
++ 		 * the subpool reservations.
++ 		 */
++ 		if (avoid_reserve)
++ 			gbl_chg = 1;
++ 	}
++ 
+  	ret = hugetlb_cgroup_charge_cgroup(idx, pages_per_huge_page(h), &h_cg);
+ -	if (ret)
+ -		goto out_subpool_put;
+ -
+ +	if (ret) {
+ +		if (chg || avoid_reserve)
+ +			hugepage_subpool_put_pages(spool, 1);
+ +		return ERR_PTR(-ENOSPC);
+ +	}
+  	spin_lock(&hugetlb_lock);
+- 	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, chg);
++ 	/*
++ 	 * glb_chg is passed to indicate whether or not a page must be taken
++ 	 * from the global free pool (global change).  gbl_chg == 0 indicates
++ 	 * a reservation exists for the allocation.
++ 	 */
++ 	page = dequeue_huge_page_vma(h, vma, addr, avoid_reserve, gbl_chg);
+  	if (!page) {
+  		spin_unlock(&hugetlb_lock);
+ -		page = alloc_buddy_huge_page(h, NUMA_NO_NODE);
+ -		if (!page)
+ -			goto out_uncharge_cgroup;
+ -
+ +		page = __alloc_buddy_huge_page_with_mpol(h, vma, addr);
+ +		if (!page) {
+ +			hugetlb_cgroup_uncharge_cgroup(idx,
+ +						       pages_per_huge_page(h),
+ +						       h_cg);
+ +			if (chg || avoid_reserve)
+ +				hugepage_subpool_put_pages(spool, 1);
+ +			return ERR_PTR(-ENOSPC);
+ +		}
+ +		if (!avoid_reserve && vma_has_reserves(vma, chg)) {
+ +			SetPagePrivate(page);
+ +			h->resv_huge_pages--;
+ +		}
+  		spin_lock(&hugetlb_lock);
+  		list_move(&page->lru, &h->hugepage_activelist);
+  		/* Fall through */
+@@@ -1648,6 -1817,14 +1678,17 @@@
+  		hugetlb_acct_memory(h, -rsv_adjust);
+  	}
+  	return page;
+++<<<<<<< HEAD
+++=======
++ 
++ out_uncharge_cgroup:
++ 	hugetlb_cgroup_uncharge_cgroup(idx, pages_per_huge_page(h), h_cg);
++ out_subpool_put:
++ 	if (map_chg || avoid_reserve)
++ 		hugepage_subpool_put_pages(spool, 1);
++ 	vma_end_reservation(h, vma, addr);
++ 	return ERR_PTR(-ENOSPC);
+++>>>>>>> d85f69b0b533 (mm/hugetlb: alloc_huge_page handle areas hole punched by fallocate)
+  }
+  
+  /*
+* Unmerged path mm/hugetlb.c
