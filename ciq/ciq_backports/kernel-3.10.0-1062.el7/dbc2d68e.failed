@@ -1,0 +1,174 @@
+nfp: flower: handle merge hint messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit dbc2d68edc987cd9941428c0845641c64737c3ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dbc2d68e.failed
+
+If a merge hint is received containing 2 flows that are matched via an
+implicit recirculation (sending to and matching on an internal port), fw
+reports that the flows (called sub_flows) may be able to be combined to a
+single flow.
+
+Add infastructure to accept and process merge hint messages. The actual
+merging of the flows is left as a stub call.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dbc2d68edc987cd9941428c0845641c64737c3ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+index 61e9f4d6e604,2054a2f0bbc4..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+@@@ -233,9 -201,53 +233,53 @@@ nfp_flower_cmsg_portreify_rx(struct nfp
+  	}
+  
+  	atomic_inc(&priv->reify_replies);
+ -	wake_up(&priv->reify_wait_queue);
+ +	wake_up_interruptible(&priv->reify_wait_queue);
+  }
+  
++ static void
++ nfp_flower_cmsg_merge_hint_rx(struct nfp_app *app, struct sk_buff *skb)
++ {
++ 	unsigned int msg_len = nfp_flower_cmsg_get_data_len(skb);
++ 	struct nfp_flower_cmsg_merge_hint *msg;
++ 	struct nfp_fl_payload *sub_flows[2];
++ 	int err, i, flow_cnt;
++ 
++ 	msg = nfp_flower_cmsg_get_data(skb);
++ 	/* msg->count starts at 0 and always assumes at least 1 entry. */
++ 	flow_cnt = msg->count + 1;
++ 
++ 	if (msg_len < struct_size(msg, flow, flow_cnt)) {
++ 		nfp_flower_cmsg_warn(app, "Merge hint ctrl msg too short - %d bytes but expect %ld\n",
++ 				     msg_len, struct_size(msg, flow, flow_cnt));
++ 		return;
++ 	}
++ 
++ 	if (flow_cnt != 2) {
++ 		nfp_flower_cmsg_warn(app, "Merge hint contains %d flows - two are expected\n",
++ 				     flow_cnt);
++ 		return;
++ 	}
++ 
++ 	rtnl_lock();
++ 	for (i = 0; i < flow_cnt; i++) {
++ 		u32 ctx = be32_to_cpu(msg->flow[i].host_ctx);
++ 
++ 		sub_flows[i] = nfp_flower_get_fl_payload_from_ctx(app, ctx);
++ 		if (!sub_flows[i]) {
++ 			nfp_flower_cmsg_warn(app, "Invalid flow in merge hint\n");
++ 			goto err_rtnl_unlock;
++ 		}
++ 	}
++ 
++ 	err = nfp_flower_merge_offloaded_flows(app, sub_flows[0], sub_flows[1]);
++ 	/* Only warn on memory fail. Hint veto will not break functionality. */
++ 	if (err == -ENOMEM)
++ 		nfp_flower_cmsg_warn(app, "Flow merge memory fail.\n");
++ 
++ err_rtnl_unlock:
++ 	rtnl_unlock();
++ }
++ 
+  static void
+  nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
+  {
+@@@ -254,6 -266,12 +298,15 @@@
+  	case NFP_FLOWER_CMSG_TYPE_PORT_MOD:
+  		nfp_flower_cmsg_portmod_rx(app, skb);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case NFP_FLOWER_CMSG_TYPE_MERGE_HINT:
++ 		if (app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MERGE) {
++ 			nfp_flower_cmsg_merge_hint_rx(app, skb);
++ 			break;
++ 		}
++ 		goto err_default;
+++>>>>>>> dbc2d68edc98 (nfp: flower: handle merge hint messages)
+  	case NFP_FLOWER_CMSG_TYPE_NO_NEIGH:
+  		nfp_tunnel_request_route(app, skb);
+  		break;
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,311daffb897d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -260,7 -285,11 +260,15 @@@ void nfp_flower_metadata_cleanup(struc
+  
+  int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+  			enum tc_setup_type type, void *type_data);
+++<<<<<<< HEAD
+ +int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+++=======
++ int nfp_flower_merge_offloaded_flows(struct nfp_app *app,
++ 				     struct nfp_fl_payload *sub_flow1,
++ 				     struct nfp_fl_payload *sub_flow2);
++ int nfp_flower_compile_flow_match(struct nfp_app *app,
++ 				  struct tc_cls_flower_offload *flow,
+++>>>>>>> dbc2d68edc98 (nfp: flower: handle merge hint messages)
+  				  struct nfp_fl_key_ls *key_ls,
+  				  struct net_device *netdev,
+  				  struct nfp_fl_payload *nfp_flow,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 062d7040a0dc..8a2aa8f1c8c9 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -441,6 +441,16 @@ struct nfp_flower_cmsg_portreify {
+ 
+ #define NFP_FLOWER_CMSG_PORTREIFY_INFO_EXIST	BIT(0)
+ 
++/* NFP_FLOWER_CMSG_TYPE_FLOW_MERGE_HINT */
++struct nfp_flower_cmsg_merge_hint {
++	u8 reserved[3];
++	u8 count;
++	struct {
++		__be32 host_ctx;
++		__be64 host_cookie;
++	} __packed flow[0];
++};
++
+ enum nfp_flower_cmsg_port_type {
+ 	NFP_FLOWER_CMSG_PORT_TYPE_UNSPEC =	0x0,
+ 	NFP_FLOWER_CMSG_PORT_TYPE_PHYS_PORT =	0x1,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/offload.c b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 050fdefa9950..c95a825a0ab4 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -457,6 +457,24 @@ err_free_flow:
+ 	return NULL;
+ }
+ 
++/**
++ * nfp_flower_merge_offloaded_flows() - Merge 2 existing flows to single flow.
++ * @app:	Pointer to the APP handle
++ * @sub_flow1:	Initial flow matched to produce merge hint
++ * @sub_flow2:	Post recirculation flow matched in merge hint
++ *
++ * Combines 2 flows (if valid) to a single flow, removing the initial from hw
++ * and offloading the new, merged flow.
++ *
++ * Return: negative value on error, 0 in success.
++ */
++int nfp_flower_merge_offloaded_flows(struct nfp_app *app,
++				     struct nfp_fl_payload *sub_flow1,
++				     struct nfp_fl_payload *sub_flow2)
++{
++	return -EOPNOTSUPP;
++}
++
+ /**
+  * nfp_flower_add_offload() - Adds a new flow to hardware.
+  * @app:	Pointer to the APP handle
