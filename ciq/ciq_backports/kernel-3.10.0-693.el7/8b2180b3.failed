@@ -1,0 +1,123 @@
+xfs: don't invalidate whole file on DAX read/write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8b2180b3bf0338625cab07da6543acb436df9c40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8b2180b3.failed
+
+When we do DAX IO, we try to invalidate the entire page cache held
+on the file. This is incorrect as it will trash the entire mapping
+tree that now tracks dirty state in exceptional entries in the radix
+tree slots.
+
+What we are trying to do is remove cached pages (e.g from reads
+into holes) that sit in the radix tree over the range we are about
+to write to. Hence we should just limit the invalidation to the
+range we are about to overwrite.
+
+	Reported-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 8b2180b3bf0338625cab07da6543acb436df9c40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,e612a0233710..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -869,10 -699,81 +869,85 @@@ out
+  	xfs_rw_iunlock(ip, iolock);
+  
+  	/*
+ -	 * No fallback to buffered IO on errors for XFS, direct IO will either
+ -	 * complete fully or fail.
+ +	 * No fallback to buffered IO on errors for XFS. DAX can result in
+ +	 * partial writes, but direct IO will either complete fully or fail.
+  	 */
+++<<<<<<< HEAD
+ +	ASSERT(ret < 0 || ret == count || IS_DAX(VFS_I(ip)));
+++=======
++ 	ASSERT(ret < 0 || ret == count);
++ 	return ret;
++ }
++ 
++ static noinline ssize_t
++ xfs_file_dax_write(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*from)
++ {
++ 	struct address_space	*mapping = iocb->ki_filp->f_mapping;
++ 	struct inode		*inode = mapping->host;
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	ssize_t			ret = 0;
++ 	int			unaligned_io = 0;
++ 	int			iolock;
++ 	struct iov_iter		data;
++ 
++ 	/* "unaligned" here means not aligned to a filesystem block */
++ 	if ((iocb->ki_pos & mp->m_blockmask) ||
++ 	    ((iocb->ki_pos + iov_iter_count(from)) & mp->m_blockmask)) {
++ 		unaligned_io = 1;
++ 		iolock = XFS_IOLOCK_EXCL;
++ 	} else if (mapping->nrpages) {
++ 		iolock = XFS_IOLOCK_EXCL;
++ 	} else {
++ 		iolock = XFS_IOLOCK_SHARED;
++ 	}
++ 	xfs_rw_ilock(ip, iolock);
++ 
++ 	ret = xfs_file_aio_write_checks(iocb, from, &iolock);
++ 	if (ret)
++ 		goto out;
++ 
++ 	/*
++ 	 * Yes, even DAX files can have page cache attached to them:  A zeroed
++ 	 * page is inserted into the pagecache when we have to serve a write
++ 	 * fault on a hole.  It should never be dirtied and can simply be
++ 	 * dropped from the pagecache once we get real data for the page.
++ 	 *
++ 	 * XXX: This is racy against mmap, and there's nothing we can do about
++ 	 * it. dax_do_io() should really do this invalidation internally as
++ 	 * it will know if we've allocated over a holei for this specific IO and
++ 	 * if so it needs to update the mapping tree and invalidate existing
++ 	 * PTEs over the newly allocated range. Remove this invalidation when
++ 	 * dax_do_io() is fixed up.
++ 	 */
++ 	if (mapping->nrpages) {
++ 		loff_t end = iocb->ki_pos + iov_iter_count(from) - 1;
++ 
++ 		ret = invalidate_inode_pages2_range(mapping,
++ 						    iocb->ki_pos >> PAGE_SHIFT,
++ 						    end >> PAGE_SHIFT);
++ 		WARN_ON_ONCE(ret);
++ 	}
++ 
++ 	if (iolock == XFS_IOLOCK_EXCL && !unaligned_io) {
++ 		xfs_rw_ilock_demote(ip, XFS_IOLOCK_EXCL);
++ 		iolock = XFS_IOLOCK_SHARED;
++ 	}
++ 
++ 	trace_xfs_file_dax_write(ip, iov_iter_count(from), iocb->ki_pos);
++ 
++ 	data = *from;
++ 	ret = dax_do_io(iocb, inode, &data, xfs_get_blocks_direct,
++ 			xfs_end_io_direct_write, 0);
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(from, ret);
++ 	}
++ out:
++ 	xfs_rw_iunlock(ip, iolock);
+++>>>>>>> 8b2180b3bf03 (xfs: don't invalidate whole file on DAX read/write)
+  	return ret;
+  }
+  
+* Unmerged path fs/xfs/xfs_file.c
