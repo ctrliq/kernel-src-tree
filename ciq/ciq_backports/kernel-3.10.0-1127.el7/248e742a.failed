@@ -1,0 +1,309 @@
+Drivers: hv: vmbus: Implement Direct Mode for stimer0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [hv] hv: vmbus: Implement Direct Mode for stimer0 (Vitaly Kuznetsov) [1712344]
+Rebuild_FUZZ: 90.72%
+commit-author Michael Kelley <mhkelley@outlook.com>
+commit 248e742a396e7f00b283f1c56e14b1bef6e3ec56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/248e742a.failed
+
+The 2016 version of Hyper-V offers the option to operate the guest VM
+per-vcpu stimer's in Direct Mode, which means the timer interupts on its
+own vector rather than queueing a VMbus message. Direct Mode reduces
+timer processing overhead in both the hypervisor and the guest, and
+avoids having timer interrupts pollute the VMbus interrupt stream for
+the synthetic NIC and storage.  This patch enables Direct Mode by
+default on stimer0 when running on a version of Hyper-V that supports
+it.
+
+In prep for coming support of Hyper-V on ARM64, the arch independent
+portion of the code contains calls to routines that will be populated
+on ARM64 but are not needed and do nothing on x86.
+
+	Signed-off-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 248e742a396e7f00b283f1c56e14b1bef6e3ec56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/entry_32.S
+#	arch/x86/entry/entry_64.S
+#	arch/x86/include/asm/hardirq.h
+#	arch/x86/include/asm/irq_vectors.h
+#	arch/x86/kernel/cpu/mshyperv.c
+#	arch/x86/kernel/irq.c
+#	drivers/hv/hv.c
+diff --cc arch/x86/include/asm/hardirq.h
+index e87df1cc441d,5ea2afd4c871..000000000000
+--- a/arch/x86/include/asm/hardirq.h
++++ b/arch/x86/include/asm/hardirq.h
+@@@ -33,6 -32,16 +33,19 @@@ typedef struct 
+  #ifdef CONFIG_X86_MCE_THRESHOLD
+  	unsigned int irq_threshold_count;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_MCE_AMD
++ 	unsigned int irq_deferred_error_count;
++ #endif
++ #if IS_ENABLED(CONFIG_HYPERV) || defined(CONFIG_XEN)
++ 	unsigned int irq_hv_callback_count;
++ #endif
++ #if IS_ENABLED(CONFIG_HYPERV)
++ 	unsigned int irq_hv_reenlightenment_count;
++ 	unsigned int hyperv_stimer0_count;
++ #endif
+++>>>>>>> 248e742a396e (Drivers: hv: vmbus: Implement Direct Mode for stimer0)
+  } ____cacheline_aligned irq_cpustat_t;
+  
+  DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+diff --cc arch/x86/include/asm/irq_vectors.h
+index 7e778ba8466e,404c5fdff859..000000000000
+--- a/arch/x86/include/asm/irq_vectors.h
++++ b/arch/x86/include/asm/irq_vectors.h
+@@@ -120,12 -102,14 +120,23 @@@
+  #define POSTED_INTR_NESTED_VECTOR	0xf0
+  #endif
+  
+++<<<<<<< HEAD
+ +/*
+ + * Local APIC timer IRQ vector is on a different priority level,
+ + * to work around the 'lost local interrupt if more than 2 IRQ
+ + * sources per level' errata.
+ + */
+ +#define LOCAL_TIMER_VECTOR		0xef
+++=======
++ #define MANAGED_IRQ_SHUTDOWN_VECTOR	0xef
++ 
++ #if IS_ENABLED(CONFIG_HYPERV)
++ #define HYPERV_REENLIGHTENMENT_VECTOR	0xee
++ #define HYPERV_STIMER0_VECTOR		0xed
++ #endif
++ 
++ #define LOCAL_TIMER_VECTOR		0xec
+++>>>>>>> 248e742a396e (Drivers: hv: vmbus: Implement Direct Mode for stimer0)
+  
+  #define NR_VECTORS			 256
+  
+diff --cc arch/x86/kernel/cpu/mshyperv.c
+index 1ebbbde703db,4488cf0dd499..000000000000
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@@ -34,6 -35,9 +34,12 @@@
+  struct ms_hyperv_info ms_hyperv;
+  EXPORT_SYMBOL_GPL(ms_hyperv);
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_HYPERV)
++ static void (*vmbus_handler)(void);
++ static void (*hv_stimer0_handler)(void);
+++>>>>>>> 248e742a396e (Drivers: hv: vmbus: Implement Direct Mode for stimer0)
+  static void (*hv_kexec_handler)(void);
+  static void (*hv_crash_handler)(struct pt_regs *regs);
+  
+@@@ -249,18 -285,18 +290,22 @@@ static void __init ms_hyperv_init_platf
+  	 */
+  	x86_platform.apic_post_init = hyperv_init;
+  	hyperv_setup_mmu_ops();
+ -	/* Setup the IDT for hypervisor callback */
+ -	alloc_intr_gate(HYPERVISOR_CALLBACK_VECTOR, hyperv_callback_vector);
+  
+ -	/* Setup the IDT for reenlightenment notifications */
+ -	if (ms_hyperv.features & HV_X64_ACCESS_REENLIGHTENMENT)
+ -		alloc_intr_gate(HYPERV_REENLIGHTENMENT_VECTOR,
+ -				hyperv_reenlightenment_vector);
+ +	/*
+ +	 * Hyper-V doesn't provide irq remapping for IO-APIC. To enable x2apic,
+ +	 * set x2apic destination mode to physcial mode when x2apic is available
+ +	 * and Hyper-V IOMMU driver makes sure cpus assigned with IO-APIC irqs
+ +	 * have 8-bit APIC id.
+ +	 */
+ +# ifdef CONFIG_X86_X2APIC
+ +	if (x2apic_supported())
+ +		x2apic_phys = 1;
+ +# endif
+  
++ 	/* Setup the IDT for stimer0 */
++ 	if (ms_hyperv.misc_features & HV_X64_STIMER_DIRECT_MODE_AVAILABLE)
++ 		alloc_intr_gate(HYPERV_STIMER0_VECTOR,
++ 				hv_stimer0_callback_vector);
+  #endif
+  }
+  
+diff --cc arch/x86/kernel/irq.c
+index fde69cfa1ec4,328d027d829d..000000000000
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@@ -137,9 -138,26 +137,29 @@@ int arch_show_interrupts(struct seq_fil
+  		seq_printf(p, "%*s: ", prec, "HYP");
+  		for_each_online_cpu(j)
+  			seq_printf(p, "%10u ",
+ -				   irq_stats(j)->irq_hv_callback_count);
+ -		seq_puts(p, "  Hypervisor callback interrupts\n");
+ +				   rh_irq_stats(j)->irq_hv_callback_count);
+ +		seq_printf(p, "  Hypervisor callback interrupts\n");
+  	}
+++<<<<<<< HEAD
+++=======
++ #endif
++ #if IS_ENABLED(CONFIG_HYPERV)
++ 	if (test_bit(HYPERV_REENLIGHTENMENT_VECTOR, system_vectors)) {
++ 		seq_printf(p, "%*s: ", prec, "HRE");
++ 		for_each_online_cpu(j)
++ 			seq_printf(p, "%10u ",
++ 				   irq_stats(j)->irq_hv_reenlightenment_count);
++ 		seq_puts(p, "  Hyper-V reenlightenment interrupts\n");
++ 	}
++ 	if (test_bit(HYPERV_STIMER0_VECTOR, system_vectors)) {
++ 		seq_printf(p, "%*s: ", prec, "HVS");
++ 		for_each_online_cpu(j)
++ 			seq_printf(p, "%10u ",
++ 				   irq_stats(j)->hyperv_stimer0_count);
++ 		seq_puts(p, "  Hyper-V stimer0 interrupts\n");
++ 	}
++ #endif
+++>>>>>>> 248e742a396e (Drivers: hv: vmbus: Implement Direct Mode for stimer0)
+  	seq_printf(p, "%*s: %10u\n", prec, "ERR", atomic_read(&irq_err_count));
+  #if defined(CONFIG_X86_IO_APIC)
+  	seq_printf(p, "%*s: %10u\n", prec, "MIS", atomic_read(&irq_mis_count));
+diff --cc drivers/hv/hv.c
+index 48c7cee5b844,b1f6793acf4c..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -104,31 -132,41 +132,69 @@@ static int hv_ce_set_next_event(unsigne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void hv_ce_setmode(enum clock_event_mode mode,
+ +			  struct clock_event_device *evt)
+ +{
+ +	union hv_timer_config timer_cfg;
+ +
+ +	switch (mode) {
+ +	case CLOCK_EVT_MODE_PERIODIC:
+ +		/* unsupported */
+ +		break;
+ +
+ +	case CLOCK_EVT_MODE_ONESHOT:
+ +		timer_cfg.enable = 1;
+ +		timer_cfg.auto_enable = 1;
+ +		timer_cfg.sintx = VMBUS_MESSAGE_SINT;
+ +		hv_init_timer_config(HV_X64_MSR_STIMER0_CONFIG, timer_cfg.as_uint64);
+ +		break;
+ +
+ +	case CLOCK_EVT_MODE_UNUSED:
+ +	case CLOCK_EVT_MODE_SHUTDOWN:
+ +		hv_init_timer(HV_X64_MSR_STIMER0_COUNT, 0);
+ +		hv_init_timer_config(HV_X64_MSR_STIMER0_CONFIG, 0);
+ +		break;
+ +	case CLOCK_EVT_MODE_RESUME:
+ +		break;
+ +	}
+++=======
++ static int hv_ce_shutdown(struct clock_event_device *evt)
++ {
++ 	hv_init_timer(HV_X64_MSR_STIMER0_COUNT, 0);
++ 	hv_init_timer_config(HV_X64_MSR_STIMER0_CONFIG, 0);
++ 	if (direct_mode_enabled)
++ 		hv_disable_stimer0_percpu_irq(stimer0_irq);
++ 
++ 	return 0;
++ }
++ 
++ static int hv_ce_set_oneshot(struct clock_event_device *evt)
++ {
++ 	union hv_timer_config timer_cfg;
++ 
++ 	timer_cfg.as_uint64 = 0;
++ 	timer_cfg.enable = 1;
++ 	timer_cfg.auto_enable = 1;
++ 	if (direct_mode_enabled) {
++ 		/*
++ 		 * When it expires, the timer will directly interrupt
++ 		 * on the specified hardware vector/IRQ.
++ 		 */
++ 		timer_cfg.direct_mode = 1;
++ 		timer_cfg.apic_vector = stimer0_vector;
++ 		hv_enable_stimer0_percpu_irq(stimer0_irq);
++ 	} else {
++ 		/*
++ 		 * When it expires, the timer will generate a VMbus message,
++ 		 * to be handled by the normal VMbus interrupt handler.
++ 		 */
++ 		timer_cfg.direct_mode = 0;
++ 		timer_cfg.sintx = VMBUS_MESSAGE_SINT;
++ 	}
++ 	hv_init_timer_config(HV_X64_MSR_STIMER0_CONFIG, timer_cfg.as_uint64);
++ 	return 0;
+++>>>>>>> 248e742a396e (Drivers: hv: vmbus: Implement Direct Mode for stimer0)
+  }
+  
+  static void hv_init_clockevent_device(struct clock_event_device *dev, int cpu)
+* Unmerged path arch/x86/entry/entry_32.S
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/entry/entry_32.S
+* Unmerged path arch/x86/entry/entry_64.S
+* Unmerged path arch/x86/include/asm/hardirq.h
+* Unmerged path arch/x86/include/asm/irq_vectors.h
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index 619dd920be70..98cbf8b5c748 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -171,6 +171,19 @@ void hv_remove_kexec_handler(void);
+ void hv_setup_crash_handler(void (*handler)(struct pt_regs *regs));
+ void hv_remove_crash_handler(void);
+ 
++/*
++ * Routines for stimer0 Direct Mode handling.
++ * On x86/x64, there are no percpu actions to take.
++ */
++void hv_stimer0_vector_handler(struct pt_regs *regs);
++void hv_stimer0_callback_vector(void);
++int hv_setup_stimer0_irq(int *irq, int *vector, void (*handler)(void));
++void hv_remove_stimer0_irq(int irq);
++
++static inline void hv_enable_stimer0_percpu_irq(int irq) {}
++static inline void hv_disable_stimer0_percpu_irq(int irq) {}
++
++
+ #if IS_ENABLED(CONFIG_HYPERV)
+ extern struct clocksource *hyperv_cs;
+ extern void *hv_hypercall_pg;
+diff --git a/arch/x86/include/uapi/asm/hyperv.h b/arch/x86/include/uapi/asm/hyperv.h
+index d4862fbb78fe..44f024cc954a 100644
+--- a/arch/x86/include/uapi/asm/hyperv.h
++++ b/arch/x86/include/uapi/asm/hyperv.h
+@@ -73,6 +73,9 @@
+ /* Crash MSR available */
+ #define HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE (1 << 10)
+ 
++/* stimer Direct Mode is available */
++#define HV_X64_STIMER_DIRECT_MODE_AVAILABLE	(1 << 19)
++
+ /*
+  * Feature identification: EBX indicates which flags were specified at
+  * partition creation. The format is the same as the partition creation
+* Unmerged path arch/x86/kernel/cpu/mshyperv.c
+* Unmerged path arch/x86/kernel/irq.c
+* Unmerged path drivers/hv/hv.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 03b09bd6514d..beecba709f09 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -57,7 +57,9 @@ union hv_timer_config {
+ 		u64 periodic:1;
+ 		u64 lazy:1;
+ 		u64 auto_enable:1;
+-		u64 reserved_z0:12;
++		u64 apic_vector:8;
++		u64 direct_mode:1;
++		u64 reserved_z0:3;
+ 		u64 sintx:4;
+ 		u64 reserved_z1:44;
+ 	};
