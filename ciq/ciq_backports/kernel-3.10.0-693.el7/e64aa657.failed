@@ -1,0 +1,187 @@
+target: enhance and export target_alloc_sgl/target_free_sgl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [target] enhance and export target_alloc_sgl/target_free_sgl (Don Dutile) [1417284]
+Rebuild_FUZZ: 92.73%
+commit-author Christoph Hellwig <hch@lst.de>
+commit e64aa657c3d0dae84c2ccc166f6fe25b7d1d28c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e64aa657.failed
+
+The SRP target driver will need to allocate and chain it's own SGLs soon.
+For this export target_alloc_sgl, and add a new argument to it so that it
+can allocate an additional chain entry that doesn't point to a page.  Also
+export transport_free_sgl after renaming it to target_free_sgl to free
+these SGLs again.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e64aa657c3d0dae84c2ccc166f6fe25b7d1d28c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_transport.c
+#	include/target/target_core_fabric.h
+diff --cc drivers/target/target_core_transport.c
+index 86700d5e9a81,590384a2bf8b..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -2098,6 -2225,12 +2099,15 @@@ static inline void transport_reset_sgl_
+  
+  static inline void transport_free_pages(struct se_cmd *cmd)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (!(cmd->se_cmd_flags & SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC)) {
++ 		target_free_sgl(cmd->t_prot_sg, cmd->t_prot_nents);
++ 		cmd->t_prot_sg = NULL;
++ 		cmd->t_prot_nents = 0;
++ 	}
++ 
+++>>>>>>> e64aa657c3d0 (target: enhance and export target_alloc_sgl/target_free_sgl)
+  	if (cmd->se_cmd_flags & SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC) {
+  		/*
+  		 * Release special case READ buffer payload required for
+@@@ -2118,13 -2251,9 +2128,13 @@@
+  	cmd->t_data_sg = NULL;
+  	cmd->t_data_nents = 0;
+  
+- 	transport_free_sgl(cmd->t_bidi_data_sg, cmd->t_bidi_data_nents);
++ 	target_free_sgl(cmd->t_bidi_data_sg, cmd->t_bidi_data_nents);
+  	cmd->t_bidi_data_sg = NULL;
+  	cmd->t_bidi_data_nents = 0;
+ +
+ +	transport_free_sgl(cmd->t_prot_sg, cmd->t_prot_nents);
+ +	cmd->t_prot_sg = NULL;
+ +	cmd->t_prot_nents = 0;
+  }
+  
+  /**
+@@@ -2263,6 -2377,14 +2276,17 @@@ transport_generic_new_cmd(struct se_cm
+  	int ret = 0;
+  	bool zero_flag = !(cmd->se_cmd_flags & SCF_SCSI_DATA_CDB);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cmd->prot_op != TARGET_PROT_NORMAL &&
++ 	    !(cmd->se_cmd_flags & SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC)) {
++ 		ret = target_alloc_sgl(&cmd->t_prot_sg, &cmd->t_prot_nents,
++ 				       cmd->prot_length, true, false);
++ 		if (ret < 0)
++ 			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 	}
++ 
+++>>>>>>> e64aa657c3d0 (target: enhance and export target_alloc_sgl/target_free_sgl)
+  	/*
+  	 * Determine is the TCM fabric module has already allocated physical
+  	 * memory, and is directly calling transport_generic_map_mem_to_cmd()
+@@@ -2288,16 -2410,8 +2312,16 @@@
+  				return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  		}
+  
+ +		if (cmd->prot_op != TARGET_PROT_NORMAL) {
+ +			ret = target_alloc_sgl(&cmd->t_prot_sg,
+ +					       &cmd->t_prot_nents,
+ +					       cmd->prot_length, true);
+ +			if (ret < 0)
+ +				return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ +		}
+ +
+  		ret = target_alloc_sgl(&cmd->t_data_sg, &cmd->t_data_nents,
+- 				       cmd->data_length, zero_flag);
++ 				       cmd->data_length, zero_flag, false);
+  		if (ret < 0)
+  			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  	} else if ((cmd->se_cmd_flags & SCF_COMPARE_AND_WRITE) &&
+diff --cc include/target/target_core_fabric.h
+index e21dbdb0fe3d,78d88f03b296..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -142,47 -175,19 +142,53 @@@ int	transport_lookup_tmr_lun(struct se_
+  
+  struct se_node_acl *core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
+  		unsigned char *);
+ -bool	target_tpg_has_node_acl(struct se_portal_group *tpg,
+ -		const char *);
+  struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
+  		unsigned char *);
+ -int	core_tpg_set_initiator_node_queue_depth(struct se_node_acl *, u32);
+ +void	core_tpg_clear_object_luns(struct se_portal_group *);
+ +struct se_node_acl *core_tpg_add_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, const char *, u32);
+ +int	core_tpg_del_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, int);
+ +int	core_tpg_set_initiator_node_queue_depth(struct se_portal_group *,
+ +		unsigned char *, u32, int);
+  int	core_tpg_set_initiator_node_tag(struct se_portal_group *,
+  		struct se_node_acl *, const char *);
+ -int	core_tpg_register(struct se_wwn *, struct se_portal_group *, int);
+ +int	core_tpg_register(struct target_core_fabric_ops *, struct se_wwn *,
+ +		struct se_portal_group *, void *, int);
+  int	core_tpg_deregister(struct se_portal_group *);
+  
+++<<<<<<< HEAD
+ +/* SAS helpers */
+ +u8	sas_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	sas_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	sas_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*sas_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+ +
+ +/* FC helpers */
+ +u8	fc_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	fc_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	fc_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*fc_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+ +
+ +/* iSCSI helpers */
+ +u8	iscsi_get_fabric_proto_ident(struct se_portal_group *);
+ +u32	iscsi_get_pr_transport_id(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *, unsigned char *);
+ +u32	iscsi_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *,
+ +		struct t10_pr_registration *, int *);
+ +char	*iscsi_parse_pr_out_transport_id(struct se_portal_group *, const char *,
+ +		u32 *, char **);
+++=======
++ int	target_alloc_sgl(struct scatterlist **sgl, unsigned int *nents,
++ 		u32 length, bool zero_page, bool chainable);
++ void	target_free_sgl(struct scatterlist *sgl, int nents);
+++>>>>>>> e64aa657c3d0 (target: enhance and export target_alloc_sgl/target_free_sgl)
+  
+  /*
+   * The LIO target core uses DMA_TO_DEVICE to mean that data is going
+* Unmerged path drivers/target/target_core_transport.c
+diff --git a/drivers/target/target_core_xcopy.c b/drivers/target/target_core_xcopy.c
+index 33ac39bf75e5..1d2421a126a3 100644
+--- a/drivers/target/target_core_xcopy.c
++++ b/drivers/target/target_core_xcopy.c
+@@ -608,7 +608,7 @@ static int target_xcopy_setup_pt_cmd(
+ 
+ 	if (alloc_mem) {
+ 		rc = target_alloc_sgl(&cmd->t_data_sg, &cmd->t_data_nents,
+-				      cmd->data_length, false);
++				      cmd->data_length, false, false);
+ 		if (rc < 0) {
+ 			ret = rc;
+ 			goto out;
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index d61be7297b2c..9a5bd0994191 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -101,7 +101,6 @@ int	transport_set_vpd_ident(struct t10_vpd *, unsigned char *);
+ void	*transport_kmap_data_sg(struct se_cmd *);
+ void	transport_kunmap_data_sg(struct se_cmd *);
+ /* core helpers also used by xcopy during internal command setup */
+-int	target_alloc_sgl(struct scatterlist **, unsigned int *, u32, bool);
+ sense_reason_t	transport_generic_map_mem_to_cmd(struct se_cmd *,
+ 		struct scatterlist *, u32, struct scatterlist *, u32);
+ 
+* Unmerged path include/target/target_core_fabric.h
