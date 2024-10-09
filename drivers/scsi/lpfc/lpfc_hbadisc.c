@@ -893,6 +893,8 @@ lpfc_linkdown(struct lpfc_hba *phba)
 	/* Block all SCSI stack I/Os */
 	lpfc_scsi_dev_block(phba);
 
+	phba->defer_flogi_acc_flag = false;
+
 	spin_lock_irq(&phba->hbalock);
 	phba->fcf.fcf_flag &= ~(FCF_AVAILABLE | FCF_SCAN_DONE);
 	spin_unlock_irq(&phba->hbalock);
@@ -1039,6 +1041,11 @@ lpfc_linkup(struct lpfc_hba *phba)
 	spin_lock_irq(shost->host_lock);
 	phba->pport->rcv_flogi_cnt = 0;
 	spin_unlock_irq(shost->host_lock);
+
+	/* reinitialize initial FLOGI flag */
+	phba->hba_flag &= ~(HBA_FLOGI_ISSUED);
+	phba->defer_flogi_acc_flag = false;
+
 	return 0;
 }
 
