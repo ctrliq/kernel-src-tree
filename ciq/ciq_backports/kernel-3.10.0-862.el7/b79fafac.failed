@@ -1,0 +1,344 @@
+target: make queue_tm_rsp() return void
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] make queue_tm_rsp() return void (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 88.57%
+commit-author Joern Engel <joern@logfs.org>
+commit b79fafac70fc9bbe640b8193ed772eb850efdfe6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b79fafac.failed
+
+The return value wasn't checked by any of the callers.  Assuming this is
+correct behaviour, we can simplify some code by not bothering to
+generate it.
+
+nab: Add srpt_queue_data_in() + srpt_queue_tm_rsp() nops around
+     srpt_queue_response() void return
+
+	Signed-off-by: Joern Engel <joern@logfs.org>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit b79fafac70fc9bbe640b8193ed772eb850efdfe6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/target/iscsi/iscsi_target_configfs.c
+#	drivers/target/loopback/tcm_loop.c
+#	drivers/target/sbp/sbp_target.c
+#	drivers/target/tcm_fc/tcm_fc.h
+#	drivers/target/tcm_fc/tfc_cmd.c
+#	include/target/target_core_fabric.h
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 72146d165e84,653ac6bfc57a..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -2299,17 -3013,17 +2299,22 @@@ static u8 tcm_to_srp_tsk_mgmt_status(co
+   */
+  static void srpt_queue_response(struct se_cmd *cmd)
+  {
+ -	struct srpt_rdma_ch *ch;
+ -	struct srpt_send_ioctx *ioctx;
+ +	struct srpt_send_ioctx *ioctx =
+ +		container_of(cmd, struct srpt_send_ioctx, cmd);
+ +	struct srpt_rdma_ch *ch = ioctx->ch;
+ +	struct srpt_device *sdev = ch->sport->sdev;
+ +	struct ib_send_wr send_wr, *first_wr = &send_wr, *bad_wr;
+ +	struct ib_sge sge;
+  	enum srpt_command_state state;
+  	unsigned long flags;
+ -	int ret;
+ -	enum dma_data_direction dir;
+ -	int resp_len;
+ +	int resp_len, ret, i;
+  	u8 srp_tm_status;
+  
+++<<<<<<< HEAD
+++=======
++ 	ioctx = container_of(cmd, struct srpt_send_ioctx, cmd);
++ 	ch = ioctx->ch;
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  	BUG_ON(!ch);
+  
+  	spin_lock_irqsave(&ioctx->spinlock, flags);
+@@@ -2336,15 -3050,16 +2341,23 @@@
+  		return;
+  	}
+  
+ -	dir = ioctx->cmd.data_direction;
+ -
+  	/* For read commands, transfer the data to the initiator. */
+ -	if (dir == DMA_FROM_DEVICE && ioctx->cmd.data_length &&
+ +	if (ioctx->cmd.data_direction == DMA_FROM_DEVICE &&
+ +	    ioctx->cmd.data_length &&
+  	    !ioctx->queue_status_only) {
+++<<<<<<< HEAD
+ +		for (i = ioctx->n_rw_ctx - 1; i >= 0; i--) {
+ +			struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
+ +
+ +			first_wr = rdma_rw_ctx_wrs(&ctx->rw, ch->qp,
+ +					ch->sport->port, NULL, first_wr);
+++=======
++ 		ret = srpt_xfer_data(ch, ioctx);
++ 		if (ret) {
++ 			printk(KERN_ERR "xfer_data failed for tag %llu\n",
++ 			       ioctx->tag);
++ 			return;
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  		}
+  	}
+  
+@@@ -2357,48 -3072,16 +2370,52 @@@
+  		resp_len = srpt_build_tskmgmt_rsp(ch, ioctx, srp_tm_status,
+  						 ioctx->tag);
+  	}
+ -	ret = srpt_post_send(ch, ioctx, resp_len);
+ -	if (ret) {
+ -		printk(KERN_ERR "sending cmd response failed for tag %llu\n",
+ -		       ioctx->tag);
+ -		srpt_unmap_sg_to_ib_sge(ch, ioctx);
+ -		srpt_set_cmd_state(ioctx, SRPT_STATE_DONE);
+ -		target_put_sess_cmd(ioctx->ch->sess, &ioctx->cmd);
+ +
+ +	atomic_inc(&ch->req_lim);
+ +
+ +	if (unlikely(atomic_sub_return(1 + ioctx->n_rdma,
+ +			&ch->sq_wr_avail) < 0)) {
+ +		pr_warn("%s: IB send queue full (needed %d)\n",
+ +				__func__, ioctx->n_rdma);
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+++}
+ +
+++<<<<<<< HEAD
+ +	ib_dma_sync_single_for_device(sdev->device, ioctx->ioctx.dma, resp_len,
+ +				      DMA_TO_DEVICE);
+ +
+ +	sge.addr = ioctx->ioctx.dma;
+ +	sge.length = resp_len;
+ +	sge.lkey = sdev->pd->local_dma_lkey;
+ +
+ +	ioctx->ioctx.cqe.done = srpt_send_done;
+ +	send_wr.next = NULL;
+ +	send_wr.wr_cqe = &ioctx->ioctx.cqe;
+ +	send_wr.sg_list = &sge;
+ +	send_wr.num_sge = 1;
+ +	send_wr.opcode = IB_WR_SEND;
+ +	send_wr.send_flags = IB_SEND_SIGNALED;
+ +
+ +	ret = ib_post_send(ch->qp, first_wr, &bad_wr);
+ +	if (ret < 0) {
+ +		pr_err("%s: sending cmd response failed for tag %llu (%d)\n",
+ +			__func__, ioctx->tag, ret);
+ +		goto out;
+  	}
+ +
+ +	return;
+ +
+ +out:
+ +	atomic_add(1 + ioctx->n_rdma, &ch->sq_wr_avail);
+ +	atomic_dec(&ch->req_lim);
+ +	srpt_set_cmd_state(ioctx, SRPT_STATE_DONE);
+ +	target_put_sess_cmd(&ioctx->cmd);
+  }
+  
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  static int srpt_queue_data_in(struct se_cmd *cmd)
+  {
+  	srpt_queue_response(cmd);
+@@@ -2408,10 -3091,6 +2425,13 @@@
+  static void srpt_queue_tm_rsp(struct se_cmd *cmd)
+  {
+  	srpt_queue_response(cmd);
+++<<<<<<< HEAD
+ +}
+ +
+ +static void srpt_aborted_task(struct se_cmd *cmd)
+ +{
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  }
+  
+  static int srpt_queue_status(struct se_cmd *cmd)
+@@@ -3249,7 -3940,6 +3269,10 @@@ static struct target_core_fabric_ops sr
+  	.queue_data_in			= srpt_queue_data_in,
+  	.queue_status			= srpt_queue_status,
+  	.queue_tm_rsp			= srpt_queue_tm_rsp,
+++<<<<<<< HEAD
+ +	.aborted_task			= srpt_aborted_task,
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  	/*
+  	 * Setup function pointers for generic logic in
+  	 * target_core_fabric_configfs.c
+diff --cc drivers/target/iscsi/iscsi_target_configfs.c
+index e6631abc9d0c,7d4e19f39fe6..000000000000
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@@ -1900,13 -1796,6 +1900,16 @@@ static void lio_queue_tm_rsp(struct se_
+  
+  	cmd->i_state = ISTATE_SEND_TASKMGTRSP;
+  	iscsit_add_cmd_to_response_queue(cmd, cmd->conn, cmd->i_state);
+++<<<<<<< HEAD
+ +}
+ +
+ +static void lio_aborted_task(struct se_cmd *se_cmd)
+ +{
+ +	struct iscsi_cmd *cmd = container_of(se_cmd, struct iscsi_cmd, se_cmd);
+ +
+ +	cmd->conn->conn_transport->iscsit_aborted_task(cmd->conn, cmd);
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  }
+  
+  static char *lio_tpg_get_endpoint_wwn(struct se_portal_group *se_tpg)
+diff --cc drivers/target/loopback/tcm_loop.c
+index 072063c96590,568ad25f25d3..000000000000
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@@ -877,11 -796,6 +877,14 @@@ static void tcm_loop_queue_tm_rsp(struc
+  	 */
+  	atomic_set(&tl_tmr->tmr_complete, 1);
+  	wake_up(&tl_tmr->tl_tmr_wait);
+++<<<<<<< HEAD
+ +}
+ +
+ +static void tcm_loop_aborted_task(struct se_cmd *se_cmd)
+ +{
+ +	return;
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  }
+  
+  static char *tcm_loop_dump_proto_id(struct tcm_loop_hba *tl_hba)
+diff --cc drivers/target/sbp/sbp_target.c
+index 9512af6a8114,e51b09a04d52..000000000000
+--- a/drivers/target/sbp/sbp_target.c
++++ b/drivers/target/sbp/sbp_target.c
+@@@ -1844,11 -1844,6 +1844,14 @@@ static int sbp_queue_status(struct se_c
+  
+  static void sbp_queue_tm_rsp(struct se_cmd *se_cmd)
+  {
+++<<<<<<< HEAD
+ +}
+ +
+ +static void sbp_aborted_task(struct se_cmd *se_cmd)
+ +{
+ +	return;
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  }
+  
+  static int sbp_check_stop_free(struct se_cmd *se_cmd)
+diff --cc drivers/target/tcm_fc/tcm_fc.h
+index a0bcfd3e7e7d,0dd54a44abcf..000000000000
+--- a/drivers/target/tcm_fc/tcm_fc.h
++++ b/drivers/target/tcm_fc/tcm_fc.h
+@@@ -161,7 -162,6 +161,10 @@@ int ft_write_pending_status(struct se_c
+  u32 ft_get_task_tag(struct se_cmd *);
+  int ft_get_cmd_state(struct se_cmd *);
+  void ft_queue_tm_resp(struct se_cmd *);
+++<<<<<<< HEAD
+ +void ft_aborted_task(struct se_cmd *);
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  
+  /*
+   * other internal functions.
+diff --cc drivers/target/tcm_fc/tfc_cmd.c
+index edcafa4490c0,0e5a1caed176..000000000000
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@@ -437,11 -421,6 +437,14 @@@ void ft_queue_tm_resp(struct se_cmd *se
+  	pr_debug("tmr fn %d resp %d fcp code %d\n",
+  		  tmr->function, tmr->response, code);
+  	ft_send_resp_code(cmd, code);
+++<<<<<<< HEAD
+ +}
+ +
+ +void ft_aborted_task(struct se_cmd *se_cmd)
+ +{
+ +	return;
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  }
+  
+  static void ft_send_work(struct work_struct *work);
+diff --cc include/target/target_core_fabric.h
+index 1fde19894921,7a16178424f9..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -62,7 -62,6 +62,10 @@@ struct target_core_fabric_ops 
+  	int (*queue_data_in)(struct se_cmd *);
+  	int (*queue_status)(struct se_cmd *);
+  	void (*queue_tm_rsp)(struct se_cmd *);
+++<<<<<<< HEAD
+ +	void (*aborted_task)(struct se_cmd *);
+++=======
+++>>>>>>> b79fafac70fc (target: make queue_tm_rsp() return void)
+  	/*
+  	 * fabric module calls for target_core_fabric_configfs.c
+  	 */
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index e9c7bfd1510c..0975fb20265b 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -717,7 +717,7 @@ static int tcm_qla2xxx_queue_status(struct se_cmd *se_cmd)
+ 	return qlt_xmit_response(cmd, xmit_type, se_cmd->scsi_status);
+ }
+ 
+-static int tcm_qla2xxx_queue_tm_rsp(struct se_cmd *se_cmd)
++static void tcm_qla2xxx_queue_tm_rsp(struct se_cmd *se_cmd)
+ {
+ 	struct se_tmr_req *se_tmr = se_cmd->se_tmr_req;
+ 	struct qla_tgt_mgmt_cmd *mcmd = container_of(se_cmd,
+@@ -749,8 +749,6 @@ static int tcm_qla2xxx_queue_tm_rsp(struct se_cmd *se_cmd)
+ 	 * CTIO response packet.
+ 	 */
+ 	qlt_xmit_tm_rsp(mcmd);
+-
+-	return 0;
+ }
+ 
+ /* Local pointer to allocated TCM configfs fabric module */
+* Unmerged path drivers/target/iscsi/iscsi_target_configfs.c
+* Unmerged path drivers/target/loopback/tcm_loop.c
+* Unmerged path drivers/target/sbp/sbp_target.c
+* Unmerged path drivers/target/tcm_fc/tcm_fc.h
+* Unmerged path drivers/target/tcm_fc/tfc_cmd.c
+diff --git a/drivers/usb/gadget/tcm_usb_gadget.c b/drivers/usb/gadget/tcm_usb_gadget.c
+index 7cacd6ae818e..0ff33396eef3 100644
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@ -1467,9 +1467,8 @@ static int usbg_get_cmd_state(struct se_cmd *se_cmd)
+ 	return 0;
+ }
+ 
+-static int usbg_queue_tm_rsp(struct se_cmd *se_cmd)
++static void usbg_queue_tm_rsp(struct se_cmd *se_cmd)
+ {
+-	return 0;
+ }
+ 
+ static const char *usbg_check_wwn(const char *name)
+diff --git a/drivers/vhost/scsi.c b/drivers/vhost/scsi.c
+index 65142d377371..3185c8d4e3bc 100644
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -515,9 +515,9 @@ static int tcm_vhost_queue_status(struct se_cmd *se_cmd)
+ 	return 0;
+ }
+ 
+-static int tcm_vhost_queue_tm_rsp(struct se_cmd *se_cmd)
++static void tcm_vhost_queue_tm_rsp(struct se_cmd *se_cmd)
+ {
+-	return 0;
++	return;
+ }
+ 
+ static void tcm_vhost_free_evt(struct vhost_scsi *vs, struct tcm_vhost_evt *evt)
+* Unmerged path include/target/target_core_fabric.h
