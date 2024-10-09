@@ -1,0 +1,144 @@
+bridge: set is_local and is_static before fdb entry is added to the fdb hashtable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit b7af1472afa2228bd9fe8b4cea3b003b4027d72d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b7af1472.failed
+
+Problem Description:
+We can add fdbs pointing to the bridge with NULL ->dst but that has a
+few race conditions because br_fdb_insert() is used which first creates
+the fdb and then, after the fdb has been published/linked, sets
+"is_local" to 1 and in that time frame if a packet arrives for that fdb
+it may see it as non-local and either do a NULL ptr dereference in
+br_forward() or attach the fdb to the port where it arrived, and later
+br_fdb_insert() will make it local thus getting a wrong fdb entry.
+Call chain br_handle_frame_finish() -> br_forward():
+But in br_handle_frame_finish() in order to call br_forward() the dst
+should not be local i.e. skb != NULL, whenever the dst is
+found to be local skb is set to NULL so we can't forward it,
+and here comes the problem since it's running only
+with RCU when forwarding packets it can see the entry before "is_local"
+is set to 1 and actually try to dereference NULL.
+The main issue is that if someone sends a packet to the switch while
+it's adding the entry which points to the bridge device, it may
+dereference NULL ptr. This is needed now after we can add fdbs
+pointing to the bridge.  This poses a problem for
+br_fdb_update() as well, while someone's adding a bridge fdb, but
+before it has is_local == 1, it might get moved to a port if it comes
+as a source mac and then it may get its "is_local" set to 1
+
+This patch changes fdb_create to take is_local and is_static as
+arguments to set these values in the fdb entry before it is added to the
+hash. Also adds null check for port in br_forward.
+
+Fixes: 3741873b4f73 ("bridge: allow adding of fdb entries pointing to the bridge device")
+	Reported-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Reviewed-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Acked-by: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b7af1472afa2228bd9fe8b4cea3b003b4027d72d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_fdb.c
+diff --cc net/bridge/br_fdb.c
+index 46b89ee4408e,a642bb829d09..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -483,9 -506,10 +485,9 @@@ static struct net_bridge_fdb_entry *fdb
+  		memcpy(fdb->addr.addr, addr, ETH_ALEN);
+  		fdb->dst = source;
+  		fdb->vlan_id = vid;
+- 		fdb->is_local = 0;
+- 		fdb->is_static = 0;
++ 		fdb->is_local = is_local;
++ 		fdb->is_static = is_static;
+  		fdb->added_by_user = 0;
+ -		fdb->added_by_external_learn = 0;
+  		fdb->updated = fdb->used = jiffies;
+  		hlist_add_head_rcu(&fdb->hlist, head);
+  	}
+@@@ -988,3 -1086,61 +989,64 @@@ void br_fdb_unsync_static(struct net_br
+  		}
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
++ 			      const unsigned char *addr, u16 vid)
++ {
++ 	struct hlist_head *head;
++ 	struct net_bridge_fdb_entry *fdb;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 	spin_lock_bh(&br->hash_lock);
++ 
++ 	head = &br->hash[br_mac_hash(addr, vid)];
++ 	fdb = fdb_find(head, addr, vid);
++ 	if (!fdb) {
++ 		fdb = fdb_create(head, p, addr, vid, 0, 0);
++ 		if (!fdb) {
++ 			err = -ENOMEM;
++ 			goto err_unlock;
++ 		}
++ 		fdb->added_by_external_learn = 1;
++ 		fdb_notify(br, fdb, RTM_NEWNEIGH);
++ 	} else if (fdb->added_by_external_learn) {
++ 		/* Refresh entry */
++ 		fdb->updated = fdb->used = jiffies;
++ 	} else if (!fdb->added_by_user) {
++ 		/* Take over SW learned entry */
++ 		fdb->added_by_external_learn = 1;
++ 		fdb->updated = jiffies;
++ 		fdb_notify(br, fdb, RTM_NEWNEIGH);
++ 	}
++ 
++ err_unlock:
++ 	spin_unlock_bh(&br->hash_lock);
++ 
++ 	return err;
++ }
++ 
++ int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
++ 			      const unsigned char *addr, u16 vid)
++ {
++ 	struct hlist_head *head;
++ 	struct net_bridge_fdb_entry *fdb;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 	spin_lock_bh(&br->hash_lock);
++ 
++ 	head = &br->hash[br_mac_hash(addr, vid)];
++ 	fdb = fdb_find(head, addr, vid);
++ 	if (fdb && fdb->added_by_external_learn)
++ 		fdb_delete(br, fdb);
++ 	else
++ 		err = -ENOENT;
++ 
++ 	spin_unlock_bh(&br->hash_lock);
++ 
++ 	return err;
++ }
+++>>>>>>> b7af1472afa2 (bridge: set is_local and is_static before fdb entry is added to the fdb hashtable)
+* Unmerged path net/bridge/br_fdb.c
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+index 20c11b41fe6a..077c920b346e 100644
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -138,7 +138,7 @@ EXPORT_SYMBOL_GPL(br_deliver);
+ /* called with rcu_read_lock */
+ void br_forward(const struct net_bridge_port *to, struct sk_buff *skb, struct sk_buff *skb0)
+ {
+-	if (should_deliver(to, skb)) {
++	if (to && should_deliver(to, skb)) {
+ 		if (skb0)
+ 			deliver_clone(to, skb, __br_forward);
+ 		else
