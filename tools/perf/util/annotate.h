@@ -200,7 +200,7 @@ struct cyc_hist {
 
 /** struct annotated_source - symbols with hits have this attached as in sannotation
  *
- * @histogram: Array of addr hit histograms per event being monitored
+ * @histograms: Array of addr hit histograms per event being monitored
  * @lines: If 'print_lines' is specified, per source code line percentages
  * @source: source parsed from a disassembler like objdump -dS
  * @cyc_hist: Average cycles per basic block
@@ -216,7 +216,7 @@ struct annotated_source {
 	int    		   nr_histograms;
 	size_t		   sizeof_sym_hist;
 	struct cyc_hist	   *cycles_hist;
-	struct sym_hist	   histograms[0];
+	struct sym_hist	   *histograms;
 };
 
 struct annotation {
@@ -268,7 +268,7 @@ void annotation__init_column_widths(struct annotation *notes, struct symbol *sym
 
 static inline struct sym_hist *annotation__histogram(struct annotation *notes, int idx)
 {
-	return (((void *)&notes->src->histograms) +
+	return (((void *)notes->src->histograms) +
 	 	(notes->src->sizeof_sym_hist * idx));
 }
 
