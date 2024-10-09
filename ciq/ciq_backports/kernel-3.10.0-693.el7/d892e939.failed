@@ -1,0 +1,255 @@
+drm/i915: Pass timeout==0 on to i915_gem_object_wait_fence()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Pass timeout==0 on to i915_gem_object_wait_fence() (Rob Clark) [1422186]
+Rebuild_FUZZ: 96.55%
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit d892e9398ecf6defc7972a62227b77dad6be20bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d892e939.failed
+
+The i915_gem_object_wait_fence() uses an incoming timeout=0 to query
+whether the current fence is busy or idle, without waiting. This can be
+used by the wait-ioctl to implement a busy query.
+
+Fixes: e95433c73a11 ("drm/i915: Rearrange i915_wait_request() accounting with callers")
+Testcase: igt/gem_wait/basic-busy-write-all
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Matthew Auld <matthew.william.auld@gmail.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: <drm-intel-fixes@lists.freedesktop.org> # v4.10-rc1+
+	Cc: stable@vger.kernel.org
+Link: http://patchwork.freedesktop.org/patch/msgid/20170212215344.16600-1-chris@chris-wilson.co.uk
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+(cherry picked from commit d892e9398ecf6defc7972a62227b77dad6be20bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index 6fdaedc1cdbc,71297920fdf4..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -282,6 -350,216 +282,219 @@@ drop_pages(struct drm_i915_gem_object *
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static long
++ i915_gem_object_wait_fence(struct dma_fence *fence,
++ 			   unsigned int flags,
++ 			   long timeout,
++ 			   struct intel_rps_client *rps)
++ {
++ 	struct drm_i915_gem_request *rq;
++ 
++ 	BUILD_BUG_ON(I915_WAIT_INTERRUPTIBLE != 0x1);
++ 
++ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
++ 		return timeout;
++ 
++ 	if (!dma_fence_is_i915(fence))
++ 		return dma_fence_wait_timeout(fence,
++ 					      flags & I915_WAIT_INTERRUPTIBLE,
++ 					      timeout);
++ 
++ 	rq = to_request(fence);
++ 	if (i915_gem_request_completed(rq))
++ 		goto out;
++ 
++ 	/* This client is about to stall waiting for the GPU. In many cases
++ 	 * this is undesirable and limits the throughput of the system, as
++ 	 * many clients cannot continue processing user input/output whilst
++ 	 * blocked. RPS autotuning may take tens of milliseconds to respond
++ 	 * to the GPU load and thus incurs additional latency for the client.
++ 	 * We can circumvent that by promoting the GPU frequency to maximum
++ 	 * before we wait. This makes the GPU throttle up much more quickly
++ 	 * (good for benchmarks and user experience, e.g. window animations),
++ 	 * but at a cost of spending more power processing the workload
++ 	 * (bad for battery). Not all clients even want their results
++ 	 * immediately and for them we should just let the GPU select its own
++ 	 * frequency to maximise efficiency. To prevent a single client from
++ 	 * forcing the clocks too high for the whole system, we only allow
++ 	 * each client to waitboost once in a busy period.
++ 	 */
++ 	if (rps) {
++ 		if (INTEL_GEN(rq->i915) >= 6)
++ 			gen6_rps_boost(rq->i915, rps, rq->emitted_jiffies);
++ 		else
++ 			rps = NULL;
++ 	}
++ 
++ 	timeout = i915_wait_request(rq, flags, timeout);
++ 
++ out:
++ 	if (flags & I915_WAIT_LOCKED && i915_gem_request_completed(rq))
++ 		i915_gem_request_retire_upto(rq);
++ 
++ 	if (rps && rq->global_seqno == intel_engine_last_submit(rq->engine)) {
++ 		/* The GPU is now idle and this client has stalled.
++ 		 * Since no other client has submitted a request in the
++ 		 * meantime, assume that this client is the only one
++ 		 * supplying work to the GPU but is unable to keep that
++ 		 * work supplied because it is waiting. Since the GPU is
++ 		 * then never kept fully busy, RPS autoclocking will
++ 		 * keep the clocks relatively low, causing further delays.
++ 		 * Compensate by giving the synchronous client credit for
++ 		 * a waitboost next time.
++ 		 */
++ 		spin_lock(&rq->i915->rps.client_lock);
++ 		list_del_init(&rps->link);
++ 		spin_unlock(&rq->i915->rps.client_lock);
++ 	}
++ 
++ 	return timeout;
++ }
++ 
++ static long
++ i915_gem_object_wait_reservation(struct reservation_object *resv,
++ 				 unsigned int flags,
++ 				 long timeout,
++ 				 struct intel_rps_client *rps)
++ {
++ 	struct dma_fence *excl;
++ 
++ 	if (flags & I915_WAIT_ALL) {
++ 		struct dma_fence **shared;
++ 		unsigned int count, i;
++ 		int ret;
++ 
++ 		ret = reservation_object_get_fences_rcu(resv,
++ 							&excl, &count, &shared);
++ 		if (ret)
++ 			return ret;
++ 
++ 		for (i = 0; i < count; i++) {
++ 			timeout = i915_gem_object_wait_fence(shared[i],
++ 							     flags, timeout,
++ 							     rps);
++ 			if (timeout < 0)
++ 				break;
++ 
++ 			dma_fence_put(shared[i]);
++ 		}
++ 
++ 		for (; i < count; i++)
++ 			dma_fence_put(shared[i]);
++ 		kfree(shared);
++ 	} else {
++ 		excl = reservation_object_get_excl_rcu(resv);
++ 	}
++ 
++ 	if (excl && timeout >= 0)
++ 		timeout = i915_gem_object_wait_fence(excl, flags, timeout, rps);
++ 
++ 	dma_fence_put(excl);
++ 
++ 	return timeout;
++ }
++ 
++ static void __fence_set_priority(struct dma_fence *fence, int prio)
++ {
++ 	struct drm_i915_gem_request *rq;
++ 	struct intel_engine_cs *engine;
++ 
++ 	if (!dma_fence_is_i915(fence))
++ 		return;
++ 
++ 	rq = to_request(fence);
++ 	engine = rq->engine;
++ 	if (!engine->schedule)
++ 		return;
++ 
++ 	engine->schedule(rq, prio);
++ }
++ 
++ static void fence_set_priority(struct dma_fence *fence, int prio)
++ {
++ 	/* Recurse once into a fence-array */
++ 	if (dma_fence_is_array(fence)) {
++ 		struct dma_fence_array *array = to_dma_fence_array(fence);
++ 		int i;
++ 
++ 		for (i = 0; i < array->num_fences; i++)
++ 			__fence_set_priority(array->fences[i], prio);
++ 	} else {
++ 		__fence_set_priority(fence, prio);
++ 	}
++ }
++ 
++ int
++ i915_gem_object_wait_priority(struct drm_i915_gem_object *obj,
++ 			      unsigned int flags,
++ 			      int prio)
++ {
++ 	struct dma_fence *excl;
++ 
++ 	if (flags & I915_WAIT_ALL) {
++ 		struct dma_fence **shared;
++ 		unsigned int count, i;
++ 		int ret;
++ 
++ 		ret = reservation_object_get_fences_rcu(obj->resv,
++ 							&excl, &count, &shared);
++ 		if (ret)
++ 			return ret;
++ 
++ 		for (i = 0; i < count; i++) {
++ 			fence_set_priority(shared[i], prio);
++ 			dma_fence_put(shared[i]);
++ 		}
++ 
++ 		kfree(shared);
++ 	} else {
++ 		excl = reservation_object_get_excl_rcu(obj->resv);
++ 	}
++ 
++ 	if (excl) {
++ 		fence_set_priority(excl, prio);
++ 		dma_fence_put(excl);
++ 	}
++ 	return 0;
++ }
++ 
++ /**
++  * Waits for rendering to the object to be completed
++  * @obj: i915 gem object
++  * @flags: how to wait (under a lock, for all rendering or just for writes etc)
++  * @timeout: how long to wait
++  * @rps: client (user process) to charge for any waitboosting
++  */
++ int
++ i915_gem_object_wait(struct drm_i915_gem_object *obj,
++ 		     unsigned int flags,
++ 		     long timeout,
++ 		     struct intel_rps_client *rps)
++ {
++ 	might_sleep();
++ #if IS_ENABLED(CONFIG_LOCKDEP)
++ 	GEM_BUG_ON(debug_locks &&
++ 		   !!lockdep_is_held(&obj->base.dev->struct_mutex) !=
++ 		   !!(flags & I915_WAIT_LOCKED));
++ #endif
++ 	GEM_BUG_ON(timeout < 0);
++ 
++ 	timeout = i915_gem_object_wait_reservation(obj->resv,
++ 						   flags, timeout,
++ 						   rps);
++ 	return timeout < 0 ? timeout : 0;
++ }
++ 
++ static struct intel_rps_client *to_rps_client(struct drm_file *file)
++ {
++ 	struct drm_i915_file_private *fpriv = file->driver_priv;
++ 
++ 	return &fpriv->rps;
++ }
++ 
+++>>>>>>> d892e9398ecf (drm/i915: Pass timeout==0 on to i915_gem_object_wait_fence())
+  int
+  i915_gem_object_attach_phys(struct drm_i915_gem_object *obj,
+  			    int align)
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
