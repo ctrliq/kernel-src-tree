@@ -1,0 +1,326 @@
+start carving bsd_acct_struct up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 1629d0eb3ead0e0c49e4402049ec7b5b31b81cd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1629d0eb.failed
+
+pull generic parts into struct fs_pin.  Eventually we want those
+to replace mnt_pin()/mnt_unpin() mess; that stuff will move to
+fs/*.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 1629d0eb3ead0e0c49e4402049ec7b5b31b81cd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/acct.c
+diff --cc kernel/acct.c
+index 7ffb48430dba,afeaaa6f49bf..000000000000
+--- a/kernel/acct.c
++++ b/kernel/acct.c
+@@@ -77,18 -78,34 +77,42 @@@ int acct_parm[3] = {4, 2, 30}
+   */
+  static void do_acct_process(struct bsd_acct_struct *acct);
+  
+++<<<<<<< HEAD
+ +struct bsd_acct_struct {
+ +	long			count;
+++=======
++ struct fs_pin {
++ 	atomic_long_t		count;
++ 	union {
++ 		struct {
++ 			struct hlist_node	s_list;
++ 			struct hlist_node	m_list;
++ 		};
++ 		struct rcu_head rcu;
++ 	};
++ };
++ 
++ struct bsd_acct_struct {
++ 	struct fs_pin		pin;
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  	struct mutex		lock;
+  	int			active;
+  	unsigned long		needcheck;
+  	struct file		*file;
+  	struct pid_namespace	*ns;
+ -	struct work_struct	work;
+ -	struct completion	done;
+ +	struct list_head	list;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void pin_free_rcu(struct rcu_head *head)
++ {
++ 	kfree(container_of(head, struct fs_pin, rcu));
++ }
++ 
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  static DEFINE_SPINLOCK(acct_lock);
+ +static LIST_HEAD(acct_list);
+  
+  /*
+   * Check the amount of free space and suspend/resume accordingly.
+@@@ -147,39 -138,47 +171,64 @@@ static int check_free_space(struct bsd_
+  	}
+  
+  	acct->needcheck = jiffies + ACCT_TIMEOUT*HZ;
+ +	res = acct->active;
+  out:
+ -	return acct->active;
+ +	spin_unlock(&acct_lock);
+ +	return res;
+  }
+  
+- static void acct_put(struct bsd_acct_struct *p)
++ static void pin_put(struct fs_pin *p)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&acct_lock);
+ +	if (!--p->count)
+ +		kfree(p);
+ +	spin_unlock(&acct_lock);
+ +}
+ +
+ +static struct bsd_acct_struct *acct_get(struct bsd_acct_struct **p)
+++=======
++ 	if (atomic_long_dec_and_test(&p->count))
++ 		call_rcu(&p->rcu, pin_free_rcu);
++ }
++ 
++ static struct bsd_acct_struct *__acct_get(struct bsd_acct_struct *res)
++ {
++ 	if (!atomic_long_inc_not_zero(&res->pin.count)) {
++ 		rcu_read_unlock();
++ 		cpu_relax();
++ 		return NULL;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_lock(&res->lock);
++ 	if (!res->ns) {
++ 		mutex_unlock(&res->lock);
++ 		pin_put(&res->pin);
++ 		return NULL;
++ 	}
++ 	return res;
++ }
++ 
++ static struct bsd_acct_struct *acct_get(struct pid_namespace *ns)
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  {
+  	struct bsd_acct_struct *res;
+ +	spin_lock(&acct_lock);
+  again:
+ -	smp_rmb();
+ -	rcu_read_lock();
+ -	res = ACCESS_ONCE(ns->bacct);
+ -	if (!res) {
+ -		rcu_read_unlock();
+ -		return NULL;
+ +	res = *p;
+ +	if (res)
+ +		res->count++;
+ +	spin_unlock(&acct_lock);
+ +	if (res) {
+ +		mutex_lock(&res->lock);
+ +		if (!res->ns) {
+ +			mutex_unlock(&res->lock);
+ +			spin_lock(&acct_lock);
+ +			if (!--res->count)
+ +				kfree(res);
+ +			goto again;
+ +		}
+  	}
+ -	res = __acct_get(res);
+ -	if (!res)
+ -		goto again;
+  	return res;
+  }
+  
+@@@ -187,25 -197,29 +236,44 @@@ static void acct_kill(struct bsd_acct_s
+  		      struct bsd_acct_struct *new)
+  {
+  	if (acct) {
+ +		struct file *file = acct->file;
+  		struct pid_namespace *ns = acct->ns;
+ -		do_acct_process(acct);
+ -		INIT_WORK(&acct->work, close_work);
+ -		init_completion(&acct->done);
+ -		schedule_work(&acct->work);
+ -		wait_for_completion(&acct->done);
+  		spin_lock(&acct_lock);
+++<<<<<<< HEAD
+ +		list_del(&acct->list);
+ +		mnt_unpin(file->f_path.mnt);
+++=======
++ 		hlist_del(&acct->pin.m_list);
++ 		hlist_del(&acct->pin.s_list);
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  		spin_unlock(&acct_lock);
+ +		do_acct_process(acct);
+ +		filp_close(file, NULL);
+ +		spin_lock(&acct_lock);
+  		ns->bacct = new;
+  		if (new) {
+++<<<<<<< HEAD
+ +			mnt_pin(new->file->f_path.mnt);
+ +			list_add(&new->list, &acct_list);
+ +		}
+ +		acct->ns = NULL;
+ +		mutex_unlock(&acct->lock);
+ +		if (!(acct->count -= 2))
+ +			kfree(acct);
+ +		spin_unlock(&acct_lock);
+++=======
++ 			struct vfsmount *m = new->file->f_path.mnt;
++ 			spin_lock(&acct_lock);
++ 			hlist_add_head(&new->pin.s_list, &m->mnt_sb->s_pins);
++ 			hlist_add_head(&new->pin.m_list, &real_mount(m)->mnt_pins);
++ 			spin_unlock(&acct_lock);
++ 			mutex_unlock(&new->lock);
++ 		}
++ 		acct->ns = NULL;
++ 		atomic_long_dec(&acct->pin.count);
++ 		mutex_unlock(&acct->lock);
++ 		pin_put(&acct->pin);
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  	}
+  }
+  
+@@@ -239,7 -253,7 +307,11 @@@ static int acct_on(struct filename *pat
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+ +	acct->count = 1;
+++=======
++ 	atomic_long_set(&acct->pin.count, 1);
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  	acct->file = file;
+  	acct->needcheck = jiffies;
+  	acct->ns = ns;
+@@@ -250,11 -266,12 +322,16 @@@
+  	if (old) {
+  		acct_kill(old, acct);
+  	} else {
+ -		ns->bacct = acct;
+  		spin_lock(&acct_lock);
+++<<<<<<< HEAD
+ +		ns->bacct = acct;
+ +		mnt_pin(mnt);
+ +		list_add(&acct->list, &acct_list);
+++=======
++ 		hlist_add_head(&acct->pin.s_list, &mnt->mnt_sb->s_pins);
++ 		hlist_add_head(&acct->pin.m_list, &real_mount(mnt)->mnt_pins);
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  		spin_unlock(&acct_lock);
+ -		mutex_unlock(&acct->lock);
+  	}
+  	mntput(mnt); /* it's pinned, now give up active reference */
+  	return 0;
+@@@ -291,68 -312,34 +368,96 @@@ SYSCALL_DEFINE1(acct, const char __use
+  	return error;
+  }
+  
+ -void acct_auto_close_mnt(struct hlist_head *list)
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @m: vfsmount being shut down
+ + *
+ + * If the accounting is turned on for a file in the subtree pointed to
+ + * to by m, turn accounting off.  Done when m is about to die.
+ + */
+ +void acct_auto_close_mnt(struct vfsmount *m)
+  {
+++<<<<<<< HEAD
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.mnt == m) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+++=======
++ 	rcu_read_lock();
++ 	while (1) {
++ 		struct hlist_node *p = ACCESS_ONCE(list->first);
++ 		if (!p)
++ 			break;
++ 		acct_kill(__acct_get(hlist_entry(p,
++ 						 struct bsd_acct_struct,
++ 						 pin.m_list)), NULL);
++ 		rcu_read_lock();
++ 	}
++ 	rcu_read_unlock();
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  }
+  
+ -void acct_auto_close(struct hlist_head *list)
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @sb: super block for the filesystem
+ + *
+ + * If the accounting is turned on for a file in the filesystem pointed
+ + * to by sb, turn accounting off.
+ + */
+ +void acct_auto_close(struct super_block *sb)
+  {
+++<<<<<<< HEAD
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.dentry->d_sb == sb) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+++=======
++ 	rcu_read_lock();
++ 	while (1) {
++ 		struct hlist_node *p = ACCESS_ONCE(list->first);
++ 		if (!p)
++ 			break;
++ 		acct_kill(__acct_get(hlist_entry(p,
++ 						 struct bsd_acct_struct,
++ 						 pin.s_list)), NULL);
++ 		rcu_read_lock();
++ 	}
++ 	rcu_read_unlock();
+++>>>>>>> 1629d0eb3ead (start carving bsd_acct_struct up)
+  }
+  
+  void acct_exit_ns(struct pid_namespace *ns)
+* Unmerged path kernel/acct.c
