@@ -1,0 +1,337 @@
+nfp: store device pointer for the fastpath
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit fa43d2a895e61defdd32f6ed825740bd2f08106c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fa43d2a8.failed
+
+We really only need the device pointer on the fast path, stash it at
+the beginning of the adapter structure and move pci_dev pointer down.
+This saves up a few lines of code.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fa43d2a895e61defdd32f6ed825740bd2f08106c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 17869d0ebe76,397d9e82ed0e..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -967,39 -1022,46 +964,61 @@@ static void nfp_net_tx_complete(struct 
+  static void
+  nfp_net_tx_ring_reset(struct nfp_net *nn, struct nfp_net_tx_ring *tx_ring)
+  {
+ -	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
+  	const struct skb_frag_struct *frag;
+  	struct netdev_queue *nd_q;
+ +	struct pci_dev *pdev = nn->pdev;
+  
+  	while (tx_ring->rd_p != tx_ring->wr_p) {
+ -		struct nfp_net_tx_buf *tx_buf;
+ -		int idx;
+ +		int nr_frags, fidx, idx;
+ +		struct sk_buff *skb;
+  
+  		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
+ -		tx_buf = &tx_ring->txbufs[idx];
+ +		skb = tx_ring->txbufs[idx].skb;
+ +		nr_frags = skb_shinfo(skb)->nr_frags;
+ +		fidx = tx_ring->txbufs[idx].fidx;
+  
+ -		if (tx_ring == r_vec->xdp_ring) {
+ -			nfp_net_dma_unmap_rx(nn, tx_buf->dma_addr,
+ -					     nn->fl_bufsz, DMA_BIDIRECTIONAL);
+ -			__free_page(virt_to_page(tx_ring->txbufs[idx].frag));
+ +		if (fidx == -1) {
+ +			/* unmap head */
+ +			dma_unmap_single(&pdev->dev,
+ +					 tx_ring->txbufs[idx].dma_addr,
+ +					 skb_headlen(skb), DMA_TO_DEVICE);
+  		} else {
+++<<<<<<< HEAD
+ +			/* unmap fragment */
+ +			frag = &skb_shinfo(skb)->frags[fidx];
+ +			dma_unmap_page(&pdev->dev,
+ +				       tx_ring->txbufs[idx].dma_addr,
+ +				       skb_frag_size(frag), DMA_TO_DEVICE);
+++=======
++ 			struct sk_buff *skb = tx_ring->txbufs[idx].skb;
++ 			int nr_frags = skb_shinfo(skb)->nr_frags;
++ 
++ 			if (tx_buf->fidx == -1) {
++ 				/* unmap head */
++ 				dma_unmap_single(nn->dev, tx_buf->dma_addr,
++ 						 skb_headlen(skb),
++ 						 DMA_TO_DEVICE);
++ 			} else {
++ 				/* unmap fragment */
++ 				frag = &skb_shinfo(skb)->frags[tx_buf->fidx];
++ 				dma_unmap_page(nn->dev, tx_buf->dma_addr,
++ 					       skb_frag_size(frag),
++ 					       DMA_TO_DEVICE);
++ 			}
++ 
++ 			/* check for last gather fragment */
++ 			if (tx_buf->fidx == nr_frags - 1)
++ 				dev_kfree_skb_any(skb);
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  		}
+  
+ -		tx_buf->dma_addr = 0;
+ -		tx_buf->skb = NULL;
+ -		tx_buf->fidx = -2;
+ +		/* check for last gather fragment */
+ +		if (fidx == nr_frags - 1)
+ +			dev_kfree_skb_any(skb);
+ +
+ +		tx_ring->txbufs[idx].dma_addr = 0;
+ +		tx_ring->txbufs[idx].skb = NULL;
+ +		tx_ring->txbufs[idx].fidx = -2;
+  
+  		tx_ring->qcp_rd_p++;
+  		tx_ring->rd_p++;
+@@@ -1071,9 -1150,11 +1090,17 @@@ nfp_net_rx_alloc_one(struct nfp_net_rx_
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	*dma_addr = nfp_net_dma_map_rx(nn, frag, fl_bufsz, DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&nn->pdev->dev, *dma_addr)) {
+ +		skb_free_frag(frag);
+++=======
++ 	direction = xdp ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
++ 
++ 	*dma_addr = nfp_net_dma_map_rx(nn, frag, fl_bufsz, direction);
++ 	if (dma_mapping_error(nn->dev, *dma_addr)) {
++ 		nfp_net_free_frag(frag, xdp);
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  		nn_warn_ratelimit(nn, "Failed to map DMA RX buffer\n");
+  		return NULL;
+  	}
+@@@ -1091,9 -1176,9 +1118,15 @@@ static void *nfp_net_napi_alloc_one(str
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	*dma_addr = nfp_net_dma_map_rx(nn, frag, nn->fl_bufsz, DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&nn->pdev->dev, *dma_addr)) {
+ +		skb_free_frag(frag);
+++=======
++ 	*dma_addr = nfp_net_dma_map_rx(nn, frag, nn->fl_bufsz, direction);
++ 	if (dma_mapping_error(nn->dev, *dma_addr)) {
++ 		nfp_net_free_frag(frag, nn->xdp_prog);
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  		nn_warn_ratelimit(nn, "Failed to map DMA RX buffer\n");
+  		return NULL;
+  	}
+@@@ -1351,6 -1461,69 +1384,72 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net *nn, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int pkt_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	dma_addr_t new_dma_addr;
++ 	void *new_frag;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 
++ 	new_frag = nfp_net_napi_alloc_one(nn, DMA_BIDIRECTIONAL, &new_dma_addr);
++ 	if (unlikely(!new_frag)) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 	nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(nn->dev, rxbuf->dma_addr + pkt_off,
++ 				   pkt_len, DMA_BIDIRECTIONAL);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + pkt_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->l4_offset = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, unsigned int len)
++ {
++ 	struct xdp_buff xdp;
++ 
++ 	xdp.data = data;
++ 	xdp.data_end = data + len;
++ 
++ 	return bpf_prog_run_xdp(prog, &xdp);
++ }
++ 
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1420,7 -1603,36 +1519,40 @@@ static int nfp_net_rx(struct nfp_net_rx
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  nn->bpf_offload_xdp)) {
++ 			int act;
++ 
++ 			dma_sync_single_for_cpu(nn->dev,
++ 						rxbuf->dma_addr + pkt_off,
++ 						pkt_len, DMA_BIDIRECTIONAL);
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag + data_off,
++ 					      pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (unlikely(!nfp_net_tx_xdp_buf(nn, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 pkt_off, pkt_len)))
++ 					trace_xdp_exception(nn->netdev, xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(nn->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  		if (unlikely(!skb)) {
+  			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+@@@ -2712,7 -3145,25 +2841,29 @@@ void nfp_net_netdev_free(struct nfp_ne
+   */
+  static void nfp_net_rss_init(struct nfp_net *nn)
+  {
+++<<<<<<< HEAD
+ +	netdev_rss_key_fill(nn->rss_key, NFP_NET_CFG_RSS_KEY_SZ);
+++=======
++ 	unsigned long func_bit, rss_cap_hfunc;
++ 	u32 reg;
++ 
++ 	/* Read the RSS function capability and select first supported func */
++ 	reg = nn_readl(nn, NFP_NET_CFG_RSS_CAP);
++ 	rss_cap_hfunc =	FIELD_GET(NFP_NET_CFG_RSS_CAP_HFUNC, reg);
++ 	if (!rss_cap_hfunc)
++ 		rss_cap_hfunc =	FIELD_GET(NFP_NET_CFG_RSS_CAP_HFUNC,
++ 					  NFP_NET_CFG_RSS_TOEPLITZ);
++ 
++ 	func_bit = find_first_bit(&rss_cap_hfunc, NFP_NET_CFG_RSS_HFUNCS);
++ 	if (func_bit == NFP_NET_CFG_RSS_HFUNCS) {
++ 		dev_warn(nn->dev,
++ 			 "Bad RSS config, defaulting to Toeplitz hash\n");
++ 		func_bit = ETH_RSS_HASH_TOP_BIT;
++ 	}
++ 	nn->rss_hfunc = 1 << func_bit;
++ 
++ 	netdev_rss_key_fill(nn->rss_key, nfp_net_rss_key_sz(nn));
+++>>>>>>> fa43d2a895e6 (nfp: store device pointer for the fastpath)
+  
+  	nfp_net_rss_init_itbl(nn);
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da..129cd01d44fa 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -419,7 +419,7 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
+ 
+ /**
+  * struct nfp_net - NFP network device structure
+- * @pdev:               Backpointer to PCI device
++ * @dev:		Backpointer to struct device
+  * @netdev:             Backpointer to net_device structure
+  * @is_vf:              Is the driver attached to a VF?
+  * @fw_loaded:          Is the firmware loaded?
+@@ -471,10 +471,11 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
+  * @debugfs_dir:	Device directory in debugfs
+  * @ethtool_dump_flag:	Ethtool dump flag
+  * @port_list:		Entry on device port list
++ * @pdev:		Backpointer to PCI device
+  * @cpp:		CPP device handle if available
+  */
+ struct nfp_net {
+-	struct pci_dev *pdev;
++	struct device *dev;
+ 	struct net_device *netdev;
+ 
+ 	unsigned is_vf:1;
+@@ -552,6 +553,7 @@ struct nfp_net {
+ 
+ 	struct list_head port_list;
+ 
++	struct pci_dev *pdev;
+ 	struct nfp_cpp *cpp;
+ };
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 3afcdc11480c..ba12867bf03c 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -141,8 +141,7 @@ nfp_net_get_mac_addr_hwinfo(struct nfp_net *nn, struct nfp_cpp *cpp,
+ 
+ 	mac_str = nfp_hwinfo_lookup(cpp, name);
+ 	if (!mac_str) {
+-		dev_warn(&nn->pdev->dev,
+-			 "Can't lookup MAC address. Generate\n");
++		dev_warn(nn->dev, "Can't lookup MAC address. Generate\n");
+ 		eth_hw_addr_random(nn->netdev);
+ 		return;
+ 	}
+@@ -150,7 +149,7 @@ nfp_net_get_mac_addr_hwinfo(struct nfp_net *nn, struct nfp_cpp *cpp,
+ 	if (sscanf(mac_str, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
+ 		   &mac_addr[0], &mac_addr[1], &mac_addr[2],
+ 		   &mac_addr[3], &mac_addr[4], &mac_addr[5]) != 6) {
+-		dev_warn(&nn->pdev->dev,
++		dev_warn(nn->dev,
+ 			 "Can't parse MAC address (%s). Generate.\n", mac_str);
+ 		eth_hw_addr_random(nn->netdev);
+ 		return;
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_offload.c
