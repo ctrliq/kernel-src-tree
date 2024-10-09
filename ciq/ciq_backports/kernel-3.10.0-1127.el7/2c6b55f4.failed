@@ -1,0 +1,89 @@
+ipv6: fix neighbour resolution with raw socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 2c6b55f45d53420d8310d41310e0e2cd41fe073f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2c6b55f4.failed
+
+The scenario is the following: the user uses a raw socket to send an ipv6
+packet, destinated to a not-connected network, and specify a connected nh.
+Here is the corresponding python script to reproduce this scenario:
+
+ import socket
+ IPPROTO_RAW = 255
+ send_s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, IPPROTO_RAW)
+ # scapy
+ # p = IPv6(src='fd00:100::1', dst='fd00:200::fa')/ICMPv6EchoRequest()
+ # str(p)
+ req = b'`\x00\x00\x00\x00\x08:@\xfd\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xfd\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfa\x80\x00\x81\xc0\x00\x00\x00\x00'
+ send_s.sendto(req, ('fd00:175::2', 0, 0, 0))
+
+fd00:175::/64 is a connected route and fd00:200::fa is not a connected
+host.
+
+With this scenario, the kernel starts by sending a NS to resolve
+fd00:175::2. When it receives the NA, it flushes its queue and try to send
+the initial packet. But instead of sending it, it sends another NS to
+resolve fd00:200::fa, which obvioulsy fails, thus the packet is dropped. If
+the user sends again the packet, it now uses the right nh (fd00:175::2).
+
+The problem is that ip6_dst_lookup_neigh() uses the rt6i_gateway, which is
+:: because the associated route is a connected route, thus it uses the dst
+addr of the packet. Let's use rt6_nexthop() to choose the right nh.
+
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2c6b55f45d53420d8310d41310e0e2cd41fe073f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/route.c
+diff --cc net/ipv6/route.c
+index 1e005c00b52a,97a843cf164c..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -201,18 -196,30 +201,34 @@@ static inline const void *choose_neigh_
+  	return daddr;
+  }
+  
+ -struct neighbour *ip6_neigh_lookup(const struct in6_addr *gw,
+ -				   struct net_device *dev,
+ -				   struct sk_buff *skb,
+ -				   const void *daddr)
+ +static struct neighbour *ip6_neigh_lookup(const struct dst_entry *dst,
+ +					  struct sk_buff *skb,
+ +					  const void *daddr)
+  {
+ +	struct rt6_info *rt = (struct rt6_info *) dst;
+  	struct neighbour *n;
+  
+ -	daddr = choose_neigh_daddr(gw, skb, daddr);
+ -	n = __ipv6_neigh_lookup(dev, daddr);
+ +	daddr = choose_neigh_daddr(rt, skb, daddr);
+ +	n = __ipv6_neigh_lookup(dst->dev, daddr);
+  	if (n)
+  		return n;
+++<<<<<<< HEAD
+ +	return neigh_create(&nd_tbl, daddr, dst->dev);
+++=======
++ 
++ 	n = neigh_create(&nd_tbl, daddr, dev);
++ 	return IS_ERR(n) ? NULL : n;
++ }
++ 
++ static struct neighbour *ip6_dst_neigh_lookup(const struct dst_entry *dst,
++ 					      struct sk_buff *skb,
++ 					      const void *daddr)
++ {
++ 	const struct rt6_info *rt = container_of(dst, struct rt6_info, dst);
++ 
++ 	return ip6_neigh_lookup(rt6_nexthop(rt, &in6addr_any),
++ 				dst->dev, skb, daddr);
+++>>>>>>> 2c6b55f45d53 (ipv6: fix neighbour resolution with raw socket)
+  }
+  
+  static void ip6_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+* Unmerged path net/ipv6/route.c
