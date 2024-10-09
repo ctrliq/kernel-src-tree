@@ -1,0 +1,184 @@
+x86/boot/KASLR: Prefer mirrored memory regions for the kernel physical address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Baoquan He <bhe@redhat.com>
+commit c05cd79750fbe5415cda896bb99350603cc995ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c05cd797.failed
+
+Currently KASLR will parse all e820 entries of RAM type and add all
+candidate positions into the slots array. After that we choose one slot
+randomly as the new position which the kernel will be decompressed into
+and run at.
+
+On systems with EFI enabled, e820 memory regions are coming from EFI
+memory regions by combining adjacent regions.
+
+These EFI memory regions have various attributes, and the "mirrored"
+attribute is one of them. The physical memory region whose descriptors
+in EFI memory map has EFI_MEMORY_MORE_RELIABLE attribute (bit: 16) are
+mirrored. The address range mirroring feature of the kernel arranges such
+mirrored regions into normal zones and other regions into movable zones.
+
+With the mirroring feature enabled, the code and data of the kernel can only
+be located in the more reliable mirrored regions. However, the current KASLR
+code doesn't check EFI memory entries, and could choose a new kernel position
+in non-mirrored regions. This will break the intended functionality of the
+address range mirroring feature.
+
+To fix this, if EFI is detected, iterate EFI memory map and pick the mirrored
+region to process for adding candidate of randomization slot. If EFI is disabled
+or no mirrored region found, still process the e820 memory map.
+
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ard.biesheuvel@linaro.org
+	Cc: fanc.fnst@cn.fujitsu.com
+	Cc: izumi.taku@jp.fujitsu.com
+	Cc: keescook@chromium.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: matt@codeblueprint.co.uk
+	Cc: n-horiguchi@ah.jp.nec.com
+	Cc: thgarnie@google.com
+Link: http://lkml.kernel.org/r/1502722464-20614-3-git-send-email-bhe@redhat.com
+[ Rewrote most of the text. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c05cd79750fbe5415cda896bb99350603cc995ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr.c
+diff --cc arch/x86/boot/compressed/kaslr.c
+index b93f968ac8d4,7de23bb279ce..000000000000
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@@ -562,31 -560,104 +564,123 @@@ static void process_e820_entry(struct e
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_EFI
++ /*
++  * Returns true if mirror region found (and must have been processed
++  * for slots adding)
++  */
++ static bool
++ process_efi_entries(unsigned long minimum, unsigned long image_size)
++ {
++ 	struct efi_info *e = &boot_params->efi_info;
++ 	bool efi_mirror_found = false;
++ 	struct mem_vector region;
++ 	efi_memory_desc_t *md;
++ 	unsigned long pmap;
++ 	char *signature;
++ 	u32 nr_desc;
++ 	int i;
++ 
++ 	signature = (char *)&e->efi_loader_signature;
++ 	if (strncmp(signature, EFI32_LOADER_SIGNATURE, 4) &&
++ 	    strncmp(signature, EFI64_LOADER_SIGNATURE, 4))
++ 		return false;
++ 
++ #ifdef CONFIG_X86_32
++ 	/* Can't handle data above 4GB at this time */
++ 	if (e->efi_memmap_hi) {
++ 		warn("EFI memmap is above 4GB, can't be handled now on x86_32. EFI should be disabled.\n");
++ 		return false;
++ 	}
++ 	pmap =  e->efi_memmap;
++ #else
++ 	pmap = (e->efi_memmap | ((__u64)e->efi_memmap_hi << 32));
++ #endif
++ 
++ 	nr_desc = e->efi_memmap_size / e->efi_memdesc_size;
++ 	for (i = 0; i < nr_desc; i++) {
++ 		md = efi_early_memdesc_ptr(pmap, e->efi_memdesc_size, i);
++ 		if (md->attribute & EFI_MEMORY_MORE_RELIABLE) {
++ 			region.start = md->phys_addr;
++ 			region.size = md->num_pages << EFI_PAGE_SHIFT;
++ 			process_mem_region(&region, minimum, image_size);
++ 			efi_mirror_found = true;
++ 
++ 			if (slot_area_index == MAX_SLOT_AREA) {
++ 				debug_putstr("Aborted EFI scan (slot_areas full)!\n");
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	return efi_mirror_found;
++ }
++ #else
++ static inline bool
++ process_efi_entries(unsigned long minimum, unsigned long image_size)
++ {
++ 	return false;
++ }
++ #endif
++ 
++ static void process_e820_entries(unsigned long minimum,
++ 				 unsigned long image_size)
++ {
++ 	int i;
++ 	struct mem_vector region;
++ 	struct boot_e820_entry *entry;
++ 
++ 	/* Verify potential e820 positions, appending to slots list. */
++ 	for (i = 0; i < boot_params->e820_entries; i++) {
++ 		entry = &boot_params->e820_table[i];
++ 		/* Skip non-RAM entries. */
++ 		if (entry->type != E820_TYPE_RAM)
++ 			continue;
++ 		region.start = entry->addr;
++ 		region.size = entry->size;
++ 		process_mem_region(&region, minimum, image_size);
++ 		if (slot_area_index == MAX_SLOT_AREA) {
++ 			debug_putstr("Aborted e820 scan (slot_areas full)!\n");
++ 			break;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> c05cd79750fb (x86/boot/KASLR: Prefer mirrored memory regions for the kernel physical address)
+  static unsigned long find_random_phys_addr(unsigned long minimum,
+  					   unsigned long image_size)
+  {
+ +	int i;
+ +	unsigned long addr;
+ +
+  	/* Check if we had too many memmaps. */
+  	if (memmap_too_large) {
+- 		debug_putstr("Aborted e820 scan (more than 4 memmap= args)!\n");
++ 		debug_putstr("Aborted memory entries scan (more than 4 memmap= args)!\n");
+  		return 0;
+  	}
+  
+  	/* Make sure minimum is aligned. */
+  	minimum = ALIGN(minimum, CONFIG_PHYSICAL_ALIGN);
+  
+++<<<<<<< HEAD
+ +	/* Verify potential e820 positions, appending to slots list. */
+ +	for (i = 0; i < boot_params->e820_entries; i++) {
+ +		process_e820_entry(&boot_params->e820_map[i], minimum,
+ +				   image_size);
+ +		if (slot_area_index == MAX_SLOT_AREA) {
+ +			debug_putstr("Aborted e820 scan (slot_areas full)!\n");
+ +			break;
+ +		}
+ +	}
+ +
+++=======
++ 	if (process_efi_entries(minimum, image_size))
++ 		return slots_fetch_random();
++ 
++ 	process_e820_entries(minimum, image_size);
+++>>>>>>> c05cd79750fb (x86/boot/KASLR: Prefer mirrored memory regions for the kernel physical address)
+  	return slots_fetch_random();
+  }
+  
+* Unmerged path arch/x86/boot/compressed/kaslr.c
