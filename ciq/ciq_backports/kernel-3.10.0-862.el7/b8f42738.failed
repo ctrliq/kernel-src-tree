@@ -1,0 +1,200 @@
+IB/hfi1: On error, fix use after free during user context setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit b8f42738acaddf67731c34935c0994e09a588ca7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b8f42738.failed
+
+During base context setup, if setup_base_ctxt() fails, the context is
+deallocated. This is incorrect because the context is referenced on
+return, to notify any waiting subcontext.  If there are no subcontexts
+the pointer will be invalid.
+
+Reorganize the error path so that deallocate_ctxt() is called after all
+the possible subcontexts have been notified.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b8f42738acaddf67731c34935c0994e09a588ca7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 7180c3d1bfd2,d9a1e9893136..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -855,31 -906,40 +855,55 @@@ static int assign_ctxt(struct file *fp
+  
+  	swminor = uinfo->userversion & 0xffff;
+  
+ -	/*
+ -	 * Acquire the mutex to protect against multiple creations of what
+ -	 * could be a shared base context.
+ -	 */
+  	mutex_lock(&hfi1_mutex);
+ -	/*
+ -	 * Get a sub context if available  (fd->uctxt will be set).
+ -	 * ret < 0 error, 0 no context, 1 sub-context found
+ -	 */
+ -	ret = find_sub_ctxt(fd, uinfo);
+ -
+ +	/* First, lets check if we need to setup a shared context? */
+ +	if (uinfo->subctxt_cnt) {
+ +		struct hfi1_filedata *fd = fp->private_data;
+ +
+++<<<<<<< HEAD
+ +		ret = find_shared_ctxt(fp, uinfo);
+ +		if (ret < 0)
+ +			goto done_unlock;
+ +		if (ret) {
+ +			fd->rec_cpu_num =
+ +				hfi1_get_proc_affinity(fd->uctxt->numa_id);
+ +		}
+++=======
++ 	/*
++ 	 * Allocate a base context if context sharing is not required or a
++ 	 * sub context wasn't found.
++ 	 */
++ 	if (!ret)
++ 		ret = allocate_ctxt(fd, fd->dd, uinfo, &uctxt);
++ 
++ 	mutex_unlock(&hfi1_mutex);
++ 
++ 	/* Depending on the context type, finish the appropriate init */
++ 	switch (ret) {
++ 	case 0:
++ 		ret = setup_base_ctxt(fd, uctxt);
++ 		if (ret)
++ 			deallocate_ctxt(uctxt);
++ 		break;
++ 	case 1:
++ 		ret = complete_subctxt(fd);
++ 		break;
++ 	default:
++ 		break;
+++>>>>>>> b8f42738acad (IB/hfi1: On error, fix use after free during user context setup)
+  	}
+  
+ +	/*
+ +	 * We execute the following block if we couldn't find a
+ +	 * shared context or if context sharing is not required.
+ +	 */
+ +	if (!ret) {
+ +		i_minor = iminor(file_inode(fp)) - HFI1_USER_MINOR_BASE;
+ +		ret = get_user_context(fp, uinfo, i_minor);
+ +	}
+ +done_unlock:
+ +	mutex_unlock(&hfi1_mutex);
+ +done:
+  	return ret;
+  }
+  
+@@@ -1224,54 -1293,54 +1248,98 @@@ static int setup_ctxt(struct file *fp
+  	struct hfi1_devdata *dd = uctxt->dd;
+  	int ret = 0;
+  
+ -	hfi1_init_ctxt(uctxt->sc);
+ +	/*
+ +	 * Context should be set up only once, including allocation and
+ +	 * programming of eager buffers. This is done if context sharing
+ +	 * is not requested or by the master process.
+ +	 */
+ +	if (!uctxt->subctxt_cnt || !fd->subctxt) {
+ +		ret = hfi1_init_ctxt(uctxt->sc);
+ +		if (ret)
+ +			goto done;
+ +
+ +		/* Now allocate the RcvHdr queue and eager buffers. */
+ +		ret = hfi1_create_rcvhdrq(dd, uctxt);
+ +		if (ret)
+ +			goto done;
+ +		ret = hfi1_setup_eagerbufs(uctxt);
+ +		if (ret)
+ +			goto done;
+ +		if (uctxt->subctxt_cnt && !fd->subctxt) {
+ +			ret = setup_subctxt(uctxt);
+ +			if (ret)
+ +				goto done;
+ +		}
+ +	} else {
+ +		ret = wait_event_interruptible(uctxt->wait, !test_bit(
+ +					       HFI1_CTXT_MASTER_UNINIT,
+ +					       &uctxt->event_flags));
+ +		if (ret)
+ +			goto done;
+ +	}
+  
+ -	/* Now allocate the RcvHdr queue and eager buffers. */
+ -	ret = hfi1_create_rcvhdrq(dd, uctxt);
+ +	ret = hfi1_user_sdma_alloc_queues(uctxt, fp);
+ +	if (ret)
+ +		goto done;
+++<<<<<<< HEAD
+ +	/*
+ +	 * Expected receive has to be setup for all processes (including
+ +	 * shared contexts). However, it has to be done after the master
+ +	 * context has been fully configured as it depends on the
+ +	 * eager/expected split of the RcvArray entries.
+ +	 * Setting it up here ensures that the subcontexts will be waiting
+ +	 * (due to the above wait_event_interruptible() until the master
+ +	 * is setup.
+ +	 */
+ +	ret = hfi1_user_exp_rcv_init(fp);
+  	if (ret)
+  		goto done;
+++=======
++ 
++ 	ret = hfi1_setup_eagerbufs(uctxt);
++ 	if (ret)
++ 		goto done;
++ 
++ 	/* If sub-contexts are enabled, do the appropriate setup */
++ 	if (uctxt->subctxt_cnt)
++ 		ret = setup_subctxt(uctxt);
++ 	if (ret)
++ 		goto done;
++ 
++ 	ret = hfi1_alloc_ctxt_rcv_groups(uctxt);
++ 	if (ret)
++ 		goto done;
++ 
++ 	ret = init_user_ctxt(fd, uctxt);
++ 	if (ret)
++ 		goto done;
++ 
++ 	user_init(uctxt);
++ 
++ 	/* Now that the context is set up, the fd can get a reference. */
++ 	fd->uctxt = uctxt;
++ 	hfi1_rcd_get(uctxt);
++ 
++ done:
++ 	if (uctxt->subctxt_cnt) {
++ 		/*
++ 		 * On error, set the failed bit so sub-contexts will clean up
++ 		 * correctly.
++ 		 */
++ 		if (ret)
++ 			set_bit(HFI1_CTXT_BASE_FAILED, &uctxt->event_flags);
++ 
++ 		/*
++ 		 * Base context is done (successfully or not), notify anybody
++ 		 * using a sub-context that is waiting for this completion.
++ 		 */
++ 		clear_bit(HFI1_CTXT_BASE_UNINIT, &uctxt->event_flags);
++ 		wake_up(&uctxt->wait);
++ 	}
+++>>>>>>> b8f42738acad (IB/hfi1: On error, fix use after free during user context setup)
+  
+ +	set_bit(HFI1_CTXT_SETUP_DONE, &uctxt->event_flags);
+ +done:
+  	return ret;
+  }
+  
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
