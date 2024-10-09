@@ -1,0 +1,410 @@
+module: preserve Elf information for livepatch modules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jessica Yu <jeyu@redhat.com>
+commit 1ce15ef4f60529cf1313f80f4338c88bd65cc572
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1ce15ef4.failed
+
+For livepatch modules, copy Elf section, symbol, and string information
+from the load_info struct in the module loader. Persist copies of the
+original symbol table and string table.
+
+Livepatch manages its own relocation sections in order to reuse module
+loader code to write relocations. Livepatch modules must preserve Elf
+information such as section indices in order to apply livepatch relocation
+sections using the module loader's apply_relocate_add() function.
+
+In order to apply livepatch relocation sections, livepatch modules must
+keep a complete copy of their original symbol table in memory. Normally, a
+stripped down copy of a module's symbol table (containing only "core"
+symbols) is made available through module->core_symtab. But for livepatch
+modules, the symbol table copied into memory on module load must be exactly
+the same as the symbol table produced when the patch module was compiled.
+This is because the relocations in each livepatch relocation section refer
+to their respective symbols with their symbol indices, and the original
+symbol indices (and thus the symtab ordering) must be preserved in order
+for apply_relocate_add() to find the right symbol.
+
+	Signed-off-by: Jessica Yu <jeyu@redhat.com>
+	Reviewed-by: Miroslav Benes <mbenes@suse.cz>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+	Reviewed-by: Rusty Russell <rusty@rustcorp.com.au>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 1ce15ef4f60529cf1313f80f4338c88bd65cc572)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/module.h
+#	kernel/module.c
+diff --cc include/linux/module.h
+index cb24355b2d5e,3daf2b3a09d2..000000000000
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@@ -236,8 -317,29 +236,34 @@@ struct module_ext 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+ +struct module
+ +{
+++=======
++ #ifdef CONFIG_MODULES_TREE_LOOKUP
++ /* Only touch one cacheline for common rbtree-for-core-layout case. */
++ #define __module_layout_align ____cacheline_aligned
++ #else
++ #define __module_layout_align
++ #endif
++ 
++ struct mod_kallsyms {
++ 	Elf_Sym *symtab;
++ 	unsigned int num_symtab;
++ 	char *strtab;
++ };
++ 
++ #ifdef CONFIG_LIVEPATCH
++ struct klp_modinfo {
++ 	Elf_Ehdr hdr;
++ 	Elf_Shdr *sechdrs;
++ 	char *secstrings;
++ 	unsigned int symndx;
++ };
++ #endif
++ 
++ struct module {
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  	enum module_state state;
+  
+  	/* Member of list of modules */
+@@@ -375,6 -464,14 +401,17 @@@
+  	unsigned long *ftrace_callsites;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_LIVEPATCH
++ 	bool klp; /* Is this a livepatch module? */
++ 	bool klp_alive;
++ 
++ 	/* Elf information */
++ 	struct klp_modinfo *klp_info;
++ #endif
++ 
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  #ifdef CONFIG_MODULE_UNLOAD
+  	/* What modules depend on me? */
+  	struct list_head source_list;
+@@@ -532,8 -638,23 +569,20 @@@ int unregister_module_notifier(struct n
+  
+  extern void print_modules(void);
+  
+ -static inline bool module_requested_async_probing(struct module *module)
+ -{
+ -	return module && module->async_probe_requested;
+ -}
+ +bool check_module_rhelversion(struct module *mod, char *version);
+  
++ #ifdef CONFIG_LIVEPATCH
++ static inline bool is_livepatch_module(struct module *mod)
++ {
++ 	return mod->klp;
++ }
++ #else /* !CONFIG_LIVEPATCH */
++ static inline bool is_livepatch_module(struct module *mod)
++ {
++ 	return false;
++ }
++ #endif /* CONFIG_LIVEPATCH */
++ 
+  #else /* !CONFIG_MODULES... */
+  
+  /* Given an address, look for it in the exception tables. */
+diff --cc kernel/module.c
+index 65af51b1c60d,5f71aa63ed2a..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -1928,14 -1958,99 +1928,95 @@@ void set_all_modules_text_ro(void
+  	}
+  	mutex_unlock(&module_mutex);
+  }
+ -
+ -static void disable_ro_nx(const struct module_layout *layout)
+ -{
+ -	frob_text(layout, set_memory_rw);
+ -	frob_rodata(layout, set_memory_rw);
+ -	frob_rodata(layout, set_memory_x);
+ -	frob_writable_data(layout, set_memory_x);
+ -}
+ -
+  #else
+ -static void disable_ro_nx(const struct module_layout *layout) { }
+ -static void module_enable_nx(const struct module *mod) { }
+ -static void module_disable_nx(const struct module *mod) { }
+ +static void set_module_core_ro_nx(struct module *mod) { }
+ +static void set_module_init_ro_nx(struct module *mod) { }
+ +static void unset_module_core_ro_nx(struct module *mod) { }
+ +static void unset_module_init_ro_nx(struct module *mod) { }
+  #endif
+  
+++<<<<<<< HEAD
+ +void __weak module_free(struct module *mod, void *module_region)
+++=======
++ #ifdef CONFIG_LIVEPATCH
++ /*
++  * Persist Elf information about a module. Copy the Elf header,
++  * section header table, section string table, and symtab section
++  * index from info to mod->klp_info.
++  */
++ static int copy_module_elf(struct module *mod, struct load_info *info)
++ {
++ 	unsigned int size, symndx;
++ 	int ret;
++ 
++ 	size = sizeof(*mod->klp_info);
++ 	mod->klp_info = kmalloc(size, GFP_KERNEL);
++ 	if (mod->klp_info == NULL)
++ 		return -ENOMEM;
++ 
++ 	/* Elf header */
++ 	size = sizeof(mod->klp_info->hdr);
++ 	memcpy(&mod->klp_info->hdr, info->hdr, size);
++ 
++ 	/* Elf section header table */
++ 	size = sizeof(*info->sechdrs) * info->hdr->e_shnum;
++ 	mod->klp_info->sechdrs = kmalloc(size, GFP_KERNEL);
++ 	if (mod->klp_info->sechdrs == NULL) {
++ 		ret = -ENOMEM;
++ 		goto free_info;
++ 	}
++ 	memcpy(mod->klp_info->sechdrs, info->sechdrs, size);
++ 
++ 	/* Elf section name string table */
++ 	size = info->sechdrs[info->hdr->e_shstrndx].sh_size;
++ 	mod->klp_info->secstrings = kmalloc(size, GFP_KERNEL);
++ 	if (mod->klp_info->secstrings == NULL) {
++ 		ret = -ENOMEM;
++ 		goto free_sechdrs;
++ 	}
++ 	memcpy(mod->klp_info->secstrings, info->secstrings, size);
++ 
++ 	/* Elf symbol section index */
++ 	symndx = info->index.sym;
++ 	mod->klp_info->symndx = symndx;
++ 
++ 	/*
++ 	 * For livepatch modules, core_kallsyms.symtab is a complete
++ 	 * copy of the original symbol table. Adjust sh_addr to point
++ 	 * to core_kallsyms.symtab since the copy of the symtab in module
++ 	 * init memory is freed at the end of do_init_module().
++ 	 */
++ 	mod->klp_info->sechdrs[symndx].sh_addr = \
++ 		(unsigned long) mod->core_kallsyms.symtab;
++ 
++ 	return 0;
++ 
++ free_sechdrs:
++ 	kfree(mod->klp_info->sechdrs);
++ free_info:
++ 	kfree(mod->klp_info);
++ 	return ret;
++ }
++ 
++ static void free_module_elf(struct module *mod)
++ {
++ 	kfree(mod->klp_info->sechdrs);
++ 	kfree(mod->klp_info->secstrings);
++ 	kfree(mod->klp_info);
++ }
++ #else /* !CONFIG_LIVEPATCH */
++ static int copy_module_elf(struct module *mod, struct load_info *info)
++ {
++ 	return 0;
++ }
++ 
++ static void free_module_elf(struct module *mod)
++ {
++ }
++ #endif /* CONFIG_LIVEPATCH */
++ 
++ void __weak module_memfree(void *module_region)
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  {
+  	vfree(module_region);
+  }
+@@@ -1971,19 -2088,24 +2052,22 @@@ static void free_module(struct module *
+  	/* Free any allocated parameters. */
+  	destroy_params(mod->kp, mod->num_kp);
+  
++ 	if (is_livepatch_module(mod))
++ 		free_module_elf(mod);
++ 
+  	/* Now we can delete it from the lists */
+  	mutex_lock(&module_mutex);
+ -	/* Unlink carefully: kallsyms could be walking list. */
+ -	list_del_rcu(&mod->list);
+ -	mod_tree_remove(mod);
+ -	/* Remove this module from bug list, this uses list_del_rcu */
+ -	module_bug_cleanup(mod);
+ -	/* Wait for RCU-sched synchronizing before releasing mod->list and buglist. */
+ -	synchronize_sched();
+ +	stop_machine(__unlink_module, mod, NULL);
+  	mutex_unlock(&module_mutex);
+  
+ -	/* This may be empty, but that's OK */
+ -	disable_ro_nx(&mod->init_layout);
+ -	module_arch_freeing_init(mod);
+ -	module_memfree(mod->init_layout.base);
+ +	mutex_lock(&module_ext_mutex);
+ +	mod_ext = find_module_ext(mod);
+ +	list_del(&mod_ext->next);
+ +	mutex_unlock(&module_ext_mutex);
+ +
+ +	/* This may be NULL, but that's OK */
+ +	unset_module_init_ro_nx(mod);
+ +	module_free(mod, mod->module_init);
+  	kfree(mod->args);
+  	percpu_modfree(mod);
+  
+@@@ -2419,8 -2557,9 +2511,14 @@@ static void layout_symtab(struct modul
+  
+  	/* Compute total space required for the core symbols' strtab. */
+  	for (ndst = i = 0; i < nsrc; i++) {
+++<<<<<<< HEAD
+ +		if (i == 0 ||
+ +		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
+++=======
++ 		if (i == 0 || is_livepatch_module(mod) ||
++ 		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
++ 				   info->index.pcpu)) {
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  			strtab_size += strlen(&info->strtab[src[i].st_name])+1;
+  			ndst++;
+  		}
+@@@ -2446,24 -2598,30 +2544,35 @@@ static void add_kallsyms(struct module 
+  	char *s;
+  	Elf_Shdr *symsec = &info->sechdrs[info->index.sym];
+  
+ -	/* Set up to point into init section. */
+ -	mod->kallsyms = mod->init_layout.base + info->mod_kallsyms_init_off;
+ -
+ -	mod->kallsyms->symtab = (void *)symsec->sh_addr;
+ -	mod->kallsyms->num_symtab = symsec->sh_size / sizeof(Elf_Sym);
+ +	mod->symtab = (void *)symsec->sh_addr;
+ +	mod->num_symtab = symsec->sh_size / sizeof(Elf_Sym);
+  	/* Make sure we get permanent strtab: don't use info->strtab. */
+ -	mod->kallsyms->strtab = (void *)info->sechdrs[info->index.str].sh_addr;
+ +	mod->strtab = (void *)info->sechdrs[info->index.str].sh_addr;
+  
+  	/* Set types up while we still have access to sections. */
+ -	for (i = 0; i < mod->kallsyms->num_symtab; i++)
+ -		mod->kallsyms->symtab[i].st_info
+ -			= elf_type(&mod->kallsyms->symtab[i], info);
+ -
+ +	for (i = 0; i < mod->num_symtab; i++)
+ +		mod->symtab[i].st_info = elf_type(&mod->symtab[i], info);
+ +
+++<<<<<<< HEAD
+ +	mod->core_symtab = dst = mod->module_core + info->symoffs;
+ +	mod->core_strtab = s = mod->module_core + info->stroffs;
+ +	src = mod->symtab;
+ +	for (ndst = i = 0; i < mod->num_symtab; i++) {
+ +		if (i == 0 ||
+ +		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
+++=======
++ 	/* Now populate the cut down core kallsyms for after init. */
++ 	mod->core_kallsyms.symtab = dst = mod->core_layout.base + info->symoffs;
++ 	mod->core_kallsyms.strtab = s = mod->core_layout.base + info->stroffs;
++ 	src = mod->kallsyms->symtab;
++ 	for (ndst = i = 0; i < mod->kallsyms->num_symtab; i++) {
++ 		if (i == 0 || is_livepatch_module(mod) ||
++ 		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum,
++ 				   info->index.pcpu)) {
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  			dst[ndst] = src[i];
+ -			dst[ndst++].st_name = s - mod->core_kallsyms.strtab;
+ -			s += strlcpy(s, &mod->kallsyms->strtab[src[i].st_name],
+ +			dst[ndst++].st_name = s - mod->core_strtab;
+ +			s += strlcpy(s, &mod->strtab[src[i].st_name],
+  				     KSYM_NAME_LEN) + 1;
+  		}
+  	}
+@@@ -2820,12 -2925,11 +2949,16 @@@ static int check_modinfo(struct module 
+  
+  	if (get_modinfo(info, "staging")) {
+  		add_taint_module(mod, TAINT_CRAP, LOCKDEP_STILL_OK);
+ -		pr_warn("%s: module is from the staging directory, the quality "
+ -			"is unknown, you have been warned.\n", mod->name);
+ +		printk(KERN_WARNING "%s: module is from the staging directory,"
+ +		       " the quality is unknown, you have been warned.\n",
+ +		       mod->name);
+  	}
+  
+++<<<<<<< HEAD
+ +	err = check_modinfo_livepatch(mod, info);
+++=======
++ 	err = find_livepatch_modinfo(mod, info);
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+  	if (err)
+  		return err;
+  
+@@@ -3470,17 -3585,33 +3603,23 @@@ static int load_module(struct load_inf
+  	if (err)
+  		goto ddebug_cleanup;
+  
+ -	err = prepare_coming_module(mod);
+ -	if (err)
+ -		goto bug_cleanup;
+ -
+  	/* Module is ready to execute: parsing args may do that. */
+ -	after_dashes = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
+ -				  -32768, 32767, mod,
+ -				  unknown_module_param_cb);
+ -	if (IS_ERR(after_dashes)) {
+ -		err = PTR_ERR(after_dashes);
+ -		goto coming_cleanup;
+ -	} else if (after_dashes) {
+ -		pr_warn("%s: parameters '%s' after `--' ignored\n",
+ -		       mod->name, after_dashes);
+ -	}
+ +	err = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
+ +			 -32768, 32767, &ddebug_dyndbg_module_param_cb);
+ +	if (err < 0)
+ +		goto bug_cleanup;
+  
+ -	/* Link in to syfs. */
+ +	/* Link in to sysfs. */
+  	err = mod_sysfs_setup(mod, info, mod->kp, mod->num_kp);
+  	if (err < 0)
+ -		goto coming_cleanup;
+ +		goto bug_cleanup;
+  
++ 	if (is_livepatch_module(mod)) {
++ 		err = copy_module_elf(mod, info);
++ 		if (err < 0)
++ 			goto sysfs_cleanup;
++ 	}
++ 
+  	/* Get rid of temporary copy. */
+  	free_copy(info);
+  
+@@@ -3489,6 -3620,12 +3628,15 @@@
+  
+  	return do_init_module(mod);
+  
+++<<<<<<< HEAD
+++=======
++  sysfs_cleanup:
++ 	mod_sysfs_teardown(mod);
++  coming_cleanup:
++ 	blocking_notifier_call_chain(&module_notify_list,
++ 				     MODULE_STATE_GOING, mod);
++ 	klp_module_going(mod);
+++>>>>>>> 1ce15ef4f605 (module: preserve Elf information for livepatch modules)
+   bug_cleanup:
+  	/* module_bug_cleanup needs module_mutex protection */
+  	mutex_lock(&module_mutex);
+* Unmerged path include/linux/module.h
+* Unmerged path kernel/module.c
