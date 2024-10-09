@@ -499,7 +499,7 @@ static int nfit_test_cmd_ars_error_inject(struct nfit_test *t,
 {
 	int rc;
 
-	if (buf_len < sizeof(*err_inj)) {
+	if (buf_len != sizeof(*err_inj)) {
 		rc = -EINVAL;
 		goto err;
 	}
@@ -530,7 +530,7 @@ static int nfit_test_cmd_ars_inject_clear(struct nfit_test *t,
 {
 	int rc;
 
-	if (buf_len < sizeof(*err_clr)) {
+	if (buf_len != sizeof(*err_clr)) {
 		rc = -EINVAL;
 		goto err;
 	}
