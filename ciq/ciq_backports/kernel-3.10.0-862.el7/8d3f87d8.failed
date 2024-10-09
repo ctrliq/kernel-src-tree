@@ -1,0 +1,185 @@
+qed*: Fix issues in the ptp filter config implementation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] qed*: Fix issues in the ptp filter config implementation (Don Dutile) [1462433 1499362]
+Rebuild_FUZZ: 99.12%
+commit-author sudarsana.kalluru@cavium.com <sudarsana.kalluru@cavium.com>
+commit 8d3f87d8cd0a16c58ae7e4410938528866c1c0db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8d3f87d8.failed
+
+PTP hardware filter configuration performed by the driver for a given
+user requested config is not correct for some of the PTP modes.
+Following changes are needed for PTP config-filter implementation.
+ 1. NIG_REG_TX_PTP_EN register - Bits 0/1/2 respectively enables
+    TimeSync/"V1 frame format support"/"V2 frame format support" on
+    the TX side. Set the associated bits based on the user request.
+ 2. ptp4l application fails to operate in Peer Delay mode. Following
+    changes are needed to fix this,
+    a. Driver should enable (set to 0) DA #1-related bits for IPv4,
+       IPv6 and MAC destination addresses in these registers:
+         NIG_REG_TX_LLH_PTP_RULE_MASK
+         NIG_REG_LLH_PTP_RULE_MASK
+    b. NIG_REG_LLH_PTP_PARAM_MASK/NIG_REG_TX_LLH_PTP_PARAM_MASK should
+       be set to 0x0 in all modes.
+
+	Signed-off-by: Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d3f87d8cd0a16c58ae7e4410938528866c1c0db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_ptp.c
+#	include/linux/qed/qed_eth_if.h
+diff --cc include/linux/qed/qed_eth_if.h
+index 3613d63cd5d0,d66d16a559e1..000000000000
+--- a/include/linux/qed/qed_eth_if.h
++++ b/include/linux/qed/qed_eth_if.h
+@@@ -157,6 -158,27 +157,30 @@@ struct qed_tunn_params 
+  struct qed_eth_cb_ops {
+  	struct qed_common_cb_ops common;
+  	void (*force_mac) (void *dev, u8 *mac, bool forced);
+++<<<<<<< HEAD
+++=======
++ 	void (*ports_update)(void *dev, u16 vxlan_port, u16 geneve_port);
++ };
++ 
++ #define QED_MAX_PHC_DRIFT_PPB   291666666
++ 
++ enum qed_ptp_filter_type {
++ 	QED_PTP_FILTER_NONE,
++ 	QED_PTP_FILTER_ALL,
++ 	QED_PTP_FILTER_V1_L4_EVENT,
++ 	QED_PTP_FILTER_V1_L4_GEN,
++ 	QED_PTP_FILTER_V2_L4_EVENT,
++ 	QED_PTP_FILTER_V2_L4_GEN,
++ 	QED_PTP_FILTER_V2_L2_EVENT,
++ 	QED_PTP_FILTER_V2_L2_GEN,
++ 	QED_PTP_FILTER_V2_EVENT,
++ 	QED_PTP_FILTER_V2_GEN
++ };
++ 
++ enum qed_ptp_hwtstamp_tx_type {
++ 	QED_PTP_HWTSTAMP_TX_OFF,
++ 	QED_PTP_HWTSTAMP_TX_ON,
+++>>>>>>> 8d3f87d8cd0a (qed*: Fix issues in the ptp filter config implementation.)
+  };
+  
+  #ifdef CONFIG_DCB
+@@@ -218,6 -240,17 +242,20 @@@ struct qed_eth_dcbnl_ops 
+  };
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ struct qed_eth_ptp_ops {
++ 	int (*cfg_filters)(struct qed_dev *, enum qed_ptp_filter_type,
++ 			   enum qed_ptp_hwtstamp_tx_type);
++ 	int (*read_rx_ts)(struct qed_dev *, u64 *);
++ 	int (*read_tx_ts)(struct qed_dev *, u64 *);
++ 	int (*read_cc)(struct qed_dev *, u64 *);
++ 	int (*disable)(struct qed_dev *);
++ 	int (*adjfreq)(struct qed_dev *, s32);
++ 	int (*enable)(struct qed_dev *);
++ };
++ 
+++>>>>>>> 8d3f87d8cd0a (qed*: Fix issues in the ptp filter config implementation.)
+  struct qed_eth_ops {
+  	const struct qed_common_ops *common;
+  #ifdef CONFIG_QED_SRIOV
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_ptp.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_ptp.c
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_ptp.c b/drivers/net/ethernet/qlogic/qede/qede_ptp.c
+index f5f743f68705..26aaf63ad6e1 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_ptp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ptp.c
+@@ -224,6 +224,8 @@ static void qede_ptp_init_cc(struct qede_dev *edev)
+ 
+ static int qede_ptp_cfg_filters(struct qede_dev *edev)
+ {
++	enum qed_ptp_hwtstamp_tx_type tx_type = QED_PTP_HWTSTAMP_TX_ON;
++	enum qed_ptp_filter_type rx_filter = QED_PTP_FILTER_NONE;
+ 	struct qede_ptp *ptp = edev->ptp;
+ 
+ 	if (!ptp)
+@@ -237,7 +239,12 @@ static int qede_ptp_cfg_filters(struct qede_dev *edev)
+ 	switch (ptp->tx_type) {
+ 	case HWTSTAMP_TX_ON:
+ 		edev->flags |= QEDE_TX_TIMESTAMPING_EN;
+-		ptp->ops->hwtstamp_tx_on(edev->cdev);
++		tx_type = QED_PTP_HWTSTAMP_TX_ON;
++		break;
++
++	case HWTSTAMP_TX_OFF:
++		edev->flags &= ~QEDE_TX_TIMESTAMPING_EN;
++		tx_type = QED_PTP_HWTSTAMP_TX_OFF;
+ 		break;
+ 
+ 	case HWTSTAMP_TX_ONESTEP_SYNC:
+@@ -248,42 +255,57 @@ static int qede_ptp_cfg_filters(struct qede_dev *edev)
+ 	spin_lock_bh(&ptp->lock);
+ 	switch (ptp->rx_filter) {
+ 	case HWTSTAMP_FILTER_NONE:
++		rx_filter = QED_PTP_FILTER_NONE;
+ 		break;
+ 	case HWTSTAMP_FILTER_ALL:
+ 	case HWTSTAMP_FILTER_SOME:
+ 		ptp->rx_filter = HWTSTAMP_FILTER_NONE;
++		rx_filter = QED_PTP_FILTER_ALL;
+ 		break;
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
++		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V1_L4_EVENT;
++		rx_filter = QED_PTP_FILTER_V1_L4_EVENT;
++		break;
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
+ 		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V1_L4_EVENT;
+ 		/* Initialize PTP detection for UDP/IPv4 events */
+-		ptp->ops->cfg_rx_filters(edev->cdev, QED_PTP_FILTER_IPV4);
++		rx_filter = QED_PTP_FILTER_V1_L4_GEN;
+ 		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:
++		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L4_EVENT;
++		rx_filter = QED_PTP_FILTER_V2_L4_EVENT;
++		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
+ 		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L4_EVENT;
+ 		/* Initialize PTP detection for UDP/IPv4 or UDP/IPv6 events */
+-		ptp->ops->cfg_rx_filters(edev->cdev, QED_PTP_FILTER_IPV4_IPV6);
++		rx_filter = QED_PTP_FILTER_V2_L4_GEN;
+ 		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
++		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L2_EVENT;
++		rx_filter = QED_PTP_FILTER_V2_L2_EVENT;
++		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
+ 		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_L2_EVENT;
+ 		/* Initialize PTP detection L2 events */
+-		ptp->ops->cfg_rx_filters(edev->cdev, QED_PTP_FILTER_L2);
++		rx_filter = QED_PTP_FILTER_V2_L2_GEN;
+ 		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_EVENT:
++		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
++		rx_filter = QED_PTP_FILTER_V2_EVENT;
++		break;
+ 	case HWTSTAMP_FILTER_PTP_V2_SYNC:
+ 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+ 		ptp->rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
+ 		/* Initialize PTP detection L2, UDP/IPv4 or UDP/IPv6 events */
+-		ptp->ops->cfg_rx_filters(edev->cdev,
+-					 QED_PTP_FILTER_L2_IPV4_IPV6);
++		rx_filter = QED_PTP_FILTER_V2_GEN;
+ 		break;
+ 	}
+ 
++	ptp->ops->cfg_filters(edev->cdev, rx_filter, tx_type);
++
+ 	spin_unlock_bh(&ptp->lock);
+ 
+ 	return 0;
+* Unmerged path include/linux/qed/qed_eth_if.h
