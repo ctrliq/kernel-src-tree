@@ -1,0 +1,287 @@
+mm: split 'tlb_flush_mmu()' into tlb flushing and memory freeing parts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] split 'tlb_flush_mmu()' into tlb flushing and memory freeing parts (Aaron Tomlin) [1677343]
+Rebuild_FUZZ: 97.06%
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 1cf35d47712dd5dc4d62c6ce984f04ac6eab0408
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1cf35d47.failed
+
+The mmu-gather operation 'tlb_flush_mmu()' has done two things: the
+actual tlb flush operation, and the batched freeing of the pages that
+the TLB entries pointed at.
+
+This splits the operation into separate phases, so that the forced
+batched flushing done by zap_pte_range() can now do the actual TLB flush
+while still holding the page table lock, but delay the batched freeing
+of all the pages to after the lock has been dropped.
+
+This in turn allows us to avoid a race condition between
+set_page_dirty() (as called by zap_pte_range() when it finds a dirty
+shared memory pte) and page_mkclean(): because we now flush all the
+dirty page data from the TLB's while holding the pte lock,
+page_mkclean() will be held up walking the (recently cleaned) page
+tables until after the TLB entries have been flushed from all CPU's.
+
+	Reported-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Tested-by: Dave Hansen <dave.hansen@intel.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Russell King - ARM Linux <linux@arm.linux.org.uk>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1cf35d47712dd5dc4d62c6ce984f04ac6eab0408)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/tlb.h
+#	mm/memory.c
+diff --cc arch/s390/include/asm/tlb.h
+index 6d6d92b4ea11,a25f09fbaf36..000000000000
+--- a/arch/s390/include/asm/tlb.h
++++ b/arch/s390/include/asm/tlb.h
+@@@ -57,12 -57,15 +57,20 @@@ static inline void tlb_gather_mmu(struc
+  	tlb->end = end;
+  	tlb->fullmm = !(start | (end+1));
+  	tlb->batch = NULL;
+ +	if (tlb->fullmm)
+ +		__tlb_flush_mm(mm);
+  }
+  
+- static inline void tlb_flush_mmu(struct mmu_gather *tlb)
++ static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+  {
+++<<<<<<< HEAD
+++=======
++ 	__tlb_flush_mm_lazy(tlb->mm);
++ }
++ 
++ static inline void tlb_flush_mmu_free(struct mmu_gather *tlb)
++ {
+++>>>>>>> 1cf35d47712d (mm: split 'tlb_flush_mmu()' into tlb flushing and memory freeing parts)
+  	tlb_table_flush(tlb);
+  }
+  
+diff --cc mm/memory.c
+index f33fb19b1965,037b812a9531..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -247,15 -232,10 +247,11 @@@ void tlb_gather_mmu(struct mmu_gather *
+  #endif
+  }
+  
+- void tlb_flush_mmu(struct mmu_gather *tlb)
++ static void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+  {
+- 	struct mmu_gather_batch *batch;
+- 
+- 	if (!tlb->need_flush)
+- 		return;
+  	tlb->need_flush = 0;
+  	tlb_flush(tlb);
+ +	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
+  #ifdef CONFIG_HAVE_RCU_TABLE_FREE
+  	tlb_table_flush(tlb);
+  #endif
+@@@ -1188,23 -1133,27 +1197,33 @@@ again
+  					pte_file_mksoft_dirty(ptfile);
+  				set_pte_at(mm, addr, pte, ptfile);
+  			}
+++<<<<<<< HEAD
+ +			if (!PageAnon(page)) {
+ +				if (pte_dirty(ptent))
+++=======
++ 			if (PageAnon(page))
++ 				rss[MM_ANONPAGES]--;
++ 			else {
++ 				if (pte_dirty(ptent)) {
++ 					force_flush = 1;
+++>>>>>>> 1cf35d47712d (mm: split 'tlb_flush_mmu()' into tlb flushing and memory freeing parts)
+  					set_page_dirty(page);
++ 				}
+  				if (pte_young(ptent) &&
+ -				    likely(!(vma->vm_flags & VM_SEQ_READ)))
+ +				    likely(!VM_SequentialReadHint(vma)))
+  					mark_page_accessed(page);
+ -				rss[MM_FILEPAGES]--;
+  			}
+ +			rss[mm_counter(page)]--;
+  			page_remove_rmap(page);
+  			if (unlikely(page_mapcount(page) < 0))
+  				print_bad_pte(vma, addr, ptent, page);
+- 			force_flush = !__tlb_remove_page(tlb, page);
+- 			if (force_flush)
++ 			if (unlikely(!__tlb_remove_page(tlb, page))) {
++ 				force_flush = 1;
+  				break;
++ 			}
+  			continue;
+  		}
+ +
+  		/*
+  		 * If details->check_mapping, we leave swap entries;
+  		 * if details->nonlinear_vma, we leave file entries.
+diff --git a/arch/arm/include/asm/tlb.h b/arch/arm/include/asm/tlb.h
+index aa9b4ac3fdf6..e6d26f6385ab 100644
+--- a/arch/arm/include/asm/tlb.h
++++ b/arch/arm/include/asm/tlb.h
+@@ -98,15 +98,25 @@ static inline void __tlb_alloc_page(struct mmu_gather *tlb)
+ 	}
+ }
+ 
+-static inline void tlb_flush_mmu(struct mmu_gather *tlb)
++static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+ {
+ 	tlb_flush(tlb);
++}
++
++static inline void tlb_flush_mmu_free(struct mmu_gather *tlb)
++{
+ 	free_pages_and_swap_cache(tlb->pages, tlb->nr);
+ 	tlb->nr = 0;
+ 	if (tlb->pages == tlb->local)
+ 		__tlb_alloc_page(tlb);
+ }
+ 
++static inline void tlb_flush_mmu(struct mmu_gather *tlb)
++{
++	tlb_flush_mmu_tlbonly(tlb);
++	tlb_flush_mmu_free(tlb);
++}
++
+ static inline void
+ tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
+ {
+diff --git a/arch/ia64/include/asm/tlb.h b/arch/ia64/include/asm/tlb.h
+index bc5efc7c3f3f..39d64e0df1de 100644
+--- a/arch/ia64/include/asm/tlb.h
++++ b/arch/ia64/include/asm/tlb.h
+@@ -91,18 +91,9 @@ extern struct ia64_tr_entry *ia64_idtrs[NR_CPUS];
+ #define RR_RID_MASK	0x00000000ffffff00L
+ #define RR_TO_RID(val) 	((val >> 8) & 0xffffff)
+ 
+-/*
+- * Flush the TLB for address range START to END and, if not in fast mode, release the
+- * freed pages that where gathered up to this point.
+- */
+ static inline void
+-ia64_tlb_flush_mmu (struct mmu_gather *tlb, unsigned long start, unsigned long end)
++ia64_tlb_flush_mmu_tlbonly(struct mmu_gather *tlb, unsigned long start, unsigned long end)
+ {
+-	unsigned long i;
+-	unsigned int nr;
+-
+-	if (!tlb->need_flush)
+-		return;
+ 	tlb->need_flush = 0;
+ 
+ 	if (tlb->fullmm) {
+@@ -135,6 +126,14 @@ ia64_tlb_flush_mmu (struct mmu_gather *tlb, unsigned long start, unsigned long e
+ 		flush_tlb_range(&vma, ia64_thash(start), ia64_thash(end));
+ 	}
+ 
++}
++
++static inline void
++ia64_tlb_flush_mmu_free(struct mmu_gather *tlb)
++{
++	unsigned long i;
++	unsigned int nr;
++
+ 	/* lastly, release the freed pages */
+ 	nr = tlb->nr;
+ 
+@@ -144,6 +143,19 @@ ia64_tlb_flush_mmu (struct mmu_gather *tlb, unsigned long start, unsigned long e
+ 		free_page_and_swap_cache(tlb->pages[i]);
+ }
+ 
++/*
++ * Flush the TLB for address range START to END and, if not in fast mode, release the
++ * freed pages that where gathered up to this point.
++ */
++static inline void
++ia64_tlb_flush_mmu (struct mmu_gather *tlb, unsigned long start, unsigned long end)
++{
++	if (!tlb->need_flush)
++		return;
++	ia64_tlb_flush_mmu_tlbonly(tlb, start, end);
++	ia64_tlb_flush_mmu_free(tlb);
++}
++
+ static inline void __tlb_alloc_page(struct mmu_gather *tlb)
+ {
+ 	unsigned long addr = __get_free_pages(GFP_NOWAIT | __GFP_NOWARN, 0);
+@@ -206,6 +218,16 @@ static inline int __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
+ 	return tlb->max - tlb->nr;
+ }
+ 
++static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
++{
++	ia64_tlb_flush_mmu_tlbonly(tlb, tlb->start_addr, tlb->end_addr);
++}
++
++static inline void tlb_flush_mmu_free(struct mmu_gather *tlb)
++{
++	ia64_tlb_flush_mmu_free(tlb);
++}
++
+ static inline void tlb_flush_mmu(struct mmu_gather *tlb)
+ {
+ 	ia64_tlb_flush_mmu(tlb, tlb->start_addr, tlb->end_addr);
+* Unmerged path arch/s390/include/asm/tlb.h
+diff --git a/arch/sh/include/asm/tlb.h b/arch/sh/include/asm/tlb.h
+index 362192ed12fe..62f80d2a9df9 100644
+--- a/arch/sh/include/asm/tlb.h
++++ b/arch/sh/include/asm/tlb.h
+@@ -86,6 +86,14 @@ tlb_end_vma(struct mmu_gather *tlb, struct vm_area_struct *vma)
+ 	}
+ }
+ 
++static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
++{
++}
++
++static inline void tlb_flush_mmu_free(struct mmu_gather *tlb)
++{
++}
++
+ static inline void tlb_flush_mmu(struct mmu_gather *tlb)
+ {
+ }
+diff --git a/arch/um/include/asm/tlb.h b/arch/um/include/asm/tlb.h
+index 29b0301c18aa..16eb63fac57d 100644
+--- a/arch/um/include/asm/tlb.h
++++ b/arch/um/include/asm/tlb.h
+@@ -58,14 +58,26 @@ tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start
+ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 			       unsigned long end);
+ 
++static inline void
++tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
++{
++	flush_tlb_mm_range(tlb->mm, tlb->start, tlb->end);
++}
++
++static inline void
++tlb_flush_mmu_free(struct mmu_gather *tlb)
++{
++	init_tlb_gather(tlb);
++}
++
+ static inline void
+ tlb_flush_mmu(struct mmu_gather *tlb)
+ {
+ 	if (!tlb->need_flush)
+ 		return;
+ 
+-	flush_tlb_mm_range(tlb->mm, tlb->start, tlb->end);
+-	init_tlb_gather(tlb);
++	tlb_flush_mmu_tlbonly(tlb);
++	tlb_flush_mmu_free(tlb);
+ }
+ 
+ /* tlb_finish_mmu
+* Unmerged path mm/memory.c
