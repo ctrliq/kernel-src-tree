@@ -1,0 +1,149 @@
+powerpc/smp: Use nid as fallback for package_id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.6.1.el7
+commit-author Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+commit a05f0e5be4e81e4977d3f92aaf7688ee0cb7d5db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.6.1.el7/a05f0e5b.failed
+
+package_id is to match cores that are part of the same chip. On
+PowerNV machines, package_id defaults to chip_id. However ibm,chip_id
+property is not present in device-tree of PowerVM LPARs. Hence lscpu
+output shows one core per socket and multiple cores.
+
+To overcome this, use nid as the package_id on PowerVM LPARs.
+
+Before the patch:
+
+  Architecture:        ppc64le
+  Byte Order:          Little Endian
+  CPU(s):              128
+  On-line CPU(s) list: 0-127
+  Thread(s) per core:  8
+  Core(s) per socket:  1                     <----------------------
+  Socket(s):           16                    <----------------------
+  NUMA node(s):        2
+  Model:               2.2 (pvr 004e 0202)
+  Model name:          POWER9 (architected), altivec supported
+  Hypervisor vendor:   pHyp
+  Virtualization type: para
+  L1d cache:           32K
+  L1i cache:           32K
+  L2 cache:            512K
+  L3 cache:            10240K
+  NUMA node0 CPU(s):   0-63
+  NUMA node1 CPU(s):   64-127
+  #
+  # cat /sys/devices/system/cpu/cpu0/topology/physical_package_id
+  -1
+
+After the patch:
+
+  Architecture:        ppc64le
+  Byte Order:          Little Endian
+  CPU(s):              128
+  On-line CPU(s) list: 0-127
+  Thread(s) per core:  8                     <---------------------
+  Core(s) per socket:  8                     <---------------------
+  Socket(s):           2
+  NUMA node(s):        2
+  Model:               2.2 (pvr 004e 0202)
+  Model name:          POWER9 (architected), altivec supported
+  Hypervisor vendor:   pHyp
+  Virtualization type: para
+  L1d cache:           32K
+  L1i cache:           32K
+  L2 cache:            512K
+  L3 cache:            10240K
+  NUMA node0 CPU(s):   0-63
+  NUMA node1 CPU(s):   64-127
+  #
+  # cat /sys/devices/system/cpu/cpu0/topology/physical_package_id
+  0
+
+Now lscpu output is more in line with the system configuration.
+
+	Signed-off-by: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+[mpe: Use pkg_id instead of ppid, tweak change log and comment]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200129135121.24617-1-srikar@linux.vnet.ibm.com
+(cherry picked from commit a05f0e5be4e81e4977d3f92aaf7688ee0cb7d5db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/smp.c
+diff --cc arch/powerpc/kernel/smp.c
+index d8707eef215d,f68cde82bdf3..000000000000
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@@ -709,6 -1169,46 +709,49 @@@ static void remove_cpu_from_masks(int c
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline void add_cpu_to_smallcore_masks(int cpu)
++ {
++ 	struct cpumask *this_l1_cache_map = per_cpu(cpu_l1_cache_map, cpu);
++ 	int i, first_thread = cpu_first_thread_sibling(cpu);
++ 
++ 	if (!has_big_cores)
++ 		return;
++ 
++ 	cpumask_set_cpu(cpu, cpu_smallcore_mask(cpu));
++ 
++ 	for (i = first_thread; i < first_thread + threads_per_core; i++) {
++ 		if (cpu_online(i) && cpumask_test_cpu(i, this_l1_cache_map))
++ 			set_cpus_related(i, cpu, cpu_smallcore_mask);
++ 	}
++ }
++ 
++ int get_physical_package_id(int cpu)
++ {
++ 	int pkg_id = cpu_to_chip_id(cpu);
++ 
++ #ifdef CONFIG_PPC_SPLPAR
++ 	/*
++ 	 * If the platform is PowerNV or Guest on KVM, ibm,chip-id is
++ 	 * defined. Hence we would return the chip-id as the result of
++ 	 * get_physical_package_id.
++ 	 */
++ 	if (pkg_id == -1 && firmware_has_feature(FW_FEATURE_LPAR)) {
++ 		struct device_node *np = of_get_cpu_node(cpu, NULL);
++ 
++ 		if (np) {
++ 			pkg_id = of_node_to_nid(np);
++ 			of_node_put(np);
++ 		}
++ 	}
++ #endif /* CONFIG_PPC_SPLPAR */
++ 
++ 	return pkg_id;
++ }
++ EXPORT_SYMBOL_GPL(get_physical_package_id);
++ 
+++>>>>>>> a05f0e5be4e8 (powerpc/smp: Use nid as fallback for package_id)
+  static void add_cpu_to_masks(int cpu)
+  {
+  	int first_thread = cpu_first_thread_sibling(cpu);
+diff --git a/arch/powerpc/include/asm/topology.h b/arch/powerpc/include/asm/topology.h
+index 884459efdb4b..e0aa94c2771f 100644
+--- a/arch/powerpc/include/asm/topology.h
++++ b/arch/powerpc/include/asm/topology.h
+@@ -110,7 +110,13 @@ static inline void shared_proc_topology_init(void) {}
+ #ifdef CONFIG_PPC64
+ #include <asm/smp.h>
+ 
++#ifdef CONFIG_PPC_SPLPAR
++int get_physical_package_id(int cpu);
++#define topology_physical_package_id(cpu)	(get_physical_package_id(cpu))
++#else
+ #define topology_physical_package_id(cpu)	(cpu_to_chip_id(cpu))
++#endif
++
+ #define topology_sibling_cpumask(cpu)	(per_cpu(cpu_sibling_map, cpu))
+ #define topology_core_cpumask(cpu)	(per_cpu(cpu_core_map, cpu))
+ #define topology_core_id(cpu)		(cpu_to_core_id(cpu))
+* Unmerged path arch/powerpc/kernel/smp.c
