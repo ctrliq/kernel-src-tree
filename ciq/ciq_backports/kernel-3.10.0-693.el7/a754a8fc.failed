@@ -1,0 +1,170 @@
+NTB: allocate number transport entries depending on size of ring size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] allocate number transport entries depending on size of ring size (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 96.24%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit a754a8fcaf383be3c5fcc6c3c08e36d9f3005988
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a754a8fc.failed
+
+Currently we only allocate a fixed default number of descriptors for the tx
+and rx side. We should dynamically resize it to the number of descriptors
+resides in the transport rings. We should know the number of transmit
+descriptors at initializaiton. We will allocate the default number of
+descriptors for receive side and allocate additional ones when we know the
+actual max entries for receive.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Acked-by: Allen Hubbe <allen.hubbe@emc.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit a754a8fcaf383be3c5fcc6c3c08e36d9f3005988)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index cc39efa77597,6db8c8528f26..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -126,9 -153,11 +126,10 @@@ struct ntb_transport_qp 
+  	unsigned int rx_index;
+  	unsigned int rx_max_entry;
+  	unsigned int rx_max_frame;
++ 	unsigned int rx_alloc_entry;
+  	dma_cookie_t last_cookie;
+ -	struct tasklet_struct rxc_db_work;
+  
+ -	void (*event_handler)(void *data, int status);
+ +	void (*event_handler) (void *data, int status);
+  	struct delayed_work link_work;
+  	struct work_struct link_cleanup;
+  
+@@@ -435,6 -482,8 +436,11 @@@ static ssize_t debugfs_read(struct fil
+  			       "rx_index - \t%u\n", qp->rx_index);
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+  			       "rx_max_entry - \t%u\n", qp->rx_max_entry);
+++<<<<<<< HEAD
+++=======
++ 	out_offset += snprintf(buf + out_offset, out_count - out_offset,
++ 			       "rx_alloc_entry - \t%u\n\n", qp->rx_alloc_entry);
+++>>>>>>> a754a8fcaf38 (NTB: allocate number transport entries depending on size of ring size)
+  
+  	out_offset += snprintf(buf + out_offset, out_count - out_offset,
+  			       "tx_bytes - \t%llu\n", qp->tx_bytes);
+@@@ -501,26 -574,55 +507,54 @@@ out
+  	return entry;
+  }
+  
+ -static struct ntb_queue_entry *ntb_list_mv(spinlock_t *lock,
+ -					   struct list_head *list,
+ -					   struct list_head *to_list)
+ +static void ntb_transport_setup_qp_mw(struct ntb_transport *nt,
+ +				      unsigned int qp_num)
+  {
+++<<<<<<< HEAD
+ +	struct ntb_transport_qp *qp = &nt->qps[qp_num];
+++=======
++ 	struct ntb_queue_entry *entry;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(lock, flags);
++ 
++ 	if (list_empty(list)) {
++ 		entry = NULL;
++ 	} else {
++ 		entry = list_first_entry(list, struct ntb_queue_entry, entry);
++ 		list_move_tail(&entry->entry, to_list);
++ 	}
++ 
++ 	spin_unlock_irqrestore(lock, flags);
++ 
++ 	return entry;
++ }
++ 
++ static int ntb_transport_setup_qp_mw(struct ntb_transport_ctx *nt,
++ 				     unsigned int qp_num)
++ {
++ 	struct ntb_transport_qp *qp = &nt->qp_vec[qp_num];
++ 	struct ntb_transport_mw *mw;
++ 	struct ntb_dev *ndev = nt->ndev;
++ 	struct ntb_queue_entry *entry;
+++>>>>>>> a754a8fcaf38 (NTB: allocate number transport entries depending on size of ring size)
+  	unsigned int rx_size, num_qps_mw;
+ -	unsigned int mw_num, mw_count, qp_count;
+ +	u8 mw_num, mw_max;
+  	unsigned int i;
++ 	int node;
+  
+ -	mw_count = nt->mw_count;
+ -	qp_count = nt->qp_count;
+ +	mw_max = ntb_max_mw(nt->ndev);
+ +	mw_num = QP_TO_MW(nt->ndev, qp_num);
+  
+ -	mw_num = QP_TO_MW(nt, qp_num);
+ -	mw = &nt->mw_vec[mw_num];
+ +	WARN_ON(nt->mw[mw_num].virt_addr == NULL);
+  
+ -	if (!mw->virt_addr)
+ -		return -ENOMEM;
+ -
+ -	if (qp_count % mw_count && mw_num + 1 < qp_count / mw_count)
+ -		num_qps_mw = qp_count / mw_count + 1;
+ +	if (nt->max_qps % mw_max && mw_num + 1 < nt->max_qps / mw_max)
+ +		num_qps_mw = nt->max_qps / mw_max + 1;
+  	else
+ -		num_qps_mw = qp_count / mw_count;
+ +		num_qps_mw = nt->max_qps / mw_max;
+  
+ -	rx_size = (unsigned int)mw->xlat_size / num_qps_mw;
+ -	qp->rx_buff = mw->virt_addr + rx_size * (qp_num / mw_count);
+ +	rx_size = (unsigned int) nt->mw[mw_num].size / num_qps_mw;
+ +	qp->rx_buff = nt->mw[mw_num].virt_addr + qp_num / mw_max * rx_size;
+  	rx_size -= sizeof(struct ntb_rx_info);
+  
+  	qp->remote_rx_info = qp->rx_buff + rx_size;
+@@@ -1476,12 -1742,13 +1527,18 @@@ ntb_transport_create_queue(void *data, 
+  			goto err1;
+  
+  		entry->qp = qp;
+ -		ntb_list_add(&qp->ntb_rx_q_lock, &entry->entry,
+ +		ntb_list_add(&qp->ntb_rx_free_q_lock, &entry->entry,
+  			     &qp->rx_free_q);
+  	}
++ 	qp->rx_alloc_entry = NTB_QP_DEF_NUM_ENTRIES;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < NTB_QP_DEF_NUM_ENTRIES; i++) {
+ +		entry = kzalloc(sizeof(struct ntb_queue_entry), GFP_ATOMIC);
+++=======
++ 	for (i = 0; i < qp->tx_max_entry; i++) {
++ 		entry = kzalloc_node(sizeof(*entry), GFP_ATOMIC, node);
+++>>>>>>> a754a8fcaf38 (NTB: allocate number transport entries depending on size of ring size)
+  		if (!entry)
+  			goto err2;
+  
+@@@ -1503,11 -1768,14 +1560,16 @@@ err2
+  	while ((entry = ntb_list_rm(&qp->ntb_tx_free_q_lock, &qp->tx_free_q)))
+  		kfree(entry);
+  err1:
+++<<<<<<< HEAD
+ +	while ((entry = ntb_list_rm(&qp->ntb_rx_free_q_lock, &qp->rx_free_q)))
+++=======
++ 	qp->rx_alloc_entry = 0;
++ 	while ((entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_free_q)))
+++>>>>>>> a754a8fcaf38 (NTB: allocate number transport entries depending on size of ring size)
+  		kfree(entry);
+ -	if (qp->tx_dma_chan)
+ -		dma_release_channel(qp->tx_dma_chan);
+ -	if (qp->rx_dma_chan)
+ -		dma_release_channel(qp->rx_dma_chan);
+ -	nt->qp_bitmap_free |= qp_bit;
+ +	if (qp->dma_chan)
+ +		dmaengine_put();
+ +	set_bit(free_queue, &nt->qp_bitmap);
+  err:
+  	return NULL;
+  }
+* Unmerged path drivers/ntb/ntb_transport.c
