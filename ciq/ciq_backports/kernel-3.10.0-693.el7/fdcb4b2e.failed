@@ -1,0 +1,177 @@
+NTB: fix 32-bit compiler warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] fix 32-bit compiler warning (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 91.53%
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit fdcb4b2e78220bde95ce4ba3213088e3a1f1cec6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fdcb4b2e.failed
+
+resource_size_t may be 32-bit wide on some architectures, which causes
+this warning when building the NTB code:
+
+drivers/ntb/ntb_transport.c: In function 'ntb_transport_link_work':
+drivers/ntb/ntb_transport.c:828:46: warning: right shift count >= width of type [-Wshift-count-overflow]
+
+The warning is harmless but can be avoided by using the upper_32_bits()
+macro.
+
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Fixes: e26a5843f7f5 ("NTB: Split ntb_hw_intel and ntb_transport drivers")
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit fdcb4b2e78220bde95ce4ba3213088e3a1f1cec6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index 0d5e96e60628,60654d524858..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -683,108 -809,60 +683,119 @@@ static void ntb_transport_event_callbac
+  
+  static void ntb_transport_link_work(struct work_struct *work)
+  {
+ -	struct ntb_transport_ctx *nt =
+ -		container_of(work, struct ntb_transport_ctx, link_work.work);
+ -	struct ntb_dev *ndev = nt->ndev;
+ -	struct pci_dev *pdev = ndev->pdev;
+ -	resource_size_t size;
+ +	struct ntb_transport *nt = container_of(work, struct ntb_transport,
+ +						link_work.work);
+ +	struct ntb_device *ndev = nt->ndev;
+ +	struct pci_dev *pdev = ntb_query_pdev(ndev);
+  	u32 val;
+ -	int rc, i, spad;
+ +	int rc, i;
+  
+  	/* send the local info, in the opposite order of the way we read it */
+ -	for (i = 0; i < nt->mw_count; i++) {
+ -		size = nt->mw_vec[i].phys_size;
+ +	for (i = 0; i < ntb_max_mw(ndev); i++) {
+ +		rc = ntb_write_remote_spad(ndev, MW0_SZ_HIGH + (i * 2),
+ +					   ntb_get_mw_size(ndev, i) >> 32);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error writing %u to remote spad %d\n",
+ +				(u32)(ntb_get_mw_size(ndev, i) >> 32),
+ +				MW0_SZ_HIGH + (i * 2));
+ +			goto out;
+ +		}
+  
+++<<<<<<< HEAD
+ +		rc = ntb_write_remote_spad(ndev, MW0_SZ_LOW + (i * 2),
+ +					   (u32) ntb_get_mw_size(ndev, i));
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error writing %u to remote spad %d\n",
+ +				(u32) ntb_get_mw_size(ndev, i),
+ +				MW0_SZ_LOW + (i * 2));
+ +			goto out;
+ +		}
+++=======
++ 		if (max_mw_size && size > max_mw_size)
++ 			size = max_mw_size;
++ 
++ 		spad = MW0_SZ_HIGH + (i * 2);
++ 		ntb_peer_spad_write(ndev, spad, upper_32_bits(size));
++ 
++ 		spad = MW0_SZ_LOW + (i * 2);
++ 		ntb_peer_spad_write(ndev, spad, lower_32_bits(size));
+++>>>>>>> fdcb4b2e7822 (NTB: fix 32-bit compiler warning)
+  	}
+  
+ -	ntb_peer_spad_write(ndev, NUM_MWS, nt->mw_count);
+ +	rc = ntb_write_remote_spad(ndev, NUM_MWS, ntb_max_mw(ndev));
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			ntb_max_mw(ndev), NUM_MWS);
+ +		goto out;
+ +	}
+  
+ -	ntb_peer_spad_write(ndev, NUM_QPS, nt->qp_count);
+ +	rc = ntb_write_remote_spad(ndev, NUM_QPS, nt->max_qps);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			nt->max_qps, NUM_QPS);
+ +		goto out;
+ +	}
+  
+ -	ntb_peer_spad_write(ndev, VERSION, NTB_TRANSPORT_VERSION);
+ +	rc = ntb_write_remote_spad(ndev, VERSION, NTB_TRANSPORT_VERSION);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			NTB_TRANSPORT_VERSION, VERSION);
+ +		goto out;
+ +	}
+  
+  	/* Query the remote side for its info */
+ -	val = ntb_spad_read(ndev, VERSION);
+ -	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+ +	rc = ntb_read_remote_spad(ndev, VERSION, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", VERSION);
+ +		goto out;
+ +	}
+ +
+  	if (val != NTB_TRANSPORT_VERSION)
+  		goto out;
+ +	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+ +
+ +	rc = ntb_read_remote_spad(ndev, NUM_QPS, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", NUM_QPS);
+ +		goto out;
+ +	}
+  
+ -	val = ntb_spad_read(ndev, NUM_QPS);
+ +	if (val != nt->max_qps)
+ +		goto out;
+  	dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
+ -	if (val != nt->qp_count)
+ +
+ +	rc = ntb_read_remote_spad(ndev, NUM_MWS, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", NUM_MWS);
+  		goto out;
+ +	}
+  
+ -	val = ntb_spad_read(ndev, NUM_MWS);
+ -	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+ -	if (val != nt->mw_count)
+ +	if (val != ntb_max_mw(ndev))
+  		goto out;
+ +	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+  
+ -	for (i = 0; i < nt->mw_count; i++) {
+ +	for (i = 0; i < ntb_max_mw(ndev); i++) {
+  		u64 val64;
+  
+ -		val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
+ -		val64 = (u64)val << 32;
+ +		rc = ntb_read_remote_spad(ndev, MW0_SZ_HIGH + (i * 2), &val);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error reading remote spad %d\n",
+ +				MW0_SZ_HIGH + (i * 2));
+ +			goto out1;
+ +		}
+ +
+ +		val64 = (u64) val << 32;
+ +
+ +		rc = ntb_read_remote_spad(ndev, MW0_SZ_LOW + (i * 2), &val);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error reading remote spad %d\n",
+ +				MW0_SZ_LOW + (i * 2));
+ +			goto out1;
+ +		}
+  
+ -		val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
+  		val64 |= val;
+  
+ -		dev_dbg(&pdev->dev, "Remote MW%d size = %#llx\n", i, val64);
+ +		dev_dbg(&pdev->dev, "Remote MW%d size = %llu\n", i, val64);
+  
+  		rc = ntb_set_mw(nt, i, val64);
+  		if (rc)
+* Unmerged path drivers/ntb/ntb_transport.c
