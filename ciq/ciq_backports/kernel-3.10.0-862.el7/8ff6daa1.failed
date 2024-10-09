@@ -1,0 +1,1796 @@
+iomap: constify struct iomap_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8ff6daa17b6a64e59bbabaa116b9bd854fa4da1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8ff6daa1.failed
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 8ff6daa17b6a64e59bbabaa116b9bd854fa4da1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	fs/ext2/ext2.h
+#	fs/ext2/inode.c
+#	fs/ext4/ext4.h
+#	fs/ext4/inode.c
+#	fs/internal.h
+#	fs/iomap.c
+#	fs/xfs/xfs_iomap.c
+#	fs/xfs/xfs_iomap.h
+#	include/linux/dax.h
+#	include/linux/iomap.h
+diff --cc fs/dax.c
+index 1dfecdfb6245,78b9651576c6..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -988,56 -990,440 +988,396 @@@ int __dax_zero_page_range(struct block_
+  }
+  EXPORT_SYMBOL_GPL(__dax_zero_page_range);
+  
+ -static sector_t dax_iomap_sector(struct iomap *iomap, loff_t pos)
+ -{
+ -	return iomap->blkno + (((pos & PAGE_MASK) - iomap->offset) >> 9);
+ -}
+ -
+ -static loff_t
+ -dax_iomap_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+ -		struct iomap *iomap)
+ +/**
+ + * dax_zero_page_range - zero a range within a page of a DAX file
+ + * @inode: The file being truncated
+ + * @from: The file offset that is being truncated to
+ + * @length: The number of bytes to zero
+ + * @get_block: The filesystem method used to translate file offsets to blocks
+ + *
+ + * This function can be called by a filesystem when it is zeroing part of a
+ + * page in a DAX file.  This is intended for hole-punch operations.  If
+ + * you are truncating a file, the helper function dax_truncate_page() may be
+ + * more convenient.
+ + */
+ +int dax_zero_page_range(struct inode *inode, loff_t from, unsigned length,
+ +							get_block_t get_block)
+  {
+ -	struct iov_iter *iter = data;
+ -	loff_t end = pos + length, done = 0;
+ -	ssize_t ret = 0;
+ -
+ -	if (iov_iter_rw(iter) == READ) {
+ -		end = min(end, i_size_read(inode));
+ -		if (pos >= end)
+ -			return 0;
+ -
+ -		if (iomap->type == IOMAP_HOLE || iomap->type == IOMAP_UNWRITTEN)
+ -			return iov_iter_zero(min(length, end - pos), iter);
+ -	}
+ -
+ -	if (WARN_ON_ONCE(iomap->type != IOMAP_MAPPED))
+ -		return -EIO;
+ -
+ -	/*
+ -	 * Write can allocate block for an area which has a hole page mapped
+ -	 * into page tables. We have to tear down these mappings so that data
+ -	 * written by write(2) is visible in mmap.
+ -	 */
+ -	if ((iomap->flags & IOMAP_F_NEW) && inode->i_mapping->nrpages) {
+ -		invalidate_inode_pages2_range(inode->i_mapping,
+ -					      pos >> PAGE_SHIFT,
+ -					      (end - 1) >> PAGE_SHIFT);
+ -	}
+ +	struct buffer_head bh;
+ +	pgoff_t index = from >> PAGE_CACHE_SHIFT;
+ +	unsigned offset = from & (PAGE_CACHE_SIZE-1);
+ +	int err;
+  
+ -	while (pos < end) {
+ -		unsigned offset = pos & (PAGE_SIZE - 1);
+ -		struct blk_dax_ctl dax = { 0 };
+ -		ssize_t map_len;
+ -
+ -		dax.sector = dax_iomap_sector(iomap, pos);
+ -		dax.size = (length + offset + PAGE_SIZE - 1) & PAGE_MASK;
+ -		map_len = dax_map_atomic(iomap->bdev, &dax);
+ -		if (map_len < 0) {
+ -			ret = map_len;
+ -			break;
+ -		}
+ -
+ -		dax.addr += offset;
+ -		map_len -= offset;
+ -		if (map_len > end - pos)
+ -			map_len = end - pos;
+ -
+ -		if (iov_iter_rw(iter) == WRITE)
+ -			map_len = copy_from_iter_pmem(dax.addr, map_len, iter);
+ -		else
+ -			map_len = copy_to_iter(dax.addr, map_len, iter);
+ -		dax_unmap_atomic(iomap->bdev, &dax);
+ -		if (map_len <= 0) {
+ -			ret = map_len ? map_len : -EFAULT;
+ -			break;
+ -		}
+ -
+ -		pos += map_len;
+ -		length -= map_len;
+ -		done += map_len;
+ -	}
+ -
+ -	return done ? done : ret;
+ +	/* Block boundary? Nothing to do */
+ +	if (!length)
+ +		return 0;
+ +	if (WARN_ON_ONCE((offset + length) > PAGE_CACHE_SIZE))
+ +		return -EINVAL;
+ +
+ +	memset(&bh, 0, sizeof(bh));
+ +	bh.b_bdev = inode->i_sb->s_bdev;
+ +	bh.b_size = PAGE_CACHE_SIZE;
+ +	err = get_block(inode, index, &bh, 0);
+ +	if (err < 0 || !buffer_written(&bh))
+ +		return err;
+ +
+ +	return __dax_zero_page_range(bh.b_bdev, to_sector(&bh, inode),
+ +			offset, length);
+  }
+ +EXPORT_SYMBOL_GPL(dax_zero_page_range);
+  
+  /**
+ - * dax_iomap_rw - Perform I/O to a DAX file
+ - * @iocb:	The control block for this I/O
+ - * @iter:	The addresses to do I/O from or to
+ - * @ops:	iomap ops passed from the file system
+ + * dax_truncate_page - handle a partial page being truncated in a DAX file
+ + * @inode: The file being truncated
+ + * @from: The file offset that is being truncated to
+ + * @get_block: The filesystem method used to translate file offsets to blocks
+   *
+ - * This function performs read and write operations to directly mapped
+ - * persistent memory.  The callers needs to take care of read/write exclusion
+ - * and evicting any page cache pages in the region under I/O.
+ + * Similar to block_truncate_page(), this function can be called by a
+ + * filesystem when it is truncating a DAX file to handle the partial page.
+   */
+++<<<<<<< HEAD
+ +int dax_truncate_page(struct inode *inode, loff_t from, get_block_t get_block)
+++=======
++ ssize_t
++ dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		const struct iomap_ops *ops)
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  {
+ -	struct address_space *mapping = iocb->ki_filp->f_mapping;
+ -	struct inode *inode = mapping->host;
+ -	loff_t pos = iocb->ki_pos, ret = 0, done = 0;
+ -	unsigned flags = 0;
+ -
+ -	if (iov_iter_rw(iter) == WRITE)
+ -		flags |= IOMAP_WRITE;
+ -
+ -	while (iov_iter_count(iter)) {
+ -		ret = iomap_apply(inode, pos, iov_iter_count(iter), flags, ops,
+ -				iter, dax_iomap_actor);
+ -		if (ret <= 0)
+ -			break;
+ -		pos += ret;
+ -		done += ret;
+ -	}
+ -
+ -	iocb->ki_pos += done;
+ -	return done ? done : ret;
+ +	unsigned length = PAGE_CACHE_ALIGN(from) - from;
+ +	return dax_zero_page_range(inode, from, length, get_block);
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(dax_truncate_page);
+++=======
++ EXPORT_SYMBOL_GPL(dax_iomap_rw);
++ 
++ static int dax_fault_return(int error)
++ {
++ 	if (error == 0)
++ 		return VM_FAULT_NOPAGE;
++ 	if (error == -ENOMEM)
++ 		return VM_FAULT_OOM;
++ 	return VM_FAULT_SIGBUS;
++ }
++ 
++ /**
++  * dax_iomap_fault - handle a page fault on a DAX file
++  * @vma: The virtual memory area where the fault occurred
++  * @vmf: The description of the fault
++  * @ops: iomap ops passed from the file system
++  *
++  * When a page fault occurs, filesystems may call this helper in their fault
++  * or mkwrite handler for DAX files. Assumes the caller has done all the
++  * necessary locking for the page fault to proceed successfully.
++  */
++ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
++ 			const struct iomap_ops *ops)
++ {
++ 	struct address_space *mapping = vma->vm_file->f_mapping;
++ 	struct inode *inode = mapping->host;
++ 	unsigned long vaddr = vmf->address;
++ 	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
++ 	sector_t sector;
++ 	struct iomap iomap = { 0 };
++ 	unsigned flags = IOMAP_FAULT;
++ 	int error, major = 0;
++ 	int vmf_ret = 0;
++ 	void *entry;
++ 
++ 	/*
++ 	 * Check whether offset isn't beyond end of file now. Caller is supposed
++ 	 * to hold locks serializing us with truncate / punch hole so this is
++ 	 * a reliable test.
++ 	 */
++ 	if (pos >= i_size_read(inode))
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	if ((vmf->flags & FAULT_FLAG_WRITE) && !vmf->cow_page)
++ 		flags |= IOMAP_WRITE;
++ 
++ 	/*
++ 	 * Note that we don't bother to use iomap_apply here: DAX required
++ 	 * the file system block size to be equal the page size, which means
++ 	 * that we never have to deal with more than a single extent here.
++ 	 */
++ 	error = ops->iomap_begin(inode, pos, PAGE_SIZE, flags, &iomap);
++ 	if (error)
++ 		return dax_fault_return(error);
++ 	if (WARN_ON_ONCE(iomap.offset + iomap.length < pos + PAGE_SIZE)) {
++ 		vmf_ret = dax_fault_return(-EIO);	/* fs corruption? */
++ 		goto finish_iomap;
++ 	}
++ 
++ 	entry = grab_mapping_entry(mapping, vmf->pgoff, 0);
++ 	if (IS_ERR(entry)) {
++ 		vmf_ret = dax_fault_return(PTR_ERR(entry));
++ 		goto finish_iomap;
++ 	}
++ 
++ 	sector = dax_iomap_sector(&iomap, pos);
++ 
++ 	if (vmf->cow_page) {
++ 		switch (iomap.type) {
++ 		case IOMAP_HOLE:
++ 		case IOMAP_UNWRITTEN:
++ 			clear_user_highpage(vmf->cow_page, vaddr);
++ 			break;
++ 		case IOMAP_MAPPED:
++ 			error = copy_user_dax(iomap.bdev, sector, PAGE_SIZE,
++ 					vmf->cow_page, vaddr);
++ 			break;
++ 		default:
++ 			WARN_ON_ONCE(1);
++ 			error = -EIO;
++ 			break;
++ 		}
++ 
++ 		if (error)
++ 			goto error_unlock_entry;
++ 
++ 		__SetPageUptodate(vmf->cow_page);
++ 		vmf_ret = finish_fault(vmf);
++ 		if (!vmf_ret)
++ 			vmf_ret = VM_FAULT_DONE_COW;
++ 		goto unlock_entry;
++ 	}
++ 
++ 	switch (iomap.type) {
++ 	case IOMAP_MAPPED:
++ 		if (iomap.flags & IOMAP_F_NEW) {
++ 			count_vm_event(PGMAJFAULT);
++ 			mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
++ 			major = VM_FAULT_MAJOR;
++ 		}
++ 		error = dax_insert_mapping(mapping, iomap.bdev, sector,
++ 				PAGE_SIZE, &entry, vma, vmf);
++ 		/* -EBUSY is fine, somebody else faulted on the same PTE */
++ 		if (error == -EBUSY)
++ 			error = 0;
++ 		break;
++ 	case IOMAP_UNWRITTEN:
++ 	case IOMAP_HOLE:
++ 		if (!(vmf->flags & FAULT_FLAG_WRITE)) {
++ 			vmf_ret = dax_load_hole(mapping, &entry, vmf);
++ 			goto unlock_entry;
++ 		}
++ 		/*FALLTHRU*/
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		error = -EIO;
++ 		break;
++ 	}
++ 
++  error_unlock_entry:
++ 	vmf_ret = dax_fault_return(error) | major;
++  unlock_entry:
++ 	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
++  finish_iomap:
++ 	if (ops->iomap_end) {
++ 		int copied = PAGE_SIZE;
++ 
++ 		if (vmf_ret & VM_FAULT_ERROR)
++ 			copied = 0;
++ 		/*
++ 		 * The fault is done by now and there's no way back (other
++ 		 * thread may be already happily using PTE we have installed).
++ 		 * Just ignore error from ->iomap_end since we cannot do much
++ 		 * with it.
++ 		 */
++ 		ops->iomap_end(inode, pos, PAGE_SIZE, copied, flags, &iomap);
++ 	}
++ 	return vmf_ret;
++ }
++ EXPORT_SYMBOL_GPL(dax_iomap_fault);
++ 
++ #ifdef CONFIG_FS_DAX_PMD
++ /*
++  * The 'colour' (ie low bits) within a PMD of a page offset.  This comes up
++  * more often than one might expect in the below functions.
++  */
++ #define PG_PMD_COLOUR	((PMD_SIZE >> PAGE_SHIFT) - 1)
++ 
++ static int dax_pmd_insert_mapping(struct vm_area_struct *vma, pmd_t *pmd,
++ 		struct vm_fault *vmf, unsigned long address,
++ 		struct iomap *iomap, loff_t pos, bool write, void **entryp)
++ {
++ 	struct address_space *mapping = vma->vm_file->f_mapping;
++ 	struct block_device *bdev = iomap->bdev;
++ 	struct blk_dax_ctl dax = {
++ 		.sector = dax_iomap_sector(iomap, pos),
++ 		.size = PMD_SIZE,
++ 	};
++ 	long length = dax_map_atomic(bdev, &dax);
++ 	void *ret;
++ 
++ 	if (length < 0) /* dax_map_atomic() failed */
++ 		return VM_FAULT_FALLBACK;
++ 	if (length < PMD_SIZE)
++ 		goto unmap_fallback;
++ 	if (pfn_t_to_pfn(dax.pfn) & PG_PMD_COLOUR)
++ 		goto unmap_fallback;
++ 	if (!pfn_t_devmap(dax.pfn))
++ 		goto unmap_fallback;
++ 
++ 	dax_unmap_atomic(bdev, &dax);
++ 
++ 	ret = dax_insert_mapping_entry(mapping, vmf, *entryp, dax.sector,
++ 			RADIX_DAX_PMD);
++ 	if (IS_ERR(ret))
++ 		return VM_FAULT_FALLBACK;
++ 	*entryp = ret;
++ 
++ 	return vmf_insert_pfn_pmd(vma, address, pmd, dax.pfn, write);
++ 
++  unmap_fallback:
++ 	dax_unmap_atomic(bdev, &dax);
++ 	return VM_FAULT_FALLBACK;
++ }
++ 
++ static int dax_pmd_load_hole(struct vm_area_struct *vma, pmd_t *pmd,
++ 		struct vm_fault *vmf, unsigned long address,
++ 		struct iomap *iomap, void **entryp)
++ {
++ 	struct address_space *mapping = vma->vm_file->f_mapping;
++ 	unsigned long pmd_addr = address & PMD_MASK;
++ 	struct page *zero_page;
++ 	spinlock_t *ptl;
++ 	pmd_t pmd_entry;
++ 	void *ret;
++ 
++ 	zero_page = mm_get_huge_zero_page(vma->vm_mm);
++ 
++ 	if (unlikely(!zero_page))
++ 		return VM_FAULT_FALLBACK;
++ 
++ 	ret = dax_insert_mapping_entry(mapping, vmf, *entryp, 0,
++ 			RADIX_DAX_PMD | RADIX_DAX_HZP);
++ 	if (IS_ERR(ret))
++ 		return VM_FAULT_FALLBACK;
++ 	*entryp = ret;
++ 
++ 	ptl = pmd_lock(vma->vm_mm, pmd);
++ 	if (!pmd_none(*pmd)) {
++ 		spin_unlock(ptl);
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 
++ 	pmd_entry = mk_pmd(zero_page, vma->vm_page_prot);
++ 	pmd_entry = pmd_mkhuge(pmd_entry);
++ 	set_pmd_at(vma->vm_mm, pmd_addr, pmd, pmd_entry);
++ 	spin_unlock(ptl);
++ 	return VM_FAULT_NOPAGE;
++ }
++ 
++ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
++ 		pmd_t *pmd, unsigned int flags, const struct iomap_ops *ops)
++ {
++ 	struct address_space *mapping = vma->vm_file->f_mapping;
++ 	unsigned long pmd_addr = address & PMD_MASK;
++ 	bool write = flags & FAULT_FLAG_WRITE;
++ 	unsigned int iomap_flags = (write ? IOMAP_WRITE : 0) | IOMAP_FAULT;
++ 	struct inode *inode = mapping->host;
++ 	int result = VM_FAULT_FALLBACK;
++ 	struct iomap iomap = { 0 };
++ 	pgoff_t max_pgoff, pgoff;
++ 	struct vm_fault vmf;
++ 	void *entry;
++ 	loff_t pos;
++ 	int error;
++ 
++ 	/* Fall back to PTEs if we're going to COW */
++ 	if (write && !(vma->vm_flags & VM_SHARED))
++ 		goto fallback;
++ 
++ 	/* If the PMD would extend outside the VMA */
++ 	if (pmd_addr < vma->vm_start)
++ 		goto fallback;
++ 	if ((pmd_addr + PMD_SIZE) > vma->vm_end)
++ 		goto fallback;
++ 
++ 	/*
++ 	 * Check whether offset isn't beyond end of file now. Caller is
++ 	 * supposed to hold locks serializing us with truncate / punch hole so
++ 	 * this is a reliable test.
++ 	 */
++ 	pgoff = linear_page_index(vma, pmd_addr);
++ 	max_pgoff = (i_size_read(inode) - 1) >> PAGE_SHIFT;
++ 
++ 	if (pgoff > max_pgoff)
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	/* If the PMD would extend beyond the file size */
++ 	if ((pgoff | PG_PMD_COLOUR) > max_pgoff)
++ 		goto fallback;
++ 
++ 	/*
++ 	 * Note that we don't use iomap_apply here.  We aren't doing I/O, only
++ 	 * setting up a mapping, so really we're using iomap_begin() as a way
++ 	 * to look up our filesystem block.
++ 	 */
++ 	pos = (loff_t)pgoff << PAGE_SHIFT;
++ 	error = ops->iomap_begin(inode, pos, PMD_SIZE, iomap_flags, &iomap);
++ 	if (error)
++ 		goto fallback;
++ 
++ 	if (iomap.offset + iomap.length < pos + PMD_SIZE)
++ 		goto finish_iomap;
++ 
++ 	/*
++ 	 * grab_mapping_entry() will make sure we get a 2M empty entry, a DAX
++ 	 * PMD or a HZP entry.  If it can't (because a 4k page is already in
++ 	 * the tree, for instance), it will return -EEXIST and we just fall
++ 	 * back to 4k entries.
++ 	 */
++ 	entry = grab_mapping_entry(mapping, pgoff, RADIX_DAX_PMD);
++ 	if (IS_ERR(entry))
++ 		goto finish_iomap;
++ 
++ 	vmf.pgoff = pgoff;
++ 	vmf.flags = flags;
++ 	vmf.gfp_mask = mapping_gfp_mask(mapping) | __GFP_IO;
++ 
++ 	switch (iomap.type) {
++ 	case IOMAP_MAPPED:
++ 		result = dax_pmd_insert_mapping(vma, pmd, &vmf, address,
++ 				&iomap, pos, write, &entry);
++ 		break;
++ 	case IOMAP_UNWRITTEN:
++ 	case IOMAP_HOLE:
++ 		if (WARN_ON_ONCE(write))
++ 			goto unlock_entry;
++ 		result = dax_pmd_load_hole(vma, pmd, &vmf, address, &iomap,
++ 				&entry);
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		break;
++ 	}
++ 
++  unlock_entry:
++ 	put_locked_mapping_entry(mapping, pgoff, entry);
++  finish_iomap:
++ 	if (ops->iomap_end) {
++ 		int copied = PMD_SIZE;
++ 
++ 		if (result == VM_FAULT_FALLBACK)
++ 			copied = 0;
++ 		/*
++ 		 * The fault is done by now and there's no way back (other
++ 		 * thread may be already happily using PMD we have installed).
++ 		 * Just ignore error from ->iomap_end since we cannot do much
++ 		 * with it.
++ 		 */
++ 		ops->iomap_end(inode, pos, PMD_SIZE, copied, iomap_flags,
++ 				&iomap);
++ 	}
++  fallback:
++ 	if (result == VM_FAULT_FALLBACK) {
++ 		split_huge_pmd(vma, pmd, address);
++ 		count_vm_event(THP_FAULT_FALLBACK);
++ 	}
++ 	return result;
++ }
++ EXPORT_SYMBOL_GPL(dax_iomap_pmd_fault);
++ #endif /* CONFIG_FS_DAX_PMD */
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+diff --cc fs/ext2/ext2.h
+index c2fc82cf8202,5e64de9c5093..000000000000
+--- a/fs/ext2/ext2.h
++++ b/fs/ext2/ext2.h
+@@@ -805,6 -814,7 +805,10 @@@ extern const struct file_operations ext
+  /* inode.c */
+  extern const struct address_space_operations ext2_aops;
+  extern const struct address_space_operations ext2_nobh_aops;
+++<<<<<<< HEAD
+++=======
++ extern const struct iomap_ops ext2_iomap_ops;
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  
+  /* namei.c */
+  extern const struct inode_operations ext2_dir_inode_operations;
+diff --cc fs/ext2/inode.c
+index 4b6f4ec7af18,128cce540645..000000000000
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@@ -763,19 -770,87 +763,42 @@@ cleanup
+  	return err;
+  }
+  
+ -int ext2_get_block(struct inode *inode, sector_t iblock,
+ -		struct buffer_head *bh_result, int create)
+ +int ext2_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+  {
+  	unsigned max_blocks = bh_result->b_size >> inode->i_blkbits;
+ -	bool new = false, boundary = false;
+ -	u32 bno;
+ -	int ret;
+ -
+ -	ret = ext2_get_blocks(inode, iblock, max_blocks, &bno, &new, &boundary,
+ -			create);
+ -	if (ret <= 0)
+ -		return ret;
+ -
+ -	map_bh(bh_result, inode->i_sb, bno);
+ -	bh_result->b_size = (ret << inode->i_blkbits);
+ -	if (new)
+ -		set_buffer_new(bh_result);
+ -	if (boundary)
+ -		set_buffer_boundary(bh_result);
+ -	return 0;
+ -
+ -}
+ -
+ -#ifdef CONFIG_FS_DAX
+ -static int ext2_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+ -		unsigned flags, struct iomap *iomap)
+ -{
+ -	unsigned int blkbits = inode->i_blkbits;
+ -	unsigned long first_block = offset >> blkbits;
+ -	unsigned long max_blocks = (length + (1 << blkbits) - 1) >> blkbits;
+ -	bool new = false, boundary = false;
+ -	u32 bno;
+ -	int ret;
+ -
+ -	ret = ext2_get_blocks(inode, first_block, max_blocks,
+ -			&bno, &new, &boundary, flags & IOMAP_WRITE);
+ -	if (ret < 0)
+ -		return ret;
+ -
+ -	iomap->flags = 0;
+ -	iomap->bdev = inode->i_sb->s_bdev;
+ -	iomap->offset = (u64)first_block << blkbits;
+ -
+ -	if (ret == 0) {
+ -		iomap->type = IOMAP_HOLE;
+ -		iomap->blkno = IOMAP_NULL_BLOCK;
+ -		iomap->length = 1 << blkbits;
+ -	} else {
+ -		iomap->type = IOMAP_MAPPED;
+ -		iomap->blkno = (sector_t)bno << (blkbits - 9);
+ -		iomap->length = (u64)ret << blkbits;
+ -		iomap->flags |= IOMAP_F_MERGED;
+ +	int ret = ext2_get_blocks(inode, iblock, max_blocks,
+ +			      bh_result, create);
+ +	if (ret > 0) {
+ +		bh_result->b_size = (ret << inode->i_blkbits);
+ +		ret = 0;
+  	}
+ +	return ret;
+  
+ -	if (new)
+ -		iomap->flags |= IOMAP_F_NEW;
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ext2_iomap_end(struct inode *inode, loff_t offset, loff_t length,
++ 		ssize_t written, unsigned flags, struct iomap *iomap)
++ {
++ 	if (iomap->type == IOMAP_MAPPED &&
++ 	    written < length &&
++ 	    (flags & IOMAP_WRITE))
++ 		ext2_write_failed(inode->i_mapping, offset + length);
++ 	return 0;
++ }
++ 
++ const struct iomap_ops ext2_iomap_ops = {
++ 	.iomap_begin		= ext2_iomap_begin,
++ 	.iomap_end		= ext2_iomap_end,
++ };
++ #else
++ /* Define empty ops for !CONFIG_FS_DAX case to avoid ugly ifdefs */
++ const struct iomap_ops ext2_iomap_ops;
++ #endif /* CONFIG_FS_DAX */
++ 
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+  		u64 start, u64 len)
+  {
+diff --cc fs/ext4/ext4.h
+index beaca043ea50,ce70403c4707..000000000000
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@@ -2911,15 -3232,32 +2911,32 @@@ extern struct mutex ext4__aio_mutex[EXT
+  extern int ext4_resize_begin(struct super_block *sb);
+  extern void ext4_resize_end(struct super_block *sb);
+  
+ -static inline void ext4_set_io_unwritten_flag(struct inode *inode,
+ -					      struct ext4_io_end *io_end)
+ +static inline bool ext4_aligned_io(struct inode *inode, loff_t off, loff_t len)
+  {
+ -	if (!(io_end->flag & EXT4_IO_END_UNWRITTEN)) {
+ -		io_end->flag |= EXT4_IO_END_UNWRITTEN;
+ -		atomic_inc(&EXT4_I(inode)->i_unwritten);
+ -	}
+ +	int blksize = 1 << inode->i_blkbits;
+ +
+ +	return IS_ALIGNED(off, blksize) && IS_ALIGNED(len, blksize);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void ext4_clear_io_unwritten_flag(ext4_io_end_t *io_end)
++ {
++ 	struct inode *inode = io_end->inode;
++ 
++ 	if (io_end->flag & EXT4_IO_END_UNWRITTEN) {
++ 		io_end->flag &= ~EXT4_IO_END_UNWRITTEN;
++ 		/* Wake up anyone waiting on unwritten extent conversion */
++ 		if (atomic_dec_and_test(&EXT4_I(inode)->i_unwritten))
++ 			wake_up_all(ext4_ioend_wq(inode));
++ 	}
++ }
++ 
++ extern const struct iomap_ops ext4_iomap_ops;
++ 
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  #endif	/* __KERNEL__ */
+  
+ -#define EFSBADCRC	EBADMSG		/* Bad CRC detected */
+  #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */
+  
+  #endif	/* _EXT4_H */
+diff --cc fs/ext4/inode.c
+index f49ba18669c7,96c2e12cc5d6..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3024,92 -3271,151 +3024,99 @@@ static int ext4_releasepage(struct pag
+  		return try_to_free_buffers(page);
+  }
+  
+ -#ifdef CONFIG_FS_DAX
+ -static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+ -			    unsigned flags, struct iomap *iomap)
+ +/*
+ + * ext4_get_block used when preparing for a DIO write or buffer write.
+ + * We allocate an uinitialized extent if blocks haven't been allocated.
+ + * The extent will be converted to initialized after the IO is complete.
+ + */
+ +int ext4_get_block_write(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+ +{
+ +	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+ +}
+ +
+ +static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+  {
+ -	unsigned int blkbits = inode->i_blkbits;
+ -	unsigned long first_block = offset >> blkbits;
+ -	unsigned long last_block = (offset + length - 1) >> blkbits;
+ -	struct ext4_map_blocks map;
+  	int ret;
+  
+ -	if (WARN_ON_ONCE(ext4_has_inline_data(inode)))
+ -		return -ERANGE;
+ +	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	ret = _ext4_get_block(inode, iblock, bh_result, 0);
+ +	/*
+ +	 * Blocks should have been preallocated! ext4_file_write_iter() checks
+ +	 * that.
+ +	 */
+ +	WARN_ON_ONCE(!buffer_mapped(bh_result));
+  
+ -	map.m_lblk = first_block;
+ -	map.m_len = last_block - first_block + 1;
+ +	return ret;
+ +}
+  
+ -	if (!(flags & IOMAP_WRITE)) {
+ -		ret = ext4_map_blocks(NULL, inode, &map, 0);
+ -	} else {
+ -		int dio_credits;
+ -		handle_t *handle;
+ -		int retries = 0;
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FS_DAX
+ +/*
+ + * Get block function for DAX IO and mmap faults. It takes care of converting
+ + * unwritten extents to written ones and initializes new / converted blocks
+ + * to zeros.
+ + */
+ +int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+ +		       struct buffer_head *bh_result, int create)
+ +{
+ +	int ret, err;
+ +	int credits;
+ +	struct ext4_map_blocks map;
+ +	handle_t *handle = NULL;
+ +	int retries = 0;
+ +	int flags = 0;
+++=======
+++const struct iomap_ops ext4_iomap_ops = {
+++	.iomap_begin		= ext4_iomap_begin,
+++	.iomap_end		= ext4_iomap_end,
+++};
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  
+ -		/* Trim mapping request to maximum we can map at once for DIO */
+ -		if (map.m_len > DIO_MAX_BLOCKS)
+ -			map.m_len = DIO_MAX_BLOCKS;
+ -		dio_credits = ext4_chunk_trans_blocks(inode, map.m_len);
+ +	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+ +	map.m_lblk = iblock;
+ +	map.m_len = bh_result->b_size >> inode->i_blkbits;
+ +	credits = ext4_chunk_trans_blocks(inode, map.m_len);
+  retry:
+ -		/*
+ -		 * Either we allocate blocks and then we don't get unwritten
+ -		 * extent so we have reserved enough credits, or the blocks
+ -		 * are already allocated and unwritten and in that case
+ -		 * extent conversion fits in the credits as well.
+ -		 */
+ -		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS,
+ -					    dio_credits);
+ -		if (IS_ERR(handle))
+ -			return PTR_ERR(handle);
+ -
+ -		ret = ext4_map_blocks(handle, inode, &map,
+ -				      EXT4_GET_BLOCKS_CREATE_ZERO);
+ -		if (ret < 0) {
+ -			ext4_journal_stop(handle);
+ -			if (ret == -ENOSPC &&
+ -			    ext4_should_retry_alloc(inode->i_sb, &retries))
+ -				goto retry;
+ +	if (create) {
+ +		flags |= EXT4_GET_BLOCKS_CREATE_ZERO;
+ +		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
+ +		if (IS_ERR(handle)) {
+ +			ret = PTR_ERR(handle);
+  			return ret;
+  		}
+ -
+ -		/*
+ -		 * If we added blocks beyond i_size, we need to make sure they
+ -		 * will get truncated if we crash before updating i_size in
+ -		 * ext4_iomap_end(). For faults we don't need to do that (and
+ -		 * even cannot because for orphan list operations inode_lock is
+ -		 * required) - if we happen to instantiate block beyond i_size,
+ -		 * it is because we race with truncate which has already added
+ -		 * the inode to the orphan list.
+ -		 */
+ -		if (!(flags & IOMAP_FAULT) && first_block + map.m_len >
+ -		    (i_size_read(inode) + (1 << blkbits) - 1) >> blkbits) {
+ -			int err;
+ -
+ -			err = ext4_orphan_add(handle, inode);
+ -			if (err < 0) {
+ -				ext4_journal_stop(handle);
+ -				return err;
+ -			}
+ -		}
+ -		ext4_journal_stop(handle);
+  	}
+  
+ -	iomap->flags = 0;
+ -	iomap->bdev = inode->i_sb->s_bdev;
+ -	iomap->offset = first_block << blkbits;
+ -
+ -	if (ret == 0) {
+ -		iomap->type = IOMAP_HOLE;
+ -		iomap->blkno = IOMAP_NULL_BLOCK;
+ -		iomap->length = (u64)map.m_len << blkbits;
+ -	} else {
+ -		if (map.m_flags & EXT4_MAP_MAPPED) {
+ -			iomap->type = IOMAP_MAPPED;
+ -		} else if (map.m_flags & EXT4_MAP_UNWRITTEN) {
+ -			iomap->type = IOMAP_UNWRITTEN;
+ -		} else {
+ -			WARN_ON_ONCE(1);
+ -			return -EIO;
+ -		}
+ -		iomap->blkno = (sector_t)map.m_pblk << (blkbits - 9);
+ -		iomap->length = (u64)map.m_len << blkbits;
+ -	}
+ -
+ -	if (map.m_flags & EXT4_MAP_NEW)
+ -		iomap->flags |= IOMAP_F_NEW;
+ -	return 0;
+ -}
+ -
+ -static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
+ -			  ssize_t written, unsigned flags, struct iomap *iomap)
+ -{
+ -	int ret = 0;
+ -	handle_t *handle;
+ -	int blkbits = inode->i_blkbits;
+ -	bool truncate = false;
+ -
+ -	if (!(flags & IOMAP_WRITE) || (flags & IOMAP_FAULT))
+ -		return 0;
+ -
+ -	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
+ -	if (IS_ERR(handle)) {
+ -		ret = PTR_ERR(handle);
+ -		goto orphan_del;
+ -	}
+ -	if (ext4_update_inode_size(inode, offset + written))
+ -		ext4_mark_inode_dirty(handle, inode);
+ -	/*
+ -	 * We may need to truncate allocated but not written blocks beyond EOF.
+ -	 */
+ -	if (iomap->offset + iomap->length > 
+ -	    ALIGN(inode->i_size, 1 << blkbits)) {
+ -		ext4_lblk_t written_blk, end_blk;
+ -
+ -		written_blk = (offset + written) >> blkbits;
+ -		end_blk = (offset + length) >> blkbits;
+ -		if (written_blk < end_blk && ext4_can_truncate(inode))
+ -			truncate = true;
+ +	ret = ext4_map_blocks(handle, inode, &map, flags);
+ +	if (create) {
+ +		err = ext4_journal_stop(handle);
+ +		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+ +			goto retry;
+ +		if (ret >= 0 && err < 0)
+ +			ret = err;
+  	}
+ -	/*
+ -	 * Remove inode from orphan list if we were extending a inode and
+ -	 * everything went fine.
+ -	 */
+ -	if (!truncate && inode->i_nlink &&
+ -	    !list_empty(&EXT4_I(inode)->i_orphan))
+ -		ext4_orphan_del(handle, inode);
+ -	ext4_journal_stop(handle);
+ -	if (truncate) {
+ -		ext4_truncate_failed_write(inode);
+ -orphan_del:
+ +	if (ret <= 0)
+ +		goto out;
+ +out:
+ +	WARN_ON_ONCE(ret == 0 && create);
+ +	if (ret > 0) {
+ +		map_bh(bh_result, inode->i_sb, map.m_pblk);
+  		/*
+ -		 * If truncate failed early the inode might still be on the
+ -		 * orphan list; we need to make sure the inode is removed from
+ -		 * the orphan list in that case.
+ +		 * At least for now we have to clear BH_New so that DAX code
+ +		 * doesn't attempt to zero blocks again in a racy way.
+  		 */
+ -		if (inode->i_nlink)
+ -			ext4_orphan_del(NULL, inode);
+ +		map.m_flags &= ~EXT4_MAP_NEW;
+ +		ext4_update_bh_state(bh_result, map.m_flags);
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+ +		ret = 0;
+ +	} else if (ret == 0) {
+ +		/* hole case, need to fill in bh->b_size */
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+  	}
+  	return ret;
+  }
+diff --cc fs/internal.h
+index c58979ac0a78,11c6d89dce9c..000000000000
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@@ -155,3 -162,28 +155,31 @@@ extern const struct file_operations pip
+   */
+  extern void group_pin_kill(struct hlist_head *p);
+  extern void mnt_pin_kill(struct mount *m);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * fs/nsfs.c
++  */
++ extern const struct dentry_operations ns_dentry_operations;
++ 
++ /*
++  * fs/ioctl.c
++  */
++ extern int do_vfs_ioctl(struct file *file, unsigned int fd, unsigned int cmd,
++ 		    unsigned long arg);
++ extern long vfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++ 
++ /*
++  * iomap support:
++  */
++ typedef loff_t (*iomap_actor_t)(struct inode *inode, loff_t pos, loff_t len,
++ 		void *data, struct iomap *iomap);
++ 
++ loff_t iomap_apply(struct inode *inode, loff_t pos, loff_t length,
++ 		unsigned flags, const struct iomap_ops *ops, void *data,
++ 		iomap_actor_t actor);
++ 
++ /* direct-io.c: */
++ int sb_init_dio_done_wq(struct super_block *sb);
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+diff --cc fs/iomap.c
+index f6bfcdf64146,7f08ca03d95d..000000000000
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@@ -41,9 -39,9 +41,9 @@@ typedef loff_t (*iomap_actor_t)(struct 
+   * resources they require in the iomap_begin call, and release them in the
+   * iomap_end call.
+   */
+ -loff_t
+ +static loff_t
+  iomap_apply(struct inode *inode, loff_t pos, loff_t length, unsigned flags,
+- 		struct iomap_ops *ops, void *data, iomap_actor_t actor)
++ 		const struct iomap_ops *ops, void *data, iomap_actor_t actor)
+  {
+  	struct iomap iomap = { 0 };
+  	loff_t written = 0, ret;
+@@@ -589,3 -585,375 +589,378 @@@ int iomap_fiemap(struct inode *inode, s
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(iomap_fiemap);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Private flags for iomap_dio, must not overlap with the public ones in
++  * iomap.h:
++  */
++ #define IOMAP_DIO_WRITE		(1 << 30)
++ #define IOMAP_DIO_DIRTY		(1 << 31)
++ 
++ struct iomap_dio {
++ 	struct kiocb		*iocb;
++ 	iomap_dio_end_io_t	*end_io;
++ 	loff_t			i_size;
++ 	loff_t			size;
++ 	atomic_t		ref;
++ 	unsigned		flags;
++ 	int			error;
++ 
++ 	union {
++ 		/* used during submission and for synchronous completion: */
++ 		struct {
++ 			struct iov_iter		*iter;
++ 			struct task_struct	*waiter;
++ 			struct request_queue	*last_queue;
++ 			blk_qc_t		cookie;
++ 		} submit;
++ 
++ 		/* used for aio completion: */
++ 		struct {
++ 			struct work_struct	work;
++ 		} aio;
++ 	};
++ };
++ 
++ static ssize_t iomap_dio_complete(struct iomap_dio *dio)
++ {
++ 	struct kiocb *iocb = dio->iocb;
++ 	ssize_t ret;
++ 
++ 	if (dio->end_io) {
++ 		ret = dio->end_io(iocb,
++ 				dio->error ? dio->error : dio->size,
++ 				dio->flags);
++ 	} else {
++ 		ret = dio->error;
++ 	}
++ 
++ 	if (likely(!ret)) {
++ 		ret = dio->size;
++ 		/* check for short read */
++ 		if (iocb->ki_pos + ret > dio->i_size &&
++ 		    !(dio->flags & IOMAP_DIO_WRITE))
++ 			ret = dio->i_size - iocb->ki_pos;
++ 		iocb->ki_pos += ret;
++ 	}
++ 
++ 	inode_dio_end(file_inode(iocb->ki_filp));
++ 	kfree(dio);
++ 
++ 	return ret;
++ }
++ 
++ static void iomap_dio_complete_work(struct work_struct *work)
++ {
++ 	struct iomap_dio *dio = container_of(work, struct iomap_dio, aio.work);
++ 	struct kiocb *iocb = dio->iocb;
++ 	bool is_write = (dio->flags & IOMAP_DIO_WRITE);
++ 	ssize_t ret;
++ 
++ 	ret = iomap_dio_complete(dio);
++ 	if (is_write && ret > 0)
++ 		ret = generic_write_sync(iocb, ret);
++ 	iocb->ki_complete(iocb, ret, 0);
++ }
++ 
++ /*
++  * Set an error in the dio if none is set yet.  We have to use cmpxchg
++  * as the submission context and the completion context(s) can race to
++  * update the error.
++  */
++ static inline void iomap_dio_set_error(struct iomap_dio *dio, int ret)
++ {
++ 	cmpxchg(&dio->error, 0, ret);
++ }
++ 
++ static void iomap_dio_bio_end_io(struct bio *bio)
++ {
++ 	struct iomap_dio *dio = bio->bi_private;
++ 	bool should_dirty = (dio->flags & IOMAP_DIO_DIRTY);
++ 
++ 	if (bio->bi_error)
++ 		iomap_dio_set_error(dio, bio->bi_error);
++ 
++ 	if (atomic_dec_and_test(&dio->ref)) {
++ 		if (is_sync_kiocb(dio->iocb)) {
++ 			struct task_struct *waiter = dio->submit.waiter;
++ 
++ 			WRITE_ONCE(dio->submit.waiter, NULL);
++ 			wake_up_process(waiter);
++ 		} else if (dio->flags & IOMAP_DIO_WRITE) {
++ 			struct inode *inode = file_inode(dio->iocb->ki_filp);
++ 
++ 			INIT_WORK(&dio->aio.work, iomap_dio_complete_work);
++ 			queue_work(inode->i_sb->s_dio_done_wq, &dio->aio.work);
++ 		} else {
++ 			iomap_dio_complete_work(&dio->aio.work);
++ 		}
++ 	}
++ 
++ 	if (should_dirty) {
++ 		bio_check_pages_dirty(bio);
++ 	} else {
++ 		struct bio_vec *bvec;
++ 		int i;
++ 
++ 		bio_for_each_segment_all(bvec, bio, i)
++ 			put_page(bvec->bv_page);
++ 		bio_put(bio);
++ 	}
++ }
++ 
++ static blk_qc_t
++ iomap_dio_zero(struct iomap_dio *dio, struct iomap *iomap, loff_t pos,
++ 		unsigned len)
++ {
++ 	struct page *page = ZERO_PAGE(0);
++ 	struct bio *bio;
++ 
++ 	bio = bio_alloc(GFP_KERNEL, 1);
++ 	bio->bi_bdev = iomap->bdev;
++ 	bio->bi_iter.bi_sector =
++ 		iomap->blkno + ((pos - iomap->offset) >> 9);
++ 	bio->bi_private = dio;
++ 	bio->bi_end_io = iomap_dio_bio_end_io;
++ 
++ 	get_page(page);
++ 	if (bio_add_page(bio, page, len, 0) != len)
++ 		BUG();
++ 	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_SYNC | REQ_IDLE);
++ 
++ 	atomic_inc(&dio->ref);
++ 	return submit_bio(bio);
++ }
++ 
++ static loff_t
++ iomap_dio_actor(struct inode *inode, loff_t pos, loff_t length,
++ 		void *data, struct iomap *iomap)
++ {
++ 	struct iomap_dio *dio = data;
++ 	unsigned blkbits = blksize_bits(bdev_logical_block_size(iomap->bdev));
++ 	unsigned fs_block_size = (1 << inode->i_blkbits), pad;
++ 	unsigned align = iov_iter_alignment(dio->submit.iter);
++ 	struct iov_iter iter;
++ 	struct bio *bio;
++ 	bool need_zeroout = false;
++ 	int nr_pages, ret;
++ 
++ 	if ((pos | length | align) & ((1 << blkbits) - 1))
++ 		return -EINVAL;
++ 
++ 	switch (iomap->type) {
++ 	case IOMAP_HOLE:
++ 		if (WARN_ON_ONCE(dio->flags & IOMAP_DIO_WRITE))
++ 			return -EIO;
++ 		/*FALLTHRU*/
++ 	case IOMAP_UNWRITTEN:
++ 		if (!(dio->flags & IOMAP_DIO_WRITE)) {
++ 			iov_iter_zero(length, dio->submit.iter);
++ 			dio->size += length;
++ 			return length;
++ 		}
++ 		dio->flags |= IOMAP_DIO_UNWRITTEN;
++ 		need_zeroout = true;
++ 		break;
++ 	case IOMAP_MAPPED:
++ 		if (iomap->flags & IOMAP_F_SHARED)
++ 			dio->flags |= IOMAP_DIO_COW;
++ 		if (iomap->flags & IOMAP_F_NEW)
++ 			need_zeroout = true;
++ 		break;
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		return -EIO;
++ 	}
++ 
++ 	/*
++ 	 * Operate on a partial iter trimmed to the extent we were called for.
++ 	 * We'll update the iter in the dio once we're done with this extent.
++ 	 */
++ 	iter = *dio->submit.iter;
++ 	iov_iter_truncate(&iter, length);
++ 
++ 	nr_pages = iov_iter_npages(&iter, BIO_MAX_PAGES);
++ 	if (nr_pages <= 0)
++ 		return nr_pages;
++ 
++ 	if (need_zeroout) {
++ 		/* zero out from the start of the block to the write offset */
++ 		pad = pos & (fs_block_size - 1);
++ 		if (pad)
++ 			iomap_dio_zero(dio, iomap, pos - pad, pad);
++ 	}
++ 
++ 	do {
++ 		if (dio->error)
++ 			return 0;
++ 
++ 		bio = bio_alloc(GFP_KERNEL, nr_pages);
++ 		bio->bi_bdev = iomap->bdev;
++ 		bio->bi_iter.bi_sector =
++ 			iomap->blkno + ((pos - iomap->offset) >> 9);
++ 		bio->bi_private = dio;
++ 		bio->bi_end_io = iomap_dio_bio_end_io;
++ 
++ 		ret = bio_iov_iter_get_pages(bio, &iter);
++ 		if (unlikely(ret)) {
++ 			bio_put(bio);
++ 			return ret;
++ 		}
++ 
++ 		if (dio->flags & IOMAP_DIO_WRITE) {
++ 			bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_SYNC | REQ_IDLE);
++ 			task_io_account_write(bio->bi_iter.bi_size);
++ 		} else {
++ 			bio_set_op_attrs(bio, REQ_OP_READ, 0);
++ 			if (dio->flags & IOMAP_DIO_DIRTY)
++ 				bio_set_pages_dirty(bio);
++ 		}
++ 
++ 		dio->size += bio->bi_iter.bi_size;
++ 		pos += bio->bi_iter.bi_size;
++ 
++ 		nr_pages = iov_iter_npages(&iter, BIO_MAX_PAGES);
++ 
++ 		atomic_inc(&dio->ref);
++ 
++ 		dio->submit.last_queue = bdev_get_queue(iomap->bdev);
++ 		dio->submit.cookie = submit_bio(bio);
++ 	} while (nr_pages);
++ 
++ 	if (need_zeroout) {
++ 		/* zero out from the end of the write to the end of the block */
++ 		pad = pos & (fs_block_size - 1);
++ 		if (pad)
++ 			iomap_dio_zero(dio, iomap, pos, fs_block_size - pad);
++ 	}
++ 
++ 	iov_iter_advance(dio->submit.iter, length);
++ 	return length;
++ }
++ 
++ ssize_t
++ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		const struct iomap_ops *ops, iomap_dio_end_io_t end_io)
++ {
++ 	struct address_space *mapping = iocb->ki_filp->f_mapping;
++ 	struct inode *inode = file_inode(iocb->ki_filp);
++ 	size_t count = iov_iter_count(iter);
++ 	loff_t pos = iocb->ki_pos, end = iocb->ki_pos + count - 1, ret = 0;
++ 	unsigned int flags = IOMAP_DIRECT;
++ 	struct blk_plug plug;
++ 	struct iomap_dio *dio;
++ 
++ 	lockdep_assert_held(&inode->i_rwsem);
++ 
++ 	if (!count)
++ 		return 0;
++ 
++ 	dio = kmalloc(sizeof(*dio), GFP_KERNEL);
++ 	if (!dio)
++ 		return -ENOMEM;
++ 
++ 	dio->iocb = iocb;
++ 	atomic_set(&dio->ref, 1);
++ 	dio->size = 0;
++ 	dio->i_size = i_size_read(inode);
++ 	dio->end_io = end_io;
++ 	dio->error = 0;
++ 	dio->flags = 0;
++ 
++ 	dio->submit.iter = iter;
++ 	if (is_sync_kiocb(iocb)) {
++ 		dio->submit.waiter = current;
++ 		dio->submit.cookie = BLK_QC_T_NONE;
++ 		dio->submit.last_queue = NULL;
++ 	}
++ 
++ 	if (iov_iter_rw(iter) == READ) {
++ 		if (pos >= dio->i_size)
++ 			goto out_free_dio;
++ 
++ 		if (iter->type == ITER_IOVEC)
++ 			dio->flags |= IOMAP_DIO_DIRTY;
++ 	} else {
++ 		dio->flags |= IOMAP_DIO_WRITE;
++ 		flags |= IOMAP_WRITE;
++ 	}
++ 
++ 	if (mapping->nrpages) {
++ 		ret = filemap_write_and_wait_range(mapping, iocb->ki_pos, end);
++ 		if (ret)
++ 			goto out_free_dio;
++ 
++ 		ret = invalidate_inode_pages2_range(mapping,
++ 				iocb->ki_pos >> PAGE_SHIFT, end >> PAGE_SHIFT);
++ 		WARN_ON_ONCE(ret);
++ 		ret = 0;
++ 	}
++ 
++ 	inode_dio_begin(inode);
++ 
++ 	blk_start_plug(&plug);
++ 	do {
++ 		ret = iomap_apply(inode, pos, count, flags, ops, dio,
++ 				iomap_dio_actor);
++ 		if (ret <= 0) {
++ 			/* magic error code to fall back to buffered I/O */
++ 			if (ret == -ENOTBLK)
++ 				ret = 0;
++ 			break;
++ 		}
++ 		pos += ret;
++ 	} while ((count = iov_iter_count(iter)) > 0);
++ 	blk_finish_plug(&plug);
++ 
++ 	if (ret < 0)
++ 		iomap_dio_set_error(dio, ret);
++ 
++ 	if (ret >= 0 && iov_iter_rw(iter) == WRITE && !is_sync_kiocb(iocb) &&
++ 			!inode->i_sb->s_dio_done_wq) {
++ 		ret = sb_init_dio_done_wq(inode->i_sb);
++ 		if (ret < 0)
++ 			iomap_dio_set_error(dio, ret);
++ 	}
++ 
++ 	if (!atomic_dec_and_test(&dio->ref)) {
++ 		if (!is_sync_kiocb(iocb))
++ 			return -EIOCBQUEUED;
++ 
++ 		for (;;) {
++ 			set_current_state(TASK_UNINTERRUPTIBLE);
++ 			if (!READ_ONCE(dio->submit.waiter))
++ 				break;
++ 
++ 			if (!(iocb->ki_flags & IOCB_HIPRI) ||
++ 			    !dio->submit.last_queue ||
++ 			    !blk_mq_poll(dio->submit.last_queue,
++ 					 dio->submit.cookie))
++ 				io_schedule();
++ 		}
++ 		__set_current_state(TASK_RUNNING);
++ 	}
++ 
++ 	/*
++ 	 * Try again to invalidate clean pages which might have been cached by
++ 	 * non-direct readahead, or faulted in by get_user_pages() if the source
++ 	 * of the write was an mmap'ed region of the file we're writing.  Either
++ 	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
++ 	 * this invalidation fails, tough, the write still worked...
++ 	 */
++ 	if (iov_iter_rw(iter) == WRITE && mapping->nrpages) {
++ 		ret = invalidate_inode_pages2_range(mapping,
++ 				iocb->ki_pos >> PAGE_SHIFT, end >> PAGE_SHIFT);
++ 		WARN_ON_ONCE(ret);
++ 	}
++ 
++ 	return iomap_dio_complete(dio);
++ 
++ out_free_dio:
++ 	kfree(dio);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(iomap_dio_rw);
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+diff --cc fs/xfs/xfs_iomap.c
+index 39ce9cf9a329,25ed98324b27..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -943,28 -941,255 +943,96 @@@ error_on_bmapi_transaction
+  	return error;
+  }
+  
+ -static inline bool imap_needs_alloc(struct inode *inode,
+ -		struct xfs_bmbt_irec *imap, int nimaps)
+ -{
+ -	return !nimaps ||
+ -		imap->br_startblock == HOLESTARTBLOCK ||
+ -		imap->br_startblock == DELAYSTARTBLOCK ||
+ -		(IS_DAX(inode) && ISUNWRITTEN(imap));
+ -}
+ -
+ -static inline bool need_excl_ilock(struct xfs_inode *ip, unsigned flags)
+ -{
+ -	/*
+ -	 * COW writes will allocate delalloc space, so we need to make sure
+ -	 * to take the lock exclusively here.
+ -	 */
+ -	if (xfs_is_reflink_inode(ip) && (flags & (IOMAP_WRITE | IOMAP_ZERO)))
+ -		return true;
+ -	if ((flags & IOMAP_DIRECT) && (flags & IOMAP_WRITE))
+ -		return true;
+ -	return false;
+ -}
+ -
+ -static int
+ -xfs_file_iomap_begin(
+ -	struct inode		*inode,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	unsigned		flags,
+ -	struct iomap		*iomap)
+ -{
+ -	struct xfs_inode	*ip = XFS_I(inode);
+ -	struct xfs_mount	*mp = ip->i_mount;
+ -	struct xfs_bmbt_irec	imap;
+ -	xfs_fileoff_t		offset_fsb, end_fsb;
+ -	int			nimaps = 1, error = 0;
+ -	bool			shared = false, trimmed = false;
+ -	unsigned		lockmode;
+ -
+ -	if (XFS_FORCED_SHUTDOWN(mp))
+ -		return -EIO;
+ -
+ -	if (((flags & (IOMAP_WRITE | IOMAP_DIRECT)) == IOMAP_WRITE) &&
+ -			!IS_DAX(inode) && !xfs_get_extsz_hint(ip)) {
+ -		/* Reserve delalloc blocks for regular writeback. */
+ -		return xfs_file_iomap_begin_delay(inode, offset, length, flags,
+ -				iomap);
+ -	}
+ -
+ -	if (need_excl_ilock(ip, flags)) {
+ -		lockmode = XFS_ILOCK_EXCL;
+ -		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ -	} else {
+ -		lockmode = xfs_ilock_data_map_shared(ip);
+ -	}
+ -
+ -	ASSERT(offset <= mp->m_super->s_maxbytes);
+ -	if ((xfs_fsize_t)offset + length > mp->m_super->s_maxbytes)
+ -		length = mp->m_super->s_maxbytes - offset;
+ -	offset_fsb = XFS_B_TO_FSBT(mp, offset);
+ -	end_fsb = XFS_B_TO_FSB(mp, offset + length);
+ -
+ -	if (xfs_is_reflink_inode(ip) &&
+ -	    (flags & IOMAP_WRITE) && (flags & IOMAP_DIRECT)) {
+ -		shared = xfs_reflink_find_cow_mapping(ip, offset, &imap);
+ -		if (shared) {
+ -			xfs_iunlock(ip, lockmode);
+ -			goto alloc_done;
+ -		}
+ -		ASSERT(!isnullstartblock(imap.br_startblock));
+ -	}
+ -
+ -	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
+ -			       &nimaps, 0);
+ -	if (error)
+ -		goto out_unlock;
+ -
+ -	if ((flags & IOMAP_REPORT) ||
+ -	    (xfs_is_reflink_inode(ip) &&
+ -	     (flags & IOMAP_WRITE) && (flags & IOMAP_DIRECT))) {
+ -		/* Trim the mapping to the nearest shared extent boundary. */
+ -		error = xfs_reflink_trim_around_shared(ip, &imap, &shared,
+ -				&trimmed);
+ -		if (error)
+ -			goto out_unlock;
+ -
+ -		/*
+ -		 * We're here because we're trying to do a directio write to a
+ -		 * region that isn't aligned to a filesystem block.  If the
+ -		 * extent is shared, fall back to buffered mode to handle the
+ -		 * RMW.
+ -		 */
+ -		if (!(flags & IOMAP_REPORT) && shared) {
+ -			trace_xfs_reflink_bounce_dio_write(ip, &imap);
+ -			error = -EREMCHG;
+ -			goto out_unlock;
+ -		}
+ -	}
+ -
+ -	if ((flags & (IOMAP_WRITE | IOMAP_ZERO)) && xfs_is_reflink_inode(ip)) {
+ -		error = xfs_reflink_reserve_cow(ip, &imap, &shared);
+ -		if (error)
+ -			goto out_unlock;
+ -
+ -		end_fsb = imap.br_startoff + imap.br_blockcount;
+ -		length = XFS_FSB_TO_B(mp, end_fsb) - offset;
+ -	}
+ -
+ -	if ((flags & IOMAP_WRITE) && imap_needs_alloc(inode, &imap, nimaps)) {
+ -		/*
+ -		 * We cap the maximum length we map here to MAX_WRITEBACK_PAGES
+ -		 * pages to keep the chunks of work done where somewhat symmetric
+ -		 * with the work writeback does. This is a completely arbitrary
+ -		 * number pulled out of thin air as a best guess for initial
+ -		 * testing.
+ -		 *
+ -		 * Note that the values needs to be less than 32-bits wide until
+ -		 * the lower level functions are updated.
+ -		 */
+ -		length = min_t(loff_t, length, 1024 * PAGE_SIZE);
+ -		/*
+ -		 * xfs_iomap_write_direct() expects the shared lock. It
+ -		 * is unlocked on return.
+ -		 */
+ -		if (lockmode == XFS_ILOCK_EXCL)
+ -			xfs_ilock_demote(ip, lockmode);
+ -		error = xfs_iomap_write_direct(ip, offset, length, &imap,
+ -				nimaps);
+ -		if (error)
+ -			return error;
+ -
+ -alloc_done:
+ -		iomap->flags = IOMAP_F_NEW;
+ -		trace_xfs_iomap_alloc(ip, offset, length, 0, &imap);
+ -	} else {
+ -		ASSERT(nimaps);
+ -
+ -		xfs_iunlock(ip, lockmode);
+ -		trace_xfs_iomap_found(ip, offset, length, 0, &imap);
+ -	}
+ -
+ -	xfs_bmbt_to_iomap(ip, iomap, &imap);
+ -	if (shared)
+ -		iomap->flags |= IOMAP_F_SHARED;
+ -	return 0;
+ -out_unlock:
+ -	xfs_iunlock(ip, lockmode);
+ -	return error;
+ -}
+ -
+ -static int
+ -xfs_file_iomap_end_delalloc(
+ +void
+ +xfs_bmbt_to_iomap(
+  	struct xfs_inode	*ip,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	ssize_t			written)
+ +	struct iomap		*iomap,
+ +	struct xfs_bmbt_irec	*imap)
+  {
+  	struct xfs_mount	*mp = ip->i_mount;
+ -	xfs_fileoff_t		start_fsb;
+ -	xfs_fileoff_t		end_fsb;
+ -	int			error = 0;
+ -
+ -	start_fsb = XFS_B_TO_FSB(mp, offset + written);
+ -	end_fsb = XFS_B_TO_FSB(mp, offset + length);
+  
+ -	/*
+ -	 * Trim back delalloc blocks if we didn't manage to write the whole
+ -	 * range reserved.
+ -	 *
+ -	 * We don't need to care about racing delalloc as we hold i_mutex
+ -	 * across the reserve/allocate/unreserve calls. If there are delalloc
+ -	 * blocks in the range, they are ours.
+ -	 */
+ -	if (start_fsb < end_fsb) {
+ -		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ -		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ -					       end_fsb - start_fsb);
+ -		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ -
+ -		if (error && !XFS_FORCED_SHUTDOWN(mp)) {
+ -			xfs_alert(mp, "%s: unable to clean up ino %lld",
+ -				__func__, ip->i_ino);
+ -			return error;
+ -		}
+ +	if (imap->br_startblock == HOLESTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_HOLE;
+ +	} else if (imap->br_startblock == DELAYSTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_DELALLOC;
+ +	} else {
+ +		iomap->blkno = xfs_fsb_to_db(ip, imap->br_startblock);
+ +		if (imap->br_state == XFS_EXT_UNWRITTEN)
+ +			iomap->type = IOMAP_UNWRITTEN;
+ +		else
+ +			iomap->type = IOMAP_MAPPED;
+  	}
+ -
+ -	return 0;
+ +	iomap->offset = XFS_FSB_TO_B(mp, imap->br_startoff);
+ +	iomap->length = XFS_FSB_TO_B(mp, imap->br_blockcount);
+ +	iomap->bdev = xfs_find_bdev_for_inode(VFS_I(ip));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int
++ xfs_file_iomap_end(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	ssize_t			written,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	if ((flags & IOMAP_WRITE) && iomap->type == IOMAP_DELALLOC)
++ 		return xfs_file_iomap_end_delalloc(XFS_I(inode), offset,
++ 				length, written);
++ 	return 0;
++ }
++ 
++ const struct iomap_ops xfs_iomap_ops = {
++ 	.iomap_begin		= xfs_file_iomap_begin,
++ 	.iomap_end		= xfs_file_iomap_end,
++ };
++ 
++ static int
++ xfs_xattr_iomap_begin(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
++ 	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + length);
++ 	struct xfs_bmbt_irec	imap;
++ 	int			nimaps = 1, error = 0;
++ 	unsigned		lockmode;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	lockmode = xfs_ilock_data_map_shared(ip);
++ 
++ 	/* if there are no attribute fork or extents, return ENOENT */
++ 	if (XFS_IFORK_Q(ip) || !ip->i_d.di_anextents) {
++ 		error = -ENOENT;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ASSERT(ip->i_d.di_aformat != XFS_DINODE_FMT_LOCAL);
++ 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
++ 			       &nimaps, XFS_BMAPI_ENTIRE | XFS_BMAPI_ATTRFORK);
++ out_unlock:
++ 	xfs_iunlock(ip, lockmode);
++ 
++ 	if (!error) {
++ 		ASSERT(nimaps);
++ 		xfs_bmbt_to_iomap(ip, iomap, &imap);
++ 	}
++ 
++ 	return error;
++ }
++ 
++ const struct iomap_ops xfs_xattr_iomap_ops = {
++ 	.iomap_begin		= xfs_xattr_iomap_begin,
++ };
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+diff --cc fs/xfs/xfs_iomap.h
+index 718f07c5c0d2,705224b66b6a..000000000000
+--- a/fs/xfs/xfs_iomap.h
++++ b/fs/xfs/xfs_iomap.h
+@@@ -32,5 -31,9 +32,12 @@@ int xfs_iomap_write_unwritten(struct xf
+  
+  void xfs_bmbt_to_iomap(struct xfs_inode *, struct iomap *,
+  		struct xfs_bmbt_irec *);
+++<<<<<<< HEAD
+++=======
++ xfs_extlen_t xfs_eof_alignment(struct xfs_inode *ip, xfs_extlen_t extsize);
++ 
++ extern const struct iomap_ops xfs_iomap_ops;
++ extern const struct iomap_ops xfs_xattr_iomap_ops;
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  
+  #endif /* __XFS_IOMAP_H__*/
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,2983e52efd07..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,44 +6,43 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+ -struct iomap_ops;
+ -
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+  
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+  
+++<<<<<<< HEAD
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+++=======
++ static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
++ {
++ 	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
++ 			((unsigned long)sector << RADIX_DAX_SHIFT) |
++ 			RADIX_DAX_ENTRY_LOCK);
++ }
++ 
++ ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		const struct iomap_ops *ops);
++ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
++ 			const struct iomap_ops *ops);
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+@@@ -56,8 -64,23 +70,28 @@@ static inline int __dax_zero_page_range
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline int dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+ +				pmd_t *pmd, unsigned int flags, get_block_t gb)
+++=======
++ #ifdef CONFIG_FS_DAX_PMD
++ static inline unsigned int dax_radix_order(void *entry)
++ {
++ 	if ((unsigned long)entry & RADIX_DAX_PMD)
++ 		return PMD_SHIFT - PAGE_SHIFT;
++ 	return 0;
++ }
++ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
++ 		pmd_t *pmd, unsigned int flags, const struct iomap_ops *ops);
++ #else
++ static inline unsigned int dax_radix_order(void *entry)
++ {
++ 	return 0;
++ }
++ static inline int dax_iomap_pmd_fault(struct vm_area_struct *vma,
++ 		unsigned long address, pmd_t *pmd, unsigned int flags,
++ 		const struct iomap_ops *ops)
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  {
+  	return VM_FAULT_FALLBACK;
+  }
+diff --cc include/linux/iomap.h
+index c74226a738a3,891459caa278..000000000000
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@@ -64,16 -72,26 +64,29 @@@ struct iomap_ops 
+  };
+  
+  ssize_t iomap_file_buffered_write(struct kiocb *iocb, struct iov_iter *from,
+- 		struct iomap_ops *ops);
++ 		const struct iomap_ops *ops);
+  int iomap_file_dirty(struct inode *inode, loff_t pos, loff_t len,
+- 		struct iomap_ops *ops);
++ 		const struct iomap_ops *ops);
+  int iomap_zero_range(struct inode *inode, loff_t pos, loff_t len,
+- 		bool *did_zero, struct iomap_ops *ops);
++ 		bool *did_zero, const struct iomap_ops *ops);
+  int iomap_truncate_page(struct inode *inode, loff_t pos, bool *did_zero,
+- 		struct iomap_ops *ops);
++ 		const struct iomap_ops *ops);
+  int iomap_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
+- 		struct iomap_ops *ops);
++ 		const struct iomap_ops *ops);
+  int iomap_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+- 		loff_t start, loff_t len, struct iomap_ops *ops);
++ 		loff_t start, loff_t len, const struct iomap_ops *ops);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Flags for direct I/O ->end_io:
++  */
++ #define IOMAP_DIO_UNWRITTEN	(1 << 0)	/* covers unwritten extent(s) */
++ #define IOMAP_DIO_COW		(1 << 1)	/* covers COW extent(s) */
++ typedef int (iomap_dio_end_io_t)(struct kiocb *iocb, ssize_t ret,
++ 		unsigned flags);
++ ssize_t iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		const struct iomap_ops *ops, iomap_dio_end_io_t end_io);
++ 
+++>>>>>>> 8ff6daa17b6a (iomap: constify struct iomap_ops)
+  #endif /* LINUX_IOMAP_H */
+* Unmerged path fs/dax.c
+* Unmerged path fs/ext2/ext2.h
+* Unmerged path fs/ext2/inode.c
+* Unmerged path fs/ext4/ext4.h
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/internal.h
+* Unmerged path fs/iomap.c
+* Unmerged path fs/xfs/xfs_iomap.c
+* Unmerged path fs/xfs/xfs_iomap.h
+* Unmerged path include/linux/dax.h
+* Unmerged path include/linux/iomap.h
