@@ -1753,7 +1753,8 @@ static int qed_start_vport(struct qed_dev *cdev,
 			   start.vport_id, start.mtu);
 	}
 
-	qed_reset_vport_stats(cdev);
+	if (params->clear_stats)
+		qed_reset_vport_stats(cdev);
 
 	return 0;
 }
