@@ -1,0 +1,232 @@
+memcg, slab: never try to merge memcg caches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit a44cb9449182fd7b25bf5f1cc38b7f19e0b96f6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a44cb944.failed
+
+When a kmem cache is created (kmem_cache_create_memcg()), we first try to
+find a compatible cache that already exists and can handle requests from
+the new cache, i.e.  has the same object size, alignment, ctor, etc.  If
+there is such a cache, we do not create any new caches, instead we simply
+increment the refcount of the cache found and return it.
+
+Currently we do this procedure not only when creating root caches, but
+also for memcg caches.  However, there is no point in that, because, as
+every memcg cache has exactly the same parameters as its parent and cache
+merging cannot be turned off in runtime (only on boot by passing
+"slub_nomerge"), the root caches of any two potentially mergeable memcg
+caches should be merged already, i.e.  it must be the same root cache, and
+therefore we couldn't even get to the memcg cache creation, because it
+already exists.
+
+The only exception is boot caches - they are explicitly forbidden to be
+merged by setting their refcount to -1.  There are currently only two of
+them - kmem_cache and kmem_cache_node, which are used in slab internals (I
+do not count kmalloc caches as their refcount is set to 1 immediately
+after creation).  Since they are prevented from merging preliminary I
+guess we should avoid to merge their children too.
+
+So let's remove the useless code responsible for merging memcg caches.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a44cb9449182fd7b25bf5f1cc38b7f19e0b96f6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab_common.c
+diff --cc mm/slab_common.c
+index e13d227ed0ab,e77b51eb7347..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -207,42 -200,38 +207,50 @@@ kmem_cache_create_memcg(struct mem_cgro
+  	 */
+  	flags &= CACHE_CREATE_MASK;
+  
+++<<<<<<< HEAD
+ +	s = __kmem_cache_alias(memcg, name, size, align, flags, ctor);
+ +	if (s)
+ +		goto out_locked;
+++=======
++ 	if (!memcg) {
++ 		s = __kmem_cache_alias(name, size, align, flags, ctor);
++ 		if (s)
++ 			goto out_unlock;
++ 	}
+++>>>>>>> a44cb9449182 (memcg, slab: never try to merge memcg caches)
+  
+ -	err = -ENOMEM;
+  	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+ -	if (!s)
+ -		goto out_unlock;
+ -
+ -	s->object_size = s->size = size;
+ -	s->align = calculate_alignment(flags, align, size);
+ -	s->ctor = ctor;
+ -
+ -	s->name = kstrdup(name, GFP_KERNEL);
+ -	if (!s->name)
+ -		goto out_free_cache;
+ +	if (s) {
+ +		s->object_size = s->size = size;
+ +		s->align = calculate_alignment(flags, align, size);
+ +		s->ctor = ctor;
+  
+ -	err = memcg_alloc_cache_params(memcg, s, parent_cache);
+ -	if (err)
+ -		goto out_free_cache;
+ +		if (memcg_register_cache(memcg, s, parent_cache)) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+  
+ -	err = __kmem_cache_create(s, flags);
+ -	if (err)
+ -		goto out_free_cache;
+ +		s->name = kstrdup(name, GFP_KERNEL);
+ +		if (!s->name) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+  
+ -	s->refcount = 1;
+ -	list_add(&s->list, &slab_caches);
+ -	memcg_register_cache(s);
+ +		err = __kmem_cache_create(s, flags);
+ +		if (!err) {
+ +			s->refcount = 1;
+ +			list_add(&s->list, &slab_caches);
+ +			memcg_cache_list_add(memcg, s);
+ +		} else {
+ +			kfree(s->name);
+ +			kmem_cache_free(kmem_cache, s);
+ +		}
+ +	} else
+ +		err = -ENOMEM;
+  
+ -out_unlock:
+ +out_locked:
+  	mutex_unlock(&slab_mutex);
+  	put_online_cpus();
+  
+diff --git a/mm/slab.h b/mm/slab.h
+index 1e2ba6833b10..7474c0a584b5 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -55,12 +55,12 @@ extern void create_boot_cache(struct kmem_cache *, const char *name,
+ struct mem_cgroup;
+ #ifdef CONFIG_SLUB
+ struct kmem_cache *
+-__kmem_cache_alias(struct mem_cgroup *memcg, const char *name, size_t size,
+-		   size_t align, unsigned long flags, void (*ctor)(void *));
++__kmem_cache_alias(const char *name, size_t size, size_t align,
++		   unsigned long flags, void (*ctor)(void *));
+ #else
+ static inline struct kmem_cache *
+-__kmem_cache_alias(struct mem_cgroup *memcg, const char *name, size_t size,
+-		   size_t align, unsigned long flags, void (*ctor)(void *))
++__kmem_cache_alias(const char *name, size_t size, size_t align,
++		   unsigned long flags, void (*ctor)(void *))
+ { return NULL; }
+ #endif
+ 
+@@ -128,13 +128,6 @@ static inline bool is_root_cache(struct kmem_cache *s)
+ 	return !s->memcg_params || s->memcg_params->is_root_cache;
+ }
+ 
+-static inline bool cache_match_memcg(struct kmem_cache *cachep,
+-				     struct mem_cgroup *memcg)
+-{
+-	return (is_root_cache(cachep) && !memcg) ||
+-				(cachep->memcg_params->memcg == memcg);
+-}
+-
+ static inline void memcg_bind_pages(struct kmem_cache *s, int order)
+ {
+ 	if (!is_root_cache(s))
+@@ -188,12 +181,6 @@ static inline bool is_root_cache(struct kmem_cache *s)
+ 	return true;
+ }
+ 
+-static inline bool cache_match_memcg(struct kmem_cache *cachep,
+-				     struct mem_cgroup *memcg)
+-{
+-	return true;
+-}
+-
+ static inline void memcg_bind_pages(struct kmem_cache *s, int order)
+ {
+ }
+* Unmerged path mm/slab_common.c
+diff --git a/mm/slub.c b/mm/slub.c
+index 4e83c8337168..d3a16ca611f6 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3896,6 +3896,9 @@ static int slab_unmergeable(struct kmem_cache *s)
+ 	if (slub_nomerge || (s->flags & SLUB_NEVER_MERGE))
+ 		return 1;
+ 
++	if (!is_root_cache(s))
++		return 1;
++
+ 	if (s->ctor)
+ 		return 1;
+ 
+@@ -3908,9 +3911,8 @@ static int slab_unmergeable(struct kmem_cache *s)
+ 	return 0;
+ }
+ 
+-static struct kmem_cache *find_mergeable(struct mem_cgroup *memcg, size_t size,
+-		size_t align, unsigned long flags, const char *name,
+-		void (*ctor)(void *))
++static struct kmem_cache *find_mergeable(size_t size, size_t align,
++		unsigned long flags, const char *name, void (*ctor)(void *))
+ {
+ 	struct kmem_cache *s;
+ 
+@@ -3933,7 +3935,7 @@ static struct kmem_cache *find_mergeable(struct mem_cgroup *memcg, size_t size,
+ 			continue;
+ 
+ 		if ((flags & SLUB_MERGE_SAME) != (s->flags & SLUB_MERGE_SAME))
+-				continue;
++			continue;
+ 		/*
+ 		 * Check if alignment is compatible.
+ 		 * Courtesy of Adrian Drzewiecki
+@@ -3944,21 +3946,18 @@ static struct kmem_cache *find_mergeable(struct mem_cgroup *memcg, size_t size,
+ 		if (s->size - size >= sizeof(void *))
+ 			continue;
+ 
+-		if (!cache_match_memcg(s, memcg))
+-			continue;
+-
+ 		return s;
+ 	}
+ 	return NULL;
+ }
+ 
+ struct kmem_cache *
+-__kmem_cache_alias(struct mem_cgroup *memcg, const char *name, size_t size,
+-		   size_t align, unsigned long flags, void (*ctor)(void *))
++__kmem_cache_alias(const char *name, size_t size, size_t align,
++		   unsigned long flags, void (*ctor)(void *))
+ {
+ 	struct kmem_cache *s;
+ 
+-	s = find_mergeable(memcg, size, align, flags, name, ctor);
++	s = find_mergeable(size, align, flags, name, ctor);
+ 	if (s) {
+ 		s->refcount++;
+ 		/*
