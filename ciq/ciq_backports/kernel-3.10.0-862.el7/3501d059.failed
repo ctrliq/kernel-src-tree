@@ -1,0 +1,129 @@
+sch_cbq: fix null pointer dereferences on init failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 3501d059921246ff617b43e86250a719c140bd97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3501d059.failed
+
+CBQ can fail on ->init by wrong nl attributes or simply for missing any,
+f.e. if it's set as a default qdisc then TCA_OPTIONS (opt) will be NULL
+when it is activated. The first thing init does is parse opt but it will
+dereference a null pointer if used as a default qdisc, also since init
+failure at default qdisc invokes ->reset() which cancels all timers then
+we'll also dereference two more null pointers (timer->base) as they were
+never initialized.
+
+To reproduce:
+$ sysctl net.core.default_qdisc=cbq
+$ ip l set ethX up
+
+Crash log of the first null ptr deref:
+[44727.907454] BUG: unable to handle kernel NULL pointer dereference at (null)
+[44727.907600] IP: cbq_init+0x27/0x205
+[44727.907676] PGD 59ff4067
+[44727.907677] P4D 59ff4067
+[44727.907742] PUD 59c70067
+[44727.907807] PMD 0
+[44727.907873]
+[44727.907982] Oops: 0000 [#1] SMP
+[44727.908054] Modules linked in:
+[44727.908126] CPU: 1 PID: 21312 Comm: ip Not tainted 4.13.0-rc6+ #60
+[44727.908235] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.7.5-20140531_083030-gandalf 04/01/2014
+[44727.908477] task: ffff88005ad42700 task.stack: ffff880037214000
+[44727.908672] RIP: 0010:cbq_init+0x27/0x205
+[44727.908838] RSP: 0018:ffff8800372175f0 EFLAGS: 00010286
+[44727.909018] RAX: ffffffff816c3852 RBX: ffff880058c53800 RCX: 0000000000000000
+[44727.909222] RDX: 0000000000000004 RSI: 0000000000000000 RDI: ffff8800372175f8
+[44727.909427] RBP: ffff880037217650 R08: ffffffff81b0f380 R09: 0000000000000000
+[44727.909631] R10: ffff880037217660 R11: 0000000000000020 R12: ffffffff822a44c0
+[44727.909835] R13: ffff880058b92000 R14: 00000000ffffffff R15: 0000000000000001
+[44727.910040] FS:  00007ff8bc583740(0000) GS:ffff88005d880000(0000) knlGS:0000000000000000
+[44727.910339] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[44727.910525] CR2: 0000000000000000 CR3: 00000000371e5000 CR4: 00000000000406e0
+[44727.910731] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[44727.910936] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[44727.911141] Call Trace:
+[44727.911291]  ? lockdep_init_map+0xb6/0x1ba
+[44727.911461]  ? qdisc_alloc+0x14e/0x187
+[44727.911626]  qdisc_create_dflt+0x7a/0x94
+[44727.911794]  ? dev_activate+0x129/0x129
+[44727.911959]  attach_one_default_qdisc+0x36/0x63
+[44727.912132]  netdev_for_each_tx_queue+0x3d/0x48
+[44727.912305]  dev_activate+0x4b/0x129
+[44727.912468]  __dev_open+0xe7/0x104
+[44727.912631]  __dev_change_flags+0xc6/0x15c
+[44727.912799]  dev_change_flags+0x25/0x59
+[44727.912966]  do_setlink+0x30c/0xb3f
+[44727.913129]  ? check_chain_key+0xb0/0xfd
+[44727.913294]  ? check_chain_key+0xb0/0xfd
+[44727.913463]  rtnl_newlink+0x3a4/0x729
+[44727.913626]  ? rtnl_newlink+0x117/0x729
+[44727.913801]  ? ns_capable_common+0xd/0xb1
+[44727.913968]  ? ns_capable+0x13/0x15
+[44727.914131]  rtnetlink_rcv_msg+0x188/0x197
+[44727.914300]  ? rcu_read_unlock+0x3e/0x5f
+[44727.914465]  ? rtnl_newlink+0x729/0x729
+[44727.914630]  netlink_rcv_skb+0x6c/0xce
+[44727.914796]  rtnetlink_rcv+0x23/0x2a
+[44727.914956]  netlink_unicast+0x103/0x181
+[44727.915122]  netlink_sendmsg+0x326/0x337
+[44727.915291]  sock_sendmsg_nosec+0x14/0x3f
+[44727.915459]  sock_sendmsg+0x29/0x2e
+[44727.915619]  ___sys_sendmsg+0x209/0x28b
+[44727.915784]  ? do_raw_spin_unlock+0xcd/0xf8
+[44727.915954]  ? _raw_spin_unlock+0x27/0x31
+[44727.916121]  ? __handle_mm_fault+0x651/0xdb1
+[44727.916290]  ? check_chain_key+0xb0/0xfd
+[44727.916461]  __sys_sendmsg+0x45/0x63
+[44727.916626]  ? __sys_sendmsg+0x45/0x63
+[44727.916792]  SyS_sendmsg+0x19/0x1b
+[44727.916950]  entry_SYSCALL_64_fastpath+0x23/0xc2
+[44727.917125] RIP: 0033:0x7ff8bbc96690
+[44727.917286] RSP: 002b:00007ffc360991e8 EFLAGS: 00000246 ORIG_RAX: 000000000000002e
+[44727.917579] RAX: ffffffffffffffda RBX: ffffffff810d278c RCX: 00007ff8bbc96690
+[44727.917783] RDX: 0000000000000000 RSI: 00007ffc36099230 RDI: 0000000000000003
+[44727.917987] RBP: ffff880037217f98 R08: 0000000000000001 R09: 0000000000000003
+[44727.918190] R10: 00007ffc36098fb0 R11: 0000000000000246 R12: 0000000000000006
+[44727.918393] R13: 000000000066f1a0 R14: 00007ffc360a12e0 R15: 0000000000000000
+[44727.918597]  ? trace_hardirqs_off_caller+0xa7/0xcf
+[44727.918774] Code: 41 5f 5d c3 66 66 66 66 90 55 48 8d 56 04 45 31 c9
+49 c7 c0 80 f3 b0 81 48 89 e5 41 55 41 54 53 48 89 fb 48 8d 7d a8 48 83
+ec 48 <0f> b7 0e be 07 00 00 00 83 e9 04 e8 e6 f7 d8 ff 85 c0 0f 88 bb
+[44727.919332] RIP: cbq_init+0x27/0x205 RSP: ffff8800372175f0
+[44727.919516] CR2: 0000000000000000
+
+Fixes: 0fbbeb1ba43b ("[PKT_SCHED]: Fix missing qdisc_destroy() in qdisc_create_dflt()")
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3501d059921246ff617b43e86250a719c140bd97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_cbq.c
+diff --cc net/sched/sch_cbq.c
+index bc44b883495b,156c8a33c677..000000000000
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@@ -1160,7 -1139,14 +1160,18 @@@ static int cbq_init(struct Qdisc *sch, 
+  	struct tc_ratespec *r;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = nla_parse_nested(tb, TCA_CBQ_MAX, opt, cbq_policy);
+++=======
++ 	qdisc_watchdog_init(&q->watchdog, sch);
++ 	hrtimer_init(&q->delay_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
++ 	q->delay_timer.function = cbq_undelay;
++ 
++ 	if (!opt)
++ 		return -EINVAL;
++ 
++ 	err = nla_parse_nested(tb, TCA_CBQ_MAX, opt, cbq_policy, NULL);
+++>>>>>>> 3501d0599212 (sch_cbq: fix null pointer dereferences on init failure)
+  	if (err < 0)
+  		return err;
+  
+* Unmerged path net/sched/sch_cbq.c
