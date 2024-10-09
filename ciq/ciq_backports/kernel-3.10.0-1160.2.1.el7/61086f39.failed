@@ -1,0 +1,172 @@
+net/mlx5e: Protect encap hash table with mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.2.1.el7
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 61086f391044fd587af9d70a9b8f6f800dd474ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.2.1.el7/61086f39.failed
+
+To remove dependency on rtnl lock, protect encap hash table from concurrent
+modifications with new "encap_tbl_lock" mutex. Use the mutex to protect
+internal encap entry state from concurrent modification. This is necessary
+because a flow can be attached to multiple encap entries simultaneously,
+which significantly complicates using finer grained per-entry lock.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 61086f391044fd587af9d70a9b8f6f800dd474ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index eddd344d962a,f0692407f617..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1726,14 -1999,15 +1726,15 @@@ int mlx5_eswitch_init(struct mlx5_core_
+  	if (err)
+  		goto abort;
+  
++ 	mutex_init(&esw->offloads.encap_tbl_lock);
+  	hash_init(esw->offloads.encap_tbl);
+ -	mutex_init(&esw->offloads.mod_hdr.lock);
+ -	hash_init(esw->offloads.mod_hdr.hlist);
+ -	atomic64_set(&esw->offloads.num_flows, 0);
+ +	hash_init(esw->offloads.mod_hdr_tbl);
+  	mutex_init(&esw->state_lock);
+  
+ -	mlx5_esw_for_all_vports(esw, i, vport) {
+ -		vport->vport = mlx5_eswitch_index_to_vport_num(esw, i);
+ +	for (vport_num = 0; vport_num < total_vports; vport_num++) {
+ +		struct mlx5_vport *vport = &esw->vports[vport_num];
+ +
+ +		vport->vport = vport_num;
+  		vport->info.link_state = MLX5_VPORT_ADMIN_STATE_AUTO;
+  		vport->dev = dev;
+  		INIT_WORK(&vport->vport_change_handler,
+@@@ -1766,6 -2039,8 +1767,11 @@@ void mlx5_eswitch_cleanup(struct mlx5_e
+  	esw->dev->priv.eswitch = NULL;
+  	destroy_workqueue(esw->work_queue);
+  	esw_offloads_cleanup_reps(esw);
+++<<<<<<< HEAD
+++=======
++ 	mutex_destroy(&esw->offloads.mod_hdr.lock);
++ 	mutex_destroy(&esw->offloads.encap_tbl_lock);
+++>>>>>>> 61086f391044 (net/mlx5e: Protect encap hash table with mutex)
+  	kfree(esw->vports);
+  	kfree(esw);
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 38175da1db0a..5afb86883968 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -1243,33 +1243,51 @@ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
+ 	}
+ }
+ 
+-void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
++static void mlx5e_encap_dealloc(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
+ {
+-	if (!refcount_dec_and_test(&e->refcnt))
+-		return;
+-
+ 	WARN_ON(!list_empty(&e->flows));
+ 	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
+ 
+ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+ 		mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+ 
+-	hash_del_rcu(&e->encap_hlist);
+ 	kfree(e->encap_header);
+ 	kfree(e);
+ }
+ 
++void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
++{
++	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++
++	if (!refcount_dec_and_mutex_lock(&e->refcnt, &esw->offloads.encap_tbl_lock))
++		return;
++	hash_del_rcu(&e->encap_hlist);
++	mutex_unlock(&esw->offloads.encap_tbl_lock);
++
++	mlx5e_encap_dealloc(priv, e);
++}
++
+ static void mlx5e_detach_encap(struct mlx5e_priv *priv,
+ 			       struct mlx5e_tc_flow *flow, int out_index)
+ {
++	struct mlx5e_encap_entry *e = flow->encaps[out_index].e;
++	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++
+ 	/* flow wasn't fully initialized */
+-	if (!flow->encaps[out_index].e)
++	if (!e)
+ 		return;
+ 
++	mutex_lock(&esw->offloads.encap_tbl_lock);
+ 	list_del(&flow->encaps[out_index].list);
+-
+-	mlx5e_encap_put(priv, flow->encaps[out_index].e);
+ 	flow->encaps[out_index].e = NULL;
++	if (!refcount_dec_and_test(&e->refcnt)) {
++		mutex_unlock(&esw->offloads.encap_tbl_lock);
++		return;
++	}
++	hash_del_rcu(&e->encap_hlist);
++	mutex_unlock(&esw->offloads.encap_tbl_lock);
++
++	mlx5e_encap_dealloc(priv, e);
+ }
+ 
+ static void __mlx5e_tc_del_fdb_peer_flow(struct mlx5e_tc_flow *flow)
+@@ -2623,6 +2641,7 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 
+ 	hash_key = hash_encap_info(&key);
+ 
++	mutex_lock(&esw->offloads.encap_tbl_lock);
+ 	e = mlx5e_encap_get(priv, &key, hash_key);
+ 
+ 	/* must verify if encap is valid or not */
+@@ -2637,8 +2656,10 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 	}
+ 
+ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+-	if (!e)
+-		return -ENOMEM;
++	if (!e) {
++		err = -ENOMEM;
++		goto out_err;
++	}
+ 
+ 	refcount_set(&e->refcnt, 1);
+ 	e->tun_info = *tun_info;
+@@ -2670,10 +2691,12 @@ attach_flow:
+ 	} else {
+ 		*encap_valid = false;
+ 	}
++	mutex_unlock(&esw->offloads.encap_tbl_lock);
+ 
+ 	return err;
+ 
+ out_err:
++	mutex_unlock(&esw->offloads.encap_tbl_lock);
+ 	kfree(e);
+ 	return err;
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index cc11db6786be..7d67c43f8bc3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -170,6 +170,7 @@ struct mlx5_esw_offload {
+ 	struct mlx5_eswitch_rep *vport_reps;
+ 	struct list_head peer_flows;
+ 	struct mutex peer_mutex;
++	struct mutex encap_tbl_lock; /* protects encap_tbl */
+ 	DECLARE_HASHTABLE(encap_tbl, 8);
+ 	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
+ 	DECLARE_HASHTABLE(termtbl_tbl, 8);
