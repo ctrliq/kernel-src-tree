@@ -1,0 +1,169 @@
+powerpc/module: Only try to generate the ftrace_caller() stub once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] module: Only try to generate the ftrace_caller() stub once (Josh Poimboeuf) [1578960]
+Rebuild_FUZZ: 93.55%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit 136cd3450af8092f30d0e289806f08ac2aeee38f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/136cd345.failed
+
+Currently we generate the module stub for ftrace_caller() at the bottom
+of apply_relocate_add(). However apply_relocate_add() is potentially
+called more than once per module, which means we will try to generate
+the ftrace_caller() stub multiple times.
+
+Although the current code deals with that correctly, ie. it only
+generates a stub the first time, it would be clearer to only try to
+generate the stub once.
+
+Note also on first reading it may appear that we generate a different
+stub for each section that requires relocation, but that is not the
+case. The code in stub_for_addr() that searches for an existing stub
+uses sechdrs[me->arch.stubs_section], ie. the single stub section for
+this module.
+
+A cleaner approach is to only generate the ftrace_caller() stub once,
+from module_finalize(). Although the original code didn't check to see
+if the stub was actually generated correctly, it seems prudent to add a
+check, so do that. And an additional benefit is we can clean the ifdefs
+up a little.
+
+Finally we must propagate the const'ness of some of the pointers passed
+to module_finalize(), but that is also an improvement.
+
+	Reviewed-by: Balbir Singh <bsingharora@gmail.com>
+	Reviewed-by: Torsten Duwe <duwe@suse.de>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 136cd3450af8092f30d0e289806f08ac2aeee38f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/module_32.c
+diff --cc arch/powerpc/kernel/module_32.c
+index 6cff040bf456,5a7a78f12562..000000000000
+--- a/arch/powerpc/kernel/module_32.c
++++ b/arch/powerpc/kernel/module_32.c
+@@@ -297,11 -294,19 +297,28 @@@ int apply_relocate_add(Elf32_Shdr *sech
+  			return -ENOEXEC;
+  		}
+  	}
+++<<<<<<< HEAD
+ +#ifdef CONFIG_DYNAMIC_FTRACE
+ +	module->arch.tramp =
+ +		do_plt_call(module->module_core,
+ +			    (unsigned long)ftrace_caller,
+ +			    sechdrs, module);
+ +#endif
+++=======
++ 
+++>>>>>>> 136cd3450af8 (powerpc/module: Only try to generate the ftrace_caller() stub once)
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_DYNAMIC_FTRACE
++ int module_finalize_ftrace(struct module *module, const Elf_Shdr *sechdrs)
++ {
++ 	module->arch.tramp = do_plt_call(module->core_layout.base,
++ 					 (unsigned long)ftrace_caller,
++ 					 sechdrs, module);
++ 	if (!module->arch.tramp)
++ 		return -ENOENT;
++ 
+  	return 0;
+  }
++ #endif
+diff --git a/arch/powerpc/include/asm/module.h b/arch/powerpc/include/asm/module.h
+index fdd5df2f73dc..171acddb3595 100644
+--- a/arch/powerpc/include/asm/module.h
++++ b/arch/powerpc/include/asm/module.h
+@@ -85,6 +85,15 @@ bool is_module_trampoline(u32 *insns);
+ int module_trampoline_target(struct module *mod, u32 *trampoline,
+ 			     unsigned long *target);
+ 
++#ifdef CONFIG_DYNAMIC_FTRACE
++int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sechdrs);
++#else
++static inline int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sechdrs)
++{
++	return 0;
++}
++#endif
++
+ struct exception_table_entry;
+ void sort_ex_table(struct exception_table_entry *start,
+ 		   struct exception_table_entry *finish);
+diff --git a/arch/powerpc/kernel/module.c b/arch/powerpc/kernel/module.c
+index b2874108d879..30b89d5cbb03 100644
+--- a/arch/powerpc/kernel/module.c
++++ b/arch/powerpc/kernel/module.c
+@@ -47,6 +47,11 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 		const Elf_Shdr *sechdrs, struct module *me)
+ {
+ 	const Elf_Shdr *sect;
++	int rc;
++
++	rc = module_finalize_ftrace(me, sechdrs);
++	if (rc)
++		return rc;
+ 
+ 	/* Apply feature fixups */
+ 	sect = find_section(hdr, sechdrs, "__ftr_fixup");
+* Unmerged path arch/powerpc/kernel/module_32.c
+diff --git a/arch/powerpc/kernel/module_64.c b/arch/powerpc/kernel/module_64.c
+index ea47d533221d..3482947c2bbc 100644
+--- a/arch/powerpc/kernel/module_64.c
++++ b/arch/powerpc/kernel/module_64.c
+@@ -415,7 +415,7 @@ int module_frob_arch_sections(Elf64_Ehdr *hdr,
+ /* r2 is the TOC pointer: it actually points 0x8000 into the TOC (this
+    gives the value maximum span in an instruction which uses a signed
+    offset) */
+-static inline unsigned long my_r2(Elf64_Shdr *sechdrs, struct module *me)
++static inline unsigned long my_r2(const Elf64_Shdr *sechdrs, struct module *me)
+ {
+ 	return sechdrs[me->arch.toc_section].sh_addr + 0x8000;
+ }
+@@ -428,7 +428,7 @@ static inline unsigned long my_r2(Elf64_Shdr *sechdrs, struct module *me)
+ #define PPC_HA(v) PPC_HI ((v) + 0x8000)
+ 
+ /* Patch stub to reference function and correct r2 value. */
+-static inline int create_stub(Elf64_Shdr *sechdrs,
++static inline int create_stub(const Elf64_Shdr *sechdrs,
+ 			      struct ppc64_stub_entry *entry,
+ 			      unsigned long addr,
+ 			      struct module *me)
+@@ -454,7 +454,7 @@ static inline int create_stub(Elf64_Shdr *sechdrs,
+ 
+ /* Create stub to jump to function described in this OPD/ptr: we need the
+    stub to set up the TOC ptr (r2) for the function. */
+-static unsigned long stub_for_addr(Elf64_Shdr *sechdrs,
++static unsigned long stub_for_addr(const Elf64_Shdr *sechdrs,
+ 				   unsigned long addr,
+ 				   struct module *me)
+ {
+@@ -668,12 +668,18 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		}
+ 	}
+ 
++	return 0;
++}
++
+ #ifdef CONFIG_DYNAMIC_FTRACE
+-	me->arch.toc = my_r2(sechdrs, me);
+-	me->arch.tramp = stub_for_addr(sechdrs,
+-				       (unsigned long)ftrace_caller,
+-				       me);
+-#endif
++int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sechdrs)
++{
++	mod->arch.toc = my_r2(sechdrs, mod);
++	mod->arch.tramp = stub_for_addr(sechdrs, (unsigned long)ftrace_caller, mod);
++
++	if (!mod->arch.tramp)
++		return -ENOENT;
+ 
+ 	return 0;
+ }
++#endif
