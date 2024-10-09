@@ -1,0 +1,316 @@
+drm/i915: Silence compiler warning for hsw_power_well_enable()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit 320671f94ada80ff036cc9d5dcd730ba4f3e0f1a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/320671f9.failed
+
+Not all compilers are able to determine that pg is guarded by wait_fuses
+and so may think that pg is used uninitialized.
+
+	Reported-by: Geert Uytterhoeven <geert@linux-m68k.org>
+Fixes: b2891eb2531e ("drm/i915/hsw+: Add has_fuses power well attribute")
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Imre Deak <imre.deak@intel.com>
+	Cc: Arkadiusz Hiler <arkadiusz.hiler@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171002100416.25865-1-chris@chris-wilson.co.uk
+	Reviewed-by: Imre Deak <imre.deak@intel.com>
+(cherry picked from commit 320671f94ada80ff036cc9d5dcd730ba4f3e0f1a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_runtime_pm.c
+diff --cc drivers/gpu/drm/i915/intel_runtime_pm.c
+index 87b4af092d54,c4e1aba83c3e..000000000000
+--- a/drivers/gpu/drm/i915/intel_runtime_pm.c
++++ b/drivers/gpu/drm/i915/intel_runtime_pm.c
+@@@ -299,159 -282,146 +299,220 @@@ static void hsw_power_well_post_enable(
+  	 * sure vgacon can keep working normally without triggering interrupts
+  	 * and error messages.
+  	 */
+ -	if (has_vga) {
+ -		vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+ -		outb(inb(VGA_MSR_READ), VGA_MSR_WRITE);
+ -		vga_put(pdev, VGA_RSRC_LEGACY_IO);
+ -	}
+ +	vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+ +	outb(inb(VGA_MSR_READ), VGA_MSR_WRITE);
+ +	vga_put(pdev, VGA_RSRC_LEGACY_IO);
+  
+ -	if (irq_pipe_mask)
+ -		gen8_irq_power_well_post_enable(dev_priv, irq_pipe_mask);
+ +	if (IS_BROADWELL(dev_priv))
+ +		gen8_irq_power_well_post_enable(dev_priv,
+ +						1 << PIPE_C | 1 << PIPE_B);
+  }
+  
+ -static void hsw_power_well_pre_disable(struct drm_i915_private *dev_priv,
+ -				       u8 irq_pipe_mask)
+ +static void hsw_power_well_pre_disable(struct drm_i915_private *dev_priv)
+  {
+ -	if (irq_pipe_mask)
+ -		gen8_irq_power_well_pre_disable(dev_priv, irq_pipe_mask);
+ +	if (IS_BROADWELL(dev_priv))
+ +		gen8_irq_power_well_pre_disable(dev_priv,
+ +						1 << PIPE_C | 1 << PIPE_B);
+  }
+  
+ -
+ -static void hsw_wait_for_power_well_enable(struct drm_i915_private *dev_priv,
+ -					   struct i915_power_well *power_well)
+ +static void skl_power_well_post_enable(struct drm_i915_private *dev_priv,
+ +				       struct i915_power_well *power_well)
+  {
+ -	enum i915_power_well_id id = power_well->id;
+ +	struct pci_dev *pdev = dev_priv->drm.pdev;
+ +
+ +	/*
+ +	 * After we re-enable the power well, if we touch VGA register 0x3d5
+ +	 * we'll get unclaimed register interrupts. This stops after we write
+ +	 * anything to the VGA MSR register. The vgacon module uses this
+ +	 * register all the time, so if we unbind our driver and, as a
+ +	 * consequence, bind vgacon, we'll get stuck in an infinite loop at
+ +	 * console_unlock(). So make here we touch the VGA MSR register, making
+ +	 * sure vgacon can keep working normally without triggering interrupts
+ +	 * and error messages.
+ +	 */
+ +	if (power_well->id == SKL_DISP_PW_2) {
+ +		vga_get_uninterruptible(pdev, VGA_RSRC_LEGACY_IO);
+ +		outb(inb(VGA_MSR_READ), VGA_MSR_WRITE);
+ +		vga_put(pdev, VGA_RSRC_LEGACY_IO);
+  
+ -	/* Timeout for PW1:10 us, AUX:not specified, other PWs:20 us. */
+ -	WARN_ON(intel_wait_for_register(dev_priv,
+ -					HSW_PWR_WELL_CTL_DRIVER(id),
+ -					HSW_PWR_WELL_CTL_STATE(id),
+ -					HSW_PWR_WELL_CTL_STATE(id),
+ -					1));
+ +		gen8_irq_power_well_post_enable(dev_priv,
+ +						1 << PIPE_C | 1 << PIPE_B);
+ +	}
+  }
+  
+ -static u32 hsw_power_well_requesters(struct drm_i915_private *dev_priv,
+ -				     enum i915_power_well_id id)
+ +static void skl_power_well_pre_disable(struct drm_i915_private *dev_priv,
+ +				       struct i915_power_well *power_well)
+  {
+ -	u32 req_mask = HSW_PWR_WELL_CTL_REQ(id);
+ -	u32 ret;
+ +	if (power_well->id == SKL_DISP_PW_2)
+ +		gen8_irq_power_well_pre_disable(dev_priv,
+ +						1 << PIPE_C | 1 << PIPE_B);
+ +}
+  
+ -	ret = I915_READ(HSW_PWR_WELL_CTL_BIOS(id)) & req_mask ? 1 : 0;
+ -	ret |= I915_READ(HSW_PWR_WELL_CTL_DRIVER(id)) & req_mask ? 2 : 0;
+ -	ret |= I915_READ(HSW_PWR_WELL_CTL_KVMR) & req_mask ? 4 : 0;
+ -	ret |= I915_READ(HSW_PWR_WELL_CTL_DEBUG(id)) & req_mask ? 8 : 0;
+ +static void hsw_set_power_well(struct drm_i915_private *dev_priv,
+ +			       struct i915_power_well *power_well, bool enable)
+ +{
+ +	bool is_enabled, enable_requested;
+ +	uint32_t tmp;
+  
+ +	tmp = I915_READ(HSW_PWR_WELL_DRIVER);
+ +	is_enabled = tmp & HSW_PWR_WELL_STATE_ENABLED;
+ +	enable_requested = tmp & HSW_PWR_WELL_ENABLE_REQUEST;
+ +
+ +	if (enable) {
+ +		if (!enable_requested)
+ +			I915_WRITE(HSW_PWR_WELL_DRIVER,
+ +				   HSW_PWR_WELL_ENABLE_REQUEST);
+ +
+ +		if (!is_enabled) {
+ +			DRM_DEBUG_KMS("Enabling power well\n");
+ +			if (intel_wait_for_register(dev_priv,
+ +						    HSW_PWR_WELL_DRIVER,
+ +						    HSW_PWR_WELL_STATE_ENABLED,
+ +						    HSW_PWR_WELL_STATE_ENABLED,
+ +						    20))
+ +				DRM_ERROR("Timeout enabling power well\n");
+ +			hsw_power_well_post_enable(dev_priv);
+ +		}
+ +
+++<<<<<<< HEAD
+ +	} else {
+ +		if (enable_requested) {
+ +			hsw_power_well_pre_disable(dev_priv);
+ +			I915_WRITE(HSW_PWR_WELL_DRIVER, 0);
+ +			POSTING_READ(HSW_PWR_WELL_DRIVER);
+ +			DRM_DEBUG_KMS("Requesting to disable the power well\n");
+ +		}
+++=======
++ 	return ret;
++ }
++ 
++ static void hsw_wait_for_power_well_disable(struct drm_i915_private *dev_priv,
++ 					    struct i915_power_well *power_well)
++ {
++ 	enum i915_power_well_id id = power_well->id;
++ 	bool disabled;
++ 	u32 reqs;
++ 
++ 	/*
++ 	 * Bspec doesn't require waiting for PWs to get disabled, but still do
++ 	 * this for paranoia. The known cases where a PW will be forced on:
++ 	 * - a KVMR request on any power well via the KVMR request register
++ 	 * - a DMC request on PW1 and MISC_IO power wells via the BIOS and
++ 	 *   DEBUG request registers
++ 	 * Skip the wait in case any of the request bits are set and print a
++ 	 * diagnostic message.
++ 	 */
++ 	wait_for((disabled = !(I915_READ(HSW_PWR_WELL_CTL_DRIVER(id)) &
++ 			       HSW_PWR_WELL_CTL_STATE(id))) ||
++ 		 (reqs = hsw_power_well_requesters(dev_priv, id)), 1);
++ 	if (disabled)
++ 		return;
++ 
++ 	DRM_DEBUG_KMS("%s forced on (bios:%d driver:%d kvmr:%d debug:%d)\n",
++ 		      power_well->name,
++ 		      !!(reqs & 1), !!(reqs & 2), !!(reqs & 4), !!(reqs & 8));
++ }
++ 
++ static void gen9_wait_for_power_well_fuses(struct drm_i915_private *dev_priv,
++ 					   enum skl_power_gate pg)
++ {
++ 	/* Timeout 5us for PG#0, for other PGs 1us */
++ 	WARN_ON(intel_wait_for_register(dev_priv, SKL_FUSE_STATUS,
++ 					SKL_FUSE_PG_DIST_STATUS(pg),
++ 					SKL_FUSE_PG_DIST_STATUS(pg), 1));
++ }
++ 
++ static void hsw_power_well_enable(struct drm_i915_private *dev_priv,
++ 				  struct i915_power_well *power_well)
++ {
++ 	enum i915_power_well_id id = power_well->id;
++ 	bool wait_fuses = power_well->hsw.has_fuses;
++ 	enum skl_power_gate uninitialized_var(pg);
++ 	u32 val;
++ 
++ 	if (wait_fuses) {
++ 		pg = SKL_PW_TO_PG(id);
++ 		/*
++ 		 * For PW1 we have to wait both for the PW0/PG0 fuse state
++ 		 * before enabling the power well and PW1/PG1's own fuse
++ 		 * state after the enabling. For all other power wells with
++ 		 * fuses we only have to wait for that PW/PG's fuse state
++ 		 * after the enabling.
++ 		 */
++ 		if (pg == SKL_PG1)
++ 			gen9_wait_for_power_well_fuses(dev_priv, SKL_PG0);
+++>>>>>>> 320671f94ada (drm/i915: Silence compiler warning for hsw_power_well_enable())
+  	}
+ -
+ -	val = I915_READ(HSW_PWR_WELL_CTL_DRIVER(id));
+ -	I915_WRITE(HSW_PWR_WELL_CTL_DRIVER(id), val | HSW_PWR_WELL_CTL_REQ(id));
+ -	hsw_wait_for_power_well_enable(dev_priv, power_well);
+ -
+ -	if (wait_fuses)
+ -		gen9_wait_for_power_well_fuses(dev_priv, pg);
+ -
+ -	hsw_power_well_post_enable(dev_priv, power_well->hsw.irq_pipe_mask,
+ -				   power_well->hsw.has_vga);
+ -}
+ -
+ -static void hsw_power_well_disable(struct drm_i915_private *dev_priv,
+ -				   struct i915_power_well *power_well)
+ -{
+ -	enum i915_power_well_id id = power_well->id;
+ -	u32 val;
+ -
+ -	hsw_power_well_pre_disable(dev_priv, power_well->hsw.irq_pipe_mask);
+ -
+ -	val = I915_READ(HSW_PWR_WELL_CTL_DRIVER(id));
+ -	I915_WRITE(HSW_PWR_WELL_CTL_DRIVER(id),
+ -		   val & ~HSW_PWR_WELL_CTL_REQ(id));
+ -	hsw_wait_for_power_well_disable(dev_priv, power_well);
+  }
+  
+ -/*
+ - * We should only use the power well if we explicitly asked the hardware to
+ - * enable it, so check if it's enabled and also check if we've requested it to
+ - * be enabled.
+ - */
+ -static bool hsw_power_well_enabled(struct drm_i915_private *dev_priv,
+ -				   struct i915_power_well *power_well)
+ -{
+ -	enum i915_power_well_id id = power_well->id;
+ -	u32 mask = HSW_PWR_WELL_CTL_REQ(id) | HSW_PWR_WELL_CTL_STATE(id);
+ +#define SKL_DISPLAY_POWERWELL_2_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_TRANSCODER_A) |		\
+ +	BIT(POWER_DOMAIN_PIPE_B) |			\
+ +	BIT(POWER_DOMAIN_TRANSCODER_B) |		\
+ +	BIT(POWER_DOMAIN_PIPE_C) |			\
+ +	BIT(POWER_DOMAIN_TRANSCODER_C) |		\
+ +	BIT(POWER_DOMAIN_PIPE_B_PANEL_FITTER) |		\
+ +	BIT(POWER_DOMAIN_PIPE_C_PANEL_FITTER) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_B_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_C_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_D_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_E_LANES) |		\
+ +	BIT(POWER_DOMAIN_AUX_B) |                       \
+ +	BIT(POWER_DOMAIN_AUX_C) |			\
+ +	BIT(POWER_DOMAIN_AUX_D) |			\
+ +	BIT(POWER_DOMAIN_AUDIO) |			\
+ +	BIT(POWER_DOMAIN_VGA) |				\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define SKL_DISPLAY_DDI_A_E_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_A_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_E_LANES) |		\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define SKL_DISPLAY_DDI_B_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_B_LANES) |		\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define SKL_DISPLAY_DDI_C_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_C_LANES) |		\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define SKL_DISPLAY_DDI_D_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_D_LANES) |		\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define SKL_DISPLAY_DC_OFF_POWER_DOMAINS (		\
+ +	SKL_DISPLAY_POWERWELL_2_POWER_DOMAINS |		\
+ +	BIT(POWER_DOMAIN_MODESET) |			\
+ +	BIT(POWER_DOMAIN_AUX_A) |			\
+ +	BIT(POWER_DOMAIN_INIT))
+  
+ -	return (I915_READ(HSW_PWR_WELL_CTL_DRIVER(id)) & mask) == mask;
+ -}
+ +#define BXT_DISPLAY_POWERWELL_2_POWER_DOMAINS (		\
+ +	BIT(POWER_DOMAIN_TRANSCODER_A) |		\
+ +	BIT(POWER_DOMAIN_PIPE_B) |			\
+ +	BIT(POWER_DOMAIN_TRANSCODER_B) |		\
+ +	BIT(POWER_DOMAIN_PIPE_C) |			\
+ +	BIT(POWER_DOMAIN_TRANSCODER_C) |		\
+ +	BIT(POWER_DOMAIN_PIPE_B_PANEL_FITTER) |		\
+ +	BIT(POWER_DOMAIN_PIPE_C_PANEL_FITTER) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_B_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_C_LANES) |		\
+ +	BIT(POWER_DOMAIN_AUX_B) |			\
+ +	BIT(POWER_DOMAIN_AUX_C) |			\
+ +	BIT(POWER_DOMAIN_AUDIO) |			\
+ +	BIT(POWER_DOMAIN_VGA) |				\
+ +	BIT(POWER_DOMAIN_GMBUS) |			\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define BXT_DISPLAY_DC_OFF_POWER_DOMAINS (		\
+ +	BXT_DISPLAY_POWERWELL_2_POWER_DOMAINS |		\
+ +	BIT(POWER_DOMAIN_MODESET) |			\
+ +	BIT(POWER_DOMAIN_AUX_A) |			\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define BXT_DPIO_CMN_A_POWER_DOMAINS (			\
+ +	BIT(POWER_DOMAIN_PORT_DDI_A_LANES) |		\
+ +	BIT(POWER_DOMAIN_AUX_A) |			\
+ +	BIT(POWER_DOMAIN_INIT))
+ +#define BXT_DPIO_CMN_BC_POWER_DOMAINS (			\
+ +	BIT(POWER_DOMAIN_PORT_DDI_B_LANES) |		\
+ +	BIT(POWER_DOMAIN_PORT_DDI_C_LANES) |		\
+ +	BIT(POWER_DOMAIN_AUX_B) |			\
+ +	BIT(POWER_DOMAIN_AUX_C) |			\
+ +	BIT(POWER_DOMAIN_INIT))
+  
+  static void assert_can_enable_dc9(struct drm_i915_private *dev_priv)
+  {
+* Unmerged path drivers/gpu/drm/i915/intel_runtime_pm.c
