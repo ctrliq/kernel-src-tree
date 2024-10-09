@@ -3819,9 +3819,11 @@ static inline struct sk_buff *handle_ing(struct sk_buff *skb,
 		break;
 	case TC_ACT_SHOT:
 		qdisc_qstats_cpu_drop(cl->q);
+		kfree_skb(skb);
+		return NULL;
 	case TC_ACT_STOLEN:
 	case TC_ACT_QUEUED:
-		kfree_skb(skb);
+		consume_skb(skb);
 		return NULL;
 	default:
 		break;
