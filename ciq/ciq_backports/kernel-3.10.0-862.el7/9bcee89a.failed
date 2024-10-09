@@ -1,0 +1,454 @@
+net/mlx4_en: Improve receive data-path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Improve receive data-path (Don Dutile) [1499363 1456692]
+Rebuild_FUZZ: 94.44%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 9bcee89ac4dbafe77b7a2fc68c4a784358d6e4e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9bcee89a.failed
+
+Several small performance improvements in RX datapath,
+including:
+- Compiler branch predictor hints.
+- Replace a multiplication with a shift operation.
+- Minimize variables scope.
+- Write-prefetch for packet header.
+- Avoid trinary-operator ("?") when value can be preset in a matching
+  branch.
+- Save a branch by updating RX ring doorbell within
+  mlx4_en_refill_rx_buffers(), which now returns void.
+
+Performance tests:
+Tested on ConnectX3Pro, Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+Single queue no-RSS optimization ON
+(enable by ethtool -L <interface> rx 1).
+
+XDP_DROP packet rate:
+Same (28.1 Mpps), lower CPU utilization (from ~100% to ~92%).
+
+Drop packets in TC:
+-------------------------------------
+     | Before    | After     | Gain |
+IPv4 | 4.14 Mpps | 4.18 Mpps |   1% |
+-------------------------------------
+
+XDP_TX packet rate:
+-------------------------------------
+     | Before    | After     | Gain |
+IPv4 | 10.1 Mpps | 10.3 Mpps |   2% |
+IPv6 | 10.1 Mpps | 10.3 Mpps |   2% |
+-------------------------------------
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Cc: kernel-team@fb.com
+	Cc: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9bcee89ac4dbafe77b7a2fc68c4a784358d6e4e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 89651461efa3,507c48ef2674..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -242,13 -134,20 +242,27 @@@ static int mlx4_en_prepare_rx_desc(stru
+  				   struct mlx4_en_rx_ring *ring, int index,
+  				   gfp_t gfp)
+  {
+- 	struct mlx4_en_rx_desc *rx_desc = ring->buf + (index * ring->stride);
++ 	struct mlx4_en_rx_desc *rx_desc = ring->buf +
++ 		(index << ring->log_stride);
+  	struct mlx4_en_rx_alloc *frags = ring->rx_info +
+  					(index << priv->log_rx_info);
+++<<<<<<< HEAD
+ +
+ +	if (ring->page_cache.index > 0) {
+ +		frags[0] = ring->page_cache.buf[--ring->page_cache.index];
+ +		rx_desc->data[0].addr = cpu_to_be64(frags[0].dma);
+++=======
++ 	if (likely(ring->page_cache.index > 0)) {
++ 		/* XDP uses a single page per frame */
++ 		if (!frags->page) {
++ 			ring->page_cache.index--;
++ 			frags->page = ring->page_cache.buf[ring->page_cache.index].page;
++ 			frags->dma  = ring->page_cache.buf[ring->page_cache.index].dma;
++ 		}
++ 		frags->page_offset = XDP_PACKET_HEADROOM;
++ 		rx_desc->data[0].addr = cpu_to_be64(frags->dma +
++ 						    XDP_PACKET_HEADROOM);
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  		return 0;
+  	}
+  
+@@@ -791,20 -639,14 +806,28 @@@ static int check_csum(struct mlx4_cqe *
+  int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int budget)
+  {
+  	struct mlx4_en_priv *priv = netdev_priv(dev);
+++<<<<<<< HEAD
+ +	struct mlx4_en_dev *mdev = priv->mdev;
+ +	struct mlx4_cqe *cqe;
+ +	struct mlx4_en_rx_ring *ring = priv->rx_ring[cq->ring];
+ +	struct mlx4_en_rx_alloc *frags;
+ +	struct mlx4_en_rx_desc *rx_desc;
+ +	struct sk_buff *skb;
+ +	int index;
+ +	int nr;
+ +	unsigned int length;
+ +	int polled = 0;
+ +	int ip_summed;
+++=======
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  	int factor = priv->cqe_factor;
+- 	u64 timestamp;
+- 	bool l2_tunnel;
++ 	struct mlx4_en_rx_ring *ring;
++ 	struct bpf_prog *xdp_prog;
++ 	int cq_ring = cq->ring;
++ 	int doorbell_pending;
++ 	struct mlx4_cqe *cqe;
++ 	int polled = 0;
++ 	int index;
+  
+  	if (unlikely(!priv->port_up))
+  		return 0;
+@@@ -812,6 -654,13 +835,16 @@@
+  	if (unlikely(budget <= 0))
+  		return polled;
+  
+++<<<<<<< HEAD
+++=======
++ 	ring = priv->rx_ring[cq_ring];
++ 
++ 	/* Protect accesses to: ring->xdp_prog, priv->mac_hash list */
++ 	rcu_read_lock();
++ 	xdp_prog = rcu_dereference(ring->xdp_prog);
++ 	doorbell_pending = 0;
++ 
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  	/* We assume a 1:1 mapping between CQEs and Rx descriptors, so Rx
+  	 * descriptor offset can be deduced from the CQE index instead of
+  	 * reading 'cqe->index' */
+@@@ -821,10 -670,17 +854,24 @@@
+  	/* Process all completed CQEs */
+  	while (XNOR(cqe->owner_sr_opcode & MLX4_CQE_OWNER_MASK,
+  		    cq->mcq.cons_index & cq->size)) {
+++<<<<<<< HEAD
+ +
+ +		frags = ring->rx_info + (index << priv->log_rx_info);
+ +		rx_desc = ring->buf + (index << ring->log_stride);
+ +
+++=======
++ 		struct mlx4_en_rx_alloc *frags;
++ 		enum pkt_hash_types hash_type;
++ 		struct sk_buff *skb;
++ 		unsigned int length;
++ 		int ip_summed;
++ 		void *va;
++ 		int nr;
++ 
++ 		frags = ring->rx_info + (index << priv->log_rx_info);
++ 		va = page_address(frags[0].page) + frags[0].page_offset;
++ 		prefetchw(va);
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  		/*
+  		 * make sure we read the CQE after we read the ownership bit
+  		 */
+@@@ -888,142 -738,123 +935,239 @@@
+  		 */
+  		length = be32_to_cpu(cqe->byte_cnt);
+  		length -= ring->fcs_del;
+++<<<<<<< HEAD
+ +		ring->bytes += length;
+ +		ring->packets++;
+ +		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+ +			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+++=======
++ 
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			void *orig_data;
++ 			u32 act;
++ 
++ 			dma = frags[0].dma + frags[0].page_offset;
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data_hard_start = va - frags[0].page_offset;
++ 			xdp.data = va;
++ 			xdp.data_end = xdp.data + length;
++ 			orig_data = xdp.data;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 			if (xdp.data != orig_data) {
++ 				length = xdp.data_end - xdp.data;
++ 				frags[0].page_offset = xdp.data -
++ 					xdp.data_hard_start;
++ 				va = xdp.data;
++ 			}
++ 
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(ring, frags, dev,
++ 							length, cq_ring,
++ 							&doorbell_pending))) {
++ 					frags[0].page = NULL;
++ 					goto next;
++ 				}
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 				goto xdp_drop_no_cnt; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				ring->xdp_drop++;
++ xdp_drop_no_cnt:
++ 				goto next;
++ 			}
++ 		}
++ 
++ 		ring->bytes += length;
++ 		ring->packets++;
++ 
++ 		skb = napi_get_frags(&cq->napi);
++ 		if (unlikely(!skb))
++ 			goto next;
++ 
++ 		if (unlikely(ring->hwtstamp_rx_filter == HWTSTAMP_FILTER_ALL)) {
++ 			u64 timestamp = mlx4_en_get_cqe_ts(cqe);
++ 
++ 			mlx4_en_fill_hwtstamps(priv->mdev, skb_hwtstamps(skb),
++ 					       timestamp);
++ 		}
++ 		skb_record_rx_queue(skb, cq_ring);
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+  						      MLX4_CQE_STATUS_UDP)) {
+  				if ((cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPOK)) &&
+  				    cqe->checksum == cpu_to_be16(0xffff)) {
+++<<<<<<< HEAD
+++					ip_summed = CHECKSUM_UNNECESSARY;
+++=======
++ 					bool l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
++ 						(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
++ 
+  					ip_summed = CHECKSUM_UNNECESSARY;
++ 					hash_type = PKT_HASH_TYPE_L4;
++ 					if (l2_tunnel)
++ 						skb->csum_level = 1;
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  					ring->csum_ok++;
+  				} else {
+ -					goto csum_none;
+ +					ip_summed = CHECKSUM_NONE;
+ +					ring->csum_none++;
+  				}
+  			} else {
+  				if (priv->flags & MLX4_EN_FLAG_RX_CSUM_NON_TCP_UDP &&
+  				    (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV4 |
+  							       MLX4_CQE_STATUS_IPV6))) {
+++<<<<<<< HEAD
+ +					ip_summed = CHECKSUM_COMPLETE;
+ +					ring->csum_complete++;
+++=======
++ 					if (check_csum(cqe, skb, va, dev->features)) {
++ 						goto csum_none;
++ 					} else {
++ 						ip_summed = CHECKSUM_COMPLETE;
++ 						hash_type = PKT_HASH_TYPE_L3;
++ 						ring->csum_complete++;
++ 					}
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  				} else {
+ -					goto csum_none;
+ +					ip_summed = CHECKSUM_NONE;
+ +					ring->csum_none++;
+  				}
+  			}
+  		} else {
+ -csum_none:
+  			ip_summed = CHECKSUM_NONE;
++ 			hash_type = PKT_HASH_TYPE_L3;
+  			ring->csum_none++;
+  		}
+ +
+ +		/* This packet is eligible for GRO if it is:
+ +		 * - DIX Ethernet (type interpretation)
+ +		 * - TCP/IP (v4)
+ +		 * - without IP options
+ +		 * - not an IP fragment
+ +		 */
+ +		if (dev->features & NETIF_F_GRO) {
+ +			struct sk_buff *gro_skb = napi_get_frags(&cq->napi);
+ +			if (!gro_skb)
+ +				goto next;
+ +
+ +			nr = mlx4_en_complete_rx_desc(priv,
+ +				rx_desc, frags, gro_skb,
+ +				length);
+ +			if (!nr)
+ +				goto next;
+ +
+ +			if (ip_summed == CHECKSUM_COMPLETE) {
+ +				void *va = skb_frag_address(skb_shinfo(gro_skb)->frags);
+ +				if (check_csum(cqe, gro_skb, va,
+ +					       dev->features)) {
+ +					ip_summed = CHECKSUM_NONE;
+ +					ring->csum_none++;
+ +					ring->csum_complete--;
+ +				}
+ +			}
+ +
+ +			skb_shinfo(gro_skb)->nr_frags = nr;
+ +			gro_skb->len = length;
+ +			gro_skb->data_len = length;
+ +			gro_skb->ip_summed = ip_summed;
+ +
+ +			if (l2_tunnel && ip_summed == CHECKSUM_UNNECESSARY)
+ +				gro_skb->csum_level = 1;
+ +
+ +			if ((cqe->vlan_my_qpn &
+ +			    cpu_to_be32(MLX4_CQE_CVLAN_PRESENT_MASK)) &&
+ +			    (dev->features & NETIF_F_HW_VLAN_CTAG_RX)) {
+ +				u16 vid = be16_to_cpu(cqe->sl_vid);
+ +
+ +				__vlan_hwaccel_put_tag(gro_skb, htons(ETH_P_8021Q), vid);
+ +			} else if ((be32_to_cpu(cqe->vlan_my_qpn) &
+ +				  MLX4_CQE_SVLAN_PRESENT_MASK) &&
+ +				 (dev->features & NETIF_F_HW_VLAN_STAG_RX)) {
+ +				__vlan_hwaccel_put_tag(gro_skb,
+ +						       htons(ETH_P_8021AD),
+ +						       be16_to_cpu(cqe->sl_vid));
+ +			}
+ +
+ +			if (dev->features & NETIF_F_RXHASH)
+ +				skb_set_hash(gro_skb,
+ +					     be32_to_cpu(cqe->immed_rss_invalid),
+ +					     (ip_summed == CHECKSUM_UNNECESSARY) ?
+ +						PKT_HASH_TYPE_L4 :
+ +						PKT_HASH_TYPE_L3);
+ +
+ +			skb_record_rx_queue(gro_skb, cq->ring);
+ +
+ +			if (ring->hwtstamp_rx_filter == HWTSTAMP_FILTER_ALL) {
+ +				timestamp = mlx4_en_get_cqe_ts(cqe);
+ +				mlx4_en_fill_hwtstamps(mdev,
+ +						       skb_hwtstamps(gro_skb),
+ +						       timestamp);
+ +			}
+ +
+ +			napi_gro_frags(&cq->napi);
+ +			goto next;
+ +		}
+ +
+ +		/* GRO not possible, complete processing here */
+ +		skb = mlx4_en_rx_skb(priv, rx_desc, frags, length);
+ +		if (unlikely(!skb)) {
+ +			ring->dropped++;
+ +			goto next;
+ +		}
+ +
+ +		if (ip_summed == CHECKSUM_COMPLETE) {
+ +			if (check_csum(cqe, skb, skb->data, dev->features)) {
+ +				ip_summed = CHECKSUM_NONE;
+ +				ring->csum_complete--;
+ +				ring->csum_none++;
+ +			}
+ +		}
+ +
+  		skb->ip_summed = ip_summed;
+ +		skb->protocol = eth_type_trans(skb, dev);
+ +		skb_record_rx_queue(skb, cq->ring);
+ +
+ +		if (l2_tunnel && ip_summed == CHECKSUM_UNNECESSARY)
+ +			skb->csum_level = 1;
+ +
+  		if (dev->features & NETIF_F_RXHASH)
+  			skb_set_hash(skb,
+  				     be32_to_cpu(cqe->immed_rss_invalid),
+++<<<<<<< HEAD
+ +				     (ip_summed == CHECKSUM_UNNECESSARY) ?
+ +					PKT_HASH_TYPE_L4 :
+ +					PKT_HASH_TYPE_L3);
+ +
+ +		if ((be32_to_cpu(cqe->vlan_my_qpn) &
+ +		    MLX4_CQE_CVLAN_PRESENT_MASK) &&
+++=======
++ 				     hash_type);
++ 
++ 		if ((cqe->vlan_my_qpn &
++ 		     cpu_to_be32(MLX4_CQE_CVLAN_PRESENT_MASK)) &&
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  		    (dev->features & NETIF_F_HW_VLAN_CTAG_RX))
+ -			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+ -					       be16_to_cpu(cqe->sl_vid));
+ -		else if ((cqe->vlan_my_qpn &
+ -			  cpu_to_be32(MLX4_CQE_SVLAN_PRESENT_MASK)) &&
+ +			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), be16_to_cpu(cqe->sl_vid));
+ +		else if ((be32_to_cpu(cqe->vlan_my_qpn) &
+ +			  MLX4_CQE_SVLAN_PRESENT_MASK) &&
+  			 (dev->features & NETIF_F_HW_VLAN_STAG_RX))
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021AD),
+  					       be16_to_cpu(cqe->sl_vid));
+@@@ -1042,12 -873,16 +1186,25 @@@ next
+  		++cq->mcq.cons_index;
+  		index = (cq->mcq.cons_index) & ring->size_mask;
+  		cqe = mlx4_en_get_cqe(cq->buf, index, priv->cqe_size) + factor;
+++<<<<<<< HEAD
+ +		if (++polled == budget)
+ +			goto out;
+ +	}
+ +
+ +out:
+ +	if (polled) {
+++=======
++ 		if (unlikely(++polled == budget))
++ 			break;
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	if (likely(polled)) {
++ 		if (doorbell_pending)
++ 			mlx4_en_xmit_doorbell(priv->tx_ring[TX_XDP][cq->ring]);
++ 
+++>>>>>>> 9bcee89ac4db (net/mlx4_en: Improve receive data-path)
+  		mlx4_cq_set_ci(&cq->mcq);
+  		wmb(); /* ensure HW sees CQ consumer before we post new buffers */
+  		ring->cons = cq->mcq.cons_index;
+@@@ -1110,18 -939,9 +1266,18 @@@ int mlx4_en_poll_rx_cq(struct napi_stru
+  		 */
+  		if (done)
+  			done--;
+ +#else
+ +		if (cq->tot_rx < MLX4_EN_MIN_RX_ARM)
+ +			return budget;
+ +
+ +		cq->tot_rx = 0;
+ +		done = 0;
+ +	} else {
+ +		cq->tot_rx = 0;
+ +#endif
+  	}
+  	/* Done for now */
+- 	if (napi_complete_done(napi, done))
++ 	if (likely(napi_complete_done(napi, done)))
+  		mlx4_en_arm_cq(priv, cq);
+  	return done;
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
