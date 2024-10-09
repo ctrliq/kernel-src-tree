@@ -1,0 +1,171 @@
+xprtrdma: Support for SG_GAP devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 5e9fc6a06bba9e6821ce964067fcf4401496bc29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5e9fc6a0.failed
+
+Some devices (such as the Mellanox CX-4) can register, under a
+single R_key, a set of memory regions that are not contiguous. When
+this is done, all the segments in a Reply list, say, can then be
+invalidated in a single LocalInv Work Request (or via Remote
+Invalidation, which can invalidate exactly one R_key when completing
+a Receive).
+
+This means a single FastReg WR is used to register, and one or zero
+LocalInv WRs can invalidate, the memory involved with RDMA transfers
+on behalf of an RPC.
+
+In addition, xprtrdma constructs some Reply chunks from three or
+more segments. By registering them with SG_GAP, only one segment
+is needed for the Reply chunk, allowing the whole chunk to be
+invalidated remotely.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 5e9fc6a06bba9e6821ce964067fcf4401496bc29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index cba1269d30ef,e99bf6180136..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -148,7 -100,8 +148,11 @@@ __frwr_init(struct rpcrdma_mw *r, struc
+  	struct rpcrdma_frmr *f = &r->frmr;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	f->fr_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, depth);
+++=======
++ 	f->fr_mr = ib_alloc_mr(ia->ri_pd, ia->ri_mrtype, depth);
+++>>>>>>> 5e9fc6a06bba (xprtrdma: Support for SG_GAP devices)
+  	if (IS_ERR(f->fr_mr))
+  		goto out_mr_err;
+  
+@@@ -181,11 -132,78 +185,80 @@@ __frwr_release(struct rpcrdma_mw *r
+  {
+  	int rc;
+  
+ -	/* Ensure MW is not on any rl_registered list */
+ -	if (!list_empty(&r->mw_list))
+ -		list_del(&r->mw_list);
+ -
+  	rc = ib_dereg_mr(r->frmr.fr_mr);
+  	if (rc)
+++<<<<<<< HEAD
+ +		dprintk("RPC:       %s: ib_dereg_mr status %i\n",
+ +			__func__, rc);
+ +	kfree(r->frmr.sg);
+++=======
++ 		pr_err("rpcrdma: final ib_dereg_mr for %p returned %i\n",
++ 		       r, rc);
++ 	kfree(r->mw_sg);
++ 	kfree(r);
++ }
++ 
++ static int
++ __frwr_reset_mr(struct rpcrdma_ia *ia, struct rpcrdma_mw *r)
++ {
++ 	struct rpcrdma_frmr *f = &r->frmr;
++ 	int rc;
++ 
++ 	rc = ib_dereg_mr(f->fr_mr);
++ 	if (rc) {
++ 		pr_warn("rpcrdma: ib_dereg_mr status %d, frwr %p orphaned\n",
++ 			rc, r);
++ 		return rc;
++ 	}
++ 
++ 	f->fr_mr = ib_alloc_mr(ia->ri_pd, ia->ri_mrtype,
++ 			       ia->ri_max_frmr_depth);
++ 	if (IS_ERR(f->fr_mr)) {
++ 		pr_warn("rpcrdma: ib_alloc_mr status %ld, frwr %p orphaned\n",
++ 			PTR_ERR(f->fr_mr), r);
++ 		return PTR_ERR(f->fr_mr);
++ 	}
++ 
++ 	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, f);
++ 	f->fr_state = FRMR_IS_INVALID;
++ 	return 0;
++ }
++ 
++ /* Reset of a single FRMR. Generate a fresh rkey by replacing the MR.
++  *
++  * There's no recovery if this fails. The FRMR is abandoned, but
++  * remains in rb_all. It will be cleaned up when the transport is
++  * destroyed.
++  */
++ static void
++ frwr_op_recover_mr(struct rpcrdma_mw *mw)
++ {
++ 	enum rpcrdma_frmr_state state = mw->frmr.fr_state;
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
++ 	int rc;
++ 
++ 	rc = __frwr_reset_mr(ia, mw);
++ 	if (state != FRMR_FLUSHED_LI)
++ 		ib_dma_unmap_sg(ia->ri_device,
++ 				mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc)
++ 		goto out_release;
++ 
++ 	rpcrdma_put_mw(r_xprt, mw);
++ 	r_xprt->rx_stats.mrs_recovered++;
++ 	return;
++ 
++ out_release:
++ 	pr_err("rpcrdma: FRMR reset failed %d, %p release\n", rc, mw);
++ 	r_xprt->rx_stats.mrs_orphaned++;
++ 
++ 	spin_lock(&r_xprt->rx_buf.rb_mwlock);
++ 	list_del(&mw->mw_all);
++ 	spin_unlock(&r_xprt->rx_buf.rb_mwlock);
++ 
++ 	frwr_op_release_mr(mw);
+++>>>>>>> 5e9fc6a06bba (xprtrdma: Support for SG_GAP devices)
+  }
+  
+  static int
+@@@ -365,12 -350,10 +443,16 @@@ frwr_op_init(struct rpcrdma_xprt *r_xpr
+   */
+  static int
+  frwr_op_map(struct rpcrdma_xprt *r_xprt, struct rpcrdma_mr_seg *seg,
+ -	    int nsegs, bool writing, struct rpcrdma_mw **out)
+ +	    int nsegs, bool writing)
+  {
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+++<<<<<<< HEAD
+ +	struct ib_device *device = ia->ri_device;
+ +	enum dma_data_direction direction = rpcrdma_data_dir(writing);
+ +	struct rpcrdma_mr_seg *seg1 = seg;
+++=======
++ 	bool holes_ok = ia->ri_mrtype == IB_MR_TYPE_SG_GAPS;
+++>>>>>>> 5e9fc6a06bba (xprtrdma: Support for SG_GAP devices)
+  	struct rpcrdma_mw *mw;
+  	struct rpcrdma_frmr *frmr;
+  	struct ib_mr *mr;
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6,b8424fa47d29..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -75,6 -74,8 +75,11 @@@ struct rpcrdma_ia 
+  	unsigned int		ri_max_frmr_depth;
+  	unsigned int		ri_max_inline_write;
+  	unsigned int		ri_max_inline_read;
+++<<<<<<< HEAD
+++=======
++ 	bool			ri_reminv_expected;
++ 	enum ib_mr_type		ri_mrtype;
+++>>>>>>> 5e9fc6a06bba (xprtrdma: Support for SG_GAP devices)
+  	struct ib_qp_attr	ri_qp_attr;
+  	struct ib_qp_init_attr	ri_qp_init_attr;
+  };
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
