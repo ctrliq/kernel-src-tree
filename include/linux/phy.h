@@ -331,8 +331,8 @@ struct phy_c45_device_ids {
  * adjust_link: Callback for the enet controller to respond to
  * changes in the link state.
  *
- * speed, duplex, pause, supported, advertising, and
- * autoneg are used like in mii_if_info
+ * speed, duplex, pause, supported, advertising, lp_advertising,
+ * and autoneg are used like in mii_if_info
  *
  * interrupts currently only supports enabled or disabled,
  * but could be changed in the future to support enabling
@@ -385,6 +385,7 @@ struct phy_device {
 	/* See mii.h for more info */
 	u32 supported;
 	u32 advertising;
+	u32 lp_advertising;
 
 	int autoneg;
 
