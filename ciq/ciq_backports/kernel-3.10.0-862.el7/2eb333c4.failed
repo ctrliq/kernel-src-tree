@@ -1,0 +1,167 @@
+nfp: improve order of interfaces in breakout mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 2eb333c4b442c4bcab79ada53019d4a47f252e46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2eb333c4.failed
+
+For historical reasons we enumerate the vNICs in order.  This means
+that if user configures breakout on a multiport card, the first
+interface of the second port will have its MAC address changed.
+
+What's worse, when moved from static information (HWInfo) to using
+management FW (NSP), more features started depending on the port ids.
+Right now in case of breakout first subport of the second port and
+second subport of the first port will have their link info swapped.
+
+Revise the ordering scheme so that first subport maintains its address.
+Side effect of this change is that we will use base lane ids in
+devlink (i.e. 40G ports will be 4 ids apart), e.g.:
+
+pci/0000:04:00.0/0: type eth netdev p6p1
+pci/0000:04:00.0/4: type eth netdev p6p2
+
+Note that behaviour of phys_port_id is not changed since there is
+a separate id number for the subport there.
+
+Fixes: ec8b1fbe682d ("nfp: support port splitting via devlink")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2eb333c4b442c4bcab79ada53019d4a47f252e46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,365252ab4660..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -102,4 -144,14 +102,15 @@@ extern struct pci_driver nfp_netvf_pci_
+  int nfp_net_pci_probe(struct nfp_pf *pf);
+  void nfp_net_pci_remove(struct nfp_pf *pf);
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_hwmon_register(struct nfp_pf *pf);
++ void nfp_hwmon_unregister(struct nfp_pf *pf);
++ 
++ void
++ nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port, unsigned int id);
++ 
++ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
++ 
+++>>>>>>> 2eb333c4b442 (nfp: improve order of interfaces in breakout mode)
+  #endif /* NFP_MAIN_H */
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,bfcdada29cc0..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -157,37 -122,25 +157,48 @@@ nfp_net_get_mac_addr_hwinfo(struct nfp_
+  		return;
+  	}
+  
+ -	ether_addr_copy(port->netdev->dev_addr, mac_addr);
+ -	ether_addr_copy(port->netdev->perm_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * nfp_net_get_mac_addr() - Get the MAC address.
+ + * @nn:       NFP Network structure
+ + * @pf:	      NFP PF device structure
+ + * @id:	      NFP port id
+ + *
+ + * First try to get the MAC address from NSP ETH table. If that
+ + * fails try HWInfo.  As a last resort generate a random address.
+ + */
+ +static void
+ +nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_pf *pf, unsigned int id)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; pf->eth_tbl && i < pf->eth_tbl->count; i++)
+ +		if (pf->eth_tbl->ports[i].eth_index == id) {
+ +			const u8 *mac_addr = pf->eth_tbl->ports[i].mac_addr;
+++=======
++ static struct nfp_eth_table_port *
++ nfp_net_find_port(struct nfp_eth_table *eth_tbl, unsigned int index)
++ {
++ 	int i;
++ 
++ 	for (i = 0; eth_tbl && i < eth_tbl->count; i++)
++ 		if (eth_tbl->ports[i].index == index)
++ 			return &eth_tbl->ports[i];
+++>>>>>>> 2eb333c4b442 (nfp: improve order of interfaces in breakout mode)
+  
+ -	return NULL;
+ +			ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +			ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+ +			return;
+ +		}
+ +
+ +	nfp_net_get_mac_addr_hwinfo(nn, pf->cpp, id);
+  }
+  
+ -static int
+ -nfp_net_pf_rtsym_read_optional(struct nfp_pf *pf, const char *format,
+ -			       unsigned int default_val)
+ +static unsigned int nfp_net_pf_get_num_ports(struct nfp_pf *pf)
+  {
+  	char name[256];
+  	int err = 0;
+@@@ -281,13 -200,16 +292,19 @@@ static void nfp_net_pf_free_netdevs(str
+  }
+  
+  static struct nfp_net *
+++<<<<<<< HEAD
+ +nfp_net_pf_alloc_port_netdev(struct nfp_pf *pf, void __iomem *ctrl_bar,
+ +			     void __iomem *tx_bar, void __iomem *rx_bar,
+ +			     int stride, struct nfp_net_fw_version *fw_ver)
+++=======
++ nfp_net_pf_alloc_vnic(struct nfp_pf *pf, bool needs_netdev,
++ 		      void __iomem *ctrl_bar, void __iomem *qc_bar,
++ 		      int stride, unsigned int id)
+++>>>>>>> 2eb333c4b442 (nfp: improve order of interfaces in breakout mode)
+  {
+ -	u32 tx_base, rx_base, n_tx_rings, n_rx_rings;
+ +	u32 n_tx_rings, n_rx_rings;
+  	struct nfp_net *nn;
+ -	int err;
+  
+ -	tx_base = readl(ctrl_bar + NFP_NET_CFG_START_TXQ);
+ -	rx_base = readl(ctrl_bar + NFP_NET_CFG_START_RXQ);
+  	n_tx_rings = readl(ctrl_bar + NFP_NET_CFG_MAX_TXRINGS);
+  	n_rx_rings = readl(ctrl_bar + NFP_NET_CFG_MAX_RXRINGS);
+  
+@@@ -305,6 -227,17 +322,20 @@@
+  	nn->stride_rx = stride;
+  	nn->stride_tx = stride;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (needs_netdev) {
++ 		err = nfp_app_vnic_init(pf->app, nn, id);
++ 		if (err) {
++ 			nfp_net_free(nn);
++ 			return ERR_PTR(err);
++ 		}
++ 	}
++ 
++ 	pf->num_vnics++;
++ 	list_add_tail(&nn->vnic_list, &pf->vnics);
++ 
+++>>>>>>> 2eb333c4b442 (nfp: improve order of interfaces in breakout mode)
+  	return nn;
+  }
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
