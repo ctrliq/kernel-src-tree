@@ -1,0 +1,98 @@
+bpf: fix range propagation on direct packet access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 2d2be8cab26ed918e94d2deae89580003242a123
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2d2be8ca.failed
+
+LLVM can generate code that tests for direct packet access via
+skb->data/data_end in a way that currently gets rejected by the
+verifier, example:
+
+  [...]
+   7: (61) r3 = *(u32 *)(r6 +80)
+   8: (61) r9 = *(u32 *)(r6 +76)
+   9: (bf) r2 = r9
+  10: (07) r2 += 54
+  11: (3d) if r3 >= r2 goto pc+12
+   R1=inv R2=pkt(id=0,off=54,r=0) R3=pkt_end R4=inv R6=ctx
+   R9=pkt(id=0,off=0,r=0) R10=fp
+  12: (18) r4 = 0xffffff7a
+  14: (05) goto pc+430
+  [...]
+
+  from 11 to 24: R1=inv R2=pkt(id=0,off=54,r=0) R3=pkt_end R4=inv
+                 R6=ctx R9=pkt(id=0,off=0,r=0) R10=fp
+  24: (7b) *(u64 *)(r10 -40) = r1
+  25: (b7) r1 = 0
+  26: (63) *(u32 *)(r6 +56) = r1
+  27: (b7) r2 = 40
+  28: (71) r8 = *(u8 *)(r9 +20)
+  invalid access to packet, off=20 size=1, R9(id=0,off=0,r=0)
+
+The reason why this gets rejected despite a proper test is that we
+currently call find_good_pkt_pointers() only in case where we detect
+tests like rX > pkt_end, where rX is of type pkt(id=Y,off=Z,r=0) and
+derived, for example, from a register of type pkt(id=Y,off=0,r=0)
+pointing to skb->data. find_good_pkt_pointers() then fills the range
+in the current branch to pkt(id=Y,off=0,r=Z) on success.
+
+For above case, we need to extend that to recognize pkt_end >= rX
+pattern and mark the other branch that is taken on success with the
+appropriate pkt(id=Y,off=0,r=Z) type via find_good_pkt_pointers().
+Since eBPF operates on BPF_JGT (>) and BPF_JGE (>=), these are the
+only two practical options to test for from what LLVM could have
+generated, since there's no such thing as BPF_JLT (<) or BPF_JLE (<=)
+that we would need to take into account as well.
+
+After the fix:
+
+  [...]
+   7: (61) r3 = *(u32 *)(r6 +80)
+   8: (61) r9 = *(u32 *)(r6 +76)
+   9: (bf) r2 = r9
+  10: (07) r2 += 54
+  11: (3d) if r3 >= r2 goto pc+12
+   R1=inv R2=pkt(id=0,off=54,r=0) R3=pkt_end R4=inv R6=ctx
+   R9=pkt(id=0,off=0,r=0) R10=fp
+  12: (18) r4 = 0xffffff7a
+  14: (05) goto pc+430
+  [...]
+
+  from 11 to 24: R1=inv R2=pkt(id=0,off=54,r=54) R3=pkt_end R4=inv
+                 R6=ctx R9=pkt(id=0,off=0,r=54) R10=fp
+  24: (7b) *(u64 *)(r10 -40) = r1
+  25: (b7) r1 = 0
+  26: (63) *(u32 *)(r6 +56) = r1
+  27: (b7) r2 = 40
+  28: (71) r8 = *(u8 *)(r9 +20)
+  29: (bf) r1 = r8
+  30: (25) if r8 > 0x3c goto pc+47
+   R1=inv56 R2=imm40 R3=pkt_end R4=inv R6=ctx R8=inv56
+   R9=pkt(id=0,off=0,r=54) R10=fp
+  31: (b7) r1 = 1
+  [...]
+
+Verifier test cases are also added in this work, one that demonstrates
+the mentioned example here and one that tries a bad packet access for
+the current/fall-through branch (the one with types pkt(id=X,off=Y,r=0),
+pkt(id=X,off=0,r=0)), then a case with good and bad accesses, and two
+with both test variants (>, >=).
+
+Fixes: 969bf05eb3ce ("bpf: direct packet access")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2d2be8cab26ed918e94d2deae89580003242a123)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+#	samples/bpf/test_verifier.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path samples/bpf/test_verifier.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path samples/bpf/test_verifier.c
