@@ -1,0 +1,166 @@
+KEYS: user_defined: sanitize key payloads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Biggers <ebiggers@google.com>
+commit 6966c74932b328b3d6df92b11b083bfbcd067986
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6966c749.failed
+
+Zero the payloads of user and logon keys before freeing them.  This
+prevents sensitive key material from being kept around in the slab
+caches after a key is released.
+
+	Signed-off-by: Eric Biggers <ebiggers@google.com>
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: James Morris <james.l.morris@oracle.com>
+(cherry picked from commit 6966c74932b328b3d6df92b11b083bfbcd067986)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/keys/user_defined.c
+diff --cc security/keys/user_defined.c
+index faa2caeb593f,3d8c68eba516..000000000000
+--- a/security/keys/user_defined.c
++++ b/security/keys/user_defined.c
+@@@ -64,87 -64,67 +64,108 @@@ int user_instantiate(struct key *key, s
+  {
+  	struct user_key_payload *upayload;
+  	size_t datalen = prep->datalen;
+ +	int ret;
+  
+ +	ret = -EINVAL;
+  	if (datalen <= 0 || datalen > 32767 || !prep->data)
+ -		return -EINVAL;
+ +		goto error;
+ +
+ +	ret = key_payload_reserve(key, datalen);
+ +	if (ret < 0)
+ +		goto error;
+  
+ +	ret = -ENOMEM;
+  	upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+  	if (!upayload)
+ -		return -ENOMEM;
+ +		goto error;
+  
+  	/* attach the data */
+ -	prep->quotalen = datalen;
+ -	prep->payload.data[0] = upayload;
+  	upayload->datalen = datalen;
+  	memcpy(upayload->data, prep->data, datalen);
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL_GPL(user_preparse);
+ +	rcu_assign_keypointer(key, upayload);
+ +	ret = 0;
+  
+++<<<<<<< HEAD
+ +error:
+ +	return ret;
+++=======
++ /*
++  * Free a preparse of a user defined key payload
++  */
++ void user_free_preparse(struct key_preparsed_payload *prep)
++ {
++ 	kzfree(prep->payload.data[0]);
+++>>>>>>> 6966c74932b3 (KEYS: user_defined: sanitize key payloads)
+  }
+ -EXPORT_SYMBOL_GPL(user_free_preparse);
+ +
+ +EXPORT_SYMBOL_GPL(user_instantiate);
+  
++ static void user_free_payload_rcu(struct rcu_head *head)
++ {
++ 	struct user_key_payload *payload;
++ 
++ 	payload = container_of(head, struct user_key_payload, rcu);
++ 	kzfree(payload);
++ }
++ 
+  /*
+   * update a user defined key
+   * - the key's semaphore is write-locked
+   */
+  int user_update(struct key *key, struct key_preparsed_payload *prep)
+  {
+ -	struct user_key_payload *zap = NULL;
+ +	struct user_key_payload *upayload, *zap;
+ +	size_t datalen = prep->datalen;
+  	int ret;
+  
+ +	ret = -EINVAL;
+ +	if (datalen <= 0 || datalen > 32767 || !prep->data)
+ +		goto error;
+ +
+ +	/* construct a replacement payload */
+ +	ret = -ENOMEM;
+ +	upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+ +	if (!upayload)
+ +		goto error;
+ +
+ +	upayload->datalen = datalen;
+ +	memcpy(upayload->data, prep->data, datalen);
+ +
+  	/* check the quota and attach the new data */
+ -	ret = key_payload_reserve(key, prep->datalen);
+ -	if (ret < 0)
+ -		return ret;
+ +	zap = upayload;
+  
+ -	/* attach the new data, displacing the old */
+ -	key->expiry = prep->expiry;
+ -	if (!test_bit(KEY_FLAG_NEGATIVE, &key->flags))
+ -		zap = dereference_key_locked(key);
+ -	rcu_assign_keypointer(key, prep->payload.data[0]);
+ -	prep->payload.data[0] = NULL;
+ +	ret = key_payload_reserve(key, datalen);
+ +
+ +	if (ret == 0) {
+ +		/* attach the new data, displacing the old */
+ +		zap = key->payload.data;
+ +		rcu_assign_keypointer(key, upayload);
+ +		key->expiry = 0;
+ +	}
+  
+  	if (zap)
+++<<<<<<< HEAD
+ +		kfree_rcu(zap, rcu);
+ +
+ +error:
+++=======
++ 		call_rcu(&zap->rcu, user_free_payload_rcu);
+++>>>>>>> 6966c74932b3 (KEYS: user_defined: sanitize key payloads)
+  	return ret;
+  }
+ +
+  EXPORT_SYMBOL_GPL(user_update);
+  
+ +/*
+ + * match users on their name
+ + */
+ +int user_match(const struct key *key, const void *description)
+ +{
+ +	return strcmp(key->description, description) == 0;
+ +}
+ +
+ +EXPORT_SYMBOL_GPL(user_match);
+ +
+  /*
+   * dispose of the links from a revoked keyring
+   * - called with the key sem write-locked
+@@@ -169,9 -149,9 +190,9 @@@ EXPORT_SYMBOL(user_revoke)
+   */
+  void user_destroy(struct key *key)
+  {
+ -	struct user_key_payload *upayload = key->payload.data[0];
+ +	struct user_key_payload *upayload = key->payload.data;
+  
+- 	kfree(upayload);
++ 	kzfree(upayload);
+  }
+  
+  EXPORT_SYMBOL_GPL(user_destroy);
+* Unmerged path security/keys/user_defined.c
