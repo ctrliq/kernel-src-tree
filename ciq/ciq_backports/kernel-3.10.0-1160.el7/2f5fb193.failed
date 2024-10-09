@@ -1,0 +1,113 @@
+x86/speculation: Prevent deadlock on ssb_state::lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2f5fb19341883bb6e37da351bc3700489d8506a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/2f5fb193.failed
+
+Mikhail reported a lockdep splat related to the AMD specific ssb_state
+lock:
+
+  CPU0                       CPU1
+  lock(&st->lock);
+                             local_irq_disable();
+                             lock(&(&sighand->siglock)->rlock);
+                             lock(&st->lock);
+  <Interrupt>
+     lock(&(&sighand->siglock)->rlock);
+
+  *** DEADLOCK ***
+
+The connection between sighand->siglock and st->lock comes through seccomp,
+which takes st->lock while holding sighand->siglock.
+
+Make sure interrupts are disabled when __speculation_ctrl_update() is
+invoked via prctl() -> speculation_ctrl_update(). Add a lockdep assert to
+catch future offenders.
+
+Fixes: 1f50ddb4f418 ("x86/speculation: Handle HT correctly on AMD")
+	Reported-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+	Cc: Thomas Lendacky <thomas.lendacky@amd.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1904141948200.4917@nanos.tec.linutronix.de
+
+(cherry picked from commit 2f5fb19341883bb6e37da351bc3700489d8506a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/process.c
+diff --cc arch/x86/kernel/process.c
+index cf14a22177f5,957eae13b370..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -319,13 -416,25 +319,25 @@@ static __always_inline void amd_set_ssb
+  static __always_inline void __speculation_ctrl_update(unsigned long tifp,
+  						      unsigned long tifn)
+  {
+ -	unsigned long tif_diff = tifp ^ tifn;
+ -	u64 msr = x86_spec_ctrl_base;
+  	bool updmsr = false;
+  
+++<<<<<<< HEAD
+ +	if (!static_key_false(&ssbd_userset_key))
+ +		return;	/* Don't do anything if not user settable */
+ +
+ +	/* If TIF_SSBD is different, select the proper mitigation method */
+ +	if ((tifp ^ tifn) & _TIF_SSBD) {
+++=======
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/*
++ 	 * If TIF_SSBD is different, select the proper mitigation
++ 	 * method. Note that if SSBD mitigation is disabled or permanentely
++ 	 * enabled this branch can't be taken because nothing can set
++ 	 * TIF_SSBD.
++ 	 */
++ 	if (tif_diff & _TIF_SSBD) {
+++>>>>>>> 2f5fb1934188 (x86/speculation: Prevent deadlock on ssb_state::lock)
+  		if (static_cpu_has(X86_FEATURE_VIRT_SSBD)) {
+  			amd_set_ssb_virt_state(tifn);
+  		} else if (static_cpu_has(X86_FEATURE_LS_CFG_SSBD)) {
+@@@ -356,32 -479,13 +368,34 @@@ static unsigned long speculation_ctrl_u
+  
+  void speculation_ctrl_update(unsigned long tif)
+  {
++ 	unsigned long flags;
++ 
+  	/* Forced update. Make sure all relevant TIF flags are different */
+- 	preempt_disable();
++ 	local_irq_save(flags);
+  	__speculation_ctrl_update(~tif, tif);
+- 	preempt_enable();
++ 	local_irq_restore(flags);
+  }
+ +EXPORT_SYMBOL_GPL(speculation_ctrl_update);
+ +
+ +static inline void switch_to_bitmap(struct tss_struct *tss,
+ +				    struct thread_struct *prev,
+ +				    struct thread_struct *next,
+ +				    unsigned long tifp, unsigned long tifn)
+ +{
+ +	if (tifn & _TIF_IO_BITMAP) {
+ +		/*
+ +		 * Copy the relevant range of the IO bitmap.
+ +		 * Normally this is 128 bytes or less:
+ +		 */
+ +		memcpy(tss->io_bitmap, next->io_bitmap_ptr,
+ +		       max(prev->io_bitmap_max, next->io_bitmap_max));
+ +	} else if (tifp & _TIF_IO_BITMAP) {
+ +		/*
+ +		 * Clear any possible leftover bits:
+ +		 */
+ +		memset(tss->io_bitmap, 0xff, prev->io_bitmap_max);
+ +	}
+ +}
+  
+  /* Called from seccomp/prctl update */
+  void speculation_ctrl_update_current(void)
+* Unmerged path arch/x86/kernel/process.c
