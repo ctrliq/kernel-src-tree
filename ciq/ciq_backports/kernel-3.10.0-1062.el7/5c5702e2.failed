@@ -1,0 +1,406 @@
+RDMA/core: Set right entry state before releasing reference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 5c5702e259dc66e6fceed5117effab79c186e87a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5c5702e2.failed
+
+Currently add_modify_gid() for IB link layer has followong issue
+in cache update path.
+
+When GID update event occurs, core releases reference to the GID
+table without updating its state and/or entry pointer.
+
+CPU-0                              CPU-1
+------                             -----
+ib_cache_update()                    IPoIB ULP
+   add_modify_gid()                   [..]
+      put_gid_entry()
+      refcnt = 0, but
+      state = valid,
+      entry is valid.
+      (work item is not yet executed).
+                                   ipoib_create_ah()
+                                     rdma_create_ah()
+                                        rdma_get_gid_attr() <--
+                                   	Tries to acquire gid_attr
+                                        which has refcnt = 0.
+                                   	This is incorrect.
+
+GID entry state and entry pointer is provides the accurate GID enty
+state. Such fields must be updated with rwlock to protect against
+readers and, such fields must be in sane state before refcount can drop
+to zero. Otherwise above race condition can happen leading to
+use-after-free situation.
+
+Following backtrace has been observed when cache update for an IB port
+is triggered while IPoIB ULP is creating an AH.
+
+Therefore, when updating GID entry, first mark a valid entry as invalid
+through state and set the barrier so that no callers can acquired
+the GID entry, followed by release reference to it.
+
+refcount_t: increment on 0; use-after-free.
+WARNING: CPU: 4 PID: 29106 at lib/refcount.c:153 refcount_inc_checked+0x30/0x50
+Workqueue: ib-comp-unb-wq ib_cq_poll_work [ib_core]
+RIP: 0010:refcount_inc_checked+0x30/0x50
+RSP: 0018:ffff8802ad36f600 EFLAGS: 00010082
+RAX: 0000000000000000 RBX: 0000000000000000 RCX: 0000000000000000
+RDX: 0000000000000002 RSI: 0000000000000008 RDI: ffffffff86710100
+RBP: ffff8802d6e60a30 R08: ffffed005d67bf8b R09: ffffed005d67bf8b
+R10: 0000000000000001 R11: ffffed005d67bf8a R12: ffff88027620cee8
+R13: ffff8802d6e60988 R14: ffff8802d6e60a78 R15: 0000000000000202
+FS: 0000000000000000(0000) GS:ffff8802eb200000(0000) knlGS:0000000000000000
+CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007f3ab35e5c88 CR3: 00000002ce84a000 CR4: 00000000000006e0
+IPv6: ADDRCONF(NETDEV_CHANGE): ib1: link becomes ready
+Call Trace:
+rdma_get_gid_attr+0x220/0x310 [ib_core]
+? lock_acquire+0x145/0x3a0
+rdma_fill_sgid_attr+0x32c/0x470 [ib_core]
+rdma_create_ah+0x89/0x160 [ib_core]
+? rdma_fill_sgid_attr+0x470/0x470 [ib_core]
+? ipoib_create_ah+0x52/0x260 [ib_ipoib]
+ipoib_create_ah+0xf5/0x260 [ib_ipoib]
+ipoib_mcast_join_complete+0xbbe/0x2540 [ib_ipoib]
+
+Fixes: b150c3862d21 ("IB/core: Introduce GID entry reference counts")
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5c5702e259dc66e6fceed5117effab79c186e87a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 36d3478f5cc1,3208ad6ad540..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -163,94 -183,243 +163,261 @@@ int ib_cache_gid_parse_type_str(const c
+  }
+  EXPORT_SYMBOL(ib_cache_gid_parse_type_str);
+  
+ -static struct ib_gid_table *rdma_gid_table(struct ib_device *device, u8 port)
+ -{
+ -	return device->cache.ports[port - rdma_start_port(device)].gid;
+ -}
+ -
+ -static bool is_gid_entry_free(const struct ib_gid_table_entry *entry)
+ -{
+ -	return !entry;
+ -}
+ -
+ -static bool is_gid_entry_valid(const struct ib_gid_table_entry *entry)
+ -{
+ -	return entry && entry->state == GID_TABLE_ENTRY_VALID;
+ -}
+ -
+ -static void schedule_free_gid(struct kref *kref)
+ +/* This function expects that rwlock will be write locked in all
+ + * scenarios and that lock will be locked in sleep-able (RoCE)
+ + * scenarios.
+ + */
+ +static int write_gid(struct ib_device *ib_dev, u8 port,
+ +		     struct ib_gid_table *table, int ix,
+ +		     const union ib_gid *gid,
+ +		     const struct ib_gid_attr *attr,
+ +		     enum gid_table_write_action action,
+ +		     bool  default_gid)
+ +	__releases(&table->rwlock) __acquires(&table->rwlock)
+  {
+ -	struct ib_gid_table_entry *entry =
+ -			container_of(kref, struct ib_gid_table_entry, kref);
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +	struct net_device *old_net_dev;
+ +	enum ib_gid_type old_gid_type;
+  
+ -	queue_work(ib_wq, &entry->del_work);
+ -}
+ +	/* in rdma_cap_roce_gid_table, this funciton should be protected by a
+ +	 * sleep-able lock.
+ +	 */
+  
+ -static void free_gid_entry_locked(struct ib_gid_table_entry *entry)
+ -{
+ -	struct ib_device *device = entry->attr.device;
+ -	u8 port_num = entry->attr.port_num;
+ -	struct ib_gid_table *table = rdma_gid_table(device, port_num);
+ +	if (rdma_cap_roce_gid_table(ib_dev, port)) {
+ +		table->data_vec[ix].props |= GID_TABLE_ENTRY_INVALID;
+ +		write_unlock_irq(&table->rwlock);
+ +		/* GID_TABLE_WRITE_ACTION_MODIFY currently isn't supported by
+ +		 * RoCE providers and thus only updates the cache.
+ +		 */
+ +		if (action == GID_TABLE_WRITE_ACTION_ADD)
+ +			ret = ib_dev->add_gid(ib_dev, port, ix, gid, attr,
+ +					      &table->data_vec[ix].context);
+ +		else if (action == GID_TABLE_WRITE_ACTION_DEL)
+ +			ret = ib_dev->del_gid(ib_dev, port, ix,
+ +					      &table->data_vec[ix].context);
+ +		write_lock_irq(&table->rwlock);
+ +	}
+  
+ -	pr_debug("%s device=%s port=%d index=%d gid %pI6\n", __func__,
+ -		 device->name, port_num, entry->attr.index,
+ -		 entry->attr.gid.raw);
+ +	old_net_dev = table->data_vec[ix].attr.ndev;
+ +	old_gid_type = table->data_vec[ix].attr.gid_type;
+ +	if (old_net_dev && old_net_dev != attr->ndev)
+ +		dev_put(old_net_dev);
+ +	/* if modify_gid failed, just delete the old gid */
+ +	if (ret || action == GID_TABLE_WRITE_ACTION_DEL) {
+ +		gid = &zgid;
+ +		attr = &zattr;
+ +		table->data_vec[ix].context = NULL;
+ +	}
+  
+ -	if (rdma_cap_roce_gid_table(device, port_num) &&
+ -	    entry->state != GID_TABLE_ENTRY_INVALID)
+ -		device->del_gid(&entry->attr, &entry->context);
+ +	memcpy(&table->data_vec[ix].gid, gid, sizeof(*gid));
+ +	memcpy(&table->data_vec[ix].attr, attr, sizeof(*attr));
+ +	if (default_gid) {
+ +		table->data_vec[ix].props |= GID_TABLE_ENTRY_DEFAULT;
+ +		if (action == GID_TABLE_WRITE_ACTION_DEL)
+ +			table->data_vec[ix].attr.gid_type = old_gid_type;
+ +	}
+ +	if (table->data_vec[ix].attr.ndev &&
+ +	    table->data_vec[ix].attr.ndev != old_net_dev)
+ +		dev_hold(table->data_vec[ix].attr.ndev);
+  
+ -	write_lock_irq(&table->rwlock);
+ +	table->data_vec[ix].props &= ~GID_TABLE_ENTRY_INVALID;
+  
+ -	/*
+ -	 * The only way to avoid overwriting NULL in table is
+ -	 * by comparing if it is same entry in table or not!
+ -	 * If new entry in table is added by the time we free here,
+ -	 * don't overwrite the table entry.
+ -	 */
+ -	if (entry == table->data_vec[entry->attr.index])
+ -		table->data_vec[entry->attr.index] = NULL;
+ -	/* Now this index is ready to be allocated */
+ -	write_unlock_irq(&table->rwlock);
+ +	return ret;
+ +}
+  
+ -	if (entry->attr.ndev)
+ -		dev_put(entry->attr.ndev);
+ -	kfree(entry);
+ +static int add_gid(struct ib_device *ib_dev, u8 port,
+ +		   struct ib_gid_table *table, int ix,
+ +		   const union ib_gid *gid,
+ +		   const struct ib_gid_attr *attr,
+ +		   bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, gid, attr,
+ +			 GID_TABLE_WRITE_ACTION_ADD, default_gid);
+  }
+  
+ -static void free_gid_entry(struct kref *kref)
+ -{
+ -	struct ib_gid_table_entry *entry =
+ -			container_of(kref, struct ib_gid_table_entry, kref);
+ +static int modify_gid(struct ib_device *ib_dev, u8 port,
+ +		      struct ib_gid_table *table, int ix,
+ +		      const union ib_gid *gid,
+ +		      const struct ib_gid_attr *attr,
+ +		      bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, gid, attr,
+ +			 GID_TABLE_WRITE_ACTION_MODIFY, default_gid);
+ +}
+  
+ -	free_gid_entry_locked(entry);
+ +static int del_gid(struct ib_device *ib_dev, u8 port,
+ +		   struct ib_gid_table *table, int ix,
+ +		   bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, &zgid, &zattr,
+ +			 GID_TABLE_WRITE_ACTION_DEL, default_gid);
+  }
+  
+ -/**
+ - * free_gid_work - Release reference to the GID entry
+ - * @work: Work structure to refer to GID entry which needs to be
+ - * deleted.
+ - *
+ - * free_gid_work() frees the entry from the HCA's hardware table
+ - * if provider supports it. It releases reference to netdevice.
+ - */
+ -static void free_gid_work(struct work_struct *work)
+ -{
+ +/* rwlock should be read locked */
+++=======
++ 	struct ib_gid_table_entry *entry =
++ 		container_of(work, struct ib_gid_table_entry, del_work);
++ 	struct ib_device *device = entry->attr.device;
++ 	u8 port_num = entry->attr.port_num;
++ 	struct ib_gid_table *table = rdma_gid_table(device, port_num);
++ 
++ 	mutex_lock(&table->lock);
++ 	free_gid_entry_locked(entry);
++ 	mutex_unlock(&table->lock);
++ }
++ 
++ static struct ib_gid_table_entry *
++ alloc_gid_entry(const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 	kref_init(&entry->kref);
++ 	memcpy(&entry->attr, attr, sizeof(*attr));
++ 	if (entry->attr.ndev)
++ 		dev_hold(entry->attr.ndev);
++ 	INIT_WORK(&entry->del_work, free_gid_work);
++ 	entry->state = GID_TABLE_ENTRY_INVALID;
++ 	return entry;
++ }
++ 
++ static void store_gid_entry(struct ib_gid_table *table,
++ 			    struct ib_gid_table_entry *entry)
++ {
++ 	entry->state = GID_TABLE_ENTRY_VALID;
++ 
++ 	pr_debug("%s device=%s port=%d index=%d gid %pI6\n", __func__,
++ 		 entry->attr.device->name, entry->attr.port_num,
++ 		 entry->attr.index, entry->attr.gid.raw);
++ 
++ 	lockdep_assert_held(&table->lock);
++ 	write_lock_irq(&table->rwlock);
++ 	table->data_vec[entry->attr.index] = entry;
++ 	write_unlock_irq(&table->rwlock);
++ }
++ 
++ static void get_gid_entry(struct ib_gid_table_entry *entry)
++ {
++ 	kref_get(&entry->kref);
++ }
++ 
++ static void put_gid_entry(struct ib_gid_table_entry *entry)
++ {
++ 	kref_put(&entry->kref, schedule_free_gid);
++ }
++ 
++ static void put_gid_entry_locked(struct ib_gid_table_entry *entry)
++ {
++ 	kref_put(&entry->kref, free_gid_entry);
++ }
++ 
++ static int add_roce_gid(struct ib_gid_table_entry *entry)
++ {
++ 	const struct ib_gid_attr *attr = &entry->attr;
++ 	int ret;
++ 
++ 	if (!attr->ndev) {
++ 		pr_err("%s NULL netdev device=%s port=%d index=%d\n",
++ 		       __func__, attr->device->name, attr->port_num,
++ 		       attr->index);
++ 		return -EINVAL;
++ 	}
++ 	if (rdma_cap_roce_gid_table(attr->device, attr->port_num)) {
++ 		ret = attr->device->add_gid(attr, &entry->context);
++ 		if (ret) {
++ 			pr_err("%s GID add failed device=%s port=%d index=%d\n",
++ 			       __func__, attr->device->name, attr->port_num,
++ 			       attr->index);
++ 			return ret;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ /**
++  * del_gid - Delete GID table entry
++  *
++  * @ib_dev:	IB device whose GID entry to be deleted
++  * @port:	Port number of the IB device
++  * @table:	GID table of the IB device for a port
++  * @ix:		GID entry index to delete
++  *
++  */
++ static void del_gid(struct ib_device *ib_dev, u8 port,
++ 		    struct ib_gid_table *table, int ix)
++ {
++ 	struct ib_gid_table_entry *entry;
++ 
++ 	lockdep_assert_held(&table->lock);
++ 
++ 	pr_debug("%s device=%s port=%d index=%d gid %pI6\n", __func__,
++ 		 ib_dev->name, port, ix,
++ 		 table->data_vec[ix]->attr.gid.raw);
++ 
++ 	write_lock_irq(&table->rwlock);
++ 	entry = table->data_vec[ix];
++ 	entry->state = GID_TABLE_ENTRY_PENDING_DEL;
++ 	/*
++ 	 * For non RoCE protocol, GID entry slot is ready to use.
++ 	 */
++ 	if (!rdma_protocol_roce(ib_dev, port))
++ 		table->data_vec[ix] = NULL;
++ 	write_unlock_irq(&table->rwlock);
++ 
++ 	put_gid_entry_locked(entry);
++ }
++ 
++ /**
++  * add_modify_gid - Add or modify GID table entry
++  *
++  * @table:	GID table in which GID to be added or modified
++  * @attr:	Attributes of the GID
++  *
++  * Returns 0 on success or appropriate error code. It accepts zero
++  * GID addition for non RoCE ports for HCA's who report them as valid
++  * GID. However such zero GIDs are not added to the cache.
++  */
++ static int add_modify_gid(struct ib_gid_table *table,
++ 			  const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Invalidate any old entry in the table to make it safe to write to
++ 	 * this index.
++ 	 */
++ 	if (is_gid_entry_valid(table->data_vec[attr->index]))
++ 		del_gid(attr->device, attr->port_num, table, attr->index);
++ 
++ 	/*
++ 	 * Some HCA's report multiple GID entries with only one valid GID, and
++ 	 * leave other unused entries as the zero GID. Convert zero GIDs to
++ 	 * empty table entries instead of storing them.
++ 	 */
++ 	if (rdma_is_zero_gid(&attr->gid))
++ 		return 0;
++ 
++ 	entry = alloc_gid_entry(attr);
++ 	if (!entry)
++ 		return -ENOMEM;
++ 
++ 	if (rdma_protocol_roce(attr->device, attr->port_num)) {
++ 		ret = add_roce_gid(entry);
++ 		if (ret)
++ 			goto done;
++ 	}
++ 
++ 	store_gid_entry(table, entry);
++ 	return 0;
++ 
++ done:
++ 	put_gid_entry(entry);
++ 	return ret;
++ }
++ 
++ /* rwlock should be read locked, or lock should be held */
+++>>>>>>> 5c5702e259dc (RDMA/core: Set right entry state before releasing reference)
+  static int find_gid(struct ib_gid_table *table, const union ib_gid *gid,
+  		    const struct ib_gid_attr *val, bool default_gid,
+  		    unsigned long mask, int *pempty)
+* Unmerged path drivers/infiniband/core/cache.c
