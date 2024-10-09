@@ -1,0 +1,158 @@
+sysfs: remove sysfs_addrm_cxt->parent_sd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit d69ac5a0bbcf1d9962883fb23e337caf5b38cec8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d69ac5a0.failed
+
+sysfs_addrm_start/finish() enclose sysfs_dirent additions and
+deletions and sysfs_addrm_cxt is used to record information necessary
+to finish the operations.  Currently, sysfs_addrm_start() takes
+@parent_sd, records it in sysfs_addrm_cxt, and assumes that all
+operations in the block are performed under that @parent_sd.
+
+This assumption has been fine until now but we want to make some
+operations behave recursively and, while having @parent_sd recorded in
+sysfs_addrm_cxt doesn't necessarily prevents that, it becomes
+confusing.
+
+This patch removes sysfs_addrm_cxt->parent_sd and makes
+sysfs_add_one() take an explicit @parent_sd parameter.  Note that
+sysfs_remove_one() doesn't need the extra argument as its parent is
+always known from the target @sd.
+
+While at it, add __acquires/releases() notations to
+sysfs_addrm_start/finish() respectively.
+
+This patch doesn't make any functional difference.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d69ac5a0bbcf1d9962883fb23e337caf5b38cec8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/dir.c
+#	fs/sysfs/symlink.c
+diff --cc fs/sysfs/dir.c
+index fd502d3fc9fc,671868914b5b..000000000000
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@@ -437,15 -450,8 +436,20 @@@ int __sysfs_add_one(struct sysfs_addrm_
+  	struct sysfs_inode_attrs *ps_iattr;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!!sysfs_ns_type(acxt->parent_sd) != !!sd->s_ns) {
+ +		WARN(1, KERN_WARNING "sysfs: ns %s in '%s' for '%s'\n",
+ +			sysfs_ns_type(acxt->parent_sd)? "required": "invalid",
+ +			acxt->parent_sd->s_name, sd->s_name);
+ +		return -EINVAL;
+ +	}
+ +
+ +	sd->s_hash = sysfs_name_hash(sd->s_ns, sd->s_name);
+ +	sd->s_parent = sysfs_get(acxt->parent_sd);
+++=======
++ 	sd->s_hash = sysfs_name_hash(sd->s_name, sd->s_ns);
++ 	sd->s_parent = sysfs_get(parent_sd);
+++>>>>>>> d69ac5a0bbcf (sysfs: remove sysfs_addrm_cxt->parent_sd)
+  
+  	ret = sysfs_link_sibling(sd);
+  	if (ret)
+diff --cc fs/sysfs/symlink.c
+index 9fab2e7f7357,22ea2f5796f5..000000000000
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@@ -56,23 -53,11 +56,31 @@@ static int sysfs_do_create_link_sd(stru
+  	sd->s_symlink.target_sd = target_sd;
+  	target_sd = NULL;	/* reference is now owned by the symlink */
+  
+++<<<<<<< HEAD
+ +	sysfs_addrm_start(&acxt, parent_sd);
+ +	/* Symlinks must be between directories with the same ns_type */
+ +	if (!ns_type ||
+ +	    (ns_type == sysfs_ns_type(sd->s_symlink.target_sd->s_parent))) {
+ +		if (warn)
+ +			error = sysfs_add_one(&acxt, sd);
+ +		else
+ +			error = __sysfs_add_one(&acxt, sd);
+ +	} else {
+ +		error = -EINVAL;
+ +		WARN(1, KERN_WARNING
+ +			"sysfs: symlink across ns_types %s/%s -> %s/%s\n",
+ +			parent_sd->s_name,
+ +			sd->s_name,
+ +			sd->s_symlink.target_sd->s_parent->s_name,
+ +			sd->s_symlink.target_sd->s_name);
+ +	}
+++=======
++ 	sysfs_addrm_start(&acxt);
++ 	if (warn)
++ 		error = sysfs_add_one(&acxt, sd, parent_sd);
++ 	else
++ 		error = __sysfs_add_one(&acxt, sd, parent_sd);
+++>>>>>>> d69ac5a0bbcf (sysfs: remove sysfs_addrm_cxt->parent_sd)
+  	sysfs_addrm_finish(&acxt);
+  
+  	if (error)
+* Unmerged path fs/sysfs/dir.c
+diff --git a/fs/sysfs/file.c b/fs/sysfs/file.c
+index 3de7949b1b72..3ea224b15d52 100644
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -546,8 +546,8 @@ int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ 	sd->s_attr.attr = (void *)attr;
+ 	sysfs_dirent_init_lockdep(sd);
+ 
+-	sysfs_addrm_start(&acxt, dir_sd);
+-	rc = sysfs_add_one(&acxt, sd);
++	sysfs_addrm_start(&acxt);
++	rc = sysfs_add_one(&acxt, sd, dir_sd);
+ 	sysfs_addrm_finish(&acxt);
+ 
+ 	if (rc)
+diff --git a/fs/sysfs/inode.c b/fs/sysfs/inode.c
+index 15a606d56f5d..b6f6b5ebcb58 100644
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@ -323,7 +323,7 @@ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const void *ns, const cha
+ 		return -ENOENT;
+ 	}
+ 
+-	sysfs_addrm_start(&acxt, dir_sd);
++	sysfs_addrm_start(&acxt);
+ 
+ 	sd = sysfs_find_dirent(dir_sd, ns, name);
+ 	if (sd)
+* Unmerged path fs/sysfs/symlink.c
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index b6deca3e301d..b14be9e1feed 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -132,7 +132,6 @@ do {								\
+  * Context structure to be used while adding/removing nodes.
+  */
+ struct sysfs_addrm_cxt {
+-	struct sysfs_dirent	*parent_sd;
+ 	struct sysfs_dirent	*removed;
+ };
+ 
+@@ -165,10 +164,11 @@ extern const struct inode_operations sysfs_dir_inode_operations;
+ struct dentry *sysfs_get_dentry(struct sysfs_dirent *sd);
+ struct sysfs_dirent *sysfs_get_active(struct sysfs_dirent *sd);
+ void sysfs_put_active(struct sysfs_dirent *sd);
+-void sysfs_addrm_start(struct sysfs_addrm_cxt *acxt,
+-		       struct sysfs_dirent *parent_sd);
+-int __sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
+-int sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
++void sysfs_addrm_start(struct sysfs_addrm_cxt *acxt);
++int __sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd,
++		    struct sysfs_dirent *parent_sd);
++int sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd,
++		  struct sysfs_dirent *parent_sd);
+ void sysfs_remove_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
+ void sysfs_addrm_finish(struct sysfs_addrm_cxt *acxt);
+ 
