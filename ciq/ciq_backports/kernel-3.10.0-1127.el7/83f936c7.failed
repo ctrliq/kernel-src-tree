@@ -1,0 +1,164 @@
+mark struct file that had write access grabbed by open()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 83f936c75e3689a63253d89c47a4d239c56d7410
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/83f936c7.failed
+
+new flag in ->f_mode - FMODE_WRITER.  Set by do_dentry_open() in case
+when it has grabbed write access, checked by __fput() to decide whether
+it wants to drop the sucker.  Allows to stop bothering with mnt_clone_write()
+in alloc_file(), along with fewer special_file() checks.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 83f936c75e3689a63253d89c47a4d239c56d7410)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file_table.c
+#	fs/open.c
+diff --cc fs/file_table.c
+index cfd92eac323a,ce1504fec5a1..000000000000
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@@ -180,46 -177,12 +180,52 @@@ struct file *alloc_file(struct path *pa
+  	file->f_mapping = path->dentry->d_inode->i_mapping;
+  	file->f_mode = mode;
+  	file->f_op = fop;
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * These mounts don't really matter in practice
+ +	 * for r/o bind mounts.  They aren't userspace-
+ +	 * visible.  We do this for consistency, and so
+ +	 * that we can do debugging checks at __fput()
+ +	 */
+ +	if ((mode & FMODE_WRITE) && !special_file(path->dentry->d_inode->i_mode)) {
+ +		file_take_write(file);
+ +		WARN_ON(mnt_clone_write(path->mnt));
+ +	}
+++=======
+++>>>>>>> 83f936c75e36 (mark struct file that had write access grabbed by open())
+  	if ((mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
+  		i_readcount_inc(path->dentry->d_inode);
+  	return file;
+  }
+  EXPORT_SYMBOL(alloc_file);
+  
+++<<<<<<< HEAD
+ +/**
+ + * drop_file_write_access - give up ability to write to a file
+ + * @file: the file to which we will stop writing
+ + *
+ + * This is a central place which will give up the ability
+ + * to write to @file, along with access to write through
+ + * its vfsmount.
+ + */
+ +static void drop_file_write_access(struct file *file)
+ +{
+ +	struct vfsmount *mnt = file->f_path.mnt;
+ +	struct inode *inode = file->f_inode;
+ +
+ +	put_write_access(inode);
+ +
+ +	if (special_file(inode->i_mode))
+ +		return;
+ +	if (file_check_writeable(file) != 0)
+ +		return;
+ +	__mnt_drop_write(mnt);
+ +	file_release_write(file);
+ +}
+ +
+++=======
+++>>>>>>> 83f936c75e36 (mark struct file that had write access grabbed by open())
+  /* the real guts of fput() - releasing the last reference to file
+   */
+  static void __fput(struct file *file)
+diff --cc fs/open.c
+index 0bdd69faf284,dcefb2f02d10..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -722,13 -660,17 +722,22 @@@ static int do_dentry_open(struct file *
+  		f->f_mode = FMODE_PATH;
+  
+  	path_get(&f->f_path);
+ -	inode = f->f_inode = f->f_path.dentry->d_inode;
+ -	if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode)) {
+ -		error = get_write_access(inode);
+ +	f->f_inode = inode;
+ +	if (f->f_mode & FMODE_WRITE) {
+ +		error = __get_file_write_access(inode, f->f_path.mnt);
+  		if (error)
+  			goto cleanup_file;
+++<<<<<<< HEAD
+ +		if (!special_file(inode->i_mode))
+ +			file_take_write(f);
+++=======
++ 		error = __mnt_want_write(f->f_path.mnt);
++ 		if (error) {
++ 			put_write_access(inode);
++ 			goto cleanup_file;
++ 		}
++ 		f->f_mode |= FMODE_WRITER;
+++>>>>>>> 83f936c75e36 (mark struct file that had write access grabbed by open())
+  	}
+  
+  	f->f_mapping = inode->i_mapping;
+@@@ -770,18 -716,9 +779,24 @@@
+  
+  cleanup_all:
+  	fops_put(f->f_op);
+++<<<<<<< HEAD
+ +	if (f->f_mode & FMODE_WRITE) {
+ +		put_write_access(inode);
+ +		if (!special_file(inode->i_mode)) {
+ +			/*
+ +			 * We don't consider this a real
+ +			 * mnt_want/drop_write() pair
+ +			 * because it all happenend right
+ +			 * here, so just reset the state.
+ +			 */
+ +			file_reset_write(f);
+ +			__mnt_drop_write(f->f_path.mnt);
+ +		}
+++=======
++ 	if (f->f_mode & FMODE_WRITER) {
++ 		put_write_access(inode);
++ 		__mnt_drop_write(f->f_path.mnt);
+++>>>>>>> 83f936c75e36 (mark struct file that had write access grabbed by open())
+  	}
+  cleanup_file:
+  	path_put(&f->f_path);
+* Unmerged path fs/file_table.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 52c8d67862f3..0656945e22db 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -422,9 +422,7 @@ EXPORT_SYMBOL_GPL(mnt_clone_write);
+  */
+ int __mnt_want_write_file(struct file *file)
+ {
+-	struct inode *inode = file_inode(file);
+-
+-	if (!(file->f_mode & FMODE_WRITE) || special_file(inode->i_mode))
++	if (!(file->f_mode & FMODE_WRITER))
+ 		return __mnt_want_write(file->f_path.mnt);
+ 	else
+ 		return mnt_clone_write(file->f_path.mnt);
+* Unmerged path fs/open.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index f4c0e7616f02..f2686609fe6b 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -130,6 +130,8 @@ typedef void (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ 
+ /* File needs atomic accesses to f_pos */
+ #define FMODE_ATOMIC_POS	((__force fmode_t)0x8000)
++/* Write access to underlying fs */
++#define FMODE_WRITER		((__force fmode_t)0x10000)
+ 
+ /* File was opened by fanotify and shouldn't generate fanotify events */
+ #define FMODE_NONOTIFY		((__force fmode_t)0x1000000)
