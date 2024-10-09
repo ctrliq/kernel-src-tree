@@ -1,0 +1,138 @@
+sched/rt: Fix picking RT and DL tasks from empty queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Kirill Tkhai <ktkhai@parallels.com>
+commit 734ff2a71f9e6aa6fedfa5a9a34818b8586516d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/734ff2a7.failed
+
+The problems:
+
+1) We check for rt_nr_running before call of put_prev_task().
+   If previous task is RT, its rt_rq may become throttled
+   and dequeued after this call.
+
+In case of p is from rt->rq this just causes picking a task
+from throttled queue, but in case of its rt_rq is child
+we are guaranteed catch BUG_ON.
+
+2) The same with deadline class. The only difference we operate
+   on only dl_rq.
+
+This patch fixes all the above problems and it adds a small skip in the
+DL update like we've already done for RT class:
+
+	if (unlikely((s64)delta_exec <= 0))
+		return;
+
+This will optimize sequential update_curr_dl() calls a little.
+
+	Signed-off-by: Kirill Tkhai <ktkhai@parallels.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Juri Lelli <juri.lelli@gmail.com>
+Link: http://lkml.kernel.org/r/1393946746.3643.3.camel@tkhai
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 734ff2a71f9e6aa6fedfa5a9a34818b8586516d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/deadline.c
+#	kernel/sched/rt.c
+diff --cc kernel/sched/deadline.c
+index 75f9634980d1,27ef40925525..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -1060,14 -609,11 +1060,19 @@@ static void update_curr_dl(struct rq *r
+  	 * approach need further study.
+  	 */
+  	delta_exec = rq_clock_task(rq) - curr->se.exec_start;
+++<<<<<<< HEAD
+ +	if (unlikely((s64)delta_exec <= 0)) {
+ +		if (unlikely(dl_se->dl_yielded))
+ +			goto throttle;
+ +		return;
+ +	}
+++=======
++ 	if (unlikely((s64)delta_exec <= 0))
++ 		return;
+++>>>>>>> 734ff2a71f9e (sched/rt: Fix picking RT and DL tasks from empty queue)
+  
+ -	schedstat_set(curr->se.statistics.exec_max,
+ -		      max(curr->se.statistics.exec_max, delta_exec));
+ +	schedstat_set(curr->se.statistics->exec_max,
+ +		      max(curr->se.statistics->exec_max, delta_exec));
+  
+  	curr->se.sum_exec_runtime += delta_exec;
+  	account_group_exec_runtime(curr, delta_exec);
+@@@ -1589,6 -1021,15 +1594,18 @@@ struct task_struct *pick_next_task_dl(s
+  
+  	dl_rq = &rq->dl;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (need_pull_dl_task(rq, prev))
++ 		pull_dl_task(rq);
++ 	/*
++ 	 * When prev is DL, we may throttle it in put_prev_task().
++ 	 * So, we update time before we check for dl_nr_running.
++ 	 */
++ 	if (prev->sched_class == &dl_sched_class)
++ 		update_curr_dl(rq);
++ 
+++>>>>>>> 734ff2a71f9e (sched/rt: Fix picking RT and DL tasks from empty queue)
+  	if (unlikely(!dl_rq->dl_nr_running))
+  		return NULL;
+  
+diff --cc kernel/sched/rt.c
+index 6b68ceb9a68d,f3cee0a63b76..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -1370,9 -1362,39 +1370,42 @@@ static struct task_struct *_pick_next_t
+  	return p;
+  }
+  
+ -static struct task_struct *
+ -pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ +static struct task_struct *pick_next_task_rt(struct rq *rq)
+  {
+++<<<<<<< HEAD
+ +	struct task_struct *p = _pick_next_task_rt(rq);
+++=======
++ 	struct task_struct *p;
++ 	struct rt_rq *rt_rq = &rq->rt;
++ 
++ 	if (need_pull_rt_task(rq, prev)) {
++ 		pull_rt_task(rq);
++ 		/*
++ 		 * pull_rt_task() can drop (and re-acquire) rq->lock; this
++ 		 * means a dl task can slip in, in which case we need to
++ 		 * re-start task selection.
++ 		 */
++ 		if (unlikely(rq->dl.dl_nr_running))
++ 			return RETRY_TASK;
++ 	}
++ 
++ 	/*
++ 	 * We may dequeue prev's rt_rq in put_prev_task().
++ 	 * So, we update time before rt_nr_running check.
++ 	 */
++ 	if (prev->sched_class == &rt_sched_class)
++ 		update_curr_rt(rq);
++ 
++ 	if (!rt_rq->rt_nr_running)
++ 		return NULL;
++ 
++ 	if (rt_rq_throttled(rt_rq))
++ 		return NULL;
++ 
++ 	put_prev_task(rq, prev);
++ 
++ 	p = _pick_next_task_rt(rq);
+++>>>>>>> 734ff2a71f9e (sched/rt: Fix picking RT and DL tasks from empty queue)
+  
+  	/* The running task is never eligible for pushing */
+  	if (p)
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/rt.c
