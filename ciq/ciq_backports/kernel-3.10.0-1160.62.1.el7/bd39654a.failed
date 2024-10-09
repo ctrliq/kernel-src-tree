@@ -1,0 +1,1293 @@
+s390/AP: support new dynamic AP bus size limit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.62.1.el7
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit bd39654a2282c1a51c044575a6bc00d641d5dfd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.62.1.el7/bd39654a.failed
+
+This patch provides support for new dynamic AP bus message limit
+with the existing zcrypt device driver and AP bus core code.
+
+There is support for a new field 'ml' from TAPQ query. The field
+gives if != 0 the AP bus limit for this card in 4k chunk units.
+The actual message size limit per card is shown as a new read-only
+sysfs attribute. The sysfs attribute
+
+  /sys/devices/ap/cardxx/max_msg_size
+
+shows the upper limit in bytes used by the AP bus and zcrypt device
+driver for requests and replies send to and received from this card.
+Currently up to CEX7 support only max 12kB msg size and thus the field
+shows 12288 meaning the upper limit of a valid msg for this card is
+12kB. Please note that the usable payload is somewhat lower and
+depends on the msg type and thus the header struct which is to be
+prepended by the zcrypt dd.
+
+The dispatcher responsible for choosing the right card and queue is
+aware of the individual card AP bus message limit. So a request is
+only assigned to a queue of a card which is able to handle the size of
+the request (e.g. a 14kB request will never go to a max 12kB card).
+If no such card is found the ioctl will fail with ENODEV.
+
+The reply buffer held by the device driver is determined by the ml
+field of the TAPQ for this card. If a response from the card exceeds
+this limit however, the response is not truncated but the ioctl for
+this request will fail with errno EMSGSIZE to indicate that the device
+driver has dropped the response because it would overflow the buffer
+limit.
+
+If the request size does not indicate to the dispatcher that an
+adapter with extended limit is to be used, a random card will be
+chosen when no specific card is addressed (ANY addressing). This may
+result in an ioctl failure when the reply size needs an adapter with
+extended limit but the randomly chosen one is not capable of handling
+the broader reply size. The user space application needs to use
+dedicated addressing to forward such a request only to suitable cards
+to get requests like this processed properly.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Reviewed-by: Ingo Tuchscherer <ingo.tuchscherer@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit bd39654a2282c1a51c044575a6bc00d641d5dfd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/ap_bus.h
+#	drivers/s390/crypto/ap_card.c
+#	drivers/s390/crypto/ap_queue.c
+#	drivers/s390/crypto/zcrypt_msgtype50.c
+#	drivers/s390/crypto/zcrypt_msgtype6.c
+#	drivers/s390/crypto/zcrypt_queue.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index d6dc25e7c089,8d3a1d84a757..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -84,10 -61,15 +84,13 @@@ static char *aqm_str
+  module_param_named(aqmask, aqm_str, charp, 0440);
+  MODULE_PARM_DESC(aqmask, "AP bus domain mask.");
+  
++ atomic_t ap_max_msg_size = ATOMIC_INIT(AP_DEFAULT_MAX_MSG_SIZE);
++ EXPORT_SYMBOL(ap_max_msg_size);
++ 
+  static struct device *ap_root_device;
+  
+ -/* Hashtable of all queue devices on the AP bus */
+ -DEFINE_HASHTABLE(ap_queues, 8);
+ -/* lock used for the ap_queues hashtable */
+ -DEFINE_SPINLOCK(ap_queues_lock);
+ +DEFINE_SPINLOCK(ap_list_lock);
+ +LIST_HEAD(ap_card_list);
+  
+  /* Default permissions (ioctl, card and domain masking) */
+  struct ap_perms ap_perms;
+@@@ -328,39 -314,58 +331,84 @@@ int ap_test_config_ctrl_domain(unsigne
+  }
+  EXPORT_SYMBOL(ap_test_config_ctrl_domain);
+  
+ -/*
+ - * ap_queue_info(): Check and get AP queue info.
+ - * Returns true if TAPQ succeeded and the info is filled or
+ - * false otherwise.
+ +/**
+ + * ap_query_queue(): Check if an AP queue is available.
+ + * @qid: The AP queue number
+ + * @queue_depth: Pointer to queue depth value
+ + * @device_type: Pointer to device type value
+ + * @facilities: Pointer to facility indicator
+   */
+++<<<<<<< HEAD
+ +static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type,
+ +			  unsigned int *facilities)
+ +{
+ +	struct ap_queue_status status;
+ +	unsigned long info;
+ +	int nd;
+++=======
++ static bool ap_queue_info(ap_qid_t qid, int *q_type, unsigned int *q_fac,
++ 			  int *q_depth, int *q_ml, bool *q_decfg)
++ {
++ 	struct ap_queue_status status;
++ 	union {
++ 		unsigned long value;
++ 		struct {
++ 			unsigned int fac   : 32; /* facility bits */
++ 			unsigned int at	   :  8; /* ap type */
++ 			unsigned int _res1 :  8;
++ 			unsigned int _res2 :  4;
++ 			unsigned int ml	   :  4; /* apxl ml */
++ 			unsigned int _res3 :  4;
++ 			unsigned int qd	   :  4; /* queue depth */
++ 		} tapq_gr2;
++ 	} tapq_info;
++ 
++ 	tapq_info.value = 0;
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  
+ -	/* make sure we don't run into a specifiation exception */
+ -	if (AP_QID_CARD(qid) > ap_max_adapter_id ||
+ -	    AP_QID_QUEUE(qid) > ap_max_domain_id)
+ -		return false;
+ +	if (!ap_test_config_card_id(AP_QID_CARD(qid)))
+ +		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	status = ap_test_queue(qid, ap_apft_available(), &info);
+ +	switch (status.response_code) {
+ +	case AP_RESPONSE_NORMAL:
+ +		*queue_depth = (int)(info & 0xff);
+ +		*device_type = (int)((info >> 24) & 0xff);
+ +		*facilities = (unsigned int)(info >> 32);
+ +		/* Update maximum domain id */
+ +		nd = (info >> 16) & 0xff;
+ +		/* if N bit is available, z13 and newer */
+ +		if ((info & (1UL << 57)) && nd > 0)
+ +			ap_max_domain_id = nd;
+ +		else /* older machine types */
+ +			ap_max_domain_id = 15;
+ +		switch (*device_type) {
+++=======
++ 	/* call TAPQ on this APQN */
++ 	status = ap_test_queue(qid, ap_apft_available(), &tapq_info.value);
++ 	switch (status.response_code) {
++ 	case AP_RESPONSE_NORMAL:
++ 	case AP_RESPONSE_RESET_IN_PROGRESS:
++ 	case AP_RESPONSE_DECONFIGURED:
++ 	case AP_RESPONSE_CHECKSTOPPED:
++ 	case AP_RESPONSE_BUSY:
++ 		/*
++ 		 * According to the architecture in all these cases the
++ 		 * info should be filled. All bits 0 is not possible as
++ 		 * there is at least one of the mode bits set.
++ 		 */
++ 		if (WARN_ON_ONCE(!tapq_info.value))
++ 			return false;
++ 		*q_type = tapq_info.tapq_gr2.at;
++ 		*q_fac = tapq_info.tapq_gr2.fac;
++ 		*q_depth = tapq_info.tapq_gr2.qd;
++ 		*q_ml = tapq_info.tapq_gr2.ml;
++ 		*q_decfg = status.response_code == AP_RESPONSE_DECONFIGURED;
++ 		switch (*q_type) {
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  			/* For CEX2 and CEX3 the available functions
+ -			 * are not reflected by the facilities bits.
+ +			 * are not refrected by the facilities bits.
+  			 * Instead it is coded into the type. So here
+  			 * modify the function bits based on the type.
+  			 */
+@@@ -1375,6 -1499,304 +1423,307 @@@ static int __match_queue_device_with_qi
+  	return is_queue_dev(dev) && to_ap_queue(dev)->qid == (int)(long) data;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Helper function to be used with bus_find_dev
++  * matches any queue device with given queue id
++  */
++ static int __match_queue_device_with_queue_id(struct device *dev, const void *data)
++ {
++ 	return is_queue_dev(dev)
++ 		&& AP_QID_QUEUE(to_ap_queue(dev)->qid) == (int)(long) data;
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Remove card device and associated queue devices.
++  */
++ static inline void ap_scan_rm_card_dev_and_queue_devs(struct ap_card *ac)
++ {
++ 	bus_for_each_dev(&ap_bus_type, NULL,
++ 			 (void *)(long) ac->id,
++ 			 __ap_queue_devices_with_id_unregister);
++ 	device_unregister(&ac->ap_dev.device);
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Does the scan bus job for all the domains within
++  * a valid adapter given by an ap_card ptr.
++  */
++ static inline void ap_scan_domains(struct ap_card *ac)
++ {
++ 	bool decfg;
++ 	ap_qid_t qid;
++ 	unsigned int func;
++ 	struct device *dev;
++ 	struct ap_queue *aq;
++ 	int rc, dom, depth, type, ml;
++ 
++ 	/*
++ 	 * Go through the configuration for the domains and compare them
++ 	 * to the existing queue devices. Also take care of the config
++ 	 * and error state for the queue devices.
++ 	 */
++ 
++ 	for (dom = 0; dom <= ap_max_domain_id; dom++) {
++ 		qid = AP_MKQID(ac->id, dom);
++ 		dev = bus_find_device(&ap_bus_type, NULL,
++ 				      (void *)(long) qid,
++ 				      __match_queue_device_with_qid);
++ 		aq = dev ? to_ap_queue(dev) : NULL;
++ 		if (!ap_test_config_usage_domain(dom)) {
++ 			if (dev) {
++ 				AP_DBF_INFO("%s(%d,%d) not in config any more, rm queue device\n",
++ 					    __func__, ac->id, dom);
++ 				device_unregister(dev);
++ 				put_device(dev);
++ 			}
++ 			continue;
++ 		}
++ 		/* domain is valid, get info from this APQN */
++ 		if (!ap_queue_info(qid, &type, &func, &depth, &ml, &decfg)) {
++ 			if (aq) {
++ 				AP_DBF_INFO(
++ 					"%s(%d,%d) ap_queue_info() not successful, rm queue device\n",
++ 					__func__, ac->id, dom);
++ 				device_unregister(dev);
++ 				put_device(dev);
++ 			}
++ 			continue;
++ 		}
++ 		/* if no queue device exists, create a new one */
++ 		if (!aq) {
++ 			aq = ap_queue_create(qid, ac->ap_dev.device_type);
++ 			if (!aq) {
++ 				AP_DBF_WARN("%s(%d,%d) ap_queue_create() failed\n",
++ 					    __func__, ac->id, dom);
++ 				continue;
++ 			}
++ 			aq->card = ac;
++ 			aq->config = !decfg;
++ 			dev = &aq->ap_dev.device;
++ 			dev->bus = &ap_bus_type;
++ 			dev->parent = &ac->ap_dev.device;
++ 			dev_set_name(dev, "%02x.%04x", ac->id, dom);
++ 			/* register queue device */
++ 			rc = device_register(dev);
++ 			if (rc) {
++ 				AP_DBF_WARN("%s(%d,%d) device_register() failed\n",
++ 					    __func__, ac->id, dom);
++ 				goto put_dev_and_continue;
++ 			}
++ 			/* get it and thus adjust reference counter */
++ 			get_device(dev);
++ 			if (decfg)
++ 				AP_DBF_INFO("%s(%d,%d) new (decfg) queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			else
++ 				AP_DBF_INFO("%s(%d,%d) new queue device created\n",
++ 					    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* Check config state on the already existing queue device */
++ 		spin_lock_bh(&aq->lock);
++ 		if (decfg && aq->config) {
++ 			/* config off this queue device */
++ 			aq->config = false;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_ERROR;
++ 				aq->last_err_rc = AP_RESPONSE_DECONFIGURED;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config off\n",
++ 				    __func__, ac->id, dom);
++ 			ap_send_config_uevent(&aq->ap_dev, aq->config);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			goto put_dev_and_continue;
++ 		}
++ 		if (!decfg && !aq->config) {
++ 			/* config on this queue device */
++ 			aq->config = true;
++ 			if (aq->dev_state > AP_DEV_STATE_UNINITIATED) {
++ 				aq->dev_state = AP_DEV_STATE_OPERATING;
++ 				aq->sm_state = AP_SM_STATE_RESET_START;
++ 			}
++ 			spin_unlock_bh(&aq->lock);
++ 			AP_DBF_INFO("%s(%d,%d) queue device config on\n",
++ 				    __func__, ac->id, dom);
++ 			ap_send_config_uevent(&aq->ap_dev, aq->config);
++ 			goto put_dev_and_continue;
++ 		}
++ 		/* handle other error states */
++ 		if (!decfg && aq->dev_state == AP_DEV_STATE_ERROR) {
++ 			spin_unlock_bh(&aq->lock);
++ 			/* 'receive' pending messages with -EAGAIN */
++ 			ap_flush_queue(aq);
++ 			/* re-init (with reset) the queue device */
++ 			ap_queue_init_state(aq);
++ 			AP_DBF_INFO("%s(%d,%d) queue device reinit enforced\n",
++ 				    __func__, ac->id, dom);
++ 			goto put_dev_and_continue;
++ 		}
++ 		spin_unlock_bh(&aq->lock);
++ put_dev_and_continue:
++ 		put_device(dev);
++ 	}
++ }
++ 
++ /*
++  * Helper function for ap_scan_bus().
++  * Does the scan bus job for the given adapter id.
++  */
++ static inline void ap_scan_adapter(int ap)
++ {
++ 	bool decfg;
++ 	ap_qid_t qid;
++ 	unsigned int func;
++ 	struct device *dev;
++ 	struct ap_card *ac;
++ 	int rc, dom, depth, type, comp_type, ml;
++ 
++ 	/* Is there currently a card device for this adapter ? */
++ 	dev = bus_find_device(&ap_bus_type, NULL,
++ 			      (void *)(long) ap,
++ 			      __match_card_device_with_id);
++ 	ac = dev ? to_ap_card(dev) : NULL;
++ 
++ 	/* Adapter not in configuration ? */
++ 	if (!ap_test_config_card_id(ap)) {
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) ap not in config any more, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		}
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * Adapter ap is valid in the current configuration. So do some checks:
++ 	 * If no card device exists, build one. If a card device exists, check
++ 	 * for type and functions changed. For all this we need to find a valid
++ 	 * APQN first.
++ 	 */
++ 
++ 	for (dom = 0; dom <= ap_max_domain_id; dom++)
++ 		if (ap_test_config_usage_domain(dom)) {
++ 			qid = AP_MKQID(ap, dom);
++ 			if (ap_queue_info(qid, &type, &func,
++ 					  &depth, &ml, &decfg))
++ 				break;
++ 		}
++ 	if (dom > ap_max_domain_id) {
++ 		/* Could not find a valid APQN for this adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO(
++ 				"%s(%d) no type info (no APQN found), rm card and queue devices\n",
++ 				__func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no type info (no APQN found), ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 	if (!type) {
++ 		/* No apdater type info available, an unusable adapter */
++ 		if (ac) {
++ 			AP_DBF_INFO("%s(%d) no valid type (0) info, rm card and queue devices\n",
++ 				    __func__, ap);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 		} else {
++ 			AP_DBF_DBG("%s(%d) no valid type (0) info, ignored\n",
++ 				   __func__, ap);
++ 		}
++ 		return;
++ 	}
++ 
++ 	if (ac) {
++ 		/* Check APQN against existing card device for changes */
++ 		if (ac->raw_hwtype != type) {
++ 			AP_DBF_INFO("%s(%d) hwtype %d changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else if (ac->functions != func) {
++ 			AP_DBF_INFO("%s(%d) functions 0x%08x changed, rm card and queue devices\n",
++ 				    __func__, ap, type);
++ 			ap_scan_rm_card_dev_and_queue_devs(ac);
++ 			put_device(dev);
++ 			ac = NULL;
++ 		} else {
++ 			if (decfg && ac->config) {
++ 				ac->config = false;
++ 				AP_DBF_INFO("%s(%d) card device config off\n",
++ 					    __func__, ap);
++ 				ap_send_config_uevent(&ac->ap_dev, ac->config);
++ 			}
++ 			if (!decfg && !ac->config) {
++ 				ac->config = true;
++ 				AP_DBF_INFO("%s(%d) card device config on\n",
++ 					    __func__, ap);
++ 				ap_send_config_uevent(&ac->ap_dev, ac->config);
++ 			}
++ 		}
++ 	}
++ 
++ 	if (!ac) {
++ 		/* Build a new card device */
++ 		comp_type = ap_get_compatible_type(qid, type, func);
++ 		if (!comp_type) {
++ 			AP_DBF_WARN("%s(%d) type %d, can't get compatibility type\n",
++ 				    __func__, ap, type);
++ 			return;
++ 		}
++ 		ac = ap_card_create(ap, depth, type, comp_type, func, ml);
++ 		if (!ac) {
++ 			AP_DBF_WARN("%s(%d) ap_card_create() failed\n",
++ 				    __func__, ap);
++ 			return;
++ 		}
++ 		ac->config = !decfg;
++ 		dev = &ac->ap_dev.device;
++ 		dev->bus = &ap_bus_type;
++ 		dev->parent = ap_root_device;
++ 		dev_set_name(dev, "card%02x", ap);
++ 		/* maybe enlarge ap_max_msg_size to support this card */
++ 		if (ac->maxmsgsize > atomic_read(&ap_max_msg_size)) {
++ 			atomic_set(&ap_max_msg_size, ac->maxmsgsize);
++ 			AP_DBF_INFO("%s(%d) ap_max_msg_size update to %d byte\n",
++ 				    __func__, ap, atomic_read(&ap_max_msg_size));
++ 		}
++ 		/* Register the new card device with AP bus */
++ 		rc = device_register(dev);
++ 		if (rc) {
++ 			AP_DBF_WARN("%s(%d) device_register() failed\n",
++ 				    __func__, ap);
++ 			put_device(dev);
++ 			return;
++ 		}
++ 		/* get it and thus adjust reference counter */
++ 		get_device(dev);
++ 		if (decfg)
++ 			AP_DBF_INFO("%s(%d) new (decfg) card device type=%d func=0x%08x created\n",
++ 				    __func__, ap, type, func);
++ 		else
++ 			AP_DBF_INFO("%s(%d) new card device type=%d func=0x%08x created\n",
++ 				    __func__, ap, type, func);
++ 	}
++ 
++ 	/* Verify the domains and the queue devices for this card */
++ 	ap_scan_domains(ac);
++ 
++ 	/* release the card device */
++ 	put_device(&ac->ap_dev.device);
++ }
++ 
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  /**
+   * ap_scan_bus(): Scan the AP bus for new devices
+   * Runs periodically, workqueue timer (ap_config_time)
+diff --cc drivers/s390/crypto/ap_bus.h
+index 1a77360585be,8f18abdbbc2b..000000000000
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@@ -36,11 -25,14 +36,14 @@@
+  #define AP_RESET_TIMEOUT (HZ*0.7)	/* Time in ticks for reset timeouts. */
+  #define AP_CONFIG_TIME 30	/* Time in seconds between AP bus rescans. */
+  #define AP_POLL_TIME 1		/* Time in ticks between receive polls. */
++ #define AP_DEFAULT_MAX_MSG_SIZE (12 * 1024)
++ #define AP_TAPQ_ML_FIELD_CHUNK_SIZE (4096)
+  
+  extern int ap_domain_index;
++ extern atomic_t ap_max_msg_size;
+  
+ -extern DECLARE_HASHTABLE(ap_queues, 8);
+ -extern spinlock_t ap_queues_lock;
+ +extern spinlock_t ap_list_lock;
+ +extern struct list_head ap_card_list;
+  
+  static inline int ap_test_bit(unsigned int *ptr, unsigned int nr)
+  {
+@@@ -178,7 -170,9 +181,13 @@@ struct ap_card 
+  	unsigned int functions;		/* AP device function bitfield. */
+  	int queue_depth;		/* AP queue depth.*/
+  	int id;				/* AP card number. */
+++<<<<<<< HEAD
+ +	atomic_t total_request_count;	/* # requests ever for this AP device.*/
+++=======
++ 	unsigned int maxmsgsize;	/* AP msg limit for this card */
++ 	bool config;			/* configured state */
++ 	atomic64_t total_request_count;	/* # requests ever for this AP device.*/
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  };
+  
+  #define to_ap_card(x) container_of((x), struct ap_card, ap_dev.device)
+@@@ -210,12 -231,13 +219,20 @@@ typedef enum ap_wait (ap_func_t)(struc
+  struct ap_message {
+  	struct list_head list;		/* Request queueing. */
+  	unsigned long long psmid;	/* Message id. */
+++<<<<<<< HEAD
+ +	void *message;			/* Pointer to message buffer. */
+ +	size_t length;			/* Message length. */
+++=======
++ 	void *msg;			/* Pointer to message buffer. */
++ 	unsigned int len;		/* actual msg len in msg buffer */
++ 	unsigned int bufsize;		/* allocated msg buffer size */
++ 	u16 flags;			/* Flags, see AP_MSG_FLAG_xxx */
++ 	struct ap_fi fi;		/* Failure Injection cmd */
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	int rc;				/* Return code for this message */
+ +
+  	void *private;			/* ap driver private pointer. */
+ +	unsigned int special:1;		/* Used for special commands. */
+  	/* receive is called from tasklet context */
+  	void (*receive)(struct ap_queue *, struct ap_message *,
+  			struct ap_message *);
+@@@ -273,16 -291,13 +290,16 @@@ int ap_test_config_ctrl_domain(unsigne
+  
+  void ap_queue_init_reply(struct ap_queue *aq, struct ap_message *ap_msg);
+  struct ap_queue *ap_queue_create(ap_qid_t qid, int device_type);
+ -void ap_queue_prepare_remove(struct ap_queue *aq);
+  void ap_queue_remove(struct ap_queue *aq);
+ -void ap_queue_init_state(struct ap_queue *aq);
+ +void ap_queue_suspend(struct ap_device *ap_dev);
+ +void ap_queue_resume(struct ap_device *ap_dev);
+  
+- struct ap_card *ap_card_create(int id, int queue_depth, int raw_device_type,
+- 			       int comp_device_type, unsigned int functions);
++ struct ap_card *ap_card_create(int id, int queue_depth, int raw_type,
++ 			       int comp_type, unsigned int functions, int ml);
+  
+ +int ap_module_init(void);
+ +void ap_module_exit(void);
+ +
+  struct ap_perms {
+  	unsigned long ioctlm[BITS_TO_LONGS(AP_IOCTLS)];
+  	unsigned long apm[BITS_TO_LONGS(AP_DEVICES)];
+diff --cc drivers/s390/crypto/ap_card.c
+index d4ca8495f519,196325a66662..000000000000
+--- a/drivers/s390/crypto/ap_card.c
++++ b/drivers/s390/crypto/ap_card.c
+@@@ -88,50 -91,99 +88,60 @@@ static ssize_t ap_req_count_store(struc
+  	return count;
+  }
+  
+ -static DEVICE_ATTR_RW(request_count);
+ +static DEVICE_ATTR(request_count, 0644, ap_req_count_show, ap_req_count_store);
+  
+ -static ssize_t requestq_count_show(struct device *dev,
+ -				   struct device_attribute *attr, char *buf)
+ +static ssize_t ap_requestq_count_show(struct device *dev,
+ +				      struct device_attribute *attr, char *buf)
+  {
+ -	int bkt;
+ +	struct ap_card *ac = to_ap_card(dev);
+  	struct ap_queue *aq;
+  	unsigned int reqq_cnt;
+ -	struct ap_card *ac = to_ap_card(dev);
+  
+  	reqq_cnt = 0;
+ -	spin_lock_bh(&ap_queues_lock);
+ -	hash_for_each(ap_queues, bkt, aq, hnode)
+ -		if (ac == aq->card)
+ -			reqq_cnt += aq->requestq_count;
+ -	spin_unlock_bh(&ap_queues_lock);
+ -	return scnprintf(buf, PAGE_SIZE, "%d\n", reqq_cnt);
+ +	spin_lock_bh(&ap_list_lock);
+ +	for_each_ap_queue(aq, ac)
+ +		reqq_cnt += aq->requestq_count;
+ +	spin_unlock_bh(&ap_list_lock);
+ +	return snprintf(buf, PAGE_SIZE, "%d\n", reqq_cnt);
+  }
+  
+ -static DEVICE_ATTR_RO(requestq_count);
+ +static DEVICE_ATTR(requestq_count, 0444, ap_requestq_count_show, NULL);
+  
+ -static ssize_t pendingq_count_show(struct device *dev,
+ -				   struct device_attribute *attr, char *buf)
+ +static ssize_t ap_pendingq_count_show(struct device *dev,
+ +				      struct device_attribute *attr, char *buf)
+  {
+ -	int bkt;
+ +	struct ap_card *ac = to_ap_card(dev);
+  	struct ap_queue *aq;
+  	unsigned int penq_cnt;
+ -	struct ap_card *ac = to_ap_card(dev);
+  
+  	penq_cnt = 0;
+ -	spin_lock_bh(&ap_queues_lock);
+ -	hash_for_each(ap_queues, bkt, aq, hnode)
+ -		if (ac == aq->card)
+ -			penq_cnt += aq->pendingq_count;
+ -	spin_unlock_bh(&ap_queues_lock);
+ -	return scnprintf(buf, PAGE_SIZE, "%d\n", penq_cnt);
+ -}
+ -
+ -static DEVICE_ATTR_RO(pendingq_count);
+ -
+ -static ssize_t modalias_show(struct device *dev,
+ -			     struct device_attribute *attr, char *buf)
+ -{
+ -	return scnprintf(buf, PAGE_SIZE, "ap:t%02X\n",
+ -			 to_ap_dev(dev)->device_type);
+ +	spin_lock_bh(&ap_list_lock);
+ +	for_each_ap_queue(aq, ac)
+ +		penq_cnt += aq->pendingq_count;
+ +	spin_unlock_bh(&ap_list_lock);
+ +	return snprintf(buf, PAGE_SIZE, "%d\n", penq_cnt);
+  }
+  
+ -static DEVICE_ATTR_RO(modalias);
+ +static DEVICE_ATTR(pendingq_count, 0444, ap_pendingq_count_show, NULL);
+  
+ -static ssize_t config_show(struct device *dev,
+ -			   struct device_attribute *attr, char *buf)
+ +static ssize_t ap_modalias_show(struct device *dev,
+ +				struct device_attribute *attr, char *buf)
+  {
+ -	struct ap_card *ac = to_ap_card(dev);
+ -
+ -	return scnprintf(buf, PAGE_SIZE, "%d\n", ac->config ? 1 : 0);
+ -}
+ -
+ -static ssize_t config_store(struct device *dev,
+ -			    struct device_attribute *attr,
+ -			    const char *buf, size_t count)
+ -{
+ -	int rc = 0, cfg;
+ -	struct ap_card *ac = to_ap_card(dev);
+ -
+ -	if (sscanf(buf, "%d\n", &cfg) != 1 || cfg < 0 || cfg > 1)
+ -		return -EINVAL;
+ -
+ -	if (cfg && !ac->config)
+ -		rc = sclp_ap_configure(ac->id);
+ -	else if (!cfg && ac->config)
+ -		rc = sclp_ap_deconfigure(ac->id);
+ -	if (rc)
+ -		return rc;
+ -
+ -	ac->config = cfg ? true : false;
+ -
+ -	ap_send_config_uevent(&ac->ap_dev, ac->config);
+ -
+ -	return count;
+ +	return sprintf(buf, "ap:t%02X\n", to_ap_dev(dev)->device_type);
+  }
+  
+ -static DEVICE_ATTR_RW(config);
+ +static DEVICE_ATTR(modalias, 0444, ap_modalias_show, NULL);
+  
++ static ssize_t max_msg_size_show(struct device *dev,
++ 				 struct device_attribute *attr, char *buf)
++ {
++ 	struct ap_card *ac = to_ap_card(dev);
++ 
++ 	return scnprintf(buf, PAGE_SIZE, "%u\n", ac->maxmsgsize);
++ }
++ 
++ static DEVICE_ATTR_RO(max_msg_size);
++ 
+  static struct attribute *ap_card_dev_attrs[] = {
+  	&dev_attr_hwtype.attr,
+  	&dev_attr_raw_hwtype.attr,
+@@@ -141,6 -193,8 +151,11 @@@
+  	&dev_attr_requestq_count.attr,
+  	&dev_attr_pendingq_count.attr,
+  	&dev_attr_modalias.attr,
+++<<<<<<< HEAD
+++=======
++ 	&dev_attr_config.attr,
++ 	&dev_attr_max_msg_size.attr,
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	NULL
+  };
+  
+diff --cc drivers/s390/crypto/ap_queue.c
+index 41bd2b5b454d,c5e0fe0286e5..000000000000
+--- a/drivers/s390/crypto/ap_queue.c
++++ b/drivers/s390/crypto/ap_queue.c
+@@@ -151,12 -135,13 +151,16 @@@ static struct ap_queue_status ap_sm_rec
+  {
+  	struct ap_queue_status status;
+  	struct ap_message *ap_msg;
+ -	bool found = false;
+  
+  	status = ap_dqap(aq->qid, &aq->reply->psmid,
+++<<<<<<< HEAD
+ +			 aq->reply->message, aq->reply->length);
+++=======
++ 			 aq->reply->msg, aq->reply->bufsize);
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+ -		aq->queue_count = max_t(int, 0, aq->queue_count - 1);
+ +		aq->queue_count--;
+  		if (aq->queue_count > 0)
+  			mod_timer(&aq->timeout,
+  				  jiffies + aq->request_timeout);
+diff --cc drivers/s390/crypto/zcrypt_msgtype50.c
+index 6dd5d7c58dd0,99405472824d..000000000000
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@@ -435,17 -440,17 +435,27 @@@ static void zcrypt_cex2a_receive(struc
+  	/* Copy the reply message to the request message buffer. */
+  	if (!reply)
+  		goto out;	/* ap_msg->rc indicates the error */
+ -	t80h = reply->msg;
+ +	t80h = reply->message;
+  	if (t80h->type == TYPE80_RSP_CODE) {
+++<<<<<<< HEAD
+ +		if (aq->ap_dev.device_type == AP_DEVICE_TYPE_CEX2A)
+ +			length = min_t(int,
+ +				       CEX2A_MAX_RESPONSE_SIZE, t80h->len);
+ +		else
+ +			length = min_t(int,
+ +				       CEX3A_MAX_RESPONSE_SIZE, t80h->len);
+ +		memcpy(msg->message, reply->message, length);
+++=======
++ 		len = t80h->len;
++ 		if (len > reply->bufsize || len > msg->bufsize) {
++ 			msg->rc = -EMSGSIZE;
++ 		} else {
++ 			memcpy(msg->msg, reply->msg, len);
++ 			msg->len = len;
++ 		}
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	} else
+ -		memcpy(msg->msg, reply->msg, sizeof(error_reply));
+ +		memcpy(msg->message, reply->message, sizeof(error_reply));
+  out:
+  	complete((struct completion *) msg->private);
+  }
+@@@ -466,35 -471,34 +476,42 @@@ static long zcrypt_cex2a_modexpo(struc
+  	struct completion work;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	ap_init_message(&ap_msg);
+ +	if (zq->zcard->user_space_type == ZCRYPT_CEX2A)
+ +		ap_msg.message = kmalloc(MSGTYPE50_CRB2_MAX_MSG_SIZE,
+ +					 GFP_KERNEL);
+ +	else
+ +		ap_msg.message = kmalloc(MSGTYPE50_CRB3_MAX_MSG_SIZE,
+ +					 GFP_KERNEL);
+ +	if (!ap_msg.message)
+++=======
++ 	ap_msg->bufsize = (zq->zcard->user_space_type == ZCRYPT_CEX2A) ?
++ 		MSGTYPE50_CRB2_MAX_MSG_SIZE : MSGTYPE50_CRB3_MAX_MSG_SIZE;
++ 	ap_msg->msg = kmalloc(ap_msg->bufsize, GFP_KERNEL);
++ 	if (!ap_msg->msg)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -ENOMEM;
+ -	ap_msg->receive = zcrypt_cex2a_receive;
+ -	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+ -		atomic_inc_return(&zcrypt_step);
+ -	ap_msg->private = &work;
+ -	rc = ICAMEX_msg_to_type50MEX_msg(zq, ap_msg, mex);
+ +	ap_msg.receive = zcrypt_cex2a_receive;
+ +	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
+ +				atomic_inc_return(&zcrypt_step);
+ +	ap_msg.private = &work;
+ +	rc = ICAMEX_msg_to_type50MEX_msg(zq, &ap_msg, mex);
+  	if (rc)
+ -		goto out;
+ +		goto out_free;
+  	init_completion(&work);
+ -	rc = ap_queue_message(zq->queue, ap_msg);
+ -	if (rc)
+ -		goto out;
+ +	ap_queue_message(zq->queue, &ap_msg);
+  	rc = wait_for_completion_interruptible(&work);
+  	if (rc == 0) {
+ -		rc = ap_msg->rc;
+ +		rc = ap_msg.rc;
+  		if (rc == 0)
+ -			rc = convert_response_cex2a(zq, ap_msg,
+ -						    mex->outputdata,
+ -						    mex->outputdatalength);
+ +			rc = convert_response(zq, &ap_msg, mex->outputdata,
+ +					      mex->outputdatalength);
+  	} else
+  		/* Signal pending. */
+ -		ap_cancel_message(zq->queue, ap_msg);
+ -out:
+ -	ap_msg->private = NULL;
+ +		ap_cancel_message(zq->queue, &ap_msg);
+ +out_free:
+ +	kfree(ap_msg.message);
+  	return rc;
+  }
+  
+@@@ -512,35 -516,34 +529,42 @@@ static long zcrypt_cex2a_modexpo_crt(st
+  	struct completion work;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	ap_init_message(&ap_msg);
+ +	if (zq->zcard->user_space_type == ZCRYPT_CEX2A)
+ +		ap_msg.message = kmalloc(MSGTYPE50_CRB2_MAX_MSG_SIZE,
+ +					 GFP_KERNEL);
+ +	else
+ +		ap_msg.message = kmalloc(MSGTYPE50_CRB3_MAX_MSG_SIZE,
+ +					 GFP_KERNEL);
+ +	if (!ap_msg.message)
+++=======
++ 	ap_msg->bufsize = (zq->zcard->user_space_type == ZCRYPT_CEX2A) ?
++ 		MSGTYPE50_CRB2_MAX_MSG_SIZE : MSGTYPE50_CRB3_MAX_MSG_SIZE;
++ 	ap_msg->msg = kmalloc(ap_msg->bufsize, GFP_KERNEL);
++ 	if (!ap_msg->msg)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -ENOMEM;
+ -	ap_msg->receive = zcrypt_cex2a_receive;
+ -	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+ -		atomic_inc_return(&zcrypt_step);
+ -	ap_msg->private = &work;
+ -	rc = ICACRT_msg_to_type50CRT_msg(zq, ap_msg, crt);
+ +	ap_msg.receive = zcrypt_cex2a_receive;
+ +	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
+ +				atomic_inc_return(&zcrypt_step);
+ +	ap_msg.private = &work;
+ +	rc = ICACRT_msg_to_type50CRT_msg(zq, &ap_msg, crt);
+  	if (rc)
+ -		goto out;
+ +		goto out_free;
+  	init_completion(&work);
+ -	rc = ap_queue_message(zq->queue, ap_msg);
+ -	if (rc)
+ -		goto out;
+ +	ap_queue_message(zq->queue, &ap_msg);
+  	rc = wait_for_completion_interruptible(&work);
+  	if (rc == 0) {
+ -		rc = ap_msg->rc;
+ +		rc = ap_msg.rc;
+  		if (rc == 0)
+ -			rc = convert_response_cex2a(zq, ap_msg,
+ -						    crt->outputdata,
+ -						    crt->outputdatalength);
+ +			rc = convert_response(zq, &ap_msg, crt->outputdata,
+ +					      crt->outputdatalength);
+  	} else
+  		/* Signal pending. */
+ -		ap_cancel_message(zq->queue, ap_msg);
+ -out:
+ -	ap_msg->private = NULL;
+ +		ap_cancel_message(zq->queue, &ap_msg);
+ +out_free:
+ +	kfree(ap_msg.message);
+  	return rc;
+  }
+  
+diff --cc drivers/s390/crypto/zcrypt_msgtype6.c
+index 86910661f0c5,752c6398fcd6..000000000000
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@@ -400,11 -400,11 +400,16 @@@ static int XCRB_msg_to_type6CPRB_msgX(s
+  	struct {
+  		struct type6_hdr hdr;
+  		struct CPRBX cprbx;
+ -	} __packed * msg = ap_msg->msg;
+ +	} __packed * msg = ap_msg->message;
+  
+  	int rcblen = CEIL4(xcRB->request_control_blk_length);
+++<<<<<<< HEAD
+ +	int replylen, req_sumlen, resp_sumlen;
+ +	char *req_data = ap_msg->message + sizeof(struct type6_hdr) + rcblen;
+++=======
++ 	int req_sumlen, resp_sumlen;
++ 	char *req_data = ap_msg->msg + sizeof(struct type6_hdr) + rcblen;
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	char *function_code;
+  
+  	if (CEIL4(xcRB->request_control_blk_length) <
+@@@ -412,14 -412,16 +417,18 @@@
+  		return -EINVAL; /* overflow after alignment*/
+  
+  	/* length checks */
+ -	ap_msg->len = sizeof(struct type6_hdr) +
+ +	ap_msg->length = sizeof(struct type6_hdr) +
+  		CEIL4(xcRB->request_control_blk_length) +
+  		xcRB->request_data_length;
+++<<<<<<< HEAD
+ +	if (ap_msg->length > MSGTYPE06_MAX_MSG_SIZE)
+++=======
++ 	if (ap_msg->len > ap_msg->bufsize)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -EINVAL;
+  
+ -	/*
+ -	 * Overflow check
+ -	 * sum must be greater (or equal) than the largest operand
+ -	 */
+ +	/* Overflow check
+ +	   sum must be greater (or equal) than the largest operand */
+  	req_sumlen = CEIL4(xcRB->request_control_blk_length) +
+  			xcRB->request_data_length;
+  	if ((CEIL4(xcRB->request_control_blk_length) <=
+@@@ -433,14 -435,10 +442,21 @@@
+  			xcRB->reply_control_blk_length)
+  		return -EINVAL; /* overflow after alignment*/
+  
+++<<<<<<< HEAD
+ +	replylen = sizeof(struct type86_fmt2_msg) +
+ +		CEIL4(xcRB->reply_control_blk_length) +
+ +		xcRB->reply_data_length;
+ +	if (replylen > MSGTYPE06_MAX_MSG_SIZE)
+ +		return -EINVAL;
+ +
+ +	/* Overflow check
+ +	   sum must be greater (or equal) than the largest operand */
+++=======
++ 	/*
++ 	 * Overflow check
++ 	 * sum must be greater (or equal) than the largest operand
++ 	 */
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	resp_sumlen = CEIL4(xcRB->reply_control_blk_length) +
+  			xcRB->reply_data_length;
+  	if ((CEIL4(xcRB->reply_control_blk_length) <= xcRB->reply_data_length) ?
+@@@ -523,9 -524,8 +539,14 @@@ static int xcrb_msg_to_type6_ep11cprb_m
+  		return -EINVAL; /* overflow after alignment*/
+  
+  	/* length checks */
+++<<<<<<< HEAD
+ +	ap_msg->length = sizeof(struct type6_hdr) + xcRB->req_len;
+ +	if (CEIL4(xcRB->req_len) > MSGTYPE06_MAX_MSG_SIZE -
+ +				   (sizeof(struct type6_hdr)))
+++=======
++ 	ap_msg->len = sizeof(struct type6_hdr) + CEIL4(xcRB->req_len);
++ 	if (ap_msg->len > ap_msg->bufsize)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -EINVAL;
+  
+  	if (CEIL4(xcRB->resp_len) < xcRB->resp_len)
+@@@ -942,23 -939,29 +959,43 @@@ static void zcrypt_msgtype6_receive(str
+  	if (t86r->hdr.type == TYPE86_RSP_CODE &&
+  		 t86r->cprbx.cprb_ver_id == 0x02) {
+  		switch (resp_type->type) {
+++<<<<<<< HEAD
+ +		case PCIXCC_RESPONSE_TYPE_ICA:
+ +			length = sizeof(struct type86x_reply)
+ +				+ t86r->length - 2;
+ +			length = min(PCIXCC_MAX_ICA_RESPONSE_SIZE, length);
+ +			memcpy(msg->message, reply->message, length);
+ +			break;
+ +		case PCIXCC_RESPONSE_TYPE_XCRB:
+ +			length = t86r->fmt2.offset2 + t86r->fmt2.count2;
+ +			length = min(MSGTYPE06_MAX_MSG_SIZE, length);
+ +			memcpy(msg->message, reply->message, length);
+++=======
++ 		case CEXXC_RESPONSE_TYPE_ICA:
++ 			len = sizeof(struct type86x_reply) + t86r->length - 2;
++ 			if (len > reply->bufsize || len > msg->bufsize) {
++ 				msg->rc = -EMSGSIZE;
++ 			} else {
++ 				memcpy(msg->msg, reply->msg, len);
++ 				msg->len = len;
++ 			}
++ 			break;
++ 		case CEXXC_RESPONSE_TYPE_XCRB:
++ 			len = t86r->fmt2.offset2 + t86r->fmt2.count2;
++ 			if (len > reply->bufsize || len > msg->bufsize) {
++ 				msg->rc = -EMSGSIZE;
++ 			} else {
++ 				memcpy(msg->msg, reply->msg, len);
++ 				msg->len = len;
++ 			}
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  			break;
+  		default:
+ -			memcpy(msg->msg, &error_reply, sizeof(error_reply));
+ +			memcpy(msg->message, &error_reply,
+ +			       sizeof(error_reply));
+  		}
+  	} else
+ -		memcpy(msg->msg, reply->msg, sizeof(error_reply));
+ +		memcpy(msg->message, reply->message, sizeof(error_reply));
+  out:
+  	complete(&(resp_type->work));
+  }
+@@@ -991,17 -994,21 +1028,28 @@@ static void zcrypt_msgtype6_receive_ep1
+  	if (t86r->hdr.type == TYPE86_RSP_CODE &&
+  	    t86r->cprbx.cprb_ver_id == 0x04) {
+  		switch (resp_type->type) {
+++<<<<<<< HEAD
+ +		case PCIXCC_RESPONSE_TYPE_EP11:
+ +			length = t86r->fmt2.offset1 + t86r->fmt2.count1;
+ +			length = min(MSGTYPE06_MAX_MSG_SIZE, length);
+ +			memcpy(msg->message, reply->message, length);
+++=======
++ 		case CEXXC_RESPONSE_TYPE_EP11:
++ 			len = t86r->fmt2.offset1 + t86r->fmt2.count1;
++ 			if (len > reply->bufsize || len > msg->bufsize) {
++ 				msg->rc = -EMSGSIZE;
++ 			} else {
++ 				memcpy(msg->msg, reply->msg, len);
++ 				msg->len = len;
++ 			}
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  			break;
+  		default:
+ -			memcpy(msg->msg, &error_reply, sizeof(error_reply));
+ +			memcpy(msg->message, &error_reply, sizeof(error_reply));
+  		}
+  	} else {
+ -		memcpy(msg->msg, reply->msg, sizeof(error_reply));
+ -	}
+ +		memcpy(msg->message, reply->message, sizeof(error_reply));
+ +	  }
+  out:
+  	complete(&(resp_type->work));
+  }
+@@@ -1024,15 -1031,15 +1072,24 @@@ static long zcrypt_msgtype6_modexpo(str
+  	};
+  	int rc;
+  
+ -	ap_msg->msg = (void *) get_zeroed_page(GFP_KERNEL);
+ -	if (!ap_msg->msg)
+ +	ap_init_message(&ap_msg);
+ +	ap_msg.message = (void *) get_zeroed_page(GFP_KERNEL);
+ +	if (!ap_msg.message)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+ +	ap_msg.receive = zcrypt_msgtype6_receive;
+ +	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
+ +				atomic_inc_return(&zcrypt_step);
+ +	ap_msg.private = &resp_type;
+ +	rc = ICAMEX_msg_to_type6MEX_msgX(zq, &ap_msg, mex);
+++=======
++ 	ap_msg->bufsize = PAGE_SIZE;
++ 	ap_msg->receive = zcrypt_msgtype6_receive;
++ 	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
++ 		atomic_inc_return(&zcrypt_step);
++ 	ap_msg->private = &resp_type;
++ 	rc = ICAMEX_msg_to_type6MEX_msgX(zq, ap_msg, mex);
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	if (rc)
+  		goto out_free;
+  	init_completion(&resp_type.work);
+@@@ -1068,15 -1079,15 +1125,24 @@@ static long zcrypt_msgtype6_modexpo_crt
+  	};
+  	int rc;
+  
+ -	ap_msg->msg = (void *) get_zeroed_page(GFP_KERNEL);
+ -	if (!ap_msg->msg)
+ +	ap_init_message(&ap_msg);
+ +	ap_msg.message = (void *) get_zeroed_page(GFP_KERNEL);
+ +	if (!ap_msg.message)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+ +	ap_msg.receive = zcrypt_msgtype6_receive;
+ +	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
+ +				atomic_inc_return(&zcrypt_step);
+ +	ap_msg.private = &resp_type;
+ +	rc = ICACRT_msg_to_type6CRT_msgX(zq, &ap_msg, crt);
+++=======
++ 	ap_msg->bufsize = PAGE_SIZE;
++ 	ap_msg->receive = zcrypt_msgtype6_receive;
++ 	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
++ 		atomic_inc_return(&zcrypt_step);
++ 	ap_msg->private = &resp_type;
++ 	rc = ICACRT_msg_to_type6CRT_msgX(zq, ap_msg, crt);
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	if (rc)
+  		goto out_free;
+  	init_completion(&resp_type.work);
+@@@ -1104,16 -1119,17 +1170,22 @@@ out_free
+   * by the caller with ap_init_message(). Also the caller has to
+   * make sure ap_release_message() is always called even on failure.
+   */
+ -unsigned int get_cprb_fc(bool userspace, struct ica_xcRB *xcRB,
+ -			 struct ap_message *ap_msg,
+ -			 unsigned int *func_code, unsigned short **dom)
+ +unsigned int get_cprb_fc(struct ica_xcRB *xcRB,
+ +				struct ap_message *ap_msg,
+ +				unsigned int *func_code, unsigned short **dom)
+  {
+  	struct response_type resp_type = {
+ -		.type = CEXXC_RESPONSE_TYPE_XCRB,
+ +		.type = PCIXCC_RESPONSE_TYPE_XCRB,
+  	};
+  
+++<<<<<<< HEAD
+ +	ap_msg->message = kmalloc(MSGTYPE06_MAX_MSG_SIZE, GFP_KERNEL);
+ +	if (!ap_msg->message)
+++=======
++ 	ap_msg->bufsize = atomic_read(&ap_max_msg_size);
++ 	ap_msg->msg = kmalloc(ap_msg->bufsize, GFP_KERNEL);
++ 	if (!ap_msg->msg)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -ENOMEM;
+  	ap_msg->receive = zcrypt_msgtype6_receive;
+  	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+@@@ -1160,16 -1177,17 +1232,22 @@@ static long zcrypt_msgtype6_send_cprb(s
+   * by the caller with ap_init_message(). Also the caller has to
+   * make sure ap_release_message() is always called even on failure.
+   */
+ -unsigned int get_ep11cprb_fc(bool userspace, struct ep11_urb *xcrb,
+ -			     struct ap_message *ap_msg,
+ -			     unsigned int *func_code)
+ +unsigned int get_ep11cprb_fc(struct ep11_urb *xcrb,
+ +				    struct ap_message *ap_msg,
+ +				    unsigned int *func_code)
+  {
+  	struct response_type resp_type = {
+ -		.type = CEXXC_RESPONSE_TYPE_EP11,
+ +		.type = PCIXCC_RESPONSE_TYPE_EP11,
+  	};
+  
+++<<<<<<< HEAD
+ +	ap_msg->message = kmalloc(MSGTYPE06_MAX_MSG_SIZE, GFP_KERNEL);
+ +	if (!ap_msg->message)
+++=======
++ 	ap_msg->bufsize = atomic_read(&ap_max_msg_size);
++ 	ap_msg->msg = kmalloc(ap_msg->bufsize, GFP_KERNEL);
++ 	if (!ap_msg->msg)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -ENOMEM;
+  	ap_msg->receive = zcrypt_msgtype6_receive_ep11;
+  	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+@@@ -1260,11 -1279,12 +1338,17 @@@ unsigned int get_rng_fc(struct ap_messa
+  						   unsigned int *domain)
+  {
+  	struct response_type resp_type = {
+ -		.type = CEXXC_RESPONSE_TYPE_XCRB,
+ +		.type = PCIXCC_RESPONSE_TYPE_XCRB,
+  	};
+  
+++<<<<<<< HEAD
+ +	ap_msg->message = kmalloc(MSGTYPE06_MAX_MSG_SIZE, GFP_KERNEL);
+ +	if (!ap_msg->message)
+++=======
++ 	ap_msg->bufsize = AP_DEFAULT_MAX_MSG_SIZE;
++ 	ap_msg->msg = kmalloc(ap_msg->bufsize, GFP_KERNEL);
++ 	if (!ap_msg->msg)
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  		return -ENOMEM;
+  	ap_msg->receive = zcrypt_msgtype6_receive;
+  	ap_msg->psmid = (((unsigned long long) current->pid) << 32) +
+diff --cc drivers/s390/crypto/zcrypt_queue.c
+index a303f3b2c328,20f12288a8c1..000000000000
+--- a/drivers/s390/crypto/zcrypt_queue.c
++++ b/drivers/s390/crypto/zcrypt_queue.c
+@@@ -93,24 -100,28 +93,31 @@@ static struct attribute_group zcrypt_qu
+  	.attrs = zcrypt_queue_attrs,
+  };
+  
+ -bool zcrypt_queue_force_online(struct zcrypt_queue *zq, int online)
+ +void zcrypt_queue_force_online(struct zcrypt_queue *zq, int online)
+  {
+ -	if (!!zq->online != !!online) {
+ -		zq->online = online;
+ -		if (!online)
+ -			ap_flush_queue(zq->queue);
+ -		return true;
+ -	}
+ -	return false;
+ +	zq->online = online;
+ +	if (!online)
+ +		ap_flush_queue(zq->queue);
+  }
+  
+- struct zcrypt_queue *zcrypt_queue_alloc(size_t max_response_size)
++ struct zcrypt_queue *zcrypt_queue_alloc(size_t reply_buf_size)
+  {
+  	struct zcrypt_queue *zq;
+  
+  	zq = kzalloc(sizeof(struct zcrypt_queue), GFP_KERNEL);
+  	if (!zq)
+  		return NULL;
+++<<<<<<< HEAD
+ +	zq->reply.message = kmalloc(max_response_size, GFP_KERNEL);
+ +	if (!zq->reply.message)
+ +		goto out_free;
+ +	zq->reply.length = max_response_size;
+++=======
++ 	zq->reply.msg = kmalloc(reply_buf_size, GFP_KERNEL);
++ 	if (!zq->reply.msg)
++ 		goto out_free;
++ 	zq->reply.bufsize = reply_buf_size;
+++>>>>>>> bd39654a2282 (s390/AP: support new dynamic AP bus size limit)
+  	INIT_LIST_HEAD(&zq->list);
+  	kref_init(&zq->refcount);
+  	return zq;
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/ap_bus.h
+* Unmerged path drivers/s390/crypto/ap_card.c
+* Unmerged path drivers/s390/crypto/ap_queue.c
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index b00fe6cc2f3b..146f2bd127fb 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -866,6 +866,9 @@ static long _zcrypt_send_cprb(struct ap_perms *perms,
+ 		if (xcRB->user_defined != AUTOSELECT &&
+ 		    xcRB->user_defined != zc->card->id)
+ 			continue;
++		/* check if request size exceeds card max msg size */
++		if (ap_msg.len > zc->card->maxmsgsize)
++			continue;
+ 		/* check if device node has admission for this card */
+ 		if (!zcrypt_check_card(perms, zc->card->id))
+ 			continue;
+@@ -1000,6 +1003,9 @@ static long zcrypt_send_ep11_cprb(struct ap_perms *perms,
+ 		if (targets &&
+ 		    !is_desired_ep11_card(zc->card->id, target_num, targets))
+ 			continue;
++		/* check if request size exceeds card max msg size */
++		if (ap_msg.len > zc->card->maxmsgsize)
++			continue;
+ 		/* check if device node has admission for this card */
+ 		if (!zcrypt_check_card(perms, zc->card->id))
+ 			continue;
+diff --git a/drivers/s390/crypto/zcrypt_cex4.c b/drivers/s390/crypto/zcrypt_cex4.c
+index 5de695dec230..f9e1e256cc4a 100644
+--- a/drivers/s390/crypto/zcrypt_cex4.c
++++ b/drivers/s390/crypto/zcrypt_cex4.c
+@@ -25,9 +25,6 @@
+ #define CEX4C_MIN_MOD_SIZE	 16	/*  256 bits	*/
+ #define CEX4C_MAX_MOD_SIZE	512	/* 4096 bits	*/
+ 
+-#define CEX4A_MAX_MESSAGE_SIZE	MSGTYPE50_CRB3_MAX_MSG_SIZE
+-#define CEX4C_MAX_MESSAGE_SIZE	MSGTYPE06_MAX_MSG_SIZE
+-
+ /* Waiting time for requests to be processed.
+  * Currently there are some types of request which are not deterministic.
+  * But the maximum time limit managed by the stomper code is set to 60sec.
+@@ -228,19 +225,19 @@ static int zcrypt_cex4_queue_probe(struct ap_device *ap_dev)
+ 	int rc;
+ 
+ 	if (ap_test_bit(&aq->card->functions, AP_FUNC_ACCEL)) {
+-		zq = zcrypt_queue_alloc(CEX4A_MAX_MESSAGE_SIZE);
++		zq = zcrypt_queue_alloc(aq->card->maxmsgsize);
+ 		if (!zq)
+ 			return -ENOMEM;
+ 		zq->ops = zcrypt_msgtype(MSGTYPE50_NAME,
+ 					 MSGTYPE50_VARIANT_DEFAULT);
+ 	} else if (ap_test_bit(&aq->card->functions, AP_FUNC_COPRO)) {
+-		zq = zcrypt_queue_alloc(CEX4C_MAX_MESSAGE_SIZE);
++		zq = zcrypt_queue_alloc(aq->card->maxmsgsize);
+ 		if (!zq)
+ 			return -ENOMEM;
+ 		zq->ops = zcrypt_msgtype(MSGTYPE06_NAME,
+ 					 MSGTYPE06_VARIANT_DEFAULT);
+ 	} else if (ap_test_bit(&aq->card->functions, AP_FUNC_EP11)) {
+-		zq = zcrypt_queue_alloc(CEX4C_MAX_MESSAGE_SIZE);
++		zq = zcrypt_queue_alloc(aq->card->maxmsgsize);
+ 		if (!zq)
+ 			return -ENOMEM;
+ 		zq->ops = zcrypt_msgtype(MSGTYPE06_NAME,
+* Unmerged path drivers/s390/crypto/zcrypt_msgtype50.c
+* Unmerged path drivers/s390/crypto/zcrypt_msgtype6.c
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.h b/drivers/s390/crypto/zcrypt_msgtype6.h
+index 7a0d5b57821f..e22762c11c9a 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.h
++++ b/drivers/s390/crypto/zcrypt_msgtype6.h
+@@ -34,8 +34,6 @@
+ #define MSGTYPE06_VARIANT_NORNG		1
+ #define MSGTYPE06_VARIANT_EP11		2
+ 
+-#define MSGTYPE06_MAX_MSG_SIZE		(12*1024)
+-
+ /**
+  * The type 6 message family is associated with PCICC or PCIXCC cards.
+  *
+* Unmerged path drivers/s390/crypto/zcrypt_queue.c
