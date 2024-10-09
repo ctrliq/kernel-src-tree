@@ -1,0 +1,94 @@
+dm cache: fix race condition in the writeback mode overwrite_bio optimisation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit d1260e2a3f85f4c1010510a15f89597001318b1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d1260e2a.failed
+
+When a DM cache in writeback mode moves data between the slow and fast
+device it can often avoid a copy if the triggering bio either:
+
+i) covers the whole block (no point copying if we're about to overwrite it)
+ii) the migration is a promotion and the origin block is currently discarded
+
+Prior to this fix there was a race with case (ii).  The discard status
+was checked with a shared lock held (rather than exclusive).  This meant
+another bio could run in parallel and write data to the origin, removing
+the discard state.  After the promotion the parallel write would have
+been lost.
+
+With this fix the discard status is re-checked once the exclusive lock
+has been aquired.  If the block is no longer discarded it falls back to
+the slower full copy path.
+
+Fixes: b29d4986d ("dm cache: significant rework to leverage dm-bio-prison-v2")
+	Cc: stable@vger.kernel.org # v4.12+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit d1260e2a3f85f4c1010510a15f89597001318b1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index 9a1cc393163a,0b7edfd0b454..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -1488,26 -1539,8 +1538,31 @@@ static void mg_copy(struct work_struct 
+  		 */
+  		overwrite(mg, mg_update_metadata_after_copy);
+  
+++<<<<<<< HEAD
+ +	} else {
+ +		struct cache *cache = mg->cache;
+ +		struct policy_work *op = mg->op;
+ +		bool is_policy_promote = (op->op == POLICY_PROMOTE);
+ +
+ +		if ((!is_policy_promote && !is_dirty(cache, op->cblock)) ||
+ +		    is_discarded_oblock(cache, op->oblock)) {
+ +			mg_upgrade_lock(ws);
+ +			return;
+ +		}
+ +
+ +		init_continuation(&mg->k, mg_upgrade_lock);
+ +
+ +		r = copy(mg, is_policy_promote);
+ +		if (r) {
+ +			DMERR_LIMIT("%s: migration copy failed", cache_device_name(cache));
+ +			mg->k.input = -EIO;
+ +			mg_complete(mg, false);
+ +		}
+ +	}
+++=======
++ 	} else
++ 		mg_full_copy(ws);
+++>>>>>>> d1260e2a3f85 (dm cache: fix race condition in the writeback mode overwrite_bio optimisation)
+  }
+  
+  static int mg_lock_writes(struct dm_cache_migration *mg)
+@@@ -1747,18 -1780,6 +1802,21 @@@ static void inc_miss_counter(struct cac
+  
+  /*----------------------------------------------------------------*/
+  
+++<<<<<<< HEAD
+ +static bool bio_writes_complete_block(struct cache *cache, struct bio *bio)
+ +{
+ +	return (bio_data_dir(bio) == WRITE) &&
+ +		(bio->bi_size == (cache->sectors_per_block << SECTOR_SHIFT));
+ +}
+ +
+ +static bool optimisable_bio(struct cache *cache, struct bio *bio, dm_oblock_t block)
+ +{
+ +	return writeback_mode(&cache->features) &&
+ +		(is_discarded_oblock(cache, block) || bio_writes_complete_block(cache, bio));
+ +}
+ +
+++=======
+++>>>>>>> d1260e2a3f85 (dm cache: fix race condition in the writeback mode overwrite_bio optimisation)
+  static int map_bio(struct cache *cache, struct bio *bio, dm_oblock_t block,
+  		   bool *commit_needed)
+  {
+* Unmerged path drivers/md/dm-cache-target.c
