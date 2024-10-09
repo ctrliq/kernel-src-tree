@@ -1,0 +1,211 @@
+mm: always enable thp for dax mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] always enable thp for dax mappings (Jeff Moyer) [1472025]
+Rebuild_FUZZ: 94.44%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit baabda261424517110ea98c6651f632ebf2561e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/baabda26.failed
+
+The madvise policy for transparent huge pages is meant to avoid unwanted
+allocations of transparent huge pages.  It allows a policy of disabling
+the extra memory pressure and effort to arrange for a huge page when it
+is not needed.
+
+DAX by definition never incurs this overhead since it is statically
+allocated.  The policy choice makes even less sense for device-dax which
+tries to guarantee a given tlb-fault size.  Specifically, the following
+setting:
+
+	echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+...violates that guarantee and silently disables all device-dax
+instances with a 2M or 1G alignment.  So, let's avoid that non-obvious
+side effect by force enabling thp for dax mappings in all cases.
+
+It is worth noting that the reason this uses vma_is_dax(), and the
+resulting header include changes, is that previous attempts to add a
+VM_DAX flag were NAKd.
+
+Link: http://lkml.kernel.org/r/149739531127.20686.15813586620597484283.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit baabda261424517110ea98c6651f632ebf2561e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs.h
+#	include/linux/huge_mm.h
+diff --cc include/linux/fs.h
+index 24213ce025a6,78e1dbbe4cfd..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -16,8 -17,11 +16,13 @@@
+  #include <linux/pid.h>
+  #include <linux/bug.h>
+  #include <linux/mutex.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/rwsem.h>
++ #include <linux/mm_types.h>
+++>>>>>>> baabda261424 (mm: always enable thp for dax mappings)
+  #include <linux/capability.h>
+  #include <linux/semaphore.h>
+ -#include <linux/fcntl.h>
+  #include <linux/fiemap.h>
+  #include <linux/rculist_bl.h>
+  #include <linux/atomic.h>
+@@@ -3122,6 -3128,44 +3127,47 @@@ static inline bool io_is_direct(struct 
+  	return (filp->f_flags & O_DIRECT) || IS_DAX(filp->f_mapping->host);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool vma_is_dax(struct vm_area_struct *vma)
++ {
++ 	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
++ }
++ 
++ static inline int iocb_flags(struct file *file)
++ {
++ 	int res = 0;
++ 	if (file->f_flags & O_APPEND)
++ 		res |= IOCB_APPEND;
++ 	if (io_is_direct(file))
++ 		res |= IOCB_DIRECT;
++ 	if ((file->f_flags & O_DSYNC) || IS_SYNC(file->f_mapping->host))
++ 		res |= IOCB_DSYNC;
++ 	if (file->f_flags & __O_SYNC)
++ 		res |= IOCB_SYNC;
++ 	return res;
++ }
++ 
++ static inline int kiocb_set_rw_flags(struct kiocb *ki, int flags)
++ {
++ 	if (unlikely(flags & ~RWF_SUPPORTED))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (flags & RWF_NOWAIT) {
++ 		if (!(ki->ki_filp->f_mode & FMODE_AIO_NOWAIT))
++ 			return -EOPNOTSUPP;
++ 		ki->ki_flags |= IOCB_NOWAIT;
++ 	}
++ 	if (flags & RWF_HIPRI)
++ 		ki->ki_flags |= IOCB_HIPRI;
++ 	if (flags & RWF_DSYNC)
++ 		ki->ki_flags |= IOCB_DSYNC;
++ 	if (flags & RWF_SYNC)
++ 		ki->ki_flags |= (IOCB_DSYNC | IOCB_SYNC);
++ 	return 0;
++ }
++ 
+++>>>>>>> baabda261424 (mm: always enable thp for dax mappings)
+  static inline ino_t parent_ino(struct dentry *dentry)
+  {
+  	ino_t res;
+diff --cc include/linux/huge_mm.h
+index 2f1205c8c5a1,ee696347f928..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -1,10 -1,11 +1,18 @@@
+  #ifndef _LINUX_HUGE_MM_H
+  #define _LINUX_HUGE_MM_H
+  
+++<<<<<<< HEAD
+ +extern int do_huge_pmd_anonymous_page(struct mm_struct *mm,
+ +				      struct vm_area_struct *vma,
+ +				      unsigned long address, pmd_t *pmd,
+ +				      unsigned int flags);
+++=======
++ #include <linux/sched/coredump.h>
++ 
++ #include <linux/fs.h> /* only for vma_is_dax() */
++ 
++ extern int do_huge_pmd_anonymous_page(struct vm_fault *vmf);
+++>>>>>>> baabda261424 (mm: always enable thp for dax mappings)
+  extern int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+  			 pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
+  			 struct vm_area_struct *vma);
+@@@ -68,22 -83,38 +76,51 @@@ extern pmd_t *page_check_address_pmd(st
+  #define HPAGE_PMD_SIZE	((1UL) << HPAGE_PMD_SHIFT)
+  #define HPAGE_PMD_MASK	(~(HPAGE_PMD_SIZE - 1))
+  
+ -#define HPAGE_PUD_SHIFT PUD_SHIFT
+ -#define HPAGE_PUD_SIZE	((1UL) << HPAGE_PUD_SHIFT)
+ -#define HPAGE_PUD_MASK	(~(HPAGE_PUD_SIZE - 1))
+ -
+  extern bool is_vma_temporary_stack(struct vm_area_struct *vma);
+  
+++<<<<<<< HEAD
+ +#define transparent_hugepage_enabled(__vma)				\
+ +	((transparent_hugepage_flags &					\
+ +	  (1<<TRANSPARENT_HUGEPAGE_FLAG) ||				\
+ +	  (transparent_hugepage_flags &					\
+ +	   (1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG) &&			\
+ +	   ((__vma)->vm_flags & VM_HUGEPAGE))) &&			\
+ +	 !((__vma)->vm_flags & VM_NOHUGEPAGE) &&			\
+ +	 !is_vma_temporary_stack(__vma))
+ +#define transparent_hugepage_defrag(__vma)				\
+ +	((transparent_hugepage_flags &					\
+ +	  (1<<TRANSPARENT_HUGEPAGE_DEFRAG_FLAG)) ||			\
+ +	 (transparent_hugepage_flags &					\
+ +	  (1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG) &&		\
+ +	  (__vma)->vm_flags & VM_HUGEPAGE))
+++=======
++ extern unsigned long transparent_hugepage_flags;
++ 
++ static inline bool transparent_hugepage_enabled(struct vm_area_struct *vma)
++ {
++ 	if (vma->vm_flags & VM_NOHUGEPAGE)
++ 		return false;
++ 
++ 	if (is_vma_temporary_stack(vma))
++ 		return false;
++ 
++ 	if (test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
++ 		return false;
++ 
++ 	if (transparent_hugepage_flags & (1 << TRANSPARENT_HUGEPAGE_FLAG))
++ 		return true;
++ 
++ 	if (vma_is_dax(vma))
++ 		return true;
++ 
++ 	if (transparent_hugepage_flags &
++ 				(1 << TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG))
++ 		return !!(vma->vm_flags & VM_HUGEPAGE);
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> baabda261424 (mm: always enable thp for dax mappings)
+  #define transparent_hugepage_use_zero_page()				\
+  	(transparent_hugepage_flags &					\
+  	 (1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG))
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index 8937c7aed5cb..0e895b764f34 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -65,11 +65,6 @@ static inline int dax_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+ int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
+ #define dax_mkwrite(vma, vmf, gb)	dax_fault(vma, vmf, gb)
+ 
+-static inline bool vma_is_dax(struct vm_area_struct *vma)
+-{
+-	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
+-}
+-
+ static inline bool dax_mapping(struct address_space *mapping)
+ {
+ 	return mapping->host && IS_DAX(mapping->host);
+* Unmerged path include/linux/fs.h
+* Unmerged path include/linux/huge_mm.h
