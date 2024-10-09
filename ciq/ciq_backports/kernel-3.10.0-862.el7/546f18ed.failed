@@ -1,0 +1,161 @@
+net/mlx5e: Fail safe ethtool settings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fail safe ethtool settings (Don Dutile) [1456659 1499362]
+Rebuild_FUZZ: 94.29%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 546f18ed3fb55a6689488993d03b5576982790c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/546f18ed.failed
+
+Use the new fail-safe channels switch mechanism to set new ethtool
+settings:
+ - ring parameters
+ - coalesce parameters
+ - tx copy break parameters
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+(cherry picked from commit 546f18ed3fb55a6689488993d03b5576982790c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 35c9cc1953cf,457a796cc248..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -457,8 -456,8 +457,13 @@@ static int mlx5e_set_ringparam(struct n
+  			       struct ethtool_ringparam *param)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(dev);
+++<<<<<<< HEAD
+ +	bool was_opened;
+ +	int rq_wq_type = priv->params.rq_wq_type;
+++=======
++ 	int rq_wq_type = priv->channels.params.rq_wq_type;
++ 	struct mlx5e_channels new_channels = {};
+++>>>>>>> 546f18ed3fb5 (net/mlx5e: Fail safe ethtool settings)
+  	u32 rx_pending_wqes;
+  	u32 min_rq_size;
+  	u32 max_rq_size;
+@@@ -531,17 -527,22 +536,28 @@@
+  
+  	mutex_lock(&priv->state_lock);
+  
+- 	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+- 	if (was_opened)
+- 		mlx5e_close_locked(dev);
++ 	new_channels.params = priv->channels.params;
++ 	new_channels.params.log_rq_size = log_rq_size;
++ 	new_channels.params.log_sq_size = log_sq_size;
+  
+++<<<<<<< HEAD
+ +	priv->params.log_rq_size = log_rq_size;
+ +	priv->params.log_sq_size = log_sq_size;
+ +	priv->params.min_rx_wqes = min_rx_wqes;
+++=======
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++ 		priv->channels.params = new_channels.params;
++ 		goto unlock;
++ 	}
+++>>>>>>> 546f18ed3fb5 (net/mlx5e: Fail safe ethtool settings)
+  
+- 	if (was_opened)
+- 		err = mlx5e_open_locked(dev);
++ 	err = mlx5e_open_channels(priv, &new_channels);
++ 	if (err)
++ 		goto unlock;
+  
++ 	mlx5e_switch_priv_channels(priv, &new_channels);
++ 
++ unlock:
+  	mutex_unlock(&priv->state_lock);
+  
+  	return err;
+@@@ -623,40 -629,15 +639,47 @@@ static int mlx5e_get_coalesce(struct ne
+  	return 0;
+  }
+  
+- static int mlx5e_set_coalesce(struct net_device *netdev,
+- 			      struct ethtool_coalesce *coal)
++ static void
++ mlx5e_set_priv_channels_coalesce(struct mlx5e_priv *priv, struct ethtool_coalesce *coal)
+  {
+- 	struct mlx5e_priv *priv    = netdev_priv(netdev);
+  	struct mlx5_core_dev *mdev = priv->mdev;
+++<<<<<<< HEAD
+ +	struct mlx5e_channel *c;
+ +	bool restart =
+ +		!!coal->use_adaptive_rx_coalesce != priv->params.rx_am_enabled;
+ +	bool was_opened;
+ +	int err = 0;
+ +	int tc;
+ +	int i;
+ +
+ +	if (!MLX5_CAP_GEN(mdev, cq_moderation))
+ +		return -EOPNOTSUPP;
+ +
+ +	mutex_lock(&priv->state_lock);
+ +
+ +	was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	if (was_opened && restart) {
+ +		mlx5e_close_locked(netdev);
+ +		priv->params.rx_am_enabled = !!coal->use_adaptive_rx_coalesce;
+ +	}
+ +
+ +	priv->params.tx_cq_moderation.usec = coal->tx_coalesce_usecs;
+ +	priv->params.tx_cq_moderation.pkts = coal->tx_max_coalesced_frames;
+ +	priv->params.rx_cq_moderation.usec = coal->rx_coalesce_usecs;
+ +	priv->params.rx_cq_moderation.pkts = coal->rx_max_coalesced_frames;
+ +
+ +	if (!was_opened || restart)
+ +		goto out;
+ +
+ +	for (i = 0; i < priv->params.num_channels; ++i) {
+ +		c = priv->channel[i];
+++=======
++ 	int tc;
++ 	int i;
++ 
++ 	for (i = 0; i < priv->channels.num; ++i) {
++ 		struct mlx5e_channel *c = priv->channels.c[i];
+++>>>>>>> 546f18ed3fb5 (net/mlx5e: Fail safe ethtool settings)
+  
+  		for (tc = 0; tc < c->num_tc; tc++) {
+  			mlx5_core_modify_cq_moderation(mdev,
+@@@ -1125,18 -1155,19 +1189,23 @@@ static int mlx5e_set_tunable(struct net
+  			break;
+  		}
+  
+- 		mutex_lock(&priv->state_lock);
++ 		new_channels.params = priv->channels.params;
++ 		new_channels.params.tx_max_inline = val;
+  
+- 		was_opened = test_bit(MLX5E_STATE_OPENED, &priv->state);
+- 		if (was_opened)
+- 			mlx5e_close_locked(dev);
++ 		if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
++ 			priv->channels.params = new_channels.params;
++ 			break;
++ 		}
+  
+++<<<<<<< HEAD
+ +		priv->params.tx_max_inline = val;
+++=======
++ 		err = mlx5e_open_channels(priv, &new_channels);
++ 		if (err)
++ 			break;
++ 		mlx5e_switch_priv_channels(priv, &new_channels);
+++>>>>>>> 546f18ed3fb5 (net/mlx5e: Fail safe ethtool settings)
+  
+- 		if (was_opened)
+- 			err = mlx5e_open_locked(dev);
+- 
+- 		mutex_unlock(&priv->state_lock);
+  		break;
+  	default:
+  		err = -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
