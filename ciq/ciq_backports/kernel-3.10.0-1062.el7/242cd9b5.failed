@@ -1,0 +1,153 @@
+r8169: use phy_resume/phy_suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 242cd9b5866aa2caf9ff770283b85ddb35d52f90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/242cd9b5.failed
+
+Use phy_resume() / phy_suspend() instead of open coding this functionality.
+The chip version specific differences are handled by the respective PHY
+drivers.
+
+The call to r8168_phy_power_down() in r8168_pll_power_down() can be
+removed because phylib takes care now. The relevant scenarios are:
+- rtl8169_close(): phy_disconnect() powers down PHY
+- suspend: mdio_bus_phy_suspend() takes care
+- runtime-suspend: WoL is active, don't suspend PHY
+- rtl_shutdown(): no need to power down PHY
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 242cd9b5866aa2caf9ff770283b85ddb35d52f90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/realtek/r8169.c
+diff --cc drivers/net/ethernet/realtek/r8169.c
+index ba5aac4e1fe4,15fa08e81660..000000000000
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@@ -4472,44 -4450,6 +4472,47 @@@ static bool rtl_wol_pll_power_down(stru
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static void r8168_phy_power_up(struct rtl8169_private *tp)
+ +{
+ +	rtl_writephy(tp, 0x1f, 0x0000);
+ +	switch (tp->mac_version) {
+ +	case RTL_GIGA_MAC_VER_11:
+ +	case RTL_GIGA_MAC_VER_12:
+ +	case RTL_GIGA_MAC_VER_17 ... RTL_GIGA_MAC_VER_28:
+ +	case RTL_GIGA_MAC_VER_31:
+ +		rtl_writephy(tp, 0x0e, 0x0000);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+ +	rtl_writephy(tp, MII_BMCR, BMCR_ANENABLE);
+ +}
+ +
+ +static void r8168_phy_power_down(struct rtl8169_private *tp)
+ +{
+ +	rtl_writephy(tp, 0x1f, 0x0000);
+ +	switch (tp->mac_version) {
+ +	case RTL_GIGA_MAC_VER_32:
+ +	case RTL_GIGA_MAC_VER_33:
+ +	case RTL_GIGA_MAC_VER_40:
+ +	case RTL_GIGA_MAC_VER_41:
+ +		rtl_writephy(tp, MII_BMCR, BMCR_ANENABLE | BMCR_PDOWN);
+ +		break;
+ +
+ +	case RTL_GIGA_MAC_VER_11:
+ +	case RTL_GIGA_MAC_VER_12:
+ +	case RTL_GIGA_MAC_VER_17 ... RTL_GIGA_MAC_VER_28:
+ +	case RTL_GIGA_MAC_VER_31:
+ +		rtl_writephy(tp, 0x0e, 0x0200);
+ +	default:
+ +		rtl_writephy(tp, MII_BMCR, BMCR_PDOWN);
+ +		break;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 242cd9b5866a (r8169: use phy_resume/phy_suspend)
+  static void r8168_pll_power_down(struct rtl8169_private *tp)
+  {
+  	if (r8168_check_dash(tp))
+@@@ -7389,6 -7377,68 +7392,71 @@@ DECLARE_RTL_COND(rtl_rxtx_empty_cond
+  	return (RTL_R8(tp, MCU) & RXTX_EMPTY) == RXTX_EMPTY;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int r8169_mdio_read_reg(struct mii_bus *mii_bus, int phyaddr, int phyreg)
++ {
++ 	struct rtl8169_private *tp = mii_bus->priv;
++ 
++ 	if (phyaddr > 0)
++ 		return -ENODEV;
++ 
++ 	return rtl_readphy(tp, phyreg);
++ }
++ 
++ static int r8169_mdio_write_reg(struct mii_bus *mii_bus, int phyaddr,
++ 				int phyreg, u16 val)
++ {
++ 	struct rtl8169_private *tp = mii_bus->priv;
++ 
++ 	if (phyaddr > 0)
++ 		return -ENODEV;
++ 
++ 	rtl_writephy(tp, phyreg, val);
++ 
++ 	return 0;
++ }
++ 
++ static int r8169_mdio_register(struct rtl8169_private *tp)
++ {
++ 	struct pci_dev *pdev = tp->pci_dev;
++ 	struct phy_device *phydev;
++ 	struct mii_bus *new_bus;
++ 	int ret;
++ 
++ 	new_bus = devm_mdiobus_alloc(&pdev->dev);
++ 	if (!new_bus)
++ 		return -ENOMEM;
++ 
++ 	new_bus->name = "r8169";
++ 	new_bus->priv = tp;
++ 	new_bus->parent = &pdev->dev;
++ 	new_bus->irq[0] = PHY_IGNORE_INTERRUPT;
++ 	snprintf(new_bus->id, MII_BUS_ID_SIZE, "r8169-%x",
++ 		 PCI_DEVID(pdev->bus->number, pdev->devfn));
++ 
++ 	new_bus->read = r8169_mdio_read_reg;
++ 	new_bus->write = r8169_mdio_write_reg;
++ 
++ 	ret = mdiobus_register(new_bus);
++ 	if (ret)
++ 		return ret;
++ 
++ 	phydev = mdiobus_get_phy(new_bus, 0);
++ 	if (!phydev) {
++ 		mdiobus_unregister(new_bus);
++ 		return -ENODEV;
++ 	}
++ 
++ 	/* PHY will be woken up in rtl_open() */
++ 	phy_suspend(phydev);
++ 
++ 	tp->mii_bus = new_bus;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 242cd9b5866a (r8169: use phy_resume/phy_suspend)
+  static void rtl_hw_init_8168g(struct rtl8169_private *tp)
+  {
+  	u32 data;
+* Unmerged path drivers/net/ethernet/realtek/r8169.c
