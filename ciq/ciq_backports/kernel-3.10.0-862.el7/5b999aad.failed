@@ -1,0 +1,222 @@
+mm: swap: zswap: maybe_preload & refactoring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] swap: zswap: maybe_preload & refactoring (Jerome Marchand) [1532517]
+Rebuild_FUZZ: 95.24%
+commit-author Dmitry Safonov <0x7f454c46@gmail.com>
+commit 5b999aadbae65696a148f55250d94b6f3d74071e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5b999aad.failed
+
+zswap_get_swap_cache_page and read_swap_cache_async have pretty much the
+same code with only significant difference in return value and usage of
+swap_readpage.
+
+I a helper __read_swap_cache_async() with the common code.  Behavior
+change: now zswap_get_swap_cache_page will use radix_tree_maybe_preload
+instead radix_tree_preload.  Looks like, this wasn't changed only by the
+reason of code duplication.
+
+	Signed-off-by: Dmitry Safonov <0x7f454c46@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: David Herrmann <dh.herrmann@gmail.com>
+	Cc: Seth Jennings <sjennings@variantweb.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5b999aadbae65696a148f55250d94b6f3d74071e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap_state.c
+#	mm/zswap.c
+diff --cc mm/swap_state.c
+index 8ead62769c81,d504adb7fa5f..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -402,6 -380,69 +398,72 @@@ struct page *__read_swap_cache_async(sw
+  	return found_page;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Locate a page of swap in physical memory, reserving swap cache space
++  * and reading the disk if it is not already cached.
++  * A failure return means that either the page allocation failed or that
++  * the swap entry is no longer in use.
++  */
++ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
++ 			struct vm_area_struct *vma, unsigned long addr)
++ {
++ 	bool page_was_allocated;
++ 	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
++ 			vma, addr, &page_was_allocated);
++ 
++ 	if (page_was_allocated)
++ 		swap_readpage(retpage);
++ 
++ 	return retpage;
++ }
++ 
++ static unsigned long swapin_nr_pages(unsigned long offset)
++ {
++ 	static unsigned long prev_offset;
++ 	unsigned int pages, max_pages, last_ra;
++ 	static atomic_t last_readahead_pages;
++ 
++ 	max_pages = 1 << READ_ONCE(page_cluster);
++ 	if (max_pages <= 1)
++ 		return 1;
++ 
++ 	/*
++ 	 * This heuristic has been found to work well on both sequential and
++ 	 * random loads, swapping to hard disk or to SSD: please don't ask
++ 	 * what the "+ 2" means, it just happens to work well, that's all.
++ 	 */
++ 	pages = atomic_xchg(&swapin_readahead_hits, 0) + 2;
++ 	if (pages == 2) {
++ 		/*
++ 		 * We can have no readahead hits to judge by: but must not get
++ 		 * stuck here forever, so check for an adjacent offset instead
++ 		 * (and don't even bother to check whether swap type is same).
++ 		 */
++ 		if (offset != prev_offset + 1 && offset != prev_offset - 1)
++ 			pages = 1;
++ 		prev_offset = offset;
++ 	} else {
++ 		unsigned int roundup = 4;
++ 		while (roundup < pages)
++ 			roundup <<= 1;
++ 		pages = roundup;
++ 	}
++ 
++ 	if (pages > max_pages)
++ 		pages = max_pages;
++ 
++ 	/* Don't shrink readahead too fast */
++ 	last_ra = atomic_read(&last_readahead_pages) / 2;
++ 	if (pages < last_ra)
++ 		pages = last_ra;
++ 	atomic_set(&last_readahead_pages, pages);
++ 
++ 	return pages;
++ }
++ 
+++>>>>>>> 5b999aadbae6 (mm: swap: zswap: maybe_preload & refactoring)
+  /**
+   * swapin_readahead - swap in pages in hope we need them soon
+   * @entry: swap entry of this memory
+diff --cc mm/zswap.c
+index 4eb661cab809,09208c7c86f3..000000000000
+--- a/mm/zswap.c
++++ b/mm/zswap.c
+@@@ -446,75 -446,14 +446,80 @@@ enum zswap_get_swap_ret 
+  static int zswap_get_swap_cache_page(swp_entry_t entry,
+  				struct page **retpage)
+  {
+- 	struct page *found_page, *new_page = NULL;
+- 	struct address_space *swapper_space = swap_address_space(entry);
+- 	int err;
++ 	bool page_was_allocated;
+  
+++<<<<<<< HEAD
+ +	*retpage = NULL;
+ +	do {
+ +		/*
+ +		 * First check the swap cache.  Since this is normally
+ +		 * called after lookup_swap_cache() failed, re-calling
+ +		 * that would confuse statistics.
+ +		 */
+ +		found_page = find_get_page(swapper_space, entry.val);
+ +		if (found_page)
+ +			break;
+ +
+ +		/*
+ +		 * Get a new page to read into from swap.
+ +		 */
+ +		if (!new_page) {
+ +			new_page = alloc_page(GFP_KERNEL);
+ +			if (!new_page)
+ +				break; /* Out of memory */
+ +		}
+ +
+ +		/*
+ +		 * call radix_tree_preload() while we can wait.
+ +		 */
+ +		err = radix_tree_preload(GFP_KERNEL);
+ +		if (err)
+ +			break;
+ +
+ +		/*
+ +		 * Swap entry may have been freed since our caller observed it.
+ +		 */
+ +		err = swapcache_prepare(entry);
+ +		if (err == -EEXIST) { /* seems racy */
+ +			radix_tree_preload_end();
+ +			continue;
+ +		}
+ +		if (err) { /* swp entry is obsolete ? */
+ +			radix_tree_preload_end();
+ +			break;
+ +		}
+ +
+ +		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+ +		__set_page_locked(new_page);
+ +		SetPageSwapBacked(new_page);
+ +		err = __add_to_swap_cache(new_page, entry);
+ +		if (likely(!err)) {
+ +			radix_tree_preload_end();
+ +			lru_cache_add_anon(new_page);
+ +			*retpage = new_page;
+ +			return ZSWAP_SWAPCACHE_NEW;
+ +		}
+ +		radix_tree_preload_end();
+ +		ClearPageSwapBacked(new_page);
+ +		__clear_page_locked(new_page);
+ +		/*
+ +		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
+ +		 * clear SWAP_HAS_CACHE flag.
+ +		 */
+ +		swapcache_free(entry, NULL);
+ +	} while (err != -ENOMEM);
+ +
+ +	if (new_page)
+ +		page_cache_release(new_page);
+ +	if (!found_page)
+++=======
++ 	*retpage = __read_swap_cache_async(entry, GFP_KERNEL,
++ 			NULL, 0, &page_was_allocated);
++ 	if (page_was_allocated)
++ 		return ZSWAP_SWAPCACHE_NEW;
++ 	if (!*retpage)
+++>>>>>>> 5b999aadbae6 (mm: swap: zswap: maybe_preload & refactoring)
+  		return ZSWAP_SWAPCACHE_FAIL;
+- 	*retpage = found_page;
+  	return ZSWAP_SWAPCACHE_EXIST;
+  }
+  
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 61d41d507b58..6e76304654d5 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -397,6 +397,9 @@ extern void free_pages_and_swap_cache(struct page **, int);
+ extern struct page *lookup_swap_cache(swp_entry_t);
+ extern struct page *read_swap_cache_async(swp_entry_t, gfp_t,
+ 			struct vm_area_struct *vma, unsigned long addr);
++extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
++			struct vm_area_struct *vma, unsigned long addr,
++			bool *new_page_allocated);
+ extern struct page *swapin_readahead(swp_entry_t, gfp_t,
+ 			struct vm_area_struct *vma, unsigned long addr);
+ 
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/zswap.c
