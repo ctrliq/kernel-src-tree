@@ -1,0 +1,235 @@
+mm: mlock: refactor mlock, munlock, and munlockall code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] mlock: refactor mlock, munlock, and munlockall code (Rafael Aquini) [1560030]
+Rebuild_FUZZ: 96.23%
+commit-author Eric B Munson <emunson@akamai.com>
+commit 1aab92ec3de552362397b718744872ea2d17add2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1aab92ec.failed
+
+mlock() allows a user to control page out of program memory, but this
+comes at the cost of faulting in the entire mapping when it is allocated.
+For large mappings where the entire area is not necessary this is not
+ideal.  Instead of forcing all locked pages to be present when they are
+allocated, this set creates a middle ground.  Pages are marked to be
+placed on the unevictable LRU (locked) when they are first used, but they
+are not faulted in by the mlock call.
+
+This series introduces a new mlock() system call that takes a flags
+argument along with the start address and size.  This flags argument gives
+the caller the ability to request memory be locked in the traditional way,
+or to be locked after the page is faulted in.  A new MCL flag is added to
+mirror the lock on fault behavior from mlock() in mlockall().
+
+There are two main use cases that this set covers.  The first is the
+security focussed mlock case.  A buffer is needed that cannot be written
+to swap.  The maximum size is known, but on average the memory used is
+significantly less than this maximum.  With lock on fault, the buffer is
+guaranteed to never be paged out without consuming the maximum size every
+time such a buffer is created.
+
+The second use case is focussed on performance.  Portions of a large file
+are needed and we want to keep the used portions in memory once accessed.
+This is the case for large graphical models where the path through the
+graph is not known until run time.  The entire graph is unlikely to be
+used in a given invocation, but once a node has been used it needs to stay
+resident for further processing.  Given these constraints we have a number
+of options.  We can potentially waste a large amount of memory by mlocking
+the entire region (this can also cause a significant stall at startup as
+the entire file is read in).  We can mlock every page as we access them
+without tracking if the page is already resident but this introduces large
+overhead for each access.  The third option is mapping the entire region
+with PROT_NONE and using a signal handler for SIGSEGV to
+mprotect(PROT_READ) and mlock() the needed page.  Doing this page at a
+time adds a significant performance penalty.  Batching can be used to
+mitigate this overhead, but in order to safely avoid trying to mprotect
+pages outside of the mapping, the boundaries of each mapping to be used in
+this way must be tracked and available to the signal handler.  This is
+precisely what the mm system in the kernel should already be doing.
+
+For mlock(MLOCK_ONFAULT) the user is charged against RLIMIT_MEMLOCK as if
+mlock(MLOCK_LOCKED) or mmap(MAP_LOCKED) was used, so when the VMA is
+created not when the pages are faulted in.  For mlockall(MCL_ONFAULT) the
+user is charged as if MCL_FUTURE was used.  This decision was made to keep
+the accounting checks out of the page fault path.
+
+To illustrate the benefit of this set I wrote a test program that mmaps a
+5 GB file filled with random data and then makes 15,000,000 accesses to
+random addresses in that mapping.  The test program was run 20 times for
+each setup.  Results are reported for two program portions, setup and
+execution.  The setup phase is calling mmap and optionally mlock on the
+entire region.  For most experiments this is trivial, but it highlights
+the cost of faulting in the entire region.  Results are averages across
+the 20 runs in milliseconds.
+
+mmap with mlock(MLOCK_LOCKED) on entire range:
+Setup avg:      8228.666
+Processing avg: 8274.257
+
+mmap with mlock(MLOCK_LOCKED) before each access:
+Setup avg:      0.113
+Processing avg: 90993.552
+
+mmap with PROT_NONE and signal handler and batch size of 1 page:
+With the default value in max_map_count, this gets ENOMEM as I attempt
+to change the permissions, after upping the sysctl significantly I get:
+Setup avg:      0.058
+Processing avg: 69488.073
+mmap with PROT_NONE and signal handler and batch size of 8 pages:
+Setup avg:      0.068
+Processing avg: 38204.116
+
+mmap with PROT_NONE and signal handler and batch size of 16 pages:
+Setup avg:      0.044
+Processing avg: 29671.180
+
+mmap with mlock(MLOCK_ONFAULT) on entire range:
+Setup avg:      0.189
+Processing avg: 17904.899
+
+The signal handler in the batch cases faulted in memory in two steps to
+avoid having to know the start and end of the faulting mapping.  The first
+step covers the page that caused the fault as we know that it will be
+possible to lock.  The second step speculatively tries to mlock and
+mprotect the batch size - 1 pages that follow.  There may be a clever way
+to avoid this without having the program track each mapping to be covered
+by this handeler in a globally accessible structure, but I could not find
+it.  It should be noted that with a large enough batch size this two step
+fault handler can still cause the program to crash if it reaches far
+beyond the end of the mapping.
+
+These results show that if the developer knows that a majority of the
+mapping will be used, it is better to try and fault it in at once,
+otherwise mlock(MLOCK_ONFAULT) is significantly faster.
+
+The performance cost of these patches are minimal on the two benchmarks I
+have tested (stream and kernbench).  The following are the average values
+across 20 runs of stream and 10 runs of kernbench after a warmup run whose
+results were discarded.
+
+Avg throughput in MB/s from stream using 1000000 element arrays
+Test     4.2-rc1      4.2-rc1+lock-on-fault
+Copy:    10,566.5     10,421
+Scale:   10,685       10,503.5
+Add:     12,044.1     11,814.2
+Triad:   12,064.8     11,846.3
+
+Kernbench optimal load
+                 4.2-rc1  4.2-rc1+lock-on-fault
+Elapsed Time     78.453   78.991
+User Time        64.2395  65.2355
+System Time      9.7335   9.7085
+Context Switches 22211.5  22412.1
+Sleeps           14965.3  14956.1
+
+This patch (of 6):
+
+Extending the mlock system call is very difficult because it currently
+does not take a flags argument.  A later patch in this set will extend
+mlock to support a middle ground between pages that are locked and faulted
+in immediately and unlocked pages.  To pave the way for the new system
+call, the code needs some reorganization so that all the actual entry
+point handles is checking input and translating to VMA flags.
+
+	Signed-off-by: Eric B Munson <emunson@akamai.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+	Cc: Guenter Roeck <linux@roeck-us.net>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Ralf Baechle <ralf@linux-mips.org>
+	Cc: Shuah Khan <shuahkh@osg.samsung.com>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1aab92ec3de552362397b718744872ea2d17add2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mlock.c
+diff --cc mm/mlock.c
+index 51bce8fdbf14,fbd8c03f7b37..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -623,69 -603,7 +621,73 @@@ static int apply_vma_lock_flags(unsigne
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * __mm_populate - populate and/or mlock pages within a range of address space.
+ + *
+ + * This is used to implement mlock() and the MAP_POPULATE / MAP_LOCKED mmap
+ + * flags. VMAs must be already marked with the desired vm_flags, and
+ + * mmap_sem must not be held.
+ + */
+ +int __mm_populate(unsigned long start, unsigned long len, int ignore_errors)
+ +{
+ +	struct mm_struct *mm = current->mm;
+ +	unsigned long end, nstart, nend;
+ +	struct vm_area_struct *vma = NULL;
+ +	int locked = 0;
+ +	long ret = 0;
+ +
+ +	VM_BUG_ON(start & ~PAGE_MASK);
+ +	VM_BUG_ON(len != PAGE_ALIGN(len));
+ +	end = start + len;
+ +
+ +	for (nstart = start; nstart < end; nstart = nend) {
+ +		/*
+ +		 * We want to fault in pages for [nstart; end) address range.
+ +		 * Find first corresponding VMA.
+ +		 */
+ +		if (!locked) {
+ +			locked = 1;
+ +			down_read(&mm->mmap_sem);
+ +			vma = find_vma(mm, nstart);
+ +		} else if (nstart >= vma->vm_end)
+ +			vma = vma->vm_next;
+ +		if (!vma || vma->vm_start >= end)
+ +			break;
+ +		/*
+ +		 * Set [nstart; nend) to intersection of desired address
+ +		 * range with the first VMA. Also, skip undesirable VMA types.
+ +		 */
+ +		nend = min(end, vma->vm_end);
+ +		if (vma->vm_flags & (VM_IO | VM_PFNMAP))
+ +			continue;
+ +		if (nstart < vma->vm_start)
+ +			nstart = vma->vm_start;
+ +		/*
+ +		 * Now fault in a range of pages. populate_vma_page_range()
+ +		 * double checks the vma flags, so that it won't mlock pages
+ +		 * if the vma was already munlocked.
+ +		 */
+ +		ret = populate_vma_page_range(vma, nstart, nend, &locked);
+ +		if (ret < 0) {
+ +			if (ignore_errors) {
+ +				ret = 0;
+ +				continue;	/* continue at next VMA */
+ +			}
+ +			break;
+ +		}
+ +		nend = nstart + ret * PAGE_SIZE;
+ +		ret = 0;
+ +	}
+ +	if (locked)
+ +		up_read(&mm->mmap_sem);
+ +	return ret;	/* 0 or negative error code */
+ +}
+ +
+ +SYSCALL_DEFINE2(mlock, unsigned long, start, size_t, len)
+++=======
++ static int do_mlock(unsigned long start, size_t len, vm_flags_t flags)
+++>>>>>>> 1aab92ec3de5 (mm: mlock: refactor mlock, munlock, and munlockall code)
+  {
+  	unsigned long locked;
+  	unsigned long lock_limit;
+* Unmerged path mm/mlock.c
