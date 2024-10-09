@@ -1,0 +1,301 @@
+svm: Manage vcpu load/unload when enable AVIC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 8221c13700561b36fb1bfda583888cbb43b572f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8221c137.failed
+
+When a vcpu is loaded/unloaded to a physical core, we need to update
+host physical APIC ID information in the Physical APIC-ID table
+accordingly.
+
+Also, when vCPU is blocking/un-blocking (due to halt instruction),
+we need to make sure that the is-running bit in set accordingly in the
+physical APIC-ID table.
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+[Return void from new functions, add WARN_ON when they returned negative
+ errno; split load and put into separate function as they have almost
+ nothing in common. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8221c13700561b36fb1bfda583888cbb43b572f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 6f2d74ac8a7d,7aeef57a093a..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -29,9 -32,10 +29,10 @@@
+  #include <linux/vmalloc.h>
+  #include <linux/highmem.h>
+  #include <linux/sched.h>
+ -#include <linux/trace_events.h>
+ +#include <linux/ftrace_event.h>
+  #include <linux/slab.h>
+  
++ #include <asm/apic.h>
+  #include <asm/perf_event.h>
+  #include <asm/tlbflush.h>
+  #include <asm/desc.h>
+@@@ -160,8 -180,21 +161,16 @@@ struct vcpu_svm 
+  
+  	/* cached guest cpuid flags for faster access */
+  	bool nrips_enabled	: 1;
+++<<<<<<< HEAD
+++=======
++ 
++ 	u32 ldr_reg;
++ 	struct page *avic_backing_page;
++ 	u64 *avic_physical_id_cache;
++ 	bool avic_is_running;
+++>>>>>>> 8221c1370056 (svm: Manage vcpu load/unload when enable AVIC)
+  };
+  
+ -#define AVIC_LOGICAL_ID_ENTRY_GUEST_PHYSICAL_ID_MASK	(0xFF)
+ -#define AVIC_LOGICAL_ID_ENTRY_VALID_MASK		(1 << 31)
+ -
+ -#define AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK	(0xFFULL)
+ -#define AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK	(0xFFFFFFFFFFULL << 12)
+ -#define AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK		(1ULL << 62)
+ -#define AVIC_PHYSICAL_ID_ENTRY_VALID_MASK		(1ULL << 63)
+ -
+  static DEFINE_PER_CPU(u64, current_tsc_ratio);
+  #define TSC_RATIO_DEFAULT	0x0100000000ULL
+  
+@@@ -1105,8 -1194,196 +1114,74 @@@ static void init_vmcb(struct vcpu_svm *
+  	mark_all_dirty(svm->vmcb);
+  
+  	enable_gif(svm);
+ -
+ -}
+ -
+ -static u64 *avic_get_physical_id_entry(struct kvm_vcpu *vcpu, int index)
+ -{
+ -	u64 *avic_physical_id_table;
+ -	struct kvm_arch *vm_data = &vcpu->kvm->arch;
+ -
+ -	if (index >= AVIC_MAX_PHYSICAL_ID_COUNT)
+ -		return NULL;
+ -
+ -	avic_physical_id_table = page_address(vm_data->avic_physical_id_table_page);
+ -
+ -	return &avic_physical_id_table[index];
+ -}
+ -
+ -/**
+ - * Note:
+ - * AVIC hardware walks the nested page table to check permissions,
+ - * but does not use the SPA address specified in the leaf page
+ - * table entry since it uses  address in the AVIC_BACKING_PAGE pointer
+ - * field of the VMCB. Therefore, we set up the
+ - * APIC_ACCESS_PAGE_PRIVATE_MEMSLOT (4KB) here.
+ - */
+ -static int avic_init_access_page(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm *kvm = vcpu->kvm;
+ -	int ret;
+ -
+ -	if (kvm->arch.apic_access_page_done)
+ -		return 0;
+ -
+ -	ret = x86_set_memory_region(kvm,
+ -				    APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
+ -				    APIC_DEFAULT_PHYS_BASE,
+ -				    PAGE_SIZE);
+ -	if (ret)
+ -		return ret;
+ -
+ -	kvm->arch.apic_access_page_done = true;
+ -	return 0;
+ -}
+ -
+ -static int avic_init_backing_page(struct kvm_vcpu *vcpu)
+ -{
+ -	int ret;
+ -	u64 *entry, new_entry;
+ -	int id = vcpu->vcpu_id;
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ -
+ -	ret = avic_init_access_page(vcpu);
+ -	if (ret)
+ -		return ret;
+ -
+ -	if (id >= AVIC_MAX_PHYSICAL_ID_COUNT)
+ -		return -EINVAL;
+ -
+ -	if (!svm->vcpu.arch.apic->regs)
+ -		return -EINVAL;
+ -
+ -	svm->avic_backing_page = virt_to_page(svm->vcpu.arch.apic->regs);
+ -
+ -	/* Setting AVIC backing page address in the phy APIC ID table */
+ -	entry = avic_get_physical_id_entry(vcpu, id);
+ -	if (!entry)
+ -		return -EINVAL;
+ -
+ -	new_entry = READ_ONCE(*entry);
+ -	new_entry = (page_to_phys(svm->avic_backing_page) &
+ -		     AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK) |
+ -		     AVIC_PHYSICAL_ID_ENTRY_VALID_MASK;
+ -	WRITE_ONCE(*entry, new_entry);
+ -
+ -	svm->avic_physical_id_cache = entry;
+ -
+ -	return 0;
+ -}
+ -
+ -static void avic_vm_destroy(struct kvm *kvm)
+ -{
+ -	struct kvm_arch *vm_data = &kvm->arch;
+ -
+ -	if (vm_data->avic_logical_id_table_page)
+ -		__free_page(vm_data->avic_logical_id_table_page);
+ -	if (vm_data->avic_physical_id_table_page)
+ -		__free_page(vm_data->avic_physical_id_table_page);
+ -}
+ -
+ -static int avic_vm_init(struct kvm *kvm)
+ -{
+ -	int err = -ENOMEM;
+ -	struct kvm_arch *vm_data = &kvm->arch;
+ -	struct page *p_page;
+ -	struct page *l_page;
+ -
+ -	if (!avic)
+ -		return 0;
+ -
+ -	/* Allocating physical APIC ID table (4KB) */
+ -	p_page = alloc_page(GFP_KERNEL);
+ -	if (!p_page)
+ -		goto free_avic;
+ -
+ -	vm_data->avic_physical_id_table_page = p_page;
+ -	clear_page(page_address(p_page));
+ -
+ -	/* Allocating logical APIC ID table (4KB) */
+ -	l_page = alloc_page(GFP_KERNEL);
+ -	if (!l_page)
+ -		goto free_avic;
+ -
+ -	vm_data->avic_logical_id_table_page = l_page;
+ -	clear_page(page_address(l_page));
+ -
+ -	return 0;
+ -
+ -free_avic:
+ -	avic_vm_destroy(kvm);
+ -	return err;
+  }
+  
++ /**
++  * This function is called during VCPU halt/unhalt.
++  */
++ static void avic_set_running(struct kvm_vcpu *vcpu, bool is_run)
++ {
++ 	u64 entry;
++ 	int h_physical_id = __default_cpu_present_to_apicid(vcpu->cpu);
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	if (!kvm_vcpu_apicv_active(vcpu))
++ 		return;
++ 
++ 	svm->avic_is_running = is_run;
++ 
++ 	/* ID = 0xff (broadcast), ID > 0xff (reserved) */
++ 	if (WARN_ON(h_physical_id >= AVIC_MAX_PHYSICAL_ID_COUNT))
++ 		return;
++ 
++ 	entry = READ_ONCE(*(svm->avic_physical_id_cache));
++ 	WARN_ON(is_run == !!(entry & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK));
++ 
++ 	entry &= ~AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
++ 	if (is_run)
++ 		entry |= AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
++ 	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
++ }
++ 
++ static void avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++ {
++ 	u64 entry;
++ 	/* ID = 0xff (broadcast), ID > 0xff (reserved) */
++ 	int h_physical_id = __default_cpu_present_to_apicid(cpu);
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	if (!kvm_vcpu_apicv_active(vcpu))
++ 		return;
++ 
++ 	if (WARN_ON(h_physical_id >= AVIC_MAX_PHYSICAL_ID_COUNT))
++ 		return;
++ 
++ 	entry = READ_ONCE(*(svm->avic_physical_id_cache));
++ 	WARN_ON(entry & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK);
++ 
++ 	entry &= ~AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK;
++ 	entry |= (h_physical_id & AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK);
++ 
++ 	entry &= ~AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
++ 	if (svm->avic_is_running)
++ 		entry |= AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
++ 
++ 	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
++ }
++ 
++ static void avic_vcpu_put(struct kvm_vcpu *vcpu)
++ {
++ 	u64 entry;
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	if (!kvm_vcpu_apicv_active(vcpu))
++ 		return;
++ 
++ 	entry = READ_ONCE(*(svm->avic_physical_id_cache));
++ 	entry &= ~AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
++ 	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
++ }
++ 
+  static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+@@@ -1161,6 -1441,17 +1236,20 @@@ static struct kvm_vcpu *svm_create_vcpu
+  	if (!hsave_page)
+  		goto free_page3;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (avic) {
++ 		err = avic_init_backing_page(&svm->vcpu);
++ 		if (err)
++ 			goto free_page4;
++ 	}
++ 
++ 	/* We initialize this flag to true to make sure that the is_running
++ 	 * bit would be set the first time the vcpu is loaded.
++ 	 */
++ 	svm->avic_is_running = true;
++ 
+++>>>>>>> 8221c1370056 (svm: Manage vcpu load/unload when enable AVIC)
+  	svm->nested.hsave = page_address(hsave_page);
+  
+  	svm->msrpm = page_address(msrpm_pages);
+@@@ -1232,6 -1525,11 +1321,14 @@@ static void svm_vcpu_load(struct kvm_vc
+  			wrmsrl(MSR_AMD64_TSC_RATIO, tsc_ratio);
+  		}
+  	}
+++<<<<<<< HEAD
+++=======
++ 	/* This assumes that the kernel never uses MSR_TSC_AUX */
++ 	if (static_cpu_has(X86_FEATURE_RDTSCP))
++ 		wrmsrl(MSR_TSC_AUX, svm->tsc_aux);
++ 
++ 	avic_vcpu_load(vcpu, cpu);
+++>>>>>>> 8221c1370056 (svm: Manage vcpu load/unload when enable AVIC)
+  }
+  
+  static void svm_vcpu_put(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/svm.c
