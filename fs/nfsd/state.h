@@ -568,8 +568,15 @@ enum nfsd4_cb_op {
 	NFSPROC4_CLNT_CB_RECALL,
 	NFSPROC4_CLNT_CB_LAYOUT,
 	NFSPROC4_CLNT_CB_SEQUENCE,
+	NFSPROC4_CLNT_CB_NOTIFY_LOCK,
 };
 
+
+struct nfsd4_blocked_lock {
+	struct file_lock	nbl_lock;
+	struct knfsd_fh		nbl_fh;
+	struct nfsd4_callback	nbl_cb;
+};
 
 struct nfsd4_compound_state;
 struct nfsd_net;
