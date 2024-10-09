@@ -1,0 +1,785 @@
+qed: Utilize resource-lock based scheme
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tomer Tayar <Tomer.Tayar@cavium.com>
+commit 9c8517c40f6873d5fcdfa0eafdf28c5a921d600b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9c8517c4.failed
+
+Management firmware is used as an arbiter between the various PFs
+in matters of resources, but some of the resources that need to
+be divided are dependent on the non-management firmware used,
+so management firmware first needs to be told how many resources
+there are before trying to divide them.
+
+As part of the initialization sequence, driver would first inform
+the management firmware of the available resources under
+a dedicated resource lock, and afterwards request for various
+resources which might be based on the previous set values.
+
+	Signed-off-by: Tomer Tayar <Tomer.Tayar@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9c8517c40f6873d5fcdfa0eafdf28c5a921d600b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_mcp.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index ab5be3bfbe79,619eac845028..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@@ -1721,35 -2279,87 +1773,112 @@@ static enum resource_id_enum qed_mcp_ge
+  	  DRV_MB_PARAM_RESOURCE_ALLOC_VERSION_MAJOR_SHIFT) | \
+  	 (QED_RESC_ALLOC_VERSION_MINOR <<		     \
+  	  DRV_MB_PARAM_RESOURCE_ALLOC_VERSION_MINOR_SHIFT))
+- int qed_mcp_get_resc_info(struct qed_hwfn *p_hwfn,
+- 			  struct qed_ptt *p_ptt,
+- 			  struct resource_info *p_resc_info,
+- 			  u32 *p_mcp_resp, u32 *p_mcp_param)
++ 
++ struct qed_resc_alloc_in_params {
++ 	u32 cmd;
++ 	enum qed_resources res_id;
++ 	u32 resc_max_val;
++ };
++ 
++ struct qed_resc_alloc_out_params {
++ 	u32 mcp_resp;
++ 	u32 mcp_param;
++ 	u32 resc_num;
++ 	u32 resc_start;
++ 	u32 vf_resc_num;
++ 	u32 vf_resc_start;
++ 	u32 flags;
++ };
++ 
++ static int
++ qed_mcp_resc_allocation_msg(struct qed_hwfn *p_hwfn,
++ 			    struct qed_ptt *p_ptt,
++ 			    struct qed_resc_alloc_in_params *p_in_params,
++ 			    struct qed_resc_alloc_out_params *p_out_params)
+  {
+  	struct qed_mcp_mb_params mb_params;
+++<<<<<<< HEAD
+ +	union drv_union_data union_data;
+ +	int rc;
+ +
+ +	memset(&mb_params, 0, sizeof(mb_params));
+ +	memset(&union_data, 0, sizeof(union_data));
+ +	mb_params.cmd = DRV_MSG_GET_RESOURCE_ALLOC_MSG;
+ +	mb_params.param = QED_RESC_ALLOC_VERSION;
+ +
+ +	/* Need to have a sufficient large struct, as the cmd_and_union
+ +	 * is going to do memcpy from and to it.
+ +	 */
+ +	memcpy(&union_data.resource, p_resc_info, sizeof(*p_resc_info));
+ +
+ +	mb_params.p_data_src = &union_data;
+ +	mb_params.p_data_dst = &union_data;
+++=======
++ 	struct resource_info mfw_resc_info;
++ 	int rc;
++ 
++ 	memset(&mfw_resc_info, 0, sizeof(mfw_resc_info));
++ 
++ 	mfw_resc_info.res_id = qed_mcp_get_mfw_res_id(p_in_params->res_id);
++ 	if (mfw_resc_info.res_id == RESOURCE_NUM_INVALID) {
++ 		DP_ERR(p_hwfn,
++ 		       "Failed to match resource %d [%s] with the MFW resources\n",
++ 		       p_in_params->res_id,
++ 		       qed_hw_get_resc_name(p_in_params->res_id));
++ 		return -EINVAL;
++ 	}
++ 
++ 	switch (p_in_params->cmd) {
++ 	case DRV_MSG_SET_RESOURCE_VALUE_MSG:
++ 		mfw_resc_info.size = p_in_params->resc_max_val;
++ 		/* Fallthrough */
++ 	case DRV_MSG_GET_RESOURCE_ALLOC_MSG:
++ 		break;
++ 	default:
++ 		DP_ERR(p_hwfn, "Unexpected resource alloc command [0x%08x]\n",
++ 		       p_in_params->cmd);
++ 		return -EINVAL;
++ 	}
++ 
++ 	memset(&mb_params, 0, sizeof(mb_params));
++ 	mb_params.cmd = p_in_params->cmd;
++ 	mb_params.param = QED_RESC_ALLOC_VERSION;
++ 	mb_params.p_data_src = &mfw_resc_info;
++ 	mb_params.data_src_size = sizeof(mfw_resc_info);
++ 	mb_params.p_data_dst = mb_params.p_data_src;
++ 	mb_params.data_dst_size = mb_params.data_src_size;
++ 
++ 	DP_VERBOSE(p_hwfn,
++ 		   QED_MSG_SP,
++ 		   "Resource message request: cmd 0x%08x, res_id %d [%s], hsi_version %d.%d, val 0x%x\n",
++ 		   p_in_params->cmd,
++ 		   p_in_params->res_id,
++ 		   qed_hw_get_resc_name(p_in_params->res_id),
++ 		   QED_MFW_GET_FIELD(mb_params.param,
++ 				     DRV_MB_PARAM_RESOURCE_ALLOC_VERSION_MAJOR),
++ 		   QED_MFW_GET_FIELD(mb_params.param,
++ 				     DRV_MB_PARAM_RESOURCE_ALLOC_VERSION_MINOR),
++ 		   p_in_params->resc_max_val);
++ 
+++>>>>>>> 9c8517c40f68 (qed: Utilize resource-lock based scheme)
+  	rc = qed_mcp_cmd_and_union(p_hwfn, p_ptt, &mb_params);
+  	if (rc)
+  		return rc;
+  
+++<<<<<<< HEAD
+ +	/* Copy the data back */
+ +	memcpy(p_resc_info, &union_data.resource, sizeof(*p_resc_info));
+ +	*p_mcp_resp = mb_params.mcp_resp;
+ +	*p_mcp_param = mb_params.mcp_param;
+++=======
++ 	p_out_params->mcp_resp = mb_params.mcp_resp;
++ 	p_out_params->mcp_param = mb_params.mcp_param;
++ 	p_out_params->resc_num = mfw_resc_info.size;
++ 	p_out_params->resc_start = mfw_resc_info.offset;
++ 	p_out_params->vf_resc_num = mfw_resc_info.vf_size;
++ 	p_out_params->vf_resc_start = mfw_resc_info.vf_offset;
++ 	p_out_params->flags = mfw_resc_info.flags;
+++>>>>>>> 9c8517c40f68 (qed: Utilize resource-lock based scheme)
+  
+  	DP_VERBOSE(p_hwfn,
+  		   QED_MSG_SP,
+diff --git a/drivers/net/ethernet/qlogic/qed/qed.h b/drivers/net/ethernet/qlogic/qed/qed.h
+index 079b98ee34fc..6d33875b5ba6 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -198,6 +198,7 @@ enum qed_resources {
+ 	QED_LL2_QUEUE,
+ 	QED_CMDQS_CQS,
+ 	QED_RDMA_STATS_QUEUE,
++	QED_BDQ,
+ 	QED_MAX_RESC,
+ };
+ 
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev.c b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 251d96f68dd4..78c278a5deb0 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -1590,187 +1590,222 @@ static void qed_hw_set_feat(struct qed_hwfn *p_hwfn)
+ 		   RESC_NUM(p_hwfn, QED_SB));
+ }
+ 
+-static enum resource_id_enum qed_hw_get_mfw_res_id(enum qed_resources res_id)
++const char *qed_hw_get_resc_name(enum qed_resources res_id)
+ {
+-	enum resource_id_enum mfw_res_id = RESOURCE_NUM_INVALID;
+-
+ 	switch (res_id) {
+-	case QED_SB:
+-		mfw_res_id = RESOURCE_NUM_SB_E;
+-		break;
+ 	case QED_L2_QUEUE:
+-		mfw_res_id = RESOURCE_NUM_L2_QUEUE_E;
+-		break;
++		return "L2_QUEUE";
+ 	case QED_VPORT:
+-		mfw_res_id = RESOURCE_NUM_VPORT_E;
+-		break;
++		return "VPORT";
+ 	case QED_RSS_ENG:
+-		mfw_res_id = RESOURCE_NUM_RSS_ENGINES_E;
+-		break;
++		return "RSS_ENG";
+ 	case QED_PQ:
+-		mfw_res_id = RESOURCE_NUM_PQ_E;
+-		break;
++		return "PQ";
+ 	case QED_RL:
+-		mfw_res_id = RESOURCE_NUM_RL_E;
+-		break;
++		return "RL";
+ 	case QED_MAC:
++		return "MAC";
+ 	case QED_VLAN:
+-		/* Each VFC resource can accommodate both a MAC and a VLAN */
+-		mfw_res_id = RESOURCE_VFC_FILTER_E;
+-		break;
++		return "VLAN";
++	case QED_RDMA_CNQ_RAM:
++		return "RDMA_CNQ_RAM";
+ 	case QED_ILT:
+-		mfw_res_id = RESOURCE_ILT_E;
+-		break;
++		return "ILT";
+ 	case QED_LL2_QUEUE:
+-		mfw_res_id = RESOURCE_LL2_QUEUE_E;
+-		break;
+-	case QED_RDMA_CNQ_RAM:
++		return "LL2_QUEUE";
+ 	case QED_CMDQS_CQS:
+-		/* CNQ/CMDQS are the same resource */
+-		mfw_res_id = RESOURCE_CQS_E;
+-		break;
++		return "CMDQS_CQS";
+ 	case QED_RDMA_STATS_QUEUE:
+-		mfw_res_id = RESOURCE_RDMA_STATS_QUEUE_E;
+-		break;
++		return "RDMA_STATS_QUEUE";
++	case QED_BDQ:
++		return "BDQ";
++	case QED_SB:
++		return "SB";
+ 	default:
+-		break;
++		return "UNKNOWN_RESOURCE";
++	}
++}
++
++static int
++__qed_hw_set_soft_resc_size(struct qed_hwfn *p_hwfn,
++			    struct qed_ptt *p_ptt,
++			    enum qed_resources res_id,
++			    u32 resc_max_val, u32 *p_mcp_resp)
++{
++	int rc;
++
++	rc = qed_mcp_set_resc_max_val(p_hwfn, p_ptt, res_id,
++				      resc_max_val, p_mcp_resp);
++	if (rc) {
++		DP_NOTICE(p_hwfn,
++			  "MFW response failure for a max value setting of resource %d [%s]\n",
++			  res_id, qed_hw_get_resc_name(res_id));
++		return rc;
+ 	}
+ 
+-	return mfw_res_id;
++	if (*p_mcp_resp != FW_MSG_CODE_RESOURCE_ALLOC_OK)
++		DP_INFO(p_hwfn,
++			"Failed to set the max value of resource %d [%s]. mcp_resp = 0x%08x.\n",
++			res_id, qed_hw_get_resc_name(res_id), *p_mcp_resp);
++
++	return 0;
+ }
+ 
+-static u32 qed_hw_get_dflt_resc_num(struct qed_hwfn *p_hwfn,
+-				    enum qed_resources res_id)
++static int
++qed_hw_set_soft_resc_size(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	bool b_ah = QED_IS_AH(p_hwfn->cdev);
++	u32 resc_max_val, mcp_resp;
++	u8 res_id;
++	int rc;
++
++	for (res_id = 0; res_id < QED_MAX_RESC; res_id++) {
++		switch (res_id) {
++		case QED_LL2_QUEUE:
++			resc_max_val = MAX_NUM_LL2_RX_QUEUES;
++			break;
++		case QED_RDMA_CNQ_RAM:
++			/* No need for a case for QED_CMDQS_CQS since
++			 * CNQ/CMDQS are the same resource.
++			 */
++			resc_max_val = NUM_OF_CMDQS_CQS;
++			break;
++		case QED_RDMA_STATS_QUEUE:
++			resc_max_val = b_ah ? RDMA_NUM_STATISTIC_COUNTERS_K2
++			    : RDMA_NUM_STATISTIC_COUNTERS_BB;
++			break;
++		case QED_BDQ:
++			resc_max_val = BDQ_NUM_RESOURCES;
++			break;
++		default:
++			continue;
++		}
++
++		rc = __qed_hw_set_soft_resc_size(p_hwfn, p_ptt, res_id,
++						 resc_max_val, &mcp_resp);
++		if (rc)
++			return rc;
++
++		/* There's no point to continue to the next resource if the
++		 * command is not supported by the MFW.
++		 * We do continue if the command is supported but the resource
++		 * is unknown to the MFW. Such a resource will be later
++		 * configured with the default allocation values.
++		 */
++		if (mcp_resp == FW_MSG_CODE_UNSUPPORTED)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++static
++int qed_hw_get_dflt_resc(struct qed_hwfn *p_hwfn,
++			 enum qed_resources res_id,
++			 u32 *p_resc_num, u32 *p_resc_start)
+ {
+ 	u8 num_funcs = p_hwfn->num_funcs_on_engine;
+ 	bool b_ah = QED_IS_AH(p_hwfn->cdev);
+ 	struct qed_sb_cnt_info sb_cnt_info;
+-	u32 dflt_resc_num = 0;
+ 
+ 	switch (res_id) {
+-	case QED_SB:
+-		memset(&sb_cnt_info, 0, sizeof(sb_cnt_info));
+-		qed_int_get_num_sbs(p_hwfn, &sb_cnt_info);
+-		dflt_resc_num = sb_cnt_info.sb_cnt;
+-		break;
+ 	case QED_L2_QUEUE:
+-		dflt_resc_num = (b_ah ? MAX_NUM_L2_QUEUES_K2
+-				      : MAX_NUM_L2_QUEUES_BB) / num_funcs;
++		*p_resc_num = (b_ah ? MAX_NUM_L2_QUEUES_K2 :
++			       MAX_NUM_L2_QUEUES_BB) / num_funcs;
+ 		break;
+ 	case QED_VPORT:
+-		dflt_resc_num = MAX_NUM_VPORTS_BB / num_funcs;
+-		dflt_resc_num = (b_ah ? MAX_NUM_VPORTS_K2
+-				      : MAX_NUM_VPORTS_BB) / num_funcs;
++		*p_resc_num = (b_ah ? MAX_NUM_VPORTS_K2 :
++			       MAX_NUM_VPORTS_BB) / num_funcs;
+ 		break;
+ 	case QED_RSS_ENG:
+-		dflt_resc_num = (b_ah ? ETH_RSS_ENGINE_NUM_K2
+-				      : ETH_RSS_ENGINE_NUM_BB) / num_funcs;
++		*p_resc_num = (b_ah ? ETH_RSS_ENGINE_NUM_K2 :
++			       ETH_RSS_ENGINE_NUM_BB) / num_funcs;
+ 		break;
+ 	case QED_PQ:
+-		/* The granularity of the PQs is 8 */
+-		dflt_resc_num = (b_ah ? MAX_QM_TX_QUEUES_K2
+-				      : MAX_QM_TX_QUEUES_BB) / num_funcs;
+-		dflt_resc_num &= ~0x7;
++		*p_resc_num = (b_ah ? MAX_QM_TX_QUEUES_K2 :
++			       MAX_QM_TX_QUEUES_BB) / num_funcs;
++		*p_resc_num &= ~0x7;	/* The granularity of the PQs is 8 */
+ 		break;
+ 	case QED_RL:
+-		dflt_resc_num = MAX_QM_GLOBAL_RLS / num_funcs;
++		*p_resc_num = MAX_QM_GLOBAL_RLS / num_funcs;
+ 		break;
+ 	case QED_MAC:
+ 	case QED_VLAN:
+ 		/* Each VFC resource can accommodate both a MAC and a VLAN */
+-		dflt_resc_num = ETH_NUM_MAC_FILTERS / num_funcs;
++		*p_resc_num = ETH_NUM_MAC_FILTERS / num_funcs;
+ 		break;
+ 	case QED_ILT:
+-		dflt_resc_num = (b_ah ? PXP_NUM_ILT_RECORDS_K2
+-				      : PXP_NUM_ILT_RECORDS_BB) / num_funcs;
++		*p_resc_num = (b_ah ? PXP_NUM_ILT_RECORDS_K2 :
++			       PXP_NUM_ILT_RECORDS_BB) / num_funcs;
+ 		break;
+ 	case QED_LL2_QUEUE:
+-		dflt_resc_num = MAX_NUM_LL2_RX_QUEUES / num_funcs;
++		*p_resc_num = MAX_NUM_LL2_RX_QUEUES / num_funcs;
+ 		break;
+ 	case QED_RDMA_CNQ_RAM:
+ 	case QED_CMDQS_CQS:
+ 		/* CNQ/CMDQS are the same resource */
+-		dflt_resc_num = NUM_OF_CMDQS_CQS / num_funcs;
++		*p_resc_num = NUM_OF_CMDQS_CQS / num_funcs;
+ 		break;
+ 	case QED_RDMA_STATS_QUEUE:
+-		dflt_resc_num = (b_ah ? RDMA_NUM_STATISTIC_COUNTERS_K2
+-				      : RDMA_NUM_STATISTIC_COUNTERS_BB) /
+-				num_funcs;
+-
++		*p_resc_num = (b_ah ? RDMA_NUM_STATISTIC_COUNTERS_K2 :
++			       RDMA_NUM_STATISTIC_COUNTERS_BB) / num_funcs;
+ 		break;
+-	default:
++	case QED_BDQ:
++		if (p_hwfn->hw_info.personality != QED_PCI_ISCSI &&
++		    p_hwfn->hw_info.personality != QED_PCI_FCOE)
++			*p_resc_num = 0;
++		else
++			*p_resc_num = 1;
+ 		break;
++	case QED_SB:
++		memset(&sb_cnt_info, 0, sizeof(sb_cnt_info));
++		qed_int_get_num_sbs(p_hwfn, &sb_cnt_info);
++		*p_resc_num = sb_cnt_info.sb_cnt;
++		break;
++	default:
++		return -EINVAL;
+ 	}
+ 
+-	return dflt_resc_num;
+-}
+-
+-static const char *qed_hw_get_resc_name(enum qed_resources res_id)
+-{
+ 	switch (res_id) {
+-	case QED_SB:
+-		return "SB";
+-	case QED_L2_QUEUE:
+-		return "L2_QUEUE";
+-	case QED_VPORT:
+-		return "VPORT";
+-	case QED_RSS_ENG:
+-		return "RSS_ENG";
+-	case QED_PQ:
+-		return "PQ";
+-	case QED_RL:
+-		return "RL";
+-	case QED_MAC:
+-		return "MAC";
+-	case QED_VLAN:
+-		return "VLAN";
+-	case QED_RDMA_CNQ_RAM:
+-		return "RDMA_CNQ_RAM";
+-	case QED_ILT:
+-		return "ILT";
+-	case QED_LL2_QUEUE:
+-		return "LL2_QUEUE";
+-	case QED_CMDQS_CQS:
+-		return "CMDQS_CQS";
+-	case QED_RDMA_STATS_QUEUE:
+-		return "RDMA_STATS_QUEUE";
++	case QED_BDQ:
++		if (!*p_resc_num)
++			*p_resc_start = 0;
++		else if (p_hwfn->cdev->num_ports_in_engines == 4)
++			*p_resc_start = p_hwfn->port_id;
++		else if (p_hwfn->hw_info.personality == QED_PCI_ISCSI)
++			*p_resc_start = p_hwfn->port_id;
++		else if (p_hwfn->hw_info.personality == QED_PCI_FCOE)
++			*p_resc_start = p_hwfn->port_id + 2;
++		break;
+ 	default:
+-		return "UNKNOWN_RESOURCE";
++		*p_resc_start = *p_resc_num * p_hwfn->enabled_func_idx;
++		break;
+ 	}
++
++	return 0;
+ }
+ 
+-static int qed_hw_set_resc_info(struct qed_hwfn *p_hwfn,
+-				enum qed_resources res_id)
++static int __qed_hw_set_resc_info(struct qed_hwfn *p_hwfn,
++				  enum qed_resources res_id)
+ {
+-	u32 dflt_resc_num = 0, dflt_resc_start = 0, mcp_resp, mcp_param;
+-	u32 *p_resc_num, *p_resc_start;
+-	struct resource_info resc_info;
++	u32 dflt_resc_num = 0, dflt_resc_start = 0;
++	u32 mcp_resp, *p_resc_num, *p_resc_start;
+ 	int rc;
+ 
+ 	p_resc_num = &RESC_NUM(p_hwfn, res_id);
+ 	p_resc_start = &RESC_START(p_hwfn, res_id);
+ 
+-	/* Default values assumes that each function received equal share */
+-	dflt_resc_num = qed_hw_get_dflt_resc_num(p_hwfn, res_id);
+-	if (!dflt_resc_num) {
++	rc = qed_hw_get_dflt_resc(p_hwfn, res_id, &dflt_resc_num,
++				  &dflt_resc_start);
++	if (rc) {
+ 		DP_ERR(p_hwfn,
+ 		       "Failed to get default amount for resource %d [%s]\n",
+ 		       res_id, qed_hw_get_resc_name(res_id));
+-		return -EINVAL;
+-	}
+-	dflt_resc_start = dflt_resc_num * p_hwfn->enabled_func_idx;
+-
+-	memset(&resc_info, 0, sizeof(resc_info));
+-	resc_info.res_id = qed_hw_get_mfw_res_id(res_id);
+-	if (resc_info.res_id == RESOURCE_NUM_INVALID) {
+-		DP_ERR(p_hwfn,
+-		       "Failed to match resource %d [%s] with the MFW resources\n",
+-		       res_id, qed_hw_get_resc_name(res_id));
+-		return -EINVAL;
++		return rc;
+ 	}
+ 
+-	rc = qed_mcp_get_resc_info(p_hwfn, p_hwfn->p_main_ptt, &resc_info,
+-				   &mcp_resp, &mcp_param);
++	rc = qed_mcp_get_resc_info(p_hwfn, p_hwfn->p_main_ptt, res_id,
++				   &mcp_resp, p_resc_num, p_resc_start);
+ 	if (rc) {
+ 		DP_NOTICE(p_hwfn,
+ 			  "MFW response failure for an allocation request for resource %d [%s]\n",
+@@ -1783,13 +1818,12 @@ static int qed_hw_set_resc_info(struct qed_hwfn *p_hwfn,
+ 	 * - There is an internal error in the MFW while processing the request
+ 	 * - The resource ID is unknown to the MFW
+ 	 */
+-	if (mcp_resp != FW_MSG_CODE_RESOURCE_ALLOC_OK &&
+-	    mcp_resp != FW_MSG_CODE_RESOURCE_ALLOC_DEPRECATED) {
+-		DP_NOTICE(p_hwfn,
+-			  "Resource %d [%s]: No allocation info was received [mcp_resp 0x%x]. Applying default values [num %d, start %d].\n",
+-			  res_id,
+-			  qed_hw_get_resc_name(res_id),
+-			  mcp_resp, dflt_resc_num, dflt_resc_start);
++	if (mcp_resp != FW_MSG_CODE_RESOURCE_ALLOC_OK) {
++		DP_INFO(p_hwfn,
++			"Failed to receive allocation info for resource %d [%s]. mcp_resp = 0x%x. Applying default values [%d,%d].\n",
++			res_id,
++			qed_hw_get_resc_name(res_id),
++			mcp_resp, dflt_resc_num, dflt_resc_start);
+ 		*p_resc_num = dflt_resc_num;
+ 		*p_resc_start = dflt_resc_start;
+ 		goto out;
+@@ -1797,13 +1831,9 @@ static int qed_hw_set_resc_info(struct qed_hwfn *p_hwfn,
+ 
+ 	/* Special handling for status blocks; Would be revised in future */
+ 	if (res_id == QED_SB) {
+-		resc_info.size -= 1;
+-		resc_info.offset -= p_hwfn->enabled_func_idx;
++		*p_resc_num -= 1;
++		*p_resc_start -= p_hwfn->enabled_func_idx;
+ 	}
+-
+-	*p_resc_num = resc_info.size;
+-	*p_resc_start = resc_info.offset;
+-
+ out:
+ 	/* PQs have to divide by 8 [that's the HW granularity].
+ 	 * Reduce number so it would fit.
+@@ -1821,18 +1851,85 @@ out:
+ 	return 0;
+ }
+ 
+-static int qed_hw_get_resc(struct qed_hwfn *p_hwfn)
++static int qed_hw_set_resc_info(struct qed_hwfn *p_hwfn)
+ {
+-	bool b_ah = QED_IS_AH(p_hwfn->cdev);
+-	u8 res_id;
+ 	int rc;
++	u8 res_id;
+ 
+ 	for (res_id = 0; res_id < QED_MAX_RESC; res_id++) {
+-		rc = qed_hw_set_resc_info(p_hwfn, res_id);
++		rc = __qed_hw_set_resc_info(p_hwfn, res_id);
+ 		if (rc)
+ 			return rc;
+ 	}
+ 
++	return 0;
++}
++
++#define QED_RESC_ALLOC_LOCK_RETRY_CNT           10
++#define QED_RESC_ALLOC_LOCK_RETRY_INTVL_US      10000	/* 10 msec */
++
++static int qed_hw_get_resc(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	struct qed_resc_unlock_params resc_unlock_params;
++	struct qed_resc_lock_params resc_lock_params;
++	bool b_ah = QED_IS_AH(p_hwfn->cdev);
++	u8 res_id;
++	int rc;
++
++	/* Setting the max values of the soft resources and the following
++	 * resources allocation queries should be atomic. Since several PFs can
++	 * run in parallel - a resource lock is needed.
++	 * If either the resource lock or resource set value commands are not
++	 * supported - skip the the max values setting, release the lock if
++	 * needed, and proceed to the queries. Other failures, including a
++	 * failure to acquire the lock, will cause this function to fail.
++	 */
++	memset(&resc_lock_params, 0, sizeof(resc_lock_params));
++	resc_lock_params.resource = QED_RESC_LOCK_RESC_ALLOC;
++	resc_lock_params.retry_num = QED_RESC_ALLOC_LOCK_RETRY_CNT;
++	resc_lock_params.retry_interval = QED_RESC_ALLOC_LOCK_RETRY_INTVL_US;
++	resc_lock_params.sleep_b4_retry = true;
++	memset(&resc_unlock_params, 0, sizeof(resc_unlock_params));
++	resc_unlock_params.resource = QED_RESC_LOCK_RESC_ALLOC;
++
++	rc = qed_mcp_resc_lock(p_hwfn, p_ptt, &resc_lock_params);
++	if (rc && rc != -EINVAL) {
++		return rc;
++	} else if (rc == -EINVAL) {
++		DP_INFO(p_hwfn,
++			"Skip the max values setting of the soft resources since the resource lock is not supported by the MFW\n");
++	} else if (!rc && !resc_lock_params.b_granted) {
++		DP_NOTICE(p_hwfn,
++			  "Failed to acquire the resource lock for the resource allocation commands\n");
++		return -EBUSY;
++	} else {
++		rc = qed_hw_set_soft_resc_size(p_hwfn, p_ptt);
++		if (rc && rc != -EINVAL) {
++			DP_NOTICE(p_hwfn,
++				  "Failed to set the max values of the soft resources\n");
++			goto unlock_and_exit;
++		} else if (rc == -EINVAL) {
++			DP_INFO(p_hwfn,
++				"Skip the max values setting of the soft resources since it is not supported by the MFW\n");
++			rc = qed_mcp_resc_unlock(p_hwfn, p_ptt,
++						 &resc_unlock_params);
++			if (rc)
++				DP_INFO(p_hwfn,
++					"Failed to release the resource lock for the resource allocation commands\n");
++		}
++	}
++
++	rc = qed_hw_set_resc_info(p_hwfn);
++	if (rc)
++		goto unlock_and_exit;
++
++	if (resc_lock_params.b_granted && !resc_unlock_params.b_released) {
++		rc = qed_mcp_resc_unlock(p_hwfn, p_ptt, &resc_unlock_params);
++		if (rc)
++			DP_INFO(p_hwfn,
++				"Failed to release the resource lock for the resource allocation commands\n");
++	}
++
+ 	/* Sanity for ILT */
+ 	if ((b_ah && (RESC_END(p_hwfn, QED_ILT) > PXP_NUM_ILT_RECORDS_K2)) ||
+ 	    (!b_ah && (RESC_END(p_hwfn, QED_ILT) > PXP_NUM_ILT_RECORDS_BB))) {
+@@ -1844,8 +1941,6 @@ static int qed_hw_get_resc(struct qed_hwfn *p_hwfn)
+ 
+ 	qed_hw_set_feat(p_hwfn);
+ 
+-	DP_VERBOSE(p_hwfn, NETIF_MSG_PROBE,
+-		   "The numbers for each resource are:\n");
+ 	for (res_id = 0; res_id < QED_MAX_RESC; res_id++)
+ 		DP_VERBOSE(p_hwfn, NETIF_MSG_PROBE, "%s = %d start = %d\n",
+ 			   qed_hw_get_resc_name(res_id),
+@@ -1853,6 +1948,11 @@ static int qed_hw_get_resc(struct qed_hwfn *p_hwfn)
+ 			   RESC_START(p_hwfn, res_id));
+ 
+ 	return 0;
++
++unlock_and_exit:
++	if (resc_lock_params.b_granted && !resc_unlock_params.b_released)
++		qed_mcp_resc_unlock(p_hwfn, p_ptt, &resc_unlock_params);
++	return rc;
+ }
+ 
+ static int qed_hw_get_nvm_info(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+@@ -2183,7 +2283,7 @@ qed_get_hw_info(struct qed_hwfn *p_hwfn,
+ 	if (qed_mcp_is_init(p_hwfn))
+ 		p_hwfn->hw_info.mtu = p_hwfn->mcp_info->func_info.mtu;
+ 
+-	return qed_hw_get_resc(p_hwfn);
++	return qed_hw_get_resc(p_hwfn, p_ptt);
+ }
+ 
+ static int qed_get_dev_info(struct qed_dev *cdev)
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+index 8799d96fd924..0bf4975bb33d 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+@@ -446,4 +446,6 @@ int qed_set_rxq_coalesce(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
+  */
+ int qed_set_txq_coalesce(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt,
+ 			 u16 coalesce, u8 qid, u16 sb_id);
++
++const char *qed_hw_get_resc_name(enum qed_resources res_id);
+ #endif
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_hsi.h b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+index 0a55b034a058..cf6a24e66c47 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@ -9984,6 +9984,7 @@ enum resource_id_enum {
+ 	RESOURCE_NUM_RSS_ENGINES_E = 14,
+ 	RESOURCE_LL2_QUEUE_E = 15,
+ 	RESOURCE_RDMA_STATS_QUEUE_E = 16,
++	RESOURCE_BDQ_E = 17,
+ 	RESOURCE_MAX_NUM,
+ 	RESOURCE_NUM_INVALID = 0xFFFFFFFF
+ };
+@@ -10044,12 +10045,13 @@ struct public_drv_mb {
+ #define DRV_MSG_CODE_OV_UPDATE_DRIVER_STATE     0x31000000
+ #define DRV_MSG_CODE_BW_UPDATE_ACK              0x32000000
+ #define DRV_MSG_CODE_OV_UPDATE_MTU              0x33000000
++#define DRV_MSG_GET_RESOURCE_ALLOC_MSG		0x34000000
++#define DRV_MSG_SET_RESOURCE_VALUE_MSG		0x35000000
+ #define DRV_MSG_CODE_OV_UPDATE_WOL              0x38000000
+ #define DRV_MSG_CODE_OV_UPDATE_ESWITCH_MODE     0x39000000
+ 
+ #define DRV_MSG_CODE_BW_UPDATE_ACK		0x32000000
+ #define DRV_MSG_CODE_NIG_DRAIN			0x30000000
+-#define DRV_MSG_GET_RESOURCE_ALLOC_MSG          0x34000000
+ #define DRV_MSG_CODE_INITIATE_PF_FLR            0x02010000
+ #define DRV_MSG_CODE_VF_DISABLED_DONE		0xc0000000
+ #define DRV_MSG_CODE_CFG_VF_MSIX		0xc0010000
+@@ -10217,6 +10219,10 @@ struct public_drv_mb {
+ #define FW_MSG_SEQ_NUMBER_MASK			0x0000ffff
+ 
+ 	u32 fw_mb_param;
++#define FW_MB_PARAM_RESOURCE_ALLOC_VERSION_MAJOR_MASK	0xFFFF0000
++#define FW_MB_PARAM_RESOURCE_ALLOC_VERSION_MAJOR_SHIFT	16
++#define FW_MB_PARAM_RESOURCE_ALLOC_VERSION_MINOR_MASK	0x0000FFFF
++#define FW_MB_PARAM_RESOURCE_ALLOC_VERSION_MINOR_SHIFT	0
+ 
+ 	/* get pf rdma protocol command responce */
+ #define FW_MB_PARAM_GET_PF_RDMA_NONE		0x0
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_mcp.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.h b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+index 18c783a25451..37c0670e1894 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -701,33 +701,60 @@ int qed_mcp_mask_parities(struct qed_hwfn *p_hwfn,
+ 			  struct qed_ptt *p_ptt, u32 mask_parities);
+ 
+ /**
+- * @brief Send eswitch mode to MFW
++ * @brief - Sets the MFW's max value for the given resource
+  *
+  *  @param p_hwfn
+  *  @param p_ptt
+- *  @param eswitch - eswitch mode
++ *  @param res_id
++ *  @param resc_max_val
++ *  @param p_mcp_resp
+  *
+  * @return int - 0 - operation was successful.
+  */
+-int qed_mcp_ov_update_eswitch(struct qed_hwfn *p_hwfn,
+-			      struct qed_ptt *p_ptt,
+-			      enum qed_ov_eswitch eswitch);
++int
++qed_mcp_set_resc_max_val(struct qed_hwfn *p_hwfn,
++			 struct qed_ptt *p_ptt,
++			 enum qed_resources res_id,
++			 u32 resc_max_val, u32 *p_mcp_resp);
+ 
+ /**
+  * @brief - Gets the MFW allocation info for the given resource
+  *
+  *  @param p_hwfn
+  *  @param p_ptt
+- *  @param p_resc_info - descriptor of requested resource
++ *  @param res_id
+  *  @param p_mcp_resp
+- *  @param p_mcp_param
++ *  @param p_resc_num
++ *  @param p_resc_start
+  *
+  * @return int - 0 - operation was successful.
+  */
+-int qed_mcp_get_resc_info(struct qed_hwfn *p_hwfn,
+-			  struct qed_ptt *p_ptt,
+-			  struct resource_info *p_resc_info,
+-			  u32 *p_mcp_resp, u32 *p_mcp_param);
++int
++qed_mcp_get_resc_info(struct qed_hwfn *p_hwfn,
++		      struct qed_ptt *p_ptt,
++		      enum qed_resources res_id,
++		      u32 *p_mcp_resp, u32 *p_resc_num, u32 *p_resc_start);
++
++/**
++ * @brief Send eswitch mode to MFW
++ *
++ *  @param p_hwfn
++ *  @param p_ptt
++ *  @param eswitch - eswitch mode
++ *
++ * @return int - 0 - operation was successful.
++ */
++int qed_mcp_ov_update_eswitch(struct qed_hwfn *p_hwfn,
++			      struct qed_ptt *p_ptt,
++			      enum qed_ov_eswitch eswitch);
++
++#define QED_MCP_RESC_LOCK_MIN_VAL       RESOURCE_DUMP
++#define QED_MCP_RESC_LOCK_MAX_VAL       31
++
++enum qed_resc_lock {
++	QED_RESC_LOCK_DBG_DUMP = QED_MCP_RESC_LOCK_MIN_VAL,
++	QED_RESC_LOCK_RESC_ALLOC = QED_MCP_RESC_LOCK_MAX_VAL
++};
+ 
+ /**
+  * @brief - Initiates PF FLR
