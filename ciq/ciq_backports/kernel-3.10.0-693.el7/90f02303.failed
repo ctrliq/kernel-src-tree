@@ -1,0 +1,254 @@
+kmod: use system_unbound_wq instead of khelper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit 90f023030e26ce8f981b3e688cb79329d8d07cc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/90f02303.failed
+
+We need to launch the usermodehelper kernel threads with the widest
+affinity and this is partly why we use khelper.  This workqueue has
+unbound properties and thus a wide affinity inherited by all its children.
+
+Now khelper also has special properties that we aren't much interested in:
+ordered and singlethread.  There is really no need about ordering as all
+we do is creating kernel threads.  This can be done concurrently.  And
+singlethread is a useless limitation as well.
+
+The workqueue engine already proposes generic unbound workqueues that
+don't share these useless properties and handle well parallel jobs.
+
+The only worrysome specific is their affinity to the node of the current
+CPU.  It's fine for creating the usermodehelper kernel threads but those
+inherit this affinity for longer jobs such as requesting modules.
+
+This patch proposes to use these node affine unbound workqueues assuming
+that a node is sufficient to handle several parallel usermodehelper
+requests.
+
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 90f023030e26ce8f981b3e688cb79329d8d07cc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kmod.c
+diff --cc kernel/kmod.c
+index f178dc8c4d7c,d38b2dab99a7..000000000000
+--- a/kernel/kmod.c
++++ b/kernel/kmod.c
+@@@ -45,15 -45,6 +45,18 @@@
+  
+  extern int max_threads;
+  
+++<<<<<<< HEAD
+ +static struct workqueue_struct *khelper_wq;
+ +
+ +/*
+ + * kmod_thread_locker is used for deadlock avoidance.  There is no explicit
+ + * locking to protect this global - it is private to the singleton khelper
+ + * thread and should only ever be modified by that thread.
+ + */
+ +static const struct task_struct *kmod_thread_locker;
+ +
+++=======
+++>>>>>>> 90f023030e26 (kmod: use system_unbound_wq instead of khelper)
+  #define CAP_BSET	(void *)1
+  #define CAP_PI		(void *)2
+  
+@@@ -272,8 -209,69 +275,74 @@@ static void umh_complete(struct subproc
+  		call_usermodehelper_freeinfo(sub_info);
+  }
+  
+++<<<<<<< HEAD
+ +/* Keventd can't block, but this (a child) can. */
+ +static int wait_for_helper(void *data)
+++=======
++ /*
++  * This is the task which runs the usermode application
++  */
++ static int call_usermodehelper_exec_async(void *data)
++ {
++ 	struct subprocess_info *sub_info = data;
++ 	struct cred *new;
++ 	int retval;
++ 
++ 	spin_lock_irq(&current->sighand->siglock);
++ 	flush_signal_handlers(current, 1);
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 
++ 	/*
++ 	 * Our parent (unbound workqueue) runs with elevated scheduling
++ 	 * priority. Avoid propagating that into the userspace child.
++ 	 */
++ 	set_user_nice(current, 0);
++ 
++ 	retval = -ENOMEM;
++ 	new = prepare_kernel_cred(current);
++ 	if (!new)
++ 		goto out;
++ 
++ 	spin_lock(&umh_sysctl_lock);
++ 	new->cap_bset = cap_intersect(usermodehelper_bset, new->cap_bset);
++ 	new->cap_inheritable = cap_intersect(usermodehelper_inheritable,
++ 					     new->cap_inheritable);
++ 	spin_unlock(&umh_sysctl_lock);
++ 
++ 	if (sub_info->init) {
++ 		retval = sub_info->init(sub_info, new);
++ 		if (retval) {
++ 			abort_creds(new);
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	commit_creds(new);
++ 
++ 	retval = do_execve(getname_kernel(sub_info->path),
++ 			   (const char __user *const __user *)sub_info->argv,
++ 			   (const char __user *const __user *)sub_info->envp);
++ out:
++ 	sub_info->retval = retval;
++ 	/*
++ 	 * call_usermodehelper_exec_sync() will call umh_complete
++ 	 * if UHM_WAIT_PROC.
++ 	 */
++ 	if (!(sub_info->wait & UMH_WAIT_PROC))
++ 		umh_complete(sub_info);
++ 	if (!retval)
++ 		return 0;
++ 	do_exit(0);
++ }
++ 
++ /*
++  * Handles UMH_WAIT_PROC. Our parent (unbound workqueue) might not be able to
++  * run enough instances to handle usermodehelper completions without blocking
++  * some other pending requests. That's why we use a kernel thread dedicated for
++  * that purpose.
++  */
++ static int call_usermodehelper_exec_sync(void *data)
+++>>>>>>> 90f023030e26 (kmod: use system_unbound_wq instead of khelper)
+  {
+  	struct subprocess_info *sub_info = data;
+  	pid_t pid;
+@@@ -312,8 -308,21 +381,26 @@@
+  	do_exit(0);
+  }
+  
+++<<<<<<< HEAD
+ +/* This is run by khelper thread  */
+ +static void __call_usermodehelper(struct work_struct *work)
+++=======
++ /*
++  * This function doesn't strictly needs to be called asynchronously. But we
++  * need to create the usermodehelper kernel threads from a task that is affine
++  * to an optimized set of CPUs (or nohz housekeeping ones) such that they
++  * inherit a widest affinity irrespective of call_usermodehelper() callers with
++  * possibly reduced affinity (eg: per-cpu workqueues). We don't want
++  * usermodehelper targets to contend a busy CPU.
++  *
++  * Unbound workqueues provide such wide affinity.
++  *
++  * Besides, workqueues provide the privilege level that caller might not have
++  * to perform the usermodehelper request.
++  *
++  */
++ static void call_usermodehelper_exec_work(struct work_struct *work)
+++>>>>>>> 90f023030e26 (kmod: use system_unbound_wq instead of khelper)
+  {
+  	struct subprocess_info *sub_info =
+  		container_of(work, struct subprocess_info, work);
+@@@ -557,42 -549,32 +644,51 @@@ EXPORT_SYMBOL(call_usermodehelper_setup
+   *        from interrupt context.
+   *
+   * Runs a user-space application.  The application is started
+++<<<<<<< HEAD
+ + * asynchronously if wait is not set, and runs as a child of keventd.
+ + * (ie. it runs with full root capabilities).
+++=======
++  * asynchronously if wait is not set, and runs as a child of system workqueues.
++  * (ie. it runs with full root capabilities and optimized affinity).
+++>>>>>>> 90f023030e26 (kmod: use system_unbound_wq instead of khelper)
+   */
+  int call_usermodehelper_exec(struct subprocess_info *sub_info, int wait)
+  {
+  	DECLARE_COMPLETION_ONSTACK(done);
+  	int retval = 0;
+  
+ +	helper_lock();
+++<<<<<<< HEAD
+  	if (!sub_info->path) {
+ -		call_usermodehelper_freeinfo(sub_info);
+ -		return -EINVAL;
+ +		retval = -EINVAL;
+ +		goto out;
+  	}
+ -	helper_lock();
+ +
+ +	if (sub_info->path[0] == '\0')
+ +		goto out;
+ +
+ +	if (!khelper_wq || usermodehelper_disabled) {
+++=======
++ 	if (usermodehelper_disabled) {
+++>>>>>>> 90f023030e26 (kmod: use system_unbound_wq instead of khelper)
+  		retval = -EBUSY;
+  		goto out;
+  	}
+  	/*
+ -	 * Set the completion pointer only if there is a waiter.
+ -	 * This makes it possible to use umh_complete to free
+ -	 * the data structure in case of UMH_NO_WAIT.
+ +	 * Worker thread must not wait for khelper thread at below
+ +	 * wait_for_completion() if the thread was created with CLONE_VFORK
+ +	 * flag, for khelper thread is already waiting for the thread at
+ +	 * wait_for_completion() in do_fork().
+  	 */
+ -	sub_info->complete = (wait == UMH_NO_WAIT) ? NULL : &done;
+ +	if (wait != UMH_NO_WAIT && current == kmod_thread_locker) {
+ +		retval = -EBUSY;
+ +		goto out;
+ +	}
+ +
+ +	sub_info->complete = &done;
+  	sub_info->wait = wait;
+  
+- 	queue_work(khelper_wq, &sub_info->work);
++ 	queue_work(system_unbound_wq, &sub_info->work);
+  	if (wait == UMH_NO_WAIT)	/* task has freed sub_info */
+  		goto unlock;
+  
+diff --git a/include/linux/kmod.h b/include/linux/kmod.h
+index 0555cc66a15b..fcfd2bf14d3f 100644
+--- a/include/linux/kmod.h
++++ b/include/linux/kmod.h
+@@ -85,8 +85,6 @@ enum umh_disable_depth {
+ 	UMH_DISABLED,
+ };
+ 
+-extern void usermodehelper_init(void);
+-
+ extern int __usermodehelper_disable(enum umh_disable_depth depth);
+ extern void __usermodehelper_set_disable_depth(enum umh_disable_depth depth);
+ 
+diff --git a/init/main.c b/init/main.c
+index c2bf5c4b1906..f02de4787b1c 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -844,7 +844,6 @@ static void __init do_initcalls(void)
+ static void __init do_basic_setup(void)
+ {
+ 	cpuset_init_smp();
+-	usermodehelper_init();
+ 	shmem_init();
+ 	driver_init();
+ 	init_irq_proc();
+* Unmerged path kernel/kmod.c
