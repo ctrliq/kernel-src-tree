@@ -1,0 +1,334 @@
+NFS append COMMIT after synchronous COPY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Olga Kornievskaia <kolga@netapp.com>
+commit e092693443b995c8e3a565a73b5fdb05f1260f9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e0926934.failed
+
+Instead of messing with the commit path which has been causing issues,
+add a COMMIT op after the COPY and ask for stable copies in the first
+space.
+
+It saves a round trip, since after the COPY, the client sends a COMMIT
+anyway.
+
+	Signed-off-by: Olga Kornievskaia <kolga@netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit e092693443b995c8e3a565a73b5fdb05f1260f9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42proc.c
+#	fs/nfs/nfs42xdr.c
+#	include/linux/nfs_xdr.h
+diff --cc fs/nfs/nfs42proc.c
+index 923864bebddf,929d09a5310a..000000000000
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@@ -121,8 -124,142 +121,142 @@@ int nfs42_proc_deallocate(struct file *
+  		truncate_pagecache_range(inode, offset, (offset + len) -1);
+  	if (err == -EOPNOTSUPP)
+  		NFS_SERVER(inode)->caps &= ~NFS_CAP_DEALLOCATE;
+ -out_unlock:
+ -	inode_unlock(inode);
+ -	return err;
+ -}
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&inode->i_mutex);
+++=======
++ static ssize_t _nfs42_proc_copy(struct file *src,
++ 				struct nfs_lock_context *src_lock,
++ 				struct file *dst,
++ 				struct nfs_lock_context *dst_lock,
++ 				struct nfs42_copy_args *args,
++ 				struct nfs42_copy_res *res)
++ {
++ 	struct rpc_message msg = {
++ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_COPY],
++ 		.rpc_argp = args,
++ 		.rpc_resp = res,
++ 	};
++ 	struct inode *dst_inode = file_inode(dst);
++ 	struct nfs_server *server = NFS_SERVER(dst_inode);
++ 	loff_t pos_src = args->src_pos;
++ 	loff_t pos_dst = args->dst_pos;
++ 	size_t count = args->count;
++ 	int status;
++ 
++ 	status = nfs4_set_rw_stateid(&args->src_stateid, src_lock->open_context,
++ 				     src_lock, FMODE_READ);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs_filemap_write_and_wait_range(file_inode(src)->i_mapping,
++ 			pos_src, pos_src + (loff_t)count - 1);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs4_set_rw_stateid(&args->dst_stateid, dst_lock->open_context,
++ 				     dst_lock, FMODE_WRITE);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs_sync_inode(dst_inode);
++ 	if (status)
++ 		return status;
++ 
++ 	res->commit_res.verf = kzalloc(sizeof(struct nfs_writeverf), GFP_NOFS);
++ 	if (!res->commit_res.verf)
++ 		return -ENOMEM;
++ 	status = nfs4_call_sync(server->client, server, &msg,
++ 				&args->seq_args, &res->seq_res, 0);
++ 	if (status == -ENOTSUPP)
++ 		server->caps &= ~NFS_CAP_COPY;
++ 	if (status)
++ 		goto out;
++ 
++ 	if (!nfs_write_verifier_cmp(&res->write_res.verifier.verifier,
++ 				    &res->commit_res.verf->verifier)) {
++ 		status = -EAGAIN;
++ 		goto out;
++ 	}
++ 
++ 	truncate_pagecache_range(dst_inode, pos_dst,
++ 				 pos_dst + res->write_res.count);
++ 
++ 	status = res->write_res.count;
++ out:
++ 	kfree(res->commit_res.verf);
++ 	return status;
++ }
++ 
++ ssize_t nfs42_proc_copy(struct file *src, loff_t pos_src,
++ 			struct file *dst, loff_t pos_dst,
++ 			size_t count)
++ {
++ 	struct nfs_server *server = NFS_SERVER(file_inode(dst));
++ 	struct nfs_lock_context *src_lock;
++ 	struct nfs_lock_context *dst_lock;
++ 	struct nfs42_copy_args args = {
++ 		.src_fh		= NFS_FH(file_inode(src)),
++ 		.src_pos	= pos_src,
++ 		.dst_fh		= NFS_FH(file_inode(dst)),
++ 		.dst_pos	= pos_dst,
++ 		.count		= count,
++ 	};
++ 	struct nfs42_copy_res res;
++ 	struct nfs4_exception src_exception = {
++ 		.inode		= file_inode(src),
++ 		.stateid	= &args.src_stateid,
++ 	};
++ 	struct nfs4_exception dst_exception = {
++ 		.inode		= file_inode(dst),
++ 		.stateid	= &args.dst_stateid,
++ 	};
++ 	ssize_t err, err2;
++ 
++ 	if (!nfs_server_capable(file_inode(dst), NFS_CAP_COPY))
++ 		return -EOPNOTSUPP;
++ 
++ 	src_lock = nfs_get_lock_context(nfs_file_open_context(src));
++ 	if (IS_ERR(src_lock))
++ 		return PTR_ERR(src_lock);
++ 
++ 	src_exception.state = src_lock->open_context->state;
++ 
++ 	dst_lock = nfs_get_lock_context(nfs_file_open_context(dst));
++ 	if (IS_ERR(dst_lock)) {
++ 		err = PTR_ERR(dst_lock);
++ 		goto out_put_src_lock;
++ 	}
++ 
++ 	dst_exception.state = dst_lock->open_context->state;
++ 
++ 	do {
++ 		inode_lock(file_inode(dst));
++ 		err = _nfs42_proc_copy(src, src_lock,
++ 				dst, dst_lock,
++ 				&args, &res);
++ 		inode_unlock(file_inode(dst));
++ 
++ 		if (err >= 0)
++ 			break;
++ 		if (err == -ENOTSUPP) {
++ 			err = -EOPNOTSUPP;
++ 			break;
++ 		} if (err == -EAGAIN) {
++ 			dst_exception.retry = 1;
++ 			continue;
++ 		}
++ 
++ 		err2 = nfs4_handle_exception(server, err, &src_exception);
++ 		err  = nfs4_handle_exception(server, err, &dst_exception);
++ 		if (!err)
++ 			err = err2;
++ 	} while (src_exception.retry || dst_exception.retry);
++ 
++ 	nfs_put_lock_context(dst_lock);
++ out_put_src_lock:
++ 	nfs_put_lock_context(src_lock);
+++>>>>>>> e092693443b9 (NFS append COMMIT after synchronous COPY)
+  	return err;
+  }
+  
+diff --cc fs/nfs/nfs42xdr.c
+index 0ca482a51e53,528362f69cc1..000000000000
+--- a/fs/nfs/nfs42xdr.c
++++ b/fs/nfs/nfs42xdr.c
+@@@ -49,6 -62,18 +49,21 @@@
+  					 decode_putfh_maxsz + \
+  					 decode_allocate_maxsz + \
+  					 decode_getattr_maxsz)
+++<<<<<<< HEAD
+++=======
++ #define NFS4_enc_copy_sz		(compound_encode_hdr_maxsz + \
++ 					 encode_putfh_maxsz + \
++ 					 encode_savefh_maxsz + \
++ 					 encode_putfh_maxsz + \
++ 					 encode_copy_maxsz + \
++ 					 encode_commit_maxsz)
++ #define NFS4_dec_copy_sz		(compound_decode_hdr_maxsz + \
++ 					 decode_putfh_maxsz + \
++ 					 decode_savefh_maxsz + \
++ 					 decode_putfh_maxsz + \
++ 					 decode_copy_maxsz + \
++ 					 decode_commit_maxsz)
+++>>>>>>> e092693443b9 (NFS append COMMIT after synchronous COPY)
+  #define NFS4_enc_deallocate_sz		(compound_encode_hdr_maxsz + \
+  					 encode_putfh_maxsz + \
+  					 encode_deallocate_maxsz + \
+@@@ -181,7 -224,40 +196,43 @@@ static void nfs4_xdr_enc_allocate(struc
+  	encode_nops(&hdr);
+  }
+  
++ static void encode_copy_commit(struct xdr_stream *xdr,
++ 			  struct nfs42_copy_args *args,
++ 			  struct compound_hdr *hdr)
++ {
++ 	__be32 *p;
++ 
++ 	encode_op_hdr(xdr, OP_COMMIT, decode_commit_maxsz, hdr);
++ 	p = reserve_space(xdr, 12);
++ 	p = xdr_encode_hyper(p, args->dst_pos);
++ 	*p = cpu_to_be32(args->count);
++ }
++ 
++ /*
+++<<<<<<< HEAD
+++=======
++  * Encode COPY request
++  */
++ static void nfs4_xdr_enc_copy(struct rpc_rqst *req,
++ 			      struct xdr_stream *xdr,
++ 			      struct nfs42_copy_args *args)
++ {
++ 	struct compound_hdr hdr = {
++ 		.minorversion = nfs4_xdr_minorversion(&args->seq_args),
++ 	};
++ 
++ 	encode_compound_hdr(xdr, req, &hdr);
++ 	encode_sequence(xdr, &args->seq_args, &hdr);
++ 	encode_putfh(xdr, args->src_fh, &hdr);
++ 	encode_savefh(xdr, &hdr);
++ 	encode_putfh(xdr, args->dst_fh, &hdr);
++ 	encode_copy(xdr, args, &hdr);
++ 	encode_copy_commit(xdr, args, &hdr);
++ 	encode_nops(&hdr);
++ }
++ 
+  /*
+++>>>>>>> e092693443b9 (NFS append COMMIT after synchronous COPY)
+   * Encode DEALLOCATE request
+   */
+  static void nfs4_xdr_enc_deallocate(struct rpc_rqst *req,
+@@@ -331,6 -471,39 +382,42 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Decode COPY response
++  */
++ static int nfs4_xdr_dec_copy(struct rpc_rqst *rqstp,
++ 			     struct xdr_stream *xdr,
++ 			     struct nfs42_copy_res *res)
++ {
++ 	struct compound_hdr hdr;
++ 	int status;
++ 
++ 	status = decode_compound_hdr(xdr, &hdr);
++ 	if (status)
++ 		goto out;
++ 	status = decode_sequence(xdr, &res->seq_res, rqstp);
++ 	if (status)
++ 		goto out;
++ 	status = decode_putfh(xdr);
++ 	if (status)
++ 		goto out;
++ 	status = decode_savefh(xdr);
++ 	if (status)
++ 		goto out;
++ 	status = decode_putfh(xdr);
++ 	if (status)
++ 		goto out;
++ 	status = decode_copy(xdr, res);
++ 	if (status)
++ 		goto out;
++ 	status = decode_commit(xdr, &res->commit_res);
++ out:
++ 	return status;
++ }
++ 
++ /*
+++>>>>>>> e092693443b9 (NFS append COMMIT after synchronous COPY)
+   * Decode DEALLOCATE request
+   */
+  static int nfs4_xdr_dec_deallocate(struct rpc_rqst *rqstp,
+diff --cc include/linux/nfs_xdr.h
+index ec4603fd2a1c,b28c83475ee8..000000000000
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@@ -1343,6 -1359,33 +1343,36 @@@ struct nfs42_falloc_res 
+  	const struct nfs_server		*falloc_server;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nfs42_copy_args {
++ 	struct nfs4_sequence_args	seq_args;
++ 
++ 	struct nfs_fh			*src_fh;
++ 	nfs4_stateid			src_stateid;
++ 	u64				src_pos;
++ 
++ 	struct nfs_fh			*dst_fh;
++ 	nfs4_stateid			dst_stateid;
++ 	u64				dst_pos;
++ 
++ 	u64				count;
++ };
++ 
++ struct nfs42_write_res {
++ 	u64			count;
++ 	struct nfs_writeverf	verifier;
++ };
++ 
++ struct nfs42_copy_res {
++ 	struct nfs4_sequence_res	seq_res;
++ 	struct nfs42_write_res		write_res;
++ 	bool				consecutive;
++ 	bool				synchronous;
++ 	struct nfs_commitres		commit_res;
++ };
++ 
+++>>>>>>> e092693443b9 (NFS append COMMIT after synchronous COPY)
+  struct nfs42_seek_args {
+  	struct nfs4_sequence_args	seq_args;
+  
+* Unmerged path fs/nfs/nfs42proc.c
+* Unmerged path fs/nfs/nfs42xdr.c
+* Unmerged path include/linux/nfs_xdr.h
