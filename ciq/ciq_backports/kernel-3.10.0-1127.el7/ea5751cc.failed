@@ -1,0 +1,142 @@
+proc/sysctl: don't return ENOMEM on lookup when a table is unregistering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Ivan Delalande <colona@arista.com>
+commit ea5751ccd665a2fd1b24f9af81f6167f0718c5f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ea5751cc.failed
+
+proc_sys_lookup can fail with ENOMEM instead of ENOENT when the
+corresponding sysctl table is being unregistered. In our case we see
+this upon opening /proc/sys/net/*/conf files while network interfaces
+are being deleted, which confuses our configuration daemon.
+
+The problem was successfully reproduced and this fix tested on v4.9.122
+and v4.20-rc6.
+
+v2: return ERR_PTRs in all cases when proc_sys_make_inode fails instead
+of mixing them with NULL. Thanks Al Viro for the feedback.
+
+Fixes: ace0c791e6c3 ("proc/sysctl: Don't grab i_lock under sysctl_lock.")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Ivan Delalande <colona@arista.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit ea5751ccd665a2fd1b24f9af81f6167f0718c5f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/proc_sysctl.c
+diff --cc fs/proc/proc_sysctl.c
+index df9e927d244d,4d598a399bbf..000000000000
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@@ -439,12 -468,21 +439,22 @@@ static struct inode *proc_sys_make_inod
+  
+  	inode->i_ino = get_next_ino();
+  
+ +	sysctl_head_get(head);
+  	ei = PROC_I(inode);
+++<<<<<<< HEAD
+++=======
++ 
++ 	spin_lock(&sysctl_lock);
++ 	if (unlikely(head->unregistering)) {
++ 		spin_unlock(&sysctl_lock);
++ 		iput(inode);
++ 		return ERR_PTR(-ENOENT);
++ 	}
+++>>>>>>> ea5751ccd665 (proc/sysctl: don't return ENOMEM on lookup when a table is unregistering)
+  	ei->sysctl = head;
+  	ei->sysctl_entry = table;
+ -	hlist_add_head_rcu(&ei->sysctl_inodes, &head->inodes);
+ -	head->count++;
+ -	spin_unlock(&sysctl_lock);
+  
+ -	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+ +	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+  	inode->i_mode = table->mode;
+  	if (!S_ISDIR(table->mode)) {
+  		inode->i_mode |= S_IFREG;
+@@@ -457,7 -495,10 +467,14 @@@
+  		if (is_empty_dir(head))
+  			make_empty_dir_inode(inode);
+  	}
+++<<<<<<< HEAD
+ +out:
+++=======
++ 
++ 	if (root->set_ownership)
++ 		root->set_ownership(head, table, &inode->i_uid, &inode->i_gid);
++ 
+++>>>>>>> ea5751ccd665 (proc/sysctl: don't return ENOMEM on lookup when a table is unregistering)
+  	return inode;
+  }
+  
+@@@ -497,14 -547,14 +514,15 @@@ static struct dentry *proc_sys_lookup(s
+  			goto out;
+  	}
+  
+- 	err = ERR_PTR(-ENOMEM);
+  	inode = proc_sys_make_inode(dir->i_sb, h ? h : head, p);
+- 	if (!inode)
++ 	if (IS_ERR(inode)) {
++ 		err = ERR_CAST(inode);
+  		goto out;
++ 	}
+  
+ +	err = NULL;
+  	d_set_d_op(dentry, &proc_sys_dentry_operations);
+ -	err = d_splice_alias(inode, dentry);
+ +	d_add(dentry, inode);
+  
+  out:
+  	if (h)
+@@@ -627,21 -677,32 +645,26 @@@ static int proc_sys_fill_cache(struct f
+  
+  	child = d_lookup(dir, &qname);
+  	if (!child) {
+ -		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+ -		child = d_alloc_parallel(dir, &qname, &wq);
+ -		if (IS_ERR(child))
+ -			return false;
+ -		if (d_in_lookup(child)) {
+ -			struct dentry *res;
+ +		child = d_alloc(dir, &qname);
+ +		if (child) {
+  			inode = proc_sys_make_inode(dir->d_sb, head, table);
+++<<<<<<< HEAD
+ +			if (!inode) {
+++=======
++ 			if (IS_ERR(inode)) {
++ 				d_lookup_done(child);
+++>>>>>>> ea5751ccd665 (proc/sysctl: don't return ENOMEM on lookup when a table is unregistering)
+  				dput(child);
+ -				return false;
+ -			}
+ -			d_set_d_op(child, &proc_sys_dentry_operations);
+ -			res = d_splice_alias(inode, child);
+ -			d_lookup_done(child);
+ -			if (unlikely(res)) {
+ -				if (IS_ERR(res)) {
+ -					dput(child);
+ -					return false;
+ -				}
+ -				dput(child);
+ -				child = res;
+ +				return -ENOMEM;
+ +			} else {
+ +				d_set_d_op(child, &proc_sys_dentry_operations);
+ +				d_add(child, inode);
+  			}
+ +		} else {
+ +			return -ENOMEM;
+  		}
+  	}
+ -	inode = d_inode(child);
+ +	inode = child->d_inode;
+  	ino  = inode->i_ino;
+  	type = inode->i_mode >> 12;
+  	dput(child);
+* Unmerged path fs/proc/proc_sysctl.c
