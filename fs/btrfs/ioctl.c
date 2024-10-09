@@ -660,6 +660,13 @@ static int create_snapshot(struct btrfs_root *root, struct inode *dir,
 	if (!pending_snapshot)
 		return -ENOMEM;
 
+	pending_snapshot->root_item = kzalloc(sizeof(struct btrfs_root_item),
+			GFP_NOFS);
+	if (!pending_snapshot->root_item) {
+		ret = -ENOMEM;
+		goto free_pending;
+	}
+
 	atomic_inc(&root->will_be_snapshoted);
 	smp_mb__after_atomic_inc();
 	btrfs_wait_for_no_snapshoting_writes(root);
@@ -739,6 +746,8 @@ fail:
 dec_and_free:
 	if (atomic_dec_and_test(&root->will_be_snapshoted))
 		wake_up_atomic_t(&root->will_be_snapshoted);
+free_pending:
+	kfree(pending_snapshot->root_item);
 	kfree(pending_snapshot);
 
 	return ret;
