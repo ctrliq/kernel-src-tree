@@ -4016,7 +4016,8 @@ static int sctp_connect(struct sock *sk, struct sockaddr *addr,
 		 addr, addr_len);
 
 	/* Validate addr_len before calling common connect/connectx routine. */
-	af = sctp_get_af_specific(addr->sa_family);
+	af = addr_len < offsetofend(struct sockaddr, sa_family) ? NULL :
+		sctp_get_af_specific(addr->sa_family);
 	if (!af || addr_len < af->sockaddr_len) {
 		err = -EINVAL;
 	} else {
