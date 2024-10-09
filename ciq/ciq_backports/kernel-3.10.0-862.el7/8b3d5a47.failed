@@ -1,0 +1,168 @@
+nfp: support long reads and writes with the cpp helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 8b3d5a47ae6b93654e39b543e33ded07c06fa8a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b3d5a47.failed
+
+nfp_cpp_{read,write}() helpers perform device memory mapping (setting
+the PCIe -> NOC translation BARs) and accessing it.  They, however,
+currently implicitly expect that the length of entire operation will
+fit in one BAR translation window.  There is a number of 16MB windows
+available, and we don't really need to access such large areas today.
+
+If the user, however, manages to trick the driver into making a big
+mapping (e.g. by providing a huge fake FW file), the driver will
+print a warning saying "No suitable BAR found for request" and a
+stack trace - which most users find concerning.
+
+To be future-proof and not scare users with warnings, make the
+nfp_cpp_{read,write}() helpers do accesses chunk by chunk if the area
+size is large.  Set the notion of "large" to 2MB, which is the size
+of the smallest BAR window.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8b3d5a47ae6b93654e39b543e33ded07c06fa8a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+index d4e4ca064535,8d46b9acb69f..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+@@@ -42,7 -42,7 +42,11 @@@
+  
+  #include <linux/ctype.h>
+  #include <linux/types.h>
+++<<<<<<< HEAD
+ +#include <linux/err.h>
+++=======
++ #include <linux/sizes.h>
+++>>>>>>> 8b3d5a47ae6b (nfp: support long reads and writes with the cpp helpers)
+  
+  #ifndef NFP_SUBSYS
+  #define NFP_SUBSYS "nfp"
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+index d56f0eb94c21..fbdf954601b5 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+@@ -925,18 +925,9 @@ area_cache_put(struct nfp_cpp *cpp, struct nfp_cpp_area_cache *cache)
+ 	mutex_unlock(&cpp->area_cache_mutex);
+ }
+ 
+-/**
+- * nfp_cpp_read() - read from CPP target
+- * @cpp:		CPP handle
+- * @destination:	CPP id
+- * @address:		offset into CPP target
+- * @kernel_vaddr:	kernel buffer for result
+- * @length:		number of bytes to read
+- *
+- * Return: length of io, or -ERRNO
+- */
+-int nfp_cpp_read(struct nfp_cpp *cpp, u32 destination,
+-		 unsigned long long address, void *kernel_vaddr, size_t length)
++static int __nfp_cpp_read(struct nfp_cpp *cpp, u32 destination,
++			  unsigned long long address, void *kernel_vaddr,
++			  size_t length)
+ {
+ 	struct nfp_cpp_area_cache *cache;
+ 	struct nfp_cpp_area *area;
+@@ -969,18 +960,43 @@ int nfp_cpp_read(struct nfp_cpp *cpp, u32 destination,
+ }
+ 
+ /**
+- * nfp_cpp_write() - write to CPP target
++ * nfp_cpp_read() - read from CPP target
+  * @cpp:		CPP handle
+  * @destination:	CPP id
+  * @address:		offset into CPP target
+- * @kernel_vaddr:	kernel buffer to read from
+- * @length:		number of bytes to write
++ * @kernel_vaddr:	kernel buffer for result
++ * @length:		number of bytes to read
+  *
+  * Return: length of io, or -ERRNO
+  */
+-int nfp_cpp_write(struct nfp_cpp *cpp, u32 destination,
+-		  unsigned long long address,
+-		  const void *kernel_vaddr, size_t length)
++int nfp_cpp_read(struct nfp_cpp *cpp, u32 destination,
++		 unsigned long long address, void *kernel_vaddr,
++		 size_t length)
++{
++	size_t n, offset;
++	int ret;
++
++	for (offset = 0; offset < length; offset += n) {
++		unsigned long long r_addr = address + offset;
++
++		/* make first read smaller to align to safe window */
++		n = min_t(size_t, length - offset,
++			  ALIGN(r_addr + 1, NFP_CPP_SAFE_AREA_SIZE) - r_addr);
++
++		ret = __nfp_cpp_read(cpp, destination, address + offset,
++				     kernel_vaddr + offset, n);
++		if (ret < 0)
++			return ret;
++		if (ret != n)
++			return offset + n;
++	}
++
++	return length;
++}
++
++static int __nfp_cpp_write(struct nfp_cpp *cpp, u32 destination,
++			   unsigned long long address,
++			   const void *kernel_vaddr, size_t length)
+ {
+ 	struct nfp_cpp_area_cache *cache;
+ 	struct nfp_cpp_area *area;
+@@ -1012,6 +1028,41 @@ int nfp_cpp_write(struct nfp_cpp *cpp, u32 destination,
+ 	return err;
+ }
+ 
++/**
++ * nfp_cpp_write() - write to CPP target
++ * @cpp:		CPP handle
++ * @destination:	CPP id
++ * @address:		offset into CPP target
++ * @kernel_vaddr:	kernel buffer to read from
++ * @length:		number of bytes to write
++ *
++ * Return: length of io, or -ERRNO
++ */
++int nfp_cpp_write(struct nfp_cpp *cpp, u32 destination,
++		  unsigned long long address,
++		  const void *kernel_vaddr, size_t length)
++{
++	size_t n, offset;
++	int ret;
++
++	for (offset = 0; offset < length; offset += n) {
++		unsigned long long w_addr = address + offset;
++
++		/* make first write smaller to align to safe window */
++		n = min_t(size_t, length - offset,
++			  ALIGN(w_addr + 1, NFP_CPP_SAFE_AREA_SIZE) - w_addr);
++
++		ret = __nfp_cpp_write(cpp, destination, address + offset,
++				      kernel_vaddr + offset, n);
++		if (ret < 0)
++			return ret;
++		if (ret != n)
++			return offset + n;
++	}
++
++	return length;
++}
++
+ /* Return the correct CPP address, and fixup xpb_addr as needed. */
+ static u32 nfp_xpb_to_cpp(struct nfp_cpp *cpp, u32 *xpb_addr)
+ {
