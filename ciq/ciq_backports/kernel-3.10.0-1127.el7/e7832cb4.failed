@@ -1,0 +1,246 @@
+nvme: make fabrics command run on a separate request queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit e7832cb48a654cd12b2bc9181b2f0ad49d526ac6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/e7832cb4.failed
+
+We have a fundamental issue that fabric commands use the admin_q.
+The reason is, that admin-connect, register reads and writes and
+admin commands cannot be guaranteed ordering while we are running
+controller resets.
+
+For example, when we reset a controller we perform:
+1. disable the controller
+2. teardown the admin queue
+3. re-establish the admin queue
+4. enable the controller
+
+In order to perform (3), we need to unquiesce the admin queue, however
+we may have some admin commands that are already pending on the
+quiesced admin_q and will immediate execute when we unquiesce it before
+we execute (4). The host must not send admin commands to the controller
+before enabling the controller.
+
+To fix this, we have the fabric commands (admin connect and property
+get/set, but not I/O queue connect) use a separate fabrics_q and make
+sure to quiesce the admin_q before we disable the controller, and
+unquiesce it only after we enable the controller.
+
+This fixes the error prints from nvmet in a controller reset storm test:
+kernel: nvmet: got cmd 6 while CC.EN == 0 on qid = 0
+Which indicate that the host is sending an admin command when the
+controller is not enabled.
+
+	Reviewed-by:  James Smart <james.smart@broadcom.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit e7832cb48a654cd12b2bc9181b2f0ad49d526ac6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fabrics.c
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/host/tcp.c
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/host/fabrics.c
+index 926f89ac2eb5,145c210edb03..000000000000
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@@ -158,8 -150,8 +158,13 @@@ int nvmf_reg_read32(struct nvme_ctrl *c
+  	cmd.prop_get.fctype = nvme_fabrics_type_property_get;
+  	cmd.prop_get.offset = cpu_to_le32(off);
+  
+++<<<<<<< HEAD
+ +	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res, NULL, 0, 0,
+ +			NVME_QID_ANY, 0, 0);
+++=======
++ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res, NULL, 0, 0,
++ 			NVME_QID_ANY, 0, 0, false);
+++>>>>>>> e7832cb48a65 (nvme: make fabrics command run on a separate request queue)
+  
+  	if (ret >= 0)
+  		*val = le64_to_cpu(res.u64);
+@@@ -205,8 -197,8 +210,13 @@@ int nvmf_reg_read64(struct nvme_ctrl *c
+  	cmd.prop_get.attrib = 1;
+  	cmd.prop_get.offset = cpu_to_le32(off);
+  
+++<<<<<<< HEAD
+ +	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res, NULL, 0, 0,
+ +			NVME_QID_ANY, 0, 0);
+++=======
++ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res, NULL, 0, 0,
++ 			NVME_QID_ANY, 0, 0, false);
+++>>>>>>> e7832cb48a65 (nvme: make fabrics command run on a separate request queue)
+  
+  	if (ret >= 0)
+  		*val = le64_to_cpu(res.u64);
+@@@ -251,8 -243,8 +261,13 @@@ int nvmf_reg_write32(struct nvme_ctrl *
+  	cmd.prop_set.offset = cpu_to_le32(off);
+  	cmd.prop_set.value = cpu_to_le64(val);
+  
+++<<<<<<< HEAD
+ +	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, NULL, NULL, 0, 0,
+ +			NVME_QID_ANY, 0, 0);
+++=======
++ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, NULL, NULL, 0, 0,
++ 			NVME_QID_ANY, 0, 0, false);
+++>>>>>>> e7832cb48a65 (nvme: make fabrics command run on a separate request queue)
+  	if (unlikely(ret))
+  		dev_err(ctrl->device,
+  			"Property Set error: %d, offset %#x\n",
+@@@ -401,9 -396,9 +416,9 @@@ int nvmf_connect_admin_queue(struct nvm
+  	strncpy(data->subsysnqn, ctrl->opts->subsysnqn, NVMF_NQN_SIZE);
+  	strncpy(data->hostnqn, ctrl->opts->host->nqn, NVMF_NQN_SIZE);
+  
+- 	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res,
++ 	ret = __nvme_submit_sync_cmd(ctrl->fabrics_q, &cmd, &res,
+  			data, sizeof(*data), 0, NVME_QID_ANY, 1,
+ -			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT, false);
+ +			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT);
+  	if (ret) {
+  		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
+  				       &cmd, data);
+diff --cc drivers/nvme/host/rdma.c
+index ddaa67fa3a70,0ef05a75c428..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -805,8 -815,10 +812,10 @@@ static int nvme_rdma_configure_admin_qu
+  		goto out_stop_queue;
+  
+  	ctrl->ctrl.max_hw_sectors =
+ -		(ctrl->max_fr_pages - 1) << (ilog2(SZ_4K) - 9);
+ +		(ctrl->max_fr_pages - 1) << (PAGE_SHIFT - 9);
+  
++ 	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
++ 
+  	error = nvme_init_identify(&ctrl->ctrl);
+  	if (error)
+  		goto out_stop_queue;
+@@@ -887,10 -902,13 +899,17 @@@ static void nvme_rdma_teardown_admin_qu
+  {
+  	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+  	nvme_rdma_stop_queue(&ctrl->queues[0]);
+ -	if (ctrl->ctrl.admin_tagset) {
+ +	if (ctrl->ctrl.admin_tagset)
+  		blk_mq_tagset_busy_iter(ctrl->ctrl.admin_tagset,
+  			nvme_cancel_request, &ctrl->ctrl);
+++<<<<<<< HEAD
+ +	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+++=======
++ 		blk_mq_tagset_wait_completed_request(ctrl->ctrl.admin_tagset);
++ 	}
++ 	if (remove)
++ 		blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+++>>>>>>> e7832cb48a65 (nvme: make fabrics command run on a separate request queue)
+  	nvme_rdma_destroy_admin_queue(ctrl, remove);
+  }
+  
+@@@ -1793,7 -1868,11 +1813,8 @@@ static struct blk_mq_ops nvme_rdma_admi
+  
+  static void nvme_rdma_shutdown_ctrl(struct nvme_rdma_ctrl *ctrl, bool shutdown)
+  {
+ -	cancel_work_sync(&ctrl->err_work);
+ -	cancel_delayed_work_sync(&ctrl->reconnect_work);
+ -
+  	nvme_rdma_teardown_io_queues(ctrl, shutdown);
++ 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+  	if (shutdown)
+  		nvme_shutdown_ctrl(&ctrl->ctrl);
+  	else
+diff --cc drivers/nvme/target/loop.c
+index 2fc4c291a3ef,9ee093b9fc74..000000000000
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@@ -439,10 -416,9 +451,13 @@@ static void nvme_loop_shutdown_ctrl(str
+  	if (ctrl->ctrl.state == NVME_CTRL_LIVE)
+  		nvme_shutdown_ctrl(&ctrl->ctrl);
+  
+- 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+  	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
+  				nvme_cancel_request, &ctrl->ctrl);
+++<<<<<<< HEAD
+ +	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+++=======
++ 	blk_mq_tagset_wait_completed_request(&ctrl->admin_tag_set);
+++>>>>>>> e7832cb48a65 (nvme: make fabrics command run on a separate request queue)
+  	nvme_loop_destroy_admin_queue(ctrl);
+  }
+  
+* Unmerged path drivers/nvme/host/tcp.c
+* Unmerged path drivers/nvme/host/fabrics.c
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 09366228ddd9..618b7bdc0a46 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2014,6 +2014,7 @@ nvme_fc_ctrl_free(struct kref *ref)
+ 
+ 	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+ 	blk_cleanup_queue(ctrl->ctrl.admin_q);
++	blk_cleanup_queue(ctrl->ctrl.fabrics_q);
+ 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
+ 
+ 	kfree(ctrl->queues);
+@@ -2634,8 +2635,6 @@ nvme_fc_create_association(struct nvme_fc_ctrl *ctrl)
+ 	if (ret)
+ 		goto out_delete_hw_queue;
+ 
+-	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+-
+ 	ret = nvmf_connect_admin_queue(&ctrl->ctrl);
+ 	if (ret)
+ 		goto out_disconnect_admin_queue;
+@@ -2666,6 +2665,8 @@ nvme_fc_create_association(struct nvme_fc_ctrl *ctrl)
+ 	ctrl->ctrl.max_hw_sectors =
+ 		(ctrl->lport->ops->max_sgl_segments - 1) << (PAGE_SHIFT - 9);
+ 
++	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
++
+ 	ret = nvme_init_identify(&ctrl->ctrl);
+ 	if (ret)
+ 		goto out_disconnect_admin_queue;
+@@ -3107,10 +3108,16 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 		goto out_free_queues;
+ 	ctrl->ctrl.admin_tagset = &ctrl->admin_tag_set;
+ 
++	ctrl->ctrl.fabrics_q = blk_mq_init_queue(&ctrl->admin_tag_set);
++	if (IS_ERR(ctrl->ctrl.fabrics_q)) {
++		ret = PTR_ERR(ctrl->ctrl.fabrics_q);
++		goto out_free_admin_tag_set;
++	}
++
+ 	ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
+ 	if (IS_ERR(ctrl->ctrl.admin_q)) {
+ 		ret = PTR_ERR(ctrl->ctrl.admin_q);
+-		goto out_free_admin_tag_set;
++		goto out_cleanup_fabrics_q;
+ 	}
+ 	ctrl->ctrl.admin_q->tail_queue = 1;
+ 
+@@ -3183,6 +3190,8 @@ fail_ctrl:
+ 
+ out_cleanup_admin_q:
+ 	blk_cleanup_queue(ctrl->ctrl.admin_q);
++out_cleanup_fabrics_q:
++	blk_cleanup_queue(ctrl->ctrl.fabrics_q);
+ out_free_admin_tag_set:
+ 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
+ out_free_queues:
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 44ab8fc55afb..81883e22da88 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -132,6 +132,7 @@ struct nvme_ctrl {
+ 	const struct nvme_ctrl_ops *ops;
+ 	struct request_queue *admin_q;
+ 	struct request_queue *connect_q;
++	struct request_queue *fabrics_q;
+ 	struct device *dev;
+ 	int instance;
+ 	struct blk_mq_tag_set *tagset;
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/host/tcp.c
+* Unmerged path drivers/nvme/target/loop.c
