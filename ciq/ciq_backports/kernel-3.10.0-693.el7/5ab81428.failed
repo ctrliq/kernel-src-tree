@@ -1,0 +1,332 @@
+xprtrdma: Chunk list encoders no longer share one rl_segments array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 5ab8142839c714ed5ac9a9de1846ab71f87a3ed7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5ab81428.failed
+
+Currently, all three chunk list encoders each use a portion of the
+one rl_segments array in rpcrdma_req. This is because the MWs for
+each chunk list were preserved in rl_segments so that ro_unmap could
+find and invalidate them after the RPC was complete.
+
+However, now that MWs are placed on a per-req linked list as they
+are registered, there is no longer any information in rpcrdma_mr_seg
+that is shared between ro_map and ro_unmap_{sync,safe}, and thus
+nothing in rl_segments needs to be preserved after
+rpcrdma_marshal_req is complete.
+
+Thus the rl_segments array can be used now just for the needs of
+each rpcrdma_convert_iovs call. Once each chunk list is encoded, the
+next chunk list encoder is free to re-use all of rl_segments.
+
+This means all three chunk lists in one RPC request can now each
+encode a full size data payload with no increase in the size of
+rl_segments.
+
+This is a key requirement for Kerberos support, since both the Call
+and Reply for a single RPC transaction are conveyed via Long
+messages (RDMA Read/Write). Both can be large.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 5ab8142839c714ed5ac9a9de1846ab71f87a3ed7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index d2719e1b5171,f60d229b78b4..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -283,165 -282,18 +282,169 @@@ rpcrdma_convert_iovs(struct xdr_buf *xd
+  	}
+  
+  	return n;
++ 
++ out_overflow:
++ 	pr_err("rpcrdma: segment array overflow\n");
++ 	return -EIO;
+  }
+  
+ +/*
+ + * Create read/write chunk lists, and reply chunks, for RDMA
+ + *
+ + *   Assume check against THRESHOLD has been done, and chunks are required.
+ + *   Assume only encoding one list entry for read|write chunks. The NFSv3
+ + *     protocol is simple enough to allow this as it only has a single "bulk
+ + *     result" in each procedure - complicated NFSv4 COMPOUNDs are not. (The
+ + *     RDMA/Sessions NFSv4 proposal addresses this for future v4 revs.)
+ + *
+ + * When used for a single reply chunk (which is a special write
+ + * chunk used for the entire reply, rather than just the data), it
+ + * is used primarily for READDIR and READLINK which would otherwise
+ + * be severely size-limited by a small rdma inline read max. The server
+ + * response will come back as an RDMA Write, followed by a message
+ + * of type RDMA_NOMSG carrying the xid and length. As a result, reply
+ + * chunks do not provide data alignment, however they do not require
+ + * "fixup" (moving the response to the upper layer buffer) either.
+ + *
+ + * Encoding key for single-list chunks (HLOO = Handle32 Length32 Offset64):
+ + *
+ + *  Read chunklist (a linked list):
+ + *   N elements, position P (same P for all chunks of same arg!):
+ + *    1 - PHLOO - 1 - PHLOO - ... - 1 - PHLOO - 0
+ + *
+ + *  Write chunklist (a list of (one) counted array):
+ + *   N elements:
+ + *    1 - N - HLOO - HLOO - ... - HLOO - 0
+ + *
+ + *  Reply chunk (a counted array):
+ + *   N elements:
+ + *    1 - N - HLOO - HLOO - ... - HLOO
+ + *
+ + * Returns positive RPC/RDMA header size, or negative errno.
+ + */
+ +
+ +static ssize_t
+ +rpcrdma_create_chunks(struct rpc_rqst *rqst, struct xdr_buf *target,
+ +		struct rpcrdma_msg *headerp, enum rpcrdma_chunktype type)
+ +{
+ +	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
+ +	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ +	int n, nsegs, nchunks = 0;
+ +	unsigned int pos;
+ +	struct rpcrdma_mr_seg *seg = req->rl_segments;
+ +	struct rpcrdma_read_chunk *cur_rchunk = NULL;
+ +	struct rpcrdma_write_array *warray = NULL;
+ +	struct rpcrdma_write_chunk *cur_wchunk = NULL;
+ +	__be32 *iptr = headerp->rm_body.rm_chunks;
+ +	int (*map)(struct rpcrdma_xprt *, struct rpcrdma_mr_seg *, int, bool);
+ +
+ +	if (type == rpcrdma_readch || type == rpcrdma_areadch) {
+ +		/* a read chunk - server will RDMA Read our memory */
+ +		cur_rchunk = (struct rpcrdma_read_chunk *) iptr;
+ +	} else {
+ +		/* a write or reply chunk - server will RDMA Write our memory */
+ +		*iptr++ = xdr_zero;	/* encode a NULL read chunk list */
+ +		if (type == rpcrdma_replych)
+ +			*iptr++ = xdr_zero;	/* a NULL write chunk list */
+ +		warray = (struct rpcrdma_write_array *) iptr;
+ +		cur_wchunk = (struct rpcrdma_write_chunk *) (warray + 1);
+ +	}
+ +
+ +	if (type == rpcrdma_replych || type == rpcrdma_areadch)
+ +		pos = 0;
+ +	else
+ +		pos = target->head[0].iov_len;
+ +
+ +	nsegs = rpcrdma_convert_iovs(target, pos, type, seg, RPCRDMA_MAX_SEGS);
+ +	if (nsegs < 0)
+ +		return nsegs;
+ +
+ +	map = r_xprt->rx_ia.ri_ops->ro_map;
+ +	do {
+ +		n = map(r_xprt, seg, nsegs, cur_wchunk != NULL);
+ +		if (n <= 0)
+ +			goto out;
+ +		if (cur_rchunk) {	/* read */
+ +			cur_rchunk->rc_discrim = xdr_one;
+ +			/* all read chunks have the same "position" */
+ +			cur_rchunk->rc_position = cpu_to_be32(pos);
+ +			cur_rchunk->rc_target.rs_handle =
+ +						cpu_to_be32(seg->mr_rkey);
+ +			cur_rchunk->rc_target.rs_length =
+ +						cpu_to_be32(seg->mr_len);
+ +			xdr_encode_hyper(
+ +					(__be32 *)&cur_rchunk->rc_target.rs_offset,
+ +					seg->mr_base);
+ +			dprintk("RPC:       %s: read chunk "
+ +				"elem %d@0x%llx:0x%x pos %u (%s)\n", __func__,
+ +				seg->mr_len, (unsigned long long)seg->mr_base,
+ +				seg->mr_rkey, pos, n < nsegs ? "more" : "last");
+ +			cur_rchunk++;
+ +			r_xprt->rx_stats.read_chunk_count++;
+ +		} else {		/* write/reply */
+ +			cur_wchunk->wc_target.rs_handle =
+ +						cpu_to_be32(seg->mr_rkey);
+ +			cur_wchunk->wc_target.rs_length =
+ +						cpu_to_be32(seg->mr_len);
+ +			xdr_encode_hyper(
+ +					(__be32 *)&cur_wchunk->wc_target.rs_offset,
+ +					seg->mr_base);
+ +			dprintk("RPC:       %s: %s chunk "
+ +				"elem %d@0x%llx:0x%x (%s)\n", __func__,
+ +				(type == rpcrdma_replych) ? "reply" : "write",
+ +				seg->mr_len, (unsigned long long)seg->mr_base,
+ +				seg->mr_rkey, n < nsegs ? "more" : "last");
+ +			cur_wchunk++;
+ +			if (type == rpcrdma_replych)
+ +				r_xprt->rx_stats.reply_chunk_count++;
+ +			else
+ +				r_xprt->rx_stats.write_chunk_count++;
+ +			r_xprt->rx_stats.total_rdma_request += seg->mr_len;
+ +		}
+ +		nchunks++;
+ +		seg   += n;
+ +		nsegs -= n;
+ +	} while (nsegs);
+ +
+ +	/* success. all failures return above */
+ +	req->rl_nchunks = nchunks;
+ +
+ +	/*
+ +	 * finish off header. If write, marshal discrim and nchunks.
+ +	 */
+ +	if (cur_rchunk) {
+ +		iptr = (__be32 *) cur_rchunk;
+ +		*iptr++ = xdr_zero;	/* finish the read chunk list */
+ +		*iptr++ = xdr_zero;	/* encode a NULL write chunk list */
+ +		*iptr++ = xdr_zero;	/* encode a NULL reply chunk */
+ +	} else {
+ +		warray->wc_discrim = xdr_one;
+ +		warray->wc_nchunks = cpu_to_be32(nchunks);
+ +		iptr = (__be32 *) cur_wchunk;
+ +		if (type == rpcrdma_writech) {
+ +			*iptr++ = xdr_zero; /* finish the write chunk list */
+ +			*iptr++ = xdr_zero; /* encode a NULL reply chunk */
+ +		}
+ +	}
+ +
+ +	/*
+ +	 * Return header size.
+ +	 */
+ +	return (unsigned char *)iptr - (unsigned char *)headerp;
+ +
+ +out:
+ +	for (pos = 0; nchunks--;)
+ +		pos += r_xprt->rx_ia.ri_ops->ro_unmap(r_xprt,
+ +						      &req->rl_segments[pos]);
+ +	return n;
+ +}
+ +
+  static inline __be32 *
+ -xdr_encode_rdma_segment(__be32 *iptr, struct rpcrdma_mw *mw)
+ +xdr_encode_rdma_segment(__be32 *iptr, struct rpcrdma_mr_seg *seg)
+  {
+ -	*iptr++ = cpu_to_be32(mw->mw_handle);
+ -	*iptr++ = cpu_to_be32(mw->mw_length);
+ -	return xdr_encode_hyper(iptr, mw->mw_offset);
+ +	*iptr++ = cpu_to_be32(seg->mr_rkey);
+ +	*iptr++ = cpu_to_be32(seg->mr_len);
+ +	return xdr_encode_hyper(iptr, seg->mr_base);
+  }
+  
+  /* XDR-encode the Read list. Supports encoding a list of read
+@@@ -461,7 -313,8 +464,12 @@@ rpcrdma_encode_read_list(struct rpcrdma
+  			 struct rpcrdma_req *req, struct rpc_rqst *rqst,
+  			 __be32 *iptr, enum rpcrdma_chunktype rtype)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_mr_seg *seg = req->rl_nextseg;
+++=======
++ 	struct rpcrdma_mr_seg *seg;
++ 	struct rpcrdma_mw *mw;
+++>>>>>>> 5ab8142839c7 (xprtrdma: Chunk list encoders no longer share one rl_segments array)
+  	unsigned int pos;
+  	int n, nsegs;
+  
+@@@ -489,16 -344,14 +497,15 @@@
+  		 * have the same "position".
+  		 */
+  		*iptr++ = cpu_to_be32(pos);
+ -		iptr = xdr_encode_rdma_segment(iptr, mw);
+ +		iptr = xdr_encode_rdma_segment(iptr, seg);
+  
+ -		dprintk("RPC: %5u %s: pos %u %u@0x%016llx:0x%08x (%s)\n",
+ +		dprintk("RPC: %5u %s: read segment pos %u "
+ +			"%d@0x%016llx:0x%08x (%s)\n",
+  			rqst->rq_task->tk_pid, __func__, pos,
+ -			mw->mw_length, (unsigned long long)mw->mw_offset,
+ -			mw->mw_handle, n < nsegs ? "more" : "last");
+ +			seg->mr_len, (unsigned long long)seg->mr_base,
+ +			seg->mr_rkey, n < nsegs ? "more" : "last");
+  
+  		r_xprt->rx_stats.read_chunk_count++;
+- 		req->rl_nchunks++;
+  		seg += n;
+  		nsegs -= n;
+  	} while (nsegs);
+@@@ -526,7 -378,8 +532,12 @@@ rpcrdma_encode_write_list(struct rpcrdm
+  			  struct rpc_rqst *rqst, __be32 *iptr,
+  			  enum rpcrdma_chunktype wtype)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_mr_seg *seg = req->rl_nextseg;
+++=======
++ 	struct rpcrdma_mr_seg *seg;
++ 	struct rpcrdma_mw *mw;
+++>>>>>>> 5ab8142839c7 (xprtrdma: Chunk list encoders no longer share one rl_segments array)
+  	int n, nsegs, nchunks;
+  	__be32 *segcount;
+  
+@@@ -593,7 -445,8 +602,12 @@@ rpcrdma_encode_reply_chunk(struct rpcrd
+  			   struct rpcrdma_req *req, struct rpc_rqst *rqst,
+  			   __be32 *iptr, enum rpcrdma_chunktype wtype)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_mr_seg *seg = req->rl_nextseg;
+++=======
++ 	struct rpcrdma_mr_seg *seg;
++ 	struct rpcrdma_mw *mw;
+++>>>>>>> 5ab8142839c7 (xprtrdma: Chunk list encoders no longer share one rl_segments array)
+  	int n, nsegs, nchunks;
+  	__be32 *segcount;
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index b1a53c89aa34,670fad57153a..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -265,20 -258,20 +256,33 @@@ struct rpcrdma_mw 
+   * of iovs for send operations. The reason is that the iovs passed to
+   * ib_post_{send,recv} must not be modified until the work request
+   * completes.
+++<<<<<<< HEAD
+ + *
+ + * NOTES:
+ + *   o RPCRDMA_MAX_SEGS is the max number of addressible chunk elements we
+ + *     marshal. The number needed varies depending on the iov lists that
+ + *     are passed to us, the memory registration mode we are in, and if
+ + *     physical addressing is used, the layout.
+++=======
+++>>>>>>> 5ab8142839c7 (xprtrdma: Chunk list encoders no longer share one rl_segments array)
++  */
++ 
++ /* Maximum number of page-sized "segments" per chunk list to be
++  * registered or invalidated. Must handle a Reply chunk:
+   */
++ enum {
++ 	RPCRDMA_MAX_IOV_SEGS	= 3,
++ 	RPCRDMA_MAX_DATA_SEGS	= ((1 * 1024 * 1024) / PAGE_SIZE) + 1,
++ 	RPCRDMA_MAX_SEGS	= RPCRDMA_MAX_DATA_SEGS +
++ 				  RPCRDMA_MAX_IOV_SEGS,
++ };
+  
+  struct rpcrdma_mr_seg {		/* chunk descriptors */
+ +	struct rpcrdma_mw *rl_mw;	/* registered MR */
+ +	u64		mr_base;	/* registration result */
+ +	u32		mr_rkey;	/* registration result */
+  	u32		mr_len;		/* length of chunk or segment */
+ +	int		mr_nsegs;	/* number of segments in chunk or 0 */
+  	struct page	*mr_page;	/* owning page, if any */
+  	char		*mr_offset;	/* kva if no page, else offset */
+  };
+@@@ -296,8 -289,6 +300,11 @@@ struct rpcrdma_req 
+  	struct ib_sge		rl_send_iov[RPCRDMA_MAX_IOVS];
+  	struct rpcrdma_regbuf	*rl_rdmabuf;
+  	struct rpcrdma_regbuf	*rl_sendbuf;
+++<<<<<<< HEAD
+ +	struct rpcrdma_mr_seg	rl_segments[RPCRDMA_MAX_SEGS];
+ +	struct rpcrdma_mr_seg	*rl_nextseg;
+++=======
+++>>>>>>> 5ab8142839c7 (xprtrdma: Chunk list encoders no longer share one rl_segments array)
+  
+  	struct ib_cqe		rl_cqe;
+  	struct list_head	rl_all;
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
