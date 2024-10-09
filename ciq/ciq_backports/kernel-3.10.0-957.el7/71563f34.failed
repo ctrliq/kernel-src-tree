@@ -1,0 +1,119 @@
+ipvs: skb_orphan in case of forwarding
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alex Gartrell <agartrell@fb.com>
+commit 71563f3414e917c62acd8e0fb0edf8ed6af63e4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/71563f34.failed
+
+It is possible that we bind against a local socket in early_demux when we
+are actually going to want to forward it.  In this case, the socket serves
+no purpose and only serves to confuse things (particularly functions which
+implicitly expect sk_fullsock to be true, like ip_local_out).
+Additionally, skb_set_owner_w is totally broken for non full-socks.
+
+	Signed-off-by: Alex Gartrell <agartrell@fb.com>
+Fixes: 41063e9dd119 ("ipv4: Early TCP socket demux.")
+	Acked-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit 71563f3414e917c62acd8e0fb0edf8ed6af63e4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_xmit.c
+diff --cc net/netfilter/ipvs/ip_vs_xmit.c
+index 10d85776d3eb,34dc1429ebdb..000000000000
+--- a/net/netfilter/ipvs/ip_vs_xmit.c
++++ b/net/netfilter/ipvs/ip_vs_xmit.c
+@@@ -803,6 -858,85 +828,88 @@@ tx_error
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* When forwarding a packet, we must ensure that we've got enough headroom
++  * for the encapsulation packet in the skb.  This also gives us an
++  * opportunity to figure out what the payload_len, dsfield, ttl, and df
++  * values should be, so that we won't need to look at the old ip header
++  * again
++  */
++ static struct sk_buff *
++ ip_vs_prepare_tunneled_skb(struct sk_buff *skb, int skb_af,
++ 			   unsigned int max_headroom, __u8 *next_protocol,
++ 			   __u32 *payload_len, __u8 *dsfield, __u8 *ttl,
++ 			   __be16 *df)
++ {
++ 	struct sk_buff *new_skb = NULL;
++ 	struct iphdr *old_iph = NULL;
++ #ifdef CONFIG_IP_VS_IPV6
++ 	struct ipv6hdr *old_ipv6h = NULL;
++ #endif
++ 
++ 	ip_vs_drop_early_demux_sk(skb);
++ 
++ 	if (skb_headroom(skb) < max_headroom || skb_cloned(skb)) {
++ 		new_skb = skb_realloc_headroom(skb, max_headroom);
++ 		if (!new_skb)
++ 			goto error;
++ 		if (skb->sk)
++ 			skb_set_owner_w(new_skb, skb->sk);
++ 		consume_skb(skb);
++ 		skb = new_skb;
++ 	}
++ 
++ #ifdef CONFIG_IP_VS_IPV6
++ 	if (skb_af == AF_INET6) {
++ 		old_ipv6h = ipv6_hdr(skb);
++ 		*next_protocol = IPPROTO_IPV6;
++ 		if (payload_len)
++ 			*payload_len =
++ 				ntohs(old_ipv6h->payload_len) +
++ 				sizeof(*old_ipv6h);
++ 		*dsfield = ipv6_get_dsfield(old_ipv6h);
++ 		*ttl = old_ipv6h->hop_limit;
++ 		if (df)
++ 			*df = 0;
++ 	} else
++ #endif
++ 	{
++ 		old_iph = ip_hdr(skb);
++ 		/* Copy DF, reset fragment offset and MF */
++ 		if (df)
++ 			*df = (old_iph->frag_off & htons(IP_DF));
++ 		*next_protocol = IPPROTO_IPIP;
++ 
++ 		/* fix old IP header checksum */
++ 		ip_send_check(old_iph);
++ 		*dsfield = ipv4_get_dsfield(old_iph);
++ 		*ttl = old_iph->ttl;
++ 		if (payload_len)
++ 			*payload_len = ntohs(old_iph->tot_len);
++ 	}
++ 
++ 	return skb;
++ error:
++ 	kfree_skb(skb);
++ 	return ERR_PTR(-ENOMEM);
++ }
++ 
++ static inline int __tun_gso_type_mask(int encaps_af, int orig_af)
++ {
++ 	if (encaps_af == AF_INET) {
++ 		if (orig_af == AF_INET)
++ 			return SKB_GSO_IPIP;
++ 
++ 		return SKB_GSO_SIT;
++ 	}
++ 
++ 	/* GSO: we need to provide proper SKB_GSO_ value for IPv6:
++ 	 * SKB_GSO_SIT/IPV6
++ 	 */
++ 	return 0;
++ }
+++>>>>>>> 71563f3414e9 (ipvs: skb_orphan in case of forwarding)
+  
+  /*
+   *   IP Tunneling transmitter
+* Unmerged path net/netfilter/ipvs/ip_vs_xmit.c
