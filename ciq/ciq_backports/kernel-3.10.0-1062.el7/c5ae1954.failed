@@ -1,0 +1,126 @@
+IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit c5ae1954c47d3fd8815bd5a592aba18702c93f33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c5ae1954.failed
+
+To prevent a hardware memory leak when a DEVX DCT object is destroyed
+without calling DRAIN DCT before, (e.g. under cleanup flow), need to
+manage its creation and destruction via mlx5 core.
+
+In that case the DRAIN DCT command will be called and only once that it
+will be completed the DESTROY DCT command will be called.  Otherwise, the
+DESTROY DCT may fail and a hardware leak may occur.
+
+As of that change the DRAIN DCT command should not be exposed any more
+from DEVX, it's managed internally by the driver to work as expected by
+the device specification.
+
+Fixes: 7efce3691d33 ("IB/mlx5: Add obj create and destroy functionality")
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c5ae1954c47d3fd8815bd5a592aba18702c93f33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/qp.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/qp.c
+index 4f0182154934,b8ba74de9555..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/qp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+@@@ -192,13 -230,42 +192,17 @@@ static void destroy_resource_common(str
+  	wait_for_completion(&qp->common.free);
+  }
+  
+ -static int _mlx5_core_destroy_dct(struct mlx5_core_dev *dev,
+ -				  struct mlx5_core_dct *dct, bool need_cleanup)
+ -{
+ -	u32 out[MLX5_ST_SZ_DW(destroy_dct_out)] = {0};
+ -	u32 in[MLX5_ST_SZ_DW(destroy_dct_in)]   = {0};
+ -	struct mlx5_core_qp *qp = &dct->mqp;
+ -	int err;
+ -
+ -	err = mlx5_core_drain_dct(dev, dct);
+ -	if (err) {
+ -		if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
+ -			goto destroy;
+ -		} else {
+ -			mlx5_core_warn(
+ -				dev, "failed drain DCT 0x%x with error 0x%x\n",
+ -				qp->qpn, err);
+ -			return err;
+ -		}
+ -	}
+ -	wait_for_completion(&dct->drained);
+ -destroy:
+ -	if (need_cleanup)
+ -		destroy_resource_common(dev, &dct->mqp);
+ -	MLX5_SET(destroy_dct_in, in, opcode, MLX5_CMD_OP_DESTROY_DCT);
+ -	MLX5_SET(destroy_dct_in, in, dctn, qp->qpn);
+ -	MLX5_SET(destroy_dct_in, in, uid, qp->uid);
+ -	err = mlx5_cmd_exec(dev, (void *)&in, sizeof(in),
+ -			    (void *)&out, sizeof(out));
+ -	return err;
+ -}
+ -
+  int mlx5_core_create_dct(struct mlx5_core_dev *dev,
+  			 struct mlx5_core_dct *dct,
+- 			 u32 *in, int inlen)
++ 			 u32 *in, int inlen,
++ 			 u32 *out, int outlen)
+  {
+++<<<<<<< HEAD
+ +	u32 out[MLX5_ST_SZ_DW(create_dct_out)]   = {0};
+ +	u32 din[MLX5_ST_SZ_DW(destroy_dct_in)]   = {0};
+ +	u32 dout[MLX5_ST_SZ_DW(destroy_dct_out)] = {0};
+++=======
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  	struct mlx5_core_qp *qp = &dct->mqp;
+  	int err;
+  
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index fc4130ad1871..d914006aacaa 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -3522,6 +3522,7 @@ static int mlx5_ib_modify_dct(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 
+ 	} else if (cur_state == IB_QPS_INIT && new_state == IB_QPS_RTR) {
+ 		struct mlx5_ib_modify_qp_resp resp = {};
++		u32 out[MLX5_ST_SZ_DW(create_dct_out)] = {0};
+ 		u32 min_resp_len = offsetof(typeof(resp), dctn) +
+ 				   sizeof(resp.dctn);
+ 
+@@ -3540,7 +3541,8 @@ static int mlx5_ib_modify_dct(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		MLX5_SET(dctc, dctc, hop_limit, attr->ah_attr.grh.hop_limit);
+ 
+ 		err = mlx5_core_create_dct(dev->mdev, &qp->dct.mdct, qp->dct.in,
+-					   MLX5_ST_SZ_BYTES(create_dct_in));
++					   MLX5_ST_SZ_BYTES(create_dct_in), out,
++					   sizeof(out));
+ 		if (err)
+ 			return err;
+ 		resp.dctn = qp->dct.mdct.mqp.qpn;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/qp.c
+diff --git a/include/linux/mlx5/qp.h b/include/linux/mlx5/qp.h
+index b26ea9077384..0343c81d4c5f 100644
+--- a/include/linux/mlx5/qp.h
++++ b/include/linux/mlx5/qp.h
+@@ -557,7 +557,8 @@ static inline struct mlx5_core_mkey *__mlx5_mr_lookup(struct mlx5_core_dev *dev,
+ 
+ int mlx5_core_create_dct(struct mlx5_core_dev *dev,
+ 			 struct mlx5_core_dct *qp,
+-			 u32 *in, int inlen);
++			 u32 *in, int inlen,
++			 u32 *out, int outlen);
+ int mlx5_core_create_qp(struct mlx5_core_dev *dev,
+ 			struct mlx5_core_qp *qp,
+ 			u32 *in,
