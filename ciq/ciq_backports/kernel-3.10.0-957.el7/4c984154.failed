@@ -1,0 +1,175 @@
+nvme-fc: change controllers first connect to use reconnect path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit 4c984154efa13175bbb1e2aeb1de9fb2960ca28c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4c984154.failed
+
+Current code follows the framework that has been in the transports
+from the beginning where initial link-side controller connect occurs
+as part of "creating the controller". Thus that first connect fully
+talks to the controller and obtains values that can then be used in
+for blk-mq setup, etc. It also means that everything about the
+controller is fully know before the "create controller" call returns.
+
+This has several weaknesses:
+- The initial create_ctrl call made by the cli will block for a long
+  time as wire transactions are performed synchronously. This delay
+  becomes longer if errors occur or connectivity is lost and retries
+  need to be performed.
+- Code wise, it means there is a separate connect path for initial
+  controller connect vs the (same) steps used in the reconnect path.
+- And as there's separate paths, it means there's separate error
+  handling and retry logic. It also plays havoc with the NEW state
+  (should transition out of it after successful initial connect) vs
+  the RESETTING and CONNECTING (reconnect) states that want to be
+  transitioned to on error.
+- As there's separate paths, to recover from errors and disruptions,
+  it requires separate recovery/retry paths as well and can severely
+  convolute the controller state.
+
+This patch reworks the fc transport to use the same connect paths
+for the initial connection as it uses for reconnect. This makes a
+single path for error recovery and handling.
+
+This patch:
+- Removes the driving of the initial connect and replaces it with
+  a state transition to CONNECTING and initiating the reconnect
+  thread. A dummy state transition of RESETTING had to be traversed
+  as a direct transtion of NEW->CONNECTING is not allowed. Given
+  that the controller is "new", the RESETTING transition is a simple
+  no-op. Once in the reconnecting thread, the normal behaviors of
+  ctrl_loss_tmo (max_retries * connect_delay) and dev_loss_tmo will
+  apply before the controller is torn down.
+- Only if the state transitions couldn't be traversed and the
+  reconnect thread not scheduled, will the controller be torn down
+  while in create_ctrl.
+- The prior code used the controller state of NEW to indicate
+  whether request queues had been initialized or not. For the admin
+  queue, the request queue is always created, so there's no need to
+  check a state. For IO queues, change to tracking whether a successful
+  io request queue create has occurred (e.g. 1st successful connect).
+- The initial controller id is initialized to the dynamic controller
+  id used in the initial connect message. It will be overwritten by
+  the real controller id once the controller is connected on the wire.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 4c984154efa13175bbb1e2aeb1de9fb2960ca28c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index d165c0527376,9d826b726425..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -2715,8 -2618,7 +2718,12 @@@ nvme_fc_create_association(struct nvme_
+  	if (ret)
+  		goto out_delete_hw_queue;
+  
+++<<<<<<< HEAD
+ +	if (ctrl->ctrl.state != NVME_CTRL_NEW)
+ +		blk_mq_start_stopped_hw_queues(ctrl->ctrl.admin_q, true);
+++=======
++ 	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+++>>>>>>> 4c984154efa1 (nvme-fc: change controllers first connect to use reconnect path)
+  
+  	ret = nvmf_connect_admin_queue(&ctrl->ctrl);
+  	if (ret)
+@@@ -2866,8 -2778,7 +2873,12 @@@ nvme_fc_delete_association(struct nvme_
+  	 * use blk_mq_tagset_busy_itr() and the transport routine to
+  	 * terminate the exchanges.
+  	 */
+++<<<<<<< HEAD
+ +	if (ctrl->ctrl.state != NVME_CTRL_NEW)
+ +		blk_mq_stop_hw_queues(ctrl->ctrl.admin_q);
+++=======
++ 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+++>>>>>>> 4c984154efa1 (nvme-fc: change controllers first connect to use reconnect path)
+  	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
+  				nvme_fc_terminate_exchange, &ctrl->ctrl);
+  
+@@@ -3215,62 -3085,24 +3229,57 @@@ nvme_fc_init_ctrl(struct device *dev, s
+  	list_add_tail(&ctrl->ctrl_list, &rport->ctrl_list);
+  	spin_unlock_irqrestore(&rport->lock, flags);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * It's possible that transactions used to create the association
+ +	 * may fail. Examples: CreateAssociation LS or CreateIOConnection
+ +	 * LS gets dropped/corrupted/fails; or a frame gets dropped or a
+ +	 * command times out for one of the actions to init the controller
+ +	 * (Connect, Get/Set_Property, Set_Features, etc). Many of these
+ +	 * transport errors (frame drop, LS failure) inherently must kill
+ +	 * the association. The transport is coded so that any command used
+ +	 * to create the association (prior to a LIVE state transition
+ +	 * while NEW or RECONNECTING) will fail if it completes in error or
+ +	 * times out.
+ +	 *
+ +	 * As such: as the connect request was mostly likely due to a
+ +	 * udev event that discovered the remote port, meaning there is
+ +	 * not an admin or script there to restart if the connect
+ +	 * request fails, retry the initial connection creation up to
+ +	 * three times before giving up and declaring failure.
+ +	 */
+ +	for (retry = 0; retry < 3; retry++) {
+ +		ret = nvme_fc_create_association(ctrl);
+ +		if (!ret)
+ +			break;
+ +	}
+ +
+ +	if (ret) {
+ +		nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING);
+ +		cancel_work_sync(&ctrl->ctrl.reset_work);
+ +		cancel_delayed_work_sync(&ctrl->connect_work);
+ +
+ +		/* couldn't schedule retry - fail out */
+++=======
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING) ||
++ 	    !nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING)) {
+++>>>>>>> 4c984154efa1 (nvme-fc: change controllers first connect to use reconnect path)
+  		dev_err(ctrl->ctrl.device,
+- 			"NVME-FC{%d}: Connect retry failed\n", ctrl->cnum);
+- 
+- 		ctrl->ctrl.opts = NULL;
++ 			"NVME-FC{%d}: failed to init ctrl state\n", ctrl->cnum);
++ 		goto fail_ctrl;
++ 	}
+  
+- 		/* initiate nvme ctrl ref counting teardown */
+- 		nvme_uninit_ctrl(&ctrl->ctrl);
+ -	nvme_get_ctrl(&ctrl->ctrl);
+++	kref_get(&ctrl->ctrl.kref);
+  
+- 		/* Remove core ctrl ref. */
++ 	if (!queue_delayed_work(nvme_wq, &ctrl->connect_work, 0)) {
+  		nvme_put_ctrl(&ctrl->ctrl);
+- 
+- 		/* as we're past the point where we transition to the ref
+- 		 * counting teardown path, if we return a bad pointer here,
+- 		 * the calling routine, thinking it's prior to the
+- 		 * transition, will do an rport put. Since the teardown
+- 		 * path also does a rport put, we do an extra get here to
+- 		 * so proper order/teardown happens.
+- 		 */
+- 		nvme_fc_rport_get(rport);
+- 
+- 		if (ret > 0)
+- 			ret = -EIO;
+- 		return ERR_PTR(ret);
++ 		dev_err(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: failed to schedule initial connect\n",
++ 			ctrl->cnum);
++ 		goto fail_ctrl;
+  	}
+  
+- 	kref_get(&ctrl->ctrl.kref);
++ 	flush_delayed_work(&ctrl->connect_work);
+  
+  	dev_info(ctrl->ctrl.device,
+  		"NVME-FC{%d}: new ctrl: NQN \"%s\"\n",
+* Unmerged path drivers/nvme/host/fc.c
