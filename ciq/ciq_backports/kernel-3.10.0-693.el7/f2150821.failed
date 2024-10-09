@@ -1,0 +1,167 @@
+block: add REQ_OP definitions and helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit f21508211d2b16e65821abd171378fa6ece126fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f2150821.failed
+
+The following patches separate the operation (WRITE, READ, DISCARD,
+etc) from the rq_flag_bits flags. This patch adds definitions for
+request/bio operations (REQ_OPs) and adds request/bio accessors to
+get/set the op.
+
+In this patch the REQ_OPs match the REQ rq_flag_bits ones
+for compat reasons while all the code is converted to use the
+op accessors in the set. In the last patches the op will become a
+number and the accessors and helpers in this patch will be dropped
+or updated.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f21508211d2b16e65821abd171378fa6ece126fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk_types.h
+#	include/linux/blkdev.h
+diff --cc include/linux/blk_types.h
+index ff396bb3d876,6e60baa583da..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -264,4 -242,52 +264,55 @@@ enum rq_flag_bits 
+  #define REQ_HASHED		(1ULL << __REQ_HASHED)
+  #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
+  
+++<<<<<<< HEAD
+++=======
++ enum req_op {
++ 	REQ_OP_READ,
++ 	REQ_OP_WRITE		= REQ_WRITE,
++ 	REQ_OP_DISCARD		= REQ_DISCARD,
++ 	REQ_OP_WRITE_SAME	= REQ_WRITE_SAME,
++ };
++ 
++ /*
++  * tmp cpmpat. Users used to set the write bit for all non reads, but
++  * we will be dropping the bitmap use for ops. Support both until
++  * the end of the patchset.
++  */
++ static inline int op_from_rq_bits(u64 flags)
++ {
++ 	if (flags & REQ_OP_DISCARD)
++ 		return REQ_OP_DISCARD;
++ 	else if (flags & REQ_OP_WRITE_SAME)
++ 		return REQ_OP_WRITE_SAME;
++ 	else if (flags & REQ_OP_WRITE)
++ 		return REQ_OP_WRITE;
++ 	else
++ 		return REQ_OP_READ;
++ }
++ 
++ typedef unsigned int blk_qc_t;
++ #define BLK_QC_T_NONE	-1U
++ #define BLK_QC_T_SHIFT	16
++ 
++ static inline bool blk_qc_t_valid(blk_qc_t cookie)
++ {
++ 	return cookie != BLK_QC_T_NONE;
++ }
++ 
++ static inline blk_qc_t blk_tag_to_qc_t(unsigned int tag, unsigned int queue_num)
++ {
++ 	return tag | (queue_num << BLK_QC_T_SHIFT);
++ }
++ 
++ static inline unsigned int blk_qc_t_to_queue_num(blk_qc_t cookie)
++ {
++ 	return cookie >> BLK_QC_T_SHIFT;
++ }
++ 
++ static inline unsigned int blk_qc_t_to_tag(blk_qc_t cookie)
++ {
++ 	return cookie & ((1u << BLK_QC_T_SHIFT) - 1);
++ }
++ 
+++>>>>>>> f21508211d2b (block: add REQ_OP definitions and helpers)
+  #endif /* __LINUX_BLK_TYPES_H */
+diff --cc include/linux/blkdev.h
+index d0c02b856b7c,49c2dbcad583..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -667,7 -604,8 +674,12 @@@ static inline void queue_flag_clear(uns
+  
+  #define list_entry_rq(ptr)	list_entry((ptr), struct request, queuelist)
+  
+++<<<<<<< HEAD
+ +#define rq_data_dir(rq)		(((rq)->cmd_flags & 1) != 0)
+++=======
++ #define rq_data_dir(rq) \
++ 	(op_is_write(op_from_rq_bits(rq->cmd_flags)) ? WRITE : READ)
+++>>>>>>> f21508211d2b (block: add REQ_OP definitions and helpers)
+  
+  /*
+   * Driver can handle struct request, if it either has an old style
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index ab342b2c644b..82368793ce4e 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -44,6 +44,9 @@
+ #define BIO_MAX_SIZE		(BIO_MAX_PAGES << PAGE_CACHE_SHIFT)
+ #define BIO_MAX_SECTORS		(BIO_MAX_SIZE >> 9)
+ 
++#define bio_op(bio)				(op_from_rq_bits((bio)->bi_rw))
++#define bio_set_op_attrs(bio, op, flags)	((bio)->bi_rw |= (op | flags))
++
+ /*
+  * upper 16 bits of bi_rw define the io priority of this bio
+  */
+* Unmerged path include/linux/blk_types.h
+* Unmerged path include/linux/blkdev.h
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8dc175024e03..41f303785869 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2529,15 +2529,37 @@ extern void make_bad_inode(struct inode *);
+ extern int is_bad_inode(struct inode *);
+ 
+ #ifdef CONFIG_BLOCK
++/*
++ * tmp cpmpat. Users used to set the write bit for all non reads, but
++ * we will be dropping the bitmap use for ops. Support both until
++ * the end of the patchset.
++ */
++static inline bool op_is_write(unsigned long flags)
++{
++	if (flags & (REQ_OP_WRITE | REQ_OP_WRITE_SAME | REQ_OP_DISCARD))
++		return true;
++	else
++		return false;
++}
++
+ /*
+  * return READ, READA, or WRITE
+  */
+-#define bio_rw(bio)		((bio)->bi_rw & (RW_MASK | RWA_MASK))
++static inline int bio_rw(struct bio *bio)
++{
++	if (op_is_write(op_from_rq_bits(bio->bi_rw)))
++		return WRITE;
++
++	return bio->bi_rw & RWA_MASK;
++}
+ 
+ /*
+  * return data direction, READ or WRITE
+  */
+-#define bio_data_dir(bio)	((bio)->bi_rw & 1)
++static inline int bio_data_dir(struct bio *bio)
++{
++	return op_is_write(op_from_rq_bits(bio->bi_rw)) ? WRITE : READ;
++}
+ 
+ extern void check_disk_size_change(struct gendisk *disk,
+ 				   struct block_device *bdev);
