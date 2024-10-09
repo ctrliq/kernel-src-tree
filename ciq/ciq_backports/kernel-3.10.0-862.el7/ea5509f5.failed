@@ -1,0 +1,159 @@
+ibmvnic: Correct ibmvnic handling of device open/close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author John Allen <jallen@linux.vnet.ibm.com>
+commit ea5509f53ce81662eb409c514086734d1ce16207
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ea5509f5.failed
+
+When closing the ibmvnic device we need to release the resources used
+in communicating to the virtual I/O server. These need to be
+re-negotiated with the server at open time.
+
+This patch moves the releasing of resources a separate routine
+and updates the open and close handlers to release all resources at
+close and re-negotiate and allocate these resources at open.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ea5509f53ce81662eb409c514086734d1ce16207)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 6a325c61534d,30e1699649b8..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -110,6 -110,11 +110,14 @@@ static int ibmvnic_poll(struct napi_str
+  static void send_map_query(struct ibmvnic_adapter *adapter);
+  static void send_request_map(struct ibmvnic_adapter *, dma_addr_t, __be32, u8);
+  static void send_request_unmap(struct ibmvnic_adapter *, u8);
+++<<<<<<< HEAD
+++=======
++ static void send_login(struct ibmvnic_adapter *adapter);
++ static void send_cap_queries(struct ibmvnic_adapter *adapter);
++ static int init_sub_crq_irqs(struct ibmvnic_adapter *adapter);
++ static int ibmvnic_init(struct ibmvnic_adapter *);
++ static void ibmvnic_release_crq_queue(struct ibmvnic_adapter *);
+++>>>>>>> ea5509f53ce8 (ibmvnic: Correct ibmvnic handling of device open/close)
+  
+  struct ibmvnic_stat {
+  	char name[ETH_GSTRING_LEN];
+@@@ -377,8 -414,31 +385,33 @@@ static int ibmvnic_open(struct net_devi
+  	int rxadd_subcrqs;
+  	u64 *size_array;
+  	int tx_subcrqs;
+ -	int rc = 0;
+  	int i, j;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (adapter->is_closed) {
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = ibmvnic_login(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = netif_set_real_num_tx_queues(netdev, adapter->req_tx_queues);
++ 	if (rc) {
++ 		dev_err(dev, "failed to set the number of tx queues\n");
++ 		return -1;
++ 	}
++ 
++ 	rc = init_sub_crq_irqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "failed to initialize sub crq irqs\n");
++ 		return -1;
++ 	}
++ 
+++>>>>>>> ea5509f53ce8 (ibmvnic: Correct ibmvnic handling of device open/close)
+  	rxadd_subcrqs =
+  	    be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+  	tx_subcrqs =
+@@@ -3814,60 -3921,14 +3876,65 @@@ static int ibmvnic_probe(struct vio_de
+  	spin_lock_init(&adapter->error_list_lock);
+  	spin_lock_init(&adapter->inflight_lock);
+  
+ -	rc = ibmvnic_init(adapter);
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+ +
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+ +
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+ +
+ +	rc = init_sub_crq_irqs(adapter);
+  	if (rc) {
+ -		free_netdev(netdev);
+ -		return rc;
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+  	}
+  
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+++=======
++ 	netdev->mtu = adapter->req_mtu - ETH_HLEN;
++ 	adapter->is_closed = false;
+++>>>>>>> ea5509f53ce8 (ibmvnic: Correct ibmvnic handling of device open/close)
+  
+  	rc = register_netdev(netdev);
+  	if (rc) {
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.h b/drivers/net/ethernet/ibm/ibmvnic.h
+index 1e223c86bca9..e32bf96a1da8 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@ -1052,4 +1052,5 @@ struct ibmvnic_adapter {
+ 	struct work_struct ibmvnic_xport;
+ 	struct tasklet_struct tasklet;
+ 	bool failover;
++	bool is_closed;
+ };
