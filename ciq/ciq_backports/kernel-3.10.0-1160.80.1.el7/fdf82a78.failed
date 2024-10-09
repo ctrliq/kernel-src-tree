@@ -1,0 +1,201 @@
+x86/speculation: Protect against userspace-userspace spectreRSB
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit fdf82a7856b32d905c39afc85e34364491e46346
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/fdf82a78.failed
+
+The article "Spectre Returns! Speculation Attacks using the Return Stack 
+Buffer" [1] describes two new (sub-)variants of spectrev2-like attacks, 
+making use solely of the RSB contents even on CPUs that don't fallback to 
+BTB on RSB underflow (Skylake+).
+
+Mitigate userspace-userspace attacks by always unconditionally filling RSB on
+context switch when the generic spectrev2 mitigation has been enabled.
+
+[1] https://arxiv.org/pdf/1807.07940.pdf
+
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: David Woodhouse <dwmw@amazon.co.uk>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/nycvar.YFH.7.76.1807261308190.997@cbobk.fhfr.pm
+
+(cherry picked from commit fdf82a7856b32d905c39afc85e34364491e46346)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index a7e93ef81745,bc8c43b22460..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -732,16 -313,10 +732,23 @@@ static enum spectre_v2_mitigation_cmd _
+  	return cmd;
+  }
+  
+++<<<<<<< HEAD
+ +void __spectre_v2_select_mitigation(void)
+ +{
+ +	const bool full_retpoline = IS_ENABLED(CONFIG_RETPOLINE) && retp_compiler();
+ +	enum spectre_v2_mitigation_cmd cmd = spectre_v2_cmd;
+ +
+ +	/* Initialize Indirect Branch Prediction Barrier if supported */
+ +	if (boot_cpu_has(X86_FEATURE_IBPB)) {
+ +		setup_force_cpu_cap(X86_FEATURE_USE_IBPB);
+ +		pr_info("Enabling Indirect Branch Prediction Barrier\n");
+ +	}
+++=======
++ static void __init spectre_v2_select_mitigation(void)
++ {
++ 	enum spectre_v2_mitigation_cmd cmd = spectre_v2_parse_cmdline();
++ 	enum spectre_v2_mitigation mode = SPECTRE_V2_NONE;
+++>>>>>>> fdf82a7856b3 (x86/speculation: Protect against userspace-userspace spectreRSB)
+  
+  	/*
+  	 * If the CPU is not affected and the command line mode is NONE or AUTO
+@@@ -757,74 -332,70 +764,87 @@@
+  
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_amd;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_generic;
+ +		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+ +			spec_ctrl_enable_ibrs_enhanced();
+ +			return;
+ +		}
+  		break;
+ +
+  	case SPECTRE_V2_CMD_RETPOLINE:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ +		spec_ctrl_enable_retpoline();
+ +		return;
+ +
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_force_enable_ibrs())
+ +			return;
+  		break;
+ -	}
+ -	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ -	return;
+  
+ -retpoline_auto:
+ -	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {
+ -	retpoline_amd:
+ -		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ -			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ -			goto retpoline_generic;
+ -		}
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_AMD :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL_AMD;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	} else {
+ -	retpoline_generic:
+ -		mode = retp_compiler() ? SPECTRE_V2_RETPOLINE_GENERIC :
+ -					 SPECTRE_V2_RETPOLINE_MINIMAL;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		if (spec_ctrl_enable_ibrs_always() ||
+ +		    spec_ctrl_force_enable_ibp_disabled())
+ +			return;
+ +		break;
+ +
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		if (spec_ctrl_enable_retpoline_ibrs_user())
+ +			return;
+ +		break;
+  	}
+  
+ -	spectre_v2_enabled = mode;
+ -	pr_info("%s\n", spectre_v2_strings[mode]);
+ +	if (spec_ctrl_cond_enable_ibrs(full_retpoline))
+ +		return;
+  
+++<<<<<<< HEAD
+ +	if (spec_ctrl_cond_enable_ibp_disabled())
+ +		return;
+++=======
++ 	/*
++ 	 * If spectre v2 protection has been enabled, unconditionally fill
++ 	 * RSB during a context switch; this protects against two independent
++ 	 * issues:
++ 	 *
++ 	 *	- RSB underflow (and switch to BTB) on Skylake+
++ 	 *	- SpectreRSB variant of spectre v2 on X86_BUG_SPECTRE_V2 CPUs
++ 	 */
++ 	setup_force_cpu_cap(X86_FEATURE_RSB_CTXSW);
++ 	pr_info("Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch\n");
+++>>>>>>> fdf82a7856b3 (x86/speculation: Protect against userspace-userspace spectreRSB)
+  
+ -	/* Initialize Indirect Branch Prediction Barrier if supported */
+ -	if (boot_cpu_has(X86_FEATURE_IBPB)) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBPB);
+ -		pr_info("Spectre v2 mitigation: Enabling Indirect Branch Prediction Barrier\n");
+ -	}
+ +	spec_ctrl_enable_retpoline();
+ +}
+ +
+ +void spectre_v2_print_mitigation(void)
+ +{
+ +
+ +	pr_info("%s\n", spectre_v2_strings[spec_ctrl_get_mitigation()]);
+ +}
+ +
+ +#undef pr_fmt
+ +#define pr_fmt(fmt) fmt
+ +
+ +/* Update the static key controlling the MDS CPU buffer clear in idle */
+ +static void update_mds_branch_idle(void)
+ +{
+ +	u64 ia32_cap = x86_read_arch_cap_msr();
+  
+  	/*
+ -	 * Retpoline means the kernel is safe because it has no indirect
+ -	 * branches. But firmware isn't, so use IBRS to protect that.
+ +	 * Enable the idle clearing if SMT is active on CPUs which are
+ +	 * affected only by MSBDS and not any other MDS variant.
+ +	 *
+ +	 * The other variants cannot be mitigated when SMT is enabled, so
+ +	 * clearing the buffers on idle just to prevent the Store Buffer
+ +	 * repartitioning leak would be a window dressing exercise.
+  	 */
+ -	if (boot_cpu_has(X86_FEATURE_IBRS)) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBRS_FW);
+ -		pr_info("Enabling Restricted Speculation for firmware calls\n");
+ +	if (!boot_cpu_has(X86_BUG_MSBDS_ONLY))
+ +		return;
+ +
+ +	if (sched_smt_active()) {
+ +		if (!static_key_enabled(&mds_idle_clear))
+ +			static_key_slow_inc(&mds_idle_clear);
+ +	} else if (mmio_mitigation == MMIO_MITIGATION_OFF ||
+ +		   (ia32_cap & ARCH_CAP_FBSDP_NO)) {
+ +		if (static_key_enabled(&mds_idle_clear))
+ +			static_key_slow_dec(&mds_idle_clear);
+  	}
+  }
+  
+* Unmerged path arch/x86/kernel/cpu/bugs.c
