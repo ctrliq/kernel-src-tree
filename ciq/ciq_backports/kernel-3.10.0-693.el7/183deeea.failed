@@ -1,0 +1,285 @@
+powerpc/pseries: Consolidate CPU hotplug code to hotplug-cpu.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Consolidate CPU hotplug code to hotplug-cpu.c (Thomas Huth) [1323417]
+Rebuild_FUZZ: 93.10%
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 183deeea5871a6f750ec64ab1cff85fb089d38df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/183deeea.failed
+
+No functional changes, this patch is simply a move of the cpu hotplug
+code from pseries/dlpar.c to pseries/hotplug-cpu.c. This is in an effort
+to consolidate all of the cpu hotplug code in a common place.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 183deeea5871a6f750ec64ab1cff85fb089d38df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/dlpar.c
+diff --cc arch/powerpc/platforms/pseries/dlpar.c
+index eb48c7790834,438fdbd7e40e..000000000000
+--- a/arch/powerpc/platforms/pseries/dlpar.c
++++ b/arch/powerpc/platforms/pseries/dlpar.c
+@@@ -18,7 -18,9 +18,13 @@@
+  #include <linux/cpu.h>
+  #include <linux/slab.h>
+  #include <linux/of.h>
+++<<<<<<< HEAD
+ +#include "offline_states.h"
+++=======
++ 
++ #include "of_helpers.h"
++ #include "pseries.h"
+++>>>>>>> 183deeea5871 (powerpc/pseries: Consolidate CPU hotplug code to hotplug-cpu.c)
+  
+  #include <asm/prom.h>
+  #include <asm/machdep.h>
+* Unmerged path arch/powerpc/platforms/pseries/dlpar.c
+diff --git a/arch/powerpc/platforms/pseries/hotplug-cpu.c b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+index 5c375f93c669..e23dfb5cbbc1 100644
+--- a/arch/powerpc/platforms/pseries/hotplug-cpu.c
++++ b/arch/powerpc/platforms/pseries/hotplug-cpu.c
+@@ -32,6 +32,7 @@
+ #include <asm/xics.h>
+ #include <asm/plpar_wrappers.h>
+ 
++#include "pseries.h"
+ #include "offline_states.h"
+ 
+ /* This version can't take the spinlock, because it never returns */
+@@ -339,6 +340,218 @@ static void pseries_remove_processor(struct device_node *np)
+ 	cpu_maps_update_done();
+ }
+ 
++#ifdef CONFIG_ARCH_CPU_PROBE_RELEASE
++
++static int dlpar_online_cpu(struct device_node *dn)
++{
++	int rc = 0;
++	unsigned int cpu;
++	int len, nthreads, i;
++	const __be32 *intserv;
++	u32 thread;
++
++	intserv = of_get_property(dn, "ibm,ppc-interrupt-server#s", &len);
++	if (!intserv)
++		return -EINVAL;
++
++	nthreads = len / sizeof(u32);
++
++	cpu_maps_update_begin();
++	for (i = 0; i < nthreads; i++) {
++		thread = be32_to_cpu(intserv[i]);
++		for_each_present_cpu(cpu) {
++			if (get_hard_smp_processor_id(cpu) != thread)
++				continue;
++			BUG_ON(get_cpu_current_state(cpu)
++					!= CPU_STATE_OFFLINE);
++			cpu_maps_update_done();
++			rc = device_online(get_cpu_device(cpu));
++			if (rc)
++				goto out;
++			cpu_maps_update_begin();
++
++			break;
++		}
++		if (cpu == num_possible_cpus())
++			printk(KERN_WARNING "Could not find cpu to online "
++			       "with physical id 0x%x\n", thread);
++	}
++	cpu_maps_update_done();
++
++out:
++	return rc;
++
++}
++
++static bool dlpar_cpu_exists(struct device_node *parent, u32 drc_index)
++{
++	struct device_node *child = NULL;
++	u32 my_drc_index;
++	bool found;
++	int rc;
++
++	/* Assume cpu doesn't exist */
++	found = false;
++
++	for_each_child_of_node(parent, child) {
++		rc = of_property_read_u32(child, "ibm,my-drc-index",
++					  &my_drc_index);
++		if (rc)
++			continue;
++
++		if (my_drc_index == drc_index) {
++			of_node_put(child);
++			found = true;
++			break;
++		}
++	}
++
++	return found;
++}
++
++static ssize_t dlpar_cpu_probe(const char *buf, size_t count)
++{
++	struct device_node *dn, *parent;
++	u32 drc_index;
++	int rc;
++
++	rc = kstrtou32(buf, 0, &drc_index);
++	if (rc)
++		return -EINVAL;
++
++	parent = of_find_node_by_path("/cpus");
++	if (!parent)
++		return -ENODEV;
++
++	if (dlpar_cpu_exists(parent, drc_index)) {
++		of_node_put(parent);
++		printk(KERN_WARNING "CPU with drc index %x already exists\n",
++		       drc_index);
++		return -EINVAL;
++	}
++
++	rc = dlpar_acquire_drc(drc_index);
++	if (rc) {
++		of_node_put(parent);
++		return -EINVAL;
++	}
++
++	dn = dlpar_configure_connector(cpu_to_be32(drc_index), parent);
++	of_node_put(parent);
++	if (!dn)
++		return -EINVAL;
++
++	rc = dlpar_attach_node(dn);
++	if (rc) {
++		dlpar_release_drc(drc_index);
++		dlpar_free_cc_nodes(dn);
++		return rc;
++	}
++
++	rc = dlpar_online_cpu(dn);
++	if (rc)
++		return rc;
++
++	return count;
++}
++
++static int dlpar_offline_cpu(struct device_node *dn)
++{
++	int rc = 0;
++	unsigned int cpu;
++	int len, nthreads, i;
++	const __be32 *intserv;
++	u32 thread;
++
++	intserv = of_get_property(dn, "ibm,ppc-interrupt-server#s", &len);
++	if (!intserv)
++		return -EINVAL;
++
++	nthreads = len / sizeof(u32);
++
++	cpu_maps_update_begin();
++	for (i = 0; i < nthreads; i++) {
++		thread = be32_to_cpu(intserv[i]);
++		for_each_present_cpu(cpu) {
++			if (get_hard_smp_processor_id(cpu) != thread)
++				continue;
++
++			if (get_cpu_current_state(cpu) == CPU_STATE_OFFLINE)
++				break;
++
++			if (get_cpu_current_state(cpu) == CPU_STATE_ONLINE) {
++				set_preferred_offline_state(cpu,
++							    CPU_STATE_OFFLINE);
++				cpu_maps_update_done();
++				rc = device_offline(get_cpu_device(cpu));
++				if (rc)
++					goto out;
++				cpu_maps_update_begin();
++				break;
++
++			}
++
++			/*
++			 * The cpu is in CPU_STATE_INACTIVE.
++			 * Upgrade it's state to CPU_STATE_OFFLINE.
++			 */
++			set_preferred_offline_state(cpu, CPU_STATE_OFFLINE);
++			BUG_ON(plpar_hcall_norets(H_PROD, thread)
++								!= H_SUCCESS);
++			__cpu_die(cpu);
++			break;
++		}
++		if (cpu == num_possible_cpus())
++			printk(KERN_WARNING "Could not find cpu to offline with physical id 0x%x\n", thread);
++	}
++	cpu_maps_update_done();
++
++out:
++	return rc;
++
++}
++
++static ssize_t dlpar_cpu_release(const char *buf, size_t count)
++{
++	struct device_node *dn;
++	u32 drc_index;
++	int rc;
++
++	dn = of_find_node_by_path(buf);
++	if (!dn)
++		return -EINVAL;
++
++	rc = of_property_read_u32(dn, "ibm,my-drc-index", &drc_index);
++	if (rc) {
++		of_node_put(dn);
++		return -EINVAL;
++	}
++
++	rc = dlpar_offline_cpu(dn);
++	if (rc) {
++		of_node_put(dn);
++		return -EINVAL;
++	}
++
++	rc = dlpar_release_drc(drc_index);
++	if (rc) {
++		of_node_put(dn);
++		return rc;
++	}
++
++	rc = dlpar_detach_node(dn);
++	if (rc) {
++		dlpar_acquire_drc(drc_index);
++		return rc;
++	}
++
++	of_node_put(dn);
++
++	return count;
++}
++
++#endif /* CONFIG_ARCH_CPU_PROBE_RELEASE */
++
+ static int pseries_smp_notifier(struct notifier_block *nb,
+ 				unsigned long action, void *node)
+ {
+@@ -384,6 +597,11 @@ static int __init pseries_cpu_hotplug_init(void)
+ 	int cpu;
+ 	int qcss_tok;
+ 
++#ifdef CONFIG_ARCH_CPU_PROBE_RELEASE
++	ppc_md.cpu_probe = dlpar_cpu_probe;
++	ppc_md.cpu_release = dlpar_cpu_release;
++#endif /* CONFIG_ARCH_CPU_PROBE_RELEASE */
++
+ 	for_each_node_by_name(np, "interrupt-controller") {
+ 		typep = of_get_property(np, "compatible", NULL);
+ 		if (strstr(typep, "open-pic")) {
