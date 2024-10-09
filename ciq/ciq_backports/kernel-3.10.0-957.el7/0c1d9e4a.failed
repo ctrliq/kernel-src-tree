@@ -1,0 +1,372 @@
+xfs: simplify validation of the unwritten extent bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0c1d9e4a61590c2a4d657d1deddd1674f1565097
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0c1d9e4a.failed
+
+XFS only supports the unwritten extent bit in the data fork, and only if
+the file system has a version 5 superblock or the unwritten extent
+feature bit.
+
+We currently have two routines that validate the invariant:
+xfs_check_nostate_extents which return -EFSCORRUPTED when it's not met,
+and xfs_validate_extent that triggers and assert in debug build.
+
+Both of them iterate over all extents of an inode fork when called,
+which isn't very efficient.
+
+This patch instead adds a new helper that verifies the invariant one
+extent at a time, and calls it from the places where we iterate over
+all extents to converted them from or two the in-memory format.  The
+callers then return -EFSCORRUPTED when reading invalid extents from
+disk, or trigger an assert when writing them to disk.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 0c1d9e4a61590c2a4d657d1deddd1674f1565097)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.h
+#	fs/xfs/libxfs/xfs_bmap_btree.h
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index b02804fe53c5,c35a14fa1527..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -190,19 -239,42 +190,27 @@@ int	xfs_bunmapi(struct xfs_trans *tp, s
+  		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
+  		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
+  		struct xfs_defer_ops *dfops, int *done);
+++<<<<<<< HEAD
+ +int	xfs_check_nostate_extents(struct xfs_ifork *ifp, xfs_extnum_t idx,
+ +		xfs_extnum_t num);
+++=======
++ int	xfs_bmap_del_extent_delay(struct xfs_inode *ip, int whichfork,
++ 		xfs_extnum_t *idx, struct xfs_bmbt_irec *got,
++ 		struct xfs_bmbt_irec *del);
++ void	xfs_bmap_del_extent_cow(struct xfs_inode *ip, xfs_extnum_t *idx,
++ 		struct xfs_bmbt_irec *got, struct xfs_bmbt_irec *del);
+++>>>>>>> 0c1d9e4a6159 (xfs: simplify validation of the unwritten extent bit)
+  uint	xfs_default_attroffset(struct xfs_inode *ip);
+  int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+ -		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
+ -		int *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
+ -		struct xfs_defer_ops *dfops, enum shift_direction direction,
+ -		int num_exts);
+ -int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
+ -int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, int whichfork,
+ -		xfs_fileoff_t off, xfs_filblks_t len, xfs_filblks_t prealloc,
+ -		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
+ -
+ -enum xfs_bmap_intent_type {
+ -	XFS_BMAP_MAP = 1,
+ -	XFS_BMAP_UNMAP,
+ -};
+ -
+ -struct xfs_bmap_intent {
+ -	struct list_head			bi_list;
+ -	enum xfs_bmap_intent_type		bi_type;
+ -	struct xfs_inode			*bi_owner;
+ -	int					bi_whichfork;
+ -	struct xfs_bmbt_irec			bi_bmap;
+ -};
+ -
+ -int	xfs_bmap_finish_one(struct xfs_trans *tp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, enum xfs_bmap_intent_type type,
+ -		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
+ -		xfs_filblks_t blockcount, xfs_exntst_t state);
+ -int	xfs_bmap_map_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+ -int	xfs_bmap_unmap_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+ +		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
+ +		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
+ +		struct xfs_defer_ops *dfops, int num_exts);
+ +struct xfs_bmbt_rec_host *
+ +	xfs_bmap_search_extents(struct xfs_inode *ip, xfs_fileoff_t bno,
+ +		int fork, int *eofp, xfs_extnum_t *lastxp,
+ +		struct xfs_bmbt_irec *gotp, struct xfs_bmbt_irec *prevp);
+ +int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t aoff,
+ +		xfs_filblks_t len, struct xfs_bmbt_irec *got,
+ +		struct xfs_bmbt_irec *prev, xfs_extnum_t *lastx, int eof);
+  
+  #endif	/* __XFS_BMAP_H__ */
+diff --cc fs/xfs/libxfs/xfs_bmap_btree.h
+index 819a8a4dee95,9da5a8d4f184..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap_btree.h
++++ b/fs/xfs/libxfs/xfs_bmap_btree.h
+@@@ -25,14 -25,6 +25,17 @@@ struct xfs_inode
+  struct xfs_trans;
+  
+  /*
+++<<<<<<< HEAD
+ + * Extent state and extent format macros.
+ + */
+ +#define XFS_EXTFMT_INODE(x)	\
+ +	(xfs_sb_version_hasextflgbit(&((x)->i_mount->m_sb)) ? \
+ +		XFS_EXTFMT_HASSTATE : XFS_EXTFMT_NOSTATE)
+ +#define ISUNWRITTEN(x)	((x)->br_state == XFS_EXT_UNWRITTEN)
+ +
+ +/*
+++=======
+++>>>>>>> 0c1d9e4a6159 (xfs: simplify validation of the unwritten extent bit)
+   * Btree block header size depends on a superblock flag.
+   */
+  #define XFS_BMBT_BLOCK_LEN(mp) \
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 0b8885f65b8b..60cc08542e33 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -1203,7 +1203,6 @@ xfs_bmap_read_extents(
+ 	xfs_fsblock_t		bno;	/* block # of "block" */
+ 	xfs_buf_t		*bp;	/* buffer for "block" */
+ 	int			error;	/* error return value */
+-	xfs_exntfmt_t		exntf;	/* XFS_EXTFMT_NOSTATE, if checking */
+ 	xfs_extnum_t		i, j;	/* index into the extents list */
+ 	xfs_ifork_t		*ifp;	/* fork structure */
+ 	int			level;	/* btree level, for checking */
+@@ -1214,8 +1213,6 @@ xfs_bmap_read_extents(
+ 
+ 	mp = ip->i_mount;
+ 	ifp = XFS_IFORK_PTR(ip, whichfork);
+-	exntf = (whichfork != XFS_DATA_FORK) ? XFS_EXTFMT_NOSTATE :
+-					XFS_EXTFMT_INODE(ip);
+ 	block = ifp->if_broot;
+ 	/*
+ 	 * Root level must use BMAP_BROOT_PTR_ADDR macro to get ptr out.
+@@ -1283,18 +1280,9 @@ xfs_bmap_read_extents(
+ 			xfs_bmbt_rec_host_t *trp = xfs_iext_get_ext(ifp, i);
+ 			trp->l0 = be64_to_cpu(frp->l0);
+ 			trp->l1 = be64_to_cpu(frp->l1);
+-		}
+-		if (exntf == XFS_EXTFMT_NOSTATE) {
+-			/*
+-			 * Check all attribute bmap btree records and
+-			 * any "older" data bmap btree records for a
+-			 * set bit in the "extent flag" position.
+-			 */
+-			if (unlikely(xfs_check_nostate_extents(ifp,
+-					start, num_recs))) {
++			if (!xfs_bmbt_validate_extent(mp, whichfork, trp)) {
+ 				XFS_ERROR_REPORT("xfs_bmap_read_extents(2)",
+-						 XFS_ERRLEVEL_LOW,
+-						 ip->i_mount);
++						 XFS_ERRLEVEL_LOW, mp);
+ 				goto error0;
+ 			}
+ 		}
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
+diff --git a/fs/xfs/libxfs/xfs_bmap_btree.c b/fs/xfs/libxfs/xfs_bmap_btree.c
+index 02efded83ebf..1784ce682710 100644
+--- a/fs/xfs/libxfs/xfs_bmap_btree.c
++++ b/fs/xfs/libxfs/xfs_bmap_btree.c
+@@ -371,32 +371,6 @@ xfs_bmbt_to_bmdr(
+ 	memcpy(tpp, fpp, sizeof(*fpp) * dmxr);
+ }
+ 
+-/*
+- * Check extent records, which have just been read, for
+- * any bit in the extent flag field. ASSERT on debug
+- * kernels, as this condition should not occur.
+- * Return an error condition (1) if any flags found,
+- * otherwise return 0.
+- */
+-
+-int
+-xfs_check_nostate_extents(
+-	xfs_ifork_t		*ifp,
+-	xfs_extnum_t		idx,
+-	xfs_extnum_t		num)
+-{
+-	for (; num > 0; num--, idx++) {
+-		xfs_bmbt_rec_host_t *ep = xfs_iext_get_ext(ifp, idx);
+-		if ((ep->l0 >>
+-		     (64 - BMBT_EXNTFLAG_BITLEN)) != 0) {
+-			ASSERT(0);
+-			return 1;
+-		}
+-	}
+-	return 0;
+-}
+-
+-
+ STATIC struct xfs_btree_cur *
+ xfs_bmbt_dup_cursor(
+ 	struct xfs_btree_cur	*cur)
+* Unmerged path fs/xfs/libxfs/xfs_bmap_btree.h
+diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+index 7adfccb0f769..b10fa104e632 100644
+--- a/fs/xfs/libxfs/xfs_format.h
++++ b/fs/xfs/libxfs/xfs_format.h
+@@ -1384,14 +1384,6 @@ static inline xfs_filblks_t startblockval(xfs_fsblock_t x)
+ 	return (xfs_filblks_t)((x) & ~STARTBLOCKMASK);
+ }
+ 
+-/*
+- * Possible extent formats.
+- */
+-typedef enum {
+-	XFS_EXTFMT_NOSTATE = 0,
+-	XFS_EXTFMT_HASSTATE
+-} xfs_exntfmt_t;
+-
+ /*
+  * Possible extent states.
+  */
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.c b/fs/xfs/libxfs/xfs_inode_fork.c
+index 8d32195a5669..e3a778ad7a0b 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@ -42,35 +42,6 @@ STATIC int xfs_iformat_local(xfs_inode_t *, xfs_dinode_t *, int, int);
+ STATIC int xfs_iformat_extents(xfs_inode_t *, xfs_dinode_t *, int);
+ STATIC int xfs_iformat_btree(xfs_inode_t *, xfs_dinode_t *, int);
+ 
+-#ifdef DEBUG
+-/*
+- * Make sure that the extents in the given memory buffer
+- * are valid.
+- */
+-void
+-xfs_validate_extents(
+-	xfs_ifork_t		*ifp,
+-	int			nrecs,
+-	xfs_exntfmt_t		fmt)
+-{
+-	xfs_bmbt_irec_t		irec;
+-	xfs_bmbt_rec_host_t	rec;
+-	int			i;
+-
+-	for (i = 0; i < nrecs; i++) {
+-		xfs_bmbt_rec_host_t *ep = xfs_iext_get_ext(ifp, i);
+-		rec.l0 = get_unaligned(&ep->l0);
+-		rec.l1 = get_unaligned(&ep->l1);
+-		xfs_bmbt_get_all(&rec, &irec);
+-		if (fmt == XFS_EXTFMT_NOSTATE)
+-			ASSERT(irec.br_state == XFS_EXT_NORM);
+-	}
+-}
+-#else /* DEBUG */
+-#define xfs_validate_extents(ifp, nrecs, fmt)
+-#endif /* DEBUG */
+-
+-
+ /*
+  * Move inode type and inode format specific information from the
+  * on-disk inode to the in-core inode.  For fifos, devs, and sockets
+@@ -310,40 +281,33 @@ xfs_iformat_local(
+ }
+ 
+ /*
+- * The file consists of a set of extents all
+- * of which fit into the on-disk inode.
+- * If there are few enough extents to fit into
+- * the if_inline_ext, then copy them there.
+- * Otherwise allocate a buffer for them and copy
+- * them into it.  Either way, set if_extents
+- * to point at the extents.
++ * The file consists of a set of extents all of which fit into the on-disk
++ * inode.  If there are few enough extents to fit into the if_inline_ext, then
++ * copy them there.  Otherwise allocate a buffer for them and copy them into it.
++ * Either way, set if_extents to point at the extents.
+  */
+ STATIC int
+ xfs_iformat_extents(
+-	xfs_inode_t	*ip,
+-	xfs_dinode_t	*dip,
+-	int		whichfork)
++	struct xfs_inode	*ip,
++	struct xfs_dinode	*dip,
++	int			whichfork)
+ {
+-	xfs_bmbt_rec_t	*dp;
+-	xfs_ifork_t	*ifp;
+-	int		nex;
+-	int		size;
+-	int		i;
+-
+-	ifp = XFS_IFORK_PTR(ip, whichfork);
+-	nex = XFS_DFORK_NEXTENTS(dip, whichfork);
+-	size = nex * (uint)sizeof(xfs_bmbt_rec_t);
++	struct xfs_mount	*mp = ip->i_mount;
++	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
++	int			nex = XFS_DFORK_NEXTENTS(dip, whichfork);
++	int			size = nex * sizeof(xfs_bmbt_rec_t);
++	struct xfs_bmbt_rec	*dp;
++	int			i;
+ 
+ 	/*
+-	 * If the number of extents is unreasonable, then something
+-	 * is wrong and we just bail out rather than crash in
+-	 * kmem_alloc() or memcpy() below.
++	 * If the number of extents is unreasonable, then something is wrong and
++	 * we just bail out rather than crash in kmem_alloc() or memcpy() below.
+ 	 */
+-	if (unlikely(size < 0 || size > XFS_DFORK_SIZE(dip, ip->i_mount, whichfork))) {
++	if (unlikely(size < 0 || size > XFS_DFORK_SIZE(dip, mp, whichfork))) {
+ 		xfs_warn(ip->i_mount, "corrupt inode %Lu ((a)extents = %d).",
+ 			(unsigned long long) ip->i_ino, nex);
+ 		XFS_CORRUPTION_ERROR("xfs_iformat_extents(1)", XFS_ERRLEVEL_LOW,
+-				     ip->i_mount, dip);
++				     mp, dip);
+ 		return -EFSCORRUPTED;
+ 	}
+ 
+@@ -358,22 +322,17 @@ xfs_iformat_extents(
+ 	ifp->if_bytes = size;
+ 	if (size) {
+ 		dp = (xfs_bmbt_rec_t *) XFS_DFORK_PTR(dip, whichfork);
+-		xfs_validate_extents(ifp, nex, XFS_EXTFMT_INODE(ip));
+ 		for (i = 0; i < nex; i++, dp++) {
+ 			xfs_bmbt_rec_host_t *ep = xfs_iext_get_ext(ifp, i);
+ 			ep->l0 = get_unaligned_be64(&dp->l0);
+ 			ep->l1 = get_unaligned_be64(&dp->l1);
++			if (!xfs_bmbt_validate_extent(mp, whichfork, ep)) {
++				XFS_ERROR_REPORT("xfs_iformat_extents(2)",
++						 XFS_ERRLEVEL_LOW, mp);
++				return -EFSCORRUPTED;
++			}
+ 		}
+ 		XFS_BMAP_TRACE_EXLIST(ip, nex, whichfork);
+-		if (whichfork != XFS_DATA_FORK ||
+-			XFS_EXTFMT_INODE(ip) == XFS_EXTFMT_NOSTATE)
+-				if (unlikely(xfs_check_nostate_extents(
+-				    ifp, 0, nex))) {
+-					XFS_ERROR_REPORT("xfs_iformat_extents(2)",
+-							 XFS_ERRLEVEL_LOW,
+-							 ip->i_mount);
+-					return -EFSCORRUPTED;
+-				}
+ 	}
+ 	ifp->if_flags |= XFS_IFEXTENTS;
+ 	return 0;
+@@ -474,7 +433,6 @@ xfs_iread_extents(
+ 		xfs_iext_destroy(ifp);
+ 		return error;
+ 	}
+-	xfs_validate_extents(ifp, nextents, XFS_EXTFMT_INODE(ip));
+ 	ifp->if_flags |= XFS_IFEXTENTS;
+ 	return 0;
+ }
+@@ -790,6 +748,9 @@ xfs_iextents_copy(
+ 	copied = 0;
+ 	for (i = 0; i < nrecs; i++) {
+ 		xfs_bmbt_rec_host_t *ep = xfs_iext_get_ext(ifp, i);
++
++		ASSERT(xfs_bmbt_validate_extent(ip->i_mount, whichfork, ep));
++
+ 		start_block = xfs_bmbt_get_startblock(ep);
+ 		if (isnullstartblock(start_block)) {
+ 			/*
+@@ -805,7 +766,6 @@ xfs_iextents_copy(
+ 		copied++;
+ 	}
+ 	ASSERT(copied != 0);
+-	xfs_validate_extents(ifp, copied, XFS_EXTFMT_INODE(ip));
+ 
+ 	return (copied * (uint)sizeof(xfs_bmbt_rec_t));
+ }
