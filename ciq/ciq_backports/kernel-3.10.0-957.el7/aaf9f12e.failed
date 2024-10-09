@@ -1,0 +1,266 @@
+md/raid5: sort bios
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid5: sort bios (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 91.43%
+commit-author Shaohua Li <shli@fb.com>
+commit aaf9f12ebfafd1ea603d61ead6dbcf456a86e0f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/aaf9f12e.failed
+
+Previous patch (raid5: only dispatch IO from raid5d for harddisk raid)
+defers IO dispatching. The goal is to create better IO pattern. At that
+time, we don't sort the deffered IO and hope the block layer can do IO
+merge and sort. Now the raid5-cache writeback could create large amount
+of bios. And if we enable muti-thread for stripe handling, we can't
+control when to dispatch IO to raid disks. In a lot of time, we are
+dispatching IO which block layer can't do merge effectively.
+
+This patch moves further for the IO dispatching defer. We accumulate
+bios, but we don't dispatch all the bios after a threshold is met. This
+'dispatch partial portion of bios' stragety allows bios coming in a
+large time window are sent to disks together. At the dispatching time,
+there is large chance the block layer can merge the bios. To make this
+more effective, we dispatch IO in ascending order. This increases
+request merge chance and reduces disk seek.
+
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit aaf9f12ebfafd1ea603d61ead6dbcf456a86e0f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+#	drivers/md/raid5.h
+diff --cc drivers/md/raid5.c
+index 0d38d591bfa3,013398ce2080..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -55,7 -55,10 +55,8 @@@
+  #include <linux/ratelimit.h>
+  #include <linux/nodemask.h>
+  #include <linux/flex_array.h>
+ -#include <linux/sched/signal.h>
+ -
+  #include <trace/events/block.h>
++ #include <linux/list_sort.h>
+  
+  #include "md.h"
+  #include "raid5.h"
+@@@ -883,10 -879,113 +884,116 @@@ static int use_new_offset(struct r5con
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dispatch_bio_list(struct bio_list *tmp)
++ {
++ 	struct bio *bio;
++ 
++ 	while ((bio = bio_list_pop(tmp)))
++ 		generic_make_request(bio);
++ }
++ 
++ static int cmp_stripe(void *priv, struct list_head *a, struct list_head *b)
++ {
++ 	const struct r5pending_data *da = list_entry(a,
++ 				struct r5pending_data, sibling);
++ 	const struct r5pending_data *db = list_entry(b,
++ 				struct r5pending_data, sibling);
++ 	if (da->sector > db->sector)
++ 		return 1;
++ 	if (da->sector < db->sector)
++ 		return -1;
++ 	return 0;
++ }
++ 
++ static void dispatch_defer_bios(struct r5conf *conf, int target,
++ 				struct bio_list *list)
++ {
++ 	struct r5pending_data *data;
++ 	struct list_head *first, *next = NULL;
++ 	int cnt = 0;
++ 
++ 	if (conf->pending_data_cnt == 0)
++ 		return;
++ 
++ 	list_sort(NULL, &conf->pending_list, cmp_stripe);
++ 
++ 	first = conf->pending_list.next;
++ 
++ 	/* temporarily move the head */
++ 	if (conf->next_pending_data)
++ 		list_move_tail(&conf->pending_list,
++ 				&conf->next_pending_data->sibling);
++ 
++ 	while (!list_empty(&conf->pending_list)) {
++ 		data = list_first_entry(&conf->pending_list,
++ 			struct r5pending_data, sibling);
++ 		if (&data->sibling == first)
++ 			first = data->sibling.next;
++ 		next = data->sibling.next;
++ 
++ 		bio_list_merge(list, &data->bios);
++ 		list_move(&data->sibling, &conf->free_list);
++ 		cnt++;
++ 		if (cnt >= target)
++ 			break;
++ 	}
++ 	conf->pending_data_cnt -= cnt;
++ 	BUG_ON(conf->pending_data_cnt < 0 || cnt < target);
++ 
++ 	if (next != &conf->pending_list)
++ 		conf->next_pending_data = list_entry(next,
++ 				struct r5pending_data, sibling);
++ 	else
++ 		conf->next_pending_data = NULL;
++ 	/* list isn't empty */
++ 	if (first != &conf->pending_list)
++ 		list_move_tail(&conf->pending_list, first);
++ }
++ 
++ static void flush_deferred_bios(struct r5conf *conf)
++ {
++ 	struct bio_list tmp = BIO_EMPTY_LIST;
++ 
++ 	if (conf->pending_data_cnt == 0)
++ 		return;
++ 
++ 	spin_lock(&conf->pending_bios_lock);
++ 	dispatch_defer_bios(conf, conf->pending_data_cnt, &tmp);
++ 	BUG_ON(conf->pending_data_cnt != 0);
++ 	spin_unlock(&conf->pending_bios_lock);
++ 
++ 	dispatch_bio_list(&tmp);
++ }
++ 
++ static void defer_issue_bios(struct r5conf *conf, sector_t sector,
++ 				struct bio_list *bios)
++ {
++ 	struct bio_list tmp = BIO_EMPTY_LIST;
++ 	struct r5pending_data *ent;
++ 
++ 	spin_lock(&conf->pending_bios_lock);
++ 	ent = list_first_entry(&conf->free_list, struct r5pending_data,
++ 							sibling);
++ 	list_move_tail(&ent->sibling, &conf->pending_list);
++ 	ent->sector = sector;
++ 	bio_list_init(&ent->bios);
++ 	bio_list_merge(&ent->bios, bios);
++ 	conf->pending_data_cnt++;
++ 	if (conf->pending_data_cnt >= PENDING_IO_MAX)
++ 		dispatch_defer_bios(conf, PENDING_IO_ONE_FLUSH, &tmp);
++ 
++ 	spin_unlock(&conf->pending_bios_lock);
++ 
++ 	dispatch_bio_list(&tmp);
++ }
++ 
+++>>>>>>> aaf9f12ebfaf (md/raid5: sort bios)
+  static void
+ -raid5_end_read_request(struct bio *bi);
+ +raid5_end_read_request(struct bio *bi, int error);
+  static void
+ -raid5_end_write_request(struct bio *bi);
+ +raid5_end_write_request(struct bio *bi, int error);
+  
+  static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+  {
+@@@ -909,8 -1010,10 +1018,10 @@@
+  		}
+  	}
+  
++ 	should_defer = conf->batch_bio_dispatch && conf->group_cnt;
++ 
+  	for (i = disks; i--; ) {
+ -		int op, op_flags = 0;
+ +		int rw;
+  		int replace_only = 0;
+  		struct bio *bi, *rbi;
+  		struct md_rdev *rdev, *rrdev = NULL;
+@@@ -1064,7 -1166,10 +1175,14 @@@ again
+  				trace_block_bio_remap(bdev_get_queue(bi->bi_bdev),
+  						      bi, disk_devt(conf->mddev->gendisk),
+  						      sh->dev[i].sector);
+++<<<<<<< HEAD
+ +			generic_make_request(bi);
+++=======
++ 			if (should_defer && op_is_write(op))
++ 				bio_list_add(&pending_bios, bi);
++ 			else
++ 				generic_make_request(bi);
+++>>>>>>> aaf9f12ebfaf (md/raid5: sort bios)
+  		}
+  		if (rrdev) {
+  			if (s->syncing || s->expanding || s->expanded
+@@@ -1109,13 -1214,16 +1227,20 @@@
+  				trace_block_bio_remap(bdev_get_queue(rbi->bi_bdev),
+  						      rbi, disk_devt(conf->mddev->gendisk),
+  						      sh->dev[i].sector);
+++<<<<<<< HEAD
+ +			generic_make_request(rbi);
+++=======
++ 			if (should_defer && op_is_write(op))
++ 				bio_list_add(&pending_bios, rbi);
++ 			else
++ 				generic_make_request(rbi);
+++>>>>>>> aaf9f12ebfaf (md/raid5: sort bios)
+  		}
+  		if (!rdev && !rrdev) {
+ -			if (op_is_write(op))
+ +			if (rw & WRITE)
+  				set_bit(STRIPE_DEGRADED, &sh->state);
+ -			pr_debug("skip op %d on disc %d for sector %llu\n",
+ -				bi->bi_opf, i, (unsigned long long)sh->sector);
+ +			pr_debug("skip op %ld on disc %d for sector %llu\n",
+ +				bi->bi_rw, i, (unsigned long long)sh->sector);
+  			clear_bit(R5_LOCKED, &sh->dev[i].flags);
+  			set_bit(STRIPE_HANDLE, &sh->state);
+  		}
+@@@ -6858,6 -6900,17 +6995,20 @@@ static struct r5conf *setup_conf(struc
+  	atomic_set(&conf->active_stripes, 0);
+  	atomic_set(&conf->preread_active_stripes, 0);
+  	atomic_set(&conf->active_aligned_reads, 0);
+++<<<<<<< HEAD
+++=======
++ 	spin_lock_init(&conf->pending_bios_lock);
++ 	conf->batch_bio_dispatch = true;
++ 	rdev_for_each(rdev, mddev) {
++ 		if (test_bit(Journal, &rdev->flags))
++ 			continue;
++ 		if (blk_queue_nonrot(bdev_get_queue(rdev->bdev))) {
++ 			conf->batch_bio_dispatch = false;
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> aaf9f12ebfaf (md/raid5: sort bios)
+  	conf->bypass_threshold = BYPASS_THRESHOLD;
+  	conf->recovery_disabled = mddev->recovery_disabled - 1;
+  
+diff --cc drivers/md/raid5.h
+index ae60c3f29e72,985cdc4850c2..000000000000
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@@ -703,7 -696,14 +711,18 @@@ struct r5conf 
+  	int			group_cnt;
+  	int			worker_cnt_per_group;
+  	struct r5l_log		*log;
+++<<<<<<< HEAD
+ +	void			*log_private;
+++=======
++ 
++ 	spinlock_t		pending_bios_lock;
++ 	bool			batch_bio_dispatch;
++ 	struct r5pending_data	*pending_data;
++ 	struct list_head	free_list;
++ 	struct list_head	pending_list;
++ 	int			pending_data_cnt;
++ 	struct r5pending_data	*next_pending_data;
+++>>>>>>> aaf9f12ebfaf (md/raid5: sort bios)
+  };
+  
+  
+* Unmerged path drivers/md/raid5.c
+* Unmerged path drivers/md/raid5.h
