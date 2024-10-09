@@ -187,9 +187,10 @@ int sctp_rcv(struct sk_buff *skb)
 	 * bound to another interface, via SO_BINDTODEVICE, treat it as OOTB
 	 */
 	if (sk->sk_bound_dev_if && (sk->sk_bound_dev_if != af->skb_iif(skb))) {
-		if (asoc) {
-			sctp_association_put(asoc);
+		if (transport) {
+			sctp_transport_put(transport);
 			asoc = NULL;
+			transport = NULL;
 		} else {
 			sctp_endpoint_put(ep);
 			ep = NULL;
@@ -275,8 +276,8 @@ int sctp_rcv(struct sk_buff *skb)
 	bh_unlock_sock(sk);
 
 	/* Release the asoc/ep ref we took in the lookup calls. */
-	if (asoc)
-		sctp_association_put(asoc);
+	if (transport)
+		sctp_transport_put(transport);
 	else
 		sctp_endpoint_put(ep);
 
@@ -289,8 +290,8 @@ discard_it:
 
 discard_release:
 	/* Release the asoc/ep ref we took in the lookup calls. */
-	if (asoc)
-		sctp_association_put(asoc);
+	if (transport)
+		sctp_transport_put(transport);
 	else
 		sctp_endpoint_put(ep);
 
@@ -306,6 +307,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	struct sctp_chunk *chunk = SCTP_INPUT_CB(skb)->chunk;
 	struct sctp_inq *inqueue = &chunk->rcvr->inqueue;
+	struct sctp_transport *t = chunk->transport;
 	struct sctp_ep_common *rcvr = NULL;
 	int backloged = 0;
 
@@ -355,7 +357,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 done:
 	/* Release the refs we took in sctp_add_backlog */
 	if (SCTP_EP_TYPE_ASSOCIATION == rcvr->type)
-		sctp_association_put(sctp_assoc(rcvr));
+		sctp_transport_put(t);
 	else if (SCTP_EP_TYPE_SOCKET == rcvr->type)
 		sctp_endpoint_put(sctp_ep(rcvr));
 	else
@@ -367,6 +369,7 @@ done:
 static int sctp_add_backlog(struct sock *sk, struct sk_buff *skb)
 {
 	struct sctp_chunk *chunk = SCTP_INPUT_CB(skb)->chunk;
+	struct sctp_transport *t = chunk->transport;
 	struct sctp_ep_common *rcvr = chunk->rcvr;
 	int ret;
 
@@ -377,7 +380,7 @@ static int sctp_add_backlog(struct sock *sk, struct sk_buff *skb)
 		 * from us
 		 */
 		if (SCTP_EP_TYPE_ASSOCIATION == rcvr->type)
-			sctp_association_hold(sctp_assoc(rcvr));
+			sctp_transport_hold(t);
 		else if (SCTP_EP_TYPE_SOCKET == rcvr->type)
 			sctp_endpoint_hold(sctp_ep(rcvr));
 		else
@@ -541,15 +544,15 @@ struct sock *sctp_err_lookup(struct net *net, int family, struct sk_buff *skb,
 	return sk;
 
 out:
-	sctp_association_put(asoc);
+	sctp_transport_put(transport);
 	return NULL;
 }
 
 /* Common cleanup code for icmp/icmpv6 error handler. */
-void sctp_err_finish(struct sock *sk, struct sctp_association *asoc)
+void sctp_err_finish(struct sock *sk, struct sctp_transport *t)
 {
 	bh_unlock_sock(sk);
-	sctp_association_put(asoc);
+	sctp_transport_put(t);
 }
 
 /*
@@ -645,7 +648,7 @@ void sctp_v4_err(struct sk_buff *skb, __u32 info)
 	}
 
 out_unlock:
-	sctp_err_finish(sk, asoc);
+	sctp_err_finish(sk, transport);
 }
 
 /*
@@ -956,10 +959,7 @@ static struct sctp_association *__sctp_lookup_association(
 		goto out;
 
 	asoc = t->asoc;
-	sctp_association_hold(asoc);
 	*pt = t;
-
-	sctp_transport_put(t);
 
 out:
 	return asoc;
@@ -990,7 +990,7 @@ int sctp_has_association(struct net *net,
 	struct sctp_transport *transport;
 
 	if ((asoc = sctp_lookup_association(net, laddr, paddr, &transport))) {
-		sctp_association_put(asoc);
+		sctp_transport_put(transport);
 		return 1;
 	}
 
