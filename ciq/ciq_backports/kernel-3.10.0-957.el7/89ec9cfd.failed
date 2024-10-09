@@ -1,0 +1,128 @@
+tcmu: split unmap_thread_fn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 89ec9cfd3b644fbc36047e36776509130d2fc1ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/89ec9cfd.failed
+
+Separate unmap_thread_fn to make it easier to read.
+
+Note: this patch does not fix the bug where we might
+miss a wake up call. The next patch will fix that.
+This patch only separates the code into functions.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 89ec9cfd3b644fbc36047e36776509130d2fc1ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,cab6c72eb012..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1650,6 -1973,96 +1650,99 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	uint32_t start, end, block;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs waiting the global pool or in idle */
++ 		if (udev->waiting_global || !udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so there is
++ 			 * no need to shrink any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static void run_cmdr_queues(void)
++ {
++ 	struct tcmu_dev *udev;
++ 
++ 	/*
++ 	 * Try to wake up the udevs who are waiting
++ 	 * for the global data block pool.
++ 	 */
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 		if (!udev->waiting_global) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			break;
++ 		}
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		wake_up(&udev->wait_cmdr);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ }
++ 
++ static int unmap_thread_fn(void *data)
++ {
++ 	while (!kthread_should_stop()) {
++ 		DEFINE_WAIT(__wait);
++ 
++ 		prepare_to_wait(&unmap_wait, &__wait, TASK_INTERRUPTIBLE);
++ 		schedule();
++ 		finish_wait(&unmap_wait, &__wait);
++ 
++ 		if (kthread_should_stop())
++ 			break;
++ 
++ 		find_free_blocks();
++ 		run_cmdr_queues();
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 89ec9cfd3b64 (tcmu: split unmap_thread_fn)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+* Unmerged path drivers/target/target_core_user.c
