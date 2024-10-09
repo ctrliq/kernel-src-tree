@@ -1,0 +1,151 @@
+x86/topology: Add topology_max_smt_threads()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 70b8301f6b8f7bc053377a9cbd0c4e42e29d9807
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/70b8301f.failed
+
+For SMT specific workarounds it is useful to know if SMT is active
+on any online CPU in the system. This currently requires a loop
+over all online CPUs.
+
+Add a global variable that is updated with the maximum number
+of smt threads on any CPU on online/offline, and use it for
+topology_max_smt_threads()
+
+The single call is easier to use than a loop.
+
+Not exported to user space because user space already can use
+the existing sibling interfaces to find this out.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: acme@kernel.org
+	Cc: jolsa@kernel.org
+Link: http://lkml.kernel.org/r/1463703002-19686-2-git-send-email-andi@firstfloor.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 70b8301f6b8f7bc053377a9cbd0c4e42e29d9807)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/smpboot.c
+diff --cc arch/x86/kernel/smpboot.c
+index 92e0aea4e8c8,2ed0ec1353f8..000000000000
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@@ -114,7 -103,47 +114,50 @@@ static unsigned long *physical_package_
+  static unsigned int max_physical_pkg_id __read_mostly;
+  unsigned int __max_logical_packages __read_mostly;
+  EXPORT_SYMBOL(__max_logical_packages);
+++<<<<<<< HEAD
+ +static unsigned int logical_packages __read_mostly;
+++=======
++ 
++ /* Maximum number of SMT threads on any online core */
++ int __max_smt_threads __read_mostly;
++ 
++ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0xa, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 	local_flush_tlb();
++ 	pr_debug("1.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_HIGH)) =
++ 							start_eip >> 4;
++ 	pr_debug("2.\n");
++ 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) =
++ 							start_eip & 0xf;
++ 	pr_debug("3.\n");
++ }
++ 
++ static inline void smpboot_restore_warm_reset_vector(void)
++ {
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * Install writable page 0 entry to set BIOS data area.
++ 	 */
++ 	local_flush_tlb();
++ 
++ 	/*
++ 	 * Paranoid:  Set warm reset code and vector here back
++ 	 * to default values.
++ 	 */
++ 	spin_lock_irqsave(&rtc_lock, flags);
++ 	CMOS_WRITE(0, 0xf);
++ 	spin_unlock_irqrestore(&rtc_lock, flags);
++ 
++ 	*((volatile u32 *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) = 0;
++ }
+++>>>>>>> 70b8301f6b8f (x86/topology: Add topology_max_smt_threads())
+  
+  /*
+   * Report back to the Boot Processor during boot time or to the caller processor
+@@@ -561,8 -551,12 +604,12 @@@ void set_cpu_sibling_map(int cpu
+  				c->booted_cores = cpu_data(i).booted_cores;
+  		}
+  		if (match_die(c, o) && !topology_same_node(c, o))
+ -			primarily_use_numa_for_topology();
+ +			x86_has_numa_in_package = true;
+  	}
++ 
++ 	threads = cpumask_weight(topology_sibling_cpumask(cpu));
++ 	if (threads > __max_smt_threads)
++ 		__max_smt_threads = threads;
+  }
+  
+  /* maps the cpu to the sched domain representing multi-core */
+@@@ -1494,9 -1487,10 +1556,10 @@@ static void remove_siblinginfo(int cpu
+  	c->phys_proc_id = 0;
+  	c->cpu_core_id = 0;
+  	cpumask_clear_cpu(cpu, cpu_sibling_setup_mask);
++ 	recompute_smt_state();
+  }
+  
+ -static void remove_cpu_from_maps(int cpu)
+ +static void __ref remove_cpu_from_maps(int cpu)
+  {
+  	set_cpu_online(cpu, false);
+  	cpumask_clear_cpu(cpu, cpu_callout_mask);
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 93b2cb826344..dabeff9ab68d 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -131,6 +131,14 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ extern unsigned int __max_logical_packages;
+ #define topology_max_packages()			(__max_logical_packages)
++
++extern int __max_smt_threads;
++
++static inline int topology_max_smt_threads(void)
++{
++	return __max_smt_threads;
++}
++
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
+ extern int topology_phys_to_logical_pkg(unsigned int pkg);
+ #else
+@@ -138,6 +146,7 @@ extern int topology_phys_to_logical_pkg(unsigned int pkg);
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
++static inline int topology_max_smt_threads(void) { return 1; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+* Unmerged path arch/x86/kernel/smpboot.c
