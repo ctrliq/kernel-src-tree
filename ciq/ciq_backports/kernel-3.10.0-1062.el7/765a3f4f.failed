@@ -1,0 +1,135 @@
+rcu: Provide grace-period piggybacking API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+commit 765a3f4fed708ae429ee095914a7897acb3a65bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/765a3f4f.failed
+
+The following pattern is currently not well supported by RCU:
+
+1.	Make data element inaccessible to RCU readers.
+
+2.	Do work that probably lasts for more than one grace period.
+
+3.	Do something to make sure RCU readers in flight before #1 above
+	have completed.
+
+Here are some things that could currently be done:
+
+a.	Do a synchronize_rcu() unconditionally at either #1 or #3 above.
+	This works, but imposes needless work and latency.
+
+b.	Post an RCU callback at #1 above that does a wakeup, then
+	wait for the wakeup at #3.  This works well, but likely results
+	in an extra unneeded grace period.  Open-coding this is also
+	a bit more semi-tricky code than would be good.
+
+This commit therefore adds get_state_synchronize_rcu() and
+cond_synchronize_rcu() APIs.  Call get_state_synchronize_rcu() at #1
+above and pass its return value to cond_synchronize_rcu() at #3 above.
+This results in a call to synchronize_rcu() if no grace period has
+elapsed between #1 and #3, but requires only a load, comparison, and
+memory barrier if a full grace period did elapse.
+
+Requested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+(cherry picked from commit 765a3f4fed708ae429ee095914a7897acb3a65bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rcutiny.h
+#	include/linux/rcutree.h
+#	kernel/rcutree.c
+diff --cc include/linux/rcutiny.h
+index 83a5dc37e363,425c659d54e5..000000000000
+--- a/include/linux/rcutiny.h
++++ b/include/linux/rcutiny.h
+@@@ -27,8 -27,14 +27,19 @@@
+  
+  #include <linux/cache.h>
+  
+++<<<<<<< HEAD
+ +static inline void rcu_init(void)
+ +{
+++=======
++ static inline unsigned long get_state_synchronize_rcu(void)
++ {
++ 	return 0;
++ }
++ 
++ static inline void cond_synchronize_rcu(unsigned long oldstate)
++ {
++ 	might_sleep();
+++>>>>>>> 765a3f4fed70 (rcu: Provide grace-period piggybacking API)
+  }
+  
+  static inline void rcu_barrier_bh(void)
+diff --cc include/linux/rcutree.h
+index 6c4a21789ebf,a59ca05fd4e3..000000000000
+--- a/include/linux/rcutree.h
++++ b/include/linux/rcutree.h
+@@@ -72,9 -73,11 +72,17 @@@ static inline void synchronize_rcu_bh_e
+  	synchronize_sched_expedited();
+  }
+  
+++<<<<<<< HEAD
+ +extern void rcu_barrier(void);
+ +extern void rcu_barrier_bh(void);
+ +extern void rcu_barrier_sched(void);
+++=======
++ void rcu_barrier(void);
++ void rcu_barrier_bh(void);
++ void rcu_barrier_sched(void);
++ unsigned long get_state_synchronize_rcu(void);
++ void cond_synchronize_rcu(unsigned long oldstate);
+++>>>>>>> 765a3f4fed70 (rcu: Provide grace-period piggybacking API)
+  
+  extern unsigned long rcutorture_testseq;
+  extern unsigned long rcutorture_vernum;
+diff --cc kernel/rcutree.c
+index 3276ac1a80da,0c47e300210a..000000000000
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@@ -1510,9 -1421,9 +1510,15 @@@ static int rcu_gp_init(struct rcu_stat
+  
+  	/* Advance to a new grace period and initialize state. */
+  	record_gp_stall_check_time(rsp);
+++<<<<<<< HEAD:kernel/rcutree.c
+ +	smp_wmb(); /* Record GP times before starting GP. */
+ +	rsp->gpnum++;
+ +	trace_rcu_grace_period(rsp->name, rsp->gpnum, "start");
+++=======
++ 	/* Record GP times before starting GP, hence smp_store_release(). */
++ 	smp_store_release(&rsp->gpnum, rsp->gpnum + 1);
++ 	trace_rcu_grace_period(rsp->name, rsp->gpnum, TPS("start"));
+++>>>>>>> 765a3f4fed70 (rcu: Provide grace-period piggybacking API):kernel/rcu/tree.c
+  	raw_spin_unlock_irq(&rnp->lock);
+  
+  	/* Exclude any concurrent CPU-hotplug operations. */
+@@@ -1634,10 -1556,12 +1641,19 @@@ static void rcu_gp_cleanup(struct rcu_s
+  	}
+  	rnp = rcu_get_root(rsp);
+  	raw_spin_lock_irq(&rnp->lock);
+++<<<<<<< HEAD:kernel/rcutree.c
+ +	rcu_nocb_gp_set(rnp, nocb);
+ +
+ +	rsp->completed = rsp->gpnum; /* Declare grace period done. */
+ +	trace_rcu_grace_period(rsp->name, rsp->completed, "end");
+++=======
++ 	smp_mb__after_unlock_lock(); /* Order GP before ->completed update. */
++ 	rcu_nocb_gp_set(rnp, nocb);
++ 
++ 	/* Declare grace period done. */
++ 	ACCESS_ONCE(rsp->completed) = rsp->gpnum;
++ 	trace_rcu_grace_period(rsp->name, rsp->completed, TPS("end"));
+++>>>>>>> 765a3f4fed70 (rcu: Provide grace-period piggybacking API):kernel/rcu/tree.c
+  	rsp->fqs_state = RCU_GP_IDLE;
+  	rdp = this_cpu_ptr(rsp->rda);
+  	rcu_advance_cbs(rsp, rnp, rdp);  /* Reduce false positives below. */
+* Unmerged path include/linux/rcutiny.h
+* Unmerged path include/linux/rcutree.h
+* Unmerged path kernel/rcutree.c
