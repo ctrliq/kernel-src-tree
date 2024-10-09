@@ -1,0 +1,157 @@
+RDMA: Validate grh_required when handling AVs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Artemy Kovalyov <artemyko@mellanox.com>
+commit b02289b3d60f79ba0831051a7743d8fdb4110355
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b02289b3.failed
+
+Extend the existing grh_required flag to check when AV's are handled that
+a GRH is present.
+
+Since we don't want to do query_port during the AV checks for performance
+reasons move the flag into the immutable_data.
+
+	Signed-off-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b02289b3d60f79ba0831051a7743d8fdb4110355)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/rdma/ib_verbs.h
+diff --cc include/rdma/ib_verbs.h
+index d90947756c9b,b523298d486b..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -577,6 -575,8 +582,11 @@@ struct ib_port_attr 
+  	enum ib_mtu		max_mtu;
+  	enum ib_mtu		active_mtu;
+  	int			gid_tbl_len;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int		ip_gids:1;
++ 	/* This is the value from PortInfo CapabilityMask, defined by IBA */
+++>>>>>>> b02289b3d60f (RDMA: Validate grh_required when handling AVs)
+  	u32			port_cap_flags;
+  	u32			max_msg_sz;
+  	u32			bad_pkey_cntr;
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index ecabd9c41d9f..a9d3596bbd66 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -2275,6 +2275,7 @@ static void update_sm_ah(struct work_struct *work)
+ 	struct ib_sa_sm_ah *new_ah;
+ 	struct ib_port_attr port_attr;
+ 	struct rdma_ah_attr   ah_attr;
++	bool grh_required;
+ 
+ 	if (ib_query_port(port->agent->device, port->port_num, &port_attr)) {
+ 		pr_warn("Couldn't query port\n");
+@@ -2300,6 +2301,9 @@ static void update_sm_ah(struct work_struct *work)
+ 	rdma_ah_set_sl(&ah_attr, port_attr.sm_sl);
+ 	rdma_ah_set_port_num(&ah_attr, port->port_num);
+ 
++	grh_required = rdma_is_grh_required(port->agent->device,
++					    port->port_num);
++
+ 	/*
+ 	 * The OPA sm_lid of 0xFFFF needs special handling so that it can be
+ 	 * differentiated from a permissive LID of 0xFFFF.  We set the
+@@ -2307,11 +2311,11 @@ static void update_sm_ah(struct work_struct *work)
+ 	 * address handle appropriately
+ 	 */
+ 	if (ah_attr.type == RDMA_AH_ATTR_TYPE_OPA &&
+-	    (port_attr.grh_required ||
++	    (grh_required ||
+ 	     port_attr.sm_lid == be16_to_cpu(IB_LID_PERMISSIVE)))
+ 		rdma_ah_set_make_grd(&ah_attr, true);
+ 
+-	if (ah_attr.type == RDMA_AH_ATTR_TYPE_IB && port_attr.grh_required) {
++	if (ah_attr.type == RDMA_AH_ATTR_TYPE_IB && grh_required) {
+ 		rdma_ah_set_ah_flags(&ah_attr, IB_AH_GRH);
+ 		rdma_ah_set_subnet_prefix(&ah_attr,
+ 					  cpu_to_be64(port_attr.subnet_prefix));
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 0a296b42f86b..a5883c54d03f 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -390,7 +390,8 @@ static int rdma_check_ah_attr(struct ib_device *device,
+ 	if (!rdma_is_port_valid(device, ah_attr->port_num))
+ 		return -EINVAL;
+ 
+-	if (ah_attr->type == RDMA_AH_ATTR_TYPE_ROCE &&
++	if ((rdma_is_grh_required(device, ah_attr->port_num) ||
++	     ah_attr->type == RDMA_AH_ATTR_TYPE_ROCE) &&
+ 	    !(ah_attr->ah_flags & IB_AH_GRH))
+ 		return -EINVAL;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index caab7cc36fbe..6bccf65e20ba 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1195,7 +1195,6 @@ static int mlx5_query_hca_port(struct ib_device *ibdev, u8 port,
+ 	props->qkey_viol_cntr	= rep->qkey_violation_counter;
+ 	props->subnet_timeout	= rep->subnet_timeout;
+ 	props->init_type_reply	= rep->init_type_reply;
+-	props->grh_required	= rep->grh_required;
+ 
+ 	err = mlx5_query_port_link_width_oper(mdev, &ib_link_width_oper, port);
+ 	if (err)
+@@ -3691,7 +3690,8 @@ static void destroy_dev_resources(struct mlx5_ib_resources *devr)
+ 		cancel_work_sync(&devr->ports[port].pkey_change_work);
+ }
+ 
+-static u32 get_core_cap_flags(struct ib_device *ibdev)
++static u32 get_core_cap_flags(struct ib_device *ibdev,
++			      struct mlx5_hca_vport_context *rep)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
+ 	enum rdma_link_layer ll = mlx5_ib_port_link_layer(ibdev, 1);
+@@ -3700,11 +3700,14 @@ static u32 get_core_cap_flags(struct ib_device *ibdev)
+ 	bool raw_support = !mlx5_core_mp_enabled(dev->mdev);
+ 	u32 ret = 0;
+ 
++	if (rep->grh_required)
++		ret |= RDMA_CORE_CAP_IB_GRH_REQUIRED;
++
+ 	if (ll == IB_LINK_LAYER_INFINIBAND)
+-		return RDMA_CORE_PORT_IBA_IB;
++		return ret | RDMA_CORE_PORT_IBA_IB;
+ 
+ 	if (raw_support)
+-		ret = RDMA_CORE_PORT_RAW_PACKET;
++		ret |= RDMA_CORE_PORT_RAW_PACKET;
+ 
+ 	if (!(l3_type_cap & MLX5_ROCE_L3_TYPE_IPV4_CAP))
+ 		return ret;
+@@ -3727,17 +3730,23 @@ static int mlx5_port_immutable(struct ib_device *ibdev, u8 port_num,
+ 	struct ib_port_attr attr;
+ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
+ 	enum rdma_link_layer ll = mlx5_ib_port_link_layer(ibdev, port_num);
++	struct mlx5_hca_vport_context rep = {0};
+ 	int err;
+ 
+-	immutable->core_cap_flags = get_core_cap_flags(ibdev);
+-
+ 	err = ib_query_port(ibdev, port_num, &attr);
+ 	if (err)
+ 		return err;
+ 
++	if (ll == IB_LINK_LAYER_INFINIBAND) {
++		err = mlx5_query_hca_vport_context(dev->mdev, 0, port_num, 0,
++						   &rep);
++		if (err)
++			return err;
++	}
++
+ 	immutable->pkey_tbl_len = attr.pkey_tbl_len;
+ 	immutable->gid_tbl_len = attr.gid_tbl_len;
+-	immutable->core_cap_flags = get_core_cap_flags(ibdev);
++	immutable->core_cap_flags = get_core_cap_flags(ibdev, &rep);
+ 	if ((ll == IB_LINK_LAYER_INFINIBAND) || MLX5_CAP_GEN(dev->mdev, roce))
+ 		immutable->max_mad_size = IB_MGMT_MAD_SIZE;
+ 
+* Unmerged path include/rdma/ib_verbs.h
