@@ -1,0 +1,216 @@
+KVM: x86: support using the vmx preemption timer for tsc deadline timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yunhong Jiang <yunhong.jiang@gmail.com>
+commit ce7a058a2117f0bca2f42f2870a97bfa9aa8e099
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ce7a058a.failed
+
+The VMX preemption timer can be used to virtualize the TSC deadline timer.
+The VMX preemption timer is armed when the vCPU is running, and a VMExit
+will happen if the virtual TSC deadline timer expires.
+
+When the vCPU thread is blocked because of HLT, KVM will switch to use
+an hrtimer, and then go back to the VMX preemption timer when the vCPU
+thread is unblocked.
+
+This solution avoids the complex OS's hrtimer system, and the host
+timer interrupt handling cost, replacing them with a little math
+(for guest->host TSC and host TSC->preemption timer conversion)
+and a cheaper VMexit.  This benefits latency for isolated pCPUs.
+
+[A word about performance... Yunhong reported a 30% reduction in average
+ latency from cyclictest.  I made a similar test with tscdeadline_latency
+ from kvm-unit-tests, and measured
+
+ - ~20 clock cycles loss (out of ~3200, so less than 1% but still
+   statistically significant) in the worst case where the test halts
+   just after programming the TSC deadline timer
+
+ - ~800 clock cycles gain (25% reduction in latency) in the best case
+   where the test busy waits.
+
+ I removed the VMX bits from Yunhong's patch, to concentrate them in the
+ next patch - Paolo]
+
+	Signed-off-by: Yunhong Jiang <yunhong.jiang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ce7a058a2117f0bca2f42f2870a97bfa9aa8e099)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 7223dfd6e387,e055f3787dc9..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -955,7 -1006,8 +955,12 @@@ struct kvm_x86_ops 
+  			      uint32_t guest_irq, bool set);
+  	void (*apicv_post_state_restore)(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+ +	void (*setup_mce)(struct kvm_vcpu *vcpu);
+++=======
++ 	int (*set_hv_timer)(struct kvm_vcpu *vcpu, u64 guest_deadline_tsc);
++ 	void (*cancel_hv_timer)(struct kvm_vcpu *vcpu);
+++>>>>>>> ce7a058a2117 (KVM: x86: support using the vmx preemption timer for tsc deadline timer)
+  };
+  
+  struct kvm_arch_async_pf {
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index e191bcf72fce..87b28bcd2c94 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1373,6 +1373,68 @@ static void start_sw_tscdeadline(struct kvm_lapic *apic)
+ 	local_irq_restore(flags);
+ }
+ 
++bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
++{
++	return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++}
++EXPORT_SYMBOL_GPL(kvm_lapic_hv_timer_in_use);
++
++void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++
++	WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++	WARN_ON(swait_active(&vcpu->wq));
++	kvm_x86_ops->cancel_hv_timer(vcpu);
++	apic->lapic_timer.hv_timer_in_use = false;
++	apic_timer_expired(apic);
++}
++EXPORT_SYMBOL_GPL(kvm_lapic_expired_hv_timer);
++
++void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++
++	WARN_ON(apic->lapic_timer.hv_timer_in_use);
++
++	if (apic_lvtt_tscdeadline(apic) &&
++	    !atomic_read(&apic->lapic_timer.pending)) {
++		u64 tscdeadline = apic->lapic_timer.tscdeadline;
++
++		if (!kvm_x86_ops->set_hv_timer(vcpu, tscdeadline)) {
++			apic->lapic_timer.hv_timer_in_use = true;
++			hrtimer_cancel(&apic->lapic_timer.timer);
++
++			/* In case the sw timer triggered in the window */
++			if (atomic_read(&apic->lapic_timer.pending)) {
++				apic->lapic_timer.hv_timer_in_use = false;
++				kvm_x86_ops->cancel_hv_timer(apic->vcpu);
++			}
++		}
++		trace_kvm_hv_timer_state(vcpu->vcpu_id,
++				apic->lapic_timer.hv_timer_in_use);
++	}
++}
++EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_hv_timer);
++
++void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++
++	/* Possibly the TSC deadline timer is not enabled yet */
++	if (!apic->lapic_timer.hv_timer_in_use)
++		return;
++
++	kvm_x86_ops->cancel_hv_timer(vcpu);
++	apic->lapic_timer.hv_timer_in_use = false;
++
++	if (atomic_read(&apic->lapic_timer.pending))
++		return;
++
++	start_sw_tscdeadline(apic);
++}
++EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_sw_timer);
++
+ static void start_apic_timer(struct kvm_lapic *apic)
+ {
+ 	ktime_t now;
+@@ -1418,7 +1480,16 @@ static void start_apic_timer(struct kvm_lapic *apic)
+ 			   ktime_to_ns(ktime_add_ns(now,
+ 					apic->lapic_timer.period)));
+ 	} else if (apic_lvtt_tscdeadline(apic)) {
+-		start_sw_tscdeadline(apic);
++		/* lapic timer in tsc deadline mode */
++		u64 tscdeadline = apic->lapic_timer.tscdeadline;
++
++		if (kvm_x86_ops->set_hv_timer &&
++		    !kvm_x86_ops->set_hv_timer(apic->vcpu, tscdeadline)) {
++			apic->lapic_timer.hv_timer_in_use = true;
++			trace_kvm_hv_timer_state(apic->vcpu->vcpu_id,
++					apic->lapic_timer.hv_timer_in_use);
++		} else
++			start_sw_tscdeadline(apic);
+ 	}
+ }
+ 
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index 5761180667d2..8131b7e0da76 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -20,6 +20,7 @@ struct kvm_timer {
+ 	u64 tscdeadline;
+ 	u64 expired_tscdeadline;
+ 	atomic_t pending;			/* accumulated triggered timers */
++	bool hv_timer_in_use;
+ };
+ 
+ struct kvm_lapic {
+@@ -208,4 +209,8 @@ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+ 			struct kvm_vcpu **dest_vcpu);
+ int kvm_vector_to_index(u32 vector, u32 dest_vcpus,
+ 			const unsigned long *bitmap, u32 bitmap_size);
++void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu);
++void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu);
++void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu);
++bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu);
+ #endif
+diff --git a/arch/x86/kvm/trace.h b/arch/x86/kvm/trace.h
+index 355400018170..1d779c897539 100644
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@ -1086,6 +1086,21 @@ TRACE_EVENT(kvm_avic_unaccelerated_access,
+ 		  __entry->vec)
+ );
+ 
++TRACE_EVENT(kvm_hv_timer_state,
++		TP_PROTO(unsigned int vcpu_id, unsigned int hv_timer_in_use),
++		TP_ARGS(vcpu_id, hv_timer_in_use),
++		TP_STRUCT__entry(
++			__field(unsigned int, vcpu_id)
++			__field(unsigned int, hv_timer_in_use)
++			),
++		TP_fast_assign(
++			__entry->vcpu_id = vcpu_id;
++			__entry->hv_timer_in_use = hv_timer_in_use;
++			),
++		TP_printk("vcpu_id %x hv_timer %x\n",
++			__entry->vcpu_id,
++			__entry->hv_timer_in_use)
++);
+ #endif /* _TRACE_KVM_H */
+ 
+ #undef TRACE_INCLUDE_PATH
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index db49db518a51..fee18c07525f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2781,6 +2781,11 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 				rdtsc() - vcpu->arch.last_host_tsc;
+ 		if (tsc_delta < 0)
+ 			mark_tsc_unstable("KVM discovered backwards TSC");
++
++		if (kvm_lapic_hv_timer_in_use(vcpu) &&
++				kvm_x86_ops->set_hv_timer(vcpu,
++					kvm_get_lapic_tscdeadline_msr(vcpu)))
++			kvm_lapic_switch_to_sw_timer(vcpu);
+ 		if (check_tsc_unstable()) {
+ 			u64 offset = kvm_compute_tsc_offset(vcpu,
+ 						vcpu->arch.last_guest_tsc);
