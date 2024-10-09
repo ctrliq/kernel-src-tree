@@ -1,0 +1,198 @@
+blk-mq: Rename blk_mq_request_direct_issue() into blk_mq_request_issue_directly()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit c77ff7fd03ddca8face268c4cf093c0edf4bcf1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c77ff7fd.failed
+
+Most blk-mq functions have a name that follows the pattern blk_mq_${action}.
+However, the function name blk_mq_request_direct_issue is an exception.
+Hence rename this function. This patch does not change any functionality.
+
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c77ff7fd03ddca8face268c4cf093c0edf4bcf1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-core.c
+index 3c1e8c52cafa,1645a1e54a37..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2327,8 -2520,7 +2327,12 @@@ int blk_insert_cloned_request(struct re
+  		 * bypass a potential scheduler on the bottom device for
+  		 * insert.
+  		 */
+++<<<<<<< HEAD
+ +		blk_mq_request_bypass_insert(rq, true);
+ +		return 0;
+++=======
++ 		return blk_mq_request_issue_directly(rq);
+++>>>>>>> c77ff7fd03dd (blk-mq: Rename blk_mq_request_direct_issue() into blk_mq_request_issue_directly())
+  	}
+  
+  	spin_lock_irqsave(q->queue_lock, flags);
+diff --cc block/blk-mq.c
+index 1eaa154c3ecb,0fc6c95e5a29..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1535,14 -1745,52 +1535,25 @@@ static void __blk_mq_try_issue_directly
+  	struct request_queue *q = rq->q;
+  	struct blk_mq_queue_data bd = {
+  		.rq = rq,
+ +		.list = NULL,
+  		.last = true,
+  	};
+ -	blk_qc_t new_cookie;
+ -	blk_status_t ret;
+ -
+ -	new_cookie = request_to_qc_t(hctx, rq);
+ -
+ -	/*
+ -	 * For OK queue, we are done. For error, caller may kill it.
+ -	 * Any other error (busy), just add it to our list as we
+ -	 * previously would have done.
+ -	 */
+ -	ret = q->mq_ops->queue_rq(hctx, &bd);
+ -	switch (ret) {
+ -	case BLK_STS_OK:
+ -		*cookie = new_cookie;
+ -		break;
+ -	case BLK_STS_RESOURCE:
+ -		__blk_mq_requeue_request(rq);
+ -		break;
+ -	default:
+ -		*cookie = BLK_QC_T_NONE;
+ -		break;
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+ -static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -						struct request *rq,
+ -						blk_qc_t *cookie,
+ -						bool bypass_insert)
+ -{
+ -	struct request_queue *q = rq->q;
+ +	int ret;
+  	bool run_queue = true;
+  
+++<<<<<<< HEAD
+ +	if (blk_mq_hctx_stopped(hctx)) {
+++=======
++ 	/*
++ 	 * RCU or SRCU read lock is needed before checking quiesced flag.
++ 	 *
++ 	 * When queue is stopped or quiesced, ignore 'bypass_insert' from
++ 	 * blk_mq_request_issue_directly(), and return BLK_STS_OK to caller,
++ 	 * and avoid driver to try to dispatch again.
++ 	 */
++ 	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(q)) {
+++>>>>>>> c77ff7fd03dd (blk-mq: Rename blk_mq_request_direct_issue() into blk_mq_request_issue_directly())
+  		run_queue = false;
+ -		bypass_insert = false;
+  		goto insert;
+  	}
+  
+@@@ -1578,27 -1815,43 +1589,31 @@@ insert
+  }
+  
+  static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, blk_qc_t *cookie)
+ +				      struct request *rq)
+  {
+ -	blk_status_t ret;
+ -	int srcu_idx;
+ -
+ -	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
+ -
+ -	hctx_lock(hctx, &srcu_idx);
+ +	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +		rcu_read_lock();
+ +		__blk_mq_try_issue_directly(hctx, rq, false);
+ +		rcu_read_unlock();
+ +	} else {
+ +		unsigned int srcu_idx;
+  
+ -	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
+ -	if (ret == BLK_STS_RESOURCE)
+ -		blk_mq_sched_insert_request(rq, false, true, false);
+ -	else if (ret != BLK_STS_OK)
+ -		blk_mq_end_request(rq, ret);
+ +		might_sleep();
+  
+ -	hctx_unlock(hctx, srcu_idx);
+ +		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ +		__blk_mq_try_issue_directly(hctx, rq, true);
+ +		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+ +	}
+  }
+  
+++<<<<<<< HEAD
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+++=======
++ blk_status_t blk_mq_request_issue_directly(struct request *rq)
+++>>>>>>> c77ff7fd03dd (blk-mq: Rename blk_mq_request_direct_issue() into blk_mq_request_issue_directly())
+  {
+ -	blk_status_t ret;
+ -	int srcu_idx;
+ -	blk_qc_t unused_cookie;
+ -	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ -	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(rq->q, ctx->cpu);
+ -
+ -	hctx_lock(hctx, &srcu_idx);
+ -	ret = __blk_mq_try_issue_directly(hctx, rq, &unused_cookie, true);
+ -	hctx_unlock(hctx, srcu_idx);
+ -
+ -	return ret;
+ -}
+ -
+ -static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ -{
+ -	const int is_sync = op_is_sync(bio->bi_opf);
+ -	const int is_flush_fua = op_is_flush(bio->bi_opf);
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	struct blk_mq_alloc_data data = { .flags = 0 };
+  	struct request *rq;
+  	unsigned int request_count = 0;
+diff --cc block/blk-mq.h
+index a1edc1df16f2,88c558f71819..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -62,18 -73,9 +62,24 @@@ void __blk_mq_insert_request(struct blk
+  void blk_mq_request_bypass_insert(struct request *rq, bool run_queue);
+  void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+  				struct list_head *list);
+++<<<<<<< HEAD
+ +/*
+ + * CPU hotplug helpers
+ + */
+ +struct blk_mq_cpu_notifier;
+ +void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ +			      int (*fn)(void *, unsigned long, unsigned int),
+ +			      void *data);
+ +void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_cpu_init(void);
+ +void blk_mq_enable_hotplug(void);
+ +void blk_mq_disable_hotplug(void);
+++=======
++ 
++ /* Used by blk_insert_cloned_request() to issue request directly */
++ blk_status_t blk_mq_request_issue_directly(struct request *rq);
+++>>>>>>> c77ff7fd03dd (blk-mq: Rename blk_mq_request_direct_issue() into blk_mq_request_issue_directly())
+  
+  /*
+   * CPU -> queue mappings
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
