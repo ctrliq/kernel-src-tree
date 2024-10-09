@@ -851,7 +851,6 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	int status = 0;
 	unsigned long waking = 0;
 	const bool forks = argc > 0;
-	struct machine *machine;
 	struct perf_tool *tool = &rec->tool;
 	struct record_opts *opts = &rec->opts;
 	struct perf_data *data = &rec->data;
@@ -934,8 +933,6 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		goto out_child;
 	}
 
-	machine = &session->machines.host;
-
 	err = record__synthesize(rec, false);
 	if (err < 0)
 		goto out_child;
@@ -963,6 +960,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	 * Let the child rip
 	 */
 	if (forks) {
+		struct machine *machine = &session->machines.host;
 		union perf_event *event;
 
 		event = malloc(sizeof(event->comm) + machine->id_hdr_size);
