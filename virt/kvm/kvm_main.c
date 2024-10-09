@@ -2255,6 +2255,7 @@ static int kvm_vcpu_release(struct inode *inode, struct file *filp)
 {
 	struct kvm_vcpu *vcpu = filp->private_data;
 
+	debugfs_remove_recursive(vcpu->debugfs_dentry);
 	kvm_put_kvm(vcpu->kvm);
 	return 0;
 }
@@ -2277,6 +2278,32 @@ static int create_vcpu_fd(struct kvm_vcpu *vcpu)
 	return anon_inode_getfd("kvm-vcpu", &kvm_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
 }
 
+static int kvm_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
+{
+	char dir_name[ITOA_MAX_LEN * 2];
+	int ret;
+
+	if (!kvm_arch_has_vcpu_debugfs())
+		return 0;
+
+	if (!debugfs_initialized())
+		return 0;
+
+	snprintf(dir_name, sizeof(dir_name), "vcpu%d", vcpu->vcpu_id);
+	vcpu->debugfs_dentry = debugfs_create_dir(dir_name,
+								vcpu->kvm->debugfs_dentry);
+	if (!vcpu->debugfs_dentry)
+		return -ENOMEM;
+
+	ret = kvm_arch_create_vcpu_debugfs(vcpu);
+	if (ret < 0) {
+		debugfs_remove_recursive(vcpu->debugfs_dentry);
+		return ret;
+	}
+
+	return 0;
+}
+
 /*
  * Creates some virtual cpus.  Good luck creating more than one.
  */
@@ -2295,6 +2322,10 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	preempt_notifier_init(&vcpu->preempt_notifier, &kvm_preempt_ops);
 
 	r = kvm_arch_vcpu_setup(vcpu);
+	if (r)
+		goto vcpu_destroy;
+
+	r = kvm_create_vcpu_debugfs(vcpu);
 	if (r)
 		goto vcpu_destroy;
 
@@ -2339,6 +2370,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 
 unlock_vcpu_destroy:
 	mutex_unlock(&kvm->lock);
+	debugfs_remove_recursive(vcpu->debugfs_dentry);
 vcpu_destroy:
 	kvm_arch_vcpu_destroy(vcpu);
 	return r;
