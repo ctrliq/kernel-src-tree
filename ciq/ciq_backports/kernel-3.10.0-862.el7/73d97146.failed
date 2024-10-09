@@ -1,0 +1,284 @@
+sysfs: copy bin mmap support from fs/sysfs/bin.c to fs/sysfs/file.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 73d9714627adced2942e8d53ce0e73d9699a996c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/73d97146.failed
+
+sysfs bin file handling will be merged into the regular file support.
+This patch copies mmap support from bin so that fs/sysfs/file.c can
+handle mmapping bin files.
+
+The code is copied mostly verbatim with the following updates.
+
+* ->mmapped and ->vm_ops are added to sysfs_open_file and bin_buffer
+  references are replaced with sysfs_open_file ones.
+
+* Symbols are prefixed with sysfs_.
+
+* sysfs_unmap_bin_file() grabs sysfs_open_dirent and traverses
+  ->files.  Invocation of this function is added to
+  sysfs_addrm_finish().
+
+* sysfs_bin_mmap() is added to sysfs_bin_operations.
+
+This is a preparation and the new mmap path isn't used yet.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 73d9714627adced2942e8d53ce0e73d9699a996c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+#	fs/sysfs/sysfs.h
+diff --cc fs/sysfs/file.c
+index d8887c896abc,02797a134cf8..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -21,6 -21,8 +21,11 @@@
+  #include <linux/mutex.h>
+  #include <linux/limits.h>
+  #include <linux/uaccess.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/seq_file.h>
++ #include <linux/mm.h>
+++>>>>>>> 73d9714627ad (sysfs: copy bin mmap support from fs/sysfs/bin.c to fs/sysfs/file.c)
+  
+  #include "sysfs.h"
+  
+@@@ -41,52 -44,90 +46,55 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+  };
+  
+ -struct sysfs_open_file {
+ -	struct sysfs_dirent	*sd;
+ -	struct file		*file;
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+  	struct mutex		mutex;
+ +	int			needs_read_fill;
+  	int			event;
+  	struct list_head	list;
++ 
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
+  };
+  
+ -static bool sysfs_is_bin(struct sysfs_dirent *sd)
+ -{
+ -	return sysfs_type(sd) == SYSFS_KOBJ_BIN_ATTR;
+ -}
+ -
+ -static struct sysfs_open_file *sysfs_of(struct file *file)
+ -{
+ -	return ((struct seq_file *)file->private_data)->private;
+ -}
+ -
+ -/*
+ - * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
+ - * must be called while holding an active reference.
+ - */
+ -static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
+ -{
+ -	struct kobject *kobj = sd->s_parent->s_dir.kobj;
+ -
+ -	lockdep_assert_held(sd);
+ -	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
+ -}
+ -
+ -/*
+ - * Reads on sysfs are handled through seq_file, which takes care of hairy
+ - * details like buffering and seeking.  The following function pipes
+ - * sysfs_ops->show() result through seq_file.
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's
+ + *	data.
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+   */
+ -static int sysfs_seq_show(struct seq_file *sf, void *v)
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+  {
+ -	struct sysfs_open_file *of = sf->private;
+ -	struct kobject *kobj = of->sd->s_parent->s_dir.kobj;
+ -	const struct sysfs_ops *ops;
+ -	char *buf;
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+  	ssize_t count;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -	/*
+ -	 * Need @of->sd for attr and ops, its parent for kobj.  @of->mutex
+ -	 * nests outside active ref and is just to ensure that the ops
+ -	 * aren't called concurrently for the same open file.
+ -	 */
+ -	mutex_lock(&of->mutex);
+ -	if (!sysfs_get_active(of->sd)) {
+ -		mutex_unlock(&of->mutex);
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+  		return -ENODEV;
+ -	}
+  
+ -	of->event = atomic_read(&of->sd->s_attr.open->event);
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+  
+ -	/*
+ -	 * Lookup @ops and invoke show().  Control may reach here via seq
+ -	 * file lseek even if @ops->show() isn't implemented.
+ -	 */
+ -	ops = sysfs_file_ops(of->sd);
+ -	if (ops->show)
+ -		count = ops->show(kobj, of->sd->s_attr.attr, buf);
+ -	else
+ -		count = 0;
+ -
+ -	sysfs_put_active(of->sd);
+ -	mutex_unlock(&of->mutex);
+ -
+ -	if (count < 0)
+ -		return count;
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+@@@ -315,7 -591,9 +535,13 @@@ static void sysfs_put_open_dirent(struc
+  	mutex_lock(&sysfs_open_file_mutex);
+  	spin_lock_irqsave(&sysfs_open_dirent_lock, flags);
+  
+++<<<<<<< HEAD
+ +	list_del(&buffer->list);
+++=======
++ 	if (of)
++ 		list_del(&of->list);
++ 
+++>>>>>>> 73d9714627ad (sysfs: copy bin mmap support from fs/sysfs/bin.c to fs/sysfs/file.c)
+  	if (atomic_dec_and_test(&od->refcnt))
+  		sd->s_attr.open = NULL;
+  	else
+@@@ -492,47 -802,16 +744,56 @@@ const struct file_operations sysfs_file
+  	.poll		= sysfs_poll,
+  };
+  
+++<<<<<<< HEAD
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+++=======
++ const struct file_operations sysfs_bin_operations = {
++ 	.read		= sysfs_bin_read,
++ 	.write		= sysfs_write_file,
++ 	.llseek		= generic_file_llseek,
++ 	.mmap		= sysfs_bin_mmap,
++ };
+++>>>>>>> 73d9714627ad (sysfs: copy bin mmap support from fs/sysfs/bin.c to fs/sysfs/file.c)
+ +
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+ +
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+  
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, int type,
+ -			   umode_t amode, const void *ns)
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+  	struct sysfs_addrm_cxt acxt;
+diff --cc fs/sysfs/sysfs.h
+index b6deca3e301d,c960d6272cf6..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -230,8 -217,11 +230,16 @@@ extern const struct file_operations sys
+  int sysfs_add_file(struct sysfs_dirent *dir_sd,
+  		   const struct attribute *attr, int type);
+  
+++<<<<<<< HEAD
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode);
+++=======
++ int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
++ 			   const struct attribute *attr, int type,
++ 			   umode_t amode, const void *ns);
++ void sysfs_unmap_bin_file(struct sysfs_dirent *sd);
++ 
+++>>>>>>> 73d9714627ad (sysfs: copy bin mmap support from fs/sysfs/bin.c to fs/sysfs/file.c)
+  /*
+   * bin.c
+   */
+diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
+index fd502d3fc9fc..310c78d9730b 100644
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -585,6 +585,7 @@ void sysfs_addrm_finish(struct sysfs_addrm_cxt *acxt)
+ 		acxt->removed = sd->u.removed_list;
+ 
+ 		sysfs_deactivate(sd);
++		sysfs_unmap_bin_file(sd);
+ 		unmap_bin_file(sd);
+ 		sysfs_put(sd);
+ 	}
+* Unmerged path fs/sysfs/file.c
+* Unmerged path fs/sysfs/sysfs.h
