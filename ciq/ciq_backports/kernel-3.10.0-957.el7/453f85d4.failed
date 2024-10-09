@@ -1,0 +1,996 @@
+mm: remove __GFP_COLD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 453f85d43fa9ee243f0fc3ac4e1be45615301e3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/453f85d4.failed
+
+As the page free path makes no distinction between cache hot and cold
+pages, there is no real useful ordering of pages in the free list that
+allocation requests can take advantage of.  Juding from the users of
+__GFP_COLD, it is likely that a number of them are the result of copying
+other sites instead of actually measuring the impact.  Remove the
+__GFP_COLD parameter which simplifies a number of paths in the page
+allocator.
+
+This is potentially controversial but bear in mind that the size of the
+per-cpu pagelists versus modern cache sizes means that the whole per-cpu
+list can often fit in the L3 cache.  Hence, there is only a potential
+benefit for microbenchmarks that alloc/free pages in a tight loop.  It's
+even worse when THP is taken into account which has little or no chance
+of getting a cache-hot page as the per-cpu list is bypassed and the
+zeroing of multiple pages will thrash the cache anyway.
+
+The truncate microbenchmarks are not shown as this patch affects the
+allocation path and not the free path.  A page fault microbenchmark was
+tested but it showed no sigificant difference which is not surprising
+given that the __GFP_COLD branches are a miniscule percentage of the
+fault path.
+
+Link: http://lkml.kernel.org/r/20171018075952.10627-9-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 453f85d43fa9ee243f0fc3ac4e1be45615301e3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/synopsys/dwc-xlgmac-desc.c
+#	drivers/net/ethernet/ti/netcp_core.c
+#	drivers/staging/lustre/lustre/mdc/mdc_request.c
+#	include/linux/gfp.h
+#	include/linux/pagemap.h
+#	include/trace/events/mmflags.h
+#	mm/page_alloc.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index b3bc87fe3764,cc1e4f820e64..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -265,12 -288,16 +265,16 @@@ static int xgbe_alloc_pages(struct xgbe
+  {
+  	struct page *pages = NULL;
+  	dma_addr_t pages_dma;
+ -	gfp_t gfp;
+ -	int order, ret;
+ -
+ -again:
+ -	order = alloc_order;
+ +	int ret;
+  
+  	/* Try to obtain pages, decreasing order if necessary */
+++<<<<<<< HEAD
+ +	gfp |= __GFP_COLD | __GFP_COMP | __GFP_NOWARN;
+++=======
++ 	gfp = GFP_ATOMIC | __GFP_COMP | __GFP_NOWARN;
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  	while (order >= 0) {
+ -		pages = alloc_pages_node(node, gfp, order);
+ +		pages = alloc_pages(gfp, order);
+  		if (pages)
+  			break;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 3846e4eea8e4,ffb12dc13a5a..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1223,10 -1212,12 +1223,19 @@@ static void *nfp_net_napi_alloc_one(str
+  	} else {
+  		struct page *page;
+  
+++<<<<<<< HEAD
+ +		page = dev_alloc_page();
+ +		if (unlikely(!page))
+ +			return NULL;
+ +		frag = page_address(page);
+++=======
++ 		page = alloc_page(GFP_ATOMIC);
++ 		frag = page ? page_address(page) : NULL;
++ 	}
++ 	if (!frag) {
++ 		nn_dp_warn(dp, "Failed to alloc receive page frag\n");
++ 		return NULL;
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  	}
+  
+  	*dma_addr = nfp_net_dma_map_rx(dp, frag);
+diff --cc include/linux/gfp.h
+index 4d33ca67b826,1a4582b44d32..000000000000
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@@ -24,9 -24,8 +24,8 @@@ struct vm_area_struct
+  #define ___GFP_HIGH		0x20u
+  #define ___GFP_IO		0x40u
+  #define ___GFP_FS		0x80u
+- #define ___GFP_COLD		0x100u
+  #define ___GFP_NOWARN		0x200u
+ -#define ___GFP_RETRY_MAYFAIL	0x400u
+ +#define ___GFP_REPEAT		0x400u
+  #define ___GFP_NOFAIL		0x800u
+  #define ___GFP_NORETRY		0x1000u
+  #define ___GFP_MEMALLOC		0x2000u
+@@@ -55,118 -56,243 +54,132 @@@
+  #define __GFP_DMA	((__force gfp_t)___GFP_DMA)
+  #define __GFP_HIGHMEM	((__force gfp_t)___GFP_HIGHMEM)
+  #define __GFP_DMA32	((__force gfp_t)___GFP_DMA32)
+ -#define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* ZONE_MOVABLE allowed */
+ +#define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
+  #define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+ -
+ -/*
+ - * Page mobility and placement hints
+ - *
+ - * These flags provide hints about how mobile the page is. Pages with similar
+ - * mobility are placed within the same pageblocks to minimise problems due
+ - * to external fragmentation.
+ - *
+ - * __GFP_MOVABLE (also a zone modifier) indicates that the page can be
+ - *   moved by page migration during memory compaction or can be reclaimed.
+ - *
+ - * __GFP_RECLAIMABLE is used for slab allocations that specify
+ - *   SLAB_RECLAIM_ACCOUNT and whose pages can be freed via shrinkers.
+ - *
+ - * __GFP_WRITE indicates the caller intends to dirty the page. Where possible,
+ - *   these pages will be spread between local zones to avoid all the dirty
+ - *   pages being in one zone (fair zone allocation policy).
+ - *
+ - * __GFP_HARDWALL enforces the cpuset memory allocation policy.
+ - *
+ - * __GFP_THISNODE forces the allocation to be satisified from the requested
+ - *   node with no fallbacks or placement policy enforcements.
+ - *
+ - * __GFP_ACCOUNT causes the allocation to be accounted to kmemcg.
+ - */
+ -#define __GFP_RECLAIMABLE ((__force gfp_t)___GFP_RECLAIMABLE)
+ -#define __GFP_WRITE	((__force gfp_t)___GFP_WRITE)
+ -#define __GFP_HARDWALL   ((__force gfp_t)___GFP_HARDWALL)
+ -#define __GFP_THISNODE	((__force gfp_t)___GFP_THISNODE)
+ -#define __GFP_ACCOUNT	((__force gfp_t)___GFP_ACCOUNT)
+ -
+  /*
+ - * Watermark modifiers -- controls access to emergency reserves
+ + * Action modifiers - doesn't change the zoning
+   *
+ - * __GFP_HIGH indicates that the caller is high-priority and that granting
+ - *   the request is necessary before the system can make forward progress.
+ - *   For example, creating an IO context to clean pages.
+ + * __GFP_REPEAT: Try hard to allocate the memory, but the allocation attempt
+ + * _might_ fail.  This depends upon the particular VM implementation.
+   *
+ - * __GFP_ATOMIC indicates that the caller cannot reclaim or sleep and is
+ - *   high priority. Users are typically interrupt handlers. This may be
+ - *   used in conjunction with __GFP_HIGH
+ + * __GFP_NOFAIL: The VM implementation _must_ retry infinitely: the caller
+ + * cannot handle allocation failures.  This modifier is deprecated and no new
+ + * users should be added.
+   *
+ - * __GFP_MEMALLOC allows access to all memory. This should only be used when
+ - *   the caller guarantees the allocation will allow more memory to be freed
+ - *   very shortly e.g. process exiting or swapping. Users either should
+ - *   be the MM or co-ordinating closely with the VM (e.g. swap over NFS).
+ + * __GFP_NORETRY: The VM implementation must not retry indefinitely.
+   *
+ - * __GFP_NOMEMALLOC is used to explicitly forbid access to emergency reserves.
+ - *   This takes precedence over the __GFP_MEMALLOC flag if both are set.
+ + * __GFP_MOVABLE: Flag that this page will be movable by the page migration
+ + * mechanism or reclaimed
+   */
+ -#define __GFP_ATOMIC	((__force gfp_t)___GFP_ATOMIC)
+ -#define __GFP_HIGH	((__force gfp_t)___GFP_HIGH)
+ -#define __GFP_MEMALLOC	((__force gfp_t)___GFP_MEMALLOC)
+ -#define __GFP_NOMEMALLOC ((__force gfp_t)___GFP_NOMEMALLOC)
+ +#define __GFP_WAIT	((__force gfp_t)___GFP_WAIT)	/* Can wait and reschedule? */
+ +#define __GFP_HIGH	((__force gfp_t)___GFP_HIGH)	/* Should access emergency pools? */
+ +#define __GFP_IO	((__force gfp_t)___GFP_IO)	/* Can start physical IO? */
+ +#define __GFP_FS	((__force gfp_t)___GFP_FS)	/* Can call down to low-level FS? */
+ +#define __GFP_COLD	((__force gfp_t)___GFP_COLD)	/* Cache-cold page required */
+ +#define __GFP_NOWARN	((__force gfp_t)___GFP_NOWARN)	/* Suppress page allocation failure warning */
+ +#define __GFP_REPEAT	((__force gfp_t)___GFP_REPEAT)	/* See above */
+ +#define __GFP_NOFAIL	((__force gfp_t)___GFP_NOFAIL)	/* See above */
+ +#define __GFP_NORETRY	((__force gfp_t)___GFP_NORETRY) /* See above */
+ +#define __GFP_MEMALLOC	((__force gfp_t)___GFP_MEMALLOC)/* Allow access to emergency reserves */
+ +#define __GFP_COMP	((__force gfp_t)___GFP_COMP)	/* Add compound page metadata */
+ +#define __GFP_ZERO	((__force gfp_t)___GFP_ZERO)	/* Return zeroed page on success */
+ +#define __GFP_NOMEMALLOC ((__force gfp_t)___GFP_NOMEMALLOC) /* Don't use emergency reserves.
+ +							 * This takes precedence over the
+ +							 * __GFP_MEMALLOC flag if both are
+ +							 * set
+ +							 */
+ +#define __GFP_HARDWALL   ((__force gfp_t)___GFP_HARDWALL) /* Enforce hardwall cpuset memory allocs */
+ +#define __GFP_THISNODE	((__force gfp_t)___GFP_THISNODE)/* No fallback, no policies */
+ +#define __GFP_RECLAIMABLE ((__force gfp_t)___GFP_RECLAIMABLE) /* Page is reclaimable */
+ +#define __GFP_NOTRACK	((__force gfp_t)___GFP_NOTRACK)  /* Don't track with kmemcheck */
+ +
+ +#define __GFP_NO_KSWAPD	((__force gfp_t)___GFP_NO_KSWAPD)
+ +#define __GFP_OTHER_NODE ((__force gfp_t)___GFP_OTHER_NODE) /* On behalf of other node */
+ +#define __GFP_KMEMCG	((__force gfp_t)___GFP_KMEMCG) /* Allocation comes from a memcg-accounted resource */
+ +#define __GFP_WRITE	((__force gfp_t)___GFP_WRITE)	/* Allocator intends to dirty page */
+  
+  /*
+ - * Reclaim modifiers
+ - *
+ - * __GFP_IO can start physical IO.
+ - *
+ - * __GFP_FS can call down to the low-level FS. Clearing the flag avoids the
+ - *   allocator recursing into the filesystem which might already be holding
+ - *   locks.
+ - *
+ - * __GFP_DIRECT_RECLAIM indicates that the caller may enter direct reclaim.
+ - *   This flag can be cleared to avoid unnecessary delays when a fallback
+ - *   option is available.
+ - *
+ - * __GFP_KSWAPD_RECLAIM indicates that the caller wants to wake kswapd when
+ - *   the low watermark is reached and have it reclaim pages until the high
+ - *   watermark is reached. A caller may wish to clear this flag when fallback
+ - *   options are available and the reclaim is likely to disrupt the system. The
+ - *   canonical example is THP allocation where a fallback is cheap but
+ - *   reclaim/compaction may cause indirect stalls.
+ - *
+ - * __GFP_RECLAIM is shorthand to allow/forbid both direct and kswapd reclaim.
+ - *
+ - * The default allocator behavior depends on the request size. We have a concept
+ - * of so called costly allocations (with order > PAGE_ALLOC_COSTLY_ORDER).
+ - * !costly allocations are too essential to fail so they are implicitly
+ - * non-failing by default (with some exceptions like OOM victims might fail so
+ - * the caller still has to check for failures) while costly requests try to be
+ - * not disruptive and back off even without invoking the OOM killer.
+ - * The following three modifiers might be used to override some of these
+ - * implicit rules
+ - *
+ - * __GFP_NORETRY: The VM implementation will try only very lightweight
+ - *   memory direct reclaim to get some memory under memory pressure (thus
+ - *   it can sleep). It will avoid disruptive actions like OOM killer. The
+ - *   caller must handle the failure which is quite likely to happen under
+ - *   heavy memory pressure. The flag is suitable when failure can easily be
+ - *   handled at small cost, such as reduced throughput
+ - *
+ - * __GFP_RETRY_MAYFAIL: The VM implementation will retry memory reclaim
+ - *   procedures that have previously failed if there is some indication
+ - *   that progress has been made else where.  It can wait for other
+ - *   tasks to attempt high level approaches to freeing memory such as
+ - *   compaction (which removes fragmentation) and page-out.
+ - *   There is still a definite limit to the number of retries, but it is
+ - *   a larger limit than with __GFP_NORETRY.
+ - *   Allocations with this flag may fail, but only when there is
+ - *   genuinely little unused memory. While these allocations do not
+ - *   directly trigger the OOM killer, their failure indicates that
+ - *   the system is likely to need to use the OOM killer soon.  The
+ - *   caller must handle failure, but can reasonably do so by failing
+ - *   a higher-level request, or completing it only in a much less
+ - *   efficient manner.
+ - *   If the allocation does fail, and the caller is in a position to
+ - *   free some non-essential memory, doing so could benefit the system
+ - *   as a whole.
+ - *
+ - * __GFP_NOFAIL: The VM implementation _must_ retry infinitely: the caller
+ - *   cannot handle allocation failures. The allocation could block
+ - *   indefinitely but will never return with failure. Testing for
+ - *   failure is pointless.
+ - *   New users should be evaluated carefully (and the flag should be
+ - *   used only when there is no reasonable failure policy) but it is
+ - *   definitely preferable to use the flag rather than opencode endless
+ - *   loop around allocator.
+ - *   Using this flag for costly allocations is _highly_ discouraged.
+++<<<<<<< HEAD
+ + * This may seem redundant, but it's a way of annotating false positives vs.
+ + * allocations that simply cannot be supported (e.g. page tables).
+   */
+ -#define __GFP_IO	((__force gfp_t)___GFP_IO)
+ -#define __GFP_FS	((__force gfp_t)___GFP_FS)
+ -#define __GFP_DIRECT_RECLAIM	((__force gfp_t)___GFP_DIRECT_RECLAIM) /* Caller can reclaim */
+ -#define __GFP_KSWAPD_RECLAIM	((__force gfp_t)___GFP_KSWAPD_RECLAIM) /* kswapd can wake */
+ -#define __GFP_RECLAIM ((__force gfp_t)(___GFP_DIRECT_RECLAIM|___GFP_KSWAPD_RECLAIM))
+ -#define __GFP_RETRY_MAYFAIL	((__force gfp_t)___GFP_RETRY_MAYFAIL)
+ -#define __GFP_NOFAIL	((__force gfp_t)___GFP_NOFAIL)
+ -#define __GFP_NORETRY	((__force gfp_t)___GFP_NORETRY)
+ -
+ -/*
+ +#define __GFP_NOTRACK_FALSE_POSITIVE (__GFP_NOTRACK)
+++=======
++  * Action modifiers
++  *
++  * __GFP_NOWARN suppresses allocation failure reports.
++  *
++  * __GFP_COMP address compound page metadata.
++  *
++  * __GFP_ZERO returns a zeroed page on success.
++  */
++ #define __GFP_NOWARN	((__force gfp_t)___GFP_NOWARN)
++ #define __GFP_COMP	((__force gfp_t)___GFP_COMP)
++ #define __GFP_ZERO	((__force gfp_t)___GFP_ZERO)
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  
+ -/* Disable lockdep for GFP context tracking */
+ -#define __GFP_NOLOCKDEP ((__force gfp_t)___GFP_NOLOCKDEP)
+ -
+ -/* Room for N __GFP_FOO bits */
+ -#define __GFP_BITS_SHIFT (25 + IS_ENABLED(CONFIG_LOCKDEP))
+ +#define __GFP_BITS_SHIFT 25	/* Room for N __GFP_FOO bits */
+  #define __GFP_BITS_MASK ((__force gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
+  
+ +/* This equals 0, but use constants in case they ever change */
+ +#define GFP_NOWAIT	(GFP_ATOMIC & ~__GFP_HIGH)
+ +/* GFP_ATOMIC means both !wait (__GFP_WAIT not set) and use emergency pool */
+ +#define GFP_ATOMIC	(__GFP_HIGH)
+ +#define GFP_NOIO	(__GFP_WAIT)
+ +#define GFP_NOFS	(__GFP_WAIT | __GFP_IO)
+ +#define GFP_KERNEL	(__GFP_WAIT | __GFP_IO | __GFP_FS)
+ +#define GFP_TEMPORARY	(__GFP_WAIT | __GFP_IO | __GFP_FS | \
+ +			 __GFP_RECLAIMABLE)
+ +#define GFP_USER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
+ +#define GFP_HIGHUSER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL | \
+ +			 __GFP_HIGHMEM)
+ +#define GFP_HIGHUSER_MOVABLE	(__GFP_WAIT | __GFP_IO | __GFP_FS | \
+ +				 __GFP_HARDWALL | __GFP_HIGHMEM | \
+ +				 __GFP_MOVABLE)
+ +#define GFP_IOFS	(__GFP_IO | __GFP_FS)
+ +#define GFP_TRANSHUGE	(GFP_HIGHUSER_MOVABLE | __GFP_COMP | \
+ +			 __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN | \
+ +			 __GFP_NO_KSWAPD)
+ +
+  /*
+ - * Useful GFP flag combinations that are commonly used. It is recommended
+ - * that subsystems start with one of these combinations and then set/clear
+ - * __GFP_FOO flags as necessary.
+ - *
+ - * GFP_ATOMIC users can not sleep and need the allocation to succeed. A lower
+ - *   watermark is applied to allow access to "atomic reserves"
+ - *
+ - * GFP_KERNEL is typical for kernel-internal allocations. The caller requires
+ - *   ZONE_NORMAL or a lower zone for direct access but can direct reclaim.
+ - *
+ - * GFP_KERNEL_ACCOUNT is the same as GFP_KERNEL, except the allocation is
+ - *   accounted to kmemcg.
+ - *
+ - * GFP_NOWAIT is for kernel allocations that should not stall for direct
+ - *   reclaim, start physical IO or use any filesystem callback.
+ - *
+ - * GFP_NOIO will use direct reclaim to discard clean pages or slab pages
+ - *   that do not require the starting of any physical IO.
+ - *   Please try to avoid using this flag directly and instead use
+ - *   memalloc_noio_{save,restore} to mark the whole scope which cannot
+ - *   perform any IO with a short explanation why. All allocation requests
+ - *   will inherit GFP_NOIO implicitly.
+ - *
+ - * GFP_NOFS will use direct reclaim but will not use any filesystem interfaces.
+ - *   Please try to avoid using this flag directly and instead use
+ - *   memalloc_nofs_{save,restore} to mark the whole scope which cannot/shouldn't
+ - *   recurse into the FS layer with a short explanation why. All allocation
+ - *   requests will inherit GFP_NOFS implicitly.
+ - *
+ - * GFP_USER is for userspace allocations that also need to be directly
+ - *   accessibly by the kernel or hardware. It is typically used by hardware
+ - *   for buffers that are mapped to userspace (e.g. graphics) that hardware
+ - *   still must DMA to. cpuset limits are enforced for these allocations.
+ - *
+ - * GFP_DMA exists for historical reasons and should be avoided where possible.
+ - *   The flags indicates that the caller requires that the lowest zone be
+ - *   used (ZONE_DMA or 16M on x86-64). Ideally, this would be removed but
+ - *   it would require careful auditing as some users really require it and
+ - *   others use the flag to avoid lowmem reserves in ZONE_DMA and treat the
+ - *   lowest zone as a type of emergency reserve.
+ - *
+ - * GFP_DMA32 is similar to GFP_DMA except that the caller requires a 32-bit
+ - *   address.
+ - *
+ - * GFP_HIGHUSER is for userspace allocations that may be mapped to userspace,
+ - *   do not need to be directly accessible by the kernel but that cannot
+ - *   move once in use. An example may be a hardware allocation that maps
+ - *   data directly into userspace but has no addressing limitations.
+ - *
+ - * GFP_HIGHUSER_MOVABLE is for userspace allocations that the kernel does not
+ - *   need direct access to but can use kmap() when access is required. They
+ - *   are expected to be movable via page reclaim or page migration. Typically,
+ - *   pages on the LRU would also be allocated with GFP_HIGHUSER_MOVABLE.
+ - *
+ - * GFP_TRANSHUGE and GFP_TRANSHUGE_LIGHT are used for THP allocations. They are
+ - *   compound allocations that will generally fail quickly if memory is not
+ - *   available and will not wake kswapd/kcompactd on failure. The _LIGHT
+ - *   version does not attempt reclaim/compaction at all and is by default used
+ - *   in page fault path, while the non-light is used by khugepaged.
+ + * GFP_THISNODE does not perform any reclaim, you most likely want to
+ + * use __GFP_THISNODE to allocate from a given node without fallback!
+   */
+ -#define GFP_ATOMIC	(__GFP_HIGH|__GFP_ATOMIC|__GFP_KSWAPD_RECLAIM)
+ -#define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
+ -#define GFP_KERNEL_ACCOUNT (GFP_KERNEL | __GFP_ACCOUNT)
+ -#define GFP_NOWAIT	(__GFP_KSWAPD_RECLAIM)
+ -#define GFP_NOIO	(__GFP_RECLAIM)
+ -#define GFP_NOFS	(__GFP_RECLAIM | __GFP_IO)
+ -#define GFP_USER	(__GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
+ +#ifdef CONFIG_NUMA
+ +#define GFP_THISNODE	(__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)
+ +#else
+ +#define GFP_THISNODE	((__force gfp_t)0)
+ +#endif
+ +
+ +/* This mask makes up all the page movable related flags */
+ +#define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
+ +
+ +/* Control page allocator reclaim behavior */
+ +#define GFP_RECLAIM_MASK (__GFP_WAIT|__GFP_HIGH|__GFP_IO|__GFP_FS|\
+ +			__GFP_NOWARN|__GFP_REPEAT|__GFP_NOFAIL|\
+ +			__GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC)
+ +
+ +/* Control slab gfp mask during early boot */
+ +#define GFP_BOOT_MASK (__GFP_BITS_MASK & ~(__GFP_WAIT|__GFP_IO|__GFP_FS))
+ +
+ +/* Control allocation constraints */
+ +#define GFP_CONSTRAINT_MASK (__GFP_HARDWALL|__GFP_THISNODE)
+ +
+ +/* Do not use these with a slab allocator */
+ +#define GFP_SLAB_BUG_MASK (__GFP_DMA32|__GFP_HIGHMEM|~__GFP_BITS_MASK)
+ +
+ +/* Flag - indicates that the buffer will be suitable for DMA.  Ignored on some
+ +   platforms, used as appropriate on others */
+ +
+  #define GFP_DMA		__GFP_DMA
+ +
+ +/* 4GB DMA on some platforms */
+  #define GFP_DMA32	__GFP_DMA32
+ -#define GFP_HIGHUSER	(GFP_USER | __GFP_HIGHMEM)
+ -#define GFP_HIGHUSER_MOVABLE	(GFP_HIGHUSER | __GFP_MOVABLE)
+ -#define GFP_TRANSHUGE_LIGHT	((GFP_HIGHUSER_MOVABLE | __GFP_COMP | \
+ -			 __GFP_NOMEMALLOC | __GFP_NOWARN) & ~__GFP_RECLAIM)
+ -#define GFP_TRANSHUGE	(GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM)
+  
+  /* Convert GFP flags to their corresponding migrate type */
+ -#define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
+ -#define GFP_MOVABLE_SHIFT 3
+ -
+ -static inline int gfpflags_to_migratetype(const gfp_t gfp_flags)
+ +static inline int allocflags_to_migratetype(gfp_t gfp_flags)
+  {
+ -	VM_WARN_ON((gfp_flags & GFP_MOVABLE_MASK) == GFP_MOVABLE_MASK);
+ -	BUILD_BUG_ON((1UL << GFP_MOVABLE_SHIFT) != ___GFP_MOVABLE);
+ -	BUILD_BUG_ON((___GFP_MOVABLE >> GFP_MOVABLE_SHIFT) != MIGRATE_MOVABLE);
+ +	WARN_ON((gfp_flags & GFP_MOVABLE_MASK) == GFP_MOVABLE_MASK);
+  
+  	if (unlikely(page_group_by_mobility_disabled))
+  		return MIGRATE_UNMOVABLE;
+diff --cc include/linux/pagemap.h
+index d0d8c6bd7b31,34ce3ebf97d5..000000000000
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@@ -231,15 -234,9 +231,21 @@@ static inline struct page *page_cache_a
+  	return __page_cache_alloc(mapping_gfp_mask(x));
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct page *page_cache_alloc_cold(struct address_space *x)
+ +{
+ +	return __page_cache_alloc(mapping_gfp_mask(x)|__GFP_COLD);
+ +}
+ +
+ +static inline struct page *page_cache_alloc_readahead(struct address_space *x)
+ +{
+ +	return __page_cache_alloc(mapping_gfp_mask(x) |
+ +				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN);
+++=======
++ static inline gfp_t readahead_gfp_mask(struct address_space *x)
++ {
++ 	return mapping_gfp_mask(x) | __GFP_NORETRY | __GFP_NOWARN;
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  }
+  
+  typedef int filler_t(void *, struct page *);
+diff --cc mm/page_alloc.c
+index 0f8b31880f9c,370b64d03e3f..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -1624,9 -2336,9 +1624,9 @@@ retry_reserve
+   */
+  static int rmqueue_bulk(struct zone *zone, unsigned int order,
+  			unsigned long count, struct list_head *list,
+- 			int migratetype, bool cold)
++ 			int migratetype)
+  {
+ -	int i, alloced = 0;
+ +	int mt = migratetype, i;
+  
+  	spin_lock(&zone->lock);
+  	for (i = 0; i < count; ++i) {
+@@@ -1643,18 -2358,10 +1643,22 @@@
+  		 * merge IO requests if the physical pages are ordered
+  		 * properly.
+  		 */
+++<<<<<<< HEAD
+ +		if (likely(!cold))
+ +			list_add(&page->lru, list);
+ +		else
+ +			list_add_tail(&page->lru, list);
+ +		if (IS_ENABLED(CONFIG_CMA)) {
+ +			mt = get_pageblock_migratetype(page);
+ +			if (!is_migrate_cma(mt) && !is_migrate_isolate(mt))
+ +				mt = migratetype;
+ +		}
+ +		set_freepage_migratetype(page, mt);
+++=======
++ 		list_add(&page->lru, list);
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  		list = &page->lru;
+ -		alloced++;
+ -		if (is_migrate_cma(get_pcppage_migratetype(page)))
+ +		if (is_migrate_cma(mt))
+  			__mod_zone_page_state(zone, NR_FREE_CMA_PAGES,
+  					      -(1 << order));
+  	}
+@@@ -1968,101 -2768,121 +1972,172 @@@ static int __isolate_free_page(struct p
+  }
+  
+  /*
+ - * Update NUMA hit/miss statistics
+ + * Similar to split_page except the page is already free. As this is only
+ + * being used for migration, the migratetype of the block also changes.
+ + * As this is called with interrupts disabled, the caller is responsible
+ + * for calling arch_alloc_page() and kernel_map_page() after interrupts
+ + * are enabled.
+   *
+ - * Must be called with interrupts disabled.
+ + * Note: this is probably too low level an operation for use in drivers.
+ + * Please consult with lkml before using this in your driver.
+   */
+ -static inline void zone_statistics(struct zone *preferred_zone, struct zone *z)
+ +int split_free_page(struct page *page)
+  {
+ -#ifdef CONFIG_NUMA
+ -	enum numa_stat_item local_stat = NUMA_LOCAL;
+ +	unsigned int order;
+ +	int nr_pages;
+  
+ -	if (z->node != numa_node_id())
+ -		local_stat = NUMA_OTHER;
+ +	order = page_order(page);
+  
+ -	if (z->node == preferred_zone->node)
+ -		__inc_numa_state(z, NUMA_HIT);
+ -	else {
+ -		__inc_numa_state(z, NUMA_MISS);
+ -		__inc_numa_state(preferred_zone, NUMA_FOREIGN);
+ -	}
+ -	__inc_numa_state(z, local_stat);
+ -#endif
+ +	nr_pages = __isolate_free_page(page, order);
+ +	if (!nr_pages)
+ +		return 0;
+ +
+ +	/* Split into individual pages */
+ +	set_page_refcounted(page);
+ +	split_page(page, order);
+ +	return nr_pages;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Really, prep_compound_page() should be called from __rmqueue_bulk().  But
+ + * we cheat by calling it from here, in the order > 0 path.  Saves a branch
+ + * or two.
+ + */
+ +static inline
+ +struct page *buffered_rmqueue(struct zone *preferred_zone,
+ +			struct zone *zone, int order, gfp_t gfp_flags,
+ +			int migratetype)
+++=======
++ /* Remove page from the per-cpu list, caller must protect the list */
++ static struct page *__rmqueue_pcplist(struct zone *zone, int migratetype,
++ 			struct per_cpu_pages *pcp,
++ 			struct list_head *list)
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  {
+ +	unsigned long flags;
+  	struct page *page;
+ +	bool cold = ((gfp_flags & __GFP_COLD) != 0);
+  
+ -	do {
+ +again:
+ +	if (likely(order == 0)) {
+ +		struct per_cpu_pages *pcp;
+ +		struct list_head *list;
+ +
+ +		local_irq_save(flags);
+ +		pcp = &this_cpu_ptr(zone->pageset)->pcp;
+ +		list = &pcp->lists[migratetype];
+  		if (list_empty(list)) {
+  			pcp->count += rmqueue_bulk(zone, 0,
+  					pcp->batch, list,
+- 					migratetype, cold);
++ 					migratetype);
+  			if (unlikely(list_empty(list)))
+ -				return NULL;
+ +				goto failed;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (cold)
+ +			page = list_entry(list->prev, struct page, lru);
+ +		else
+ +			page = list_entry(list->next, struct page, lru);
+ +
+ +		list_del(&page->lru);
+ +		pcp->count--;
+ +	} else {
+ +		if (unlikely(gfp_flags & __GFP_NOFAIL)) {
+ +			/*
+ +			 * __GFP_NOFAIL is not to be used in new code.
+ +			 *
+ +			 * All __GFP_NOFAIL callers should be fixed so that they
+ +			 * properly detect and handle allocation failures.
+ +			 *
+ +			 * We most definitely don't want callers attempting to
+ +			 * allocate greater than order-1 page units with
+ +			 * __GFP_NOFAIL.
+ +			 */
+ +			WARN_ON_ONCE(order > 1);
+++=======
++ 		page = list_first_entry(list, struct page, lru);
++ 		list_del(&page->lru);
++ 		pcp->count--;
++ 	} while (check_new_pcp(page));
++ 
++ 	return page;
++ }
++ 
++ /* Lock and remove page from the per-cpu list */
++ static struct page *rmqueue_pcplist(struct zone *preferred_zone,
++ 			struct zone *zone, unsigned int order,
++ 			gfp_t gfp_flags, int migratetype)
++ {
++ 	struct per_cpu_pages *pcp;
++ 	struct list_head *list;
++ 	struct page *page;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	pcp = &this_cpu_ptr(zone->pageset)->pcp;
++ 	list = &pcp->lists[migratetype];
++ 	page = __rmqueue_pcplist(zone,  migratetype, pcp, list);
++ 	if (page) {
++ 		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
++ 		zone_statistics(preferred_zone, zone);
++ 	}
++ 	local_irq_restore(flags);
++ 	return page;
++ }
++ 
++ /*
++  * Allocate a page from the given zone. Use pcplists for order-0 allocations.
++  */
++ static inline
++ struct page *rmqueue(struct zone *preferred_zone,
++ 			struct zone *zone, unsigned int order,
++ 			gfp_t gfp_flags, unsigned int alloc_flags,
++ 			int migratetype)
++ {
++ 	unsigned long flags;
++ 	struct page *page;
++ 
++ 	if (likely(order == 0)) {
++ 		page = rmqueue_pcplist(preferred_zone, zone, order,
++ 				gfp_flags, migratetype);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * We most definitely don't want callers attempting to
++ 	 * allocate greater than order-1 page units with __GFP_NOFAIL.
++ 	 */
++ 	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
++ 	spin_lock_irqsave(&zone->lock, flags);
++ 
++ 	do {
++ 		page = NULL;
++ 		if (alloc_flags & ALLOC_HARDER) {
++ 			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
++ 			if (page)
++ 				trace_mm_page_alloc_zone_locked(page, order, migratetype);
+++>>>>>>> 453f85d43fa9 (mm: remove __GFP_COLD)
+  		}
+ +		spin_lock_irqsave(&zone->lock, flags);
+ +		page = __rmqueue(zone, order, migratetype);
+ +		spin_unlock(&zone->lock);
+  		if (!page)
+ -			page = __rmqueue(zone, order, migratetype);
+ -	} while (page && check_new_pages(page, order));
+ -	spin_unlock(&zone->lock);
+ -	if (!page)
+ -		goto failed;
+ -	__mod_zone_freepage_state(zone, -(1 << order),
+ -				  get_pcppage_migratetype(page));
+ +			goto failed;
+ +		__mod_zone_freepage_state(zone, -(1 << order),
+ +					  get_pageblock_migratetype(page));
+ +	}
+ +
+ +	__mod_zone_page_state(zone, NR_ALLOC_BATCH, -(1 << order));
+  
+ -	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+ -	zone_statistics(preferred_zone, zone);
+ +	__count_zone_vm_events(PGALLOC, zone, 1 << order);
+ +	zone_statistics(preferred_zone, zone, gfp_flags);
+  	local_irq_restore(flags);
+  
+ -out:
+ -	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
+ +	VM_BUG_ON_PAGE(bad_range(zone, page), page);
+ +	if (prep_new_page(page, order, gfp_flags))
+ +		goto again;
+  	return page;
+  
+  failed:
+* Unmerged path drivers/net/ethernet/synopsys/dwc-xlgmac-desc.c
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+* Unmerged path drivers/staging/lustre/lustre/mdc/mdc_request.c
+* Unmerged path include/trace/events/mmflags.h
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.c b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+index d8a45b85df52..c36fbcb0dba9 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@ -522,7 +522,7 @@ static int ena_refill_rx_bufs(struct ena_ring *rx_ring, u32 num)
+ 
+ 
+ 		rc = ena_alloc_rx_page(rx_ring, rx_info,
+-				       __GFP_COLD | GFP_ATOMIC | __GFP_COMP);
++				       GFP_ATOMIC | __GFP_COMP);
+ 		if (unlikely(rc < 0)) {
+ 			netif_warn(rx_ring->adapter, rx_err, rx_ring->netdev,
+ 				   "failed to alloc buffer for rx queue %d\n",
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+index 7fea429d4fae..b5f1f62e8e25 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ring.c
+@@ -307,8 +307,7 @@ int aq_ring_rx_fill(struct aq_ring_s *self)
+ 		buff->flags = 0U;
+ 		buff->len = AQ_CFG_RX_FRAME_MAX;
+ 
+-		buff->page = alloc_pages(GFP_ATOMIC | __GFP_COLD |
+-					 __GFP_COMP, pages_order);
++		buff->page = alloc_pages(GFP_ATOMIC | __GFP_COMP, pages_order);
+ 		if (!buff->page) {
+ 			err = -ENOMEM;
+ 			goto err_exit;
+diff --git a/drivers/net/ethernet/cavium/liquidio/octeon_network.h b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+index 6b6ac6672ca3..b1c209ac24da 100644
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -198,7 +198,7 @@ static inline void
+ 	struct sk_buff *skb;
+ 	struct octeon_skb_page_info *skb_pg_info;
+ 
+-	page = alloc_page(GFP_ATOMIC | __GFP_COLD);
++	page = alloc_page(GFP_ATOMIC);
+ 	if (unlikely(!page))
+ 		return NULL;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index bfba89f7da62..255d01beccf9 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -190,7 +190,7 @@ static int mlx4_en_fill_rx_buffers(struct mlx4_en_priv *priv)
+ 
+ 			if (mlx4_en_prepare_rx_desc(priv, ring,
+ 						    ring->actual_size,
+-						    GFP_KERNEL | __GFP_COLD)) {
++						    GFP_KERNEL)) {
+ 				if (ring->actual_size < MLX4_EN_MIN_RX_SIZE) {
+ 					en_err(priv, "Failed to allocate enough rx buffers\n");
+ 					return -ENOMEM;
+@@ -542,8 +542,7 @@ static void mlx4_en_refill_rx_buffers(struct mlx4_en_priv *priv,
+ 	do {
+ 		if (mlx4_en_prepare_rx_desc(priv, ring,
+ 					    ring->prod & ring->size_mask,
+-					    GFP_ATOMIC | __GFP_COLD |
+-					    __GFP_MEMALLOC))
++					    GFP_ATOMIC | __GFP_MEMALLOC))
+ 			break;
+ 		ring->prod++;
+ 	} while (likely(--missing));
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/qlogic/qlge/qlge_main.c b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+index 55efbcdfa7f9..4d8fdd3a26e8 100644
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_main.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+@@ -1092,8 +1092,7 @@ static int ql_get_next_chunk(struct ql_adapter *qdev, struct rx_ring *rx_ring,
+ {
+ 	if (!rx_ring->pg_chunk.page) {
+ 		u64 map;
+-		rx_ring->pg_chunk.page = alloc_pages(__GFP_COLD | __GFP_COMP |
+-						GFP_ATOMIC,
++		rx_ring->pg_chunk.page = alloc_pages(__GFP_COMP | GFP_ATOMIC,
+ 						qdev->lbq_buf_order);
+ 		if (unlikely(!rx_ring->pg_chunk.page)) {
+ 			netif_err(qdev, drv, qdev->ndev,
+diff --git a/drivers/net/ethernet/sfc/falcon/rx.c b/drivers/net/ethernet/sfc/falcon/rx.c
+index 8238c232d006..9854bbed6e9b 100644
+--- a/drivers/net/ethernet/sfc/falcon/rx.c
++++ b/drivers/net/ethernet/sfc/falcon/rx.c
+@@ -163,7 +163,7 @@ static int ef4_init_rx_buffers(struct ef4_rx_queue *rx_queue, bool atomic)
+ 	do {
+ 		page = ef4_reuse_page(rx_queue);
+ 		if (page == NULL) {
+-			page = alloc_pages(__GFP_COLD | __GFP_COMP |
++			page = alloc_pages(__GFP_COMP |
+ 					   (atomic ? GFP_ATOMIC : GFP_KERNEL),
+ 					   efx->rx_buffer_order);
+ 			if (unlikely(page == NULL))
+diff --git a/drivers/net/ethernet/sfc/rx.c b/drivers/net/ethernet/sfc/rx.c
+index 90c85f16047f..e5b179475224 100644
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@ -163,7 +163,7 @@ static int efx_init_rx_buffers(struct efx_rx_queue *rx_queue, bool atomic)
+ 	do {
+ 		page = efx_reuse_page(rx_queue);
+ 		if (page == NULL) {
+-			page = alloc_pages(__GFP_COLD | __GFP_COMP |
++			page = alloc_pages(__GFP_COMP |
+ 					   (atomic ? GFP_ATOMIC : GFP_KERNEL),
+ 					   efx->rx_buffer_order);
+ 			if (unlikely(page == NULL))
+* Unmerged path drivers/net/ethernet/synopsys/dwc-xlgmac-desc.c
+* Unmerged path drivers/net/ethernet/ti/netcp_core.c
+* Unmerged path drivers/staging/lustre/lustre/mdc/mdc_request.c
+diff --git a/fs/cachefiles/rdwr.c b/fs/cachefiles/rdwr.c
+index 1db6647851c1..ac10243cef52 100644
+--- a/fs/cachefiles/rdwr.c
++++ b/fs/cachefiles/rdwr.c
+@@ -256,8 +256,7 @@ static int cachefiles_read_backing_file_one(struct cachefiles_object *object,
+ 			goto backing_page_already_present;
+ 
+ 		if (!newpage) {
+-			newpage = __page_cache_alloc(cachefiles_gfp |
+-						     __GFP_COLD);
++			newpage = __page_cache_alloc(cachefiles_gfp);
+ 			if (!newpage)
+ 				goto nomem_monitor;
+ 		}
+@@ -493,8 +492,7 @@ static int cachefiles_read_backing_file(struct cachefiles_object *object,
+ 				goto backing_page_already_present;
+ 
+ 			if (!newpage) {
+-				newpage = __page_cache_alloc(cachefiles_gfp |
+-							     __GFP_COLD);
++				newpage = __page_cache_alloc(cachefiles_gfp);
+ 				if (!newpage)
+ 					goto nomem;
+ 			}
+* Unmerged path include/linux/gfp.h
+* Unmerged path include/linux/pagemap.h
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index dee52dfc1c40..bc1c1df65aa0 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2570,7 +2570,7 @@ static inline struct page *__dev_alloc_pages(gfp_t gfp_mask,
+ 	 * 4.  __GFP_MEMALLOC is ignored if __GFP_NOMEMALLOC is set due to
+ 	 *     code in gfp_to_alloc_flags that should be enforcing this.
+ 	 */
+-	gfp_mask |= __GFP_COLD | __GFP_COMP | __GFP_MEMALLOC;
++	gfp_mask |= __GFP_COMP | __GFP_MEMALLOC;
+ 
+ 	return alloc_pages_node(NUMA_NO_NODE, gfp_mask, order);
+ }
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index fe5b5415e5c9..261f052c14ae 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -387,9 +387,6 @@ void print_slabinfo_header(struct seq_file *m);
+  * Also it is possible to set different flags by OR'ing
+  * in one or more of the following additional @flags:
+  *
+- * %__GFP_COLD - Request cache-cold pages instead of
+- *   trying to return cache-warm pages.
+- *
+  * %__GFP_HIGH - This allocation has high priority and may use emergency pools.
+  *
+  * %__GFP_NOFAIL - Indicate that this allocation is in no way allowed to fail
+* Unmerged path include/trace/events/mmflags.h
+diff --git a/kernel/power/snapshot.c b/kernel/power/snapshot.c
+index c8630400bde0..ffc2a398ea35 100644
+--- a/kernel/power/snapshot.c
++++ b/kernel/power/snapshot.c
+@@ -1505,7 +1505,7 @@ static int enough_free_mem(unsigned int nr_pages, unsigned int nr_highmem)
+ 
+ static inline int get_highmem_buffer(int safe_needed)
+ {
+-	buffer = get_image_page(GFP_ATOMIC | __GFP_COLD, safe_needed);
++	buffer = get_image_page(GFP_ATOMIC, safe_needed);
+ 	return buffer ? 0 : -ENOMEM;
+ }
+ 
+@@ -1568,7 +1568,7 @@ swsusp_alloc(struct memory_bitmap *orig_bm, struct memory_bitmap *copy_bm,
+ 		while (nr_pages-- > 0) {
+ 			struct page *page;
+ 
+-			page = alloc_image_page(GFP_ATOMIC | __GFP_COLD);
++			page = alloc_image_page(GFP_ATOMIC);
+ 			if (!page)
+ 				goto err_out;
+ 			memory_bm_set_bit(copy_bm, page_to_pfn(page));
+diff --git a/mm/filemap.c b/mm/filemap.c
+index da33af546761..052df0057833 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1935,7 +1935,7 @@ no_cached_page:
+ 		 * Ok, it wasn't cached, so we need to create a new
+ 		 * page..
+ 		 */
+-		page = page_cache_alloc_cold(mapping);
++		page = page_cache_alloc(mapping);
+ 		if (!page) {
+ 			desc->error = -ENOMEM;
+ 			goto out;
+@@ -2163,7 +2163,7 @@ static int page_cache_read(struct file *file, pgoff_t offset, gfp_t gfp_mask)
+ 	int ret;
+ 
+ 	do {
+-		page = __page_cache_alloc(gfp_mask|__GFP_COLD);
++		page = __page_cache_alloc(gfp_mask);
+ 		if (!page)
+ 			return -ENOMEM;
+ 
+@@ -2460,7 +2460,7 @@ static struct page *__read_cache_page(struct address_space *mapping,
+ repeat:
+ 	page = find_get_page(mapping, index);
+ 	if (!page) {
+-		page = __page_cache_alloc(gfp | __GFP_COLD);
++		page = __page_cache_alloc(gfp);
+ 		if (!page)
+ 			return ERR_PTR(-ENOMEM);
+ 		err = add_to_page_cache_lru(page, mapping, index, gfp);
+* Unmerged path mm/page_alloc.c
+diff --git a/mm/percpu-vm.c b/mm/percpu-vm.c
+index 538998a137d2..b8bfb3183bf1 100644
+--- a/mm/percpu-vm.c
++++ b/mm/percpu-vm.c
+@@ -82,7 +82,7 @@ static void pcpu_free_pages(struct pcpu_chunk *chunk,
+ static int pcpu_alloc_pages(struct pcpu_chunk *chunk,
+ 			    struct page **pages, int page_start, int page_end)
+ {
+-	const gfp_t gfp = GFP_KERNEL | __GFP_HIGHMEM | __GFP_COLD;
++	const gfp_t gfp = GFP_KERNEL | __GFP_HIGHMEM;
+ 	unsigned int cpu, tcpu;
+ 	int i;
+ 
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 9488c5317ec3..b9868f47da86 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -411,7 +411,7 @@ static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+  */
+ void *netdev_alloc_frag(unsigned int fragsz)
+ {
+-	return __netdev_alloc_frag(fragsz, GFP_ATOMIC | __GFP_COLD);
++	return __netdev_alloc_frag(fragsz, GFP_ATOMIC);
+ }
+ EXPORT_SYMBOL(netdev_alloc_frag);
+ 
+@@ -424,7 +424,7 @@ static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+ 
+ void *napi_alloc_frag(unsigned int fragsz)
+ {
+-	return __napi_alloc_frag(fragsz, GFP_ATOMIC | __GFP_COLD);
++	return __napi_alloc_frag(fragsz, GFP_ATOMIC);
+ }
+ EXPORT_SYMBOL(napi_alloc_frag);
+ 
+diff --git a/tools/perf/builtin-kmem.c b/tools/perf/builtin-kmem.c
+index 428efeea0244..9efcd8378efa 100644
+--- a/tools/perf/builtin-kmem.c
++++ b/tools/perf/builtin-kmem.c
+@@ -640,7 +640,6 @@ static const struct {
+ 	{ "__GFP_ATOMIC",		"_A" },
+ 	{ "__GFP_IO",			"I" },
+ 	{ "__GFP_FS",			"F" },
+-	{ "__GFP_COLD",			"CO" },
+ 	{ "__GFP_NOWARN",		"NWR" },
+ 	{ "__GFP_REPEAT",		"R" },
+ 	{ "__GFP_NOFAIL",		"NF" },
