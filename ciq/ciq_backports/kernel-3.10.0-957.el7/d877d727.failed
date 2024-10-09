@@ -1,0 +1,151 @@
+target: Fix a deadlock between the XCOPY code and iSCSI session shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [target] Fix a deadlock between the XCOPY code and iSCSI session shutdown (Maurizio Lombardi) [1585081]
+Rebuild_FUZZ: 94.12%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit d877d7275be34ad70ce92bcbb4bb36cec77ed004
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d877d727.failed
+
+Move the code for parsing an XCOPY command from the context of
+the iSCSI receiver thread to the context of the XCOPY workqueue.
+Keep the simple XCOPY checks in the context of the iSCSI receiver
+thread. Move the code for allocating and freeing struct xcopy_op
+from the code that parses an XCOPY command to its caller.
+
+This patch fixes the following deadlock:
+
+======================================================
+[ INFO: possible circular locking dependency detected ]
+4.10.0-rc7-dbg+ #1 Not tainted
+-------------------------------------------------------
+rmdir/13321 is trying to acquire lock:
+ (&sess->cmdsn_mutex){+.+.+.}, at: [<ffffffffa02cb47d>] iscsit_free_all_ooo_cmdsns+0x2d/0xb0 [iscsi_target_mod]
+
+but task is already holding lock:
+ (&sb->s_type->i_mutex_key#14){++++++}, at: [<ffffffff811c6e20>] vfs_rmdir+0x50/0x140
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+-> #1 (&sb->s_type->i_mutex_key#14){++++++}:
+ lock_acquire+0x71/0x90
+ down_write+0x3f/0x70
+ configfs_depend_item+0x3a/0xb0 [configfs]
+ target_depend_item+0x13/0x20 [target_core_mod]
+ target_xcopy_locate_se_dev_e4+0xdd/0x1a0 [target_core_mod]
+ target_do_xcopy+0x34b/0x970 [target_core_mod]
+ __target_execute_cmd+0x22/0xa0 [target_core_mod]
+ target_execute_cmd+0x233/0x2c0 [target_core_mod]
+ iscsit_execute_cmd+0x208/0x270 [iscsi_target_mod]
+ iscsit_sequence_cmd+0x10b/0x190 [iscsi_target_mod]
+ iscsit_get_rx_pdu+0x37d/0xcd0 [iscsi_target_mod]
+ iscsi_target_rx_thread+0x6e/0xa0 [iscsi_target_mod]
+ kthread+0x102/0x140
+ ret_from_fork+0x31/0x40
+
+-> #0 (&sess->cmdsn_mutex){+.+.+.}:
+ __lock_acquire+0x10e6/0x1260
+ lock_acquire+0x71/0x90
+ mutex_lock_nested+0x5f/0x670
+ iscsit_free_all_ooo_cmdsns+0x2d/0xb0 [iscsi_target_mod]
+ iscsit_close_session+0xac/0x200 [iscsi_target_mod]
+ lio_tpg_close_session+0x9f/0xb0 [iscsi_target_mod]
+ target_shutdown_sessions+0xc3/0xd0 [target_core_mod]
+ core_tpg_del_initiator_node_acl+0x91/0x140 [target_core_mod]
+ target_fabric_nacl_base_release+0x20/0x30 [target_core_mod]
+ config_item_release+0x5a/0xc0 [configfs]
+ config_item_put+0x1d/0x1f [configfs]
+ configfs_rmdir+0x1a6/0x300 [configfs]
+ vfs_rmdir+0xb7/0x140
+ do_rmdir+0x1f4/0x200
+ SyS_rmdir+0x11/0x20
+ entry_SYSCALL_64_fastpath+0x23/0xc6
+
+other info that might help us debug this:
+
+ Possible unsafe locking scenario:
+       CPU0                    CPU1
+       ----                    ----
+  lock(&sb->s_type->i_mutex_key#14);
+                               lock(&sess->cmdsn_mutex);
+                               lock(&sb->s_type->i_mutex_key#14);
+  lock(&sess->cmdsn_mutex);
+
+ *** DEADLOCK ***
+
+3 locks held by rmdir/13321:
+ #0:  (sb_writers#10){.+.+.+}, at: [<ffffffff811e1aff>] mnt_want_write+0x1f/0x50
+ #1:  (&default_group_class[depth - 1]#2/1){+.+.+.}, at: [<ffffffff811cc8ce>] do_rmdir+0x15e/0x200
+ #2:  (&sb->s_type->i_mutex_key#14){++++++}, at: [<ffffffff811c6e20>] vfs_rmdir+0x50/0x140
+
+stack backtrace:
+CPU: 2 PID: 13321 Comm: rmdir Not tainted 4.10.0-rc7-dbg+ #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.0.0-prebuilt.qemu-project.org 04/01/2014
+Call Trace:
+ dump_stack+0x86/0xc3
+ print_circular_bug+0x1c7/0x220
+ __lock_acquire+0x10e6/0x1260
+ lock_acquire+0x71/0x90
+ mutex_lock_nested+0x5f/0x670
+ iscsit_free_all_ooo_cmdsns+0x2d/0xb0 [iscsi_target_mod]
+ iscsit_close_session+0xac/0x200 [iscsi_target_mod]
+ lio_tpg_close_session+0x9f/0xb0 [iscsi_target_mod]
+ target_shutdown_sessions+0xc3/0xd0 [target_core_mod]
+ core_tpg_del_initiator_node_acl+0x91/0x140 [target_core_mod]
+ target_fabric_nacl_base_release+0x20/0x30 [target_core_mod]
+ config_item_release+0x5a/0xc0 [configfs]
+ config_item_put+0x1d/0x1f [configfs]
+ configfs_rmdir+0x1a6/0x300 [configfs]
+ vfs_rmdir+0xb7/0x140
+ do_rmdir+0x1f4/0x200
+ SyS_rmdir+0x11/0x20
+ entry_SYSCALL_64_fastpath+0x23/0xc6
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: David Disseldorp <ddiss@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit d877d7275be34ad70ce92bcbb4bb36cec77ed004)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_xcopy.c
+diff --cc drivers/target/target_core_xcopy.c
+index 0336d3eb6d21,56738a41e346..000000000000
+--- a/drivers/target/target_core_xcopy.c
++++ b/drivers/target/target_core_xcopy.c
+@@@ -877,24 -893,6 +895,27 @@@ static sense_reason_t target_parse_xcop
+  	int rc;
+  	unsigned short tdll;
+  
+++<<<<<<< HEAD
+ +	if (!dev->dev_attrib.emulate_3pc) {
+ +		pr_err("EXTENDED_COPY operation explicitly disabled\n");
+ +		return TCM_UNSUPPORTED_SCSI_OPCODE;
+ +	}
+ +
+ +	sa = se_cmd->t_task_cdb[1] & 0x1f;
+ +	if (sa != 0x00) {
+ +		pr_err("EXTENDED_COPY(LID4) not supported\n");
+ +		return TCM_UNSUPPORTED_SCSI_OPCODE;
+ +	}
+ +
+ +	xop = kzalloc(sizeof(struct xcopy_op), GFP_KERNEL);
+ +	if (!xop) {
+ +		pr_err("Unable to allocate xcopy_op\n");
+ +		return TCM_OUT_OF_RESOURCES;
+ +	}
+ +	xop->xop_se_cmd = se_cmd;
+ +
+++=======
+++>>>>>>> d877d7275be3 (target: Fix a deadlock between the XCOPY code and iSCSI session shutdown)
+  	p = transport_kmap_data_sg(se_cmd);
+  	if (!p) {
+  		pr_err("transport_kmap_data_sg() failed in target_do_xcopy\n");
+* Unmerged path drivers/target/target_core_xcopy.c
