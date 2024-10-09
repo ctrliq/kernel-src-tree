@@ -1,0 +1,453 @@
+net_sch: red: Add offload ability to RED qdisc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: red: Add offload ability to RED qdisc (Ivan Vecera) [1583702]
+Rebuild_FUZZ: 93.33%
+commit-author Nogah Frankel <nogahf@mellanox.com>
+commit 602f3baf22188aad24b9a58be3209ab774b97d74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/602f3baf.failed
+
+Add the ability to offload RED qdisc by using ndo_setup_tc.
+There are four commands for RED offloading:
+* TC_RED_SET: handles set and change.
+* TC_RED_DESTROY: handle qdisc destroy.
+* TC_RED_STATS: update the qdiscs counters (given as reference)
+* TC_RED_XSTAT: returns red xstats.
+
+Whether RED is being offloaded is being determined every time dump action
+is being called because parent change of this qdisc could change its
+offload state but doesn't require any RED function to be called.
+
+	Signed-off-by: Nogah Frankel <nogahf@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 602f3baf22188aad24b9a58be3209ab774b97d74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/pkt_cls.h
+diff --cc include/linux/netdevice.h
+index dbc794e21d64,71968a2ca9f3..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -814,176 -775,15 +814,182 @@@ enum tc_setup_type 
+  	TC_SETUP_CLSFLOWER,
+  	TC_SETUP_CLSMATCHALL,
+  	TC_SETUP_CLSBPF,
+++<<<<<<< HEAD
+++=======
++ 	TC_SETUP_BLOCK,
++ 	TC_SETUP_CBS,
++ 	TC_SETUP_QDISC_RED,
+++>>>>>>> 602f3baf2218 (net_sch: red: Add offload ability to RED qdisc)
+  };
+  
+ -/* These structures hold the attributes of bpf state that are being passed
+ - * to the netdevice through the bpf op.
+ +/* Forward declaration of tc_to_netdev structure used by __rh_call_ndo_setup_tc
+ + * wrapper for out-of-tree drivers compiled against RHEL7.4.
+   */
+ -enum bpf_netdev_command {
+ +struct tc_to_netdev_rh74;
+ +
+ +struct tc_cls_u32_offload;
+ +
+ +struct tc_to_netdev {
+ +	unsigned int type;
+ +	union {
+ +		u8 tc;
+ +		struct tc_cls_u32_offload *cls_u32;
+ +		struct tc_cls_flower_offload *cls_flower;
+ +		struct tc_cls_matchall_offload *cls_mall;
+ +		struct tc_cls_bpf_offload *cls_bpf;
+ +	};
+ +	bool egress_dev;
+ +};
+ +
+ +/* This structure defines the management hooks for network devices.
+ + * It is an extension of net_device_ops. Drivers that want to use any of the
+ + * fields defined here must initialize net_device_ops->ndo_size to
+ + * sizeof(struct net_device_ops).
+ + *
+ + * void* (*ndo_dfwd_add_station)(struct net_device *pdev,
+ + *				 struct net_device *dev)
+ + *	Called by upper layer devices to accelerate switching or other
+ + *	station functionality into hardware. 'pdev is the lowerdev
+ + *	to use for the offload and 'dev' is the net device that will
+ + *	back the offload. Returns a pointer to the private structure
+ + *	the upper layer will maintain.
+ + * void (*ndo_dfwd_del_station)(struct net_device *pdev, void *priv)
+ + *	Called by upper layer device to delete the station created
+ + *	by 'ndo_dfwd_add_station'. 'pdev' is the net device backing
+ + *	the station and priv is the structure returned by the add
+ + *	operation.
+ + * int (*ndo_set_tx_maxrate)(struct net_device *dev,
+ + *			     int queue_index, u32 maxrate);
+ + *	Called when a user wants to set a max-rate limitation of specific
+ + *	TX queue.
+ + * void (*ndo_set_rx_headroom)(struct net_device *dev, int needed_headroom);
+ + *	This function is used to specify the headroom that the skb must
+ + *	consider when allocation skb during packet reception. Setting
+ + *	appropriate rx headroom value allows avoiding skb head copy on
+ + *	forward. Setting a negative value reset the rx headroom to the
+ + *	default value.
+ + * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
+ + *		       struct net_device *dev, struct net_device *filter_dev,
+ + *		       int *idx)
+ + *	Used to add FDB entries to dump requests. Implementers should add
+ + *	entries to skb and update idx with the number of entries.
+ + * void (*ndo_change_proto_down)(struct net_device *dev,
+ + *				 bool proto_down);
+ + *	This function is used to pass protocol port error state information
+ + *	to the switch driver. The switch driver can react to the proto_down
+ + *      by doing a phys down on the associated switch port.
+ + * void (*ndo_udp_tunnel_add)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify a driver about the UDP port and socket
+ + *	address family that a UDP tunnel is listnening to. It is called only
+ + *	when a new port starts listening. The operation is protected by the
+ + *	RTNL.
+ + *
+ + * void (*ndo_udp_tunnel_del)(struct net_device *dev,
+ + *			      struct udp_tunnel_info *ti);
+ + *	Called by UDP tunnel to notify the driver about a UDP port and socket
+ + *	address family that the UDP tunnel is not listening to anymore. The
+ + *	operation is protected by the RTNL.
+ + *
+ + * int (*ndo_set_vf_vlan)(struct net_device *dev, int vf, u16 vlan,
+ + *			  u8 qos, __be16 proto);
+ + *
+ + * bool (*ndo_has_offload_stats)(const struct net_device *dev, int attr_id)
+ + *	Return true if this device supports offload stats of this attr_id.
+ + *
+ + * int (*ndo_get_offload_stats)(int attr_id, const struct net_device *dev,
+ + *	void *attr_data)
+ + *	Get statistics for offload operations by attr_id. Write it into the
+ + *	attr_data pointer.
+ + *
+ + * int (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
+ + *	Called when a user wants to change the Maximum Transfer Unit
+ + *	of a device.
+ + *	RHEL: This is an entry point for network device drivers that
+ + *	      use central MTU range checking provided by network core.
+ + *
+ + * int (*ndo_setup_tc)(struct net_device *dev, enum tc_setup_type type,
+ + *		       void *type_data);
+ + *	Called to setup any 'tc' scheduler, classifier or action on @dev.
+ + *	This is always called from the stack with the rtnl lock held and netif
+ + *	tx queues stopped. This allows the netdevice to perform queue
+ + *	management safely.
+ + *	RHEL: Note that this callback is not part of kABI and its prototype
+ + *	and semantic can be changed across releases.
+ + * int (*ndo_xdp)(struct net_device *dev, struct netdev_xdp *xdp);
+ + *	This function is used to set or query state related to XDP on the
+ + *	netdevice. See definition of enum xdp_netdev_command for details.
+ + * int (*ndo_xdp_xmit)(struct net_device *dev, struct xdp_buff *xdp);
+ + *	This function is used to submit a XDP packet for transmit on a
+ + *	netdevice.
+ + * void (*ndo_xdp_flush)(struct net_device *dev);
+ + *	This function is used to inform the driver to flush a paticular
+ + *	xpd tx queue. Must be called on same CPU as xdp_xmit.
+ + */
+ +struct net_device_ops_extended {
+ +	int			(*ndo_set_vf_trust)(struct net_device *dev,
+ +						    int vf, bool setting);
+ +	void*			(*ndo_dfwd_add_station)(struct net_device *pdev,
+ +							struct net_device *dev);
+ +	void			(*ndo_dfwd_del_station)(struct net_device *pdev,
+ +							void *priv);
+ +	int			(*ndo_set_tx_maxrate)(struct net_device *dev,
+ +						      int queue_index,
+ +						      u32 maxrate);
+ +	void			(*ndo_set_rx_headroom)(struct net_device *dev,
+ +						       int needed_headroom);
+ +	int			(*ndo_set_vf_guid)(struct net_device *dev,
+ +						   int vf, u64 guid,
+ +						   int guid_type);
+ +	int			(*ndo_fdb_dump_rh73)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int idx);
+ +	int			(*ndo_get_phys_port_name)(struct net_device *dev,
+ +							  char *name, size_t len);
+ +	int			(*ndo_change_proto_down)(struct net_device *dev,
+ +							 bool proto_down);
+ +	void			(*ndo_udp_tunnel_add)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	void			(*ndo_udp_tunnel_del)(struct net_device *dev,
+ +						      struct udp_tunnel_info *ti);
+ +	int			(*ndo_neigh_construct)(struct net_device *dev,
+ +						       struct neighbour *n);
+ +	void			(*ndo_neigh_destroy)(struct net_device *dev,
+ +						     struct neighbour *n);
+ +	int			(*ndo_set_vf_vlan)(struct net_device *dev,
+ +						   int vf, u16 vlan, u8 qos,
+ +						   __be16 proto);
+ +	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+ +						struct netlink_callback *cb,
+ +						struct net_device *dev,
+ +						struct net_device *filter_dev,
+ +						int *idx);
+ +	bool			(*ndo_has_offload_stats)(const struct net_device *dev, int attr_id);
+ +	int			(*ndo_get_offload_stats)(int attr_id,
+ +							 const struct net_device *dev,
+ +							 void *attr_data);
+ +	int			(*ndo_change_mtu)(struct net_device *dev,
+ +						  int new_mtu);
+ +	/*
+ +	 * RHEL: Note that this callback is not part of kABI and its prototype
+ +	 * and semantic can be changed across releases.
+ +	 */
+ +	int			(*ndo_setup_tc_rh)(struct net_device *dev,
+ +						   enum tc_setup_type type,
+ +						   void *type_data);
+ +	int			(*ndo_xdp)(struct net_device *dev,
+ +						  struct netdev_xdp *xdp);
+ +	int                     (*ndo_xdp_xmit)(struct net_device *dev,
+ +						struct xdp_buff *xdp);
+ +	void                    (*ndo_xdp_flush)(struct net_device *dev);
+ +};
+ +
+ +/* These structures hold the attributes of xdp state that are being passed
+ + * to the netdevice through the xdp op.
+ + */
+ +enum xdp_netdev_command {
+  	/* Set or clear a bpf program used in the earliest stages of packet
+  	 * rx. The prog will have been loaded as BPF_PROG_TYPE_XDP. The callee
+  	 * is responsible for calling bpf_prog_put on any old progs that are
+diff --cc include/net/pkt_cls.h
+index bf70a6a4bd8a,03c208d3c922..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -591,14 -669,6 +591,15 @@@ struct tc_cls_matchall_offload 
+  	unsigned long cookie;
+  };
+  
+ +/* This structure holds cookie structure that is passed from user
+ + * to the kernel for actions and classifiers
+ + */
+ +struct tc_cookie {
+ +	u8  *data;
+ +	u32 len;
+ +};
+ +
+++<<<<<<< HEAD
+  enum tc_clsbpf_command {
+  	TC_CLSBPF_ADD,
+  	TC_CLSBPF_REPLACE,
+@@@ -611,6 -683,54 +612,35 @@@ struct tc_cls_bpf_offload 
+  	struct bpf_prog *prog;
+  	const char *name;
+  	bool exts_integrated;
+ -	u32 gen_flags;
+ -};
+ -
+ -struct tc_mqprio_qopt_offload {
+ -	/* struct tc_mqprio_qopt must always be the first element */
+ -	struct tc_mqprio_qopt qopt;
+ -	u16 mode;
+ -	u16 shaper;
+ -	u32 flags;
+ -	u64 min_rate[TC_QOPT_MAX_QUEUE];
+ -	u64 max_rate[TC_QOPT_MAX_QUEUE];
+ -};
+ -
+ -/* This structure holds cookie structure that is passed from user
+ - * to the kernel for actions and classifiers
+ - */
+ -struct tc_cookie {
+ -	u8  *data;
+ -	u32 len;
+ -};
+ -
+++=======
++ enum tc_red_command {
++ 	TC_RED_REPLACE,
++ 	TC_RED_DESTROY,
++ 	TC_RED_STATS,
++ 	TC_RED_XSTATS,
++ };
++ 
++ struct tc_red_qopt_offload_params {
++ 	u32 min;
++ 	u32 max;
++ 	u32 probability;
++ 	bool is_ecn;
++ };
++ struct tc_red_qopt_offload_stats {
++ 	struct gnet_stats_basic_packed *bstats;
++ 	struct gnet_stats_queue *qstats;
++ };
++ 
++ struct tc_red_qopt_offload {
++ 	enum tc_red_command command;
++ 	u32 handle;
++ 	u32 parent;
++ 	union {
++ 		struct tc_red_qopt_offload_params set;
++ 		struct tc_red_qopt_offload_stats stats;
++ 		struct red_stats *xstats;
++ 	};
+++>>>>>>> 602f3baf2218 (net_sch: red: Add offload ability to RED qdisc)
+  };
+  
+  #endif
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/net/pkt_cls.h
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index e35bcb419e64..74ee1291e479 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -255,6 +255,7 @@ struct tc_red_qopt {
+ #define TC_RED_ECN		1
+ #define TC_RED_HARDDROP		2
+ #define TC_RED_ADAPTATIVE	4
++#define TC_RED_OFFLOADED	8
+ };
+ 
+ struct tc_red_xstats {
+diff --git a/net/sched/sch_red.c b/net/sched/sch_red.c
+index ffa7875f9b91..5d3761180fbd 100644
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -19,6 +19,7 @@
+ #include <linux/kernel.h>
+ #include <linux/skbuff.h>
+ #include <net/pkt_sched.h>
++#include <net/pkt_cls.h>
+ #include <net/inet_ecn.h>
+ #include <net/red.h>
+ 
+@@ -147,11 +148,37 @@ static void red_reset(struct Qdisc *sch)
+ 	red_restart(&q->vars);
+ }
+ 
++static int red_offload(struct Qdisc *sch, bool enable)
++{
++	struct red_sched_data *q = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_red_qopt_offload opt = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++	};
++
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	if (enable) {
++		opt.command = TC_RED_REPLACE;
++		opt.set.min = q->parms.qth_min >> q->parms.Wlog;
++		opt.set.max = q->parms.qth_max >> q->parms.Wlog;
++		opt.set.probability = q->parms.max_P;
++		opt.set.is_ecn = red_use_ecn(q);
++	} else {
++		opt.command = TC_RED_DESTROY;
++	}
++
++	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED, &opt);
++}
++
+ static void red_destroy(struct Qdisc *sch)
+ {
+ 	struct red_sched_data *q = qdisc_priv(sch);
+ 
+ 	del_timer_sync(&q->adapt_timer);
++	red_offload(sch, false);
+ 	qdisc_destroy(q->qdisc);
+ }
+ 
+@@ -218,6 +245,7 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
+ 		red_start_of_idle_period(&q->vars);
+ 
+ 	sch_tree_unlock(sch);
++	red_offload(sch, true);
+ 	return 0;
+ }
+ 
+@@ -242,6 +270,33 @@ static int red_init(struct Qdisc *sch, struct nlattr *opt)
+ 	return red_change(sch, opt);
+ }
+ 
++static int red_dump_offload(struct Qdisc *sch, struct tc_red_qopt *opt)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_red_qopt_offload hw_stats = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++		.command = TC_RED_STATS,
++		.stats.bstats = &sch->bstats,
++		.stats.qstats = &sch->qstats,
++	};
++	int err;
++
++	opt->flags &= ~TC_RED_OFFLOADED;
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return 0;
++
++	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_RED,
++					    &hw_stats);
++	if (err == -EOPNOTSUPP)
++		return 0;
++
++	if (!err)
++		opt->flags |= TC_RED_OFFLOADED;
++
++	return err;
++}
++
+ static int red_dump(struct Qdisc *sch, struct sk_buff *skb)
+ {
+ 	struct red_sched_data *q = qdisc_priv(sch);
+@@ -255,8 +310,13 @@ static int red_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 		.Plog		= q->parms.Plog,
+ 		.Scell_log	= q->parms.Scell_log,
+ 	};
++	int err;
+ 
+ 	sch->qstats.backlog = q->qdisc->qstats.backlog;
++	err = red_dump_offload(sch, &opt);
++	if (err)
++		goto nla_put_failure;
++
+ 	opts = nla_nest_start(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+@@ -273,6 +333,7 @@ nla_put_failure:
+ static int red_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ {
+ 	struct red_sched_data *q = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
+ 	struct tc_red_xstats st = {
+ 		.early	= q->stats.prob_drop + q->stats.forced_drop,
+ 		.pdrop	= q->stats.pdrop,
+@@ -280,6 +341,24 @@ static int red_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ 		.marked	= q->stats.prob_mark + q->stats.forced_mark,
+ 	};
+ 
++	if (tc_can_offload(dev) &&  dev->netdev_ops->ndo_setup_tc) {
++		struct red_stats hw_stats = {0};
++		struct tc_red_qopt_offload hw_stats_request = {
++			.handle = sch->handle,
++			.parent = sch->parent,
++			.command = TC_RED_XSTATS,
++			.xstats = &hw_stats,
++		};
++		if (!dev->netdev_ops->ndo_setup_tc(dev,
++						   TC_SETUP_QDISC_RED,
++						   &hw_stats_request)) {
++			st.early += hw_stats.prob_drop + hw_stats.forced_drop;
++			st.pdrop += hw_stats.pdrop;
++			st.other += hw_stats.other;
++			st.marked += hw_stats.prob_mark + hw_stats.forced_mark;
++		}
++	}
++
+ 	return gnet_stats_copy_app(d, &st, sizeof(st));
+ }
+ 
