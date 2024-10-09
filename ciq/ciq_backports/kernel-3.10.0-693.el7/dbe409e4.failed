@@ -1,0 +1,232 @@
+mm/hugetlb.c: fix resv map memory leak for placeholder entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb.c: fix resv map memory leak for placeholder entries (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.52%
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit dbe409e4f5e5075bd9ff7f8dd5c627abf3ee38c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dbe409e4.failed
+
+Dmitry Vyukov reported the following memory leak
+
+unreferenced object 0xffff88002eaafd88 (size 32):
+  comm "a.out", pid 5063, jiffies 4295774645 (age 15.810s)
+  hex dump (first 32 bytes):
+    28 e9 4e 63 00 88 ff ff 28 e9 4e 63 00 88 ff ff  (.Nc....(.Nc....
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  backtrace:
+     kmalloc include/linux/slab.h:458
+     region_chg+0x2d4/0x6b0 mm/hugetlb.c:398
+     __vma_reservation_common+0x2c3/0x390 mm/hugetlb.c:1791
+     vma_needs_reservation mm/hugetlb.c:1813
+     alloc_huge_page+0x19e/0xc70 mm/hugetlb.c:1845
+     hugetlb_no_page mm/hugetlb.c:3543
+     hugetlb_fault+0x7a1/0x1250 mm/hugetlb.c:3717
+     follow_hugetlb_page+0x339/0xc70 mm/hugetlb.c:3880
+     __get_user_pages+0x542/0xf30 mm/gup.c:497
+     populate_vma_page_range+0xde/0x110 mm/gup.c:919
+     __mm_populate+0x1c7/0x310 mm/gup.c:969
+     do_mlock+0x291/0x360 mm/mlock.c:637
+     SYSC_mlock2 mm/mlock.c:658
+     SyS_mlock2+0x4b/0x70 mm/mlock.c:648
+
+Dmitry identified a potential memory leak in the routine region_chg,
+where a region descriptor is not free'ed on an error path.
+
+However, the root cause for the above memory leak resides in region_del.
+In this specific case, a "placeholder" entry is created in region_chg.
+The associated page allocation fails, and the placeholder entry is left
+in the reserve map.  This is "by design" as the entry should be deleted
+when the map is released.  The bug is in the region_del routine which is
+used to delete entries within a specific range (and when the map is
+released).  region_del did not handle the case where a placeholder entry
+exactly matched the start of the range range to be deleted.  In this
+case, the entry would not be deleted and leaked.  The fix is to take
+these special placeholder entries into account in region_del.
+
+The region_chg error path leak is also fixed.
+
+Fixes: feba16e25a57 ("mm/hugetlb: add region_del() to delete a specific range of entries")
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: <stable@vger.kernel.org>	[4.3+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dbe409e4f5e5075bd9ff7f8dd5c627abf3ee38c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index d3ccf80274cd,ef6963b577fd..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -254,6 -356,33 +254,36 @@@ static long region_chg(struct resv_map 
+  
+  retry:
+  	spin_lock(&resv->lock);
+++<<<<<<< HEAD
+++=======
++ retry_locked:
++ 	resv->adds_in_progress++;
++ 
++ 	/*
++ 	 * Check for sufficient descriptors in the cache to accommodate
++ 	 * the number of in progress add operations.
++ 	 */
++ 	if (resv->adds_in_progress > resv->region_cache_count) {
++ 		struct file_region *trg;
++ 
++ 		VM_BUG_ON(resv->adds_in_progress - resv->region_cache_count > 1);
++ 		/* Must drop lock to allocate a new descriptor. */
++ 		resv->adds_in_progress--;
++ 		spin_unlock(&resv->lock);
++ 
++ 		trg = kmalloc(sizeof(*trg), GFP_KERNEL);
++ 		if (!trg) {
++ 			kfree(nrg);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		spin_lock(&resv->lock);
++ 		list_add(&trg->link, &resv->region_cache);
++ 		resv->region_cache_count++;
++ 		goto retry_locked;
++ 	}
++ 
+++>>>>>>> dbe409e4f5e5 (mm/hugetlb.c: fix resv map memory leak for placeholder entries)
+  	/* Locate the region we are before or in. */
+  	list_for_each_entry(rg, head, link)
+  		if (f <= rg->to)
+@@@ -321,35 -479,103 +351,50 @@@ static long region_truncate(struct resv
+  {
+  	struct list_head *head = &resv->regions;
+  	struct file_region *rg, *trg;
+ -	struct file_region *nrg = NULL;
+ -	long del = 0;
+ +	long chg = 0;
+  
+ -retry:
+  	spin_lock(&resv->lock);
+++<<<<<<< HEAD
+ +	/* Locate the region we are either in or before. */
+ +	list_for_each_entry(rg, head, link)
+ +		if (end <= rg->to)
+++=======
++ 	list_for_each_entry_safe(rg, trg, head, link) {
++ 		/*
++ 		 * Skip regions before the range to be deleted.  file_region
++ 		 * ranges are normally of the form [from, to).  However, there
++ 		 * may be a "placeholder" entry in the map which is of the form
++ 		 * (from, to) with from == to.  Check for placeholder entries
++ 		 * at the beginning of the range to be deleted.
++ 		 */
++ 		if (rg->to <= f && (rg->to != rg->from || rg->to != f))
++ 			continue;
++ 
++ 		if (rg->from >= t)
+++>>>>>>> dbe409e4f5e5 (mm/hugetlb.c: fix resv map memory leak for placeholder entries)
+  			break;
+ +	if (&rg->link == head)
+ +		goto out;
+  
+ -		if (f > rg->from && t < rg->to) { /* Must split region */
+ -			/*
+ -			 * Check for an entry in the cache before dropping
+ -			 * lock and attempting allocation.
+ -			 */
+ -			if (!nrg &&
+ -			    resv->region_cache_count > resv->adds_in_progress) {
+ -				nrg = list_first_entry(&resv->region_cache,
+ -							struct file_region,
+ -							link);
+ -				list_del(&nrg->link);
+ -				resv->region_cache_count--;
+ -			}
+ -
+ -			if (!nrg) {
+ -				spin_unlock(&resv->lock);
+ -				nrg = kmalloc(sizeof(*nrg), GFP_KERNEL);
+ -				if (!nrg)
+ -					return -ENOMEM;
+ -				goto retry;
+ -			}
+ -
+ -			del += t - f;
+ -
+ -			/* New entry for end of split region */
+ -			nrg->from = t;
+ -			nrg->to = rg->to;
+ -			INIT_LIST_HEAD(&nrg->link);
+ -
+ -			/* Original entry is trimmed */
+ -			rg->to = f;
+ +	/* If we are in the middle of a region then adjust it. */
+ +	if (end > rg->from) {
+ +		chg = rg->to - end;
+ +		rg->to = end;
+ +		rg = list_entry(rg->link.next, typeof(*rg), link);
+ +	}
+  
+ -			list_add(&nrg->link, &rg->link);
+ -			nrg = NULL;
+ +	/* Drop any remaining regions. */
+ +	list_for_each_entry_safe(rg, trg, rg->link.prev, link) {
+ +		if (&rg->link == head)
+  			break;
+ -		}
+ -
+ -		if (f <= rg->from && t >= rg->to) { /* Remove entire region */
+ -			del += rg->to - rg->from;
+ -			list_del(&rg->link);
+ -			kfree(rg);
+ -			continue;
+ -		}
+ -
+ -		if (f <= rg->from) {	/* Trim beginning of region */
+ -			del += t - rg->from;
+ -			rg->from = t;
+ -		} else {		/* Trim end of region */
+ -			del += rg->to - f;
+ -			rg->to = f;
+ -		}
+ +		chg += rg->to - rg->from;
+ +		list_del(&rg->link);
+ +		kfree(rg);
+  	}
+  
+ +out:
+  	spin_unlock(&resv->lock);
+ -	kfree(nrg);
+ -	return del;
+ -}
+ -
+ -/*
+ - * A rare out of memory error was encountered which prevented removal of
+ - * the reserve map region for a page.  The huge page itself was free'ed
+ - * and removed from the page cache.  This routine will adjust the subpool
+ - * usage count, and the global reserve count if needed.  By incrementing
+ - * these counts, the reserve map entry which could not be deleted will
+ - * appear as a "reserved" entry instead of simply dangling with incorrect
+ - * counts.
+ - */
+ -void hugetlb_fix_reserve_counts(struct inode *inode, bool restore_reserve)
+ -{
+ -	struct hugepage_subpool *spool = subpool_inode(inode);
+ -	long rsv_adjust;
+ -
+ -	rsv_adjust = hugepage_subpool_get_pages(spool, 1);
+ -	if (restore_reserve && rsv_adjust) {
+ -		struct hstate *h = hstate_inode(inode);
+ -
+ -		hugetlb_acct_memory(h, 1);
+ -	}
+ +	return chg;
+  }
+  
+  /*
+* Unmerged path mm/hugetlb.c
