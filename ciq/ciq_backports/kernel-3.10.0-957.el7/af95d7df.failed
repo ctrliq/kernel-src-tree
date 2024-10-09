@@ -1,0 +1,402 @@
+net: tcp_memcontrol: remove dead per-memcg count of allocated sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] tcp_memcontrol: remove dead per-memcg count of allocated sockets (Davide Caratti) [1554191]
+Rebuild_FUZZ: 96.24%
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit af95d7df4059cfeab7e7c244f3564214aada7dad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/af95d7df.failed
+
+The number of allocated sockets is used for calculations in the soft
+limit phase, where packets are accepted but the socket is under memory
+pressure.
+ Since there is no soft limit phase in tcp_memcontrol, and memory
+pressure is only entered when packets are already dropped, this is
+actually dead code.  Remove it.
+
+As this is the last user of parent_cg_proto(), remove that too.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Reviewed-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit af95d7df4059cfeab7e7c244f3564214aada7dad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	include/net/sock.h
+#	net/ipv4/tcp_memcontrol.c
+diff --cc include/linux/memcontrol.h
+index 5cb1a6d66642,15acc04ebdd3..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -41,29 -58,240 +41,76 @@@ struct mem_cgroup_reclaim_cookie 
+  	unsigned int generation;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum mem_cgroup_events_index {
++ 	MEM_CGROUP_EVENTS_PGPGIN,	/* # of pages paged in */
++ 	MEM_CGROUP_EVENTS_PGPGOUT,	/* # of pages paged out */
++ 	MEM_CGROUP_EVENTS_PGFAULT,	/* # of page-faults */
++ 	MEM_CGROUP_EVENTS_PGMAJFAULT,	/* # of major page-faults */
++ 	MEM_CGROUP_EVENTS_NSTATS,
++ 	/* default hierarchy events */
++ 	MEMCG_LOW = MEM_CGROUP_EVENTS_NSTATS,
++ 	MEMCG_HIGH,
++ 	MEMCG_MAX,
++ 	MEMCG_OOM,
++ 	MEMCG_NR_EVENTS,
++ };
++ 
++ /*
++  * Per memcg event counter is incremented at every pagein/pageout. With THP,
++  * it will be incremated by the number of pages. This counter is used for
++  * for trigger some periodic events. This is straightforward and better
++  * than using jiffies etc. to handle periodic memcg event.
++  */
++ enum mem_cgroup_events_target {
++ 	MEM_CGROUP_TARGET_THRESH,
++ 	MEM_CGROUP_TARGET_SOFTLIMIT,
++ 	MEM_CGROUP_TARGET_NUMAINFO,
++ 	MEM_CGROUP_NTARGETS,
++ };
++ 
++ struct cg_proto {
++ 	struct page_counter	memory_allocated;	/* Current allocated memory. */
++ 	int			memory_pressure;
++ 	bool			active;
++ 	long			sysctl_mem[3];
++ 	/*
++ 	 * memcg field is used to find which memcg we belong directly
++ 	 * Each memcg struct can hold more than one cg_proto, so container_of
++ 	 * won't really cut.
++ 	 *
++ 	 * The elegant solution would be having an inverse function to
++ 	 * proto_cgroup in struct proto, but that means polluting the structure
++ 	 * for everybody, instead of just for memcg users.
++ 	 */
++ 	struct mem_cgroup	*memcg;
++ };
++ 
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  #ifdef CONFIG_MEMCG
+ -struct mem_cgroup_stat_cpu {
+ -	long count[MEM_CGROUP_STAT_NSTATS];
+ -	unsigned long events[MEMCG_NR_EVENTS];
+ -	unsigned long nr_page_events;
+ -	unsigned long targets[MEM_CGROUP_NTARGETS];
+ -};
+ -
+ -struct mem_cgroup_reclaim_iter {
+ -	struct mem_cgroup *position;
+ -	/* scan generation, increased every round-trip */
+ -	unsigned int generation;
+ -};
+ -
+  /*
+ - * per-zone information in memory controller.
+ - */
+ -struct mem_cgroup_per_zone {
+ -	struct lruvec		lruvec;
+ -	unsigned long		lru_size[NR_LRU_LISTS];
+ -
+ -	struct mem_cgroup_reclaim_iter	iter[DEF_PRIORITY + 1];
+ -
+ -	struct rb_node		tree_node;	/* RB tree node */
+ -	unsigned long		usage_in_excess;/* Set to the value by which */
+ -						/* the soft limit is exceeded*/
+ -	bool			on_tree;
+ -	struct mem_cgroup	*memcg;		/* Back pointer, we cannot */
+ -						/* use container_of	   */
+ -};
+ -
+ -struct mem_cgroup_per_node {
+ -	struct mem_cgroup_per_zone zoneinfo[MAX_NR_ZONES];
+ -};
+ -
+ -struct mem_cgroup_threshold {
+ -	struct eventfd_ctx *eventfd;
+ -	unsigned long threshold;
+ -};
+ -
+ -/* For threshold */
+ -struct mem_cgroup_threshold_ary {
+ -	/* An array index points to threshold just below or equal to usage. */
+ -	int current_threshold;
+ -	/* Size of entries[] */
+ -	unsigned int size;
+ -	/* Array of thresholds */
+ -	struct mem_cgroup_threshold entries[0];
+ -};
+ -
+ -struct mem_cgroup_thresholds {
+ -	/* Primary thresholds array */
+ -	struct mem_cgroup_threshold_ary *primary;
+ -	/*
+ -	 * Spare threshold array.
+ -	 * This is needed to make mem_cgroup_unregister_event() "never fail".
+ -	 * It must be able to store at least primary->size - 1 entries.
+ -	 */
+ -	struct mem_cgroup_threshold_ary *spare;
+ -};
+ -
+ -/*
+ - * The memory controller data structure. The memory controller controls both
+ - * page cache and RSS per cgroup. We would eventually like to provide
+ - * statistics based on the statistics developed by Rik Van Riel for clock-pro,
+ - * to help the administrator determine what knobs to tune.
+ - */
+ -struct mem_cgroup {
+ -	struct cgroup_subsys_state css;
+ -
+ -	/* Accounted resources */
+ -	struct page_counter memory;
+ -	struct page_counter memsw;
+ -	struct page_counter kmem;
+ -
+ -	/* Normal memory consumption range */
+ -	unsigned long low;
+ -	unsigned long high;
+ -
+ -	unsigned long soft_limit;
+ -
+ -	/* vmpressure notifications */
+ -	struct vmpressure vmpressure;
+ -
+ -	/* css_online() has been completed */
+ -	int initialized;
+ -
+ -	/*
+ -	 * Should the accounting and control be hierarchical, per subtree?
+ -	 */
+ -	bool use_hierarchy;
+ -
+ -	/* protected by memcg_oom_lock */
+ -	bool		oom_lock;
+ -	int		under_oom;
+ -
+ -	int	swappiness;
+ -	/* OOM-Killer disable */
+ -	int		oom_kill_disable;
+ -
+ -	/* handle for "memory.events" */
+ -	struct cgroup_file events_file;
+ -
+ -	/* protect arrays of thresholds */
+ -	struct mutex thresholds_lock;
+ -
+ -	/* thresholds for memory usage. RCU-protected */
+ -	struct mem_cgroup_thresholds thresholds;
+ -
+ -	/* thresholds for mem+swap usage. RCU-protected */
+ -	struct mem_cgroup_thresholds memsw_thresholds;
+ -
+ -	/* For oom notifier event fd */
+ -	struct list_head oom_notify;
+ -
+ -	/*
+ -	 * Should we move charges of a task when a task is moved into this
+ -	 * mem_cgroup ? And what type of charges should we move ?
+ -	 */
+ -	unsigned long move_charge_at_immigrate;
+ -	/*
+ -	 * set > 0 if pages under this cgroup are moving to other cgroup.
+ -	 */
+ -	atomic_t		moving_account;
+ -	/* taken only while moving_account > 0 */
+ -	spinlock_t		move_lock;
+ -	struct task_struct	*move_lock_task;
+ -	unsigned long		move_lock_flags;
+ -	/*
+ -	 * percpu counter.
+ -	 */
+ -	struct mem_cgroup_stat_cpu __percpu *stat;
+ -
+ -#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_INET)
+ -	struct cg_proto tcp_mem;
+ -#endif
+ -#if defined(CONFIG_MEMCG_KMEM)
+ -        /* Index in the kmem_cache->memcg_params.memcg_caches array */
+ -	int kmemcg_id;
+ -	bool kmem_acct_activated;
+ -	bool kmem_acct_active;
+ -#endif
+ -
+ -	int last_scanned_node;
+ -#if MAX_NUMNODES > 1
+ -	nodemask_t	scan_nodes;
+ -	atomic_t	numainfo_events;
+ -	atomic_t	numainfo_updating;
+ -#endif
+ -
+ -#ifdef CONFIG_CGROUP_WRITEBACK
+ -	struct list_head cgwb_list;
+ -	struct wb_domain cgwb_domain;
+ -#endif
+ -
+ -	/* List of events which userspace want to receive */
+ -	struct list_head event_list;
+ -	spinlock_t event_list_lock;
+ -
+ -	struct mem_cgroup_per_node *nodeinfo[0];
+ -	/* WARNING: nodeinfo must be the last member here */
+ -};
+ -
+ -extern struct mem_cgroup *root_mem_cgroup;
+ -
+ -/**
+ - * mem_cgroup_events - count memory events against a cgroup
+ - * @memcg: the memory cgroup
+ - * @idx: the event index
+ - * @nr: the number of events to account for
+ + * All "charge" functions with gfp_mask should use GFP_KERNEL or
+ + * (gfp_mask & GFP_RECLAIM_MASK). In current implementatin, memcg doesn't
+ + * alloc memory but reclaims memory from all available zones. So, "where I want
+ + * memory from" bits of gfp_mask has no meaning. So any bits of that field is
+ + * available but adding a rule is better. charge functions' gfp_mask should
+ + * be set to GFP_KERNEL or gfp_mask & GFP_RECLAIM_MASK for avoiding ambiguous
+ + * codes.
+ + * (Of course, if memcg does memory allocation in future, GFP_KERNEL is sane.)
+   */
+ -static inline void mem_cgroup_events(struct mem_cgroup *memcg,
+ -		       enum mem_cgroup_events_index idx,
+ -		       unsigned int nr)
+ -{
+ -	this_cpu_add(memcg->stat->events[idx], nr);
+ -	cgroup_file_notify(&memcg->events_file);
+ -}
+ -
+ -bool mem_cgroup_low(struct mem_cgroup *root, struct mem_cgroup *memcg);
+  
+ -int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
+ -			  gfp_t gfp_mask, struct mem_cgroup **memcgp);
+ -void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
+ -			      bool lrucare);
+ -void mem_cgroup_cancel_charge(struct page *page, struct mem_cgroup *memcg);
+ -void mem_cgroup_uncharge(struct page *page);
+ -void mem_cgroup_uncharge_list(struct list_head *page_list);
+ +extern int mem_cgroup_newpage_charge(struct page *page, struct mm_struct *mm,
+ +				gfp_t gfp_mask);
+ +/* for swap handling */
+ +extern int mem_cgroup_try_charge_swapin(struct mm_struct *mm,
+ +		struct page *page, gfp_t mask, struct mem_cgroup **memcgp);
+ +extern void mem_cgroup_commit_charge_swapin(struct page *page,
+ +					struct mem_cgroup *memcg);
+ +extern void mem_cgroup_cancel_charge_swapin(struct mem_cgroup *memcg);
+  
+ -void mem_cgroup_replace_page(struct page *oldpage, struct page *newpage);
+ +extern int mem_cgroup_cache_charge(struct page *page, struct mm_struct *mm,
+ +					gfp_t gfp_mask);
+  
+  struct lruvec *mem_cgroup_zone_lruvec(struct zone *, struct mem_cgroup *);
+  struct lruvec *mem_cgroup_page_lruvec(struct page *, struct zone *);
+diff --cc include/net/sock.h
+index 91144cd664b8,1f15937ec208..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -1316,41 -1226,18 +1306,53 @@@ sk_memory_allocated_sub(struct sock *sk
+  
+  static inline void sk_sockets_allocated_dec(struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	struct proto *prot = sk->sk_prot;
+ +
+ +	if (mem_cgroup_sockets_enabled && sk->sk_cgrp) {
+ +		struct cg_proto *cg_proto = sk->sk_cgrp;
+ +
+ +		for (; cg_proto; cg_proto = parent_cg_proto(prot, cg_proto))
+ +			percpu_counter_dec(cg_proto->sockets_allocated);
+ +	}
+ +
+ +	percpu_counter_dec(prot->sockets_allocated);
+++=======
++ 	percpu_counter_dec(sk->sk_prot->sockets_allocated);
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  }
+  
+  static inline void sk_sockets_allocated_inc(struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	struct proto *prot = sk->sk_prot;
+ +
+ +	if (mem_cgroup_sockets_enabled && sk->sk_cgrp) {
+ +		struct cg_proto *cg_proto = sk->sk_cgrp;
+ +
+ +		for (; cg_proto; cg_proto = parent_cg_proto(prot, cg_proto))
+ +			percpu_counter_inc(cg_proto->sockets_allocated);
+ +	}
+ +
+ +	percpu_counter_inc(prot->sockets_allocated);
+++=======
++ 	percpu_counter_inc(sk->sk_prot->sockets_allocated);
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  }
+  
+  static inline int
+  sk_sockets_allocated_read_positive(struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	struct proto *prot = sk->sk_prot;
+ +
+ +	if (mem_cgroup_sockets_enabled && sk->sk_cgrp)
+ +		return percpu_counter_read_positive(sk->sk_cgrp->sockets_allocated);
+ +
+ +	return percpu_counter_read_positive(prot->sockets_allocated);
+++=======
++ 	return percpu_counter_read_positive(sk->sk_prot->sockets_allocated);
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  }
+  
+  static inline int
+diff --cc net/ipv4/tcp_memcontrol.c
+index 70070aaee41c,6759e0d6bba1..000000000000
+--- a/net/ipv4/tcp_memcontrol.c
++++ b/net/ipv4/tcp_memcontrol.c
+@@@ -44,17 -29,9 +44,21 @@@ int tcp_init_cgroup(struct mem_cgroup *
+  
+  	parent_cg = tcp_prot.proto_cgroup(parent);
+  	if (parent_cg)
+ -		counter_parent = &parent_cg->memory_allocated;
+ +		counter_parent = parent_cg->memory_allocated;
+ +
+++<<<<<<< HEAD
+ +	page_counter_init(&tcp->tcp_memory_allocated, counter_parent);
+ +	percpu_counter_init(&tcp->tcp_sockets_allocated, 0, GFP_KERNEL);
+  
+ +	cg_proto->enter_memory_pressure = memcg_tcp_enter_memory_pressure;
+ +	cg_proto->memory_pressure = &tcp->tcp_memory_pressure;
+ +	cg_proto->sysctl_mem = tcp->tcp_prot_mem;
+ +	cg_proto->memory_allocated = &tcp->tcp_memory_allocated;
+ +	cg_proto->sockets_allocated = &tcp->tcp_sockets_allocated;
+ +	cg_proto->memcg = memcg;
+++=======
++ 	page_counter_init(&cg_proto->memory_allocated, counter_parent);
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  
+  	return 0;
+  }
+@@@ -69,8 -45,9 +73,14 @@@ void tcp_destroy_cgroup(struct mem_cgro
+  	if (!cg_proto)
+  		return;
+  
+++<<<<<<< HEAD
+ +	tcp = tcp_from_cgproto(cg_proto);
+ +	percpu_counter_destroy(&tcp->tcp_sockets_allocated);
+++=======
++ 	if (cg_proto->active)
++ 		static_key_slow_dec(&memcg_socket_limit_enabled);
++ 
+++>>>>>>> af95d7df4059 (net: tcp_memcontrol: remove dead per-memcg count of allocated sockets)
+  }
+  EXPORT_SYMBOL(tcp_destroy_cgroup);
+  
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path include/net/sock.h
+* Unmerged path net/ipv4/tcp_memcontrol.c
