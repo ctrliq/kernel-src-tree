@@ -1,0 +1,145 @@
+buffer.c: call thaw_super during emergency thaw
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mateusz Guzik <mguzik@redhat.com>
+commit 08fdc8a0138afaf324296a342f32ad26ec465e43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/08fdc8a0.failed
+
+There are 2 distinct freezing mechanisms - one operates on block
+devices and another one directly on super blocks. Both end up with the
+same result, but thaw of only one of these does not thaw the other.
+
+In particular fsfreeze --freeze uses the ioctl variant going to the
+super block. Since prior to this patch emergency thaw was not doing
+a relevant thaw, filesystems frozen with this method remained
+unaffected.
+
+The patch is a hack which adds blind unfreezing.
+
+In order to keep the super block write-locked the whole time the code
+is shuffled around and the newly introduced __iterate_supers is
+employed.
+
+	Signed-off-by: Mateusz Guzik <mguzik@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 08fdc8a0138afaf324296a342f32ad26ec465e43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index b908333fd0c1,83c5c8a60f5f..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -34,12 -33,13 +34,16 @@@
+  #include <linux/cleancache.h>
+  #include <linux/fsnotify.h>
+  #include <linux/lockdep.h>
+ -#include <linux/user_namespace.h>
+  #include "internal.h"
+  
+++<<<<<<< HEAD
+ +const unsigned super_block_wrapper_version = 0;
+++=======
++ static int thaw_super_locked(struct super_block *sb);
+++>>>>>>> 08fdc8a0138a (buffer.c: call thaw_super during emergency thaw)
+  
+ -static LIST_HEAD(super_blocks);
+ -static DEFINE_SPINLOCK(sb_lock);
+ +LIST_HEAD(super_blocks);
+ +DEFINE_SPINLOCK(sb_lock);
+  
+  static char *sb_writers_name[SB_FREEZE_LEVELS] = {
+  	"sb_writers",
+@@@ -1335,12 -1565,17 +1372,18 @@@ static int thaw_super_locked(struct sup
+  		}
+  	}
+  
+ -	sb->s_writers.frozen = SB_UNFROZEN;
+ -	sb_freeze_unlock(sb);
+  out:
+ +	sb->s_writers.frozen = SB_UNFROZEN;
+ +	smp_wmb();
+  	wake_up(&sb->s_writers.wait_unfrozen);
+  	deactivate_locked_super(sb);
+ +
+  	return 0;
+  }
++ 
++ int thaw_super(struct super_block *sb)
++ {
++ 	down_write(&sb->s_umount);
++ 	return thaw_super_locked(sb);
++ }
+  EXPORT_SYMBOL(thaw_super);
+diff --git a/fs/buffer.c b/fs/buffer.c
+index ace86fe2bca8..3183d87306b6 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -525,7 +525,7 @@ repeat:
+ 	return err;
+ }
+ 
+-static void do_thaw_one(struct super_block *sb, void *unused)
++void emergency_thaw_bdev(struct super_block *sb)
+ {
+ 	char b[BDEVNAME_SIZE];
+ 	while (sb->s_bdev && !thaw_bdev(sb->s_bdev, sb))
+@@ -533,29 +533,6 @@ static void do_thaw_one(struct super_block *sb, void *unused)
+ 		       bdevname(sb->s_bdev, b));
+ }
+ 
+-static void do_thaw_all(struct work_struct *work)
+-{
+-	iterate_supers(do_thaw_one, NULL);
+-	kfree(work);
+-	printk(KERN_WARNING "Emergency Thaw complete\n");
+-}
+-
+-/**
+- * emergency_thaw_all -- forcibly thaw every frozen filesystem
+- *
+- * Used for emergency unfreeze of all filesystems via SysRq
+- */
+-void emergency_thaw_all(void)
+-{
+-	struct work_struct *work;
+-
+-	work = kmalloc(sizeof(*work), GFP_ATOMIC);
+-	if (work) {
+-		INIT_WORK(work, do_thaw_all);
+-		schedule_work(work);
+-	}
+-}
+-
+ /**
+  * sync_mapping_buffers - write out & wait upon a mapping's "associated" buffers
+  * @mapping: the mapping which wants those buffers written
+* Unmerged path fs/super.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 7f3e55eaa223..d81c2ea02263 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2436,6 +2436,7 @@ extern int sync_blockdev(struct block_device *bdev);
+ extern void kill_bdev(struct block_device *);
+ extern struct super_block *freeze_bdev(struct block_device *);
+ extern void emergency_thaw_all(void);
++extern void emergency_thaw_bdev(struct super_block *sb);
+ extern int thaw_bdev(struct block_device *bdev, struct super_block *sb);
+ extern int fsync_bdev(struct block_device *);
+ extern int sb_is_blkdev_sb(struct super_block *sb);
+@@ -2455,6 +2456,11 @@ static inline int thaw_bdev(struct block_device *bdev, struct super_block *sb)
+ 	return 0;
+ }
+ 
++static inline int emergency_thaw_bdev(struct super_block *sb)
++{
++	return 0;
++}
++
+ static inline void iterate_bdevs(void (*f)(struct block_device *, void *), void *arg)
+ {
+ }
