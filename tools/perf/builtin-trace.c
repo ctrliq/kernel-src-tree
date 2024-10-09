@@ -999,6 +999,13 @@ static const char *tioctls[] = {
 static DEFINE_STRARRAY_OFFSET(tioctls, 0x5401);
 #endif /* defined(__i386__) || defined(__x86_64__) */
 
+#ifndef SECCOMP_SET_MODE_STRICT
+#define SECCOMP_SET_MODE_STRICT 0
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+
 static size_t syscall_arg__scnprintf_seccomp_op(char *bf, size_t size, struct syscall_arg *arg)
 {
 	int op = arg->val;
@@ -1016,6 +1023,10 @@ static size_t syscall_arg__scnprintf_seccomp_op(char *bf, size_t size, struct sy
 }
 
 #define SCA_SECCOMP_OP  syscall_arg__scnprintf_seccomp_op
+
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
 
 static size_t syscall_arg__scnprintf_seccomp_flags(char *bf, size_t size,
 						   struct syscall_arg *arg)
