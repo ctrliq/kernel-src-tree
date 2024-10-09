@@ -1,0 +1,2379 @@
+KVM: Use simple waitqueue for vcpu->wq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Marcelo Tosatti <mtosatti@redhat.com>
+commit 8577370fb0cbe88266b7583d8d3b9f43ced077a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8577370f.failed
+
+The problem:
+
+On -rt, an emulated LAPIC timer instances has the following path:
+
+1) hard interrupt
+2) ksoftirqd is scheduled
+3) ksoftirqd wakes up vcpu thread
+4) vcpu thread is scheduled
+
+This extra context switch introduces unnecessary latency in the
+LAPIC path for a KVM guest.
+
+The solution:
+
+Allow waking up vcpu thread from hardirq context,
+thus avoiding the need for ksoftirqd to be scheduled.
+
+Normal waitqueues make use of spinlocks, which on -RT
+are sleepable locks. Therefore, waking up a waitqueue
+waiter involves locking a sleeping lock, which
+is not allowed from hard interrupt context.
+
+cyclictest command line:
+
+This patch reduces the average latency in my tests from 14us to 11us.
+
+Daniel writes:
+Paolo asked for numbers from kvm-unit-tests/tscdeadline_latency
+benchmark on mainline. The test was run 1000 times on
+tip/sched/core 4.4.0-rc8-01134-g0905f04:
+
+  ./x86-run x86/tscdeadline_latency.flat -cpu host
+
+with idle=poll.
+
+The test seems not to deliver really stable numbers though most of
+them are smaller. Paolo write:
+
+"Anything above ~10000 cycles means that the host went to C1 or
+lower---the number means more or less nothing in that case.
+
+The mean shows an improvement indeed."
+
+Before:
+
+               min             max         mean           std
+count  1000.000000     1000.000000  1000.000000   1000.000000
+mean   5162.596000  2019270.084000  5824.491541  20681.645558
+std      75.431231   622607.723969    89.575700   6492.272062
+min    4466.000000    23928.000000  5537.926500    585.864966
+25%    5163.000000  1613252.750000  5790.132275  16683.745433
+50%    5175.000000  2281919.000000  5834.654000  23151.990026
+75%    5190.000000  2382865.750000  5861.412950  24148.206168
+max    5228.000000  4175158.000000  6254.827300  46481.048691
+
+After
+               min            max         mean           std
+count  1000.000000     1000.00000  1000.000000   1000.000000
+mean   5143.511000  2076886.10300  5813.312474  21207.357565
+std      77.668322   610413.09583    86.541500   6331.915127
+min    4427.000000    25103.00000  5529.756600    559.187707
+25%    5148.000000  1691272.75000  5784.889825  17473.518244
+50%    5160.000000  2308328.50000  5832.025000  23464.837068
+75%    5172.000000  2393037.75000  5853.177675  24223.969976
+max    5222.000000  3922458.00000  6186.720500  42520.379830
+
+[Patch was originaly based on the swait implementation found in the -rt
+ tree. Daniel ported it to mainline's version and gathered the
+ benchmark numbers for tscdeadline_latency test.]
+
+	Signed-off-by: Daniel Wagner <daniel.wagner@bmw-carit.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: linux-rt-users@vger.kernel.org
+	Cc: Boqun Feng <boqun.feng@gmail.com>
+	Cc: Marcelo Tosatti <mtosatti@redhat.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Link: http://lkml.kernel.org/r/1455871601-27484-4-git-send-email-wagi@monom.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 8577370fb0cbe88266b7583d8d3b9f43ced077a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/kvm/arm.c
+#	arch/arm/kvm/psci.c
+#	arch/mips/kvm/mips.c
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/kvm/book3s_hv.c
+#	arch/s390/include/asm/kvm_host.h
+#	arch/s390/kvm/interrupt.c
+#	arch/x86/kvm/lapic.c
+#	virt/kvm/kvm_main.c
+diff --cc arch/arm/kvm/arm.c
+index 0f97e8848f54,08e49c423c24..000000000000
+--- a/arch/arm/kvm/arm.c
++++ b/arch/arm/kvm/arm.c
+@@@ -500,11 -482,43 +500,51 @@@ static int kvm_vcpu_first_run_init(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void vcpu_pause(struct kvm_vcpu *vcpu)
+++=======
++ bool kvm_arch_intc_initialized(struct kvm *kvm)
+  {
+- 	wait_queue_head_t *wq = kvm_arch_vcpu_wq(vcpu);
++ 	return vgic_initialized(kvm);
++ }
++ 
++ static void kvm_arm_halt_guest(struct kvm *kvm) __maybe_unused;
++ static void kvm_arm_resume_guest(struct kvm *kvm) __maybe_unused;
++ 
++ static void kvm_arm_halt_guest(struct kvm *kvm)
++ {
++ 	int i;
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm)
++ 		vcpu->arch.pause = true;
++ 	force_vm_exit(cpu_all_mask);
++ }
++ 
++ static void kvm_arm_resume_guest(struct kvm *kvm)
++ {
++ 	int i;
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		struct swait_queue_head *wq = kvm_arch_vcpu_wq(vcpu);
++ 
++ 		vcpu->arch.pause = false;
++ 		swake_up(wq);
++ 	}
++ }
++ 
++ static void vcpu_sleep(struct kvm_vcpu *vcpu)
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
++ {
++ 	struct swait_queue_head *wq = kvm_arch_vcpu_wq(vcpu);
+  
+++<<<<<<< HEAD
+ +	wait_event_interruptible(*wq, !vcpu->arch.pause);
+++=======
++ 	swait_event_interruptible(*wq, ((!vcpu->arch.power_off) &&
++ 				       (!vcpu->arch.pause)));
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  }
+  
+  static int kvm_vcpu_initialized(struct kvm_vcpu *vcpu)
+diff --cc arch/arm/kvm/psci.c
+index 7ee5bb7a3667,c2b131527a64..000000000000
+--- a/arch/arm/kvm/psci.c
++++ b/arch/arm/kvm/psci.c
+@@@ -34,12 -69,13 +34,17 @@@ static void kvm_psci_vcpu_off(struct kv
+  static unsigned long kvm_psci_vcpu_on(struct kvm_vcpu *source_vcpu)
+  {
+  	struct kvm *kvm = source_vcpu->kvm;
+++<<<<<<< HEAD
+ +	struct kvm_vcpu *vcpu;
+ +	wait_queue_head_t *wq;
+++=======
++ 	struct kvm_vcpu *vcpu = NULL;
++ 	struct swait_queue_head *wq;
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  	unsigned long cpu_id;
+ -	unsigned long context_id;
+  	phys_addr_t target_pc;
+  
+ -	cpu_id = vcpu_get_reg(source_vcpu, 1) & MPIDR_HWID_BITMASK;
+ +	cpu_id = *vcpu_reg(source_vcpu, 1);
+  	if (vcpu_mode_is_32bit(source_vcpu))
+  		cpu_id &= ~((u32) 0);
+  
+@@@ -62,28 -105,181 +67,33 @@@
+  		vcpu_set_thumb(vcpu);
+  	}
+  
+ -	/* Propagate caller endianness */
+ -	if (kvm_vcpu_is_be(source_vcpu))
+ -		kvm_vcpu_set_be(vcpu);
+ -
+  	*vcpu_pc(vcpu) = target_pc;
+ -	/*
+ -	 * NOTE: We always update r0 (or x0) because for PSCI v0.1
+ -	 * the general puspose registers are undefined upon CPU_ON.
+ -	 */
+ -	vcpu_set_reg(vcpu, 0, context_id);
+ -	vcpu->arch.power_off = false;
+ +	vcpu->arch.pause = false;
+  	smp_mb();		/* Make sure the above is visible */
+  
+++<<<<<<< HEAD
+ +	wake_up_interruptible(wq);
+++=======
++ 	wq = kvm_arch_vcpu_wq(vcpu);
++ 	swake_up(wq);
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  
+ -	return PSCI_RET_SUCCESS;
+ -}
+ -
+ -static unsigned long kvm_psci_vcpu_affinity_info(struct kvm_vcpu *vcpu)
+ -{
+ -	int i, matching_cpus = 0;
+ -	unsigned long mpidr;
+ -	unsigned long target_affinity;
+ -	unsigned long target_affinity_mask;
+ -	unsigned long lowest_affinity_level;
+ -	struct kvm *kvm = vcpu->kvm;
+ -	struct kvm_vcpu *tmp;
+ -
+ -	target_affinity = vcpu_get_reg(vcpu, 1);
+ -	lowest_affinity_level = vcpu_get_reg(vcpu, 2);
+ -
+ -	/* Determine target affinity mask */
+ -	target_affinity_mask = psci_affinity_mask(lowest_affinity_level);
+ -	if (!target_affinity_mask)
+ -		return PSCI_RET_INVALID_PARAMS;
+ -
+ -	/* Ignore other bits of target affinity */
+ -	target_affinity &= target_affinity_mask;
+ -
+ -	/*
+ -	 * If one or more VCPU matching target affinity are running
+ -	 * then ON else OFF
+ -	 */
+ -	kvm_for_each_vcpu(i, tmp, kvm) {
+ -		mpidr = kvm_vcpu_get_mpidr_aff(tmp);
+ -		if ((mpidr & target_affinity_mask) == target_affinity) {
+ -			matching_cpus++;
+ -			if (!tmp->arch.power_off)
+ -				return PSCI_0_2_AFFINITY_LEVEL_ON;
+ -		}
+ -	}
+ -
+ -	if (!matching_cpus)
+ -		return PSCI_RET_INVALID_PARAMS;
+ -
+ -	return PSCI_0_2_AFFINITY_LEVEL_OFF;
+ -}
+ -
+ -static void kvm_prepare_system_event(struct kvm_vcpu *vcpu, u32 type)
+ -{
+ -	int i;
+ -	struct kvm_vcpu *tmp;
+ -
+ -	/*
+ -	 * The KVM ABI specifies that a system event exit may call KVM_RUN
+ -	 * again and may perform shutdown/reboot at a later time that when the
+ -	 * actual request is made.  Since we are implementing PSCI and a
+ -	 * caller of PSCI reboot and shutdown expects that the system shuts
+ -	 * down or reboots immediately, let's make sure that VCPUs are not run
+ -	 * after this call is handled and before the VCPUs have been
+ -	 * re-initialized.
+ -	 */
+ -	kvm_for_each_vcpu(i, tmp, vcpu->kvm) {
+ -		tmp->arch.power_off = true;
+ -		kvm_vcpu_kick(tmp);
+ -	}
+ -
+ -	memset(&vcpu->run->system_event, 0, sizeof(vcpu->run->system_event));
+ -	vcpu->run->system_event.type = type;
+ -	vcpu->run->exit_reason = KVM_EXIT_SYSTEM_EVENT;
+ -}
+ -
+ -static void kvm_psci_system_off(struct kvm_vcpu *vcpu)
+ -{
+ -	kvm_prepare_system_event(vcpu, KVM_SYSTEM_EVENT_SHUTDOWN);
+ -}
+ -
+ -static void kvm_psci_system_reset(struct kvm_vcpu *vcpu)
+ -{
+ -	kvm_prepare_system_event(vcpu, KVM_SYSTEM_EVENT_RESET);
+ -}
+ -
+ -int kvm_psci_version(struct kvm_vcpu *vcpu)
+ -{
+ -	if (test_bit(KVM_ARM_VCPU_PSCI_0_2, vcpu->arch.features))
+ -		return KVM_ARM_PSCI_0_2;
+ -
+ -	return KVM_ARM_PSCI_0_1;
+ +	return KVM_PSCI_RET_SUCCESS;
+  }
+  
+ -static int kvm_psci_0_2_call(struct kvm_vcpu *vcpu)
+ -{
+ -	int ret = 1;
+ -	unsigned long psci_fn = vcpu_get_reg(vcpu, 0) & ~((u32) 0);
+ -	unsigned long val;
+ -
+ -	switch (psci_fn) {
+ -	case PSCI_0_2_FN_PSCI_VERSION:
+ -		/*
+ -		 * Bits[31:16] = Major Version = 0
+ -		 * Bits[15:0] = Minor Version = 2
+ -		 */
+ -		val = 2;
+ -		break;
+ -	case PSCI_0_2_FN_CPU_SUSPEND:
+ -	case PSCI_0_2_FN64_CPU_SUSPEND:
+ -		val = kvm_psci_vcpu_suspend(vcpu);
+ -		break;
+ -	case PSCI_0_2_FN_CPU_OFF:
+ -		kvm_psci_vcpu_off(vcpu);
+ -		val = PSCI_RET_SUCCESS;
+ -		break;
+ -	case PSCI_0_2_FN_CPU_ON:
+ -	case PSCI_0_2_FN64_CPU_ON:
+ -		val = kvm_psci_vcpu_on(vcpu);
+ -		break;
+ -	case PSCI_0_2_FN_AFFINITY_INFO:
+ -	case PSCI_0_2_FN64_AFFINITY_INFO:
+ -		val = kvm_psci_vcpu_affinity_info(vcpu);
+ -		break;
+ -	case PSCI_0_2_FN_MIGRATE_INFO_TYPE:
+ -		/*
+ -		 * Trusted OS is MP hence does not require migration
+ -	         * or
+ -		 * Trusted OS is not present
+ -		 */
+ -		val = PSCI_0_2_TOS_MP;
+ -		break;
+ -	case PSCI_0_2_FN_SYSTEM_OFF:
+ -		kvm_psci_system_off(vcpu);
+ -		/*
+ -		 * We should'nt be going back to guest VCPU after
+ -		 * receiving SYSTEM_OFF request.
+ -		 *
+ -		 * If user space accidently/deliberately resumes
+ -		 * guest VCPU after SYSTEM_OFF request then guest
+ -		 * VCPU should see internal failure from PSCI return
+ -		 * value. To achieve this, we preload r0 (or x0) with
+ -		 * PSCI return value INTERNAL_FAILURE.
+ -		 */
+ -		val = PSCI_RET_INTERNAL_FAILURE;
+ -		ret = 0;
+ -		break;
+ -	case PSCI_0_2_FN_SYSTEM_RESET:
+ -		kvm_psci_system_reset(vcpu);
+ -		/*
+ -		 * Same reason as SYSTEM_OFF for preloading r0 (or x0)
+ -		 * with PSCI return value INTERNAL_FAILURE.
+ -		 */
+ -		val = PSCI_RET_INTERNAL_FAILURE;
+ -		ret = 0;
+ -		break;
+ -	default:
+ -		val = PSCI_RET_NOT_SUPPORTED;
+ -		break;
+ -	}
+ -
+ -	vcpu_set_reg(vcpu, 0, val);
+ -	return ret;
+ -}
+ -
+ -static int kvm_psci_0_1_call(struct kvm_vcpu *vcpu)
+ +/**
+ + * kvm_psci_call - handle PSCI call if r0 value is in range
+ + * @vcpu: Pointer to the VCPU struct
+ + *
+ + * Handle PSCI calls from guests through traps from HVC or SMC instructions.
+ + * The calling convention is similar to SMC calls to the secure world where
+ + * the function number is placed in r0 and this function returns true if the
+ + * function number specified in r0 is withing the PSCI range, and false
+ + * otherwise.
+ + */
+ +bool kvm_psci_call(struct kvm_vcpu *vcpu)
+  {
+ -	unsigned long psci_fn = vcpu_get_reg(vcpu, 0) & ~((u32) 0);
+ +	unsigned long psci_fn = *vcpu_reg(vcpu, 0) & ~((u32) 0);
+  	unsigned long val;
+  
+  	switch (psci_fn) {
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index 328d42daf22c,c98afa538b3a..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -281,6 -268,41 +281,44 @@@ struct kvm_arch 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Struct for a virtual core.
++  * Note: entry_exit_map combines a bitmap of threads that have entered
++  * in the bottom 8 bits and a bitmap of threads that have exited in the
++  * next 8 bits.  This is so that we can atomically set the entry bit
++  * iff the exit map is 0 without taking a lock.
++  */
++ struct kvmppc_vcore {
++ 	int n_runnable;
++ 	int num_threads;
++ 	int entry_exit_map;
++ 	int napping_threads;
++ 	int first_vcpuid;
++ 	u16 pcpu;
++ 	u16 last_cpu;
++ 	u8 vcore_state;
++ 	u8 in_guest;
++ 	struct kvmppc_vcore *master_vcore;
++ 	struct list_head runnable_threads;
++ 	struct list_head preempt_list;
++ 	spinlock_t lock;
++ 	struct swait_queue_head wq;
++ 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
++ 	u64 stolen_tb;
++ 	u64 preempt_tb;
++ 	struct kvm_vcpu *runner;
++ 	struct kvm *kvm;
++ 	u64 tb_offset;		/* guest timebase - host timebase */
++ 	ulong lpcr;
++ 	u32 arch_compat;
++ 	ulong pcr;
++ 	ulong dpdes;		/* doorbell state (POWER8) */
++ 	ulong conferring_threads;
++ };
++ 
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  #define VCORE_ENTRY_MAP(vc)	((vc)->entry_exit_map & 0xff)
+  #define VCORE_EXIT_MAP(vc)	((vc)->entry_exit_map >> 8)
+  #define VCORE_IS_EXITING(vc)	(VCORE_EXIT_MAP(vc) != 0)
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 92357b82799a,f1187bb6dd4d..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1534,9 -1456,10 +1534,9 @@@ static struct kvmppc_vcore *kvmppc_vcor
+  	if (vcore == NULL)
+  		return NULL;
+  
+ -	INIT_LIST_HEAD(&vcore->runnable_threads);
+  	spin_lock_init(&vcore->lock);
+  	spin_lock_init(&vcore->stoltb_lock);
+- 	init_waitqueue_head(&vcore->wq);
++ 	init_swait_queue_head(&vcore->wq);
+  	vcore->preempt_tb = TB_NIL;
+  	vcore->lpcr = kvm->arch.lpcr;
+  	vcore->first_vcpuid = core * threads_per_subcore;
+@@@ -2561,51 -2529,28 +2561,63 @@@ static int kvmppc_vcore_check_block(str
+   */
+  static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
+  {
+ -	struct kvm_vcpu *vcpu;
+ +	ktime_t cur, start_poll, start_wait;
+  	int do_sleep = 1;
+++<<<<<<< HEAD
+ +	u64 block_ns;
+ +
+ +	DEFINE_WAIT(wait);
+ +
+ +	/* Poll for pending exceptions and ceded state */
+ +	cur = start_poll = ktime_get();
+ +	if (vc->halt_poll_ns) {
+ +		ktime_t stop = ktime_add_ns(start_poll, vc->halt_poll_ns);
+ +		++vc->runner->stat.halt_attempted_poll;
+++=======
++ 	DECLARE_SWAITQUEUE(wait);
++ 
++ 	prepare_to_swait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  
+ -	/*
+ -	 * Check one last time for pending exceptions and ceded state after
+ -	 * we put ourselves on the wait queue
+ -	 */
+ -	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ -		if (vcpu->arch.pending_exceptions || !vcpu->arch.ceded) {
+ -			do_sleep = 0;
+ -			break;
+ +		vc->vcore_state = VCORE_POLLING;
+ +		spin_unlock(&vc->lock);
+ +
+ +		do {
+ +			if (kvmppc_vcore_check_block(vc)) {
+ +				do_sleep = 0;
+ +				break;
+ +			}
+ +			cur = ktime_get();
+ +		} while (single_task_running() && ktime_before(cur, stop));
+ +
+ +		spin_lock(&vc->lock);
+ +		vc->vcore_state = VCORE_INACTIVE;
+ +
+ +		if (!do_sleep) {
+ +			++vc->runner->stat.halt_successful_poll;
+ +			goto out;
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	prepare_to_wait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+ +
+ +	if (kvmppc_vcore_check_block(vc)) {
+ +		finish_wait(&vc->wq, &wait);
+ +		do_sleep = 0;
+ +		/* If we polled, count this as a successful poll */
+ +		if (vc->halt_poll_ns)
+ +			++vc->runner->stat.halt_successful_poll;
+ +		goto out;
+++=======
++ 	if (!do_sleep) {
++ 		finish_swait(&vc->wq, &wait);
++ 		return;
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  	}
+  
+ +	start_wait = ktime_get();
+ +
+  	vc->vcore_state = VCORE_SLEEPING;
+  	trace_kvmppc_vcore_blocked(vc, 0);
+  	spin_unlock(&vc->lock);
+diff --cc arch/s390/include/asm/kvm_host.h
+index 0aaab12c8aec,b0c8ad0799c7..000000000000
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@@ -231,25 -466,81 +231,29 @@@ struct kvm_s390_interrupt_info 
+  
+  struct kvm_s390_local_interrupt {
+  	spinlock_t lock;
+ +	struct list_head list;
+ +	atomic_t active;
+  	struct kvm_s390_float_interrupt *float_int;
+++<<<<<<< HEAD
+ +	int timer_due; /* event indicator for waitqueue below */
+ +	wait_queue_head_t *wq;
+++=======
++ 	struct swait_queue_head *wq;
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  	atomic_t *cpuflags;
+ -	DECLARE_BITMAP(sigp_emerg_pending, KVM_MAX_VCPUS);
+ -	struct kvm_s390_irq_payload irq;
+ -	unsigned long pending_irqs;
+ +	unsigned int action_bits;
+  };
+  
+ -#define FIRQ_LIST_IO_ISC_0 0
+ -#define FIRQ_LIST_IO_ISC_1 1
+ -#define FIRQ_LIST_IO_ISC_2 2
+ -#define FIRQ_LIST_IO_ISC_3 3
+ -#define FIRQ_LIST_IO_ISC_4 4
+ -#define FIRQ_LIST_IO_ISC_5 5
+ -#define FIRQ_LIST_IO_ISC_6 6
+ -#define FIRQ_LIST_IO_ISC_7 7
+ -#define FIRQ_LIST_PFAULT   8
+ -#define FIRQ_LIST_VIRTIO   9
+ -#define FIRQ_LIST_COUNT   10
+ -#define FIRQ_CNTR_IO       0
+ -#define FIRQ_CNTR_SERVICE  1
+ -#define FIRQ_CNTR_VIRTIO   2
+ -#define FIRQ_CNTR_PFAULT   3
+ -#define FIRQ_MAX_COUNT     4
+ -
+  struct kvm_s390_float_interrupt {
+ -	unsigned long pending_irqs;
+  	spinlock_t lock;
+ -	struct list_head lists[FIRQ_LIST_COUNT];
+ -	int counters[FIRQ_MAX_COUNT];
+ -	struct kvm_s390_mchk_info mchk;
+ -	struct kvm_s390_ext_info srv_signal;
+ +	struct list_head list;
+ +	atomic_t active;
+  	int next_rr_cpu;
+ -	unsigned long idle_mask[BITS_TO_LONGS(KVM_MAX_VCPUS)];
+ +	unsigned long idle_mask[(KVM_MAX_VCPUS + sizeof(long) - 1)
+ +				/ sizeof(long)];
+ +	struct kvm_s390_local_interrupt *local_int[KVM_MAX_VCPUS];
+  };
+  
+ -struct kvm_hw_wp_info_arch {
+ -	unsigned long addr;
+ -	unsigned long phys_addr;
+ -	int len;
+ -	char *old_data;
+ -};
+ -
+ -struct kvm_hw_bp_info_arch {
+ -	unsigned long addr;
+ -	int len;
+ -};
+ -
+ -/*
+ - * Only the upper 16 bits of kvm_guest_debug->control are arch specific.
+ - * Further KVM_GUESTDBG flags which an be used from userspace can be found in
+ - * arch/s390/include/uapi/asm/kvm.h
+ - */
+ -#define KVM_GUESTDBG_EXIT_PENDING 0x10000000
+ -
+ -#define guestdbg_enabled(vcpu) \
+ -		(vcpu->guest_debug & KVM_GUESTDBG_ENABLE)
+ -#define guestdbg_sstep_enabled(vcpu) \
+ -		(vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
+ -#define guestdbg_hw_bp_enabled(vcpu) \
+ -		(vcpu->guest_debug & KVM_GUESTDBG_USE_HW_BP)
+ -#define guestdbg_exit_pending(vcpu) (guestdbg_enabled(vcpu) && \
+ -		(vcpu->guest_debug & KVM_GUESTDBG_EXIT_PENDING))
+ -
+ -struct kvm_guestdbg_info_arch {
+ -	unsigned long cr0;
+ -	unsigned long cr9;
+ -	unsigned long cr10;
+ -	unsigned long cr11;
+ -	struct kvm_hw_bp_info_arch *hw_bp_info;
+ -	struct kvm_hw_wp_info_arch *hw_wp_info;
+ -	int nr_hw_bp;
+ -	int nr_hw_wp;
+ -	unsigned long last_bp;
+ -};
+  
+  struct kvm_vcpu_arch {
+  	struct kvm_s390_sie_block *sie_block;
+diff --cc arch/s390/kvm/interrupt.c
+index 7f1f7ac5cf7f,9ffc73221792..000000000000
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@@ -459,298 -527,1365 +459,310 @@@ no_timer
+  	return 0;
+  }
+  
+ -static int __must_check __deliver_emergency_signal(struct kvm_vcpu *vcpu)
+ +void kvm_s390_tasklet(unsigned long parm)
+  {
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	int rc;
+ -	int cpu_addr;
+ -
+ -	spin_lock(&li->lock);
+ -	cpu_addr = find_first_bit(li->sigp_emerg_pending, KVM_MAX_VCPUS);
+ -	clear_bit(cpu_addr, li->sigp_emerg_pending);
+ -	if (bitmap_empty(li->sigp_emerg_pending, KVM_MAX_VCPUS))
+ -		clear_bit(IRQ_PEND_EXT_EMERGENCY, &li->pending_irqs);
+ -	spin_unlock(&li->lock);
+ -
+ -	VCPU_EVENT(vcpu, 4, "%s", "deliver: sigp emerg");
+ -	vcpu->stat.deliver_emergency_signal++;
+ -	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_INT_EMERGENCY,
+ -					 cpu_addr, 0);
+ -
+ -	rc  = put_guest_lc(vcpu, EXT_IRQ_EMERGENCY_SIG,
+ -			   (u16 *)__LC_EXT_INT_CODE);
+ -	rc |= put_guest_lc(vcpu, cpu_addr, (u16 *)__LC_EXT_CPU_ADDR);
+ -	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+ -			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+ -			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	return rc ? -EFAULT : 0;
+++<<<<<<< HEAD
+ +	struct kvm_vcpu *vcpu = (struct kvm_vcpu *) parm;
+ +
+ +	spin_lock(&vcpu->arch.local_int.lock);
+ +	vcpu->arch.local_int.timer_due = 1;
+ +	if (waitqueue_active(&vcpu->wq))
+ +		wake_up_interruptible(&vcpu->wq);
+ +	spin_unlock(&vcpu->arch.local_int.lock);
+++=======
+++	if (swait_active(&vcpu->wq)) {
+++		/*
+++		 * The vcpu gave up the cpu voluntarily, mark it as a good
+++		 * yield-candidate.
+++		 */
+++		vcpu->preempted = true;
+++		swake_up(&vcpu->wq);
+++		vcpu->stat.halt_wakeup++;
+++	}
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  }
+  
+ -static int __must_check __deliver_external_call(struct kvm_vcpu *vcpu)
+ +/*
+ + * low level hrtimer wake routine. Because this runs in hardirq context
+ + * we schedule a tasklet to do the real work.
+ + */
+ +enum hrtimer_restart kvm_s390_idle_wakeup(struct hrtimer *timer)
+  {
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_extcall_info extcall;
+ -	int rc;
+ +	struct kvm_vcpu *vcpu;
+ +
+ +	vcpu = container_of(timer, struct kvm_vcpu, arch.ckc_timer);
+ +	tasklet_schedule(&vcpu->arch.tasklet);
+  
+ -	spin_lock(&li->lock);
+ -	extcall = li->irq.extcall;
+ -	li->irq.extcall.code = 0;
+ -	clear_bit(IRQ_PEND_EXT_EXTERNAL, &li->pending_irqs);
+ -	spin_unlock(&li->lock);
+ -
+ -	VCPU_EVENT(vcpu, 4, "%s", "deliver: sigp ext call");
+ -	vcpu->stat.deliver_external_call++;
+ -	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id,
+ -					 KVM_S390_INT_EXTERNAL_CALL,
+ -					 extcall.code, 0);
+ -
+ -	rc  = put_guest_lc(vcpu, EXT_IRQ_EXTERNAL_CALL,
+ -			   (u16 *)__LC_EXT_INT_CODE);
+ -	rc |= put_guest_lc(vcpu, extcall.code, (u16 *)__LC_EXT_CPU_ADDR);
+ -	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+ -			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW, &vcpu->arch.sie_block->gpsw,
+ -			    sizeof(psw_t));
+ -	return rc ? -EFAULT : 0;
+ +	return HRTIMER_NORESTART;
+  }
+  
+ -static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
+ +void kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu)
+  {
+  	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_pgm_info pgm_info;
+ -	int rc = 0, nullifying = false;
+ -	u16 ilc = get_ilc(vcpu);
+ -
+ -	spin_lock(&li->lock);
+ -	pgm_info = li->irq.pgm;
+ -	clear_bit(IRQ_PEND_PROG, &li->pending_irqs);
+ -	memset(&li->irq.pgm, 0, sizeof(pgm_info));
+ -	spin_unlock(&li->lock);
+ -
+ -	VCPU_EVENT(vcpu, 3, "deliver: program irq code 0x%x, ilc:%d",
+ -		   pgm_info.code, ilc);
+ -	vcpu->stat.deliver_program_int++;
+ -	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_PROGRAM_INT,
+ -					 pgm_info.code, 0);
+ -
+ -	switch (pgm_info.code & ~PGM_PER) {
+ -	case PGM_AFX_TRANSLATION:
+ -	case PGM_ASX_TRANSLATION:
+ -	case PGM_EX_TRANSLATION:
+ -	case PGM_LFX_TRANSLATION:
+ -	case PGM_LSTE_SEQUENCE:
+ -	case PGM_LSX_TRANSLATION:
+ -	case PGM_LX_TRANSLATION:
+ -	case PGM_PRIMARY_AUTHORITY:
+ -	case PGM_SECONDARY_AUTHORITY:
+ -		nullifying = true;
+ -		/* fall through */
+ -	case PGM_SPACE_SWITCH:
+ -		rc = put_guest_lc(vcpu, pgm_info.trans_exc_code,
+ -				  (u64 *)__LC_TRANS_EXC_CODE);
+ -		break;
+ -	case PGM_ALEN_TRANSLATION:
+ -	case PGM_ALE_SEQUENCE:
+ -	case PGM_ASTE_INSTANCE:
+ -	case PGM_ASTE_SEQUENCE:
+ -	case PGM_ASTE_VALIDITY:
+ -	case PGM_EXTENDED_AUTHORITY:
+ -		rc = put_guest_lc(vcpu, pgm_info.exc_access_id,
+ -				  (u8 *)__LC_EXC_ACCESS_ID);
+ -		nullifying = true;
+ -		break;
+ -	case PGM_ASCE_TYPE:
+ -	case PGM_PAGE_TRANSLATION:
+ -	case PGM_REGION_FIRST_TRANS:
+ -	case PGM_REGION_SECOND_TRANS:
+ -	case PGM_REGION_THIRD_TRANS:
+ -	case PGM_SEGMENT_TRANSLATION:
+ -		rc = put_guest_lc(vcpu, pgm_info.trans_exc_code,
+ -				  (u64 *)__LC_TRANS_EXC_CODE);
+ -		rc |= put_guest_lc(vcpu, pgm_info.exc_access_id,
+ -				   (u8 *)__LC_EXC_ACCESS_ID);
+ -		rc |= put_guest_lc(vcpu, pgm_info.op_access_id,
+ -				   (u8 *)__LC_OP_ACCESS_ID);
+ -		nullifying = true;
+ -		break;
+ -	case PGM_MONITOR:
+ -		rc = put_guest_lc(vcpu, pgm_info.mon_class_nr,
+ -				  (u16 *)__LC_MON_CLASS_NR);
+ -		rc |= put_guest_lc(vcpu, pgm_info.mon_code,
+ -				   (u64 *)__LC_MON_CODE);
+ -		break;
+ -	case PGM_VECTOR_PROCESSING:
+ -	case PGM_DATA:
+ -		rc = put_guest_lc(vcpu, pgm_info.data_exc_code,
+ -				  (u32 *)__LC_DATA_EXC_CODE);
+ -		break;
+ -	case PGM_PROTECTION:
+ -		rc = put_guest_lc(vcpu, pgm_info.trans_exc_code,
+ -				  (u64 *)__LC_TRANS_EXC_CODE);
+ -		rc |= put_guest_lc(vcpu, pgm_info.exc_access_id,
+ -				   (u8 *)__LC_EXC_ACCESS_ID);
+ -		break;
+ -	case PGM_STACK_FULL:
+ -	case PGM_STACK_EMPTY:
+ -	case PGM_STACK_SPECIFICATION:
+ -	case PGM_STACK_TYPE:
+ -	case PGM_STACK_OPERATION:
+ -	case PGM_TRACE_TABEL:
+ -	case PGM_CRYPTO_OPERATION:
+ -		nullifying = true;
+ -		break;
+ -	}
+ +	struct kvm_s390_float_interrupt *fi = vcpu->arch.local_int.float_int;
+ +	struct kvm_s390_interrupt_info  *n, *inti = NULL;
+ +	int deliver;
+  
+ -	if (pgm_info.code & PGM_PER) {
+ -		rc |= put_guest_lc(vcpu, pgm_info.per_code,
+ -				   (u8 *) __LC_PER_CODE);
+ -		rc |= put_guest_lc(vcpu, pgm_info.per_atmid,
+ -				   (u8 *)__LC_PER_ATMID);
+ -		rc |= put_guest_lc(vcpu, pgm_info.per_address,
+ -				   (u64 *) __LC_PER_ADDRESS);
+ -		rc |= put_guest_lc(vcpu, pgm_info.per_access_id,
+ -				   (u8 *) __LC_PER_ACCESS_ID);
+ +	__reset_intercept_indicators(vcpu);
+ +	if (atomic_read(&li->active)) {
+ +		do {
+ +			deliver = 0;
+ +			spin_lock_bh(&li->lock);
+ +			list_for_each_entry_safe(inti, n, &li->list, list) {
+ +				if (__interrupt_is_deliverable(vcpu, inti)) {
+ +					list_del(&inti->list);
+ +					deliver = 1;
+ +					break;
+ +				}
+ +				__set_intercept_indicator(vcpu, inti);
+ +			}
+ +			if (list_empty(&li->list))
+ +				atomic_set(&li->active, 0);
+ +			spin_unlock_bh(&li->lock);
+ +			if (deliver) {
+ +				__do_deliver_interrupt(vcpu, inti);
+ +				kfree(inti);
+ +			}
+ +		} while (deliver);
+  	}
+  
+ -	if (nullifying && vcpu->arch.sie_block->icptcode == ICPT_INST)
+ -		kvm_s390_rewind_psw(vcpu, ilc);
+ -
+ -	rc |= put_guest_lc(vcpu, ilc, (u16 *) __LC_PGM_ILC);
+ -	rc |= put_guest_lc(vcpu, vcpu->arch.sie_block->gbea,
+ -				 (u64 *) __LC_LAST_BREAK);
+ -	rc |= put_guest_lc(vcpu, pgm_info.code,
+ -			   (u16 *)__LC_PGM_INT_CODE);
+ -	rc |= write_guest_lc(vcpu, __LC_PGM_OLD_PSW,
+ -			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	rc |= read_guest_lc(vcpu, __LC_PGM_NEW_PSW,
+ -			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	return rc ? -EFAULT : 0;
+ +	if ((vcpu->arch.sie_block->ckc <
+ +		get_tod_clock_fast() + vcpu->arch.sie_block->epoch))
+ +		__try_deliver_ckc_interrupt(vcpu);
+ +
+ +	if (atomic_read(&fi->active)) {
+ +		do {
+ +			deliver = 0;
+ +			spin_lock(&fi->lock);
+ +			list_for_each_entry_safe(inti, n, &fi->list, list) {
+ +				if (__interrupt_is_deliverable(vcpu, inti)) {
+ +					list_del(&inti->list);
+ +					deliver = 1;
+ +					break;
+ +				}
+ +				__set_intercept_indicator(vcpu, inti);
+ +			}
+ +			if (list_empty(&fi->list))
+ +				atomic_set(&fi->active, 0);
+ +			spin_unlock(&fi->lock);
+ +			if (deliver) {
+ +				__do_deliver_interrupt(vcpu, inti);
+ +				kfree(inti);
+ +			}
+ +		} while (deliver);
+ +	}
+  }
+  
+ -static int __must_check __deliver_service(struct kvm_vcpu *vcpu)
+ +void kvm_s390_deliver_pending_machine_checks(struct kvm_vcpu *vcpu)
+  {
+ -	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
+ -	struct kvm_s390_ext_info ext;
+ -	int rc = 0;
+ +	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ +	struct kvm_s390_float_interrupt *fi = vcpu->arch.local_int.float_int;
+ +	struct kvm_s390_interrupt_info  *n, *inti = NULL;
+ +	int deliver;
+  
+ -	spin_lock(&fi->lock);
+ -	if (!(test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs))) {
+ -		spin_unlock(&fi->lock);
+ -		return 0;
+ +	__reset_intercept_indicators(vcpu);
+ +	if (atomic_read(&li->active)) {
+ +		do {
+ +			deliver = 0;
+ +			spin_lock_bh(&li->lock);
+ +			list_for_each_entry_safe(inti, n, &li->list, list) {
+ +				if ((inti->type == KVM_S390_MCHK) &&
+ +				    __interrupt_is_deliverable(vcpu, inti)) {
+ +					list_del(&inti->list);
+ +					deliver = 1;
+ +					break;
+ +				}
+ +				__set_intercept_indicator(vcpu, inti);
+ +			}
+ +			if (list_empty(&li->list))
+ +				atomic_set(&li->active, 0);
+ +			spin_unlock_bh(&li->lock);
+ +			if (deliver) {
+ +				__do_deliver_interrupt(vcpu, inti);
+ +				kfree(inti);
+ +			}
+ +		} while (deliver);
+  	}
+ -	ext = fi->srv_signal;
+ -	memset(&fi->srv_signal, 0, sizeof(ext));
+ -	clear_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -
+ -	VCPU_EVENT(vcpu, 4, "deliver: sclp parameter 0x%x",
+ -		   ext.ext_params);
+ -	vcpu->stat.deliver_service_signal++;
+ -	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_INT_SERVICE,
+ -					 ext.ext_params, 0);
+ -
+ -	rc  = put_guest_lc(vcpu, EXT_IRQ_SERVICE_SIG, (u16 *)__LC_EXT_INT_CODE);
+ -	rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
+ -	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+ -			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+ -			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+ -	rc |= put_guest_lc(vcpu, ext.ext_params,
+ -			   (u32 *)__LC_EXT_PARAMS);
+  
+ -	return rc ? -EFAULT : 0;
+ +	if (atomic_read(&fi->active)) {
+ +		do {
+ +			deliver = 0;
+ +			spin_lock(&fi->lock);
+ +			list_for_each_entry_safe(inti, n, &fi->list, list) {
+ +				if ((inti->type == KVM_S390_MCHK) &&
+ +				    __interrupt_is_deliverable(vcpu, inti)) {
+ +					list_del(&inti->list);
+ +					deliver = 1;
+ +					break;
+ +				}
+ +				__set_intercept_indicator(vcpu, inti);
+ +			}
+ +			if (list_empty(&fi->list))
+ +				atomic_set(&fi->active, 0);
+ +			spin_unlock(&fi->lock);
+ +			if (deliver) {
+ +				__do_deliver_interrupt(vcpu, inti);
+ +				kfree(inti);
+ +			}
+ +		} while (deliver);
+ +	}
+  }
+  
+ -static int __must_check __deliver_pfault_done(struct kvm_vcpu *vcpu)
+ +int kvm_s390_inject_program_int(struct kvm_vcpu *vcpu, u16 code)
+  {
+ -	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
+ +	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+  	struct kvm_s390_interrupt_info *inti;
+ -	int rc = 0;
+ -
+ -	spin_lock(&fi->lock);
+ -	inti = list_first_entry_or_null(&fi->lists[FIRQ_LIST_PFAULT],
+ -					struct kvm_s390_interrupt_info,
+ -					list);
+ -	if (inti) {
+ -		list_del(&inti->list);
+ -		fi->counters[FIRQ_CNTR_PFAULT] -= 1;
+ -	}
+ -	if (list_empty(&fi->lists[FIRQ_LIST_PFAULT]))
+ -		clear_bit(IRQ_PEND_PFAULT_DONE, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -
+ -	if (inti) {
+ -		trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id,
+ -						 KVM_S390_INT_PFAULT_DONE, 0,
+ -						 inti->ext.ext_params2);
+ -		VCPU_EVENT(vcpu, 4, "deliver: pfault done token 0x%llx",
+ -			   inti->ext.ext_params2);
+ -
+ -		rc  = put_guest_lc(vcpu, EXT_IRQ_CP_SERVICE,
+ -				(u16 *)__LC_EXT_INT_CODE);
+ -		rc |= put_guest_lc(vcpu, PFAULT_DONE,
+ -				(u16 *)__LC_EXT_CPU_ADDR);
+ -		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		rc |= put_guest_lc(vcpu, inti->ext.ext_params2,
+ -				(u64 *)__LC_EXT_PARAMS2);
+ -		kfree(inti);
+ -	}
+ -	return rc ? -EFAULT : 0;
+ -}
+ -
+ -static int __must_check __deliver_virtio(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
+ -	struct kvm_s390_interrupt_info *inti;
+ -	int rc = 0;
+ -
+ -	spin_lock(&fi->lock);
+ -	inti = list_first_entry_or_null(&fi->lists[FIRQ_LIST_VIRTIO],
+ -					struct kvm_s390_interrupt_info,
+ -					list);
+ -	if (inti) {
+ -		VCPU_EVENT(vcpu, 4,
+ -			   "deliver: virtio parm: 0x%x,parm64: 0x%llx",
+ -			   inti->ext.ext_params, inti->ext.ext_params2);
+ -		vcpu->stat.deliver_virtio_interrupt++;
+ -		trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id,
+ -				inti->type,
+ -				inti->ext.ext_params,
+ -				inti->ext.ext_params2);
+ -		list_del(&inti->list);
+ -		fi->counters[FIRQ_CNTR_VIRTIO] -= 1;
+ -	}
+ -	if (list_empty(&fi->lists[FIRQ_LIST_VIRTIO]))
+ -		clear_bit(IRQ_PEND_VIRTIO, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -
+ -	if (inti) {
+ -		rc  = put_guest_lc(vcpu, EXT_IRQ_CP_SERVICE,
+ -				(u16 *)__LC_EXT_INT_CODE);
+ -		rc |= put_guest_lc(vcpu, VIRTIO_PARAM,
+ -				(u16 *)__LC_EXT_CPU_ADDR);
+ -		rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		rc |= put_guest_lc(vcpu, inti->ext.ext_params,
+ -				(u32 *)__LC_EXT_PARAMS);
+ -		rc |= put_guest_lc(vcpu, inti->ext.ext_params2,
+ -				(u64 *)__LC_EXT_PARAMS2);
+ -		kfree(inti);
+ -	}
+ -	return rc ? -EFAULT : 0;
+ -}
+ -
+ -static int __must_check __deliver_io(struct kvm_vcpu *vcpu,
+ -				     unsigned long irq_type)
+ -{
+ -	struct list_head *isc_list;
+ -	struct kvm_s390_float_interrupt *fi;
+ -	struct kvm_s390_interrupt_info *inti = NULL;
+ -	int rc = 0;
+ -
+ -	fi = &vcpu->kvm->arch.float_int;
+ -
+ -	spin_lock(&fi->lock);
+ -	isc_list = &fi->lists[irq_type - IRQ_PEND_IO_ISC_0];
+ -	inti = list_first_entry_or_null(isc_list,
+ -					struct kvm_s390_interrupt_info,
+ -					list);
+ -	if (inti) {
+ -		VCPU_EVENT(vcpu, 4, "deliver: I/O 0x%llx", inti->type);
+ -		vcpu->stat.deliver_io_int++;
+ -		trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id,
+ -				inti->type,
+ -				((__u32)inti->io.subchannel_id << 16) |
+ -				inti->io.subchannel_nr,
+ -				((__u64)inti->io.io_int_parm << 32) |
+ -				inti->io.io_int_word);
+ -		list_del(&inti->list);
+ -		fi->counters[FIRQ_CNTR_IO] -= 1;
+ -	}
+ -	if (list_empty(isc_list))
+ -		clear_bit(irq_type, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -
+ -	if (inti) {
+ -		rc  = put_guest_lc(vcpu, inti->io.subchannel_id,
+ -				(u16 *)__LC_SUBCHANNEL_ID);
+ -		rc |= put_guest_lc(vcpu, inti->io.subchannel_nr,
+ -				(u16 *)__LC_SUBCHANNEL_NR);
+ -		rc |= put_guest_lc(vcpu, inti->io.io_int_parm,
+ -				(u32 *)__LC_IO_INT_PARM);
+ -		rc |= put_guest_lc(vcpu, inti->io.io_int_word,
+ -				(u32 *)__LC_IO_INT_WORD);
+ -		rc |= write_guest_lc(vcpu, __LC_IO_OLD_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		rc |= read_guest_lc(vcpu, __LC_IO_NEW_PSW,
+ -				&vcpu->arch.sie_block->gpsw,
+ -				sizeof(psw_t));
+ -		kfree(inti);
+ -	}
+ -
+ -	return rc ? -EFAULT : 0;
+ -}
+ -
+ -typedef int (*deliver_irq_t)(struct kvm_vcpu *vcpu);
+ -
+ -static const deliver_irq_t deliver_irq_funcs[] = {
+ -	[IRQ_PEND_MCHK_EX]        = __deliver_machine_check,
+ -	[IRQ_PEND_MCHK_REP]       = __deliver_machine_check,
+ -	[IRQ_PEND_PROG]           = __deliver_prog,
+ -	[IRQ_PEND_EXT_EMERGENCY]  = __deliver_emergency_signal,
+ -	[IRQ_PEND_EXT_EXTERNAL]   = __deliver_external_call,
+ -	[IRQ_PEND_EXT_CLOCK_COMP] = __deliver_ckc,
+ -	[IRQ_PEND_EXT_CPU_TIMER]  = __deliver_cpu_timer,
+ -	[IRQ_PEND_RESTART]        = __deliver_restart,
+ -	[IRQ_PEND_SET_PREFIX]     = __deliver_set_prefix,
+ -	[IRQ_PEND_PFAULT_INIT]    = __deliver_pfault_init,
+ -	[IRQ_PEND_EXT_SERVICE]    = __deliver_service,
+ -	[IRQ_PEND_PFAULT_DONE]    = __deliver_pfault_done,
+ -	[IRQ_PEND_VIRTIO]         = __deliver_virtio,
+ -};
+ -
+ -/* Check whether an external call is pending (deliverable or not) */
+ -int kvm_s390_ext_call_pending(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	if (!sclp.has_sigpif)
+ -		return test_bit(IRQ_PEND_EXT_EXTERNAL, &li->pending_irqs);
+ -
+ -	return sca_ext_call_pending(vcpu, NULL);
+ -}
+ -
+ -int kvm_s390_vcpu_has_irq(struct kvm_vcpu *vcpu, int exclude_stop)
+ -{
+ -	if (deliverable_irqs(vcpu))
+ -		return 1;
+ -
+ -	if (kvm_cpu_has_pending_timer(vcpu))
+ -		return 1;
+ -
+ -	/* external call pending and deliverable */
+ -	if (kvm_s390_ext_call_pending(vcpu) &&
+ -	    !psw_extint_disabled(vcpu) &&
+ -	    (vcpu->arch.sie_block->gcr[0] & 0x2000ul))
+ -		return 1;
+ -
+ -	if (!exclude_stop && kvm_s390_is_stop_irq_pending(vcpu))
+ -		return 1;
+ -	return 0;
+ -}
+ -
+ -int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
+ -{
+ -	return ckc_irq_pending(vcpu) || cpu_timer_irq_pending(vcpu);
+ -}
+ -
+ -int kvm_s390_handle_wait(struct kvm_vcpu *vcpu)
+ -{
+ -	u64 now, sltime;
+ -
+ -	vcpu->stat.exit_wait_state++;
+ -
+ -	/* fast path */
+ -	if (kvm_arch_vcpu_runnable(vcpu))
+ -		return 0;
+ -
+ -	if (psw_interrupts_disabled(vcpu)) {
+ -		VCPU_EVENT(vcpu, 3, "%s", "disabled wait");
+ -		return -EOPNOTSUPP; /* disabled wait */
+ -	}
+ -
+ -	if (!ckc_interrupts_enabled(vcpu)) {
+ -		VCPU_EVENT(vcpu, 3, "%s", "enabled wait w/o timer");
+ -		__set_cpu_idle(vcpu);
+ -		goto no_timer;
+ -	}
+ -
+ -	now = kvm_s390_get_tod_clock_fast(vcpu->kvm);
+ -	sltime = tod_to_ns(vcpu->arch.sie_block->ckc - now);
+ -
+ -	/* underflow */
+ -	if (vcpu->arch.sie_block->ckc < now)
+ -		return 0;
+ -
+ -	__set_cpu_idle(vcpu);
+ -	hrtimer_start(&vcpu->arch.ckc_timer, ktime_set (0, sltime) , HRTIMER_MODE_REL);
+ -	VCPU_EVENT(vcpu, 4, "enabled wait via clock comparator: %llu ns", sltime);
+ -no_timer:
+ -	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+ -	kvm_vcpu_block(vcpu);
+ -	__unset_cpu_idle(vcpu);
+ -	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+ -
+ -	hrtimer_cancel(&vcpu->arch.ckc_timer);
+ -	return 0;
+ -}
+ -
+ -void kvm_s390_vcpu_wakeup(struct kvm_vcpu *vcpu)
+ -{
+ -	if (swait_active(&vcpu->wq)) {
+ -		/*
+ -		 * The vcpu gave up the cpu voluntarily, mark it as a good
+ -		 * yield-candidate.
+ -		 */
+ -		vcpu->preempted = true;
+ -		swake_up(&vcpu->wq);
+ -		vcpu->stat.halt_wakeup++;
+ -	}
+ -}
+ -
+ -enum hrtimer_restart kvm_s390_idle_wakeup(struct hrtimer *timer)
+ -{
+ -	struct kvm_vcpu *vcpu;
+ -	u64 now, sltime;
+ -
+ -	vcpu = container_of(timer, struct kvm_vcpu, arch.ckc_timer);
+ -	now = kvm_s390_get_tod_clock_fast(vcpu->kvm);
+ -	sltime = tod_to_ns(vcpu->arch.sie_block->ckc - now);
+ -
+ -	/*
+ -	 * If the monotonic clock runs faster than the tod clock we might be
+ -	 * woken up too early and have to go back to sleep to avoid deadlocks.
+ -	 */
+ -	if (vcpu->arch.sie_block->ckc > now &&
+ -	    hrtimer_forward_now(timer, ns_to_ktime(sltime)))
+ -		return HRTIMER_RESTART;
+ -	kvm_s390_vcpu_wakeup(vcpu);
+ -	return HRTIMER_NORESTART;
+ -}
+ -
+ -void kvm_s390_clear_local_irqs(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	spin_lock(&li->lock);
+ -	li->pending_irqs = 0;
+ -	bitmap_zero(li->sigp_emerg_pending, KVM_MAX_VCPUS);
+ -	memset(&li->irq, 0, sizeof(li->irq));
+ -	spin_unlock(&li->lock);
+ -
+ -	sca_clear_ext_call(vcpu);
+ -}
+ -
+ -int __must_check kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	deliver_irq_t func;
+ -	int rc = 0;
+ -	unsigned long irq_type;
+ -	unsigned long irqs;
+ -
+ -	__reset_intercept_indicators(vcpu);
+ -
+ -	/* pending ckc conditions might have been invalidated */
+ -	clear_bit(IRQ_PEND_EXT_CLOCK_COMP, &li->pending_irqs);
+ -	if (ckc_irq_pending(vcpu))
+ -		set_bit(IRQ_PEND_EXT_CLOCK_COMP, &li->pending_irqs);
+ -
+ -	/* pending cpu timer conditions might have been invalidated */
+ -	clear_bit(IRQ_PEND_EXT_CPU_TIMER, &li->pending_irqs);
+ -	if (cpu_timer_irq_pending(vcpu))
+ -		set_bit(IRQ_PEND_EXT_CPU_TIMER, &li->pending_irqs);
+ -
+ -	while ((irqs = deliverable_irqs(vcpu)) && !rc) {
+ -		/* bits are in the order of interrupt priority */
+ -		irq_type = find_first_bit(&irqs, IRQ_PEND_COUNT);
+ -		if (is_ioirq(irq_type)) {
+ -			rc = __deliver_io(vcpu, irq_type);
+ -		} else {
+ -			func = deliver_irq_funcs[irq_type];
+ -			if (!func) {
+ -				WARN_ON_ONCE(func == NULL);
+ -				clear_bit(irq_type, &li->pending_irqs);
+ -				continue;
+ -			}
+ -			rc = func(vcpu);
+ -		}
+ -	}
+ -
+ -	set_intercept_indicators(vcpu);
+ -
+ -	return rc;
+ -}
+ -
+ -static int __inject_prog(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 3, "inject: program irq code 0x%x", irq->u.pgm.code);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_PROGRAM_INT,
+ -				   irq->u.pgm.code, 0);
+ -
+ -	if (irq->u.pgm.code == PGM_PER) {
+ -		li->irq.pgm.code |= PGM_PER;
+ -		/* only modify PER related information */
+ -		li->irq.pgm.per_address = irq->u.pgm.per_address;
+ -		li->irq.pgm.per_code = irq->u.pgm.per_code;
+ -		li->irq.pgm.per_atmid = irq->u.pgm.per_atmid;
+ -		li->irq.pgm.per_access_id = irq->u.pgm.per_access_id;
+ -	} else if (!(irq->u.pgm.code & PGM_PER)) {
+ -		li->irq.pgm.code = (li->irq.pgm.code & PGM_PER) |
+ -				   irq->u.pgm.code;
+ -		/* only modify non-PER information */
+ -		li->irq.pgm.trans_exc_code = irq->u.pgm.trans_exc_code;
+ -		li->irq.pgm.mon_code = irq->u.pgm.mon_code;
+ -		li->irq.pgm.data_exc_code = irq->u.pgm.data_exc_code;
+ -		li->irq.pgm.mon_class_nr = irq->u.pgm.mon_class_nr;
+ -		li->irq.pgm.exc_access_id = irq->u.pgm.exc_access_id;
+ -		li->irq.pgm.op_access_id = irq->u.pgm.op_access_id;
+ -	} else {
+ -		li->irq.pgm = irq->u.pgm;
+ -	}
+ -	set_bit(IRQ_PEND_PROG, &li->pending_irqs);
+ -	return 0;
+ -}
+ -
+ -static int __inject_pfault_init(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 4, "inject: pfault init parameter block at 0x%llx",
+ -		   irq->u.ext.ext_params2);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_PFAULT_INIT,
+ -				   irq->u.ext.ext_params,
+ -				   irq->u.ext.ext_params2);
+ -
+ -	li->irq.ext = irq->u.ext;
+ -	set_bit(IRQ_PEND_PFAULT_INIT, &li->pending_irqs);
+ -	atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -	return 0;
+ -}
+ -
+ -static int __inject_extcall(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_extcall_info *extcall = &li->irq.extcall;
+ -	uint16_t src_id = irq->u.extcall.code;
+ -
+ -	VCPU_EVENT(vcpu, 4, "inject: external call source-cpu:%u",
+ -		   src_id);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_EXTERNAL_CALL,
+ -				   src_id, 0);
+ -
+ -	/* sending vcpu invalid */
+ -	if (kvm_get_vcpu_by_id(vcpu->kvm, src_id) == NULL)
+ -		return -EINVAL;
+ -
+ -	if (sclp.has_sigpif)
+ -		return sca_inject_ext_call(vcpu, src_id);
+ -
+ -	if (test_and_set_bit(IRQ_PEND_EXT_EXTERNAL, &li->pending_irqs))
+ -		return -EBUSY;
+ -	*extcall = irq->u.extcall;
+ -	atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -	return 0;
+ -}
+ -
+ -static int __inject_set_prefix(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_prefix_info *prefix = &li->irq.prefix;
+ -
+ -	VCPU_EVENT(vcpu, 3, "inject: set prefix to %x",
+ -		   irq->u.prefix.address);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_SIGP_SET_PREFIX,
+ -				   irq->u.prefix.address, 0);
+ -
+ -	if (!is_vcpu_stopped(vcpu))
+ -		return -EBUSY;
+ -
+ -	*prefix = irq->u.prefix;
+ -	set_bit(IRQ_PEND_SET_PREFIX, &li->pending_irqs);
+ -	return 0;
+ -}
+ -
+ -#define KVM_S390_STOP_SUPP_FLAGS (KVM_S390_STOP_FLAG_STORE_STATUS)
+ -static int __inject_sigp_stop(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_stop_info *stop = &li->irq.stop;
+ -	int rc = 0;
+ -
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_SIGP_STOP, 0, 0);
+ -
+ -	if (irq->u.stop.flags & ~KVM_S390_STOP_SUPP_FLAGS)
+ -		return -EINVAL;
+ -
+ -	if (is_vcpu_stopped(vcpu)) {
+ -		if (irq->u.stop.flags & KVM_S390_STOP_FLAG_STORE_STATUS)
+ -			rc = kvm_s390_store_status_unloaded(vcpu,
+ -						KVM_S390_STORE_STATUS_NOADDR);
+ -		return rc;
+ -	}
+ -
+ -	if (test_and_set_bit(IRQ_PEND_SIGP_STOP, &li->pending_irqs))
+ -		return -EBUSY;
+ -	stop->flags = irq->u.stop.flags;
+ -	__set_cpuflag(vcpu, CPUSTAT_STOP_INT);
+ -	return 0;
+ -}
+ -
+ -static int __inject_sigp_restart(struct kvm_vcpu *vcpu,
+ -				 struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 3, "%s", "inject: restart int");
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_RESTART, 0, 0);
+ -
+ -	set_bit(IRQ_PEND_RESTART, &li->pending_irqs);
+ -	return 0;
+ -}
+ -
+ -static int __inject_sigp_emergency(struct kvm_vcpu *vcpu,
+ -				   struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 4, "inject: emergency from cpu %u",
+ -		   irq->u.emerg.code);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_EMERGENCY,
+ -				   irq->u.emerg.code, 0);
+ -
+ -	/* sending vcpu invalid */
+ -	if (kvm_get_vcpu_by_id(vcpu->kvm, irq->u.emerg.code) == NULL)
+ -		return -EINVAL;
+ -
+ -	set_bit(irq->u.emerg.code, li->sigp_emerg_pending);
+ -	set_bit(IRQ_PEND_EXT_EMERGENCY, &li->pending_irqs);
+ -	atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -	return 0;
+ -}
+ -
+ -static int __inject_mchk(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	struct kvm_s390_mchk_info *mchk = &li->irq.mchk;
+ -
+ -	VCPU_EVENT(vcpu, 3, "inject: machine check mcic 0x%llx",
+ -		   irq->u.mchk.mcic);
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_MCHK, 0,
+ -				   irq->u.mchk.mcic);
+ -
+ -	/*
+ -	 * Because repressible machine checks can be indicated along with
+ -	 * exigent machine checks (PoP, Chapter 11, Interruption action)
+ -	 * we need to combine cr14, mcic and external damage code.
+ -	 * Failing storage address and the logout area should not be or'ed
+ -	 * together, we just indicate the last occurrence of the corresponding
+ -	 * machine check
+ -	 */
+ -	mchk->cr14 |= irq->u.mchk.cr14;
+ -	mchk->mcic |= irq->u.mchk.mcic;
+ -	mchk->ext_damage_code |= irq->u.mchk.ext_damage_code;
+ -	mchk->failing_storage_address = irq->u.mchk.failing_storage_address;
+ -	memcpy(&mchk->fixed_logout, &irq->u.mchk.fixed_logout,
+ -	       sizeof(mchk->fixed_logout));
+ -	if (mchk->mcic & MCHK_EX_MASK)
+ -		set_bit(IRQ_PEND_MCHK_EX, &li->pending_irqs);
+ -	else if (mchk->mcic & MCHK_REP_MASK)
+ -		set_bit(IRQ_PEND_MCHK_REP,  &li->pending_irqs);
+ -	return 0;
+ -}
+ -
+ -static int __inject_ckc(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 3, "%s", "inject: clock comparator external");
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_CLOCK_COMP,
+ -				   0, 0);
+ -
+ -	set_bit(IRQ_PEND_EXT_CLOCK_COMP, &li->pending_irqs);
+ -	atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -	return 0;
+ -}
+ -
+ -static int __inject_cpu_timer(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	VCPU_EVENT(vcpu, 3, "%s", "inject: cpu timer external");
+ -	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, KVM_S390_INT_CPU_TIMER,
+ -				   0, 0);
+ -
+ -	set_bit(IRQ_PEND_EXT_CPU_TIMER, &li->pending_irqs);
+ -	atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -	return 0;
+ -}
+ -
+ -static struct kvm_s390_interrupt_info *get_io_int(struct kvm *kvm,
+ -						  int isc, u32 schid)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -	struct list_head *isc_list = &fi->lists[FIRQ_LIST_IO_ISC_0 + isc];
+ -	struct kvm_s390_interrupt_info *iter;
+ -	u16 id = (schid & 0xffff0000U) >> 16;
+ -	u16 nr = schid & 0x0000ffffU;
+ -
+ -	spin_lock(&fi->lock);
+ -	list_for_each_entry(iter, isc_list, list) {
+ -		if (schid && (id != iter->io.subchannel_id ||
+ -			      nr != iter->io.subchannel_nr))
+ -			continue;
+ -		/* found an appropriate entry */
+ -		list_del_init(&iter->list);
+ -		fi->counters[FIRQ_CNTR_IO] -= 1;
+ -		if (list_empty(isc_list))
+ -			clear_bit(IRQ_PEND_IO_ISC_0 + isc, &fi->pending_irqs);
+ -		spin_unlock(&fi->lock);
+ -		return iter;
+ -	}
+ -	spin_unlock(&fi->lock);
+ -	return NULL;
+ -}
+ -
+ -/*
+ - * Dequeue and return an I/O interrupt matching any of the interruption
+ - * subclasses as designated by the isc mask in cr6 and the schid (if != 0).
+ - */
+ -struct kvm_s390_interrupt_info *kvm_s390_get_io_int(struct kvm *kvm,
+ -						    u64 isc_mask, u32 schid)
+ -{
+ -	struct kvm_s390_interrupt_info *inti = NULL;
+ -	int isc;
+ -
+ -	for (isc = 0; isc <= MAX_ISC && !inti; isc++) {
+ -		if (isc_mask & isc_to_isc_bits(isc))
+ -			inti = get_io_int(kvm, isc, schid);
+ -	}
+ -	return inti;
+ -}
+ -
+ -#define SCCB_MASK 0xFFFFFFF8
+ -#define SCCB_EVENT_PENDING 0x3
+ -
+ -static int __inject_service(struct kvm *kvm,
+ -			     struct kvm_s390_interrupt_info *inti)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -
+ -	spin_lock(&fi->lock);
+ -	fi->srv_signal.ext_params |= inti->ext.ext_params & SCCB_EVENT_PENDING;
+ -	/*
+ -	 * Early versions of the QEMU s390 bios will inject several
+ -	 * service interrupts after another without handling a
+ -	 * condition code indicating busy.
+ -	 * We will silently ignore those superfluous sccb values.
+ -	 * A future version of QEMU will take care of serialization
+ -	 * of servc requests
+ -	 */
+ -	if (fi->srv_signal.ext_params & SCCB_MASK)
+ -		goto out;
+ -	fi->srv_signal.ext_params |= inti->ext.ext_params & SCCB_MASK;
+ -	set_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
+ -out:
+ -	spin_unlock(&fi->lock);
+ -	kfree(inti);
+ -	return 0;
+ -}
+ -
+ -static int __inject_virtio(struct kvm *kvm,
+ -			    struct kvm_s390_interrupt_info *inti)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -
+ -	spin_lock(&fi->lock);
+ -	if (fi->counters[FIRQ_CNTR_VIRTIO] >= KVM_S390_MAX_VIRTIO_IRQS) {
+ -		spin_unlock(&fi->lock);
+ -		return -EBUSY;
+ -	}
+ -	fi->counters[FIRQ_CNTR_VIRTIO] += 1;
+ -	list_add_tail(&inti->list, &fi->lists[FIRQ_LIST_VIRTIO]);
+ -	set_bit(IRQ_PEND_VIRTIO, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -	return 0;
+ -}
+ -
+ -static int __inject_pfault_done(struct kvm *kvm,
+ -				 struct kvm_s390_interrupt_info *inti)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -
+ -	spin_lock(&fi->lock);
+ -	if (fi->counters[FIRQ_CNTR_PFAULT] >=
+ -		(ASYNC_PF_PER_VCPU * KVM_MAX_VCPUS)) {
+ -		spin_unlock(&fi->lock);
+ -		return -EBUSY;
+ -	}
+ -	fi->counters[FIRQ_CNTR_PFAULT] += 1;
+ -	list_add_tail(&inti->list, &fi->lists[FIRQ_LIST_PFAULT]);
+ -	set_bit(IRQ_PEND_PFAULT_DONE, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -	return 0;
+ -}
+ -
+ -#define CR_PENDING_SUBCLASS 28
+ -static int __inject_float_mchk(struct kvm *kvm,
+ -				struct kvm_s390_interrupt_info *inti)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -
+ -	spin_lock(&fi->lock);
+ -	fi->mchk.cr14 |= inti->mchk.cr14 & (1UL << CR_PENDING_SUBCLASS);
+ -	fi->mchk.mcic |= inti->mchk.mcic;
+ -	set_bit(IRQ_PEND_MCHK_REP, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -	kfree(inti);
+ -	return 0;
+ -}
+ -
+ -static int __inject_io(struct kvm *kvm, struct kvm_s390_interrupt_info *inti)
+ -{
+ -	struct kvm_s390_float_interrupt *fi;
+ -	struct list_head *list;
+ -	int isc;
+ -
+ -	fi = &kvm->arch.float_int;
+ -	spin_lock(&fi->lock);
+ -	if (fi->counters[FIRQ_CNTR_IO] >= KVM_S390_MAX_FLOAT_IRQS) {
+ -		spin_unlock(&fi->lock);
+ -		return -EBUSY;
+ -	}
+ -	fi->counters[FIRQ_CNTR_IO] += 1;
+ -
+ -	isc = int_word_to_isc(inti->io.io_int_word);
+ -	list = &fi->lists[FIRQ_LIST_IO_ISC_0 + isc];
+ -	list_add_tail(&inti->list, list);
+ -	set_bit(IRQ_PEND_IO_ISC_0 + isc, &fi->pending_irqs);
+ -	spin_unlock(&fi->lock);
+ -	return 0;
+ -}
+ -
+ -/*
+ - * Find a destination VCPU for a floating irq and kick it.
+ - */
+ -static void __floating_irq_kick(struct kvm *kvm, u64 type)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -	struct kvm_s390_local_interrupt *li;
+ -	struct kvm_vcpu *dst_vcpu;
+ -	int sigcpu, online_vcpus, nr_tries = 0;
+ -
+ -	online_vcpus = atomic_read(&kvm->online_vcpus);
+ -	if (!online_vcpus)
+ -		return;
+ -
+ -	/* find idle VCPUs first, then round robin */
+ -	sigcpu = find_first_bit(fi->idle_mask, online_vcpus);
+ -	if (sigcpu == online_vcpus) {
+ -		do {
+ -			sigcpu = fi->next_rr_cpu;
+ -			fi->next_rr_cpu = (fi->next_rr_cpu + 1) % online_vcpus;
+ -			/* avoid endless loops if all vcpus are stopped */
+ -			if (nr_tries++ >= online_vcpus)
+ -				return;
+ -		} while (is_vcpu_stopped(kvm_get_vcpu(kvm, sigcpu)));
+ -	}
+ -	dst_vcpu = kvm_get_vcpu(kvm, sigcpu);
+ -
+ -	/* make the VCPU drop out of the SIE, or wake it up if sleeping */
+ -	li = &dst_vcpu->arch.local_int;
+ -	spin_lock(&li->lock);
+ -	switch (type) {
+ -	case KVM_S390_MCHK:
+ -		atomic_or(CPUSTAT_STOP_INT, li->cpuflags);
+ -		break;
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -		atomic_or(CPUSTAT_IO_INT, li->cpuflags);
+ -		break;
+ -	default:
+ -		atomic_or(CPUSTAT_EXT_INT, li->cpuflags);
+ -		break;
+ -	}
+ -	spin_unlock(&li->lock);
+ -	kvm_s390_vcpu_wakeup(dst_vcpu);
+ -}
+ -
+ -static int __inject_vm(struct kvm *kvm, struct kvm_s390_interrupt_info *inti)
+ -{
+ -	u64 type = READ_ONCE(inti->type);
+ -	int rc;
+ -
+ -	switch (type) {
+ -	case KVM_S390_MCHK:
+ -		rc = __inject_float_mchk(kvm, inti);
+ -		break;
+ -	case KVM_S390_INT_VIRTIO:
+ -		rc = __inject_virtio(kvm, inti);
+ -		break;
+ -	case KVM_S390_INT_SERVICE:
+ -		rc = __inject_service(kvm, inti);
+ -		break;
+ -	case KVM_S390_INT_PFAULT_DONE:
+ -		rc = __inject_pfault_done(kvm, inti);
+ -		break;
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -		rc = __inject_io(kvm, inti);
+ -		break;
+ -	default:
+ -		rc = -EINVAL;
+ -	}
+ -	if (rc)
+ -		return rc;
+ -
+ -	__floating_irq_kick(kvm, type);
+ -	return 0;
+ -}
+ -
+ -int kvm_s390_inject_vm(struct kvm *kvm,
+ -		       struct kvm_s390_interrupt *s390int)
+ -{
+ -	struct kvm_s390_interrupt_info *inti;
+ -	int rc;
+ -
+ -	inti = kzalloc(sizeof(*inti), GFP_KERNEL);
+ -	if (!inti)
+ -		return -ENOMEM;
+ -
+ -	inti->type = s390int->type;
+ -	switch (inti->type) {
+ -	case KVM_S390_INT_VIRTIO:
+ -		VM_EVENT(kvm, 5, "inject: virtio parm:%x,parm64:%llx",
+ -			 s390int->parm, s390int->parm64);
+ -		inti->ext.ext_params = s390int->parm;
+ -		inti->ext.ext_params2 = s390int->parm64;
+ -		break;
+ -	case KVM_S390_INT_SERVICE:
+ -		VM_EVENT(kvm, 4, "inject: sclp parm:%x", s390int->parm);
+ -		inti->ext.ext_params = s390int->parm;
+ -		break;
+ -	case KVM_S390_INT_PFAULT_DONE:
+ -		inti->ext.ext_params2 = s390int->parm64;
+ -		break;
+ -	case KVM_S390_MCHK:
+ -		VM_EVENT(kvm, 3, "inject: machine check mcic 0x%llx",
+ -			 s390int->parm64);
+ -		inti->mchk.cr14 = s390int->parm; /* upper bits are not used */
+ -		inti->mchk.mcic = s390int->parm64;
+ -		break;
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -		if (inti->type & KVM_S390_INT_IO_AI_MASK)
+ -			VM_EVENT(kvm, 5, "%s", "inject: I/O (AI)");
+ -		else
+ -			VM_EVENT(kvm, 5, "inject: I/O css %x ss %x schid %04x",
+ -				 s390int->type & IOINT_CSSID_MASK,
+ -				 s390int->type & IOINT_SSID_MASK,
+ -				 s390int->type & IOINT_SCHID_MASK);
+ -		inti->io.subchannel_id = s390int->parm >> 16;
+ -		inti->io.subchannel_nr = s390int->parm & 0x0000ffffu;
+ -		inti->io.io_int_parm = s390int->parm64 >> 32;
+ -		inti->io.io_int_word = s390int->parm64 & 0x00000000ffffffffull;
+ -		break;
+ -	default:
+ -		kfree(inti);
+ -		return -EINVAL;
+ -	}
+ -	trace_kvm_s390_inject_vm(s390int->type, s390int->parm, s390int->parm64,
+ -				 2);
+ -
+ -	rc = __inject_vm(kvm, inti);
+ -	if (rc)
+ -		kfree(inti);
+ -	return rc;
+ -}
+ -
+ -int kvm_s390_reinject_io_int(struct kvm *kvm,
+ -			      struct kvm_s390_interrupt_info *inti)
+ -{
+ -	return __inject_vm(kvm, inti);
+ -}
+ -
+ -int s390int_to_s390irq(struct kvm_s390_interrupt *s390int,
+ -		       struct kvm_s390_irq *irq)
+ -{
+ -	irq->type = s390int->type;
+ -	switch (irq->type) {
+ -	case KVM_S390_PROGRAM_INT:
+ -		if (s390int->parm & 0xffff0000)
+ -			return -EINVAL;
+ -		irq->u.pgm.code = s390int->parm;
+ -		break;
+ -	case KVM_S390_SIGP_SET_PREFIX:
+ -		irq->u.prefix.address = s390int->parm;
+ -		break;
+ -	case KVM_S390_SIGP_STOP:
+ -		irq->u.stop.flags = s390int->parm;
+ -		break;
+ -	case KVM_S390_INT_EXTERNAL_CALL:
+ -		if (s390int->parm & 0xffff0000)
+ -			return -EINVAL;
+ -		irq->u.extcall.code = s390int->parm;
+ -		break;
+ -	case KVM_S390_INT_EMERGENCY:
+ -		if (s390int->parm & 0xffff0000)
+ -			return -EINVAL;
+ -		irq->u.emerg.code = s390int->parm;
+ -		break;
+ -	case KVM_S390_MCHK:
+ -		irq->u.mchk.mcic = s390int->parm64;
+ -		break;
+ -	}
+ -	return 0;
+ -}
+ -
+ -int kvm_s390_is_stop_irq_pending(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	return test_bit(IRQ_PEND_SIGP_STOP, &li->pending_irqs);
+ -}
+ -
+ -void kvm_s390_clear_stop_irq(struct kvm_vcpu *vcpu)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -
+ -	spin_lock(&li->lock);
+ -	li->irq.stop.flags = 0;
+ -	clear_bit(IRQ_PEND_SIGP_STOP, &li->pending_irqs);
+ -	spin_unlock(&li->lock);
+ -}
+ -
+ -static int do_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	int rc;
+ -
+ -	switch (irq->type) {
+ -	case KVM_S390_PROGRAM_INT:
+ -		rc = __inject_prog(vcpu, irq);
+ -		break;
+ -	case KVM_S390_SIGP_SET_PREFIX:
+ -		rc = __inject_set_prefix(vcpu, irq);
+ -		break;
+ -	case KVM_S390_SIGP_STOP:
+ -		rc = __inject_sigp_stop(vcpu, irq);
+ -		break;
+ -	case KVM_S390_RESTART:
+ -		rc = __inject_sigp_restart(vcpu, irq);
+ -		break;
+ -	case KVM_S390_INT_CLOCK_COMP:
+ -		rc = __inject_ckc(vcpu);
+ -		break;
+ -	case KVM_S390_INT_CPU_TIMER:
+ -		rc = __inject_cpu_timer(vcpu);
+ -		break;
+ -	case KVM_S390_INT_EXTERNAL_CALL:
+ -		rc = __inject_extcall(vcpu, irq);
+ -		break;
+ -	case KVM_S390_INT_EMERGENCY:
+ -		rc = __inject_sigp_emergency(vcpu, irq);
+ -		break;
+ -	case KVM_S390_MCHK:
+ -		rc = __inject_mchk(vcpu, irq);
+ -		break;
+ -	case KVM_S390_INT_PFAULT_INIT:
+ -		rc = __inject_pfault_init(vcpu, irq);
+ -		break;
+ -	case KVM_S390_INT_VIRTIO:
+ -	case KVM_S390_INT_SERVICE:
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -	default:
+ -		rc = -EINVAL;
+ -	}
+ -
+ -	return rc;
+ -}
+ -
+ -int kvm_s390_inject_vcpu(struct kvm_vcpu *vcpu, struct kvm_s390_irq *irq)
+ -{
+ -	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+ -	int rc;
+ -
+ -	spin_lock(&li->lock);
+ -	rc = do_inject_vcpu(vcpu, irq);
+ -	spin_unlock(&li->lock);
+ -	if (!rc)
+ -		kvm_s390_vcpu_wakeup(vcpu);
+ -	return rc;
+ -}
+ -
+ -static inline void clear_irq_list(struct list_head *_list)
+ -{
+ -	struct kvm_s390_interrupt_info *inti, *n;
+ -
+ -	list_for_each_entry_safe(inti, n, _list, list) {
+ -		list_del(&inti->list);
+ -		kfree(inti);
+ -	}
+ -}
+ -
+ -static void inti_to_irq(struct kvm_s390_interrupt_info *inti,
+ -		       struct kvm_s390_irq *irq)
+ -{
+ -	irq->type = inti->type;
+ -	switch (inti->type) {
+ -	case KVM_S390_INT_PFAULT_INIT:
+ -	case KVM_S390_INT_PFAULT_DONE:
+ -	case KVM_S390_INT_VIRTIO:
+ -		irq->u.ext = inti->ext;
+ -		break;
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -		irq->u.io = inti->io;
+ -		break;
+ -	}
+ -}
+ -
+ -void kvm_s390_clear_float_irqs(struct kvm *kvm)
+ -{
+ -	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ -	int i;
+ -
+ -	spin_lock(&fi->lock);
+ -	fi->pending_irqs = 0;
+ -	memset(&fi->srv_signal, 0, sizeof(fi->srv_signal));
+ -	memset(&fi->mchk, 0, sizeof(fi->mchk));
+ -	for (i = 0; i < FIRQ_LIST_COUNT; i++)
+ -		clear_irq_list(&fi->lists[i]);
+ -	for (i = 0; i < FIRQ_MAX_COUNT; i++)
+ -		fi->counters[i] = 0;
+ -	spin_unlock(&fi->lock);
+ -};
+ -
+ -static int get_all_floating_irqs(struct kvm *kvm, u8 __user *usrbuf, u64 len)
+ -{
+ -	struct kvm_s390_interrupt_info *inti;
+ -	struct kvm_s390_float_interrupt *fi;
+ -	struct kvm_s390_irq *buf;
+ -	struct kvm_s390_irq *irq;
+ -	int max_irqs;
+ -	int ret = 0;
+ -	int n = 0;
+ -	int i;
+ -
+ -	if (len > KVM_S390_FLIC_MAX_BUFFER || len == 0)
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * We are already using -ENOMEM to signal
+ -	 * userspace it may retry with a bigger buffer,
+ -	 * so we need to use something else for this case
+ -	 */
+ -	buf = vzalloc(len);
+ -	if (!buf)
+ -		return -ENOBUFS;
+ -
+ -	max_irqs = len / sizeof(struct kvm_s390_irq);
+ -
+ -	fi = &kvm->arch.float_int;
+ -	spin_lock(&fi->lock);
+ -	for (i = 0; i < FIRQ_LIST_COUNT; i++) {
+ -		list_for_each_entry(inti, &fi->lists[i], list) {
+ -			if (n == max_irqs) {
+ -				/* signal userspace to try again */
+ -				ret = -ENOMEM;
+ -				goto out;
+ -			}
+ -			inti_to_irq(inti, &buf[n]);
+ -			n++;
+ -		}
+ -	}
+ -	if (test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs)) {
+ -		if (n == max_irqs) {
+ -			/* signal userspace to try again */
+ -			ret = -ENOMEM;
+ -			goto out;
+ -		}
+ -		irq = (struct kvm_s390_irq *) &buf[n];
+ -		irq->type = KVM_S390_INT_SERVICE;
+ -		irq->u.ext = fi->srv_signal;
+ -		n++;
+ -	}
+ -	if (test_bit(IRQ_PEND_MCHK_REP, &fi->pending_irqs)) {
+ -		if (n == max_irqs) {
+ -				/* signal userspace to try again */
+ -				ret = -ENOMEM;
+ -				goto out;
+ -		}
+ -		irq = (struct kvm_s390_irq *) &buf[n];
+ -		irq->type = KVM_S390_MCHK;
+ -		irq->u.mchk = fi->mchk;
+ -		n++;
+ -}
+  
+ -out:
+ -	spin_unlock(&fi->lock);
+ -	if (!ret && n > 0) {
+ -		if (copy_to_user(usrbuf, buf, sizeof(struct kvm_s390_irq) * n))
+ -			ret = -EFAULT;
+ -	}
+ -	vfree(buf);
+ +	inti = kzalloc(sizeof(*inti), GFP_KERNEL);
+ +	if (!inti)
+ +		return -ENOMEM;
+ +
+ +	inti->type = KVM_S390_PROGRAM_INT;
+ +	inti->pgm.code = code;
+  
+ -	return ret < 0 ? ret : n;
+ +	VCPU_EVENT(vcpu, 3, "inject: program check %d (from kernel)", code);
+ +	trace_kvm_s390_inject_vcpu(vcpu->vcpu_id, inti->type, code, 0, 1);
+ +	spin_lock_bh(&li->lock);
+ +	list_add(&inti->list, &li->list);
+ +	atomic_set(&li->active, 1);
+ +	BUG_ON(waitqueue_active(li->wq));
+ +	spin_unlock_bh(&li->lock);
+ +	return 0;
+  }
+  
+ -static int flic_get_attr(struct kvm_device *dev, struct kvm_device_attr *attr)
+ +struct kvm_s390_interrupt_info *kvm_s390_get_io_int(struct kvm *kvm,
+ +						    u64 cr6, u64 schid)
+  {
+ -	int r;
+ +	struct kvm_s390_float_interrupt *fi;
+ +	struct kvm_s390_interrupt_info *inti, *iter;
+  
+ -	switch (attr->group) {
+ -	case KVM_DEV_FLIC_GET_ALL_IRQS:
+ -		r = get_all_floating_irqs(dev->kvm, (u8 __user *) attr->addr,
+ -					  attr->attr);
+ +	if ((!schid && !cr6) || (schid && cr6))
+ +		return NULL;
+ +	mutex_lock(&kvm->lock);
+ +	fi = &kvm->arch.float_int;
+ +	spin_lock(&fi->lock);
+ +	inti = NULL;
+ +	list_for_each_entry(iter, &fi->list, list) {
+ +		if (!is_ioint(iter->type))
+ +			continue;
+ +		if (cr6 &&
+ +		    ((cr6 & int_word_to_isc_bits(iter->io.io_int_word)) == 0))
+ +			continue;
+ +		if (schid) {
+ +			if (((schid & 0x00000000ffff0000) >> 16) !=
+ +			    iter->io.subchannel_id)
+ +				continue;
+ +			if ((schid & 0x000000000000ffff) !=
+ +			    iter->io.subchannel_nr)
+ +				continue;
+ +		}
+ +		inti = iter;
+  		break;
+ -	default:
+ -		r = -EINVAL;
+  	}
+ -
+ -	return r;
+ +	if (inti)
+ +		list_del_init(&inti->list);
+ +	if (list_empty(&fi->list))
+ +		atomic_set(&fi->active, 0);
+ +	spin_unlock(&fi->lock);
+ +	mutex_unlock(&kvm->lock);
+ +	return inti;
+  }
+  
+ -static inline int copy_irq_from_user(struct kvm_s390_interrupt_info *inti,
+ -				     u64 addr)
+ +int kvm_s390_inject_vm(struct kvm *kvm,
+ +		       struct kvm_s390_interrupt *s390int)
+  {
+ -	struct kvm_s390_irq __user *uptr = (struct kvm_s390_irq __user *) addr;
+ -	void *target = NULL;
+ -	void __user *source;
+ -	u64 size;
+ +	struct kvm_s390_local_interrupt *li;
+ +	struct kvm_s390_float_interrupt *fi;
+ +	struct kvm_s390_interrupt_info *inti, *iter;
+ +	int sigcpu;
+  
+ -	if (get_user(inti->type, (u64 __user *)addr))
+ -		return -EFAULT;
+ +	inti = kzalloc(sizeof(*inti), GFP_KERNEL);
+ +	if (!inti)
+ +		return -ENOMEM;
+  
+ -	switch (inti->type) {
+ -	case KVM_S390_INT_PFAULT_INIT:
+ -	case KVM_S390_INT_PFAULT_DONE:
+ +	switch (s390int->type) {
+  	case KVM_S390_INT_VIRTIO:
+ -	case KVM_S390_INT_SERVICE:
+ -		target = (void *) &inti->ext;
+ -		source = &uptr->u.ext;
+ -		size = sizeof(inti->ext);
+ +		VM_EVENT(kvm, 5, "inject: virtio parm:%x,parm64:%llx",
+ +			 s390int->parm, s390int->parm64);
+ +		inti->type = s390int->type;
+ +		inti->ext.ext_params = s390int->parm;
+ +		inti->ext.ext_params2 = s390int->parm64;
+  		break;
+ -	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ -		target = (void *) &inti->io;
+ -		source = &uptr->u.io;
+ -		size = sizeof(inti->io);
+ +	case KVM_S390_INT_SERVICE:
+ +		VM_EVENT(kvm, 5, "inject: sclp parm:%x", s390int->parm);
+ +		inti->type = s390int->type;
+ +		inti->ext.ext_params = s390int->parm;
+  		break;
+ +	case KVM_S390_PROGRAM_INT:
+ +	case KVM_S390_SIGP_STOP:
+ +	case KVM_S390_INT_EXTERNAL_CALL:
+ +	case KVM_S390_INT_EMERGENCY:
+ +		kfree(inti);
+ +		return -EINVAL;
+  	case KVM_S390_MCHK:
+ -		target = (void *) &inti->mchk;
+ -		source = &uptr->u.mchk;
+ -		size = sizeof(inti->mchk);
+ +		VM_EVENT(kvm, 5, "inject: machine check parm64:%llx",
+ +			 s390int->parm64);
+ +		inti->type = s390int->type;
+ +		inti->mchk.cr14 = s390int->parm; /* upper bits are not used */
+ +		inti->mchk.mcic = s390int->parm64;
+ +		break;
+ +	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ +		if (s390int->type & IOINT_AI_MASK)
+ +			VM_EVENT(kvm, 5, "%s", "inject: I/O (AI)");
+ +		else
+ +			VM_EVENT(kvm, 5, "inject: I/O css %x ss %x schid %04x",
+ +				 s390int->type & IOINT_CSSID_MASK,
+ +				 s390int->type & IOINT_SSID_MASK,
+ +				 s390int->type & IOINT_SCHID_MASK);
+ +		inti->type = s390int->type;
+ +		inti->io.subchannel_id = s390int->parm >> 16;
+ +		inti->io.subchannel_nr = s390int->parm & 0x0000ffffu;
+ +		inti->io.io_int_parm = s390int->parm64 >> 32;
+ +		inti->io.io_int_word = s390int->parm64 & 0x00000000ffffffffull;
+  		break;
+  	default:
+ +		kfree(inti);
+  		return -EINVAL;
+  	}
+ +	trace_kvm_s390_inject_vm(s390int->type, s390int->parm, s390int->parm64,
+ +				 2);
+  
+ -	if (copy_from_user(target, source, size))
+ -		return -EFAULT;
+ -
+ -	return 0;
+ -}
+ -
+ -static int enqueue_floating_irq(struct kvm_device *dev,
+ -				struct kvm_device_attr *attr)
+ -{
+ -	struct kvm_s390_interrupt_info *inti = NULL;
+ -	int r = 0;
+ -	int len = attr->attr;
+ -
+ -	if (len % sizeof(struct kvm_s390_irq) != 0)
+ -		return -EINVAL;
+ -	else if (len > KVM_S390_FLIC_MAX_BUFFER)
+ -		return -EINVAL;
+ -
+ -	while (len >= sizeof(struct kvm_s390_irq)) {
+ -		inti = kzalloc(sizeof(*inti), GFP_KERNEL);
+ -		if (!inti)
+ -			return -ENOMEM;
+ -
+ -		r = copy_irq_from_user(inti, attr->addr);
+ -		if (r) {
+ -			kfree(inti);
+ -			return r;
+ -		}
+ -		r = __inject_vm(dev->kvm, inti);
+ -		if (r) {
+ -			kfree(inti);
+ -			return r;
+ +	mutex_lock(&kvm->lock);
+ +	fi = &kvm->arch.float_int;
+ +	spin_lock(&fi->lock);
+ +	if (!is_ioint(inti->type))
+ +		list_add_tail(&inti->list, &fi->list);
+ +	else {
+ +		u64 isc_bits = int_word_to_isc_bits(inti->io.io_int_word);
+ +
+ +		/* Keep I/O interrupts sorted in isc order. */
+ +		list_for_each_entry(iter, &fi->list, list) {
+ +			if (!is_ioint(iter->type))
+ +				continue;
+ +			if (int_word_to_isc_bits(iter->io.io_int_word)
+ +			    <= isc_bits)
+ +				continue;
+ +			break;
+  		}
+ -		len -= sizeof(struct kvm_s390_irq);
+ -		attr->addr += sizeof(struct kvm_s390_irq);
+ +		list_add_tail(&inti->list, &iter->list);
+  	}
+ -
+ -	return r;
+ -}
+ -
+ -static struct s390_io_adapter *get_io_adapter(struct kvm *kvm, unsigned int id)
+ -{
+ -	if (id >= MAX_S390_IO_ADAPTERS)
+ -		return NULL;
+ -	return kvm->arch.adapters[id];
+ -}
+ -
+ -static int register_io_adapter(struct kvm_device *dev,
+ -			       struct kvm_device_attr *attr)
+ -{
+ -	struct s390_io_adapter *adapter;
+ -	struct kvm_s390_io_adapter adapter_info;
+ -
+ -	if (copy_from_user(&adapter_info,
+ -			   (void __user *)attr->addr, sizeof(adapter_info)))
+ -		return -EFAULT;
+ -
+ -	if ((adapter_info.id >= MAX_S390_IO_ADAPTERS) ||
+ -	    (dev->kvm->arch.adapters[adapter_info.id] != NULL))
+ -		return -EINVAL;
+ -
+ -	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
+ -	if (!adapter)
+ -		return -ENOMEM;
+ -
+ -	INIT_LIST_HEAD(&adapter->maps);
+ -	init_rwsem(&adapter->maps_lock);
+ -	atomic_set(&adapter->nr_maps, 0);
+ -	adapter->id = adapter_info.id;
+ -	adapter->isc = adapter_info.isc;
+ -	adapter->maskable = adapter_info.maskable;
+ -	adapter->masked = false;
+ -	adapter->swap = adapter_info.swap;
+ -	dev->kvm->arch.adapters[adapter->id] = adapter;
+ -
+ +	atomic_set(&fi->active, 1);
+ +	sigcpu = find_first_bit(fi->idle_mask, KVM_MAX_VCPUS);
+ +	if (sigcpu == KVM_MAX_VCPUS) {
+ +		do {
+ +			sigcpu = fi->next_rr_cpu++;
+ +			if (sigcpu == KVM_MAX_VCPUS)
+ +				sigcpu = fi->next_rr_cpu = 0;
+ +		} while (fi->local_int[sigcpu] == NULL);
+ +	}
+ +	li = fi->local_int[sigcpu];
+ +	spin_lock_bh(&li->lock);
+ +	atomic_set_mask(CPUSTAT_EXT_INT, li->cpuflags);
+ +	if (waitqueue_active(li->wq))
+ +		wake_up_interruptible(li->wq);
+ +	spin_unlock_bh(&li->lock);
+ +	spin_unlock(&fi->lock);
+ +	mutex_unlock(&kvm->lock);
+  	return 0;
+  }
+  
+diff --cc arch/x86/kvm/lapic.c
+index 7dda91466410,3a045f39ed81..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1264,6 -1181,36 +1264,39 @@@ static void update_divide_count(struct 
+  				   apic->divide_count);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void apic_update_lvtt(struct kvm_lapic *apic)
++ {
++ 	u32 timer_mode = kvm_apic_get_reg(apic, APIC_LVTT) &
++ 			apic->lapic_timer.timer_mode_mask;
++ 
++ 	if (apic->lapic_timer.timer_mode != timer_mode) {
++ 		apic->lapic_timer.timer_mode = timer_mode;
++ 		hrtimer_cancel(&apic->lapic_timer.timer);
++ 	}
++ }
++ 
++ static void apic_timer_expired(struct kvm_lapic *apic)
++ {
++ 	struct kvm_vcpu *vcpu = apic->vcpu;
++ 	struct swait_queue_head *q = &vcpu->wq;
++ 	struct kvm_timer *ktimer = &apic->lapic_timer;
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	atomic_inc(&apic->lapic_timer.pending);
++ 	kvm_set_pending_timer(vcpu);
++ 
++ 	if (swait_active(q))
++ 		swake_up(q);
++ 
++ 	if (apic_lvtt_tscdeadline(apic))
++ 		ktimer->expired_tscdeadline = ktimer->tscdeadline;
++ }
++ 
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  /*
+   * On APICv, this test will cause a busy wait
+   * during a higher-priority task.
+diff --cc virt/kvm/kvm_main.c
+index 7b5d2dcd7b53,f8417d09a56d..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -2143,13 -2048,18 +2142,19 @@@ out
+  EXPORT_SYMBOL_GPL(kvm_vcpu_block);
+  
+  #ifndef CONFIG_S390
+ -/*
+ - * Kick a sleeping VCPU, or a guest VCPU in guest mode, into host kernel mode.
+ - */
+ -void kvm_vcpu_kick(struct kvm_vcpu *vcpu)
+ +void kvm_vcpu_wake_up(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	wait_queue_head_t *wqp;
+++=======
++ 	int me;
++ 	int cpu = vcpu->cpu;
++ 	struct swait_queue_head *wqp;
+++>>>>>>> 8577370fb0cb (KVM: Use simple waitqueue for vcpu->wq)
+  
+  	wqp = kvm_arch_vcpu_wq(vcpu);
+- 	if (waitqueue_active(wqp)) {
+- 		wake_up_interruptible(wqp);
++ 	if (swait_active(wqp)) {
++ 		swake_up(wqp);
+  		++vcpu->stat.halt_wakeup;
+  	}
+  
+* Unmerged path arch/mips/kvm/mips.c
+* Unmerged path arch/arm/kvm/arm.c
+* Unmerged path arch/arm/kvm/psci.c
+* Unmerged path arch/mips/kvm/mips.c
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+* Unmerged path arch/s390/include/asm/kvm_host.h
+* Unmerged path arch/s390/kvm/interrupt.c
+* Unmerged path arch/x86/kvm/lapic.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index bafcb41336f3..a0c6bd7c3417 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -25,6 +25,7 @@
+ #include <linux/irqflags.h>
+ #include <linux/context_tracking.h>
+ #include <linux/irqbypass.h>
++#include <linux/swait.h>
+ #include <asm/signal.h>
+ 
+ #include <linux/kvm.h>
+@@ -248,7 +249,7 @@ struct kvm_vcpu {
+ 	int fpu_active;
+ 	int guest_fpu_loaded, guest_xcr0_loaded;
+ 	unsigned char fpu_counter;
+-	wait_queue_head_t wq;
++	struct swait_queue_head wq;
+ 	struct pid *pid;
+ 	int sigset_active;
+ 	sigset_t sigset;
+@@ -793,7 +794,7 @@ static inline bool kvm_arch_has_assigned_device(struct kvm *kvm)
+ }
+ #endif
+ 
+-static inline wait_queue_head_t *kvm_arch_vcpu_wq(struct kvm_vcpu *vcpu)
++static inline struct swait_queue_head *kvm_arch_vcpu_wq(struct kvm_vcpu *vcpu)
+ {
+ #ifdef __KVM_HAVE_ARCH_WQP
+ 	return vcpu->arch.wqp;
+diff --git a/virt/kvm/async_pf.c b/virt/kvm/async_pf.c
+index d1ed9e7b49f6..91a90933b04a 100644
+--- a/virt/kvm/async_pf.c
++++ b/virt/kvm/async_pf.c
+@@ -98,8 +98,8 @@ static void async_pf_execute(struct work_struct *work)
+ 	 * This memory barrier pairs with prepare_to_wait's set_current_state()
+ 	 */
+ 	smp_mb();
+-	if (waitqueue_active(&vcpu->wq))
+-		wake_up_interruptible(&vcpu->wq);
++	if (swait_active(&vcpu->wq))
++		swake_up(&vcpu->wq);
+ 
+ 	mmput(mm);
+ 	kvm_put_kvm(vcpu->kvm);
+* Unmerged path virt/kvm/kvm_main.c
