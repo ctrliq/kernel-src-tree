@@ -1,0 +1,173 @@
+powerpc/opal: Wake up kopald polling thread before waiting for events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] opal: Wake up kopald polling thread before waiting for events (Gustavo Duarte) [1577105]
+Rebuild_FUZZ: 93.85%
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit a203658b5ed37c11e5016d3fbbbab9ce018c1b78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a203658b.failed
+
+On some environments (prototype machines, some simulators, etc...)
+there is no functional interrupt source to signal completion, so
+we rely on the fairly slow OPAL heartbeat.
+
+In a number of cases, the calls complete very quickly or even
+immediately. We've observed that it helps a lot to wakeup the OPAL
+heartbeat thread before waiting for event in those cases, it will
+call OPAL immediately to collect completions for anything that
+finished fast enough.
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Acked-By: Michael Neuling <mikey@neuling.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit a203658b5ed37c11e5016d3fbbbab9ce018c1b78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/opal.c
+diff --cc arch/powerpc/platforms/powernv/opal.c
+index 20dc06f5b2a8,da40d6bdb0e6..000000000000
+--- a/arch/powerpc/platforms/powernv/opal.c
++++ b/arch/powerpc/platforms/powernv/opal.c
+@@@ -53,15 -53,9 +53,16 @@@ static int mc_recoverable_range_len
+  
+  struct device_node *opal_node;
+  static DEFINE_SPINLOCK(opal_write_lock);
+ +extern u64 opal_mc_secondary_handler[];
+ +static unsigned int *opal_irqs;
+ +static unsigned int opal_irq_count;
+ +static ATOMIC_NOTIFIER_HEAD(opal_notifier_head);
+  static struct atomic_notifier_head opal_msg_notifier_head[OPAL_MSG_TYPE_MAX];
+ +static DEFINE_SPINLOCK(opal_notifier_lock);
+ +static uint64_t last_notified_mask = 0x0ul;
+ +static atomic_t opal_notifier_hold = ATOMIC_INIT(0);
+  static uint32_t opal_heartbeat;
++ static struct task_struct *kopald_tsk;
+  
+  static void opal_reinit_cores(void)
+  {
+@@@ -735,13 -644,25 +736,25 @@@ static void opal_pdev_init(struct devic
+  			of_platform_device_create(np, NULL, NULL);
+  }
+  
+ -static void opal_i2c_create_devs(void)
+ -{
+ -	struct device_node *np;
+ -
+ -	for_each_compatible_node(np, NULL, "ibm,opal-i2c")
+ -		of_platform_device_create(np, NULL, NULL);
+ -}
+ -
+  static int kopald(void *unused)
+  {
+++<<<<<<< HEAD
+ +	set_freezable();
+ +	do {
+ +		try_to_freeze();
+ +		opal_poll_events(NULL);
+ +		msleep_interruptible(opal_heartbeat);
+++=======
++ 	unsigned long timeout = msecs_to_jiffies(opal_heartbeat) + 1;
++ 	__be64 events;
++ 
++ 	set_freezable();
++ 	do {
++ 		try_to_freeze();
++ 		opal_poll_events(&events);
++ 		opal_handle_events(be64_to_cpu(events));
++ 		schedule_timeout_interruptible(timeout);
+++>>>>>>> a203658b5ed3 (powerpc/opal: Wake up kopald polling thread before waiting for events)
+  	} while (!kthread_should_stop());
+  
+  	return 0;
+@@@ -755,56 -682,9 +774,56 @@@ static void opal_init_heartbeat(void
+  		opal_heartbeat = 0;
+  
+  	if (opal_heartbeat)
+- 		kthread_run(kopald, NULL, "kopald");
++ 		kopald_tsk = kthread_run(kopald, NULL, "kopald");
+  }
+  
+ +static void opal_i2c_create_devs(void)
+ +{
+ +	struct device_node *np;
+ +
+ +	for_each_compatible_node(np, NULL, "ibm,opal-i2c")
+ +		of_platform_device_create(np, NULL, NULL);
+ +}
+ +
+ +static void __init opal_irq_init(struct device_node *dn)
+ +{
+ +	const __be32 *irqs;
+ +	int i, irqlen;
+ +
+ +	/* Get interrupt property */
+ +	irqs = of_get_property(opal_node, "opal-interrupts", &irqlen);
+ +	pr_debug("Found %d interrupts reserved for OPAL\n",
+ +		 irqs ? (irqlen / 4) : 0);
+ +
+ +	/* Install interrupt handlers */
+ +	opal_irq_count = irqlen / 4;
+ +	opal_irqs = kzalloc(opal_irq_count * sizeof(unsigned int), GFP_KERNEL);
+ +	for (i = 0; irqs && i < opal_irq_count; i++, irqs++) {
+ +		unsigned int irq, virq;
+ +		int rc;
+ +
+ +		/* Get hardware and virtual IRQ */
+ +		irq = be32_to_cpup(irqs);
+ +		virq = irq_create_mapping(NULL, irq);
+ +		if (virq == NO_IRQ) {
+ +			pr_warn("Failed to map irq 0x%x\n", irq);
+ +			continue;
+ +		}
+ +
+ +		/* Install interrupt handler */
+ +		rc = request_irq(virq, opal_interrupt, 0, "opal", NULL);
+ +		if (rc) {
+ +			irq_dispose_mapping(virq);
+ +			pr_warn("Error %d requesting irq %d (0x%x)\n",
+ +				 rc, virq, irq);
+ +			continue;
+ +		}
+ +
+ +		/* Cache IRQ */
+ +		opal_irqs[i] = virq;
+ +	}
+ +}
+ +
+  static int __init opal_init(void)
+  {
+  	struct device_node *np, *consoles, *leds;
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index b2af73d0b7ad..9500ff5e29ba 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -1283,6 +1283,8 @@ enum {
+ 	OPAL_PCI_TCE_KILL_ALL,
+ };
+ 
++void opal_wake_poller(void);
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* __OPAL_H */
+diff --git a/arch/powerpc/platforms/powernv/opal-async.c b/arch/powerpc/platforms/powernv/opal-async.c
+index 693b6cdac691..5c84212d8cf0 100644
+--- a/arch/powerpc/platforms/powernv/opal-async.c
++++ b/arch/powerpc/platforms/powernv/opal-async.c
+@@ -117,6 +117,11 @@ int opal_async_wait_response(uint64_t token, struct opal_msg *msg)
+ 		return -EINVAL;
+ 	}
+ 
++	/* Wakeup the poller before we wait for events to speed things
++	 * up on platforms or simulators where the interrupts aren't
++	 * functional.
++	 */
++	opal_wake_poller();
+ 	wait_event(opal_async_wait, test_bit(token, opal_async_complete_map));
+ 	memcpy(msg, &opal_async_responses[token], sizeof(*msg));
+ 
+* Unmerged path arch/powerpc/platforms/powernv/opal.c
