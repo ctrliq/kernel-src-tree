@@ -1,0 +1,538 @@
+ipc: allow boot time extension of IPCMNI from 32k to 16M
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [ipc] allow boot time extension of IPCMNI from 32k to 16M (Waiman Long) [1373519]
+Rebuild_FUZZ: 95.33%
+commit-author Waiman Long <longman@redhat.com>
+commit 5ac893b8cb10fe2a47a77780d37f9bf5b142854b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5ac893b8.failed
+
+The maximum number of unique System V IPC identifiers was limited to
+32k.  That limit should be big enough for most use cases.
+
+However, there are some users out there requesting for more, especially
+those that are migrating from Solaris which uses 24 bits for unique
+identifiers.  To satisfy the need of those users, a new boot time kernel
+option "ipcmni_extend" is added to extend the IPCMNI value to 16M.  This
+is a 512X increase which should be big enough for users out there that
+need a large number of unique IPC identifier.
+
+The use of this new option will change the pattern of the IPC
+identifiers returned by functions like shmget(2).  An application that
+depends on such pattern may not work properly.  So it should only be
+used if the users really need more than 32k of unique IPC numbers.
+
+This new option does have the side effect of reducing the maximum number
+of unique sequence numbers from 64k down to 128.  So it is a trade-off.
+
+The computation of a new IPC id is not done in the performance critical
+path.  So a little bit of additional overhead shouldn't have any real
+performance impact.
+
+Link: http://lkml.kernel.org/r/20190329204930.21620-1-longman@redhat.com
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Acked-by: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Davidlohr Bueso <dbueso@suse.de>
+	Cc: "Eric W . Biederman" <ebiederm@xmission.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: "Luis R. Rodriguez" <mcgrof@kernel.org>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5ac893b8cb10fe2a47a77780d37f9bf5b142854b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	ipc/util.c
+#	ipc/util.h
+diff --cc Documentation/kernel-parameters.txt
+index 4ee8a23b1fd1,d1d1da911085..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -1414,23 -1830,31 +1414,28 @@@ bytes respectively. Such letter suffixe
+  	ip=		[IP_PNP]
+  			See Documentation/filesystems/nfs/nfsroot.txt.
+  
+++<<<<<<< HEAD:Documentation/kernel-parameters.txt
+ +	ip2=		[HW] Set IO/IRQ pairs for up to 4 IntelliPort boards
+ +			See comment before ip2_setup() in
+ +			drivers/char/ip2/ip2base.c.
+++=======
++ 	ipcmni_extend	[KNL] Extend the maximum number of unique System V
++ 			IPC identifiers from 32,768 to 16,777,216.
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M):Documentation/admin-guide/kernel-parameters.txt
+  
+  	irqaffinity=	[SMP] Set the default irq affinity mask
+ -			The argument is a cpu list, as described above.
+ -
+ -	irqchip.gicv2_force_probe=
+ -			[ARM, ARM64]
+ -			Format: <bool>
+ -			Force the kernel to look for the second 4kB page
+ -			of a GICv2 controller even if the memory range
+ -			exposed by the device tree is too small.
+ -
+ -	irqchip.gicv3_nolpi=
+ -			[ARM, ARM64]
+ -			Force the kernel to ignore the availability of
+ -			LPIs (and by consequence ITSs). Intended for system
+ -			that use the kernel as a bootloader, and thus want
+ -			to let secondary kernels in charge of setting up
+ -			LPIs.
+ -
+ -	irqchip.gicv3_pseudo_nmi= [ARM64]
+ -			Enables support for pseudo-NMIs in the kernel. This
+ -			requires the kernel to be built with
+ -			CONFIG_ARM64_PSEUDO_NMI.
+ +			Format:
+ +			<cpu number>,...,<cpu number>
+ +			or
+ +			<cpu number>-<cpu number>
+ +			or
+ +			drivers
+ +			(must be a positive range in ascending order)
+ +			or a mixture
+ +			<cpu number>,...,<cpu number>-<cpu number>
+ +			drivers will use drivers' affinity masks for
+ +			default interrupt assignment instead of placing them
+ +			all on CPU0.
+  
+  	irqfixup	[HW]
+  			When an interrupt is not handled search all handlers
+diff --cc ipc/util.c
+index 1df75a61612b,cf5d1087409e..000000000000
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@@ -130,30 -97,31 +130,35 @@@ static int __init ipc_init(void
+  }
+  device_initcall(ipc_init);
+  
+ -static const struct rhashtable_params ipc_kht_params = {
+ -	.head_offset		= offsetof(struct kern_ipc_perm, khtnode),
+ -	.key_offset		= offsetof(struct kern_ipc_perm, key),
+ -	.key_len		= FIELD_SIZEOF(struct kern_ipc_perm, key),
+ -	.automatic_shrinking	= true,
+ -};
+ -
+  /**
+ - * ipc_init_ids	- initialise ipc identifiers
+ - * @ids: ipc identifier set
+ + *	ipc_init_ids		-	initialise IPC identifiers
+ + *	@ids: Identifier set
+   *
+++<<<<<<< HEAD
+ + *	Set up the sequence range to use for the ipc identifier range (limited
+ + *	below IPCMNI) then initialise the ids idr.
+++=======
++  * Set up the sequence range to use for the ipc identifier range (limited
++  * below ipc_mni) then initialise the keys hashtable and ids idr.
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+   */
+ + 
+  void ipc_init_ids(struct ipc_ids *ids)
+  {
+ +	init_rwsem(&ids->rwsem);
+ +
+  	ids->in_use = 0;
+  	ids->seq = 0;
+ -	init_rwsem(&ids->rwsem);
+ -	rhashtable_init(&ids->key_ht, &ipc_kht_params);
+ -	idr_init(&ids->ipcs_idr);
+ -	ids->max_idx = -1;
+ -#ifdef CONFIG_CHECKPOINT_RESTORE
+  	ids->next_id = -1;
+ -#endif
+ +	{
+ +		int seq_limit = INT_MAX/SEQ_MULTIPLIER;
+ +		if (seq_limit > USHRT_MAX)
+ +			ids->seq_max = USHRT_MAX;
+ +		 else
+ +		 	ids->seq_max = seq_limit;
+ +	}
+ +
+ +	idr_init(&ids->ipcs_idr);
+  }
+  
+  #ifdef CONFIG_PROC_FS
+@@@ -191,70 -158,75 +196,76 @@@ void __init ipc_init_proc_interface(con
+  #endif
+  
+  /**
+ - * ipc_findkey	- find a key in an ipc identifier set
+ - * @ids: ipc identifier set
+ - * @key: key to find
+ - *
+ - * Returns the locked pointer to the ipc structure if found or NULL
+ - * otherwise. If key is found ipc points to the owning ipc structure
+ - *
+ - * Called with writer ipc_ids.rwsem held.
+ + *	ipc_findkey	-	find a key in an ipc identifier set	
+ + *	@ids: Identifier set
+ + *	@key: The key to find
+ + *	
+ + *	Requires ipc_ids.rwsem locked.
+ + *	Returns the LOCKED pointer to the ipc structure if found or NULL
+ + *	if not.
+ + *	If key is found ipc points to the owning ipc structure
+   */
+ + 
+  static struct kern_ipc_perm *ipc_findkey(struct ipc_ids *ids, key_t key)
+  {
+ -	struct kern_ipc_perm *ipcp;
+ +	struct kern_ipc_perm *ipc;
+ +	int next_id;
+ +	int total;
+  
+ -	ipcp = rhashtable_lookup_fast(&ids->key_ht, &key,
+ -					      ipc_kht_params);
+ -	if (!ipcp)
+ -		return NULL;
+ +	for (total = 0, next_id = 0; total < ids->in_use; next_id++) {
+ +		ipc = idr_find(&ids->ipcs_idr, next_id);
+  
+ -	rcu_read_lock();
+ -	ipc_lock_object(ipcp);
+ -	return ipcp;
+ +		if (ipc == NULL)
+ +			continue;
+ +
+ +		if (ipc->key != key) {
+ +			total++;
+ +			continue;
+ +		}
+ +
+ +		rcu_read_lock();
+ +		ipc_lock_object(ipc);
+ +		return ipc;
+ +	}
+++<<<<<<< HEAD
+ +
+ +	return NULL;
+++=======
+++	if (idx >= 0)
+++		new->id = (new->seq << IPCMNI_SEQ_SHIFT) + idx;
+++	return idx;
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  }
+  
+ -/*
+ - * Insert new IPC object into idr tree, and set sequence number and id
+ - * in the correct order.
+ - * Especially:
+ - * - the sequence number must be set before inserting the object into the idr,
+ - *   because the sequence number is accessed without a lock.
+ - * - the id can/must be set after inserting the object into the idr.
+ - *   All accesses must be done after getting kern_ipc_perm.lock.
+ - *
+ - * The caller must own kern_ipc_perm.lock.of the new object.
+ - * On error, the function returns a (negative) error code.
+ +/**
+ + *	ipc_get_maxid 	-	get the last assigned id
+ + *	@ids: IPC identifier set
+ + *
+ + *	Called with ipc_ids.rwsem held.
+   */
+ -static inline int ipc_idr_alloc(struct ipc_ids *ids, struct kern_ipc_perm *new)
+ +
+ +int ipc_get_maxid(struct ipc_ids *ids)
+  {
+ -	int idx, next_id = -1;
+ +	struct kern_ipc_perm *ipc;
+ +	int max_id = -1;
+ +	int total, id;
+  
+ -#ifdef CONFIG_CHECKPOINT_RESTORE
+ -	next_id = ids->next_id;
+ -	ids->next_id = -1;
+ -#endif
+ +	if (ids->in_use == 0)
+ +		return -1;
+  
+ -	/*
+ -	 * As soon as a new object is inserted into the idr,
+ -	 * ipc_obtain_object_idr() or ipc_obtain_object_check() can find it,
+ -	 * and the lockless preparations for ipc operations can start.
+ -	 * This means especially: permission checks, audit calls, allocation
+ -	 * of undo structures, ...
+ -	 *
+ -	 * Thus the object must be fully initialized, and if something fails,
+ -	 * then the full tear-down sequence must be followed.
+ -	 * (i.e.: set new->deleted, reduce refcount, call_rcu())
+ -	 */
+ +	if (ids->in_use == IPCMNI)
+ +		return IPCMNI - 1;
+  
+ -	if (next_id < 0) { /* !CHECKPOINT_RESTORE or next_id is unset */
+ -		new->seq = ids->seq++;
+ -		if (ids->seq > IPCID_SEQ_MAX)
+ -			ids->seq = 0;
+ -		idx = idr_alloc(&ids->ipcs_idr, new, 0, 0, GFP_NOWAIT);
+ -	} else {
+ -		new->seq = ipcid_to_seqx(next_id);
+ -		idx = idr_alloc(&ids->ipcs_idr, new, ipcid_to_idx(next_id),
+ -				0, GFP_NOWAIT);
+ +	/* Look for the last assigned id */
+ +	total = 0;
+ +	for (id = 0; id < IPCMNI && total < ids->in_use; id++) {
+ +		ipc = idr_find(&ids->ipcs_idr, id);
+ +		if (ipc != NULL) {
+ +			max_id = id;
+ +			total++;
+ +		}
+  	}
+ -	if (idx >= 0)
+ -		new->id = (new->seq << IPCMNI_SEQ_SHIFT) + idx;
+ -	return idx;
+ +	return max_id;
+  }
+  
+  /**
+@@@ -274,13 -248,15 +285,20 @@@ int ipc_addid(struct ipc_ids* ids, stru
+  {
+  	kuid_t euid;
+  	kgid_t egid;
+ -	int idx, err;
+ +	int id;
+ +	int next_id = ids->next_id;
+  
+ -	/* 1) Initialize the refcount so that ipc_rcu_putref works */
+ -	refcount_set(&new->refcount, 1);
+ +	if (size > IPCMNI)
+ +		size = IPCMNI;
+  
+++<<<<<<< HEAD
+ +	if (ids->in_use >= size)
+++=======
++ 	if (limit > ipc_mni)
++ 		limit = ipc_mni;
++ 
++ 	if (ids->in_use >= limit)
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  		return -ENOSPC;
+  
+  	idr_preload(GFP_KERNEL);
+@@@ -819,7 -737,7 +837,11 @@@ static struct kern_ipc_perm *sysvipc_fi
+  	if (total >= ids->in_use)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	for ( ; pos < IPCMNI; pos++) {
+++=======
++ 	for (; pos < ipc_mni; pos++) {
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  		ipc = idr_find(&ids->ipcs_idr, pos);
+  		if (ipc != NULL) {
+  			*new_pos = pos + 1;
+diff --cc ipc/util.h
+index 778c12c8c204,9746886757de..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -12,15 -13,43 +12,41 @@@
+  
+  #include <linux/unistd.h>
+  #include <linux/err.h>
+ -#include <linux/ipc_namespace.h>
+  
+- #define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
+- #define SEQ_MULTIPLIER	(IPCMNI)
++ /*
++  * The IPC ID contains 2 separate numbers - index and sequence number.
++  * By default,
++  *   bits  0-14: index (32k, 15 bits)
++  *   bits 15-30: sequence number (64k, 16 bits)
++  *
++  * When IPCMNI extension mode is turned on, the composition changes:
++  *   bits  0-23: index (16M, 24 bits)
++  *   bits 24-30: sequence number (128, 7 bits)
++  */
++ #define IPCMNI_SHIFT		15
++ #define IPCMNI_EXTEND_SHIFT	24
++ #define IPCMNI			(1 << IPCMNI_SHIFT)
++ #define IPCMNI_EXTEND		(1 << IPCMNI_EXTEND_SHIFT)
++ 
++ #ifdef CONFIG_SYSVIPC_SYSCTL
++ extern int ipc_mni;
++ extern int ipc_mni_shift;
++ 
++ #define IPCMNI_SEQ_SHIFT	ipc_mni_shift
++ #define IPCMNI_IDX_MASK		((1 << ipc_mni_shift) - 1)
++ 
++ #else /* CONFIG_SYSVIPC_SYSCTL */
++ 
++ #define ipc_mni			IPCMNI
++ #define IPCMNI_SEQ_SHIFT	IPCMNI_SHIFT
++ #define IPCMNI_IDX_MASK		((1 << IPCMNI_SHIFT) - 1)
++ #endif /* CONFIG_SYSVIPC_SYSCTL */
+  
+ -void sem_init(void);
+ -void msg_init(void);
+ -void shm_init(void);
+ +void sem_init (void);
+ +void msg_init (void);
+ +void shm_init (void);
+  
+  struct ipc_namespace;
+ -struct pid_namespace;
+  
+  #ifdef CONFIG_POSIX_MQUEUE
+  extern void mq_clear_sbinfo(struct ipc_namespace *ns);
+@@@ -99,8 -122,9 +125,14 @@@ void __init ipc_init_proc_interface(con
+  #define IPC_MSG_IDS	1
+  #define IPC_SHM_IDS	2
+  
+++<<<<<<< HEAD
+ +#define ipcid_to_idx(id) ((id) % SEQ_MULTIPLIER)
+ +#define ipcid_to_seqx(id) ((id) / SEQ_MULTIPLIER)
+++=======
++ #define ipcid_to_idx(id)  ((id) & IPCMNI_IDX_MASK)
++ #define ipcid_to_seqx(id) ((id) >> IPCMNI_SEQ_SHIFT)
++ #define IPCID_SEQ_MAX	  (INT_MAX >> IPCMNI_SEQ_SHIFT)
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  
+  /* must be called with ids->rwsem acquired for writing */
+  int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int);
+@@@ -114,11 -138,22 +146,24 @@@ void ipc_rmid(struct ipc_ids *, struct 
+  /* must be called with ipcp locked */
+  int ipcperms(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp, short flg);
+  
+ -/**
+ - * ipc_get_maxidx - get the highest assigned index
+ - * @ids: ipc identifier set
+ - *
+ - * Called with ipc_ids.rwsem held for reading.
+ +/* for rare, potentially huge allocations.
+ + * both function can sleep
+   */
+++<<<<<<< HEAD
+ +void* ipc_alloc(int size);
+ +void ipc_free(void* ptr, int size);
+++=======
++ static inline int ipc_get_maxidx(struct ipc_ids *ids)
++ {
++ 	if (ids->in_use == 0)
++ 		return -1;
++ 
++ 	if (ids->in_use == ipc_mni)
++ 		return ipc_mni - 1;
++ 
++ 	return ids->max_idx;
++ }
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  
+  /*
+   * For allocation that need to be freed by RCU.
+@@@ -201,7 -236,73 +246,76 @@@ static inline bool ipc_valid_object(str
+  
+  struct kern_ipc_perm *ipc_obtain_object_check(struct ipc_ids *ids, int id);
+  int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
+ -			const struct ipc_ops *ops, struct ipc_params *params);
+ +			struct ipc_ops *ops, struct ipc_params *params);
+  void free_ipcs(struct ipc_namespace *ns, struct ipc_ids *ids,
+  		void (*free)(struct ipc_namespace *, struct kern_ipc_perm *));
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int sem_check_semmni(struct ipc_namespace *ns) {
++ 	/*
++ 	 * Check semmni range [0, ipc_mni]
++ 	 * semmni is the last element of sem_ctls[4] array
++ 	 */
++ 	return ((ns->sem_ctls[3] < 0) || (ns->sem_ctls[3] > ipc_mni))
++ 		? -ERANGE : 0;
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ #include <linux/compat.h>
++ struct compat_ipc_perm {
++ 	key_t key;
++ 	__compat_uid_t uid;
++ 	__compat_gid_t gid;
++ 	__compat_uid_t cuid;
++ 	__compat_gid_t cgid;
++ 	compat_mode_t mode;
++ 	unsigned short seq;
++ };
++ 
++ void to_compat_ipc_perm(struct compat_ipc_perm *, struct ipc64_perm *);
++ void to_compat_ipc64_perm(struct compat_ipc64_perm *, struct ipc64_perm *);
++ int get_compat_ipc_perm(struct ipc64_perm *, struct compat_ipc_perm __user *);
++ int get_compat_ipc64_perm(struct ipc64_perm *,
++ 			  struct compat_ipc64_perm __user *);
++ 
++ static inline int compat_ipc_parse_version(int *cmd)
++ {
++ 	int version = *cmd & IPC_64;
++ 	*cmd &= ~IPC_64;
++ 	return version;
++ }
++ #endif
++ 
++ /* for __ARCH_WANT_SYS_IPC */
++ long ksys_semtimedop(int semid, struct sembuf __user *tsops,
++ 		     unsigned int nsops,
++ 		     const struct __kernel_timespec __user *timeout);
++ long ksys_semget(key_t key, int nsems, int semflg);
++ long ksys_old_semctl(int semid, int semnum, int cmd, unsigned long arg);
++ long ksys_msgget(key_t key, int msgflg);
++ long ksys_old_msgctl(int msqid, int cmd, struct msqid_ds __user *buf);
++ long ksys_msgrcv(int msqid, struct msgbuf __user *msgp, size_t msgsz,
++ 		 long msgtyp, int msgflg);
++ long ksys_msgsnd(int msqid, struct msgbuf __user *msgp, size_t msgsz,
++ 		 int msgflg);
++ long ksys_shmget(key_t key, size_t size, int shmflg);
++ long ksys_shmdt(char __user *shmaddr);
++ long ksys_old_shmctl(int shmid, int cmd, struct shmid_ds __user *buf);
++ 
++ /* for CONFIG_ARCH_WANT_OLD_COMPAT_IPC */
++ long compat_ksys_semtimedop(int semid, struct sembuf __user *tsems,
++ 			    unsigned int nsops,
++ 			    const struct old_timespec32 __user *timeout);
++ #ifdef CONFIG_COMPAT
++ long compat_ksys_old_semctl(int semid, int semnum, int cmd, int arg);
++ long compat_ksys_old_msgctl(int msqid, int cmd, void __user *uptr);
++ long compat_ksys_msgrcv(int msqid, compat_uptr_t msgp, compat_ssize_t msgsz,
++ 			compat_long_t msgtyp, int msgflg);
++ long compat_ksys_msgsnd(int msqid, compat_uptr_t msgp,
++ 		       compat_ssize_t msgsz, int msgflg);
++ long compat_ksys_old_shmctl(int shmid, int cmd, void __user *uptr);
++ #endif /* CONFIG_COMPAT */
++ 
+++>>>>>>> 5ac893b8cb10 (ipc: allow boot time extension of IPCMNI from 32k to 16M)
+  #endif
+* Unmerged path Documentation/kernel-parameters.txt
+diff --git a/ipc/ipc_sysctl.c b/ipc/ipc_sysctl.c
+index 68c60de19527..55682234b04f 100644
+--- a/ipc/ipc_sysctl.c
++++ b/ipc/ipc_sysctl.c
+@@ -158,7 +158,8 @@ static int proc_ipcauto_dointvec_minmax(ctl_table *table, int write,
+ static int zero;
+ static int one = 1;
+ static int int_max = INT_MAX;
+-static int ipc_mni = IPCMNI;
++int ipc_mni = IPCMNI;
++int ipc_mni_shift = IPCMNI_SHIFT;
+ 
+ static struct ctl_table ipc_kern_table[] = {
+ 	{
+@@ -284,3 +285,12 @@ static int __init ipc_sysctl_init(void)
+ }
+ 
+ device_initcall(ipc_sysctl_init);
++
++static int __init ipc_mni_extend(char *str)
++{
++	ipc_mni = IPCMNI_EXTEND;
++	ipc_mni_shift = IPCMNI_EXTEND_SHIFT;
++	pr_info("IPCMNI extended to %d.\n", ipc_mni);
++	return 0;
++}
++early_param("ipcmni_extend", ipc_mni_extend);
+* Unmerged path ipc/util.c
+* Unmerged path ipc/util.h
