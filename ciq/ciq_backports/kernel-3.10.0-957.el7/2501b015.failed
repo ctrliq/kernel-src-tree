@@ -1,0 +1,303 @@
+watchdog: core: add option to avoid early handling of watchdog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] core: add option to avoid early handling of watchdog (David Arcari) [1576173]
+Rebuild_FUZZ: 91.23%
+commit-author Sebastian Reichel <sebastian.reichel@collabora.co.uk>
+commit 2501b015313fe2fa40ed11fa4dd1748e09b7c773
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2501b015.failed
+
+On some systems its desirable to have watchdog reboot the system
+when it does not come up fast enough. This adds a kernel parameter
+to disable the auto-update of watchdog before userspace takes over
+and a kernel option to set the default. The info messages were
+added to shorten error searching on misconfigured systems.
+
+	Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.co.uk>
+	Reviewed-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Wim Van Sebroeck <wim@iguana.be>
+(cherry picked from commit 2501b015313fe2fa40ed11fa4dd1748e09b7c773)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/watchdog/watchdog_dev.c
+diff --cc drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2,4bc7ab60b12c..000000000000
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@@ -46,8 -52,123 +46,105 @@@
+  
+  /* the dev_t structure to store the dynamically allocated watchdog devices */
+  static dev_t watchdog_devt;
+++<<<<<<< HEAD
+ +/* the watchdog device behind /dev/watchdog */
+ +static struct watchdog_device *old_wdd;
+++=======
++ /* Reference to watchdog device behind /dev/watchdog */
++ static struct watchdog_core_data *old_wd_data;
++ 
++ static struct workqueue_struct *watchdog_wq;
++ 
++ static bool handle_boot_enabled =
++ 	IS_ENABLED(CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED);
++ 
++ static inline bool watchdog_need_worker(struct watchdog_device *wdd)
++ {
++ 	/* All variables in milli-seconds */
++ 	unsigned int hm = wdd->max_hw_heartbeat_ms;
++ 	unsigned int t = wdd->timeout * 1000;
++ 
++ 	/*
++ 	 * A worker to generate heartbeat requests is needed if all of the
++ 	 * following conditions are true.
++ 	 * - Userspace activated the watchdog.
++ 	 * - The driver provided a value for the maximum hardware timeout, and
++ 	 *   thus is aware that the framework supports generating heartbeat
++ 	 *   requests.
++ 	 * - Userspace requests a longer timeout than the hardware can handle.
++ 	 *
++ 	 * Alternatively, if userspace has not opened the watchdog
++ 	 * device, we take care of feeding the watchdog if it is
++ 	 * running.
++ 	 */
++ 	return (hm && watchdog_active(wdd) && t > hm) ||
++ 		(t && !watchdog_active(wdd) && watchdog_hw_running(wdd));
++ }
++ 
++ static long watchdog_next_keepalive(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 	unsigned int timeout_ms = wdd->timeout * 1000;
++ 	unsigned long keepalive_interval;
++ 	unsigned long last_heartbeat;
++ 	unsigned long virt_timeout;
++ 	unsigned int hw_heartbeat_ms;
++ 
++ 	virt_timeout = wd_data->last_keepalive + msecs_to_jiffies(timeout_ms);
++ 	hw_heartbeat_ms = min_not_zero(timeout_ms, wdd->max_hw_heartbeat_ms);
++ 	keepalive_interval = msecs_to_jiffies(hw_heartbeat_ms / 2);
++ 
++ 	if (!watchdog_active(wdd))
++ 		return keepalive_interval;
++ 
++ 	/*
++ 	 * To ensure that the watchdog times out wdd->timeout seconds
++ 	 * after the most recent ping from userspace, the last
++ 	 * worker ping has to come in hw_heartbeat_ms before this timeout.
++ 	 */
++ 	last_heartbeat = virt_timeout - msecs_to_jiffies(hw_heartbeat_ms);
++ 	return min_t(long, last_heartbeat - jiffies, keepalive_interval);
++ }
++ 
++ static inline void watchdog_update_worker(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	if (watchdog_need_worker(wdd)) {
++ 		long t = watchdog_next_keepalive(wdd);
++ 
++ 		if (t > 0)
++ 			mod_delayed_work(watchdog_wq, &wd_data->work, t);
++ 	} else {
++ 		cancel_delayed_work(&wd_data->work);
++ 	}
++ }
++ 
++ static int __watchdog_ping(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 	unsigned long earliest_keepalive = wd_data->last_hw_keepalive +
++ 				msecs_to_jiffies(wdd->min_hw_heartbeat_ms);
++ 	int err;
++ 
++ 	if (time_is_after_jiffies(earliest_keepalive)) {
++ 		mod_delayed_work(watchdog_wq, &wd_data->work,
++ 				 earliest_keepalive - jiffies);
++ 		return 0;
++ 	}
++ 
++ 	wd_data->last_hw_keepalive = jiffies;
++ 
++ 	if (wdd->ops->ping)
++ 		err = wdd->ops->ping(wdd);  /* ping the watchdog */
++ 	else
++ 		err = wdd->ops->start(wdd); /* restart watchdog */
++ 
++ 	watchdog_update_worker(wdd);
++ 
++ 	return err;
++ }
+++>>>>>>> 2501b015313f (watchdog: core: add option to avoid early handling of watchdog)
+  
+  /*
+   *	watchdog_ping: ping the watchdog.
+@@@ -628,6 -890,128 +725,131 @@@ static struct miscdevice watchdog_miscd
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *	watchdog_cdev_register: register watchdog character device
++  *	@wdd: watchdog device
++  *	@devno: character device number
++  *
++  *	Register a watchdog character device including handling the legacy
++  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++  *	thus we set it up like that.
++  */
++ 
++ static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
++ {
++ 	struct watchdog_core_data *wd_data;
++ 	int err;
++ 
++ 	wd_data = kzalloc(sizeof(struct watchdog_core_data), GFP_KERNEL);
++ 	if (!wd_data)
++ 		return -ENOMEM;
++ 	kref_init(&wd_data->kref);
++ 	mutex_init(&wd_data->lock);
++ 
++ 	wd_data->wdd = wdd;
++ 	wdd->wd_data = wd_data;
++ 
++ 	if (!watchdog_wq)
++ 		return -ENODEV;
++ 
++ 	INIT_DELAYED_WORK(&wd_data->work, watchdog_ping_work);
++ 
++ 	if (wdd->id == 0) {
++ 		old_wd_data = wd_data;
++ 		watchdog_miscdev.parent = wdd->parent;
++ 		err = misc_register(&watchdog_miscdev);
++ 		if (err != 0) {
++ 			pr_err("%s: cannot register miscdev on minor=%d (err=%d).\n",
++ 				wdd->info->identity, WATCHDOG_MINOR, err);
++ 			if (err == -EBUSY)
++ 				pr_err("%s: a legacy watchdog module is probably present.\n",
++ 					wdd->info->identity);
++ 			old_wd_data = NULL;
++ 			kfree(wd_data);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	/* Fill in the data structures */
++ 	cdev_init(&wd_data->cdev, &watchdog_fops);
++ 	wd_data->cdev.owner = wdd->ops->owner;
++ 
++ 	/* Add the device */
++ 	err = cdev_add(&wd_data->cdev, devno, 1);
++ 	if (err) {
++ 		pr_err("watchdog%d unable to add device %d:%d\n",
++ 			wdd->id,  MAJOR(watchdog_devt), wdd->id);
++ 		if (wdd->id == 0) {
++ 			misc_deregister(&watchdog_miscdev);
++ 			old_wd_data = NULL;
++ 			kref_put(&wd_data->kref, watchdog_core_data_release);
++ 		}
++ 		return err;
++ 	}
++ 
++ 	/* Record time of most recent heartbeat as 'just before now'. */
++ 	wd_data->last_hw_keepalive = jiffies - 1;
++ 
++ 	/*
++ 	 * If the watchdog is running, prevent its driver from being unloaded,
++ 	 * and schedule an immediate ping.
++ 	 */
++ 	if (watchdog_hw_running(wdd)) {
++ 		if (handle_boot_enabled) {
++ 			__module_get(wdd->ops->owner);
++ 			kref_get(&wd_data->kref);
++ 			queue_delayed_work(watchdog_wq, &wd_data->work, 0);
++ 		} else {
++ 			pr_info("watchdog%d running and kernel based pre-userspace handler disabled\n",
++ 					wdd->id);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  *	watchdog_cdev_unregister: unregister watchdog character device
++  *	@watchdog: watchdog device
++  *
++  *	Unregister watchdog character device and if needed the legacy
++  *	/dev/watchdog device.
++  */
++ 
++ static void watchdog_cdev_unregister(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	cdev_del(&wd_data->cdev);
++ 	if (wdd->id == 0) {
++ 		misc_deregister(&watchdog_miscdev);
++ 		old_wd_data = NULL;
++ 	}
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wd_data->wdd = NULL;
++ 	wdd->wd_data = NULL;
++ 	mutex_unlock(&wd_data->lock);
++ 
++ 	if (watchdog_active(wdd) &&
++ 	    test_bit(WDOG_STOP_ON_UNREGISTER, &wdd->status)) {
++ 		watchdog_stop(wdd);
++ 	}
++ 
++ 	cancel_delayed_work_sync(&wd_data->work);
++ 
++ 	kref_put(&wd_data->kref, watchdog_core_data_release);
++ }
++ 
++ static struct class watchdog_class = {
++ 	.name =		"watchdog",
++ 	.owner =	THIS_MODULE,
++ 	.dev_groups =	wdt_groups,
++ };
++ 
++ /*
+++>>>>>>> 2501b015313f (watchdog: core: add option to avoid early handling of watchdog)
+   *	watchdog_dev_register: register a watchdog device
+   *	@wdd: watchdog device
+   *
+@@@ -736,4 -1112,10 +958,9 @@@ void __exit watchdog_dev_exit(void
+  {
+  	unregister_chrdev_region(watchdog_devt, MAX_DOGS);
+  	class_unregister(&watchdog_class);
+ -	destroy_workqueue(watchdog_wq);
+  }
++ 
++ module_param(handle_boot_enabled, bool, 0444);
++ MODULE_PARM_DESC(handle_boot_enabled,
++ 	"Watchdog core auto-updates boot enabled watchdogs before userspace takes over (default="
++ 	__MODULE_STRING(IS_ENABLED(CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED)) ")");
+diff --git a/drivers/watchdog/Kconfig b/drivers/watchdog/Kconfig
+index d321bee25827..c342e7ded209 100644
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -45,6 +45,17 @@ config WATCHDOG_NOWAYOUT
+ 	  get killed. If you say Y here, the watchdog cannot be stopped once
+ 	  it has been started.
+ 
++config WATCHDOG_HANDLE_BOOT_ENABLED
++	bool "Update boot-enabled watchdog until userspace takes over"
++	default y
++	help
++	  The default watchdog behaviour (which you get if you say Y here) is
++	  to ping watchdog devices that were enabled before the driver has
++	  been loaded until control is taken over from userspace using the
++	  /dev/watchdog file. If you say N here, the kernel will not update
++	  the watchdog on its own. Thus if your userspace does not start fast
++	  enough your device will reboot.
++
+ config WATCHDOG_SYSFS
+ 	bool "Read different watchdog information through sysfs"
+ 	default n
+* Unmerged path drivers/watchdog/watchdog_dev.c
