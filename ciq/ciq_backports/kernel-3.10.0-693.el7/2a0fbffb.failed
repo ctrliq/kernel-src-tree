@@ -1,0 +1,248 @@
+dm thin: fix a race condition between discarding and provisioning a block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit 2a0fbffb1e50939a969d5efe495667a3aa0f72f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2a0fbffb.failed
+
+The discard passdown was being issued after the block was unmapped,
+which meant the block could be reprovisioned whilst the passdown discard
+was still in flight.
+
+We can only identify unshared blocks (safe to do a passdown a discard
+to) once they're unmapped and their ref count hits zero.  Block ref
+counts are now used to guard against concurrent allocation of these
+blocks that are being discarded.  So now we unmap the block, issue
+passdown discards, and the immediately increment ref counts for regions
+that have been discarded via passed down (this is safe because
+allocation occurs within the same thread).  We then decrement ref counts
+once the passdown discard IO is complete -- signaling these blocks may
+now be allocated.
+
+This fixes the potential for corruption that was reported here:
+https://www.redhat.com/archives/dm-devel/2016-June/msg00311.html
+
+	Reported-by: Dennis Yang <dennisyang@qnap.com>
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 2a0fbffb1e50939a969d5efe495667a3aa0f72f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-thin.c
+diff --cc drivers/md/dm-thin.c
+index 12a42f602507,197ea2003400..000000000000
+--- a/drivers/md/dm-thin.c
++++ b/drivers/md/dm-thin.c
+@@@ -1061,7 -1001,10 +1063,14 @@@ static void process_prepared_discard_no
+  	mempool_free(m, tc->pool->mapping_pool);
+  }
+  
+++<<<<<<< HEAD
+ +static int passdown_double_checking_shared_status(struct dm_thin_new_mapping *m)
+++=======
++ /*----------------------------------------------------------------*/
++ 
++ static void passdown_double_checking_shared_status(struct dm_thin_new_mapping *m,
++ 						   struct bio *discard_parent)
+++>>>>>>> 2a0fbffb1e50 (dm thin: fix a race condition between discarding and provisioning a block)
+  {
+  	/*
+  	 * We've already unmapped this range of blocks, but before we
+@@@ -1072,7 -1015,9 +1081,11 @@@
+  	struct thin_c *tc = m->tc;
+  	struct pool *pool = tc->pool;
+  	dm_block_t b = m->data_block, e, end = m->data_block + m->virt_end - m->virt_begin;
+ -	struct discard_op op;
+  
+++<<<<<<< HEAD
+++=======
++ 	begin_discard(&op, tc, discard_parent);
+++>>>>>>> 2a0fbffb1e50 (dm thin: fix a race condition between discarding and provisioning a block)
+  	while (b != end) {
+  		/* find start of unmapped run */
+  		for (; b < end; b++) {
+@@@ -1103,30 -1048,105 +1116,121 @@@
+  
+  		b = e;
+  	}
+ -out:
+ -	end_discard(&op, r);
+ +
+ +	return 0;
+  }
+  
+- static void process_prepared_discard_passdown(struct dm_thin_new_mapping *m)
++ static void queue_passdown_pt2(struct dm_thin_new_mapping *m)
++ {
++ 	unsigned long flags;
++ 	struct pool *pool = m->tc->pool;
++ 
++ 	spin_lock_irqsave(&pool->lock, flags);
++ 	list_add_tail(&m->list, &pool->prepared_discards_pt2);
++ 	spin_unlock_irqrestore(&pool->lock, flags);
++ 	wake_worker(pool);
++ }
++ 
++ static void passdown_endio(struct bio *bio)
++ {
++ 	/*
++ 	 * It doesn't matter if the passdown discard failed, we still want
++ 	 * to unmap (we ignore err).
++ 	 */
++ 	queue_passdown_pt2(bio->bi_private);
++ }
++ 
++ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
++ {
++ 	int r;
++ 	struct thin_c *tc = m->tc;
++ 	struct pool *pool = tc->pool;
++ 	struct bio *discard_parent;
++ 	dm_block_t data_end = m->data_block + (m->virt_end - m->virt_begin);
++ 
++ 	/*
++ 	 * Only this thread allocates blocks, so we can be sure that the
++ 	 * newly unmapped blocks will not be allocated before the end of
++ 	 * the function.
++ 	 */
++ 	r = dm_thin_remove_range(tc->td, m->virt_begin, m->virt_end);
++ 	if (r) {
++ 		metadata_operation_failed(pool, "dm_thin_remove_range", r);
++ 		bio_io_error(m->bio);
++ 		cell_defer_no_holder(tc, m->cell);
++ 		mempool_free(m, pool->mapping_pool);
++ 		return;
++ 	}
++ 
++ 	discard_parent = bio_alloc(GFP_NOIO, 1);
++ 	if (!discard_parent) {
++ 		DMWARN("%s: unable to allocate top level discard bio for passdown. Skipping passdown.",
++ 		       dm_device_name(tc->pool->pool_md));
++ 		queue_passdown_pt2(m);
++ 
++ 	} else {
++ 		discard_parent->bi_end_io = passdown_endio;
++ 		discard_parent->bi_private = m;
++ 
++ 		if (m->maybe_shared)
++ 			passdown_double_checking_shared_status(m, discard_parent);
++ 		else {
++ 			struct discard_op op;
++ 
++ 			begin_discard(&op, tc, discard_parent);
++ 			r = issue_discard(&op, m->data_block, data_end);
++ 			end_discard(&op, r);
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Increment the unmapped blocks.  This prevents a race between the
++ 	 * passdown io and reallocation of freed blocks.
++ 	 */
++ 	r = dm_pool_inc_data_range(pool->pmd, m->data_block, data_end);
++ 	if (r) {
++ 		metadata_operation_failed(pool, "dm_pool_inc_data_range", r);
++ 		bio_io_error(m->bio);
++ 		cell_defer_no_holder(tc, m->cell);
++ 		mempool_free(m, pool->mapping_pool);
++ 		return;
++ 	}
++ }
++ 
++ static void process_prepared_discard_passdown_pt2(struct dm_thin_new_mapping *m)
+  {
+  	int r;
+  	struct thin_c *tc = m->tc;
+  	struct pool *pool = tc->pool;
+  
+++<<<<<<< HEAD
+ +	r = dm_thin_remove_range(tc->td, m->virt_begin, m->virt_end);
+ +	if (r)
+ +		metadata_operation_failed(pool, "dm_thin_remove_range", r);
+ +
+ +	else if (m->maybe_shared)
+ +		r = passdown_double_checking_shared_status(m);
+ +	else
+ +		r = issue_discard(tc, m->data_block, m->data_block + (m->virt_end - m->virt_begin), m->bio);
+++=======
++ 	/*
++ 	 * The passdown has completed, so now we can decrement all those
++ 	 * unmapped blocks.
++ 	 */
++ 	r = dm_pool_dec_data_range(pool->pmd, m->data_block,
++ 				   m->data_block + (m->virt_end - m->virt_begin));
++ 	if (r) {
++ 		metadata_operation_failed(pool, "dm_pool_dec_data_range", r);
++ 		bio_io_error(m->bio);
++ 	} else
++ 		bio_endio(m->bio);
+++>>>>>>> 2a0fbffb1e50 (dm thin: fix a race condition between discarding and provisioning a block)
+  
+ +	/*
+ +	 * Even if r is set, there could be sub discards in flight that we
+ +	 * need to wait for.
+ +	 */
+ +	bio_endio(m->bio, r);
+  	cell_defer_no_holder(tc, m->cell);
+  	mempool_free(m, pool->mapping_pool);
+  }
+diff --git a/drivers/md/dm-thin-metadata.c b/drivers/md/dm-thin-metadata.c
+index 43824d73366d..a15091a0d40c 100644
+--- a/drivers/md/dm-thin-metadata.c
++++ b/drivers/md/dm-thin-metadata.c
+@@ -1677,6 +1677,36 @@ int dm_pool_block_is_used(struct dm_pool_metadata *pmd, dm_block_t b, bool *resu
+ 	return r;
+ }
+ 
++int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e)
++{
++	int r = 0;
++
++	down_write(&pmd->root_lock);
++	for (; b != e; b++) {
++		r = dm_sm_inc_block(pmd->data_sm, b);
++		if (r)
++			break;
++	}
++	up_write(&pmd->root_lock);
++
++	return r;
++}
++
++int dm_pool_dec_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e)
++{
++	int r = 0;
++
++	down_write(&pmd->root_lock);
++	for (; b != e; b++) {
++		r = dm_sm_dec_block(pmd->data_sm, b);
++		if (r)
++			break;
++	}
++	up_write(&pmd->root_lock);
++
++	return r;
++}
++
+ bool dm_thin_changed_this_transaction(struct dm_thin_device *td)
+ {
+ 	int r;
+diff --git a/drivers/md/dm-thin-metadata.h b/drivers/md/dm-thin-metadata.h
+index a938babe4258..35e954ea20a9 100644
+--- a/drivers/md/dm-thin-metadata.h
++++ b/drivers/md/dm-thin-metadata.h
+@@ -197,6 +197,9 @@ int dm_pool_get_data_dev_size(struct dm_pool_metadata *pmd, dm_block_t *result);
+ 
+ int dm_pool_block_is_used(struct dm_pool_metadata *pmd, dm_block_t b, bool *result);
+ 
++int dm_pool_inc_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e);
++int dm_pool_dec_data_range(struct dm_pool_metadata *pmd, dm_block_t b, dm_block_t e);
++
+ /*
+  * Returns -ENOSPC if the new size is too small and already allocated
+  * blocks would be lost.
+* Unmerged path drivers/md/dm-thin.c
