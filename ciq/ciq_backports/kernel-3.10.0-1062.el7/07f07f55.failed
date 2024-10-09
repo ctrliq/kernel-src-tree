@@ -1,0 +1,388 @@
+x86/speculation/mds: Conditionally clear CPU buffers on idle entry
+
+jira LE-1907
+cve CVE-2019-11091
+cve CVE-2018-12130
+cve CVE-2018-12127
+cve CVE-2018-12126
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 07f07f55a29cb705e221eda7894dd67ab81ef343
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/07f07f55.failed
+
+Add a static key which controls the invocation of the CPU buffer clear
+mechanism on idle entry. This is independent of other MDS mitigations
+because the idle entry invocation to mitigate the potential leakage due to
+store buffer repartitioning is only necessary on SMT systems.
+
+Add the actual invocations to the different halt/mwait variants which
+covers all usage sites. mwaitx is not patched as it's not available on
+Intel CPUs.
+
+The buffer clear is only invoked before entering the C-State to prevent
+that stale data from the idling CPU is spilled to the Hyper-Thread sibling
+after the Store buffer got repartitioned and all entries are available to
+the non idle sibling.
+
+When coming out of idle the store buffer is partitioned again so each
+sibling has half of it available. Now CPU which returned from idle could be
+speculatively exposed to contents of the sibling, but the buffers are
+flushed either on exit to user space or on VMENTER.
+
+When later on conditional buffer clearing is implemented on top of this,
+then there is no action required either because before returning to user
+space the context switch will set the condition flag which causes a flush
+on the return to user path.
+
+Note, that the buffer clearing on idle is only sensible on CPUs which are
+solely affected by MSBDS and not any other variant of MDS because the other
+MDS variants cannot be mitigated when SMT is enabled, so the buffer
+clearing on idle would be a window dressing exercise.
+
+This intentionally does not handle the case in the acpi/processor_idle
+driver which uses the legacy IO port interface for C-State transitions for
+two reasons:
+
+ - The acpi/processor_idle driver was replaced by the intel_idle driver
+   almost a decade ago. Anything Nehalem upwards supports it and defaults
+   to that new driver.
+
+ - The legacy IO port interface is likely to be used on older and therefore
+   unaffected CPUs or on systems which do not receive microcode updates
+   anymore, so there is no point in adding that.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+	Reviewed-by: Jon Masters <jcm@redhat.com>
+	Tested-by: Jon Masters <jcm@redhat.com>
+
+(cherry picked from commit 07f07f55a29cb705e221eda7894dd67ab81ef343)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/x86/mds.rst
+#	arch/x86/include/asm/mwait.h
+#	arch/x86/include/asm/nospec-branch.h
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/include/asm/mwait.h
+index 6b1502523c80,eb0f80ce8524..000000000000
+--- a/arch/x86/include/asm/mwait.h
++++ b/arch/x86/include/asm/mwait.h
+@@@ -2,9 -3,10 +2,10 @@@
+  #define _ASM_X86_MWAIT_H
+  
+  #include <linux/sched.h>
+ -#include <linux/sched/idle.h>
+ +#include <asm/spec_ctrl.h>
+  
+  #include <asm/cpufeature.h>
++ #include <asm/nospec-branch.h>
+  
+  #define MWAIT_SUBSTATE_MASK		0xf
+  #define MWAIT_CSTATE_MASK		0xf
+@@@ -26,14 -31,70 +27,65 @@@ static __always_inline void __monitor(c
+  		     :: "a" (eax), "c" (ecx), "d"(edx));
+  }
+  
+ -static inline void __monitorx(const void *eax, unsigned long ecx,
+ -			      unsigned long edx)
+ -{
+ -	/* "monitorx %eax, %ecx, %edx;" */
+ -	asm volatile(".byte 0x0f, 0x01, 0xfa;"
+ -		     :: "a" (eax), "c" (ecx), "d"(edx));
+ -}
+ -
+ -static inline void __mwait(unsigned long eax, unsigned long ecx)
+ +static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
+  {
++ 	mds_idle_clear_cpu_buffers();
++ 
+  	/* "mwait %eax, %ecx;" */
+  	asm volatile(".byte 0x0f, 0x01, 0xc9;"
+  		     :: "a" (eax), "c" (ecx));
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * MWAITX allows for a timer expiration to get the core out a wait state in
++  * addition to the default MWAIT exit condition of a store appearing at a
++  * monitored virtual address.
++  *
++  * Registers:
++  *
++  * MWAITX ECX[1]: enable timer if set
++  * MWAITX EBX[31:0]: max wait time expressed in SW P0 clocks. The software P0
++  * frequency is the same as the TSC frequency.
++  *
++  * Below is a comparison between MWAIT and MWAITX on AMD processors:
++  *
++  *                 MWAIT                           MWAITX
++  * opcode          0f 01 c9           |            0f 01 fb
++  * ECX[0]                  value of RFLAGS.IF seen by instruction
++  * ECX[1]          unused/#GP if set  |            enable timer if set
++  * ECX[31:2]                     unused/#GP if set
++  * EAX                           unused (reserve for hint)
++  * EBX[31:0]       unused             |            max wait time (P0 clocks)
++  *
++  *                 MONITOR                         MONITORX
++  * opcode          0f 01 c8           |            0f 01 fa
++  * EAX                     (logical) address to monitor
++  * ECX                     #GP if not zero
++  */
++ static inline void __mwaitx(unsigned long eax, unsigned long ebx,
++ 			    unsigned long ecx)
++ {
++ 	/* No MDS buffer clear as this is AMD/HYGON only */
++ 
++ 	/* "mwaitx %eax, %ebx, %ecx;" */
++ 	asm volatile(".byte 0x0f, 0x01, 0xfb;"
++ 		     :: "a" (eax), "b" (ebx), "c" (ecx));
++ }
++ 
++ static inline void __sti_mwait(unsigned long eax, unsigned long ecx)
++ {
++ 	mds_idle_clear_cpu_buffers();
++ 
++ 	trace_hardirqs_on();
++ 	/* "mwait %eax, %ecx;" */
++ 	asm volatile("sti; .byte 0x0f, 0x01, 0xc9;"
++ 		     :: "a" (eax), "c" (ecx));
++ }
++ 
++ /*
+++>>>>>>> 07f07f55a29c (x86/speculation/mds: Conditionally clear CPU buffers on idle entry)
+   * This uses new MONITOR/MWAIT instructions on P4 processors with PNI,
+   * which can obviate IPI to trigger checking of need_resched.
+   * We execute MONITOR against need_resched and enter optimized wait state
+diff --cc arch/x86/include/asm/nospec-branch.h
+index 5dd73594c0d2,4e970390110f..000000000000
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@@ -218,16 -252,120 +218,119 @@@ extern u64 x86_amd_ls_cfg_ssbd_mask
+   * On VMEXIT we must ensure that no RSB predictions learned in the guest
+   * can be followed in the host, by overwriting the RSB completely. Both
+   * retpoline and IBRS mitigations for Spectre v2 need this; only on future
+ - * CPUs with IBRS_ALL *might* it be avoided.
+ + * CPUs with IBRS_ATT *might* it be avoided.
+   */
+ -static inline void vmexit_fill_RSB(void)
+ +static inline void fill_RSB(void)
+  {
+ -#ifdef CONFIG_RETPOLINE
+  	unsigned long loops;
+ +	register unsigned long sp asm(_ASM_SP);
+  
+ -	asm volatile (ANNOTATE_NOSPEC_ALTERNATIVE
+ -		      ALTERNATIVE("jmp 910f",
+ -				  __stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1)),
+ -				  X86_FEATURE_RETPOLINE)
+ -		      "910:"
+ -		      : "=r" (loops), ASM_CALL_CONSTRAINT
+ +	asm volatile (__stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1))
+ +		      : "=r" (loops), "+r" (sp)
+  		      : : "memory" );
+++<<<<<<< HEAD
+++=======
++ #endif
++ }
++ 
++ static __always_inline
++ void alternative_msr_write(unsigned int msr, u64 val, unsigned int feature)
++ {
++ 	asm volatile(ALTERNATIVE("", "wrmsr", %c[feature])
++ 		: : "c" (msr),
++ 		    "a" ((u32)val),
++ 		    "d" ((u32)(val >> 32)),
++ 		    [feature] "i" (feature)
++ 		: "memory");
++ }
++ 
++ static inline void indirect_branch_prediction_barrier(void)
++ {
++ 	u64 val = PRED_CMD_IBPB;
++ 
++ 	alternative_msr_write(MSR_IA32_PRED_CMD, val, X86_FEATURE_USE_IBPB);
++ }
++ 
++ /* The Intel SPEC CTRL MSR base value cache */
++ extern u64 x86_spec_ctrl_base;
++ 
++ /*
++  * With retpoline, we must use IBRS to restrict branch prediction
++  * before calling into firmware.
++  *
++  * (Implemented as CPP macros due to header hell.)
++  */
++ #define firmware_restrict_branch_speculation_start()			\
++ do {									\
++ 	u64 val = x86_spec_ctrl_base | SPEC_CTRL_IBRS;			\
++ 									\
++ 	preempt_disable();						\
++ 	alternative_msr_write(MSR_IA32_SPEC_CTRL, val,			\
++ 			      X86_FEATURE_USE_IBRS_FW);			\
++ } while (0)
++ 
++ #define firmware_restrict_branch_speculation_end()			\
++ do {									\
++ 	u64 val = x86_spec_ctrl_base;					\
++ 									\
++ 	alternative_msr_write(MSR_IA32_SPEC_CTRL, val,			\
++ 			      X86_FEATURE_USE_IBRS_FW);			\
++ 	preempt_enable();						\
++ } while (0)
++ 
++ DECLARE_STATIC_KEY_FALSE(switch_to_cond_stibp);
++ DECLARE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
++ DECLARE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
++ 
++ DECLARE_STATIC_KEY_FALSE(mds_user_clear);
++ DECLARE_STATIC_KEY_FALSE(mds_idle_clear);
++ 
++ #include <asm/segment.h>
++ 
++ /**
++  * mds_clear_cpu_buffers - Mitigation for MDS vulnerability
++  *
++  * This uses the otherwise unused and obsolete VERW instruction in
++  * combination with microcode which triggers a CPU buffer flush when the
++  * instruction is executed.
++  */
++ static inline void mds_clear_cpu_buffers(void)
++ {
++ 	static const u16 ds = __KERNEL_DS;
++ 
++ 	/*
++ 	 * Has to be the memory-operand variant because only that
++ 	 * guarantees the CPU buffer flush functionality according to
++ 	 * documentation. The register-operand variant does not.
++ 	 * Works with any segment selector, but a valid writable
++ 	 * data segment is the fastest variant.
++ 	 *
++ 	 * "cc" clobber is required because VERW modifies ZF.
++ 	 */
++ 	asm volatile("verw %[ds]" : : [ds] "m" (ds) : "cc");
++ }
++ 
++ /**
++  * mds_user_clear_cpu_buffers - Mitigation for MDS vulnerability
++  *
++  * Clear CPU buffers if the corresponding static key is enabled
++  */
++ static inline void mds_user_clear_cpu_buffers(void)
++ {
++ 	if (static_branch_likely(&mds_user_clear))
++ 		mds_clear_cpu_buffers();
+++>>>>>>> 07f07f55a29c (x86/speculation/mds: Conditionally clear CPU buffers on idle entry)
++ }
++ 
++ /**
++  * mds_idle_clear_cpu_buffers - Mitigation for MDS vulnerability
++  *
++  * Clear CPU buffers if the corresponding static key is enabled
++  */
++ static inline void mds_idle_clear_cpu_buffers(void)
++ {
++ 	if (static_branch_likely(&mds_idle_clear))
++ 		mds_clear_cpu_buffers();
+  }
+  
+  #endif /* __ASSEMBLY__ */
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 6ec1d2da76d1,916995167301..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -22,15 -27,48 +22,50 @@@
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
+  #include <asm/pgtable.h>
+ -#include <asm/set_memory.h>
+ -#include <asm/intel-family.h>
+ -#include <asm/e820/api.h>
+ -#include <asm/hypervisor.h>
+ -
+ -#include "cpu.h"
+ +#include <asm/cacheflush.h>
+ +#include <asm/spec_ctrl.h>
+ +#include <linux/prctl.h>
+  
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+++<<<<<<< HEAD
+ +extern void spec_ctrl_save_msr(void);
+++=======
++ 
++ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
++ u64 x86_spec_ctrl_base;
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
++ static DEFINE_MUTEX(spec_ctrl_mutex);
++ 
++ /*
++  * The vendor and possibly platform specific bits which can be modified in
++  * x86_spec_ctrl_base.
++  */
++ static u64 __ro_after_init x86_spec_ctrl_mask = SPEC_CTRL_IBRS;
++ 
++ /*
++  * AMD specific MSR info for Speculative Store Bypass control.
++  * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
++  */
++ u64 __ro_after_init x86_amd_ls_cfg_base;
++ u64 __ro_after_init x86_amd_ls_cfg_ssbd_mask;
++ 
++ /* Control conditional STIBP in switch_to() */
++ DEFINE_STATIC_KEY_FALSE(switch_to_cond_stibp);
++ /* Control conditional IBPB in switch_mm() */
++ DEFINE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
++ /* Control unconditional IBPB in switch_mm() */
++ DEFINE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
++ 
++ /* Control MDS CPU buffer clear before returning to user space */
++ DEFINE_STATIC_KEY_FALSE(mds_user_clear);
++ EXPORT_SYMBOL_GPL(mds_user_clear);
++ /* Control MDS CPU buffer clear before idling (halt, mwait) */
++ DEFINE_STATIC_KEY_FALSE(mds_idle_clear);
++ EXPORT_SYMBOL_GPL(mds_idle_clear);
+++>>>>>>> 07f07f55a29c (x86/speculation/mds: Conditionally clear CPU buffers on idle entry)
+  
+  void __init check_bugs(void)
+  {
+* Unmerged path Documentation/x86/mds.rst
+* Unmerged path Documentation/x86/mds.rst
+diff --git a/arch/x86/include/asm/irqflags.h b/arch/x86/include/asm/irqflags.h
+index b927dcc864c7..45b499df0f04 100644
+--- a/arch/x86/include/asm/irqflags.h
++++ b/arch/x86/include/asm/irqflags.h
+@@ -5,6 +5,8 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <asm/nospec-branch.h>
++
+ /* Provide __cpuidle; we can't safely include <linux/cpu.h> */
+ #define __cpuidle __attribute__((__section__(".cpuidle.text")))
+ 
+@@ -50,11 +52,13 @@ static inline void native_irq_enable(void)
+ 
+ static inline __cpuidle void native_safe_halt(void)
+ {
++	mds_idle_clear_cpu_buffers();
+ 	asm volatile("sti; hlt": : :"memory");
+ }
+ 
+ static inline __cpuidle void native_halt(void)
+ {
++	mds_idle_clear_cpu_buffers();
+ 	asm volatile("hlt": : :"memory");
+ }
+ 
+* Unmerged path arch/x86/include/asm/mwait.h
+* Unmerged path arch/x86/include/asm/nospec-branch.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
