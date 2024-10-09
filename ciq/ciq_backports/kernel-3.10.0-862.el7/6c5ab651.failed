@@ -1,0 +1,202 @@
+mm: support __GFP_REPEAT in kvmalloc_node for >32kB
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] support __GFP_REPEAT in kvmalloc_node for >32kB (Don Dutile) [1511159]
+Rebuild_FUZZ: 95.92%
+commit-author Michal Hocko <mhocko@suse.com>
+commit 6c5ab6511f718c3fb19bcc3f78a90b0e0b601675
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6c5ab651.failed
+
+vhost code uses __GFP_REPEAT when allocating vhost_virtqueue resp.
+vhost_vsock because it would really like to prefer kmalloc to the
+vmalloc fallback - see 23cc5a991c7a ("vhost-net: extend device
+allocation to vmalloc") for more context.  Michael Tsirkin has also
+noted:
+
+ "__GFP_REPEAT overhead is during allocation time. Using vmalloc means
+  all accesses are slowed down. Allocation is not on data path, accesses
+  are."
+
+The similar applies to other vhost_kvzalloc users.
+
+Let's teach kvmalloc_node to handle __GFP_REPEAT properly.  There are
+two things to be careful about.  First we should prevent from the OOM
+killer and so have to involve __GFP_NORETRY by default and secondly
+override __GFP_REPEAT for !costly order requests as the __GFP_REPEAT is
+ignored for !costly orders.
+
+Supporting __GFP_REPEAT like semantic for !costly request is possible it
+would require changes in the page allocator.  This is out of scope of
+this patch.
+
+This patch shouldn't introduce any functional change.
+
+Link: http://lkml.kernel.org/r/20170306103032.2540-3-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Cc: David Miller <davem@davemloft.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6c5ab6511f718c3fb19bcc3f78a90b0e0b601675)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/util.c
+diff --cc mm/util.c
+index 7bb27027324a,f4e590b2c0da..000000000000
+--- a/mm/util.c
++++ b/mm/util.c
+@@@ -444,6 -329,63 +444,66 @@@ unsigned long vm_mmap(struct file *file
+  }
+  EXPORT_SYMBOL(vm_mmap);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * kvmalloc_node - attempt to allocate physically contiguous memory, but upon
++  * failure, fall back to non-contiguous (vmalloc) allocation.
++  * @size: size of the request.
++  * @flags: gfp mask for the allocation - must be compatible (superset) with GFP_KERNEL.
++  * @node: numa node to allocate from
++  *
++  * Uses kmalloc to get the memory but if the allocation fails then falls back
++  * to the vmalloc allocator. Use kvfree for freeing the memory.
++  *
++  * Reclaim modifiers - __GFP_NORETRY and __GFP_NOFAIL are not supported. __GFP_REPEAT
++  * is supported only for large (>32kB) allocations, and it should be used only if
++  * kmalloc is preferable to the vmalloc fallback, due to visible performance drawbacks.
++  *
++  * Any use of gfp flags outside of GFP_KERNEL should be consulted with mm people.
++  */
++ void *kvmalloc_node(size_t size, gfp_t flags, int node)
++ {
++ 	gfp_t kmalloc_flags = flags;
++ 	void *ret;
++ 
++ 	/*
++ 	 * vmalloc uses GFP_KERNEL for some internal allocations (e.g page tables)
++ 	 * so the given set of flags has to be compatible.
++ 	 */
++ 	WARN_ON_ONCE((flags & GFP_KERNEL) != GFP_KERNEL);
++ 
++ 	/*
++ 	 * Make sure that larger requests are not too disruptive - no OOM
++ 	 * killer and no allocation failure warnings as we have a fallback
++ 	 */
++ 	if (size > PAGE_SIZE) {
++ 		kmalloc_flags |= __GFP_NOWARN;
++ 
++ 		/*
++ 		 * We have to override __GFP_REPEAT by __GFP_NORETRY for !costly
++ 		 * requests because there is no other way to tell the allocator
++ 		 * that we want to fail rather than retry endlessly.
++ 		 */
++ 		if (!(kmalloc_flags & __GFP_REPEAT) ||
++ 				(size <= PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER))
++ 			kmalloc_flags |= __GFP_NORETRY;
++ 	}
++ 
++ 	ret = kmalloc_node(size, kmalloc_flags, node);
++ 
++ 	/*
++ 	 * It doesn't really make sense to fallback to vmalloc for sub page
++ 	 * requests
++ 	 */
++ 	if (ret || size <= PAGE_SIZE)
++ 		return ret;
++ 
++ 	return __vmalloc_node_flags(size, node, flags | __GFP_HIGHMEM);
++ }
++ EXPORT_SYMBOL(kvmalloc_node);
++ 
+++>>>>>>> 6c5ab6511f71 (mm: support __GFP_REPEAT in kvmalloc_node for >32kB)
+  void kvfree(const void *addr)
+  {
+  	if (is_vmalloc_addr(addr))
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index cd57a27c00c7..baf5b225a11a 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -840,12 +840,9 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 	struct vhost_virtqueue **vqs;
+ 	int r, i;
+ 
+-	n = kmalloc(sizeof *n, GFP_KERNEL | __GFP_NOWARN | __GFP_REPEAT);
+-	if (!n) {
+-		n = vmalloc(sizeof *n);
+-		if (!n)
+-			return -ENOMEM;
+-	}
++	n = kvmalloc(sizeof *n, GFP_KERNEL | __GFP_REPEAT);
++	if (!n)
++		return -ENOMEM;
+ 	vqs = kmalloc(VHOST_NET_VQ_MAX * sizeof(*vqs), GFP_KERNEL);
+ 	if (!vqs) {
+ 		vhost_net_free(n);
+diff --git a/drivers/vhost/vhost.c b/drivers/vhost/vhost.c
+index 093267a56a1a..b5e8f5c6ca5f 100644
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -514,18 +514,9 @@ err_mm:
+ }
+ EXPORT_SYMBOL_GPL(vhost_dev_set_owner);
+ 
+-static void *vhost_kvzalloc(unsigned long size)
+-{
+-	void *n = kzalloc(size, GFP_KERNEL | __GFP_NOWARN | __GFP_REPEAT);
+-
+-	if (!n)
+-		n = vzalloc(size);
+-	return n;
+-}
+-
+ struct vhost_umem *vhost_dev_reset_owner_prepare(void)
+ {
+-	return vhost_kvzalloc(sizeof(struct vhost_umem));
++	return kvzalloc(sizeof(struct vhost_umem), GFP_KERNEL);
+ }
+ EXPORT_SYMBOL_GPL(vhost_dev_reset_owner_prepare);
+ 
+@@ -1249,7 +1240,7 @@ EXPORT_SYMBOL_GPL(vhost_vq_access_ok);
+ 
+ static struct vhost_umem *vhost_umem_alloc(void)
+ {
+-	struct vhost_umem *umem = vhost_kvzalloc(sizeof(*umem));
++	struct vhost_umem *umem = kvzalloc(sizeof(*umem), GFP_KERNEL);
+ 
+ 	if (!umem)
+ 		return NULL;
+@@ -1275,7 +1266,7 @@ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
+ 		return -EOPNOTSUPP;
+ 	if (mem.nregions > max_mem_regions)
+ 		return -E2BIG;
+-	newmem = vhost_kvzalloc(size + mem.nregions * sizeof(*m->regions));
++	newmem = kvzalloc(size + mem.nregions * sizeof(*m->regions), GFP_KERNEL);
+ 	if (!newmem)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index 1a1f33438ac1..f3b5d7fd62f8 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -481,12 +481,9 @@ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
+ 	/* This struct is large and allocation could fail, fall back to vmalloc
+ 	 * if there is no other way.
+ 	 */
+-	vsock = kzalloc(sizeof(*vsock), GFP_KERNEL | __GFP_NOWARN | __GFP_REPEAT);
+-	if (!vsock) {
+-		vsock = vmalloc(sizeof(*vsock));
+-		if (!vsock)
+-			return -ENOMEM;
+-	}
++	vsock = kvmalloc(sizeof(*vsock), GFP_KERNEL | __GFP_REPEAT);
++	if (!vsock)
++		return -ENOMEM;
+ 
+ 	vqs = kmalloc_array(ARRAY_SIZE(vsock->vqs), sizeof(*vqs), GFP_KERNEL);
+ 	if (!vqs) {
+* Unmerged path mm/util.c
