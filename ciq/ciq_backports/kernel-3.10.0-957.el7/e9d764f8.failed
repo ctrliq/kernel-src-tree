@@ -1,0 +1,196 @@
+powerpc/pseries: Enable kernel CPU dlpar from sysfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Enable kernel CPU dlpar from sysfs (Laurent Vivier) [1532968]
+Rebuild_FUZZ: 91.49%
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit e9d764f803964a54ca7da4a67d124fe824ebd80a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e9d764f8.failed
+
+Enable new kernel cpu hotplug functionality by allowing cpu dlpar requests
+to be initiated from sysfs.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit e9d764f803964a54ca7da4a67d124fe824ebd80a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/dlpar.c
+diff --cc arch/powerpc/platforms/pseries/dlpar.c
+index 755a3e61aeb5,2b93ae8d557a..000000000000
+--- a/arch/powerpc/platforms/pseries/dlpar.c
++++ b/arch/powerpc/platforms/pseries/dlpar.c
+@@@ -402,131 -368,56 +405,138 @@@ static int handle_dlpar_errorlog(struc
+  	return rc;
+  }
+  
+ -static ssize_t dlpar_store(struct class *class, struct class_attribute *attr,
+ -			   const char *buf, size_t count)
+ +static void pseries_hp_work_fn(struct work_struct *work)
+  {
+ -	struct pseries_hp_errorlog *hp_elog;
+ -	const char *arg;
+ -	int rc;
+ +	struct pseries_hp_work *hp_work =
+ +			container_of(work, struct pseries_hp_work, work);
+  
+ -	hp_elog = kzalloc(sizeof(*hp_elog), GFP_KERNEL);
+ -	if (!hp_elog) {
+ -		rc = -ENOMEM;
+ -		goto dlpar_store_out;
+ +	if (hp_work->rc)
+ +		*(hp_work->rc) = handle_dlpar_errorlog(hp_work->errlog);
+ +	else
+ +		handle_dlpar_errorlog(hp_work->errlog);
+ +
+ +	if (hp_work->hp_completion)
+ +		complete(hp_work->hp_completion);
+ +
+ +	kfree(hp_work->errlog);
+ +	kfree((void *)work);
+ +}
+ +
+ +void queue_hotplug_event(struct pseries_hp_errorlog *hp_errlog,
+ +			 struct completion *hotplug_done, int *rc)
+ +{
+ +	struct pseries_hp_work *work;
+ +	struct pseries_hp_errorlog *hp_errlog_copy;
+ +
+ +	hp_errlog_copy = kmalloc(sizeof(struct pseries_hp_errorlog),
+ +				 GFP_KERNEL);
+ +	memcpy(hp_errlog_copy, hp_errlog, sizeof(struct pseries_hp_errorlog));
+ +
+ +	work = kmalloc(sizeof(struct pseries_hp_work), GFP_KERNEL);
+ +	if (work) {
+ +		INIT_WORK((struct work_struct *)work, pseries_hp_work_fn);
+ +		work->errlog = hp_errlog_copy;
+ +		work->hp_completion = hotplug_done;
+ +		work->rc = rc;
+ +		queue_work(pseries_hp_wq, (struct work_struct *)work);
+ +	} else {
+ +		*rc = -ENOMEM;
+ +		kfree(hp_errlog_copy);
+ +		complete(hotplug_done);
+  	}
+ +}
+  
+ -	/* Parse out the request from the user, this will be in the form
+ -	 * <resource> <action> <id_type> <id>
+ -	 */
+ -	arg = buf;
+ -	if (!strncmp(arg, "memory", 6)) {
+ +static int dlpar_parse_resource(char **cmd, struct pseries_hp_errorlog *hp_elog)
+ +{
+ +	char *arg;
+ +
+ +	arg = strsep(cmd, " ");
+ +	if (!arg)
+ +		return -EINVAL;
+ +
+ +	if (sysfs_streq(arg, "memory")) {
+  		hp_elog->resource = PSERIES_HP_ELOG_RESOURCE_MEM;
+++<<<<<<< HEAD
+++=======
++ 		arg += strlen("memory ");
++ 	} else if (!strncmp(arg, "cpu", 3)) {
++ 		hp_elog->resource = PSERIES_HP_ELOG_RESOURCE_CPU;
++ 		arg += strlen("cpu ");
+++>>>>>>> e9d764f80396 (powerpc/pseries: Enable kernel CPU dlpar from sysfs)
+  	} else {
+ -		pr_err("Invalid resource specified: \"%s\"\n", buf);
+ -		rc = -EINVAL;
+ -		goto dlpar_store_out;
+ +		pr_err("Invalid resource specified.\n");
+ +		return -EINVAL;
+  	}
+  
+ -	if (!strncmp(arg, "add", 3)) {
+ +	return 0;
+ +}
+ +
+ +static int dlpar_parse_action(char **cmd, struct pseries_hp_errorlog *hp_elog)
+ +{
+ +	char *arg;
+ +
+ +	arg = strsep(cmd, " ");
+ +	if (!arg)
+ +		return -EINVAL;
+ +
+ +	if (sysfs_streq(arg, "add")) {
+  		hp_elog->action = PSERIES_HP_ELOG_ACTION_ADD;
+ -		arg += strlen("add ");
+ -	} else if (!strncmp(arg, "remove", 6)) {
+ +	} else if (sysfs_streq(arg, "remove")) {
+  		hp_elog->action = PSERIES_HP_ELOG_ACTION_REMOVE;
+ -		arg += strlen("remove ");
+  	} else {
+ -		pr_err("Invalid action specified: \"%s\"\n", buf);
+ -		rc = -EINVAL;
+ -		goto dlpar_store_out;
+ +		pr_err("Invalid action specified.\n");
+ +		return -EINVAL;
+  	}
+  
+ -	if (!strncmp(arg, "index", 5)) {
+ -		u32 index;
+ +	return 0;
+ +}
+ +
+ +static int dlpar_parse_id_type(char **cmd, struct pseries_hp_errorlog *hp_elog)
+ +{
+ +	char *arg;
+ +	u32 count, index;
+ +
+ +	arg = strsep(cmd, " ");
+ +	if (!arg)
+ +		return -EINVAL;
+ +
+ +	if (sysfs_streq(arg, "indexed-count")) {
+ +		hp_elog->id_type = PSERIES_HP_ELOG_ID_DRC_IC;
+ +		arg = strsep(cmd, " ");
+ +		if (!arg) {
+ +			pr_err("No DRC count specified.\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		if (kstrtou32(arg, 0, &count)) {
+ +			pr_err("Invalid DRC count specified.\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		arg = strsep(cmd, " ");
+ +		if (!arg) {
+ +			pr_err("No DRC Index specified.\n");
+ +			return -EINVAL;
+ +		}
+  
+ +		if (kstrtou32(arg, 0, &index)) {
+ +			pr_err("Invalid DRC Index specified.\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		hp_elog->_drc_u.ic.count = cpu_to_be32(count);
+ +		hp_elog->_drc_u.ic.index = cpu_to_be32(index);
+ +	} else if (sysfs_streq(arg, "index")) {
+  		hp_elog->id_type = PSERIES_HP_ELOG_ID_DRC_INDEX;
+ -		arg += strlen("index ");
+ +		arg = strsep(cmd, " ");
+ +		if (!arg) {
+ +			pr_err("No DRC Index specified.\n");
+ +			return -EINVAL;
+ +		}
+ +
+  		if (kstrtou32(arg, 0, &index)) {
+ -			rc = -EINVAL;
+ -			pr_err("Invalid drc_index specified: \"%s\"\n", buf);
+ -			goto dlpar_store_out;
+ +			pr_err("Invalid DRC Index specified.\n");
+ +			return -EINVAL;
+  		}
+  
+  		hp_elog->_drc_u.drc_index = cpu_to_be32(index);
+* Unmerged path arch/powerpc/platforms/pseries/dlpar.c
