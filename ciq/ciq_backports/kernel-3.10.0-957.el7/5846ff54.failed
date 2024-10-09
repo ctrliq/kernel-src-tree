@@ -1,0 +1,213 @@
+vfio/pci: Intel IGD OpRegion support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alex Williamson <alex.williamson@redhat.com>
+commit 5846ff54e87d8bab4f1e330af0b5407747a0a57e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5846ff54.failed
+
+This is the first consumer of vfio device specific resource support,
+providing read-only access to the OpRegion for Intel graphics devices.
+
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 5846ff54e87d8bab4f1e330af0b5407747a0a57e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/pci/vfio_pci.c
+diff --cc drivers/vfio/pci/vfio_pci.c
+index 6a4d778abd18,cb2624db37d8..000000000000
+--- a/drivers/vfio/pci/vfio_pci.c
++++ b/drivers/vfio/pci/vfio_pci.c
+@@@ -272,7 -169,12 +272,16 @@@ static int vfio_pci_enable(struct vfio_
+  	if (!vfio_vga_disabled() && vfio_pci_is_vga(pdev))
+  		vdev->has_vga = true;
+  
+++<<<<<<< HEAD
+ +	vfio_pci_probe_mmaps(vdev);
+++=======
++ 
++ 	if (vfio_pci_is_vga(pdev) && pdev->vendor == PCI_VENDOR_ID_INTEL) {
++ 		if (vfio_pci_igd_opregion_init(vdev) == 0)
++ 			dev_info(&pdev->dev,
++ 				 "Intel IGD OpRegion support enabled\n");
++ 	}
+++>>>>>>> 5846ff54e87d (vfio/pci: Intel IGD OpRegion support)
+  
+  	return 0;
+  }
+diff --git a/drivers/vfio/pci/Kconfig b/drivers/vfio/pci/Kconfig
+index ce8f48e623ed..cf6efab33f24 100644
+--- a/drivers/vfio/pci/Kconfig
++++ b/drivers/vfio/pci/Kconfig
+@@ -25,3 +25,7 @@ config VFIO_PCI_MMAP
+ config VFIO_PCI_INTX
+ 	depends on VFIO_PCI
+ 	def_bool y if !S390
++
++config VFIO_PCI_IGD
++	depends on VFIO_PCI
++	def_bool y if X86
+diff --git a/drivers/vfio/pci/Makefile b/drivers/vfio/pci/Makefile
+index 131079255fd9..76d8ec058edd 100644
+--- a/drivers/vfio/pci/Makefile
++++ b/drivers/vfio/pci/Makefile
+@@ -1,4 +1,5 @@
+ 
+ vfio-pci-y := vfio_pci.o vfio_pci_intrs.o vfio_pci_rdwr.o vfio_pci_config.o
++vfio-pci-$(CONFIG_VFIO_PCI_IGD) += vfio_pci_igd.o
+ 
+ obj-$(CONFIG_VFIO_PCI) += vfio-pci.o
+* Unmerged path drivers/vfio/pci/vfio_pci.c
+diff --git a/drivers/vfio/pci/vfio_pci_igd.c b/drivers/vfio/pci/vfio_pci_igd.c
+new file mode 100644
+index 000000000000..3b6a6f7b367b
+--- /dev/null
++++ b/drivers/vfio/pci/vfio_pci_igd.c
+@@ -0,0 +1,111 @@
++/*
++ * VFIO PCI Intel Graphics support
++ *
++ * Copyright (C) 2016 Red Hat, Inc.  All rights reserved.
++ *	Author: Alex Williamson <alex.williamson@redhat.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Register a device specific region through which to provide read-only
++ * access to the Intel IGD opregion.  The register defining the opregion
++ * address is also virtualized to prevent user modification.
++ */
++
++#include <linux/io.h>
++#include <linux/pci.h>
++#include <linux/uaccess.h>
++#include <linux/vfio.h>
++
++#include "vfio_pci_private.h"
++
++#define OPREGION_SIGNATURE	"IntelGraphicsMem"
++#define OPREGION_SIZE		(8 * 1024)
++#define OPREGION_PCI_ADDR	0xfc
++
++static size_t vfio_pci_igd_rw(struct vfio_pci_device *vdev, char __user *buf,
++			      size_t count, loff_t *ppos, bool iswrite)
++{
++	unsigned int i = VFIO_PCI_OFFSET_TO_INDEX(*ppos) - VFIO_PCI_NUM_REGIONS;
++	void *base = vdev->region[i].data;
++	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
++
++	if (pos >= vdev->region[i].size || iswrite)
++		return -EINVAL;
++
++	count = min(count, (size_t)(vdev->region[i].size - pos));
++
++	if (copy_to_user(buf, base + pos, count))
++		return -EFAULT;
++
++	*ppos += count;
++
++	return count;
++}
++
++static void vfio_pci_igd_release(struct vfio_pci_device *vdev,
++				 struct vfio_pci_region *region)
++{
++	memunmap(region->data);
++}
++
++static const struct vfio_pci_regops vfio_pci_igd_regops = {
++	.rw		= vfio_pci_igd_rw,
++	.release	= vfio_pci_igd_release,
++};
++
++int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev)
++{
++	__le32 *dwordp = (__le32 *)(vdev->vconfig + OPREGION_PCI_ADDR);
++	u32 addr, size;
++	void *base;
++	int ret;
++
++	ret = pci_read_config_dword(vdev->pdev, OPREGION_PCI_ADDR, &addr);
++	if (ret)
++		return ret;
++
++	if (!addr || !(~addr))
++		return -ENODEV;
++
++	base = memremap(addr, OPREGION_SIZE, MEMREMAP_WB);
++	if (!base)
++		return -ENOMEM;
++
++	if (memcmp(base, OPREGION_SIGNATURE, 16)) {
++		memunmap(base);
++		return -EINVAL;
++	}
++
++	size = le32_to_cpu(*(__le32 *)(base + 16));
++	if (!size) {
++		memunmap(base);
++		return -EINVAL;
++	}
++
++	size *= 1024; /* In KB */
++
++	if (size != OPREGION_SIZE) {
++		memunmap(base);
++		base = memremap(addr, size, MEMREMAP_WB);
++		if (!base)
++			return -ENOMEM;
++	}
++
++	ret = vfio_pci_register_dev_region(vdev,
++		PCI_VENDOR_ID_INTEL | VFIO_REGION_TYPE_PCI_VENDOR_TYPE,
++		VFIO_REGION_SUBTYPE_INTEL_IGD_OPREGION,
++		&vfio_pci_igd_regops, size, VFIO_REGION_INFO_FLAG_READ, base);
++	if (ret) {
++		memunmap(base);
++		return ret;
++	}
++
++	/* Fill vconfig with the hw value and virtualize register */
++	*dwordp = cpu_to_le32(addr);
++	memset(vdev->pci_config_map + OPREGION_PCI_ADDR,
++	       PCI_CAP_ID_INVALID_VIRT, 4);
++
++	return ret;
++}
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 2f1149c97192..24980778532d 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -134,4 +134,12 @@ extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
+ 					unsigned int type, unsigned int subtype,
+ 					const struct vfio_pci_regops *ops,
+ 					size_t size, u32 flags, void *data);
++#ifdef CONFIG_VFIO_PCI_IGD
++extern int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev);
++#else
++static inline int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev)
++{
++	return -ENODEV;
++}
++#endif
+ #endif /* VFIO_PCI_PRIVATE_H */
+diff --git a/include/uapi/linux/vfio.h b/include/uapi/linux/vfio.h
+index d7eabeaf6ddd..d96d27c0e5b2 100644
+--- a/include/uapi/linux/vfio.h
++++ b/include/uapi/linux/vfio.h
+@@ -285,6 +285,11 @@ struct vfio_region_info_cap_type {
+ 	__u32 subtype;	/* type specific */
+ };
+ 
++#define VFIO_REGION_TYPE_PCI_VENDOR_TYPE	(1 << 31)
++#define VFIO_REGION_TYPE_PCI_VENDOR_MASK	(0xffff)
++
++#define VFIO_REGION_SUBTYPE_INTEL_IGD_OPREGION	(1)
++
+ /**
+  * VFIO_DEVICE_GET_IRQ_INFO - _IOWR(VFIO_TYPE, VFIO_BASE + 9,
+  *				    struct vfio_irq_info)
