@@ -1,0 +1,230 @@
+s390: add support for ipl devices in subchannel sets > 0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] add support for ipl devices in subchannel sets > 0 (Hendrik Brueckner) [1381848]
+Rebuild_FUZZ: 94.34%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 18e22a1772260045648e49e2048ecc7193422a80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/18e22a17.failed
+
+Allow to ipl from CCW based devices residing in any subchannel set.
+
+	Reviewed-by: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 18e22a1772260045648e49e2048ecc7193422a80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/ipl.c
+diff --cc arch/s390/kernel/ipl.c
+index 74fe12143621,b1f0a90f933b..000000000000
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@@ -820,6 -801,42 +848,45 @@@ static ssize_t reipl_generic_loadparm_s
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* FCP wrapper */
++ static ssize_t reipl_fcp_loadparm_show(struct kobject *kobj,
++ 				       struct kobj_attribute *attr, char *page)
++ {
++ 	return reipl_generic_loadparm_show(reipl_block_fcp, page);
++ }
++ 
++ static ssize_t reipl_fcp_loadparm_store(struct kobject *kobj,
++ 					struct kobj_attribute *attr,
++ 					const char *buf, size_t len)
++ {
++ 	return reipl_generic_loadparm_store(reipl_block_fcp, buf, len);
++ }
++ 
++ static struct kobj_attribute sys_reipl_fcp_loadparm_attr =
++ 	__ATTR(loadparm, S_IRUGO | S_IWUSR, reipl_fcp_loadparm_show,
++ 					    reipl_fcp_loadparm_store);
++ 
++ static struct attribute *reipl_fcp_attrs[] = {
++ 	&sys_reipl_fcp_device_attr.attr,
++ 	&sys_reipl_fcp_wwpn_attr.attr,
++ 	&sys_reipl_fcp_lun_attr.attr,
++ 	&sys_reipl_fcp_bootprog_attr.attr,
++ 	&sys_reipl_fcp_br_lba_attr.attr,
++ 	&sys_reipl_fcp_loadparm_attr.attr,
++ 	NULL,
++ };
++ 
++ static struct attribute_group reipl_fcp_attr_group = {
++ 	.attrs = reipl_fcp_attrs,
++ 	.bin_attrs = reipl_fcp_bin_attrs,
++ };
++ 
++ /* CCW reipl device attributes */
++ DEFINE_IPL_CCW_ATTR_RW(reipl_ccw, device, reipl_block_ccw->ipl_info.ccw);
++ 
+++>>>>>>> 18e22a177226 (s390: add support for ipl devices in subchannel sets > 0)
+  /* NSS wrapper */
+  static ssize_t reipl_nss_loadparm_show(struct kobject *kobj,
+  				       struct kobj_attribute *attr, char *page)
+diff --git a/arch/s390/include/asm/cio.h b/arch/s390/include/asm/cio.h
+index d42625053c37..eecf243cf75a 100644
+--- a/arch/s390/include/asm/cio.h
++++ b/arch/s390/include/asm/cio.h
+@@ -302,6 +302,7 @@ extern void css_schedule_reprobe(void);
+ extern void reipl_ccw_dev(struct ccw_dev_id *id);
+ 
+ struct cio_iplinfo {
++	u8 ssid;
+ 	u16 devno;
+ 	int is_qdio;
+ };
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index 5d96a80d822c..4c11eaadb28b 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -64,7 +64,8 @@ struct ipl_block_fcp {
+ struct ipl_block_ccw {
+ 	u8  load_parm[8];
+ 	u8  reserved1[84];
+-	u8  reserved2[2];
++	u16 reserved2 : 13;
++	u8  ssid : 3;
+ 	u16 devno;
+ 	u8  vm_flags;
+ 	u8  reserved3[3];
+* Unmerged path arch/s390/kernel/ipl.c
+diff --git a/drivers/s390/cio/chsc.c b/drivers/s390/cio/chsc.c
+index 4f66c1796523..3b32cebc73bb 100644
+--- a/drivers/s390/cio/chsc.c
++++ b/drivers/s390/cio/chsc.c
+@@ -995,28 +995,10 @@ void __init chsc_init_cleanup(void)
+ 	free_page((unsigned long)sei_page);
+ }
+ 
+-int chsc_enable_facility(int operation_code)
++int __chsc_enable_facility(struct chsc_sda_area *sda_area, int operation_code)
+ {
+-	unsigned long flags;
+ 	int ret;
+-	struct {
+-		struct chsc_header request;
+-		u8 reserved1:4;
+-		u8 format:4;
+-		u8 reserved2;
+-		u16 operation_code;
+-		u32 reserved3;
+-		u32 reserved4;
+-		u32 operation_data_area[252];
+-		struct chsc_header response;
+-		u32 reserved5:4;
+-		u32 format2:4;
+-		u32 reserved6:24;
+-	} __attribute__ ((packed)) *sda_area;
+ 
+-	spin_lock_irqsave(&chsc_page_lock, flags);
+-	memset(chsc_page, 0, PAGE_SIZE);
+-	sda_area = chsc_page;
+ 	sda_area->request.length = 0x0400;
+ 	sda_area->request.code = 0x0031;
+ 	sda_area->operation_code = operation_code;
+@@ -1034,10 +1016,25 @@ int chsc_enable_facility(int operation_code)
+ 	default:
+ 		ret = chsc_error_from_response(sda_area->response.code);
+ 	}
++out:
++	return ret;
++}
++
++int chsc_enable_facility(int operation_code)
++{
++	struct chsc_sda_area *sda_area;
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&chsc_page_lock, flags);
++	memset(chsc_page, 0, PAGE_SIZE);
++	sda_area = chsc_page;
++
++	ret = __chsc_enable_facility(sda_area, operation_code);
+ 	if (ret != 0)
+ 		CIO_CRW_EVENT(2, "chsc: sda (oc=%x) failed (rc=%04x)\n",
+ 			      operation_code, sda_area->response.code);
+-out:
++
+ 	spin_unlock_irqrestore(&chsc_page_lock, flags);
+ 	return ret;
+ }
+diff --git a/drivers/s390/cio/chsc.h b/drivers/s390/cio/chsc.h
+index 76c9b50700b2..0de134c3a204 100644
+--- a/drivers/s390/cio/chsc.h
++++ b/drivers/s390/cio/chsc.h
+@@ -115,6 +115,20 @@ struct chsc_scpd {
+ 	u8 data[PAGE_SIZE - 20];
+ } __attribute__ ((packed));
+ 
++struct chsc_sda_area {
++	struct chsc_header request;
++	u8 :4;
++	u8 format:4;
++	u8 :8;
++	u16 operation_code;
++	u32 :32;
++	u32 :32;
++	u32 operation_data_area[252];
++	struct chsc_header response;
++	u32 :4;
++	u32 format2:4;
++	u32 :24;
++} __packed __aligned(PAGE_SIZE);
+ 
+ extern int chsc_get_ssd_info(struct subchannel_id schid,
+ 			     struct chsc_ssd_info *ssd);
+@@ -122,6 +136,7 @@ extern int chsc_determine_css_characteristics(void);
+ extern int chsc_init(void);
+ extern void chsc_init_cleanup(void);
+ 
++int __chsc_enable_facility(struct chsc_sda_area *sda_area, int operation_code);
+ extern int chsc_enable_facility(int);
+ struct channel_subsystem;
+ extern int chsc_secm(struct channel_subsystem *, int);
+diff --git a/drivers/s390/cio/cio.c b/drivers/s390/cio/cio.c
+index ed47cc888651..ace10937134d 100644
+--- a/drivers/s390/cio/cio.c
++++ b/drivers/s390/cio/cio.c
+@@ -955,18 +955,32 @@ void reipl_ccw_dev(struct ccw_dev_id *devid)
+ 
+ int __init cio_get_iplinfo(struct cio_iplinfo *iplinfo)
+ {
++	static struct chsc_sda_area sda_area __initdata;
+ 	struct subchannel_id schid;
+ 	struct schib schib;
+ 
+ 	schid = *(struct subchannel_id *)&S390_lowcore.subchannel_id;
+ 	if (!schid.one)
+ 		return -ENODEV;
++
++	if (schid.ssid) {
++		/*
++		 * Firmware should have already enabled MSS but whoever started
++		 * the kernel might have initiated a channel subsystem reset.
++		 * Ensure that MSS is enabled.
++		 */
++		memset(&sda_area, 0, sizeof(sda_area));
++		if (__chsc_enable_facility(&sda_area, CHSC_SDA_OC_MSS))
++			return -ENODEV;
++	}
+ 	if (stsch_err(schid, &schib))
+ 		return -ENODEV;
+ 	if (schib.pmcw.st != SUBCHANNEL_TYPE_IO)
+ 		return -ENODEV;
+ 	if (!schib.pmcw.dnv)
+ 		return -ENODEV;
++
++	iplinfo->ssid = schid.ssid;
+ 	iplinfo->devno = schib.pmcw.dev;
+ 	iplinfo->is_qdio = schib.pmcw.qf;
+ 	return 0;
