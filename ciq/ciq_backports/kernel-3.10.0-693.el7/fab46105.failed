@@ -1,0 +1,182 @@
+ACPICA: Cleanup the option of forcing the use of the RSDT.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [acpi] acpica: Cleanup the option of forcing the use of the RSDT (Prarit Bhargava) [1425180]
+Rebuild_FUZZ: 99.13%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit fab4610583855d544394320d47fccb43305a6398
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fab46105.failed
+
+This change adds a runtime option that will force ACPICA to use the
+RSDT instead of the XSDT. Although the ACPI spec requires that an XSDT
+be used instead of the RSDT, the XSDT has been found to be corrupt or
+ill-formed on some machines.
+
+This option is already in the Linux kernel.  When it is back ported to
+ACPICA, code is re-written to follow ACPICA coding style.  This patch
+is the generation of the integration.
+
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Bob Moore <robert.moore@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit fab4610583855d544394320d47fccb43305a6398)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/tbutils.c
+diff --cc drivers/acpi/acpica/tbutils.c
+index bffdfc7b8322,6412d3c301cb..000000000000
+--- a/drivers/acpi/acpica/tbutils.c
++++ b/drivers/acpi/acpica/tbutils.c
+@@@ -458,19 -478,17 +458,24 @@@ acpi_tb_parse_root_table(acpi_physical_
+  				   ACPI_CAST_PTR(struct acpi_table_header,
+  						 rsdp));
+  
+- 	/* Differentiate between RSDT and XSDT root tables */
++ 	/* Use XSDT if present and not overridden. Otherwise, use RSDT */
+  
+++<<<<<<< HEAD
+ +	if (rsdp->revision > 1 && rsdp->xsdt_physical_address
+ +			&& !acpi_rsdt_forced) {
+++=======
++ 	if ((rsdp->revision > 1) &&
++ 	    rsdp->xsdt_physical_address && !acpi_gbl_do_not_use_xsdt) {
+++>>>>>>> fab461058385 (ACPICA: Cleanup the option of forcing the use of the RSDT.)
+  		/*
+ -		 * RSDP contains an XSDT (64-bit physical addresses). We must use
+ -		 * the XSDT if the revision is > 1 and the XSDT pointer is present,
+ -		 * as per the ACPI specification.
+ +		 * Root table is an XSDT (64-bit physical addresses). We must use the
+ +		 * XSDT if the revision is > 1 and the XSDT pointer is present, as per
+ +		 * the ACPI specification.
+  		 */
+  		address = (acpi_physical_address) rsdp->xsdt_physical_address;
+ -		table_entry_size = ACPI_XSDT_ENTRY_SIZE;
+ +		table_entry_size = sizeof(u64);
+ +		rsdt_address = (acpi_physical_address)
+ +					rsdp->rsdt_physical_address;
+  	} else {
+  		/* Root table is an RSDT (32-bit physical addresses) */
+  
+@@@ -484,15 -502,25 +489,34 @@@
+  	 */
+  	acpi_os_unmap_memory(rsdp, sizeof(struct acpi_table_rsdp));
+  
+++<<<<<<< HEAD
+ +	if (table_entry_size == sizeof(u64)) {
+ +		if (acpi_tb_check_xsdt(address) == AE_NULL_ENTRY) {
+ +			/* XSDT has NULL entry, RSDT is used */
+ +			address = rsdt_address;
+ +			table_entry_size = sizeof(u32);
+ +			ACPI_WARNING((AE_INFO, "BIOS XSDT has NULL entry, "
+ +					"using RSDT"));
+++=======
++ 	/*
++ 	 * If it is present and used, validate the XSDT for access/size
++ 	 * and ensure that all table entries are at least non-NULL
++ 	 */
++ 	if (table_entry_size == ACPI_XSDT_ENTRY_SIZE) {
++ 		status = acpi_tb_validate_xsdt(address);
++ 		if (ACPI_FAILURE(status)) {
++ 			ACPI_BIOS_WARNING((AE_INFO,
++ 					   "XSDT is invalid (%s), using RSDT",
++ 					   acpi_format_exception(status)));
++ 
++ 			/* Fall back to the RSDT */
++ 
++ 			address =
++ 			    (acpi_physical_address) rsdp->rsdt_physical_address;
++ 			table_entry_size = ACPI_RSDT_ENTRY_SIZE;
+++>>>>>>> fab461058385 (ACPICA: Cleanup the option of forcing the use of the RSDT.)
+  		}
+  	}
+ -
+  	/* Map the RSDT/XSDT table header to get the full table length */
+  
+  	table = acpi_os_map_memory(address, sizeof(struct acpi_table_header));
+diff --git a/arch/ia64/kernel/acpi.c b/arch/ia64/kernel/acpi.c
+index 335eb07480fe..c2c14ed812a8 100644
+--- a/arch/ia64/kernel/acpi.c
++++ b/arch/ia64/kernel/acpi.c
+@@ -61,7 +61,6 @@
+ 
+ #define PREFIX			"ACPI: "
+ 
+-u32 acpi_rsdt_forced;
+ unsigned int acpi_cpei_override;
+ unsigned int acpi_cpei_phys_cpuid;
+ 
+diff --git a/arch/x86/kernel/acpi/boot.c b/arch/x86/kernel/acpi/boot.c
+index 677e7c384661..8dd4189923b6 100644
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@ -48,7 +48,6 @@
+ 
+ #include "sleep.h" /* To include x86_acpi_suspend_lowlevel */
+ static int __initdata acpi_force = 0;
+-u32 acpi_rsdt_forced;
+ int acpi_disabled;
+ EXPORT_SYMBOL(acpi_disabled);
+ 
+@@ -1569,7 +1568,7 @@ static int __init parse_acpi(char *arg)
+ 	}
+ 	/* acpi=rsdt use RSDT instead of XSDT */
+ 	else if (strcmp(arg, "rsdt") == 0) {
+-		acpi_rsdt_forced = 1;
++		acpi_gbl_do_not_use_xsdt = TRUE;
+ 	}
+ 	/* "acpi=noirq" disables ACPI interrupt routing */
+ 	else if (strcmp(arg, "noirq") == 0) {
+diff --git a/drivers/acpi/acpica/acglobal.h b/drivers/acpi/acpica/acglobal.h
+index b8d38117a20c..7352dd57eca9 100644
+--- a/drivers/acpi/acpica/acglobal.h
++++ b/drivers/acpi/acpica/acglobal.h
+@@ -118,6 +118,14 @@ bool ACPI_INIT_GLOBAL(acpi_gbl_enable_aml_debug_object, FALSE);
+  */
+ u8 ACPI_INIT_GLOBAL(acpi_gbl_copy_dsdt_locally, FALSE);
+ 
++/*
++ * Optionally ignore an XSDT if present and use the RSDT instead.
++ * Although the ACPI specification requires that an XSDT be used instead
++ * of the RSDT, the XSDT has been found to be corrupt or ill-formed on
++ * some machines. Default behavior is to use the XSDT if present.
++ */
++u8 ACPI_INIT_GLOBAL(acpi_gbl_do_not_use_xsdt, FALSE);
++
+ /*
+  * Optionally truncate I/O addresses to 16 bits. Provides compatibility
+  * with other ACPI implementations. NOTE: During ACPICA initialization,
+* Unmerged path drivers/acpi/acpica/tbutils.c
+diff --git a/include/acpi/acpixf.h b/include/acpi/acpixf.h
+index 4f88d18b72e7..887fc32ddd07 100644
+--- a/include/acpi/acpixf.h
++++ b/include/acpi/acpixf.h
+@@ -71,17 +71,18 @@ extern u32 acpi_dbg_layer;
+ 
+ /* ACPICA runtime options */
+ 
+-extern u8 acpi_gbl_enable_interpreter_slack;
+ extern u8 acpi_gbl_all_methods_serialized;
+-extern u8 acpi_gbl_create_osi_method;
+-extern u8 acpi_gbl_use_default_register_widths;
+-extern acpi_name acpi_gbl_trace_method_name;
+-extern u32 acpi_gbl_trace_flags;
+-extern bool acpi_gbl_enable_aml_debug_object;
+ extern u8 acpi_gbl_copy_dsdt_locally;
+-extern u8 acpi_gbl_truncate_io_addresses;
++extern u8 acpi_gbl_create_osi_method;
+ extern u8 acpi_gbl_disable_auto_repair;
+ extern u8 acpi_gbl_disable_ssdt_table_load;
++extern u8 acpi_gbl_do_not_use_xsdt;
++extern bool acpi_gbl_enable_aml_debug_object;
++extern u8 acpi_gbl_enable_interpreter_slack;
++extern u32 acpi_gbl_trace_flags;
++extern acpi_name acpi_gbl_trace_method_name;
++extern u8 acpi_gbl_truncate_io_addresses;
++extern u8 acpi_gbl_use_default_register_widths;
+ 
+ /*
+  * Hardware-reduced prototypes. All interfaces that use these macros will
