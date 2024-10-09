@@ -487,6 +487,8 @@ static int __mlxsw_sp_port_fid_join(struct mlxsw_sp_port *mlxsw_sp_port,
 
 	f->ref_count++;
 
+	netdev_dbg(mlxsw_sp_port->dev, "Joined FID=%d\n", fid);
+
 	return 0;
 }
 
@@ -498,6 +500,8 @@ static void __mlxsw_sp_port_fid_leave(struct mlxsw_sp_port *mlxsw_sp_port,
 	f = mlxsw_sp_fid_find(mlxsw_sp_port->mlxsw_sp, fid);
 	if (WARN_ON(!f))
 		return;
+
+	netdev_dbg(mlxsw_sp_port->dev, "Left FID=%d\n", fid);
 
 	mlxsw_sp_port_fdb_flush(mlxsw_sp_port, fid);
 
