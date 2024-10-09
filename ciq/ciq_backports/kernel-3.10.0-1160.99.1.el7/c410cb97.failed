@@ -1,0 +1,89 @@
+netfilter: conntrack: handle tcp challenge acks during connection reuse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.99.1.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit c410cb974f2ba562920ecb8492ee66945dcf88af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.99.1.el7/c410cb97.failed
+
+When a connection is re-used, following can happen:
+[ connection starts to close, fin sent in either direction ]
+ > syn   # initator quickly reuses connection
+ < ack   # peer sends a challenge ack
+ > rst   # rst, sequence number == ack_seq of previous challenge ack
+ > syn   # this syn is expected to pass
+
+Problem is that the rst will fail window validation, so it gets
+tagged as invalid.
+
+If ruleset drops such packets, we get repeated syn-retransmits until
+initator gives up or peer starts responding with syn/ack.
+
+Before the commit indicated in the "Fixes" tag below this used to work:
+
+The challenge-ack made conntrack re-init state based on the challenge
+ack itself, so the following rst would pass window validation.
+
+Add challenge-ack support: If we get ack for syn, record the ack_seq,
+and then check if the rst sequence number matches the last ack number
+seen in reverse direction.
+
+Fixes: c7aab4f17021 ("netfilter: nf_conntrack_tcp: re-init for syn packets only")
+	Reported-by: Michal Tesar <mtesar@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit c410cb974f2ba562920ecb8492ee66945dcf88af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_tcp.c
+diff --cc net/netfilter/nf_conntrack_proto_tcp.c
+index e40f15ad94d9,3ac1af6f59fc..000000000000
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@@ -976,11 -1068,18 +976,18 @@@ static int tcp_packet(struct nf_conn *c
+  				ct->proto.tcp.last_flags |=
+  					IP_CT_EXP_CHALLENGE_ACK;
+  		}
++ 
++ 		/* possible challenge ack reply to syn */
++ 		if (old_state == TCP_CONNTRACK_SYN_SENT &&
++ 		    index == TCP_ACK_SET &&
++ 		    dir == IP_CT_DIR_REPLY)
++ 			ct->proto.tcp.last_ack = ntohl(th->ack_seq);
++ 
+  		spin_unlock_bh(&ct->lock);
+ -		nf_ct_l4proto_log_invalid(skb, ct, state,
+ -					  "packet (index %d) in dir %d ignored, state %s",
+ -					  index, dir,
+ -					  tcp_conntrack_names[old_state]);
+ +		if (LOG_INVALID(net, IPPROTO_TCP))
+ +			nf_log_packet(net, pf, 0, skb, NULL, NULL, NULL,
+ +				  "nf_ct_tcp: invalid packet ignored in "
+ +				  "state %s ", tcp_conntrack_names[old_state]);
+  		return NF_ACCEPT;
+  	case TCP_CONNTRACK_MAX:
+  		/* Special case for SYN proxy: when the SYN to the server or
+@@@ -1053,7 -1200,15 +1060,19 @@@
+  			 * segments we ignored. */
+  			goto in_window;
+  		}
+++<<<<<<< HEAD
+ +		/* Just fall through */
+++=======
++ 
++ 		/* Reset in response to a challenge-ack we let through earlier */
++ 		if (old_state == TCP_CONNTRACK_SYN_SENT &&
++ 		    ct->proto.tcp.last_index == TCP_ACK_SET &&
++ 		    ct->proto.tcp.last_dir == IP_CT_DIR_REPLY &&
++ 		    ntohl(th->seq) == ct->proto.tcp.last_ack)
++ 			goto in_window;
++ 
++ 		break;
+++>>>>>>> c410cb974f2b (netfilter: conntrack: handle tcp challenge acks during connection reuse)
+  	default:
+  		/* Keep compilers happy. */
+  		break;
+* Unmerged path net/netfilter/nf_conntrack_proto_tcp.c
