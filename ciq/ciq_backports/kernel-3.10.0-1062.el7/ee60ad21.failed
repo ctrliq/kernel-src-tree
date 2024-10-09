@@ -1,0 +1,96 @@
+route: set the deleted fnhe fnhe_daddr to 0 in ip_del_fnhe to fix a race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit ee60ad219f5c7c4fb2f047f88037770063ef785f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ee60ad21.failed
+
+The race occurs in __mkroute_output() when 2 threads lookup a dst:
+
+  CPU A                 CPU B
+  find_exception()
+                        find_exception() [fnhe expires]
+                        ip_del_fnhe() [fnhe is deleted]
+  rt_bind_exception()
+
+In rt_bind_exception() it will bind a deleted fnhe with the new dst, and
+this dst will get no chance to be freed. It causes a dev defcnt leak and
+consecutive dmesg warnings:
+
+  unregister_netdevice: waiting for ethX to become free. Usage count = 1
+
+Especially thanks Jon to identify the issue.
+
+This patch fixes it by setting fnhe_daddr to 0 in ip_del_fnhe() to stop
+binding the deleted fnhe with a new dst when checking fnhe's fnhe_daddr
+and daddr in rt_bind_exception().
+
+It works as both ip_del_fnhe() and rt_bind_exception() are protected by
+fnhe_lock and the fhne is freed by kfree_rcu().
+
+Fixes: deed49df7390 ("route: check and remove route cache when we get route")
+	Signed-off-by: Jon Maxwell <jmaxwell37@gmail.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Reviewed-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee60ad219f5c7c4fb2f047f88037770063ef785f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/route.c
+diff --cc net/ipv4/route.c
+index 1ca3ee23b3a6,a5da63e5faa2..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1284,7 -1280,43 +1284,47 @@@ static unsigned int ipv4_mtu(const stru
+  			mtu = 576;
+  	}
+  
+++<<<<<<< HEAD
+ +	return min_t(unsigned int, mtu, IP_MAX_MTU);
+++=======
++ 	mtu = min_t(unsigned int, mtu, IP_MAX_MTU);
++ 
++ 	return mtu - lwtunnel_headroom(dst->lwtstate, mtu);
++ }
++ 
++ static void ip_del_fnhe(struct fib_nh *nh, __be32 daddr)
++ {
++ 	struct fnhe_hash_bucket *hash;
++ 	struct fib_nh_exception *fnhe, __rcu **fnhe_p;
++ 	u32 hval = fnhe_hashfun(daddr);
++ 
++ 	spin_lock_bh(&fnhe_lock);
++ 
++ 	hash = rcu_dereference_protected(nh->nh_exceptions,
++ 					 lockdep_is_held(&fnhe_lock));
++ 	hash += hval;
++ 
++ 	fnhe_p = &hash->chain;
++ 	fnhe = rcu_dereference_protected(*fnhe_p, lockdep_is_held(&fnhe_lock));
++ 	while (fnhe) {
++ 		if (fnhe->fnhe_daddr == daddr) {
++ 			rcu_assign_pointer(*fnhe_p, rcu_dereference_protected(
++ 				fnhe->fnhe_next, lockdep_is_held(&fnhe_lock)));
++ 			/* set fnhe_daddr to 0 to ensure it won't bind with
++ 			 * new dsts in rt_bind_exception().
++ 			 */
++ 			fnhe->fnhe_daddr = 0;
++ 			fnhe_flush_routes(fnhe);
++ 			kfree_rcu(fnhe, rcu);
++ 			break;
++ 		}
++ 		fnhe_p = &fnhe->fnhe_next;
++ 		fnhe = rcu_dereference_protected(fnhe->fnhe_next,
++ 						 lockdep_is_held(&fnhe_lock));
++ 	}
++ 
++ 	spin_unlock_bh(&fnhe_lock);
+++>>>>>>> ee60ad219f5c (route: set the deleted fnhe fnhe_daddr to 0 in ip_del_fnhe to fix a race)
+  }
+  
+  static struct fib_nh_exception *find_exception(struct fib_nh *nh, __be32 daddr)
+* Unmerged path net/ipv4/route.c
