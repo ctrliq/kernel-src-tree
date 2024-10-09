@@ -1,0 +1,2015 @@
+sched/core: Idle_task_exit() shouldn't use switch_mm_irqs_off()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 252d2a4117bc181b287eeddf848863788da733ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/252d2a41.failed
+
+idle_task_exit() can be called with IRQs on x86 on and therefore
+should use switch_mm(), not switch_mm_irqs_off().
+
+This doesn't seem to cause any problems right now, but it will
+confuse my upcoming TLB flush changes.  Nonetheless, I think it
+should be backported because it's trivial.  There won't be any
+meaningful performance impact because idle_task_exit() is only
+used when offlining a CPU.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: stable@vger.kernel.org
+Fixes: f98db6013c55 ("sched/core: Add switch_mm_irqs_off() and use it in the scheduler")
+Link: http://lkml.kernel.org/r/ca3d1a9fa93a0b49f5a8ff729eda3640fb6abdf9.1497034141.git.luto@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 252d2a4117bc181b287eeddf848863788da733ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 0268f967b362,326d4f88e2b1..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4266,1813 -3913,204 +4266,1820 @@@ int can_nice(const struct task_struct *
+  	return (nice_rlim <= task_rlimit(p, RLIMIT_NICE) ||
+  		capable(CAP_SYS_NICE));
+  }
+ -
+ -#ifdef __ARCH_WANT_SYS_NICE
+ +
+ +#ifdef __ARCH_WANT_SYS_NICE
+ +
+ +/*
+ + * sys_nice - change the priority of the current process.
+ + * @increment: priority increment
+ + *
+ + * sys_setpriority is a more generic, but much slower function that
+ + * does similar things.
+ + */
+ +SYSCALL_DEFINE1(nice, int, increment)
+ +{
+ +	long nice, retval;
+ +
+ +	/*
+ +	 * Setpriority might change our priority at the same moment.
+ +	 * We don't have to worry. Conceptually one call occurs first
+ +	 * and we have a single winner.
+ +	 */
+ +	if (increment < -40)
+ +		increment = -40;
+ +	if (increment > 40)
+ +		increment = 40;
+ +
+ +	nice = TASK_NICE(current) + increment;
+ +	if (nice < -20)
+ +		nice = -20;
+ +	if (nice > 19)
+ +		nice = 19;
+ +
+ +	if (increment < 0 && !can_nice(current, nice))
+ +		return -EPERM;
+ +
+ +	retval = security_task_setnice(current, nice);
+ +	if (retval)
+ +		return retval;
+ +
+ +	set_user_nice(current, nice);
+ +	return 0;
+ +}
+ +
+ +#endif
+ +
+ +/**
+ + * task_prio - return the priority value of a given task.
+ + * @p: the task in question.
+ + *
+ + * Return: The priority value as seen by users in /proc.
+ + * RT tasks are offset by -200. Normal tasks are centered
+ + * around 0, value goes from -16 to +15.
+ + */
+ +int task_prio(const struct task_struct *p)
+ +{
+ +	return p->prio - MAX_RT_PRIO;
+ +}
+ +
+ +/**
+ + * task_nice - return the nice value of a given task.
+ + * @p: the task in question.
+ + *
+ + * Return: The nice value [ -20 ... 0 ... 19 ].
+ + */
+ +int task_nice(const struct task_struct *p)
+ +{
+ +	return TASK_NICE(p);
+ +}
+ +EXPORT_SYMBOL(task_nice);
+ +
+ +/**
+ + * idle_cpu - is a given cpu idle currently?
+ + * @cpu: the processor in question.
+ + *
+ + * Return: 1 if the CPU is currently idle. 0 otherwise.
+ + */
+ +int idle_cpu(int cpu)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+ +
+ +	if (rq->curr != rq->idle)
+ +		return 0;
+ +
+ +	if (rq->nr_running)
+ +		return 0;
+ +
+ +#ifdef CONFIG_SMP
+ +	if (!llist_empty(&rq->wake_list))
+ +		return 0;
+ +#endif
+ +
+ +	return 1;
+ +}
+ +
+ +/**
+ + * idle_task - return the idle task for a given cpu.
+ + * @cpu: the processor in question.
+ + *
+ + * Return: The idle task for the cpu @cpu.
+ + */
+ +struct task_struct *idle_task(int cpu)
+ +{
+ +	return cpu_rq(cpu)->idle;
+ +}
+ +
+ +/**
+ + * find_process_by_pid - find a process with a matching PID value.
+ + * @pid: the pid in question.
+ + *
+ + * The task of @pid, if found. %NULL otherwise.
+ + */
+ +static struct task_struct *find_process_by_pid(pid_t pid)
+ +{
+ +	return pid ? find_task_by_vpid(pid) : current;
+ +}
+ +
+ +/*
+ + * This function initializes the sched_dl_entity of a newly becoming
+ + * SCHED_DEADLINE task.
+ + *
+ + * Only the static values are considered here, the actual runtime and the
+ + * absolute deadline will be properly calculated when the task is enqueued
+ + * for the first time with its new policy.
+ + */
+ +static void
+ +__setparam_dl(struct task_struct *p, const struct sched_attr *attr)
+ +{
+ +	struct sched_dl_entity *dl_se = &p->dl;
+ +
+ +	dl_se->dl_runtime = attr->sched_runtime;
+ +	dl_se->dl_deadline = attr->sched_deadline;
+ +	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
+ +	dl_se->flags = attr->sched_flags;
+ +	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
+ +	dl_se->dl_density = to_ratio(dl_se->dl_deadline, dl_se->dl_runtime);
+ +
+ +	/*
+ +	 * Changing the parameters of a task is 'tricky' and we're not doing
+ +	 * the correct thing -- also see task_dead_dl() and switched_from_dl().
+ +	 *
+ +	 * What we SHOULD do is delay the bandwidth release until the 0-lag
+ +	 * point. This would include retaining the task_struct until that time
+ +	 * and change dl_overflow() to not immediately decrement the current
+ +	 * amount.
+ +	 *
+ +	 * Instead we retain the current runtime/deadline and let the new
+ +	 * parameters take effect after the current reservation period lapses.
+ +	 * This is safe (albeit pessimistic) because the 0-lag point is always
+ +	 * before the current scheduling deadline.
+ +	 *
+ +	 * We can still have temporary overloads because we do not delay the
+ +	 * change in bandwidth until that time; so admission control is
+ +	 * not on the safe side. It does however guarantee tasks will never
+ +	 * consume more than promised.
+ +	 */
+ +}
+ +
+ +/* Actually do priority change: must hold pi & rq lock. */
+ +static void __setscheduler(struct rq *rq, struct task_struct *p,
+ +			   const struct sched_attr *attr)
+ +{
+ +	int policy = attr->sched_policy;
+ +
+ +	if (policy == -1) /* setparam */
+ +		policy = p->policy;
+ +
+ +	p->policy = policy;
+ +
+ +	if (dl_policy(policy))
+ +		__setparam_dl(p, attr);
+ +	else if (fair_policy(policy))
+ +		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ +
+ +	/*
+ +	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+ +	 * !rt_policy. Always setting this ensures that things like
+ +	 * getparam()/getattr() don't report silly values for !rt tasks.
+ +	 */
+ +	p->rt_priority = attr->sched_priority;
+ +
+ +	p->normal_prio = normal_prio(p);
+ +	p->prio = rt_mutex_getprio(p);
+ +
+ +	if (dl_prio(p->prio))
+ +		p->sched_class = &dl_sched_class;
+ +	else if (rt_prio(p->prio))
+ +		p->sched_class = &rt_sched_class;
+ +	else
+ +		p->sched_class = &fair_sched_class;
+ +
+ +	set_load_weight(p);
+ +}
+ +
+ +static void
+ +__getparam_dl(struct task_struct *p, struct sched_attr *attr)
+ +{
+ +	struct sched_dl_entity *dl_se = &p->dl;
+ +
+ +	attr->sched_priority = p->rt_priority;
+ +	attr->sched_runtime = dl_se->dl_runtime;
+ +	attr->sched_deadline = dl_se->dl_deadline;
+ +	attr->sched_period = dl_se->dl_period;
+ +	attr->sched_flags = dl_se->flags;
+ +}
+ +
+ +/*
+ + * This function validates the new parameters of a -deadline task.
+ + * We ask for the deadline not being zero, and greater or equal
+ + * than the runtime, as well as the period of being zero or
+ + * greater than deadline. Furthermore, we have to be sure that
+ + * user parameters are above the internal resolution of 1us (we
+ + * check sched_runtime only since it is always the smaller one) and
+ + * below 2^63 ns (we have to check both sched_deadline and
+ + * sched_period, as the latter can be zero).
+ + */
+ +static bool
+ +__checkparam_dl(const struct sched_attr *attr)
+ +{
+ +	/* deadline != 0 */
+ +	if (attr->sched_deadline == 0)
+ +		return false;
+ +
+ +	/*
+ +	 * Since we truncate DL_SCALE bits, make sure we're at least
+ +	 * that big.
+ +	 */
+ +	if (attr->sched_runtime < (1ULL << DL_SCALE))
+ +		return false;
+ +
+ +	/*
+ +	 * Since we use the MSB for wrap-around and sign issues, make
+ +	 * sure it's not set (mind that period can be equal to zero).
+ +	 */
+ +	if (attr->sched_deadline & (1ULL << 63) ||
+ +	    attr->sched_period & (1ULL << 63))
+ +		return false;
+ +
+ +	/* runtime <= deadline <= period (if period != 0) */
+ +	if ((attr->sched_period != 0 &&
+ +	     attr->sched_period < attr->sched_deadline) ||
+ +	    attr->sched_deadline < attr->sched_runtime)
+ +		return false;
+ +
+ +	return true;
+ +}
+ +
+ +/*
+ + * check the target process has a UID that matches the current process's
+ + */
+ +static bool check_same_owner(struct task_struct *p)
+ +{
+ +	const struct cred *cred = current_cred(), *pcred;
+ +	bool match;
+ +
+ +	rcu_read_lock();
+ +	pcred = __task_cred(p);
+ +	match = (uid_eq(cred->euid, pcred->euid) ||
+ +		 uid_eq(cred->euid, pcred->uid));
+ +	rcu_read_unlock();
+ +	return match;
+ +}
+ +
+ +static int __sched_setscheduler(struct task_struct *p,
+ +				const struct sched_attr *attr,
+ +				bool user)
+ +{
+ +	int retval, oldprio, oldpolicy = -1, on_rq, running;
+ +	int policy = attr->sched_policy;
+ +	unsigned long flags;
+ +	const struct sched_class *prev_class;
+ +	struct rq *rq;
+ +	int reset_on_fork;
+ +
+ +	/* may grab non-irq protected spin_locks */
+ +	BUG_ON(in_interrupt());
+ +recheck:
+ +	/* double check policy once rq lock held */
+ +	if (policy < 0) {
+ +		reset_on_fork = p->sched_reset_on_fork;
+ +		policy = oldpolicy = p->policy;
+ +	} else {
+ +		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
+ +
+ +		if (policy != SCHED_DEADLINE &&
+ +				policy != SCHED_FIFO && policy != SCHED_RR &&
+ +				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
+ +				policy != SCHED_IDLE)
+ +			return -EINVAL;
+ +	}
+ +
+ +	if (attr->sched_flags &
+ +		~(SCHED_FLAG_RESET_ON_FORK | SCHED_FLAG_RECLAIM))
+ +		return -EINVAL;
+ +
+ +	/*
+ +	 * Valid priorities for SCHED_FIFO and SCHED_RR are
+ +	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
+ +	 * SCHED_BATCH and SCHED_IDLE is 0.
+ +	 */
+ +	if ((p->mm && attr->sched_priority > MAX_USER_RT_PRIO-1) ||
+ +	    (!p->mm && attr->sched_priority > MAX_RT_PRIO-1))
+ +		return -EINVAL;
+ +	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
+ +	    (rt_policy(policy) != (attr->sched_priority != 0)))
+ +		return -EINVAL;
+ +
+ +	/*
+ +	 * Allow unprivileged RT tasks to decrease priority:
+ +	 */
+ +	if (user && !capable(CAP_SYS_NICE)) {
+ +		if (fair_policy(policy)) {
+ +			if (attr->sched_nice < TASK_NICE(p) &&
+ +			    !can_nice(p, attr->sched_nice))
+ +				return -EPERM;
+ +		}
+ +
+ +		if (rt_policy(policy)) {
+ +			unsigned long rlim_rtprio =
+ +					task_rlimit(p, RLIMIT_RTPRIO);
+ +
+ +			/* can't set/change the rt policy */
+ +			if (policy != p->policy && !rlim_rtprio)
+ +				return -EPERM;
+ +
+ +			/* can't increase priority */
+ +			if (attr->sched_priority > p->rt_priority &&
+ +			    attr->sched_priority > rlim_rtprio)
+ +				return -EPERM;
+ +		}
+ +
+ +		 /*
+ +		  * Can't set/change SCHED_DEADLINE policy at all for now
+ +		  * (safest behavior); in the future we would like to allow
+ +		  * unprivileged DL tasks to increase their relative deadline
+ +		  * or reduce their runtime (both ways reducing utilization)
+ +		  */
+ +		if (dl_policy(policy))
+ +			return -EPERM;
+ +
+ +		/*
+ +		 * Treat SCHED_IDLE as nice 20. Only allow a switch to
+ +		 * SCHED_NORMAL if the RLIMIT_NICE would normally permit it.
+ +		 */
+ +		if (p->policy == SCHED_IDLE && policy != SCHED_IDLE) {
+ +			if (!can_nice(p, TASK_NICE(p)))
+ +				return -EPERM;
+ +		}
+ +
+ +		/* can't change other user's priorities */
+ +		if (!check_same_owner(p))
+ +			return -EPERM;
+ +
+ +		/* Normal users shall not reset the sched_reset_on_fork flag */
+ +		if (p->sched_reset_on_fork && !reset_on_fork)
+ +			return -EPERM;
+ +	}
+ +
+ +	if (user) {
+ +		retval = security_task_setscheduler(p);
+ +		if (retval)
+ +			return retval;
+ +	}
+ +
+ +	/*
+ +	 * make sure no PI-waiters arrive (or leave) while we are
+ +	 * changing the priority of the task:
+ +	 *
+ +	 * To be able to change p->policy safely, the appropriate
+ +	 * runqueue lock must be held.
+ +	 */
+ +	rq = task_rq_lock(p, &flags);
+ +
+ +	/*
+ +	 * Changing the policy of the stop threads its a very bad idea
+ +	 */
+ +	if (p == rq->stop) {
+ +		task_rq_unlock(rq, p, &flags);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/*
+ +	 * If not changing anything there's no need to proceed further:
+ +	 */
+ +	if (unlikely(policy == p->policy)) {
+ +		if (fair_policy(policy) && attr->sched_nice != TASK_NICE(p))
+ +			goto change;
+ +		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
+ +			goto change;
+ +		if (dl_policy(policy))
+ +			goto change;
+ +
+ +		task_rq_unlock(rq, p, &flags);
+ +		return 0;
+ +	}
+ +change:
+ +
+ +	if (user) {
+ +#ifdef CONFIG_RT_GROUP_SCHED
+ +		/*
+ +		 * Do not allow realtime tasks into groups that have no runtime
+ +		 * assigned.
+ +		 */
+ +		if (rt_bandwidth_enabled() && rt_policy(policy) &&
+ +				task_group(p)->rt_bandwidth.rt_runtime == 0 &&
+ +				!task_group_is_autogroup(task_group(p))) {
+ +			task_rq_unlock(rq, p, &flags);
+ +			return -EPERM;
+ +		}
+ +#endif
+ +#ifdef CONFIG_SMP
+ +		if (dl_bandwidth_enabled() && dl_policy(policy)) {
+ +			cpumask_t *span = rq->rd->span;
+ +
+ +			/*
+ +			 * Don't allow tasks with an affinity mask smaller than
+ +			 * the entire root_domain to become SCHED_DEADLINE. We
+ +			 * will also fail if there's no bandwidth available.
+ +			 */
+ +			if (!cpumask_subset(span, &p->cpus_allowed) ||
+ +			    rq->rd->dl_bw.bw == 0) {
+ +				task_rq_unlock(rq, p, &flags);
+ +				return -EPERM;
+ +			}
+ +		}
+ +#endif
+ +	}
+ +
+ +	/* recheck policy now with rq lock held */
+ +	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
+ +		policy = oldpolicy = -1;
+ +		task_rq_unlock(rq, p, &flags);
+ +		goto recheck;
+ +	}
+ +
+ +	/*
+ +	 * If setscheduling to SCHED_DEADLINE (or changing the parameters
+ +	 * of a SCHED_DEADLINE task) we need to check if enough bandwidth
+ +	 * is available.
+ +	 */
+ +	if ((dl_policy(policy) || dl_task(p)) && dl_overflow(p, policy, attr)) {
+ +		task_rq_unlock(rq, p, &flags);
+ +		return -EBUSY;
+ +	}
+ +
+ +	on_rq = p->on_rq;
+ +	running = task_current(rq, p);
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+ +	if (running)
+ +		p->sched_class->put_prev_task(rq, p);
+ +
+ +	p->sched_reset_on_fork = reset_on_fork;
+ +
+ +	oldprio = p->prio;
+ +	prev_class = p->sched_class;
+ +	__setscheduler(rq, p, attr);
+ +
+ +	if (running)
+ +		p->sched_class->set_curr_task(rq);
+ +	if (on_rq)
+ +		enqueue_task(rq, p, 0);
+ +
+ +	check_class_changed(rq, p, prev_class, oldprio);
+ +	task_rq_unlock(rq, p, &flags);
+ +
+ +	rt_mutex_adjust_pi(p);
+ +
+ +	return 0;
+ +}
+ +
+ +static int _sched_setscheduler(struct task_struct *p, int policy,
+ +			       const struct sched_param *param, bool check)
+ +{
+ +	struct sched_attr attr = {
+ +		.sched_policy   = policy,
+ +		.sched_priority = param->sched_priority,
+ +		.sched_nice	= PRIO_TO_NICE(p->static_prio),
+ +	};
+ +
+ +	/*
+ +	 * Fixup the legacy SCHED_RESET_ON_FORK hack, except if
+ +	 * the policy=-1 was passed by sched_setparam().
+ +	 */
+ +	if ((policy != -1) && (policy & SCHED_RESET_ON_FORK)) {
+ +		attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
+ +		policy &= ~SCHED_RESET_ON_FORK;
+ +		attr.sched_policy = policy;
+ +	}
+ +
+ +	return __sched_setscheduler(p, &attr, check);
+ +}
+ +/**
+ + * sched_setscheduler - change the scheduling policy and/or RT priority of a thread.
+ + * @p: the task in question.
+ + * @policy: new policy.
+ + * @param: structure containing the new RT priority.
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + *
+ + * NOTE that the task may be already dead.
+ + */
+ +int sched_setscheduler(struct task_struct *p, int policy,
+ +		       const struct sched_param *param)
+ +{
+ +	return _sched_setscheduler(p, policy, param, true);
+ +}
+ +EXPORT_SYMBOL_GPL(sched_setscheduler);
+ +
+ +int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
+ +{
+ +	return __sched_setscheduler(p, attr, true);
+ +}
+ +EXPORT_SYMBOL_GPL(sched_setattr);
+ +
+ +/**
+ + * sched_setscheduler_nocheck - change the scheduling policy and/or RT priority of a thread from kernelspace.
+ + * @p: the task in question.
+ + * @policy: new policy.
+ + * @param: structure containing the new RT priority.
+ + *
+ + * Just like sched_setscheduler, only don't bother checking if the
+ + * current context has permission.  For example, this is needed in
+ + * stop_machine(): we create temporary high priority worker threads,
+ + * but our caller might not have that capability.
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + */
+ +int sched_setscheduler_nocheck(struct task_struct *p, int policy,
+ +			       const struct sched_param *param)
+ +{
+ +	return _sched_setscheduler(p, policy, param, false);
+ +}
+ +EXPORT_SYMBOL_GPL(sched_setscheduler_nocheck);
+ +
+ +static int
+ +do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
+ +{
+ +	struct sched_param lparam;
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	if (!param || pid < 0)
+ +		return -EINVAL;
+ +	if (copy_from_user(&lparam, param, sizeof(struct sched_param)))
+ +		return -EFAULT;
+ +
+ +	rcu_read_lock();
+ +	retval = -ESRCH;
+ +	p = find_process_by_pid(pid);
+ +	if (p != NULL)
+ +		retval = sched_setscheduler(p, policy, &lparam);
+ +	rcu_read_unlock();
+ +
+ +	return retval;
+ +}
+ +
+ +/*
+ + * Mimics kernel/events/core.c perf_copy_attr().
+ + */
+ +static int sched_copy_attr(struct sched_attr __user *uattr,
+ +			   struct sched_attr *attr)
+ +{
+ +	u32 size;
+ +	int ret;
+ +
+ +	if (!access_ok(VERIFY_WRITE, uattr, SCHED_ATTR_SIZE_VER0))
+ +		return -EFAULT;
+ +
+ +	/*
+ +	 * zero the full structure, so that a short copy will be nice.
+ +	 */
+ +	memset(attr, 0, sizeof(*attr));
+ +
+ +	ret = get_user(size, &uattr->size);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (size > PAGE_SIZE)	/* silly large */
+ +		goto err_size;
+ +
+ +	if (!size)		/* abi compat */
+ +		size = SCHED_ATTR_SIZE_VER0;
+ +
+ +	if (size < SCHED_ATTR_SIZE_VER0)
+ +		goto err_size;
+ +
+ +	/*
+ +	 * If we're handed a bigger struct than we know of,
+ +	 * ensure all the unknown bits are 0 - i.e. new
+ +	 * user-space does not rely on any kernel feature
+ +	 * extensions we dont know about yet.
+ +	 */
+ +	if (size > sizeof(*attr)) {
+ +		unsigned char __user *addr;
+ +		unsigned char __user *end;
+ +		unsigned char val;
+ +
+ +		addr = (void __user *)uattr + sizeof(*attr);
+ +		end  = (void __user *)uattr + size;
+ +
+ +		for (; addr < end; addr++) {
+ +			ret = get_user(val, addr);
+ +			if (ret)
+ +				return ret;
+ +			if (val)
+ +				goto err_size;
+ +		}
+ +		size = sizeof(*attr);
+ +	}
+ +
+ +	ret = copy_from_user(attr, uattr, size);
+ +	if (ret)
+ +		return -EFAULT;
+ +
+ +	/*
+ +	 * XXX: do we want to be lenient like existing syscalls; or do we want
+ +	 * to be strict and return an error on out-of-bounds values?
+ +	 */
+ +	attr->sched_nice = clamp(attr->sched_nice, -20, 19);
+ +
+ +out:
+ +	return ret;
+ +
+ +err_size:
+ +	put_user(sizeof(*attr), &uattr->size);
+ +	ret = -E2BIG;
+ +	goto out;
+ +}
+ +
+ +/**
+ + * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+ + * @pid: the pid in question.
+ + * @policy: new policy.
+ + * @param: structure containing the new RT priority.
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + */
+ +SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy,
+ +		struct sched_param __user *, param)
+ +{
+ +	/* negative values for policy are not valid */
+ +	if (policy < 0)
+ +		return -EINVAL;
+ +
+ +	return do_sched_setscheduler(pid, policy, param);
+ +}
+ +
+ +/**
+ + * sys_sched_setparam - set/change the RT priority of a thread
+ + * @pid: the pid in question.
+ + * @param: structure containing the new RT priority.
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + */
+ +SYSCALL_DEFINE2(sched_setparam, pid_t, pid, struct sched_param __user *, param)
+ +{
+ +	return do_sched_setscheduler(pid, -1, param);
+ +}
+ +
+ +static const bool sched_deadline_enable;
+ +
+ +/**
+ + * sys_sched_setattr - same as above, but with extended sched_attr
+ + * @pid: the pid in question.
+ + * @uattr: structure containing the extended parameters.
+ + * @flags: for future extension.
+ + */
+ +SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
+ +			       unsigned int, flags)
+ +{
+ +	struct sched_attr attr;
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	if (!sched_deadline_enable)
+ +		return -ENOSYS;
+ +
+ +	if (!uattr || pid < 0 || flags)
+ +		return -EINVAL;
+ +
+ +	retval = sched_copy_attr(uattr, &attr);
+ +	if (retval)
+ +		return retval;
+ +
+ +	if ((int)attr.sched_policy < 0)
+ +		return -EINVAL;
+ +
+ +	rcu_read_lock();
+ +	retval = -ESRCH;
+ +	p = find_process_by_pid(pid);
+ +	if (p != NULL)
+ +		retval = sched_setattr(p, &attr);
+ +	rcu_read_unlock();
+ +
+ +	return retval;
+ +}
+ +
+ +/**
+ + * sys_sched_getscheduler - get the policy (scheduling class) of a thread
+ + * @pid: the pid in question.
+ + *
+ + * Return: On success, the policy of the thread. Otherwise, a negative error
+ + * code.
+ + */
+ +SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
+ +{
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	if (pid < 0)
+ +		return -EINVAL;
+ +
+ +	retval = -ESRCH;
+ +	rcu_read_lock();
+ +	p = find_process_by_pid(pid);
+ +	if (p) {
+ +		retval = security_task_getscheduler(p);
+ +		if (!retval)
+ +			retval = p->policy
+ +				| (p->sched_reset_on_fork ? SCHED_RESET_ON_FORK : 0);
+ +	}
+ +	rcu_read_unlock();
+ +	return retval;
+ +}
+ +
+ +/**
+ + * sys_sched_getparam - get the RT priority of a thread
+ + * @pid: the pid in question.
+ + * @param: structure containing the RT priority.
+ + *
+ + * Return: On success, 0 and the RT priority is in @param. Otherwise, an error
+ + * code.
+ + */
+ +SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
+ +{
+ +	struct sched_param lp;
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	if (!param || pid < 0)
+ +		return -EINVAL;
+ +
+ +	rcu_read_lock();
+ +	p = find_process_by_pid(pid);
+ +	retval = -ESRCH;
+ +	if (!p)
+ +		goto out_unlock;
+ +
+ +	retval = security_task_getscheduler(p);
+ +	if (retval)
+ +		goto out_unlock;
+ +
+ +	if (task_has_dl_policy(p)) {
+ +		retval = -EINVAL;
+ +		goto out_unlock;
+ +	}
+ +	lp.sched_priority = p->rt_priority;
+ +	rcu_read_unlock();
+ +
+ +	/*
+ +	 * This one might sleep, we cannot do it with a spinlock held ...
+ +	 */
+ +	retval = copy_to_user(param, &lp, sizeof(*param)) ? -EFAULT : 0;
+ +
+ +	return retval;
+ +
+ +out_unlock:
+ +	rcu_read_unlock();
+ +	return retval;
+ +}
+ +
+ +static int sched_read_attr(struct sched_attr __user *uattr,
+ +			   struct sched_attr *attr,
+ +			   unsigned int usize)
+ +{
+ +	int ret;
+ +
+ +	if (!access_ok(VERIFY_WRITE, uattr, usize))
+ +		return -EFAULT;
+ +
+ +	/*
+ +	 * If we're handed a smaller struct than we know of,
+ +	 * ensure all the unknown bits are 0 - i.e. old
+ +	 * user-space does not get uncomplete information.
+ +	 */
+ +	if (usize < sizeof(*attr)) {
+ +		unsigned char *addr;
+ +		unsigned char *end;
+ +
+ +		addr = (void *)attr + usize;
+ +		end  = (void *)attr + sizeof(*attr);
+ +
+ +		for (; addr < end; addr++) {
+ +			if (*addr)
+ +				goto err_size;
+ +		}
+ +
+ +		attr->size = usize;
+ +	}
+ +
+ +	ret = copy_to_user(uattr, attr, attr->size);
+ +	if (ret)
+ +		return -EFAULT;
+ +
+ +out:
+ +	return ret;
+ +
+ +err_size:
+ +	ret = -E2BIG;
+ +	goto out;
+ +}
+ +
+ +/**
+ + * sys_sched_getattr - similar to sched_getparam, but with sched_attr
+ + * @pid: the pid in question.
+ + * @uattr: structure containing the extended parameters.
+ + * @size: sizeof(attr) for fwd/bwd comp.
+ + * @flags: for future extension.
+ + */
+ +SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
+ +		unsigned int, size, unsigned int, flags)
+ +{
+ +	struct sched_attr attr = {
+ +		.size = sizeof(struct sched_attr),
+ +	};
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	if (!sched_deadline_enable)
+ +		return -ENOSYS;
+ +
+ +	if (!uattr || pid < 0 || size > PAGE_SIZE ||
+ +	    size < SCHED_ATTR_SIZE_VER0 || flags)
+ +		return -EINVAL;
+ +
+ +	rcu_read_lock();
+ +	p = find_process_by_pid(pid);
+ +	retval = -ESRCH;
+ +	if (!p)
+ +		goto out_unlock;
+ +
+ +	retval = security_task_getscheduler(p);
+ +	if (retval)
+ +		goto out_unlock;
+ +
+ +	attr.sched_policy = p->policy;
+ +	if (p->sched_reset_on_fork)
+ +		attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
+ +	if (task_has_dl_policy(p))
+ +		__getparam_dl(p, &attr);
+ +	else if (task_has_rt_policy(p))
+ +		attr.sched_priority = p->rt_priority;
+ +	else
+ +		attr.sched_nice = TASK_NICE(p);
+ +
+ +	rcu_read_unlock();
+ +
+ +	retval = sched_read_attr(uattr, &attr, size);
+ +	return retval;
+ +
+ +out_unlock:
+ +	rcu_read_unlock();
+ +	return retval;
+ +}
+ +
+ +long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
+ +{
+ +	cpumask_var_t cpus_allowed, new_mask;
+ +	struct task_struct *p;
+ +	int retval;
+ +
+ +	rcu_read_lock();
+ +
+ +	p = find_process_by_pid(pid);
+ +	if (!p) {
+ +		rcu_read_unlock();
+ +		return -ESRCH;
+ +	}
+ +
+ +	/* Prevent p going away */
+ +	get_task_struct(p);
+ +	rcu_read_unlock();
+ +
+ +	if (p->flags & PF_NO_SETAFFINITY) {
+ +		retval = -EINVAL;
+ +		goto out_put_task;
+ +	}
+ +	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL)) {
+ +		retval = -ENOMEM;
+ +		goto out_put_task;
+ +	}
+ +	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL)) {
+ +		retval = -ENOMEM;
+ +		goto out_free_cpus_allowed;
+ +	}
+ +	retval = -EPERM;
+ +	if (!check_same_owner(p)) {
+ +		rcu_read_lock();
+ +		if (!ns_capable(__task_cred(p)->user_ns, CAP_SYS_NICE)) {
+ +			rcu_read_unlock();
+ +			goto out_unlock;
+ +		}
+ +		rcu_read_unlock();
+ +	}
+ +
+ +	retval = security_task_setscheduler(p);
+ +	if (retval)
+ +		goto out_unlock;
+ +
+ +
+ +	cpuset_cpus_allowed(p, cpus_allowed);
+ +	cpumask_and(new_mask, in_mask, cpus_allowed);
+ +
+ +	/*
+ +	 * Since bandwidth control happens on root_domain basis,
+ +	 * if admission test is enabled, we only admit -deadline
+ +	 * tasks allowed to run on all the CPUs in the task's
+ +	 * root_domain.
+ +	 */
+ +#ifdef CONFIG_SMP
+ +	if (task_has_dl_policy(p)) {
+ +		const struct cpumask *span = task_rq(p)->rd->span;
+ +
+ +		if (dl_bandwidth_enabled() && !cpumask_subset(span, new_mask)) {
+ +			retval = -EBUSY;
+ +			goto out_unlock;
+ +		}
+ +	}
+ +#endif
+ +again:
+ +	retval = set_cpus_allowed_ptr(p, new_mask);
+ +
+ +	if (!retval) {
+ +		cpuset_cpus_allowed(p, cpus_allowed);
+ +		if (!cpumask_subset(new_mask, cpus_allowed)) {
+ +			/*
+ +			 * We must have raced with a concurrent cpuset
+ +			 * update. Just reset the cpus_allowed to the
+ +			 * cpuset's cpus_allowed
+ +			 */
+ +			cpumask_copy(new_mask, cpus_allowed);
+ +			goto again;
+ +		}
+ +	}
+ +out_unlock:
+ +	free_cpumask_var(new_mask);
+ +out_free_cpus_allowed:
+ +	free_cpumask_var(cpus_allowed);
+ +out_put_task:
+ +	put_task_struct(p);
+ +	return retval;
+ +}
+ +
+ +static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
+ +			     struct cpumask *new_mask)
+ +{
+ +	if (len < cpumask_size())
+ +		cpumask_clear(new_mask);
+ +	else if (len > cpumask_size())
+ +		len = cpumask_size();
+ +
+ +	return copy_from_user(new_mask, user_mask_ptr, len) ? -EFAULT : 0;
+ +}
+ +
+ +/**
+ + * sys_sched_setaffinity - set the cpu affinity of a process
+ + * @pid: pid of the process
+ + * @len: length in bytes of the bitmask pointed to by user_mask_ptr
+ + * @user_mask_ptr: user-space pointer to the new cpu mask
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + */
+ +SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
+ +		unsigned long __user *, user_mask_ptr)
+ +{
+ +	cpumask_var_t new_mask;
+ +	int retval;
+ +
+ +	if (!alloc_cpumask_var(&new_mask, GFP_KERNEL))
+ +		return -ENOMEM;
+ +
+ +	retval = get_user_cpu_mask(user_mask_ptr, len, new_mask);
+ +	if (retval == 0)
+ +		retval = sched_setaffinity(pid, new_mask);
+ +	free_cpumask_var(new_mask);
+ +	return retval;
+ +}
+ +
+ +long sched_getaffinity(pid_t pid, struct cpumask *mask)
+ +{
+ +	struct task_struct *p;
+ +	unsigned long flags;
+ +	int retval;
+ +
+ +	rcu_read_lock();
+ +
+ +	retval = -ESRCH;
+ +	p = find_process_by_pid(pid);
+ +	if (!p)
+ +		goto out_unlock;
+ +
+ +	retval = security_task_getscheduler(p);
+ +	if (retval)
+ +		goto out_unlock;
+ +
+ +	raw_spin_lock_irqsave(&p->pi_lock, flags);
+ +	cpumask_and(mask, &p->cpus_allowed, cpu_active_mask);
+ +	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+ +
+ +out_unlock:
+ +	rcu_read_unlock();
+ +
+ +	return retval;
+ +}
+ +
+ +/**
+ + * sys_sched_getaffinity - get the cpu affinity of a process
+ + * @pid: pid of the process
+ + * @len: length in bytes of the bitmask pointed to by user_mask_ptr
+ + * @user_mask_ptr: user-space pointer to hold the current cpu mask
+ + *
+ + * Return: 0 on success. An error code otherwise.
+ + */
+ +SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
+ +		unsigned long __user *, user_mask_ptr)
+ +{
+ +	int ret;
+ +	cpumask_var_t mask;
+ +
+ +	if ((len * BITS_PER_BYTE) < nr_cpu_ids)
+ +		return -EINVAL;
+ +	if (len & (sizeof(unsigned long)-1))
+ +		return -EINVAL;
+ +
+ +	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+ +		return -ENOMEM;
+ +
+ +	ret = sched_getaffinity(pid, mask);
+ +	if (ret == 0) {
+ +		size_t retlen = min_t(size_t, len, cpumask_size());
+ +
+ +		if (copy_to_user(user_mask_ptr, mask, retlen))
+ +			ret = -EFAULT;
+ +		else
+ +			ret = retlen;
+ +	}
+ +	free_cpumask_var(mask);
+ +
+ +	return ret;
+ +}
+ +
+ +/**
+ + * sys_sched_yield - yield the current processor to other threads.
+ + *
+ + * This function yields the current CPU to other tasks. If there are no
+ + * other threads running on this CPU then this function will return.
+ + *
+ + * Return: 0.
+ + */
+ +SYSCALL_DEFINE0(sched_yield)
+ +{
+ +	struct rq *rq = this_rq_lock();
+ +
+ +	schedstat_inc(rq, yld_count);
+ +	current->sched_class->yield_task(rq);
+ +
+ +	/*
+ +	 * Since we are going to call schedule() anyway, there's
+ +	 * no need to preempt or enable interrupts:
+ +	 */
+ +	__release(rq->lock);
+ +	spin_release(&rq->lock.dep_map, 1, _THIS_IP_);
+ +	do_raw_spin_unlock(&rq->lock);
+ +	sched_preempt_enable_no_resched();
+ +
+ +	schedule();
+ +
+ +	return 0;
+ +}
+ +
+ +static inline int should_resched(void)
+ +{
+ +	return need_resched() && !(preempt_count() & PREEMPT_ACTIVE);
+ +}
+ +
+ +static void __cond_resched(void)
+ +{
+ +	add_preempt_count(PREEMPT_ACTIVE);
+ +	__schedule();
+ +	sub_preempt_count(PREEMPT_ACTIVE);
+ +}
+ +
+ +int __sched _cond_resched(void)
+ +{
+ +	if (should_resched()) {
+ +		__cond_resched();
+ +		return 1;
+ +	}
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(_cond_resched);
+ +
+ +/*
+ + * __cond_resched_lock() - if a reschedule is pending, drop the given lock,
+ + * call schedule, and on return reacquire the lock.
+ + *
+ + * This works OK both with and without CONFIG_PREEMPT. We do strange low-level
+ + * operations here to prevent schedule() from being called twice (once via
+ + * spin_unlock(), once by hand).
+ + */
+ +int __cond_resched_lock(spinlock_t *lock)
+ +{
+ +	int resched = should_resched();
+ +	int ret = 0;
+ +
+ +	lockdep_assert_held(lock);
+ +
+ +	if (spin_needbreak(lock) || resched) {
+ +		spin_unlock(lock);
+ +		if (resched)
+ +			__cond_resched();
+ +		else
+ +			cpu_relax();
+ +		ret = 1;
+ +		spin_lock(lock);
+ +	}
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL(__cond_resched_lock);
+ +
+ +int __sched __cond_resched_softirq(void)
+ +{
+ +	BUG_ON(!in_softirq());
+ +
+ +	if (should_resched()) {
+ +		local_bh_enable();
+ +		__cond_resched();
+ +		local_bh_disable();
+ +		return 1;
+ +	}
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(__cond_resched_softirq);
+ +
+ +/**
+ + * yield - yield the current processor to other threads.
+ + *
+ + * Do not ever use this function, there's a 99% chance you're doing it wrong.
+ + *
+ + * The scheduler is at all times free to pick the calling task as the most
+ + * eligible task to run, if removing the yield() call from your code breaks
+ + * it, its already broken.
+ + *
+ + * Typical broken usage is:
+ + *
+ + * while (!event)
+ + * 	yield();
+ + *
+ + * where one assumes that yield() will let 'the other' process run that will
+ + * make event true. If the current task is a SCHED_FIFO task that will never
+ + * happen. Never use yield() as a progress guarantee!!
+ + *
+ + * If you want to use yield() to wait for something, use wait_event().
+ + * If you want to use yield() to be 'nice' for others, use cond_resched().
+ + * If you still want to use yield(), do not!
+ + */
+ +void __sched yield(void)
+ +{
+ +	set_current_state(TASK_RUNNING);
+ +	sys_sched_yield();
+ +}
+ +EXPORT_SYMBOL(yield);
+ +
+ +/**
+ + * yield_to - yield the current processor to another thread in
+ + * your thread group, or accelerate that thread toward the
+ + * processor it's on.
+ + * @p: target task
+ + * @preempt: whether task preemption is allowed or not
+ + *
+ + * It's the caller's job to ensure that the target task struct
+ + * can't go away on us before we can do any checks.
+ + *
+ + * Return:
+ + *	true (>0) if we indeed boosted the target task.
+ + *	false (0) if we failed to boost the target.
+ + *	-ESRCH if there's no task to yield to.
+ + */
+ +int __sched yield_to(struct task_struct *p, bool preempt)
+ +{
+ +	struct task_struct *curr = current;
+ +	struct rq *rq, *p_rq;
+ +	unsigned long flags;
+ +	int yielded = 0;
+ +
+ +	local_irq_save(flags);
+ +	rq = this_rq();
+ +
+ +again:
+ +	p_rq = task_rq(p);
+ +	/*
+ +	 * If we're the only runnable task on the rq and target rq also
+ +	 * has only one task, there's absolutely no point in yielding.
+ +	 */
+ +	if (rq->nr_running == 1 && p_rq->nr_running == 1) {
+ +		yielded = -ESRCH;
+ +		goto out_irq;
+ +	}
+ +
+ +	double_rq_lock(rq, p_rq);
+ +	if (task_rq(p) != p_rq) {
+ +		double_rq_unlock(rq, p_rq);
+ +		goto again;
+ +	}
+ +
+ +	if (!curr->sched_class->yield_to_task)
+ +		goto out_unlock;
+ +
+ +	if (curr->sched_class != p->sched_class)
+ +		goto out_unlock;
+ +
+ +	if (task_running(p_rq, p) || p->state)
+ +		goto out_unlock;
+ +
+ +	yielded = curr->sched_class->yield_to_task(rq, p, preempt);
+ +	if (yielded) {
+ +		schedstat_inc(rq, yld_count);
+ +		/*
+ +		 * Make p's CPU reschedule; pick_next_entity takes care of
+ +		 * fairness.
+ +		 */
+ +		if (preempt && rq != p_rq)
+ +			resched_curr(p_rq);
+ +	}
+ +
+ +out_unlock:
+ +	double_rq_unlock(rq, p_rq);
+ +out_irq:
+ +	local_irq_restore(flags);
+ +
+ +	if (yielded > 0)
+ +		schedule();
+ +
+ +	return yielded;
+ +}
+ +EXPORT_SYMBOL_GPL(yield_to);
+ +
+ +/*
+ + * This task is about to go to sleep on IO. Increment rq->nr_iowait so
+ + * that process accounting knows that this is a task in IO wait state.
+ + */
+ +void __sched io_schedule(void)
+ +{
+ +	io_schedule_timeout(MAX_SCHEDULE_TIMEOUT);
+ +}
+ +EXPORT_SYMBOL(io_schedule);
+ +
+ +long __sched io_schedule_timeout(long timeout)
+ +{
+ +	int old_iowait = current->in_iowait;
+ +	struct rq *rq;
+ +	long ret;
+ +
+ +	current->in_iowait = 1;
+ +	if (old_iowait)
+ +		blk_schedule_flush_plug(current);
+ +	else
+ +		blk_flush_plug(current);
+ +
+ +	delayacct_blkio_start();
+ +	rq = raw_rq();
+ +	atomic_inc(&rq->nr_iowait);
+ +	ret = schedule_timeout(timeout);
+ +	current->in_iowait = old_iowait;
+ +	atomic_dec(&rq->nr_iowait);
+ +	delayacct_blkio_end();
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL(io_schedule_timeout);
+ +
+ +/**
+ + * sys_sched_get_priority_max - return maximum RT priority.
+ + * @policy: scheduling class.
+ + *
+ + * Return: On success, this syscall returns the maximum
+ + * rt_priority that can be used by a given scheduling class.
+ + * On failure, a negative error code is returned.
+ + */
+ +SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
+ +{
+ +	int ret = -EINVAL;
+ +
+ +	switch (policy) {
+ +	case SCHED_FIFO:
+ +	case SCHED_RR:
+ +		ret = MAX_USER_RT_PRIO-1;
+ +		break;
+ +	case SCHED_DEADLINE:
+ +	case SCHED_NORMAL:
+ +	case SCHED_BATCH:
+ +	case SCHED_IDLE:
+ +		ret = 0;
+ +		break;
+ +	}
+ +	return ret;
+ +}
+ +
+ +/**
+ + * sys_sched_get_priority_min - return minimum RT priority.
+ + * @policy: scheduling class.
+ + *
+ + * Return: On success, this syscall returns the minimum
+ + * rt_priority that can be used by a given scheduling class.
+ + * On failure, a negative error code is returned.
+ + */
+ +SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ +{
+ +	int ret = -EINVAL;
+ +
+ +	switch (policy) {
+ +	case SCHED_FIFO:
+ +	case SCHED_RR:
+ +		ret = 1;
+ +		break;
+ +	case SCHED_DEADLINE:
+ +	case SCHED_NORMAL:
+ +	case SCHED_BATCH:
+ +	case SCHED_IDLE:
+ +		ret = 0;
+ +	}
+ +	return ret;
+ +}
+ +
+ +/**
+ + * sys_sched_rr_get_interval - return the default timeslice of a process.
+ + * @pid: pid of the process.
+ + * @interval: userspace pointer to the timeslice value.
+ + *
+ + * this syscall writes the default timeslice value of a given process
+ + * into the user-space timespec buffer. A value of '0' means infinity.
+ + *
+ + * Return: On success, 0 and the timeslice is in @interval. Otherwise,
+ + * an error code.
+ + */
+ +SYSCALL_DEFINE2(sched_rr_get_interval, pid_t, pid,
+ +		struct timespec __user *, interval)
+ +{
+ +	struct task_struct *p;
+ +	unsigned int time_slice;
+ +	unsigned long flags;
+ +	struct rq *rq;
+ +	int retval;
+ +	struct timespec t;
+ +
+ +	if (pid < 0)
+ +		return -EINVAL;
+ +
+ +	retval = -ESRCH;
+ +	rcu_read_lock();
+ +	p = find_process_by_pid(pid);
+ +	if (!p)
+ +		goto out_unlock;
+ +
+ +	retval = security_task_getscheduler(p);
+ +	if (retval)
+ +		goto out_unlock;
+ +
+ +	rq = task_rq_lock(p, &flags);
+ +	time_slice = p->sched_class->get_rr_interval(rq, p);
+ +	task_rq_unlock(rq, p, &flags);
+ +
+ +	rcu_read_unlock();
+ +	jiffies_to_timespec(time_slice, &t);
+ +	retval = copy_to_user(interval, &t, sizeof(t)) ? -EFAULT : 0;
+ +	return retval;
+ +
+ +out_unlock:
+ +	rcu_read_unlock();
+ +	return retval;
+ +}
+ +
+ +static const char stat_nam[] = TASK_STATE_TO_CHAR_STR;
+ +
+ +void sched_show_task(struct task_struct *p)
+ +{
+ +	unsigned long free = 0;
+ +	int ppid;
+ +	unsigned state;
+ +
+ +	state = p->state ? __ffs(p->state) + 1 : 0;
+ +	printk(KERN_INFO "%-15.15s %c", p->comm,
+ +		state < sizeof(stat_nam) - 1 ? stat_nam[state] : '?');
+ +#if BITS_PER_LONG == 32
+ +	if (state == TASK_RUNNING)
+ +		printk(KERN_CONT " running  ");
+ +	else
+ +		printk(KERN_CONT " %08lx ", thread_saved_pc(p));
+ +#else
+ +	if (state == TASK_RUNNING)
+ +		printk(KERN_CONT "  running task    ");
+ +	else
+ +		printk(KERN_CONT " %016lx ", thread_saved_pc(p));
+ +#endif
+ +#ifdef CONFIG_DEBUG_STACK_USAGE
+ +	free = stack_not_used(p);
+ +#endif
+ +	rcu_read_lock();
+ +	ppid = task_pid_nr(rcu_dereference(p->real_parent));
+ +	rcu_read_unlock();
+ +	printk(KERN_CONT "%5lu %5d %6d 0x%08lx\n", free,
+ +		task_pid_nr(p), ppid,
+ +		(unsigned long)task_thread_info(p)->flags);
+ +
+ +	print_worker_info(KERN_INFO, p);
+ +	show_stack(p, NULL);
+ +}
+ +
+ +void show_state_filter(unsigned long state_filter)
+ +{
+ +	struct task_struct *g, *p;
+ +
+ +#if BITS_PER_LONG == 32
+ +	printk(KERN_INFO
+ +		"  task                PC stack   pid father\n");
+ +#else
+ +	printk(KERN_INFO
+ +		"  task                        PC stack   pid father\n");
+ +#endif
+ +	rcu_read_lock();
+ +	do_each_thread(g, p) {
+ +		/*
+ +		 * reset the NMI-timeout, listing all files on a slow
+ +		 * console might take a lot of time:
+ +		 */
+ +		touch_nmi_watchdog();
+ +		if (!state_filter || (p->state & state_filter))
+ +			sched_show_task(p);
+ +	} while_each_thread(g, p);
+ +
+ +	touch_all_softlockup_watchdogs();
+ +
+ +#ifdef CONFIG_SCHED_DEBUG
+ +	sysrq_sched_debug_show();
+ +#endif
+ +	rcu_read_unlock();
+ +	/*
+ +	 * Only show locks if all tasks are dumped:
+ +	 */
+ +	if (!state_filter)
+ +		debug_show_all_locks();
+ +}
+ +
+ +void init_idle_bootup_task(struct task_struct *idle)
+ +{
+ +	idle->sched_class = &idle_sched_class;
+ +}
+ +
+ +/**
+ + * init_idle - set up an idle thread for a given CPU
+ + * @idle: task in question
+ + * @cpu: cpu the idle task belongs to
+ + *
+ + * NOTE: this function does not set the idle thread's NEED_RESCHED
+ + * flag, to make booting more robust.
+ + */
+ +void init_idle(struct task_struct *idle, int cpu)
+ +{
+ +	struct rq *rq = cpu_rq(cpu);
+ +	unsigned long flags;
+ +
+ +	raw_spin_lock_irqsave(&rq->lock, flags);
+ +
+ +	__sched_fork(0, idle);
+ +	idle->state = TASK_RUNNING;
+ +	idle->se.exec_start = sched_clock();
+ +
+ +	do_set_cpus_allowed(idle, cpumask_of(cpu));
+ +	/*
+ +	 * We're having a chicken and egg problem, even though we are
+ +	 * holding rq->lock, the cpu isn't yet set to this cpu so the
+ +	 * lockdep check in task_group() will fail.
+ +	 *
+ +	 * Similar case to sched_fork(). / Alternatively we could
+ +	 * use task_rq_lock() here and obtain the other rq->lock.
+ +	 *
+ +	 * Silence PROVE_RCU
+ +	 */
+ +	rcu_read_lock();
+ +	__set_task_cpu(idle, cpu);
+ +	rcu_read_unlock();
+ +
+ +	rq->curr = rq->idle = idle;
+ +#if defined(CONFIG_SMP)
+ +	idle->on_cpu = 1;
+ +#endif
+ +	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ +
+ +	/* Set the preempt count _outside_ the spinlocks! */
+ +	task_thread_info(idle)->preempt_count = 0;
+ +
+ +	/*
+ +	 * The idle tasks have their own, simple scheduling class:
+ +	 */
+ +	idle->sched_class = &idle_sched_class;
+ +	ftrace_graph_init_idle_task(idle, cpu);
+ +	vtime_init_idle(idle, cpu);
+ +#if defined(CONFIG_SMP)
+ +	sprintf(idle->comm, "%s/%d", INIT_TASK_COMM, cpu);
+ +#endif
+ +}
+ +
+ +int cpuset_cpumask_can_shrink(const struct cpumask *cur,
+ +			      const struct cpumask *trial)
+ +{
+ +	int ret = 1, trial_cpus;
+ +	struct dl_bw *cur_dl_b;
+ +	unsigned long flags;
+ +
+ +	if (!cpumask_weight(cur))
+ +		return ret;
+ +
+ +	rcu_read_lock_sched();
+ +	cur_dl_b = dl_bw_of(cpumask_any(cur));
+ +	trial_cpus = cpumask_weight(trial);
+ +
+ +	raw_spin_lock_irqsave(&cur_dl_b->lock, flags);
+ +	if (cur_dl_b->bw != -1 &&
+ +	    cur_dl_b->bw * trial_cpus < cur_dl_b->total_bw)
+ +		ret = 0;
+ +	raw_spin_unlock_irqrestore(&cur_dl_b->lock, flags);
+ +	rcu_read_unlock_sched();
+ +
+ +	return ret;
+ +}
+ +
+ +int task_can_attach(struct task_struct *p,
+ +		    const struct cpumask *cs_cpus_allowed)
+ +{
+ +	int ret = 0;
+ +
+ +	/*
+ +	 * Kthreads which disallow setaffinity shouldn't be moved
+ +	 * to a new cpuset; we don't want to change their cpu
+ +	 * affinity and isolating such threads by their set of
+ +	 * allowed nodes is unnecessary.  Thus, cpusets are not
+ +	 * applicable for such threads.  This prevents checking for
+ +	 * success of set_cpus_allowed_ptr() on all attached tasks
+ +	 * before cpus_allowed may be changed.
+ +	 */
+ +	if (p->flags & PF_NO_SETAFFINITY) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +#ifdef CONFIG_SMP
+ +	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
+ +					      cs_cpus_allowed)) {
+ +		unsigned int dest_cpu = cpumask_any_and(cpu_active_mask,
+ +							cs_cpus_allowed);
+ +		struct dl_bw *dl_b;
+ +		bool overflow;
+ +		int cpus;
+ +		unsigned long flags;
+ +
+ +		rcu_read_lock_sched();
+ +		dl_b = dl_bw_of(dest_cpu);
+ +		raw_spin_lock_irqsave(&dl_b->lock, flags);
+ +		cpus = dl_bw_cpus(dest_cpu);
+ +		overflow = __dl_overflow(dl_b, cpus, 0, p->dl.dl_bw);
+ +		if (overflow)
+ +			ret = -EBUSY;
+ +		else {
+ +			/*
+ +			 * We reserve space for this task in the destination
+ +			 * root_domain, as we can't fail after this point.
+ +			 * We will free resources in the source root_domain
+ +			 * later on (see set_cpus_allowed_dl()).
+ +			 */
+ +			__dl_add(dl_b, p->dl.dl_bw);
+ +		}
+ +		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
+ +		rcu_read_unlock_sched();
+ +
+ +	}
+ +#endif
+ +out:
+ +	return ret;
+ +}
+ +
+ +#ifdef CONFIG_SMP
+ +void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
+ +{
+ +	if (p->sched_class && p->sched_class->set_cpus_allowed)
+ +		p->sched_class->set_cpus_allowed(p, new_mask);
+ +
+ +	cpumask_copy(&p->cpus_allowed, new_mask);
+ +	p->nr_cpus_allowed = cpumask_weight(new_mask);
+ +}
+ +
+ +/*
+ + * This is how migration works:
+ + *
+ + * 1) we invoke migration_cpu_stop() on the target CPU using
+ + *    stop_one_cpu().
+ + * 2) stopper starts to run (implicitly forcing the migrated thread
+ + *    off the CPU)
+ + * 3) it checks whether the migrated task is still in the wrong runqueue.
+ + * 4) if it's in the wrong runqueue then the migration thread removes
+ + *    it and puts it into the right queue.
+ + * 5) stopper completes and stop_one_cpu() returns and the migration
+ + *    is done.
+ + */
+ +
+ +/*
+ + * Change a given task's CPU affinity. Migrate the thread to a
+ + * proper CPU and schedule it away if the CPU it's executing on
+ + * is removed from the allowed bitmask.
+ + *
+ + * NOTE: the caller must have a valid reference to the task, the
+ + * task must not exit() & deallocate itself prematurely. The
+ + * call is not atomic; no spinlocks may be held.
+ + */
+ +int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
+ +{
+ +	unsigned long flags;
+ +	struct rq *rq;
+ +	unsigned int dest_cpu;
+ +	int ret = 0;
+ +
+ +	rq = task_rq_lock(p, &flags);
+ +
+ +	if (cpumask_equal(&p->cpus_allowed, new_mask))
+ +		goto out;
+ +
+ +	if (!cpumask_intersects(new_mask, cpu_active_mask)) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +	do_set_cpus_allowed(p, new_mask);
+ +
+ +	/* Can the task run on the task's current CPU? If so, we're done */
+ +	if (cpumask_test_cpu(task_cpu(p), new_mask))
+ +		goto out;
+ +
+ +	dest_cpu = cpumask_any_and(cpu_active_mask, new_mask);
+ +	if (p->on_rq) {
+ +		struct migration_arg arg = { p, dest_cpu };
+ +		/* Need help from migration thread: drop lock and wait. */
+ +		task_rq_unlock(rq, p, &flags);
+ +		stop_one_cpu(cpu_of(rq), migration_cpu_stop, &arg);
+ +		tlb_migrate_finish(p->mm);
+ +		return 0;
+ +	}
+ +out:
+ +	task_rq_unlock(rq, p, &flags);
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
+  
+  /*
+ - * sys_nice - change the priority of the current process.
+ - * @increment: priority increment
+ + * Move (not current) task off this cpu, onto dest cpu. We're doing
+ + * this because either it can't run here any more (set_cpus_allowed()
+ + * away from this CPU, or CPU going down), or because we're
+ + * attempting to rebalance this task on exec (sched_exec).
+   *
+ - * sys_setpriority is a more generic, but much slower function that
+ - * does similar things.
+ + * So we race with normal scheduler movements, but that's OK, as long
+ + * as the task is no longer on this CPU.
+ + *
+ + * Returns non-zero if task was successfully migrated.
+   */
+ -SYSCALL_DEFINE1(nice, int, increment)
+ +static int __migrate_task(struct task_struct *p, int src_cpu, int dest_cpu)
+  {
+ -	long nice, retval;
+ +	struct rq *rq_dest, *rq_src;
+ +	int ret = 0;
+  
+ -	/*
+ -	 * Setpriority might change our priority at the same moment.
+ -	 * We don't have to worry. Conceptually one call occurs first
+ -	 * and we have a single winner.
+ -	 */
+ -	increment = clamp(increment, -NICE_WIDTH, NICE_WIDTH);
+ -	nice = task_nice(current) + increment;
+ +	if (unlikely(!cpu_active(dest_cpu)))
+ +		return ret;
+  
+ -	nice = clamp_val(nice, MIN_NICE, MAX_NICE);
+ -	if (increment < 0 && !can_nice(current, nice))
+ -		return -EPERM;
+ +	rq_src = cpu_rq(src_cpu);
+ +	rq_dest = cpu_rq(dest_cpu);
+  
+ -	retval = security_task_setnice(current, nice);
+ -	if (retval)
+ -		return retval;
+ +	raw_spin_lock(&p->pi_lock);
+ +	double_rq_lock(rq_src, rq_dest);
+ +	/* Already moved. */
+ +	if (task_cpu(p) != src_cpu)
+ +		goto done;
+ +	/* Affinity changed (again). */
+ +	if (!cpumask_test_cpu(dest_cpu, tsk_cpus_allowed(p)))
+ +		goto fail;
+  
+ -	set_user_nice(current, nice);
+ -	return 0;
+ +	/*
+ +	 * If we're not on a rq, the next wake-up will ensure we're
+ +	 * placed properly.
+ +	 */
+ +	if (p->on_rq) {
+ +		dequeue_task(rq_src, p, 0);
+ +		set_task_cpu(p, dest_cpu);
+ +		enqueue_task(rq_dest, p, 0);
+ +		check_preempt_curr(rq_dest, p, 0);
+ +	}
+ +done:
+ +	ret = 1;
+ +fail:
+ +	double_rq_unlock(rq_src, rq_dest);
+ +	raw_spin_unlock(&p->pi_lock);
+ +	return ret;
+  }
+  
+ -#endif
+ -
+ -/**
+ - * task_prio - return the priority value of a given task.
+ - * @p: the task in question.
+ - *
+ - * Return: The priority value as seen by users in /proc.
+ - * RT tasks are offset by -200. Normal tasks are centered
+ - * around 0, value goes from -16 to +15.
+ - */
+ -int task_prio(const struct task_struct *p)
+ -{
+ -	return p->prio - MAX_RT_PRIO;
+ -}
+ +static bool sched_smp_initialized __read_mostly;
+  
+ -/**
+ - * idle_cpu - is a given CPU idle currently?
+ - * @cpu: the processor in question.
+ - *
+ - * Return: 1 if the CPU is currently idle. 0 otherwise.
+ - */
+ -int idle_cpu(int cpu)
+ +#ifdef CONFIG_NUMA_BALANCING
+ +/* Migrate current task p to target_cpu */
+ +int migrate_task_to(struct task_struct *p, int target_cpu)
+  {
+ -	struct rq *rq = cpu_rq(cpu);
+ +	struct migration_arg arg = { p, target_cpu };
+ +	int curr_cpu = task_cpu(p);
+  
+ -	if (rq->curr != rq->idle)
+ +	if (curr_cpu == target_cpu)
+  		return 0;
+  
+ -	if (rq->nr_running)
+ -		return 0;
+ +	if (!cpumask_test_cpu(target_cpu, tsk_cpus_allowed(p)))
+ +		return -EINVAL;
+  
+ -#ifdef CONFIG_SMP
+ -	if (!llist_empty(&rq->wake_list))
+ -		return 0;
+ -#endif
+ +	/* TODO: This is not properly updating schedstats */
+  
+ -	return 1;
+ +	trace_sched_move_numa(p, curr_cpu, target_cpu);
+ +	return stop_one_cpu(curr_cpu, migration_cpu_stop, &arg);
+  }
+  
+ -/**
+ - * idle_task - return the idle task for a given CPU.
+ - * @cpu: the processor in question.
+ - *
+ - * Return: The idle task for the CPU @cpu.
+ +/*
+ + * Requeue a task on a given node and accurately track the number of NUMA
+ + * tasks on the runqueues
+   */
+ -struct task_struct *idle_task(int cpu)
+ +void sched_setnuma(struct task_struct *p, int nid)
+  {
+ -	return cpu_rq(cpu)->idle;
+ -}
+ +	struct rq *rq;
+ +	unsigned long flags;
+ +	bool on_rq, running;
+  
+ -/**
+ - * find_process_by_pid - find a process with a matching PID value.
+ - * @pid: the pid in question.
+ - *
+ - * The task of @pid, if found. %NULL otherwise.
+ - */
+ -static struct task_struct *find_process_by_pid(pid_t pid)
+ -{
+ -	return pid ? find_task_by_vpid(pid) : current;
+ -}
+ +	rq = task_rq_lock(p, &flags);
+ +	on_rq = p->on_rq;
+ +	running = task_current(rq, p);
+  
+ -/*
+ - * This function initializes the sched_dl_entity of a newly becoming
+ - * SCHED_DEADLINE task.
+ - *
+ - * Only the static values are considered here, the actual runtime and the
+ - * absolute deadline will be properly calculated when the task is enqueued
+ - * for the first time with its new policy.
+ - */
+ -static void
+ -__setparam_dl(struct task_struct *p, const struct sched_attr *attr)
+ -{
+ -	struct sched_dl_entity *dl_se = &p->dl;
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+ +	if (running)
+ +		p->sched_class->put_prev_task(rq, p);
+  
+ -	dl_se->dl_runtime = attr->sched_runtime;
+ -	dl_se->dl_deadline = attr->sched_deadline;
+ -	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
+ -	dl_se->flags = attr->sched_flags;
+ -	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
+ +	p->numa_preferred_nid = nid;
+  
+ -	/*
+ -	 * Changing the parameters of a task is 'tricky' and we're not doing
+ -	 * the correct thing -- also see task_dead_dl() and switched_from_dl().
+ -	 *
+ -	 * What we SHOULD do is delay the bandwidth release until the 0-lag
+ -	 * point. This would include retaining the task_struct until that time
+ -	 * and change dl_overflow() to not immediately decrement the current
+ -	 * amount.
+ -	 *
+ -	 * Instead we retain the current runtime/deadline and let the new
+ -	 * parameters take effect after the current reservation period lapses.
+ -	 * This is safe (albeit pessimistic) because the 0-lag point is always
+ -	 * before the current scheduling deadline.
+ -	 *
+ -	 * We can still have temporary overloads because we do not delay the
+ -	 * change in bandwidth until that time; so admission control is
+ -	 * not on the safe side. It does however guarantee tasks will never
+ -	 * consume more than promised.
+ -	 */
+ +	if (running)
+ +		p->sched_class->set_curr_task(rq);
+ +	if (on_rq)
+ +		enqueue_task(rq, p, 0);
+ +	task_rq_unlock(rq, p, &flags);
+  }
+ +#endif
+  
+  /*
+ - * sched_setparam() passes in -1 for its policy, to let the functions
+ - * it calls know not to change it.
+ + * migration_cpu_stop - this will be executed by a highprio stopper thread
+ + * and performs thread migration by bumping thread off CPU then
+ + * 'pushing' onto another runqueue.
+   */
+ -#define SETPARAM_POLICY	-1
+ -
+ -static void __setscheduler_params(struct task_struct *p,
+ -		const struct sched_attr *attr)
+ +static int migration_cpu_stop(void *data)
+  {
+ -	int policy = attr->sched_policy;
+ -
+ -	if (policy == SETPARAM_POLICY)
+ -		policy = p->policy;
+ -
+ -	p->policy = policy;
+ -
+ -	if (dl_policy(policy))
+ -		__setparam_dl(p, attr);
+ -	else if (fair_policy(policy))
+ -		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ +	struct migration_arg *arg = data;
+  
+  	/*
+ -	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+ -	 * !rt_policy. Always setting this ensures that things like
+ -	 * getparam()/getattr() don't report silly values for !rt tasks.
+ +	 * The original target cpu might have gone down and we might
+ +	 * be on another cpu but it doesn't matter.
+  	 */
+ -	p->rt_priority = attr->sched_priority;
+ -	p->normal_prio = normal_prio(p);
+ -	set_load_weight(p);
+ +	local_irq_disable();
+ +	__migrate_task(arg->task, raw_smp_processor_id(), arg->dest_cpu);
+ +	local_irq_enable();
+ +	return 0;
+  }
+  
+ -/* Actually do priority change: must hold pi & rq lock. */
+ -static void __setscheduler(struct rq *rq, struct task_struct *p,
+ -			   const struct sched_attr *attr, bool keep_boost)
+ +#ifdef CONFIG_HOTPLUG_CPU
+ +
+ +/*
+ + * Ensures that the idle task is using init_mm right before its cpu goes
+ + * offline.
+ + */
+ +void idle_task_exit(void)
+  {
+ -	__setscheduler_params(p, attr);
+ +	struct mm_struct *mm = current->active_mm;
+  
+ -	/*
+ -	 * Keep a potential priority boosting if called from
+ -	 * sched_setscheduler().
+ -	 */
+ -	p->prio = normal_prio(p);
+ -	if (keep_boost)
+ -		p->prio = rt_effective_prio(p, p->prio);
+ +	BUG_ON(cpu_online(smp_processor_id()));
+  
+ -	if (dl_prio(p->prio))
+ -		p->sched_class = &dl_sched_class;
+ -	else if (rt_prio(p->prio))
+ -		p->sched_class = &rt_sched_class;
+ -	else
+ -		p->sched_class = &fair_sched_class;
+++<<<<<<< HEAD
+ +	if (mm != &init_mm)
+ +		switch_mm(mm, &init_mm, current);
+++=======
+++	if (mm != &init_mm) {
+++		switch_mm(mm, &init_mm, current);
+++		finish_arch_post_lock_switch();
+++	}
+++>>>>>>> 252d2a4117bc (sched/core: Idle_task_exit() shouldn't use switch_mm_irqs_off())
+ +	mmdrop(mm);
+  }
+  
+ -static void
+ -__getparam_dl(struct task_struct *p, struct sched_attr *attr)
+ +/*
+ + * Since this CPU is going 'away' for a while, fold any nr_active delta
+ + * we might have. Assumes we're called after migrate_tasks() so that the
+ + * nr_active count is stable.
+ + *
+ + * Also see the comment "Global load-average calculations".
+ + */
+ +static void calc_load_migrate(struct rq *rq)
+  {
+ -	struct sched_dl_entity *dl_se = &p->dl;
+ -
+ -	attr->sched_priority = p->rt_priority;
+ -	attr->sched_runtime = dl_se->dl_runtime;
+ -	attr->sched_deadline = dl_se->dl_deadline;
+ -	attr->sched_period = dl_se->dl_period;
+ -	attr->sched_flags = dl_se->flags;
+ +	long delta = calc_load_fold_active(rq);
+ +	if (delta)
+ +		atomic_long_add(delta, &calc_load_tasks);
+  }
+  
+  /*
+* Unmerged path kernel/sched/core.c
