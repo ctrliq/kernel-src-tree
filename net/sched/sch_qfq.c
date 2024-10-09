@@ -390,7 +390,7 @@ static int qfq_change_agg(struct Qdisc *sch, struct qfq_class *cl, u32 weight,
 	struct qfq_aggregate *new_agg;
 
 	/* 'lmax' can range from [QFQ_MIN_LMAX, pktlen + stab overhead] */
-	if (lmax > QFQ_MAX_LMAX)
+	if (lmax > (1UL << QFQ_MTU_SHIFT))
 		return -EINVAL;
 
 	new_agg = qfq_find_agg(q, lmax, weight);
