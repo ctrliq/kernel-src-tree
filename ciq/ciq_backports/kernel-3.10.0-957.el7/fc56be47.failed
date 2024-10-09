@@ -1,0 +1,694 @@
+devlink: convert occ_get op to separate registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit fc56be47da8cb111add373c36230b0139139898f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fc56be47.failed
+
+This resolves race during initialization where the resources with
+ops are registered before driver and the structures used by occ_get
+op is initialized. So keep occ_get callbacks registered only when
+all structs are initialized.
+
+The example flows, as it is in mlxsw:
+1) driver load/asic probe:
+   mlxsw_core
+      -> mlxsw_sp_resources_register
+        -> mlxsw_sp_kvdl_resources_register
+          -> devlink_resource_register IDX
+   mlxsw_spectrum
+      -> mlxsw_sp_kvdl_init
+        -> mlxsw_sp_kvdl_parts_init
+          -> mlxsw_sp_kvdl_part_init
+            -> devlink_resource_size_get IDX (to get the current setup
+                                              size from devlink)
+        -> devlink_resource_occ_get_register IDX (register current
+                                                  occupancy getter)
+2) reload triggered by devlink command:
+  -> mlxsw_devlink_core_bus_device_reload
+    -> mlxsw_sp_fini
+      -> mlxsw_sp_kvdl_fini
+	-> devlink_resource_occ_get_unregister IDX
+    (struct mlxsw_sp *mlxsw_sp is freed at this point, call to occ get
+     which is using mlxsw_sp would cause use-after free)
+    -> mlxsw_sp_init
+      -> mlxsw_sp_kvdl_init
+        -> mlxsw_sp_kvdl_parts_init
+          -> mlxsw_sp_kvdl_part_init
+            -> devlink_resource_size_get IDX (to get the current setup
+                                              size from devlink)
+        -> devlink_resource_occ_get_register IDX (register current
+                                                  occupancy getter)
+
+Fixes: d9f9b9a4d05f ("devlink: Add support for resource abstraction")
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fc56be47da8cb111add373c36230b0139139898f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+#	drivers/net/netdevsim/devlink.c
+#	include/net/devlink.h
+#	net/core/devlink.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 6957213219f7,ca38a30fbe91..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -3841,9 -3803,165 +3841,169 @@@ static const struct mlxsw_config_profil
+  			.type		= MLXSW_PORT_SWID_TYPE_ETH,
+  		}
+  	},
+ +	.resource_query_enable		= 1,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ mlxsw_sp_resource_size_params_prepare(struct mlxsw_core *mlxsw_core,
++ 				      struct devlink_resource_size_params *kvd_size_params,
++ 				      struct devlink_resource_size_params *linear_size_params,
++ 				      struct devlink_resource_size_params *hash_double_size_params,
++ 				      struct devlink_resource_size_params *hash_single_size_params)
++ {
++ 	u32 single_size_min = MLXSW_CORE_RES_GET(mlxsw_core,
++ 						 KVD_SINGLE_MIN_SIZE);
++ 	u32 double_size_min = MLXSW_CORE_RES_GET(mlxsw_core,
++ 						 KVD_DOUBLE_MIN_SIZE);
++ 	u32 kvd_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE);
++ 	u32 linear_size_min = 0;
++ 
++ 	devlink_resource_size_params_init(kvd_size_params, kvd_size, kvd_size,
++ 					  MLXSW_SP_KVD_GRANULARITY,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	devlink_resource_size_params_init(linear_size_params, linear_size_min,
++ 					  kvd_size - single_size_min -
++ 					  double_size_min,
++ 					  MLXSW_SP_KVD_GRANULARITY,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	devlink_resource_size_params_init(hash_double_size_params,
++ 					  double_size_min,
++ 					  kvd_size - single_size_min -
++ 					  linear_size_min,
++ 					  MLXSW_SP_KVD_GRANULARITY,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	devlink_resource_size_params_init(hash_single_size_params,
++ 					  single_size_min,
++ 					  kvd_size - double_size_min -
++ 					  linear_size_min,
++ 					  MLXSW_SP_KVD_GRANULARITY,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ }
++ 
++ static int mlxsw_sp_resources_register(struct mlxsw_core *mlxsw_core)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
++ 	struct devlink_resource_size_params hash_single_size_params;
++ 	struct devlink_resource_size_params hash_double_size_params;
++ 	struct devlink_resource_size_params linear_size_params;
++ 	struct devlink_resource_size_params kvd_size_params;
++ 	u32 kvd_size, single_size, double_size, linear_size;
++ 	const struct mlxsw_config_profile *profile;
++ 	int err;
++ 
++ 	profile = &mlxsw_sp_config_profile;
++ 	if (!MLXSW_CORE_RES_VALID(mlxsw_core, KVD_SIZE))
++ 		return -EIO;
++ 
++ 	mlxsw_sp_resource_size_params_prepare(mlxsw_core, &kvd_size_params,
++ 					      &linear_size_params,
++ 					      &hash_double_size_params,
++ 					      &hash_single_size_params);
++ 
++ 	kvd_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD,
++ 					kvd_size, MLXSW_SP_RESOURCE_KVD,
++ 					DEVLINK_RESOURCE_ID_PARENT_TOP,
++ 					&kvd_size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	linear_size = profile->kvd_linear_size;
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR,
++ 					linear_size,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					MLXSW_SP_RESOURCE_KVD,
++ 					&linear_size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlxsw_sp_kvdl_resources_register(mlxsw_core);
++ 	if  (err)
++ 		return err;
++ 
++ 	double_size = kvd_size - linear_size;
++ 	double_size *= profile->kvd_hash_double_parts;
++ 	double_size /= profile->kvd_hash_double_parts +
++ 		       profile->kvd_hash_single_parts;
++ 	double_size = rounddown(double_size, MLXSW_SP_KVD_GRANULARITY);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_HASH_DOUBLE,
++ 					double_size,
++ 					MLXSW_SP_RESOURCE_KVD_HASH_DOUBLE,
++ 					MLXSW_SP_RESOURCE_KVD,
++ 					&hash_double_size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	single_size = kvd_size - double_size - linear_size;
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_HASH_SINGLE,
++ 					single_size,
++ 					MLXSW_SP_RESOURCE_KVD_HASH_SINGLE,
++ 					MLXSW_SP_RESOURCE_KVD,
++ 					&hash_single_size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static int mlxsw_sp_kvd_sizes_get(struct mlxsw_core *mlxsw_core,
++ 				  const struct mlxsw_config_profile *profile,
++ 				  u64 *p_single_size, u64 *p_double_size,
++ 				  u64 *p_linear_size)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
++ 	u32 double_size;
++ 	int err;
++ 
++ 	if (!MLXSW_CORE_RES_VALID(mlxsw_core, KVD_SINGLE_MIN_SIZE) ||
++ 	    !MLXSW_CORE_RES_VALID(mlxsw_core, KVD_DOUBLE_MIN_SIZE))
++ 		return -EIO;
++ 
++ 	/* The hash part is what left of the kvd without the
++ 	 * linear part. It is split to the single size and
++ 	 * double size by the parts ratio from the profile.
++ 	 * Both sizes must be a multiplications of the
++ 	 * granularity from the profile. In case the user
++ 	 * provided the sizes they are obtained via devlink.
++ 	 */
++ 	err = devlink_resource_size_get(devlink,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					p_linear_size);
++ 	if (err)
++ 		*p_linear_size = profile->kvd_linear_size;
++ 
++ 	err = devlink_resource_size_get(devlink,
++ 					MLXSW_SP_RESOURCE_KVD_HASH_DOUBLE,
++ 					p_double_size);
++ 	if (err) {
++ 		double_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE) -
++ 			      *p_linear_size;
++ 		double_size *= profile->kvd_hash_double_parts;
++ 		double_size /= profile->kvd_hash_double_parts +
++ 			       profile->kvd_hash_single_parts;
++ 		*p_double_size = rounddown(double_size,
++ 					   MLXSW_SP_KVD_GRANULARITY);
++ 	}
++ 
++ 	err = devlink_resource_size_get(devlink,
++ 					MLXSW_SP_RESOURCE_KVD_HASH_SINGLE,
++ 					p_single_size);
++ 	if (err)
++ 		*p_single_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE) -
++ 				 *p_double_size - *p_linear_size;
++ 
++ 	/* Check results are legal. */
++ 	if (*p_single_size < MLXSW_CORE_RES_GET(mlxsw_core, KVD_SINGLE_MIN_SIZE) ||
++ 	    *p_double_size < MLXSW_CORE_RES_GET(mlxsw_core, KVD_DOUBLE_MIN_SIZE) ||
++ 	    MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE) < *p_linear_size)
++ 		return -EIO;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  static struct mlxsw_driver mlxsw_sp_driver = {
+  	.kind				= mlxsw_sp_driver_name,
+  	.priv_size			= sizeof(struct mlxsw_sp),
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 84ce83acdc19,804d4d2c8031..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@@ -397,6 -437,12 +397,13 @@@ void mlxsw_sp_rif_destroy(struct mlxsw_
+  int mlxsw_sp_kvdl_alloc(struct mlxsw_sp *mlxsw_sp, unsigned int entry_count,
+  			u32 *p_entry_index);
+  void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index);
+++<<<<<<< HEAD
+++=======
++ int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int entry_count,
++ 				   unsigned int *p_alloc_size);
++ int mlxsw_sp_kvdl_resources_register(struct mlxsw_core *mlxsw_core);
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  
+  struct mlxsw_sp_acl_rule_info {
+  	unsigned int priority;
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+index 26c26cd30c3d,fe4327f547d2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+@@@ -48,46 -177,278 +48,205 @@@
+  int mlxsw_sp_kvdl_alloc(struct mlxsw_sp *mlxsw_sp, unsigned int entry_count,
+  			u32 *p_entry_index)
+  {
+ -	struct mlxsw_sp_kvdl_part *part;
+ -
+ -	/* Find partition with smallest allocation size satisfying the
+ -	 * requested size.
+ -	 */
+ -	part = mlxsw_sp_kvdl_alloc_size_part(mlxsw_sp->kvdl, entry_count);
+ -	if (IS_ERR(part))
+ -		return PTR_ERR(part);
+ -
+ -	return mlxsw_sp_kvdl_part_alloc(part, p_entry_index);
+ -}
+ -
+ -void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index)
+ -{
+ -	struct mlxsw_sp_kvdl_part *part;
+ -
+ -	part = mlxsw_sp_kvdl_index_part(mlxsw_sp->kvdl, entry_index);
+ -	if (IS_ERR(part))
+ -		return;
+ -	mlxsw_sp_kvdl_part_free(part, entry_index);
+ -}
+ -
+ -int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
+ -				   unsigned int entry_count,
+ -				   unsigned int *p_alloc_size)
+ -{
+ -	struct mlxsw_sp_kvdl_part *part;
+ -
+ -	part = mlxsw_sp_kvdl_alloc_size_part(mlxsw_sp->kvdl, entry_count);
+ -	if (IS_ERR(part))
+ -		return PTR_ERR(part);
+ -
+ -	*p_alloc_size = part->info.alloc_size;
+ -
+ -	return 0;
+ -}
+ -
+ -static void mlxsw_sp_kvdl_part_update(struct mlxsw_sp_kvdl_part *part,
+ -				      struct mlxsw_sp_kvdl_part *part_prev,
+ -				      unsigned int size)
+ -{
+ -
+ -	if (!part_prev) {
+ -		part->info.end_index = size - 1;
+ +	int entry_index;
+ +	int size;
+ +	int type_base;
+ +	int type_size;
+ +	int type_entries;
+ +
+ +	if (entry_count == 0 || entry_count > MLXSW_SP_CHUNK_MAX) {
+ +		return -EINVAL;
+ +	} else if (entry_count == 1) {
+ +		type_base = MLXSW_SP_KVDL_SINGLE_BASE;
+ +		type_size = MLXSW_SP_KVDL_SINGLE_SIZE;
+ +		type_entries = 1;
+  	} else {
+ -		part->info.start_index = part_prev->info.end_index + 1;
+ -		part->info.end_index = part->info.start_index + size - 1;
+ +		type_base = MLXSW_SP_KVDL_CHUNKS_BASE;
+ +		type_size = MLXSW_SP_KVDL_CHUNKS_SIZE;
+ +		type_entries = MLXSW_SP_CHUNK_MAX;
+  	}
+ -}
+  
+ -static struct mlxsw_sp_kvdl_part *
+ -mlxsw_sp_kvdl_part_init(struct mlxsw_sp *mlxsw_sp,
+ -			const struct mlxsw_sp_kvdl_part_info *info,
+ -			struct mlxsw_sp_kvdl_part *part_prev)
+ -{
+ -	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
+ -	struct mlxsw_sp_kvdl_part *part;
+ -	bool need_update = true;
+ -	unsigned int nr_entries;
+ -	size_t usage_size;
+ -	u64 resource_size;
+ -	int err;
+ -
+ -	err = devlink_resource_size_get(devlink, info->resource_id,
+ -					&resource_size);
+ -	if (err) {
+ -		need_update = false;
+ -		resource_size = info->end_index - info->start_index + 1;
+ -	}
+ -
+ -	nr_entries = div_u64(resource_size, info->alloc_size);
+ -	usage_size = BITS_TO_LONGS(nr_entries) * sizeof(unsigned long);
+ -	part = kzalloc(sizeof(*part) + usage_size, GFP_KERNEL);
+ -	if (!part)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	memcpy(&part->info, info, sizeof(part->info));
+ -
+ -	if (need_update)
+ -		mlxsw_sp_kvdl_part_update(part, part_prev, resource_size);
+ -	return part;
+ -}
+ +	entry_index = type_base;
+ +	size = type_base + type_size;
+ +	for_each_clear_bit_from(entry_index, mlxsw_sp->kvdl.usage, size) {
+ +		int i;
+  
+ -static void mlxsw_sp_kvdl_part_fini(struct mlxsw_sp_kvdl_part *part)
+ -{
+ -	kfree(part);
+ -}
+ -
+ -static int mlxsw_sp_kvdl_parts_init(struct mlxsw_sp *mlxsw_sp)
+ -{
+ -	struct mlxsw_sp_kvdl *kvdl = mlxsw_sp->kvdl;
+ -	const struct mlxsw_sp_kvdl_part_info *info;
+ -	struct mlxsw_sp_kvdl_part *part_prev = NULL;
+ -	int err, i;
+ -
+ -	for (i = 0; i < MLXSW_SP_KVDL_PARTS_INFO_LEN; i++) {
+ -		info = &mlxsw_sp_kvdl_parts_info[i];
+ -		kvdl->parts[i] = mlxsw_sp_kvdl_part_init(mlxsw_sp, info,
+ -							 part_prev);
+ -		if (IS_ERR(kvdl->parts[i])) {
+ -			err = PTR_ERR(kvdl->parts[i]);
+ -			goto err_kvdl_part_init;
+ -		}
+ -		part_prev = kvdl->parts[i];
+ +		for (i = 0; i < type_entries; i++)
+ +			set_bit(entry_index + i, mlxsw_sp->kvdl.usage);
+ +		*p_entry_index = entry_index;
+ +		return 0;
+  	}
+ -	return 0;
+ -
+ -err_kvdl_part_init:
+ -	for (i--; i >= 0; i--)
+ -		mlxsw_sp_kvdl_part_fini(kvdl->parts[i]);
+ -	return err;
+ +	return -ENOBUFS;
+  }
+  
+ -static void mlxsw_sp_kvdl_parts_fini(struct mlxsw_sp *mlxsw_sp)
+ +void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index)
+  {
+ -	struct mlxsw_sp_kvdl *kvdl = mlxsw_sp->kvdl;
+ +	int type_entries;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (entry_index < MLXSW_SP_KVDL_CHUNKS_BASE)
+ +		type_entries = 1;
+ +	else
+ +		type_entries = MLXSW_SP_CHUNK_MAX;
+ +	for (i = 0; i < type_entries; i++)
+ +		clear_bit(entry_index + i, mlxsw_sp->kvdl.usage);
+++=======
++ 	for (i = 0; i < MLXSW_SP_KVDL_PARTS_INFO_LEN; i++)
++ 		mlxsw_sp_kvdl_part_fini(kvdl->parts[i]);
++ }
++ 
++ static u64 mlxsw_sp_kvdl_part_occ(struct mlxsw_sp_kvdl_part *part)
++ {
++ 	const struct mlxsw_sp_kvdl_part_info *info = &part->info;
++ 	unsigned int nr_entries;
++ 	int bit = -1;
++ 	u64 occ = 0;
++ 
++ 	nr_entries = (info->end_index -
++ 		      info->start_index + 1) /
++ 		      info->alloc_size;
++ 	while ((bit = find_next_bit(part->usage, nr_entries, bit + 1))
++ 		< nr_entries)
++ 		occ += info->alloc_size;
++ 	return occ;
++ }
++ 
++ static u64 mlxsw_sp_kvdl_occ_get(void *priv)
++ {
++ 	const struct mlxsw_sp *mlxsw_sp = priv;
++ 	u64 occ = 0;
++ 	int i;
++ 
++ 	for (i = 0; i < MLXSW_SP_KVDL_PARTS_INFO_LEN; i++)
++ 		occ += mlxsw_sp_kvdl_part_occ(mlxsw_sp->kvdl->parts[i]);
++ 
++ 	return occ;
++ }
++ 
++ static u64 mlxsw_sp_kvdl_single_occ_get(void *priv)
++ {
++ 	const struct mlxsw_sp *mlxsw_sp = priv;
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp->kvdl->parts[MLXSW_SP_KVDL_PART_ID_SINGLE];
++ 	return mlxsw_sp_kvdl_part_occ(part);
++ }
++ 
++ static u64 mlxsw_sp_kvdl_chunks_occ_get(void *priv)
++ {
++ 	const struct mlxsw_sp *mlxsw_sp = priv;
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp->kvdl->parts[MLXSW_SP_KVDL_PART_ID_CHUNKS];
++ 	return mlxsw_sp_kvdl_part_occ(part);
++ }
++ 
++ static u64 mlxsw_sp_kvdl_large_chunks_occ_get(void *priv)
++ {
++ 	const struct mlxsw_sp *mlxsw_sp = priv;
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp->kvdl->parts[MLXSW_SP_KVDL_PART_ID_LARGE_CHUNKS];
++ 	return mlxsw_sp_kvdl_part_occ(part);
++ }
++ 
++ int mlxsw_sp_kvdl_resources_register(struct mlxsw_core *mlxsw_core)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_core);
++ 	static struct devlink_resource_size_params size_params;
++ 	u32 kvdl_max_size;
++ 	int err;
++ 
++ 	kvdl_max_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE) -
++ 			MLXSW_CORE_RES_GET(mlxsw_core, KVD_SINGLE_MIN_SIZE) -
++ 			MLXSW_CORE_RES_GET(mlxsw_core, KVD_DOUBLE_MIN_SIZE);
++ 
++ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
++ 					  MLXSW_SP_KVDL_SINGLE_ALLOC_SIZE,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_SINGLES,
++ 					MLXSW_SP_KVDL_SINGLE_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
++ 					  MLXSW_SP_KVDL_CHUNKS_ALLOC_SIZE,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_CHUNKS,
++ 					MLXSW_SP_KVDL_CHUNKS_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&size_params);
++ 	if (err)
++ 		return err;
++ 
++ 	devlink_resource_size_params_init(&size_params, 0, kvdl_max_size,
++ 					  MLXSW_SP_KVDL_LARGE_CHUNKS_ALLOC_SIZE,
++ 					  DEVLINK_RESOURCE_UNIT_ENTRY);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_LARGE_CHUNKS,
++ 					MLXSW_SP_KVDL_LARGE_CHUNKS_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&size_params);
++ 	return err;
++ }
++ 
++ int mlxsw_sp_kvdl_init(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 	struct mlxsw_sp_kvdl *kvdl;
++ 	int err;
++ 
++ 	kvdl = kzalloc(sizeof(*mlxsw_sp->kvdl), GFP_KERNEL);
++ 	if (!kvdl)
++ 		return -ENOMEM;
++ 	mlxsw_sp->kvdl = kvdl;
++ 
++ 	err = mlxsw_sp_kvdl_parts_init(mlxsw_sp);
++ 	if (err)
++ 		goto err_kvdl_parts_init;
++ 
++ 	devlink_resource_occ_get_register(devlink,
++ 					  MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					  mlxsw_sp_kvdl_occ_get,
++ 					  mlxsw_sp);
++ 	devlink_resource_occ_get_register(devlink,
++ 					  MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
++ 					  mlxsw_sp_kvdl_single_occ_get,
++ 					  mlxsw_sp);
++ 	devlink_resource_occ_get_register(devlink,
++ 					  MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
++ 					  mlxsw_sp_kvdl_chunks_occ_get,
++ 					  mlxsw_sp);
++ 	devlink_resource_occ_get_register(devlink,
++ 					  MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
++ 					  mlxsw_sp_kvdl_large_chunks_occ_get,
++ 					  mlxsw_sp);
++ 
++ 	return 0;
++ 
++ err_kvdl_parts_init:
++ 	kfree(mlxsw_sp->kvdl);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_kvdl_fini(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct devlink *devlink = priv_to_devlink(mlxsw_sp->core);
++ 
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    MLXSW_SP_RESOURCE_KVD_LINEAR);
++ 	mlxsw_sp_kvdl_parts_fini(mlxsw_sp);
++ 	kfree(mlxsw_sp->kvdl);
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  }
+diff --cc include/net/devlink.h
+index 49579bdfcd23,2e4f71e16e95..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -232,18 -232,6 +232,21 @@@ struct devlink_dpipe_headers 
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * struct devlink_resource_ops - resource ops
+ + * @occ_get: get the occupied size
+ + * @size_validate: validate the size of the resource before update, reload
+ + *                 is needed for changes to take place
+ + */
+ +struct devlink_resource_ops {
+ +	u64 (*occ_get)(struct devlink *devlink);
+ +	int (*size_validate)(struct devlink *devlink, u64 size,
+ +			     struct netlink_ext_ack *extack);
+ +};
+ +
+ +/**
+++=======
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+   * struct devlink_resource_size_params - resource's size parameters
+   * @size_min: minimum size which can be set
+   * @size_max: maximum size which can be set
+@@@ -257,6 -245,20 +260,23 @@@ struct devlink_resource_size_params 
+  	enum devlink_resource_unit unit;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline void
++ devlink_resource_size_params_init(struct devlink_resource_size_params *size_params,
++ 				  u64 size_min, u64 size_max,
++ 				  u64 size_granularity,
++ 				  enum devlink_resource_unit unit)
++ {
++ 	size_params->size_min = size_min;
++ 	size_params->size_max = size_max;
++ 	size_params->size_granularity = size_granularity;
++ 	size_params->unit = unit;
++ }
++ 
++ typedef u64 devlink_resource_occ_get_t(void *priv);
++ 
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  /**
+   * struct devlink_resource - devlink resource
+   * @name: name of the resource
+@@@ -278,10 -279,11 +297,11 @@@ struct devlink_resource 
+  	u64 size_new;
+  	bool size_valid;
+  	struct devlink_resource *parent;
+ -	struct devlink_resource_size_params size_params;
+ +	struct devlink_resource_size_params *size_params;
+  	struct list_head list;
+  	struct list_head resource_list;
+- 	const struct devlink_resource_ops *resource_ops;
++ 	devlink_resource_occ_get_t *occ_get;
++ 	void *occ_get_priv;
+  };
+  
+  #define DEVLINK_RESOURCE_ID_PARENT_TOP 0
+@@@ -402,8 -403,7 +422,12 @@@ int devlink_resource_register(struct de
+  			      u64 resource_size,
+  			      u64 resource_id,
+  			      u64 parent_resource_id,
+++<<<<<<< HEAD
+ +			      struct devlink_resource_size_params *size_params,
+ +			      const struct devlink_resource_ops *resource_ops);
+++=======
++ 			      const struct devlink_resource_size_params *size_params);
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  void devlink_resources_unregister(struct devlink *devlink,
+  				  struct devlink_resource *resource);
+  int devlink_resource_size_get(struct devlink *devlink,
+@@@ -555,8 -561,7 +585,12 @@@ devlink_resource_register(struct devlin
+  			  u64 resource_size,
+  			  u64 resource_id,
+  			  u64 parent_resource_id,
+++<<<<<<< HEAD
+ +			  struct devlink_resource_size_params *size_params,
+ +			  const struct devlink_resource_ops *resource_ops)
+++=======
++ 			  const struct devlink_resource_size_params *size_params)
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  {
+  	return 0;
+  }
+diff --cc net/core/devlink.c
+index c6d54c669328,ad1317376798..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -3177,8 -3175,7 +3183,12 @@@ int devlink_resource_register(struct de
+  			      u64 resource_size,
+  			      u64 resource_id,
+  			      u64 parent_resource_id,
+++<<<<<<< HEAD
+ +			      struct devlink_resource_size_params *size_params,
+ +			      const struct devlink_resource_ops *resource_ops)
+++=======
++ 			      const struct devlink_resource_size_params *size_params)
+++>>>>>>> fc56be47da8c (devlink: convert occ_get op to separate registration)
+  {
+  	struct devlink_resource *resource;
+  	struct list_head *resource_list;
+@@@ -3218,9 -3218,9 +3228,8 @@@
+  	resource->size = resource_size;
+  	resource->size_new = resource_size;
+  	resource->id = resource_id;
+- 	resource->resource_ops = resource_ops;
+  	resource->size_valid = true;
+ -	memcpy(&resource->size_params, size_params,
+ -	       sizeof(resource->size_params));
+ +	resource->size_params = size_params;
+  	INIT_LIST_HEAD(&resource->resource_list);
+  	list_add_tail(&resource->list, resource_list);
+  out:
+* Unmerged path drivers/net/netdevsim/devlink.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+* Unmerged path drivers/net/netdevsim/devlink.c
+* Unmerged path include/net/devlink.h
+* Unmerged path net/core/devlink.c
