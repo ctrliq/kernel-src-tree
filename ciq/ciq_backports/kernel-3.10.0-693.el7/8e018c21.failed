@@ -1,0 +1,83 @@
+raid5-cache: fix a deadlock in superblock write
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Shaohua Li <shli@fb.com>
+commit 8e018c21da3febb558586b48c8db0d6d66cb6593
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8e018c21.failed
+
+There is a potential deadlock in superblock write. Discard could zero data, so
+before discard we must make sure superblock is updated to new log tail.
+Updating superblock (either directly call md_update_sb() or depend on md
+thread) must hold reconfig mutex. On the other hand, raid5_quiesce is called
+with reconfig_mutex hold. The first step of raid5_quiesce() is waitting for all
+IO finish, hence waitting for reclaim thread, while reclaim thread is calling
+this function and waitting for reconfig mutex. So there is a deadlock. We
+workaround this issue with a trylock. The downside of the solution is we could
+miss discard if we can't take reconfig mutex. But this should happen rarely
+(mainly in raid array stop), so miss discard shouldn't be a big problem.
+
+	Cc: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 8e018c21da3febb558586b48c8db0d6d66cb6593)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index 8e8b9d8fa041,1b1ab4a1d132..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -714,31 -703,22 +713,42 @@@ static void r5l_write_super_and_discard
+  
+  	mddev = log->rdev->mddev;
+  	/*
+- 	 * This is to avoid a deadlock. r5l_quiesce holds reconfig_mutex and
+- 	 * wait for this thread to finish. This thread waits for
+- 	 * MD_CHANGE_PENDING clear, which is supposed to be done in
+- 	 * md_check_recovery(). md_check_recovery() tries to get
+- 	 * reconfig_mutex. Since r5l_quiesce already holds the mutex,
+- 	 * md_check_recovery() fails, so the PENDING never get cleared. The
+- 	 * in_teardown check workaround this issue.
++ 	 * Discard could zero data, so before discard we must make sure
++ 	 * superblock is updated to new log tail. Updating superblock (either
++ 	 * directly call md_update_sb() or depend on md thread) must hold
++ 	 * reconfig mutex. On the other hand, raid5_quiesce is called with
++ 	 * reconfig_mutex hold. The first step of raid5_quiesce() is waitting
++ 	 * for all IO finish, hence waitting for reclaim thread, while reclaim
++ 	 * thread is calling this function and waitting for reconfig mutex. So
++ 	 * there is a deadlock. We workaround this issue with a trylock.
++ 	 * FIXME: we could miss discard if we can't take reconfig mutex
+  	 */
+++<<<<<<< HEAD
+ +	if (!log->in_teardown) {
+ +		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +		set_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +		md_wakeup_thread(mddev->thread);
+ +		wait_event(mddev->sb_wait,
+ +			!test_bit(MD_CHANGE_PENDING, &mddev->flags) ||
+ +			log->in_teardown);
+ +		/*
+ +		 * r5l_quiesce could run after in_teardown check and hold
+ +		 * mutex first. Superblock might get updated twice.
+ +		 */
+ +		if (log->in_teardown)
+ +			md_update_sb(mddev, 1);
+ +	} else {
+ +		WARN_ON(!mddev_is_locked(mddev));
+ +		md_update_sb(mddev, 1);
+ +	}
+++=======
++ 	set_mask_bits(&mddev->flags, 0,
++ 		BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
++ 	if (!mddev_trylock(mddev))
++ 		return;
++ 	md_update_sb(mddev, 1);
++ 	mddev_unlock(mddev);
+++>>>>>>> 8e018c21da3f (raid5-cache: fix a deadlock in superblock write)
+  
+  	/* discard IO error really doesn't matter, ignore it */
+  	if (log->last_checkpoint < end) {
+* Unmerged path drivers/md/raid5-cache.c
