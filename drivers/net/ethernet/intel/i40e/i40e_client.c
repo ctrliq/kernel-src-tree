@@ -584,6 +584,7 @@ void i40e_client_subtask(struct i40e_pf *pf)
 				 pf->hw.bus.device, pf->hw.bus.func);
 		}
 
+		mutex_lock(&i40e_client_instance_mutex);
 		/* Send an Open request to the client */
 		atomic_inc(&cdev->ref_cnt);
 		if (client->ops && client->ops->open)
@@ -598,6 +599,7 @@ void i40e_client_subtask(struct i40e_pf *pf)
 			atomic_dec(&client->ref_cnt);
 			continue;
 		}
+		mutex_unlock(&i40e_client_instance_mutex);
 	}
 	mutex_unlock(&i40e_client_mutex);
 }
