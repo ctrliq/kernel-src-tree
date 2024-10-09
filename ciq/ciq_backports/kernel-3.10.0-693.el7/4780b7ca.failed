@@ -1,0 +1,190 @@
+amd-xgbe: Move ring allocation to device open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 4780b7cae60cf10af4ae75bc5d6643f41d4c2969
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4780b7ca.failed
+
+Move the channel and ring tracking structures allocation to device
+open.  This will allow for future support to vary the number of Tx/Rx
+queues without unloading the module.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4780b7cae60cf10af4ae75bc5d6643f41d4c2969)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 6baf601c4282,07b00bdcd9f9..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -770,16 -1190,22 +844,25 @@@ static int xgbe_open(struct net_device 
+  	/* Calculate the Rx buffer size before allocating rings */
+  	ret = xgbe_calc_rx_buf_size(netdev, netdev->mtu);
+  	if (ret < 0)
+ -		goto err_ptpclk;
+ +		goto err_clk;
+  	pdata->rx_buf_size = ret;
+  
++ 	/* Allocate the channel and ring structures */
++ 	ret = xgbe_alloc_channels(pdata);
++ 	if (ret)
++ 		goto err_ptpclk;
++ 
+  	/* Allocate the ring descriptors and buffers */
+  	ret = desc_if->alloc_ring_resources(pdata);
+  	if (ret)
+++<<<<<<< HEAD
+ +		goto err_clk;
+++=======
++ 		goto err_channels;
+++>>>>>>> 4780b7cae60c (amd-xgbe: Move ring allocation to device open)
+  
+ -	/* Initialize the device restart and Tx timestamp work struct */
+ +	/* Initialize the device restart work struct */
+  	INIT_WORK(&pdata->restart_work, xgbe_restart);
+ -	INIT_WORK(&pdata->tx_tstamp_work, xgbe_tx_tstamp);
+  
+  	/* Request interrupts */
+  	ret = devm_request_irq(pdata->dev, netdev->irq, xgbe_isr, 0,
+@@@ -805,11 -1231,20 +888,25 @@@ err_start
+  	devm_free_irq(pdata->dev, pdata->irq_number, pdata);
+  	pdata->irq_number = 0;
+  
+- err_irq:
++ err_rings:
+  	desc_if->free_ring_resources(pdata);
+  
+++<<<<<<< HEAD
+ +err_clk:
+ +	clk_disable_unprepare(pdata->sysclock);
+++=======
++ err_channels:
++ 	xgbe_free_channels(pdata);
++ 
++ err_ptpclk:
++ 	clk_disable_unprepare(pdata->ptpclk);
++ 
++ err_sysclk:
++ 	clk_disable_unprepare(pdata->sysclk);
++ 
++ err_phy_init:
++ 	xgbe_phy_exit(pdata);
+++>>>>>>> 4780b7cae60c (amd-xgbe: Move ring allocation to device open)
+  
+  	return ret;
+  }
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index 477038ad98fd..79d90280bc6f 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -450,9 +450,9 @@ static int xgbe_set_coalesce(struct net_device *netdev,
+ 			     rx_usecs);
+ 		return -EINVAL;
+ 	}
+-	if (rx_frames > pdata->channel->rx_ring->rdesc_count) {
++	if (rx_frames > pdata->rx_desc_count) {
+ 		netdev_alert(netdev, "rx-frames is limited to %d frames\n",
+-			     pdata->channel->rx_ring->rdesc_count);
++			     pdata->rx_desc_count);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -460,9 +460,9 @@ static int xgbe_set_coalesce(struct net_device *netdev,
+ 	tx_frames = ec->tx_max_coalesced_frames;
+ 
+ 	/* Check the bounds of values for Tx */
+-	if (tx_frames > pdata->channel->tx_ring->rdesc_count) {
++	if (tx_frames > pdata->tx_desc_count) {
+ 		netdev_alert(netdev, "tx-frames is limited to %d frames\n",
+-			     pdata->channel->tx_ring->rdesc_count);
++			     pdata->tx_desc_count);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-main.c b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index 5ad0a540825b..ca5c2ae1f3e5 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@ -134,60 +134,6 @@ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_VERSION(XGBE_DRV_VERSION);
+ MODULE_DESCRIPTION(XGBE_DRV_DESC);
+ 
+-static struct xgbe_channel *xgbe_alloc_rings(struct xgbe_prv_data *pdata)
+-{
+-	struct xgbe_channel *channel_mem, *channel;
+-	struct xgbe_ring *tx_ring, *rx_ring;
+-	unsigned int count, i;
+-
+-	DBGPR("-->xgbe_alloc_rings\n");
+-
+-	count = max_t(unsigned int, pdata->tx_ring_count, pdata->rx_ring_count);
+-
+-	channel_mem = devm_kcalloc(pdata->dev, count,
+-				   sizeof(struct xgbe_channel), GFP_KERNEL);
+-	if (!channel_mem)
+-		return NULL;
+-
+-	tx_ring = devm_kcalloc(pdata->dev, pdata->tx_ring_count,
+-			       sizeof(struct xgbe_ring), GFP_KERNEL);
+-	if (!tx_ring)
+-		return NULL;
+-
+-	rx_ring = devm_kcalloc(pdata->dev, pdata->rx_ring_count,
+-			       sizeof(struct xgbe_ring), GFP_KERNEL);
+-	if (!rx_ring)
+-		return NULL;
+-
+-	for (i = 0, channel = channel_mem; i < count; i++, channel++) {
+-		snprintf(channel->name, sizeof(channel->name), "channel-%d", i);
+-		channel->pdata = pdata;
+-		channel->queue_index = i;
+-		channel->dma_regs = pdata->xgmac_regs + DMA_CH_BASE +
+-				    (DMA_CH_INC * i);
+-
+-		if (i < pdata->tx_ring_count) {
+-			spin_lock_init(&tx_ring->lock);
+-			channel->tx_ring = tx_ring++;
+-		}
+-
+-		if (i < pdata->rx_ring_count) {
+-			spin_lock_init(&rx_ring->lock);
+-			channel->rx_ring = rx_ring++;
+-		}
+-
+-		DBGPR("  %s - queue_index=%u, dma_regs=%p, tx=%p, rx=%p\n",
+-		      channel->name, channel->queue_index, channel->dma_regs,
+-		      channel->tx_ring, channel->rx_ring);
+-	}
+-
+-	pdata->channel_count = count;
+-
+-	DBGPR("<--xgbe_alloc_rings\n");
+-
+-	return channel_mem;
+-}
+-
+ static void xgbe_default_config(struct xgbe_prv_data *pdata)
+ {
+ 	DBGPR("-->xgbe_default_config\n");
+@@ -366,14 +312,6 @@ static int xgbe_probe(struct platform_device *pdev)
+ 		goto err_io;
+ 	}
+ 
+-	/* Allocate the rings for the DMA channels */
+-	pdata->channel = xgbe_alloc_rings(pdata);
+-	if (!pdata->channel) {
+-		dev_err(dev, "ring allocation failed\n");
+-		ret = -ENOMEM;
+-		goto err_io;
+-	}
+-
+ 	/* Prepare to regsiter with MDIO */
+ 	pdata->mii_bus_id = kasprintf(GFP_KERNEL, "%s", pdev->name);
+ 	if (!pdata->mii_bus_id) {
