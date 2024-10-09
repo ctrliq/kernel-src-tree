@@ -67,7 +67,7 @@ cgroupfs_find_mountpoint(char *buf, size_t maxlen)
 	return -1;
 }
 
-static int open_cgroup(char *name)
+static int open_cgroup(const char *name)
 {
 	char path[PATH_MAX + 1];
 	char mnt[PATH_MAX + 1];
@@ -86,7 +86,7 @@ static int open_cgroup(char *name)
 	return fd;
 }
 
-static struct cgroup *evlist__find_cgroup(struct perf_evlist *evlist, char *str)
+static struct cgroup *evlist__find_cgroup(struct perf_evlist *evlist, const char *str)
 {
 	struct perf_evsel *counter;
 	struct cgroup *cgrp = NULL;
@@ -105,33 +105,38 @@ static struct cgroup *evlist__find_cgroup(struct perf_evlist *evlist, char *str)
 	return cgrp;
 }
 
-static struct cgroup *cgroup__new(char *name)
+static struct cgroup *cgroup__new(const char *name)
 {
 	struct cgroup *cgroup = zalloc(sizeof(*cgroup));
 
 	if (cgroup != NULL) {
-		cgroup->name = name;
 		refcount_set(&cgroup->refcnt, 1);
 
+		cgroup->name = strdup(name);
+		if (!cgroup->name)
+			goto out_err;
 		cgroup->fd = open_cgroup(name);
 		if (cgroup->fd == -1)
-			goto out_err;
+			goto out_free_name;
 	}
 
 	return cgroup;
+
+out_free_name:
+	free(cgroup->name);
 out_err:
 	free(cgroup);
 	return NULL;
 }
 
-struct cgroup *evlist__findnew_cgroup(struct perf_evlist *evlist, char *name)
+struct cgroup *evlist__findnew_cgroup(struct perf_evlist *evlist, const char *name)
 {
 	struct cgroup *cgroup = evlist__find_cgroup(evlist, name);
 
 	return cgroup ?: cgroup__new(name);
 }
 
-static int add_cgroup(struct perf_evlist *evlist, char *str)
+static int add_cgroup(struct perf_evlist *evlist, const char *str)
 {
 	struct perf_evsel *counter;
 	struct cgroup *cgrp = evlist__findnew_cgroup(evlist, str);
@@ -218,10 +223,9 @@ int parse_cgroups(const struct option *opt, const char *str,
 			if (!s)
 				return -1;
 			ret = add_cgroup(evlist, s);
-			if (ret) {
-				free(s);
+			free(s);
+			if (ret)
 				return -1;
-			}
 		}
 		/* nr_cgroups is increased een for empty cgroups */
 		nr_cgroups++;
