@@ -1,0 +1,280 @@
+dm snapshot: Make exception tables scalable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Nikos Tsironis <ntsironis@arrikto.com>
+commit f79ae415b64c35d9ecca159fe796cf98d2ff9e9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/f79ae415.failed
+
+Use list_bl to implement the exception hash tables' buckets. This change
+permits concurrent access, to distinct buckets, by multiple threads.
+
+Also, implement helper functions to lock and unlock the exception tables
+based on the chunk number of the exception at hand.
+
+We retain the global locking, by means of down_write(), which is
+replaced by the next commit.
+
+Still, we must acquire the per-bucket spinlocks when accessing the hash
+tables, since list_bl does not allow modification on unlocked lists.
+
+Co-developed-by: Ilias Tsitsimpis <iliastsi@arrikto.com>
+	Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+	Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit f79ae415b64c35d9ecca159fe796cf98d2ff9e9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-snap.c
+diff --cc drivers/md/dm-snap.c
+index 4f3251269638,10bb37e27ecf..000000000000
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@@ -1474,26 -1530,34 +1531,38 @@@ static void pending_complete(void *cont
+  	struct bio *origin_bios = NULL;
+  	struct bio *snapshot_bios = NULL;
+  	struct bio *full_bio = NULL;
++ 	struct dm_exception_table_lock lock;
+  	int error = 0;
+  
++ 	dm_exception_table_lock_init(s, pe->e.old_chunk, &lock);
++ 
+  	if (!success) {
+  		/* Read/write error - snapshot is unusable */
+ -		down_write(&s->lock);
+ +		mutex_lock(&s->lock);
+  		__invalidate_snapshot(s, -EIO);
+  		error = 1;
++ 
++ 		dm_exception_table_lock(&lock);
+  		goto out;
+  	}
+  
+  	e = alloc_completed_exception(GFP_NOIO);
+  	if (!e) {
+ -		down_write(&s->lock);
+ +		mutex_lock(&s->lock);
+  		__invalidate_snapshot(s, -ENOMEM);
+  		error = 1;
++ 
++ 		dm_exception_table_lock(&lock);
+  		goto out;
+  	}
+  	*e = pe->e;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&s->lock);
+++=======
++ 	down_write(&s->lock);
++ 	dm_exception_table_lock(&lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  	if (!s->valid) {
+  		free_completed_exception(e);
+  		error = 1;
+@@@ -1511,9 -1575,11 +1580,17 @@@
+  
+  	/* Wait for conflicting reads to drain */
+  	if (__chunk_is_tracked(s, pe->e.old_chunk)) {
+++<<<<<<< HEAD
+ +		mutex_unlock(&s->lock);
+ +		__check_for_conflicting_io(s, pe->e.old_chunk);
+ +		mutex_lock(&s->lock);
+++=======
++ 		dm_exception_table_unlock(&lock);
++ 		up_write(&s->lock);
++ 		__check_for_conflicting_io(s, pe->e.old_chunk);
++ 		down_write(&s->lock);
++ 		dm_exception_table_lock(&lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  	}
+  
+  out:
+@@@ -1743,17 -1812,20 +1824,27 @@@ static int snapshot_map(struct dm_targe
+  		return DM_MAPIO_REMAPPED;
+  	}
+  
+++<<<<<<< HEAD
+ +	chunk = sector_to_chunk(s->store, bio->bi_sector);
+++=======
++ 	chunk = sector_to_chunk(s->store, bio->bi_iter.bi_sector);
++ 	dm_exception_table_lock_init(s, chunk, &lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  
+  	/* Full snapshots are not usable */
+  	/* To get here the table must be live so s->active is always set. */
+  	if (!s->valid)
+ -		return DM_MAPIO_KILL;
+ +		return -EIO;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&s->lock);
+++=======
++ 	down_write(&s->lock);
++ 	dm_exception_table_lock(&lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  
+ -	if (!s->valid || (unlikely(s->snapshot_overflowed) &&
+ -	    bio_data_dir(bio) == WRITE)) {
+ -		r = DM_MAPIO_KILL;
+ +	if (!s->valid || (unlikely(s->snapshot_overflowed) && bio_rw(bio) == WRITE)) {
+ +		r = -EIO;
+  		goto out_unlock;
+  	}
+  
+@@@ -1769,12 -1841,14 +1860,20 @@@
+  	 * flags so we should only get this if we are
+  	 * writeable.
+  	 */
+ -	if (bio_data_dir(bio) == WRITE) {
+ +	if (bio_rw(bio) == WRITE) {
+  		pe = __lookup_pending_exception(s, chunk);
+  		if (!pe) {
+++<<<<<<< HEAD
+ +			mutex_unlock(&s->lock);
+ +			pe = alloc_pending_exception(s);
+ +			mutex_lock(&s->lock);
+++=======
++ 			dm_exception_table_unlock(&lock);
++ 			up_write(&s->lock);
++ 			pe = alloc_pending_exception(s);
++ 			down_write(&s->lock);
++ 			dm_exception_table_lock(&lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  
+  			if (!s->valid || s->snapshot_overflowed) {
+  				free_pending_exception(pe);
+@@@ -1796,8 -1872,10 +1897,15 @@@
+  					DMERR("Snapshot overflowed: Unable to allocate exception.");
+  				} else
+  					__invalidate_snapshot(s, -ENOMEM);
+++<<<<<<< HEAD
+ +				r = -EIO;
+ +				goto out_unlock;
+++=======
++ 				up_write(&s->lock);
++ 
++ 				r = DM_MAPIO_KILL;
++ 				goto out;
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  			}
+  		}
+  
+@@@ -1806,9 -1884,11 +1914,14 @@@
+  		r = DM_MAPIO_SUBMITTED;
+  
+  		if (!pe->started &&
+ -		    bio->bi_iter.bi_size ==
+ -		    (s->store->chunk_size << SECTOR_SHIFT)) {
+ +		    bio->bi_size == (s->store->chunk_size << SECTOR_SHIFT)) {
+  			pe->started = 1;
+++<<<<<<< HEAD
+ +			mutex_unlock(&s->lock);
+++=======
++ 			dm_exception_table_unlock(&lock);
++ 			up_write(&s->lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  			start_full_bio(pe, bio);
+  			goto out;
+  		}
+@@@ -1818,7 -1898,8 +1931,12 @@@
+  		if (!pe->started) {
+  			/* this is protected by snap->lock */
+  			pe->started = 1;
+++<<<<<<< HEAD
+ +			mutex_unlock(&s->lock);
+++=======
++ 			dm_exception_table_unlock(&lock);
++ 			up_write(&s->lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  			start_copy(pe);
+  			goto out;
+  		}
+@@@ -1828,7 -1909,8 +1946,12 @@@
+  	}
+  
+  out_unlock:
+++<<<<<<< HEAD
+ +	mutex_unlock(&s->lock);
+++=======
++ 	dm_exception_table_unlock(&lock);
++ 	up_write(&s->lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  out:
+  	return r;
+  }
+@@@ -2139,15 -2223,9 +2263,18 @@@ static int __origin_write(struct list_h
+  		if (dm_target_is_snapshot_merge(snap->ti))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&snap->lock);
+ +
+ +		/* Only deal with valid and active snapshots */
+ +		if (!snap->valid || !snap->active)
+ +			goto next_snapshot;
+ +
+++=======
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  		/* Nothing to do if writing beyond end of snapshot */
+  		if (sector >= dm_table_get_size(snap->ti->table))
+- 			goto next_snapshot;
++ 			continue;
+  
+  		/*
+  		 * Remember, different snapshots can have
+@@@ -2166,9 -2252,11 +2301,17 @@@
+  			if (e)
+  				goto next_snapshot;
+  
+++<<<<<<< HEAD
+ +			mutex_unlock(&snap->lock);
+ +			pe = alloc_pending_exception(snap);
+ +			mutex_lock(&snap->lock);
+++=======
++ 			dm_exception_table_unlock(&lock);
++ 			up_write(&snap->lock);
++ 			pe = alloc_pending_exception(snap);
++ 			down_write(&snap->lock);
++ 			dm_exception_table_lock(&lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  
+  			if (!snap->valid) {
+  				free_pending_exception(pe);
+@@@ -2218,7 -2309,8 +2364,12 @@@
+  		}
+  
+  next_snapshot:
+++<<<<<<< HEAD
+ +		mutex_unlock(&snap->lock);
+++=======
++ 		dm_exception_table_unlock(&lock);
++ 		up_write(&snap->lock);
+++>>>>>>> f79ae415b64c (dm snapshot: Make exception tables scalable)
+  
+  		if (pe_to_start_now) {
+  			start_copy(pe_to_start_now);
+diff --git a/drivers/md/dm-exception-store.h b/drivers/md/dm-exception-store.h
+index 12b5216c2cfe..5a3c696c057f 100644
+--- a/drivers/md/dm-exception-store.h
++++ b/drivers/md/dm-exception-store.h
+@@ -11,6 +11,7 @@
+ #define _LINUX_DM_EXCEPTION_STORE
+ 
+ #include <linux/blkdev.h>
++#include <linux/list_bl.h>
+ #include <linux/device-mapper.h>
+ 
+ /*
+@@ -27,7 +28,7 @@ typedef sector_t chunk_t;
+  * chunk within the device.
+  */
+ struct dm_exception {
+-	struct list_head hash_list;
++	struct hlist_bl_node hash_list;
+ 
+ 	chunk_t old_chunk;
+ 	chunk_t new_chunk;
+* Unmerged path drivers/md/dm-snap.c
