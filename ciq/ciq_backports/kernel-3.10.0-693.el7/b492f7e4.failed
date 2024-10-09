@@ -1,0 +1,205 @@
+powerpc/64: Fix checksum folding in csum_tcpudp_nofold and ip_fast_csum_nofold
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit b492f7e4e07a28e706db26cf4943bb0911435426
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b492f7e4.failed
+
+These functions compute an IP checksum by computing a 64-bit sum and
+folding it to 32 bits (the "nofold" in their names refers to folding
+down to 16 bits).  However, doing (u32) (s + (s >> 32)) is not
+sufficient to fold a 64-bit sum to 32 bits correctly.  The addition
+can produce a carry out from bit 31, which needs to be added in to
+the sum to produce the correct result.
+
+To fix this, we copy the from64to32() function from lib/checksum.c
+and use that.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit b492f7e4e07a28e706db26cf4943bb0911435426)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/checksum.h
+diff --cc arch/powerpc/include/asm/checksum.h
+index 0ffd793cff0f,5b1a6e39afa7..000000000000
+--- a/arch/powerpc/include/asm/checksum.h
++++ b/arch/powerpc/include/asm/checksum.h
+@@@ -83,22 -53,20 +83,36 @@@ static inline __sum16 csum_fold(__wsum 
+  	return (__force __sum16)(~((__force u32)sum + tmp) >> 16);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * this routine is used for miscellaneous IP-like checksums, mainly
+ + * in icmp.c
+ + */
+ +static inline __sum16 ip_compute_csum(const void *buff, int len)
+ +{
+ +	return csum_fold(csum_partial(buff, len, 0));
+ +}
+ +
+ +static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr,
+ +                                     unsigned short len,
+ +                                     unsigned short proto,
+ +                                     __wsum sum)
+++=======
++ static inline u32 from64to32(u64 x)
++ {
++ 	/* add up 32-bit and 32-bit for 32+c bit */
++ 	x = (x & 0xffffffff) + (x >> 32);
++ 	/* add up carry.. */
++ 	x = (x & 0xffffffff) + (x >> 32);
++ 	return (u32)x;
++ }
++ 
++ static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len,
++ 					__u8 proto, __wsum sum)
+++>>>>>>> b492f7e4e07a (powerpc/64: Fix checksum folding in csum_tcpudp_nofold and ip_fast_csum_nofold)
+  {
+  #ifdef __powerpc64__
+- 	unsigned long s = (__force u32)sum;
++ 	u64 s = (__force u32)sum;
+  
+  	s += (__force u32)saddr;
+  	s += (__force u32)daddr;
+@@@ -118,6 -85,131 +131,134 @@@
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * computes the checksum of the TCP/UDP pseudo-header
++  * returns a 16-bit checksum, already complemented
++  */
++ static inline __sum16 csum_tcpudp_magic(__be32 saddr, __be32 daddr, __u32 len,
++ 					__u8 proto, __wsum sum)
++ {
++ 	return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));
++ }
++ 
++ #define HAVE_ARCH_CSUM_ADD
++ static inline __wsum csum_add(__wsum csum, __wsum addend)
++ {
++ #ifdef __powerpc64__
++ 	u64 res = (__force u64)csum;
++ #endif
++ 	if (__builtin_constant_p(csum) && csum == 0)
++ 		return addend;
++ 	if (__builtin_constant_p(addend) && addend == 0)
++ 		return csum;
++ 
++ #ifdef __powerpc64__
++ 	res += (__force u64)addend;
++ 	return (__force __wsum)((u32)res + (res >> 32));
++ #else
++ 	asm("addc %0,%0,%1;"
++ 	    "addze %0,%0;"
++ 	    : "+r" (csum) : "r" (addend) : "xer");
++ 	return csum;
++ #endif
++ }
++ 
++ /*
++  * This is a version of ip_compute_csum() optimized for IP headers,
++  * which always checksum on 4 octet boundaries.  ihl is the number
++  * of 32-bit words and is always >= 5.
++  */
++ static inline __wsum ip_fast_csum_nofold(const void *iph, unsigned int ihl)
++ {
++ 	const u32 *ptr = (const u32 *)iph + 1;
++ #ifdef __powerpc64__
++ 	unsigned int i;
++ 	u64 s = *(const u32 *)iph;
++ 
++ 	for (i = 0; i < ihl - 1; i++, ptr++)
++ 		s += *ptr;
++ 	return (__force __wsum)from64to32(s);
++ #else
++ 	__wsum sum, tmp;
++ 
++ 	asm("mtctr %3;"
++ 	    "addc %0,%4,%5;"
++ 	    "1: lwzu %1, 4(%2);"
++ 	    "adde %0,%0,%1;"
++ 	    "bdnz 1b;"
++ 	    "addze %0,%0;"
++ 	    : "=r" (sum), "=r" (tmp), "+b" (ptr)
++ 	    : "r" (ihl - 2), "r" (*(const u32 *)iph), "r" (*ptr)
++ 	    : "ctr", "xer", "memory");
++ 
++ 	return sum;
++ #endif
++ }
++ 
++ static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
++ {
++ 	return csum_fold(ip_fast_csum_nofold(iph, ihl));
++ }
++ 
++ /*
++  * computes the checksum of a memory block at buff, length len,
++  * and adds in "sum" (32-bit)
++  *
++  * returns a 32-bit number suitable for feeding into itself
++  * or csum_tcpudp_magic
++  *
++  * this function must be called with even lengths, except
++  * for the last fragment, which may be odd
++  *
++  * it's best to have buff aligned on a 32-bit boundary
++  */
++ __wsum __csum_partial(const void *buff, int len, __wsum sum);
++ 
++ static inline __wsum csum_partial(const void *buff, int len, __wsum sum)
++ {
++ 	if (__builtin_constant_p(len) && len <= 16 && (len & 1) == 0) {
++ 		if (len == 2)
++ 			sum = csum_add(sum, (__force __wsum)*(const u16 *)buff);
++ 		if (len >= 4)
++ 			sum = csum_add(sum, (__force __wsum)*(const u32 *)buff);
++ 		if (len == 6)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u16 *)(buff + 4));
++ 		if (len >= 8)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u32 *)(buff + 4));
++ 		if (len == 10)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u16 *)(buff + 8));
++ 		if (len >= 12)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u32 *)(buff + 8));
++ 		if (len == 14)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u16 *)(buff + 12));
++ 		if (len >= 16)
++ 			sum = csum_add(sum, (__force __wsum)
++ 					    *(const u32 *)(buff + 12));
++ 	} else if (__builtin_constant_p(len) && (len & 3) == 0) {
++ 		sum = csum_add(sum, ip_fast_csum_nofold(buff, len >> 2));
++ 	} else {
++ 		sum = __csum_partial(buff, len, sum);
++ 	}
++ 	return sum;
++ }
++ 
++ /*
++  * this routine is used for miscellaneous IP-like checksums, mainly
++  * in icmp.c
++  */
++ static inline __sum16 ip_compute_csum(const void *buff, int len)
++ {
++ 	return csum_fold(csum_partial(buff, len, 0));
++ }
++ 
+++>>>>>>> b492f7e4e07a (powerpc/64: Fix checksum folding in csum_tcpudp_nofold and ip_fast_csum_nofold)
+  #endif
+  #endif /* __KERNEL__ */
+  #endif
+* Unmerged path arch/powerpc/include/asm/checksum.h
