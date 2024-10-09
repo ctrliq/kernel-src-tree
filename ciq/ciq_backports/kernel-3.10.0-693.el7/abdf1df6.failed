@@ -1,0 +1,176 @@
+x86/platform/UV: Add Support for UV4 Hubless NMIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] platform/uv: Add Support for UV4 Hubless NMIs (Frank Ramsay) [1416460]
+Rebuild_FUZZ: 95.74%
+commit-author travis@sgi.com <travis@sgi.com>
+commit abdf1df6bc0416ec19b841e92b497ca55b23454c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/abdf1df6.failed
+
+Merge new UV Hubless NMI support into existing UV NMI handler.
+
+	Signed-off-by: Mike Travis <travis@sgi.com>
+	Reviewed-by: Russ Anderson <rja@hpe.com>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Dimitri Sivanich <sivanich@hpe.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20170125163517.585269837@asylum.americas.sgi.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit abdf1df6bc0416ec19b841e92b497ca55b23454c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/x2apic_uv_x.c
+#	arch/x86/platform/uv/uv_nmi.c
+diff --cc arch/x86/kernel/apic/x2apic_uv_x.c
+index bdcca5ada7d6,e9f8f8cdd570..000000000000
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@@ -1534,4 -1503,19 +1534,22 @@@ void __init uv_system_init(void
+  		reboot_type = BOOT_ACPI;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * There is a small amount of UV specific code needed to initialize a
++  * UV system that does not have a "UV HUB" (referred to as "hubless").
++  */
++ void __init uv_system_init(void)
++ {
++ 	if (likely(!is_uv_system() && !is_uv_hubless()))
++ 		return;
++ 
++ 	if (is_uv_system())
++ 		uv_system_init_hub();
++ 	else
++ 		uv_nmi_setup_hubless();
++ }
++ 
+++>>>>>>> abdf1df6bc04 (x86/platform/UV: Add Support for UV4 Hubless NMIs)
+  apic_driver(apic_x2apic_uv_x);
+diff --cc arch/x86/platform/uv/uv_nmi.c
+index c6fd36338c09,df7b092941fe..000000000000
+--- a/arch/x86/platform/uv/uv_nmi.c
++++ b/arch/x86/platform/uv/uv_nmi.c
+@@@ -63,9 -64,21 +63,21 @@@
+  
+  static struct uv_hub_nmi_s **uv_hub_nmi_list;
+  
+ -DEFINE_PER_CPU(struct uv_cpu_nmi_s, uv_cpu_nmi);
+ -EXPORT_PER_CPU_SYMBOL_GPL(uv_cpu_nmi);
+ +DEFINE_PER_CPU(struct uv_cpu_nmi_s, __uv_cpu_nmi);
+ +EXPORT_PER_CPU_SYMBOL_GPL(__uv_cpu_nmi);
+  
++ /* UV hubless values */
++ #define NMI_CONTROL_PORT	0x70
++ #define NMI_DUMMY_PORT		0x71
++ #define GPI_NMI_STS_GPP_D_0	0x164
++ #define GPI_NMI_ENA_GPP_D_0	0x174
++ #define STS_GPP_D_0_MASK	0x1
++ #define PAD_CFG_DW0_GPP_D_0	0x4c0
++ #define GPIROUTNMI		(1ul << 17)
++ #define PCH_PCR_GPIO_1_BASE	0xfdae0000ul
++ #define PCH_PCR_GPIO_ADDRESS(offset) (int *)((u64)(pch_base) | (u64)(offset))
++ 
++ static u64 *pch_base;
+  static unsigned long nmi_mmr;
+  static unsigned long nmi_mmr_clear;
+  static unsigned long nmi_mmr_pending;
+@@@ -213,9 -310,10 +309,10 @@@ static int uv_check_nmi(struct uv_hub_n
+  {
+  	int cpu = smp_processor_id();
+  	int nmi = 0;
++ 	int nmi_detected = 0;
+  
+  	local64_inc(&uv_nmi_count);
+ -	this_cpu_inc(uv_cpu_nmi.queries);
+ +	uv_cpu_nmi.queries++;
+  
+  	do {
+  		nmi = atomic_read(&hub_nmi->in_nmi);
+@@@ -371,8 -478,10 +491,15 @@@ static void uv_nmi_wait(int master
+  			break;
+  
+  		/* if not all made it in, send IPI NMI to them */
+++<<<<<<< HEAD
+ +		uv_nmi_nr_cpus_pr(KERN_ALERT
+ +			"UV: Sending NMI IPI to %d non-responding CPUs: %s\n");
+++=======
++ 		pr_alert("UV: Sending NMI IPI to %d CPUs: %*pbl\n",
++ 			 cpumask_weight(uv_nmi_cpu_mask),
++ 			 cpumask_pr_args(uv_nmi_cpu_mask));
++ 
+++>>>>>>> abdf1df6bc04 (x86/platform/UV: Add Support for UV4 Hubless NMIs)
+  		uv_nmi_nr_cpus_ping();
+  
+  		/* if all cpus are in, then done */
+@@@ -630,16 -741,24 +757,24 @@@ int uv_handle_nmi(unsigned int reason, 
+  	/* Pause as all cpus enter the NMI handler */
+  	uv_nmi_wait(master);
+  
+- 	/* Dump state of each cpu */
+- 	if (uv_nmi_action_is("ips") || uv_nmi_action_is("dump"))
++ 	/* Process actions other than "kdump": */
++ 	if (uv_nmi_action_is("ips") || uv_nmi_action_is("dump")) {
+  		uv_nmi_dump_state(cpu, regs, master);
+- 
+- 	/* Call KGDB/KDB if enabled */
+- 	else if (uv_nmi_action_is("kdb") || uv_nmi_action_is("kgdb"))
++ 	} else if (uv_nmi_action_is("kdb") || uv_nmi_action_is("kgdb")) {
+  		uv_call_kgdb_kdb(cpu, regs, master);
++ 	} else {
++ 		if (master)
++ 			pr_alert("UV: unknown NMI action: %s\n", uv_nmi_action);
++ 		uv_nmi_sync_exit(master);
++ 	}
+  
+++<<<<<<< HEAD
+ +	/* Clear per_cpu "in nmi" flag */
+ +	atomic_set(&uv_cpu_nmi.state, UV_NMI_STATE_OUT);
+++=======
++ 	/* Clear per_cpu "in_nmi" flag */
++ 	this_cpu_write(uv_cpu_nmi.state, UV_NMI_STATE_OUT);
+++>>>>>>> abdf1df6bc04 (x86/platform/UV: Add Support for UV4 Hubless NMIs)
+  
+  	/* Clear MMR NMI flag on each hub */
+  	uv_clear_nmi(cpu);
+@@@ -651,6 -770,8 +786,11 @@@
+  		atomic_set(&uv_nmi_cpus_in_nmi, -1);
+  		atomic_set(&uv_nmi_cpu, -1);
+  		atomic_set(&uv_in_nmi, 0);
+++<<<<<<< HEAD
+++=======
++ 		atomic_set(&uv_nmi_kexec_failed, 0);
++ 		atomic_set(&uv_nmi_slave_continue, SLAVE_CLEAR);
+++>>>>>>> abdf1df6bc04 (x86/platform/UV: Add Support for UV4 Hubless NMIs)
+  	}
+  
+  	uv_nmi_touch_watchdogs();
+diff --git a/arch/x86/include/asm/uv/uv_hub.h b/arch/x86/include/asm/uv/uv_hub.h
+index 0193cbe21d32..a9bf19046b71 100644
+--- a/arch/x86/include/asm/uv/uv_hub.h
++++ b/arch/x86/include/asm/uv/uv_hub.h
+@@ -772,6 +772,7 @@ static inline int uv_num_possible_blades(void)
+ 
+ /* Per Hub NMI support */
+ extern void uv_nmi_setup(void);
++extern void uv_nmi_setup_hubless(void);
+ 
+ /* BMC sets a bit this MMR non-zero before sending an NMI */
+ #define UVH_NMI_MMR		UVH_SCRATCH5
+@@ -799,6 +800,8 @@ struct uv_hub_nmi_s {
+ 	atomic_t	read_mmr_count;	/* count of MMR reads */
+ 	atomic_t	nmi_count;	/* count of true UV NMIs */
+ 	unsigned long	nmi_value;	/* last value read from NMI MMR */
++	bool		hub_present;	/* false means UV hubless system */
++	bool		pch_owner;	/* indicates this hub owns PCH */
+ };
+ 
+ struct uv_cpu_nmi_s {
+* Unmerged path arch/x86/kernel/apic/x2apic_uv_x.c
+* Unmerged path arch/x86/platform/uv/uv_nmi.c
