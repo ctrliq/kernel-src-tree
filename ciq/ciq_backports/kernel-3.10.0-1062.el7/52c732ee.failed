@@ -1,0 +1,181 @@
+xfs: refactor btree block header checking functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 52c732eee78b47ac2eb828b1c7fa611cd37b0090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/52c732ee.failed
+
+Refactor the btree block header checks to have an internal function that
+returns the address of the failing check without logging errors.  The
+scrubber will call the internal function, while the external version
+will maintain the current logging behavior.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 52c732eee78b47ac2eb828b1c7fa611cd37b0090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_btree.c
+diff --cc fs/xfs/libxfs/xfs_btree.c
+index bad40823795f,8bb20e1cf57b..000000000000
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@@ -62,45 -63,63 +62,73 @@@ xfs_btree_magic
+  	return magic;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +STATIC int				/* error (0 or EFSCORRUPTED) */
+ +xfs_btree_check_lblock(
+ +	struct xfs_btree_cur	*cur,	/* btree cursor */
+ +	struct xfs_btree_block	*block,	/* btree long form block pointer */
+ +	int			level,	/* level of the btree block */
+ +	struct xfs_buf		*bp)	/* buffer for block, if any */
+++=======
++ /*
++  * Check a long btree block header.  Return the address of the failing check,
++  * or NULL if everything is ok.
++  */
++ xfs_failaddr_t
++ __xfs_btree_check_lblock(
++ 	struct xfs_btree_cur	*cur,
++ 	struct xfs_btree_block	*block,
++ 	int			level,
++ 	struct xfs_buf		*bp)
+++>>>>>>> 52c732eee78b (xfs: refactor btree block header checking functions)
+  {
+- 	int			lblock_ok = 1; /* block passes checks */
+- 	struct xfs_mount	*mp;	/* file system mount point */
++ 	struct xfs_mount	*mp = cur->bc_mp;
+  	xfs_btnum_t		btnum = cur->bc_btnum;
+- 	int			crc;
+- 
+- 	mp = cur->bc_mp;
+- 	crc = xfs_sb_version_hascrc(&mp->m_sb);
++ 	int			crc = xfs_sb_version_hascrc(&mp->m_sb);
+  
+  	if (crc) {
+- 		lblock_ok = lblock_ok &&
+- 			uuid_equal(&block->bb_u.l.bb_uuid,
+- 				   &mp->m_sb.sb_meta_uuid) &&
+- 			block->bb_u.l.bb_blkno == cpu_to_be64(
+- 				bp ? bp->b_bn : XFS_BUF_DADDR_NULL);
++ 		if (!uuid_equal(&block->bb_u.l.bb_uuid, &mp->m_sb.sb_meta_uuid))
++ 			return __this_address;
++ 		if (block->bb_u.l.bb_blkno !=
++ 		    cpu_to_be64(bp ? bp->b_bn : XFS_BUF_DADDR_NULL))
++ 			return __this_address;
++ 		if (block->bb_u.l.bb_pad != cpu_to_be32(0))
++ 			return __this_address;
+  	}
+  
+- 	lblock_ok = lblock_ok &&
+- 		be32_to_cpu(block->bb_magic) == xfs_btree_magic(crc, btnum) &&
+- 		be16_to_cpu(block->bb_level) == level &&
+- 		be16_to_cpu(block->bb_numrecs) <=
+- 			cur->bc_ops->get_maxrecs(cur, level) &&
+- 		block->bb_u.l.bb_leftsib &&
+- 		(block->bb_u.l.bb_leftsib == cpu_to_be64(NULLFSBLOCK) ||
+- 		 XFS_FSB_SANITY_CHECK(mp,
+- 			be64_to_cpu(block->bb_u.l.bb_leftsib))) &&
+- 		block->bb_u.l.bb_rightsib &&
+- 		(block->bb_u.l.bb_rightsib == cpu_to_be64(NULLFSBLOCK) ||
+- 		 XFS_FSB_SANITY_CHECK(mp,
+- 			be64_to_cpu(block->bb_u.l.bb_rightsib)));
+- 
+- 	if (unlikely(XFS_TEST_ERROR(!lblock_ok, mp,
++ 	if (be32_to_cpu(block->bb_magic) != xfs_btree_magic(crc, btnum))
++ 		return __this_address;
++ 	if (be16_to_cpu(block->bb_level) != level)
++ 		return __this_address;
++ 	if (be16_to_cpu(block->bb_numrecs) >
++ 	    cur->bc_ops->get_maxrecs(cur, level))
++ 		return __this_address;
++ 	if (block->bb_u.l.bb_leftsib != cpu_to_be64(NULLFSBLOCK) &&
++ 	    !xfs_btree_check_lptr(cur, be64_to_cpu(block->bb_u.l.bb_leftsib),
++ 			level + 1))
++ 		return __this_address;
++ 	if (block->bb_u.l.bb_rightsib != cpu_to_be64(NULLFSBLOCK) &&
++ 	    !xfs_btree_check_lptr(cur, be64_to_cpu(block->bb_u.l.bb_rightsib),
++ 			level + 1))
++ 		return __this_address;
++ 
++ 	return NULL;
++ }
++ 
++ /* Check a long btree block header. */
++ int
++ xfs_btree_check_lblock(
++ 	struct xfs_btree_cur	*cur,
++ 	struct xfs_btree_block	*block,
++ 	int			level,
++ 	struct xfs_buf		*bp)
++ {
++ 	struct xfs_mount	*mp = cur->bc_mp;
++ 	xfs_failaddr_t		fa;
++ 
++ 	fa = __xfs_btree_check_lblock(cur, block, level, bp);
++ 	if (unlikely(XFS_TEST_ERROR(fa != NULL, mp,
+  			XFS_ERRTAG_BTREE_CHECK_LBLOCK))) {
+  		if (bp)
+  			trace_xfs_btree_corrupt(bp, _RET_IP_);
+* Unmerged path fs/xfs/libxfs/xfs_btree.c
+diff --git a/fs/xfs/libxfs/xfs_btree.h b/fs/xfs/libxfs/xfs_btree.h
+index be72dada276d..75d4922af9c5 100644
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@ -232,6 +232,14 @@ typedef struct xfs_btree_cur
+  */
+ #define	XFS_BUF_TO_BLOCK(bp)	((struct xfs_btree_block *)((bp)->b_addr))
+ 
++/*
++ * Internal long and short btree block checks.  They return NULL if the
++ * block is ok or the address of the failed check otherwise.
++ */
++xfs_failaddr_t __xfs_btree_check_lblock(struct xfs_btree_cur *cur,
++		struct xfs_btree_block *block, int level, struct xfs_buf *bp);
++xfs_failaddr_t __xfs_btree_check_sblock(struct xfs_btree_cur *cur,
++		struct xfs_btree_block *block, int level, struct xfs_buf *bp);
+ 
+ /*
+  * Check that block header is ok.
+diff --git a/fs/xfs/libxfs/xfs_types.h b/fs/xfs/libxfs/xfs_types.h
+index 10360687fd92..7ad6c08930aa 100644
+--- a/fs/xfs/libxfs/xfs_types.h
++++ b/fs/xfs/libxfs/xfs_types.h
+@@ -47,6 +47,12 @@ typedef uint64_t	xfs_filblks_t;	/* number of blocks in a file */
+ typedef int64_t		xfs_srtblock_t;	/* signed version of xfs_rtblock_t */
+ typedef int64_t		xfs_sfiloff_t;	/* signed block number in a file */
+ 
++/*
++ * New verifiers will return the instruction address of the failing check.
++ * NULL means everything is ok.
++ */
++typedef void *		xfs_failaddr_t;
++
+ /*
+  * Null values for the types.
+  */
+diff --git a/fs/xfs/xfs_linux.h b/fs/xfs/xfs_linux.h
+index 1152089db20e..2ab6153a388c 100644
+--- a/fs/xfs/xfs_linux.h
++++ b/fs/xfs/xfs_linux.h
+@@ -143,6 +143,13 @@ typedef uuid_be			uuid_t;
+ #define SYNCHRONIZE()	barrier()
+ #define __return_address __builtin_return_address(0)
+ 
++/*
++ * Return the address of a label.  Use barrier() so that the optimizer
++ * won't reorder code to refactor the error jumpouts into a single
++ * return, which throws off the reported address.
++ */
++#define __this_address	({ __label__ __here; __here: barrier(); &&__here; })
++
+ #define XFS_PROJID_DEFAULT	0
+ 
+ #define MIN(a,b)	(min(a,b))
