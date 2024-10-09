@@ -1,0 +1,668 @@
+nfp: flower: offload merge flows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 8af56f40e53b102a1f7ef5cd2b057cd6db776d6e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8af56f40.failed
+
+A merge flow is formed from 2 sub flows. The match fields of the merge are
+the same as the first sub flow that has formed it, with the actions being
+a combination of the first and second sub flow. Therefore, a merge flow
+should replace sub flow 1 when offloaded.
+
+Offload valid merge flows by using a new 'flow mod' message type to
+replace an existing offloaded rule. Track the deletion of sub flows that
+are linked to a merge flow and revert offloaded merge rules if required.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8af56f40e53b102a1f7ef5cd2b057cd6db776d6e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,675f43f06526..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -237,8 -251,30 +237,13 @@@ struct nfp_fl_payload 
+  	char *unmasked_data;
+  	char *mask_data;
+  	char *action_data;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head linked_flows;
++ 	bool in_hw;
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  };
+  
+ -struct nfp_fl_payload_link {
+ -	/* A link contains a pointer to a merge flow and an associated sub_flow.
+ -	 * Each merge flow will feature in 2 links to its underlying sub_flows.
+ -	 * A sub_flow will have at least 1 link to a merge flow or more if it
+ -	 * has been used to create multiple merge flows.
+ -	 *
+ -	 * For a merge flow, 'linked_flows' in its nfp_fl_payload struct lists
+ -	 * all links to sub_flows (sub_flow.flow) via merge.list.
+ -	 * For a sub_flow, 'linked_flows' gives all links to merge flows it has
+ -	 * formed (merge_flow.flow) via sub_flow.list.
+ -	 */
+ -	struct {
+ -		struct list_head list;
+ -		struct nfp_fl_payload *flow;
+ -	} merge_flow, sub_flow;
+ -};
+ -
+ -extern const struct rhashtable_params nfp_flower_table_params;
+ -
+  struct nfp_fl_stats_frame {
+  	__be32 stats_con_id;
+  	__be32 pkt_count;
+@@@ -270,7 -328,10 +275,14 @@@ int nfp_flower_compile_action(struct tc
+  			      struct nfp_fl_payload *nfp_flow);
+  int nfp_compile_flow_metadata(struct nfp_app *app,
+  			      struct tc_cls_flower_offload *flow,
+++<<<<<<< HEAD
+ +			      struct nfp_fl_payload *nfp_flow);
+++=======
++ 			      struct nfp_fl_payload *nfp_flow,
++ 			      struct net_device *netdev);
++ void __nfp_modify_flow_metadata(struct nfp_flower_priv *priv,
++ 				struct nfp_fl_payload *nfp_flow);
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  int nfp_modify_flow_metadata(struct nfp_app *app,
+  			     struct nfp_fl_payload *nfp_flow);
+  
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 050fdefa9950,df81d86ee16b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -444,7 -398,8 +444,12 @@@ nfp_flower_allocate_new(struct nfp_fl_k
+  
+  	flow_pay->nfp_tun_ipv4_addr = 0;
+  	flow_pay->meta.flags = 0;
+++<<<<<<< HEAD
+ +	spin_lock_init(&flow_pay->lock);
+++=======
++ 	INIT_LIST_HEAD(&flow_pay->linked_flows);
++ 	flow_pay->in_hw = false;
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  
+  	return flow_pay;
+  
+@@@ -457,6 -412,446 +462,449 @@@ err_free_flow
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_flower_update_merge_with_actions(struct nfp_fl_payload *flow,
++ 				     struct nfp_flower_merge_check *merge,
++ 				     u8 *last_act_id, int *act_out)
++ {
++ 	struct nfp_fl_set_ipv6_tc_hl_fl *ipv6_tc_hl_fl;
++ 	struct nfp_fl_set_ip4_ttl_tos *ipv4_ttl_tos;
++ 	struct nfp_fl_set_ip4_addrs *ipv4_add;
++ 	struct nfp_fl_set_ipv6_addr *ipv6_add;
++ 	struct nfp_fl_push_vlan *push_vlan;
++ 	struct nfp_fl_set_tport *tport;
++ 	struct nfp_fl_set_eth *eth;
++ 	struct nfp_fl_act_head *a;
++ 	unsigned int act_off = 0;
++ 	u8 act_id = 0;
++ 	u8 *ports;
++ 	int i;
++ 
++ 	while (act_off < flow->meta.act_len) {
++ 		a = (struct nfp_fl_act_head *)&flow->action_data[act_off];
++ 		act_id = a->jump_id;
++ 
++ 		switch (act_id) {
++ 		case NFP_FL_ACTION_OPCODE_OUTPUT:
++ 			if (act_out)
++ 				(*act_out)++;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_PUSH_VLAN:
++ 			push_vlan = (struct nfp_fl_push_vlan *)a;
++ 			if (push_vlan->vlan_tci)
++ 				merge->tci = cpu_to_be16(0xffff);
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_POP_VLAN:
++ 			merge->tci = cpu_to_be16(0);
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV4_TUNNEL:
++ 			/* New tunnel header means l2 to l4 can be matched. */
++ 			eth_broadcast_addr(&merge->l2.mac_dst[0]);
++ 			eth_broadcast_addr(&merge->l2.mac_src[0]);
++ 			memset(&merge->l4, 0xff,
++ 			       sizeof(struct nfp_flower_tp_ports));
++ 			memset(&merge->ipv4, 0xff,
++ 			       sizeof(struct nfp_flower_ipv4));
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_ETHERNET:
++ 			eth = (struct nfp_fl_set_eth *)a;
++ 			for (i = 0; i < ETH_ALEN; i++)
++ 				merge->l2.mac_dst[i] |= eth->eth_addr_mask[i];
++ 			for (i = 0; i < ETH_ALEN; i++)
++ 				merge->l2.mac_src[i] |=
++ 					eth->eth_addr_mask[ETH_ALEN + i];
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS:
++ 			ipv4_add = (struct nfp_fl_set_ip4_addrs *)a;
++ 			merge->ipv4.ipv4_src |= ipv4_add->ipv4_src_mask;
++ 			merge->ipv4.ipv4_dst |= ipv4_add->ipv4_dst_mask;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV4_TTL_TOS:
++ 			ipv4_ttl_tos = (struct nfp_fl_set_ip4_ttl_tos *)a;
++ 			merge->ipv4.ip_ext.ttl |= ipv4_ttl_tos->ipv4_ttl_mask;
++ 			merge->ipv4.ip_ext.tos |= ipv4_ttl_tos->ipv4_tos_mask;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV6_SRC:
++ 			ipv6_add = (struct nfp_fl_set_ipv6_addr *)a;
++ 			for (i = 0; i < 4; i++)
++ 				merge->ipv6.ipv6_src.in6_u.u6_addr32[i] |=
++ 					ipv6_add->ipv6[i].mask;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV6_DST:
++ 			ipv6_add = (struct nfp_fl_set_ipv6_addr *)a;
++ 			for (i = 0; i < 4; i++)
++ 				merge->ipv6.ipv6_dst.in6_u.u6_addr32[i] |=
++ 					ipv6_add->ipv6[i].mask;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_IPV6_TC_HL_FL:
++ 			ipv6_tc_hl_fl = (struct nfp_fl_set_ipv6_tc_hl_fl *)a;
++ 			merge->ipv6.ip_ext.ttl |=
++ 				ipv6_tc_hl_fl->ipv6_hop_limit_mask;
++ 			merge->ipv6.ip_ext.tos |= ipv6_tc_hl_fl->ipv6_tc_mask;
++ 			merge->ipv6.ipv6_flow_label_exthdr |=
++ 				ipv6_tc_hl_fl->ipv6_label_mask;
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_SET_UDP:
++ 		case NFP_FL_ACTION_OPCODE_SET_TCP:
++ 			tport = (struct nfp_fl_set_tport *)a;
++ 			ports = (u8 *)&merge->l4.port_src;
++ 			for (i = 0; i < 4; i++)
++ 				ports[i] |= tport->tp_port_mask[i];
++ 			break;
++ 		case NFP_FL_ACTION_OPCODE_PRE_TUNNEL:
++ 		case NFP_FL_ACTION_OPCODE_PRE_LAG:
++ 		case NFP_FL_ACTION_OPCODE_PUSH_GENEVE:
++ 			break;
++ 		default:
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		act_off += a->len_lw << NFP_FL_LW_SIZ;
++ 	}
++ 
++ 	if (last_act_id)
++ 		*last_act_id = act_id;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_flower_populate_merge_match(struct nfp_fl_payload *flow,
++ 				struct nfp_flower_merge_check *merge,
++ 				bool extra_fields)
++ {
++ 	struct nfp_flower_meta_tci *meta_tci;
++ 	u8 *mask = flow->mask_data;
++ 	u8 key_layer, match_size;
++ 
++ 	memset(merge, 0, sizeof(struct nfp_flower_merge_check));
++ 
++ 	meta_tci = (struct nfp_flower_meta_tci *)mask;
++ 	key_layer = meta_tci->nfp_flow_key_layer;
++ 
++ 	if (key_layer & ~NFP_FLOWER_MERGE_FIELDS && !extra_fields)
++ 		return -EOPNOTSUPP;
++ 
++ 	merge->tci = meta_tci->tci;
++ 	mask += sizeof(struct nfp_flower_meta_tci);
++ 
++ 	if (key_layer & NFP_FLOWER_LAYER_EXT_META)
++ 		mask += sizeof(struct nfp_flower_ext_meta);
++ 
++ 	mask += sizeof(struct nfp_flower_in_port);
++ 
++ 	if (key_layer & NFP_FLOWER_LAYER_MAC) {
++ 		match_size = sizeof(struct nfp_flower_mac_mpls);
++ 		memcpy(&merge->l2, mask, match_size);
++ 		mask += match_size;
++ 	}
++ 
++ 	if (key_layer & NFP_FLOWER_LAYER_TP) {
++ 		match_size = sizeof(struct nfp_flower_tp_ports);
++ 		memcpy(&merge->l4, mask, match_size);
++ 		mask += match_size;
++ 	}
++ 
++ 	if (key_layer & NFP_FLOWER_LAYER_IPV4) {
++ 		match_size = sizeof(struct nfp_flower_ipv4);
++ 		memcpy(&merge->ipv4, mask, match_size);
++ 	}
++ 
++ 	if (key_layer & NFP_FLOWER_LAYER_IPV6) {
++ 		match_size = sizeof(struct nfp_flower_ipv6);
++ 		memcpy(&merge->ipv6, mask, match_size);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_flower_can_merge(struct nfp_fl_payload *sub_flow1,
++ 		     struct nfp_fl_payload *sub_flow2)
++ {
++ 	/* Two flows can be merged if sub_flow2 only matches on bits that are
++ 	 * either matched by sub_flow1 or set by a sub_flow1 action. This
++ 	 * ensures that every packet that hits sub_flow1 and recirculates is
++ 	 * guaranteed to hit sub_flow2.
++ 	 */
++ 	struct nfp_flower_merge_check sub_flow1_merge, sub_flow2_merge;
++ 	int err, act_out = 0;
++ 	u8 last_act_id = 0;
++ 
++ 	err = nfp_flower_populate_merge_match(sub_flow1, &sub_flow1_merge,
++ 					      true);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_flower_populate_merge_match(sub_flow2, &sub_flow2_merge,
++ 					      false);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_flower_update_merge_with_actions(sub_flow1, &sub_flow1_merge,
++ 						   &last_act_id, &act_out);
++ 	if (err)
++ 		return err;
++ 
++ 	/* Must only be 1 output action and it must be the last in sequence. */
++ 	if (act_out != 1 || last_act_id != NFP_FL_ACTION_OPCODE_OUTPUT)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Reject merge if sub_flow2 matches on something that is not matched
++ 	 * on or set in an action by sub_flow1.
++ 	 */
++ 	err = bitmap_andnot(sub_flow2_merge.vals, sub_flow2_merge.vals,
++ 			    sub_flow1_merge.vals,
++ 			    sizeof(struct nfp_flower_merge_check) * 8);
++ 	if (err)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int
++ nfp_flower_copy_pre_actions(char *act_dst, char *act_src, int len,
++ 			    bool *tunnel_act)
++ {
++ 	unsigned int act_off = 0, act_len;
++ 	struct nfp_fl_act_head *a;
++ 	u8 act_id = 0;
++ 
++ 	while (act_off < len) {
++ 		a = (struct nfp_fl_act_head *)&act_src[act_off];
++ 		act_len = a->len_lw << NFP_FL_LW_SIZ;
++ 		act_id = a->jump_id;
++ 
++ 		switch (act_id) {
++ 		case NFP_FL_ACTION_OPCODE_PRE_TUNNEL:
++ 			if (tunnel_act)
++ 				*tunnel_act = true;
++ 		case NFP_FL_ACTION_OPCODE_PRE_LAG:
++ 			memcpy(act_dst + act_off, act_src + act_off, act_len);
++ 			break;
++ 		default:
++ 			return act_off;
++ 		}
++ 
++ 		act_off += act_len;
++ 	}
++ 
++ 	return act_off;
++ }
++ 
++ static int nfp_fl_verify_post_tun_acts(char *acts, int len)
++ {
++ 	struct nfp_fl_act_head *a;
++ 	unsigned int act_off = 0;
++ 
++ 	while (act_off < len) {
++ 		a = (struct nfp_fl_act_head *)&acts[act_off];
++ 		if (a->jump_id != NFP_FL_ACTION_OPCODE_OUTPUT)
++ 			return -EOPNOTSUPP;
++ 
++ 		act_off += a->len_lw << NFP_FL_LW_SIZ;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_flower_merge_action(struct nfp_fl_payload *sub_flow1,
++ 			struct nfp_fl_payload *sub_flow2,
++ 			struct nfp_fl_payload *merge_flow)
++ {
++ 	unsigned int sub1_act_len, sub2_act_len, pre_off1, pre_off2;
++ 	bool tunnel_act = false;
++ 	char *merge_act;
++ 	int err;
++ 
++ 	/* The last action of sub_flow1 must be output - do not merge this. */
++ 	sub1_act_len = sub_flow1->meta.act_len - sizeof(struct nfp_fl_output);
++ 	sub2_act_len = sub_flow2->meta.act_len;
++ 
++ 	if (!sub2_act_len)
++ 		return -EINVAL;
++ 
++ 	if (sub1_act_len + sub2_act_len > NFP_FL_MAX_A_SIZ)
++ 		return -EINVAL;
++ 
++ 	/* A shortcut can only be applied if there is a single action. */
++ 	if (sub1_act_len)
++ 		merge_flow->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_NULL);
++ 	else
++ 		merge_flow->meta.shortcut = sub_flow2->meta.shortcut;
++ 
++ 	merge_flow->meta.act_len = sub1_act_len + sub2_act_len;
++ 	merge_act = merge_flow->action_data;
++ 
++ 	/* Copy any pre-actions to the start of merge flow action list. */
++ 	pre_off1 = nfp_flower_copy_pre_actions(merge_act,
++ 					       sub_flow1->action_data,
++ 					       sub1_act_len, &tunnel_act);
++ 	merge_act += pre_off1;
++ 	sub1_act_len -= pre_off1;
++ 	pre_off2 = nfp_flower_copy_pre_actions(merge_act,
++ 					       sub_flow2->action_data,
++ 					       sub2_act_len, NULL);
++ 	merge_act += pre_off2;
++ 	sub2_act_len -= pre_off2;
++ 
++ 	/* FW does a tunnel push when egressing, therefore, if sub_flow 1 pushes
++ 	 * a tunnel, sub_flow 2 can only have output actions for a valid merge.
++ 	 */
++ 	if (tunnel_act) {
++ 		char *post_tun_acts = &sub_flow2->action_data[pre_off2];
++ 
++ 		err = nfp_fl_verify_post_tun_acts(post_tun_acts, sub2_act_len);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	/* Copy remaining actions from sub_flows 1 and 2. */
++ 	memcpy(merge_act, sub_flow1->action_data + pre_off1, sub1_act_len);
++ 	merge_act += sub1_act_len;
++ 	memcpy(merge_act, sub_flow2->action_data + pre_off2, sub2_act_len);
++ 
++ 	return 0;
++ }
++ 
++ /* Flow link code should only be accessed under RTNL. */
++ static void nfp_flower_unlink_flow(struct nfp_fl_payload_link *link)
++ {
++ 	list_del(&link->merge_flow.list);
++ 	list_del(&link->sub_flow.list);
++ 	kfree(link);
++ }
++ 
++ static void nfp_flower_unlink_flows(struct nfp_fl_payload *merge_flow,
++ 				    struct nfp_fl_payload *sub_flow)
++ {
++ 	struct nfp_fl_payload_link *link;
++ 
++ 	list_for_each_entry(link, &merge_flow->linked_flows, merge_flow.list)
++ 		if (link->sub_flow.flow == sub_flow) {
++ 			nfp_flower_unlink_flow(link);
++ 			return;
++ 		}
++ }
++ 
++ static int nfp_flower_link_flows(struct nfp_fl_payload *merge_flow,
++ 				 struct nfp_fl_payload *sub_flow)
++ {
++ 	struct nfp_fl_payload_link *link;
++ 
++ 	link = kmalloc(sizeof(*link), GFP_KERNEL);
++ 	if (!link)
++ 		return -ENOMEM;
++ 
++ 	link->merge_flow.flow = merge_flow;
++ 	list_add_tail(&link->merge_flow.list, &merge_flow->linked_flows);
++ 	link->sub_flow.flow = sub_flow;
++ 	list_add_tail(&link->sub_flow.list, &sub_flow->linked_flows);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * nfp_flower_merge_offloaded_flows() - Merge 2 existing flows to single flow.
++  * @app:	Pointer to the APP handle
++  * @sub_flow1:	Initial flow matched to produce merge hint
++  * @sub_flow2:	Post recirculation flow matched in merge hint
++  *
++  * Combines 2 flows (if valid) to a single flow, removing the initial from hw
++  * and offloading the new, merged flow.
++  *
++  * Return: negative value on error, 0 in success.
++  */
++ int nfp_flower_merge_offloaded_flows(struct nfp_app *app,
++ 				     struct nfp_fl_payload *sub_flow1,
++ 				     struct nfp_fl_payload *sub_flow2)
++ {
++ 	struct tc_cls_flower_offload merge_tc_off;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 	struct nfp_fl_payload *merge_flow;
++ 	struct nfp_fl_key_ls merge_key_ls;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (sub_flow1 == sub_flow2 ||
++ 	    nfp_flower_is_merge_flow(sub_flow1) ||
++ 	    nfp_flower_is_merge_flow(sub_flow2))
++ 		return -EINVAL;
++ 
++ 	err = nfp_flower_can_merge(sub_flow1, sub_flow2);
++ 	if (err)
++ 		return err;
++ 
++ 	merge_key_ls.key_size = sub_flow1->meta.key_len;
++ 
++ 	merge_flow = nfp_flower_allocate_new(&merge_key_ls);
++ 	if (!merge_flow)
++ 		return -ENOMEM;
++ 
++ 	merge_flow->tc_flower_cookie = (unsigned long)merge_flow;
++ 	merge_flow->ingress_dev = sub_flow1->ingress_dev;
++ 
++ 	memcpy(merge_flow->unmasked_data, sub_flow1->unmasked_data,
++ 	       sub_flow1->meta.key_len);
++ 	memcpy(merge_flow->mask_data, sub_flow1->mask_data,
++ 	       sub_flow1->meta.mask_len);
++ 
++ 	err = nfp_flower_merge_action(sub_flow1, sub_flow2, merge_flow);
++ 	if (err)
++ 		goto err_destroy_merge_flow;
++ 
++ 	err = nfp_flower_link_flows(merge_flow, sub_flow1);
++ 	if (err)
++ 		goto err_destroy_merge_flow;
++ 
++ 	err = nfp_flower_link_flows(merge_flow, sub_flow2);
++ 	if (err)
++ 		goto err_unlink_sub_flow1;
++ 
++ 	merge_tc_off.cookie = merge_flow->tc_flower_cookie;
++ 	err = nfp_compile_flow_metadata(app, &merge_tc_off, merge_flow,
++ 					merge_flow->ingress_dev);
++ 	if (err)
++ 		goto err_unlink_sub_flow2;
++ 
++ 	err = rhashtable_insert_fast(&priv->flow_table, &merge_flow->fl_node,
++ 				     nfp_flower_table_params);
++ 	if (err)
++ 		goto err_release_metadata;
++ 
++ 	err = nfp_flower_xmit_flow(app, merge_flow,
++ 				   NFP_FLOWER_CMSG_TYPE_FLOW_MOD);
++ 	if (err)
++ 		goto err_remove_rhash;
++ 
++ 	merge_flow->in_hw = true;
++ 	sub_flow1->in_hw = false;
++ 
++ 	return 0;
++ 
++ err_remove_rhash:
++ 	WARN_ON_ONCE(rhashtable_remove_fast(&priv->flow_table,
++ 					    &merge_flow->fl_node,
++ 					    nfp_flower_table_params));
++ err_release_metadata:
++ 	nfp_modify_flow_metadata(app, merge_flow);
++ err_unlink_sub_flow2:
++ 	nfp_flower_unlink_flows(merge_flow, sub_flow2);
++ err_unlink_sub_flow1:
++ 	nfp_flower_unlink_flows(merge_flow, sub_flow1);
++ err_destroy_merge_flow:
++ 	kfree(merge_flow->action_data);
++ 	kfree(merge_flow->mask_data);
++ 	kfree(merge_flow->unmasked_data);
++ 	kfree(merge_flow);
++ 	return err;
++ }
++ 
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  /**
+   * nfp_flower_add_offload() - Adds a new flow to hardware.
+   * @app:	Pointer to the APP handle
+@@@ -508,17 -904,22 +956,19 @@@ nfp_flower_add_offload(struct nfp_app *
+  	if (err)
+  		goto err_destroy_flow;
+  
+ -	flow_pay->tc_flower_cookie = flow->cookie;
+ -	err = rhashtable_insert_fast(&priv->flow_table, &flow_pay->fl_node,
+ -				     nfp_flower_table_params);
+ -	if (err)
+ -		goto err_release_metadata;
+ -
+ -	err = nfp_flower_xmit_flow(app, flow_pay,
+ +	err = nfp_flower_xmit_flow(netdev, flow_pay,
+  				   NFP_FLOWER_CMSG_TYPE_FLOW_ADD);
+  	if (err)
+ -		goto err_remove_rhash;
+ +		goto err_destroy_flow;
+  
+ -	if (port)
+ -		port->tc_offload_cnt++;
+ +	INIT_HLIST_NODE(&flow_pay->link);
+ +	flow_pay->tc_flower_cookie = flow->cookie;
+ +	fl_key = nfp_flower_fl_key(flow->cookie);
+ +	hash_add_rcu(priv->flow_table, &flow_pay->link, fl_key);
+ +	port->tc_offload_cnt++;
+  
++ 	flow_pay->in_hw = true;
++ 
+  	/* Deallocate flow payload when flower rule has been destroyed. */
+  	kfree(key_layer);
+  
+@@@ -564,14 -1044,19 +1083,29 @@@ nfp_flower_del_offload(struct nfp_app *
+  	if (nfp_flow->nfp_tun_ipv4_addr)
+  		nfp_tunnel_del_ipv4_off(app, nfp_flow->nfp_tun_ipv4_addr);
+  
+++<<<<<<< HEAD
+ +	err = nfp_flower_xmit_flow(netdev, nfp_flow,
+++=======
++ 	if (!nfp_flow->in_hw) {
++ 		err = 0;
++ 		goto err_free_merge_flow;
++ 	}
++ 
++ 	err = nfp_flower_xmit_flow(app, nfp_flow,
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  				   NFP_FLOWER_CMSG_TYPE_FLOW_DEL);
+- 	if (err)
+- 		goto err_free_flow;
++ 	/* Fall through on error. */
+  
+++<<<<<<< HEAD
+ +err_free_flow:
+ +	hash_del_rcu(&nfp_flow->link);
+ +	port->tc_offload_cnt--;
+++=======
++ err_free_merge_flow:
++ 	nfp_flower_del_linked_merge_flows(app, nfp_flow);
++ 	if (port)
++ 		port->tc_offload_cnt--;
+++>>>>>>> 8af56f40e53b (nfp: flower: offload merge flows)
+  	kfree(nfp_flow->action_data);
+  	kfree(nfp_flow->mask_data);
+  	kfree(nfp_flow->unmasked_data);
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 062d7040a0dc..574517d1c32b 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -392,6 +392,7 @@ struct nfp_flower_cmsg_hdr {
+ /* Types defined for port related control messages  */
+ enum nfp_flower_cmsg_type_port {
+ 	NFP_FLOWER_CMSG_TYPE_FLOW_ADD =		0,
++	NFP_FLOWER_CMSG_TYPE_FLOW_MOD =		1,
+ 	NFP_FLOWER_CMSG_TYPE_FLOW_DEL =		2,
+ 	NFP_FLOWER_CMSG_TYPE_LAG_CONFIG =	4,
+ 	NFP_FLOWER_CMSG_TYPE_PORT_REIFY =	6,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/metadata.c b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+index c748aceb17bb..c757a06e8caa 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/metadata.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+@@ -298,9 +298,6 @@ nfp_check_mask_remove(struct nfp_app *app, char *mask_data, u32 mask_len,
+ 	if (!mask_entry)
+ 		return false;
+ 
+-	if (meta_flags)
+-		*meta_flags &= ~NFP_FL_META_FLAG_MANAGE_MASK;
+-
+ 	*mask_id = mask_entry->mask_id;
+ 	mask_entry->ref_cnt--;
+ 	if (!mask_entry->ref_cnt) {
+@@ -363,6 +360,14 @@ int nfp_compile_flow_metadata(struct nfp_app *app,
+ 	return 0;
+ }
+ 
++void __nfp_modify_flow_metadata(struct nfp_flower_priv *priv,
++				struct nfp_fl_payload *nfp_flow)
++{
++	nfp_flow->meta.flags &= ~NFP_FL_META_FLAG_MANAGE_MASK;
++	nfp_flow->meta.flow_version = cpu_to_be64(priv->flower_version);
++	priv->flower_version++;
++}
++
+ int nfp_modify_flow_metadata(struct nfp_app *app,
+ 			     struct nfp_fl_payload *nfp_flow)
+ {
+@@ -370,13 +375,12 @@ int nfp_modify_flow_metadata(struct nfp_app *app,
+ 	u8 new_mask_id = 0;
+ 	u32 temp_ctx_id;
+ 
++	__nfp_modify_flow_metadata(priv, nfp_flow);
++
+ 	nfp_check_mask_remove(app, nfp_flow->mask_data,
+ 			      nfp_flow->meta.mask_len, &nfp_flow->meta.flags,
+ 			      &new_mask_id);
+ 
+-	nfp_flow->meta.flow_version = cpu_to_be64(priv->flower_version);
+-	priv->flower_version++;
+-
+ 	/* Update flow payload with mask ids. */
+ 	nfp_flow->unmasked_data[NFP_FL_MASK_ID_LOCATION] = new_mask_id;
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
