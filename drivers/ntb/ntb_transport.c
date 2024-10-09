@@ -60,7 +60,7 @@
 
 #define NTB_TRANSPORT_VERSION	3
 
-static unsigned int transport_mtu = 0x401E;
+static unsigned int transport_mtu = 0x10000;
 module_param(transport_mtu, uint, 0644);
 MODULE_PARM_DESC(transport_mtu, "Maximum size of NTB transport packets");
 
