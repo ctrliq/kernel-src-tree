@@ -1,0 +1,635 @@
+nfp: bpf: use extack support to improve debugging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Quentin Monnet <quentin.monnet@netronome.com>
+commit 52be9a7cde1fd26e43a01ac06d5c2558c563a7cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/52be9a7c.failed
+
+Use the recently added extack support for eBPF offload in the driver.
+
+	Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 52be9a7cde1fd26e43a01ac06d5c2558c563a7cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/bpf/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 60a7af297852,b3206855535a..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -62,20 -62,19 +62,29 @@@ nfp_bpf_xdp_offload(struct nfp_app *app
+  	if (!nfp_net_ebpf_capable(nn))
+  		return -EINVAL;
+  
+ -	running = nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+ -	xdp_running = running && nn->dp.bpf_offload_xdp;
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF) {
+ +		if (!nn->dp.bpf_offload_xdp)
+ +			return prog ? -EBUSY : 0;
+ +		cmd.command = prog ? TC_CLSBPF_REPLACE : TC_CLSBPF_DESTROY;
+ +	} else {
+ +		if (!prog)
+ +			return 0;
+ +		cmd.command = TC_CLSBPF_ADD;
+ +	}
+  
+++<<<<<<< HEAD
+ +	ret = nfp_net_bpf_offload(nn, &cmd);
+++=======
++ 	if (!prog && !xdp_running)
++ 		return 0;
++ 	if (prog && running && !xdp_running)
++ 		return -EBUSY;
++ 
++ 	ret = nfp_net_bpf_offload(nn, prog, running, extack);
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  	/* Stop offload if replace not possible */
+ -	if (ret && prog)
+ -		nfp_bpf_xdp_offload(app, nn, NULL, extack);
+ -
+ +	if (ret && cmd.command == TC_CLSBPF_REPLACE)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+  	nn->dp.bpf_offload_xdp = prog && !ret;
+  	return ret;
+  }
+@@@ -109,9 -110,92 +118,98 @@@ nfp_bpf_vnic_alloc(struct nfp_app *app
+  
+  static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
+  {
+++<<<<<<< HEAD
+ +	if (nn->dp.bpf_offload_xdp)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+ +	kfree(nn->app_priv);
+++=======
++ 	struct nfp_bpf_vnic *bv = nn->app_priv;
++ 
++ 	WARN_ON(bv->tc_prog);
++ 	kfree(bv);
++ }
++ 
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
++ {
++ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
++ 	struct nfp_net *nn = cb_priv;
++ 	struct bpf_prog *oldprog;
++ 	struct nfp_bpf_vnic *bv;
++ 	int err;
++ 
++ 	if (type != TC_SETUP_CLSBPF) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only offload of BPF classifiers supported");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (!tc_can_offload_extack(nn->dp.netdev, cls_bpf->common.extack))
++ 		return -EOPNOTSUPP;
++ 	if (!nfp_net_ebpf_capable(nn)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "NFP firmware does not support eBPF offload");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (cls_bpf->common.protocol != htons(ETH_P_ALL)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only ETH_P_ALL supported as filter protocol");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (cls_bpf->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Only support TC direct action */
++ 	if (!cls_bpf->exts_integrated ||
++ 	    tcf_exts_has_actions(cls_bpf->exts)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only direct action with no legacy actions supported");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (cls_bpf->command != TC_CLSBPF_OFFLOAD)
++ 		return -EOPNOTSUPP;
++ 
++ 	bv = nn->app_priv;
++ 	oldprog = cls_bpf->oldprog;
++ 
++ 	/* Don't remove if oldprog doesn't match driver's state */
++ 	if (bv->tc_prog != oldprog) {
++ 		oldprog = NULL;
++ 		if (!cls_bpf->prog)
++ 			return 0;
++ 	}
++ 
++ 	err = nfp_net_bpf_offload(nn, cls_bpf->prog, oldprog,
++ 				  cls_bpf->common.extack);
++ 	if (err)
++ 		return err;
++ 
++ 	bv->tc_prog = cls_bpf->prog;
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_setup_tc_block(struct net_device *netdev,
++ 				  struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_bpf_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_bpf_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  }
+  
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,424fe8338105..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -183,37 -310,52 +183,44 @@@ struct nfp_prog 
+  	struct list_head insns;
+  };
+  
+ -/**
+ - * struct nfp_bpf_vnic - per-vNIC BPF priv structure
+ - * @tc_prog:	currently loaded cls_bpf program
+ - * @start_off:	address of the first instruction in the memory
+ - * @tgt_done:	jump target to get the next packet
+ - */
+ -struct nfp_bpf_vnic {
+ -	struct bpf_prog *tc_prog;
+ -	unsigned int start_off;
+ -	unsigned int tgt_done;
+ +struct nfp_bpf_result {
+ +	unsigned int n_instr;
+ +	bool dense_mode;
+  };
+  
+ -void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ -int nfp_bpf_jit(struct nfp_prog *prog);
+ -bool nfp_bpf_supported_opcode(u8 code);
+ +int
+ +nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
+ +	    unsigned int prog_start, unsigned int prog_done,
+ +	    unsigned int prog_sz, struct nfp_bpf_result *res);
+  
+ -extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ +int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+  
+ -struct netdev_bpf;
+ -struct nfp_app;
+  struct nfp_net;
+ +struct tc_cls_bpf_offload;
+  
+++<<<<<<< HEAD
+ +/**
+ + * struct nfp_net_bpf_priv - per-vNIC BPF private data
+ + * @rx_filter:		Filter offload statistics - dropped packets/bytes
+ + * @rx_filter_prev:	Filter offload statistics - values from previous update
+ + * @rx_filter_change:	Jiffies when statistics last changed
+ + * @rx_filter_stats_timer:  Timer for polling filter offload statistics
+ + * @rx_filter_lock:	Lock protecting timer state changes (teardown)
+ + */
+ +struct nfp_net_bpf_priv {
+ +	struct nfp_stat_pair rx_filter, rx_filter_prev;
+ +	unsigned long rx_filter_change;
+ +	struct timer_list rx_filter_stats_timer;
+ +	spinlock_t rx_filter_lock;
+ +};
+++=======
++ int nfp_ndo_bpf(struct nfp_app *app, struct nfp_net *nn,
++ 		struct netdev_bpf *bpf);
++ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
++ 			bool old_prog, struct netlink_ext_ack *extack);
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+ +
+ +int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+ +void nfp_net_filter_stats_timer(unsigned long data);
+  
+ -struct nfp_insn_meta *
+ -nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ -		  unsigned int insn_idx, unsigned int n_insns);
+ -
+ -void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ -
+ -long long int
+ -nfp_bpf_ctrl_alloc_map(struct nfp_app_bpf *bpf, struct bpf_map *map);
+ -void
+ -nfp_bpf_ctrl_free_map(struct nfp_app_bpf *bpf, struct nfp_bpf_map *nfp_map);
+ -int nfp_bpf_ctrl_getfirst_entry(struct bpf_offloaded_map *offmap,
+ -				void *next_key);
+ -int nfp_bpf_ctrl_update_entry(struct bpf_offloaded_map *offmap,
+ -			      void *key, void *value, u64 flags);
+ -int nfp_bpf_ctrl_del_entry(struct bpf_offloaded_map *offmap, void *key);
+ -int nfp_bpf_ctrl_lookup_entry(struct bpf_offloaded_map *offmap,
+ -			      void *key, void *value);
+ -int nfp_bpf_ctrl_getnext_entry(struct bpf_offloaded_map *offmap,
+ -			       void *key, void *next_key);
+ -
+ -void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index de79faf0874b,0a7732385469..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@@ -147,22 -91,205 +147,217 @@@ nfp_net_bpf_get_act(struct nfp_net *nn
+  }
+  
+  static int
+ -nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+ -		      struct netdev_bpf *bpf)
+ +nfp_net_bpf_offload_prepare(struct nfp_net *nn,
+ +			    struct tc_cls_bpf_offload *cls_bpf,
+ +			    struct nfp_bpf_result *res,
+ +			    void **code, dma_addr_t *dma_addr, u16 max_instr)
+  {
+ -	struct bpf_prog *prog = bpf->verifier.prog;
+ -	struct nfp_prog *nfp_prog;
+ +	unsigned int code_sz = max_instr * sizeof(u64);
+ +	enum nfp_bpf_action_type act;
+ +	unsigned int stack_size;
+ +	u16 start_off, done_off;
+ +	unsigned int max_mtu;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = nfp_net_bpf_get_act(nn, cls_bpf);
+ +	if (ret < 0)
+ +		return ret;
+ +	act = ret;
+++=======
++ 	nfp_prog = kzalloc(sizeof(*nfp_prog), GFP_KERNEL);
++ 	if (!nfp_prog)
++ 		return -ENOMEM;
++ 	prog->aux->offload->dev_priv = nfp_prog;
++ 
++ 	INIT_LIST_HEAD(&nfp_prog->insns);
++ 	nfp_prog->type = prog->type;
++ 	nfp_prog->bpf = app->priv;
++ 
++ 	ret = nfp_prog_prepare(nfp_prog, prog->insnsi, prog->len);
++ 	if (ret)
++ 		goto err_free;
++ 
++ 	nfp_prog->verifier_meta = nfp_prog_first_meta(nfp_prog);
++ 	bpf->verifier.ops = &nfp_bpf_analyzer_ops;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	nfp_prog_free(nfp_prog);
++ 
++ 	return ret;
++ }
++ 
++ static int nfp_bpf_translate(struct nfp_net *nn, struct bpf_prog *prog)
++ {
++ 	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
++ 	unsigned int stack_size;
++ 	unsigned int max_instr;
++ 	int err;
++ 
++ 	stack_size = nn_readb(nn, NFP_NET_CFG_BPF_STACK_SZ) * 64;
++ 	if (prog->aux->stack_depth > stack_size) {
++ 		nn_info(nn, "stack too large: program %dB > FW stack %dB\n",
++ 			prog->aux->stack_depth, stack_size);
++ 		return -EOPNOTSUPP;
++ 	}
++ 	nfp_prog->stack_depth = round_up(prog->aux->stack_depth, 4);
++ 
++ 	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
++ 	nfp_prog->__prog_alloc_len = max_instr * sizeof(u64);
++ 
++ 	nfp_prog->prog = kvmalloc(nfp_prog->__prog_alloc_len, GFP_KERNEL);
++ 	if (!nfp_prog->prog)
++ 		return -ENOMEM;
++ 
++ 	err = nfp_bpf_jit(nfp_prog);
++ 	if (err)
++ 		return err;
++ 
++ 	prog->aux->offload->jited_len = nfp_prog->prog_len * sizeof(u64);
++ 	prog->aux->offload->jited_image = nfp_prog->prog;
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_destroy(struct nfp_net *nn, struct bpf_prog *prog)
++ {
++ 	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
++ 
++ 	kvfree(nfp_prog->prog);
++ 	nfp_prog_free(nfp_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
++ 			 void *key, void *next_key)
++ {
++ 	if (!key)
++ 		return nfp_bpf_ctrl_getfirst_entry(offmap, next_key);
++ 	return nfp_bpf_ctrl_getnext_entry(offmap, key, next_key);
++ }
++ 
++ static int
++ nfp_bpf_map_delete_elem(struct bpf_offloaded_map *offmap, void *key)
++ {
++ 	if (offmap->map.map_type == BPF_MAP_TYPE_ARRAY)
++ 		return -EINVAL;
++ 	return nfp_bpf_ctrl_del_entry(offmap, key);
++ }
++ 
++ static const struct bpf_map_dev_ops nfp_bpf_map_ops = {
++ 	.map_get_next_key	= nfp_bpf_map_get_next_key,
++ 	.map_lookup_elem	= nfp_bpf_ctrl_lookup_entry,
++ 	.map_update_elem	= nfp_bpf_ctrl_update_entry,
++ 	.map_delete_elem	= nfp_bpf_map_delete_elem,
++ };
++ 
++ static int
++ nfp_bpf_map_alloc(struct nfp_app_bpf *bpf, struct bpf_offloaded_map *offmap)
++ {
++ 	struct nfp_bpf_map *nfp_map;
++ 	long long int res;
++ 
++ 	if (!bpf->maps.types)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (offmap->map.map_flags ||
++ 	    offmap->map.numa_node != NUMA_NO_NODE) {
++ 		pr_info("map flags are not supported\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!(bpf->maps.types & 1 << offmap->map.map_type)) {
++ 		pr_info("map type not supported\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (bpf->maps.max_maps == bpf->maps_in_use) {
++ 		pr_info("too many maps for a device\n");
++ 		return -ENOMEM;
++ 	}
++ 	if (bpf->maps.max_elems - bpf->map_elems_in_use <
++ 	    offmap->map.max_entries) {
++ 		pr_info("map with too many elements: %u, left: %u\n",
++ 			offmap->map.max_entries,
++ 			bpf->maps.max_elems - bpf->map_elems_in_use);
++ 		return -ENOMEM;
++ 	}
++ 	if (offmap->map.key_size > bpf->maps.max_key_sz ||
++ 	    offmap->map.value_size > bpf->maps.max_val_sz ||
++ 	    round_up(offmap->map.key_size, 8) +
++ 	    round_up(offmap->map.value_size, 8) > bpf->maps.max_elem_sz) {
++ 		pr_info("elements don't fit in device constraints\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	nfp_map = kzalloc(sizeof(*nfp_map), GFP_USER);
++ 	if (!nfp_map)
++ 		return -ENOMEM;
++ 
++ 	offmap->dev_priv = nfp_map;
++ 	nfp_map->offmap = offmap;
++ 	nfp_map->bpf = bpf;
++ 
++ 	res = nfp_bpf_ctrl_alloc_map(bpf, &offmap->map);
++ 	if (res < 0) {
++ 		kfree(nfp_map);
++ 		return res;
++ 	}
++ 
++ 	nfp_map->tid = res;
++ 	offmap->dev_ops = &nfp_bpf_map_ops;
++ 	bpf->maps_in_use++;
++ 	bpf->map_elems_in_use += offmap->map.max_entries;
++ 	list_add_tail(&nfp_map->l, &bpf->map_list);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_map_free(struct nfp_app_bpf *bpf, struct bpf_offloaded_map *offmap)
++ {
++ 	struct nfp_bpf_map *nfp_map = offmap->dev_priv;
++ 
++ 	nfp_bpf_ctrl_free_map(bpf, nfp_map);
++ 	list_del_init(&nfp_map->l);
++ 	bpf->map_elems_in_use -= offmap->map.max_entries;
++ 	bpf->maps_in_use--;
++ 	kfree(nfp_map);
++ 
++ 	return 0;
++ }
++ 
++ int nfp_ndo_bpf(struct nfp_app *app, struct nfp_net *nn, struct netdev_bpf *bpf)
++ {
++ 	switch (bpf->command) {
++ 	case BPF_OFFLOAD_VERIFIER_PREP:
++ 		return nfp_bpf_verifier_prep(app, nn, bpf);
++ 	case BPF_OFFLOAD_TRANSLATE:
++ 		return nfp_bpf_translate(nn, bpf->offload.prog);
++ 	case BPF_OFFLOAD_DESTROY:
++ 		return nfp_bpf_destroy(nn, bpf->offload.prog);
++ 	case BPF_OFFLOAD_MAP_ALLOC:
++ 		return nfp_bpf_map_alloc(app->priv, bpf->offmap);
++ 	case BPF_OFFLOAD_MAP_FREE:
++ 		return nfp_bpf_map_free(app->priv, bpf->offmap);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int
++ nfp_net_bpf_load(struct nfp_net *nn, struct bpf_prog *prog,
++ 		 struct netlink_ext_ack *extack)
++ {
++ 	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
++ 	unsigned int max_mtu;
++ 	dma_addr_t dma_addr;
++ 	void *img;
++ 	int err;
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  
+  	max_mtu = nn_readb(nn, NFP_NET_CFG_BPF_INL_MTU) * 64 - 32;
+  	if (max_mtu < nn->dp.netdev->mtu) {
+@@@ -223,20 -315,28 +418,41 @@@ nfp_net_bpf_load_and_start(struct nfp_n
+  	/* Load up the JITed code */
+  	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_BPF);
+  	if (err)
+- 		nn_err(nn, "FW command error while loading BPF: %d\n", err);
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "FW command error while loading BPF");
++ 
+++<<<<<<< HEAD
+++=======
++ 	dma_unmap_single(nn->dp.dev, dma_addr, nfp_prog->prog_len * sizeof(u64),
++ 			 DMA_TO_DEVICE);
++ 	kfree(img);
+  
++ 	return err;
++ }
++ 
++ static void
++ nfp_net_bpf_start(struct nfp_net *nn, struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  	/* Enable passing packets through BPF function */
+  	nn->dp.ctrl |= NFP_NET_CFG_CTRL_BPF;
+  	nn_writel(nn, NFP_NET_CFG_CTRL, nn->dp.ctrl);
+  	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_GEN);
+  	if (err)
+++<<<<<<< HEAD
+ +		nn_err(nn, "FW command error while enabling BPF: %d\n", err);
+ +
+ +	dma_free_coherent(nn->dp.dev, code_sz, code, dma_addr);
+ +
+ +	nfp_net_bpf_stats_reset(nn);
+ +	mod_timer(&priv->rx_filter_stats_timer,
+ +		  jiffies + NFP_NET_STAT_POLL_IVL);
+++=======
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "FW command error while enabling BPF");
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  }
+  
+  static int nfp_net_bpf_stop(struct nfp_net *nn)
+@@@ -246,76 -344,50 +462,108 @@@
+  	if (!(nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF))
+  		return 0;
+  
+ +	spin_lock_bh(&priv->rx_filter_lock);
+  	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_BPF;
+ +	spin_unlock_bh(&priv->rx_filter_lock);
+  	nn_writel(nn, NFP_NET_CFG_CTRL, nn->dp.ctrl);
+  
+ +	del_timer_sync(&priv->rx_filter_stats_timer);
+ +	nn->dp.bpf_offload_skip_sw = 0;
+ +
+  	return nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_GEN);
+  }
+ +#endif
+  
+++<<<<<<< HEAD
+ +int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+++=======
++ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
++ 			bool old_prog, struct netlink_ext_ack *extack)
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  {
+ +#if 0 /* Not in RHEL7 */
+ +	struct nfp_bpf_result res;
+ +	dma_addr_t dma_addr;
+ +	u16 max_instr;
+ +	void *code;
+  	int err;
+  
+ -	if (prog) {
+ -		struct bpf_prog_offload *offload = prog->aux->offload;
+ +	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+  
+++<<<<<<< HEAD
+ +	switch (cls_bpf->command) {
+ +	case TC_CLSBPF_REPLACE:
+ +		/* There is nothing stopping us from implementing seamless
+ +		 * replace but the simple method of loading I adopted in
+ +		 * the firmware does not handle atomic replace (i.e. we have to
+ +		 * stop the BPF offload and re-enable it).  Leaking-in a few
+ +		 * frames which didn't have BPF applied in the hardware should
+ +		 * be fine if software fallback is available, though.
+ +		 */
+ +		if (nn->dp.bpf_offload_skip_sw)
+++=======
++ 		if (!offload)
++ 			return -EINVAL;
++ 		if (offload->netdev != nn->dp.netdev)
++ 			return -EINVAL;
++ 	}
++ 
++ 	if (prog && old_prog) {
++ 		u8 cap;
++ 
++ 		cap = nn_readb(nn, NFP_NET_CFG_BPF_CAP);
++ 		if (!(cap & NFP_NET_BPF_CAP_RELO)) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "FW does not support live reload");
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  			return -EBUSY;
+ -		}
+ -	}
+  
+ -	/* Something else is loaded, different program type? */
+ -	if (!old_prog && nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ -		return -EBUSY;
+ +		err = nfp_net_bpf_offload_prepare(nn, cls_bpf, &res, &code,
+ +						  &dma_addr, max_instr);
+ +		if (err)
+ +			return err;
+ +
+ +		nfp_net_bpf_stop(nn);
+ +		nfp_net_bpf_load_and_start(nn, cls_bpf->gen_flags, code,
+ +					   dma_addr, max_instr * sizeof(u64),
+ +					   res.n_instr, res.dense_mode);
+ +		return 0;
+  
+ -	if (old_prog && !prog)
+ +	case TC_CLSBPF_ADD:
+ +		if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ +			return -EBUSY;
+ +
+ +		err = nfp_net_bpf_offload_prepare(nn, cls_bpf, &res, &code,
+ +						  &dma_addr, max_instr);
+ +		if (err)
+ +			return err;
+ +
+ +		nfp_net_bpf_load_and_start(nn, cls_bpf->gen_flags, code,
+ +					   dma_addr, max_instr * sizeof(u64),
+ +					   res.n_instr, res.dense_mode);
+ +		return 0;
+ +
+ +	case TC_CLSBPF_DESTROY:
+  		return nfp_net_bpf_stop(nn);
+  
+++<<<<<<< HEAD
+ +	case TC_CLSBPF_STATS:
+ +		return nfp_net_bpf_stats_update(nn, cls_bpf);
+ +
+ +	default:
+ +		return -EOPNOTSUPP;
+ +	}
+ +#else
+ +	return -EOPNOTSUPP;
+ +#endif
+++=======
++ 	err = nfp_net_bpf_load(nn, prog, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	if (!old_prog)
++ 		nfp_net_bpf_start(nn, extack);
++ 
++ 	return 0;
+++>>>>>>> 52be9a7cde1f (nfp: bpf: use extack support to improve debugging)
+  }
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/offload.c
