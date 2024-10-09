@@ -2543,6 +2543,8 @@ check_scsi_status:
 
 	if (rsp->status_srb == NULL)
 		sp->done(sp, res);
+	else
+		WARN_ON_ONCE(true);
 }
 
 /**
@@ -2620,6 +2622,8 @@ qlafx00_status_cont_entry(struct rsp_que *rsp, sts_cont_entry_t *pkt)
 	if (sense_len == 0) {
 		rsp->status_srb = NULL;
 		sp->done(sp, cp->result);
+	} else {
+		WARN_ON_ONCE(true);
 	}
 }
 
