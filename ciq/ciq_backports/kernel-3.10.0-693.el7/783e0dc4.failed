@@ -1,0 +1,157 @@
+qla2xxx: Check for device state before unloading the driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Check for device state before unloading the driver (Chad Dupuis) [1384091]
+Rebuild_FUZZ: 99.16%
+commit-author Sawan Chandak <sawan.chandak@qlogic.com>
+commit 783e0dc4f66ade6bbd8833b6bae778158d54c1a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/783e0dc4.failed
+
+During hot swap of PCI device, there can be PCI error on device,
+during normal driver unload. The race between normal driver unload and
+driver unload due to PCI error, can lead to system crash.Fix is to check
+if there is unload going on and allow that function to unload the driver.
+
+	Signed-off-by: Sawan Chandak <sawan.chandak@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 783e0dc4f66ade6bbd8833b6bae778158d54c1a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 2e18dc18ea3a,2790e5f2f29c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -12,15 -12,14 +12,23 @@@
+   * |             Level            |   Last Value Used  |     Holes	|
+   * ----------------------------------------------------------------------
+   * | Module Init and Probe        |       0x018f       | 0x0146         |
+++<<<<<<< HEAD
+ + * | Mailbox commands             |       0x1181       | 0x111a-0x111b  |
+ + * |                              |                    | 0x1155-0x1158  |
+ + * |                              |                    | 0x1018-0x1019  |
+ + * |                              |                    | 0x1115-0x1116  |
+ + * |                              |                    | 0x10ca         |
+ + * | Device Discovery             |       0x2095       | 0x2020-0x2022, |
+++=======
++  * |                              |                    | 0x015b-0x0160	|
++  * |                              |                    | 0x016e		|
++  * | Mailbox commands             |       0x1191       | 		|
++  * |                              |                    |		|
++  * | Device Discovery             |       0x2003       | 0x2016		|
+++>>>>>>> 783e0dc4f66a (qla2xxx: Check for device state before unloading the driver.)
+   * |                              |                    | 0x2011-0x2012, |
+   * |                              |                    | 0x2099-0x20a4  |
+ - * | Queue Command and IO tracing |       0x3074       | 0x300b         |
+ + * | Queue Command and IO tracing |       0x3075       | 0x300b         |
+   * |                              |                    | 0x3027-0x3028  |
+   * |                              |                    | 0x303d-0x3041  |
+   * |                              |                    | 0x302d,0x3033  |
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index d35ce3ed4436,fde7ee17ed85..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -3205,7 -3139,11 +3206,15 @@@ qla2x00_remove_one(struct pci_dev *pdev
+  
+  	qla2x00_wait_for_hba_ready(base_vha);
+  
+++<<<<<<< HEAD
+ +	ha->flags.host_shutting_down = 1;
+++=======
++ 	/* if UNLOAD flag is already set, then continue unload,
++ 	 * where it was set first.
++ 	 */
++ 	if (test_bit(UNLOADING, &base_vha->dpc_flags))
++ 		return;
+++>>>>>>> 783e0dc4f66a (qla2xxx: Check for device state before unloading the driver.)
+  
+  	set_bit(UNLOADING, &base_vha->dpc_flags);
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 0e1f0af3adff..f637786f472c 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3558,6 +3558,7 @@ typedef struct scsi_qla_host {
+ #define PFLG_DISCONNECTED	0	/* PCI device removed */
+ #define PFLG_DRIVER_REMOVING	1	/* PCI driver .remove */
+ #define PFLG_DRIVER_PROBING	2	/* PCI driver .probe */
++#define PCI_ERR			30
+ 
+ 	uint32_t	device_flags;
+ #define SWITCH_FOUND		BIT_0
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index fbe27de90b21..123ea88a053c 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -64,6 +64,13 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
+ 		return QLA_FUNCTION_TIMEOUT;
+ 	}
+ 
++	 /* if PCI error, then avoid mbx processing.*/
++	 if (test_bit(PCI_ERR, &base_vha->dpc_flags)) {
++		ql_log(ql_log_warn, vha, 0x1191,
++		    "PCI error, exiting.\n");
++		return QLA_FUNCTION_TIMEOUT;
++	 }
++
+ 	reg = ha->iobase;
+ 	io_lock_on = base_vha->flags.init_done;
+ 
+@@ -266,6 +273,7 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
+ 
+ 		uint16_t mb0;
+ 		uint32_t ictrl;
++		uint16_t        w;
+ 
+ 		if (IS_FWI2_CAPABLE(ha)) {
+ 			mb0 = RD_REG_WORD(&reg->isp24.mailbox0);
+@@ -279,15 +287,32 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
+ 		    "mb[0]=0x%x\n", command, ictrl, jiffies, mb0);
+ 		ql_dump_regs(ql_dbg_mbx + ql_dbg_buffer, vha, 0x1019);
+ 
+-		/*
+-		 * Attempt to capture a firmware dump for further analysis
+-		 * of the current firmware state.  We do not need to do this
+-		 * if we are intentionally generating a dump.
+-		 */
+-		if (mcp->mb[0] != MBC_GEN_SYSTEM_ERROR)
+-			ha->isp_ops->fw_dump(vha, 0);
++		/* Capture FW dump only, if PCI device active */
++		if (!pci_channel_offline(vha->hw->pdev)) {
++			pci_read_config_word(ha->pdev, PCI_VENDOR_ID, &w);
++			if (w == 0xffff || ictrl == 0xffffffff) {
++				/* This is special case if there is unload
++				 * of driver happening and if PCI device go
++				 * into bad state due to PCI error condition
++				 * then only PCI ERR flag would be set.
++				 * we will do premature exit for above case.
++				 */
++				if (test_bit(UNLOADING, &base_vha->dpc_flags))
++					set_bit(PCI_ERR, &base_vha->dpc_flags);
++				ha->flags.mbox_busy = 0;
++				rval = QLA_FUNCTION_TIMEOUT;
++				goto premature_exit;
++			}
+ 
+-		rval = QLA_FUNCTION_TIMEOUT;
++			/* Attempt to capture firmware dump for further
++			 * anallysis of the current formware state. we do not
++			 * need to do this if we are intentionally generating
++			 * a dump
++			 */
++			if (mcp->mb[0] != MBC_GEN_SYSTEM_ERROR)
++				ha->isp_ops->fw_dump(vha, 0);
++			rval = QLA_FUNCTION_TIMEOUT;
++		 }
+ 	}
+ 
+ 	ha->flags.mbox_busy = 0;
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
