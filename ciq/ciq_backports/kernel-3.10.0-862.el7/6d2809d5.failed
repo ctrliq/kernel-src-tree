@@ -1,0 +1,83 @@
+blk-mq: make blk_mq_alloc_request_hctx() allocate a scheduler request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 6d2809d51a5079f01a416d91dd63b0766cb685d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6d2809d5.failed
+
+blk_mq_alloc_request_hctx() allocates a driver request directly, unlike
+its blk_mq_alloc_request() counterpart. It also crashes because it
+doesn't update the tags->rqs map.
+
+Fix it by making it allocate a scheduler request.
+
+	Reported-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Tested-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 6d2809d51a5079f01a416d91dd63b0766cb685d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 3e6f9b3d2b64..ba5ed063d8a8 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -306,10 +306,9 @@ EXPORT_SYMBOL(blk_mq_alloc_request);
+ struct request *blk_mq_alloc_request_hctx(struct request_queue *q, int rw,
+ 		unsigned int flags, unsigned int hctx_idx)
+ {
+-	struct blk_mq_hw_ctx *hctx;
+-	struct blk_mq_ctx *ctx;
++	struct blk_mq_alloc_data alloc_data = { .flags = flags };
+ 	struct request *rq;
+-	struct blk_mq_alloc_data alloc_data;
++	unsigned int cpu;
+ 	int ret;
+ 
+ 	/*
+@@ -332,25 +331,23 @@ struct request *blk_mq_alloc_request_hctx(struct request_queue *q, int rw,
+ 	 * Check if the hardware context is actually mapped to anything.
+ 	 * If not tell the caller that it should skip this queue.
+ 	 */
+-	hctx = q->queue_hw_ctx[hctx_idx];
+-	if (!blk_mq_hw_queue_mapped(hctx)) {
+-		ret = -EXDEV;
+-		goto out_queue_exit;
+-	}
+-	ctx = __blk_mq_get_ctx(q, cpumask_first(hctx->cpumask));
+-
+-	blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
+-	rq = __blk_mq_alloc_request(&alloc_data, rw);
+-	if (!rq) {
+-		ret = -EWOULDBLOCK;
+-		goto out_queue_exit;
++	alloc_data.hctx = q->queue_hw_ctx[hctx_idx];
++	if (!blk_mq_hw_queue_mapped(alloc_data.hctx)) {
++		blk_queue_exit(q);
++		return ERR_PTR(-EXDEV);
+ 	}
++	cpu = cpumask_first(alloc_data.hctx->cpumask);
++	alloc_data.ctx = __blk_mq_get_ctx(q, cpu);
+ 
+-	return rq;
++	rq = blk_mq_sched_get_request(q, NULL, rw, &alloc_data);
+ 
+-out_queue_exit:
++	blk_mq_put_ctx(alloc_data.ctx);
+ 	blk_queue_exit(q);
+-	return ERR_PTR(ret);
++
++	if (!rq)
++		return ERR_PTR(-EWOULDBLOCK);
++
++	return rq;
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
+ 
