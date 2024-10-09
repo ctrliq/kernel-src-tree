@@ -1,0 +1,126 @@
+PCI/MSI: Simplify PCI MSI code by initializing msi_desc.nvec_used earlier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [pci] msi: Simplify PCI MSI code by initializing msi_desc.nvec_used earlier (Prarit Bhargava) [1417650]
+Rebuild_FUZZ: 97.18%
+commit-author Jiang Liu <jiang.liu@linux.intel.com>
+commit 63a7b17e3fe8ef6217daa7be35e373c7807275f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/63a7b17e.failed
+
+Simplify PCI MSI code by initializing msi_desc.nvec_used and
+msi_desc.msi_attrib.multiple when creating MSI descriptors.
+
+Also remove redundant checks in IRQ remapping drivers, PCI MSI core
+already guarantees these.
+
+	Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Grant Likely <grant.likely@linaro.org>
+	Cc: Marc Zyngier <marc.zyngier@arm.com>
+	Cc: Yingjoe Chen <yingjoe.chen@mediatek.com>
+	Cc: Yijing Wang <wangyijing@huawei.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 63a7b17e3fe8ef6217daa7be35e373c7807275f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/msi.c
+diff --cc drivers/pci/msi.c
+index 48ccfed10215,df0170b8da73..000000000000
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@@ -347,21 -357,12 +341,28 @@@ static void free_msi_irqs(struct pci_de
+  	struct msi_desc *entry, *tmp;
+  	struct attribute **msi_attrs;
+  	struct device_attribute *dev_attr;
+- 	int count = 0;
++ 	int i, count = 0;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(entry, &dev->msi_list, list) {
+ +		int i, nvec;
+ +		if (!entry->irq)
+ +			continue;
+ +		if (entry->nvec_used)
+ +			nvec = entry->nvec_used;
+ +		else
+ +			nvec = 1 << entry->msi_attrib.multiple;
+ +#ifdef CONFIG_GENERIC_HARDIRQS
+ +		for (i = 0; i < nvec; i++)
+ +			BUG_ON(irq_has_action(entry->irq + i));
+ +#endif
+ +	}
+++=======
++ 	list_for_each_entry(entry, &dev->msi_list, list)
++ 		if (entry->irq)
++ 			for (i = 0; i < entry->nvec_used; i++)
++ 				BUG_ON(irq_has_action(entry->irq + i));
+++>>>>>>> 63a7b17e3fe8 (PCI/MSI: Simplify PCI MSI code by initializing msi_desc.nvec_used earlier)
+  
+  	arch_teardown_msi_irqs(dev);
+  
+@@@ -569,8 -570,9 +570,14 @@@ static struct msi_desc *msi_setup_entry
+  	entry->msi_attrib.entry_nr	= 0;
+  	entry->msi_attrib.maskbit	= !!(control & PCI_MSI_FLAGS_MASKBIT);
+  	entry->msi_attrib.default_irq	= dev->irq;	/* Save IOAPIC IRQ */
+++<<<<<<< HEAD
+ +	entry->msi_attrib.pos		= dev->msi_cap;
+ +	entry->multi_cap		= (control & PCI_MSI_FLAGS_QMASK) >> 1;
+++=======
++ 	entry->msi_attrib.multi_cap	= (control & PCI_MSI_FLAGS_QMASK) >> 1;
++ 	entry->msi_attrib.multiple	= ilog2(__roundup_pow_of_two(nvec));
++ 	entry->nvec_used		= nvec;
+++>>>>>>> 63a7b17e3fe8 (PCI/MSI: Simplify PCI MSI code by initializing msi_desc.nvec_used earlier)
+  
+  	if (control & PCI_MSI_FLAGS_64BIT)
+  		entry->mask_pos = dev->msi_cap + PCI_MSI_MASK_64;
+@@@ -615,9 -603,9 +622,9 @@@ static int msi_capability_init(struct p
+  	int ret;
+  	unsigned mask;
+  
+ -	msi_set_enable(dev, 0);	/* Disable MSI during set up */
+ +	pci_msi_set_enable(dev, 0);	/* Disable MSI during set up */
+  
+- 	entry = msi_setup_entry(dev);
++ 	entry = msi_setup_entry(dev, nvec);
+  	if (!entry)
+  		return -ENOMEM;
+  
+diff --git a/drivers/iommu/irq_remapping.c b/drivers/iommu/irq_remapping.c
+index 83c5fe29777f..27f245ae4be7 100644
+--- a/drivers/iommu/irq_remapping.c
++++ b/drivers/iommu/irq_remapping.c
+@@ -57,19 +57,13 @@ static int do_setup_msi_irqs(struct pci_dev *dev, int nvec)
+ 	unsigned int irq;
+ 	struct msi_desc *msidesc;
+ 
+-	WARN_ON(!list_is_singular(&dev->msi_list));
+ 	msidesc = list_entry(dev->msi_list.next, struct msi_desc, list);
+-	WARN_ON(msidesc->irq);
+-	WARN_ON(msidesc->msi_attrib.multiple);
+-	WARN_ON(msidesc->nvec_used);
+ 
+ 	irq = irq_alloc_hwirqs(nvec, dev_to_node(&dev->dev));
+ 	if (irq == 0)
+ 		return -ENOSPC;
+ 
+ 	nvec_pow2 = __roundup_pow_of_two(nvec);
+-	msidesc->nvec_used = nvec;
+-	msidesc->msi_attrib.multiple = ilog2(nvec_pow2);
+ 	for (sub_handle = 0; sub_handle < nvec; sub_handle++) {
+ 		if (!sub_handle) {
+ 			index = msi_alloc_remapped_irq(dev, irq, nvec_pow2);
+@@ -97,8 +91,6 @@ error:
+ 	 * IRQs from tearing down again in default_teardown_msi_irqs()
+ 	 */
+ 	msidesc->irq = 0;
+-	msidesc->nvec_used = 0;
+-	msidesc->msi_attrib.multiple = 0;
+ 
+ 	return ret;
+ }
+* Unmerged path drivers/pci/msi.c
