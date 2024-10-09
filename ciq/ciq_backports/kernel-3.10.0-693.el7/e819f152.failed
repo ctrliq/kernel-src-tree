@@ -1,0 +1,265 @@
+mnt: Improve the umount_tree flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit e819f152104c9f7c9fe50e1aecce6f5d4bf06d65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e819f152.failed
+
+- Remove the unneeded declaration from pnode.h
+- Mark umount_tree static as it has no callers outside of namespace.c
+- Define an enumeration of umount_tree's flags.
+- Pass umount_tree's flags in by name
+
+This removes the magic numbers 0, 1 and 2 making the code a little
+clearer and makes it possible for there to be lazy unmounts that don't
+propagate.  Which is what __detach_mounts actually wants for example.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit e819f152104c9f7c9fe50e1aecce6f5d4bf06d65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index 07e51358b239,e06e36777b90..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -1208,32 -1317,47 +1208,54 @@@ static inline void namespace_lock(void
+  	down_write(&namespace_sem);
+  }
+  
++ enum umount_tree_flags {
++ 	UMOUNT_SYNC = 1,
++ 	UMOUNT_PROPAGATE = 2,
++ };
+  /*
+ - * mount_lock must be held
+ + * vfsmount lock must be held for write
+   * namespace_sem must be held for write
+   */
+++<<<<<<< HEAD
+ +void umount_tree(struct mount *mnt, int propagate)
+++=======
++ static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  {
+ -	HLIST_HEAD(tmp_list);
+ +	LIST_HEAD(tmp_list);
+  	struct mount *p;
+  
+ -	for (p = mnt; p; p = next_mnt(p, mnt)) {
+ -		hlist_del_init_rcu(&p->mnt_hash);
+ -		hlist_add_head(&p->mnt_hash, &tmp_list);
+ -	}
+ +	for (p = mnt; p; p = next_mnt(p, mnt))
+ +		list_move(&p->mnt_hash, &tmp_list);
+  
+++<<<<<<< HEAD
+ +	if (propagate)
+++=======
++ 	hlist_for_each_entry(p, &tmp_list, mnt_hash)
++ 		list_del_init(&p->mnt_child);
++ 
++ 	if (how & UMOUNT_PROPAGATE)
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  		propagate_umount(&tmp_list);
+  
+ -	while (!hlist_empty(&tmp_list)) {
+ -		p = hlist_entry(tmp_list.first, struct mount, mnt_hash);
+ -		hlist_del_init_rcu(&p->mnt_hash);
+ +	list_for_each_entry(p, &tmp_list, mnt_hash) {
+  		list_del_init(&p->mnt_expire);
+  		list_del_init(&p->mnt_list);
+  		__touch_mnt_namespace(p->mnt_ns);
+  		p->mnt_ns = NULL;
+++<<<<<<< HEAD
+ +		list_del_init(&p->mnt_child);
+++=======
++ 		if (how & UMOUNT_SYNC)
++ 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
++ 
++ 		pin_insert_group(&p->mnt_umount, &p->mnt_parent->mnt, &unmounted);
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  		if (mnt_has_parent(p)) {
+ -			hlist_del_init(&p->mnt_mp_list);
+  			put_mountpoint(p->mnt_mp);
+ -			mnt_add_count(p->mnt_parent, -1);
+ -			/* old mountpoint will be dropped when we can do that */
+ -			p->mnt_ex_mountpoint = p->mnt_mountpoint;
+ +			/* move the reference to mountpoint into ->mnt_ex_mountpoint */
+ +			p->mnt_ex_mountpoint.dentry = p->mnt_mountpoint;
+ +			p->mnt_ex_mountpoint.mnt = &p->mnt_parent->mnt;
+  			p->mnt_mountpoint = p->mnt.mnt_root;
+  			p->mnt_parent = p;
+  			p->mnt_mp = NULL;
+@@@ -1318,23 -1441,58 +1340,72 @@@ static int do_umount(struct mount *mnt
+  	}
+  
+  	namespace_lock();
+ -	lock_mount_hash();
+ +	br_write_lock(&vfsmount_lock);
+  	event++;
+  
+++<<<<<<< HEAD
+ +	if (!(flags & MNT_DETACH))
+ +		shrink_submounts(mnt);
+ +
+ +	retval = -EBUSY;
+ +	if (flags & MNT_DETACH || !propagate_mount_busy(mnt, 2)) {
+ +		if (!list_empty(&mnt->mnt_list))
+ +			umount_tree(mnt, 1);
+ +		retval = 0;
+++=======
++ 	if (flags & MNT_DETACH) {
++ 		if (!list_empty(&mnt->mnt_list))
++ 			umount_tree(mnt, UMOUNT_PROPAGATE);
++ 		retval = 0;
++ 	} else {
++ 		shrink_submounts(mnt);
++ 		retval = -EBUSY;
++ 		if (!propagate_mount_busy(mnt, 2)) {
++ 			if (!list_empty(&mnt->mnt_list))
++ 				umount_tree(mnt, UMOUNT_PROPAGATE|UMOUNT_SYNC);
++ 			retval = 0;
++ 		}
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  	}
+ -	unlock_mount_hash();
+ +	br_write_unlock(&vfsmount_lock);
+  	namespace_unlock();
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * __detach_mounts - lazily unmount all mounts on the specified dentry
++  *
++  * During unlink, rmdir, and d_drop it is possible to loose the path
++  * to an existing mountpoint, and wind up leaking the mount.
++  * detach_mounts allows lazily unmounting those mounts instead of
++  * leaking them.
++  *
++  * The caller may hold dentry->d_inode->i_mutex.
++  */
++ void __detach_mounts(struct dentry *dentry)
++ {
++ 	struct mountpoint *mp;
++ 	struct mount *mnt;
++ 
++ 	namespace_lock();
++ 	mp = lookup_mountpoint(dentry);
++ 	if (!mp)
++ 		goto out_unlock;
++ 
++ 	lock_mount_hash();
++ 	while (!hlist_empty(&mp->m_list)) {
++ 		mnt = hlist_entry(mp->m_list.first, struct mount, mnt_mp_list);
++ 		umount_tree(mnt, UMOUNT_PROPAGATE);
++ 	}
++ 	unlock_mount_hash();
++ 	put_mountpoint(mp);
++ out_unlock:
++ 	namespace_unlock();
++ }
++ 
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  /* 
+   * Is the caller allowed to modify his namespace?
+   */
+@@@ -1481,9 -1646,9 +1552,15 @@@ struct mount *copy_tree(struct mount *m
+  	return res;
+  out:
+  	if (res) {
+++<<<<<<< HEAD
+ +		br_write_lock(&vfsmount_lock);
+ +		umount_tree(res, 0);
+ +		br_write_unlock(&vfsmount_lock);
+++=======
++ 		lock_mount_hash();
++ 		umount_tree(res, UMOUNT_SYNC);
++ 		unlock_mount_hash();
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  	}
+  	return q;
+  }
+@@@ -1505,9 -1670,9 +1582,15 @@@ struct vfsmount *collect_mounts(struct 
+  void drop_collected_mounts(struct vfsmount *mnt)
+  {
+  	namespace_lock();
+++<<<<<<< HEAD
+ +	br_write_lock(&vfsmount_lock);
+ +	umount_tree(real_mount(mnt), 0);
+ +	br_write_unlock(&vfsmount_lock);
+++=======
++ 	lock_mount_hash();
++ 	umount_tree(real_mount(mnt), UMOUNT_SYNC);
++ 	unlock_mount_hash();
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  	namespace_unlock();
+  }
+  
+@@@ -1683,11 -1852,11 +1766,17 @@@ static int attach_recursive_mnt(struct 
+  	return 0;
+  
+   out_cleanup_ids:
+++<<<<<<< HEAD
+ +	while (!list_empty(&tree_list)) {
+ +		child = list_first_entry(&tree_list, struct mount, mnt_hash);
+ +		umount_tree(child, 0);
+++=======
++ 	while (!hlist_empty(&tree_list)) {
++ 		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
++ 		umount_tree(child, UMOUNT_SYNC);
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  	}
+ -	unlock_mount_hash();
+ +	br_write_unlock(&vfsmount_lock);
+  	cleanup_group_ids(source_mnt, NULL);
+   out:
+  	return err;
+@@@ -1861,9 -2033,9 +1950,15 @@@ static int do_loopback(struct path *pat
+  
+  	err = graft_tree(mnt, parent, mp);
+  	if (err) {
+++<<<<<<< HEAD
+ +		br_write_lock(&vfsmount_lock);
+ +		umount_tree(mnt, 0);
+ +		br_write_unlock(&vfsmount_lock);
+++=======
++ 		lock_mount_hash();
++ 		umount_tree(mnt, UMOUNT_SYNC);
++ 		unlock_mount_hash();
+++>>>>>>> e819f152104c (mnt: Improve the umount_tree flags)
+  	}
+  out2:
+  	unlock_mount(mp);
+@@@ -2203,9 -2405,9 +2298,9 @@@ void mark_mounts_for_expiry(struct list
+  	while (!list_empty(&graveyard)) {
+  		mnt = list_first_entry(&graveyard, struct mount, mnt_expire);
+  		touch_mnt_namespace(mnt->mnt_ns);
+- 		umount_tree(mnt, 1);
++ 		umount_tree(mnt, UMOUNT_PROPAGATE|UMOUNT_SYNC);
+  	}
+ -	unlock_mount_hash();
+ +	br_write_unlock(&vfsmount_lock);
+  	namespace_unlock();
+  }
+  
+* Unmerged path fs/namespace.c
+diff --git a/fs/pnode.h b/fs/pnode.h
+index 65e04f65fa1a..34b195caa577 100644
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -47,7 +47,6 @@ int get_dominating_id(struct mount *mnt, const struct path *root);
+ unsigned int mnt_get_count(struct mount *mnt);
+ void mnt_set_mountpoint(struct mount *, struct mountpoint *,
+ 			struct mount *);
+-void umount_tree(struct mount *, int);
+ struct mount *copy_tree(struct mount *, struct dentry *, int);
+ bool is_path_reachable(struct mount *, struct dentry *,
+ 			 const struct path *root);
