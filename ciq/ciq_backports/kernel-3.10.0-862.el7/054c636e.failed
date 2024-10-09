@@ -1,0 +1,568 @@
+fsnotify: Move ->free_mark callback to fsnotify_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 054c636e5c8054884ede889be82ce059879945e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/054c636e.failed
+
+Pointer to ->free_mark callback unnecessarily occupies one long in each
+fsnotify_mark although they are the same for all marks from one
+notification group. Move the callback pointer to fsnotify_ops.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 054c636e5c8054884ede889be82ce059879945e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/dnotify/dnotify.c
+#	fs/notify/fanotify/fanotify_user.c
+#	fs/notify/inotify/inotify.h
+#	fs/notify/inotify/inotify_user.c
+#	fs/notify/mark.c
+#	include/linux/fsnotify_backend.h
+#	kernel/audit_fsnotify.c
+#	kernel/audit_tree.c
+#	kernel/audit_watch.c
+diff --cc fs/notify/dnotify/dnotify.c
+index 38696275be90,2430a0415995..000000000000
+--- a/fs/notify/dnotify/dnotify.c
++++ b/fs/notify/dnotify/dnotify.c
+@@@ -308,7 -306,7 +309,11 @@@ int fcntl_dirnotify(int fd, struct fil
+  
+  	/* set up the new_fsn_mark and new_dn_mark */
+  	new_fsn_mark = &new_dn_mark->fsn_mark;
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(new_fsn_mark, dnotify_free_mark);
+++=======
++ 	fsnotify_init_mark(new_fsn_mark, dnotify_group);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	new_fsn_mark->mask = mask;
+  	new_dn_mark->dn = NULL;
+  
+diff --cc fs/notify/fanotify/fanotify_user.c
+index 0bc2e0fd9d85,bf306d4f72f7..000000000000
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@@ -630,8 -623,8 +625,13 @@@ static struct fsnotify_mark *fanotify_a
+  	if (!mark)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(mark, fanotify_free_mark);
+ +	ret = fsnotify_add_mark_locked(mark, group, inode, mnt, 0);
+++=======
++ 	fsnotify_init_mark(mark, group);
++ 	ret = fsnotify_add_mark_locked(mark, inode, mnt, 0);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	if (ret) {
+  		fsnotify_put_mark(mark);
+  		return ERR_PTR(ret);
+diff --cc fs/notify/inotify/inotify.h
+index a6f5907a3fee,9ff67b61da8a..000000000000
+--- a/fs/notify/inotify/inotify.h
++++ b/fs/notify/inotify/inotify.h
+@@@ -27,6 -27,25 +27,27 @@@ extern int inotify_handle_event(struct 
+  				struct fsnotify_mark *inode_mark,
+  				struct fsnotify_mark *vfsmount_mark,
+  				u32 mask, const void *data, int data_type,
+ -				const unsigned char *file_name, u32 cookie,
+ -				struct fsnotify_iter_info *iter_info);
+ +				const unsigned char *file_name, u32 cookie);
+  
+  extern const struct fsnotify_ops inotify_fsnotify_ops;
+++<<<<<<< HEAD
+++=======
++ extern struct kmem_cache *inotify_inode_mark_cachep;
++ 
++ #ifdef CONFIG_INOTIFY_USER
++ static inline void dec_inotify_instances(struct ucounts *ucounts)
++ {
++ 	dec_ucount(ucounts, UCOUNT_INOTIFY_INSTANCES);
++ }
++ 
++ static inline struct ucounts *inc_inotify_watches(struct ucounts *ucounts)
++ {
++ 	return inc_ucount(ucounts->ns, ucounts->uid, UCOUNT_INOTIFY_WATCHES);
++ }
++ 
++ static inline void dec_inotify_watches(struct ucounts *ucounts)
++ {
++ 	dec_ucount(ucounts, UCOUNT_INOTIFY_WATCHES);
++ }
++ #endif
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+diff --cc fs/notify/inotify/inotify_user.c
+index 9881b183eb6d,7cc7d3fb1862..000000000000
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@@ -44,12 -44,10 +44,12 @@@
+  
+  #include <asm/ioctls.h>
+  
+ -/* configurable via /proc/sys/fs/inotify/ */
+ +/* these are configurable via /proc/sys/fs/inotify/ */
+ +static int inotify_max_user_instances __read_mostly;
+  static int inotify_max_queued_events __read_mostly;
+ +static int inotify_max_user_watches __read_mostly;
+  
+- static struct kmem_cache *inotify_inode_mark_cachep __read_mostly;
++ struct kmem_cache *inotify_inode_mark_cachep __read_mostly;
+  
+  #ifdef CONFIG_SYSCTL
+  
+@@@ -482,19 -480,9 +482,9 @@@ void inotify_ignored_and_remove_idr(str
+  	/* remove this mark from the idr */
+  	inotify_remove_from_idr(group, i_mark);
+  
+ -	dec_inotify_watches(group->inotify_data.ucounts);
+ +	atomic_dec(&group->inotify_data.user->inotify_watches);
+  }
+  
+- /* ding dong the mark is dead */
+- static void inotify_free_mark(struct fsnotify_mark *fsn_mark)
+- {
+- 	struct inotify_inode_mark *i_mark;
+- 
+- 	i_mark = container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
+- 
+- 	kmem_cache_free(inotify_inode_mark_cachep, i_mark);
+- }
+- 
+  static int inotify_update_existing_watch(struct fsnotify_group *group,
+  					 struct inode *inode,
+  					 u32 arg)
+@@@ -562,7 -548,7 +552,11 @@@ static int inotify_new_watch(struct fsn
+  	if (unlikely(!tmp_i_mark))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(&tmp_i_mark->fsn_mark, inotify_free_mark);
+++=======
++ 	fsnotify_init_mark(&tmp_i_mark->fsn_mark, group);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	tmp_i_mark->fsn_mark.mask = mask;
+  	tmp_i_mark->wd = -1;
+  
+diff --cc fs/notify/mark.c
+index 4fae28e73aa3,55955ded338d..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -118,8 -136,198 +118,203 @@@ u32 fsnotify_recalc_mask(struct hlist_h
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Remove mark from inode / vfsmount list, group list, drop inode reference
+ + * if we got one.
+++=======
++  * Calculate mask of events for a list of marks. The caller must make sure
++  * connector and connector->inode cannot disappear under us.  Callers achieve
++  * this by holding a mark->lock or mark->group->mark_mutex for a mark on this
++  * list.
++  */
++ void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
++ {
++ 	if (!conn)
++ 		return;
++ 
++ 	spin_lock(&conn->lock);
++ 	__fsnotify_recalc_mask(conn);
++ 	spin_unlock(&conn->lock);
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		__fsnotify_update_child_dentry_flags(conn->inode);
++ }
++ 
++ /* Free all connectors queued for freeing once SRCU period ends */
++ static void fsnotify_connector_destroy_workfn(struct work_struct *work)
++ {
++ 	struct fsnotify_mark_connector *conn, *free;
++ 
++ 	spin_lock(&destroy_lock);
++ 	conn = connector_destroy_list;
++ 	connector_destroy_list = NULL;
++ 	spin_unlock(&destroy_lock);
++ 
++ 	synchronize_srcu(&fsnotify_mark_srcu);
++ 	while (conn) {
++ 		free = conn;
++ 		conn = conn->destroy_next;
++ 		kmem_cache_free(fsnotify_mark_connector_cachep, free);
++ 	}
++ }
++ 
++ static struct inode *fsnotify_detach_connector_from_object(
++ 					struct fsnotify_mark_connector *conn)
++ {
++ 	struct inode *inode = NULL;
++ 
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE) {
++ 		inode = conn->inode;
++ 		rcu_assign_pointer(inode->i_fsnotify_marks, NULL);
++ 		inode->i_fsnotify_mask = 0;
++ 		conn->inode = NULL;
++ 		conn->flags &= ~FSNOTIFY_OBJ_TYPE_INODE;
++ 	} else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
++ 		rcu_assign_pointer(real_mount(conn->mnt)->mnt_fsnotify_marks,
++ 				   NULL);
++ 		real_mount(conn->mnt)->mnt_fsnotify_mask = 0;
++ 		conn->mnt = NULL;
++ 		conn->flags &= ~FSNOTIFY_OBJ_TYPE_VFSMOUNT;
++ 	}
++ 
++ 	return inode;
++ }
++ 
++ static void fsnotify_final_mark_destroy(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_group *group = mark->group;
++ 
++ 	if (WARN_ON_ONCE(!group))
++ 		return;
++ 	group->ops->free_mark(mark);
++ 	fsnotify_put_group(group);
++ }
++ 
++ void fsnotify_put_mark(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_mark_connector *conn;
++ 	struct inode *inode = NULL;
++ 	bool free_conn = false;
++ 
++ 	/* Catch marks that were actually never attached to object */
++ 	if (!mark->connector) {
++ 		if (atomic_dec_and_test(&mark->refcnt))
++ 			fsnotify_final_mark_destroy(mark);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We have to be careful so that traversals of obj_list under lock can
++ 	 * safely grab mark reference.
++ 	 */
++ 	if (!atomic_dec_and_lock(&mark->refcnt, &mark->connector->lock))
++ 		return;
++ 
++ 	conn = mark->connector;
++ 	hlist_del_init_rcu(&mark->obj_list);
++ 	if (hlist_empty(&conn->list)) {
++ 		inode = fsnotify_detach_connector_from_object(conn);
++ 		free_conn = true;
++ 	} else {
++ 		__fsnotify_recalc_mask(conn);
++ 	}
++ 	mark->connector = NULL;
++ 	spin_unlock(&conn->lock);
++ 
++ 	iput(inode);
++ 
++ 	if (free_conn) {
++ 		spin_lock(&destroy_lock);
++ 		conn->destroy_next = connector_destroy_list;
++ 		connector_destroy_list = conn;
++ 		spin_unlock(&destroy_lock);
++ 		queue_work(system_unbound_wq, &connector_reaper_work);
++ 	}
++ 	/*
++ 	 * Note that we didn't update flags telling whether inode cares about
++ 	 * what's happening with children. We update these flags from
++ 	 * __fsnotify_parent() lazily when next event happens on one of our
++ 	 * children.
++ 	 */
++ 	spin_lock(&destroy_lock);
++ 	list_add(&mark->g_list, &destroy_list);
++ 	spin_unlock(&destroy_lock);
++ 	queue_delayed_work(system_unbound_wq, &reaper_work,
++ 			   FSNOTIFY_REAPER_DELAY);
++ }
++ 
++ bool fsnotify_prepare_user_wait(struct fsnotify_iter_info *iter_info)
++ {
++ 	struct fsnotify_group *group;
++ 
++ 	if (WARN_ON_ONCE(!iter_info->inode_mark && !iter_info->vfsmount_mark))
++ 		return false;
++ 
++ 	if (iter_info->inode_mark)
++ 		group = iter_info->inode_mark->group;
++ 	else
++ 		group = iter_info->vfsmount_mark->group;
++ 
++ 	/*
++ 	 * Since acquisition of mark reference is an atomic op as well, we can
++ 	 * be sure this inc is seen before any effect of refcount increment.
++ 	 */
++ 	atomic_inc(&group->user_waits);
++ 
++ 	if (iter_info->inode_mark) {
++ 		/* This can fail if mark is being removed */
++ 		if (!fsnotify_get_mark_safe(iter_info->inode_mark))
++ 			goto out_wait;
++ 	}
++ 	if (iter_info->vfsmount_mark) {
++ 		if (!fsnotify_get_mark_safe(iter_info->vfsmount_mark))
++ 			goto out_inode;
++ 	}
++ 
++ 	/*
++ 	 * Now that both marks are pinned by refcount in the inode / vfsmount
++ 	 * lists, we can drop SRCU lock, and safely resume the list iteration
++ 	 * once userspace returns.
++ 	 */
++ 	srcu_read_unlock(&fsnotify_mark_srcu, iter_info->srcu_idx);
++ 
++ 	return true;
++ out_inode:
++ 	if (iter_info->inode_mark)
++ 		fsnotify_put_mark(iter_info->inode_mark);
++ out_wait:
++ 	if (atomic_dec_and_test(&group->user_waits) && group->shutdown)
++ 		wake_up(&group->notification_waitq);
++ 	return false;
++ }
++ 
++ void fsnotify_finish_user_wait(struct fsnotify_iter_info *iter_info)
++ {
++ 	struct fsnotify_group *group = NULL;
++ 
++ 	iter_info->srcu_idx = srcu_read_lock(&fsnotify_mark_srcu);
++ 	if (iter_info->inode_mark) {
++ 		group = iter_info->inode_mark->group;
++ 		fsnotify_put_mark(iter_info->inode_mark);
++ 	}
++ 	if (iter_info->vfsmount_mark) {
++ 		group = iter_info->vfsmount_mark->group;
++ 		fsnotify_put_mark(iter_info->vfsmount_mark);
++ 	}
++ 	/*
++ 	 * We abuse notification_waitq on group shutdown for waiting for all
++ 	 * marks pinned when waiting for userspace.
++ 	 */
++ 	if (atomic_dec_and_test(&group->user_waits) && group->shutdown)
++ 		wake_up(&group->notification_waitq);
++ }
++ 
++ /*
++  * Mark mark as detached, remove it from group list. Mark still stays in object
++  * list until its last reference is dropped. Note that we rely on mark being
++  * removed from group list before corresponding reference to it is dropped. In
++  * particular we rely on mark->connector being valid while we hold
++  * group->mark_mutex if we found the mark through g_list.
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+   *
+   * Must be called with group->mark_mutex held. The caller must either hold
+   * reference to the mark or be protected by fsnotify_mark_srcu.
+@@@ -486,12 -735,13 +681,21 @@@ void fsnotify_detach_group_marks(struc
+   * Nothing fancy, just initialize lists and locks and counters.
+   */
+  void fsnotify_init_mark(struct fsnotify_mark *mark,
+++<<<<<<< HEAD
+ +			void (*free_mark)(struct fsnotify_mark *mark))
+++=======
++ 			struct fsnotify_group *group)
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  {
+  	memset(mark, 0, sizeof(*mark));
+  	spin_lock_init(&mark->lock);
+  	atomic_set(&mark->refcnt, 1);
+++<<<<<<< HEAD
+ +	mark->free_mark = free_mark;
+++=======
++ 	fsnotify_get_group(group);
++ 	mark->group = group;
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  }
+  
+  /*
+diff --cc include/linux/fsnotify_backend.h
+index 0256909191e5,c6c69318752b..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -223,22 -253,16 +225,21 @@@ struct fsnotify_mark 
+  	struct list_head g_list;
+  	/* Protects inode / mnt pointers, flags, masks */
+  	spinlock_t lock;
+ -	/* List of marks for inode / vfsmount [connector->lock, mark ref] */
+ +	/* List of marks for inode / vfsmount [obj_lock] */
+  	struct hlist_node obj_list;
+ -	/* Head of list of marks for an object [mark ref] */
+ -	struct fsnotify_mark_connector *connector;
+ +	union {	/* Object pointer [mark->lock, group->mark_mutex] */
+ +		struct inode *inode;	/* inode this mark is associated with */
+ +		struct vfsmount *mnt;	/* vfsmount this mark is associated with */
+ +	};
+  	/* Events types to ignore [mark->lock, group->mark_mutex] */
+  	__u32 ignored_mask;
+ -#define FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY	0x01
+ -#define FSNOTIFY_MARK_FLAG_ALIVE		0x02
+ -#define FSNOTIFY_MARK_FLAG_ATTACHED		0x04
+ +#define FSNOTIFY_MARK_FLAG_INODE		0x01
+ +#define FSNOTIFY_MARK_FLAG_VFSMOUNT		0x02
+ +#define FSNOTIFY_MARK_FLAG_OBJECT_PINNED	0x04
+ +#define FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY	0x08
+ +#define FSNOTIFY_MARK_FLAG_ALIVE		0x10
+ +#define FSNOTIFY_MARK_FLAG_ATTACHED		0x20
+  	unsigned int flags;		/* flags [mark->lock] */
+- 	void (*free_mark)(struct fsnotify_mark *mark); /* called on final put+free */
+  };
+  
+  #ifdef CONFIG_FSNOTIFY
+@@@ -331,23 -339,18 +332,38 @@@ extern struct fsnotify_event *fsnotify_
+  
+  /* functions used to manipulate the marks attached to inodes */
+  
+++<<<<<<< HEAD
+ +/* run all marks associated with a vfsmount and update mnt->mnt_fsnotify_mask */
+ +extern void fsnotify_recalc_vfsmount_mask(struct vfsmount *mnt);
+ +/* run all marks associated with an inode and update inode->i_fsnotify_mask */
+ +extern void fsnotify_recalc_inode_mask(struct inode *inode);
+ +extern void fsnotify_init_mark(struct fsnotify_mark *mark, void (*free_mark)(struct fsnotify_mark *mark));
+ +/* find (and take a reference) to a mark associated with group and inode */
+ +extern struct fsnotify_mark *fsnotify_find_inode_mark(struct fsnotify_group *group, struct inode *inode);
+ +/* find (and take a reference) to a mark associated with group and vfsmount */
+ +extern struct fsnotify_mark *fsnotify_find_vfsmount_mark(struct fsnotify_group *group, struct vfsmount *mnt);
+ +/* set the ignored_mask of a mark */
+ +extern void fsnotify_set_mark_ignored_mask_locked(struct fsnotify_mark *mark, __u32 mask);
+ +/* set the mask of a mark (might pin the object into memory */
+ +extern void fsnotify_set_mark_mask_locked(struct fsnotify_mark *mark, __u32 mask);
+ +/* attach the mark to both the group and the inode */
+ +extern int fsnotify_add_mark(struct fsnotify_mark *mark, struct fsnotify_group *group,
+ +			     struct inode *inode, struct vfsmount *mnt, int allow_dups);
+ +extern int fsnotify_add_mark_locked(struct fsnotify_mark *mark, struct fsnotify_group *group,
+++=======
++ /* Calculate mask of events for a list of marks */
++ extern void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn);
++ extern void fsnotify_init_mark(struct fsnotify_mark *mark,
++ 			       struct fsnotify_group *group);
++ /* Find mark belonging to given group in the list of marks */
++ extern struct fsnotify_mark *fsnotify_find_mark(
++ 				struct fsnotify_mark_connector __rcu **connp,
++ 				struct fsnotify_group *group);
++ /* attach the mark to the inode or vfsmount */
++ extern int fsnotify_add_mark(struct fsnotify_mark *mark, struct inode *inode,
++ 			     struct vfsmount *mnt, int allow_dups);
++ extern int fsnotify_add_mark_locked(struct fsnotify_mark *mark,
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  				    struct inode *inode, struct vfsmount *mnt, int allow_dups);
+  /* given a group and a mark, flag mark to be freed when all references are dropped */
+  extern void fsnotify_destroy_mark(struct fsnotify_mark *mark,
+diff --cc kernel/audit_fsnotify.c
+index a0a04ea5fb32,4aad0a467fed..000000000000
+--- a/kernel/audit_fsnotify.c
++++ b/kernel/audit_fsnotify.c
+@@@ -103,7 -103,7 +103,11 @@@ struct audit_fsnotify_mark *audit_alloc
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(&audit_mark->mark, audit_fsnotify_free_mark);
+++=======
++ 	fsnotify_init_mark(&audit_mark->mark, audit_fsnotify_group);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	audit_mark->mark.mask = AUDIT_FS_EVENTS;
+  	audit_mark->path = pathname;
+  	audit_update_mark(audit_mark, dentry->d_inode);
+diff --cc kernel/audit_tree.c
+index 4dfdb945bae9,a14cff67a148..000000000000
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@@ -153,7 -154,7 +153,11 @@@ static struct audit_chunk *alloc_chunk(
+  		INIT_LIST_HEAD(&chunk->owners[i].list);
+  		chunk->owners[i].index = i;
+  	}
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(&chunk->mark, audit_tree_destroy_watch);
+++=======
++ 	fsnotify_init_mark(&chunk->mark, audit_tree_group);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	chunk->mark.mask = FS_IN_IGNORED;
+  	return chunk;
+  }
+diff --cc kernel/audit_watch.c
+index 30ee1f1108b2,13d30a8dfc56..000000000000
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@@ -157,9 -157,9 +157,13 @@@ static struct audit_parent *audit_init_
+  
+  	INIT_LIST_HEAD(&parent->watches);
+  
+++<<<<<<< HEAD
+ +	fsnotify_init_mark(&parent->mark, audit_watch_free_mark);
+++=======
++ 	fsnotify_init_mark(&parent->mark, audit_watch_group);
+++>>>>>>> 054c636e5c80 (fsnotify: Move ->free_mark callback to fsnotify_ops)
+  	parent->mark.mask = AUDIT_FS_WATCH;
+ -	ret = fsnotify_add_mark(&parent->mark, inode, NULL, 0);
+ +	ret = fsnotify_add_mark(&parent->mark, audit_watch_group, inode, NULL, 0);
+  	if (ret < 0) {
+  		audit_free_parent(parent);
+  		return ERR_PTR(ret);
+* Unmerged path fs/notify/dnotify/dnotify.c
+diff --git a/fs/notify/fanotify/fanotify.c b/fs/notify/fanotify/fanotify.c
+index 39ab11fe4f37..1858d53add94 100644
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@ -266,8 +266,14 @@ static void fanotify_free_event(struct fsnotify_event *fsn_event)
+ 	kmem_cache_free(fanotify_event_cachep, event);
+ }
+ 
++static void fanotify_free_mark(struct fsnotify_mark *fsn_mark)
++{
++	kmem_cache_free(fanotify_mark_cache, fsn_mark);
++}
++
+ const struct fsnotify_ops fanotify_fsnotify_ops = {
+ 	.handle_event = fanotify_handle_event,
+ 	.free_group_priv = fanotify_free_group_priv,
+ 	.free_event = fanotify_free_event,
++	.free_mark = fanotify_free_mark,
+ };
+diff --git a/fs/notify/fanotify/fanotify.h b/fs/notify/fanotify/fanotify.h
+index 4500a74f8d38..4eb6f5efa282 100644
+--- a/fs/notify/fanotify/fanotify.h
++++ b/fs/notify/fanotify/fanotify.h
+@@ -2,6 +2,7 @@
+ #include <linux/path.h>
+ #include <linux/slab.h>
+ 
++extern struct kmem_cache *fanotify_mark_cache;
+ extern struct kmem_cache *fanotify_event_cachep;
+ extern struct kmem_cache *fanotify_perm_event_cachep;
+ 
+* Unmerged path fs/notify/fanotify/fanotify_user.c
+* Unmerged path fs/notify/inotify/inotify.h
+diff --git a/fs/notify/inotify/inotify_fsnotify.c b/fs/notify/inotify/inotify_fsnotify.c
+index 8421f44b3cb3..3c6431cd61e8 100644
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@ -176,9 +176,20 @@ static void inotify_free_event(struct fsnotify_event *fsn_event)
+ 	kfree(INOTIFY_E(fsn_event));
+ }
+ 
++/* ding dong the mark is dead */
++static void inotify_free_mark(struct fsnotify_mark *fsn_mark)
++{
++	struct inotify_inode_mark *i_mark;
++
++	i_mark = container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
++
++	kmem_cache_free(inotify_inode_mark_cachep, i_mark);
++}
++
+ const struct fsnotify_ops inotify_fsnotify_ops = {
+ 	.handle_event = inotify_handle_event,
+ 	.free_group_priv = inotify_free_group_priv,
+ 	.free_event = inotify_free_event,
+ 	.freeing_mark = inotify_freeing_mark,
++	.free_mark = inotify_free_mark,
+ };
+* Unmerged path fs/notify/inotify/inotify_user.c
+* Unmerged path fs/notify/mark.c
+* Unmerged path include/linux/fsnotify_backend.h
+* Unmerged path kernel/audit_fsnotify.c
+* Unmerged path kernel/audit_tree.c
+* Unmerged path kernel/audit_watch.c
