@@ -1,0 +1,413 @@
+bpf/verifier: rework value tracking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit f1174f77b50c94eecaa658fdc56fa69b421de4b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f1174f77.failed
+
+Unifies adjusted and unadjusted register value types (e.g. FRAME_POINTER is
+ now just a PTR_TO_STACK with zero offset).
+Tracks value alignment by means of tracking known & unknown bits.  This
+ also replaces the 'reg->imm' (leading zero bits) calculations for (what
+ were) UNKNOWN_VALUEs.
+If pointer leaks are allowed, and adjust_ptr_min_max_vals returns -EACCES,
+ treat the pointer as an unknown scalar and try again, because we might be
+ able to conclude something about the result (e.g. pointer & 0x40 is either
+ 0 or 0x40).
+Verifier hooks in the netronome/nfp driver were changed to match the new
+ data structures.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f1174f77b50c94eecaa658fdc56fa69b421de4b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/Makefile
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,39229c455cba..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -84,8 -96,64 +84,60 @@@ struct bpf_map *bpf_map_get(struct fd f
+  struct bpf_func_proto {
+  	u64 (*func)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+  	bool gpl_only;
+ -	bool pkt_access;
+ -	enum bpf_return_type ret_type;
+ -	enum bpf_arg_type arg1_type;
+ -	enum bpf_arg_type arg2_type;
+ -	enum bpf_arg_type arg3_type;
+ -	enum bpf_arg_type arg4_type;
+ -	enum bpf_arg_type arg5_type;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* bpf_context is intentionally undefined structure. Pointer to bpf_context is
++  * the first argument to eBPF programs.
++  * For socket filters: 'struct bpf_context *' == 'struct sk_buff *'
++  */
++ struct bpf_context;
++ 
++ enum bpf_access_type {
++ 	BPF_READ = 1,
++ 	BPF_WRITE = 2
++ };
++ 
++ /* types of values stored in eBPF registers */
++ /* Pointer types represent:
++  * pointer
++  * pointer + imm
++  * pointer + (u16) var
++  * pointer + (u16) var + imm
++  * if (range > 0) then [ptr, ptr + range - off) is safe to access
++  * if (id > 0) means that some 'var' was added
++  * if (off > 0) means that 'imm' was added
++  */
++ enum bpf_reg_type {
++ 	NOT_INIT = 0,		 /* nothing was written into register */
++ 	SCALAR_VALUE,		 /* reg doesn't contain a valid pointer */
++ 	PTR_TO_CTX,		 /* reg points to bpf_context */
++ 	CONST_PTR_TO_MAP,	 /* reg points to struct bpf_map */
++ 	PTR_TO_MAP_VALUE,	 /* reg points to map element value */
++ 	PTR_TO_MAP_VALUE_OR_NULL,/* points to map elem value or NULL */
++ 	PTR_TO_STACK,		 /* reg == frame_pointer + offset */
++ 	PTR_TO_PACKET,		 /* reg points to skb->data */
++ 	PTR_TO_PACKET_END,	 /* skb->data + headlen */
++ };
++ 
++ struct bpf_prog;
++ 
++ /* The information passed from prog-specific *_is_valid_access
++  * back to the verifier.
++  */
++ struct bpf_insn_access_aux {
++ 	enum bpf_reg_type reg_type;
++ 	int ctx_field_size;
++ };
++ 
++ static inline void
++ bpf_ctx_record_field_size(struct bpf_insn_access_aux *aux, u32 size)
++ {
++ 	aux->ctx_field_size = size;
++ }
++ 
+++>>>>>>> f1174f77b50c (bpf/verifier: rework value tracking)
+  struct bpf_verifier_ops {
+  	/* return eBPF function prototype for verification */
+  	const struct bpf_func_proto *(*get_func_proto)(enum bpf_func_id func_id);
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/Makefile
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 0f4ae869a0f1..36871f20de9e 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -93,28 +93,32 @@ nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
+ 		   const struct bpf_verifier_env *env)
+ {
+ 	const struct bpf_reg_state *reg0 = &env->cur_state.regs[0];
++	u64 imm;
+ 
+ 	if (nfp_prog->act == NN_ACT_XDP)
+ 		return 0;
+ 
+-	if (reg0->type != CONST_IMM) {
+-		pr_info("unsupported exit state: %d, imm: %llx\n",
+-			reg0->type, reg0->imm);
++	if (!(reg0->type == SCALAR_VALUE && tnum_is_const(reg0->var_off))) {
++		char tn_buf[48];
++
++		tnum_strn(tn_buf, sizeof(tn_buf), reg0->var_off);
++		pr_info("unsupported exit state: %d, var_off: %s\n",
++			reg0->type, tn_buf);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (nfp_prog->act != NN_ACT_DIRECT &&
+-	    reg0->imm != 0 && (reg0->imm & ~0U) != ~0U) {
++	imm = reg0->var_off.value;
++	if (nfp_prog->act != NN_ACT_DIRECT && imm != 0 && (imm & ~0U) != ~0U) {
+ 		pr_info("unsupported exit state: %d, imm: %llx\n",
+-			reg0->type, reg0->imm);
++			reg0->type, imm);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (nfp_prog->act == NN_ACT_DIRECT && reg0->imm <= TC_ACT_REDIRECT &&
+-	    reg0->imm != TC_ACT_SHOT && reg0->imm != TC_ACT_STOLEN &&
+-	    reg0->imm != TC_ACT_QUEUED) {
++	if (nfp_prog->act == NN_ACT_DIRECT && imm <= TC_ACT_REDIRECT &&
++	    imm != TC_ACT_SHOT && imm != TC_ACT_STOLEN &&
++	    imm != TC_ACT_QUEUED) {
+ 		pr_info("unsupported exit state: %d, imm: %llx\n",
+-			reg0->type, reg0->imm);
++			reg0->type, imm);
+ 		return -EINVAL;
+ 	}
+ 
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/bpf_verifier.h
+diff --git a/include/linux/tnum.h b/include/linux/tnum.h
+new file mode 100644
+index 000000000000..a0b07bf1842b
+--- /dev/null
++++ b/include/linux/tnum.h
+@@ -0,0 +1,79 @@
++/* tnum: tracked (or tristate) numbers
++ *
++ * A tnum tracks knowledge about the bits of a value.  Each bit can be either
++ * known (0 or 1), or unknown (x).  Arithmetic operations on tnums will
++ * propagate the unknown bits such that the tnum result represents all the
++ * possible results for possible values of the operands.
++ */
++#include <linux/types.h>
++
++struct tnum {
++	u64 value;
++	u64 mask;
++};
++
++/* Constructors */
++/* Represent a known constant as a tnum. */
++struct tnum tnum_const(u64 value);
++/* A completely unknown value */
++extern const struct tnum tnum_unknown;
++
++/* Arithmetic and logical ops */
++/* Shift a tnum left (by a fixed shift) */
++struct tnum tnum_lshift(struct tnum a, u8 shift);
++/* Shift a tnum right (by a fixed shift) */
++struct tnum tnum_rshift(struct tnum a, u8 shift);
++/* Add two tnums, return @a + @b */
++struct tnum tnum_add(struct tnum a, struct tnum b);
++/* Subtract two tnums, return @a - @b */
++struct tnum tnum_sub(struct tnum a, struct tnum b);
++/* Bitwise-AND, return @a & @b */
++struct tnum tnum_and(struct tnum a, struct tnum b);
++/* Bitwise-OR, return @a | @b */
++struct tnum tnum_or(struct tnum a, struct tnum b);
++/* Bitwise-XOR, return @a ^ @b */
++struct tnum tnum_xor(struct tnum a, struct tnum b);
++/* Multiply two tnums, return @a * @b */
++struct tnum tnum_mul(struct tnum a, struct tnum b);
++
++/* Return a tnum representing numbers satisfying both @a and @b */
++struct tnum tnum_intersect(struct tnum a, struct tnum b);
++
++/* Return @a with all but the lowest @size bytes cleared */
++struct tnum tnum_cast(struct tnum a, u8 size);
++
++/* Returns true if @a is a known constant */
++static inline bool tnum_is_const(struct tnum a)
++{
++	return !a.mask;
++}
++
++/* Returns true if @a == tnum_const(@b) */
++static inline bool tnum_equals_const(struct tnum a, u64 b)
++{
++	return tnum_is_const(a) && a.value == b;
++}
++
++/* Returns true if @a is completely unknown */
++static inline bool tnum_is_unknown(struct tnum a)
++{
++	return !~a.mask;
++}
++
++/* Returns true if @a is known to be a multiple of @size.
++ * @size must be a power of two.
++ */
++bool tnum_is_aligned(struct tnum a, u64 size);
++
++/* Returns true if @b represents a subset of @a. */
++bool tnum_in(struct tnum a, struct tnum b);
++
++/* Formatting functions.  These have snprintf-like semantics: they will write
++ * up to @size bytes (including the terminating NUL byte), and return the number
++ * of bytes (excluding the terminating NUL) which would have been written had
++ * sufficient space been available.  (Thus tnum_sbin always returns 64.)
++ */
++/* Format a tnum as a pair of hex numbers (value; mask) */
++int tnum_strn(char *str, size_t size, struct tnum a);
++/* Format a tnum as tristate binary expansion */
++int tnum_sbin(char *str, size_t size, struct tnum a);
+* Unmerged path kernel/bpf/Makefile
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+new file mode 100644
+index 000000000000..92eeeb1974a2
+--- /dev/null
++++ b/kernel/bpf/tnum.c
+@@ -0,0 +1,164 @@
++/* tnum: tracked (or tristate) numbers
++ *
++ * A tnum tracks knowledge about the bits of a value.  Each bit can be either
++ * known (0 or 1), or unknown (x).  Arithmetic operations on tnums will
++ * propagate the unknown bits such that the tnum result represents all the
++ * possible results for possible values of the operands.
++ */
++#include <linux/kernel.h>
++#include <linux/tnum.h>
++
++#define TNUM(_v, _m)	(struct tnum){.value = _v, .mask = _m}
++/* A completely unknown value */
++const struct tnum tnum_unknown = { .value = 0, .mask = -1 };
++
++struct tnum tnum_const(u64 value)
++{
++	return TNUM(value, 0);
++}
++
++struct tnum tnum_lshift(struct tnum a, u8 shift)
++{
++	return TNUM(a.value << shift, a.mask << shift);
++}
++
++struct tnum tnum_rshift(struct tnum a, u8 shift)
++{
++	return TNUM(a.value >> shift, a.mask >> shift);
++}
++
++struct tnum tnum_add(struct tnum a, struct tnum b)
++{
++	u64 sm, sv, sigma, chi, mu;
++
++	sm = a.mask + b.mask;
++	sv = a.value + b.value;
++	sigma = sm + sv;
++	chi = sigma ^ sv;
++	mu = chi | a.mask | b.mask;
++	return TNUM(sv & ~mu, mu);
++}
++
++struct tnum tnum_sub(struct tnum a, struct tnum b)
++{
++	u64 dv, alpha, beta, chi, mu;
++
++	dv = a.value - b.value;
++	alpha = dv + a.mask;
++	beta = dv - b.mask;
++	chi = alpha ^ beta;
++	mu = chi | a.mask | b.mask;
++	return TNUM(dv & ~mu, mu);
++}
++
++struct tnum tnum_and(struct tnum a, struct tnum b)
++{
++	u64 alpha, beta, v;
++
++	alpha = a.value | a.mask;
++	beta = b.value | b.mask;
++	v = a.value & b.value;
++	return TNUM(v, alpha & beta & ~v);
++}
++
++struct tnum tnum_or(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value | b.value;
++	mu = a.mask | b.mask;
++	return TNUM(v, mu & ~v);
++}
++
++struct tnum tnum_xor(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value ^ b.value;
++	mu = a.mask | b.mask;
++	return TNUM(v & ~mu, mu);
++}
++
++/* half-multiply add: acc += (unknown * mask * value).
++ * An intermediate step in the multiply algorithm.
++ */
++static struct tnum hma(struct tnum acc, u64 value, u64 mask)
++{
++	while (mask) {
++		if (mask & 1)
++			acc = tnum_add(acc, TNUM(0, value));
++		mask >>= 1;
++		value <<= 1;
++	}
++	return acc;
++}
++
++struct tnum tnum_mul(struct tnum a, struct tnum b)
++{
++	struct tnum acc;
++	u64 pi;
++
++	pi = a.value * b.value;
++	acc = hma(TNUM(pi, 0), a.mask, b.mask | b.value);
++	return hma(acc, b.mask, a.value);
++}
++
++/* Note that if a and b disagree - i.e. one has a 'known 1' where the other has
++ * a 'known 0' - this will return a 'known 1' for that bit.
++ */
++struct tnum tnum_intersect(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value | b.value;
++	mu = a.mask & b.mask;
++	return TNUM(v & ~mu, mu);
++}
++
++struct tnum tnum_cast(struct tnum a, u8 size)
++{
++	a.value &= (1ULL << (size * 8)) - 1;
++	a.mask &= (1ULL << (size * 8)) - 1;
++	return a;
++}
++
++bool tnum_is_aligned(struct tnum a, u64 size)
++{
++	if (!size)
++		return true;
++	return !((a.value | a.mask) & (size - 1));
++}
++
++bool tnum_in(struct tnum a, struct tnum b)
++{
++	if (b.mask & ~a.mask)
++		return false;
++	b.value &= ~a.mask;
++	return a.value == b.value;
++}
++
++int tnum_strn(char *str, size_t size, struct tnum a)
++{
++	return snprintf(str, size, "(%#llx; %#llx)", a.value, a.mask);
++}
++EXPORT_SYMBOL_GPL(tnum_strn);
++
++int tnum_sbin(char *str, size_t size, struct tnum a)
++{
++	size_t n;
++
++	for (n = 64; n; n--) {
++		if (n < size) {
++			if (a.mask & 1)
++				str[n - 1] = 'x';
++			else if (a.value & 1)
++				str[n - 1] = '1';
++			else
++				str[n - 1] = '0';
++		}
++		a.mask >>= 1;
++		a.value >>= 1;
++	}
++	str[min(size - 1, (size_t)64)] = 0;
++	return 64;
++}
+* Unmerged path kernel/bpf/verifier.c
