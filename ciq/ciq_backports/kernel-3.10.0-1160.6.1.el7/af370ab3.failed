@@ -1,0 +1,170 @@
+netfilter: nf_queue: do not release refcouts until nf_reinject is done
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.6.1.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit af370ab36fcd19f04e3408c402608e7e56e6f188
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.6.1.el7/af370ab3.failed
+
+nf_queue is problematic when another NF_QUEUE invocation happens
+from nf_reinject().
+
+1. nf_queue is invoked, increments state->sk refcount.
+2. skb is queued, waiting for verdict.
+3. sk is closed/released.
+3. verdict comes back, nf_reinject is called.
+4. nf_reinject drops the reference -- refcount can now drop to 0
+
+Instead of get_ref/release_ref pattern, we need to nest the get_ref calls:
+    get_ref
+       get_ref
+       release_ref
+     release_ref
+
+So that when we invoke the next processing stage (another netfilter
+or the okfn()), we hold at least one reference count on the
+devices/socket.
+
+After previous patch, it is now safe to put the entry even after okfn()
+has potentially free'd the skb.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit af370ab36fcd19f04e3408c402608e7e56e6f188)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_queue.c
+diff --cc net/netfilter/nf_queue.c
+index 2e88032cd5ad,aadccdd117f0..000000000000
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@@ -169,26 -225,99 +169,34 @@@ err
+  	return status;
+  }
+  
+ -/* Packets leaving via this function must come back through nf_reinject(). */
+ -int nf_queue(struct sk_buff *skb, struct nf_hook_state *state,
+ -	     unsigned int index, unsigned int verdict)
+ -{
+ -	int ret;
+ -
+ -	ret = __nf_queue(skb, state, index, verdict >> NF_VERDICT_QBITS);
+ -	if (ret < 0) {
+ -		if (ret == -ESRCH &&
+ -		    (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
+ -			return 1;
+ -		kfree_skb(skb);
+ -	}
+ -
+ -	return 0;
+ -}
+ -EXPORT_SYMBOL_GPL(nf_queue);
+ -
+ -static unsigned int nf_iterate(struct sk_buff *skb,
+ -			       struct nf_hook_state *state,
+ -			       const struct nf_hook_entries *hooks,
+ -			       unsigned int *index)
+ -{
+ -	const struct nf_hook_entry *hook;
+ -	unsigned int verdict, i = *index;
+ -
+ -	while (i < hooks->num_hook_entries) {
+ -		hook = &hooks->hooks[i];
+ -repeat:
+ -		verdict = nf_hook_entry_hookfn(hook, skb, state);
+ -		if (verdict != NF_ACCEPT) {
+ -			*index = i;
+ -			if (verdict != NF_REPEAT)
+ -				return verdict;
+ -			goto repeat;
+ -		}
+ -		i++;
+ -	}
+ -
+ -	*index = i;
+ -	return NF_ACCEPT;
+ -}
+ -
+ -static struct nf_hook_entries *nf_hook_entries_head(const struct net *net, u8 pf, u8 hooknum)
+ -{
+ -	switch (pf) {
+ -#ifdef CONFIG_NETFILTER_FAMILY_BRIDGE
+ -	case NFPROTO_BRIDGE:
+ -		return rcu_dereference(net->nf.hooks_bridge[hooknum]);
+ -#endif
+ -	case NFPROTO_IPV4:
+ -		return rcu_dereference(net->nf.hooks_ipv4[hooknum]);
+ -	case NFPROTO_IPV6:
+ -		return rcu_dereference(net->nf.hooks_ipv6[hooknum]);
+ -	default:
+ -		WARN_ON_ONCE(1);
+ -		return NULL;
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+ -/* Caller must hold rcu read-side lock */
+  void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+  {
+ -	const struct nf_hook_entry *hook_entry;
+ -	const struct nf_hook_entries *hooks;
+  	struct sk_buff *skb = entry->skb;
+ -	const struct net *net;
+ -	unsigned int i;
+ +	struct nf_hook_ops *elem = entry->elem;
+ +	const struct nf_afinfo *afinfo;
+  	int err;
+ -	u8 pf;
+  
+ -	net = entry->state.net;
+ -	pf = entry->state.pf;
+ +	rcu_read_lock();
+  
+ -	hooks = nf_hook_entries_head(net, pf, entry->state.hook);
+++<<<<<<< HEAD
+ +	nf_queue_entry_release_refs(entry);
+  
+ +	/* Continue traversal iff userspace said ok... */
+ +	if (verdict == NF_REPEAT) {
+ +		elem = list_entry(elem->list.prev, struct nf_hook_ops, list);
+ +		verdict = NF_ACCEPT;
+++=======
++ 	i = entry->hook_index;
++ 	if (WARN_ON_ONCE(!hooks || i >= hooks->num_hook_entries)) {
++ 		kfree_skb(skb);
++ 		nf_queue_entry_free(entry);
++ 		return;
+++>>>>>>> af370ab36fcd (netfilter: nf_queue: do not release refcouts until nf_reinject is done)
+  	}
+  
+ -	hook_entry = &hooks->hooks[i];
+ -
+ -	/* Continue traversal iff userspace said ok... */
+ -	if (verdict == NF_REPEAT)
+ -		verdict = nf_hook_entry_hookfn(hook_entry, skb, &entry->state);
+ -
+  	if (verdict == NF_ACCEPT) {
+ -		if (nf_reroute(skb, entry) < 0)
+ +		afinfo = nf_get_afinfo(entry->state.pf);
+ +		if (!afinfo || afinfo->reroute(skb, entry) < 0)
+  			verdict = NF_DROP;
+  	}
+  
+@@@ -224,7 -344,7 +232,12 @@@
+  	default:
+  		kfree_skb(skb);
+  	}
+++<<<<<<< HEAD
+ +	rcu_read_unlock();
+ +	kfree(entry);
+++=======
++ 
++ 	nf_queue_entry_free(entry);
+++>>>>>>> af370ab36fcd (netfilter: nf_queue: do not release refcouts until nf_reinject is done)
+  }
+  EXPORT_SYMBOL(nf_reinject);
+* Unmerged path net/netfilter/nf_queue.c
