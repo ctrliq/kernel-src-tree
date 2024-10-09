@@ -1,0 +1,216 @@
+hv_utils: drop .getcrosststamp() support from PTP driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 4f9bac039a64f6306b613a0d90e6b7e75d7ab0c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4f9bac03.failed
+
+Turns out that our implementation of .getcrosststamp() never actually
+worked. Hyper-V is sending time samples every 5 seconds and this is
+too much for get_device_system_crosststamp() as it's interpolation
+algorithm (which nobody is currently using in kernel, btw) accounts
+for a 'slow' device but we're not slow in Hyper-V, our time reference
+is too far away.
+
+.getcrosststamp() is not currently used, get_device_system_crosststamp()
+almost always returns -EINVAL and client falls back to using PTP_SYS_OFFSET
+so this patch doesn't change much. I also tried doing interpolation
+manually (e.g. the same way hv_ptp_gettime() works and it turns out that
+we're getting even lower quality:
+
+PTP_SYS_OFFSET_PRECISE with manual interpolation:
+* PHC0                     0   3    37     4  -3974ns[-5338ns] +/-  977ns
+* PHC0                     0   3    77     7  +2227ns[+3184ns] +/-  576ns
+* PHC0                     0   3   177    10  +3060ns[+5220ns] +/-  548ns
+* PHC0                     0   3   377    12  +3937ns[+4371ns] +/- 1414ns
+* PHC0                     0   3   377     6   +764ns[+1240ns] +/- 1047ns
+* PHC0                     0   3   377     7  -1210ns[-3731ns] +/-  479ns
+* PHC0                     0   3   377     9   +153ns[-1019ns] +/-  406ns
+* PHC0                     0   3   377    12   -872ns[-1793ns] +/-  443ns
+* PHC0                     0   3   377     5   +701ns[+3599ns] +/-  426ns
+* PHC0                     0   3   377     5   -923ns[ -375ns] +/- 1062ns
+
+PTP_SYS_OFFSET:
+* PHC0                     0   3     7     5    +72ns[+8020ns] +/-  251ns
+* PHC0                     0   3    17     5   -885ns[-3661ns] +/-  254ns
+* PHC0                     0   3    37     6   -454ns[-5732ns] +/-  258ns
+* PHC0                     0   3    77    10  +1183ns[+3754ns] +/-  164ns
+* PHC0                     0   3   377     5   +579ns[+1137ns] +/-  110ns
+* PHC0                     0   3   377     7   +501ns[+1064ns] +/-   96ns
+* PHC0                     0   3   377     9  +1641ns[+3342ns] +/-  106ns
+* PHC0                     0   3   377     8    -47ns[  +77ns] +/-  160ns
+* PHC0                     0   3   377     5    +54ns[ +107ns] +/-  102ns
+* PHC0                     0   3   377     8   -354ns[ -617ns] +/-   89ns
+
+This fact wasn't noticed during the initial testing of the PTP device
+somehow but got revealed now. Let's just drop .getcrosststamp()
+implementation for now as it doesn't seem to be suitable for us.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4f9bac039a64f6306b613a0d90e6b7e75d7ab0c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv_util.c
+diff --cc drivers/hv/hv_util.c
+index e7707747f56d,2849143bf6f0..000000000000
+--- a/drivers/hv/hv_util.c
++++ b/drivers/hv/hv_util.c
+@@@ -222,22 -239,58 +222,62 @@@ static void hv_set_host_time(struct wor
+   * to discipline the clock.
+   */
+  static struct adj_time_work  wrk;
+++<<<<<<< HEAD
+ +static inline void adj_guesttime(u64 hosttime, u64 reftime, u8 flags)
+++=======
++ 
++ /*
++  * The last time sample, received from the host. PTP device responds to
++  * requests by using this data and the current partition-wide time reference
++  * count.
++  */
++ static struct {
++ 	u64				host_time;
++ 	u64				ref_time;
++ 	spinlock_t			lock;
++ } host_ts;
++ 
++ static inline void adj_guesttime(u64 hosttime, u64 reftime, u8 adj_flags)
+++>>>>>>> 4f9bac039a64 (hv_utils: drop .getcrosststamp() support from PTP driver)
+  {
+ -	unsigned long flags;
+ -	u64 cur_reftime;
+  
+  	/*
+  	 * This check is safe since we are executing in the
+ -	 * interrupt context and time synch messages are always
+ +	 * interrupt context and time synch messages arre always
+  	 * delivered on the same CPU.
+  	 */
+ -	if (adj_flags & ICTIMESYNCFLAG_SYNC) {
+ -		/* Queue a job to do do_settimeofday64() */
+ -		if (work_pending(&wrk.work))
+ -			return;
+ -
+ -		wrk.host_time = hosttime;
+ -		wrk.ref_time = reftime;
+ -		wrk.flags = adj_flags;
+ +	if (work_pending(&wrk.work))
+ +		return;
+ +
+ +	wrk.host_time = hosttime;
+ +	wrk.ref_time = reftime;
+ +	wrk.flags = flags;
+ +	if ((flags & (ICTIMESYNCFLAG_SYNC | ICTIMESYNCFLAG_SAMPLE)) != 0) {
+  		schedule_work(&wrk.work);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		/*
++ 		 * Save the adjusted time sample from the host and the snapshot
++ 		 * of the current system time for PTP device.
++ 		 */
++ 		spin_lock_irqsave(&host_ts.lock, flags);
++ 
++ 		cur_reftime = hyperv_cs->read(hyperv_cs);
++ 		host_ts.host_time = hosttime;
++ 		host_ts.ref_time = cur_reftime;
++ 
++ 		/*
++ 		 * TimeSync v4 messages contain reference time (guest's Hyper-V
++ 		 * clocksource read when the time sample was generated), we can
++ 		 * improve the precision by adding the delta between now and the
++ 		 * time of generation.
++ 		 */
++ 		if (ts_srv_version > TS_VERSION_3)
++ 			host_ts.host_time += (cur_reftime - reftime);
++ 
++ 		spin_unlock_irqrestore(&host_ts.lock, flags);
+++>>>>>>> 4f9bac039a64 (hv_utils: drop .getcrosststamp() support from PTP driver)
+  	}
+  }
+  
+@@@ -470,9 -502,74 +510,58 @@@ static  struct hv_driver util_drv = 
+  	.remove =  util_remove,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int hv_ptp_enable(struct ptp_clock_info *info,
++ 			 struct ptp_clock_request *request, int on)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int hv_ptp_settime(struct ptp_clock_info *p, const struct timespec64 *ts)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int hv_ptp_adjfreq(struct ptp_clock_info *ptp, s32 delta)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static int hv_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static int hv_ptp_gettime(struct ptp_clock_info *info, struct timespec64 *ts)
++ {
++ 	unsigned long flags;
++ 	u64 newtime, reftime;
++ 
++ 	spin_lock_irqsave(&host_ts.lock, flags);
++ 	reftime = hyperv_cs->read(hyperv_cs);
++ 	newtime = host_ts.host_time + (reftime - host_ts.ref_time);
++ 	*ts = ns_to_timespec64((newtime - WLTIMEDELTA) * 100);
++ 	spin_unlock_irqrestore(&host_ts.lock, flags);
++ 
++ 	return 0;
++ }
++ 
++ static struct ptp_clock_info ptp_hyperv_info = {
++ 	.name		= "hyperv",
++ 	.enable         = hv_ptp_enable,
++ 	.adjtime        = hv_ptp_adjtime,
++ 	.adjfreq        = hv_ptp_adjfreq,
++ 	.gettime64      = hv_ptp_gettime,
++ 	.settime64      = hv_ptp_settime,
++ 	.owner		= THIS_MODULE,
++ };
++ 
++ static struct ptp_clock *hv_ptp_clock;
++ 
+++>>>>>>> 4f9bac039a64 (hv_utils: drop .getcrosststamp() support from PTP driver)
+  static int hv_timesync_init(struct hv_util_service *srv)
+  {
+ -	/* TimeSync requires Hyper-V clocksource. */
+ -	if (!hyperv_cs)
+ -		return -ENODEV;
+ -
+ -	spin_lock_init(&host_ts.lock);
+ -
+  	INIT_WORK(&wrk.work, hv_set_host_time);
+ -
+ -	/*
+ -	 * ptp_clock_register() returns NULL when CONFIG_PTP_1588_CLOCK is
+ -	 * disabled but the driver is still useful without the PTP device
+ -	 * as it still handles the ICTIMESYNCFLAG_SYNC case.
+ -	 */
+ -	hv_ptp_clock = ptp_clock_register(&ptp_hyperv_info, NULL);
+ -	if (IS_ERR_OR_NULL(hv_ptp_clock)) {
+ -		pr_err("cannot register PTP clock: %ld\n",
+ -		       PTR_ERR(hv_ptp_clock));
+ -		hv_ptp_clock = NULL;
+ -	}
+ -
+  	return 0;
+  }
+  
+* Unmerged path drivers/hv/hv_util.c
