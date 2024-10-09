@@ -911,7 +911,7 @@ static int autofs4_root_ioctl_unlocked(struct inode *inode, struct file *filp,
 		return autofs4_expire_multi(inode->i_sb,filp->f_path.mnt,sbi, p);
 
 	default:
-		return -ENOSYS;
+		return -EINVAL;
 	}
 }
 
