@@ -1,0 +1,203 @@
+ipmr: Add reference count to MFC entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yotam Gigi <yotamg@mellanox.com>
+commit 310ebbba3b7396b00bce08a33f1d2de2c74fa257
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/310ebbba.failed
+
+Next commits will introduce MFC notifications through the atomic
+fib_notification chain, thus allowing modules to be aware of MFC entries.
+
+Due to the fact that modules may need to hold a reference to an MFC entry,
+add reference count to MFC entries to prevent them from being freed while
+these modules use them.
+
+The reference counting is done only on resolved MFC entries currently.
+
+	Signed-off-by: Yotam Gigi <yotamg@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 310ebbba3b7396b00bce08a33f1d2de2c74fa257)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mroute.h
+#	net/ipv4/ipmr.c
+diff --cc include/linux/mroute.h
+index 50e6b3419aab,10028f208efb..000000000000
+--- a/include/linux/mroute.h
++++ b/include/linux/mroute.h
+@@@ -66,12 -86,44 +66,42 @@@ enum 
+  	MFC_STATIC = BIT(0),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mfc_cache_cmp_arg {
++ 	__be32 mfc_mcastgrp;
++ 	__be32 mfc_origin;
++ };
++ 
++ /**
++  * struct mfc_cache - multicast routing entries
++  * @mnode: rhashtable list
++  * @mfc_mcastgrp: destination multicast group address
++  * @mfc_origin: source address
++  * @cmparg: used for rhashtable comparisons
++  * @mfc_parent: source interface (iif)
++  * @mfc_flags: entry flags
++  * @expires: unresolved entry expire time
++  * @unresolved: unresolved cached skbs
++  * @last_assert: time of last assert
++  * @minvif: minimum VIF id
++  * @maxvif: maximum VIF id
++  * @bytes: bytes that have passed for this entry
++  * @pkt: packets that have passed for this entry
++  * @wrong_if: number of wrong source interface hits
++  * @lastuse: time of last use of the group (traffic or update)
++  * @ttls: OIF TTL threshold array
++  * @refcount: reference count for this entry
++  * @list: global entry list
++  * @rcu: used for entry destruction
++  */
+++>>>>>>> 310ebbba3b73 (ipmr: Add reference count to MFC entries)
+  struct mfc_cache {
+ -	struct rhlist_head mnode;
+ -	union {
+ -		struct {
+ -			__be32 mfc_mcastgrp;
+ -			__be32 mfc_origin;
+ -		};
+ -		struct mfc_cache_cmp_arg cmparg;
+ -	};
+ -	vifi_t mfc_parent;
+ -	int mfc_flags;
+ +	struct list_head list;
+ +	__be32 mfc_mcastgrp;			/* Group the entry belongs to 	*/
+ +	__be32 mfc_origin;			/* Source of packet 		*/
+ +	vifi_t mfc_parent;			/* Source interface		*/
+ +	int mfc_flags;				/* Flags on line		*/
+  
+  	union {
+  		struct {
+@@@ -86,9 -138,11 +116,14 @@@
+  			unsigned long pkt;
+  			unsigned long wrong_if;
+  			unsigned long lastuse;
+++<<<<<<< HEAD
+ +			unsigned char ttls[MAXVIFS];	/* TTL thresholds		*/
+++=======
++ 			unsigned char ttls[MAXVIFS];
++ 			refcount_t refcount;
+++>>>>>>> 310ebbba3b73 (ipmr: Add reference count to MFC entries)
+  		} res;
+  	} mfc_un;
+ -	struct list_head list;
+  	struct rcu_head	rcu;
+  };
+  
+@@@ -103,5 -149,24 +138,28 @@@
+  struct rtmsg;
+  int ipmr_get_route(struct net *net, struct sk_buff *skb,
+  		   __be32 saddr, __be32 daddr,
+++<<<<<<< HEAD
+ +		   struct rtmsg *rtm, int nowait, u32 portid);
+++=======
++ 		   struct rtmsg *rtm, u32 portid);
++ 
++ #ifdef CONFIG_IP_MROUTE
++ void ipmr_cache_free(struct mfc_cache *mfc_cache);
++ #else
++ static inline void ipmr_cache_free(struct mfc_cache *mfc_cache)
++ {
++ }
++ #endif
++ 
++ static inline void ipmr_cache_put(struct mfc_cache *c)
++ {
++ 	if (refcount_dec_and_test(&c->mfc_un.res.refcount))
++ 		ipmr_cache_free(c);
++ }
++ static inline void ipmr_cache_hold(struct mfc_cache *c)
++ {
++ 	refcount_inc(&c->mfc_un.res.refcount);
++ }
++ 
+++>>>>>>> 310ebbba3b73 (ipmr: Add reference count to MFC entries)
+  #endif
+diff --cc net/ipv4/ipmr.c
+index 2741c7ea1966,86dc5f98c5dd..000000000000
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@@ -1100,22 -1152,21 +1102,36 @@@ ipmr_cache_unresolved(struct mr_table *
+  
+  static int ipmr_mfc_delete(struct mr_table *mrt, struct mfcctl *mfc, int parent)
+  {
+ -	struct mfc_cache *c;
+ +	int line;
+ +	struct mfc_cache *c, *next;
+  
+++<<<<<<< HEAD
+ +	line = MFC_HASH(mfc->mfcc_mcastgrp.s_addr, mfc->mfcc_origin.s_addr);
+++=======
++ 	/* The entries are added/deleted only under RTNL */
++ 	rcu_read_lock();
++ 	c = ipmr_cache_find_parent(mrt, mfc->mfcc_origin.s_addr,
++ 				   mfc->mfcc_mcastgrp.s_addr, parent);
++ 	rcu_read_unlock();
++ 	if (!c)
++ 		return -ENOENT;
++ 	rhltable_remove(&mrt->mfc_hash, &c->mnode, ipmr_rht_params);
++ 	list_del_rcu(&c->list);
++ 	mroute_netlink_event(mrt, c, RTM_DELROUTE);
++ 	ipmr_cache_put(c);
+++>>>>>>> 310ebbba3b73 (ipmr: Add reference count to MFC entries)
+  
+ -	return 0;
+ +	list_for_each_entry_safe(c, next, &mrt->mfc_cache_array[line], list) {
+ +		if (c->mfc_origin == mfc->mfcc_origin.s_addr &&
+ +		    c->mfc_mcastgrp == mfc->mfcc_mcastgrp.s_addr &&
+ +		    (parent == -1 || parent == c->mfc_parent)) {
+ +			list_del_rcu(&c->list);
+ +			mroute_netlink_event(mrt, c, RTM_DELROUTE);
+ +			ipmr_cache_free(c);
+ +			return 0;
+ +		}
+ +	}
+ +	return -ENOENT;
+  }
+  
+  static int ipmr_mfc_add(struct net *net, struct mr_table *mrt,
+@@@ -1214,15 -1260,13 +1230,25 @@@ static void mroute_clean_tables(struct 
+  	unregister_netdevice_many(&list);
+  
+  	/* Wipe the cache */
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < MFC_LINES; i++) {
+ +		list_for_each_entry_safe(c, next, &mrt->mfc_cache_array[i], list) {
+ +			if (!all && (c->mfc_flags & MFC_STATIC))
+ +				continue;
+ +			list_del_rcu(&c->list);
+ +			mroute_netlink_event(mrt, c, RTM_DELROUTE);
+ +			ipmr_cache_free(c);
+ +		}
+++=======
++ 	list_for_each_entry_safe(c, tmp, &mrt->mfc_cache_list, list) {
++ 		if (!all && (c->mfc_flags & MFC_STATIC))
++ 			continue;
++ 		rhltable_remove(&mrt->mfc_hash, &c->mnode, ipmr_rht_params);
++ 		list_del_rcu(&c->list);
++ 		mroute_netlink_event(mrt, c, RTM_DELROUTE);
++ 		ipmr_cache_put(c);
+++>>>>>>> 310ebbba3b73 (ipmr: Add reference count to MFC entries)
+  	}
+  
+  	if (atomic_read(&mrt->cache_resolve_queue_len) != 0) {
+* Unmerged path include/linux/mroute.h
+* Unmerged path net/ipv4/ipmr.c
