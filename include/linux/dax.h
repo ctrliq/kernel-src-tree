@@ -3,6 +3,7 @@
 
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/radix-tree.h>
 #include <asm/pgtable.h>
 
 ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
