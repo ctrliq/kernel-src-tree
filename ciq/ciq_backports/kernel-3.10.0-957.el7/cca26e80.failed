@@ -1,0 +1,242 @@
+sched: Teach scheduler to understand TASK_ON_RQ_MIGRATING state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kirill Tkhai <ktkhai@parallels.com>
+commit cca26e8009d1939a6a5bf0200d276fa26f03e536
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cca26e80.failed
+
+This is a new p->on_rq state which will be used to indicate that a task
+is in a process of migrating between two RQs. It allows to get
+rid of double_rq_lock(), which we used to use to change a rq of
+a queued task before.
+
+Let's consider an example. To move a task between src_rq and
+dst_rq we will do the following:
+
+	raw_spin_lock(&src_rq->lock);
+	/* p is a task which is queued on src_rq */
+	p = ...;
+
+	dequeue_task(src_rq, p, 0);
+	p->on_rq = TASK_ON_RQ_MIGRATING;
+	set_task_cpu(p, dst_cpu);
+	raw_spin_unlock(&src_rq->lock);
+
+    	/*
+    	 * Both RQs are unlocked here.
+    	 * Task p is dequeued from src_rq
+    	 * but its on_rq value is not zero.
+    	 */
+
+	raw_spin_lock(&dst_rq->lock);
+	p->on_rq = TASK_ON_RQ_QUEUED;
+	enqueue_task(dst_rq, p, 0);
+	raw_spin_unlock(&dst_rq->lock);
+
+While p->on_rq is TASK_ON_RQ_MIGRATING, task is considered as
+"migrating", and other parallel scheduler actions with it are
+not available to parallel callers. The parallel caller is
+spining till migration is completed.
+
+The unavailable actions are changing of cpu affinity, changing
+of priority etc, in other words all the functionality which used
+to require task_rq(p)->lock before (and related to the task).
+
+To implement TASK_ON_RQ_MIGRATING support we primarily are using
+the following fact. Most of scheduler users (from which we are
+protecting a migrating task) use task_rq_lock() and
+__task_rq_lock() to get the lock of task_rq(p). These primitives
+know that task's cpu may change, and they are spining while the
+lock of the right RQ is not held. We add one more condition into
+them, so they will be also spinning until the migration is
+finished.
+
+	Signed-off-by: Kirill Tkhai <ktkhai@parallels.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Paul Turner <pjt@google.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: Kirill Tkhai <tkhai@yandex.ru>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Nicolas Pitre <nicolas.pitre@linaro.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/1408528062.23412.88.camel@tkhai
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit cca26e8009d1939a6a5bf0200d276fa26f03e536)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,71b836034912..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -309,6 -321,66 +309,69 @@@ __read_mostly int scheduler_running
+  int sysctl_sched_rt_runtime = 950000;
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * __task_rq_lock - lock the rq @p resides on.
++  */
++ static inline struct rq *__task_rq_lock(struct task_struct *p)
++ 	__acquires(rq->lock)
++ {
++ 	struct rq *rq;
++ 
++ 	lockdep_assert_held(&p->pi_lock);
++ 
++ 	for (;;) {
++ 		rq = task_rq(p);
++ 		raw_spin_lock(&rq->lock);
++ 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p)))
++ 			return rq;
++ 		raw_spin_unlock(&rq->lock);
++ 
++ 		while (unlikely(task_on_rq_migrating(p)))
++ 			cpu_relax();
++ 	}
++ }
++ 
++ /*
++  * task_rq_lock - lock p->pi_lock and lock the rq @p resides on.
++  */
++ static struct rq *task_rq_lock(struct task_struct *p, unsigned long *flags)
++ 	__acquires(p->pi_lock)
++ 	__acquires(rq->lock)
++ {
++ 	struct rq *rq;
++ 
++ 	for (;;) {
++ 		raw_spin_lock_irqsave(&p->pi_lock, *flags);
++ 		rq = task_rq(p);
++ 		raw_spin_lock(&rq->lock);
++ 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p)))
++ 			return rq;
++ 		raw_spin_unlock(&rq->lock);
++ 		raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
++ 
++ 		while (unlikely(task_on_rq_migrating(p)))
++ 			cpu_relax();
++ 	}
++ }
++ 
++ static void __task_rq_unlock(struct rq *rq)
++ 	__releases(rq->lock)
++ {
++ 	raw_spin_unlock(&rq->lock);
++ }
++ 
++ static inline void
++ task_rq_unlock(struct rq *rq, struct task_struct *p, unsigned long *flags)
++ 	__releases(rq->lock)
++ 	__releases(p->pi_lock)
++ {
++ 	raw_spin_unlock(&rq->lock);
++ 	raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
++ }
++ 
++ /*
+++>>>>>>> cca26e8009d1 (sched: Teach scheduler to understand TASK_ON_RQ_MIGRATING state)
+   * this_rq_lock - lock this runqueue and disable interrupts.
+   */
+  static struct rq *this_rq_lock(void)
+@@@ -1723,28 -1684,6 +1786,31 @@@ try_to_wake_up(struct task_struct *p, u
+  	success = 1; /* we're going to change ->state */
+  	cpu = task_cpu(p);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Ensure we load p->on_rq _after_ p->state, otherwise it would
+ +	 * be possible to, falsely, observe p->on_rq == 0 and get stuck
+ +	 * in smp_cond_load_acquire() below.
+ +	 *
+ +	 * sched_ttwu_pending()                 try_to_wake_up()
+ +	 *   [S] p->on_rq = 1;                  [L] P->state
+ +	 *       UNLOCK rq->lock  -----.
+ +	 *                              \
+ +	 *				 +---   RMB
+ +	 * schedule()                   /
+ +	 *       LOCK rq->lock    -----'
+ +	 *       UNLOCK rq->lock
+ +	 *
+ +	 * [task p]
+ +	 *   [S] p->state = UNINTERRUPTIBLE     [L] p->on_rq
+ +	 *
+ +	 * Pairs with the UNLOCK+LOCK on rq->lock from the
+ +	 * last wakeup of our task and the schedule that got our task
+ +	 * current.
+ +	 */
+ +	smp_rmb();
+++=======
+++>>>>>>> cca26e8009d1 (sched: Teach scheduler to understand TASK_ON_RQ_MIGRATING state)
+  	if (p->on_rq && ttwu_remote(p, wake_flags))
+  		goto stat;
+  
+diff --cc kernel/sched/sched.h
+index 98cec6922405,aa0f73ba3777..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -16,25 -13,19 +16,34 @@@
+  #include "cpudeadline.h"
+  #include "cpuacct.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct rq;
++ 
++ /* task_struct::on_rq states: */
++ #define TASK_ON_RQ_QUEUED	1
++ #define TASK_ON_RQ_MIGRATING	2
++ 
+++>>>>>>> cca26e8009d1 (sched: Teach scheduler to understand TASK_ON_RQ_MIGRATING state)
+  extern __read_mostly int scheduler_running;
+  
+ -extern unsigned long calc_load_update;
+ -extern atomic_long_t calc_load_tasks;
+ +/*
+ + * Convert user-nice values [ -20 ... 0 ... 19 ]
+ + * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
+ + * and back.
+ + */
+ +#define NICE_TO_PRIO(nice)	(MAX_RT_PRIO + (nice) + 20)
+ +#define PRIO_TO_NICE(prio)	((prio) - MAX_RT_PRIO - 20)
+ +#define TASK_NICE(p)		PRIO_TO_NICE((p)->static_prio)
+  
+ -extern long calc_load_fold_active(struct rq *this_rq);
+ -extern void update_cpu_load_active(struct rq *this_rq);
+ +/*
+ + * 'User priority' is the nice value converted to something we
+ + * can work with better when scaling various scheduler parameters,
+ + * it's a [ 0 ... 39 ] range.
+ + */
+ +#define USER_PRIO(p)		((p)-MAX_RT_PRIO)
+ +#define TASK_USER_PRIO(p)	USER_PRIO((p)->static_prio)
+ +#define MAX_USER_PRIO		(USER_PRIO(MAX_PRIO))
+  
+  /*
+   * Helpers for converting nanosecond timing to jiffy resolution
+@@@ -1016,7 -946,16 +1025,12 @@@ static inline int task_running(struct r
+  #endif
+  }
+  
+ -static inline int task_on_rq_queued(struct task_struct *p)
+ -{
+ -	return p->on_rq == TASK_ON_RQ_QUEUED;
+ -}
+  
++ static inline int task_on_rq_migrating(struct task_struct *p)
++ {
++ 	return p->on_rq == TASK_ON_RQ_MIGRATING;
++ }
++ 
+  #ifndef prepare_arch_switch
+  # define prepare_arch_switch(next)	do { } while (0)
+  #endif
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/sched.h
