@@ -1,0 +1,831 @@
+bpf: allow bpf programs to tail-call other bpf programs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@plumgrid.com>
+commit 04fd61ab36ec065e194ab5e74ae34a5240d992bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/04fd61ab.failed
+
+introduce bpf_tail_call(ctx, &jmp_table, index) helper function
+which can be used from BPF programs like:
+int bpf_prog(struct pt_regs *ctx)
+{
+  ...
+  bpf_tail_call(ctx, &jmp_table, index);
+  ...
+}
+that is roughly equivalent to:
+int bpf_prog(struct pt_regs *ctx)
+{
+  ...
+  if (jmp_table[index])
+    return (*jmp_table[index])(ctx);
+  ...
+}
+The important detail that it's not a normal call, but a tail call.
+The kernel stack is precious, so this helper reuses the current
+stack frame and jumps into another BPF program without adding
+extra call frame.
+It's trivially done in interpreter and a bit trickier in JITs.
+In case of x64 JIT the bigger part of generated assembler prologue
+is common for all programs, so it is simply skipped while jumping.
+Other JITs can do similar prologue-skipping optimization or
+do stack unwind before jumping into the next program.
+
+bpf_tail_call() arguments:
+ctx - context pointer
+jmp_table - one of BPF_MAP_TYPE_PROG_ARRAY maps used as the jump table
+index - index in the jump table
+
+Since all BPF programs are idenitified by file descriptor, user space
+need to populate the jmp_table with FDs of other BPF programs.
+If jmp_table[index] is empty the bpf_tail_call() doesn't jump anywhere
+and program execution continues as normal.
+
+New BPF_MAP_TYPE_PROG_ARRAY map type is introduced so that user space can
+populate this jmp_table array with FDs of other bpf programs.
+Programs can share the same jmp_table array or use multiple jmp_tables.
+
+The chain of tail calls can form unpredictable dynamic loops therefore
+tail_call_cnt is used to limit the number of calls and currently is set to 32.
+
+Use cases:
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+
+==========
+- simplify complex programs by splitting them into a sequence of small programs
+
+- dispatch routine
+  For tracing and future seccomp the program may be triggered on all system
+  calls, but processing of syscall arguments will be different. It's more
+  efficient to implement them as:
+  int syscall_entry(struct seccomp_data *ctx)
+  {
+     bpf_tail_call(ctx, &syscall_jmp_table, ctx->nr /* syscall number */);
+     ... default: process unknown syscall ...
+  }
+  int sys_write_event(struct seccomp_data *ctx) {...}
+  int sys_read_event(struct seccomp_data *ctx) {...}
+  syscall_jmp_table[__NR_write] = sys_write_event;
+  syscall_jmp_table[__NR_read] = sys_read_event;
+
+  For networking the program may call into different parsers depending on
+  packet format, like:
+  int packet_parser(struct __sk_buff *skb)
+  {
+     ... parse L2, L3 here ...
+     __u8 ipproto = load_byte(skb, ... offsetof(struct iphdr, protocol));
+     bpf_tail_call(skb, &ipproto_jmp_table, ipproto);
+     ... default: process unknown protocol ...
+  }
+  int parse_tcp(struct __sk_buff *skb) {...}
+  int parse_udp(struct __sk_buff *skb) {...}
+  ipproto_jmp_table[IPPROTO_TCP] = parse_tcp;
+  ipproto_jmp_table[IPPROTO_UDP] = parse_udp;
+
+- for TC use case, bpf_tail_call() allows to implement reclassify-like logic
+
+- bpf_map_update_elem/delete calls into BPF_MAP_TYPE_PROG_ARRAY jump table
+  are atomic, so user space can build chains of BPF programs on the fly
+
+Implementation details:
+=======================
+- high performance of bpf_tail_call() is the goal.
+  It could have been implemented without JIT changes as a wrapper on top of
+  BPF_PROG_RUN() macro, but with two downsides:
+  . all programs would have to pay performance penalty for this feature and
+    tail call itself would be slower, since mandatory stack unwind, return,
+    stack allocate would be done for every tailcall.
+  . tailcall would be limited to programs running preempt_disabled, since
+    generic 'void *ctx' doesn't have room for 'tail_call_cnt' and it would
+    need to be either global per_cpu variable accessed by helper and by wrapper
+    or global variable protected by locks.
+
+  In this implementation x64 JIT bypasses stack unwind and jumps into the
+  callee program after prologue.
+
+- bpf_prog_array_compatible() ensures that prog_type of callee and caller
+  are the same and JITed/non-JITed flag is the same, since calling JITed
+  program from non-JITed is invalid, since stack frames are different.
+  Similarly calling kprobe type program from socket type program is invalid.
+
+- jump table is implemented as BPF_MAP_TYPE_PROG_ARRAY to reuse 'map'
+  abstraction, its user space API and all of verifier logic.
+  It's in the existing arraymap.c file, since several functions are
+  shared with regular array map.
+
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 04fd61ab36ec065e194ab5e74ae34a5240d992bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/filter.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/arraymap.c
+#	kernel/bpf/core.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+#	kernel/trace/bpf_trace.c
+#	net/core/filter.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,8821b9a8689e..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -113,4 -126,61 +113,64 @@@ struct bpf_prog_aux 
+  	struct work_struct work;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_array {
++ 	struct bpf_map map;
++ 	u32 elem_size;
++ 	/* 'ownership' of prog_array is claimed by the first program that
++ 	 * is going to use this map or by the first program which FD is stored
++ 	 * in the map to make sure that all callers and callees have the same
++ 	 * prog_type and JITed flag
++ 	 */
++ 	enum bpf_prog_type owner_prog_type;
++ 	bool owner_jited;
++ 	union {
++ 		char value[0] __aligned(8);
++ 		struct bpf_prog *prog[0] __aligned(8);
++ 	};
++ };
++ #define MAX_TAIL_CALL_CNT 32
++ 
++ u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5);
++ void bpf_prog_array_map_clear(struct bpf_map *map);
++ bool bpf_prog_array_compatible(struct bpf_array *array, const struct bpf_prog *fp);
++ 
++ #ifdef CONFIG_BPF_SYSCALL
++ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
++ void bpf_register_map_type(struct bpf_map_type_list *tl);
++ 
++ struct bpf_prog *bpf_prog_get(u32 ufd);
++ void bpf_prog_put(struct bpf_prog *prog);
++ 
++ struct bpf_map *bpf_map_get(struct fd f);
++ void bpf_map_put(struct bpf_map *map);
++ 
++ /* verify correctness of eBPF program */
++ int bpf_check(struct bpf_prog **fp, union bpf_attr *attr);
++ #else
++ static inline void bpf_register_prog_type(struct bpf_prog_type_list *tl)
++ {
++ }
++ 
++ static inline struct bpf_prog *bpf_prog_get(u32 ufd)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline void bpf_prog_put(struct bpf_prog *prog)
++ {
++ }
++ #endif /* CONFIG_BPF_SYSCALL */
++ 
++ /* verifier prototypes for helper functions called from eBPF programs */
++ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
++ extern const struct bpf_func_proto bpf_map_update_elem_proto;
++ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
++ 
++ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
++ extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
++ extern const struct bpf_func_proto bpf_tail_call_proto;
++ 
+++>>>>>>> 04fd61ab36ec (bpf: allow bpf programs to tail-call other bpf programs)
+  #endif /* _LINUX_BPF_H */
+diff --cc include/linux/filter.h
+index d322ed880333,17724f6ea983..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -21,79 -313,116 +21,99 @@@ struct compat_sock_fprog 
+  };
+  #endif
+  
+ -struct sock_fprog_kern {
+ -	u16			len;
+ -	struct sock_filter	*filter;
+ -};
+ +struct sk_buff;
+ +struct sock;
+ +struct bpf_prog_aux;
+  
+ -struct bpf_binary_header {
+ -	unsigned int pages;
+ -	u8 image[];
+ +struct bpf_prog
+ +{
+ +	struct bpf_prog_aux	*aux;	/* Auxiliary fields */
+  };
+  
+ -struct bpf_prog {
+ -	u16			pages;		/* Number of allocated pages */
+ -	bool			jited;		/* Is our filter JIT'ed? */
+ -	bool			gpl_compatible;	/* Is our filter GPL compatible? */
+ -	u32			len;		/* Number of filter blocks */
+ -	enum bpf_prog_type	type;		/* Type of BPF program */
+ -	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+ -	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+ +struct sk_filter
+ +{
+ +	atomic_t		refcnt;
+ +	unsigned int         	len;	/* Number of filter blocks */
+  	unsigned int		(*bpf_func)(const struct sk_buff *skb,
+ -					    const struct bpf_insn *filter);
+ -	/* Instructions for interpreter */
+ -	union {
+ -		struct sock_filter	insns[0];
+ -		struct bpf_insn		insnsi[0];
+ -	};
+ +					    const struct sock_filter *filter);
+ +	struct rcu_head		rcu;
+ +	struct sock_filter     	insns[0];
+  };
+  
+ -struct sk_filter {
+ -	atomic_t	refcnt;
+ -	struct rcu_head	rcu;
+ -	struct bpf_prog	*prog;
+ +struct xdp_buff {
+ +	void *data;
+ +	void *data_end;
+ +	void *data_hard_start;
+  };
+  
+ -#define BPF_PROG_RUN(filter, ctx)  (*filter->bpf_func)(ctx, filter->insnsi)
+ -
+ -static inline unsigned int bpf_prog_size(unsigned int proglen)
+ +/* compute the linear packet data range [data, data_end) which
+ + * will be accessed by cls_bpf and act_bpf programs
+ + */
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+  {
+ -	return max(sizeof(struct bpf_prog),
+ -		   offsetof(struct bpf_prog, insns[proglen]));
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+  }
+  
+ -#define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
+ -
+ -#ifdef CONFIG_DEBUG_SET_MODULE_RONX
+ -static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+ +static inline void bpf_compute_data_end(struct sk_buff *skb)
+  {
+ -	set_memory_ro((unsigned long)fp, fp->pages);
+ +	return;
+  }
+  
+ -static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+ -{
+ -	set_memory_rw((unsigned long)fp, fp->pages);
+ -}
+ -#else
+ -static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+ +int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+ +static inline int sk_filter(struct sock *sk, struct sk_buff *skb)
+  {
+ +	return sk_filter_trim_cap(sk, skb, 1);
+  }
+  
+ -static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+ +extern unsigned int sk_run_filter(const struct sk_buff *skb,
+ +				  const struct sock_filter *filter);
+ +extern int sk_unattached_filter_create(struct sk_filter **pfp,
+ +				       struct sock_fprog *fprog);
+ +extern void sk_unattached_filter_destroy(struct sk_filter *fp);
+ +extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ +extern int sk_detach_filter(struct sock *sk);
+ +extern int sk_chk_filter(struct sock_filter *filter, unsigned int flen);
+ +extern int sk_get_filter(struct sock *sk, struct sock_filter __user *filter, unsigned len);
+ +extern void sk_decode_filter(struct sock_filter *filt, struct sock_filter *to);
+ +
+ +static inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ +				   struct xdp_buff *xdp)
+  {
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ }
++ #endif /* CONFIG_DEBUG_SET_MODULE_RONX */
++ 
++ int sk_filter(struct sock *sk, struct sk_buff *skb);
++ 
++ int bpf_prog_select_runtime(struct bpf_prog *fp);
++ void bpf_prog_free(struct bpf_prog *fp);
++ 
++ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags);
++ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
++ 				  gfp_t gfp_extra_flags);
++ void __bpf_prog_free(struct bpf_prog *fp);
++ 
++ static inline void bpf_prog_unlock_free(struct bpf_prog *fp)
++ {
++ 	bpf_prog_unlock_ro(fp);
++ 	__bpf_prog_free(fp);
+++>>>>>>> 04fd61ab36ec (bpf: allow bpf programs to tail-call other bpf programs)
+  }
+  
+ -typedef int (*bpf_aux_classic_check_t)(struct sock_filter *filter,
+ -				       unsigned int flen);
+ -
+ -int bpf_prog_create(struct bpf_prog **pfp, struct sock_fprog_kern *fprog);
+ -int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
+ -			      bpf_aux_classic_check_t trans);
+ -void bpf_prog_destroy(struct bpf_prog *fp);
+ -
+ -int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ -int sk_attach_bpf(u32 ufd, struct sock *sk);
+ -int sk_detach_filter(struct sock *sk);
+ -int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
+ -		  unsigned int len);
+ -
+ -bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
+ -void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
+ -
+ -u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ -void bpf_int_jit_compile(struct bpf_prog *fp);
+ +static inline void bpf_warn_invalid_xdp_action(u32 act)
+ +{
+ +	return;
+ +}
+  
+  #ifdef CONFIG_BPF_JIT
+ -typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+ -
+ -struct bpf_binary_header *
+ -bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
+ -		     unsigned int alignment,
+ -		     bpf_jit_fill_hole_t bpf_fill_ill_insns);
+ -void bpf_jit_binary_free(struct bpf_binary_header *hdr);
+ +#include <stdarg.h>
+ +#include <linux/linkage.h>
+ +#include <linux/printk.h>
+  
+ -void bpf_jit_compile(struct bpf_prog *fp);
+ -void bpf_jit_free(struct bpf_prog *fp);
+ +extern void bpf_jit_compile(struct sk_filter *fp);
+ +extern void bpf_jit_free(struct sk_filter *fp);
+  
+  static inline void bpf_jit_dump(unsigned int flen, unsigned int proglen,
+  				u32 pass, void *image)
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,f0a9af8b4dae..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -110,7 -111,9 +110,13 @@@ enum bpf_cmd 
+  
+  enum bpf_map_type {
+  	BPF_MAP_TYPE_UNSPEC,
+++<<<<<<< HEAD
+ +	BPF_PROG_TYPE_XDP,
+++=======
++ 	BPF_MAP_TYPE_HASH,
++ 	BPF_MAP_TYPE_ARRAY,
++ 	BPF_MAP_TYPE_PROG_ARRAY,
+++>>>>>>> 04fd61ab36ec (bpf: allow bpf programs to tail-call other bpf programs)
+  };
+  
+  enum bpf_prog_type {
+@@@ -162,6 -166,60 +168,63 @@@ struct xdp_md 
+   */
+  enum bpf_func_id {
+  	BPF_FUNC_unspec,
+++<<<<<<< HEAD
+++=======
++ 	BPF_FUNC_map_lookup_elem, /* void *map_lookup_elem(&map, &key) */
++ 	BPF_FUNC_map_update_elem, /* int map_update_elem(&map, &key, &value, flags) */
++ 	BPF_FUNC_map_delete_elem, /* int map_delete_elem(&map, &key) */
++ 	BPF_FUNC_probe_read,      /* int bpf_probe_read(void *dst, int size, void *src) */
++ 	BPF_FUNC_ktime_get_ns,    /* u64 bpf_ktime_get_ns(void) */
++ 	BPF_FUNC_trace_printk,    /* int bpf_trace_printk(const char *fmt, int fmt_size, ...) */
++ 	BPF_FUNC_get_prandom_u32, /* u32 prandom_u32(void) */
++ 	BPF_FUNC_get_smp_processor_id, /* u32 raw_smp_processor_id(void) */
++ 
++ 	/**
++ 	 * skb_store_bytes(skb, offset, from, len, flags) - store bytes into packet
++ 	 * @skb: pointer to skb
++ 	 * @offset: offset within packet from skb->mac_header
++ 	 * @from: pointer where to copy bytes from
++ 	 * @len: number of bytes to store into packet
++ 	 * @flags: bit 0 - if true, recompute skb->csum
++ 	 *         other bits - reserved
++ 	 * Return: 0 on success
++ 	 */
++ 	BPF_FUNC_skb_store_bytes,
++ 
++ 	/**
++ 	 * l3_csum_replace(skb, offset, from, to, flags) - recompute IP checksum
++ 	 * @skb: pointer to skb
++ 	 * @offset: offset within packet where IP checksum is located
++ 	 * @from: old value of header field
++ 	 * @to: new value of header field
++ 	 * @flags: bits 0-3 - size of header field
++ 	 *         other bits - reserved
++ 	 * Return: 0 on success
++ 	 */
++ 	BPF_FUNC_l3_csum_replace,
++ 
++ 	/**
++ 	 * l4_csum_replace(skb, offset, from, to, flags) - recompute TCP/UDP checksum
++ 	 * @skb: pointer to skb
++ 	 * @offset: offset within packet where TCP/UDP checksum is located
++ 	 * @from: old value of header field
++ 	 * @to: new value of header field
++ 	 * @flags: bits 0-3 - size of header field
++ 	 *         bit 4 - is pseudo header
++ 	 *         other bits - reserved
++ 	 * Return: 0 on success
++ 	 */
++ 	BPF_FUNC_l4_csum_replace,
++ 
++ 	/**
++ 	 * bpf_tail_call(ctx, prog_array_map, index) - jump into another BPF program
++ 	 * @ctx: context pointer passed to next program
++ 	 * @prog_array_map: pointer to map which type is BPF_MAP_TYPE_PROG_ARRAY
++ 	 * @index: index inside array that selects specific program to run
++ 	 * Return: 0 on success
++ 	 */
++ 	BPF_FUNC_tail_call,
+++>>>>>>> 04fd61ab36ec (bpf: allow bpf programs to tail-call other bpf programs)
+  	__BPF_FUNC_MAX_ID,
+  };
+  
+diff --cc net/core/filter.c
+index 060ed5f86613,3adcca6f17a4..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -763,6 -1212,351 +763,354 @@@ int sk_attach_filter(struct sock_fprog 
+  }
+  EXPORT_SYMBOL_GPL(sk_attach_filter);
+  
+++<<<<<<< HEAD
+++=======
++ int sk_attach_bpf(u32 ufd, struct sock *sk)
++ {
++ 	struct bpf_prog *prog;
++ 	int err;
++ 
++ 	if (sock_flag(sk, SOCK_FILTER_LOCKED))
++ 		return -EPERM;
++ 
++ 	prog = bpf_prog_get(ufd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_SOCKET_FILTER) {
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = __sk_attach_prog(prog, sk);
++ 	if (err < 0) {
++ 		bpf_prog_put(prog);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  *	bpf_skb_clone_not_writable - is the header of a clone not writable
++  *	@skb: buffer to check
++  *	@len: length up to which to write, can be negative
++  *
++  *	Returns true if modifying the header part of the cloned buffer
++  *	does require the data to be copied. I.e. this version works with
++  *	negative lengths needed for eBPF case!
++  */
++ static bool bpf_skb_clone_unwritable(const struct sk_buff *skb, int len)
++ {
++ 	return skb_header_cloned(skb) ||
++ 	       (int) skb_headroom(skb) + len > skb->hdr_len;
++ }
++ 
++ #define BPF_RECOMPUTE_CSUM(flags)	((flags) & 1)
++ 
++ static u64 bpf_skb_store_bytes(u64 r1, u64 r2, u64 r3, u64 r4, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	void *from = (void *) (long) r3;
++ 	unsigned int len = (unsigned int) r4;
++ 	char buf[16];
++ 	void *ptr;
++ 
++ 	/* bpf verifier guarantees that:
++ 	 * 'from' pointer points to bpf program stack
++ 	 * 'len' bytes of it were initialized
++ 	 * 'len' > 0
++ 	 * 'skb' is a valid pointer to 'struct sk_buff'
++ 	 *
++ 	 * so check for invalid 'offset' and too large 'len'
++ 	 */
++ 	if (unlikely((u32) offset > 0xffff || len > sizeof(buf)))
++ 		return -EFAULT;
++ 
++ 	offset -= skb->data - skb_mac_header(skb);
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     bpf_skb_clone_unwritable(skb, offset + len)))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, len, buf);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	if (BPF_RECOMPUTE_CSUM(flags))
++ 		skb_postpull_rcsum(skb, ptr, len);
++ 
++ 	memcpy(ptr, from, len);
++ 
++ 	if (ptr == buf)
++ 		/* skb_store_bits cannot return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, len);
++ 
++ 	if (BPF_RECOMPUTE_CSUM(flags) && skb->ip_summed == CHECKSUM_COMPLETE)
++ 		skb->csum = csum_add(skb->csum, csum_partial(ptr, len, 0));
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_skb_store_bytes_proto = {
++ 	.func		= bpf_skb_store_bytes,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_PTR_TO_STACK,
++ 	.arg4_type	= ARG_CONST_STACK_SIZE,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ #define BPF_HEADER_FIELD_SIZE(flags)	((flags) & 0x0f)
++ #define BPF_IS_PSEUDO_HEADER(flags)	((flags) & 0x10)
++ 
++ static u64 bpf_l3_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 
++ 	offset -= skb->data - skb_mac_header(skb);
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     bpf_skb_clone_unwritable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	switch (BPF_HEADER_FIELD_SIZE(flags)) {
++ 	case 2:
++ 		csum_replace2(ptr, from, to);
++ 		break;
++ 	case 4:
++ 		csum_replace4(ptr, from, to);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_l3_csum_replace_proto = {
++ 	.func		= bpf_l3_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static u64 bpf_l4_csum_replace(u64 r1, u64 r2, u64 from, u64 to, u64 flags)
++ {
++ 	struct sk_buff *skb = (struct sk_buff *) (long) r1;
++ 	u32 is_pseudo = BPF_IS_PSEUDO_HEADER(flags);
++ 	int offset = (int) r2;
++ 	__sum16 sum, *ptr;
++ 
++ 	if (unlikely((u32) offset > 0xffff))
++ 		return -EFAULT;
++ 
++ 	offset -= skb->data - skb_mac_header(skb);
++ 	if (unlikely(skb_cloned(skb) &&
++ 		     bpf_skb_clone_unwritable(skb, offset + sizeof(sum))))
++ 		return -EFAULT;
++ 
++ 	ptr = skb_header_pointer(skb, offset, sizeof(sum), &sum);
++ 	if (unlikely(!ptr))
++ 		return -EFAULT;
++ 
++ 	switch (BPF_HEADER_FIELD_SIZE(flags)) {
++ 	case 2:
++ 		inet_proto_csum_replace2(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	case 4:
++ 		inet_proto_csum_replace4(ptr, skb, from, to, is_pseudo);
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (ptr == &sum)
++ 		/* skb_store_bits guaranteed to not return -EFAULT here */
++ 		skb_store_bits(skb, offset, ptr, sizeof(sum));
++ 
++ 	return 0;
++ }
++ 
++ const struct bpf_func_proto bpf_l4_csum_replace_proto = {
++ 	.func		= bpf_l4_csum_replace,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_ANYTHING,
++ 	.arg3_type	= ARG_ANYTHING,
++ 	.arg4_type	= ARG_ANYTHING,
++ 	.arg5_type	= ARG_ANYTHING,
++ };
++ 
++ static const struct bpf_func_proto *
++ sk_filter_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_map_lookup_elem:
++ 		return &bpf_map_lookup_elem_proto;
++ 	case BPF_FUNC_map_update_elem:
++ 		return &bpf_map_update_elem_proto;
++ 	case BPF_FUNC_map_delete_elem:
++ 		return &bpf_map_delete_elem_proto;
++ 	case BPF_FUNC_get_prandom_u32:
++ 		return &bpf_get_prandom_u32_proto;
++ 	case BPF_FUNC_get_smp_processor_id:
++ 		return &bpf_get_smp_processor_id_proto;
++ 	case BPF_FUNC_tail_call:
++ 		return &bpf_tail_call_proto;
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ static const struct bpf_func_proto *
++ tc_cls_act_func_proto(enum bpf_func_id func_id)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_skb_store_bytes:
++ 		return &bpf_skb_store_bytes_proto;
++ 	case BPF_FUNC_l3_csum_replace:
++ 		return &bpf_l3_csum_replace_proto;
++ 	case BPF_FUNC_l4_csum_replace:
++ 		return &bpf_l4_csum_replace_proto;
++ 	default:
++ 		return sk_filter_func_proto(func_id);
++ 	}
++ }
++ 
++ static bool sk_filter_is_valid_access(int off, int size,
++ 				      enum bpf_access_type type)
++ {
++ 	/* only read is allowed */
++ 	if (type != BPF_READ)
++ 		return false;
++ 
++ 	/* check bounds */
++ 	if (off < 0 || off >= sizeof(struct __sk_buff))
++ 		return false;
++ 
++ 	/* disallow misaligned access */
++ 	if (off % size != 0)
++ 		return false;
++ 
++ 	/* all __sk_buff fields are __u32 */
++ 	if (size != 4)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static u32 sk_filter_convert_ctx_access(int dst_reg, int src_reg, int ctx_off,
++ 					struct bpf_insn *insn_buf)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (ctx_off) {
++ 	case offsetof(struct __sk_buff, len):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, len) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, len));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, protocol):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, protocol) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, protocol));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, vlan_proto):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_proto) != 2);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, vlan_proto));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, priority):
++ 		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, priority) != 4);
++ 
++ 		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++ 				      offsetof(struct sk_buff, priority));
++ 		break;
++ 
++ 	case offsetof(struct __sk_buff, mark):
++ 		return convert_skb_access(SKF_AD_MARK, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, pkt_type):
++ 		return convert_skb_access(SKF_AD_PKTTYPE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, queue_mapping):
++ 		return convert_skb_access(SKF_AD_QUEUE, dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_present):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG_PRESENT,
++ 					  dst_reg, src_reg, insn);
++ 
++ 	case offsetof(struct __sk_buff, vlan_tci):
++ 		return convert_skb_access(SKF_AD_VLAN_TAG,
++ 					  dst_reg, src_reg, insn);
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static const struct bpf_verifier_ops sk_filter_ops = {
++ 	.get_func_proto = sk_filter_func_proto,
++ 	.is_valid_access = sk_filter_is_valid_access,
++ 	.convert_ctx_access = sk_filter_convert_ctx_access,
++ };
++ 
++ static const struct bpf_verifier_ops tc_cls_act_ops = {
++ 	.get_func_proto = tc_cls_act_func_proto,
++ 	.is_valid_access = sk_filter_is_valid_access,
++ 	.convert_ctx_access = sk_filter_convert_ctx_access,
++ };
++ 
++ static struct bpf_prog_type_list sk_filter_type __read_mostly = {
++ 	.ops = &sk_filter_ops,
++ 	.type = BPF_PROG_TYPE_SOCKET_FILTER,
++ };
++ 
++ static struct bpf_prog_type_list sched_cls_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_CLS,
++ };
++ 
++ static struct bpf_prog_type_list sched_act_type __read_mostly = {
++ 	.ops = &tc_cls_act_ops,
++ 	.type = BPF_PROG_TYPE_SCHED_ACT,
++ };
++ 
++ static int __init register_sk_filter_ops(void)
++ {
++ 	bpf_register_prog_type(&sk_filter_type);
++ 	bpf_register_prog_type(&sched_cls_type);
++ 	bpf_register_prog_type(&sched_act_type);
++ 
++ 	return 0;
++ }
++ late_initcall(register_sk_filter_ops);
++ 
+++>>>>>>> 04fd61ab36ec (bpf: allow bpf programs to tail-call other bpf programs)
+  int sk_detach_filter(struct sock *sk)
+  {
+  	int ret = -ENOENT;
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/trace/bpf_trace.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/trace/bpf_trace.c
+* Unmerged path net/core/filter.c
