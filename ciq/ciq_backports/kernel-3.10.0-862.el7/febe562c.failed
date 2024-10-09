@@ -1,0 +1,205 @@
+target: Fix LUN_RESET active I/O handling for ACK_KREF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix LUN_RESET active I/O handling for ACK_KREF (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 92.00%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit febe562c20dfa8f33bee7d419c6b517986a5aa33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/febe562c.failed
+
+This patch fixes a NULL pointer se_cmd->cmd_kref < 0
+refcount bug during TMR LUN_RESET with active se_cmd
+I/O, that can be triggered during se_cmd descriptor
+shutdown + release via core_tmr_drain_state_list() code.
+
+To address this bug, add common __target_check_io_state()
+helper for ABORT_TASK + LUN_RESET w/ CMD_T_COMPLETE
+checking, and set CMD_T_ABORTED + obtain ->cmd_kref for
+both cases ahead of last target_put_sess_cmd() after
+TFO->aborted_task() -> transport_cmd_finish_abort()
+callback has completed.
+
+It also introduces SCF_ACK_KREF to determine when
+transport_cmd_finish_abort() needs to drop the second
+extra reference, ahead of calling target_put_sess_cmd()
+for the final kref_put(&se_cmd->cmd_kref).
+
+It also updates transport_cmd_check_stop() to avoid
+holding se_cmd->t_state_lock while dropping se_cmd
+device state via target_remove_from_state_list(), now
+that core_tmr_drain_state_list() is holding the
+se_device lock while checking se_cmd state from
+within TMR logic.
+
+Finally, move transport_put_cmd() release of SGL +
+TMR + extended CDB memory into target_free_cmd_mem()
+in order to avoid potential resource leaks in TMR
+ABORT_TASK + LUN_RESET code-paths.  Also update
+target_release_cmd_kref() accordingly.
+
+	Reviewed-by: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Cc: Mike Christie <mchristi@redhat.com>
+	Cc: stable@vger.kernel.org # 3.10+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit febe562c20dfa8f33bee7d419c6b517986a5aa33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tmr.c
+#	drivers/target/target_core_transport.c
+#	include/target/target_core_base.h
+diff --cc drivers/target/target_core_tmr.c
+index b2e169fba3c6,fb3decc28589..000000000000
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@@ -133,31 -158,25 +161,37 @@@ void core_tmr_abort_task
+  		if (tmr->ref_task_tag != ref_tag)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		printk("ABORT_TASK: Found referenced %s task_tag: %u\n",
+ +			se_cmd->se_tfo->get_fabric_name(), ref_tag);
+ +
+ +		spin_lock(&se_cmd->t_state_lock);
+ +		if (se_cmd->transport_state & CMD_T_COMPLETE) {
+ +			printk("ABORT_TASK: ref_tag: %u already complete, skipping\n", ref_tag);
+ +			spin_unlock(&se_cmd->t_state_lock);
+ +			spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+++=======
++ 		printk("ABORT_TASK: Found referenced %s task_tag: %llu\n",
++ 			se_cmd->se_tfo->get_fabric_name(), ref_tag);
++ 
++ 		if (!__target_check_io_state(se_cmd)) {
++ 			spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 			target_put_sess_cmd(se_cmd);
+++>>>>>>> febe562c20df (target: Fix LUN_RESET active I/O handling for ACK_KREF)
+  			goto out;
+  		}
+- 		se_cmd->transport_state |= CMD_T_ABORTED;
+- 		spin_unlock(&se_cmd->t_state_lock);
+- 
+  		list_del_init(&se_cmd->se_cmd_list);
+ +		kref_get(&se_cmd->cmd_kref);
+  		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+  
+  		cancel_work_sync(&se_cmd->work);
+  		transport_wait_for_tasks(se_cmd);
+  
+- 		target_put_sess_cmd(se_cmd);
+  		transport_cmd_finish_abort(se_cmd, true);
++ 		target_put_sess_cmd(se_cmd);
+  
+  		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ -				" ref_tag: %llu\n", ref_tag);
+ +				" ref_tag: %d\n", ref_tag);
+  		tmr->response = TMR_FUNCTION_COMPLETE;
+  		return;
+  	}
+@@@ -286,19 -317,19 +332,19 @@@ static void core_tmr_drain_state_list
+  
+  	while (!list_empty(&drain_task_list)) {
+  		cmd = list_entry(drain_task_list.next, struct se_cmd, state_list);
+- 		list_del(&cmd->state_list);
++ 		list_del_init(&cmd->state_list);
+  
+  		pr_debug("LUN_RESET: %s cmd: %p"
+ -			" ITT/CmdSN: 0x%08llx/0x%08x, i_state: %d, t_state: %d"
+ +			" ITT/CmdSN: 0x%08x/0x%08x, i_state: %d, t_state: %d"
+  			"cdb: 0x%02x\n",
+  			(preempt_and_abort_list) ? "Preempt" : "", cmd,
+ -			cmd->tag, 0,
+ +			cmd->se_tfo->get_task_tag(cmd), 0,
+  			cmd->se_tfo->get_cmd_state(cmd), cmd->t_state,
+  			cmd->t_task_cdb[0]);
+ -		pr_debug("LUN_RESET: ITT[0x%08llx] - pr_res_key: 0x%016Lx"
+ +		pr_debug("LUN_RESET: ITT[0x%08x] - pr_res_key: 0x%016Lx"
+  			" -- CMD_T_ACTIVE: %d"
+  			" CMD_T_STOP: %d CMD_T_SENT: %d\n",
+ -			cmd->tag, cmd->pr_res_key,
+ +			cmd->se_tfo->get_task_tag(cmd), cmd->pr_res_key,
+  			(cmd->transport_state & CMD_T_ACTIVE) != 0,
+  			(cmd->transport_state & CMD_T_STOP) != 0,
+  			(cmd->transport_state & CMD_T_SENT) != 0);
+diff --cc drivers/target/target_core_transport.c
+index cf7ad6dd6620,af52f8bd8954..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -2541,25 -2494,39 +2518,46 @@@ out
+  }
+  EXPORT_SYMBOL(target_get_sess_cmd);
+  
++ static void target_free_cmd_mem(struct se_cmd *cmd)
++ {
++ 	transport_free_pages(cmd);
++ 
++ 	if (cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)
++ 		core_tmr_release_req(cmd->se_tmr_req);
++ 	if (cmd->t_task_cdb != cmd->__t_task_cdb)
++ 		kfree(cmd->t_task_cdb);
++ }
++ 
+  static void target_release_cmd_kref(struct kref *kref)
+ +		__releases(&se_cmd->se_sess->sess_cmd_lock)
+  {
+  	struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
+  	struct se_session *se_sess = se_cmd->se_sess;
+ -	unsigned long flags;
+  
+ -	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+  	if (list_empty(&se_cmd->se_cmd_list)) {
+++<<<<<<< HEAD
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+++=======
++ 		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 		target_free_cmd_mem(se_cmd);
+++>>>>>>> febe562c20df (target: Fix LUN_RESET active I/O handling for ACK_KREF)
+  		se_cmd->se_tfo->release_cmd(se_cmd);
+  		return;
+  	}
+  	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
+++<<<<<<< HEAD
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+++=======
++ 		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 		target_free_cmd_mem(se_cmd);
+++>>>>>>> febe562c20df (target: Fix LUN_RESET active I/O handling for ACK_KREF)
+  		complete(&se_cmd->cmd_wait_comp);
+  		return;
+  	}
+  	list_del(&se_cmd->se_cmd_list);
+ -	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ +	spin_unlock(&se_sess->sess_cmd_lock);
+  
++ 	target_free_cmd_mem(se_cmd);
+  	se_cmd->se_tfo->release_cmd(se_cmd);
+  }
+  
+diff --cc include/target/target_core_base.h
+index 6a27f0cf6579,1a76726c45a2..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -168,8 -139,8 +168,13 @@@ enum se_cmd_flags_table 
+  	SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC = 0x00020000,
+  	SCF_COMPARE_AND_WRITE		= 0x00080000,
+  	SCF_COMPARE_AND_WRITE_POST	= 0x00100000,
+++<<<<<<< HEAD
+ +	SCF_CMD_XCOPY_PASSTHROUGH	= 0x00200000,
+ +	SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC = 0x00400000,
+++=======
++ 	SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC = 0x00200000,
++ 	SCF_ACK_KREF			= 0x00400000,
+++>>>>>>> febe562c20df (target: Fix LUN_RESET active I/O handling for ACK_KREF)
+  };
+  
+  /* struct se_dev_entry->lun_flags and struct se_lun->lun_access */
+* Unmerged path drivers/target/target_core_tmr.c
+* Unmerged path drivers/target/target_core_transport.c
+* Unmerged path include/target/target_core_base.h
