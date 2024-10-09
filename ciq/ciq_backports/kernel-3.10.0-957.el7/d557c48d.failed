@@ -1,0 +1,127 @@
+ceph: quota: add counter for snaprealms with quota
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Luis Henriques <lhenriques@suse.com>
+commit d557c48db730eaab6b75d4af332c135309b7a6a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d557c48d.failed
+
+By keeping a counter with the number of snaprealms that have quota set
+allows to optimize the functions that need to walk throught the realms
+hierarchy looking for quotas.  Thus, if this counter is zero it's safe to
+assume that there are no realms with quota.
+
+	Signed-off-by: Luis Henriques <lhenriques@suse.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit d557c48db730eaab6b75d4af332c135309b7a6a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/inode.c
+#	fs/ceph/quota.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/inode.c
+index 89fde4d86e99,8bf60250309e..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -529,8 -535,13 +529,11 @@@ void ceph_destroy_inode(struct inode *i
+  
+  	dout("destroy_inode %p ino %llx.%llx\n", inode, ceph_vinop(inode));
+  
+ -	ceph_fscache_unregister_inode_cookie(ci);
+ -
+  	ceph_queue_caps_release(inode);
+  
++ 	if (__ceph_has_any_quota(ci))
++ 		ceph_adjust_quota_realms_count(inode, false);
++ 
+  	/*
+  	 * we may still have a snap_realm reference if there are stray
+  	 * caps in i_snap_caps.
+@@@ -774,6 -799,8 +777,11 @@@ static int fill_inode(struct inode *ino
+  	inode->i_rdev = le32_to_cpu(info->rdev);
+  	inode->i_blkbits = fls(le32_to_cpu(info->layout.fl_stripe_unit)) - 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	__ceph_update_quota(ci, iinfo->max_bytes, iinfo->max_files);
++ 
+++>>>>>>> d557c48db730 (ceph: quota: add counter for snaprealms with quota)
+  	if ((new_version || (new_issued & CEPH_CAP_AUTH_SHARED)) &&
+  	    (issued & CEPH_CAP_AUTH_EXCL) == 0) {
+  		inode->i_mode = le32_to_cpu(info->mode);
+diff --cc fs/ceph/super.h
+index 2ea6359d8d08,1321a6749953..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -1022,4 -1074,35 +1022,38 @@@ extern int lock_to_ceph_filelock(struc
+  extern int ceph_fs_debugfs_init(struct ceph_fs_client *client);
+  extern void ceph_fs_debugfs_cleanup(struct ceph_fs_client *client);
+  
+++<<<<<<< HEAD
+++=======
++ /* quota.c */
++ static inline bool __ceph_has_any_quota(struct ceph_inode_info *ci)
++ {
++ 	return ci->i_max_files || ci->i_max_bytes;
++ }
++ 
++ extern void ceph_adjust_quota_realms_count(struct inode *inode, bool inc);
++ 
++ static inline void __ceph_update_quota(struct ceph_inode_info *ci,
++ 				       u64 max_bytes, u64 max_files)
++ {
++ 	bool had_quota, has_quota;
++ 	had_quota = __ceph_has_any_quota(ci);
++ 	ci->i_max_bytes = max_bytes;
++ 	ci->i_max_files = max_files;
++ 	has_quota = __ceph_has_any_quota(ci);
++ 
++ 	if (had_quota != has_quota)
++ 		ceph_adjust_quota_realms_count(&ci->vfs_inode, has_quota);
++ }
++ 
++ extern void ceph_handle_quota(struct ceph_mds_client *mdsc,
++ 			      struct ceph_mds_session *session,
++ 			      struct ceph_msg *msg);
++ extern bool ceph_quota_is_max_files_exceeded(struct inode *inode);
++ extern bool ceph_quota_is_same_realm(struct inode *old, struct inode *new);
++ extern bool ceph_quota_is_max_bytes_exceeded(struct inode *inode,
++ 					     loff_t newlen);
++ extern bool ceph_quota_is_max_bytes_approaching(struct inode *inode,
++ 						loff_t newlen);
++ 
+++>>>>>>> d557c48db730 (ceph: quota: add counter for snaprealms with quota)
+  #endif /* _FS_CEPH_SUPER_H */
+* Unmerged path fs/ceph/quota.c
+* Unmerged path fs/ceph/inode.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index b252f485a1dc..04205a386bd0 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -3593,6 +3593,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
+ 	atomic_set(&mdsc->num_sessions, 0);
+ 	mdsc->max_sessions = 0;
+ 	mdsc->stopping = 0;
++	atomic64_set(&mdsc->quotarealms_count, 0);
+ 	mdsc->last_snap_seq = 0;
+ 	init_rwsem(&mdsc->snap_rwsem);
+ 	mdsc->snap_realms = RB_ROOT;
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index 3c0db49cd37e..ebd44688e5a0 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -307,6 +307,8 @@ struct ceph_mds_client {
+ 	int                     max_sessions;  /* len of s_mds_sessions */
+ 	int                     stopping;      /* true if shutting down */
+ 
++	atomic64_t		quotarealms_count; /* # realms with quota */
++
+ 	/*
+ 	 * snap_rwsem will cover cap linkage into snaprealms, and
+ 	 * realm snap contexts.  (later, we can do per-realm snap
+* Unmerged path fs/ceph/quota.c
+* Unmerged path fs/ceph/super.h
