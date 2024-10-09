@@ -1,0 +1,220 @@
+mqprio: Introduce new hardware offload mode and shaper in mqprio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Amritha Nambiar <amritha.nambiar@intel.com>
+commit 4e8b86c062695454df0b76f3fee4fab8dc4bb716
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4e8b86c0.failed
+
+The offload types currently supported in mqprio are 0 (no offload) and
+1 (offload only TCs) by setting these values for the 'hw' option. If
+offloads are supported by setting the 'hw' option to 1, the default
+offload mode is 'dcb' where only the TC values are offloaded to the
+device. This patch introduces a new hardware offload mode called
+'channel' with 'hw' set to 1 in mqprio which makes full use of the
+mqprio options, the TCs, the queue configurations and the QoS parameters
+for the TCs. This is achieved through a new netlink attribute for the
+'mode' option which takes values such as 'dcb' (default) and 'channel'.
+The 'channel' mode also supports QoS attributes for traffic class such as
+minimum and maximum values for bandwidth rate limits.
+
+This patch enables configuring additional HW shaper attributes associated
+with a traffic class. Currently the shaper for bandwidth rate limiting is
+supported which takes options such as minimum and maximum bandwidth rates
+and are offloaded to the hardware in the 'channel' mode. The min and max
+limits for bandwidth rates are provided by the user along with the TCs
+and the queue configurations when creating the mqprio qdisc. The interface
+can be extended to support new HW shapers in future through the 'shaper'
+attribute.
+
+Introduces a new data structure 'tc_mqprio_qopt_offload' for offloading
+mqprio queue options and use this to be shared between the kernel and
+device driver. This contains a copy of the existing data structure
+for mqprio queue options. This new data structure can be extended when
+adding new attributes for traffic class such as mode, shaper, shaper
+parameters (bandwidth rate limits). The existing data structure for mqprio
+queue options will be shared between the kernel and userspace.
+
+Example:
+  queues 4@0 4@4 hw 1 mode channel shaper bw_rlimit\
+  min_rate 1Gbit 2Gbit max_rate 4Gbit 5Gbit
+
+To dump the bandwidth rates:
+
+qdisc mqprio 804a: root  tc 2 map 0 0 0 0 1 1 1 1 0 0 0 0 0 0 0 0
+             queues:(0:3) (4:7)
+             mode:channel
+             shaper:bw_rlimit   min_rate:1Gbit 2Gbit   max_rate:4Gbit 5Gbit
+
+	Signed-off-by: Amritha Nambiar <amritha.nambiar@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 4e8b86c062695454df0b76f3fee4fab8dc4bb716)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	net/sched/sch_mqprio.c
+diff --cc include/net/pkt_cls.h
+index 065c00671d15,60d39789e4f0..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -558,6 -529,33 +558,36 @@@ struct tc_cls_matchall_offload 
+  	unsigned long cookie;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum tc_clsbpf_command {
++ 	TC_CLSBPF_ADD,
++ 	TC_CLSBPF_REPLACE,
++ 	TC_CLSBPF_DESTROY,
++ 	TC_CLSBPF_STATS,
++ };
++ 
++ struct tc_cls_bpf_offload {
++ 	struct tc_cls_common_offload common;
++ 	enum tc_clsbpf_command command;
++ 	struct tcf_exts *exts;
++ 	struct bpf_prog *prog;
++ 	const char *name;
++ 	bool exts_integrated;
++ 	u32 gen_flags;
++ };
++ 
++ struct tc_mqprio_qopt_offload {
++ 	/* struct tc_mqprio_qopt must always be the first element */
++ 	struct tc_mqprio_qopt qopt;
++ 	u16 mode;
++ 	u16 shaper;
++ 	u32 flags;
++ 	u64 min_rate[TC_QOPT_MAX_QUEUE];
++ 	u64 max_rate[TC_QOPT_MAX_QUEUE];
++ };
++ 
+++>>>>>>> 4e8b86c06269 (mqprio: Introduce new hardware offload mode and shaper in mqprio)
+  /* This structure holds cookie structure that is passed from user
+   * to the kernel for actions and classifiers
+   */
+diff --cc net/sched/sch_mqprio.c
+index 5cc75dbd241e,f1ae9be83934..000000000000
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@@ -38,10 -44,18 +44,25 @@@ static void mqprio_destroy(struct Qdis
+  		kfree(priv->qdiscs);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (priv->hw_offload && __rh_has_ndo_setup_tc(dev)) {
+ +		struct tc_mqprio_qopt mqprio = {};
+ +
+ +		__rh_call_ndo_setup_tc(dev, TC_SETUP_MQPRIO, &mqprio);
+++=======
++ 	if (priv->hw_offload && dev->netdev_ops->ndo_setup_tc) {
++ 		struct tc_mqprio_qopt_offload mqprio = { { 0 } };
++ 
++ 		switch (priv->mode) {
++ 		case TC_MQPRIO_MODE_DCB:
++ 		case TC_MQPRIO_MODE_CHANNEL:
++ 			dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_MQPRIO,
++ 						      &mqprio);
++ 			break;
++ 		default:
++ 			return;
++ 		}
+++>>>>>>> 4e8b86c06269 (mqprio: Introduce new hardware offload mode and shaper in mqprio)
+  	} else {
+  		netdev_set_num_tc(dev, 0);
+  	}
+@@@ -146,9 -236,32 +243,36 @@@ static int mqprio_init(struct Qdisc *sc
+  	 * supplied and verified mapping
+  	 */
+  	if (qopt->hw) {
+- 		struct tc_mqprio_qopt mqprio = *qopt;
++ 		struct tc_mqprio_qopt_offload mqprio = {.qopt = *qopt};
+  
+++<<<<<<< HEAD
+ +		err = __rh_call_ndo_setup_tc(dev, TC_SETUP_MQPRIO, &mqprio);
+++=======
++ 		switch (priv->mode) {
++ 		case TC_MQPRIO_MODE_DCB:
++ 			if (priv->shaper != TC_MQPRIO_SHAPER_DCB)
++ 				return -EINVAL;
++ 			break;
++ 		case TC_MQPRIO_MODE_CHANNEL:
++ 			mqprio.flags = priv->flags;
++ 			if (priv->flags & TC_MQPRIO_F_MODE)
++ 				mqprio.mode = priv->mode;
++ 			if (priv->flags & TC_MQPRIO_F_SHAPER)
++ 				mqprio.shaper = priv->shaper;
++ 			if (priv->flags & TC_MQPRIO_F_MIN_RATE)
++ 				for (i = 0; i < mqprio.qopt.num_tc; i++)
++ 					mqprio.min_rate[i] = priv->min_rate[i];
++ 			if (priv->flags & TC_MQPRIO_F_MAX_RATE)
++ 				for (i = 0; i < mqprio.qopt.num_tc; i++)
++ 					mqprio.max_rate[i] = priv->max_rate[i];
++ 			break;
++ 		default:
++ 			return -EINVAL;
++ 		}
++ 		err = dev->netdev_ops->ndo_setup_tc(dev,
++ 						    TC_SETUP_MQPRIO,
++ 						    &mqprio);
+++>>>>>>> 4e8b86c06269 (mqprio: Introduce new hardware offload mode and shaper in mqprio)
+  		if (err)
+  			return err;
+  
+* Unmerged path include/net/pkt_cls.h
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index 099bf5528fed..e95b5c9b9fad 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -625,6 +625,22 @@ enum {
+ 
+ #define TC_MQPRIO_HW_OFFLOAD_MAX (__TC_MQPRIO_HW_OFFLOAD_MAX - 1)
+ 
++enum {
++	TC_MQPRIO_MODE_DCB,
++	TC_MQPRIO_MODE_CHANNEL,
++	__TC_MQPRIO_MODE_MAX
++};
++
++#define __TC_MQPRIO_MODE_MAX (__TC_MQPRIO_MODE_MAX - 1)
++
++enum {
++	TC_MQPRIO_SHAPER_DCB,
++	TC_MQPRIO_SHAPER_BW_RATE,	/* Add new shapers below */
++	__TC_MQPRIO_SHAPER_MAX
++};
++
++#define __TC_MQPRIO_SHAPER_MAX (__TC_MQPRIO_SHAPER_MAX - 1)
++
+ struct tc_mqprio_qopt {
+ 	__u8	num_tc;
+ 	__u8	prio_tc_map[TC_QOPT_BITMASK + 1];
+@@ -633,6 +649,22 @@ struct tc_mqprio_qopt {
+ 	__u16	offset[TC_QOPT_MAX_QUEUE];
+ };
+ 
++#define TC_MQPRIO_F_MODE		0x1
++#define TC_MQPRIO_F_SHAPER		0x2
++#define TC_MQPRIO_F_MIN_RATE		0x4
++#define TC_MQPRIO_F_MAX_RATE		0x8
++
++enum {
++	TCA_MQPRIO_UNSPEC,
++	TCA_MQPRIO_MODE,
++	TCA_MQPRIO_SHAPER,
++	TCA_MQPRIO_MIN_RATE64,
++	TCA_MQPRIO_MAX_RATE64,
++	__TCA_MQPRIO_MAX,
++};
++
++#define TCA_MQPRIO_MAX (__TCA_MQPRIO_MAX - 1)
++
+ /* SFB */
+ 
+ enum {
+* Unmerged path net/sched/sch_mqprio.c
