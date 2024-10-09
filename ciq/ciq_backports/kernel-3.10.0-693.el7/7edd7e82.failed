@@ -1,0 +1,150 @@
+console: Move userspace I/O out of console_lock to fix lockdep warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Waiman Long <longman@redhat.com>
+commit 7edd7e82b96bcbcc2f9437449df29fde0f08295e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7edd7e82.failed
+
+When running certain workload on a debug kernel with lockdep turned on,
+a ppc64 kvm guest could sometimes hit the following lockdep warning:
+
+  [ INFO: possible circular locking dependency detected ]
+  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock(&mm->mmap_sem);
+                                lock(console_lock);
+                                lock(&mm->mmap_sem);
+   lock(cpu_hotplug.lock);
+
+  *** DEADLOCK ***
+
+Looking at the console code, the console_lock-->mmap_sem scenario will
+only happen when reading or writing the console unicode map leading to
+a page fault.
+
+To break this circular locking dependency, all the userspace I/O
+operations in consolemap.c are now moved outside of the console_lock
+critical sections so that the mmap_sem won't be acquired when holding
+the console_lock.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 7edd7e82b96bcbcc2f9437449df29fde0f08295e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/vt/consolemap.c
+diff --cc drivers/tty/vt/consolemap.c
+index d0a3e23d2539,71e81406ef71..000000000000
+--- a/drivers/tty/vt/consolemap.c
++++ b/drivers/tty/vt/consolemap.c
+@@@ -535,7 -552,20 +551,23 @@@ int con_set_unimap(struct vc_data *vc, 
+  {
+  	int err = 0, err1, i;
+  	struct uni_pagedir *p, *q;
++ 	struct unipair *unilist, *plist;
++ 
+++<<<<<<< HEAD
+++=======
++ 	if (!ct)
++ 		return 0;
+  
++ 	unilist = kmalloc_array(ct, sizeof(struct unipair), GFP_KERNEL);
++ 	if (!unilist)
++ 		return -ENOMEM;
++ 
++ 	for (i = ct, plist = unilist; i; i--, plist++, list++) {
++ 		__get_user(plist->unicode, &list->unicode);
++ 		__get_user(plist->fontpos, &list->fontpos);
++ 	}
++ 
+++>>>>>>> 7edd7e82b96b (console: Move userspace I/O out of console_lock to fix lockdep warning)
+  	console_lock();
+  
+  	/* Save original vc_unipagdir_loc in case we allocate a new one */
+@@@ -561,10 -581,10 +593,10 @@@
+  		int j, k;
+  		u16 **p1, *p2, l;
+  		
+ -		err1 = con_do_clear_unimap(vc);
+ +		err1 = con_do_clear_unimap(vc, NULL);
+  		if (err1) {
+- 			console_unlock();
+- 			return err1;
++ 			err = err1;
++ 			goto out_unlock;
+  		}
+  		
+  		/*
+@@@ -593,11 -615,11 +625,11 @@@
+  					err1 = con_insert_unipair(q, l, p2[k]);
+  					if (err1) {
+  						p->refcount++;
+ -						*vc->vc_uni_pagedir_loc = p;
+ +						*vc->vc_uni_pagedir_loc = (unsigned long)p;
+  						con_release_unimap(q);
+  						kfree(q);
+- 						console_unlock();
+- 						return err1; 
++ 						err = err1;
++ 						goto out_unlock;
+  					}
+  				}
+  			} else {
+@@@ -745,24 -771,33 +779,46 @@@ int con_get_unimap(struct vc_data *vc, 
+  
+  	ect = 0;
+  	if (*vc->vc_uni_pagedir_loc) {
+++<<<<<<< HEAD
+ +		p = (struct uni_pagedir *)*vc->vc_uni_pagedir_loc;
+ +		for (i = 0; i < 32; i++)
+ +		if ((p1 = p->uni_pgdir[i]))
+ +			for (j = 0; j < 32; j++)
+ +			if ((p2 = *(p1++)))
+ +				for (k = 0; k < 64; k++) {
+ +					if (*p2 < MAX_GLYPH && ect++ < ct) {
+ +						__put_user((u_short)((i<<11)+(j<<6)+k),
+ +							   &list->unicode);
+ +						__put_user((u_short) *p2, 
+ +							   &list->fontpos);
+ +						list++;
+++=======
++ 		p = *vc->vc_uni_pagedir_loc;
++ 		for (i = 0; i < 32; i++) {
++ 		p1 = p->uni_pgdir[i];
++ 		if (p1)
++ 			for (j = 0; j < 32; j++) {
++ 			p2 = *(p1++);
++ 			if (p2)
++ 				for (k = 0; k < 64; k++, p2++) {
++ 					if (*p2 >= MAX_GLYPH)
++ 						continue;
++ 					if (ect < ct) {
++ 						unilist[ect].unicode =
++ 							(i<<11)+(j<<6)+k;
++ 						unilist[ect].fontpos = *p2;
+++>>>>>>> 7edd7e82b96b (console: Move userspace I/O out of console_lock to fix lockdep warning)
+  					}
+- 					p2++;
++ 					ect++;
+  				}
+ -			}
+ -		}
+  	}
+- 	__put_user(ect, uct);
+  	console_unlock();
++ 	for (i = min(ect, ct), plist = unilist; i; i--, list++, plist++) {
++ 		__put_user(plist->unicode, &list->unicode);
++ 		__put_user(plist->fontpos, &list->fontpos);
++ 	}
++ 	__put_user(ect, uct);
++ 	kfree(unilist);
+  	return ((ect <= ct) ? 0 : -ENOMEM);
+  }
+  
+* Unmerged path drivers/tty/vt/consolemap.c
