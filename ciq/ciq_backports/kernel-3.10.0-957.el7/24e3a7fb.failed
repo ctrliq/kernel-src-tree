@@ -1,0 +1,135 @@
+libnvdimm, btt: Fix an incompatibility in the log layout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Vishal Verma <vishal.l.verma@intel.com>
+commit 24e3a7fb60a9187e5df90e5fa655ffc94b9c4f77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/24e3a7fb.failed
+
+Due to a spec misinterpretation, the Linux implementation of the BTT log
+area had different padding scheme from other implementations, such as
+UEFI and NVML.
+
+This fixes the padding scheme, and defaults to it for new BTT layouts.
+We attempt to detect the padding scheme in use when probing for an
+existing BTT. If we detect the older/incompatible scheme, we continue
+using it.
+
+	Reported-by: Juston Li <juston.li@intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: <stable@vger.kernel.org>
+Fixes: 5212e11fde4d ("nd_btt: atomic sector updates")
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 24e3a7fb60a9187e5df90e5fa655ffc94b9c4f77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/btt.c
+diff --cc drivers/nvdimm/btt.c
+index 5d8aab5be8de,c586bcdb5190..000000000000
+--- a/drivers/nvdimm/btt.c
++++ b/drivers/nvdimm/btt.c
+@@@ -758,6 -884,14 +884,17 @@@ static int discover_arenas(struct btt *
+  		arena->external_lba_start = cur_nlba;
+  		parse_arena_meta(arena, super, cur_off);
+  
+++<<<<<<< HEAD
+++=======
++ 		ret = log_set_indices(arena);
++ 		if (ret) {
++ 			dev_err(to_dev(arena),
++ 				"Unable to deduce log/padding indices\n");
++ 			goto out;
++ 		}
++ 
++ 		mutex_init(&arena->err_lock);
+++>>>>>>> 24e3a7fb60a9 (libnvdimm, btt: Fix an incompatibility in the log layout)
+  		ret = btt_freelist_init(arena);
+  		if (ret)
+  			goto out;
+* Unmerged path drivers/nvdimm/btt.c
+diff --git a/drivers/nvdimm/btt.h b/drivers/nvdimm/btt.h
+index 884fbbbdd18a..db3cb6d4d0d4 100644
+--- a/drivers/nvdimm/btt.h
++++ b/drivers/nvdimm/btt.h
+@@ -27,6 +27,7 @@
+ #define MAP_ERR_MASK (1 << MAP_ERR_SHIFT)
+ #define MAP_LBA_MASK (~((1 << MAP_TRIM_SHIFT) | (1 << MAP_ERR_SHIFT)))
+ #define MAP_ENT_NORMAL 0xC0000000
++#define LOG_GRP_SIZE sizeof(struct log_group)
+ #define LOG_ENT_SIZE sizeof(struct log_entry)
+ #define ARENA_MIN_SIZE (1UL << 24)	/* 16 MB */
+ #define ARENA_MAX_SIZE (1ULL << 39)	/* 512 GB */
+@@ -50,12 +51,52 @@ enum btt_init_state {
+ 	INIT_READY
+ };
+ 
++/*
++ * A log group represents one log 'lane', and consists of four log entries.
++ * Two of the four entries are valid entries, and the remaining two are
++ * padding. Due to an old bug in the padding location, we need to perform a
++ * test to determine the padding scheme being used, and use that scheme
++ * thereafter.
++ *
++ * In kernels prior to 4.15, 'log group' would have actual log entries at
++ * indices (0, 2) and padding at indices (1, 3), where as the correct/updated
++ * format has log entries at indices (0, 1) and padding at indices (2, 3).
++ *
++ * Old (pre 4.15) format:
++ * +-----------------+-----------------+
++ * |      ent[0]     |      ent[1]     |
++ * |       16B       |       16B       |
++ * | lba/old/new/seq |       pad       |
++ * +-----------------------------------+
++ * |      ent[2]     |      ent[3]     |
++ * |       16B       |       16B       |
++ * | lba/old/new/seq |       pad       |
++ * +-----------------+-----------------+
++ *
++ * New format:
++ * +-----------------+-----------------+
++ * |      ent[0]     |      ent[1]     |
++ * |       16B       |       16B       |
++ * | lba/old/new/seq | lba/old/new/seq |
++ * +-----------------------------------+
++ * |      ent[2]     |      ent[3]     |
++ * |       16B       |       16B       |
++ * |       pad       |       pad       |
++ * +-----------------+-----------------+
++ *
++ * We detect during start-up which format is in use, and set
++ * arena->log_index[(0, 1)] with the detected format.
++ */
++
+ struct log_entry {
+ 	__le32 lba;
+ 	__le32 old_map;
+ 	__le32 new_map;
+ 	__le32 seq;
+-	__le64 padding[2];
++};
++
++struct log_group {
++	struct log_entry ent[4];
+ };
+ 
+ struct btt_sb {
+@@ -126,6 +167,7 @@ struct aligned_lock {
+  * @debugfs_dir:	Debugfs dentry
+  * @flags:		Arena flags - may signify error states.
+  * @err_lock:		Mutex for synchronizing error clearing.
++ * @log_index:		Indices of the valid log entries in a log_group
+  *
+  * arena_info is a per-arena handle. Once an arena is narrowed down for an
+  * IO, this struct is passed around for the duration of the IO.
+@@ -158,6 +200,7 @@ struct arena_info {
+ 	/* Arena flags */
+ 	u32 flags;
+ 	struct mutex err_lock;
++	int log_index[2];
+ };
+ 
+ /**
