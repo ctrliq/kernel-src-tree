@@ -1083,7 +1083,7 @@ int symbol__tui_annotate(struct symbol *sym, struct map *map,
 			 struct perf_evsel *evsel,
 			 struct hist_browser_timer *hbt)
 {
-	struct disasm_line *pos, *n;
+	struct disasm_line *pos;
 	struct annotation *notes;
 	size_t size;
 	struct map_symbol ms = {
@@ -1179,10 +1179,8 @@ int symbol__tui_annotate(struct symbol *sym, struct map *map,
 	annotate_browser__update_addr_width(&browser);
 
 	ret = annotate_browser__run(&browser, evsel, hbt);
-	list_for_each_entry_safe(pos, n, &notes->src->source, al.node) {
-		list_del(&pos->al.node);
-		disasm_line__free(pos);
-	}
+
+	annotated_source__purge(notes->src);
 
 out_free_offsets:
 	free(browser.offsets);
