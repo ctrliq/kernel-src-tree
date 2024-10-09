@@ -787,7 +787,8 @@ struct mlx5e_priv {
 	struct mlx5e_channel_stats channel_stats[MLX5E_MAX_NUM_CHANNELS];
 	u8                         max_opened_tc;
 	struct hwtstamp_config     tstamp;
-	u16 q_counter;
+	u16                        q_counter;
+	u16                        drop_rq_q_counter;
 #ifdef CONFIG_MLX5_CORE_EN_DCB
 	struct mlx5e_dcbx          dcbx;
 #endif
