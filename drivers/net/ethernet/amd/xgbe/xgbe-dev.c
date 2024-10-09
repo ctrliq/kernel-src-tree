@@ -1376,8 +1376,8 @@ static void xgbe_config_mtl_mode(struct xgbe_prv_data *pdata)
 	XGMAC_IOWRITE_BITS(pdata, MTL_OMR, RAA, MTL_RAA_SP);
 }
 
-static unsigned int xgbe_calculate_per_queue_fifo(unsigned long fifo_size,
-						  unsigned char queue_count)
+static unsigned int xgbe_calculate_per_queue_fifo(unsigned int fifo_size,
+						  unsigned int queue_count)
 {
 	unsigned int q_fifo_size = 0;
 	enum xgbe_mtl_fifo_size p_fifo = XGMAC_MTL_FIFO_SIZE_256;
@@ -1421,6 +1421,10 @@ static unsigned int xgbe_calculate_per_queue_fifo(unsigned long fifo_size,
 		q_fifo_size = XGBE_FIFO_SIZE_KB(256);
 		break;
 	}
+
+	/* The configured value is not the actual amount of fifo RAM */
+	q_fifo_size = min_t(unsigned int, XGBE_FIFO_MAX, q_fifo_size);
+
 	q_fifo_size = q_fifo_size / queue_count;
 
 	/* Set the queue fifo size programmable value */
