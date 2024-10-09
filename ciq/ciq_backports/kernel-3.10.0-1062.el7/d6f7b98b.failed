@@ -1,0 +1,258 @@
+fsnotify: use type id to identify connector object type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit d6f7b98bc8147abd290ead82922f8d83c525fb42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d6f7b98b.failed
+
+An fsnotify_mark_connector is referencing a single type of object
+(either inode or vfsmount). Instead of storing a type mask in
+connector->flags, store a single type id in connector->type to
+identify the type of object.
+
+When a connector object is detached from the object, its type is set
+to FSNOTIFY_OBJ_TYPE_DETACHED and this object is not going to be
+reused.
+
+The function fsnotify_clear_marks_by_group() is the only place where
+type mask was used, so use type flags instead of type id to this
+function.
+
+This change is going to be more convenient when adding a new object
+type (super block).
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit d6f7b98bc8147abd290ead82922f8d83c525fb42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fdinfo.c
+diff --cc fs/notify/fdinfo.c
+index 3b054e0b60bc,10aac1942c9f..000000000000
+--- a/fs/notify/fdinfo.c
++++ b/fs/notify/fdinfo.c
+@@@ -79,10 -76,9 +79,15 @@@ static int inotify_fdinfo(struct seq_fi
+  {
+  	struct inotify_inode_mark *inode_mark;
+  	struct inode *inode;
+ +	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (!(mark->connector->flags & FSNOTIFY_OBJ_TYPE_INODE))
+ +		return 0;
+++=======
++ 	if (mark->connector->type != FSNOTIFY_OBJ_TYPE_INODE)
++ 		return;
+++>>>>>>> d6f7b98bc814 (fsnotify: use type id to identify connector object type)
+  
+  	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
+  	inode = igrab(mark->connector->inode);
+@@@ -125,29 -116,25 +130,29 @@@ static int fanotify_fdinfo(struct seq_f
+  	if (mark->flags & FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY)
+  		mflags |= FAN_MARK_IGNORED_SURV_MODIFY;
+  
+- 	if (mark->connector->flags & FSNOTIFY_OBJ_TYPE_INODE) {
++ 	if (mark->connector->type == FSNOTIFY_OBJ_TYPE_INODE) {
+  		inode = igrab(mark->connector->inode);
+  		if (!inode)
+ -			return;
+ -		seq_printf(m, "fanotify ino:%lx sdev:%x mflags:%x mask:%x ignored_mask:%x ",
+ -			   inode->i_ino, inode->i_sb->s_dev,
+ -			   mflags, mark->mask, mark->ignored_mask);
+ -		show_mark_fhandle(m, inode);
+ -		seq_putc(m, '\n');
+ +			goto out;
+ +		ret = seq_printf(m, "fanotify ino:%lx sdev:%x "
+ +				 "mflags:%x mask:%x ignored_mask:%x ",
+ +				 inode->i_ino, inode->i_sb->s_dev,
+ +				 mflags, mark->mask, mark->ignored_mask);
+ +		ret |= show_mark_fhandle(m, inode);
+ +		ret |= seq_putc(m, '\n');
+  		iput(inode);
+- 	} else if (mark->connector->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
++ 	} else if (mark->connector->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+  		struct mount *mnt = real_mount(mark->connector->mnt);
+  
+ -		seq_printf(m, "fanotify mnt_id:%x mflags:%x mask:%x ignored_mask:%x\n",
+ -			   mnt->mnt_id, mflags, mark->mask, mark->ignored_mask);
+ +		ret = seq_printf(m, "fanotify mnt_id:%x mflags:%x mask:%x "
+ +				 "ignored_mask:%x\n", mnt->mnt_id, mflags,
+ +				 mark->mask, mark->ignored_mask);
+  	}
+ +out:
+ +	return ret;
+  }
+  
+ -void fanotify_show_fdinfo(struct seq_file *m, struct file *f)
+ +int fanotify_show_fdinfo(struct seq_file *m, struct file *f)
+  {
+  	struct fsnotify_group *group = f->private_data;
+  	unsigned int flags = 0;
+* Unmerged path fs/notify/fdinfo.c
+diff --git a/fs/notify/group.c b/fs/notify/group.c
+index 32357534de18..f4bab6a4b7f6 100644
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@ -67,7 +67,7 @@ void fsnotify_destroy_group(struct fsnotify_group *group)
+ 	fsnotify_group_stop_queueing(group);
+ 
+ 	/* Clear all marks for this group and queue them for destruction */
+-	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_ALL_TYPES);
++	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_ALL_TYPES_MASK);
+ 
+ 	/*
+ 	 * Some marks can still be pinned when waiting for response from
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index 258d99087183..f8b99570933a 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -119,9 +119,9 @@ static void __fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ 		if (mark->flags & FSNOTIFY_MARK_FLAG_ATTACHED)
+ 			new_mask |= mark->mask;
+ 	}
+-	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE)
+ 		conn->inode->i_fsnotify_mask = new_mask;
+-	else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++	else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT)
+ 		real_mount(conn->mnt)->mnt_fsnotify_mask = new_mask;
+ }
+ 
+@@ -139,7 +139,7 @@ void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ 	spin_lock(&conn->lock);
+ 	__fsnotify_recalc_mask(conn);
+ 	spin_unlock(&conn->lock);
+-	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE)
+ 		__fsnotify_update_child_dentry_flags(conn->inode);
+ }
+ 
+@@ -166,18 +166,18 @@ static struct inode *fsnotify_detach_connector_from_object(
+ {
+ 	struct inode *inode = NULL;
+ 
+-	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE) {
++	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE) {
+ 		inode = conn->inode;
+ 		rcu_assign_pointer(inode->i_fsnotify_marks, NULL);
+ 		inode->i_fsnotify_mask = 0;
+ 		conn->inode = NULL;
+-		conn->flags &= ~FSNOTIFY_OBJ_TYPE_INODE;
+-	} else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
++		conn->type = FSNOTIFY_OBJ_TYPE_DETACHED;
++	} else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+ 		rcu_assign_pointer(real_mount(conn->mnt)->mnt_fsnotify_marks,
+ 				   NULL);
+ 		real_mount(conn->mnt)->mnt_fsnotify_mask = 0;
+ 		conn->mnt = NULL;
+-		conn->flags &= ~FSNOTIFY_OBJ_TYPE_VFSMOUNT;
++		conn->type = FSNOTIFY_OBJ_TYPE_DETACHED;
+ 	}
+ 
+ 	return inode;
+@@ -442,10 +442,10 @@ static int fsnotify_attach_connector_to_object(
+ 	spin_lock_init(&conn->lock);
+ 	INIT_HLIST_HEAD(&conn->list);
+ 	if (inode) {
+-		conn->flags = FSNOTIFY_OBJ_TYPE_INODE;
++		conn->type = FSNOTIFY_OBJ_TYPE_INODE;
+ 		conn->inode = igrab(inode);
+ 	} else {
+-		conn->flags = FSNOTIFY_OBJ_TYPE_VFSMOUNT;
++		conn->type = FSNOTIFY_OBJ_TYPE_VFSMOUNT;
+ 		conn->mnt = mnt;
+ 	}
+ 	/*
+@@ -479,8 +479,7 @@ static struct fsnotify_mark_connector *fsnotify_grab_connector(
+ 	if (!conn)
+ 		goto out;
+ 	spin_lock(&conn->lock);
+-	if (!(conn->flags & (FSNOTIFY_OBJ_TYPE_INODE |
+-			     FSNOTIFY_OBJ_TYPE_VFSMOUNT))) {
++	if (conn->type == FSNOTIFY_OBJ_TYPE_DETACHED) {
+ 		spin_unlock(&conn->lock);
+ 		srcu_read_unlock(&fsnotify_mark_srcu, idx);
+ 		return NULL;
+@@ -644,16 +643,16 @@ struct fsnotify_mark *fsnotify_find_mark(
+ 	return NULL;
+ }
+ 
+-/* Clear any marks in a group with given type */
++/* Clear any marks in a group with given type mask */
+ void fsnotify_clear_marks_by_group(struct fsnotify_group *group,
+-				   unsigned int type)
++				   unsigned int type_mask)
+ {
+ 	struct fsnotify_mark *lmark, *mark;
+ 	LIST_HEAD(to_free);
+ 	struct list_head *head = &to_free;
+ 
+ 	/* Skip selection step if we want to clear all marks. */
+-	if (type == FSNOTIFY_OBJ_ALL_TYPES) {
++	if (type_mask == FSNOTIFY_OBJ_ALL_TYPES_MASK) {
+ 		head = &group->marks_list;
+ 		goto clear;
+ 	}
+@@ -668,7 +667,7 @@ void fsnotify_clear_marks_by_group(struct fsnotify_group *group,
+ 	 */
+ 	mutex_lock_nested(&group->mark_mutex, SINGLE_DEPTH_NESTING);
+ 	list_for_each_entry_safe(mark, lmark, &group->marks_list, g_list) {
+-		if (mark->connector->flags & type)
++		if ((1U << mark->connector->type) & type_mask)
+ 			list_move(&mark->g_list, &to_free);
+ 	}
+ 	mutex_unlock(&group->mark_mutex);
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index 68286d820069..680d57ec1c40 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -200,6 +200,17 @@ struct fsnotify_group {
+ #define FSNOTIFY_EVENT_PATH	1
+ #define FSNOTIFY_EVENT_INODE	2
+ 
++enum fsnotify_obj_type {
++	FSNOTIFY_OBJ_TYPE_INODE,
++	FSNOTIFY_OBJ_TYPE_VFSMOUNT,
++	FSNOTIFY_OBJ_TYPE_COUNT,
++	FSNOTIFY_OBJ_TYPE_DETACHED = FSNOTIFY_OBJ_TYPE_COUNT
++};
++
++#define FSNOTIFY_OBJ_TYPE_INODE_FL	(1U << FSNOTIFY_OBJ_TYPE_INODE)
++#define FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL	(1U << FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++#define FSNOTIFY_OBJ_ALL_TYPES_MASK	((1U << FSNOTIFY_OBJ_TYPE_COUNT) - 1)
++
+ /*
+  * Inode / vfsmount point to this structure which tracks all marks attached to
+  * the inode / vfsmount. The reference to inode / vfsmount is held by this
+@@ -208,11 +219,7 @@ struct fsnotify_group {
+  */
+ struct fsnotify_mark_connector {
+ 	spinlock_t lock;
+-#define FSNOTIFY_OBJ_TYPE_INODE		0x01
+-#define FSNOTIFY_OBJ_TYPE_VFSMOUNT	0x02
+-#define FSNOTIFY_OBJ_ALL_TYPES		(FSNOTIFY_OBJ_TYPE_INODE | \
+-					 FSNOTIFY_OBJ_TYPE_VFSMOUNT)
+-	unsigned int flags;	/* Type of object [lock] */
++	unsigned int type;	/* Type of object [lock] */
+ 	union {	/* Object pointer [lock] */
+ 		struct inode *inode;
+ 		struct vfsmount *mnt;
+@@ -362,12 +369,12 @@ extern void fsnotify_clear_marks_by_group(struct fsnotify_group *group, unsigned
+ /* run all the marks in a group, and clear all of the vfsmount marks */
+ static inline void fsnotify_clear_vfsmount_marks_by_group(struct fsnotify_group *group)
+ {
+-	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_TYPE_VFSMOUNT);
++	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL);
+ }
+ /* run all the marks in a group, and clear all of the inode marks */
+ static inline void fsnotify_clear_inode_marks_by_group(struct fsnotify_group *group)
+ {
+-	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_TYPE_INODE);
++	fsnotify_clear_marks_by_group(group, FSNOTIFY_OBJ_TYPE_INODE_FL);
+ }
+ extern void fsnotify_get_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_put_mark(struct fsnotify_mark *mark);
