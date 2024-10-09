@@ -1,0 +1,218 @@
+md: set MD_CHANGE_PENDING in a atomic region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] set MD_CHANGE_PENDING in a atomic region (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 95.24%
+commit-author Guoqing Jiang <gqjiang@suse.com>
+commit 85ad1d13ee9b3db00615ea24b031c15e5ba14fd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/85ad1d13.failed
+
+Some code waits for a metadata update by:
+
+1. flagging that it is needed (MD_CHANGE_DEVS or MD_CHANGE_CLEAN)
+2. setting MD_CHANGE_PENDING and waking the management thread
+3. waiting for MD_CHANGE_PENDING to be cleared
+
+If the first two are done without locking, the code in md_update_sb()
+which checks if it needs to repeat might test if an update is needed
+before step 1, then clear MD_CHANGE_PENDING after step 2, resulting
+in the wait returning early.
+
+So make sure all places that set MD_CHANGE_PENDING are atomicial, and
+bit_clear_unless (suggested by Neil) is introduced for the purpose.
+
+	Cc: Martin Kepplinger <martink@posteo.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Cc: <linux-kernel@vger.kernel.org>
+	Reviewed-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Guoqing Jiang <gqjiang@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 85ad1d13ee9b3db00615ea24b031c15e5ba14fd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 493acb72c925,a79462dcd5e1..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -2263,7 -2290,25 +2263,27 @@@ void md_update_sb(struct mddev *mddev, 
+  			set_bit(MD_CHANGE_DEVS, &mddev->flags);
+  		return;
+  	}
+ -
+  repeat:
+++<<<<<<< HEAD
+++=======
++ 	if (mddev_is_clustered(mddev)) {
++ 		if (test_and_clear_bit(MD_CHANGE_DEVS, &mddev->flags))
++ 			force_change = 1;
++ 		if (test_and_clear_bit(MD_CHANGE_CLEAN, &mddev->flags))
++ 			nospares = 1;
++ 		ret = md_cluster_ops->metadata_update_start(mddev);
++ 		/* Has someone else has updated the sb */
++ 		if (!does_sb_need_changing(mddev)) {
++ 			if (ret == 0)
++ 				md_cluster_ops->metadata_update_cancel(mddev);
++ 			bit_clear_unless(&mddev->flags, BIT(MD_CHANGE_PENDING),
++ 							 BIT(MD_CHANGE_DEVS) |
++ 							 BIT(MD_CHANGE_CLEAN));
++ 			return;
++ 		}
++ 	}
++ 
+++>>>>>>> 85ad1d13ee9b (md: set MD_CHANGE_PENDING in a atomic region)
+  	/* First make sure individual recovery_offsets are correct */
+  	rdev_for_each(rdev, mddev) {
+  		if (rdev->raid_disk >= 0 &&
+@@@ -2390,15 -2435,14 +2410,18 @@@
+  	md_super_wait(mddev);
+  	/* if there was a failure, MD_CHANGE_DEVS was set, and we re-write super */
+  
+++<<<<<<< HEAD
+ +	spin_lock(&mddev->lock);
+++=======
++ 	if (mddev_is_clustered(mddev) && ret == 0)
++ 		md_cluster_ops->metadata_update_finish(mddev);
++ 
+++>>>>>>> 85ad1d13ee9b (md: set MD_CHANGE_PENDING in a atomic region)
+  	if (mddev->in_sync != sync_req ||
+- 	    test_bit(MD_CHANGE_DEVS, &mddev->flags)) {
++ 	    !bit_clear_unless(&mddev->flags, BIT(MD_CHANGE_PENDING),
++ 			       BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_CLEAN)))
+  		/* have to write it out again */
+- 		spin_unlock(&mddev->lock);
+  		goto repeat;
+- 	}
+- 	clear_bit(MD_CHANGE_PENDING, &mddev->flags);
+- 	spin_unlock(&mddev->lock);
+  	wake_up(&mddev->sb_wait);
+  	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+  		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+@@@ -7916,7 -8147,18 +7939,22 @@@ void md_do_sync(struct md_thread *threa
+  		}
+  	}
+   skip:
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+++=======
++ 	if (mddev_is_clustered(mddev) &&
++ 	    ret == 0) {
++ 		/* set CHANGE_PENDING here since maybe another
++ 		 * update is needed, so other nodes are informed */
++ 		set_mask_bits(&mddev->flags, 0,
++ 			      BIT(MD_CHANGE_PENDING) | BIT(MD_CHANGE_DEVS));
++ 		md_wakeup_thread(mddev->thread);
++ 		wait_event(mddev->sb_wait,
++ 			   !test_bit(MD_CHANGE_PENDING, &mddev->flags));
++ 		md_cluster_ops->resync_finish(mddev);
++ 	} else
++ 		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+++>>>>>>> 85ad1d13ee9b (md: set MD_CHANGE_PENDING in a atomic region)
+  
+  	spin_lock(&mddev->lock);
+  	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 7b064c521af1..9179f24761fc 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1493,8 +1493,8 @@ static void raid1_error(struct mddev *mddev, struct md_rdev *rdev)
+ 	 * if recovery is running, make sure it aborts.
+ 	 */
+ 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+-	set_bit(MD_CHANGE_PENDING, &mddev->flags);
++	set_mask_bits(&mddev->flags, 0,
++		      BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
+ 	printk(KERN_ALERT
+ 	       "md/raid1:%s: Disk failure on %s, disabling device.\n"
+ 	       "md/raid1:%s: Operation continuing on %d devices.\n",
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 3d7f7d8e4fd0..054fc7fffc43 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1248,8 +1248,8 @@ static void raid10_make_request(struct mddev *mddev, struct bio * bio)
+ 		bio->bi_sector < conf->reshape_progress))) {
+ 		/* Need to update reshape_position in metadata */
+ 		mddev->reshape_position = conf->reshape_progress;
+-		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+-		set_bit(MD_CHANGE_PENDING, &mddev->flags);
++		set_mask_bits(&mddev->flags, 0,
++			      BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
+ 		md_wakeup_thread(mddev->thread);
+ 		wait_event(mddev->sb_wait,
+ 			   !test_bit(MD_CHANGE_PENDING, &mddev->flags));
+@@ -1698,8 +1698,8 @@ static void raid10_error(struct mddev *mddev, struct md_rdev *rdev)
+ 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 	set_bit(Blocked, &rdev->flags);
+ 	set_bit(Faulty, &rdev->flags);
+-	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+-	set_bit(MD_CHANGE_PENDING, &mddev->flags);
++	set_mask_bits(&mddev->flags, 0,
++		      BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
+ 	spin_unlock_irqrestore(&conf->device_lock, flags);
+ 	printk(KERN_ALERT
+ 	       "md/raid10:%s: Disk failure on %s, disabling device.\n"
+diff --git a/drivers/md/raid5-cache.c b/drivers/md/raid5-cache.c
+index 8e8b9d8fa041..a26701af63ae 100644
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -723,8 +723,8 @@ static void r5l_write_super_and_discard_space(struct r5l_log *log,
+ 	 * in_teardown check workaround this issue.
+ 	 */
+ 	if (!log->in_teardown) {
+-		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+-		set_bit(MD_CHANGE_PENDING, &mddev->flags);
++		set_mask_bits(&mddev->flags, 0,
++			      BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
+ 		md_wakeup_thread(mddev->thread);
+ 		wait_event(mddev->sb_wait,
+ 			!test_bit(MD_CHANGE_PENDING, &mddev->flags) ||
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 97708d7511e6..8d3e979426f2 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2516,8 +2516,8 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
+ 
+ 	set_bit(Blocked, &rdev->flags);
+ 	set_bit(Faulty, &rdev->flags);
+-	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+-	set_bit(MD_CHANGE_PENDING, &mddev->flags);
++	set_mask_bits(&mddev->flags, 0,
++		      BIT(MD_CHANGE_DEVS) | BIT(MD_CHANGE_PENDING));
+ 	printk(KERN_ALERT
+ 	       "md/raid:%s: Disk failure on %s, disabling device.\n"
+ 	       "md/raid:%s: Operation continuing on %d devices.\n",
+diff --git a/include/linux/bitops.h b/include/linux/bitops.h
+index db0c9f1ffb9d..9455d74b2846 100644
+--- a/include/linux/bitops.h
++++ b/include/linux/bitops.h
+@@ -245,6 +245,22 @@ static inline unsigned long __ffs64(u64 word)
+ })
+ #endif
+ 
++#ifndef bit_clear_unless
++#define bit_clear_unless(ptr, _clear, _test)	\
++({								\
++	const typeof(*ptr) clear = (_clear), test = (_test);	\
++	typeof(*ptr) old, new;					\
++								\
++	do {							\
++		old = ACCESS_ONCE(*ptr);			\
++		new = old & ~clear;				\
++	} while (!(old & test) &&				\
++		 cmpxchg(ptr, old, new) != old);		\
++								\
++	!(old & test);						\
++})
++#endif
++
+ #ifndef find_last_bit
+ /**
+  * find_last_bit - find the last set bit in a memory region
