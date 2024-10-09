@@ -1,0 +1,274 @@
+vxlan: don't allow overwrite of config src addr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Brian Russell <brussell@brocade.com>
+commit 1158632b5a2dcce0786c1b1b99654e81cc867981
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1158632b.failed
+
+When using IPv6 transport and a default dst, a pointer to the configured
+source address is passed into the route lookup. If no source address is
+configured, then the value is overwritten.
+
+IPv6 route lookup ignores egress ifindex match if the source address is set,
+so if egress ifindex match is desired, the source address must be passed
+as any. The overwrite breaks this for subsequent lookups.
+
+Avoid this by copying the configured address to an existing stack variable
+and pass a pointer to that instead.
+
+Fixes: 272d96a5ab10 ("net: vxlan: lwt: Use source ip address during route lookup.")
+
+	Signed-off-by: Brian Russell <brussell@brocade.com>
+	Acked-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1158632b5a2dcce0786c1b1b99654e81cc867981)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 2de3754e14e0,b7911994112a..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1906,12 -2032,9 +1906,11 @@@ static void vxlan_xmit_one(struct sk_bu
+  	struct dst_cache *dst_cache;
+  	struct ip_tunnel_info *info;
+  	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	const struct iphdr *old_iph = ip_hdr(skb);
+ +	struct sock *sk;
+ +	struct rtable *rt = NULL;
+ +	const struct iphdr *old_iph;
+  	union vxlan_addr *dst;
+  	union vxlan_addr remote_ip, local_ip;
+- 	union vxlan_addr *src;
+  	struct vxlan_metadata _md;
+  	struct vxlan_metadata *md = &_md;
+  	__be16 src_port = 0, dst_port;
+@@@ -1926,11 -2049,34 +1925,16 @@@
+  	info = skb_tunnel_info(skb);
+  
+  	if (rdst) {
+ -		dst = &rdst->remote_ip;
+ -		if (vxlan_addr_any(dst)) {
+ -			if (did_rsc) {
+ -				/* short-circuited back to local bridge */
+ -				vxlan_encap_bypass(skb, vxlan, vxlan, default_vni);
+ -				return;
+ -			}
+ -			goto drop;
+ -		}
+ -
+  		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
+++<<<<<<< HEAD
+ +		vni = rdst->remote_vni;
+ +		dst = &rdst->remote_ip;
+ +		src = &vxlan->cfg.saddr;
+++=======
++ 		vni = (rdst->remote_vni) ? : default_vni;
++ 		local_ip = vxlan->cfg.saddr;
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  		dst_cache = &rdst->dst_cache;
+ -		md->gbp = skb->mark;
+ -		ttl = vxlan->cfg.ttl;
+ -		if (!ttl && vxlan_addr_multicast(dst))
+ -			ttl = 1;
+ -
+ -		tos = vxlan->cfg.tos;
+ -		if (tos == 1)
+ -			tos = ip_tunnel_get_dsfield(old_iph, skb);
+ -
+ -		if (dst->sa.sa_family == AF_INET)
+ -			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM_TX);
+ -		else
+ -			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM6_TX);
+ -		label = vxlan->cfg.label;
+  	} else {
+  		if (!info) {
+  			WARN_ONCE(1, "%s: Missing encapsulation instructions\n",
+@@@ -1948,117 -2092,70 +1952,136 @@@
+  			local_ip.sin6.sin6_addr = info->key.u.ipv6.src;
+  		}
+  		dst = &remote_ip;
+++<<<<<<< HEAD
+ +		src = &local_ip;
+++=======
++ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
++ 		vni = tunnel_id_to_key32(info->key.tun_id);
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  		dst_cache = &info->dst_cache;
+ -		if (info->options_len)
+ -			md = ip_tunnel_info_opts(info);
+ +	}
+ +
+ +	if (vxlan_addr_any(dst)) {
+ +		if (did_rsc) {
+ +			/* short-circuited back to local bridge */
+ +			vxlan_encap_bypass(skb, vxlan, vxlan);
+ +			return;
+ +		}
+ +		goto drop;
+ +	}
+ +
+ +	old_iph = ip_hdr(skb);
+ +
+ +	ttl = vxlan->cfg.ttl;
+ +	if (!ttl && vxlan_addr_multicast(dst))
+ +		ttl = 1;
+ +
+ +	tos = vxlan->cfg.tos;
+ +	if (tos == 1)
+ +		tos = ip_tunnel_get_dsfield(old_iph, skb);
+ +
+ +	label = vxlan->cfg.label;
+ +	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
+ +				     vxlan->cfg.port_max, true);
+ +
+ +	if (info) {
+  		ttl = info->key.ttl;
+  		tos = info->key.tos;
+  		label = info->key.label;
+  		udp_sum = !!(info->key.tun_flags & TUNNEL_CSUM);
+ +
+ +		if (info->options_len)
+ +			md = ip_tunnel_info_opts(info);
+ +	} else {
+ +		md->gbp = skb->mark;
+  	}
+ -	src_port = udp_flow_src_port(dev_net(dev), skb, vxlan->cfg.port_min,
+ -				     vxlan->cfg.port_max, true);
+  
+  	if (dst->sa.sa_family == AF_INET) {
+ -		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
+ -		struct rtable *rt;
+ -		__be16 df = 0;
+ +		if (!vxlan->vn4_sock)
+ +			goto drop;
+ +		sk = vxlan->vn4_sock->sock->sk;
+  
+ -		rt = vxlan_get_route(vxlan, dev, sock4, skb,
+ +		rt = vxlan_get_route(vxlan, skb,
+  				     rdst ? rdst->remote_ifindex : 0, tos,
+  				     dst->sin.sin_addr.s_addr,
+++<<<<<<< HEAD
+ +				     &src->sin.sin_addr.s_addr,
+++=======
++ 				     &local_ip.sin.sin_addr.s_addr,
++ 				     dst_port, src_port,
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  				     dst_cache, info);
+  		if (IS_ERR(rt)) {
+ -			err = PTR_ERR(rt);
+ +			netdev_dbg(dev, "no route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+  		}
+  
+ +		if (rt->dst.dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.collisions++;
+ +			goto rt_tx_error;
+ +		}
+ +
+  		/* Bypass encapsulation if the destination is local */
+ -		if (!info) {
+ -			err = encap_bypass_if_local(skb, dev, vxlan, dst,
+ -						    dst_port, vni, &rt->dst,
+ -						    rt->rt_flags);
+ -			if (err)
+ -				return;
+ -		} else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT) {
+ -			df = htons(IP_DF);
+ +		if (!info && rt->rt_flags & RTCF_LOCAL &&
+ +		    !(rt->rt_flags & (RTCF_BROADCAST | RTCF_MULTICAST))) {
+ +			struct vxlan_dev *dst_vxlan;
+ +
+ +			ip_rt_put(rt);
+ +			dst_vxlan = vxlan_find_vni(vxlan->net, vni,
+ +						   dst->sa.sa_family, dst_port,
+ +						   vxlan->flags);
+ +			if (!dst_vxlan)
+ +				goto tx_error;
+ +			vxlan_encap_bypass(skb, vxlan, dst_vxlan);
+ +			return;
+  		}
+  
+ -		ndst = &rt->dst;
+ +		if (!info)
+ +			udp_sum = !(flags & VXLAN_F_UDP_ZERO_CSUM_TX);
+ +		else if (info->key.tun_flags & TUNNEL_DONT_FRAGMENT)
+ +			df = htons(IP_DF);
+ +
+  		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+  		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ -		err = vxlan_build_skb(skb, ndst, sizeof(struct iphdr),
+ +		err = vxlan_build_skb(skb, &rt->dst, sizeof(struct iphdr),
+  				      vni, md, flags, udp_sum);
+  		if (err < 0)
+ -			goto tx_error;
+ +			goto xmit_tx_error;
+  
+++<<<<<<< HEAD
+ +		udp_tunnel_xmit_skb(rt, sk, skb, src->sin.sin_addr.s_addr,
+++=======
++ 		udp_tunnel_xmit_skb(rt, sock4->sock->sk, skb, local_ip.sin.sin_addr.s_addr,
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  				    dst->sin.sin_addr.s_addr, tos, ttl, df,
+  				    src_port, dst_port, xnet, !udp_sum);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+ -		struct vxlan_sock *sock6 = rcu_dereference(vxlan->vn6_sock);
+ +		struct dst_entry *ndst;
+ +		u32 rt6i_flags;
+  
+ -		ndst = vxlan6_get_route(vxlan, dev, sock6, skb,
+ +		if (!vxlan->vn6_sock)
+ +			goto drop;
+ +		sk = vxlan->vn6_sock->sock->sk;
+ +
+ +		ndst = vxlan6_get_route(vxlan, skb,
+  					rdst ? rdst->remote_ifindex : 0, tos,
+  					label, &dst->sin6.sin6_addr,
+++<<<<<<< HEAD
+ +					&src->sin6.sin6_addr,
+++=======
++ 					&local_ip.sin6.sin6_addr,
++ 					dst_port, src_port,
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  					dst_cache, info);
+  		if (IS_ERR(ndst)) {
+ -			err = PTR_ERR(ndst);
+ -			ndst = NULL;
+ +			netdev_dbg(dev, "no route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+  		}
+  
+@@@ -2094,13 -2174,11 +2117,21 @@@
+  		skb_scrub_packet(skb, xnet);
+  		err = vxlan_build_skb(skb, ndst, sizeof(struct ipv6hdr),
+  				      vni, md, flags, udp_sum);
+++<<<<<<< HEAD
+ +		if (err < 0) {
+ +			dst_release(ndst);
+ +			dev->stats.tx_errors++;
+ +			return;
+ +		}
+ +		udp_tunnel6_xmit_skb(ndst, sk, skb, dev,
+ +				     &src->sin6.sin6_addr,
+++=======
++ 		if (err < 0)
++ 			goto tx_error;
++ 
++ 		udp_tunnel6_xmit_skb(ndst, sock6->sock->sk, skb, dev,
++ 				     &local_ip.sin6.sin6_addr,
+++>>>>>>> 1158632b5a2d (vxlan: don't allow overwrite of config src addr)
+  				     &dst->sin6.sin6_addr, tos, ttl,
+  				     label, src_port, dst_port, !udp_sum);
+  #endif
+* Unmerged path drivers/net/vxlan.c
