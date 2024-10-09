@@ -1,0 +1,258 @@
+ovl: use inode_insert5() to hash a newly created inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 01b39dcc95680b04c7af5de7f39f577e9c4865e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/01b39dcc.failed
+
+Currently, there is a small window where ovl_obtain_alias() can
+race with ovl_instantiate() and create two different overlay inodes
+with the same underlying real non-dir non-hardlink inode.
+
+The race requires an adversary to guess the file handle of the
+yet to be created upper inode and decode the guessed file handle
+after ovl_creat_real(), but before ovl_instantiate().
+This race does not affect overlay directory inodes, because those
+are decoded via ovl_lookup_real() and not with ovl_obtain_alias().
+
+This patch fixes the race, by using inode_insert5() to add a newly
+created inode to cache.
+
+If the newly created inode apears to already exist in cache (hashed
+by the same real upper inode), we instantiate the dentry with the old
+inode and drop the new inode, instead of silently not hashing the new
+inode.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 01b39dcc95680b04c7af5de7f39f577e9c4865e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/overlayfs.h
+diff --cc fs/overlayfs/dir.c
+index f6a29de3ac88,f480b1a2cd2e..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -238,13 -315,17 +268,24 @@@ static int ovl_create_upper(struct dent
+  		ovl_set_opaque(dentry, newdentry);
+  	}
+  
+++<<<<<<< HEAD
+ +	ovl_instantiate(dentry, inode, newdentry, !!hardlink);
+ +	newdentry = NULL;
+ +out_dput:
+ +	dput(newdentry);
+++=======
++ 	err = ovl_instantiate(dentry, inode, newdentry, !!attr->hardlink);
++ 	if (err)
++ 		goto out_cleanup;
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  out_unlock:
+ -	inode_unlock(udir);
+ +	mutex_unlock(&udir->i_mutex);
+  	return err;
++ 
++ out_cleanup:
++ 	ovl_cleanup(udir, newdentry);
++ 	dput(newdentry);
++ 	goto out_unlock;
+  }
+  
+  static struct dentry *ovl_clear_empty(struct dentry *dentry,
+@@@ -482,12 -510,11 +523,19 @@@ static int ovl_create_over_whiteout(str
+  		if (err)
+  			goto out_cleanup;
+  	}
+++<<<<<<< HEAD
+ +	ovl_instantiate(dentry, inode, newdentry, !!hardlink);
+ +	newdentry = NULL;
+ +out_dput2:
+++=======
++ 	err = ovl_instantiate(dentry, inode, newdentry, hardlink);
++ 	if (err)
++ 		goto out_cleanup;
++ out_dput:
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  	dput(upper);
+ +out_dput:
+ +	dput(newdentry);
+  out_unlock:
+  	unlock_rename(workdir, upperdir);
+  out:
+@@@ -582,8 -604,9 +631,14 @@@ static int ovl_create_object(struct den
+  	inode_init_owner(inode, dentry->d_parent->d_inode, mode);
+  	attr.mode = inode->i_mode;
+  
+++<<<<<<< HEAD
+ +	err = ovl_create_or_link(dentry, inode, &attr, NULL, false);
+ +	if (err)
+++=======
++ 	err = ovl_create_or_link(dentry, inode, &attr, false);
++ 	/* Did we end up using the preallocated inode? */
++ 	if (inode != d_inode(dentry))
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  		iput(inode);
+  
+  out_drop_write:
+diff --cc fs/overlayfs/inode.c
+index 24ce49ae057f,1db5b3b458a1..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -690,16 -698,77 +690,59 @@@ static bool ovl_verify_inode(struct ino
+  	return true;
+  }
+  
+ -struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
+ -			       bool is_upper)
+ -{
+ -	struct inode *inode, *key = d_inode(real);
+ -
+ -	inode = ilookup5(sb, (unsigned long) key, ovl_inode_test, key);
+ -	if (!inode)
+ -		return NULL;
+ -
+ -	if (!ovl_verify_inode(inode, is_upper ? NULL : real,
+ -			      is_upper ? real : NULL, false)) {
+ -		iput(inode);
+ -		return ERR_PTR(-ESTALE);
+ -	}
+ -
+ -	return inode;
+ -}
+ -
+ -/*
+ - * Does overlay inode need to be hashed by lower inode?
+ - */
+ -static bool ovl_hash_bylower(struct super_block *sb, struct dentry *upper,
+ -			     struct dentry *lower, struct dentry *index)
+ +struct inode *ovl_get_inode(struct super_block *sb, struct dentry *upperdentry,
+ +			    struct dentry *lowerdentry, struct dentry *index,
+ +			    unsigned int numlower)
+  {
+  	struct ovl_fs *ofs = sb->s_fs_info;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* No, if pure upper */
++ 	if (!lower)
++ 		return false;
++ 
++ 	/* Yes, if already indexed */
++ 	if (index)
++ 		return true;
++ 
++ 	/* Yes, if won't be copied up */
++ 	if (!ofs->upper_mnt)
++ 		return true;
++ 
++ 	/* No, if lower hardlink is or will be broken on copy up */
++ 	if ((upper || !ovl_indexdir(sb)) &&
++ 	    !d_is_dir(lower) && d_inode(lower)->i_nlink > 1)
++ 		return false;
++ 
++ 	/* No, if non-indexed upper with NFS export */
++ 	if (sb->s_export_op && upper)
++ 		return false;
++ 
++ 	/* Otherwise, hash by lower inode for fsnotify */
++ 	return true;
++ }
++ 
++ static struct inode *ovl_iget5(struct super_block *sb, struct inode *newinode,
++ 			       struct inode *key)
++ {
++ 	return newinode ? inode_insert5(newinode, (unsigned long) key,
++ 					 ovl_inode_test, ovl_inode_set, key) :
++ 			  iget5_locked(sb, (unsigned long) key,
++ 				       ovl_inode_test, ovl_inode_set, key);
++ }
++ 
++ struct inode *ovl_get_inode(struct super_block *sb,
++ 			    struct ovl_inode_params *oip)
++ {
++ 	struct dentry *upperdentry = oip->upperdentry;
++ 	struct ovl_path *lowerpath = oip->lowerpath;
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  	struct inode *realinode = upperdentry ? d_inode(upperdentry) : NULL;
+  	struct inode *inode;
+ -	struct dentry *lowerdentry = lowerpath ? lowerpath->dentry : NULL;
+ -	bool bylower = ovl_hash_bylower(sb, upperdentry, lowerdentry,
+ -					oip->index);
+ -	int fsid = bylower ? oip->lowerpath->layer->fsid : 0;
+ +	/* Already indexed or could be indexed on copy up? */
+ +	bool indexed = (index || (ovl_indexdir(sb) && !upperdentry));
+ +	struct dentry *origin = indexed ? lowerdentry : NULL;
+  	bool is_dir;
+  	unsigned long ino = 0;
+  
+@@@ -710,23 -776,16 +753,27 @@@
+  		realinode = d_inode(lowerdentry);
+  
+  	/*
+ -	 * Copy up origin (lower) may exist for non-indexed upper, but we must
+ -	 * not use lower as hash key if this is a broken hardlink.
+ +	 * Copy up origin (lower) may exist for non-indexed non-dir upper, but
+ +	 * we must not use lower as hash key in that case.
+ +	 * Hash non-dir that is or could be indexed by origin inode.
+ +	 * Hash dir that is or could be merged by origin inode.
+ +	 * Hash pure upper and non-indexed non-dir by upper inode.
+ +	 * Hash non-indexed dir by upper inode for NFS export.
+  	 */
+  	is_dir = S_ISDIR(realinode->i_mode);
+ -	if (upperdentry || bylower) {
+ -		struct inode *key = d_inode(bylower ? lowerdentry :
+ -						      upperdentry);
+ +	if (is_dir && (indexed || !sb->s_export_op || !ofs->upper_mnt))
+ +		origin = lowerdentry;
+ +
+ +	if (upperdentry || origin) {
+ +		struct inode *key = d_inode(origin ?: upperdentry);
+  		unsigned int nlink = is_dir ? 1 : realinode->i_nlink;
+  
+++<<<<<<< HEAD
+ +		inode = iget5_locked(sb, (unsigned long) key,
+ +				     ovl_inode_test, ovl_inode_set, key);
+++=======
++ 		inode = ovl_iget5(sb, oip->newinode, key);
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  		if (!inode)
+  			goto out_nomem;
+  		if (!(inode->i_state & I_NEW)) {
+diff --cc fs/overlayfs/overlayfs.h
+index 403c48960f89,3c5e9f18b0d9..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -288,10 -328,18 +288,20 @@@ int ovl_open_maybe_copy_up(struct dentr
+  int ovl_update_time(struct inode *inode, struct timespec *ts, int flags);
+  bool ovl_is_private_xattr(const char *name);
+  
+++<<<<<<< HEAD
+++=======
++ struct ovl_inode_params {
++ 	struct inode *newinode;
++ 	struct dentry *upperdentry;
++ 	struct ovl_path *lowerpath;
++ 	struct dentry *index;
++ 	unsigned int numlower;
++ };
+++>>>>>>> 01b39dcc9568 (ovl: use inode_insert5() to hash a newly created inode)
+  struct inode *ovl_new_inode(struct super_block *sb, umode_t mode, dev_t rdev);
+ -struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
+ -			       bool is_upper);
+ -struct inode *ovl_get_inode(struct super_block *sb,
+ -			    struct ovl_inode_params *oip);
+ +struct inode *ovl_get_inode(struct super_block *sb, struct dentry *upperdentry,
+ +			    struct dentry *lowerdentry, struct dentry *index,
+ +			    unsigned int numlower);
+  static inline void ovl_copyattr(struct inode *from, struct inode *to)
+  {
+  	to->i_uid = from->i_uid;
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/overlayfs.h
