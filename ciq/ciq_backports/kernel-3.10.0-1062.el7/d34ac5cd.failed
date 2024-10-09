@@ -1,0 +1,1446 @@
+RDMA, core and ULPs: Declare ib_post_send() and ib_post_recv() arguments const
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [rdma] core and ulps: Declare ib_post_send() and ib_post_recv() arguments const (Kamal Heib) [1655920]
+Rebuild_FUZZ: 96.00%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit d34ac5cd3a73aacd11009c4fc3ba15d7ea62c411
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d34ac5cd.failed
+
+Since neither ib_post_send() nor ib_post_recv() modify the data structure
+their second argument points at, declare that argument const. This change
+makes it necessary to declare the 'bad_wr' argument const too and also to
+modify all ULPs that call ib_post_send(), ib_post_recv() or
+ib_post_srq_recv(). This patch does not change any functionality but makes
+it possible for the compiler to verify whether the
+ib_post_(send|recv|srq_recv) really do not modify the posted work request.
+
+To make this possible, only one cast had to be introduce that casts away
+constness, namely in rpcrdma_post_recvs(). The only way I can think of to
+avoid that cast is to introduce an additional loop in that function or to
+change the data type of bad_wr from struct ib_recv_wr ** into int
+(an index that refers to an element in the work request list). However,
+both approaches would require even more extensive changes than this
+patch.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit d34ac5cd3a73aacd11009c4fc3ba15d7ea62c411)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/qp.c
+#	drivers/infiniband/hw/hns/hns_roce_device.h
+#	drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+#	drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+diff --cc drivers/infiniband/hw/cxgb4/qp.c
+index 4106eed1b8fb,62e2c0d899f5..000000000000
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@@ -605,8 -634,22 +605,25 @@@ static int build_rdma_recv(struct c4iw_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int build_srq_recv(union t4_recv_wr *wqe, const struct ib_recv_wr *wr,
++ 			  u8 *len16)
++ {
++ 	int ret;
++ 
++ 	ret = build_isgl((__be64 *)wqe, (__be64 *)(wqe + 1),
++ 			 &wqe->recv.isgl, wr->sg_list, wr->num_sge, NULL);
++ 	if (ret)
++ 		return ret;
++ 	*len16 = DIV_ROUND_UP(sizeof(wqe->recv) +
++ 			      wr->num_sge * sizeof(struct fw_ri_sge), 16);
++ 	return 0;
++ }
++ 
+++>>>>>>> d34ac5cd3a73 (RDMA, core and ULPs: Declare ib_post_send() and ib_post_recv() arguments const)
+  static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
+ -			      const struct ib_reg_wr *wr, struct c4iw_mr *mhp,
+ +			      struct ib_reg_wr *wr, struct c4iw_mr *mhp,
+  			      u8 *len16)
+  {
+  	__be64 *p = (__be64 *)fr->pbl;
+@@@ -1145,6 -1193,89 +1165,92 @@@ int c4iw_post_receive(struct ib_qp *ibq
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void defer_srq_wr(struct t4_srq *srq, union t4_recv_wr *wqe,
++ 			 u64 wr_id, u8 len16)
++ {
++ 	struct t4_srq_pending_wr *pwr = &srq->pending_wrs[srq->pending_pidx];
++ 
++ 	pr_debug("%s cidx %u pidx %u wq_pidx %u in_use %u ooo_count %u wr_id 0x%llx pending_cidx %u pending_pidx %u pending_in_use %u\n",
++ 		 __func__, srq->cidx, srq->pidx, srq->wq_pidx,
++ 		 srq->in_use, srq->ooo_count,
++ 		 (unsigned long long)wr_id, srq->pending_cidx,
++ 		 srq->pending_pidx, srq->pending_in_use);
++ 	pwr->wr_id = wr_id;
++ 	pwr->len16 = len16;
++ 	memcpy(&pwr->wqe, wqe, len16 * 16);
++ 	t4_srq_produce_pending_wr(srq);
++ }
++ 
++ int c4iw_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++ 		       const struct ib_recv_wr **bad_wr)
++ {
++ 	union t4_recv_wr *wqe, lwqe;
++ 	struct c4iw_srq *srq;
++ 	unsigned long flag;
++ 	u8 len16 = 0;
++ 	u16 idx = 0;
++ 	int err = 0;
++ 	u32 num_wrs;
++ 
++ 	srq = to_c4iw_srq(ibsrq);
++ 	spin_lock_irqsave(&srq->lock, flag);
++ 	num_wrs = t4_srq_avail(&srq->wq);
++ 	if (num_wrs == 0) {
++ 		spin_unlock_irqrestore(&srq->lock, flag);
++ 		return -ENOMEM;
++ 	}
++ 	while (wr) {
++ 		if (wr->num_sge > T4_MAX_RECV_SGE) {
++ 			err = -EINVAL;
++ 			*bad_wr = wr;
++ 			break;
++ 		}
++ 		wqe = &lwqe;
++ 		if (num_wrs)
++ 			err = build_srq_recv(wqe, wr, &len16);
++ 		else
++ 			err = -ENOMEM;
++ 		if (err) {
++ 			*bad_wr = wr;
++ 			break;
++ 		}
++ 
++ 		wqe->recv.opcode = FW_RI_RECV_WR;
++ 		wqe->recv.r1 = 0;
++ 		wqe->recv.wrid = srq->wq.pidx;
++ 		wqe->recv.r2[0] = 0;
++ 		wqe->recv.r2[1] = 0;
++ 		wqe->recv.r2[2] = 0;
++ 		wqe->recv.len16 = len16;
++ 
++ 		if (srq->wq.ooo_count ||
++ 		    srq->wq.pending_in_use ||
++ 		    srq->wq.sw_rq[srq->wq.pidx].valid) {
++ 			defer_srq_wr(&srq->wq, wqe, wr->wr_id, len16);
++ 		} else {
++ 			srq->wq.sw_rq[srq->wq.pidx].wr_id = wr->wr_id;
++ 			srq->wq.sw_rq[srq->wq.pidx].valid = 1;
++ 			c4iw_copy_wr_to_srq(&srq->wq, wqe, len16);
++ 			pr_debug("%s cidx %u pidx %u wq_pidx %u in_use %u wr_id 0x%llx\n",
++ 				 __func__, srq->wq.cidx,
++ 				 srq->wq.pidx, srq->wq.wq_pidx,
++ 				 srq->wq.in_use,
++ 				 (unsigned long long)wr->wr_id);
++ 			t4_srq_produce(&srq->wq, len16);
++ 			idx += DIV_ROUND_UP(len16 * 16, T4_EQ_ENTRY_SIZE);
++ 		}
++ 		wr = wr->next;
++ 		num_wrs--;
++ 	}
++ 	if (idx)
++ 		t4_ring_srq_db(&srq->wq, idx, len16, wqe);
++ 	spin_unlock_irqrestore(&srq->lock, flag);
++ 	return err;
++ }
++ 
+++>>>>>>> d34ac5cd3a73 (RDMA, core and ULPs: Declare ib_post_send() and ib_post_recv() arguments const)
+  static inline void build_term_codes(struct t4_cqe *err_cqe, u8 *layer_type,
+  				    u8 *ecode)
+  {
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_device.h
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index f1558e6f86c4..cd44d19eec16 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -2180,7 +2180,8 @@ ssize_t ib_uverbs_post_send(struct ib_uverbs_file *file,
+ 	struct ib_uverbs_post_send      cmd;
+ 	struct ib_uverbs_post_send_resp resp;
+ 	struct ib_uverbs_send_wr       *user_wr;
+-	struct ib_send_wr              *wr = NULL, *last, *next, *bad_wr;
++	struct ib_send_wr              *wr = NULL, *last, *next;
++	const struct ib_send_wr	       *bad_wr;
+ 	struct ib_qp                   *qp;
+ 	int                             i, sg_ind;
+ 	int				is_ud;
+@@ -2459,7 +2460,8 @@ ssize_t ib_uverbs_post_recv(struct ib_uverbs_file *file,
+ {
+ 	struct ib_uverbs_post_recv      cmd;
+ 	struct ib_uverbs_post_recv_resp resp;
+-	struct ib_recv_wr              *wr, *next, *bad_wr;
++	struct ib_recv_wr              *wr, *next;
++	const struct ib_recv_wr	       *bad_wr;
+ 	struct ib_qp                   *qp;
+ 	ssize_t                         ret = -EINVAL;
+ 
+@@ -2508,7 +2510,8 @@ ssize_t ib_uverbs_post_srq_recv(struct ib_uverbs_file *file,
+ {
+ 	struct ib_uverbs_post_srq_recv      cmd;
+ 	struct ib_uverbs_post_srq_recv_resp resp;
+-	struct ib_recv_wr                  *wr, *next, *bad_wr;
++	struct ib_recv_wr                  *wr, *next;
++	const struct ib_recv_wr		   *bad_wr;
+ 	struct ib_srq                      *srq;
+ 	ssize_t                             ret = -EINVAL;
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 8301d7e5fa8c..3d10acd8e4db 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -1533,8 +1533,8 @@ int bnxt_re_query_srq(struct ib_srq *ib_srq, struct ib_srq_attr *srq_attr)
+ 	return 0;
+ }
+ 
+-int bnxt_re_post_srq_recv(struct ib_srq *ib_srq, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr)
++int bnxt_re_post_srq_recv(struct ib_srq *ib_srq, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr)
+ {
+ 	struct bnxt_re_srq *srq = container_of(ib_srq, struct bnxt_re_srq,
+ 					       ib_srq);
+@@ -2084,7 +2084,7 @@ static int bnxt_re_build_qp1_send_v2(struct bnxt_re_qp *qp,
+  * and the MAD datagram out to the provided SGE.
+  */
+ static int bnxt_re_build_qp1_shadow_qp_recv(struct bnxt_re_qp *qp,
+-					    struct ib_recv_wr *wr,
++					    const struct ib_recv_wr *wr,
+ 					    struct bnxt_qplib_swqe *wqe,
+ 					    int payload_size)
+ {
+@@ -2397,8 +2397,8 @@ bad:
+ 	return rc;
+ }
+ 
+-int bnxt_re_post_send(struct ib_qp *ib_qp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr)
++int bnxt_re_post_send(struct ib_qp *ib_qp, const struct ib_send_wr *wr,
++		      const struct ib_send_wr **bad_wr)
+ {
+ 	struct bnxt_re_qp *qp = container_of(ib_qp, struct bnxt_re_qp, ib_qp);
+ 	struct bnxt_qplib_swqe wqe;
+@@ -2497,7 +2497,7 @@ bad:
+ 
+ static int bnxt_re_post_recv_shadow_qp(struct bnxt_re_dev *rdev,
+ 				       struct bnxt_re_qp *qp,
+-				       struct ib_recv_wr *wr)
++				       const struct ib_recv_wr *wr)
+ {
+ 	struct bnxt_qplib_swqe wqe;
+ 	int rc = 0;
+@@ -2530,8 +2530,8 @@ static int bnxt_re_post_recv_shadow_qp(struct bnxt_re_dev *rdev,
+ 	return rc;
+ }
+ 
+-int bnxt_re_post_recv(struct ib_qp *ib_qp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr)
++int bnxt_re_post_recv(struct ib_qp *ib_qp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr)
+ {
+ 	struct bnxt_re_qp *qp = container_of(ib_qp, struct bnxt_re_qp, ib_qp);
+ 	struct bnxt_qplib_swqe wqe;
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.h b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+index e62b7c2c7da6..a0bb8cd37263 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.h
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+@@ -184,8 +184,8 @@ int bnxt_re_modify_srq(struct ib_srq *srq, struct ib_srq_attr *srq_attr,
+ 		       struct ib_udata *udata);
+ int bnxt_re_query_srq(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
+ int bnxt_re_destroy_srq(struct ib_srq *srq);
+-int bnxt_re_post_srq_recv(struct ib_srq *srq, struct ib_recv_wr *recv_wr,
+-			  struct ib_recv_wr **bad_recv_wr);
++int bnxt_re_post_srq_recv(struct ib_srq *srq, const struct ib_recv_wr *recv_wr,
++			  const struct ib_recv_wr **bad_recv_wr);
+ struct ib_qp *bnxt_re_create_qp(struct ib_pd *pd,
+ 				struct ib_qp_init_attr *qp_init_attr,
+ 				struct ib_udata *udata);
+@@ -194,10 +194,10 @@ int bnxt_re_modify_qp(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
+ int bnxt_re_query_qp(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
+ 		     int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr);
+ int bnxt_re_destroy_qp(struct ib_qp *qp);
+-int bnxt_re_post_send(struct ib_qp *qp, struct ib_send_wr *send_wr,
+-		      struct ib_send_wr **bad_send_wr);
+-int bnxt_re_post_recv(struct ib_qp *qp, struct ib_recv_wr *recv_wr,
+-		      struct ib_recv_wr **bad_recv_wr);
++int bnxt_re_post_send(struct ib_qp *qp, const struct ib_send_wr *send_wr,
++		      const struct ib_send_wr **bad_send_wr);
++int bnxt_re_post_recv(struct ib_qp *qp, const struct ib_recv_wr *recv_wr,
++		      const struct ib_recv_wr **bad_recv_wr);
+ struct ib_cq *bnxt_re_create_cq(struct ib_device *ibdev,
+ 				const struct ib_cq_init_attr *attr,
+ 				struct ib_ucontext *context,
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.h b/drivers/infiniband/hw/cxgb3/iwch_provider.h
+index 9e216edec4c0..84b2459b1a2f 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.h
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.h
+@@ -327,10 +327,10 @@ enum iwch_qp_query_flags {
+ };
+ 
+ u16 iwch_rqes_posted(struct iwch_qp *qhp);
+-int iwch_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr);
+-int iwch_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr);
++int iwch_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		   const struct ib_send_wr **bad_wr);
++int iwch_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr);
+ int iwch_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc);
+ int iwch_post_terminate(struct iwch_qp *qhp, struct respQ_msg_t *rsp_msg);
+ int iwch_post_zb_read(struct iwch_ep *ep);
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_qp.c b/drivers/infiniband/hw/cxgb3/iwch_qp.c
+index ba6d5d281b03..83a26e19b4b7 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_qp.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_qp.c
+@@ -246,7 +246,7 @@ static int iwch_sgl2pbl_map(struct iwch_dev *rhp, struct ib_sge *sg_list,
+ }
+ 
+ static int build_rdma_recv(struct iwch_qp *qhp, union t3_wr *wqe,
+-				struct ib_recv_wr *wr)
++			   const struct ib_recv_wr *wr)
+ {
+ 	int i, err = 0;
+ 	u32 pbl_addr[T3_MAX_SGE];
+@@ -286,7 +286,7 @@ static int build_rdma_recv(struct iwch_qp *qhp, union t3_wr *wqe,
+ }
+ 
+ static int build_zero_stag_recv(struct iwch_qp *qhp, union t3_wr *wqe,
+-				struct ib_recv_wr *wr)
++				const struct ib_recv_wr *wr)
+ {
+ 	int i;
+ 	u32 pbl_addr;
+@@ -348,8 +348,8 @@ static int build_zero_stag_recv(struct iwch_qp *qhp, union t3_wr *wqe,
+ 	return 0;
+ }
+ 
+-int iwch_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr)
++int iwch_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		   const struct ib_send_wr **bad_wr)
+ {
+ 	int err = 0;
+ 	u8 uninitialized_var(t3_wr_flit_cnt);
+@@ -463,8 +463,8 @@ out:
+ 	return err;
+ }
+ 
+-int iwch_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr)
++int iwch_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr)
+ {
+ 	int err = 0;
+ 	struct iwch_qp *qhp;
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index d6c215c77581..67ef04552ee0 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -1032,10 +1032,10 @@ void c4iw_release_dev_ucontext(struct c4iw_rdev *rdev,
+ void c4iw_init_dev_ucontext(struct c4iw_rdev *rdev,
+ 			    struct c4iw_dev_ucontext *uctx);
+ int c4iw_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc);
+-int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr);
+-int c4iw_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr);
++int c4iw_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		   const struct ib_send_wr **bad_wr);
++int c4iw_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr);
+ int c4iw_connect(struct iw_cm_id *cm_id, struct iw_cm_conn_param *conn_param);
+ int c4iw_create_listen(struct iw_cm_id *cm_id, int backlog);
+ int c4iw_destroy_listen(struct iw_cm_id *cm_id);
+@@ -1118,8 +1118,8 @@ void c4iw_invalidate_mr(struct c4iw_dev *rhp, u32 rkey);
+ void c4iw_dispatch_srq_limit_reached_event(struct c4iw_srq *srq);
+ void c4iw_copy_wr_to_srq(struct t4_srq *srq, union t4_recv_wr *wqe, u8 len16);
+ void c4iw_flush_srqidx(struct c4iw_qp *qhp, u32 srqidx);
+-int c4iw_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-		       struct ib_recv_wr **bad_wr);
++int c4iw_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_wr);
+ struct c4iw_wr_wait *c4iw_alloc_wr_wait(gfp_t gfp);
+ 
+ #endif
+* Unmerged path drivers/infiniband/hw/cxgb4/qp.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_device.h
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 744f55eeb57b..75379db7007e 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -2191,8 +2191,8 @@ static void i40iw_copy_sg_list(struct i40iw_sge *sg_list, struct ib_sge *sgl, in
+  * @bad_wr: return of bad wr if err
+  */
+ static int i40iw_post_send(struct ib_qp *ibqp,
+-			   struct ib_send_wr *ib_wr,
+-			   struct ib_send_wr **bad_wr)
++			   const struct ib_send_wr *ib_wr,
++			   const struct ib_send_wr **bad_wr)
+ {
+ 	struct i40iw_qp *iwqp;
+ 	struct i40iw_qp_uk *ukqp;
+@@ -2367,9 +2367,8 @@ out:
+  * @ib_wr: work request for receive
+  * @bad_wr: bad wr caused an error
+  */
+-static int i40iw_post_recv(struct ib_qp *ibqp,
+-			   struct ib_recv_wr *ib_wr,
+-			   struct ib_recv_wr **bad_wr)
++static int i40iw_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *ib_wr,
++			   const struct ib_recv_wr **bad_wr)
+ {
+ 	struct i40iw_qp *iwqp;
+ 	struct i40iw_qp_uk *ukqp;
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 0793a21d76f4..f66647c6cc09 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -506,7 +506,7 @@ int mlx4_ib_send_to_slave(struct mlx4_ib_dev *dev, int slave, u8 port,
+ {
+ 	struct ib_sge list;
+ 	struct ib_ud_wr wr;
+-	struct ib_send_wr *bad_wr;
++	const struct ib_send_wr *bad_wr;
+ 	struct mlx4_ib_demux_pv_ctx *tun_ctx;
+ 	struct mlx4_ib_demux_pv_qp *tun_qp;
+ 	struct mlx4_rcv_tunnel_mad *tun_mad;
+@@ -1310,7 +1310,8 @@ static int mlx4_ib_post_pv_qp_buf(struct mlx4_ib_demux_pv_ctx *ctx,
+ 				  int index)
+ {
+ 	struct ib_sge sg_list;
+-	struct ib_recv_wr recv_wr, *bad_recv_wr;
++	struct ib_recv_wr recv_wr;
++	const struct ib_recv_wr *bad_recv_wr;
+ 	int size;
+ 
+ 	size = (tun_qp->qp->qp_type == IB_QPT_UD) ?
+@@ -1361,7 +1362,7 @@ int mlx4_ib_send_to_wire(struct mlx4_ib_dev *dev, int slave, u8 port,
+ {
+ 	struct ib_sge list;
+ 	struct ib_ud_wr wr;
+-	struct ib_send_wr *bad_wr;
++	const struct ib_send_wr *bad_wr;
+ 	struct mlx4_ib_demux_pv_ctx *sqp_ctx;
+ 	struct mlx4_ib_demux_pv_qp *sqp;
+ 	struct mlx4_mad_snd_buf *sqp_mad;
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 4a4bbfdec0d8..53bb091c531e 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -770,8 +770,8 @@ int mlx4_ib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ int mlx4_ib_query_srq(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
+ int mlx4_ib_destroy_srq(struct ib_srq *srq);
+ void mlx4_ib_free_srq_wqe(struct mlx4_ib_srq *srq, int wqe_index);
+-int mlx4_ib_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr);
++int mlx4_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr);
+ 
+ struct ib_qp *mlx4_ib_create_qp(struct ib_pd *pd,
+ 				struct ib_qp_init_attr *init_attr,
+@@ -783,10 +783,10 @@ int mlx4_ib_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		      int attr_mask, struct ib_udata *udata);
+ int mlx4_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr_mask,
+ 		     struct ib_qp_init_attr *qp_init_attr);
+-int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr);
+-int mlx4_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr);
++int mlx4_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		      const struct ib_send_wr **bad_wr);
++int mlx4_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr);
+ 
+ int mlx4_MAD_IFC(struct mlx4_ib_dev *dev, int mad_ifc_flags,
+ 		 int port, const struct ib_wc *in_wc, const struct ib_grh *in_grh,
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 6c569c852f88..3cd564f67a8e 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -3566,8 +3566,8 @@ static void add_zero_len_inline(void *wqe)
+ 	inl->byte_count = cpu_to_be32(1 << 31);
+ }
+ 
+-static int _mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			      struct ib_send_wr **bad_wr, bool drain)
++static int _mlx4_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			      const struct ib_send_wr **bad_wr, bool drain)
+ {
+ 	struct mlx4_ib_qp *qp = to_mqp(ibqp);
+ 	void *wqe;
+@@ -3898,14 +3898,14 @@ out:
+ 	return err;
+ }
+ 
+-int mlx4_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr)
++int mlx4_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		      const struct ib_send_wr **bad_wr)
+ {
+ 	return _mlx4_ib_post_send(ibqp, wr, bad_wr, false);
+ }
+ 
+-static int _mlx4_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			      struct ib_recv_wr **bad_wr, bool drain)
++static int _mlx4_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			      const struct ib_recv_wr **bad_wr, bool drain)
+ {
+ 	struct mlx4_ib_qp *qp = to_mqp(ibqp);
+ 	struct mlx4_wqe_data_seg *scat;
+@@ -3992,8 +3992,8 @@ out:
+ 	return err;
+ }
+ 
+-int mlx4_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr)
++int mlx4_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr)
+ {
+ 	return _mlx4_ib_post_recv(ibqp, wr, bad_wr, false);
+ }
+@@ -4530,7 +4530,7 @@ void mlx4_ib_drain_sq(struct ib_qp *qp)
+ 	struct ib_cq *cq = qp->send_cq;
+ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+ 	struct mlx4_ib_drain_cqe sdrain;
+-	struct ib_send_wr *bad_swr;
++	const struct ib_send_wr *bad_swr;
+ 	struct ib_rdma_wr swr = {
+ 		.wr = {
+ 			.next = NULL,
+@@ -4565,7 +4565,8 @@ void mlx4_ib_drain_rq(struct ib_qp *qp)
+ 	struct ib_cq *cq = qp->recv_cq;
+ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+ 	struct mlx4_ib_drain_cqe rdrain;
+-	struct ib_recv_wr rwr = {}, *bad_rwr;
++	struct ib_recv_wr rwr = {};
++	const struct ib_recv_wr *bad_rwr;
+ 	int ret;
+ 	struct mlx4_ib_dev *dev = to_mdev(qp->device);
+ 	struct mlx4_dev *mdev = dev->dev;
+diff --git a/drivers/infiniband/hw/mlx4/srq.c b/drivers/infiniband/hw/mlx4/srq.c
+index ebee56cbc0e2..3731b31c3653 100644
+--- a/drivers/infiniband/hw/mlx4/srq.c
++++ b/drivers/infiniband/hw/mlx4/srq.c
+@@ -307,8 +307,8 @@ void mlx4_ib_free_srq_wqe(struct mlx4_ib_srq *srq, int wqe_index)
+ 	spin_unlock(&srq->lock);
+ }
+ 
+-int mlx4_ib_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr)
++int mlx4_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mlx4_ib_srq *srq = to_msrq(ibsrq);
+ 	struct mlx4_wqe_srq_next_seg *next;
+diff --git a/drivers/infiniband/hw/mlx5/gsi.c b/drivers/infiniband/hw/mlx5/gsi.c
+index 79e6309460dc..4950df3f71b6 100644
+--- a/drivers/infiniband/hw/mlx5/gsi.c
++++ b/drivers/infiniband/hw/mlx5/gsi.c
+@@ -477,8 +477,8 @@ static struct ib_qp *get_tx_qp(struct mlx5_ib_gsi_qp *gsi, struct ib_ud_wr *wr)
+ 	return gsi->tx_qps[qp_index];
+ }
+ 
+-int mlx5_ib_gsi_post_send(struct ib_qp *qp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr)
++int mlx5_ib_gsi_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr)
+ {
+ 	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
+ 	struct ib_qp *tx_qp;
+@@ -522,8 +522,8 @@ err:
+ 	return ret;
+ }
+ 
+-int mlx5_ib_gsi_post_recv(struct ib_qp *qp, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr)
++int mlx5_ib_gsi_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mlx5_ib_gsi_qp *gsi = gsi_qp(qp);
+ 
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index dcf4ca4d31a6..ac8e39268888 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -912,8 +912,8 @@ int mlx5_ib_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		       enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
+ int mlx5_ib_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *srq_attr);
+ int mlx5_ib_destroy_srq(struct ib_srq *srq);
+-int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr);
++int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr);
+ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+ 				struct ib_qp_init_attr *init_attr,
+ 				struct ib_udata *udata);
+@@ -924,10 +924,10 @@ int mlx5_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr
+ int mlx5_ib_destroy_qp(struct ib_qp *qp);
+ void mlx5_ib_drain_sq(struct ib_qp *qp);
+ void mlx5_ib_drain_rq(struct ib_qp *qp);
+-int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr);
+-int mlx5_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr);
++int mlx5_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		      const struct ib_send_wr **bad_wr);
++int mlx5_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr);
+ void *mlx5_get_send_wqe(struct mlx5_ib_qp *qp, int n);
+ int mlx5_ib_read_user_wqe(struct mlx5_ib_qp *qp, int send, int wqe_index,
+ 			  void *buffer, u32 length,
+@@ -1078,10 +1078,10 @@ int mlx5_ib_gsi_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
+ int mlx5_ib_gsi_query_qp(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
+ 			 int qp_attr_mask,
+ 			 struct ib_qp_init_attr *qp_init_attr);
+-int mlx5_ib_gsi_post_send(struct ib_qp *qp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr);
+-int mlx5_ib_gsi_post_recv(struct ib_qp *qp, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr);
++int mlx5_ib_gsi_post_send(struct ib_qp *qp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr);
++int mlx5_ib_gsi_post_recv(struct ib_qp *qp, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr);
+ void mlx5_ib_gsi_pkey_change(struct mlx5_ib_gsi_qp *gsi);
+ 
+ int mlx5_ib_generate_wc(struct ib_cq *ibcq, struct ib_wc *wc);
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index ae95e582f2ef..60cbfea96869 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -896,7 +896,7 @@ static int mlx5_ib_post_send_wait(struct mlx5_ib_dev *dev,
+ 				  struct mlx5_umr_wr *umrwr)
+ {
+ 	struct umr_common *umrc = &dev->umrc;
+-	struct ib_send_wr *bad;
++	const struct ib_send_wr *bad;
+ 	int err;
+ 	struct mlx5_ib_umr_context umr_context;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 7893a97bd9c2..0672dbaee00f 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -4272,8 +4272,8 @@ static void finish_wqe(struct mlx5_ib_qp *qp,
+ 	qp->sq.w_list[idx].next = qp->sq.cur_post;
+ }
+ 
+-static int _mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr, bool drain)
++static int _mlx5_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			      const struct ib_send_wr **bad_wr, bool drain)
+ {
+ 	struct mlx5_wqe_ctrl_seg *ctrl = NULL;  /* compiler warning */
+ 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+@@ -4601,8 +4601,8 @@ out:
+ 	return err;
+ }
+ 
+-int mlx5_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		      struct ib_send_wr **bad_wr)
++int mlx5_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		      const struct ib_send_wr **bad_wr)
+ {
+ 	return _mlx5_ib_post_send(ibqp, wr, bad_wr, false);
+ }
+@@ -4612,8 +4612,8 @@ static void set_sig_seg(struct mlx5_rwqe_sig *sig, int size)
+ 	sig->signature = calc_sig(sig, size);
+ }
+ 
+-static int _mlx5_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr, bool drain)
++static int _mlx5_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr, bool drain)
+ {
+ 	struct mlx5_ib_qp *qp = to_mqp(ibqp);
+ 	struct mlx5_wqe_data_seg *scat;
+@@ -4693,8 +4693,8 @@ out:
+ 	return err;
+ }
+ 
+-int mlx5_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr)
++int mlx5_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr)
+ {
+ 	return _mlx5_ib_post_recv(ibqp, wr, bad_wr, false);
+ }
+@@ -5702,7 +5702,7 @@ void mlx5_ib_drain_sq(struct ib_qp *qp)
+ 	struct ib_cq *cq = qp->send_cq;
+ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+ 	struct mlx5_ib_drain_cqe sdrain;
+-	struct ib_send_wr *bad_swr;
++	const struct ib_send_wr *bad_swr;
+ 	struct ib_rdma_wr swr = {
+ 		.wr = {
+ 			.next = NULL,
+@@ -5737,7 +5737,8 @@ void mlx5_ib_drain_rq(struct ib_qp *qp)
+ 	struct ib_cq *cq = qp->recv_cq;
+ 	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+ 	struct mlx5_ib_drain_cqe rdrain;
+-	struct ib_recv_wr rwr = {}, *bad_rwr;
++	struct ib_recv_wr rwr = {};
++	const struct ib_recv_wr *bad_rwr;
+ 	int ret;
+ 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
+ 	struct mlx5_core_dev *mdev = dev->mdev;
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 3c7522d025f2..2248e768a0a8 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -440,8 +440,8 @@ void mlx5_ib_free_srq_wqe(struct mlx5_ib_srq *srq, int wqe_index)
+ 	spin_unlock(&srq->lock);
+ }
+ 
+-int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			  struct ib_recv_wr **bad_wr)
++int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			  const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mlx5_ib_srq *srq = to_msrq(ibsrq);
+ 	struct mlx5_wqe_srq_next_seg *next;
+diff --git a/drivers/infiniband/hw/mthca/mthca_dev.h b/drivers/infiniband/hw/mthca/mthca_dev.h
+index 5508afbf1c67..220a3e4717a3 100644
+--- a/drivers/infiniband/hw/mthca/mthca_dev.h
++++ b/drivers/infiniband/hw/mthca/mthca_dev.h
+@@ -519,10 +519,10 @@ int mthca_max_srq_sge(struct mthca_dev *dev);
+ void mthca_srq_event(struct mthca_dev *dev, u32 srqn,
+ 		     enum ib_event_type event_type);
+ void mthca_free_srq_wqe(struct mthca_srq *srq, u32 wqe_addr);
+-int mthca_tavor_post_srq_recv(struct ib_srq *srq, struct ib_recv_wr *wr,
+-			      struct ib_recv_wr **bad_wr);
+-int mthca_arbel_post_srq_recv(struct ib_srq *srq, struct ib_recv_wr *wr,
+-			      struct ib_recv_wr **bad_wr);
++int mthca_tavor_post_srq_recv(struct ib_srq *srq, const struct ib_recv_wr *wr,
++			      const struct ib_recv_wr **bad_wr);
++int mthca_arbel_post_srq_recv(struct ib_srq *srq, const struct ib_recv_wr *wr,
++			      const struct ib_recv_wr **bad_wr);
+ 
+ void mthca_qp_event(struct mthca_dev *dev, u32 qpn,
+ 		    enum ib_event_type event_type);
+@@ -530,14 +530,14 @@ int mthca_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr_m
+ 		   struct ib_qp_init_attr *qp_init_attr);
+ int mthca_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr, int attr_mask,
+ 		    struct ib_udata *udata);
+-int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr);
+-int mthca_tavor_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			     struct ib_recv_wr **bad_wr);
+-int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr);
+-int mthca_arbel_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			     struct ib_recv_wr **bad_wr);
++int mthca_tavor_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr);
++int mthca_tavor_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			     const struct ib_recv_wr **bad_wr);
++int mthca_arbel_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr);
++int mthca_arbel_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			     const struct ib_recv_wr **bad_wr);
+ void mthca_free_err_wqe(struct mthca_dev *dev, struct mthca_qp *qp, int is_send,
+ 			int index, int *dbd, __be32 *new_wqe);
+ int mthca_alloc_qp(struct mthca_dev *dev,
+diff --git a/drivers/infiniband/hw/mthca/mthca_qp.c b/drivers/infiniband/hw/mthca/mthca_qp.c
+index d21960cd9a49..3077f9221707 100644
+--- a/drivers/infiniband/hw/mthca/mthca_qp.c
++++ b/drivers/infiniband/hw/mthca/mthca_qp.c
+@@ -1611,8 +1611,8 @@ static void set_arbel_ud_seg(struct mthca_arbel_ud_seg *useg,
+ 	useg->qkey = cpu_to_be32(wr->remote_qkey);
+ }
+ 
+-int mthca_tavor_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr)
++int mthca_tavor_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibqp->device);
+ 	struct mthca_qp *qp = to_mqp(ibqp);
+@@ -1814,8 +1814,8 @@ out:
+ 	return err;
+ }
+ 
+-int mthca_tavor_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			     struct ib_recv_wr **bad_wr)
++int mthca_tavor_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			     const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibqp->device);
+ 	struct mthca_qp *qp = to_mqp(ibqp);
+@@ -1925,8 +1925,8 @@ out:
+ 	return err;
+ }
+ 
+-int mthca_arbel_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			  struct ib_send_wr **bad_wr)
++int mthca_arbel_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			  const struct ib_send_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibqp->device);
+ 	struct mthca_qp *qp = to_mqp(ibqp);
+@@ -2165,8 +2165,8 @@ out:
+ 	return err;
+ }
+ 
+-int mthca_arbel_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			     struct ib_recv_wr **bad_wr)
++int mthca_arbel_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			     const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibqp->device);
+ 	struct mthca_qp *qp = to_mqp(ibqp);
+diff --git a/drivers/infiniband/hw/mthca/mthca_srq.c b/drivers/infiniband/hw/mthca/mthca_srq.c
+index d22f970480c0..cd7a121ca4e5 100644
+--- a/drivers/infiniband/hw/mthca/mthca_srq.c
++++ b/drivers/infiniband/hw/mthca/mthca_srq.c
+@@ -472,8 +472,8 @@ void mthca_free_srq_wqe(struct mthca_srq *srq, u32 wqe_addr)
+ 	spin_unlock(&srq->lock);
+ }
+ 
+-int mthca_tavor_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			      struct ib_recv_wr **bad_wr)
++int mthca_tavor_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			      const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibsrq->device);
+ 	struct mthca_srq *srq = to_msrq(ibsrq);
+@@ -572,8 +572,8 @@ int mthca_tavor_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+ 	return err;
+ }
+ 
+-int mthca_arbel_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			      struct ib_recv_wr **bad_wr)
++int mthca_arbel_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			      const struct ib_recv_wr **bad_wr)
+ {
+ 	struct mthca_dev *dev = to_mdev(ibsrq->device);
+ 	struct mthca_srq *srq = to_msrq(ibsrq);
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 989ad9f44435..1ea96d366a54 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -3066,8 +3066,8 @@ fill_wqe_sg_send(struct nes_hw_qp_wqe *wqe, struct ib_send_wr *ib_wr, u32 uselke
+ /**
+  * nes_post_send
+  */
+-static int nes_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
+-		struct ib_send_wr **bad_wr)
++static int nes_post_send(struct ib_qp *ibqp, const struct ib_send_wr *ib_wr,
++			 const struct ib_send_wr **bad_wr)
+ {
+ 	u64 u64temp;
+ 	unsigned long flags = 0;
+@@ -3328,8 +3328,8 @@ out:
+ /**
+  * nes_post_recv
+  */
+-static int nes_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *ib_wr,
+-		struct ib_recv_wr **bad_wr)
++static int nes_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *ib_wr,
++			 const struct ib_recv_wr **bad_wr)
+ {
+ 	u64 u64temp;
+ 	unsigned long flags = 0;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 2276e1ab6b2b..bd4753886316 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -2183,8 +2183,8 @@ static void ocrdma_ring_sq_db(struct ocrdma_qp *qp)
+ 	iowrite32(val, qp->sq_db);
+ }
+ 
+-int ocrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		     struct ib_send_wr **bad_wr)
++int ocrdma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		     const struct ib_send_wr **bad_wr)
+ {
+ 	int status = 0;
+ 	struct ocrdma_qp *qp = get_ocrdma_qp(ibqp);
+@@ -2295,8 +2295,8 @@ static void ocrdma_ring_rq_db(struct ocrdma_qp *qp)
+ 	iowrite32(val, qp->rq_db);
+ }
+ 
+-static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe, struct ib_recv_wr *wr,
+-			     u16 tag)
++static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe,
++			     const struct ib_recv_wr *wr, u16 tag)
+ {
+ 	u32 wqe_size = 0;
+ 	struct ocrdma_sge *sge;
+@@ -2316,8 +2316,8 @@ static void ocrdma_build_rqe(struct ocrdma_hdr_wqe *rqe, struct ib_recv_wr *wr,
+ 	ocrdma_cpu_to_le32(rqe, wqe_size);
+ }
+ 
+-int ocrdma_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		     struct ib_recv_wr **bad_wr)
++int ocrdma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		     const struct ib_recv_wr **bad_wr)
+ {
+ 	int status = 0;
+ 	unsigned long flags;
+@@ -2386,8 +2386,8 @@ static void ocrdma_ring_srq_db(struct ocrdma_srq *srq)
+ 	iowrite32(val, srq->db + OCRDMA_DB_GEN2_SRQ_OFFSET);
+ }
+ 
+-int ocrdma_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			 struct ib_recv_wr **bad_wr)
++int ocrdma_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			 const struct ib_recv_wr **bad_wr)
+ {
+ 	int status = 0;
+ 	unsigned long flags;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+index a48eab35861f..06cbb57638d5 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.h
+@@ -43,10 +43,10 @@
+ #ifndef __OCRDMA_VERBS_H__
+ #define __OCRDMA_VERBS_H__
+ 
+-int ocrdma_post_send(struct ib_qp *, struct ib_send_wr *,
+-		     struct ib_send_wr **bad_wr);
+-int ocrdma_post_recv(struct ib_qp *, struct ib_recv_wr *,
+-		     struct ib_recv_wr **bad_wr);
++int ocrdma_post_send(struct ib_qp *, const struct ib_send_wr *,
++		     const struct ib_send_wr **bad_wr);
++int ocrdma_post_recv(struct ib_qp *, const struct ib_recv_wr *,
++		     const struct ib_recv_wr **bad_wr);
+ 
+ int ocrdma_poll_cq(struct ib_cq *, int num_entries, struct ib_wc *wc);
+ int ocrdma_arm_cq(struct ib_cq *, enum ib_cq_notify_flags flags);
+@@ -102,8 +102,8 @@ int ocrdma_modify_srq(struct ib_srq *, struct ib_srq_attr *,
+ 		      enum ib_srq_attr_mask, struct ib_udata *);
+ int ocrdma_query_srq(struct ib_srq *, struct ib_srq_attr *);
+ int ocrdma_destroy_srq(struct ib_srq *);
+-int ocrdma_post_srq_recv(struct ib_srq *, struct ib_recv_wr *,
+-			 struct ib_recv_wr **bad_recv_wr);
++int ocrdma_post_srq_recv(struct ib_srq *, const struct ib_recv_wr *,
++			 const struct ib_recv_wr **bad_recv_wr);
+ 
+ int ocrdma_dereg_mr(struct ib_mr *);
+ struct ib_mr *ocrdma_get_dma_mr(struct ib_pd *, int acc);
+diff --git a/drivers/infiniband/hw/qedr/qedr_roce_cm.c b/drivers/infiniband/hw/qedr/qedr_roce_cm.c
+index eedb937d6fa9..408171a6ed99 100644
+--- a/drivers/infiniband/hw/qedr/qedr_roce_cm.c
++++ b/drivers/infiniband/hw/qedr/qedr_roce_cm.c
+@@ -552,8 +552,8 @@ static inline int qedr_gsi_build_packet(struct qedr_dev *dev,
+ 	return 0;
+ }
+ 
+-int qedr_gsi_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		       struct ib_send_wr **bad_wr)
++int qedr_gsi_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		       const struct ib_send_wr **bad_wr)
+ {
+ 	struct qed_roce_ll2_packet *pkt = NULL;
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+@@ -622,8 +622,8 @@ err:
+ 	return rc;
+ }
+ 
+-int qedr_gsi_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		       struct ib_recv_wr **bad_wr)
++int qedr_gsi_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_wr)
+ {
+ 	struct qedr_dev *dev = get_qedr_dev(ibqp->device);
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+diff --git a/drivers/infiniband/hw/qedr/qedr_roce_cm.h b/drivers/infiniband/hw/qedr/qedr_roce_cm.h
+index a55916323ea9..d46dcd3f6424 100644
+--- a/drivers/infiniband/hw/qedr/qedr_roce_cm.h
++++ b/drivers/infiniband/hw/qedr/qedr_roce_cm.h
+@@ -46,10 +46,10 @@ static inline u32 qedr_get_ipv4_from_gid(const u8 *gid)
+ 
+ /* RDMA CM */
+ int qedr_gsi_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *wc);
+-int qedr_gsi_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		       struct ib_recv_wr **bad_wr);
+-int qedr_gsi_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		       struct ib_send_wr **bad_wr);
++int qedr_gsi_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_wr);
++int qedr_gsi_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		       const struct ib_send_wr **bad_wr);
+ struct ib_qp *qedr_create_gsi_qp(struct qedr_dev *dev,
+ 				 struct ib_qp_init_attr *attrs,
+ 				 struct qedr_qp *qp);
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index 7a90bdd4b979..82c80bfa1613 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -2731,9 +2731,9 @@ static void swap_wqe_data64(u64 *p)
+ 
+ static u32 qedr_prepare_sq_inline_data(struct qedr_dev *dev,
+ 				       struct qedr_qp *qp, u8 *wqe_size,
+-				       struct ib_send_wr *wr,
+-				       struct ib_send_wr **bad_wr, u8 *bits,
+-				       u8 bit)
++				       const struct ib_send_wr *wr,
++				       const struct ib_send_wr **bad_wr,
++				       u8 *bits, u8 bit)
+ {
+ 	u32 data_size = sge_data_len(wr->sg_list, wr->num_sge);
+ 	char *seg_prt, *wqe;
+@@ -2840,8 +2840,8 @@ static u32 qedr_prepare_sq_rdma_data(struct qedr_dev *dev,
+ 				     struct qedr_qp *qp,
+ 				     struct rdma_sq_rdma_wqe_1st *rwqe,
+ 				     struct rdma_sq_rdma_wqe_2nd *rwqe2,
+-				     struct ib_send_wr *wr,
+-				     struct ib_send_wr **bad_wr)
++				     const struct ib_send_wr *wr,
++				     const struct ib_send_wr **bad_wr)
+ {
+ 	rwqe2->r_key = cpu_to_le32(rdma_wr(wr)->rkey);
+ 	DMA_REGPAIR_LE(rwqe2->remote_va, rdma_wr(wr)->remote_addr);
+@@ -2863,8 +2863,8 @@ static u32 qedr_prepare_sq_send_data(struct qedr_dev *dev,
+ 				     struct qedr_qp *qp,
+ 				     struct rdma_sq_send_wqe_1st *swqe,
+ 				     struct rdma_sq_send_wqe_2st *swqe2,
+-				     struct ib_send_wr *wr,
+-				     struct ib_send_wr **bad_wr)
++				     const struct ib_send_wr *wr,
++				     const struct ib_send_wr **bad_wr)
+ {
+ 	memset(swqe2, 0, sizeof(*swqe2));
+ 	if (wr->send_flags & IB_SEND_INLINE) {
+@@ -2979,8 +2979,8 @@ static inline bool qedr_can_post_send(struct qedr_qp *qp, struct ib_send_wr *wr)
+ 	return true;
+ }
+ 
+-static int __qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		     struct ib_send_wr **bad_wr)
++static int __qedr_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			    const struct ib_send_wr **bad_wr)
+ {
+ 	struct qedr_dev *dev = get_qedr_dev(ibqp->device);
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+@@ -3194,8 +3194,8 @@ static int __qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 	return rc;
+ }
+ 
+-int qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		   struct ib_send_wr **bad_wr)
++int qedr_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		   const struct ib_send_wr **bad_wr)
+ {
+ 	struct qedr_dev *dev = get_qedr_dev(ibqp->device);
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+@@ -3253,8 +3253,8 @@ int qedr_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 	return rc;
+ }
+ 
+-int qedr_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		   struct ib_recv_wr **bad_wr)
++int qedr_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		   const struct ib_recv_wr **bad_wr)
+ {
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+ 	struct qedr_dev *dev = qp->dev;
+diff --git a/drivers/infiniband/hw/qedr/verbs.h b/drivers/infiniband/hw/qedr/verbs.h
+index b5330495bf7c..9cf2126b464d 100644
+--- a/drivers/infiniband/hw/qedr/verbs.h
++++ b/drivers/infiniband/hw/qedr/verbs.h
+@@ -83,10 +83,10 @@ int qedr_map_mr_sg(struct ib_mr *ibmr, struct scatterlist *sg,
+ struct ib_mr *qedr_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
+ 			    u32 max_num_sg);
+ int qedr_poll_cq(struct ib_cq *, int num_entries, struct ib_wc *wc);
+-int qedr_post_send(struct ib_qp *, struct ib_send_wr *,
+-		   struct ib_send_wr **bad_wr);
+-int qedr_post_recv(struct ib_qp *, struct ib_recv_wr *,
+-		   struct ib_recv_wr **bad_wr);
++int qedr_post_send(struct ib_qp *, const struct ib_send_wr *,
++		   const struct ib_send_wr **bad_wr);
++int qedr_post_recv(struct ib_qp *, const struct ib_recv_wr *,
++		   const struct ib_recv_wr **bad_wr);
+ int qedr_process_mad(struct ib_device *ibdev, int process_mad_flags,
+ 		     u8 port_num, const struct ib_wc *in_wc,
+ 		     const struct ib_grh *in_grh,
+diff --git a/drivers/infiniband/hw/usnic/usnic_ib_verbs.c b/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+index a688a5669168..3bdec2584ed3 100644
+--- a/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+@@ -771,15 +771,15 @@ int usnic_ib_destroy_ah(struct ib_ah *ah)
+ 	return -EINVAL;
+ }
+ 
+-int usnic_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-				struct ib_send_wr **bad_wr)
++int usnic_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		       const struct ib_send_wr **bad_wr)
+ {
+ 	usnic_dbg("\n");
+ 	return -EINVAL;
+ }
+ 
+-int usnic_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-				struct ib_recv_wr **bad_wr)
++int usnic_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_wr)
+ {
+ 	usnic_dbg("\n");
+ 	return -EINVAL;
+diff --git a/drivers/infiniband/hw/usnic/usnic_ib_verbs.h b/drivers/infiniband/hw/usnic/usnic_ib_verbs.h
+index 1fda94425116..2a2c9beb715f 100644
+--- a/drivers/infiniband/hw/usnic/usnic_ib_verbs.h
++++ b/drivers/infiniband/hw/usnic/usnic_ib_verbs.h
+@@ -80,10 +80,10 @@ struct ib_ah *usnic_ib_create_ah(struct ib_pd *pd,
+ 				 struct ib_udata *udata);
+ 
+ int usnic_ib_destroy_ah(struct ib_ah *ah);
+-int usnic_ib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			struct ib_send_wr **bad_wr);
+-int usnic_ib_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			struct ib_recv_wr **bad_wr);
++int usnic_ib_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			const struct ib_send_wr **bad_wr);
++int usnic_ib_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		       const struct ib_recv_wr **bad_wr);
+ int usnic_ib_poll_cq(struct ib_cq *ibcq, int num_entries,
+ 			struct ib_wc *wc);
+ int usnic_ib_req_notify_cq(struct ib_cq *cq,
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+index eb5b1065ec08..5b8f92f271d0 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+@@ -623,8 +623,8 @@ static int set_reg_seg(struct pvrdma_sq_wqe_hdr *wqe_hdr, struct ib_reg_wr *wr)
+  *
+  * @return: 0 on success, otherwise errno returned.
+  */
+-int pvrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		     struct ib_send_wr **bad_wr)
++int pvrdma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		     const struct ib_send_wr **bad_wr)
+ {
+ 	struct pvrdma_qp *qp = to_vqp(ibqp);
+ 	struct pvrdma_dev *dev = to_vdev(ibqp->device);
+@@ -827,8 +827,8 @@ out:
+  *
+  * @return: 0 on success, otherwise errno returned.
+  */
+-int pvrdma_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		     struct ib_recv_wr **bad_wr)
++int pvrdma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		     const struct ib_recv_wr **bad_wr)
+ {
+ 	struct pvrdma_dev *dev = to_vdev(ibqp->device);
+ 	unsigned long flags;
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+index 484106894cea..2189768fa05e 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+@@ -52,8 +52,8 @@
+ 
+ #include "pvrdma.h"
+ 
+-int pvrdma_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			 struct ib_recv_wr **bad_wr)
++int pvrdma_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			 const struct ib_recv_wr **bad_wr)
+ {
+ 	/* No support for kernel clients. */
+ 	return -EOPNOTSUPP;
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.h b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.h
+index b7b25728a7e5..6ebf3360ea12 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.h
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_verbs.h
+@@ -435,8 +435,8 @@ int pvrdma_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		      enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
+ int pvrdma_query_srq(struct ib_srq *srq, struct ib_srq_attr *srq_attr);
+ int pvrdma_destroy_srq(struct ib_srq *srq);
+-int pvrdma_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			 struct ib_recv_wr **bad_wr);
++int pvrdma_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			 const struct ib_recv_wr **bad_wr);
+ 
+ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
+ 			       struct ib_qp_init_attr *init_attr,
+@@ -446,9 +446,9 @@ int pvrdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ int pvrdma_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr,
+ 		    int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr);
+ int pvrdma_destroy_qp(struct ib_qp *qp);
+-int pvrdma_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		     struct ib_send_wr **bad_wr);
+-int pvrdma_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		     struct ib_recv_wr **bad_wr);
++int pvrdma_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		     const struct ib_send_wr **bad_wr);
++int pvrdma_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		     const struct ib_recv_wr **bad_wr);
+ 
+ #endif /* __PVRDMA_VERBS_H__ */
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index f91606eb43cc..db75f71a134d 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -1538,8 +1538,8 @@ int rvt_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+  *
+  * Return: 0 on success otherwise errno
+  */
+-int rvt_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		  struct ib_recv_wr **bad_wr)
++int rvt_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		  const struct ib_recv_wr **bad_wr)
+ {
+ 	struct rvt_qp *qp = ibqp_to_rvtqp(ibqp);
+ 	struct rvt_rwq *wq = qp->r_rq.wq;
+@@ -1891,8 +1891,8 @@ bail_inval_free:
+  *
+  * Return: 0 on success else errno
+  */
+-int rvt_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		  struct ib_send_wr **bad_wr)
++int rvt_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		  const struct ib_send_wr **bad_wr)
+ {
+ 	struct rvt_qp *qp = ibqp_to_rvtqp(ibqp);
+ 	struct rvt_dev_info *rdi = ib_to_rvt(ibqp->device);
+@@ -1948,8 +1948,8 @@ bail:
+  *
+  * Return: 0 on success else errno
+  */
+-int rvt_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr)
++int rvt_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr)
+ {
+ 	struct rvt_srq *srq = ibsrq_to_rvtsrq(ibsrq);
+ 	struct rvt_rwq *wq;
+diff --git a/drivers/infiniband/sw/rdmavt/qp.h b/drivers/infiniband/sw/rdmavt/qp.h
+index 8409f80d5f25..264811fdc530 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.h
++++ b/drivers/infiniband/sw/rdmavt/qp.h
+@@ -60,10 +60,10 @@ int rvt_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ int rvt_destroy_qp(struct ib_qp *ibqp);
+ int rvt_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		 int attr_mask, struct ib_qp_init_attr *init_attr);
+-int rvt_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-		  struct ib_recv_wr **bad_wr);
+-int rvt_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-		  struct ib_send_wr **bad_wr);
+-int rvt_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-		      struct ib_recv_wr **bad_wr);
++int rvt_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++		  const struct ib_recv_wr **bad_wr);
++int rvt_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++		  const struct ib_send_wr **bad_wr);
++int rvt_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++		      const struct ib_recv_wr **bad_wr);
+ #endif          /* DEF_RVTQP_H */
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index 39cef3e024df..1a13061006f3 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -351,7 +351,7 @@ static int rxe_destroy_ah(struct ib_ah *ibah)
+ 	return 0;
+ }
+ 
+-static int post_one_recv(struct rxe_rq *rq, struct ib_recv_wr *ibwr)
++static int post_one_recv(struct rxe_rq *rq, const struct ib_recv_wr *ibwr)
+ {
+ 	int err;
+ 	int i;
+@@ -502,8 +502,8 @@ static int rxe_destroy_srq(struct ib_srq *ibsrq)
+ 	return 0;
+ }
+ 
+-static int rxe_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
+-			     struct ib_recv_wr **bad_wr)
++static int rxe_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
++			     const struct ib_recv_wr **bad_wr)
+ {
+ 	int err = 0;
+ 	unsigned long flags;
+@@ -790,8 +790,8 @@ err1:
+ 	return err;
+ }
+ 
+-static int rxe_post_send_kernel(struct rxe_qp *qp, struct ib_send_wr *wr,
+-				struct ib_send_wr **bad_wr)
++static int rxe_post_send_kernel(struct rxe_qp *qp, const struct ib_send_wr *wr,
++				const struct ib_send_wr **bad_wr)
+ {
+ 	int err = 0;
+ 	unsigned int mask;
+@@ -833,8 +833,8 @@ static int rxe_post_send_kernel(struct rxe_qp *qp, struct ib_send_wr *wr,
+ 	return err;
+ }
+ 
+-static int rxe_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+-			 struct ib_send_wr **bad_wr)
++static int rxe_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
++			 const struct ib_send_wr **bad_wr)
+ {
+ 	struct rxe_qp *qp = to_rqp(ibqp);
+ 
+@@ -856,8 +856,8 @@ static int rxe_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+ 		return rxe_post_send_kernel(qp, wr, bad_wr);
+ }
+ 
+-static int rxe_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+-			 struct ib_recv_wr **bad_wr)
++static int rxe_post_recv(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
++			 const struct ib_recv_wr **bad_wr)
+ {
+ 	int err = 0;
+ 	struct rxe_qp *qp = to_rqp(ibqp);
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index f069d7abc349..5012299fdfaa 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2314,8 +2314,8 @@ struct ib_device {
+ 						struct ib_srq_attr *srq_attr);
+ 	int                        (*destroy_srq)(struct ib_srq *srq);
+ 	int                        (*post_srq_recv)(struct ib_srq *srq,
+-						    struct ib_recv_wr *recv_wr,
+-						    struct ib_recv_wr **bad_recv_wr);
++						    const struct ib_recv_wr *recv_wr,
++						    const struct ib_recv_wr **bad_recv_wr);
+ 	struct ib_qp *             (*create_qp)(struct ib_pd *pd,
+ 						struct ib_qp_init_attr *qp_init_attr,
+ 						struct ib_udata *udata);
+@@ -2329,11 +2329,11 @@ struct ib_device {
+ 					       struct ib_qp_init_attr *qp_init_attr);
+ 	int                        (*destroy_qp)(struct ib_qp *qp);
+ 	int                        (*post_send)(struct ib_qp *qp,
+-						struct ib_send_wr *send_wr,
+-						struct ib_send_wr **bad_send_wr);
++						const struct ib_send_wr *send_wr,
++						const struct ib_send_wr **bad_send_wr);
+ 	int                        (*post_recv)(struct ib_qp *qp,
+-						struct ib_recv_wr *recv_wr,
+-						struct ib_recv_wr **bad_recv_wr);
++						const struct ib_recv_wr *recv_wr,
++						const struct ib_recv_wr **bad_recv_wr);
+ 	struct ib_cq *             (*create_cq)(struct ib_device *device,
+ 						const struct ib_cq_init_attr *attr,
+ 						struct ib_ucontext *context,
+@@ -3147,10 +3147,10 @@ int ib_destroy_srq(struct ib_srq *srq);
+  *   the work request that failed to be posted on the QP.
+  */
+ static inline int ib_post_srq_recv(struct ib_srq *srq,
+-				   struct ib_recv_wr *recv_wr,
+-				   struct ib_recv_wr **bad_recv_wr)
++				   const struct ib_recv_wr *recv_wr,
++				   const struct ib_recv_wr **bad_recv_wr)
+ {
+-	struct ib_recv_wr *dummy;
++	const struct ib_recv_wr *dummy;
+ 
+ 	return srq->device->post_srq_recv(srq, recv_wr, bad_recv_wr ? : &dummy);
+ }
+@@ -3250,10 +3250,10 @@ int ib_close_qp(struct ib_qp *qp);
+  * earlier work requests in the list.
+  */
+ static inline int ib_post_send(struct ib_qp *qp,
+-			       struct ib_send_wr *send_wr,
+-			       struct ib_send_wr **bad_send_wr)
++			       const struct ib_send_wr *send_wr,
++			       const struct ib_send_wr **bad_send_wr)
+ {
+-	struct ib_send_wr *dummy;
++	const struct ib_send_wr *dummy;
+ 
+ 	return qp->device->post_send(qp, send_wr, bad_send_wr ? : &dummy);
+ }
+@@ -3267,10 +3267,10 @@ static inline int ib_post_send(struct ib_qp *qp,
+  *   the work request that failed to be posted on the QP.
+  */
+ static inline int ib_post_recv(struct ib_qp *qp,
+-			       struct ib_recv_wr *recv_wr,
+-			       struct ib_recv_wr **bad_recv_wr)
++			       const struct ib_recv_wr *recv_wr,
++			       const struct ib_recv_wr **bad_recv_wr)
+ {
+-	struct ib_recv_wr *dummy;
++	const struct ib_recv_wr *dummy;
+ 
+ 	return qp->device->post_recv(qp, recv_wr, bad_recv_wr ? : &dummy);
+ }
+diff --git a/net/rds/ib_send.c b/net/rds/ib_send.c
+index 9a9701cd08f5..50495794d56c 100644
+--- a/net/rds/ib_send.c
++++ b/net/rds/ib_send.c
+@@ -486,7 +486,7 @@ int rds_ib_xmit(struct rds_connection *conn, struct rds_message *rm,
+ 	struct rds_ib_send_work *send = NULL;
+ 	struct rds_ib_send_work *first;
+ 	struct rds_ib_send_work *prev;
+-	struct ib_send_wr *failed_wr;
++	const struct ib_send_wr *failed_wr;
+ 	struct scatterlist *scat;
+ 	u32 pos;
+ 	u32 i;
+@@ -754,7 +754,7 @@ int rds_ib_xmit_atomic(struct rds_connection *conn, struct rm_atomic_op *op)
+ {
+ 	struct rds_ib_connection *ic = conn->c_transport_data;
+ 	struct rds_ib_send_work *send = NULL;
+-	struct ib_send_wr *failed_wr;
++	const struct ib_send_wr *failed_wr;
+ 	struct rds_ib_device *rds_ibdev;
+ 	u32 pos;
+ 	u32 work_alloc;
+@@ -845,7 +845,7 @@ int rds_ib_xmit_rdma(struct rds_connection *conn, struct rm_rdma_op *op)
+ 	struct rds_ib_send_work *send = NULL;
+ 	struct rds_ib_send_work *first;
+ 	struct rds_ib_send_work *prev;
+-	struct ib_send_wr *failed_wr;
++	const struct ib_send_wr *failed_wr;
+ 	struct scatterlist *scat;
+ 	unsigned long len;
+ 	u64 remote_addr = op->op_remote_addr;
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 3040fe00fc7d..76aa1bb754f2 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -516,7 +516,8 @@ frwr_op_reminv(struct rpcrdma_rep *rep, struct list_head *mrs)
+ static void
+ frwr_op_unmap_sync(struct rpcrdma_xprt *r_xprt, struct list_head *mrs)
+ {
+-	struct ib_send_wr *first, **prev, *last, *bad_wr;
++	struct ib_send_wr *first, **prev, *last;
++	const struct ib_send_wr *bad_wr;
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 	struct rpcrdma_frwr *frwr;
+ 	struct rpcrdma_mr *mr;
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_rw.c b/net/sunrpc/xprtrdma/svc_rdma_rw.c
+index 506b9ec4883d..58f4a65e0f55 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_rw.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_rw.c
+@@ -306,7 +306,8 @@ static int svc_rdma_post_chunk_ctxt(struct svc_rdma_chunk_ctxt *cc)
+ {
+ 	struct svcxprt_rdma *rdma = cc->cc_rdma;
+ 	struct svc_xprt *xprt = &rdma->sc_xprt;
+-	struct ib_send_wr *first_wr, *bad_wr;
++	struct ib_send_wr *first_wr;
++	const struct ib_send_wr *bad_wr;
+ 	struct list_head *tmp;
+ 	struct ib_cqe *cqe;
+ 	int ret;
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 16161a36dc73..0aefa8b25082 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1559,7 +1559,8 @@ rpcrdma_post_recvs(struct rpcrdma_xprt *r_xprt, bool temp)
+ 	if (!count)
+ 		return;
+ 
+-	rc = ib_post_recv(r_xprt->rx_ia.ri_id->qp, wr, &bad_wr);
++	rc = ib_post_recv(r_xprt->rx_ia.ri_id->qp, wr,
++			  (const struct ib_recv_wr **)&bad_wr);
+ 	if (rc) {
+ 		for (wr = bad_wr; wr; wr = wr->next) {
+ 			struct rpcrdma_rep *rep;
