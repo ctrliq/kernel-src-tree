@@ -1,0 +1,135 @@
+iommu/iova: Make rcache flush optional on IOVA allocation failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [iommu] iova: Make rcache flush optional on IOVA allocation failure (Jerry Snitselaar) [1615865]
+Rebuild_FUZZ: 95.16%
+commit-author Tomasz Nowicki <tomasz.nowicki@caviumnetworks.com>
+commit 538d5b333216c3daa7a5821307164f10af73ec8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/538d5b33.failed
+
+Since IOVA allocation failure is not unusual case we need to flush
+CPUs' rcache in hope we will succeed in next round.
+
+However, it is useful to decide whether we need rcache flush step because
+of two reasons:
+- Not scalability. On large system with ~100 CPUs iterating and flushing
+  rcache for each CPU becomes serious bottleneck so we may want to defer it.
+- free_cpu_cached_iovas() does not care about max PFN we are interested in.
+  Thus we may flush our rcaches and still get no new IOVA like in the
+  commonly used scenario:
+
+    if (dma_limit > DMA_BIT_MASK(32) && dev_is_pci(dev))
+        iova = alloc_iova_fast(iovad, iova_len, DMA_BIT_MASK(32) >> shift);
+
+    if (!iova)
+        iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift);
+
+   1. First alloc_iova_fast() call is limited to DMA_BIT_MASK(32) to get
+      PCI devices a SAC address
+   2. alloc_iova() fails due to full 32-bit space
+   3. rcaches contain PFNs out of 32-bit space so free_cpu_cached_iovas()
+      throws entries away for nothing and alloc_iova() fails again
+   4. Next alloc_iova_fast() call cannot take advantage of rcache since we
+      have just defeated caches. In this case we pick the slowest option
+      to proceed.
+
+This patch reworks flushed_rcache local flag to be additional function
+argument instead and control rcache flush step. Also, it updates all users
+to do the flush as the last chance.
+
+	Signed-off-by: Tomasz Nowicki <Tomasz.Nowicki@caviumnetworks.com>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Tested-by: Nate Watterson <nwatters@codeaurora.org>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 538d5b333216c3daa7a5821307164f10af73ec8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iova.c
+diff --cc drivers/iommu/iova.c
+index cd8d9a0ec019,84bda3a4dafc..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -466,11 -420,9 +467,15 @@@ retry
+  			return 0;
+  
+  		/* Try replenishing IOVAs by flushing rcache. */
+++<<<<<<< HEAD
+ +		flushed_rcache = true;
+ +		preempt_disable();
+++=======
++ 		flush_rcache = false;
+++>>>>>>> 538d5b333216 (iommu/iova: Make rcache flush optional on IOVA allocation failure)
+  		for_each_online_cpu(cpu)
+  			free_cpu_cached_iovas(cpu, iovad);
+ +		preempt_enable();
+  		goto retry;
+  	}
+  
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index 3ed91bdea0ae..fa152cbae4a3 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -1560,10 +1560,11 @@ static unsigned long dma_ops_alloc_iova(struct device *dev,
+ 
+ 	if (dma_mask > DMA_BIT_MASK(32))
+ 		pfn = alloc_iova_fast(&dma_dom->iovad, pages,
+-				      IOVA_PFN(DMA_BIT_MASK(32)));
++				      IOVA_PFN(DMA_BIT_MASK(32)), false);
+ 
+ 	if (!pfn)
+-		pfn = alloc_iova_fast(&dma_dom->iovad, pages, IOVA_PFN(dma_mask));
++		pfn = alloc_iova_fast(&dma_dom->iovad, pages,
++				      IOVA_PFN(dma_mask), true);
+ 
+ 	return (pfn << PAGE_SHIFT);
+ }
+* Unmerged path drivers/iommu/dma-iommu.c
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 600840490d25..5b75b6d82bd9 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -3407,11 +3407,12 @@ static unsigned long intel_alloc_iova(struct device *dev,
+ 		 * from higher range
+ 		 */
+ 		iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
+-					   IOVA_PFN(DMA_BIT_MASK(32)));
++					   IOVA_PFN(DMA_BIT_MASK(32)), false);
+ 		if (iova_pfn)
+ 			return iova_pfn;
+ 	}
+-	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages, IOVA_PFN(dma_mask));
++	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
++				   IOVA_PFN(dma_mask), true);
+ 	if (unlikely(!iova_pfn)) {
+ 		pr_err("Allocating %ld-page iova for %s failed",
+ 		       nrpages, dev_name(dev));
+* Unmerged path drivers/iommu/iova.c
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index 09ce7dfe55b2..451e8e725723 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -148,7 +148,7 @@ void queue_iova(struct iova_domain *iovad,
+ 		unsigned long pfn, unsigned long pages,
+ 		unsigned long data);
+ unsigned long alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
+-			      unsigned long limit_pfn);
++			      unsigned long limit_pfn, bool flush_rcache);
+ struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
+ 	unsigned long pfn_hi);
+ void copy_reserved_iova(struct iova_domain *from, struct iova_domain *to);
+@@ -204,7 +204,8 @@ static inline void free_iova_fast(struct iova_domain *iovad,
+ 
+ static inline unsigned long alloc_iova_fast(struct iova_domain *iovad,
+ 					    unsigned long size,
+-					    unsigned long limit_pfn)
++					    unsigned long limit_pfn,
++					    bool flush_rcache)
+ {
+ 	return 0;
+ }
