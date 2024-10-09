@@ -1,0 +1,315 @@
+powerpc/fadump: Do not use hugepages when fadump is active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] fadump: Do not use hugepages when fadump is active (Gustavo Duarte) [1559113]
+Rebuild_FUZZ: 92.59%
+commit-author Hari Bathini <hbathini@linux.vnet.ibm.com>
+commit 8597538712ebd90bc83dfb0b3b40398a0c53ad5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/85975387.failed
+
+FADump capture kernel boots in restricted memory environment preserving
+the context of previous kernel to save vmcore. Supporting hugepages in
+such environment makes things unnecessarily complicated, as hugepages
+need memory set aside for them. This means most of the capture kernel's
+memory is used in supporting hugepages. In most cases, this results in
+out-of-memory issues while booting FADump capture kernel. But hugepages
+are not of much use in capture kernel whose only job is to save vmcore.
+So, disabling hugepages support, when fadump is active, is a reliable
+solution for the out of memory issues. Introducing a flag variable to
+disable HugeTLB support when fadump is active.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.vnet.ibm.com>
+	Reviewed-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8597538712ebd90bc83dfb0b3b40398a0c53ad5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/hash_utils_64.c
+#	arch/powerpc/mm/hugetlbpage.c
+diff --cc arch/powerpc/mm/hash_utils_64.c
+index 64f971665227,5beeec6fbb9b..000000000000
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@@ -485,17 -562,77 +485,84 @@@ static void __init htab_init_page_sizes
+  	 * Try to find the available page sizes in the device-tree
+  	 */
+  	rc = of_scan_flat_dt(htab_dt_scan_page_sizes, NULL);
+ -	if (rc == 0 && early_mmu_has_feature(MMU_FTR_16M_PAGE)) {
+ -		/*
+ -		 * Nothing in the device-tree, but the CPU supports 16M pages,
+ -		 * so let's fallback on a known size list for 16M capable CPUs.
+ -		 */
+ +	if (rc != 0)  /* Found */
+ +		goto found;
+ +
+ +	/*
+ +	 * Not in the device-tree, let's fallback on known size
+ +	 * list for 16M capable GP & GR
+ +	 */
+ +	if (mmu_has_feature(MMU_FTR_16M_PAGE))
+  		memcpy(mmu_psize_defs, mmu_psize_defaults_gp,
+  		       sizeof(mmu_psize_defaults_gp));
+++<<<<<<< HEAD
+ +found:
+++=======
++ 	}
++ 
++ #ifdef CONFIG_HUGETLB_PAGE
++ 	if (!hugetlb_disabled) {
++ 		/* Reserve 16G huge page memory sections for huge pages */
++ 		of_scan_flat_dt(htab_dt_scan_hugepage_blocks, NULL);
++ 	}
++ #endif /* CONFIG_HUGETLB_PAGE */
++ }
++ 
++ /*
++  * Fill in the hpte_page_sizes[] array.
++  * We go through the mmu_psize_defs[] array looking for all the
++  * supported base/actual page size combinations.  Each combination
++  * has a unique pagesize encoding (penc) value in the low bits of
++  * the LP field of the HPTE.  For actual page sizes less than 1MB,
++  * some of the upper LP bits are used for RPN bits, meaning that
++  * we need to fill in several entries in hpte_page_sizes[].
++  *
++  * In diagrammatic form, with r = RPN bits and z = page size bits:
++  *        PTE LP     actual page size
++  *    rrrr rrrz		>=8KB
++  *    rrrr rrzz		>=16KB
++  *    rrrr rzzz		>=32KB
++  *    rrrr zzzz		>=64KB
++  *    ...
++  *
++  * The zzzz bits are implementation-specific but are chosen so that
++  * no encoding for a larger page size uses the same value in its
++  * low-order N bits as the encoding for the 2^(12+N) byte page size
++  * (if it exists).
++  */
++ static void init_hpte_page_sizes(void)
++ {
++ 	long int ap, bp;
++ 	long int shift, penc;
++ 
++ 	for (bp = 0; bp < MMU_PAGE_COUNT; ++bp) {
++ 		if (!mmu_psize_defs[bp].shift)
++ 			continue;	/* not a supported page size */
++ 		for (ap = bp; ap < MMU_PAGE_COUNT; ++ap) {
++ 			penc = mmu_psize_defs[bp].penc[ap];
++ 			if (penc == -1 || !mmu_psize_defs[ap].shift)
++ 				continue;
++ 			shift = mmu_psize_defs[ap].shift - LP_SHIFT;
++ 			if (shift <= 0)
++ 				continue;	/* should never happen */
++ 			/*
++ 			 * For page sizes less than 1MB, this loop
++ 			 * replicates the entry for all possible values
++ 			 * of the rrrr bits.
++ 			 */
++ 			while (penc < (1 << LP_BITS)) {
++ 				hpte_page_sizes[penc] = (ap << 4) | bp;
++ 				penc += 1 << shift;
++ 			}
++ 		}
++ 	}
++ }
++ 
++ static void __init htab_init_page_sizes(void)
++ {
++ 	init_hpte_page_sizes();
++ 
+++>>>>>>> 8597538712eb (powerpc/fadump: Do not use hugepages when fadump is active)
+  	if (!debug_pagealloc_enabled()) {
+  		/*
+  		 * Pick a size for the linear mapping. Currently, we only
+diff --cc arch/powerpc/mm/hugetlbpage.c
+index ec09aae4330e,2a4b1bf8bde6..000000000000
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@@ -29,84 -33,22 +29,86 @@@
+  #define PAGE_SHIFT_16M	24
+  #define PAGE_SHIFT_16G	34
+  
++ bool hugetlb_disabled = false;
++ 
+  unsigned int HPAGE_SHIFT;
+ -EXPORT_SYMBOL(HPAGE_SHIFT);
+  
+ -#define hugepd_none(hpd)	(hpd_val(hpd) == 0)
+ +/*
+ + * Tracks gpages after the device tree is scanned and before the
+ + * huge_boot_pages list is ready.  On non-Freescale implementations, this is
+ + * just used to track 16G pages and so is a single array.  FSL-based
+ + * implementations may have more than one gpage size, so we need multiple
+ + * arrays
+ + */
+ +#ifdef CONFIG_PPC_FSL_BOOK3E
+ +#define MAX_NUMBER_GPAGES	128
+ +struct psize_gpages {
+ +	u64 gpage_list[MAX_NUMBER_GPAGES];
+ +	unsigned int nr_gpages;
+ +};
+ +static struct psize_gpages gpage_freearray[MMU_PAGE_COUNT];
+ +#else
+ +#define MAX_NUMBER_GPAGES	1024
+ +static u64 gpage_freearray[MAX_NUMBER_GPAGES];
+ +static unsigned nr_gpages;
+ +#endif
+ +
+ +#define hugepd_none(hpd)	((hpd).pd == 0)
+ +
+ +#ifdef CONFIG_PPC_BOOK3S_64
+ +/*
+ + * At this point we do the placement change only for BOOK3S 64. This would
+ + * possibly work on other subarchs.
+ + */
+ +
+ +/*
+ + * We have PGD_INDEX_SIZ = 12 and PTE_INDEX_SIZE = 8, so that we can have
+ + * 16GB hugepage pte in PGD and 16MB hugepage pte at PMD;
+ + */
+ +int pmd_huge(pmd_t pmd)
+ +{
+ +	/*
+ +	 * leaf pte for huge page, bottom two bits != 00
+ +	 */
+ +	return ((pmd_val(pmd) & 0x3) != 0x0);
+ +}
+ +
+ +int pud_huge(pud_t pud)
+ +{
+ +	/*
+ +	 * leaf pte for huge page, bottom two bits != 00
+ +	 */
+ +	return ((pud_val(pud) & 0x3) != 0x0);
+ +}
+  
+ -pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr, unsigned long sz)
+ +int pgd_huge(pgd_t pgd)
+  {
+  	/*
+ -	 * Only called for hugetlbfs pages, hence can ignore THP and the
+ -	 * irq disabled walk.
+ +	 * leaf pte for huge page, bottom two bits != 00
+  	 */
+ -	return __find_linux_pte(mm->pgd, addr, NULL, NULL);
+ +	return ((pgd_val(pgd) & 0x3) != 0x0);
+ +}
+ +#else
+ +int pmd_huge(pmd_t pmd)
+ +{
+ +	return 0;
+ +}
+ +
+ +int pud_huge(pud_t pud)
+ +{
+ +	return 0;
+ +}
+ +
+ +int pgd_huge(pgd_t pgd)
+ +{
+ +	return 0;
+ +}
+ +#endif
+ +
+ +pte_t *huge_pte_offset(struct mm_struct *mm, unsigned long addr)
+ +{
+ +	/* Only called for hugetlbfs pages, hence can ignore THP */
+ +	return __find_linux_pte_or_hugepte(mm->pgd, addr, NULL, NULL);
+  }
+  
+  static int __hugepte_alloc(struct mm_struct *mm, hugepd_t *hpdp,
+@@@ -860,47 -653,15 +862,57 @@@ static int __init hugetlbpage_init(void
+  {
+  	int psize;
+  
+++<<<<<<< HEAD
+ +	for (psize = 0; psize < MMU_PAGE_COUNT; ++psize) {
+ +		unsigned shift;
+ +
+ +		if (!mmu_psize_defs[psize].shift)
+ +			continue;
+ +
+ +		shift = mmu_psize_to_shift(psize);
+ +
+ +		/* Don't treat normal page sizes as huge... */
+ +		if (shift != PAGE_SHIFT)
+ +			if (add_huge_page_size(1ULL << shift) < 0)
+ +				continue;
+ +	}
+ +
+ +	/*
+ +	 * Create a kmem cache for hugeptes.  The bottom bits in the pte have
+ +	 * size information encoded in them, so align them to allow this
+ +	 */
+ +	hugepte_cache =  kmem_cache_create("hugepte-cache", sizeof(pte_t),
+ +					   HUGEPD_SHIFT_MASK + 1, 0, NULL);
+ +	if (hugepte_cache == NULL)
+ +		panic("%s: Unable to create kmem cache for hugeptes\n",
+ +		      __func__);
+ +
+ +	/* Default hpage size = 4M */
+ +	if (mmu_psize_defs[MMU_PAGE_4M].shift)
+ +		HPAGE_SHIFT = mmu_psize_defs[MMU_PAGE_4M].shift;
+ +	else
+ +		panic("%s: Unable to set default huge page size\n", __func__);
+ +
+ +
+ +	return 0;
+ +}
+ +#else
+ +static int __init hugetlbpage_init(void)
+ +{
+ +	int psize;
+ +
+ +	if (!mmu_has_feature(MMU_FTR_16M_PAGE))
+++=======
++ 	if (hugetlb_disabled) {
++ 		pr_info("HugeTLB support is disabled!\n");
++ 		return 0;
++ 	}
++ 
++ #if !defined(CONFIG_PPC_FSL_BOOK3E) && !defined(CONFIG_PPC_8xx)
++ 	if (!radix_enabled() && !mmu_has_feature(MMU_FTR_16M_PAGE))
+++>>>>>>> 8597538712eb (powerpc/fadump: Do not use hugepages when fadump is active)
+  		return -ENODEV;
+ -#endif
+ +
+  	for (psize = 0; psize < MMU_PAGE_COUNT; ++psize) {
+  		unsigned shift;
+  		unsigned pdshift;
+diff --git a/arch/powerpc/include/asm/page.h b/arch/powerpc/include/asm/page.h
+index f9c23c24f9f1..5609863fe8e4 100644
+--- a/arch/powerpc/include/asm/page.h
++++ b/arch/powerpc/include/asm/page.h
+@@ -38,6 +38,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ #ifdef CONFIG_HUGETLB_PAGE
++extern bool hugetlb_disabled;
+ extern unsigned int HPAGE_SHIFT;
+ #else
+ #define HPAGE_SHIFT PAGE_SHIFT
+diff --git a/arch/powerpc/kernel/fadump.c b/arch/powerpc/kernel/fadump.c
+index 2b42e52c61ab..6cded4110809 100644
+--- a/arch/powerpc/kernel/fadump.c
++++ b/arch/powerpc/kernel/fadump.c
+@@ -396,6 +396,14 @@ int __init fadump_reserve_mem(void)
+ 	if (fw_dump.dump_active) {
+ 		pr_info("Firmware-assisted dump is active.\n");
+ 
++#ifdef CONFIG_HUGETLB_PAGE
++		/*
++		 * FADump capture kernel doesn't care much about hugepages.
++		 * In fact, handling hugepages in capture kernel is asking for
++		 * trouble. So, disable HugeTLB support when fadump is active.
++		 */
++		hugetlb_disabled = true;
++#endif
+ 		/*
+ 		 * If last boot has crashed then reserve all the memory
+ 		 * above boot_memory_size so that we don't touch it until
+* Unmerged path arch/powerpc/mm/hash_utils_64.c
+* Unmerged path arch/powerpc/mm/hugetlbpage.c
