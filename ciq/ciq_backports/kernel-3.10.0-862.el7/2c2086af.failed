@@ -1,0 +1,105 @@
+block: Protect less code with sysfs_lock in blk_{un,}register_queue()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] Protect less code with sysfs_lock in blk_(un,) register_queue() (Mike Snitzer) [1517771]
+Rebuild_FUZZ: 90.91%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit 2c2086afc2b8b974fac32cb028e73dc27bfae442
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2c2086af.failed
+
+The __blk_mq_register_dev(), blk_mq_unregister_dev(),
+elv_register_queue() and elv_unregister_queue() calls need to be
+protected with sysfs_lock but other code in these functions not.
+Hence protect only this code with sysfs_lock. This patch fixes a
+locking inversion issue in blk_unregister_queue() and also in an
+error path of blk_register_queue(): it is not allowed to hold
+sysfs_lock around the kobject_del(&q->kobj) call.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2c2086afc2b8b974fac32cb028e73dc27bfae442)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+diff --cc block/blk-sysfs.c
+index 28651fcb101c,cbea895a5547..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -631,10 -921,20 +636,17 @@@ int blk_register_queue(struct gendisk *
+  			return ret;
+  		}
+  	}
+ -	ret = 0;
+ -unlock:
+ -	mutex_unlock(&q->sysfs_lock);
+ -	return ret;
+ +
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(blk_register_queue);
+  
++ /**
++  * blk_unregister_queue - counterpart of blk_register_queue()
++  * @disk: Disk of which the request queue should be unregistered from sysfs.
++  *
++  * Note: the caller is responsible for guaranteeing that this function is called
++  * after blk_register_queue() has finished.
++  */
+  void blk_unregister_queue(struct gendisk *disk)
+  {
+  	struct request_queue *q = disk->queue;
+@@@ -642,14 -942,39 +654,45 @@@
+  	if (WARN_ON(!q))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Return early if disk->queue was never registered. */
++ 	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
++ 		return;
++ 
++ 	/*
++ 	 * Since sysfs_remove_dir() prevents adding new directory entries
++ 	 * before removal of existing entries starts, protect against
++ 	 * concurrent elv_iosched_store() calls.
++ 	 */
++ 	mutex_lock(&q->sysfs_lock);
++ 
++ 	spin_lock_irq(q->queue_lock);
++ 	queue_flag_clear(QUEUE_FLAG_REGISTERED, q);
++ 	spin_unlock_irq(q->queue_lock);
++ 
++ 	/*
++ 	 * Remove the sysfs attributes before unregistering the queue data
++ 	 * structures that can be modified through sysfs.
++ 	 */
+++>>>>>>> 2c2086afc2b8 (block: Protect less code with sysfs_lock in blk_{un,}register_queue())
+  	if (q->mq_ops)
+  		blk_mq_unregister_dev(disk_to_dev(disk), q);
+- 
+- 	if (q->request_fn || (q->mq_ops && q->elevator))
+- 		elv_unregister_queue(q);
++ 	mutex_unlock(&q->sysfs_lock);
+  
+  	kobject_uevent(&q->kobj, KOBJ_REMOVE);
+  	kobject_del(&q->kobj);
+  	blk_trace_remove_sysfs(disk_to_dev(disk));
+++<<<<<<< HEAD
+++=======
++ 
++ 	wbt_exit(q);
++ 
++ 	mutex_lock(&q->sysfs_lock);
++ 	if (q->request_fn || (q->mq_ops && q->elevator))
++ 		elv_unregister_queue(q);
++ 	mutex_unlock(&q->sysfs_lock);
++ 
+++>>>>>>> 2c2086afc2b8 (block: Protect less code with sysfs_lock in blk_{un,}register_queue())
+  	kobject_put(&disk_to_dev(disk)->kobj);
+  }
+* Unmerged path block/blk-sysfs.c
