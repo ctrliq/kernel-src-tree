@@ -51,7 +51,11 @@
 struct ixgbevf_tx_buffer {
 	union ixgbe_adv_tx_desc *next_to_watch;
 	unsigned long time_stamp;
-	struct sk_buff *skb;
+	union {
+		struct sk_buff *skb;
+		/* XDP uses address ptr on irq_clean */
+		void *data;
+	};
 	unsigned int bytecount;
 	unsigned short gso_segs;
 	__be16 protocol;
@@ -94,7 +98,15 @@ enum ixgbevf_ring_state_t {
 	__IXGBEVF_RX_BUILD_SKB_ENABLED,
 	__IXGBEVF_TX_DETECT_HANG,
 	__IXGBEVF_HANG_CHECK_ARMED,
+	__IXGBEVF_TX_XDP_RING,
 };
+
+#define ring_is_xdp(ring) \
+		test_bit(__IXGBEVF_TX_XDP_RING, &(ring)->state)
+#define set_ring_xdp(ring) \
+		set_bit(__IXGBEVF_TX_XDP_RING, &(ring)->state)
+#define clear_ring_xdp(ring) \
+		clear_bit(__IXGBEVF_TX_XDP_RING, &(ring)->state)
 
 struct ixgbevf_ring {
 	struct ixgbevf_ring *next;
@@ -138,6 +150,7 @@ struct ixgbevf_ring {
 
 #define MAX_RX_QUEUES IXGBE_VF_MAX_RX_QUEUES
 #define MAX_TX_QUEUES IXGBE_VF_MAX_TX_QUEUES
+#define MAX_XDP_QUEUES IXGBE_VF_MAX_TX_QUEUES
 #define IXGBEVF_MAX_RSS_QUEUES		2
 #define IXGBEVF_82599_RETA_SIZE		128	/* 128 entries */
 #define IXGBEVF_X550_VFRETA_SIZE	64	/* 64 entries */
@@ -338,6 +351,10 @@ struct ixgbevf_adapter {
 	u32 eims_enable_mask;
 	u32 eims_other;
 
+	/* XDP */
+	int num_xdp_queues;
+	struct ixgbevf_ring *xdp_ring[MAX_XDP_QUEUES];
+
 	/* TX */
 	int num_tx_queues;
 	struct ixgbevf_ring *tx_ring[MAX_TX_QUEUES]; /* One per active queue */
@@ -372,6 +389,7 @@ struct ixgbevf_adapter {
 	unsigned long state;
 	u64 tx_busy;
 	unsigned int tx_ring_count;
+	unsigned int xdp_ring_count;
 	unsigned int rx_ring_count;
 
 	u8 __iomem *io_addr; /* Mainly for iounmap use */
