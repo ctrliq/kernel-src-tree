@@ -1,0 +1,202 @@
+scsi: lpfc: Fix SLI3 drivers attempting NVME ELS commands.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix SLI3 drivers attempting NVME ELS commands (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 93.58%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 09559e81121f9663e8f1f6ed05672c49e31be3db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/09559e81.failed
+
+In a server with an 8G adapter and a 32G adapter, running NVME and FCP,
+the server would crash with the following stack.
+
+RIP: 0010: ... lpfc_nvme_register_port+0x38/0x420 [lpfc]
+ lpfc_nlp_state_cleanup+0x154/0x4f0 [lpfc]
+ lpfc_nlp_set_state+0x9d/0x1a0 [lpfc]
+ lpfc_cmpl_prli_prli_issue+0x35f/0x440 [lpfc]
+ lpfc_disc_state_machine+0x78/0x1c0 [lpfc]
+ lpfc_cmpl_els_prli+0x17c/0x1f0 [lpfc]
+ lpfc_sli_sp_handle_rspiocb+0x39b/0x6b0 [lpfc]
+ lpfc_sli_handle_slow_ring_event_s3+0x134/0x2d0 [lpfc]
+ lpfc_work_done+0x8ac/0x13b0 [lpfc]
+ lpfc_do_work+0xf1/0x1b0 [lpfc]
+
+Crash, on the 8G adapter, is due to a vport which does not have a nvme
+local port structure. It's not supposed to have one. NVME is not
+supported on the 8G adapter, so the NVME PRLI, which started this flow
+shouldn't have been sent in the first place.
+
+Correct discovery engine to recognize when on an SLI3 rport, which
+doesn't support SLI3, if the rport supports only NVME, don't send a NVME
+PRLI. Instead, as no FC4 will be used, a LOGO is sent.  If rport is FCP
+and NVME, only execute the SCSI PRLI.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 09559e81121f9663e8f1f6ed05672c49e31be3db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_els.c
+#	drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index ec919b3a122f,54de984d695f..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -2127,10 -2148,41 +2127,43 @@@ lpfc_issue_els_prli(struct lpfc_vport *
+  	struct lpfc_iocbq *elsiocb;
+  	uint8_t *pcmd;
+  	uint16_t cmdsize;
+ -	u32 local_nlp_type, elscmd;
+  
+++<<<<<<< HEAD
+ +	cmdsize = (sizeof(uint32_t) + sizeof(PRLI));
+++=======
++ 	local_nlp_type = ndlp->nlp_fc4_type;
++ 
++  send_next_prli:
++ 	if (local_nlp_type & NLP_FC4_FCP) {
++ 		/* Payload is 4 + 16 = 20 x14 bytes. */
++ 		cmdsize = (sizeof(uint32_t) + sizeof(PRLI));
++ 		elscmd = ELS_CMD_PRLI;
++ 	} else if (local_nlp_type & NLP_FC4_NVME) {
++ 		/* Payload is 4 + 20 = 24 x18 bytes. */
++ 		cmdsize = (sizeof(uint32_t) + sizeof(struct lpfc_nvme_prli));
++ 		elscmd = ELS_CMD_NVMEPRLI;
++ 	} else {
++ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++ 				 "3083 Unknown FC_TYPE x%x ndlp x%06x\n",
++ 				 ndlp->nlp_fc4_type, ndlp->nlp_DID);
++ 		return 1;
++ 	}
++ 
++ 	/* SLI3 ports don't support NVME.  If this rport is a strict NVME
++ 	 * FC4 type, implicitly LOGO.
++ 	 */
++ 	if (phba->sli_rev == LPFC_SLI_REV3 &&
++ 	    ndlp->nlp_fc4_type == NLP_FC4_NVME) {
++ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++ 				 "3088 Rport fc4 type 0x%x not supported by SLI3 adapter\n",
++ 				 ndlp->nlp_type);
++ 		lpfc_disc_state_machine(vport, ndlp, NULL, NLP_EVT_DEVICE_RM);
++ 		return 1;
++ 	}
++ 
+++>>>>>>> 09559e81121f (scsi: lpfc: Fix SLI3 drivers attempting NVME ELS commands.)
+  	elsiocb = lpfc_prep_els_iocb(vport, 1, cmdsize, retry, ndlp,
+ -				     ndlp->nlp_DID, elscmd);
+ +				     ndlp->nlp_DID, ELS_CMD_PRLI);
+  	if (!elsiocb)
+  		return 1;
+  
+@@@ -2178,7 -2270,21 +2211,19 @@@
+  		lpfc_els_free_iocb(phba, elsiocb);
+  		return 1;
+  	}
+ -
+ -	/* The vport counters are used for lpfc_scan_finished, but
+ -	 * the ndlp is used to track outstanding PRLIs for different
+ -	 * FC4 types.
+ -	 */
+  	vport->fc_prli_sent++;
+++<<<<<<< HEAD
+++=======
++ 	ndlp->fc4_prli_sent++;
++ 
++ 	/* The driver supports 2 FC4 types.  Make sure
++ 	 * a PRLI is issued for all types before exiting.
++ 	 */
++ 	if (phba->sli_rev == LPFC_SLI_REV4 &&
++ 	    local_nlp_type & (NLP_FC4_FCP | NLP_FC4_NVME))
++ 		goto send_next_prli;
++ 
+++>>>>>>> 09559e81121f (scsi: lpfc: Fix SLI3 drivers attempting NVME ELS commands.)
+  	return 0;
+  }
+  
+diff --cc drivers/scsi/lpfc/lpfc_hbadisc.c
+index 79d58e5464d6,aa5e5ff56dfb..000000000000
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@@ -4049,23 -4159,59 +4049,54 @@@ lpfc_nlp_state_cleanup(struct lpfc_vpor
+  	if (new_state == NLP_STE_NPR_NODE)
+  		ndlp->nlp_flag &= ~NLP_RCV_PLOGI;
+  
+ -	/* FCP and NVME Transport interface */
+ -	if ((old_state == NLP_STE_MAPPED_NODE ||
+ -	     old_state == NLP_STE_UNMAPPED_NODE)) {
+ -		if (ndlp->rport) {
+ -			vport->phba->nport_event_cnt++;
+ -			lpfc_unregister_remote_port(ndlp);
+ -		}
+ -
+ -		if (ndlp->nlp_fc4_type & NLP_FC4_NVME) {
+ -			vport->phba->nport_event_cnt++;
+ -			if (vport->phba->nvmet_support == 0)
+ -				/* Start devloss */
+ -				lpfc_nvme_unregister_port(vport, ndlp);
+ -			else
+ -				/* NVMET has no upcall. */
+ -				lpfc_nlp_put(ndlp);
+ -		}
+ +	/* Transport interface */
+ +	if (ndlp->rport && (old_state == NLP_STE_MAPPED_NODE ||
+ +			    old_state == NLP_STE_UNMAPPED_NODE)) {
+ +		vport->phba->nport_event_cnt++;
+ +		lpfc_unregister_remote_port(ndlp);
+  	}
+  
+ -	/* FCP and NVME Transport interfaces */
+ -
+  	if (new_state ==  NLP_STE_MAPPED_NODE ||
+  	    new_state == NLP_STE_UNMAPPED_NODE) {
+++<<<<<<< HEAD
+ +		vport->phba->nport_event_cnt++;
+ +		/*
+ +		 * Tell the fc transport about the port, if we haven't
+ +		 * already. If we have, and it's a scsi entity, be
+ +		 * sure to unblock any attached scsi devices
+ +		 */
+ +		lpfc_register_remote_port(vport, ndlp);
+++=======
++ 		if (ndlp->nlp_fc4_type & NLP_FC4_FCP ||
++ 		    ndlp->nlp_DID == Fabric_DID ||
++ 		    ndlp->nlp_DID == NameServer_DID ||
++ 		    ndlp->nlp_DID == FDMI_DID) {
++ 			vport->phba->nport_event_cnt++;
++ 			/*
++ 			 * Tell the fc transport about the port, if we haven't
++ 			 * already. If we have, and it's a scsi entity, be
++ 			 */
++ 			lpfc_register_remote_port(vport, ndlp);
++ 		}
++ 		/* Notify the NVME transport of this new rport. */
++ 		if (vport->phba->sli_rev >= LPFC_SLI_REV4 &&
++ 		    ndlp->nlp_fc4_type & NLP_FC4_NVME) {
++ 			if (vport->phba->nvmet_support == 0) {
++ 				/* Register this rport with the transport.
++ 				 * Initiators take the NDLP ref count in
++ 				 * the register.
++ 				 */
++ 				vport->phba->nport_event_cnt++;
++ 				lpfc_nvme_register_port(vport, ndlp);
++ 			} else {
++ 				/* Just take an NDLP ref count since the
++ 				 * target does not register rports.
++ 				 */
++ 				lpfc_nlp_get(ndlp);
++ 			}
++ 		}
+++>>>>>>> 09559e81121f (scsi: lpfc: Fix SLI3 drivers attempting NVME ELS commands.)
+  	}
+ -
+  	if ((new_state ==  NLP_STE_MAPPED_NODE) &&
+  		(vport->stat_data_enabled)) {
+  		/*
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+* Unmerged path drivers/scsi/lpfc/lpfc_hbadisc.c
