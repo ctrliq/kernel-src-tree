@@ -1,0 +1,297 @@
+seqcount: Add lockdep functionality to seqcount/seqlock structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Stultz <john.stultz@linaro.org>
+commit 1ca7d67cf5d5a2aef26a8d9afd789006fa098347
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1ca7d67c.failed
+
+Currently seqlocks and seqcounts don't support lockdep.
+
+After running across a seqcount related deadlock in the timekeeping
+code, I used a less-refined and more focused variant of this patch
+to narrow down the cause of the issue.
+
+This is a first-pass attempt to properly enable lockdep functionality
+on seqlocks and seqcounts.
+
+Since seqcounts are used in the vdso gettimeofday code, I've provided
+non-lockdep accessors for those needs.
+
+I've also handled one case where there were nested seqlock writers
+and there may be more edge cases.
+
+Comments and feedback would be appreciated!
+
+	Signed-off-by: John Stultz <john.stultz@linaro.org>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: Li Zefan <lizefan@huawei.com>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: netdev@vger.kernel.org
+Link: http://lkml.kernel.org/r/1381186321-4906-3-git-send-email-john.stultz@linaro.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1ca7d67cf5d5a2aef26a8d9afd789006fa098347)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/init_task.h
+#	include/linux/lockdep.h
+#	include/linux/seqlock.h
+#	mm/filemap_xip.c
+diff --cc include/linux/init_task.h
+index a05294bda8c3,b0ed422e4e4a..000000000000
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@@ -33,23 -32,14 +33,23 @@@ extern struct fs_struct init_fs
+  #endif
+  
+  #ifdef CONFIG_CPUSETS
+- #define INIT_CPUSET_SEQ							\
+- 	.mems_allowed_seq = SEQCNT_ZERO,
++ #define INIT_CPUSET_SEQ(tsk)							\
++ 	.mems_allowed_seq = SEQCNT_ZERO(tsk.mems_allowed_seq),
+  #else
+- #define INIT_CPUSET_SEQ
++ #define INIT_CPUSET_SEQ(tsk)
+  #endif
+  
+ +#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ +#define INIT_PREV_CPUTIME(x)	.prev_cputime = {			\
+ +	.lock = __RAW_SPIN_LOCK_UNLOCKED(x.prev_cputime.lock),		\
+ +},
+ +#else
+ +#define INIT_PREV_CPUTIME(x)
+ +#endif
+ +
+  #define INIT_SIGNALS(sig) {						\
+  	.nr_threads	= 1,						\
+ +	.thread_head	= LIST_HEAD_INIT(init_task.thread_node),	\
+  	.wait_chldexit	= __WAIT_QUEUE_HEAD_INITIALIZER(sig.wait_chldexit),\
+  	.shared_pending	= { 						\
+  		.list = LIST_HEAD_INIT(sig.shared_pending.list),	\
+@@@ -240,9 -220,7 +240,13 @@@ extern struct task_group root_task_grou
+  	INIT_FTRACE_GRAPH						\
+  	INIT_TRACE_RECURSION						\
+  	INIT_TASK_RCU_PREEMPT(tsk)					\
+++<<<<<<< HEAD
+ +	INIT_CPUSET_SEQ							\
+ +	INIT_RT_MUTEXES(tsk)					\
+ +	INIT_PREV_CPUTIME(tsk)						\
+++=======
++ 	INIT_CPUSET_SEQ(tsk)						\
+++>>>>>>> 1ca7d67cf5d5 (seqcount: Add lockdep functionality to seqcount/seqlock structures)
+  	INIT_VTIME(tsk)							\
+  }
+  
+diff --cc include/linux/lockdep.h
+index 67c46470a4a2,92b1bfc5da60..000000000000
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@@ -513,8 -512,7 +517,12 @@@ static inline void print_irqtrace_event
+  
+  #define lock_map_acquire(l)			lock_acquire_exclusive(l, 0, 0, NULL, _THIS_IP_)
+  #define lock_map_acquire_read(l)		lock_acquire_shared_recursive(l, 0, 0, NULL, _THIS_IP_)
+++<<<<<<< HEAD
+ +#define lock_map_acquire_tryread(l)		lock_acquire_shared_recursive(l, 0, 1, NULL, _THIS_IP_)
+ +# define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
+++=======
++ #define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
+++>>>>>>> 1ca7d67cf5d5 (seqcount: Add lockdep functionality to seqcount/seqlock structures)
+  
+  #ifdef CONFIG_PROVE_LOCKING
+  # define might_lock(lock) 						\
+diff --cc include/linux/seqlock.h
+index 48f2f69e3867,1e8a8b6e837d..000000000000
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@@ -44,18 -45,51 +45,58 @@@
+   */
+  typedef struct seqcount {
+  	unsigned sequence;
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lockdep_map dep_map;
++ #endif
+  } seqcount_t;
+  
+- #define SEQCNT_ZERO { 0 }
+- #define seqcount_init(x)	do { *(x) = (seqcount_t) SEQCNT_ZERO; } while (0)
++ static inline void __seqcount_init(seqcount_t *s, const char *name,
++ 					  struct lock_class_key *key)
++ {
++ 	/*
++ 	 * Make sure we are not reinitializing a held lock:
++ 	 */
++ 	lockdep_init_map(&s->dep_map, name, key, 0);
++ 	s->sequence = 0;
++ }
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ # define SEQCOUNT_DEP_MAP_INIT(lockname) \
++ 		.dep_map = { .name = #lockname } \
++ 
++ # define seqcount_init(s)				\
++ 	do {						\
++ 		static struct lock_class_key __key;	\
++ 		__seqcount_init((s), #s, &__key);	\
++ 	} while (0)
++ 
++ static inline void seqcount_lockdep_reader_access(const seqcount_t *s)
++ {
++ 	seqcount_t *l = (seqcount_t *)s;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	seqcount_acquire_read(&l->dep_map, 0, 0, _RET_IP_);
++ 	seqcount_release(&l->dep_map, 1, _RET_IP_);
++ 	local_irq_restore(flags);
++ }
++ 
++ #else
++ # define SEQCOUNT_DEP_MAP_INIT(lockname)
++ # define seqcount_init(s) __seqcount_init(s, NULL, NULL)
++ # define seqcount_lockdep_reader_access(x)
++ #endif
++ 
++ #define SEQCNT_ZERO(lockname) { .sequence = 0, SEQCOUNT_DEP_MAP_INIT(lockname)}
++ 
+  
+ +
+ +static inline void __seqcount_init(seqcount_t *s, const char *name,
+ +					  struct lock_class_key *key)
+ +{
+ +	s->sequence = 0;
+ +}
+ +
+  /**
+   * __read_seqcount_begin - begin a seq-read critical section (without barrier)
+   * @s: pointer to seqcount_t
+@@@ -83,17 -117,17 +124,31 @@@ repeat
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * raw_read_seqcount - Read the raw seqcount
+ + * @s: pointer to seqcount_t
+ + * Returns: count to be passed to read_seqcount_retry
+ + *
+ + * raw_read_seqcount opens a read critical section of the given
+ + * seqcount without any lockdep checking and without checking or
+ + * masking the LSB. Calling code is responsible for handling that.
+ + */
+ +static inline unsigned raw_read_seqcount(const seqcount_t *s)
+ +{
+ +	unsigned ret = READ_ONCE(s->sequence);
+++=======
++  * read_seqcount_begin_no_lockdep - start seq-read critical section w/o lockdep
++  * @s: pointer to seqcount_t
++  * Returns: count to be passed to read_seqcount_retry
++  *
++  * read_seqcount_begin_no_lockdep opens a read critical section of the given
++  * seqcount, but without any lockdep checking. Validity of the critical
++  * section is tested by checking read_seqcount_retry function.
++  */
++ static inline unsigned read_seqcount_begin_no_lockdep(const seqcount_t *s)
++ {
++ 	unsigned ret = __read_seqcount_begin(s);
+++>>>>>>> 1ca7d67cf5d5 (seqcount: Add lockdep functionality to seqcount/seqlock structures)
+  	smp_rmb();
+  	return ret;
+  }
+@@@ -130,7 -163,9 +184,13 @@@ static inline unsigned read_seqcount_be
+   */
+  static inline unsigned raw_seqcount_begin(const seqcount_t *s)
+  {
+++<<<<<<< HEAD
+ +	unsigned ret = READ_ONCE(s->sequence);
+++=======
++ 	unsigned ret = ACCESS_ONCE(s->sequence);
++ 
++ 	seqcount_lockdep_reader_access(s);
+++>>>>>>> 1ca7d67cf5d5 (seqcount: Add lockdep functionality to seqcount/seqlock structures)
+  	smp_rmb();
+  	return ret & ~1;
+  }
+* Unmerged path mm/filemap_xip.c
+diff --git a/arch/x86/vdso/vclock_gettime.c b/arch/x86/vdso/vclock_gettime.c
+index 7bd0b1186cc9..32b1615cb628 100644
+--- a/arch/x86/vdso/vclock_gettime.c
++++ b/arch/x86/vdso/vclock_gettime.c
+@@ -184,7 +184,7 @@ notrace static int __always_inline do_realtime(struct timespec *ts)
+ 
+ 	ts->tv_nsec = 0;
+ 	do {
+-		seq = read_seqcount_begin(&gtod->seq);
++		seq = read_seqcount_begin_no_lockdep(&gtod->seq);
+ 		mode = gtod->clock.vclock_mode;
+ 		ts->tv_sec = gtod->wall_time_sec;
+ 		ns = gtod->wall_time_snsec;
+@@ -204,7 +204,7 @@ notrace static int do_monotonic(struct timespec *ts)
+ 
+ 	ts->tv_nsec = 0;
+ 	do {
+-		seq = read_seqcount_begin(&gtod->seq);
++		seq = read_seqcount_begin_no_lockdep(&gtod->seq);
+ 		mode = gtod->clock.vclock_mode;
+ 		ts->tv_sec = gtod->monotonic_time_sec;
+ 		ns = gtod->monotonic_time_snsec;
+@@ -220,7 +220,7 @@ notrace static int do_realtime_coarse(struct timespec *ts)
+ {
+ 	unsigned long seq;
+ 	do {
+-		seq = read_seqcount_begin(&gtod->seq);
++		seq = read_seqcount_begin_no_lockdep(&gtod->seq);
+ 		ts->tv_sec = gtod->wall_time_coarse.tv_sec;
+ 		ts->tv_nsec = gtod->wall_time_coarse.tv_nsec;
+ 	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
+@@ -231,7 +231,7 @@ notrace static int do_monotonic_coarse(struct timespec *ts)
+ {
+ 	unsigned long seq;
+ 	do {
+-		seq = read_seqcount_begin(&gtod->seq);
++		seq = read_seqcount_begin_no_lockdep(&gtod->seq);
+ 		ts->tv_sec = gtod->monotonic_time_coarse.tv_sec;
+ 		ts->tv_nsec = gtod->monotonic_time_coarse.tv_nsec;
+ 	} while (unlikely(read_seqcount_retry(&gtod->seq, seq)));
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 1eabedd8b45c..ab4725bf7b06 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -2461,7 +2461,7 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
+ 	dentry_lock_for_move(dentry, target);
+ 
+ 	write_seqcount_begin(&dentry->d_seq);
+-	write_seqcount_begin(&target->d_seq);
++	write_seqcount_begin_nested(&target->d_seq, DENTRY_D_LOCK_NESTED);
+ 
+ 	/* __d_drop does write_seqcount_barrier, but they're OK to nest. */
+ 
+@@ -2620,7 +2620,7 @@ static void __d_materialise_dentry(struct dentry *dentry, struct dentry *anon)
+ 	dentry_lock_for_move(anon, dentry);
+ 
+ 	write_seqcount_begin(&dentry->d_seq);
+-	write_seqcount_begin(&anon->d_seq);
++	write_seqcount_begin_nested(&anon->d_seq, DENTRY_D_LOCK_NESTED);
+ 
+ 	dparent = dentry->d_parent;
+ 
+diff --git a/fs/fs_struct.c b/fs/fs_struct.c
+index 03e2b6c348fd..3b2da903c39d 100644
+--- a/fs/fs_struct.c
++++ b/fs/fs_struct.c
+@@ -161,6 +161,6 @@ EXPORT_SYMBOL(current_umask);
+ struct fs_struct init_fs = {
+ 	.users		= 1,
+ 	.lock		= __SPIN_LOCK_UNLOCKED(init_fs.lock),
+-	.seq		= SEQCNT_ZERO,
++	.seq		= SEQCNT_ZERO(init_fs.seq),
+ 	.umask		= 0022,
+ };
+* Unmerged path include/linux/init_task.h
+* Unmerged path include/linux/lockdep.h
+* Unmerged path include/linux/seqlock.h
+* Unmerged path mm/filemap_xip.c
