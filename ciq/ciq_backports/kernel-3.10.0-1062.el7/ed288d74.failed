@@ -1,0 +1,624 @@
+net/xprtrdma: Simplify ib_post_(send|recv|srq_recv)() calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] xprtrdma: Simplify ib_post_(send|recv|srq_recv)() calls (Kamal Heib) [1655920]
+Rebuild_FUZZ: 96.49%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit ed288d74a9e5d9ff869350906ad35eb231c55388
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ed288d74.failed
+
+Instead of declaring and passing a dummy 'bad_wr' pointer, pass NULL
+as third argument to ib_post_(send|recv|srq_recv)().
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Chuck Lever <chuck.lever@oracle.com>
+	Acked-by: Anna Schumaker <Anna.Schumaker@netapp.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit ed288d74a9e5d9ff869350906ad35eb231c55388)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+#	net/sunrpc/xprtrdma/svc_rdma_sendto.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index 2eed6e104513,2ef75e885411..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@@ -108,61 -108,266 +108,247 @@@
+  
+  #define RPCDBG_FACILITY	RPCDBG_SVCXPRT
+  
+ -static void svc_rdma_wc_receive(struct ib_cq *cq, struct ib_wc *wc);
+ -
+ -static inline struct svc_rdma_recv_ctxt *
+ -svc_rdma_next_recv_ctxt(struct list_head *list)
+ -{
+ -	return list_first_entry_or_null(list, struct svc_rdma_recv_ctxt,
+ -					rc_list);
+ -}
+ -
+ -static struct svc_rdma_recv_ctxt *
+ -svc_rdma_recv_ctxt_alloc(struct svcxprt_rdma *rdma)
+ -{
+ -	struct svc_rdma_recv_ctxt *ctxt;
+ -	dma_addr_t addr;
+ -	void *buffer;
+ -
+ -	ctxt = kmalloc(sizeof(*ctxt), GFP_KERNEL);
+ -	if (!ctxt)
+ -		goto fail0;
+ -	buffer = kmalloc(rdma->sc_max_req_size, GFP_KERNEL);
+ -	if (!buffer)
+ -		goto fail1;
+ -	addr = ib_dma_map_single(rdma->sc_pd->device, buffer,
+ -				 rdma->sc_max_req_size, DMA_FROM_DEVICE);
+ -	if (ib_dma_mapping_error(rdma->sc_pd->device, addr))
+ -		goto fail2;
+ -
+ -	ctxt->rc_recv_wr.next = NULL;
+ -	ctxt->rc_recv_wr.wr_cqe = &ctxt->rc_cqe;
+ -	ctxt->rc_recv_wr.sg_list = &ctxt->rc_recv_sge;
+ -	ctxt->rc_recv_wr.num_sge = 1;
+ -	ctxt->rc_cqe.done = svc_rdma_wc_receive;
+ -	ctxt->rc_recv_sge.addr = addr;
+ -	ctxt->rc_recv_sge.length = rdma->sc_max_req_size;
+ -	ctxt->rc_recv_sge.lkey = rdma->sc_pd->local_dma_lkey;
+ -	ctxt->rc_recv_buf = buffer;
+ -	ctxt->rc_temp = false;
+ -	return ctxt;
+ -
+ -fail2:
+ -	kfree(buffer);
+ -fail1:
+ -	kfree(ctxt);
+ -fail0:
+ -	return NULL;
+ -}
+ -
+ -static void svc_rdma_recv_ctxt_destroy(struct svcxprt_rdma *rdma,
+ -				       struct svc_rdma_recv_ctxt *ctxt)
+ -{
+ -	ib_dma_unmap_single(rdma->sc_pd->device, ctxt->rc_recv_sge.addr,
+ -			    ctxt->rc_recv_sge.length, DMA_FROM_DEVICE);
+ -	kfree(ctxt->rc_recv_buf);
+ -	kfree(ctxt);
+ -}
+ -
+ -/**
+ - * svc_rdma_recv_ctxts_destroy - Release all recv_ctxt's for an xprt
+ - * @rdma: svcxprt_rdma being torn down
+ - *
+ +/*
+ + * Replace the pages in the rq_argpages array with the pages from the SGE in
+ + * the RDMA_RECV completion. The SGL should contain full pages up until the
+ + * last one.
+   */
+++<<<<<<< HEAD
+++=======
++ void svc_rdma_recv_ctxts_destroy(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 
++ 	while ((ctxt = svc_rdma_next_recv_ctxt(&rdma->sc_recv_ctxts))) {
++ 		list_del(&ctxt->rc_list);
++ 		svc_rdma_recv_ctxt_destroy(rdma, ctxt);
++ 	}
++ }
++ 
++ static struct svc_rdma_recv_ctxt *
++ svc_rdma_recv_ctxt_get(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 
++ 	spin_lock(&rdma->sc_recv_lock);
++ 	ctxt = svc_rdma_next_recv_ctxt(&rdma->sc_recv_ctxts);
++ 	if (!ctxt)
++ 		goto out_empty;
++ 	list_del(&ctxt->rc_list);
++ 	spin_unlock(&rdma->sc_recv_lock);
++ 
++ out:
++ 	ctxt->rc_page_count = 0;
++ 	return ctxt;
++ 
++ out_empty:
++ 	spin_unlock(&rdma->sc_recv_lock);
++ 
++ 	ctxt = svc_rdma_recv_ctxt_alloc(rdma);
++ 	if (!ctxt)
++ 		return NULL;
++ 	goto out;
++ }
++ 
++ /**
++  * svc_rdma_recv_ctxt_put - Return recv_ctxt to free list
++  * @rdma: controlling svcxprt_rdma
++  * @ctxt: object to return to the free list
++  *
++  */
++ void svc_rdma_recv_ctxt_put(struct svcxprt_rdma *rdma,
++ 			    struct svc_rdma_recv_ctxt *ctxt)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < ctxt->rc_page_count; i++)
++ 		put_page(ctxt->rc_pages[i]);
++ 
++ 	if (!ctxt->rc_temp) {
++ 		spin_lock(&rdma->sc_recv_lock);
++ 		list_add(&ctxt->rc_list, &rdma->sc_recv_ctxts);
++ 		spin_unlock(&rdma->sc_recv_lock);
++ 	} else
++ 		svc_rdma_recv_ctxt_destroy(rdma, ctxt);
++ }
++ 
++ static int __svc_rdma_post_recv(struct svcxprt_rdma *rdma,
++ 				struct svc_rdma_recv_ctxt *ctxt)
++ {
++ 	int ret;
++ 
++ 	svc_xprt_get(&rdma->sc_xprt);
++ 	ret = ib_post_recv(rdma->sc_qp, &ctxt->rc_recv_wr, NULL);
++ 	trace_svcrdma_post_recv(&ctxt->rc_recv_wr, ret);
++ 	if (ret)
++ 		goto err_post;
++ 	return 0;
++ 
++ err_post:
++ 	svc_rdma_recv_ctxt_put(rdma, ctxt);
++ 	svc_xprt_put(&rdma->sc_xprt);
++ 	return ret;
++ }
++ 
++ static int svc_rdma_post_recv(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 
++ 	ctxt = svc_rdma_recv_ctxt_get(rdma);
++ 	if (!ctxt)
++ 		return -ENOMEM;
++ 	return __svc_rdma_post_recv(rdma, ctxt);
++ }
++ 
++ /**
++  * svc_rdma_post_recvs - Post initial set of Recv WRs
++  * @rdma: fresh svcxprt_rdma
++  *
++  * Returns true if successful, otherwise false.
++  */
++ bool svc_rdma_post_recvs(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 	unsigned int i;
++ 	int ret;
++ 
++ 	for (i = 0; i < rdma->sc_max_requests; i++) {
++ 		ctxt = svc_rdma_recv_ctxt_get(rdma);
++ 		if (!ctxt)
++ 			return false;
++ 		ctxt->rc_temp = true;
++ 		ret = __svc_rdma_post_recv(rdma, ctxt);
++ 		if (ret) {
++ 			pr_err("svcrdma: failure posting recv buffers: %d\n",
++ 			       ret);
++ 			return false;
++ 		}
++ 	}
++ 	return true;
++ }
++ 
++ /**
++  * svc_rdma_wc_receive - Invoked by RDMA provider for each polled Receive WC
++  * @cq: Completion Queue context
++  * @wc: Work Completion object
++  *
++  * NB: The svc_xprt/svcxprt_rdma is pinned whenever it's possible that
++  * the Receive completion handler could be running.
++  */
++ static void svc_rdma_wc_receive(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct svcxprt_rdma *rdma = cq->cq_context;
++ 	struct ib_cqe *cqe = wc->wr_cqe;
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 
++ 	trace_svcrdma_wc_receive(wc);
++ 
++ 	/* WARNING: Only wc->wr_cqe and wc->status are reliable */
++ 	ctxt = container_of(cqe, struct svc_rdma_recv_ctxt, rc_cqe);
++ 
++ 	if (wc->status != IB_WC_SUCCESS)
++ 		goto flushed;
++ 
++ 	if (svc_rdma_post_recv(rdma))
++ 		goto post_err;
++ 
++ 	/* All wc fields are now known to be valid */
++ 	ctxt->rc_byte_len = wc->byte_len;
++ 	ib_dma_sync_single_for_cpu(rdma->sc_pd->device,
++ 				   ctxt->rc_recv_sge.addr,
++ 				   wc->byte_len, DMA_FROM_DEVICE);
++ 
++ 	spin_lock(&rdma->sc_rq_dto_lock);
++ 	list_add_tail(&ctxt->rc_list, &rdma->sc_rq_dto_q);
++ 	spin_unlock(&rdma->sc_rq_dto_lock);
++ 	set_bit(XPT_DATA, &rdma->sc_xprt.xpt_flags);
++ 	if (!test_bit(RDMAXPRT_CONN_PENDING, &rdma->sc_flags))
++ 		svc_xprt_enqueue(&rdma->sc_xprt);
++ 	goto out;
++ 
++ flushed:
++ 	if (wc->status != IB_WC_WR_FLUSH_ERR)
++ 		pr_err("svcrdma: Recv: %s (%u/0x%x)\n",
++ 		       ib_wc_status_msg(wc->status),
++ 		       wc->status, wc->vendor_err);
++ post_err:
++ 	svc_rdma_recv_ctxt_put(rdma, ctxt);
++ 	set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
++ 	svc_xprt_enqueue(&rdma->sc_xprt);
++ out:
++ 	svc_xprt_put(&rdma->sc_xprt);
++ }
++ 
++ /**
++  * svc_rdma_flush_recv_queues - Drain pending Receive work
++  * @rdma: svcxprt_rdma being shut down
++  *
++  */
++ void svc_rdma_flush_recv_queues(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_recv_ctxt *ctxt;
++ 
++ 	while ((ctxt = svc_rdma_next_recv_ctxt(&rdma->sc_read_complete_q))) {
++ 		list_del(&ctxt->rc_list);
++ 		svc_rdma_recv_ctxt_put(rdma, ctxt);
++ 	}
++ 	while ((ctxt = svc_rdma_next_recv_ctxt(&rdma->sc_rq_dto_q))) {
++ 		list_del(&ctxt->rc_list);
++ 		svc_rdma_recv_ctxt_put(rdma, ctxt);
++ 	}
++ }
++ 
+++>>>>>>> ed288d74a9e5 (net/xprtrdma: Simplify ib_post_(send|recv|srq_recv)() calls)
+  static void svc_rdma_build_arg_xdr(struct svc_rqst *rqstp,
+ -				   struct svc_rdma_recv_ctxt *ctxt)
+ +				   struct svc_rdma_op_ctxt *ctxt)
+  {
+ -	struct xdr_buf *arg = &rqstp->rq_arg;
+ -
+ -	arg->head[0].iov_base = ctxt->rc_recv_buf;
+ -	arg->head[0].iov_len = ctxt->rc_byte_len;
+ -	arg->tail[0].iov_base = NULL;
+ -	arg->tail[0].iov_len = 0;
+ -	arg->page_len = 0;
+ -	arg->page_base = 0;
+ -	arg->buflen = ctxt->rc_byte_len;
+ -	arg->len = ctxt->rc_byte_len;
+ -
+ -	rqstp->rq_respages = &rqstp->rq_pages[0];
+ +	struct page *page;
+ +	int sge_no;
+ +	u32 len;
+ +
+ +	/* The reply path assumes the Call's transport header resides
+ +	 * in rqstp->rq_pages[0].
+ +	 */
+ +	page = ctxt->pages[0];
+ +	put_page(rqstp->rq_pages[0]);
+ +	rqstp->rq_pages[0] = page;
+ +
+ +	/* Set up the XDR head */
+ +	rqstp->rq_arg.head[0].iov_base = page_address(page);
+ +	rqstp->rq_arg.head[0].iov_len =
+ +		min_t(size_t, ctxt->byte_len, ctxt->sge[0].length);
+ +	rqstp->rq_arg.len = ctxt->byte_len;
+ +	rqstp->rq_arg.buflen = ctxt->byte_len;
+ +
+ +	/* Compute bytes past head in the SGL */
+ +	len = ctxt->byte_len - rqstp->rq_arg.head[0].iov_len;
+ +
+ +	/* If data remains, store it in the pagelist */
+ +	rqstp->rq_arg.page_len = len;
+ +	rqstp->rq_arg.page_base = 0;
+ +
+ +	sge_no = 1;
+ +	while (len && sge_no < ctxt->count) {
+ +		page = ctxt->pages[sge_no];
+ +		put_page(rqstp->rq_pages[sge_no]);
+ +		rqstp->rq_pages[sge_no] = page;
+ +		len -= min_t(u32, len, ctxt->sge[sge_no].length);
+ +		sge_no++;
+ +	}
+ +	rqstp->rq_respages = &rqstp->rq_pages[sge_no];
+  	rqstp->rq_next_page = rqstp->rq_respages + 1;
+ +
+ +	/* If not all pages were used from the SGL, free the remaining ones */
+ +	len = sge_no;
+ +	while (sge_no < ctxt->count) {
+ +		page = ctxt->pages[sge_no++];
+ +		put_page(page);
+ +	}
+ +	ctxt->count = len;
+ +
+ +	/* Set up tail */
+ +	rqstp->rq_arg.tail[0].iov_base = NULL;
+ +	rqstp->rq_arg.tail[0].iov_len = 0;
+  }
+  
+  /* This accommodates the largest possible Write chunk,
+diff --cc net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 00a497c70989,ffef0c508f1a..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@@ -114,6 -114,214 +114,217 @@@
+  
+  #define RPCDBG_FACILITY	RPCDBG_SVCXPRT
+  
+++<<<<<<< HEAD
+++=======
++ static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
++ 
++ static inline struct svc_rdma_send_ctxt *
++ svc_rdma_next_send_ctxt(struct list_head *list)
++ {
++ 	return list_first_entry_or_null(list, struct svc_rdma_send_ctxt,
++ 					sc_list);
++ }
++ 
++ static struct svc_rdma_send_ctxt *
++ svc_rdma_send_ctxt_alloc(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 	dma_addr_t addr;
++ 	void *buffer;
++ 	size_t size;
++ 	int i;
++ 
++ 	size = sizeof(*ctxt);
++ 	size += rdma->sc_max_send_sges * sizeof(struct ib_sge);
++ 	ctxt = kmalloc(size, GFP_KERNEL);
++ 	if (!ctxt)
++ 		goto fail0;
++ 	buffer = kmalloc(rdma->sc_max_req_size, GFP_KERNEL);
++ 	if (!buffer)
++ 		goto fail1;
++ 	addr = ib_dma_map_single(rdma->sc_pd->device, buffer,
++ 				 rdma->sc_max_req_size, DMA_TO_DEVICE);
++ 	if (ib_dma_mapping_error(rdma->sc_pd->device, addr))
++ 		goto fail2;
++ 
++ 	ctxt->sc_send_wr.next = NULL;
++ 	ctxt->sc_send_wr.wr_cqe = &ctxt->sc_cqe;
++ 	ctxt->sc_send_wr.sg_list = ctxt->sc_sges;
++ 	ctxt->sc_send_wr.send_flags = IB_SEND_SIGNALED;
++ 	ctxt->sc_cqe.done = svc_rdma_wc_send;
++ 	ctxt->sc_xprt_buf = buffer;
++ 	ctxt->sc_sges[0].addr = addr;
++ 
++ 	for (i = 0; i < rdma->sc_max_send_sges; i++)
++ 		ctxt->sc_sges[i].lkey = rdma->sc_pd->local_dma_lkey;
++ 	return ctxt;
++ 
++ fail2:
++ 	kfree(buffer);
++ fail1:
++ 	kfree(ctxt);
++ fail0:
++ 	return NULL;
++ }
++ 
++ /**
++  * svc_rdma_send_ctxts_destroy - Release all send_ctxt's for an xprt
++  * @rdma: svcxprt_rdma being torn down
++  *
++  */
++ void svc_rdma_send_ctxts_destroy(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	while ((ctxt = svc_rdma_next_send_ctxt(&rdma->sc_send_ctxts))) {
++ 		list_del(&ctxt->sc_list);
++ 		ib_dma_unmap_single(rdma->sc_pd->device,
++ 				    ctxt->sc_sges[0].addr,
++ 				    rdma->sc_max_req_size,
++ 				    DMA_TO_DEVICE);
++ 		kfree(ctxt->sc_xprt_buf);
++ 		kfree(ctxt);
++ 	}
++ }
++ 
++ /**
++  * svc_rdma_send_ctxt_get - Get a free send_ctxt
++  * @rdma: controlling svcxprt_rdma
++  *
++  * Returns a ready-to-use send_ctxt, or NULL if none are
++  * available and a fresh one cannot be allocated.
++  */
++ struct svc_rdma_send_ctxt *svc_rdma_send_ctxt_get(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	spin_lock(&rdma->sc_send_lock);
++ 	ctxt = svc_rdma_next_send_ctxt(&rdma->sc_send_ctxts);
++ 	if (!ctxt)
++ 		goto out_empty;
++ 	list_del(&ctxt->sc_list);
++ 	spin_unlock(&rdma->sc_send_lock);
++ 
++ out:
++ 	ctxt->sc_send_wr.num_sge = 0;
++ 	ctxt->sc_cur_sge_no = 0;
++ 	ctxt->sc_page_count = 0;
++ 	return ctxt;
++ 
++ out_empty:
++ 	spin_unlock(&rdma->sc_send_lock);
++ 	ctxt = svc_rdma_send_ctxt_alloc(rdma);
++ 	if (!ctxt)
++ 		return NULL;
++ 	goto out;
++ }
++ 
++ /**
++  * svc_rdma_send_ctxt_put - Return send_ctxt to free list
++  * @rdma: controlling svcxprt_rdma
++  * @ctxt: object to return to the free list
++  *
++  * Pages left in sc_pages are DMA unmapped and released.
++  */
++ void svc_rdma_send_ctxt_put(struct svcxprt_rdma *rdma,
++ 			    struct svc_rdma_send_ctxt *ctxt)
++ {
++ 	struct ib_device *device = rdma->sc_cm_id->device;
++ 	unsigned int i;
++ 
++ 	/* The first SGE contains the transport header, which
++ 	 * remains mapped until @ctxt is destroyed.
++ 	 */
++ 	for (i = 1; i < ctxt->sc_send_wr.num_sge; i++)
++ 		ib_dma_unmap_page(device,
++ 				  ctxt->sc_sges[i].addr,
++ 				  ctxt->sc_sges[i].length,
++ 				  DMA_TO_DEVICE);
++ 
++ 	for (i = 0; i < ctxt->sc_page_count; ++i)
++ 		put_page(ctxt->sc_pages[i]);
++ 
++ 	spin_lock(&rdma->sc_send_lock);
++ 	list_add(&ctxt->sc_list, &rdma->sc_send_ctxts);
++ 	spin_unlock(&rdma->sc_send_lock);
++ }
++ 
++ /**
++  * svc_rdma_wc_send - Invoked by RDMA provider for each polled Send WC
++  * @cq: Completion Queue context
++  * @wc: Work Completion object
++  *
++  * NB: The svc_xprt/svcxprt_rdma is pinned whenever it's possible that
++  * the Send completion handler could be running.
++  */
++ static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct svcxprt_rdma *rdma = cq->cq_context;
++ 	struct ib_cqe *cqe = wc->wr_cqe;
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	trace_svcrdma_wc_send(wc);
++ 
++ 	atomic_inc(&rdma->sc_sq_avail);
++ 	wake_up(&rdma->sc_send_wait);
++ 
++ 	ctxt = container_of(cqe, struct svc_rdma_send_ctxt, sc_cqe);
++ 	svc_rdma_send_ctxt_put(rdma, ctxt);
++ 
++ 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
++ 		set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
++ 		svc_xprt_enqueue(&rdma->sc_xprt);
++ 		if (wc->status != IB_WC_WR_FLUSH_ERR)
++ 			pr_err("svcrdma: Send: %s (%u/0x%x)\n",
++ 			       ib_wc_status_msg(wc->status),
++ 			       wc->status, wc->vendor_err);
++ 	}
++ 
++ 	svc_xprt_put(&rdma->sc_xprt);
++ }
++ 
++ /**
++  * svc_rdma_send - Post a single Send WR
++  * @rdma: transport on which to post the WR
++  * @wr: prepared Send WR to post
++  *
++  * Returns zero the Send WR was posted successfully. Otherwise, a
++  * negative errno is returned.
++  */
++ int svc_rdma_send(struct svcxprt_rdma *rdma, struct ib_send_wr *wr)
++ {
++ 	int ret;
++ 
++ 	might_sleep();
++ 
++ 	/* If the SQ is full, wait until an SQ entry is available */
++ 	while (1) {
++ 		if ((atomic_dec_return(&rdma->sc_sq_avail) < 0)) {
++ 			atomic_inc(&rdma_stat_sq_starve);
++ 			trace_svcrdma_sq_full(rdma);
++ 			atomic_inc(&rdma->sc_sq_avail);
++ 			wait_event(rdma->sc_send_wait,
++ 				   atomic_read(&rdma->sc_sq_avail) > 1);
++ 			if (test_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags))
++ 				return -ENOTCONN;
++ 			trace_svcrdma_sq_retry(rdma);
++ 			continue;
++ 		}
++ 
++ 		svc_xprt_get(&rdma->sc_xprt);
++ 		ret = ib_post_send(rdma->sc_qp, wr, NULL);
++ 		trace_svcrdma_post_send(wr, ret);
++ 		if (ret) {
++ 			set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
++ 			svc_xprt_put(&rdma->sc_xprt);
++ 			wake_up(&rdma->sc_send_wait);
++ 		}
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> ed288d74a9e5 (net/xprtrdma: Simplify ib_post_(send|recv|srq_recv)() calls)
+  static u32 xdr_padsize(u32 len)
+  {
+  	return (len & 3) ? (4 - (len & 3)) : 0;
+diff --git a/net/sunrpc/xprtrdma/fmr_ops.c b/net/sunrpc/xprtrdma/fmr_ops.c
+index 9b95b2ca7380..da787e2fd043 100644
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@ -278,9 +278,7 @@ out_maperr:
+ static int
+ fmr_op_send(struct rpcrdma_ia *ia, struct rpcrdma_req *req)
+ {
+-	struct ib_send_wr *bad_wr;
+-
+-	return ib_post_send(ia->ri_id->qp, &req->rl_sendctx->sc_wr, &bad_wr);
++	return ib_post_send(ia->ri_id->qp, &req->rl_sendctx->sc_wr, NULL);
+ }
+ 
+ /* Invalidate all memory regions that were registered for "req".
+diff --git a/net/sunrpc/xprtrdma/frwr_ops.c b/net/sunrpc/xprtrdma/frwr_ops.c
+index 3040fe00fc7d..3b309f46e611 100644
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -463,7 +463,7 @@ out_mapmr_err:
+ static int
+ frwr_op_send(struct rpcrdma_ia *ia, struct rpcrdma_req *req)
+ {
+-	struct ib_send_wr *post_wr, *bad_wr;
++	struct ib_send_wr *post_wr;
+ 	struct rpcrdma_mr *mr;
+ 
+ 	post_wr = &req->rl_sendctx->sc_wr;
+@@ -485,7 +485,7 @@ frwr_op_send(struct rpcrdma_ia *ia, struct rpcrdma_req *req)
+ 	/* If ib_post_send fails, the next ->send_request for
+ 	 * @req will queue these MWs for recovery.
+ 	 */
+-	return ib_post_send(ia->ri_id->qp, post_wr, &bad_wr);
++	return ib_post_send(ia->ri_id->qp, post_wr, NULL);
+ }
+ 
+ /* Handle a remotely invalidated mr on the @mrs list
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_rw.c b/net/sunrpc/xprtrdma/svc_rdma_rw.c
+index 506b9ec4883d..619dbf3fabae 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_rw.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_rw.c
+@@ -328,7 +328,7 @@ static int svc_rdma_post_chunk_ctxt(struct svc_rdma_chunk_ctxt *cc)
+ 	do {
+ 		if (atomic_sub_return(cc->cc_sqecount,
+ 				      &rdma->sc_sq_avail) > 0) {
+-			ret = ib_post_send(rdma->sc_qp, first_wr, &bad_wr);
++			ret = ib_post_send(rdma->sc_qp, first_wr, NULL);
+ 			trace_svcrdma_post_rw(&cc->cc_cqe,
+ 					      cc->cc_sqecount, ret);
+ 			if (ret)
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_sendto.c
