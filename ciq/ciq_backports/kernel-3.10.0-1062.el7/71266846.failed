@@ -1,0 +1,324 @@
+hwmon: (coretemp) Simplify package management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [hwmon] (coretemp) Simplify package management (David Arcari) [1700822]
+Rebuild_FUZZ: 91.57%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 712668460594294d74c13f2a023398a597fbe95f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/71266846.failed
+
+Keeping track of the per package platform devices requires an extra object,
+which is held in a linked list.
+
+The maximum number of packages is known at init() time. So the extra object
+and linked list management can be replaced by an array of platform device
+pointers in which the per package devices pointers can be stored. Lookup
+becomes a simple array lookup instead of a list walk.
+
+The mutex protecting the list can be removed as well because the array is
+only accessed from cpu hotplug callbacks which are already serialized.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+(cherry picked from commit 712668460594294d74c13f2a023398a597fbe95f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hwmon/coretemp.c
+diff --cc drivers/hwmon/coretemp.c
+index 158187653545,3ac4c03ba77b..000000000000
+--- a/drivers/hwmon/coretemp.c
++++ b/drivers/hwmon/coretemp.c
+@@@ -102,9 -102,10 +101,16 @@@ struct temp_data 
+  
+  /* Platform Data per Physical CPU */
+  struct platform_data {
+++<<<<<<< HEAD
+ +	struct device *hwmon_dev;
+ +	u16 phys_proc_id;
+ +	struct temp_data *core_data[MAX_CORE_DATA];
+++=======
++ 	struct device		*hwmon_dev;
++ 	u16			pkg_id;
++ 	struct cpumask		cpumask;
++ 	struct temp_data	*core_data[MAX_CORE_DATA];
+++>>>>>>> 712668460594 (hwmon: (coretemp) Simplify package management)
+  	struct device_attribute name_attr;
+  };
+  
+@@@ -626,62 -590,19 +611,37 @@@ static struct platform_device *coretemp
+  
+  	err = platform_device_add(pdev);
+  	if (err) {
+- 		pr_err("Device addition failed (%d)\n", err);
+- 		goto exit_device_free;
++ 		platform_device_put(pdev);
++ 		return ERR_PTR(err);
+  	}
+  
+- 	pdev_entry->pdev = pdev;
+- 	pdev_entry->phys_proc_id = pdev->id;
+- 
+- 	list_add_tail(&pdev_entry->list, &pdev_list);
+- 	mutex_unlock(&pdev_list_mutex);
+- 
+- 	return 0;
+- 
+- exit_device_free:
+- 	kfree(pdev_entry);
+- exit_device_put:
+- 	platform_device_put(pdev);
+- exit:
+- 	mutex_unlock(&pdev_list_mutex);
+- 	return err;
+- }
+- 
+- static void coretemp_device_remove(unsigned int cpu)
+- {
+- 	struct pdev_entry *p, *n;
+- 	u16 phys_proc_id = TO_PHYS_ID(cpu);
+- 
+- 	mutex_lock(&pdev_list_mutex);
+- 	list_for_each_entry_safe(p, n, &pdev_list, list) {
+- 		if (p->phys_proc_id != phys_proc_id)
+- 			continue;
+- 		platform_device_unregister(p->pdev);
+- 		list_del(&p->list);
+- 		kfree(p);
+- 	}
+- 	mutex_unlock(&pdev_list_mutex);
++ 	pkg_devices[pkgid] = pdev;
++ 	return pdev;
+  }
+  
+ -static int coretemp_cpu_online(unsigned int cpu)
+ +static bool is_any_core_online(struct platform_data *pdata)
+ +{
+ +	int i;
+ +
+ +	/* Find online cores, except pkgtemp data */
+ +	for (i = MAX_CORE_DATA - 1; i >= 0; --i) {
+ +		if (pdata->core_data[i] &&
+ +			!pdata->core_data[i]->is_pkg_data) {
+ +			return true;
+ +		}
+ +	}
+ +	return false;
+ +}
+ +
+ +static void get_core_online(unsigned int cpu)
+  {
+ -	struct platform_device *pdev = coretemp_get_pdev(cpu);
+  	struct cpuinfo_x86 *c = &cpu_data(cpu);
+++<<<<<<< HEAD
+ +	struct platform_device *pdev = coretemp_get_pdev(cpu);
+ +	int err;
+++=======
++ 	struct platform_data *pdata;
+++>>>>>>> 712668460594 (hwmon: (coretemp) Simplify package management)
+  
+  	/*
+  	 * CPUID.06H.EAX[0] indicates whether the CPU has thermal
+@@@ -702,9 -623,10 +662,16 @@@
+  		 * online. So, initialize per-pkg data structures and
+  		 * then bring this core online.
+  		 */
+++<<<<<<< HEAD
+ +		err = coretemp_device_add(cpu);
+ +		if (err)
+ +			return;
+++=======
++ 		pdev = coretemp_device_add(cpu);
++ 		if (IS_ERR(pdev))
++ 			return PTR_ERR(pdev);
++ 
+++>>>>>>> 712668460594 (hwmon: (coretemp) Simplify package management)
+  		/*
+  		 * Check whether pkgtemp support is available.
+  		 * If so, add interfaces for pkgtemp.
+@@@ -727,67 -653,59 +694,87 @@@ static void put_core_offline(unsigned i
+  
+  	/* If the physical CPU device does not exist, just return */
+  	if (!pdev)
+ -		return 0;
+ +		return;
+ +
+ +	pdata = platform_get_drvdata(pdev);
+  
+ -	/* The core id is too big, just return */
+  	indx = TO_ATTR_NO(cpu);
+ -	if (indx > MAX_CORE_DATA - 1)
+ -		return 0;
+  
+ -	pd = platform_get_drvdata(pdev);
+ -	tdata = pd->core_data[indx];
+ +	/* The core id is too big, just return */
+ +	if (indx > MAX_CORE_DATA - 1)
+ +		return;
+  
+ -	cpumask_clear_cpu(cpu, &pd->cpumask);
+ +	if (pdata->core_data[indx] && pdata->core_data[indx]->cpu == cpu)
+ +		coretemp_remove_core(pdata, indx);
+  
+  	/*
+ -	 * If this is the last thread sibling, remove the CPU core
+ -	 * interface, If there is still a sibling online, transfer the
+ -	 * target cpu of that core interface to it.
+ +	 * If a HT sibling of a core is taken offline, but another HT sibling
+ +	 * of the same core is still online, register the alternate sibling.
+ +	 * This ensures that exactly one set of attributes is provided as long
+ +	 * as at least one HT sibling of a core is online.
+  	 */
+ -	target = cpumask_any_and(&pd->cpumask, topology_sibling_cpumask(cpu));
+ -	if (target >= nr_cpu_ids) {
+ -		coretemp_remove_core(pd, indx);
+ -	} else if (tdata && tdata->cpu == cpu) {
+ -		mutex_lock(&tdata->update_lock);
+ -		tdata->cpu = target;
+ -		mutex_unlock(&tdata->update_lock);
+ +	for_each_sibling(i, cpu) {
+ +		if (i != cpu) {
+ +			get_core_online(i);
+ +			/*
+ +			 * Display temperature sensor data for one HT sibling
+ +			 * per core only, so abort the loop after one such
+ +			 * sibling has been found.
+ +			 */
+ +			break;
+ +		}
+  	}
+ -
+  	/*
+- 	 * If all cores in this pkg are offline, remove the device.
+- 	 * coretemp_device_remove calls unregister_platform_device,
+- 	 * which in turn calls coretemp_remove. This removes the
+- 	 * pkgtemp entry and does other clean ups.
++ 	 * If all cores in this pkg are offline, remove the device. This
++ 	 * will invoke the platform driver remove function, which cleans up
++ 	 * the rest.
+  	 */
+++<<<<<<< HEAD
+ +	if (!is_any_core_online(pdata))
+ +		coretemp_device_remove(cpu);
+++=======
++ 	if (cpumask_empty(&pd->cpumask)) {
++ 		pkg_devices[topology_logical_package_id(cpu)] = NULL;
++ 		platform_device_unregister(pdev);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Check whether this core is the target for the package
++ 	 * interface. We need to assign it to some other cpu.
++ 	 */
++ 	tdata = pd->core_data[PKG_SYSFS_ATTR_NO];
++ 	if (tdata && tdata->cpu == cpu) {
++ 		target = cpumask_first(&pd->cpumask);
++ 		mutex_lock(&tdata->update_lock);
++ 		tdata->cpu = target;
++ 		mutex_unlock(&tdata->update_lock);
++ 	}
++ 	return 0;
+++>>>>>>> 712668460594 (hwmon: (coretemp) Simplify package management)
+ +}
+ +
+ +static int coretemp_cpu_callback(struct notifier_block *nfb,
+ +				 unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (unsigned long) hcpu;
+ +
+ +	switch (action) {
+ +	case CPU_ONLINE:
+ +	case CPU_DOWN_FAILED:
+ +		get_core_online(cpu);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		put_core_offline(cpu);
+ +		break;
+ +	}
+ +	return NOTIFY_OK;
+  }
+ +
+ +static struct notifier_block coretemp_cpu_notifier __refdata = {
+ +	.notifier_call = coretemp_cpu_callback,
+ +};
+ +
+  static const struct x86_cpu_id __initconst coretemp_ids[] = {
+  	{ X86_VENDOR_INTEL, X86_FAMILY_ANY, X86_MODEL_ANY, X86_FEATURE_DTHERM },
+  	{}
+@@@ -806,50 -726,37 +793,61 @@@ static int __init coretemp_init(void
+  	if (!x86_match_cpu(coretemp_ids))
+  		return -ENODEV;
+  
++ 	max_packages = topology_max_packages();
++ 	pkg_devices = kzalloc(max_packages * sizeof(struct platform_device *),
++ 			      GFP_KERNEL);
++ 	if (!pkg_devices)
++ 		return -ENOMEM;
++ 
+  	err = platform_driver_register(&coretemp_driver);
+  	if (err)
+ -		return err;
+ +		goto exit;
+ +
+ +	cpu_notifier_register_begin();
+ +	for_each_online_cpu(i)
+ +		get_core_online(i);
+ +
+ +#ifndef CONFIG_HOTPLUG_CPU
+ +	if (list_empty(&pdev_list)) {
+ +		cpu_notifier_register_done();
+ +		err = -ENODEV;
+ +		goto exit_driver_unreg;
+ +	}
+ +#endif
+  
+ -	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "hwmon/coretemp:online",
+ -				coretemp_cpu_online, coretemp_cpu_offline);
+ -	if (err < 0)
+ -		goto outdrv;
+ -	coretemp_hp_online = err;
+ +	__register_hotcpu_notifier(&coretemp_cpu_notifier);
+ +	cpu_notifier_register_done();
+  	return 0;
+  
+ -outdrv:
+ +#ifndef CONFIG_HOTPLUG_CPU
+ +exit_driver_unreg:
+  	platform_driver_unregister(&coretemp_driver);
+++<<<<<<< HEAD
+ +#endif
+ +exit:
+++=======
++ 	kfree(pkg_devices);
+++>>>>>>> 712668460594 (hwmon: (coretemp) Simplify package management)
+  	return err;
+  }
+ -module_init(coretemp_init)
+  
+  static void __exit coretemp_exit(void)
+  {
+ -	cpuhp_remove_state(coretemp_hp_online);
+ +	struct pdev_entry *p, *n;
+ +
+ +	cpu_notifier_register_begin();
+ +	__unregister_hotcpu_notifier(&coretemp_cpu_notifier);
+ +	mutex_lock(&pdev_list_mutex);
+ +	list_for_each_entry_safe(p, n, &pdev_list, list) {
+ +		platform_device_unregister(p->pdev);
+ +		list_del(&p->list);
+ +		kfree(p);
+ +	}
+ +	mutex_unlock(&pdev_list_mutex);
+ +	cpu_notifier_register_done();
+  	platform_driver_unregister(&coretemp_driver);
++ 	kfree(pkg_devices);
+  }
+ -module_exit(coretemp_exit)
+  
+  MODULE_AUTHOR("Rudolf Marek <r.marek@assembler.cz>");
+  MODULE_DESCRIPTION("Intel Core temperature monitor");
+* Unmerged path drivers/hwmon/coretemp.c
