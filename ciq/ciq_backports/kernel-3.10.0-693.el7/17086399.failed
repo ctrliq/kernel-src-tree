@@ -1,0 +1,202 @@
+bnxt_en: fix pci cleanup in bnxt_init_one() failure path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sathya Perla <sathya.perla@broadcom.com>
+commit 17086399c113d933e1202697f85b8f0f82fcb8ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/17086399.failed
+
+In the bnxt_init_one() failure path, bar1 and bar2 are not
+being unmapped.  This commit fixes this issue.  Reorganize the
+code so that bnxt_init_one()'s failure path and bnxt_remove_one()
+can call the same function to do the PCI cleanup.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 17086399c113d933e1202697f85b8f0f82fcb8ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 34876b804a73,6dacdf1e4d26..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -6284,6 -6645,62 +6284,65 @@@ static void bnxt_sp_task(struct work_st
+  	clear_bit(BNXT_STATE_IN_SP_TASK, &bp->state);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Under rtnl_lock */
++ int bnxt_reserve_rings(struct bnxt *bp, int tx, int rx, int tcs, int tx_xdp)
++ {
++ 	int max_rx, max_tx, tx_sets = 1;
++ 	int tx_rings_needed;
++ 	bool sh = true;
++ 	int rc;
++ 
++ 	if (!(bp->flags & BNXT_FLAG_SHARED_RINGS))
++ 		sh = false;
++ 
++ 	if (tcs)
++ 		tx_sets = tcs;
++ 
++ 	rc = bnxt_get_max_rings(bp, &max_rx, &max_tx, sh);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (max_rx < rx)
++ 		return -ENOMEM;
++ 
++ 	tx_rings_needed = tx * tx_sets + tx_xdp;
++ 	if (max_tx < tx_rings_needed)
++ 		return -ENOMEM;
++ 
++ 	if (bnxt_hwrm_reserve_tx_rings(bp, &tx_rings_needed) ||
++ 	    tx_rings_needed < (tx * tx_sets + tx_xdp))
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void bnxt_unmap_bars(struct bnxt *bp, struct pci_dev *pdev)
++ {
++ 	if (bp->bar2) {
++ 		pci_iounmap(pdev, bp->bar2);
++ 		bp->bar2 = NULL;
++ 	}
++ 
++ 	if (bp->bar1) {
++ 		pci_iounmap(pdev, bp->bar1);
++ 		bp->bar1 = NULL;
++ 	}
++ 
++ 	if (bp->bar0) {
++ 		pci_iounmap(pdev, bp->bar0);
++ 		bp->bar0 = NULL;
++ 	}
++ }
++ 
++ static void bnxt_cleanup_pci(struct bnxt *bp)
++ {
++ 	bnxt_unmap_bars(bp, bp->pdev);
++ 	pci_release_regions(bp->pdev);
++ 	pci_disable_device(bp->pdev);
++ }
++ 
+++>>>>>>> 17086399c113 (bnxt_en: fix pci cleanup in bnxt_init_one() failure path)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+@@@ -6769,15 -7192,16 +6813,21 @@@ static void bnxt_remove_one(struct pci_
+  	cancel_work_sync(&bp->sp_task);
+  	bp->sp_event = 0;
+  
+ -	bnxt_clear_int_mode(bp);
+  	bnxt_hwrm_func_drv_unrgtr(bp);
+  	bnxt_free_hwrm_resources(bp);
+++<<<<<<< HEAD
+ +	pci_iounmap(pdev, bp->bar2);
+ +	pci_iounmap(pdev, bp->bar1);
+ +	pci_iounmap(pdev, bp->bar0);
+++=======
++ 	bnxt_dcb_free(bp);
++ 	kfree(bp->edev);
++ 	bp->edev = NULL;
++ 	if (bp->xdp_prog)
++ 		bpf_prog_put(bp->xdp_prog);
++ 	bnxt_cleanup_pci(bp);
+++>>>>>>> 17086399c113 (bnxt_en: fix pci cleanup in bnxt_init_one() failure path)
+  	free_netdev(dev);
+- 
+- 	pci_release_regions(pdev);
+- 	pci_disable_device(pdev);
+  }
+  
+  static int bnxt_probe_phy(struct bnxt *bp)
+@@@ -7005,8 -7490,10 +7054,8 @@@ static int bnxt_init_one(struct pci_de
+  
+  	rc = bnxt_hwrm_func_rgtr_async_events(bp, NULL, 0);
+  	if (rc)
+- 		goto init_err;
++ 		goto init_err_pci_clean;
+  
+ -	bp->ulp_probe = bnxt_ulp_probe;
+ -
+  	/* Get the MAX capabilities for this function */
+  	rc = bnxt_hwrm_func_qcaps(bp);
+  	if (rc) {
+@@@ -7027,15 -7514,16 +7076,25 @@@
+  	bnxt_hwrm_func_qcfg(bp);
+  	bnxt_hwrm_port_led_qcaps(bp);
+  
+ -	bnxt_set_rx_skb_mode(bp, false);
+  	bnxt_set_tpa_flags(bp);
+  	bnxt_set_ring_params(bp);
+++<<<<<<< HEAD
+ +	if (BNXT_PF(bp))
+ +		bp->pf.max_irqs = max_irqs;
+ +#if defined(CONFIG_BNXT_SRIOV)
+ +	else
+ +		bp->vf.max_irqs = max_irqs;
+ +#endif
+ +	bnxt_set_dflt_rings(bp);
+++=======
++ 	bnxt_set_max_func_irqs(bp, max_irqs);
++ 	rc = bnxt_set_dflt_rings(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Not enough rings available.\n");
++ 		rc = -ENOMEM;
++ 		goto init_err_pci_clean;
++ 	}
+++>>>>>>> 17086399c113 (bnxt_en: fix pci cleanup in bnxt_init_one() failure path)
+  
+  	/* Default RSS hash cfg. */
+  	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
+@@@ -7063,11 -7552,19 +7122,22 @@@
+  
+  	rc = bnxt_probe_phy(bp);
+  	if (rc)
+- 		goto init_err;
++ 		goto init_err_pci_clean;
+  
+++<<<<<<< HEAD
+++=======
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		goto init_err_pci_clean;
++ 
++ 	rc = bnxt_init_int_mode(bp);
++ 	if (rc)
++ 		goto init_err_pci_clean;
++ 
+++>>>>>>> 17086399c113 (bnxt_en: fix pci cleanup in bnxt_init_one() failure path)
+  	rc = register_netdev(dev);
+  	if (rc)
+ -		goto init_err_clr_int;
+ +		goto init_err;
+  
+  	netdev_info(dev, "%s found at mem %lx, node addr %pM\n",
+  		    board_info[ent->driver_data].name,
+@@@ -7077,10 -7574,11 +7147,18 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +init_err:
+ +	pci_iounmap(pdev, bp->bar0);
+ +	pci_release_regions(pdev);
+ +	pci_disable_device(pdev);
+++=======
++ init_err_clr_int:
++ 	bnxt_clear_int_mode(bp);
++ 
++ init_err_pci_clean:
++ 	bnxt_cleanup_pci(bp);
+++>>>>>>> 17086399c113 (bnxt_en: fix pci cleanup in bnxt_init_one() failure path)
+  
+  init_err_free:
+  	free_netdev(dev);
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
