@@ -4,6 +4,7 @@ HEADERS='
 include/uapi/linux/fcntl.h
 include/uapi/linux/kvm.h
 include/uapi/linux/perf_event.h
+include/uapi/linux/prctl.h
 include/uapi/linux/sched.h
 include/uapi/linux/stat.h
 include/uapi/linux/vhost.h
