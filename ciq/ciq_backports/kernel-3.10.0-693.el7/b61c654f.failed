@@ -1,0 +1,114 @@
+sctp: free msg->chunks when sctp_primitive_SEND return err
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit b61c654f9b3f1a271217e46c893f80565b1f754d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b61c654f.failed
+
+Last patch "sctp: do not return the transmit err back to sctp_sendmsg"
+made sctp_primitive_SEND return err only when asoc state is unavailable.
+In this case, chunks are not enqueued, they have no chance to be freed if
+we don't take care of them later.
+
+This Patch is actually to revert commit 1cd4d5c4326a ("sctp: remove the
+unused sctp_datamsg_free()"), commit 69b5777f2e57 ("sctp: hold the chunks
+only after the chunk is enqueued in outq") and commit 8b570dc9f7b6 ("sctp:
+only drop the reference on the datamsg after sending a msg"), to use
+sctp_datamsg_free to free the chunks of current msg.
+
+Fixes: 8b570dc9f7b6 ("sctp: only drop the reference on the datamsg after sending a msg")
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b61c654f9b3f1a271217e46c893f80565b1f754d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/structs.h
+diff --cc include/net/sctp/structs.h
+index a698350414b7,f61fb7c87e53..000000000000
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@@ -541,7 -536,8 +541,12 @@@ struct sctp_datamsg 
+  
+  struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *,
+  					    struct sctp_sndrcvinfo *,
+++<<<<<<< HEAD
+ +					    struct msghdr *, int len);
+++=======
++ 					    struct iov_iter *);
++ void sctp_datamsg_free(struct sctp_datamsg *);
+++>>>>>>> b61c654f9b3f (sctp: free msg->chunks when sctp_primitive_SEND return err)
+  void sctp_datamsg_put(struct sctp_datamsg *);
+  void sctp_chunk_fail(struct sctp_chunk *, int error);
+  int sctp_chunk_abandoned(struct sctp_chunk *);
+* Unmerged path include/net/sctp/structs.h
+diff --git a/net/sctp/chunk.c b/net/sctp/chunk.c
+index c85246732c88..47e2c80909cf 100644
+--- a/net/sctp/chunk.c
++++ b/net/sctp/chunk.c
+@@ -77,6 +77,19 @@ static struct sctp_datamsg *sctp_datamsg_new(gfp_t gfp)
+ 	return msg;
+ }
+ 
++void sctp_datamsg_free(struct sctp_datamsg *msg)
++{
++	struct sctp_chunk *chunk;
++
++	/* This doesn't have to be a _safe vairant because
++	 * sctp_chunk_free() only drops the refs.
++	 */
++	list_for_each_entry(chunk, &msg->chunks, frag_list)
++		sctp_chunk_free(chunk);
++
++	sctp_datamsg_put(msg);
++}
++
+ /* Final destructruction of datamsg memory. */
+ static void sctp_datamsg_destroy(struct sctp_datamsg *msg)
+ {
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index 92f5cdb5f83c..7aed2a6136a5 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -311,7 +311,6 @@ int sctp_outq_tail(struct sctp_outq *q, struct sctp_chunk *chunk, gfp_t gfp)
+ 			 sctp_cname(SCTP_ST_CHUNK(chunk->chunk_hdr->type)) :
+ 			 "illegal chunk");
+ 
+-		sctp_chunk_hold(chunk);
+ 		sctp_outq_tail_data(q, chunk);
+ 		if (chunk->asoc->prsctp_enable &&
+ 		    SCTP_PR_PRIO_ENABLED(chunk->sinfo.sinfo_flags))
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 8abf43e71303..cdd84f242c3c 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -1952,6 +1952,8 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 
+ 	/* Now send the (possibly) fragmented message. */
+ 	list_for_each_entry(chunk, &datamsg->chunks, frag_list) {
++		sctp_chunk_hold(chunk);
++
+ 		/* Do accounting for the write space.  */
+ 		sctp_set_owner_w(chunk);
+ 
+@@ -1964,13 +1966,15 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	 * breaks.
+ 	 */
+ 	err = sctp_primitive_SEND(net, asoc, datamsg);
+-	sctp_datamsg_put(datamsg);
+ 	/* Did the lower layer accept the chunk? */
+-	if (err)
++	if (err) {
++		sctp_datamsg_free(datamsg);
+ 		goto out_free;
++	}
+ 
+ 	pr_debug("%s: we sent primitively\n", __func__);
+ 
++	sctp_datamsg_put(datamsg);
+ 	err = msg_len;
+ 
+ 	if (unlikely(wait_connect)) {
