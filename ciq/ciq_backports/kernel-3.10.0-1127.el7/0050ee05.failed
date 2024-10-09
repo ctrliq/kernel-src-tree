@@ -1,0 +1,514 @@
+ipc/msg: increase MSGMNI, remove scaling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [ipc] msg: increase MSGMNI, remove scaling (Waiman Long) [1373519]
+Rebuild_FUZZ: 94.74%
+commit-author Manfred Spraul <manfred@colorfullife.com>
+commit 0050ee059f7fc86b1df2527aaa14ed5dc72f9973
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0050ee05.failed
+
+SysV can be abused to allocate locked kernel memory.  For most systems, a
+small limit doesn't make sense, see the discussion with regards to SHMMAX.
+
+Therefore: increase MSGMNI to the maximum supported.
+
+And: If we ignore the risk of locking too much memory, then an automatic
+scaling of MSGMNI doesn't make sense.  Therefore the logic can be removed.
+
+The code preserves auto_msgmni to avoid breaking any user space applications
+that expect that the value exists.
+
+Notes:
+1) If an administrator must limit the memory allocations, then he can set
+MSGMNI as necessary.
+
+Or he can disable sysv entirely (as e.g. done by Android).
+
+2) MSGMAX and MSGMNB are intentionally not increased, as these values are used
+to control latency vs. throughput:
+If MSGMNB is large, then msgsnd() just returns and more messages can be queued
+before a task switch to a task that calls msgrcv() is forced.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Rafael Aquini <aquini@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0050ee059f7fc86b1df2527aaa14ed5dc72f9973)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/ipc_sysctl.c
+#	ipc/msg.c
+#	ipc/namespace.c
+diff --cc ipc/ipc_sysctl.c
+index 5a6a50921f2f,8ad93c29f511..000000000000
+--- a/ipc/ipc_sysctl.c
++++ b/ipc/ipc_sysctl.c
+@@@ -62,30 -62,7 +62,34 @@@ static int proc_ipc_dointvec_minmax_orp
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int proc_ipc_callback_dointvec_minmax(ctl_table *table, int write,
+ +	void __user *buffer, size_t *lenp, loff_t *ppos)
+ +{
+ +	struct ctl_table ipc_table;
+ +	size_t lenp_bef = *lenp;
+ +	int rc;
+ +
+ +	memcpy(&ipc_table, table, sizeof(ipc_table));
+ +	ipc_table.data = get_ipc(table);
+ +
+ +	rc = proc_dointvec_minmax(&ipc_table, write, buffer, lenp, ppos);
+ +
+ +	if (write && !rc && lenp_bef == *lenp)
+ +		/*
+ +		 * Tunable has successfully been changed by hand. Disable its
+ +		 * automatic adjustment. This simply requires unregistering
+ +		 * the notifiers that trigger recalculation.
+ +		 */
+ +		unregister_ipcns_notifier(current->nsproxy->ipc_ns);
+ +
+ +	return rc;
+ +}
+ +
+ +static int proc_ipc_doulongvec_minmax(ctl_table *table, int write,
+++=======
++ static int proc_ipc_doulongvec_minmax(struct ctl_table *table, int write,
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+  	void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	struct ctl_table ipc_table;
+@@@ -96,30 -73,7 +100,34 @@@
+  					lenp, ppos);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Routine that is called when the file "auto_msgmni" has successfully been
+ + * written.
+ + * Two values are allowed:
+ + * 0: unregister msgmni's callback routine from the ipc namespace notifier
+ + *    chain. This means that msgmni won't be recomputed anymore upon memory
+ + *    add/remove or ipc namespace creation/removal.
+ + * 1: register back the callback routine.
+ + */
+ +static void ipc_auto_callback(int val)
+ +{
+ +	if (!val)
+ +		unregister_ipcns_notifier(current->nsproxy->ipc_ns);
+ +	else {
+ +		/*
+ +		 * Re-enable automatic recomputing only if not already
+ +		 * enabled.
+ +		 */
+ +		recompute_msgmni(current->nsproxy->ipc_ns);
+ +		cond_register_ipcns_notifier(current->nsproxy->ipc_ns);
+ +	}
+ +}
+ +
+ +static int proc_ipcauto_dointvec_minmax(ctl_table *table, int write,
+++=======
++ static int proc_ipc_auto_msgmni(struct ctl_table *table, int write,
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+  	void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	struct ctl_table ipc_table;
+@@@ -202,9 -143,9 +197,9 @@@ static struct ctl_table ipc_kern_table[
+  	{
+  		.procname	= "msgmni",
+  		.data		= &init_ipc_ns.msg_ctlmni,
+ -		.maxlen		= sizeof(init_ipc_ns.msg_ctlmni),
+ +		.maxlen		= sizeof (init_ipc_ns.msg_ctlmni),
+  		.mode		= 0644,
+- 		.proc_handler	= proc_ipc_callback_dointvec_minmax,
++ 		.proc_handler	= proc_ipc_dointvec_minmax,
+  		.extra1		= &zero,
+  		.extra2		= &int_max,
+  	},
+diff --cc ipc/msg.c
+index f7b262dd9f68,a7261d5cbc89..000000000000
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@@ -1048,6 -989,26 +1048,29 @@@ SYSCALL_DEFINE5(msgrcv, int, msqid, str
+  	return do_msgrcv(msqid, msgp, msgsz, msgtyp, msgflg, do_msg_fill);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ void msg_init_ns(struct ipc_namespace *ns)
++ {
++ 	ns->msg_ctlmax = MSGMAX;
++ 	ns->msg_ctlmnb = MSGMNB;
++ 	ns->msg_ctlmni = MSGMNI;
++ 
++ 	atomic_set(&ns->msg_bytes, 0);
++ 	atomic_set(&ns->msg_hdrs, 0);
++ 	ipc_init_ids(&ns->ids[IPC_MSG_IDS]);
++ }
++ 
++ #ifdef CONFIG_IPC_NS
++ void msg_exit_ns(struct ipc_namespace *ns)
++ {
++ 	free_ipcs(ns, &msg_ids(ns), freeque);
++ 	idr_destroy(&ns->ids[IPC_MSG_IDS].ipcs_idr);
++ }
++ #endif
++ 
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+  #ifdef CONFIG_PROC_FS
+  static int sysvipc_msg_proc_show(struct seq_file *s, void *it)
+  {
+@@@ -1072,3 -1033,12 +1095,15 @@@
+  			msq->q_ctime);
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ void __init msg_init(void)
++ {
++ 	msg_init_ns(&init_ipc_ns);
++ 
++ 	ipc_init_proc_interface("sysvipc/msg",
++ 				"       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
++ 				IPC_MSG_IDS, sysvipc_msg_proc_show);
++ }
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+diff --cc ipc/namespace.c
+index f4cc0ef2d8ac,1a3ffd40356e..000000000000
+--- a/ipc/namespace.c
++++ b/ipc/namespace.c
+@@@ -60,25 -45,9 +60,29 @@@ static struct ipc_namespace *create_ipc
+  	msg_init_ns(ns);
+  	shm_init_ns(ns);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * msgmni has already been computed for the new ipc ns.
+ +	 * Thus, do the ipcns creation notification before registering that
+ +	 * new ipcns in the chain.
+ +	 */
+ +	ipcns_notify(IPCNS_CREATED);
+ +	register_ipcns_notifier(ns);
+++=======
++ 	ns->user_ns = get_user_ns(user_ns);
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+  
+  	return ns;
+ +
+ +fail_put:
+ +	put_user_ns(ns->user_ns);
+ +	proc_free_inum(ns->proc_inum);
+ +fail_free:
+ +	kfree(ns);
+ +fail_dec:
+ +	dec_ipc_namespaces(ucounts);
+ +fail:
+ +	return ERR_PTR(err);
+  }
+  
+  struct ipc_namespace *copy_ipcs(unsigned long flags,
+@@@ -136,12 -96,6 +131,15 @@@ static void free_ipc_ns(struct ipc_name
+  	shm_exit_ns(ns);
+  	atomic_dec(&nr_ipc_ns);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Do the ipcns removal notification after decrementing nr_ipc_ns in
+ +	 * order to have a correct value when recomputing msgmni.
+ +	 */
+ +	ipcns_notify(IPCNS_REMOVED);
+ +	dec_ipc_namespaces(ns->ucounts);
+++=======
+++>>>>>>> 0050ee059f7f (ipc/msg: increase MSGMNI, remove scaling)
+  	put_user_ns(ns->user_ns);
+  	proc_free_inum(ns->proc_inum);
+  	kfree(ns);
+diff --git a/Documentation/sysctl/kernel.txt b/Documentation/sysctl/kernel.txt
+index faaa10d0b546..58289dc9670e 100644
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@ -125,10 +125,12 @@ set during run time.
+ 
+ auto_msgmni:
+ 
+-Enables/Disables automatic recomputing of msgmni upon memory add/remove
+-or upon ipc namespace creation/removal (see the msgmni description
+-above). Echoing "1" into this file enables msgmni automatic recomputing.
+-Echoing "0" turns it off. auto_msgmni default value is 1.
++This variable has no effect and may be removed in future kernel
++releases. Reading it always returns 0.
++Up to Linux 3.17, it enabled/disabled automatic recomputing of msgmni
++upon memory add/remove or upon ipc namespace creation/removal.
++Echoing "1" into this file enabled msgmni automatic recomputing.
++Echoing "0" turned it off. auto_msgmni default value was 1.
+ 
+ 
+ ==============================================================
+diff --git a/include/linux/ipc_namespace.h b/include/linux/ipc_namespace.h
+index 3077f12384f0..8a6f4173b848 100644
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@ -7,15 +7,6 @@
+ #include <linux/notifier.h>
+ #include <linux/nsproxy.h>
+ 
+-/*
+- * ipc namespace events
+- */
+-#define IPCNS_MEMCHANGED   0x00000001   /* Notify lowmem size changed */
+-#define IPCNS_CREATED  0x00000002   /* Notify new ipc namespace created */
+-#define IPCNS_REMOVED  0x00000003   /* Notify ipc namespace removed */
+-
+-#define IPCNS_CALLBACK_PRI 0
+-
+ struct user_namespace;
+ 
+ struct ipc_ids {
+@@ -39,7 +30,6 @@ struct ipc_namespace {
+ 	unsigned int	msg_ctlmni;
+ 	atomic_t	msg_bytes;
+ 	atomic_t	msg_hdrs;
+-	int		auto_msgmni;
+ 
+ 	size_t		shm_ctlmax;
+ 	size_t		shm_ctlall;
+@@ -79,18 +69,8 @@ extern atomic_t nr_ipc_ns;
+ extern spinlock_t mq_lock;
+ 
+ #ifdef CONFIG_SYSVIPC
+-extern int register_ipcns_notifier(struct ipc_namespace *);
+-extern int cond_register_ipcns_notifier(struct ipc_namespace *);
+-extern void unregister_ipcns_notifier(struct ipc_namespace *);
+-extern int ipcns_notify(unsigned long);
+ extern void shm_destroy_orphaned(struct ipc_namespace *ns);
+ #else /* CONFIG_SYSVIPC */
+-static inline int register_ipcns_notifier(struct ipc_namespace *ns)
+-{ return 0; }
+-static inline int cond_register_ipcns_notifier(struct ipc_namespace *ns)
+-{ return 0; }
+-static inline void unregister_ipcns_notifier(struct ipc_namespace *ns) { }
+-static inline int ipcns_notify(unsigned long l) { return 0; }
+ static inline void shm_destroy_orphaned(struct ipc_namespace *ns) {}
+ #endif /* CONFIG_SYSVIPC */
+ 
+diff --git a/include/uapi/linux/msg.h b/include/uapi/linux/msg.h
+index 8e5f4d4f55f2..94a1ab0d8d63 100644
+--- a/include/uapi/linux/msg.h
++++ b/include/uapi/linux/msg.h
+@@ -52,16 +52,28 @@ struct msginfo {
+ };
+ 
+ /*
+- * Scaling factor to compute msgmni:
+- * the memory dedicated to msg queues (msgmni * msgmnb) should occupy
+- * at most 1/MSG_MEM_SCALE of the lowmem (see the formula in ipc/msg.c):
+- * up to 8MB       : msgmni = 16 (MSGMNI)
+- * 4 GB            : msgmni = 8K
+- * more than 16 GB : msgmni = 32K (IPCMNI)
++ * MSGMNI, MSGMAX and MSGMNB are default values which can be
++ * modified by sysctl.
++ *
++ * MSGMNI is the upper limit for the number of messages queues per
++ * namespace.
++ * It has been chosen to be as large possible without facilitating
++ * scenarios where userspace causes overflows when adjusting the limits via
++ * operations of the form retrieve current limit; add X; update limit".
++ *
++ * MSGMNB is the default size of a new message queue. Non-root tasks can
++ * decrease the size with msgctl(IPC_SET), root tasks
++ * (actually: CAP_SYS_RESOURCE) can both increase and decrease the queue
++ * size. The optimal value is application dependent.
++ * 16384 is used because it was always used (since 0.99.10)
++ *
++ * MAXMAX is the maximum size of an individual message, it's a global
++ * (per-namespace) limit that applies for all message queues.
++ * It's set to 1/2 of MSGMNB, to ensure that at least two messages fit into
++ * the queue. This is also an arbitrary choice (since 2.6.0).
+  */
+-#define MSG_MEM_SCALE 32
+ 
+-#define MSGMNI    16   /* <= IPCMNI */     /* max # of msg queue identifiers */
++#define MSGMNI 32000   /* <= IPCMNI */     /* max # of msg queue identifiers */
+ #define MSGMAX  8192   /* <= INT_MAX */   /* max size of message (bytes) */
+ #define MSGMNB 16384   /* <= INT_MAX */   /* default max size of a message queue */
+ 
+diff --git a/ipc/Makefile b/ipc/Makefile
+index 9075e172e52c..86c7300ecdf5 100644
+--- a/ipc/Makefile
++++ b/ipc/Makefile
+@@ -3,7 +3,7 @@
+ #
+ 
+ obj-$(CONFIG_SYSVIPC_COMPAT) += compat.o
+-obj-$(CONFIG_SYSVIPC) += util.o msgutil.o msg.o sem.o shm.o ipcns_notifier.o syscall.o
++obj-$(CONFIG_SYSVIPC) += util.o msgutil.o msg.o sem.o shm.o syscall.o
+ obj-$(CONFIG_SYSVIPC_SYSCTL) += ipc_sysctl.o
+ obj_mq-$(CONFIG_COMPAT) += compat_mq.o
+ obj-$(CONFIG_POSIX_MQUEUE) += mqueue.o msgutil.o $(obj_mq-y)
+* Unmerged path ipc/ipc_sysctl.c
+diff --git a/ipc/ipcns_notifier.c b/ipc/ipcns_notifier.c
+deleted file mode 100644
+index b9b31a4f77e1..000000000000
+--- a/ipc/ipcns_notifier.c
++++ /dev/null
+@@ -1,92 +0,0 @@
+-/*
+- * linux/ipc/ipcns_notifier.c
+- * Copyright (C) 2007 BULL SA. Nadia Derbey
+- *
+- * Notification mechanism for ipc namespaces:
+- * The callback routine registered in the memory chain invokes the ipcns
+- * notifier chain with the IPCNS_MEMCHANGED event.
+- * Each callback routine registered in the ipcns namespace recomputes msgmni
+- * for the owning namespace.
+- */
+-
+-#include <linux/msg.h>
+-#include <linux/rcupdate.h>
+-#include <linux/notifier.h>
+-#include <linux/nsproxy.h>
+-#include <linux/ipc_namespace.h>
+-
+-#include "util.h"
+-
+-
+-
+-static BLOCKING_NOTIFIER_HEAD(ipcns_chain);
+-
+-
+-static int ipcns_callback(struct notifier_block *self,
+-				unsigned long action, void *arg)
+-{
+-	struct ipc_namespace *ns;
+-
+-	switch (action) {
+-	case IPCNS_MEMCHANGED:   /* amount of lowmem has changed */
+-	case IPCNS_CREATED:
+-	case IPCNS_REMOVED:
+-		/*
+-		 * It's time to recompute msgmni
+-		 */
+-		ns = container_of(self, struct ipc_namespace, ipcns_nb);
+-		/*
+-		 * No need to get a reference on the ns: the 1st job of
+-		 * free_ipc_ns() is to unregister the callback routine.
+-		 * blocking_notifier_chain_unregister takes the wr lock to do
+-		 * it.
+-		 * When this callback routine is called the rd lock is held by
+-		 * blocking_notifier_call_chain.
+-		 * So the ipc ns cannot be freed while we are here.
+-		 */
+-		recompute_msgmni(ns);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return NOTIFY_OK;
+-}
+-
+-int register_ipcns_notifier(struct ipc_namespace *ns)
+-{
+-	int rc;
+-
+-	memset(&ns->ipcns_nb, 0, sizeof(ns->ipcns_nb));
+-	ns->ipcns_nb.notifier_call = ipcns_callback;
+-	ns->ipcns_nb.priority = IPCNS_CALLBACK_PRI;
+-	rc = blocking_notifier_chain_register(&ipcns_chain, &ns->ipcns_nb);
+-	if (!rc)
+-		ns->auto_msgmni = 1;
+-	return rc;
+-}
+-
+-int cond_register_ipcns_notifier(struct ipc_namespace *ns)
+-{
+-	int rc;
+-
+-	memset(&ns->ipcns_nb, 0, sizeof(ns->ipcns_nb));
+-	ns->ipcns_nb.notifier_call = ipcns_callback;
+-	ns->ipcns_nb.priority = IPCNS_CALLBACK_PRI;
+-	rc = blocking_notifier_chain_cond_register(&ipcns_chain,
+-							&ns->ipcns_nb);
+-	if (!rc)
+-		ns->auto_msgmni = 1;
+-	return rc;
+-}
+-
+-void unregister_ipcns_notifier(struct ipc_namespace *ns)
+-{
+-	blocking_notifier_chain_unregister(&ipcns_chain, &ns->ipcns_nb);
+-	ns->auto_msgmni = 0;
+-}
+-
+-int ipcns_notify(unsigned long val)
+-{
+-	return blocking_notifier_call_chain(&ipcns_chain, val, NULL);
+-}
+* Unmerged path ipc/msg.c
+* Unmerged path ipc/namespace.c
+diff --git a/ipc/util.c b/ipc/util.c
+index 1df75a61612b..1b43adb12e25 100644
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@ -71,44 +71,6 @@ struct ipc_proc_iface {
+ 	int (*show)(struct seq_file *, void *);
+ };
+ 
+-static void ipc_memory_notifier(struct work_struct *work)
+-{
+-	ipcns_notify(IPCNS_MEMCHANGED);
+-}
+-
+-static int ipc_memory_callback(struct notifier_block *self,
+-				unsigned long action, void *arg)
+-{
+-	static DECLARE_WORK(ipc_memory_wq, ipc_memory_notifier);
+-
+-	switch (action) {
+-	case MEM_ONLINE:    /* memory successfully brought online */
+-	case MEM_OFFLINE:   /* or offline: it's time to recompute msgmni */
+-		/*
+-		 * This is done by invoking the ipcns notifier chain with the
+-		 * IPC_MEMCHANGED event.
+-		 * In order not to keep the lock on the hotplug memory chain
+-		 * for too long, queue a work item that will, when waken up,
+-		 * activate the ipcns notification chain.
+-		 */
+-		schedule_work(&ipc_memory_wq);
+-		break;
+-	case MEM_GOING_ONLINE:
+-	case MEM_GOING_OFFLINE:
+-	case MEM_CANCEL_ONLINE:
+-	case MEM_CANCEL_OFFLINE:
+-	default:
+-		break;
+-	}
+-
+-	return NOTIFY_OK;
+-}
+-
+-static struct notifier_block ipc_memory_nb = {
+-	.notifier_call = ipc_memory_callback,
+-	.priority = IPC_CALLBACK_PRI,
+-};
+-
+ /**
+  *	ipc_init	-	initialise IPC subsystem
+  *
+@@ -124,8 +86,6 @@ static int __init ipc_init(void)
+ 	sem_init();
+ 	msg_init();
+ 	shm_init();
+-	register_hotmemory_notifier(&ipc_memory_nb);
+-	register_ipcns_notifier(&init_ipc_ns);
+ 	return 0;
+ }
+ device_initcall(ipc_init);
