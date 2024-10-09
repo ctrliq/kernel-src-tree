@@ -1,0 +1,188 @@
+xfrm: prefer secpath_set over secpath_dup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit a84e3f533324e40e4a99f50dee2188bf140d8098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a84e3f53.failed
+
+secpath_set is a wrapper for secpath_dup that will not perform
+an allocation if the secpath attached to the skb has a reference count
+of one, i.e., it doesn't need to be COW'ed.
+
+Also, secpath_dup doesn't attach the secpath to the skb, it leaves
+this to the caller.
+
+Use secpath_set in places that immediately assign the return value to
+skb.
+
+This allows to remove skb->sp without touching these spots again.
+
+secpath_dup can eventually be removed in followup patch.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a84e3f533324e40e4a99f50dee2188bf140d8098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xfrm/Kconfig
+#	net/xfrm/xfrm_output.c
+diff --cc net/xfrm/Kconfig
+index bda1a13628a8,5d43aaa17027..000000000000
+--- a/net/xfrm/Kconfig
++++ b/net/xfrm/Kconfig
+@@@ -4,6 -4,11 +4,14 @@@
+  config XFRM
+         bool
+         depends on NET
+++<<<<<<< HEAD
+++=======
++        select GRO_CELLS
++        select SKB_EXTENSIONS
++ 
++ config XFRM_OFFLOAD
++        bool
+++>>>>>>> a84e3f533324 (xfrm: prefer secpath_set over secpath_dup)
+  
+  config XFRM_ALGO
+  	tristate
+diff --cc net/xfrm/xfrm_output.c
+index 6a63b59285e9,757c4d11983b..000000000000
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@@ -191,10 -210,38 +191,40 @@@ static int xfrm_output_gso(struct sock 
+  int xfrm_output(struct sock *sk, struct sk_buff *skb)
+  {
+  	struct net *net = dev_net(skb_dst(skb)->dev);
+ -	struct xfrm_state *x = skb_dst(skb)->xfrm;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	secpath_reset(skb);
++ 
++ 	if (xfrm_dev_offload_ok(skb, x)) {
++ 		struct sec_path *sp;
++ 
++ 		sp = secpath_set(skb);
++ 		if (!sp) {
++ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++ 			kfree_skb(skb);
++ 			return -ENOMEM;
++ 		}
++ 		skb->encapsulation = 1;
++ 
++ 		sp->olen++;
++ 		sp->xvec[sp->len++] = x;
++ 		xfrm_state_hold(x);
++ 
++ 		if (skb_is_gso(skb)) {
++ 			skb_shinfo(skb)->gso_type |= SKB_GSO_ESP;
++ 
++ 			return xfrm_output2(net, sk, skb);
++ 		}
++ 
++ 		if (x->xso.dev && x->xso.dev->features & NETIF_F_HW_ESP_TX_CSUM)
++ 			goto out;
++ 	}
++ 
+++>>>>>>> a84e3f533324 (xfrm: prefer secpath_set over secpath_dup)
+  	if (skb_is_gso(skb))
+ -		return xfrm_output_gso(net, sk, skb);
+ +		return xfrm_output_gso(sk, skb);
+  
+  	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+  		err = skb_checksum_help(skb);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+index 4d77f42e035c..d7849ba6701b 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ipsec.c
+@@ -1159,6 +1159,7 @@ void ixgbe_ipsec_rx(struct ixgbe_ring *rx_ring,
+ 	struct xfrm_state *xs = NULL;
+ 	struct ipv6hdr *ip6 = NULL;
+ 	struct iphdr *ip4 = NULL;
++	struct sec_path *sp;
+ 	void *daddr;
+ 	__be32 spi;
+ 	u8 *c_hdr;
+@@ -1198,12 +1199,12 @@ void ixgbe_ipsec_rx(struct ixgbe_ring *rx_ring,
+ 	if (unlikely(!xs))
+ 		return;
+ 
+-	skb->sp = secpath_dup(skb->sp);
+-	if (unlikely(!skb->sp))
++	sp = secpath_set(skb);
++	if (unlikely(!sp))
+ 		return;
+ 
+-	skb->sp->xvec[skb->sp->len++] = xs;
+-	skb->sp->olen++;
++	sp->xvec[sp->len++] = xs;
++	sp->olen++;
+ 	xo = xfrm_offload(skb);
+ 	xo->flags = CRYPTO_DONE;
+ 	xo->status = CRYPTO_SUCCESS;
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ipsec.c b/drivers/net/ethernet/intel/ixgbevf/ipsec.c
+index e8a3231be0bf..5df8278f1767 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ipsec.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ipsec.c
+@@ -546,6 +546,7 @@ void ixgbevf_ipsec_rx(struct ixgbevf_ring *rx_ring,
+ 	struct xfrm_state *xs = NULL;
+ 	struct ipv6hdr *ip6 = NULL;
+ 	struct iphdr *ip4 = NULL;
++	struct sec_path *sp;
+ 	void *daddr;
+ 	__be32 spi;
+ 	u8 *c_hdr;
+@@ -585,12 +586,12 @@ void ixgbevf_ipsec_rx(struct ixgbevf_ring *rx_ring,
+ 	if (unlikely(!xs))
+ 		return;
+ 
+-	skb->sp = secpath_dup(skb->sp);
+-	if (unlikely(!skb->sp))
++	sp = secpath_set(skb);
++	if (unlikely(!sp))
+ 		return;
+ 
+-	skb->sp->xvec[skb->sp->len++] = xs;
+-	skb->sp->olen++;
++	sp->xvec[sp->len++] = xs;
++	sp->olen++;
+ 	xo = xfrm_offload(skb);
+ 	xo->flags = CRYPTO_DONE;
+ 	xo->status = CRYPTO_SUCCESS;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+index c245d8e78509..d87e845825fa 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+@@ -304,10 +304,11 @@ mlx5e_ipsec_build_sp(struct net_device *netdev, struct sk_buff *skb,
+ 	struct mlx5e_priv *priv = netdev_priv(netdev);
+ 	struct xfrm_offload *xo;
+ 	struct xfrm_state *xs;
++	struct sec_path *sp;
+ 	u32 sa_handle;
+ 
+-	skb->sp = secpath_dup(skb->sp);
+-	if (unlikely(!skb->sp)) {
++	sp = secpath_set(skb);
++	if (unlikely(!sp)) {
+ 		atomic64_inc(&priv->ipsec->sw_stats.ipsec_rx_drop_sp_alloc);
+ 		return NULL;
+ 	}
+@@ -319,8 +320,9 @@ mlx5e_ipsec_build_sp(struct net_device *netdev, struct sk_buff *skb,
+ 		return NULL;
+ 	}
+ 
+-	skb->sp->xvec[skb->sp->len++] = xs;
+-	skb->sp->olen++;
++	sp = skb_sec_path(skb);
++	sp->xvec[sp->len++] = xs;
++	sp->olen++;
+ 
+ 	xo = xfrm_offload(skb);
+ 	xo->flags = CRYPTO_DONE;
+* Unmerged path net/xfrm/Kconfig
+* Unmerged path net/xfrm/xfrm_output.c
