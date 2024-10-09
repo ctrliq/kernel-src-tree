@@ -1,0 +1,484 @@
+IB/hfi1: Size rcd array index correctly and consistently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit e6f7622df177d594f11d93343c3dda7637c761e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e6f7622d.failed
+
+The array index for the rcd array is sized several different ways
+throughout the code.
+
+Use the user interface size (u16) as the standard size and update the
+necessary code to reflect this.
+
+u16 is large enough for the largest amount of supported contexts.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit e6f7622df177d594f11d93343c3dda7637c761e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	drivers/infiniband/hw/hfi1/hfi.h
+#	drivers/infiniband/hw/hfi1/user_sdma.h
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494,c8f34bc6b620..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -881,86 -920,65 +881,96 @@@ done
+  	return ret;
+  }
+  
+ -/*
+ - * The hfi1_mutex must be held when this function is called.  It is
+ - * necessary to ensure serialized access to the bitmask in_use_ctxts.
+ - */
+ -static int find_sub_ctxt(struct hfi1_filedata *fd,
+ -			 const struct hfi1_user_info *uinfo)
+ +static int get_user_context(struct file *fp, struct hfi1_user_info *uinfo,
+ +			    int devno)
+  {
+++<<<<<<< HEAD
+ +	struct hfi1_devdata *dd = NULL;
+ +	int devmax, npresent, nup;
+++=======
++ 	u16 i;
++ 	struct hfi1_devdata *dd = fd->dd;
++ 	u16 subctxt;
+++>>>>>>> e6f7622df177 (IB/hfi1: Size rcd array index correctly and consistently)
+  
+ -	for (i = dd->first_dyn_alloc_ctxt; i < dd->num_rcv_contexts; i++) {
+ -		struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ -
+ -		/* Skip ctxts which are not yet open */
+ -		if (!uctxt ||
+ -		    bitmap_empty(uctxt->in_use_ctxts,
+ -				 HFI1_MAX_SHARED_CTXTS))
+ -			continue;
+ +	devmax = hfi1_count_units(&npresent, &nup);
+ +	if (!npresent)
+ +		return -ENXIO;
+  
+ -		/* Skip dynamically allocted kernel contexts */
+ -		if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ -			continue;
+ +	if (!nup)
+ +		return -ENETDOWN;
+  
+ -		/* Skip ctxt if it doesn't match the requested one */
+ -		if (memcmp(uctxt->uuid, uinfo->uuid,
+ -			   sizeof(uctxt->uuid)) ||
+ -		    uctxt->jkey != generate_jkey(current_uid()) ||
+ -		    uctxt->subctxt_id != uinfo->subctxt_id ||
+ -		    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
+ -			continue;
+ +	dd = hfi1_lookup(devno);
+ +	if (!dd)
+ +		return -ENODEV;
+ +	else if (!dd->freectxts)
+ +		return -EBUSY;
+  
+ -		/* Verify the sharing process matches the master */
+ -		if (uctxt->userversion != uinfo->userversion)
+ -			return -EINVAL;
+ +	return allocate_ctxt(fp, dd, uinfo);
+ +}
+  
+ -		/* Find an unused context */
+ -		subctxt = find_first_zero_bit(uctxt->in_use_ctxts,
+ -					      HFI1_MAX_SHARED_CTXTS);
+ -		if (subctxt >= uctxt->subctxt_cnt)
+ -			return -EBUSY;
+ +static int find_shared_ctxt(struct file *fp,
+ +			    const struct hfi1_user_info *uinfo)
+ +{
+ +	int devmax, ndev, i;
+ +	int ret = 0;
+ +	struct hfi1_filedata *fd = fp->private_data;
+  
+ -		fd->uctxt = uctxt;
+ -		fd->subctxt = subctxt;
+ +	devmax = hfi1_count_units(NULL, NULL);
+  
+ -		hfi1_rcd_get(uctxt);
+ -		__set_bit(fd->subctxt, uctxt->in_use_ctxts);
+ +	for (ndev = 0; ndev < devmax; ndev++) {
+ +		struct hfi1_devdata *dd = hfi1_lookup(ndev);
+  
+ -		return 1;
+ +		if (!(dd && (dd->flags & HFI1_PRESENT) && dd->kregbase))
+ +			continue;
+ +		for (i = dd->first_dyn_alloc_ctxt;
+ +		     i < dd->num_rcv_contexts; i++) {
+ +			struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ +
+ +			/* Skip ctxts which are not yet open */
+ +			if (!uctxt || !uctxt->cnt)
+ +				continue;
+ +
+ +			/* Skip dynamically allocted kernel contexts */
+ +			if (uctxt->sc && (uctxt->sc->type == SC_KERNEL))
+ +				continue;
+ +
+ +			/* Skip ctxt if it doesn't match the requested one */
+ +			if (memcmp(uctxt->uuid, uinfo->uuid,
+ +				   sizeof(uctxt->uuid)) ||
+ +			    uctxt->jkey != generate_jkey(current_uid()) ||
+ +			    uctxt->subctxt_id != uinfo->subctxt_id ||
+ +			    uctxt->subctxt_cnt != uinfo->subctxt_cnt)
+ +				continue;
+ +
+ +			/* Verify the sharing process matches the master */
+ +			if (uctxt->userversion != uinfo->userversion ||
+ +			    uctxt->cnt >= uctxt->subctxt_cnt) {
+ +				ret = -EINVAL;
+ +				goto done;
+ +			}
+ +			fd->uctxt = uctxt;
+ +			fd->subctxt  = uctxt->cnt++;
+ +			uctxt->active_slaves |= 1 << fd->subctxt;
+ +			ret = 1;
+ +			goto done;
+ +		}
+  	}
+  
+ -	return 0;
+ +done:
+ +	return ret;
+  }
+  
+ -static int allocate_ctxt(struct hfi1_filedata *fd, struct hfi1_devdata *dd,
+ +static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+  			 struct hfi1_user_info *uinfo)
+  {
+ +	struct hfi1_filedata *fd = fp->private_data;
+  	struct hfi1_ctxtdata *uctxt;
+++<<<<<<< HEAD
+ +	unsigned ctxt;
+++=======
++ 	u16 ctxt;
+++>>>>>>> e6f7622df177 (IB/hfi1: Size rcd array index correctly and consistently)
+  	int ret, numa;
+  
+  	if (dd->flags & HFI1_FROZEN) {
+diff --cc drivers/infiniband/hw/hfi1/hfi.h
+index 9e4a63b05006,2ce3fc58b61b..000000000000
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@@ -219,18 -213,15 +219,26 @@@ struct hfi1_ctxtdata 
+  
+  	/* dynamic receive available interrupt timeout */
+  	u32 rcvavail_timeout;
+++<<<<<<< HEAD
+++=======
++ 	/* Reference count the base context usage */
++ 	struct kref kref;
++ 
++ 	/* Device context index */
++ 	u16 ctxt;
+++>>>>>>> e6f7622df177 (IB/hfi1: Size rcd array index correctly and consistently)
+ +	/*
+ +	 * number of opens (including slave sub-contexts) on this instance
+ +	 * (ignoring forks, dup, etc. for now)
+ +	 */
+ +	int cnt;
+  	/*
+ -	 * non-zero if ctxt can be shared, and defines the maximum number of
+ -	 * sub-contexts for this device context.
+ +	 * how much space to leave at start of eager TID entries for
+ +	 * protocol use, on each TID
+  	 */
+ +	/* instead of calculating it */
+ +	unsigned ctxt;
+ +	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_cnt;
+  	/* non-zero if ctxt is being shared. */
+  	u16 subctxt_id;
+@@@ -1281,17 -1261,19 +1289,30 @@@ void handle_linkup_change(struct hfi1_d
+  
+  void handle_user_interrupt(struct hfi1_ctxtdata *rcd);
+  
+ -int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
+ -int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *rcd);
+ +int hfi1_create_rcvhdrq(struct hfi1_devdata *, struct hfi1_ctxtdata *);
+ +int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *);
+  int hfi1_create_ctxts(struct hfi1_devdata *dd);
+++<<<<<<< HEAD
+ +struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *, u32, int);
+ +void hfi1_init_pportdata(struct pci_dev *, struct hfi1_pportdata *,
+ +			 struct hfi1_devdata *, u8, u8);
+ +void hfi1_free_ctxtdata(struct hfi1_devdata *, struct hfi1_ctxtdata *);
+ +
+ +int handle_receive_interrupt(struct hfi1_ctxtdata *, int);
+ +int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *, int);
+ +int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *, int);
+++=======
++ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u16 ctxt,
++ 					   int numa);
++ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
++ 			 struct hfi1_devdata *dd, u8 hw_pidx, u8 port);
++ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
++ int hfi1_rcd_put(struct hfi1_ctxtdata *rcd);
++ void hfi1_rcd_get(struct hfi1_ctxtdata *rcd);
++ int handle_receive_interrupt(struct hfi1_ctxtdata *rcd, int thread);
++ int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *rcd, int thread);
++ int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *rcd, int thread);
+++>>>>>>> e6f7622df177 (IB/hfi1: Size rcd array index correctly and consistently)
+  void set_all_slowpath(struct hfi1_devdata *dd);
+  void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd);
+  void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd);
+diff --cc drivers/infiniband/hw/hfi1/user_sdma.h
+index 39001714f551,73c2455189d3..000000000000
+--- a/drivers/infiniband/hw/hfi1/user_sdma.h
++++ b/drivers/infiniband/hw/hfi1/user_sdma.h
+@@@ -54,9 -56,8 +54,14 @@@
+  extern uint extended_psn;
+  
+  struct hfi1_user_sdma_pkt_q {
+++<<<<<<< HEAD
+ +	struct list_head list;
+ +	unsigned ctxt;
+ +	unsigned subctxt;
+++=======
++ 	u16 ctxt;
++ 	u16 subctxt;
+++>>>>>>> e6f7622df177 (IB/hfi1: Size rcd array index correctly and consistently)
+  	u16 n_max_reqs;
+  	atomic_t n_reqs;
+  	u16 reqidx;
+diff --git a/drivers/infiniband/hw/hfi1/aspm.h b/drivers/infiniband/hw/hfi1/aspm.h
+index 794e6814a531..3f9a071ccac3 100644
+--- a/drivers/infiniband/hw/hfi1/aspm.h
++++ b/drivers/infiniband/hw/hfi1/aspm.h
+@@ -237,7 +237,7 @@ static inline void aspm_disable_all(struct hfi1_devdata *dd)
+ {
+ 	struct hfi1_ctxtdata *rcd;
+ 	unsigned long flags;
+-	unsigned i;
++	u16 i;
+ 
+ 	for (i = 0; i < dd->first_dyn_alloc_ctxt; i++) {
+ 		rcd = dd->rcd[i];
+@@ -256,7 +256,7 @@ static inline void aspm_enable_all(struct hfi1_devdata *dd)
+ {
+ 	struct hfi1_ctxtdata *rcd;
+ 	unsigned long flags;
+-	unsigned i;
++	u16 i;
+ 
+ 	aspm_enable(dd);
+ 
+@@ -284,7 +284,7 @@ static inline void aspm_ctx_init(struct hfi1_ctxtdata *rcd)
+ 
+ static inline void aspm_init(struct hfi1_devdata *dd)
+ {
+-	unsigned i;
++	u16 i;
+ 
+ 	spin_lock_init(&dd->aspm_lock);
+ 	dd->aspm_supported = aspm_hw_l1_supported(dd);
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index f57caa8b4d09..1469a2140e02 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -6754,7 +6754,7 @@ static void rxe_freeze(struct hfi1_devdata *dd)
+ static void rxe_kernel_unfreeze(struct hfi1_devdata *dd)
+ {
+ 	u32 rcvmask;
+-	int i;
++	u16 i;
+ 
+ 	/* enable all kernel contexts */
+ 	for (i = 0; i < dd->num_rcv_contexts; i++) {
+@@ -11682,7 +11682,7 @@ static u32 encoded_size(u32 size)
+ 	return 0x1;	/* if invalid, go with the minimum size */
+ }
+ 
+-void hfi1_rcvctrl(struct hfi1_devdata *dd, unsigned int op, int ctxt)
++void hfi1_rcvctrl(struct hfi1_devdata *dd, unsigned int op, u16 ctxt)
+ {
+ 	struct hfi1_ctxtdata *rcd;
+ 	u64 rcvctrl, reg;
+@@ -14460,7 +14460,7 @@ static void init_txe(struct hfi1_devdata *dd)
+ 		write_csr(dd, SEND_CM_TIMER_CTRL, HFI1_CREDIT_RETURN_RATE);
+ }
+ 
+-int hfi1_set_ctxt_jkey(struct hfi1_devdata *dd, unsigned ctxt, u16 jkey)
++int hfi1_set_ctxt_jkey(struct hfi1_devdata *dd, u16 ctxt, u16 jkey)
+ {
+ 	struct hfi1_ctxtdata *rcd = dd->rcd[ctxt];
+ 	unsigned sctxt;
+@@ -14497,7 +14497,7 @@ done:
+ 	return ret;
+ }
+ 
+-int hfi1_clear_ctxt_jkey(struct hfi1_devdata *dd, unsigned ctxt)
++int hfi1_clear_ctxt_jkey(struct hfi1_devdata *dd, u16 ctxt)
+ {
+ 	struct hfi1_ctxtdata *rcd = dd->rcd[ctxt];
+ 	unsigned sctxt;
+@@ -14526,7 +14526,7 @@ done:
+ 	return ret;
+ }
+ 
+-int hfi1_set_ctxt_pkey(struct hfi1_devdata *dd, unsigned ctxt, u16 pkey)
++int hfi1_set_ctxt_pkey(struct hfi1_devdata *dd, u16 ctxt, u16 pkey)
+ {
+ 	struct hfi1_ctxtdata *rcd;
+ 	unsigned sctxt;
+diff --git a/drivers/infiniband/hw/hfi1/chip.h b/drivers/infiniband/hw/hfi1/chip.h
+index 8a7b218d745f..170d1e018d60 100644
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@ -1351,15 +1351,15 @@ int hfi1_init_ctxt(struct send_context *sc);
+ void hfi1_put_tid(struct hfi1_devdata *dd, u32 index,
+ 		  u32 type, unsigned long pa, u16 order);
+ void hfi1_quiet_serdes(struct hfi1_pportdata *ppd);
+-void hfi1_rcvctrl(struct hfi1_devdata *dd, unsigned int op, int ctxt);
++void hfi1_rcvctrl(struct hfi1_devdata *dd, unsigned int op, u16 ctxt);
+ u32 hfi1_read_cntrs(struct hfi1_devdata *dd, char **namep, u64 **cntrp);
+ u32 hfi1_read_portcntrs(struct hfi1_pportdata *ppd, char **namep, u64 **cntrp);
+ u8 hfi1_ibphys_portstate(struct hfi1_pportdata *ppd);
+ int hfi1_get_ib_cfg(struct hfi1_pportdata *ppd, int which);
+ int hfi1_set_ib_cfg(struct hfi1_pportdata *ppd, int which, u32 val);
+-int hfi1_set_ctxt_jkey(struct hfi1_devdata *dd, unsigned ctxt, u16 jkey);
+-int hfi1_clear_ctxt_jkey(struct hfi1_devdata *dd, unsigned ctxt);
+-int hfi1_set_ctxt_pkey(struct hfi1_devdata *dd, unsigned ctxt, u16 pkey);
++int hfi1_set_ctxt_jkey(struct hfi1_devdata *dd, u16 ctxt, u16 jkey);
++int hfi1_clear_ctxt_jkey(struct hfi1_devdata *dd, u16 ctxt);
++int hfi1_set_ctxt_pkey(struct hfi1_devdata *dd, u16 ctxt, u16 pkey);
+ int hfi1_clear_ctxt_pkey(struct hfi1_devdata *dd, struct hfi1_ctxtdata *ctxt);
+ void hfi1_read_link_quality(struct hfi1_devdata *dd, u8 *link_quality);
+ void hfi1_init_vnic_rsm(struct hfi1_devdata *dd);
+diff --git a/drivers/infiniband/hw/hfi1/driver.c b/drivers/infiniband/hw/hfi1/driver.c
+index 500b129ed565..b130c6beceb3 100644
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -873,9 +873,9 @@ bail:
+ 	return last;
+ }
+ 
+-static inline void set_nodma_rtail(struct hfi1_devdata *dd, u8 ctxt)
++static inline void set_nodma_rtail(struct hfi1_devdata *dd, u16 ctxt)
+ {
+-	int i;
++	u16 i;
+ 
+ 	/*
+ 	 * For dynamically allocated kernel contexts (like vnic) switch
+@@ -893,9 +893,9 @@ static inline void set_nodma_rtail(struct hfi1_devdata *dd, u8 ctxt)
+ 			&handle_receive_interrupt_nodma_rtail;
+ }
+ 
+-static inline void set_dma_rtail(struct hfi1_devdata *dd, u8 ctxt)
++static inline void set_dma_rtail(struct hfi1_devdata *dd, u16 ctxt)
+ {
+-	int i;
++	u16 i;
+ 
+ 	/*
+ 	 * For dynamically allocated kernel contexts (like vnic) switch
+@@ -915,7 +915,7 @@ static inline void set_dma_rtail(struct hfi1_devdata *dd, u8 ctxt)
+ 
+ void set_all_slowpath(struct hfi1_devdata *dd)
+ {
+-	int i;
++	u16 i;
+ 
+ 	/* HFI1_CTRL_CTXT must always use the slow path interrupt handler */
+ 	for (i = HFI1_CTRL_CTXT + 1; i < dd->num_rcv_contexts; i++) {
+@@ -1099,7 +1099,7 @@ void receive_interrupt_work(struct work_struct *work)
+ 	struct hfi1_pportdata *ppd = container_of(work, struct hfi1_pportdata,
+ 						  linkstate_active_work);
+ 	struct hfi1_devdata *dd = ppd->dd;
+-	int i;
++	u16 i;
+ 
+ 	/* Received non-SC15 packet implies neighbor_normal */
+ 	ppd->neighbor_normal = 1;
+@@ -1300,7 +1300,8 @@ void hfi1_start_led_override(struct hfi1_pportdata *ppd, unsigned int timeon,
+  */
+ int hfi1_reset_device(int unit)
+ {
+-	int ret, i;
++	int ret;
++	u16 i;
+ 	struct hfi1_devdata *dd = hfi1_lookup(unit);
+ 	struct hfi1_pportdata *ppd;
+ 	unsigned long flags;
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+* Unmerged path drivers/infiniband/hw/hfi1/hfi.h
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index d1e1227c533d..67dc95e23386 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -129,7 +129,7 @@ unsigned long *hfi1_cpulist;
+  */
+ int hfi1_create_ctxts(struct hfi1_devdata *dd)
+ {
+-	unsigned i;
++	u16 i;
+ 	int ret;
+ 
+ 	/* Control context has to be always 0 */
+@@ -207,7 +207,7 @@ bail:
+ /*
+  * Common code for user and kernel context setup.
+  */
+-struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
++struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u16 ctxt,
+ 					   int numa)
+ {
+ 	struct hfi1_devdata *dd = ppd->dd;
+@@ -584,7 +584,7 @@ static int init_after_reset(struct hfi1_devdata *dd)
+ static void enable_chip(struct hfi1_devdata *dd)
+ {
+ 	u32 rcvmask;
+-	u32 i;
++	u16 i;
+ 
+ 	/* enable PIO send */
+ 	pio_send_control(dd, PSC_GLOBAL_ENABLE);
+@@ -661,7 +661,8 @@ wq_error:
+ int hfi1_init(struct hfi1_devdata *dd, int reinit)
+ {
+ 	int ret = 0, pidx, lastfail = 0;
+-	unsigned i, len;
++	unsigned long len;
++	u16 i;
+ 	struct hfi1_ctxtdata *rcd;
+ 	struct hfi1_pportdata *ppd;
+ 
+diff --git a/drivers/infiniband/hw/hfi1/trace_rx.h b/drivers/infiniband/hw/hfi1/trace_rx.h
+index 84929578cfe6..bebf0a8f214d 100644
+--- a/drivers/infiniband/hw/hfi1/trace_rx.h
++++ b/drivers/infiniband/hw/hfi1/trace_rx.h
+@@ -114,7 +114,7 @@ TRACE_EVENT(hfi1_rcvhdr,
+ );
+ 
+ TRACE_EVENT(hfi1_receive_interrupt,
+-	    TP_PROTO(struct hfi1_devdata *dd, u32 ctxt),
++	    TP_PROTO(struct hfi1_devdata *dd, u16 ctxt),
+ 	    TP_ARGS(dd, ctxt),
+ 	    TP_STRUCT__entry(DD_DEV_ENTRY(dd)
+ 			     __field(u32, ctxt)
+* Unmerged path drivers/infiniband/hw/hfi1/user_sdma.h
+diff --git a/drivers/infiniband/hw/hfi1/vnic_main.c b/drivers/infiniband/hw/hfi1/vnic_main.c
+index b1572c795c35..92cc960f8ad0 100644
+--- a/drivers/infiniband/hw/hfi1/vnic_main.c
++++ b/drivers/infiniband/hw/hfi1/vnic_main.c
+@@ -110,7 +110,7 @@ static int allocate_vnic_ctxt(struct hfi1_devdata *dd,
+ 			      struct hfi1_ctxtdata **vnic_ctxt)
+ {
+ 	struct hfi1_ctxtdata *uctxt;
+-	unsigned int ctxt;
++	u16 ctxt;
+ 	int ret;
+ 
+ 	if (dd->flags & HFI1_FROZEN)
