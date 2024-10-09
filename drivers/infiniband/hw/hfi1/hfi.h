@@ -1015,6 +1015,14 @@ struct hfi1_devdata {
 	/* initial vl15 credits to use */
 	u16 vl15_init;
 
+	/*
+	 * Cached value for vl15buf, read during verify cap interrupt. VL15
+	 * credits are to be kept at 0 and set when handling the link-up
+	 * interrupt. This removes the possibility of receiving VL15 MAD
+	 * packets before this HFI is ready.
+	 */
+	u16 vl15buf_cached;
+
 	/* Misc small ints */
 	u8 n_krcv_queues;
 	u8 qos_shift;
@@ -1542,7 +1550,8 @@ int hfi1_rcvbuf_validate(u32, u8, u16 *);
 int fm_get_table(struct hfi1_pportdata *, int, void *);
 int fm_set_table(struct hfi1_pportdata *, int, void *);
 
-void set_up_vl15(struct hfi1_devdata *dd, u8 vau, u16 vl15buf);
+void set_up_vau(struct hfi1_devdata *dd, u8 vau);
+void set_up_vl15(struct hfi1_devdata *dd, u16 vl15buf);
 void reset_link_credits(struct hfi1_devdata *dd);
 void assign_remote_cm_au_table(struct hfi1_devdata *dd, u8 vcu);
 

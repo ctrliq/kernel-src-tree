@@ -129,7 +129,8 @@ void handle_linkup_change(struct hfi1_devdata *dd, u32 linkup)
 		 * the remote values.  Both sides must be using the values.
 		 */
 		if (quick_linkup || dd->icode == ICODE_FUNCTIONAL_SIMULATOR) {
-			set_up_vl15(dd, dd->vau, dd->vl15_init);
+			set_up_vau(dd, dd->vau);
+			set_up_vl15(dd, dd->vl15_init);
 			assign_remote_cm_au_table(dd, dd->vcu);
 			ppd->neighbor_guid =
 				read_csr(dd, DC_DC8051_STS_REMOTE_GUID);
