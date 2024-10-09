@@ -1,0 +1,2197 @@
+target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Subsume se_port + t10_alua_tg_pt_gp_member into se_lun (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.10%
+commit-author Christoph Hellwig <hch@lst.de>
+commit adf653f92f38e80a78bb77e912d49bcc8055330f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/adf653f9.failed
+
+This patch eliminates all se_port + t10_alua_tg_pt_gp_member usage,
+and converts current users to direct se_lun pointer dereference.
+
+This includes the removal of core_export_port(), core_release_port()
+core_dev_export() and core_dev_unexport().  Along with conversion
+of special case se_lun pointer dereference within PR ALL_TG_PT=1
+and ALUA access state transition UNIT_ATTENTION handling.
+
+Also, update core_enable_device_list_for_node() to reference the
+new per se_lun->lun_deve_list when creating a new entry, or
+replacing an existing one via RCU.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit adf653f92f38e80a78bb77e912d49bcc8055330f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_alua.c
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_fabric_configfs.c
+#	drivers/target/target_core_internal.h
+#	drivers/target/target_core_pr.c
+#	drivers/target/target_core_tpg.c
+#	include/target/target_core_base.h
+diff --cc drivers/target/target_core_alua.c
+index a73542598e96,1109c2833fe6..000000000000
+--- a/drivers/target/target_core_alua.c
++++ b/drivers/target/target_core_alua.c
+@@@ -42,10 -41,9 +42,9 @@@
+  #include "target_core_ua.h"
+  
+  static sense_reason_t core_alua_check_transition(int state, int valid,
+ -						 int *primary);
+ +						 int *primary, int explicit);
+  static int core_alua_set_tg_pt_secondary_state(
+- 		struct t10_alua_tg_pt_gp_member *tg_pt_gp_mem,
+- 		struct se_port *port, int explicit, int offline);
++ 		struct se_lun *lun, int explicit, int offline);
+  
+  static char *core_alua_dump_state(int state);
+  
+@@@ -703,11 -689,9 +689,9 @@@ target_alua_state_check(struct se_cmd *
+  
+  	if (dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE)
+  		return 0;
+ -	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH)
+ +	if (dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH_ALUA)
+  		return 0;
+  
+- 	if (!port)
+- 		return 0;
+  	/*
+  	 * First, check for a struct se_port specific secondary ALUA target port
+  	 * access state: OFFLINE
+@@@ -718,21 -702,17 +702,23 @@@
+  		set_ascq(cmd, ASCQ_04H_ALUA_OFFLINE);
+  		return TCM_CHECK_CONDITION_NOT_READY;
+  	}
+- 	 /*
+- 	 * Second, obtain the struct t10_alua_tg_pt_gp_member pointer to the
+- 	 * ALUA target port group, to obtain current ALUA access state.
+- 	 * Otherwise look for the underlying struct se_device association with
+- 	 * a ALUA logical unit group.
+- 	 */
+- 	tg_pt_gp_mem = port->sep_alua_tg_pt_gp_mem;
+- 	if (!tg_pt_gp_mem)
++ 
++ 	if (!lun->lun_tg_pt_gp)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
+ +	tg_pt_gp = tg_pt_gp_mem->tg_pt_gp;
+ +	out_alua_state = tg_pt_gp->tg_pt_gp_alua_access_state;
+++=======
++ 	spin_lock(&lun->lun_tg_pt_gp_lock);
++ 	tg_pt_gp = lun->lun_tg_pt_gp;
++ 	out_alua_state = atomic_read(&tg_pt_gp->tg_pt_gp_alua_access_state);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	nonop_delay_msecs = tg_pt_gp->tg_pt_gp_nonop_delay_msecs;
+- 	spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
++ 
++ 	// XXX: keeps using tg_pt_gp witout reference after unlock
++ 	spin_unlock(&lun->lun_tg_pt_gp_lock);
+  	/*
+  	 * Process ALUA_ACCESS_STATE_ACTIVE_OPTIMIZED in a separate conditional
+  	 * statement so the compiler knows explicitly to check this case first.
+@@@ -968,17 -941,20 +950,22 @@@ static int core_alua_update_tpg_primary
+  	return rc;
+  }
+  
+ -static void core_alua_do_transition_tg_pt_work(struct work_struct *work)
+ +static void core_alua_do_transition_ua(struct t10_alua_tg_pt_gp *tg_pt_gp)
+  {
+ -	struct t10_alua_tg_pt_gp *tg_pt_gp = container_of(work,
+ -		struct t10_alua_tg_pt_gp, tg_pt_gp_transition_work.work);
+ -	struct se_device *dev = tg_pt_gp->tg_pt_gp_dev;
+  	struct se_dev_entry *se_deve;
++ 	struct se_lun *lun;
+  	struct se_lun_acl *lacl;
+++<<<<<<< HEAD
+ +	struct se_port *port;
+ +	struct t10_alua_tg_pt_gp_member *mem;
+++=======
++ 	bool explicit = (tg_pt_gp->tg_pt_gp_alua_access_status ==
++ 			 ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+  	spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+- 	list_for_each_entry(mem, &tg_pt_gp->tg_pt_gp_mem_list,
+- 				tg_pt_gp_mem_list) {
+- 		port = mem->tg_pt;
++ 	list_for_each_entry(lun, &tg_pt_gp->tg_pt_gp_lun_list,
++ 				lun_tg_pt_gp_link) {
+  		/*
+  		 * After an implicit target port asymmetric access state
+  		 * change, a device server shall establish a unit attention
+@@@ -993,13 -969,13 +980,20 @@@
+  		 * every I_T nexus other than the I_T nexus on which the SET
+  		 * TARGET PORT GROUPS command
+  		 */
+- 		atomic_inc_mb(&mem->tg_pt_gp_mem_ref_cnt);
++ 		atomic_inc_mb(&lun->lun_active);
+  		spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  
+++<<<<<<< HEAD
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(se_deve, &port->sep_alua_list,
+ +					alua_port_list) {
+ +			lacl = se_deve->se_lun_acl;
+++=======
++ 		spin_lock_bh(&lun->lun_deve_lock);
++ 		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link) {
++ 			lacl = rcu_dereference_check(se_deve->se_lun_acl,
++ 					lockdep_is_held(&lun->lun_deve_lock));
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  			/*
+  			 * se_deve->se_lun_acl pointer may be NULL for a
+  			 * entry created without explicit Node+MappedLUN ACLs
+@@@ -1019,12 -995,47 +1013,12 @@@
+  				se_deve->mapped_lun, 0x2A,
+  				ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED);
+  		}
+- 		spin_unlock_bh(&port->sep_alua_lock);
++ 		spin_unlock_bh(&lun->lun_deve_lock);
+  
+  		spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+- 		atomic_dec_mb(&mem->tg_pt_gp_mem_ref_cnt);
++ 		atomic_dec_mb(&lun->lun_active);
+  	}
+  	spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+ -	/*
+ -	 * Update the ALUA metadata buf that has been allocated in
+ -	 * core_alua_do_port_transition(), this metadata will be written
+ -	 * to struct file.
+ -	 *
+ -	 * Note that there is the case where we do not want to update the
+ -	 * metadata when the saved metadata is being parsed in userspace
+ -	 * when setting the existing port access state and access status.
+ -	 *
+ -	 * Also note that the failure to write out the ALUA metadata to
+ -	 * struct file does NOT affect the actual ALUA transition.
+ -	 */
+ -	if (tg_pt_gp->tg_pt_gp_write_metadata) {
+ -		mutex_lock(&tg_pt_gp->tg_pt_gp_md_mutex);
+ -		core_alua_update_tpg_primary_metadata(tg_pt_gp);
+ -		mutex_unlock(&tg_pt_gp->tg_pt_gp_md_mutex);
+ -	}
+ -	/*
+ -	 * Set the current primary ALUA access state to the requested new state
+ -	 */
+ -	atomic_set(&tg_pt_gp->tg_pt_gp_alua_access_state,
+ -		   tg_pt_gp->tg_pt_gp_alua_pending_state);
+ -
+ -	pr_debug("Successful %s ALUA transition TG PT Group: %s ID: %hu"
+ -		" from primary access state %s to %s\n", (explicit) ? "explicit" :
+ -		"implicit", config_item_name(&tg_pt_gp->tg_pt_gp_group.cg_item),
+ -		tg_pt_gp->tg_pt_gp_id,
+ -		core_alua_dump_state(tg_pt_gp->tg_pt_gp_alua_previous_state),
+ -		core_alua_dump_state(tg_pt_gp->tg_pt_gp_alua_pending_state));
+ -	spin_lock(&dev->t10_alua.tg_pt_gps_lock);
+ -	atomic_dec(&tg_pt_gp->tg_pt_gp_ref_cnt);
+ -	spin_unlock(&dev->t10_alua.tg_pt_gps_lock);
+ -
+ -	if (tg_pt_gp->tg_pt_gp_transition_complete)
+ -		complete(tg_pt_gp->tg_pt_gp_transition_complete);
+  }
+  
+  static int core_alua_do_transition_tg_pt(
+@@@ -1664,13 -1669,15 +1654,18 @@@ struct t10_alua_tg_pt_gp *core_alua_all
+  		return NULL;
+  	}
+  	INIT_LIST_HEAD(&tg_pt_gp->tg_pt_gp_list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&tg_pt_gp->tg_pt_gp_mem_list);
+ +	mutex_init(&tg_pt_gp->tg_pt_gp_transition_mutex);
+++=======
++ 	INIT_LIST_HEAD(&tg_pt_gp->tg_pt_gp_lun_list);
++ 	mutex_init(&tg_pt_gp->tg_pt_gp_md_mutex);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	spin_lock_init(&tg_pt_gp->tg_pt_gp_lock);
+  	atomic_set(&tg_pt_gp->tg_pt_gp_ref_cnt, 0);
+ -	INIT_DELAYED_WORK(&tg_pt_gp->tg_pt_gp_transition_work,
+ -			  core_alua_do_transition_tg_pt_work);
+  	tg_pt_gp->tg_pt_gp_dev = dev;
+ -	atomic_set(&tg_pt_gp->tg_pt_gp_alua_access_state,
+ -		ALUA_ACCESS_STATE_ACTIVE_OPTIMIZED);
+ +	tg_pt_gp->tg_pt_gp_alua_access_state =
+ +			ALUA_ACCESS_STATE_ACTIVE_OPTIMIZED;
+  	/*
+  	 * Enable both explicit and implicit ALUA support by default
+  	 */
+@@@ -1955,15 -1916,15 +1902,15 @@@ ssize_t core_alua_show_tg_pt_gp_info(st
+  			"Primary Access Status: %s\nTG Port Secondary Access"
+  			" State: %s\nTG Port Secondary Access Status: %s\n",
+  			config_item_name(tg_pt_ci), tg_pt_gp->tg_pt_gp_id,
+ -			core_alua_dump_state(atomic_read(
+ -					&tg_pt_gp->tg_pt_gp_alua_access_state)),
+ +			core_alua_dump_state(
+ +				tg_pt_gp->tg_pt_gp_alua_access_state),
+  			core_alua_dump_status(
+  				tg_pt_gp->tg_pt_gp_alua_access_status),
+- 			(atomic_read(&port->sep_tg_pt_secondary_offline)) ?
++ 			atomic_read(&lun->lun_tg_pt_secondary_offline) ?
+  			"Offline" : "None",
+- 			core_alua_dump_status(port->sep_tg_pt_secondary_stat));
++ 			core_alua_dump_status(lun->lun_tg_pt_secondary_stat));
+  	}
+- 	spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
++ 	spin_unlock(&lun->lun_tg_pt_gp_lock);
+  
+  	return len;
+  }
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,8485e9a789fc..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -304,67 -309,73 +304,96 @@@ int core_enable_device_list_for_node
+  	struct se_node_acl *nacl,
+  	struct se_portal_group *tpg)
+  {
+++<<<<<<< HEAD
+ +	struct se_port *port = lun->lun_sep;
+ +	struct se_dev_entry *deve;
+++=======
++ 	struct se_dev_entry *orig, *new;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+ -	new = kzalloc(sizeof(*new), GFP_KERNEL);
+ -	if (!new) {
+ -		pr_err("Unable to allocate se_dev_entry memory\n");
+ -		return -ENOMEM;
+ -	}
+ +	spin_lock_irq(&nacl->device_list_lock);
+  
+++<<<<<<< HEAD
+ +	deve = nacl->device_list[mapped_lun];
+++=======
++ 	atomic_set(&new->ua_count, 0);
++ 	spin_lock_init(&new->ua_lock);
++ 	INIT_LIST_HEAD(&new->ua_list);
++ 	INIT_LIST_HEAD(&new->lun_link);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+ -	new->mapped_lun = mapped_lun;
+ -	kref_init(&new->pr_kref);
+ -	init_completion(&new->pr_comp);
+ -
+ -	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE)
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ -	else
+ -		new->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ -
+ -	new->creation_time = get_jiffies_64();
+ -	new->attach_count++;
+ -
+ -	mutex_lock(&nacl->lun_entry_mutex);
+ -	orig = target_nacl_find_deve(nacl, mapped_lun);
+ -	if (orig && orig->se_lun) {
+ -		struct se_lun *orig_lun = rcu_dereference_check(orig->se_lun,
+ -					lockdep_is_held(&nacl->lun_entry_mutex));
+ -
+ -		if (orig_lun != lun) {
+ -			pr_err("Existing orig->se_lun doesn't match new lun"
+ -			       " for dynamic -> explicit NodeACL conversion:"
+ -				" %s\n", nacl->initiatorname);
+ -			mutex_unlock(&nacl->lun_entry_mutex);
+ -			kfree(new);
+ +	/*
+ +	 * Check if the call is handling demo mode -> explicit LUN ACL
+ +	 * transition.  This transition must be for the same struct se_lun
+ +	 * + mapped_lun that was setup in demo mode..
+ +	 */
+ +	if (deve->lun_flags & TRANSPORT_LUNFLAGS_INITIATOR_ACCESS) {
+ +		if (deve->se_lun_acl != NULL) {
+ +			pr_err("struct se_dev_entry->se_lun_acl"
+ +			       " already set for demo mode -> explicit"
+ +			       " LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+ +			return -EINVAL;
+ +		}
+ +		if (deve->se_lun != lun) {
+ +			pr_err("struct se_dev_entry->se_lun does"
+ +			       " match passed struct se_lun for demo mode"
+ +			       " -> explicit LUN ACL transition\n");
+ +			spin_unlock_irq(&nacl->device_list_lock);
+  			return -EINVAL;
+  		}
+ -		BUG_ON(orig->se_lun_acl != NULL);
+ +		deve->se_lun_acl = lun_acl;
+  
+ -		rcu_assign_pointer(new->se_lun, lun);
+ -		rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -		hlist_del_rcu(&orig->link);
+ -		hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -		mutex_unlock(&nacl->lun_entry_mutex);
+ +		if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		} else {
+ +			deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +			deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		}
+  
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&nacl->device_list_lock);
+++=======
++ 		spin_lock_bh(&lun->lun_deve_lock);
++ 		list_del(&orig->lun_link);
++ 		list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 		spin_unlock_bh(&lun->lun_deve_lock);
++ 
++ 		kref_put(&orig->pr_kref, target_pr_kref_release);
++ 		wait_for_completion(&orig->pr_comp);
++ 
++ 		kfree_rcu(orig, rcu_head);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  		return 0;
+  	}
+  
+ -	rcu_assign_pointer(new->se_lun, lun);
+ -	rcu_assign_pointer(new->se_lun_acl, lun_acl);
+ -	hlist_add_head_rcu(&new->link, &nacl->lun_entry_hlist);
+ -	mutex_unlock(&nacl->lun_entry_mutex);
+ +	deve->se_lun = lun;
+ +	deve->se_lun_acl = lun_acl;
+ +	deve->mapped_lun = mapped_lun;
+ +	deve->lun_flags |= TRANSPORT_LUNFLAGS_INITIATOR_ACCESS;
+ +
+ +	if (lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_ONLY;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_WRITE;
+ +	} else {
+ +		deve->lun_flags &= ~TRANSPORT_LUNFLAGS_READ_WRITE;
+ +		deve->lun_flags |= TRANSPORT_LUNFLAGS_READ_ONLY;
+ +	}
+ +
+ +	deve->creation_time = get_jiffies_64();
+ +	deve->attach_count++;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_add_tail(&deve->alua_port_list, &port->sep_alua_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 	spin_lock_bh(&lun->lun_deve_lock);
++ 	list_add_tail(&new->lun_link, &lun->lun_deve_list);
++ 	spin_unlock_bh(&lun->lun_deve_lock);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+  	return 0;
+  }
+@@@ -381,12 -389,9 +410,15 @@@ int core_disable_device_list_for_node
+  	struct se_node_acl *nacl,
+  	struct se_portal_group *tpg)
+  {
+++<<<<<<< HEAD
+ +	struct se_port *port = lun->lun_sep;
+ +	struct se_dev_entry *deve = nacl->device_list[mapped_lun];
+ +
+++=======
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	/*
+  	 * If the MappedLUN entry is being disabled, the entry in
+- 	 * port->sep_alua_list must be removed now before clearing the
++ 	 * lun->lun_deve_list must be removed now before clearing the
+  	 * struct se_dev_entry pointers below as logic in
+  	 * core_alua_do_transition_tg_pt() depends on these being present.
+  	 *
+@@@ -397,30 -402,31 +429,36 @@@
+  	 * NodeACL context specific PR metadata for demo-mode
+  	 * MappedLUN *deve will be released below..
+  	 */
+++<<<<<<< HEAD
+ +	spin_lock_bh(&port->sep_alua_lock);
+ +	list_del(&deve->alua_port_list);
+ +	spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 	spin_lock_bh(&lun->lun_deve_lock);
++ 	list_del(&orig->lun_link);
++ 	spin_unlock_bh(&lun->lun_deve_lock);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	/*
+ -	 * Disable struct se_dev_entry LUN ACL mapping
+ +	 * Wait for any in process SPEC_I_PT=1 or REGISTER_AND_MOVE
+ +	 * PR operation to complete.
+  	 */
+ -	core_scsi3_ua_release_all(orig);
+ -
+ -	hlist_del_rcu(&orig->link);
+ -	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
+ -	rcu_assign_pointer(orig->se_lun, NULL);
+ -	rcu_assign_pointer(orig->se_lun_acl, NULL);
+ -	orig->lun_flags = 0;
+ -	orig->creation_time = 0;
+ -	orig->attach_count--;
+ +	while (atomic_read(&deve->pr_ref_count) != 0)
+ +		cpu_relax();
+ +
+ +	spin_lock_irq(&nacl->device_list_lock);
+  	/*
+ -	 * Before firing off RCU callback, wait for any in process SPEC_I_PT=1
+ -	 * or REGISTER_AND_MOVE PR operation to complete.
+ +	 * Disable struct se_dev_entry LUN ACL mapping
+  	 */
+ -	kref_put(&orig->pr_kref, target_pr_kref_release);
+ -	wait_for_completion(&orig->pr_comp);
+ -
+ -	kfree_rcu(orig, rcu_head);
+ +	core_scsi3_ua_release_all(deve);
+ +	deve->se_lun = NULL;
+ +	deve->se_lun_acl = NULL;
+ +	deve->lun_flags = 0;
+ +	deve->creation_time = 0;
+ +	deve->attach_count--;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  
+  	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+ +	return 0;
+  }
+  
+  /*      core_clear_lun_from_tpg():
+@@@ -431,49 -437,31 +469,38 @@@ void core_clear_lun_from_tpg(struct se_
+  {
+  	struct se_node_acl *nacl;
+  	struct se_dev_entry *deve;
+ +	u32 i;
+  
+ -	mutex_lock(&tpg->acl_node_mutex);
+ +	spin_lock_irq(&tpg->acl_node_lock);
+  	list_for_each_entry(nacl, &tpg->acl_node_list, acl_list) {
+ +		spin_unlock_irq(&tpg->acl_node_lock);
+  
+ -		mutex_lock(&nacl->lun_entry_mutex);
+ -		hlist_for_each_entry_rcu(deve, &nacl->lun_entry_hlist, link) {
+ -			struct se_lun *tmp_lun = rcu_dereference_check(deve->se_lun,
+ -					lockdep_is_held(&nacl->lun_entry_mutex));
+ -
+ -			if (lun != tmp_lun)
+ +		spin_lock_irq(&nacl->device_list_lock);
+ +		for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +			deve = nacl->device_list[i];
+ +			if (lun != deve->se_lun)
+  				continue;
+ +			spin_unlock_irq(&nacl->device_list_lock);
+  
+ -			core_disable_device_list_for_node(lun, deve, nacl, tpg);
+ +			core_disable_device_list_for_node(lun, NULL,
+ +				deve->mapped_lun, TRANSPORT_LUNFLAGS_NO_ACCESS,
+ +				nacl, tpg);
+ +
+ +			spin_lock_irq(&nacl->device_list_lock);
+  		}
+ -		mutex_unlock(&nacl->lun_entry_mutex);
+ +		spin_unlock_irq(&nacl->device_list_lock);
+ +
+ +		spin_lock_irq(&tpg->acl_node_lock);
+  	}
+ -	mutex_unlock(&tpg->acl_node_mutex);
+ +	spin_unlock_irq(&tpg->acl_node_lock);
+  }
+  
+- static struct se_port *core_alloc_port(struct se_device *dev)
++ int core_alloc_rtpi(struct se_lun *lun, struct se_device *dev)
+  {
+- 	struct se_port *port, *port_tmp;
+- 
+- 	port = kzalloc(sizeof(struct se_port), GFP_KERNEL);
+- 	if (!port) {
+- 		pr_err("Unable to allocate struct se_port\n");
+- 		return ERR_PTR(-ENOMEM);
+- 	}
+- 	INIT_LIST_HEAD(&port->sep_alua_list);
+- 	INIT_LIST_HEAD(&port->sep_list);
+- 	atomic_set(&port->sep_tg_pt_secondary_offline, 0);
+- 	spin_lock_init(&port->sep_alua_lock);
+- 	mutex_init(&port->sep_tg_pt_md_mutex);
++ 	struct se_lun *tmp;
+  
+  	spin_lock(&dev->se_port_lock);
+- 	if (dev->dev_port_count == 0x0000ffff) {
++ 	if (dev->export_count == 0x0000ffff) {
+  		pr_warn("Reached dev->dev_port_count =="
+  				" 0x0000ffff\n");
+  		spin_unlock(&dev->se_port_lock);
+@@@ -506,90 -494,6 +533,93 @@@ again
+  	}
+  	spin_unlock(&dev->se_port_lock);
+  
+++<<<<<<< HEAD
+ +	return port;
+ +}
+ +
+ +static void core_export_port(
+ +	struct se_device *dev,
+ +	struct se_portal_group *tpg,
+ +	struct se_port *port,
+ +	struct se_lun *lun)
+ +{
+ +	struct t10_alua_tg_pt_gp_member *tg_pt_gp_mem = NULL;
+ +
+ +	spin_lock(&dev->se_port_lock);
+ +	spin_lock(&lun->lun_sep_lock);
+ +	port->sep_tpg = tpg;
+ +	port->sep_lun = lun;
+ +	lun->lun_sep = port;
+ +	spin_unlock(&lun->lun_sep_lock);
+ +
+ +	list_add_tail(&port->sep_list, &dev->dev_sep_list);
+ +	spin_unlock(&dev->se_port_lock);
+ +
+ +	if (!(dev->transport->transport_flags &
+ +	      TRANSPORT_FLAG_PASSTHROUGH_ALUA) &&
+ +	    !(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE)) {
+ +		tg_pt_gp_mem = core_alua_allocate_tg_pt_gp_mem(port);
+ +		if (IS_ERR(tg_pt_gp_mem) || !tg_pt_gp_mem) {
+ +			pr_err("Unable to allocate t10_alua_tg_pt"
+ +					"_gp_member_t\n");
+ +			return;
+ +		}
+ +		spin_lock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
+ +		__core_alua_attach_tg_pt_gp_mem(tg_pt_gp_mem,
+ +			dev->t10_alua.default_tg_pt_gp);
+ +		spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
+ +		pr_debug("%s/%s: Adding to default ALUA Target Port"
+ +			" Group: alua/default_tg_pt_gp\n",
+ +			dev->transport->name, tpg->se_tpg_tfo->get_fabric_name());
+ +	}
+ +
+ +	dev->dev_port_count++;
+ +	port->sep_index = port->sep_rtpi; /* RELATIVE TARGET PORT IDENTIFIER */
+ +}
+ +
+ +/*
+ + *	Called with struct se_device->se_port_lock spinlock held.
+ + */
+ +static void core_release_port(struct se_device *dev, struct se_port *port)
+ +	__releases(&dev->se_port_lock) __acquires(&dev->se_port_lock)
+ +{
+ +	/*
+ +	 * Wait for any port reference for PR ALL_TG_PT=1 operation
+ +	 * to complete in __core_scsi3_alloc_registration()
+ +	 */
+ +	spin_unlock(&dev->se_port_lock);
+ +	if (atomic_read(&port->sep_tg_pt_ref_cnt))
+ +		cpu_relax();
+ +	spin_lock(&dev->se_port_lock);
+ +
+ +	core_alua_free_tg_pt_gp_mem(port);
+ +
+ +	list_del(&port->sep_list);
+ +	dev->dev_port_count--;
+ +	kfree(port);
+ +}
+ +
+ +int core_dev_export(
+ +	struct se_device *dev,
+ +	struct se_portal_group *tpg,
+ +	struct se_lun *lun)
+ +{
+ +	struct se_hba *hba = dev->se_hba;
+ +	struct se_port *port;
+ +
+ +	port = core_alloc_port(dev);
+ +	if (IS_ERR(port))
+ +		return PTR_ERR(port);
+ +
+ +	lun->lun_se_dev = dev;
+ +
+ +	spin_lock(&hba->device_lock);
+ +	dev->export_count++;
+ +	spin_unlock(&hba->device_lock);
+ +
+ +	core_export_port(dev, tpg, port, lun);
+++=======
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	return 0;
+  }
+  
+@@@ -1385,16 -657,13 +1388,16 @@@ int core_dev_add_initiator_node_lun_acl
+  	return 0;
+  }
+  
+ +/*      core_dev_del_initiator_node_lun_acl():
+ + *
+ + *
+ + */
+  int core_dev_del_initiator_node_lun_acl(
+- 	struct se_portal_group *tpg,
+  	struct se_lun *lun,
+  	struct se_lun_acl *lacl)
+  {
++ 	struct se_portal_group *tpg = lun->lun_tpg;
+  	struct se_node_acl *nacl;
+ -	struct se_dev_entry *deve;
+  
+  	nacl = lacl->se_lun_nacl;
+  	if (!nacl)
+@@@ -1538,11 -803,12 +1541,15 @@@ struct se_device *target_alloc_device(s
+  
+  	xcopy_lun = &dev->xcopy_lun;
+  	xcopy_lun->lun_se_dev = dev;
+ +	init_completion(&xcopy_lun->lun_shutdown_comp);
+ +	INIT_LIST_HEAD(&xcopy_lun->lun_acl_list);
+ +	spin_lock_init(&xcopy_lun->lun_acl_lock);
+  	spin_lock_init(&xcopy_lun->lun_sep_lock);
+  	init_completion(&xcopy_lun->lun_ref_comp);
++ 	INIT_LIST_HEAD(&xcopy_lun->lun_deve_list);
++ 	INIT_LIST_HEAD(&xcopy_lun->lun_dev_link);
++ 	mutex_init(&xcopy_lun->lun_tg_pt_md_mutex);
++ 	xcopy_lun->lun_tpg = &xcopy_pt_tpg;
+  
+  	return dev;
+  }
+diff --cc drivers/target/target_core_fabric_configfs.c
+index 0c3f90130b7d,0ee182fce1a6..000000000000
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@@ -137,23 -145,12 +136,30 @@@ static int target_fabric_mappedlun_unli
+  	struct config_item *lun_acl_ci,
+  	struct config_item *lun_ci)
+  {
+ +	struct se_lun *lun;
+  	struct se_lun_acl *lacl = container_of(to_config_group(lun_acl_ci),
+  			struct se_lun_acl, se_lun_group);
+++<<<<<<< HEAD
+ +	struct se_node_acl *nacl = lacl->se_lun_nacl;
+ +	struct se_dev_entry *deve = nacl->device_list[lacl->mapped_lun];
+ +	struct se_portal_group *se_tpg;
+ +	/*
+ +	 * Determine if the underlying MappedLUN has already been released..
+ +	 */
+ +	if (!deve->se_lun)
+ +		return 0;
+ +
+ +	lun = container_of(to_config_group(lun_ci), struct se_lun, lun_group);
+ +	se_tpg = lun->lun_sep->sep_tpg;
+ +
+ +	core_dev_del_initiator_node_lun_acl(se_tpg, lun, lacl);
+ +	return 0;
+++=======
++ 	struct se_lun *lun = container_of(to_config_group(lun_ci),
++ 			struct se_lun, lun_group);
++ 
++ 	return core_dev_del_initiator_node_lun_acl(lun, lacl);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  }
+  
+  CONFIGFS_EATTR_STRUCT(target_fabric_mappedlun, se_lun_acl);
+@@@ -810,10 -809,10 +816,10 @@@ static int target_fabric_port_unlink
+  {
+  	struct se_lun *lun = container_of(to_config_group(lun_ci),
+  				struct se_lun, lun_group);
+- 	struct se_portal_group *se_tpg = lun->lun_sep->sep_tpg;
++ 	struct se_portal_group *se_tpg = lun->lun_tpg;
+  	struct target_fabric_configfs *tf = se_tpg->se_tpg_wwn->wwn_tf;
+  
+ -	if (tf->tf_ops->fabric_pre_unlink) {
+ +	if (tf->tf_ops.fabric_pre_unlink) {
+  		/*
+  		 * Call the optional fabric_pre_unlink() to allow a
+  		 * fabric module to release any additional stat before
+diff --cc drivers/target/target_core_internal.h
+index 874a9bc988d8,8d8737a13e6f..000000000000
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@@ -11,28 -21,27 +11,40 @@@ extern struct configfs_subsystem *targe
+  extern struct mutex g_device_mutex;
+  extern struct list_head g_device_list;
+  
++ int	core_alloc_rtpi(struct se_lun *lun, struct se_device *dev);
+  struct se_dev_entry *core_get_se_deve_from_rtpi(struct se_node_acl *, u16);
+ -void	target_pr_kref_release(struct kref *);
+ -void	core_free_device_list_for_node(struct se_node_acl *,
+ +int	core_free_device_list_for_node(struct se_node_acl *,
+  		struct se_portal_group *);
+  void	core_update_device_list_access(u32, u32, struct se_node_acl *);
+ -struct se_dev_entry *target_nacl_find_deve(struct se_node_acl *, u32);
+  int	core_enable_device_list_for_node(struct se_lun *, struct se_lun_acl *,
+  		u32, u32, struct se_node_acl *, struct se_portal_group *);
+ -void	core_disable_device_list_for_node(struct se_lun *, struct se_dev_entry *,
+ -		struct se_node_acl *, struct se_portal_group *);
+ +int	core_disable_device_list_for_node(struct se_lun *, struct se_lun_acl *,
+ +		u32, u32, struct se_node_acl *, struct se_portal_group *);
+  void	core_clear_lun_from_tpg(struct se_lun *, struct se_portal_group *);
+++<<<<<<< HEAD
+ +int	core_dev_export(struct se_device *, struct se_portal_group *,
+ +		struct se_lun *);
+ +void	core_dev_unexport(struct se_device *, struct se_portal_group *,
+ +		struct se_lun *);
+ +struct se_lun *core_dev_add_lun(struct se_portal_group *, struct se_device *, u32);
+++=======
++ int	core_dev_add_lun(struct se_portal_group *, struct se_device *,
++ 		struct se_lun *lun);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  void	core_dev_del_lun(struct se_portal_group *, struct se_lun *);
+ +struct se_lun *core_get_lun_from_tpg(struct se_portal_group *, u32);
+  struct se_lun_acl *core_dev_init_initiator_node_lun_acl(struct se_portal_group *,
+  		struct se_node_acl *, u32, int *);
+  int	core_dev_add_initiator_node_lun_acl(struct se_portal_group *,
+++<<<<<<< HEAD
+ +		struct se_lun_acl *, u32, u32);
+ +int	core_dev_del_initiator_node_lun_acl(struct se_portal_group *,
+ +		struct se_lun *, struct se_lun_acl *);
+++=======
++ 		struct se_lun_acl *, struct se_lun *lun, u32);
++ int	core_dev_del_initiator_node_lun_acl(struct se_lun *,
++ 		struct se_lun_acl *);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  void	core_dev_free_initiator_node_lun_acl(struct se_portal_group *,
+  		struct se_lun_acl *lacl);
+  int	core_dev_setup_virtual_lun0(void);
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,60624bb6c598..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -642,8 -640,9 +642,14 @@@ static struct t10_pr_registration *__co
+  	atomic_set(&pr_reg->pr_res_holders, 0);
+  	pr_reg->pr_reg_nacl = nacl;
+  	pr_reg->pr_reg_deve = deve;
+++<<<<<<< HEAD
+ +	pr_reg->pr_res_mapped_lun = deve->mapped_lun;
+ +	pr_reg->pr_aptpl_target_lun = deve->se_lun->unpacked_lun;
+++=======
++ 	pr_reg->pr_res_mapped_lun = mapped_lun;
++ 	pr_reg->pr_aptpl_target_lun = lun->unpacked_lun;
++ 	pr_reg->tg_pt_sep_rtpi = lun->lun_rtpi;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	pr_reg->pr_res_key = sa_res_key;
+  	pr_reg->pr_reg_all_tg_pt = all_tg_pt;
+  	pr_reg->pr_reg_aptpl = aptpl;
+@@@ -679,8 -679,9 +685,14 @@@ static struct t10_pr_registration *__co
+  {
+  	struct se_dev_entry *deve_tmp;
+  	struct se_node_acl *nacl_tmp;
+++<<<<<<< HEAD
+ +	struct se_port *port, *port_tmp;
+ +	struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+++=======
++ 	struct se_lun_acl *lacl_tmp;
++ 	struct se_lun *lun_tmp, *next, *dest_lun;
++ 	const struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	struct t10_pr_registration *pr_reg, *pr_reg_atp, *pr_reg_tmp, *pr_reg_tmp_safe;
+  	int ret;
+  	/*
+@@@ -716,7 -717,9 +727,13 @@@
+  			if (!deve_tmp->se_lun_acl)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			nacl_tmp = deve_tmp->se_lun_acl->se_lun_nacl;
+++=======
++ 			lacl_tmp = rcu_dereference_check(deve_tmp->se_lun_acl,
++ 						lockdep_is_held(&lun_tmp->lun_deve_lock));
++ 			nacl_tmp = lacl_tmp->se_lun_nacl;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  			/*
+  			 * Skip the matching struct se_node_acl that is allocated
+  			 * above..
+@@@ -736,8 -739,8 +753,13 @@@
+  			if (strcmp(nacl->initiatorname, nacl_tmp->initiatorname))
+  				continue;
+  
+++<<<<<<< HEAD
+ +			atomic_inc_mb(&deve_tmp->pr_ref_count);
+ +			spin_unlock_bh(&port->sep_alua_lock);
+++=======
++ 			kref_get(&deve_tmp->pr_kref);
++ 			spin_unlock_bh(&lun_tmp->lun_deve_lock);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  			/*
+  			 * Grab a configfs group dependency that is released
+  			 * for the exception path at label out: below, or upon
+@@@ -748,8 -751,8 +770,13 @@@
+  			if (ret < 0) {
+  				pr_err("core_scsi3_lunacl_depend"
+  						"_item() failed\n");
+++<<<<<<< HEAD
+ +				atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+ +				atomic_dec_mb(&deve_tmp->pr_ref_count);
+++=======
++ 				atomic_dec_mb(&lun->lun_active);
++ 				kref_put(&deve_tmp->pr_kref, target_pr_kref_release);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  				goto out;
+  			}
+  			/*
+@@@ -759,12 -762,15 +786,24 @@@
+  			 * the original *pr_reg is processed in
+  			 * __core_scsi3_add_registration()
+  			 */
+++<<<<<<< HEAD
+ +			pr_reg_atp = __core_scsi3_do_alloc_registration(dev,
+ +						nacl_tmp, deve_tmp, NULL,
+ +						sa_res_key, all_tg_pt, aptpl);
+ +			if (!pr_reg_atp) {
+ +				atomic_dec_mb(&port->sep_tg_pt_ref_cnt);
+ +				atomic_dec_mb(&deve_tmp->pr_ref_count);
+++=======
++ 			dest_lun = rcu_dereference_check(deve_tmp->se_lun,
++ 				atomic_read(&deve_tmp->pr_kref.refcount) != 0);
++ 
++ 			pr_reg_atp = __core_scsi3_do_alloc_registration(dev,
++ 						nacl_tmp, dest_lun, deve_tmp,
++ 						deve_tmp->mapped_lun, NULL,
++ 						sa_res_key, all_tg_pt, aptpl);
++ 			if (!pr_reg_atp) {
++ 				atomic_dec_mb(&lun_tmp->lun_active);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  				core_scsi3_lunacl_undepend_item(deve_tmp);
+  				goto out;
+  			}
+@@@ -931,8 -936,7 +970,12 @@@ static int __core_scsi3_check_aptpl_reg
+  		     (pr_reg->pr_aptpl_target_lun == target_lun)) {
+  
+  			pr_reg->pr_reg_nacl = nacl;
+++<<<<<<< HEAD
+ +			pr_reg->pr_reg_deve = deve;
+ +			pr_reg->pr_reg_tg_pt_lun = lun;
+++=======
++ 			pr_reg->tg_pt_sep_rtpi = lun->lun_rtpi;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+  			list_del(&pr_reg->pr_reg_aptpl_list);
+  			spin_unlock(&pr_tmpl->aptpl_reg_lock);
+@@@ -1541,32 -1547,25 +1583,43 @@@ core_scsi3_decode_spec_i_port
+  	ptr = &buf[28];
+  
+  	while (tpdl > 0) {
+++<<<<<<< HEAD
+++=======
++ 		struct se_lun *dest_lun, *tmp_lun;
++ 
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  		proto_ident = (ptr[0] & 0x0f);
+  		dest_tpg = NULL;
+  
+  		spin_lock(&dev->se_port_lock);
+++<<<<<<< HEAD
+ +		list_for_each_entry(tmp_port, &dev->dev_sep_list, sep_list) {
+ +			tmp_tpg = tmp_port->sep_tpg;
+ +			if (!tmp_tpg)
+ +				continue;
+ +			tmp_tf_ops = tmp_tpg->se_tpg_tfo;
+ +			if (!tmp_tf_ops)
+ +				continue;
+ +			if (!tmp_tf_ops->get_fabric_proto_ident ||
+ +			    !tmp_tf_ops->tpg_parse_pr_out_transport_id)
+ +				continue;
+++=======
++ 		list_for_each_entry(tmp_lun, &dev->dev_sep_list, lun_dev_link) {
++ 			tmp_tpg = tmp_lun->lun_tpg;
++ 
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  			/*
+  			 * Look for the matching proto_ident provided by
+  			 * the received TransportID
+  			 */
+ -			if (tmp_tpg->proto_id != proto_ident)
+ +			tmp_proto_ident = tmp_tf_ops->get_fabric_proto_ident(tmp_tpg);
+ +			if (tmp_proto_ident != proto_ident)
+  				continue;
+- 			dest_rtpi = tmp_port->sep_rtpi;
++ 			dest_rtpi = tmp_lun->lun_rtpi;
+  
+ -			i_str = target_parse_pr_out_transport_id(tmp_tpg,
+ -					(const char *)ptr, &tid_len, &iport_ptr);
+ +			i_str = tmp_tf_ops->tpg_parse_pr_out_transport_id(
+ +					tmp_tpg, (const char *)ptr, &tid_len,
+ +					&iport_ptr);
+  			if (!i_str)
+  				continue;
+  
+@@@ -3115,11 -3114,10 +3168,10 @@@ core_scsi3_emulate_pro_register_and_mov
+  	struct se_session *se_sess = cmd->se_sess;
+  	struct se_device *dev = cmd->se_dev;
+  	struct se_dev_entry *dest_se_deve = NULL;
+- 	struct se_lun *se_lun = cmd->se_lun;
++ 	struct se_lun *se_lun = cmd->se_lun, *tmp_lun;
+  	struct se_node_acl *pr_res_nacl, *pr_reg_nacl, *dest_node_acl = NULL;
+- 	struct se_port *se_port;
+  	struct se_portal_group *se_tpg, *dest_se_tpg = NULL;
+ -	const struct target_core_fabric_ops *dest_tf_ops = NULL, *tf_ops;
+ +	struct target_core_fabric_ops *dest_tf_ops = NULL, *tf_ops;
+  	struct t10_pr_registration *pr_reg, *pr_res_holder, *dest_pr_reg;
+  	struct t10_reservation *pr_tmpl = &dev->t10_pr;
+  	unsigned char *buf;
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,499b1399035a..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -647,78 -485,36 +648,101 @@@ static void core_tpg_lun_ref_release(st
+  	complete(&lun->lun_ref_comp);
+  }
+  
+++<<<<<<< HEAD
+ +static int core_tpg_setup_virtual_lun0(struct se_portal_group *se_tpg)
+ +{
+ +	/* Set in core_dev_setup_virtual_lun0() */
+ +	struct se_device *dev = g_lun0_dev;
+ +	struct se_lun *lun = &se_tpg->tpg_virt_lun0;
+ +	u32 lun_access = TRANSPORT_LUNFLAGS_READ_ONLY;
+ +	int ret;
+ +
+ +	lun->unpacked_lun = 0;
+ +	lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ +	atomic_set(&lun->lun_acl_count, 0);
+ +	init_completion(&lun->lun_shutdown_comp);
+ +	INIT_LIST_HEAD(&lun->lun_acl_list);
+ +	spin_lock_init(&lun->lun_acl_lock);
+ +	spin_lock_init(&lun->lun_sep_lock);
+ +	init_completion(&lun->lun_ref_comp);
+ +
+ +	ret = core_tpg_add_lun(se_tpg, lun, lun_access, dev);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  int core_tpg_register(
+ -	const struct target_core_fabric_ops *tfo,
+ +	struct target_core_fabric_ops *tfo,
+  	struct se_wwn *se_wwn,
+  	struct se_portal_group *se_tpg,
+ -	int proto_id)
+ +	void *tpg_fabric_ptr,
+ +	int se_tpg_type)
+  {
+++<<<<<<< HEAD
+ +	struct se_lun *lun;
+ +	u32 i;
+ +
+ +	se_tpg->tpg_lun_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
+ +			sizeof(struct se_lun), GFP_KERNEL);
+ +	if (!se_tpg->tpg_lun_list) {
+ +		pr_err("Unable to allocate struct se_portal_group->"
+ +				"tpg_lun_list\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		lun = se_tpg->tpg_lun_list[i];
+ +		lun->unpacked_lun = i;
+ +		lun->lun_link_magic = SE_LUN_LINK_MAGIC;
+ +		lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ +		atomic_set(&lun->lun_acl_count, 0);
+ +		init_completion(&lun->lun_shutdown_comp);
+ +		INIT_LIST_HEAD(&lun->lun_acl_list);
+ +		spin_lock_init(&lun->lun_acl_lock);
+ +		spin_lock_init(&lun->lun_sep_lock);
+ +		init_completion(&lun->lun_ref_comp);
+ +	}
+ +
+ +	se_tpg->se_tpg_type = se_tpg_type;
+ +	se_tpg->se_tpg_fabric_ptr = tpg_fabric_ptr;
+++=======
++ 	int ret;
++ 
++ 	INIT_HLIST_HEAD(&se_tpg->tpg_lun_hlist);
++ 	se_tpg->proto_id = proto_id;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	se_tpg->se_tpg_tfo = tfo;
+  	se_tpg->se_tpg_wwn = se_wwn;
+  	atomic_set(&se_tpg->tpg_pr_ref_count, 0);
+  	INIT_LIST_HEAD(&se_tpg->acl_node_list);
+  	INIT_LIST_HEAD(&se_tpg->se_tpg_node);
+  	INIT_LIST_HEAD(&se_tpg->tpg_sess_list);
+ +	spin_lock_init(&se_tpg->acl_node_lock);
+  	spin_lock_init(&se_tpg->session_lock);
+ -	mutex_init(&se_tpg->tpg_lun_mutex);
+ -	mutex_init(&se_tpg->acl_node_mutex);
+ -
+ +	spin_lock_init(&se_tpg->tpg_lun_lock);
+ +
+++<<<<<<< HEAD
+ +	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL) {
+ +		if (core_tpg_setup_virtual_lun0(se_tpg) < 0) {
+ +			array_free(se_tpg->tpg_lun_list,
+ +				   TRANSPORT_MAX_LUNS_PER_TPG);
+ +			return -ENOMEM;
+++=======
++ 	if (se_tpg->proto_id >= 0) {
++ 		se_tpg->tpg_virt_lun0 = core_tpg_alloc_lun(se_tpg, 0);
++ 		if (IS_ERR(se_tpg->tpg_virt_lun0))
++ 			return PTR_ERR(se_tpg->tpg_virt_lun0);
++ 
++ 		ret = core_tpg_add_lun(se_tpg, se_tpg->tpg_virt_lun0,
++ 				TRANSPORT_LUNFLAGS_READ_ONLY, g_lun0_dev);
++ 		if (ret < 0) {
++ 			kfree(se_tpg->tpg_virt_lun0);
++ 			return ret;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  		}
+  	}
+  
+@@@ -767,17 -563,14 +791,24 @@@ int core_tpg_deregister(struct se_porta
+  
+  		core_tpg_wait_for_nacl_pr_ref(nacl);
+  		core_free_device_list_for_node(nacl, se_tpg);
+ -		kfree(nacl);
+ +		se_tpg->se_tpg_tfo->tpg_release_fabric_acl(se_tpg, nacl);
+ +
+++<<<<<<< HEAD
+ +		spin_lock_irq(&se_tpg->acl_node_lock);
+  	}
+ +	spin_unlock_irq(&se_tpg->acl_node_lock);
+  
+ +	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL)
+ +		core_tpg_remove_lun(se_tpg, &se_tpg->tpg_virt_lun0);
+++=======
++ 	if (se_tpg->proto_id >= 0) {
++ 		core_tpg_remove_lun(se_tpg, se_tpg->tpg_virt_lun0);
++ 		kfree_rcu(se_tpg->tpg_virt_lun0, rcu_head);
++ 	}
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+ +	se_tpg->se_tpg_fabric_ptr = NULL;
+ +	array_free(se_tpg->tpg_lun_list, TRANSPORT_MAX_LUNS_PER_TPG);
+  	return 0;
+  }
+  EXPORT_SYMBOL(core_tpg_deregister);
+@@@ -797,17 -590,25 +828,34 @@@ struct se_lun *core_tpg_alloc_lun
+  		return ERR_PTR(-EOVERFLOW);
+  	}
+  
+ -	lun = kzalloc(sizeof(*lun), GFP_KERNEL);
+ -	if (!lun) {
+ -		pr_err("Unable to allocate se_lun memory\n");
+ -		return ERR_PTR(-ENOMEM);
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun = tpg->tpg_lun_list[unpacked_lun];
+ +	if (lun->lun_status == TRANSPORT_LUN_STATUS_ACTIVE) {
+ +		pr_err("TPG Logical Unit Number: %u is already active"
+ +			" on %s Target Portal Group: %u, ignoring request.\n",
+ +			unpacked_lun, tpg->se_tpg_tfo->get_fabric_name(),
+ +			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ +		spin_unlock(&tpg->tpg_lun_lock);
+ +		return ERR_PTR(-EINVAL);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&tpg->tpg_lun_lock);
+++=======
++ 	lun->unpacked_lun = unpacked_lun;
++ 	lun->lun_link_magic = SE_LUN_LINK_MAGIC;
++ 	atomic_set(&lun->lun_acl_count, 0);
++ 	spin_lock_init(&lun->lun_sep_lock);
++ 	init_completion(&lun->lun_ref_comp);
++ 	INIT_LIST_HEAD(&lun->lun_deve_list);
++ 	INIT_LIST_HEAD(&lun->lun_dev_link);
++ 	atomic_set(&lun->lun_tg_pt_secondary_offline, 0);
++ 	spin_lock_init(&lun->lun_deve_lock);
++ 	mutex_init(&lun->lun_tg_pt_md_mutex);
++ 	INIT_LIST_HEAD(&lun->lun_tg_pt_gp_link);
++ 	spin_lock_init(&lun->lun_tg_pt_gp_lock);
++ 	atomic_set(&lun->lun_active, 0);
++ 	lun->lun_tpg = tpg;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+  	return lun;
+  }
+@@@ -823,20 -624,40 +871,43 @@@ int core_tpg_add_lun
+  	ret = percpu_ref_init(&lun->lun_ref, core_tpg_lun_ref_release, 0,
+  			      GFP_KERNEL);
+  	if (ret < 0)
+- 		return ret;
++ 		goto out;
+  
+- 	ret = core_dev_export(dev, tpg, lun);
+- 	if (ret < 0) {
+- 		percpu_ref_exit(&lun->lun_ref);
+- 		return ret;
+- 	}
++ 	ret = core_alloc_rtpi(lun, dev);
++ 	if (ret)
++ 		goto out_kill_ref;
++ 
++ 	if (!(dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH) &&
++ 	    !(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
++ 		target_attach_tg_pt_gp(lun, dev->t10_alua.default_tg_pt_gp);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&tpg->tpg_lun_lock);
+++=======
++ 	mutex_lock(&tpg->tpg_lun_mutex);
++ 
++ 	spin_lock(&lun->lun_sep_lock);
++ 	lun->lun_index = dev->dev_index;
++ 	lun->lun_se_dev = dev;
++ 	spin_unlock(&lun->lun_sep_lock);
++ 
++ 	spin_lock(&dev->se_port_lock);
++ 	rcu_assign_pointer(lun->lun_se_dev, dev);
++ 	dev->export_count++;
++ 	list_add_tail(&lun->lun_dev_link, &dev->dev_sep_list);
++ 	spin_unlock(&dev->se_port_lock);
++ 
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	lun->lun_access = lun_access;
+ -	if (!(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
+ -		hlist_add_head_rcu(&lun->link, &tpg->tpg_lun_hlist);
+ -	mutex_unlock(&tpg->tpg_lun_mutex);
+ +	lun->lun_status = TRANSPORT_LUN_STATUS_ACTIVE;
+ +	spin_unlock(&tpg->tpg_lun_lock);
+  
+  	return 0;
++ 
++ out_kill_ref:
++ 	percpu_ref_exit(&lun->lun_ref);
++ out:
++ 	return ret;
+  }
+  
+  void core_tpg_remove_lun(
+@@@ -846,11 -667,24 +917,30 @@@
+  	core_clear_lun_from_tpg(lun, tpg);
+  	transport_clear_lun_ref(lun);
+  
+++<<<<<<< HEAD
+ +	core_dev_unexport(lun->lun_se_dev, tpg, lun);
+ +
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ +	spin_unlock(&tpg->tpg_lun_lock);
+++=======
++ 	mutex_lock(&tpg->tpg_lun_mutex);
++ 	if (lun->lun_se_dev) {
++ 		while (atomic_read(&lun->lun_active))
++ 			cpu_relax();
++ 
++ 		target_detach_tg_pt_gp(lun);
++ 
++ 		spin_lock(&dev->se_port_lock);
++ 		list_del(&lun->lun_dev_link);
++ 		dev->export_count--;
++ 		rcu_assign_pointer(lun->lun_se_dev, NULL);
++ 		spin_unlock(&dev->se_port_lock);
++ 	}
++ 	if (!(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE))
++ 		hlist_del_rcu(&lun->link);
++ 	mutex_unlock(&tpg->tpg_lun_mutex);
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  
+  	percpu_ref_exit(&lun->lun_ref);
+  }
+diff --cc include/target/target_core_base.h
+index 7bcf92529421,1927dd5947a7..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -324,20 -304,13 +324,11 @@@ struct t10_alua_tg_pt_gp 
+  	struct se_device *tg_pt_gp_dev;
+  	struct config_group tg_pt_gp_group;
+  	struct list_head tg_pt_gp_list;
+- 	struct list_head tg_pt_gp_mem_list;
+- 	struct se_port *tg_pt_gp_alua_port;
++ 	struct list_head tg_pt_gp_lun_list;
++ 	struct se_lun *tg_pt_gp_alua_lun;
+  	struct se_node_acl *tg_pt_gp_alua_nacl;
+ -	struct delayed_work tg_pt_gp_transition_work;
+ -	struct completion *tg_pt_gp_transition_complete;
+  };
+  
+- struct t10_alua_tg_pt_gp_member {
+- 	bool tg_pt_gp_assoc;
+- 	atomic_t tg_pt_gp_mem_ref_cnt;
+- 	spinlock_t tg_pt_gp_mem_lock;
+- 	struct t10_alua_tg_pt_gp *tg_pt_gp;
+- 	struct se_port *tg_pt;
+- 	struct list_head tg_pt_gp_mem_list;
+- };
+- 
+  struct t10_vpd {
+  	unsigned char device_identifier[INQUIRY_VPD_DEVICE_IDENTIFIER_LEN];
+  	int protocol_identifier_set;
+@@@ -657,16 -628,23 +648,17 @@@ struct se_dev_entry 
+  	u64			pr_res_key;
+  	u64			creation_time;
+  	u32			attach_count;
+ -	atomic_long_t		total_cmds;
+ -	atomic_long_t		read_bytes;
+ -	atomic_long_t		write_bytes;
+ +	u64			read_bytes;
+ +	u64			write_bytes;
+  	atomic_t		ua_count;
+  	/* Used for PR SPEC_I_PT=1 and REGISTER_AND_MOVE */
+ -	struct kref		pr_kref;
+ -	struct completion	pr_comp;
+ -	struct se_lun_acl __rcu	*se_lun_acl;
+ +	atomic_t		pr_ref_count;
+ +	struct se_lun_acl	*se_lun_acl;
+  	spinlock_t		ua_lock;
+ -	struct se_lun __rcu	*se_lun;
+ -#define DEF_PR_REG_ACTIVE		1
+ -	unsigned long		deve_flags;
+ +	struct se_lun		*se_lun;
+  	struct list_head	alua_port_list;
++ 	struct list_head	lun_link;
+  	struct list_head	ua_list;
+ -	struct hlist_node	link;
+ -	struct rcu_head		rcu_head;
+  };
+  
+  struct se_dev_attrib {
+@@@ -711,25 -689,49 +703,64 @@@ struct se_port_stat_grps 
+  	struct config_group scsi_transport_group;
+  };
+  
++ struct scsi_port_stats {
++ 	u32		cmd_pdus;
++ 	u64		tx_data_octets;
++ 	u64		rx_data_octets;
++ };
++ 
+  struct se_lun {
+++<<<<<<< HEAD
+++=======
++ 	/* RELATIVE TARGET PORT IDENTIFER */
++ 	u16			lun_rtpi;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  #define SE_LUN_LINK_MAGIC			0xffff7771
+  	u32			lun_link_magic;
+ +	/* See transport_lun_status_table */
+ +	enum transport_lun_status_table lun_status;
+  	u32			lun_access;
+  	u32			lun_flags;
+  	u32			unpacked_lun;
+ -	u32			lun_index;
+  	atomic_t		lun_acl_count;
+ +	spinlock_t		lun_acl_lock;
+  	spinlock_t		lun_sep_lock;
+++<<<<<<< HEAD
+ +	struct completion	lun_shutdown_comp;
+ +	struct list_head	lun_acl_list;
+ +	struct se_device	*lun_se_dev;
+ +	struct se_port		*lun_sep;
+++=======
++ 	struct se_device __rcu	*lun_se_dev;
++ 
++ 	struct list_head	lun_deve_list;
++ 	spinlock_t		lun_deve_lock;
++ 
++ 	/* ALUA state */
++ 	int			lun_tg_pt_secondary_stat;
++ 	int			lun_tg_pt_secondary_write_md;
++ 	atomic_t		lun_tg_pt_secondary_offline;
++ 	struct mutex		lun_tg_pt_md_mutex;
++ 
++ 	/* ALUA target port group linkage */
++ 	struct list_head	lun_tg_pt_gp_link;
++ 	struct t10_alua_tg_pt_gp *lun_tg_pt_gp;
++ 	spinlock_t		lun_tg_pt_gp_lock;
++ 
++ 	atomic_t		lun_active;
++ 	struct se_portal_group	*lun_tpg;
++ 	struct scsi_port_stats	lun_stats;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	struct config_group	lun_group;
+  	struct se_port_stat_grps port_stat_grps;
+  	struct completion	lun_ref_comp;
+  	struct percpu_ref	lun_ref;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head	lun_dev_link;
++ 	struct hlist_node	link;
++ 	struct rcu_head		rcu_head;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  };
+  
+  struct se_dev_stat_grps {
+@@@ -833,35 -834,9 +863,9 @@@ struct se_hba 
+  	spinlock_t		device_lock;
+  	struct config_group	hba_group;
+  	struct mutex		hba_access_mutex;
+ -	struct target_backend	*backend;
+ +	struct se_subsystem_api *transport;
+  };
+  
+- struct scsi_port_stats {
+-        u64     cmd_pdus;
+-        u64     tx_data_octets;
+-        u64     rx_data_octets;
+- };
+- 
+- struct se_port {
+- 	/* RELATIVE TARGET PORT IDENTIFER */
+- 	u16		sep_rtpi;
+- 	int		sep_tg_pt_secondary_stat;
+- 	int		sep_tg_pt_secondary_write_md;
+- 	u32		sep_index;
+- 	struct scsi_port_stats sep_stats;
+- 	/* Used for ALUA Target Port Groups membership */
+- 	atomic_t	sep_tg_pt_secondary_offline;
+- 	/* Used for PR ALL_TG_PT=1 */
+- 	atomic_t	sep_tg_pt_ref_cnt;
+- 	spinlock_t	sep_alua_lock;
+- 	struct mutex	sep_tg_pt_md_mutex;
+- 	struct t10_alua_tg_pt_gp_member *sep_alua_tg_pt_gp_mem;
+- 	struct se_lun *sep_lun;
+- 	struct se_portal_group *sep_tpg;
+- 	struct list_head sep_alua_list;
+- 	struct list_head sep_list;
+- };
+- 
+  struct se_tpg_np {
+  	struct se_portal_group *tpg_np_parent;
+  	struct config_group	tpg_np_group;
+@@@ -884,8 -861,8 +888,13 @@@ struct se_portal_group 
+  	struct list_head	se_tpg_node;
+  	/* linked list for initiator ACL list */
+  	struct list_head	acl_node_list;
+++<<<<<<< HEAD
+ +	struct se_lun		**tpg_lun_list;
+ +	struct se_lun		tpg_virt_lun0;
+++=======
++ 	struct hlist_head	tpg_lun_hlist;
++ 	struct se_lun		*tpg_virt_lun0;
+++>>>>>>> adf653f92f38 (target: Subsume se_port + t10_alua_tg_pt_gp_member into se_lun)
+  	/* List of TCM sessions associated wth this TPG */
+  	struct list_head	tpg_sess_list;
+  	/* Pointer to $FABRIC_MOD dependent code */
+* Unmerged path drivers/target/target_core_alua.c
+diff --git a/drivers/target/target_core_alua.h b/drivers/target/target_core_alua.h
+index 0a7d65e80404..9b250f9b33bf 100644
+--- a/drivers/target/target_core_alua.h
++++ b/drivers/target/target_core_alua.h
+@@ -85,7 +85,6 @@
+ extern struct kmem_cache *t10_alua_lu_gp_cache;
+ extern struct kmem_cache *t10_alua_lu_gp_mem_cache;
+ extern struct kmem_cache *t10_alua_tg_pt_gp_cache;
+-extern struct kmem_cache *t10_alua_tg_pt_gp_mem_cache;
+ extern struct kmem_cache *t10_alua_lba_map_cache;
+ extern struct kmem_cache *t10_alua_lba_map_mem_cache;
+ 
+@@ -94,7 +93,7 @@ extern sense_reason_t target_emulate_set_target_port_groups(struct se_cmd *);
+ extern sense_reason_t target_emulate_report_referrals(struct se_cmd *);
+ extern int core_alua_check_nonop_delay(struct se_cmd *);
+ extern int core_alua_do_port_transition(struct t10_alua_tg_pt_gp *,
+-				struct se_device *, struct se_port *,
++				struct se_device *, struct se_lun *,
+ 				struct se_node_acl *, int, int);
+ extern char *core_alua_dump_status(int);
+ extern struct t10_alua_lba_map *core_alua_allocate_lba_map(
+@@ -117,14 +116,11 @@ extern void core_alua_drop_lu_gp_dev(struct se_device *);
+ extern struct t10_alua_tg_pt_gp *core_alua_allocate_tg_pt_gp(
+ 			struct se_device *, const char *, int);
+ extern int core_alua_set_tg_pt_gp_id(struct t10_alua_tg_pt_gp *, u16);
+-extern struct t10_alua_tg_pt_gp_member *core_alua_allocate_tg_pt_gp_mem(
+-					struct se_port *);
+ extern void core_alua_free_tg_pt_gp(struct t10_alua_tg_pt_gp *);
+-extern void core_alua_free_tg_pt_gp_mem(struct se_port *);
+-extern void __core_alua_attach_tg_pt_gp_mem(struct t10_alua_tg_pt_gp_member *,
+-					struct t10_alua_tg_pt_gp *);
+-extern ssize_t core_alua_show_tg_pt_gp_info(struct se_port *, char *);
+-extern ssize_t core_alua_store_tg_pt_gp_info(struct se_port *, const char *,
++extern void target_detach_tg_pt_gp(struct se_lun *);
++extern void target_attach_tg_pt_gp(struct se_lun *, struct t10_alua_tg_pt_gp *);
++extern ssize_t core_alua_show_tg_pt_gp_info(struct se_lun *, char *);
++extern ssize_t core_alua_store_tg_pt_gp_info(struct se_lun *, const char *,
+ 						size_t);
+ extern ssize_t core_alua_show_access_type(struct t10_alua_tg_pt_gp *, char *);
+ extern ssize_t core_alua_store_access_type(struct t10_alua_tg_pt_gp *,
+diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
+index 5a4ad5ca14f6..b656a13cfc9c 100644
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -2417,21 +2417,16 @@ static ssize_t target_core_alua_tg_pt_gp_show_attr_members(
+ 	struct t10_alua_tg_pt_gp *tg_pt_gp,
+ 	char *page)
+ {
+-	struct se_port *port;
+-	struct se_portal_group *tpg;
+ 	struct se_lun *lun;
+-	struct t10_alua_tg_pt_gp_member *tg_pt_gp_mem;
+ 	ssize_t len = 0, cur_len;
+ 	unsigned char buf[TG_PT_GROUP_NAME_BUF];
+ 
+ 	memset(buf, 0, TG_PT_GROUP_NAME_BUF);
+ 
+ 	spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+-	list_for_each_entry(tg_pt_gp_mem, &tg_pt_gp->tg_pt_gp_mem_list,
+-			tg_pt_gp_mem_list) {
+-		port = tg_pt_gp_mem->tg_pt;
+-		tpg = port->sep_tpg;
+-		lun = port->sep_lun;
++	list_for_each_entry(lun, &tg_pt_gp->tg_pt_gp_lun_list,
++			lun_tg_pt_gp_link) {
++		struct se_portal_group *tpg = lun->lun_tpg;
+ 
+ 		cur_len = snprintf(buf, TG_PT_GROUP_NAME_BUF, "%s/%s/tpgt_%hu"
+ 			"/%s\n", tpg->se_tpg_tfo->get_fabric_name(),
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_fabric_configfs.c
+* Unmerged path drivers/target/target_core_internal.h
+* Unmerged path drivers/target/target_core_pr.c
+diff --git a/drivers/target/target_core_spc.c b/drivers/target/target_core_spc.c
+index 7912aa124385..fc283fdfd0e4 100644
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@ -37,10 +37,9 @@
+ #include "target_core_ua.h"
+ #include "target_core_xcopy.h"
+ 
+-static void spc_fill_alua_data(struct se_port *port, unsigned char *buf)
++static void spc_fill_alua_data(struct se_lun *lun, unsigned char *buf)
+ {
+ 	struct t10_alua_tg_pt_gp *tg_pt_gp;
+-	struct t10_alua_tg_pt_gp_member *tg_pt_gp_mem;
+ 
+ 	/*
+ 	 * Set SCCS for MAINTENANCE_IN + REPORT_TARGET_PORT_GROUPS.
+@@ -53,17 +52,11 @@ static void spc_fill_alua_data(struct se_port *port, unsigned char *buf)
+ 	 *
+ 	 * See spc4r17 section 6.4.2 Table 135
+ 	 */
+-	if (!port)
+-		return;
+-	tg_pt_gp_mem = port->sep_alua_tg_pt_gp_mem;
+-	if (!tg_pt_gp_mem)
+-		return;
+-
+-	spin_lock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
+-	tg_pt_gp = tg_pt_gp_mem->tg_pt_gp;
++	spin_lock(&lun->lun_tg_pt_gp_lock);
++	tg_pt_gp = lun->lun_tg_pt_gp;
+ 	if (tg_pt_gp)
+ 		buf[5] |= tg_pt_gp->tg_pt_gp_alua_access_type;
+-	spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
++	spin_unlock(&lun->lun_tg_pt_gp_lock);
+ }
+ 
+ sense_reason_t
+@@ -94,7 +87,7 @@ spc_emulate_inquiry_std(struct se_cmd *cmd, unsigned char *buf)
+ 	/*
+ 	 * Enable SCCS and TPGS fields for Emulated ALUA
+ 	 */
+-	spc_fill_alua_data(lun->lun_sep, buf);
++	spc_fill_alua_data(lun, buf);
+ 
+ 	/*
+ 	 * Set Third-Party Copy (3PC) bit to indicate support for EXTENDED_COPY
+@@ -181,11 +174,9 @@ spc_emulate_evpd_83(struct se_cmd *cmd, unsigned char *buf)
+ {
+ 	struct se_device *dev = cmd->se_dev;
+ 	struct se_lun *lun = cmd->se_lun;
+-	struct se_port *port = NULL;
+ 	struct se_portal_group *tpg = NULL;
+ 	struct t10_alua_lu_gp_member *lu_gp_mem;
+ 	struct t10_alua_tg_pt_gp *tg_pt_gp;
+-	struct t10_alua_tg_pt_gp_member *tg_pt_gp_mem;
+ 	unsigned char *prod = &dev->t10_wwn.model[0];
+ 	u32 prod_len;
+ 	u32 unit_serial_len, off = 0;
+@@ -267,18 +258,15 @@ check_t10_vend_desc:
+ 	/* Header size for Designation descriptor */
+ 	len += (id_len + 4);
+ 	off += (id_len + 4);
+-	/*
+-	 * struct se_port is only set for INQUIRY VPD=1 through $FABRIC_MOD
+-	 */
+-	port = lun->lun_sep;
+-	if (port) {
++
++	if (1) {
+ 		struct t10_alua_lu_gp *lu_gp;
+ 		u32 padding, scsi_name_len, scsi_target_len;
+ 		u16 lu_gp_id = 0;
+ 		u16 tg_pt_gp_id = 0;
+ 		u16 tpgt;
+ 
+-		tpg = port->sep_tpg;
++		tpg = lun->lun_tpg;
+ 		/*
+ 		 * Relative target port identifer, see spc4r17
+ 		 * section 7.7.3.7
+@@ -299,8 +287,8 @@ check_t10_vend_desc:
+ 		/* Skip over Obsolete field in RTPI payload
+ 		 * in Table 472 */
+ 		off += 2;
+-		buf[off++] = ((port->sep_rtpi >> 8) & 0xff);
+-		buf[off++] = (port->sep_rtpi & 0xff);
++		buf[off++] = ((lun->lun_rtpi >> 8) & 0xff);
++		buf[off++] = (lun->lun_rtpi & 0xff);
+ 		len += 8; /* Header size + Designation descriptor */
+ 		/*
+ 		 * Target port group identifier, see spc4r17
+@@ -309,18 +297,14 @@ check_t10_vend_desc:
+ 		 * Get the PROTOCOL IDENTIFIER as defined by spc4r17
+ 		 * section 7.5.1 Table 362
+ 		 */
+-		tg_pt_gp_mem = port->sep_alua_tg_pt_gp_mem;
+-		if (!tg_pt_gp_mem)
+-			goto check_lu_gp;
+-
+-		spin_lock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
+-		tg_pt_gp = tg_pt_gp_mem->tg_pt_gp;
++		spin_lock(&lun->lun_tg_pt_gp_lock);
++		tg_pt_gp = lun->lun_tg_pt_gp;
+ 		if (!tg_pt_gp) {
+-			spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
++			spin_unlock(&lun->lun_tg_pt_gp_lock);
+ 			goto check_lu_gp;
+ 		}
+ 		tg_pt_gp_id = tg_pt_gp->tg_pt_gp_id;
+-		spin_unlock(&tg_pt_gp_mem->tg_pt_gp_mem_lock);
++		spin_unlock(&lun->lun_tg_pt_gp_lock);
+ 
+ 		buf[off] =
+ 			(tpg->se_tpg_tfo->get_fabric_proto_ident(tpg) << 4);
+@@ -698,7 +682,7 @@ static sense_reason_t
+ spc_emulate_inquiry(struct se_cmd *cmd)
+ {
+ 	struct se_device *dev = cmd->se_dev;
+-	struct se_portal_group *tpg = cmd->se_lun->lun_sep->sep_tpg;
++	struct se_portal_group *tpg = cmd->se_lun->lun_tpg;
+ 	unsigned char *rbuf;
+ 	unsigned char *cdb = cmd->t_task_cdb;
+ 	unsigned char *buf;
+@@ -712,7 +696,7 @@ spc_emulate_inquiry(struct se_cmd *cmd)
+ 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ 	}
+ 
+-	if (dev == tpg->tpg_virt_lun0.lun_se_dev)
++	if (dev == tpg->tpg_virt_lun0->lun_se_dev)
+ 		buf[0] = 0x3f; /* Not connected */
+ 	else
+ 		buf[0] = dev->transport->get_device_type(dev);
+diff --git a/drivers/target/target_core_stat.c b/drivers/target/target_core_stat.c
+index 59830a27f502..b6a8eb83a269 100644
+--- a/drivers/target/target_core_stat.c
++++ b/drivers/target/target_core_stat.c
+@@ -107,7 +107,7 @@ static ssize_t target_stat_scsi_dev_show_attr_ports(
+ 	struct se_device *dev =
+ 		container_of(sgrps, struct se_device, dev_stat_grps);
+ 
+-	return snprintf(page, PAGE_SIZE, "%u\n", dev->dev_port_count);
++	return snprintf(page, PAGE_SIZE, "%u\n", dev->export_count);
+ }
+ DEV_STAT_SCSI_DEV_ATTR_RO(ports);
+ 
+@@ -543,19 +543,13 @@ static ssize_t target_stat_scsi_port_show_attr_inst(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_device *dev = lun->lun_se_dev;
+-	struct se_hba *hba;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	hba = dev->se_hba;
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", hba->hba_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", dev->se_hba->hba_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -565,17 +559,13 @@ static ssize_t target_stat_scsi_port_show_attr_dev(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_device *dev = lun->lun_se_dev;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", dev->dev_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", dev->dev_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -585,16 +575,13 @@ static ssize_t target_stat_scsi_port_show_attr_indx(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", sep->sep_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", lun->lun_rtpi);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -604,20 +591,13 @@ static ssize_t target_stat_scsi_port_show_attr_role(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_device *dev = lun->lun_se_dev;
+-	struct se_port *sep;
+-	ssize_t ret;
+-
+-	if (!dev)
+-		return -ENODEV;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	ret = snprintf(page, PAGE_SIZE, "%s%u\n", "Device", dev->dev_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%s%u\n", "Device", dev->dev_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -627,17 +607,15 @@ static ssize_t target_stat_scsi_port_show_attr_busy_count(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
++	dev = lun->lun_se_dev;
++	if (dev) {
++		/* FIXME: scsiPortBusyStatuses  */
++		ret = snprintf(page, PAGE_SIZE, "%u\n", 0);
+ 	}
+-	/* FIXME: scsiPortBusyStatuses  */
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", 0);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -686,19 +664,13 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_inst(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_device *dev = lun->lun_se_dev;
+-	struct se_port *sep;
+-	struct se_hba *hba;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	hba = dev->se_hba;
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", hba->hba_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", dev->se_hba->hba_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -708,17 +680,13 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_dev(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_device *dev = lun->lun_se_dev;
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", dev->dev_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", dev->dev_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -728,16 +696,13 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_indx(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", sep->sep_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", lun->lun_rtpi);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -747,20 +712,16 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_name(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_portal_group *tpg;
+-	ssize_t ret;
++	struct se_portal_group *tpg = lun->lun_tpg;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	tpg = sep->sep_tpg;
+-
+-	ret = snprintf(page, PAGE_SIZE, "%sPort#%u\n",
+-		tpg->se_tpg_tfo->get_fabric_name(), sep->sep_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%sPort#%u\n",
++			tpg->se_tpg_tfo->get_fabric_name(),
++			lun->lun_rtpi);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -770,21 +731,16 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_port_index(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_portal_group *tpg;
+-	ssize_t ret;
++	struct se_portal_group *tpg = lun->lun_tpg;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	tpg = sep->sep_tpg;
+-
+-	ret = snprintf(page, PAGE_SIZE, "%s%s%d\n",
+-		tpg->se_tpg_tfo->tpg_get_wwn(tpg), "+t+",
+-		tpg->se_tpg_tfo->tpg_get_tag(tpg));
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%s%s%d\n",
++			tpg->se_tpg_tfo->tpg_get_wwn(tpg), "+t+",
++			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -794,17 +750,13 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_in_cmds(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-
+-	ret = snprintf(page, PAGE_SIZE, "%llu\n", sep->sep_stats.cmd_pdus);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", lun->lun_stats.cmd_pdus);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -814,18 +766,14 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_write_mbytes(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-
+-	ret = snprintf(page, PAGE_SIZE, "%u\n",
+-			(u32)(sep->sep_stats.rx_data_octets >> 20));
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n",
++				(u32)(lun->lun_stats.rx_data_octets >> 20));
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -835,18 +783,14 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_read_mbytes(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-
+-	ret = snprintf(page, PAGE_SIZE, "%u\n",
+-			(u32)(sep->sep_stats.tx_data_octets >> 20));
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n",
++				(u32)(lun->lun_stats.tx_data_octets >> 20));
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -856,18 +800,15 @@ static ssize_t target_stat_scsi_tgt_port_show_attr_hs_in_cmds(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
++	dev = lun->lun_se_dev;
++	if (dev) {
++		/* FIXME: scsiTgtPortHsInCommands */
++		ret = snprintf(page, PAGE_SIZE, "%u\n", 0);
+ 	}
+-
+-	/* FIXME: scsiTgtPortHsInCommands */
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", 0);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -922,20 +863,13 @@ static ssize_t target_stat_scsi_transport_show_attr_inst(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_device *dev = lun->lun_se_dev;
+-	struct se_port *sep;
+-	struct se_hba *hba;
+-	ssize_t ret;
++	struct se_device *dev;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-
+-	hba = dev->se_hba;
+-	ret = snprintf(page, PAGE_SIZE, "%u\n", hba->hba_index);
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n", dev->se_hba->hba_index);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -945,20 +879,17 @@ static ssize_t target_stat_scsi_transport_show_attr_device(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_portal_group *tpg;
+-	ssize_t ret;
++	struct se_device *dev;
++	struct se_portal_group *tpg = lun->lun_tpg;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
++	dev = lun->lun_se_dev;
++	if (dev) {
++		/* scsiTransportType */
++		ret = snprintf(page, PAGE_SIZE, "scsiTransport%s\n",
++			       tpg->se_tpg_tfo->get_fabric_name());
+ 	}
+-	tpg = sep->sep_tpg;
+-	/* scsiTransportType */
+-	ret = snprintf(page, PAGE_SIZE, "scsiTransport%s\n",
+-			tpg->se_tpg_tfo->get_fabric_name());
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -968,19 +899,15 @@ static ssize_t target_stat_scsi_transport_show_attr_indx(
+ 	struct se_port_stat_grps *pgrps, char *page)
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+-	struct se_port *sep;
+-	struct se_portal_group *tpg;
+-	ssize_t ret;
++	struct se_device *dev;
++	struct se_portal_group *tpg = lun->lun_tpg;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
+-	}
+-	tpg = sep->sep_tpg;
+-	ret = snprintf(page, PAGE_SIZE, "%u\n",
+-			tpg->se_tpg_tfo->tpg_get_inst_index(tpg));
++	dev = lun->lun_se_dev;
++	if (dev)
++		ret = snprintf(page, PAGE_SIZE, "%u\n",
++			       tpg->se_tpg_tfo->tpg_get_inst_index(tpg));
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+@@ -991,24 +918,20 @@ static ssize_t target_stat_scsi_transport_show_attr_dev_name(
+ {
+ 	struct se_lun *lun = container_of(pgrps, struct se_lun, port_stat_grps);
+ 	struct se_device *dev = lun->lun_se_dev;
+-	struct se_port *sep;
+-	struct se_portal_group *tpg;
++	struct se_portal_group *tpg = lun->lun_tpg;
+ 	struct t10_wwn *wwn;
+-	ssize_t ret;
++	ssize_t ret = -ENODEV;
+ 
+ 	spin_lock(&lun->lun_sep_lock);
+-	sep = lun->lun_sep;
+-	if (!sep) {
+-		spin_unlock(&lun->lun_sep_lock);
+-		return -ENODEV;
++	dev = lun->lun_se_dev;
++	if (dev) {
++		wwn = &dev->t10_wwn;
++		/* scsiTransportDevName */
++		ret = snprintf(page, PAGE_SIZE, "%s+%s\n",
++				tpg->se_tpg_tfo->tpg_get_wwn(tpg),
++				(strlen(wwn->unit_serial)) ? wwn->unit_serial :
++				wwn->vendor);
+ 	}
+-	tpg = sep->sep_tpg;
+-	wwn = &dev->t10_wwn;
+-	/* scsiTransportDevName */
+-	ret = snprintf(page, PAGE_SIZE, "%s+%s\n",
+-			tpg->se_tpg_tfo->tpg_get_wwn(tpg),
+-			(strlen(wwn->unit_serial)) ? wwn->unit_serial :
+-			wwn->vendor);
+ 	spin_unlock(&lun->lun_sep_lock);
+ 	return ret;
+ }
+* Unmerged path drivers/target/target_core_tpg.c
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 9cc3afa0ef11..19940e9b2232 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -61,7 +61,6 @@ struct kmem_cache *t10_pr_reg_cache;
+ struct kmem_cache *t10_alua_lu_gp_cache;
+ struct kmem_cache *t10_alua_lu_gp_mem_cache;
+ struct kmem_cache *t10_alua_tg_pt_gp_cache;
+-struct kmem_cache *t10_alua_tg_pt_gp_mem_cache;
+ struct kmem_cache *t10_alua_lba_map_cache;
+ struct kmem_cache *t10_alua_lba_map_mem_cache;
+ 
+@@ -120,16 +119,6 @@ int init_se_kmem_caches(void)
+ 				"cache failed\n");
+ 		goto out_free_lu_gp_mem_cache;
+ 	}
+-	t10_alua_tg_pt_gp_mem_cache = kmem_cache_create(
+-			"t10_alua_tg_pt_gp_mem_cache",
+-			sizeof(struct t10_alua_tg_pt_gp_member),
+-			__alignof__(struct t10_alua_tg_pt_gp_member),
+-			0, NULL);
+-	if (!t10_alua_tg_pt_gp_mem_cache) {
+-		pr_err("kmem_cache_create() for t10_alua_tg_pt_gp_"
+-				"mem_t failed\n");
+-		goto out_free_tg_pt_gp_cache;
+-	}
+ 	t10_alua_lba_map_cache = kmem_cache_create(
+ 			"t10_alua_lba_map_cache",
+ 			sizeof(struct t10_alua_lba_map),
+@@ -137,7 +126,7 @@ int init_se_kmem_caches(void)
+ 	if (!t10_alua_lba_map_cache) {
+ 		pr_err("kmem_cache_create() for t10_alua_lba_map_"
+ 				"cache failed\n");
+-		goto out_free_tg_pt_gp_mem_cache;
++		goto out_free_tg_pt_gp_cache;
+ 	}
+ 	t10_alua_lba_map_mem_cache = kmem_cache_create(
+ 			"t10_alua_lba_map_mem_cache",
+@@ -160,8 +149,6 @@ out_free_lba_map_mem_cache:
+ 	kmem_cache_destroy(t10_alua_lba_map_mem_cache);
+ out_free_lba_map_cache:
+ 	kmem_cache_destroy(t10_alua_lba_map_cache);
+-out_free_tg_pt_gp_mem_cache:
+-	kmem_cache_destroy(t10_alua_tg_pt_gp_mem_cache);
+ out_free_tg_pt_gp_cache:
+ 	kmem_cache_destroy(t10_alua_tg_pt_gp_cache);
+ out_free_lu_gp_mem_cache:
+@@ -187,7 +174,6 @@ void release_se_kmem_caches(void)
+ 	kmem_cache_destroy(t10_alua_lu_gp_cache);
+ 	kmem_cache_destroy(t10_alua_lu_gp_mem_cache);
+ 	kmem_cache_destroy(t10_alua_tg_pt_gp_cache);
+-	kmem_cache_destroy(t10_alua_tg_pt_gp_mem_cache);
+ 	kmem_cache_destroy(t10_alua_lba_map_cache);
+ 	kmem_cache_destroy(t10_alua_lba_map_mem_cache);
+ }
+@@ -1296,8 +1282,7 @@ target_setup_cmd_from_cdb(struct se_cmd *cmd, unsigned char *cdb)
+ 	cmd->se_cmd_flags |= SCF_SUPPORTED_SAM_OPCODE;
+ 
+ 	spin_lock(&cmd->se_lun->lun_sep_lock);
+-	if (cmd->se_lun->lun_sep)
+-		cmd->se_lun->lun_sep->sep_stats.cmd_pdus++;
++	cmd->se_lun->lun_stats.cmd_pdus++;
+ 	spin_unlock(&cmd->se_lun->lun_sep_lock);
+ 	return 0;
+ }
+@@ -2121,10 +2106,7 @@ queue_rsp:
+ 	switch (cmd->data_direction) {
+ 	case DMA_FROM_DEVICE:
+ 		spin_lock(&cmd->se_lun->lun_sep_lock);
+-		if (cmd->se_lun->lun_sep) {
+-			cmd->se_lun->lun_sep->sep_stats.tx_data_octets +=
+-					cmd->data_length;
+-		}
++		cmd->se_lun->lun_stats.tx_data_octets += cmd->data_length;
+ 		spin_unlock(&cmd->se_lun->lun_sep_lock);
+ 		/*
+ 		 * Perform READ_STRIP of PI using software emulation when
+@@ -2149,20 +2131,14 @@ queue_rsp:
+ 		break;
+ 	case DMA_TO_DEVICE:
+ 		spin_lock(&cmd->se_lun->lun_sep_lock);
+-		if (cmd->se_lun->lun_sep) {
+-			cmd->se_lun->lun_sep->sep_stats.rx_data_octets +=
+-				cmd->data_length;
+-		}
++		cmd->se_lun->lun_stats.rx_data_octets += cmd->data_length;
+ 		spin_unlock(&cmd->se_lun->lun_sep_lock);
+ 		/*
+ 		 * Check if we need to send READ payload for BIDI-COMMAND
+ 		 */
+ 		if (cmd->se_cmd_flags & SCF_BIDI) {
+ 			spin_lock(&cmd->se_lun->lun_sep_lock);
+-			if (cmd->se_lun->lun_sep) {
+-				cmd->se_lun->lun_sep->sep_stats.tx_data_octets +=
+-					cmd->data_length;
+-			}
++			cmd->se_lun->lun_stats.tx_data_octets += cmd->data_length;
+ 			spin_unlock(&cmd->se_lun->lun_sep_lock);
+ 			ret = cmd->se_tfo->queue_data_in(cmd);
+ 			if (ret)
+diff --git a/drivers/target/target_core_xcopy.c b/drivers/target/target_core_xcopy.c
+index 32a82dc5ac30..ad64a5742fb8 100644
+--- a/drivers/target/target_core_xcopy.c
++++ b/drivers/target/target_core_xcopy.c
+@@ -351,8 +351,7 @@ struct xcopy_pt_cmd {
+ 	unsigned char sense_buffer[TRANSPORT_SENSE_BUFFER];
+ };
+ 
+-static struct se_port xcopy_pt_port;
+-static struct se_portal_group xcopy_pt_tpg;
++struct se_portal_group xcopy_pt_tpg;
+ static struct se_session xcopy_pt_sess;
+ static struct se_node_acl xcopy_pt_nacl;
+ 
+@@ -449,17 +448,11 @@ int target_xcopy_setup_pt(void)
+ 		return -ENOMEM;
+ 	}
+ 
+-	memset(&xcopy_pt_port, 0, sizeof(struct se_port));
+-	INIT_LIST_HEAD(&xcopy_pt_port.sep_alua_list);
+-	INIT_LIST_HEAD(&xcopy_pt_port.sep_list);
+-	mutex_init(&xcopy_pt_port.sep_tg_pt_md_mutex);
+-
+ 	memset(&xcopy_pt_tpg, 0, sizeof(struct se_portal_group));
+ 	INIT_LIST_HEAD(&xcopy_pt_tpg.se_tpg_node);
+ 	INIT_LIST_HEAD(&xcopy_pt_tpg.acl_node_list);
+ 	INIT_LIST_HEAD(&xcopy_pt_tpg.tpg_sess_list);
+ 
+-	xcopy_pt_port.sep_tpg = &xcopy_pt_tpg;
+ 	xcopy_pt_tpg.se_tpg_tfo = &xcopy_pt_tfo;
+ 
+ 	memset(&xcopy_pt_nacl, 0, sizeof(struct se_node_acl));
+@@ -500,10 +493,6 @@ static void target_xcopy_setup_pt_port(
+ 		 */
+ 		if (remote_port) {
+ 			xpt_cmd->remote_port = remote_port;
+-			pt_cmd->se_lun->lun_sep = &xcopy_pt_port;
+-			pr_debug("Setup emulated remote DEST xcopy_pt_port: %p to"
+-				" cmd->se_lun->lun_sep for X-COPY data PUSH\n",
+-				pt_cmd->se_lun->lun_sep);
+ 		} else {
+ 			pt_cmd->se_lun = ec_cmd->se_lun;
+ 			pt_cmd->se_dev = ec_cmd->se_dev;
+@@ -523,10 +512,6 @@ static void target_xcopy_setup_pt_port(
+ 		 */
+ 		if (remote_port) {
+ 			xpt_cmd->remote_port = remote_port;
+-			pt_cmd->se_lun->lun_sep = &xcopy_pt_port;
+-			pr_debug("Setup emulated remote SRC xcopy_pt_port: %p to"
+-				" cmd->se_lun->lun_sep for X-COPY data PULL\n",
+-				pt_cmd->se_lun->lun_sep);
+ 		} else {
+ 			pt_cmd->se_lun = ec_cmd->se_lun;
+ 			pt_cmd->se_dev = ec_cmd->se_dev;
+* Unmerged path include/target/target_core_base.h
