@@ -1,0 +1,269 @@
+iommu/amd: Use container_of to get dma_ops_domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Use container_of to get dma_ops_domain (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 93.48%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit b3311b061de2e51db683a67092546876839df532
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b3311b06.failed
+
+This is better than storing an extra pointer in struct
+protection_domain, because this pointer can now be removed
+from the struct.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit b3311b061de2e51db683a67092546876839df532)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index c8c3026772fe,fb43cc5857c7..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -2571,9 -2382,9 +2577,14 @@@ static dma_addr_t map_page(struct devic
+  		return DMA_ERROR_CODE;
+  
+  	dma_mask = *dev->dma_mask;
++ 	dma_dom = to_dma_ops_domain(domain);
+  
+++<<<<<<< HEAD
+ +	return __map_single(dev, domain->priv, paddr, size, dir, false,
+ +			    dma_mask);
+++=======
++ 	return __map_single(dev, dma_dom, paddr, size, dir, dma_mask);
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  }
+  
+  /*
+@@@ -2588,9 -2400,37 +2600,11 @@@ static void unmap_page(struct device *d
+  	if (IS_ERR(domain))
+  		return;
+  
+- 	__unmap_single(domain->priv, dma_addr, size, dir);
++ 	dma_dom = to_dma_ops_domain(domain);
++ 
++ 	__unmap_single(dma_dom, dma_addr, size, dir);
+  }
+  
+ -static int sg_num_pages(struct device *dev,
+ -			struct scatterlist *sglist,
+ -			int nelems)
+ -{
+ -	unsigned long mask, boundary_size;
+ -	struct scatterlist *s;
+ -	int i, npages = 0;
+ -
+ -	mask          = dma_get_seg_boundary(dev);
+ -	boundary_size = mask + 1 ? ALIGN(mask + 1, PAGE_SIZE) >> PAGE_SHIFT :
+ -				   1UL << (BITS_PER_LONG - PAGE_SHIFT);
+ -
+ -	for_each_sg(sglist, s, nelems, i) {
+ -		int p, n;
+ -
+ -		s->dma_address = npages << PAGE_SHIFT;
+ -		p = npages % boundary_size;
+ -		n = iommu_num_pages(sg_phys(s), s->length, PAGE_SIZE);
+ -		if (p + n > boundary_size)
+ -			npages += boundary_size - p;
+ -		npages += n;
+ -	}
+ -
+ -	return npages;
+ -}
+ -
+  /*
+   * The exported map_sg function for dma_ops (handles scatter-gather
+   * lists).
+@@@ -2610,32 -2450,65 +2624,36 @@@ static int map_sg(struct device *dev, s
+  	if (IS_ERR(domain))
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	dma_dom  = to_dma_ops_domain(domain);
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  	dma_mask = *dev->dma_mask;
+  
+ -	npages = sg_num_pages(dev, sglist, nelems);
+ -
+ -	address = dma_ops_alloc_iova(dev, dma_dom, npages, dma_mask);
+ -	if (address == DMA_ERROR_CODE)
+ -		goto out_err;
+ -
+ -	prot = dir2prot(direction);
+ -
+ -	/* Map all sg entries */
+  	for_each_sg(sglist, s, nelems, i) {
+ -		int j, pages = iommu_num_pages(sg_phys(s), s->length, PAGE_SIZE);
+ +		paddr = sg_phys(s);
+  
+ -		for (j = 0; j < pages; ++j) {
+ -			unsigned long bus_addr, phys_addr;
+ -			int ret;
+ +		s->dma_address = __map_single(dev, domain->priv,
+ +					      paddr, s->length, dir, false,
+ +					      dma_mask);
+  
+ -			bus_addr  = address + s->dma_address + (j << PAGE_SHIFT);
+ -			phys_addr = (sg_phys(s) & PAGE_MASK) + (j << PAGE_SHIFT);
+ -			ret = iommu_map_page(domain, bus_addr, phys_addr, PAGE_SIZE, prot, GFP_ATOMIC);
+ -			if (ret)
+ -				goto out_unmap;
+ -
+ -			mapped_pages += 1;
+ -		}
+ -	}
+ -
+ -	/* Everything is mapped - write the right values into s->dma_address */
+ -	for_each_sg(sglist, s, nelems, i) {
+ -		s->dma_address += address + s->offset;
+ -		s->dma_length   = s->length;
+ +		if (s->dma_address) {
+ +			s->dma_length = s->length;
+ +			mapped_elems++;
+ +		} else
+ +			goto unmap;
+  	}
+  
+ -	return nelems;
+ +	return mapped_elems;
+  
+ -out_unmap:
+ -	pr_err("%s: IOMMU mapping error in map_sg (io-pages: %d)\n",
+ -	       dev_name(dev), npages);
+ -
+ -	for_each_sg(sglist, s, nelems, i) {
+ -		int j, pages = iommu_num_pages(sg_phys(s), s->length, PAGE_SIZE);
+ -
+ -		for (j = 0; j < pages; ++j) {
+ -			unsigned long bus_addr;
+ -
+ -			bus_addr  = address + s->dma_address + (j << PAGE_SHIFT);
+ -			iommu_unmap_page(domain, bus_addr, PAGE_SIZE);
+ -
+ -			if (--mapped_pages)
+ -				goto out_free_iova;
+ -		}
+ +unmap:
+ +	for_each_sg(sglist, s, mapped_elems, i) {
+ +		if (s->dma_address)
+ +			__unmap_single(domain->priv, s->dma_address,
+ +				       s->dma_length, dir);
+ +		s->dma_address = s->dma_length = 0;
+  	}
+  
+ -out_free_iova:
+ -	free_iova_fast(&dma_dom->iovad, address, npages);
+ -
+ -out_err:
+  	return 0;
+  }
+  
+@@@ -2648,18 -2521,19 +2666,32 @@@ static void unmap_sg(struct device *dev
+  		     struct dma_attrs *attrs)
+  {
+  	struct protection_domain *domain;
+++<<<<<<< HEAD
+ +	struct scatterlist *s;
+ +	int i;
+++=======
++ 	struct dma_ops_domain *dma_dom;
++ 	unsigned long startaddr;
++ 	int npages = 2;
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  
+  	domain = get_domain(dev);
+  	if (IS_ERR(domain))
+  		return;
+  
+++<<<<<<< HEAD
+ +	for_each_sg(sglist, s, nelems, i) {
+ +		__unmap_single(domain->priv, s->dma_address,
+ +			       s->dma_length, dir);
+ +		s->dma_address = s->dma_length = 0;
+ +	}
+++=======
++ 	startaddr = sg_dma_address(sglist) & PAGE_MASK;
++ 	dma_dom   = to_dma_ops_domain(domain);
++ 	npages    = sg_num_pages(dev, sglist, nelems);
++ 
++ 	__unmap_single(dma_dom, startaddr, npages << PAGE_SHIFT, dir);
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  }
+  
+  /*
+@@@ -2700,8 -2576,8 +2734,13 @@@ static void *alloc_coherent(struct devi
+  	if (!dma_mask)
+  		dma_mask = *dev->dma_mask;
+  
+++<<<<<<< HEAD
+ +	*dma_addr = __map_single(dev, domain->priv, page_to_phys(page),
+ +				 size, DMA_BIDIRECTIONAL, true, dma_mask);
+++=======
++ 	*dma_addr = __map_single(dev, dma_dom, page_to_phys(page),
++ 				 size, DMA_BIDIRECTIONAL, dma_mask);
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  
+  	if (*dma_addr == DMA_ERROR_CODE)
+  		goto out_free;
+@@@ -2949,7 -2898,14 +2991,18 @@@ static void amd_iommu_domain_free(struc
+  
+  	switch (dom->type) {
+  	case IOMMU_DOMAIN_DMA:
+++<<<<<<< HEAD
+ +		dma_dom = domain->priv;
+++=======
++ 		/*
++ 		 * First make sure the domain is no longer referenced from the
++ 		 * flush queue
++ 		 */
++ 		queue_flush_all();
++ 
++ 		/* Now release the domain */
++ 		dma_dom = to_dma_ops_domain(domain);
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  		dma_ops_domain_free(dma_dom);
+  		break;
+  	default:
+@@@ -3129,7 -3089,20 +3182,24 @@@ static void amd_iommu_put_dm_regions(st
+  		kfree(entry);
+  }
+  
+++<<<<<<< HEAD
+ +static struct iommu_ops amd_iommu_ops = {
+++=======
++ static void amd_iommu_apply_dm_region(struct device *dev,
++ 				      struct iommu_domain *domain,
++ 				      struct iommu_dm_region *region)
++ {
++ 	struct dma_ops_domain *dma_dom = to_dma_ops_domain(to_pdomain(domain));
++ 	unsigned long start, end;
++ 
++ 	start = IOVA_PFN(region->start);
++ 	end   = IOVA_PFN(region->start + region->length);
++ 
++ 	WARN_ON_ONCE(reserve_iova(&dma_dom->iovad, start, end) == NULL);
++ }
++ 
++ static const struct iommu_ops amd_iommu_ops = {
+++>>>>>>> b3311b061de2 (iommu/amd: Use container_of to get dma_ops_domain)
+  	.capable = amd_iommu_capable,
+  	.domain_alloc = amd_iommu_domain_alloc,
+  	.domain_free  = amd_iommu_domain_free,
+* Unmerged path drivers/iommu/amd_iommu.c
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index c9e00df52a4f..ae31633c5582 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -419,7 +419,6 @@ struct protection_domain {
+ 	bool updated;		/* complete domain flush required */
+ 	unsigned dev_cnt;	/* devices assigned to this domain */
+ 	unsigned dev_iommu[MAX_IOMMUS]; /* per-IOMMU reference count */
+-	void *priv;             /* private data */
+ };
+ 
+ /*
