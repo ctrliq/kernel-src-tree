@@ -1,0 +1,146 @@
+gfs2: log error reform
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 036330c914365f449ead353ef152fb29411cd4cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/036330c9.failed
+
+Before this patch, gfs2 kept track of journal io errors in two
+places sd_log_error and the SDF_AIL1_IO_ERROR flag in sd_flags.
+This patch consolidates the two into sd_log_error so that it
+reflects the first error encountered writing to the journal.
+In future patches, we will take advantage of this by checking
+this value rather than having to check both when reacting to
+io errors.
+
+In addition, this fixes a tight loop in unmount: If buffers
+get on the ail1 list and an io error occurs elsewhere, the
+ail1 list would never be cleared because they were always busy.
+So unmount would hang, waiting for the ail1 list to empty.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 036330c914365f449ead353ef152fb29411cd4cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/incore.h
+index 1f6f222b6802,ab89f746b3b6..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -588,6 -615,14 +588,17 @@@ enum 
+  	SDF_RORECOVERY		= 7, /* read only recovery */
+  	SDF_SKIP_DLM_UNLOCK	= 8,
+  	SDF_FORCE_AIL_FLUSH     = 9,
+++<<<<<<< HEAD
+++=======
++ 	SDF_FS_FROZEN           = 10,
++ 	SDF_WITHDRAWING		= 11, /* Will withdraw eventually */
++ };
++ 
++ enum gfs2_freeze_state {
++ 	SFS_UNFROZEN		= 0,
++ 	SFS_STARTING_FREEZE	= 1,
++ 	SFS_FROZEN		= 2,
+++>>>>>>> 036330c91436 (gfs2: log error reform)
+  };
+  
+  #define GFS2_FSNAME_LEN		256
+@@@ -788,10 -827,12 +799,10 @@@ struct gfs2_sbd 
+  	atomic_t sd_log_in_flight;
+  	struct bio *sd_log_bio;
+  	wait_queue_head_t sd_log_flush_wait;
+- 	int sd_log_error;
++ 	int sd_log_error; /* First log error */
+  
+ -	atomic_t sd_reserving_log;
+ -	wait_queue_head_t sd_reserving_log_wait;
+ -
+  	unsigned int sd_log_flush_head;
+ +	u64 sd_log_flush_wrapped;
+  
+  	spinlock_t sd_ail_lock;
+  	struct list_head sd_ail1_list;
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,584bb7ce15bf..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -105,12 -103,21 +105,21 @@@ __acquires(&sdp->sd_ail_lock
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+  
+  		if (!buffer_busy(bh)) {
+++<<<<<<< HEAD
+ +			if (!buffer_uptodate(bh))
+++=======
++ 			if (buffer_uptodate(bh)) {
++ 				list_move(&bd->bd_ail_st_list,
++ 					  &tr->tr_ail2_list);
++ 				continue;
++ 			}
++ 			if (!cmpxchg(&sdp->sd_log_error, 0, -EIO)) {
+++>>>>>>> 036330c91436 (gfs2: log error reform)
+  				gfs2_io_error_bh(sdp, bh);
+ -				gfs2_withdraw_delayed(sdp);
+ -			}
+ -		}
+ -
+ -		if (gfs2_withdrawn(sdp)) {
+ -			gfs2_remove_from_ail(bd);
+ +			list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+  			continue;
+  		}
+ +
+  		if (!buffer_dirty(bh))
+  			continue;
+  		if (gl == bd->bd_gl)
+@@@ -192,13 -204,24 +201,27 @@@ static void gfs2_ail1_empty_one(struct 
+  					 bd_ail_st_list) {
+  		bh = bd->bd_bh;
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+- 		if (buffer_busy(bh))
++ 		/*
++ 		 * If another process flagged an io error, e.g. writing to the
++ 		 * journal, error all other bhs and move them off the ail1 to
++ 		 * prevent a tight loop when unmount tries to flush ail1,
++ 		 * regardless of whether they're still busy. If no outside
++ 		 * errors were found and the buffer is busy, move to the next.
++ 		 * If the ail buffer is not busy and caught an error, flag it
++ 		 * for others.
++ 		 */
++ 		if (!sdp->sd_log_error && buffer_busy(bh))
+  			continue;
+++<<<<<<< HEAD
+ +		if (!buffer_uptodate(bh))
+++=======
++ 		if (!buffer_uptodate(bh) &&
++ 		    !cmpxchg(&sdp->sd_log_error, 0, -EIO)) {
+++>>>>>>> 036330c91436 (gfs2: log error reform)
+  			gfs2_io_error_bh(sdp, bh);
+ -			gfs2_withdraw_delayed(sdp);
+ -		}
+  		list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+  	}
+ +
+  }
+  
+  /**
+* Unmerged path fs/gfs2/incore.h
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index e2f42a2af815..559c6c167860 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -1490,7 +1490,7 @@ static void quotad_error(struct gfs2_sbd *sdp, const char *msg, int error)
+ 		return;
+ 	if (!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) {
+ 		fs_err(sdp, "gfs2_quotad: %s error %d\n", msg, error);
+-		sdp->sd_log_error = error;
++		cmpxchg(&sdp->sd_log_error, 0, error);
+ 		wake_up(&sdp->sd_logd_waitq);
+ 	}
+ }
