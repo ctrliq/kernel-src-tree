@@ -613,6 +613,15 @@ int blk_queue_enter(struct request_queue *q, gfp_t gfp)
 		if (!(gfp & __GFP_WAIT))
 			return -EBUSY;
 
+		/*
+		 * read pair of barrier in blk_mq_freeze_queue_start(),
+		 * we need to order reading __PERCPU_REF_DEAD flag of
+		 * .q_usage_counter and reading .mq_freeze_depth,
+		 * otherwise the following wait may never return if the
+		 * two reads are reordered.
+		 */
+		smp_rmb();
+
 		ret = wait_event_interruptible(q->mq_freeze_wq,
 				!atomic_read(&q->mq_freeze_depth) ||
 				blk_queue_dying(q));
