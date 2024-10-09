@@ -1,0 +1,564 @@
+cxgb4: add support to delete hash filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kumar Sanghvi <kumaras@chelsio.com>
+commit 3b0b3bee56dd4e5cd1976a046f391a1435d727b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3b0b3bee.failed
+
+Use a combined ulptx work-request to send hash filter deletion
+request to hw. Hash filter deletion reply is processed on
+getting cpl_abort_rpl_rss.
+
+Release any L2T/SMT/CLIP entries on filter deletion.
+Also, free up the corresponding filter entry.
+
+	Signed-off-by: Kumar Sanghvi <kumaras@chelsio.com>
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b0b3bee56dd4e5cd1976a046f391a1435d727b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,3297ce025e8b..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -30,33 -32,38 +30,61 @@@
+   * SOFTWARE.
+   */
+  
+ -#ifndef __T4_TCB_H
+ -#define __T4_TCB_H
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+  
+ -#define TCB_SMAC_SEL_W		0
+ -#define TCB_SMAC_SEL_S		24
+ -#define TCB_SMAC_SEL_M		0xffULL
+ -#define TCB_SMAC_SEL_V(x)	((x) << TCB_SMAC_SEL_S)
+ +#include "ipath_kernel.h"
+  
+ -#define TCB_T_FLAGS_W		1
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+ +{
+ +	return 0;
+ +}
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +/**
+ + * ipath_unordered_wc - indicate whether write combining is unordered
+ + *
+ + * Because our performance depends on our ability to do write
+ + * combining mmio writes in the most efficient way, we need to
+ + * know if we are on a processor that may reorder stores when
+ + * write combining.
+ + */
+ +int ipath_unordered_wc(void)
+ +{
+ +	return 1;
+ +}
+++=======
++ #define TF_CCTRL_ECE_S		60
++ #define TF_CCTRL_CWR_S		61
++ #define TF_CCTRL_RFR_S		62
++ 
++ #define TCB_RSS_INFO_W		3
++ #define TCB_RSS_INFO_S		0
++ #define TCB_RSS_INFO_M		0x3ffULL
++ #define TCB_RSS_INFO_V(x)	((x) << TCB_RSS_INFO_S)
++ 
++ #define TCB_TIMESTAMP_W		5
++ #define TCB_TIMESTAMP_S		0
++ #define TCB_TIMESTAMP_M		0xffffffffULL
++ #define TCB_TIMESTAMP_V(x)	((x) << TCB_TIMESTAMP_S)
++ 
++ #define TCB_RTT_TS_RECENT_AGE_W		6
++ #define TCB_RTT_TS_RECENT_AGE_S		0
++ #define TCB_RTT_TS_RECENT_AGE_M		0xffffffffULL
++ #define TCB_RTT_TS_RECENT_AGE_V(x)	((x) << TCB_RTT_TS_RECENT_AGE_S)
++ 
++ #define TCB_SND_UNA_RAW_W	10
++ #define TCB_RX_FRAG2_PTR_RAW_W	27
++ #define TCB_RX_FRAG3_LEN_RAW_W	29
++ #define TCB_RX_FRAG3_START_IDX_OFFSET_RAW_W	30
++ #define TCB_PDU_HDR_LEN_W	31
++ #endif /* __T4_TCB_H */
+++>>>>>>> 3b0b3bee56dd (cxgb4: add support to delete hash filter):drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+index 7006326dc1ab,eb6ba9824501..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+@@@ -48,6 -52,194 +48,197 @@@ static inline bool unsupported(u32 conf
+  	return !(conf & conf_mask) && is_field_set(val, mask);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int set_tcb_field(struct adapter *adap, struct filter_entry *f,
++ 			 unsigned int ftid,  u16 word, u64 mask, u64 val,
++ 			 int no_reply)
++ {
++ 	struct cpl_set_tcb_field *req;
++ 	struct sk_buff *skb;
++ 
++ 	skb = alloc_skb(sizeof(struct cpl_set_tcb_field), GFP_ATOMIC);
++ 	if (!skb)
++ 		return -ENOMEM;
++ 
++ 	req = (struct cpl_set_tcb_field *)__skb_put(skb, sizeof(*req));
++ 	memset(req, 0, sizeof(*req));
++ 	INIT_TP_WR_CPL(req, CPL_SET_TCB_FIELD, ftid);
++ 	req->reply_ctrl = htons(REPLY_CHAN_V(0) |
++ 				QUEUENO_V(adap->sge.fw_evtq.abs_id) |
++ 				NO_REPLY_V(no_reply));
++ 	req->word_cookie = htons(TCB_WORD_V(word) | TCB_COOKIE_V(ftid));
++ 	req->mask = cpu_to_be64(mask);
++ 	req->val = cpu_to_be64(val);
++ 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, f->fs.val.iport & 0x3);
++ 	t4_ofld_send(adap, skb);
++ 	return 0;
++ }
++ 
++ /* Set one of the t_flags bits in the TCB.
++  */
++ static int set_tcb_tflag(struct adapter *adap, struct filter_entry *f,
++ 			 unsigned int ftid, unsigned int bit_pos,
++ 			 unsigned int val, int no_reply)
++ {
++ 	return set_tcb_field(adap, f, ftid,  TCB_T_FLAGS_W, 1ULL << bit_pos,
++ 			     (unsigned long long)val << bit_pos, no_reply);
++ }
++ 
++ static void mk_abort_req_ulp(struct cpl_abort_req *abort_req, unsigned int tid)
++ {
++ 	struct ulp_txpkt *txpkt = (struct ulp_txpkt *)abort_req;
++ 	struct ulptx_idata *sc = (struct ulptx_idata *)(txpkt + 1);
++ 
++ 	txpkt->cmd_dest = htonl(ULPTX_CMD_V(ULP_TX_PKT) | ULP_TXPKT_DEST_V(0));
++ 	txpkt->len = htonl(DIV_ROUND_UP(sizeof(*abort_req), 16));
++ 	sc->cmd_more = htonl(ULPTX_CMD_V(ULP_TX_SC_IMM));
++ 	sc->len = htonl(sizeof(*abort_req) - sizeof(struct work_request_hdr));
++ 	OPCODE_TID(abort_req) = htonl(MK_OPCODE_TID(CPL_ABORT_REQ, tid));
++ 	abort_req->rsvd0 = htonl(0);
++ 	abort_req->rsvd1 = 0;
++ 	abort_req->cmd = CPL_ABORT_NO_RST;
++ }
++ 
++ static void mk_abort_rpl_ulp(struct cpl_abort_rpl *abort_rpl, unsigned int tid)
++ {
++ 	struct ulp_txpkt *txpkt = (struct ulp_txpkt *)abort_rpl;
++ 	struct ulptx_idata *sc = (struct ulptx_idata *)(txpkt + 1);
++ 
++ 	txpkt->cmd_dest = htonl(ULPTX_CMD_V(ULP_TX_PKT) | ULP_TXPKT_DEST_V(0));
++ 	txpkt->len = htonl(DIV_ROUND_UP(sizeof(*abort_rpl), 16));
++ 	sc->cmd_more = htonl(ULPTX_CMD_V(ULP_TX_SC_IMM));
++ 	sc->len = htonl(sizeof(*abort_rpl) - sizeof(struct work_request_hdr));
++ 	OPCODE_TID(abort_rpl) = htonl(MK_OPCODE_TID(CPL_ABORT_RPL, tid));
++ 	abort_rpl->rsvd0 = htonl(0);
++ 	abort_rpl->rsvd1 = 0;
++ 	abort_rpl->cmd = CPL_ABORT_NO_RST;
++ }
++ 
++ static void mk_set_tcb_ulp(struct filter_entry *f,
++ 			   struct cpl_set_tcb_field *req,
++ 			   unsigned int word, u64 mask, u64 val,
++ 			   u8 cookie, int no_reply)
++ {
++ 	struct ulp_txpkt *txpkt = (struct ulp_txpkt *)req;
++ 	struct ulptx_idata *sc = (struct ulptx_idata *)(txpkt + 1);
++ 
++ 	txpkt->cmd_dest = htonl(ULPTX_CMD_V(ULP_TX_PKT) | ULP_TXPKT_DEST_V(0));
++ 	txpkt->len = htonl(DIV_ROUND_UP(sizeof(*req), 16));
++ 	sc->cmd_more = htonl(ULPTX_CMD_V(ULP_TX_SC_IMM));
++ 	sc->len = htonl(sizeof(*req) - sizeof(struct work_request_hdr));
++ 	OPCODE_TID(req) = htonl(MK_OPCODE_TID(CPL_SET_TCB_FIELD, f->tid));
++ 	req->reply_ctrl = htons(NO_REPLY_V(no_reply) | REPLY_CHAN_V(0) |
++ 				QUEUENO_V(0));
++ 	req->word_cookie = htons(TCB_WORD_V(word) | TCB_COOKIE_V(cookie));
++ 	req->mask = cpu_to_be64(mask);
++ 	req->val = cpu_to_be64(val);
++ 	sc = (struct ulptx_idata *)(req + 1);
++ 	sc->cmd_more = htonl(ULPTX_CMD_V(ULP_TX_SC_NOOP));
++ 	sc->len = htonl(0);
++ }
++ 
++ static int configure_filter_smac(struct adapter *adap, struct filter_entry *f)
++ {
++ 	int err;
++ 
++ 	/* do a set-tcb for smac-sel and CWR bit.. */
++ 	err = set_tcb_tflag(adap, f, f->tid, TF_CCTRL_CWR_S, 1, 1);
++ 	if (err)
++ 		goto smac_err;
++ 
++ 	err = set_tcb_field(adap, f, f->tid, TCB_SMAC_SEL_W,
++ 			    TCB_SMAC_SEL_V(TCB_SMAC_SEL_M),
++ 			    TCB_SMAC_SEL_V(f->smt->idx), 1);
++ 	if (!err)
++ 		return 0;
++ 
++ smac_err:
++ 	dev_err(adap->pdev_dev, "filter %u smac config failed with error %u\n",
++ 		f->tid, err);
++ 	return err;
++ }
++ 
++ static void set_nat_params(struct adapter *adap, struct filter_entry *f,
++ 			   unsigned int tid, bool dip, bool sip, bool dp,
++ 			   bool sp)
++ {
++ 	if (dip) {
++ 		if (f->fs.type) {
++ 			set_tcb_field(adap, f, tid, TCB_SND_UNA_RAW_W,
++ 				      WORD_MASK, f->fs.nat_lip[15] |
++ 				      f->fs.nat_lip[14] << 8 |
++ 				      f->fs.nat_lip[13] << 16 |
++ 				      f->fs.nat_lip[12] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_SND_UNA_RAW_W + 1,
++ 				      WORD_MASK, f->fs.nat_lip[11] |
++ 				      f->fs.nat_lip[10] << 8 |
++ 				      f->fs.nat_lip[9] << 16 |
++ 				      f->fs.nat_lip[8] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_SND_UNA_RAW_W + 2,
++ 				      WORD_MASK, f->fs.nat_lip[7] |
++ 				      f->fs.nat_lip[6] << 8 |
++ 				      f->fs.nat_lip[5] << 16 |
++ 				      f->fs.nat_lip[4] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_SND_UNA_RAW_W + 3,
++ 				      WORD_MASK, f->fs.nat_lip[3] |
++ 				      f->fs.nat_lip[2] << 8 |
++ 				      f->fs.nat_lip[1] << 16 |
++ 				      f->fs.nat_lip[0] << 24, 1);
++ 		} else {
++ 			set_tcb_field(adap, f, tid, TCB_RX_FRAG3_LEN_RAW_W,
++ 				      WORD_MASK, f->fs.nat_lip[3] |
++ 				      f->fs.nat_lip[2] << 8 |
++ 				      f->fs.nat_lip[1] << 16 |
++ 				      f->fs.nat_lip[0] << 24, 1);
++ 		}
++ 	}
++ 
++ 	if (sip) {
++ 		if (f->fs.type) {
++ 			set_tcb_field(adap, f, tid, TCB_RX_FRAG2_PTR_RAW_W,
++ 				      WORD_MASK, f->fs.nat_fip[15] |
++ 				      f->fs.nat_fip[14] << 8 |
++ 				      f->fs.nat_fip[13] << 16 |
++ 				      f->fs.nat_fip[12] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_RX_FRAG2_PTR_RAW_W + 1,
++ 				      WORD_MASK, f->fs.nat_fip[11] |
++ 				      f->fs.nat_fip[10] << 8 |
++ 				      f->fs.nat_fip[9] << 16 |
++ 				      f->fs.nat_fip[8] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_RX_FRAG2_PTR_RAW_W + 2,
++ 				      WORD_MASK, f->fs.nat_fip[7] |
++ 				      f->fs.nat_fip[6] << 8 |
++ 				      f->fs.nat_fip[5] << 16 |
++ 				      f->fs.nat_fip[4] << 24, 1);
++ 
++ 			set_tcb_field(adap, f, tid, TCB_RX_FRAG2_PTR_RAW_W + 3,
++ 				      WORD_MASK, f->fs.nat_fip[3] |
++ 				      f->fs.nat_fip[2] << 8 |
++ 				      f->fs.nat_fip[1] << 16 |
++ 				      f->fs.nat_fip[0] << 24, 1);
++ 
++ 		} else {
++ 			set_tcb_field(adap, f, tid,
++ 				      TCB_RX_FRAG3_START_IDX_OFFSET_RAW_W,
++ 				      WORD_MASK, f->fs.nat_fip[3] |
++ 				      f->fs.nat_fip[2] << 8 |
++ 				      f->fs.nat_fip[1] << 16 |
++ 				      f->fs.nat_fip[0] << 24, 1);
++ 		}
++ 	}
++ 
++ 	set_tcb_field(adap, f, tid, TCB_PDU_HDR_LEN_W, WORD_MASK,
++ 		      (dp ? f->fs.nat_lport : 0) |
++ 		      (sp ? f->fs.nat_fport << 16 : 0), 1);
++ }
++ 
+++>>>>>>> 3b0b3bee56dd (cxgb4: add support to delete hash filter)
+  /* Validate filter spec against configuration done on the card. */
+  static int validate_filter(struct net_device *dev,
+  			   struct ch_filter_specification *fs)
+@@@ -773,6 -1322,157 +1035,160 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int configure_filter_tcb(struct adapter *adap, unsigned int tid,
++ 				struct filter_entry *f)
++ {
++ 	if (f->fs.hitcnts)
++ 		set_tcb_field(adap, f, tid, TCB_TIMESTAMP_W,
++ 			      TCB_TIMESTAMP_V(TCB_TIMESTAMP_M) |
++ 			      TCB_RTT_TS_RECENT_AGE_V(TCB_RTT_TS_RECENT_AGE_M),
++ 			      TCB_TIMESTAMP_V(0ULL) |
++ 			      TCB_RTT_TS_RECENT_AGE_V(0ULL),
++ 			      1);
++ 
++ 	if (f->fs.newdmac)
++ 		set_tcb_tflag(adap, f, tid, TF_CCTRL_ECE_S, 1,
++ 			      1);
++ 
++ 	if (f->fs.newvlan == VLAN_INSERT ||
++ 	    f->fs.newvlan == VLAN_REWRITE)
++ 		set_tcb_tflag(adap, f, tid, TF_CCTRL_RFR_S, 1,
++ 			      1);
++ 	if (f->fs.newsmac)
++ 		configure_filter_smac(adap, f);
++ 
++ 	if (f->fs.nat_mode) {
++ 		switch (f->fs.nat_mode) {
++ 		case NAT_MODE_DIP:
++ 			set_nat_params(adap, f, tid, true, false, false, false);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_DP:
++ 			set_nat_params(adap, f, tid, true, false, true, false);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_DP_SIP:
++ 			set_nat_params(adap, f, tid, true, true, true, false);
++ 			break;
++ 		case NAT_MODE_DIP_DP_SP:
++ 			set_nat_params(adap, f, tid, true, false, true, true);
++ 			break;
++ 
++ 		case NAT_MODE_SIP_SP:
++ 			set_nat_params(adap, f, tid, false, true, false, true);
++ 			break;
++ 
++ 		case NAT_MODE_DIP_SIP_SP:
++ 			set_nat_params(adap, f, tid, true, true, false, true);
++ 			break;
++ 
++ 		case NAT_MODE_ALL:
++ 			set_nat_params(adap, f, tid, true, true, true, true);
++ 			break;
++ 
++ 		default:
++ 			pr_err("%s: Invalid NAT mode: %d\n",
++ 			       __func__, f->fs.nat_mode);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ void hash_del_filter_rpl(struct adapter *adap,
++ 			 const struct cpl_abort_rpl_rss *rpl)
++ {
++ 	unsigned int status = rpl->status;
++ 	struct tid_info *t = &adap->tids;
++ 	unsigned int tid = GET_TID(rpl);
++ 	struct filter_ctx *ctx = NULL;
++ 	struct filter_entry *f;
++ 
++ 	dev_dbg(adap->pdev_dev, "%s: status = %u; tid = %u\n",
++ 		__func__, status, tid);
++ 
++ 	f = lookup_tid(t, tid);
++ 	if (!f) {
++ 		dev_err(adap->pdev_dev, "%s:could not find filter entry",
++ 			__func__);
++ 		return;
++ 	}
++ 	ctx = f->ctx;
++ 	f->ctx = NULL;
++ 	clear_filter(adap, f);
++ 	cxgb4_remove_tid(t, 0, tid, 0);
++ 	kfree(f);
++ 	if (ctx) {
++ 		ctx->result = 0;
++ 		complete(&ctx->completion);
++ 	}
++ }
++ 
++ void hash_filter_rpl(struct adapter *adap, const struct cpl_act_open_rpl *rpl)
++ {
++ 	unsigned int ftid = TID_TID_G(AOPEN_ATID_G(ntohl(rpl->atid_status)));
++ 	unsigned int status  = AOPEN_STATUS_G(ntohl(rpl->atid_status));
++ 	struct tid_info *t = &adap->tids;
++ 	unsigned int tid = GET_TID(rpl);
++ 	struct filter_ctx *ctx = NULL;
++ 	struct filter_entry *f;
++ 
++ 	dev_dbg(adap->pdev_dev, "%s: tid = %u; atid = %u; status = %u\n",
++ 		__func__, tid, ftid, status);
++ 
++ 	f = lookup_atid(t, ftid);
++ 	if (!f) {
++ 		dev_err(adap->pdev_dev, "%s:could not find filter entry",
++ 			__func__);
++ 		return;
++ 	}
++ 	ctx = f->ctx;
++ 	f->ctx = NULL;
++ 
++ 	switch (status) {
++ 	case CPL_ERR_NONE:
++ 		f->tid = tid;
++ 		f->pending = 0;
++ 		f->valid = 1;
++ 		cxgb4_insert_tid(t, f, f->tid, 0);
++ 		cxgb4_free_atid(t, ftid);
++ 		if (ctx) {
++ 			ctx->tid = f->tid;
++ 			ctx->result = 0;
++ 		}
++ 		if (configure_filter_tcb(adap, tid, f)) {
++ 			clear_filter(adap, f);
++ 			cxgb4_remove_tid(t, 0, tid, 0);
++ 			kfree(f);
++ 			if (ctx) {
++ 				ctx->result = -EINVAL;
++ 				complete(&ctx->completion);
++ 			}
++ 			return;
++ 		}
++ 		break;
++ 
++ 	default:
++ 		dev_err(adap->pdev_dev, "%s: filter creation PROBLEM; status = %u\n",
++ 			__func__, status);
++ 
++ 		if (ctx) {
++ 			if (status == CPL_ERR_TCAM_FULL)
++ 				ctx->result = -EAGAIN;
++ 			else
++ 				ctx->result = -EINVAL;
++ 		}
++ 		clear_filter(adap, f);
++ 		cxgb4_free_atid(t, ftid);
++ 		kfree(f);
++ 	}
++ 	if (ctx)
++ 		complete(&ctx->completion);
++ }
++ 
+++>>>>>>> 3b0b3bee56dd (cxgb4: add support to delete hash filter)
+  /* Handle a filter write/deletion reply. */
+  void filter_rpl(struct adapter *adap, const struct cpl_set_tcb_rpl *rpl)
+  {
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+index d3c1a8fafd32,9475abd3384e..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+@@@ -37,7 -37,12 +37,13 @@@
+  
+  #include "t4_msg.h"
+  
+ -#define WORD_MASK	0xffffffff
+ -
+  void filter_rpl(struct adapter *adap, const struct cpl_set_tcb_rpl *rpl);
+++<<<<<<< HEAD
+++=======
++ void hash_filter_rpl(struct adapter *adap, const struct cpl_act_open_rpl *rpl);
++ void hash_del_filter_rpl(struct adapter *adap,
++ 			 const struct cpl_abort_rpl_rss *rpl);
+++>>>>>>> 3b0b3bee56dd (cxgb4: add support to delete hash filter)
+  void clear_filter(struct adapter *adap, struct filter_entry *f);
+  
+  int set_filter_wr(struct adapter *adapter, int fidx);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 4992c0939d79,35709c7f7c5b..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -567,6 -572,14 +567,17 @@@ static int fwevtq_handler(struct sge_rs
+  		const struct cpl_set_tcb_rpl *p = (void *)rsp;
+  
+  		filter_rpl(q->adap, p);
+++<<<<<<< HEAD
+++=======
++ 	} else if (opcode == CPL_ACT_OPEN_RPL) {
++ 		const struct cpl_act_open_rpl *p = (void *)rsp;
++ 
++ 		hash_filter_rpl(q->adap, p);
++ 	} else if (opcode == CPL_ABORT_RPL_RSS) {
++ 		const struct cpl_abort_rpl_rss *p = (void *)rsp;
++ 
++ 		hash_del_filter_rpl(q->adap, p);
+++>>>>>>> 3b0b3bee56dd (cxgb4: add support to delete hash filter)
+  	} else
+  		dev_err(q->adap->pdev_dev,
+  			"unexpected CPL %#x on FW event queue\n", opcode);
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_filter.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+index 892dfce1fa63..2969bd365c77 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+@@ -730,7 +730,7 @@ int cxgb4_tc_flower_destroy(struct net_device *dev,
+ 	if (!ch_flower)
+ 		return -ENOENT;
+ 
+-	ret = cxgb4_del_filter(dev, ch_flower->filter_id);
++	ret = cxgb4_del_filter(dev, ch_flower->filter_id, &ch_flower->fs);
+ 	if (ret)
+ 		goto err;
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+index 48970ba08bdc..cd0cd13a964d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
+@@ -380,7 +380,7 @@ int cxgb4_delete_knode(struct net_device *dev, struct tc_cls_u32_offload *cls)
+ 			return -EINVAL;
+ 	}
+ 
+-	ret = cxgb4_del_filter(dev, filter_id);
++	ret = cxgb4_del_filter(dev, filter_id, NULL);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -399,7 +399,7 @@ int cxgb4_delete_knode(struct net_device *dev, struct tc_cls_u32_offload *cls)
+ 				if (!test_bit(j, link->tid_map))
+ 					continue;
+ 
+-				ret = __cxgb4_del_filter(dev, j, NULL);
++				ret = __cxgb4_del_filter(dev, j, NULL, NULL);
+ 				if (ret)
+ 					goto out;
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index 52324c77a4fe..a1c850861cbf 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@ -217,10 +217,12 @@ int __cxgb4_set_filter(struct net_device *dev, int filter_id,
+ 		       struct ch_filter_specification *fs,
+ 		       struct filter_ctx *ctx);
+ int __cxgb4_del_filter(struct net_device *dev, int filter_id,
++		       struct ch_filter_specification *fs,
+ 		       struct filter_ctx *ctx);
+ int cxgb4_set_filter(struct net_device *dev, int filter_id,
+ 		     struct ch_filter_specification *fs);
+-int cxgb4_del_filter(struct net_device *dev, int filter_id);
++int cxgb4_del_filter(struct net_device *dev, int filter_id,
++		     struct ch_filter_specification *fs);
+ int cxgb4_get_filter_counters(struct net_device *dev, unsigned int fidx,
+ 			      u64 *hitcnt, u64 *bytecnt);
+ 
