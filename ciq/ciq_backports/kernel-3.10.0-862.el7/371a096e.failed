@@ -1,0 +1,149 @@
+mm: don't use radix tree writeback tags for pages in swap cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] don't use radix tree writeback tags for pages in swap cache (Jerome Marchand) [1400689]
+Rebuild_FUZZ: 96.72%
+commit-author Huang Ying <ying.huang@intel.com>
+commit 371a096edf43a8c71844cf71c20765c8b21d07d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/371a096e.failed
+
+File pages use a set of radix tree tags (DIRTY, TOWRITE, WRITEBACK,
+etc.) to accelerate finding the pages with a specific tag in the radix
+tree during inode writeback.  But for anonymous pages in the swap cache,
+there is no inode writeback.  So there is no need to find the pages with
+some writeback tags in the radix tree.  It is not necessary to touch
+radix tree writeback tags for pages in the swap cache.
+
+Per Rik van Riel's suggestion, a new flag AS_NO_WRITEBACK_TAGS is
+introduced for address spaces which don't need to update the writeback
+tags.  The flag is set for swap caches.  It may be used for DAX file
+systems, etc.
+
+With this patch, the swap out bandwidth improved 22.3% (from ~1.2GB/s to
+~1.48GBps) in the vm-scalability swap-w-seq test case with 8 processes.
+The test is done on a Xeon E5 v3 system.  The swap device used is a RAM
+simulated PMEM (persistent memory) device.  The improvement comes from
+the reduced contention on the swap cache radix tree lock.  To test
+sequential swapping out, the test case uses 8 processes, which
+sequentially allocate and write to the anonymous pages until RAM and
+part of the swap device is used up.
+
+Details of comparison is as follow,
+
+base             base+patch
+---------------- --------------------------
+         %stddev     %change         %stddev
+             \          |                \
+   2506952 Â±  2%     +28.1%    3212076 Â±  7%  vm-scalability.throughput
+   1207402 Â±  7%     +22.3%    1476578 Â±  6%  vmstat.swap.so
+     10.86 Â± 12%     -23.4%       8.31 Â± 16%  perf-profile.cycles-pp._raw_spin_lock_irq.__add_to_swap_cache.add_to_swap_cache.add_to_swap.shrink_page_list
+     10.82 Â± 13%     -33.1%       7.24 Â± 14%  perf-profile.cycles-pp._raw_spin_lock_irqsave.__remove_mapping.shrink_page_list.shrink_inactive_list.shrink_zone_memcg
+     10.36 Â± 11%    -100.0%       0.00 Â± -1%  perf-profile.cycles-pp._raw_spin_lock_irqsave.__test_set_page_writeback.bdev_write_page.__swap_writepage.swap_writepage
+     10.52 Â± 12%    -100.0%       0.00 Â± -1%  perf-profile.cycles-pp._raw_spin_lock_irqsave.test_clear_page_writeback.end_page_writeback.page_endio.pmem_rw_page
+
+Link: http://lkml.kernel.org/r/1472578089-5560-1-git-send-email-ying.huang@intel.com
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Wu Fengguang <fengguang.wu@intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 371a096edf43a8c71844cf71c20765c8b21d07d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page-writeback.c
+#	mm/swap_state.c
+diff --cc mm/page-writeback.c
+index e90d9c5e28b9,439cc63ad903..000000000000
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@@ -2364,8 -2715,10 +2364,15 @@@ int test_clear_page_writeback(struct pa
+  	struct address_space *mapping = page_mapping(page);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (mapping) {
+ +		struct backing_dev_info *bdi = mapping->backing_dev_info;
+++=======
++ 	lock_page_memcg(page);
++ 	if (mapping && mapping_use_writeback_tags(mapping)) {
++ 		struct inode *inode = mapping->host;
++ 		struct backing_dev_info *bdi = inode_to_bdi(inode);
+++>>>>>>> 371a096edf43 (mm: don't use radix tree writeback tags for pages in swap cache)
+  		unsigned long flags;
+  
+  		spin_lock_irqsave(&mapping->tree_lock, flags);
+@@@ -2395,8 -2758,10 +2402,15 @@@ int __test_set_page_writeback(struct pa
+  	struct address_space *mapping = page_mapping(page);
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (mapping) {
+ +		struct backing_dev_info *bdi = mapping->backing_dev_info;
+++=======
++ 	lock_page_memcg(page);
++ 	if (mapping && mapping_use_writeback_tags(mapping)) {
++ 		struct inode *inode = mapping->host;
++ 		struct backing_dev_info *bdi = inode_to_bdi(inode);
+++>>>>>>> 371a096edf43 (mm: don't use radix tree writeback tags for pages in swap cache)
+  		unsigned long flags;
+  
+  		spin_lock_irqsave(&mapping->tree_lock, flags);
+diff --cc mm/swap_state.c
+index 8ead62769c81,268b8191982b..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -41,7 -37,8 +41,12 @@@ struct address_space swapper_spaces[MAX
+  		.page_tree	= RADIX_TREE_INIT(GFP_ATOMIC|__GFP_NOWARN),
+  		.i_mmap_writable = ATOMIC_INIT(0),
+  		.a_ops		= &swap_aops,
+++<<<<<<< HEAD
+ +		.backing_dev_info = &swap_backing_dev_info,
+++=======
++ 		/* swap cache doesn't use writeback related tags */
++ 		.flags		= 1 << AS_NO_WRITEBACK_TAGS,
+++>>>>>>> 371a096edf43 (mm: don't use radix tree writeback tags for pages in swap cache)
+  	}
+  };
+  
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 8576311e4195..d0d8c6bd7b31 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -25,6 +25,8 @@ enum mapping_flags {
+ 	AS_MM_ALL_LOCKS	= __GFP_BITS_SHIFT + 2,	/* under mm_take_all_locks() */
+ 	AS_UNEVICTABLE	= __GFP_BITS_SHIFT + 3,	/* e.g., ramdisk, SHM_LOCK */
+ 	AS_EXITING	= __GFP_BITS_SHIFT + 4, /* final truncate in progress */
++	/* writeback related tags are not used */
++	AS_NO_WRITEBACK_TAGS = __GFP_BITS_SHIFT + 5,
+ };
+ 
+ static inline void mapping_set_error(struct address_space *mapping, int error)
+@@ -64,6 +66,16 @@ static inline int mapping_exiting(struct address_space *mapping)
+ 	return test_bit(AS_EXITING, &mapping->flags);
+ }
+ 
++static inline void mapping_set_no_writeback_tags(struct address_space *mapping)
++{
++	set_bit(AS_NO_WRITEBACK_TAGS, &mapping->flags);
++}
++
++static inline int mapping_use_writeback_tags(struct address_space *mapping)
++{
++	return !test_bit(AS_NO_WRITEBACK_TAGS, &mapping->flags);
++}
++
+ static inline gfp_t mapping_gfp_mask(struct address_space * mapping)
+ {
+ 	return (__force gfp_t)mapping->flags & __GFP_BITS_MASK;
+* Unmerged path mm/page-writeback.c
+* Unmerged path mm/swap_state.c
