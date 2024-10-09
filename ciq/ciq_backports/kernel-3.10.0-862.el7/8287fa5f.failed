@@ -1,0 +1,178 @@
+target/file: Remove fd_prot bounce buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sagi Grimberg <sagig@mellanox.com>
+commit 8287fa5fb43c3fa05748560b8e13b91c4e88f586
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8287fa5f.failed
+
+The reason this bounce buffer exists is to allow code
+reuse between rd_mcp and fileio in DIF mode. But the fact is,
+that this bounce is really not needed at all, we can simply call
+sbc_dif_verify on cmd->t_prot_sg and use it for file IO.
+
+This also removes fd_do_prot_rw as fd_do_rw was generalised
+to receive file pointer, block size (8 bytes for DIF data) and
+total data length.
+
+(Fix apply breakage from commit c836777 - nab)
+
+	Tested-by: Akinobu Mita <akinobu.mita@gmail.com>
+	Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 8287fa5fb43c3fa05748560b8e13b91c4e88f586)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_file.c
+diff --cc drivers/target/target_core_file.c
+index 909f66aed985,fe6c19c1e001..000000000000
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@@ -258,104 -258,41 +258,51 @@@ static void fd_free_device(struct se_de
+  	kfree(fd_dev);
+  }
+  
+- static int fd_do_prot_rw(struct se_cmd *cmd, struct fd_prot *fd_prot,
+- 			 int is_write)
++ static int fd_do_rw(struct se_cmd *cmd, struct file *fd,
++ 		    u32 block_size, struct scatterlist *sgl,
++ 		    u32 sgl_nents, u32 data_length, int is_write)
+  {
+- 	struct se_device *se_dev = cmd->se_dev;
+- 	struct fd_dev *dev = FD_DEV(se_dev);
+- 	struct file *prot_fd = dev->fd_prot_file;
+- 	loff_t pos = (cmd->t_task_lba * se_dev->prot_length);
+- 	unsigned char *buf;
+- 	u32 prot_size;
+- 	int rc, ret = 1;
+- 
+- 	prot_size = (cmd->data_length / se_dev->dev_attrib.block_size) *
+- 		     se_dev->prot_length;
+- 
+- 	if (!is_write) {
+- 		fd_prot->prot_buf = kzalloc(prot_size, GFP_KERNEL);
+- 		if (!fd_prot->prot_buf) {
+- 			pr_err("Unable to allocate fd_prot->prot_buf\n");
+- 			return -ENOMEM;
+- 		}
+- 		buf = fd_prot->prot_buf;
+- 
+- 		fd_prot->prot_sg_nents = 1;
+- 		fd_prot->prot_sg = kzalloc(sizeof(struct scatterlist),
+- 					   GFP_KERNEL);
+- 		if (!fd_prot->prot_sg) {
+- 			pr_err("Unable to allocate fd_prot->prot_sg\n");
+- 			kfree(fd_prot->prot_buf);
+- 			return -ENOMEM;
+- 		}
+- 		sg_init_table(fd_prot->prot_sg, fd_prot->prot_sg_nents);
+- 		sg_set_buf(fd_prot->prot_sg, buf, prot_size);
+- 	}
+- 
+- 	if (is_write) {
+- 		rc = kernel_write(prot_fd, fd_prot->prot_buf, prot_size, pos);
+- 		if (rc < 0 || prot_size != rc) {
+- 			pr_err("kernel_write() for fd_do_prot_rw failed:"
+- 			       " %d\n", rc);
+- 			ret = -EINVAL;
+- 		}
+- 	} else {
+- 		rc = kernel_read(prot_fd, pos, fd_prot->prot_buf, prot_size);
+- 		if (rc < 0) {
+- 			pr_err("kernel_read() for fd_do_prot_rw failed:"
+- 			       " %d\n", rc);
+- 			ret = -EINVAL;
+- 		}
+- 	}
+- 
+- 	if (is_write || ret < 0) {
+- 		kfree(fd_prot->prot_sg);
+- 		kfree(fd_prot->prot_buf);
+- 	}
+- 
+- 	return ret;
+- }
+- 
+- static int fd_do_rw(struct se_cmd *cmd, struct scatterlist *sgl,
+- 		u32 sgl_nents, int is_write)
+- {
+- 	struct se_device *se_dev = cmd->se_dev;
+- 	struct fd_dev *dev = FD_DEV(se_dev);
+- 	struct file *fd = dev->fd_file;
+  	struct scatterlist *sg;
+++<<<<<<< HEAD
+ +	struct iovec *iov;
+ +	mm_segment_t old_fs;
+ +	loff_t pos = (cmd->t_task_lba * se_dev->dev_attrib.block_size);
+++=======
++ 	struct iov_iter iter;
++ 	struct bio_vec *bvec;
++ 	ssize_t len = 0;
++ 	loff_t pos = (cmd->t_task_lba * block_size);
+++>>>>>>> 8287fa5fb43c (target/file: Remove fd_prot bounce buffer)
+  	int ret = 0, i;
+  
+ -	bvec = kcalloc(sgl_nents, sizeof(struct bio_vec), GFP_KERNEL);
+ -	if (!bvec) {
+ +	iov = kzalloc(sizeof(struct iovec) * sgl_nents, GFP_KERNEL);
+ +	if (!iov) {
+  		pr_err("Unable to allocate fd_do_readv iov[]\n");
+  		return -ENOMEM;
+  	}
+  
+  	for_each_sg(sgl, sg, sgl_nents, i) {
+ -		bvec[i].bv_page = sg_page(sg);
+ -		bvec[i].bv_len = sg->length;
+ -		bvec[i].bv_offset = sg->offset;
+ -
+ -		len += sg->length;
+ +		iov[i].iov_len = sg->length;
+ +		iov[i].iov_base = kmap(sg_page(sg)) + sg->offset;
+  	}
+  
+ -	iov_iter_bvec(&iter, ITER_BVEC, bvec, sgl_nents, len);
+ +	old_fs = get_fs();
+ +	set_fs(get_ds());
+ +
+  	if (is_write)
+ -		ret = vfs_iter_write(fd, &iter, &pos);
+ +		ret = vfs_writev(fd, &iov[0], sgl_nents, &pos);
+  	else
+ -		ret = vfs_iter_read(fd, &iter, &pos);
+ +		ret = vfs_readv(fd, &iov[0], sgl_nents, &pos);
+ +
+ +	set_fs(old_fs);
+  
+ -	kfree(bvec);
+ +	for_each_sg(sgl, sg, sgl_nents, i)
+ +		kunmap(sg_page(sg));
+ +
+ +	kfree(iov);
+  
+  	if (is_write) {
+- 		if (ret < 0 || ret != cmd->data_length) {
++ 		if (ret < 0 || ret != data_length) {
+  			pr_err("%s() write returned %d\n", __func__, ret);
+  			return (ret < 0 ? ret : -EINVAL);
+  		}
+* Unmerged path drivers/target/target_core_file.c
+diff --git a/drivers/target/target_core_file.h b/drivers/target/target_core_file.h
+index 19076355a20b..1111b37fa007 100644
+--- a/drivers/target/target_core_file.h
++++ b/drivers/target/target_core_file.h
+@@ -23,12 +23,6 @@
+ #define FDBD_HAS_BUFFERED_IO_WCE 0x04
+ #define FDBD_FORMAT_UNIT_SIZE	2048
+ 
+-struct fd_prot {
+-	unsigned char	*prot_buf;
+-	struct scatterlist *prot_sg;
+-	u32 prot_sg_nents;
+-};
+-
+ struct fd_dev {
+ 	struct se_device dev;
+ 
