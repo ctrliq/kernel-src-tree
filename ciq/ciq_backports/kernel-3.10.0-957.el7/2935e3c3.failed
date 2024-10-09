@@ -1,0 +1,246 @@
+sfc: on 8000 series use TX queues for TX timestamps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit 2935e3c38228ad9bf073eeb0eedff5849eea63db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2935e3c3.failed
+
+For this we create and use one or more new TX queues on the PTP channel,
+ and enable sync events for it.
+Based on a patch by Martin Habets <mhabets@solarflare.com>.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2935e3c38228ad9bf073eeb0eedff5849eea63db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ptp.c
+#	drivers/net/ethernet/sfc/tx.c
+diff --cc drivers/net/ethernet/sfc/ptp.c
+index 6d90793c008f,87a72f37141b..000000000000
+--- a/drivers/net/ethernet/sfc/ptp.c
++++ b/drivers/net/ethernet/sfc/ptp.c
+@@@ -331,6 -331,24 +331,27 @@@ static int efx_phc_settime(struct ptp_c
+  static int efx_phc_enable(struct ptp_clock_info *ptp,
+  			  struct ptp_clock_request *request, int on);
+  
+++<<<<<<< HEAD
+++=======
++ bool efx_ptp_use_mac_tx_timestamps(struct efx_nic *efx)
++ {
++ 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++ 
++ 	return ((efx_nic_rev(efx) >= EFX_REV_HUNT_A0) &&
++ 		(nic_data->datapath_caps2 &
++ 		 (1 << MC_CMD_GET_CAPABILITIES_V2_OUT_TX_MAC_TIMESTAMPING_LBN)
++ 		));
++ }
++ 
++ /* PTP 'extra' channel is still a traffic channel, but we only create TX queues
++  * if PTP uses MAC TX timestamps, not if PTP uses the MC directly to transmit.
++  */
++ bool efx_ptp_want_txqs(struct efx_channel *channel)
++ {
++ 	return efx_ptp_use_mac_tx_timestamps(channel->efx);
++ }
++ 
+++>>>>>>> 2935e3c38228 (sfc: on 8000 series use TX queues for TX timestamps)
+  #define PTP_SW_STAT(ext_name, field_name)				\
+  	{ #ext_name, 0, offsetof(struct efx_ptp_data, field_name) }
+  #define PTP_MC_STAT(ext_name, mcdi_name)				\
+diff --cc drivers/net/ethernet/sfc/tx.c
+index 62b99b03d4e2,cece961f2e82..000000000000
+--- a/drivers/net/ethernet/sfc/tx.c
++++ b/drivers/net/ethernet/sfc/tx.c
+@@@ -830,6 -842,11 +830,14 @@@ void efx_init_tx_queue(struct efx_tx_qu
+  	tx_queue->old_read_count = 0;
+  	tx_queue->empty_read_count = 0 | EFX_EMPTY_COUNT_VALID;
+  	tx_queue->xmit_more_available = false;
+++<<<<<<< HEAD
+++=======
++ 	tx_queue->timestamping = (efx_ptp_use_mac_tx_timestamps(efx) &&
++ 				  tx_queue->channel == efx_ptp_channel(efx));
++ 	tx_queue->completed_desc_ptr = tx_queue->ptr_mask;
++ 	tx_queue->completed_timestamp_major = 0;
++ 	tx_queue->completed_timestamp_minor = 0;
+++>>>>>>> 2935e3c38228 (sfc: on 8000 series use TX queues for TX timestamps)
+  
+  	/* Set up default function pointers. These may get replaced by
+  	 * efx_nic_init_tx() based off NIC/queue capabilities.
+diff --git a/drivers/net/ethernet/sfc/ef10.c b/drivers/net/ethernet/sfc/ef10.c
+index caebb4cb203b..400517603bdd 100644
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -951,6 +951,11 @@ static int efx_ef10_link_piobufs(struct efx_nic *efx)
+ 
+ 	/* Link a buffer to each TX queue */
+ 	efx_for_each_channel(channel, efx) {
++		/* Extra channels, even those with TXQs (PTP), do not require
++		 * PIO resources.
++		 */
++		if (!channel->type->want_pio)
++			continue;
+ 		efx_for_each_channel_tx_queue(tx_queue, channel) {
+ 			/* We assign the PIO buffers to queues in
+ 			 * reverse order to allow for the following
+@@ -1298,7 +1303,9 @@ static int efx_ef10_dimension_resources(struct efx_nic *efx)
+ 	void __iomem *membase;
+ 	int rc;
+ 
+-	channel_vis = max(efx->n_channels, efx->n_tx_channels * EFX_TXQ_TYPES);
++	channel_vis = max(efx->n_channels,
++			  (efx->n_tx_channels + efx->n_extra_tx_channels) *
++			  EFX_TXQ_TYPES);
+ 
+ #ifdef EFX_USE_PIO
+ 	/* Try to allocate PIO buffers if wanted and if the full
+@@ -6200,7 +6207,8 @@ static int efx_ef10_ptp_set_ts_sync_events(struct efx_nic *efx, bool en,
+ 	      efx_ef10_rx_enable_timestamping :
+ 	      efx_ef10_rx_disable_timestamping;
+ 
+-	efx_for_each_channel(channel, efx) {
++	channel = efx_ptp_channel(efx);
++	if (channel) {
+ 		int rc = set(channel, temp);
+ 		if (en && rc != 0) {
+ 			efx_ef10_ptp_set_ts_sync_events(efx, false, temp);
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index f8a7c1e80cda..f86e1284d3d8 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -898,12 +898,20 @@ void efx_schedule_slow_fill(struct efx_rx_queue *rx_queue)
+ 	mod_timer(&rx_queue->slow_fill, jiffies + msecs_to_jiffies(100));
+ }
+ 
++bool efx_default_channel_want_txqs(struct efx_channel *channel)
++{
++	return channel->channel - channel->efx->tx_channel_offset <
++		channel->efx->n_tx_channels;
++}
++
+ static const struct efx_channel_type efx_default_channel_type = {
+ 	.pre_probe		= efx_channel_dummy_op_int,
+ 	.post_remove		= efx_channel_dummy_op_void,
+ 	.get_name		= efx_get_channel_name,
+ 	.copy			= efx_copy_channel,
++	.want_txqs		= efx_default_channel_want_txqs,
+ 	.keep_eventq		= false,
++	.want_pio		= true,
+ };
+ 
+ int efx_channel_dummy_op_int(struct efx_channel *channel)
+@@ -1503,6 +1511,7 @@ static int efx_probe_interrupts(struct efx_nic *efx)
+ 	}
+ 
+ 	/* Assign extra channels if possible */
++	efx->n_extra_tx_channels = 0;
+ 	j = efx->n_channels;
+ 	for (i = 0; i < EFX_MAX_EXTRA_CHANNELS; i++) {
+ 		if (!efx->extra_channel_type[i])
+@@ -1514,6 +1523,8 @@ static int efx_probe_interrupts(struct efx_nic *efx)
+ 			--j;
+ 			efx_get_channel(efx, j)->type =
+ 				efx->extra_channel_type[i];
++			if (efx_channel_has_tx_queues(efx_get_channel(efx, j)))
++				efx->n_extra_tx_channels++;
+ 		}
+ 	}
+ 
+diff --git a/drivers/net/ethernet/sfc/farch.c b/drivers/net/ethernet/sfc/farch.c
+index 6608dfe455b1..3c960b05d77c 100644
+--- a/drivers/net/ethernet/sfc/farch.c
++++ b/drivers/net/ethernet/sfc/farch.c
+@@ -1090,7 +1090,7 @@ efx_farch_handle_tx_flush_done(struct efx_nic *efx, efx_qword_t *event)
+ 	int qid;
+ 
+ 	qid = EFX_QWORD_FIELD(*event, FSF_AZ_DRIVER_EV_SUBDATA);
+-	if (qid < EFX_TXQ_TYPES * efx->n_tx_channels) {
++	if (qid < EFX_TXQ_TYPES * (efx->n_tx_channels + efx->n_extra_tx_channels)) {
+ 		tx_queue = efx_get_tx_queue(efx, qid / EFX_TXQ_TYPES,
+ 					    qid % EFX_TXQ_TYPES);
+ 		if (atomic_cmpxchg(&tx_queue->flush_outstanding, 1, 0)) {
+@@ -1680,20 +1680,21 @@ void efx_farch_rx_pull_indir_table(struct efx_nic *efx)
+  */
+ void efx_farch_dimension_resources(struct efx_nic *efx, unsigned sram_lim_qw)
+ {
+-	unsigned vi_count, buftbl_min;
++	unsigned vi_count, buftbl_min, total_tx_channels;
+ 
+ #ifdef CONFIG_SFC_SRIOV
+ 	struct siena_nic_data *nic_data = efx->nic_data;
+ #endif
+ 
++	total_tx_channels = efx->n_tx_channels + efx->n_extra_tx_channels;
+ 	/* Account for the buffer table entries backing the datapath channels
+ 	 * and the descriptor caches for those channels.
+ 	 */
+ 	buftbl_min = ((efx->n_rx_channels * EFX_MAX_DMAQ_SIZE +
+-		       efx->n_tx_channels * EFX_TXQ_TYPES * EFX_MAX_DMAQ_SIZE +
++		       total_tx_channels * EFX_TXQ_TYPES * EFX_MAX_DMAQ_SIZE +
+ 		       efx->n_channels * EFX_MAX_EVQ_SIZE)
+ 		      * sizeof(efx_qword_t) / EFX_BUF_SIZE);
+-	vi_count = max(efx->n_channels, efx->n_tx_channels * EFX_TXQ_TYPES);
++	vi_count = max(efx->n_channels, total_tx_channels * EFX_TXQ_TYPES);
+ 
+ #ifdef CONFIG_SFC_SRIOV
+ 	if (efx->type->sriov_wanted) {
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index 44753b252b1b..ff9d313e8745 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -518,8 +518,12 @@ struct efx_msi_context {
+  * @copy: Copy the channel state prior to reallocation.  May be %NULL if
+  *	reallocation is not supported.
+  * @receive_skb: Handle an skb ready to be passed to netif_receive_skb()
++ * @want_txqs: Determine whether this channel should have TX queues
++ *	created.  If %NULL, TX queues are not created.
+  * @keep_eventq: Flag for whether event queue should be kept initialised
+  *	while the device is stopped
++ * @want_pio: Flag for whether PIO buffers should be linked to this
++ *	channel's TX queues.
+  */
+ struct efx_channel_type {
+ 	void (*handle_no_channel)(struct efx_nic *);
+@@ -528,7 +532,9 @@ struct efx_channel_type {
+ 	void (*get_name)(struct efx_channel *, char *buf, size_t len);
+ 	struct efx_channel *(*copy)(const struct efx_channel *);
+ 	bool (*receive_skb)(struct efx_channel *, struct sk_buff *);
++	bool (*want_txqs)(struct efx_channel *);
+ 	bool keep_eventq;
++	bool want_pio;
+ };
+ 
+ enum efx_led_mode {
+@@ -731,6 +737,7 @@ struct vfdi_status;
+  * @n_channels: Number of channels in use
+  * @n_rx_channels: Number of channels used for RX (= number of RX queues)
+  * @n_tx_channels: Number of channels used for TX
++ * @n_extra_tx_channels: Number of extra channels with TX queues
+  * @rx_ip_align: RX DMA address offset to have IP header aligned in
+  *	in accordance with NET_IP_ALIGN
+  * @rx_dma_len: Current maximum RX DMA length
+@@ -877,6 +884,7 @@ struct efx_nic {
+ 	unsigned rss_spread;
+ 	unsigned tx_channel_offset;
+ 	unsigned n_tx_channels;
++	unsigned n_extra_tx_channels;
+ 	unsigned int rx_ip_align;
+ 	unsigned int rx_dma_len;
+ 	unsigned int rx_buffer_order;
+@@ -1359,8 +1367,8 @@ efx_get_tx_queue(struct efx_nic *efx, unsigned index, unsigned type)
+ 
+ static inline bool efx_channel_has_tx_queues(struct efx_channel *channel)
+ {
+-	return channel->channel - channel->efx->tx_channel_offset <
+-		channel->efx->n_tx_channels;
++	return channel->type && channel->type->want_txqs &&
++				channel->type->want_txqs(channel);
+ }
+ 
+ static inline struct efx_tx_queue *
+* Unmerged path drivers/net/ethernet/sfc/ptp.c
+* Unmerged path drivers/net/ethernet/sfc/tx.c
