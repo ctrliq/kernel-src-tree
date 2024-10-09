@@ -1,0 +1,123 @@
+vfs/proc/kcore, x86/mm/kcore: Fix SMAP fault when dumping vsyscall user page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jia Zhang <zhang.jia@linux.alibaba.com>
+commit 595dd46ebfc10be041a365d0a3fa99df50b6ba73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/595dd46e.failed
+
+Commit:
+
+  df04abfd181a ("fs/proc/kcore.c: Add bounce buffer for ktext data")
+
+... introduced a bounce buffer to work around CONFIG_HARDENED_USERCOPY=y.
+However, accessing the vsyscall user page will cause an SMAP fault.
+
+Replace memcpy() with copy_from_user() to fix this bug works, but adding
+a common way to handle this sort of user page may be useful for future.
+
+Currently, only vsyscall page requires KCORE_USER.
+
+	Signed-off-by: Jia Zhang <zhang.jia@linux.alibaba.com>
+	Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: jolsa@redhat.com
+Link: http://lkml.kernel.org/r/1518446694-21124-2-git-send-email-zhang.jia@linux.alibaba.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 595dd46ebfc10be041a365d0a3fa99df50b6ba73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init_64.c
+diff --cc arch/x86/mm/init_64.c
+index 25c65b6af83e,6aa33d1e198f..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -1024,38 -1180,24 +1024,43 @@@ void __init mem_init(void
+  
+  	/* clear_bss() already clear the empty_zero_page */
+  
+ -	/* this will put all memory onto the freelists */
+ -	free_all_bootmem();
+ -	after_bootmem = 1;
+ -
+ -	/*
+ -	 * Must be done after boot memory is put on freelist, because here we
+ -	 * might set fields in deferred struct pages that have not yet been
+ -	 * initialized, and free_all_bootmem() initializes all the reserved
+ -	 * deferred pages for us.
+ -	 */
+  	register_page_bootmem_info();
+  
+++<<<<<<< HEAD
+ +	/* this will put all memory onto the freelists */
+ +	totalram_pages = free_all_bootmem();
+++=======
++ 	/* Register memory areas for /proc/kcore */
++ 	kclist_add(&kcore_vsyscall, (void *)VSYSCALL_ADDR, PAGE_SIZE, KCORE_USER);
+++>>>>>>> 595dd46ebfc1 (vfs/proc/kcore, x86/mm/kcore: Fix SMAP fault when dumping vsyscall user page)
+ +
+ +	absent_pages = absent_pages_in_range(0, max_pfn);
+ +	reservedpages = max_pfn - totalram_pages - absent_pages;
+ +	after_bootmem = 1;
+  
+ -	mem_init_print_info(NULL);
+ +	codesize =  (unsigned long) &_etext - (unsigned long) &_text;
+ +	datasize =  (unsigned long) &_edata - (unsigned long) &_etext;
+ +	initsize =  (unsigned long) &__init_end - (unsigned long) &__init_begin;
+ +
+ +	/* Register memory areas for /proc/kcore */
+ +	kclist_add(&kcore_vsyscall, (void *)VSYSCALL_START,
+ +			 VSYSCALL_END - VSYSCALL_START, KCORE_OTHER);
+ +
+ +	printk(KERN_INFO "Memory: %luk/%luk available (%ldk kernel code, "
+ +			 "%ldk absent, %ldk reserved, %ldk data, %ldk init)\n",
+ +		nr_free_pages() << (PAGE_SHIFT-10),
+ +		max_pfn << (PAGE_SHIFT-10),
+ +		codesize >> 10,
+ +		absent_pages << (PAGE_SHIFT-10),
+ +		reservedpages << (PAGE_SHIFT-10),
+ +		datasize >> 10,
+ +		initsize >> 10);
+  }
+  
+ +#ifdef CONFIG_DEBUG_RODATA
+ +const int rodata_test_data = 0xC3;
+ +EXPORT_SYMBOL_GPL(rodata_test_data);
+ +
+  int kernel_set_to_readonly;
+  
+  void set_kernel_text_rw(void)
+* Unmerged path arch/x86/mm/init_64.c
+diff --git a/fs/proc/kcore.c b/fs/proc/kcore.c
+index 14908c719fef..89982e107324 100644
+--- a/fs/proc/kcore.c
++++ b/fs/proc/kcore.c
+@@ -509,6 +509,10 @@ read_kcore(struct file *file, char __user *buffer, size_t buflen, loff_t *fpos)
+ 			/* we have to zero-fill user buffer even if no read */
+ 			if (copy_to_user(buffer, buf, tsz))
+ 				return -EFAULT;
++		} else if (m->type == KCORE_USER) {
++			/* User page is handled prior to normal kernel page: */
++			if (copy_to_user(buffer, (char *)start, tsz))
++				return -EFAULT;
+ 		} else {
+ 			if (kern_addr_valid(start)) {
+ 				/*
+diff --git a/include/linux/kcore.h b/include/linux/kcore.h
+index d92762286645..3ffade4f2798 100644
+--- a/include/linux/kcore.h
++++ b/include/linux/kcore.h
+@@ -9,6 +9,7 @@ enum kcore_type {
+ 	KCORE_VMALLOC,
+ 	KCORE_RAM,
+ 	KCORE_VMEMMAP,
++	KCORE_USER,
+ 	KCORE_OTHER,
+ };
+ 
