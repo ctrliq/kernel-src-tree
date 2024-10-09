@@ -1,0 +1,177 @@
+nvme: add new reconnecting controller state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] add new reconnecting controller state (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 92.50%
+commit-author Christoph Hellwig <hch@lst.de>
+commit def61eca9632af0559931f047c49d2762401857c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/def61eca.failed
+
+The nvme fabric (RDMA, FC, etc...) can introduce port, link or node
+failures that may require a reconnect to re-establish the connection.
+
+Add a new reconnecting state that will initially be used by the RDMA
+driver.
+
+	Reviewed-by: Jay Freyensee <james.p.freyensee@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit def61eca9632af0559931f047c49d2762401857c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index 63f6b5f40b5c,4babdf0d895c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -56,6 -59,94 +56,97 @@@ DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ void nvme_cancel_request(struct request *req, void *data, bool reserved)
++ {
++ 	int status;
++ 
++ 	if (!blk_mq_request_started(req))
++ 		return;
++ 
++ 	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
++ 				"Cancelling I/O %d", req->tag);
++ 
++ 	status = NVME_SC_ABORT_REQ;
++ 	if (blk_queue_dying(req->q))
++ 		status |= NVME_SC_DNR;
++ 	blk_mq_complete_request(req, status);
++ }
++ EXPORT_SYMBOL_GPL(nvme_cancel_request);
++ 
++ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
++ 		enum nvme_ctrl_state new_state)
++ {
++ 	enum nvme_ctrl_state old_state = ctrl->state;
++ 	bool changed = false;
++ 
++ 	spin_lock_irq(&ctrl->lock);
++ 	switch (new_state) {
++ 	case NVME_CTRL_LIVE:
++ 		switch (old_state) {
++ 		case NVME_CTRL_NEW:
++ 		case NVME_CTRL_RESETTING:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_RESETTING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_NEW:
++ 		case NVME_CTRL_LIVE:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_RECONNECTING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_LIVE:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DELETING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_LIVE:
++ 		case NVME_CTRL_RESETTING:
++ 		case NVME_CTRL_RECONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DEAD:
++ 		switch (old_state) {
++ 		case NVME_CTRL_DELETING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	spin_unlock_irq(&ctrl->lock);
++ 
++ 	if (changed)
++ 		ctrl->state = new_state;
++ 
++ 	return changed;
++ }
++ EXPORT_SYMBOL_GPL(nvme_change_ctrl_state);
++ 
+++>>>>>>> def61eca9632 (nvme: add new reconnecting controller state)
+  static void nvme_free_ns(struct kref *kref)
+  {
+  	struct nvme_ns *ns = container_of(kref, struct nvme_ns, kref);
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,abe83b43a71a..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -60,24 -68,23 +60,35 @@@ enum nvme_quirks 
+  	 * logical blocks.
+  	 */
+  	NVME_QUIRK_DISCARD_ZEROES		= (1 << 2),
+ +
+ +	/*
+ +	 * The controller needs a delay before starts checking the device
+ +	 * readiness, which is done by reading the NVME_CSTS_RDY bit.
+ +	 */
+ +	NVME_QUIRK_DELAY_BEFORE_CHK_RDY		= (1 << 3),
+  };
+  
+++<<<<<<< HEAD
+ +/* The below value is the specific amount of delay needed before checking
+ + * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
+ + * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
+ + * found empirically.
+ + */
+ +#define NVME_QUIRK_DELAY_AMOUNT		2000
+++=======
++ enum nvme_ctrl_state {
++ 	NVME_CTRL_NEW,
++ 	NVME_CTRL_LIVE,
++ 	NVME_CTRL_RESETTING,
++ 	NVME_CTRL_RECONNECTING,
++ 	NVME_CTRL_DELETING,
++ 	NVME_CTRL_DEAD,
++ };
+++>>>>>>> def61eca9632 (nvme: add new reconnecting controller state)
+  
+  struct nvme_ctrl {
+ -	enum nvme_ctrl_state state;
+ -	spinlock_t lock;
+  	const struct nvme_ctrl_ops *ops;
+  	struct request_queue *admin_q;
+ -	struct request_queue *connect_q;
+  	struct device *dev;
+  	struct kref kref;
+  	int instance;
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
