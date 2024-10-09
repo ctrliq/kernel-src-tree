@@ -1,0 +1,196 @@
+ovl: merge getattr for dir and nondir
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 5b712091a3a3904b0ae8311e18e6b540a070d464
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5b712091.failed
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 5b712091a3a3904b0ae8311e18e6b540a070d464)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/dir.c
+index c82fdefe6d3b,f4cf2928cf8e..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -121,40 -127,17 +121,43 @@@ int ovl_create_real(struct inode *dir, 
+  	return err;
+  }
+  
+ -static int ovl_set_opaque(struct dentry *dentry, struct dentry *upperdentry)
+ +static int ovl_set_opaque(struct dentry *upperdentry)
+ +{
+ +	return ovl_do_setxattr(upperdentry, OVL_XATTR_OPAQUE, "y", 1, 0);
+ +}
+ +
+++<<<<<<< HEAD
+ +static int ovl_dir_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ +			 struct kstat *stat)
+  {
+  	int err;
+ +	enum ovl_path_type type;
+ +	struct path realpath;
+ +	const struct cred *old_cred;
+  
+ -	err = ovl_do_setxattr(upperdentry, OVL_XATTR_OPAQUE, "y", 1, 0);
+ -	if (!err)
+ -		ovl_dentry_set_opaque(dentry);
+ +	type = ovl_path_real(dentry, &realpath);
+ +	old_cred = ovl_override_creds(dentry->d_sb);
+ +	err = vfs_getattr(&realpath, stat);
+ +	revert_creds(old_cred);
+ +	if (err)
+ +		return err;
+  
+ -	return err;
+ +	stat->dev = dentry->d_sb->s_dev;
+ +	stat->ino = dentry->d_inode->i_ino;
+ +
+ +	/*
+ +	 * It's probably not worth it to count subdirs to get the
+ +	 * correct link count.  nlink=1 seems to pacify 'find' and
+ +	 * other utilities.
+ +	 */
+ +	if (OVL_TYPE_MERGE(type))
+ +		stat->nlink = 1;
+ +
+ +	return 0;
+  }
+  
+++=======
+++>>>>>>> 5b712091a3a3 (ovl: merge getattr for dir and nondir)
+  /* Common operations required to be done after creation of file on upper */
+  static void ovl_instantiate(struct dentry *dentry, struct inode *inode,
+  			    struct dentry *newdentry, bool hardlink)
+@@@ -1013,13 -1040,8 +1016,17 @@@ const struct inode_operations_wrapper o
+  	.create		= ovl_create,
+  	.mknod		= ovl_mknod,
+  	.permission	= ovl_permission,
+++<<<<<<< HEAD
+ +	.getattr	= ovl_dir_getattr,
+ +	.setxattr	= generic_setxattr,
+ +	.getxattr	= generic_getxattr,
+++=======
++ 	.getattr	= ovl_getattr,
+++>>>>>>> 5b712091a3a3 (ovl: merge getattr for dir and nondir)
+  	.listxattr	= ovl_listxattr,
+ +	.removexattr	= generic_removexattr,
+  	.get_acl	= ovl_get_acl,
+  	.update_time	= ovl_update_time,
+ +	},
+ +	.rename2	= ovl_rename2,
+  };
+diff --cc fs/overlayfs/inode.c
+index 470081ef3bc4,ad9547f82da5..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -78,17 -57,78 +78,84 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int ovl_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ +			 struct kstat *stat)
+++=======
++ int ovl_getattr(const struct path *path, struct kstat *stat,
++ 		u32 request_mask, unsigned int flags)
+++>>>>>>> 5b712091a3a3 (ovl: merge getattr for dir and nondir)
+  {
+ -	struct dentry *dentry = path->dentry;
+ -	enum ovl_path_type type;
+  	struct path realpath;
+  	const struct cred *old_cred;
++ 	bool is_dir = S_ISDIR(dentry->d_inode->i_mode);
+  	int err;
+  
+ -	type = ovl_path_real(dentry, &realpath);
+ +	ovl_path_real(dentry, &realpath);
+  	old_cred = ovl_override_creds(dentry->d_sb);
+++<<<<<<< HEAD
+ +	err = vfs_getattr(&realpath, stat);
+++=======
++ 	err = vfs_getattr(&realpath, stat, request_mask, flags);
++ 	if (err)
++ 		goto out;
++ 
++ 	/*
++ 	 * When all layers are on the same fs, all real inode number are
++ 	 * unique, so we use the overlay st_dev, which is friendly to du -x.
++ 	 *
++ 	 * We also use st_ino of the copy up origin, if we know it.
++ 	 * This guaranties constant st_dev/st_ino across copy up.
++ 	 *
++ 	 * If filesystem supports NFS export ops, this also guaranties
++ 	 * persistent st_ino across mount cycle.
++ 	 */
++ 	if (ovl_same_sb(dentry->d_sb)) {
++ 		if (OVL_TYPE_ORIGIN(type)) {
++ 			struct kstat lowerstat;
++ 			u32 lowermask = STATX_INO | (!is_dir ? STATX_NLINK : 0);
++ 
++ 			ovl_path_lower(dentry, &realpath);
++ 			err = vfs_getattr(&realpath, &lowerstat,
++ 					  lowermask, flags);
++ 			if (err)
++ 				goto out;
++ 
++ 			WARN_ON_ONCE(stat->dev != lowerstat.dev);
++ 			/*
++ 			 * Lower hardlinks are broken on copy up to different
++ 			 * upper files, so we cannot use the lower origin st_ino
++ 			 * for those different files, even for the same fs case.
++ 			 */
++ 			if (is_dir || lowerstat.nlink == 1)
++ 				stat->ino = lowerstat.ino;
++ 		}
++ 		stat->dev = dentry->d_sb->s_dev;
++ 	} else if (is_dir) {
++ 		/*
++ 		 * If not all layers are on the same fs the pair {real st_ino;
++ 		 * overlay st_dev} is not unique, so use the non persistent
++ 		 * overlay st_ino.
++ 		 *
++ 		 * Always use the overlay st_dev for directories, so 'find
++ 		 * -xdev' will scan the entire overlay mount and won't cross the
++ 		 * overlay mount boundaries.
++ 		 */
++ 		stat->dev = dentry->d_sb->s_dev;
++ 		stat->ino = dentry->d_inode->i_ino;
++ 	}
++ 
++ 	/*
++ 	 * It's probably not worth it to count subdirs to get the
++ 	 * correct link count.  nlink=1 seems to pacify 'find' and
++ 	 * other utilities.
++ 	 */
++ 	if (is_dir && OVL_TYPE_MERGE(type))
++ 		stat->nlink = 1;
++ 
++ out:
+++>>>>>>> 5b712091a3a3 (ovl: merge getattr for dir and nondir)
+  	revert_creds(old_cred);
+ -
+  	return err;
+  }
+  
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/inode.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 952ccab31629..51f6a4cf11b1 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -184,6 +184,8 @@ void ovl_workdir_cleanup(struct inode *dir, struct vfsmount *mnt,
+ 
+ /* inode.c */
+ int ovl_setattr(struct dentry *dentry, struct iattr *attr);
++int ovl_getattr(const struct path *path, struct kstat *stat,
++		u32 request_mask, unsigned int flags);
+ int ovl_permission(struct inode *inode, int mask);
+ int ovl_xattr_set(struct dentry *dentry, const char *name, const void *value,
+ 		  size_t size, int flags);
