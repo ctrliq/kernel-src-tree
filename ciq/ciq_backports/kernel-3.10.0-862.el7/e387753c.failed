@@ -1,0 +1,145 @@
+s390/zcrypt: Fix kernel crash on systems without AP bus support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Fix kernel crash on systems without AP bus support (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 95.87%
+commit-author Sascha Silbe <silbe@linux.vnet.ibm.com>
+commit e387753c5fb4ae40393ba3f00b7958744670cac2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e387753c.failed
+
+On systems without AP bus (e.g. KVM) the kernel crashes during init
+calls when zcrypt is built-in:
+
+kernel BUG at drivers/base/driver.c:153!
+illegal operation: 0001 ilc:1 [#1] SMP
+Modules linked in:
+CPU: 1 PID: 1 Comm: swapper/0 Not tainted 4.2.0+ #221
+task: 0000000010a40000 ti: 0000000010a48000 task.ti:0000000010a48000
+Krnl PSW : 0704c00180000000 0000000000592bd6(driver_register+0x106/0x140)
+           R:0 T:1 IO:1 EX:1 Key:0 M:1 W:0 P:0 AS:3 CC:0 PM:0 EA:3
+           0000000000000012 0000000000000000 0000000000c45328 0000000000c44e30
+           00000000009ef63c 000000000067f598 0000000000cf3c58 0000000000000000
+           000000000000007b 0000000000cb1030 0000000000000002 0000000000000000
+           0000000000ca8580 0000000010306700 00000000001001d8 0000000010a4bd88
+Krnl Code: 0000000000592bc6: f0b00004ebcf	srp 4(12,%r0),3023(%r14),0
+           0000000000592bcc: f0a0000407f4       srp     4(11,%r0),2036,0
+          #0000000000592bd2: a7f40001           brc     15,592bd4
+          >0000000000592bd6: e330d0000004       lg      %r3,0(%r13)
+           0000000000592bdc: c0200021edfd       larl    %r2,9d07d6
+           0000000000592be2: c0e500126d8f       brasl   %r14,7e0700
+           0000000000592be8: e330d0080004       lg      %r3,8(%r13)
+           0000000000592bee: a7f4ffab           brc     15,592b44
+Call Trace:
+([<00000000001001c8>] do_one_initcall+0x90/0x1d0)
+ [<0000000000c6dd34>] kernel_init_freeable+0x1e4/0x2a0
+ [<00000000007db53a>] kernel_init+0x2a/0x120
+ [<00000000007e8ece>] kernel_thread_starter+0x6/0xc
+ [<00000000007e8ec8>] kernel_thread_starter+0x0/0xc
+Last Breaking-Event-Address:
+ [<0000000000592bd2>] driver_register+0x102/0x140
+
+When zcrypt is built as a module, the module loader ensures that the
+driver modules cannot be loaded if the AP bus module returns an error
+during initialisation. But if zcrypt and the driver are built-in, the
+driver is getting initialised even if the AP bus initialisation
+failed. The driver invokes ap_driver_register() during initialisation,
+which then causes operations on uninitialised data structures to be
+performed.
+
+Explicitly protect ap_driver_register() by introducing an
+"initialised" flag that gets set iff the AP bus initialisation was
+successful. When the AP bus initialisation failed,
+ap_driver_register() will error out with -ENODEV, causing the driver
+initialisation to fail as well.
+
+Test results:
+1. Inside KVM (no AP bus), zcrypt built-in
+
+   Boots. /sys/bus/ap not present (expected).
+
+2. Inside KVM (no AP bus), zcrypt as module
+
+   Boots. Loading zcrypt_cex4 fails because loading ap_bus fails
+   (expected).
+
+3. On LPAR with CEX5, zcrypt built-in
+
+   Boots. /sys/bus/ap/devices/card* present but .../card*/type missing
+   (i.e. zcrypt_device_register() fails, unrelated issue).
+
+4. On LPAR with CEX5, zcrypt as module
+
+   Boots. Loading zcrypt_cex4 successful,
+   /sys/bus/ap/devices/card*/type present. No further testing
+   (user-space functionality) was done.
+
+	Signed-off-by: Sascha Silbe <silbe@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit e387753c5fb4ae40393ba3f00b7958744670cac2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,61f768518a34..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -95,14 -74,15 +95,15 @@@ static struct device *ap_root_device = 
+  static struct ap_config_info *ap_configuration;
+  static DEFINE_SPINLOCK(ap_device_list_lock);
+  static LIST_HEAD(ap_device_list);
++ static bool initialised;
+  
+  /*
+ - * Workqueue timer for bus rescan.
+ + * Workqueue & timer for bus rescan.
+   */
+ +static struct workqueue_struct *ap_work_queue;
+  static struct timer_list ap_config_timer;
+  static int ap_config_time = AP_CONFIG_TIME;
+ -static void ap_scan_bus(struct work_struct *);
+ -static DECLARE_WORK(ap_scan_work, ap_scan_bus);
+ +static DECLARE_WORK(ap_config_work, ap_scan_bus);
+  
+  /*
+   * Tasklet & timer for AP request polling and interrupts
+@@@ -2119,13 -1807,19 +2123,23 @@@ int __init ap_module_init(void
+  			goto out_work;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	rc = register_pm_notifier(&ap_power_notifier);
++ 	if (rc)
++ 		goto out_pm;
++ 
++ 	queue_work(system_long_wq, &ap_scan_work);
++ 	initialised = true;
++ 
+++>>>>>>> e387753c5fb4 (s390/zcrypt: Fix kernel crash on systems without AP bus support)
+  	return 0;
+  
+ -out_pm:
+ -	ap_poll_thread_stop();
+  out_work:
+ +	del_timer_sync(&ap_config_timer);
+  	hrtimer_cancel(&ap_poll_timer);
+ +	destroy_workqueue(ap_work_queue);
+ +out_root:
+  	root_device_unregister(ap_root_device);
+  out_bus:
+  	while (i--)
+@@@ -2151,8 -1841,8 +2165,9 @@@ static int __ap_match_all(struct devic
+  void ap_module_exit(void)
+  {
+  	int i;
+ +	struct device *dev;
+  
++ 	initialised = false;
+  	ap_reset_domain();
+  	ap_poll_thread_stop();
+  	del_timer_sync(&ap_config_timer);
+* Unmerged path drivers/s390/crypto/ap_bus.c
