@@ -1,0 +1,178 @@
+power_supply: Add API for safe access of power supply function attrs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Krzysztof Kozlowski <k.kozlowski@samsung.com>
+commit bc1540561c9ede1efb6d7bf44804676d3d02a3cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bc154056.failed
+
+Add simple wrappers for accessing power supply's function attributes:
+ - get_property -> power_supply_get_property
+ - set_property -> power_supply_set_property
+ - property_is_writeable -> power_supply_property_is_writeable
+ - external_power_changed -> power_supply_external_power_changed
+
+This API along with atomic usage counter adds a safe way of accessing a
+power supply from another driver. If power supply is unregistered after
+obtaining reference to it by some driver, then the API wrappers won't be
+executed in invalid (freed) context.
+
+Next patch changing the ownership of power supply class is still needed
+to fully fix race conditions in accessing freed power supply.
+
+	Signed-off-by: Krzysztof Kozlowski <k.kozlowski@samsung.com>
+	Reviewed-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Reviewed-by: Sebastian Reichel <sre@kernel.org>
+	Acked-by: Pavel Machek <pavel@ucw.cz>
+	Signed-off-by: Sebastian Reichel <sre@kernel.org>
+(cherry picked from commit bc1540561c9ede1efb6d7bf44804676d3d02a3cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/power/power_supply_core.c
+diff --cc drivers/power/power_supply_core.c
+index 0d8164e2f763,583dece8845b..000000000000
+--- a/drivers/power/power_supply_core.c
++++ b/drivers/power/power_supply_core.c
+@@@ -331,6 -342,73 +333,76 @@@ struct power_supply *power_supply_get_b
+  }
+  EXPORT_SYMBOL_GPL(power_supply_get_by_name);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_OF
++ static int power_supply_match_device_node(struct device *dev, const void *data)
++ {
++ 	return dev->parent && dev->parent->of_node == data;
++ }
++ 
++ struct power_supply *power_supply_get_by_phandle(struct device_node *np,
++ 							const char *property)
++ {
++ 	struct device_node *power_supply_np;
++ 	struct device *dev;
++ 
++ 	power_supply_np = of_parse_phandle(np, property, 0);
++ 	if (!power_supply_np)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	dev = class_find_device(power_supply_class, NULL, power_supply_np,
++ 						power_supply_match_device_node);
++ 
++ 	of_node_put(power_supply_np);
++ 
++ 	return dev ? dev_get_drvdata(dev) : NULL;
++ }
++ EXPORT_SYMBOL_GPL(power_supply_get_by_phandle);
++ #endif /* CONFIG_OF */
++ 
++ int power_supply_get_property(struct power_supply *psy,
++ 			    enum power_supply_property psp,
++ 			    union power_supply_propval *val)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0)
++ 		return -ENODEV;
++ 
++ 	return psy->get_property(psy, psp, val);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_get_property);
++ 
++ int power_supply_set_property(struct power_supply *psy,
++ 			    enum power_supply_property psp,
++ 			    const union power_supply_propval *val)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 || !psy->set_property)
++ 		return -ENODEV;
++ 
++ 	return psy->set_property(psy, psp, val);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_set_property);
++ 
++ int power_supply_property_is_writeable(struct power_supply *psy,
++ 					enum power_supply_property psp)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 || !psy->property_is_writeable)
++ 		return -ENODEV;
++ 
++ 	return psy->property_is_writeable(psy, psp);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_property_is_writeable);
++ 
++ void power_supply_external_power_changed(struct power_supply *psy)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 || !psy->external_power_changed)
++ 		return;
++ 
++ 	psy->external_power_changed(psy);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_external_power_changed);
++ 
+++>>>>>>> bc1540561c9e (power_supply: Add API for safe access of power supply function attrs)
+  int power_supply_powers(struct power_supply *psy, struct device *dev)
+  {
+  	return sysfs_create_link(&psy->dev->kobj, &dev->kobj, "powers");
+@@@ -506,6 -598,17 +578,20 @@@ int __power_supply_register(struct devi
+  	dev->release = power_supply_dev_release;
+  	dev_set_drvdata(dev, psy);
+  	psy->dev = dev;
+++<<<<<<< HEAD
+++=======
++ 	atomic_inc(&psy->use_cnt);
++ 	if (cfg) {
++ 		psy->drv_data = cfg->drv_data;
++ 		psy->of_node = cfg->of_node;
++ 		psy->supplied_to = cfg->supplied_to;
++ 		psy->num_supplicants = cfg->num_supplicants;
++ 	}
++ 
++ 	rc = dev_set_name(dev, "%s", psy->name);
++ 	if (rc)
++ 		goto dev_set_name_failed;
+++>>>>>>> bc1540561c9e (power_supply: Add API for safe access of power supply function attrs)
+  
+  	INIT_WORK(&psy->changed_work, power_supply_changed_work);
+  
+* Unmerged path drivers/power/power_supply_core.c
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index b5a0d5291835..5a7415b86731 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -178,6 +178,12 @@ struct power_supply {
+ 	size_t num_supplies;
+ 	struct device_node *of_node;
+ 
++	/*
++	 * Functions for drivers implementing power supply class.
++	 * These shouldn't be called directly by other drivers for accessing
++	 * this power supply. Instead use power_supply_*() functions (for
++	 * example power_supply_get_property()).
++	 */
+ 	int (*get_property)(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    union power_supply_propval *val);
+@@ -200,6 +206,7 @@ struct power_supply {
+ 	struct work_struct changed_work;
+ 	spinlock_t changed_lock;
+ 	bool changed;
++	atomic_t use_cnt;
+ #ifdef CONFIG_THERMAL
+ 	struct thermal_zone_device *tzd;
+ 	struct thermal_cooling_device *tcd;
+@@ -249,6 +256,15 @@ extern int power_supply_is_system_supplied(void);
+ static inline int power_supply_is_system_supplied(void) { return -ENOSYS; }
+ #endif
+ 
++extern int power_supply_get_property(struct power_supply *psy,
++			    enum power_supply_property psp,
++			    union power_supply_propval *val);
++extern int power_supply_set_property(struct power_supply *psy,
++			    enum power_supply_property psp,
++			    const union power_supply_propval *val);
++extern int power_supply_property_is_writeable(struct power_supply *psy,
++					enum power_supply_property psp);
++extern void power_supply_external_power_changed(struct power_supply *psy);
+ extern int power_supply_register(struct device *parent,
+ 				 struct power_supply *psy);
+ extern int power_supply_register_no_ws(struct device *parent,
