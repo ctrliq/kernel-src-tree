@@ -1,0 +1,282 @@
+IB/IPoIB: Allow setting the device address
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mark Bloch <markb@mellanox.com>
+commit 492a7e67ff83fc59adb768de25ccaecd33d46beb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/492a7e67.failed
+
+In IB networks, and specifically in IPoIB/rdmacm traffic, the device
+address of an IPoIB interface is used as a means to exchange information
+between nodes needed for communication.
+
+Currently an IPoIB interface will always be created with a device
+address based on its node GUID without a way to change that.
+
+This change adds the ability to set the device address of an IPoIB
+interface by value. We use the set mac address ndo to do that.
+
+The flow should be broken down to two:
+1) The GID value is already in the GID table,
+   in this case the interface will be able to set carrier up.
+
+2) The GID value is not yet in the GID table,
+   in this case the interface won't try to join the multicast group
+   and will wait (listen on GID_CHANGE event) until the GID is inserted.
+
+In order to track those changes, we add a new flag:
+* IPOIB_FLAG_DEV_ADDR_SET.
+
+When set, it means the dev_addr is a based on a value in the gid
+table. this bit will be cleared upon a dev_addr change triggered
+by the user and set after validation.
+
+Per IB spec the port GUID can't change if the module is loaded.
+port GUID is the basis for GID at index 0 which is the basis for
+the default device address of a ipoib interface.
+
+The issue is that there are devices that don't follow the spec,
+they change the port GUID while HCA is powered on, so in order
+not to break userspace applications. We need to check if the
+user wanted to control the device address and we assume that
+if he sets the device address back to be based on GID index 0,
+he no longer wishs to control it.
+
+In order to track this, we add an additional flag:
+* IPOIB_FLAG_DEV_ADDR_CTRL
+
+When setting the device address, there is no validation of the upper
+twelve bytes of the device address (flags, qpn, subnet prefix) as those
+bytes are not under the control of the user.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 492a7e67ff83fc59adb768de25ccaecd33d46beb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 379887a88961,2c3fb5337bc1..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1734,7 -1722,8 +1735,12 @@@ static const struct net_device_ops ipoi
+  	.ndo_set_vf_link_state	 = ipoib_set_vf_link_state,
+  	.ndo_get_vf_config	 = ipoib_get_vf_config,
+  	.ndo_get_vf_stats	 = ipoib_get_vf_stats,
+++<<<<<<< HEAD
+ +	.extended.ndo_set_vf_guid	 = ipoib_set_vf_guid,
+++=======
++ 	.ndo_set_vf_guid	 = ipoib_set_vf_guid,
++ 	.ndo_set_mac_address	 = ipoib_set_mac,
+++>>>>>>> 492a7e67ff83 (IB/IPoIB: Allow setting the device address)
+  };
+  
+  static const struct net_device_ops ipoib_netdev_ops_vf = {
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index cdf4a79551a0..97dcc4787a30 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -94,6 +94,8 @@ enum {
+ 	IPOIB_FLAG_UMCAST	  = 10,
+ 	IPOIB_STOP_NEIGH_GC	  = 11,
+ 	IPOIB_NEIGH_TBL_FLUSH	  = 12,
++	IPOIB_FLAG_DEV_ADDR_SET	  = 13,
++	IPOIB_FLAG_DEV_ADDR_CTRL  = 14,
+ 
+ 	IPOIB_MAX_BACKOFF_SECONDS = 16,
+ 
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_ib.c b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+index b5ff0e81b73d..360dfb97b4a7 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -997,6 +997,106 @@ static inline int update_child_pkey(struct ipoib_dev_priv *priv)
+ 	return 0;
+ }
+ 
++/*
++ * returns true if the device address of the ipoib interface has changed and the
++ * new address is a valid one (i.e in the gid table), return false otherwise.
++ */
++static bool ipoib_dev_addr_changed_valid(struct ipoib_dev_priv *priv)
++{
++	union ib_gid search_gid;
++	union ib_gid gid0;
++	union ib_gid *netdev_gid;
++	int err;
++	u16 index;
++	u8 port;
++	bool ret = false;
++
++	netdev_gid = (union ib_gid *)(priv->dev->dev_addr + 4);
++	if (ib_query_gid(priv->ca, priv->port, 0, &gid0, NULL))
++		return false;
++
++	netif_addr_lock(priv->dev);
++
++	/* The subnet prefix may have changed, update it now so we won't have
++	 * to do it later
++	 */
++	priv->local_gid.global.subnet_prefix = gid0.global.subnet_prefix;
++	netdev_gid->global.subnet_prefix = gid0.global.subnet_prefix;
++	search_gid.global.subnet_prefix = gid0.global.subnet_prefix;
++
++	search_gid.global.interface_id = priv->local_gid.global.interface_id;
++
++	netif_addr_unlock(priv->dev);
++
++	err = ib_find_gid(priv->ca, &search_gid, IB_GID_TYPE_IB,
++			  priv->dev, &port, &index);
++
++	netif_addr_lock(priv->dev);
++
++	if (search_gid.global.interface_id !=
++	    priv->local_gid.global.interface_id)
++		/* There was a change while we were looking up the gid, bail
++		 * here and let the next work sort this out
++		 */
++		goto out;
++
++	/* The next section of code needs some background:
++	 * Per IB spec the port GUID can't change if the HCA is powered on.
++	 * port GUID is the basis for GID at index 0 which is the basis for
++	 * the default device address of a ipoib interface.
++	 *
++	 * so it seems the flow should be:
++	 * if user_changed_dev_addr && gid in gid tbl
++	 *	set bit dev_addr_set
++	 *	return true
++	 * else
++	 *	return false
++	 *
++	 * The issue is that there are devices that don't follow the spec,
++	 * they change the port GUID when the HCA is powered, so in order
++	 * not to break userspace applications, We need to check if the
++	 * user wanted to control the device address and we assume that
++	 * if he sets the device address back to be based on GID index 0,
++	 * he no longer wishs to control it.
++	 *
++	 * If the user doesn't control the the device address,
++	 * IPOIB_FLAG_DEV_ADDR_SET is set and ib_find_gid failed it means
++	 * the port GUID has changed and GID at index 0 has changed
++	 * so we need to change priv->local_gid and priv->dev->dev_addr
++	 * to reflect the new GID.
++	 */
++	if (!test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
++		if (!err && port == priv->port) {
++			set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
++			if (index == 0)
++				clear_bit(IPOIB_FLAG_DEV_ADDR_CTRL,
++					  &priv->flags);
++			else
++				set_bit(IPOIB_FLAG_DEV_ADDR_CTRL, &priv->flags);
++			ret = true;
++		} else {
++			ret = false;
++		}
++	} else {
++		if (!err && port == priv->port) {
++			ret = true;
++		} else {
++			if (!test_bit(IPOIB_FLAG_DEV_ADDR_CTRL, &priv->flags)) {
++				memcpy(&priv->local_gid, &gid0,
++				       sizeof(priv->local_gid));
++				memcpy(priv->dev->dev_addr + 4, &gid0,
++				       sizeof(priv->local_gid));
++				ret = true;
++			}
++		}
++	}
++
++out:
++	netif_addr_unlock(priv->dev);
++
++	return ret;
++}
++
+ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+ 				enum ipoib_flush_level level,
+ 				int nesting)
+@@ -1018,6 +1118,9 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+ 
+ 	if (!test_bit(IPOIB_FLAG_INITIALIZED, &priv->flags) &&
+ 	    level != IPOIB_FLUSH_HEAVY) {
++		/* Make sure the dev_addr is set even if not flushing */
++		if (level == IPOIB_FLUSH_LIGHT)
++			ipoib_dev_addr_changed_valid(priv);
+ 		ipoib_dbg(priv, "Not flushing - IPOIB_FLAG_INITIALIZED not set.\n");
+ 		return;
+ 	}
+@@ -1029,7 +1132,8 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+ 				update_parent_pkey(priv);
+ 			else
+ 				update_child_pkey(priv);
+-		}
++		} else if (level == IPOIB_FLUSH_LIGHT)
++			ipoib_dev_addr_changed_valid(priv);
+ 		ipoib_dbg(priv, "Not flushing - IPOIB_FLAG_ADMIN_UP not set.\n");
+ 		return;
+ 	}
+@@ -1081,7 +1185,8 @@ static void __ipoib_ib_dev_flush(struct ipoib_dev_priv *priv,
+ 	if (test_bit(IPOIB_FLAG_ADMIN_UP, &priv->flags)) {
+ 		if (level >= IPOIB_FLUSH_NORMAL)
+ 			ipoib_ib_dev_up(dev);
+-		ipoib_mcast_restart_task(&priv->restart_task);
++		if (ipoib_dev_addr_changed_valid(priv))
++			ipoib_mcast_restart_task(&priv->restart_task);
+ 	}
+ }
+ 
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+index c0a90dd9a218..f62f5c0f6f9f 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -582,11 +582,13 @@ void ipoib_mcast_join_task(struct work_struct *work)
+ 		return;
+ 	}
+ 	priv->local_lid = port_attr.lid;
++	netif_addr_lock(dev);
+ 
+-	if (ib_query_gid(priv->ca, priv->port, 0, &priv->local_gid, NULL))
+-		ipoib_warn(priv, "ib_query_gid() failed\n");
+-	else
+-		memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw, sizeof (union ib_gid));
++	if (!test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
++		netif_addr_unlock(dev);
++		return;
++	}
++	netif_addr_unlock(dev);
+ 
+ 	spin_lock_irq(&priv->lock);
+ 	if (!test_bit(IPOIB_FLAG_OPER_UP, &priv->flags))
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+index b809c373e40e..1e7cbbaa15bd 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_verbs.c
+@@ -307,5 +307,8 @@ void ipoib_event(struct ib_event_handler *handler,
+ 		queue_work(ipoib_workqueue, &priv->flush_normal);
+ 	} else if (record->event == IB_EVENT_PKEY_CHANGE) {
+ 		queue_work(ipoib_workqueue, &priv->flush_heavy);
++	} else if (record->event == IB_EVENT_GID_CHANGE &&
++		   !test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
++		queue_work(ipoib_workqueue, &priv->flush_light);
+ 	}
+ }
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index fca1a882de27..64a35595eab8 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@ -68,6 +68,8 @@ int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+ 	priv->pkey = pkey;
+ 
+ 	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
++	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
++	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ 	priv->dev->broadcast[8] = pkey >> 8;
+ 	priv->dev->broadcast[9] = pkey & 0xff;
+ 
