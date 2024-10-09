@@ -1606,6 +1606,7 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 	int rc = 0;
 	char *str = strdup(arg);
 	int type = -1;
+	enum { DEFAULT, SET, ADD, REMOVE } change = DEFAULT;
 
 	if (!str)
 		return -ENOMEM;
@@ -1651,6 +1652,10 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 			goto out;
 		}
 
+		/* Don't override defaults for +- */
+		if (strchr(str, '+') || strchr(str, '-'))
+			goto parse;
+
 		if (output_set_by_user())
 			pr_warning("Overriding previous field request for all events.\n");
 
@@ -1661,13 +1666,30 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 		}
 	}
 
+parse:
 	for (tok = strtok_r(tok, ",", &strtok_saveptr); tok; tok = strtok_r(NULL, ",", &strtok_saveptr)) {
+		if (*tok == '+') {
+			if (change == SET)
+				goto out_badmix;
+			change = ADD;
+			tok++;
+		} else if (*tok == '-') {
+			if (change == SET)
+				goto out_badmix;
+			change = REMOVE;
+			tok++;
+		} else {
+			if (change != SET && change != DEFAULT)
+				goto out_badmix;
+			change = SET;
+		}
+
 		for (i = 0; i < imax; ++i) {
 			if (strcmp(tok, all_output_options[i].str) == 0)
 				break;
 		}
 		if (i == imax && strcmp(tok, "flags") == 0) {
-			print_flags = true;
+			print_flags = change == REMOVE ? false : true;
 			continue;
 		}
 		if (i == imax) {
@@ -1684,8 +1706,12 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 				if (output[j].invalid_fields & all_output_options[i].field) {
 					pr_warning("\'%s\' not valid for %s events. Ignoring.\n",
 						   all_output_options[i].str, event_type(j));
-				} else
-					output[j].fields |= all_output_options[i].field;
+				} else {
+					if (change == REMOVE)
+						output[j].fields &= ~all_output_options[i].field;
+					else
+						output[j].fields |= all_output_options[i].field;
+				}
 			}
 		} else {
 			if (output[type].invalid_fields & all_output_options[i].field) {
@@ -1705,7 +1731,11 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 				 "Events will not be displayed.\n", event_type(type));
 		}
 	}
+	goto out;
 
+out_badmix:
+	fprintf(stderr, "Cannot mix +-field with overridden fields\n");
+	rc = -EINVAL;
 out:
 	free(str);
 	return rc;
@@ -2322,6 +2352,7 @@ int cmd_script(int argc, const char **argv)
 		     symbol__config_symfs),
 	OPT_CALLBACK('F', "fields", NULL, "str",
 		     "comma separated output fields prepend with 'type:'. "
+		     "+field to add and -field to remove."
 		     "Valid types: hw,sw,trace,raw. "
 		     "Fields: comm,tid,pid,time,cpu,event,trace,ip,sym,dso,"
 		     "addr,symoff,period,iregs,brstack,brstacksym,flags,"
