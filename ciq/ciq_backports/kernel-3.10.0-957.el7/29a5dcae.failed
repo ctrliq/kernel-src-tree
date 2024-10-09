@@ -1,0 +1,335 @@
+nfp: flower: offload phys port MTU change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 29a5dcae2790ba7fb26ea7128cbe61ecf906ab0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/29a5dcae.failed
+
+Trigger a port mod message to request an MTU change on the NIC when any
+physical port representor is assigned a new MTU value. The driver waits
+10 msec for an ack that the FW has set the MTU. If no ack is received the
+request is rejected and an appropriate warning flagged.
+
+Rather than maintain an MTU queue per repr, one is maintained per app.
+Because the MTU ndo is protected by the rtnl lock, there can never be
+contention here. Portmod messages from the NIC are also protected by
+rtnl so we first check if the portmod is an ack and, if so, handle outside
+rtnl and the cmsg work queue.
+
+Acks are detected by the marking of a bit in a portmod response. They are
+then verfied by checking the port number and MTU value expected by the
+app. If the expected MTU is 0 then no acks are currently expected.
+
+Also, ensure that the packet headroom reserved by the flower firmware is
+considered when accepting an MTU change on any repr.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 29a5dcae2790ba7fb26ea7128cbe61ecf906ab0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+#	drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+index c5d938a06ed8,3735c09d2112..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+@@@ -125,6 -130,55 +130,58 @@@ int nfp_flower_cmsg_portmod(struct nfp_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_flower_cmsg_portreify(struct nfp_repr *repr, bool exists)
++ {
++ 	struct nfp_flower_cmsg_portreify *msg;
++ 	struct sk_buff *skb;
++ 
++ 	skb = nfp_flower_cmsg_alloc(repr->app, sizeof(*msg),
++ 				    NFP_FLOWER_CMSG_TYPE_PORT_REIFY,
++ 				    GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOMEM;
++ 
++ 	msg = nfp_flower_cmsg_get_data(skb);
++ 	msg->portnum = cpu_to_be32(repr->dst->u.port_info.port_id);
++ 	msg->reserved = 0;
++ 	msg->info = cpu_to_be16(exists);
++ 
++ 	nfp_ctrl_tx(repr->app->ctrl, skb);
++ 
++ 	return 0;
++ }
++ 
++ static bool
++ nfp_flower_process_mtu_ack(struct nfp_app *app, struct sk_buff *skb)
++ {
++ 	struct nfp_flower_priv *app_priv = app->priv;
++ 	struct nfp_flower_cmsg_portmod *msg;
++ 
++ 	msg = nfp_flower_cmsg_get_data(skb);
++ 
++ 	if (!(msg->info & NFP_FLOWER_CMSG_PORTMOD_MTU_CHANGE_ONLY))
++ 		return false;
++ 
++ 	spin_lock_bh(&app_priv->mtu_conf.lock);
++ 	if (!app_priv->mtu_conf.requested_val ||
++ 	    app_priv->mtu_conf.portnum != be32_to_cpu(msg->portnum) ||
++ 	    be16_to_cpu(msg->mtu) != app_priv->mtu_conf.requested_val) {
++ 		/* Not an ack for requested MTU change. */
++ 		spin_unlock_bh(&app_priv->mtu_conf.lock);
++ 		return false;
++ 	}
++ 
++ 	app_priv->mtu_conf.ack = true;
++ 	app_priv->mtu_conf.requested_val = 0;
++ 	wake_up(&app_priv->mtu_conf.wait_q);
++ 	spin_unlock_bh(&app_priv->mtu_conf.lock);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 29a5dcae2790 (nfp: flower: offload phys port MTU change)
+  static void
+  nfp_flower_cmsg_portmod_rx(struct nfp_app *app, struct sk_buff *skb)
+  {
+@@@ -254,7 -302,12 +311,11 @@@ void nfp_flower_cmsg_rx(struct nfp_app 
+  		/* We need to deal with stats updates from HW asap */
+  		nfp_flower_rx_flow_stats(app, skb);
+  		dev_consume_skb_any(skb);
++ 	} else if (cmsg_hdr->type == NFP_FLOWER_CMSG_TYPE_PORT_MOD &&
++ 		   nfp_flower_process_mtu_ack(app, skb)) {
++ 		/* Handle MTU acks outside wq to prevent RTNL conflict. */
++ 		dev_consume_skb_any(skb);
+  	} else {
+ -		skb_queue_tail(&priv->cmsg_skbs, skb);
+ -		schedule_work(&priv->cmsg_work);
+ +		nfp_flower_queue_ctl_msg(app, skb, cmsg_hdr->type);
+  	}
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 7441cc42fcbb,96bc0e33980c..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@@ -380,7 -397,17 +380,8 @@@ struct nfp_flower_cmsg_portmod 
+  };
+  
+  #define NFP_FLOWER_CMSG_PORTMOD_INFO_LINK	BIT(0)
++ #define NFP_FLOWER_CMSG_PORTMOD_MTU_CHANGE_ONLY	BIT(1)
+  
+ -/* NFP_FLOWER_CMSG_TYPE_PORT_REIFY */
+ -struct nfp_flower_cmsg_portreify {
+ -	__be32 portnum;
+ -	u16 reserved;
+ -	__be16 info;
+ -};
+ -
+ -#define NFP_FLOWER_CMSG_PORTREIFY_INFO_EXIST	BIT(0)
+ -
+  enum nfp_flower_cmsg_port_type {
+  	NFP_FLOWER_CMSG_PORT_TYPE_UNSPEC =	0x0,
+  	NFP_FLOWER_CMSG_PORT_TYPE_PHYS_PORT =	0x1,
+@@@ -438,7 -465,9 +439,13 @@@ voi
+  nfp_flower_cmsg_mac_repr_add(struct sk_buff *skb, unsigned int idx,
+  			     unsigned int nbi, unsigned int nbi_port,
+  			     unsigned int phys_port);
+++<<<<<<< HEAD
+ +int nfp_flower_cmsg_portmod(struct nfp_repr *repr, bool carrier_ok);
+++=======
++ int nfp_flower_cmsg_portmod(struct nfp_repr *repr, bool carrier_ok,
++ 			    unsigned int mtu, bool mtu_only);
++ int nfp_flower_cmsg_portreify(struct nfp_repr *repr, bool exists);
+++>>>>>>> 29a5dcae2790 (nfp: flower: offload phys port MTU change)
+  void nfp_flower_cmsg_process_rx(struct work_struct *work);
+  void nfp_flower_cmsg_rx(struct nfp_app *app, struct sk_buff *skb);
+  struct sk_buff *
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 9a7f51433140,e030b3ce4510..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -59,9 -61,11 +59,15 @@@ struct nfp_app
+  #define NFP_FL_MASK_ID_LOCATION		1
+  
+  #define NFP_FL_VXLAN_PORT		4789
+ -#define NFP_FL_GENEVE_PORT		6081
+  
+++<<<<<<< HEAD
+ +#define NFP_FLOWER_GOLDEN_RATIO_64	0x61C8864680B583EBull
+ +#define NFP_FLOWER_GOLDEN_RATIO_32	0x61C88647
+++=======
++ /* Extra features bitmap. */
++ #define NFP_FL_FEATS_GENEVE		BIT(0)
++ #define NFP_FL_NBI_MTU_SETTING		BIT(1)
+++>>>>>>> 29a5dcae2790 (nfp: flower: offload phys port MTU change)
+  
+  struct nfp_fl_mask_id {
+  	struct circ_buf mask_id_free_list;
+@@@ -103,6 -120,10 +125,13 @@@ struct nfp_mtu_conf 
+   * @nfp_mac_off_count:	Number of MACs in address list
+   * @nfp_tun_mac_nb:	Notifier to monitor link state
+   * @nfp_tun_neigh_nb:	Notifier to monitor neighbour state
+++<<<<<<< HEAD
+++=======
++  * @reify_replies:	atomically stores the number of replies received
++  *			from firmware for repr reify
++  * @reify_wait_queue:	wait queue for repr reify response counting
++  * @mtu_conf:		Configuration of repr MTU value
+++>>>>>>> 29a5dcae2790 (nfp: flower: offload phys port MTU change)
+   */
+  struct nfp_flower_priv {
+  	struct nfp_app *app;
+@@@ -129,6 -149,9 +158,12 @@@
+  	int nfp_mac_off_count;
+  	struct notifier_block nfp_tun_mac_nb;
+  	struct notifier_block nfp_tun_neigh_nb;
+++<<<<<<< HEAD
+++=======
++ 	atomic_t reify_replies;
++ 	wait_queue_head_t reify_wait_queue;
++ 	struct nfp_mtu_conf mtu_conf;
+++>>>>>>> 29a5dcae2790 (nfp: flower: offload phys port MTU change)
+  };
+  
+  struct nfp_fl_key_ls {
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/cmsg.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index 8fa0cccc6c1f..2a85131d66f2 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -51,6 +51,8 @@
+ 
+ #define NFP_FLOWER_ALLOWED_VER 0x0001000000010000UL
+ 
++#define NFP_FLOWER_FRAME_HEADROOM	158
++
+ static const char *nfp_flower_extra_cap(struct nfp_app *app, struct nfp_net *nn)
+ {
+ 	return "FLOWER";
+@@ -106,7 +108,7 @@ nfp_flower_repr_netdev_open(struct nfp_app *app, struct nfp_repr *repr)
+ {
+ 	int err;
+ 
+-	err = nfp_flower_cmsg_portmod(repr, true);
++	err = nfp_flower_cmsg_portmod(repr, true, repr->netdev->mtu, false);
+ 	if (err)
+ 		return err;
+ 
+@@ -120,7 +122,7 @@ nfp_flower_repr_netdev_stop(struct nfp_app *app, struct nfp_repr *repr)
+ {
+ 	netif_tx_disable(repr->netdev);
+ 
+-	return nfp_flower_cmsg_portmod(repr, false);
++	return nfp_flower_cmsg_portmod(repr, false, repr->netdev->mtu, false);
+ }
+ 
+ static void nfp_flower_sriov_disable(struct nfp_app *app)
+@@ -404,6 +406,9 @@ static int nfp_flower_init(struct nfp_app *app)
+ 	skb_queue_head_init(&app_priv->cmsg_skbs_low);
+ 	INIT_WORK(&app_priv->cmsg_work, nfp_flower_cmsg_process_rx);
+ 
++	init_waitqueue_head(&app_priv->mtu_conf.wait_q);
++	spin_lock_init(&app_priv->mtu_conf.lock);
++
+ 	err = nfp_flower_metadata_init(app);
+ 	if (err)
+ 		goto err_free_app_priv;
+@@ -436,6 +441,81 @@ static void nfp_flower_clean(struct nfp_app *app)
+ 	app->priv = NULL;
+ }
+ 
++static int
++nfp_flower_check_mtu(struct nfp_app *app, struct net_device *netdev,
++		     int new_mtu)
++{
++	/* The flower fw reserves NFP_FLOWER_FRAME_HEADROOM bytes of the
++	 * supported max MTU to allow for appending tunnel headers. To prevent
++	 * unexpected behaviour this needs to be accounted for.
++	 */
++	if (new_mtu > netdev->max_mtu - NFP_FLOWER_FRAME_HEADROOM) {
++		nfp_err(app->cpp, "New MTU (%d) is not valid\n", new_mtu);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static bool nfp_flower_check_ack(struct nfp_flower_priv *app_priv)
++{
++	bool ret;
++
++	spin_lock_bh(&app_priv->mtu_conf.lock);
++	ret = app_priv->mtu_conf.ack;
++	spin_unlock_bh(&app_priv->mtu_conf.lock);
++
++	return ret;
++}
++
++static int
++nfp_flower_repr_change_mtu(struct nfp_app *app, struct net_device *netdev,
++			   int new_mtu)
++{
++	struct nfp_flower_priv *app_priv = app->priv;
++	struct nfp_repr *repr = netdev_priv(netdev);
++	int err, ack;
++
++	/* Only need to config FW for physical port MTU change. */
++	if (repr->port->type != NFP_PORT_PHYS_PORT)
++		return 0;
++
++	if (!(app_priv->flower_ext_feats & NFP_FL_NBI_MTU_SETTING)) {
++		nfp_err(app->cpp, "Physical port MTU setting not supported\n");
++		return -EINVAL;
++	}
++
++	spin_lock_bh(&app_priv->mtu_conf.lock);
++	app_priv->mtu_conf.ack = false;
++	app_priv->mtu_conf.requested_val = new_mtu;
++	app_priv->mtu_conf.portnum = repr->dst->u.port_info.port_id;
++	spin_unlock_bh(&app_priv->mtu_conf.lock);
++
++	err = nfp_flower_cmsg_portmod(repr, netif_carrier_ok(netdev), new_mtu,
++				      true);
++	if (err) {
++		spin_lock_bh(&app_priv->mtu_conf.lock);
++		app_priv->mtu_conf.requested_val = 0;
++		spin_unlock_bh(&app_priv->mtu_conf.lock);
++		return err;
++	}
++
++	/* Wait for fw to ack the change. */
++	ack = wait_event_timeout(app_priv->mtu_conf.wait_q,
++				 nfp_flower_check_ack(app_priv),
++				 msecs_to_jiffies(10));
++
++	if (!ack) {
++		spin_lock_bh(&app_priv->mtu_conf.lock);
++		app_priv->mtu_conf.requested_val = 0;
++		spin_unlock_bh(&app_priv->mtu_conf.lock);
++		nfp_warn(app->cpp, "MTU change not verified with fw\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
+ static int nfp_flower_start(struct nfp_app *app)
+ {
+ 	return nfp_tunnel_config_start(app);
+@@ -456,6 +536,9 @@ const struct nfp_app_type app_flower = {
+ 	.init		= nfp_flower_init,
+ 	.clean		= nfp_flower_clean,
+ 
++	.check_mtu	= nfp_flower_check_mtu,
++	.repr_change_mtu  = nfp_flower_repr_change_mtu,
++
+ 	.vnic_alloc	= nfp_flower_vnic_alloc,
+ 	.vnic_init	= nfp_flower_vnic_init,
+ 	.vnic_clean	= nfp_flower_vnic_clean,
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
