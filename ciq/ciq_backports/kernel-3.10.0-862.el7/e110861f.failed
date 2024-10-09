@@ -1,0 +1,313 @@
+net: add a sysctl to reflect the fwmark on replies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] add a sysctl to reflect the fwmark on replies (Matteo Croce) [1469857]
+Rebuild_FUZZ: 94.74%
+commit-author Lorenzo Colitti <lorenzo@google.com>
+commit e110861f86094cd78cc85593b873970092deb43a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e110861f.failed
+
+Kernel-originated IP packets that have no user socket associated
+with them (e.g., ICMP errors and echo replies, TCP RSTs, etc.)
+are emitted with a mark of zero. Add a sysctl to make them have
+the same mark as the packet they are replying to.
+
+This allows an administrator that wishes to do so to use
+mark-based routing, firewalling, etc. for these replies by
+marking the original packets inbound.
+
+Tested using user-mode linux:
+ - ICMP/ICMPv6 echo replies and errors.
+ - TCP RST packets (IPv4 and IPv6).
+
+	Signed-off-by: Lorenzo Colitti <lorenzo@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e110861f86094cd78cc85593b873970092deb43a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/ipv4.h
+#	include/net/netns/ipv6.h
+#	net/ipv4/icmp.c
+#	net/ipv4/sysctl_net_ipv4.c
+#	net/ipv6/icmp.c
+#	net/ipv6/sysctl_net_ipv6.c
+diff --cc include/net/netns/ipv4.h
+index 4b15ee83774e,a32fc4d705da..000000000000
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@@ -70,13 -71,17 +70,19 @@@ struct netns_ipv4 
+  	int sysctl_icmp_ratemask;
+  	int sysctl_icmp_errors_use_inbound_ifaddr;
+  
+ -	struct local_ports ip_local_ports;
+ -
+  	int sysctl_tcp_ecn;
+ -	int sysctl_ip_no_pmtu_disc;
+ -	int sysctl_ip_fwd_use_pmtu;
+  
+++<<<<<<< HEAD
+ +	kgid_t sysctl_ping_group_range[2];
+ +	long sysctl_tcp_mem[3];
+++=======
++ 	int sysctl_fwmark_reflect;
++ 
++ 	struct ping_group_range ping_group_range;
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  
+  	atomic_t dev_addr_genid;
+ +	RH_KABI_FILL_HOLE(unsigned int	fib_seq)	/* protected by rtnl_mutex */
+  
+  #ifdef CONFIG_IP_MROUTE
+  #ifndef CONFIG_IP_MROUTE_MULTIPLE_TABLES
+diff --cc include/net/netns/ipv6.h
+index 005e2c2e39a9,19d3446e59d2..000000000000
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@@ -27,7 -27,10 +27,12 @@@ struct netns_sysctl_ipv6 
+  	int ip6_rt_gc_elasticity;
+  	int ip6_rt_mtu_expires;
+  	int ip6_rt_min_advmss;
+ -	int flowlabel_consistency;
+  	int icmpv6_time;
+++<<<<<<< HEAD
+++=======
++ 	int anycast_src_echo_reply;
++ 	int fwmark_reflect;
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  };
+  
+  struct netns_ipv6 {
+diff --cc net/ipv4/icmp.c
+index edc0736c5843,79c3d947a481..000000000000
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@@ -405,8 -337,7 +405,12 @@@ static void icmp_reply(struct icmp_bxm 
+  	struct sock *sk;
+  	struct inet_sock *inet;
+  	__be32 daddr, saddr;
+++<<<<<<< HEAD
+ +	int type = icmp_param->data.icmph.type;
+ +	int code = icmp_param->data.icmph.code;
+++=======
++ 	u32 mark = IP4_REPLY_MARK(net, skb->mark);
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  
+  	if (ip_options_echo(&icmp_param->replyopts.opt.opt, skb))
+  		return;
+@@@ -695,8 -597,9 +703,9 @@@ void icmp_send(struct sk_buff *skb_in, 
+  	tos = icmp_pointers[type].error ? ((iph->tos & IPTOS_TOS_MASK) |
+  					   IPTOS_PREC_INTERNETCONTROL) :
+  					  iph->tos;
++ 	mark = IP4_REPLY_MARK(net, skb_in->mark);
+  
+ -	if (ip_options_echo(&icmp_param->replyopts.opt.opt, skb_in))
+ +	if (ip_options_echo(&icmp_param.replyopts.opt.opt, skb_in))
+  		goto out_unlock;
+  
+  
+@@@ -704,21 -607,22 +713,27 @@@
+  	 *	Prepare data for ICMP header.
+  	 */
+  
+ -	icmp_param->data.icmph.type	 = type;
+ -	icmp_param->data.icmph.code	 = code;
+ -	icmp_param->data.icmph.un.gateway = info;
+ -	icmp_param->data.icmph.checksum	 = 0;
+ -	icmp_param->skb	  = skb_in;
+ -	icmp_param->offset = skb_network_offset(skb_in);
+ +	icmp_param.data.icmph.type	 = type;
+ +	icmp_param.data.icmph.code	 = code;
+ +	icmp_param.data.icmph.un.gateway = info;
+ +	icmp_param.data.icmph.checksum	 = 0;
+ +	icmp_param.skb	  = skb_in;
+ +	icmp_param.offset = skb_network_offset(skb_in);
+  	inet_sk(sk)->tos = tos;
++ 	sk->sk_mark = mark;
+  	ipc.addr = iph->saddr;
+ -	ipc.opt = &icmp_param->replyopts.opt;
+ +	ipc.opt = &icmp_param.replyopts.opt;
+  	ipc.tx_flags = 0;
+  	ipc.ttl = 0;
+  	ipc.tos = -1;
+  
+++<<<<<<< HEAD
+ +	rt = icmp_route_lookup(net, &fl4, skb_in, iph, saddr, tos,
+ +			       type, code, &icmp_param);
+++=======
++ 	rt = icmp_route_lookup(net, &fl4, skb_in, iph, saddr, tos, mark,
++ 			       type, code, icmp_param);
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  	if (IS_ERR(rt))
+  		goto out_unlock;
+  
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index d18eb9254a01,f50d51850285..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -913,11 -839,11 +913,19 @@@ static struct ctl_table ipv4_net_table[
+  		.proc_handler	= proc_dointvec,
+  	},
+  	{
+++<<<<<<< HEAD
+ +		.procname	= "ip_nonlocal_bind",
+ +		.data		= &init_net.ipv4_sysctl_ip_nonlocal_bind,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec
+++=======
++ 		.procname	= "fwmark_reflect",
++ 		.data		= &init_net.ipv4.sysctl_fwmark_reflect,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec,
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  	},
+  	{ }
+  };
+diff --cc net/ipv6/icmp.c
+index fb469788e2d2,f6c84a6eb238..000000000000
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@@ -486,9 -474,9 +488,15 @@@ static void icmp6_send(struct sk_buff *
+  	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
+  
+  	sk = icmpv6_xmit_lock(net);
+++<<<<<<< HEAD
+ +	if (!sk)
+ +		goto out_bh_enable;
+ +
+++=======
++ 	if (sk == NULL)
++ 		return;
++ 	sk->sk_mark = mark;
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  	np = inet6_sk(sk);
+  
+  	if (!icmpv6_xrlim_allow(sk, type, &fl6))
+@@@ -572,6 -553,8 +580,11 @@@ static void icmpv6_echo_reply(struct sk
+  	struct dst_entry *dst;
+  	int err = 0;
+  	int hlimit;
+++<<<<<<< HEAD
+++=======
++ 	u8 tclass;
++ 	u32 mark = IP6_REPLY_MARK(net, skb->mark);
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  
+  	saddr = &ipv6_hdr(skb)->daddr;
+  
+@@@ -590,12 -573,13 +603,19 @@@
+  		fl6.saddr = *saddr;
+  	fl6.flowi6_oif = skb->dev->ifindex;
+  	fl6.fl6_icmp_type = ICMPV6_ECHO_REPLY;
++ 	fl6.flowi6_mark = mark;
+  	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
+  
+ +	local_bh_disable();
+  	sk = icmpv6_xmit_lock(net);
+++<<<<<<< HEAD
+ +	if (!sk)
+ +		goto out_bh_enable;
+++=======
++ 	if (sk == NULL)
++ 		return;
++ 	sk->sk_mark = mark;
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  	np = inet6_sk(sk);
+  
+  	if (!fl6.flowi6_oif && ipv6_addr_is_multicast(&fl6.daddr))
+diff --cc net/ipv6/sysctl_net_ipv6.c
+index 05e2621aad72,058f3eca2e53..000000000000
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@@ -41,18 -39,11 +41,26 @@@ static struct ctl_table ipv6_table_temp
+  		.proc_handler	= proc_dointvec
+  	},
+  	{
+++<<<<<<< HEAD
+ +		.procname	= "idgen_retries",
+ +		.data		= &init_net.idgen_retries,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec,
+ +	},
+ +	{
+ +		.procname	= "idgen_delay",
+ +		.data		= &init_net.idgen_delay,
+ +		.maxlen		= sizeof(int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec_jiffies,
+++=======
++ 		.procname	= "fwmark_reflect",
++ 		.data		= &init_net.ipv6.sysctl.fwmark_reflect,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
+++>>>>>>> e110861f8609 (net: add a sysctl to reflect the fwmark on replies)
+  	},
+  	{ }
+  };
+diff --git a/include/net/ip.h b/include/net/ip.h
+index ffa8d9c42026..07069c9bfb09 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -253,6 +253,9 @@ void ipfrag_init(void);
+ 
+ void ip_static_sysctl_init(void);
+ 
++#define IP4_REPLY_MARK(net, mark) \
++	((net)->ipv4.sysctl_fwmark_reflect ? (mark) : 0)
++
+ static inline bool ip_is_fragment(const struct iphdr *iph)
+ {
+ 	return (iph->frag_off & htons(IP_MF | IP_OFFSET)) != 0;
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index cc38d71d43a3..82e4fd03d44f 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -114,6 +114,9 @@ struct frag_hdr {
+ #define	IP6_MF		0x0001
+ #define	IP6_OFFSET	0xFFF8
+ 
++#define IP6_REPLY_MARK(net, mark) \
++	((net)->ipv6.sysctl.fwmark_reflect ? (mark) : 0)
++
+ #include <net/sock.h>
+ 
+ /* sysctls */
+* Unmerged path include/net/netns/ipv4.h
+* Unmerged path include/net/netns/ipv6.h
+* Unmerged path net/ipv4/icmp.c
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 8ac72848ccf5..e2b72980f846 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1577,7 +1577,8 @@ void ip_send_unicast_reply(struct sock *sk, struct sk_buff *skb,
+ 			daddr = replyopts.opt.opt.faddr;
+ 	}
+ 
+-	flowi4_init_output(&fl4, arg->bound_dev_if, 0,
++	flowi4_init_output(&fl4, arg->bound_dev_if,
++			   IP4_REPLY_MARK(net, skb->mark),
+ 			   RT_TOS(arg->tos),
+ 			   RT_SCOPE_UNIVERSE, ip_hdr(skb)->protocol,
+ 			   ip_reply_arg_flowi_flags(arg),
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
+* Unmerged path net/ipv6/icmp.c
+* Unmerged path net/ipv6/sysctl_net_ipv6.c
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index f8fb83478a30..b6985d021360 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -864,6 +864,7 @@ static void tcp_v6_send_response(struct sock *sk, struct sk_buff *skb, u32 seq,
+ 		fl6.flowi6_oif = inet6_iif(skb);
+ 	else
+ 		fl6.flowi6_oif = oif;
++	fl6.flowi6_mark = IP6_REPLY_MARK(net, skb->mark);
+ 	fl6.fl6_dport = t1->dest;
+ 	fl6.fl6_sport = t1->source;
+ 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
