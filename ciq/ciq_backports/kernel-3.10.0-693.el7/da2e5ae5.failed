@@ -1,0 +1,395 @@
+NTB: Fix ntb_transport out-of-order RX update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] Fix ntb_transport out-of-order RX update (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.12%
+commit-author Allen Hubbe <Allen.Hubbe@emc.com>
+commit da2e5ae56164b86823c1bff5b4d28430ca4a7108
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/da2e5ae5.failed
+
+It was possible for a synchronous update of the RX index in the error
+case to get ahead of the asynchronous RX index update in the normal
+case.  Change the RX processing to preserve an RX completion order.
+
+There were two error cases.  First, if a buffer is not present to
+receive data, there would be no queue entry to preserve the RX
+completion order.  Instead of dropping the RX frame, leave the RX frame
+in the ring.  Schedule RX processing when RX entries are enqueued, in
+case there are RX frames waiting in the ring to be received.
+
+Second, if a buffer is too small to receive data, drop the frame in the
+ring, mark the RX entry as done, and indicate the error in the RX entry
+length.  Check for a negative length in the receive callback in
+ntb_netdev, and count occurrences as rx_length_errors.
+
+	Signed-off-by: Allen Hubbe <Allen.Hubbe@emc.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit da2e5ae56164b86823c1bff5b4d28430ca4a7108)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index 3458260f41b6,98e58c765f2e..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -116,12 -140,13 +116,18 @@@ struct ntb_transport_qp 
+  	unsigned int tx_max_entry;
+  	unsigned int tx_max_frame;
+  
+++<<<<<<< HEAD
+ +	void (*rx_handler) (struct ntb_transport_qp *qp, void *qp_data,
+ +			    void *data, int len);
+++=======
++ 	void (*rx_handler)(struct ntb_transport_qp *qp, void *qp_data,
++ 			   void *data, int len);
++ 	struct list_head rx_post_q;
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
+  	struct list_head rx_pend_q;
+  	struct list_head rx_free_q;
+- 	spinlock_t ntb_rx_pend_q_lock;
+- 	spinlock_t ntb_rx_free_q_lock;
++ 	/* ntb_rx_q_lock: synchronize access to rx_XXXX_q */
++ 	spinlock_t ntb_rx_q_lock;
+  	void *rx_buff;
+  	unsigned int rx_index;
+  	unsigned int rx_max_entry;
+@@@ -497,26 -535,52 +503,52 @@@ out
+  	return entry;
+  }
+  
+++<<<<<<< HEAD
+ +static void ntb_transport_setup_qp_mw(struct ntb_transport *nt,
+ +				      unsigned int qp_num)
+++=======
++ static struct ntb_queue_entry *ntb_list_mv(spinlock_t *lock,
++ 					   struct list_head *list,
++ 					   struct list_head *to_list)
++ {
++ 	struct ntb_queue_entry *entry;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(lock, flags);
++ 
++ 	if (list_empty(list)) {
++ 		entry = NULL;
++ 	} else {
++ 		entry = list_first_entry(list, struct ntb_queue_entry, entry);
++ 		list_move_tail(&entry->entry, to_list);
++ 	}
++ 
++ 	spin_unlock_irqrestore(lock, flags);
++ 
++ 	return entry;
++ }
++ 
++ static int ntb_transport_setup_qp_mw(struct ntb_transport_ctx *nt,
++ 				     unsigned int qp_num)
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
+  {
+ -	struct ntb_transport_qp *qp = &nt->qp_vec[qp_num];
+ -	struct ntb_transport_mw *mw;
+ +	struct ntb_transport_qp *qp = &nt->qps[qp_num];
+  	unsigned int rx_size, num_qps_mw;
+ -	unsigned int mw_num, mw_count, qp_count;
+ +	u8 mw_num, mw_max;
+  	unsigned int i;
+  
+ -	mw_count = nt->mw_count;
+ -	qp_count = nt->qp_count;
+ -
+ -	mw_num = QP_TO_MW(nt, qp_num);
+ -	mw = &nt->mw_vec[mw_num];
+ +	mw_max = ntb_max_mw(nt->ndev);
+ +	mw_num = QP_TO_MW(nt->ndev, qp_num);
+  
+ -	if (!mw->virt_addr)
+ -		return -ENOMEM;
+ +	WARN_ON(nt->mw[mw_num].virt_addr == NULL);
+  
+ -	if (qp_count % mw_count && mw_num + 1 < qp_count / mw_count)
+ -		num_qps_mw = qp_count / mw_count + 1;
+ +	if (nt->max_qps % mw_max && mw_num + 1 < nt->max_qps / mw_max)
+ +		num_qps_mw = nt->max_qps / mw_max + 1;
+  	else
+ -		num_qps_mw = qp_count / mw_count;
+ +		num_qps_mw = nt->max_qps / mw_max;
+  
+ -	rx_size = (unsigned int)mw->xlat_size / num_qps_mw;
+ -	qp->rx_buff = mw->virt_addr + rx_size * qp_num / mw_count;
+ +	rx_size = (unsigned int) nt->mw[mw_num].size / num_qps_mw;
+ +	qp->rx_buff = nt->mw[mw_num].virt_addr + qp_num / mw_max * rx_size;
+  	rx_size -= sizeof(struct ntb_rx_info);
+  
+  	qp->remote_rx_info = qp->rx_buff + rx_size;
+@@@ -1026,21 -1166,10 +1092,23 @@@ static void ntb_complete_rxc(struct ntb
+  static void ntb_rx_copy_callback(void *data)
+  {
+  	struct ntb_queue_entry *entry = data;
+- 	struct ntb_transport_qp *qp = entry->qp;
+- 	void *cb_data = entry->cb_data;
+- 	unsigned int len = entry->len;
+- 	struct ntb_payload_header *hdr = entry->rx_hdr;
+  
+++<<<<<<< HEAD
+ +	/* Ensure that the data is fully copied out before clearing the flag */
+ +	wmb();
+ +	hdr->flags = 0;
+ +
+ +	iowrite32(entry->index, &qp->rx_info->entry);
+ +
+ +	ntb_list_add(&qp->ntb_rx_free_q_lock, &entry->entry, &qp->rx_free_q);
+ +
+ +	if (qp->rx_handler && qp->client_ready == NTB_LINK_UP)
+ +		qp->rx_handler(qp, qp->cb_data, cb_data, len);
+++=======
++ 	entry->flags |= DESC_DONE_FLAG;
++ 
++ 	ntb_complete_rxc(entry->qp);
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
+  }
+  
+  static void ntb_memcpy_rx(struct ntb_queue_entry *entry, void *offset)
+@@@ -1064,9 -1195,8 +1131,9 @@@ static void ntb_async_rx(struct ntb_que
+  	struct dmaengine_unmap_data *unmap;
+  	dma_cookie_t cookie;
+  	void *buf = entry->buf;
+ +	unsigned long flags;
+  
+- 	entry->len = len;
++ 	len = entry->len;
+  
+  	if (!chan)
+  		goto err;
+@@@ -1163,67 -1285,67 +1230,106 @@@ static int ntb_process_rxc(struct ntb_t
+  		return -EAGAIN;
+  	}
+  
+ +	if (hdr->ver != (u32) qp->rx_pkts) {
+ +		dev_dbg(&ntb_query_pdev(qp->ndev)->dev,
+ +			"qp %d: version mismatch, expected %llu - got %u\n",
+ +			qp->qp_num, qp->rx_pkts, hdr->ver);
+ +		ntb_list_add(&qp->ntb_rx_pend_q_lock, &entry->entry,
+ +			     &qp->rx_pend_q);
+ +		qp->rx_err_ver++;
+ +		return -EIO;
+ +	}
+ +
+++<<<<<<< HEAD
+  	if (hdr->flags & LINK_DOWN_FLAG) {
+ -		dev_dbg(&qp->ndev->pdev->dev, "link down flag set\n");
+  		ntb_qp_link_down(qp);
+ -		hdr->flags = 0;
+ -		return -EAGAIN;
+ +
+ +		goto err;
+  	}
+  
+ -	if (hdr->ver != (u32)qp->rx_pkts) {
+ -		dev_dbg(&qp->ndev->pdev->dev,
+ -			"version mismatch, expected %llu - got %u\n",
+ -			qp->rx_pkts, hdr->ver);
+ -		qp->rx_err_ver++;
+ -		return -EIO;
+ +	dev_dbg(&ntb_query_pdev(qp->ndev)->dev,
+ +		"rx offset %u, ver %u - %d payload received, buf size %d\n",
+ +		qp->rx_index, hdr->ver, hdr->len, entry->len);
+ +
+ +	qp->rx_bytes += hdr->len;
+ +	qp->rx_pkts++;
+ +
+ +	if (hdr->len > entry->len) {
+ +		qp->rx_err_oflow++;
+ +		dev_dbg(&ntb_query_pdev(qp->ndev)->dev,
+ +			"RX overflow! Wanted %d got %d\n",
+ +			hdr->len, entry->len);
+ +
+ +		goto err;
+  	}
+  
+ +	entry->index = qp->rx_index;
+ +	entry->rx_hdr = hdr;
+ +
+ +	ntb_async_rx(entry, offset, hdr->len);
+ +
+ +out:
+++=======
++ 	entry = ntb_list_mv(&qp->ntb_rx_q_lock, &qp->rx_pend_q, &qp->rx_post_q);
++ 	if (!entry) {
++ 		dev_dbg(&qp->ndev->pdev->dev, "no receive buffer\n");
++ 		qp->rx_err_no_buf++;
++ 		return -EAGAIN;
++ 	}
++ 
++ 	entry->rx_hdr = hdr;
++ 	entry->index = qp->rx_index;
++ 
++ 	if (hdr->len > entry->len) {
++ 		dev_dbg(&qp->ndev->pdev->dev,
++ 			"receive buffer overflow! Wanted %d got %d\n",
++ 			hdr->len, entry->len);
++ 		qp->rx_err_oflow++;
++ 
++ 		entry->len = -EIO;
++ 		entry->flags |= DESC_DONE_FLAG;
++ 
++ 		ntb_complete_rxc(qp);
++ 	} else {
++ 		dev_dbg(&qp->ndev->pdev->dev,
++ 			"RX OK index %u ver %u size %d into buf size %d\n",
++ 			qp->rx_index, hdr->ver, hdr->len, entry->len);
++ 
++ 		qp->rx_bytes += hdr->len;
++ 		qp->rx_pkts++;
++ 
++ 		entry->len = hdr->len;
++ 
++ 		ntb_async_rx(entry, offset);
++ 	}
++ 
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
+  	qp->rx_index++;
+  	qp->rx_index %= qp->rx_max_entry;
+  
+  	return 0;
+++<<<<<<< HEAD
+ +
+ +err:
+ +	ntb_list_add(&qp->ntb_rx_pend_q_lock, &entry->entry,
+ +		     &qp->rx_pend_q);
+ +	/* Ensure that the data is fully copied out before clearing the flag */
+ +	wmb();
+ +	hdr->flags = 0;
+ +	iowrite32(qp->rx_index, &qp->rx_info->entry);
+ +
+ +	goto out;
+++=======
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
+  }
+  
+ -static void ntb_transport_rxc_db(unsigned long data)
+ +static int ntb_transport_rxc_db(void *data, int db_num)
+  {
+ -	struct ntb_transport_qp *qp = (void *)data;
+ +	struct ntb_transport_qp *qp = data;
+  	int rc, i;
+  
+ -	dev_dbg(&qp->ndev->pdev->dev, "%s: doorbell %d received\n",
+ -		__func__, qp->qp_num);
+ +	dev_dbg(&ntb_query_pdev(qp->ndev)->dev, "%s: doorbell %d received\n",
+ +		__func__, db_num);
+  
+  	/* Limit the number of packets processed in a single interrupt to
+  	 * provide fairness to others
+@@@ -1234,10 -1356,24 +1340,10 @@@
+  			break;
+  	}
+  
+- 	if (qp->dma_chan)
++ 	if (i && qp->dma_chan)
+  		dma_async_issue_pending(qp->dma_chan);
+  
+ -	if (i == qp->rx_max_entry) {
+ -		/* there is more work to do */
+ -		tasklet_schedule(&qp->rxc_db_work);
+ -	} else if (ntb_db_read(qp->ndev) & BIT_ULL(qp->qp_num)) {
+ -		/* the doorbell bit is set: clear it */
+ -		ntb_db_clear(qp->ndev, BIT_ULL(qp->qp_num));
+ -		/* ntb_db_read ensures ntb_db_clear write is committed */
+ -		ntb_db_read(qp->ndev);
+ -
+ -		/* an interrupt may have arrived between finishing
+ -		 * ntb_process_rxc and clearing the doorbell bit:
+ -		 * there might be some more work to do.
+ -		 */
+ -		tasklet_schedule(&qp->rxc_db_work);
+ -	}
+ +	return i;
+  }
+  
+  static void ntb_tx_copy_callback(void *data)
+@@@ -1499,11 -1657,11 +1605,11 @@@ err2
+  	while ((entry = ntb_list_rm(&qp->ntb_tx_free_q_lock, &qp->tx_free_q)))
+  		kfree(entry);
+  err1:
+- 	while ((entry = ntb_list_rm(&qp->ntb_rx_free_q_lock, &qp->rx_free_q)))
++ 	while ((entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_free_q)))
+  		kfree(entry);
+  	if (qp->dma_chan)
+ -		dma_release_channel(qp->dma_chan);
+ -	nt->qp_bitmap_free |= qp_bit;
+ +		dmaengine_put();
+ +	set_bit(free_queue, &nt->qp_bitmap);
+  err:
+  	return NULL;
+  }
+@@@ -1544,11 -1707,21 +1650,25 @@@ void ntb_transport_free_queue(struct nt
+  
+  	cancel_delayed_work_sync(&qp->link_work);
+  
+++<<<<<<< HEAD
+ +	while ((entry = ntb_list_rm(&qp->ntb_rx_free_q_lock, &qp->rx_free_q)))
+++=======
++ 	qp->cb_data = NULL;
++ 	qp->rx_handler = NULL;
++ 	qp->tx_handler = NULL;
++ 	qp->event_handler = NULL;
++ 
++ 	while ((entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_free_q)))
+++>>>>>>> da2e5ae56164 (NTB: Fix ntb_transport out-of-order RX update)
++ 		kfree(entry);
++ 
++ 	while ((entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_pend_q))) {
++ 		dev_warn(&pdev->dev, "Freeing item from non-empty rx_pend_q\n");
+  		kfree(entry);
++ 	}
+  
+- 	while ((entry = ntb_list_rm(&qp->ntb_rx_pend_q_lock, &qp->rx_pend_q))) {
+- 		dev_warn(&pdev->dev, "Freeing item from a non-empty queue\n");
++ 	while ((entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_post_q))) {
++ 		dev_warn(&pdev->dev, "Freeing item from non-empty rx_post_q\n");
+  		kfree(entry);
+  	}
+  
+@@@ -1576,10 -1749,10 +1696,10 @@@ void *ntb_transport_rx_remove(struct nt
+  	struct ntb_queue_entry *entry;
+  	void *buf;
+  
+ -	if (!qp || qp->client_ready)
+ +	if (!qp || qp->client_ready == NTB_LINK_UP)
+  		return NULL;
+  
+- 	entry = ntb_list_rm(&qp->ntb_rx_pend_q_lock, &qp->rx_pend_q);
++ 	entry = ntb_list_rm(&qp->ntb_rx_q_lock, &qp->rx_pend_q);
+  	if (!entry)
+  		return NULL;
+  
+diff --git a/drivers/net/ntb_netdev.c b/drivers/net/ntb_netdev.c
+index db34e2d54fd9..05358ce06528 100644
+--- a/drivers/net/ntb_netdev.c
++++ b/drivers/net/ntb_netdev.c
+@@ -106,6 +106,12 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
+ 
+ 	netdev_dbg(ndev, "%s: %d byte payload received\n", __func__, len);
+ 
++	if (len < 0) {
++		ndev->stats.rx_errors++;
++		ndev->stats.rx_length_errors++;
++		goto enqueue_again;
++	}
++
+ 	skb_put(skb, len);
+ 	skb->protocol = eth_type_trans(skb, ndev);
+ 	skb->ip_summed = CHECKSUM_NONE;
+@@ -125,6 +131,7 @@ static void ntb_netdev_rx_handler(struct ntb_transport_qp *qp, void *qp_data,
+ 		return;
+ 	}
+ 
++enqueue_again:
+ 	rc = ntb_transport_rx_enqueue(qp, skb, skb->data, ndev->mtu + ETH_HLEN);
+ 	if (rc) {
+ 		dev_kfree_skb(skb);
+* Unmerged path drivers/ntb/ntb_transport.c
