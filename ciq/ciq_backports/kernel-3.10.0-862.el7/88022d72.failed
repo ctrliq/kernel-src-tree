@@ -1,0 +1,399 @@
+blk-mq: don't handle failure in .get_budget
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 88022d7201e96b43f1754b0358fc6bcd8dbdcde1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/88022d72.failed
+
+It is enough to just check if we can get the budget via .get_budget().
+And we don't need to deal with device state change in .get_budget().
+
+For SCSI, one issue to be fixed is that we have to call
+scsi_mq_uninit_cmd() to free allocated ressources if SCSI device fails
+to handle the request. And it isn't enough to simply call
+blk_mq_end_request() to do that if this request is marked as
+RQF_DONTPREP.
+
+Fixes: 0df21c86bdbf(scsi: implement .get_budget and .put_budget for blk-mq)
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 88022d7201e96b43f1754b0358fc6bcd8dbdcde1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+#	drivers/scsi/scsi_lib.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index d9bfe0c6bc0e,c9fa4b294664..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -843,10 -1106,40 +843,42 @@@ bool blk_mq_dispatch_rq_list(struct blk
+  	 * Now process all the entries, sending them to the driver.
+  	 */
+  	errors = queued = 0;
+ -	do {
+ +	while (!list_empty(list)) {
+  		struct blk_mq_queue_data bd;
+ -		blk_status_t ret;
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+++<<<<<<< HEAD
+++=======
++ 		if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 			if (!queued && reorder_tags_to_front(list))
++ 				continue;
++ 
++ 			/*
++ 			 * The initial allocation attempt failed, so we need to
++ 			 * rerun the hardware queue when a tag is freed.
++ 			 */
++ 			if (!blk_mq_dispatch_wait_add(hctx)) {
++ 				if (got_budget)
++ 					blk_mq_put_dispatch_budget(hctx);
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * It's possible that a tag was freed in the window
++ 			 * between the allocation failure and adding the
++ 			 * hardware queue to the wait queue.
++ 			 */
++ 			if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 				if (got_budget)
++ 					blk_mq_put_dispatch_budget(hctx);
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (!got_budget && !blk_mq_get_dispatch_budget(hctx))
++ 			break;
++ 
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  		list_del_init(&rq->queuelist);
+  
+  		bd.rq = rq;
+@@@ -862,25 -1163,16 +894,31 @@@
+  			list_add(&rq->queuelist, list);
+  			__blk_mq_requeue_request(rq);
+  			break;
+++<<<<<<< HEAD
+ +		default:
+ +			pr_err("blk-mq: bad return on queue: %d\n", ret);
+ +		case BLK_MQ_RQ_QUEUE_ERROR:
+++=======
++ 		}
++ 
++ 		if (unlikely(ret != BLK_STS_OK)) {
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  			errors++;
+ -			blk_mq_end_request(rq, BLK_STS_IOERR);
+ -			continue;
+ +			rq->errors = -EIO;
+ +			blk_mq_end_request(rq, rq->errors);
+ +			break;
+  		}
+  
+ -		queued++;
+ -	} while (!list_empty(list));
+ +		if (ret == BLK_MQ_RQ_QUEUE_BUSY)
+ +			break;
+ +
+ +		/*
+ +		 * We've done the first request. If we have more than 1
+ +		 * left in the list, set dptr to defer issue.
+ +		 */
+ +		if (!dptr && list->next != list->prev)
+ +			dptr = &driver_list;
+ +	}
+  
+  	hctx->dispatched[queued_to_index(queued)]++;
+  
+@@@ -1268,102 -1587,61 +1306,111 @@@ void blk_mq_flush_plug_list(struct blk_
+  
+  static void blk_mq_bio_to_request(struct request *rq, struct bio *bio)
+  {
+ -	blk_init_request_from_bio(rq, bio);
+ +	init_request_from_bio(rq, bio);
+  
+ -	blk_rq_set_rl(rq, blk_get_rl(rq->q, bio));
+ +	if (blk_do_io_stat(rq))
+ +		blk_account_io_start(rq, true);
+ +}
+  
+ -	blk_account_io_start(rq, true);
+ +static inline bool hctx_allow_merges(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	return (hctx->flags & BLK_MQ_F_SHOULD_MERGE) &&
+ +		!blk_queue_nomerges(hctx->queue);
+  }
+  
+ -static inline void blk_mq_queue_io(struct blk_mq_hw_ctx *hctx,
+ -				   struct blk_mq_ctx *ctx,
+ -				   struct request *rq)
+ +static inline bool blk_mq_merge_queue_io(struct blk_mq_hw_ctx *hctx,
+ +					 struct blk_mq_ctx *ctx,
+ +					 struct request *rq, struct bio *bio)
+  {
+ -	spin_lock(&ctx->lock);
+ -	__blk_mq_insert_request(hctx, rq, false);
+ -	spin_unlock(&ctx->lock);
+ +	if (!hctx_allow_merges(hctx) || !bio_mergeable(bio)) {
+ +		blk_mq_bio_to_request(rq, bio);
+ +		spin_lock(&ctx->lock);
+ +insert_rq:
+ +		__blk_mq_insert_request(hctx, rq, false);
+ +		spin_unlock(&ctx->lock);
+ +		return false;
+ +	} else {
+ +		struct request_queue *q = hctx->queue;
+ +
+ +		spin_lock(&ctx->lock);
+ +		if (!blk_mq_attempt_merge(q, ctx, bio)) {
+ +			blk_mq_bio_to_request(rq, bio);
+ +			goto insert_rq;
+ +		}
+ +
+ +		spin_unlock(&ctx->lock);
+ +		__blk_mq_free_request(hctx, ctx, rq);
+ +		return true;
+ +	}
+  }
+  
+ -static blk_qc_t request_to_qc_t(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ +struct blk_map_ctx {
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +};
+ +
+ +static struct request *blk_mq_map_request(struct request_queue *q,
+ +					  struct bio *bio,
+ +					  struct blk_map_ctx *data)
+  {
+ -	if (rq->tag != -1)
+ -		return blk_tag_to_qc_t(rq->tag, hctx->queue_num, false);
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +	struct request *rq;
+ +	int rw = bio_data_dir(bio);
+ +	struct blk_mq_alloc_data alloc_data;
+ +
+ +	blk_queue_enter_live(q);
+ +	ctx = blk_mq_get_ctx(q);
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +
+ +	if (rw_is_sync(bio->bi_rw))
+ +		rw |= REQ_SYNC;
+  
+ -	return blk_tag_to_qc_t(rq->internal_tag, hctx->queue_num, true);
+ +	trace_block_getrq(q, bio, rw);
+ +	blk_mq_set_alloc_data(&alloc_data, q, BLK_MQ_REQ_NOWAIT, ctx, hctx);
+ +	rq = __blk_mq_alloc_request(&alloc_data, rw);
+ +	if (unlikely(!rq)) {
+ +		__blk_mq_run_hw_queue(hctx);
+ +		blk_mq_put_ctx(ctx);
+ +		trace_block_sleeprq(q, bio, rw);
+ +
+ +		ctx = blk_mq_get_ctx(q);
+ +		hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +		blk_mq_set_alloc_data(&alloc_data, q, 0, ctx, hctx);
+ +		rq = __blk_mq_alloc_request(&alloc_data, rw);
+ +		ctx = alloc_data.ctx;
+ +		hctx = alloc_data.hctx;
+ +	}
+ +
+ +	hctx->queued++;
+ +	data->hctx = hctx;
+ +	data->ctx = ctx;
+ +	return rq;
+  }
+  
+ -static void __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -					struct request *rq,
+ -					blk_qc_t *cookie, bool may_sleep)
+ +static void blk_mq_try_issue_directly(struct request *rq)
+  {
+ +	int ret;
+  	struct request_queue *q = rq->q;
+ +	struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q,
+ +			rq->mq_ctx->cpu);
+  	struct blk_mq_queue_data bd = {
+  		.rq = rq,
+ -		.last = true,
+ +		.list = NULL,
+ +		.last = 1
+  	};
+ -	blk_qc_t new_cookie;
+ -	blk_status_t ret;
+ -	bool run_queue = true;
+ -
+ -	/* RCU or SRCU read lock is needed before checking quiesced flag */
+ -	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(q)) {
+ -		run_queue = false;
+ -		goto insert;
+ -	}
+ -
+ -	if (q->elevator)
+ -		goto insert;
+  
+ -	if (!blk_mq_get_driver_tag(rq, NULL, false))
+++<<<<<<< HEAD
+ +	if (blk_mq_hctx_stopped(hctx))
+  		goto insert;
+ -
+++=======
++ 	if (!blk_mq_get_dispatch_budget(hctx)) {
++ 		blk_mq_put_driver_tag(rq);
++ 		goto insert;
++ 	}
++ 
++ 	new_cookie = request_to_qc_t(hctx, rq);
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  
+  	/*
+  	 * For OK queue, we are done. For error, kill it. Any other
+@@@ -1371,12 -1649,16 +1418,21 @@@
+  	 * would have done
+  	 */
+  	ret = q->mq_ops->queue_rq(hctx, &bd);
+ -	switch (ret) {
+ -	case BLK_STS_OK:
+ -		*cookie = new_cookie;
+ +	if (ret == BLK_MQ_RQ_QUEUE_OK)
+  		return;
+++<<<<<<< HEAD
+ +
+ +	if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
+ +		rq->errors = -EIO;
+ +		blk_mq_end_request(rq, rq->errors);
+++=======
++ 	case BLK_STS_RESOURCE:
++ 		__blk_mq_requeue_request(rq);
++ 		goto insert;
++ 	default:
++ 		*cookie = BLK_QC_T_NONE;
++ 		blk_mq_end_request(rq, ret);
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  		return;
+  	}
+  
+diff --cc block/blk-mq.h
+index 2d50f02667c4,f97aceff76e9..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -126,4 -136,24 +126,27 @@@ static inline bool blk_mq_hw_queue_mapp
+  	return hctx->nr_ctx && hctx->tags;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			unsigned int inflight[2]);
++ 
++ static inline void blk_mq_put_dispatch_budget(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 
++ 	if (q->mq_ops->put_budget)
++ 		q->mq_ops->put_budget(hctx);
++ }
++ 
++ static inline bool blk_mq_get_dispatch_budget(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 
++ 	if (q->mq_ops->get_budget)
++ 		return q->mq_ops->get_budget(hctx);
++ 	return true;
++ }
++ 
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  #endif
+diff --cc drivers/scsi/scsi_lib.c
+index 540886abddcc,286ea983c9e3..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1800,10 -1943,37 +1800,41 @@@ static int scsi_mq_prep_fn(struct reque
+  static void scsi_mq_done(struct scsi_cmnd *cmd)
+  {
+  	trace_scsi_dispatch_cmd_done(cmd);
+ -	blk_mq_complete_request(cmd->request);
+ +	blk_mq_complete_request(cmd->request, cmd->request->errors);
+  }
+  
+++<<<<<<< HEAD
+ +static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+++=======
++ static void scsi_mq_put_budget(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	struct scsi_device *sdev = q->queuedata;
++ 
++ 	atomic_dec(&sdev->device_busy);
++ 	put_device(&sdev->sdev_gendev);
++ }
++ 
++ static bool scsi_mq_get_budget(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	struct scsi_device *sdev = q->queuedata;
++ 
++ 	if (!get_device(&sdev->sdev_gendev))
++ 		goto out;
++ 	if (!scsi_dev_queue_ready(q, sdev))
++ 		goto out_put_device;
++ 
++ 	return true;
++ 
++ out_put_device:
++ 	put_device(&sdev->sdev_gendev);
++ out:
++ 	return false;
++ }
++ 
++ static blk_status_t scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  			 const struct blk_mq_queue_data *bd)
+  {
+  	struct request *req = bd->rq;
+diff --cc include/linux/blk-mq.h
+index ab31251b7413,674641527da7..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -117,18 -90,10 +117,25 @@@ struct blk_mq_queue_data 
+  	bool last;
+  };
+  
+++<<<<<<< HEAD
+ +/* None of these function pointers are covered by RHEL kABI */
+ +#ifdef __GENKSYMS__
+ +typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+ +#else
+ +typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, const struct blk_mq_queue_data *);
+ +#endif
+ +
+ +typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ +#ifdef __GENKSYMS__
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ +typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ +#endif
+++=======
++ typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
++ 		const struct blk_mq_queue_data *);
++ typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
++ typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
+++>>>>>>> 88022d7201e9 (blk-mq: don't handle failure in .get_budget)
+  typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+* Unmerged path drivers/scsi/scsi_lib.c
+* Unmerged path include/linux/blk-mq.h
