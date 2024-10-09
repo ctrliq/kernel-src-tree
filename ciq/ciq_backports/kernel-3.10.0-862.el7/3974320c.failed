@@ -1,0 +1,307 @@
+GFS2: Implement iomap for block_map
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 3974320ca6aa68d479051f208d5c95afd1e47a4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3974320c.failed
+
+This patch implements iomap for block mapping, and switches the
+block_map function to use it under the covers.
+
+The additional IOMAP_F_BOUNDARY iomap flag indicates when iomap has
+reached a "metadata boundary" and fetching the next mapping is likely to
+incur an additional I/O.  This flag is used for setting the bh buffer
+boundary flag.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 3974320ca6aa68d479051f208d5c95afd1e47a4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+#	include/linux/iomap.h
+diff --cc fs/gfs2/bmap.c
+index 15571283d4f0,d5f0d96169c5..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -608,87 -849,43 +795,116 @@@ int gfs2_block_map(struct inode *inode
+  		   struct buffer_head *bh_map, int create)
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
+++<<<<<<< HEAD
+ +	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ +	unsigned int bsize = sdp->sd_sb.sb_bsize;
+ +	const size_t maxlen = bh_map->b_size >> inode->i_blkbits;
+ +	const u64 *arr = sdp->sd_heightsize;
+ +	__be64 *ptr;
+ +	u64 size;
+ +	struct metapath mp;
+ +	int ret;
+ +	int eob;
+ +	unsigned int len;
+ +	struct buffer_head *bh;
+ +	u8 height;
+ +	bool zero_new = false;
+ +	sector_t dblock = 0;
+ +	unsigned dblks;
+ +
+ +	BUG_ON(maxlen == 0);
+ +
+ +	memset(mp.mp_bh, 0, sizeof(mp.mp_bh));
+ +	bmap_lock(ip, create);
+++=======
++ 	struct iomap iomap;
++ 	int ret, flags = 0;
++ 
+++>>>>>>> 3974320ca6aa (GFS2: Implement iomap for block_map)
+  	clear_buffer_mapped(bh_map);
+  	clear_buffer_new(bh_map);
+  	clear_buffer_boundary(bh_map);
+  	trace_gfs2_bmap(ip, bh_map, lblock, create, 1);
+++<<<<<<< HEAD
+ +	if (gfs2_is_dir(ip)) {
+ +		bsize = sdp->sd_jbsize;
+ +		arr = sdp->sd_jheightsize;
+ +	}
+ +
+ +	ret = gfs2_meta_inode_buffer(ip, &mp.mp_bh[0]);
+ +	if (ret)
+ +		goto out;
+ +
+ +	height = ip->i_height;
+ +	size = (lblock + 1) * bsize;
+ +	while (size > arr[height])
+ +		height++;
+ +	find_metapath(sdp, lblock, &mp, height);
+ +	mp.mp_aheight = 1;
+ +	if (height > ip->i_height || gfs2_is_stuffed(ip))
+ +		goto do_alloc;
+ +	ret = lookup_metapath(ip, &mp);
+ +	if (ret < 0)
+ +		goto out;
+ +	if (mp.mp_aheight != ip->i_height)
+ +		goto do_alloc;
+ +	ptr = metapointer(ip->i_height - 1, &mp);
+ +	if (*ptr == 0)
+ +		goto do_alloc;
+ +	map_bh(bh_map, inode->i_sb, be64_to_cpu(*ptr));
+ +	bh = mp.mp_bh[ip->i_height - 1];
+ +	len = gfs2_extent_length(bh->b_data, bh->b_size, ptr, maxlen, &eob);
+ +	bh_map->b_size = (len << inode->i_blkbits);
+ +	if (eob)
+ +		set_buffer_boundary(bh_map);
+ +	ret = 0;
+ +out:
+ +	release_metapath(&mp);
+ +	trace_gfs2_bmap(ip, bh_map, lblock, create, ret);
+ +	bmap_unlock(ip, create);
+ +	return ret;
+ +
+ +do_alloc:
+ +	/* All allocations are done here, firstly check create flag */
+ +	if (!create) {
+ +		BUG_ON(gfs2_is_stuffed(ip));
+ +		ret = 0;
+ +		goto out;
+ +	}
+ +
+ +	/* At this point ret is the tree depth of already allocated blocks */
+++=======
++ 
++ 	if (create)
++ 		flags |= IOMAP_WRITE;
+++>>>>>>> 3974320ca6aa (GFS2: Implement iomap for block_map)
+  	if (buffer_zeronew(bh_map))
+- 		zero_new = true;
+- 	ret = gfs2_bmap_alloc(inode, lblock, zero_new, &mp, maxlen, &dblock,
+- 			      &dblks);
+- 	if (ret == 0) {
+- 		map_bh(bh_map, inode->i_sb, dblock);
+- 		bh_map->b_size = dblks << inode->i_blkbits;
+- 		set_buffer_new(bh_map);
++ 		flags |= IOMAP_ZERO;
++ 	ret = gfs2_iomap_begin(inode, (loff_t)lblock << inode->i_blkbits,
++ 			       bh_map->b_size, flags, &iomap);
++ 	if (ret) {
++ 		if (!create && ret == -ENOENT) {
++ 			/* Return unmapped buffer beyond the end of file.  */
++ 			ret = 0;
++ 		}
++ 		goto out;
++ 	}
++ 
++ 	if (iomap.length > bh_map->b_size) {
++ 		iomap.length = bh_map->b_size;
++ 		iomap.flags &= ~IOMAP_F_BOUNDARY;
+  	}
+- 	goto out;
++ 	if (iomap.addr != IOMAP_NULL_ADDR)
++ 		map_bh(bh_map, inode->i_sb, iomap.addr >> inode->i_blkbits);
++ 	bh_map->b_size = iomap.length;
++ 	if (iomap.flags & IOMAP_F_BOUNDARY)
++ 		set_buffer_boundary(bh_map);
++ 	if (iomap.flags & IOMAP_F_NEW)
++ 		set_buffer_new(bh_map);
++ 
++ out:
++ 	trace_gfs2_bmap(ip, bh_map, lblock, create, ret);
++ 	return ret;
+  }
+  
+  /*
+diff --cc include/linux/iomap.h
+index c74226a738a3,a61be86710b5..000000000000
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@@ -15,22 -15,29 +15,27 @@@ struct vm_fault
+   */
+  #define IOMAP_HOLE	0x01	/* no blocks allocated, need allocation */
+  #define IOMAP_DELALLOC	0x02	/* delayed allocation blocks */
+ -#define IOMAP_MAPPED	0x03	/* blocks allocated at @addr */
+ -#define IOMAP_UNWRITTEN	0x04	/* blocks allocated at @addr in unwritten state */
+ +#define IOMAP_MAPPED	0x03	/* blocks allocated @blkno */
+ +#define IOMAP_UNWRITTEN	0x04	/* blocks allocated @blkno in unwritten state */
+  
+  /*
+ - * Flags for all iomap mappings:
+ + * Flags for iomap mappings:
+   */
+++<<<<<<< HEAD
+ +#define IOMAP_F_MERGED	0x01	/* contains multiple blocks/extents */
+ +#define IOMAP_F_SHARED	0x02	/* block shared with another file */
+++=======
++ #define IOMAP_F_NEW		0x01	/* blocks have been newly allocated */
++ #define IOMAP_F_BOUNDARY	0x02	/* mapping ends at metadata boundary */
+++>>>>>>> 3974320ca6aa (GFS2: Implement iomap for block_map)
+  
+  /*
+ - * Flags that only need to be reported for IOMAP_REPORT requests:
+ + * Magic value for blkno:
+   */
+ -#define IOMAP_F_MERGED		0x10	/* contains multiple blocks/extents */
+ -#define IOMAP_F_SHARED		0x20	/* block shared with another file */
+ -#define IOMAP_F_DATA_INLINE	0x40	/* data inline in the inode */
+ -
+ -/*
+ - * Magic value for addr:
+ - */
+ -#define IOMAP_NULL_ADDR -1ULL	/* addr is not valid */
+ +#define IOMAP_NULL_BLOCK -1LL	/* blkno is not valid */
+  
+  struct iomap {
+ -	u64			addr; /* disk offset of mapping, bytes */
+ +	sector_t		blkno;	/* 1st sector of mapping, 512b units */
+  	loff_t			offset;	/* file offset of mapping, bytes */
+  	u64			length;	/* length of mapping, bytes */
+  	u16			type;	/* type of mapping */
+* Unmerged path fs/gfs2/bmap.c
+diff --git a/fs/gfs2/bmap.h b/fs/gfs2/bmap.h
+index 42fea03e2bd9..ae77fbf8b45f 100644
+--- a/fs/gfs2/bmap.h
++++ b/fs/gfs2/bmap.h
+@@ -10,6 +10,8 @@
+ #ifndef __BMAP_DOT_H__
+ #define __BMAP_DOT_H__
+ 
++#include <linux/iomap.h>
++
+ #include "inode.h"
+ 
+ struct inode;
+@@ -47,6 +49,8 @@ static inline void gfs2_write_calc_reserv(const struct gfs2_inode *ip,
+ extern int gfs2_unstuff_dinode(struct gfs2_inode *ip, struct page *page);
+ extern int gfs2_block_map(struct inode *inode, sector_t lblock,
+ 			  struct buffer_head *bh, int create);
++extern int gfs2_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
++			    unsigned flags, struct iomap *iomap);
+ extern int gfs2_extent_map(struct inode *inode, u64 lblock, int *new,
+ 			   u64 *dblock, unsigned *extlen);
+ extern int gfs2_setattr_size(struct inode *inode, u64 size);
+diff --git a/fs/gfs2/trace_gfs2.h b/fs/gfs2/trace_gfs2.h
+index fff47d0e0ef5..d1de2edc2705 100644
+--- a/fs/gfs2/trace_gfs2.h
++++ b/fs/gfs2/trace_gfs2.h
+@@ -12,6 +12,7 @@
+ #include <linux/gfs2_ondisk.h>
+ #include <linux/writeback.h>
+ #include <linux/ktime.h>
++#include <linux/iomap.h>
+ #include "incore.h"
+ #include "glock.h"
+ #include "rgrp.h"
+@@ -469,6 +470,70 @@ TRACE_EVENT(gfs2_bmap,
+ 		  __entry->errno)
+ );
+ 
++TRACE_EVENT(gfs2_iomap_start,
++
++	TP_PROTO(const struct gfs2_inode *ip, loff_t pos, ssize_t length,
++		 u16 flags),
++
++	TP_ARGS(ip, pos, length, flags),
++
++	TP_STRUCT__entry(
++		__field(        dev_t,  dev                     )
++		__field(	u64,	inum			)
++		__field(	loff_t, pos			)
++		__field(	ssize_t, length			)
++		__field(	u16,	flags			)
++	),
++
++	TP_fast_assign(
++		__entry->dev            = ip->i_gl->gl_name.ln_sbd->sd_vfs->s_dev;
++		__entry->inum		= ip->i_no_addr;
++		__entry->pos		= pos;
++		__entry->length		= length;
++		__entry->flags		= flags;
++	),
++
++	TP_printk("%u,%u bmap %llu iomap start %llu/%lu flags:%08x",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  (unsigned long long)__entry->inum,
++		  (unsigned long long)__entry->pos,
++		  (unsigned long)__entry->length, (u16)__entry->flags)
++);
++
++TRACE_EVENT(gfs2_iomap_end,
++
++	TP_PROTO(const struct gfs2_inode *ip, struct iomap *iomap, int ret),
++
++	TP_ARGS(ip, iomap, ret),
++
++	TP_STRUCT__entry(
++		__field(        dev_t,  dev                     )
++		__field(	u64,	inum			)
++		__field(	loff_t, offset			)
++		__field(	ssize_t, length			)
++		__field(	u16,	flags			)
++		__field(	u16,	type			)
++		__field(	int,	ret			)
++	),
++
++	TP_fast_assign(
++		__entry->dev            = ip->i_gl->gl_name.ln_sbd->sd_vfs->s_dev;
++		__entry->inum		= ip->i_no_addr;
++		__entry->offset		= iomap->offset;
++		__entry->length		= iomap->length;
++		__entry->flags		= iomap->flags;
++		__entry->type		= iomap->type;
++		__entry->ret		= ret;
++	),
++
++	TP_printk("%u,%u bmap %llu iomap end %llu/%lu ty:%d flags:%08x rc:%d",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  (unsigned long long)__entry->inum,
++		  (unsigned long long)__entry->offset,
++		  (unsigned long)__entry->length, (u16)__entry->type,
++		  (u16)__entry->flags, __entry->ret)
++);
++
+ /* Keep track of blocks as they are allocated/freed */
+ TRACE_EVENT(gfs2_block_alloc,
+ 
+* Unmerged path include/linux/iomap.h
