@@ -1,0 +1,203 @@
+kvm/x86: Hyper-V VMBus hypercall userspace exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andrey Smetanin <asmetanin@virtuozzo.com>
+commit 83326e43f27e9a8a501427a0060f8af519a39bb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/83326e43.failed
+
+The patch implements KVM_EXIT_HYPERV userspace exit
+functionality for Hyper-V VMBus hypercalls:
+HV_X64_HCALL_POST_MESSAGE, HV_X64_HCALL_SIGNAL_EVENT.
+
+Changes v3:
+* use vcpu->arch.complete_userspace_io to setup hypercall
+result
+
+Changes v2:
+* use KVM_EXIT_HYPERV for hypercalls
+
+	Signed-off-by: Andrey Smetanin <asmetanin@virtuozzo.com>
+	Reviewed-by: Roman Kagan <rkagan@virtuozzo.com>
+CC: Gleb Natapov <gleb@kernel.org>
+CC: Paolo Bonzini <pbonzini@redhat.com>
+CC: Joerg Roedel <joro@8bytes.org>
+CC: "K. Y. Srinivasan" <kys@microsoft.com>
+CC: Haiyang Zhang <haiyangz@microsoft.com>
+CC: Roman Kagan <rkagan@virtuozzo.com>
+CC: Denis V. Lunev <den@openvz.org>
+CC: qemu-devel@nongnu.org
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 83326e43f27e9a8a501427a0060f8af519a39bb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virtual/kvm/api.txt
+index 9488596d832f,4a661e555c09..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -3098,21 -3337,33 +3098,51 @@@ the userspace IOAPIC should process th
+  it is still asserted.  Vector is the LAPIC interrupt vector for which the
+  EOI was received.
+  
+++<<<<<<< HEAD
+ +               /* KVM_EXIT_SYSTEM_EVENT */
+ +               struct {
+ +#define KVM_SYSTEM_EVENT_SHUTDOWN       1
+ +#define KVM_SYSTEM_EVENT_RESET          2
+ +#define KVM_SYSTEM_EVENT_CRASH          3
+ +                       __u32 type;
+ +                       __u64 flags;
+ +               } system_event;
+ +
+ +If exit_reason is KVM_EXIT_SYSTEM_EVENT then the vcpu has triggered
+ +a system-level event using some architecture specific mechanism (hypercall
+ +or some special instruction). In case of ARM/ARM64, this is triggered using
+ +HVC instruction based PSCI call from the vcpu. The 'type' field describes
+ +the system-level event type. The 'flags' field describes architecture
+ +specific flags for the system-level event.
+++=======
++ 		struct kvm_hyperv_exit {
++ #define KVM_EXIT_HYPERV_SYNIC          1
++ #define KVM_EXIT_HYPERV_HCALL          2
++ 			__u32 type;
++ 			union {
++ 				struct {
++ 					__u32 msr;
++ 					__u64 control;
++ 					__u64 evt_page;
++ 					__u64 msg_page;
++ 				} synic;
++ 				struct {
++ 					__u64 input;
++ 					__u64 result;
++ 					__u64 params[2];
++ 				} hcall;
++ 			} u;
++ 		};
++ 		/* KVM_EXIT_HYPERV */
++                 struct kvm_hyperv_exit hyperv;
++ Indicates that the VCPU exits into userspace to process some tasks
++ related to Hyper-V emulation.
++ Valid values for 'type' are:
++ 	KVM_EXIT_HYPERV_SYNIC -- synchronously notify user-space about
++ Hyper-V SynIC state change. Notification is used to remap SynIC
++ event/message pages and to enable/disable SynIC messages/events processing
++ in userspace.
+++>>>>>>> 83326e43f27e (kvm/x86: Hyper-V VMBus hypercall userspace exit)
+  
+  		/* Fix the size of the union. */
+  		char padding[256];
+diff --cc include/uapi/linux/kvm.h
+index 6b525ccf5361,82581b6e944d..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -147,6 -147,36 +147,39 @@@ struct kvm_pit_config 
+  
+  #define KVM_PIT_SPEAKER_DUMMY     1
+  
+++<<<<<<< HEAD
+++=======
++ struct kvm_s390_skeys {
++ 	__u64 start_gfn;
++ 	__u64 count;
++ 	__u64 skeydata_addr;
++ 	__u32 flags;
++ 	__u32 reserved[9];
++ };
++ 
++ struct kvm_hyperv_exit {
++ #define KVM_EXIT_HYPERV_SYNIC          1
++ #define KVM_EXIT_HYPERV_HCALL          2
++ 	__u32 type;
++ 	union {
++ 		struct {
++ 			__u32 msr;
++ 			__u64 control;
++ 			__u64 evt_page;
++ 			__u64 msg_page;
++ 		} synic;
++ 		struct {
++ 			__u64 input;
++ 			__u64 result;
++ 			__u64 params[2];
++ 		} hcall;
++ 	} u;
++ };
++ 
++ #define KVM_S390_GET_SKEYS_NONE   1
++ #define KVM_S390_SKEYS_MAX        1048576
++ 
+++>>>>>>> 83326e43f27e (kvm/x86: Hyper-V VMBus hypercall userspace exit)
+  #define KVM_EXIT_UNKNOWN          0
+  #define KVM_EXIT_EXCEPTION        1
+  #define KVM_EXIT_IO               2
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index a44fd11c98a7..2b1d17dfc9f7 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -483,6 +483,27 @@ bool kvm_hv_hypercall_enabled(struct kvm *kvm)
+ 	return READ_ONCE(kvm->arch.hyperv.hv_hypercall) & HV_X64_MSR_HYPERCALL_ENABLE;
+ }
+ 
++static void kvm_hv_hypercall_set_result(struct kvm_vcpu *vcpu, u64 result)
++{
++	bool longmode;
++
++	longmode = is_64_bit_mode(vcpu);
++	if (longmode)
++		kvm_register_write(vcpu, VCPU_REGS_RAX, result);
++	else {
++		kvm_register_write(vcpu, VCPU_REGS_RDX, result >> 32);
++		kvm_register_write(vcpu, VCPU_REGS_RAX, result & 0xffffffff);
++	}
++}
++
++static int kvm_hv_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++
++	kvm_hv_hypercall_set_result(vcpu, run->hyperv.u.hcall.result);
++	return 1;
++}
++
+ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ {
+ 	u64 param, ingpa, outgpa, ret;
+@@ -533,6 +554,16 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ 	case HVCALL_NOTIFY_LONG_SPIN_WAIT:
+ 		kvm_vcpu_on_spin(vcpu);
+ 		break;
++	case HVCALL_POST_MESSAGE:
++	case HVCALL_SIGNAL_EVENT:
++		vcpu->run->exit_reason = KVM_EXIT_HYPERV;
++		vcpu->run->hyperv.type = KVM_EXIT_HYPERV_HCALL;
++		vcpu->run->hyperv.u.hcall.input = param;
++		vcpu->run->hyperv.u.hcall.params[0] = ingpa;
++		vcpu->run->hyperv.u.hcall.params[1] = outgpa;
++		vcpu->arch.complete_userspace_io =
++				kvm_hv_hypercall_complete_userspace;
++		return 0;
+ 	default:
+ 		res = HV_STATUS_INVALID_HYPERCALL_CODE;
+ 		break;
+@@ -540,12 +571,6 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ 
+ set_result:
+ 	ret = res | (((u64)rep_done & 0xfff) << 32);
+-	if (longmode) {
+-		kvm_register_write(vcpu, VCPU_REGS_RAX, ret);
+-	} else {
+-		kvm_register_write(vcpu, VCPU_REGS_RDX, ret >> 32);
+-		kvm_register_write(vcpu, VCPU_REGS_RAX, ret & 0xffffffff);
+-	}
+-
++	kvm_hv_hypercall_set_result(vcpu, ret);
+ 	return 1;
+ }
+* Unmerged path include/uapi/linux/kvm.h
