@@ -1,0 +1,206 @@
+ALSA: x86: Don't bail out from PCM ops when disconnected
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit b1ef30e5ed17a417fc78eaff12da28f9a1c2efcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b1ef30e5.failed
+
+Currently the driver returns -ENODEV when the monitor is disconnected.
+But PA alsa module doesn't like this and it starts playing Juliet,
+kills itself as if it were a fatal tragedy.
+
+Since we protect the whole read/write at disconnection, just allow the
+PCM accesses even during disconnection.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit b1ef30e5ed17a417fc78eaff12da28f9a1c2efcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+diff --cc sound/x86/intel_hdmi_audio.c
+index 3dd33e089501,360cff35b239..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -952,41 -1047,15 +952,44 @@@ static int snd_intelhad_open(struct snd
+  {
+  	struct snd_intelhad *intelhaddata;
+  	struct snd_pcm_runtime *runtime;
+ +	struct had_stream_pvt *stream;
+ +	struct had_pvt_data *had_stream;
+  	int retval;
+  
+ +	pr_debug("snd_intelhad_open called\n");
+  	intelhaddata = snd_pcm_substream_chip(substream);
+ +	had_stream = intelhaddata->private_data;
+  	runtime = substream->runtime;
+ +	intelhaddata->underrun_count = 0;
+ +
+ +	pm_runtime_get(intelhaddata->dev);
+  
+ -	pm_runtime_get_sync(intelhaddata->dev);
+++<<<<<<< HEAD
+ +	if (had_get_hwstate(intelhaddata)) {
+ +		pr_err("%s: HDMI cable plugged-out\n", __func__);
+ +		retval = -ENODEV;
+ +		goto exit_put_handle;
+ +	}
+ +
+ +	/* Check, if device already in use */
+ +	if (runtime->private_data) {
+ +		pr_err("Device already in use\n");
+ +		retval = -EBUSY;
+ +		goto exit_put_handle;
+ +	}
+  
+++=======
+++>>>>>>> b1ef30e5ed17 (ALSA: x86: Don't bail out from PCM ops when disconnected)
+  	/* set the runtime hw parameter with local snd_pcm_hardware struct */
+ -	runtime->hw = had_pcm_hardware;
+ +	runtime->hw = snd_intel_hadstream;
+ +
+ +	stream = kzalloc(sizeof(*stream), GFP_KERNEL);
+ +	if (!stream) {
+ +		retval = -ENOMEM;
+ +		goto exit_put_handle;
+ +	}
+ +	stream->stream_status = STREAM_INIT;
+ +	runtime->private_data = stream;
+  
+  	retval = snd_pcm_hw_constraint_integer(runtime,
+  			 SNDRV_PCM_HW_PARAM_PERIODS);
+@@@ -1159,54 -1164,24 +1162,59 @@@ static int snd_intelhad_hw_free(struct 
+  	return 0;
+  }
+  
+ -/*
+ - * ALSA PCM trigger callback
+ +/**
+ + * snd_intelhad_pcm_trigger - stream activities are handled here
+ + * @substream:substream for which the stream function is called
+ + * @cmd:the stream commamd thats requested from upper layer
+ + * This function is called whenever an a stream activity is invoked
+   */
+ -static int had_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ +static int snd_intelhad_pcm_trigger(struct snd_pcm_substream *substream,
+ +					int cmd)
+  {
+ -	int retval = 0;
+ +	int caps, retval = 0;
+ +	unsigned long flag_irq;
+  	struct snd_intelhad *intelhaddata;
+ +	struct had_stream_pvt *stream;
+ +	struct had_pvt_data *had_stream;
+ +
+ +	pr_debug("snd_intelhad_pcm_trigger called\n");
+  
+  	intelhaddata = snd_pcm_substream_chip(substream);
+ +	stream = substream->runtime->private_data;
+ +	had_stream = intelhaddata->private_data;
+  
+ -	spin_lock(&intelhaddata->had_spinlock);
+  	switch (cmd) {
+  	case SNDRV_PCM_TRIGGER_START:
+++<<<<<<< HEAD
+ +		pr_debug("Trigger Start\n");
+ +
+ +		/* Disable local INTRs till register prgmng is done */
+ +		if (had_get_hwstate(intelhaddata)) {
+ +			pr_err("_START: HDMI cable plugged-out\n");
+ +			retval = -ENODEV;
+ +			break;
+ +		}
+ +		stream->stream_status = STREAM_RUNNING;
+ +
+ +		had_stream->stream_type = HAD_RUNNING_STREAM;
+ +
+++=======
++ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++ 	case SNDRV_PCM_TRIGGER_RESUME:
+++>>>>>>> b1ef30e5ed17 (ALSA: x86: Don't bail out from PCM ops when disconnected)
+  		/* Enable Audio */
+ -		had_ack_irqs(intelhaddata); /* FIXME: do we need this? */
+ -		had_enable_audio(intelhaddata, true);
+ +		/*
+ +		 * ToDo: Need to enable UNDERRUN interrupts as well
+ +		 *   caps = HDMI_AUDIO_UNDERRUN | HDMI_AUDIO_BUFFER_DONE;
+ +		 */
+ +		caps = HDMI_AUDIO_BUFFER_DONE;
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO_INT,
+ +				      &caps);
+ +		retval = had_set_caps(intelhaddata, HAD_SET_ENABLE_AUDIO, NULL);
+ +		snd_intelhad_enable_audio(substream, 1);
+ +
+ +		pr_debug("Processed _Start\n");
+ +
+  		break;
+  
+  	case SNDRV_PCM_TRIGGER_STOP:
+@@@ -1260,49 -1211,24 +1268,53 @@@ static int snd_intelhad_pcm_prepare(str
+  
+  	intelhaddata = snd_pcm_substream_chip(substream);
+  	runtime = substream->runtime;
+ +	had_stream = intelhaddata->private_data;
+ +
+++<<<<<<< HEAD
+ +	if (had_get_hwstate(intelhaddata)) {
+ +		pr_err("%s: HDMI cable plugged-out\n", __func__);
+ +		retval = -ENODEV;
+ +		goto prep_end;
+ +	}
+  
+ +	pr_debug("period_size=%d\n",
+++=======
++ 	dev_dbg(intelhaddata->dev, "period_size=%d\n",
+++>>>>>>> b1ef30e5ed17 (ALSA: x86: Don't bail out from PCM ops when disconnected)
+  		(int)frames_to_bytes(runtime, runtime->period_size));
+ -	dev_dbg(intelhaddata->dev, "periods=%d\n", runtime->periods);
+ -	dev_dbg(intelhaddata->dev, "buffer_size=%d\n",
+ -		(int)snd_pcm_lib_buffer_bytes(substream));
+ -	dev_dbg(intelhaddata->dev, "rate=%d\n", runtime->rate);
+ -	dev_dbg(intelhaddata->dev, "channels=%d\n", runtime->channels);
+ +	pr_debug("periods=%d\n", runtime->periods);
+ +	pr_debug("buffer_size=%d\n", (int)snd_pcm_lib_buffer_bytes(substream));
+ +	pr_debug("rate=%d\n", runtime->rate);
+ +	pr_debug("channels=%d\n", runtime->channels);
+ +
+ +	if (intelhaddata->stream_info.str_id) {
+ +		pr_debug("_prepare is called for existing str_id#%d\n",
+ +					intelhaddata->stream_info.str_id);
+ +		retval = snd_intelhad_pcm_trigger(substream,
+ +						SNDRV_PCM_TRIGGER_STOP);
+ +		return retval;
+ +	}
+ +
+ +	retval = snd_intelhad_init_stream(substream);
+ +	if (retval)
+ +		goto prep_end;
+  
+ -	had_do_reset(intelhaddata);
+  
+  	/* Get N value in KHz */
+ -	disp_samp_freq = intelhaddata->tmds_clock_speed;
+ +	retval = had_get_caps(intelhaddata, HAD_GET_DISPLAY_RATE,
+ +			      &disp_samp_freq);
+ +	if (retval) {
+ +		pr_err("querying display sampling freq failed %#x\n", retval);
+ +		goto prep_end;
+ +	}
+ +
+ +	had_get_caps(intelhaddata, HAD_GET_ELD, &intelhaddata->eeld);
+ +	had_get_caps(intelhaddata, HAD_GET_DP_OUTPUT, &intelhaddata->dp_output);
+  
+ -	retval = had_prog_n(substream->runtime->rate, &n_param, intelhaddata);
+ +	retval = snd_intelhad_prog_n(substream->runtime->rate, &n_param,
+ +				     intelhaddata);
+  	if (retval) {
+ -		dev_err(intelhaddata->dev,
+ -			"programming N value failed %#x\n", retval);
+ +		pr_err("programming N value failed %#x\n", retval);
+  		goto prep_end;
+  	}
+  
+* Unmerged path sound/x86/intel_hdmi_audio.c
