@@ -1,0 +1,159 @@
+tun: fix use after free for ptr_ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [net] tun: fix use after free for ptr_array (Eugenio Perez) [1713616]
+Rebuild_FUZZ: 90.41%
+commit-author Jason Wang <jasowang@redhat.com>
+commit b196d88aba8ac72b775137854121097f4c4c6862
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/b196d88a.failed
+
+We used to initialize ptr_ring during TUNSETIFF, this is because its
+size depends on the tx_queue_len of netdevice. And we try to clean it
+up when socket were detached from netdevice. A race were spotted when
+trying to do uninit during a read which will lead a use after free for
+pointer ring. Solving this by always initialize a zero size ptr_ring
+in open() and do resizing during TUNSETIFF, and then we can safely do
+cleanup during close(). With this, there's no need for the workaround
+that was introduced by commit 4df0bfc79904 ("tun: fix a memory leak
+for tfile->tx_array").
+
+	Reported-by: syzbot+e8b902c3c3fadf0a9dba@syzkaller.appspotmail.com
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+Fixes: 1576d9860599 ("tun: switch to use skb array for tx")
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b196d88aba8ac72b775137854121097f4c4c6862)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index 4cdb9597f760,9fbbb328b95b..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -505,14 -656,29 +505,18 @@@ static struct tun_struct *tun_enable_qu
+  	return tun;
+  }
+  
+ -void tun_ptr_free(void *ptr)
+ -{
+ -	if (!ptr)
+ -		return;
+ -	if (tun_is_xdp_buff(ptr)) {
+ -		struct xdp_buff *xdp = tun_ptr_to_xdp(ptr);
+ -
+ -		put_page(virt_to_head_page(xdp->data));
+ -	} else {
+ -		__skb_array_destroy_skb(ptr);
+ -	}
+ -}
+ -EXPORT_SYMBOL_GPL(tun_ptr_free);
+ -
+  static void tun_queue_purge(struct tun_file *tfile)
+  {
+ -	void *ptr;
+ +	struct sk_buff *skb;
+  
+ -	while ((ptr = ptr_ring_consume(&tfile->tx_ring)) != NULL)
+ -		tun_ptr_free(ptr);
+ +	while ((skb = skb_array_consume(&tfile->tx_array)) != NULL)
+ +		kfree_skb(skb);
+  
+  	skb_queue_purge(&tfile->sk.sk_write_queue);
+++<<<<<<< HEAD
+++=======
++ 	skb_queue_purge(&tfile->sk.sk_error_queue);
+++>>>>>>> b196d88aba8a (tun: fix use after free for ptr_ring)
+  }
+  
+  static void __tun_detach(struct tun_file *tfile, bool clean)
+@@@ -556,13 -727,9 +560,19 @@@
+  			    tun->dev->reg_state == NETREG_REGISTERED)
+  				unregister_netdevice(tun->dev);
+  		}
+++<<<<<<< HEAD
+ +
+ +		if (tun)
+ +			skb_array_cleanup(&tfile->tx_array);
+ +
+ +		BUG_ON(!test_bit(SOCK_EXTERNALLY_ALLOCATED,
+ +				 &tfile->socket.flags));
+ +		sk_release_kernel(&tfile->sk);
+++=======
++ 		if (tun)
++ 			xdp_rxq_info_unreg(&tfile->xdp_rxq);
++ 		sock_put(&tfile->sk);
+++>>>>>>> b196d88aba8a (tun: fix use after free for ptr_ring)
+  	}
+  }
+  
+@@@ -602,8 -772,10 +612,9 @@@ static void tun_detach_all(struct net_d
+  	synchronize_net();
+  	for (i = 0; i < n; i++) {
+  		tfile = rtnl_dereference(tun->tfiles[i]);
+ -		tun_napi_del(tun, tfile);
+  		/* Drop read queue */
+  		tun_queue_purge(tfile);
++ 		xdp_rxq_info_unreg(&tfile->xdp_rxq);
+  		sock_put(&tfile->sk);
+  	}
+  	list_for_each_entry_safe(tfile, tmp, &tun->disabled, next) {
+@@@ -650,7 -826,8 +662,12 @@@ static int tun_attach(struct tun_struc
+  	}
+  
+  	if (!tfile->detached &&
+++<<<<<<< HEAD
+ +	    skb_array_init(&tfile->tx_array, dev->tx_queue_len, GFP_KERNEL)) {
+++=======
++ 	    ptr_ring_resize(&tfile->tx_ring, dev->tx_queue_len,
++ 			    GFP_KERNEL, tun_ptr_free)) {
+++>>>>>>> b196d88aba8a (tun: fix use after free for ptr_ring)
+  		err = -ENOMEM;
+  		goto out;
+  	}
+@@@ -2615,12 -3208,16 +2632,21 @@@ static int tun_chr_open(struct inode *i
+  
+  	DBG1(KERN_INFO, "tunX: tun_chr_open\n");
+  
+ -	tfile = (struct tun_file *)sk_alloc(net, AF_UNSPEC, GFP_KERNEL,
+ -					    &tun_proto, 0);
+ +	tfile = (struct tun_file *)sk_alloc(&init_net, AF_UNSPEC, GFP_KERNEL,
+ +					    &tun_proto);
+  	if (!tfile)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+ +	rcu_assign_pointer(tfile->tun, NULL);
+ +	tfile->net = get_net(current->nsproxy->net_ns);
+++=======
++ 	if (ptr_ring_init(&tfile->tx_ring, 0, GFP_KERNEL)) {
++ 		sk_free(&tfile->sk);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	RCU_INIT_POINTER(tfile->tun, NULL);
+++>>>>>>> b196d88aba8a (tun: fix use after free for ptr_ring)
+  	tfile->flags = 0;
+  	tfile->ifindex = 0;
+  
+@@@ -2648,10 -3243,9 +2674,14 @@@
+  static int tun_chr_close(struct inode *inode, struct file *file)
+  {
+  	struct tun_file *tfile = file->private_data;
+ +	struct net *net = tfile->net;
+  
+  	tun_detach(tfile, true);
+++<<<<<<< HEAD
+ +	put_net(net);
+++=======
++ 	ptr_ring_cleanup(&tfile->tx_ring, tun_ptr_free);
+++>>>>>>> b196d88aba8a (tun: fix use after free for ptr_ring)
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/tun.c
