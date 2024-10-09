@@ -1,0 +1,134 @@
+nfp: report auto-negotiation in ethtool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 42b1e6aa4672beba79882673c687985b884f7904
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/42b1e6aa.failed
+
+NSP ABI version 0.17 is exposing the autonegotiation settings.
+Report whether autoneg is on via ethtool.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 42b1e6aa4672beba79882673c687985b884f7904)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87,dcb1bc81e554..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@@ -62,6 -62,8 +62,11 @@@
+  #define NSP_ETH_STATE_TX_ENABLED	BIT_ULL(2)
+  #define NSP_ETH_STATE_RX_ENABLED	BIT_ULL(3)
+  #define NSP_ETH_STATE_RATE		GENMASK_ULL(11, 8)
+++<<<<<<< HEAD
+++=======
++ #define NSP_ETH_STATE_OVRD_CHNG		BIT_ULL(22)
++ #define NSP_ETH_STATE_ANEG		GENMASK_ULL(25, 23)
+++>>>>>>> 42b1e6aa4672 (nfp: report auto-negotiation in ethtool)
+  
+  #define NSP_ETH_CTRL_ENABLED		BIT_ULL(1)
+  #define NSP_ETH_CTRL_TX_ENABLED		BIT_ULL(2)
+@@@ -134,9 -136,38 +139,44 @@@ nfp_eth_port_translate(const struct eth
+  
+  	nfp_eth_copy_mac_reverse(dst->mac_addr, src->mac_addr);
+  
+++<<<<<<< HEAD
+ +	snprintf(dst->label, sizeof(dst->label) - 1, "%llu.%llu",
+ +		 FIELD_GET(NSP_ETH_PORT_PHYLABEL, port),
+ +		 FIELD_GET(NSP_ETH_PORT_LABEL, port));
+++=======
++ 	dst->label_port = FIELD_GET(NSP_ETH_PORT_PHYLABEL, port);
++ 	dst->label_subport = FIELD_GET(NSP_ETH_PORT_LABEL, port);
++ 
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 17)
++ 		return;
++ 
++ 	dst->override_changed = FIELD_GET(NSP_ETH_STATE_OVRD_CHNG, state);
++ 	dst->aneg = FIELD_GET(NSP_ETH_STATE_ANEG, state);
++ }
++ 
++ static void
++ nfp_eth_mark_split_ports(struct nfp_cpp *cpp, struct nfp_eth_table *table)
++ {
++ 	unsigned int i, j;
++ 
++ 	for (i = 0; i < table->count; i++)
++ 		for (j = 0; j < table->count; j++) {
++ 			if (i == j)
++ 				continue;
++ 			if (table->ports[i].label_port !=
++ 			    table->ports[j].label_port)
++ 				continue;
++ 			if (table->ports[i].label_subport ==
++ 			    table->ports[j].label_subport)
++ 				nfp_warn(cpp,
++ 					 "Port %d subport %d is a duplicate\n",
++ 					 table->ports[i].label_port,
++ 					 table->ports[i].label_subport);
++ 
++ 			table->ports[i].is_split = true;
++ 			break;
++ 		}
+++>>>>>>> 42b1e6aa4672 (nfp: report auto-negotiation in ethtool)
+  }
+  
+  /**
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 023c710a1350..cb1ee2106d9d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -190,6 +190,10 @@ nfp_net_get_link_ksettings(struct net_device *netdev,
+ 	cmd->base.speed = SPEED_UNKNOWN;
+ 	cmd->base.duplex = DUPLEX_UNKNOWN;
+ 
++	if (nn->eth_port)
++		cmd->base.autoneg = nn->eth_port->aneg != NFP_ANEG_DISABLED ?
++			AUTONEG_ENABLE : AUTONEG_DISABLE;
++
+ 	if (!netif_carrier_ok(netdev))
+ 		return 0;
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+index edf703d319c8..7d68adbc75cb 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+@@ -37,6 +37,14 @@
+ #include <linux/types.h>
+ #include <linux/if_ether.h>
+ 
++enum nfp_eth_aneg {
++	NFP_ANEG_AUTO = 0,
++	NFP_ANEG_SEARCH,
++	NFP_ANEG_25G_CONSORTIUM,
++	NFP_ANEG_25G_IEEE,
++	NFP_ANEG_DISABLED,
++};
++
+ /**
+  * struct nfp_eth_table - ETH table information
+  * @count:	number of table entries
+@@ -48,6 +56,7 @@
+  * @base:	first channel index (within NBI)
+  * @lanes:	number of channels
+  * @speed:	interface speed (in Mbps)
++ * @aneg:	auto negotiation mode
+  * @mac_addr:	interface MAC address
+  * @label:	interface id string
+  * @enabled:	is enabled?
+@@ -64,6 +73,8 @@ struct nfp_eth_table {
+ 		unsigned int lanes;
+ 		unsigned int speed;
+ 
++		enum nfp_eth_aneg aneg;
++
+ 		u8 mac_addr[ETH_ALEN];
+ 		char label[8];
+ 
