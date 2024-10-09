@@ -1,0 +1,171 @@
+raid5-ppl: use resize_stripes() when enabling or disabling ppl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+commit 845b9e229fe0716ab6b4d94b4364c99069667b59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/845b9e22.failed
+
+Use resize_stripes() instead of raid5_reset_stripe_cache() to allocate
+or free sh->ppl_page at runtime for all stripes in the stripe cache.
+raid5_reset_stripe_cache() required suspending the mddev and could
+deadlock because of GFP_KERNEL allocations.
+
+Move the 'newsize' check to check_reshape() to allow reallocating the
+stripes with the same number of disks. Allocate sh->ppl_page in
+alloc_stripe() instead of grow_buffers(). Pass 'struct r5conf *conf' as
+a parameter to alloc_stripe() because it is needed to check whether to
+allocate ppl_page. Add free_stripe() and use it to free stripes rather
+than directly call kmem_cache_free(). Also free sh->ppl_page in
+free_stripe().
+
+Set MD_HAS_PPL at the end of ppl_init_log() instead of explicitly
+setting it in advance and add another parameter to log_init() to allow
+calling ppl_init_log() without the bit set. Don't try to calculate
+partial parity or add a stripe to log if it does not have ppl_page set.
+
+Enabling ppl can now be performed without suspending the mddev, because
+the log won't be used until new stripes are allocated with ppl_page.
+Calling mddev_suspend/resume is still necessary when disabling ppl,
+because we want all stripes to finish before stopping the log, but
+resize_stripes() can be called after mddev_resume() when ppl is no
+longer active.
+
+	Suggested-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 845b9e229fe0716ab6b4d94b4364c99069667b59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 1500f218f73e,e04d7b11bc87..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -2031,14 -2148,17 +2028,22 @@@ static struct stripe_head *alloc_stripe
+  		for (i = 0; i < disks; i++) {
+  			struct r5dev *dev = &sh->dev[i];
+  
+ -			bio_init(&dev->req, &dev->vec, 1);
+ -			bio_init(&dev->rreq, &dev->rvec, 1);
+ +			bio_init(&dev->req);
+ +			dev->req.bi_io_vec = &dev->vec;
+ +			dev->req.bi_max_vecs = 1;
+ +
+ +			bio_init(&dev->rreq);
+ +			dev->rreq.bi_io_vec = &dev->rvec;
+ +			dev->rreq.bi_max_vecs = 1;
+  		}
++ 
++ 		if (raid5_has_ppl(conf)) {
++ 			sh->ppl_page = alloc_page(gfp);
++ 			if (!sh->ppl_page) {
++ 				free_stripe(sc, sh);
++ 				sh = NULL;
++ 			}
++ 		}
+  	}
+  	return sh;
+  }
+@@@ -8155,18 -8292,42 +8143,57 @@@ static int raid5_change_consistency_pol
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (strncmp(buf, "ppl", 3) == 0 && !raid5_has_ppl(conf)) {
+ +		mddev_suspend(mddev);
+ +		set_bit(MD_HAS_PPL, &mddev->flags);
+ +		err = log_init(conf, NULL);
+ +		if (!err)
+ +			raid5_reset_stripe_cache(mddev);
+ +		mddev_resume(mddev);
+ +	} else if (strncmp(buf, "resync", 6) == 0 && raid5_has_ppl(conf)) {
+ +		mddev_suspend(mddev);
+ +		log_exit(conf);
+ +		raid5_reset_stripe_cache(mddev);
+ +		mddev_resume(mddev);
+++=======
++ 	if (strncmp(buf, "ppl", 3) == 0) {
++ 		/* ppl only works with RAID 5 */
++ 		if (!raid5_has_ppl(conf) && conf->level == 5) {
++ 			err = log_init(conf, NULL, true);
++ 			if (!err) {
++ 				err = resize_stripes(conf, conf->pool_size);
++ 				if (err)
++ 					log_exit(conf);
++ 			}
++ 		} else
++ 			err = -EINVAL;
++ 	} else if (strncmp(buf, "resync", 6) == 0) {
++ 		if (raid5_has_ppl(conf)) {
++ 			mddev_suspend(mddev);
++ 			log_exit(conf);
++ 			mddev_resume(mddev);
++ 			err = resize_stripes(conf, conf->pool_size);
++ 		} else if (test_bit(MD_HAS_JOURNAL, &conf->mddev->flags) &&
++ 			   r5l_log_disk_error(conf)) {
++ 			bool journal_dev_exists = false;
++ 			struct md_rdev *rdev;
++ 
++ 			rdev_for_each(rdev, mddev)
++ 				if (test_bit(Journal, &rdev->flags)) {
++ 					journal_dev_exists = true;
++ 					break;
++ 				}
++ 
++ 			if (!journal_dev_exists) {
++ 				mddev_suspend(mddev);
++ 				clear_bit(MD_HAS_JOURNAL, &mddev->flags);
++ 				mddev_resume(mddev);
++ 			} else  /* need remove journal device first */
++ 				err = -EBUSY;
++ 		} else
++ 			err = -EINVAL;
+++>>>>>>> 845b9e229fe0 (raid5-ppl: use resize_stripes() when enabling or disabling ppl)
+  	} else {
+  		err = -EINVAL;
+  	}
+diff --git a/drivers/md/raid5-log.h b/drivers/md/raid5-log.h
+index a3f05ab8085f..dccbe0ceaf4b 100644
+--- a/drivers/md/raid5-log.h
++++ b/drivers/md/raid5-log.h
+@@ -64,11 +64,12 @@ static inline void log_exit(struct r5conf *conf)
+ 		ppl_exit_log(conf);
+ }
+ 
+-static inline int log_init(struct r5conf *conf, struct md_rdev *journal_dev)
++static inline int log_init(struct r5conf *conf, struct md_rdev *journal_dev,
++			   bool ppl)
+ {
+ 	if (journal_dev)
+ 		return r5l_init_log(conf, journal_dev);
+-	else if (raid5_has_ppl(conf))
++	else if (ppl)
+ 		return ppl_init_log(conf);
+ 
+ 	return 0;
+diff --git a/drivers/md/raid5-ppl.c b/drivers/md/raid5-ppl.c
+index d82ba1ae30b5..7ceda1af5234 100644
+--- a/drivers/md/raid5-ppl.c
++++ b/drivers/md/raid5-ppl.c
+@@ -336,7 +336,7 @@ int ppl_write_stripe(struct r5conf *conf, struct stripe_head *sh)
+ 	struct ppl_io_unit *io = sh->ppl_io;
+ 	struct ppl_log *log;
+ 
+-	if (io || test_bit(STRIPE_SYNCING, &sh->state) ||
++	if (io || test_bit(STRIPE_SYNCING, &sh->state) || !sh->ppl_page ||
+ 	    !test_bit(R5_Wantwrite, &sh->dev[sh->pd_idx].flags) ||
+ 	    !test_bit(R5_Insync, &sh->dev[sh->pd_idx].flags)) {
+ 		clear_bit(STRIPE_LOG_TRAPPED, &sh->state);
+@@ -1210,6 +1210,7 @@ int ppl_init_log(struct r5conf *conf)
+ 	}
+ 
+ 	conf->log_private = ppl_conf;
++	set_bit(MD_HAS_PPL, &ppl_conf->mddev->flags);
+ 
+ 	return 0;
+ err:
+* Unmerged path drivers/md/raid5.c
