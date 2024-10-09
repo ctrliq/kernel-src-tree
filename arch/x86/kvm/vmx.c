@@ -7191,7 +7191,6 @@ static int nested_vmx_check_vmcs12(struct kvm_vcpu *vcpu)
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	if (vmx->nested.current_vmptr == -1ull) {
 		nested_vmx_failInvalid(vcpu);
-		skip_emulated_instruction(vcpu);
 		return 0;
 	}
 	return 1;
@@ -7205,9 +7204,13 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
 	u32 vmx_instruction_info = vmcs_read32(VMX_INSTRUCTION_INFO);
 	gva_t gva = 0;
 
-	if (!nested_vmx_check_permission(vcpu) ||
-	    !nested_vmx_check_vmcs12(vcpu))
+	if (!nested_vmx_check_permission(vcpu))
 		return 1;
+
+	if (!nested_vmx_check_vmcs12(vcpu)) {
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
 
 	/* Decode instruction info and find the field to read */
 	field = kvm_register_readl(vcpu, (((vmx_instruction_info) >> 28) & 0xf));
@@ -7255,9 +7258,13 @@ static int handle_vmwrite(struct kvm_vcpu *vcpu)
 	u64 field_value = 0;
 	struct x86_exception e;
 
-	if (!nested_vmx_check_permission(vcpu) ||
-	    !nested_vmx_check_vmcs12(vcpu))
+	if (!nested_vmx_check_permission(vcpu))
 		return 1;
+
+	if (!nested_vmx_check_vmcs12(vcpu)) {
+		skip_emulated_instruction(vcpu);
+		return 1;
+	}
 
 	if (vmx_instruction_info & (1u << 10))
 		field_value = kvm_register_readl(vcpu,
@@ -9970,11 +9977,12 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 	u32 msr_entry_idx;
 	unsigned long exit_qualification;
 
-	if (!nested_vmx_check_permission(vcpu) ||
-	    !nested_vmx_check_vmcs12(vcpu))
+	if (!nested_vmx_check_permission(vcpu))
 		return 1;
 
-	skip_emulated_instruction(vcpu);
+	if (!nested_vmx_check_vmcs12(vcpu))
+		goto out;
+
 	vmcs12 = get_vmcs12(vcpu);
 
 	if (enable_shadow_vmcs)
@@ -9994,33 +10002,33 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		nested_vmx_failValid(vcpu,
 			launch ? VMXERR_VMLAUNCH_NONCLEAR_VMCS
 			       : VMXERR_VMRESUME_NONLAUNCHED_VMCS);
-		return 1;
+		goto out;
 	}
 
 	if (vmcs12->guest_activity_state != GUEST_ACTIVITY_ACTIVE &&
 	    vmcs12->guest_activity_state != GUEST_ACTIVITY_HLT) {
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (!nested_get_vmcs12_pages(vcpu, vmcs12)) {
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (nested_vmx_check_msr_bitmap_controls(vcpu, vmcs12)) {
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (nested_vmx_check_apicv_controls(vcpu, vmcs12)) {
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (nested_vmx_check_msr_switch_controls(vcpu, vmcs12)) {
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (!vmx_control_verify(vmcs12->cpu_based_vm_exec_control,
@@ -10040,7 +10048,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 				vmx->nested.nested_vmx_entry_ctls_high))
 	{
 		nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (((vmcs12->host_cr0 & VMXON_CR0_ALWAYSON) != VMXON_CR0_ALWAYSON) ||
@@ -10048,19 +10056,19 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 	    !nested_cr3_valid(vcpu, vmcs12->host_cr3)) {
 		nested_vmx_failValid(vcpu,
 			VMXERR_ENTRY_INVALID_HOST_STATE_FIELD);
-		return 1;
+		goto out;
 	}
 
 	if (!nested_cr0_valid(vcpu, vmcs12->guest_cr0) ||
 	    ((vmcs12->guest_cr4 & VMXON_CR4_ALWAYSON) != VMXON_CR4_ALWAYSON)) {
 		nested_vmx_entry_failure(vcpu, vmcs12,
 			EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-		return 1;
+		goto out;
 	}
 	if (vmcs12->vmcs_link_pointer != -1ull) {
 		nested_vmx_entry_failure(vcpu, vmcs12,
 			EXIT_REASON_INVALID_STATE, ENTRY_FAIL_VMCS_LINK_PTR);
-		return 1;
+		goto out;
 	}
 
 	/*
@@ -10080,7 +10088,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		     ia32e != !!(vmcs12->guest_ia32_efer & EFER_LME))) {
 			nested_vmx_entry_failure(vcpu, vmcs12,
 				EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-			return 1;
+			goto out;
 		}
 	}
 
@@ -10098,7 +10106,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LME)) {
 			nested_vmx_entry_failure(vcpu, vmcs12,
 				EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-			return 1;
+			goto out;
 		}
 	}
 
@@ -10111,6 +10119,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 	if (!vmcs02)
 		return -ENOMEM;
 
+	skip_emulated_instruction(vcpu);
 	enter_guest_mode(vcpu);
 
 	if (!(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS))
@@ -10157,6 +10166,10 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 	 * returned as far as L1 is concerned. It will only return (and set
 	 * the success flag) when L2 exits (see nested_vmx_vmexit()).
 	 */
+	return 1;
+
+out:
+	skip_emulated_instruction(vcpu);
 	return 1;
 }
 
