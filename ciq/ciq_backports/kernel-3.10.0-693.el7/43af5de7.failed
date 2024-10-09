@@ -1,0 +1,216 @@
+lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [fs] lsm, audit, selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE (Vivek Goyal) [1297929]
+Rebuild_FUZZ: 98.59%
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 43af5de74288a7cdc3684902c5259346ae67adf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/43af5de7.failed
+
+Right now LSM_AUDIT_DATA_PATH type contains "struct path" in union "u"
+of common_audit_data. This information is used to print path of file
+at the same time it is also used to get to dentry and inode. And this
+inode information is used to get to superblock and device and print
+device information.
+
+This does not work well for layered filesystems like overlay where dentry
+contained in path is overlay dentry and not the real dentry of underlying
+file system. That means inode retrieved from dentry is also overlay
+inode and not the real inode.
+
+SELinux helpers like file_path_has_perm() are doing checks on inode
+retrieved from file_inode(). This returns the real inode and not the
+overlay inode. That means we are doing check on real inode but for audit
+purposes we are printing details of overlay inode and that can be
+confusing while debugging.
+
+Hence, introduce a new type LSM_AUDIT_DATA_FILE which carries file
+information and inode retrieved is real inode using file_inode(). That
+way right avc denied information is given to user.
+
+For example, following is one example avc before the patch.
+
+  type=AVC msg=audit(1473360868.399:214): avc:  denied  { read open } for
+    pid=1765 comm="cat"
+    path="/root/.../overlay/container1/merged/readfile"
+    dev="overlay" ino=21443
+    scontext=unconfined_u:unconfined_r:test_overlay_client_t:s0:c10,c20
+    tcontext=unconfined_u:object_r:test_overlay_files_ro_t:s0
+    tclass=file permissive=0
+
+It looks as follows after the patch.
+
+  type=AVC msg=audit(1473360017.388:282): avc:  denied  { read open } for
+    pid=2530 comm="cat"
+    path="/root/.../overlay/container1/merged/readfile"
+    dev="dm-0" ino=2377915
+    scontext=unconfined_u:unconfined_r:test_overlay_client_t:s0:c10,c20
+    tcontext=unconfined_u:object_r:test_overlay_files_ro_t:s0
+    tclass=file permissive=0
+
+Notice that now dev information points to "dm-0" device instead of
+"overlay" device. This makes it clear that check failed on underlying
+inode and not on the overlay inode.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+[PM: slight tweaks to the description to make checkpatch.pl happy]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 43af5de74288a7cdc3684902c5259346ae67adf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lsm_audit.h
+#	security/lsm_audit.c
+#	security/selinux/hooks.c
+diff --cc include/linux/lsm_audit.h
+index 1cc89e9df480,e58e577117b6..000000000000
+--- a/include/linux/lsm_audit.h
++++ b/include/linux/lsm_audit.h
+@@@ -53,6 -58,8 +53,11 @@@ struct common_audit_data 
+  #define LSM_AUDIT_DATA_KMOD	8
+  #define LSM_AUDIT_DATA_INODE	9
+  #define LSM_AUDIT_DATA_DENTRY	10
+++<<<<<<< HEAD
+++=======
++ #define LSM_AUDIT_DATA_IOCTL_OP	11
++ #define LSM_AUDIT_DATA_FILE	12
+++>>>>>>> 43af5de74288 (lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE)
+  	union 	{
+  		struct path path;
+  		struct dentry *dentry;
+@@@ -68,6 -75,8 +73,11 @@@
+  		} key_struct;
+  #endif
+  		char *kmod_name;
+++<<<<<<< HEAD
+++=======
++ 		struct lsm_ioctlop_audit *op;
++ 		struct file *file;
+++>>>>>>> 43af5de74288 (lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE)
+  	} u;
+  	/* this union contains LSM specific data */
+  	union {
+diff --cc security/lsm_audit.c
+index b526ddc3add5,8bfa3147fd54..000000000000
+--- a/security/lsm_audit.c
++++ b/security/lsm_audit.c
+@@@ -245,6 -245,34 +245,37 @@@ static void dump_common_audit_data(stru
+  		}
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case LSM_AUDIT_DATA_FILE: {
++ 		struct inode *inode;
++ 
++ 		audit_log_d_path(ab, " path=", &a->u.file->f_path);
++ 
++ 		inode = file_inode(a->u.file);
++ 		if (inode) {
++ 			audit_log_format(ab, " dev=");
++ 			audit_log_untrustedstring(ab, inode->i_sb->s_id);
++ 			audit_log_format(ab, " ino=%lu", inode->i_ino);
++ 		}
++ 		break;
++ 	}
++ 	case LSM_AUDIT_DATA_IOCTL_OP: {
++ 		struct inode *inode;
++ 
++ 		audit_log_d_path(ab, " path=", &a->u.op->path);
++ 
++ 		inode = a->u.op->path.dentry->d_inode;
++ 		if (inode) {
++ 			audit_log_format(ab, " dev=");
++ 			audit_log_untrustedstring(ab, inode->i_sb->s_id);
++ 			audit_log_format(ab, " ino=%lu", inode->i_ino);
++ 		}
++ 
++ 		audit_log_format(ab, " ioctlcmd=0x%hx", a->u.op->cmd);
++ 		break;
++ 	}
+++>>>>>>> 43af5de74288 (lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE)
+  	case LSM_AUDIT_DATA_DENTRY: {
+  		struct inode *inode;
+  
+diff --cc security/selinux/hooks.c
+index d1ea9953353a,2205ea27aa0a..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -1621,9 -1761,9 +1621,15 @@@ static inline int file_path_has_perm(co
+  {
+  	struct common_audit_data ad;
+  
+++<<<<<<< HEAD
+ +	ad.type = LSM_AUDIT_DATA_PATH;
+ +	ad.u.path = file->f_path;
+ +	return inode_has_perm(cred, file_inode(file), av, &ad, 0);
+++=======
++ 	ad.type = LSM_AUDIT_DATA_FILE;
++ 	ad.u.file = file;
++ 	return inode_has_perm(cred, file_inode(file), av, &ad);
+++>>>>>>> 43af5de74288 (lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE)
+  }
+  
+  /* Check whether a task can use an open file descriptor to
+@@@ -3538,6 -3818,52 +3544,55 @@@ static int selinux_kernel_module_reques
+  			    SYSTEM__MODULE_REQUEST, &ad);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int selinux_kernel_module_from_file(struct file *file)
++ {
++ 	struct common_audit_data ad;
++ 	struct inode_security_struct *isec;
++ 	struct file_security_struct *fsec;
++ 	u32 sid = current_sid();
++ 	int rc;
++ 
++ 	/* init_module */
++ 	if (file == NULL)
++ 		return avc_has_perm(sid, sid, SECCLASS_SYSTEM,
++ 					SYSTEM__MODULE_LOAD, NULL);
++ 
++ 	/* finit_module */
++ 
++ 	ad.type = LSM_AUDIT_DATA_FILE;
++ 	ad.u.file = file;
++ 
++ 	fsec = file->f_security;
++ 	if (sid != fsec->sid) {
++ 		rc = avc_has_perm(sid, fsec->sid, SECCLASS_FD, FD__USE, &ad);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	isec = inode_security(file_inode(file));
++ 	return avc_has_perm(sid, isec->sid, SECCLASS_SYSTEM,
++ 				SYSTEM__MODULE_LOAD, &ad);
++ }
++ 
++ static int selinux_kernel_read_file(struct file *file,
++ 				    enum kernel_read_file_id id)
++ {
++ 	int rc = 0;
++ 
++ 	switch (id) {
++ 	case READING_MODULE:
++ 		rc = selinux_kernel_module_from_file(file);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 43af5de74288 (lsm,audit,selinux: Introduce a new audit data type LSM_AUDIT_DATA_FILE)
+  static int selinux_task_setpgid(struct task_struct *p, pid_t pgid)
+  {
+  	return current_has_perm(p, PROCESS__SETPGID);
+* Unmerged path include/linux/lsm_audit.h
+* Unmerged path security/lsm_audit.c
+* Unmerged path security/selinux/hooks.c
