@@ -1,0 +1,313 @@
+net/mlx5: Add user chosen levels when allocating flow tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Add user chosen levels when allocating flow tables (Don Dutile) [1383273 1417284]
+Rebuild_FUZZ: 96.55%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit d63cd28608bb563d52e62990fa01c016e8dbdb75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d63cd286.failed
+
+Currently, consumers of the flow steering infrastructure can't
+choose their own flow table levels and are limited to one
+flow table per level. This just waste levels.
+Instead, we introduce here the possibility to use multiple
+flow tables in a level. The user is free to connect these
+flow tables, while following the rule (FTEs in FT of level x
+could only point to FTs of level y where y > x).
+
+In addition this patch switch the order of the create/destroy
+flow tables of the NIC(vlan and main).
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d63cd28608bb563d52e62990fa01c016e8dbdb75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index c59be3674778..f9b68537b0ee 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1840,7 +1840,8 @@ static struct mlx5_ib_flow_prio *get_flow_table(struct mlx5_ib_dev *dev,
+ 	if (!ft) {
+ 		ft = mlx5_create_auto_grouped_flow_table(ns, priority,
+ 							 num_entries,
+-							 num_groups);
++							 num_groups,
++							 0);
+ 
+ 		if (!IS_ERR(ft)) {
+ 			prio->refcount = 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+index 4df49e660587..d61171ae0168 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@ -37,6 +37,11 @@
+ #include <linux/mlx5/fs.h>
+ #include "en.h"
+ 
++enum {
++	MLX5E_VLAN_FT_LEVEL = 0,
++	MLX5E_MAIN_FT_LEVEL
++};
++
+ #define MLX5_SET_CFG(p, f, v) MLX5_SET(create_flow_group_in, p, f, v)
+ 
+ enum {
+@@ -1041,7 +1046,8 @@ static int mlx5e_create_main_flow_table(struct mlx5e_priv *priv)
+ 	int err;
+ 
+ 	ft->num_groups = 0;
+-	ft->t = mlx5_create_flow_table(priv->fts.ns, 1, MLX5E_MAIN_TABLE_SIZE);
++	ft->t = mlx5_create_flow_table(priv->fts.ns, 1, MLX5E_MAIN_TABLE_SIZE,
++				       MLX5E_MAIN_FT_LEVEL);
+ 
+ 	if (IS_ERR(ft->t)) {
+ 		err = PTR_ERR(ft->t);
+@@ -1150,7 +1156,8 @@ static int mlx5e_create_vlan_flow_table(struct mlx5e_priv *priv)
+ 	int err;
+ 
+ 	ft->num_groups = 0;
+-	ft->t = mlx5_create_flow_table(priv->fts.ns, 1, MLX5E_VLAN_TABLE_SIZE);
++	ft->t = mlx5_create_flow_table(priv->fts.ns, 1, MLX5E_VLAN_TABLE_SIZE,
++				       MLX5E_VLAN_FT_LEVEL);
+ 
+ 	if (IS_ERR(ft->t)) {
+ 		err = PTR_ERR(ft->t);
+@@ -1167,11 +1174,16 @@ static int mlx5e_create_vlan_flow_table(struct mlx5e_priv *priv)
+ 	if (err)
+ 		goto err_free_g;
+ 
++	err = mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_UNTAGGED, 0);
++	if (err)
++		goto err_destroy_vlan_flow_groups;
++
+ 	return 0;
+ 
++err_destroy_vlan_flow_groups:
++	mlx5e_destroy_groups(ft);
+ err_free_g:
+ 	kfree(ft->g);
+-
+ err_destroy_vlan_flow_table:
+ 	mlx5_destroy_flow_table(ft->t);
+ 	ft->t = NULL;
+@@ -1194,15 +1206,11 @@ int mlx5e_create_flow_tables(struct mlx5e_priv *priv)
+ 	if (!priv->fts.ns)
+ 		return -EINVAL;
+ 
+-	err = mlx5e_create_vlan_flow_table(priv);
+-	if (err)
+-		return err;
+-
+ 	err = mlx5e_create_main_flow_table(priv);
+ 	if (err)
+-		goto err_destroy_vlan_flow_table;
++		return err;
+ 
+-	err = mlx5e_add_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_UNTAGGED, 0);
++	err = mlx5e_create_vlan_flow_table(priv);
+ 	if (err)
+ 		goto err_destroy_main_flow_table;
+ 
+@@ -1210,8 +1218,6 @@ int mlx5e_create_flow_tables(struct mlx5e_priv *priv)
+ 
+ err_destroy_main_flow_table:
+ 	mlx5e_destroy_main_flow_table(priv);
+-err_destroy_vlan_flow_table:
+-	mlx5e_destroy_vlan_flow_table(priv);
+ 
+ 	return err;
+ }
+@@ -1219,6 +1225,6 @@ err_destroy_vlan_flow_table:
+ void mlx5e_destroy_flow_tables(struct mlx5e_priv *priv)
+ {
+ 	mlx5e_del_vlan_rule(priv, MLX5E_VLAN_RULE_TYPE_UNTAGGED, 0);
+-	mlx5e_destroy_main_flow_table(priv);
+ 	mlx5e_destroy_vlan_flow_table(priv);
++	mlx5e_destroy_main_flow_table(priv);
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 6c7352099dd6..a573101a761b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -414,7 +414,7 @@ static int esw_create_fdb_table(struct mlx5_eswitch *esw, int nvports)
+ 	memset(flow_group_in, 0, inlen);
+ 
+ 	table_size = BIT(MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size));
+-	fdb = mlx5_create_flow_table(root_ns, 0, table_size);
++	fdb = mlx5_create_flow_table(root_ns, 0, table_size, 0);
+ 	if (IS_ERR_OR_NULL(fdb)) {
+ 		err = PTR_ERR(fdb);
+ 		esw_warn(dev, "Failed to create FDB Table err %d\n", err);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index de1cde8dc012..d4c01ecd118b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -237,19 +237,6 @@ static struct fs_prio *find_prio(struct mlx5_flow_namespace *ns,
+ 	return NULL;
+ }
+ 
+-static unsigned int find_next_free_level(struct fs_prio *prio)
+-{
+-	if (!list_empty(&prio->node.children)) {
+-		struct mlx5_flow_table *ft;
+-
+-		ft = list_last_entry(&prio->node.children,
+-				     struct mlx5_flow_table,
+-				     node.list);
+-		return ft->level + 1;
+-	}
+-	return prio->start_level;
+-}
+-
+ static bool masked_memcmp(void *mask, void *val1, void *val2, size_t size)
+ {
+ 	unsigned int i;
+@@ -711,9 +698,23 @@ static int connect_flow_table(struct mlx5_core_dev *dev, struct mlx5_flow_table
+ 	return err;
+ }
+ 
++static void list_add_flow_table(struct mlx5_flow_table *ft,
++				struct fs_prio *prio)
++{
++	struct list_head *prev = &prio->node.children;
++	struct mlx5_flow_table *iter;
++
++	fs_for_each_ft(iter, prio) {
++		if (iter->level > ft->level)
++			break;
++		prev = &iter->node.list;
++	}
++	list_add(&ft->node.list, prev);
++}
++
+ struct mlx5_flow_table *mlx5_create_flow_table(struct mlx5_flow_namespace *ns,
+-					       int prio,
+-					       int max_fte)
++					       int prio, int max_fte,
++					       u32 level)
+ {
+ 	struct mlx5_flow_table *next_ft = NULL;
+ 	struct mlx5_flow_table *ft;
+@@ -734,12 +735,15 @@ struct mlx5_flow_table *mlx5_create_flow_table(struct mlx5_flow_namespace *ns,
+ 		err = -EINVAL;
+ 		goto unlock_root;
+ 	}
+-	if (fs_prio->num_ft == fs_prio->num_levels) {
++	if (level >= fs_prio->num_levels) {
+ 		err = -ENOSPC;
+ 		goto unlock_root;
+ 	}
+-
+-	ft = alloc_flow_table(find_next_free_level(fs_prio),
++	/* The level is related to the
++	 * priority level range.
++	 */
++	level += fs_prio->start_level;
++	ft = alloc_flow_table(level,
+ 			      roundup_pow_of_two(max_fte),
+ 			      root->table_type);
+ 	if (!ft) {
+@@ -760,7 +764,7 @@ struct mlx5_flow_table *mlx5_create_flow_table(struct mlx5_flow_namespace *ns,
+ 		goto destroy_ft;
+ 	lock_ref_node(&fs_prio->node);
+ 	tree_add_node(&ft->node, &fs_prio->node);
+-	list_add_tail(&ft->node.list, &fs_prio->node.children);
++	list_add_flow_table(ft, fs_prio);
+ 	fs_prio->num_ft++;
+ 	unlock_ref_node(&fs_prio->node);
+ 	mutex_unlock(&root->chain_lock);
+@@ -777,14 +781,15 @@ unlock_root:
+ struct mlx5_flow_table *mlx5_create_auto_grouped_flow_table(struct mlx5_flow_namespace *ns,
+ 							    int prio,
+ 							    int num_flow_table_entries,
+-							    int max_num_groups)
++							    int max_num_groups,
++							    u32 level)
+ {
+ 	struct mlx5_flow_table *ft;
+ 
+ 	if (max_num_groups > num_flow_table_entries)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	ft = mlx5_create_flow_table(ns, prio, num_flow_table_entries);
++	ft = mlx5_create_flow_table(ns, prio, num_flow_table_entries, level);
+ 	if (IS_ERR(ft))
+ 		return ft;
+ 
+@@ -1104,6 +1109,20 @@ unlock_fg:
+ 	return rule;
+ }
+ 
++static bool dest_is_valid(struct mlx5_flow_destination *dest,
++			  u32 action,
++			  struct mlx5_flow_table *ft)
++{
++	if (!(action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST))
++		return true;
++
++	if (!dest || ((dest->type ==
++	    MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE) &&
++	    (dest->ft->level <= ft->level)))
++		return false;
++	return true;
++}
++
+ static struct mlx5_flow_rule *
+ _mlx5_add_flow_rule(struct mlx5_flow_table *ft,
+ 		    u8 match_criteria_enable,
+@@ -1116,7 +1135,7 @@ _mlx5_add_flow_rule(struct mlx5_flow_table *ft,
+ 	struct mlx5_flow_group *g;
+ 	struct mlx5_flow_rule *rule;
+ 
+-	if ((action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) && !dest)
++	if (!dest_is_valid(dest, action, ft))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	nested_lock_ref_node(&ft->node, FS_MUTEX_GRANDPARENT);
+@@ -1559,6 +1578,7 @@ static void set_prio_attrs(struct mlx5_flow_root_namespace *root_ns)
+ 
+ #define ANCHOR_PRIO 0
+ #define ANCHOR_SIZE 1
++#define ANCHOR_LEVEL 0
+ static int create_anchor_flow_table(struct mlx5_core_dev
+ 							*dev)
+ {
+@@ -1568,7 +1588,7 @@ static int create_anchor_flow_table(struct mlx5_core_dev
+ 	ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_ANCHOR);
+ 	if (!ns)
+ 		return -EINVAL;
+-	ft = mlx5_create_flow_table(ns, ANCHOR_PRIO, ANCHOR_SIZE);
++	ft = mlx5_create_flow_table(ns, ANCHOR_PRIO, ANCHOR_SIZE, ANCHOR_LEVEL);
+ 	if (IS_ERR(ft)) {
+ 		mlx5_core_err(dev, "Failed to create last anchor flow table");
+ 		return PTR_ERR(ft);
+diff --git a/include/linux/mlx5/fs.h b/include/linux/mlx5/fs.h
+index 3f3444d24756..ce782f1fd0b3 100644
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -83,12 +83,14 @@ struct mlx5_flow_table *
+ mlx5_create_auto_grouped_flow_table(struct mlx5_flow_namespace *ns,
+ 				    int prio,
+ 				    int num_flow_table_entries,
+-				    int max_num_groups);
++				    int max_num_groups,
++				    u32 level);
+ 
+ struct mlx5_flow_table *
+ mlx5_create_flow_table(struct mlx5_flow_namespace *ns,
+ 		       int prio,
+-		       int num_flow_table_entries);
++		       int num_flow_table_entries,
++		       u32 level);
+ int mlx5_destroy_flow_table(struct mlx5_flow_table *ft);
+ 
+ /* inbox should be set with the following values:
