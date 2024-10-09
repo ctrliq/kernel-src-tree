@@ -1,0 +1,169 @@
+nfp: bpf: don't offload XDP programs in DRV_MODE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 9f82fca9422eab3877ab2b697ccc5eef44c63b54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9f82fca9.failed
+
+DRV_MODE means that user space wants the program to be run in
+the driver.  Do not try to offload.  Only offload if no mode
+flags have been specified.
+
+Remember what the mode is when the program is installed and refuse
+new setup requests if there is already a program loaded in a
+different mode.  This should leave it open for us to implement
+simultaneous loading of two programs - one in the drv path and
+another to the NIC later.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9f82fca9422eab3877ab2b697ccc5eef44c63b54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,7952fbfb94d6..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -432,16 -540,11 +432,21 @@@ static inline bool nfp_net_fw_ver_eq(st
+   * @rss_cfg:            RSS configuration
+   * @rss_key:            RSS secret key
+   * @rss_itbl:           RSS indirection table
+++<<<<<<< HEAD
+++=======
++  * @xdp_flags:		Flags with which XDP prog was loaded
++  * @max_r_vecs:		Number of allocated interrupt vectors for RX/TX
+++>>>>>>> 9f82fca9422e (nfp: bpf: don't offload XDP programs in DRV_MODE)
+   * @max_tx_rings:       Maximum number of TX rings supported by the Firmware
+   * @max_rx_rings:       Maximum number of RX rings supported by the Firmware
+ + * @num_tx_rings:       Currently configured number of TX rings
+ + * @num_rx_rings:       Currently configured number of RX rings
+ + * @txd_cnt:            Size of the TX ring in number of descriptors
+ + * @rxd_cnt:            Size of the RX ring in number of descriptors
+ + * @tx_rings:           Array of pre-allocated TX ring structures
+ + * @rx_rings:           Array of pre-allocated RX ring structures
+ + * @max_r_vecs:	        Number of allocated interrupt vectors for RX/TX
+ + * @num_r_vecs:         Number of used ring vectors
+   * @r_vecs:             Pre-allocated array of ring vectors
+   * @irq_entries:        Pre-allocated array of MSI-X entries
+   * @lsc_handler:        Handler for Link State Change interrupt
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,9563615cf4b7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2600,8 -3274,103 +2600,108 @@@ static void nfp_net_del_vxlan_port(stru
+  		nfp_net_set_vxlan_port(nn, idx, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static const struct net_device_ops nfp_net_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+++=======
++ static int
++ nfp_net_xdp_setup_drv(struct nfp_net *nn, struct bpf_prog *prog,
++ 		      struct netlink_ext_ack *extack)
++ {
++ 	struct bpf_prog *old_prog = nn->dp.xdp_prog;
++ 	struct nfp_net_dp *dp;
++ 	int err;
++ 
++ 	if (!prog && !nn->dp.xdp_prog)
++ 		return 0;
++ 	if (prog && nn->dp.xdp_prog) {
++ 		prog = xchg(&nn->dp.xdp_prog, prog);
++ 		bpf_prog_put(prog);
++ 		return 0;
++ 	}
++ 
++ 	dp = nfp_net_clone_dp(nn);
++ 	if (!dp)
++ 		return -ENOMEM;
++ 
++ 	dp->xdp_prog = prog;
++ 	dp->num_tx_rings += prog ? nn->dp.num_rx_rings : -nn->dp.num_rx_rings;
++ 	dp->rx_dma_dir = prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
++ 	dp->rx_dma_off = prog ? XDP_PACKET_HEADROOM - nn->dp.rx_offset : 0;
++ 
++ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
++ 	err = nfp_net_ring_reconfig(nn, dp, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog, u32 flags,
++ 		  struct netlink_ext_ack *extack)
++ {
++ 	struct bpf_prog *offload_prog;
++ 	int err;
++ 
++ 	if (nn->dp.xdp_prog && (flags ^ nn->xdp_flags) & XDP_FLAGS_MODES)
++ 		return -EBUSY;
++ 
++ 	offload_prog = flags & XDP_FLAGS_DRV_MODE ? NULL : prog;
++ 
++ 	err = nfp_net_xdp_setup_drv(nn, prog, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	nfp_app_xdp_offload(nn->app, nn, offload_prog);
++ 	nn->xdp_flags = flags;
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
++ 					 xdp->extack);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!nn->dp.xdp_prog;
++ 		xdp->prog_id = nn->dp.xdp_prog ? nn->dp.xdp_prog->aux->id : 0;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int nfp_net_set_mac_address(struct net_device *netdev, void *addr)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	struct sockaddr *saddr = addr;
++ 	int err;
++ 
++ 	err = eth_prepare_mac_addr_change(netdev, addr);
++ 	if (err)
++ 		return err;
++ 
++ 	nfp_net_write_mac_addr(nn, saddr->sa_data);
++ 
++ 	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_MACADDR);
++ 	if (err)
++ 		return err;
++ 
++ 	eth_commit_mac_addr_change(netdev, addr);
++ 
++ 	return 0;
++ }
++ 
++ const struct net_device_ops nfp_net_netdev_ops = {
+++>>>>>>> 9f82fca9422e (nfp: bpf: don't offload XDP programs in DRV_MODE)
+  	.ndo_open		= nfp_net_netdev_open,
+  	.ndo_stop		= nfp_net_netdev_close,
+  	.ndo_start_xmit		= nfp_net_tx,
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
