@@ -1,0 +1,1215 @@
+VFS: (Scripted) Convert S_ISLNK/DIR/REG(dentry->d_inode) to d_is_*(dentry)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [fs] vfs: Convert S_ISLNK/DIR/REG(dentry->d_inode) to d_is_*(dentry) (Ian Kent) [1413523]
+Rebuild_FUZZ: 91.97%
+commit-author David Howells <dhowells@redhat.com>
+commit e36cb0b89ce20b4f8786a57e8a6bc8476f577650
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e36cb0b8.failed
+
+Convert the following where appropriate:
+
+ (1) S_ISLNK(dentry->d_inode) to d_is_symlink(dentry).
+
+ (2) S_ISREG(dentry->d_inode) to d_is_reg(dentry).
+
+ (3) S_ISDIR(dentry->d_inode) to d_is_dir(dentry).  This is actually more
+     complicated than it appears as some calls should be converted to
+     d_can_lookup() instead.  The difference is whether the directory in
+     question is a real dir with a ->lookup op or whether it's a fake dir with
+     a ->d_automount op.
+
+In some circumstances, we can subsume checks for dentry->d_inode not being
+NULL into this, provided we the code isn't in a filesystem that expects
+d_inode to be NULL if the dirent really *is* negative (ie. if we're going to
+use d_inode() rather than d_backing_inode() to get the inode pointer).
+
+Note that the dentry type field may be set to something other than
+DCACHE_MISS_TYPE when d_inode is NULL in the case of unionmount, where the VFS
+manages the fall-through from a negative dentry to a lower layer.  In such a
+case, the dentry type of the negative union dentry is set to the same as the
+type of the lower dentry.
+
+However, if you know d_inode is not NULL at the call site, then you can use
+the d_is_xxx() functions even in a filesystem.
+
+There is one further complication: a 0,0 chardev dentry may be labelled
+DCACHE_WHITEOUT_TYPE rather than DCACHE_SPECIAL_TYPE.  Strictly, this was
+intended for special directory entry types that don't have attached inodes.
+
+The following perl+coccinelle script was used:
+
+use strict;
+
+my @callers;
+open($fd, 'git grep -l \'S_IS[A-Z].*->d_inode\' |') ||
+    die "Can't grep for S_ISDIR and co. callers";
+@callers = <$fd>;
+close($fd);
+unless (@callers) {
+    print "No matches\n";
+    exit(0);
+}
+
+my @cocci = (
+    '@@',
+    'expression E;',
+    '@@',
+    '',
+    '- S_ISLNK(E->d_inode->i_mode)',
+    '+ d_is_symlink(E)',
+    '',
+    '@@',
+    'expression E;',
+    '@@',
+    '',
+    '- S_ISDIR(E->d_inode->i_mode)',
+    '+ d_is_dir(E)',
+    '',
+    '@@',
+    'expression E;',
+    '@@',
+    '',
+    '- S_ISREG(E->d_inode->i_mode)',
+    '+ d_is_reg(E)' );
+
+my $coccifile = "tmp.sp.cocci";
+open($fd, ">$coccifile") || die $coccifile;
+print($fd "$_\n") || die $coccifile foreach (@cocci);
+close($fd);
+
+foreach my $file (@callers) {
+    chomp $file;
+    print "Processing ", $file, "\n";
+    system("spatch", "--sp-file", $coccifile, $file, "--in-place", "--no-show-diff") == 0 ||
+	die "spatch failed";
+}
+
+[AV: overlayfs parts skipped]
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit e36cb0b89ce20b4f8786a57e8a6bc8476f577650)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/autofs4/expire.c
+#	fs/posix_acl.c
+#	fs/reiserfs/xattr.c
+diff --cc fs/autofs4/expire.c
+index 683a5b9ce22a,11dd118f75e2..000000000000
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@@ -381,9 -374,8 +381,14 @@@ static struct dentry *should_expire(str
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)) {
+ +		DPRINTK("checking symlink %p %.*s",
+ +			dentry, (int)dentry->d_name.len, dentry->d_name.name);
+++=======
++ 	if (dentry->d_inode && d_is_symlink(dentry)) {
++ 		DPRINTK("checking symlink %p %pd", dentry, dentry);
+++>>>>>>> e36cb0b89ce2 (VFS: (Scripted) Convert S_ISLNK/DIR/REG(dentry->d_inode) to d_is_*(dentry))
+  		/*
+  		 * A symlink can't be "busy" in the usual sense so
+  		 * just check last used for expire timeout.
+diff --cc fs/posix_acl.c
+index 3000aa424973,3a48bb789c9f..000000000000
+--- a/fs/posix_acl.c
++++ b/fs/posix_acl.c
+@@@ -444,4 -513,393 +444,369 @@@ posix_acl_chmod(struct posix_acl **acl
+  	*acl = clone;
+  	return err;
+  }
+ -EXPORT_SYMBOL(__posix_acl_chmod);
+ -
+ -int
+ -posix_acl_chmod(struct inode *inode, umode_t mode)
+ -{
+ -	struct posix_acl *acl;
+ -	int ret = 0;
+ -
+ -	if (!IS_POSIXACL(inode))
+ -		return 0;
+ -	if (!inode->i_op->set_acl)
+ -		return -EOPNOTSUPP;
+ -
+ -	acl = get_acl(inode, ACL_TYPE_ACCESS);
+ -	if (IS_ERR_OR_NULL(acl)) {
+ -		if (acl == ERR_PTR(-EOPNOTSUPP))
+ -			return 0;
+ -		return PTR_ERR(acl);
+ -	}
+ -
+ -	ret = __posix_acl_chmod(&acl, GFP_KERNEL, mode);
+ -	if (ret)
+ -		return ret;
+ -	ret = inode->i_op->set_acl(inode, acl, ACL_TYPE_ACCESS);
+ -	posix_acl_release(acl);
+ -	return ret;
+ -}
+  EXPORT_SYMBOL(posix_acl_chmod);
+++<<<<<<< HEAD
+++=======
++ 
++ int
++ posix_acl_create(struct inode *dir, umode_t *mode,
++ 		struct posix_acl **default_acl, struct posix_acl **acl)
++ {
++ 	struct posix_acl *p;
++ 	int ret;
++ 
++ 	if (S_ISLNK(*mode) || !IS_POSIXACL(dir))
++ 		goto no_acl;
++ 
++ 	p = get_acl(dir, ACL_TYPE_DEFAULT);
++ 	if (IS_ERR(p)) {
++ 		if (p == ERR_PTR(-EOPNOTSUPP))
++ 			goto apply_umask;
++ 		return PTR_ERR(p);
++ 	}
++ 
++ 	if (!p)
++ 		goto apply_umask;
++ 
++ 	*acl = posix_acl_clone(p, GFP_NOFS);
++ 	if (!*acl)
++ 		goto no_mem;
++ 
++ 	ret = posix_acl_create_masq(*acl, mode);
++ 	if (ret < 0)
++ 		goto no_mem_clone;
++ 
++ 	if (ret == 0) {
++ 		posix_acl_release(*acl);
++ 		*acl = NULL;
++ 	}
++ 
++ 	if (!S_ISDIR(*mode)) {
++ 		posix_acl_release(p);
++ 		*default_acl = NULL;
++ 	} else {
++ 		*default_acl = p;
++ 	}
++ 	return 0;
++ 
++ apply_umask:
++ 	*mode &= ~current_umask();
++ no_acl:
++ 	*default_acl = NULL;
++ 	*acl = NULL;
++ 	return 0;
++ 
++ no_mem_clone:
++ 	posix_acl_release(*acl);
++ no_mem:
++ 	posix_acl_release(p);
++ 	return -ENOMEM;
++ }
++ EXPORT_SYMBOL_GPL(posix_acl_create);
++ 
++ /*
++  * Fix up the uids and gids in posix acl extended attributes in place.
++  */
++ static void posix_acl_fix_xattr_userns(
++ 	struct user_namespace *to, struct user_namespace *from,
++ 	void *value, size_t size)
++ {
++ 	posix_acl_xattr_header *header = (posix_acl_xattr_header *)value;
++ 	posix_acl_xattr_entry *entry = (posix_acl_xattr_entry *)(header+1), *end;
++ 	int count;
++ 	kuid_t uid;
++ 	kgid_t gid;
++ 
++ 	if (!value)
++ 		return;
++ 	if (size < sizeof(posix_acl_xattr_header))
++ 		return;
++ 	if (header->a_version != cpu_to_le32(POSIX_ACL_XATTR_VERSION))
++ 		return;
++ 
++ 	count = posix_acl_xattr_count(size);
++ 	if (count < 0)
++ 		return;
++ 	if (count == 0)
++ 		return;
++ 
++ 	for (end = entry + count; entry != end; entry++) {
++ 		switch(le16_to_cpu(entry->e_tag)) {
++ 		case ACL_USER:
++ 			uid = make_kuid(from, le32_to_cpu(entry->e_id));
++ 			entry->e_id = cpu_to_le32(from_kuid(to, uid));
++ 			break;
++ 		case ACL_GROUP:
++ 			gid = make_kgid(from, le32_to_cpu(entry->e_id));
++ 			entry->e_id = cpu_to_le32(from_kgid(to, gid));
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ void posix_acl_fix_xattr_from_user(void *value, size_t size)
++ {
++ 	struct user_namespace *user_ns = current_user_ns();
++ 	if (user_ns == &init_user_ns)
++ 		return;
++ 	posix_acl_fix_xattr_userns(&init_user_ns, user_ns, value, size);
++ }
++ 
++ void posix_acl_fix_xattr_to_user(void *value, size_t size)
++ {
++ 	struct user_namespace *user_ns = current_user_ns();
++ 	if (user_ns == &init_user_ns)
++ 		return;
++ 	posix_acl_fix_xattr_userns(user_ns, &init_user_ns, value, size);
++ }
++ 
++ /*
++  * Convert from extended attribute to in-memory representation.
++  */
++ struct posix_acl *
++ posix_acl_from_xattr(struct user_namespace *user_ns,
++ 		     const void *value, size_t size)
++ {
++ 	posix_acl_xattr_header *header = (posix_acl_xattr_header *)value;
++ 	posix_acl_xattr_entry *entry = (posix_acl_xattr_entry *)(header+1), *end;
++ 	int count;
++ 	struct posix_acl *acl;
++ 	struct posix_acl_entry *acl_e;
++ 
++ 	if (!value)
++ 		return NULL;
++ 	if (size < sizeof(posix_acl_xattr_header))
++ 		 return ERR_PTR(-EINVAL);
++ 	if (header->a_version != cpu_to_le32(POSIX_ACL_XATTR_VERSION))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	count = posix_acl_xattr_count(size);
++ 	if (count < 0)
++ 		return ERR_PTR(-EINVAL);
++ 	if (count == 0)
++ 		return NULL;
++ 	
++ 	acl = posix_acl_alloc(count, GFP_NOFS);
++ 	if (!acl)
++ 		return ERR_PTR(-ENOMEM);
++ 	acl_e = acl->a_entries;
++ 	
++ 	for (end = entry + count; entry != end; acl_e++, entry++) {
++ 		acl_e->e_tag  = le16_to_cpu(entry->e_tag);
++ 		acl_e->e_perm = le16_to_cpu(entry->e_perm);
++ 
++ 		switch(acl_e->e_tag) {
++ 			case ACL_USER_OBJ:
++ 			case ACL_GROUP_OBJ:
++ 			case ACL_MASK:
++ 			case ACL_OTHER:
++ 				break;
++ 
++ 			case ACL_USER:
++ 				acl_e->e_uid =
++ 					make_kuid(user_ns,
++ 						  le32_to_cpu(entry->e_id));
++ 				if (!uid_valid(acl_e->e_uid))
++ 					goto fail;
++ 				break;
++ 			case ACL_GROUP:
++ 				acl_e->e_gid =
++ 					make_kgid(user_ns,
++ 						  le32_to_cpu(entry->e_id));
++ 				if (!gid_valid(acl_e->e_gid))
++ 					goto fail;
++ 				break;
++ 
++ 			default:
++ 				goto fail;
++ 		}
++ 	}
++ 	return acl;
++ 
++ fail:
++ 	posix_acl_release(acl);
++ 	return ERR_PTR(-EINVAL);
++ }
++ EXPORT_SYMBOL (posix_acl_from_xattr);
++ 
++ /*
++  * Convert from in-memory to extended attribute representation.
++  */
++ int
++ posix_acl_to_xattr(struct user_namespace *user_ns, const struct posix_acl *acl,
++ 		   void *buffer, size_t size)
++ {
++ 	posix_acl_xattr_header *ext_acl = (posix_acl_xattr_header *)buffer;
++ 	posix_acl_xattr_entry *ext_entry;
++ 	int real_size, n;
++ 
++ 	real_size = posix_acl_xattr_size(acl->a_count);
++ 	if (!buffer)
++ 		return real_size;
++ 	if (real_size > size)
++ 		return -ERANGE;
++ 
++ 	ext_entry = ext_acl->a_entries;
++ 	ext_acl->a_version = cpu_to_le32(POSIX_ACL_XATTR_VERSION);
++ 
++ 	for (n=0; n < acl->a_count; n++, ext_entry++) {
++ 		const struct posix_acl_entry *acl_e = &acl->a_entries[n];
++ 		ext_entry->e_tag  = cpu_to_le16(acl_e->e_tag);
++ 		ext_entry->e_perm = cpu_to_le16(acl_e->e_perm);
++ 		switch(acl_e->e_tag) {
++ 		case ACL_USER:
++ 			ext_entry->e_id =
++ 				cpu_to_le32(from_kuid(user_ns, acl_e->e_uid));
++ 			break;
++ 		case ACL_GROUP:
++ 			ext_entry->e_id =
++ 				cpu_to_le32(from_kgid(user_ns, acl_e->e_gid));
++ 			break;
++ 		default:
++ 			ext_entry->e_id = cpu_to_le32(ACL_UNDEFINED_ID);
++ 			break;
++ 		}
++ 	}
++ 	return real_size;
++ }
++ EXPORT_SYMBOL (posix_acl_to_xattr);
++ 
++ static int
++ posix_acl_xattr_get(struct dentry *dentry, const char *name,
++ 		void *value, size_t size, int type)
++ {
++ 	struct posix_acl *acl;
++ 	int error;
++ 
++ 	if (!IS_POSIXACL(dentry->d_inode))
++ 		return -EOPNOTSUPP;
++ 	if (d_is_symlink(dentry))
++ 		return -EOPNOTSUPP;
++ 
++ 	acl = get_acl(dentry->d_inode, type);
++ 	if (IS_ERR(acl))
++ 		return PTR_ERR(acl);
++ 	if (acl == NULL)
++ 		return -ENODATA;
++ 
++ 	error = posix_acl_to_xattr(&init_user_ns, acl, value, size);
++ 	posix_acl_release(acl);
++ 
++ 	return error;
++ }
++ 
++ static int
++ posix_acl_xattr_set(struct dentry *dentry, const char *name,
++ 		const void *value, size_t size, int flags, int type)
++ {
++ 	struct inode *inode = dentry->d_inode;
++ 	struct posix_acl *acl = NULL;
++ 	int ret;
++ 
++ 	if (!IS_POSIXACL(inode))
++ 		return -EOPNOTSUPP;
++ 	if (!inode->i_op->set_acl)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
++ 		return value ? -EACCES : 0;
++ 	if (!inode_owner_or_capable(inode))
++ 		return -EPERM;
++ 
++ 	if (value) {
++ 		acl = posix_acl_from_xattr(&init_user_ns, value, size);
++ 		if (IS_ERR(acl))
++ 			return PTR_ERR(acl);
++ 
++ 		if (acl) {
++ 			ret = posix_acl_valid(acl);
++ 			if (ret)
++ 				goto out;
++ 		}
++ 	}
++ 
++ 	ret = inode->i_op->set_acl(inode, acl, type);
++ out:
++ 	posix_acl_release(acl);
++ 	return ret;
++ }
++ 
++ static size_t
++ posix_acl_xattr_list(struct dentry *dentry, char *list, size_t list_size,
++ 		const char *name, size_t name_len, int type)
++ {
++ 	const char *xname;
++ 	size_t size;
++ 
++ 	if (!IS_POSIXACL(dentry->d_inode))
++ 		return -EOPNOTSUPP;
++ 	if (d_is_symlink(dentry))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (type == ACL_TYPE_ACCESS)
++ 		xname = POSIX_ACL_XATTR_ACCESS;
++ 	else
++ 		xname = POSIX_ACL_XATTR_DEFAULT;
++ 
++ 	size = strlen(xname) + 1;
++ 	if (list && size <= list_size)
++ 		memcpy(list, xname, size);
++ 	return size;
++ }
++ 
++ const struct xattr_handler posix_acl_access_xattr_handler = {
++ 	.prefix = POSIX_ACL_XATTR_ACCESS,
++ 	.flags = ACL_TYPE_ACCESS,
++ 	.list = posix_acl_xattr_list,
++ 	.get = posix_acl_xattr_get,
++ 	.set = posix_acl_xattr_set,
++ };
++ EXPORT_SYMBOL_GPL(posix_acl_access_xattr_handler);
++ 
++ const struct xattr_handler posix_acl_default_xattr_handler = {
++ 	.prefix = POSIX_ACL_XATTR_DEFAULT,
++ 	.flags = ACL_TYPE_DEFAULT,
++ 	.list = posix_acl_xattr_list,
++ 	.get = posix_acl_xattr_get,
++ 	.set = posix_acl_xattr_set,
++ };
++ EXPORT_SYMBOL_GPL(posix_acl_default_xattr_handler);
++ 
++ int simple_set_acl(struct inode *inode, struct posix_acl *acl, int type)
++ {
++ 	int error;
++ 
++ 	if (type == ACL_TYPE_ACCESS) {
++ 		error = posix_acl_equiv_mode(acl, &inode->i_mode);
++ 		if (error < 0)
++ 			return 0;
++ 		if (error == 0)
++ 			acl = NULL;
++ 	}
++ 
++ 	inode->i_ctime = CURRENT_TIME;
++ 	set_cached_acl(inode, type, acl);
++ 	return 0;
++ }
++ 
++ int simple_acl_create(struct inode *dir, struct inode *inode)
++ {
++ 	struct posix_acl *default_acl, *acl;
++ 	int error;
++ 
++ 	error = posix_acl_create(dir, &inode->i_mode, &default_acl, &acl);
++ 	if (error)
++ 		return error;
++ 
++ 	set_cached_acl(inode, ACL_TYPE_DEFAULT, default_acl);
++ 	set_cached_acl(inode, ACL_TYPE_ACCESS, acl);
++ 
++ 	if (default_acl)
++ 		posix_acl_release(default_acl);
++ 	if (acl)
++ 		posix_acl_release(acl);
++ 	return 0;
++ }
+++>>>>>>> e36cb0b89ce2 (VFS: (Scripted) Convert S_ISLNK/DIR/REG(dentry->d_inode) to d_is_*(dentry))
+diff --cc fs/reiserfs/xattr.c
+index 821bcf70e467,4e781e697c90..000000000000
+--- a/fs/reiserfs/xattr.c
++++ b/fs/reiserfs/xattr.c
+@@@ -246,19 -256,18 +246,24 @@@ static int reiserfs_for_each_xattr(stru
+  
+  	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_XATTR);
+  
+ +	reiserfs_write_lock(inode->i_sb);
+ +
+  	buf.xadir = dir;
+ -	while (1) {
+ -		err = reiserfs_readdir_inode(dir->d_inode, &buf.ctx);
+ -		if (err)
+ -			break;
+ -		if (!buf.count)
+ -			break;
+ -		for (i = 0; !err && i < buf.count && buf.dentries[i]; i++) {
+ +	err = reiserfs_readdir_dentry(dir, &buf, fill_with_dentries, &pos);
+ +	while ((err == 0 || err == -ENOSPC) && buf.count) {
+ +		err = 0;
+ +
+ +		for (i = 0; i < buf.count && buf.dentries[i]; i++) {
+ +			int lerr = 0;
+  			struct dentry *dentry = buf.dentries[i];
+  
+++<<<<<<< HEAD
+ +			if (err == 0 && !S_ISDIR(dentry->d_inode->i_mode))
+ +				lerr = action(dentry, data);
+++=======
++ 			if (!d_is_dir(dentry))
++ 				err = action(dentry, data);
+++>>>>>>> e36cb0b89ce2 (VFS: (Scripted) Convert S_ISLNK/DIR/REG(dentry->d_inode) to d_is_*(dentry))
+  
+  			dput(dentry);
+  			buf.dentries[i] = NULL;
+diff --git a/arch/s390/hypfs/inode.c b/arch/s390/hypfs/inode.c
+index b9e6cfb925ab..174445659e01 100644
+--- a/arch/s390/hypfs/inode.c
++++ b/arch/s390/hypfs/inode.c
+@@ -75,7 +75,7 @@ static void hypfs_remove(struct dentry *dentry)
+ 	parent = dentry->d_parent;
+ 	mutex_lock(&parent->d_inode->i_mutex);
+ 	if (hypfs_positive(dentry)) {
+-		if (S_ISDIR(dentry->d_inode->i_mode))
++		if (d_is_dir(dentry))
+ 			simple_rmdir(parent->d_inode, dentry);
+ 		else
+ 			simple_unlink(parent->d_inode, dentry);
+diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+index c05c0a842783..90a38fe62860 100644
+--- a/fs/9p/vfs_inode.c
++++ b/fs/9p/vfs_inode.c
+@@ -1129,7 +1129,7 @@ static int v9fs_vfs_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	}
+ 
+ 	/* Write all dirty data */
+-	if (S_ISREG(dentry->d_inode->i_mode))
++	if (d_is_reg(dentry))
+ 		filemap_write_and_wait(dentry->d_inode->i_mapping);
+ 
+ 	retval = p9_client_wstat(fid, &wstat);
+* Unmerged path fs/autofs4/expire.c
+diff --git a/fs/autofs4/root.c b/fs/autofs4/root.c
+index 80cc78d5c0b2..a5021daef7bb 100644
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -374,7 +374,7 @@ static struct vfsmount *autofs4_d_automount(struct path *path)
+ 	 * having d_mountpoint() true, so there's no need to call back
+ 	 * to the daemon.
+ 	 */
+-	if (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)) {
++	if (dentry->d_inode && d_is_symlink(dentry)) {
+ 		spin_unlock(&sbi->fs_lock);
+ 		goto done;
+ 	}
+@@ -489,7 +489,7 @@ static int autofs4_d_manage(struct dentry *dentry, bool rcu_walk)
+ 		 * an incorrect ELOOP error return.
+ 		 */
+ 		if ((!d_mountpoint(dentry) && !simple_empty(dentry)) ||
+-		    (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)))
++		    (dentry->d_inode && d_is_symlink(dentry)))
+ 			status = -EISDIR;
+ 	}
+ 	spin_unlock(&sbi->fs_lock);
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 43c3786aca1d..30e634796667 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -805,11 +805,11 @@ static int btrfs_may_delete(struct inode *dir, struct dentry *victim, int isdir)
+ 	    IS_IMMUTABLE(victim->d_inode) || IS_SWAPFILE(victim->d_inode))
+ 		return -EPERM;
+ 	if (isdir) {
+-		if (!S_ISDIR(victim->d_inode->i_mode))
++		if (!d_is_dir(victim))
+ 			return -ENOTDIR;
+ 		if (IS_ROOT(victim))
+ 			return -EBUSY;
+-	} else if (S_ISDIR(victim->d_inode->i_mode))
++	} else if (d_is_dir(victim))
+ 		return -EISDIR;
+ 	if (IS_DEADDIR(dir))
+ 		return -ENOENT;
+diff --git a/fs/cachefiles/daemon.c b/fs/cachefiles/daemon.c
+index 46bc6921c186..ae1fad303087 100644
+--- a/fs/cachefiles/daemon.c
++++ b/fs/cachefiles/daemon.c
+@@ -581,7 +581,7 @@ static int cachefiles_daemon_cull(struct cachefiles_cache *cache, char *args)
+ 	/* extract the directory dentry from the cwd */
+ 	get_fs_pwd(current->fs, &path);
+ 
+-	if (!S_ISDIR(path.dentry->d_inode->i_mode))
++	if (!d_is_dir(path.dentry))
+ 		goto notdir;
+ 
+ 	cachefiles_begin_secure(cache, &saved_cred);
+@@ -653,7 +653,7 @@ static int cachefiles_daemon_inuse(struct cachefiles_cache *cache, char *args)
+ 	/* extract the directory dentry from the cwd */
+ 	get_fs_pwd(current->fs, &path);
+ 
+-	if (!S_ISDIR(path.dentry->d_inode->i_mode))
++	if (!d_is_dir(path.dentry))
+ 		goto notdir;
+ 
+ 	cachefiles_begin_secure(cache, &saved_cred);
+diff --git a/fs/cachefiles/namei.c b/fs/cachefiles/namei.c
+index 295429faa0d6..ba1cf38b004d 100644
+--- a/fs/cachefiles/namei.c
++++ b/fs/cachefiles/namei.c
+@@ -305,7 +305,7 @@ static int cachefiles_bury_object(struct cachefiles_cache *cache,
+ 	_debug("remove %p from %p", rep, dir);
+ 
+ 	/* non-directories can just be unlinked */
+-	if (!S_ISDIR(rep->d_inode->i_mode)) {
++	if (!d_is_dir(rep)) {
+ 		_debug("unlink stale object");
+ 
+ 		path.mnt = cache->mnt;
+@@ -351,7 +351,7 @@ try_again:
+ 		return 0;
+ 	}
+ 
+-	if (!S_ISDIR(cache->graveyard->d_inode->i_mode)) {
++	if (!d_is_dir(cache->graveyard)) {
+ 		unlock_rename(cache->graveyard, dir);
+ 		cachefiles_io_error(cache, "Graveyard no longer a directory");
+ 		return -EIO;
+@@ -504,7 +504,7 @@ int cachefiles_walk_to_object(struct cachefiles_object *parent,
+ 	ASSERT(parent->dentry);
+ 	ASSERT(parent->dentry->d_inode);
+ 
+-	if (!(S_ISDIR(parent->dentry->d_inode->i_mode))) {
++	if (!(d_is_dir(parent->dentry))) {
+ 		// TODO: convert file to dir
+ 		_leave("looking up in none directory");
+ 		return -ENOBUFS;
+@@ -568,7 +568,7 @@ lookup_again:
+ 			_debug("mkdir -> %p{%p{ino=%lu}}",
+ 			       next, next->d_inode, next->d_inode->i_ino);
+ 
+-		} else if (!S_ISDIR(next->d_inode->i_mode)) {
++		} else if (!d_is_dir(next)) {
+ 			pr_err("inode %lu is not a directory\n",
+ 			       next->d_inode->i_ino);
+ 			ret = -ENOBUFS;
+@@ -597,8 +597,8 @@ lookup_again:
+ 			_debug("create -> %p{%p{ino=%lu}}",
+ 			       next, next->d_inode, next->d_inode->i_ino);
+ 
+-		} else if (!S_ISDIR(next->d_inode->i_mode) &&
+-			   !S_ISREG(next->d_inode->i_mode)
++		} else if (!d_is_dir(next) &&
++			   !d_is_reg(next)
+ 			   ) {
+ 			pr_err("inode %lu is not a file or directory\n",
+ 			       next->d_inode->i_ino);
+@@ -674,7 +674,7 @@ lookup_again:
+ 
+ 	/* open a file interface onto a data file */
+ 	if (object->type != FSCACHE_COOKIE_TYPE_INDEX) {
+-		if (S_ISREG(object->dentry->d_inode->i_mode)) {
++		if (d_is_reg(object->dentry)) {
+ 			const struct address_space_operations *aops;
+ 
+ 			ret = -EPERM;
+@@ -796,7 +796,7 @@ struct dentry *cachefiles_get_directory(struct cachefiles_cache *cache,
+ 	/* we need to make sure the subdir is a directory */
+ 	ASSERT(subdir->d_inode);
+ 
+-	if (!S_ISDIR(subdir->d_inode->i_mode)) {
++	if (!d_is_dir(subdir)) {
+ 		pr_err("%s is not a directory\n", dirname);
+ 		ret = -EIO;
+ 		goto check_error;
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index f5abab663b08..57737355adc9 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -919,7 +919,7 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 	} else if (ceph_snap(dir) == CEPH_NOSNAP) {
+ 		dout("unlink/rmdir dir %p dn %p inode %p\n",
+ 		     dir, dentry, inode);
+-		op = S_ISDIR(dentry->d_inode->i_mode) ?
++		op = d_is_dir(dentry) ?
+ 			CEPH_MDS_OP_RMDIR : CEPH_MDS_OP_UNLINK;
+ 	} else
+ 		goto out;
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 1d49d61253bc..eb9331ebd75f 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -353,7 +353,7 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+ 	}
+ 	if (err)
+ 		goto out_req;
+-	if (dn || dentry->d_inode == NULL || S_ISLNK(dentry->d_inode->i_mode)) {
++	if (dn || dentry->d_inode == NULL || d_is_symlink(dentry)) {
+ 		/* make vfs retry on splice, ENOENT, or symlink */
+ 		dout("atomic_open finish_no_open on dn %p\n", dn);
+ 		err = finish_no_open(file, dn);
+diff --git a/fs/coda/dir.c b/fs/coda/dir.c
+index c424e27b42f9..206a0f9cbee7 100644
+--- a/fs/coda/dir.c
++++ b/fs/coda/dir.c
+@@ -361,7 +361,7 @@ static int coda_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 			     (const char *) old_name, (const char *)new_name);
+ 	if (!error) {
+ 		if (new_dentry->d_inode) {
+-			if (S_ISDIR(new_dentry->d_inode->i_mode)) {
++			if (d_is_dir(new_dentry)) {
+ 				coda_dir_drop_nlink(old_dir);
+ 				coda_dir_inc_nlink(new_dir);
+ 			}
+diff --git a/fs/debugfs/inode.c b/fs/debugfs/inode.c
+index c7c83ff0f752..d963c62e7186 100644
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -626,7 +626,7 @@ struct dentry *debugfs_rename(struct dentry *old_dir, struct dentry *old_dentry,
+ 	}
+ 	d_move(old_dentry, dentry);
+ 	fsnotify_move(old_dir->d_inode, new_dir->d_inode, old_name,
+-		S_ISDIR(old_dentry->d_inode->i_mode),
++		d_is_dir(old_dentry),
+ 		NULL, old_dentry);
+ 	fsnotify_oldname_free(old_name);
+ 	unlock_rename(new_dir, old_dir);
+diff --git a/fs/ecryptfs/file.c b/fs/ecryptfs/file.c
+index a7abbea2c096..175a19fcd8ca 100644
+--- a/fs/ecryptfs/file.c
++++ b/fs/ecryptfs/file.c
+@@ -248,7 +248,7 @@ static int ecryptfs_open(struct inode *inode, struct file *file)
+ 	}
+ 	ecryptfs_set_file_lower(
+ 		file, ecryptfs_inode_to_private(inode)->lower_file);
+-	if (S_ISDIR(ecryptfs_dentry->d_inode->i_mode)) {
++	if (d_is_dir(ecryptfs_dentry)) {
+ 		ecryptfs_printk(KERN_DEBUG, "This is a directory\n");
+ 		mutex_lock(&crypt_stat->cs_mutex);
+ 		crypt_stat->flags &= ~(ECRYPTFS_ENCRYPTED);
+diff --git a/fs/ecryptfs/inode.c b/fs/ecryptfs/inode.c
+index 1648908cf236..adb0b5e37260 100644
+--- a/fs/ecryptfs/inode.c
++++ b/fs/ecryptfs/inode.c
+@@ -922,9 +922,9 @@ static int ecryptfs_setattr(struct dentry *dentry, struct iattr *ia)
+ 	lower_inode = ecryptfs_inode_to_lower(inode);
+ 	lower_dentry = ecryptfs_dentry_to_lower(dentry);
+ 	mutex_lock(&crypt_stat->cs_mutex);
+-	if (S_ISDIR(dentry->d_inode->i_mode))
++	if (d_is_dir(dentry))
+ 		crypt_stat->flags &= ~(ECRYPTFS_ENCRYPTED);
+-	else if (S_ISREG(dentry->d_inode->i_mode)
++	else if (d_is_reg(dentry)
+ 		 && (!(crypt_stat->flags & ECRYPTFS_POLICY_APPLIED)
+ 		     || !(crypt_stat->flags & ECRYPTFS_KEY_VALID))) {
+ 		struct ecryptfs_mount_crypt_stat *mount_crypt_stat;
+diff --git a/fs/exportfs/expfs.c b/fs/exportfs/expfs.c
+index 262fc9940982..c47d600583a6 100644
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -395,7 +395,7 @@ struct dentry *exportfs_decode_fh(struct vfsmount *mnt, struct fid *fid,
+ 	if (IS_ERR(result))
+ 		return result;
+ 
+-	if (S_ISDIR(result->d_inode->i_mode)) {
++	if (d_is_dir(result)) {
+ 		/*
+ 		 * This request is for a directory.
+ 		 *
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 07254ac422e9..8410e3df7353 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1044,7 +1044,7 @@ int fuse_reverse_inval_entry(struct super_block *sb, u64 parent_nodeid,
+ 			err = -EBUSY;
+ 			goto badentry;
+ 		}
+-		if (S_ISDIR(entry->d_inode->i_mode)) {
++		if (d_is_dir(entry)) {
+ 			shrink_dcache_parent(entry);
+ 			if (!simple_empty(entry)) {
+ 				err = -ENOTEMPTY;
+diff --git a/fs/gfs2/dir.c b/fs/gfs2/dir.c
+index 2f15db06abea..d52e4cf73b25 100644
+--- a/fs/gfs2/dir.c
++++ b/fs/gfs2/dir.c
+@@ -1922,7 +1922,7 @@ int gfs2_dir_del(struct gfs2_inode *dip, const struct dentry *dentry)
+ 		gfs2_consist_inode(dip);
+ 	dip->i_entries--;
+ 	dip->i_inode.i_mtime = dip->i_inode.i_ctime = tv;
+-	if (S_ISDIR(dentry->d_inode->i_mode))
++	if (d_is_dir(dentry))
+ 		drop_nlink(&dip->i_inode);
+ 	mark_inode_dirty(&dip->i_inode);
+ 
+diff --git a/fs/hfsplus/dir.c b/fs/hfsplus/dir.c
+index a37ac934732f..12fbfea72327 100644
+--- a/fs/hfsplus/dir.c
++++ b/fs/hfsplus/dir.c
+@@ -503,7 +503,7 @@ static int hfsplus_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 
+ 	/* Unlink destination if it already exists */
+ 	if (new_dentry->d_inode) {
+-		if (S_ISDIR(new_dentry->d_inode->i_mode))
++		if (d_is_dir(new_dentry))
+ 			res = hfsplus_rmdir(new_dir, new_dentry);
+ 		else
+ 			res = hfsplus_unlink(new_dir, new_dentry);
+diff --git a/fs/hppfs/hppfs.c b/fs/hppfs/hppfs.c
+index cd3e38972c86..33871d5abb2b 100644
+--- a/fs/hppfs/hppfs.c
++++ b/fs/hppfs/hppfs.c
+@@ -681,10 +681,10 @@ static struct inode *get_inode(struct super_block *sb, struct dentry *dentry)
+ 		return NULL;
+ 	}
+ 
+-	if (S_ISDIR(dentry->d_inode->i_mode)) {
++	if (d_is_dir(dentry)) {
+ 		inode->i_op = &hppfs_dir_iops;
+ 		inode->i_fop = &hppfs_dir_fops;
+-	} else if (S_ISLNK(dentry->d_inode->i_mode)) {
++	} else if (d_is_symlink(dentry)) {
+ 		inode->i_op = &hppfs_link_iops;
+ 		inode->i_fop = &hppfs_file_fops;
+ 	} else {
+diff --git a/fs/jffs2/dir.c b/fs/jffs2/dir.c
+index acd46a4160cb..e0eaa3c5ca3d 100644
+--- a/fs/jffs2/dir.c
++++ b/fs/jffs2/dir.c
+@@ -271,7 +271,7 @@ static int jffs2_link (struct dentry *old_dentry, struct inode *dir_i, struct de
+ 	if (!f->inocache)
+ 		return -EIO;
+ 
+-	if (S_ISDIR(old_dentry->d_inode->i_mode))
++	if (d_is_dir(old_dentry))
+ 		return -EPERM;
+ 
+ 	/* XXX: This is ugly */
+@@ -791,7 +791,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 	 */
+ 	if (new_dentry->d_inode) {
+ 		victim_f = JFFS2_INODE_INFO(new_dentry->d_inode);
+-		if (S_ISDIR(new_dentry->d_inode->i_mode)) {
++		if (d_is_dir(new_dentry)) {
+ 			struct jffs2_full_dirent *fd;
+ 
+ 			mutex_lock(&victim_f->sem);
+@@ -826,7 +826,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 
+ 	if (victim_f) {
+ 		/* There was a victim. Kill it off nicely */
+-		if (S_ISDIR(new_dentry->d_inode->i_mode))
++		if (d_is_dir(new_dentry))
+ 			clear_nlink(new_dentry->d_inode);
+ 		else
+ 			drop_nlink(new_dentry->d_inode);
+@@ -834,7 +834,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 		   inode which didn't exist. */
+ 		if (victim_f->inocache) {
+ 			mutex_lock(&victim_f->sem);
+-			if (S_ISDIR(new_dentry->d_inode->i_mode))
++			if (d_is_dir(new_dentry))
+ 				victim_f->inocache->pino_nlink = 0;
+ 			else
+ 				victim_f->inocache->pino_nlink--;
+@@ -844,7 +844,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 
+ 	/* If it was a directory we moved, and there was no victim,
+ 	   increase i_nlink on its new parent */
+-	if (S_ISDIR(old_dentry->d_inode->i_mode) && !victim_f)
++	if (d_is_dir(old_dentry) && !victim_f)
+ 		inc_nlink(new_dir_i);
+ 
+ 	/* Unlink the original */
+@@ -858,7 +858,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 		struct jffs2_inode_info *f = JFFS2_INODE_INFO(old_dentry->d_inode);
+ 		mutex_lock(&f->sem);
+ 		inc_nlink(old_dentry->d_inode);
+-		if (f->inocache && !S_ISDIR(old_dentry->d_inode->i_mode))
++		if (f->inocache && !d_is_dir(old_dentry))
+ 			f->inocache->pino_nlink++;
+ 		mutex_unlock(&f->sem);
+ 
+@@ -871,7 +871,7 @@ static int jffs2_rename (struct inode *old_dir_i, struct dentry *old_dentry,
+ 		return ret;
+ 	}
+ 
+-	if (S_ISDIR(old_dentry->d_inode->i_mode))
++	if (d_is_dir(old_dentry))
+ 		drop_nlink(old_dir_i);
+ 
+ 	new_dir_i->i_mtime = new_dir_i->i_ctime = old_dir_i->i_mtime = old_dir_i->i_ctime = ITIME(now);
+diff --git a/fs/jffs2/super.c b/fs/jffs2/super.c
+index 0defb1cc2a35..43a8383c946a 100644
+--- a/fs/jffs2/super.c
++++ b/fs/jffs2/super.c
+@@ -138,7 +138,7 @@ static struct dentry *jffs2_get_parent(struct dentry *child)
+ 	struct jffs2_inode_info *f;
+ 	uint32_t pino;
+ 
+-	BUG_ON(!S_ISDIR(child->d_inode->i_mode));
++	BUG_ON(!d_is_dir(child));
+ 
+ 	f = JFFS2_INODE_INFO(child->d_inode);
+ 
+diff --git a/fs/libfs.c b/fs/libfs.c
+index 23fbb25d1c9f..5314ca10cfef 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -346,7 +346,7 @@ int simple_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 		struct inode *new_dir, struct dentry *new_dentry)
+ {
+ 	struct inode *inode = old_dentry->d_inode;
+-	int they_are_dirs = S_ISDIR(old_dentry->d_inode->i_mode);
++	int they_are_dirs = d_is_dir(old_dentry);
+ 
+ 	if (!simple_empty(new_dentry))
+ 		return -ENOTEMPTY;
+diff --git a/fs/namei.c b/fs/namei.c
+index 803918366933..192a201b0bdc 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2925,7 +2925,7 @@ no_open:
+ 			} else if (!dentry->d_inode) {
+ 				goto out;
+ 			} else if ((open_flag & O_TRUNC) &&
+-				   S_ISREG(dentry->d_inode->i_mode)) {
++				   d_is_reg(dentry)) {
+ 				goto out;
+ 			}
+ 			/* will fail later, go on to get the right error */
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 5bfed5a73a95..7a9efeabbe75 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1734,8 +1734,8 @@ static int graft_tree(struct mount *mnt, struct mount *p, struct mountpoint *mp)
+ 	if (mnt->mnt.mnt_sb->s_flags & MS_NOUSER)
+ 		return -EINVAL;
+ 
+-	if (S_ISDIR(mp->m_dentry->d_inode->i_mode) !=
+-	      S_ISDIR(mnt->mnt.mnt_root->d_inode->i_mode))
++	if (d_is_dir(mp->m_dentry) !=
++	      d_is_dir(mnt->mnt.mnt_root))
+ 		return -ENOTDIR;
+ 
+ 	return attach_recursive_mnt(mnt, p, mp, NULL);
+@@ -1974,8 +1974,8 @@ static int do_move_mount(struct path *path, const char *old_name)
+ 	if (!mnt_has_parent(old))
+ 		goto out1;
+ 
+-	if (S_ISDIR(path->dentry->d_inode->i_mode) !=
+-	      S_ISDIR(old_path.dentry->d_inode->i_mode))
++	if (d_is_dir(path->dentry) !=
++	      d_is_dir(old_path.dentry))
+ 		goto out1;
+ 	/*
+ 	 * Don't move a mount residing in a shared parent.
+@@ -2065,7 +2065,7 @@ static int do_add_mount(struct mount *newmnt, struct path *path, int mnt_flags)
+ 		goto unlock;
+ 
+ 	err = -EINVAL;
+-	if (S_ISLNK(newmnt->mnt.mnt_root->d_inode->i_mode))
++	if (d_is_symlink(newmnt->mnt.mnt_root))
+ 		goto unlock;
+ 
+ 	newmnt->mnt.mnt_flags = mnt_flags;
+diff --git a/fs/nfsd/nfs4recover.c b/fs/nfsd/nfs4recover.c
+index cdb8e1753ca6..71cc160a38a6 100644
+--- a/fs/nfsd/nfs4recover.c
++++ b/fs/nfsd/nfs4recover.c
+@@ -578,7 +578,7 @@ nfs4_reset_recoverydir(char *recdir)
+ 	if (status)
+ 		return status;
+ 	status = -ENOTDIR;
+-	if (S_ISDIR(path.dentry->d_inode->i_mode)) {
++	if (d_is_dir(path.dentry)) {
+ 		strcpy(user_recovery_dirname, recdir);
+ 		status = 0;
+ 	}
+@@ -1422,7 +1422,7 @@ nfsd4_client_tracking_init(struct net *net)
+ 	nn->client_tracking_ops = &nfsd4_legacy_tracking_ops;
+ 	status = kern_path(nfs4_recoverydir(), LOOKUP_FOLLOW, &path);
+ 	if (!status) {
+-		status = S_ISDIR(path.dentry->d_inode->i_mode);
++		status = d_is_dir(path.dentry);
+ 		path_put(&path);
+ 		if (status)
+ 			goto do_init;
+diff --git a/fs/nfsd/nfsfh.c b/fs/nfsd/nfsfh.c
+index 165f56f78802..38ec13512b75 100644
+--- a/fs/nfsd/nfsfh.c
++++ b/fs/nfsd/nfsfh.c
+@@ -114,8 +114,8 @@ static inline __be32 check_pseudo_root(struct svc_rqst *rqstp,
+ 	 * We're exposing only the directories and symlinks that have to be
+ 	 * traversed on the way to real exports:
+ 	 */
+-	if (unlikely(!S_ISDIR(dentry->d_inode->i_mode) &&
+-		     !S_ISLNK(dentry->d_inode->i_mode)))
++	if (unlikely(!d_is_dir(dentry) &&
++		     !d_is_symlink(dentry)))
+ 		return nfserr_stale;
+ 	/*
+ 	 * A pseudoroot export gives permission to access only one
+@@ -259,7 +259,7 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
+ 		goto out;
+ 	}
+ 
+-	if (S_ISDIR(dentry->d_inode->i_mode) &&
++	if (d_is_dir(dentry) &&
+ 			(dentry->d_flags & DCACHE_DISCONNECTED)) {
+ 		printk("nfsd: find_fh_dentry returned a DISCONNECTED directory: %pd2\n",
+ 				dentry);
+@@ -414,7 +414,7 @@ static inline void _fh_update_old(struct dentry *dentry,
+ {
+ 	fh->ofh_ino = ino_t_to_u32(dentry->d_inode->i_ino);
+ 	fh->ofh_generation = dentry->d_inode->i_generation;
+-	if (S_ISDIR(dentry->d_inode->i_mode) ||
++	if (d_is_dir(dentry) ||
+ 	    (exp->ex_flags & NFSEXP_NOSUBTREECHECK))
+ 		fh->ofh_dirino = 0;
+ }
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index c439a9b86cda..9e1e206f9f4c 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -756,9 +756,9 @@ nfsd_access(struct svc_rqst *rqstp, struct svc_fh *fhp, u32 *access, u32 *suppor
+ 	export = fhp->fh_export;
+ 	dentry = fhp->fh_dentry;
+ 
+-	if (S_ISREG(dentry->d_inode->i_mode))
++	if (d_is_reg(dentry))
+ 		map = nfs3_regaccess;
+-	else if (S_ISDIR(dentry->d_inode->i_mode))
++	else if (d_is_dir(dentry))
+ 		map = nfs3_diraccess;
+ 	else
+ 		map = nfs3_anyaccess;
+@@ -1522,7 +1522,7 @@ do_nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ 
+ 		switch (createmode) {
+ 		case NFS3_CREATE_UNCHECKED:
+-			if (! S_ISREG(dchild->d_inode->i_mode))
++			if (! d_is_reg(dchild))
+ 				goto out;
+ 			else if (truncp) {
+ 				/* in nfsv4, we need to treat this case a little
+@@ -1735,7 +1735,7 @@ nfsd_link(struct svc_rqst *rqstp, struct svc_fh *ffhp,
+ 	if (err)
+ 		goto out;
+ 	err = nfserr_isdir;
+-	if (S_ISDIR(tfhp->fh_dentry->d_inode->i_mode))
++	if (d_is_dir(tfhp->fh_dentry))
+ 		goto out;
+ 	err = nfserr_perm;
+ 	if (!len)
+diff --git a/fs/notify/fanotify/fanotify.c b/fs/notify/fanotify/fanotify.c
+index 0edb66a22699..d1cf37e7a2d0 100644
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@ -104,8 +104,8 @@ static bool fanotify_should_send_event(struct fsnotify_mark *inode_mark,
+ 		return false;
+ 
+ 	/* sorry, fanotify only gives a damn about files and dirs */
+-	if (!S_ISREG(path->dentry->d_inode->i_mode) &&
+-	    !S_ISDIR(path->dentry->d_inode->i_mode))
++	if (!d_is_reg(path->dentry) &&
++	    !d_is_dir(path->dentry))
+ 		return false;
+ 
+ 	if (inode_mark && vfsmnt_mark) {
+@@ -128,7 +128,7 @@ static bool fanotify_should_send_event(struct fsnotify_mark *inode_mark,
+ 		BUG();
+ 	}
+ 
+-	if (S_ISDIR(path->dentry->d_inode->i_mode) &&
++	if (d_is_dir(path->dentry) &&
+ 	    !(marks_mask & FS_ISDIR & ~marks_ignored_mask))
+ 		return false;
+ 
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index 6bbc598eb773..b9302e6a3656 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -22,7 +22,7 @@ void ovl_cleanup(struct inode *wdir, struct dentry *wdentry)
+ 	int err;
+ 
+ 	dget(wdentry);
+-	if (S_ISDIR(wdentry->d_inode->i_mode))
++	if (d_is_dir(wdentry))
+ 		err = ovl_do_rmdir(wdir, wdentry);
+ 	else
+ 		err = ovl_do_unlink(wdir, wdentry);
+@@ -827,7 +827,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
+ 	bool new_opaque;
+ 	bool cleanup_whiteout = false;
+ 	bool overwrite = !(flags & RENAME_EXCHANGE);
+-	bool is_dir = S_ISDIR(old->d_inode->i_mode);
++	bool is_dir = d_is_dir(old);
+ 	bool new_is_dir = false;
+ 	struct dentry *opaquedir = NULL;
+ 	const struct cred *old_cred = NULL;
+@@ -853,7 +853,7 @@ static int ovl_rename2(struct inode *olddir, struct dentry *old,
+ 		if (err)
+ 			goto out;
+ 
+-		if (S_ISDIR(new->d_inode->i_mode))
++		if (d_is_dir(new))
+ 			new_is_dir = true;
+ 
+ 		new_type = ovl_path_type(new);
+* Unmerged path fs/posix_acl.c
+* Unmerged path fs/reiserfs/xattr.c
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 3573fe146993..28c79516a4cc 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -314,7 +314,7 @@ xfs_readlink_by_handle(
+ 		return PTR_ERR(dentry);
+ 
+ 	/* Restrict this handle operation to symlinks only. */
+-	if (!S_ISLNK(dentry->d_inode->i_mode)) {
++	if (!d_is_symlink(dentry)) {
+ 		error = -EINVAL;
+ 		goto out_dput;
+ 	}
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 021ba8dffccb..aea8366b646c 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2390,8 +2390,8 @@ static int shmem_rmdir(struct inode *dir, struct dentry *dentry)
+ 
+ static int shmem_exchange(struct inode *old_dir, struct dentry *old_dentry, struct inode *new_dir, struct dentry *new_dentry)
+ {
+-	bool old_is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
+-	bool new_is_dir = S_ISDIR(new_dentry->d_inode->i_mode);
++	bool old_is_dir = d_is_dir(old_dentry);
++	bool new_is_dir = d_is_dir(new_dentry);
+ 
+ 	if (old_dir != new_dir && old_is_dir != new_is_dir) {
+ 		if (old_is_dir) {
+diff --git a/security/inode.c b/security/inode.c
+index 43ce6e19015f..13d4a4b949c2 100644
+--- a/security/inode.c
++++ b/security/inode.c
+@@ -203,7 +203,7 @@ void securityfs_remove(struct dentry *dentry)
+ 	mutex_lock(&parent->d_inode->i_mutex);
+ 	if (positive(dentry)) {
+ 		if (dentry->d_inode) {
+-			if (S_ISDIR(dentry->d_inode->i_mode))
++			if (d_is_dir(dentry))
+ 				simple_rmdir(parent->d_inode, dentry);
+ 			else
+ 				simple_unlink(parent->d_inode, dentry);
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 2e8d9da677e0..1ebe4f8baf25 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -1779,7 +1779,7 @@ static inline int may_rename(struct inode *old_dir,
+ 
+ 	old_dsec = old_dir->i_security;
+ 	old_isec = old_dentry->d_inode->i_security;
+-	old_is_dir = S_ISDIR(old_dentry->d_inode->i_mode);
++	old_is_dir = d_is_dir(old_dentry);
+ 	new_dsec = new_dir->i_security;
+ 
+ 	ad.type = LSM_AUDIT_DATA_DENTRY;
+@@ -1809,7 +1809,7 @@ static inline int may_rename(struct inode *old_dir,
+ 		return rc;
+ 	if (new_dentry->d_inode) {
+ 		new_isec = new_dentry->d_inode->i_security;
+-		new_is_dir = S_ISDIR(new_dentry->d_inode->i_mode);
++		new_is_dir = d_is_dir(new_dentry);
+ 		rc = avc_has_perm(sid, new_isec->sid,
+ 				  new_isec->sclass,
+ 				  (new_is_dir ? DIR__RMDIR : FILE__UNLINK), &ad);
