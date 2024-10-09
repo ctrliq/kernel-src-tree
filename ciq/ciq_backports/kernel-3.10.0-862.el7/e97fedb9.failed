@@ -1,0 +1,138 @@
+sync: serialise per-superblock sync operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit e97fedb9ef9868ff24d588be781906cf7c1b59ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e97fedb9.failed
+
+When competing sync(2) calls walk the same filesystem, they need to
+walk the list of inodes on the superblock to find all the inodes
+that we need to wait for IO completion on. However, when multiple
+wait_sb_inodes() calls do this at the same time, they contend on the
+the inode_sb_list_lock and the contention causes system wide
+slowdowns. In effect, concurrent sync(2) calls can take longer and
+burn more CPU than if they were serialised.
+
+Stop the worst of the contention by adding a per-sb mutex to wrap
+around wait_sb_inodes() so that we only execute one sync(2) IO
+completion walk per superblock superblock at a time and hence avoid
+contention being triggered by concurrent sync(2) calls.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit e97fedb9ef9868ff24d588be781906cf7c1b59ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs-writeback.c
+#	include/linux/fs.h
+diff --cc fs/fs-writeback.c
+index 204141e64775,3c974442bdf0..000000000000
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@@ -1224,7 -2133,8 +1233,12 @@@ static void wait_sb_inodes(struct super
+  	 */
+  	WARN_ON(!rwsem_is_locked(&sb->s_umount));
+  
+++<<<<<<< HEAD
+ +	spin_lock(&inode_sb_list_lock);
+++=======
++ 	mutex_lock(&sb->s_sync_lock);
++ 	spin_lock(&sb->s_inode_list_lock);
+++>>>>>>> e97fedb9ef98 (sync: serialise per-superblock sync operations)
+  
+  	/*
+  	 * Data integrity sync. Must wait for all pages under writeback,
+@@@ -1266,12 -2171,35 +1280,13 @@@
+  
+  		cond_resched();
+  
+ -		spin_lock(&sb->s_inode_list_lock);
+ +		spin_lock(&inode_sb_list_lock);
+  	}
+ -	spin_unlock(&sb->s_inode_list_lock);
+ +	spin_unlock(&inode_sb_list_lock);
+  	iput(old_inode);
++ 	mutex_unlock(&sb->s_sync_lock);
+  }
+  
+ -static void __writeback_inodes_sb_nr(struct super_block *sb, unsigned long nr,
+ -				     enum wb_reason reason, bool skip_if_busy)
+ -{
+ -	DEFINE_WB_COMPLETION_ONSTACK(done);
+ -	struct wb_writeback_work work = {
+ -		.sb			= sb,
+ -		.sync_mode		= WB_SYNC_NONE,
+ -		.tagged_writepages	= 1,
+ -		.done			= &done,
+ -		.nr_pages		= nr,
+ -		.reason			= reason,
+ -	};
+ -	struct backing_dev_info *bdi = sb->s_bdi;
+ -
+ -	if (!bdi_has_dirty_io(bdi) || bdi == &noop_backing_dev_info)
+ -		return;
+ -	WARN_ON(!rwsem_is_locked(&sb->s_umount));
+ -
+ -	bdi_split_work_to_wbs(sb->s_bdi, &work, skip_if_busy);
+ -	wb_wait_for_completion(bdi, &done);
+ -}
+ -
+  /**
+   * writeback_inodes_sb_nr -	writeback dirty inodes from given super_block
+   * @sb: the superblock
+diff --cc include/linux/fs.h
+index 4086333a0708,82dfc5519b4b..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1523,16 -1364,19 +1523,21 @@@ struct super_block 
+  	int s_readonly_remount;
+  
+  	/* AIO completions deferred from interrupt context */
+ -	struct workqueue_struct *s_dio_done_wq;
+ -	struct hlist_head s_pins;
+ +	RH_KABI_EXTEND(struct workqueue_struct *s_dio_done_wq)
+ +	RH_KABI_EXTEND(struct rcu_head rcu)
+ +	RH_KABI_EXTEND(struct hlist_head s_pins)
+ +};
+  
+ -	/*
+ -	 * Keep the lru lists last in the structure so they always sit on their
+ -	 * own individual cachelines.
+ -	 */
+ -	struct list_lru		s_dentry_lru ____cacheline_aligned_in_smp;
+ -	struct list_lru		s_inode_lru ____cacheline_aligned_in_smp;
+ -	struct rcu_head		rcu;
+ +extern const unsigned super_block_wrapper_version;
+ +struct super_block_wrapper {
+ +	struct super_block sb;
+  
+++<<<<<<< HEAD
+ +	/* -- Wrapper version 0 -- */
+++=======
++ 	struct mutex		s_sync_lock;	/* sync serialisation lock */
++ 
+++>>>>>>> e97fedb9ef98 (sync: serialise per-superblock sync operations)
+  	/*
+  	 * Indicates how deep in a filesystem stack this SB is
+  	 */
+* Unmerged path fs/fs-writeback.c
+diff --git a/fs/super.c b/fs/super.c
+index 985ae62de171..33d3f98fdb7d 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -157,6 +157,7 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
+ 	s->s_bdi = &default_backing_dev_info;
+ 	INIT_HLIST_NODE(&s->s_instances);
+ 	INIT_HLIST_BL_HEAD(&s->s_anon);
++	mutex_init(&s->s_sync_lock);
+ 	INIT_LIST_HEAD(&s->s_inodes);
+ 	INIT_LIST_HEAD(&s->s_dentry_lru);
+ 	INIT_LIST_HEAD(&s->s_inode_lru);
+* Unmerged path include/linux/fs.h
