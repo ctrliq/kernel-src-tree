@@ -1,0 +1,289 @@
+ACPICA: Events: Cleanup GPE dispatcher type obtaining code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit 7c43312af8b363b679d1e7840858ff8d204a4d91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c43312a.failed
+
+ACPICA commit 7926d5ca9452c87f866938dcea8f12e1efb58f89
+
+There is an issue in acpi_install_gpe_handler() and acpi_remove_gpe_handler().
+The code to obtain the GPE dispatcher type from the Handler->original_flags
+is wrong:
+    if (((Handler->original_flags & ACPI_GPE_DISPATCH_METHOD) ||
+         (Handler->original_flags & ACPI_GPE_DISPATCH_NOTIFY)) &&
+ACPI_GPE_DISPATCH_NOTIFY is 0x03 and ACPI_GPE_DISPATCH_METHOD is 0x02, thus
+this statement is TRUE for the following dispatcher types:
+    0x01 (ACPI_GPE_DISPATCH_HANDLER): not expected
+    0x02 (ACPI_GPE_DISPATCH_METHOD): expected
+    0x03 (ACPI_GPE_DISPATCH_NOTIFY): expected
+
+There is no functional issue due to this because Handler->original_flags is
+only set in acpi_install_gpe_handler(), and an earlier checker has excluded
+the ACPI_GPE_DISPATCH_HANDLER:
+    if ((gpe_event_info->Flags & ACPI_GPE_DISPATCH_MASK) ==
+            ACPI_GPE_DISPATCH_HANDLER)
+    {
+        Status = AE_ALREADY_EXISTS;
+        goto free_and_exit;
+    }
+    ...
+    Handler->original_flags = (u8) (gpe_event_info->Flags &
+        (ACPI_GPE_XRUPT_TYPE_MASK | ACPI_GPE_DISPATCH_MASK));
+
+We need to clean this up before modifying the GPE dispatcher type values.
+
+In order to prevent such issue from happening in the future, this patch
+introduces ACPI_GPE_DISPATCH_TYPE() macro to be used to obtain the GPE
+dispatcher types. Lv Zheng.
+
+Link: https://github.com/acpica/acpica/commit/7926d5ca
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: David E. Box <david.e.box@linux.intel.com>
+	Signed-off-by: Bob Moore <robert.moore@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 7c43312af8b363b679d1e7840858ff8d204a4d91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/evgpe.c
+#	drivers/acpi/acpica/evxface.c
+#	drivers/acpi/acpica/evxfgpe.c
+#	drivers/acpi/acpica/hwgpe.c
+diff --cc drivers/acpi/acpica/evgpe.c
+index ca3b0369c1c0,fccdfb2f73df..000000000000
+--- a/drivers/acpi/acpica/evgpe.c
++++ b/drivers/acpi/acpica/evgpe.c
+@@@ -490,44 -501,9 +490,48 @@@ static void ACPI_SYSTEM_XFACE acpi_ev_a
+  
+  	ACPI_FUNCTION_TRACE(ev_asynch_execute_gpe_method);
+  
+ +	/* Allocate a local GPE block */
+ +
+ +	local_gpe_event_info =
+ +	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpi_gpe_event_info));
+ +	if (!local_gpe_event_info) {
+ +		ACPI_EXCEPTION((AE_INFO, AE_NO_MEMORY, "while handling a GPE"));
+ +		return_VOID;
+ +	}
+ +
+ +	status = acpi_ut_acquire_mutex(ACPI_MTX_EVENTS);
+ +	if (ACPI_FAILURE(status)) {
+ +		ACPI_FREE(local_gpe_event_info);
+ +		return_VOID;
+ +	}
+ +
+ +	/* Must revalidate the gpe_number/gpe_block */
+ +
+ +	if (!acpi_ev_valid_gpe_event(gpe_event_info)) {
+ +		status = acpi_ut_release_mutex(ACPI_MTX_EVENTS);
+ +		ACPI_FREE(local_gpe_event_info);
+ +		return_VOID;
+ +	}
+ +
+ +	/*
+ +	 * Take a snapshot of the GPE info for this level - we copy the info to
+ +	 * prevent a race condition with remove_handler/remove_block.
+ +	 */
+ +	memcpy(local_gpe_event_info, gpe_event_info,
+ +	       sizeof(struct acpi_gpe_event_info));
+ +
+ +	status = acpi_ut_release_mutex(ACPI_MTX_EVENTS);
+ +	if (ACPI_FAILURE(status)) {
+ +		return_VOID;
+ +	}
+ +
+  	/* Do the correct dispatch - normal method or implicit notify */
+  
+++<<<<<<< HEAD
+ +	switch (local_gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) {
+++=======
++ 	switch (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags)) {
+++>>>>>>> 7c43312af8b3 (ACPICA: Events: Cleanup GPE dispatcher type obtaining code)
+  	case ACPI_GPE_DISPATCH_NOTIFY:
+  		/*
+  		 * Implicit notify.
+diff --cc drivers/acpi/acpica/evxface.c
+index 00d67a948816,61b0261dd137..000000000000
+--- a/drivers/acpi/acpica/evxface.c
++++ b/drivers/acpi/acpica/evxface.c
+@@@ -652,11 -793,20 +652,19 @@@ acpi_install_gpe_handler(acpi_handle gp
+  	 * automatically during initialization, in which case it has to be
+  	 * disabled now to avoid spurious execution of the handler.
+  	 */
+++<<<<<<< HEAD
+ +
+ +	if ((handler->original_flags & ACPI_GPE_DISPATCH_METHOD)
+ +	    && gpe_event_info->runtime_count) {
+ +		handler->originally_enabled = 1;
+++=======
++ 	if (((ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
++ 	      ACPI_GPE_DISPATCH_METHOD) ||
++ 	     (ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
++ 	      ACPI_GPE_DISPATCH_NOTIFY)) && gpe_event_info->runtime_count) {
++ 		handler->originally_enabled = TRUE;
+++>>>>>>> 7c43312af8b3 (ACPICA: Events: Cleanup GPE dispatcher type obtaining code)
+  		(void)acpi_ev_remove_gpe_reference(gpe_event_info);
+ -
+ -		/* Sanity check of original type against new type */
+ -
+ -		if (type !=
+ -		    (u32)(gpe_event_info->flags & ACPI_GPE_XRUPT_TYPE_MASK)) {
+ -			ACPI_WARNING((AE_INFO,
+ -				      "GPE type mismatch (level/edge)"));
+ -		}
+  	}
+  
+  	/* Install the handler */
+@@@ -760,8 -911,10 +768,15 @@@ acpi_remove_gpe_handler(acpi_handle gpe
+  	 * enabled, it should be enabled at this point to restore the
+  	 * post-initialization configuration.
+  	 */
+++<<<<<<< HEAD
+ +	if ((handler->original_flags & ACPI_GPE_DISPATCH_METHOD) &&
+ +	    handler->originally_enabled) {
+++=======
++ 	if (((ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
++ 	      ACPI_GPE_DISPATCH_METHOD) ||
++ 	     (ACPI_GPE_DISPATCH_TYPE(handler->original_flags) ==
++ 	      ACPI_GPE_DISPATCH_NOTIFY)) && handler->originally_enabled) {
+++>>>>>>> 7c43312af8b3 (ACPICA: Events: Cleanup GPE dispatcher type obtaining code)
+  		(void)acpi_ev_add_gpe_reference(gpe_event_info);
+  	}
+  
+diff --cc drivers/acpi/acpica/evxfgpe.c
+index fab40d9b3bd6,b836139e13bb..000000000000
+--- a/drivers/acpi/acpica/evxfgpe.c
++++ b/drivers/acpi/acpica/evxfgpe.c
+@@@ -126,11 -125,19 +126,20 @@@ acpi_status acpi_enable_gpe(acpi_handl
+  
+  	flags = acpi_os_acquire_lock(acpi_gbl_gpe_lock);
+  
+ -	/*
+ -	 * Ensure that we have a valid GPE number and that there is some way
+ -	 * of handling the GPE (handler or a GPE method). In other words, we
+ -	 * won't allow a valid GPE to be enabled if there is no way to handle it.
+ -	 */
+ +	/* Ensure that we have a valid GPE number */
+ +
+  	gpe_event_info = acpi_ev_get_gpe_event_info(gpe_device, gpe_number);
+  	if (gpe_event_info) {
+++<<<<<<< HEAD
+ +		status = acpi_ev_add_gpe_reference(gpe_event_info);
+++=======
++ 		if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) !=
++ 		    ACPI_GPE_DISPATCH_NONE) {
++ 			status = acpi_ev_add_gpe_reference(gpe_event_info);
++ 		} else {
++ 			status = AE_NO_HANDLER;
++ 		}
+++>>>>>>> 7c43312af8b3 (ACPICA: Events: Cleanup GPE dispatcher type obtaining code)
+  	}
+  
+  	acpi_os_release_lock(acpi_gbl_gpe_lock, flags);
+diff --cc drivers/acpi/acpica/hwgpe.c
+index 96540506058f,ed85fe7494ae..000000000000
+--- a/drivers/acpi/acpica/hwgpe.c
++++ b/drivers/acpi/acpica/hwgpe.c
+@@@ -216,6 -223,13 +216,16 @@@ acpi_hw_get_gpe_status(struct acpi_gpe_
+  		return (AE_BAD_PARAMETER);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* GPE currently handled? */
++ 
++ 	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) !=
++ 	    ACPI_GPE_DISPATCH_NONE) {
++ 		local_event_status |= ACPI_EVENT_FLAG_HAS_HANDLER;
++ 	}
++ 
+++>>>>>>> 7c43312af8b3 (ACPICA: Events: Cleanup GPE dispatcher type obtaining code)
+  	/* Get the info block for the entire GPE register */
+  
+  	gpe_register_info = gpe_event_info->register_info;
+* Unmerged path drivers/acpi/acpica/evgpe.c
+diff --git a/drivers/acpi/acpica/evgpeblk.c b/drivers/acpi/acpica/evgpeblk.c
+index ef2c009793e7..65dde9c8622c 100644
+--- a/drivers/acpi/acpica/evgpeblk.c
++++ b/drivers/acpi/acpica/evgpeblk.c
+@@ -476,10 +476,10 @@ acpi_ev_initialize_gpe_block(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+ 			 * Ignore GPEs that have no corresponding _Lxx/_Exx method
+ 			 * and GPEs that are used to wake the system
+ 			 */
+-			if (((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
++			if ((ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
+ 			     ACPI_GPE_DISPATCH_NONE)
+-			    || ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK)
+-				== ACPI_GPE_DISPATCH_HANDLER)
++			    || (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
++				ACPI_GPE_DISPATCH_HANDLER)
+ 			    || (gpe_event_info->flags & ACPI_GPE_CAN_WAKE)) {
+ 				continue;
+ 			}
+diff --git a/drivers/acpi/acpica/evgpeinit.c b/drivers/acpi/acpica/evgpeinit.c
+index 7e98aac85539..68a28593c193 100644
+--- a/drivers/acpi/acpica/evgpeinit.c
++++ b/drivers/acpi/acpica/evgpeinit.c
+@@ -411,7 +411,7 @@ acpi_ev_match_gpe_method(acpi_handle obj_handle,
+ 		return_ACPI_STATUS(AE_OK);
+ 	}
+ 
+-	if ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
++	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
+ 	    ACPI_GPE_DISPATCH_HANDLER) {
+ 
+ 		/* If there is already a handler, ignore this GPE method */
+@@ -419,7 +419,7 @@ acpi_ev_match_gpe_method(acpi_handle obj_handle,
+ 		return_ACPI_STATUS(AE_OK);
+ 	}
+ 
+-	if ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
++	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
+ 	    ACPI_GPE_DISPATCH_METHOD) {
+ 		/*
+ 		 * If there is already a method, ignore this method. But check
+diff --git a/drivers/acpi/acpica/evgpeutil.c b/drivers/acpi/acpica/evgpeutil.c
+index b24dbb80fab8..b357d65c2f06 100644
+--- a/drivers/acpi/acpica/evgpeutil.c
++++ b/drivers/acpi/acpica/evgpeutil.c
+@@ -365,7 +365,7 @@ acpi_ev_delete_gpe_handlers(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+ 								 ACPI_GPE_REGISTER_WIDTH)
+ 								+ j];
+ 
+-			if ((gpe_event_info->flags & ACPI_GPE_DISPATCH_MASK) ==
++			if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
+ 			    ACPI_GPE_DISPATCH_HANDLER) {
+ 
+ 				/* Delete an installed handler block */
+@@ -374,10 +374,8 @@ acpi_ev_delete_gpe_handlers(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+ 				gpe_event_info->dispatch.handler = NULL;
+ 				gpe_event_info->flags &=
+ 				    ~ACPI_GPE_DISPATCH_MASK;
+-			} else
+-			    if ((gpe_event_info->
+-				 flags & ACPI_GPE_DISPATCH_MASK) ==
+-				ACPI_GPE_DISPATCH_NOTIFY) {
++			} else if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags)
++				   == ACPI_GPE_DISPATCH_NOTIFY) {
+ 
+ 				/* Delete the implicit notification device list */
+ 
+* Unmerged path drivers/acpi/acpica/evxface.c
+* Unmerged path drivers/acpi/acpica/evxfgpe.c
+* Unmerged path drivers/acpi/acpica/hwgpe.c
+diff --git a/include/acpi/actypes.h b/include/acpi/actypes.h
+index 50e47dab668a..7f413f67f58a 100644
+--- a/include/acpi/actypes.h
++++ b/include/acpi/actypes.h
+@@ -737,6 +737,7 @@ typedef u32 acpi_event_status;
+ #define ACPI_GPE_DISPATCH_HANDLER       (u8) 0x02
+ #define ACPI_GPE_DISPATCH_NOTIFY        (u8) 0x03
+ #define ACPI_GPE_DISPATCH_MASK          (u8) 0x03
++#define ACPI_GPE_DISPATCH_TYPE(flags)   ((u8) ((flags) & ACPI_GPE_DISPATCH_MASK))
+ 
+ #define ACPI_GPE_LEVEL_TRIGGERED        (u8) 0x04
+ #define ACPI_GPE_EDGE_TRIGGERED         (u8) 0x00
