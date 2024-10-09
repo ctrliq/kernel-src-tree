@@ -1,0 +1,139 @@
+ixgbe: delay tail write to every 'n' packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author John Fastabend <john.r.fastabend@intel.com>
+commit 7379f97a4fce3c1aa3b80a85cb8440453bf30411
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7379f97a.failed
+
+Current XDP implementation hits the tail on every XDP_TX return
+code. This patch changes driver behavior to only hit the tail after
+packet processing is complete.
+
+With this patch I can run XDP drop programs @ 14+Mpps and XDP_TX
+programs are at ~13.5Mpps.
+
+	Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 7379f97a4fce3c1aa3b80a85cb8440453bf30411)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 90f60ed0b65b,3d7b09100945..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -2229,14 -2312,34 +2230,37 @@@ static int ixgbe_clean_rx_irq(struct ix
+  		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
+  
+  		/* retrieve a buffer from the ring */
+++<<<<<<< HEAD
+ +		if (skb)
+++=======
++ 		if (!skb) {
++ 			xdp.data = page_address(rx_buffer->page) +
++ 				   rx_buffer->page_offset;
++ 			xdp.data_hard_start = xdp.data -
++ 					      ixgbe_rx_offset(rx_ring);
++ 			xdp.data_end = xdp.data + size;
++ 
++ 			skb = ixgbe_run_xdp(adapter, rx_ring, &xdp);
++ 		}
++ 
++ 		if (IS_ERR(skb)) {
++ 			if (PTR_ERR(skb) == -IXGBE_XDP_TX) {
++ 				xdp_xmit = true;
++ 				ixgbe_rx_buffer_flip(rx_ring, rx_buffer, size);
++ 			} else {
++ 				rx_buffer->pagecnt_bias++;
++ 			}
++ 			total_rx_packets++;
++ 			total_rx_bytes += size;
++ 		} else if (skb) {
+++>>>>>>> 7379f97a4fce (ixgbe: delay tail write to every 'n' packets)
+  			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+ -		} else if (ring_uses_build_skb(rx_ring)) {
+ +		else if (ring_uses_build_skb(rx_ring))
+  			skb = ixgbe_build_skb(rx_ring, rx_buffer,
+ -					      &xdp, rx_desc);
+ -		} else {
+ +					      rx_desc, size);
+ +		else
+  			skb = ixgbe_construct_skb(rx_ring, rx_buffer,
+ -						  &xdp, rx_desc);
+ -		}
+ +						  rx_desc, size);
+  
+  		/* exit if we failed to retrieve a buffer */
+  		if (!skb) {
+@@@ -8080,6 -8209,62 +8114,65 @@@ static u16 ixgbe_select_queue(struct ne
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_xmit_xdp_ring(struct ixgbe_adapter *adapter,
++ 			       struct xdp_buff *xdp)
++ {
++ 	struct ixgbe_ring *ring = adapter->xdp_ring[smp_processor_id()];
++ 	struct ixgbe_tx_buffer *tx_buffer;
++ 	union ixgbe_adv_tx_desc *tx_desc;
++ 	u32 len, cmd_type;
++ 	dma_addr_t dma;
++ 	u16 i;
++ 
++ 	len = xdp->data_end - xdp->data;
++ 
++ 	if (unlikely(!ixgbe_desc_unused(ring)))
++ 		return IXGBE_XDP_CONSUMED;
++ 
++ 	dma = dma_map_single(ring->dev, xdp->data, len, DMA_TO_DEVICE);
++ 	if (dma_mapping_error(ring->dev, dma))
++ 		return IXGBE_XDP_CONSUMED;
++ 
++ 	/* record the location of the first descriptor for this packet */
++ 	tx_buffer = &ring->tx_buffer_info[ring->next_to_use];
++ 	tx_buffer->bytecount = len;
++ 	tx_buffer->gso_segs = 1;
++ 	tx_buffer->protocol = 0;
++ 
++ 	i = ring->next_to_use;
++ 	tx_desc = IXGBE_TX_DESC(ring, i);
++ 
++ 	dma_unmap_len_set(tx_buffer, len, len);
++ 	dma_unmap_addr_set(tx_buffer, dma, dma);
++ 	tx_buffer->data = xdp->data;
++ 	tx_desc->read.buffer_addr = cpu_to_le64(dma);
++ 
++ 	/* put descriptor type bits */
++ 	cmd_type = IXGBE_ADVTXD_DTYP_DATA |
++ 		   IXGBE_ADVTXD_DCMD_DEXT |
++ 		   IXGBE_ADVTXD_DCMD_IFCS;
++ 	cmd_type |= len | IXGBE_TXD_CMD;
++ 	tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 	tx_desc->read.olinfo_status =
++ 		cpu_to_le32(len << IXGBE_ADVTXD_PAYLEN_SHIFT);
++ 
++ 	/* Avoid any potential race with xdp_xmit and cleanup */
++ 	smp_wmb();
++ 
++ 	/* set next_to_watch value indicating a packet is present */
++ 	i++;
++ 	if (i == ring->count)
++ 		i = 0;
++ 
++ 	tx_buffer->next_to_watch = tx_desc;
++ 	ring->next_to_use = i;
++ 
++ 	return IXGBE_XDP_TX;
++ }
++ 
+++>>>>>>> 7379f97a4fce (ixgbe: delay tail write to every 'n' packets)
+  netdev_tx_t ixgbe_xmit_frame_ring(struct sk_buff *skb,
+  			  struct ixgbe_adapter *adapter,
+  			  struct ixgbe_ring *tx_ring)
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
