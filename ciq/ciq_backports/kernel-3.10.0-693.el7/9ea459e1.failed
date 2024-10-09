@@ -1,0 +1,191 @@
+delayed mntput
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 9ea459e110df32e60a762f311f7939eaa879601d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9ea459e1.failed
+
+On final mntput() we want fs shutdown to happen before return to
+userland; however, the only case where we want it happen right
+there (i.e. where task_work_add won't do) is MNT_INTERNAL victim.
+Those have to be fully synchronous - failure halfway through module
+init might count on having vfsmount killed right there.  Fortunately,
+final mntput on MNT_INTERNAL vfsmounts happens on shallow stack.
+So we handle those synchronously and do an analog of delayed fput
+logics for everything else.
+
+As the result, we are guaranteed that fs shutdown will always happen
+on shallow stack.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 9ea459e110df32e60a762f311f7939eaa879601d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/mount.h
+#	fs/namespace.c
+diff --cc fs/mount.h
+index 78d1559796ee,8f2a14ae38a2..000000000000
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@@ -29,6 -29,10 +29,13 @@@ struct mount 
+  	struct mount *mnt_parent;
+  	struct dentry *mnt_mountpoint;
+  	struct vfsmount mnt;
+++<<<<<<< HEAD
+++=======
++ 	union {
++ 		struct rcu_head mnt_rcu;
++ 		struct llist_node mnt_llist;
++ 	};
+++>>>>>>> 9ea459e110df (delayed mntput)
+  #ifdef CONFIG_SMP
+  	struct mnt_pcp __percpu *mnt_pcp;
+  #else
+diff --cc fs/namespace.c
+index a5b701394bb8,044134315f93..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -23,6 -22,8 +23,11 @@@
+  #include <linux/uaccess.h>
+  #include <linux/proc_ns.h>
+  #include <linux/magic.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bootmem.h>
++ #include <linux/task_work.h>
+++>>>>>>> 9ea459e110df (delayed mntput)
+  #include "pnode.h"
+  #include "internal.h"
+  
+@@@ -874,57 -958,83 +879,112 @@@ static struct mount *clone_mnt(struct m
+  	return ERR_PTR(err);
+  }
+  
++ static void cleanup_mnt(struct mount *mnt)
++ {
++ 	/*
++ 	 * This probably indicates that somebody messed
++ 	 * up a mnt_want/drop_write() pair.  If this
++ 	 * happens, the filesystem was probably unable
++ 	 * to make r/w->r/o transitions.
++ 	 */
++ 	/*
++ 	 * The locking used to deal with mnt_count decrement provides barriers,
++ 	 * so mnt_get_writers() below is safe.
++ 	 */
++ 	WARN_ON(mnt_get_writers(mnt));
++ 	if (unlikely(mnt->mnt_pins.first))
++ 		mnt_pin_kill(mnt);
++ 	fsnotify_vfsmount_delete(&mnt->mnt);
++ 	dput(mnt->mnt.mnt_root);
++ 	deactivate_super(mnt->mnt.mnt_sb);
++ 	mnt_free_id(mnt);
++ 	call_rcu(&mnt->mnt_rcu, delayed_free_vfsmnt);
++ }
++ 
++ static void __cleanup_mnt(struct rcu_head *head)
++ {
++ 	cleanup_mnt(container_of(head, struct mount, mnt_rcu));
++ }
++ 
++ static LLIST_HEAD(delayed_mntput_list);
++ static void delayed_mntput(struct work_struct *unused)
++ {
++ 	struct llist_node *node = llist_del_all(&delayed_mntput_list);
++ 	struct llist_node *next;
++ 
++ 	for (; node; node = next) {
++ 		next = llist_next(node);
++ 		cleanup_mnt(llist_entry(node, struct mount, mnt_llist));
++ 	}
++ }
++ static DECLARE_DELAYED_WORK(delayed_mntput_work, delayed_mntput);
++ 
+  static void mntput_no_expire(struct mount *mnt)
+  {
+ -	rcu_read_lock();
+ -	mnt_add_count(mnt, -1);
+ -	if (likely(mnt->mnt_ns)) { /* shouldn't be the last one */
+ -		rcu_read_unlock();
+ +put_again:
+ +#ifdef CONFIG_SMP
+ +	br_read_lock(&vfsmount_lock);
+ +	if (likely(mnt->mnt_ns)) {
+ +		/* shouldn't be the last one */
+ +		mnt_add_count(mnt, -1);
+ +		br_read_unlock(&vfsmount_lock);
+  		return;
+  	}
+ -	lock_mount_hash();
+ +	br_read_unlock(&vfsmount_lock);
+ +
+ +	br_write_lock(&vfsmount_lock);
+ +	mnt_add_count(mnt, -1);
+  	if (mnt_get_count(mnt)) {
+ -		rcu_read_unlock();
+ -		unlock_mount_hash();
+ +		br_write_unlock(&vfsmount_lock);
+  		return;
+  	}
+ -	if (unlikely(mnt->mnt.mnt_flags & MNT_DOOMED)) {
+ -		rcu_read_unlock();
+ -		unlock_mount_hash();
+ +#else
+ +	mnt_add_count(mnt, -1);
+ +	if (likely(mnt_get_count(mnt)))
+  		return;
+ +	br_write_lock(&vfsmount_lock);
+ +#endif
+ +	if (unlikely(mnt->mnt_pinned)) {
+ +		mnt_add_count(mnt, mnt->mnt_pinned + 1);
+ +		mnt->mnt_pinned = 0;
+ +		br_write_unlock(&vfsmount_lock);
+ +		acct_auto_close_mnt(&mnt->mnt);
+ +		goto put_again;
+  	}
+ -	mnt->mnt.mnt_flags |= MNT_DOOMED;
+ -	rcu_read_unlock();
+  
+  	list_del(&mnt->mnt_instance);
+ -	unlock_mount_hash();
+ +	br_write_unlock(&vfsmount_lock);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * This probably indicates that somebody messed
+ +	 * up a mnt_want/drop_write() pair.  If this
+ +	 * happens, the filesystem was probably unable
+ +	 * to make r/w->r/o transitions.
+ +	 */
+ +	/*
+ +	 * The locking used to deal with mnt_count decrement provides barriers,
+ +	 * so mnt_get_writers() below is safe.
+ +	 */
+ +	WARN_ON(mnt_get_writers(mnt));
+ +	fsnotify_vfsmount_delete(&mnt->mnt);
+ +	dput(mnt->mnt.mnt_root);
+ +	deactivate_super(mnt->mnt.mnt_sb);
+ +	free_vfsmnt(mnt);
+++=======
++ 	if (likely(!(mnt->mnt.mnt_flags & MNT_INTERNAL))) {
++ 		struct task_struct *task = current;
++ 		if (likely(!(task->flags & PF_KTHREAD))) {
++ 			init_task_work(&mnt->mnt_rcu, __cleanup_mnt);
++ 			if (!task_work_add(task, &mnt->mnt_rcu, true))
++ 				return;
++ 		}
++ 		if (llist_add(&mnt->mnt_llist, &delayed_mntput_list))
++ 			schedule_delayed_work(&delayed_mntput_work, 1);
++ 		return;
++ 	}
++ 	cleanup_mnt(mnt);
+++>>>>>>> 9ea459e110df (delayed mntput)
+  }
+  
+  void mntput(struct vfsmount *mnt)
+* Unmerged path fs/mount.h
+* Unmerged path fs/namespace.c
