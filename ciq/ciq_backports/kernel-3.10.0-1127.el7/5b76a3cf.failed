@@ -1,0 +1,168 @@
+KVM: VMX: Tell the nested hypervisor to skip L1D flush on vmentry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 5b76a3cff011df2dcb6186c965a2e4d809a05ad4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5b76a3cf.failed
+
+When nested virtualization is in use, VMENTER operations from the nested
+hypervisor into the nested guest will always be processed by the bare metal
+hypervisor, and KVM's "conditional cache flushes" mode in particular does a
+flush on nested vmentry.  Therefore, include the "skip L1D flush on
+vmentry" bit in KVM's suggested ARCH_CAPABILITIES setting.
+
+Add the relevant Documentation.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 5b76a3cff011df2dcb6186c965a2e4d809a05ad4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/hw-vuln/l1tf.rst
+#	arch/x86/kvm/x86.c
+diff --cc Documentation/admin-guide/hw-vuln/l1tf.rst
+index 31653a9f0e1b,bae52b845de0..000000000000
+--- a/Documentation/admin-guide/hw-vuln/l1tf.rst
++++ b/Documentation/admin-guide/hw-vuln/l1tf.rst
+@@@ -557,7 -553,7 +557,11 @@@ When nested virtualization is in use, t
+  the bare metal hypervisor, the nested hypervisor and the nested virtual
+  machine.  VMENTER operations from the nested hypervisor into the nested
+  guest will always be processed by the bare metal hypervisor. If KVM is the
+++<<<<<<< HEAD:Documentation/admin-guide/hw-vuln/l1tf.rst
+ +bare metal hypervisor it will:
+++=======
++ bare metal hypervisor it wiil:
+++>>>>>>> 5b76a3cff011 (KVM: VMX: Tell the nested hypervisor to skip L1D flush on vmentry):Documentation/admin-guide/l1tf.rst
+  
+   - Flush the L1D cache on every switch from the nested hypervisor to the
+     nested virtual machine, so that the nested hypervisor's secrets are not
+diff --cc arch/x86/kvm/x86.c
+index 69feb8491cac,a5caa5e5480c..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1039,6 -1072,90 +1039,93 @@@ static u32 emulated_msrs[] = 
+  
+  static unsigned num_emulated_msrs;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * List of msr numbers which are used to expose MSR-based features that
++  * can be used by a hypervisor to validate requested CPU features.
++  */
++ static u32 msr_based_features[] = {
++ 	MSR_IA32_VMX_BASIC,
++ 	MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++ 	MSR_IA32_VMX_PINBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_EXIT_CTLS,
++ 	MSR_IA32_VMX_EXIT_CTLS,
++ 	MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++ 	MSR_IA32_VMX_ENTRY_CTLS,
++ 	MSR_IA32_VMX_MISC,
++ 	MSR_IA32_VMX_CR0_FIXED0,
++ 	MSR_IA32_VMX_CR0_FIXED1,
++ 	MSR_IA32_VMX_CR4_FIXED0,
++ 	MSR_IA32_VMX_CR4_FIXED1,
++ 	MSR_IA32_VMX_VMCS_ENUM,
++ 	MSR_IA32_VMX_PROCBASED_CTLS2,
++ 	MSR_IA32_VMX_EPT_VPID_CAP,
++ 	MSR_IA32_VMX_VMFUNC,
++ 
++ 	MSR_F10H_DECFG,
++ 	MSR_IA32_UCODE_REV,
++ 	MSR_IA32_ARCH_CAPABILITIES,
++ };
++ 
++ static unsigned int num_msr_based_features;
++ 
++ u64 kvm_get_arch_capabilities(void)
++ {
++ 	u64 data;
++ 
++ 	rdmsrl_safe(MSR_IA32_ARCH_CAPABILITIES, &data);
++ 
++ 	/*
++ 	 * If we're doing cache flushes (either "always" or "cond")
++ 	 * we will do one whenever the guest does a vmlaunch/vmresume.
++ 	 * If an outer hypervisor is doing the cache flush for us
++ 	 * (VMENTER_L1D_FLUSH_NESTED_VM), we can safely pass that
++ 	 * capability to the guest too, and if EPT is disabled we're not
++ 	 * vulnerable.  Overall, only VMENTER_L1D_FLUSH_NEVER will
++ 	 * require a nested hypervisor to do a flush of its own.
++ 	 */
++ 	if (l1tf_vmx_mitigation != VMENTER_L1D_FLUSH_NEVER)
++ 		data |= ARCH_CAP_SKIP_VMENTRY_L1DFLUSH;
++ 
++ 	return data;
++ }
++ EXPORT_SYMBOL_GPL(kvm_get_arch_capabilities);
++ 
++ static int kvm_get_msr_feature(struct kvm_msr_entry *msr)
++ {
++ 	switch (msr->index) {
++ 	case MSR_IA32_ARCH_CAPABILITIES:
++ 		msr->data = kvm_get_arch_capabilities();
++ 		break;
++ 	case MSR_IA32_UCODE_REV:
++ 		rdmsrl_safe(msr->index, &msr->data);
++ 		break;
++ 	default:
++ 		if (kvm_x86_ops->get_msr_feature(msr))
++ 			return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ static int do_get_msr_feature(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
++ {
++ 	struct kvm_msr_entry msr;
++ 	int r;
++ 
++ 	msr.index = index;
++ 	r = kvm_get_msr_feature(&msr);
++ 	if (r)
++ 		return r;
++ 
++ 	*data = msr.data;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 5b76a3cff011 (KVM: VMX: Tell the nested hypervisor to skip L1D flush on vmentry)
+  bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
+  {
+  	if (efer & efer_reserved_bits)
+* Unmerged path Documentation/admin-guide/hw-vuln/l1tf.rst
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 35f22ae3e497..ed92dee063fd 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1411,6 +1411,7 @@ void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu);
+ void kvm_arch_mmu_notifier_invalidate_page(struct kvm *kvm,
+ 					   unsigned long address);
+ 
++u64 kvm_get_arch_capabilities(void);
+ void kvm_define_shared_msr(unsigned index, u32 msr);
+ int kvm_set_shared_msr(unsigned index, u64 val, u64 mask);
+ 
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 0288e33ce3ec..8e95c2c0b7a9 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5571,8 +5571,7 @@ static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
+ 		++vmx->nmsrs;
+ 	}
+ 
+-	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES))
+-		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, vmx->arch_capabilities);
++	vmx->arch_capabilities = kvm_get_arch_capabilities();
+ 
+ 	vm_exit_controls_init(vmx, vmcs_config.vmexit_ctrl);
+ 
+* Unmerged path arch/x86/kvm/x86.c
