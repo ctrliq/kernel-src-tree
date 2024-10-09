@@ -1,0 +1,406 @@
+genirq: Avoid summation loops for /proc/stat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 1136b0728969901a091f0471968b2b76ed14d9ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1136b072.failed
+
+Waiman reported that on large systems with a large amount of interrupts the
+readout of /proc/stat takes a long time to sum up the interrupt
+statistics. In principle this is not a problem. but for unknown reasons
+some enterprise quality software reads /proc/stat with a high frequency.
+
+The reason for this is that interrupt statistics are accounted per cpu. So
+the /proc/stat logic has to sum up the interrupt stats for each interrupt.
+
+This can be largely avoided for interrupts which are not marked as
+'PER_CPU' interrupts by simply adding a per interrupt summation counter
+which is incremented along with the per interrupt per cpu counter.
+
+The PER_CPU interrupts need to avoid that and use only per cpu accounting
+because they share the interrupt number and the interrupt descriptor and
+concurrent updates would conflict or require unwanted synchronization.
+
+	Reported-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+	Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: linux-fsdevel@vger.kernel.org
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Miklos Szeredi <miklos@szeredi.hu>
+	Cc: Daniel Colascione <dancol@google.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+Link: https://lkml.kernel.org/r/20190208135020.925487496@linutronix.de
+
+
+8<-------------
+
+v2: Undo the unintentional layout change of struct irq_desc.
+
+ include/linux/irqdesc.h |    1 +
+ kernel/irq/chip.c       |   12 ++++++++++--
+ kernel/irq/internals.h  |    8 +++++++-
+ kernel/irq/irqdesc.c    |    7 ++++++-
+ 4 files changed, 24 insertions(+), 4 deletions(-)
+
+
+
+(cherry picked from commit 1136b0728969901a091f0471968b2b76ed14d9ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/irq/chip.c
+#	kernel/irq/internals.h
+#	kernel/irq/irqdesc.c
+diff --cc kernel/irq/chip.c
+index 7f033cf4f504,e960c4f46ee0..000000000000
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@@ -642,7 -855,11 +642,15 @@@ handle_percpu_irq(unsigned int irq, str
+  {
+  	struct irq_chip *chip = irq_desc_get_chip(desc);
+  
+++<<<<<<< HEAD
+ +	kstat_incr_irqs_this_cpu(irq, desc);
+++=======
++ 	/*
++ 	 * PER CPU interrupts are not serialized. Do not touch
++ 	 * desc->tot_count.
++ 	 */
++ 	__kstat_incr_irqs_this_cpu(desc);
+++>>>>>>> 1136b0728969 (genirq: Avoid summation loops for /proc/stat)
+  
+  	if (chip->irq_ack)
+  		chip->irq_ack(&desc->irq_data);
+@@@ -669,10 -885,14 +677,18 @@@ void handle_percpu_devid_irq(unsigned i
+  {
+  	struct irq_chip *chip = irq_desc_get_chip(desc);
+  	struct irqaction *action = desc->action;
+ -	unsigned int irq = irq_desc_get_irq(desc);
+ +	void *dev_id = __this_cpu_ptr(action->percpu_dev_id);
+  	irqreturn_t res;
+  
+++<<<<<<< HEAD
+ +	kstat_incr_irqs_this_cpu(irq, desc);
+++=======
++ 	/*
++ 	 * PER CPU interrupts are not serialized. Do not touch
++ 	 * desc->tot_count.
++ 	 */
++ 	__kstat_incr_irqs_this_cpu(desc);
+++>>>>>>> 1136b0728969 (genirq: Avoid summation loops for /proc/stat)
+  
+  	if (chip->irq_ack)
+  		chip->irq_ack(&desc->irq_data);
+diff --cc kernel/irq/internals.h
+index 4ba6bbb36d4d,e74e7eea76cf..000000000000
+--- a/kernel/irq/internals.h
++++ b/kernel/irq/internals.h
+@@@ -180,5 -227,261 +180,264 @@@ static inline void irqd_set(struct irq_
+  
+  static inline bool irqd_has_set(struct irq_data *d, unsigned int mask)
+  {
+ -	return __irqd_to_state(d) & mask;
+ +	return d->state_use_accessors & mask;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void irq_state_set_disabled(struct irq_desc *desc)
++ {
++ 	irqd_set(&desc->irq_data, IRQD_IRQ_DISABLED);
++ }
++ 
++ static inline void irq_state_set_masked(struct irq_desc *desc)
++ {
++ 	irqd_set(&desc->irq_data, IRQD_IRQ_MASKED);
++ }
++ 
++ #undef __irqd_to_state
++ 
++ static inline void __kstat_incr_irqs_this_cpu(struct irq_desc *desc)
++ {
++ 	__this_cpu_inc(*desc->kstat_irqs);
++ 	__this_cpu_inc(kstat.irqs_sum);
++ }
++ 
++ static inline void kstat_incr_irqs_this_cpu(struct irq_desc *desc)
++ {
++ 	__kstat_incr_irqs_this_cpu(desc);
++ 	desc->tot_count++;
++ }
++ 
++ static inline int irq_desc_get_node(struct irq_desc *desc)
++ {
++ 	return irq_common_data_get_node(&desc->irq_common_data);
++ }
++ 
++ static inline int irq_desc_is_chained(struct irq_desc *desc)
++ {
++ 	return (desc->action && desc->action == &chained_action);
++ }
++ 
++ #ifdef CONFIG_PM_SLEEP
++ bool irq_pm_check_wakeup(struct irq_desc *desc);
++ void irq_pm_install_action(struct irq_desc *desc, struct irqaction *action);
++ void irq_pm_remove_action(struct irq_desc *desc, struct irqaction *action);
++ #else
++ static inline bool irq_pm_check_wakeup(struct irq_desc *desc) { return false; }
++ static inline void
++ irq_pm_install_action(struct irq_desc *desc, struct irqaction *action) { }
++ static inline void
++ irq_pm_remove_action(struct irq_desc *desc, struct irqaction *action) { }
++ #endif
++ 
++ #ifdef CONFIG_IRQ_TIMINGS
++ 
++ #define IRQ_TIMINGS_SHIFT	5
++ #define IRQ_TIMINGS_SIZE	(1 << IRQ_TIMINGS_SHIFT)
++ #define IRQ_TIMINGS_MASK	(IRQ_TIMINGS_SIZE - 1)
++ 
++ /**
++  * struct irq_timings - irq timings storing structure
++  * @values: a circular buffer of u64 encoded <timestamp,irq> values
++  * @count: the number of elements in the array
++  */
++ struct irq_timings {
++ 	u64	values[IRQ_TIMINGS_SIZE];
++ 	int	count;
++ };
++ 
++ DECLARE_PER_CPU(struct irq_timings, irq_timings);
++ 
++ extern void irq_timings_free(int irq);
++ extern int irq_timings_alloc(int irq);
++ 
++ static inline void irq_remove_timings(struct irq_desc *desc)
++ {
++ 	desc->istate &= ~IRQS_TIMINGS;
++ 
++ 	irq_timings_free(irq_desc_get_irq(desc));
++ }
++ 
++ static inline void irq_setup_timings(struct irq_desc *desc, struct irqaction *act)
++ {
++ 	int irq = irq_desc_get_irq(desc);
++ 	int ret;
++ 
++ 	/*
++ 	 * We don't need the measurement because the idle code already
++ 	 * knows the next expiry event.
++ 	 */
++ 	if (act->flags & __IRQF_TIMER)
++ 		return;
++ 
++ 	/*
++ 	 * In case the timing allocation fails, we just want to warn,
++ 	 * not fail, so letting the system boot anyway.
++ 	 */
++ 	ret = irq_timings_alloc(irq);
++ 	if (ret) {
++ 		pr_warn("Failed to allocate irq timing stats for irq%d (%d)",
++ 			irq, ret);
++ 		return;
++ 	}
++ 
++ 	desc->istate |= IRQS_TIMINGS;
++ }
++ 
++ extern void irq_timings_enable(void);
++ extern void irq_timings_disable(void);
++ 
++ DECLARE_STATIC_KEY_FALSE(irq_timing_enabled);
++ 
++ /*
++  * The interrupt number and the timestamp are encoded into a single
++  * u64 variable to optimize the size.
++  * 48 bit time stamp and 16 bit IRQ number is way sufficient.
++  *  Who cares an IRQ after 78 hours of idle time?
++  */
++ static inline u64 irq_timing_encode(u64 timestamp, int irq)
++ {
++ 	return (timestamp << 16) | irq;
++ }
++ 
++ static inline int irq_timing_decode(u64 value, u64 *timestamp)
++ {
++ 	*timestamp = value >> 16;
++ 	return value & U16_MAX;
++ }
++ 
++ /*
++  * The function record_irq_time is only called in one place in the
++  * interrupts handler. We want this function always inline so the code
++  * inside is embedded in the function and the static key branching
++  * code can act at the higher level. Without the explicit
++  * __always_inline we can end up with a function call and a small
++  * overhead in the hotpath for nothing.
++  */
++ static __always_inline void record_irq_time(struct irq_desc *desc)
++ {
++ 	if (!static_branch_likely(&irq_timing_enabled))
++ 		return;
++ 
++ 	if (desc->istate & IRQS_TIMINGS) {
++ 		struct irq_timings *timings = this_cpu_ptr(&irq_timings);
++ 
++ 		timings->values[timings->count & IRQ_TIMINGS_MASK] =
++ 			irq_timing_encode(local_clock(),
++ 					  irq_desc_get_irq(desc));
++ 
++ 		timings->count++;
++ 	}
++ }
++ #else
++ static inline void irq_remove_timings(struct irq_desc *desc) {}
++ static inline void irq_setup_timings(struct irq_desc *desc,
++ 				     struct irqaction *act) {};
++ static inline void record_irq_time(struct irq_desc *desc) {}
++ #endif /* CONFIG_IRQ_TIMINGS */
++ 
++ 
++ #ifdef CONFIG_GENERIC_IRQ_CHIP
++ void irq_init_generic_chip(struct irq_chip_generic *gc, const char *name,
++ 			   int num_ct, unsigned int irq_base,
++ 			   void __iomem *reg_base, irq_flow_handler_t handler);
++ #else
++ static inline void
++ irq_init_generic_chip(struct irq_chip_generic *gc, const char *name,
++ 		      int num_ct, unsigned int irq_base,
++ 		      void __iomem *reg_base, irq_flow_handler_t handler) { }
++ #endif /* CONFIG_GENERIC_IRQ_CHIP */
++ 
++ #ifdef CONFIG_GENERIC_PENDING_IRQ
++ static inline bool irq_can_move_pcntxt(struct irq_data *data)
++ {
++ 	return irqd_can_move_in_process_context(data);
++ }
++ static inline bool irq_move_pending(struct irq_data *data)
++ {
++ 	return irqd_is_setaffinity_pending(data);
++ }
++ static inline void
++ irq_copy_pending(struct irq_desc *desc, const struct cpumask *mask)
++ {
++ 	cpumask_copy(desc->pending_mask, mask);
++ }
++ static inline void
++ irq_get_pending(struct cpumask *mask, struct irq_desc *desc)
++ {
++ 	cpumask_copy(mask, desc->pending_mask);
++ }
++ static inline struct cpumask *irq_desc_get_pending_mask(struct irq_desc *desc)
++ {
++ 	return desc->pending_mask;
++ }
++ bool irq_fixup_move_pending(struct irq_desc *desc, bool force_clear);
++ #else /* CONFIG_GENERIC_PENDING_IRQ */
++ static inline bool irq_can_move_pcntxt(struct irq_data *data)
++ {
++ 	return true;
++ }
++ static inline bool irq_move_pending(struct irq_data *data)
++ {
++ 	return false;
++ }
++ static inline void
++ irq_copy_pending(struct irq_desc *desc, const struct cpumask *mask)
++ {
++ }
++ static inline void
++ irq_get_pending(struct cpumask *mask, struct irq_desc *desc)
++ {
++ }
++ static inline struct cpumask *irq_desc_get_pending_mask(struct irq_desc *desc)
++ {
++ 	return NULL;
++ }
++ static inline bool irq_fixup_move_pending(struct irq_desc *desc, bool fclear)
++ {
++ 	return false;
++ }
++ #endif /* !CONFIG_GENERIC_PENDING_IRQ */
++ 
++ #if !defined(CONFIG_IRQ_DOMAIN) || !defined(CONFIG_IRQ_DOMAIN_HIERARCHY)
++ static inline int irq_domain_activate_irq(struct irq_data *data, bool reserve)
++ {
++ 	irqd_set_activated(data);
++ 	return 0;
++ }
++ static inline void irq_domain_deactivate_irq(struct irq_data *data)
++ {
++ 	irqd_clr_activated(data);
++ }
++ #endif
++ 
++ #ifdef CONFIG_GENERIC_IRQ_DEBUGFS
++ #include <linux/debugfs.h>
++ 
++ void irq_add_debugfs_entry(unsigned int irq, struct irq_desc *desc);
++ static inline void irq_remove_debugfs_entry(struct irq_desc *desc)
++ {
++ 	debugfs_remove(desc->debugfs_file);
++ 	kfree(desc->dev_name);
++ }
++ void irq_debugfs_copy_devname(int irq, struct device *dev);
++ # ifdef CONFIG_IRQ_DOMAIN
++ void irq_domain_debugfs_init(struct dentry *root);
++ # else
++ static inline void irq_domain_debugfs_init(struct dentry *root)
++ {
++ }
++ # endif
++ #else /* CONFIG_GENERIC_IRQ_DEBUGFS */
++ static inline void irq_add_debugfs_entry(unsigned int irq, struct irq_desc *d)
++ {
++ }
++ static inline void irq_remove_debugfs_entry(struct irq_desc *d)
++ {
++ }
++ static inline void irq_debugfs_copy_devname(int irq, struct device *dev)
++ {
++ }
++ #endif /* CONFIG_GENERIC_IRQ_DEBUGFS */
+++>>>>>>> 1136b0728969 (genirq: Avoid summation loops for /proc/stat)
+diff --cc kernel/irq/irqdesc.c
+index 4858d8aea718,f98293d0e173..000000000000
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@@ -609,8 -912,16 +610,13 @@@ unsigned int kstat_irqs_cpu(unsigned in
+  unsigned int kstat_irqs(unsigned int irq)
+  {
+  	struct irq_desc *desc = irq_to_desc(irq);
+++<<<<<<< HEAD
+ +	int cpu;
+ +	int sum = 0;
+++=======
++ 	unsigned int sum = 0;
++ 	int cpu;
+++>>>>>>> 1136b0728969 (genirq: Avoid summation loops for /proc/stat)
+  
+  	if (!desc || !desc->kstat_irqs)
+  		return 0;
+diff --git a/include/linux/irqdesc.h b/include/linux/irqdesc.h
+index 623325e2ff97..d15c1d70f0fe 100644
+--- a/include/linux/irqdesc.h
++++ b/include/linux/irqdesc.h
+@@ -49,6 +49,7 @@ struct irq_desc {
+ 	unsigned int		core_internal_state__do_not_mess_with_it;
+ 	unsigned int		depth;		/* nested irq disables */
+ 	unsigned int		wake_depth;	/* nested wake enables */
++	unsigned int		tot_count;
+ 	unsigned int		irq_count;	/* For detecting broken IRQs */
+ 	unsigned long		last_unhandled;	/* Aging timer for unhandled count */
+ 	unsigned int		irqs_unhandled;
+* Unmerged path kernel/irq/chip.c
+* Unmerged path kernel/irq/internals.h
+* Unmerged path kernel/irq/irqdesc.c
