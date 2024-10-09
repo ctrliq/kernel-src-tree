@@ -1527,10 +1527,10 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
 	 * tail pages of non-compound higher order allocations, which
 	 * would then underflow the refcount when the caller does the
 	 * required put_page. Don't allow those pages here.
-	 */ 
+	 */
+
 	if (!kvm_try_get_pfn(pfn))
 		r = -EFAULT;
-
 	*p_pfn = pfn;
 
 	return r;
