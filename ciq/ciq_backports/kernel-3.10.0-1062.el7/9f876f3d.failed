@@ -1,0 +1,294 @@
+IB/mlx5: Support RoCE ICRC encapsulated error counter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Talat Batheesh <talatb@mellanox.com>
+commit 9f876f3de6616f02960d7d88ad52c805946f4b63
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9f876f3d.failed
+
+This patch adds support to query the counter that counts the
+RoCE packets with corrupted ICRC (Invariant Cyclic Redundancy Code).
+
+This counter will be under
+/sys/class/infiniband/<mlx5-dev>/ports/<port>/hw_counters/
+
+rx_icrc_encapsulated - The number of RoCE packets with ICRC
+error.
+
+	Signed-off-by: Talat Batheesh <talatb@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 9f876f3de6616f02960d7d88ad52c805946f4b63)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/cmd.c
+diff --cc drivers/infiniband/hw/mlx5/cmd.c
+index 6f6712f87a73,026717eaa92d..000000000000
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@@ -66,3 -66,119 +66,122 @@@ int mlx5_cmd_modify_cong_params(struct 
+  
+  	return mlx5_cmd_exec(dev, in, in_size, out, sizeof(out));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++ 			  u64 length, u32 alignment)
++ {
++ 	struct mlx5_core_dev *dev = memic->dev;
++ 	u64 num_memic_hw_pages = MLX5_CAP_DEV_MEM(dev, memic_bar_size)
++ 					>> PAGE_SHIFT;
++ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++ 	u32 max_alignment = MLX5_CAP_DEV_MEM(dev, log_max_memic_addr_alignment);
++ 	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++ 	u32 out[MLX5_ST_SZ_DW(alloc_memic_out)] = {};
++ 	u32 in[MLX5_ST_SZ_DW(alloc_memic_in)] = {};
++ 	u32 mlx5_alignment;
++ 	u64 page_idx = 0;
++ 	int ret = 0;
++ 
++ 	if (!length || (length & MLX5_MEMIC_ALLOC_SIZE_MASK))
++ 		return -EINVAL;
++ 
++ 	/* mlx5 device sets alignment as 64*2^driver_value
++ 	 * so normalizing is needed.
++ 	 */
++ 	mlx5_alignment = (alignment < MLX5_MEMIC_BASE_ALIGN) ? 0 :
++ 			 alignment - MLX5_MEMIC_BASE_ALIGN;
++ 	if (mlx5_alignment > max_alignment)
++ 		return -EINVAL;
++ 
++ 	MLX5_SET(alloc_memic_in, in, opcode, MLX5_CMD_OP_ALLOC_MEMIC);
++ 	MLX5_SET(alloc_memic_in, in, range_size, num_pages * PAGE_SIZE);
++ 	MLX5_SET(alloc_memic_in, in, memic_size, length);
++ 	MLX5_SET(alloc_memic_in, in, log_memic_addr_alignment,
++ 		 mlx5_alignment);
++ 
++ 	while (page_idx < num_memic_hw_pages) {
++ 		spin_lock(&memic->memic_lock);
++ 		page_idx = bitmap_find_next_zero_area(memic->memic_alloc_pages,
++ 						      num_memic_hw_pages,
++ 						      page_idx,
++ 						      num_pages, 0);
++ 
++ 		if (page_idx < num_memic_hw_pages)
++ 			bitmap_set(memic->memic_alloc_pages,
++ 				   page_idx, num_pages);
++ 
++ 		spin_unlock(&memic->memic_lock);
++ 
++ 		if (page_idx >= num_memic_hw_pages)
++ 			break;
++ 
++ 		MLX5_SET64(alloc_memic_in, in, range_start_addr,
++ 			   hw_start_addr + (page_idx * PAGE_SIZE));
++ 
++ 		ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 		if (ret) {
++ 			spin_lock(&memic->memic_lock);
++ 			bitmap_clear(memic->memic_alloc_pages,
++ 				     page_idx, num_pages);
++ 			spin_unlock(&memic->memic_lock);
++ 
++ 			if (ret == -EAGAIN) {
++ 				page_idx++;
++ 				continue;
++ 			}
++ 
++ 			return ret;
++ 		}
++ 
++ 		*addr = pci_resource_start(dev->pdev, 0) +
++ 			MLX5_GET64(alloc_memic_out, out, memic_start_addr);
++ 
++ 		return 0;
++ 	}
++ 
++ 	return -ENOMEM;
++ }
++ 
++ int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
++ {
++ 	struct mlx5_core_dev *dev = memic->dev;
++ 	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++ 	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++ 	u32 out[MLX5_ST_SZ_DW(dealloc_memic_out)] = {0};
++ 	u32 in[MLX5_ST_SZ_DW(dealloc_memic_in)] = {0};
++ 	u64 start_page_idx;
++ 	int err;
++ 
++ 	addr -= pci_resource_start(dev->pdev, 0);
++ 	start_page_idx = (addr - hw_start_addr) >> PAGE_SHIFT;
++ 
++ 	MLX5_SET(dealloc_memic_in, in, opcode, MLX5_CMD_OP_DEALLOC_MEMIC);
++ 	MLX5_SET64(dealloc_memic_in, in, memic_start_addr, addr);
++ 	MLX5_SET(dealloc_memic_in, in, memic_size, length);
++ 
++ 	err =  mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++ 
++ 	if (!err) {
++ 		spin_lock(&memic->memic_lock);
++ 		bitmap_clear(memic->memic_alloc_pages,
++ 			     start_page_idx, num_pages);
++ 		spin_unlock(&memic->memic_lock);
++ 	}
++ 
++ 	return err;
++ }
++ 
++ int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(ppcnt_reg)] = {};
++ 	int sz = MLX5_ST_SZ_BYTES(ppcnt_reg);
++ 
++ 	MLX5_SET(ppcnt_reg, in, local_port, 1);
++ 
++ 	MLX5_SET(ppcnt_reg, in, grp, MLX5_ETHERNET_EXTENDED_COUNTERS_GROUP);
++ 	return  mlx5_core_access_reg(dev, in, sz, out, sz, MLX5_REG_PPCNT,
++ 				     0, 0);
++ }
+++>>>>>>> 9f876f3de661 (IB/mlx5: Support RoCE ICRC encapsulated error counter)
+* Unmerged path drivers/infiniband/hw/mlx5/cmd.c
+diff --git a/drivers/infiniband/hw/mlx5/cmd.h b/drivers/infiniband/hw/mlx5/cmd.h
+index 78ffded7cc2c..7e516d490a41 100644
+--- a/drivers/infiniband/hw/mlx5/cmd.h
++++ b/drivers/infiniband/hw/mlx5/cmd.h
+@@ -39,6 +39,7 @@
+ int mlx5_cmd_null_mkey(struct mlx5_core_dev *dev, u32 *null_mkey);
+ int mlx5_cmd_query_cong_params(struct mlx5_core_dev *dev, int cong_point,
+ 			       void *out, int out_size);
++int mlx5_cmd_query_ext_ppcnt_counters(struct mlx5_core_dev *dev, void *out);
+ int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *mdev,
+ 				void *in, int in_size);
+ #endif /* MLX5_IB_CMD_H */
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index f0bdca720be0..f71886714458 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -4194,6 +4194,15 @@ static const struct mlx5_ib_counter extended_err_cnts[] = {
+ 	INIT_Q_COUNTER(req_cqe_flush_error),
+ };
+ 
++#define INIT_EXT_PPCNT_COUNTER(_name)		\
++	{ .name = #_name, .offset =	\
++	MLX5_BYTE_OFF(ppcnt_reg, \
++		      counter_set.eth_extended_cntrs_grp_data_layout._name##_high)}
++
++static const struct mlx5_ib_counter ext_ppcnt_cnts[] = {
++	INIT_EXT_PPCNT_COUNTER(rx_icrc_encapsulated),
++};
++
+ static void mlx5_ib_dealloc_counters(struct mlx5_ib_dev *dev)
+ {
+ 	int i;
+@@ -4229,7 +4238,10 @@ static int __mlx5_ib_alloc_counters(struct mlx5_ib_dev *dev,
+ 		cnts->num_cong_counters = ARRAY_SIZE(cong_cnts);
+ 		num_counters += ARRAY_SIZE(cong_cnts);
+ 	}
+-
++	if (MLX5_CAP_PCAM_FEATURE(dev->mdev, rx_icrc_encapsulated_counter)) {
++		cnts->num_ext_ppcnt_counters = ARRAY_SIZE(ext_ppcnt_cnts);
++		num_counters += ARRAY_SIZE(ext_ppcnt_cnts);
++	}
+ 	cnts->names = kcalloc(num_counters, sizeof(cnts->names), GFP_KERNEL);
+ 	if (!cnts->names)
+ 		return -ENOMEM;
+@@ -4286,6 +4298,13 @@ static void mlx5_ib_fill_counters(struct mlx5_ib_dev *dev,
+ 			offsets[j] = cong_cnts[i].offset;
+ 		}
+ 	}
++
++	if (MLX5_CAP_PCAM_FEATURE(dev->mdev, rx_icrc_encapsulated_counter)) {
++		for (i = 0; i < ARRAY_SIZE(ext_ppcnt_cnts); i++, j++) {
++			names[j] = ext_ppcnt_cnts[i].name;
++			offsets[j] = ext_ppcnt_cnts[i].offset;
++		}
++	}
+ }
+ 
+ static int mlx5_ib_alloc_counters(struct mlx5_ib_dev *dev)
+@@ -4331,7 +4350,8 @@ static struct rdma_hw_stats *mlx5_ib_alloc_hw_stats(struct ib_device *ibdev,
+ 
+ 	return rdma_alloc_hw_stats_struct(port->cnts.names,
+ 					  port->cnts.num_q_counters +
+-					  port->cnts.num_cong_counters,
++					  port->cnts.num_cong_counters +
++					  port->cnts.num_ext_ppcnt_counters,
+ 					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
+ }
+ 
+@@ -4364,6 +4384,34 @@ free:
+ 	return ret;
+ }
+ 
++static int mlx5_ib_query_ext_ppcnt_counters(struct mlx5_ib_dev *dev,
++					  struct mlx5_ib_port *port,
++					  struct rdma_hw_stats *stats)
++{
++	int offset = port->cnts.num_q_counters + port->cnts.num_cong_counters;
++	int sz = MLX5_ST_SZ_BYTES(ppcnt_reg);
++	int ret, i;
++	void *out;
++
++	out = kvzalloc(sz, GFP_KERNEL);
++	if (!out)
++		return -ENOMEM;
++
++	ret = mlx5_cmd_query_ext_ppcnt_counters(dev->mdev, out);
++	if (ret)
++		goto free;
++
++	for (i = 0; i < port->cnts.num_ext_ppcnt_counters; i++) {
++		stats->value[i + offset] =
++			be64_to_cpup((__be64 *)(out +
++				    port->cnts.offsets[i + offset]));
++	}
++
++free:
++	kvfree(out);
++	return ret;
++}
++
+ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
+ 				struct rdma_hw_stats *stats,
+ 				u8 port_num, int index)
+@@ -4377,13 +4425,21 @@ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
+ 	if (!stats)
+ 		return -EINVAL;
+ 
+-	num_counters = port->cnts.num_q_counters + port->cnts.num_cong_counters;
++	num_counters = port->cnts.num_q_counters +
++		       port->cnts.num_cong_counters +
++		       port->cnts.num_ext_ppcnt_counters;
+ 
+ 	/* q_counters are per IB device, query the master mdev */
+ 	ret = mlx5_ib_query_q_counters(dev->mdev, port, stats);
+ 	if (ret)
+ 		return ret;
+ 
++	if (MLX5_CAP_PCAM_FEATURE(dev->mdev, rx_icrc_encapsulated_counter)) {
++		ret =  mlx5_ib_query_ext_ppcnt_counters(dev, port, stats);
++		if (ret)
++			return ret;
++	}
++
+ 	if (MLX5_CAP_GEN(dev->mdev, cc_query_allowed)) {
+ 		mdev = mlx5_ib_get_native_port_mdev(dev, port_num,
+ 						    &mdev_port_num);
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 7653bfad9f25..b63e6e52809b 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -641,6 +641,7 @@ struct mlx5_ib_counters {
+ 	size_t *offsets;
+ 	u32 num_q_counters;
+ 	u32 num_cong_counters;
++	u32 num_ext_ppcnt_counters;
+ 	u16 set_id;
+ 	bool set_id_valid;
+ };
