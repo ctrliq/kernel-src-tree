@@ -1,0 +1,243 @@
+nvme: add keep-alive support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] add keep-alive support (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 88.00%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 038bd4cb6766c69b5b9c77507f389cc718a36842
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/038bd4cb.failed
+
+Periodic keep-alive is a mandatory feature in NVMe over Fabrics, and
+optional in NVMe 1.2.1 for PCIe.  This patch adds periodic keep-alive
+sent from the host to verify that the controller is still responsive
+and vice-versa.  The keep-alive timeout is user-defined (with
+keep_alive_tmo connection parameter) and defaults to 5 seconds.
+
+In order to avoid a race condition where the host sends a keep-alive
+competing with the target side keep-alive timeout expiration, the host
+adds a grace period of 10 seconds when publishing the keep-alive timeout
+to the target.
+
+In case a keep-alive failed (or timed out), a transport specific error
+recovery kicks in.
+
+For now only NVMe over Fabrics is wired up to support keep alive, but
+we can add PCIe support easily once controllers actually supporting it
+become available.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Steve Wise <swise@chelsio.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 038bd4cb6766c69b5b9c77507f389cc718a36842)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/fabrics.c
+#	drivers/nvme/host/fabrics.h
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index 63f6b5f40b5c,c01687d61009..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -266,14 -464,83 +267,82 @@@ int nvme_submit_user_cmd(struct request
+  			result, timeout);
+  }
+  
++ static void nvme_keep_alive_end_io(struct request *rq, int error)
++ {
++ 	struct nvme_ctrl *ctrl = rq->end_io_data;
++ 
++ 	blk_mq_free_request(rq);
++ 
++ 	if (error) {
++ 		dev_err(ctrl->device,
++ 			"failed nvme_keep_alive_end_io error=%d\n", error);
++ 		return;
++ 	}
++ 
++ 	schedule_delayed_work(&ctrl->ka_work, ctrl->kato * HZ);
++ }
++ 
++ static int nvme_keep_alive(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_command c;
++ 	struct request *rq;
++ 
++ 	memset(&c, 0, sizeof(c));
++ 	c.common.opcode = nvme_admin_keep_alive;
++ 
++ 	rq = nvme_alloc_request(ctrl->admin_q, &c, BLK_MQ_REQ_RESERVED,
++ 			NVME_QID_ANY);
++ 	if (IS_ERR(rq))
++ 		return PTR_ERR(rq);
++ 
++ 	rq->timeout = ctrl->kato * HZ;
++ 	rq->end_io_data = ctrl;
++ 
++ 	blk_execute_rq_nowait(rq->q, NULL, rq, 0, nvme_keep_alive_end_io);
++ 
++ 	return 0;
++ }
++ 
++ static void nvme_keep_alive_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl = container_of(to_delayed_work(work),
++ 			struct nvme_ctrl, ka_work);
++ 
++ 	if (nvme_keep_alive(ctrl)) {
++ 		/* allocation failure, reset the controller */
++ 		dev_err(ctrl->device, "keep-alive failed\n");
++ 		ctrl->ops->reset_ctrl(ctrl);
++ 		return;
++ 	}
++ }
++ 
++ void nvme_start_keep_alive(struct nvme_ctrl *ctrl)
++ {
++ 	if (unlikely(ctrl->kato == 0))
++ 		return;
++ 
++ 	INIT_DELAYED_WORK(&ctrl->ka_work, nvme_keep_alive_work);
++ 	schedule_delayed_work(&ctrl->ka_work, ctrl->kato * HZ);
++ }
++ EXPORT_SYMBOL_GPL(nvme_start_keep_alive);
++ 
++ void nvme_stop_keep_alive(struct nvme_ctrl *ctrl)
++ {
++ 	if (unlikely(ctrl->kato == 0))
++ 		return;
++ 
++ 	cancel_delayed_work_sync(&ctrl->ka_work);
++ }
++ EXPORT_SYMBOL_GPL(nvme_stop_keep_alive);
++ 
+  int nvme_identify_ctrl(struct nvme_ctrl *dev, struct nvme_id_ctrl **id)
+  {
+ -	struct nvme_command c = { };
+ +	struct nvme_command c = {
+ +		.identify.opcode = nvme_admin_identify,
+ +		.identify.cns = cpu_to_le32(1),
+ +	};
+  	int error;
+  
+ -	/* gcc-4.4.4 (at least) has issues with initializers and anon unions */
+ -	c.identify.opcode = nvme_admin_identify;
+ -	c.identify.cns = cpu_to_le32(1);
+ -
+  	*id = kmalloc(sizeof(struct nvme_id_ctrl), GFP_KERNEL);
+  	if (!*id)
+  		return -ENOMEM;
+@@@ -934,10 -1247,35 +1003,37 @@@ int nvme_init_identify(struct nvme_ctr
+  	}
+  
+  	nvme_set_queue_limits(ctrl, ctrl->admin_q);
+++<<<<<<< HEAD
+++=======
++ 	ctrl->sgls = le32_to_cpu(id->sgls);
++ 	ctrl->kas = le16_to_cpu(id->kas);
++ 
++ 	if (ctrl->ops->is_fabrics) {
++ 		ctrl->icdoff = le16_to_cpu(id->icdoff);
++ 		ctrl->ioccsz = le32_to_cpu(id->ioccsz);
++ 		ctrl->iorcsz = le32_to_cpu(id->iorcsz);
++ 		ctrl->maxcmd = le16_to_cpu(id->maxcmd);
++ 
++ 		/*
++ 		 * In fabrics we need to verify the cntlid matches the
++ 		 * admin connect
++ 		 */
++ 		if (ctrl->cntlid != le16_to_cpu(id->cntlid))
++ 			ret = -EINVAL;
++ 
++ 		if (!ctrl->opts->discovery_nqn && !ctrl->kas) {
++ 			dev_err(ctrl->dev,
++ 				"keep-alive support is mandatory for fabrics\n");
++ 			ret = -EINVAL;
++ 		}
++ 	} else {
++ 		ctrl->cntlid = le16_to_cpu(id->cntlid);
++ 	}
+++>>>>>>> 038bd4cb6766 (nvme: add keep-alive support)
+  
+  	kfree(id);
+ -	return ret;
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(nvme_init_identify);
+  
+  static int nvme_dev_open(struct inode *inode, struct file *file)
+  {
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,8d8cbc437699..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -38,6 -38,14 +38,17 @@@ extern unsigned char admin_timeout
+  extern unsigned char shutdown_timeout;
+  #define SHUTDOWN_TIMEOUT	(shutdown_timeout * HZ)
+  
+++<<<<<<< HEAD
+++=======
++ #define NVME_DEFAULT_KATO	5
++ #define NVME_KATO_GRACE		10
++ 
++ enum {
++ 	NVME_NS_LBA		= 0,
++ 	NVME_NS_LIGHTNVM	= 1,
++ };
++ 
+++>>>>>>> 038bd4cb6766 (nvme: add keep-alive support)
+  /*
+   * List of workarounds for devices that required behavior not specified in
+   * the standard.
+@@@ -105,8 -111,22 +116,27 @@@ struct nvme_ctrl 
+  	u8 event_limit;
+  	u8 vwc;
+  	u32 vs;
+++<<<<<<< HEAD
+++	bool subsystem;
+++	unsigned long quirks;
+++=======
++ 	u32 sgls;
++ 	u16 kas;
++ 	unsigned int kato;
+  	bool subsystem;
+  	unsigned long quirks;
++ 	struct work_struct scan_work;
++ 	struct work_struct async_event_work;
++ 	struct delayed_work ka_work;
++ 
++ 	/* Fabrics only */
++ 	u16 sqsize;
++ 	u32 ioccsz;
++ 	u32 iorcsz;
++ 	u16 icdoff;
++ 	u16 maxcmd;
++ 	struct nvmf_ctrl_options *opts;
+++>>>>>>> 038bd4cb6766 (nvme: add keep-alive support)
+  };
+  
+  /*
+@@@ -268,9 -279,9 +298,11 @@@ int nvme_get_features(struct nvme_ctrl 
+  int nvme_set_features(struct nvme_ctrl *dev, unsigned fid, unsigned dword11,
+  			dma_addr_t dma_addr, u32 *result);
+  int nvme_set_queue_count(struct nvme_ctrl *ctrl, int *count);
++ void nvme_start_keep_alive(struct nvme_ctrl *ctrl);
++ void nvme_stop_keep_alive(struct nvme_ctrl *ctrl);
+  
+ +extern spinlock_t dev_list_lock;
+ +
+  struct sg_io_hdr;
+  
+  int nvme_sg_io(struct nvme_ns *ns, struct sg_io_hdr __user *u_hdr);
+* Unmerged path drivers/nvme/host/fabrics.c
+* Unmerged path drivers/nvme/host/fabrics.h
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/fabrics.c
+* Unmerged path drivers/nvme/host/fabrics.h
+* Unmerged path drivers/nvme/host/nvme.h
