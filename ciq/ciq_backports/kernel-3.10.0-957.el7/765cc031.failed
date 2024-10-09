@@ -1,0 +1,424 @@
+nvme: change namespaces_mutext to namespaces_rwsem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] change namespaces_mutext to namespaces_rwsem (David Milburn) [1515584]
+Rebuild_FUZZ: 93.62%
+commit-author Jianchao Wang <jianchao.w.wang@oracle.com>
+commit 765cc031cddde40bdc279e8e2697571c7956c54e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/765cc031.failed
+
+namespaces_mutext is used to synchronize the operations on ctrl
+namespaces list. Most of the time, it is a read operation.
+
+On the other hand, there are many interfaces in nvme core that
+need this lock, such as nvme_wait_freeze, and even more interfaces
+will be added. If we use mutex here, circular dependency could be
+introduced easily. For example:
+context A                  context B
+nvme_xxx                   nvme_xxx
+hold namespaces_mutext     require namespaces_mutext
+sync context B
+
+So it is better to change it from mutex to rwsem.
+
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jianchao Wang <jianchao.w.wang@oracle.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 765cc031cddde40bdc279e8e2697571c7956c54e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index d63d62bfc80f,ea99265565ae..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -903,6 -1075,85 +903,88 @@@ static int nvme_submit_io(struct nvme_n
+  			metadata, meta_len, io.slba, NULL, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 nvme_known_admin_effects(u8 opcode)
++ {
++ 	switch (opcode) {
++ 	case nvme_admin_format_nvm:
++ 		return NVME_CMD_EFFECTS_CSUPP | NVME_CMD_EFFECTS_LBCC |
++ 					NVME_CMD_EFFECTS_CSE_MASK;
++ 	case nvme_admin_sanitize_nvm:
++ 		return NVME_CMD_EFFECTS_CSE_MASK;
++ 	default:
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++ 								u8 opcode)
++ {
++ 	u32 effects = 0;
++ 
++ 	if (ns) {
++ 		if (ctrl->effects)
++ 			effects = le32_to_cpu(ctrl->effects->iocs[opcode]);
++ 		if (effects & ~NVME_CMD_EFFECTS_CSUPP)
++ 			dev_warn(ctrl->device,
++ 				 "IO command:%02x has unhandled effects:%08x\n",
++ 				 opcode, effects);
++ 		return 0;
++ 	}
++ 
++ 	if (ctrl->effects)
++ 		effects = le32_to_cpu(ctrl->effects->iocs[opcode]);
++ 	else
++ 		effects = nvme_known_admin_effects(opcode);
++ 
++ 	/*
++ 	 * For simplicity, IO to all namespaces is quiesced even if the command
++ 	 * effects say only one namespace is affected.
++ 	 */
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
++ 		nvme_start_freeze(ctrl);
++ 		nvme_wait_freeze(ctrl);
++ 	}
++ 	return effects;
++ }
++ 
++ static void nvme_update_formats(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_ns *ns, *next;
++ 	LIST_HEAD(rm_list);
++ 
++ 	down_write(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list) {
++ 		if (ns->disk && nvme_revalidate_disk(ns->disk)) {
++ 			list_move_tail(&ns->list, &rm_list);
++ 		}
++ 	}
++ 	up_write(&ctrl->namespaces_rwsem);
++ 
++ 	list_for_each_entry_safe(ns, next, &rm_list, list)
++ 		nvme_ns_remove(ns);
++ }
++ 
++ static void nvme_passthru_end(struct nvme_ctrl *ctrl, u32 effects)
++ {
++ 	/*
++ 	 * Revalidate LBA changes prior to unfreezing. This is necessary to
++ 	 * prevent memory corruption if a logical block size was changed by
++ 	 * this command.
++ 	 */
++ 	if (effects & NVME_CMD_EFFECTS_LBCC)
++ 		nvme_update_formats(ctrl);
++ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK))
++ 		nvme_unfreeze(ctrl);
++ 	if (effects & NVME_CMD_EFFECTS_CCC)
++ 		nvme_init_identify(ctrl);
++ 	if (effects & (NVME_CMD_EFFECTS_NIC | NVME_CMD_EFFECTS_NCC))
++ 		nvme_queue_scan(ctrl);
++ }
++ 
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+  			struct nvme_passthru_cmd __user *ucmd)
+  {
+@@@ -2128,18 -2894,18 +2210,18 @@@ static struct nvme_ns *nvme_find_get_ns
+  {
+  	struct nvme_ns *ns, *ret = NULL;
+  
+- 	mutex_lock(&ctrl->namespaces_mutex);
++ 	down_read(&ctrl->namespaces_rwsem);
+  	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ -		if (ns->head->ns_id == nsid) {
+ +		if (ns->ns_id == nsid) {
+  			if (!kref_get_unless_zero(&ns->kref))
+  				continue;
+  			ret = ns;
+  			break;
+  		}
+ -		if (ns->head->ns_id > nsid)
+ +		if (ns->ns_id > nsid)
+  			break;
+  	}
+- 	mutex_unlock(&ctrl->namespaces_mutex);
++ 	up_read(&ctrl->namespaces_rwsem);
+  	return ret;
+  }
+  
+@@@ -2180,31 -2963,88 +2262,31 @@@ static void nvme_alloc_ns(struct nvme_c
+  	disk->fops = &nvme_fops;
+  	disk->private_data = ns;
+  	disk->queue = ns->queue;
+ -	disk->flags = flags;
+ -	memcpy(disk->disk_name, disk_name, DISK_NAME_LEN);
+ -	ns->disk = disk;
+ +	disk->driverfs_dev = ctrl->device;
+ +	disk->flags = GENHD_FL_EXT_DEVT;
+ +	sprintf(disk->disk_name, "nvme%dn%d", ctrl->instance, ns->instance);
+  
+ -	__nvme_revalidate_disk(disk, id);
+ +	if (nvme_revalidate_disk(ns->disk))
+ +		goto out_free_disk;
+  
+- 	mutex_lock(&ctrl->namespaces_mutex);
++ 	down_write(&ctrl->namespaces_rwsem);
+  	list_add_tail(&ns->list, &ctrl->namespaces);
+- 	mutex_unlock(&ctrl->namespaces_mutex);
++ 	up_write(&ctrl->namespaces_rwsem);
+  
+ -	nvme_get_ctrl(ctrl);
+ -
+ -	kfree(id);
+ +	kref_get(&ctrl->kref);
+  
+ -	device_add_disk(ctrl->device, ns->disk);
+ +	add_disk(ns->disk);
+  	if (sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
+ -					&nvme_ns_id_attr_group))
+ +					&nvme_ns_attr_group))
+  		pr_warn("%s: failed to create sysfs group for identification\n",
+  			ns->disk->disk_name);
+ -	if (ns->ndev && nvme_nvm_register_sysfs(ns))
+ -		pr_warn("%s: failed to register lightnvm sysfs group for identification\n",
+ -			ns->disk->disk_name);
+ -
+ -	nvme_mpath_add_disk(ns->head);
+ -	nvme_mpath_add_disk_links(ns);
+ -	nvme_fault_inject_init(ns);
+  	return;
+ - out_unlink_ns:
+ -	mutex_lock(&ctrl->subsys->lock);
+ -	list_del_rcu(&ns->siblings);
+ -	mutex_unlock(&ctrl->subsys->lock);
+ - out_free_id:
+ -	kfree(id);
+ + out_free_disk:
+ +	kfree(disk);
+   out_free_queue:
+  	blk_cleanup_queue(ns->queue);
+ + out_release_instance:
+ +	ida_simple_remove(&ctrl->ns_ida, ns->instance);
+   out_free_ns:
+  	kfree(ns);
+  }
+@@@ -2214,19 -3054,30 +2296,28 @@@ static void nvme_ns_remove(struct nvme_
+  	if (test_and_set_bit(NVME_NS_REMOVING, &ns->flags))
+  		return;
+  
+ -	nvme_fault_inject_fini(ns);
+ -	if (ns->disk && ns->disk->flags & GENHD_FL_UP) {
+ -		nvme_mpath_remove_disk_links(ns);
+ +	if (ns->disk->flags & GENHD_FL_UP) {
+ +		if (blk_get_integrity(ns->disk))
+ +			blk_integrity_unregister(ns->disk);
+  		sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
+ -					&nvme_ns_id_attr_group);
+ -		if (ns->ndev)
+ -			nvme_nvm_unregister_sysfs(ns);
+ +					&nvme_ns_attr_group);
+  		del_gendisk(ns->disk);
+  		blk_cleanup_queue(ns->queue);
+ -		if (blk_get_integrity(ns->disk))
+ -			blk_integrity_unregister(ns->disk);
+  	}
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ns->ctrl->namespaces_mutex);
+++=======
++ 	mutex_lock(&ns->ctrl->subsys->lock);
++ 	nvme_mpath_clear_current_path(ns);
++ 	list_del_rcu(&ns->siblings);
++ 	mutex_unlock(&ns->ctrl->subsys->lock);
++ 
++ 	down_write(&ns->ctrl->namespaces_rwsem);
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  	list_del_init(&ns->list);
+- 	mutex_unlock(&ns->ctrl->namespaces_mutex);
++ 	up_write(&ns->ctrl->namespaces_rwsem);
+  
+ -	synchronize_srcu(&ns->head->srcu);
+ -	nvme_mpath_check_last_path(ns);
+  	nvme_put_ns(ns);
+  }
+  
+@@@ -2247,11 -3098,18 +2338,23 @@@ static void nvme_remove_invalid_namespa
+  					unsigned nsid)
+  {
+  	struct nvme_ns *ns, *next;
+ -	LIST_HEAD(rm_list);
+  
+++<<<<<<< HEAD
+++=======
++ 	down_write(&ctrl->namespaces_rwsem);
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list) {
+ -		if (ns->head->ns_id > nsid)
+ -			list_move_tail(&ns->list, &rm_list);
+ +		if (ns->ns_id > nsid)
+ +			nvme_ns_remove(ns);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	up_write(&ctrl->namespaces_rwsem);
++ 
++ 	list_for_each_entry_safe(ns, next, &rm_list, list)
++ 		nvme_ns_remove(ns);
++ 
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  }
+  
+  static int nvme_scan_ns_list(struct nvme_ctrl *ctrl, unsigned nn)
+@@@ -2360,7 -3220,11 +2463,15 @@@ void nvme_remove_namespaces(struct nvme
+  	if (ctrl->state == NVME_CTRL_DEAD)
+  		nvme_kill_queues(ctrl);
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+++=======
++ 	down_write(&ctrl->namespaces_rwsem);
++ 	list_splice_init(&ctrl->namespaces, &ns_list);
++ 	up_write(&ctrl->namespaces_rwsem);
++ 
++ 	list_for_each_entry_safe(ns, next, &ns_list, list)
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  		nvme_ns_remove(ns);
+  }
+  EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
+@@@ -2551,8 -3411,7 +2662,12 @@@ int nvme_init_ctrl(struct nvme_ctrl *ct
+  	ctrl->state = NVME_CTRL_NEW;
+  	spin_lock_init(&ctrl->lock);
+  	INIT_LIST_HEAD(&ctrl->namespaces);
+++<<<<<<< HEAD
+ +	mutex_init(&ctrl->namespaces_mutex);
+ +	kref_init(&ctrl->kref);
+++=======
++ 	init_rwsem(&ctrl->namespaces_rwsem);
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  	ctrl->dev = dev;
+  	ctrl->ops = ops;
+  	ctrl->quirks = quirks;
+@@@ -2607,11 -3472,11 +2722,11 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  {
+  	struct nvme_ns *ns;
+  
+- 	mutex_lock(&ctrl->namespaces_mutex);
++ 	down_read(&ctrl->namespaces_rwsem);
+  
+ -	/* Forcibly unquiesce queues to avoid blocking dispatch */
+ +	/* Forcibly start all queues to avoid having stuck requests */
+  	if (ctrl->admin_q)
+ -		blk_mq_unquiesce_queue(ctrl->admin_q);
+ +		blk_mq_start_hw_queues(ctrl->admin_q);
+  
+  	list_for_each_entry(ns, &ctrl->namespaces, list) {
+  		/*
+@@@ -2623,14 -3488,10 +2738,14 @@@
+  		revalidate_disk(ns->disk);
+  		blk_set_queue_dying(ns->queue);
+  
+ -		/* Forcibly unquiesce queues to avoid blocking dispatch */
+ -		blk_mq_unquiesce_queue(ns->queue);
+ +		/*
+ +		 * Forcibly start all queues to avoid having stuck requests.
+ +		 * Note that we must ensure the queues are not stopped
+ +		 * when the final removal happens.
+ +		 */
+ +		blk_mq_start_hw_queues(ns->queue);
+  	}
+- 	mutex_unlock(&ctrl->namespaces_mutex);
++ 	up_read(&ctrl->namespaces_rwsem);
+  }
+  EXPORT_SYMBOL_GPL(nvme_kill_queues);
+  
+@@@ -2685,15 -3546,10 +2800,22 @@@ void nvme_stop_queues(struct nvme_ctrl 
+  {
+  	struct nvme_ns *ns;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ctrl->namespaces_mutex);
+ +	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ +		spin_lock_irq(ns->queue->queue_lock);
+ +		queue_flag_set(QUEUE_FLAG_STOPPED, ns->queue);
+ +		spin_unlock_irq(ns->queue->queue_lock);
+ +
+ +		blk_mq_quiesce_queue(ns->queue);
+ +	}
+ +	mutex_unlock(&ctrl->namespaces_mutex);
+++=======
++ 	down_read(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_mq_quiesce_queue(ns->queue);
++ 	up_read(&ctrl->namespaces_rwsem);
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  }
+  EXPORT_SYMBOL_GPL(nvme_stop_queues);
+  
+@@@ -2701,12 -3557,10 +2823,19 @@@ void nvme_start_queues(struct nvme_ctr
+  {
+  	struct nvme_ns *ns;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&ctrl->namespaces_mutex);
+ +	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ +		queue_flag_clear_unlocked(QUEUE_FLAG_STOPPED, ns->queue);
+ +		blk_mq_start_stopped_hw_queues(ns->queue, true);
+ +	}
+ +	mutex_unlock(&ctrl->namespaces_mutex);
+++=======
++ 	down_read(&ctrl->namespaces_rwsem);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_mq_unquiesce_queue(ns->queue);
++ 	up_read(&ctrl->namespaces_rwsem);
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  }
+  EXPORT_SYMBOL_GPL(nvme_start_queues);
+  
+diff --cc drivers/nvme/host/nvme.h
+index 9f38c3e9b7c3,29942b1892f7..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -116,21 -137,23 +116,26 @@@ struct nvme_ctrl 
+  	struct request_queue *admin_q;
+  	struct request_queue *connect_q;
+  	struct device *dev;
+ +	struct kref kref;
+  	int instance;
+  	struct blk_mq_tag_set *tagset;
+ -	struct blk_mq_tag_set *admin_tagset;
+  	struct list_head namespaces;
+++<<<<<<< HEAD
+ +	struct mutex namespaces_mutex;
+++=======
++ 	struct rw_semaphore namespaces_rwsem;
++ 	struct device ctrl_device;
+++>>>>>>> 765cc031cddd (nvme: change namespaces_mutext to namespaces_rwsem)
+  	struct device *device;	/* char device */
+ -	struct cdev cdev;
+ +	struct list_head node;
+ +	struct ida ns_ida;
+  	struct work_struct reset_work;
+ -	struct work_struct delete_work;
+ -
+ -	struct nvme_subsystem *subsys;
+ -	struct list_head subsys_entry;
+ -
+ -	struct opal_dev *opal_dev;
+  
+  	char name[12];
+ +	char serial[20];
+ +	char model[40];
+ +	char firmware_rev[8];
+ +	char subnqn[NVMF_NQN_SIZE];
+  	u16 cntlid;
+  
+  	u32 ctrl_config;
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/nvme.h
