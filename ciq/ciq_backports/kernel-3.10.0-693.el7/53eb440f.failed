@@ -1,0 +1,253 @@
+net sched actions: introduce timestamp for firsttime use
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: actions: introduce timestamp for firsttime use (Ivan Vecera) [1442088]
+Rebuild_FUZZ: 95.41%
+commit-author Jamal Hadi Salim <jhs@mojatatu.com>
+commit 53eb440f4ada034ea43b295891feec3df0fa7a29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/53eb440f.failed
+
+Useful to know when the action was first used for accounting
+(and debugging)
+
+	Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 53eb440f4ada034ea43b295891feec3df0fa7a29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/act_bpf.c
+#	net/sched/act_connmark.c
+#	net/sched/act_police.c
+diff --cc include/net/act_api.h
+index 11aac9abd0ca,8389c007076f..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -46,10 -51,34 +46,37 @@@ static inline unsigned int tcf_hash(u3
+  	return index & hmask;
+  }
+  
+ -static inline int tcf_hashinfo_init(struct tcf_hashinfo *hf, unsigned int mask)
+ -{
+ -	int i;
+ +#ifdef CONFIG_NET_CLS_ACT
+  
+++<<<<<<< HEAD
+ +#define ACT_P_CREATED 1
+ +#define ACT_P_DELETED 1
+++=======
++ 	spin_lock_init(&hf->lock);
++ 	hf->index = 0;
++ 	hf->hmask = mask;
++ 	hf->htab = kzalloc((mask + 1) * sizeof(struct hlist_head),
++ 			   GFP_KERNEL);
++ 	if (!hf->htab)
++ 		return -ENOMEM;
++ 	for (i = 0; i < mask + 1; i++)
++ 		INIT_HLIST_HEAD(&hf->htab[i]);
++ 	return 0;
++ }
++ 
++ /* Update lastuse only if needed, to avoid dirtying a cache line.
++  * We use a temp variable to avoid fetching jiffies twice.
++  */
++ static inline void tcf_lastuse_update(struct tcf_t *tm)
++ {
++ 	unsigned long now = jiffies;
++ 
++ 	if (tm->lastuse != now)
++ 		tm->lastuse = now;
++ 	if (unlikely(!tm->firstuse))
++ 		tm->firstuse = now;
++ }
+++>>>>>>> 53eb440f4ada (net sched actions: introduce timestamp for firsttime use)
+  
+  struct tc_action {
+  	void			*priv;
+diff --cc net/sched/act_police.c
+index 376c02554325,820b11686f85..000000000000
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@@ -266,12 -238,14 +266,19 @@@ override
+  
+  	police->tcfp_t_c = ktime_get_ns();
+  	police->tcf_index = parm->index ? parm->index :
+++<<<<<<< HEAD
+ +		tcf_hash_new_index(&police_idx_gen, &police_hash_info);
+++=======
++ 		tcf_hash_new_index(tn);
++ 	police->tcf_tm.install = jiffies;
++ 	police->tcf_tm.lastuse = jiffies;
++ 	police->tcf_tm.firstuse = 0;
+++>>>>>>> 53eb440f4ada (net sched actions: introduce timestamp for firsttime use)
+  	h = tcf_hash(police->tcf_index, POL_TAB_MASK);
+ -	spin_lock_bh(&hinfo->lock);
+ -	hlist_add_head(&police->tcf_head, &hinfo->htab[h]);
+ -	spin_unlock_bh(&hinfo->lock);
+ +	write_lock_bh(&police_lock);
+ +	police->tcf_next = tcf_police_ht[h];
+ +	tcf_police_ht[h] = &police->common;
+ +	write_unlock_bh(&police_lock);
+  
+  	a->priv = police;
+  	return ret;
+@@@ -389,6 -345,14 +396,17 @@@ tcf_act_police_dump(struct sk_buff *skb
+  	if (police->tcfp_ewma_rate &&
+  	    nla_put_u32(skb, TCA_POLICE_AVRATE, police->tcfp_ewma_rate))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+++=======
++ 
++ 	t.install = jiffies_to_clock_t(jiffies - police->tcf_tm.install);
++ 	t.lastuse = jiffies_to_clock_t(jiffies - police->tcf_tm.lastuse);
++ 	t.firstuse = jiffies_to_clock_t(jiffies - police->tcf_tm.firstuse);
++ 	t.expires = jiffies_to_clock_t(police->tcf_tm.expires);
++ 	if (nla_put_64bit(skb, TCA_POLICE_TM, sizeof(t), &t, TCA_POLICE_PAD))
++ 		goto nla_put_failure;
++ 
+++>>>>>>> 53eb440f4ada (net sched actions: introduce timestamp for firsttime use)
+  	return skb->len;
+  
+  nla_put_failure:
+* Unmerged path net/sched/act_bpf.c
+* Unmerged path net/sched/act_connmark.c
+* Unmerged path include/net/act_api.h
+diff --git a/include/uapi/linux/pkt_cls.h b/include/uapi/linux/pkt_cls.h
+index 3abfe7f00823..4839c3864d26 100644
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -144,6 +144,7 @@ struct tcf_t {
+ 	__u64   install;
+ 	__u64   lastuse;
+ 	__u64   expires;
++	__u64   firstuse;
+ };
+ 
+ struct tc_cnt {
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 45d305cc522a..d5d50dffdea2 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -237,6 +237,7 @@ struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
+ 	p->tcfc_index = index ? index : tcf_hash_new_index(idx_gen, hinfo);
+ 	p->tcfc_tm.install = jiffies;
+ 	p->tcfc_tm.lastuse = jiffies;
++	p->tcfc_tm.firstuse = 0;
+ 	if (est) {
+ 		int err = gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
+ 					    &p->tcfc_lock, est);
+* Unmerged path net/sched/act_bpf.c
+* Unmerged path net/sched/act_connmark.c
+diff --git a/net/sched/act_csum.c b/net/sched/act_csum.c
+index 11fe1a416433..aaabe9fad9f0 100644
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@ -565,6 +565,7 @@ static int tcf_csum_dump(struct sk_buff *skb,
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - p->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - p->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - p->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(p->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_CSUM_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index 085ab295a109..4bdac219509d 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -202,6 +202,7 @@ static int tcf_gact_dump(struct sk_buff *skb, struct tc_action *a, int bind, int
+ #endif
+ 	t.install = jiffies_to_clock_t(jiffies - gact->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - gact->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - gact->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(gact->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_GACT_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 90a973aacc76..6dac39fbf77e 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -281,6 +281,7 @@ static int tcf_ipt_dump(struct sk_buff *skb, struct tc_action *a, int bind, int
+ 		goto nla_put_failure;
+ 	tm.install = jiffies_to_clock_t(jiffies - ipt->tcf_tm.install);
+ 	tm.lastuse = jiffies_to_clock_t(jiffies - ipt->tcf_tm.lastuse);
++	tm.firstuse = jiffies_to_clock_t(jiffies - ipt->tcf_tm.firstuse);
+ 	tm.expires = jiffies_to_clock_t(ipt->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_IPT_TM, sizeof (tm), &tm))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 4b6188539f6c..86a9ebe5b9e4 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -230,6 +230,7 @@ static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind, i
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - m->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - m->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - m->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(m->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_MIRRED_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_nat.c b/net/sched/act_nat.c
+index 76869538d028..3cc4bb2b1dd2 100644
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@ -288,6 +288,7 @@ static int tcf_nat_dump(struct sk_buff *skb, struct tc_action *a,
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - p->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - p->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - p->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(p->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_NAT_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index 0978c6d2f6cf..46edc7bbce0f 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -221,6 +221,7 @@ static int tcf_pedit_dump(struct sk_buff *skb, struct tc_action *a,
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - p->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - p->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - p->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(p->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_PEDIT_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+* Unmerged path net/sched/act_police.c
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index f7b45ab85388..f09bd7b98ffc 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -184,6 +184,7 @@ static int tcf_simp_dump(struct sk_buff *skb, struct tc_action *a,
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - d->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - d->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - d->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(d->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_DEF_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index 8fe9d25c3008..18a582f5755f 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -184,6 +184,7 @@ static int tcf_skbedit_dump(struct sk_buff *skb, struct tc_action *a,
+ 		goto nla_put_failure;
+ 	t.install = jiffies_to_clock_t(jiffies - d->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - d->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - d->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(d->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_SKBEDIT_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index d735ecf0b1a7..b170645e43f3 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -170,6 +170,7 @@ static int tcf_vlan_dump(struct sk_buff *skb, struct tc_action *a,
+ 
+ 	t.install = jiffies_to_clock_t(jiffies - v->tcf_tm.install);
+ 	t.lastuse = jiffies_to_clock_t(jiffies - v->tcf_tm.lastuse);
++	t.firstuse = jiffies_to_clock_t(jiffies - v->tcf_tm.firstuse);
+ 	t.expires = jiffies_to_clock_t(v->tcf_tm.expires);
+ 	if (nla_put(skb, TCA_VLAN_TM, sizeof(t), &t))
+ 		goto nla_put_failure;
