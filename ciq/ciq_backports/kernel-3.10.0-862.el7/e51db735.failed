@@ -1,0 +1,233 @@
+userns: Better restrictions on when proc and sysfs can be mounted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit e51db73532955dc5eaba4235e62b74b460709d5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e51db735.failed
+
+Rely on the fact that another flavor of the filesystem is already
+mounted and do not rely on state in the user namespace.
+
+Verify that the mounted filesystem is not covered in any significant
+way.  I would love to verify that the previously mounted filesystem
+has no mounts on top but there are at least the directories
+/proc/sys/fs/binfmt_misc and /sys/fs/cgroup/ that exist explicitly
+for other filesystems to mount on top of.
+
+Refactor the test into a function named fs_fully_visible and call that
+function from the mount routines of proc and sysfs.  This makes this
+test local to the filesystems involved and the results current of when
+the mounts take place, removing a weird threading of the user
+namespace, the mount namespace and the filesystems themselves.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit e51db73532955dc5eaba4235e62b74b460709d5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	kernel/user.c
+#	kernel/user_namespace.c
+diff --cc include/linux/user_namespace.h
+index 9cca1de7ecaf,4ce009324933..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -53,29 -26,6 +53,32 @@@ struct user_namespace 
+  	kuid_t			owner;
+  	kgid_t			group;
+  	unsigned int		proc_inum;
+++<<<<<<< HEAD
+ +	bool			may_mount_sysfs;
+ +	bool			may_mount_proc;
+ +
+ +	/* Register of per-UID persistent keyrings for this namespace */
+ +#ifdef CONFIG_PERSISTENT_KEYRINGS
+ +	struct key		*persistent_keyring_register;
+ +	struct rw_semaphore	persistent_keyring_register_sem;
+ +#endif
+ +	RH_KABI_EXTEND(int level)
+ +	RH_KABI_EXTEND(unsigned long flags)
+ +	RH_KABI_EXTEND(struct work_struct work)
+ +	RH_KABI_EXTEND(struct ctl_table_set set)
+ +	RH_KABI_EXTEND(struct ctl_table_header *sysctls)
+ +	RH_KABI_EXTEND(struct ucounts *ucounts)
+ +	RH_KABI_EXTEND(int ucount_max[UCOUNT_COUNTS])
+ +};
+ +
+ +struct ucounts {
+ +	struct hlist_node node;
+ +	struct user_namespace *ns;
+ +	kuid_t uid;
+ +	int count;
+ +	atomic_t ucount[UCOUNT_COUNTS];
+++=======
+++>>>>>>> e51db7353295 (userns: Better restrictions on when proc and sysfs can be mounted)
+  };
+  
+  extern struct user_namespace init_user_ns;
+@@@ -138,12 -80,6 +141,10 @@@ static inline void put_user_ns(struct u
+  {
+  }
+  
+ +static inline bool userns_may_setgroups(const struct user_namespace *ns)
+ +{
+ +	return true;
+ +}
+  #endif
+  
+- void update_mnt_policy(struct user_namespace *userns);
+- 
+  #endif /* _LINUX_USER_H */
+diff --cc kernel/user.c
+index 1d39b0dbc2c4,5bbb91988e69..000000000000
+--- a/kernel/user.c
++++ b/kernel/user.c
+@@@ -51,13 -51,6 +51,16 @@@ struct user_namespace init_user_ns = 
+  	.owner = GLOBAL_ROOT_UID,
+  	.group = GLOBAL_ROOT_GID,
+  	.proc_inum = PROC_USER_INIT_INO,
+++<<<<<<< HEAD
+ +	.may_mount_sysfs = true,
+ +	.may_mount_proc = true,
+ +	.flags = USERNS_INIT_FLAGS,
+ +#ifdef CONFIG_PERSISTENT_KEYRINGS
+ +	.persistent_keyring_register_sem =
+ +	__RWSEM_INITIALIZER(init_user_ns.persistent_keyring_register_sem),
+ +#endif
+++=======
+++>>>>>>> e51db7353295 (userns: Better restrictions on when proc and sysfs can be mounted)
+  };
+  EXPORT_SYMBOL_GPL(init_user_ns);
+  
+diff --cc kernel/user_namespace.c
+index f698a257e27c,d58ad1e7a794..000000000000
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@@ -150,19 -97,7 +150,22 @@@ int create_user_ns(struct cred *new
+  
+  	set_cred_user_ns(new, ns);
+  
+++<<<<<<< HEAD
+ +	update_mnt_policy(ns);
+++=======
+++>>>>>>> e51db7353295 (userns: Better restrictions on when proc and sysfs can be mounted)
+  	return 0;
+ +fail_keyring:
+ +#ifdef CONFIG_PERSISTENT_KEYRINGS
+ +	key_put(ns->persistent_keyring_register);
+ +#endif
+ +fail_free:
+ +	proc_free_inum(ns->proc_inum);
+ +	kmem_cache_free(user_ns_cachep, ns);
+ +fail_dec:
+ +	dec_user_namespaces(ucounts);
+ +fail:
+ +	return ret;
+  }
+  
+  int unshare_userns(unsigned long unshare_flags, struct cred **new_cred)
+diff --git a/fs/namespace.c b/fs/namespace.c
+index d21098c35db1..13803f1034dc 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -3251,25 +3251,38 @@ bool current_chrooted(void)
+ 	return chrooted;
+ }
+ 
+-void update_mnt_policy(struct user_namespace *userns)
++bool fs_fully_visible(struct file_system_type *type)
+ {
+ 	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+ 	struct mount *mnt;
++	bool visible = false;
+ 
+-	down_read(&namespace_sem);
++	if (unlikely(!ns))
++		return false;
++
++	namespace_lock();
+ 	list_for_each_entry(mnt, &ns->list, mnt_list) {
+-		switch (mnt->mnt.mnt_sb->s_magic) {
+-		case SYSFS_MAGIC:
+-			userns->may_mount_sysfs = true;
+-			break;
+-		case PROC_SUPER_MAGIC:
+-			userns->may_mount_proc = true;
+-			break;
++		struct mount *child;
++		if (mnt->mnt.mnt_sb->s_type != type)
++			continue;
++
++		/* This mount is not fully visible if there are any child mounts
++		 * that cover anything except for empty directories.
++		 */
++		list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
++			struct inode *inode = child->mnt_mountpoint->d_inode;
++			if (!S_ISDIR(inode->i_mode))
++				goto next;
++			if (inode->i_nlink != 2)
++				goto next;
+ 		}
+-		if (userns->may_mount_sysfs && userns->may_mount_proc)
+-			break;
++		visible = true;
++		goto found;
++	next:	;
+ 	}
+-	up_read(&namespace_sem);
++found:
++	namespace_unlock();
++	return visible;
+ }
+ 
+ static void *mntns_get(struct task_struct *task)
+diff --git a/fs/proc/root.c b/fs/proc/root.c
+index 3a48c1b05b1a..95879022eee5 100644
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -110,8 +110,11 @@ static struct dentry *proc_mount(struct file_system_type *fs_type,
+ 		ns = task_active_pid_ns(current);
+ 		options = data;
+ 
+-		if (!current_user_ns()->may_mount_proc ||
+-		    !ns_capable(ns->user_ns, CAP_SYS_ADMIN))
++		if (!capable(CAP_SYS_ADMIN) && !fs_fully_visible(fs_type))
++			return ERR_PTR(-EPERM);
++
++		/* Does the mounter have privilege over the pid namespace? */
++		if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+ 			return ERR_PTR(-EPERM);
+ 	}
+ 
+diff --git a/fs/sysfs/mount.c b/fs/sysfs/mount.c
+index afd83273e6ce..4a2da3a4b1b1 100644
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@ -112,7 +112,8 @@ static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ 	struct super_block *sb;
+ 	int error;
+ 
+-	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
++	if (!(flags & MS_KERNMOUNT) && !capable(CAP_SYS_ADMIN) &&
++	    !fs_fully_visible(fs_type))
+ 		return ERR_PTR(-EPERM);
+ 
+ 	info = kzalloc(sizeof(*info), GFP_KERNEL);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 4086333a0708..9684ef7e61fa 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2274,6 +2274,7 @@ extern int vfs_ustat(dev_t, struct kstatfs *);
+ extern int freeze_super(struct super_block *super);
+ extern int thaw_super(struct super_block *super);
+ extern bool our_mnt(struct vfsmount *mnt);
++extern bool fs_fully_visible(struct file_system_type *);
+ 
+ extern int current_umask(void);
+ 
+* Unmerged path include/linux/user_namespace.h
+* Unmerged path kernel/user.c
+* Unmerged path kernel/user_namespace.c
