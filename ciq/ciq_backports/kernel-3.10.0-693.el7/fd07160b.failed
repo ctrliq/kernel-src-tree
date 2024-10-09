@@ -1,0 +1,159 @@
+xen-netfront: avoid packet loss when ethernet header crosses page boundary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit fd07160bb7180cdd0afeb089d8cdfd66002f17e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fd07160b.failed
+
+Small packet loss is reported on complex multi host network configurations
+including tunnels, NAT, ... My investigation led me to the following check
+in netback which drops packets:
+
+        if (unlikely(txreq.size < ETH_HLEN)) {
+                netdev_err(queue->vif->dev,
+                           "Bad packet size: %d\n", txreq.size);
+                xenvif_tx_err(queue, &txreq, extra_count, idx);
+                break;
+        }
+
+But this check itself is legitimate. SKBs consist of a linear part (which
+has to have the ethernet header) and (optionally) a number of frags.
+Netfront transmits the head of the linear part up to the page boundary
+as the first request and all the rest becomes frags so when we're
+reconstructing the SKB in netback we can't distinguish between original
+frags and the 'tail' of the linear part. The first SKB needs to be at
+least ETH_HLEN size. So in case we have an SKB with its linear part
+starting too close to the page boundary the packet is lost.
+
+I see two ways to fix the issue:
+- Change the 'wire' protocol between netfront and netback to start keeping
+  the original SKB structure. We'll have to add a flag indicating the fact
+  that the particular request is a part of the original linear part and not
+  a frag. We'll need to know the length of the linear part to pre-allocate
+  memory.
+- Avoid transmitting SKBs with linear parts starting too close to the page
+  boundary. That seems preferable short-term and shouldn't bring
+  significant performance degradation as such packets are rare. That's what
+  this patch is trying to achieve with skb_copy().
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Acked-by: David Vrabel <david.vrabel@citrix.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fd07160bb7180cdd0afeb089d8cdfd66002f17e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/xen-netfront.c
+index 76beea67d145,e17879dd5d5a..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -532,27 -524,55 +532,41 @@@ static int xennet_count_skb_frag_slots(
+  		/* Skip unused frames from start of page */
+  		offset &= ~PAGE_MASK;
+  
+ -		slots += gnttab_count_grant(offset, size);
+ -	}
+ -
+ -	return slots;
+ -}
+ -
+ -static u16 xennet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ -			       void *accel_priv, select_queue_fallback_t fallback)
+ -{
+ -	unsigned int num_queues = dev->real_num_tx_queues;
+ -	u32 hash;
+ -	u16 queue_idx;
+ -
+ -	/* First, check if there is only one queue */
+ -	if (num_queues == 1) {
+ -		queue_idx = 0;
+ -	} else {
+ -		hash = skb_get_hash(skb);
+ -		queue_idx = hash % num_queues;
+ +		pages += PFN_UP(offset + size);
+  	}
+  
+ -	return queue_idx;
+ +	return pages;
+  }
+  
+ -#define MAX_XEN_SKB_FRAGS (65536 / XEN_PAGE_SIZE + 1)
+ -
+  static int xennet_start_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+ +	unsigned short id;
+  	struct netfront_info *np = netdev_priv(dev);
+ -	struct netfront_stats *tx_stats = this_cpu_ptr(np->tx_stats);
+ -	struct xen_netif_tx_request *tx, *first_tx;
+ -	unsigned int i;
+ +	struct netfront_stats *stats = this_cpu_ptr(np->stats);
+ +	struct xen_netif_tx_request *tx;
+ +	char *data = skb->data;
+ +	RING_IDX i;
+ +	grant_ref_t ref;
+ +	unsigned long mfn;
+  	int notify;
+  	int slots;
+ -	struct page *page;
+ -	unsigned int offset;
+ -	unsigned int len;
+ +	unsigned int offset = offset_in_page(data);
+ +	unsigned int len = skb_headlen(skb);
+  	unsigned long flags;
+++<<<<<<< HEAD
+++=======
++ 	struct netfront_queue *queue = NULL;
++ 	unsigned int num_queues = dev->real_num_tx_queues;
++ 	u16 queue_index;
++ 	struct sk_buff *nskb;
++ 
++ 	/* Drop the packet if no queues are set up */
++ 	if (num_queues < 1)
++ 		goto drop;
++ 	/* Determine which queue to transmit this SKB on */
++ 	queue_index = skb_get_queue_mapping(skb);
++ 	queue = &np->queues[queue_index];
+++>>>>>>> fd07160bb718 (xen-netfront: avoid packet loss when ethernet header crosses page boundary)
+  
+  	/* If skb->len is too big for wire format, drop skb and alert
+  	 * user about misconfiguration.
+@@@ -571,12 -590,27 +585,34 @@@
+  				    slots, skb->len);
+  		if (skb_linearize(skb))
+  			goto drop;
+ +		data = skb->data;
+ +		offset = offset_in_page(data);
+ +		len = skb_headlen(skb);
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&np->tx_lock, flags);
+++=======
++ 	page = virt_to_page(skb->data);
++ 	offset = offset_in_page(skb->data);
++ 
++ 	/* The first req should be at least ETH_HLEN size or the packet will be
++ 	 * dropped by netback.
++ 	 */
++ 	if (unlikely(PAGE_SIZE - offset < ETH_HLEN)) {
++ 		nskb = skb_copy(skb, GFP_ATOMIC);
++ 		if (!nskb)
++ 			goto drop;
++ 		dev_kfree_skb_any(skb);
++ 		skb = nskb;
++ 		page = virt_to_page(skb->data);
++ 		offset = offset_in_page(skb->data);
++ 	}
++ 
++ 	len = skb_headlen(skb);
++ 
++ 	spin_lock_irqsave(&queue->tx_lock, flags);
+++>>>>>>> fd07160bb718 (xen-netfront: avoid packet loss when ethernet header crosses page boundary)
+  
+  	if (unlikely(!netif_carrier_ok(dev) ||
+  		     (slots > 1 && !xennet_can_sg(dev)) ||
+* Unmerged path drivers/net/xen-netfront.c
