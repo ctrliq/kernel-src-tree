@@ -577,7 +577,7 @@ static void print_sample_bts(struct perf_sample *sample,
 				print_opts &= ~PRINT_IP_OPT_SRCLINE;
 			}
 		}
-		perf_evsel__print_ip(evsel, sample, al, print_opts,
+		perf_evsel__print_ip(evsel, sample, al, 0, print_opts,
 				     scripting_max_stack, stdout);
 	}
 
@@ -708,7 +708,7 @@ static void process_event(struct perf_script *script,
 		else
 			printf("\n");
 
-		perf_evsel__print_ip(evsel, sample, al,
+		perf_evsel__print_ip(evsel, sample, al, 0,
 				     output[attr->type].print_ip_opts,
 				     scripting_max_stack, stdout);
 	}
