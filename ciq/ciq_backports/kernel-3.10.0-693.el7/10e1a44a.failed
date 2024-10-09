@@ -1,0 +1,490 @@
+scsi: be2iscsi: Fail the sessions immediately after TPE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fail the sessions immediately after TPE (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 94.23%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 10e1a44ab2bfc850f5ccca5624c68f7c7f8c460c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/10e1a44a.failed
+
+Sessions are no longer valid, so schedule sess_work to fail the sessions
+immediately when error is detected. This is done to avoid iSCSI transport
+layer to keep sending NOP-Out which driver any ways fail.
+
+Schedule sess_work immediately in case of HBA error. Old sessions are gone
+for good and need to be re-established.
+
+iscsi_session_failure needs process context hence this work.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 10e1a44ab2bfc850f5ccca5624c68f7c7f8c460c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/be2iscsi/be_main.h
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 8e3a0f9d2ac4,cf82973e2789..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -5378,53 -5350,242 +5378,136 @@@ static void be_eqd_update(struct beiscs
+  			num++;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	if (num) {
+ +		tag = be_cmd_modify_eq_delay(phba, set_eqd, num);
+ +		if (tag)
+ +			beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+++=======
++ 	if (num)
++ 		/* completion of this is ignored */
++ 		beiscsi_modify_eq_delay(phba, set_eqd, num);
++ 
++ 	schedule_delayed_work(&phba->eqd_update,
++ 			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
++ }
++ 
++ static void beiscsi_msix_enable(struct beiscsi_hba *phba)
++ {
++ 	int i, status;
++ 
++ 	for (i = 0; i <= phba->num_cpus; i++)
++ 		phba->msix_entries[i].entry = i;
++ 
++ 	status = pci_enable_msix_range(phba->pcidev, phba->msix_entries,
++ 				       phba->num_cpus + 1, phba->num_cpus + 1);
++ 	if (status > 0)
++ 		phba->msix_enabled = true;
++ }
++ 
++ static void beiscsi_hw_tpe_check(unsigned long ptr)
++ {
++ 	struct beiscsi_hba *phba;
++ 	u32 wait;
++ 
++ 	phba = (struct beiscsi_hba *)ptr;
++ 	/* if not TPE, do nothing */
++ 	if (!beiscsi_detect_tpe(phba))
++ 		return;
++ 
++ 	/* wait default 4000ms before recovering */
++ 	wait = 4000;
++ 	if (phba->ue2rp > BEISCSI_UE_DETECT_INTERVAL)
++ 		wait = phba->ue2rp - BEISCSI_UE_DETECT_INTERVAL;
++ 	queue_delayed_work(phba->wq, &phba->recover_port,
++ 			   msecs_to_jiffies(wait));
++ }
++ 
++ static void beiscsi_hw_health_check(unsigned long ptr)
++ {
++ 	struct beiscsi_hba *phba;
++ 
++ 	phba = (struct beiscsi_hba *)ptr;
++ 	beiscsi_detect_ue(phba);
++ 	if (beiscsi_detect_ue(phba)) {
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			      "BM_%d : port in error: %lx\n", phba->state);
++ 		/* sessions are no longer valid, so first fail the sessions */
++ 		queue_work(phba->wq, &phba->sess_work);
++ 
++ 		/* detect UER supported */
++ 		if (!test_bit(BEISCSI_HBA_UER_SUPP, &phba->state))
++ 			return;
++ 		/* modify this timer to check TPE */
++ 		phba->hw_check.function = beiscsi_hw_tpe_check;
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  	}
+ -
+ -	mod_timer(&phba->hw_check,
+ -		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
+  }
+  
+ -/*
+ - * beiscsi_enable_port()- Enables the disabled port.
+ - * Only port resources freed in disable function are reallocated.
+ - * This is called in HBA error handling path.
+ - *
+ - * @phba: Instance of driver private structure
+ - *
+ - **/
+ -static int beiscsi_enable_port(struct beiscsi_hba *phba)
+ +static void be_check_boot_session(struct beiscsi_hba *phba)
+  {
+ -	struct hwi_context_memory *phwi_context;
+ -	struct hwi_controller *phwi_ctrlr;
+ -	struct be_eq_obj *pbe_eq;
+ -	int ret, i;
+ -
+ -	if (test_bit(BEISCSI_HBA_ONLINE, &phba->state)) {
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			      "BM_%d : %s : port is online %lx\n",
+ -			      __func__, phba->state);
+ -		return 0;
+ -	}
+ -
+ -	ret = beiscsi_init_sliport(phba);
+ -	if (ret)
+ -		return ret;
+ -
+ -	if (enable_msix)
+ -		find_num_cpus(phba);
+ -	else
+ -		phba->num_cpus = 1;
+ -	if (enable_msix) {
+ -		beiscsi_msix_enable(phba);
+ -		if (!phba->msix_enabled)
+ -			phba->num_cpus = 1;
+ -	}
+ -
+ -	beiscsi_get_params(phba);
+ -	/* Re-enable UER. If different TPE occurs then it is recoverable. */
+ -	beiscsi_set_uer_feature(phba);
+ -
+ -	phba->shost->max_id = phba->params.cxns_per_ctrl;
+ -	phba->shost->can_queue = phba->params.ios_per_ctrl;
+ -	ret = hwi_init_controller(phba);
+ -	if (ret) {
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			      "BM_%d : init controller failed %d\n", ret);
+ -		goto disable_msix;
+ -	}
+ -
+ -	for (i = 0; i < MAX_MCC_CMD; i++) {
+ -		init_waitqueue_head(&phba->ctrl.mcc_wait[i + 1]);
+ -		phba->ctrl.mcc_tag[i] = i + 1;
+ -		phba->ctrl.mcc_tag_status[i + 1] = 0;
+ -		phba->ctrl.mcc_tag_available++;
+ -	}
+ -
+ -	phwi_ctrlr = phba->phwi_ctrlr;
+ -	phwi_context = phwi_ctrlr->phwi_ctxt;
+ -	for (i = 0; i < phba->num_cpus; i++) {
+ -		pbe_eq = &phwi_context->be_eq[i];
+ -		irq_poll_init(&pbe_eq->iopoll, be_iopoll_budget, be_iopoll);
+ -	}
+ -
+ -	i = (phba->msix_enabled) ? i : 0;
+ -	/* Work item for MCC handling */
+ -	pbe_eq = &phwi_context->be_eq[i];
+ -	INIT_WORK(&pbe_eq->mcc_work, beiscsi_mcc_work);
+ -
+ -	ret = beiscsi_init_irqs(phba);
+ -	if (ret < 0) {
+ -		__beiscsi_log(phba, KERN_ERR,
+ -			      "BM_%d : setup IRQs failed %d\n", ret);
+ -		goto cleanup_port;
+ -	}
+ -	hwi_enable_intr(phba);
+ -	/* port operational: clear all error bits */
+ -	set_bit(BEISCSI_HBA_ONLINE, &phba->state);
+ -	__beiscsi_log(phba, KERN_INFO,
+ -		      "BM_%d : port online: 0x%lx\n", phba->state);
+ -
+ -	/* start hw_check timer and eqd_update work */
+ -	schedule_delayed_work(&phba->eqd_update,
+ -			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
+ -
+ -	/**
+ -	 * Timer function gets modified for TPE detection.
+ -	 * Always reinit to do health check first.
+ -	 */
+ -	phba->hw_check.function = beiscsi_hw_health_check;
+ -	mod_timer(&phba->hw_check,
+ -		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
+ -	return 0;
+ -
+ -cleanup_port:
+ -	for (i = 0; i < phba->num_cpus; i++) {
+ -		pbe_eq = &phwi_context->be_eq[i];
+ -		irq_poll_disable(&pbe_eq->iopoll);
+ -	}
+ -	hwi_cleanup_port(phba);
+ -
+ -disable_msix:
+ -	if (phba->msix_enabled)
+ -		pci_disable_msix(phba->pcidev);
+ -
+ -	return ret;
+ +	if (beiscsi_setup_boot_info(phba))
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+ +			    "BM_%d : Could not set up "
+ +			    "iSCSI boot info on async event.\n");
+  }
+  
+  /*
+ - * beiscsi_disable_port()- Disable port and cleanup driver resources.
+ - * This is called in HBA error handling and driver removal.
+ - * @phba: Instance Priv structure
+ - * @unload: indicate driver is unloading
+ + * beiscsi_hw_health_check()- Check adapter health
+ + * @work: work item to check HW health
+   *
+ - * Free the OS and HW resources held by the driver
+ + * Check if adapter in an unrecoverable state or not.
+   **/
+ -static void beiscsi_disable_port(struct beiscsi_hba *phba, int unload)
+ +static void
+ +beiscsi_hw_health_check(struct work_struct *work)
+  {
+ -	struct hwi_context_memory *phwi_context;
+ -	struct hwi_controller *phwi_ctrlr;
+ -	struct be_eq_obj *pbe_eq;
+ -	unsigned int i, msix_vec;
+ +	struct beiscsi_hba *phba =
+ +		container_of(work, struct beiscsi_hba,
+ +			     beiscsi_hw_check_task.work);
+  
+ -	if (!test_and_clear_bit(BEISCSI_HBA_ONLINE, &phba->state))
+ -		return;
+ +	be_eqd_update(phba);
+  
+ -	phwi_ctrlr = phba->phwi_ctrlr;
+ -	phwi_context = phwi_ctrlr->phwi_ctxt;
+ -	hwi_disable_intr(phba);
+ -	if (phba->msix_enabled) {
+ -		for (i = 0; i <= phba->num_cpus; i++) {
+ -			msix_vec = phba->msix_entries[i].vector;
+ -			free_irq(msix_vec, &phwi_context->be_eq[i]);
+ -			kfree(phba->msi_name[i]);
+ +	if (phba->state & BE_ADAPTER_CHECK_BOOT) {
+ +		if ((phba->get_boot > 0) && (!phba->boot_kset)) {
+ +			phba->get_boot--;
+ +			if (!(phba->get_boot % BE_GET_BOOT_TO))
+ +				be_check_boot_session(phba);
+ +		} else {
+ +			phba->state &= ~BE_ADAPTER_CHECK_BOOT;
+ +			phba->get_boot = 0;
+  		}
+ -	} else
+ -		if (phba->pcidev->irq)
+ -			free_irq(phba->pcidev->irq, phba);
+ -	pci_disable_msix(phba->pcidev);
+ -
+ -	for (i = 0; i < phba->num_cpus; i++) {
+ -		pbe_eq = &phwi_context->be_eq[i];
+ -		irq_poll_disable(&pbe_eq->iopoll);
+  	}
+ -	cancel_delayed_work_sync(&phba->eqd_update);
+ -	cancel_work_sync(&phba->boot_work);
+ -	/* WQ might be running cancel queued mcc_work if we are not exiting */
+ -	if (!unload && beiscsi_hba_in_error(phba)) {
+ -		pbe_eq = &phwi_context->be_eq[i];
+ -		cancel_work_sync(&pbe_eq->mcc_work);
+ -	}
+ -	hwi_cleanup_port(phba);
+ +
+ +	beiscsi_ue_detect(phba);
+ +
+ +	schedule_delayed_work(&phba->beiscsi_hw_check_task,
+ +			      msecs_to_jiffies(1000));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void beiscsi_sess_work(struct work_struct *work)
++ {
++ 	struct beiscsi_hba *phba;
++ 
++ 	phba = container_of(work, struct beiscsi_hba, sess_work);
++ 	/*
++ 	 * This work gets scheduled only in case of HBA error.
++ 	 * Old sessions are gone so need to be re-established.
++ 	 * iscsi_session_failure needs process context hence this work.
++ 	 */
++ 	iscsi_host_for_each_session(phba->shost, beiscsi_session_fail);
++ }
++ 
++ static void beiscsi_recover_port(struct work_struct *work)
++ {
++ 	struct beiscsi_hba *phba;
++ 
++ 	phba = container_of(work, struct beiscsi_hba, recover_port.work);
++ 	beiscsi_disable_port(phba, 0);
++ 	beiscsi_enable_port(phba);
++ }
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  
+  static pci_ers_result_t beiscsi_eeh_err_detected(struct pci_dev *pdev,
+  		pci_channel_state_t state)
+@@@ -5437,7 -5598,13 +5520,17 @@@
+  	beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+  		    "BM_%d : EEH error detected\n");
+  
+++<<<<<<< HEAD
+ +	beiscsi_quiesce(phba, BEISCSI_EEH_UNLOAD);
+++=======
++ 	/* first stop UE detection when PCI error detected */
++ 	del_timer_sync(&phba->hw_check);
++ 	cancel_delayed_work_sync(&phba->recover_port);
++ 
++ 	/* sessions are no longer valid, so first fail the sessions */
++ 	iscsi_host_for_each_session(phba->shost, beiscsi_session_fail);
++ 	beiscsi_disable_port(phba, 0);
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  
+  	if (state == pci_channel_io_perm_failure) {
+  		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+@@@ -5745,22 -5824,42 +5838,39 @@@ static int beiscsi_dev_probe(struct pci
+  	}
+  	hwi_enable_intr(phba);
+  
+ -	ret = iscsi_host_add(phba->shost, &phba->pcidev->dev);
+ -	if (ret)
+ +	if (iscsi_host_add(phba->shost, &phba->pcidev->dev))
+  		goto free_blkenbld;
+  
+ -	/* set online bit after port is operational */
+ -	set_bit(BEISCSI_HBA_ONLINE, &phba->state);
+ -	__beiscsi_log(phba, KERN_INFO,
+ -		      "BM_%d : port online: 0x%lx\n", phba->state);
+ -
+ -	INIT_WORK(&phba->boot_work, beiscsi_boot_work);
+ -	ret = beiscsi_boot_get_shandle(phba, &s_handle);
+ -	if (ret > 0) {
+ -		beiscsi_start_boot_work(phba, s_handle);
+ -		/**
+ -		 * Set this bit after starting the work to let
+ -		 * probe handle it first.
+ -		 * ASYNC event can too schedule this work.
+ +	if (beiscsi_setup_boot_info(phba))
+ +		/*
+ +		 * log error but continue, because we may not be using
+ +		 * iscsi boot.
+  		 */
+ -		set_bit(BEISCSI_HBA_BOOT_FOUND, &phba->state);
+ -	}
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+ +			    "BM_%d : Could not set up "
+ +			    "iSCSI boot info.\n");
+  
+  	beiscsi_iface_create_default(phba);
+++<<<<<<< HEAD
+ +	schedule_delayed_work(&phba->beiscsi_hw_check_task,
+ +			      msecs_to_jiffies(1000));
+ +
+++=======
++ 	schedule_delayed_work(&phba->eqd_update,
++ 			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
++ 
++ 	INIT_WORK(&phba->sess_work, beiscsi_sess_work);
++ 	INIT_DELAYED_WORK(&phba->recover_port, beiscsi_recover_port);
++ 	/**
++ 	 * Start UE detection here. UE before this will cause stall in probe
++ 	 * and eventually fail the probe.
++ 	 */
++ 	init_timer(&phba->hw_check);
++ 	phba->hw_check.function = beiscsi_hw_health_check;
++ 	phba->hw_check.data = (unsigned long)phba;
++ 	mod_timer(&phba->hw_check,
++ 		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_INIT,
+  		    "\n\n\n BM_%d : SUCCESS - DRIVER LOADED\n\n\n");
+  	return 0;
+@@@ -5792,6 -5892,49 +5902,52 @@@ disable_pci
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void beiscsi_remove(struct pci_dev *pcidev)
++ {
++ 	struct beiscsi_hba *phba = NULL;
++ 
++ 	phba = pci_get_drvdata(pcidev);
++ 	if (!phba) {
++ 		dev_err(&pcidev->dev, "beiscsi_remove called with no phba\n");
++ 		return;
++ 	}
++ 
++ 	/* first stop UE detection before unloading */
++ 	del_timer_sync(&phba->hw_check);
++ 	cancel_delayed_work_sync(&phba->recover_port);
++ 	cancel_work_sync(&phba->sess_work);
++ 
++ 	beiscsi_iface_destroy_default(phba);
++ 	iscsi_host_remove(phba->shost);
++ 	beiscsi_disable_port(phba, 1);
++ 
++ 	/* after cancelling boot_work */
++ 	iscsi_boot_destroy_kset(phba->boot_struct.boot_kset);
++ 
++ 	/* free all resources */
++ 	destroy_workqueue(phba->wq);
++ 	beiscsi_cleanup_port(phba);
++ 	beiscsi_free_mem(phba);
++ 
++ 	/* ctrl uninit */
++ 	beiscsi_unmap_pci_function(phba);
++ 	pci_free_consistent(phba->pcidev,
++ 			    phba->ctrl.mbox_mem_alloced.size,
++ 			    phba->ctrl.mbox_mem_alloced.va,
++ 			    phba->ctrl.mbox_mem_alloced.dma);
++ 
++ 	pci_dev_put(phba->pcidev);
++ 	iscsi_host_free(phba->shost);
++ 	pci_disable_pcie_error_reporting(pcidev);
++ 	pci_set_drvdata(pcidev, NULL);
++ 	pci_release_regions(pcidev);
++ 	pci_disable_device(pcidev);
++ }
++ 
++ 
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  static struct pci_error_handlers beiscsi_eeh_handlers = {
+  	.error_detected = beiscsi_eeh_err_detected,
+  	.slot_reset = beiscsi_eeh_reset,
+diff --cc drivers/scsi/be2iscsi/be_main.h
+index 90cdc10c01fb,953d94a84f9c..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@@ -417,12 -392,33 +417,24 @@@ struct beiscsi_hba 
+  		unsigned long ulp_supported;
+  	} fw_config;
+  
+ -	unsigned long state;
+ -#define BEISCSI_HBA_ONLINE	0
+ -#define BEISCSI_HBA_LINK_UP	1
+ -#define BEISCSI_HBA_BOOT_FOUND	2
+ -#define BEISCSI_HBA_BOOT_WORK	3
+ -#define BEISCSI_HBA_UER_SUPP	4
+ -#define BEISCSI_HBA_PCI_ERR	5
+ -#define BEISCSI_HBA_FW_TIMEOUT	6
+ -#define BEISCSI_HBA_IN_UE	7
+ -#define BEISCSI_HBA_IN_TPE	8
+ -
+ -/* error bits */
+ -#define BEISCSI_HBA_IN_ERR	((1 << BEISCSI_HBA_PCI_ERR) | \
+ -				 (1 << BEISCSI_HBA_FW_TIMEOUT) | \
+ -				 (1 << BEISCSI_HBA_IN_UE) | \
+ -				 (1 << BEISCSI_HBA_IN_TPE))
+ -
+ +	unsigned int state;
+  	u8 optic_state;
+++<<<<<<< HEAD
+ +	int get_boot;
+ +	bool fw_timeout;
+ +	bool ue_detected;
+ +	struct delayed_work beiscsi_hw_check_task;
+++=======
++ 	struct delayed_work eqd_update;
++ 	/* update EQ delay timer every 1000ms */
++ #define BEISCSI_EQD_UPDATE_INTERVAL	1000
++ 	struct timer_list hw_check;
++ 	/* check for UE every 1000ms */
++ #define BEISCSI_UE_DETECT_INTERVAL	1000
++ 	u32 ue2rp;
++ 	struct delayed_work recover_port;
++ 	struct work_struct sess_work;
+++>>>>>>> 10e1a44ab2bf (scsi: be2iscsi: Fail the sessions immediately after TPE)
+  
+  	bool mac_addr_set;
+  	u8 mac_address[ETH_ALEN];
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+* Unmerged path drivers/scsi/be2iscsi/be_main.h
