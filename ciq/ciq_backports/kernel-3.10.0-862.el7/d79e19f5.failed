@@ -1,0 +1,415 @@
+nfp: debug dump ethtool ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Carl Heymann <carl.heymann@netronome.com>
+commit d79e19f564bfbd8017e75878fb2a9fce0af764cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d79e19f5.failed
+
+- Skeleton code to perform a binary debug dump via ethtoolops
+  "set_dump", "get_dump_flags" and "get_dump_data", i.e. the ethtool
+  -W/w mechanism.
+- Skeleton functions for debugdump operations provided.
+- An integer "dump level" can be specified, this is stored between
+  ethtool invocations. Dump level 0 is still the "arm.diag" resource for
+  backward compatibility. Other dump levels each define a set of state
+  information to include in the dump, driven by a spec from FW.
+
+	Signed-off-by: Carl Heymann <carl.heymann@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d79e19f564bfbd8017e75878fb2a9fce0af764cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.c
+index 11612af996f5,0953fa8f3109..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@@ -44,6 -44,9 +44,11 @@@
+  #include <linux/pci.h>
+  #include <linux/firmware.h>
+  #include <linux/vermagic.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/vmalloc.h>
++ #include <net/devlink.h>
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  
+  #include "nfpcore/nfp.h"
+  #include "nfpcore/nfp_cpp.h"
+@@@ -362,8 -505,14 +367,11 @@@ static int nfp_pci_probe(struct pci_de
+  
+  	err = nfp_nsp_init(pdev, pf);
+  	if (err)
+ -		goto err_devlink_unreg;
+ -
+ -	pf->mip = nfp_mip_open(pf->cpp);
+ -	pf->rtbl = __nfp_rtsym_table_read(pf->cpp, pf->mip);
+ +		goto err_cpp_free;
+  
++ 	pf->dump_flag = NFP_DUMP_NSP_DIAG;
++ 	pf->dumpspec = nfp_net_dump_load_dumpspec(pf->cpp, pf->rtbl);
++ 
+  	err = nfp_pcie_sriov_read_nfd_limit(pf);
+  	if (err)
+  		goto err_fw_unload;
+@@@ -388,11 -545,21 +396,20 @@@ err_fw_unload
+  	if (pf->fw_loaded)
+  		nfp_fw_unload(pf);
+  	kfree(pf->eth_tbl);
+++<<<<<<< HEAD
+ +err_cpp_free:
+++=======
++ 	kfree(pf->nspi);
++ 	vfree(pf->dumpspec);
++ err_devlink_unreg:
++ 	devlink_unregister(devlink);
++ err_hwinfo_free:
++ 	kfree(pf->hwinfo);
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  	nfp_cpp_free(pf->cpp);
+  err_disable_msix:
+ -	destroy_workqueue(pf->wq);
+ -err_pci_priv_unset:
+  	pci_set_drvdata(pdev, NULL);
+ -	mutex_destroy(&pf->lock);
+ -	devlink_free(devlink);
+ +	kfree(pf);
+  err_rel_regions:
+  	pci_release_regions(pdev);
+  err_pci_disable:
+@@@ -410,6 -582,11 +427,14 @@@ static void nfp_pci_remove(struct pci_d
+  	nfp_pcie_sriov_disable(pdev);
+  	pci_sriov_set_totalvfs(pf->pdev, 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	devlink_unregister(devlink);
++ 
++ 	vfree(pf->dumpspec);
++ 	kfree(pf->rtbl);
++ 	nfp_mip_close(pf->mip);
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  	if (pf->fw_loaded)
+  		nfp_fw_unload(pf);
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,add46e28212b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -52,7 -55,24 +53,18 @@@ struct pci_dev
+  struct nfp_cpp;
+  struct nfp_cpp_area;
+  struct nfp_eth_table;
+ -struct nfp_hwinfo;
+ -struct nfp_mip;
+ -struct nfp_net;
+ -struct nfp_nsp_identify;
+ -struct nfp_port;
+ -struct nfp_rtsym_table;
+  
++ /**
++  * struct nfp_dumpspec - NFP FW dump specification structure
++  * @size:	Size of the data
++  * @data:	Sequence of TLVs, each being an instruction to dump some data
++  *		from FW
++  */
++ struct nfp_dumpspec {
++ 	u32 size;
++ 	u8 data[0];
++ };
++ 
+  /**
+   * struct nfp_pf - NFP PF-specific device structure
+   * @pdev:		Backpointer to PCI device
+@@@ -64,12 -91,24 +76,22 @@@
+   * @limit_vfs:		Number of VFs supported by firmware (~0 for PCI limit)
+   * @num_vfs:		Number of SR-IOV VFs enabled
+   * @fw_loaded:		Is the firmware loaded?
+++<<<<<<< HEAD
+++=======
++  * @ctrl_vnic:		Pointer to the control vNIC if available
++  * @mip:		MIP handle
++  * @rtbl:		RTsym table
++  * @hwinfo:		HWInfo table
++  * @dumpspec:		Debug dump specification
++  * @dump_flag:		Store dump flag between set_dump and get_dump_flag
++  * @dump_len:		Store dump length between set_dump and get_dump_flag
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+   * @eth_tbl:		NSP ETH table
+ - * @nspi:		NSP identification info
+ - * @hwmon_dev:		pointer to hwmon device
+   * @ddir:		Per-device debugfs directory
+ - * @max_data_vnics:	Number of data vNICs app firmware supports
+ - * @num_vnics:		Number of vNICs spawned
+ - * @vnics:		Linked list of vNIC structures (struct nfp_net)
+ - * @ports:		Linked list of port structures (struct nfp_port)
+ - * @wq:			Workqueue for running works which need to grab @lock
+ + * @num_ports:		Number of adapter ports
+ + * @ports:		Linked list of port structures (struct nfp_net)
+ + * @port_lock:		Protects @ports, @num_ports, @num_netdevs
+   * @port_refresh_work:	Work entry for taking netdevs out
+ - * @lock:		Protects all fields which may change after probe
+   */
+  struct nfp_pf {
+  	struct pci_dev *pdev;
+@@@ -87,7 -134,18 +109,18 @@@
+  
+  	bool fw_loaded;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct nfp_net *ctrl_vnic;
++ 
++ 	const struct nfp_mip *mip;
++ 	struct nfp_rtsym_table *rtbl;
++ 	struct nfp_hwinfo *hwinfo;
++ 	struct nfp_dumpspec *dumpspec;
++ 	u32 dump_flag;
++ 	u32 dump_len;
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  	struct nfp_eth_table *eth_tbl;
+ -	struct nfp_nsp_identify *nspi;
+ -
+ -	struct device *hwmon_dev;
+  
+  	struct dentry *ddir;
+  
+@@@ -102,4 -166,24 +135,25 @@@ extern struct pci_driver nfp_netvf_pci_
+  int nfp_net_pci_probe(struct nfp_pf *pf);
+  void nfp_net_pci_remove(struct nfp_pf *pf);
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_hwmon_register(struct nfp_pf *pf);
++ void nfp_hwmon_unregister(struct nfp_pf *pf);
++ 
++ void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port);
++ 
++ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
++ 
++ enum nfp_dump_diag {
++ 	NFP_DUMP_NSP_DIAG = 0,
++ };
++ 
++ struct nfp_dumpspec *
++ nfp_net_dump_load_dumpspec(struct nfp_cpp *cpp, struct nfp_rtsym_table *rtbl);
++ s64 nfp_net_dump_calculate_size(struct nfp_pf *pf, struct nfp_dumpspec *spec,
++ 				u32 flag);
++ int nfp_net_dump_populate_buffer(struct nfp_pf *pf, struct nfp_dumpspec *spec,
++ 				 struct ethtool_dump *dump_param, void *dest);
++ 
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  #endif /* NFP_MAIN_H */
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 69f458e0de89,2cde0eb00ee3..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -48,20 -49,15 +48,30 @@@
+  #include <linux/ethtool.h>
+  
+  #include "nfpcore/nfp.h"
+++<<<<<<< HEAD
+ +#include "nfpcore/nfp_nsp_eth.h"
+++=======
++ #include "nfpcore/nfp_nsp.h"
++ #include "nfp_app.h"
++ #include "nfp_main.h"
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+ -#include "nfp_port.h"
+  
+++<<<<<<< HEAD
+ +enum nfp_dump_diag {
+ +	NFP_DUMP_NSP_DIAG = 0,
+ +};
+ +
+ +/* Support for stats. Returns netdev, driver, and device stats */
+ +enum { NETDEV_ET_STATS, NFP_NET_DRV_ET_STATS, NFP_NET_DEV_ET_STATS };
+ +struct _nfp_net_et_stats {
+++=======
++ struct nfp_et_stat {
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  	char name[ETH_GSTRING_LEN];
+ +	int type;
+ +	int sz;
+  	int off;
+  };
+  
+@@@ -715,32 -1063,72 +725,88 @@@ exit_release
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int nfp_net_set_dump(struct net_device *netdev, struct ethtool_dump *val)
+ +{
+ +	struct nfp_net *nn = netdev_priv(netdev);
+++=======
++ /* Set the dump flag/level. Calculate the dump length for flag > 0 only (new TLV
++  * based dumps), since flag 0 (default) calculates the length in
++  * nfp_app_get_dump_flag(), and we need to support triggering a level 0 dump
++  * without setting the flag first, for backward compatibility.
++  */
++ static int nfp_app_set_dump(struct net_device *netdev, struct ethtool_dump *val)
++ {
++ 	struct nfp_app *app = nfp_app_from_netdev(netdev);
++ 	s64 len;
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  
+ -	if (!app)
+ +	if (!nn->cpp)
+  		return -EOPNOTSUPP;
+  
+- 	if (val->flag != NFP_DUMP_NSP_DIAG)
+- 		return -EINVAL;
++ 	if (val->flag == NFP_DUMP_NSP_DIAG) {
++ 		app->pf->dump_flag = val->flag;
++ 		return 0;
++ 	}
++ 
++ 	if (!app->pf->dumpspec)
++ 		return -EOPNOTSUPP;
++ 
++ 	len = nfp_net_dump_calculate_size(app->pf, app->pf->dumpspec,
++ 					  val->flag);
++ 	if (len < 0)
++ 		return len;
++ 
++ 	app->pf->dump_flag = val->flag;
++ 	app->pf->dump_len = len;
+  
+ +	nn->ethtool_dump_flag = val->flag;
+ +
+  	return 0;
+  }
+  
+  static int
+ -nfp_app_get_dump_flag(struct net_device *netdev, struct ethtool_dump *dump)
+ +nfp_net_get_dump_flag(struct net_device *netdev, struct ethtool_dump *dump)
+  {
+++<<<<<<< HEAD
+ +	return nfp_dump_nsp_diag(netdev_priv(netdev), dump, NULL);
+++=======
++ 	struct nfp_app *app = nfp_app_from_netdev(netdev);
++ 
++ 	if (!app)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (app->pf->dump_flag == NFP_DUMP_NSP_DIAG)
++ 		return nfp_dump_nsp_diag(app, dump, NULL);
++ 
++ 	dump->flag = app->pf->dump_flag;
++ 	dump->len = app->pf->dump_len;
++ 
++ 	return 0;
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  }
+  
+  static int
+ -nfp_app_get_dump_data(struct net_device *netdev, struct ethtool_dump *dump,
+ +nfp_net_get_dump_data(struct net_device *netdev, struct ethtool_dump *dump,
+  		      void *buffer)
+  {
+++<<<<<<< HEAD
+ +	return nfp_dump_nsp_diag(netdev_priv(netdev), dump, buffer);
+++=======
++ 	struct nfp_app *app = nfp_app_from_netdev(netdev);
++ 
++ 	if (!app)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (app->pf->dump_flag == NFP_DUMP_NSP_DIAG)
++ 		return nfp_dump_nsp_diag(app, dump, buffer);
++ 
++ 	dump->flag = app->pf->dump_flag;
++ 	dump->len = app->pf->dump_len;
++ 
++ 	return nfp_net_dump_populate_buffer(app->pf, app->pf->dumpspec, dump,
++ 					    buffer);
+++>>>>>>> d79e19f564bf (nfp: debug dump ethtool ops)
+  }
+  
+  static int nfp_net_set_coalesce(struct net_device *netdev,
+diff --git a/drivers/net/ethernet/netronome/nfp/Makefile b/drivers/net/ethernet/netronome/nfp/Makefile
+index a30f2e651180..87596b128015 100644
+--- a/drivers/net/ethernet/netronome/nfp/Makefile
++++ b/drivers/net/ethernet/netronome/nfp/Makefile
+@@ -16,6 +16,7 @@ nfp-objs := \
+ 	    nfpcore/nfp_target.o \
+ 	    nfp_main.o \
+ 	    nfp_net_common.o \
++	    nfp_net_debugdump.o \
+ 	    nfp_net_ethtool.o \
+ 	    nfp_net_main.o \
+ 	    nfp_netvf_main.o
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c b/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c
+new file mode 100644
+index 000000000000..a7061b6c609d
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_debugdump.c
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 2017 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/ethtool.h>
++
++#include "nfp_main.h"
++
++struct nfp_dumpspec *
++nfp_net_dump_load_dumpspec(struct nfp_cpp *cpp, struct nfp_rtsym_table *rtbl)
++{
++	return NULL;
++}
++
++s64 nfp_net_dump_calculate_size(struct nfp_pf *pf, struct nfp_dumpspec *spec,
++				u32 flag)
++{
++	return -EOPNOTSUPP;
++}
++
++int nfp_net_dump_populate_buffer(struct nfp_pf *pf, struct nfp_dumpspec *spec,
++				 struct ethtool_dump *dump_param, void *dest)
++{
++	return -EOPNOTSUPP;
++}
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
