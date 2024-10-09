@@ -1,0 +1,1111 @@
+tcmu: allow max block and global max blocks to be settable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 80eb876138a1adc7d30831ce275ea744c050d97e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/80eb8761.failed
+
+Users might have a physical system to a target so they could
+have a lot more than 2 gigs of memory they want to devote to
+tcmu. OTOH, we could be running in a vm and so a 2 gig
+global and 1 gig per dev limit might be too high. This patch
+allows the user to specify the limits.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 80eb876138a1adc7d30831ce275ea744c050d97e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5b22226ed5d2,bac08bc72e3b..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -61,17 -67,32 +61,41 @@@
+   * this may have a 'UAM' comment.
+   */
+  
+ +
+  #define TCMU_TIME_OUT (30 * MSEC_PER_SEC)
+  
+ -/* For cmd area, the size is fixed 8MB */
+ -#define CMDR_SIZE (8 * 1024 * 1024)
+ +#define DATA_BLOCK_BITS 2048
+ +#define DATA_BLOCK_SIZE 4096
+ +
+++<<<<<<< HEAD
+ +#define CMDR_SIZE (16 * 4096)
+ +#define DATA_SIZE (DATA_BLOCK_BITS * DATA_BLOCK_SIZE)
+ +
+ +#define TCMU_RING_SIZE (CMDR_SIZE + DATA_SIZE)
+  
+++=======
++ /*
++  * For data area, the block size is PAGE_SIZE and
++  * the total size is 256K * PAGE_SIZE.
++  */
++ #define DATA_BLOCK_SIZE PAGE_SIZE
++ #define DATA_BLOCK_SHIFT PAGE_SHIFT
++ #define DATA_BLOCK_BITS_DEF (256 * 1024)
++ #define DATA_SIZE (DATA_BLOCK_BITS * DATA_BLOCK_SIZE)
++ 
++ #define TCMU_MBS_TO_BLOCKS(_mbs) (_mbs << (20 - DATA_BLOCK_SHIFT))
++ #define TCMU_BLOCKS_TO_MBS(_blocks) (_blocks >> (20 - DATA_BLOCK_SHIFT))
++ 
++ /* The total size of the ring is 8M + 256K * PAGE_SIZE */
++ #define TCMU_RING_SIZE (CMDR_SIZE + DATA_SIZE)
++ 
++ /*
++  * Default number of global data blocks(512K * PAGE_SIZE)
++  * when the unmap thread will be started.
++  */
++ #define TCMU_GLOBAL_MAX_BLOCKS_DEF (512 * 1024)
++ 
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  static u8 tcmu_kern_cmd_reply_supported;
+  
+  static struct device *tcmu_root_device;
+@@@ -110,19 -135,27 +134,31 @@@ struct tcmu_dev 
+  	/* Must add data_off and mb_addr to get the address */
+  	size_t data_off;
+  	size_t data_size;
++ 	uint32_t max_blocks;
++ 	size_t ring_size;
+  
+++<<<<<<< HEAD
+ +	DECLARE_BITMAP(data_bitmap, DATA_BLOCK_BITS);
+ +
+ +	wait_queue_head_t wait_cmdr;
+ +	/* TODO should this be a mutex? */
+ +	spinlock_t cmdr_lock;
+++=======
++ 	struct mutex cmdr_lock;
++ 	struct list_head cmdr_queue;
++ 
++ 	uint32_t dbi_max;
++ 	uint32_t dbi_thresh;
++ 	unsigned long *data_bitmap;
++ 	struct radix_tree_root data_blocks;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  
+  	struct idr commands;
+ +	spinlock_t commands_lock;
+  
+ -	struct timer_list cmd_timer;
+ +	struct timer_list timeout;
+  	unsigned int cmd_time_out;
+  
+ -	struct timer_list qfull_timer;
+ -	int qfull_time_out;
+ -
+ -	struct list_head timedout_entry;
+ -
+  	spinlock_t nl_cmd_lock;
+  	struct tcmu_nl_cmd curr_nl_cmd;
+  	/* wake up threads waiting on curr_nl_cmd */
+@@@ -150,12 -188,68 +186,74 @@@ struct tcmu_cmd 
+  #define TCMU_CMD_BIT_EXPIRED 0
+  	unsigned long flags;
+  };
+++<<<<<<< HEAD
+++=======
++ /*
++  * To avoid dead lock the mutex lock order should always be:
++  *
++  * mutex_lock(&root_udev_mutex);
++  * ...
++  * mutex_lock(&tcmu_dev->cmdr_lock);
++  * mutex_unlock(&tcmu_dev->cmdr_lock);
++  * ...
++  * mutex_unlock(&root_udev_mutex);
++  */
++ static DEFINE_MUTEX(root_udev_mutex);
++ static LIST_HEAD(root_udev);
++ 
++ static DEFINE_SPINLOCK(timed_out_udevs_lock);
++ static LIST_HEAD(timed_out_udevs);
+  
+  static struct kmem_cache *tcmu_cmd_cache;
+  
++ static atomic_t global_db_count = ATOMIC_INIT(0);
++ static struct delayed_work tcmu_unmap_work;
++ static int tcmu_global_max_blocks = TCMU_GLOBAL_MAX_BLOCKS_DEF;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
++ 
++ static int tcmu_set_global_max_data_area(const char *str,
++ 					 const struct kernel_param *kp)
++ {
++ 	int ret, max_area_mb;
++ 
++ 	ret = kstrtoint(str, 10, &max_area_mb);
++ 	if (ret)
++ 		return -EINVAL;
++ 
++ 	if (max_area_mb <= 0) {
++ 		pr_err("global_max_data_area must be larger than 0.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	tcmu_global_max_blocks = TCMU_MBS_TO_BLOCKS(max_area_mb);
++ 	if (atomic_read(&global_db_count) > tcmu_global_max_blocks)
++ 		schedule_delayed_work(&tcmu_unmap_work, 0);
++ 	else
++ 		cancel_delayed_work_sync(&tcmu_unmap_work);
++ 
++ 	return 0;
++ }
++ 
++ static int tcmu_get_global_max_data_area(char *buffer,
++ 					 const struct kernel_param *kp)
++ {
++ 	return sprintf(buffer, "%d", TCMU_BLOCKS_TO_MBS(tcmu_global_max_blocks));
++ }
++ 
++ static const struct kernel_param_ops tcmu_global_max_data_area_op = {
++ 	.set = tcmu_set_global_max_data_area,
++ 	.get = tcmu_get_global_max_data_area,
++ };
++ 
++ module_param_cb(global_max_data_area_mb, &tcmu_global_max_data_area_op, NULL,
++ 		S_IWUSR | S_IRUGO);
++ MODULE_PARM_DESC(global_max_data_area_mb,
++ 		 "Max MBs allowed to be allocated to all the tcmu device's "
++ 		 "data areas.");
++ 
+ +static DEFINE_IDR(devices_idr);
+ +static DEFINE_MUTEX(device_mutex);
+ +
+  /* multicast group */
+  enum tcmu_multicast_groups {
+  	TCMU_MCGRP_CONFIG,
+@@@ -288,6 -383,105 +386,108 @@@ static struct genl_family tcmu_genl_fam
+  	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define tcmu_cmd_set_dbi_cur(cmd, index) ((cmd)->dbi_cur = (index))
++ #define tcmu_cmd_reset_dbi_cur(cmd) tcmu_cmd_set_dbi_cur(cmd, 0)
++ #define tcmu_cmd_set_dbi(cmd, index) ((cmd)->dbi[(cmd)->dbi_cur++] = (index))
++ #define tcmu_cmd_get_dbi(cmd) ((cmd)->dbi[(cmd)->dbi_cur++])
++ 
++ static void tcmu_cmd_free_data(struct tcmu_cmd *tcmu_cmd, uint32_t len)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	uint32_t i;
++ 
++ 	for (i = 0; i < len; i++)
++ 		clear_bit(tcmu_cmd->dbi[i], udev->data_bitmap);
++ }
++ 
++ static inline bool tcmu_get_empty_block(struct tcmu_dev *udev,
++ 					struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct page *page;
++ 	int ret, dbi;
++ 
++ 	dbi = find_first_zero_bit(udev->data_bitmap, udev->dbi_thresh);
++ 	if (dbi == udev->dbi_thresh)
++ 		return false;
++ 
++ 	page = radix_tree_lookup(&udev->data_blocks, dbi);
++ 	if (!page) {
++ 		if (atomic_add_return(1, &global_db_count) >
++ 				      tcmu_global_max_blocks)
++ 			schedule_delayed_work(&tcmu_unmap_work, 0);
++ 
++ 		/* try to get new page from the mm */
++ 		page = alloc_page(GFP_KERNEL);
++ 		if (!page)
++ 			goto err_alloc;
++ 
++ 		ret = radix_tree_insert(&udev->data_blocks, dbi, page);
++ 		if (ret)
++ 			goto err_insert;
++ 	}
++ 
++ 	if (dbi > udev->dbi_max)
++ 		udev->dbi_max = dbi;
++ 
++ 	set_bit(dbi, udev->data_bitmap);
++ 	tcmu_cmd_set_dbi(tcmu_cmd, dbi);
++ 
++ 	return true;
++ err_insert:
++ 	__free_page(page);
++ err_alloc:
++ 	atomic_dec(&global_db_count);
++ 	return false;
++ }
++ 
++ static bool tcmu_get_empty_blocks(struct tcmu_dev *udev,
++ 				  struct tcmu_cmd *tcmu_cmd)
++ {
++ 	int i;
++ 
++ 	for (i = tcmu_cmd->dbi_cur; i < tcmu_cmd->dbi_cnt; i++) {
++ 		if (!tcmu_get_empty_block(udev, tcmu_cmd))
++ 			return false;
++ 	}
++ 	return true;
++ }
++ 
++ static inline struct page *
++ tcmu_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
++ {
++ 	return radix_tree_lookup(&udev->data_blocks, dbi);
++ }
++ 
++ static inline void tcmu_free_cmd(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	kfree(tcmu_cmd->dbi);
++ 	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
++ }
++ 
++ static inline size_t tcmu_cmd_get_data_length(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
++ 	size_t data_length = round_up(se_cmd->data_length, DATA_BLOCK_SIZE);
++ 
++ 	if (se_cmd->se_cmd_flags & SCF_BIDI) {
++ 		BUG_ON(!(se_cmd->t_bidi_data_sg && se_cmd->t_bidi_data_nents));
++ 		data_length += round_up(se_cmd->t_bidi_data_sg->length,
++ 				DATA_BLOCK_SIZE);
++ 	}
++ 
++ 	return data_length;
++ }
++ 
++ static inline uint32_t tcmu_cmd_get_block_cnt(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	size_t data_length = tcmu_cmd_get_data_length(tcmu_cmd);
++ 
++ 	return data_length / DATA_BLOCK_SIZE;
++ }
++ 
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
+  {
+  	struct se_device *se_dev = se_cmd->se_dev;
+@@@ -511,18 -750,116 +711,37 @@@ static bool is_ring_space_avail(struct 
+  		return false;
+  	}
+  
+++<<<<<<< HEAD
+ +	space = spc_bitmap_free(udev->data_bitmap);
+ +	if (space < data_needed) {
+ +		pr_debug("no data space: only %zu available, but ask for %zu\n",
+ +				space, data_needed);
+ +		return false;
+++=======
++ 	/* try to check and get the data blocks as needed */
++ 	space = spc_bitmap_free(udev->data_bitmap, udev->dbi_thresh);
++ 	if ((space * DATA_BLOCK_SIZE) < data_needed) {
++ 		unsigned long blocks_left =
++ 				(udev->max_blocks - udev->dbi_thresh) + space;
++ 
++ 		if (blocks_left < blocks_needed) {
++ 			pr_debug("no data space: only %lu available, but ask for %zu\n",
++ 					blocks_left * DATA_BLOCK_SIZE,
++ 					data_needed);
++ 			return false;
++ 		}
++ 
++ 		udev->dbi_thresh += blocks_needed;
++ 		if (udev->dbi_thresh > udev->max_blocks)
++ 			udev->dbi_thresh = udev->max_blocks;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  	}
+  
+ -	return tcmu_get_empty_blocks(udev, cmd);
+ -}
+ -
+ -static inline size_t tcmu_cmd_get_base_cmd_size(size_t iov_cnt)
+ -{
+ -	return max(offsetof(struct tcmu_cmd_entry, req.iov[iov_cnt]),
+ -			sizeof(struct tcmu_cmd_entry));
+ -}
+ -
+ -static inline size_t tcmu_cmd_get_cmd_size(struct tcmu_cmd *tcmu_cmd,
+ -					   size_t base_command_size)
+ -{
+ -	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+ -	size_t command_size;
+ -
+ -	command_size = base_command_size +
+ -		round_up(scsi_command_size(se_cmd->t_task_cdb),
+ -				TCMU_OP_ALIGN_SIZE);
+ -
+ -	WARN_ON(command_size & (TCMU_OP_ALIGN_SIZE-1));
+ -
+ -	return command_size;
+ -}
+ -
+ -static int tcmu_setup_cmd_timer(struct tcmu_cmd *tcmu_cmd, unsigned int tmo,
+ -				struct timer_list *timer)
+ -{
+ -	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+ -	int cmd_id;
+ -
+ -	if (tcmu_cmd->cmd_id)
+ -		goto setup_timer;
+ -
+ -	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 1, USHRT_MAX, GFP_NOWAIT);
+ -	if (cmd_id < 0) {
+ -		pr_err("tcmu: Could not allocate cmd id.\n");
+ -		return cmd_id;
+ -	}
+ -	tcmu_cmd->cmd_id = cmd_id;
+ -
+ -	pr_debug("allocated cmd %u for dev %s tmo %lu\n", tcmu_cmd->cmd_id,
+ -		 udev->name, tmo / MSEC_PER_SEC);
+ -
+ -setup_timer:
+ -	if (!tmo)
+ -		return 0;
+ -
+ -	tcmu_cmd->deadline = round_jiffies_up(jiffies + msecs_to_jiffies(tmo));
+ -	mod_timer(timer, tcmu_cmd->deadline);
+ -	return 0;
+ -}
+ -
+ -static int add_to_cmdr_queue(struct tcmu_cmd *tcmu_cmd)
+ -{
+ -	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+ -	unsigned int tmo;
+ -	int ret;
+ -
+ -	/*
+ -	 * For backwards compat if qfull_time_out is not set use
+ -	 * cmd_time_out and if that's not set use the default time out.
+ -	 */
+ -	if (!udev->qfull_time_out)
+ -		return -ETIMEDOUT;
+ -	else if (udev->qfull_time_out > 0)
+ -		tmo = udev->qfull_time_out;
+ -	else if (udev->cmd_time_out)
+ -		tmo = udev->cmd_time_out;
+ -	else
+ -		tmo = TCMU_TIME_OUT;
+ -
+ -	ret = tcmu_setup_cmd_timer(tcmu_cmd, tmo, &udev->qfull_timer);
+ -	if (ret)
+ -		return ret;
+ -
+ -	list_add_tail(&tcmu_cmd->cmdr_queue_entry, &udev->cmdr_queue);
+ -	pr_debug("adding cmd %u on dev %s to ring space wait queue\n",
+ -		 tcmu_cmd->cmd_id, udev->name);
+ -	return 0;
+ +	return true;
+  }
+  
+ -/**
+ - * queue_cmd_ring - queue cmd to ring or internally
+ - * @tcmu_cmd: cmd to queue
+ - * @scsi_err: TCM error code if failure (-1) returned.
+ - *
+ - * Returns:
+ - * -1 we cannot queue internally or to the ring.
+ - *  0 success
+ - *  1 internally queued to wait for ring memory to free.
+ - */
+ -static sense_reason_t queue_cmd_ring(struct tcmu_cmd *tcmu_cmd, int *scsi_err)
+ +static sense_reason_t
+ +tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
+  {
+  	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -798,12 -1112,20 +1017,25 @@@ static unsigned int tcmu_handle_complet
+  		handled++;
+  	}
+  
+ -	if (mb->cmd_tail == mb->cmd_head) {
+ -		/* no more pending commands */
+ -		del_timer(&udev->cmd_timer);
+ +	if (mb->cmd_tail == mb->cmd_head)
+ +		del_timer(&udev->timeout); /* no more pending cmds */
+ +
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&udev->cmdr_lock, flags);
+  
+ +	wake_up(&udev->wait_cmdr);
+++=======
++ 		if (list_empty(&udev->cmdr_queue)) {
++ 			/*
++ 			 * no more pending or waiting commands so try to
++ 			 * reclaim blocks if needed.
++ 			 */
++ 			if (atomic_read(&global_db_count) >
++ 			    tcmu_global_max_blocks)
++ 				schedule_delayed_work(&tcmu_unmap_work, 0);
++ 		}
++ 	}
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  
+  	return handled;
+  }
+@@@ -881,15 -1239,17 +1113,20 @@@ static struct se_device *tcmu_alloc_dev
+  
+  	udev->hba = hba;
+  	udev->cmd_time_out = TCMU_TIME_OUT;
+ -	udev->qfull_time_out = -1;
+  
+++<<<<<<< HEAD
+ +	init_waitqueue_head(&udev->wait_cmdr);
+ +	spin_lock_init(&udev->cmdr_lock);
+++=======
++ 	udev->max_blocks = DATA_BLOCK_BITS_DEF;
++ 	mutex_init(&udev->cmdr_lock);
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  
+ -	INIT_LIST_HEAD(&udev->timedout_entry);
+ -	INIT_LIST_HEAD(&udev->cmdr_queue);
+  	idr_init(&udev->commands);
+ +	spin_lock_init(&udev->commands_lock);
+  
+ -	timer_setup(&udev->qfull_timer, tcmu_qfull_timedout, 0);
+ -	timer_setup(&udev->cmd_timer, tcmu_cmd_timedout, 0);
+ +	setup_timer(&udev->timeout, tcmu_device_timedout,
+ +		(unsigned long)udev);
+  
+  	init_waitqueue_head(&udev->nl_cmd_wq);
+  	spin_lock_init(&udev->nl_cmd_lock);
+@@@ -923,9 -1339,63 +1160,67 @@@ static int tcmu_find_mem_index(struct v
+  	return -1;
+  }
+  
+ -static struct page *tcmu_try_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
+ +static int tcmu_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+++<<<<<<< HEAD
+ +	struct tcmu_dev *udev = vma->vm_private_data;
+++=======
++ 	struct page *page;
++ 	int ret;
++ 
++ 	mutex_lock(&udev->cmdr_lock);
++ 	page = tcmu_get_block_page(udev, dbi);
++ 	if (likely(page)) {
++ 		mutex_unlock(&udev->cmdr_lock);
++ 		return page;
++ 	}
++ 
++ 	/*
++ 	 * Normally it shouldn't be here:
++ 	 * Only when the userspace has touched the blocks which
++ 	 * are out of the tcmu_cmd's data iov[], and will return
++ 	 * one zeroed page.
++ 	 */
++ 	pr_warn("Block(%u) out of cmd's iov[] has been touched!\n", dbi);
++ 	pr_warn("Mostly it will be a bug of userspace, please have a check!\n");
++ 
++ 	if (dbi >= udev->dbi_thresh) {
++ 		/* Extern the udev->dbi_thresh to dbi + 1 */
++ 		udev->dbi_thresh = dbi + 1;
++ 		udev->dbi_max = dbi;
++ 	}
++ 
++ 	page = radix_tree_lookup(&udev->data_blocks, dbi);
++ 	if (!page) {
++ 		page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++ 		if (!page) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			return NULL;
++ 		}
++ 
++ 		ret = radix_tree_insert(&udev->data_blocks, dbi, page);
++ 		if (ret) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			__free_page(page);
++ 			return NULL;
++ 		}
++ 
++ 		/*
++ 		 * Since this case is rare in page fault routine, here we
++ 		 * will allow the global_db_count >= tcmu_global_max_blocks
++ 		 * to reduce possible page fault call trace.
++ 		 */
++ 		atomic_inc(&global_db_count);
++ 	}
++ 	mutex_unlock(&udev->cmdr_lock);
++ 
++ 	return page;
++ }
++ 
++ static int tcmu_vma_fault(struct vm_fault *vmf)
++ {
++ 	struct tcmu_dev *udev = vmf->vma->vm_private_data;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  	struct uio_info *info = &udev->uio_info;
+  	struct page *page;
+  	unsigned long offset;
+@@@ -984,6 -1466,72 +1279,75 @@@ static int tcmu_open(struct uio_info *i
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcmu_dev_call_rcu(struct rcu_head *p)
++ {
++ 	struct se_device *dev = container_of(p, struct se_device, rcu_head);
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
++ 	kfree(udev->uio_info.name);
++ 	kfree(udev->name);
++ 	kfree(udev);
++ }
++ 
++ static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
++ {
++ 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
++ 		kmem_cache_free(tcmu_cmd_cache, cmd);
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static void tcmu_blocks_release(struct radix_tree_root *blocks,
++ 				int start, int end)
++ {
++ 	int i;
++ 	struct page *page;
++ 
++ 	for (i = start; i < end; i++) {
++ 		page = radix_tree_delete(blocks, i);
++ 		if (page) {
++ 			__free_page(page);
++ 			atomic_dec(&global_db_count);
++ 		}
++ 	}
++ }
++ 
++ static void tcmu_dev_kref_release(struct kref *kref)
++ {
++ 	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, kref);
++ 	struct se_device *dev = &udev->se_dev;
++ 	struct tcmu_cmd *cmd;
++ 	bool all_expired = true;
++ 	int i;
++ 
++ 	vfree(udev->mb_addr);
++ 	udev->mb_addr = NULL;
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	if (!list_empty(&udev->timedout_entry))
++ 		list_del(&udev->timedout_entry);
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 	/* Upper layer should drain all requests before calling this */
++ 	mutex_lock(&udev->cmdr_lock);
++ 	idr_for_each_entry(&udev->commands, cmd, i) {
++ 		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
++ 			all_expired = false;
++ 	}
++ 	idr_destroy(&udev->commands);
++ 	WARN_ON(!all_expired);
++ 
++ 	tcmu_blocks_release(&udev->data_blocks, 0, udev->dbi_max + 1);
++ 	kfree(udev->data_bitmap);
++ 	mutex_unlock(&udev->cmdr_lock);
++ 
++ 	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
++ }
++ 
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  static int tcmu_release(struct uio_info *info, struct inode *inode)
+  {
+  	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+@@@ -1119,9 -1683,32 +1483,34 @@@ static int tcmu_configure_device(struc
+  	if (udev->dev_config[0])
+  		snprintf(str + used, size - used, "/%s", udev->dev_config);
+  
+ -	/* If the old string exists, free it */
+ -	kfree(info->name);
+  	info->name = str;
+  
+++<<<<<<< HEAD
+ +	udev->mb_addr = vzalloc(TCMU_RING_SIZE);
+++=======
++ 	return 0;
++ }
++ 
++ static int tcmu_configure_device(struct se_device *dev)
++ {
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 	struct uio_info *info;
++ 	struct tcmu_mailbox *mb;
++ 	int ret = 0;
++ 
++ 	ret = tcmu_update_uio_info(udev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	info = &udev->uio_info;
++ 
++ 	udev->data_bitmap = kzalloc(BITS_TO_LONGS(udev->max_blocks) *
++ 				    sizeof(unsigned long), GFP_KERNEL);
++ 	if (!udev->data_bitmap)
++ 		goto err_bitmap_alloc;
++ 
++ 	udev->mb_addr = vzalloc(CMDR_SIZE);
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  	if (!udev->mb_addr) {
+  		ret = -ENOMEM;
+  		goto err_vzalloc;
+@@@ -1130,8 -1717,10 +1519,13 @@@
+  	/* mailbox fits in first part of CMDR space */
+  	udev->cmdr_size = CMDR_SIZE - CMDR_OFF;
+  	udev->data_off = CMDR_SIZE;
+++<<<<<<< HEAD
+ +	udev->data_size = TCMU_RING_SIZE - CMDR_SIZE;
+++=======
++ 	udev->data_size = udev->max_blocks * DATA_BLOCK_SIZE;
++ 	udev->dbi_thresh = 0; /* Default in Idle state */
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  
+ -	/* Initialise the mailbox of the ring buffer */
+  	mb = udev->mb_addr;
+  	mb->version = TCMU_MAILBOX_VERSION;
+  	mb->flags = TCMU_MAILBOX_FLAG_CAP_OOOC;
+@@@ -1146,8 -1735,8 +1540,13 @@@
+  
+  	info->mem[0].name = "tcm-user command & data buffer";
+  	info->mem[0].addr = (phys_addr_t)(uintptr_t)udev->mb_addr;
+++<<<<<<< HEAD
+ +	info->mem[0].size = TCMU_RING_SIZE;
+ +	info->mem[0].memtype = UIO_MEM_VIRTUAL;
+++=======
++ 	info->mem[0].size = udev->ring_size = udev->data_size + CMDR_SIZE;
++ 	info->mem[0].memtype = UIO_MEM_NONE;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  
+  	info->irqcontrol = tcmu_irqcontrol;
+  	info->irq = UIO_IRQ_CUSTOM;
+@@@ -1178,12 -1785,14 +1577,15 @@@ err_netlink
+  	uio_unregister_device(&udev->uio_info);
+  err_register:
+  	vfree(udev->mb_addr);
+ -	udev->mb_addr = NULL;
+  err_vzalloc:
++ 	kfree(udev->data_bitmap);
++ 	udev->data_bitmap = NULL;
++ err_bitmap_alloc:
+  	kfree(info->name);
+ -	info->name = NULL;
+ +err_kmalloc:
+ +	mutex_lock(&device_mutex);
+ +	idr_remove(&devices_idr, udev->dev_index);
+ +	mutex_unlock(&device_mutex);
+  
+  	return ret;
+  }
+@@@ -1245,7 -1831,7 +1647,11 @@@ static void tcmu_destroy_device(struct 
+  
+  enum {
+  	Opt_dev_config, Opt_dev_size, Opt_hw_block_size, Opt_hw_max_sectors,
+++<<<<<<< HEAD
+ +	Opt_err,
+++=======
++ 	Opt_nl_reply_supported, Opt_max_data_area_mb, Opt_err,
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  };
+  
+  static match_table_t tokens = {
+@@@ -1253,6 -1839,8 +1659,11 @@@
+  	{Opt_dev_size, "dev_size=%u"},
+  	{Opt_hw_block_size, "hw_block_size=%u"},
+  	{Opt_hw_max_sectors, "hw_max_sectors=%u"},
+++<<<<<<< HEAD
+++=======
++ 	{Opt_nl_reply_supported, "nl_reply_supported=%d"},
++ 	{Opt_max_data_area_mb, "max_data_area_mb=%u"},
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  	{Opt_err, NULL}
+  };
+  
+@@@ -1327,6 -1915,50 +1738,53 @@@ static ssize_t tcmu_set_configfs_dev_pa
+  			ret = tcmu_set_dev_attrib(&args[0],
+  					&(dev->dev_attrib.hw_max_sectors));
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case Opt_nl_reply_supported:
++ 			arg_p = match_strdup(&args[0]);
++ 			if (!arg_p) {
++ 				ret = -ENOMEM;
++ 				break;
++ 			}
++ 			ret = kstrtoint(arg_p, 0, &udev->nl_reply_supported);
++ 			kfree(arg_p);
++ 			if (ret < 0)
++ 				pr_err("kstrtoint() failed for nl_reply_supported=\n");
++ 			break;
++ 		case Opt_max_data_area_mb:
++ 			if (dev->export_count) {
++ 				pr_err("Unable to set max_data_area_mb while exports exist\n");
++ 				ret = -EINVAL;
++ 				break;
++ 			}
++ 
++ 			arg_p = match_strdup(&args[0]);
++ 			if (!arg_p) {
++ 				ret = -ENOMEM;
++ 				break;
++ 			}
++ 			ret = kstrtoint(arg_p, 0, &tmpval);
++ 			kfree(arg_p);
++ 			if (ret < 0) {
++ 				pr_err("kstrtoint() failed for max_data_area_mb=\n");
++ 				break;
++ 			}
++ 
++ 			if (tmpval <= 0) {
++ 				pr_err("Invalid max_data_area %d\n", tmpval);
++ 				ret = -EINVAL;
++ 				break;
++ 			}
++ 
++ 			udev->max_blocks = TCMU_MBS_TO_BLOCKS(tmpval);
++ 			if (udev->max_blocks > tcmu_global_max_blocks) {
++ 				pr_err("%d is too large. Adjusting max_data_area_mb to global limit of %u\n",
++ 				       tmpval,
++ 				       TCMU_BLOCKS_TO_MBS(tcmu_global_max_blocks));
++ 				udev->max_blocks = tcmu_global_max_blocks;
++ 			}
++ 			break;
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  		default:
+  			break;
+  		}
+@@@ -1456,26 -2030,204 +1916,201 @@@ static ssize_t tcmu_dev_store_attr_cmd_
+  	udev->cmd_time_out = val * MSEC_PER_SEC;
+  	return count;
+  }
+ -CONFIGFS_ATTR(tcmu_, cmd_time_out);
+ +TB_DEV_ATTR(tcmu, cmd_time_out, S_IRUGO | S_IWUSR);
+  
+ -static ssize_t tcmu_qfull_time_out_show(struct config_item *item, char *page)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -						struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+ +TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+  
+ -	return snprintf(page, PAGE_SIZE, "%ld\n", udev->qfull_time_out <= 0 ?
+ -			udev->qfull_time_out :
+ -			udev->qfull_time_out / MSEC_PER_SEC);
+ -}
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_block_size);
+ +TB_DEV_ATTR_RO(tcmu, hw_block_size);
+  
+ -static ssize_t tcmu_qfull_time_out_store(struct config_item *item,
+ -					 const char *page, size_t count)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -					struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ -	s32 val;
+ -	int ret;
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_max_sectors);
+ +TB_DEV_ATTR_RO(tcmu, hw_max_sectors);
+  
+ -	ret = kstrtos32(page, 0, &val);
+ -	if (ret < 0)
+ -		return ret;
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_queue_depth);
+ +TB_DEV_ATTR_RO(tcmu, hw_queue_depth);
+  
+++<<<<<<< HEAD
+ +static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
+ +	&tcmu_dev_attrib_hw_pi_prot_type.attr,
+ +	&tcmu_dev_attrib_hw_block_size.attr,
+ +	&tcmu_dev_attrib_hw_max_sectors.attr,
+ +	&tcmu_dev_attrib_hw_queue_depth.attr,
+ +	&tcmu_dev_attrib_cmd_time_out.attr,
+++=======
++ 	if (val >= 0) {
++ 		udev->qfull_time_out = val * MSEC_PER_SEC;
++ 	} else {
++ 		printk(KERN_ERR "Invalid qfull timeout value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, qfull_time_out);
++ 
++ static ssize_t tcmu_max_data_area_mb_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%u\n",
++ 			TCMU_BLOCKS_TO_MBS(udev->max_blocks));
++ }
++ CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
++ 
++ static ssize_t tcmu_dev_config_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%s\n", udev->dev_config);
++ }
++ 
++ static ssize_t tcmu_dev_config_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	int ret, len;
++ 
++ 	len = strlen(page);
++ 	if (!len || len > TCMU_CONFIG_LEN - 1)
++ 		return -EINVAL;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_DEV_CFG, page);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 		strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 		ret = tcmu_update_uio_info(udev);
++ 		if (ret)
++ 			return ret;
++ 		return count;
++ 	}
++ 	strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_config);
++ 
++ static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%zu\n", udev->dev_size);
++ }
++ 
++ static ssize_t tcmu_dev_size_store(struct config_item *item, const char *page,
++ 				   size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u64 val;
++ 	int ret;
++ 
++ 	ret = kstrtou64(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_DEV_SIZE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 	udev->dev_size = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_size);
++ 
++ static ssize_t tcmu_nl_reply_supported_show(struct config_item *item,
++ 		char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%d\n", udev->nl_reply_supported);
++ }
++ 
++ static ssize_t tcmu_nl_reply_supported_store(struct config_item *item,
++ 		const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	s8 val;
++ 	int ret;
++ 
++ 	ret = kstrtos8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	udev->nl_reply_supported = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, nl_reply_supported);
++ 
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_WRITECACHE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
++ 
++ static struct configfs_attribute *tcmu_attrib_attrs[] = {
++ 	&tcmu_attr_cmd_time_out,
++ 	&tcmu_attr_qfull_time_out,
++ 	&tcmu_attr_max_data_area_mb,
++ 	&tcmu_attr_dev_config,
++ 	&tcmu_attr_dev_size,
++ 	&tcmu_attr_emulate_write_cache,
++ 	&tcmu_attr_nl_reply_supported,
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  	NULL,
+  };
+  
+@@@ -1494,12 -2248,98 +2129,101 @@@ static struct se_subsystem_api tcmu_tem
+  	.show_configfs_dev_params = tcmu_show_configfs_dev_params,
+  	.get_device_type	= sbc_get_device_type,
+  	.get_blocks		= tcmu_get_blocks,
+ -	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	u32 start, end, block, total_freed = 0;
++ 
++ 	if (atomic_read(&global_db_count) <= tcmu_global_max_blocks)
++ 		return;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs in idle */
++ 		if (!udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so it is not possible
++ 			 * reclaim any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		total_freed += end - start;
++ 		pr_debug("Freed %u blocks (total %u) from %s.\n", end - start,
++ 			 total_freed, udev->name);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ 
++ 	if (atomic_read(&global_db_count) > tcmu_global_max_blocks)
++ 		schedule_delayed_work(&tcmu_unmap_work, msecs_to_jiffies(5000));
++ }
++ 
++ static void check_timedout_devices(void)
++ {
++ 	struct tcmu_dev *udev, *tmp_dev;
++ 	LIST_HEAD(devs);
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	list_splice_init(&timed_out_udevs, &devs);
++ 
++ 	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
++ 		list_del_init(&udev->timedout_entry);
++ 		spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 		mutex_lock(&udev->cmdr_lock);
++ 		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		spin_lock_bh(&timed_out_udevs_lock);
++ 	}
++ 
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ }
++ 
++ static void tcmu_unmap_work_fn(struct work_struct *work)
++ {
++ 	check_timedout_devices();
++ 	find_free_blocks();
++ }
++ 
+++>>>>>>> 80eb876138a1 (tcmu: allow max block and global max blocks to be settable)
+  static int __init tcmu_module_init(void)
+  {
+ -	int ret, i, k, len = 0;
+ +	struct target_backend_cits *tbc = &tcmu_template.tb_cits;
+ +	int ret;
+  
+  	BUILD_BUG_ON((sizeof(struct tcmu_cmd_entry) % TCMU_OP_ALIGN_SIZE) != 0);
+  
+* Unmerged path drivers/target/target_core_user.c
