@@ -1124,8 +1124,8 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 #endif
 	}
 	/* Done for now */
-	napi_complete_done(napi, done);
-	mlx4_en_arm_cq(priv, cq);
+	if (napi_complete_done(napi, done))
+		mlx4_en_arm_cq(priv, cq);
 	return done;
 }
 
