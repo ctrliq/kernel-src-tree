@@ -1,0 +1,1089 @@
+scsi: be2iscsi: Fix to make boot discovery non-blocking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fix to make boot discovery non-blocking (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 94.23%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 50a4b824be9e4a01f3b87790865e26b1546fcbb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/50a4b824.failed
+
+Boot work involves:
+1. Find and fetch configured boot session and its handle.
+2. Attempt to open the session if its not.
+3. Get the session details for boot kset creation.
+4. Logout of that session owned by FW.
+5. Create boot kset for session details.
+
+All these actions were done in blocking call with retries in global wq.
+Other works in wq suffered if the IOCTLs stalled or timed out.
+
+This change moves all the boot work to make it non-blocking.
+The work queued in global wq just issues the IOCTL depending on the action
+to be taken and mcc wq schedules work depending on status of the IOCTL.
+Initial boot_work is started on link and ASYNC event.
+
+The other code changes move all boot related functions in one place and
+follow naming conventions.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 50a4b824be9e4a01f3b87790865e26b1546fcbb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_cmds.c
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/be2iscsi/be_main.h
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index 403296239ae9,27d10cee0c40..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -145,22 -211,19 +211,16 @@@ int beiscsi_mccq_compl_wait(struct beis
+  			    struct be_dma_mem *mbx_cmd_mem)
+  {
+  	int rc = 0;
+- 	uint32_t mcc_tag_status;
+- 	uint16_t status = 0, addl_status = 0, wrb_num = 0;
+- 	struct be_mcc_wrb *temp_wrb;
+- 	struct be_cmd_req_hdr *mbx_hdr;
+- 	struct be_cmd_resp_hdr *mbx_resp_hdr;
+- 	struct be_queue_info *mccq = &phba->ctrl.mcc_obj.q;
+  
+ -	if (beiscsi_hba_in_error(phba)) {
+ -		clear_bit(MCC_TAG_STATE_RUNNING,
+ -			  &phba->ctrl.ptag_state[tag].tag_state);
+ -		return -EIO;
+ -	}
+ +	if (beiscsi_error(phba))
+ +		return -EPERM;
+  
+  	/* wait for the mccq completion */
+- 	rc = wait_event_interruptible_timeout(
+- 				phba->ctrl.mcc_wait[tag],
+- 				phba->ctrl.mcc_tag_status[tag],
+- 				msecs_to_jiffies(
+- 				BEISCSI_HOST_MBX_TIMEOUT));
++ 	rc = wait_event_interruptible_timeout(phba->ctrl.mcc_wait[tag],
++ 					      phba->ctrl.mcc_tag_status[tag],
++ 					      msecs_to_jiffies(
++ 						BEISCSI_HOST_MBX_TIMEOUT));
++ 
+  	/**
+  	 * If MBOX cmd timeout expired, tag and resource allocated
+  	 * for cmd is not freed until FW returns completion.
+@@@ -315,8 -338,9 +335,14 @@@ static void beiscsi_process_async_link(
+  	 * This has been newly introduced in SKH-R Firmware 10.0.338.45.
+  	 **/
+  	if (evt->port_link_status & BE_ASYNC_LINK_UP_MASK) {
+++<<<<<<< HEAD
+ +		phba->state = BE_ADAPTER_LINK_UP | BE_ADAPTER_CHECK_BOOT;
+ +		phba->get_boot = BE_GET_BOOT_RETRIES;
+++=======
++ 		set_bit(BEISCSI_HBA_LINK_UP, &phba->state);
++ 		if (test_bit(BEISCSI_HBA_BOOT_FOUND, &phba->state))
++ 			beiscsi_start_boot_work(phba, BE_BOOT_INVALID_SHANDLE);
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  		__beiscsi_log(phba, KERN_ERR,
+  			      "BC_%d : Link Up on Port %d tag 0x%x\n",
+  			      evt->physical_port, evt->event_tag);
+@@@ -406,8 -430,8 +432,13 @@@ void beiscsi_process_async_event(struc
+  		beiscsi_process_async_link(phba, compl);
+  		break;
+  	case ASYNC_EVENT_CODE_ISCSI:
+++<<<<<<< HEAD
+ +		phba->state |= BE_ADAPTER_CHECK_BOOT;
+ +		phba->get_boot = BE_GET_BOOT_RETRIES;
+++=======
++ 		if (test_bit(BEISCSI_HBA_BOOT_FOUND, &phba->state))
++ 			beiscsi_start_boot_work(phba, BE_BOOT_INVALID_SHANDLE);
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  		sev = KERN_ERR;
+  		break;
+  	case ASYNC_EVENT_CODE_SLI:
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 8e3a0f9d2ac4,eb4ce17a683d..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -4301,150 -4166,6 +4155,153 @@@ static void hwi_disable_intr(struct bei
+  			    "BM_%d : In hwi_disable_intr, Already Disabled\n");
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * beiscsi_get_boot_info()- Get the boot session info
+ + * @phba: The device priv structure instance
+ + *
+ + * Get the boot target info and store in driver priv structure
+ + *
+ + * return values
+ + *	Success: 0
+ + *	Failure: Non-Zero Value
+ + **/
+ +static int beiscsi_get_boot_info(struct beiscsi_hba *phba)
+ +{
+ +	struct be_cmd_get_session_resp *session_resp;
+ +	struct be_dma_mem nonemb_cmd;
+ +	unsigned int tag;
+ +	unsigned int s_handle;
+ +	int ret = -ENOMEM;
+ +
+ +	/* Get the session handle of the boot target */
+ +	ret = be_mgmt_get_boot_shandle(phba, &s_handle);
+ +	if (ret) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BM_%d : No boot session\n");
+ +
+ +		if (ret == -ENXIO)
+ +			phba->get_boot = 0;
+ +
+ +
+ +		return ret;
+ +	}
+ +	phba->get_boot = 0;
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(*session_resp),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "beiscsi_get_session_info\n");
+ +
+ +		return -ENOMEM;
+ +	}
+ +
+ +	memset(nonemb_cmd.va, 0, sizeof(*session_resp));
+ +	tag = mgmt_get_session_info(phba, s_handle,
+ +				    &nonemb_cmd);
+ +	if (!tag) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BM_%d : beiscsi_get_session_info"
+ +			    " Failed\n");
+ +
+ +		goto boot_freemem;
+ +	}
+ +
+ +	ret = beiscsi_mccq_compl_wait(phba, tag, NULL, &nonemb_cmd);
+ +	if (ret) {
+ +		beiscsi_log(phba, KERN_ERR,
+ +			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+ +			    "BM_%d : beiscsi_get_session_info Failed");
+ +
+ +		if (ret != -EBUSY)
+ +			goto boot_freemem;
+ +		else
+ +			return ret;
+ +	}
+ +
+ +	session_resp = nonemb_cmd.va ;
+ +
+ +	memcpy(&phba->boot_sess, &session_resp->session_info,
+ +	       sizeof(struct mgmt_session_info));
+ +
+ +	 beiscsi_logout_fw_sess(phba,
+ +				phba->boot_sess.session_handle);
+ +	ret = 0;
+ +
+ +boot_freemem:
+ +	pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+ +		    nonemb_cmd.va, nonemb_cmd.dma);
+ +	return ret;
+ +}
+ +
+ +static void beiscsi_boot_release(void *data)
+ +{
+ +	struct beiscsi_hba *phba = data;
+ +
+ +	scsi_host_put(phba->shost);
+ +}
+ +
+ +static int beiscsi_setup_boot_info(struct beiscsi_hba *phba)
+ +{
+ +	struct iscsi_boot_kobj *boot_kobj;
+ +
+ +	/* it has been created previously */
+ +	if (phba->boot_kset)
+ +		return 0;
+ +
+ +	/* get boot info using mgmt cmd */
+ +	if (beiscsi_get_boot_info(phba))
+ +		/* Try to see if we can carry on without this */
+ +		return 0;
+ +
+ +	phba->boot_kset = iscsi_boot_create_host_kset(phba->shost->host_no);
+ +	if (!phba->boot_kset)
+ +		return -ENOMEM;
+ +
+ +	/* get a ref because the show function will ref the phba */
+ +	if (!scsi_host_get(phba->shost))
+ +		goto free_kset;
+ +	boot_kobj = iscsi_boot_create_target(phba->boot_kset, 0, phba,
+ +					     beiscsi_show_boot_tgt_info,
+ +					     beiscsi_tgt_get_attr_visibility,
+ +					     beiscsi_boot_release);
+ +	if (!boot_kobj)
+ +		goto put_shost;
+ +
+ +	if (!scsi_host_get(phba->shost))
+ +		goto free_kset;
+ +	boot_kobj = iscsi_boot_create_initiator(phba->boot_kset, 0, phba,
+ +						beiscsi_show_boot_ini_info,
+ +						beiscsi_ini_get_attr_visibility,
+ +						beiscsi_boot_release);
+ +	if (!boot_kobj)
+ +		goto put_shost;
+ +
+ +	if (!scsi_host_get(phba->shost))
+ +		goto free_kset;
+ +	boot_kobj = iscsi_boot_create_ethernet(phba->boot_kset, 0, phba,
+ +					       beiscsi_show_boot_eth_info,
+ +					       beiscsi_eth_get_attr_visibility,
+ +					       beiscsi_boot_release);
+ +	if (!boot_kobj)
+ +		goto put_shost;
+ +	return 0;
+ +
+ +put_shost:
+ +	scsi_host_put(phba->shost);
+ +free_kset:
+ +	iscsi_boot_destroy_kset(phba->boot_kset);
+ +	phba->boot_kset = NULL;
+ +	return -ENOMEM;
+ +}
+ +
+++=======
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  static int beiscsi_init_port(struct beiscsi_hba *phba)
+  {
+  	int ret;
+@@@ -5307,10 -5035,12 +5165,15 @@@ static void beiscsi_remove(struct pci_d
+  		return;
+  	}
+  
+ -	clear_bit(BEISCSI_HBA_RUNNING, &phba->state);
+  	beiscsi_iface_destroy_default(phba);
+- 	iscsi_boot_destroy_kset(phba->boot_kset);
+  	iscsi_host_remove(phba->shost);
+++<<<<<<< HEAD
+ +	beiscsi_quiesce(phba, BEISCSI_CLEAN_UNLOAD);
+++=======
++ 	beiscsi_quiesce(phba);
++ 	/* after cancelling boot_work */
++ 	iscsi_boot_destroy_kset(phba->boot_struct.boot_kset);
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  	pci_dev_put(phba->pcidev);
+  	iscsi_host_free(phba->shost);
+  	pci_disable_pcie_error_reporting(pcidev);
+@@@ -5385,14 -5393,6 +5523,17 @@@ static void be_eqd_update(struct beiscs
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void be_check_boot_session(struct beiscsi_hba *phba)
+ +{
+ +	if (beiscsi_setup_boot_info(phba))
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+ +			    "BM_%d : Could not set up "
+ +			    "iSCSI boot info on async event.\n");
+ +}
+ +
+++=======
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  /*
+   * beiscsi_hw_health_check()- Check adapter health
+   * @work: work item to check HW health
+@@@ -5408,17 -5408,6 +5549,20 @@@ beiscsi_hw_health_check(struct work_str
+  
+  	be_eqd_update(phba);
+  
+++<<<<<<< HEAD
+ +	if (phba->state & BE_ADAPTER_CHECK_BOOT) {
+ +		if ((phba->get_boot > 0) && (!phba->boot_kset)) {
+ +			phba->get_boot--;
+ +			if (!(phba->get_boot % BE_GET_BOOT_TO))
+ +				be_check_boot_session(phba);
+ +		} else {
+ +			phba->state &= ~BE_ADAPTER_CHECK_BOOT;
+ +			phba->get_boot = 0;
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  	beiscsi_ue_detect(phba);
+  
+  	schedule_delayed_work(&phba->beiscsi_hw_check_task,
+diff --cc drivers/scsi/be2iscsi/be_main.h
+index 90cdc10c01fb,780c3fc16ec6..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@@ -96,22 -96,6 +96,25 @@@
+  #define MAX_CMD_SZ			65536
+  #define IIOC_SCSI_DATA                  0x05	/* Write Operation */
+  
+++<<<<<<< HEAD
+ +#define INVALID_SESS_HANDLE	0xFFFFFFFF
+ +
+ +/**
+ + * Adapter States
+ + **/
+ +#define BE_ADAPTER_LINK_UP	0x001
+ +#define BE_ADAPTER_LINK_DOWN	0x002
+ +#define BE_ADAPTER_PCI_ERR	0x004
+ +#define BE_ADAPTER_CHECK_BOOT	0x008
+ +
+ +
+ +#define BEISCSI_CLEAN_UNLOAD	0x01
+ +#define BEISCSI_EEH_UNLOAD	0x02
+ +
+ +#define BE_GET_BOOT_RETRIES	45
+ +#define BE_GET_BOOT_TO		20
+++=======
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  /**
+   * hardware needs the async PDU buffers to be posted in multiples of 8
+   * So have atleast 8 of them by default
+@@@ -417,11 -400,20 +419,28 @@@ struct beiscsi_hba 
+  		unsigned long ulp_supported;
+  	} fw_config;
+  
+++<<<<<<< HEAD
+ +	unsigned int state;
+ +	u8 optic_state;
+ +	int get_boot;
+ +	bool fw_timeout;
+ +	bool ue_detected;
+++=======
++ 	unsigned long state;
++ #define BEISCSI_HBA_RUNNING	0
++ #define BEISCSI_HBA_LINK_UP	1
++ #define BEISCSI_HBA_BOOT_FOUND	2
++ #define BEISCSI_HBA_BOOT_WORK	3
++ #define BEISCSI_HBA_PCI_ERR	4
++ #define BEISCSI_HBA_FW_TIMEOUT	5
++ #define BEISCSI_HBA_IN_UE	6
++ /* error bits */
++ #define BEISCSI_HBA_IN_ERR	((1 << BEISCSI_HBA_PCI_ERR) | \
++ 				 (1 << BEISCSI_HBA_FW_TIMEOUT) | \
++ 				 (1 << BEISCSI_HBA_IN_UE))
++ 
++ 	u8 optic_state;
+++>>>>>>> 50a4b824be9e (scsi: be2iscsi: Fix to make boot discovery non-blocking)
+  	struct delayed_work beiscsi_hw_check_task;
+  
+  	bool mac_addr_set;
+@@@ -443,8 -434,26 +461,24 @@@
+  			struct scatterlist *sg,
+  			uint32_t num_sg, uint32_t xferlen,
+  			uint32_t writedir);
++ 	struct boot_struct {
++ 		int retry;
++ 		unsigned int tag;
++ 		unsigned int s_handle;
++ 		struct be_dma_mem nonemb_cmd;
++ 		enum {
++ 			BEISCSI_BOOT_REOPEN_SESS = 1,
++ 			BEISCSI_BOOT_GET_SHANDLE,
++ 			BEISCSI_BOOT_GET_SINFO,
++ 			BEISCSI_BOOT_LOGOUT_SESS,
++ 			BEISCSI_BOOT_CREATE_KSET,
++ 		} action;
++ 		struct mgmt_session_info boot_sess;
++ 		struct iscsi_boot_kset *boot_kset;
++ 	} boot_struct;
++ 	struct work_struct boot_work;
+  };
+  
+ -#define beiscsi_hba_in_error(phba) ((phba)->state & BEISCSI_HBA_IN_ERR)
+ -
+  struct beiscsi_session {
+  	struct pci_pool *bhs_pool;
+  };
+diff --git a/drivers/scsi/be2iscsi/be.h b/drivers/scsi/be2iscsi/be.h
+index b4770d3f9056..bdec5ee2edce 100644
+--- a/drivers/scsi/be2iscsi/be.h
++++ b/drivers/scsi/be2iscsi/be.h
+@@ -113,6 +113,8 @@ struct beiscsi_mcc_tag_state {
+ 	unsigned long tag_state;
+ #define MCC_TAG_STATE_RUNNING	1
+ #define MCC_TAG_STATE_TIMEOUT	2
++#define MCC_TAG_STATE_ASYNC	3
++	void (*cbfn)(struct beiscsi_hba *, unsigned int);
+ 	struct be_dma_mem tag_mem_state;
+ };
+ 
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index c50b74afd00a..0510b6767341 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -345,8 +345,8 @@ struct be_cmd_req_logout_fw_sess {
+ 
+ struct be_cmd_resp_logout_fw_sess {
+ 	struct be_cmd_resp_hdr hdr;	/* dw[4] */
+-#define BEISCSI_MGMT_SESSION_CLOSE 0x20
+ 	uint32_t session_status;
++#define BE_SESS_STATUS_CLOSE		0x20
+ } __packed;
+ 
+ struct mgmt_conn_login_options {
+@@ -438,8 +438,13 @@ struct be_cmd_get_boot_target_req {
+ 
+ struct be_cmd_get_boot_target_resp {
+ 	struct be_cmd_resp_hdr hdr;
+-	u32  boot_session_count;
+-	int  boot_session_handle;
++	u32 boot_session_count;
++	u32 boot_session_handle;
++/**
++ * FW returns 0xffffffff if it couldn't establish connection with
++ * configured boot target.
++ */
++#define BE_BOOT_INVALID_SHANDLE	0xffffffff
+ };
+ 
+ struct be_cmd_reopen_session_req {
+@@ -741,8 +746,13 @@ void free_mcc_wrb(struct be_ctrl_info *ctrl, unsigned int tag);
+ int be_cmd_modify_eq_delay(struct beiscsi_hba *phba, struct be_set_eqd *,
+ 			    int num);
+ int beiscsi_mccq_compl_wait(struct beiscsi_hba *phba,
+-			    uint32_t tag, struct be_mcc_wrb **wrb,
++			    unsigned int tag,
++			    struct be_mcc_wrb **wrb,
+ 			    struct be_dma_mem *mbx_cmd_mem);
++int __beiscsi_mcc_compl_status(struct beiscsi_hba *phba,
++			       unsigned int tag,
++			       struct be_mcc_wrb **wrb,
++			       struct be_dma_mem *mbx_cmd_mem);
+ /*ISCSI Functuions */
+ int be_cmd_fw_initialize(struct be_ctrl_info *ctrl);
+ int be_cmd_fw_uninit(struct be_ctrl_info *ctrl);
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+* Unmerged path drivers/scsi/be2iscsi/be_main.h
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index fa17b8e5a47c..89d1899a2bdc 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -189,120 +189,6 @@ int be_cmd_modify_eq_delay(struct beiscsi_hba *phba,
+ 	return tag;
+ }
+ 
+-/**
+- * mgmt_reopen_session()- Reopen a session based on reopen_type
+- * @phba: Device priv structure instance
+- * @reopen_type: Type of reopen_session FW should do.
+- * @sess_handle: Session Handle of the session to be re-opened
+- *
+- * return
+- *	the TAG used for MBOX Command
+- *
+- **/
+-unsigned int mgmt_reopen_session(struct beiscsi_hba *phba,
+-				  unsigned int reopen_type,
+-				  unsigned int sess_handle)
+-{
+-	struct be_ctrl_info *ctrl = &phba->ctrl;
+-	struct be_mcc_wrb *wrb;
+-	struct be_cmd_reopen_session_req *req;
+-	unsigned int tag;
+-
+-	beiscsi_log(phba, KERN_INFO,
+-		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-		    "BG_%d : In bescsi_get_boot_target\n");
+-
+-	mutex_lock(&ctrl->mbox_lock);
+-	wrb = alloc_mcc_wrb(phba, &tag);
+-	if (!wrb) {
+-		mutex_unlock(&ctrl->mbox_lock);
+-		return 0;
+-	}
+-
+-	req = embedded_payload(wrb);
+-	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+-	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+-			   OPCODE_ISCSI_INI_DRIVER_REOPEN_ALL_SESSIONS,
+-			   sizeof(struct be_cmd_reopen_session_resp));
+-
+-	/* set the reopen_type,sess_handle */
+-	req->reopen_type = reopen_type;
+-	req->session_handle = sess_handle;
+-
+-	be_mcc_notify(phba, tag);
+-	mutex_unlock(&ctrl->mbox_lock);
+-	return tag;
+-}
+-
+-unsigned int mgmt_get_boot_target(struct beiscsi_hba *phba)
+-{
+-	struct be_ctrl_info *ctrl = &phba->ctrl;
+-	struct be_mcc_wrb *wrb;
+-	struct be_cmd_get_boot_target_req *req;
+-	unsigned int tag;
+-
+-	beiscsi_log(phba, KERN_INFO,
+-		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-		    "BG_%d : In bescsi_get_boot_target\n");
+-
+-	mutex_lock(&ctrl->mbox_lock);
+-	wrb = alloc_mcc_wrb(phba, &tag);
+-	if (!wrb) {
+-		mutex_unlock(&ctrl->mbox_lock);
+-		return 0;
+-	}
+-
+-	req = embedded_payload(wrb);
+-	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+-	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+-			   OPCODE_ISCSI_INI_BOOT_GET_BOOT_TARGET,
+-			   sizeof(struct be_cmd_get_boot_target_resp));
+-
+-	be_mcc_notify(phba, tag);
+-	mutex_unlock(&ctrl->mbox_lock);
+-	return tag;
+-}
+-
+-unsigned int mgmt_get_session_info(struct beiscsi_hba *phba,
+-				   u32 boot_session_handle,
+-				   struct be_dma_mem *nonemb_cmd)
+-{
+-	struct be_ctrl_info *ctrl = &phba->ctrl;
+-	struct be_mcc_wrb *wrb;
+-	unsigned int tag;
+-	struct  be_cmd_get_session_req *req;
+-	struct be_cmd_get_session_resp *resp;
+-	struct be_sge *sge;
+-
+-	beiscsi_log(phba, KERN_INFO,
+-		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-		    "BG_%d : In beiscsi_get_session_info\n");
+-
+-	mutex_lock(&ctrl->mbox_lock);
+-	wrb = alloc_mcc_wrb(phba, &tag);
+-	if (!wrb) {
+-		mutex_unlock(&ctrl->mbox_lock);
+-		return 0;
+-	}
+-
+-	nonemb_cmd->size = sizeof(*resp);
+-	req = nonemb_cmd->va;
+-	memset(req, 0, sizeof(*req));
+-	sge = nonembedded_sgl(wrb);
+-	be_wrb_hdr_prepare(wrb, sizeof(*req), false, 1);
+-	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+-			   OPCODE_ISCSI_INI_SESSION_GET_A_SESSION,
+-			   sizeof(*resp));
+-	req->session_handle = boot_session_handle;
+-	sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
+-	sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
+-	sge->len = cpu_to_le32(nonemb_cmd->size);
+-
+-	be_mcc_notify(phba, tag);
+-	mutex_unlock(&ctrl->mbox_lock);
+-	return tag;
+-}
+-
+ /**
+  * mgmt_get_port_name()- Get port name for the function
+  * @ctrl: ptr to Ctrl Info
+@@ -1423,87 +1309,315 @@ unsigned int be_cmd_get_initname(struct beiscsi_hba *phba)
+ 	return tag;
+ }
+ 
++static void beiscsi_boot_process_compl(struct beiscsi_hba *phba,
++				       unsigned int tag)
++{
++	struct be_cmd_get_boot_target_resp *boot_resp;
++	struct be_cmd_resp_logout_fw_sess *logo_resp;
++	struct be_cmd_get_session_resp *sess_resp;
++	struct be_mcc_wrb *wrb;
++	struct boot_struct *bs;
++	int boot_work, status;
++
++	if (!test_bit(BEISCSI_HBA_BOOT_WORK, &phba->state)) {
++		__beiscsi_log(phba, KERN_ERR,
++			      "BG_%d : %s no boot work %lx\n",
++			      __func__, phba->state);
++		return;
++	}
++
++	if (phba->boot_struct.tag != tag) {
++		__beiscsi_log(phba, KERN_ERR,
++			      "BG_%d : %s tag mismatch %d:%d\n",
++			      __func__, tag, phba->boot_struct.tag);
++		return;
++	}
++	bs = &phba->boot_struct;
++	boot_work = 1;
++	status = 0;
++	switch (bs->action) {
++	case BEISCSI_BOOT_REOPEN_SESS:
++		status = __beiscsi_mcc_compl_status(phba, tag, NULL, NULL);
++		if (!status)
++			bs->action = BEISCSI_BOOT_GET_SHANDLE;
++		else
++			bs->retry--;
++		break;
++	case BEISCSI_BOOT_GET_SHANDLE:
++		status = __beiscsi_mcc_compl_status(phba, tag, &wrb, NULL);
++		if (!status) {
++			boot_resp = embedded_payload(wrb);
++			bs->s_handle = boot_resp->boot_session_handle;
++		}
++		if (bs->s_handle == BE_BOOT_INVALID_SHANDLE) {
++			bs->action = BEISCSI_BOOT_REOPEN_SESS;
++			bs->retry--;
++		} else {
++			bs->action = BEISCSI_BOOT_GET_SINFO;
++		}
++		break;
++	case BEISCSI_BOOT_GET_SINFO:
++		status = __beiscsi_mcc_compl_status(phba, tag, NULL,
++						    &bs->nonemb_cmd);
++		if (!status) {
++			sess_resp = bs->nonemb_cmd.va;
++			memcpy(&bs->boot_sess, &sess_resp->session_info,
++			       sizeof(struct mgmt_session_info));
++			bs->action = BEISCSI_BOOT_LOGOUT_SESS;
++		} else {
++			__beiscsi_log(phba, KERN_ERR,
++				      "BG_%d : get boot session info error : 0x%x\n",
++				      status);
++			boot_work = 0;
++		}
++		pci_free_consistent(phba->ctrl.pdev, bs->nonemb_cmd.size,
++				    bs->nonemb_cmd.va, bs->nonemb_cmd.dma);
++		bs->nonemb_cmd.va = NULL;
++		break;
++	case BEISCSI_BOOT_LOGOUT_SESS:
++		status = __beiscsi_mcc_compl_status(phba, tag, &wrb, NULL);
++		if (!status) {
++			logo_resp = embedded_payload(wrb);
++			if (logo_resp->session_status != BE_SESS_STATUS_CLOSE) {
++				__beiscsi_log(phba, KERN_ERR,
++					      "BG_%d : FW boot session logout error : 0x%x\n",
++					      logo_resp->session_status);
++			}
++		}
++		/* continue to create boot_kset even if logout failed? */
++		bs->action = BEISCSI_BOOT_CREATE_KSET;
++		break;
++	default:
++		break;
++	}
++
++	/* clear the tag so no other completion matches this tag */
++	bs->tag = 0;
++	if (!bs->retry) {
++		boot_work = 0;
++		__beiscsi_log(phba, KERN_ERR,
++			      "BG_%d : failed to setup boot target: status %d action %d\n",
++			      status, bs->action);
++	}
++	if (!boot_work) {
++		/* wait for next event to start boot_work */
++		clear_bit(BEISCSI_HBA_BOOT_WORK, &phba->state);
++		return;
++	}
++	schedule_work(&phba->boot_work);
++}
++
+ /**
+- * be_mgmt_get_boot_shandle()- Get the session handle
+- * @phba: device priv structure instance
+- * @s_handle: session handle returned for boot session.
++ * beiscsi_boot_logout_sess()- Logout from boot FW session
++ * @phba: Device priv structure instance
+  *
+- * Get the boot target session handle. In case of
+- * crashdump mode driver has to issue and MBX Cmd
+- * for FW to login to boot target
++ * return
++ *	the TAG used for MBOX Command
++ *
++ */
++unsigned int beiscsi_boot_logout_sess(struct beiscsi_hba *phba)
++{
++	struct be_ctrl_info *ctrl = &phba->ctrl;
++	struct be_mcc_wrb *wrb;
++	struct be_cmd_req_logout_fw_sess *req;
++	unsigned int tag;
++
++	mutex_lock(&ctrl->mbox_lock);
++	wrb = alloc_mcc_wrb(phba, &tag);
++	if (!wrb) {
++		mutex_unlock(&ctrl->mbox_lock);
++		return 0;
++	}
++
++	req = embedded_payload(wrb);
++	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
++	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
++			   OPCODE_ISCSI_INI_SESSION_LOGOUT_TARGET,
++			   sizeof(struct be_cmd_req_logout_fw_sess));
++	/* Use the session handle copied into boot_sess */
++	req->session_handle = phba->boot_struct.boot_sess.session_handle;
++
++	phba->boot_struct.tag = tag;
++	set_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state);
++	ctrl->ptag_state[tag].cbfn = beiscsi_boot_process_compl;
++
++	be_mcc_notify(phba, tag);
++	mutex_unlock(&ctrl->mbox_lock);
++
++	return tag;
++}
++/**
++ * beiscsi_boot_reopen_sess()- Reopen boot session
++ * @phba: Device priv structure instance
+  *
+  * return
+- *	Success: 0
+- *	Failure: Non-Zero value
++ *	the TAG used for MBOX Command
+  *
+  **/
+-int be_mgmt_get_boot_shandle(struct beiscsi_hba *phba,
+-			      unsigned int *s_handle)
++unsigned int beiscsi_boot_reopen_sess(struct beiscsi_hba *phba)
+ {
+-	struct be_cmd_get_boot_target_resp *boot_resp;
++	struct be_ctrl_info *ctrl = &phba->ctrl;
+ 	struct be_mcc_wrb *wrb;
++	struct be_cmd_reopen_session_req *req;
+ 	unsigned int tag;
+-	uint8_t boot_retry = 3;
+-	int rc;
+ 
+-	do {
+-		/* Get the Boot Target Session Handle and Count*/
+-		tag = mgmt_get_boot_target(phba);
+-		if (!tag) {
+-			beiscsi_log(phba, KERN_ERR,
+-				    BEISCSI_LOG_CONFIG | BEISCSI_LOG_INIT,
+-				    "BG_%d : Getting Boot Target Info Failed\n");
+-			return -EAGAIN;
+-		}
++	mutex_lock(&ctrl->mbox_lock);
++	wrb = alloc_mcc_wrb(phba, &tag);
++	if (!wrb) {
++		mutex_unlock(&ctrl->mbox_lock);
++		return 0;
++	}
+ 
+-		rc = beiscsi_mccq_compl_wait(phba, tag, &wrb, NULL);
+-		if (rc) {
+-			beiscsi_log(phba, KERN_ERR,
+-				    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-				    "BG_%d : MBX CMD get_boot_target Failed\n");
+-			return -EBUSY;
+-		}
++	req = embedded_payload(wrb);
++	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
++	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
++			   OPCODE_ISCSI_INI_DRIVER_REOPEN_ALL_SESSIONS,
++			   sizeof(struct be_cmd_reopen_session_resp));
++	req->reopen_type = BE_REOPEN_BOOT_SESSIONS;
++	req->session_handle = BE_BOOT_INVALID_SHANDLE;
+ 
+-		boot_resp = embedded_payload(wrb);
++	phba->boot_struct.tag = tag;
++	set_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state);
++	ctrl->ptag_state[tag].cbfn = beiscsi_boot_process_compl;
+ 
+-		/* Check if the there are any Boot targets configured */
+-		if (!boot_resp->boot_session_count) {
+-			beiscsi_log(phba, KERN_INFO,
+-				    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-				    "BG_%d  ;No boot targets configured\n");
+-			return -ENXIO;
+-		}
++	be_mcc_notify(phba, tag);
++	mutex_unlock(&ctrl->mbox_lock);
++	return tag;
++}
+ 
+-		/* FW returns the session handle of the boot session */
+-		if (boot_resp->boot_session_handle != INVALID_SESS_HANDLE) {
+-			*s_handle = boot_resp->boot_session_handle;
+-			return 0;
+-		}
+ 
+-		/* Issue MBX Cmd to FW to login to the boot target */
+-		tag = mgmt_reopen_session(phba, BE_REOPEN_BOOT_SESSIONS,
+-					  INVALID_SESS_HANDLE);
+-		if (!tag) {
+-			beiscsi_log(phba, KERN_ERR,
+-				    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-				    "BG_%d : mgmt_reopen_session Failed\n");
+-			return -EAGAIN;
+-		}
++/**
++ * beiscsi_boot_get_sinfo()- Get boot session info
++ * @phba: device priv structure instance
++ *
++ * Fetches the boot_struct.s_handle info from FW.
++ * return
++ *	the TAG used for MBOX Command
++ *
++ **/
++unsigned int beiscsi_boot_get_sinfo(struct beiscsi_hba *phba)
++{
++	struct be_ctrl_info *ctrl = &phba->ctrl;
++	struct be_cmd_get_session_resp *resp;
++	struct be_cmd_get_session_req *req;
++	struct be_dma_mem *nonemb_cmd;
++	struct be_mcc_wrb *wrb;
++	struct be_sge *sge;
++	unsigned int tag;
+ 
+-		rc = beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+-		if (rc) {
+-			beiscsi_log(phba, KERN_ERR,
+-				    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-				    "BG_%d : mgmt_reopen_session Failed");
+-			return rc;
+-		}
+-	} while (--boot_retry);
++	mutex_lock(&ctrl->mbox_lock);
++	wrb = alloc_mcc_wrb(phba, &tag);
++	if (!wrb) {
++		mutex_unlock(&ctrl->mbox_lock);
++		return 0;
++	}
++
++	nonemb_cmd = &phba->boot_struct.nonemb_cmd;
++	nonemb_cmd->size = sizeof(*resp);
++	nonemb_cmd->va = pci_alloc_consistent(phba->ctrl.pdev,
++					      sizeof(nonemb_cmd->size),
++					      &nonemb_cmd->dma);
++	if (!nonemb_cmd->va)
++		return 0;
++
++	req = nonemb_cmd->va;
++	memset(req, 0, sizeof(*req));
++	sge = nonembedded_sgl(wrb);
++	be_wrb_hdr_prepare(wrb, sizeof(*req), false, 1);
++	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
++			   OPCODE_ISCSI_INI_SESSION_GET_A_SESSION,
++			   sizeof(*resp));
++	req->session_handle = phba->boot_struct.s_handle;
++	sge->pa_hi = cpu_to_le32(upper_32_bits(nonemb_cmd->dma));
++	sge->pa_lo = cpu_to_le32(nonemb_cmd->dma & 0xFFFFFFFF);
++	sge->len = cpu_to_le32(nonemb_cmd->size);
++
++	phba->boot_struct.tag = tag;
++	set_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state);
++	ctrl->ptag_state[tag].cbfn = beiscsi_boot_process_compl;
+ 
+-	/* Couldn't log into the boot target */
+-	beiscsi_log(phba, KERN_ERR,
+-		    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-		    "BG_%d : Login to Boot Target Failed\n");
+-	return -ENXIO;
++	be_mcc_notify(phba, tag);
++	mutex_unlock(&ctrl->mbox_lock);
++	return tag;
++}
++
++unsigned int __beiscsi_boot_get_shandle(struct beiscsi_hba *phba, int async)
++{
++	struct be_ctrl_info *ctrl = &phba->ctrl;
++	struct be_mcc_wrb *wrb;
++	struct be_cmd_get_boot_target_req *req;
++	unsigned int tag;
++
++	mutex_lock(&ctrl->mbox_lock);
++	wrb = alloc_mcc_wrb(phba, &tag);
++	if (!wrb) {
++		mutex_unlock(&ctrl->mbox_lock);
++		return 0;
++	}
++
++	req = embedded_payload(wrb);
++	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
++	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
++			   OPCODE_ISCSI_INI_BOOT_GET_BOOT_TARGET,
++			   sizeof(struct be_cmd_get_boot_target_resp));
++
++	if (async) {
++		phba->boot_struct.tag = tag;
++		set_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state);
++		ctrl->ptag_state[tag].cbfn = beiscsi_boot_process_compl;
++	}
++
++	be_mcc_notify(phba, tag);
++	mutex_unlock(&ctrl->mbox_lock);
++	return tag;
++}
++
++/**
++ * beiscsi_boot_get_shandle()- Get boot session handle
++ * @phba: device priv structure instance
++ * @s_handle: session handle returned for boot session.
++ *
++ * return
++ *	Success: 1
++ *	Failure: negative
++ *
++ **/
++int beiscsi_boot_get_shandle(struct beiscsi_hba *phba, unsigned int *s_handle)
++{
++	struct be_cmd_get_boot_target_resp *boot_resp;
++	struct be_mcc_wrb *wrb;
++	unsigned int tag;
++	int rc;
++
++	*s_handle = BE_BOOT_INVALID_SHANDLE;
++	/* get configured boot session count and handle */
++	tag = __beiscsi_boot_get_shandle(phba, 0);
++	if (!tag) {
++		beiscsi_log(phba, KERN_ERR,
++			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_INIT,
++			    "BG_%d : Getting Boot Target Info Failed\n");
++		return -EAGAIN;
++	}
++
++	rc = beiscsi_mccq_compl_wait(phba, tag, &wrb, NULL);
++	if (rc) {
++		beiscsi_log(phba, KERN_ERR,
++			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
++			    "BG_%d : MBX CMD get_boot_target Failed\n");
++		return -EBUSY;
++	}
++
++	boot_resp = embedded_payload(wrb);
++	/* check if there are any boot targets configured */
++	if (!boot_resp->boot_session_count) {
++		__beiscsi_log(phba, KERN_INFO,
++			      "BG_%d : No boot targets configured\n");
++		return -ENXIO;
++	}
++
++	/* only if FW has logged in to the boot target, s_handle is valid */
++	*s_handle = boot_resp->boot_session_handle;
++	return 1;
+ }
+ 
+ /**
+@@ -1813,70 +1927,3 @@ void beiscsi_offload_cxn_v2(struct beiscsi_offload_params *params,
+ 		     (params->dw[offsetof(struct amap_beiscsi_offload_params,
+ 		      exp_statsn) / 32] + 1));
+ }
+-
+-/**
+- * beiscsi_logout_fw_sess()- Firmware Session Logout
+- * @phba: Device priv structure instance
+- * @fw_sess_handle: FW session handle
+- *
+- * Logout from the FW established sessions.
+- * returns
+- *  Success: 0
+- *  Failure: Non-Zero Value
+- *
+- */
+-int beiscsi_logout_fw_sess(struct beiscsi_hba *phba,
+-		uint32_t fw_sess_handle)
+-{
+-	struct be_ctrl_info *ctrl = &phba->ctrl;
+-	struct be_mcc_wrb *wrb;
+-	struct be_cmd_req_logout_fw_sess *req;
+-	struct be_cmd_resp_logout_fw_sess *resp;
+-	unsigned int tag;
+-	int rc;
+-
+-	beiscsi_log(phba, KERN_INFO,
+-		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-		    "BG_%d : In bescsi_logout_fwboot_sess\n");
+-
+-	mutex_lock(&ctrl->mbox_lock);
+-	wrb = alloc_mcc_wrb(phba, &tag);
+-	if (!wrb) {
+-		mutex_unlock(&ctrl->mbox_lock);
+-		beiscsi_log(phba, KERN_INFO,
+-			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-			    "BG_%d : MBX Tag Failure\n");
+-		return -EINVAL;
+-	}
+-
+-	req = embedded_payload(wrb);
+-	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+-	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_ISCSI_INI,
+-			   OPCODE_ISCSI_INI_SESSION_LOGOUT_TARGET,
+-			   sizeof(struct be_cmd_req_logout_fw_sess));
+-
+-	/* Set the session handle */
+-	req->session_handle = fw_sess_handle;
+-	be_mcc_notify(phba, tag);
+-	mutex_unlock(&ctrl->mbox_lock);
+-
+-	rc = beiscsi_mccq_compl_wait(phba, tag, &wrb, NULL);
+-	if (rc) {
+-		beiscsi_log(phba, KERN_ERR,
+-			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-			    "BG_%d : MBX CMD FW_SESSION_LOGOUT_TARGET Failed\n");
+-		return -EBUSY;
+-	}
+-
+-	resp = embedded_payload(wrb);
+-	if (resp->session_status !=
+-		BEISCSI_MGMT_SESSION_CLOSE) {
+-		beiscsi_log(phba, KERN_ERR,
+-			    BEISCSI_LOG_INIT | BEISCSI_LOG_CONFIG,
+-			    "BG_%d : FW_SESSION_LOGOUT_TARGET resp : 0x%x\n",
+-			    resp->session_status);
+-		rc = -EINVAL;
+-	}
+-
+-	return rc;
+-}
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.h b/drivers/scsi/be2iscsi/be_mgmt.h
+index 294b740805a6..25053483cf28 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.h
++++ b/drivers/scsi/be2iscsi/be_mgmt.h
+@@ -282,16 +282,6 @@ int beiscsi_if_en_dhcp(struct beiscsi_hba *phba, u32 ip_type);
+ int beiscsi_if_en_static(struct beiscsi_hba *phba, u32 ip_type,
+ 			 u8 *ip, u8 *subnet);
+ 
+-unsigned int mgmt_get_boot_target(struct beiscsi_hba *phba);
+-
+-unsigned int mgmt_reopen_session(struct beiscsi_hba *phba,
+-				  unsigned int reopen_type,
+-				  unsigned sess_handle);
+-
+-unsigned int mgmt_get_session_info(struct beiscsi_hba *phba,
+-				   u32 boot_session_handle,
+-				   struct be_dma_mem *nonemb_cmd);
+-
+ int mgmt_get_nic_conf(struct beiscsi_hba *phba,
+ 		      struct be_cmd_get_nic_conf_resp *mac);
+ 
+@@ -303,13 +293,20 @@ int beiscsi_if_get_gw(struct beiscsi_hba *phba, u32 ip_type,
+ 
+ int beiscsi_if_set_gw(struct beiscsi_hba *phba, u32 ip_type, u8 *gw);
+ 
+-int be_mgmt_get_boot_shandle(struct beiscsi_hba *phba,
+-			      unsigned int *s_handle);
+-
+ unsigned int beiscsi_if_get_handle(struct beiscsi_hba *phba);
+ 
+ int beiscsi_if_set_vlan(struct beiscsi_hba *phba, uint16_t vlan_tag);
+ 
++unsigned int beiscsi_boot_logout_sess(struct beiscsi_hba *phba);
++
++unsigned int beiscsi_boot_reopen_sess(struct beiscsi_hba *phba);
++
++unsigned int beiscsi_boot_get_sinfo(struct beiscsi_hba *phba);
++
++unsigned int __beiscsi_boot_get_shandle(struct beiscsi_hba *phba, int async);
++
++int beiscsi_boot_get_shandle(struct beiscsi_hba *phba, unsigned int *s_handle);
++
+ ssize_t beiscsi_drvr_ver_disp(struct device *dev,
+ 			       struct device_attribute *attr, char *buf);
+ 
