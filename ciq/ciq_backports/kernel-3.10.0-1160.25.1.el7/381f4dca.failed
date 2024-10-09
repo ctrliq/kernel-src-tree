@@ -1,0 +1,108 @@
+ipv6: clean up anycast when an interface is destroyed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.25.1.el7
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit 381f4dca48d23e155b936b86ccd3ff12f073cf0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.25.1.el7/381f4dca.failed
+
+If we try to rmmod the driver for an interface while sockets with
+setsockopt(JOIN_ANYCAST) are alive, some refcounts aren't cleaned up
+and we get stuck on:
+
+  unregister_netdevice: waiting for ens3 to become free. Usage count = 1
+
+If we LEAVE_ANYCAST/close everything before rmmod'ing, there is no
+problem.
+
+We need to perform a cleanup similar to the one for multicast in
+addrconf_ifdown(how == 1).
+
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 381f4dca48d23e155b936b86ccd3ff12f073cf0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index dd5d47eb08cd,3342ee64f2e3..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -3545,20 -3094,13 +3545,27 @@@ static int addrconf_ifdown(struct net_d
+  
+  	write_unlock_bh(&idev->lock);
+  
+++<<<<<<< HEAD
+ +	/* now clean up addresses to be removed */
+ +	while (!list_empty(&del_list)) {
+ +		ifa = list_first_entry(&del_list,
+ +				       struct inet6_ifaddr, if_list);
+ +		list_del(&ifa->if_list);
+ +
+ +		in6_ifa_put(ifa);
+ +	}
+ +
+ +	/* Step 5: Discard multicast list */
+ +	if (how)
+++=======
++ 	/* Step 5: Discard anycast and multicast list */
++ 	if (how) {
++ 		ipv6_ac_destroy_dev(idev);
+++>>>>>>> 381f4dca48d2 (ipv6: clean up anycast when an interface is destroyed)
+  		ipv6_mc_destroy_dev(idev);
+- 	else
++ 	} else {
+  		ipv6_mc_down(idev);
++ 	}
+  
+  	idev->tstamp = jiffies;
+  
+diff --git a/include/net/addrconf.h b/include/net/addrconf.h
+index 2f274aa065b6..6bfce0b8db0f 100644
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@ -269,6 +269,7 @@ void ipv6_sock_ac_close(struct sock *sk);
+ 
+ int ipv6_dev_ac_inc(struct net_device *dev, const struct in6_addr *addr);
+ int __ipv6_dev_ac_dec(struct inet6_dev *idev, const struct in6_addr *addr);
++void ipv6_ac_destroy_dev(struct inet6_dev *idev);
+ bool ipv6_chk_acast_addr(struct net *net, struct net_device *dev,
+ 				const struct in6_addr *addr);
+ 
+* Unmerged path net/ipv6/addrconf.c
+diff --git a/net/ipv6/anycast.c b/net/ipv6/anycast.c
+index b0f207a15087..9525f48b44c7 100644
+--- a/net/ipv6/anycast.c
++++ b/net/ipv6/anycast.c
+@@ -332,6 +332,27 @@ static int ipv6_dev_ac_dec(struct net_device *dev, const struct in6_addr *addr)
+ 	return __ipv6_dev_ac_dec(idev, addr);
+ }
+ 
++void ipv6_ac_destroy_dev(struct inet6_dev *idev)
++{
++	struct ifacaddr6 *aca;
++
++	write_lock_bh(&idev->lock);
++	while ((aca = idev->ac_list) != NULL) {
++		idev->ac_list = aca->aca_next;
++		write_unlock_bh(&idev->lock);
++
++		addrconf_leave_solict(idev, &aca->aca_addr);
++
++		dst_hold(&aca->aca_rt->dst);
++		ip6_del_rt(aca->aca_rt);
++
++		aca_put(aca);
++
++		write_lock_bh(&idev->lock);
++	}
++	write_unlock_bh(&idev->lock);
++}
++
+ /*
+  *	check if the interface has this anycast address
+  *	called with rcu_read_lock()
