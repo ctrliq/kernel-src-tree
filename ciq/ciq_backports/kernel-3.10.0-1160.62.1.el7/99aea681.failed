@@ -1,0 +1,141 @@
+vfs: Don't let __fdget_pos() get FMODE_PATH files
+
+jira LE-1907
+cve CVE-2021-4083
+Rebuild_History Non-Buildable kernel-3.10.0-1160.62.1.el7
+commit-author Eric Biggers <ebiggers3@gmail.com>
+commit 99aea68134f3c2a27b4d463c91cfa298c3efaccf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.62.1.el7/99aea681.failed
+
+Commit bd2a31d522344 ("get rid of fget_light()") introduced the
+__fdget_pos() function, which returns the resulting file pointer and
+fdput flags combined in an 'unsigned long'.  However, it also changed the
+behavior to return files with FMODE_PATH set, which shouldn't happen
+because read(), write(), lseek(), etc. aren't allowed on such files.
+This commit restores the old behavior.
+
+This regression actually had no effect on read() and write() since
+FMODE_READ and FMODE_WRITE are not set on file descriptors opened with
+O_PATH, but it did cause lseek() on a file descriptor opened with O_PATH
+to fail with ESPIPE rather than EBADF.
+
+	Signed-off-by: Eric Biggers <ebiggers3@gmail.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 99aea68134f3c2a27b4d463c91cfa298c3efaccf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file.c
+diff --cc fs/file.c
+index 44bd634b636a,eb56a13dab3e..000000000000
+--- a/fs/file.c
++++ b/fs/file.c
+@@@ -772,57 -683,53 +772,98 @@@ EXPORT_SYMBOL(fget_raw)
+   * The fput_needed flag returned by fget_light should be passed to the
+   * corresponding fput_light.
+   */
+ -static unsigned long __fget_light(unsigned int fd, fmode_t mask)
+ +struct file *fget_light(unsigned int fd, int *fput_needed)
+  {
+ -	struct files_struct *files = current->files;
+  	struct file *file;
+++<<<<<<< HEAD
+ +	struct files_struct *files = current->files;
+ +
+ +	*fput_needed = 0;
+ +	if (atomic_read(&files->count) == 1) {
+ +		file = fcheck_files(files, fd);
+ +		if (file && (file->f_mode & FMODE_PATH))
+ +			file = NULL;
+ +	} else {
+ +		rcu_read_lock();
+ +		file = fcheck_files(files, fd);
+ +		if (file) {
+ +			if (!(file->f_mode & FMODE_PATH) &&
+ +			    atomic_long_inc_not_zero(&file->f_count))
+ +				*fput_needed = 1;
+ +			else
+ +				/* Didn't get the reference, someone's freed */
+ +				file = NULL;
+++=======
++ 
++ 	if (atomic_read(&files->count) == 1) {
++ 		file = __fcheck_files(files, fd);
++ 		if (!file || unlikely(file->f_mode & mask))
++ 			return 0;
++ 		return (unsigned long)file;
++ 	} else {
++ 		file = __fget(fd, mask);
++ 		if (!file)
++ 			return 0;
++ 		return FDPUT_FPUT | (unsigned long)file;
++ 	}
++ }
++ unsigned long __fdget(unsigned int fd)
++ {
++ 	return __fget_light(fd, FMODE_PATH);
++ }
++ EXPORT_SYMBOL(__fdget);
++ 
++ unsigned long __fdget_raw(unsigned int fd)
++ {
++ 	return __fget_light(fd, 0);
++ }
++ 
++ unsigned long __fdget_pos(unsigned int fd)
++ {
++ 	unsigned long v = __fdget(fd);
++ 	struct file *file = (struct file *)(v & ~3);
++ 
++ 	if (file && (file->f_mode & FMODE_ATOMIC_POS)) {
++ 		if (file_count(file) > 1) {
++ 			v |= FDPUT_POS_UNLOCK;
++ 			mutex_lock(&file->f_pos_lock);
+++>>>>>>> 99aea68134f3 (vfs: Don't let __fdget_pos() get FMODE_PATH files)
+  		}
+ +		rcu_read_unlock();
+  	}
+++<<<<<<< HEAD
+++=======
++ 	return v;
++ }
+++>>>>>>> 99aea68134f3 (vfs: Don't let __fdget_pos() get FMODE_PATH files)
+  
+ -/*
+ - * We only lock f_pos if we have threads or if the file might be
+ - * shared with another process. In both cases we'll have an elevated
+ - * file count (done either by fdget() or by fork()).
+ - */
+ +	return file;
+ +}
+ +EXPORT_SYMBOL(fget_light);
+ +
+ +struct file *fget_raw_light(unsigned int fd, int *fput_needed)
+ +{
+ +	struct file *file;
+ +	struct files_struct *files = current->files;
+ +
+ +	*fput_needed = 0;
+ +	if (atomic_read(&files->count) == 1) {
+ +		file = fcheck_files(files, fd);
+ +	} else {
+ +		rcu_read_lock();
+ +		file = fcheck_files(files, fd);
+ +		if (file) {
+ +			if (atomic_long_inc_not_zero(&file->f_count))
+ +				*fput_needed = 1;
+ +			else
+ +				/* Didn't get the reference, someone's freed */
+ +				file = NULL;
+ +		}
+ +		rcu_read_unlock();
+ +	}
+ +
+ +	return file;
+ +}
+  
+  void set_close_on_exec(unsigned int fd, int flag)
+  {
+* Unmerged path fs/file.c
