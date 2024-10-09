@@ -1,0 +1,399 @@
+userfaultfd: non-cooperative: userfaultfd_remove revalidate vma in MADV_DONTNEED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 70ccb92fdd90b35bb6f9200093d4ffd6cb38156b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/70ccb92f.failed
+
+userfaultfd_remove() has to be execute before zapping the pagetables or
+UFFDIO_COPY could keep filling pages after zap_page_range returned,
+which would result in non zero data after a MADV_DONTNEED.
+
+However userfaultfd_remove() may have to release the mmap_sem.  This was
+handled correctly in MADV_REMOVE, but MADV_DONTNEED accessed a
+potentially stale vma (the very vma passed to zap_page_range(vma, ...)).
+
+The fix consists in revalidating the vma in case userfaultfd_remove()
+had to release the mmap_sem.
+
+This also optimizes away an unnecessary down_read/up_read in the
+MADV_REMOVE case if UFFD_EVENT_FORK had to be delivered.
+
+It all remains zero runtime cost in case CONFIG_USERFAULTFD=n as
+userfaultfd_remove() will be defined as "true" at build time.
+
+Link: http://lkml.kernel.org/r/20170302173738.18994-3-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Acked-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 70ccb92fdd90b35bb6f9200093d4ffd6cb38156b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/userfaultfd.c
+#	include/linux/userfaultfd_k.h
+#	mm/madvise.c
+diff --cc fs/userfaultfd.c
+index 84ef3b1b8aff,9fd5e51ffb31..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -531,6 -587,197 +531,200 @@@ static void userfaultfd_event_complete(
+  	__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
++ {
++ 	struct userfaultfd_ctx *ctx = NULL, *octx;
++ 	struct userfaultfd_fork_ctx *fctx;
++ 
++ 	octx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!octx || !(octx->features & UFFD_FEATURE_EVENT_FORK)) {
++ 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
++ 		vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
++ 		return 0;
++ 	}
++ 
++ 	list_for_each_entry(fctx, fcs, list)
++ 		if (fctx->orig == octx) {
++ 			ctx = fctx->new;
++ 			break;
++ 		}
++ 
++ 	if (!ctx) {
++ 		fctx = kmalloc(sizeof(*fctx), GFP_KERNEL);
++ 		if (!fctx)
++ 			return -ENOMEM;
++ 
++ 		ctx = kmem_cache_alloc(userfaultfd_ctx_cachep, GFP_KERNEL);
++ 		if (!ctx) {
++ 			kfree(fctx);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		atomic_set(&ctx->refcount, 1);
++ 		ctx->flags = octx->flags;
++ 		ctx->state = UFFD_STATE_RUNNING;
++ 		ctx->features = octx->features;
++ 		ctx->released = false;
++ 		ctx->mm = vma->vm_mm;
++ 		atomic_inc(&ctx->mm->mm_count);
++ 
++ 		userfaultfd_ctx_get(octx);
++ 		fctx->orig = octx;
++ 		fctx->new = ctx;
++ 		list_add_tail(&fctx->list, fcs);
++ 	}
++ 
++ 	vma->vm_userfaultfd_ctx.ctx = ctx;
++ 	return 0;
++ }
++ 
++ static void dup_fctx(struct userfaultfd_fork_ctx *fctx)
++ {
++ 	struct userfaultfd_ctx *ctx = fctx->orig;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_FORK;
++ 	ewq.msg.arg.reserved.reserved1 = (unsigned long)fctx->new;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void dup_userfaultfd_complete(struct list_head *fcs)
++ {
++ 	struct userfaultfd_fork_ctx *fctx, *n;
++ 
++ 	list_for_each_entry_safe(fctx, n, fcs, list) {
++ 		dup_fctx(fctx);
++ 		list_del(&fctx->list);
++ 		kfree(fctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 			     struct vm_userfaultfd_ctx *vm_ctx)
++ {
++ 	struct userfaultfd_ctx *ctx;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (ctx && (ctx->features & UFFD_FEATURE_EVENT_REMAP)) {
++ 		vm_ctx->ctx = ctx;
++ 		userfaultfd_ctx_get(ctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *vm_ctx,
++ 				 unsigned long from, unsigned long to,
++ 				 unsigned long len)
++ {
++ 	struct userfaultfd_ctx *ctx = vm_ctx->ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	if (!ctx)
++ 		return;
++ 
++ 	if (to & ~PAGE_MASK) {
++ 		userfaultfd_ctx_put(ctx);
++ 		return;
++ 	}
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMAP;
++ 	ewq.msg.arg.remap.from = from;
++ 	ewq.msg.arg.remap.to = to;
++ 	ewq.msg.arg.remap.len = len;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ bool userfaultfd_remove(struct vm_area_struct *vma,
++ 			unsigned long start, unsigned long end)
++ {
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	struct userfaultfd_ctx *ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_REMOVE))
++ 		return true;
++ 
++ 	userfaultfd_ctx_get(ctx);
++ 	up_read(&mm->mmap_sem);
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMOVE;
++ 	ewq.msg.arg.remove.start = start;
++ 	ewq.msg.arg.remove.end = end;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ 
++ 	return false;
++ }
++ 
++ static bool has_unmap_ctx(struct userfaultfd_ctx *ctx, struct list_head *unmaps,
++ 			  unsigned long start, unsigned long end)
++ {
++ 	struct userfaultfd_unmap_ctx *unmap_ctx;
++ 
++ 	list_for_each_entry(unmap_ctx, unmaps, list)
++ 		if (unmap_ctx->ctx == ctx && unmap_ctx->start == start &&
++ 		    unmap_ctx->end == end)
++ 			return true;
++ 
++ 	return false;
++ }
++ 
++ int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 			   unsigned long start, unsigned long end,
++ 			   struct list_head *unmaps)
++ {
++ 	for ( ; vma && vma->vm_start < end; vma = vma->vm_next) {
++ 		struct userfaultfd_unmap_ctx *unmap_ctx;
++ 		struct userfaultfd_ctx *ctx = vma->vm_userfaultfd_ctx.ctx;
++ 
++ 		if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_UNMAP) ||
++ 		    has_unmap_ctx(ctx, unmaps, start, end))
++ 			continue;
++ 
++ 		unmap_ctx = kzalloc(sizeof(*unmap_ctx), GFP_KERNEL);
++ 		if (!unmap_ctx)
++ 			return -ENOMEM;
++ 
++ 		userfaultfd_ctx_get(ctx);
++ 		unmap_ctx->ctx = ctx;
++ 		unmap_ctx->start = start;
++ 		unmap_ctx->end = end;
++ 		list_add_tail(&unmap_ctx->list, unmaps);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void userfaultfd_unmap_complete(struct mm_struct *mm, struct list_head *uf)
++ {
++ 	struct userfaultfd_unmap_ctx *ctx, *n;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	list_for_each_entry_safe(ctx, n, uf, list) {
++ 		msg_init(&ewq.msg);
++ 
++ 		ewq.msg.event = UFFD_EVENT_UNMAP;
++ 		ewq.msg.arg.remove.start = ctx->start;
++ 		ewq.msg.arg.remove.end = ctx->end;
++ 
++ 		userfaultfd_event_wait_completion(ctx->ctx, &ewq);
++ 
++ 		list_del(&ctx->list);
++ 		kfree(ctx);
++ 	}
++ }
++ 
+++>>>>>>> 70ccb92fdd90 (userfaultfd: non-cooperative: userfaultfd_remove revalidate vma in MADV_DONTNEED)
+  static int userfaultfd_release(struct inode *inode, struct file *file)
+  {
+  	struct userfaultfd_ctx *ctx = file->private_data;
+diff --cc include/linux/userfaultfd_k.h
+index 587480ad41b7,48a3483dccb1..000000000000
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@@ -53,6 -52,25 +53,28 @@@ static inline bool userfaultfd_armed(st
+  	return vma->vm_flags & (VM_UFFD_MISSING | VM_UFFD_WP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
++ extern void dup_userfaultfd_complete(struct list_head *);
++ 
++ extern void mremap_userfaultfd_prep(struct vm_area_struct *,
++ 				    struct vm_userfaultfd_ctx *);
++ extern void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *,
++ 					unsigned long from, unsigned long to,
++ 					unsigned long len);
++ 
++ extern bool userfaultfd_remove(struct vm_area_struct *vma,
++ 			       unsigned long start,
++ 			       unsigned long end);
++ 
++ extern int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 				  unsigned long start, unsigned long end,
++ 				  struct list_head *uf);
++ extern void userfaultfd_unmap_complete(struct mm_struct *mm,
++ 				       struct list_head *uf);
++ 
+++>>>>>>> 70ccb92fdd90 (userfaultfd: non-cooperative: userfaultfd_remove revalidate vma in MADV_DONTNEED)
+  #else /* CONFIG_USERFAULTFD */
+  
+  /* mm helpers */
+@@@ -80,6 -95,47 +102,50 @@@ static inline bool userfaultfd_armed(st
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int dup_userfaultfd(struct vm_area_struct *vma,
++ 				  struct list_head *l)
++ {
++ 	return 0;
++ }
++ 
++ static inline void dup_userfaultfd_complete(struct list_head *l)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 					   struct vm_userfaultfd_ctx *ctx)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *ctx,
++ 					       unsigned long from,
++ 					       unsigned long to,
++ 					       unsigned long len)
++ {
++ }
++ 
++ static inline bool userfaultfd_remove(struct vm_area_struct *vma,
++ 				      unsigned long start,
++ 				      unsigned long end)
++ {
++ 	return true;
++ }
++ 
++ static inline int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 					 unsigned long start, unsigned long end,
++ 					 struct list_head *uf)
++ {
++ 	return 0;
++ }
++ 
++ static inline void userfaultfd_unmap_complete(struct mm_struct *mm,
++ 					      struct list_head *uf)
++ {
++ }
++ 
+++>>>>>>> 70ccb92fdd90 (userfaultfd: non-cooperative: userfaultfd_remove revalidate vma in MADV_DONTNEED)
+  #endif /* CONFIG_USERFAULTFD */
+  
+  #endif /* _LINUX_USERFAULTFD_K_H */
+diff --cc mm/madvise.c
+index ba35af4c0b09,7a2abf0127ae..000000000000
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@@ -276,17 -510,47 +276,58 @@@ static long madvise_dontneed(struct vm_
+  			     unsigned long start, unsigned long end)
+  {
+  	*prev = vma;
+ -	if (!can_madv_dontneed_vma(vma))
+ +	if (vma->vm_flags & (VM_LOCKED|VM_HUGETLB|VM_PFNMAP))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(vma->vm_flags & VM_NONLINEAR)) {
+ +		struct zap_details details = {
+ +			.nonlinear_vma = vma,
+ +			.last_index = ULONG_MAX,
+ +		};
+ +		zap_page_range(vma, start, end - start, &details);
+ +	} else
+ +		zap_page_range(vma, start, end - start, NULL);
+++=======
++ 	if (!userfaultfd_remove(vma, start, end)) {
++ 		*prev = NULL; /* mmap_sem has been dropped, prev is stale */
++ 
++ 		down_read(&current->mm->mmap_sem);
++ 		vma = find_vma(current->mm, start);
++ 		if (!vma)
++ 			return -ENOMEM;
++ 		if (start < vma->vm_start) {
++ 			/*
++ 			 * This "vma" under revalidation is the one
++ 			 * with the lowest vma->vm_start where start
++ 			 * is also < vma->vm_end. If start <
++ 			 * vma->vm_start it means an hole materialized
++ 			 * in the user address space within the
++ 			 * virtual range passed to MADV_DONTNEED.
++ 			 */
++ 			return -ENOMEM;
++ 		}
++ 		if (!can_madv_dontneed_vma(vma))
++ 			return -EINVAL;
++ 		if (end > vma->vm_end) {
++ 			/*
++ 			 * Don't fail if end > vma->vm_end. If the old
++ 			 * vma was splitted while the mmap_sem was
++ 			 * released the effect of the concurrent
++ 			 * operation may not cause MADV_DONTNEED to
++ 			 * have an undefined result. There may be an
++ 			 * adjacent next vma that we'll walk
++ 			 * next. userfaultfd_remove() will generate an
++ 			 * UFFD_EVENT_REMOVE repetition on the
++ 			 * end-vma->vm_end range, but the manager can
++ 			 * handle a repetition fine.
++ 			 */
++ 			end = vma->vm_end;
++ 		}
++ 		VM_WARN_ON(start >= end);
++ 	}
++ 	zap_page_range(vma, start, end - start);
+++>>>>>>> 70ccb92fdd90 (userfaultfd: non-cooperative: userfaultfd_remove revalidate vma in MADV_DONTNEED)
+  	return 0;
+  }
+  
+* Unmerged path fs/userfaultfd.c
+* Unmerged path include/linux/userfaultfd_k.h
+* Unmerged path mm/madvise.c
