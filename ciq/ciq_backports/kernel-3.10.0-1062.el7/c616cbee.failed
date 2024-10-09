@@ -1,0 +1,141 @@
+blk-mq: punt failed direct issue to dispatch list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit c616cbee97aed4bc6178f148a7240206dcdb85a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c616cbee.failed
+
+After the direct dispatch corruption fix, we permanently disallow direct
+dispatch of non read/write requests. This works fine off the normal IO
+path, as they will be retried like any other failed direct dispatch
+request. But for the blk_insert_cloned_request() that only DM uses to
+bypass the bottom level scheduler, we always first attempt direct
+dispatch. For some types of requests, that's now a permanent failure,
+and no amount of retrying will make that succeed. This results in a
+livelock.
+
+Instead of making special cases for what we can direct issue, and now
+having to deal with DM solving the livelock while still retaining a BUSY
+condition feedback loop, always just add a request that has been through
+->queue_rq() to the hardware queue dispatch list. These are safe to use
+as no merging can take place there. Additionally, if requests do have
+prepped data from drivers, we aren't dependent on them not sharing space
+in the request structure to safely add them to the IO scheduler lists.
+
+This basically reverts ffe81d45322c and is based on a patch from Ming,
+but with the list insert case covered as well.
+
+Fixes: ffe81d45322c ("blk-mq: fix corruption with direct issue")
+	Cc: stable@vger.kernel.org
+	Suggested-by: Ming Lei <ming.lei@redhat.com>
+	Reported-by: Bart Van Assche <bvanassche@acm.org>
+	Tested-by: Ming Lei <ming.lei@redhat.com>
+	Acked-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c616cbee97aed4bc6178f148a7240206dcdb85a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 3dd6f1d72cee,6a7566244de3..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1690,11 -1709,12 +1690,16 @@@ static int __blk_mq_issue_directly(stru
+  	 */
+  	ret = q->mq_ops->queue_rq(hctx, &bd);
+  	switch (ret) {
+ -	case BLK_STS_OK:
+ +	case BLK_MQ_RQ_QUEUE_OK:
+  		blk_mq_update_dispatch_busy(hctx, false);
+ -		*cookie = new_cookie;
+  		break;
+++<<<<<<< HEAD
+ +	case BLK_MQ_RQ_QUEUE_BUSY:
+ +	case BLK_MQ_RQ_QUEUE_DEV_BUSY:
+++=======
++ 	case BLK_STS_RESOURCE:
++ 	case BLK_STS_DEV_RESOURCE:
+++>>>>>>> c616cbee97ae (blk-mq: punt failed direct issue to dispatch list)
+  		blk_mq_update_dispatch_busy(hctx, true);
+  		__blk_mq_requeue_request(rq);
+  		break;
+@@@ -1706,8 -1727,9 +1711,12 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+++=======
++ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+++>>>>>>> c616cbee97ae (blk-mq: punt failed direct issue to dispatch list)
+  						struct request *rq,
+ -						blk_qc_t *cookie,
+  						bool bypass_insert)
+  {
+  	struct request_queue *q = rq->q;
+@@@ -1737,13 -1759,13 +1746,18 @@@
+  		goto insert;
+  	}
+  
+ -	return __blk_mq_issue_directly(hctx, rq, cookie);
+ +	return __blk_mq_issue_directly(hctx, rq);
+  insert:
+  	if (bypass_insert)
+ -		return BLK_STS_RESOURCE;
+ +		return BLK_MQ_RQ_QUEUE_BUSY;
+  
+++<<<<<<< HEAD
+ +	blk_mq_sched_insert_request(rq, false, run_queue, false);
+ +	return BLK_MQ_RQ_QUEUE_OK;
+++=======
++ 	blk_mq_request_bypass_insert(rq, run_queue);
++ 	return BLK_STS_OK;
+++>>>>>>> c616cbee97ae (blk-mq: punt failed direct issue to dispatch list)
+  }
+  
+  static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+@@@ -1753,11 -1775,13 +1767,19 @@@
+  	int srcu_idx;
+  
+  	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
+ -
+  	hctx_lock(hctx, &srcu_idx);
+++<<<<<<< HEAD
+ +	ret = __blk_mq_try_issue_directly(hctx, rq, false);
+ +	if (ret == BLK_MQ_RQ_QUEUE_BUSY || ret == BLK_MQ_RQ_QUEUE_DEV_BUSY)
+ +		blk_mq_sched_insert_request(rq, false, true, false);
+ +	else if (ret != BLK_MQ_RQ_QUEUE_OK)
+++=======
++ 
++ 	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
++ 	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
++ 		blk_mq_request_bypass_insert(rq, true);
++ 	else if (ret != BLK_STS_OK)
+++>>>>>>> c616cbee97ae (blk-mq: punt failed direct issue to dispatch list)
+  		blk_mq_end_request(rq, ret);
+  
+  	hctx_unlock(hctx, srcu_idx);
+@@@ -1787,10 -1812,11 +1809,18 @@@ void blk_mq_try_issue_list_directly(str
+  
+  		list_del_init(&rq->queuelist);
+  		ret = blk_mq_request_issue_directly(rq);
+++<<<<<<< HEAD
+ +		if (ret != BLK_MQ_RQ_QUEUE_OK) {
+ +			if (ret == BLK_MQ_RQ_QUEUE_BUSY ||
+ +					ret == BLK_MQ_RQ_QUEUE_DEV_BUSY) {
+ +				list_add(&rq->queuelist, list);
+++=======
++ 		if (ret != BLK_STS_OK) {
++ 			if (ret == BLK_STS_RESOURCE ||
++ 					ret == BLK_STS_DEV_RESOURCE) {
++ 				blk_mq_request_bypass_insert(rq,
++ 							list_empty(list));
+++>>>>>>> c616cbee97ae (blk-mq: punt failed direct issue to dispatch list)
+  				break;
+  			}
+  			blk_mq_end_request(rq, ret);
+* Unmerged path block/blk-mq.c
