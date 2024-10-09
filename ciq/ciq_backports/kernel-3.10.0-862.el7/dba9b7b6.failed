@@ -1,0 +1,129 @@
+ALSA: hda - Fix doubly initialization of i915 component
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit dba9b7b6ca1af60fd21137c18795a81a5652c5ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dba9b7b6.failed
+
+In the commit fcc88d91cd36 ("ALSA: hda - Bind with i915 component
+before codec binding"), the binding with i915 audio component is moved
+to be performed always at probing the controller.  This fixed the
+potential problems on IVB, but now it brought another issue on HSW and
+BDW.  These two platforms give two individual HD-audio controllers,
+one for the analog codec on PCH and another for HDMI over gfx.  Since
+I decided to take a lazy path to check only AZX_DRIVER_PCH type in the
+commit above, now both controllers try to bind with i915, and you see
+a kernel WARNING.
+
+This patch tries to address it again properly.  Now a new DCAPS bit,
+AZX_DCAPS_I915_COMPONENT, is introduced for indicating the binding
+with i915 component in addition to the existing I915_POWERWELL bit
+flag.  Each PCI entry has to give this new flag if it requires the
+binding with i915 component.  For HSW/BDW PCH (i.e. the ones defined
+by AZX_DCAPS_INTEL_PCH) doesn't contain AZX_DCAPS_I915_COMPONENT bit
+while others have it.
+
+While we're at it, add parentheses around the bit flag check for
+avoiding possible compiler warnings, too.
+
+The bug was spotted by Intel CI tests.
+
+Fixes: fcc88d91cd36 ("ALSA: hda - Bind with i915 component before codec binding")
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=196219
+	Reported-by: Martin Peres <martin.peres@free.fr>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit dba9b7b6ca1af60fd21137c18795a81a5652c5ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/hda_intel.c
+diff --cc sound/pci/hda/hda_intel.c
+index 4ed47eae8c57,03e34edc8f24..000000000000
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@@ -1379,8 -1384,9 +1384,13 @@@ static int azx_free(struct azx *chip
+  	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL) {
+  		if (hda->need_i915_power)
+  			snd_hdac_display_power(bus, false);
+++<<<<<<< HEAD
+++=======
++ 	}
++ 	if (chip->driver_type & AZX_DCAPS_I915_COMPONENT)
+++>>>>>>> dba9b7b6ca1a (ALSA: hda - Fix doubly initialization of i915 component)
+  		snd_hdac_i915_exit(bus);
+ +	}
+  	kfree(hda);
+  
+  	return 0;
+@@@ -2196,16 -2202,8 +2206,21 @@@ static int azx_probe_continue(struct az
+  
+  	hda->probe_continued = 1;
+  
+++<<<<<<< HEAD
+ +	/* Request display power well for the HDA controller or codec. For
+ +	 * Haswell/Broadwell, both the display HDA controller and codec need
+ +	 * this power. For other platforms, like Baytrail/Braswell, only the
+ +	 * display codec needs the power and it can be released after probe.
+ +	 */
+ +	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL) {
+ +		/* HSW/BDW controllers need this power */
+ +		if (CONTROLLER_IN_GPU(pci))
+ +			hda->need_i915_power = 1;
+ +
+++=======
++ 	/* bind with i915 if needed */
++ 	if (chip->driver_caps & AZX_DCAPS_I915_COMPONENT) {
+++>>>>>>> dba9b7b6ca1a (ALSA: hda - Fix doubly initialization of i915 component)
+  		err = snd_hdac_i915_init(bus);
+  		if (err < 0) {
+  			/* if the controller is bound only with HDMI/DP
+@@@ -2217,9 -2215,23 +2232,17 @@@
+  				dev_err(chip->card->dev,
+  					"HSW/BDW HD-audio HDMI/DP requires binding with gfx driver\n");
+  				goto out_free;
+++<<<<<<< HEAD
+ +			} else
+ +				goto skip_i915;
+++=======
++ 			} else {
++ 				/* don't bother any longer */
++ 				chip->driver_caps &=
++ 					~(AZX_DCAPS_I915_COMPONENT | AZX_DCAPS_I915_POWERWELL);
++ 			}
+++>>>>>>> dba9b7b6ca1a (ALSA: hda - Fix doubly initialization of i915 component)
+  		}
+ -	}
+ -
+ -	/* Request display power well for the HDA controller or codec. For
+ -	 * Haswell/Broadwell, both the display HDA controller and codec need
+ -	 * this power. For other platforms, like Baytrail/Braswell, only the
+ -	 * display codec needs the power and it can be released after probe.
+ -	 */
+ -	if (chip->driver_caps & AZX_DCAPS_I915_POWERWELL) {
+ -		/* HSW/BDW controllers need this power */
+ -		if (CONTROLLER_IN_GPU(pci))
+ -			hda->need_i915_power = 1;
+  
+  		err = snd_hdac_display_power(bus, true);
+  		if (err < 0) {
+diff --git a/sound/pci/hda/hda_controller.h b/sound/pci/hda/hda_controller.h
+index bad56a139493..a1fa7e928f74 100644
+--- a/sound/pci/hda/hda_controller.h
++++ b/sound/pci/hda/hda_controller.h
+@@ -31,7 +31,11 @@
+ #define AZX_DCAPS_NO_MSI	(1 << 9)	/* No MSI support */
+ #define AZX_DCAPS_SNOOP_MASK	(3 << 10)	/* snoop type mask */
+ #define AZX_DCAPS_SNOOP_OFF	(1 << 12)	/* snoop default off */
+-/* 13 unused */
++#ifdef CONFIG_SND_HDA_I915
++#define AZX_DCAPS_I915_COMPONENT (1 << 13)	/* bind with i915 gfx */
++#else
++#define AZX_DCAPS_I915_COMPONENT 0		/* NOP */
++#endif
+ /* 14 unused */
+ #define AZX_DCAPS_CTX_WORKAROUND (1 << 15)	/* X-Fi workaround */
+ #define AZX_DCAPS_POSFIX_LPIB	(1 << 16)	/* Use LPIB as default */
+* Unmerged path sound/pci/hda/hda_intel.c
