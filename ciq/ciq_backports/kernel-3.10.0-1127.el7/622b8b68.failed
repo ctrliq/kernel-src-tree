@@ -1,0 +1,125 @@
+nvme: wait until all completed request's complete fn is called
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 622b8b6893ff3096e130250c1298adf57a0cab03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/622b8b68.failed
+
+When aborting in-flight request for recovering controller, we have
+to make sure that queue's complete function is called on completed
+request before moving on. Otherwise, for example, the warning of
+WARN_ON_ONCE(qp->mrs_used > 0) in ib_destroy_qp_user() may be
+triggered on nvme-rdma.
+
+Fix this issue by using blk_mq_tagset_wait_completed_request.
+
+	Cc: Max Gurtovoy <maxg@mellanox.com>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 622b8b6893ff3096e130250c1298adf57a0cab03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+#	drivers/nvme/host/tcp.c
+diff --cc drivers/nvme/host/rdma.c
+index a2ff5b88b98b,b313a60be1ca..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -887,8 -901,11 +887,16 @@@ static void nvme_rdma_teardown_admin_qu
+  {
+  	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+  	nvme_rdma_stop_queue(&ctrl->queues[0]);
+++<<<<<<< HEAD
+ +	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set, nvme_cancel_request,
+ +			&ctrl->ctrl);
+++=======
++ 	if (ctrl->ctrl.admin_tagset) {
++ 		blk_mq_tagset_busy_iter(ctrl->ctrl.admin_tagset,
++ 			nvme_cancel_request, &ctrl->ctrl);
++ 		blk_mq_tagset_wait_completed_request(ctrl->ctrl.admin_tagset);
++ 	}
+++>>>>>>> 622b8b6893ff (nvme: wait until all completed request's complete fn is called)
+  	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+  	nvme_rdma_destroy_admin_queue(ctrl, remove);
+  }
+@@@ -899,8 -916,11 +907,16 @@@ static void nvme_rdma_teardown_io_queue
+  	if (ctrl->ctrl.queue_count > 1) {
+  		nvme_stop_queues(&ctrl->ctrl);
+  		nvme_rdma_stop_io_queues(ctrl);
+++<<<<<<< HEAD
+ +		blk_mq_tagset_busy_iter(&ctrl->tag_set, nvme_cancel_request,
+ +				&ctrl->ctrl);
+++=======
++ 		if (ctrl->ctrl.tagset) {
++ 			blk_mq_tagset_busy_iter(ctrl->ctrl.tagset,
++ 				nvme_cancel_request, &ctrl->ctrl);
++ 			blk_mq_tagset_wait_completed_request(ctrl->ctrl.tagset);
++ 		}
+++>>>>>>> 622b8b6893ff (nvme: wait until all completed request's complete fn is called)
+  		if (remove)
+  			nvme_start_queues(&ctrl->ctrl);
+  		nvme_rdma_destroy_io_queues(ctrl, remove);
+* Unmerged path drivers/nvme/host/tcp.c
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 09366228ddd9..80c32a73f0b7 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2775,6 +2775,7 @@ nvme_fc_delete_association(struct nvme_fc_ctrl *ctrl)
+ 		nvme_stop_queues(&ctrl->ctrl);
+ 		blk_mq_tagset_busy_iter(&ctrl->tag_set,
+ 				nvme_fc_terminate_exchange, &ctrl->ctrl);
++		blk_mq_tagset_wait_completed_request(&ctrl->tag_set);
+ 	}
+ 
+ 	/*
+@@ -2797,6 +2798,7 @@ nvme_fc_delete_association(struct nvme_fc_ctrl *ctrl)
+ 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+ 	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
+ 				nvme_fc_terminate_exchange, &ctrl->ctrl);
++	blk_mq_tagset_wait_completed_request(&ctrl->admin_tag_set);
+ 
+ 	/* kill the aens as they are a separate path */
+ 	nvme_fc_abort_aen_ops(ctrl);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index fae1a4379aac..016b9cc33576 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2034,6 +2034,8 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 
+ 	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
+ 	blk_mq_tagset_busy_iter(&dev->admin_tagset, nvme_cancel_request, &dev->ctrl);
++	blk_mq_tagset_wait_completed_request(&dev->tagset);
++	blk_mq_tagset_wait_completed_request(&dev->admin_tagset);
+ 
+ 	/*
+ 	 * The driver will not be starting up queues again if shutting down so
+* Unmerged path drivers/nvme/host/rdma.c
+* Unmerged path drivers/nvme/host/tcp.c
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 2fc4c291a3ef..0dc986fd3b0f 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -433,6 +433,7 @@ static void nvme_loop_shutdown_ctrl(struct nvme_loop_ctrl *ctrl)
+ 		nvme_stop_queues(&ctrl->ctrl);
+ 		blk_mq_tagset_busy_iter(&ctrl->tag_set,
+ 					nvme_cancel_request, &ctrl->ctrl);
++		blk_mq_tagset_wait_completed_request(&ctrl->tag_set);
+ 		nvme_loop_destroy_io_queues(ctrl);
+ 	}
+ 
+@@ -442,6 +443,7 @@ static void nvme_loop_shutdown_ctrl(struct nvme_loop_ctrl *ctrl)
+ 	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
+ 	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
+ 				nvme_cancel_request, &ctrl->ctrl);
++	blk_mq_tagset_wait_completed_request(&ctrl->admin_tag_set);
+ 	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+ 	nvme_loop_destroy_admin_queue(ctrl);
+ }
