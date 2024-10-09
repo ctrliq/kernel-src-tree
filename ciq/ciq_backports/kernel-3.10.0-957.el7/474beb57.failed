@@ -1,0 +1,113 @@
+md/raid1,raid10: silence warning about wait-within-wait
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid1, raid10: silence warning about wait-within-wait (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.30%
+commit-author NeilBrown <neilb@suse.com>
+commit 474beb575c03e0e7f1a704ac428916898f81b3cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/474beb57.failed
+
+If you prepare_to_wait() after a previous prepare_to_wait(),
+but before calling schedule(), you get warning:
+
+  do not call blocking ops when !TASK_RUNNING; state=2
+
+This is appropriate as it is often a bug.  The event that the
+first prepare_to_wait() expects might wake up the schedule following
+the second prepare_to_wait(), which could be confusing.
+
+However if both prepare_to_wait()s are part of simple wait_event()
+loops, and if the inner one is rarely called, then there is
+no problem.  The inner loop is too simple to get confused by
+a stray wakeup, and the outer loop won't spin unduly because the
+inner doesnt affect it often.
+
+This pattern occurs in both raid1.c and raid10.c in the use of
+flush_pending_writes().
+
+The warning can be silenced by setting current->state to TASK_RUNNING.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 474beb575c03e0e7f1a704ac428916898f81b3cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid1.c
+index e54d0416ed5a,b2eae332e1a2..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -824,22 -814,21 +824,39 @@@ static void flush_pending_writes(struc
+  		bio = bio_list_get(&conf->pending_bio_list);
+  		conf->pending_count = 0;
+  		spin_unlock_irq(&conf->device_lock);
+++<<<<<<< HEAD
+ +		/* flush any pending bitmap writes to
+ +		 * disk before proceeding w/ I/O */
+ +		bitmap_unplug(conf->mddev->bitmap);
+ +		wake_up(&conf->wait_barrier);
+ +
+ +		while (bio) { /* submit pending writes */
+ +			struct bio *next = bio->bi_next;
+ +			bio->bi_next = NULL;
+ +			if (unlikely((bio->bi_rw & REQ_DISCARD) &&
+ +			    !blk_queue_discard(bdev_get_queue(bio->bi_bdev))))
+ +				/* Just ignore it */
+ +				bio_endio(bio, 0);
+ +			else
+ +				generic_make_request(bio);
+ +			bio = next;
+ +		}
+++=======
++ 
++ 		/*
++ 		 * As this is called in a wait_event() loop (see freeze_array),
++ 		 * current->state might be TASK_UNINTERRUPTIBLE which will
++ 		 * cause a warning when we prepare to wait again.  As it is
++ 		 * rare that this path is taken, it is perfectly safe to force
++ 		 * us to go around the wait_event() loop again, so the warning
++ 		 * is a false-positive.  Silence the warning by resetting
++ 		 * thread state
++ 		 */
++ 		__set_current_state(TASK_RUNNING);
++ 		blk_start_plug(&plug);
++ 		flush_bio_list(conf, bio);
++ 		blk_finish_plug(&plug);
+++>>>>>>> 474beb575c03 (md/raid1,raid10: silence warning about wait-within-wait)
+  	} else
+  		spin_unlock_irq(&conf->device_lock);
+  }
+diff --cc drivers/md/raid10.c
+index 17d84aee79e2,99c9207899a7..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -964,6 -899,20 +964,22 @@@ static void flush_pending_writes(struc
+  		bio = bio_list_get(&conf->pending_bio_list);
+  		conf->pending_count = 0;
+  		spin_unlock_irq(&conf->device_lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 		/*
++ 		 * As this is called in a wait_event() loop (see freeze_array),
++ 		 * current->state might be TASK_UNINTERRUPTIBLE which will
++ 		 * cause a warning when we prepare to wait again.  As it is
++ 		 * rare that this path is taken, it is perfectly safe to force
++ 		 * us to go around the wait_event() loop again, so the warning
++ 		 * is a false-positive. Silence the warning by resetting
++ 		 * thread state
++ 		 */
++ 		__set_current_state(TASK_RUNNING);
++ 
++ 		blk_start_plug(&plug);
+++>>>>>>> 474beb575c03 (md/raid1,raid10: silence warning about wait-within-wait)
+  		/* flush any pending bitmap writes to disk
+  		 * before proceeding w/ I/O */
+  		bitmap_unplug(conf->mddev->bitmap);
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
