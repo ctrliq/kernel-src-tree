@@ -1,0 +1,146 @@
+qed: Support dynamic s-tag change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 2a351fd9b9ffe4168409e9f6519e048581ba6a41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2a351fd9.failed
+
+In case management firmware indicates a change in the used S-tag,
+propagate the configuration to HW and FW.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2a351fd9b9ffe4168409e9f6519e048581ba6a41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_hsi.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_hsi.h
+index 60cc88a3ac01,24b1458d7aa3..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@@ -10052,7 -11474,7 +10052,11 @@@ struct public_drv_mb 
+  
+  #define DRV_MSG_CODE_BW_UPDATE_ACK		0x32000000
+  #define DRV_MSG_CODE_NIG_DRAIN			0x30000000
+++<<<<<<< HEAD
+ +#define DRV_MSG_GET_RESOURCE_ALLOC_MSG          0x34000000
+++=======
++ #define DRV_MSG_CODE_S_TAG_UPDATE_ACK		0x3b000000
+++>>>>>>> 2a351fd9b9ff (qed: Support dynamic s-tag change)
+  #define DRV_MSG_CODE_INITIATE_PF_FLR            0x02010000
+  #define DRV_MSG_CODE_VF_DISABLED_DONE		0xc0000000
+  #define DRV_MSG_CODE_CFG_VF_MSIX		0xc0010000
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_hsi.h
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.c b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index 2a6d83190c33..dbbeedc4e38b 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -898,6 +898,28 @@ static void qed_mcp_update_bw(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ 		    &param);
+ }
+ 
++static void qed_mcp_update_stag(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	struct public_func shmem_info;
++	u32 resp = 0, param = 0;
++
++	qed_mcp_get_shmem_func(p_hwfn, p_ptt, &shmem_info, MCP_PF_ID(p_hwfn));
++
++	p_hwfn->mcp_info->func_info.ovlan = (u16)shmem_info.ovlan_stag &
++						 FUNC_MF_CFG_OV_STAG_MASK;
++	p_hwfn->hw_info.ovlan = p_hwfn->mcp_info->func_info.ovlan;
++	if ((p_hwfn->hw_info.hw_mode & BIT(MODE_MF_SD)) &&
++	    (p_hwfn->hw_info.ovlan != QED_MCP_VLAN_UNSET)) {
++		qed_wr(p_hwfn, p_ptt,
++		       NIG_REG_LLH_FUNC_TAG_VALUE, p_hwfn->hw_info.ovlan);
++		qed_sp_pf_update_stag(p_hwfn);
++	}
++
++	/* Acknowledge the MFW */
++	qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_S_TAG_UPDATE_ACK, 0,
++		    &resp, &param);
++}
++
+ int qed_mcp_handle_events(struct qed_hwfn *p_hwfn,
+ 			  struct qed_ptt *p_ptt)
+ {
+@@ -953,6 +975,10 @@ int qed_mcp_handle_events(struct qed_hwfn *p_hwfn,
+ 		case MFW_DRV_MSG_BW_UPDATE:
+ 			qed_mcp_update_bw(p_hwfn, p_ptt);
+ 			break;
++		case MFW_DRV_MSG_S_TAG_UPDATE:
++			qed_mcp_update_stag(p_hwfn, p_ptt);
++			break;
++			break;
+ 		default:
+ 			DP_INFO(p_hwfn, "Unimplemented MFW message %d\n", i);
+ 			rc = -EINVAL;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+index 05026c665bb5..b742e34206ab 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+@@ -242,6 +242,8 @@
+ 	0x50196cUL
+ #define NIG_REG_LLH_CLS_TYPE_DUALMODE \
+ 	0x501964UL
++#define NIG_REG_LLH_FUNC_TAG_EN 0x5019b0UL
++#define NIG_REG_LLH_FUNC_TAG_VALUE 0x5019d0UL
+ #define NIG_REG_LLH_FUNC_FILTER_VALUE \
+ 	0x501a00UL
+ #define NIG_REG_LLH_FUNC_FILTER_VALUE_SIZE \
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sp.h b/drivers/net/ethernet/qlogic/qed/qed_sp.h
+index 6847d794bced..40f0aa3b14e5 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sp.h
+@@ -414,6 +414,15 @@ int qed_sp_pf_start(struct qed_hwfn *p_hwfn,
+ 
+ int qed_sp_pf_update(struct qed_hwfn *p_hwfn);
+ 
++/**
++ * @brief qed_sp_pf_update_stag - Update firmware of new outer tag
++ *
++ * @param p_hwfn
++ *
++ * @return int
++ */
++int qed_sp_pf_update_stag(struct qed_hwfn *p_hwfn);
++
+ /**
+  * @brief qed_sp_pf_stop - PF Function Stop Ramrod
+  *
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c b/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
+index afe0faa02f48..61a71cb4c07f 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
+@@ -520,3 +520,27 @@ int qed_sp_heartbeat_ramrod(struct qed_hwfn *p_hwfn)
+ 
+ 	return qed_spq_post(p_hwfn, p_ent, NULL);
+ }
++
++int qed_sp_pf_update_stag(struct qed_hwfn *p_hwfn)
++{
++	struct qed_spq_entry *p_ent = NULL;
++	struct qed_sp_init_data init_data;
++	int rc = -EINVAL;
++
++	/* Get SPQ entry */
++	memset(&init_data, 0, sizeof(init_data));
++	init_data.cid = qed_spq_get_cid(p_hwfn);
++	init_data.opaque_fid = p_hwfn->hw_info.opaque_fid;
++	init_data.comp_mode = QED_SPQ_MODE_CB;
++
++	rc = qed_sp_init_request(p_hwfn, &p_ent,
++				 COMMON_RAMROD_PF_UPDATE, PROTOCOLID_COMMON,
++				 &init_data);
++	if (rc)
++		return rc;
++
++	p_ent->ramrod.pf_update.update_mf_vlan_flag = true;
++	p_ent->ramrod.pf_update.mf_vlan = cpu_to_le16(p_hwfn->hw_info.ovlan);
++
++	return qed_spq_post(p_hwfn, p_ent, NULL);
++}
