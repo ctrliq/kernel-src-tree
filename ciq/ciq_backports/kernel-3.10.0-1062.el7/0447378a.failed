@@ -1,0 +1,139 @@
+kvm: vmx: Nested VM-entry prereqs for event inj.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] kvm: vmx: Nested VM-entry prereqs for event inj (Vitaly Kuznetsov) [1565739 1497611]
+Rebuild_FUZZ: 98.95%
+commit-author Marc Orr <marcorr@google.com>
+commit 0447378a4a793da008451fad50bc0f93e9675ae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0447378a.failed
+
+This patch extends the checks done prior to a nested VM entry.
+Specifically, it extends the check_vmentry_prereqs function with checks
+for fields relevant to the VM-entry event injection information, as
+described in the Intel SDM, volume 3.
+
+This patch is motivated by a syzkaller bug, where a bad VM-entry
+interruption information field is generated in the VMCS02, which causes
+the nested VM launch to fail. Then, KVM fails to resume L1.
+
+While KVM should be improved to correctly resume L1 execution after a
+failed nested launch, this change is justified because the existing code
+to resume L1 is flaky/ad-hoc and the test coverage for resuming L1 is
+sparse.
+
+	Reported-by: syzbot <syzkaller@googlegroups.com>
+	Signed-off-by: Marc Orr <marcorr@google.com>
+[Removed comment whose parts were describing previous revisions and the
+ rest was obvious from function/variable naming. - Radim]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 0447378a4a793da008451fad50bc0f93e9675ae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+#	arch/x86/kvm/x86.h
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,1689f433f3a0..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1475,6 -1689,33 +1475,36 @@@ static inline bool report_flexpriority(
+  	return flexpriority_enabled;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned nested_cpu_vmx_misc_cr3_count(struct kvm_vcpu *vcpu)
++ {
++ 	return vmx_misc_cr3_count(to_vmx(vcpu)->nested.msrs.misc_low);
++ }
++ 
++ /*
++  * Do the virtual VMX capability MSRs specify that L1 can use VMWRITE
++  * to modify any valid field of the VMCS, or are the VM-exit
++  * information fields read-only?
++  */
++ static inline bool nested_cpu_has_vmwrite_any_field(struct kvm_vcpu *vcpu)
++ {
++ 	return to_vmx(vcpu)->nested.msrs.misc_low &
++ 		MSR_IA32_VMX_MISC_VMWRITE_SHADOW_RO_FIELDS;
++ }
++ 
++ static inline bool nested_cpu_has_zero_length_injection(struct kvm_vcpu *vcpu)
++ {
++ 	return to_vmx(vcpu)->nested.msrs.misc_low & VMX_MISC_ZERO_LEN_INS;
++ }
++ 
++ static inline bool nested_cpu_supports_monitor_trap_flag(struct kvm_vcpu *vcpu)
++ {
++ 	return to_vmx(vcpu)->nested.msrs.procbased_ctls_high &
++ 			CPU_BASED_MONITOR_TRAP_FLAG;
++ }
++ 
+++>>>>>>> 0447378a4a79 (kvm: vmx: Nested VM-entry prereqs for event inj.)
+  static inline bool nested_cpu_has(struct vmcs12 *vmcs12, u32 bit)
+  {
+  	return vmcs12->cpu_based_vm_exec_control & bit;
+diff --cc arch/x86/kvm/x86.h
+index a9c89e9553f5,257f27620bc2..000000000000
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@@ -98,6 -100,25 +98,28 @@@ static inline bool is_64_bit_mode(struc
+  	return cs_l;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool is_la57_mode(struct kvm_vcpu *vcpu)
++ {
++ #ifdef CONFIG_X86_64
++ 	return (vcpu->arch.efer & EFER_LMA) &&
++ 		 kvm_read_cr4_bits(vcpu, X86_CR4_LA57);
++ #else
++ 	return 0;
++ #endif
++ }
++ 
++ static inline bool x86_exception_has_error_code(unsigned int vector)
++ {
++ 	static u32 exception_has_error_code = BIT(DF_VECTOR) | BIT(TS_VECTOR) |
++ 			BIT(NP_VECTOR) | BIT(SS_VECTOR) | BIT(GP_VECTOR) |
++ 			BIT(PF_VECTOR) | BIT(AC_VECTOR);
++ 
++ 	return (1U << vector) & exception_has_error_code;
++ }
++ 
+++>>>>>>> 0447378a4a79 (kvm: vmx: Nested VM-entry prereqs for event inj.)
+  static inline bool mmu_is_nested(struct kvm_vcpu *vcpu)
+  {
+  	return vcpu->arch.walk_mmu == &vcpu->arch.nested_mmu;
+diff --git a/arch/x86/include/asm/vmx.h b/arch/x86/include/asm/vmx.h
+index 65fd8b7c90e1..876382813af5 100644
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -112,6 +112,7 @@
+ #define VMX_MISC_PREEMPTION_TIMER_RATE_MASK	0x0000001f
+ #define VMX_MISC_SAVE_EFER_LMA			0x00000020
+ #define VMX_MISC_ACTIVITY_HLT			0x00000040
++#define VMX_MISC_ZERO_LEN_INS			0x40000000
+ 
+ /* VMCS Encodings */
+ enum vmcs_field {
+@@ -307,11 +308,13 @@ enum vmcs_field {
+ #define VECTORING_INFO_VALID_MASK       	INTR_INFO_VALID_MASK
+ 
+ #define INTR_TYPE_EXT_INTR              (0 << 8) /* external interrupt */
++#define INTR_TYPE_RESERVED              (1 << 8) /* reserved */
+ #define INTR_TYPE_NMI_INTR		(2 << 8) /* NMI */
+ #define INTR_TYPE_HARD_EXCEPTION	(3 << 8) /* processor exception */
+ #define INTR_TYPE_SOFT_INTR             (4 << 8) /* software interrupt */
+ #define INTR_TYPE_PRIV_SW_EXCEPTION	(5 << 8) /* ICE breakpoint - undocumented */
+ #define INTR_TYPE_SOFT_EXCEPTION	(6 << 8) /* software exception */
++#define INTR_TYPE_OTHER_EVENT           (7 << 8) /* other event */
+ 
+ /* GUEST_INTERRUPTIBILITY_INFO flags. */
+ #define GUEST_INTR_STATE_STI		0x00000001
+* Unmerged path arch/x86/kvm/vmx.c
+* Unmerged path arch/x86/kvm/x86.h
