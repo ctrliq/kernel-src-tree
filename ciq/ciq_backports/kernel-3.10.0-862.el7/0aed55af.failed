@@ -1,0 +1,798 @@
+x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations (Jeff Moyer) [1471678]
+Rebuild_FUZZ: 96.93%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 0aed55af88345b5d673240f90e671d79662fb01e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0aed55af.failed
+
+The pmem driver has a need to transfer data with a persistent memory
+destination and be able to rely on the fact that the destination writes are not
+cached. It is sufficient for the writes to be flushed to a cpu-store-buffer
+(non-temporal / "movnt" in x86 terms), as we expect userspace to call fsync()
+to ensure data-writes have reached a power-fail-safe zone in the platform. The
+fsync() triggers a REQ_FUA or REQ_FLUSH to the pmem driver which will turn
+around and fence previous writes with an "sfence".
+
+Implement a __copy_from_user_inatomic_flushcache, memcpy_page_flushcache, and
+memcpy_flushcache, that guarantee that the destination buffer is not dirty in
+the cpu cache on completion. The new copy_from_iter_flushcache and sub-routines
+will be used to replace the "pmem api" (include/linux/pmem.h +
+arch/x86/include/asm/pmem.h). The availability of copy_from_iter_flushcache()
+and memcpy_flushcache() are gated by the CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
+config symbol, and fallback to copy_from_iter_nocache() and plain memcpy()
+otherwise.
+
+This is meant to satisfy the concern from Linus that if a driver wants to do
+something beyond the normal nocache semantics it should be something private to
+that driver [1], and Al's concern that anything uaccess related belongs with
+the rest of the uaccess code [2].
+
+The first consumer of this interface is a new 'copy_from_iter' dax operation so
+that pmem can inject cache maintenance operations without imposing this
+overhead on other dax-capable drivers.
+
+[1]: https://lists.01.org/pipermail/linux-nvdimm/2017-January/008364.html
+[2]: https://lists.01.org/pipermail/linux-nvdimm/2017-April/009942.html
+
+	Cc: <x86@kernel.org>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 0aed55af88345b5d673240f90e671d79662fb01e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	arch/x86/include/asm/string_64.h
+#	arch/x86/lib/usercopy_64.c
+#	drivers/nvdimm/pmem.c
+#	include/linux/dax.h
+#	include/linux/string.h
+#	include/linux/uio.h
+#	lib/iov_iter.c
+diff --cc arch/x86/Kconfig
+index 0912e61d8b57,bb273b2f50b5..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -15,66 -21,142 +15,149 @@@ config X86_3
+  config X86_64
+  	def_bool y
+  	depends on 64BIT
+ -	# Options that are inherently 64-bit kernel only:
+ -	select ARCH_HAS_GIGANTIC_PAGE
+ -	select ARCH_SUPPORTS_INT128
+ -	select ARCH_USE_CMPXCHG_LOCKREF
+ -	select HAVE_ARCH_SOFT_DIRTY
+ -	select MODULES_USE_ELF_RELA
+  	select X86_DEV_DMA_OPS
+ +	select ARCH_USE_CMPXCHG_LOCKREF
+  
+ -#
+ -# Arch settings
+ -#
+ -# ( Note that options that are marked 'if X86_64' could in principle be
+ -#   ported to 32-bit as well. )
+ -#
+ +### Arch settings
+  config X86
+  	def_bool y
+ -	#
+ -	# Note: keep this list sorted alphabetically
+ -	#
+ -	select ACPI_LEGACY_TABLES_LOOKUP	if ACPI
+ -	select ACPI_SYSTEM_POWER_STATES_SUPPORT	if ACPI
+ -	select ANON_INODES
+ -	select ARCH_CLOCKSOURCE_DATA
+ -	select ARCH_DISCARD_MEMBLOCK
+ -	select ARCH_HAS_ACPI_TABLE_UPGRADE	if ACPI
+ -	select ARCH_HAS_DEBUG_VIRTUAL
+ -	select ARCH_HAS_DEVMEM_IS_ALLOWED
+ -	select ARCH_HAS_ELF_RANDOMIZE
+ -	select ARCH_HAS_FAST_MULTIPLIER
+ -	select ARCH_HAS_GCOV_PROFILE_ALL
+ -	select ARCH_HAS_KCOV			if X86_64
+ -	select ARCH_HAS_MMIO_FLUSH
+ +	select ARCH_HAS_DEBUG_STRICT_USER_COPY_CHECKS
+  	select ARCH_HAS_PMEM_API		if X86_64
+++<<<<<<< HEAD
+ +	select ARCH_HAS_MMIO_FLUSH
+ +	select HAVE_AOUT if X86_32
+ +	select HAVE_UNSTABLE_SCHED_CLOCK
+ +	select ARCH_SUPPORTS_NUMA_BALANCING
+ +	select ARCH_SUPPORTS_INT128 if X86_64
+ +	select ARCH_WANTS_PROT_NUMA_PROT_NONE
+++=======
++ 	select ARCH_HAS_UACCESS_FLUSHCACHE	if X86_64
++ 	select ARCH_HAS_SET_MEMORY
++ 	select ARCH_HAS_SG_CHAIN
++ 	select ARCH_HAS_STRICT_KERNEL_RWX
++ 	select ARCH_HAS_STRICT_MODULE_RWX
++ 	select ARCH_HAS_UBSAN_SANITIZE_ALL
++ 	select ARCH_HAVE_NMI_SAFE_CMPXCHG
++ 	select ARCH_MIGHT_HAVE_ACPI_PDC		if ACPI
++ 	select ARCH_MIGHT_HAVE_PC_PARPORT
++ 	select ARCH_MIGHT_HAVE_PC_SERIO
++ 	select ARCH_SUPPORTS_ATOMIC_RMW
++ 	select ARCH_SUPPORTS_DEFERRED_STRUCT_PAGE_INIT
++ 	select ARCH_SUPPORTS_NUMA_BALANCING	if X86_64
++ 	select ARCH_USE_BUILTIN_BSWAP
++ 	select ARCH_USE_QUEUED_RWLOCKS
++ 	select ARCH_USE_QUEUED_SPINLOCKS
++ 	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if SMP
++ 	select ARCH_WANT_FRAME_POINTERS
++ 	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
++ 	select BUILDTIME_EXTABLE_SORT
++ 	select CLKEVT_I8253
++ 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
++ 	select CLOCKSOURCE_WATCHDOG
++ 	select DCACHE_WORD_ACCESS
++ 	select EDAC_ATOMIC_SCRUB
++ 	select EDAC_SUPPORT
++ 	select GENERIC_CLOCKEVENTS
++ 	select GENERIC_CLOCKEVENTS_BROADCAST	if X86_64 || (X86_32 && X86_LOCAL_APIC)
++ 	select GENERIC_CLOCKEVENTS_MIN_ADJUST
++ 	select GENERIC_CMOS_UPDATE
++ 	select GENERIC_CPU_AUTOPROBE
++ 	select GENERIC_EARLY_IOREMAP
++ 	select GENERIC_FIND_FIRST_BIT
++ 	select GENERIC_IOMAP
++ 	select GENERIC_IRQ_PROBE
++ 	select GENERIC_IRQ_SHOW
++ 	select GENERIC_PENDING_IRQ		if SMP
++ 	select GENERIC_SMP_IDLE_THREAD
++ 	select GENERIC_STRNCPY_FROM_USER
++ 	select GENERIC_STRNLEN_USER
++ 	select GENERIC_TIME_VSYSCALL
++ 	select HAVE_ACPI_APEI			if ACPI
++ 	select HAVE_ACPI_APEI_NMI		if ACPI
++ 	select HAVE_ALIGNED_STRUCT_PAGE		if SLUB
++ 	select HAVE_ARCH_AUDITSYSCALL
++ 	select HAVE_ARCH_HUGE_VMAP		if X86_64 || X86_PAE
++ 	select HAVE_ARCH_JUMP_LABEL
++ 	select HAVE_ARCH_KASAN			if X86_64 && SPARSEMEM_VMEMMAP
++ 	select HAVE_ARCH_KGDB
++ 	select HAVE_ARCH_KMEMCHECK
++ 	select HAVE_ARCH_MMAP_RND_BITS		if MMU
++ 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if MMU && COMPAT
++ 	select HAVE_ARCH_COMPAT_MMAP_BASES	if MMU && COMPAT
++ 	select HAVE_ARCH_SECCOMP_FILTER
++ 	select HAVE_ARCH_TRACEHOOK
++ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
++ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD if X86_64
++ 	select HAVE_ARCH_VMAP_STACK		if X86_64
++ 	select HAVE_ARCH_WITHIN_STACK_FRAMES
++ 	select HAVE_CC_STACKPROTECTOR
++ 	select HAVE_CMPXCHG_DOUBLE
++ 	select HAVE_CMPXCHG_LOCAL
++ 	select HAVE_CONTEXT_TRACKING		if X86_64
++ 	select HAVE_COPY_THREAD_TLS
++ 	select HAVE_C_RECORDMCOUNT
++ 	select HAVE_DEBUG_KMEMLEAK
++ 	select HAVE_DEBUG_STACKOVERFLOW
++ 	select HAVE_DMA_API_DEBUG
++ 	select HAVE_DMA_CONTIGUOUS
++ 	select HAVE_DYNAMIC_FTRACE
++ 	select HAVE_DYNAMIC_FTRACE_WITH_REGS
++ 	select HAVE_EBPF_JIT			if X86_64
++ 	select HAVE_EFFICIENT_UNALIGNED_ACCESS
++ 	select HAVE_EXIT_THREAD
++ 	select HAVE_FENTRY			if X86_64 || DYNAMIC_FTRACE
++ 	select HAVE_FTRACE_MCOUNT_RECORD
++ 	select HAVE_FUNCTION_GRAPH_TRACER
++ 	select HAVE_FUNCTION_TRACER
++ 	select HAVE_GCC_PLUGINS
++ 	select HAVE_HW_BREAKPOINT
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  	select HAVE_IDE
+ +	select HAVE_OPROFILE
+ +	select HAVE_PCSPKR_PLATFORM
+ +	select HAVE_PERF_EVENTS
+  	select HAVE_IOREMAP_PROT
+ -	select HAVE_IRQ_EXIT_ON_IRQ_STACK	if X86_64
+ -	select HAVE_IRQ_TIME_ACCOUNTING
+ -	select HAVE_KERNEL_BZIP2
+ -	select HAVE_KERNEL_GZIP
+ -	select HAVE_KERNEL_LZ4
+ -	select HAVE_KERNEL_LZMA
+ -	select HAVE_KERNEL_LZO
+ -	select HAVE_KERNEL_XZ
+  	select HAVE_KPROBES
+ -	select HAVE_KPROBES_ON_FTRACE
+ -	select HAVE_KRETPROBES
+ -	select HAVE_KVM
+ -	select HAVE_LIVEPATCH			if X86_64
+  	select HAVE_MEMBLOCK
+  	select HAVE_MEMBLOCK_NODE_MAP
+ -	select HAVE_MIXED_BREAKPOINTS_REGS
+ -	select HAVE_NMI
+ -	select HAVE_OPROFILE
+ +	select ARCH_DISCARD_MEMBLOCK
+ +	select ARCH_SUPPORTS_DEFERRED_STRUCT_PAGE_INIT
+ +	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH if SMP
+ +	select ARCH_WANT_OPTIONAL_GPIOLIB
+ +	select ARCH_WANT_FRAME_POINTERS
+ +	select HAVE_DMA_ATTRS
+ +	select HAVE_DMA_CONTIGUOUS if !SWIOTLB
+ +	select HAVE_KRETPROBES
+  	select HAVE_OPTPROBES
+ -	select HAVE_PCSPKR_PLATFORM
+ -	select HAVE_PERF_EVENTS
+ +	select HAVE_KPROBES_ON_FTRACE
+ +	select HAVE_FTRACE_MCOUNT_RECORD
+ +	select HAVE_FENTRY if X86_64
+ +	select HAVE_ARCH_MMAP_RND_BITS		if MMU
+ +	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if MMU && COMPAT
+ +	select HAVE_C_RECORDMCOUNT
+ +	select HAVE_DYNAMIC_FTRACE
+ +	select HAVE_DYNAMIC_FTRACE_WITH_REGS
+ +	select HAVE_FUNCTION_TRACER
+ +	select HAVE_FUNCTION_GRAPH_TRACER
+ +	select HAVE_FUNCTION_GRAPH_FP_TEST
+ +	select HAVE_SYSCALL_TRACEPOINTS
+ +	select SYSCTL_EXCEPTION_TRACE
+ +	select HAVE_KVM
+ +	select HAVE_ARCH_KGDB
+ +	select HAVE_ARCH_TRACEHOOK
+ +	select HAVE_GENERIC_DMA_COHERENT if X86_32
+ +	select HAVE_EFFICIENT_UNALIGNED_ACCESS
+ +	select USER_STACKTRACE_SUPPORT
+ +	select HAVE_REGS_AND_STACK_ACCESS_API
+ +	select HAVE_DMA_API_DEBUG
+ +	select HAVE_KERNEL_GZIP
+ +	select HAVE_KERNEL_BZIP2
+ +	select HAVE_KERNEL_LZMA
+ +	select HAVE_KERNEL_XZ
+ +	select HAVE_KERNEL_LZO
+ +	select HAVE_HW_BREAKPOINT
+ +	select HAVE_MIXED_BREAKPOINTS_REGS
+ +	select PERF_EVENTS
+  	select HAVE_PERF_EVENTS_NMI
+  	select HAVE_PERF_REGS
+  	select HAVE_PERF_USER_STACK_DUMP
+diff --cc arch/x86/include/asm/string_64.h
+index 19e2c468fc2c,1f22bc277c45..000000000000
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@@ -63,6 -66,54 +63,57 @@@ char *strcpy(char *dest, const char *sr
+  char *strcat(char *dest, const char *src);
+  int strcmp(const char *cs, const char *ct);
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
++ 
++ /*
++  * For files that not instrumented (e.g. mm/slub.c) we
++  * should use not instrumented version of mem* functions.
++  */
++ 
++ #undef memcpy
++ #define memcpy(dst, src, len) __memcpy(dst, src, len)
++ #define memmove(dst, src, len) __memmove(dst, src, len)
++ #define memset(s, c, n) __memset(s, c, n)
++ #endif
++ 
++ #define __HAVE_ARCH_MEMCPY_MCSAFE 1
++ __must_check int memcpy_mcsafe_unrolled(void *dst, const void *src, size_t cnt);
++ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
++ 
++ /**
++  * memcpy_mcsafe - copy memory with indication if a machine check happened
++  *
++  * @dst:	destination address
++  * @src:	source address
++  * @cnt:	number of bytes to copy
++  *
++  * Low level memory copy function that catches machine checks
++  * We only call into the "safe" function on systems that can
++  * actually do machine check recovery. Everyone else can just
++  * use memcpy().
++  *
++  * Return 0 for success, -EFAULT for fail
++  */
++ static __always_inline __must_check int
++ memcpy_mcsafe(void *dst, const void *src, size_t cnt)
++ {
++ #ifdef CONFIG_X86_MCE
++ 	if (static_branch_unlikely(&mcsafe_key))
++ 		return memcpy_mcsafe_unrolled(dst, src, cnt);
++ 	else
++ #endif
++ 		memcpy(dst, src, cnt);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
++ #define __HAVE_ARCH_MEMCPY_FLUSHCACHE 1
++ void memcpy_flushcache(void *dst, const void *src, size_t cnt);
++ #endif
++ 
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  #endif /* __KERNEL__ */
+  
+  #endif /* _ASM_X86_STRING_64_H */
+diff --cc arch/x86/lib/usercopy_64.c
+index 906fea315791,f42d2fd86ca3..000000000000
+--- a/arch/x86/lib/usercopy_64.c
++++ b/arch/x86/lib/usercopy_64.c
+@@@ -5,8 -5,9 +5,14 @@@
+   * Copyright 1997 Linus Torvalds
+   * Copyright 2002 Andi Kleen <ak@suse.de>
+   */
+++<<<<<<< HEAD
+ +#include <linux/module.h>
+ +#include <asm/uaccess.h>
+++=======
++ #include <linux/export.h>
++ #include <linux/uaccess.h>
++ #include <linux/highmem.h>
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  
+  /*
+   * Zero Userspace
+diff --cc drivers/nvdimm/pmem.c
+index 0a54cd24934c,2f3aefe565c6..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -28,6 -28,9 +28,11 @@@
+  #include <linux/pfn_t.h>
+  #include <linux/slab.h>
+  #include <linux/pmem.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/uio.h>
++ #include <linux/dax.h>
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  #include <linux/nd.h>
+  #include "pmem.h"
+  #include "pfn.h"
+@@@ -222,6 -228,25 +227,28 @@@ static const struct block_device_operat
+  	.revalidate_disk =	nvdimm_revalidate_disk,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static long pmem_dax_direct_access(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct pmem_device *pmem = dax_get_private(dax_dev);
++ 
++ 	return __pmem_direct_access(pmem, pgoff, nr_pages, kaddr, pfn);
++ }
++ 
++ static size_t pmem_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	return copy_from_iter_flushcache(addr, bytes, i);
++ }
++ 
++ static const struct dax_operations pmem_dax_ops = {
++ 	.direct_access = pmem_dax_direct_access,
++ 	.copy_from_iter = pmem_copy_from_iter,
++ };
++ 
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  static void pmem_release_queue(void *q)
+  {
+  	blk_cleanup_queue(q);
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,bbe79ed90e2b..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,114 +6,105 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ 	/* copy_from_iter: dax-driver override for default copy_from_iter */
++ 	size_t (*copy_from_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
++ };
++ 
++ #if IS_ENABLED(CONFIG_DAX)
++ struct dax_device *dax_get_by_host(const char *host);
++ void put_dax(struct dax_device *dax_dev);
++ #else
++ static inline struct dax_device *dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
++ #if IS_ENABLED(CONFIG_FS_DAX)
++ int __bdev_dax_supported(struct super_block *sb, int blocksize);
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return __bdev_dax_supported(sb, blocksize);
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return dax_get_by_host(host);
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ 	put_dax(dax_dev);
++ }
++ 
++ #else
++ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ }
++ #endif
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
++ 		void **kaddr, pfn_t *pfn);
++ 
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ -
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ -
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+ -
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+ +
+ +
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+diff --cc include/linux/string.h
+index d9d3ff2b1343,7439d83eaa33..000000000000
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@@ -114,7 -114,22 +114,24 @@@ extern int memcmp(const void *,const vo
+  #ifndef __HAVE_ARCH_MEMCHR
+  extern void * memchr(const void *,int,__kernel_size_t);
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifndef __HAVE_ARCH_MEMCPY_MCSAFE
++ static inline __must_check int memcpy_mcsafe(void *dst, const void *src,
++ 		size_t cnt)
++ {
++ 	memcpy(dst, src, cnt);
++ 	return 0;
++ }
++ #endif
++ #ifndef __HAVE_ARCH_MEMCPY_FLUSHCACHE
++ static inline void memcpy_flushcache(void *dst, const void *src, size_t cnt)
++ {
++ 	memcpy(dst, src, cnt);
++ }
++ #endif
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  void *memchr_inv(const void *s, int c, size_t n);
+ -char *strreplace(char *s, char old, char new);
+  
+  extern void kfree_const(const void *x);
+  
+diff --cc include/linux/uio.h
+index c55ce243cc09,55cd54a0e941..000000000000
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@@ -34,8 -63,133 +34,122 @@@ static inline size_t iov_length(const s
+  	return ret;
+  }
+  
+ -static inline struct iovec iov_iter_iovec(const struct iov_iter *iter)
+ -{
+ -	return (struct iovec) {
+ -		.iov_base = iter->iov->iov_base + iter->iov_offset,
+ -		.iov_len = min(iter->count,
+ -			       iter->iov->iov_len - iter->iov_offset),
+ -	};
+ -}
+ -
+ -#define iov_for_each(iov, iter, start)				\
+ -	if (!((start).type & (ITER_BVEC | ITER_PIPE)))		\
+ -	for (iter = (start);					\
+ -	     (iter).count &&					\
+ -	     ((iov = iov_iter_iovec(&(iter))), 1);		\
+ -	     iov_iter_advance(&(iter), (iov).iov_len))
+ -
+  unsigned long iov_shorten(struct iovec *iov, unsigned long nr_segs, size_t to);
+  
+++<<<<<<< HEAD
+ +int memcpy_fromiovec(unsigned char *kdata, struct iovec *iov, int len);
+ +int memcpy_toiovec(struct iovec *iov, unsigned char *kdata, int len);
+++=======
++ size_t iov_iter_copy_from_user_atomic(struct page *page,
++ 		struct iov_iter *i, unsigned long offset, size_t bytes);
++ void iov_iter_advance(struct iov_iter *i, size_t bytes);
++ void iov_iter_revert(struct iov_iter *i, size_t bytes);
++ int iov_iter_fault_in_readable(struct iov_iter *i, size_t bytes);
++ size_t iov_iter_single_seg_count(const struct iov_iter *i);
++ size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
++ 			 struct iov_iter *i);
++ size_t copy_page_from_iter(struct page *page, size_t offset, size_t bytes,
++ 			 struct iov_iter *i);
++ size_t copy_to_iter(const void *addr, size_t bytes, struct iov_iter *i);
++ size_t copy_from_iter(void *addr, size_t bytes, struct iov_iter *i);
++ bool copy_from_iter_full(void *addr, size_t bytes, struct iov_iter *i);
++ size_t copy_from_iter_nocache(void *addr, size_t bytes, struct iov_iter *i);
++ #ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
++ /*
++  * Note, users like pmem that depend on the stricter semantics of
++  * copy_from_iter_flushcache() than copy_from_iter_nocache() must check for
++  * IS_ENABLED(CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE) before assuming that the
++  * destination is flushed from the cache on return.
++  */
++ size_t copy_from_iter_flushcache(void *addr, size_t bytes, struct iov_iter *i);
++ #else
++ static inline size_t copy_from_iter_flushcache(void *addr, size_t bytes,
++ 				       struct iov_iter *i)
++ {
++ 	return copy_from_iter_nocache(addr, bytes, i);
++ }
++ #endif
++ bool copy_from_iter_full_nocache(void *addr, size_t bytes, struct iov_iter *i);
++ size_t iov_iter_zero(size_t bytes, struct iov_iter *);
++ unsigned long iov_iter_alignment(const struct iov_iter *i);
++ unsigned long iov_iter_gap_alignment(const struct iov_iter *i);
++ void iov_iter_init(struct iov_iter *i, int direction, const struct iovec *iov,
++ 			unsigned long nr_segs, size_t count);
++ void iov_iter_kvec(struct iov_iter *i, int direction, const struct kvec *kvec,
++ 			unsigned long nr_segs, size_t count);
++ void iov_iter_bvec(struct iov_iter *i, int direction, const struct bio_vec *bvec,
++ 			unsigned long nr_segs, size_t count);
++ void iov_iter_pipe(struct iov_iter *i, int direction, struct pipe_inode_info *pipe,
++ 			size_t count);
++ ssize_t iov_iter_get_pages(struct iov_iter *i, struct page **pages,
++ 			size_t maxsize, unsigned maxpages, size_t *start);
++ ssize_t iov_iter_get_pages_alloc(struct iov_iter *i, struct page ***pages,
++ 			size_t maxsize, size_t *start);
++ int iov_iter_npages(const struct iov_iter *i, int maxpages);
++ 
++ const void *dup_iter(struct iov_iter *new, struct iov_iter *old, gfp_t flags);
++ 
++ static inline size_t iov_iter_count(const struct iov_iter *i)
++ {
++ 	return i->count;
++ }
++ 
++ static inline bool iter_is_iovec(const struct iov_iter *i)
++ {
++ 	return !(i->type & (ITER_BVEC | ITER_KVEC | ITER_PIPE));
++ }
++ 
++ /*
++  * Get one of READ or WRITE out of iter->type without any other flags OR'd in
++  * with it.
++  *
++  * The ?: is just for type safety.
++  */
++ #define iov_iter_rw(i) ((0 ? (struct iov_iter *)0 : (i))->type & (READ | WRITE))
++ 
++ /*
++  * Cap the iov_iter by given limit; note that the second argument is
++  * *not* the new size - it's upper limit for such.  Passing it a value
++  * greater than the amount of data in iov_iter is fine - it'll just do
++  * nothing in that case.
++  */
++ static inline void iov_iter_truncate(struct iov_iter *i, u64 count)
++ {
++ 	/*
++ 	 * count doesn't have to fit in size_t - comparison extends both
++ 	 * operands to u64 here and any value that would be truncated by
++ 	 * conversion in assignement is by definition greater than all
++ 	 * values of size_t, including old i->count.
++ 	 */
++ 	if (i->count > count)
++ 		i->count = count;
++ }
++ 
++ /*
++  * reexpand a previously truncated iterator; count must be no more than how much
++  * we had shrunk it.
++  */
++ static inline void iov_iter_reexpand(struct iov_iter *i, size_t count)
++ {
++ 	i->count = count;
++ }
++ size_t csum_and_copy_to_iter(const void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
++ size_t csum_and_copy_from_iter(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
++ bool csum_and_copy_from_iter_full(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
++ 
++ int import_iovec(int type, const struct iovec __user * uvector,
++ 		 unsigned nr_segs, unsigned fast_segs,
++ 		 struct iovec **iov, struct iov_iter *i);
++ 
++ #ifdef CONFIG_COMPAT
++ struct compat_iovec;
++ int compat_import_iovec(int type, const struct compat_iovec __user * uvector,
++ 		 unsigned nr_segs, unsigned fast_segs,
++ 		 struct iovec **iov, struct iov_iter *i);
++ #endif
++ 
++ int import_single_range(int type, void __user *buf, size_t len,
++ 		 struct iovec *iov, struct iov_iter *i);
++ 
+++>>>>>>> 0aed55af8834 (x86, uaccess: introduce copy_from_iter_flushcache for pmem / cache-bypass operations)
+  #endif
+* Unmerged path lib/iov_iter.c
+* Unmerged path arch/x86/Kconfig
+* Unmerged path arch/x86/include/asm/string_64.h
+diff --git a/arch/x86/include/asm/uaccess_64.h b/arch/x86/include/asm/uaccess_64.h
+index 4f7923dd0007..38dd658b9ce9 100644
+--- a/arch/x86/include/asm/uaccess_64.h
++++ b/arch/x86/include/asm/uaccess_64.h
+@@ -232,6 +232,10 @@ __copy_to_user_inatomic(void __user *dst, const void *src, unsigned size)
+ extern long __copy_user_nocache(void *dst, const void __user *src,
+ 				unsigned size, int zerorest);
+ 
++extern long __copy_user_flushcache(void *dst, const void __user *src, unsigned size);
++extern void memcpy_page_flushcache(char *to, struct page *page, size_t offset,
++			   size_t len);
++
+ static inline int
+ __copy_from_user_nocache(void *dst, const void __user *src, unsigned size)
+ {
+@@ -246,6 +250,13 @@ __copy_from_user_inatomic_nocache(void *dst, const void __user *src,
+ 	return __copy_user_nocache(dst, src, size, 0);
+ }
+ 
++static inline int
++__copy_from_user_flushcache(void *dst, const void __user *src, unsigned size)
++{
++	kasan_check_write(dst, size);
++	return __copy_user_flushcache(dst, src, size);
++}
++
+ unsigned long
+ copy_user_handle_tail(char *to, char *from, unsigned len, unsigned zerorest);
+ 
+* Unmerged path arch/x86/lib/usercopy_64.c
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 95a335d63b99..99eee7fb98fe 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -1967,8 +1967,7 @@ static int acpi_nfit_blk_single_io(struct nfit_blk *nfit_blk,
+ 		}
+ 
+ 		if (rw)
+-			memcpy_to_pmem(mmio->addr.aperture + offset,
+-					iobuf + copied, c);
++			memcpy_flushcache(mmio->addr.aperture + offset, iobuf + copied, c);
+ 		else {
+ 			if (nfit_blk->dimm_flags & NFIT_BLK_READ_FLUSH)
+ 				mmio_flush_range((void __force *)
+diff --git a/drivers/nvdimm/claim.c b/drivers/nvdimm/claim.c
+index 961c67033dc8..53bf68b6a02f 100644
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -303,7 +303,7 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
+ 			rc = -EIO;
+ 	}
+ 
+-	memcpy_to_pmem(nsio->addr + offset, buf, size);
++	memcpy_flushcache(nsio->addr + offset, buf, size);
+ 	nvdimm_flush(to_nd_region(ndns->dev.parent));
+ 
+ 	return rc;
+* Unmerged path drivers/nvdimm/pmem.c
+diff --git a/drivers/nvdimm/region_devs.c b/drivers/nvdimm/region_devs.c
+index bc66a045a661..6ef40b0f2bfd 100644
+--- a/drivers/nvdimm/region_devs.c
++++ b/drivers/nvdimm/region_devs.c
+@@ -1051,8 +1051,8 @@ void nvdimm_flush(struct nd_region *nd_region)
+ 	 * The first wmb() is needed to 'sfence' all previous writes
+ 	 * such that they are architecturally visible for the platform
+ 	 * buffer flush.  Note that we've already arranged for pmem
+-	 * writes to avoid the cache via arch_memcpy_to_pmem().  The
+-	 * final wmb() ensures ordering for the NVDIMM flush write.
++	 * writes to avoid the cache via memcpy_flushcache().  The final
++	 * wmb() ensures ordering for the NVDIMM flush write.
+ 	 */
+ 	wmb();
+ 	for (i = 0; i < nd_region->ndr_mappings; i++)
+* Unmerged path include/linux/dax.h
+* Unmerged path include/linux/string.h
+* Unmerged path include/linux/uio.h
+diff --git a/lib/Kconfig b/lib/Kconfig
+index fbd6fb868614..741e950ce585 100644
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -478,6 +478,9 @@ config SG_POOL
+ config ARCH_HAS_PMEM_API
+ 	bool
+ 
++config ARCH_HAS_UACCESS_FLUSHCACHE
++	bool
++
+ config ARCH_HAS_MMIO_FLUSH
+ 	bool
+ 
+* Unmerged path lib/iov_iter.c
