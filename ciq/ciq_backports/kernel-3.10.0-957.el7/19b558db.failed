@@ -1,0 +1,221 @@
+posix-timers: Protect posix clock array access against speculation
+
+jira LE-1907
+cve CVE-2018-3693
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [kernel] time: Protect posix clock array access against speculation (Lauro Ramos Venancio) [1589035] {CVE-2018-3693}
+Rebuild_FUZZ: 93.55%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 19b558db12f9f4e45a22012bae7b4783e62224da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/19b558db.failed
+
+The clockid argument of clockid_to_kclock() comes straight from user space
+via various syscalls and is used as index into the posix_clocks array.
+
+Protect it against spectre v1 array out of bounds speculation. Remove the
+redundant check for !posix_clock[id] as this is another source for
+speculation and does not provide any advantage over the return
+posix_clock[id] path which returns NULL in that case anyway.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Dan Williams <dan.j.williams@intel.com>
+	Cc: Rasmus Villemoes <rasmus.villemoes@prevas.dk>
+	Cc: Greg KH <gregkh@linuxfoundation.org>
+	Cc: stable@vger.kernel.org
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: David Woodhouse <dwmw@amazon.co.uk>
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1802151718320.1296@nanos.tec.linutronix.de
+
+(cherry picked from commit 19b558db12f9f4e45a22012bae7b4783e62224da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/posix-timers.c
+diff --cc kernel/posix-timers.c
+index 5a4d6a493c9b,10b7186d0638..000000000000
+--- a/kernel/posix-timers.c
++++ b/kernel/posix-timers.c
+@@@ -48,8 -49,11 +48,13 @@@
+  #include <linux/workqueue.h>
+  #include <linux/export.h>
+  #include <linux/hashtable.h>
+++<<<<<<< HEAD:kernel/posix-timers.c
+++=======
++ #include <linux/compat.h>
++ #include <linux/nospec.h>
+++>>>>>>> 19b558db12f9 (posix-timers: Protect posix clock array access against speculation):kernel/time/posix-timers.c
+  
+ -#include "timekeeping.h"
+ -#include "posix-timers.h"
+ +#include "time/timekeeping.h"
+  
+  /*
+   * Management arrays for POSIX timers. Timers are now kept in static hash table
+@@@ -1098,26 -1214,148 +1103,147 @@@ SYSCALL_DEFINE4(clock_nanosleep, const 
+  	if (!kc->nsleep)
+  		return -ENANOSLEEP_NOTSUP;
+  
+ -	if (get_timespec64(&t, rqtp))
+ +	if (copy_from_user(&t, rqtp, sizeof (struct timespec)))
+  		return -EFAULT;
+  
+ -	if (!timespec64_valid(&t))
+ +	if (!timespec_valid(&t))
+  		return -EINVAL;
+ -	if (flags & TIMER_ABSTIME)
+ -		rmtp = NULL;
+ -	current->restart_block.nanosleep.type = rmtp ? TT_NATIVE : TT_NONE;
+ -	current->restart_block.nanosleep.rmtp = rmtp;
+  
+ -	return kc->nsleep(which_clock, flags, &t);
+ +	return kc->nsleep(which_clock, flags, &t, rmtp);
+  }
+  
+ -#ifdef CONFIG_COMPAT
+ -COMPAT_SYSCALL_DEFINE4(clock_nanosleep, clockid_t, which_clock, int, flags,
+ -		       struct compat_timespec __user *, rqtp,
+ -		       struct compat_timespec __user *, rmtp)
+ +/*
+ + * This will restart clock_nanosleep. This is required only by
+ + * compat_clock_nanosleep_restart for now.
+ + */
+ +long clock_nanosleep_restart(struct restart_block *restart_block)
+  {
+ -	const struct k_clock *kc = clockid_to_kclock(which_clock);
+ -	struct timespec64 t;
+ +	clockid_t which_clock = restart_block->nanosleep.clockid;
+ +	struct k_clock *kc = clockid_to_kclock(which_clock);
+  
+ -	if (!kc)
+ +	if (WARN_ON_ONCE(!kc || !kc->nsleep_restart))
+  		return -EINVAL;
+ -	if (!kc->nsleep)
+ -		return -ENANOSLEEP_NOTSUP;
+  
+++<<<<<<< HEAD:kernel/posix-timers.c
+ +	return kc->nsleep_restart(restart_block);
+++=======
++ 	if (compat_get_timespec64(&t, rqtp))
++ 		return -EFAULT;
++ 
++ 	if (!timespec64_valid(&t))
++ 		return -EINVAL;
++ 	if (flags & TIMER_ABSTIME)
++ 		rmtp = NULL;
++ 	current->restart_block.nanosleep.type = rmtp ? TT_COMPAT : TT_NONE;
++ 	current->restart_block.nanosleep.compat_rmtp = rmtp;
++ 
++ 	return kc->nsleep(which_clock, flags, &t);
++ }
++ #endif
++ 
++ static const struct k_clock clock_realtime = {
++ 	.clock_getres		= posix_get_hrtimer_res,
++ 	.clock_get		= posix_clock_realtime_get,
++ 	.clock_set		= posix_clock_realtime_set,
++ 	.clock_adj		= posix_clock_realtime_adj,
++ 	.nsleep			= common_nsleep,
++ 	.timer_create		= common_timer_create,
++ 	.timer_set		= common_timer_set,
++ 	.timer_get		= common_timer_get,
++ 	.timer_del		= common_timer_del,
++ 	.timer_rearm		= common_hrtimer_rearm,
++ 	.timer_forward		= common_hrtimer_forward,
++ 	.timer_remaining	= common_hrtimer_remaining,
++ 	.timer_try_to_cancel	= common_hrtimer_try_to_cancel,
++ 	.timer_arm		= common_hrtimer_arm,
++ };
++ 
++ static const struct k_clock clock_monotonic = {
++ 	.clock_getres		= posix_get_hrtimer_res,
++ 	.clock_get		= posix_ktime_get_ts,
++ 	.nsleep			= common_nsleep,
++ 	.timer_create		= common_timer_create,
++ 	.timer_set		= common_timer_set,
++ 	.timer_get		= common_timer_get,
++ 	.timer_del		= common_timer_del,
++ 	.timer_rearm		= common_hrtimer_rearm,
++ 	.timer_forward		= common_hrtimer_forward,
++ 	.timer_remaining	= common_hrtimer_remaining,
++ 	.timer_try_to_cancel	= common_hrtimer_try_to_cancel,
++ 	.timer_arm		= common_hrtimer_arm,
++ };
++ 
++ static const struct k_clock clock_monotonic_raw = {
++ 	.clock_getres		= posix_get_hrtimer_res,
++ 	.clock_get		= posix_get_monotonic_raw,
++ };
++ 
++ static const struct k_clock clock_realtime_coarse = {
++ 	.clock_getres		= posix_get_coarse_res,
++ 	.clock_get		= posix_get_realtime_coarse,
++ };
++ 
++ static const struct k_clock clock_monotonic_coarse = {
++ 	.clock_getres		= posix_get_coarse_res,
++ 	.clock_get		= posix_get_monotonic_coarse,
++ };
++ 
++ static const struct k_clock clock_tai = {
++ 	.clock_getres		= posix_get_hrtimer_res,
++ 	.clock_get		= posix_get_tai,
++ 	.nsleep			= common_nsleep,
++ 	.timer_create		= common_timer_create,
++ 	.timer_set		= common_timer_set,
++ 	.timer_get		= common_timer_get,
++ 	.timer_del		= common_timer_del,
++ 	.timer_rearm		= common_hrtimer_rearm,
++ 	.timer_forward		= common_hrtimer_forward,
++ 	.timer_remaining	= common_hrtimer_remaining,
++ 	.timer_try_to_cancel	= common_hrtimer_try_to_cancel,
++ 	.timer_arm		= common_hrtimer_arm,
++ };
++ 
++ static const struct k_clock clock_boottime = {
++ 	.clock_getres		= posix_get_hrtimer_res,
++ 	.clock_get		= posix_get_boottime,
++ 	.nsleep			= common_nsleep,
++ 	.timer_create		= common_timer_create,
++ 	.timer_set		= common_timer_set,
++ 	.timer_get		= common_timer_get,
++ 	.timer_del		= common_timer_del,
++ 	.timer_rearm		= common_hrtimer_rearm,
++ 	.timer_forward		= common_hrtimer_forward,
++ 	.timer_remaining	= common_hrtimer_remaining,
++ 	.timer_try_to_cancel	= common_hrtimer_try_to_cancel,
++ 	.timer_arm		= common_hrtimer_arm,
++ };
++ 
++ static const struct k_clock * const posix_clocks[] = {
++ 	[CLOCK_REALTIME]		= &clock_realtime,
++ 	[CLOCK_MONOTONIC]		= &clock_monotonic,
++ 	[CLOCK_PROCESS_CPUTIME_ID]	= &clock_process,
++ 	[CLOCK_THREAD_CPUTIME_ID]	= &clock_thread,
++ 	[CLOCK_MONOTONIC_RAW]		= &clock_monotonic_raw,
++ 	[CLOCK_REALTIME_COARSE]		= &clock_realtime_coarse,
++ 	[CLOCK_MONOTONIC_COARSE]	= &clock_monotonic_coarse,
++ 	[CLOCK_BOOTTIME]		= &clock_boottime,
++ 	[CLOCK_REALTIME_ALARM]		= &alarm_clock,
++ 	[CLOCK_BOOTTIME_ALARM]		= &alarm_clock,
++ 	[CLOCK_TAI]			= &clock_tai,
++ };
++ 
++ static const struct k_clock *clockid_to_kclock(const clockid_t id)
++ {
++ 	clockid_t idx = id;
++ 
++ 	if (id < 0) {
++ 		return (id & CLOCKFD_MASK) == CLOCKFD ?
++ 			&clock_posix_dynamic : &clock_posix_cpu;
++ 	}
++ 
++ 	if (id >= ARRAY_SIZE(posix_clocks))
++ 		return NULL;
++ 
++ 	return posix_clocks[array_index_nospec(idx, ARRAY_SIZE(posix_clocks))];
+++>>>>>>> 19b558db12f9 (posix-timers: Protect posix clock array access against speculation):kernel/time/posix-timers.c
+  }
+* Unmerged path kernel/posix-timers.c
