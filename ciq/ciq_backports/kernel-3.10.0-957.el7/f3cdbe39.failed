@@ -1,0 +1,167 @@
+tcmu: fix crash during device removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit f3cdbe39b2ab0636dec0d5d43b54f1061ce7566c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f3cdbe39.failed
+
+We currently do
+
+tcmu_free_device ->tcmu_netlink_event(TCMU_CMD_REMOVED_DEVICE) ->
+uio_unregister_device -> kfree(tcmu_dev).
+
+The problem is that the kernel does not wait for userspace to
+do the close() on the uio device before freeing the tcmu_dev.
+We can then hit a race where the kernel frees the tcmu_dev before
+userspace does close() and so when close() -> release -> tcmu_release
+is done, we try to access a freed tcmu_dev.
+
+This patch made over the target-pending master branch moves the freeing
+of the tcmu_dev to when the last reference has been dropped.
+
+This also fixes a leak where if tcmu_configure_device was not called on a
+device we did not free udev->name which was allocated at tcmu_alloc_device time.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit f3cdbe39b2ab0636dec0d5d43b54f1061ce7566c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,beb5f098f32d..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -83,16 -95,10 +83,22 @@@ struct tcmu_hba 
+  
+  #define TCMU_CONFIG_LEN 256
+  
+++<<<<<<< HEAD
+ +struct tcmu_nl_cmd {
+ +	/* wake up thread waiting for reply */
+ +	struct completion complete;
+ +	int cmd;
+ +	int status;
+ +};
+ +
+ +struct tcmu_dev {
+++=======
++ struct tcmu_dev {
++ 	struct list_head node;
++ 	struct kref kref;
+++>>>>>>> f3cdbe39b2ab (tcmu: fix crash during device removal)
+  	struct se_device se_dev;
+ +	int dev_index;
+  
+  	char *name;
+  	struct se_hba *hba;
+@@@ -1264,7 -1292,14 +1290,18 @@@ static int tcmu_configure_device(struc
+  		dev->dev_attrib.hw_max_sectors = 128;
+  	dev->dev_attrib.hw_queue_depth = 128;
+  
+++<<<<<<< HEAD
+ +	ret = tcmu_netlink_event(udev, TCMU_CMD_ADDED_DEVICE, 0, NULL);
+++=======
++ 	/*
++ 	 * Get a ref incase userspace does a close on the uio device before
++ 	 * LIO has initiated tcmu_free_device.
++ 	 */
++ 	kref_get(&udev->kref);
++ 
++ 	ret = tcmu_netlink_event(TCMU_CMD_ADDED_DEVICE, udev->uio_info.name,
++ 				 udev->uio_info.uio_dev->minor);
+++>>>>>>> f3cdbe39b2ab (tcmu: fix crash during device removal)
+  	if (ret)
+  		goto err_netlink;
+  
+@@@ -1275,13 -1315,8 +1313,17 @@@ err_netlink
+  err_register:
+  	vfree(udev->mb_addr);
+  err_vzalloc:
+ +	kfree(udev->data_bitmap);
+ +err_bitmap_alloc:
+  	kfree(info->name);
+++<<<<<<< HEAD
+ +err_kmalloc:
+ +	mutex_lock(&device_mutex);
+ +	idr_remove(&devices_idr, udev->dev_index);
+ +	mutex_unlock(&device_mutex);
+++=======
++ 	info->name = NULL;
+++>>>>>>> f3cdbe39b2ab (tcmu: fix crash during device removal)
+  
+  	return ret;
+  }
+@@@ -1295,25 -1330,29 +1337,28 @@@ static int tcmu_check_and_free_pending_
+  	return -EINVAL;
+  }
+  
+ -static bool tcmu_dev_configured(struct tcmu_dev *udev)
+++<<<<<<< HEAD
+ +static void tcmu_dev_call_rcu(struct rcu_head *p)
+  {
+ -	return udev->uio_info.uio_dev ? true : false;
+ +	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ +	struct tcmu_dev *udev = TCMU_DEV(dev);
+ +
+ +	kfree(udev);
+  }
+  
+ -static void tcmu_blocks_release(struct tcmu_dev *udev)
+ +static void tcmu_free_device(struct se_device *dev)
+  {
+ -	int i;
+ -	struct page *page;
+ +	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
+ +}
+  
+ -	/* Try to release all block pages */
+ -	mutex_lock(&udev->cmdr_lock);
+ -	for (i = 0; i <= udev->dbi_max; i++) {
+ -		page = radix_tree_delete(&udev->data_blocks, i);
+ -		if (page) {
+ -			__free_page(page);
+ -			atomic_dec(&global_db_count);
+ -		}
+ -	}
+ -	mutex_unlock(&udev->cmdr_lock);
+++=======
+++>>>>>>> f3cdbe39b2ab (tcmu: fix crash during device removal)
+ +static bool tcmu_dev_configured(struct tcmu_dev *udev)
+ +{
+ +	return udev->uio_info.uio_dev ? true : false;
+  }
+  
+ -static void tcmu_free_device(struct se_device *dev)
+ +static void tcmu_destroy_device(struct se_device *dev)
+  {
+  	struct tcmu_dev *udev = TCMU_DEV(dev);
+  	struct tcmu_cmd *cmd;
+@@@ -1345,7 -1376,18 +1390,22 @@@
+  	idr_destroy(&udev->commands);
+  	spin_unlock_irq(&udev->commands_lock);
+  	WARN_ON(!all_expired);
+++<<<<<<< HEAD
+ +	kfree(udev->data_bitmap);
+++=======
++ 
++ 	tcmu_blocks_release(udev);
++ 
++ 	if (tcmu_dev_configured(udev)) {
++ 		tcmu_netlink_event(TCMU_CMD_REMOVED_DEVICE, udev->uio_info.name,
++ 				   udev->uio_info.uio_dev->minor);
++ 
++ 		uio_unregister_device(&udev->uio_info);
++ 	}
++ 
++ 	/* release ref from init */
++ 	kref_put(&udev->kref, tcmu_dev_kref_release);
+++>>>>>>> f3cdbe39b2ab (tcmu: fix crash during device removal)
+  }
+  
+  enum {
+* Unmerged path drivers/target/target_core_user.c
