@@ -1274,14 +1274,11 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	}
 
 	/* Sanity checks */
-	if (unlikely(adap->name[0] == '\0')) {
-		pr_err("i2c-core: Attempt to register an adapter with "
-		       "no name!\n");
+	if (WARN(!adap->name[0], "i2c adapter has no name"))
 		goto out_list;
-	}
-	if (unlikely(!adap->algo)) {
-		pr_err("i2c-core: Attempt to register adapter '%s' with "
-		       "no algo!\n", adap->name);
+
+	if (!adap->algo) {
+		pr_err("i2c-core: adapter '%s': no algo supplied!\n", adap->name);
 		goto out_list;
 	}
 
@@ -1303,8 +1300,11 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	adap->dev.bus = &i2c_bus_type;
 	adap->dev.type = &i2c_adapter_type;
 	res = device_register(&adap->dev);
-	if (res)
+	if (res) {
+		pr_err("i2c-core: adapter '%s': can't register device (%d)\n",
+			adap->name, res);
 		goto out_list;
+	}
 
 	dev_dbg(&adap->dev, "adapter [%s] registered\n", adap->name);
 
