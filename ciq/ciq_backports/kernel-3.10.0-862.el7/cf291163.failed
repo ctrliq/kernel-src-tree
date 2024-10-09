@@ -1,0 +1,147 @@
+scsi: qedf: Corrent VLAN tag insertion in fallback VLAN case.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qedf: Corrent VLAN tag insertion in fallback VLAN case (Chad Dupuis) [1461960]
+Rebuild_FUZZ: 93.91%
+commit-author Chad Dupuis <chad.dupuis@cavium.com>
+commit cf29116375b7868aabe826ceda6fbe3f2451f8a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cf291163.failed
+
+Currently in the driver the qedf_ctx attribute vlan_hw_insert is used to
+which whether to insert a VLAN tag in FIP frames (except for FIP VLAN
+request which is explicitly sent out untagged at least from the driver's
+point of view).
+
+When we receive a FIP VLAN response, we set qedf->vlan_hw_insert to 0 which
+makes the qedf_fip_send function insert the VLAN.  However when we exhaust
+our FIP VLAN retries, we do not set qedf->vlan_hw_insert to 0 which means
+that the driver will not tag the FIP frame with the correct VLAN ID.  The
+result that was observed on the wire is that some entity either in the LL2
+or L2 firmware is adding a NULL VLAN tag which can cause FIP solicitation
+to fail.
+
+The offload FCoE frame function, qedf_xmit, does not use the vlan_hw_insert
+attribute to decide whether to tag frames with the FIP/FCoE VLAN.  Instead
+it unilaterially tags the offload frames with the VLAN ID stored in
+qedf->vlan_id. This is the correct behavior so the driver can guarantee
+that non-offload FIP frames go out with the correct VLAN ID.
+
+Also use the Linux network layer helpers instead of doing the VLAN insert
+manually.
+
+Also fix setting the fallback VLAN so that it used the module parameter and
+is not hardcoded to 1002 (though 1002 is the default).
+
+[mkp: fixed typo]
+
+	Signed-off-by: Chad Dupuis <chad.dupuis@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cf29116375b7868aabe826ceda6fbe3f2451f8a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qedf/qedf_fip.c
+diff --cc drivers/scsi/qedf/qedf_fip.c
+index 5dde777df0fc,773558fc0697..000000000000
+--- a/drivers/scsi/qedf/qedf_fip.c
++++ b/drivers/scsi/qedf/qedf_fip.c
+@@@ -124,17 -123,14 +123,25 @@@ void qedf_fip_send(struct fcoe_ctlr *fi
+  	op = ntohs(fiph->fip_op);
+  	sub = fiph->fip_subcode;
+  
+++<<<<<<< HEAD
+ +	if (!qedf->vlan_hw_insert) {
+ +		vlan_hdr = (struct vlan_ethhdr *)skb_push(skb, sizeof(*vlan_hdr)
+ +		    - sizeof(*eth_hdr));
+ +		memcpy(vlan_hdr, eth_hdr, 2 * ETH_ALEN);
+ +		vlan_hdr->h_vlan_proto = htons(ETH_P_8021Q);
+ +		vlan_hdr->h_vlan_encapsulated_proto = eth_hdr->h_proto;
+ +		vlan_hdr->h_vlan_TCI = vlan_tci =  htons(qedf->vlan_id);
+ +	}
+++=======
++ 	/*
++ 	 * Add VLAN tag to non-offload FIP frame based on current stored VLAN
++ 	 * for FIP/FCoE traffic.
++ 	 */
++ 	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), qedf->vlan_id);
+++>>>>>>> cf29116375b7 (scsi: qedf: Corrent VLAN tag insertion in fallback VLAN case.)
+  
+- 	/* Update eth_hdr since we added a VLAN tag */
+- 	eth_hdr = (struct ethhdr *)skb_mac_header(skb);
++ 	/* Get VLAN ID from skb for printing purposes */
++ 	__vlan_hwaccel_get_tag(skb, &vlan_tci);
+  
+  	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_LL2, "FIP frame send: "
+  	    "dest=%pM op=%x sub=%x vlan=%04x.", eth_hdr->h_dest, op, sub,
+@@@ -174,9 -169,8 +181,8 @@@ void qedf_fip_recv(struct qedf_ctx *qed
+  		    skb->data, skb->len, false);
+  
+  	/* Handle FIP VLAN resp in the driver */
+ -	if (op == FIP_OP_VLAN && sub == FIP_SC_VL_NOTE) {
+ +	if (op == FIP_OP_VLAN && sub == FIP_SC_VL_REP) {
+  		qedf_fcoe_process_vlan_resp(qedf, skb);
+- 		qedf->vlan_hw_insert = 0;
+  		kfree_skb(skb);
+  	} else if (op == FIP_OP_CTRL && sub == FIP_SC_CLR_VLINK) {
+  		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC, "Clear virtual "
+diff --git a/drivers/scsi/qedf/qedf.h b/drivers/scsi/qedf/qedf.h
+index 26e70138b422..3dfefb2fea72 100644
+--- a/drivers/scsi/qedf/qedf.h
++++ b/drivers/scsi/qedf/qedf.h
+@@ -300,7 +300,6 @@ struct qedf_ctx {
+ #define QEDF_FALLBACK_VLAN	1002
+ #define QEDF_DEFAULT_PRIO	3
+ 	int vlan_id;
+-	uint vlan_hw_insert:1;
+ 	struct qed_dev *cdev;
+ 	struct qed_dev_fcoe_info dev_info;
+ 	struct qed_int_info int_info;
+* Unmerged path drivers/scsi/qedf/qedf_fip.c
+diff --git a/drivers/scsi/qedf/qedf_main.c b/drivers/scsi/qedf/qedf_main.c
+index 96d89c25e1b9..8224fed4a843 100644
+--- a/drivers/scsi/qedf/qedf_main.c
++++ b/drivers/scsi/qedf/qedf_main.c
+@@ -164,7 +164,7 @@ static void qedf_handle_link_update(struct work_struct *work)
+ 		QEDF_WARN(&(qedf->dbg_ctx), "Did not receive FIP VLAN "
+ 			   "response, falling back to default VLAN %d.\n",
+ 			   qedf_fallback_vlan);
+-		qedf_set_vlan_id(qedf, QEDF_FALLBACK_VLAN);
++		qedf_set_vlan_id(qedf, qedf_fallback_vlan);
+ 
+ 		/*
+ 		 * Zero out data_src_addr so we'll update it with the new
+@@ -362,8 +362,9 @@ static void qedf_link_recovery(struct work_struct *work)
+ 	/* Since the link when down and up to verify which vlan we're on */
+ 	qedf->fipvlan_retries = qedf_fipvlan_retries;
+ 	rc = qedf_initiate_fipvlan_req(qedf);
++	/* If getting the VLAN fails, set the VLAN to the fallback one */
+ 	if (!rc)
+-		return;
++		qedf_set_vlan_id(qedf, qedf_fallback_vlan);
+ 
+ 	/*
+ 	 * We need to wait for an FCF to be selected due to the
+@@ -968,6 +969,10 @@ static int qedf_xmit(struct fc_lport *lport, struct fc_frame *fp)
+ 	skb->mac_len = elen;
+ 	skb->protocol = htons(ETH_P_FCOE);
+ 
++	/*
++	 * Add VLAN tag to non-offload FCoE frame based on current stored VLAN
++	 * for FIP/FCoE traffic.
++	 */
+ 	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), qedf->vlan_id);
+ 
+ 	/* fill up mac and fcoe headers */
+@@ -3178,8 +3183,7 @@ static int __qedf_probe(struct pci_dev *pdev, int mode)
+ 	}
+ 	set_bit(QEDF_LL2_STARTED, &qedf->flags);
+ 
+-	/* hw will be insterting vlan tag*/
+-	qedf->vlan_hw_insert = 1;
++	/* Set initial FIP/FCoE VLAN to NULL */
+ 	qedf->vlan_id = 0;
+ 
+ 	/*
