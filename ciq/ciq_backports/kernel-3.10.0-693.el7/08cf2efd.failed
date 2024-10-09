@@ -1,0 +1,187 @@
+xprtrdma: Use smaller buffers for RPC-over-RDMA headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 08cf2efd5423121985af5962d66e6db14dff4130
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/08cf2efd.failed
+
+Commit 949317464bc2 ("xprtrdma: Limit number of RDMA segments in
+RPC-over-RDMA headers") capped the number of chunks that may appear
+in RPC-over-RDMA headers. The maximum header size can be estimated
+and fixed to avoid allocating buffer space that is never used.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 08cf2efd5423121985af5962d66e6db14dff4130)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/transport.c
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,94dbfd3e89a7..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -477,23 -477,108 +477,115 @@@ xprt_rdma_connect(struct rpc_xprt *xprt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ /* Allocate a fixed-size buffer in which to construct and send the
++  * RPC-over-RDMA header for this request.
++  */
++ static bool
++ rpcrdma_get_rdmabuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    gfp_t flags)
++ {
++ 	size_t size = RPCRDMA_HDRBUF_SIZE;
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_rdmabuf)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, size, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_rdmabuf = rb;
++ 	return true;
++ }
++ 
++ /* RPC/RDMA marshaling may choose to send payload bearing ops inline,
++  * if the resulting Call message is smaller than the inline threshold.
++  * The value of the "rq_callsize" argument accounts for RPC header
++  * requirements, but not for the data payload in these cases.
++  *
++  * See rpcrdma_inline_pullup.
++  */
++ static bool
++ rpcrdma_get_sendbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 	size_t min_size;
++ 
++ 	if (req->rl_sendbuf && rdmab_length(req->rl_sendbuf) >= size)
++ 		return true;
++ 
++ 	min_size = max_t(size_t, size, r_xprt->rx_data.inline_wsize);
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, min_size, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(&r_xprt->rx_ia, req->rl_sendbuf);
++ 	r_xprt->rx_stats.hardway_register_count += min_size;
++ 	req->rl_sendbuf = rb;
++ 	return true;
++ }
++ 
++ /* The rq_rcv_buf is used only if a Reply chunk is necessary.
++  * The decision to use a Reply chunk is made later in
++  * rpcrdma_marshal_req. This buffer is registered at that time.
++  *
++  * Otherwise, the associated RPC Reply arrives in a separate
++  * Receive buffer, arbitrarily chosen by the HCA. The buffer
++  * allocated here for the RPC Reply is not utilized in that
++  * case. See rpcrdma_inline_fixup.
++  *
++  * A regbuf is used here to remember the buffer size.
++  */
++ static bool
++ rpcrdma_get_recvbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_recvbuf && rdmab_length(req->rl_recvbuf) >= size)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, size, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(&r_xprt->rx_ia, req->rl_recvbuf);
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_recvbuf = rb;
++ 	return true;
++ }
++ 
++ /**
++  * xprt_rdma_allocate - allocate transport resources for an RPC
++  * @task: RPC task
++  *
++  * Return values:
++  *        0:	Success; rq_buffer points to RPC buffer to use
++  *   ENOMEM:	Out of memory, call again later
++  *      EIO:	A permanent error occurred, do not retry
++  *
+++>>>>>>> 08cf2efd5423 (xprtrdma: Use smaller buffers for RPC-over-RDMA headers)
+   * The RDMA allocate/free functions need the task structure as a place
+ - * to hide the struct rpcrdma_req, which is necessary for the actual
+ - * send/recv sequence.
+ + * to hide the struct rpcrdma_req, which is necessary for the actual send/recv
+ + * sequence.
+   *
+ - * xprt_rdma_allocate provides buffers that are already mapped for
+ - * DMA, and a local DMA lkey is provided for each.
+ + * The RPC layer allocates both send and receive buffers in the same call
+ + * (rq_send_buf and rq_rcv_buf are both part of a single contiguous buffer).
+ + * We may register rq_rcv_buf when using reply chunks.
+   */
+ -static int
+ -xprt_rdma_allocate(struct rpc_task *task)
+ +static void *
+ +xprt_rdma_allocate(struct rpc_task *task, size_t size)
+  {
+ -	struct rpc_rqst *rqst = task->tk_rqstp;
+ -	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ +	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+ +	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+ +	struct rpcrdma_regbuf *rb;
+  	struct rpcrdma_req *req;
+ +	size_t min_size;
+  	gfp_t flags;
+  
+  	req = rpcrdma_buffer_get(&r_xprt->rx_buf);
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index d3cfaf281e55..39a058e3bafc 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -45,13 +45,12 @@ static int rpcrdma_bc_setup_rqst(struct rpcrdma_xprt *r_xprt,
+ 		return PTR_ERR(req);
+ 	req->rl_backchannel = true;
+ 
+-	size = r_xprt->rx_data.inline_wsize;
+-	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
++	rb = rpcrdma_alloc_regbuf(ia, RPCRDMA_HDRBUF_SIZE, GFP_KERNEL);
+ 	if (IS_ERR(rb))
+ 		goto out_fail;
+ 	req->rl_rdmabuf = rb;
+ 
+-	size += r_xprt->rx_data.inline_rsize;
++	size = r_xprt->rx_data.inline_rsize;
+ 	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+ 	if (IS_ERR(rb))
+ 		goto out_fail;
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index be2bcc2ea72b..25944e987b92 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -163,7 +163,10 @@ rdmab_to_msg(struct rpcrdma_regbuf *rb)
+  * The smallest inline threshold is 1024 bytes, ensuring that
+  * at least 750 bytes are available for RPC messages.
+  */
+-#define RPCRDMA_MAX_HDR_SEGS	(8)
++enum {
++	RPCRDMA_MAX_HDR_SEGS = 8,
++	RPCRDMA_HDRBUF_SIZE = 256,
++};
+ 
+ /*
+  * struct rpcrdma_rep -- this structure encapsulates state required to recv
