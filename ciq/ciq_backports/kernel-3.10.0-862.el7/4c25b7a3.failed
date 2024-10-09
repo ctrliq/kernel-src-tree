@@ -1,0 +1,192 @@
+IB/mlx5: Fix cached MR allocation flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Majd Dibbiny <majd@mellanox.com>
+commit 4c25b7a39005c9243a492b577c3e940eeac36a25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4c25b7a3.failed
+
+When we have a miss in one order of the mkey cache, we try to get
+an mkey from a higher order.
+
+We still need to check that the higher order can be used with UMR
+before using it. Otherwise, we will get an mkey with 0 entries and
+the post send operation that is used to fill it will complete with
+the following error:
+
+mlx5_0:dump_cqe:275:(pid 0): dump error cqe
+00000000 00000000 00000000 00000000
+00000000 00000000 00000000 00000000
+00000000 0f007806 25000025 49ce59d2
+
+Fixes: 49780d42dfc9 ("IB/mlx5: Expose MR cache for mlx5_ib")
+	Cc: <stable@vger.kernel.org> # v4.10+
+	Signed-off-by: Majd Dibbiny <majd@mellanox.com>
+	Reviewed-by: Ilya Lesokhin <ilyal@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 4c25b7a39005c9243a492b577c3e940eeac36a25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 41cc30b2cbb2,a0eb2f96179a..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -46,14 -46,11 +46,20 @@@ enum 
+  };
+  
+  #define MLX5_UMR_ALIGN 2048
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +static __be64 mlx5_ib_update_mtt_emergency_buffer[
+ +		MLX5_UMR_MTT_MIN_CHUNK_SIZE/sizeof(__be64)]
+ +	__aligned(MLX5_UMR_ALIGN);
+ +static DEFINE_MUTEX(mlx5_ib_update_mtt_emergency_buffer_mutex);
+ +#endif
+  
+  static int clean_mr(struct mlx5_ib_mr *mr);
+++<<<<<<< HEAD
+++=======
++ static int max_umr_order(struct mlx5_ib_dev *dev);
++ static int use_umr(struct mlx5_ib_dev *dev, int order);
++ static int unreg_umr(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr);
+++>>>>>>> 4c25b7a39005 (IB/mlx5: Fix cached MR allocation flow)
+  
+  static int destroy_mkey(struct mlx5_ib_dev *dev, struct mlx5_ib_mr *mr)
+  {
+@@@ -461,12 -497,13 +468,21 @@@ static struct mlx5_ib_mr *alloc_cached_
+  	int i;
+  
+  	c = order2idx(dev, order);
+++<<<<<<< HEAD
+ +	if (c < 0 || c >= MAX_MR_CACHE_ENTRIES) {
+++=======
++ 	last_umr_cache_entry = order2idx(dev, max_umr_order(dev));
++ 	if (c < 0 || c > last_umr_cache_entry) {
+++>>>>>>> 4c25b7a39005 (IB/mlx5: Fix cached MR allocation flow)
+  		mlx5_ib_warn(dev, "order %d, cache index %d\n", order, c);
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = c; i < MAX_MR_CACHE_ENTRIES; i++) {
+++=======
++ 	for (i = c; i <= last_umr_cache_entry; i++) {
+++>>>>>>> 4c25b7a39005 (IB/mlx5: Fix cached MR allocation flow)
+  		ent = &cache->ent[i];
+  
+  		mlx5_ib_dbg(dev, "order %d, cache index %d\n", ent->order, i);
+@@@ -769,96 -819,16 +785,109 @@@ static int get_octo_len(u64 addr, u64 l
+  	return (npages + 1) / 2;
+  }
+  
+++<<<<<<< HEAD
+ +static int use_umr(int order)
+ +{
+ +	return order <= MLX5_MAX_UMR_SHIFT;
+++=======
++ static int max_umr_order(struct mlx5_ib_dev *dev)
++ {
++ 	if (MLX5_CAP_GEN(dev->mdev, umr_extended_translation_offset))
++ 		return MAX_UMR_CACHE_ENTRY + 2;
++ 	return MLX5_MAX_UMR_SHIFT;
++ }
++ 
++ static int use_umr(struct mlx5_ib_dev *dev, int order)
++ {
++ 	return order <= max_umr_order(dev);
+++>>>>>>> 4c25b7a39005 (IB/mlx5: Fix cached MR allocation flow)
+ +}
+ +
+ +static int dma_map_mr_pas(struct mlx5_ib_dev *dev, struct ib_umem *umem,
+ +			  int npages, int page_shift, int *size,
+ +			  __be64 **mr_pas, dma_addr_t *dma)
+ +{
+ +	__be64 *pas;
+ +	struct device *ddev = dev->ib_dev.dev.parent;
+ +
+ +	/*
+ +	 * UMR copies MTTs in units of MLX5_UMR_MTT_ALIGNMENT bytes.
+ +	 * To avoid copying garbage after the pas array, we allocate
+ +	 * a little more.
+ +	 */
+ +	*size = ALIGN(sizeof(struct mlx5_mtt) * npages, MLX5_UMR_MTT_ALIGNMENT);
+ +	*mr_pas = kmalloc(*size + MLX5_UMR_ALIGN - 1, GFP_KERNEL);
+ +	if (!(*mr_pas))
+ +		return -ENOMEM;
+ +
+ +	pas = PTR_ALIGN(*mr_pas, MLX5_UMR_ALIGN);
+ +	mlx5_ib_populate_pas(dev, umem, page_shift, pas, MLX5_IB_MTT_PRESENT);
+ +	/* Clear padding after the actual pages. */
+ +	memset(pas + npages, 0, *size - npages * sizeof(struct mlx5_mtt));
+ +
+ +	*dma = dma_map_single(ddev, pas, *size, DMA_TO_DEVICE);
+ +	if (dma_mapping_error(ddev, *dma)) {
+ +		kfree(*mr_pas);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static void prep_umr_wqe_common(struct ib_pd *pd, struct ib_send_wr *wr,
+ +				struct ib_sge *sg, u64 dma, int n, u32 key,
+ +				int page_shift)
+ +{
+ +	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ +	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ +
+ +	sg->addr = dma;
+ +	sg->length = ALIGN(sizeof(struct mlx5_mtt) * n,
+ +			   MLX5_IB_UMR_XLT_ALIGNMENT);
+ +	sg->lkey = dev->umrc.pd->local_dma_lkey;
+ +
+ +	wr->next = NULL;
+ +	wr->sg_list = sg;
+ +	if (n)
+ +		wr->num_sge = 1;
+ +	else
+ +		wr->num_sge = 0;
+ +
+ +	wr->opcode = MLX5_IB_WR_UMR;
+ +
+ +	umrwr->xlt_size = sg->length;
+ +	umrwr->page_shift = page_shift;
+ +	umrwr->mkey = key;
+ +}
+ +
+ +static void prep_umr_reg_wqe(struct ib_pd *pd, struct ib_send_wr *wr,
+ +			     struct ib_sge *sg, u64 dma, int n, u32 key,
+ +			     int page_shift, u64 virt_addr, u64 len,
+ +			     int access_flags)
+ +{
+ +	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ +
+ +	prep_umr_wqe_common(pd, wr, sg, dma, n, key, page_shift);
+ +
+ +	wr->send_flags = MLX5_IB_SEND_UMR_ENABLE_MR |
+ +			 MLX5_IB_SEND_UMR_UPDATE_TRANSLATION |
+ +			 MLX5_IB_SEND_UMR_UPDATE_PD_ACCESS;
+ +
+ +	umrwr->virt_addr = virt_addr;
+ +	umrwr->length = len;
+ +	umrwr->access_flags = access_flags;
+ +	umrwr->pd = pd;
+ +}
+ +
+ +static void prep_umr_unreg_wqe(struct mlx5_ib_dev *dev,
+ +			       struct ib_send_wr *wr, u32 key)
+ +{
+ +	struct mlx5_umr_wr *umrwr = umr_wr(wr);
+ +
+ +	wr->send_flags = MLX5_IB_SEND_UMR_DISABLE_MR |
+ +			 MLX5_IB_SEND_UMR_FAIL_IF_FREE;
+ +	wr->opcode = MLX5_IB_WR_UMR;
+ +	umrwr->mkey = key;
+  }
+  
+  static int mr_umem_get(struct ib_pd *pd, u64 start, u64 length,
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
