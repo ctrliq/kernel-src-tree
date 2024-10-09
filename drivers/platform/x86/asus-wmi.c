@@ -271,7 +271,7 @@ static int asus_wmi_evaluate_method(u32 method_id, u32 arg0, u32 arg1,
 	union acpi_object *obj;
 	u32 tmp;
 
-	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 1, method_id,
+	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID, 0, method_id,
 				     &input, &output);
 
 	if (ACPI_FAILURE(status))
@@ -1669,7 +1669,7 @@ static int show_call(struct seq_file *m, void *data)
 		return -EPERM;
 
 	status = wmi_evaluate_method(ASUS_WMI_MGMT_GUID,
-				     1, asus->debug.method_id,
+				     0, asus->debug.method_id,
 				     &input, &output);
 
 	if (ACPI_FAILURE(status))
