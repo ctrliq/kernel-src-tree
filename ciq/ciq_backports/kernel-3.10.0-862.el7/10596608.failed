@@ -1,0 +1,442 @@
+netfilter: nf_tables: fix mismatch in big-endian system
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Liping Zhang <zlpnobody@gmail.com>
+commit 10596608c4d62cb8c1c2b806debcbd32fe657e71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/10596608.failed
+
+Currently, there are two different methods to store an u16 integer to
+the u32 data register. For example:
+  u32 *dest = &regs->data[priv->dreg];
+  1. *dest = 0; *(u16 *) dest = val_u16;
+  2. *dest = val_u16;
+
+For method 1, the u16 value will be stored like this, either in
+big-endian or little-endian system:
+  0          15           31
+  +-+-+-+-+-+-+-+-+-+-+-+-+
+  |   Value   |     0     |
+  +-+-+-+-+-+-+-+-+-+-+-+-+
+
+For method 2, in little-endian system, the u16 value will be the same
+as listed above. But in big-endian system, the u16 value will be stored
+like this:
+  0          15           31
+  +-+-+-+-+-+-+-+-+-+-+-+-+
+  |     0     |   Value   |
+  +-+-+-+-+-+-+-+-+-+-+-+-+
+
+So later we use "memcmp(&regs->data[priv->sreg], data, 2);" to do
+compare in nft_cmp, nft_lookup expr ..., method 2 will get the wrong
+result in big-endian system, as 0~15 bits will always be zero.
+
+For the similar reason, when loading an u16 value from the u32 data
+register, we should use "*(u16 *) sreg;" instead of "(u16)*sreg;",
+the 2nd method will get the wrong value in the big-endian system.
+
+So introduce some wrapper functions to store/load an u8 or u16
+integer to/from the u32 data register, and use them in the right
+place.
+
+	Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 10596608c4d62cb8c1c2b806debcbd32fe657e71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_ct.c
+#	net/netfilter/nft_meta.c
+diff --cc net/netfilter/nft_ct.c
+index 99db2148319d,91585b5e5307..000000000000
+--- a/net/netfilter/nft_ct.c
++++ b/net/netfilter/nft_ct.c
+@@@ -128,6 -134,42 +128,45 @@@ static void nft_ct_get_eval(const struc
+  		memcpy(dest, &count, sizeof(count));
+  		return;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case NFT_CT_AVGPKT: {
++ 		const struct nf_conn_acct *acct = nf_conn_acct_find(ct);
++ 		u64 avgcnt = 0, bcnt = 0, pcnt = 0;
++ 
++ 		if (acct) {
++ 			pcnt = nft_ct_get_eval_counter(acct->counter,
++ 						       NFT_CT_PKTS, priv->dir);
++ 			bcnt = nft_ct_get_eval_counter(acct->counter,
++ 						       NFT_CT_BYTES, priv->dir);
++ 			if (pcnt != 0)
++ 				avgcnt = div64_u64(bcnt, pcnt);
++ 		}
++ 
++ 		memcpy(dest, &avgcnt, sizeof(avgcnt));
++ 		return;
++ 	}
++ 	case NFT_CT_L3PROTOCOL:
++ 		nft_reg_store8(dest, nf_ct_l3num(ct));
++ 		return;
++ 	case NFT_CT_PROTOCOL:
++ 		nft_reg_store8(dest, nf_ct_protonum(ct));
++ 		return;
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ 	case NFT_CT_ZONE: {
++ 		const struct nf_conntrack_zone *zone = nf_ct_zone(ct);
++ 		u16 zoneid;
++ 
++ 		if (priv->dir < IP_CT_DIR_MAX)
++ 			zoneid = nf_ct_zone_id(zone, priv->dir);
++ 		else
++ 			zoneid = zone->id;
++ 
++ 		nft_reg_store16(dest, zoneid);
++ 		return;
++ 	}
++ #endif
+++>>>>>>> 10596608c4d6 (netfilter: nf_tables: fix mismatch in big-endian system)
+  	default:
+  		break;
+  	}
+@@@ -145,14 -184,11 +184,14 @@@
+  		memcpy(dest, tuple->dst.u3.all,
+  		       nf_ct_l3num(ct) == NFPROTO_IPV4 ? 4 : 16);
+  		return;
+ +	case NFT_CT_PROTOCOL:
+ +		*dest = nf_ct_protonum(ct);
+ +		return;
+  	case NFT_CT_PROTO_SRC:
+- 		*dest = (__force __u16)tuple->src.u.all;
++ 		nft_reg_store16(dest, (__force u16)tuple->src.u.all);
+  		return;
+  	case NFT_CT_PROTO_DST:
+- 		*dest = (__force __u16)tuple->dst.u.all;
++ 		nft_reg_store16(dest, (__force u16)tuple->dst.u.all);
+  		return;
+  	default:
+  		break;
+@@@ -162,6 -198,53 +201,56 @@@ err
+  	regs->verdict.code = NFT_BREAK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NF_CONNTRACK_ZONES
++ static void nft_ct_set_zone_eval(const struct nft_expr *expr,
++ 				 struct nft_regs *regs,
++ 				 const struct nft_pktinfo *pkt)
++ {
++ 	struct nf_conntrack_zone zone = { .dir = NF_CT_DEFAULT_ZONE_DIR };
++ 	const struct nft_ct *priv = nft_expr_priv(expr);
++ 	struct sk_buff *skb = pkt->skb;
++ 	enum ip_conntrack_info ctinfo;
++ 	u16 value = nft_reg_load16(&regs->data[priv->sreg]);
++ 	struct nf_conn *ct;
++ 
++ 	ct = nf_ct_get(skb, &ctinfo);
++ 	if (ct) /* already tracked */
++ 		return;
++ 
++ 	zone.id = value;
++ 
++ 	switch (priv->dir) {
++ 	case IP_CT_DIR_ORIGINAL:
++ 		zone.dir = NF_CT_ZONE_DIR_ORIG;
++ 		break;
++ 	case IP_CT_DIR_REPLY:
++ 		zone.dir = NF_CT_ZONE_DIR_REPL;
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	ct = this_cpu_read(nft_ct_pcpu_template);
++ 
++ 	if (likely(atomic_read(&ct->ct_general.use) == 1)) {
++ 		nf_ct_zone_add(ct, &zone);
++ 	} else {
++ 		/* previous skb got queued to userspace */
++ 		ct = nf_ct_tmpl_alloc(nft_net(pkt), &zone, GFP_ATOMIC);
++ 		if (!ct) {
++ 			regs->verdict.code = NF_DROP;
++ 			return;
++ 		}
++ 	}
++ 
++ 	atomic_inc(&ct->ct_general.use);
++ 	nf_ct_set(skb, ct, IP_CT_NEW);
++ }
++ #endif
++ 
+++>>>>>>> 10596608c4d6 (netfilter: nf_tables: fix mismatch in big-endian system)
+  static void nft_ct_set_eval(const struct nft_expr *expr,
+  			    struct nft_regs *regs,
+  			    const struct nft_pktinfo *pkt)
+diff --cc net/netfilter/nft_meta.c
+index 9e9434994d10,7b60e01f38ff..000000000000
+--- a/net/netfilter/nft_meta.c
++++ b/net/netfilter/nft_meta.c
+@@@ -42,14 -45,15 +42,22 @@@ void nft_meta_get_eval(const struct nft
+  		*dest = skb->len;
+  		break;
+  	case NFT_META_PROTOCOL:
+- 		*dest = 0;
+- 		*(__be16 *)dest = skb->protocol;
++ 		nft_reg_store16(dest, (__force u16)skb->protocol);
+  		break;
+  	case NFT_META_NFPROTO:
+++<<<<<<< HEAD
+ +		*dest = pkt->pf;
+ +		break;
+ +	case NFT_META_L4PROTO:
+ +		*dest = pkt->tprot;
+++=======
++ 		nft_reg_store8(dest, nft_pf(pkt));
++ 		break;
++ 	case NFT_META_L4PROTO:
++ 		if (!pkt->tprot_set)
++ 			goto err;
++ 		nft_reg_store8(dest, pkt->tprot);
+++>>>>>>> 10596608c4d6 (netfilter: nf_tables: fix mismatch in big-endian system)
+  		break;
+  	case NFT_META_PRIORITY:
+  		*dest = skb->priority;
+@@@ -86,17 -89,17 +93,16 @@@
+  	case NFT_META_OIFTYPE:
+  		if (out == NULL)
+  			goto err;
+- 		*dest = 0;
+- 		*(u16 *)dest = out->type;
++ 		nft_reg_store16(dest, out->type);
+  		break;
+  	case NFT_META_SKUID:
+ -		sk = skb_to_full_sk(skb);
+ -		if (!sk || !sk_fullsock(sk))
+ +		if (skb->sk == NULL || !sk_fullsock(skb->sk))
+  			goto err;
+  
+ -		read_lock_bh(&sk->sk_callback_lock);
+ -		if (sk->sk_socket == NULL ||
+ -		    sk->sk_socket->file == NULL) {
+ -			read_unlock_bh(&sk->sk_callback_lock);
+ +		read_lock_bh(&skb->sk->sk_callback_lock);
+ +		if (skb->sk->sk_socket == NULL ||
+ +		    skb->sk->sk_socket->file == NULL) {
+ +			read_unlock_bh(&skb->sk->sk_callback_lock);
+  			goto err;
+  		}
+  
+@@@ -139,21 -143,44 +145,51 @@@
+  			break;
+  		}
+  
+ -		switch (nft_pf(pkt)) {
+ +		switch (pkt->pf) {
+  		case NFPROTO_IPV4:
+  			if (ipv4_is_multicast(ip_hdr(skb)->daddr))
+- 				*dest = PACKET_MULTICAST;
++ 				nft_reg_store8(dest, PACKET_MULTICAST);
+  			else
+- 				*dest = PACKET_BROADCAST;
++ 				nft_reg_store8(dest, PACKET_BROADCAST);
+  			break;
+  		case NFPROTO_IPV6:
+++<<<<<<< HEAD
+ +			if (ipv6_hdr(skb)->daddr.s6_addr[0] == 0xFF)
+ +				*dest = PACKET_MULTICAST;
+ +			else
+ +				*dest = PACKET_BROADCAST;
+++=======
++ 			nft_reg_store8(dest, PACKET_MULTICAST);
++ 			break;
++ 		case NFPROTO_NETDEV:
++ 			switch (skb->protocol) {
++ 			case htons(ETH_P_IP): {
++ 				int noff = skb_network_offset(skb);
++ 				struct iphdr *iph, _iph;
++ 
++ 				iph = skb_header_pointer(skb, noff,
++ 							 sizeof(_iph), &_iph);
++ 				if (!iph)
++ 					goto err;
++ 
++ 				if (ipv4_is_multicast(iph->daddr))
++ 					nft_reg_store8(dest, PACKET_MULTICAST);
++ 				else
++ 					nft_reg_store8(dest, PACKET_BROADCAST);
++ 
++ 				break;
++ 			}
++ 			case htons(ETH_P_IPV6):
++ 				nft_reg_store8(dest, PACKET_MULTICAST);
++ 				break;
++ 			default:
++ 				WARN_ON_ONCE(1);
++ 				goto err;
++ 			}
+++>>>>>>> 10596608c4d6 (netfilter: nf_tables: fix mismatch in big-endian system)
+  			break;
+  		default:
+ -			WARN_ON_ONCE(1);
+ +			WARN_ON(1);
+  			goto err;
+  		}
+  		break;
+@@@ -202,12 -239,15 +240,15 @@@ void nft_meta_set_eval(const struct nft
+  		skb->priority = value;
+  		break;
+  	case NFT_META_PKTTYPE:
+- 		if (skb->pkt_type != value &&
+- 		    skb_pkt_type_ok(value) && skb_pkt_type_ok(skb->pkt_type))
+- 			skb->pkt_type = value;
++ 		pkt_type = nft_reg_load8(sreg);
++ 
++ 		if (skb->pkt_type != pkt_type &&
++ 		    skb_pkt_type_ok(pkt_type) &&
++ 		    skb_pkt_type_ok(skb->pkt_type))
++ 			skb->pkt_type = pkt_type;
+  		break;
+  	case NFT_META_NFTRACE:
+ -		skb->nf_trace = !!value;
+ +		skb->nf_trace = 1;
+  		break;
+  	default:
+  		WARN_ON(1);
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 8948cc291b70..6c2dc3b0f434 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -72,6 +72,35 @@ struct nft_regs {
+ 	};
+ };
+ 
++/* Store/load an u16 or u8 integer to/from the u32 data register.
++ *
++ * Note, when using concatenations, register allocation happens at 32-bit
++ * level. So for store instruction, pad the rest part with zero to avoid
++ * garbage values.
++ */
++
++static inline void nft_reg_store16(u32 *dreg, u16 val)
++{
++	*dreg = 0;
++	*(u16 *)dreg = val;
++}
++
++static inline void nft_reg_store8(u32 *dreg, u8 val)
++{
++	*dreg = 0;
++	*(u8 *)dreg = val;
++}
++
++static inline u16 nft_reg_load16(u32 *sreg)
++{
++	return *(u16 *)sreg;
++}
++
++static inline u8 nft_reg_load8(u32 *sreg)
++{
++	return *(u8 *)sreg;
++}
++
+ static inline void nft_data_copy(u32 *dst, const struct nft_data *src,
+ 				 unsigned int len)
+ {
+diff --git a/net/ipv4/netfilter/nft_masq_ipv4.c b/net/ipv4/netfilter/nft_masq_ipv4.c
+index 51ced81b616c..dc3628a396ec 100644
+--- a/net/ipv4/netfilter/nft_masq_ipv4.c
++++ b/net/ipv4/netfilter/nft_masq_ipv4.c
+@@ -26,10 +26,10 @@ static void nft_masq_ipv4_eval(const struct nft_expr *expr,
+ 	memset(&range, 0, sizeof(range));
+ 	range.flags = priv->flags;
+ 	if (priv->sreg_proto_min) {
+-		range.min_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_min];
+-		range.max_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_max];
++		range.min_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_min]);
++		range.max_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_max]);
+ 	}
+ 	regs->verdict.code = nf_nat_masquerade_ipv4(pkt->skb, pkt->hook,
+ 						    &range, pkt->out);
+diff --git a/net/ipv4/netfilter/nft_redir_ipv4.c b/net/ipv4/netfilter/nft_redir_ipv4.c
+index c09d4381427e..f760524e1353 100644
+--- a/net/ipv4/netfilter/nft_redir_ipv4.c
++++ b/net/ipv4/netfilter/nft_redir_ipv4.c
+@@ -26,10 +26,10 @@ static void nft_redir_ipv4_eval(const struct nft_expr *expr,
+ 
+ 	memset(&mr, 0, sizeof(mr));
+ 	if (priv->sreg_proto_min) {
+-		mr.range[0].min.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_min];
+-		mr.range[0].max.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_max];
++		mr.range[0].min.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_min]);
++		mr.range[0].max.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_max]);
+ 		mr.range[0].flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+ 	}
+ 
+diff --git a/net/ipv6/netfilter/nft_masq_ipv6.c b/net/ipv6/netfilter/nft_masq_ipv6.c
+index 9597ffb74077..b74a420050c4 100644
+--- a/net/ipv6/netfilter/nft_masq_ipv6.c
++++ b/net/ipv6/netfilter/nft_masq_ipv6.c
+@@ -27,10 +27,10 @@ static void nft_masq_ipv6_eval(const struct nft_expr *expr,
+ 	memset(&range, 0, sizeof(range));
+ 	range.flags = priv->flags;
+ 	if (priv->sreg_proto_min) {
+-		range.min_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_min];
+-		range.max_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_max];
++		range.min_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_min]);
++		range.max_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_max]);
+ 	}
+ 	regs->verdict.code = nf_nat_masquerade_ipv6(pkt->skb, &range, pkt->out);
+ }
+diff --git a/net/ipv6/netfilter/nft_redir_ipv6.c b/net/ipv6/netfilter/nft_redir_ipv6.c
+index aca44e89a881..7ef58e493fca 100644
+--- a/net/ipv6/netfilter/nft_redir_ipv6.c
++++ b/net/ipv6/netfilter/nft_redir_ipv6.c
+@@ -26,10 +26,10 @@ static void nft_redir_ipv6_eval(const struct nft_expr *expr,
+ 
+ 	memset(&range, 0, sizeof(range));
+ 	if (priv->sreg_proto_min) {
+-		range.min_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_min],
+-		range.max_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_max],
++		range.min_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_min]);
++		range.max_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_max]);
+ 		range.flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+ 	}
+ 
+* Unmerged path net/netfilter/nft_ct.c
+* Unmerged path net/netfilter/nft_meta.c
+diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
+index ee2d71753746..4c48e9bb21e2 100644
+--- a/net/netfilter/nft_nat.c
++++ b/net/netfilter/nft_nat.c
+@@ -65,10 +65,10 @@ static void nft_nat_eval(const struct nft_expr *expr,
+ 	}
+ 
+ 	if (priv->sreg_proto_min) {
+-		range.min_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_min];
+-		range.max_proto.all =
+-			*(__be16 *)&regs->data[priv->sreg_proto_max];
++		range.min_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_min]);
++		range.max_proto.all = (__force __be16)nft_reg_load16(
++			&regs->data[priv->sreg_proto_max]);
+ 		range.flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+ 	}
+ 
