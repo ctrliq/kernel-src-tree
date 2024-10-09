@@ -1,0 +1,169 @@
+xdp: export xdp_rxq_info_unreg_mem_model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit dce5bd6140a436e3348f6d13a1efb6e6c5a89acd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dce5bd61.failed
+
+Export __xdp_rxq_info_unreg_mem_model as xdp_rxq_info_unreg_mem_model,
+so it can be used from netdev drivers. Also, add additional checks for
+the memory type.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit dce5bd6140a436e3348f6d13a1efb6e6c5a89acd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/xdp.c
+diff --cc net/core/xdp.c
+index e553510efc2e,654dbb19707e..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -13,9 -20,124 +13,130 @@@
+  #define REG_STATE_UNREGISTERED	0x2
+  #define REG_STATE_UNUSED	0x3
+  
+++<<<<<<< HEAD
+ +void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq)
+ +{
+ +	return;
+++=======
++ static DEFINE_IDA(mem_id_pool);
++ static DEFINE_MUTEX(mem_id_lock);
++ #define MEM_ID_MAX 0xFFFE
++ #define MEM_ID_MIN 1
++ static int mem_id_next = MEM_ID_MIN;
++ 
++ static bool mem_id_init; /* false */
++ static struct rhashtable *mem_id_ht;
++ 
++ struct xdp_mem_allocator {
++ 	struct xdp_mem_info mem;
++ 	union {
++ 		void *allocator;
++ 		struct page_pool *page_pool;
++ 		struct zero_copy_allocator *zc_alloc;
++ 	};
++ 	struct rhash_head node;
++ 	struct rcu_head rcu;
++ };
++ 
++ static u32 xdp_mem_id_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const u32 *k = data;
++ 	const u32 key = *k;
++ 
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct xdp_mem_allocator, mem.id)
++ 		     != sizeof(u32));
++ 
++ 	/* Use cyclic increasing ID as direct hash key */
++ 	return key;
++ }
++ 
++ static int xdp_mem_id_cmp(struct rhashtable_compare_arg *arg,
++ 			  const void *ptr)
++ {
++ 	const struct xdp_mem_allocator *xa = ptr;
++ 	u32 mem_id = *(u32 *)arg->key;
++ 
++ 	return xa->mem.id != mem_id;
++ }
++ 
++ static const struct rhashtable_params mem_id_rht_params = {
++ 	.nelem_hint = 64,
++ 	.head_offset = offsetof(struct xdp_mem_allocator, node),
++ 	.key_offset  = offsetof(struct xdp_mem_allocator, mem.id),
++ 	.key_len = FIELD_SIZEOF(struct xdp_mem_allocator, mem.id),
++ 	.max_size = MEM_ID_MAX,
++ 	.min_size = 8,
++ 	.automatic_shrinking = true,
++ 	.hashfn    = xdp_mem_id_hashfn,
++ 	.obj_cmpfn = xdp_mem_id_cmp,
++ };
++ 
++ static void __xdp_mem_allocator_rcu_free(struct rcu_head *rcu)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 
++ 	xa = container_of(rcu, struct xdp_mem_allocator, rcu);
++ 
++ 	/* Allow this ID to be reused */
++ 	ida_simple_remove(&mem_id_pool, xa->mem.id);
++ 
++ 	/* Notice, driver is expected to free the *allocator,
++ 	 * e.g. page_pool, and MUST also use RCU free.
++ 	 */
++ 
++ 	/* Poison memory */
++ 	xa->mem.id = 0xFFFF;
++ 	xa->mem.type = 0xF0F0;
++ 	xa->allocator = (void *)0xDEAD9001;
++ 
++ 	kfree(xa);
++ }
++ 
++ void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	int id = xdp_rxq->mem.id;
++ 
++ 	if (xdp_rxq->reg_state != REG_STATE_REGISTERED) {
++ 		WARN(1, "Missing register, driver bug");
++ 		return;
++ 	}
++ 
++ 	if (xdp_rxq->mem.type != MEM_TYPE_PAGE_POOL &&
++ 	    xdp_rxq->mem.type != MEM_TYPE_ZERO_COPY) {
++ 		return;
++ 	}
++ 
++ 	if (id == 0)
++ 		return;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
++ 	if (xa && !rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
++ 		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ }
++ EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg_mem_model);
++ 
++ void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq)
++ {
++ 	/* Simplify driver cleanup code paths, allow unreg "unused" */
++ 	if (xdp_rxq->reg_state == REG_STATE_UNUSED)
++ 		return;
++ 
++ 	WARN(!(xdp_rxq->reg_state == REG_STATE_REGISTERED), "Driver BUG");
++ 
++ 	xdp_rxq_info_unreg_mem_model(xdp_rxq);
++ 
++ 	xdp_rxq->reg_state = REG_STATE_UNREGISTERED;
++ 	xdp_rxq->dev = NULL;
++ 
++ 	/* Reset mem info to defaults */
++ 	xdp_rxq->mem.id = 0;
++ 	xdp_rxq->mem.type = 0;
+++>>>>>>> dce5bd6140a4 (xdp: export xdp_rxq_info_unreg_mem_model)
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg);
+  
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index 6ac69520ed7c..941b350a0f83 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -89,6 +89,7 @@ void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq);
+ bool xdp_rxq_info_is_reg(struct xdp_rxq_info *xdp_rxq);
+ int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
+ 			       enum xdp_mem_type type, void *allocator);
++void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq);
+ 
+ /* Drivers not supporting XDP metadata can use this helper, which
+  * rejects any room expansion for metadata as a result.
+* Unmerged path net/core/xdp.c
