@@ -653,6 +653,10 @@ void __rds_conn_error(struct rds_connection *conn, const char *, ...);
 #define rds_conn_error(conn, fmt...) \
 	__rds_conn_error(conn, KERN_WARNING "RDS: " fmt)
 
+void __rds_conn_path_error(struct rds_conn_path *cp, const char *, ...);
+#define rds_conn_path_error(cp, fmt...) \
+	__rds_conn_path_error(cp, KERN_WARNING "RDS: " fmt)
+
 static inline int
 rds_conn_transition(struct rds_connection *conn, int old, int new)
 {

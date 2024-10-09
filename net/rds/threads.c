@@ -157,7 +157,8 @@ void rds_connect_worker(struct work_struct *work)
 			if (rds_conn_transition(conn, RDS_CONN_CONNECTING, RDS_CONN_DOWN))
 				rds_queue_reconnect(conn);
 			else
-				rds_conn_error(conn, "RDS: connect failed\n");
+				rds_conn_path_error(cp,
+						    "RDS: connect failed\n");
 		}
 	}
 }
