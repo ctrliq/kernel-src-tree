@@ -1,0 +1,114 @@
+NFSv4: change nfs4_select_rw_stateid to take a lock_context inplace of lock_owner
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author NeilBrown <neilb@suse.com>
+commit 1739347549653dc2463d208d7039f5e97b8f1e8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/17393475.failed
+
+The only time that a lock_context is not immediately available is in
+setattr, and now that it has an open_context, it can easily find one
+with nfs_get_lock_context.
+This removes the need for the on-stack nfs_lockowner.
+
+This change is preparation for correctly support flock stateids.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 1739347549653dc2463d208d7039f5e97b8f1e8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index b211a49fc834,1c629f5e1ae5..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -2911,14 -2944,14 +2911,25 @@@ static int _nfs4_do_setattr(struct inod
+  
+  	if (nfs4_copy_delegation_stateid(inode, fmode, &arg->stateid, &delegation_cred)) {
+  		/* Use that stateid */
+++<<<<<<< HEAD
+ +	} else if (truncate && state != NULL) {
+ +		struct nfs_lockowner lockowner = {
+ +			.l_owner = current->files,
+ +			.l_pid = current->tgid,
+ +		};
+ +		if (!nfs4_valid_open_stateid(state))
+ +			return -EBADF;
+ +		if (nfs4_select_rw_stateid(state, FMODE_WRITE, &lockowner,
+++=======
++ 	} else if (truncate && ctx != NULL) {
++ 		struct nfs_lock_context *l_ctx;
++ 		if (!nfs4_valid_open_stateid(ctx->state))
++ 			return -EBADF;
++ 		l_ctx = nfs_get_lock_context(ctx);
++ 		if (IS_ERR(l_ctx))
++ 			return PTR_ERR(l_ctx);
++ 		if (nfs4_select_rw_stateid(ctx->state, FMODE_WRITE, l_ctx,
+++>>>>>>> 173934754965 (NFSv4: change nfs4_select_rw_stateid to take a lock_context inplace of lock_owner)
+  				&arg->stateid, &delegation_cred) == -EIO)
+  			return -EBADF;
+  	} else
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index b1f6c0566777..3eab0f1262f4 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -456,7 +456,7 @@ extern void nfs41_handle_server_scope(struct nfs_client *,
+ extern void nfs4_put_lock_state(struct nfs4_lock_state *lsp);
+ extern int nfs4_set_lock_state(struct nfs4_state *state, struct file_lock *fl);
+ extern int nfs4_select_rw_stateid(struct nfs4_state *, fmode_t,
+-		const struct nfs_lockowner *, nfs4_stateid *,
++		const struct nfs_lock_context *, nfs4_stateid *,
+ 		struct rpc_cred **);
+ 
+ extern struct nfs_seqid *nfs_alloc_seqid(struct nfs_seqid_counter *counter, gfp_t gfp_mask);
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4state.c b/fs/nfs/nfs4state.c
+index 9ae72244a959..04beef87a34a 100644
+--- a/fs/nfs/nfs4state.c
++++ b/fs/nfs/nfs4state.c
+@@ -936,20 +936,19 @@ int nfs4_set_lock_state(struct nfs4_state *state, struct file_lock *fl)
+ 
+ static int nfs4_copy_lock_stateid(nfs4_stateid *dst,
+ 		struct nfs4_state *state,
+-		const struct nfs_lockowner *lockowner)
++		const struct nfs_lock_context *l_ctx)
+ {
+ 	struct nfs4_lock_state *lsp;
+ 	fl_owner_t fl_owner;
+ 	int ret = -ENOENT;
+ 
+-
+-	if (lockowner == NULL)
++	if (l_ctx == NULL)
+ 		goto out;
+ 
+ 	if (test_bit(LK_STATE_IN_USE, &state->flags) == 0)
+ 		goto out;
+ 
+-	fl_owner = lockowner->l_owner;
++	fl_owner = l_ctx->lockowner.l_owner;
+ 	spin_lock(&state->state_lock);
+ 	lsp = __nfs4_find_lock_state(state, fl_owner);
+ 	if (lsp && test_bit(NFS_LOCK_LOST, &lsp->ls_flags))
+@@ -983,14 +982,14 @@ static void nfs4_copy_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
+  * requests.
+  */
+ int nfs4_select_rw_stateid(struct nfs4_state *state,
+-		fmode_t fmode, const struct nfs_lockowner *lockowner,
++		fmode_t fmode, const struct nfs_lock_context *l_ctx,
+ 		nfs4_stateid *dst, struct rpc_cred **cred)
+ {
+ 	int ret;
+ 
+ 	if (cred != NULL)
+ 		*cred = NULL;
+-	ret = nfs4_copy_lock_stateid(dst, state, lockowner);
++	ret = nfs4_copy_lock_stateid(dst, state, l_ctx);
+ 	if (ret == -EIO)
+ 		/* A lost lock - don't even consider delegations */
+ 		goto out;
