@@ -1,0 +1,216 @@
+blk-mq: provide internal in-flight variant
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit f299b7c7a9dee64425e5965bd4f56dc024c1befc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f299b7c7.failed
+
+We don't have to inc/dec some counter, since we can just
+iterate the tags. That makes inc/dec a noop, but means we
+have to iterate busy tags to get an in-flight count.
+
+	Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f299b7c7a9dee64425e5965bd4f56dc024c1befc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.h
+#	include/linux/genhd.h
+diff --cc block/blk-mq.h
+index a1edc1df16f2,98252b79b80b..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -160,53 -133,7 +160,58 @@@ static inline bool blk_mq_hw_queue_mapp
+  	return hctx->nr_ctx && hctx->tags;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void blk_mq_put_dispatch_budget(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	struct request_queue *q = hctx->queue;
+ +
+ +	if (q->mq_ops->aux_ops && q->mq_ops->aux_ops->put_budget)
+ +		q->mq_ops->aux_ops->put_budget(hctx);
+ +}
+ +
+ +static inline bool blk_mq_get_dispatch_budget(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	struct request_queue *q = hctx->queue;
+ +
+ +	if (q->mq_ops->aux_ops && q->mq_ops->aux_ops->get_budget)
+ +		return q->mq_ops->aux_ops->get_budget(hctx);
+ +	return true;
+ +}
+ +
+ +static inline void __blk_mq_put_driver_tag(struct blk_mq_hw_ctx *hctx,
+ +					   struct request *rq)
+ +{
+ +	blk_mq_put_tag(hctx, hctx->tags, rq->mq_ctx, rq->tag);
+ +	rq->tag = -1;
+ +
+ +	if (rq->cmd_flags & REQ_MQ_INFLIGHT) {
+ +		rq->cmd_flags &= ~REQ_MQ_INFLIGHT;
+ +		atomic_dec(&hctx->nr_active);
+ +	}
+ +}
+ +
+ +static inline void blk_mq_put_driver_tag_hctx(struct blk_mq_hw_ctx *hctx,
+ +				       struct request *rq)
+ +{
+ +	if (rq->tag == -1 || rq_aux(rq)->internal_tag == -1)
+ +		return;
+ +
+ +	__blk_mq_put_driver_tag(hctx, rq);
+ +}
+ +
+ +static inline void blk_mq_put_driver_tag(struct request *rq)
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +
+ +	if (rq->tag == -1 || rq_aux(rq)->internal_tag == -1)
+ +		return;
+ +
+ +	hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu);
+ +	__blk_mq_put_driver_tag(hctx, rq);
+ +}
+++=======
++ void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			unsigned int inflight[2]);
+++>>>>>>> f299b7c7a9de (blk-mq: provide internal in-flight variant)
+  
+  #endif
+diff --cc include/linux/genhd.h
+index 4292be9dbdf8,ea652bfcd675..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -382,24 -362,12 +382,33 @@@ static inline void free_part_stats(stru
+  #define part_stat_sub(cpu, gendiskp, field, subnd)			\
+  	part_stat_add(cpu, gendiskp, field, -subnd)
+  
+++<<<<<<< HEAD
+ +static inline void part_inc_in_flight(struct hd_struct *part, int rw)
+ +{
+ +	atomic_inc(&part->in_flight[rw]);
+ +	if (part->partno)
+ +		atomic_inc(&part_to_disk(part)->part0.in_flight[rw]);
+ +}
+ +
+ +static inline void part_dec_in_flight(struct hd_struct *part, int rw)
+ +{
+ +	atomic_dec(&part->in_flight[rw]);
+ +	if (part->partno)
+ +		atomic_dec(&part_to_disk(part)->part0.in_flight[rw]);
+ +}
+ +
+ +static inline int part_in_flight(struct hd_struct *part)
+ +{
+ +	return atomic_read(&part->in_flight[0]) + atomic_read(&part->in_flight[1]);
+ +}
+++=======
++ void part_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			unsigned int inflight[2]);
++ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
+++>>>>>>> f299b7c7a9de (blk-mq: provide internal in-flight variant)
+  
+  static inline struct partition_meta_info *alloc_part_info(struct gendisk *disk)
+  {
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a8e551c0c631..21845989d707 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -65,6 +65,37 @@ static void blk_mq_hctx_clear_pending(struct blk_mq_hw_ctx *hctx,
+ 	sbitmap_clear_bit(&hctx->ctx_map, ctx->index_hw);
+ }
+ 
++struct mq_inflight {
++	struct hd_struct *part;
++	unsigned int *inflight;
++};
++
++static void blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
++				  struct request *rq, void *priv,
++				  bool reserved)
++{
++	struct mq_inflight *mi = priv;
++
++	if (test_bit(REQ_ATOM_STARTED, &rq->atomic_flags) &&
++	    !test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags)) {
++		/*
++		 * Count as inflight if it either matches the partition we
++		 * asked for, or if it's the root
++		 */
++		if (rq->part == mi->part || mi->part->partno)
++			mi->inflight[0]++;
++	}
++}
++
++void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
++		      unsigned int inflight[2])
++{
++	struct mq_inflight mi = { .part = part, .inflight = inflight, };
++
++	inflight[0] = 0;
++	blk_mq_queue_tag_busy_iter(q, blk_mq_check_inflight, &mi);
++}
++
+ void blk_freeze_queue_start(struct request_queue *q)
+ {
+ 	int freeze_depth;
+* Unmerged path block/blk-mq.h
+diff --git a/block/genhd.c b/block/genhd.c
+index efc72b7773e8..6c1004bcc876 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -44,6 +44,43 @@ static void disk_add_events(struct gendisk *disk);
+ static void disk_del_events(struct gendisk *disk);
+ static void disk_release_events(struct gendisk *disk);
+ 
++void part_inc_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
++{
++	if (q->mq_ops)
++		return;
++
++	atomic_inc(&part->in_flight[rw]);
++	if (part->partno)
++		atomic_inc(&part_to_disk(part)->part0.in_flight[rw]);
++}
++
++void part_dec_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
++{
++	if (q->mq_ops)
++		return;
++
++	atomic_dec(&part->in_flight[rw]);
++	if (part->partno)
++		atomic_dec(&part_to_disk(part)->part0.in_flight[rw]);
++}
++
++void part_in_flight(struct request_queue *q, struct hd_struct *part,
++		    unsigned int inflight[2])
++{
++	if (q->mq_ops) {
++		blk_mq_in_flight(q, part, inflight);
++		return;
++	}
++
++	inflight[0] = atomic_read(&part->in_flight[0]) +
++			atomic_read(&part->in_flight[1]);
++	if (part->partno) {
++		part = &part_to_disk(part)->part0;
++		inflight[1] = atomic_read(&part->in_flight[0]) +
++				atomic_read(&part->in_flight[1]);
++	}
++}
++
+ /**
+  * disk_get_part - get partition
+  * @disk: disk to look partition from
+* Unmerged path include/linux/genhd.h
