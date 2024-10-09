@@ -1,0 +1,127 @@
+KVM: x86: work around leak of uninitialized stack contents
+
+jira LE-1907
+cve CVE-2019-7222
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Fuqian Huang <huangfq.daxian@gmail.com>
+commit 541ab2aeb28251bf7135c7961f3a6080eebcc705
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/541ab2ae.failed
+
+Emulation of VMPTRST can incorrectly inject a page fault
+when passed an operand that points to an MMIO address.
+The page fault will use uninitialized kernel stack memory
+as the CR2 and error code.
+
+The right behavior would be to abort the VM with a KVM_EXIT_INTERNAL_ERROR
+exit to userspace; however, it is not an easy fix, so for now just ensure
+that the error code and CR2 are zero.
+
+	Signed-off-by: Fuqian Huang <huangfq.daxian@gmail.com>
+	Cc: stable@vger.kernel.org
+[add comment]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 541ab2aeb28251bf7135c7961f3a6080eebcc705)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index bc19a3517278,91602d310a3f..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -4402,14 -5291,84 +4402,48 @@@ int kvm_write_guest_virt_system(struct 
+  out:
+  	return r;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int emulator_write_std(struct x86_emulate_ctxt *ctxt, gva_t addr, void *val,
++ 			      unsigned int bytes, struct x86_exception *exception,
++ 			      bool system)
++ {
++ 	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
++ 	u32 access = PFERR_WRITE_MASK;
++ 
++ 	if (!system && kvm_x86_ops->get_cpl(vcpu) == 3)
++ 		access |= PFERR_USER_MASK;
++ 
++ 	return kvm_write_guest_virt_helper(addr, val, bytes, vcpu,
++ 					   access, exception);
++ }
++ 
++ int kvm_write_guest_virt_system(struct kvm_vcpu *vcpu, gva_t addr, void *val,
++ 				unsigned int bytes, struct x86_exception *exception)
++ {
++ 	/* kvm_write_guest_virt_system can pull in tons of pages. */
++ 	vcpu->arch.l1tf_flush_l1d = true;
++ 
++ 	/*
++ 	 * FIXME: this should call handle_emulation_failure if X86EMUL_IO_NEEDED
++ 	 * is returned, but our callers are not ready for that and they blindly
++ 	 * call kvm_inject_page_fault.  Ensure that they at least do not leak
++ 	 * uninitialized kernel stack memory into cr2 and error code.
++ 	 */
++ 	memset(exception, 0, sizeof(*exception));
++ 	return kvm_write_guest_virt_helper(addr, val, bytes, vcpu,
++ 					   PFERR_WRITE_MASK, exception);
++ }
+++>>>>>>> 541ab2aeb282 (KVM: x86: work around leak of uninitialized stack contents)
+  EXPORT_SYMBOL_GPL(kvm_write_guest_virt_system);
+  
+ -int handle_ud(struct kvm_vcpu *vcpu)
+ +static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ +				gpa_t *gpa, struct x86_exception *exception,
+ +				bool write)
+  {
+ -	int emul_type = EMULTYPE_TRAP_UD;
+ -	enum emulation_result er;
+ -	char sig[5]; /* ud2; .ascii "kvm" */
+ -	struct x86_exception e;
+ -
+ -	if (force_emulation_prefix &&
+ -	    kvm_read_guest_virt(vcpu, kvm_get_linear_rip(vcpu),
+ -				sig, sizeof(sig), &e) == 0 &&
+ -	    memcmp(sig, "\xf\xbkvm", sizeof(sig)) == 0) {
+ -		kvm_rip_write(vcpu, kvm_rip_read(vcpu) + sizeof(sig));
+ -		emul_type = 0;
+ -	}
+ -
+ -	er = kvm_emulate_instruction(vcpu, emul_type);
+ -	if (er == EMULATE_USER_EXIT)
+ -		return 0;
+ -	if (er != EMULATE_DONE)
+ -		kvm_queue_exception(vcpu, UD_VECTOR);
+ -	return 1;
+ -}
+ -EXPORT_SYMBOL_GPL(handle_ud);
+ -
+ -static int vcpu_is_mmio_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ -			    gpa_t gpa, bool write)
+ -{
+ -	/* For APIC access vmexit */
+ -	if ((gpa & PAGE_MASK) == APIC_DEFAULT_PHYS_BASE)
+ -		return 1;
+ -
+ -	if (vcpu_match_mmio_gpa(vcpu, gpa)) {
+ -		trace_vcpu_match_mmio(gva, gpa, write, true);
+ -		return 1;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int vcpu_mmio_gva_to_gpa(struct kvm_vcpu *vcpu, unsigned long gva,
+ -				gpa_t *gpa, struct x86_exception *exception,
+ -				bool write)
+ -{
+ -	u32 access = ((kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0)
+ -		| (write ? PFERR_WRITE_MASK : 0);
+ +	u32 access = ((kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0)
+ +		| (write ? PFERR_WRITE_MASK : 0);
+  
+  	/*
+  	 * currently PKRU is only applied to ept enabled guest so
+* Unmerged path arch/x86/kvm/x86.c
