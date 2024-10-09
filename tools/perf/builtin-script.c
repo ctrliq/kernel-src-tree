@@ -115,6 +115,11 @@ struct output_option {
 	{.str = "brstackinsn", .field = PERF_OUTPUT_BRSTACKINSN},
 };
 
+enum {
+	OUTPUT_TYPE_SYNTH = PERF_TYPE_MAX,
+	OUTPUT_TYPE_MAX
+};
+
 /* default set to maintain compatibility with current format */
 static struct {
 	bool user_set;
@@ -122,7 +127,7 @@ static struct {
 	unsigned int print_ip_opts;
 	u64 fields;
 	u64 invalid_fields;
-} output[PERF_TYPE_MAX] = {
+} output[OUTPUT_TYPE_MAX] = {
 
 	[PERF_TYPE_HARDWARE] = {
 		.user_set = false,
@@ -180,12 +185,43 @@ static struct {
 
 		.invalid_fields = PERF_OUTPUT_TRACE,
 	},
+
+	[OUTPUT_TYPE_SYNTH] = {
+		.user_set = false,
+
+		.fields = PERF_OUTPUT_COMM | PERF_OUTPUT_TID |
+			      PERF_OUTPUT_CPU | PERF_OUTPUT_TIME |
+			      PERF_OUTPUT_EVNAME | PERF_OUTPUT_IP |
+			      PERF_OUTPUT_SYM | PERF_OUTPUT_DSO,
+
+		.invalid_fields = PERF_OUTPUT_TRACE | PERF_OUTPUT_BPF_OUTPUT,
+	},
 };
+
+static inline int output_type(unsigned int type)
+{
+	switch (type) {
+	case PERF_TYPE_SYNTH:
+		return OUTPUT_TYPE_SYNTH;
+	default:
+		return type;
+	}
+}
+
+static inline unsigned int attr_type(unsigned int type)
+{
+	switch (type) {
+	case OUTPUT_TYPE_SYNTH:
+		return PERF_TYPE_SYNTH;
+	default:
+		return type;
+	}
+}
 
 static bool output_set_by_user(void)
 {
 	int j;
-	for (j = 0; j < PERF_TYPE_MAX; ++j) {
+	for (j = 0; j < OUTPUT_TYPE_MAX; ++j) {
 		if (output[j].user_set)
 			return true;
 	}
@@ -206,7 +242,7 @@ static const char *output_field2str(enum perf_output_field field)
 	return str;
 }
 
-#define PRINT_FIELD(x)  (output[attr->type].fields & PERF_OUTPUT_##x)
+#define PRINT_FIELD(x)  (output[output_type(attr->type)].fields & PERF_OUTPUT_##x)
 
 static int perf_evsel__do_check_stype(struct perf_evsel *evsel,
 				      u64 sample_type, const char *sample_msg,
@@ -214,7 +250,7 @@ static int perf_evsel__do_check_stype(struct perf_evsel *evsel,
 				      bool allow_user_set)
 {
 	struct perf_event_attr *attr = &evsel->attr;
-	int type = attr->type;
+	int type = output_type(attr->type);
 	const char *evname;
 
 	if (attr->sample_type & sample_type)
@@ -344,7 +380,7 @@ static int perf_evsel__check_attr(struct perf_evsel *evsel,
 
 static void set_print_ip_opts(struct perf_event_attr *attr)
 {
-	unsigned int type = attr->type;
+	unsigned int type = output_type(attr->type);
 
 	output[type].print_ip_opts = 0;
 	if (PRINT_FIELD(IP))
@@ -372,14 +408,15 @@ static int perf_session__check_output_opt(struct perf_session *session)
 	unsigned int j;
 	struct perf_evsel *evsel;
 
-	for (j = 0; j < PERF_TYPE_MAX; ++j) {
-		evsel = perf_session__find_first_evtype(session, j);
+	for (j = 0; j < OUTPUT_TYPE_MAX; ++j) {
+		evsel = perf_session__find_first_evtype(session, attr_type(j));
 
 		/*
 		 * even if fields is set to 0 (ie., show nothing) event must
 		 * exist if user explicitly includes it on the command line
 		 */
-		if (!evsel && output[j].user_set && !output[j].wildcard_set) {
+		if (!evsel && output[j].user_set && !output[j].wildcard_set &&
+		    j != OUTPUT_TYPE_SYNTH) {
 			pr_err("%s events do not exist. "
 			       "Remove corresponding -F option to proceed.\n",
 			       event_type(j));
@@ -904,6 +941,7 @@ static void print_sample_bts(struct perf_sample *sample,
 			     struct machine *machine)
 {
 	struct perf_event_attr *attr = &evsel->attr;
+	unsigned int type = output_type(attr->type);
 	bool print_srcline_last = false;
 
 	if (PRINT_FIELD(CALLINDENT))
@@ -911,7 +949,7 @@ static void print_sample_bts(struct perf_sample *sample,
 
 	/* print branch_from information */
 	if (PRINT_FIELD(IP)) {
-		unsigned int print_opts = output[attr->type].print_ip_opts;
+		unsigned int print_opts = output[type].print_ip_opts;
 		struct callchain_cursor *cursor = NULL;
 
 		if (symbol_conf.use_callchain && sample->callchain &&
@@ -934,7 +972,7 @@ static void print_sample_bts(struct perf_sample *sample,
 	/* print branch_to information */
 	if (PRINT_FIELD(ADDR) ||
 	    ((evsel->attr.sample_type & PERF_SAMPLE_ADDR) &&
-	     !output[attr->type].user_set)) {
+	     !output[type].user_set)) {
 		printf(" => ");
 		print_sample_addr(sample, thread, attr);
 	}
@@ -1051,8 +1089,9 @@ static void process_event(struct perf_script *script,
 {
 	struct thread *thread = al->thread;
 	struct perf_event_attr *attr = &evsel->attr;
+	unsigned int type = output_type(attr->type);
 
-	if (output[attr->type].fields == 0)
+	if (output[type].fields == 0)
 		return;
 
 	print_sample_start(sample, thread, evsel);
@@ -1099,7 +1138,7 @@ static void process_event(struct perf_script *script,
 			cursor = &callchain_cursor;
 
 		putchar(cursor ? '\n' : ' ');
-		sample__fprintf_sym(sample, al, 0, output[attr->type].print_ip_opts, cursor, stdout);
+		sample__fprintf_sym(sample, al, 0, output[type].print_ip_opts, cursor, stdout);
 	}
 
 	if (PRINT_FIELD(IREGS))
@@ -1241,7 +1280,8 @@ static int process_attr(struct perf_tool *tool, union perf_event *event,
 	evlist = *pevlist;
 	evsel = perf_evlist__last(*pevlist);
 
-	if (evsel->attr.type >= PERF_TYPE_MAX)
+	if (evsel->attr.type >= PERF_TYPE_MAX &&
+	    evsel->attr.type != PERF_TYPE_SYNTH)
 		return 0;
 
 	evlist__for_each_entry(evlist, pos) {
@@ -1629,6 +1669,8 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 			type = PERF_TYPE_RAW;
 		else if (!strcmp(str, "break"))
 			type = PERF_TYPE_BREAKPOINT;
+		else if (!strcmp(str, "synth"))
+			type = OUTPUT_TYPE_SYNTH;
 		else {
 			fprintf(stderr, "Invalid event type in field string.\n");
 			rc = -EINVAL;
@@ -1659,7 +1701,7 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
 		if (output_set_by_user())
 			pr_warning("Overriding previous field request for all events.\n");
 
-		for (j = 0; j < PERF_TYPE_MAX; ++j) {
+		for (j = 0; j < OUTPUT_TYPE_MAX; ++j) {
 			output[j].fields = 0;
 			output[j].user_set = true;
 			output[j].wildcard_set = true;
@@ -1702,7 +1744,7 @@ parse:
 			/* add user option to all events types for
 			 * which it is valid
 			 */
-			for (j = 0; j < PERF_TYPE_MAX; ++j) {
+			for (j = 0; j < OUTPUT_TYPE_MAX; ++j) {
 				if (output[j].invalid_fields & all_output_options[i].field) {
 					pr_warning("\'%s\' not valid for %s events. Ignoring.\n",
 						   all_output_options[i].str, event_type(j));
@@ -2353,7 +2395,7 @@ int cmd_script(int argc, const char **argv)
 	OPT_CALLBACK('F', "fields", NULL, "str",
 		     "comma separated output fields prepend with 'type:'. "
 		     "+field to add and -field to remove."
-		     "Valid types: hw,sw,trace,raw. "
+		     "Valid types: hw,sw,trace,raw,synth. "
 		     "Fields: comm,tid,pid,time,cpu,event,trace,ip,sym,dso,"
 		     "addr,symoff,period,iregs,brstack,brstacksym,flags,"
 		     "callindent,insn,insnlen,brstackinsn",
