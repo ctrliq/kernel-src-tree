@@ -1,0 +1,690 @@
+ext2, ext4, xfs: retrieve dax_device for iomap operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit fa5d932c323e8e0d9b24b3517997d15b36d1607d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fa5d932c.failed
+
+In preparation for converting fs/dax.c to use dax_direct_access()
+instead of bdev_direct_access(), add the plumbing to retrieve the
+dax_device associated with a given block_device.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit fa5d932c323e8e0d9b24b3517997d15b36d1607d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext2/inode.c
+#	fs/ext4/inode.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/ext2/inode.c
+index 4b6f4ec7af18,4c9d2d44e879..000000000000
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@@ -763,19 -770,94 +763,100 @@@ cleanup
+  	return err;
+  }
+  
+ -int ext2_get_block(struct inode *inode, sector_t iblock,
+ -		struct buffer_head *bh_result, int create)
+ +int ext2_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+  {
+  	unsigned max_blocks = bh_result->b_size >> inode->i_blkbits;
+++<<<<<<< HEAD
+ +	int ret = ext2_get_blocks(inode, iblock, max_blocks,
+ +			      bh_result, create);
+ +	if (ret > 0) {
+ +		bh_result->b_size = (ret << inode->i_blkbits);
+ +		ret = 0;
+++=======
++ 	bool new = false, boundary = false;
++ 	u32 bno;
++ 	int ret;
++ 
++ 	ret = ext2_get_blocks(inode, iblock, max_blocks, &bno, &new, &boundary,
++ 			create);
++ 	if (ret <= 0)
++ 		return ret;
++ 
++ 	map_bh(bh_result, inode->i_sb, bno);
++ 	bh_result->b_size = (ret << inode->i_blkbits);
++ 	if (new)
++ 		set_buffer_new(bh_result);
++ 	if (boundary)
++ 		set_buffer_boundary(bh_result);
++ 	return 0;
++ 
++ }
++ 
++ #ifdef CONFIG_FS_DAX
++ static int ext2_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
++ 		unsigned flags, struct iomap *iomap)
++ {
++ 	struct block_device *bdev;
++ 	unsigned int blkbits = inode->i_blkbits;
++ 	unsigned long first_block = offset >> blkbits;
++ 	unsigned long max_blocks = (length + (1 << blkbits) - 1) >> blkbits;
++ 	bool new = false, boundary = false;
++ 	u32 bno;
++ 	int ret;
++ 
++ 	ret = ext2_get_blocks(inode, first_block, max_blocks,
++ 			&bno, &new, &boundary, flags & IOMAP_WRITE);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	iomap->flags = 0;
++ 	bdev = inode->i_sb->s_bdev;
++ 	iomap->bdev = bdev;
++ 	iomap->offset = (u64)first_block << blkbits;
++ 	if (blk_queue_dax(bdev->bd_queue))
++ 		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
++ 	else
++ 		iomap->dax_dev = NULL;
++ 
++ 	if (ret == 0) {
++ 		iomap->type = IOMAP_HOLE;
++ 		iomap->blkno = IOMAP_NULL_BLOCK;
++ 		iomap->length = 1 << blkbits;
++ 	} else {
++ 		iomap->type = IOMAP_MAPPED;
++ 		iomap->blkno = (sector_t)bno << (blkbits - 9);
++ 		iomap->length = (u64)ret << blkbits;
++ 		iomap->flags |= IOMAP_F_MERGED;
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+  	}
+ +	return ret;
+  
+ -	if (new)
+ -		iomap->flags |= IOMAP_F_NEW;
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ext2_iomap_end(struct inode *inode, loff_t offset, loff_t length,
++ 		ssize_t written, unsigned flags, struct iomap *iomap)
++ {
++ 	put_dax(iomap->dax_dev);
++ 	if (iomap->type == IOMAP_MAPPED &&
++ 	    written < length &&
++ 	    (flags & IOMAP_WRITE))
++ 		ext2_write_failed(inode->i_mapping, offset + length);
++ 	return 0;
++ }
++ 
++ const struct iomap_ops ext2_iomap_ops = {
++ 	.iomap_begin		= ext2_iomap_begin,
++ 	.iomap_end		= ext2_iomap_end,
++ };
++ #else
++ /* Define empty ops for !CONFIG_FS_DAX case to avoid ugly ifdefs */
++ const struct iomap_ops ext2_iomap_ops;
++ #endif /* CONFIG_FS_DAX */
++ 
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+  int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+  		u64 start, u64 len)
+  {
+diff --cc fs/ext4/inode.c
+index f49ba18669c7,2cb2634daa99..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3024,92 -3301,158 +3024,206 @@@ static int ext4_releasepage(struct pag
+  		return try_to_free_buffers(page);
+  }
+  
+ -#ifdef CONFIG_FS_DAX
+ -static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+ -			    unsigned flags, struct iomap *iomap)
+ +/*
+ + * ext4_get_block used when preparing for a DIO write or buffer write.
+ + * We allocate an uinitialized extent if blocks haven't been allocated.
+ + * The extent will be converted to initialized after the IO is complete.
+ + */
+ +int ext4_get_block_write(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+  {
+++<<<<<<< HEAD
+ +	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+++=======
++ 	struct block_device *bdev;
++ 	unsigned int blkbits = inode->i_blkbits;
++ 	unsigned long first_block = offset >> blkbits;
++ 	unsigned long last_block = (offset + length - 1) >> blkbits;
++ 	struct ext4_map_blocks map;
++ 	int ret;
++ 
++ 	if (WARN_ON_ONCE(ext4_has_inline_data(inode)))
++ 		return -ERANGE;
++ 
++ 	map.m_lblk = first_block;
++ 	map.m_len = last_block - first_block + 1;
++ 
++ 	if (!(flags & IOMAP_WRITE)) {
++ 		ret = ext4_map_blocks(NULL, inode, &map, 0);
++ 	} else {
++ 		int dio_credits;
++ 		handle_t *handle;
++ 		int retries = 0;
++ 
++ 		/* Trim mapping request to maximum we can map at once for DIO */
++ 		if (map.m_len > DIO_MAX_BLOCKS)
++ 			map.m_len = DIO_MAX_BLOCKS;
++ 		dio_credits = ext4_chunk_trans_blocks(inode, map.m_len);
++ retry:
++ 		/*
++ 		 * Either we allocate blocks and then we don't get unwritten
++ 		 * extent so we have reserved enough credits, or the blocks
++ 		 * are already allocated and unwritten and in that case
++ 		 * extent conversion fits in the credits as well.
++ 		 */
++ 		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS,
++ 					    dio_credits);
++ 		if (IS_ERR(handle))
++ 			return PTR_ERR(handle);
++ 
++ 		ret = ext4_map_blocks(handle, inode, &map,
++ 				      EXT4_GET_BLOCKS_CREATE_ZERO);
++ 		if (ret < 0) {
++ 			ext4_journal_stop(handle);
++ 			if (ret == -ENOSPC &&
++ 			    ext4_should_retry_alloc(inode->i_sb, &retries))
++ 				goto retry;
++ 			return ret;
++ 		}
++ 
++ 		/*
++ 		 * If we added blocks beyond i_size, we need to make sure they
++ 		 * will get truncated if we crash before updating i_size in
++ 		 * ext4_iomap_end(). For faults we don't need to do that (and
++ 		 * even cannot because for orphan list operations inode_lock is
++ 		 * required) - if we happen to instantiate block beyond i_size,
++ 		 * it is because we race with truncate which has already added
++ 		 * the inode to the orphan list.
++ 		 */
++ 		if (!(flags & IOMAP_FAULT) && first_block + map.m_len >
++ 		    (i_size_read(inode) + (1 << blkbits) - 1) >> blkbits) {
++ 			int err;
++ 
++ 			err = ext4_orphan_add(handle, inode);
++ 			if (err < 0) {
++ 				ext4_journal_stop(handle);
++ 				return err;
++ 			}
++ 		}
++ 		ext4_journal_stop(handle);
++ 	}
++ 
++ 	iomap->flags = 0;
++ 	bdev = inode->i_sb->s_bdev;
++ 	iomap->bdev = bdev;
++ 	if (blk_queue_dax(bdev->bd_queue))
++ 		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
++ 	else
++ 		iomap->dax_dev = NULL;
++ 	iomap->offset = first_block << blkbits;
++ 
++ 	if (ret == 0) {
++ 		iomap->type = IOMAP_HOLE;
++ 		iomap->blkno = IOMAP_NULL_BLOCK;
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	} else {
++ 		if (map.m_flags & EXT4_MAP_MAPPED) {
++ 			iomap->type = IOMAP_MAPPED;
++ 		} else if (map.m_flags & EXT4_MAP_UNWRITTEN) {
++ 			iomap->type = IOMAP_UNWRITTEN;
++ 		} else {
++ 			WARN_ON_ONCE(1);
++ 			return -EIO;
++ 		}
++ 		iomap->blkno = (sector_t)map.m_pblk << (blkbits - 9);
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	}
++ 
++ 	if (map.m_flags & EXT4_MAP_NEW)
++ 		iomap->flags |= IOMAP_F_NEW;
++ 	return 0;
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+  }
+  
+ -static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
+ -			  ssize_t written, unsigned flags, struct iomap *iomap)
+ +static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+  {
+ -	int ret = 0;
+ -	handle_t *handle;
+ -	int blkbits = inode->i_blkbits;
+ -	bool truncate = false;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	ret = _ext4_get_block(inode, iblock, bh_result, 0);
+++=======
++ 	put_dax(iomap->dax_dev);
++ 	if (!(flags & IOMAP_WRITE) || (flags & IOMAP_FAULT))
++ 		return 0;
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 	if (IS_ERR(handle)) {
++ 		ret = PTR_ERR(handle);
++ 		goto orphan_del;
++ 	}
++ 	if (ext4_update_inode_size(inode, offset + written))
++ 		ext4_mark_inode_dirty(handle, inode);
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+  	/*
+ -	 * We may need to truncate allocated but not written blocks beyond EOF.
+ +	 * Blocks should have been preallocated! ext4_file_write_iter() checks
+ +	 * that.
+  	 */
+ -	if (iomap->offset + iomap->length > 
+ -	    ALIGN(inode->i_size, 1 << blkbits)) {
+ -		ext4_lblk_t written_blk, end_blk;
+ +	WARN_ON_ONCE(!buffer_mapped(bh_result));
+ +
+ +	return ret;
+ +}
+ +
+ +#ifdef CONFIG_FS_DAX
+ +/*
+ + * Get block function for DAX IO and mmap faults. It takes care of converting
+ + * unwritten extents to written ones and initializes new / converted blocks
+ + * to zeros.
+ + */
+ +int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+ +		       struct buffer_head *bh_result, int create)
+ +{
+ +	int ret, err;
+ +	int credits;
+ +	struct ext4_map_blocks map;
+ +	handle_t *handle = NULL;
+ +	int retries = 0;
+ +	int flags = 0;
+  
+ -		written_blk = (offset + written) >> blkbits;
+ -		end_blk = (offset + length) >> blkbits;
+ -		if (written_blk < end_blk && ext4_can_truncate(inode))
+ -			truncate = true;
+ +	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+ +	map.m_lblk = iblock;
+ +	map.m_len = bh_result->b_size >> inode->i_blkbits;
+ +	credits = ext4_chunk_trans_blocks(inode, map.m_len);
+ +retry:
+ +	if (create) {
+ +		flags |= EXT4_GET_BLOCKS_CREATE_ZERO;
+ +		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
+ +		if (IS_ERR(handle)) {
+ +			ret = PTR_ERR(handle);
+ +			return ret;
+ +		}
+  	}
+ -	/*
+ -	 * Remove inode from orphan list if we were extending a inode and
+ -	 * everything went fine.
+ -	 */
+ -	if (!truncate && inode->i_nlink &&
+ -	    !list_empty(&EXT4_I(inode)->i_orphan))
+ -		ext4_orphan_del(handle, inode);
+ -	ext4_journal_stop(handle);
+ -	if (truncate) {
+ -		ext4_truncate_failed_write(inode);
+ -orphan_del:
+ +
+ +	ret = ext4_map_blocks(handle, inode, &map, flags);
+ +	if (create) {
+ +		err = ext4_journal_stop(handle);
+ +		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+ +			goto retry;
+ +		if (ret >= 0 && err < 0)
+ +			ret = err;
+ +	}
+ +	if (ret <= 0)
+ +		goto out;
+ +out:
+ +	WARN_ON_ONCE(ret == 0 && create);
+ +	if (ret > 0) {
+ +		map_bh(bh_result, inode->i_sb, map.m_pblk);
+  		/*
+ -		 * If truncate failed early the inode might still be on the
+ -		 * orphan list; we need to make sure the inode is removed from
+ -		 * the orphan list in that case.
+ +		 * At least for now we have to clear BH_New so that DAX code
+ +		 * doesn't attempt to zero blocks again in a racy way.
+  		 */
+ -		if (inode->i_nlink)
+ -			ext4_orphan_del(NULL, inode);
+ +		map.m_flags &= ~EXT4_MAP_NEW;
+ +		ext4_update_bh_state(bh_result, map.m_flags);
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+ +		ret = 0;
+ +	} else if (ret == 0) {
+ +		/* hole case, need to fill in bh->b_size */
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+  	}
+  	return ret;
+  }
+diff --cc fs/xfs/xfs_iomap.c
+index 39ce9cf9a329,4b47403f8089..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -943,28 -939,269 +943,243 @@@ error_on_bmapi_transaction
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +void
+ +xfs_bmbt_to_iomap(
+++=======
++ static inline bool imap_needs_alloc(struct inode *inode,
++ 		struct xfs_bmbt_irec *imap, int nimaps)
++ {
++ 	return !nimaps ||
++ 		imap->br_startblock == HOLESTARTBLOCK ||
++ 		imap->br_startblock == DELAYSTARTBLOCK ||
++ 		(IS_DAX(inode) && ISUNWRITTEN(imap));
++ }
++ 
++ static inline bool need_excl_ilock(struct xfs_inode *ip, unsigned flags)
++ {
++ 	/*
++ 	 * COW writes will allocate delalloc space, so we need to make sure
++ 	 * to take the lock exclusively here.
++ 	 */
++ 	if (xfs_is_reflink_inode(ip) && (flags & (IOMAP_WRITE | IOMAP_ZERO)))
++ 		return true;
++ 	if ((flags & IOMAP_DIRECT) && (flags & IOMAP_WRITE))
++ 		return true;
++ 	return false;
++ }
++ 
++ static int
++ xfs_file_iomap_begin(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_bmbt_irec	imap;
++ 	xfs_fileoff_t		offset_fsb, end_fsb;
++ 	int			nimaps = 1, error = 0;
++ 	bool			shared = false, trimmed = false;
++ 	unsigned		lockmode;
++ 	struct block_device	*bdev;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	if (((flags & (IOMAP_WRITE | IOMAP_DIRECT)) == IOMAP_WRITE) &&
++ 			!IS_DAX(inode) && !xfs_get_extsz_hint(ip)) {
++ 		/* Reserve delalloc blocks for regular writeback. */
++ 		return xfs_file_iomap_begin_delay(inode, offset, length, flags,
++ 				iomap);
++ 	}
++ 
++ 	if (need_excl_ilock(ip, flags)) {
++ 		lockmode = XFS_ILOCK_EXCL;
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	} else {
++ 		lockmode = xfs_ilock_data_map_shared(ip);
++ 	}
++ 
++ 	ASSERT(offset <= mp->m_super->s_maxbytes);
++ 	if ((xfs_fsize_t)offset + length > mp->m_super->s_maxbytes)
++ 		length = mp->m_super->s_maxbytes - offset;
++ 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
++ 	end_fsb = XFS_B_TO_FSB(mp, offset + length);
++ 
++ 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
++ 			       &nimaps, 0);
++ 	if (error)
++ 		goto out_unlock;
++ 
++ 	if (flags & IOMAP_REPORT) {
++ 		/* Trim the mapping to the nearest shared extent boundary. */
++ 		error = xfs_reflink_trim_around_shared(ip, &imap, &shared,
++ 				&trimmed);
++ 		if (error)
++ 			goto out_unlock;
++ 	}
++ 
++ 	if ((flags & (IOMAP_WRITE | IOMAP_ZERO)) && xfs_is_reflink_inode(ip)) {
++ 		if (flags & IOMAP_DIRECT) {
++ 			/* may drop and re-acquire the ilock */
++ 			error = xfs_reflink_allocate_cow(ip, &imap, &shared,
++ 					&lockmode);
++ 			if (error)
++ 				goto out_unlock;
++ 		} else {
++ 			error = xfs_reflink_reserve_cow(ip, &imap, &shared);
++ 			if (error)
++ 				goto out_unlock;
++ 		}
++ 
++ 		end_fsb = imap.br_startoff + imap.br_blockcount;
++ 		length = XFS_FSB_TO_B(mp, end_fsb) - offset;
++ 	}
++ 
++ 	if ((flags & IOMAP_WRITE) && imap_needs_alloc(inode, &imap, nimaps)) {
++ 		/*
++ 		 * We cap the maximum length we map here to MAX_WRITEBACK_PAGES
++ 		 * pages to keep the chunks of work done where somewhat symmetric
++ 		 * with the work writeback does. This is a completely arbitrary
++ 		 * number pulled out of thin air as a best guess for initial
++ 		 * testing.
++ 		 *
++ 		 * Note that the values needs to be less than 32-bits wide until
++ 		 * the lower level functions are updated.
++ 		 */
++ 		length = min_t(loff_t, length, 1024 * PAGE_SIZE);
++ 		/*
++ 		 * xfs_iomap_write_direct() expects the shared lock. It
++ 		 * is unlocked on return.
++ 		 */
++ 		if (lockmode == XFS_ILOCK_EXCL)
++ 			xfs_ilock_demote(ip, lockmode);
++ 		error = xfs_iomap_write_direct(ip, offset, length, &imap,
++ 				nimaps);
++ 		if (error)
++ 			return error;
++ 
++ 		iomap->flags = IOMAP_F_NEW;
++ 		trace_xfs_iomap_alloc(ip, offset, length, 0, &imap);
++ 	} else {
++ 		ASSERT(nimaps);
++ 
++ 		xfs_iunlock(ip, lockmode);
++ 		trace_xfs_iomap_found(ip, offset, length, 0, &imap);
++ 	}
++ 
++ 	xfs_bmbt_to_iomap(ip, iomap, &imap);
++ 
++ 	/* optionally associate a dax device with the iomap bdev */
++ 	bdev = iomap->bdev;
++ 	if (blk_queue_dax(bdev->bd_queue))
++ 		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
++ 	else
++ 		iomap->dax_dev = NULL;
++ 
++ 	if (shared)
++ 		iomap->flags |= IOMAP_F_SHARED;
++ 	return 0;
++ out_unlock:
++ 	xfs_iunlock(ip, lockmode);
++ 	return error;
++ }
++ 
++ static int
++ xfs_file_iomap_end_delalloc(
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+  	struct xfs_inode	*ip,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	ssize_t			written,
+ -	struct iomap		*iomap)
+ +	struct iomap		*iomap,
+ +	struct xfs_bmbt_irec	*imap)
+  {
+  	struct xfs_mount	*mp = ip->i_mount;
+ -	xfs_fileoff_t		start_fsb;
+ -	xfs_fileoff_t		end_fsb;
+ -	int			error = 0;
+ -
+ -	/*
+ -	 * Behave as if the write failed if drop writes is enabled. Set the NEW
+ -	 * flag to force delalloc cleanup.
+ -	 */
+ -	if (xfs_mp_drop_writes(mp)) {
+ -		iomap->flags |= IOMAP_F_NEW;
+ -		written = 0;
+ -	}
+ -
+ -	/*
+ -	 * start_fsb refers to the first unused block after a short write. If
+ -	 * nothing was written, round offset down to point at the first block in
+ -	 * the range.
+ -	 */
+ -	if (unlikely(!written))
+ -		start_fsb = XFS_B_TO_FSBT(mp, offset);
+ -	else
+ -		start_fsb = XFS_B_TO_FSB(mp, offset + written);
+ -	end_fsb = XFS_B_TO_FSB(mp, offset + length);
+ -
+ -	/*
+ -	 * Trim delalloc blocks if they were allocated by this write and we
+ -	 * didn't manage to write the whole range.
+ -	 *
+ -	 * We don't need to care about racing delalloc as we hold i_mutex
+ -	 * across the reserve/allocate/unreserve calls. If there are delalloc
+ -	 * blocks in the range, they are ours.
+ -	 */
+ -	if ((iomap->flags & IOMAP_F_NEW) && start_fsb < end_fsb) {
+ -		truncate_pagecache_range(VFS_I(ip), XFS_FSB_TO_B(mp, start_fsb),
+ -					 XFS_FSB_TO_B(mp, end_fsb) - 1);
+  
+ -		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ -		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ -					       end_fsb - start_fsb);
+ -		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ -
+ -		if (error && !XFS_FORCED_SHUTDOWN(mp)) {
+ -			xfs_alert(mp, "%s: unable to clean up ino %lld",
+ -				__func__, ip->i_ino);
+ -			return error;
+ -		}
+ +	if (imap->br_startblock == HOLESTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_HOLE;
+ +	} else if (imap->br_startblock == DELAYSTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_DELALLOC;
+ +	} else {
+ +		iomap->blkno = xfs_fsb_to_db(ip, imap->br_startblock);
+ +		if (imap->br_state == XFS_EXT_UNWRITTEN)
+ +			iomap->type = IOMAP_UNWRITTEN;
+ +		else
+ +			iomap->type = IOMAP_MAPPED;
+  	}
+ -
+ -	return 0;
+ +	iomap->offset = XFS_FSB_TO_B(mp, imap->br_startoff);
+ +	iomap->length = XFS_FSB_TO_B(mp, imap->br_blockcount);
+ +	iomap->bdev = xfs_find_bdev_for_inode(VFS_I(ip));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int
++ xfs_file_iomap_end(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	ssize_t			written,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	put_dax(iomap->dax_dev);
++ 	if ((flags & IOMAP_WRITE) && iomap->type == IOMAP_DELALLOC)
++ 		return xfs_file_iomap_end_delalloc(XFS_I(inode), offset,
++ 				length, written, iomap);
++ 	return 0;
++ }
++ 
++ const struct iomap_ops xfs_iomap_ops = {
++ 	.iomap_begin		= xfs_file_iomap_begin,
++ 	.iomap_end		= xfs_file_iomap_end,
++ };
++ 
++ static int
++ xfs_xattr_iomap_begin(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
++ 	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + length);
++ 	struct xfs_bmbt_irec	imap;
++ 	int			nimaps = 1, error = 0;
++ 	unsigned		lockmode;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	lockmode = xfs_ilock_data_map_shared(ip);
++ 
++ 	/* if there are no attribute fork or extents, return ENOENT */
++ 	if (XFS_IFORK_Q(ip) || !ip->i_d.di_anextents) {
++ 		error = -ENOENT;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ASSERT(ip->i_d.di_aformat != XFS_DINODE_FMT_LOCAL);
++ 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
++ 			       &nimaps, XFS_BMAPI_ENTIRE | XFS_BMAPI_ATTRFORK);
++ out_unlock:
++ 	xfs_iunlock(ip, lockmode);
++ 
++ 	if (!error) {
++ 		ASSERT(nimaps);
++ 		xfs_bmbt_to_iomap(ip, iomap, &imap);
++ 	}
++ 
++ 	return error;
++ }
++ 
++ const struct iomap_ops xfs_xattr_iomap_ops = {
++ 	.iomap_begin		= xfs_xattr_iomap_begin,
++ };
+++>>>>>>> fa5d932c323e (ext2, ext4, xfs: retrieve dax_device for iomap operations)
+* Unmerged path fs/ext2/inode.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/xfs/xfs_iomap.c
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index c74226a738a3..900de0842c86 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -36,6 +36,7 @@ struct iomap {
+ 	u16			type;	/* type of mapping */
+ 	u16			flags;	/* flags for mapping */
+ 	struct block_device	*bdev;	/* block device for I/O */
++	struct dax_device	*dax_dev; /* dax_dev for dax operations */
+ };
+ 
+ /*
