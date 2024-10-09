@@ -290,6 +290,7 @@ void inet_twdr_twkill_work(struct work_struct *work)
 {
 	struct inet_timewait_death_row *twdr =
 		container_of(work, struct inet_timewait_death_row, twkill_work);
+	bool rearm_timer = false;
 	int i;
 
 	BUILD_BUG_ON((INET_TWDR_TWKILL_SLOTS - 1) >
@@ -302,6 +303,7 @@ void inet_twdr_twkill_work(struct work_struct *work)
 				continue;
 
 			while (inet_twdr_do_twkill_work(twdr, i) != 0) {
+				rearm_timer = true;
 				if (need_resched()) {
 					spin_unlock_bh(&twdr->death_lock);
 					schedule();
@@ -313,6 +315,23 @@ void inet_twdr_twkill_work(struct work_struct *work)
 		}
 		spin_unlock_bh(&twdr->death_lock);
 	}
+
+	/* RHEL hack: re-arm hangman timer with short delay (one second instead
+	 * of TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS) if we exceeded
+	 * TIME_WAIT reaping quota for at least one of the thread slots.
+	 * Otherwise, with high CPU load, inet_twdr_do_twkill_work() won't run
+	 * frequently enough to empty the slots in a reasonable timeframe, and
+	 * we just end up clearing thread slot bits too early. Up to 45s
+	 * additional reaping time was observed for bursts of 2000 TCP closing
+	 * sockets after the 60s TIME_WAIT expiration time on 4 loaded CPUs.
+	 *
+	 * This doesn't need to be fixed upstream as commit 789f558cfb36
+	 * ("tcp/dccp: get rid of central timewait timer") gets rid of the
+	 * centralized timer wheel altogether and spreads TIME_WAIT reaping load
+	 * to all CPUs, without using thread slots at all.
+	 */
+	if (rearm_timer)
+		mod_timer(&twdr->tw_timer, jiffies + HZ);
 }
 EXPORT_SYMBOL_GPL(inet_twdr_twkill_work);
 

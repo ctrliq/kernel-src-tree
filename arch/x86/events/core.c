@@ -32,6 +32,7 @@
 #include <asm/nmi.h>
 #include <asm/smp.h>
 #include <asm/alternative.h>
+#include <asm/mmu_context.h>
 #include <asm/timer.h>
 #include <asm/desc.h>
 #include <asm/ldt.h>
@@ -483,22 +484,28 @@ static inline int precise_br_compat(struct perf_event *event)
 	return m == b;
 }
 
+int x86_pmu_max_precise(void)
+{
+	int precise = 0;
+
+	/* Support for constant skid */
+	if (x86_pmu.pebs_active && !x86_pmu.pebs_broken) {
+		precise++;
+
+		/* Support for IP fixup */
+		if (x86_pmu.lbr_nr || x86_pmu.intel_cap.pebs_format >= 2)
+			precise++;
+
+		if (x86_pmu.pebs_prec_dist)
+			precise++;
+	}
+	return precise;
+}
+
 int x86_pmu_hw_config(struct perf_event *event)
 {
 	if (event->attr.precise_ip) {
-		int precise = 0;
-
-		/* Support for constant skid */
-		if (x86_pmu.pebs_active && !x86_pmu.pebs_broken) {
-			precise++;
-
-			/* Support for IP fixup */
-			if (x86_pmu.lbr_nr || x86_pmu.intel_cap.pebs_format >= 2)
-				precise++;
-
-			if (x86_pmu.pebs_prec_dist)
-				precise++;
-		}
+		int precise = x86_pmu_max_precise();
 
 		if (event->attr.precise_ip > precise)
 			return -EOPNOTSUPP;
@@ -1719,6 +1726,7 @@ ssize_t x86_event_sysfs_show(char *page, u64 config, u64 event)
 }
 
 static struct attribute_group x86_pmu_attr_group;
+static struct attribute_group x86_pmu_caps_group;
 
 static int __init init_hw_perf_events(void)
 {
@@ -1766,6 +1774,14 @@ static int __init init_hw_perf_events(void)
 				   0, x86_pmu.num_counters, 0, 0);
 
 	x86_pmu_format_group.attrs = x86_pmu.format_attrs;
+
+	if (x86_pmu.caps_attrs) {
+		struct attribute **tmp;
+
+		tmp = merge_attr(x86_pmu_caps_group.attrs, x86_pmu.caps_attrs);
+		if (!WARN_ON(!tmp))
+			x86_pmu_caps_group.attrs = tmp;
+	}
 
 	if (x86_pmu.event_attrs)
 		x86_pmu_events_group.attrs = x86_pmu.event_attrs;
@@ -2110,10 +2126,30 @@ static struct attribute_group x86_pmu_attr_group = {
 	.attrs = x86_pmu_attrs,
 };
 
+static ssize_t max_precise_show(struct device *cdev,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", x86_pmu_max_precise());
+}
+
+static DEVICE_ATTR_RO(max_precise);
+
+static struct attribute *x86_pmu_caps_attrs[] = {
+	&dev_attr_max_precise.attr,
+	NULL
+};
+
+static struct attribute_group x86_pmu_caps_group = {
+	.name = "caps",
+	.attrs = x86_pmu_caps_attrs,
+};
+
 static const struct attribute_group *x86_pmu_attr_groups[] = {
 	&x86_pmu_attr_group,
 	&x86_pmu_format_group,
 	&x86_pmu_events_group,
+	&x86_pmu_caps_group,
 	NULL,
 };
 
@@ -2219,24 +2255,28 @@ valid_user_frame(const void __user *fp, unsigned long size)
 static unsigned long get_segment_base(unsigned int segment)
 {
 	struct desc_struct *desc;
-	int idx = segment >> 3;
+	unsigned int idx = segment >> 3;
 
 	if ((segment & SEGMENT_TI_MASK) == SEGMENT_LDT) {
+		struct ldt_struct *ldt;
+
 		if (idx > LDT_ENTRIES)
 			return 0;
 
-		if (idx > current->active_mm->context.size)
+		/* IRQs are off, so this synchronizes with smp_store_release */
+		ldt = lockless_dereference(current->active_mm->context.ldt);
+		if (!ldt || idx > ldt->size)
 			return 0;
 
-		desc = current->active_mm->context.ldt;
+		desc = &ldt->entries[idx];
 	} else {
 		if (idx > GDT_ENTRIES)
 			return 0;
 
-		desc = __this_cpu_ptr(&gdt_page.gdt[0]);
+		desc = per_cpu_ptr(gdt_page.gdt, 0) + idx;
 	}
 
-	return get_desc_base(desc + idx);
+	return get_desc_base(desc);
 }
 
 #ifdef CONFIG_COMPAT

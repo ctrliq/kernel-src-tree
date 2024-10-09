@@ -483,12 +483,13 @@ GLOBAL(system_call_after_swapgs)
 	jnz tracesys
 system_call_fastpath:
 #if __SYSCALL_MASK == ~0
-	cmpq $__NR_syscall_max,%rax
+	cmpq $__NR_syscall_max+1,%rax
 #else
 	andl $__SYSCALL_MASK,%eax
-	cmpl $__NR_syscall_max,%eax
+	cmpl $__NR_syscall_max+1,%eax
 #endif
-	ja badsys
+	jae badsys
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%rcx
 	movq %r10,%rcx
 
 #ifdef CONFIG_RETPOLINE
@@ -611,12 +612,13 @@ tracesys:
 	 */
 	LOAD_ARGS ARGOFFSET, 1
 #if __SYSCALL_MASK == ~0
-	cmpq $__NR_syscall_max,%rax
+	cmpq $__NR_syscall_max+1,%rax
 #else
 	andl $__SYSCALL_MASK,%eax
-	cmpl $__NR_syscall_max,%eax
+	cmpl $__NR_syscall_max+1,%eax
 #endif
-	ja   1f		/* RAX(%rsp) set to -ENOSYS above */
+	jae   1f	/* RAX(%rsp) set to -ENOSYS above */
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%rcx
 	movq %r10,%rcx	/* fixup for C */
 
 #ifdef CONFIG_RETPOLINE
@@ -932,6 +934,10 @@ retint_restore_args:	/* return to kernel space */
 	RESTORE_ARGS 1,8,1
 
 irq_return:
+	/*
+	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
+	 * when returning from IPI handler.
+	 */
 	INTERRUPT_RETURN
 	_ASM_EXTABLE(irq_return, bad_iret)
 
@@ -1400,7 +1406,7 @@ apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
 	.pushsection .kprobes.text, "ax"
 
 paranoidzeroentry_ist debug do_debug DEBUG_STACK
-paranoidzeroentry_ist int3 do_int3 DEBUG_STACK
+zeroentry int3 do_int3
 errorentry stack_segment do_stack_segment
 #ifdef CONFIG_XEN
 zeroentry xen_debug do_debug
@@ -1440,6 +1446,7 @@ ENTRY(paranoid_exit)
 	jnz   paranoid_userspace
 paranoid_swapgs_restore:
 	/* return to kernel with swapgs */
+	TRACE_IRQS_IRETQ 0
 	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
 	RESTORE_ALL 8
@@ -1447,6 +1454,7 @@ paranoid_swapgs_restore:
 	jmp irq_return
 paranoid_noswapgs_restore:
 	/* return to kernel */
+	TRACE_IRQS_IRETQ_DEBUG 0
 	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
 	RESTORE_ALL 8

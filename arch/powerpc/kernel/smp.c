@@ -331,8 +331,9 @@ void smp_send_debugger_break(void)
 	if (unlikely(!smp_ops))
 		return;
 
-	for_each_online_cpu(cpu)
-		if (cpu != me)
+	for_each_present_cpu(cpu)
+		if (cpu != me && (cpu_online(cpu) ||
+			(kdump_in_progress() && crash_wake_offline)))
 			do_message_pass(cpu, PPC_MSG_DEBUGGER_BREAK);
 }
 #endif

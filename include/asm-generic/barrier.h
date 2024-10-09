@@ -44,6 +44,7 @@
 
 #ifndef gmb
 #define gmb()	do { } while (0)
+#define barrier_nospec() gmb()
 #endif
 
 #ifndef dma_rmb

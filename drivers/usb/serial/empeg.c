@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * USB Empeg empeg-car player driver
  *
@@ -6,10 +7,6 @@
  *
  *	Copyright (C) 1999 - 2001
  *	    Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License, as published by
- *	the Free Software Foundation, version 2.
  *
  * See Documentation/usb/usb-serial.txt for more information on using this
  * driver

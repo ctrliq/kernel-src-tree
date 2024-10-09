@@ -18,4 +18,3 @@ static inline void sync_core_before_usermode(void)
 #endif
 
 #endif /* _LINUX_SYNC_CORE_H */
-

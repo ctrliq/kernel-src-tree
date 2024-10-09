@@ -41,6 +41,7 @@
 
 #include <linux/interrupt.h>
 #include <linux/pci.h>
+#include <scsi/scsi_host.h>
 
 /*------------------------------------------------------------------------------
  *              D E F I N E S
@@ -428,7 +429,6 @@ struct aac_ciss_identify_pd {
 #define PMC_DEVICE_S6	0x28b
 #define PMC_DEVICE_S7	0x28c
 #define PMC_DEVICE_S8	0x28d
-#define PMC_DEVICE_S9	0x28f
 
 #define aac_phys_to_logical(x)  ((x)+1)
 #define aac_logical_to_phys(x)  ((x)?(x)-1:0)
@@ -1341,6 +1341,8 @@ struct fib {
 #define AAC_DEVTYPE_ARC_RAW		2
 #define AAC_DEVTYPE_NATIVE_RAW		3
 
+#define AAC_SAFW_RESCAN_DELAY		(10 * HZ)
+
 struct aac_hba_map_info {
 	__le32	rmw_nexus;		/* nexus for native HBA devices */
 	u8		devtype;	/* device type */
@@ -1611,6 +1613,7 @@ struct aac_dev
 	int			maximum_num_channels;
 	struct fsa_dev_info	*fsa_dev;
 	struct task_struct	*thread;
+	struct delayed_work	safw_rescan_work;
 	int			cardtype;
 	/*
 	 *This lock will protect the two 32-bit
@@ -2644,15 +2647,41 @@ static inline int aac_adapter_check_health(struct aac_dev *dev)
 	return (dev)->a_ops.adapter_check_health(dev);
 }
 
+
+int aac_scan_host(struct aac_dev *dev);
+
+static inline void aac_schedule_safw_scan_worker(struct aac_dev *dev)
+{
+	schedule_delayed_work(&dev->safw_rescan_work, AAC_SAFW_RESCAN_DELAY);
+}
+
+static inline void aac_safw_rescan_worker(struct work_struct *work)
+{
+	struct aac_dev *dev = container_of(to_delayed_work(work),
+		struct aac_dev, safw_rescan_work);
+
+	wait_event(dev->scsi_host_ptr->host_wait,
+		!scsi_host_in_recovery(dev->scsi_host_ptr));
+
+	aac_scan_host(dev);
+}
+
+static inline void aac_cancel_safw_rescan_worker(struct aac_dev *dev)
+{
+	if (dev->sa_firmware)
+		cancel_delayed_work_sync(&dev->safw_rescan_work);
+}
+
 /* SCp.phase values */
 #define AAC_OWNER_MIDLEVEL	0x101
 #define AAC_OWNER_LOWLEVEL	0x102
 #define AAC_OWNER_ERROR_HANDLER	0x103
 #define AAC_OWNER_FIRMWARE	0x106
 
+void aac_safw_rescan_worker(struct work_struct *work);
 int aac_acquire_irq(struct aac_dev *dev);
 void aac_free_irq(struct aac_dev *dev);
-int aac_setup_safw_adapter(struct aac_dev *dev, int rescan);
+int aac_setup_safw_adapter(struct aac_dev *dev);
 const char *aac_driverinfo(struct Scsi_Host *);
 void aac_fib_vector_assign(struct aac_dev *dev);
 struct fib *aac_fib_alloc(struct aac_dev *dev);
@@ -2707,6 +2736,23 @@ int aac_probe_container(struct aac_dev *dev, int cid);
 int _aac_rx_init(struct aac_dev *dev);
 int aac_rx_select_comm(struct aac_dev *dev, int comm);
 int aac_rx_deliver_producer(struct fib * fib);
+
+static inline int aac_is_src(struct aac_dev *dev)
+{
+	u16 device = dev->pdev->device;
+
+	if (device == PMC_DEVICE_S6 ||
+		device == PMC_DEVICE_S7 ||
+		device == PMC_DEVICE_S8)
+		return 1;
+	return 0;
+}
+
+static inline int aac_supports_2T(struct aac_dev *dev)
+{
+	return (dev->adapter_info.options & AAC_OPT_NEW_COMM_64);
+}
+
 char * get_container_type(unsigned type);
 extern int numacb;
 extern char aac_driver_version[];

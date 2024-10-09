@@ -585,7 +585,7 @@ static inline int kallsyms_for_perf(void)
  * Otherwise, require CAP_SYSLOG (assuming kptr_restrict isn't set to
  * block even that).
  */
-static int kallsyms_show_value(void)
+int kallsyms_show_value(void)
 {
 	switch (kptr_restrict) {
 	case 0:

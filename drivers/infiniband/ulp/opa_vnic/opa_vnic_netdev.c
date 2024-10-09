@@ -161,7 +161,7 @@ void opa_vnic_process_vema_config(struct opa_vnic_adapter *adapter)
 
 	/* Handle MTU limit change */
 	rtnl_lock();
-	netdev->extended->max_mtu = max_t(unsigned int, info->vesw.eth_mtu_non_vlan,
+	netdev->extended->max_mtu = max_t(unsigned int, info->vesw.eth_mtu,
 				netdev->extended->min_mtu);
 	if (netdev->mtu > netdev->extended->max_mtu)
 		dev_set_mtu(netdev, netdev->extended->max_mtu);

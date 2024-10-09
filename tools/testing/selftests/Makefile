@@ -7,6 +7,7 @@ TARGETS += mqueue
 TARGETS += net
 TARGETS += ptrace
 TARGETS += vm
+TARGETS += x86
 TARGETS += powerpc
 
 all:

@@ -1221,6 +1221,12 @@ static inline int mlx5_core_is_pf(struct mlx5_core_dev *dev)
 	return !(dev->priv.pci_dev_data & MLX5_PCI_DEV_IS_VF);
 }
 
+#define MLX5_TOTAL_VPORTS(mdev) (1 + pci_sriov_get_totalvfs((mdev)->pdev))
+#define MLX5_VPORT_MANAGER(mdev) \
+	(MLX5_CAP_GEN(mdev, vport_group_manager) && \
+	 (MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) && \
+	 mlx5_core_is_pf(mdev))
+
 static inline int mlx5_get_gid_table_len(u16 param)
 {
 	if (param > 4) {
@@ -1236,6 +1242,31 @@ static inline bool mlx5_rl_is_supported(struct mlx5_core_dev *dev)
 	return !!(dev->priv.rl_table.max_size);
 }
 
+static inline int mlx5_core_is_mp_slave(struct mlx5_core_dev *dev)
+{
+	return MLX5_CAP_GEN(dev, affiliate_nic_vport_criteria) &&
+	       MLX5_CAP_GEN(dev, num_vhca_ports) <= 1;
+}
+
+static inline int mlx5_core_is_mp_master(struct mlx5_core_dev *dev)
+{
+	return MLX5_CAP_GEN(dev, num_vhca_ports) > 1;
+}
+
+static inline int mlx5_core_mp_enabled(struct mlx5_core_dev *dev)
+{
+	return mlx5_core_is_mp_slave(dev) ||
+	       mlx5_core_is_mp_master(dev);
+}
+
+static inline int mlx5_core_native_port_num(struct mlx5_core_dev *dev)
+{
+	if (!mlx5_core_mp_enabled(dev))
+		return 1;
+
+	return MLX5_CAP_GEN(dev, native_port_num);
+}
+
 enum {
 	MLX5_TRIGGERED_CMD_COMP = (u64)1 << 32,
 };
@@ -1243,6 +1274,10 @@ enum {
 static inline const struct cpumask *
 mlx5_get_vector_affinity(struct mlx5_core_dev *dev, int vector)
 {
+/* calling irq_to_desc will result to undefinded irq_desc symbol */
+#ifndef CONFIG_GENERIC_HARDIRQS
+	return cpu_possible_mask;
+#else
 	const struct cpumask *mask;
 	struct irq_desc *desc;
 	unsigned int irq;
@@ -1257,9 +1292,10 @@ mlx5_get_vector_affinity(struct mlx5_core_dev *dev, int vector)
 #ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
 	mask = irq_data_get_effective_affinity_mask(&desc->irq_data);
 #else
-	mask = desc->irq_common_data.affinity;
+	mask = desc->irq_data.affinity;
 #endif
 	return mask;
+#endif
 }
 
 #endif /* MLX5_DRIVER_H */

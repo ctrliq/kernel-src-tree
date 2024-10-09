@@ -49,9 +49,7 @@
 #include <linux/key-type.h>
 #include "cifs_spnego.h"
 #include "fscache.h"
-#ifdef CONFIG_CIFS_SMB2
 #include "smb2pdu.h"
-#endif
 
 int cifsFYI = 0;
 bool traceSMB;
@@ -269,9 +267,8 @@ cifs_alloc_inode(struct super_block *sb)
 	cifs_inode->uniqueid = 0;
 	cifs_inode->createtime = 0;
 	cifs_inode->epoch = 0;
-#ifdef CONFIG_CIFS_SMB2
 	generate_random_uuid(cifs_inode->lease_key);
-#endif
+
 	/*
 	 * Can not set i_flags here - they get immediately overwritten to zero
 	 * by the VFS.
@@ -894,7 +891,6 @@ struct file_system_type cifs_fs_type = {
 	.name = "cifs",
 	.mount = cifs_do_mount,
 	.kill_sb = cifs_kill_sb,
-	.fs_flags = FS_HAS_FO_EXTEND,
 };
 MODULE_ALIAS_FS("cifs");
 const struct inode_operations_wrapper cifs_dir_inode_ops = {
@@ -1260,14 +1256,12 @@ cifs_destroy_inodecache(void)
 static int
 cifs_init_request_bufs(void)
 {
-	size_t max_hdr_size = MAX_CIFS_HDR_SIZE;
-#ifdef CONFIG_CIFS_SMB2
 	/*
 	 * SMB2 maximum header size is bigger than CIFS one - no problems to
 	 * allocate some more bytes for CIFS.
 	 */
-	max_hdr_size = MAX_SMB2_HDR_SIZE;
-#endif
+	size_t max_hdr_size = MAX_SMB2_HDR_SIZE;
+
 	if (CIFSMaxBufSize < 8192) {
 	/* Buffer size can not be smaller than 2 * PATH_MAX since maximum
 	Unicode path name has to fit in any SMB/CIFS path based frames */
@@ -1373,6 +1367,50 @@ cifs_destroy_mids(void)
 	kmem_cache_destroy(cifs_mid_cachep);
 }
 
+static void
+cifs_unregister_fo_extends(void)
+{
+	unregister_fo_extend(&cifs_dir_ops);
+	unregister_fo_extend(&cifs_file_direct_nobrl_ops);
+	unregister_fo_extend(&cifs_file_strict_nobrl_ops);
+	unregister_fo_extend(&cifs_file_nobrl_ops);
+	unregister_fo_extend(&cifs_file_direct_ops);
+	unregister_fo_extend(&cifs_file_strict_ops);
+	unregister_fo_extend(&cifs_file_ops);
+}
+
+static int __init
+cifs_register_fo_extends(void)
+{
+	int rc;
+
+	rc = register_fo_extend(&cifs_file_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_file_strict_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_file_direct_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_file_nobrl_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_file_strict_nobrl_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_file_direct_nobrl_ops);
+	if (rc)
+		goto out;
+	rc = register_fo_extend(&cifs_dir_ops);
+	if (rc)
+		goto out;
+	return 0;
+out:
+	cifs_unregister_fo_extends();
+	return -1;
+}
+
 static int __init
 init_cifs(void)
 {
@@ -1458,12 +1496,18 @@ init_cifs(void)
 		goto out_register_key_type;
 #endif /* CONFIG_CIFS_ACL */
 
-	rc = register_filesystem(&cifs_fs_type);
+	rc = cifs_register_fo_extends();
 	if (rc)
 		goto out_init_cifs_idmap;
 
+	rc = register_filesystem(&cifs_fs_type);
+	if (rc)
+		goto out_init_cifs_fo_extends;
+
 	return 0;
 
+out_init_cifs_fo_extends:
+	cifs_unregister_fo_extends();
 out_init_cifs_idmap:
 #ifdef CONFIG_CIFS_ACL
 	exit_cifs_idmap();
@@ -1494,6 +1538,7 @@ exit_cifs(void)
 {
 	cifs_dbg(NOISY, "exit_cifs\n");
 	unregister_filesystem(&cifs_fs_type);
+	cifs_unregister_fo_extends();
 	cifs_dfs_release_automount_timer();
 #ifdef CONFIG_CIFS_ACL
 	exit_cifs_idmap();
@@ -1523,12 +1568,10 @@ MODULE_SOFTDEP("pre: hmac");
 MODULE_SOFTDEP("pre: md4");
 MODULE_SOFTDEP("pre: md5");
 MODULE_SOFTDEP("pre: nls");
-#ifdef CONFIG_CIFS_SMB2
 MODULE_SOFTDEP("pre: aes");
 MODULE_SOFTDEP("pre: cmac");
 MODULE_SOFTDEP("pre: sha256");
 MODULE_SOFTDEP("pre: aead2");
 MODULE_SOFTDEP("pre: ccm");
-#endif /* CONFIG_CIFS_SMB2 */
 module_init(init_cifs)
 module_exit(exit_cifs)

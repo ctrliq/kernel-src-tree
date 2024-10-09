@@ -90,6 +90,8 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_SECCOMP		10	/* secure computing */
 #define TIF_SYSCALL_TRACEPOINT	11	/* syscall tracepoint instrumentation */
 #define TIF_SYSCALL		12	/* inside a system call */
+#define TIF_ISOLATE_BP		13	/* Run process with isolated BP */
+#define TIF_ISOLATE_BP_GUEST	14	/* Run KVM guests with isolated BP */
 #define TIF_31BIT		17	/* 32bit process */
 #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
 #define TIF_RESTORE_SIGMASK	19	/* restore signal mask in do_signal() */
@@ -97,6 +99,8 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_UPROBE_SINGLESTEP	21	/* This task is uprobe single stepped */
 
 #define _TIF_SYSCALL		(1<<TIF_SYSCALL)
+#define _TIF_ISOLATE_BP		(1<<TIF_ISOLATE_BP)
+#define _TIF_ISOLATE_BP_GUEST	(1<<TIF_ISOLATE_BP_GUEST)
 #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
 #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
 #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)

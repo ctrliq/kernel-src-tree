@@ -37,7 +37,7 @@ realloc:
 	return cpu;
 }
 
-int test__PERF_RECORD(int subtest __maybe_unused)
+int test__PERF_RECORD(struct test *test __maybe_unused, int subtest __maybe_unused)
 {
 	struct record_opts opts = {
 		.target = {
@@ -140,7 +140,7 @@ int test__PERF_RECORD(int subtest __maybe_unused)
 	 * fds in the same CPU to be injected in the same mmap ring buffer
 	 * (using ioctl(PERF_EVENT_IOC_SET_OUTPUT)).
 	 */
-	err = perf_evlist__mmap(evlist, opts.mmap_pages, false);
+	err = perf_evlist__mmap(evlist, opts.mmap_pages);
 	if (err < 0) {
 		pr_debug("perf_evlist__mmap: %s\n",
 			 str_error_r(errno, sbuf, sizeof(sbuf)));
@@ -164,13 +164,12 @@ int test__PERF_RECORD(int subtest __maybe_unused)
 		for (i = 0; i < evlist->nr_mmaps; i++) {
 			union perf_event *event;
 			struct perf_mmap *md;
-			u64 end, start;
 
 			md = &evlist->mmap[i];
-			if (perf_mmap__read_init(md, false, &start, &end) < 0)
+			if (perf_mmap__read_init(md) < 0)
 				continue;
 
-			while ((event = perf_mmap__read_event(md, false, &start, end)) != NULL) {
+			while ((event = perf_mmap__read_event(md)) != NULL) {
 				const u32 type = event->header.type;
 				const char *name = perf_event__name(type);
 
@@ -271,7 +270,7 @@ int test__PERF_RECORD(int subtest __maybe_unused)
 					++errs;
 				}
 
-				perf_mmap__consume(md, false);
+				perf_mmap__consume(md);
 			}
 			perf_mmap__read_done(md);
 		}

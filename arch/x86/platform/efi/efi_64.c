@@ -30,6 +30,7 @@
 #include <linux/io.h>
 #include <linux/reboot.h>
 #include <linux/slab.h>
+#include <linux/mem_encrypt.h>
 
 #include <asm/pgalloc.h>
 #include <asm/setup.h>
@@ -170,7 +171,7 @@ int __init efi_alloc_page_tables(void)
 		return 0;
 
 	gfp_mask = GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO;
-	efi_pgd = (pgd_t *)__get_free_page(gfp_mask);
+	efi_pgd = (pgd_t *)__get_free_pages(gfp_mask, PGD_ALLOCATION_ORDER);
 	if (!efi_pgd)
 		return -ENOMEM;
 
@@ -178,7 +179,7 @@ int __init efi_alloc_page_tables(void)
 
 	pud = pud_alloc_one(NULL, 0);
 	if (!pud) {
-		free_page((unsigned long)efi_pgd);
+		free_pages((unsigned long)efi_pgd, PGD_ALLOCATION_ORDER);
 		return -ENOMEM;
 	}
 
@@ -314,6 +315,9 @@ static void __init __map_region(efi_memory_desc_t *md, u64 va)
 
 	if (!(md->attribute & EFI_MEMORY_WB))
 		flags |= _PAGE_PCD;
+
+	if (sev_active() && md->type != EFI_MEMORY_MAPPED_IO)
+		flags |= _PAGE_ENC;
 
 	pfn = md->phys_addr >> PAGE_SHIFT;
 	if (kernel_map_pages_in_pgd(pgd, pfn, va, md->num_pages, flags))

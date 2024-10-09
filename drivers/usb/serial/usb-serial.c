@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * USB Serial Converter driver
  *
@@ -5,10 +6,6 @@
  * Copyright (C) 1999 - 2012 Greg Kroah-Hartman (greg@kroah.com)
  * Copyright (C) 2000 Peter Berger (pberger@brimson.com)
  * Copyright (C) 2000 Al Borchers (borchers@steinerpoint.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
  *
  * This driver was originally based on the ACM driver by Armin Fuerst (which was
  * based on a driver by Brad Keryan)
@@ -709,17 +706,6 @@ static const struct tty_port_operations serial_port_ops = {
 	.shutdown		= serial_port_shutdown,
 };
 
-struct usb_serial_endpoints {
-	unsigned char num_bulk_in;
-	unsigned char num_bulk_out;
-	unsigned char num_interrupt_in;
-	unsigned char num_interrupt_out;
-	struct usb_endpoint_descriptor *bulk_in[MAX_NUM_PORTS];
-	struct usb_endpoint_descriptor *bulk_out[MAX_NUM_PORTS];
-	struct usb_endpoint_descriptor *interrupt_in[MAX_NUM_PORTS];
-	struct usb_endpoint_descriptor *interrupt_out[MAX_NUM_PORTS];
-};
-
 static void find_endpoints(struct usb_serial *serial,
 					struct usb_serial_endpoints *epds)
 {
@@ -936,23 +922,16 @@ static int usb_serial_probe(struct usb_interface *interface,
 		retval = -ENODEV;
 		goto err_free_epds;
 	}
-#ifdef CONFIG_USB_SERIAL_GENERIC
-	if (type == &usb_serial_generic_device) {
-		num_ports = epds->num_bulk_out;
-		if (num_ports == 0) {
-			dev_err(ddev, "Generic device with no bulk out, not allowed.\n");
-			retval = -EIO;
+
+	if (type->calc_num_ports) {
+		retval = type->calc_num_ports(serial, epds);
+		if (retval < 0)
 			goto err_free_epds;
-		}
+		num_ports = retval;
 	}
-#endif
-	if (!num_ports) {
-		/* if this device type has a calc_num_ports function, call it */
-		if (type->calc_num_ports)
-			num_ports = type->calc_num_ports(serial);
-		if (!num_ports)
-			num_ports = type->num_ports;
-	}
+
+	if (!num_ports)
+		num_ports = type->num_ports;
 
 	if (num_ports > MAX_NUM_PORTS) {
 		dev_warn(ddev, "too many ports requested: %d\n", num_ports);

@@ -49,17 +49,43 @@ struct hid_sensor_hub_attribute_info {
 };
 
 /**
+ * struct sensor_hub_pending - Synchronous read pending information
+ * @status:		Pending status true/false.
+ * @ready:		Completion synchronization data.
+ * @usage_id:		Usage id for physical device, E.g. Gyro usage id.
+ * @attr_usage_id:	Usage Id of a field, E.g. X-AXIS for a gyro.
+ * @raw_size:		Response size for a read request.
+ * @raw_data:		Place holder for received response.
+ */
+struct sensor_hub_pending {
+	bool status;
+	struct completion ready;
+	u32 usage_id;
+	u32 attr_usage_id;
+	int raw_size;
+	u8  *raw_data;
+};
+
+/**
  * struct hid_sensor_hub_device - Stores the hub instance data
  * @hdev:		Stores the hid instance.
  * @vendor_id:		Vendor id of hub device.
  * @product_id:		Product id of hub device.
- * @ref_cnt:		Number of MFD clients have opened this device
+ * @usage:		Usage id for this hub device instance.
+ * @start_collection_index: Starting index for a phy type collection
+ * @end_collection_index: Last index for a phy type collection
+ * @mutex_ptr:		synchronizing mutex pointer.
+ * @pending:		Holds information of pending sync read request.
  */
 struct hid_sensor_hub_device {
 	struct hid_device *hdev;
 	u32 vendor_id;
 	u32 product_id;
-	int ref_cnt;
+	u32 usage;
+	int start_collection_index;
+	int end_collection_index;
+	struct mutex *mutex_ptr;
+	struct sensor_hub_pending pending;
 };
 
 /**
@@ -145,20 +171,28 @@ int sensor_hub_input_get_attribute_info(struct hid_sensor_hub_device *hsdev,
 			struct hid_sensor_hub_attribute_info *info);
 
 /**
-* sensor_hub_input_attr_get_raw_value() - Synchronous read request
+* sensor_hub_input_attr_get_raw_value() - Attribute read request
 * @hsdev:	Hub device instance.
 * @usage_id:	Attribute usage id of parent physical device as per spec
 * @attr_usage_id:	Attribute usage id as per spec
 * @report_id:	Report id to look for
+* @flag:      Synchronous or asynchronous read
 *
-* Issues a synchronous read request for an input attribute. Returns
-* data upto 32 bits. Since client can get events, so this call should
-* not be used for data paths, this will impact performance.
+* Issues a synchronous or asynchronous read request for an input attribute.
+* Returns data upto 32 bits.
 */
 
+enum sensor_hub_read_flags {
+	SENSOR_HUB_SYNC,
+	SENSOR_HUB_ASYNC,
+};
+
 int sensor_hub_input_attr_get_raw_value(struct hid_sensor_hub_device *hsdev,
-			u32 usage_id,
-			u32 attr_usage_id, u32 report_id);
+ 					u32 usage_id,
+ 					u32 attr_usage_id, u32 report_id,
+ 					enum sensor_hub_read_flags flag
+);
+
 /**
 * sensor_hub_set_feature() - Feature set request
 * @hsdev:	Hub device instance.
@@ -201,6 +235,7 @@ struct hid_sensor_common {
 	int raw_hystersis;
 	int latency_ms;
 	struct iio_trigger *trigger;
+	int timestamp_ns_scale;
 	struct hid_sensor_hub_attribute_info poll;
 	struct hid_sensor_hub_attribute_info report_state;
 	struct hid_sensor_hub_attribute_info power_state;
@@ -232,8 +267,17 @@ int hid_sensor_write_samp_freq_value(struct hid_sensor_common *st,
 int hid_sensor_read_samp_freq_value(struct hid_sensor_common *st,
 					int *val1, int *val2);
 
+int hid_sensor_get_usage_index(struct hid_sensor_hub_device *hsdev,
+				u32 report_id, int field_index, u32 usage_id);
+
+int hid_sensor_format_scale(u32 usage_id,
+			    struct hid_sensor_hub_attribute_info *attr_info,
+			    int *val0, int *val1);
+
 s32 hid_sensor_read_poll_value(struct hid_sensor_common *st);
 
+int64_t hid_sensor_convert_timestamp(struct hid_sensor_common *st,
+				     int64_t raw_value);
 bool hid_sensor_batch_mode_supported(struct hid_sensor_common *st);
 int hid_sensor_set_report_latency(struct hid_sensor_common *st, int latency);
 int hid_sensor_get_report_latency(struct hid_sensor_common *st);

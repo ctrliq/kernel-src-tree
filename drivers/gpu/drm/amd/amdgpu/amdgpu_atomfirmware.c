@@ -71,19 +71,33 @@ int amdgpu_atomfirmware_allocate_fb_scratch(struct amdgpu_device *adev)
 	struct atom_context *ctx = adev->mode_info.atom_context;
 	int index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
 						vram_usagebyfirmware);
+	struct vram_usagebyfirmware_v2_1 *	firmware_usage;
+	uint32_t start_addr, size;
 	uint16_t data_offset;
 	int usage_bytes = 0;
 
 	if (amdgpu_atom_parse_data_header(ctx, index, NULL, NULL, NULL, &data_offset)) {
-		struct vram_usagebyfirmware_v2_1 *firmware_usage =
-			(struct vram_usagebyfirmware_v2_1 *)(ctx->bios + data_offset);
-
+		firmware_usage = (struct vram_usagebyfirmware_v2_1 *)(ctx->bios + data_offset);
 		DRM_DEBUG("atom firmware requested %08x %dkb fw %dkb drv\n",
 			  le32_to_cpu(firmware_usage->start_address_in_kb),
 			  le16_to_cpu(firmware_usage->used_by_firmware_in_kb),
 			  le16_to_cpu(firmware_usage->used_by_driver_in_kb));
 
-		usage_bytes = le16_to_cpu(firmware_usage->used_by_driver_in_kb) * 1024;
+		start_addr = le32_to_cpu(firmware_usage->start_address_in_kb);
+		size = le16_to_cpu(firmware_usage->used_by_firmware_in_kb);
+
+		if ((uint32_t)(start_addr & ATOM_VRAM_OPERATION_FLAGS_MASK) ==
+			(uint32_t)(ATOM_VRAM_BLOCK_SRIOV_MSG_SHARE_RESERVATION <<
+			ATOM_VRAM_OPERATION_FLAGS_SHIFT)) {
+			/* Firmware request VRAM reservation for SR-IOV */
+			adev->fw_vram_usage.start_offset = (start_addr &
+				(~ATOM_VRAM_OPERATION_FLAGS_MASK)) << 10;
+			adev->fw_vram_usage.size = size << 10;
+			/* Use the default scratch size */
+			usage_bytes = 0;
+		} else {
+			usage_bytes = le16_to_cpu(firmware_usage->used_by_driver_in_kb) << 10;
+		}
 	}
 	ctx->scratch_size_bytes = 0;
 	if (usage_bytes == 0)
@@ -100,6 +114,9 @@ union igp_info {
 	struct atom_integrated_system_info_v1_11 v11;
 };
 
+union umc_info {
+	struct atom_umc_info_v3_1 v31;
+};
 /*
  * Return vram width from integrated system info table, if available,
  * or 0 if not.
@@ -129,16 +146,100 @@ int amdgpu_atomfirmware_get_vram_width(struct amdgpu_device *adev)
 	return 0;
 }
 
+static int convert_atom_mem_type_to_vram_type (struct amdgpu_device *adev,
+					       int atom_mem_type)
+{
+	int vram_type;
+
+	if (adev->flags & AMD_IS_APU) {
+		switch (atom_mem_type) {
+		case Ddr2MemType:
+		case LpDdr2MemType:
+			vram_type = AMDGPU_VRAM_TYPE_DDR2;
+			break;
+		case Ddr3MemType:
+		case LpDdr3MemType:
+			vram_type = AMDGPU_VRAM_TYPE_DDR3;
+			break;
+		case Ddr4MemType:
+		case LpDdr4MemType:
+			vram_type = AMDGPU_VRAM_TYPE_DDR4;
+			break;
+		default:
+			vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+			break;
+		}
+	} else {
+		switch (atom_mem_type) {
+		case ATOM_DGPU_VRAM_TYPE_GDDR5:
+			vram_type = AMDGPU_VRAM_TYPE_GDDR5;
+			break;
+		case ATOM_DGPU_VRAM_TYPE_HBM:
+			vram_type = AMDGPU_VRAM_TYPE_HBM;
+			break;
+		default:
+			vram_type = AMDGPU_VRAM_TYPE_UNKNOWN;
+			break;
+		}
+	}
+
+	return vram_type;
+}
+/*
+ * Return vram type from either integrated system info table
+ * or umc info table, if available, or 0 (TYPE_UNKNOWN) if not
+ */
+int amdgpu_atomfirmware_get_vram_type(struct amdgpu_device *adev)
+{
+	struct amdgpu_mode_info *mode_info = &adev->mode_info;
+	int index;
+	u16 data_offset, size;
+	union igp_info *igp_info;
+	union umc_info *umc_info;
+	u8 frev, crev;
+	u8 mem_type;
+
+	if (adev->flags & AMD_IS_APU)
+		index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
+						    integratedsysteminfo);
+	else
+		index = get_index_into_master_table(atom_master_list_of_data_tables_v2_1,
+						    umc_info);
+	if (amdgpu_atom_parse_data_header(mode_info->atom_context,
+					  index, &size,
+					  &frev, &crev, &data_offset)) {
+		if (adev->flags & AMD_IS_APU) {
+			igp_info = (union igp_info *)
+				(mode_info->atom_context->bios + data_offset);
+			switch (crev) {
+			case 11:
+				mem_type = igp_info->v11.memorytype;
+				return convert_atom_mem_type_to_vram_type(adev, mem_type);
+			default:
+				return 0;
+			}
+		} else {
+			umc_info = (union umc_info *)
+				(mode_info->atom_context->bios + data_offset);
+			switch (crev) {
+			case 1:
+				mem_type = umc_info->v31.vram_type;
+				return convert_atom_mem_type_to_vram_type(adev, mem_type);
+			default:
+				return 0;
+			}
+		}
+	}
+
+	return 0;
+}
+
 union firmware_info {
 	struct atom_firmware_info_v3_1 v31;
 };
 
 union smu_info {
 	struct atom_smu_info_v3_1 v31;
-};
-
-union umc_info {
-	struct atom_umc_info_v3_1 v31;
 };
 
 int amdgpu_atomfirmware_get_clock_info(struct amdgpu_device *adev)

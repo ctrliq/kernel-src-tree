@@ -491,7 +491,7 @@ static void trans_go_sync(struct gfs2_glock *gl)
 	if (gl->gl_state != LM_ST_UNLOCKED &&
 	    test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
 		gfs2_meta_syncfs(sdp);
-		gfs2_log_shutdown(sdp);
+		gfs2_log_shutdown(sdp, 0);
 	}
 }
 

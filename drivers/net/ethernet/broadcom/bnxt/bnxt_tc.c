@@ -54,12 +54,10 @@ static int bnxt_tc_parse_redir(struct bnxt *bp,
 			       struct bnxt_tc_actions *actions,
 			       const struct tc_action *tc_act)
 {
-	int ifindex = tcf_mirred_ifindex(tc_act);
-	struct net_device *dev;
+	struct net_device *dev = tcf_mirred_dev(tc_act);
 
-	dev = __dev_get_by_index(dev_net(bp->dev), ifindex);
 	if (!dev) {
-		netdev_info(bp->dev, "no dev for ifindex=%d", ifindex);
+		netdev_info(bp->dev, "no dev in mirred action");
 		return -EINVAL;
 	}
 
@@ -1551,9 +1549,6 @@ int bnxt_tc_setup_flower(struct bnxt *bp, u16 src_fid,
 			 struct tc_cls_flower_offload *cls_flower)
 {
 	int rc = 0;
-
-	if (cls_flower->common.chain_index)
-		return -EOPNOTSUPP;
 
 	switch (cls_flower->command) {
 	case TC_CLSFLOWER_REPLACE:

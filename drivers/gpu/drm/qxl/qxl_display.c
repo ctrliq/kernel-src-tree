@@ -364,6 +364,7 @@ static void qxl_crtc_destroy(struct drm_crtc *crtc)
 {
 	struct qxl_crtc *qxl_crtc = to_qxl_crtc(crtc);
 
+	qxl_bo_unref(&qxl_crtc->cursor_bo);
 	drm_crtc_cleanup(crtc);
 	kfree(qxl_crtc);
 }
@@ -383,7 +384,7 @@ void qxl_user_framebuffer_destroy(struct drm_framebuffer *fb)
 	struct qxl_bo *bo = gem_to_qxl_bo(qxl_fb->obj);
 
 	WARN_ON(bo->shadow);
-	drm_gem_object_unreference_unlocked(qxl_fb->obj);
+	drm_gem_object_put_unlocked(qxl_fb->obj);
 	drm_framebuffer_cleanup(fb);
 	kfree(qxl_fb);
 }
@@ -502,6 +503,53 @@ static int qxl_primary_atomic_check(struct drm_plane *plane,
 	return 0;
 }
 
+static int qxl_primary_apply_cursor(struct drm_plane *plane)
+{
+	struct drm_device *dev = plane->dev;
+	struct qxl_device *qdev = dev->dev_private;
+	struct drm_framebuffer *fb = plane->state->fb;
+	struct qxl_crtc *qcrtc = to_qxl_crtc(plane->state->crtc);
+	struct qxl_cursor_cmd *cmd;
+	struct qxl_release *release;
+	int ret = 0;
+
+	if (!qcrtc->cursor_bo)
+		return 0;
+
+	ret = qxl_alloc_release_reserved(qdev, sizeof(*cmd),
+					 QXL_RELEASE_CURSOR_CMD,
+					 &release, NULL);
+	if (ret)
+		return ret;
+
+	ret = qxl_release_list_add(release, qcrtc->cursor_bo);
+	if (ret)
+		goto out_free_release;
+
+	ret = qxl_release_reserve_list(release, false);
+	if (ret)
+		goto out_free_release;
+
+	cmd = (struct qxl_cursor_cmd *)qxl_release_map(qdev, release);
+	cmd->type = QXL_CURSOR_SET;
+	cmd->u.set.position.x = plane->state->crtc_x + fb->hot_x;
+	cmd->u.set.position.y = plane->state->crtc_y + fb->hot_y;
+
+	cmd->u.set.shape = qxl_bo_physical_address(qdev, qcrtc->cursor_bo, 0);
+
+	cmd->u.set.visible = 1;
+	qxl_release_unmap(qdev, release, &cmd->release_info);
+
+	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+	qxl_release_fence_buffer_objects(release);
+
+	return ret;
+
+out_free_release:
+	qxl_release_free(qdev, release);
+	return ret;
+}
+
 static void qxl_primary_atomic_update(struct drm_plane *plane,
 				      struct drm_plane_state *old_state)
 {
@@ -517,6 +565,7 @@ static void qxl_primary_atomic_update(struct drm_plane *plane,
 	    .x2 = qfb->base.width,
 	    .y2 = qfb->base.height
 	};
+	int ret;
 	bool same_shadow = false;
 
 	if (old_state->fb) {
@@ -538,6 +587,11 @@ static void qxl_primary_atomic_update(struct drm_plane *plane,
 		if (!same_shadow)
 			qxl_io_destroy_primary(qdev);
 		bo_old->is_primary = false;
+
+		ret = qxl_primary_apply_cursor(plane);
+		if (ret)
+			DRM_ERROR(
+			"could not set cursor after creating primary");
 	}
 
 	if (!bo->is_primary) {
@@ -578,11 +632,12 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
 	struct drm_device *dev = plane->dev;
 	struct qxl_device *qdev = dev->dev_private;
 	struct drm_framebuffer *fb = plane->state->fb;
+	struct qxl_crtc *qcrtc = to_qxl_crtc(plane->state->crtc);
 	struct qxl_release *release;
 	struct qxl_cursor_cmd *cmd;
 	struct qxl_cursor *cursor;
 	struct drm_gem_object *obj;
-	struct qxl_bo *cursor_bo, *user_bo = NULL;
+	struct qxl_bo *cursor_bo = NULL, *user_bo = NULL, *old_cursor_bo = NULL;
 	int ret;
 	void *user_ptr;
 	int size = 64*64*4;
@@ -635,6 +690,10 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
 		cmd->u.set.shape = qxl_bo_physical_address(qdev,
 							   cursor_bo, 0);
 		cmd->type = QXL_CURSOR_SET;
+
+		old_cursor_bo = qcrtc->cursor_bo;
+		qcrtc->cursor_bo = cursor_bo;
+		cursor_bo = NULL;
 	} else {
 
 		ret = qxl_release_reserve_list(release, true);
@@ -651,6 +710,11 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
 	qxl_release_unmap(qdev, release, &cmd->release_info);
 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
 	qxl_release_fence_buffer_objects(release);
+
+	if (old_cursor_bo)
+		qxl_bo_unref(&old_cursor_bo);
+
+	qxl_bo_unref(&cursor_bo);
 
 	return;
 
@@ -1106,7 +1170,7 @@ qxl_user_framebuffer_create(struct drm_device *dev,
 	ret = qxl_framebuffer_init(dev, qxl_fb, mode_cmd, obj, &qxl_fb_funcs);
 	if (ret) {
 		kfree(qxl_fb);
-		drm_gem_object_unreference_unlocked(obj);
+		drm_gem_object_put_unlocked(obj);
 		return NULL;
 	}
 

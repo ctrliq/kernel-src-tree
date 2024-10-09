@@ -67,7 +67,7 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
 	 * be resued after dying flag is set
 	 */
 	if (q->mq_ops) {
-		blk_mq_sched_insert_request(rq, at_head, true, false, false);
+		blk_mq_sched_insert_request(rq, at_head, true, false);
 		return;
 	}
 

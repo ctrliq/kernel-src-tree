@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /* Intel(R) Ethernet Switch Host Interface Driver
  * Copyright(c) 2013 - 2017 Intel Corporation.
  *
@@ -214,9 +213,10 @@ static void fm10k_start_service_event(struct fm10k_intfc *interface)
  * fm10k_service_timer - Timer Call-back
  * @data: pointer to interface cast into an unsigned long
  **/
-static void fm10k_service_timer(unsigned long data)
+static void fm10k_service_timer(struct timer_list *t)
 {
-	struct fm10k_intfc *interface = (struct fm10k_intfc *)data;
+	struct fm10k_intfc *interface = from_timer(interface, t,
+						   service_timer);
 
 	/* Reset the timer */
 	mod_timer(&interface->service_timer, (HZ * 2) + jiffies);
@@ -2102,11 +2102,11 @@ static int fm10k_sw_init(struct fm10k_intfc *interface,
 	/* initialize vxlan_port list */
 	INIT_LIST_HEAD(&interface->vxlan_port);
 
-	/* Initialize the MAC/VLAN queue */
-	INIT_LIST_HEAD(&interface->macvlan_requests);
-
 	netdev_rss_key_fill(rss_key, sizeof(rss_key));
 	memcpy(interface->rssrk, rss_key, sizeof(rss_key));
+
+	/* Initialize the MAC/VLAN queue */
+	INIT_LIST_HEAD(&interface->macvlan_requests);
 
 	/* Initialize the mailbox lock */
 	spin_lock_init(&interface->mbx_lock);
@@ -2318,8 +2318,7 @@ static int fm10k_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	/* Initialize service timer and service task late in order to avoid
 	 * cleanup issues.
 	 */
-	setup_timer(&interface->service_timer, &fm10k_service_timer,
-		    (unsigned long)interface);
+	timer_setup(&interface->service_timer, fm10k_service_timer, 0);
 	INIT_WORK(&interface->service_task, fm10k_service_task);
 
 	/* Setup the MAC/VLAN queue */
@@ -2593,7 +2592,7 @@ static void fm10k_io_resume(struct pci_dev *pdev)
 
 	if (err)
 		dev_warn(&pdev->dev,
-			 "fm10k_io_resume failed: %d\n", err);
+			 "%s failed: %d\n", __func__, err);
 	else
 		netif_device_attach(netdev);
 }
@@ -2625,7 +2624,7 @@ static void fm10k_io_reset_notify(struct pci_dev *pdev, bool prepare)
 
 	if (err) {
 		dev_warn(&pdev->dev,
-			 "fm10k_io_reset_notify failed: %d\n", err);
+			 "%s failed: %d\n", __func__, err);
 		netif_device_detach(interface->netdev);
 	}
 }

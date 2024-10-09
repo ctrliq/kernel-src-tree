@@ -945,6 +945,41 @@ static void cap_audit_rule_free(void *lsmrule)
 }
 #endif /* CONFIG_AUDIT */
 
+#ifdef CONFIG_BPF_SYSCALL
+static int cap_bpf(int cmd, union bpf_attr *attr, unsigned int size)
+{
+	return 0;
+}
+
+int cap_bpf_map(struct bpf_map *map, fmode_t fmode)
+{
+       return 0;
+}
+
+int cap_bpf_prog(struct bpf_prog *prog)
+{
+       return 0;
+}
+
+int cap_bpf_map_alloc_security(struct bpf_map *map)
+{
+       return 0;
+}
+
+int cap_bpf_prog_alloc_security(struct bpf_prog_aux *aux)
+{
+       return 0;
+}
+
+void cap_bpf_map_free_security(struct bpf_map *map)
+{
+}
+
+void cap_bpf_prog_free_security(struct bpf_prog_aux *aux)
+{
+}
+#endif /* CONFIG_BPF_SYSCALL */
+
 #define set_to_cap_if_null(ops, function)				\
 	do {								\
 		if (!ops->function) {					\
@@ -1167,5 +1202,14 @@ void __init security_fixup_ops(struct security_operations *ops)
 	set_to_cap_if_null(ops, audit_rule_known);
 	set_to_cap_if_null(ops, audit_rule_match);
 	set_to_cap_if_null(ops, audit_rule_free);
+#endif
+#ifdef CONFIG_BPF_SYSCALL
+	set_to_cap_if_null(ops, bpf);
+	set_to_cap_if_null(ops, bpf_map);
+	set_to_cap_if_null(ops, bpf_prog);
+	set_to_cap_if_null(ops, bpf_map_alloc_security);
+	set_to_cap_if_null(ops, bpf_prog_alloc_security);
+	set_to_cap_if_null(ops, bpf_map_free_security);
+	set_to_cap_if_null(ops, bpf_prog_free_security);
 #endif
 }

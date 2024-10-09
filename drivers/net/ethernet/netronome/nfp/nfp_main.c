@@ -500,13 +500,9 @@ static int nfp_pci_probe(struct pci_dev *pdev,
 	if (err)
 		goto err_hwinfo_free;
 
-	err = devlink_register(devlink, &pdev->dev);
-	if (err)
-		goto err_hwinfo_free;
-
 	err = nfp_nsp_init(pdev, pf);
 	if (err)
-		goto err_devlink_unreg;
+		goto err_hwinfo_free;
 
 	pf->mip = nfp_mip_open(pf->cpp);
 	pf->rtbl = __nfp_rtsym_table_read(pf->cpp, pf->mip);
@@ -542,8 +538,6 @@ err_fw_unload:
 		nfp_fw_unload(pf);
 	kfree(pf->eth_tbl);
 	vfree(pf->dumpspec);
-err_devlink_unreg:
-	devlink_unregister(devlink);
 err_hwinfo_free:
 	kfree(pf->hwinfo);
 	nfp_cpp_free(pf->cpp);
@@ -564,16 +558,11 @@ err_pci_disable:
 static void nfp_pci_remove(struct pci_dev *pdev)
 {
 	struct nfp_pf *pf = pci_get_drvdata(pdev);
-	struct devlink *devlink;
-
-	devlink = priv_to_devlink(pf);
-
-	nfp_net_pci_remove(pf);
 
 	nfp_pcie_sriov_disable(pdev);
 	pci_sriov_set_totalvfs(pf->pdev, 0);
 
-	devlink_unregister(devlink);
+	nfp_net_pci_remove(pf);
 
 	vfree(pf->dumpspec);
 	kfree(pf->rtbl);
@@ -588,7 +577,7 @@ static void nfp_pci_remove(struct pci_dev *pdev)
 
 	kfree(pf->eth_tbl);
 	mutex_destroy(&pf->lock);
-	devlink_free(devlink);
+	devlink_free(priv_to_devlink(pf));
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
 }

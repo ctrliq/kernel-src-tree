@@ -15,7 +15,6 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/hash.h>
-#include <linux/pmem.h>
 #include <linux/sort.h>
 #include <linux/io.h>
 #include <linux/nd.h>
@@ -396,7 +395,7 @@ resource_size_t nd_region_allocatable_dpa(struct nd_region *nd_region)
 	int i;
 
 	if (is_memory(&nd_region->dev))
-		available = PHYS_ADDR_MAX;
+		available = (phys_addr_t)ULLONG_MAX;
 
 	WARN_ON(!is_nvdimm_bus_locked(&nd_region->dev));
 	for (i = 0; i < nd_region->ndr_mappings; i++) {
@@ -580,11 +579,13 @@ static ssize_t persistence_domain_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct nd_region *nd_region = to_nd_region(dev);
-	unsigned long flags = nd_region->flags;
 
-	return sprintf(buf, "%s%s\n",
-			flags & BIT(ND_REGION_PERSIST_CACHE) ? "cpu_cache " : "",
-			flags & BIT(ND_REGION_PERSIST_MEMCTRL) ? "memory_controller " : "");
+	if (test_bit(ND_REGION_PERSIST_CACHE, &nd_region->flags))
+		return sprintf(buf, "cpu_cache\n");
+	else if (test_bit(ND_REGION_PERSIST_MEMCTRL, &nd_region->flags))
+		return sprintf(buf, "memory_controller\n");
+	else
+		return sprintf(buf, "\n");
 }
 static DEVICE_ATTR_RO(persistence_domain);
 
@@ -1167,6 +1168,13 @@ int nvdimm_has_flush(struct nd_region *nd_region)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nvdimm_has_flush);
+
+int nvdimm_has_cache(struct nd_region *nd_region)
+{
+	return is_nd_pmem(&nd_region->dev) &&
+		!test_bit(ND_REGION_PERSIST_CACHE, &nd_region->flags);
+}
+EXPORT_SYMBOL_GPL(nvdimm_has_cache);
 
 void __exit nd_region_devs_exit(void)
 {

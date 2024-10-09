@@ -1335,16 +1335,16 @@ static int kvm_vm_ioctl_enable_cap(struct kvm *kvm,
 #ifdef CONFIG_PPC_PSERIES
 static int pseries_get_cpu_char(struct kvm_ppc_cpu_char *cp)
 {
-	unsigned long character, behaviour;
+	struct h_cpu_char_result c;
 	unsigned long rc;
 
 	if (!machine_is(pseries))
 		return -ENOTTY;
 
-	rc = plpar_get_cpu_characteristics(&character, &behaviour);
+	rc = plpar_get_cpu_characteristics(&c);
 	if (rc == H_SUCCESS) {
-		cp->character = character;
-		cp->behaviour = behaviour;
+		cp->character = c.character;
+		cp->behaviour = c.behaviour;
 		cp->character_mask = KVM_PPC_CPU_CHAR_SPEC_BAR_ORI31 |
 			KVM_PPC_CPU_CHAR_BCCTRL_SERIALISED |
 			KVM_PPC_CPU_CHAR_L1D_FLUSH_ORI30 |

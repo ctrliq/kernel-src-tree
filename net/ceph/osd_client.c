@@ -102,13 +102,12 @@ static int calc_layout(struct ceph_file_layout *layout, u64 off, u64 *plen,
 			u64 *objnum, u64 *objoff, u64 *objlen)
 {
 	u64 orig_len = *plen;
-	int r;
+	u32 xlen;
 
 	/* object extent? */
-	r = ceph_calc_file_object_mapping(layout, off, orig_len, objnum,
-					  objoff, objlen);
-	if (r < 0)
-		return r;
+	ceph_calc_file_object_mapping(layout, off, orig_len, objnum,
+					  objoff, &xlen);
+	*objlen = xlen;
 	if (*objlen < orig_len) {
 		*plen = *objlen;
 		dout(" skipping last %llu, final file extent %llu~%llu\n",
@@ -116,7 +115,6 @@ static int calc_layout(struct ceph_file_layout *layout, u64 off, u64 *plen,
 	}
 
 	dout("calc_layout objnum=%llx %llu~%llu\n", *objnum, *objoff, *objlen);
-
 	return 0;
 }
 
@@ -396,7 +394,9 @@ static void target_copy(struct ceph_osd_request_target *dest,
 static void target_destroy(struct ceph_osd_request_target *t)
 {
 	ceph_oid_destroy(&t->base_oid);
+	ceph_oloc_destroy(&t->base_oloc);
 	ceph_oid_destroy(&t->target_oid);
+	ceph_oloc_destroy(&t->target_oloc);
 }
 
 /*
@@ -543,7 +543,7 @@ EXPORT_SYMBOL(ceph_osdc_alloc_request);
 
 static int ceph_oloc_encoding_size(const struct ceph_object_locator *oloc)
 {
-	return 8 + 4 + 4 + 4;
+	return 8 + 4 + 4 + 4 + (oloc->pool_ns ? oloc->pool_ns->len : 0);
 }
 
 int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
@@ -553,6 +553,7 @@ int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
 	int msg_size;
 
 	WARN_ON(ceph_oid_empty(&req->r_base_oid));
+	WARN_ON(ceph_oloc_empty(&req->r_base_oloc));
 
 	/* create request message */
 	msg_size = CEPH_ENCODING_START_BLK_LEN +
@@ -948,7 +949,7 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
 	if (opcode == CEPH_OSD_OP_CREATE || opcode == CEPH_OSD_OP_DELETE) {
 		osd_req_op_init(req, which, opcode, 0);
 	} else {
-		u32 object_size = le32_to_cpu(layout->fl_object_size);
+		u32 object_size = layout->object_size;
 		u32 object_base = off - objoff;
 		if (!(truncate_seq == 1 && truncate_size == -1ULL)) {
 			if (truncate_size <= object_base) {
@@ -965,7 +966,8 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
 
 	req->r_abort_on_full = true;
 	req->r_flags = flags;
-	req->r_base_oloc.pool = ceph_file_layout_pg_pool(*layout);
+	req->r_base_oloc.pool = layout->pool_id;
+	req->r_base_oloc.pool_ns = ceph_try_get_string(layout->pool_ns);
 	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
 
 	req->r_snapid = vino.snap;
@@ -1722,8 +1724,13 @@ static void hoid_fill_from_target(struct ceph_hobject_id *hoid,
 	hoid->snapid = CEPH_NOSNAP;
 	hoid->hash = t->pgid.seed;
 	hoid->is_max = false;
-	hoid->nspace = NULL;
-	hoid->nspace_len = 0;
+	if (t->target_oloc.pool_ns) {
+		hoid->nspace = t->target_oloc.pool_ns->str;
+		hoid->nspace_len = t->target_oloc.pool_ns->len;
+	} else {
+		hoid->nspace = NULL;
+		hoid->nspace_len = 0;
+	}
 	hoid->pool = t->target_oloc.pool;
 	ceph_hoid_build_hash_cache(hoid);
 }
@@ -1843,7 +1850,11 @@ static void encode_oloc(void **p, void *end,
 	ceph_encode_64(p, oloc->pool);
 	ceph_encode_32(p, -1); /* preferred */
 	ceph_encode_32(p, 0);  /* key len */
-	ceph_encode_32(p, 0);
+	if (oloc->pool_ns)
+		ceph_encode_string(p, end, oloc->pool_ns->str,
+				   oloc->pool_ns->len);
+	else
+		ceph_encode_32(p, 0);
 }
 
 static void encode_request_partial(struct ceph_osd_request *req,
@@ -3194,9 +3205,22 @@ static int ceph_oloc_decode(void **p, void *end,
 	}
 
 	if (struct_v >= 5) {
+		bool changed = false;
+
 		len = ceph_decode_32(p);
 		if (len > 0) {
-			pr_warn("ceph_object_locator::nspace is set\n");
+			ceph_decode_need(p, end, len, e_inval);
+			if (!oloc->pool_ns ||
+			    ceph_compare_string(oloc->pool_ns, *p, len))
+				changed = true;
+			*p += len;
+		} else {
+			if (oloc->pool_ns)
+				changed = true;
+		}
+		if (changed) {
+			/* redirect changes namespace */
+			pr_warn("ceph_object_locator::nspace is changed\n");
 			goto e_inval;
 		}
 	}
@@ -3382,7 +3406,9 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 		goto out_unlock_session;
 	}
 
+	m.redirect.oloc.pool_ns = req->r_t.target_oloc.pool_ns;
 	ret = decode_MOSDOpReply(msg, &m);
+	m.redirect.oloc.pool_ns = NULL;
 	if (ret) {
 		pr_err("failed to decode MOSDOpReply for tid %llu: %d\n",
 		       req->r_tid, ret);
@@ -3411,7 +3437,11 @@ static void handle_reply(struct ceph_osd *osd, struct ceph_msg *msg)
 		unlink_request(osd, req);
 		mutex_unlock(&osd->lock);
 
-		ceph_oloc_copy(&req->r_t.target_oloc, &m.redirect.oloc);
+		/*
+		 * Not ceph_oloc_copy() - changing pool_ns is not
+		 * supported.
+		 */
+		req->r_t.target_oloc.pool = m.redirect.oloc.pool;
 		req->r_flags |= CEPH_OSD_FLAG_REDIRECTED;
 		req->r_tid = 0;
 		__submit_request(req, false);
@@ -5033,7 +5063,7 @@ int ceph_osdc_writepages(struct ceph_osd_client *osdc, struct ceph_vino vino,
 }
 EXPORT_SYMBOL(ceph_osdc_writepages);
 
-int ceph_osdc_setup(void)
+int __init ceph_osdc_setup(void)
 {
 	size_t size = sizeof(struct ceph_osd_request) +
 	    CEPH_OSD_SLAB_OPS * sizeof(struct ceph_osd_req_op);
@@ -5044,7 +5074,6 @@ int ceph_osdc_setup(void)
 
 	return ceph_osd_request_cache ? 0 : -ENOMEM;
 }
-EXPORT_SYMBOL(ceph_osdc_setup);
 
 void ceph_osdc_cleanup(void)
 {
@@ -5052,7 +5081,6 @@ void ceph_osdc_cleanup(void)
 	kmem_cache_destroy(ceph_osd_request_cache);
 	ceph_osd_request_cache = NULL;
 }
-EXPORT_SYMBOL(ceph_osdc_cleanup);
 
 /*
  * handle incoming message

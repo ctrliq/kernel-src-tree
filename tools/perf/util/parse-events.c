@@ -34,7 +34,7 @@
 #ifdef PARSER_DEBUG
 extern int parse_events_debug;
 #endif
-int parse_events_parse(void *data, void *scanner);
+int parse_events_parse(void *parse_state, void *scanner);
 static int get_config_terms(struct list_head *head_config,
 			    struct list_head *head_terms __maybe_unused);
 
@@ -309,10 +309,11 @@ static char *get_config_name(struct list_head *head_terms)
 static struct perf_evsel *
 __add_event(struct list_head *list, int *idx,
 	    struct perf_event_attr *attr,
-	    char *name, struct cpu_map *cpus,
-	    struct list_head *config_terms)
+	    char *name, struct perf_pmu *pmu,
+	    struct list_head *config_terms, bool auto_merge_stats)
 {
 	struct perf_evsel *evsel;
+	struct cpu_map *cpus = pmu ? pmu->cpus : NULL;
 
 	event_attr_init(attr);
 
@@ -323,7 +324,8 @@ __add_event(struct list_head *list, int *idx,
 	(*idx)++;
 	evsel->cpus        = cpu_map__get(cpus);
 	evsel->own_cpus    = cpu_map__get(cpus);
-	evsel->system_wide = !!cpus;
+	evsel->system_wide = pmu ? pmu->is_uncore : false;
+	evsel->auto_merge_stats = auto_merge_stats;
 
 	if (name)
 		evsel->name = strdup(name);
@@ -339,7 +341,7 @@ static int add_event(struct list_head *list, int *idx,
 		     struct perf_event_attr *attr, char *name,
 		     struct list_head *config_terms)
 {
-	return __add_event(list, idx, attr, name, NULL, config_terms) ? 0 : -ENOMEM;
+	return __add_event(list, idx, attr, name, NULL, config_terms, false) ? 0 : -ENOMEM;
 }
 
 static int parse_aliases(char *str, const char *names[][PERF_EVSEL__MAX_ALIASES], int size)
@@ -956,7 +958,7 @@ int parse_events_add_tracepoint(struct list_head *list, int *idx,
 					    err, head_config);
 }
 
-int parse_events_add_numeric(struct parse_events_evlist *data,
+int parse_events_add_numeric(struct parse_events_state *parse_state,
 			     struct list_head *list,
 			     u32 type, u64 config,
 			     struct list_head *head_config)
@@ -969,7 +971,7 @@ int parse_events_add_numeric(struct parse_events_evlist *data,
 	attr.config = config;
 
 	if (head_config) {
-		if (config_attr(&attr, head_config, data->error,
+		if (config_attr(&attr, head_config, parse_state->error,
 				config_term_common))
 			return -EINVAL;
 
@@ -977,13 +979,13 @@ int parse_events_add_numeric(struct parse_events_evlist *data,
 			return -ENOMEM;
 	}
 
-	return add_event(list, &data->idx, &attr,
+	return add_event(list, &parse_state->idx, &attr,
 			 get_config_name(head_config), &config_terms);
 }
 
-int parse_events_add_pmu(struct parse_events_evlist *data,
+static int __parse_events_add_pmu(struct parse_events_state *parse_state,
 			 struct list_head *list, char *name,
-			 struct list_head *head_config)
+			 struct list_head *head_config, bool auto_merge_stats)
 {
 	struct perf_event_attr attr;
 	struct perf_pmu_info info;
@@ -1010,7 +1012,7 @@ int parse_events_add_pmu(struct parse_events_evlist *data,
 
 	if (!head_config) {
 		attr.type = pmu->type;
-		evsel = __add_event(list, &data->idx, &attr, NULL, pmu->cpus, NULL);
+		evsel = __add_event(list, &parse_state->idx, &attr, NULL, pmu, NULL, auto_merge_stats);
 		return evsel ? 0 : -ENOMEM;
 	}
 
@@ -1021,18 +1023,18 @@ int parse_events_add_pmu(struct parse_events_evlist *data,
 	 * Configure hardcoded terms first, no need to check
 	 * return value when called with fail == 0 ;)
 	 */
-	if (config_attr(&attr, head_config, data->error, config_term_pmu))
+	if (config_attr(&attr, head_config, parse_state->error, config_term_pmu))
 		return -EINVAL;
 
 	if (get_config_terms(head_config, &config_terms))
 		return -ENOMEM;
 
-	if (perf_pmu__config(pmu, &attr, head_config, data->error))
+	if (perf_pmu__config(pmu, &attr, head_config, parse_state->error))
 		return -EINVAL;
 
-	evsel = __add_event(list, &data->idx, &attr,
-			    get_config_name(head_config), pmu->cpus,
-			    &config_terms);
+	evsel = __add_event(list, &parse_state->idx, &attr,
+			    get_config_name(head_config), pmu,
+			    &config_terms, auto_merge_stats);
 	if (evsel) {
 		evsel->unit = info.unit;
 		evsel->scale = info.scale;
@@ -1045,7 +1047,14 @@ int parse_events_add_pmu(struct parse_events_evlist *data,
 	return evsel ? 0 : -ENOMEM;
 }
 
-int parse_events_multi_pmu_add(struct parse_events_evlist *data,
+int parse_events_add_pmu(struct parse_events_state *parse_state,
+			 struct list_head *list, char *name,
+			 struct list_head *head_config)
+{
+	return __parse_events_add_pmu(parse_state, list, name, head_config, false);
+}
+
+int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
 			       char *str, struct list_head **listp)
 {
 	struct list_head *head;
@@ -1074,8 +1083,8 @@ int parse_events_multi_pmu_add(struct parse_events_evlist *data,
 					return -1;
 				list_add_tail(&term->list, head);
 
-				if (!parse_events_add_pmu(data, list,
-						  pmu->name, head)) {
+				if (!__parse_events_add_pmu(parse_state, list,
+							    pmu->name, head, true)) {
 					pr_debug("%s -> %s/%s/\n", str,
 						 pmu->name, alias->str);
 					ok++;
@@ -1412,7 +1421,7 @@ perf_pmu__parse_check(const char *name)
 	return r ? r->type : PMU_EVENT_SYMBOL_ERR;
 }
 
-static int parse_events__scanner(const char *str, void *data, int start_token)
+static int parse_events__scanner(const char *str, void *parse_state, int start_token)
 {
 	YY_BUFFER_STATE buffer;
 	void *scanner;
@@ -1427,7 +1436,7 @@ static int parse_events__scanner(const char *str, void *data, int start_token)
 #ifdef PARSER_DEBUG
 	parse_events_debug = 1;
 #endif
-	ret = parse_events_parse(data, scanner);
+	ret = parse_events_parse(parse_state, scanner);
 
 	parse_events__flush_buffer(buffer, scanner);
 	parse_events__delete_buffer(buffer, scanner);
@@ -1440,44 +1449,44 @@ static int parse_events__scanner(const char *str, void *data, int start_token)
  */
 int parse_events_terms(struct list_head *terms, const char *str)
 {
-	struct parse_events_terms data = {
+	struct parse_events_state parse_state = {
 		.terms = NULL,
 	};
 	int ret;
 
-	ret = parse_events__scanner(str, &data, PE_START_TERMS);
+	ret = parse_events__scanner(str, &parse_state, PE_START_TERMS);
 	if (!ret) {
-		list_splice(data.terms, terms);
-		zfree(&data.terms);
+		list_splice(parse_state.terms, terms);
+		zfree(&parse_state.terms);
 		return 0;
 	}
 
-	parse_events_terms__delete(data.terms);
+	parse_events_terms__delete(parse_state.terms);
 	return ret;
 }
 
 int parse_events(struct perf_evlist *evlist, const char *str,
 		 struct parse_events_error *err)
 {
-	struct parse_events_evlist data = {
-		.list  = LIST_HEAD_INIT(data.list),
+	struct parse_events_state parse_state = {
+		.list  = LIST_HEAD_INIT(parse_state.list),
 		.idx   = evlist->nr_entries,
 		.error = err,
 	};
 	int ret;
 
-	ret = parse_events__scanner(str, &data, PE_START_EVENTS);
+	ret = parse_events__scanner(str, &parse_state, PE_START_EVENTS);
 	perf_pmu__parse_cleanup();
 	if (!ret) {
 		struct perf_evsel *last;
 
-		if (list_empty(&data.list)) {
+		if (list_empty(&parse_state.list)) {
 			WARN_ONCE(true, "WARNING: event parser found nothing");
 			return -1;
 		}
 
-		perf_evlist__splice_list_tail(evlist, &data.list);
-		evlist->nr_groups += data.nr_groups;
+		perf_evlist__splice_list_tail(evlist, &parse_state.list);
+		evlist->nr_groups += parse_state.nr_groups;
 		last = perf_evlist__last(evlist);
 		last->cmdline_group_boundary = true;
 
@@ -2299,10 +2308,10 @@ void parse_events_terms__delete(struct list_head *terms)
 	free(terms);
 }
 
-void parse_events_evlist_error(struct parse_events_evlist *data,
+void parse_events_evlist_error(struct parse_events_state *parse_state,
 			       int idx, const char *str)
 {
-	struct parse_events_error *err = data->error;
+	struct parse_events_error *err = parse_state->error;
 
 	if (!err)
 		return;

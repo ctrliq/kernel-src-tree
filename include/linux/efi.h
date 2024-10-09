@@ -20,6 +20,7 @@
 #include <linux/ioport.h>
 #include <linux/pfn.h>
 #include <linux/pstore.h>
+#include <linux/mutex.h>
 
 #include <asm/page.h>
 
@@ -1162,6 +1163,7 @@ struct efivar_entry {
 	struct kobject kobj;
 	bool scanning;
 	bool deleting;
+	struct mutex var_data_mutex;	/* Protect var.DataSize and var.Data */
 };
 
 struct efi_simple_text_output_protocol_32 {

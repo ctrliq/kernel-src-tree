@@ -79,6 +79,7 @@ extern unsigned long search_exception_table(unsigned long);
 static inline __must_check long __copy_from_user(void *to,
 		const void __user * from, unsigned long n)
 {
+	check_object_size(to, n, false);
 	if (__builtin_constant_p(n)) {
 		switch(n) {
 		case 1:
@@ -109,6 +110,7 @@ static inline __must_check long __copy_from_user(void *to,
 static inline __must_check long __copy_to_user(void __user *to,
 		const void *from, unsigned long n)
 {
+	check_object_size(from, n, true);
 	if (__builtin_constant_p(n)) {
 		switch(n) {
 		case 1:

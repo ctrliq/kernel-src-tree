@@ -233,6 +233,9 @@ static int kill_proc(struct task_struct *t, unsigned long addr, int trapno,
  */
 void shake_page(struct page *p, int access)
 {
+	if (PageHuge(p))
+		return;
+
 	if (!PageSlab(p)) {
 		lru_add_drain_all();
 		if (PageLRU(p))
@@ -1167,21 +1170,14 @@ int memory_failure(unsigned long pfn, int trapno, int flags)
 	 * The check (unnecessarily) ignores LRU pages being isolated and
 	 * walked by the page reclaim code, however that's not a big loss.
 	 */
-	if (!PageHuge(p)) {
-		if (!PageLRU(p))
-			shake_page(p, 0);
-		if (!PageLRU(p)) {
-			/*
-			 * shake_page could have turned it free.
-			 */
-			if (is_free_buddy_page(p)) {
-				if (flags & MF_COUNT_INCREASED)
-					action_result(pfn, "free buddy", DELAYED);
-				else
-					action_result(pfn, "free buddy, 2nd try", DELAYED);
-				return 0;
-			}
-		}
+	shake_page(p, 0);
+	/* shake_page could have turned it free. */
+	if (!PageLRU(p) && is_free_buddy_page(p)) {
+		if (flags & MF_COUNT_INCREASED)
+			action_result(pfn, "free buddy", DELAYED);
+		else
+			action_result(pfn, "free buddy, 2nd try", DELAYED);
+		return 0;
 	}
 
 	/*
@@ -1242,6 +1238,23 @@ int memory_failure(unsigned long pfn, int trapno, int flags)
 		put_page(hpage);
 		return 0;
 	}
+
+	/*
+	 * TODO: hwpoison for pud-sized hugetlb doesn't work right now, so
+	 * simply disable it. In order to make it work properly, we need
+	 * make sure that:
+	 *  - conversion of a pud that maps an error hugetlb into hwpoison
+	 *    entry properly works, and
+	 *  - other mm code walking over page table is aware of pud-aligned
+	 *    hwpoison entries.
+	 */
+	if (PageHuge(p) && huge_page_size(page_hstate(hpage)) > PMD_SIZE) {
+		action_result(pfn, "non-pmd-sized huge page", IGNORED);
+		unlock_page(hpage);
+		put_page(hpage);
+		return -EBUSY;
+	}
+
 	/*
 	 * Set PG_hwpoison on all pages in an error hugepage,
 	 * because containment is done in hugepage unit for now.

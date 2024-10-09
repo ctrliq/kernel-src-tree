@@ -19,7 +19,10 @@ static bool update_stack_state(struct unwind_state *state,
 			       unsigned long *next_bp)
 {
 	struct stack_info *info = &state->stack_info;
-	unsigned long *addr_p, addr;
+	enum stack_type prev_type = info->type;
+	unsigned long *prev_frame_end, *addr_p, addr;
+
+	prev_frame_end = (void *)state->bp + FRAME_HEADER_SIZE;
 
 	/*
 	 * If the next bp isn't on the current stack, switch to the next one.
@@ -33,12 +36,26 @@ static bool update_stack_state(struct unwind_state *state,
 				   &state->stack_mask))
 			return false;
 
+	/* Make sure it only unwinds up and doesn't overlap the prev frame: */
+	if (state->orig_sp && state->stack_info.type == prev_type &&
+	    next_bp < prev_frame_end)
+		return false;
+
 	/* Move state to the next frame: */
 	state->bp = next_bp;
 	addr_p = state->bp + 1;
 	addr = READ_ONCE(*addr_p);
 	state->ip = ftrace_graph_ret_addr(state->task, &state->graph_idx,
 					  addr, addr_p);
+
+	/*
+	 * Save the original stack pointer for unwind_dump():
+	 *
+	 * NOTE: RHEL doesn't have unwind_dump().  This variable is also used
+	 * in this function as a "not first frame" bool check (see above).
+	 */
+	if (!state->orig_sp)
+		state->orig_sp = next_bp;
 
 	return true;
 }

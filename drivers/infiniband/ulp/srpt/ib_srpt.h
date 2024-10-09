@@ -54,6 +54,8 @@
  */
 #define SRP_SERVICE_NAME_PREFIX		"SRP.T10:"
 
+struct srpt_nexus;
+
 enum {
 	/*
 	 * SRP IOControllerProfile attributes for SRP target ports that have
@@ -240,8 +242,9 @@ enum rdma_ch_state {
 
 /**
  * struct srpt_rdma_ch - RDMA channel
- * @cm_id:         IB CM ID associated with the channel.
+ * @nexus:         I_T nexus this channel is associated with.
  * @qp:            IB queue pair used for communicating over this channel.
+ * @cm_id:         IB CM ID associated with the channel.
  * @cq:            IB completion queue for this channel.
  * @zw_cqe:	   Zero-length write CQE.
  * @rcu:           RCU head.
@@ -251,8 +254,6 @@ enum rdma_ch_state {
  * @sq_wr_avail:   number of work requests available in the send queue.
  * @sport:         pointer to the information of the HCA port used by this
  *                 channel.
- * @i_port_id:     128-bit initiator port identifier copied from SRP_LOGIN_REQ.
- * @t_port_id:     128-bit target port identifier copied from SRP_LOGIN_REQ.
  * @max_ti_iu_len: maximum target-to-initiator information unit length.
  * @req_lim:       request limit: maximum number of requests that may be sent
  *                 by the initiator without having received a response.
@@ -260,19 +261,26 @@ enum rdma_ch_state {
  * @spinlock:      Protects free_list and state.
  * @free_list:     Head of list with free send I/O contexts.
  * @state:         channel state. See also enum rdma_ch_state.
+ * @processing_wait_list: Whether or not cmd_wait_list is being processed.
  * @ioctx_ring:    Send ring.
  * @ioctx_recv_ring: Receive I/O context ring.
- * @list:          Node in srpt_port.rch_list.
+ * @list:          Node in srpt_nexus.ch_list.
  * @cmd_wait_list: List of SCSI commands that arrived before the RTU event. This
  *                 list contains struct srpt_ioctx elements and is protected
  *                 against concurrent modification by the cm_id spinlock.
+ * @pkey:          P_Key of the IB partition for this SRP channel.
  * @sess:          Session information associated with this SRP channel.
  * @sess_name:     Session name.
  * @release_work:  Allows scheduling of srpt_release_channel().
  */
 struct srpt_rdma_ch {
-	struct ib_cm_id		*cm_id;
+	struct srpt_nexus	*nexus;
 	struct ib_qp		*qp;
+	union {
+		struct {
+			struct ib_cm_id		*cm_id;
+		} ib_cm;
+	};
 	struct ib_cq		*cq;
 	struct ib_cqe		zw_cqe;
 	struct rcu_head		rcu;
@@ -281,8 +289,6 @@ struct srpt_rdma_ch {
 	u32			max_rsp_size;
 	atomic_t		sq_wr_avail;
 	struct srpt_port	*sport;
-	u8			i_port_id[16];
-	u8			t_port_id[16];
 	int			max_ti_iu_len;
 	atomic_t		req_lim;
 	atomic_t		req_lim_delta;
@@ -293,9 +299,27 @@ struct srpt_rdma_ch {
 	struct srpt_recv_ioctx	**ioctx_recv_ring;
 	struct list_head	list;
 	struct list_head	cmd_wait_list;
+	uint16_t		pkey;
+	bool			processing_wait_list;
 	struct se_session	*sess;
 	u8			sess_name[24];
 	struct work_struct	release_work;
+};
+
+/**
+ * struct srpt_nexus - I_T nexus
+ * @rcu:       RCU head for this data structure.
+ * @entry:     srpt_port.nexus_list list node.
+ * @ch_list:   struct srpt_rdma_ch list. Protected by srpt_port.mutex.
+ * @i_port_id: 128-bit initiator port identifier copied from SRP_LOGIN_REQ.
+ * @t_port_id: 128-bit target port identifier copied from SRP_LOGIN_REQ.
+ */
+struct srpt_nexus {
+	struct rcu_head		rcu;
+	struct list_head	entry;
+	struct list_head	ch_list;
+	u8			i_port_id[16];
+	u8			t_port_id[16];
 };
 
 /**
@@ -330,9 +354,9 @@ struct srpt_port_attrib {
  * @port_gid_tpg:  TPG associated with target port GID.
  * @port_gid_wwn:  WWN associated with target port GID.
  * @port_attrib:   Port attributes that can be accessed through configfs.
- * @ch_releaseQ:   Enables waiting for removal from rch_list.
- * @mutex:	   Protects rch_list.
- * @rch_list:	   Channel list. See also srpt_rdma_ch.list.
+ * @ch_releaseQ:   Enables waiting for removal from nexus_list.
+ * @mutex:	   Protects nexus_list.
+ * @nexus_list:	   Nexus list. See also srpt_nexus.entry.
  */
 struct srpt_port {
 	struct srpt_device	*sdev;
@@ -352,7 +376,7 @@ struct srpt_port {
 	struct srpt_port_attrib port_attrib;
 	wait_queue_head_t	ch_releaseQ;
 	struct mutex		mutex;
-	struct list_head	rch_list;
+	struct list_head	nexus_list;
 };
 
 /**

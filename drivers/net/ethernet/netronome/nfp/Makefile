@@ -41,12 +41,16 @@ nfp-objs += \
 	    flower/tunnel_conf.o
 endif
 
-ifeq ($(CONFIG_BPF_SYSCALL),y)
-nfp-objs += \
-	    bpf/main.o \
-	    bpf/offload.o \
-	    bpf/verifier.o \
-	    bpf/jit.o
-endif
+# RHEL7 - Omit BPF objects, because we are going
+#         to enable CONFIG_BPF_SYSCALL
+#
+# ifeq ($(CONFIG_BPF_SYSCALL),y)
+# nfp-objs += \
+#	    bpf/cmsg.o \
+#	    bpf/main.o \
+#	    bpf/offload.o \
+#	    bpf/verifier.o \
+#	    bpf/jit.o
+#endif
 
 nfp-$(CONFIG_NFP_DEBUG) += nfp_net_debugfs.o

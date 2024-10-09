@@ -607,6 +607,7 @@ static void vti6_link_config(struct ip6_tnl *t, bool keep_mtu)
 	struct net_device *dev = t->dev;
 	struct __ip6_tnl_parm *p = &t->parms;
 	struct net_device *tdev = NULL;
+	int mtu;
 
 	memcpy(dev->dev_addr, &p->laddr, sizeof(struct in6_addr));
 	memcpy(dev->broadcast, &p->raddr, sizeof(struct in6_addr));
@@ -621,7 +622,9 @@ static void vti6_link_config(struct ip6_tnl *t, bool keep_mtu)
 		dev->flags &= ~IFF_POINTOPOINT;
 
 	if (keep_mtu && dev->mtu) {
-		dev->mtu = clamp(dev->mtu, dev->min_mtu, dev->max_mtu);
+		dev->mtu = clamp(dev->mtu, (unsigned)IPV4_MIN_MTU,
+				 (unsigned)(IP_MAX_MTU -
+					    sizeof(struct ipv6hdr)));
 		return;
 	}
 
@@ -641,8 +644,11 @@ static void vti6_link_config(struct ip6_tnl *t, bool keep_mtu)
 		tdev = __dev_get_by_index(t->net, p->link);
 
 	if (tdev)
-		dev->mtu = max_t(int, tdev->mtu - dev->hard_header_len,
-				 IPV6_MIN_MTU);
+		mtu = tdev->mtu - sizeof(struct ipv6hdr);
+	else
+		mtu = ETH_DATA_LEN - LL_MAX_HEADER - sizeof(struct ipv6hdr);
+
+	dev->mtu = max_t(int, mtu, IPV4_MIN_MTU);
 }
 
 /**
@@ -837,7 +843,7 @@ vti6_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
  **/
 static int vti6_change_mtu(struct net_device *dev, int new_mtu)
 {
-	if (new_mtu < IPV6_MIN_MTU)
+	if (new_mtu < IPV4_MIN_MTU)
 		return -EINVAL;
 
 	dev->mtu = new_mtu;
@@ -868,8 +874,6 @@ static void vti6_dev_setup(struct net_device *dev)
 	dev->extended->priv_destructor = vti6_dev_free;
 
 	dev->type = ARPHRD_TUNNEL6;
-	dev->hard_header_len = LL_MAX_HEADER + sizeof(struct ipv6hdr);
-	dev->mtu = ETH_DATA_LEN;
 	dev->flags |= IFF_NOARP;
 	dev->addr_len = sizeof(struct in6_addr);
 	netif_keep_dst(dev);

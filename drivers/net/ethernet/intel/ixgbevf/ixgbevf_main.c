@@ -60,7 +60,7 @@ const char ixgbevf_driver_name[] = "ixgbevf";
 static const char ixgbevf_driver_string[] =
 	"Intel(R) 10 Gigabit PCI Express Virtual Function Network Driver";
 
-#define DRV_VERSION "4.1.0-k-rh7.5"
+#define DRV_VERSION "4.1.0-k-rh7.6"
 const char ixgbevf_driver_version[] = DRV_VERSION;
 static char ixgbevf_copyright[] =
 	"Copyright (c) 2009 - 2015 Intel Corporation.";
@@ -567,10 +567,14 @@ static void ixgbevf_put_rx_buffer(struct ixgbevf_ring *rx_ring,
 				  struct ixgbevf_rx_buffer *rx_buffer,
 				  struct sk_buff *skb)
 {
+	DEFINE_DMA_ATTRS(attrs);
+
 	if (ixgbevf_can_reuse_rx_page(rx_buffer)) {
 		/* hand second half of page back to the ring */
 		ixgbevf_reuse_rx_page(rx_ring, rx_buffer);
 	} else {
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		if (IS_ERR(skb))
 			/* We are not reusing the buffer so unmap it and free
 			 * any references we are holding to it
@@ -578,7 +582,7 @@ static void ixgbevf_put_rx_buffer(struct ixgbevf_ring *rx_ring,
 			dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
 					     ixgbevf_rx_pg_size(rx_ring),
 					     DMA_FROM_DEVICE,
-					     IXGBEVF_RX_DMA_ATTR);
+					     &attrs);
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
 	}
@@ -624,6 +628,7 @@ static bool ixgbevf_alloc_mapped_page(struct ixgbevf_ring *rx_ring,
 {
 	struct page *page = bi->page;
 	dma_addr_t dma;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* since we are recycling buffers we should seldom need to alloc */
 	if (likely(page))
@@ -637,9 +642,11 @@ static bool ixgbevf_alloc_mapped_page(struct ixgbevf_ring *rx_ring,
 	}
 
 	/* map page for use */
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
 				 ixgbevf_rx_pg_size(rx_ring),
-				 DMA_FROM_DEVICE, IXGBEVF_RX_DMA_ATTR);
+				 DMA_FROM_DEVICE, &attrs);
 
 	/* if mapping failed free memory back to system since
 	 * there isn't much point in holding memory we can't use
@@ -1126,7 +1133,6 @@ static int ixgbevf_clean_rx_irq(struct ixgbevf_q_vector *q_vector,
 		if (!skb) {
 			xdp.data = page_address(rx_buffer->page) +
 				   rx_buffer->page_offset;
-			xdp_set_data_meta_invalid(&xdp);
 			xdp.data_hard_start = xdp.data -
 					      ixgbevf_rx_offset(rx_ring);
 			xdp.data_end = xdp.data + size;
@@ -2293,6 +2299,7 @@ void ixgbevf_up(struct ixgbevf_adapter *adapter)
 static void ixgbevf_clean_rx_ring(struct ixgbevf_ring *rx_ring)
 {
 	u16 i = rx_ring->next_to_clean;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* Free Rx ring sk_buff */
 	if (rx_ring->skb) {
@@ -2300,6 +2307,8 @@ static void ixgbevf_clean_rx_ring(struct ixgbevf_ring *rx_ring)
 		rx_ring->skb = NULL;
 	}
 
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	/* Free all the Rx ring pages */
 	while (i != rx_ring->next_to_alloc) {
 		struct ixgbevf_rx_buffer *rx_buffer;
@@ -2320,7 +2329,7 @@ static void ixgbevf_clean_rx_ring(struct ixgbevf_ring *rx_ring)
 				     rx_buffer->dma,
 				     ixgbevf_rx_pg_size(rx_ring),
 				     DMA_FROM_DEVICE,
-				     IXGBEVF_RX_DMA_ATTR);
+				     &attrs);
 
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
@@ -3105,9 +3114,10 @@ void ixgbevf_update_stats(struct ixgbevf_adapter *adapter)
  * ixgbevf_service_timer - Timer Call-back
  * @t: pointer to timer_list struct
  **/
-static void ixgbevf_service_timer(unsigned long data)
+static void ixgbevf_service_timer(struct timer_list *t)
 {
-	struct ixgbevf_adapter *adapter = (struct ixgbevf_adapter *)data;
+	struct ixgbevf_adapter *adapter = from_timer(adapter, t,
+						     service_timer);
 
 	/* Reset the timer */
 	mod_timer(&adapter->service_timer, (HZ * 2) + jiffies);
@@ -4464,7 +4474,7 @@ static const struct net_device_ops ixgbevf_netdev_ops = {
 	.ndo_poll_controller	= ixgbevf_netpoll,
 #endif
 	.ndo_features_check	= ixgbevf_features_check,
-	.ndo_bpf		= ixgbevf_xdp,
+	.extended.ndo_bpf	= ixgbevf_xdp,
 };
 
 static void ixgbevf_assign_netdev_ops(struct net_device *dev)
@@ -4629,8 +4639,7 @@ static int ixgbevf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_sw_init;
 	}
 
-	setup_timer(&adapter->service_timer, &ixgbevf_service_timer,
-		    (unsigned long)adapter);
+	timer_setup(&adapter->service_timer, ixgbevf_service_timer, 0);
 
 	INIT_WORK(&adapter->service_task, ixgbevf_service_task);
 	set_bit(__IXGBEVF_SERVICE_INITED, &adapter->state);

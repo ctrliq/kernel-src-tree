@@ -54,13 +54,15 @@
 #include <linux/ctype.h>
 #include <linux/nl80211.h>
 #include <linux/platform_device.h>
+#if 0 /* Not in RHEL */
+#include <linux/verification.h>
+#endif
 #include <linux/moduleparam.h>
 #include <linux/firmware.h>
 #include <net/cfg80211.h>
 #include "core.h"
 #include "reg.h"
 #include "rdev-ops.h"
-#include "regdb.h"
 #include "nl80211.h"
 
 /*
@@ -425,36 +427,23 @@ static const struct ieee80211_regdomain *
 reg_copy_regd(const struct ieee80211_regdomain *src_regd)
 {
 	struct ieee80211_regdomain *regd;
-	int size_of_regd, size_of_wmms;
+	int size_of_regd;
 	unsigned int i;
-	struct ieee80211_wmm_rule *d_wmm, *s_wmm;
 
 	size_of_regd =
 		sizeof(struct ieee80211_regdomain) +
 		src_regd->n_reg_rules * sizeof(struct ieee80211_reg_rule);
-	size_of_wmms = src_regd->n_wmm_rules *
-		sizeof(struct ieee80211_wmm_rule);
 
-	regd = kzalloc(size_of_regd + size_of_wmms, GFP_KERNEL);
+	regd = kzalloc(size_of_regd, GFP_KERNEL);
 	if (!regd)
 		return ERR_PTR(-ENOMEM);
 
 	memcpy(regd, src_regd, sizeof(struct ieee80211_regdomain));
 
-	d_wmm = (struct ieee80211_wmm_rule *)((u8 *)regd + size_of_regd);
-	s_wmm = (struct ieee80211_wmm_rule *)((u8 *)src_regd + size_of_regd);
-	memcpy(d_wmm, s_wmm, size_of_wmms);
-
-	for (i = 0; i < src_regd->n_reg_rules; i++) {
+	for (i = 0; i < src_regd->n_reg_rules; i++)
 		memcpy(&regd->reg_rules[i], &src_regd->reg_rules[i],
 		       sizeof(struct ieee80211_reg_rule));
-		if (!src_regd->reg_rules[i].wmm_rule)
-			continue;
 
-		regd->reg_rules[i].wmm_rule = d_wmm +
-			(src_regd->reg_rules[i].wmm_rule - s_wmm) /
-			sizeof(struct ieee80211_wmm_rule);
-	}
 	return regd;
 }
 
@@ -508,38 +497,6 @@ static int reg_schedule_apply(const struct ieee80211_regdomain *regdom)
 	schedule_work(&reg_regdb_work);
 	return 0;
 }
-
-#ifdef CONFIG_CFG80211_INTERNAL_REGDB
-static int reg_query_builtin(const char *alpha2)
-{
-	const struct ieee80211_regdomain *regdom = NULL;
-	unsigned int i;
-
-	for (i = 0; i < reg_regdb_size; i++) {
-		if (alpha2_equal(alpha2, reg_regdb[i]->alpha2)) {
-			regdom = reg_copy_regd(reg_regdb[i]);
-			break;
-		}
-	}
-	if (!regdom)
-		return -ENODATA;
-
-	return reg_schedule_apply(regdom);
-}
-
-/* Feel free to add any other sanity checks here */
-static void reg_regdb_size_check(void)
-{
-	/* We should ideally BUILD_BUG_ON() but then random builds would fail */
-	WARN_ONCE(!reg_regdb_size, "db.txt is empty, you should update it...");
-}
-#else
-static inline void reg_regdb_size_check(void) {}
-static inline int reg_query_builtin(const char *alpha2)
-{
-	return -ENODATA;
-}
-#endif /* CONFIG_CFG80211_INTERNAL_REGDB */
 
 #ifdef CONFIG_CFG80211_CRDA_SUPPORT
 /* Max number of consecutive attempts to communicate with CRDA  */
@@ -754,6 +711,115 @@ static bool valid_country(const u8 *data, unsigned int size,
 	return true;
 }
 
+#ifdef CONFIG_CFG80211_REQUIRE_SIGNED_REGDB
+static struct key *builtin_regdb_keys;
+
+static void __init load_keys_from_buffer(const u8 *p, unsigned int buflen)
+{
+	const u8 *end = p + buflen;
+	size_t plen;
+	key_ref_t key;
+
+	while (p < end) {
+		/* Each cert begins with an ASN.1 SEQUENCE tag and must be more
+		 * than 256 bytes in size.
+		 */
+		if (end - p < 4)
+			goto dodgy_cert;
+		if (p[0] != 0x30 &&
+		    p[1] != 0x82)
+			goto dodgy_cert;
+		plen = (p[2] << 8) | p[3];
+		plen += 4;
+		if (plen > end - p)
+			goto dodgy_cert;
+
+		key = key_create_or_update(make_key_ref(builtin_regdb_keys, 1),
+					   "asymmetric", NULL, p, plen,
+					   ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+					    KEY_USR_VIEW | KEY_USR_READ),
+					   KEY_ALLOC_NOT_IN_QUOTA |
+					   KEY_ALLOC_BUILT_IN |
+					   KEY_ALLOC_BYPASS_RESTRICTION);
+		if (IS_ERR(key)) {
+			pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
+			       PTR_ERR(key));
+		} else {
+			pr_notice("Loaded X.509 cert '%s'\n",
+				  key_ref_to_ptr(key)->description);
+			key_ref_put(key);
+		}
+		p += plen;
+	}
+
+	return;
+
+dodgy_cert:
+	pr_err("Problem parsing in-kernel X.509 certificate list\n");
+}
+
+static int __init load_builtin_regdb_keys(void)
+{
+	builtin_regdb_keys =
+		keyring_alloc(".builtin_regdb_keys",
+			      KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
+			      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
+			      KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH),
+			      KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
+	if (IS_ERR(builtin_regdb_keys))
+		return PTR_ERR(builtin_regdb_keys);
+
+	pr_notice("Loading compiled-in X.509 certificates for regulatory database\n");
+
+#ifdef CONFIG_CFG80211_USE_KERNEL_REGDB_KEYS
+	load_keys_from_buffer(shipped_regdb_certs, shipped_regdb_certs_len);
+#endif
+#ifdef CONFIG_CFG80211_EXTRA_REGDB_KEYDIR
+	if (CONFIG_CFG80211_EXTRA_REGDB_KEYDIR[0] != '\0')
+		load_keys_from_buffer(extra_regdb_certs, extra_regdb_certs_len);
+#endif
+
+	return 0;
+}
+
+static bool regdb_has_valid_signature(const u8 *data, unsigned int size)
+{
+	const struct firmware *sig;
+	bool result;
+
+	if (request_firmware(&sig, "regulatory.db.p7s", &reg_pdev->dev))
+		return false;
+
+	result = verify_pkcs7_signature(data, size, sig->data, sig->size,
+					builtin_regdb_keys,
+					VERIFYING_UNSPECIFIED_SIGNATURE,
+					NULL, NULL) == 0;
+
+	release_firmware(sig);
+
+	return result;
+}
+
+static void free_regdb_keyring(void)
+{
+	key_put(builtin_regdb_keys);
+}
+#else
+static int load_builtin_regdb_keys(void)
+{
+	return 0;
+}
+
+static bool regdb_has_valid_signature(const u8 *data, unsigned int size)
+{
+	return true;
+}
+
+static void free_regdb_keyring(void)
+{
+}
+#endif /* CONFIG_CFG80211_REQUIRE_SIGNED_REGDB */
+
 static bool valid_regdb(const u8 *data, unsigned int size)
 {
 	const struct fwdb_header *hdr = (void *)data;
@@ -768,6 +834,9 @@ static bool valid_regdb(const u8 *data, unsigned int size)
 	if (hdr->version != cpu_to_be32(FWDB_VERSION))
 		return false;
 
+	if (!regdb_has_valid_signature(data, size))
+		return false;
+
 	country = &hdr->country[0];
 	while ((u8 *)(country + 1) <= data + size) {
 		if (!country->coll_ptr)
@@ -780,9 +849,10 @@ static bool valid_regdb(const u8 *data, unsigned int size)
 	return true;
 }
 
-static void set_wmm_rule(struct ieee80211_wmm_rule *rule,
+static void set_wmm_rule(struct ieee80211_reg_rule *rrule,
 			 struct fwdb_wmm_rule *wmm)
 {
+	struct ieee80211_wmm_rule *rule = &rrule->wmm_rule;
 	unsigned int i;
 
 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
@@ -796,11 +866,13 @@ static void set_wmm_rule(struct ieee80211_wmm_rule *rule,
 		rule->ap[i].aifsn = wmm->ap[i].aifsn;
 		rule->ap[i].cot = 1000 * be16_to_cpu(wmm->ap[i].cot);
 	}
+
+	rrule->has_wmm = true;
 }
 
 static int __regdb_query_wmm(const struct fwdb_header *db,
 			     const struct fwdb_country *country, int freq,
-			     u32 *dbptr, struct ieee80211_wmm_rule *rule)
+			     struct ieee80211_reg_rule *rule)
 {
 	unsigned int ptr = be16_to_cpu(country->coll_ptr) << 2;
 	struct fwdb_collection *coll = (void *)((u8 *)db + ptr);
@@ -821,8 +893,6 @@ static int __regdb_query_wmm(const struct fwdb_header *db,
 			wmm_ptr = be16_to_cpu(rrule->wmm_ptr) << 2;
 			wmm = (void *)((u8 *)db + wmm_ptr);
 			set_wmm_rule(rule, wmm);
-			if (dbptr)
-				*dbptr = wmm_ptr;
 			return 0;
 		}
 	}
@@ -830,8 +900,7 @@ static int __regdb_query_wmm(const struct fwdb_header *db,
 	return -ENODATA;
 }
 
-int reg_query_regdb_wmm(char *alpha2, int freq, u32 *dbptr,
-			struct ieee80211_wmm_rule *rule)
+int reg_query_regdb_wmm(char *alpha2, int freq, struct ieee80211_reg_rule *rule)
 {
 	const struct fwdb_header *hdr = regdb;
 	const struct fwdb_country *country;
@@ -845,8 +914,7 @@ int reg_query_regdb_wmm(char *alpha2, int freq, u32 *dbptr,
 	country = &hdr->country[0];
 	while (country->coll_ptr) {
 		if (alpha2_equal(alpha2, country->alpha2))
-			return __regdb_query_wmm(regdb, country, freq, dbptr,
-						 rule);
+			return __regdb_query_wmm(regdb, country, freq, rule);
 
 		country++;
 	}
@@ -855,32 +923,13 @@ int reg_query_regdb_wmm(char *alpha2, int freq, u32 *dbptr,
 }
 EXPORT_SYMBOL(reg_query_regdb_wmm);
 
-struct wmm_ptrs {
-	struct ieee80211_wmm_rule *rule;
-	u32 ptr;
-};
-
-static struct ieee80211_wmm_rule *find_wmm_ptr(struct wmm_ptrs *wmm_ptrs,
-					       u32 wmm_ptr, int n_wmms)
-{
-	int i;
-
-	for (i = 0; i < n_wmms; i++) {
-		if (wmm_ptrs[i].ptr == wmm_ptr)
-			return wmm_ptrs[i].rule;
-	}
-	return NULL;
-}
-
 static int regdb_query_country(const struct fwdb_header *db,
 			       const struct fwdb_country *country)
 {
 	unsigned int ptr = be16_to_cpu(country->coll_ptr) << 2;
 	struct fwdb_collection *coll = (void *)((u8 *)db + ptr);
 	struct ieee80211_regdomain *regdom;
-	struct ieee80211_regdomain *tmp_rd;
-	unsigned int size_of_regd, i, n_wmms = 0;
-	struct wmm_ptrs *wmm_ptrs;
+	unsigned int size_of_regd, i;
 
 	size_of_regd = sizeof(struct ieee80211_regdomain) +
 		coll->n_rules * sizeof(struct ieee80211_reg_rule);
@@ -888,12 +937,6 @@ static int regdb_query_country(const struct fwdb_header *db,
 	regdom = kzalloc(size_of_regd, GFP_KERNEL);
 	if (!regdom)
 		return -ENOMEM;
-
-	wmm_ptrs = kcalloc(coll->n_rules, sizeof(*wmm_ptrs), GFP_KERNEL);
-	if (!wmm_ptrs) {
-		kfree(regdom);
-		return -ENOMEM;
-	}
 
 	regdom->n_reg_rules = coll->n_rules;
 	regdom->alpha2[0] = country->alpha2[0];
@@ -933,37 +976,11 @@ static int regdb_query_country(const struct fwdb_header *db,
 				1000 * be16_to_cpu(rule->cac_timeout);
 		if (rule->len >= offsetofend(struct fwdb_rule, wmm_ptr)) {
 			u32 wmm_ptr = be16_to_cpu(rule->wmm_ptr) << 2;
-			struct ieee80211_wmm_rule *wmm_pos =
-				find_wmm_ptr(wmm_ptrs, wmm_ptr, n_wmms);
-			struct fwdb_wmm_rule *wmm;
-			struct ieee80211_wmm_rule *wmm_rule;
+			struct fwdb_wmm_rule *wmm = (void *)((u8 *)db + wmm_ptr);
 
-			if (wmm_pos) {
-				rrule->wmm_rule = wmm_pos;
-				continue;
-			}
-			wmm = (void *)((u8 *)db + wmm_ptr);
-			tmp_rd = krealloc(regdom, size_of_regd + (n_wmms + 1) *
-					  sizeof(struct ieee80211_wmm_rule),
-					  GFP_KERNEL);
-
-			if (!tmp_rd) {
-				kfree(regdom);
-				kfree(wmm_ptrs);
-				return -ENOMEM;
-			}
-			regdom = tmp_rd;
-
-			wmm_rule = (struct ieee80211_wmm_rule *)
-				((u8 *)regdom + size_of_regd + n_wmms *
-				sizeof(struct ieee80211_wmm_rule));
-
-			set_wmm_rule(wmm_rule, wmm);
-			wmm_ptrs[n_wmms].ptr = wmm_ptr;
-			wmm_ptrs[n_wmms++].rule = wmm_rule;
+			set_wmm_rule(rrule, wmm);
 		}
 	}
-	kfree(wmm_ptrs);
 
 	return reg_schedule_apply(regdom);
 }
@@ -972,6 +989,8 @@ static int query_regdb(const char *alpha2)
 {
 	const struct fwdb_header *hdr = regdb;
 	const struct fwdb_country *country;
+
+	ASSERT_RTNL();
 
 	if (IS_ERR(regdb))
 		return PTR_ERR(regdb);
@@ -988,41 +1007,47 @@ static int query_regdb(const char *alpha2)
 
 static void regdb_fw_cb(const struct firmware *fw, void *context)
 {
+	int set_error = 0;
+	bool restore = true;
 	void *db;
 
 	if (!fw) {
 		pr_info("failed to load regulatory.db\n");
-		regdb = ERR_PTR(-ENODATA);
-		goto restore;
+		set_error = -ENODATA;
+	} else if (!valid_regdb(fw->data, fw->size)) {
+		pr_info("loaded regulatory.db is malformed or signature is missing/invalid\n");
+		set_error = -EINVAL;
 	}
 
-	if (!valid_regdb(fw->data, fw->size)) {
-		pr_info("loaded regulatory.db is malformed\n");
-		release_firmware(fw);
-		regdb = ERR_PTR(-EINVAL);
-		goto restore;
-	}
-
-	db = kmemdup(fw->data, fw->size, GFP_KERNEL);
-	release_firmware(fw);
-
-	if (!db)
-		goto restore;
-	regdb = db;
-
-	if (query_regdb(context))
-		goto restore;
-	goto free;
- restore:
 	rtnl_lock();
-	restore_regulatory_settings(true);
+	if (WARN_ON(regdb && !IS_ERR(regdb))) {
+		/* just restore and free new db */
+	} else if (set_error) {
+		regdb = ERR_PTR(set_error);
+	} else if (fw) {
+		db = kmemdup(fw->data, fw->size, GFP_KERNEL);
+		if (db) {
+			regdb = db;
+			restore = context && query_regdb(context);
+		} else {
+			restore = true;
+		}
+	}
+
+	if (restore)
+		restore_regulatory_settings(true);
+
 	rtnl_unlock();
- free:
+
 	kfree(context);
+
+	release_firmware(fw);
 }
 
 static int query_regdb_file(const char *alpha2)
 {
+	ASSERT_RTNL();
+
 	if (regdb)
 		return query_regdb(alpha2);
 
@@ -1035,12 +1060,40 @@ static int query_regdb_file(const char *alpha2)
 				       (void *)alpha2, regdb_fw_cb);
 }
 
+int reg_reload_regdb(void)
+{
+	const struct firmware *fw;
+	void *db;
+	int err;
+
+	err = request_firmware(&fw, "regulatory.db", &reg_pdev->dev);
+	if (err)
+		return err;
+
+	if (!valid_regdb(fw->data, fw->size)) {
+		err = -ENODATA;
+		goto out;
+	}
+
+	db = kmemdup(fw->data, fw->size, GFP_KERNEL);
+	if (!db) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	rtnl_lock();
+	if (!IS_ERR_OR_NULL(regdb))
+		kfree(regdb);
+	regdb = db;
+	rtnl_unlock();
+
+ out:
+	release_firmware(fw);
+	return err;
+}
+
 static bool reg_query_database(struct regulatory_request *request)
 {
-	/* query internal regulatory database (if it exists) */
-	if (reg_query_builtin(request->alpha2) == 0)
-		return true;
-
 	if (query_regdb_file(request->alpha2) == 0)
 		return true;
 
@@ -3744,24 +3797,13 @@ void regulatory_propagate_dfs_state(struct wiphy *wiphy,
 	}
 }
 
-int __init regulatory_init(void)
+static int __init regulatory_init_db(void)
 {
-	int err = 0;
+	int err;
 
-	reg_pdev = platform_device_register_simple("regulatory", 0, NULL, 0);
-	if (IS_ERR(reg_pdev))
-		return PTR_ERR(reg_pdev);
-
-	spin_lock_init(&reg_requests_lock);
-	spin_lock_init(&reg_pending_beacons_lock);
-	spin_lock_init(&reg_indoor_lock);
-
-	reg_regdb_size_check();
-
-	rcu_assign_pointer(cfg80211_regdomain, cfg80211_world_regdom);
-
-	user_alpha2[0] = '9';
-	user_alpha2[1] = '7';
+	err = load_builtin_regdb_keys();
+	if (err)
+		return err;
 
 	/* We always try to get an update for the static regdomain */
 	err = regulatory_hint_core(cfg80211_world_regdom->alpha2);
@@ -3789,6 +3831,31 @@ int __init regulatory_init(void)
 				     NL80211_USER_REG_HINT_USER);
 
 	return 0;
+}
+#ifndef MODULE
+late_initcall(regulatory_init_db);
+#endif
+
+int __init regulatory_init(void)
+{
+	reg_pdev = platform_device_register_simple("regulatory", 0, NULL, 0);
+	if (IS_ERR(reg_pdev))
+		return PTR_ERR(reg_pdev);
+
+	spin_lock_init(&reg_requests_lock);
+	spin_lock_init(&reg_pending_beacons_lock);
+	spin_lock_init(&reg_indoor_lock);
+
+	rcu_assign_pointer(cfg80211_regdomain, cfg80211_world_regdom);
+
+	user_alpha2[0] = '9';
+	user_alpha2[1] = '7';
+
+#ifdef MODULE
+	return regulatory_init_db();
+#else
+	return 0;
+#endif
 }
 
 void regulatory_exit(void)
@@ -3826,4 +3893,6 @@ void regulatory_exit(void)
 
 	if (!IS_ERR_OR_NULL(regdb))
 		kfree(regdb);
+
+	free_regdb_keyring();
 }

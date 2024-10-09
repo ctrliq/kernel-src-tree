@@ -2562,7 +2562,7 @@ int hfa384x_drvr_start(hfa384x_t *hw)
 	 * ok
 	 */
 	result =
-	    usb_get_std_status(hw->usb, USB_RECIP_ENDPOINT, hw->endp_in, &status);
+	    usb_get_status(hw->usb, USB_RECIP_ENDPOINT, hw->endp_in, &status);
 	if (result < 0) {
 		printk(KERN_ERR "Cannot get bulk in endpoint status.\n");
 		goto done;
@@ -2571,7 +2571,7 @@ int hfa384x_drvr_start(hfa384x_t *hw)
 		printk(KERN_ERR "Failed to reset bulk in endpoint.\n");
 
 	result =
-	    usb_get_std_status(hw->usb, USB_RECIP_ENDPOINT, hw->endp_out, &status);
+	    usb_get_status(hw->usb, USB_RECIP_ENDPOINT, hw->endp_out, &status);
 	if (result < 0) {
 		printk(KERN_ERR "Cannot get bulk out endpoint status.\n");
 		goto done;

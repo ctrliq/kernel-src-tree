@@ -4008,7 +4008,8 @@ static void irte_ga_prepare(void *entry, int index,
 	irte->lo.fields_remap.int_type    = delivery_mode;
 	irte->lo.fields_remap.dm          = dest_mode;
 	irte->hi.fields.vector            = vector;
-	irte->lo.fields_remap.destination = dest_apicid;
+	irte->lo.fields_remap.destination = APICID_TO_IRTE_DEST_LO(dest_apicid);
+	irte->hi.fields.destination       = APICID_TO_IRTE_DEST_HI(dest_apicid);
 	irte->lo.fields_remap.valid       = 1;
 	modify_irte_ga(devid, index, irte, NULL);
 }
@@ -4064,7 +4065,10 @@ static void irte_ga_set_affinity(void *entry, u16 devid, u16 index,
 	if (!dev_data || !dev_data->use_vapic ||
 	    !irte->lo.fields_remap.guest_mode) {
 		irte->hi.fields.vector = vector;
-		irte->lo.fields_remap.destination = dest_apicid;
+		irte->lo.fields_remap.destination =
+					APICID_TO_IRTE_DEST_LO(dest_apicid);
+		irte->hi.fields.destination =
+					APICID_TO_IRTE_DEST_HI(dest_apicid);
 		modify_irte_ga(devid, index, irte, NULL);
 	}
 }
@@ -4211,8 +4215,11 @@ static int set_affinity(struct irq_data *data, const struct cpumask *mask,
 		return err;
 	}
 
-	iommu->irte_ops->set_affinity(irte_info->ir_data->entry, irte_info->devid,
-			    irte_info->index, cfg->vector, dest);
+	if (irte_info->ir_data)
+		iommu->irte_ops->set_affinity(irte_info->ir_data->entry,
+					      irte_info->devid,
+					      irte_info->index,
+					      cfg->vector, dest);
 
 	if (cfg->move_in_progress)
 		send_cleanup_vector(cfg);
@@ -4222,7 +4229,12 @@ static int set_affinity(struct irq_data *data, const struct cpumask *mask,
 	return 0;
 }
 
-static int free_irq(int irq)
+/*
+ * RHEL: Renamed to free_irq_rh() because the prototype conflicts with
+ * global free_irq() that has different return value. Upstream is not affected
+ * because this local function was removed in the meantime.
+ */
+static int free_irq_rh(int irq)
 {
 	struct irq_2_irte *irte_info;
 	struct irq_cfg *cfg;
@@ -4234,6 +4246,8 @@ static int free_irq(int irq)
 	irte_info = &cfg->irq_2_irte;
 
 	free_irte(irte_info->devid, irte_info->index);
+	if (irte_info->ir_data)
+		kfree(irte_info->ir_data->entry);
 	kfree(irte_info->ir_data);
 
 	return 0;
@@ -4366,7 +4380,10 @@ static int amd_ir_set_vcpu_affinity(int irq, void *vcpu_info)
 		irte->lo.val = 0;
 		irte->hi.fields.vector = cfg->vector;
 		irte->lo.fields_remap.guest_mode = 0;
-		irte->lo.fields_remap.destination = dest;
+		irte->lo.fields_remap.destination =
+				APICID_TO_IRTE_DEST_LO(dest);
+		irte->hi.fields.destination =
+				APICID_TO_IRTE_DEST_HI(dest);
 		irte->lo.fields_remap.int_type = apic->irq_delivery_mode;
 		irte->lo.fields_remap.dm = apic->irq_dest_mode;
 
@@ -4441,7 +4458,7 @@ struct irq_remap_ops amd_iommu_irq_ops = {
 	.enable_faulting	= amd_iommu_enable_faulting,
 	.setup_ioapic_entry	= setup_ioapic_entry,
 	.set_affinity		= set_affinity,
-	.free_irq		= free_irq,
+	.free_irq		= free_irq_rh,
 	.compose_msi_msg	= compose_msi_msg,
 	.msi_alloc_irq		= msi_alloc_irq,
 	.msi_setup_irq		= msi_setup_irq,
@@ -4474,8 +4491,12 @@ int amd_iommu_update_ga(int cpu, bool is_run, void *data)
 	spin_lock_irqsave(&irt->lock, flags);
 
 	if (ref->lo.fields_vapic.guest_mode) {
-		if (cpu >= 0)
-			ref->lo.fields_vapic.destination = cpu;
+		if (cpu >= 0) {
+			ref->lo.fields_vapic.destination =
+						APICID_TO_IRTE_DEST_LO(cpu);
+			ref->hi.fields.destination =
+						APICID_TO_IRTE_DEST_HI(cpu);
+		}
 		ref->lo.fields_vapic.is_run = is_run;
 		barrier();
 	}

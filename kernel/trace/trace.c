@@ -3789,6 +3789,20 @@ static const struct file_operations tracing_saved_cmdlines_size_fops = {
 	.write		= tracing_saved_cmdlines_size_write,
 };
 
+static void
+trace_insert_enum_map(struct trace_enum_map **start, struct trace_enum_map **stop)
+{
+	struct trace_enum_map **map;
+	int len = stop - start;
+
+	if (len <= 0)
+		return;
+
+	map = start;
+
+	trace_event_enum_update(map, len);
+}
+
 static ssize_t
 tracing_set_trace_read(struct file *filp, char __user *ubuf,
 		       size_t cnt, loff_t *ppos)
@@ -6388,6 +6402,14 @@ init_tracer_debugfs(struct trace_array *tr, struct dentry *d_tracer)
 
 }
 
+extern struct trace_enum_map *__start_ftrace_enum_maps[];
+extern struct trace_enum_map *__stop_ftrace_enum_maps[];
+
+static void __init trace_enum_init(void)
+{
+	trace_insert_enum_map(__start_ftrace_enum_maps, __stop_ftrace_enum_maps);
+}
+
 static __init int tracer_init_debugfs(void)
 {
 	struct dentry *d_tracer;
@@ -6411,6 +6433,8 @@ static __init int tracer_init_debugfs(void)
 
 	trace_create_file("saved_cmdlines_size", 0644, d_tracer,
 			  NULL, &tracing_saved_cmdlines_size_fops);
+
+	trace_enum_init();
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 	trace_create_file("dyn_ftrace_total_info", 0444, d_tracer,

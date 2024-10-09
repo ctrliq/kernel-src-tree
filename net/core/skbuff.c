@@ -848,6 +848,7 @@ EXPORT_SYMBOL(napi_consume_skb);
 
 static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 {
+	int previous_pfmemalloc = new->pfmemalloc;
 	int previous_head_frag = new->head_frag;
 	int previous_xmit_more = new->xmit_more;
 
@@ -914,6 +915,7 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
 	 * headers_end on RHEL skb layout, but must not be copied; reset them
 	 * to their previous value to allow us using a single memcpy().
 	 */
+	new->pfmemalloc = previous_pfmemalloc;
 	new->head_frag = previous_head_frag;
 	new->xmit_more = previous_xmit_more;
 }
@@ -936,6 +938,7 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
 	n->hdr_len = skb->nohdr ? skb_headroom(skb) : skb->hdr_len;
 	n->cloned = 1;
 	n->nohdr = 0;
+	C(pfmemalloc);
 	n->destructor = NULL;
 	C(tail);
 	C(end);
@@ -2548,6 +2551,32 @@ void skb_queue_purge(struct sk_buff_head *list)
 		kfree_skb(skb);
 }
 EXPORT_SYMBOL(skb_queue_purge);
+
+/**
+ *	skb_rbtree_purge - empty a skb rbtree
+ *	@root: root of the rbtree to empty
+ *	Return value: the sum of truesizes of all purged skbs.
+ *
+ *	Delete all buffers on an &sk_buff rbtree. Each buffer is removed from
+ *	the list and one reference dropped. This function does not take
+ *	any lock. Synchronization should be handled by the caller (e.g., TCP
+ *	out-of-order queue is protected by the socket lock).
+ */
+unsigned int skb_rbtree_purge(struct rb_root *root)
+{
+	struct rb_node *p = rb_first(root);
+	unsigned int sum = 0;
+
+	while (p) {
+		struct sk_buff *skb = rb_entry(p, struct sk_buff, rbnode);
+
+		p = rb_next(p);
+		rb_erase(&skb->rbnode, root);
+		sum += skb->truesize;
+		kfree_skb(skb);
+	}
+	return sum;
+}
 
 /**
  *	skb_queue_head - queue a buffer at the list head
@@ -4325,8 +4354,6 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 		delta = from->truesize - SKB_TRUESIZE(skb_end_offset(from));
 	}
 
-	WARN_ON_ONCE(delta < len);
-
 	memcpy(skb_shinfo(to)->frags + skb_shinfo(to)->nr_frags,
 	       skb_shinfo(from)->frags,
 	       skb_shinfo(from)->nr_frags * sizeof(skb_frag_t));
@@ -4416,7 +4443,7 @@ unsigned int skb_gso_transport_seglen(const struct sk_buff *skb)
 }
 EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
 
-/**
+/*
  * skb_gso_size_check - check the skb size, considering GSO_BY_FRAGS
  *
  * There are a couple of instances where we have a GSO skb, and we
@@ -4459,6 +4486,7 @@ static inline bool skb_gso_size_check(const struct sk_buff *skb,
  * skb_gso_validate_mtu - Return in case such skb fits a given MTU
  *
  * @skb: GSO skb
+ * @mtu: MTU to validate against
  *
  * skb_gso_validate_mtu validates if a given skb will fit a wanted MTU
  * once split.

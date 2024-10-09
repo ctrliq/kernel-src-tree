@@ -12,6 +12,8 @@
 #include <asm/cacheflush.h>
 #include <asm/facility.h>
 #include <asm/dis.h>
+#include <asm/facility.h>
+#include <asm/nospec-branch.h>
 
 /*
  * Conventions:
@@ -27,7 +29,6 @@
  *   %r13 = literal pool pointer
  *   0(%r15) - 63(%r15) scratch memory array with BPF_MEMWORDS
  */
-int bpf_jit_enable __read_mostly;
 
 /*
  * assembly code in arch/x86/net/bpf_jit.S
@@ -45,6 +46,8 @@ struct bpf_jit {
 	u8 *base_ip;
 	u8 *ret0_ip;
 	u8 *exit_ip;
+	u8 *r1_thunk_ip;	/* Address of expoline thunk for 'br %r1' */
+	u8 *r14_thunk_ip;	/* Address of expoline thunk for 'br %r14' */
 	unsigned int off_load_word;
 	unsigned int off_load_half;
 	unsigned int off_load_byte;
@@ -114,6 +117,18 @@ struct bpf_jit {
 ({							\
 	unsigned int __disp = (disp) & 0xfff;		\
 	EMIT6(op1 | __disp, op2);			\
+})
+
+#define EMIT6_PCREL_RILB(op, target)				\
+({								\
+	int rel = (target - jit->prg) / 2;			\
+	EMIT6(op | rel >> 16, rel & 0xffff);			\
+})
+
+#define EMIT6_PCREL_RIL(op, target)				\
+({								\
+	int rel = (target - jit->prg) / 2;			\
+	EMIT6(op | rel >> 16, rel & 0xffff);			\
 })
 
 #define EMIT6_IMM(op, imm)				\
@@ -217,8 +232,45 @@ static void bpf_jit_epilogue(struct bpf_jit *jit)
 	else if (jit->seen & SEEN_LITERAL)
 		/* lg %r13,128(%r15) */
 		EMIT6(0xe3d0f080, 0x0004);
+	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable) {
+		jit->r14_thunk_ip = jit->prg;
+		/* Generate __s390_indirect_jump_r14 thunk */
+		if (test_facility(35)) {
+			/* exrl %r0,.+10 */
+			EMIT6_PCREL_RIL(0xc6000000, jit->prg + 10);
+		} else {
+			/* larl %r1,.+14 */
+			EMIT6_PCREL_RILB(0xc0100000, jit->prg + 14);
+			/* ex 0,0(%r1) */
+			EMIT4_DISP(0x44001000, 0);
+		}
+		/* j . */
+		EMIT4_PCREL(0xa7f40000, 0);
+	}
 	/* br %r14 */
 	EMIT2(0x07fe);
+
+	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable &&
+	    (jit->seen & SEEN_DATAREF)) {
+		jit->r1_thunk_ip = jit->prg;
+		/* Generate __s390_indirect_jump_r1 thunk */
+		if (test_facility(35)) {
+			/* exrl %r0,.+10 */
+			EMIT6_PCREL_RIL(0xc6000000, jit->prg + 10);
+			/* j . */
+			EMIT4_PCREL(0xa7f40000, 0);
+			/* br %r1 */
+			EMIT2(0x07f1);
+		} else {
+			/* larl %r1,.+14 */
+			EMIT6_PCREL_RILB(0xc0100000, jit->prg + 14);
+			/* ex 0,S390_lowcore.br_r1_tampoline */
+			EMIT4_DISP(0x44000000, offsetof(struct _lowcore,
+							br_r1_trampoline));
+			/* j . */
+			EMIT4_PCREL(0xa7f40000, 0);
+		}
+	}
 }
 
 /*
@@ -532,8 +584,13 @@ call_fn:	/* lg %r1,<d(function)>(%r13) */
 		EMIT6_DISP(0xe310d000, 0x0004, offset);
 		/* l %r3,<d(K)>(%r13) */
 		EMIT4_DISP(0x5830d000, EMIT_CONST(K));
-		/* basr %r8,%r1 */
-		EMIT2(0x0d81);
+		if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable) {
+			/* brasl %r8,__s390_indirect_jump_r1 */
+			EMIT6_PCREL_RILB(0xc0850000, jit->r1_thunk_ip);
+		} else {
+			/* basr %r8,%r1 */
+			EMIT2(0x0d81);
+		}
 		/* jnz <ret0> */
 		EMIT4_PCREL(0xa7740000, (jit->ret0_ip - jit->prg));
 		break;

@@ -281,6 +281,8 @@ typedef void (softirq_done_fn)(struct request *);
 typedef int (dma_drain_needed_fn)(struct request *);
 typedef int (lld_busy_fn) (struct request_queue *q);
 typedef int (bsg_job_fn) (struct bsg_job *);
+typedef int (init_rq_fn)(struct request_queue *, struct request *, gfp_t);
+typedef void (exit_rq_fn)(struct request_queue *, struct request *);
 
 enum blk_eh_timer_return {
 	BLK_EH_NOT_HANDLED,
@@ -379,7 +381,7 @@ struct request_queue {
 	dma_drain_needed_fn	*dma_drain_needed;
 	lld_busy_fn		*lld_busy_fn;
 
-	struct blk_mq_ops	*mq_ops;
+	RH_KABI_CONST struct blk_mq_ops *mq_ops;
 
 	unsigned int		*mq_map;
 
@@ -568,6 +570,9 @@ struct request_queue {
 	 * is for avoiding IO hang in blk_mq_queue_reinit_notify().
 	 */
 	RH_KABI_EXTEND(unsigned int         tail_queue:1)
+
+	/* This flag is set if the driver can split bio */
+	RH_KABI_EXTEND(unsigned int         can_split_bio:1)
 #ifdef CONFIG_BLK_DEBUG_FS
 	RH_KABI_EXTEND(struct dentry		*debugfs_dir)
 	RH_KABI_EXTEND(struct dentry		*sched_debugfs_dir)
@@ -575,6 +580,11 @@ struct request_queue {
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	RH_KABI_EXTEND(struct mutex		blk_trace_mutex)
 #endif
+
+	RH_KABI_EXTEND(init_rq_fn		*init_rq_fn)
+	RH_KABI_EXTEND(exit_rq_fn		*exit_rq_fn)
+	RH_KABI_EXTEND(size_t			cmd_size)
+	RH_KABI_EXTEND(void			*rq_alloc_data)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
@@ -606,6 +616,8 @@ struct request_queue {
 #define QUEUE_FLAG_STATS       26	/* track rq completion times */
 #define QUEUE_FLAG_POLL_STATS  27	/* collecting stats for hybrid polling */
 #define QUEUE_FLAG_PREEMPT_ONLY	28	/* only process REQ_PREEMPT requests */
+#define QUEUE_FLAG_QUIESCED    29	/* queue has been quiesced */
+#define QUEUE_FLAG_SCSI_PASSTHROUGH 30	/* queue supports SCSI commands */
 
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
@@ -699,6 +711,8 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 #define blk_queue_dax(q)	test_bit(QUEUE_FLAG_DAX, &(q)->queue_flags)
 #define blk_queue_preempt_only(q)				\
 	test_bit(QUEUE_FLAG_PREEMPT_ONLY, &(q)->queue_flags)
+#define blk_queue_scsi_passthrough(q)	\
+	test_bit(QUEUE_FLAG_SCSI_PASSTHROUGH, &(q)->queue_flags)
 
 extern int blk_set_preempt_only(struct request_queue *q);
 extern void blk_clear_preempt_only(struct request_queue *q);
@@ -706,6 +720,7 @@ extern void blk_clear_preempt_only(struct request_queue *q);
 #define blk_noretry_request(rq) \
 	((rq)->cmd_flags & (REQ_FAILFAST_DEV|REQ_FAILFAST_TRANSPORT| \
 			     REQ_FAILFAST_DRIVER))
+#define blk_queue_quiesced(q)	test_bit(QUEUE_FLAG_QUIESCED, &(q)->queue_flags)
 
 #define blk_account_rq(rq) \
 	(((rq)->cmd_flags & REQ_STARTED) && \
@@ -1048,8 +1063,9 @@ static inline unsigned int blk_max_size_offset(struct request_queue *q,
 	if (!q->limits.chunk_sectors)
 		return q->limits.max_sectors;
 
-	return q->limits.chunk_sectors -
-			(offset & (q->limits.chunk_sectors - 1));
+	return min_t(unsigned int, q->limits.chunk_sectors -
+			(offset & (q->limits.chunk_sectors - 1)),
+			q->limits.max_sectors);
 }
 
 static inline unsigned int blk_rq_get_max_sectors(struct request *rq)
@@ -1122,8 +1138,7 @@ extern void blk_unprep_request(struct request *);
 extern struct request_queue *blk_init_queue_node(request_fn_proc *rfn,
 					spinlock_t *lock, int node_id);
 extern struct request_queue *blk_init_queue(request_fn_proc *, spinlock_t *);
-extern struct request_queue *blk_init_allocated_queue(struct request_queue *,
-						      request_fn_proc *, spinlock_t *);
+extern int blk_init_allocated_queue(struct request_queue *);
 extern void blk_cleanup_queue(struct request_queue *);
 extern void blk_queue_make_request(struct request_queue *, make_request_fn *);
 extern void blk_queue_bounce_limit(struct request_queue *, u64);
@@ -1182,7 +1197,8 @@ extern long nr_blockdev_pages(void);
 
 bool __must_check blk_get_queue(struct request_queue *);
 struct request_queue *blk_alloc_queue(gfp_t);
-struct request_queue *blk_alloc_queue_node(gfp_t, int);
+struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id,
+					   spinlock_t *lock);
 extern void blk_put_queue(struct request_queue *);
 extern void blk_set_queue_dying(struct request_queue *);
 
@@ -1636,6 +1652,7 @@ struct work_struct;
 int kblockd_schedule_work(struct work_struct *work);
 int kblockd_schedule_delayed_work(struct delayed_work *dwork, unsigned long delay);
 int kblockd_schedule_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned long delay);
+int kblockd_mod_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned long delay);
 
 #ifdef CONFIG_BLK_CGROUP
 /*

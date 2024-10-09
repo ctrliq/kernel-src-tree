@@ -35,6 +35,7 @@
 
 #ifdef CONFIG_X86_PAT
 int __read_mostly pat_enabled = 1;
+EXPORT_SYMBOL_GPL(pat_enabled);
 
 static inline void pat_disable(const char *reason)
 {

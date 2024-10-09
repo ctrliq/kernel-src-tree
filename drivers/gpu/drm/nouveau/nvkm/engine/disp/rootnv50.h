@@ -1,8 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NV50_DISP_ROOT_H__
 #define __NV50_DISP_ROOT_H__
 #define nv50_disp_root(p) container_of((p), struct nv50_disp_root, object)
+#include <core/object.h>
 #include "nv50.h"
-#include "dmacnv50.h"
 
 struct nv50_disp_root {
 	const struct nv50_disp_root_func *func;
@@ -35,4 +36,5 @@ extern const struct nvkm_disp_oclass gm107_disp_root_oclass;
 extern const struct nvkm_disp_oclass gm200_disp_root_oclass;
 extern const struct nvkm_disp_oclass gp100_disp_root_oclass;
 extern const struct nvkm_disp_oclass gp102_disp_root_oclass;
+extern const struct nvkm_disp_oclass gv100_disp_root_oclass;
 #endif

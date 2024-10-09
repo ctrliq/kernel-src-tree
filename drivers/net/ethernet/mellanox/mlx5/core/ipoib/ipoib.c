@@ -41,7 +41,6 @@
 static int mlx5i_open(struct net_device *netdev);
 static int mlx5i_close(struct net_device *netdev);
 static int mlx5i_change_mtu(struct net_device *netdev, int new_mtu);
-static int mlx5i_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd);
 
 static const struct net_device_ops mlx5i_netdev_ops = {
 	.ndo_size                = sizeof(struct net_device_ops),
@@ -67,6 +66,7 @@ static void mlx5i_build_nic_params(struct mlx5_core_dev *mdev,
 		MLX5I_PARAMS_DEFAULT_LOG_RQ_SIZE;
 
 	params->lro_en = false;
+	params->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
 }
 
 /* Called directly after IPoIB netdevice was created to initialize SW structs */
@@ -76,16 +76,21 @@ void mlx5i_init(struct mlx5_core_dev *mdev,
 		void *ppriv)
 {
 	struct mlx5e_priv *priv  = mlx5i_epriv(netdev);
+	u16 max_mtu;
 
 	/* priv init */
 	priv->mdev        = mdev;
 	priv->netdev      = netdev;
 	priv->profile     = profile;
 	priv->ppriv       = ppriv;
-	priv->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
+	priv->max_opened_tc = 1;
 	mutex_init(&priv->state_lock);
 
-	mlx5e_build_nic_params(mdev, &priv->channels.params, profile->max_nch(mdev));
+	mlx5_query_port_max_mtu(mdev, &max_mtu, 1);
+	netdev->mtu = max_mtu;
+
+	mlx5e_build_nic_params(mdev, &priv->channels.params,
+			       profile->max_nch(mdev), netdev->mtu);
 	mlx5i_build_nic_params(mdev, &priv->channels.params);
 
 	mlx5e_timestamp_init(priv);
@@ -232,7 +237,7 @@ int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp
 		 MLX5_QP_ENHANCED_ULP_STATELESS_MODE);
 
 	addr_path = MLX5_ADDR_OF(qpc, qpc, primary_address_path);
-	MLX5_SET(ads, addr_path, port, 1);
+	MLX5_SET(ads, addr_path, vhca_port_num, 1);
 	MLX5_SET(ads, addr_path, grh, 1);
 
 	ret = mlx5_core_create_qp(mdev, qp, in, inlen);
@@ -410,25 +415,27 @@ static int mlx5i_change_mtu(struct net_device *netdev, int new_mtu)
 {
 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
 	struct mlx5e_channels new_channels = {};
-	int curr_mtu;
+	struct mlx5e_params *params;
 	int err = 0;
 
 	mutex_lock(&priv->state_lock);
 
-	curr_mtu    = netdev->mtu;
-	netdev->mtu = new_mtu;
+	params = &priv->channels.params;
 
-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
-		goto out;
-
-	new_channels.params = priv->channels.params;
-	err = mlx5e_open_channels(priv, &new_channels);
-	if (err) {
-		netdev->mtu = curr_mtu;
+	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+		params->sw_mtu = new_mtu;
+		netdev->mtu = params->sw_mtu;
 		goto out;
 	}
 
+	new_channels.params = *params;
+	new_channels.params.sw_mtu = new_mtu;
+	err = mlx5e_open_channels(priv, &new_channels);
+	if (err)
+		goto out;
+
 	mlx5e_switch_priv_channels(priv, &new_channels, NULL);
+	netdev->mtu = new_channels.params.sw_mtu;
 
 out:
 	mutex_unlock(&priv->state_lock);
@@ -451,7 +458,7 @@ int mlx5i_dev_init(struct net_device *dev)
 	return 0;
 }
 
-static int mlx5i_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+int mlx5i_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	struct mlx5e_priv *priv = mlx5i_epriv(dev);
 

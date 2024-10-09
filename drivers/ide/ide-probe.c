@@ -762,6 +762,7 @@ static int ide_init_queue(ide_drive_t *drive)
 	q = blk_init_queue_node(do_ide_request, NULL, hwif_to_node(hwif));
 	if (!q)
 		return 1;
+	queue_flag_set_unlocked(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
 
 	q->queuedata = drive;
 	blk_queue_segment_boundary(q, 0xffff);

@@ -12,12 +12,12 @@
  * |             Level            |   Last Value Used  |     Holes	|
  * ----------------------------------------------------------------------
  * | Module Init and Probe        |       0x0193       | 0x0146         |
- * | Mailbox commands             |       0x1192       | 0x1018-0x1019	|
+ * | Mailbox commands             |       0x1206       | 0x1018-0x1019	|
  * |                              |                    | 0x1155-0x1158  |
  * |                              |                    | 0x1018-0x1019  |
  * |                              |                    | 0x1115-0x1116  |
  * |                              |                    | 0x10ca,0x1193  |
- * | Device Discovery             |       0x2095       | 0x2016         |
+ * | Device Discovery             |       0x2134       | 0x2016         |
  * |                              |                    | 0x2020-0x2022, |
  * |                              |                    | 0x2011-0x2012, |
  * |                              |                    | 0x2099-0x20a4  |
@@ -61,7 +61,7 @@
  * |                              |                    | 0xb13c-0xb140  |
  * |                              |                    | 0xb149		|
  * | MultiQ                       |       0xc010       |		|
- * | Misc                         |       0xd300       | 0xd031-0xd0ff	|
+ * | Misc                         |       0xd303       | 0xd031-0xd0ff	|
  * |                              |                    | 0xd101-0xd1fe	|
  * |                              |                    | 0xd214-0xd2fe	|
  * | Target Mode		  |	  0xe081       |		|

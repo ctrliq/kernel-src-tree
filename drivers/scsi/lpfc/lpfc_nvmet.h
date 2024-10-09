@@ -27,6 +27,10 @@
 #define LPFC_NVMET_RQE_DEF_COUNT	2048
 #define LPFC_NVMET_SUCCESS_LEN		12
 
+#define LPFC_NVMET_MRQ_OFF		0xffff
+#define LPFC_NVMET_MRQ_AUTO		0
+#define LPFC_NVMET_MRQ_MAX		16
+
 /* Used for NVME Target */
 struct lpfc_nvmet_tgtport {
 	struct lpfc_hba *phba;
@@ -70,7 +74,6 @@ struct lpfc_nvmet_tgtport {
 	atomic_t xmt_fcp_rsp_aborted;
 	atomic_t xmt_fcp_rsp_drop;
 
-
 	/* Stats counters - lpfc_nvmet_xmt_fcp_abort */
 	atomic_t xmt_fcp_xri_abort_cqe;
 	atomic_t xmt_fcp_abort;
@@ -79,6 +82,11 @@ struct lpfc_nvmet_tgtport {
 	atomic_t xmt_abort_unsol;
 	atomic_t xmt_abort_rsp;
 	atomic_t xmt_abort_rsp_error;
+
+	/* Stats counters - defer IO */
+	atomic_t defer_ctx;
+	atomic_t defer_fod;
+	atomic_t defer_wqfull;
 };
 
 struct lpfc_nvmet_ctx_info {
@@ -129,7 +137,6 @@ struct lpfc_nvmet_rcv_ctx {
 #define LPFC_NVMET_XBUSY		0x4  /* XB bit set on IO cmpl */
 #define LPFC_NVMET_CTX_RLS		0x8  /* ctx free requested */
 #define LPFC_NVMET_ABTS_RCV		0x10  /* ABTS received on exchange */
-#define LPFC_NVMET_DEFER_RCV_REPOST	0x20  /* repost to RQ on defer rcv */
 #define LPFC_NVMET_DEFER_WQFULL		0x40  /* Waiting on a free WQE */
 	struct rqb_dmabuf *rqb_buffer;
 	struct lpfc_nvmet_ctxbuf *ctxbuf;

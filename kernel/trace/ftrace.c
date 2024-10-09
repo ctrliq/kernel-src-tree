@@ -1517,7 +1517,19 @@ static int ftrace_cmp_recs(const void *a, const void *b)
 	return 0;
 }
 
-static unsigned long ftrace_location_range(unsigned long start, unsigned long end)
+/**
+ * ftrace_location_range - return the first address of a traced location
+ *	if it touches the given ip range
+ * @start: start of range to search.
+ * @end: end of range to search (inclusive). @end points to the last byte
+ *	to check.
+ *
+ * Returns rec->ip if the related ftrace location is a least partly within
+ * the given address range. That is, the first address of the instruction
+ * that is either a NOP or call to the function tracer. It checks the ftrace
+ * internal tables to determine if the address belongs or not.
+ */
+unsigned long ftrace_location_range(unsigned long start, unsigned long end)
 {
 	struct ftrace_page *pg;
 	struct dyn_ftrace *rec;
@@ -2973,10 +2985,22 @@ ftrace_notrace_open(struct inode *inode, struct file *file)
 				 inode, file);
 }
 
+/*
+ * If symbols in an architecture don't correspond exactly to the user-visible
+ * name of what they represent, it is possible to define this function to
+ * perform the necessary adjustments.
+*/
+char * __weak arch_ftrace_match_adjust(char *str, const char *search)
+{
+	return str;
+}
+
 static int ftrace_match(char *str, char *regex, int len, int type)
 {
 	int matched = 0;
 	int slen;
+
+	str = arch_ftrace_match_adjust(str, regex);
 
 	switch (type) {
 	case MATCH_FULL:
@@ -4428,20 +4452,25 @@ static void ftrace_init_module(struct module *mod,
 
 void ftrace_module_init(struct module *mod)
 {
-#ifdef CONFIG_S390
+#ifdef CONFIG_X86_64
+	ftrace_init_module(mod, mod->ftrace_callsites,
+			   mod->ftrace_callsites +
+			   mod->num_ftrace_callsites);
+#else
 	struct module_ext *mod_ext;
 
 	mutex_lock(&module_ext_mutex);
 	mod_ext = find_module_ext(mod);
 	mutex_unlock(&module_ext_mutex);
 
+#ifdef CONFIG_MPROFILE_KERNEL
+	if (!mod_ext->mprofile_kernel)
+		return;
+#endif
+
 	ftrace_init_module(mod, mod_ext->ftrace_callsites,
 			   mod_ext->ftrace_callsites +
 			   mod_ext->num_ftrace_callsites);
-#else
-	ftrace_init_module(mod, mod->ftrace_callsites,
-			   mod->ftrace_callsites +
-			   mod->num_ftrace_callsites);
 #endif
 }
 #endif /* CONFIG_MODULES */

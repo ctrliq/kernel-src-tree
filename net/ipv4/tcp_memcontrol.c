@@ -53,7 +53,6 @@ int tcp_init_cgroup(struct mem_cgroup *memcg, struct cgroup_subsys *ss)
 	cg_proto->memory_pressure = &tcp->tcp_memory_pressure;
 	cg_proto->sysctl_mem = tcp->tcp_prot_mem;
 	cg_proto->memory_allocated = &tcp->tcp_memory_allocated;
-	cg_proto->sockets_allocated = &tcp->tcp_sockets_allocated;
 	cg_proto->memcg = memcg;
 
 	return 0;

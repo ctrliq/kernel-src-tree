@@ -54,6 +54,48 @@ unsigned long syscall_arg__val(struct syscall_arg *arg, u8 idx);
 size_t syscall_arg__scnprintf_strarrays(char *bf, size_t size, struct syscall_arg *arg);
 #define SCA_STRARRAYS syscall_arg__scnprintf_strarrays
 
+size_t syscall_arg__scnprintf_fd(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_FD syscall_arg__scnprintf_fd
+
+size_t syscall_arg__scnprintf_hex(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_HEX syscall_arg__scnprintf_hex
+
+size_t syscall_arg__scnprintf_int(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_INT syscall_arg__scnprintf_int
+
+size_t syscall_arg__scnprintf_long(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_LONG syscall_arg__scnprintf_long
+
+size_t syscall_arg__scnprintf_pid(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_PID syscall_arg__scnprintf_pid
+
+size_t syscall_arg__scnprintf_clone_flags(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_CLONE_FLAGS syscall_arg__scnprintf_clone_flags
+
+size_t syscall_arg__scnprintf_fcntl_cmd(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_FCNTL_CMD syscall_arg__scnprintf_fcntl_cmd
+
+size_t syscall_arg__scnprintf_fcntl_arg(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_FCNTL_ARG syscall_arg__scnprintf_fcntl_arg
+
+size_t syscall_arg__scnprintf_ioctl_cmd(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_IOCTL_CMD syscall_arg__scnprintf_ioctl_cmd
+
+size_t syscall_arg__scnprintf_pkey_alloc_access_rights(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_PKEY_ALLOC_ACCESS_RIGHTS syscall_arg__scnprintf_pkey_alloc_access_rights
+
+size_t syscall_arg__scnprintf_open_flags(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_OPEN_FLAGS syscall_arg__scnprintf_open_flags
+
+size_t syscall_arg__scnprintf_prctl_option(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_PRCTL_OPTION syscall_arg__scnprintf_prctl_option
+
+size_t syscall_arg__scnprintf_prctl_arg2(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_PRCTL_ARG2 syscall_arg__scnprintf_prctl_arg2
+
+size_t syscall_arg__scnprintf_prctl_arg3(char *bf, size_t size, struct syscall_arg *arg);
+#define SCA_PRCTL_ARG3 syscall_arg__scnprintf_prctl_arg3
+
 size_t syscall_arg__scnprintf_statx_flags(char *bf, size_t size, struct syscall_arg *arg);
 #define SCA_STATX_FLAGS syscall_arg__scnprintf_statx_flags
 
@@ -63,6 +105,6 @@ size_t syscall_arg__scnprintf_statx_mask(char *bf, size_t size, struct syscall_a
 size_t open__scnprintf_flags(unsigned long flags, char *bf, size_t size);
 
 void syscall_arg__set_ret_scnprintf(struct syscall_arg *arg,
-				    size_t (*ret_scnprintf)(unsigned long val, char *bf, size_t size));
+				    size_t (*ret_scnprintf)(char *bf, size_t size, struct syscall_arg *arg));
 
 #endif /* _PERF_TRACE_BEAUTY_H */

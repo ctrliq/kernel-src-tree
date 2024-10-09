@@ -48,8 +48,9 @@
 #include "target_core_pr.h"
 #include "target_core_ua.h"
 
-DEFINE_MUTEX(g_device_mutex);
-LIST_HEAD(g_device_list);
+static DEFINE_MUTEX(device_mutex);
+static LIST_HEAD(device_list);
+static DEFINE_IDR(devices_idr);
 
 static struct se_hba *lun0_hba;
 /* not static, needed by tpg.c */
@@ -167,12 +168,20 @@ int transport_lookup_tmr_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 	rcu_read_lock();
 	deve = target_nacl_find_deve(nacl, unpacked_lun);
 	if (deve) {
-		se_tmr->tmr_lun = rcu_dereference(deve->se_lun);
-		se_cmd->se_lun = rcu_dereference(deve->se_lun);
 		se_lun = rcu_dereference(deve->se_lun);
+
+		if (!percpu_ref_tryget_live(&se_lun->lun_ref)) {
+			se_lun = NULL;
+			goto out_unlock;
+		}
+
+		se_cmd->se_lun = rcu_dereference(deve->se_lun);
 		se_cmd->pr_res_key = deve->pr_res_key;
 		se_cmd->orig_fe_lun = unpacked_lun;
+		se_cmd->se_cmd_flags |= SCF_SE_LUN_CMD;
+		se_cmd->lun_ref_active = true;
 	}
+out_unlock:
 	rcu_read_unlock();
 
 	if (!se_lun) {
@@ -182,9 +191,6 @@ int transport_lookup_tmr_lun(struct se_cmd *se_cmd, u64 unpacked_lun)
 			unpacked_lun);
 		return -ENODEV;
 	}
-	/*
-	 * XXX: Add percpu se_lun->lun_ref reference count for TMR
-	 */
 	se_cmd->se_dev = rcu_dereference_raw(se_lun->lun_se_dev);
 	se_tmr->tmr_dev = rcu_dereference_raw(se_lun->lun_se_dev);
 
@@ -761,13 +767,11 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 	dev->prot_length = sizeof(struct se_dif_v1_tuple);
 	dev->hba_index = hba->hba_index;
 
-	INIT_LIST_HEAD(&dev->dev_list);
 	INIT_LIST_HEAD(&dev->dev_sep_list);
 	INIT_LIST_HEAD(&dev->dev_tmr_list);
 	INIT_LIST_HEAD(&dev->delayed_cmd_list);
 	INIT_LIST_HEAD(&dev->state_list);
 	INIT_LIST_HEAD(&dev->qf_cmd_list);
-	INIT_LIST_HEAD(&dev->g_dev_node);
 	spin_lock_init(&dev->execute_task_lock);
 	spin_lock_init(&dev->delayed_cmd_lock);
 	spin_lock_init(&dev->dev_reservation_lock);
@@ -874,30 +878,6 @@ sector_t target_to_linux_sector(struct se_device *dev, sector_t lb)
 }
 EXPORT_SYMBOL(target_to_linux_sector);
 
-/**
- * target_find_device - find a se_device by its dev_index
- * @id: dev_index
- * @do_depend: true if caller needs target_depend_item to be done
- *
- * If do_depend is true, the caller must do a target_undepend_item
- * when finished using the device.
- *
- * If do_depend is false, the caller must be called in a configfs
- * callback or during removal.
- */
-struct se_device *target_find_device(int id, bool do_depend)
-{
-	struct se_device *dev;
-
-	mutex_lock(&g_device_mutex);
-	dev = idr_find(&devices_idr, id);
-	if (dev && do_depend && target_depend_item(&dev->dev_group.cg_item))
-		dev = NULL;
-	mutex_unlock(&g_device_mutex);
-	return dev;
-}
-EXPORT_SYMBOL(target_find_device);
-
 struct devices_idr_iter {
 	int (*fn)(struct se_device *dev, void *data);
 	void *data;
@@ -914,7 +894,7 @@ static int target_devices_idr_iter(int id, void *p, void *data)
 	 * to allow other callers to access partially setup devices,
 	 * so we skip them here.
 	 */
-	if (!(dev->dev_flags & DF_CONFIGURED))
+	if (!target_dev_configured(dev))
 		return 0;
 
 	return iter->fn(dev, iter->data);
@@ -937,26 +917,43 @@ int target_for_each_device(int (*fn)(struct se_device *dev, void *data),
 	iter.fn = fn;
 	iter.data = data;
 
-	mutex_lock(&g_device_mutex);
+	mutex_lock(&device_mutex);
 	ret = idr_for_each(&devices_idr, target_devices_idr_iter, &iter);
-	mutex_unlock(&g_device_mutex);
+	mutex_unlock(&device_mutex);
 	return ret;
 }
 
 int target_configure_device(struct se_device *dev)
 {
 	struct se_hba *hba = dev->se_hba;
-	int ret;
+	int ret, id;
 
-	if (dev->dev_flags & DF_CONFIGURED) {
+	if (target_dev_configured(dev)) {
 		pr_err("se_dev->se_dev_ptr already set for storage"
 				" object\n");
 		return -EEXIST;
 	}
 
+	/*
+	 * Add early so modules like tcmu can use during its
+	 * configuration.
+	 */
+	mutex_lock(&device_mutex);
+	/*
+	 * Use cyclic to try and avoid collisions with devices
+	 * that were recently removed.
+	 */
+	id = idr_alloc_cyclic(&devices_idr, dev, 0, INT_MAX, GFP_KERNEL);
+	mutex_unlock(&device_mutex);
+	if (id < 0) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	dev->dev_index = id;
+
 	ret = dev->transport->configure_device(dev);
 	if (ret)
-		goto out;
+		goto out_free_index;
 	/*
 	 * XXX: there is not much point to have two different values here..
 	 */
@@ -971,12 +968,11 @@ int target_configure_device(struct se_device *dev)
 					 dev->dev_attrib.hw_block_size);
 	dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
 
-	dev->dev_index = scsi_get_new_index(SCSI_DEVICE_INDEX);
 	dev->creation_time = get_jiffies_64();
 
 	ret = core_setup_alua(dev);
 	if (ret)
-		goto out;
+		goto out_free_index;
 
 	/*
 	 * Startup the struct se_device processing thread
@@ -1014,16 +1010,16 @@ int target_configure_device(struct se_device *dev)
 	hba->dev_count++;
 	spin_unlock(&hba->device_lock);
 
-	mutex_lock(&g_device_mutex);
-	list_add_tail(&dev->g_dev_node, &g_device_list);
-	mutex_unlock(&g_device_mutex);
-
 	dev->dev_flags |= DF_CONFIGURED;
 
 	return 0;
 
 out_free_alua:
 	core_alua_free_lu_gp_mem(dev);
+out_free_index:
+	mutex_lock(&device_mutex);
+	idr_remove(&devices_idr, dev->dev_index);
+	mutex_unlock(&device_mutex);
 out:
 	se_release_vpd_for_dev(dev);
 	return ret;
@@ -1035,15 +1031,15 @@ void target_free_device(struct se_device *dev)
 
 	WARN_ON(!list_empty(&dev->dev_sep_list));
 
-	if (dev->dev_flags & DF_CONFIGURED) {
+	if (target_dev_configured(dev)) {
 		destroy_workqueue(dev->tmr_wq);
 
 		if (dev->transport->destroy_device)
 			dev->transport->destroy_device(dev);
 
-		mutex_lock(&g_device_mutex);
-		list_del(&dev->g_dev_node);
-		mutex_unlock(&g_device_mutex);
+		mutex_lock(&device_mutex);
+		idr_remove(&devices_idr, dev->dev_index);
+		mutex_unlock(&device_mutex);
 
 		spin_lock(&hba->device_lock);
 		hba->dev_count--;
@@ -1158,19 +1154,19 @@ passthrough_parse_cdb(struct se_cmd *cmd,
 	      TRANSPORT_FLAG_PASSTHROUGH_PGR)) {
 		if (cdb[0] == PERSISTENT_RESERVE_IN) {
 			cmd->execute_cmd = target_scsi3_emulate_pr_in;
-			size = (cdb[7] << 8) + cdb[8];
+			size = get_unaligned_be16(&cdb[7]);
 			return target_cmd_size_check(cmd, size);
 		}
 		if (cdb[0] == PERSISTENT_RESERVE_OUT) {
 			cmd->execute_cmd = target_scsi3_emulate_pr_out;
-			size = (cdb[7] << 8) + cdb[8];
+			size = get_unaligned_be32(&cdb[5]);
 			return target_cmd_size_check(cmd, size);
 		}
 
 		if (cdb[0] == RELEASE || cdb[0] == RELEASE_10) {
 			cmd->execute_cmd = target_scsi2_reservation_release;
 			if (cdb[0] == RELEASE_10)
-				size = (cdb[7] << 8) | cdb[8];
+				size = get_unaligned_be16(&cdb[7]);
 			else
 				size = cmd->data_length;
 			return target_cmd_size_check(cmd, size);
@@ -1178,7 +1174,7 @@ passthrough_parse_cdb(struct se_cmd *cmd,
 		if (cdb[0] == RESERVE || cdb[0] == RESERVE_10) {
 			cmd->execute_cmd = target_scsi2_reservation_reserve;
 			if (cdb[0] == RESERVE_10)
-				size = (cdb[7] << 8) | cdb[8];
+				size = get_unaligned_be16(&cdb[7]);
 			else
 				size = cmd->data_length;
 			return target_cmd_size_check(cmd, size);
@@ -1206,7 +1202,7 @@ passthrough_parse_cdb(struct se_cmd *cmd,
 		switch (get_unaligned_be16(&cdb[8])) {
 		case READ_32:
 		case WRITE_32:
-		case 0x0c: /* WRITE_VERIFY_32 */
+		case WRITE_VERIFY_32:
 		case XDWRITEREAD_32:
 			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 			break;

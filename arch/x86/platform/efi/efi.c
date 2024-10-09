@@ -1054,16 +1054,12 @@ static void __init __efi_enter_virtual_mode(void)
 	efi_delete_dummy_variable();
 }
 
-bool in_efi_virtual_mode __read_mostly;
-
 void __init efi_enter_virtual_mode(void)
 {
-	in_efi_virtual_mode = true;
 	if (efi_setup)
 		kexec_enter_virtual_mode();
 	else
 		__efi_enter_virtual_mode();
-	in_efi_virtual_mode = false;
 }
 
 /*

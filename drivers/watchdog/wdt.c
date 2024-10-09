@@ -393,7 +393,7 @@ static long wdt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (wdt_set_heartbeat(new_heartbeat))
 			return -EINVAL;
 		wdt_ping();
-		/* Fall through */
+		/* Fall */
 	case WDIOC_GETTIMEOUT:
 		return put_user(heartbeat, p);
 	default:

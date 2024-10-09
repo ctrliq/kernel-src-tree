@@ -53,6 +53,7 @@
 
 #include "uverbs.h"
 #include "rdma_core.h"
+#include "core_priv.h"
 
 MODULE_AUTHOR("Roland Dreier");
 MODULE_DESCRIPTION("InfiniBand userspace verbs access");

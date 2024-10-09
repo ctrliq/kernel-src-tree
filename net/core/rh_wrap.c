@@ -46,18 +46,22 @@ struct tc_to_netdev_rh74 {
 
 static inline
 int handle_sch_mqprio_rh74(struct net_device *dev,
-			   const struct tc_mqprio_qopt *mqprio)
+			   const struct tc_mqprio_qopt_offload *mqprio)
 {
 	struct tc_to_netdev_rh74 tc74 = {
-		.type	= TC_SETUP_MQPRIO,
-		.tc	= mqprio->num_tc,
+		.type	= TC_SETUP_QDISC_MQPRIO,
+		.tc	= mqprio->qopt.num_tc,
 	};
+
+	/* For RHEL7.4 only DCB mode is valid */
+	if (mqprio->mode != TC_MQPRIO_MODE_DCB)
+		return -ENOTSUPP;
 
 	return dev->netdev_ops->ndo_setup_tc_rh74(dev, 0, 0, &tc74);
 }
 
 static inline
-int handle_cls_u32_rh74(struct net_device *dev,
+int handle_cls_u32_rh74(struct net_device *dev, u32 handle,
 			const struct tc_cls_u32_offload *cls_u32)
 {
 	struct tc_cls_u32_offload_rh74 cls_u32_rh74 = {
@@ -75,12 +79,34 @@ int handle_cls_u32_rh74(struct net_device *dev,
 	if (common->chain_index)
 		return -ENOTSUPP;
 
-	return dev->netdev_ops->ndo_setup_tc_rh74(dev, common->handle,
-						  common->protocol, &tc74);
+	return dev->netdev_ops->ndo_setup_tc_rh74(dev, handle, common->protocol,
+						  &tc74);
 }
 
 static inline
-int handle_cls_flower_rh74(struct net_device *dev,
+int tcf_exts_get_dev(struct net_device *dev, struct tcf_exts *exts,
+		     struct net_device **hw_dev)
+{
+#ifdef CONFIG_NET_CLS_ACT
+	const struct tc_action *a;
+	LIST_HEAD(actions);
+
+	if (!tcf_exts_has_actions(exts))
+		return -EINVAL;
+
+	tcf_exts_to_list(exts, &actions);
+	list_for_each_entry(a, &actions, list) {
+		if (a->ops->get_dev)
+			*hw_dev = a->ops->get_dev(a);
+	}
+	if (*hw_dev)
+		return 0;
+#endif
+	return -EOPNOTSUPP;
+}
+
+static inline
+int handle_cls_flower_rh74(struct net_device *dev, u32 handle,
 			   const struct tc_cls_flower_offload *cls_flower)
 {
 	struct tc_cls_flower_offload_rh74 cls_flower_rh74 = {
@@ -95,7 +121,6 @@ int handle_cls_flower_rh74(struct net_device *dev,
 	struct tc_to_netdev_rh74 tc74 = {
 		.type		= TC_SETUP_CLSFLOWER,
 		.cls_flower	= &cls_flower_rh74,
-		.egress_dev	= cls_flower->egress_dev,
 	};
 	const struct tc_cls_common_offload *common = &cls_flower->common;
 
@@ -103,12 +128,32 @@ int handle_cls_flower_rh74(struct net_device *dev,
 	if (common->chain_index)
 		return -ENOTSUPP;
 
-	return dev->netdev_ops->ndo_setup_tc_rh74(dev, common->handle,
-						  common->protocol, &tc74);
+	/*
+	 * Emulate 'egress_dev':
+	 * tc_can_offload(dev)?
+	 * yes - leave egress_dev unset
+	 *     - call .ndo_setup_tc() for the 'dev'
+	 * no - retrieve egress device from one of assigned action(s)
+	 *    - set egress_dev to true
+	 *    - call .ndo_setup_tc() for this egress device
+	 */
+	if (!tc_can_offload(dev)) {
+		struct net_device *hw_dev = NULL;
+
+		if (tcf_exts_get_dev(dev, cls_flower->exts, &hw_dev) ||
+		    (hw_dev && !tc_can_offload(hw_dev)))
+			return -EINVAL;
+
+		dev = hw_dev;
+		tc74.egress_dev = true;
+	}
+
+	return dev->netdev_ops->ndo_setup_tc_rh74(dev, handle, common->protocol,
+						  &tc74);
 }
 
 static inline
-int handle_cls_matchall_rh74(struct net_device *dev,
+int handle_cls_matchall_rh74(struct net_device *dev, u32 handle,
 			     const struct tc_cls_matchall_offload *cls_mall)
 {
 	struct tc_cls_matchall_offload_rh74 cls_mall_rh74 = {
@@ -126,41 +171,85 @@ int handle_cls_matchall_rh74(struct net_device *dev,
 	if (common->chain_index)
 		return -ENOTSUPP;
 
-	return dev->netdev_ops->ndo_setup_tc_rh74(dev, common->handle,
-						  common->protocol, &tc74);
+	return dev->netdev_ops->ndo_setup_tc_rh74(dev, handle, common->protocol,
+						  &tc74);
 }
 
-int __rh_call_ndo_setup_tc(struct net_device *dev, enum tc_setup_type type,
-			   void *type_data)
+static bool tech_preview_marked = false;
+
+int __rh_call_ndo_setup_tc(struct net_device *dev, u32 handle,
+			   enum tc_setup_type type, void *type_data)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
+	int ret = -EOPNOTSUPP;
 
 	if (get_ndo_ext(ops, ndo_setup_tc_rh)) {
-		return get_ndo_ext(ops, ndo_setup_tc_rh)(dev, type, type_data);
-	} else if (ops->ndo_setup_tc_rh74) {
+		/*
+		 * The drivers implementing .ndo_setup_tc_rh() should handle
+		 * only types >= TC_SETUP_BLOCK & TC_SETUP_QDISC_MQPRIO.
+		 * The types TC_SETUP_{CLSU32,CLSFLOWER, CLSMATCHALL,CLSBPF}
+		 * are handled by TC setup callbacks.
+		 */
 		switch (type) {
-		case TC_SETUP_MQPRIO:
-			return handle_sch_mqprio_rh74(dev, type_data);
 		case TC_SETUP_CLSU32:
-			return handle_cls_u32_rh74(dev, type_data);
 		case TC_SETUP_CLSFLOWER:
-			return handle_cls_flower_rh74(dev, type_data);
 		case TC_SETUP_CLSMATCHALL:
-			return handle_cls_matchall_rh74(dev, type_data);
 		case TC_SETUP_CLSBPF:
-			return -EOPNOTSUPP;
+			return 0;
+		default:
+			ret = get_ndo_ext(ops, ndo_setup_tc_rh)(dev, type,
+								type_data);
 		}
-	} else if (ops->ndo_setup_tc_rh72 && type == TC_SETUP_MQPRIO) {
+	} else if (ops->ndo_setup_tc_rh74) {
+		/*
+		 * Callback .ndo_setup_tc() for RHEL-7.4 drivers should be
+		 * called only when TC offloading is supported and enabled
+		 * by the device. There is one exception: flower classifier
+		 * in combination with mirred action where offloading can
+		 * be provided by egress device. This functionality is
+		 * handled in handle_cls_flower_rh74().
+		 */
+		if (!tc_can_offload(dev) && type != TC_SETUP_CLSFLOWER)
+			return 0;
+		switch (type) {
+		case TC_SETUP_QDISC_MQPRIO:
+			ret = handle_sch_mqprio_rh74(dev, type_data);
+			break;
+		case TC_SETUP_CLSU32:
+			ret = handle_cls_u32_rh74(dev, handle, type_data);
+			break;
+		case TC_SETUP_CLSFLOWER:
+			ret = handle_cls_flower_rh74(dev, handle, type_data);
+			break;
+		case TC_SETUP_CLSMATCHALL:
+			ret = handle_cls_matchall_rh74(dev, handle, type_data);
+			break;
+		default:
+			break;
+		}
+	} else if (ops->ndo_setup_tc_rh72 && type == TC_SETUP_QDISC_MQPRIO) {
 		/* Drivers implementing .ndo_setup_tc_rh72()
 		 * Note that drivers that implement .ndo_setup_tc_rh72() can
 		 * only support mqprio so this entry-point can be called
 		 * only for this type.
 		 */
-		struct tc_mqprio_qopt *mqprio = type_data;
+		struct tc_mqprio_qopt_offload *mqprio = type_data;
 
-		return ops->ndo_setup_tc_rh72(dev, mqprio->num_tc);
+		/* For RHEL7.2 only DCB mode is valid */
+		if (mqprio->mode != TC_MQPRIO_MODE_DCB)
+			return -ENOTSUPP;
+
+		ret = ops->ndo_setup_tc_rh72(dev, mqprio->qopt.num_tc);
 	}
 
-	return -EOPNOTSUPP;
+	/* TC offloading is a Tech-Preview so inform an user in case that
+	 * offloading setup succeeded.
+	 */
+	if (!ret && !tech_preview_marked) {
+		mark_tech_preview("TC offloading", NULL);
+		tech_preview_marked = true;
+	}
+
+	return ret;
 }
 EXPORT_SYMBOL(__rh_call_ndo_setup_tc);

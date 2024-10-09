@@ -733,14 +733,6 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
 			ah->qplib_ah.nw_type = CMDQ_CREATE_AH_TYPE_V1;
 			break;
 		}
-		rc = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
-						  ah_attr->roce.dmac, &vlan_tag,
-						  &sgid_attr.ndev->ifindex,
-						  NULL);
-		if (rc) {
-			dev_err(rdev_to_dev(rdev), "Failed to get dmac\n");
-			goto fail;
-		}
 	}
 
 	memcpy(ah->qplib_ah.dmac, ah_attr->roce.dmac, ETH_ALEN);
@@ -793,7 +785,7 @@ int bnxt_re_query_ah(struct ib_ah *ib_ah, struct rdma_ah_attr *ah_attr)
 	return 0;
 }
 
-static unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp)
+unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp)
 	__acquires(&qp->scq->cq_lock) __acquires(&qp->rcq->cq_lock)
 {
 	unsigned long flags;
@@ -807,8 +799,8 @@ static unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp)
 	return flags;
 }
 
-static void bnxt_re_unlock_cqs(struct bnxt_re_qp *qp,
-			       unsigned long flags)
+void bnxt_re_unlock_cqs(struct bnxt_re_qp *qp,
+			unsigned long flags)
 	__releases(&qp->scq->cq_lock) __releases(&qp->rcq->cq_lock)
 {
 	if (qp->rcq != qp->scq)
@@ -1614,6 +1606,7 @@ int bnxt_re_modify_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 	int status;
 	union ib_gid sgid;
 	struct ib_gid_attr sgid_attr;
+	unsigned int flags;
 	u8 nw_type;
 
 	qp->qplib_qp.modify_flags = 0;
@@ -1642,14 +1635,18 @@ int bnxt_re_modify_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
 			dev_dbg(rdev_to_dev(rdev),
 				"Move QP = %p to flush list\n",
 				qp);
+			flags = bnxt_re_lock_cqs(qp);
 			bnxt_qplib_add_flush_qp(&qp->qplib_qp);
+			bnxt_re_unlock_cqs(qp, flags);
 		}
 		if (!qp->sumem &&
 		    qp->qplib_qp.state == CMDQ_MODIFY_QP_NEW_STATE_RESET) {
 			dev_dbg(rdev_to_dev(rdev),
 				"Move QP = %p out of flush list\n",
 				qp);
+			flags = bnxt_re_lock_cqs(qp);
 			bnxt_qplib_clean_qp(&qp->qplib_qp);
+			bnxt_re_unlock_cqs(qp, flags);
 		}
 	}
 	if (qp_attr_mask & IB_QP_EN_SQD_ASYNC_NOTIFY) {
@@ -3601,7 +3598,7 @@ struct ib_mr *bnxt_re_reg_user_mr(struct ib_pd *ib_pd, u64 start, u64 length,
 	int umem_pgs, page_shift, rc;
 
 	if (length > BNXT_RE_MAX_MR_SIZE) {
-		dev_err(rdev_to_dev(rdev), "MR Size: %lld > Max supported:%ld\n",
+		dev_err(rdev_to_dev(rdev), "MR Size: %lld > Max supported:%lld\n",
 			length, BNXT_RE_MAX_MR_SIZE);
 		return ERR_PTR(-ENOMEM);
 	}

@@ -131,6 +131,7 @@ enum scsi_timeouts {
 #define WRITE_16              0x8a
 #define READ_ATTRIBUTE        0x8c
 #define WRITE_ATTRIBUTE	      0x8d
+#define WRITE_VERIFY_16       0x8e
 #define VERIFY_16	      0x8f
 #define SYNCHRONIZE_CACHE_16  0x91
 #define WRITE_SAME_16	      0x93
@@ -170,6 +171,7 @@ enum scsi_timeouts {
 #define READ_32		      0x09
 #define VERIFY_32	      0x0a
 #define WRITE_32	      0x0b
+#define WRITE_VERIFY_32	      0x0c
 #define WRITE_SAME_32	      0x0d
 
 /* Values for T10/04-262r7 */

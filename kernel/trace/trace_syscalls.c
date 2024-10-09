@@ -18,10 +18,16 @@ static int syscall_enter_register(struct ftrace_event_call *event,
 static int syscall_exit_register(struct ftrace_event_call *event,
 				 enum trace_reg type, void *data);
 
+static struct syscall_metadata*
+syscall_metadata(struct ftrace_event_call *call)
+{
+	return call->rh_data->data;
+}
+
 static struct list_head *
 syscall_get_enter_fields(struct ftrace_event_call *call)
 {
-	struct syscall_metadata *entry = call->data;
+	struct syscall_metadata *entry = syscall_metadata(call);
 
 	return &entry->enter_fields;
 }
@@ -232,7 +238,7 @@ static int set_syscall_print_fmt(struct ftrace_event_call *call)
 {
 	char *print_fmt;
 	int len;
-	struct syscall_metadata *entry = call->data;
+	struct syscall_metadata *entry = syscall_metadata(call);
 
 	if (entry->enter_event != call) {
 		call->print_fmt = "\"0x%lx\", REC->ret";
@@ -255,7 +261,7 @@ static int set_syscall_print_fmt(struct ftrace_event_call *call)
 
 static void free_syscall_print_fmt(struct ftrace_event_call *call)
 {
-	struct syscall_metadata *entry = call->data;
+	struct syscall_metadata *entry = syscall_metadata(call);
 
 	if (entry->enter_event == call)
 		kfree(call->print_fmt);
@@ -264,7 +270,7 @@ static void free_syscall_print_fmt(struct ftrace_event_call *call)
 static int __init syscall_enter_define_fields(struct ftrace_event_call *call)
 {
 	struct syscall_trace_enter trace;
-	struct syscall_metadata *meta = call->data;
+	struct syscall_metadata *meta = syscall_metadata(call);
 	int ret;
 	int i;
 	int offset = offsetof(typeof(trace), args);
@@ -390,7 +396,7 @@ static int reg_event_syscall_enter(struct ftrace_event_file *file,
 	int ret = 0;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 	if (WARN_ON_ONCE(num < 0 || num >= NR_syscalls))
 		return -ENOSYS;
 	mutex_lock(&syscall_trace_lock);
@@ -410,7 +416,7 @@ static void unreg_event_syscall_enter(struct ftrace_event_file *file,
 	struct trace_array *tr = file->tr;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 	if (WARN_ON_ONCE(num < 0 || num >= NR_syscalls))
 		return;
 	mutex_lock(&syscall_trace_lock);
@@ -428,7 +434,7 @@ static int reg_event_syscall_exit(struct ftrace_event_file *file,
 	int ret = 0;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 	if (WARN_ON_ONCE(num < 0 || num >= NR_syscalls))
 		return -ENOSYS;
 	mutex_lock(&syscall_trace_lock);
@@ -448,7 +454,7 @@ static void unreg_event_syscall_exit(struct ftrace_event_file *file,
 	struct trace_array *tr = file->tr;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 	if (WARN_ON_ONCE(num < 0 || num >= NR_syscalls))
 		return;
 	mutex_lock(&syscall_trace_lock);
@@ -464,10 +470,10 @@ static int init_syscall_trace(struct ftrace_event_call *call)
 	int id;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 	if (num < 0 || num >= NR_syscalls) {
 		pr_debug("syscall %s metadata not mapped, disabling ftrace event\n",
-				((struct syscall_metadata *)call->data)->name);
+			 syscall_metadata(call)->name);
 		return -ENOSYS;
 	}
 
@@ -547,11 +553,30 @@ static DECLARE_BITMAP(enabled_perf_exit_syscalls, NR_syscalls);
 static int sys_perf_refcount_enter;
 static int sys_perf_refcount_exit;
 
+static int perf_call_bpf_enter(struct ftrace_event_call *call, struct pt_regs *regs,
+			       struct syscall_metadata *sys_data,
+			       struct syscall_trace_enter *rec)
+{
+	struct syscall_tp_t {
+		unsigned long long regs;
+		unsigned long syscall_nr;
+		unsigned long args[sys_data->nb_args];
+	} param;
+	int i;
+
+	*(struct pt_regs **)&param = regs;
+	param.syscall_nr = rec->nr;
+	for (i = 0; i < sys_data->nb_args; i++)
+		param.args[i] = rec->args[i];
+	return trace_call_bpf(call, &param);
+}
+
 static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
 {
 	struct syscall_metadata *sys_data;
 	struct syscall_trace_enter *rec;
 	struct hlist_head *head;
+	bool valid_prog_array;
 	int syscall_nr;
 	int rctx;
 	int size;
@@ -567,7 +592,8 @@ static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
 		return;
 
 	head = this_cpu_ptr(sys_data->enter_event->perf_events);
-	if (hlist_empty(head))
+	valid_prog_array = bpf_prog_array_valid(sys_data->enter_event);
+	if (!valid_prog_array && hlist_empty(head))
 		return;
 
 	/* get the size after alignment with the u32 buffer size field */
@@ -587,6 +613,14 @@ static void perf_syscall_enter(void *ignore, struct pt_regs *regs, long id)
 	rec->nr = syscall_nr;
 	syscall_get_arguments(current, regs, 0, sys_data->nb_args,
 			       (unsigned long *)&rec->args);
+
+	if ((valid_prog_array &&
+	     !perf_call_bpf_enter(sys_data->enter_event, regs, sys_data, rec)) ||
+	    hlist_empty(head)) {
+		perf_swevent_put_recursion_context(rctx);
+		return;
+	}
+
 	perf_trace_buf_submit(rec, size, rctx, 0, 1, regs, head, NULL);
 }
 
@@ -595,7 +629,7 @@ static int perf_sysenter_enable(struct ftrace_event_call *call)
 	int ret = 0;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 
 	mutex_lock(&syscall_trace_lock);
 	if (!sys_perf_refcount_enter)
@@ -615,7 +649,7 @@ static void perf_sysenter_disable(struct ftrace_event_call *call)
 {
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 
 	mutex_lock(&syscall_trace_lock);
 	sys_perf_refcount_enter--;
@@ -625,11 +659,27 @@ static void perf_sysenter_disable(struct ftrace_event_call *call)
 	mutex_unlock(&syscall_trace_lock);
 }
 
+static int perf_call_bpf_exit(struct ftrace_event_call *call, struct pt_regs *regs,
+			      struct syscall_trace_exit *rec)
+{
+	struct syscall_tp_t {
+		unsigned long long regs;
+		unsigned long syscall_nr;
+		unsigned long ret;
+	} param;
+
+	*(struct pt_regs **)&param = regs;
+	param.syscall_nr = rec->nr;
+	param.ret = rec->ret;
+	return trace_call_bpf(call, &param);
+}
+
 static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
 {
 	struct syscall_metadata *sys_data;
 	struct syscall_trace_exit *rec;
 	struct hlist_head *head;
+	bool valid_prog_array;
 	int syscall_nr;
 	int rctx;
 	int size;
@@ -645,7 +695,8 @@ static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
 		return;
 
 	head = this_cpu_ptr(sys_data->exit_event->perf_events);
-	if (hlist_empty(head))
+	valid_prog_array = bpf_prog_array_valid(sys_data->exit_event);
+	if (!valid_prog_array && hlist_empty(head))
 		return;
 
 	/* We can probably do that at build time */
@@ -667,6 +718,14 @@ static void perf_syscall_exit(void *ignore, struct pt_regs *regs, long ret)
 
 	rec->nr = syscall_nr;
 	rec->ret = syscall_get_return_value(current, regs);
+
+	if ((valid_prog_array &&
+	     !perf_call_bpf_exit(sys_data->exit_event, regs, rec)) ||
+	    hlist_empty(head)) {
+		perf_swevent_put_recursion_context(rctx);
+		return;
+	}
+
 	perf_trace_buf_submit(rec, size, rctx, 0, 1, regs, head, NULL);
 }
 
@@ -675,7 +734,7 @@ static int perf_sysexit_enable(struct ftrace_event_call *call)
 	int ret = 0;
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 
 	mutex_lock(&syscall_trace_lock);
 	if (!sys_perf_refcount_exit)
@@ -695,7 +754,7 @@ static void perf_sysexit_disable(struct ftrace_event_call *call)
 {
 	int num;
 
-	num = ((struct syscall_metadata *)call->data)->syscall_nr;
+	num = syscall_metadata(call)->syscall_nr;
 
 	mutex_lock(&syscall_trace_lock);
 	sys_perf_refcount_exit--;

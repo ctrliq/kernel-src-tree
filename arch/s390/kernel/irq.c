@@ -149,6 +149,14 @@ asmlinkage void do_softirq(void)
 			new -= STACK_FRAME_OVERHEAD;
 			((struct stack_frame *) new)->back_chain = old;
 
+#ifdef CONFIG_64BIT
+			asm volatile("   la    15,0(%0)\n"
+				     "   brasl 14,__do_softirq\n"
+				     "   la    15,0(%1)\n"
+				     : : "a" (new), "a" (old)
+				     : "0", "1", "2", "3", "4", "5", "14",
+				       "cc", "memory" );
+#else
 			asm volatile("   la    15,0(%0)\n"
 				     "   basr  14,%2\n"
 				     "   la    15,0(%1)\n"
@@ -156,6 +164,7 @@ asmlinkage void do_softirq(void)
 				         "a" (__do_softirq)
 				     : "0", "1", "2", "3", "4", "5", "14",
 				       "cc", "memory" );
+#endif
 		} else {
 			/* We are already on the async stack. */
 			__do_softirq();
@@ -317,9 +326,10 @@ int request_irq(unsigned int irq, irq_handler_t handler,
 }
 EXPORT_SYMBOL_GPL(request_irq);
 
-void free_irq(unsigned int irq, void *dev_id)
+const void *free_irq(unsigned int irq, void *dev_id)
 {
 	WARN_ON(1);
+	return NULL;
 }
 EXPORT_SYMBOL_GPL(free_irq);
 

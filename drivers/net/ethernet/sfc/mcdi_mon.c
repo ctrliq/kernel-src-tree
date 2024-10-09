@@ -306,7 +306,7 @@ efx_mcdi_mon_add_attr(struct efx_nic *efx, const char *name,
 	attr->limit_value = limit_value;
 	sysfs_attr_init(&attr->dev_attr.attr);
 	attr->dev_attr.attr.name = attr->name;
-	attr->dev_attr.attr.mode = S_IRUGO;
+	attr->dev_attr.attr.mode = 0444;
 	attr->dev_attr.show = reader;
 	rc = device_create_file(&efx->pci_dev->dev, &attr->dev_attr);
 	if (rc == 0)

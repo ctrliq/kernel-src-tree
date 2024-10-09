@@ -5,7 +5,6 @@
 /* glibc 2.20 deprecates _BSD_SOURCE in favour of _DEFAULT_SOURCE */
 #define _DEFAULT_SOURCE 1
 
-#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -13,19 +12,9 @@
 #include <linux/compiler.h>
 #include <linux/types.h>
 
-#ifndef __GNUC__
-#ifndef __attribute__
-#define __attribute__(x)
-#endif
-#endif
-
 /* General helper functions */
 void usage(const char *err) __noreturn;
-void die(const char *err, ...) __noreturn __attribute__((format (printf, 1, 2)));
-int error(const char *err, ...) __attribute__((format (printf, 1, 2)));
-void warning(const char *err, ...) __attribute__((format (printf, 1, 2)));
-
-void set_warning_routine(void (*routine)(const char *err, va_list params));
+void die(const char *err, ...) __noreturn __printf(1, 2);
 
 static inline void *zalloc(size_t size)
 {
@@ -43,7 +32,6 @@ struct strlist *lsdir(const char *name, bool (*filter)(const char *, struct dire
 bool lsdir_no_dot_filter(const char *name, struct dirent *d);
 int copyfile(const char *from, const char *to);
 int copyfile_mode(const char *from, const char *to, mode_t mode);
-int copyfile_offset(int fromfd, loff_t from_ofs, int tofd, loff_t to_ofs, u64 size);
 
 ssize_t readn(int fd, void *buf, size_t n);
 ssize_t writen(int fd, const void *buf, size_t n);
@@ -54,8 +42,6 @@ int hex2u64(const char *ptr, u64 *val);
 extern unsigned int page_size;
 extern int cacheline_size;
 
-bool find_process(const char *name);
-
 const char *perf_tip(const char *dirpath);
 
 #ifndef HAVE_SCHED_GETCPU_SUPPORT
@@ -65,5 +51,10 @@ int sched_getcpu(void);
 #ifndef HAVE_SETNS_SUPPORT
 int setns(int fd, int nstype);
 #endif
+
+extern bool perf_singlethreaded;
+
+void perf_set_singlethreaded(void);
+void perf_set_multithreaded(void);
 
 #endif /* GIT_COMPAT_UTIL_H */

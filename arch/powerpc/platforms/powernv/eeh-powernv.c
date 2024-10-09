@@ -16,7 +16,6 @@
 #include <linux/delay.h>
 #include <linux/export.h>
 #include <linux/init.h>
-#include <linux/interrupt.h>
 #include <linux/list.h>
 #include <linux/msi.h>
 #include <linux/of.h>
@@ -41,7 +40,6 @@
 #include "pci.h"
 
 static bool pnv_eeh_nb_init = false;
-static int eeh_event_irq = -EINVAL;
 
 /**
  * pnv_eeh_init - EEH platform dependent initialization
@@ -90,21 +88,33 @@ static int pnv_eeh_init(void)
 	return 0;
 }
 
-static irqreturn_t pnv_eeh_event(int irq, void *data)
+static int pnv_eeh_event(struct notifier_block *nb,
+			 unsigned long events, void *change)
 {
+	uint64_t changed_evts = (uint64_t)change;
+
 	/*
-	 * We simply send a special EEH event if EEH has been
-	 * enabled. We don't care about EEH events until we've
-	 * finished processing the outstanding ones. Event processing
-	 * gets unmasked in next_error() if EEH is enabled.
+	 * We simply send special EEH event if EEH has
+	 * been enabled, or clear pending events in
+	 * case that we enable EEH soon
 	 */
-	disable_irq_nosync(irq);
+	if (!(changed_evts & OPAL_EVENT_PCI_ERROR) ||
+	    !(events & OPAL_EVENT_PCI_ERROR))
+		return 0;
 
 	if (eeh_enabled())
 		eeh_send_failure_event(NULL);
+	else
+		opal_notifier_update_evt(OPAL_EVENT_PCI_ERROR, 0x0ul);
 
-	return IRQ_HANDLED;
+	return 0;
 }
+
+static struct notifier_block pnv_eeh_nb = {
+	.notifier_call	= pnv_eeh_event,
+	.next		= NULL,
+	.priority	= 0
+};
 
 #ifdef CONFIG_DEBUG_FS
 static ssize_t pnv_eeh_ei_write(struct file *filp,
@@ -227,27 +237,15 @@ static int pnv_eeh_post_init(void)
 
 	/* Register OPAL event notifier */
 	if (!pnv_eeh_nb_init) {
-		eeh_event_irq = opal_event_request(ilog2(OPAL_EVENT_PCI_ERROR));
-		if (eeh_event_irq < 0) {
-			pr_err("%s: Can't register OPAL event interrupt (%d)\n",
-			       __func__, eeh_event_irq);
-			return eeh_event_irq;
-		}
-
-		ret = request_irq(eeh_event_irq, pnv_eeh_event,
-				IRQ_TYPE_LEVEL_HIGH, "opal-eeh", NULL);
-		if (ret < 0) {
-			irq_dispose_mapping(eeh_event_irq);
-			pr_err("%s: Can't request OPAL event interrupt (%d)\n",
-			       __func__, eeh_event_irq);
+		ret = opal_notifier_register(&pnv_eeh_nb);
+		if (ret) {
+			pr_warn("%s: Can't register OPAL event notifier (%d)\n",
+				__func__, ret);
 			return ret;
 		}
 
 		pnv_eeh_nb_init = true;
 	}
-
-	if (!eeh_enabled())
-		disable_irq(eeh_event_irq);
 
 	list_for_each_entry(hose, &hose_list, list_node) {
 		phb = hose->private_data;
@@ -1443,10 +1441,12 @@ static int pnv_eeh_next_error(struct eeh_pe **pe)
 	int state, ret = EEH_NEXT_ERR_NONE;
 
 	/*
-	 * While running here, it's safe to purge the event queue. The
-	 * event should still be masked.
+	 * While running here, it's safe to purge the event queue.
+	 * And we should keep the cached OPAL notifier event sychronized
+	 * between the kernel and firmware.
 	 */
 	eeh_remove_event(NULL, false);
+	opal_notifier_update_evt(OPAL_EVENT_PCI_ERROR, 0x0ul);
 
 	list_for_each_entry(hose, &hose_list, list_node) {
 		/*
@@ -1614,10 +1614,6 @@ static int pnv_eeh_next_error(struct eeh_pe **pe)
 		if (ret > EEH_NEXT_ERR_INF)
 			break;
 	}
-
-	/* Unmask the event */
-	if (eeh_enabled())
-		enable_irq(eeh_event_irq);
 
 	return ret;
 }

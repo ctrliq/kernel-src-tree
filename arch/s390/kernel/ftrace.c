@@ -18,6 +18,8 @@
 
 void mcount_replace_code(void);
 void ftrace_disable_code(void);
+void mcount_replace_code_exrl(void);
+void ftrace_disable_code_exrl(void);
 void ftrace_enable_insn(void);
 
 #ifdef CONFIG_64BIT
@@ -52,6 +54,29 @@ void ftrace_enable_insn(void);
  * The jg instruction branches to offset 24 to skip as many instructions
  * as possible.
  */
+#ifdef CC_USING_EXPOLINE
+asm(
+	"	.align	4\n"
+	"mcount_replace_code:\n"
+	"	larl	%r0,0f\n"
+	"ftrace_disable_code:\n"
+	"	jg	0f\n"
+	"	ex	0,"__stringify(__LC_BR_R1)"\n"
+	"	j	.\n"
+	"	brc	0,0\n"
+	"0:\n"
+	"mcount_replace_code_exrl:\n"
+	"	larl	%r0,0f\n"
+	"ftrace_disable_code_exrl:\n"
+	"	jg	0f\n"
+	"	exrl	0,1f\n"
+	"	j	.\n"
+	"1:	br	1\n"
+	"0:\n"
+	"	.align	4\n"
+	"ftrace_enable_insn:\n"
+	"	lg	%r1,"__stringify(__LC_FTRACE_FUNC)"\n");
+#else
 asm(
 	"	.align	4\n"
 	"mcount_replace_code:\n"
@@ -65,6 +90,7 @@ asm(
 	"	.align	4\n"
 	"ftrace_enable_insn:\n"
 	"	lg	%r1,"__stringify(__LC_FTRACE_FUNC)"\n");
+#endif
 
 #define MCOUNT_BLOCK_SIZE	24
 #define MCOUNT_INSN_OFFSET	6
@@ -128,17 +154,27 @@ int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 int ftrace_make_nop(struct module *mod, struct dyn_ftrace *rec,
 		    unsigned long addr)
 {
+	void *replacement;
 #ifdef CONFIG_64BIT
 	/* Initial replacement of the whole mcount block */
 	if (addr == MCOUNT_ADDR) {
+		replacement = mcount_replace_code;
+#ifdef CC_USING_EXPOLINE
+		if (test_facility(35))
+			replacement = mcount_replace_code_exrl;
+#endif
 		if (probe_kernel_write((void *) rec->ip - MCOUNT_INSN_OFFSET,
-				       mcount_replace_code,
-				       MCOUNT_BLOCK_SIZE))
+				       replacement, MCOUNT_BLOCK_SIZE))
 			return -EPERM;
 		return 0;
 	}
 #endif
-	if (probe_kernel_write((void *) rec->ip, ftrace_disable_code,
+	replacement = ftrace_disable_code;
+#ifdef CC_USING_EXPOLINE
+	if (test_facility(35))
+		replacement = ftrace_disable_code_exrl;
+#endif
+	if (probe_kernel_write((void *) rec->ip, replacement,
 			       MCOUNT_INSN_SIZE))
 		return -EPERM;
 	return 0;

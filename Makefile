@@ -4,15 +4,15 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Unicycling Gorilla
 RHEL_MAJOR = 7
-RHEL_MINOR = 5
-RHEL_RELEASE = 862
+RHEL_MINOR = 6
+RHEL_RELEASE = 957
 
 #
 # DRM backport version
 #
 RHEL_DRM_VERSION = 4
-RHEL_DRM_PATCHLEVEL = 14
-RHEL_DRM_SUBLEVEL = 0
+RHEL_DRM_PATCHLEVEL = 17
+RHEL_DRM_SUBLEVEL = 19
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -682,10 +682,14 @@ KBUILD_CFLAGS 	+= $(call cc-option, -femit-struct-debug-baseonly) \
 endif
 
 ifdef CONFIG_FUNCTION_TRACER
+ifndef CC_FLAGS_FTRACE
+CC_FLAGS_FTRACE := -pg
+endif
+export CC_FLAGS_FTRACE
 ifdef CONFIG_HAVE_FENTRY
 CC_USING_FENTRY	:= $(call cc-option, -mfentry -DCC_USING_FENTRY)
 endif
-KBUILD_CFLAGS	+= -pg $(CC_USING_FENTRY)
+KBUILD_CFLAGS	+= $(CC_FLAGS_FTRACE) $(CC_USING_FENTRY)
 KBUILD_AFLAGS	+= $(CC_USING_FENTRY)
 ifdef CONFIG_DYNAMIC_FTRACE
 	ifdef CONFIG_HAVE_C_RECORDMCOUNT

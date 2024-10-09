@@ -1,6 +1,8 @@
 #ifndef TARGET_CORE_BACKEND_H
 #define TARGET_CORE_BACKEND_H
 
+#include <asm/unaligned.h>
+
 #define TRANSPORT_FLAG_PASSTHROUGH		0x1
 /*
  * ALUA commands, state checks and setup operations are handled by the
@@ -102,11 +104,20 @@ bool	target_lun_is_rdonly(struct se_cmd *);
 sense_reason_t passthrough_parse_cdb(struct se_cmd *cmd,
 	sense_reason_t (*exec_cmd)(struct se_cmd *cmd));
 
-struct	se_device *target_find_device(int id, bool do_depend);
-
 bool target_sense_desc_format(struct se_device *dev);
 sector_t target_to_linux_sector(struct se_device *dev, sector_t lb);
 bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
 				       struct request_queue *q);
+
+static inline bool target_dev_configured(struct se_device *se_dev)
+{
+	return !!(se_dev->dev_flags & DF_CONFIGURED);
+}
+
+/* Only use get_unaligned_be24() if reading p - 1 is allowed. */
+static inline uint32_t get_unaligned_be24(const uint8_t *const p)
+{
+	return get_unaligned_be32(p - 1) & 0xffffffU;
+}
 
 #endif /* TARGET_CORE_BACKEND_H */

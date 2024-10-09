@@ -211,7 +211,7 @@
 #define X86_CR3_PCID_MASK       (X86_CR3_PCID_NOFLUSH | X86_CR3_PCID_ASID_MASK)
 
 /* Make sure this is only usable in KAISER #ifdef'd code: */
-#ifdef CONFIG_KAISER
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
 #define X86_CR3_KAISER_SWITCH_BIT 11
 #endif
 
@@ -260,7 +260,7 @@ enum page_cache_mode {
  * __PAGE_KERNEL* macros.  PGE will still be enabled
  * and _PAGE_GLOBAL may still be used carefully.
  */
-#ifdef CONFIG_KAISER
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
 #define __PAGE_KERNEL_GLOBAL	0
 #else
 #define __PAGE_KERNEL_GLOBAL	_PAGE_GLOBAL

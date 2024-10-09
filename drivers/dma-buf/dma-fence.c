@@ -27,7 +27,6 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/dma_fence.h>
 
-EXPORT_TRACEPOINT_SYMBOL(dma_fence_annotate_wait_on);
 EXPORT_TRACEPOINT_SYMBOL(dma_fence_emit);
 EXPORT_TRACEPOINT_SYMBOL(dma_fence_enable_signal);
 
@@ -172,6 +171,7 @@ void dma_fence_release(struct kref *kref)
 
 	trace_dma_fence_destroy(fence);
 
+	/* Failed to signal before release, could be a refcounting issue */
 	WARN_ON(!list_empty(&fence->cb_list));
 
 	if (fence->ops->release)

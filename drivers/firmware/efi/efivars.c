@@ -69,6 +69,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/ucs2_string.h>
+#include <linux/mutex.h>
 
 #define EFIVARS_VERSION "0.08"
 #define EFIVARS_DATE "2004-May-17"
@@ -133,9 +134,14 @@ efivar_attr_read(struct efivar_entry *entry, char *buf)
 	if (!entry || !buf)
 		return -EINVAL;
 
+	mutex_lock(&entry->var_data_mutex);
+
 	var->DataSize = 1024;
-	if (efivar_entry_get(entry, &var->Attributes, &var->DataSize, var->Data))
+	if (efivar_entry_get(entry, &var->Attributes,
+			     &var->DataSize, var->Data)) {
+		mutex_unlock(&entry->var_data_mutex);
 		return -EIO;
+	}
 
 	if (var->Attributes & EFI_VARIABLE_NON_VOLATILE)
 		str += sprintf(str, "EFI_VARIABLE_NON_VOLATILE\n");
@@ -154,6 +160,8 @@ efivar_attr_read(struct efivar_entry *entry, char *buf)
 			"EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS\n");
 	if (var->Attributes & EFI_VARIABLE_APPEND_WRITE)
 		str += sprintf(str, "EFI_VARIABLE_APPEND_WRITE\n");
+
+	mutex_unlock(&entry->var_data_mutex);
 	return str - buf;
 }
 
@@ -166,11 +174,18 @@ efivar_size_read(struct efivar_entry *entry, char *buf)
 	if (!entry || !buf)
 		return -EINVAL;
 
+	mutex_lock(&entry->var_data_mutex);
+
 	var->DataSize = 1024;
-	if (efivar_entry_get(entry, &var->Attributes, &var->DataSize, var->Data))
+	if (efivar_entry_get(entry, &var->Attributes,
+			     &var->DataSize, var->Data)) {
+		mutex_unlock(&entry->var_data_mutex);
 		return -EIO;
+	}
 
 	str += sprintf(str, "0x%lx\n", var->DataSize);
+
+	mutex_unlock(&entry->var_data_mutex);
 	return str - buf;
 }
 
@@ -178,16 +193,25 @@ static ssize_t
 efivar_data_read(struct efivar_entry *entry, char *buf)
 {
 	struct efi_variable *var = &entry->var;
+	ssize_t ret;
 
 	if (!entry || !buf)
 		return -EINVAL;
 
+	mutex_lock(&entry->var_data_mutex);
+
 	var->DataSize = 1024;
-	if (efivar_entry_get(entry, &var->Attributes, &var->DataSize, var->Data))
+	if (efivar_entry_get(entry, &var->Attributes,
+			     &var->DataSize, var->Data)) {
+		mutex_unlock(&entry->var_data_mutex);
 		return -EIO;
+	}
 
 	memcpy(buf, var->Data, var->DataSize);
-	return var->DataSize;
+	ret = var->DataSize;
+
+	mutex_unlock(&entry->var_data_mutex);
+	return ret;
 }
 /*
  * We allow each variable to be edited via rewriting the
@@ -224,10 +248,12 @@ efivar_store_raw(struct efivar_entry *entry, const char *buf, size_t count)
 		return -EINVAL;
 	}
 
+	mutex_lock(&entry->var_data_mutex);
 	memcpy(&entry->var, new_var, count);
 
 	err = efivar_entry_set(entry, new_var->Attributes,
 			       new_var->DataSize, new_var->Data, NULL);
+	mutex_unlock(&entry->var_data_mutex);
 	if (err) {
 		printk(KERN_WARNING "efivars: set_variable() failed: status=%d\n", err);
 		return -EIO;
@@ -244,13 +270,18 @@ efivar_show_raw(struct efivar_entry *entry, char *buf)
 	if (!entry || !buf)
 		return 0;
 
+	mutex_lock(&entry->var_data_mutex);
+
 	var->DataSize = 1024;
 	if (efivar_entry_get(entry, &entry->var.Attributes,
-			     &entry->var.DataSize, entry->var.Data))
+			     &entry->var.DataSize, entry->var.Data)) {
+		mutex_unlock(&entry->var_data_mutex);
 		return -EIO;
+	}
 
 	memcpy(buf, var, sizeof(*var));
 
+	mutex_unlock(&entry->var_data_mutex);
 	return sizeof(*var);
 }
 
@@ -345,6 +376,13 @@ static ssize_t efivar_create(struct file *filp, struct kobject *kobj,
 
 	memcpy(&new_entry->var, new_var, sizeof(*new_var));
 
+	mutex_init(&new_entry->var_data_mutex);
+
+	/*
+	 * No need to take the var_data_mutex since new_entry is not visible
+	 * to other threads until inserted into the efivar_sysfs_list by
+	 * efivar_create_sysfs_entry().
+	 */
 	err = efivar_entry_set(new_entry, new_var->Attributes, new_var->DataSize,
 			       new_var->Data, &efivar_sysfs_list);
 	if (err) {
@@ -533,6 +571,13 @@ static void efivar_update_sysfs_entries(struct work_struct *work)
 		if (!entry)
 			return;
 
+		mutex_init(&entry->var_data_mutex);
+
+		/*
+		 * No need to take the var_data_mutex since new_entry is
+		 * not visible to other threads until inserted into the
+		 * efivar_sysfs_list by efivar_create_sysfs_entry().
+		 */
 		err = efivar_init(efivar_update_sysfs_entry, entry,
 				  true, false, &efivar_sysfs_list);
 		if (!err)
@@ -556,6 +601,13 @@ static int efivars_sysfs_callback(efi_char16_t *name, efi_guid_t vendor,
 	memcpy(entry->var.VariableName, name, name_size);
 	memcpy(&(entry->var.VendorGuid), &vendor, sizeof(efi_guid_t));
 
+	mutex_init(&entry->var_data_mutex);
+
+	/*
+	 * No need to take the var_data_mutex since new_entry is not visible
+	 * to other threads until inserted into the efivar_sysfs_list by
+	 * efivar_create_sysfs_entry().
+	 */
 	efivar_create_sysfs_entry(entry);
 
 	return 0;

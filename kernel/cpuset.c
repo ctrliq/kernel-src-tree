@@ -973,7 +973,7 @@ static void update_cpumasks_hier(struct cpuset *cs, struct cpumask *new_cpus,
 		 * If it becomes empty, inherit the effective mask of the
 		 * parent, which is guaranteed to have some CPUs.
 		 */
-		if (cgroup_on_dfl(cp->css.cgroup) && cpumask_empty(new_cpus))
+		if (cpumask_empty(new_cpus))
 			cpumask_copy(new_cpus, parent->effective_cpus);
 
 		/* skip the whole subtree if the cpumask remains the same. */
@@ -1275,7 +1275,7 @@ static void update_nodemasks_hier(struct cpuset *cs, nodemask_t *new_mems,
 		 * If it becomes empty, inherit the effective mask of the
 		 * parent, which is guaranteed to have some MEMs.
 		 */
-		if (cgroup_on_dfl(cp->css.cgroup) && nodes_empty(*new_mems))
+		if (nodes_empty(*new_mems))
 			*new_mems = parent->effective_mems;
 
 		/* skip the whole subtree if @cp have some CPU */

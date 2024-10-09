@@ -572,7 +572,6 @@ static struct desc_struct *get_desc(unsigned short sel)
 	struct desc_ptr gdt_desc = {0, 0};
 	unsigned long desc_base;
 
-#ifdef CONFIG_MODIFY_LDT_SYSCALL
 	if ((sel & SEGMENT_TI_MASK) == SEGMENT_LDT) {
 		struct desc_struct *desc = NULL;
 		struct ldt_struct *ldt;
@@ -582,14 +581,14 @@ static struct desc_struct *get_desc(unsigned short sel)
 
 		mutex_lock(&current->active_mm->context.lock);
 		ldt = current->active_mm->context.ldt;
-		if (ldt && sel < ldt->nr_entries)
+		if (ldt && sel < ldt->size)
 			desc = &ldt->entries[sel];
 
 		mutex_unlock(&current->active_mm->context.lock);
 
 		return desc;
 	}
-#endif
+
 	native_store_gdt(&gdt_desc);
 
 	/*

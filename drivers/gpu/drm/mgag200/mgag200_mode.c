@@ -1620,8 +1620,8 @@ static int mga_vga_mode_valid(struct drm_connector *connector,
 			return MODE_VIRTUAL_X;
 		if (mode->vdisplay > 1024)
 			return MODE_VIRTUAL_Y;
-		if (mga_vga_calculate_mode_bandwidth(mode,
-			bpp > (31877 * 1024)))
+		if (mga_vga_calculate_mode_bandwidth(mode, bpp) >
+		    (31877 * 1024))
 			return MODE_BANDWIDTH;
 	} else if (mdev->type == G200_EV &&
 		(mga_vga_calculate_mode_bandwidth(mode, bpp)
@@ -1670,7 +1670,7 @@ static struct drm_encoder *mga_connector_best_encoder(struct drm_connector
 	int enc_id = connector->encoder_ids[0];
 	/* pick the encoder ids */
 	if (enc_id)
-		return drm_encoder_find(connector->dev, enc_id);
+		return drm_encoder_find(connector->dev, NULL, enc_id);
 	return NULL;
 }
 

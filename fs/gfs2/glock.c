@@ -126,10 +126,13 @@ static void gfs2_glock_dealloc(struct rcu_head *rcu)
 {
 	struct gfs2_glock *gl = container_of(rcu, struct gfs2_glock, gl_rcu);
 
+	if (gl->gl_ops->go_flags & GLOF_LVB) {
+		kfree(gl->gl_lksb.sb_lvbptr);
+		gl->gl_lksb.sb_lvbptr = NULL;
+	}
 	if (gl->gl_ops->go_flags & GLOF_ASPACE) {
 		kmem_cache_free(gfs2_glock_aspace_cachep, gl);
 	} else {
-		kfree(gl->gl_lksb.sb_lvbptr);
 		kmem_cache_free(gfs2_glock_cachep, gl);
 	}
 }

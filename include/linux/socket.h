@@ -325,6 +325,14 @@ extern int memcpy_toiovecend(const struct iovec *v, unsigned char *kdata,
 			     int offset, int len);
 extern int memcpy_toiovecend_partial(const struct iovec *v,
 				     unsigned char *kdata, int offset, int len);
+
+#ifdef CONFIG_ARCH_HAS_UACCESS_MCSAFE
+int memcpy_toiovecend_partial_mcsafe(const struct iovec *v, unsigned char *kdata,
+				     int offset, int len);
+#else
+#define memcpy_toiovecend_partial_mcsafe memcpy_toiovecend_partial
+#endif
+
 extern int move_addr_to_kernel(void __user *uaddr, int ulen, struct sockaddr_storage *kaddr);
 extern int put_cmsg(struct msghdr*, int level, int type, int len, void *data);
 

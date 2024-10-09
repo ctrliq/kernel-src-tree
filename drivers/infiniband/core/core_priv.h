@@ -39,6 +39,7 @@
 #include <rdma/ib_verbs.h>
 #include <rdma/opa_addr.h>
 #include <rdma/ib_mad.h>
+#include <rdma/restrack.h>
 #include "mad_priv.h"
 
 /* Total number of ports combined across all struct ib_devices's */
@@ -139,7 +140,6 @@ int ib_cache_gid_del_all_netdev_gids(struct ib_device *ib_dev, u8 port,
 int roce_gid_mgmt_init(void);
 void roce_gid_mgmt_cleanup(void);
 
-void roce_rescan_device(struct ib_device *ib_dev);
 unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port);
 
 int ib_cache_setup_one(struct ib_device *device);
@@ -163,13 +163,6 @@ void ib_sa_cleanup(void);
 
 int rdma_nl_init(void);
 void rdma_nl_exit(void);
-
-/**
- * Check if there are any listeners to the netlink group
- * @group: the netlink group ID
- * Returns 0 on success or a negative for no listeners.
- */
-int ibnl_chk_listeners(unsigned int group);
 
 int ib_nl_handle_resolve_resp(struct sk_buff *skb,
 			      struct nlmsghdr *nlh);
@@ -279,7 +272,8 @@ void nldev_exit(void);
 static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
 					  struct ib_pd *pd,
 					  struct ib_qp_init_attr *attr,
-					  struct ib_udata *udata)
+					  struct ib_udata *udata,
+					  struct ib_uobject *uobj)
 {
 	struct ib_qp *qp;
 
@@ -292,6 +286,7 @@ static inline struct ib_qp *_ib_create_qp(struct ib_device *dev,
 
 	qp->device = dev;
 	qp->pd = pd;
+	qp->uobject = uobj;
 	/*
 	 * We don't track XRC QPs for now, because they don't have PD
 	 * and more importantly they are created internaly by driver,

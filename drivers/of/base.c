@@ -178,6 +178,7 @@ static ssize_t of_node_property_read(struct file *filp, struct kobject *kobj,
 	return memory_read_from_buffer(buf, count, &offset, pp->value, pp->length);
 }
 
+/* always return newly allocated name, caller must free after use */
 static const char *safe_name(struct kobject *kobj, const char *orig_name)
 {
 	const char *name = orig_name;
@@ -192,9 +193,12 @@ static const char *safe_name(struct kobject *kobj, const char *orig_name)
 		name = kasprintf(GFP_KERNEL, "%s#%i", orig_name, ++i);
 	}
 
-	if (name != orig_name)
+	if (name == orig_name) {
+		name = kstrdup(orig_name, GFP_KERNEL);
+	} else {
 		pr_warn("device-tree: Duplicate name in %s, renamed to \"%s\"\n",
 			kobject_name(kobj), name);
+	}
 	return name;
 }
 
@@ -219,20 +223,23 @@ static int __of_add_property_sysfs(struct device_node *np, struct property *pp)
 static int __of_node_add(struct device_node *np)
 {
 	const char *name;
+	struct kobject *parent;
 	struct property *pp;
 	int rc;
 
 	np->kobj.kset = of_kset;
 	if (!np->parent) {
 		/* Nodes without parents are new top level trees */
-		rc = kobject_add(&np->kobj, NULL, safe_name(&of_kset->kobj, "base"));
+		name = safe_name(&of_kset->kobj, "base");
+		parent = NULL;
 	} else {
 		name = safe_name(&np->parent->kobj, kbasename(np->full_name));
-		if (!name || !name[0])
-			return -EINVAL;
-
-		rc = kobject_add(&np->kobj, &np->parent->kobj, "%s", name);
+		parent = &np->parent->kobj;
 	}
+	if (!name)
+		return -ENOMEM;
+	rc = kobject_add(&np->kobj, parent, "%s", name);
+	kfree(name);
 	if (rc)
 		return rc;
 
@@ -272,7 +279,7 @@ static void of_node_remove(struct device_node *np)
 	/* only remove properties if on sysfs */
 	if (of_node_is_attached(np)) {
 		for_each_property_of_node(np, pp)
-			sysfs_remove_bin_file(&np->kobj, &pp->attr);
+			__of_sysfs_remove_bin_file(np, pp);
 		kobject_del(&np->kobj);
 	}
 
@@ -1541,6 +1548,12 @@ int of_add_property(struct device_node *np, struct property *prop)
 	return 0;
 }
 
+void __of_sysfs_remove_bin_file(struct device_node *np, struct property *prop)
+{
+	sysfs_remove_bin_file(&np->kobj, &prop->attr);
+	kfree(prop->attr.attr.name);
+}
+
 /**
  * of_remove_property - Remove a property from a node.
  *
@@ -1582,7 +1595,7 @@ int of_remove_property(struct device_node *np, struct property *prop)
 	if (!of_kset)
 		return 0;
 
-	sysfs_remove_bin_file(&np->kobj, &prop->attr);
+	__of_sysfs_remove_bin_file(np, prop);
 
 #ifdef CONFIG_PROC_DEVICETREE
 	/* try to remove the proc node as well */
@@ -1639,7 +1652,7 @@ int of_update_property(struct device_node *np, struct property *newprop)
 
 	/* Update the sysfs attribute */
 	if (oldprop)
-		sysfs_remove_bin_file(&np->kobj, &oldprop->attr);
+		__of_sysfs_remove_bin_file(np, oldprop);
 	__of_add_property_sysfs(np, newprop);
 
 	if (!found)

@@ -63,7 +63,7 @@ void rdt_last_cmd_clear(void)
 void rdt_last_cmd_puts(const char *s)
 {
 	lockdep_assert_held(&rdtgroup_mutex);
-	seq_buf_puts(&last_cmd_status, s);
+	seq_buf_printf(&last_cmd_status, "%s", s);
 }
 
 void rdt_last_cmd_printf(const char *fmt, ...)
@@ -1213,6 +1213,7 @@ static struct dentry *rdt_mount(struct file_system_type *fs_type,
 	struct dentry *dentry;
 	int ret;
 
+	get_online_cpus();
 	mutex_lock(&rdtgroup_mutex);
 	/*
 	 * resctrl file system can only be mounted once.
@@ -1290,6 +1291,7 @@ out_cdp:
 out:
 	rdt_last_cmd_clear();
 	mutex_unlock(&rdtgroup_mutex);
+	put_online_cpus();
 
 	return dentry;
 }
@@ -1428,9 +1430,7 @@ static void rmdir_all_sub(void)
 		kfree(rdtgrp);
 	}
 	/* Notify online CPUs to update per cpu storage and PQR_ASSOC MSR */
-	get_online_cpus();
 	update_closid_rmid(cpu_online_mask, &rdtgroup_default);
-	put_online_cpus();
 
 	kernfs_remove(kn_info);
 	kernfs_remove(kn_mongrp);
@@ -1441,6 +1441,7 @@ static void rdt_kill_sb(struct super_block *sb)
 {
 	struct rdt_resource *r;
 
+	get_online_cpus();
 	mutex_lock(&rdtgroup_mutex);
 
 	/*Put everything back to default values. */
@@ -1456,6 +1457,7 @@ static void rdt_kill_sb(struct super_block *sb)
 		static_key_slow_dec(&rdt_enable_key);
 	kernfs_kill_sb(sb);
 	mutex_unlock(&rdtgroup_mutex);
+	put_online_cpus();
 }
 
 static struct file_system_type rdt_fs_type = {

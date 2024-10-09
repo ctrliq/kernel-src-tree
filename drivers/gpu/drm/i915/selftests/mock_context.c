@@ -73,11 +73,7 @@ err_put:
 
 void mock_context_close(struct i915_gem_context *ctx)
 {
-	i915_gem_context_set_closed(ctx);
-
-	i915_ppgtt_close(&ctx->ppgtt->base);
-
-	i915_gem_context_put(ctx);
+	context_close(ctx);
 }
 
 void mock_init_contexts(struct drm_i915_private *i915)
@@ -95,4 +91,15 @@ live_context(struct drm_i915_private *i915, struct drm_file *file)
 	lockdep_assert_held(&i915->drm.struct_mutex);
 
 	return i915_gem_create_context(i915, file->driver_priv);
+}
+
+struct i915_gem_context *
+kernel_context(struct drm_i915_private *i915)
+{
+	return i915_gem_context_create_kernel(i915, I915_PRIORITY_NORMAL);
+}
+
+void kernel_context_close(struct i915_gem_context *ctx)
+{
+	context_close(ctx);
 }

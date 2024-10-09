@@ -404,7 +404,7 @@ int nvdimm_bus_add_badrange(struct nvdimm_bus *nvdimm_bus, u64 addr, u64 length)
 }
 EXPORT_SYMBOL_GPL(nvdimm_bus_add_badrange);
 
-#ifdef CONFIG_BLK_DEV_INTEGRITY
+#ifdef CONFIG_BLK_DEV_INTEGRITY__BROKEN__
 static void nd_pi_nop_generate(struct blk_integrity_exchg *bix)
 {
 	return;
@@ -438,7 +438,7 @@ int nd_integrity_init(struct gendisk *disk, unsigned long meta_size)
 }
 EXPORT_SYMBOL(nd_integrity_init);
 
-#else /* CONFIG_BLK_DEV_INTEGRITY */
+#else /* CONFIG_BLK_DEV_INTEGRITY__BROKEN__ */
 int nd_integrity_init(struct gendisk *disk, unsigned long meta_size)
 {
 	return 0;

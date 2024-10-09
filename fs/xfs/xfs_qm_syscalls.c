@@ -408,7 +408,7 @@ xfs_qm_scall_getqstat(
 	memset(out, 0, sizeof(fs_quota_stat_t));
 
 	out->qs_version = FS_QSTAT_VERSION;
-	out->qs_flags = (__uint16_t) xfs_qm_export_flags(mp->m_qflags &
+	out->qs_flags = (uint16_t) xfs_qm_export_flags(mp->m_qflags &
 							(XFS_ALL_QUOTA_ACCT|
 							 XFS_ALL_QUOTA_ENFD));
 	uip = q->qi_uquotaip;
@@ -486,7 +486,7 @@ xfs_qm_scall_getqstatv(
 	bool                    tempgqip = false;
 	bool                    temppqip = false;
 
-	out->qs_flags = (__uint16_t) xfs_qm_export_flags(mp->m_qflags &
+	out->qs_flags = (uint16_t) xfs_qm_export_flags(mp->m_qflags &
 							(XFS_ALL_QUOTA_ACCT|
 							 XFS_ALL_QUOTA_ENFD));
 	out->qs_uquota.qfs_ino = mp->m_sb.sb_uquotino;

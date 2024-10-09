@@ -2437,8 +2437,14 @@ static int __init init_btrfs_fs(void)
 	if (err)
 		goto unregister_ioctl;
 
+	err = register_fo_extend(&btrfs_file_operations);
+	if (err)
+		goto unregister_fs;
+
 	return 0;
 
+unregister_fs:
+	unregister_filesystem(&btrfs_fs_type);
 unregister_ioctl:
 	btrfs_interface_exit();
 free_end_io_wq:
@@ -2479,6 +2485,7 @@ static void __exit exit_btrfs_fs(void)
 	extent_io_exit();
 	btrfs_interface_exit();
 	btrfs_end_io_wq_exit();
+	unregister_fo_extend(&btrfs_file_operations);
 	unregister_filesystem(&btrfs_fs_type);
 	btrfs_exit_sysfs();
 	btrfs_cleanup_fs_uuids();

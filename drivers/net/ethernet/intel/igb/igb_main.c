@@ -1,26 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Intel(R) Gigabit Ethernet Linux driver
- * Copyright(c) 2007-2014 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program; if not, see <http://www.gnu.org/licenses/>.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- */
+/* Copyright(c) 2007 - 2018 Intel Corporation. */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -147,8 +126,8 @@ static void igb_clean_all_rx_rings(struct igb_adapter *);
 static void igb_clean_tx_ring(struct igb_ring *);
 static void igb_clean_rx_ring(struct igb_ring *);
 static void igb_set_rx_mode(struct net_device *);
-static void igb_update_phy_info(unsigned long);
-static void igb_watchdog(unsigned long);
+static void igb_update_phy_info(struct timer_list *);
+static void igb_watchdog(struct timer_list *);
 static void igb_watchdog_task(struct work_struct *);
 static netdev_tx_t igb_xmit_frame(struct sk_buff *skb, struct net_device *);
 static void igb_get_stats64(struct net_device *dev,
@@ -766,7 +745,7 @@ static void igb_cache_ring_register(struct igb_adapter *adapter)
 u32 igb_rd32(struct e1000_hw *hw, u32 reg)
 {
 	struct igb_adapter *igb = container_of(hw, struct igb_adapter, hw);
-	u8 __iomem *hw_addr = ACCESS_ONCE(hw->hw_addr);
+	u8 __iomem *hw_addr = READ_ONCE(hw->hw_addr);
 	u32 value = 0;
 
 	if (E1000_REMOVED(hw_addr))
@@ -2517,12 +2496,24 @@ static int igb_offload_cbs(struct igb_adapter *adapter,
 #define ETHER_TYPE_FULL_MASK ((__force __be16)~0)
 #define VLAN_PRIO_FULL_MASK (0x07)
 
+/* RHEL 7: We don't have a struct netlink_ext_ack and so we don't have the
+   tc_cls_common_offload::extack member (yet?) Fortunately this member is
+   only used to store an error message here.  Override the usage for now. */
+#ifdef NL_SET_ERR_MSG_MOD
+#error "Remove NL_SET_ERR_MSG_MOD override"
+#else
+#define __rhel7_no_netlink_ext_ack
+#define NL_SET_ERR_MSG_MOD(_e,_m) netdev_err(adapter->netdev, (_m))
+#endif
+
 static int igb_parse_cls_flower(struct igb_adapter *adapter,
 				struct tc_cls_flower_offload *f,
 				int traffic_class,
 				struct igb_nfc_filter *input)
 {
+#ifndef __rhel7_no_netlink_ext_ack
 	struct netlink_ext_ack *extack = f->common.extack;
+#endif
 
 	if (f->dissector->used_keys &
 	    ~(BIT(FLOW_DISSECTOR_KEY_BASIC) |
@@ -2618,7 +2609,9 @@ static int igb_parse_cls_flower(struct igb_adapter *adapter,
 static int igb_configure_clsflower(struct igb_adapter *adapter,
 				   struct tc_cls_flower_offload *cls_flower)
 {
+#ifndef __rhel7_no_netlink_ext_ack
 	struct netlink_ext_ack *extack = cls_flower->common.extack;
+#endif
 	struct igb_nfc_filter *filter, *f;
 	int err, tc;
 
@@ -2764,7 +2757,7 @@ static int igb_setup_tc(struct net_device *dev, enum tc_setup_type type,
 	struct igb_adapter *adapter = netdev_priv(dev);
 
 	switch (type) {
-	case TC_SETUP_CBS:
+	case TC_SETUP_QDISC_CBS:
 		return igb_offload_cbs(adapter, type_data);
 	case TC_SETUP_BLOCK:
 		return igb_setup_tc_block(adapter, type_data);
@@ -2792,7 +2785,7 @@ static const struct net_device_ops igb_netdev_ops = {
 	.extended.ndo_set_vf_vlan	= igb_ndo_set_vf_vlan,
 	.ndo_set_vf_rate	= igb_ndo_set_vf_bw,
 	.ndo_set_vf_spoofchk	= igb_ndo_set_vf_spoofchk,
-	.ndo_set_vf_trust	= igb_ndo_set_vf_trust,
+	.extended.ndo_set_vf_trust	= igb_ndo_set_vf_trust,
 	.ndo_get_vf_config	= igb_ndo_get_vf_config,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= igb_netpoll,
@@ -2801,7 +2794,7 @@ static const struct net_device_ops igb_netdev_ops = {
 	.ndo_set_features	= igb_set_features,
 	.ndo_fdb_add		= igb_ndo_fdb_add,
 	.ndo_features_check	= igb_features_check,
-	.ndo_setup_tc		= igb_setup_tc,
+	.extended.ndo_setup_tc_rh	= igb_setup_tc,
 };
 
 /**
@@ -3168,10 +3161,8 @@ static int igb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		wr32(E1000_TXPBS, I210_TXPBSIZE_DEFAULT);
 	}
 
-	setup_timer(&adapter->watchdog_timer, igb_watchdog,
-		    (unsigned long) adapter);
-	setup_timer(&adapter->phy_info_timer, igb_update_phy_info,
-		    (unsigned long) adapter);
+	timer_setup(&adapter->watchdog_timer, igb_watchdog, 0);
+	timer_setup(&adapter->phy_info_timer, igb_update_phy_info, 0);
 
 	INIT_WORK(&adapter->reset_task, igb_reset_task);
 	INIT_WORK(&adapter->watchdog_task, igb_watchdog_task);
@@ -5064,9 +5055,9 @@ static void igb_spoof_check(struct igb_adapter *adapter)
 /* Need to wait a few seconds after link up to get diagnostic information from
  * the phy
  */
-static void igb_update_phy_info(unsigned long data)
+static void igb_update_phy_info(struct timer_list *t)
 {
-	struct igb_adapter *adapter = (struct igb_adapter *) data;
+	struct igb_adapter *adapter = from_timer(adapter, t, phy_info_timer);
 	igb_get_phy_info(&adapter->hw);
 }
 
@@ -5153,9 +5144,9 @@ static void igb_check_lvmmc(struct igb_adapter *adapter)
  *  igb_watchdog - Timer Call-back
  *  @data: pointer to adapter cast into an unsigned long
  **/
-static void igb_watchdog(unsigned long data)
+static void igb_watchdog(struct timer_list *t)
 {
-	struct igb_adapter *adapter = (struct igb_adapter *)data;
+	struct igb_adapter *adapter = from_timer(adapter, t, watchdog_timer);
 	/* Do the rest outside of interrupt context */
 	schedule_work(&adapter->watchdog_task);
 }

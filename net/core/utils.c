@@ -30,7 +30,9 @@
 
 #include <net/sock.h>
 #include <net/net_ratelimit.h>
+#ifndef __GENKSYMS__
 #include <net/ipv6.h>
+#endif
 
 #include <asm/byteorder.h>
 #include <asm/uaccess.h>

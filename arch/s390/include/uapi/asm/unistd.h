@@ -289,6 +289,7 @@
 /* Number 351 is reserved for sys_bpf */
 #define __NR_s390_pci_mmio_write	352
 #define __NR_s390_pci_mmio_read		353
+#define __NR_membarrier		356
 #define __NR_socket		359
 #define __NR_bind		361
 #define __NR_connect		362
@@ -299,11 +300,14 @@
 #define __NR_recvfrom		371
 #define __NR_recvmsg		372
 #define __NR_shutdown		373
+#define __NR_mlock2		374
 #define __NR_copy_file_range	375
 /* Number 376 is reserved for sys_preadv2 */
 /* Number 377 is reserved for sys_pwritev2 */
 #define __NR_s390_guarded_storage	378
-#define NR_syscalls 379
+/* Number 379 is reserved for sys_statx */
+#define __NR_s390_sthyi		380
+#define NR_syscalls 381
 
 /* 
  * There are some system calls that are not present on 64 bit, some

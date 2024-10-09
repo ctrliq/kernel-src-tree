@@ -179,7 +179,7 @@ long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
 			break;
 		ret = 0;
 		if (access_process_vm(child, (u64)addrOthers, &tmp,
-					sizeof(tmp), 1) == sizeof(tmp))
+					sizeof(tmp), FOLL_WRITE) == sizeof(tmp))
 			break;
 		ret = -EIO;
 		break;

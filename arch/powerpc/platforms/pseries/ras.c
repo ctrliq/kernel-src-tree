@@ -219,8 +219,8 @@ static irqreturn_t ras_hotplug_interrupt(int irq, void *dev_id)
 	 * Since PCI hotplug is not currently supported on pseries, put PCI
 	 * hotplug events on the ras_log_buf to be handled by rtas_errd.
 	 */
-	if (hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_MEM)
-	    /* RHEL-only: Disabled: hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_CPU) */
+	if (hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_MEM ||
+	    hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_CPU)
 		queue_hotplug_event(hp_elog, NULL, NULL);
 	else
 		log_error(ras_log_buf, ERR_TYPE_RTAS_LOG, 0);

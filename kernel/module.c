@@ -2990,7 +2990,7 @@ static int check_modinfo(struct module *mod, struct load_info *info, int flags)
 
 static int find_module_sections(struct module *mod, struct load_info *info)
 {
-#ifdef CONFIG_S390
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && !defined(CONFIG_X86_64)
 	struct module_ext *mod_ext;
 #endif
 
@@ -3057,19 +3057,19 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 					 &mod->num_trace_bprintk_fmt);
 #endif
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
-#ifdef CONFIG_S390
+#ifdef CONFIG_X86_64
+	/* sechdrs[0].sh_size is always zero */
+	mod->ftrace_callsites = section_objs(info, "__mcount_loc",
+					     sizeof(*mod->ftrace_callsites),
+					     &mod->num_ftrace_callsites);
+#else /* !CONFIG_X86_64 */
 	mutex_lock(&module_ext_mutex);
 	mod_ext = find_module_ext(mod);
 	mod_ext->ftrace_callsites = section_objs(info, "__mcount_loc",
 					     sizeof(*mod_ext->ftrace_callsites),
 					     &mod_ext->num_ftrace_callsites);
 	mutex_unlock(&module_ext_mutex);
-#else /* CONFIG_S390 */
-	/* sechdrs[0].sh_size is always zero */
-	mod->ftrace_callsites = section_objs(info, "__mcount_loc",
-					     sizeof(*mod->ftrace_callsites),
-					     &mod->num_ftrace_callsites);
-#endif /* CONFIG_S390 */
+#endif /* CONFIG_X86_64 */
 #endif /* CONFIG_FTRACE_MCOUNT_RECORD */
 
 	mod->extable = section_objs(info, "__ex_table",
@@ -3596,6 +3596,11 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		mod_ext->klp = true;
 		add_taint_module(mod, TAINT_LIVEPATCH, LOCKDEP_STILL_OK);
 	}
+#endif
+
+#ifdef CONFIG_MPROFILE_KERNEL
+	if (get_modinfo(info, "mprofile"))
+		mod_ext->mprofile_kernel = true;
 #endif
 
 	/* Now we've got everything in the final locations, we can

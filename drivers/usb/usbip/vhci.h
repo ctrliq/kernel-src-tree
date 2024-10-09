@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2003-2008 Takahiro Hirofuchi
  * Copyright (C) 2015 Nobuo Iwata
@@ -66,12 +67,20 @@ struct vhci_unlink {
 	unsigned long unlink_seqnum;
 };
 
+enum hub_speed {
+	HUB_SPEED_HIGH = 0,
+	HUB_SPEED_SUPER,
+};
+
 /* Number of supported ports. Value has an upperbound of USB_MAXCHILDREN */
 #ifdef CONFIG_USBIP_VHCI_HC_PORTS
 #define VHCI_HC_PORTS CONFIG_USBIP_VHCI_HC_PORTS
 #else
 #define VHCI_HC_PORTS 8
 #endif
+
+/* Each VHCI has 2 hubs (USB2 and USB3), each has VHCI_HC_PORTS ports */
+#define VHCI_PORTS	(VHCI_HC_PORTS*2)
 
 #ifdef CONFIG_USBIP_VHCI_NR_HCS
 #define VHCI_NR_HCS CONFIG_USBIP_VHCI_NR_HCS
@@ -134,7 +143,7 @@ static inline __u32 port_to_rhport(__u32 port)
 
 static inline int port_to_pdev_nr(__u32 port)
 {
-	return port / VHCI_HC_PORTS;
+	return port / VHCI_PORTS;
 }
 
 static inline struct vhci_hcd *hcd_to_vhci_hcd(struct usb_hcd *hcd)

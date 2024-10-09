@@ -8,6 +8,7 @@
 #include <linux/utsname.h>
 #include <linux/security.h>
 #include <linux/export.h>
+#include <linux/nospec.h>
 
 unsigned int __read_mostly sysctl_sched_autogroup_enabled = 0;
 static struct autogroup autogroup_default;
@@ -218,7 +219,7 @@ int proc_sched_autogroup_set_nice(struct task_struct *p, int nice)
 {
 	static unsigned long next = INITIAL_JIFFIES;
 	struct autogroup *ag;
-	int err;
+	int err, idx;
 
 	if (nice < -20 || nice > 19)
 		return -EINVAL;
@@ -237,8 +238,10 @@ int proc_sched_autogroup_set_nice(struct task_struct *p, int nice)
 	next = HZ / 10 + jiffies;
 	ag = autogroup_task_get(p);
 
+	idx = array_index_nospec(nice + 20, 40);
+
 	down_write(&ag->lock);
-	err = sched_group_set_shares(ag->tg, prio_to_weight[nice + 20]);
+	err = sched_group_set_shares(ag->tg, prio_to_weight[idx]);
 	if (!err)
 		ag->nice = nice;
 	up_write(&ag->lock);

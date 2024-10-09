@@ -569,7 +569,7 @@ static void rt6_probe_deferred(struct work_struct *w)
 		container_of(w, struct __rt6_probe_work, work);
 
 	addrconf_addr_solict_mult(&work->target, &mcaddr);
-	ndisc_send_ns(work->dev, NULL, &work->target, &mcaddr, NULL);
+	ndisc_send_ns(work->dev, NULL, &work->target, &mcaddr, NULL, 0);
 	dev_put(work->dev);
 	kfree(w);
 }
@@ -2015,6 +2015,11 @@ int ip6_route_info_create(struct fib6_config *cfg, struct rt6_info **rt_ret)
 	if (!dev)
 		goto out;
 
+	if (idev->cnf.disable_ipv6) {
+		err = -EACCES;
+		goto out;
+	}
+
 	if (!ipv6_addr_any(&cfg->fc_prefsrc)) {
 		if (!ipv6_chk_addr(net, &cfg->fc_prefsrc, dev, 0)) {
 			err = -EINVAL;
@@ -2681,6 +2686,28 @@ struct rt6_mtu_change_arg {
 	unsigned int mtu;
 };
 
+static bool rt6_mtu_change_route_allowed(struct inet6_dev *idev,
+					 struct rt6_info *rt, int mtu)
+{
+	/* If the new MTU is lower than the route PMTU, this new MTU will be the
+	 * lowest MTU in the path: always allow updating the route PMTU to
+	 * reflect PMTU decreases.
+	 *
+	 * If the new MTU is higher, and the route PMTU is equal to the local
+	 * MTU, this means the old MTU is the lowest in the path, so allow
+	 * updating it: if other nodes now have lower MTUs, PMTU discovery will
+	 * handle this.
+	 */
+
+	if (dst_mtu(&rt->dst) >= mtu)
+		return true;
+
+	if (dst_mtu(&rt->dst) == idev->cnf.mtu6)
+		return true;
+
+	return false;
+}
+
 static int rt6_mtu_change_route(struct rt6_info *rt, void *p_arg)
 {
 	struct rt6_mtu_change_arg *arg = (struct rt6_mtu_change_arg *) p_arg;
@@ -2701,31 +2728,17 @@ static int rt6_mtu_change_route(struct rt6_info *rt, void *p_arg)
 	   Since RFC 1981 doesn't include administrative MTU increase
 	   update PMTU increase is a MUST. (i.e. jumbo frame)
 	 */
-	/*
-	   If new MTU is less than route PMTU, this new MTU will be the
-	   lowest MTU in the path, update the route PMTU to reflect PMTU
-	   decreases; if new MTU is greater than route PMTU, and the
-	   old MTU is the lowest MTU in the path, update the route PMTU
-	   to reflect the increase. In this case if the other nodes' MTU
-	   also have the lowest MTU, TOO BIG MESSAGE will be lead to
-	   PMTU discouvery.
-	 */
 	if (rt->dst.dev == arg->dev &&
 	    !dst_metric_locked(&rt->dst, RTAX_MTU)) {
 		if (rt->rt6i_flags & RTF_CACHE) {
-			/* For RTF_CACHE with rt6i_pmtu == 0
-			 * (i.e. a redirected route),
-			 * the metrics of its rt->dst.from has already
-			 * been updated.
-			 */
-			if (rt->rt6i_pmtu && rt->rt6i_pmtu > arg->mtu)
+			if (rt->rt6i_pmtu &&
+			    rt6_mtu_change_route_allowed(idev, rt, arg->mtu))
 				rt->rt6i_pmtu = arg->mtu;
-		} else if (dst_mtu(&rt->dst) >= arg->mtu ||
-			   (dst_mtu(&rt->dst) < arg->mtu &&
-			    dst_mtu(&rt->dst) == idev->cnf.mtu6)) {
+		} else if (rt6_mtu_change_route_allowed(idev, rt, arg->mtu)) {
 			dst_metric_set(&rt->dst, RTAX_MTU, arg->mtu);
 		}
 	}
+
 	return 0;
 }
 

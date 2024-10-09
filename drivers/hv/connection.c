@@ -322,6 +322,8 @@ void vmbus_on_event(unsigned long data)
 	struct vmbus_channel *channel = (void *) data;
 	unsigned long time_limit = jiffies + 2;
 
+	trace_vmbus_on_event(channel);
+
 	do {
 		void (*callback_fn)(void *);
 
@@ -411,6 +413,8 @@ void vmbus_set_event(struct vmbus_channel *channel)
 
 	if (!channel->is_dedicated_interrupt)
 		vmbus_send_interrupt(child_relid);
+
+	++channel->sig_events;
 
 	hv_do_fast_hypercall8(HVCALL_SIGNAL_EVENT, channel->sig_event);
 }

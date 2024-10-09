@@ -53,6 +53,9 @@
 
 #include "core_priv.h"
 
+static int ib_resolve_eth_dmac(struct ib_device *device,
+			       struct rdma_ah_attr *ah_attr);
+
 static const char * const ib_events[] = {
 	[IB_EVENT_CQ_ERR]		= "CQ error",
 	[IB_EVENT_QP_FATAL]		= "QP fatal error",
@@ -884,7 +887,7 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 	if (qp_init_attr->cap.max_rdma_ctxs)
 		rdma_rw_init_qp(device, qp_init_attr);
 
-	qp = _ib_create_qp(device, pd, qp_init_attr, NULL);
+	qp = _ib_create_qp(device, pd, qp_init_attr, NULL, NULL);
 	if (IS_ERR(qp))
 		return qp;
 
@@ -895,7 +898,6 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 	}
 
 	qp->real_qp    = qp;
-	qp->uobject    = NULL;
 	qp->qp_type    = qp_init_attr->qp_type;
 	qp->rwq_ind_tbl = qp_init_attr->rwq_ind_tbl;
 
@@ -1293,8 +1295,8 @@ int ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
 }
 EXPORT_SYMBOL(ib_modify_qp_is_ok);
 
-int ib_resolve_eth_dmac(struct ib_device *device,
-			struct rdma_ah_attr *ah_attr)
+static int ib_resolve_eth_dmac(struct ib_device *device,
+			       struct rdma_ah_attr *ah_attr)
 {
 	int           ret = 0;
 	struct ib_global_route *grh;
@@ -1319,7 +1321,6 @@ int ib_resolve_eth_dmac(struct ib_device *device,
 	}
 	return ret;
 }
-EXPORT_SYMBOL(ib_resolve_eth_dmac);
 
 /**
  * IB core internal function to perform QP attributes modification.
@@ -1831,11 +1832,11 @@ EXPORT_SYMBOL(ib_dealloc_xrcd);
  * ib_create_wq - Creates a WQ associated with the specified protection
  * domain.
  * @pd: The protection domain associated with the WQ.
- * @wq_init_attr: A list of initial attributes required to create the
+ * @wq_attr: A list of initial attributes required to create the
  * WQ. If WQ creation succeeds, then the attributes are updated to
  * the actual capabilities of the created WQ.
  *
- * wq_init_attr->max_wr and wq_init_attr->max_sge determine
+ * wq_attr->max_wr and wq_attr->max_sge determine
  * the requested size of the WQ, and set to the actual values allocated
  * on return.
  * If ib_create_wq() succeeds, then max_wr and max_sge will always be

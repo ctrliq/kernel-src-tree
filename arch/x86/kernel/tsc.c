@@ -712,14 +712,14 @@ unsigned long native_calibrate_tsc(void)
 		case INTEL_FAM6_KABYLAKE_DESKTOP:
 			crystal_khz = 24000;	/* 24.0 MHz */
 			break;
-		case INTEL_FAM6_SKYLAKE_X:
-			crystal_khz = 25000;	/* 25.0 MHz */
-			break;
 		case INTEL_FAM6_ATOM_GOLDMONT:
 			crystal_khz = 19200;	/* 19.2 MHz */
 			break;
 		}
 	}
+
+	if (crystal_khz == 0)
+		return 0;
 
 	return crystal_khz * ebx_numerator / eax_denominator;
 }
@@ -1357,6 +1357,12 @@ void __init tsc_init(void)
 	pr_info("Detected %lu.%03lu MHz processor\n",
 		(unsigned long)cpu_khz / 1000,
 		(unsigned long)cpu_khz % 1000);
+
+	if (cpu_khz != tsc_khz) {
+		pr_info("Detected %lu.%03lu MHz TSC",
+			(unsigned long)tsc_khz / 1000,
+			(unsigned long)tsc_khz % 1000);
+	}
 
 	/*
 	 * Secondary CPUs do not run through tsc_init(), so set up

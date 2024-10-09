@@ -236,7 +236,7 @@ struct module_ext {
 	struct list_head next;
 	struct module *module; /* "parent" struct */
 	char *rhelversion;
-#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && defined(CONFIG_S390)
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && !defined(CONFIG_X86_64)
 	unsigned int num_ftrace_callsites;
 	unsigned long *ftrace_callsites;
 #endif
@@ -247,6 +247,12 @@ struct module_ext {
 	/* Elf information */
 	struct klp_modinfo *klp_info;
 #endif
+#if defined(CONFIG_PPC64) && defined(CONFIG_DYNAMIC_FTRACE)
+	unsigned long toc;
+	unsigned long tramp;
+	bool mprofile_kernel;
+#endif
+
 };
 
 struct module
@@ -383,7 +389,7 @@ struct module
 	struct ftrace_event_call **trace_events;
 	unsigned int num_trace_events;
 #endif
-#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && !defined(CONFIG_S390)
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && defined(CONFIG_X86_64)
 	unsigned int num_ftrace_callsites;
 	unsigned long *ftrace_callsites;
 #endif

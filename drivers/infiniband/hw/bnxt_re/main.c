@@ -709,7 +709,6 @@ static void bnxt_re_dev_remove(struct bnxt_re_dev *rdev)
 	mutex_unlock(&bnxt_re_dev_lock);
 
 	synchronize_rcu();
-	flush_workqueue(bnxt_re_wq);
 
 	ib_dealloc_device(&rdev->ibdev);
 	/* rdev is gone */
@@ -748,6 +747,7 @@ static struct bnxt_re_dev *bnxt_re_dev_add(struct net_device *netdev,
 	return rdev;
 }
 
+
 static int bnxt_re_handle_unaffi_async_event(struct creq_func_event
 					     *unaffi_async)
 {
@@ -780,10 +780,18 @@ static int bnxt_re_handle_unaffi_async_event(struct creq_func_event
 	return 0;
 }
 
+
 static int bnxt_re_handle_qp_async_event(struct creq_qp_event *qp_event,
 					 struct bnxt_re_qp *qp)
 {
 	struct ib_event event;
+	unsigned int flags;
+
+	if (qp->qplib_qp.state == CMDQ_MODIFY_QP_NEW_STATE_ERR) {
+		flags = bnxt_re_lock_cqs(qp);
+		bnxt_qplib_add_flush_qp(&qp->qplib_qp);
+		bnxt_re_unlock_cqs(qp, flags);
+	}
 
 	memset(&event, 0, sizeof(event));
 	if (qp->qplib_qp.srq) {
@@ -811,11 +819,12 @@ static int bnxt_re_handle_affi_async_event(struct creq_qp_event *affi_async,
 	if (event == CREQ_QP_EVENT_EVENT_QP_ERROR_NOTIFICATION) {
 		struct bnxt_qplib_qp *lib_qp = obj;
 		struct bnxt_re_qp *qp = container_of(lib_qp, struct bnxt_re_qp,
-						     qplib_qp);
+				qplib_qp);
 		rc = bnxt_re_handle_qp_async_event(affi_async, qp);
 	}
 	return rc;
 }
+
 
 static int bnxt_re_aeq_handler(struct bnxt_qplib_rcfw *rcfw,
 			       void *aeqe, void *obj)
@@ -1497,7 +1506,7 @@ static void bnxt_re_task(struct work_struct *work)
 		break;
 	}
 	smp_mb__before_atomic();
-	clear_bit(BNXT_RE_FLAG_TASK_IN_PROG, &rdev->flags);
+	atomic_dec(&rdev->sched_count);
 	kfree(re_work);
 }
 
@@ -1559,7 +1568,7 @@ static int bnxt_re_netdev_event(struct notifier_block *notifier,
 		/* netdev notifier will call NETDEV_UNREGISTER again later since
 		 * we are still holding the reference to the netdev
 		 */
-		if (test_bit(BNXT_RE_FLAG_TASK_IN_PROG, &rdev->flags))
+		if (atomic_read(&rdev->sched_count) > 0)
 			goto exit;
 		bnxt_re_ib_unreg(rdev, false);
 		bnxt_re_remove_one(rdev);
@@ -1579,7 +1588,7 @@ static int bnxt_re_netdev_event(struct notifier_block *notifier,
 			re_work->vlan_dev = (real_dev == netdev ?
 					     NULL : netdev);
 			INIT_WORK(&re_work->work, bnxt_re_task);
-			set_bit(BNXT_RE_FLAG_TASK_IN_PROG, &rdev->flags);
+			atomic_inc(&rdev->sched_count);
 			queue_work(bnxt_re_wq, &re_work->work);
 		}
 	}
@@ -1628,6 +1637,7 @@ static void __exit bnxt_re_mod_exit(void)
 	if (!list_empty(&bnxt_re_dev_list))
 		list_splice_init(&bnxt_re_dev_list, &to_be_deleted);
 	mutex_unlock(&bnxt_re_dev_lock);
+
        /*
 	* Cleanup the devices in reverse order so that the VF device
 	* cleanup is done before PF cleanup

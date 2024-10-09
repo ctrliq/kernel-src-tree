@@ -64,7 +64,7 @@ struct record {
 	struct perf_tool	tool;
 	struct record_opts	opts;
 	u64			bytes_written;
-	struct perf_data_file	file;
+	struct perf_data	data;
 	struct auxtrace_record	*itr;
 	struct perf_evlist	*evlist;
 	struct perf_session	*session;
@@ -105,7 +105,7 @@ static bool switch_output_time(struct record *rec)
 
 static int record__write(struct record *rec, void *bf, size_t size)
 {
-	if (perf_data_file__write(rec->session->file, bf, size) < 0) {
+	if (perf_data__write(rec->session->data, bf, size) < 0) {
 		pr_err("failed to write perf data, error: %m\n");
 		return -1;
 	}
@@ -127,112 +127,12 @@ static int process_synthesized_event(struct perf_tool *tool,
 	return record__write(rec, event, event->header.size);
 }
 
-static int
-backward_rb_find_range(void *buf, int mask, u64 head, u64 *start, u64 *end)
-{
-	struct perf_event_header *pheader;
-	u64 evt_head = head;
-	int size = mask + 1;
-
-	pr_debug2("backward_rb_find_range: buf=%p, head=%"PRIx64"\n", buf, head);
-	pheader = (struct perf_event_header *)(buf + (head & mask));
-	*start = head;
-	while (true) {
-		if (evt_head - head >= (unsigned int)size) {
-			pr_debug("Finished reading backward ring buffer: rewind\n");
-			if (evt_head - head > (unsigned int)size)
-				evt_head -= pheader->size;
-			*end = evt_head;
-			return 0;
-		}
-
-		pheader = (struct perf_event_header *)(buf + (evt_head & mask));
-
-		if (pheader->size == 0) {
-			pr_debug("Finished reading backward ring buffer: get start\n");
-			*end = evt_head;
-			return 0;
-		}
-
-		evt_head += pheader->size;
-		pr_debug3("move evt_head: %"PRIx64"\n", evt_head);
-	}
-	WARN_ONCE(1, "Shouldn't get here\n");
-	return -1;
-}
-
-static int
-rb_find_range(void *data, int mask, u64 head, u64 old,
-	      u64 *start, u64 *end, bool backward)
-{
-	if (!backward) {
-		*start = old;
-		*end = head;
-		return 0;
-	}
-
-	return backward_rb_find_range(data, mask, head, start, end);
-}
-
 static int record__pushfn(void *to, void *bf, size_t size)
 {
 	struct record *rec = to;
 
 	rec->samples++;
 	return record__write(rec, bf, size);
-}
-
-static int perf_mmap__push(struct perf_mmap *md, bool overwrite, bool backward,
-			   void *to, int push(void *to, void *buf, size_t size))
-{
-	u64 head = perf_mmap__read_head(md);
-	u64 old = md->prev;
-	u64 end = head, start = old;
-	unsigned char *data = md->base + page_size;
-	unsigned long size;
-	void *buf;
-	int rc = 0;
-
-	if (rb_find_range(data, md->mask, head,
-			  old, &start, &end, backward))
-		return -1;
-
-	if (start == end)
-		return 0;
-
-	size = end - start;
-	if (size > (unsigned long)(md->mask) + 1) {
-		WARN_ONCE(1, "failed to keep up with mmap data. (warn only once)\n");
-
-		md->prev = head;
-		perf_mmap__consume(md, overwrite || backward);
-		return 0;
-	}
-
-	if ((start & md->mask) + size != (end & md->mask)) {
-		buf = &data[start & md->mask];
-		size = md->mask + 1 - (start & md->mask);
-		start += size;
-
-		if (push(to, buf, size) < 0) {
-			rc = -1;
-			goto out;
-		}
-	}
-
-	buf = &data[start & md->mask];
-	size = end - start;
-	start += size;
-
-	if (push(to, buf, size) < 0) {
-		rc = -1;
-		goto out;
-	}
-
-	md->prev = head;
-	perf_mmap__consume(md, overwrite || backward);
-out:
-	return rc;
 }
 
 static volatile int done;
@@ -271,13 +171,13 @@ static int record__process_auxtrace(struct perf_tool *tool,
 				    size_t len1, void *data2, size_t len2)
 {
 	struct record *rec = container_of(tool, struct record, tool);
-	struct perf_data_file *file = &rec->file;
+	struct perf_data *data = &rec->data;
 	size_t padding;
 	u8 pad[8] = {0};
 
-	if (!perf_data_file__is_pipe(file)) {
+	if (!perf_data__is_pipe(data)) {
 		off_t file_offset;
-		int fd = perf_data_file__fd(file);
+		int fd = perf_data__fd(data);
 		int err;
 
 		file_offset = lseek(fd, 0, SEEK_CUR);
@@ -398,7 +298,7 @@ static int record__mmap_evlist(struct record *rec,
 	struct record_opts *opts = &rec->opts;
 	char msg[512];
 
-	if (perf_evlist__mmap_ex(evlist, opts->mmap_pages, false,
+	if (perf_evlist__mmap_ex(evlist, opts->mmap_pages,
 				 opts->auxtrace_mmap_pages,
 				 opts->auxtrace_snapshot_mode) < 0) {
 		if (errno == EPERM) {
@@ -472,7 +372,7 @@ try_again:
 	}
 
 	if (perf_evlist__apply_filters(evlist, &pos)) {
-		error("failed to set filter \"%s\" on event %s with %d (%s)\n",
+		pr_err("failed to set filter \"%s\" on event %s with %d (%s)\n",
 			pos->filter, perf_evsel__name(pos), errno,
 			str_error_r(errno, msg, sizeof(msg)));
 		rc = -1;
@@ -480,7 +380,7 @@ try_again:
 	}
 
 	if (perf_evlist__apply_drv_configs(evlist, &pos, &err_term)) {
-		error("failed to set config \"%s\" on event %s with %d (%s)\n",
+		pr_err("failed to set config \"%s\" on event %s with %d (%s)\n",
 		      err_term->val.drv_cfg, perf_evsel__name(pos), errno,
 		      str_error_r(errno, msg, sizeof(msg)));
 		rc = -1;
@@ -512,10 +412,10 @@ static int process_sample_event(struct perf_tool *tool,
 
 static int process_buildids(struct record *rec)
 {
-	struct perf_data_file *file  = &rec->file;
+	struct perf_data *data = &rec->data;
 	struct perf_session *session = rec->session;
 
-	if (file->size == 0)
+	if (data->size == 0)
 		return 0;
 
 	/*
@@ -574,7 +474,7 @@ static struct perf_event_header finished_round_event = {
 };
 
 static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evlist,
-				    bool backward)
+				    bool overwrite)
 {
 	u64 bytes_written = rec->bytes_written;
 	int i;
@@ -584,18 +484,18 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
 	if (!evlist)
 		return 0;
 
-	maps = backward ? evlist->backward_mmap : evlist->mmap;
+	maps = overwrite ? evlist->overwrite_mmap : evlist->mmap;
 	if (!maps)
 		return 0;
 
-	if (backward && evlist->bkw_mmap_state != BKW_MMAP_DATA_PENDING)
+	if (overwrite && evlist->bkw_mmap_state != BKW_MMAP_DATA_PENDING)
 		return 0;
 
 	for (i = 0; i < evlist->nr_mmaps; i++) {
 		struct auxtrace_mmap *mm = &maps[i].auxtrace_mmap;
 
 		if (maps[i].base) {
-			if (perf_mmap__push(&maps[i], evlist->overwrite, backward, rec, record__pushfn) != 0) {
+			if (perf_mmap__push(&maps[i], rec, record__pushfn) != 0) {
 				rc = -1;
 				goto out;
 			}
@@ -615,7 +515,7 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
 	if (bytes_written != rec->bytes_written)
 		rc = record__write(rec, &finished_round_event, sizeof(finished_round_event));
 
-	if (backward)
+	if (overwrite)
 		perf_evlist__toggle_bkw_mmap(evlist, BKW_MMAP_EMPTY);
 out:
 	return rc;
@@ -658,14 +558,14 @@ static void record__init_features(struct record *rec)
 static void
 record__finish_output(struct record *rec)
 {
-	struct perf_data_file *file = &rec->file;
-	int fd = perf_data_file__fd(file);
+	struct perf_data *data = &rec->data;
+	int fd = perf_data__fd(data);
 
-	if (file->is_pipe)
+	if (data->is_pipe)
 		return;
 
 	rec->session->header.data_size += rec->bytes_written;
-	file->size = lseek(perf_data_file__fd(file), 0, SEEK_CUR);
+	data->size = lseek(perf_data__fd(data), 0, SEEK_CUR);
 
 	if (!rec->no_buildid) {
 		process_buildids(rec);
@@ -704,7 +604,7 @@ static int record__synthesize(struct record *rec, bool tail);
 static int
 record__switch_output(struct record *rec, bool at_exit)
 {
-	struct perf_data_file *file = &rec->file;
+	struct perf_data *data = &rec->data;
 	int fd, err;
 
 	/* Same Size:      "2015122520103046"*/
@@ -722,7 +622,7 @@ record__switch_output(struct record *rec, bool at_exit)
 		return -EINVAL;
 	}
 
-	fd = perf_data_file__switch(file, timestamp,
+	fd = perf_data__switch(data, timestamp,
 				    rec->session->header.data_offset,
 				    at_exit);
 	if (fd >= 0 && !at_exit) {
@@ -732,7 +632,7 @@ record__switch_output(struct record *rec, bool at_exit)
 
 	if (!quiet)
 		fprintf(stderr, "[ perf record: Dump %s.%s ]\n",
-			file->path, timestamp);
+			data->file.path, timestamp);
 
 	/* Output tracking events */
 	if (!at_exit) {
@@ -787,8 +687,8 @@ perf_evlist__pick_pc(struct perf_evlist *evlist)
 	if (evlist) {
 		if (evlist->mmap && evlist->mmap[0].base)
 			return evlist->mmap[0].base;
-		if (evlist->backward_mmap && evlist->backward_mmap[0].base)
-			return evlist->backward_mmap[0].base;
+		if (evlist->overwrite_mmap && evlist->overwrite_mmap[0].base)
+			return evlist->overwrite_mmap[0].base;
 	}
 	return NULL;
 }
@@ -807,16 +707,16 @@ static int record__synthesize(struct record *rec, bool tail)
 {
 	struct perf_session *session = rec->session;
 	struct machine *machine = &session->machines.host;
-	struct perf_data_file *file = &rec->file;
+	struct perf_data *data = &rec->data;
 	struct record_opts *opts = &rec->opts;
 	struct perf_tool *tool = &rec->tool;
-	int fd = perf_data_file__fd(file);
+	int fd = perf_data__fd(data);
 	int err = 0;
 
 	if (rec->opts.tail_synthesize != tail)
 		return 0;
 
-	if (file->is_pipe) {
+	if (data->is_pipe) {
 		err = perf_event__synthesize_features(
 			tool, session, rec->evlist, process_synthesized_event);
 		if (err < 0) {
@@ -883,7 +783,7 @@ static int record__synthesize(struct record *rec, bool tail)
 
 	err = __machine__synthesize_threads(machine, tool, &opts->target, rec->evlist->threads,
 					    process_synthesized_event, opts->sample_address,
-					    opts->proc_map_timeout);
+					    opts->proc_map_timeout, 1);
 out:
 	return err;
 }
@@ -897,7 +797,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	struct machine *machine;
 	struct perf_tool *tool = &rec->tool;
 	struct record_opts *opts = &rec->opts;
-	struct perf_data_file *file = &rec->file;
+	struct perf_data *data = &rec->data;
 	struct perf_session *session;
 	bool disabled = false, draining = false;
 	int fd;
@@ -920,20 +820,20 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		signal(SIGUSR2, SIG_IGN);
 	}
 
-	session = perf_session__new(file, false, tool);
+	session = perf_session__new(data, false, tool);
 	if (session == NULL) {
 		pr_err("Perf session creation failed.\n");
 		return -1;
 	}
 
-	fd = perf_data_file__fd(file);
+	fd = perf_data__fd(data);
 	rec->session = session;
 
 	record__init_features(rec);
 
 	if (forks) {
 		err = perf_evlist__prepare_workload(rec->evlist, &opts->target,
-						    argv, file->is_pipe,
+						    argv, data->is_pipe,
 						    workload_exec_failed_signal);
 		if (err < 0) {
 			pr_err("Couldn't run the workload!\n");
@@ -959,7 +859,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	if (!rec->evlist->nr_groups)
 		perf_header__clear_feat(&session->header, HEADER_GROUP_DESC);
 
-	if (file->is_pipe) {
+	if (data->is_pipe) {
 		err = perf_header__write_pipe(fd);
 		if (err < 0)
 			goto out_child;
@@ -1199,8 +1099,8 @@ out_child:
 			samples[0] = '\0';
 
 		fprintf(stderr,	"[ perf record: Captured and wrote %.3f MB %s%s%s ]\n",
-			perf_data_file__size(file) / 1024.0 / 1024.0,
-			file->path, postfix, samples);
+			perf_data__size(data) / 1024.0 / 1024.0,
+			data->file.path, postfix, samples);
 	}
 
 out_delete_session:
@@ -1563,7 +1463,7 @@ static struct option __record_options[] = {
 	OPT_STRING('C', "cpu", &record.opts.target.cpu_list, "cpu",
 		    "list of cpus to monitor"),
 	OPT_U64('c', "count", &record.opts.user_interval, "event period to sample"),
-	OPT_STRING('o', "output", &record.file.path, "file",
+	OPT_STRING('o', "output", &record.data.file.path, "file",
 		    "output file name"),
 	OPT_BOOLEAN_SET('i', "no-inherit", &record.opts.no_inherit,
 			&record.opts.no_inherit_set,

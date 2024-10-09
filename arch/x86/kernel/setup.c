@@ -157,21 +157,21 @@ static struct resource data_resource = {
 	.name	= "Kernel data",
 	.start	= 0,
 	.end	= 0,
-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
+	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
 };
 
 static struct resource code_resource = {
 	.name	= "Kernel code",
 	.start	= 0,
 	.end	= 0,
-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
+	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
 };
 
 static struct resource bss_resource = {
 	.name	= "Kernel bss",
 	.start	= 0,
 	.end	= 0,
-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
+	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
 };
 
 
@@ -887,7 +887,13 @@ static bool valid_intel_processor(__u8 model, __u8 stepping)
 
 	switch(model) {
 	case INTEL_FAM6_KABYLAKE_DESKTOP:
+		valid = (stepping <= 10 || stepping == 12);
+		break;
+
 	case INTEL_FAM6_KABYLAKE_MOBILE:
+		valid = (stepping <= 11);
+		break;
+
 	case INTEL_FAM6_XEON_PHI_KNM:
 	case INTEL_FAM6_ATOM_GEMINI_LAKE:
 	case INTEL_FAM6_ATOM_DENVERTON:
@@ -903,13 +909,16 @@ static bool valid_intel_processor(__u8 model, __u8 stepping)
 
 	case INTEL_FAM6_SKYLAKE_MOBILE:
 	case INTEL_FAM6_SKYLAKE_DESKTOP:
-	case INTEL_FAM6_SKYLAKE_X:
 		/* stepping > 4 is Cascade Lake and is not supported */
-		valid = (boot_cpu_data.x86_mask <= 4);
+		valid = (stepping <= 4);
+		break;
+
+	case INTEL_FAM6_SKYLAKE_X:
+		valid = (stepping <= 5);
 		break;
 
 	default:
-		valid = (boot_cpu_data.x86_model <= INTEL_FAM6_HASWELL_X);
+		valid = (model <= INTEL_FAM6_HASWELL_X);
 		break;
 	}
 

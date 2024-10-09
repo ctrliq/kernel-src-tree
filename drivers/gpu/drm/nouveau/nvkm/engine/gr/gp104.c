@@ -26,6 +26,8 @@
 
 static const struct gf100_gr_func
 gp104_gr = {
+	.oneinit_tiles = gm200_gr_oneinit_tiles,
+	.oneinit_sm_id = gm200_gr_oneinit_sm_id,
 	.init = gf100_gr_init,
 	.init_gpc_mmu = gm200_gr_init_gpc_mmu,
 	.init_vsc_stream_master = gk104_gr_init_vsc_stream_master,
@@ -41,11 +43,13 @@ gp104_gr = {
 	.init_tex_hww_esr = gf100_gr_init_tex_hww_esr,
 	.init_504430 = gm107_gr_init_504430,
 	.init_shader_exceptions = gp100_gr_init_shader_exceptions,
+	.trap_mp = gf100_gr_trap_mp,
 	.rops = gm200_gr_rops,
 	.gpc_nr = 6,
 	.tpc_nr = 5,
 	.ppc_nr = 3,
 	.grctx = &gp104_grctx,
+	.zbc = &gp102_gr_zbc,
 	.sclass = {
 		{ -1, -1, FERMI_TWOD_A },
 		{ -1, -1, KEPLER_INLINE_TO_MEMORY_B },

@@ -671,7 +671,7 @@ bool inet6_mc_check(struct sock *sk, const struct in6_addr *mc_addr,
 	return rv;
 }
 
-static void igmp6_group_added(struct ifmcaddr6 *mc, unsigned int mode)
+static void igmp6_group_added(struct ifmcaddr6 *mc)
 {
 	struct net_device *dev = mc->idev->dev;
 	char buf[MAX_ADDR_LEN];
@@ -701,7 +701,7 @@ static void igmp6_group_added(struct ifmcaddr6 *mc, unsigned int mode)
 	 * should not send filter-mode change record as the mode
 	 * should be from IN() to IN(A).
 	 */
-	if (mode == MCAST_EXCLUDE)
+	if (mc->mca_sfmode == MCAST_EXCLUDE)
 		mc->mca_crcount = mc->idev->mc_qrv;
 
 	mld_ifc_event(mc->idev);
@@ -801,8 +801,7 @@ static void mld_del_delrec(struct inet6_dev *idev, struct ifmcaddr6 *im)
 	spin_lock_bh(&im->mca_lock);
 	if (pmc) {
 		im->idev = pmc->idev;
-		im->mca_sfmode = pmc->mca_sfmode;
-		if (pmc->mca_sfmode == MCAST_INCLUDE) {
+		if (im->mca_sfmode == MCAST_INCLUDE) {
 			im->mca_tomb = pmc->mca_tomb;
 			im->mca_sources = pmc->mca_sources;
 			for (psf = im->mca_sources; psf; psf = psf->sf_next)
@@ -943,7 +942,7 @@ static int __ipv6_dev_mc_inc(struct net_device *dev,
 	write_unlock_bh(&idev->lock);
 
 	mld_del_delrec(idev, mc);
-	igmp6_group_added(mc, mode);
+	igmp6_group_added(mc);
 	ma_put(mc);
 	return 0;
 }
@@ -2583,7 +2582,7 @@ void ipv6_mc_up(struct inet6_dev *idev)
 	ipv6_mc_reset(idev);
 	for (i = idev->mc_list; i; i = i->next) {
 		mld_del_delrec(idev, i);
-		igmp6_group_added(i, i->mca_sfmode);
+		igmp6_group_added(i);
 	}
 	read_unlock_bh(&idev->lock);
 }

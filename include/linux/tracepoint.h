@@ -35,6 +35,12 @@ struct tracepoint {
 	struct tracepoint_func __rcu *funcs;
 };
 
+struct trace_enum_map {
+	const char		*system;
+	const char		*enum_string;
+	unsigned long		enum_value;
+};
+
 /*
  * Connect a probe to a tracepoint.
  * Internal API, should not be used directly.
@@ -91,6 +97,8 @@ static inline void tracepoint_synchronize_unregister(void)
 }
 
 #define PARAMS(args...) args
+
+#define TRACE_DEFINE_ENUM(x)
 
 #endif /* _LINUX_TRACEPOINT_H */
 

@@ -4513,11 +4513,12 @@ const char *__check_heap_object(const void *ptr, unsigned long n,
 
 	/* Find and validate object. */
 	cachep = page->slab_cache;
-	objnr = obj_to_index(cachep, page, (void *)ptr);
+	objnr = obj_to_index(cachep, page->slab_page, (void *)ptr);
 	BUG_ON(objnr >= cachep->num);
 
 	/* Find offset within object. */
-	offset = ptr - index_to_obj(cachep, page, objnr) - obj_offset(cachep);
+	offset = ptr - index_to_obj(cachep, page->slab_page, objnr) -
+		obj_offset(cachep);
 
 	/* Allow address range falling entirely within object size. */
 	if (offset <= cachep->object_size && n <= cachep->object_size - offset)

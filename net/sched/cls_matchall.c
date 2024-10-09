@@ -69,12 +69,28 @@ static void mall_destroy_rcu(struct rcu_head *rcu)
 	tcf_queue_work(&head->work);
 }
 
+static void mall_destroy_hw_filter(struct tcf_proto *tp,
+				   struct cls_mall_head *head,
+				   unsigned long cookie)
+{
+	struct tc_cls_matchall_offload cls_mall = {};
+	struct tcf_block *block = tp->chain->block;
+
+	tc_cls_common_offload_init(&cls_mall.common, tp);
+	cls_mall.command = TC_CLSMATCHALL_DESTROY;
+	cls_mall.cookie = cookie;
+
+	tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL, &cls_mall, false);
+	tcf_block_offload_dec(block, &head->flags);
+}
+
 static int mall_replace_hw_filter(struct tcf_proto *tp,
 				  struct cls_mall_head *head,
 				  unsigned long cookie)
 {
-	struct net_device *dev = tp->q->dev_queue->dev;
 	struct tc_cls_matchall_offload cls_mall = {};
+	struct tcf_block *block = tp->chain->block;
+	bool skip_sw = tc_skip_sw(head->flags);
 	int err;
 
 	tc_cls_common_offload_init(&cls_mall.common, tp);
@@ -82,36 +98,29 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
 	cls_mall.exts = &head->exts;
 	cls_mall.cookie = cookie;
 
-	err = __rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
-	if (!err)
-		head->flags |= TCA_CLS_FLAGS_IN_HW;
+	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL,
+			       &cls_mall, skip_sw);
+	if (err < 0) {
+		mall_destroy_hw_filter(tp, head, cookie);
+		return err;
+	} else if (err > 0) {
+		tcf_block_offload_inc(block, &head->flags);
+	}
 
-	return err;
-}
+	if (skip_sw && !(head->flags & TCA_CLS_FLAGS_IN_HW))
+		return -EINVAL;
 
-static void mall_destroy_hw_filter(struct tcf_proto *tp,
-				   struct cls_mall_head *head,
-				   unsigned long cookie)
-{
-	struct net_device *dev = tp->q->dev_queue->dev;
-	struct tc_cls_matchall_offload cls_mall = {};
-
-	tc_cls_common_offload_init(&cls_mall.common, tp);
-	cls_mall.command = TC_CLSMATCHALL_DESTROY;
-	cls_mall.cookie = cookie;
-
-	__rh_call_ndo_setup_tc(dev, TC_SETUP_CLSMATCHALL, &cls_mall);
+	return 0;
 }
 
 static void mall_destroy(struct tcf_proto *tp)
 {
 	struct cls_mall_head *head = rtnl_dereference(tp->root);
-	struct net_device *dev = tp->q->dev_queue->dev;
 
 	if (!head)
 		return;
 
-	if (tc_should_offload(dev, head->flags))
+	if (!tc_skip_hw(head->flags))
 		mall_destroy_hw_filter(tp, head, (unsigned long) head);
 
 	if (tcf_exts_get_net(&head->exts))
@@ -154,7 +163,6 @@ static int mall_change(struct net *net, struct sk_buff *in_skb,
 		       void **arg, bool ovr)
 {
 	struct cls_mall_head *head = rtnl_dereference(tp->root);
-	struct net_device *dev = tp->q->dev_queue->dev;
 	struct nlattr *tb[TCA_MATCHALL_MAX + 1];
 	struct cls_mall_head *new;
 	u32 flags = 0;
@@ -194,14 +202,10 @@ static int mall_change(struct net *net, struct sk_buff *in_skb,
 	if (err)
 		goto err_set_parms;
 
-	if (tc_should_offload(dev, flags)) {
+	if (!tc_skip_hw(new->flags)) {
 		err = mall_replace_hw_filter(tp, new, (unsigned long) new);
-		if (err) {
-			if (tc_skip_sw(flags))
-				goto err_replace_hw_filter;
-			else
-				err = 0;
-		}
+		if (err)
+			goto err_replace_hw_filter;
 	}
 
 	if (!tc_in_hw(new->flags))

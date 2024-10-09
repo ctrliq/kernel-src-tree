@@ -99,7 +99,7 @@ struct ipmi_user_hndl {
 
 /* Create a new user of the IPMI layer on the given interface number. */
 int ipmi_create_user(unsigned int          if_num,
-		     const struct ipmi_user_hndl *handler,
+		     RH_KABI_CONST struct ipmi_user_hndl *handler,
 		     void                  *handler_data,
 		     ipmi_user_t           *user);
 
@@ -112,9 +112,14 @@ int ipmi_create_user(unsigned int          if_num,
 int ipmi_destroy_user(ipmi_user_t user);
 
 /* Get the IPMI version of the BMC we are talking to. */
-int ipmi_get_version(ipmi_user_t   user,
-		     unsigned char *major,
-		     unsigned char *minor);
+int __ipmi_get_version(ipmi_user_t   user,
+		       unsigned char *major,
+		       unsigned char *minor);
+
+/* RHEL7 kABI wrapper for __ipmi_get_version */
+void ipmi_get_version(ipmi_user_t   user,
+		      unsigned char *major,
+		      unsigned char *minor);
 
 /* Set and get the slave address and LUN that we will use for our
    source messages.  Note that this affects the interface, not just
@@ -276,7 +281,10 @@ int ipmi_validate_addr(struct ipmi_addr *addr, int len);
  */
 enum ipmi_addr_src {
 	SI_INVALID = 0, SI_HOTMOD, SI_HARDCODED, SI_SPMI, SI_ACPI, SI_SMBIOS,
-	SI_PCI,	SI_DEVICETREE, RH_KABI_RENAME(SI_DEFAULT, SI_LAST)
+	SI_PCI,	SI_DEVICETREE, SI_DEFAULT
+#ifndef __GENKSYMS__
+	, SI_PLATFORM = SI_DEFAULT, SI_LAST
+#endif
 };
 const char *ipmi_addr_src_to_str(enum ipmi_addr_src src);
 

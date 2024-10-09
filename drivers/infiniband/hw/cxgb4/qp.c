@@ -293,8 +293,7 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	}
 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
 
-	res_wr = (struct fw_ri_res_wr *)__skb_put(skb, wr_len);
-	memset(res_wr, 0, wr_len);
+	res_wr = __skb_put_zero(skb, wr_len);
 	res_wr->op_nres = cpu_to_be32(
 			FW_WR_OP_V(FW_RI_RES_WR) |
 			FW_RI_RES_WR_NRES_V(2) |
@@ -1043,7 +1042,7 @@ int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 		if (c4iw_wr_log) {
 			swsqe->sge_ts = cxgb4_read_sge_timestamp(
 					qhp->rhp->rdev.lldi.ports[0]);
-			getnstimeofday(&swsqe->host_ts);
+			swsqe->host_time = ktime_get();
 		}
 
 		init_wr_hdr(wqe, qhp->wq.sq.pidx, fw_opcode, fw_flags, len16);
@@ -1118,8 +1117,8 @@ int c4iw_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
 			qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].sge_ts =
 				cxgb4_read_sge_timestamp(
 						qhp->rhp->rdev.lldi.ports[0]);
-			getnstimeofday(
-				&qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].host_ts);
+			qhp->wq.rq.sw_rq[qhp->wq.rq.pidx].host_time =
+				ktime_get();
 		}
 
 		wqe->recv.opcode = FW_RI_RECV_WR;
@@ -1298,7 +1297,7 @@ static void post_terminate(struct c4iw_qp *qhp, struct t4_cqe *err_cqe,
 
 	set_wr_txq(skb, CPL_PRIORITY_DATA, qhp->ep->txq_idx);
 
-	wqe = (struct fw_ri_wr *)__skb_put(skb, sizeof(*wqe));
+	wqe = __skb_put(skb, sizeof(*wqe));
 	memset(wqe, 0, sizeof *wqe);
 	wqe->op_compl = cpu_to_be32(FW_WR_OP_V(FW_RI_INIT_WR));
 	wqe->flowid_len16 = cpu_to_be32(
@@ -1422,7 +1421,7 @@ static int rdma_fini(struct c4iw_dev *rhp, struct c4iw_qp *qhp,
 
 	set_wr_txq(skb, CPL_PRIORITY_DATA, ep->txq_idx);
 
-	wqe = (struct fw_ri_wr *)__skb_put(skb, sizeof(*wqe));
+	wqe = __skb_put(skb, sizeof(*wqe));
 	memset(wqe, 0, sizeof *wqe);
 	wqe->op_compl = cpu_to_be32(
 		FW_WR_OP_V(FW_RI_INIT_WR) |
@@ -1488,7 +1487,7 @@ static int rdma_init(struct c4iw_dev *rhp, struct c4iw_qp *qhp)
 	}
 	set_wr_txq(skb, CPL_PRIORITY_DATA, qhp->ep->txq_idx);
 
-	wqe = (struct fw_ri_wr *)__skb_put(skb, sizeof(*wqe));
+	wqe = __skb_put(skb, sizeof(*wqe));
 	memset(wqe, 0, sizeof *wqe);
 	wqe->op_compl = cpu_to_be32(
 		FW_WR_OP_V(FW_RI_INIT_WR) |
@@ -2006,7 +2005,6 @@ struct ib_qp *c4iw_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attrs,
 		qhp->ucontext = ucontext;
 	}
 	qhp->ibqp.qp_num = qhp->wq.sq.qid;
-	init_timer(&(qhp->timer));
 	INIT_LIST_HEAD(&qhp->db_fc_entry);
 	pr_debug("sq id %u size %u memsize %zu num_entries %u rq id %u size %u memsize %zu num_entries %u\n",
 		 qhp->wq.sq.qid, qhp->wq.sq.size, qhp->wq.sq.memsize,

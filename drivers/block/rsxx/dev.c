@@ -118,8 +118,8 @@ static void disk_stats_start(struct rsxx_cardinfo *card, struct bio *bio)
 
 	cpu = part_stat_lock();
 
-	part_round_stats(cpu, part0);
-	part_inc_in_flight(part0, rw);
+	part_round_stats(card->queue, cpu, part0);
+	part_inc_in_flight(card->queue, part0, rw);
 
 	part_stat_unlock();
 }
@@ -139,8 +139,8 @@ static void disk_stats_complete(struct rsxx_cardinfo *card,
 	part_stat_inc(cpu, part0, ios[rw]);
 	part_stat_add(cpu, part0, ticks[rw], duration);
 
-	part_round_stats(cpu, part0);
-	part_dec_in_flight(part0, rw);
+	part_round_stats(card->queue, cpu, part0);
+	part_dec_in_flight(card->queue, part0, rw);
 
 	part_stat_unlock();
 }

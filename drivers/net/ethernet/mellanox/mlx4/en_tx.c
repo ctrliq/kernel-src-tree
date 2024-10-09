@@ -194,6 +194,7 @@ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
 	ring->last_nr_txbb = 1;
 	memset(ring->tx_info, 0, ring->size * sizeof(struct mlx4_en_tx_info));
 	memset(ring->buf, 0, ring->buf_size);
+	ring->free_tx_desc = mlx4_en_free_tx_desc;
 
 	ring->sp_qp_state = MLX4_QP_STATE_RST;
 	ring->doorbell_qpn = cpu_to_be32(ring->sp_qp.qpn << 8);
@@ -264,7 +265,7 @@ static void mlx4_en_stamp_wqe(struct mlx4_en_priv *priv,
 }
 
 
-static u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
+u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
 				struct mlx4_en_tx_ring *ring,
 				int index, u64 timestamp,
 				int napi_mode)
@@ -331,6 +332,25 @@ static u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
 	return tx_info->nr_txbb;
 }
 
+u32 mlx4_en_recycle_tx_desc(struct mlx4_en_priv *priv,
+			    struct mlx4_en_tx_ring *ring,
+			    int index, u64 timestamp,
+			    int napi_mode)
+{
+	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
+	struct mlx4_en_rx_alloc frame = {
+		.page = tx_info->page,
+		.dma = tx_info->map0_dma,
+	};
+
+	if (!mlx4_en_rx_recycle(ring->recycle_ring, &frame)) {
+		dma_unmap_page(priv->ddev, tx_info->map0_dma,
+			       PAGE_SIZE, priv->dma_dir);
+		put_page(tx_info->page);
+	}
+
+	return tx_info->nr_txbb;
+}
 
 int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
 {
@@ -349,7 +369,7 @@ int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
 	}
 
 	while (ring->cons != ring->prod) {
-		ring->last_nr_txbb = mlx4_en_free_tx_desc(priv, ring,
+		ring->last_nr_txbb = ring->free_tx_desc(priv, ring,
 						ring->cons & ring->size_mask,
 						0, 0 /* Non-NAPI caller */);
 		ring->cons += ring->last_nr_txbb;
@@ -365,8 +385,8 @@ int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
 	return cnt;
 }
 
-static bool mlx4_en_process_tx_cq(struct net_device *dev,
-				  struct mlx4_en_cq *cq, int napi_budget)
+bool mlx4_en_process_tx_cq(struct net_device *dev,
+			   struct mlx4_en_cq *cq, int napi_budget)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	struct mlx4_cq *mcq = &cq->mcq;
@@ -432,7 +452,7 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
 				timestamp = mlx4_en_get_cqe_ts(cqe);
 
 			/* free next descriptor */
-			last_nr_txbb = mlx4_en_free_tx_desc(
+			last_nr_txbb = ring->free_tx_desc(
 					priv, ring, ring_index,
 					timestamp, napi_budget);
 
@@ -461,6 +481,9 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
 	/* we want to dirty this cache line once */
 	ACCESS_ONCE(ring->last_nr_txbb) = last_nr_txbb;
 	ACCESS_ONCE(ring->cons) = ring_cons + txbbs_skipped;
+
+	if (cq->type == TX_XDP)
+		return done < budget;
 
 	netdev_tx_completed_queue(ring->tx_queue, packets, bytes);
 
@@ -1058,3 +1081,104 @@ tx_drop:
 	return NETDEV_TX_OK;
 }
 
+#define MLX4_EN_XDP_TX_NRTXBB  1
+#define MLX4_EN_XDP_TX_REAL_SZ (((CTRL_SIZE + MLX4_EN_XDP_TX_NRTXBB * DS_SIZE) \
+				 / 16) & 0x3f)
+
+void mlx4_en_init_tx_xdp_ring_descs(struct mlx4_en_priv *priv,
+				    struct mlx4_en_tx_ring *ring)
+{
+	int i;
+
+	for (i = 0; i < ring->size; i++) {
+		struct mlx4_en_tx_info *tx_info = &ring->tx_info[i];
+		struct mlx4_en_tx_desc *tx_desc = ring->buf +
+			(i << LOG_TXBB_SIZE);
+
+		tx_info->map0_byte_count = PAGE_SIZE;
+		tx_info->nr_txbb = MLX4_EN_XDP_TX_NRTXBB;
+		tx_info->data_offset = offsetof(struct mlx4_en_tx_desc, data);
+		tx_info->ts_requested = 0;
+		tx_info->nr_maps = 1;
+		tx_info->linear = 1;
+		tx_info->inl = 0;
+
+		tx_desc->data.lkey = ring->mr_key;
+		tx_desc->ctrl.qpn_vlan.fence_size = MLX4_EN_XDP_TX_REAL_SZ;
+		tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
+	}
+}
+
+netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
+			       struct mlx4_en_rx_alloc *frame,
+			       struct mlx4_en_priv *priv, unsigned int length,
+			       int tx_ind, bool *doorbell_pending)
+{
+	struct mlx4_en_tx_desc *tx_desc;
+	struct mlx4_en_tx_info *tx_info;
+	struct mlx4_wqe_data_seg *data;
+	struct mlx4_en_tx_ring *ring;
+	dma_addr_t dma;
+	__be32 op_own;
+	int index;
+
+	if (unlikely(!priv->port_up))
+		goto tx_drop;
+
+	ring = priv->tx_ring[TX_XDP][tx_ind];
+
+	if (unlikely(mlx4_en_is_tx_ring_full(ring)))
+		goto tx_drop_count;
+
+	index = ring->prod & ring->size_mask;
+	tx_info = &ring->tx_info[index];
+
+	/* Track current inflight packets for performance analysis */
+	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
+			 (u32)(ring->prod - READ_ONCE(ring->cons) - 1));
+
+	tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
+	data = &tx_desc->data;
+
+	dma = frame->dma;
+
+	tx_info->page = frame->page;
+	frame->page = NULL;
+	tx_info->map0_dma = dma;
+	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
+
+	dma_sync_single_range_for_device(priv->ddev, dma, frame->page_offset,
+					 length, PCI_DMA_TODEVICE);
+
+	data->addr = cpu_to_be64(dma + frame->page_offset);
+	dma_wmb();
+	data->byte_count = cpu_to_be32(length);
+
+	/* tx completion can avoid cache line miss for common cases */
+
+	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
+		((ring->prod & ring->size) ?
+		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
+
+	rx_ring->xdp_tx++;
+	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
+
+	ring->prod += MLX4_EN_XDP_TX_NRTXBB;
+
+	/* Ensure new descriptor hits memory
+	 * before setting ownership of this descriptor to HW
+	 */
+	dma_wmb();
+	tx_desc->ctrl.owner_opcode = op_own;
+	ring->xmit_more++;
+
+	*doorbell_pending = true;
+
+	return NETDEV_TX_OK;
+
+tx_drop_count:
+	rx_ring->xdp_tx_full++;
+	*doorbell_pending = true;
+tx_drop:
+	return NETDEV_TX_BUSY;
+}

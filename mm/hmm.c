@@ -827,7 +827,7 @@ static void hmm_devmem_release(struct device *dev, void *data)
 	page = pfn_to_page(start_pfn);
 	zone = page_zone(page);
 
-	__remove_pages(zone, start_pfn, npages);
+	__remove_pages(zone, start_pfn, npages, NULL);
 
 	hmm_devmem_radix_release(resource);
 }
@@ -870,7 +870,7 @@ static int hmm_devmem_pages_create(struct hmm_devmem *devmem)
 		return -ENXIO;
 
 	devmem->pagemap.type = MEMORY_HMM;
-	devmem->pagemap.res = devmem->resource;
+	devmem->pagemap.res = *devmem->resource;
 	devmem->pagemap.page_fault = hmm_devmem_fault;
 	devmem->pagemap.page_free = hmm_devmem_free;
 	devmem->pagemap.dev = devmem->device;
@@ -907,7 +907,7 @@ static int hmm_devmem_pages_create(struct hmm_devmem *devmem)
 	if (nid < 0)
 		nid = numa_mem_id();
 
-	ret = add_pages(nid, align_start, align_size, true);
+	ret = add_pages(nid, align_start, align_size, NULL, true);
 	if (ret)
 		goto error_radix;
 

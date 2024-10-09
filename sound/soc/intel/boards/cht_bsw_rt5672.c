@@ -24,9 +24,10 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <sound/jack.h>
+#include <sound/soc-acpi.h>
 #include "../../codecs/rt5670.h"
 #include "../atom/sst-atom-controls.h"
-#include "../common/sst-acpi.h"
+
 
 /* The platform clock #3 outputs 19.2Mhz clock to codec as I2S MCLK */
 #define CHT_PLAT_CLK_3_HZ	19200000
@@ -34,7 +35,7 @@
 
 struct cht_mc_private {
 	struct snd_soc_jack headset;
-	char codec_name[16];
+	char codec_name[SND_ACPI_I2C_ID_LEN];
 	struct clk *mclk;
 };
 
@@ -381,7 +382,7 @@ static int snd_cht_mc_probe(struct platform_device *pdev)
 {
 	int ret_val = 0;
 	struct cht_mc_private *drv;
-	struct sst_acpi_mach *mach = pdev->dev.platform_data;
+	struct snd_soc_acpi_mach *mach = pdev->dev.platform_data;
 	const char *i2c_name;
 	int i;
 
@@ -393,7 +394,7 @@ static int snd_cht_mc_probe(struct platform_device *pdev)
 
 	/* fixup codec name based on HID */
 	if (mach) {
-		i2c_name = sst_acpi_find_name_from_hid(mach->id);
+		i2c_name = snd_soc_acpi_find_name_from_hid(mach->id);
 		if (i2c_name) {
 			snprintf(drv->codec_name, sizeof(drv->codec_name),
 				 "i2c-%s", i2c_name);

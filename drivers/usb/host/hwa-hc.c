@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Host Wire Adapter:
  * Driver glue, HWA-specific functions, bridges to WAHC and WUSBHC
@@ -826,6 +827,7 @@ static int hwahc_probe(struct usb_interface *usb_iface,
 		dev_err(dev, "Cannot add HCD: %d\n", result);
 		goto error_add_hcd;
 	}
+	device_wakeup_enable(usb_hcd->self.controller);
 	result = wusbhc_b_create(&hwahc->wusbhc);
 	if (result < 0) {
 		dev_err(dev, "Cannot setup phase B of WUSBHC: %d\n", result);

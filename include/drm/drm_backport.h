@@ -13,6 +13,7 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/console.h>
+#include <linux/refcount.h>
 
 
 #include <linux/time64.h>
@@ -119,33 +120,6 @@ extern struct workqueue_struct *system_power_efficient_wq;
  */
 
 #include <linux/rculist.h>
-
-/* stubs, we don't have mipi-dsi.. */
-struct mipi_dsi_device;
-struct mipi_dsi_packet;
-struct mipi_dsi_msg;
-static inline ssize_t mipi_dsi_dcs_write_buffer(struct mipi_dsi_device *dsi,
-				  const void *data, size_t len)
-{
-	return -EINVAL;
-}
-
-static inline ssize_t mipi_dsi_generic_write(struct mipi_dsi_device *dsi, const void *payload,
-			       size_t size)
-{
-	return -EINVAL;
-}
-
-static inline int mipi_dsi_create_packet(struct mipi_dsi_packet *packet,
-			   const struct mipi_dsi_msg *msg)
-{
-	return -EINVAL;
-}
-
-static inline int mipi_dsi_attach(struct mipi_dsi_device *dsi)
-{
-	return -ENOSYS;
-}
 
 #define cpu_relax_lowlatency() cpu_relax()
 #define pagefault_disabled()   in_atomic()
@@ -377,6 +351,20 @@ do {						\
 enum {
 	PCI_DEV_FLAGS_NEEDS_RESUME = 0,
 };
+
+#define get_random_u32() ((u32)get_random_int())
+#define dev_pm_set_driver_flags(...) do { } while (0)
+#define __GFP_RETRY_MAYFAIL __GFP_REPEAT
+
+/* TODO partial backport of a55bbd375d1802141f0f043e2cd08f85c23d6209 */
+#define idr_for_each_entry_continue(idp, entry, id)                    \
+       for ((entry) = idr_get_next((idp), &(id));                      \
+            entry;                                                     \
+            ++id, (entry) = idr_get_next((idp), &(id)))
+
+/* until 8eb8284b412906181357c2b0110d879d5af95e52 is backported: */
+#define kmem_cache_create_usercopy(n, s, a, f, uo, us, c) \
+	kmem_cache_create(n, s, a, f, c)
 
 int __init drm_backport_init(void);
 void __exit drm_backport_exit(void);

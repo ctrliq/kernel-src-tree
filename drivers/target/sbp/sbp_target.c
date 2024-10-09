@@ -28,6 +28,7 @@
 #include <linux/string.h>
 #include <linux/configfs.h>
 #include <linux/ctype.h>
+#include <linux/delay.h>
 #include <linux/firewire.h>
 #include <linux/firewire-constants.h>
 #include <scsi/scsi.h>
@@ -928,7 +929,7 @@ static struct sbp_target_request *sbp_mgt_get_req(struct sbp_session *sess,
 	struct sbp_target_request *req;
 	int tag;
 
-	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, GFP_ATOMIC);
+	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
 	if (tag < 0)
 		return ERR_PTR(-ENOMEM);
 
@@ -1726,16 +1727,6 @@ static void sbp_release_cmd(struct se_cmd *se_cmd)
 	sbp_free_request(req);
 }
 
-static int sbp_shutdown_session(struct se_session *se_sess)
-{
-	return 0;
-}
-
-static void sbp_close_session(struct se_session *se_sess)
-{
-	return;
-}
-
 static u32 sbp_sess_get_index(struct se_session *se_sess)
 {
 	return 0;
@@ -2349,8 +2340,6 @@ static const struct target_core_fabric_ops sbp_ops = {
 	.tpg_check_prod_mode_write_protect = sbp_check_false,
 	.tpg_get_inst_index		= sbp_tpg_get_inst_index,
 	.release_cmd			= sbp_release_cmd,
-	.shutdown_session		= sbp_shutdown_session,
-	.close_session			= sbp_close_session,
 	.sess_get_index			= sbp_sess_get_index,
 	.write_pending			= sbp_write_pending,
 	.write_pending_status		= sbp_write_pending_status,

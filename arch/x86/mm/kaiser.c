@@ -470,7 +470,7 @@ void __init kaiser_init(void)
 		pr_info("x86/pti: Xen PV detected, disabling "
 			"PTI protection\n");
 	} else if ((kpti_force_enabled > 0) ||
-		   (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
+		   (boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN) &&
 		   !kpti_force_enabled)) {
 		pr_info("x86/pti: Unmapping kernel while in userspace\n");
 		kaiser_enable_pcp(true);

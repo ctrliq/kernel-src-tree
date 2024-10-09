@@ -991,14 +991,14 @@ gf100_grctx_pack_tpc[] = {
  ******************************************************************************/
 
 int
-gf100_grctx_mmio_data(struct gf100_grctx *info, u32 size, u32 align, u32 access)
+gf100_grctx_mmio_data(struct gf100_grctx *info, u32 size, u32 align, bool priv)
 {
 	if (info->data) {
 		info->buffer[info->buffer_nr] = round_up(info->addr, align);
 		info->addr = info->buffer[info->buffer_nr] + size;
 		info->data->size = size;
 		info->data->align = align;
-		info->data->access = access;
+		info->data->priv = priv;
 		info->data++;
 		return info->buffer_nr++;
 	}
@@ -1040,9 +1040,8 @@ void
 gf100_grctx_generate_bundle(struct gf100_grctx *info)
 {
 	const struct gf100_grctx_func *grctx = info->gr->func->grctx;
-	const u32 access = NV_MEM_ACCESS_RW | NV_MEM_ACCESS_SYS;
 	const int s = 8;
-	const int b = mmio_vram(info, grctx->bundle_size, (1 << s), access);
+	const int b = mmio_vram(info, grctx->bundle_size, (1 << s), true);
 	mmio_refn(info, 0x408004, 0x00000000, s, b);
 	mmio_wr32(info, 0x408008, 0x80000000 | (grctx->bundle_size >> s));
 	mmio_refn(info, 0x418808, 0x00000000, s, b);
@@ -1053,9 +1052,8 @@ void
 gf100_grctx_generate_pagepool(struct gf100_grctx *info)
 {
 	const struct gf100_grctx_func *grctx = info->gr->func->grctx;
-	const u32 access = NV_MEM_ACCESS_RW | NV_MEM_ACCESS_SYS;
 	const int s = 8;
-	const int b = mmio_vram(info, grctx->pagepool_size, (1 << s), access);
+	const int b = mmio_vram(info, grctx->pagepool_size, (1 << s), true);
 	mmio_refn(info, 0x40800c, 0x00000000, s, b);
 	mmio_wr32(info, 0x408010, 0x80000000);
 	mmio_refn(info, 0x419004, 0x00000000, s, b);
@@ -1069,9 +1067,8 @@ gf100_grctx_generate_attrib(struct gf100_grctx *info)
 	const struct gf100_grctx_func *grctx = gr->func->grctx;
 	const u32 attrib = grctx->attrib_nr;
 	const u32   size = 0x20 * (grctx->attrib_nr_max + grctx->alpha_nr_max);
-	const u32 access = NV_MEM_ACCESS_RW;
 	const int s = 12;
-	const int b = mmio_vram(info, size * gr->tpc_total, (1 << s), access);
+	const int b = mmio_vram(info, size * gr->tpc_total, (1 << s), false);
 	int gpc, tpc;
 	u32 bo = 0;
 
@@ -1100,23 +1097,18 @@ gf100_grctx_generate_r4060a8(struct gf100_gr *gr)
 	struct nvkm_device *device = gr->base.engine.subdev.device;
 	const u8 gpcmax = nvkm_rd32(device, 0x022430);
 	const u8 tpcmax = nvkm_rd32(device, 0x022434) * gpcmax;
-	u8 tpcnr[GPC_MAX], data[TPC_MAX];
-	int gpc, tpc, i;
+	int i, j, sm = 0;
+	u32 data;
 
-	memcpy(tpcnr, gr->tpc_nr, sizeof(gr->tpc_nr));
-	memset(data, 0x1f, sizeof(data));
-
-	gpc = -1;
-	for (tpc = 0; tpc < gr->tpc_total; tpc++) {
-		do {
-			gpc = (gpc + 1) % gr->gpc_nr;
-		} while (!tpcnr[gpc]);
-		tpcnr[gpc]--;
-		data[tpc] = gpc;
+	for (i = 0; i < DIV_ROUND_UP(tpcmax, 4); i++) {
+		for (data = 0, j = 0; j < 4; j++) {
+			if (sm < gr->sm_nr)
+				data |= gr->sm[sm++].gpc << (j * 8);
+			else
+				data |= 0x1f << (j * 8);
+		}
+		nvkm_wr32(device, 0x4060a8 + (i * 4), data);
 	}
-
-	for (i = 0; i < DIV_ROUND_UP(tpcmax, 4); i++)
-		nvkm_wr32(device, 0x4060a8 + (i * 4), ((u32 *)data)[i]);
 }
 
 void
@@ -1124,27 +1116,14 @@ gf100_grctx_generate_rop_mapping(struct gf100_gr *gr)
 {
 	struct nvkm_device *device = gr->base.engine.subdev.device;
 	u32 data[6] = {}, data2[2] = {};
-	u8  tpcnr[GPC_MAX];
 	u8  shift, ntpcv;
-	int gpc, tpc, i;
+	int i;
 
-	/* calculate first set of magics */
-	memcpy(tpcnr, gr->tpc_nr, sizeof(gr->tpc_nr));
+	/* Pack tile map into register format. */
+	for (i = 0; i < 32; i++)
+		data[i / 6] |= (gr->tile[i] & 0x07) << ((i % 6) * 5);
 
-	gpc = -1;
-	for (tpc = 0; tpc < gr->tpc_total; tpc++) {
-		do {
-			gpc = (gpc + 1) % gr->gpc_nr;
-		} while (!tpcnr[gpc]);
-		tpcnr[gpc]--;
-
-		data[tpc / 6] |= gpc << ((tpc % 6) * 5);
-	}
-
-	for (; tpc < 32; tpc++)
-		data[tpc / 6] |= 7 << ((tpc % 6) * 5);
-
-	/* and the second... */
+	/* Magic. */
 	shift = 0;
 	ntpcv = gr->tpc_total;
 	while (!(ntpcv & (1 << 4))) {
@@ -1347,16 +1326,13 @@ gf100_grctx_generate_floorsweep(struct gf100_gr *gr)
 {
 	struct nvkm_device *device = gr->base.engine.subdev.device;
 	const struct gf100_grctx_func *func = gr->func->grctx;
-	int tpc, gpc, sm, i, j;
+	int gpc, sm, i, j;
 	u32 data;
 
-	for (tpc = 0, sm = 0; tpc < gr->tpc_max; tpc++) {
-		for (gpc = 0; gpc < gr->gpc_nr; gpc++) {
-			if (tpc < gr->tpc_nr[gpc])
-				func->sm_id(gr, gpc, tpc, sm++);
-			if (func->tpc_nr)
-				func->tpc_nr(gr, gpc);
-		}
+	for (sm = 0; sm < gr->sm_nr; sm++) {
+		func->sm_id(gr, gr->sm[sm].gpc, gr->sm[sm].tpc, sm);
+		if (func->tpc_nr)
+			func->tpc_nr(gr, gr->sm[sm].gpc);
 	}
 
 	for (gpc = 0, i = 0; i < 4; i++) {
@@ -1409,6 +1385,8 @@ gf100_grctx_generate_main(struct gf100_gr *gr, struct gf100_grctx *info)
 		gf100_gr_mmio(gr, gr->fuc_sw_ctx);
 	}
 
+	gf100_gr_wait_idle(gr);
+
 	idle_timeout = nvkm_mask(device, 0x404154, 0xffffffff, 0x00000000);
 
 	grctx->pagepool(info);
@@ -1420,10 +1398,16 @@ gf100_grctx_generate_main(struct gf100_gr *gr, struct gf100_grctx *info)
 
 	gf100_grctx_generate_floorsweep(gr);
 
+	gf100_gr_wait_idle(gr);
+
+	if (grctx->r400088) grctx->r400088(gr, false);
 	if (gr->fuc_bundle)
 		gf100_gr_icmd(gr, gr->fuc_bundle);
 	else
 		gf100_gr_icmd(gr, grctx->icmd);
+	if (grctx->sw_veid_bundle_init)
+		gf100_gr_icmd(gr, grctx->sw_veid_bundle_init);
+	if (grctx->r400088) grctx->r400088(gr, true);
 
 	nvkm_wr32(device, 0x404154, idle_timeout);
 
@@ -1449,85 +1433,113 @@ gf100_grctx_generate_main(struct gf100_gr *gr, struct gf100_grctx *info)
 		grctx->r408840(gr);
 }
 
+#define CB_RESERVED 0x80000
+
 int
 gf100_grctx_generate(struct gf100_gr *gr)
 {
 	const struct gf100_grctx_func *grctx = gr->func->grctx;
 	struct nvkm_subdev *subdev = &gr->base.engine.subdev;
 	struct nvkm_device *device = subdev->device;
-	struct nvkm_memory *chan;
+	struct nvkm_memory *inst = NULL;
+	struct nvkm_memory *data = NULL;
+	struct nvkm_vmm *vmm = NULL;
+	struct nvkm_vma *ctx = NULL;
 	struct gf100_grctx info;
 	int ret, i;
 	u64 addr;
 
-	/* allocate memory to for a "channel", which we'll use to generate
-	 * the default context values
-	 */
-	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST, 0x80000 + gr->size,
-			      0x1000, true, &chan);
-	if (ret) {
-		nvkm_error(subdev, "failed to allocate chan memory, %d\n", ret);
-		return ret;
-	}
-
-	addr = nvkm_memory_addr(chan);
-
-	/* PGD pointer */
-	nvkm_kmap(chan);
-	nvkm_wo32(chan, 0x0200, lower_32_bits(addr + 0x1000));
-	nvkm_wo32(chan, 0x0204, upper_32_bits(addr + 0x1000));
-	nvkm_wo32(chan, 0x0208, 0xffffffff);
-	nvkm_wo32(chan, 0x020c, 0x000000ff);
-
-	/* PGT[0] pointer */
-	nvkm_wo32(chan, 0x1000, 0x00000000);
-	nvkm_wo32(chan, 0x1004, 0x00000001 | (addr + 0x2000) >> 8);
-
-	/* identity-map the whole "channel" into its own vm */
-	for (i = 0; i < nvkm_memory_size(chan) / 4096; i++) {
-		u64 addr = ((nvkm_memory_addr(chan) + (i * 4096)) >> 8) | 1;
-		nvkm_wo32(chan, 0x2000 + (i * 8), lower_32_bits(addr));
-		nvkm_wo32(chan, 0x2004 + (i * 8), upper_32_bits(addr));
-	}
-
-	/* context pointer (virt) */
-	nvkm_wo32(chan, 0x0210, 0x00080004);
-	nvkm_wo32(chan, 0x0214, 0x00000000);
-	nvkm_done(chan);
-
-	nvkm_wr32(device, 0x100cb8, (addr + 0x1000) >> 8);
-	nvkm_wr32(device, 0x100cbc, 0x80000001);
+	/* NV_PGRAPH_FE_PWR_MODE_FORCE_ON. */
+	nvkm_wr32(device, 0x404170, 0x00000012);
 	nvkm_msec(device, 2000,
-		if (nvkm_rd32(device, 0x100c80) & 0x00008000)
+		if (!(nvkm_rd32(device, 0x404170) & 0x00000010))
 			break;
 	);
 
-	/* setup default state for mmio list construction */
+	if (grctx->unkn88c)
+		grctx->unkn88c(gr, true);
+
+	/* Reset FECS. */
+	nvkm_wr32(device, 0x409614, 0x00000070);
+	nvkm_usec(device, 10, NVKM_DELAY);
+	nvkm_mask(device, 0x409614, 0x00000700, 0x00000700);
+	nvkm_usec(device, 10, NVKM_DELAY);
+	nvkm_rd32(device, 0x409614);
+
+	if (grctx->unkn88c)
+		grctx->unkn88c(gr, false);
+
+	/* NV_PGRAPH_FE_PWR_MODE_AUTO. */
+	nvkm_wr32(device, 0x404170, 0x00000010);
+
+	/* Init SCC RAM. */
+	nvkm_wr32(device, 0x40802c, 0x00000001);
+
+	/* Allocate memory to for a "channel", which we'll use to generate
+	 * the default context values.
+	 */
+	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST,
+			      0x1000, 0x1000, true, &inst);
+	if (ret)
+		goto done;
+
+	ret = nvkm_vmm_new(device, 0, 0, NULL, 0, NULL, "grctx", &vmm);
+	if (ret)
+		goto done;
+
+	vmm->debug = subdev->debug;
+
+	ret = nvkm_vmm_join(vmm, inst);
+	if (ret)
+		goto done;
+
+	ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST,
+			      CB_RESERVED + gr->size, 0, true, &data);
+	if (ret)
+		goto done;
+
+	ret = nvkm_vmm_get(vmm, 0, nvkm_memory_size(data), &ctx);
+	if (ret)
+		goto done;
+
+	ret = nvkm_memory_map(data, 0, vmm, ctx, NULL, 0);
+	if (ret)
+		goto done;
+
+
+	/* Setup context pointer. */
+	nvkm_kmap(inst);
+	nvkm_wo32(inst, 0x0210, lower_32_bits(ctx->addr + CB_RESERVED) | 4);
+	nvkm_wo32(inst, 0x0214, upper_32_bits(ctx->addr + CB_RESERVED));
+	nvkm_done(inst);
+
+	/* Setup default state for mmio list construction. */
 	info.gr = gr;
 	info.data = gr->mmio_data;
 	info.mmio = gr->mmio_list;
-	info.addr = 0x2000 + (i * 8);
+	info.addr = ctx->addr;
 	info.buffer_nr = 0;
 
-	/* make channel current */
+	/* Make channel current. */
+	addr = nvkm_memory_addr(inst) >> 12;
 	if (gr->firmware) {
 		nvkm_wr32(device, 0x409840, 0x00000030);
-		nvkm_wr32(device, 0x409500, 0x80000000 | addr >> 12);
+		nvkm_wr32(device, 0x409500, 0x80000000 | addr);
 		nvkm_wr32(device, 0x409504, 0x00000003);
 		nvkm_msec(device, 2000,
 			if (nvkm_rd32(device, 0x409800) & 0x00000010)
 				break;
 		);
 
-		nvkm_kmap(chan);
-		nvkm_wo32(chan, 0x8001c, 1);
-		nvkm_wo32(chan, 0x80020, 0);
-		nvkm_wo32(chan, 0x80028, 0);
-		nvkm_wo32(chan, 0x8002c, 0);
-		nvkm_done(chan);
+		nvkm_kmap(data);
+		nvkm_wo32(data, 0x1c, 1);
+		nvkm_wo32(data, 0x20, 0);
+		nvkm_wo32(data, 0x28, 0);
+		nvkm_wo32(data, 0x2c, 0);
+		nvkm_done(data);
 	} else {
 		nvkm_wr32(device, 0x409840, 0x80000000);
-		nvkm_wr32(device, 0x409500, 0x80000000 | addr >> 12);
+		nvkm_wr32(device, 0x409500, 0x80000000 | addr);
 		nvkm_wr32(device, 0x409504, 0x00000001);
 		nvkm_msec(device, 2000,
 			if (nvkm_rd32(device, 0x409800) & 0x80000000)
@@ -1537,8 +1549,8 @@ gf100_grctx_generate(struct gf100_gr *gr)
 
 	grctx->main(gr, &info);
 
-	/* trigger a context unload by unsetting the "next channel valid" bit
-	 * and faking a context switch interrupt
+	/* Trigger a context unload by unsetting the "next channel valid" bit
+	 * and faking a context switch interrupt.
 	 */
 	nvkm_mask(device, 0x409b04, 0x80000000, 0x00000000);
 	nvkm_wr32(device, 0x409000, 0x00000100);
@@ -1552,17 +1564,21 @@ gf100_grctx_generate(struct gf100_gr *gr)
 
 	gr->data = kmalloc(gr->size, GFP_KERNEL);
 	if (gr->data) {
-		nvkm_kmap(chan);
+		nvkm_kmap(data);
 		for (i = 0; i < gr->size; i += 4)
-			gr->data[i / 4] = nvkm_ro32(chan, 0x80000 + i);
-		nvkm_done(chan);
+			gr->data[i / 4] = nvkm_ro32(data, CB_RESERVED + i);
+		nvkm_done(data);
 		ret = 0;
 	} else {
 		ret = -ENOMEM;
 	}
 
 done:
-	nvkm_memory_del(&chan);
+	nvkm_vmm_put(vmm, &ctx);
+	nvkm_memory_unref(&data);
+	nvkm_vmm_part(vmm, inst);
+	nvkm_vmm_unref(&vmm);
+	nvkm_memory_unref(&inst);
 	return ret;
 }
 

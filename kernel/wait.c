@@ -176,6 +176,21 @@ static inline bool is_kthread_should_stop(void)
 	return (current->flags & PF_KTHREAD) && kthread_should_stop();
 }
 
+static int
+var_wake_function(wait_queue_t *wq_entry, unsigned int mode,
+		  int sync, void *arg)
+{
+	struct wait_bit_key *key = arg;
+	struct wait_bit_queue *wbq_entry =
+		container_of(wq_entry, struct wait_bit_queue, wait);
+
+	if (wbq_entry->key.flags != key->flags ||
+	    wbq_entry->key.bit_nr != key->bit_nr)
+		return 0;
+
+	return autoremove_wake_function(wq_entry, mode, sync, key);
+}
+
 /*
  * DEFINE_WAIT_FUNC(wait, woken_wake_func);
  *
@@ -376,6 +391,10 @@ void wake_up_bit(void *word, int bit)
 }
 EXPORT_SYMBOL(wake_up_bit);
 
+#define WAIT_TABLE_BITS 8
+#define WAIT_TABLE_SIZE (1 << WAIT_TABLE_BITS)
+static wait_queue_head_t bit_wait_table[WAIT_TABLE_SIZE] __cacheline_aligned;
+
 wait_queue_head_t *bit_waitqueue(void *word, int bit)
 {
 	const int shift = BITS_PER_LONG == 32 ? 5 : 6;
@@ -517,3 +536,39 @@ __sched int bit_wait_io_timeout(struct wait_bit_key *word, int mode)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(bit_wait_io_timeout);
+
+void init_wait_var_entry(struct wait_bit_queue *wbq_entry, void *var, int flags)
+{
+	*wbq_entry = (struct wait_bit_queue){
+		.key = {
+			.flags	= (var),
+			.bit_nr = -1,
+		},
+		.wait = {
+			.private = current,
+			.func	 = var_wake_function,
+			.task_list = LIST_HEAD_INIT(wbq_entry->wait.task_list),
+		},
+	};
+}
+EXPORT_SYMBOL(init_wait_var_entry);
+
+void wake_up_var(void *var)
+{
+	__wake_up_bit(__var_waitqueue(var), var, -1);
+}
+EXPORT_SYMBOL(wake_up_var);
+
+wait_queue_head_t *__var_waitqueue(void *p)
+{
+	return bit_wait_table + hash_ptr(p, WAIT_TABLE_BITS);
+}
+EXPORT_SYMBOL(__var_waitqueue);
+
+void __init wait_bit_init(void)
+{
+	int i;
+
+	for (i = 0; i < WAIT_TABLE_SIZE; i++)
+		init_waitqueue_head(bit_wait_table + i);
+}

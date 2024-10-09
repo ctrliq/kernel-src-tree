@@ -275,7 +275,7 @@ struct swap_info_struct {
 					 * first.
 					 */
 	RH_KABI_EXTEND(struct plist_node list)		/* entry in swap_active_head */
-	RH_KABI_EXTEND(struct plist_node avail_list)	/* entry in swap_avail_head */
+	RH_KABI_EXTEND(struct plist_node avail_lists[MAX_NUMNODES]) /* entry in swap_avail_head */
 	RH_KABI_EXTEND(struct swap_cluster_info *cluster_info) /* cluster info. Only for SSD */
 	RH_KABI_EXTEND(struct swap_cluster_list free_clusters) /* free clusters list */
 	RH_KABI_EXTEND(struct work_struct discard_work) /* discard worker */
@@ -345,6 +345,7 @@ extern void lru_add_drain(void);
 extern void lru_add_drain_cpu(int cpu);
 extern void lru_add_drain_all(void);
 extern void rotate_reclaimable_page(struct page *page);
+extern void deactivate_file_page(struct page *page);
 extern void deactivate_page(struct page *page);
 extern void swap_setup(void);
 
@@ -491,6 +492,7 @@ extern sector_t swapdev_block(int, pgoff_t);
 extern int page_swapcount(struct page *);
 extern int __swp_swapcount(swp_entry_t entry);
 extern struct swap_info_struct *page_swap_info(struct page *);
+extern struct swap_info_struct *swp_swap_info(swp_entry_t entry);
 extern int reuse_swap_page(struct page *);
 extern int try_to_free_swap(struct page *);
 struct backing_dev_info;

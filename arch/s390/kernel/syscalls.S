@@ -364,7 +364,7 @@ SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_write,sys_s390_pci_mmio_write_wrapper)
 SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_read,sys_s390_pci_mmio_read_wrapper)
 NI_SYSCALL					/* 354 sys_execveat */
 NI_SYSCALL					/* 355 sys_userfaultfd */
-NI_SYSCALL					/* 356 sys_membarrier */
+SYSCALL(sys_membarrier,sys_membarrier,sys_membarrier_wrapper)
 NI_SYSCALL					/* 357 sys_recvmmsg */
 NI_SYSCALL					/* 358 sys_sendmmsg */
 SYSCALL(sys_socket,sys_socket,sys_socket)
@@ -382,8 +382,10 @@ SYSCALL(sys_sendmsg,sys_sendmsg,sys_sendmsg_wrapper)	/* 370 */
 SYSCALL(sys_recvfrom,sys_recvfrom,sys_recvfrom_wrapper)
 SYSCALL(sys_recvmsg,sys_recvmsg,sys_recvmsg_wrapper)
 SYSCALL(sys_shutdown,sys_shutdown,sys_shutdown)
-NI_SYSCALL					/* 374 sys_mlock2 */
+SYSCALL(sys_mlock2,sys_mlock2,sys_mlock2_wrapper)
 SYSCALL(sys_copy_file_range,sys_copy_file_range,sys_copy_file_range_wrapper) /* 375 */
 NI_SYSCALL
 NI_SYSCALL
 SYSCALL(sys_s390_guarded_storage,sys_s390_guarded_storage,sys_s390_guarded_storage_wrapper) /* 378 */
+NI_SYSCALL
+SYSCALL(sys_s390_sthyi,sys_s390_sthyi,sys_s390_sthyi_wrapper) /* 380 */

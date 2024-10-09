@@ -45,8 +45,8 @@
 static char *policycap_names[] = {
 	"network_peer_controls",
 	"open_perms",
-	"extended_socket_class",
-	"always_check_network",
+	"reserved_1", /* extended_socket_class */
+	"reserved_2", /* always_check_network */
 	"cgroup_seclabel",
 	"nnp_nosuid_transition"
 };

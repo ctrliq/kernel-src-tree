@@ -6,6 +6,7 @@
  * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
  */
 #include <linux/linkage.h>
+#include <asm/nospec-insn.h>
 
 /*
  * Calling convention:
@@ -27,10 +28,12 @@
  */
 #define SKBDATA	%r8
 
+	GEN_BR_THUNK %r8
+
 	/* A = *(u32 *) (skb->data+K+X) */
 ENTRY(sk_load_word_ind)
 	ar	%r3,%r12		# offset += X
-	bmr	%r8			# < 0 -> return with cc
+	jm	sk_load_word_exit	# < 0 -> return with cc
 
 	/* A = *(u32 *) (skb->data+K) */
 ENTRY(sk_load_word)
@@ -40,7 +43,8 @@ ENTRY(sk_load_word)
 	jl	sk_load_word_slow
 	l	%r5,0(%r1,%r10)		# get word from skb
 	xr	%r1,%r1			# set cc to zero
-	br	%r8
+sk_load_word_exit:
+	BR_EX	%r8
 
 sk_load_word_slow:
 	lgr	%r9,%r2			# save %r2
@@ -51,12 +55,12 @@ sk_load_word_slow:
 	l	%r5,160(%r15)		# load result from temp buffer
 	ltgr	%r2,%r2			# set cc to (%r2 != 0)
 	lgr	%r2,%r9			# restore %r2
-	br	%r8
+	BR_EX	%r8
 
 	/* A = *(u16 *) (skb->data+K+X) */
 ENTRY(sk_load_half_ind)
 	ar	%r3,%r12		# offset += X
-	bmr	%r8			# < 0 -> return with cc
+	jm	sk_load_half_exit	# < 0 -> return with cc
 
 	/* A = *(u16 *) (skb->data+K) */
 ENTRY(sk_load_half)
@@ -66,7 +70,8 @@ ENTRY(sk_load_half)
 	jl	sk_load_half_slow
 	llgh	%r5,0(%r1,%r10)		# get half from skb
 	xr	%r1,%r1			# set cc to zero
-	br	%r8
+sk_load_half_exit:
+	BR_EX	%r8
 
 sk_load_half_slow:
 	lgr	%r9,%r2			# save %r2
@@ -78,12 +83,12 @@ sk_load_half_slow:
 	l	%r5,160(%r15)		# load result from temp buffer
 	ltgr	%r2,%r2			# set cc to (%r2 != 0)
 	lgr	%r2,%r9			# restore %r2
-	br	%r8
+	BR_EX	%r8
 
 	/* A = *(u8 *) (skb->data+K+X) */
 ENTRY(sk_load_byte_ind)
 	ar	%r3,%r12		# offset += X
-	bmr	%r8			# < 0 -> return with cc
+	jm	sk_load_byte_exit	# < 0 -> return with cc
 
 	/* A = *(u8 *) (skb->data+K) */
 ENTRY(sk_load_byte)
@@ -93,7 +98,8 @@ ENTRY(sk_load_byte)
 	lhi	%r5,0
 	ic	%r5,0(%r1,%r10)		# get byte from skb
 	xr	%r1,%r1			# set cc to zero
-	br	%r8
+sk_load_byte_exit:
+	BR_EX	%r8
 
 sk_load_byte_slow:
 	lgr	%r9,%r2			# save %r2
@@ -105,7 +111,7 @@ sk_load_byte_slow:
 	l	%r5,160(%r15)		# load result from temp buffer
 	ltgr	%r2,%r2			# set cc to (%r2 != 0)
 	lgr	%r2,%r9			# restore %r2
-	br	%r8
+	BR_Ex	%r8
 
 	/* X = (*(u8 *)(skb->data+K) & 0xf) << 2 */
 ENTRY(sk_load_byte_msh)
@@ -117,7 +123,7 @@ ENTRY(sk_load_byte_msh)
 	nill	%r12,0x0f
 	sll	%r12,2
 	xr	%r1,%r1			# set cc to zero
-	br	%r8
+	BR_EX	%r8
 
 sk_load_byte_msh_slow:
 	lgr	%r9,%r2			# save %r2
@@ -131,4 +137,4 @@ sk_load_byte_msh_slow:
 	sll	%r12,2
 	ltgr	%r2,%r2			# set cc to (%r2 != 0)
 	lgr	%r2,%r9			# restore %r2
-	br	%r8
+	BR_EX	%r8

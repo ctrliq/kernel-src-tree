@@ -24,6 +24,7 @@
 
 static int zero = 0;
 static int one = 1;
+static int two __maybe_unused = 2;
 static int ushort_max = USHRT_MAX;
 
 #ifdef CONFIG_RPS
@@ -213,8 +214,26 @@ static struct ctl_table net_core_table[] = {
 		.data		= &bpf_jit_enable,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_dointvec_minmax,
+# ifdef CONFIG_BPF_JIT_ALWAYS_ON
+		.extra1		= &one,
+		.extra2		= &one,
+# else
+		.extra1		= &zero,
+		.extra2		= &two,
+# endif
 	},
+# ifdef CONFIG_HAVE_EBPF_JIT
+	{
+		.procname	= "bpf_jit_harden",
+		.data		= &bpf_jit_harden,
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &two,
+	},
+# endif
 #endif
 	{
 		.procname	= "netdev_tstamp_prequeue",

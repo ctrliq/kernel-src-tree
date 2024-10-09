@@ -270,4 +270,6 @@ static inline pud_t native_pudp_get_and_clear(pud_t *pudp)
 #define __pte_to_swp_entry(pte)	(__swp_entry(__pteval_swp_type(pte), \
 					     __pteval_swp_offset(pte)))
 
+#include <asm/pgtable-invert.h>
+
 #endif /* _ASM_X86_PGTABLE_3LEVEL_H */

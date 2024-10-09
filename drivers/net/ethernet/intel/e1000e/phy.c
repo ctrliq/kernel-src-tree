@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /* Intel PRO/1000 Linux driver
  * Copyright(c) 1999 - 2015 Intel Corporation.
  *
@@ -2898,6 +2897,7 @@ static s32 __e1000_write_phy_reg_hv(struct e1000_hw *hw, u32 offset, u16 data,
 		    (hw->phy.addr == 2) &&
 		    !(MAX_PHY_REG_ADDRESS & reg) && (data & BIT(11))) {
 			u16 data2 = 0x7EFF;
+
 			ret_val = e1000_access_phy_debug_regs_hv(hw,
 								 BIT(6) | 0x3,
 								 &data2, false);

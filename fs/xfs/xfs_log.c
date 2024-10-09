@@ -434,7 +434,7 @@ xfs_log_reserve(
 	int		 	unit_bytes,
 	int		 	cnt,
 	struct xlog_ticket	**ticp,
-	__uint8_t	 	client,
+	uint8_t		 	client,
 	bool			permanent)
 {
 	struct xlog		*log = mp->m_log;
@@ -847,9 +847,9 @@ xfs_log_unmount_write(xfs_mount_t *mp)
 		if (!error) {
 			/* the data section must be 32 bit size aligned */
 			struct {
-			    __uint16_t magic;
-			    __uint16_t pad1;
-			    __uint32_t pad2; /* may as well make it 64 bits */
+			    uint16_t magic;
+			    uint16_t pad1;
+			    uint32_t pad2; /* may as well make it 64 bits */
 			} magic = {
 				.magic = XLOG_UNMOUNT_TYPE,
 			};
@@ -1211,8 +1211,7 @@ xlog_iodone(xfs_buf_t *bp)
 	 * IOABORT state. The IOABORT state is only set in DEBUG mode to inject
 	 * CRC errors into log recovery.
 	 */
-	if (XFS_TEST_ERROR(bp->b_error, l->l_mp, XFS_ERRTAG_IODONE_IOERR,
-			   XFS_RANDOM_IODONE_IOERR) ||
+	if (XFS_TEST_ERROR(bp->b_error, l->l_mp, XFS_ERRTAG_IODONE_IOERR) ||
 	    iclog->ic_state & XLOG_STATE_IOABORT) {
 		if (iclog->ic_state & XLOG_STATE_IOABORT)
 			iclog->ic_state &= ~XLOG_STATE_IOABORT;
@@ -1687,7 +1686,7 @@ xlog_cksum(
 	char			*dp,
 	int			size)
 {
-	__uint32_t		crc;
+	uint32_t		crc;
 
 	/* first generate the crc for the record header ... */
 	crc = xfs_start_cksum_update((char *)rhead,
@@ -1850,7 +1849,7 @@ xlog_sync(
 		 */
 		dptr = (char *)&iclog->ic_header + count;
 		for (i = 0; i < split; i += BBSIZE) {
-			__uint32_t cycle = be32_to_cpu(*(__be32 *)dptr);
+			uint32_t cycle = be32_to_cpu(*(__be32 *)dptr);
 			if (++cycle == XLOG_HEADER_MAGIC_NUM)
 				cycle++;
 			*(__be32 *)dptr = cpu_to_be32(cycle);
@@ -1864,7 +1863,6 @@ xlog_sync(
 	/* calculcate the checksum */
 	iclog->ic_header.h_crc = xlog_cksum(log, &iclog->ic_header,
 					    iclog->ic_datap, size);
-#ifdef DEBUG
 	/*
 	 * Intentionally corrupt the log record CRC based on the error injection
 	 * frequency, if defined. This facilitates testing log recovery in the
@@ -1872,15 +1870,13 @@ xlog_sync(
 	 * write on I/O completion and shutdown the fs. The subsequent mount
 	 * detects the bad CRC and attempts to recover.
 	 */
-	if (log->l_badcrc_factor &&
-	    (prandom_u32() % log->l_badcrc_factor == 0)) {
+	if (XFS_TEST_ERROR(false, log->l_mp, XFS_ERRTAG_LOG_BAD_CRC)) {
 		iclog->ic_header.h_crc &= cpu_to_le32(0xAAAAAAAA);
 		iclog->ic_state |= XLOG_STATE_IOABORT;
 		xfs_warn(log->l_mp,
 	"Intentionally corrupted log record at LSN 0x%llx. Shutdown imminent.",
 			 be64_to_cpu(iclog->ic_header.h_lsn));
 	}
-#endif
 
 	bp->b_io_length = BTOBB(count);
 	bp->b_fspriv = iclog;
@@ -2436,8 +2432,8 @@ xlog_write(
 			}
 
 			reg = &vecp[index];
-			ASSERT(reg->i_len % sizeof(__int32_t) == 0);
-			ASSERT((unsigned long)ptr % sizeof(__int32_t) == 0);
+			ASSERT(reg->i_len % sizeof(int32_t) == 0);
+			ASSERT((unsigned long)ptr % sizeof(int32_t) == 0);
 
 			start_rec_copy = xlog_write_start_rec(ptr, ticket);
 			if (start_rec_copy) {
@@ -3216,7 +3212,7 @@ xlog_state_switch_iclogs(
 	/* Round up to next log-sunit */
 	if (xfs_sb_version_haslogv2(&log->l_mp->m_sb) &&
 	    log->l_mp->m_sb.sb_logsunit > 1) {
-		__uint32_t sunit_bb = BTOBB(log->l_mp->m_sb.sb_logsunit);
+		uint32_t sunit_bb = BTOBB(log->l_mp->m_sb.sb_logsunit);
 		log->l_curr_block = roundup(log->l_curr_block, sunit_bb);
 	}
 
@@ -3844,7 +3840,7 @@ xlog_verify_iclog(
 	xlog_in_core_2_t	*xhdr;
 	void			*base_ptr, *ptr, *p;
 	ptrdiff_t		field_offset;
-	__uint8_t		clientid;
+	uint8_t			clientid;
 	int			len, i, j, k, op_len;
 	int			idx;
 

@@ -2695,7 +2695,7 @@ static bool kvm_is_mmio_pfn(kvm_pfn_t pfn)
 			 * Therefore, we check the host memory type in addition
 			 * and only treat UC/UC-/WC pages as MMIO.
 			 */
-			(!pat_enabled() || pat_pfn_immune_to_uc_mtrr(pfn));
+			(!pat_enabled || pat_pfn_immune_to_uc_mtrr(pfn));
 
 	return true;
 }
@@ -4850,6 +4850,7 @@ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gva_t cr2, u32 error_code,
 	enum emulation_result er;
 	bool direct = vcpu->arch.mmu.direct_map || mmu_is_nested(vcpu);
 
+	vcpu->arch.l1tf_flush_l1d = true;
 	if (unlikely(error_code & PFERR_RSVD_MASK)) {
 		r = handle_mmio_page_fault(vcpu, cr2, direct);
 		if (r == RET_MMIO_PF_EMULATE) {

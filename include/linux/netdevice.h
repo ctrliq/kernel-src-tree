@@ -70,6 +70,8 @@ struct bpf_prog;
 struct xdp_buff;
 
 struct netdev_xdp;
+#define netdev_bpf netdev_xdp
+
 struct net_device_extended;
 					/* source back-compat hooks */
 #define SET_ETHTOOL_OPS(netdev,ops) \
@@ -809,11 +811,15 @@ typedef u16 (*select_queue_fallback_t)(struct net_device *dev,
 				       struct sk_buff *skb);
 
 enum tc_setup_type {
-	TC_SETUP_MQPRIO,
+	TC_SETUP_QDISC_MQPRIO,
 	TC_SETUP_CLSU32,
 	TC_SETUP_CLSFLOWER,
 	TC_SETUP_CLSMATCHALL,
 	TC_SETUP_CLSBPF,
+	TC_SETUP_BLOCK,
+	TC_SETUP_QDISC_CBS,
+	TC_SETUP_QDISC_RED,
+	TC_SETUP_QDISC_PRIO,
 };
 
 /* Forward declaration of tc_to_netdev structure used by __rh_call_ndo_setup_tc
@@ -978,6 +984,8 @@ struct net_device_ops_extended {
 	int                     (*ndo_xdp_xmit)(struct net_device *dev,
 						struct xdp_buff *xdp);
 	void                    (*ndo_xdp_flush)(struct net_device *dev);
+	int                     (*ndo_bpf)(struct net_device *dev,
+					   struct netdev_bpf *bpf);
 };
 
 /* These structures hold the attributes of xdp state that are being passed
@@ -1007,8 +1015,6 @@ struct netdev_xdp {
 		struct {
 			bool prog_attached;
 			u32 prog_id;
-			/* flags with which program was installed */
-			u32 prog_flags;
 		};
 	};
 };
@@ -1802,7 +1808,7 @@ struct net_device {
 	unsigned char		broadcast[MAX_ADDR_LEN];	/* hw bcast add	*/
 
 #ifdef CONFIG_NET_CLS_ACT
-	RH_KABI_FILL_HOLE(struct tcf_proto __rcu *ingress_cl_list)
+	RH_KABI_FILL_HOLE(struct mini_Qdisc __rcu *miniq_ingress)
 #endif
 	/* Hole: 16 bytes remain */
 
@@ -2015,7 +2021,7 @@ struct net_device_extended {
 	bool needs_free_netdev;
 	void (*priv_destructor)(struct net_device *dev);
 #ifdef CONFIG_NET_CLS_ACT
-	struct tcf_proto __rcu	*egress_cl_list;
+	struct mini_Qdisc __rcu	*miniq_egress;
 #endif
 #ifdef CONFIG_NET_SCHED
 	DECLARE_HASHTABLE	(qdisc_hash, 4);
@@ -2036,8 +2042,8 @@ bool __rh_has_ndo_setup_tc(const struct net_device *dev)
 		ops->ndo_setup_tc_rh72) ? true : false;
 }
 
-int __rh_call_ndo_setup_tc(struct net_device *dev, enum tc_setup_type type,
-			   void *type_data);
+int __rh_call_ndo_setup_tc(struct net_device *dev, u32 handle,
+			   enum tc_setup_type type, void *type_data);
 
 static inline
 int netdev_get_prio_tc_map(const struct net_device *dev, u32 prio)
@@ -2397,8 +2403,19 @@ enum netdev_lag_tx_type {
 	NETDEV_LAG_TX_TYPE_HASH,
 };
 
+enum netdev_lag_hash {
+	NETDEV_LAG_HASH_NONE,
+	NETDEV_LAG_HASH_L2,
+	NETDEV_LAG_HASH_L34,
+	NETDEV_LAG_HASH_L23,
+	NETDEV_LAG_HASH_E23,
+	NETDEV_LAG_HASH_E34,
+	NETDEV_LAG_HASH_UNKNOWN,
+};
+
 struct netdev_lag_upper_info {
 	enum netdev_lag_tx_type tx_type;
+	enum netdev_lag_hash hash_type;
 };
 
 struct netdev_lag_lower_state_info {
@@ -4349,6 +4366,21 @@ static inline const char *netdev_name(const struct net_device *dev)
 	return dev->name;
 }
 
+static inline const char *netdev_reg_state(const struct net_device *dev)
+{
+	switch (dev->reg_state) {
+	case NETREG_UNINITIALIZED: return " (uninitialized)";
+	case NETREG_REGISTERED: return "";
+	case NETREG_UNREGISTERING: return " (unregistering)";
+	case NETREG_UNREGISTERED: return " (unregistered)";
+	case NETREG_RELEASED: return " (released)";
+	case NETREG_DUMMY: return " (dummy)";
+	}
+
+	WARN_ONCE(1, "%s: unknown reg_state %d\n", dev->name, dev->reg_state);
+	return " (unknown)";
+}
+
 __printf(3, 4)
 int netdev_printk(const char *level, const struct net_device *dev,
 		  const char *format, ...);
@@ -4430,10 +4462,11 @@ do {								\
  * file/line information and a backtrace.
  */
 #define netdev_WARN(dev, format, args...)			\
-	WARN(1, "netdevice: %s\n" format, netdev_name(dev), ##args)
+	WARN(1, "netdevice: %s%s: " format, netdev_name(dev),	\
+	     netdev_reg_state(dev), ##args)
 
 #define netdev_WARN_ONCE(dev, format, args...)				\
-	WARN_ONCE(1, "netdevice: %s%s\n" format, netdev_name(dev),	\
+	WARN_ONCE(1, "netdevice: %s%s: " format, netdev_name(dev),	\
 		  netdev_reg_state(dev), ##args)
 
 /* netif printk helpers, similar to netdev_printk */

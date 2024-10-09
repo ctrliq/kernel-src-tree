@@ -1075,6 +1075,10 @@ struct bnxt {
 
 #define CHIP_NUM_5745X		0xd730
 
+#define CHIP_NUM_58802		0xd802
+#define CHIP_NUM_58804		0xd804
+#define CHIP_NUM_58808		0xd808
+
 #define BNXT_CHIP_NUM_5730X(chip_num)		\
 	((chip_num) >= CHIP_NUM_57301 &&	\
 	 (chip_num) <= CHIP_NUM_57304)
@@ -1105,6 +1109,11 @@ struct bnxt {
 
 #define BNXT_CHIP_NUM_57X1X(chip_num)		\
 	(BNXT_CHIP_NUM_5731X(chip_num) || BNXT_CHIP_NUM_5741X(chip_num))
+
+#define BNXT_CHIP_NUM_588XX(chip_num)		\
+	((chip_num) == CHIP_NUM_58802 ||	\
+	 (chip_num) == CHIP_NUM_58804 ||        \
+	 (chip_num) == CHIP_NUM_58808)
 
 	struct net_device	*dev;
 	struct pci_dev		*pdev;
@@ -1166,6 +1175,7 @@ struct bnxt {
 #define BNXT_CHIP_P4_PLUS(bp)			\
 	(BNXT_CHIP_NUM_57X1X((bp)->chip_num) ||	\
 	 BNXT_CHIP_NUM_5745X((bp)->chip_num) ||	\
+	 BNXT_CHIP_NUM_588XX((bp)->chip_num) ||	\
 	 (BNXT_CHIP_NUM_58700((bp)->chip_num) &&	\
 	  !BNXT_CHIP_TYPE_NITRO_A0(bp)))
 
@@ -1428,7 +1438,10 @@ unsigned int bnxt_get_max_func_stat_ctxs(struct bnxt *bp);
 void bnxt_set_max_func_stat_ctxs(struct bnxt *bp, unsigned int max);
 unsigned int bnxt_get_max_func_cp_rings(struct bnxt *bp);
 void bnxt_set_max_func_cp_rings(struct bnxt *bp, unsigned int max);
+unsigned int bnxt_get_max_func_irqs(struct bnxt *bp);
 void bnxt_set_max_func_irqs(struct bnxt *bp, unsigned int max);
+int bnxt_get_avail_msix(struct bnxt *bp, int num);
+int bnxt_reserve_rings(struct bnxt *bp);
 void bnxt_tx_disable(struct bnxt *bp);
 void bnxt_tx_enable(struct bnxt *bp);
 int bnxt_hwrm_set_pause(struct bnxt *);

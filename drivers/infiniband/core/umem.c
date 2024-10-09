@@ -184,10 +184,10 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
 	sg_list_start = umem->sg_head.sgl;
 
 	while (npages) {
-		ret = get_user_pages(current, current->mm, cur_base,
-				     min_t(unsigned long, npages,
-					   PAGE_SIZE / sizeof (struct page *)),
-				     1, !umem->writable, page_list, vma_list);
+		ret = get_user_pages_longterm(cur_base,
+				min_t(unsigned long, npages,
+				      PAGE_SIZE / sizeof (struct page *)),
+				1, !umem->writable, page_list, vma_list);
 
 		if (ret < 0)
 			goto out;

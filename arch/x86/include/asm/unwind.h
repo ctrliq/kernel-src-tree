@@ -13,7 +13,7 @@ struct unwind_state {
 	int graph_idx;
 	bool error;
 #ifdef CONFIG_FRAME_POINTER
-	unsigned long *bp, ip;
+	unsigned long *bp, ip, *orig_sp;
 #else
 	unsigned long *sp;
 #endif

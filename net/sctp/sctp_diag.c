@@ -304,7 +304,6 @@ static int sctp_sock_dump(struct sctp_transport *tsp, void *p)
 					NETLINK_CB(cb->skb).portid,
 					cb->nlh->nlmsg_seq,
 					NLM_F_MULTI, cb->nlh) < 0) {
-			cb->args[3] = 1;
 			err = 1;
 			goto release;
 		}

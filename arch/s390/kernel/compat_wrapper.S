@@ -1524,3 +1524,21 @@ ENTRY(sys_recvmsg_wrapper)
 	llgtr	%r3,%r3		# const struct msghdr *
 	llgfr	%r4,%r4		# unsigned int
 	jg	compat_sys_recvmsg
+
+ENTRY(sys_s390_sthyi_wrapper)
+	llgfr	%r2,%r2		# unsigned long
+	llgtr	%r3,%r3		# void *
+	llgtr	%r4,%r4		# u64 *
+	llgfr	%r5,%r5		# unsigned long
+	jg	sys_s390_sthyi
+
+ENTRY(sys_membarrier_wrapper)
+	lgfr	%r2,%r2		# int
+	lgfr	%r3,%r3		# int
+	jg	sys_membarrier
+
+ENTRY(sys_mlock2_wrapper)
+	llgfr	%r2,%r2		# unsigned long
+	llgfr	%r3,%r3		# size_t
+	lgfr	%r4,%r4		# int
+	jg	sys_mlock2

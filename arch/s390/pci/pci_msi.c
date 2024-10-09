@@ -68,7 +68,7 @@ int zpci_setup_msi_irq(struct zpci_dev *zdev, struct msi_desc *msi,
 	struct msi_msg msg;
 	int rc;
 
-	map = zdev->msi_map + (nr & ZPCI_MSI_VEC_MASK);
+	map = zdev->msi_map + (nr - offset);
 	map->irq = nr;
 	map->msi = msi;
 	INIT_HLIST_NODE(&map->msi_chain);
@@ -93,9 +93,9 @@ int zpci_setup_msi_irq(struct zpci_dev *zdev, struct msi_desc *msi,
 	return 0;
 }
 
-void zpci_teardown_msi_irq(struct zpci_dev *zdev, struct msi_desc *msi)
+void zpci_teardown_msi_irq(struct zpci_dev *zdev, struct msi_desc *msi, int offset)
 {
-	int nr = msi->irq & ZPCI_MSI_VEC_MASK;
+	int nr = msi->irq - offset;
 	struct msi_map *map;
 
 	zpci_msi_set_mask_bits(msi, 1, 1);

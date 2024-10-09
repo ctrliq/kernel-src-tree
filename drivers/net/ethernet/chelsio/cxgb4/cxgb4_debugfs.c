@@ -2820,7 +2820,7 @@ static void mem_region_show(struct seq_file *seq, const char *name,
 {
 	char buf[40];
 
-	string_get_size((u64)to - from + 1, STRING_UNITS_2, buf,
+	string_get_size((u64)to - from + 1, 1, STRING_UNITS_2, buf,
 			sizeof(buf));
 	seq_printf(seq, "%-15s %#x-%#x [%s]\n", name, from, to, buf);
 }
@@ -2915,6 +2915,8 @@ static int chcr_show(struct seq_file *seq, void *v)
 		   atomic_read(&adap->chcr_stats.error));
 	seq_printf(seq, "Fallback: %10u \n",
 		   atomic_read(&adap->chcr_stats.fallback));
+	seq_printf(seq, "IPSec PDU: %10u\n",
+		   atomic_read(&adap->chcr_stats.ipsec_cnt));
 	return 0;
 }
 

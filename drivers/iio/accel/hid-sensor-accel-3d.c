@@ -42,7 +42,13 @@ struct accel_3d_state {
 	struct hid_sensor_hub_callbacks callbacks;
 	struct hid_sensor_common common_attributes;
 	struct hid_sensor_hub_attribute_info accel[ACCEL_3D_CHANNEL_MAX];
-	u32 accel_val[ACCEL_3D_CHANNEL_MAX];
+	/* Reserve for 3 channels + padding + timestamp */
+	u32 accel_val[ACCEL_3D_CHANNEL_MAX + 3];
+	int scale_pre_decml;
+	int scale_post_decml;
+	int scale_precision;
+	int value_offset;
+	int64_t timestamp;
 };
 
 static const u32 accel_3d_addresses[ACCEL_3D_CHANNEL_MAX] = {
@@ -83,7 +89,8 @@ static const struct iio_chan_spec accel_3d_channels[] = {
 		BIT(IIO_CHAN_INFO_SAMP_FREQ) |
 		BIT(IIO_CHAN_INFO_HYSTERESIS),
 		.scan_index = CHANNEL_SCAN_INDEX_Z,
-	}
+	},
+	IIO_CHAN_SOFT_TIMESTAMP(3)
 };
 
 /* Adjust channel real bits based on report descriptor */
@@ -107,26 +114,20 @@ static int accel_3d_read_raw(struct iio_dev *indio_dev,
 	int report_id = -1;
 	u32 address;
 	int ret_type;
-	s32 poll_value;
 
 	*val = 0;
 	*val2 = 0;
 	switch (mask) {
 	case 0:
-		poll_value = hid_sensor_read_poll_value(
-					&accel_state->common_attributes);
-		if (poll_value < 0)
-			return -EINVAL;
-
 		hid_sensor_power_state(&accel_state->common_attributes, true);
-		msleep_interruptible(poll_value * 2);
 		report_id = accel_state->accel[chan->scan_index].report_id;
 		address = accel_3d_addresses[chan->scan_index];
 		if (report_id >= 0)
 			*val = sensor_hub_input_attr_get_raw_value(
 					accel_state->common_attributes.hsdev,
 					HID_USAGE_SENSOR_ACCEL_3D, address,
-					report_id);
+					report_id,
+					SENSOR_HUB_SYNC);
 		else {
 			*val = 0;
 			hid_sensor_power_state(&accel_state->common_attributes,
@@ -137,12 +138,12 @@ static int accel_3d_read_raw(struct iio_dev *indio_dev,
 		ret_type = IIO_VAL_INT;
 		break;
 	case IIO_CHAN_INFO_SCALE:
-		*val = accel_state->accel[CHANNEL_SCAN_INDEX_X].units;
-		ret_type = IIO_VAL_INT;
+		*val = accel_state->scale_pre_decml;
+		*val2 = accel_state->scale_post_decml;
+		ret_type = accel_state->scale_precision;
 		break;
 	case IIO_CHAN_INFO_OFFSET:
-		*val = hid_sensor_convert_exponent(
-			accel_state->accel[CHANNEL_SCAN_INDEX_X].unit_expo);
+		*val = accel_state->value_offset;
 		ret_type = IIO_VAL_INT;
 		break;
 	case IIO_CHAN_INFO_SAMP_FREQ:
@@ -194,10 +195,11 @@ static const struct iio_info accel_3d_info = {
 };
 
 /* Function to push data to buffer */
-static void hid_sensor_push_data(struct iio_dev *indio_dev, u8 *data, int len)
+static void hid_sensor_push_data(struct iio_dev *indio_dev, void *data,
+				 int len, int64_t timestamp)
 {
 	dev_dbg(&indio_dev->dev, "hid_sensor_push_data\n");
-	iio_push_to_buffers(indio_dev, (u8 *)data);
+	iio_push_to_buffers_with_timestamp(indio_dev, data, timestamp);
 }
 
 /* Callback handler to send event after all samples are received and captured */
@@ -209,10 +211,17 @@ static int accel_3d_proc_event(struct hid_sensor_hub_device *hsdev,
 	struct accel_3d_state *accel_state = iio_priv(indio_dev);
 
 	dev_dbg(&indio_dev->dev, "accel_3d_proc_event\n");
-	if (atomic_read(&accel_state->common_attributes.data_ready))
+	if (atomic_read(&accel_state->common_attributes.data_ready)) {
+		if (!accel_state->timestamp)
+			accel_state->timestamp = iio_get_time_ns();
+
 		hid_sensor_push_data(indio_dev,
-				(u8 *)accel_state->accel_val,
-				sizeof(accel_state->accel_val));
+				     accel_state->accel_val,
+				     sizeof(accel_state->accel_val),
+				     accel_state->timestamp);
+
+		accel_state->timestamp = 0;
+	}
 
 	return 0;
 }
@@ -236,6 +245,12 @@ static int accel_3d_capture_sample(struct hid_sensor_hub_device *hsdev,
 		accel_state->accel_val[CHANNEL_SCAN_INDEX_X + offset] =
 						*(u32 *)raw_data;
 		ret = 0;
+	break;
+	case HID_USAGE_SENSOR_TIME_TIMESTAMP:
+		accel_state->timestamp =
+			hid_sensor_convert_timestamp(
+					&accel_state->common_attributes,
+					*(int64_t *)raw_data);
 	break;
 	default:
 		break;
@@ -271,6 +286,23 @@ static int accel_3d_parse_report(struct platform_device *pdev,
 			st->accel[0].report_id,
 			st->accel[1].index, st->accel[1].report_id,
 			st->accel[2].index, st->accel[2].report_id);
+
+	st->scale_precision = hid_sensor_format_scale(
+				HID_USAGE_SENSOR_ACCEL_3D,
+				&st->accel[CHANNEL_SCAN_INDEX_X],
+				&st->scale_pre_decml, &st->scale_post_decml);
+
+	/* Set Sensitivity field ids, when there is no individual modifier */
+	if (st->common_attributes.sensitivity.index < 0) {
+		sensor_hub_input_get_attribute_info(hsdev,
+			HID_FEATURE_REPORT, usage_id,
+			HID_USAGE_SENSOR_DATA_MOD_CHANGE_SENSITIVITY_ABS |
+			HID_USAGE_SENSOR_DATA_ACCELERATION,
+			&st->common_attributes.sensitivity);
+		dev_dbg(&pdev->dev, "Sensitivity index:report %d:%d\n",
+			st->common_attributes.sensitivity.index,
+			st->common_attributes.sensitivity.report_id);
+	}
 
 	return ret;
 }
@@ -397,6 +429,7 @@ static struct platform_driver hid_accel_3d_platform_driver = {
 	.driver = {
 		.name	= KBUILD_MODNAME,
 		.owner	= THIS_MODULE,
+		.pm	= &hid_sensor_pm_ops,
 	},
 	.probe		= hid_accel_3d_probe,
 	.remove		= hid_accel_3d_remove,

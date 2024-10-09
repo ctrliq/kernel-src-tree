@@ -858,6 +858,17 @@ static inline struct qeth_card *CARD_FROM_CDEV(struct ccw_device *cdev)
 	return card;
 }
 
+static inline void qeth_scrub_qdio_buffer(struct qdio_buffer *buf,
+                                          unsigned int elements)
+{
+        unsigned int i;
+
+        for (i = 0; i < elements; i++)
+                memset(&buf->element[i], 0, sizeof(struct qdio_buffer_element));
+        buf->element[14].sflags = 0;
+        buf->element[15].sflags = 0;
+}
+
 static inline int qeth_get_micros(void)
 {
 	return (int) (get_tod_clock() >> 12);

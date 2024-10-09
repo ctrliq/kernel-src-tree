@@ -58,8 +58,8 @@ struct nvmet_fc_ls_iod {
 	struct work_struct		work;
 } __aligned(sizeof(unsigned long long));
 
+/* desired maximum for a single sequence - if sg list allows it */
 #define NVMET_FC_MAX_SEQ_LENGTH		(256 * 1024)
-#define NVMET_FC_MAX_XFR_SGENTS		(NVMET_FC_MAX_SEQ_LENGTH / PAGE_SIZE)
 
 enum nvmet_fcp_datadir {
 	NVMET_FCP_NODATA,
@@ -74,9 +74,9 @@ struct nvmet_fc_fcp_iod {
 	struct nvme_fc_cmd_iu		cmdiubuf;
 	struct nvme_fc_ersp_iu		rspiubuf;
 	dma_addr_t			rspdma;
+	struct scatterlist		*next_sg;
 	struct scatterlist		*data_sg;
 	int				data_sg_cnt;
-	u32				total_length;
 	u32				offset;
 	enum nvmet_fcp_datadir		io_dir;
 	bool				active;
@@ -957,6 +957,7 @@ nvmet_fc_find_target_assoc(struct nvmet_fc_tgtport *tgtport,
 	return ret;
 }
 
+bool tech_preview_warning_issued = false;
 
 /**
  * nvme_fc_register_targetport - transport entry point called by an
@@ -984,6 +985,11 @@ nvmet_fc_register_targetport(struct nvmet_fc_port_info *pinfo,
 	struct nvmet_fc_tgtport *newrec;
 	unsigned long flags;
 	int ret, idx;
+
+	if (!tech_preview_warning_issued) {
+		mark_tech_preview("NVMe over FC Target", THIS_MODULE);
+		tech_preview_warning_issued = true;
+	}
 
 	if (!template->xmt_ls_rsp || !template->fcp_op ||
 	    !template->fcp_abort ||
@@ -1026,8 +1032,7 @@ nvmet_fc_register_targetport(struct nvmet_fc_port_info *pinfo,
 	INIT_LIST_HEAD(&newrec->assoc_list);
 	kref_init(&newrec->ref);
 	ida_init(&newrec->assoc_cnt);
-	newrec->max_sg_cnt = min_t(u32, NVMET_FC_MAX_XFR_SGENTS,
-					template->max_sgl_segments);
+	newrec->max_sg_cnt = template->max_sgl_segments;
 
 	ret = nvmet_fc_alloc_ls_iodlist(newrec);
 	if (ret) {
@@ -1564,7 +1569,7 @@ nvmet_fc_ls_disconnect(struct nvmet_fc_tgtport *tgtport,
 
 static void nvmet_fc_fcp_nvme_cmd_done(struct nvmet_req *nvme_req);
 
-static struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops;
+static const struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops;
 
 static void
 nvmet_fc_xmt_ls_rsp_done(struct nvmefc_tgt_ls_req *lsreq)
@@ -1716,7 +1721,7 @@ nvmet_fc_alloc_tgt_pgs(struct nvmet_fc_fcp_iod *fod)
 	u32 page_len, length;
 	int i = 0;
 
-	length = fod->total_length;
+	length = fod->req.transfer_len;
 	nent = DIV_ROUND_UP(length, PAGE_SIZE);
 	sg = kmalloc_array(nent, sizeof(struct scatterlist), GFP_KERNEL);
 	if (!sg)
@@ -1742,6 +1747,7 @@ nvmet_fc_alloc_tgt_pgs(struct nvmet_fc_fcp_iod *fod)
 				((fod->io_dir == NVMET_FCP_WRITE) ?
 					DMA_FROM_DEVICE : DMA_TO_DEVICE));
 				/* note: write from initiator perspective */
+	fod->next_sg = fod->data_sg;
 
 	return 0;
 
@@ -1805,7 +1811,7 @@ nvmet_fc_prep_fcp_rsp(struct nvmet_fc_tgtport *tgtport,
 	u32 rsn, rspcnt, xfr_length;
 
 	if (fod->fcpreq->op == NVMET_FCOP_READDATA_RSP)
-		xfr_length = fod->total_length;
+		xfr_length = fod->req.transfer_len;
 	else
 		xfr_length = fod->offset;
 
@@ -1831,7 +1837,7 @@ nvmet_fc_prep_fcp_rsp(struct nvmet_fc_tgtport *tgtport,
 	rspcnt = atomic_inc_return(&fod->queue->zrspcnt);
 	if (!(rspcnt % fod->queue->ersp_ratio) ||
 	    sqe->opcode == nvme_fabrics_command ||
-	    xfr_length != fod->total_length ||
+	    xfr_length != fod->req.transfer_len ||
 	    (le16_to_cpu(cqe->status) & 0xFFFE) || cqewd[0] || cqewd[1] ||
 	    (sqe->flags & (NVME_CMD_FUSE_FIRST | NVME_CMD_FUSE_SECOND)) ||
 	    queue_90percent_full(fod->queue, le16_to_cpu(cqe->sq_head)))
@@ -1899,30 +1905,55 @@ nvmet_fc_transfer_fcp_data(struct nvmet_fc_tgtport *tgtport,
 				struct nvmet_fc_fcp_iod *fod, u8 op)
 {
 	struct nvmefc_tgt_fcp_req *fcpreq = fod->fcpreq;
+	struct scatterlist *sg = fod->next_sg;
 	unsigned long flags;
-	u32 tlen;
+	u32 remaininglen = fod->req.transfer_len - fod->offset;
+	u32 tlen = 0;
 	int ret;
 
 	fcpreq->op = op;
 	fcpreq->offset = fod->offset;
 	fcpreq->timeout = NVME_FC_TGTOP_TIMEOUT_SEC;
 
-	tlen = min_t(u32, tgtport->max_sg_cnt * PAGE_SIZE,
-			(fod->total_length - fod->offset));
+	/*
+	 * for next sequence:
+	 *  break at a sg element boundary
+	 *  attempt to keep sequence length capped at
+	 *    NVMET_FC_MAX_SEQ_LENGTH but allow sequence to
+	 *    be longer if a single sg element is larger
+	 *    than that amount. This is done to avoid creating
+	 *    a new sg list to use for the tgtport api.
+	 */
+	fcpreq->sg = sg;
+	fcpreq->sg_cnt = 0;
+	while (tlen < remaininglen &&
+	       fcpreq->sg_cnt < tgtport->max_sg_cnt &&
+	       tlen + sg_dma_len(sg) < NVMET_FC_MAX_SEQ_LENGTH) {
+		fcpreq->sg_cnt++;
+		tlen += sg_dma_len(sg);
+		sg = sg_next(sg);
+	}
+	if (tlen < remaininglen && fcpreq->sg_cnt == 0) {
+		fcpreq->sg_cnt++;
+		tlen += min_t(u32, sg_dma_len(sg), remaininglen);
+		sg = sg_next(sg);
+	}
+	if (tlen < remaininglen)
+		fod->next_sg = sg;
+	else
+		fod->next_sg = NULL;
+
 	fcpreq->transfer_length = tlen;
 	fcpreq->transferred_length = 0;
 	fcpreq->fcp_error = 0;
 	fcpreq->rsplen = 0;
-
-	fcpreq->sg = &fod->data_sg[fod->offset / PAGE_SIZE];
-	fcpreq->sg_cnt = DIV_ROUND_UP(tlen, PAGE_SIZE);
 
 	/*
 	 * If the last READDATA request: check if LLDD supports
 	 * combined xfr with response.
 	 */
 	if ((op == NVMET_FCOP_READDATA) &&
-	    ((fod->offset + fcpreq->transfer_length) == fod->total_length) &&
+	    ((fod->offset + fcpreq->transfer_length) == fod->req.transfer_len) &&
 	    (tgtport->ops->target_features & NVMET_FCTGTFEAT_READDATA_RSP)) {
 		fcpreq->op = NVMET_FCOP_READDATA_RSP;
 		nvmet_fc_prep_fcp_rsp(tgtport, fod);
@@ -2002,7 +2033,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
 		}
 
 		fod->offset += fcpreq->transferred_length;
-		if (fod->offset != fod->total_length) {
+		if (fod->offset != fod->req.transfer_len) {
 			spin_lock_irqsave(&fod->flock, flags);
 			fod->writedataactive = true;
 			spin_unlock_irqrestore(&fod->flock, flags);
@@ -2014,9 +2045,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
 		}
 
 		/* data transfer complete, resume with nvmet layer */
-
-		fod->req.execute(&fod->req);
-
+		nvmet_req_execute(&fod->req);
 		break;
 
 	case NVMET_FCOP_READDATA:
@@ -2039,7 +2068,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
 		}
 
 		fod->offset += fcpreq->transferred_length;
-		if (fod->offset != fod->total_length) {
+		if (fod->offset != fod->req.transfer_len) {
 			/* transfer the next chunk */
 			nvmet_fc_transfer_fcp_data(tgtport, fod,
 						NVMET_FCOP_READDATA);
@@ -2163,6 +2192,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
 			struct nvmet_fc_fcp_iod *fod)
 {
 	struct nvme_fc_cmd_iu *cmdiu = &fod->cmdiubuf;
+	u32 xfrlen = be32_to_cpu(cmdiu->data_len);
 	int ret;
 
 	/*
@@ -2176,7 +2206,6 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
 
 	fod->fcpreq->done = nvmet_fc_xmt_fcp_op_done;
 
-	fod->total_length = be32_to_cpu(cmdiu->data_len);
 	if (cmdiu->flags & FCNVME_CMD_FLAGS_WRITE) {
 		fod->io_dir = NVMET_FCP_WRITE;
 		if (!nvme_is_write(&cmdiu->sqe))
@@ -2187,16 +2216,13 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
 			goto transport_error;
 	} else {
 		fod->io_dir = NVMET_FCP_NODATA;
-		if (fod->total_length)
+		if (xfrlen)
 			goto transport_error;
 	}
 
 	fod->req.cmd = &fod->cmdiubuf.sqe;
 	fod->req.rsp = &fod->rspiubuf.cqe;
 	fod->req.port = fod->queue->port;
-
-	/* ensure nvmet handlers will set cmd handler callback */
-	fod->req.execute = NULL;
 
 	/* clear any response payload */
 	memset(&fod->rspiubuf, 0, sizeof(fod->rspiubuf));
@@ -2214,10 +2240,12 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
 		return;
 	}
 
+	fod->req.transfer_len = xfrlen;
+
 	/* keep a running counter of tail position */
 	atomic_inc(&fod->queue->sqtail);
 
-	if (fod->total_length) {
+	if (fod->req.transfer_len) {
 		ret = nvmet_fc_alloc_tgt_pgs(fod);
 		if (ret) {
 			nvmet_req_complete(&fod->req, ret);
@@ -2240,9 +2268,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
 	 * can invoke the nvmet_layer now. If read data, cmd completion will
 	 * push the data
 	 */
-
-	fod->req.execute(&fod->req);
-
+	nvmet_req_execute(&fod->req);
 	return;
 
 transport_error:
@@ -2556,7 +2582,7 @@ nvmet_fc_remove_port(struct nvmet_port *port)
 	/* nothing to do */
 }
 
-static struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops = {
+static const struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops = {
 	.owner			= THIS_MODULE,
 	.type			= NVMF_TRTYPE_FC,
 	.msdbd			= 1,
@@ -2568,8 +2594,6 @@ static struct nvmet_fabrics_ops nvmet_fc_tgt_fcp_ops = {
 
 static int __init nvmet_fc_init_module(void)
 {
-	mark_tech_preview("NVMe over FC", THIS_MODULE);
-
 	return nvmet_register_transport(&nvmet_fc_tgt_fcp_ops);
 }
 

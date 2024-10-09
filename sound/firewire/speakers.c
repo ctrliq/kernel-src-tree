@@ -706,10 +706,10 @@ static int fwspk_probe(struct device *unit_dev)
 	u32 firmware;
 	int err;
 
-	err = snd_card_create(-1, NULL, THIS_MODULE, sizeof(*fwspk), &card);
+	err = snd_card_new(&unit->device, -1, NULL, THIS_MODULE,
+			   sizeof(*fwspk), &card);
 	if (err < 0)
 		return err;
-	snd_card_set_dev(card, unit_dev);
 
 	fwspk = card->private_data;
 	fwspk->card = card;

@@ -161,12 +161,13 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 		} else {
 			get_page(page);
 		}
-		put_dev_pagemap(pgmap);
 		SetPageReferenced(page);
 		pages[*nr] = page;
 		(*nr)++;
 
 	} while (ptep++, addr += PAGE_SIZE, addr != end);
+	if (pgmap)
+		put_dev_pagemap(pgmap);
 	pte_unmap(ptep - 1);
 
 	return 1;
@@ -197,35 +198,53 @@ static int __gup_device_huge(unsigned long pfn, unsigned long addr,
 		SetPageReferenced(page);
 		pages[*nr] = page;
 		get_page(page);
-		put_dev_pagemap(pgmap);
 		(*nr)++;
 		pfn++;
 	} while (addr += PAGE_SIZE, addr != end);
+
+	if (pgmap)
+		put_dev_pagemap(pgmap);
 	return 1;
 }
 
-static int __gup_device_huge_pmd(pmd_t pmd, unsigned long addr,
+static int __gup_device_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 		unsigned long end, struct page **pages, int *nr)
 {
 	unsigned long fault_pfn;
+	int nr_start = *nr;
 
-	fault_pfn = pmd_pfn(pmd) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
-	return __gup_device_huge(fault_pfn, addr, end, pages, nr);
+	fault_pfn = pmd_pfn(orig) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+	if (!__gup_device_huge(fault_pfn, addr, end, pages, nr))
+		return 0;
+
+	if (unlikely(pmd_val(orig) != pmd_val(*pmdp))) {
+		undo_dev_pagemap(nr, nr_start, pages);
+		return 0;
+	}
+	return 1;
 }
 
-static int __gup_device_huge_pud(pud_t pud, unsigned long addr,
+static int __gup_device_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 		unsigned long end, struct page **pages, int *nr)
 {
 	unsigned long fault_pfn;
+	int nr_start = *nr;
 
-	fault_pfn = pud_pfn(pud) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
-	return __gup_device_huge(fault_pfn, addr, end, pages, nr);
+	fault_pfn = pud_pfn(orig) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+	if (!__gup_device_huge(fault_pfn, addr, end, pages, nr))
+		return 0;
+
+	if (unlikely(pud_val(orig) != pud_val(*pudp))) {
+		undo_dev_pagemap(nr, nr_start, pages);
+		return 0;
+	}
+	return 1;
 }
 
-static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
+static noinline int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
-	pte_t pte = *(pte_t *)&pmd;
+	pte_t pte = *(pte_t *)&orig;
 	struct page *head, *page;
 	int refs;
 
@@ -233,8 +252,8 @@ static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
 		return 0;
 
 	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
-	if (pmd_devmap(pmd))
-		return __gup_device_huge_pmd(pmd, addr, end, pages, nr);
+	if (pmd_devmap(orig))
+		return __gup_device_huge_pmd(orig, pmdp, addr, end, pages, nr);
 
 	/* hugepages are never "special" */
 	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
@@ -246,7 +265,7 @@ static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
 	if (rh_flush_tlb_others_IPI_less()) {
 		if (!page_cache_get_speculative(head))
 			return 0;
-		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&pmd))) {
+		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&orig))) {
 			put_page(head);
 			return 0;
 		}
@@ -302,7 +321,8 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
 			 */
 			if (pmd_numa(pmd))
 				return 0;
-			if (!gup_huge_pmd(pmd, addr, next, write, pages, nr))
+			if (!gup_huge_pmd(pmd, pmdp, addr, next, write,
+				pages, nr))
 				return 0;
 		} else {
 			if (!gup_pte_range(pmd, addr, next, write, pages, nr))
@@ -313,10 +333,10 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
 	return 1;
 }
 
-static noinline int gup_huge_pud(pud_t pud, unsigned long addr,
+static noinline int gup_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
-	pte_t pte = *(pte_t *)&pud;
+	pte_t pte = *(pte_t *)&orig;
 	struct page *head, *page;
 	int refs;
 
@@ -324,8 +344,8 @@ static noinline int gup_huge_pud(pud_t pud, unsigned long addr,
 		return 0;
 
 	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
-	if (pud_devmap(pud))
-		return __gup_device_huge_pud(pud, addr, end, pages, nr);
+	if (pud_devmap(orig))
+		return __gup_device_huge_pud(orig, pudp, addr, end, pages, nr);
 
 	/* hugepages are never "special" */
 	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
@@ -337,7 +357,7 @@ static noinline int gup_huge_pud(pud_t pud, unsigned long addr,
 	if (rh_flush_tlb_others_IPI_less()) {
 		if (!page_cache_get_speculative(head))
 			return 0;
-		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&pud))) {
+		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&orig))) {
 			put_page(head);
 			return 0;
 		}
@@ -375,7 +395,8 @@ static int gup_pud_range(pgd_t pgd, unsigned long addr, unsigned long end,
 		if (pud_none(pud))
 			return 0;
 		if (unlikely(pud_large(pud))) {
-			if (!gup_huge_pud(pud, addr, next, write, pages, nr))
+			if (!gup_huge_pud(pud, pudp, addr, next, write,
+					  pages, nr))
 				return 0;
 		} else {
 			if (!gup_pmd_range(pud, addr, next, write, pages, nr))

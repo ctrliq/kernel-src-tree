@@ -185,11 +185,6 @@ struct prctl_mm_map {
 #define PR_MPX_ENABLE_MANAGEMENT  43
 #define PR_MPX_DISABLE_MANAGEMENT 44
 
-#define PR_SET_FP_MODE		45
-#define PR_GET_FP_MODE		46
-# define PR_FP_MODE_FR		(1 << 0)	/* 64b FP registers */
-# define PR_FP_MODE_FRE		(1 << 1)	/* 32b compatibility */
-
 /* Control the ambient capability set */
 #define PR_CAP_AMBIENT			47
 # define PR_CAP_AMBIENT_IS_SET		1

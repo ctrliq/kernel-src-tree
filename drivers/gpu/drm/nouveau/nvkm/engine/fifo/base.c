@@ -27,6 +27,7 @@
 #include <core/client.h>
 #include <core/gpuobj.h>
 #include <core/notify.h>
+#include <subdev/mc.h>
 
 #include <nvif/event.h>
 #include <nvif/cl0080.h>
@@ -293,6 +294,8 @@ nvkm_fifo_info(struct nvkm_engine *engine, u64 mthd, u64 *data)
 	switch (mthd) {
 	case NV_DEVICE_FIFO_CHANNELS: *data = fifo->nr; return 0;
 	default:
+		if (fifo->func->info)
+			return fifo->func->info(fifo, mthd, data);
 		break;
 	}
 	return -ENOSYS;
@@ -305,6 +308,12 @@ nvkm_fifo_oneinit(struct nvkm_engine *engine)
 	if (fifo->func->oneinit)
 		return fifo->func->oneinit(fifo);
 	return 0;
+}
+
+static void
+nvkm_fifo_preinit(struct nvkm_engine *engine)
+{
+	nvkm_mc_reset(engine->subdev.device, NVKM_ENGINE_FIFO);
 }
 
 static int
@@ -331,6 +340,7 @@ nvkm_fifo_dtor(struct nvkm_engine *engine)
 static const struct nvkm_engine_func
 nvkm_fifo = {
 	.dtor = nvkm_fifo_dtor,
+	.preinit = nvkm_fifo_preinit,
 	.oneinit = nvkm_fifo_oneinit,
 	.info = nvkm_fifo_info,
 	.init = nvkm_fifo_init,

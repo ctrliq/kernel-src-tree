@@ -1,5 +1,5 @@
 ifdef CONFIG_FUNCTION_TRACER
-CFLAGS_REMOVE_clock.o = -pg
+CFLAGS_REMOVE_clock.o = $(CC_FLAGS_FTRACE)
 endif
 
 ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTER),y)
@@ -20,3 +20,4 @@ obj-$(CONFIG_SCHEDSTATS) += stats.o
 obj-$(CONFIG_SCHED_DEBUG) += debug.o
 obj-$(CONFIG_CGROUP_CPUACCT) += cpuacct.o
 obj-$(CONFIG_CPU_FREQ) += cpufreq.o
+obj-$(CONFIG_MEMBARRIER) += membarrier.o

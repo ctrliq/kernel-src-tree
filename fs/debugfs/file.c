@@ -306,8 +306,14 @@ DEFINE_SIMPLE_ATTRIBUTE(fops_ulong_wo, NULL, debugfs_ulong_set, "%llu\n");
 struct dentry *debugfs_create_ulong(const char *name, umode_t mode,
 				    struct dentry *parent, unsigned long *value)
 {
-	return debugfs_create_mode(name, mode, parent, value, &fops_ulong,
-				   &fops_ulong_ro, &fops_ulong_wo);
+	/* if there are no write bits set, make read only */
+	if (!(mode & S_IWUGO))
+		return debugfs_create_file(name, mode, parent, value, &fops_ulong_ro);
+	/* if there are no read bits set, make write only */
+	if (!(mode & S_IRUGO))
+		return debugfs_create_file(name, mode, parent, value, &fops_ulong_wo);
+
+	return debugfs_create_file(name, mode, parent, value, &fops_ulong);
 }
 EXPORT_SYMBOL_GPL(debugfs_create_ulong);
 

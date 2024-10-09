@@ -33,7 +33,9 @@
 #define mb()   __asm__ __volatile__ ("sync" : : : "memory")
 #define rmb()  __asm__ __volatile__ ("sync" : : : "memory")
 #define wmb()  __asm__ __volatile__ ("sync" : : : "memory")
+
 #define gmb()  __asm__ __volatile__ ("ori 31,31,0": : : "memory")
+#define barrier_nospec() gmb()
 
 #define set_mb(var, value)	do { var = value; mb(); } while (0)
 

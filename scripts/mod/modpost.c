@@ -2032,6 +2032,13 @@ static void add_retpoline(struct buffer *b, struct module *mod)
 		      "#endif\n");
 }
 
+static void add_mprofile(struct buffer *b)
+{
+	buf_printf(b, "#ifdef CONFIG_MPROFILE_KERNEL\n"
+		      "\tMODULE_INFO(mprofile, \"Y\");\n"
+		      "#endif\n");
+}
+
 static void write_if_changed(struct buffer *b, const char *fname)
 {
 	char *tmp;
@@ -2259,6 +2266,7 @@ int main(int argc, char **argv)
 		add_srcversion(&buf, mod);
 		add_rhelversion(&buf, mod);
 		add_retpoline(&buf, mod);
+		add_mprofile(&buf);
 
 		sprintf(fname, "%s.mod.c", mod->name);
 		write_if_changed(&buf, fname);

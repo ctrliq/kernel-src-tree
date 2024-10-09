@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * USB port LED trigger
  *
@@ -141,7 +142,7 @@ static bool usbport_trig_port_observed(struct usbport_trig_data *usbport_data,
 	 *
 	 * FIXME: This is really the device node of the connected device
 	 */
-	port_np = usb_of_get_child_node(usb_dev->dev.of_node, port1);
+	port_np = usb_of_get_device_node(usb_dev, port1);
 	if (!port_np)
 		return false;
 
@@ -151,8 +152,8 @@ static bool usbport_trig_port_observed(struct usbport_trig_data *usbport_data,
 	count = of_count_phandle_with_args(led_np, "trigger-sources",
 					   "#trigger-source-cells");
 	if (count < 0) {
-		dev_warn(dev, "Failed to get trigger sources for %s\n",
-			 led_np->full_name);
+		dev_warn(dev, "Failed to get trigger sources for %pOF\n",
+			 led_np);
 		return false;
 	}
 

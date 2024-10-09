@@ -111,26 +111,20 @@ static int gyro_3d_read_raw(struct iio_dev *indio_dev,
 	int report_id = -1;
 	u32 address;
 	int ret_type;
-	s32 poll_value;
 
 	*val = 0;
 	*val2 = 0;
 	switch (mask) {
 	case 0:
-		poll_value = hid_sensor_read_poll_value(
-					&gyro_state->common_attributes);
-		if (poll_value < 0)
-			return -EINVAL;
-
 		hid_sensor_power_state(&gyro_state->common_attributes, true);
-		msleep_interruptible(poll_value * 2);
 		report_id = gyro_state->gyro[chan->scan_index].report_id;
 		address = gyro_3d_addresses[chan->scan_index];
 		if (report_id >= 0)
 			*val = sensor_hub_input_attr_get_raw_value(
 					gyro_state->common_attributes.hsdev,
 					HID_USAGE_SENSOR_GYRO_3D, address,
-					report_id);
+					report_id,
+					SENSOR_HUB_SYNC);
 		else {
 			*val = 0;
 			hid_sensor_power_state(&gyro_state->common_attributes,
@@ -198,10 +192,11 @@ static const struct iio_info gyro_3d_info = {
 };
 
 /* Function to push data to buffer */
-static void hid_sensor_push_data(struct iio_dev *indio_dev, u8 *data, int len)
+static void hid_sensor_push_data(struct iio_dev *indio_dev, const void *data,
+	int len)
 {
 	dev_dbg(&indio_dev->dev, "hid_sensor_push_data\n");
-	iio_push_to_buffers(indio_dev, (u8 *)data);
+	iio_push_to_buffers(indio_dev, data);
 }
 
 /* Callback handler to send event after all samples are received and captured */
@@ -215,7 +210,7 @@ static int gyro_3d_proc_event(struct hid_sensor_hub_device *hsdev,
 	dev_dbg(&indio_dev->dev, "gyro_3d_proc_event\n");
 	if (atomic_read(&gyro_state->common_attributes.data_ready))
 		hid_sensor_push_data(indio_dev,
-				(u8 *)gyro_state->gyro_val,
+				gyro_state->gyro_val,
 				sizeof(gyro_state->gyro_val));
 
 	return 0;
@@ -415,6 +410,7 @@ static struct platform_driver hid_gyro_3d_platform_driver = {
 	.driver = {
 		.name	= KBUILD_MODNAME,
 		.owner	= THIS_MODULE,
+		.pm	= &hid_sensor_pm_ops,
 	},
 	.probe		= hid_gyro_3d_probe,
 	.remove		= hid_gyro_3d_remove,

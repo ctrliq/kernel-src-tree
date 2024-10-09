@@ -11,23 +11,39 @@
 #define _IIO_BUFFER_GENERIC_H_
 #include <linux/sysfs.h>
 #include <linux/iio/iio.h>
+#include <linux/kref.h>
 
 #ifdef CONFIG_IIO_BUFFER
 
 struct iio_buffer;
 
+void iio_buffer_set_attrs(struct iio_buffer *buffer,
+			 const struct attribute **attrs);
+/**
+ * INDIO_BUFFER_FLAG_FIXED_WATERMARK - Watermark level of the buffer can not be
+ *   configured. It has a fixed value which will be buffer specific.
+ */
+#define INDIO_BUFFER_FLAG_FIXED_WATERMARK BIT(0)
+
 /**
  * struct iio_buffer_access_funcs - access functions for buffers.
  * @store_to:		actually store stuff to the buffer
  * @read_first_n:	try to get a specified number of bytes (must exist)
- * @data_available:	indicates whether data for reading from the buffer is
- *			available.
+ * @data_available:	indicates how much data is available for reading from
+ *			the buffer.
  * @request_update:	if a parameter change has been marked, update underlying
  *			storage.
- * @get_bytes_per_datum:get current bytes per datum
  * @set_bytes_per_datum:set number of bytes per datum
- * @get_length:		get number of datums in buffer
  * @set_length:		set number of datums in buffer
+ * @enable:             called if the buffer is attached to a device and the
+ *                      device starts sampling. Calls are balanced with
+ *                      @disable.
+ * @disable:            called if the buffer is attached to a device and the
+ *                      device stops sampling. Calles are balanced with @enable.
+ * @release:		called when the last reference to the buffer is dropped,
+ *			should free all resources allocated by the buffer.
+ * @modes:		Supported operating modes by this buffer type
+ * @flags:		A bitmask combination of INDIO_BUFFER_FLAG_*
  *
  * The purpose of this structure is to make the buffer element
  * modular as event for a given driver, different usecases may require
@@ -38,18 +54,24 @@ struct iio_buffer;
  * any of them not existing.
  **/
 struct iio_buffer_access_funcs {
-	int (*store_to)(struct iio_buffer *buffer, u8 *data);
+	int (*store_to)(struct iio_buffer *buffer, const void *data);
 	int (*read_first_n)(struct iio_buffer *buffer,
 			    size_t n,
 			    char __user *buf);
-	bool (*data_available)(struct iio_buffer *buffer);
+	size_t (*data_available)(struct iio_buffer *buffer);
 
 	int (*request_update)(struct iio_buffer *buffer);
 
-	int (*get_bytes_per_datum)(struct iio_buffer *buffer);
 	int (*set_bytes_per_datum)(struct iio_buffer *buffer, size_t bpd);
-	int (*get_length)(struct iio_buffer *buffer);
 	int (*set_length)(struct iio_buffer *buffer, int length);
+
+	int (*enable)(struct iio_buffer *buffer, struct iio_dev *indio_dev);
+	int (*disable)(struct iio_buffer *buffer, struct iio_dev *indio_dev);
+
+	void (*release)(struct iio_buffer *buffer);
+
+	unsigned int modes;
+	unsigned int flags;
 };
 
 /**
@@ -72,6 +94,8 @@ struct iio_buffer_access_funcs {
  * @demux_list:		[INTERN] list of operations required to demux the scan.
  * @demux_bounce:	[INTERN] buffer for doing gather from incoming scan.
  * @buffer_list:	[INTERN] entry in the devices list of current buffers.
+ * @ref:		[INTERN] reference count of the buffer.
+ * @watermark:		[INTERN] number of datums to wait for poll/read.
  */
 struct iio_buffer {
 	int					length;
@@ -81,13 +105,16 @@ struct iio_buffer {
 	bool					scan_timestamp;
 	const struct iio_buffer_access_funcs	*access;
 	struct list_head			scan_el_dev_attr_list;
+	struct attribute_group			buffer_group;
 	struct attribute_group			scan_el_group;
 	wait_queue_head_t			pollq;
 	bool					stufftoread;
-	const struct attribute_group *attrs;
+	const struct attribute			**attrs;
 	struct list_head			demux_list;
-	unsigned char				*demux_bounce;
+	void					*demux_bounce;
 	struct list_head			buffer_list;
+	struct kref				ref;
+	unsigned int				watermark;
 };
 
 /**
@@ -116,7 +143,7 @@ int iio_scan_mask_query(struct iio_dev *indio_dev,
  * @indio_dev:		iio_dev structure for device.
  * @data:		Full scan.
  */
-int iio_push_to_buffers(struct iio_dev *indio_dev, unsigned char *data);
+int iio_push_to_buffers(struct iio_dev *indio_dev, const void *data);
 
 /*
  * iio_push_to_buffers_with_timestamp() - push data and timestamp to buffers
@@ -145,70 +172,31 @@ static inline int iio_push_to_buffers_with_timestamp(struct iio_dev *indio_dev,
 
 int iio_update_demux(struct iio_dev *indio_dev);
 
-/**
- * iio_buffer_register() - register the buffer with IIO core
- * @indio_dev:		device with the buffer to be registered
- * @channels:		the channel descriptions used to construct buffer
- * @num_channels:	the number of channels
- **/
-int iio_buffer_register(struct iio_dev *indio_dev,
-			const struct iio_chan_spec *channels,
-			int num_channels);
-
-/**
- * iio_buffer_unregister() - unregister the buffer from IIO core
- * @indio_dev:		the device with the buffer to be unregistered
- **/
-void iio_buffer_unregister(struct iio_dev *indio_dev);
-
-/**
- * iio_buffer_read_length() - attr func to get number of datums in the buffer
- **/
-ssize_t iio_buffer_read_length(struct device *dev,
-			       struct device_attribute *attr,
-			       char *buf);
-/**
- * iio_buffer_write_length() - attr func to set number of datums in the buffer
- **/
-ssize_t iio_buffer_write_length(struct device *dev,
-			      struct device_attribute *attr,
-			      const char *buf,
-			      size_t len);
-/**
- * iio_buffer_store_enable() - attr to turn the buffer on
- **/
-ssize_t iio_buffer_store_enable(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf,
-				size_t len);
-/**
- * iio_buffer_show_enable() - attr to see if the buffer is on
- **/
-ssize_t iio_buffer_show_enable(struct device *dev,
-			       struct device_attribute *attr,
-			       char *buf);
-#define IIO_BUFFER_LENGTH_ATTR DEVICE_ATTR(length, S_IRUGO | S_IWUSR,	\
-					   iio_buffer_read_length,	\
-					   iio_buffer_write_length)
-
-#define IIO_BUFFER_ENABLE_ATTR DEVICE_ATTR(enable, S_IRUGO | S_IWUSR,	\
-					   iio_buffer_show_enable,	\
-					   iio_buffer_store_enable)
-
 bool iio_validate_scan_mask_onehot(struct iio_dev *indio_dev,
 	const unsigned long *mask);
 
-#else /* CONFIG_IIO_BUFFER */
+struct iio_buffer *iio_buffer_get(struct iio_buffer *buffer);
+void iio_buffer_put(struct iio_buffer *buffer);
 
-static inline int iio_buffer_register(struct iio_dev *indio_dev,
-					   const struct iio_chan_spec *channels,
-					   int num_channels)
+/**
+ * iio_device_attach_buffer - Attach a buffer to a IIO device
+ * @indio_dev: The device the buffer should be attached to
+ * @buffer: The buffer to attach to the device
+ *
+ * This function attaches a buffer to a IIO device. The buffer stays attached to
+ * the device until the device is freed. The function should only be called at
+ * most once per device.
+ */
+static inline void iio_device_attach_buffer(struct iio_dev *indio_dev,
+	struct iio_buffer *buffer)
 {
-	return 0;
+	indio_dev->buffer = iio_buffer_get(buffer);
 }
 
-static inline void iio_buffer_unregister(struct iio_dev *indio_dev)
-{}
+#else /* CONFIG_IIO_BUFFER */
+
+static inline void iio_buffer_get(struct iio_buffer *buffer) {}
+static inline void iio_buffer_put(struct iio_buffer *buffer) {}
 
 #endif /* CONFIG_IIO_BUFFER */
 

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * mos7720.c
  *   Controls the Moschip 7720 usb to dual port serial converter
  *
  * Copyright 2006 Moschip Semiconductor Tech. Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 2 of the License.
  *
  * Developed by:
  * 	Vijaya Kumar <vijaykumar.gn@gmail.com>
@@ -973,7 +970,8 @@ static void mos7720_bulk_out_data_callback(struct urb *urb)
 		tty_port_tty_wakeup(&mos7720_port->port->port);
 }
 
-static int mos77xx_calc_num_ports(struct usb_serial *serial)
+static int mos77xx_calc_num_ports(struct usb_serial *serial,
+					struct usb_serial_endpoints *epds)
 {
 	u16 product = le16_to_cpu(serial->dev->descriptor.idProduct);
 

@@ -543,7 +543,11 @@ struct mm_struct {
 #else
 	RH_KABI_RESERVE(6)
 #endif /* CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS */
+#ifdef CONFIG_MEMBARRIER
+	RH_KABI_USE(7, atomic_t membarrier_state)
+#else
 	RH_KABI_RESERVE(7)
+#endif
 	RH_KABI_RESERVE(8)
 };
 

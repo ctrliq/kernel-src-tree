@@ -75,6 +75,11 @@ void blk_mq_cpu_init(void);
 void blk_mq_enable_hotplug(void);
 void blk_mq_disable_hotplug(void);
 
+/* Used by blk_insert_cloned_request() to issue request directly */
+int blk_mq_request_issue_directly(struct request *rq);
+void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+				    struct list_head *list);
+
 /*
  * CPU -> queue mappings
  */
@@ -208,5 +213,10 @@ static inline void blk_mq_put_driver_tag(struct request *rq)
 	hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu);
 	__blk_mq_put_driver_tag(hctx, rq);
 }
+
+void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
+		      unsigned int inflight[2]);
+void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+			 unsigned int inflight[2]);
 
 #endif

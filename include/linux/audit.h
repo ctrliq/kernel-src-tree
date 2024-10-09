@@ -101,6 +101,105 @@ struct filename;
 
 extern void audit_log_session_info(struct audit_buffer *ab);
 
+#ifdef CONFIG_AUDIT
+/* These are defined in audit.c */
+				/* Public API */
+extern __printf(4, 5)
+void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
+	       const char *fmt, ...);
+
+extern struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type);
+extern __printf(2, 3)
+void audit_log_format(struct audit_buffer *ab, const char *fmt, ...);
+extern void		    audit_log_end(struct audit_buffer *ab);
+extern int		    audit_string_contains_control(const char *string,
+							  size_t len);
+extern void		    audit_log_n_hex(struct audit_buffer *ab,
+					  const unsigned char *buf,
+					  size_t len);
+extern void		    audit_log_n_string(struct audit_buffer *ab,
+					       const char *buf,
+					       size_t n);
+extern void		    audit_log_n_untrustedstring(struct audit_buffer *ab,
+							const char *string,
+							size_t n);
+extern void		    audit_log_untrustedstring(struct audit_buffer *ab,
+						      const char *string);
+extern void		    audit_log_d_path(struct audit_buffer *ab,
+					     const char *prefix,
+					     const struct path *path);
+extern void		    audit_log_key(struct audit_buffer *ab,
+					  char *key);
+extern void		    audit_log_link_denied(const char *operation,
+						  struct path *link);
+extern void		    audit_log_lost(const char *message);
+#ifdef CONFIG_SECURITY
+extern void 		    audit_log_secctx(struct audit_buffer *ab, u32 secid);
+#else
+static inline void	    audit_log_secctx(struct audit_buffer *ab, u32 secid)
+{ }
+#endif
+
+extern int audit_log_task_context(struct audit_buffer *ab);
+extern void audit_log_task_info(struct audit_buffer *ab,
+				struct task_struct *tsk);
+
+extern int		    audit_update_lsm_rules(void);
+
+				/* Private API (for audit.c only) */
+extern int audit_rule_change(int type, __u32 portid, int seq,
+				void *data, size_t datasz);
+extern int audit_list_rules_send(__u32 portid, int seq);
+
+extern int audit_enabled;
+#else /* CONFIG_AUDIT */
+static inline __printf(4, 5)
+void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
+	       const char *fmt, ...)
+{ }
+static inline struct audit_buffer *audit_log_start(struct audit_context *ctx,
+						   gfp_t gfp_mask, int type)
+{
+	return NULL;
+}
+static inline __printf(2, 3)
+void audit_log_format(struct audit_buffer *ab, const char *fmt, ...)
+{ }
+static inline void audit_log_end(struct audit_buffer *ab)
+{ }
+static inline void audit_log_n_hex(struct audit_buffer *ab,
+				   const unsigned char *buf, size_t len)
+{ }
+static inline void audit_log_n_string(struct audit_buffer *ab,
+				      const char *buf, size_t n)
+{ }
+static inline void  audit_log_n_untrustedstring(struct audit_buffer *ab,
+						const char *string, size_t n)
+{ }
+static inline void audit_log_untrustedstring(struct audit_buffer *ab,
+					     const char *string)
+{ }
+static inline void audit_log_d_path(struct audit_buffer *ab,
+				    const char *prefix,
+				    const struct path *path)
+{ }
+static inline void audit_log_key(struct audit_buffer *ab, char *key)
+{ }
+static inline void audit_log_link_denied(const char *string,
+					 const struct path *link)
+{ }
+static inline void audit_log_secctx(struct audit_buffer *ab, u32 secid)
+{ }
+static inline int audit_log_task_context(struct audit_buffer *ab)
+{
+	return 0;
+}
+static inline void audit_log_task_info(struct audit_buffer *ab,
+				       struct task_struct *tsk)
+{ }
+#define audit_enabled 0
+#endif /* CONFIG_AUDIT */
+
 #ifdef CONFIG_AUDITSYSCALL
 #include <asm/syscall.h> /* for syscall_get_arch() */
 
@@ -188,8 +287,7 @@ void audit_core_dumps(long signr);
 
 static inline void audit_seccomp(unsigned long syscall, long signr, int code)
 {
-	/* Force a record to be reported if a signal was delivered. */
-	if (signr || unlikely(!audit_dummy_context()))
+	if (audit_enabled && unlikely(!audit_dummy_context()))
 		__audit_seccomp(syscall, signr, code);
 }
 
@@ -461,104 +559,6 @@ static inline bool audit_loginuid_set(struct task_struct *tsk)
 	return uid_valid(audit_get_loginuid(tsk));
 }
 
-#ifdef CONFIG_AUDIT
-/* These are defined in audit.c */
-				/* Public API */
-extern __printf(4, 5)
-void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
-	       const char *fmt, ...);
-
-extern struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type);
-extern __printf(2, 3)
-void audit_log_format(struct audit_buffer *ab, const char *fmt, ...);
-extern void		    audit_log_end(struct audit_buffer *ab);
-extern int		    audit_string_contains_control(const char *string,
-							  size_t len);
-extern void		    audit_log_n_hex(struct audit_buffer *ab,
-					  const unsigned char *buf,
-					  size_t len);
-extern void		    audit_log_n_string(struct audit_buffer *ab,
-					       const char *buf,
-					       size_t n);
-extern void		    audit_log_n_untrustedstring(struct audit_buffer *ab,
-							const char *string,
-							size_t n);
-extern void		    audit_log_untrustedstring(struct audit_buffer *ab,
-						      const char *string);
-extern void		    audit_log_d_path(struct audit_buffer *ab,
-					     const char *prefix,
-					     const struct path *path);
-extern void		    audit_log_key(struct audit_buffer *ab,
-					  char *key);
-extern void		    audit_log_link_denied(const char *operation,
-						  struct path *link);
-extern void		    audit_log_lost(const char *message);
-#ifdef CONFIG_SECURITY
-extern void 		    audit_log_secctx(struct audit_buffer *ab, u32 secid);
-#else
-static inline void	    audit_log_secctx(struct audit_buffer *ab, u32 secid)
-{ }
-#endif
-
-extern int audit_log_task_context(struct audit_buffer *ab);
-extern void audit_log_task_info(struct audit_buffer *ab,
-				struct task_struct *tsk);
-
-extern int		    audit_update_lsm_rules(void);
-
-				/* Private API (for audit.c only) */
-extern int audit_rule_change(int type, __u32 portid, int seq,
-				void *data, size_t datasz);
-extern int audit_list_rules_send(__u32 portid, int seq);
-
-extern int audit_enabled;
-#else /* CONFIG_AUDIT */
-static inline __printf(4, 5)
-void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
-	       const char *fmt, ...)
-{ }
-static inline struct audit_buffer *audit_log_start(struct audit_context *ctx,
-						   gfp_t gfp_mask, int type)
-{
-	return NULL;
-}
-static inline __printf(2, 3)
-void audit_log_format(struct audit_buffer *ab, const char *fmt, ...)
-{ }
-static inline void audit_log_end(struct audit_buffer *ab)
-{ }
-static inline void audit_log_n_hex(struct audit_buffer *ab,
-				   const unsigned char *buf, size_t len)
-{ }
-static inline void audit_log_n_string(struct audit_buffer *ab,
-				      const char *buf, size_t n)
-{ }
-static inline void  audit_log_n_untrustedstring(struct audit_buffer *ab,
-						const char *string, size_t n)
-{ }
-static inline void audit_log_untrustedstring(struct audit_buffer *ab,
-					     const char *string)
-{ }
-static inline void audit_log_d_path(struct audit_buffer *ab,
-				    const char *prefix,
-				    const struct path *path)
-{ }
-static inline void audit_log_key(struct audit_buffer *ab, char *key)
-{ }
-static inline void audit_log_link_denied(const char *string,
-					 const struct path *link)
-{ }
-static inline void audit_log_secctx(struct audit_buffer *ab, u32 secid)
-{ }
-static inline int audit_log_task_context(struct audit_buffer *ab)
-{
-	return 0;
-}
-static inline void audit_log_task_info(struct audit_buffer *ab,
-				       struct task_struct *tsk)
-{ }
-#define audit_enabled 0
-#endif /* CONFIG_AUDIT */
 static inline void audit_log_string(struct audit_buffer *ab, const char *buf)
 {
 	audit_log_n_string(ab, buf, strlen(buf));

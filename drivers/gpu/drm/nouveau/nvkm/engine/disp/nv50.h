@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NV50_DISP_H__
 #define __NV50_DISP_H__
 #define nv50_disp(p) container_of((p), struct nv50_disp, base)
@@ -17,7 +18,7 @@ struct nv50_disp {
 	struct {
 		unsigned long mask;
 		int nr;
-	} head, dac;
+	} wndw, head, dac;
 
 	struct {
 		unsigned long mask;
@@ -34,7 +35,7 @@ struct nv50_disp {
 	struct nvkm_gpuobj *inst;
 	struct nvkm_ramht *ramht;
 
-	struct nv50_disp_chan *chan[21];
+	struct nv50_disp_chan *chan[81];
 };
 
 void nv50_disp_super_1(struct nv50_disp *);
@@ -61,7 +62,9 @@ struct nv50_disp_func {
 	struct {
 		int (*cnt)(struct nvkm_disp *, unsigned long *mask);
 		int (*new)(struct nvkm_disp *, int id);
-	} head, dac, sor, pior;
+	} wndw, head, dac, sor, pior;
+
+	u16 ramht_size;
 };
 
 int nv50_disp_init(struct nv50_disp *);
@@ -78,4 +81,12 @@ void gf119_disp_intr_error(struct nv50_disp *, int);
 void nv50_disp_dptmds_war_2(struct nv50_disp *, struct dcb_output *);
 void nv50_disp_dptmds_war_3(struct nv50_disp *, struct dcb_output *);
 void nv50_disp_update_sppll1(struct nv50_disp *);
+
+extern const struct nvkm_event_func nv50_disp_chan_uevent;
+int  nv50_disp_chan_uevent_ctor(struct nvkm_object *, void *, u32,
+				struct nvkm_notify *);
+void nv50_disp_chan_uevent_send(struct nv50_disp *, int);
+
+extern const struct nvkm_event_func gf119_disp_chan_uevent;
+extern const struct nvkm_event_func gv100_disp_chan_uevent;
 #endif

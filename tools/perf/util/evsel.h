@@ -132,6 +132,7 @@ struct perf_evsel {
 	char			*group_name;
 	bool			cmdline_group_boundary;
 	struct list_head	config_terms;
+	bool			auto_merge_stats;
 	bool			merged_stat;
 	const char *		metric_expr;
 	const char *		metric_name;

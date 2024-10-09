@@ -604,7 +604,7 @@ static u32 skx_deadline_rev(void)
 	case 0x04: return 0x02000014;
 	}
 
-	if (boot_cpu_data.x86_stepping > 4)
+	if (boot_cpu_data.x86_mask > 4)
 		return 0;
 
 	return ~0U;
@@ -2233,6 +2233,21 @@ void disconnect_bsp_APIC(int virt_wire_setup)
 	apic_write(APIC_LVT1, value);
 }
 
+/**
+ * apic_id_is_primary_thread - Check whether APIC ID belongs to a primary thread
+ * @id:	APIC ID to check
+ */
+bool apic_id_is_primary_thread(unsigned int apicid)
+{
+	u32 mask;
+
+	if (smp_num_siblings == 1)
+		return true;
+	/* Isolate the SMT bit(s) in the APICID and check for 0 */
+	mask = (1U << (fls(smp_num_siblings) - 1)) - 1;
+	return !(apicid & mask);
+}
+
 int generic_processor_info(int apicid, int version)
 {
 	int cpu, max = nr_cpu_ids;
@@ -2301,6 +2316,7 @@ int generic_processor_info(int apicid, int version)
 	}
 
 	num_processors++;
+
 	if (apicid == boot_cpu_physical_apicid) {
 		/*
 		 * x86_bios_cpu_apicid is required to have processors listed

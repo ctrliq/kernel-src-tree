@@ -56,6 +56,7 @@
 #include <rdma/ib_umem.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/vmw_pvrdma-abi.h>
+#include <linux/refcount.h>  /* rhel7-only */
 
 #include "pvrdma_ring.h"
 #include "pvrdma_dev_api.h"

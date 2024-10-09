@@ -176,6 +176,7 @@ int out_of_line_wait_on_bit_timeout(void *, int, wait_bit_action_f *, unsigned, 
 int out_of_line_wait_on_bit_lock(void *, int, wait_bit_action_f *, unsigned);
 int out_of_line_wait_on_atomic_t(atomic_t *, int (*)(atomic_t *), unsigned);
 wait_queue_head_t *bit_waitqueue(void *, int);
+extern void __init wait_bit_init(void);
 
 #define wake_up(x)			__wake_up(x, TASK_NORMAL, 1, NULL)
 #define wake_up_nr(x, nr)		__wake_up(x, TASK_NORMAL, nr, NULL)
@@ -1217,4 +1218,85 @@ int wait_on_atomic_t(atomic_t *val, int (*action)(atomic_t *), unsigned mode)
 	return out_of_line_wait_on_atomic_t(val, action, mode);
 }
 	
+void init_wait_var_entry(struct wait_bit_queue *wbq_entry, void *var, int flags);
+extern void wake_up_var(void *var);
+extern wait_queue_head_t *__var_waitqueue(void *p);
+
+#define ___wait_var_event(var, condition, state, exclusive, ret, cmd)	\
+({									\
+	__label__ __out;						\
+	wait_queue_head_t *__wq_head = __var_waitqueue(var);		\
+	struct wait_bit_queue __wbq_entry;				\
+	long __ret = ret; /* explicit shadow */				\
+									\
+	init_wait_var_entry(&__wbq_entry, var,				\
+			    exclusive ? WQ_FLAG_EXCLUSIVE : 0);		\
+	for (;;) {							\
+		if (exclusive)						\
+			prepare_to_wait_exclusive(__wq_head,		\
+						  &__wbq_entry.wait,	\
+						  state);		\
+		else							\
+			prepare_to_wait(__wq_head, &__wbq_entry.wait,	\
+					state);				\
+									\
+		if (condition)						\
+			break;						\
+									\
+		if (___wait_signal_pending(state)) {			\
+			__ret = -ERESTARTSYS;				\
+			if (exclusive) {				\
+				abort_exclusive_wait(__wq_head,		\
+						     &__wbq_entry.wait,	\
+						     state, NULL);	\
+				goto __out;				\
+			}						\
+			break;						\
+		}							\
+									\
+		cmd;							\
+	}								\
+	finish_wait(__wq_head, &__wbq_entry.wait);			\
+__out:	__ret;								\
+})
+
+#define __wait_var_event(var, condition)				\
+	___wait_var_event(var, condition, TASK_UNINTERRUPTIBLE, 0, 0,	\
+			  schedule())
+
+#define wait_var_event(var, condition)					\
+do {									\
+	might_sleep();							\
+	if (condition)							\
+		break;							\
+	__wait_var_event(var, condition);				\
+} while (0)
+
+#define __wait_var_event_killable(var, condition)			\
+	___wait_var_event(var, condition, TASK_KILLABLE, 0, 0,		\
+			  schedule())
+
+#define wait_var_event_killable(var, condition)				\
+({									\
+	int __ret = 0;							\
+	might_sleep();							\
+	if (!(condition))						\
+		__ret = __wait_var_event_killable(var, condition);	\
+	__ret;								\
+})
+
+#define __wait_var_event_timeout(var, condition, timeout)		\
+	___wait_var_event(var, ___wait_cond_timeout(condition),		\
+			  TASK_UNINTERRUPTIBLE, 0, timeout,		\
+			  __ret = schedule_timeout(__ret))
+
+#define wait_var_event_timeout(var, condition, timeout)			\
+({									\
+	long __ret = timeout;						\
+	might_sleep();							\
+	if (!___wait_cond_timeout(condition))				\
+		__ret = __wait_var_event_timeout(var, condition, timeout); \
+	__ret;								\
+})
+
 #endif

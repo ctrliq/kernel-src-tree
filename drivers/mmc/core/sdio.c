@@ -20,7 +20,10 @@
 #include <linux/mmc/sdio_ids.h>
 
 #include "core.h"
+#include "card.h"
+#include "host.h"
 #include "bus.h"
+#include "quirks.h"
 #include "sd.h"
 #include "sdio_bus.h"
 #include "mmc_ops.h"
@@ -1101,6 +1104,12 @@ int mmc_attach_sdio(struct mmc_host *host)
 	 */
 	if (host->caps & MMC_CAP_POWER_OFF_CARD) {
 		/*
+		 * Do not allow runtime suspend until after SDIO function
+		 * devices are added.
+		 */
+		pm_runtime_get_noresume(&card->dev);
+
+		/*
 		 * Let runtime PM core know our card is active
 		 */
 		err = pm_runtime_set_active(&card->dev);
@@ -1152,12 +1161,19 @@ int mmc_attach_sdio(struct mmc_host *host)
 			goto remove_added;
 	}
 
+	if (host->caps & MMC_CAP_POWER_OFF_CARD)
+		pm_runtime_put(&card->dev);
+
 	mmc_claim_host(host);
 	return 0;
 
 
 remove_added:
-	/* Remove without lock if the device has been added. */
+	/* Remove without lock if the device has been added.
+	 * runtime PM. Similarly we also don't pm_runtime_put() the SDIO card
+	 * because it needs to be active to remove any function devices that
+	 * were probed, and after that it gets deleted.
+	 */
 	mmc_sdio_remove(host);
 	mmc_claim_host(host);
 remove:

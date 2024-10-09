@@ -173,6 +173,7 @@ cond_syscall(sys_mlock);
 cond_syscall(sys_munlock);
 cond_syscall(sys_mlockall);
 cond_syscall(sys_munlockall);
+cond_syscall(sys_mlock2);
 cond_syscall(sys_mincore);
 cond_syscall(sys_madvise);
 cond_syscall(sys_mremap);
@@ -223,3 +224,9 @@ cond_syscall(sys_seccomp);
 cond_syscall(sys_pkey_mprotect);
 cond_syscall(sys_pkey_alloc);
 cond_syscall(sys_pkey_free);
+
+/* membarrier */
+cond_syscall(sys_membarrier);
+
+/* access BPF programs and maps */
+cond_syscall(sys_bpf);

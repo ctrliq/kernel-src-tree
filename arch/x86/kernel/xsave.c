@@ -617,6 +617,12 @@ static void __init init_xstate_size(void)
 	}
 }
 
+void eager_fpu_not_needed(void)
+{
+	if (!cpu_has_xsaveopt && eagerfpu == AUTO)
+		eagerfpu = DISABLE;
+}
+
 /*
  * Enable and initialize the xsave feature.
  */
@@ -717,7 +723,7 @@ void eager_fpu_init(void)
 	clear_used_math();
 	current_thread_info()->status = 0;
 
-	if (eagerfpu == ENABLE)
+	if (eagerfpu != DISABLE)
 		setup_force_cpu_cap(X86_FEATURE_EAGER_FPU);
 
 	if (!cpu_has_eager_fpu) {

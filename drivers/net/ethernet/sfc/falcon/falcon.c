@@ -1452,10 +1452,11 @@ static void falcon_stats_complete(struct ef4_nic *efx)
 	}
 }
 
-static void falcon_stats_timer_func(unsigned long context)
+static void falcon_stats_timer_func(struct timer_list *t)
 {
-	struct ef4_nic *efx = (struct ef4_nic *)context;
-	struct falcon_nic_data *nic_data = efx->nic_data;
+	struct falcon_nic_data *nic_data = from_timer(nic_data, t,
+						      stats_timer);
+	struct ef4_nic *efx = nic_data->efx;
 
 	spin_lock(&efx->stats_lock);
 
@@ -2293,6 +2294,7 @@ static int falcon_probe_nic(struct ef4_nic *efx)
 	if (!nic_data)
 		return -ENOMEM;
 	efx->nic_data = nic_data;
+	nic_data->efx = efx;
 
 	rc = -ENODEV;
 
@@ -2400,8 +2402,7 @@ static int falcon_probe_nic(struct ef4_nic *efx)
 	}
 
 	nic_data->stats_disable_count = 1;
-	setup_timer(&nic_data->stats_timer, &falcon_stats_timer_func,
-		    (unsigned long)efx);
+	timer_setup(&nic_data->stats_timer, falcon_stats_timer_func, 0);
 
 	return 0;
 

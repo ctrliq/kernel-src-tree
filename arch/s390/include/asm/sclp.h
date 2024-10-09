@@ -72,5 +72,6 @@ unsigned long sclp_get_hsa_size(void);
 void sclp_early_detect(void);
 int sclp_has_siif(void);
 int sclp_has_sief2(void);
+void sclp_ocf_cpc_name_copy(char *dst);
 
 #endif /* _ASM_S390_SCLP_H */

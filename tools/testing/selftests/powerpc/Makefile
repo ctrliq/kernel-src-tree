@@ -13,22 +13,22 @@ CFLAGS := -Wall -O2 -flto -Wall -Werror -DGIT_VERSION='"$(GIT_VERSION)"' -I$(CUR
 
 export CC CFLAGS
 
-TARGETS = tm switch_endian
+SUB_DIRS = tm switch_endian dscr
 
 endif
 
 all:
-	@for TARGET in $(TARGETS); do \
+	@for TARGET in $(SUB_DIRS); do \
 		$(MAKE) -C $$TARGET all; \
 	done;
 
 run_tests: all
-	@for TARGET in $(TARGETS); do \
+	@for TARGET in $(SUB_DIRS); do \
 		$(MAKE) -C $$TARGET run_tests; \
 	done;
 
 clean:
-	@for TARGET in $(TARGETS); do \
+	@for TARGET in $(SUB_DIRS); do \
 		$(MAKE) -C $$TARGET clean; \
 	done;
 	rm -f tags

@@ -37,7 +37,7 @@
 #include <linux/security.h>
 
 /* IPv4 datagram length is stored into 16bit field (tot_len) */
-#define IP_MAX_MTU	0xFFF0U
+#define IP_MAX_MTU	0xFFFFU
 
 #define RTO_ONLINK	0x01
 
@@ -61,7 +61,12 @@ struct rtable {
 	__be32			rt_gateway;
 
 	/* Miscellaneous cached information */
+#ifdef __GENKSYMS__
 	u32			rt_pmtu;
+#else
+	u32			rt_mtu_locked:1,
+				rt_pmtu:31;
+#endif
 
 	struct list_head	rt_uncached;
 };
@@ -107,13 +112,13 @@ struct in_device;
 extern int		ip_rt_init(void);
 extern void		rt_cache_flush(struct net *net);
 extern void		rt_flush_dev(struct net_device *dev);
-struct rtable *__ip_route_output_key_hash(struct net *, struct flowi4 *flp,
-					  int mp_hash);
+struct rtable *__ip_route_output_key_hash(struct net *net, struct flowi4 *flp,
+					  const struct sk_buff *skb);
 
 static inline struct rtable *__ip_route_output_key(struct net *net,
 						   struct flowi4 *flp)
 {
-	return __ip_route_output_key_hash(net, flp, -1);
+	return __ip_route_output_key_hash(net, flp, NULL);
 }
 
 extern struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
@@ -312,14 +317,13 @@ static inline int inet_iif(const struct sk_buff *skb)
 	return skb->skb_iif;
 }
 
-extern int sysctl_ip_default_ttl;
-
 static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
 {
 	int hoplimit = dst_metric_raw(dst, RTAX_HOPLIMIT);
+	struct net *net = dev_net(dst->dev);
 
 	if (hoplimit == 0)
-		hoplimit = sysctl_ip_default_ttl;
+		hoplimit = net->ipv4_sysctl_ip_default_ttl;
 	return hoplimit;
 }
 

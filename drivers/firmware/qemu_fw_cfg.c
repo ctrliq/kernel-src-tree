@@ -33,54 +33,17 @@
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#include <uapi/linux/qemu_fw_cfg.h>
 #include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/crash_core.h>
 #include <linux/crash_dump.h>
+#include <linux/crash_core.h>
 
 MODULE_AUTHOR("Gabriel L. Somlo <somlo@cmu.edu>");
 MODULE_DESCRIPTION("QEMU fw_cfg sysfs support");
 MODULE_LICENSE("GPL");
 
-/* selector key values for "well-known" fw_cfg entries */
-#define FW_CFG_SIGNATURE  0x00
-#define FW_CFG_ID         0x01
-#define FW_CFG_FILE_DIR   0x19
-
-#define FW_CFG_VERSION_DMA     0x02
-#define FW_CFG_DMA_CTL_ERROR   0x01
-#define FW_CFG_DMA_CTL_READ    0x02
-#define FW_CFG_DMA_CTL_SKIP    0x04
-#define FW_CFG_DMA_CTL_SELECT  0x08
-#define FW_CFG_DMA_CTL_WRITE   0x10
-
-/* size in bytes of fw_cfg signature */
-#define FW_CFG_SIG_SIZE 4
-
-/* fw_cfg "file name" is up to 56 characters (including terminating nul) */
-#define FW_CFG_MAX_FILE_PATH 56
-
-#define VMCOREINFO_FORMAT_ELF 0x1
-
-/* platform device for dma mapping */
-static struct device *dev;
-
 /* fw_cfg revision attribute, in /sys/firmware/qemu_fw_cfg top-level dir. */
 static u32 fw_cfg_rev;
-
-/* fw_cfg file directory entry type */
-struct fw_cfg_file {
-	u32 size;
-	u16 select;
-	u16 reserved;
-	char name[FW_CFG_MAX_FILE_PATH];
-};
-
-struct fw_cfg_dma {
-	u32 control;
-	u32 length;
-	u64 address;
-} __packed;
 
 /* fw_cfg device i/o register addresses */
 static bool fw_cfg_is_mmio;
@@ -95,45 +58,40 @@ static void __iomem *fw_cfg_reg_dma;
 static DEFINE_MUTEX(fw_cfg_dev_lock);
 
 /* pick appropriate endianness for selector key */
-static inline u16 fw_cfg_sel_endianness(u16 key)
+static void fw_cfg_sel_endianness(u16 key)
 {
-	return fw_cfg_is_mmio ? cpu_to_be16(key) : cpu_to_le16(key);
+	if (fw_cfg_is_mmio)
+		iowrite16be(key, fw_cfg_reg_ctrl);
+	else
+		iowrite16(key, fw_cfg_reg_ctrl);
 }
 
+#ifdef CONFIG_CRASH_CORE
 static inline bool fw_cfg_dma_enabled(void)
 {
-	return fw_cfg_rev & FW_CFG_VERSION_DMA && fw_cfg_reg_dma;
+	return (fw_cfg_rev & FW_CFG_VERSION_DMA) && fw_cfg_reg_dma;
 }
 
 /* qemu fw_cfg device is sync today, but spec says it may become async */
-static void fw_cfg_wait_for_control(struct fw_cfg_dma *d, dma_addr_t dma)
+static void fw_cfg_wait_for_control(struct fw_cfg_dma_access *d)
 {
-	do {
-		dma_sync_single_for_cpu(dev, dma, sizeof(*d), DMA_FROM_DEVICE);
-		if ((be32_to_cpu(d->control) & ~FW_CFG_DMA_CTL_ERROR) == 0)
+	for (;;) {
+		u32 ctrl = be32_to_cpu(READ_ONCE(d->control));
+
+		/* do not reorder the read to d->control */
+		rmb();
+		if ((ctrl & ~FW_CFG_DMA_CTL_ERROR) == 0)
 			return;
 
-		usleep_range(50, 100);
-	} while (true);
+		cpu_relax();
+	}
 }
 
 static ssize_t fw_cfg_dma_transfer(void *address, u32 length, u32 control)
 {
-	dma_addr_t dma_addr = 0;
-	struct fw_cfg_dma *d = NULL;
-	dma_addr_t dma;
+	phys_addr_t dma;
+	struct fw_cfg_dma_access *d = NULL;
 	ssize_t ret = length;
-	enum dma_data_direction dir =
-		(control & FW_CFG_DMA_CTL_READ ? DMA_FROM_DEVICE : 0) |
-		(control & FW_CFG_DMA_CTL_WRITE ? DMA_TO_DEVICE : 0);
-
-	if (address && length) {
-		dma_addr = dma_map_single(dev, address, length, dir);
-		if (dma_mapping_error(dev, dma_addr)) {
-			WARN(1, "%s: failed to map address\n", __func__);
-			return -EFAULT;
-		}
-	}
 
 	d = kmalloc(sizeof(*d), GFP_KERNEL);
 	if (!d) {
@@ -141,46 +99,39 @@ static ssize_t fw_cfg_dma_transfer(void *address, u32 length, u32 control)
 		goto end;
 	}
 
-	*d = (struct fw_cfg_dma) {
-		.address = cpu_to_be64(dma_addr),
+	/* fw_cfg device does not need IOMMU protection, so use physical addresses */
+	*d = (struct fw_cfg_dma_access) {
+		.address = cpu_to_be64(address ? virt_to_phys(address) : 0),
 		.length = cpu_to_be32(length),
 		.control = cpu_to_be32(control)
 	};
 
-	dma = dma_map_single(dev, d, sizeof(*d), DMA_BIDIRECTIONAL);
-	if (dma_mapping_error(dev, dma)) {
-		WARN(1, "%s: failed to map fw_cfg_dma\n", __func__);
-		ret = -EFAULT;
-		goto end;
-	}
+	dma = virt_to_phys(d);
 
 	iowrite32be((u64)dma >> 32, fw_cfg_reg_dma);
+	/* force memory to sync before notifying device via MMIO */
+	wmb();
 	iowrite32be(dma, fw_cfg_reg_dma + 4);
 
-	fw_cfg_wait_for_control(d, dma);
+	fw_cfg_wait_for_control(d);
 
-	if (be32_to_cpu(d->control) & FW_CFG_DMA_CTL_ERROR) {
+	if (be32_to_cpu(READ_ONCE(d->control)) & FW_CFG_DMA_CTL_ERROR) {
 		ret = -EIO;
 	}
 
-	dma_unmap_single(dev, dma, sizeof(*d), DMA_BIDIRECTIONAL);
-
 end:
 	kfree(d);
-	if (dma_addr)
-		dma_unmap_single(dev, dma_addr, length, dir);
 
 	return ret;
 }
+#endif
 
 /* read chunk of given fw_cfg blob (caller responsible for sanity-check) */
 static ssize_t fw_cfg_read_blob(u16 key,
-				void *buf, loff_t pos, size_t count,
-				bool dma)
+				void *buf, loff_t pos, size_t count)
 {
 	u32 glk = -1U;
 	acpi_status status;
-	ssize_t ret = count;
 
 	/* If we have ACPI, ensure mutual exclusion against any potential
 	 * device access by the firmware, e.g. via AML methods:
@@ -194,32 +145,14 @@ static ssize_t fw_cfg_read_blob(u16 key,
 	}
 
 	mutex_lock(&fw_cfg_dev_lock);
-	if (dma && fw_cfg_dma_enabled()) {
-		if (pos == 0) {
-			ret = fw_cfg_dma_transfer(buf, count, key << 16
-						  | FW_CFG_DMA_CTL_SELECT
-						  | FW_CFG_DMA_CTL_READ);
-		} else {
-			iowrite16(fw_cfg_sel_endianness(key), fw_cfg_reg_ctrl);
-			ret = fw_cfg_dma_transfer(NULL, pos, FW_CFG_DMA_CTL_SKIP);
-			if (ret < 0)
-				goto end;
-			ret = fw_cfg_dma_transfer(buf, count,
-						  FW_CFG_DMA_CTL_READ);
-		}
-	} else {
-		iowrite16(fw_cfg_sel_endianness(key), fw_cfg_reg_ctrl);
-		while (pos-- > 0)
-			ioread8(fw_cfg_reg_data);
-		ioread8_rep(fw_cfg_reg_data, buf, count);
-	}
-
-end:
+	fw_cfg_sel_endianness(key);
+	while (pos-- > 0)
+		ioread8(fw_cfg_reg_data);
+	ioread8_rep(fw_cfg_reg_data, buf, count);
 	mutex_unlock(&fw_cfg_dev_lock);
 
 	acpi_release_global_lock(glk);
-
-	return ret;
+	return count;
 }
 
 #ifdef CONFIG_CRASH_CORE
@@ -238,7 +171,6 @@ static ssize_t fw_cfg_write_blob(u16 key,
 	if (ACPI_FAILURE(status) && status != AE_NOT_CONFIGURED) {
 		/* Should never get here */
 		WARN(1, "%s: Failed to lock ACPI!\n", __func__);
-		memset(buf, 0, count);
 		return -EINVAL;
 	}
 
@@ -248,7 +180,7 @@ static ssize_t fw_cfg_write_blob(u16 key,
 					  | FW_CFG_DMA_CTL_SELECT
 					  | FW_CFG_DMA_CTL_WRITE);
 	} else {
-		iowrite16(fw_cfg_sel_endianness(key), fw_cfg_reg_ctrl);
+		fw_cfg_sel_endianness(key);
 		ret = fw_cfg_dma_transfer(NULL, pos, FW_CFG_DMA_CTL_SKIP);
 		if (ret < 0)
 			goto end;
@@ -353,8 +285,9 @@ static int fw_cfg_do_platform_probe(struct platform_device *pdev)
 #endif
 
 	/* verify fw_cfg device signature */
-	fw_cfg_read_blob(FW_CFG_SIGNATURE, sig, 0, FW_CFG_SIG_SIZE, false);
-	if (memcmp(sig, "QEMU", FW_CFG_SIG_SIZE) != 0) {
+	if (fw_cfg_read_blob(FW_CFG_SIGNATURE, sig,
+				0, FW_CFG_SIG_SIZE) < 0 ||
+		memcmp(sig, "QEMU", FW_CFG_SIG_SIZE) != 0) {
 		fw_cfg_io_cleanup();
 		return -ENODEV;
 	}
@@ -378,32 +311,34 @@ static const struct {
 /* fw_cfg_sysfs_entry type */
 struct fw_cfg_sysfs_entry {
 	struct kobject kobj;
-	struct fw_cfg_file f;
+	u32 size;
+	u16 select;
+	char name[FW_CFG_MAX_FILE_PATH];
 	struct list_head list;
 };
 
 #ifdef CONFIG_CRASH_CORE
-static ssize_t write_vmcoreinfo(const struct fw_cfg_file *f)
+static ssize_t fw_cfg_write_vmcoreinfo(const struct fw_cfg_file *f)
 {
-	struct vmci {
-		__le16 host_format;
-		__le16 guest_format;
-		__le32 size;
-		__le64 paddr;
-	} __packed;
-	static struct vmci data;
+	static struct fw_cfg_vmcoreinfo *data;
 	ssize_t ret;
 
-	data = (struct vmci) {
-		.guest_format = cpu_to_le16(VMCOREINFO_FORMAT_ELF),
+	data = kmalloc(sizeof(struct fw_cfg_vmcoreinfo), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	*data = (struct fw_cfg_vmcoreinfo) {
+		.guest_format = cpu_to_le16(FW_CFG_VMCOREINFO_FORMAT_ELF),
 		.size = cpu_to_le32(VMCOREINFO_NOTE_SIZE),
 		.paddr = cpu_to_le64(paddr_vmcoreinfo_note())
 	};
 	/* spare ourself reading host format support for now since we
 	 * don't know what else to format - host may ignore ours
 	 */
-	ret = fw_cfg_write_blob(f->select, &data, 0, sizeof(struct vmci));
+	ret = fw_cfg_write_blob(be16_to_cpu(f->select), data,
+				0, sizeof(struct fw_cfg_vmcoreinfo));
 
+	kfree(data);
 	return ret;
 }
 #endif /* CONFIG_CRASH_CORE */
@@ -468,17 +403,17 @@ struct fw_cfg_sysfs_attribute fw_cfg_sysfs_attr_##_attr = { \
 
 static ssize_t fw_cfg_sysfs_show_size(struct fw_cfg_sysfs_entry *e, char *buf)
 {
-	return sprintf(buf, "%u\n", e->f.size);
+	return sprintf(buf, "%u\n", e->size);
 }
 
 static ssize_t fw_cfg_sysfs_show_key(struct fw_cfg_sysfs_entry *e, char *buf)
 {
-	return sprintf(buf, "%u\n", e->f.select);
+	return sprintf(buf, "%u\n", e->select);
 }
 
 static ssize_t fw_cfg_sysfs_show_name(struct fw_cfg_sysfs_entry *e, char *buf)
 {
-	return sprintf(buf, "%s\n", e->f.name);
+	return sprintf(buf, "%s\n", e->name);
 }
 
 static FW_CFG_SYSFS_ATTR(size);
@@ -529,13 +464,13 @@ static ssize_t fw_cfg_sysfs_read_raw(struct file *filp, struct kobject *kobj,
 {
 	struct fw_cfg_sysfs_entry *entry = to_entry(kobj);
 
-	if (pos > entry->f.size)
+	if (pos > entry->size)
 		return -EINVAL;
 
-	if (count > entry->f.size - pos)
-		count = entry->f.size - pos;
+	if (count > entry->size - pos)
+		count = entry->size - pos;
 
-	return fw_cfg_read_blob(entry->f.select, buf, pos, count, true);
+	return fw_cfg_read_blob(entry->select, buf, pos, count);
 }
 
 static struct bin_attribute fw_cfg_sysfs_attr_raw = {
@@ -648,8 +583,10 @@ static int fw_cfg_register_file(const struct fw_cfg_file *f)
 	struct fw_cfg_sysfs_entry *entry;
 
 #ifdef CONFIG_CRASH_CORE
-	if (strcmp(f->name, "etc/vmcoreinfo") == 0 && !is_kdump_kernel()) {
-		if (write_vmcoreinfo(f) < 0)
+	if (fw_cfg_dma_enabled() &&
+		strcmp(f->name, FW_CFG_VMCOREINFO_FILENAME) == 0 &&
+		!is_kdump_kernel()) {
+		if (fw_cfg_write_vmcoreinfo(f) < 0)
 			pr_warn("fw_cfg: failed to write vmcoreinfo");
 	}
 #endif
@@ -660,11 +597,13 @@ static int fw_cfg_register_file(const struct fw_cfg_file *f)
 		return -ENOMEM;
 
 	/* set file entry information */
-	memcpy(&entry->f, f, sizeof(struct fw_cfg_file));
+	entry->size = be32_to_cpu(f->size);
+	entry->select = be16_to_cpu(f->select);
+	memcpy(entry->name, f->name, FW_CFG_MAX_FILE_PATH);
 
 	/* register entry under "/sys/firmware/qemu_fw_cfg/by_key/" */
 	err = kobject_init_and_add(&entry->kobj, &fw_cfg_sysfs_entry_ktype,
-				   fw_cfg_sel_ko, "%d", entry->f.select);
+				   fw_cfg_sel_ko, "%d", entry->select);
 	if (err)
 		goto err_register;
 
@@ -674,7 +613,7 @@ static int fw_cfg_register_file(const struct fw_cfg_file *f)
 		goto err_add_raw;
 
 	/* try adding "/sys/firmware/qemu_fw_cfg/by_name/" symlink */
-	fw_cfg_build_symlink(fw_cfg_fname_kset, &entry->kobj, entry->f.name);
+	fw_cfg_build_symlink(fw_cfg_fname_kset, &entry->kobj, entry->name);
 
 	/* success, add entry to global cache */
 	fw_cfg_sysfs_cache_enlist(entry);
@@ -691,28 +630,35 @@ err_register:
 static int fw_cfg_register_dir_entries(void)
 {
 	int ret = 0;
+	__be32 files_count;
 	u32 count, i;
 	struct fw_cfg_file *dir;
 	size_t dir_size;
 
-	fw_cfg_read_blob(FW_CFG_FILE_DIR, &count, 0, sizeof(count), false);
-	count = be32_to_cpu(count);
+	ret = fw_cfg_read_blob(FW_CFG_FILE_DIR, &files_count,
+			0, sizeof(files_count));
+	if (ret < 0)
+		return ret;
+
+	count = be32_to_cpu(files_count);
 	dir_size = count * sizeof(struct fw_cfg_file);
 
 	dir = kmalloc(dir_size, GFP_KERNEL);
 	if (!dir)
 		return -ENOMEM;
 
-	fw_cfg_read_blob(FW_CFG_FILE_DIR, dir, sizeof(count), dir_size, true);
+	ret = fw_cfg_read_blob(FW_CFG_FILE_DIR, dir,
+			sizeof(files_count), dir_size);
+	if (ret < 0)
+		goto end;
 
 	for (i = 0; i < count; i++) {
-		dir[i].size = be32_to_cpu(dir[i].size);
-		dir[i].select = be16_to_cpu(dir[i].select);
 		ret = fw_cfg_register_file(&dir[i]);
 		if (ret)
 			break;
 	}
 
+end:
 	kfree(dir);
 	return ret;
 }
@@ -727,6 +673,7 @@ static inline void fw_cfg_kobj_cleanup(struct kobject *kobj)
 static int fw_cfg_sysfs_probe(struct platform_device *pdev)
 {
 	int err;
+	__le32 rev;
 
 	/* NOTE: If we supported multiple fw_cfg devices, we'd first create
 	 * a subdirectory named after e.g. pdev->id, then hang per-device
@@ -734,10 +681,9 @@ static int fw_cfg_sysfs_probe(struct platform_device *pdev)
 	 * one fw_cfg device exist system-wide, so if one was already found
 	 * earlier, we might as well stop here.
 	 */
-	if (dev)
+	if (fw_cfg_sel_ko)
 		return -EBUSY;
 
-	dev = &pdev->dev;
 	/* create by_key and by_name subdirs of /sys/firmware/qemu_fw_cfg/ */
 	err = -ENOMEM;
 	fw_cfg_sel_ko = kobject_create_and_add("by_key", fw_cfg_top_ko);
@@ -753,8 +699,11 @@ static int fw_cfg_sysfs_probe(struct platform_device *pdev)
 		goto err_probe;
 
 	/* get revision number, add matching top-level attribute */
-	fw_cfg_read_blob(FW_CFG_ID, &fw_cfg_rev, 0, sizeof(fw_cfg_rev), false);
-	fw_cfg_rev = le32_to_cpu(fw_cfg_rev);
+	err = fw_cfg_read_blob(FW_CFG_ID, &rev, 0, sizeof(rev));
+	if (err < 0)
+		goto err_probe;
+
+	fw_cfg_rev = le32_to_cpu(rev);
 	err = sysfs_create_file(fw_cfg_top_ko, &fw_cfg_rev_attr.attr);
 	if (err)
 		goto err_rev;
@@ -778,7 +727,6 @@ err_probe:
 err_name:
 	fw_cfg_kobj_cleanup(fw_cfg_sel_ko);
 err_sel:
-	dev = NULL;
 	return err;
 }
 
@@ -790,7 +738,6 @@ static int fw_cfg_sysfs_remove(struct platform_device *pdev)
 	fw_cfg_io_cleanup();
 	fw_cfg_kset_unregister_recursive(fw_cfg_fname_kset);
 	fw_cfg_kobj_cleanup(fw_cfg_sel_ko);
-	dev = NULL;
 	return 0;
 }
 
@@ -802,7 +749,7 @@ MODULE_DEVICE_TABLE(of, fw_cfg_sysfs_mmio_match);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id fw_cfg_sysfs_acpi_match[] = {
-	{ "QEMU0002", },
+	{ FW_CFG_ACPI_DEVICE_ID, },
 	{},
 };
 MODULE_DEVICE_TABLE(acpi, fw_cfg_sysfs_acpi_match);

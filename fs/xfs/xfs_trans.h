@@ -32,7 +32,6 @@ struct xfs_mount;
 struct xfs_trans;
 struct xfs_trans_res;
 struct xfs_dquot_acct;
-struct xfs_busy_extent;
 
 typedef struct xfs_log_item {
 	struct list_head		li_ail;		/* AIL pointers */

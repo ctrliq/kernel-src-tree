@@ -681,8 +681,7 @@ void __init init_mem_mapping(void)
  */
 int devmem_is_allowed(unsigned long pagenr)
 {
-	if (region_intersects(PFN_PHYS(pagenr), PAGE_SIZE,
-				IORESOURCE_SYSTEM_RAM, IORES_DESC_NONE)
+	if (region_intersects_ram(PFN_PHYS(pagenr), PAGE_SIZE)
 			!= REGION_DISJOINT) {
 		/*
 		 * For disallowed memory regions in the low 1MB range,
@@ -827,7 +826,7 @@ unsigned long max_swapfile_size(void)
 		 * We encode swap offsets also with 3 bits below those for pfn
 		 * which makes the usable limit higher.
 		 */
-#if CONFIG_PGTABLE_LEVELS > 2
+#if PAGETABLE_LEVELS > 2
 		l1tf_limit <<= PAGE_SHIFT - SWP_OFFSET_FIRST_BIT;
 #endif
 		pages = min_t(unsigned long, l1tf_limit, pages);

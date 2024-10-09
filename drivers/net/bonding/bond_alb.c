@@ -72,7 +72,8 @@ static inline struct arp_pkt *arp_pkt(const struct sk_buff *skb)
 }
 
 /* Forward declaration */
-static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[]);
+static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[],
+				      bool strict_match);
 static void rlb_purge_src_ip(struct bonding *bond, struct arp_pkt *arp);
 static void rlb_src_unlink(struct bonding *bond, u32 index);
 static void rlb_src_link(struct bonding *bond, u32 ip_src_hash,
@@ -389,7 +390,7 @@ static void rlb_teach_disabled_mac_on_primary(struct bonding *bond, u8 addr[])
 
 	bond->alb_info.rlb_promisc_timeout_counter = 0;
 
-	alb_send_learning_packets(curr_active, addr);
+	alb_send_learning_packets(curr_active, addr, true);
 }
 
 /* slave being removed should not be active at this point
@@ -920,7 +921,6 @@ static void alb_send_lp_vid(struct slave *slave, u8 mac_addr[],
 	struct learning_pkt pkt;
 	struct sk_buff *skb;
 	int size = sizeof(struct learning_pkt);
-	char *data;
 
 	memset(&pkt, 0, size);
 	ether_addr_copy(pkt.mac_dst, mac_addr);
@@ -931,8 +931,7 @@ static void alb_send_lp_vid(struct slave *slave, u8 mac_addr[],
 	if (!skb)
 		return;
 
-	data = skb_put(skb, size);
-	memcpy(data, &pkt, size);
+	skb_put_data(skb, &pkt, size);
 
 	skb_reset_mac_header(skb);
 	skb->network_header = skb->mac_header + ETH_HLEN;
@@ -946,24 +945,54 @@ static void alb_send_lp_vid(struct slave *slave, u8 mac_addr[],
 	dev_queue_xmit(skb);
 }
 
+struct alb_walk_data {
+	struct bonding *bond;
+	struct slave *slave;
+	u8 *mac_addr;
+	bool strict_match;
+};
 
-static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[])
+static int alb_upper_dev_walk(struct net_device *upper, void *_data)
+{
+	struct alb_walk_data *data = _data;
+	bool strict_match = data->strict_match;
+	struct slave *slave = data->slave;
+	u8 *mac_addr = data->mac_addr;
+
+	if (is_vlan_dev(upper) && upper->priv_flags & IFF_802_1Q_VLAN) {
+		if (strict_match &&
+		    ether_addr_equal_64bits(mac_addr,
+					    upper->dev_addr)) {
+			alb_send_lp_vid(slave, mac_addr,
+					vlan_dev_vlan_proto(upper),
+					vlan_dev_vlan_id(upper));
+		} else if (!strict_match) {
+			alb_send_lp_vid(slave, upper->dev_addr,
+					vlan_dev_vlan_proto(upper),
+					vlan_dev_vlan_id(upper));
+		}
+	}
+
+	return 0;
+}
+
+static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[],
+				      bool strict_match)
 {
 	struct bonding *bond = bond_get_bond_by_slave(slave);
-	struct net_device *upper;
-	struct list_head *iter;
+	struct alb_walk_data data = {
+		.strict_match = strict_match,
+		.mac_addr = mac_addr,
+		.slave = slave,
+		.bond = bond,
+	};
 
 	/* send untagged */
 	alb_send_lp_vid(slave, mac_addr, 0, 0);
 
 	/* loop through vlans and send one packet for each */
 	rcu_read_lock();
-	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
-		if (upper->priv_flags & IFF_802_1Q_VLAN)
-			alb_send_lp_vid(slave, mac_addr,
-					vlan_dev_vlan_proto(upper),
-					vlan_dev_vlan_id(upper));
-	}
+	netdev_walk_all_upper_dev_rcu(bond->dev, alb_upper_dev_walk, &data);
 	rcu_read_unlock();
 }
 
@@ -1022,7 +1051,7 @@ static void alb_fasten_mac_swap(struct bonding *bond, struct slave *slave1,
 
 	/* fasten the change in the switch */
 	if (bond_slave_can_tx(slave1)) {
-		alb_send_learning_packets(slave1, slave1->dev->dev_addr);
+		alb_send_learning_packets(slave1, slave1->dev->dev_addr, false);
 		if (bond->alb_info.rlb_enabled) {
 			/* inform the clients that the mac address
 			 * has changed
@@ -1034,7 +1063,7 @@ static void alb_fasten_mac_swap(struct bonding *bond, struct slave *slave1,
 	}
 
 	if (bond_slave_can_tx(slave2)) {
-		alb_send_learning_packets(slave2, slave2->dev->dev_addr);
+		alb_send_learning_packets(slave2, slave2->dev->dev_addr, false);
 		if (bond->alb_info.rlb_enabled) {
 			/* inform the clients that the mac address
 			 * has changed
@@ -1474,8 +1503,17 @@ void bond_alb_monitor(struct work_struct *work)
 
 	/* send learning packets */
 	if (bond_info->lp_counter >= BOND_ALB_LP_TICKS(bond)) {
-		bond_for_each_slave_rcu(bond, slave, iter)
-			alb_send_learning_packets(slave, slave->dev->dev_addr);
+		bool strict_match;
+
+		bond_for_each_slave_rcu(bond, slave, iter) {
+			/* If updating current_active, use all currently
+			 * user mac addreses (!strict_match).  Otherwise, only
+			 * use mac of the slave device.
+			 */
+			strict_match = (slave != bond->curr_active_slave);
+			alb_send_learning_packets(slave, slave->dev->dev_addr,
+						  strict_match);
+		}
 		bond_info->lp_counter = 0;
 	}
 
@@ -1688,7 +1726,8 @@ void bond_alb_handle_active_change(struct bonding *bond, struct slave *new_slave
 		/* set the new_slave to the bond mac address */
 		alb_set_slave_mac_addr(new_slave, bond->dev->dev_addr,
 				       bond->dev->addr_len);
-		alb_send_learning_packets(new_slave, bond->dev->dev_addr);
+		alb_send_learning_packets(new_slave, bond->dev->dev_addr,
+					  false);
 	}
 }
 
@@ -1728,7 +1767,7 @@ int bond_alb_set_mac_address(struct net_device *bond_dev, void *addr)
 				       bond_dev->addr_len);
 
 		alb_send_learning_packets(curr_active,
-					  bond_dev->dev_addr);
+					  bond_dev->dev_addr, false);
 		if (bond->alb_info.rlb_enabled) {
 			/* inform clients mac address has changed */
 			rlb_req_update_slave_clients(bond, curr_active);

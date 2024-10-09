@@ -66,9 +66,20 @@ enum {
  */
 struct pt_regs 
 {
+#ifdef __GENKSYMS__
 	unsigned long args[1];
 	psw_t psw;
 	unsigned long gprs[NUM_GPRS];
+#else
+	union {
+		user_pt_regs user_regs;
+		struct {
+			unsigned long args[1];
+			psw_t psw;
+			unsigned long gprs[NUM_GPRS];
+		};
+	};
+#endif
 	unsigned long orig_gpr2;
 	unsigned int int_code;
 	unsigned long int_parm_long;

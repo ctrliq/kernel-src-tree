@@ -57,6 +57,8 @@ struct ipv6_devconf {
 #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
 	__s32		use_optimistic;
 #endif
+	__s32		keep_addr_on_down;
+	__u32		enhanced_dad;
 #endif
 	void		*sysctl;
 };

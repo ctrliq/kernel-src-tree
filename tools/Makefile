@@ -20,6 +20,7 @@ help:
 	@echo '  virtio     - vhost test module'
 	@echo '  net        - misc networking tools'
 	@echo '  vm         - misc vm tools'
+	@echo '  wmi        - WMI interface examples'
 	@echo '  x86_energy_perf_policy - Intel energy policy tool'
 	@echo '  tmon       - thermal monitoring and tuning tool'
 	@echo ''
@@ -42,7 +43,7 @@ help:
 cpupower: FORCE
 	$(call descend,power/$@)
 
-cgroup firewire guest usb virtio vm net objtool: FORCE
+cgroup firewire guest usb virtio vm net objtool wmi: FORCE
 	$(call descend,$@)
 
 libapikfs: FORCE
@@ -68,7 +69,7 @@ tmon: FORCE
 cpupower_install:
 	$(call descend,power/$(@:_install=),install)
 
-cgroup_install firewire_install lguest_install perf_install usb_install virtio_install vm_install net_install objtool_install:
+cgroup_install firewire_install lguest_install perf_install usb_install virtio_install vm_install net_install objtool_install wmi_install:
 	$(call descend,$(@:_install=),install)
 
 selftests_install:
@@ -83,7 +84,7 @@ tmon_install:
 install: cgroup_install cpupower_install firewire_install lguest_install \
 		perf_install selftests_install turbostat_install usb_install \
 		virtio_install vm_install net_install x86_energy_perf_policy_install \
-		tmon_install objtool_install
+		tmon_install objtool_install wmi_install
 
 cpupower_clean:
 	$(call descend,power/cpupower,clean)
@@ -109,6 +110,6 @@ tmon_clean:
 clean: cgroup_clean cpupower_clean firewire_clean lguest_clean perf_clean \
 		selftests_clean turbostat_clean usb_clean virtio_clean \
 		vm_clean net_clean x86_energy_perf_policy_clean tmon_clean \
-		objtool_clean
+		objtool_clean wmi_clean
 
 .PHONY: FORCE

@@ -38,9 +38,9 @@
 
 #include "iw_cxgb4.h"
 
-int use_dsgl = 0;
+int use_dsgl = 1;
 module_param(use_dsgl, int, 0644);
-MODULE_PARM_DESC(use_dsgl, "Use DSGL for PBL/FastReg (default=0)");
+MODULE_PARM_DESC(use_dsgl, "Use DSGL for PBL/FastReg (default=1) (DEPRECATED)");
 
 #define T4_ULPTX_MIN_IO 32
 #define C4IW_MAX_INLINE_SIZE 96
@@ -81,8 +81,7 @@ static int _c4iw_write_mem_dma_aligned(struct c4iw_rdev *rdev, u32 addr,
 	}
 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
 
-	req = (struct ulp_mem_io *)__skb_put(skb, wr_len);
-	memset(req, 0, wr_len);
+	req = __skb_put_zero(skb, wr_len);
 	INIT_ULPTX_WR(req, wr_len, 0, 0);
 	req->wr.wr_hi = cpu_to_be32(FW_WR_OP_V(FW_ULPTX_WR) |
 			(wr_waitp ? FW_WR_COMPL_F : 0));
@@ -141,8 +140,7 @@ static int _c4iw_write_mem_inline(struct c4iw_rdev *rdev, u32 addr, u32 len,
 		}
 		set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
 
-		req = (struct ulp_mem_io *)__skb_put(skb, wr_len);
-		memset(req, 0, wr_len);
+		req = __skb_put_zero(skb, wr_len);
 		INIT_ULPTX_WR(req, wr_len, 0, 0);
 
 		if (i == (num_wqe-1)) {
@@ -238,7 +236,7 @@ static int write_adapter_mem(struct c4iw_rdev *rdev, u32 addr, u32 len,
 {
 	int ret;
 
-	if (!is_t5(rdev->lldi.adapter_type) || !use_dsgl) {
+	if (!rdev->lldi.ulptx_memwrite_dsgl || !use_dsgl) {
 		ret = _c4iw_write_mem_inline(rdev, addr, len, data, skb,
 					      wr_waitp);
 		goto out;

@@ -100,7 +100,7 @@ static netdev_tx_t qmimux_start_xmit(struct sk_buff *skb, struct net_device *dev
 	unsigned int len = skb->len;
 	struct qmimux_hdr *hdr;
 
-	hdr = (struct qmimux_hdr *)skb_push(skb, sizeof(struct qmimux_hdr));
+	hdr = skb_push(skb, sizeof(struct qmimux_hdr));
 	hdr->pad = 0;
 	hdr->mux_id = priv->mux_id;
 	hdr->pkt_len = cpu_to_be16(len);
@@ -122,7 +122,7 @@ static void qmimux_setup(struct net_device *dev)
 	dev->addr_len        = 0;
 	dev->flags           = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
 	dev->netdev_ops      = &qmimux_netdev_ops;
-	dev->destructor      = free_netdev;
+	dev->extended->needs_free_netdev = true;
 }
 
 static struct net_device *qmimux_find_dev(struct usbnet *dev, u8 mux_id)
@@ -187,7 +187,7 @@ static int qmimux_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			goto skip;
 		}
 
-		memcpy(skb_put(skbn, len), skb->data + offset, len);
+		skb_put_data(skbn, skb->data + offset, len);
 		if (netif_rx(skbn) != NET_RX_SUCCESS)
 			return 0;
 
@@ -203,8 +203,7 @@ static int qmimux_register_device(struct net_device *real_dev, u8 mux_id)
 	struct qmimux_priv *priv;
 	int err;
 
-	new_dev = alloc_netdev(sizeof(struct qmimux_priv),
-			       "qmimux%d", NET_NAME_UNKNOWN, qmimux_setup);
+	new_dev = alloc_netdev(sizeof(struct qmimux_priv), "qmimux%d", qmimux_setup);
 	if (!new_dev)
 		return -ENOBUFS;
 
@@ -544,6 +543,7 @@ static const struct net_device_ops qmi_wwan_netdev_ops = {
 	.ndo_start_xmit		= usbnet_start_xmit,
 	.ndo_tx_timeout		= usbnet_tx_timeout,
 	.ndo_change_mtu_rh74	= usbnet_change_mtu,
+	.ndo_get_stats64	= usbnet_get_stats64,
 	.ndo_set_mac_address	= qmi_wwan_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 };

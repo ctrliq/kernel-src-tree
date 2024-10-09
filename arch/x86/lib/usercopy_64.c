@@ -89,6 +89,27 @@ copy_user_handle_tail(char *to, char *from, unsigned len, unsigned zerorest)
 	return len;
 }
 
+/*
+ * Similar to copy_user_handle_tail, probe for the write fault point,
+ * but reuse __memcpy_mcsafe in case a new read error is encountered.
+ * clac() is handled in _copy_to_iter_mcsafe().
+ */
+__visible unsigned long
+mcsafe_handle_tail(char *to, char *from, unsigned len)
+{
+	for (; len; --len, to++, from++) {
+		/*
+		 * Call the assembly routine back directly since
+		 * memcpy_mcsafe() may silently fallback to memcpy.
+		 */
+		unsigned long rem = __memcpy_mcsafe(to, from, 1);
+
+		if (rem)
+			break;
+	}
+	return len;
+}
+
 #ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
 /**
  * clean_cache_range - write back a cache range with CLWB
@@ -110,6 +131,12 @@ static void clean_cache_range(void *addr, size_t size)
 	     p < vend; p += x86_clflush_size)
 		clwb(p);
 }
+
+void arch_wb_cache_pmem(void *addr, size_t size)
+{
+	clean_cache_range(addr, size);
+}
+EXPORT_SYMBOL_GPL(arch_wb_cache_pmem);
 
 long __copy_user_flushcache(void *dst, const void __user *src, unsigned size)
 {

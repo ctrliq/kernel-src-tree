@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __GK104_FIFO_H__
 #define __GK104_FIFO_H__
 #define gk104_fifo(p) container_of((p), struct gk104_fifo, base)
@@ -39,7 +40,7 @@ struct gk104_fifo {
 
 	struct {
 		struct nvkm_memory *mem;
-		struct nvkm_vma bar;
+		struct nvkm_vma *bar;
 	} user;
 };
 
@@ -62,11 +63,18 @@ struct gk104_fifo_func {
 			     struct nvkm_memory *, u32 offset);
 	} *runlist;
 
+	struct gk104_fifo_user_user {
+		struct nvkm_sclass user;
+		int (*ctor)(const struct nvkm_oclass *, void *, u32,
+			    struct nvkm_object **);
+	} user;
+
 	struct gk104_fifo_chan_user {
 		struct nvkm_sclass user;
 		int (*ctor)(struct gk104_fifo *, const struct nvkm_oclass *,
 			    void *, u32, struct nvkm_object **);
 	} chan;
+	bool cgrp_force;
 };
 
 int gk104_fifo_new_(const struct gk104_fifo_func *, struct nvkm_device *,

@@ -1538,8 +1538,6 @@ int xfrm4_protocol_register(struct xfrm4_protocol *handler, unsigned char protoc
 int xfrm4_protocol_deregister(struct xfrm4_protocol *handler, unsigned char protocol);
 int xfrm4_tunnel_register(struct xfrm_tunnel *handler, unsigned short family);
 int xfrm4_tunnel_deregister(struct xfrm_tunnel *handler, unsigned short family);
-int xfrm4_mode_tunnel_input_register(struct xfrm_tunnel_notifier *handler);
-int xfrm4_mode_tunnel_input_deregister(struct xfrm_tunnel_notifier *handler);
 int xfrm6_mode_tunnel_input_register(struct xfrm_tunnel_notifier *handler);
 int xfrm6_mode_tunnel_input_deregister(struct xfrm_tunnel_notifier *handler);
 int xfrm6_extract_header(struct sk_buff *skb);

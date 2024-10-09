@@ -162,8 +162,9 @@ ENTRY(ia32_sysenter_target)
 	testl   $_TIF_WORK_SYSCALL_ENTRY,TI_flags+THREAD_INFO(%rsp,RIP-ARGOFFSET)
 	CFI_REMEMBER_STATE
 	jnz  sysenter_tracesys
-	cmpq	$(IA32_NR_syscalls-1),%rax
-	ja	ia32_badsys
+	cmpq	$(IA32_NR_syscalls),%rax
+	jae	ia32_badsys
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r15
 sysenter_do_call:
 	IA32_ARG_FIXUP
 sysenter_dispatch:
@@ -208,8 +209,9 @@ sysexit_from_sys_call:
 	movl %eax,%edi			/* 1st arg: syscall number */
 	call __audit_syscall_entry
 	movl RAX-ARGOFFSET(%rsp),%eax	/* reload syscall number */
-	cmpq $(IA32_NR_syscalls-1),%rax
-	ja ia32_badsys
+	cmpq $(IA32_NR_syscalls),%rax
+	jae ia32_badsys
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r15
 	movl %ebx,%edi			/* reload 1st syscall arg */
 	movl RCX-ARGOFFSET(%rsp),%esi	/* reload 2nd syscall arg */
 	movl RDX-ARGOFFSET(%rsp),%edx	/* reload 3rd syscall arg */
@@ -261,8 +263,9 @@ sysenter_tracesys:
 	call	syscall_trace_enter
 	LOAD_ARGS32 ARGOFFSET  /* reload args from stack in case ptrace changed it */
 	RESTORE_REST
-	cmpq	$(IA32_NR_syscalls-1),%rax
-	ja	int_ret_from_sys_call /* sysenter_tracesys has set RAX(%rsp) */
+	cmpq	$(IA32_NR_syscalls),%rax
+	jae	int_ret_from_sys_call /* sysenter_tracesys has set RAX(%rsp) */
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r15
 	jmp	sysenter_do_call
 	CFI_ENDPROC
 ENDPROC(ia32_sysenter_target)
@@ -331,8 +334,9 @@ ENTRY(ia32_cstar_target)
 	testl   $_TIF_WORK_SYSCALL_ENTRY,TI_flags+THREAD_INFO(%rsp,RIP-ARGOFFSET)
 	CFI_REMEMBER_STATE
 	jnz   cstar_tracesys
-	cmpq $IA32_NR_syscalls-1,%rax
-	ja  ia32_badsys
+	cmpq $IA32_NR_syscalls,%rax
+	jae  ia32_badsys
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r15
 cstar_do_call:
 	IA32_ARG_FIXUP 1
 cstar_dispatch:
@@ -390,8 +394,9 @@ cstar_tracesys:
 	LOAD_ARGS32 ARGOFFSET, 1  /* reload args from stack in case ptrace changed it */
 	RESTORE_REST
 	xchgl %ebp,%r9d
-	cmpq $(IA32_NR_syscalls-1),%rax
-	ja int_ret_from_sys_call /* cstar_tracesys has set RAX(%rsp) */
+	cmpq $(IA32_NR_syscalls),%rax
+	jae int_ret_from_sys_call /* cstar_tracesys has set RAX(%rsp) */
+	ARRAY_INDEX_NOSPEC_SYSCALL %r15
 	jmp cstar_do_call
 END(ia32_cstar_target)
 				
@@ -487,8 +492,9 @@ ENTRY(ia32_syscall)
 	orl $TS_COMPAT,TI_status+THREAD_INFO(%rsp,RIP-ARGOFFSET)
 	testl $_TIF_WORK_SYSCALL_ENTRY,TI_flags+THREAD_INFO(%rsp,RIP-ARGOFFSET)
 	jnz ia32_tracesys
-	cmpq $(IA32_NR_syscalls-1),%rax
-	ja ia32_badsys
+	cmpq $(IA32_NR_syscalls),%rax
+	jae ia32_badsys
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r8
 ia32_do_call:
 	IA32_ARG_FIXUP
 	SAVE_REST
@@ -515,8 +521,9 @@ ia32_tracesys:
 	call syscall_trace_enter
 	LOAD_ARGS32 ARGOFFSET  /* reload args from stack in case ptrace changed it */
 	RESTORE_REST
-	cmpq $(IA32_NR_syscalls-1),%rax
-	ja  int_ret_from_sys_call	/* ia32_tracesys has set RAX(%rsp) */
+	cmpq $(IA32_NR_syscalls),%rax
+	jae  int_ret_from_sys_call	/* ia32_tracesys has set RAX(%rsp) */
+	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%r8
 	jmp ia32_do_call
 END(ia32_syscall)
 

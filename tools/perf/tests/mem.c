@@ -21,7 +21,7 @@ static int check(union perf_mem_data_src data_src,
 	return 0;
 }
 
-int test__mem(int subtest __maybe_unused)
+int test__mem(struct test *text __maybe_unused, int subtest __maybe_unused)
 {
 	int ret = 0;
 	union perf_mem_data_src src;

@@ -78,13 +78,19 @@ static int efi_pstore_read_func(struct efivar_entry *entry, void *data)
 	} else
 		return 0;
 
+	mutex_lock(&entry->var_data_mutex);
+
 	entry->var.DataSize = 1024;
-	__efivar_entry_get(entry, &entry->var.Attributes,
-			   &entry->var.DataSize, entry->var.Data);
+	if (__efivar_entry_get(entry, &entry->var.Attributes,
+			       &entry->var.DataSize, entry->var.Data)) {
+		mutex_unlock(&entry->var_data_mutex);
+		return -EIO;
+	}
 	size = entry->var.DataSize;
 	memcpy(*cb_data->buf, entry->var.Data,
 	       (size_t)min_t(unsigned long, EFIVARS_DATA_SIZE_MAX, size));
 
+	mutex_unlock(&entry->var_data_mutex);
 	return size;
 }
 

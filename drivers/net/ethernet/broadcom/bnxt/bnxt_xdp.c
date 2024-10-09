@@ -6,6 +6,8 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation.
  */
+#undef CONFIG_BPF_SYSCALL
+
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/pci.h>

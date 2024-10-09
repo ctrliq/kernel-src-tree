@@ -33,9 +33,8 @@ void
 gp100_grctx_generate_pagepool(struct gf100_grctx *info)
 {
 	const struct gf100_grctx_func *grctx = info->gr->func->grctx;
-	const u32 access = NV_MEM_ACCESS_RW | NV_MEM_ACCESS_SYS;
 	const int s = 8;
-	const int b = mmio_vram(info, grctx->pagepool_size, (1 << s), access);
+	const int b = mmio_vram(info, grctx->pagepool_size, (1 << s), true);
 	mmio_refn(info, 0x40800c, 0x00000000, s, b);
 	mmio_wr32(info, 0x408010, 0x8007d800);
 	mmio_refn(info, 0x419004, 0x00000000, s, b);
@@ -49,15 +48,17 @@ gp100_grctx_generate_attrib(struct gf100_grctx *info)
 	const struct gf100_grctx_func *grctx = gr->func->grctx;
 	const u32  alpha = grctx->alpha_nr;
 	const u32 attrib = grctx->attrib_nr;
-	const u32 pertpc = 0x20 * (grctx->attrib_nr_max + grctx->alpha_nr_max);
-	const u32   size = roundup(gr->tpc_total * pertpc, 0x80);
-	const u32 access = NV_MEM_ACCESS_RW;
 	const int s = 12;
-	const int b = mmio_vram(info, size, (1 << s), access);
 	const int max_batches = 0xffff;
+	u32 size = grctx->alpha_nr_max * gr->tpc_total;
 	u32 ao = 0;
-	u32 bo = ao + grctx->alpha_nr_max * gr->tpc_total;
-	int gpc, ppc, n = 0;
+	u32 bo = ao + size;
+	int gpc, ppc, b, n = 0;
+
+	for (gpc = 0; gpc < gr->gpc_nr; gpc++)
+		size += grctx->attrib_nr_max * gr->ppc_nr[gpc] * gr->ppc_tpc_max;
+	size = ((size * 0x20) + 128) & ~127;
+	b = mmio_vram(info, size, (1 << s), false);
 
 	mmio_refn(info, 0x418810, 0x80000000, s, b);
 	mmio_refn(info, 0x419848, 0x10000000, s, b);
@@ -71,7 +72,7 @@ gp100_grctx_generate_attrib(struct gf100_grctx *info)
 	for (gpc = 0; gpc < gr->gpc_nr; gpc++) {
 		for (ppc = 0; ppc < gr->ppc_nr[gpc]; ppc++, n++) {
 			const u32 as =  alpha * gr->ppc_tpc_nr[gpc][ppc];
-			const u32 bs = attrib * gr->ppc_tpc_nr[gpc][ppc];
+			const u32 bs = attrib * gr->ppc_tpc_max;
 			const u32 u = 0x418ea0 + (n * 0x04);
 			const u32 o = PPC_UNIT(gpc, ppc, 0);
 			if (!(gr->ppc_mask[gpc] & (1 << ppc)))
@@ -79,7 +80,7 @@ gp100_grctx_generate_attrib(struct gf100_grctx *info)
 			mmio_wr32(info, o + 0xc0, bs);
 			mmio_wr32(info, o + 0xf4, bo);
 			mmio_wr32(info, o + 0xf0, bs);
-			bo += grctx->attrib_nr_max * gr->ppc_tpc_nr[gpc][ppc];
+			bo += grctx->attrib_nr_max * gr->ppc_tpc_max;
 			mmio_wr32(info, o + 0xe4, as);
 			mmio_wr32(info, o + 0xf8, ao);
 			ao += grctx->alpha_nr_max * gr->ppc_tpc_nr[gpc][ppc];
@@ -97,23 +98,13 @@ gp100_grctx_generate_smid_config(struct gf100_gr *gr)
 	struct nvkm_device *device = gr->base.engine.subdev.device;
 	const u32 dist_nr = DIV_ROUND_UP(gr->tpc_total, 4);
 	u32 dist[TPC_MAX / 4] = {}, gpcs[16] = {};
-	u8  tpcnr[GPC_MAX];
-	int tpc, gpc, i;
+	u8  sm, i;
 
-	memcpy(tpcnr, gr->tpc_nr, sizeof(gr->tpc_nr));
-
-	/* won't result in the same distribution as the binary driver where
-	 * some of the gpcs have more tpcs than others, but this shall do
-	 * for the moment.  the code for earlier gpus has this issue too.
-	 */
-	for (gpc = -1, i = 0; i < gr->tpc_total; i++) {
-		do {
-			gpc = (gpc + 1) % gr->gpc_nr;
-		} while(!tpcnr[gpc]);
-		tpc = gr->tpc_nr[gpc] - tpcnr[gpc]--;
-
-		dist[i / 4] |= ((gpc << 4) | tpc) << ((i % 4) * 8);
-		gpcs[gpc + (gr->func->gpc_nr * (tpc / 4))] |= i << (tpc * 8);
+	for (sm = 0; sm < gr->sm_nr; sm++) {
+		const u8 gpc = gr->sm[sm].gpc;
+		const u8 tpc = gr->sm[sm].tpc;
+		dist[sm / 4] |= ((gpc << 4) | tpc) << ((sm % 4) * 8);
+		gpcs[gpc + (gr->func->gpc_nr * (tpc / 4))] |= sm << ((tpc % 4) * 8);
 	}
 
 	for (i = 0; i < dist_nr; i++)

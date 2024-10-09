@@ -105,7 +105,7 @@ static void ri_tasklet(unsigned long dev)
 		if (from & AT_EGRESS) {
 			dev_queue_xmit(skb);
 		} else if (from & AT_INGRESS) {
-			skb_pull(skb, skb->mac_len);
+			skb_pull_rcsum(skb, skb->mac_len);
 			netif_receive_skb(skb);
 		} else
 			BUG();

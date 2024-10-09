@@ -1,6 +1,7 @@
 #include <linux/module.h>
 #include <asm/alternative.h>
 #include <asm/facility.h>
+#include <asm/nospec-branch.h>
 
 #define MAX_PATCH_LEN (255 - 1)
 
@@ -13,19 +14,6 @@ static int __init disable_alternative_instructions(char *str)
 }
 
 early_param("noaltinstr", disable_alternative_instructions);
-
-static int nobp_flag = 1;
-static int __init nobp_setup_early(char *str)
-{
-	bool enabled;
-	int rc;
-
-	rc = strtobool(str, &enabled);
-	if (!rc)
-		nobp_flag = !!enabled;
-	return rc;
-}
-early_param("nobp", nobp_setup_early);
 
 struct brcl_insn {
 	u16 opc;
@@ -87,7 +75,8 @@ static void __init_or_module __apply_alternatives(struct alt_instr *start,
 		instr = (u8 *)&a->instr_offset + a->instr_offset;
 		replacement = (u8 *)&a->repl_offset + a->repl_offset;
 
-		if (!test_facility(a->facility))
+		if (!__test_facility(a->facility,
+				     S390_lowcore.alt_stfle_fac_list))
 			continue;
 
 		if (unlikely(a->instrlen % 2 || a->replacementlen % 2)) {
@@ -117,10 +106,7 @@ void __init_or_module apply_alternatives(struct alt_instr *start,
 }
 
 extern struct alt_instr __alt_instructions[], __alt_instructions_end[];
-extern struct alt_instr __alt_nobp[], __alt_nobp_end[];
 void __init apply_alternative_instructions(void)
 {
 	apply_alternatives(__alt_instructions, __alt_instructions_end);
-	if (nobp_flag)
-		apply_alternatives(__alt_nobp, __alt_nobp_end);
 }

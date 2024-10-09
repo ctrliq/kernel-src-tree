@@ -41,6 +41,8 @@
  *          Chris Telfer <chris.telfer@netronome.com>
  */
 
+#undef CONFIG_BPF_SYSCALL
+
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
 #include <linux/bpf_trace.h>
@@ -185,9 +187,9 @@ static int nfp_net_reconfig_wait(struct nfp_net *nn, unsigned long deadline)
 	return timed_out ? -EIO : 0;
 }
 
-static void nfp_net_reconfig_timer(unsigned long data)
+static void nfp_net_reconfig_timer(struct timer_list *t)
 {
-	struct nfp_net *nn = (void *)data;
+	struct nfp_net *nn = from_timer(nn, t, reconfig_timer);
 
 	spin_lock_bh(&nn->reconfig_lock);
 
@@ -1202,7 +1204,7 @@ static void *nfp_net_rx_alloc_one(struct nfp_net_dp *dp, dma_addr_t *dma_addr)
 	} else {
 		struct page *page;
 
-		page = alloc_page(GFP_KERNEL | __GFP_COLD);
+		page = alloc_page(GFP_KERNEL);
 		frag = page ? page_address(page) : NULL;
 	}
 	if (!frag) {
@@ -1231,10 +1233,12 @@ static void *nfp_net_napi_alloc_one(struct nfp_net_dp *dp, dma_addr_t *dma_addr)
 	} else {
 		struct page *page;
 
-		page = dev_alloc_page();
-		if (unlikely(!page))
-			return NULL;
-		frag = page_address(page);
+		page = alloc_page(GFP_ATOMIC);
+		frag = page ? page_address(page) : NULL;
+	}
+	if (!frag) {
+		nn_dp_warn(dp, "Failed to alloc receive page frag\n");
+		return NULL;
 	}
 
 	*dma_addr = nfp_net_dma_map_rx(dp, frag);
@@ -1604,26 +1608,6 @@ nfp_net_tx_xdp_buf(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
 	tx_ring->wr_ptr_add++;
 	return true;
 }
-
-static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, void *hard_start,
-			   unsigned int *off, unsigned int *len)
-{
-	struct xdp_buff xdp;
-	void *orig_data;
-	int ret;
-
-	xdp.data_hard_start = hard_start;
-	xdp.data = data + *off;
-	xdp.data_end = data + *off + *len;
-
-	orig_data = xdp.data;
-	ret = bpf_prog_run_xdp(prog, &xdp);
-
-	*len -= xdp.data - orig_data;
-	*off += xdp.data - orig_data;
-
-	return ret;
-}
 #endif
 
 /**
@@ -1661,6 +1645,9 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 		struct nfp_meta_parsed meta;
 		struct net_device *netdev;
 		dma_addr_t new_dma_addr;
+#if 0 /* Not in RHEL7 */
+		u32 meta_len_xdp = 0;
+#endif
 		void *new_frag;
 
 		idx = D_IDX(rx_ring, rx_ring->rd_p);
@@ -1740,16 +1727,24 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 #if 0 /* Not in RHEL7 */
 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
 				  dp->bpf_offload_xdp) && !meta.portid) {
+			void *orig_data = rxbuf->frag + pkt_off;
 			unsigned int dma_off;
-			void *hard_start;
+			struct xdp_buff xdp;
 			int act;
 
-			hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
+			xdp.data_hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
+			xdp.data = orig_data;
+			xdp.data_meta = orig_data;
+			xdp.data_end = orig_data + pkt_len;
 
-			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag, hard_start,
-					      &pkt_off, &pkt_len);
+			act = bpf_prog_run_xdp(xdp_prog, &xdp);
+
+			pkt_len -= xdp.data - orig_data;
+			pkt_off += xdp.data - orig_data;
+
 			switch (act) {
 			case XDP_PASS:
+				meta_len_xdp = xdp.data - xdp.data_meta;
 				break;
 			case XDP_TX:
 				dma_off = pkt_off - NFP_NET_RX_BUF_HEADROOM;
@@ -1818,6 +1813,10 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
 			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
 					       le16_to_cpu(rxd->rxd.vlan));
+#if 0 /* Not in RHEL7 */
+		if (meta_len_xdp)
+			skb_metadata_set(skb, meta_len_xdp);
+#endif
 
 		napi_gro_receive(&rx_ring->r_vec->napi, skb);
 	}
@@ -1945,6 +1944,13 @@ err_free:
 	u64_stats_update_end(&r_vec->tx_sync);
 	dev_kfree_skb_any(skb);
 	return false;
+}
+
+bool __nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb)
+{
+	struct nfp_net_r_vector *r_vec = &nn->r_vecs[0];
+
+	return nfp_ctrl_tx_one(nn, r_vec, skb, false);
 }
 
 bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb)
@@ -3066,6 +3072,11 @@ static int nfp_net_change_mtu(struct net_device *netdev, int new_mtu)
 {
 	struct nfp_net *nn = netdev_priv(netdev);
 	struct nfp_net_dp *dp;
+	int err;
+
+	err = nfp_app_check_mtu(nn->app, netdev, new_mtu);
+	if (err)
+		return err;
 
 	dp = nfp_net_clone_dp(nn);
 	if (!dp)
@@ -3207,10 +3218,9 @@ static int nfp_net_set_features(struct net_device *netdev,
 			new_ctrl &= ~NFP_NET_CFG_CTRL_GATHER;
 	}
 
-	if (changed & NETIF_F_HW_TC && nfp_app_tc_busy(nn->app, nn)) {
-		nn_err(nn, "Cannot disable HW TC offload while in use\n");
-		return -EBUSY;
-	}
+	err = nfp_port_set_features(netdev, features);
+	if (err)
+		return err;
 
 	nn_dbg(nn, "Feature change 0x%llx -> 0x%llx (changed=0x%llx)\n",
 	       netdev->features, features, changed);
@@ -3401,7 +3411,7 @@ nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog, u32 flags,
 	if (err)
 		return err;
 
-	err = nfp_app_xdp_offload(nn->app, nn, offload_prog);
+	err = nfp_app_xdp_offload(nn->app, nn, offload_prog, extack);
 	if (err && flags & XDP_FLAGS_HW_MODE)
 		return err;
 
@@ -3432,7 +3442,7 @@ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
 		xdp->prog_flags = nn->xdp_prog ? nn->xdp_flags : 0;
 		return 0;
 	default:
-		return -EINVAL;
+		return nfp_app_bpf(nn->app, nn, xdp);
 	}
 #else
 	return -EINVAL;
@@ -3584,8 +3594,7 @@ struct nfp_net *nfp_net_alloc(struct pci_dev *pdev, bool needs_netdev,
 	spin_lock_init(&nn->reconfig_lock);
 	spin_lock_init(&nn->link_status_lock);
 
-	setup_timer(&nn->reconfig_timer,
-		    nfp_net_reconfig_timer, (unsigned long)nn);
+	timer_setup(&nn->reconfig_timer, nfp_net_reconfig_timer, 0);
 
 	return nn;
 }
@@ -3596,9 +3605,6 @@ struct nfp_net *nfp_net_alloc(struct pci_dev *pdev, bool needs_netdev,
  */
 void nfp_net_free(struct nfp_net *nn)
 {
-	if (nn->xdp_prog)
-		bpf_prog_put(nn->xdp_prog);
-
 	if (nn->dp.netdev)
 		free_netdev(nn->dp.netdev);
 	else
@@ -3799,6 +3805,10 @@ static int nfp_net_read_caps(struct nfp_net *nn)
 	} else {
 		nn->dp.rx_offset = NFP_NET_RX_OFFSET;
 	}
+
+	/* For control vNICs mask out the capabilities app doesn't want. */
+	if (!nn->dp.netdev)
+		nn->cap &= nn->app->type->ctrl_cap_mask;
 
 	return 0;
 }

@@ -2,6 +2,7 @@
 #include <linux/preempt.h>
 #include <linux/smp.h>
 #include <asm/msr.h>
+#include <asm/spec_ctrl.h>
 
 static void __rdmsr_on_cpu(void *info)
 {
@@ -28,7 +29,17 @@ static void __wrmsr_on_cpu(void *info)
 	else
 		reg = &rv->reg;
 
-	wrmsr(rv->msr_no, reg->l, reg->h);
+	/*
+	 * We need to handle the SPEC_CTRL MSR specially.
+	 * The current content of the spec_ctrl_pcp will be written out
+	 * if the data value is SPEC_CTRL_MSR_REFRESH.
+	 */
+	if (unlikely((rv->msr_no == MSR_IA32_SPEC_CTRL) &&
+		     (reg->l == SPEC_CTRL_MSR_REFRESH)))
+		wrmsr(rv->msr_no, this_cpu_read(spec_ctrl_pcp.entry),
+				  this_cpu_read(spec_ctrl_pcp.hi32));
+	else
+		wrmsr(rv->msr_no, reg->l, reg->h);
 }
 
 int rdmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 *l, u32 *h)

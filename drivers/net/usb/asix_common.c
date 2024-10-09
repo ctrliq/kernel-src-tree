@@ -126,7 +126,6 @@ int asix_rx_fixup_internal(struct usbnet *dev, struct sk_buff *skb,
 
 	while (offset + sizeof(u16) <= skb->len) {
 		u16 copy_length;
-		unsigned char *data;
 
 		if (!rx->remaining) {
 			if (skb->len - offset == sizeof(u16)) {
@@ -180,10 +179,12 @@ int asix_rx_fixup_internal(struct usbnet *dev, struct sk_buff *skb,
 		}
 
 		if (rx->ax_skb) {
-			data = skb_put(rx->ax_skb, copy_length);
-			memcpy(data, skb->data + offset, copy_length);
-			if (!rx->remaining)
+			skb_put_data(rx->ax_skb, skb->data + offset,
+				     copy_length);
+			if (!rx->remaining) {
 				usbnet_skb_return(dev, rx->ax_skb);
+				rx->ax_skb = NULL;
+			}
 		}
 
 		offset += (copy_length + 1) & 0xfffe;

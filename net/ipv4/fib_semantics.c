@@ -58,7 +58,6 @@ static unsigned int fib_info_cnt;
 static struct hlist_head fib_info_devhash[DEVINDEX_HASHSIZE];
 
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-u32 fib_multipath_secret __read_mostly;
 
 #define for_nexthops(fi) {						\
 	int nhsel; const struct fib_nh *nh;				\
@@ -205,6 +204,7 @@ static void rt_fibinfo_free_cpus(struct rtable __rcu * __percpu *rtp)
 static void free_fib_info_rcu(struct rcu_head *head)
 {
 	struct fib_info *fi = container_of(head, struct fib_info, rcu);
+	struct dst_metrics *m;
 
 	change_nexthops(fi) {
 		if (nexthop_nh->nh_dev)
@@ -215,8 +215,9 @@ static void free_fib_info_rcu(struct rcu_head *head)
 		rt_fibinfo_free(&nexthop_nh->nh_rth_input);
 	} endfor_nexthops(fi);
 
-	if (fi->fib_metrics != (u32 *) dst_default_metrics)
-		kfree(fi->fib_metrics);
+	m = fi->fib_metrics;
+	if (m != &dst_default_metrics && atomic_dec_and_test(&m->refcnt))
+		kfree(m);
 	kfree(fi);
 }
 
@@ -586,9 +587,6 @@ static void fib_rebalance(struct fib_info *fi)
 
 		atomic_set(&nexthop_nh->nh_upper_bound, upper_bound);
 	} endfor_nexthops(fi);
-
-	net_get_random_once(&fib_multipath_secret,
-			    sizeof(fib_multipath_secret));
 }
 
 static inline void fib_add_weight(struct fib_info *fi,
@@ -696,7 +694,7 @@ bool fib_metrics_match(struct fib_config *cfg, struct fib_info *fi)
 			val = nla_get_u32(nla);
 		}
 
-		fi_val = fi->fib_metrics[type - 1];
+		fi_val = fi->fib_metrics->metrics[type - 1];
 		if (type == RTAX_FEATURES)
 			fi_val &= ~DST_FEATURE_ECN_CA;
 
@@ -962,11 +960,11 @@ fib_convert_metrics(struct fib_info *fi, const struct fib_config *cfg)
 			val = 255;
 		if (type == RTAX_FEATURES && (val & ~RTAX_FEATURE_MASK))
 			return -EINVAL;
-		fi->fib_metrics[type - 1] = val;
+		fi->fib_metrics->metrics[type - 1] = val;
 	}
 
 	if (ecn_ca)
-		fi->fib_metrics[RTAX_FEATURES - 1] |= DST_FEATURE_ECN_CA;
+		fi->fib_metrics->metrics[RTAX_FEATURES - 1] |= DST_FEATURE_ECN_CA;
 
 	return 0;
 }
@@ -1020,13 +1018,16 @@ struct fib_info *fib_create_info(struct fib_config *cfg)
 	if (fi == NULL)
 		goto failure;
 	if (cfg->fc_mx) {
-		fi->fib_metrics = kzalloc(sizeof(u32) * RTAX_MAX, GFP_KERNEL);
-		if (!fi->fib_metrics)
-			goto failure;
-	} else
-		fi->fib_metrics = (u32 *) dst_default_metrics;
+		fi->fib_metrics = kzalloc(sizeof(*fi->fib_metrics), GFP_KERNEL);
+		if (unlikely(!fi->fib_metrics)) {
+			kfree(fi);
+			return ERR_PTR(err);
+		}
+		atomic_set(&fi->fib_metrics->refcnt, 1);
+	} else {
+		fi->fib_metrics = (struct dst_metrics *)&dst_default_metrics;
+	}
 	fib_info_cnt++;
-
 	fi->fib_net = net;
 	fi->fib_protocol = cfg->fc_protocol;
 	fi->fib_scope = cfg->fc_scope;
@@ -1226,7 +1227,7 @@ int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
 	if (fi->fib_priority &&
 	    nla_put_u32(skb, RTA_PRIORITY, fi->fib_priority))
 		goto nla_put_failure;
-	if (rtnetlink_put_metrics(skb, fi->fib_metrics) < 0)
+	if (rtnetlink_put_metrics(skb, fi->fib_metrics->metrics) < 0)
 		goto nla_put_failure;
 
 	if (fi->fib_prefsrc &&
@@ -1410,62 +1411,76 @@ int fib_sync_down_dev(struct net_device *dev, int force)
 }
 
 /* Must be invoked inside of an RCU protected region.  */
-void fib_select_default(struct fib_result *res)
+void fib_select_default(const struct flowi4 *flp, struct fib_result *res)
 {
 	struct fib_info *fi = NULL, *last_resort = NULL;
 	struct hlist_head *fa_head = res->fa_head;
 	struct fib_table *tb = res->table;
 	u8 slen = 32 - res->prefixlen;
 	int order = -1, last_idx = -1;
-	struct fib_alias *fa;
+	struct fib_alias *fa, *fa1 = NULL;
+	u32 last_prio = res->fi->fib_priority;
+	u8 last_tos = 0;
 
 	hlist_for_each_entry_rcu(fa, fa_head, fa_list) {
 		struct fib_info *next_fi = fa->fa_info;
 
 		if (fa->fa_slen != slen)
 			continue;
+		if (fa->fa_tos && fa->fa_tos != flp->flowi4_tos)
+			continue;
 		if (fa->tb_id != tb->tb_id)
 			continue;
+		if (next_fi->fib_priority > last_prio &&
+		    fa->fa_tos == last_tos) {
+			if (last_tos)
+				continue;
+			break;
+		}
+		if (next_fi->fib_flags & RTNH_F_DEAD)
+			continue;
+		last_tos = fa->fa_tos;
+		last_prio = next_fi->fib_priority;
+
 		if (next_fi->fib_scope != res->scope ||
 		    fa->fa_type != RTN_UNICAST)
 			continue;
-
-		if (next_fi->fib_priority > res->fi->fib_priority)
-			break;
 		if (!next_fi->fib_nh[0].nh_gw ||
 		    next_fi->fib_nh[0].nh_scope != RT_SCOPE_LINK)
 			continue;
 
 		fib_alias_accessed(fa);
 
-		if (fi == NULL) {
+		if (!fi) {
 			if (next_fi != res->fi)
 				break;
+			fa1 = fa;
 		} else if (!fib_detect_death(fi, order, &last_resort,
-					     &last_idx, tb->tb_default)) {
+					     &last_idx, fa1->fa_default)) {
 			fib_result_assign(res, fi);
-			tb->tb_default = order;
+			fa1->fa_default = order;
 			goto out;
 		}
 		fi = next_fi;
 		order++;
 	}
 
-	if (order <= 0 || fi == NULL) {
-		tb->tb_default = -1;
+	if (order <= 0 || !fi) {
+		if (fa1)
+			fa1->fa_default = -1;
 		goto out;
 	}
 
 	if (!fib_detect_death(fi, order, &last_resort, &last_idx,
-				tb->tb_default)) {
+			      fa1->fa_default)) {
 		fib_result_assign(res, fi);
-		tb->tb_default = order;
+		fa1->fa_default = order;
 		goto out;
 	}
 
 	if (last_idx >= 0)
 		fib_result_assign(res, last_resort);
-	tb->tb_default = last_idx;
+	fa1->fa_default = last_idx;
 out:
 	return;
 }
@@ -1545,3 +1560,24 @@ void fib_select_multipath(struct fib_result *res, int hash)
 	res->nh_sel = 0;
 }
 #endif
+
+void fib_select_path(struct net *net, struct fib_result *res,
+		     struct flowi4 *fl4, const struct sk_buff *skb)
+{
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+	if (res->fi->fib_nhs > 1 && fl4->flowi4_oif == 0) {
+		int h = fib_multipath_hash(res->fi, fl4, skb);
+
+		fib_select_multipath(res, h);
+	}
+	else
+#endif
+	if (!res->prefixlen &&
+	    res->table->tb_num_default > 1 &&
+	    res->type == RTN_UNICAST && !fl4->flowi4_oif)
+		fib_select_default(fl4, res);
+
+	if (!fl4->saddr)
+		fl4->saddr = FIB_RES_PREFSRC(net, *res);
+}
+EXPORT_SYMBOL_GPL(fib_select_path);

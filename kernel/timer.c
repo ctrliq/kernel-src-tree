@@ -49,6 +49,8 @@
 #include <asm/timex.h>
 #include <asm/io.h>
 
+#include "time/tick-internal.h"
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/timer.h>
 
@@ -87,10 +89,23 @@ struct tvec_base {
 	struct tvec tv4;
 	struct tvec tv5;
 	RH_KABI_EXTEND(unsigned long all_timers)
+	RH_KABI_EXTEND(int cpu)
+	RH_KABI_EXTEND(bool migration_enabled)
+	RH_KABI_EXTEND(bool nohz_active)
 } ____cacheline_aligned;
 
+/*
+ * __TIMER_INITIALIZER() needs to set ->base to a valid pointer (because we've
+ * made NULL special, hint: lock_timer_base()) and we cannot get a compile time
+ * pointer to per-cpu entries because we don't know where we'll map the section,
+ * even for the boot cpu.
+ *
+ * And so we use boot_tvec_bases for boot CPU and per-cpu __tvec_bases for the
+ * rest of them.
+ */
 struct tvec_base boot_tvec_bases;
 EXPORT_SYMBOL(boot_tvec_bases);
+
 static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;
 
 /* Functions below help us manage 'deferrable' flag */
@@ -116,6 +131,59 @@ timer_set_base(struct timer_list *timer, struct tvec_base *new_base)
 
 	timer->base = (struct tvec_base *)((unsigned long)(new_base) | flags);
 }
+
+#if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
+unsigned int sysctl_timer_migration = 1;
+
+void timers_update_migration(bool update_nohz)
+{
+	bool on = sysctl_timer_migration && tick_nohz_active;
+	unsigned int cpu;
+
+	/* Avoid the loop, if nothing to update */
+	if (this_cpu_read(tvec_bases)->migration_enabled == on)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		per_cpu(tvec_bases, cpu)->migration_enabled = on;
+		per_cpu(hrtimer_bases.migration_enabled, cpu) = on;
+		if (!update_nohz)
+			continue;
+		per_cpu(tvec_bases, cpu)->nohz_active = true;
+		per_cpu(hrtimer_bases.nohz_active, cpu) = true;
+	}
+}
+
+int timer_migration_handler(struct ctl_table *table, int write,
+			    void __user *buffer, size_t *lenp,
+			    loff_t *ppos)
+{
+
+	static DEFINE_MUTEX(mutex);
+	int ret;
+
+	mutex_lock(&mutex);
+	ret = proc_dointvec(table, write, buffer, lenp, ppos);
+	if (!ret && write)
+		timers_update_migration(false);
+	mutex_unlock(&mutex);
+	return ret;
+}
+
+static inline struct tvec_base *get_target_base(struct tvec_base *base,
+						int pinned)
+{
+	if (pinned || !base->migration_enabled)
+		return this_cpu_read(tvec_bases);
+	return per_cpu(tvec_bases, get_nohz_timer_target());
+}
+#else
+static inline struct tvec_base *get_target_base(struct tvec_base *base,
+						int pinned)
+{
+	return this_cpu_ptr(&tvec_bases);
+}
+#endif
 
 static unsigned long round_jiffies_common(unsigned long j, int cpu,
 		bool force_up)
@@ -409,8 +477,11 @@ static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 	 * require special care against races with idle_cpu(), lets deal
 	 * with that later.
 	 */
-	if (!tbase_get_deferrable(timer->base) || tick_nohz_full_cpu(base->cpu))
-		wake_up_nohz_cpu(base->cpu);
+	if (base->nohz_active) {
+		if (!tbase_get_deferrable(timer->base) ||
+		    tick_nohz_full_cpu(base->cpu))
+			wake_up_nohz_cpu(base->cpu);
+	}
 }
 
 #ifdef CONFIG_TIMER_STATS
@@ -745,11 +816,11 @@ static struct tvec_base *lock_timer_base(struct timer_list *timer,
 
 static inline int
 __mod_timer(struct timer_list *timer, unsigned long expires,
-						bool pending_only, int pinned)
+	    bool pending_only, int pinned)
 {
 	struct tvec_base *base, *new_base;
 	unsigned long flags;
-	int ret = 0 , cpu;
+	int ret = 0;
 
 	timer_stats_timer_set_start_info(timer);
 	BUG_ON(!timer->function);
@@ -762,13 +833,7 @@ __mod_timer(struct timer_list *timer, unsigned long expires,
 
 	debug_activate(timer, expires);
 
-	cpu = smp_processor_id();
-
-#if defined(CONFIG_NO_HZ_COMMON) && defined(CONFIG_SMP)
-	if (!pinned && get_sysctl_timer_migration())
-		cpu = get_nohz_timer_target();
-#endif
-	new_base = per_cpu(tvec_bases, cpu);
+	new_base = get_target_base(base, pinned);
 
 	if (base != new_base) {
 		/*
@@ -1017,6 +1082,8 @@ int try_to_del_timer_sync(struct timer_list *timer)
 EXPORT_SYMBOL(try_to_del_timer_sync);
 
 #ifdef CONFIG_SMP
+static DEFINE_PER_CPU(struct tvec_base, __tvec_bases);
+
 /**
  * del_timer_sync - deactivate a timer and wait for the handler to finish.
  * @timer: the timer to be deactivated
@@ -1520,65 +1587,6 @@ signed long __sched schedule_timeout_uninterruptible(signed long timeout)
 }
 EXPORT_SYMBOL(schedule_timeout_uninterruptible);
 
-static int init_timers_cpu(int cpu)
-{
-	int j;
-	struct tvec_base *base;
-	static char tvec_base_done[NR_CPUS];
-
-	if (!tvec_base_done[cpu]) {
-		static char boot_done;
-
-		if (boot_done) {
-			/*
-			 * The APs use this path later in boot
-			 */
-			base = kmalloc_node(sizeof(*base),
-						GFP_KERNEL | __GFP_ZERO,
-						cpu_to_node(cpu));
-			if (!base)
-				return -ENOMEM;
-
-			/* Make sure that tvec_base is 2 byte aligned */
-			if (tbase_get_deferrable(base)) {
-				WARN_ON(1);
-				kfree(base);
-				return -ENOMEM;
-			}
-			per_cpu(tvec_bases, cpu) = base;
-		} else {
-			/*
-			 * This is for the boot CPU - we use compile-time
-			 * static initialisation because per-cpu memory isn't
-			 * ready yet and because the memory allocators are not
-			 * initialised either.
-			 */
-			boot_done = 1;
-			base = &boot_tvec_bases;
-		}
-		spin_lock_init(&base->lock);
-		tvec_base_done[cpu] = 1;
-	} else {
-		base = per_cpu(tvec_bases, cpu);
-	}
-
-
-	for (j = 0; j < TVN_SIZE; j++) {
-		INIT_LIST_HEAD(base->tv5.vec + j);
-		INIT_LIST_HEAD(base->tv4.vec + j);
-		INIT_LIST_HEAD(base->tv3.vec + j);
-		INIT_LIST_HEAD(base->tv2.vec + j);
-	}
-	for (j = 0; j < TVR_SIZE; j++)
-		INIT_LIST_HEAD(base->tv1.vec + j);
-
-	base->timer_jiffies = jiffies;
-	base->next_timer = base->timer_jiffies;
-	base->active_timers = 0;
-	base->all_timers = 0;
-	return 0;
-}
-
 #ifdef CONFIG_HOTPLUG_CPU
 static void migrate_timer_list(struct tvec_base *new_base, struct list_head *head)
 {
@@ -1620,55 +1628,86 @@ static void migrate_timers(int cpu)
 		migrate_timer_list(new_base, old_base->tv5.vec + i);
 	}
 
+	old_base->active_timers = 0;
+	old_base->all_timers = 0;
+
 	spin_unlock(&old_base->lock);
 	spin_unlock_irq(&new_base->lock);
 	put_cpu_var(tvec_bases);
 }
-#endif /* CONFIG_HOTPLUG_CPU */
 
 static int timer_cpu_notify(struct notifier_block *self,
 				unsigned long action, void *hcpu)
 {
-	long cpu = (long)hcpu;
-	int err;
-
-	switch(action) {
-	case CPU_UP_PREPARE:
-	case CPU_UP_PREPARE_FROZEN:
-		err = init_timers_cpu(cpu);
-		if (err < 0)
-			return notifier_from_errno(err);
-		break;
-#ifdef CONFIG_HOTPLUG_CPU
+	switch (action) {
 	case CPU_DEAD:
 	case CPU_DEAD_FROZEN:
-		migrate_timers(cpu);
+		migrate_timers((long)hcpu);
 		break;
-#endif
 	default:
 		break;
 	}
+
 	return NOTIFY_OK;
 }
 
-static struct notifier_block timers_nb = {
-	.notifier_call	= timer_cpu_notify,
-};
+static inline void timer_register_cpu_notifier(void)
+{
+	cpu_notifier(timer_cpu_notify, 0);
+}
+#else
+static inline void timer_register_cpu_notifier(void) { }
+#endif /* CONFIG_HOTPLUG_CPU */
 
+static void __init init_timer_cpu(struct tvec_base *base, int cpu)
+{
+	int j;
+
+	BUG_ON(base != tbase_get_base(base));
+
+	base->cpu = cpu;
+	per_cpu(tvec_bases, cpu) = base;
+	spin_lock_init(&base->lock);
+
+	for (j = 0; j < TVN_SIZE; j++) {
+		INIT_LIST_HEAD(base->tv5.vec + j);
+		INIT_LIST_HEAD(base->tv4.vec + j);
+		INIT_LIST_HEAD(base->tv3.vec + j);
+		INIT_LIST_HEAD(base->tv2.vec + j);
+	}
+	for (j = 0; j < TVR_SIZE; j++)
+		INIT_LIST_HEAD(base->tv1.vec + j);
+
+	base->timer_jiffies = jiffies;
+	base->next_timer = base->timer_jiffies;
+}
+
+static void __init init_timer_cpus(void)
+{
+	struct tvec_base *base;
+	int local_cpu = smp_processor_id();
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		if (cpu == local_cpu)
+			base = &boot_tvec_bases;
+#ifdef CONFIG_SMP
+		else
+			base = per_cpu_ptr(&__tvec_bases, cpu);
+#endif
+
+		init_timer_cpu(base, cpu);
+	}
+}
 
 void __init init_timers(void)
 {
-	int err;
-
 	/* ensure there are enough low bits for flags in timer->base pointer */
 	BUILD_BUG_ON(__alignof__(struct tvec_base) & TIMER_FLAG_MASK);
 
-	err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE,
-			       (void *)(long)smp_processor_id());
+	init_timer_cpus();
 	init_timer_stats();
-
-	BUG_ON(err != NOTIFY_OK);
-	register_cpu_notifier(&timers_nb);
+	timer_register_cpu_notifier();
 	open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
 }
 

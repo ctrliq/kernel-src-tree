@@ -336,6 +336,45 @@ TRACE_EVENT(kvm_s390_handle_stsi,
 			   __entry->addr)
 	);
 
+TRACE_EVENT(kvm_s390_handle_operexc,
+	    TP_PROTO(VCPU_PROTO_COMMON, __u16 ipa, __u32 ipb),
+	    TP_ARGS(VCPU_ARGS_COMMON, ipa, ipb),
+
+	    TP_STRUCT__entry(
+		    VCPU_FIELD_COMMON
+		    __field(__u64, instruction)
+		    ),
+
+	    TP_fast_assign(
+		    VCPU_ASSIGN_COMMON
+		    __entry->instruction = ((__u64)ipa << 48) |
+		    ((__u64)ipb << 16);
+		    ),
+
+	    VCPU_TP_PRINTK("operation exception on instruction %016llx",
+			   __entry->instruction)
+	);
+
+TRACE_EVENT(kvm_s390_handle_sthyi,
+	    TP_PROTO(VCPU_PROTO_COMMON, u64 code, u64 addr),
+	    TP_ARGS(VCPU_ARGS_COMMON, code, addr),
+
+	    TP_STRUCT__entry(
+		    VCPU_FIELD_COMMON
+		    __field(u64, code)
+		    __field(u64, addr)
+		    ),
+
+	    TP_fast_assign(
+		    VCPU_ASSIGN_COMMON
+		    __entry->code = code;
+		    __entry->addr = addr;
+		    ),
+
+	    VCPU_TP_PRINTK("STHYI fc: %llu addr: %016llx",
+			   __entry->code, __entry->addr)
+	);
+
 #endif /* _TRACE_KVM_H */
 
 /* This part must be outside protection */

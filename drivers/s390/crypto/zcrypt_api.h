@@ -76,6 +76,7 @@ struct ica_z90_status {
 #define ZCRYPT_CEX3A		8
 #define ZCRYPT_CEX4	       10
 #define ZCRYPT_CEX5	        11
+#define ZCRYPT_CEX6	       12
 
 /**
  * Large random numbers are pulled in 4096 byte chunks from the crypto cards
@@ -191,6 +192,7 @@ struct zcrypt_ops *zcrypt_msgtype(unsigned char *, int);
 int zcrypt_api_init(void);
 void zcrypt_api_exit(void);
 long zcrypt_send_cprb(struct ica_xcRB *xcRB);
-void zcrypt_device_status_mask(struct zcrypt_device_matrix *devstatus);
+void zcrypt_device_status_mask(struct zcrypt_device_status *devstatus);
+void zcrypt_device_status_mask_ext(struct zcrypt_device_status_ext *devstatus);
 
 #endif /* _ZCRYPT_API_H_ */

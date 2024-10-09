@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 Netronome Systems, Inc.
+ * Copyright (C) 2016-2017 Netronome Systems, Inc.
  *
  * This software is dual licensed under the GNU General License Version 2,
  * June 1991 as shown in the file COPYING in the top-level directory of this
@@ -62,14 +62,14 @@
 #define UR_REG_IMM_encode(x) (UR_REG_IMM | (x))
 #define UR_REG_IMM_MAX	 0x0ffULL
 
-#define OP_BR_BASE	0x0d800000020ULL
-#define OP_BR_BASE_MASK	0x0f8000c3ce0ULL
-#define OP_BR_MASK	0x0000000001fULL
-#define OP_BR_EV_PIP	0x00000000300ULL
-#define OP_BR_CSS	0x0000003c000ULL
-#define OP_BR_DEFBR	0x00000300000ULL
-#define OP_BR_ADDR_LO	0x007ffc00000ULL
-#define OP_BR_ADDR_HI	0x10000000000ULL
+#define OP_BR_BASE		0x0d800000020ULL
+#define OP_BR_BASE_MASK		0x0f8000c3ce0ULL
+#define OP_BR_MASK		0x0000000001fULL
+#define OP_BR_EV_PIP		0x00000000300ULL
+#define OP_BR_CSS		0x0000003c000ULL
+#define OP_BR_DEFBR		0x00000300000ULL
+#define OP_BR_ADDR_LO		0x007ffc00000ULL
+#define OP_BR_ADDR_HI		0x10000000000ULL
 
 #define nfp_is_br(_insn)				\
 	(((_insn) & OP_BR_BASE_MASK) == OP_BR_BASE)
@@ -77,6 +77,7 @@
 enum br_mask {
 	BR_BEQ = 0x00,
 	BR_BNE = 0x01,
+	BR_BMI = 0x02,
 	BR_BHS = 0x04,
 	BR_BLO = 0x05,
 	BR_BGE = 0x08,
@@ -93,30 +94,37 @@ enum br_ctx_signal_state {
 	BR_CSS_NONE = 2,
 };
 
-#define OP_BBYTE_BASE	0x0c800000000ULL
-#define OP_BB_A_SRC	0x000000000ffULL
-#define OP_BB_BYTE	0x00000000300ULL
-#define OP_BB_B_SRC	0x0000003fc00ULL
-#define OP_BB_I8	0x00000040000ULL
-#define OP_BB_EQ	0x00000080000ULL
-#define OP_BB_DEFBR	0x00000300000ULL
-#define OP_BB_ADDR_LO	0x007ffc00000ULL
-#define OP_BB_ADDR_HI	0x10000000000ULL
+u16 br_get_offset(u64 instr);
+void br_set_offset(u64 *instr, u16 offset);
+void br_add_offset(u64 *instr, u16 offset);
 
-#define OP_BALU_BASE	0x0e800000000ULL
-#define OP_BA_A_SRC	0x000000003ffULL
-#define OP_BA_B_SRC	0x000000ffc00ULL
-#define OP_BA_DEFBR	0x00000300000ULL
-#define OP_BA_ADDR_HI	0x0007fc00000ULL
+#define OP_BBYTE_BASE		0x0c800000000ULL
+#define OP_BB_A_SRC		0x000000000ffULL
+#define OP_BB_BYTE		0x00000000300ULL
+#define OP_BB_B_SRC		0x0000003fc00ULL
+#define OP_BB_I8		0x00000040000ULL
+#define OP_BB_EQ		0x00000080000ULL
+#define OP_BB_DEFBR		0x00000300000ULL
+#define OP_BB_ADDR_LO		0x007ffc00000ULL
+#define OP_BB_ADDR_HI		0x10000000000ULL
+#define OP_BB_SRC_LMEXTN	0x40000000000ULL
 
-#define OP_IMMED_A_SRC	0x000000003ffULL
-#define OP_IMMED_B_SRC	0x000000ffc00ULL
-#define OP_IMMED_IMM	0x0000ff00000ULL
-#define OP_IMMED_WIDTH	0x00060000000ULL
-#define OP_IMMED_INV	0x00080000000ULL
-#define OP_IMMED_SHIFT	0x00600000000ULL
-#define OP_IMMED_BASE	0x0f000000000ULL
-#define OP_IMMED_WR_AB	0x20000000000ULL
+#define OP_BALU_BASE		0x0e800000000ULL
+#define OP_BA_A_SRC		0x000000003ffULL
+#define OP_BA_B_SRC		0x000000ffc00ULL
+#define OP_BA_DEFBR		0x00000300000ULL
+#define OP_BA_ADDR_HI		0x0007fc00000ULL
+
+#define OP_IMMED_A_SRC		0x000000003ffULL
+#define OP_IMMED_B_SRC		0x000000ffc00ULL
+#define OP_IMMED_IMM		0x0000ff00000ULL
+#define OP_IMMED_WIDTH		0x00060000000ULL
+#define OP_IMMED_INV		0x00080000000ULL
+#define OP_IMMED_SHIFT		0x00600000000ULL
+#define OP_IMMED_BASE		0x0f000000000ULL
+#define OP_IMMED_WR_AB		0x20000000000ULL
+#define OP_IMMED_SRC_LMEXTN	0x40000000000ULL
+#define OP_IMMED_DST_LMEXTN	0x80000000000ULL
 
 enum immed_width {
 	IMMED_WIDTH_ALL = 0,
@@ -130,17 +138,23 @@ enum immed_shift {
 	IMMED_SHIFT_2B = 2,
 };
 
-#define OP_SHF_BASE	0x08000000000ULL
-#define OP_SHF_A_SRC	0x000000000ffULL
-#define OP_SHF_SC	0x00000000300ULL
-#define OP_SHF_B_SRC	0x0000003fc00ULL
-#define OP_SHF_I8	0x00000040000ULL
-#define OP_SHF_SW	0x00000080000ULL
-#define OP_SHF_DST	0x0000ff00000ULL
-#define OP_SHF_SHIFT	0x001f0000000ULL
-#define OP_SHF_OP	0x00e00000000ULL
-#define OP_SHF_DST_AB	0x01000000000ULL
-#define OP_SHF_WR_AB	0x20000000000ULL
+u16 immed_get_value(u64 instr);
+void immed_set_value(u64 *instr, u16 immed);
+void immed_add_value(u64 *instr, u16 offset);
+
+#define OP_SHF_BASE		0x08000000000ULL
+#define OP_SHF_A_SRC		0x000000000ffULL
+#define OP_SHF_SC		0x00000000300ULL
+#define OP_SHF_B_SRC		0x0000003fc00ULL
+#define OP_SHF_I8		0x00000040000ULL
+#define OP_SHF_SW		0x00000080000ULL
+#define OP_SHF_DST		0x0000ff00000ULL
+#define OP_SHF_SHIFT		0x001f0000000ULL
+#define OP_SHF_OP		0x00e00000000ULL
+#define OP_SHF_DST_AB		0x01000000000ULL
+#define OP_SHF_WR_AB		0x20000000000ULL
+#define OP_SHF_SRC_LMEXTN	0x40000000000ULL
+#define OP_SHF_DST_LMEXTN	0x80000000000ULL
 
 enum shf_op {
 	SHF_OP_NONE = 0,
@@ -156,19 +170,22 @@ enum shf_sc {
 	SHF_SC_R_DSHF = 3,
 };
 
-#define OP_ALU_A_SRC	0x000000003ffULL
-#define OP_ALU_B_SRC	0x000000ffc00ULL
-#define OP_ALU_DST	0x0003ff00000ULL
-#define OP_ALU_SW	0x00040000000ULL
-#define OP_ALU_OP	0x00f80000000ULL
-#define OP_ALU_DST_AB	0x01000000000ULL
-#define OP_ALU_BASE	0x0a000000000ULL
-#define OP_ALU_WR_AB	0x20000000000ULL
+#define OP_ALU_A_SRC		0x000000003ffULL
+#define OP_ALU_B_SRC		0x000000ffc00ULL
+#define OP_ALU_DST		0x0003ff00000ULL
+#define OP_ALU_SW		0x00040000000ULL
+#define OP_ALU_OP		0x00f80000000ULL
+#define OP_ALU_DST_AB		0x01000000000ULL
+#define OP_ALU_BASE		0x0a000000000ULL
+#define OP_ALU_WR_AB		0x20000000000ULL
+#define OP_ALU_SRC_LMEXTN	0x40000000000ULL
+#define OP_ALU_DST_LMEXTN	0x80000000000ULL
 
 enum alu_op {
 	ALU_OP_NONE	= 0x00,
 	ALU_OP_ADD	= 0x01,
 	ALU_OP_NOT	= 0x04,
+	ALU_OP_ADD_2B	= 0x05,
 	ALU_OP_AND	= 0x08,
 	ALU_OP_SUB_C	= 0x0d,
 	ALU_OP_ADD_C	= 0x11,
@@ -182,26 +199,29 @@ enum alu_dst_ab {
 	ALU_DST_B = 1,
 };
 
-#define OP_LDF_BASE	0x0c000000000ULL
-#define OP_LDF_A_SRC	0x000000000ffULL
-#define OP_LDF_SC	0x00000000300ULL
-#define OP_LDF_B_SRC	0x0000003fc00ULL
-#define OP_LDF_I8	0x00000040000ULL
-#define OP_LDF_SW	0x00000080000ULL
-#define OP_LDF_ZF	0x00000100000ULL
-#define OP_LDF_BMASK	0x0000f000000ULL
-#define OP_LDF_SHF	0x001f0000000ULL
-#define OP_LDF_WR_AB	0x20000000000ULL
+#define OP_LDF_BASE		0x0c000000000ULL
+#define OP_LDF_A_SRC		0x000000000ffULL
+#define OP_LDF_SC		0x00000000300ULL
+#define OP_LDF_B_SRC		0x0000003fc00ULL
+#define OP_LDF_I8		0x00000040000ULL
+#define OP_LDF_SW		0x00000080000ULL
+#define OP_LDF_ZF		0x00000100000ULL
+#define OP_LDF_BMASK		0x0000f000000ULL
+#define OP_LDF_SHF		0x001f0000000ULL
+#define OP_LDF_WR_AB		0x20000000000ULL
+#define OP_LDF_SRC_LMEXTN	0x40000000000ULL
+#define OP_LDF_DST_LMEXTN	0x80000000000ULL
 
-#define OP_CMD_A_SRC	 0x000000000ffULL
-#define OP_CMD_CTX	 0x00000000300ULL
-#define OP_CMD_B_SRC	 0x0000003fc00ULL
-#define OP_CMD_TOKEN	 0x000000c0000ULL
-#define OP_CMD_XFER	 0x00001f00000ULL
-#define OP_CMD_CNT	 0x0000e000000ULL
-#define OP_CMD_SIG	 0x000f0000000ULL
-#define OP_CMD_TGT_CMD	 0x07f00000000ULL
-#define OP_CMD_MODE	0x1c0000000000ULL
+#define OP_CMD_A_SRC		0x000000000ffULL
+#define OP_CMD_CTX		0x00000000300ULL
+#define OP_CMD_B_SRC		0x0000003fc00ULL
+#define OP_CMD_TOKEN		0x000000c0000ULL
+#define OP_CMD_XFER		0x00001f00000ULL
+#define OP_CMD_CNT		0x0000e000000ULL
+#define OP_CMD_SIG		0x000f0000000ULL
+#define OP_CMD_TGT_CMD		0x07f00000000ULL
+#define OP_CMD_INDIR		0x20000000000ULL
+#define OP_CMD_MODE	       0x1c0000000000ULL
 
 struct cmd_tgt_act {
 	u8 token;
@@ -211,6 +231,7 @@ struct cmd_tgt_act {
 enum cmd_tgt_map {
 	CMD_TGT_READ8,
 	CMD_TGT_WRITE8_SWAP,
+	CMD_TGT_WRITE32_SWAP,
 	CMD_TGT_READ32,
 	CMD_TGT_READ32_LE,
 	CMD_TGT_READ32_SWAP,
@@ -232,11 +253,16 @@ enum cmd_ctx_swap {
 	CMD_CTX_NO_SWAP = 3,
 };
 
-#define OP_LCSR_BASE	0x0fc00000000ULL
-#define OP_LCSR_A_SRC	0x000000003ffULL
-#define OP_LCSR_B_SRC	0x000000ffc00ULL
-#define OP_LCSR_WRITE	0x00000200000ULL
-#define OP_LCSR_ADDR	0x001ffc00000ULL
+#define CMD_OVE_LEN	BIT(7)
+#define CMD_OV_LEN	GENMASK(12, 8)
+
+#define OP_LCSR_BASE		0x0fc00000000ULL
+#define OP_LCSR_A_SRC		0x000000003ffULL
+#define OP_LCSR_B_SRC		0x000000ffc00ULL
+#define OP_LCSR_WRITE		0x00000200000ULL
+#define OP_LCSR_ADDR		0x001ffc00000ULL
+#define OP_LCSR_SRC_LMEXTN	0x40000000000ULL
+#define OP_LCSR_DST_LMEXTN	0x80000000000ULL
 
 enum lcsr_wr_src {
 	LCSR_WR_AREG,
@@ -258,9 +284,16 @@ static inline u32 nfp_get_ind_csr_ctx_ptr_offs(u32 read_offset)
 	return (read_offset & ~NFP_IND_ME_CTX_PTR_BASE_MASK) | NFP_CSR_CTX_PTR;
 }
 
+#define NFP_CSR_ACT_LM_ADDR0	0x64
+#define NFP_CSR_ACT_LM_ADDR1	0x6c
+#define NFP_CSR_ACT_LM_ADDR2	0x94
+#define NFP_CSR_ACT_LM_ADDR3	0x9c
+
 /* Software register representation, independent of operand type */
 #define NN_REG_TYPE	GENMASK(31, 24)
-#define NN_REG_LM_IDX	BIT(22)
+#define NN_REG_LM_IDX	GENMASK(23, 22)
+#define NN_REG_LM_IDX_HI	BIT(23)
+#define NN_REG_LM_IDX_LO	BIT(22)
 #define NN_REG_LM_MOD	GENMASK(21, 20)
 #define NN_REG_VAL	GENMASK(7, 0)
 
@@ -302,7 +335,7 @@ static inline swreg __enc_swreg(u16 id, u8 type)
 
 static inline swreg __enc_swreg_lm(u8 id, enum nfp_bpf_lm_mode mode, u8 off)
 {
-	WARN_ON(id > 1 || (off && mode != NN_LM_MOD_NONE));
+	WARN_ON(id > 3 || (off && mode != NN_LM_MOD_NONE));
 
 	return (__force swreg)(FIELD_PREP(NN_REG_TYPE, NN_REG_LMEM) |
 			       FIELD_PREP(NN_REG_LM_IDX, id) |
@@ -327,7 +360,12 @@ static inline u16 swreg_value(swreg reg)
 
 static inline bool swreg_lm_idx(swreg reg)
 {
-	return FIELD_GET(NN_REG_LM_IDX, swreg_raw(reg));
+	return FIELD_GET(NN_REG_LM_IDX_LO, swreg_raw(reg));
+}
+
+static inline bool swreg_lmextn(swreg reg)
+{
+	return FIELD_GET(NN_REG_LM_IDX_HI, swreg_raw(reg));
 }
 
 static inline enum nfp_bpf_lm_mode swreg_lm_mode(swreg reg)
@@ -341,6 +379,8 @@ struct nfp_insn_ur_regs {
 	u16 areg, breg;
 	bool swap;
 	bool wr_both;
+	bool dst_lmextn;
+	bool src_lmextn;
 };
 
 struct nfp_insn_re_regs {
@@ -350,6 +390,8 @@ struct nfp_insn_re_regs {
 	bool swap;
 	bool wr_both;
 	bool i8;
+	bool dst_lmextn;
+	bool src_lmextn;
 };
 
 int swreg_to_unrestricted(swreg dst, swreg lreg, swreg rreg,

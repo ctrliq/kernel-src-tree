@@ -16,6 +16,7 @@
 #include <linux/pagemap.h>
 
 #include <asm/kvm_host.h>
+#include <asm/sysinfo.h>
 
 #include "kvm-s390.h"
 #include "gaccess.h"
@@ -137,6 +138,73 @@ static int handle_instruction_and_prog(struct kvm_vcpu *vcpu)
 	return rc2;
 }
 
+/*
+ * Handle the sthyi instruction that provides the guest with system
+ * information, like current CPU resources available at each level of
+ * the machine.
+ */
+int handle_sthyi(struct kvm_vcpu *vcpu)
+{
+	int reg1, reg2, r = 0;
+	u64 code, addr, cc = 0, rc = 0;
+	struct sthyi_sctns *sctns = NULL;
+
+	if (!test_kvm_facility(vcpu->kvm, 74))
+		return kvm_s390_inject_program_int(vcpu, PGM_OPERATION);
+
+	kvm_s390_get_regs_rre(vcpu, &reg1, &reg2);
+	code = vcpu->run->s.regs.gprs[reg1];
+	addr = vcpu->run->s.regs.gprs[reg2];
+
+	vcpu->stat.instruction_sthyi++;
+	VCPU_EVENT(vcpu, 3, "STHYI: fc: %llu addr: 0x%016llx", code, addr);
+	trace_kvm_s390_handle_sthyi(vcpu, code, addr);
+
+	if (reg1 == reg2 || reg1 & 1 || reg2 & 1)
+		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+
+	if (code & 0xffff) {
+		cc = 3;
+		rc = 4;
+		goto out;
+	}
+
+	if (addr & ~PAGE_MASK)
+		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+
+	sctns = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!sctns)
+		return -ENOMEM;
+
+	cc = sthyi_fill(sctns, &rc);
+
+out:
+	if (!cc) {
+		r = write_guest(vcpu, addr, reg2, sctns, PAGE_SIZE);
+		if (r) {
+			free_page((unsigned long)sctns);
+			return kvm_s390_inject_prog_cond(vcpu, r);
+		}
+	}
+
+	free_page((unsigned long)sctns);
+	vcpu->run->s.regs.gprs[reg2 + 1] = rc;
+	kvm_s390_set_psw_cc(vcpu, cc);
+	return r;
+}
+
+static int handle_operexc(struct kvm_vcpu *vcpu)
+{
+	vcpu->stat.exit_operation_exception++;
+	trace_kvm_s390_handle_operexc(vcpu, vcpu->arch.sie_block->ipa,
+				      vcpu->arch.sie_block->ipb);
+
+	if (vcpu->arch.sie_block->ipa == 0xb256)
+		return handle_sthyi(vcpu);
+
+	return kvm_s390_inject_program_int(vcpu, PGM_OPERATION);
+}
+
 static const intercept_handler_t intercept_funcs[] = {
 	[0x00 >> 2] = handle_noop,
 	[0x04 >> 2] = handle_instruction,
@@ -148,6 +216,7 @@ static const intercept_handler_t intercept_funcs[] = {
 	[0x1C >> 2] = kvm_s390_handle_wait,
 	[0x20 >> 2] = handle_validity,
 	[0x28 >> 2] = handle_stop,
+	[0x2c >> 2] = handle_operexc,
 };
 
 int kvm_handle_sie_intercept(struct kvm_vcpu *vcpu)

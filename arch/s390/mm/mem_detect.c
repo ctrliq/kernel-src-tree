@@ -113,6 +113,7 @@ void create_mem_hole(struct mem_chunk mem_chunk[], unsigned long addr,
 			   (addr + size >= chunk->addr + chunk->size)) {
 			memmove(chunk, chunk + 1, (MEMORY_CHUNKS-i-1) * sizeof(*chunk));
 			memset(&mem_chunk[MEMORY_CHUNKS-1], 0, sizeof(*chunk));
+			i--;
 		} else if (addr + size < chunk->addr + chunk->size) {
 			chunk->size =  chunk->addr + chunk->size - addr - size;
 			chunk->addr = addr + size;

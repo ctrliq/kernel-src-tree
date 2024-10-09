@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Qualcomm USB Auxiliary Serial Port driver
  *
  * Copyright (C) 2008 Greg Kroah-Hartman <greg@kroah.com>
  * Copyright (C) 2010 Dan Williams <dcbw@redhat.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2 as
- *  published by the Free Software Foundation.
  *
  * Devices listed here usually provide a CDC ACM port on which normal modem
  * AT commands and PPP can be used.  But when that port is in-use by PPP it

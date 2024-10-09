@@ -101,7 +101,7 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
 	struct x86_mapping_info info = {
 		.alloc_pgt_page	= alloc_pgt_page,
 		.context	= image,
-		.pmd_flag	= __PAGE_KERNEL_LARGE_EXEC,
+		.page_flag      = __PAGE_KERNEL_LARGE_EXEC,
 		.kernpg_flag	= _KERNPG_TABLE_NOENC,
 	};
 	unsigned long mstart, mend;
@@ -111,7 +111,6 @@ static int init_pgtable(struct kimage *image, unsigned long start_pgtable)
 
 	level4p = (pgd_t *)__va(start_pgtable);
 	clear_page(level4p);
-
 	if (direct_gbpages)
 		info.direct_gbpages = true;
 
@@ -238,6 +237,14 @@ int machine_kexec_prepare(struct kimage *image)
 	if (result)
 		return result;
 
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/*
+	 * The second page of control_code_page may be corrupted by the
+	 * PTI code, so just clear the page for safety.
+	 */
+	clear_page(page_address(image->control_code_page) + PAGE_SIZE);
+#endif
+
 	/* update purgatory as needed */
 	result = arch_update_purgatory(image);
 	if (result)
@@ -277,11 +284,11 @@ void machine_kexec(struct kimage *image)
 		/*
 		 * We need to put APICs in legacy mode so that we can
 		 * get timer interrupts in second kernel. kexec/kdump
-		 * paths already have calls to disable_IO_APIC() in
-		 * one form or other. kexec jump path also need
-		 * one.
+		 * paths already have calls to restore_boot_irq_mode()
+		 * in one form or other. kexec jump path also need one.
 		 */
-		disable_IO_APIC();
+		clear_IO_APIC();
+		restore_boot_irq_mode();
 #endif
 	}
 

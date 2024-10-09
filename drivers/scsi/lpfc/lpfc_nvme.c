@@ -65,13 +65,13 @@ lpfc_release_nvme_buf(struct lpfc_hba *, struct lpfc_nvme_buf *);
 
 static struct nvme_fc_port_template lpfc_nvme_template;
 
-union lpfc_wqe128 lpfc_iread_cmd_template;
-union lpfc_wqe128 lpfc_iwrite_cmd_template;
-union lpfc_wqe128 lpfc_icmnd_cmd_template;
+static union lpfc_wqe128 lpfc_iread_cmd_template;
+static union lpfc_wqe128 lpfc_iwrite_cmd_template;
+static union lpfc_wqe128 lpfc_icmnd_cmd_template;
 
 /* Setup WQE templates for NVME IOs */
 void
-lpfc_nvme_cmd_template()
+lpfc_nvme_cmd_template(void)
 {
 	union lpfc_wqe128 *wqe;
 
@@ -416,14 +416,14 @@ lpfc_nvme_cmpl_gen_req(struct lpfc_hba *phba, struct lpfc_iocbq *cmdwqe,
 static int
 lpfc_nvme_gen_req(struct lpfc_vport *vport, struct lpfc_dmabuf *bmp,
 		  struct lpfc_dmabuf *inp,
-		 struct nvmefc_ls_req *pnvme_lsreq,
-	     void (*cmpl)(struct lpfc_hba *, struct lpfc_iocbq *,
-			   struct lpfc_wcqe_complete *),
-	     struct lpfc_nodelist *ndlp, uint32_t num_entry,
-	     uint32_t tmo, uint8_t retry)
+		  struct nvmefc_ls_req *pnvme_lsreq,
+		  void (*cmpl)(struct lpfc_hba *, struct lpfc_iocbq *,
+			       struct lpfc_wcqe_complete *),
+		  struct lpfc_nodelist *ndlp, uint32_t num_entry,
+		  uint32_t tmo, uint8_t retry)
 {
-	struct lpfc_hba  *phba = vport->phba;
-	union lpfc_wqe *wqe;
+	struct lpfc_hba *phba = vport->phba;
+	union lpfc_wqe128 *wqe;
 	struct lpfc_iocbq *genwqe;
 	struct ulp_bde64 *bpl;
 	struct ulp_bde64 bde;
@@ -774,8 +774,7 @@ lpfc_nvme_adj_fcp_sgls(struct lpfc_vport *vport,
 	 * the dma address.
 	 */
 
-	/* 128 byte wqe support here */
-	wqe = (union lpfc_wqe128 *)&lpfc_ncmd->cur_iocbq.wqe;
+	wqe = &lpfc_ncmd->cur_iocbq.wqe;
 
 	/*
 	 * Adjust the FCP_CMD and FCP_RSP DMA data and sge_len to
@@ -1206,7 +1205,7 @@ lpfc_nvme_prep_io_cmd(struct lpfc_vport *vport,
 	struct lpfc_hba *phba = vport->phba;
 	struct nvmefc_fcp_req *nCmd = lpfc_ncmd->nvmeCmd;
 	struct lpfc_iocbq *pwqeq = &(lpfc_ncmd->cur_iocbq);
-	union lpfc_wqe128 *wqe = (union lpfc_wqe128 *)&pwqeq->wqe;
+	union lpfc_wqe128 *wqe = &pwqeq->wqe;
 	uint32_t req_len;
 
 	if (!pnode || !NLP_CHK_NODE_ACT(pnode))
@@ -1280,6 +1279,8 @@ lpfc_nvme_prep_io_cmd(struct lpfc_vport *vport,
 	/* Word 9 */
 	bf_set(wqe_reqtag, &wqe->generic.wqe_com, pwqeq->iotag);
 
+	/* Words 13 14 15 are for PBDE support */
+
 	pwqeq->vport = vport;
 	return 0;
 }
@@ -1307,7 +1308,7 @@ lpfc_nvme_prep_io_dma(struct lpfc_vport *vport,
 {
 	struct lpfc_hba *phba = vport->phba;
 	struct nvmefc_fcp_req *nCmd = lpfc_ncmd->nvmeCmd;
-	union lpfc_wqe128 *wqe = (union lpfc_wqe128 *)&lpfc_ncmd->cur_iocbq.wqe;
+	union lpfc_wqe128 *wqe = &lpfc_ncmd->cur_iocbq.wqe;
 	struct sli4_sge *sgl = lpfc_ncmd->nvme_sgl;
 	struct scatterlist *data_sg;
 	struct sli4_sge *first_data_sgl;
@@ -1379,7 +1380,7 @@ lpfc_nvme_prep_io_dma(struct lpfc_vport *vport,
 			data_sg = sg_next(data_sg);
 			sgl++;
 		}
-		if (phba->nvme_embed_pbde) {
+		if (phba->cfg_enable_pbde) {
 			/* Use PBDE support for first SGL only, offset == 0 */
 			/* Words 13-15 */
 			bde = (struct ulp_bde64 *)
@@ -1395,10 +1396,8 @@ lpfc_nvme_prep_io_dma(struct lpfc_vport *vport,
 			memset(&wqe->words[13], 0, (sizeof(uint32_t) * 3));
 			bf_set(wqe_pbde, &wqe->generic.wqe_com, 0);
 		}
-	} else {
-		bf_set(wqe_pbde, &wqe->generic.wqe_com, 0);
-		memset(&wqe->words[13], 0, (sizeof(uint32_t) * 3));
 
+	} else {
 		/* For this clause to be valid, the payload_length
 		 * and sg_cnt must zero.
 		 */
@@ -1728,7 +1727,7 @@ lpfc_nvme_fcp_abort(struct nvme_fc_local_port *pnvme_lport,
 	struct lpfc_iocbq *abts_buf;
 	struct lpfc_iocbq *nvmereq_wqe;
 	struct lpfc_nvme_fcpreq_priv *freqpriv;
-	union lpfc_wqe *abts_wqe;
+	union lpfc_wqe128 *abts_wqe;
 	unsigned long flags;
 	int ret_val;
 
@@ -2272,7 +2271,7 @@ lpfc_new_nvme_buf(struct lpfc_vport *vport, int num_to_alloc)
 			break;
 		}
 		pwqeq = &(lpfc_ncmd->cur_iocbq);
-		wqe = (union lpfc_wqe128 *)&pwqeq->wqe;
+		wqe = &pwqeq->wqe;
 
 		/* Allocate iotag for lpfc_ncmd->cur_iocbq. */
 		iotag = lpfc_sli_next_iotag(phba, pwqeq);

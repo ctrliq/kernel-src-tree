@@ -70,15 +70,9 @@ xfs_bmdr_to_bmbt(
 	xfs_bmbt_key_t		*tkp;
 	__be64			*tpp;
 
-	if (xfs_sb_version_hascrc(&mp->m_sb))
-		xfs_btree_init_block_int(mp, rblock, XFS_BUF_DADDR_NULL,
-				 XFS_BMAP_CRC_MAGIC, 0, 0, ip->i_ino,
-				 XFS_BTREE_LONG_PTRS | XFS_BTREE_CRC_BLOCKS);
-	else
-		xfs_btree_init_block_int(mp, rblock, XFS_BUF_DADDR_NULL,
-				 XFS_BMAP_MAGIC, 0, 0, ip->i_ino,
+	xfs_btree_init_block_int(mp, rblock, XFS_BUF_DADDR_NULL,
+				 XFS_BTNUM_BMAP, 0, 0, ip->i_ino,
 				 XFS_BTREE_LONG_PTRS);
-
 	rblock->bb_level = dblock->bb_level;
 	ASSERT(be16_to_cpu(rblock->bb_level) > 0);
 	rblock->bb_numrecs = dblock->bb_numrecs;
@@ -99,8 +93,8 @@ xfs_bmdr_to_bmbt(
  */
 STATIC void
 __xfs_bmbt_get_all(
-		__uint64_t l0,
-		__uint64_t l1,
+		uint64_t l0,
+		uint64_t l1,
 		xfs_bmbt_irec_t *s)
 {
 	int	ext_flag;
@@ -371,32 +365,6 @@ xfs_bmbt_to_bmdr(
 	memcpy(tpp, fpp, sizeof(*fpp) * dmxr);
 }
 
-/*
- * Check extent records, which have just been read, for
- * any bit in the extent flag field. ASSERT on debug
- * kernels, as this condition should not occur.
- * Return an error condition (1) if any flags found,
- * otherwise return 0.
- */
-
-int
-xfs_check_nostate_extents(
-	xfs_ifork_t		*ifp,
-	xfs_extnum_t		idx,
-	xfs_extnum_t		num)
-{
-	for (; num > 0; num--, idx++) {
-		xfs_bmbt_rec_host_t *ep = xfs_iext_get_ext(ifp, idx);
-		if ((ep->l0 >>
-		     (64 - BMBT_EXNTFLAG_BITLEN)) != 0) {
-			ASSERT(0);
-			return 1;
-		}
-	}
-	return 0;
-}
-
-
 STATIC struct xfs_btree_cur *
 xfs_bmbt_dup_cursor(
 	struct xfs_btree_cur	*cur)
@@ -615,12 +583,12 @@ xfs_bmbt_init_ptr_from_cur(
 	ptr->l = 0;
 }
 
-STATIC __int64_t
+STATIC int64_t
 xfs_bmbt_key_diff(
 	struct xfs_btree_cur	*cur,
 	union xfs_btree_key	*key)
 {
-	return (__int64_t)be64_to_cpu(key->bmbt.br_startoff) -
+	return (int64_t)be64_to_cpu(key->bmbt.br_startoff) -
 				      cur->bc_rec.b.br_startoff;
 }
 
@@ -714,7 +682,6 @@ const struct xfs_buf_ops xfs_bmbt_buf_ops = {
 };
 
 
-#if defined(DEBUG) || defined(XFS_WARN)
 STATIC int
 xfs_bmbt_keys_inorder(
 	struct xfs_btree_cur	*cur,
@@ -735,7 +702,6 @@ xfs_bmbt_recs_inorder(
 		xfs_bmbt_disk_get_blockcount(&r1->bmbt) <=
 		xfs_bmbt_disk_get_startoff(&r2->bmbt);
 }
-#endif	/* DEBUG */
 
 static const struct xfs_btree_ops xfs_bmbt_ops = {
 	.rec_len		= sizeof(xfs_bmbt_rec_t),
@@ -753,10 +719,8 @@ static const struct xfs_btree_ops xfs_bmbt_ops = {
 	.init_ptr_from_cur	= xfs_bmbt_init_ptr_from_cur,
 	.key_diff		= xfs_bmbt_key_diff,
 	.buf_ops		= &xfs_bmbt_buf_ops,
-#if defined(DEBUG) || defined(XFS_WARN)
 	.keys_inorder		= xfs_bmbt_keys_inorder,
 	.recs_inorder		= xfs_bmbt_recs_inorder,
-#endif
 
 	.get_leaf_keys		= xfs_btree_get_leaf_keys,
 	.get_node_keys		= xfs_btree_get_node_keys,
@@ -783,6 +747,7 @@ xfs_bmbt_init_cursor(
 	cur->bc_nlevels = be16_to_cpu(ifp->if_broot->bb_level) + 1;
 	cur->bc_btnum = XFS_BTNUM_BMAP;
 	cur->bc_blocklog = mp->m_sb.sb_blocklog;
+	cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_bmbt_2);
 
 	cur->bc_ops = &xfs_bmbt_ops;
 	cur->bc_flags = XFS_BTREE_LONG_PTRS | XFS_BTREE_ROOT_IN_INODE;

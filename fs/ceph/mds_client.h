@@ -46,6 +46,9 @@ struct ceph_mds_reply_info_in {
 	u32 inline_len;
 	char *inline_data;
 	u32 pool_ns_len;
+	char *pool_ns_data;
+	u64 max_bytes;
+	u64 max_files;
 };
 
 struct ceph_mds_reply_dir_entry {
@@ -285,8 +288,10 @@ struct ceph_mds_request {
 
 struct ceph_pool_perm {
 	struct rb_node node;
-	u32 pool;
 	int perm;
+	s64 pool;
+	size_t pool_ns_len;
+	char pool_ns[];
 };
 
 /*
@@ -306,6 +311,8 @@ struct ceph_mds_client {
 	atomic_t		num_sessions;
 	int                     max_sessions;  /* len of s_mds_sessions */
 	int                     stopping;      /* true if shutting down */
+
+	atomic64_t		quotarealms_count; /* # realms with quota */
 
 	/*
 	 * snap_rwsem will cover cap linkage into snaprealms, and

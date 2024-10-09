@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NVKM_DISP_IOR_H__
 #define __NVKM_DISP_IOR_H__
 #include "priv.h"
@@ -29,7 +30,7 @@ struct nvkm_ior {
 			UNKNOWN
 		} proto:3;
 		unsigned link:2;
-		unsigned head:4;
+		unsigned head:8;
 	} arm, asy;
 
 	/* Armed DP state. */
@@ -132,10 +133,15 @@ void gf119_sor_dp_watermark(struct nvkm_ior *, int, u8);
 
 void gm107_sor_dp_pattern(struct nvkm_ior *, int);
 
+void gm200_sor_route_set(struct nvkm_outp *, struct nvkm_ior *);
+int gm200_sor_route_get(struct nvkm_outp *, int *);
+void gm200_sor_dp_drive(struct nvkm_ior *, int, int, int, int, int);
+
 void g84_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
 void gt215_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
 void gf119_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
 void gk104_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
+void gv100_hdmi_ctrl(struct nvkm_ior *, int, bool, u8, u8, u8 *, u8 , u8 *, u8);
 
 void gt215_hda_hpd(struct nvkm_ior *, int, bool);
 void gt215_hda_eld(struct nvkm_ior *, u8 *, u8);
@@ -145,7 +151,7 @@ void gf119_hda_eld(struct nvkm_ior *, u8 *, u8);
 
 #define IOR_MSG(i,l,f,a...) do {                                               \
 	struct nvkm_ior *_ior = (i);                                           \
-	nvkm_##l(&_ior->disp->engine.subdev, "%s: "f, _ior->name, ##a);        \
+	nvkm_##l(&_ior->disp->engine.subdev, "%s: "f"\n", _ior->name, ##a);    \
 } while(0)
 #define IOR_WARN(i,f,a...) IOR_MSG((i), warn, f, ##a)
 #define IOR_DBG(i,f,a...) IOR_MSG((i), debug, f, ##a)
@@ -177,4 +183,7 @@ int gf119_sor_new(struct nvkm_disp *, int);
 int gk104_sor_new(struct nvkm_disp *, int);
 int gm107_sor_new(struct nvkm_disp *, int);
 int gm200_sor_new(struct nvkm_disp *, int);
+
+int gv100_sor_cnt(struct nvkm_disp *, unsigned long *);
+int gv100_sor_new(struct nvkm_disp *, int);
 #endif

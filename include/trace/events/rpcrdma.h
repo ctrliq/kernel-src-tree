@@ -307,10 +307,10 @@ DECLARE_EVENT_CLASS(xprtrdma_cb_event,
 TRACE_EVENT(xprtrdma_conn_upcall,
 	TP_PROTO(
 		const struct rpcrdma_xprt *r_xprt,
-		struct rdma_cm_event *event
+		struct rdma_cm_event *rdma_cm_event
 	),
 
-	TP_ARGS(r_xprt, event),
+	TP_ARGS(r_xprt, rdma_cm_event),
 
 	TP_STRUCT__entry(
 		__field(const void *, r_xprt)
@@ -322,8 +322,8 @@ TRACE_EVENT(xprtrdma_conn_upcall,
 
 	TP_fast_assign(
 		__entry->r_xprt = r_xprt;
-		__entry->event = event->event;
-		__entry->status = event->status;
+		__entry->event = rdma_cm_event->event;
+		__entry->status = rdma_cm_event->status;
 		__assign_str(addr, rpcrdma_addrstr(r_xprt));
 		__assign_str(port, rpcrdma_portstr(r_xprt));
 	),
@@ -378,23 +378,23 @@ DEFINE_RXPRT_EVENT(xprtrdma_inject_dsc);
 TRACE_EVENT(xprtrdma_qp_error,
 	TP_PROTO(
 		const struct rpcrdma_xprt *r_xprt,
-		const struct ib_event *event
+		const struct ib_event *ib_event
 	),
 
-	TP_ARGS(r_xprt, event),
+	TP_ARGS(r_xprt, ib_event),
 
 	TP_STRUCT__entry(
 		__field(const void *, r_xprt)
 		__field(unsigned int, event)
-		__string(name, event->device->name)
+		__string(name, ib_event->device->name)
 		__string(addr, rpcrdma_addrstr(r_xprt))
 		__string(port, rpcrdma_portstr(r_xprt))
 	),
 
 	TP_fast_assign(
 		__entry->r_xprt = r_xprt;
-		__entry->event = event->event;
-		__assign_str(name, event->device->name);
+		__entry->event = ib_event->event;
+		__assign_str(name, ib_event->device->name);
 		__assign_str(addr, rpcrdma_addrstr(r_xprt));
 		__assign_str(port, rpcrdma_portstr(r_xprt));
 	),

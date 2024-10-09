@@ -146,19 +146,6 @@ struct hrtimer_clock_base *lock_hrtimer_base(const struct hrtimer *timer,
 	}
 }
 
-
-/*
- * Get the preferred target CPU for NOHZ
- */
-static int hrtimer_get_target(int this_cpu, int pinned)
-{
-#ifdef CONFIG_NO_HZ_COMMON
-	if (!pinned && get_sysctl_timer_migration())
-		return get_nohz_timer_target();
-#endif
-	return this_cpu;
-}
-
 /*
  * With HIGHRES=y we do not migrate the timer when it is expiring
  * before the next event on the target cpu because we cannot reprogram
@@ -182,6 +169,24 @@ hrtimer_check_target(struct hrtimer *timer, struct hrtimer_clock_base *new_base)
 #endif
 }
 
+#if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
+static inline
+struct hrtimer_cpu_base *get_target_base(struct hrtimer_cpu_base *base,
+					 int pinned)
+{
+	if (pinned || !base->migration_enabled)
+		return this_cpu_ptr(&hrtimer_bases);
+	return &per_cpu(hrtimer_bases, get_nohz_timer_target());
+}
+#else
+static inline
+struct hrtimer_cpu_base *get_target_base(struct hrtimer_cpu_base *base,
+					 int pinned)
+{
+	return this_cpu_ptr(&hrtimer_bases);
+}
+#endif
+
 /*
  * Switch the timer base to the current CPU when possible.
  */
@@ -189,14 +194,13 @@ static inline struct hrtimer_clock_base *
 switch_hrtimer_base(struct hrtimer *timer, struct hrtimer_clock_base *base,
 		    int pinned)
 {
+	struct hrtimer_cpu_base *new_cpu_base, *this_base;
 	struct hrtimer_clock_base *new_base;
-	struct hrtimer_cpu_base *new_cpu_base;
-	int this_cpu = smp_processor_id();
-	int cpu = hrtimer_get_target(this_cpu, pinned);
 	int basenum = base->index;
 
+	this_base = this_cpu_ptr(&hrtimer_bases);
+	new_cpu_base = get_target_base(this_base, pinned);
 again:
-	new_cpu_base = &per_cpu(hrtimer_bases, cpu);
 	new_base = &new_cpu_base->clock_base[basenum];
 
 	if (base != new_base) {
@@ -217,17 +221,19 @@ again:
 		raw_spin_unlock(&base->cpu_base->lock);
 		raw_spin_lock(&new_base->cpu_base->lock);
 
-		if (cpu != this_cpu && hrtimer_check_target(timer, new_base)) {
-			cpu = this_cpu;
+		if (new_cpu_base != this_base &&
+		    hrtimer_check_target(timer, new_base)) {
 			raw_spin_unlock(&new_base->cpu_base->lock);
 			raw_spin_lock(&base->cpu_base->lock);
+			new_cpu_base = this_base;
 			timer->base = base;
 			goto again;
 		}
 		timer->base = new_base;
 	} else {
-		if (cpu != this_cpu && hrtimer_check_target(timer, new_base)) {
-			cpu = this_cpu;
+		if (new_cpu_base != this_base &&
+		    hrtimer_check_target(timer, new_base)) {
+			new_cpu_base = this_base;
 			goto again;
 		}
 	}
@@ -841,6 +847,9 @@ u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval)
 	if (delta.tv64 < 0)
 		return 0;
 
+	if (WARN_ON(timer->state & HRTIMER_STATE_ENQUEUED))
+		return 0;
+
 	if (interval.tv64 < timer->base->resolution.tv64)
 		interval.tv64 = timer->base->resolution.tv64;
 
@@ -1012,7 +1021,8 @@ int hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 		 * Kick to reschedule the next tick to handle the new timer
 		 * on dynticks target.
 		 */
-		wake_up_nohz_cpu(new_base->cpu_base->cpu);
+		if (new_base->cpu_base->nohz_active)
+			wake_up_nohz_cpu(new_base->cpu_base->cpu);
 	} else {
 		hrtimer_reprogram(timer, new_base);
 	}
@@ -1231,11 +1241,14 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 	 * Note: We clear the CALLBACK bit after enqueue_hrtimer and
 	 * we do not reprogramm the event hardware. Happens either in
 	 * hrtimer_start_range_ns() or in hrtimer_interrupt()
+	 *
+	 * Note: Because we dropped the cpu_base->lock above,
+	 * hrtimer_start_range_ns() can have popped in and enqueued the timer
+	 * for us already.
 	 */
-	if (restart != HRTIMER_NORESTART) {
-		BUG_ON(timer->state != HRTIMER_STATE_CALLBACK);
+	if (restart != HRTIMER_NORESTART &&
+	    !(timer->state & HRTIMER_STATE_ENQUEUED))
 		enqueue_hrtimer(timer, base);
-	}
 
 	WARN_ON_ONCE(!(timer->state & HRTIMER_STATE_CALLBACK));
 

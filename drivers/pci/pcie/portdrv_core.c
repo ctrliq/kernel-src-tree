@@ -189,20 +189,13 @@ static int pcie_init_service_irqs(struct pci_dev *dev, int *irqs, int mask)
  */
 static int get_port_device_capability(struct pci_dev *dev)
 {
+	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
 	int services = 0;
-	int cap_mask = 0;
 
-	cap_mask = PCIE_PORT_SERVICE_PME | PCIE_PORT_SERVICE_HP
-			| PCIE_PORT_SERVICE_VC | PCIE_PORT_SERVICE_DPC;
-	if (pci_aer_available())
-		cap_mask |= PCIE_PORT_SERVICE_AER;
-
-	if (pcie_ports_auto)
-		pcie_port_platform_notify(dev, &cap_mask);
-
-	/* Hot-Plug Capable */
-	if ((cap_mask & PCIE_PORT_SERVICE_HP) && dev->is_hotplug_bridge) {
+	if (dev->is_hotplug_bridge &&
+	    (pcie_ports_native || host->native_pcie_hotplug)) {
 		services |= PCIE_PORT_SERVICE_HP;
+
 		/*
 		 * Disable hot-plug interrupts in case they have been enabled
 		 * by the BIOS and the hot-plug service driver is not loaded.
@@ -210,23 +203,31 @@ static int get_port_device_capability(struct pci_dev *dev)
 		pcie_capability_clear_word(dev, PCI_EXP_SLTCTL,
 			  PCI_EXP_SLTCTL_CCIE | PCI_EXP_SLTCTL_HPIE);
 	}
-	/* AER capable */
-	if ((cap_mask & PCIE_PORT_SERVICE_AER)
-	    && pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ERR)) {
+
+	if (pci_find_ext_capability(dev, PCI_EXT_CAP_ID_ERR) &&
+	    pci_aer_available() && (pcie_ports_native || host->native_aer)) {
 		services |= PCIE_PORT_SERVICE_AER;
+
 		/*
 		 * Disable AER on this port in case it's been enabled by the
 		 * BIOS (the AER service driver will enable it when necessary).
 		 */
 		pci_disable_pcie_error_reporting(dev);
 	}
+
 	/* VC support */
 	if (pci_find_ext_capability(dev, PCI_EXT_CAP_ID_VC))
 		services |= PCIE_PORT_SERVICE_VC;
-	/* Root ports are capable of generating PME too */
-	if ((cap_mask & PCIE_PORT_SERVICE_PME)
-	    && pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) {
+
+	/*
+	 * Root ports are capable of generating PME too.  Root Complex
+	 * Event Collectors can also generate PMEs, but we don't handle
+	 * those yet.
+	 */
+	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT &&
+	    (pcie_ports_native || host->native_pme)) {
 		services |= PCIE_PORT_SERVICE_PME;
+
 		/*
 		 * Disable PME interrupt on this port in case it's been enabled
 		 * by the BIOS (the PME service driver will enable it when
@@ -234,7 +235,9 @@ static int get_port_device_capability(struct pci_dev *dev)
 		 */
 		pcie_pme_interrupt_enable(dev, false);
 	}
-	if (pci_find_ext_capability(dev, PCI_EXT_CAP_ID_DPC))
+
+	if (pci_find_ext_capability(dev, PCI_EXT_CAP_ID_DPC) &&
+	    pci_aer_available())
 		services |= PCIE_PORT_SERVICE_DPC;
 
 	return services;

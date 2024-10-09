@@ -933,6 +933,7 @@ static int nfs4_set_client(struct nfs_server *server,
 	}
 
 	if (server->nfs_client == clp) {
+		nfs_put_client(clp);
 		error = -ELOOP;
 		goto error;
 	}
@@ -1333,13 +1334,13 @@ int nfs4_update_server(struct nfs_server *server, const char *hostname,
 				clp->cl_rpcclient->cl_auth->au_flavor,
 				clp->cl_proto, clnt->cl_timeout,
 				clp->cl_minorversion, net);
-	nfs_put_client(clp);
 	if (error != 0) {
 		nfs_server_insert_lists(server);
 		dprintk("<-- %s(): nfs4_set_client returned %d\n",
 			__func__, error);
 		goto out;
 	}
+	nfs_put_client(clp);
 
 	if (server->nfs_client->cl_hostname == NULL)
 		server->nfs_client->cl_hostname = kstrdup(hostname, GFP_KERNEL);

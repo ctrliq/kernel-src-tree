@@ -1,10 +1,10 @@
 /*
  * drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
- * Copyright (c) 2016-2017 Mellanox Technologies. All rights reserved.
+ * Copyright (c) 2016-2018 Mellanox Technologies. All rights reserved.
  * Copyright (c) 2016 Jiri Pirko <jiri@mellanox.com>
  * Copyright (c) 2016 Ido Schimmel <idosch@mellanox.com>
  * Copyright (c) 2016 Yotam Gigi <yotamg@mellanox.com>
- * Copyright (c) 2017 Petr Machata <petrm@mellanox.com>
+ * Copyright (c) 2017-2018 Petr Machata <petrm@mellanox.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -69,7 +69,9 @@
 #include "spectrum_mr.h"
 #include "spectrum_mr_tcam.h"
 #include "spectrum_router.h"
+#include "spectrum_span.h"
 
+struct mlxsw_sp_fib;
 struct mlxsw_sp_vr;
 struct mlxsw_sp_lpm_tree;
 struct mlxsw_sp_rif_ops;
@@ -83,6 +85,8 @@ struct mlxsw_sp_router {
 	struct rhashtable nexthop_ht;
 	struct list_head nexthop_list;
 	struct {
+		/* One tree for each protocol: IPv4 and IPv6 */
+		struct mlxsw_sp_lpm_tree *proto_trees[2];
 		struct mlxsw_sp_lpm_tree *trees;
 		unsigned int tree_count;
 	} lpm;
@@ -160,6 +164,15 @@ struct mlxsw_sp_rif_ops {
 	void (*deconfigure)(struct mlxsw_sp_rif *rif);
 	struct mlxsw_sp_fid * (*fid_get)(struct mlxsw_sp_rif *rif);
 };
+
+static void mlxsw_sp_lpm_tree_hold(struct mlxsw_sp_lpm_tree *lpm_tree);
+static void mlxsw_sp_lpm_tree_put(struct mlxsw_sp *mlxsw_sp,
+				  struct mlxsw_sp_lpm_tree *lpm_tree);
+static int mlxsw_sp_vr_lpm_tree_bind(struct mlxsw_sp *mlxsw_sp,
+				     const struct mlxsw_sp_fib *fib,
+				     u8 tree_id);
+static int mlxsw_sp_vr_lpm_tree_unbind(struct mlxsw_sp *mlxsw_sp,
+				       const struct mlxsw_sp_fib *fib);
 
 static unsigned int *
 mlxsw_sp_rif_p_counter_get(struct mlxsw_sp_rif *rif,
@@ -389,7 +402,6 @@ enum mlxsw_sp_fib_entry_type {
 };
 
 struct mlxsw_sp_nexthop_group;
-struct mlxsw_sp_fib;
 
 struct mlxsw_sp_fib_node {
 	struct list_head entry_list;
@@ -436,6 +448,7 @@ struct mlxsw_sp_lpm_tree {
 	u8 id; /* tree ID */
 	unsigned int ref_count;
 	enum mlxsw_sp_l3proto proto;
+	unsigned long prefix_ref_count[MLXSW_SP_PREFIX_COUNT];
 	struct mlxsw_sp_prefix_usage prefix_usage;
 };
 
@@ -444,8 +457,6 @@ struct mlxsw_sp_fib {
 	struct list_head node_list;
 	struct mlxsw_sp_vr *vr;
 	struct mlxsw_sp_lpm_tree *lpm_tree;
-	unsigned long prefix_ref_count[MLXSW_SP_PREFIX_COUNT];
-	struct mlxsw_sp_prefix_usage prefix_usage;
 	enum mlxsw_sp_l3proto proto;
 };
 
@@ -460,12 +471,15 @@ struct mlxsw_sp_vr {
 
 static const struct rhashtable_params mlxsw_sp_fib_ht_params;
 
-static struct mlxsw_sp_fib *mlxsw_sp_fib_create(struct mlxsw_sp_vr *vr,
+static struct mlxsw_sp_fib *mlxsw_sp_fib_create(struct mlxsw_sp *mlxsw_sp,
+						struct mlxsw_sp_vr *vr,
 						enum mlxsw_sp_l3proto proto)
 {
+	struct mlxsw_sp_lpm_tree *lpm_tree;
 	struct mlxsw_sp_fib *fib;
 	int err;
 
+	lpm_tree = mlxsw_sp->router->lpm.proto_trees[proto];
 	fib = kzalloc(sizeof(*fib), GFP_KERNEL);
 	if (!fib)
 		return ERR_PTR(-ENOMEM);
@@ -475,17 +489,26 @@ static struct mlxsw_sp_fib *mlxsw_sp_fib_create(struct mlxsw_sp_vr *vr,
 	INIT_LIST_HEAD(&fib->node_list);
 	fib->proto = proto;
 	fib->vr = vr;
+	fib->lpm_tree = lpm_tree;
+	mlxsw_sp_lpm_tree_hold(lpm_tree);
+	err = mlxsw_sp_vr_lpm_tree_bind(mlxsw_sp, fib, lpm_tree->id);
+	if (err)
+		goto err_lpm_tree_bind;
 	return fib;
 
+err_lpm_tree_bind:
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
 err_rhashtable_init:
 	kfree(fib);
 	return ERR_PTR(err);
 }
 
-static void mlxsw_sp_fib_destroy(struct mlxsw_sp_fib *fib)
+static void mlxsw_sp_fib_destroy(struct mlxsw_sp *mlxsw_sp,
+				 struct mlxsw_sp_fib *fib)
 {
+	mlxsw_sp_vr_lpm_tree_unbind(mlxsw_sp, fib);
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, fib->lpm_tree);
 	WARN_ON(!list_empty(&fib->node_list));
-	WARN_ON(fib->lpm_tree);
 	rhashtable_destroy(&fib->ht);
 	kfree(fib);
 }
@@ -572,6 +595,9 @@ mlxsw_sp_lpm_tree_create(struct mlxsw_sp *mlxsw_sp,
 		goto err_left_struct_set;
 	memcpy(&lpm_tree->prefix_usage, prefix_usage,
 	       sizeof(lpm_tree->prefix_usage));
+	memset(&lpm_tree->prefix_ref_count, 0,
+	       sizeof(lpm_tree->prefix_ref_count));
+	lpm_tree->ref_count = 1;
 	return lpm_tree;
 
 err_left_struct_set:
@@ -598,8 +624,10 @@ mlxsw_sp_lpm_tree_get(struct mlxsw_sp *mlxsw_sp,
 		if (lpm_tree->ref_count != 0 &&
 		    lpm_tree->proto == proto &&
 		    mlxsw_sp_prefix_usage_eq(&lpm_tree->prefix_usage,
-					     prefix_usage))
+					     prefix_usage)) {
+			mlxsw_sp_lpm_tree_hold(lpm_tree);
 			return lpm_tree;
+		}
 	}
 	return mlxsw_sp_lpm_tree_create(mlxsw_sp, prefix_usage, proto);
 }
@@ -620,9 +648,10 @@ static void mlxsw_sp_lpm_tree_put(struct mlxsw_sp *mlxsw_sp,
 
 static int mlxsw_sp_lpm_init(struct mlxsw_sp *mlxsw_sp)
 {
+	struct mlxsw_sp_prefix_usage req_prefix_usage = {{ 0 } };
 	struct mlxsw_sp_lpm_tree *lpm_tree;
 	u64 max_trees;
-	int i;
+	int err, i;
 
 	if (!MLXSW_CORE_RES_VALID(mlxsw_sp->core, MAX_LPM_TREES))
 		return -EIO;
@@ -640,11 +669,42 @@ static int mlxsw_sp_lpm_init(struct mlxsw_sp *mlxsw_sp)
 		lpm_tree->id = i + MLXSW_SP_LPM_TREE_MIN;
 	}
 
+	lpm_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, &req_prefix_usage,
+					 MLXSW_SP_L3_PROTO_IPV4);
+	if (IS_ERR(lpm_tree)) {
+		err = PTR_ERR(lpm_tree);
+		goto err_ipv4_tree_get;
+	}
+	mlxsw_sp->router->lpm.proto_trees[MLXSW_SP_L3_PROTO_IPV4] = lpm_tree;
+
+	lpm_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, &req_prefix_usage,
+					 MLXSW_SP_L3_PROTO_IPV6);
+	if (IS_ERR(lpm_tree)) {
+		err = PTR_ERR(lpm_tree);
+		goto err_ipv6_tree_get;
+	}
+	mlxsw_sp->router->lpm.proto_trees[MLXSW_SP_L3_PROTO_IPV6] = lpm_tree;
+
 	return 0;
+
+err_ipv6_tree_get:
+	lpm_tree = mlxsw_sp->router->lpm.proto_trees[MLXSW_SP_L3_PROTO_IPV4];
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
+err_ipv4_tree_get:
+	kfree(mlxsw_sp->router->lpm.trees);
+	return err;
 }
 
 static void mlxsw_sp_lpm_fini(struct mlxsw_sp *mlxsw_sp)
 {
+	struct mlxsw_sp_lpm_tree *lpm_tree;
+
+	lpm_tree = mlxsw_sp->router->lpm.proto_trees[MLXSW_SP_L3_PROTO_IPV6];
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
+
+	lpm_tree = mlxsw_sp->router->lpm.proto_trees[MLXSW_SP_L3_PROTO_IPV4];
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
+
 	kfree(mlxsw_sp->router->lpm.trees);
 }
 
@@ -727,45 +787,50 @@ static struct mlxsw_sp_fib *mlxsw_sp_vr_fib(const struct mlxsw_sp_vr *vr,
 static struct mlxsw_sp_vr *mlxsw_sp_vr_create(struct mlxsw_sp *mlxsw_sp,
 					      u32 tb_id)
 {
+	struct mlxsw_sp_mr_table *mr4_table;
+	struct mlxsw_sp_fib *fib4;
+	struct mlxsw_sp_fib *fib6;
 	struct mlxsw_sp_vr *vr;
 	int err;
 
 	vr = mlxsw_sp_vr_find_unused(mlxsw_sp);
 	if (!vr)
 		return ERR_PTR(-EBUSY);
-	vr->fib4 = mlxsw_sp_fib_create(vr, MLXSW_SP_L3_PROTO_IPV4);
-	if (IS_ERR(vr->fib4))
-		return ERR_CAST(vr->fib4);
-	vr->fib6 = mlxsw_sp_fib_create(vr, MLXSW_SP_L3_PROTO_IPV6);
-	if (IS_ERR(vr->fib6)) {
-		err = PTR_ERR(vr->fib6);
+	fib4 = mlxsw_sp_fib_create(mlxsw_sp, vr, MLXSW_SP_L3_PROTO_IPV4);
+	if (IS_ERR(fib4))
+		return ERR_CAST(fib4);
+	fib6 = mlxsw_sp_fib_create(mlxsw_sp, vr, MLXSW_SP_L3_PROTO_IPV6);
+	if (IS_ERR(fib6)) {
+		err = PTR_ERR(fib6);
 		goto err_fib6_create;
 	}
-	vr->mr4_table = mlxsw_sp_mr_table_create(mlxsw_sp, vr->id,
-						 MLXSW_SP_L3_PROTO_IPV4);
-	if (IS_ERR(vr->mr4_table)) {
-		err = PTR_ERR(vr->mr4_table);
+	mr4_table = mlxsw_sp_mr_table_create(mlxsw_sp, vr->id,
+					     MLXSW_SP_L3_PROTO_IPV4);
+	if (IS_ERR(mr4_table)) {
+		err = PTR_ERR(mr4_table);
 		goto err_mr_table_create;
 	}
+	vr->fib4 = fib4;
+	vr->fib6 = fib6;
+	vr->mr4_table = mr4_table;
 	vr->tb_id = tb_id;
 	return vr;
 
 err_mr_table_create:
-	mlxsw_sp_fib_destroy(vr->fib6);
-	vr->fib6 = NULL;
+	mlxsw_sp_fib_destroy(mlxsw_sp, fib6);
 err_fib6_create:
-	mlxsw_sp_fib_destroy(vr->fib4);
-	vr->fib4 = NULL;
+	mlxsw_sp_fib_destroy(mlxsw_sp, fib4);
 	return ERR_PTR(err);
 }
 
-static void mlxsw_sp_vr_destroy(struct mlxsw_sp_vr *vr)
+static void mlxsw_sp_vr_destroy(struct mlxsw_sp *mlxsw_sp,
+				struct mlxsw_sp_vr *vr)
 {
 	mlxsw_sp_mr_table_destroy(vr->mr4_table);
 	vr->mr4_table = NULL;
-	mlxsw_sp_fib_destroy(vr->fib6);
+	mlxsw_sp_fib_destroy(mlxsw_sp, vr->fib6);
 	vr->fib6 = NULL;
-	mlxsw_sp_fib_destroy(vr->fib4);
+	mlxsw_sp_fib_destroy(mlxsw_sp, vr->fib4);
 	vr->fib4 = NULL;
 }
 
@@ -780,12 +845,12 @@ static struct mlxsw_sp_vr *mlxsw_sp_vr_get(struct mlxsw_sp *mlxsw_sp, u32 tb_id)
 	return vr;
 }
 
-static void mlxsw_sp_vr_put(struct mlxsw_sp_vr *vr)
+static void mlxsw_sp_vr_put(struct mlxsw_sp *mlxsw_sp, struct mlxsw_sp_vr *vr)
 {
 	if (!vr->rif_count && list_empty(&vr->fib4->node_list) &&
 	    list_empty(&vr->fib6->node_list) &&
 	    mlxsw_sp_mr_table_empty(vr->mr4_table))
-		mlxsw_sp_vr_destroy(vr);
+		mlxsw_sp_vr_destroy(mlxsw_sp, vr);
 }
 
 static bool
@@ -796,7 +861,7 @@ mlxsw_sp_vr_lpm_tree_should_replace(struct mlxsw_sp_vr *vr,
 
 	if (!mlxsw_sp_vr_is_used(vr))
 		return false;
-	if (fib->lpm_tree && fib->lpm_tree->id == tree_id)
+	if (fib->lpm_tree->id == tree_id)
 		return true;
 	return false;
 }
@@ -826,14 +891,13 @@ static int mlxsw_sp_vrs_lpm_tree_replace(struct mlxsw_sp *mlxsw_sp,
 					 struct mlxsw_sp_fib *fib,
 					 struct mlxsw_sp_lpm_tree *new_tree)
 {
-	struct mlxsw_sp_lpm_tree *old_tree = fib->lpm_tree;
 	enum mlxsw_sp_l3proto proto = fib->proto;
+	struct mlxsw_sp_lpm_tree *old_tree;
 	u8 old_id, new_id = new_tree->id;
 	struct mlxsw_sp_vr *vr;
 	int i, err;
 
-	if (!old_tree)
-		goto no_replace;
+	old_tree = mlxsw_sp->router->lpm.proto_trees[proto];
 	old_id = old_tree->id;
 
 	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_VRS); i++) {
@@ -847,6 +911,11 @@ static int mlxsw_sp_vrs_lpm_tree_replace(struct mlxsw_sp *mlxsw_sp,
 			goto err_tree_replace;
 	}
 
+	memcpy(new_tree->prefix_ref_count, old_tree->prefix_ref_count,
+	       sizeof(new_tree->prefix_ref_count));
+	mlxsw_sp->router->lpm.proto_trees[proto] = new_tree;
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, old_tree);
+
 	return 0;
 
 err_tree_replace:
@@ -858,36 +927,6 @@ err_tree_replace:
 					     old_tree);
 	}
 	return err;
-
-no_replace:
-	fib->lpm_tree = new_tree;
-	mlxsw_sp_lpm_tree_hold(new_tree);
-	err = mlxsw_sp_vr_lpm_tree_bind(mlxsw_sp, fib, new_tree->id);
-	if (err) {
-		mlxsw_sp_lpm_tree_put(mlxsw_sp, new_tree);
-		fib->lpm_tree = NULL;
-		return err;
-	}
-	return 0;
-}
-
-static void
-mlxsw_sp_vrs_prefixes(struct mlxsw_sp *mlxsw_sp,
-		      enum mlxsw_sp_l3proto proto,
-		      struct mlxsw_sp_prefix_usage *req_prefix_usage)
-{
-	int i;
-
-	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_VRS); i++) {
-		struct mlxsw_sp_vr *vr = &mlxsw_sp->router->vrs[i];
-		struct mlxsw_sp_fib *fib = mlxsw_sp_vr_fib(vr, proto);
-		unsigned char prefix;
-
-		if (!mlxsw_sp_vr_is_used(vr))
-			continue;
-		mlxsw_sp_prefix_usage_for_each(prefix, &fib->prefix_usage)
-			mlxsw_sp_prefix_usage_set(req_prefix_usage, prefix);
-	}
 }
 
 static int mlxsw_sp_vrs_init(struct mlxsw_sp *mlxsw_sp)
@@ -938,7 +977,7 @@ __mlxsw_sp_ipip_netdev_ul_dev_get(const struct net_device *ol_dev)
 	return __dev_get_by_index(net, tun->parms.link);
 }
 
-static u32 mlxsw_sp_ipip_dev_ul_tb_id(const struct net_device *ol_dev)
+u32 mlxsw_sp_ipip_dev_ul_tb_id(const struct net_device *ol_dev)
 {
 	struct net_device *d = __mlxsw_sp_ipip_netdev_ul_dev_get(ol_dev);
 
@@ -979,9 +1018,11 @@ mlxsw_sp_ipip_entry_alloc(struct mlxsw_sp *mlxsw_sp,
 			  enum mlxsw_sp_ipip_type ipipt,
 			  struct net_device *ol_dev)
 {
+	const struct mlxsw_sp_ipip_ops *ipip_ops;
 	struct mlxsw_sp_ipip_entry *ipip_entry;
 	struct mlxsw_sp_ipip_entry *ret = NULL;
 
+	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipipt];
 	ipip_entry = kzalloc(sizeof(*ipip_entry), GFP_KERNEL);
 	if (!ipip_entry)
 		return ERR_PTR(-ENOMEM);
@@ -996,6 +1037,15 @@ mlxsw_sp_ipip_entry_alloc(struct mlxsw_sp *mlxsw_sp,
 	ipip_entry->ipipt = ipipt;
 	ipip_entry->ol_dev = ol_dev;
 
+	switch (ipip_ops->ul_proto) {
+	case MLXSW_SP_L3_PROTO_IPV4:
+		ipip_entry->parms4 = mlxsw_sp_ipip_netdev_parms4(ol_dev);
+		break;
+	case MLXSW_SP_L3_PROTO_IPV6:
+		WARN_ON(1);
+		break;
+	}
+
 	return ipip_entry;
 
 err_ol_ipip_lb_create:
@@ -1008,12 +1058,6 @@ mlxsw_sp_ipip_entry_dealloc(struct mlxsw_sp_ipip_entry *ipip_entry)
 {
 	mlxsw_sp_rif_destroy(&ipip_entry->ol_lb->common);
 	kfree(ipip_entry);
-}
-
-static bool mlxsw_sp_l3addr_eq(const union mlxsw_sp_l3addr *addr1,
-			       const union mlxsw_sp_l3addr *addr2)
-{
-	return !memcmp(addr1, addr2, sizeof(*addr1));
 }
 
 static bool
@@ -1152,24 +1196,7 @@ mlxsw_sp_ipip_entry_create(struct mlxsw_sp *mlxsw_sp,
 			   enum mlxsw_sp_ipip_type ipipt,
 			   struct net_device *ol_dev)
 {
-	u32 ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ol_dev);
-	struct mlxsw_sp_router *router = mlxsw_sp->router;
 	struct mlxsw_sp_ipip_entry *ipip_entry;
-	enum mlxsw_sp_l3proto ul_proto;
-	union mlxsw_sp_l3addr saddr;
-
-	/* The configuration where several tunnels have the same local address
-	 * in the same underlay table needs special treatment in the HW. That is
-	 * currently not implemented in the driver.
-	 */
-	ul_proto = router->ipip_ops_arr[ipipt]->ul_proto;
-	saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ol_dev);
-	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
-			    ipip_list_node) {
-		if (mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
-						      ul_tb_id, ipip_entry))
-			return ERR_PTR(-EEXIST);
-	}
 
 	ipip_entry = mlxsw_sp_ipip_entry_alloc(mlxsw_sp, ipipt, ol_dev);
 	if (IS_ERR(ipip_entry))
@@ -1267,6 +1294,33 @@ mlxsw_sp_ipip_entry_find_by_ol_dev(struct mlxsw_sp *mlxsw_sp,
 	return NULL;
 }
 
+static struct mlxsw_sp_ipip_entry *
+mlxsw_sp_ipip_entry_find_by_ul_dev(const struct mlxsw_sp *mlxsw_sp,
+				   const struct net_device *ul_dev,
+				   struct mlxsw_sp_ipip_entry *start)
+{
+	struct mlxsw_sp_ipip_entry *ipip_entry;
+
+	ipip_entry = list_prepare_entry(start, &mlxsw_sp->router->ipip_list,
+					ipip_list_node);
+	list_for_each_entry_continue(ipip_entry, &mlxsw_sp->router->ipip_list,
+				     ipip_list_node) {
+		struct net_device *ipip_ul_dev =
+			__mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
+
+		if (ipip_ul_dev == ul_dev)
+			return ipip_entry;
+	}
+
+	return NULL;
+}
+
+bool mlxsw_sp_netdev_is_ipip_ul(const struct mlxsw_sp *mlxsw_sp,
+				const struct net_device *dev)
+{
+	return mlxsw_sp_ipip_entry_find_by_ul_dev(mlxsw_sp, dev, NULL);
+}
+
 static bool mlxsw_sp_netdevice_ipip_can_offload(struct mlxsw_sp *mlxsw_sp,
 						const struct net_device *ol_dev,
 						enum mlxsw_sp_ipip_type ipipt)
@@ -1285,14 +1339,24 @@ static int mlxsw_sp_netdevice_ipip_ol_reg_event(struct mlxsw_sp *mlxsw_sp,
 						struct net_device *ol_dev)
 {
 	struct mlxsw_sp_ipip_entry *ipip_entry;
+	enum mlxsw_sp_l3proto ul_proto;
 	enum mlxsw_sp_ipip_type ipipt;
+	union mlxsw_sp_l3addr saddr;
+	u32 ul_tb_id;
 
 	mlxsw_sp_netdev_ipip_type(mlxsw_sp, ol_dev, &ipipt);
 	if (mlxsw_sp_netdevice_ipip_can_offload(mlxsw_sp, ol_dev, ipipt)) {
-		ipip_entry = mlxsw_sp_ipip_entry_create(mlxsw_sp, ipipt,
-							ol_dev);
-		if (IS_ERR(ipip_entry))
-			return PTR_ERR(ipip_entry);
+		ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ol_dev);
+		ul_proto = mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto;
+		saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ol_dev);
+		if (!mlxsw_sp_ipip_demote_tunnel_by_saddr(mlxsw_sp, ul_proto,
+							  saddr, ul_tb_id,
+							  NULL)) {
+			ipip_entry = mlxsw_sp_ipip_entry_create(mlxsw_sp, ipipt,
+								ol_dev);
+			if (IS_ERR(ipip_entry))
+				return PTR_ERR(ipip_entry);
+		}
 	}
 
 	return 0;
@@ -1347,6 +1411,28 @@ mlxsw_sp_rif_ipip_lb_op(struct mlxsw_sp_rif_ipip_lb *lb_rif,
 	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ritr), ritr_pl);
 }
 
+static int mlxsw_sp_netdevice_ipip_ol_update_mtu(struct mlxsw_sp *mlxsw_sp,
+						 struct net_device *ol_dev)
+{
+	struct mlxsw_sp_ipip_entry *ipip_entry;
+	struct mlxsw_sp_rif_ipip_lb *lb_rif;
+	struct mlxsw_sp_vr *ul_vr;
+	int err = 0;
+
+	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
+	if (ipip_entry) {
+		lb_rif = ipip_entry->ol_lb;
+		ul_vr = &mlxsw_sp->router->vrs[lb_rif->ul_vr_id];
+		err = mlxsw_sp_rif_ipip_lb_op(lb_rif, ul_vr, true);
+		if (err)
+			goto out;
+		lb_rif->common.mtu = ol_dev->mtu;
+	}
+
+out:
+	return err;
+}
+
 static void mlxsw_sp_netdevice_ipip_ol_up_event(struct mlxsw_sp *mlxsw_sp,
 						struct net_device *ol_dev)
 {
@@ -1375,51 +1461,227 @@ static void mlxsw_sp_netdevice_ipip_ol_down_event(struct mlxsw_sp *mlxsw_sp,
 		mlxsw_sp_ipip_entry_ol_down_event(mlxsw_sp, ipip_entry);
 }
 
-static int mlxsw_sp_netdevice_ipip_ol_vrf_event(struct mlxsw_sp *mlxsw_sp,
-						struct net_device *ol_dev)
+static void mlxsw_sp_nexthop_rif_migrate(struct mlxsw_sp *mlxsw_sp,
+					 struct mlxsw_sp_rif *old_rif,
+					 struct mlxsw_sp_rif *new_rif);
+static int
+mlxsw_sp_ipip_entry_ol_lb_update(struct mlxsw_sp *mlxsw_sp,
+				 struct mlxsw_sp_ipip_entry *ipip_entry,
+				 bool keep_encap)
 {
-	struct mlxsw_sp_fib_entry *decap_fib_entry;
-	struct mlxsw_sp_ipip_entry *ipip_entry;
-	struct mlxsw_sp_rif_ipip_lb *lb_rif;
+	struct mlxsw_sp_rif_ipip_lb *old_lb_rif = ipip_entry->ol_lb;
+	struct mlxsw_sp_rif_ipip_lb *new_lb_rif;
 
-	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
-	if (!ipip_entry)
-		return 0;
+	new_lb_rif = mlxsw_sp_ipip_ol_ipip_lb_create(mlxsw_sp,
+						     ipip_entry->ipipt,
+						     ipip_entry->ol_dev);
+	if (IS_ERR(new_lb_rif))
+		return PTR_ERR(new_lb_rif);
+	ipip_entry->ol_lb = new_lb_rif;
 
-	/* When a tunneling device is moved to a different VRF, we need to
-	 * update the backing loopback. Since RIFs can't be edited, we need to
-	 * destroy and recreate it. That might create a window of opportunity
-	 * where RALUE and RATR registers end up referencing a RIF that's
-	 * already gone. RATRs are handled by the RIF destroy, and to take care
+	if (keep_encap)
+		mlxsw_sp_nexthop_rif_migrate(mlxsw_sp, &old_lb_rif->common,
+					     &new_lb_rif->common);
+
+	mlxsw_sp_rif_destroy(&old_lb_rif->common);
+
+	return 0;
+}
+
+static void mlxsw_sp_nexthop_rif_update(struct mlxsw_sp *mlxsw_sp,
+					struct mlxsw_sp_rif *rif);
+
+/**
+ * Update the offload related to an IPIP entry. This always updates decap, and
+ * in addition to that it also:
+ * @recreate_loopback: recreates the associated loopback RIF
+ * @keep_encap: updates next hops that use the tunnel netdevice. This is only
+ *              relevant when recreate_loopback is true.
+ * @update_nexthops: updates next hops, keeping the current loopback RIF. This
+ *                   is only relevant when recreate_loopback is false.
+ */
+int __mlxsw_sp_ipip_entry_update_tunnel(struct mlxsw_sp *mlxsw_sp,
+					struct mlxsw_sp_ipip_entry *ipip_entry,
+					bool recreate_loopback,
+					bool keep_encap,
+					bool update_nexthops)
+{
+	int err;
+
+	/* RIFs can't be edited, so to update loopback, we need to destroy and
+	 * recreate it. That creates a window of opportunity where RALUE and
+	 * RATR registers end up referencing a RIF that's already gone. RATRs
+	 * are handled in mlxsw_sp_ipip_entry_ol_lb_update(), and to take care
 	 * of RALUE, demote the decap route back.
 	 */
 	if (ipip_entry->decap_fib_entry)
 		mlxsw_sp_ipip_entry_demote_decap(mlxsw_sp, ipip_entry);
 
-	lb_rif = mlxsw_sp_ipip_ol_ipip_lb_create(mlxsw_sp, ipip_entry->ipipt,
-						 ol_dev);
-	if (IS_ERR(lb_rif))
-		return PTR_ERR(lb_rif);
-	mlxsw_sp_rif_destroy(&ipip_entry->ol_lb->common);
-	ipip_entry->ol_lb = lb_rif;
-
-	if (ol_dev->flags & IFF_UP) {
-		decap_fib_entry = mlxsw_sp_ipip_entry_find_decap(mlxsw_sp,
-								 ipip_entry);
-		if (decap_fib_entry)
-			mlxsw_sp_ipip_entry_promote_decap(mlxsw_sp, ipip_entry,
-							  decap_fib_entry);
+	if (recreate_loopback) {
+		err = mlxsw_sp_ipip_entry_ol_lb_update(mlxsw_sp, ipip_entry,
+						       keep_encap);
+		if (err)
+			return err;
+	} else if (update_nexthops) {
+		mlxsw_sp_nexthop_rif_update(mlxsw_sp,
+					    &ipip_entry->ol_lb->common);
 	}
+
+	if (ipip_entry->ol_dev->flags & IFF_UP)
+		mlxsw_sp_ipip_entry_ol_up_event(mlxsw_sp, ipip_entry);
 
 	return 0;
 }
 
-int
-mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
-				 struct net_device *ol_dev,
-				 unsigned long event,
-				 struct netdev_notifier_changeupper_info *info)
+static int mlxsw_sp_netdevice_ipip_ol_vrf_event(struct mlxsw_sp *mlxsw_sp,
+						struct net_device *ol_dev)
 {
+	struct mlxsw_sp_ipip_entry *ipip_entry =
+		mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
+	enum mlxsw_sp_l3proto ul_proto;
+	union mlxsw_sp_l3addr saddr;
+	u32 ul_tb_id;
+
+	if (!ipip_entry)
+		return 0;
+
+	/* For flat configuration cases, moving overlay to a different VRF might
+	 * cause local address conflict, and the conflicting tunnels need to be
+	 * demoted.
+	 */
+	ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ol_dev);
+	ul_proto = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt]->ul_proto;
+	saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ol_dev);
+	if (mlxsw_sp_ipip_demote_tunnel_by_saddr(mlxsw_sp, ul_proto,
+						 saddr, ul_tb_id,
+						 ipip_entry)) {
+		mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
+		return 0;
+	}
+
+	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
+						   true, false, false);
+}
+
+static int
+mlxsw_sp_netdevice_ipip_ul_vrf_event(struct mlxsw_sp *mlxsw_sp,
+				     struct mlxsw_sp_ipip_entry *ipip_entry,
+				     struct net_device *ul_dev)
+{
+	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
+						   true, true, false);
+}
+
+static int
+mlxsw_sp_netdevice_ipip_ul_up_event(struct mlxsw_sp *mlxsw_sp,
+				    struct mlxsw_sp_ipip_entry *ipip_entry,
+				    struct net_device *ul_dev)
+{
+	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
+						   false, false, true);
+}
+
+static int
+mlxsw_sp_netdevice_ipip_ul_down_event(struct mlxsw_sp *mlxsw_sp,
+				      struct mlxsw_sp_ipip_entry *ipip_entry,
+				      struct net_device *ul_dev)
+{
+	/* A down underlay device causes encapsulated packets to not be
+	 * forwarded, but decap still works. So refresh next hops without
+	 * touching anything else.
+	 */
+	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
+						   false, false, true);
+}
+
+static int
+mlxsw_sp_netdevice_ipip_ol_change_event(struct mlxsw_sp *mlxsw_sp,
+					struct net_device *ol_dev)
+{
+	const struct mlxsw_sp_ipip_ops *ipip_ops;
+	struct mlxsw_sp_ipip_entry *ipip_entry;
+	int err;
+
+	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
+	if (!ipip_entry)
+		/* A change might make a tunnel eligible for offloading, but
+		 * that is currently not implemented. What falls to slow path
+		 * stays there.
+		 */
+		return 0;
+
+	/* A change might make a tunnel not eligible for offloading. */
+	if (!mlxsw_sp_netdevice_ipip_can_offload(mlxsw_sp, ol_dev,
+						 ipip_entry->ipipt)) {
+		mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
+		return 0;
+	}
+
+	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
+	err = ipip_ops->ol_netdev_change(mlxsw_sp, ipip_entry);
+	return err;
+}
+
+void mlxsw_sp_ipip_entry_demote_tunnel(struct mlxsw_sp *mlxsw_sp,
+				       struct mlxsw_sp_ipip_entry *ipip_entry)
+{
+	struct net_device *ol_dev = ipip_entry->ol_dev;
+
+	if (ol_dev->flags & IFF_UP)
+		mlxsw_sp_ipip_entry_ol_down_event(mlxsw_sp, ipip_entry);
+	mlxsw_sp_ipip_entry_destroy(mlxsw_sp, ipip_entry);
+}
+
+/* The configuration where several tunnels have the same local address in the
+ * same underlay table needs special treatment in the HW. That is currently not
+ * implemented in the driver. This function finds and demotes the first tunnel
+ * with a given source address, except the one passed in in the argument
+ * `except'.
+ */
+bool
+mlxsw_sp_ipip_demote_tunnel_by_saddr(struct mlxsw_sp *mlxsw_sp,
+				     enum mlxsw_sp_l3proto ul_proto,
+				     union mlxsw_sp_l3addr saddr,
+				     u32 ul_tb_id,
+				     const struct mlxsw_sp_ipip_entry *except)
+{
+	struct mlxsw_sp_ipip_entry *ipip_entry, *tmp;
+
+	list_for_each_entry_safe(ipip_entry, tmp, &mlxsw_sp->router->ipip_list,
+				 ipip_list_node) {
+		if (ipip_entry != except &&
+		    mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
+						      ul_tb_id, ipip_entry)) {
+			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void mlxsw_sp_ipip_demote_tunnel_by_ul_netdev(struct mlxsw_sp *mlxsw_sp,
+						     struct net_device *ul_dev)
+{
+	struct mlxsw_sp_ipip_entry *ipip_entry, *tmp;
+
+	list_for_each_entry_safe(ipip_entry, tmp, &mlxsw_sp->router->ipip_list,
+				 ipip_list_node) {
+		struct net_device *ipip_ul_dev =
+			__mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
+
+		if (ipip_ul_dev == ul_dev)
+			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
+	}
+}
+
+int mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
+				     struct net_device *ol_dev,
+				     unsigned long event,
+				     struct netdev_notifier_info *info)
+{
+	struct netdev_notifier_changeupper_info *chup;
+
 	switch (event) {
 	case NETDEV_REGISTER:
 		return mlxsw_sp_netdevice_ipip_ol_reg_event(mlxsw_sp, ol_dev);
@@ -1433,11 +1695,70 @@ mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
 		mlxsw_sp_netdevice_ipip_ol_down_event(mlxsw_sp, ol_dev);
 		return 0;
 	case NETDEV_CHANGEUPPER:
-		if (netif_is_l3_master(info->upper_dev))
+		chup = container_of(info, typeof(*chup), info);
+		if (netif_is_l3_master(chup->upper_dev))
 			return mlxsw_sp_netdevice_ipip_ol_vrf_event(mlxsw_sp,
 								    ol_dev);
 		return 0;
+	case NETDEV_CHANGE:
+		return mlxsw_sp_netdevice_ipip_ol_change_event(mlxsw_sp,
+							       ol_dev);
+	case NETDEV_CHANGEMTU:
+		return mlxsw_sp_netdevice_ipip_ol_update_mtu(mlxsw_sp, ol_dev);
 	}
+	return 0;
+}
+
+static int
+__mlxsw_sp_netdevice_ipip_ul_event(struct mlxsw_sp *mlxsw_sp,
+				   struct mlxsw_sp_ipip_entry *ipip_entry,
+				   struct net_device *ul_dev,
+				   unsigned long event,
+				   struct netdev_notifier_info *info)
+{
+	struct netdev_notifier_changeupper_info *chup;
+
+	switch (event) {
+	case NETDEV_CHANGEUPPER:
+		chup = container_of(info, typeof(*chup), info);
+		if (netif_is_l3_master(chup->upper_dev))
+			return mlxsw_sp_netdevice_ipip_ul_vrf_event(mlxsw_sp,
+								    ipip_entry,
+								    ul_dev);
+		break;
+
+	case NETDEV_UP:
+		return mlxsw_sp_netdevice_ipip_ul_up_event(mlxsw_sp, ipip_entry,
+							   ul_dev);
+	case NETDEV_DOWN:
+		return mlxsw_sp_netdevice_ipip_ul_down_event(mlxsw_sp,
+							     ipip_entry,
+							     ul_dev);
+	}
+	return 0;
+}
+
+int
+mlxsw_sp_netdevice_ipip_ul_event(struct mlxsw_sp *mlxsw_sp,
+				 struct net_device *ul_dev,
+				 unsigned long event,
+				 struct netdev_notifier_info *info)
+{
+	struct mlxsw_sp_ipip_entry *ipip_entry = NULL;
+	int err;
+
+	while ((ipip_entry = mlxsw_sp_ipip_entry_find_by_ul_dev(mlxsw_sp,
+								ul_dev,
+								ipip_entry))) {
+		err = __mlxsw_sp_netdevice_ipip_ul_event(mlxsw_sp, ipip_entry,
+							 ul_dev, event, info);
+		if (err) {
+			mlxsw_sp_ipip_demote_tunnel_by_ul_netdev(mlxsw_sp,
+								 ul_dev);
+			return err;
+		}
+	}
+
 	return 0;
 }
 
@@ -1820,7 +2141,7 @@ __mlxsw_sp_router_neighs_update_rauhtd(struct mlxsw_sp *mlxsw_sp,
 		err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(rauhtd),
 				      rauhtd_pl);
 		if (err) {
-			dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Failed to dump neighbour talbe\n");
+			dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Failed to dump neighbour table\n");
 			break;
 		}
 		num_rec = mlxsw_reg_rauhtd_num_rec_get(rauhtd_pl);
@@ -2041,6 +2362,8 @@ static void mlxsw_sp_router_neigh_event_work(struct work_struct *work)
 	read_unlock_bh(&n->lock);
 
 	rtnl_lock();
+	mlxsw_sp_span_respin(mlxsw_sp);
+
 	entry_connected = nud_state & NUD_VALID && !dead;
 	neigh_entry = mlxsw_sp_neigh_entry_lookup(mlxsw_sp, n);
 	if (!entry_connected && !neigh_entry)
@@ -2138,7 +2461,7 @@ static int mlxsw_sp_router_netevent_event(struct notifier_block *nb,
 		mlxsw_core_schedule_work(&net_work->work);
 		mlxsw_sp_port_dev_put(mlxsw_sp_port);
 		break;
-	case NETEVENT_MULTIPATH_HASH_UPDATE:
+	case NETEVENT_IPV4_MPATH_HASH_UPDATE:
 		net = ptr;
 
 		if (!net_eq(net, &init_net))
@@ -2412,7 +2735,7 @@ mlxsw_sp_nexthop6_group_cmp(const struct mlxsw_sp_nexthop_group *nh_grp,
 		int ifindex, weight;
 
 		ifindex = mlxsw_sp_rt6->rt->dst.dev->ifindex;
-		weight = mlxsw_sp_rt6->rt->rt6i_nh_weight;
+		weight = 1; /* RHEL doesn't have mlxsw_sp_rt6->rt->rt6i_nh_weight */
 		gw = &mlxsw_sp_rt6->rt->rt6i_gateway;
 		if (!mlxsw_sp_nexthop6_group_has_nexthop(nh_grp, gw, ifindex,
 							 weight))
@@ -3103,19 +3426,26 @@ static void mlxsw_sp_nexthop_neigh_fini(struct mlxsw_sp *mlxsw_sp,
 	neigh_release(n);
 }
 
-static int mlxsw_sp_nexthop_ipip_init(struct mlxsw_sp *mlxsw_sp,
-				      struct mlxsw_sp_nexthop *nh,
-				      struct net_device *ol_dev)
+static bool mlxsw_sp_ipip_netdev_ul_up(struct net_device *ol_dev)
 {
+	struct net_device *ul_dev = __mlxsw_sp_ipip_netdev_ul_dev_get(ol_dev);
+
+	return ul_dev ? (ul_dev->flags & IFF_UP) : true;
+}
+
+static void mlxsw_sp_nexthop_ipip_init(struct mlxsw_sp *mlxsw_sp,
+				       struct mlxsw_sp_nexthop *nh,
+				       struct mlxsw_sp_ipip_entry *ipip_entry)
+{
+	bool removing;
+
 	if (!nh->nh_grp->gateway || nh->ipip_entry)
-		return 0;
+		return;
 
-	nh->ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
-	if (!nh->ipip_entry)
-		return -ENOENT;
-
-	__mlxsw_sp_nexthop_neigh_update(nh, false);
-	return 0;
+	nh->ipip_entry = ipip_entry;
+	removing = !mlxsw_sp_ipip_netdev_ul_up(ipip_entry->ol_dev);
+	__mlxsw_sp_nexthop_neigh_update(nh, removing);
+	mlxsw_sp_nexthop_rif_init(nh, &ipip_entry->ol_lb->common);
 }
 
 static void mlxsw_sp_nexthop_ipip_fini(struct mlxsw_sp *mlxsw_sp,
@@ -3160,21 +3490,21 @@ static int mlxsw_sp_nexthop4_type_init(struct mlxsw_sp *mlxsw_sp,
 				       struct mlxsw_sp_nexthop *nh,
 				       struct fib_nh *fib_nh)
 {
-	struct mlxsw_sp_router *router = mlxsw_sp->router;
+	const struct mlxsw_sp_ipip_ops *ipip_ops;
 	struct net_device *dev = fib_nh->nh_dev;
-	enum mlxsw_sp_ipip_type ipipt;
+	struct mlxsw_sp_ipip_entry *ipip_entry;
 	struct mlxsw_sp_rif *rif;
 	int err;
 
-	if (mlxsw_sp_nexthop4_ipip_type(mlxsw_sp, fib_nh, &ipipt) &&
-	    router->ipip_ops_arr[ipipt]->can_offload(mlxsw_sp, dev,
-						     MLXSW_SP_L3_PROTO_IPV4)) {
-		nh->type = MLXSW_SP_NEXTHOP_TYPE_IPIP;
-		err = mlxsw_sp_nexthop_ipip_init(mlxsw_sp, nh, dev);
-		if (err)
-			return err;
-		mlxsw_sp_nexthop_rif_init(nh, &nh->ipip_entry->ol_lb->common);
-		return 0;
+	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, dev);
+	if (ipip_entry) {
+		ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
+		if (ipip_ops->can_offload(mlxsw_sp, dev,
+					  MLXSW_SP_L3_PROTO_IPV4)) {
+			nh->type = MLXSW_SP_NEXTHOP_TYPE_IPIP;
+			mlxsw_sp_nexthop_ipip_init(mlxsw_sp, nh, ipip_entry);
+			return 0;
+		}
 	}
 
 	nh->type = MLXSW_SP_NEXTHOP_TYPE_ETH;
@@ -3278,6 +3608,42 @@ static void mlxsw_sp_nexthop4_event(struct mlxsw_sp *mlxsw_sp,
 	}
 
 	mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh->nh_grp);
+}
+
+static void mlxsw_sp_nexthop_rif_update(struct mlxsw_sp *mlxsw_sp,
+					struct mlxsw_sp_rif *rif)
+{
+	struct mlxsw_sp_nexthop *nh;
+	bool removing;
+
+	list_for_each_entry(nh, &rif->nexthop_list, rif_list_node) {
+		switch (nh->type) {
+		case MLXSW_SP_NEXTHOP_TYPE_ETH:
+			removing = false;
+			break;
+		case MLXSW_SP_NEXTHOP_TYPE_IPIP:
+			removing = !mlxsw_sp_ipip_netdev_ul_up(rif->dev);
+			break;
+		default:
+			WARN_ON(1);
+			continue;
+		}
+
+		__mlxsw_sp_nexthop_neigh_update(nh, removing);
+		mlxsw_sp_nexthop_group_refresh(mlxsw_sp, nh->nh_grp);
+	}
+}
+
+static void mlxsw_sp_nexthop_rif_migrate(struct mlxsw_sp *mlxsw_sp,
+					 struct mlxsw_sp_rif *old_rif,
+					 struct mlxsw_sp_rif *new_rif)
+{
+	struct mlxsw_sp_nexthop *nh;
+
+	list_splice_init(&old_rif->nexthop_list, &new_rif->nexthop_list);
+	list_for_each_entry(nh, &new_rif->nexthop_list, rif_list_node)
+		nh->rif = new_rif;
+	mlxsw_sp_nexthop_rif_update(mlxsw_sp, new_rif);
 }
 
 static void mlxsw_sp_nexthop_rif_gone_sync(struct mlxsw_sp *mlxsw_sp,
@@ -3910,71 +4276,64 @@ mlxsw_sp_fib_node_entry_is_first(const struct mlxsw_sp_fib_node *fib_node,
 static int mlxsw_sp_fib_lpm_tree_link(struct mlxsw_sp *mlxsw_sp,
 				      struct mlxsw_sp_fib_node *fib_node)
 {
-	struct mlxsw_sp_prefix_usage req_prefix_usage = {{ 0 } };
+	struct mlxsw_sp_prefix_usage req_prefix_usage;
 	struct mlxsw_sp_fib *fib = fib_node->fib;
 	struct mlxsw_sp_lpm_tree *lpm_tree;
 	int err;
 
-	/* Since the tree is shared between all virtual routers we must
-	 * make sure it contains all the required prefix lengths. This
-	 * can be computed by either adding the new prefix length to the
-	 * existing prefix usage of a bound tree, or by aggregating the
-	 * prefix lengths across all virtual routers and adding the new
-	 * one as well.
-	 */
-	if (fib->lpm_tree)
-		mlxsw_sp_prefix_usage_cpy(&req_prefix_usage,
-					  &fib->lpm_tree->prefix_usage);
-	else
-		mlxsw_sp_vrs_prefixes(mlxsw_sp, fib->proto, &req_prefix_usage);
-	mlxsw_sp_prefix_usage_set(&req_prefix_usage, fib_node->key.prefix_len);
+	lpm_tree = mlxsw_sp->router->lpm.proto_trees[fib->proto];
+	if (lpm_tree->prefix_ref_count[fib_node->key.prefix_len] != 0)
+		goto out;
 
+	mlxsw_sp_prefix_usage_cpy(&req_prefix_usage, &lpm_tree->prefix_usage);
+	mlxsw_sp_prefix_usage_set(&req_prefix_usage, fib_node->key.prefix_len);
 	lpm_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, &req_prefix_usage,
 					 fib->proto);
 	if (IS_ERR(lpm_tree))
 		return PTR_ERR(lpm_tree);
 
-	if (fib->lpm_tree && fib->lpm_tree->id == lpm_tree->id)
-		return 0;
-
 	err = mlxsw_sp_vrs_lpm_tree_replace(mlxsw_sp, fib, lpm_tree);
 	if (err)
-		return err;
+		goto err_lpm_tree_replace;
 
+out:
+	lpm_tree->prefix_ref_count[fib_node->key.prefix_len]++;
 	return 0;
+
+err_lpm_tree_replace:
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
+	return err;
 }
 
 static void mlxsw_sp_fib_lpm_tree_unlink(struct mlxsw_sp *mlxsw_sp,
 					 struct mlxsw_sp_fib_node *fib_node)
 {
+	struct mlxsw_sp_lpm_tree *lpm_tree = fib_node->fib->lpm_tree;
+	struct mlxsw_sp_prefix_usage req_prefix_usage;
 	struct mlxsw_sp_fib *fib = fib_node->fib;
+	int err;
 
-	if (!list_is_singular(&fib->node_list))
+	if (--lpm_tree->prefix_ref_count[fib_node->key.prefix_len] != 0)
 		return;
-	/* Last node is being unlinked from the FIB. Unbind the
-	 * tree and drop the reference.
+	/* Try to construct a new LPM tree from the current prefix usage
+	 * minus the unused one. If we fail, continue using the old one.
 	 */
-	mlxsw_sp_vr_lpm_tree_unbind(mlxsw_sp, fib);
-	mlxsw_sp_lpm_tree_put(mlxsw_sp, fib->lpm_tree);
-	fib->lpm_tree = NULL;
-}
+	mlxsw_sp_prefix_usage_cpy(&req_prefix_usage, &lpm_tree->prefix_usage);
+	mlxsw_sp_prefix_usage_clear(&req_prefix_usage,
+				    fib_node->key.prefix_len);
+	lpm_tree = mlxsw_sp_lpm_tree_get(mlxsw_sp, &req_prefix_usage,
+					 fib->proto);
+	if (IS_ERR(lpm_tree))
+		return;
 
-static void mlxsw_sp_fib_node_prefix_inc(struct mlxsw_sp_fib_node *fib_node)
-{
-	unsigned char prefix_len = fib_node->key.prefix_len;
-	struct mlxsw_sp_fib *fib = fib_node->fib;
+	err = mlxsw_sp_vrs_lpm_tree_replace(mlxsw_sp, fib, lpm_tree);
+	if (err)
+		goto err_lpm_tree_replace;
 
-	if (fib->prefix_ref_count[prefix_len]++ == 0)
-		mlxsw_sp_prefix_usage_set(&fib->prefix_usage, prefix_len);
-}
+	return;
 
-static void mlxsw_sp_fib_node_prefix_dec(struct mlxsw_sp_fib_node *fib_node)
-{
-	unsigned char prefix_len = fib_node->key.prefix_len;
-	struct mlxsw_sp_fib *fib = fib_node->fib;
-
-	if (--fib->prefix_ref_count[prefix_len] == 0)
-		mlxsw_sp_prefix_usage_clear(&fib->prefix_usage, prefix_len);
+err_lpm_tree_replace:
+	mlxsw_sp_lpm_tree_put(mlxsw_sp, lpm_tree);
 }
 
 static int mlxsw_sp_fib_node_init(struct mlxsw_sp *mlxsw_sp,
@@ -3992,8 +4351,6 @@ static int mlxsw_sp_fib_node_init(struct mlxsw_sp *mlxsw_sp,
 	if (err)
 		goto err_fib_lpm_tree_link;
 
-	mlxsw_sp_fib_node_prefix_inc(fib_node);
-
 	return 0;
 
 err_fib_lpm_tree_link:
@@ -4007,7 +4364,6 @@ static void mlxsw_sp_fib_node_fini(struct mlxsw_sp *mlxsw_sp,
 {
 	struct mlxsw_sp_fib *fib = fib_node->fib;
 
-	mlxsw_sp_fib_node_prefix_dec(fib_node);
 	mlxsw_sp_fib_lpm_tree_unlink(mlxsw_sp, fib_node);
 	fib_node->fib = NULL;
 	mlxsw_sp_fib_node_remove(fib, fib_node);
@@ -4047,7 +4403,7 @@ mlxsw_sp_fib_node_get(struct mlxsw_sp *mlxsw_sp, u32 tb_id, const void *addr,
 err_fib_node_init:
 	mlxsw_sp_fib_node_destroy(fib_node);
 err_fib_node_create:
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 	return ERR_PTR(err);
 }
 
@@ -4060,7 +4416,7 @@ static void mlxsw_sp_fib_node_put(struct mlxsw_sp *mlxsw_sp,
 		return;
 	mlxsw_sp_fib_node_fini(mlxsw_sp, fib_node);
 	mlxsw_sp_fib_node_destroy(fib_node);
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 }
 
 static struct mlxsw_sp_fib4_entry *
@@ -4437,21 +4793,21 @@ static int mlxsw_sp_nexthop6_type_init(struct mlxsw_sp *mlxsw_sp,
 				       struct mlxsw_sp_nexthop *nh,
 				       const struct rt6_info *rt)
 {
-	struct mlxsw_sp_router *router = mlxsw_sp->router;
+	const struct mlxsw_sp_ipip_ops *ipip_ops;
+	struct mlxsw_sp_ipip_entry *ipip_entry;
 	struct net_device *dev = rt->dst.dev;
-	enum mlxsw_sp_ipip_type ipipt;
 	struct mlxsw_sp_rif *rif;
 	int err;
 
-	if (mlxsw_sp_nexthop6_ipip_type(mlxsw_sp, rt, &ipipt) &&
-	    router->ipip_ops_arr[ipipt]->can_offload(mlxsw_sp, dev,
-						     MLXSW_SP_L3_PROTO_IPV6)) {
-		nh->type = MLXSW_SP_NEXTHOP_TYPE_IPIP;
-		err = mlxsw_sp_nexthop_ipip_init(mlxsw_sp, nh, dev);
-		if (err)
-			return err;
-		mlxsw_sp_nexthop_rif_init(nh, &nh->ipip_entry->ol_lb->common);
-		return 0;
+	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, dev);
+	if (ipip_entry) {
+		ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
+		if (ipip_ops->can_offload(mlxsw_sp, dev,
+					  MLXSW_SP_L3_PROTO_IPV6)) {
+			nh->type = MLXSW_SP_NEXTHOP_TYPE_IPIP;
+			mlxsw_sp_nexthop_ipip_init(mlxsw_sp, nh, ipip_entry);
+			return 0;
+		}
 	}
 
 	nh->type = MLXSW_SP_NEXTHOP_TYPE_ETH;
@@ -4485,7 +4841,7 @@ static int mlxsw_sp_nexthop6_init(struct mlxsw_sp *mlxsw_sp,
 	struct net_device *dev = rt->dst.dev;
 
 	nh->nh_grp = nh_grp;
-	nh->nh_weight = rt->rt6i_nh_weight;
+	nh->nh_weight = 1; /* RHEL doesn't have rt->rt6i_nh_weight */
 	memcpy(&nh->gw_addr, &rt->rt6i_gateway, sizeof(nh->gw_addr));
 	mlxsw_sp_nexthop_counter_alloc(mlxsw_sp, nh);
 
@@ -5083,7 +5439,7 @@ static void mlxsw_sp_router_fibmr_del(struct mlxsw_sp *mlxsw_sp,
 		return;
 
 	mlxsw_sp_mr_route4_del(vr->mr4_table, men_info->mfc);
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 }
 
 static int
@@ -5120,7 +5476,7 @@ mlxsw_sp_router_fibmr_vif_del(struct mlxsw_sp *mlxsw_sp,
 		return;
 
 	mlxsw_sp_mr_vif_del(vr->mr4_table, ven_info->vif_index);
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 }
 
 static int mlxsw_sp_router_set_abort_trap(struct mlxsw_sp *mlxsw_sp)
@@ -5264,12 +5620,13 @@ static void mlxsw_sp_router_fib4_event_work(struct work_struct *work)
 	struct mlxsw_sp_fib_event_work *fib_work =
 		container_of(work, struct mlxsw_sp_fib_event_work, work);
 	struct mlxsw_sp *mlxsw_sp = fib_work->mlxsw_sp;
-	struct fib_rule *rule;
 	bool replace, append;
 	int err;
 
 	/* Protect internal structures from changes */
 	rtnl_lock();
+	mlxsw_sp_span_respin(mlxsw_sp);
+
 	switch (fib_work->event) {
 	case FIB_EVENT_ENTRY_REPLACE: /* fall through */
 	case FIB_EVENT_ENTRY_APPEND: /* fall through */
@@ -5286,12 +5643,11 @@ static void mlxsw_sp_router_fib4_event_work(struct work_struct *work)
 		mlxsw_sp_router_fib4_del(mlxsw_sp, &fib_work->fen_info);
 		fib_info_put(fib_work->fen_info.fi);
 		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		rule = fib_work->fr_info.rule;
-		if (!fib4_rule_default(rule) /* && !rule->l3mdev */) /* VRF not in RHEL */
-			mlxsw_sp_router_fib_abort(mlxsw_sp);
-		fib_rule_put(rule);
+	case FIB_EVENT_RULE_ADD:
+		/* if we get here, a rule was added that we do not support.
+		 * just do the fib_abort
+		 */
+		mlxsw_sp_router_fib_abort(mlxsw_sp);
 		break;
 	case FIB_EVENT_NH_ADD: /* fall through */
 	case FIB_EVENT_NH_DEL:
@@ -5309,11 +5665,12 @@ static void mlxsw_sp_router_fib6_event_work(struct work_struct *work)
 	struct mlxsw_sp_fib_event_work *fib_work =
 		container_of(work, struct mlxsw_sp_fib_event_work, work);
 	struct mlxsw_sp *mlxsw_sp = fib_work->mlxsw_sp;
-	struct fib_rule *rule;
 	bool replace;
 	int err;
 
 	rtnl_lock();
+	mlxsw_sp_span_respin(mlxsw_sp);
+
 	switch (fib_work->event) {
 	case FIB_EVENT_ENTRY_REPLACE: /* fall through */
 	case FIB_EVENT_ENTRY_ADD:
@@ -5328,12 +5685,11 @@ static void mlxsw_sp_router_fib6_event_work(struct work_struct *work)
 		mlxsw_sp_router_fib6_del(mlxsw_sp, fib_work->fen6_info.rt);
 		mlxsw_sp_rt6_release(fib_work->fen6_info.rt);
 		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		rule = fib_work->fr_info.rule;
-		if (!fib6_rule_default(rule) /* && !rule->l3mdev */)
-			mlxsw_sp_router_fib_abort(mlxsw_sp);
-		fib_rule_put(rule);
+	case FIB_EVENT_RULE_ADD:
+		/* if we get here, a rule was added that we do not support.
+		 * just do the fib_abort
+		 */
+		mlxsw_sp_router_fib_abort(mlxsw_sp);
 		break;
 	}
 	rtnl_unlock();
@@ -5345,7 +5701,6 @@ static void mlxsw_sp_router_fibmr_event_work(struct work_struct *work)
 	struct mlxsw_sp_fib_event_work *fib_work =
 		container_of(work, struct mlxsw_sp_fib_event_work, work);
 	struct mlxsw_sp *mlxsw_sp = fib_work->mlxsw_sp;
-	struct fib_rule *rule;
 	bool replace;
 	int err;
 
@@ -5377,12 +5732,11 @@ static void mlxsw_sp_router_fibmr_event_work(struct work_struct *work)
 					      &fib_work->ven_info);
 		dev_put(fib_work->ven_info.dev);
 		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		rule = fib_work->fr_info.rule;
-		if (!ipmr_rule_default(rule) && !rule->l3mdev)
-			mlxsw_sp_router_fib_abort(mlxsw_sp);
-		fib_rule_put(rule);
+	case FIB_EVENT_RULE_ADD:
+		/* if we get here, a rule was added that we do not support.
+		 * just do the fib_abort
+		 */
+		mlxsw_sp_router_fib_abort(mlxsw_sp);
 		break;
 	}
 	rtnl_unlock();
@@ -5393,7 +5747,6 @@ static void mlxsw_sp_router_fib4_event(struct mlxsw_sp_fib_event_work *fib_work,
 				       struct fib_notifier_info *info)
 {
 	struct fib_entry_notifier_info *fen_info;
-	struct fib_rule_notifier_info *fr_info;
 	struct fib_nh_notifier_info *fnh_info;
 
 	switch (fib_work->event) {
@@ -5409,13 +5762,6 @@ static void mlxsw_sp_router_fib4_event(struct mlxsw_sp_fib_event_work *fib_work,
 		 */
 		fib_info_hold(fib_work->fen_info.fi);
 		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		fr_info = container_of(info, struct fib_rule_notifier_info,
-				       info);
-		fib_work->fr_info = *fr_info;
-		fib_rule_get(fib_work->fr_info.rule);
-		break;
 	case FIB_EVENT_NH_ADD: /* fall through */
 	case FIB_EVENT_NH_DEL:
 		fnh_info = container_of(info, struct fib_nh_notifier_info,
@@ -5430,7 +5776,6 @@ static void mlxsw_sp_router_fib6_event(struct mlxsw_sp_fib_event_work *fib_work,
 				       struct fib_notifier_info *info)
 {
 	struct fib6_entry_notifier_info *fen6_info;
-	struct fib_rule_notifier_info *fr_info;
 
 	switch (fib_work->event) {
 	case FIB_EVENT_ENTRY_REPLACE: /* fall through */
@@ -5440,13 +5785,6 @@ static void mlxsw_sp_router_fib6_event(struct mlxsw_sp_fib_event_work *fib_work,
 					 info);
 		fib_work->fen6_info = *fen6_info;
 		rt6_hold(fib_work->fen6_info.rt);
-		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		fr_info = container_of(info, struct fib_rule_notifier_info,
-				       info);
-		fib_work->fr_info = *fr_info;
-		fib_rule_get(fib_work->fr_info.rule);
 		break;
 	}
 }
@@ -5467,12 +5805,46 @@ mlxsw_sp_router_fibmr_event(struct mlxsw_sp_fib_event_work *fib_work,
 		memcpy(&fib_work->ven_info, info, sizeof(fib_work->ven_info));
 		dev_hold(fib_work->ven_info.dev);
 		break;
-	case FIB_EVENT_RULE_ADD: /* fall through */
-	case FIB_EVENT_RULE_DEL:
-		memcpy(&fib_work->fr_info, info, sizeof(fib_work->fr_info));
-		fib_rule_get(fib_work->fr_info.rule);
+	}
+}
+
+static int mlxsw_sp_router_fib_rule_event(unsigned long event,
+					  struct fib_notifier_info *info,
+					  struct mlxsw_sp *mlxsw_sp)
+{
+	struct fib_rule_notifier_info *fr_info;
+	struct fib_rule *rule;
+	int err = 0;
+
+	/* nothing to do at the moment */
+	if (event == FIB_EVENT_RULE_DEL)
+		return 0;
+
+	if (mlxsw_sp->router->aborted)
+		return 0;
+
+	fr_info = container_of(info, struct fib_rule_notifier_info, info);
+	rule = fr_info->rule;
+
+	switch (info->family) {
+	case AF_INET:
+		if (!fib4_rule_default(rule) /* && !rule->l3mdev */) /* VRF not in RHEL */
+			err = -1;
+		break;
+	case AF_INET6:
+		if (!fib6_rule_default(rule) /* && !rule->l3mdev */) /* VRF not in RHEL */
+			err = -1;
+		break;
+	case RTNL_FAMILY_IPMR:
+		if (!ipmr_rule_default(rule) /* && !rule->l3mdev */) /* VRF not in RHEL */
+			err = -1;
 		break;
 	}
+
+	if (err < 0)
+		dev_err(mlxsw_sp->bus_info->dev, "spectrum: FIB rules not supported. Aborting offload");
+
+	return err;
 }
 
 /* Called with rcu_read_lock() */
@@ -5482,17 +5854,28 @@ static int mlxsw_sp_router_fib_event(struct notifier_block *nb,
 	struct mlxsw_sp_fib_event_work *fib_work;
 	struct fib_notifier_info *info = ptr;
 	struct mlxsw_sp_router *router;
+	int err;
 
 	if (!net_eq(info->net, &init_net) ||
 	    (info->family != AF_INET && info->family != AF_INET6 &&
 	     info->family != RTNL_FAMILY_IPMR))
 		return NOTIFY_DONE;
 
+	router = container_of(nb, struct mlxsw_sp_router, fib_nb);
+
+	switch (event) {
+	case FIB_EVENT_RULE_ADD: /* fall through */
+	case FIB_EVENT_RULE_DEL:
+		err = mlxsw_sp_router_fib_rule_event(event, info,
+						     router->mlxsw_sp);
+		if (!err)
+			return NOTIFY_DONE;
+	}
+
 	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
 	if (WARN_ON(!fib_work))
 		return NOTIFY_BAD;
 
-	router = container_of(nb, struct mlxsw_sp_router, fib_nb);
 	fib_work->mlxsw_sp = router->mlxsw_sp;
 	fib_work->event = event;
 
@@ -5742,7 +6125,7 @@ err_fid_get:
 err_rif_alloc:
 err_rif_index_alloc:
 	vr->rif_count--;
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 	return ERR_PTR(err);
 }
 
@@ -5765,7 +6148,7 @@ void mlxsw_sp_rif_destroy(struct mlxsw_sp_rif *rif)
 		mlxsw_sp_fid_put(fid);
 	kfree(rif);
 	vr->rif_count--;
-	mlxsw_sp_vr_put(vr);
+	mlxsw_sp_vr_put(mlxsw_sp, vr);
 }
 
 static void
@@ -6460,7 +6843,7 @@ mlxsw_sp_rif_ipip_lb_configure(struct mlxsw_sp_rif *rif)
 	return 0;
 
 err_loopback_op:
-	mlxsw_sp_vr_put(ul_vr);
+	mlxsw_sp_vr_put(mlxsw_sp, ul_vr);
 	return err;
 }
 
@@ -6474,7 +6857,7 @@ static void mlxsw_sp_rif_ipip_lb_deconfigure(struct mlxsw_sp_rif *rif)
 	mlxsw_sp_rif_ipip_lb_op(lb_rif, ul_vr, false);
 
 	--ul_vr->rif_count;
-	mlxsw_sp_vr_put(ul_vr);
+	mlxsw_sp_vr_put(mlxsw_sp, ul_vr);
 }
 
 static const struct mlxsw_sp_rif_ops mlxsw_sp_rif_ipip_lb_ops = {
@@ -6564,7 +6947,7 @@ static void mlxsw_sp_mp_hash_field_set(char *recr2_pl, int field)
 
 static void mlxsw_sp_mp4_hash_init(char *recr2_pl)
 {
-	bool only_l3 = !init_net.ipv4.sysctl_fib_multipath_hash_policy;
+	bool only_l3 = !init_net.ipv4_sysctl_fib_multipath_hash_policy;
 
 	mlxsw_sp_mp_hash_header_set(recr2_pl,
 				    MLXSW_REG_RECR2_IPV4_EN_NOT_TCP_NOT_UDP);

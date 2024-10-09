@@ -90,6 +90,7 @@ struct kvm_s390_sie_block {
 #define LCTL_CR14	0x0002
 	__u16   lctl;			/* 0x0044 */
 	__s16	icpua;			/* 0x0046 */
+#define ICTL_OPEREXC	0x80000000
 #define ICTL_LPSW 0x00400000
 	__u32	ictl;			/* 0x0048 */
 	__u32	eca;			/* 0x004c */
@@ -135,6 +136,7 @@ struct kvm_vcpu_stat {
 	u64 instruction_lctlg;
 	u64 exit_program_interruption;
 	u64 exit_instr_and_program;
+	u32 exit_operation_exception;
 	u64 deliver_external_call;
 	u64 deliver_emergency_signal;
 	u64 deliver_service_signal;
@@ -156,6 +158,7 @@ struct kvm_vcpu_stat {
 	u64 instruction_stsi;
 	u64 instruction_stfl;
 	u64 instruction_tprot;
+	u32 instruction_sthyi;
 	u64 instruction_sigp_sense;
 	u64 instruction_sigp_sense_running;
 	u64 instruction_sigp_external_call;

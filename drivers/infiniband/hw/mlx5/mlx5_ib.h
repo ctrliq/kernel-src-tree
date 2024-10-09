@@ -645,8 +645,18 @@ struct mlx5_ib_counters {
 	bool set_id_valid;
 };
 
+struct mlx5_ib_multiport_info;
+
+struct mlx5_ib_multiport {
+	struct mlx5_ib_multiport_info *mpi;
+	/* To be held when accessing the multiport info */
+	spinlock_t mpi_lock;
+};
+
 struct mlx5_ib_port {
 	struct mlx5_ib_counters cnts;
+	struct mlx5_ib_multiport mp;
+	struct mlx5_ib_dbg_cc_params	*dbg_cc_params;
 };
 
 struct mlx5_roce {
@@ -658,12 +668,15 @@ struct mlx5_roce {
 	struct notifier_block	nb;
 	atomic_t		next_port;
 	enum ib_port_state last_port_state;
+	struct mlx5_ib_dev	*dev;
+	u8			native_port_num;
 };
 
 struct mlx5_ib_dbg_param {
 	int			offset;
 	struct mlx5_ib_dev	*dev;
 	struct dentry		*dentry;
+	u8			port_num;
 };
 
 enum mlx5_ib_dbg_cc_types {
@@ -716,10 +729,51 @@ struct mlx5_ib_delay_drop {
 	struct mlx5_ib_dbg_delay_drop *dbg;
 };
 
+enum mlx5_ib_stages {
+	MLX5_IB_STAGE_INIT,
+	MLX5_IB_STAGE_CAPS,
+	MLX5_IB_STAGE_ROCE,
+	MLX5_IB_STAGE_DEVICE_RESOURCES,
+	MLX5_IB_STAGE_ODP,
+	MLX5_IB_STAGE_COUNTERS,
+	MLX5_IB_STAGE_CONG_DEBUGFS,
+	MLX5_IB_STAGE_UAR,
+	MLX5_IB_STAGE_BFREG,
+	MLX5_IB_STAGE_PRE_IB_REG_UMR,
+	MLX5_IB_STAGE_IB_REG,
+	MLX5_IB_STAGE_POST_IB_REG_UMR,
+	MLX5_IB_STAGE_DELAY_DROP,
+	MLX5_IB_STAGE_CLASS_ATTR,
+	MLX5_IB_STAGE_MAX,
+};
+
+struct mlx5_ib_stage {
+	int (*init)(struct mlx5_ib_dev *dev);
+	void (*cleanup)(struct mlx5_ib_dev *dev);
+};
+
+#define STAGE_CREATE(_stage, _init, _cleanup) \
+	.stage[_stage] = {.init = _init, .cleanup = _cleanup}
+
+struct mlx5_ib_profile {
+	struct mlx5_ib_stage stage[MLX5_IB_STAGE_MAX];
+};
+
+struct mlx5_ib_multiport_info {
+	struct list_head list;
+	struct mlx5_ib_dev *ibdev;
+	struct mlx5_core_dev *mdev;
+	struct completion unref_comp;
+	u64 sys_image_guid;
+	u32 mdev_refcnt;
+	bool is_master;
+	bool unaffiliate;
+};
+
 struct mlx5_ib_dev {
 	struct ib_device		ib_dev;
 	struct mlx5_core_dev		*mdev;
-	struct mlx5_roce		roce;
+	struct mlx5_roce		roce[MLX5_MAX_PORTS];
 	int				num_ports;
 	/* serialize update of capability mask
 	 */
@@ -753,12 +807,14 @@ struct mlx5_ib_dev {
 	struct mlx5_sq_bfreg	bfreg;
 	struct mlx5_sq_bfreg	fp_bfreg;
 	struct mlx5_ib_delay_drop	delay_drop;
-	struct mlx5_ib_dbg_cc_params	*dbg_cc_params;
+	const struct mlx5_ib_profile	*profile;
 
 	/* protect the user_td */
 	struct mutex		lb_mutex;
 	u32			user_td;
 	u8			umr_fence;
+	struct list_head	ib_dev_list;
+	u64			sys_image_guid;
 };
 
 static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
@@ -971,7 +1027,6 @@ void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev);
 void mlx5_ib_pfault(struct mlx5_core_dev *mdev, void *context,
 		    struct mlx5_pagefault *pfault);
 int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev);
-void mlx5_ib_odp_remove_one(struct mlx5_ib_dev *ibdev);
 int __init mlx5_ib_odp_init(void);
 void mlx5_ib_odp_cleanup(void);
 void mlx5_ib_invalidate_range(struct ib_umem *umem, unsigned long start,
@@ -986,7 +1041,6 @@ static inline void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev)
 }
 
 static inline int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev) { return 0; }
-static inline void mlx5_ib_odp_remove_one(struct mlx5_ib_dev *ibdev)	    {}
 static inline int mlx5_ib_odp_init(void) { return 0; }
 static inline void mlx5_ib_odp_cleanup(void)				    {}
 static inline void mlx5_odp_init_mr_cache_entry(struct mlx5_cache_ent *ent) {}
@@ -1010,8 +1064,8 @@ __be16 mlx5_get_roce_udp_sport(struct mlx5_ib_dev *dev, u8 port_num,
 int mlx5_get_roce_gid_type(struct mlx5_ib_dev *dev, u8 port_num,
 			   int index, enum ib_gid_type *gid_type);
 
-void mlx5_ib_cleanup_cong_debugfs(struct mlx5_ib_dev *dev);
-int mlx5_ib_init_cong_debugfs(struct mlx5_ib_dev *dev);
+void mlx5_ib_cleanup_cong_debugfs(struct mlx5_ib_dev *dev, u8 port_num);
+int mlx5_ib_init_cong_debugfs(struct mlx5_ib_dev *dev, u8 port_num);
 
 /* GSI QP helper functions */
 struct ib_qp *mlx5_ib_gsi_create_qp(struct ib_pd *pd,
@@ -1032,6 +1086,12 @@ int mlx5_ib_generate_wc(struct ib_cq *ibcq, struct ib_wc *wc);
 
 void mlx5_ib_free_bfreg(struct mlx5_ib_dev *dev, struct mlx5_bfreg_info *bfregi,
 			int bfregn);
+struct mlx5_ib_dev *mlx5_ib_get_ibdev_from_mpi(struct mlx5_ib_multiport_info *mpi);
+struct mlx5_core_dev *mlx5_ib_get_native_port_mdev(struct mlx5_ib_dev *dev,
+						   u8 ib_port_num,
+						   u8 *native_port_num);
+void mlx5_ib_put_native_port_mdev(struct mlx5_ib_dev *dev,
+				  u8 port_num);
 
 static inline void init_query_mad(struct ib_smp *mad)
 {

@@ -216,6 +216,8 @@ static int xgbe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	int bar_mask;
 	int ret;
 
+	mark_tech_preview(XGBE_DRV_NAME, THIS_MODULE);
+
 	pdata = xgbe_alloc_pdata(dev);
 	if (IS_ERR(pdata)) {
 		ret = PTR_ERR(pdata);
@@ -474,6 +476,7 @@ static const struct xgbe_version_data xgbe_v2a = {
 	.irq_reissue_support		= 1,
 	.tx_desc_prefetch		= 5,
 	.rx_desc_prefetch		= 5,
+	.an_cdr_workaround		= 1,
 };
 
 static const struct xgbe_version_data xgbe_v2b = {
@@ -488,6 +491,7 @@ static const struct xgbe_version_data xgbe_v2b = {
 	.irq_reissue_support		= 1,
 	.tx_desc_prefetch		= 5,
 	.rx_desc_prefetch		= 5,
+	.an_cdr_workaround		= 1,
 };
 
 static const struct pci_device_id xgbe_pci_table[] = {

@@ -31,6 +31,7 @@
 #include <asm/code-patching.h>
 #include <linux/sort.h>
 #include <asm/setup.h>
+#include <asm/sections.h>
 
 /* FIXME: We don't do .init separately.  To do this, we'd need to have
    a separate r2 value in the init and core section, and stub between
@@ -383,7 +384,7 @@ int module_frob_arch_sections(Elf64_Ehdr *hdr,
 /* r2 is the TOC pointer: it actually points 0x8000 into the TOC (this
    gives the value maximum span in an instruction which uses a signed
    offset) */
-static inline unsigned long my_r2(Elf64_Shdr *sechdrs, struct module *me)
+static inline unsigned long my_r2(const Elf64_Shdr *sechdrs, struct module *me)
 {
 	return sechdrs[me->arch.toc_section].sh_addr + 0x8000;
 }
@@ -396,7 +397,7 @@ static inline unsigned long my_r2(Elf64_Shdr *sechdrs, struct module *me)
 #define PPC_HA(v) PPC_HI ((v) + 0x8000)
 
 /* Patch stub to reference function and correct r2 value. */
-static inline int create_stub(Elf64_Shdr *sechdrs,
+static inline int create_stub(const Elf64_Shdr *sechdrs,
 			      struct ppc64_stub_entry *entry,
 			      unsigned long addr,
 			      struct module *me)
@@ -424,7 +425,7 @@ static inline int create_stub(Elf64_Shdr *sechdrs,
 
 /* Create stub to jump to function described in this OPD/ptr: we need the
    stub to set up the TOC ptr (r2) for the function. */
-static unsigned long stub_for_addr(Elf64_Shdr *sechdrs,
+static unsigned long stub_for_addr(const Elf64_Shdr *sechdrs,
 				   unsigned long addr,
 				   struct module *me)
 {
@@ -695,12 +696,90 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 		}
 	}
 
+	return 0;
+}
+
 #ifdef CONFIG_DYNAMIC_FTRACE
-	me->arch.toc = my_r2(sechdrs, me);
-	me->arch.tramp = stub_for_addr(sechdrs,
-				       (unsigned long)ftrace_caller,
-				       me);
+
+#ifdef CC_USING_MPROFILE_KERNEL
+
+#define PACATOC offsetof(struct paca_struct, kernel_toc)
+
+/*
+ * For mprofile-kernel we use a special stub for ftrace_caller() because we
+ * can't rely on r2 containing this module's TOC when we enter the stub.
+ *
+ * That can happen if the function calling us didn't need to use the toc. In
+ * that case it won't have setup r2, and the r2 value will be either the
+ * kernel's toc, or possibly another modules toc.
+ *
+ * To deal with that this stub uses the kernel toc, which is always accessible
+ * via the paca (in r13). The target (ftrace_caller()) is responsible for
+ * saving and restoring the toc before returning.
+ */
+static unsigned long create_ftrace_stub(const Elf64_Shdr *sechdrs, struct module *me)
+{
+	struct ppc64_stub_entry *entry;
+	unsigned int i, num_stubs;
+	static u32 stub_insns[] = {
+		0xe98d0000 | PACATOC, 	/* ld      r12,PACATOC(r13)	*/
+		0x3d8c0000,		/* addis   r12,r12,<high>	*/
+		0x398c0000, 		/* addi    r12,r12,<low>	*/
+		0x7d8903a6, 		/* mtctr   r12			*/
+		0x4e800420, 		/* bctr				*/
+	};
+	long reladdr;
+
+	num_stubs = sechdrs[me->arch.stubs_section].sh_size / sizeof(*entry);
+
+	/* Find the next available stub entry */
+	entry = (void *)sechdrs[me->arch.stubs_section].sh_addr;
+	for (i = 0; i < num_stubs && stub_func_addr(entry->funcdata); i++, entry++);
+
+	if (i >= num_stubs) {
+		pr_err("%s: Unable to find a free slot for ftrace stub.\n", me->name);
+		return 0;
+	}
+
+	memcpy(entry->jump, stub_insns, sizeof(stub_insns));
+
+	/* Stub uses address relative to kernel toc (from the paca) */
+	reladdr = (unsigned long)ftrace_caller - kernel_toc_addr();
+	if (reladdr > 0x7FFFFFFF || reladdr < -(0x80000000L)) {
+		pr_err("%s: Address of ftrace_caller out of range of kernel_toc.\n", me->name);
+		return 0;
+	}
+
+	entry->jump[1] |= PPC_HA(reladdr);
+	entry->jump[2] |= PPC_LO(reladdr);
+
+	/* Eventhough we don't use funcdata in the stub, it's needed elsewhere. */
+	entry->funcdata = func_desc((unsigned long)ftrace_caller);
+	entry->magic = STUB_MAGIC;
+
+	return (unsigned long)entry;
+}
+#else
+static unsigned long create_ftrace_stub(const Elf64_Shdr *sechdrs, struct module *me)
+{
+	return stub_for_addr(sechdrs, (unsigned long)ftrace_caller, me);
+}
 #endif
+
+int module_finalize_ftrace(struct module *mod, const Elf_Shdr *sechdrs)
+{
+	struct module_ext *mod_ext;
+
+	mutex_lock(&module_ext_mutex);
+	mod_ext = find_module_ext(mod);
+	mutex_unlock(&module_ext_mutex);
+
+	mod_ext->toc = my_r2(sechdrs, mod);
+	mod_ext->tramp = create_ftrace_stub(sechdrs, mod);
+
+	if (!mod_ext->tramp)
+		return -ENOENT;
 
 	return 0;
 }
+#endif

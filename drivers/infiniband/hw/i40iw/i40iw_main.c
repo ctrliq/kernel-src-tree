@@ -1398,7 +1398,7 @@ static void i40iw_register_notifiers(void)
 	register_inetaddr_notifier(&i40iw_inetaddr_notifier);
 	register_inet6addr_notifier(&i40iw_inetaddr6_notifier);
 	register_netevent_notifier(&i40iw_net_notifier);
-	register_netdevice_notifier(&i40iw_netdevice_notifier);
+	register_netdevice_notifier_rh(&i40iw_netdevice_notifier);
 }
 
 /**
@@ -1410,7 +1410,7 @@ static void i40iw_unregister_notifiers(void)
 	unregister_netevent_notifier(&i40iw_net_notifier);
 	unregister_inetaddr_notifier(&i40iw_inetaddr_notifier);
 	unregister_inet6addr_notifier(&i40iw_inetaddr6_notifier);
-	unregister_netdevice_notifier(&i40iw_netdevice_notifier);
+	unregister_netdevice_notifier_rh(&i40iw_netdevice_notifier);
 }
 
 /**

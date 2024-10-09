@@ -90,7 +90,7 @@ enum {
 	__NETIF_F_PLACEHOLDER_3,
 	__NETIF_F_PLACEHOLDER_4,
 	__NETIF_F_PLACEHOLDER_5,
-	__NETIF_F_PLACEHOLDER_6,
+	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
 
 	NETIF_F_HW_L2FW_DOFFLOAD_BIT,	/* Allow L2 Forwarding in Hardware */
 
@@ -116,6 +116,7 @@ enum {
 #define NETIF_F_FRAGLIST	__NETIF_F(FRAGLIST)
 #define NETIF_F_FSO		__NETIF_F(FSO)
 #define NETIF_F_GRO		__NETIF_F(GRO)
+#define NETIF_F_GRO_HW		__NETIF_F(GRO_HW)
 #define NETIF_F_GSO		__NETIF_F(GSO)
 #define NETIF_F_GSO_ROBUST	__NETIF_F(GSO_ROBUST)
 #define NETIF_F_HIGHDMA		__NETIF_F(HIGHDMA)
@@ -224,11 +225,15 @@ enum {
 /* changeable features with no special hardware requirements */
 #define NETIF_F_SOFT_FEATURES	(NETIF_F_GSO | NETIF_F_GRO)
 
-#define NETIF_F_GSO_ENCAP_ALL	(NETIF_F_GSO_GRE |			\
-				 NETIF_F_GSO_GRE_CSUM |			\
+#define NETIF_F_GSO1_ENCAP_ALL	(NETIF_F_GSO_GRE |			\
 				 NETIF_F_GSO_IPIP |			\
 				 NETIF_F_GSO_SIT |			\
-				 NETIF_F_GSO_UDP_TUNNEL |		\
+				 NETIF_F_GSO_UDP_TUNNEL)
+
+#define NETIF_F_GSO2_ENCAP_ALL	(NETIF_F_GSO_GRE_CSUM |			\
 				 NETIF_F_GSO_UDP_TUNNEL_CSUM)
+
+#define NETIF_F_GSO_ENCAP_ALL	(NETIF_F_GSO1_ENCAP_ALL |               \
+				 NETIF_F_GSO2_ENCAP_ALL)
 
 #endif	/* _LINUX_NETDEV_FEATURES_H */

@@ -60,6 +60,7 @@ static void sctp_datamsg_init(struct sctp_datamsg *msg)
 	msg->send_failed = 0;
 	msg->send_error = 0;
 	msg->can_delay = 1;
+	msg->abandoned = 0;
 	msg->expires_at = 0;
 	INIT_LIST_HEAD(&msg->chunks);
 }
@@ -354,20 +355,30 @@ int sctp_chunk_abandoned(struct sctp_chunk *chunk)
 	if (!chunk->asoc->peer.prsctp_capable)
 		return 0;
 
+	if (chunk->msg->abandoned)
+		return 1;
+
+	if (!chunk->has_tsn &&
+	    !(chunk->chunk_hdr->flags & SCTP_DATA_FIRST_FRAG))
+		return 0;
+
 	if (SCTP_PR_TTL_ENABLED(chunk->sinfo.sinfo_flags) &&
 	    time_after(jiffies, chunk->msg->expires_at)) {
 		if (chunk->sent_count)
 			chunk->asoc->abandoned_sent[SCTP_PR_INDEX(TTL)]++;
 		else
 			chunk->asoc->abandoned_unsent[SCTP_PR_INDEX(TTL)]++;
+		chunk->msg->abandoned = 1;
 		return 1;
 	} else if (SCTP_PR_RTX_ENABLED(chunk->sinfo.sinfo_flags) &&
 		   chunk->sent_count > chunk->sinfo.sinfo_timetolive) {
 		chunk->asoc->abandoned_sent[SCTP_PR_INDEX(RTX)]++;
+		chunk->msg->abandoned = 1;
 		return 1;
 	} else if (!SCTP_PR_POLICY(chunk->sinfo.sinfo_flags) &&
 		   chunk->msg->expires_at &&
 		   time_after(jiffies, chunk->msg->expires_at)) {
+		chunk->msg->abandoned = 1;
 		return 1;
 	}
 	/* PRIO policy is processed by sendmsg, not here */

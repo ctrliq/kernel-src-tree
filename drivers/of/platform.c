@@ -137,9 +137,6 @@ struct platform_device *of_device_alloc(struct device_node *np,
 	if (!dev)
 		return NULL;
 
-	/* RHEL-specific alloc for device struct kabi extensions */
-	device_rh_alloc(&dev->dev);
-
 	/* count the io and irq resources */
 	while (of_address_to_resource(np, num_reg, &temp_res) == 0)
 		num_reg++;

@@ -22,6 +22,7 @@
 #include <linux/gfp.h>
 #include <linux/bootmem.h>
 #include <asm/fixmap.h>
+#include <asm/pgtable.h>
 #include <asm/pvclock.h>
 
 static u8 valid_flags __read_mostly = 0;
@@ -160,7 +161,7 @@ int __init pvclock_init_vsyscall(struct pvclock_vsyscall_time_info *i,
 	for (idx = 0; idx <= (PVCLOCK_FIXMAP_END-PVCLOCK_FIXMAP_BEGIN); idx++) {
 		__set_fixmap(PVCLOCK_FIXMAP_BEGIN + idx,
 			     __pa(i) + (idx*PAGE_SIZE),
-			     PAGE_KERNEL_VVAR);
+			     pgprot_decrypted(PAGE_KERNEL_VVAR));
 	}
 
 	return 0;

@@ -592,6 +592,9 @@ repeat:
 	if (unlikely(d_unhashed(dentry)))
 		goto kill_it;
 
+	if (unlikely(dentry->d_flags & DCACHE_DISCONNECTED))
+		goto kill_it;
+
 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE)) {
 		if (dentry->d_op->d_delete(dentry))
 			goto kill_it;
@@ -770,15 +773,21 @@ static void shrink_dentry_list(struct list_head *list)
 {
 	struct dentry *dentry, *parent;
 
-	rcu_read_lock();
 	for (;;) {
 		struct inode *inode;
+
+		cond_resched();
+		rcu_read_lock();
+
 		dentry = list_entry_rcu(list->prev, struct dentry, d_lru);
-		if (&dentry->d_lru == list)
+		if (&dentry->d_lru == list) {
+			rcu_read_unlock();
 			break; /* empty */
+		}
 		spin_lock(&dentry->d_lock);
 		if (dentry != list_entry(list->prev, struct dentry, d_lru)) {
 			spin_unlock(&dentry->d_lock);
+			rcu_read_unlock();
 			continue;
 		}
 
@@ -794,6 +803,7 @@ static void shrink_dentry_list(struct list_head *list)
 			spin_unlock(&dentry->d_lock);
 			if (parent)
 				spin_unlock(&parent->d_lock);
+			rcu_read_unlock();
 			continue;
 		}
 
@@ -805,7 +815,6 @@ static void shrink_dentry_list(struct list_head *list)
 			if (parent)
 				spin_unlock(&parent->d_lock);
 			cpu_relax();
-			rcu_read_lock();
 			continue;
 		}
 
@@ -838,9 +847,7 @@ static void shrink_dentry_list(struct list_head *list)
 			__dentry_kill(dentry);
 			dentry = parent;
 		}
-		rcu_read_lock();
 	}
-	rcu_read_unlock();
 }
 
 /**
@@ -1346,7 +1353,6 @@ void shrink_dcache_parent(struct dentry *parent)
 			break;
 
 		shrink_dentry_list(&data.dispose);
-		cond_resched();
 	}
 }
 EXPORT_SYMBOL(shrink_dcache_parent);
@@ -1429,8 +1435,6 @@ int d_invalidate(struct dentry *dentry)
 
 		if (!data.mountpoint && !data.select.found)
 			return 0;
-
-		cond_resched();
 	}
 }
 EXPORT_SYMBOL(d_invalidate);

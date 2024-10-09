@@ -149,7 +149,8 @@ static int bnxt_vf_rep_setup_tc_block_cb(enum tc_setup_type type,
 	struct bnxt *bp = vf_rep->bp;
 	int vf_fid = bp->pf.vf[vf_rep->vf_idx].fw_fid;
 
-	if (!bnxt_tc_flower_enabled(vf_rep->bp))
+	if (!bnxt_tc_flower_enabled(vf_rep->bp) ||
+	    !tc_cls_can_offload_and_chain0(bp->dev, type_data))
 		return -EOPNOTSUPP;
 
 	switch (type) {
@@ -186,8 +187,6 @@ static int bnxt_vf_rep_setup_tc(struct net_device *dev, enum tc_setup_type type,
 				void *type_data)
 {
 	switch (type) {
-	case TC_SETUP_CLSFLOWER:
-		return 0; /* will be removed after conversion from ndo */
 	case TC_SETUP_BLOCK:
 		return bnxt_vf_rep_setup_tc_block(dev, type_data);
 	default:
@@ -410,8 +409,8 @@ static void bnxt_vf_rep_netdev_init(struct bnxt *bp, struct bnxt_vf_rep *vf_rep,
 	ether_addr_copy(dev->dev_addr, dev->perm_addr);
 	/* Set VF-Rep's max-mtu to the corresponding VF's max-mtu */
 	if (!bnxt_hwrm_vfr_qcfg(bp, vf_rep, &max_mtu))
-		dev->max_mtu = max_mtu;
-	dev->min_mtu = ETH_ZLEN;
+		dev->extended->max_mtu = max_mtu;
+	dev->extended->min_mtu = ETH_ZLEN;
 }
 
 static int bnxt_pcie_dsn_get(struct bnxt *bp, u8 dsn[])

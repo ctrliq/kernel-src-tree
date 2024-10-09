@@ -91,18 +91,9 @@ static int octeon_console_debug_enabled(u32 console)
  */
 #define LIO_SYNC_OCTEON_TIME_INTERVAL_MS 60000
 
-struct liquidio_if_cfg_context {
-	int octeon_id;
-
-	wait_queue_head_t wc;
-
-	int cond;
-};
-
-struct liquidio_if_cfg_resp {
-	u64 rh;
-	struct liquidio_if_cfg_info cfg_info;
-	u64 status;
+struct lio_trusted_vf_ctx {
+	struct completion complete;
+	int status;
 };
 
 struct liquidio_rx_ctl_context {
@@ -147,32 +138,9 @@ union tx_info {
  * by this structure in the NIC module.
  */
 
-#define OCTNIC_MAX_SG  (MAX_SKB_FRAGS)
-
 #define OCTNIC_GSO_MAX_HEADER_SIZE 128
 #define OCTNIC_GSO_MAX_SIZE                                                    \
 	(CN23XX_DEFAULT_INPUT_JABBER - OCTNIC_GSO_MAX_HEADER_SIZE)
-
-/** Structure of a node in list of gather components maintained by
- * NIC driver for each network device.
- */
-struct octnic_gather {
-	/** List manipulation. Next and prev pointers. */
-	struct list_head list;
-
-	/** Size of the gather component at sg in bytes. */
-	int sg_size;
-
-	/** Number of bytes that sg was adjusted to make it 8B-aligned. */
-	int adjust;
-
-	/** Gather component that can accommodate max sized fragment list
-	 *  received from the IP layer.
-	 */
-	struct octeon_sg_entry *sg;
-
-	dma_addr_t sg_dma_ptr;
-};
 
 struct handshake {
 	struct completion init;
@@ -529,7 +497,7 @@ static void liquidio_deinit_pci(void)
  */
 static inline int check_txq_status(struct lio *lio)
 {
-	int numqs = lio->netdev->num_tx_queues;
+	int numqs = lio->netdev->real_num_tx_queues;
 	int ret_val = 0;
 	int q, iq;
 
@@ -548,129 +516,6 @@ static inline int check_txq_status(struct lio *lio)
 	}
 
 	return ret_val;
-}
-
-/**
- * \brief Delete gather lists
- * @param lio per-network private data
- */
-static void delete_glists(struct lio *lio)
-{
-	struct octnic_gather *g;
-	int i;
-
-	kfree(lio->glist_lock);
-	lio->glist_lock = NULL;
-
-	if (!lio->glist)
-		return;
-
-	for (i = 0; i < lio->linfo.num_txpciq; i++) {
-		do {
-			g = (struct octnic_gather *)
-				lio_list_delete_head(&lio->glist[i]);
-			if (g)
-				kfree(g);
-		} while (g);
-
-		if (lio->glists_virt_base && lio->glists_virt_base[i] &&
-		    lio->glists_dma_base && lio->glists_dma_base[i]) {
-			lio_dma_free(lio->oct_dev,
-				     lio->glist_entry_size * lio->tx_qsize,
-				     lio->glists_virt_base[i],
-				     lio->glists_dma_base[i]);
-		}
-	}
-
-	kfree(lio->glists_virt_base);
-	lio->glists_virt_base = NULL;
-
-	kfree(lio->glists_dma_base);
-	lio->glists_dma_base = NULL;
-
-	kfree(lio->glist);
-	lio->glist = NULL;
-}
-
-/**
- * \brief Setup gather lists
- * @param lio per-network private data
- */
-static int setup_glists(struct octeon_device *oct, struct lio *lio, int num_iqs)
-{
-	int i, j;
-	struct octnic_gather *g;
-
-	lio->glist_lock = kcalloc(num_iqs, sizeof(*lio->glist_lock),
-				  GFP_KERNEL);
-	if (!lio->glist_lock)
-		return -ENOMEM;
-
-	lio->glist = kcalloc(num_iqs, sizeof(*lio->glist),
-			     GFP_KERNEL);
-	if (!lio->glist) {
-		kfree(lio->glist_lock);
-		lio->glist_lock = NULL;
-		return -ENOMEM;
-	}
-
-	lio->glist_entry_size =
-		ROUNDUP8((ROUNDUP4(OCTNIC_MAX_SG) >> 2) * OCT_SG_ENTRY_SIZE);
-
-	/* allocate memory to store virtual and dma base address of
-	 * per glist consistent memory
-	 */
-	lio->glists_virt_base = kcalloc(num_iqs, sizeof(*lio->glists_virt_base),
-					GFP_KERNEL);
-	lio->glists_dma_base = kcalloc(num_iqs, sizeof(*lio->glists_dma_base),
-				       GFP_KERNEL);
-
-	if (!lio->glists_virt_base || !lio->glists_dma_base) {
-		delete_glists(lio);
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < num_iqs; i++) {
-		int numa_node = dev_to_node(&oct->pci_dev->dev);
-
-		spin_lock_init(&lio->glist_lock[i]);
-
-		INIT_LIST_HEAD(&lio->glist[i]);
-
-		lio->glists_virt_base[i] =
-			lio_dma_alloc(oct,
-				      lio->glist_entry_size * lio->tx_qsize,
-				      &lio->glists_dma_base[i]);
-
-		if (!lio->glists_virt_base[i]) {
-			delete_glists(lio);
-			return -ENOMEM;
-		}
-
-		for (j = 0; j < lio->tx_qsize; j++) {
-			g = kzalloc_node(sizeof(*g), GFP_KERNEL,
-					 numa_node);
-			if (!g)
-				g = kzalloc(sizeof(*g), GFP_KERNEL);
-			if (!g)
-				break;
-
-			g->sg = lio->glists_virt_base[i] +
-				(j * lio->glist_entry_size);
-
-			g->sg_dma_ptr = lio->glists_dma_base[i] +
-					(j * lio->glist_entry_size);
-
-			list_add_tail(&g->list, &lio->glist[i]);
-		}
-
-		if (j != lio->tx_qsize) {
-			delete_glists(lio);
-			return -ENOMEM;
-		}
-	}
-
-	return 0;
 }
 
 /**
@@ -704,8 +549,12 @@ static void octnet_link_status_change(struct work_struct *work)
 	struct cavium_wk *wk = (struct cavium_wk *)work;
 	struct lio *lio = (struct lio *)wk->ctxptr;
 
+	/* lio->linfo.link.s.mtu always contains max MTU of the lio interface.
+	 * this API is invoked only when new max-MTU of the interface is
+	 * less than current MTU.
+	 */
 	rtnl_lock();
-	call_netdevice_notifiers(NETDEV_CHANGEMTU, lio->netdev);
+	dev_set_mtu(lio->netdev, lio->linfo.link.s.mtu);
 	rtnl_unlock();
 }
 
@@ -754,7 +603,11 @@ static inline void update_link_status(struct net_device *netdev,
 {
 	struct lio *lio = GET_LIO(netdev);
 	int changed = (lio->linfo.link.u64 != ls->u64);
+	int current_max_mtu = lio->linfo.link.s.mtu;
+	struct octeon_device *oct = lio->oct_dev;
 
+	dev_dbg(&oct->pci_dev->dev, "%s: lio->linfo.link.u64=%llx, ls->u64=%llx\n",
+		__func__, lio->linfo.link.u64, ls->u64);
 	lio->linfo.link.u64 = ls->u64;
 
 	if ((lio->intf_open) && (changed)) {
@@ -762,11 +615,25 @@ static inline void update_link_status(struct net_device *netdev,
 		lio->link_changes++;
 
 		if (lio->linfo.link.s.link_up) {
+			dev_dbg(&oct->pci_dev->dev, "%s: link_up", __func__);
 			netif_carrier_on(netdev);
 			wake_txqs(netdev);
 		} else {
+			dev_dbg(&oct->pci_dev->dev, "%s: link_off", __func__);
 			netif_carrier_off(netdev);
 			stop_txqs(netdev);
+		}
+		if (lio->linfo.link.s.mtu != current_max_mtu) {
+			netif_info(lio, probe, lio->netdev, "Max MTU changed from %d to %d\n",
+				   current_max_mtu, lio->linfo.link.s.mtu);
+			netdev->extended->max_mtu = lio->linfo.link.s.mtu;
+		}
+		if (lio->linfo.link.s.mtu < netdev->mtu) {
+			dev_warn(&oct->pci_dev->dev,
+				 "Current MTU is higher than new max MTU; Reducing the current mtu from %d to %d\n",
+				     netdev->mtu, lio->linfo.link.s.mtu);
+			queue_delayed_work(lio->link_status_wq.wq,
+					   &lio->link_status_wq.wk.work, 0);
 		}
 	}
 }
@@ -1044,6 +911,9 @@ liquidio_probe(struct pci_dev *pdev,
 
 	/* set linux specific device pointer */
 	oct_dev->pci_dev = (void *)pdev;
+
+	oct_dev->subsystem_id = pdev->subsystem_vendor |
+		(pdev->subsystem_device << 16);
 
 	hs = &handshake[oct_dev->octeon_id];
 	init_completion(&hs->init);
@@ -1439,7 +1309,7 @@ static void liquidio_destroy_nic_device(struct octeon_device *oct, int ifidx)
 
 	cleanup_rx_oom_poll_fn(netdev);
 
-	delete_glists(lio);
+	lio_delete_glists(lio);
 
 	free_netdev(netdev);
 
@@ -1654,7 +1524,7 @@ static void free_netsgbuf(void *buf)
 		i++;
 	}
 
-	iq = skb_iq(lio, skb);
+	iq = skb_iq(lio->oct_dev, skb);
 	spin_lock(&lio->glist_lock[iq]);
 	list_add_tail(&g->list, &lio->glist[iq]);
 	spin_unlock(&lio->glist_lock[iq]);
@@ -1697,7 +1567,7 @@ static void free_netsgbuf_with_resp(void *buf)
 		i++;
 	}
 
-	iq = skb_iq(lio, skb);
+	iq = skb_iq(lio->oct_dev, skb);
 
 	spin_lock(&lio->glist_lock[iq]);
 	list_add_tail(&g->list, &lio->glist[iq]);
@@ -1910,39 +1780,6 @@ static int load_firmware(struct octeon_device *oct)
 }
 
 /**
- * \brief Callback for getting interface configuration
- * @param status status of request
- * @param buf pointer to resp structure
- */
-static void if_cfg_callback(struct octeon_device *oct,
-			    u32 status __attribute__((unused)),
-			    void *buf)
-{
-	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
-	struct liquidio_if_cfg_resp *resp;
-	struct liquidio_if_cfg_context *ctx;
-
-	resp = (struct liquidio_if_cfg_resp *)sc->virtrptr;
-	ctx = (struct liquidio_if_cfg_context *)sc->ctxptr;
-
-	oct = lio_get_device(ctx->octeon_id);
-	if (resp->status)
-		dev_err(&oct->pci_dev->dev, "nic if cfg instruction failed. Status: 0x%llx (0x%08x)\n",
-			CVM_CAST64(resp->status), status);
-	WRITE_ONCE(ctx->cond, 1);
-
-	snprintf(oct->fw_info.liquidio_firmware_version, 32, "%s",
-		 resp->cfg_info.liquidio_firmware_version);
-
-	/* This barrier is required to be sure that the response has been
-	 * written fully before waking up the handler
-	 */
-	wmb();
-
-	wake_up_interruptible(&ctx->wc);
-}
-
-/**
  * \brief Poll routine for checking transmit queue status
  * @param work work_struct data structure
  */
@@ -2017,11 +1854,6 @@ static int liquidio_open(struct net_device *netdev)
 
 	ifstate_set(lio, LIO_IFSTATE_RUNNING);
 
-	/* Ready for link status updates */
-	lio->intf_open = 1;
-
-	netif_info(lio, ifup, lio->netdev, "Interface Open, ready for traffic\n");
-
 	if (OCTEON_CN23XX_PF(oct)) {
 		if (!oct->msix_on)
 			if (setup_tx_poll_fn(netdev))
@@ -2031,7 +1863,12 @@ static int liquidio_open(struct net_device *netdev)
 			return -1;
 	}
 
-	start_txqs(netdev);
+	netif_tx_start_all_queues(netdev);
+
+	/* Ready for link status updates */
+	lio->intf_open = 1;
+
+	netif_info(lio, ifup, lio->netdev, "Interface Open, ready for traffic\n");
 
 	/* tell Octeon to start forwarding packets to host */
 	send_rx_ctrl_cmd(lio, 1);
@@ -2052,23 +1889,17 @@ static int liquidio_stop(struct net_device *netdev)
 	struct octeon_device *oct = lio->oct_dev;
 	struct napi_struct *napi, *n;
 
-	if (oct->props[lio->ifidx].napi_enabled) {
-		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
-			napi_disable(napi);
-
-		oct->props[lio->ifidx].napi_enabled = 0;
-
-		if (OCTEON_CN23XX_PF(oct))
-			oct->droq[0]->ops.poll_mode = 0;
-	}
-
 	ifstate_reset(lio, LIO_IFSTATE_RUNNING);
 
-	netif_tx_disable(netdev);
+	/* Stop any link updates */
+	lio->intf_open = 0;
+
+	stop_txqs(netdev);
 
 	/* Inform that netif carrier is down */
 	netif_carrier_off(netdev);
-	lio->intf_open = 0;
+	netif_tx_disable(netdev);
+
 	lio->linfo.link.s.link_up = 0;
 	lio->link_changes++;
 
@@ -2085,6 +1916,21 @@ static int liquidio_stop(struct net_device *netdev)
 	if (lio->ptp_clock) {
 		ptp_clock_unregister(lio->ptp_clock);
 		lio->ptp_clock = NULL;
+	}
+
+	/* Wait for any pending Rx descriptors */
+	if (lio_wait_for_clean_oq(oct))
+		netif_info(lio, rx_err, lio->netdev,
+			   "Proceeding with stop interface after partial RX desc processing\n");
+
+	if (oct->props[lio->ifidx].napi_enabled == 1) {
+		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
+			napi_disable(napi);
+
+		oct->props[lio->ifidx].napi_enabled = 0;
+
+		if (OCTEON_CN23XX_PF(oct))
+			oct->droq[0]->ops.poll_mode = 0;
 	}
 
 	dev_info(&oct->pci_dev->dev, "%s interface is stopped\n", netdev->name);
@@ -2215,14 +2061,11 @@ static int liquidio_set_mac(struct net_device *netdev, void *p)
 	return 0;
 }
 
-/**
- * \brief Net device get_stats
- * @param netdev network device
- */
-static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+static void
+liquidio_get_stats64(struct net_device *netdev,
+		     struct rtnl_link_stats64 *lstats)
 {
 	struct lio *lio = GET_LIO(netdev);
-	struct net_device_stats *stats = &netdev->stats;
 	struct octeon_device *oct;
 	u64 pkts = 0, drop = 0, bytes = 0;
 	struct oct_droq_stats *oq_stats;
@@ -2232,7 +2075,7 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
 	oct = lio->oct_dev;
 
 	if (ifstate_check(lio, LIO_IFSTATE_RESETTING))
-		return stats;
+		return;
 
 	for (i = 0; i < oct->num_iqs; i++) {
 		iq_no = lio->linfo.txpciq[i].s.q_no;
@@ -2242,9 +2085,9 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
 		bytes += iq_stats->tx_tot_bytes;
 	}
 
-	stats->tx_packets = pkts;
-	stats->tx_bytes = bytes;
-	stats->tx_dropped = drop;
+	lstats->tx_packets = pkts;
+	lstats->tx_bytes = bytes;
+	lstats->tx_dropped = drop;
 
 	pkts = 0;
 	drop = 0;
@@ -2261,43 +2104,34 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
 		bytes += oq_stats->rx_bytes_received;
 	}
 
-	stats->rx_bytes = bytes;
-	stats->rx_packets = pkts;
-	stats->rx_dropped = drop;
+	lstats->rx_bytes = bytes;
+	lstats->rx_packets = pkts;
+	lstats->rx_dropped = drop;
 
-	return stats;
-}
+	octnet_get_link_stats(netdev);
+	lstats->multicast = oct->link_stats.fromwire.fw_total_mcast;
+	lstats->collisions = oct->link_stats.fromhost.total_collisions;
 
-/**
- * \brief Net device change_mtu
- * @param netdev network device
- */
-static int liquidio_change_mtu(struct net_device *netdev, int new_mtu)
-{
-	struct lio *lio = GET_LIO(netdev);
-	struct octeon_device *oct = lio->oct_dev;
-	struct octnic_ctrl_pkt nctrl;
-	int ret = 0;
+	/* detailed rx_errors: */
+	lstats->rx_length_errors = oct->link_stats.fromwire.l2_err;
+	/* recved pkt with crc error    */
+	lstats->rx_crc_errors = oct->link_stats.fromwire.fcs_err;
+	/* recv'd frame alignment error */
+	lstats->rx_frame_errors = oct->link_stats.fromwire.frame_err;
+	/* recv'r fifo overrun */
+	lstats->rx_fifo_errors = oct->link_stats.fromwire.fifo_err;
 
-	memset(&nctrl, 0, sizeof(struct octnic_ctrl_pkt));
+	lstats->rx_errors = lstats->rx_length_errors + lstats->rx_crc_errors +
+		lstats->rx_frame_errors + lstats->rx_fifo_errors;
 
-	nctrl.ncmd.u64 = 0;
-	nctrl.ncmd.s.cmd = OCTNET_CMD_CHANGE_MTU;
-	nctrl.ncmd.s.param1 = new_mtu;
-	nctrl.iq_no = lio->linfo.txpciq[0].s.q_no;
-	nctrl.wait_time = 100;
-	nctrl.netpndev = (u64)netdev;
-	nctrl.cb_fn = liquidio_link_ctrl_cmd_completion;
+	/* detailed tx_errors */
+	lstats->tx_aborted_errors = oct->link_stats.fromhost.fw_err_pko;
+	lstats->tx_carrier_errors = oct->link_stats.fromhost.fw_err_link;
+	lstats->tx_fifo_errors = oct->link_stats.fromhost.fifo_err;
 
-	ret = octnet_send_nic_ctrl_pkt(lio->oct_dev, &nctrl);
-	if (ret < 0) {
-		dev_err(&oct->pci_dev->dev, "Failed to set MTU\n");
-		return -1;
-	}
-
-	lio->mtu = new_mtu;
-
-	return 0;
+	lstats->tx_errors = lstats->tx_aborted_errors +
+		lstats->tx_carrier_errors +
+		lstats->tx_fifo_errors;
 }
 
 /**
@@ -2505,7 +2339,7 @@ static int liquidio_xmit(struct sk_buff *skb, struct net_device *netdev)
 	lio = GET_LIO(netdev);
 	oct = lio->oct_dev;
 
-	q_idx = skb_iq(lio, skb);
+	q_idx = skb_iq(oct, skb);
 	tag = q_idx;
 	iq_no = lio->linfo.txpciq[q_idx].s.q_no;
 
@@ -3097,7 +2931,117 @@ static int liquidio_get_vf_config(struct net_device *netdev, int vfidx,
 	ether_addr_copy(&ivi->mac[0], macaddr);
 	ivi->vlan = oct->sriov_info.vf_vlantci[vfidx] & VLAN_VID_MASK;
 	ivi->qos = oct->sriov_info.vf_vlantci[vfidx] >> VLAN_PRIO_SHIFT;
+	if (oct->sriov_info.trusted_vf.active &&
+	    oct->sriov_info.trusted_vf.id == vfidx)
+		ivi->trusted = true;
+	else
+		ivi->trusted = false;
 	ivi->linkstate = oct->sriov_info.vf_linkstate[vfidx];
+	return 0;
+}
+
+static void trusted_vf_callback(struct octeon_device *oct_dev,
+				u32 status, void *ptr)
+{
+	struct octeon_soft_command *sc = (struct octeon_soft_command *)ptr;
+	struct lio_trusted_vf_ctx *ctx;
+
+	ctx = (struct lio_trusted_vf_ctx *)sc->ctxptr;
+	ctx->status = status;
+
+	complete(&ctx->complete);
+}
+
+static int liquidio_send_vf_trust_cmd(struct lio *lio, int vfidx, bool trusted)
+{
+	struct octeon_device *oct = lio->oct_dev;
+	struct lio_trusted_vf_ctx *ctx;
+	struct octeon_soft_command *sc;
+	int ctx_size, retval;
+
+	ctx_size = sizeof(struct lio_trusted_vf_ctx);
+	sc = octeon_alloc_soft_command(oct, 0, 0, ctx_size);
+
+	ctx  = (struct lio_trusted_vf_ctx *)sc->ctxptr;
+	init_completion(&ctx->complete);
+
+	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
+
+	/* vfidx is 0 based, but vf_num (param1) is 1 based */
+	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
+				    OPCODE_NIC_SET_TRUSTED_VF, 0, vfidx + 1,
+				    trusted);
+
+	sc->callback = trusted_vf_callback;
+	sc->callback_arg = sc;
+	sc->wait_time = 1000;
+
+	retval = octeon_send_soft_command(oct, sc);
+	if (retval == IQ_SEND_FAILED) {
+		retval = -1;
+	} else {
+		/* Wait for response or timeout */
+		if (wait_for_completion_timeout(&ctx->complete,
+						msecs_to_jiffies(2000)))
+			retval = ctx->status;
+		else
+			retval = -1;
+	}
+
+	octeon_free_soft_command(oct, sc);
+
+	return retval;
+}
+
+static int liquidio_set_vf_trust(struct net_device *netdev, int vfidx,
+				 bool setting)
+{
+	struct lio *lio = GET_LIO(netdev);
+	struct octeon_device *oct = lio->oct_dev;
+
+	if (strcmp(oct->fw_info.liquidio_firmware_version, "1.7.1") < 0) {
+		/* trusted vf is not supported by firmware older than 1.7.1 */
+		return -EOPNOTSUPP;
+	}
+
+	if (vfidx < 0 || vfidx >= oct->sriov_info.num_vfs_alloced) {
+		netif_info(lio, drv, lio->netdev, "Invalid vfidx %d\n", vfidx);
+		return -EINVAL;
+	}
+
+	if (setting) {
+		/* Set */
+
+		if (oct->sriov_info.trusted_vf.active &&
+		    oct->sriov_info.trusted_vf.id == vfidx)
+			return 0;
+
+		if (oct->sriov_info.trusted_vf.active) {
+			netif_info(lio, drv, lio->netdev, "More than one trusted VF is not allowed\n");
+			return -EPERM;
+		}
+	} else {
+		/* Clear */
+
+		if (!oct->sriov_info.trusted_vf.active)
+			return 0;
+	}
+
+	if (!liquidio_send_vf_trust_cmd(lio, vfidx, setting)) {
+		if (setting) {
+			oct->sriov_info.trusted_vf.id = vfidx;
+			oct->sriov_info.trusted_vf.active = true;
+		} else {
+			oct->sriov_info.trusted_vf.active = false;
+		}
+
+		netif_info(lio, drv, lio->netdev, "VF %u is %strusted\n", vfidx,
+			   setting ? "" : "not ");
+	} else {
+		netif_info(lio, drv, lio->netdev, "Failed to set VF trusted\n");
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -3241,7 +3185,7 @@ static const struct net_device_ops lionetdevops = {
 	.ndo_open		= liquidio_open,
 	.ndo_stop		= liquidio_stop,
 	.ndo_start_xmit		= liquidio_xmit,
-	.ndo_get_stats		= liquidio_get_stats,
+	.ndo_get_stats64	= liquidio_get_stats64,
 	.ndo_set_mac_address	= liquidio_set_mac,
 	.ndo_set_rx_mode	= liquidio_set_mcast_list,
 	.ndo_tx_timeout		= liquidio_tx_timeout,
@@ -3257,6 +3201,7 @@ static const struct net_device_ops lionetdevops = {
 	.ndo_set_vf_mac		= liquidio_set_vf_mac,
 	.extended.ndo_set_vf_vlan	= liquidio_set_vf_vlan,
 	.ndo_get_vf_config	= liquidio_get_vf_config,
+	.extended.ndo_set_vf_trust	= liquidio_set_vf_trust,
 	.ndo_set_vf_link_state  = liquidio_set_vf_link_state,
 	.ndo_get_vf_stats	= liquidio_get_vf_stats,
 };
@@ -3361,6 +3306,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 	struct liquidio_if_cfg_resp *resp;
 	struct octdev_props *props;
 	int retval, num_iqueues, num_oqueues;
+	int max_num_queues = 0;
 	union oct_nic_if_cfg if_cfg;
 	unsigned int base_queue;
 	unsigned int gmx_port_id;
@@ -3441,9 +3387,9 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 					    OPCODE_NIC_IF_CFG, 0,
 					    if_cfg.u64, 0);
 
-		sc->callback = if_cfg_callback;
+		sc->callback = lio_if_cfg_callback;
 		sc->callback_arg = sc;
-		sc->wait_time = 3000;
+		sc->wait_time = LIO_IFCFG_WAIT_TIME;
 
 		retval = octeon_send_soft_command(octeon_dev, sc);
 		if (retval == IQ_SEND_FAILED) {
@@ -3497,11 +3443,20 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 				resp->cfg_info.oqmask);
 			goto setup_nic_dev_fail;
 		}
+
+		if (OCTEON_CN6XXX(octeon_dev)) {
+			max_num_queues = CFG_GET_IQ_MAX_Q(CHIP_CONF(octeon_dev,
+								    cn6xxx));
+		} else if (OCTEON_CN23XX_PF(octeon_dev)) {
+			max_num_queues = CFG_GET_IQ_MAX_Q(CHIP_CONF(octeon_dev,
+								    cn23xx_pf));
+		}
+
 		dev_dbg(&octeon_dev->pci_dev->dev,
-			"interface %d, iqmask %016llx, oqmask %016llx, numiqueues %d, numoqueues %d\n",
+			"interface %d, iqmask %016llx, oqmask %016llx, numiqueues %d, numoqueues %d max_num_queues: %d\n",
 			i, resp->cfg_info.iqmask, resp->cfg_info.oqmask,
-			num_iqueues, num_oqueues);
-		netdev = alloc_etherdev_mq(LIO_SIZE, num_iqueues);
+			num_iqueues, num_oqueues, max_num_queues);
+		netdev = alloc_etherdev_mq(LIO_SIZE, max_num_queues);
 
 		if (!netdev) {
 			dev_err(&octeon_dev->pci_dev->dev, "Device allocation failed\n");
@@ -3515,6 +3470,20 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 		 */
 		netdev->netdev_ops = &lionetdevops;
 		SWITCHDEV_SET_OPS(netdev, &lio_pf_switchdev_ops);
+
+		retval = netif_set_real_num_rx_queues(netdev, num_oqueues);
+		if (retval) {
+			dev_err(&octeon_dev->pci_dev->dev,
+				"setting real number rx failed\n");
+			goto setup_nic_dev_fail;
+		}
+
+		retval = netif_set_real_num_tx_queues(netdev, num_iqueues);
+		if (retval) {
+			dev_err(&octeon_dev->pci_dev->dev,
+				"setting real number tx failed\n");
+			goto setup_nic_dev_fail;
+		}
 
 		lio = GET_LIO(netdev);
 
@@ -3637,7 +3606,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 		lio->tx_qsize = octeon_get_tx_qsize(octeon_dev, lio->txq);
 		lio->rx_qsize = octeon_get_rx_qsize(octeon_dev, lio->rxq);
 
-		if (setup_glists(octeon_dev, lio, num_iqueues)) {
+		if (lio_setup_glists(octeon_dev, lio, num_iqueues)) {
 			dev_err(&octeon_dev->pci_dev->dev,
 				"Gather list allocation failed\n");
 			goto setup_nic_dev_fail;
@@ -3699,6 +3668,23 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 			"NIC ifidx:%d Setup successful\n", i);
 
 		octeon_free_soft_command(octeon_dev, sc);
+
+		if (octeon_dev->subsystem_id ==
+			OCTEON_CN2350_25GB_SUBSYS_ID ||
+		    octeon_dev->subsystem_id ==
+			OCTEON_CN2360_25GB_SUBSYS_ID) {
+			liquidio_get_speed(lio);
+
+			if (octeon_dev->speed_setting == 0) {
+				octeon_dev->speed_setting = 25;
+				octeon_dev->no_speed_setting = 1;
+			}
+		} else {
+			octeon_dev->no_speed_setting = 1;
+			octeon_dev->speed_setting = 10;
+		}
+		octeon_dev->speed_boot = octeon_dev->speed_setting;
+
 	}
 
 	devlink = devlink_alloc(&liquidio_devlink_ops,
@@ -4136,7 +4122,9 @@ static int octeon_device_init(struct octeon_device *octeon_dev)
 		}
 		atomic_set(&octeon_dev->status, OCT_DEV_MBOX_SETUP_DONE);
 
-		if (octeon_allocate_ioq_vector(octeon_dev)) {
+		if (octeon_allocate_ioq_vector
+				(octeon_dev,
+				 octeon_dev->sriov_info.num_pf_rings)) {
 			dev_err(&octeon_dev->pci_dev->dev, "OCTEON: ioq vector allocation failed\n");
 			return 1;
 		}

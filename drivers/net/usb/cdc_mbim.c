@@ -101,6 +101,7 @@ static const struct net_device_ops cdc_mbim_netdev_ops = {
 	.ndo_start_xmit       = usbnet_start_xmit,
 	.ndo_tx_timeout       = usbnet_tx_timeout,
 	.ndo_change_mtu_rh74  = cdc_ncm_change_mtu,
+	.ndo_get_stats64      = usbnet_get_stats64,
 	.ndo_set_mac_address  = eth_mac_addr,
 	.ndo_validate_addr    = eth_validate_addr,
 	.ndo_vlan_rx_add_vid  = cdc_mbim_rx_add_vid,
@@ -398,7 +399,7 @@ static struct sk_buff *cdc_mbim_process_dgram(struct usbnet *dev, u8 *buf, size_
 	memcpy(eth_hdr(skb)->h_dest, dev->net->dev_addr, ETH_ALEN);
 
 	/* add datagram */
-	memcpy(skb_put(skb, len), buf, len);
+	skb_put_data(skb, buf, len);
 
 	/* map MBIM session to VLAN */
 	if (tci)

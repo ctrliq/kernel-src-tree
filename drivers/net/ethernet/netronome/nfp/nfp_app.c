@@ -31,6 +31,8 @@
  * SOFTWARE.
  */
 
+#undef CONFIG_BPF_SYSCALL
+
 #include <linux/bug.h>
 #include <linux/lockdep.h>
 #include <linux/rcupdate.h>

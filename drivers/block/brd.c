@@ -22,6 +22,7 @@
 #ifdef CONFIG_BLK_DEV_RAM_DAX
 #include <linux/pfn_t.h>
 #include <linux/dax.h>
+#include <linux/socket.h> /* memcpy_fromiovecend_partial */
 #endif
 
 #include <asm/uaccess.h>
@@ -401,8 +402,16 @@ static long brd_dax_direct_access(struct dax_device *dax_dev,
 	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
 }
 
+static int brd_dax_memcpy_fromiovecend(struct dax_device *dax_dev,
+		pgoff_t pgoff, void *addr, const struct iovec *iov,
+		int offset, int len)
+{
+	return memcpy_fromiovecend_partial_flushcache(addr, iov, offset, len);
+}
+
 static const struct dax_operations brd_dax_ops = {
 	.direct_access = brd_dax_direct_access,
+	.memcpy_fromiovecend = brd_dax_memcpy_fromiovecend,
 };
 #endif
 

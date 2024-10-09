@@ -1574,8 +1574,6 @@ module_param(rcu_idle_gp_delay, int, 0644);
 static int rcu_idle_lazy_gp_delay = RCU_IDLE_LAZY_GP_DELAY;
 module_param(rcu_idle_lazy_gp_delay, int, 0644);
 
-extern int tick_nohz_active;
-
 /*
  * Try to advance callbacks for all flavors of RCU on the current CPU.
  * Afterwards, if there are any callbacks ready for immediate invocation,

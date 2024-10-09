@@ -757,6 +757,7 @@ enum {
 	Opt_read_write,
 	Opt_lock_on_read,
 	Opt_exclusive,
+	Opt_notrim,
 	Opt_err
 };
 
@@ -771,6 +772,7 @@ static match_table_t rbd_opts_tokens = {
 	{Opt_read_write, "rw"},		/* Alternate spelling */
 	{Opt_lock_on_read, "lock_on_read"},
 	{Opt_exclusive, "exclusive"},
+	{Opt_notrim, "notrim"},
 	{Opt_err, NULL}
 };
 
@@ -780,6 +782,7 @@ struct rbd_options {
 	bool	read_only;
 	bool	lock_on_read;
 	bool	exclusive;
+	bool	trim;
 };
 
 #define RBD_QUEUE_DEPTH_DEFAULT	BLKDEV_MAX_RQ
@@ -787,6 +790,7 @@ struct rbd_options {
 #define RBD_READ_ONLY_DEFAULT	false
 #define RBD_LOCK_ON_READ_DEFAULT false
 #define RBD_EXCLUSIVE_DEFAULT	false
+#define RBD_TRIM_DEFAULT	true
 
 static int parse_rbd_opts_token(char *c, void *private)
 {
@@ -835,6 +839,9 @@ static int parse_rbd_opts_token(char *c, void *private)
 		break;
 	case Opt_exclusive:
 		rbd_opts->exclusive = true;
+		break;
+	case Opt_notrim:
+		rbd_opts->trim = false;
 		break;
 	default:
 		/* libceph prints "bad option" msg */
@@ -996,11 +1003,12 @@ static void rbd_init_layout(struct rbd_device *rbd_dev)
 		rbd_dev->header.stripe_count = 1;
 	}
 
-	rbd_dev->layout.fl_stripe_unit = rbd_dev->header.stripe_unit;
-	rbd_dev->layout.fl_stripe_count = rbd_dev->header.stripe_count;
-	rbd_dev->layout.fl_object_size = rbd_obj_bytes(&rbd_dev->header);
-	rbd_dev->layout.fl_pg_pool = rbd_dev->header.data_pool_id == CEPH_NOPOOL ?
+	rbd_dev->layout.stripe_unit = rbd_dev->header.stripe_unit;
+	rbd_dev->layout.stripe_count = rbd_dev->header.stripe_count;
+	rbd_dev->layout.object_size = rbd_obj_bytes(&rbd_dev->header);
+	rbd_dev->layout.pool_id = rbd_dev->header.data_pool_id == CEPH_NOPOOL ?
 			  rbd_dev->spec->pool_id : rbd_dev->header.data_pool_id;
+	RCU_INIT_POINTER(rbd_dev->layout.pool_ns, NULL);
 }
 
 /*
@@ -2001,7 +2009,7 @@ __rbd_osd_req_create(struct rbd_device *rbd_dev,
 	req->r_callback = rbd_osd_req_callback;
 	req->r_priv = obj_request;
 
-	req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+	req->r_base_oloc.pool = rbd_dev->layout.pool_id;
 	if (ceph_oid_aprintf(&req->r_base_oid, GFP_NOIO, name_format,
 			rbd_dev->header.object_prefix, obj_request->object_no))
 		goto err_req;
@@ -4451,9 +4459,8 @@ out:
 	return ret;
 }
 
-static int rbd_init_request(void *data, struct request *rq,
-		unsigned int hctx_idx, unsigned int request_idx,
-		unsigned int numa_node)
+static int rbd_init_request(struct blk_mq_tag_set *set, struct request *rq,
+		unsigned int hctx_idx, unsigned int numa_node)
 {
 	struct work_struct *work = blk_mq_rq_to_pdu(rq);
 
@@ -4519,12 +4526,12 @@ static int rbd_init_disk(struct rbd_device *rbd_dev)
 	blk_queue_io_min(q, segment_size);
 	blk_queue_io_opt(q, segment_size);
 
-	/* enable the discard support */
-	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
-	q->limits.discard_granularity = segment_size;
-	q->limits.discard_alignment = segment_size;
-	q->limits.max_discard_sectors = segment_size / SECTOR_SIZE;
-	q->limits.discard_zeroes_data = 1;
+	if (rbd_dev->opts->trim) {
+		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
+		q->limits.discard_granularity = segment_size;
+		q->limits.max_discard_sectors = segment_size / SECTOR_SIZE;
+		q->limits.discard_zeroes_data = 1;
+	}
 
 	blk_queue_merge_bvec(q, rbd_merge_bvec);
 
@@ -4840,6 +4847,7 @@ static void rbd_dev_free(struct rbd_device *rbd_dev)
 	WARN_ON(rbd_dev->lock_state != RBD_LOCK_STATE_UNLOCKED);
 
 	ceph_oid_destroy(&rbd_dev->header_oid);
+	ceph_oloc_destroy(&rbd_dev->header_oloc);
 	kfree(rbd_dev->config_info);
 
 	rbd_put_client(rbd_dev->rbd_client);
@@ -5777,6 +5785,7 @@ static int rbd_add_parse_args(const char *buf,
 	rbd_opts->lock_timeout = RBD_LOCK_TIMEOUT_DEFAULT;
 	rbd_opts->lock_on_read = RBD_LOCK_ON_READ_DEFAULT;
 	rbd_opts->exclusive = RBD_EXCLUSIVE_DEFAULT;
+	rbd_opts->trim = RBD_TRIM_DEFAULT;
 
 	copts = ceph_parse_options(options, mon_addrs,
 					mon_addrs + mon_addrs_size - 1,

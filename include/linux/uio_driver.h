@@ -14,6 +14,7 @@
 #ifndef _UIO_DRIVER_H_
 #define _UIO_DRIVER_H_
 
+#include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 
@@ -65,13 +66,14 @@ struct uio_port {
 
 struct uio_device {
 	struct module           *owner;
-	struct device           *dev;
+	struct device           dev;
 	int                     minor;
 	atomic_t                event;
 	struct fasync_struct    *async_queue;
 	wait_queue_head_t       wait;
 	int                     vma_count;
 	struct uio_info         *info;
+	struct mutex		info_lock;
 	struct kobject          *map_dir;
 	struct kobject          *portio_dir;
 };

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NVKM_FIFO_PRIV_H__
 #define __NVKM_FIFO_PRIV_H__
 #define nvkm_fifo(p) container_of((p), struct nvkm_fifo, engine)
@@ -17,6 +18,7 @@ struct nvkm_fifo_chan_oclass;
 struct nvkm_fifo_func {
 	void *(*dtor)(struct nvkm_fifo *);
 	int (*oneinit)(struct nvkm_fifo *);
+	int (*info)(struct nvkm_fifo *, u64 mthd, u64 *data);
 	void (*init)(struct nvkm_fifo *);
 	void (*fini)(struct nvkm_fifo *);
 	void (*intr)(struct nvkm_fifo *);

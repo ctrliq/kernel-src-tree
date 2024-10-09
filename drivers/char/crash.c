@@ -66,6 +66,7 @@ crash_read(struct file *file, char *buf, size_t count, loff_t *poff)
 	struct page *page;
 	u64 offset;
 	ssize_t read;
+	char *buffer = file->private_data;
 
 	offset = *poff;
 	if (offset >> PAGE_SHIFT != (offset+count-1) >> PAGE_SHIFT) 
@@ -74,8 +75,15 @@ crash_read(struct file *file, char *buf, size_t count, loff_t *poff)
 	vaddr = map_virtual(offset, &page);
 	if (!vaddr)
 		return -EFAULT;
-
-	if (copy_to_user(buf, vaddr, count)) {
+	/*
+	 * Use bounce buffer to bypass the CONFIG_HARDENED_USERCOPY
+	 * kernel text restriction.
+ 	 */
+	if (probe_kernel_read(buffer, vaddr, count)) {
+		unmap_virtual(page);
+		return -EFAULT;
+	}
+	if (copy_to_user(buf, buffer, count)) {
 		unmap_virtual(page);
 		return -EFAULT;
 	}
@@ -89,7 +97,21 @@ crash_read(struct file *file, char *buf, size_t count, loff_t *poff)
 static int 
 crash_open(struct inode * inode, struct file * filp)
 {
-        return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+
+	filp->private_data = (void *)__get_free_page(GFP_KERNEL);
+	if (!filp->private_data)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int
+crash_release(struct inode *inode, struct file *filp)
+{
+	free_pages((unsigned long)filp->private_data, 0);
+	return 0;
 }
 
 static struct file_operations crash_fops = {
@@ -97,6 +119,7 @@ static struct file_operations crash_fops = {
 	.llseek = crash_llseek,
 	.read = crash_read,
 	.open = crash_open,
+	.release = crash_release,
 };
 
 static struct miscdevice crash_dev = {

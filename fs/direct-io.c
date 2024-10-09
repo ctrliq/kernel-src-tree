@@ -244,9 +244,8 @@ static void dio_iodone_helper(struct dio *dio, loff_t offset,
 static void dio_iodone2_helper(struct dio *dio, loff_t offset,
 			       ssize_t transferred, ssize_t ret, bool is_async)
 {
-	if (dio->end_io && dio->result)
-		dio->end_io(dio->iocb, offset,
-				transferred, dio->private, ret, is_async);
+	if (dio->end_io)
+		dio->end_io(dio->iocb, offset, ret, dio->private, 0, 0);
 
 	if (!(dio->flags & DIO_SKIP_DIO_COUNT))
 		inode_dio_end(dio->inode);

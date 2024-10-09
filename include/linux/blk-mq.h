@@ -87,6 +87,7 @@ struct blk_mq_hw_ctx {
 	RH_KABI_EXTEND(struct dentry		*debugfs_dir)
 	RH_KABI_EXTEND(struct dentry		*sched_debugfs_dir)
 #endif
+	RH_KABI_EXTEND(int			dispatch_busy)
 };
 
 #ifdef __GENKSYMS__
@@ -102,7 +103,7 @@ struct blk_mq_reg {
 };
 #else
 struct blk_mq_tag_set {
-	struct blk_mq_ops	*ops;
+	RH_KABI_CONST struct blk_mq_ops  *ops;
 	unsigned int		nr_hw_queues;
 	unsigned int		queue_depth;	/* max hw supported */
 	unsigned int		reserved_tags;
@@ -154,9 +155,9 @@ typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
 typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
 typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
 typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
-typedef int (init_request_fn)(void *, struct request *, unsigned int,
+typedef int (init_request_fn)(struct blk_mq_tag_set *set, struct request *,
 		unsigned int, unsigned int);
-typedef void (exit_request_fn)(void *, struct request *, unsigned int,
+typedef void (exit_request_fn)(struct blk_mq_tag_set *set, struct request *,
 		unsigned int);
 typedef int (reinit_request_fn)(void *, struct request *);
 
@@ -233,6 +234,24 @@ enum {
 	BLK_MQ_RQ_QUEUE_OK	= 0,	/* queued fine */
 	BLK_MQ_RQ_QUEUE_BUSY	= 1,	/* requeue IO for later */
 	BLK_MQ_RQ_QUEUE_ERROR	= 2,	/* end IO with error */
+
+	/*
+	 * BLK_MQ_RQ_QUEUE_DEV_BUSY is returned from the driver to the block layer if
+	 * device related resources are unavailable, but the driver can guarantee
+	 * that the queue will be rerun in the future once resources become
+	 * available again. This is typically the case for device specific
+	 * resources that are consumed for IO. If the driver fails allocating these
+	 * resources, we know that inflight (or pending) IO will free these
+	 * resource upon completion.
+	 *
+	 * This is different from BLK_MQ_RQ_QUEUE_BUSY in that it explicitly references
+	 * a device specific resource. For resources of wider scope, allocation
+	 * failure can happen without having pending IO. This means that we can't
+	 * rely on request completions freeing these resources, as IO may not be in
+	 * flight. Examples of that are kernel memory allocations, DMA mappings, or
+	 * any other system wide resources.
+	 */
+	BLK_MQ_RQ_QUEUE_DEV_BUSY	= 3,
 
 	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
 	BLK_MQ_F_SHOULD_SORT	= 1 << 1,
@@ -328,7 +347,6 @@ void blk_mq_unquiesce_queue(struct request_queue *q);
 void blk_mq_delay_run_hw_queue(struct blk_mq_hw_ctx *hctx, unsigned long msecs);
 bool blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async);
 void blk_mq_run_hw_queues(struct request_queue *q, bool async);
-void blk_mq_delay_queue(struct blk_mq_hw_ctx *hctx, unsigned long msecs);
 void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
 		busy_tag_iter_fn *fn, void *priv);
 void blk_mq_freeze_queue(struct request_queue *q);
@@ -341,13 +359,7 @@ int blk_mq_reinit_tagset(struct blk_mq_tag_set *set);
 
 void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues);
 
-/*
- * FIXME: this helper is just for working around mpt3sas.
- */
-static inline void blk_mq_quiesce_queue_nowait(struct request_queue *q)
-{
-	blk_mq_stop_hw_queues(q);
-}
+void blk_mq_quiesce_queue_nowait(struct request_queue *q);
 
 /*
  * Driver command data is immediately after the request. So subtract request

@@ -1276,6 +1276,7 @@ static bool mp_eq_to_hgt(struct metapath *mp, __u16 *nbof, unsigned int h)
 static int trunc_dealloc(struct gfs2_inode *ip, u64 newsize)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+	const u64 *arr = sdp->sd_heightsize;
 	struct metapath mp;
 	struct buffer_head *dibh, *bh;
 	struct gfs2_holder rd_gh;
@@ -1294,6 +1295,13 @@ static int trunc_dealloc(struct gfs2_inode *ip, u64 newsize)
 	else
 		lblock = (newsize - 1) >> sdp->sd_sb.sb_bsize_shift;
 
+	if ((lblock + 1) * sdp->sd_sb.sb_bsize > arr[ip->i_height]) {
+		/*
+		 * The truncate point lies beyond the allocated meta-data;
+		 * there is nothing to truncate.
+		 */
+		return 0;
+	}
 	memset(&mp, 0, sizeof(mp));
 	find_metapath(sdp, lblock, &mp, ip->i_height);
 

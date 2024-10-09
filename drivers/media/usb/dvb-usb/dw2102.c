@@ -1707,11 +1707,12 @@ static int dw2102_load_firmware(struct usb_device *dev,
 			dw2104_properties.rc.legacy.rc_map_table = rc_map_tevii_table;
 			dw2104_properties.rc.legacy.rc_map_size =
 					ARRAY_SIZE(rc_map_tevii_table);
+			/* fall through */
 		case USB_PID_DW2104:
 			reset = 1;
 			dw210x_op_rw(dev, 0xc4, 0x0000, 0, &reset, 1,
 					DW210X_WRITE_MSG);
-			/* break omitted intentionally */
+			/* fall through */
 		case USB_PID_DW3101:
 			reset = 0;
 			dw210x_op_rw(dev, 0xbf, 0x0040, 0, &reset, 0,
@@ -1744,6 +1745,7 @@ static int dw2102_load_firmware(struct usb_device *dev,
 					break;
 				}
 			}
+			/* fall through */
 		case 0x2101:
 			dw210x_op_rw(dev, 0xbc, 0x0030, 0, &reset16[0], 2,
 					DW210X_READ_MSG);

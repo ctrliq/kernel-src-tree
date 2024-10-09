@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Thunderbolt Cactus Ridge driver - switch/port utility functions
  *
@@ -171,11 +172,11 @@ static int nvm_authenticate_host(struct tb_switch *sw)
 
 	/*
 	 * Root switch NVM upgrade requires that we disconnect the
-	 * existing PCIe paths first (in case it is not in safe mode
+	 * existing paths first (in case it is not in safe mode
 	 * already).
 	 */
 	if (!sw->safe_mode) {
-		ret = tb_domain_disconnect_pcie_paths(sw->tb);
+		ret = tb_domain_disconnect_all_paths(sw->tb);
 		if (ret)
 			return ret;
 		/*
@@ -774,6 +775,15 @@ static ssize_t authorized_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(authorized);
 
+static ssize_t boot_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+
+	return sprintf(buf, "%u\n", sw->boot);
+}
+static DEVICE_ATTR_RO(boot);
+
 static ssize_t device_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -950,6 +960,7 @@ static DEVICE_ATTR_RO(unique_id);
 
 static struct attribute *switch_attrs[] = {
 	&dev_attr_authorized.attr,
+	&dev_attr_boot.attr,
 	&dev_attr_device.attr,
 	&dev_attr_device_name.attr,
 	&dev_attr_key.attr,
@@ -976,6 +987,10 @@ static umode_t switch_attr_is_visible(struct kobject *kobj,
 	} else if (attr == &dev_attr_nvm_authenticate.attr ||
 		   attr == &dev_attr_nvm_version.attr) {
 		if (sw->dma_port)
+			return attr->mode;
+		return 0;
+	} else if (attr == &dev_attr_boot.attr) {
+		if (tb_route(sw))
 			return attr->mode;
 		return 0;
 	}
@@ -1036,6 +1051,9 @@ static int tb_switch_get_generation(struct tb_switch *sw)
 	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_4C_BRIDGE:
 	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_2C_BRIDGE:
 	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_4C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_TITAN_RIDGE_2C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_TITAN_RIDGE_4C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_TITAN_RIDGE_DD_BRIDGE:
 		return 3;
 
 	default:
@@ -1103,10 +1121,6 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, struct device *parent,
 	}
 
 	sw->generation = tb_switch_get_generation(sw);
-	if (sw->generation >= 3) {
-		mark_tech_preview("Thunderbolt 3", THIS_MODULE);
-	}
-	tb_sw_info(sw, "Thunderbolt HW version detected: %d\n", sw->generation);
 
 	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_PLUG_EVENTS);
 	if (cap < 0) {
@@ -1376,6 +1390,9 @@ void tb_switch_remove(struct tb_switch *sw)
 		if (sw->ports[i].remote)
 			tb_switch_remove(sw->ports[i].remote->sw);
 		sw->ports[i].remote = NULL;
+		if (sw->ports[i].xdomain)
+			tb_xdomain_remove(sw->ports[i].xdomain);
+		sw->ports[i].xdomain = NULL;
 	}
 
 	if (!sw->is_unplugged)
@@ -1479,6 +1496,7 @@ struct tb_sw_lookup {
 	u8 link;
 	u8 depth;
 	const uuid_t *uuid;
+	u64 route;
 };
 
 static int tb_switch_match(struct device *dev, void *data)
@@ -1493,6 +1511,11 @@ static int tb_switch_match(struct device *dev, void *data)
 
 	if (lookup->uuid)
 		return !memcmp(sw->uuid, lookup->uuid, sizeof(*lookup->uuid));
+
+	if (lookup->route) {
+		return sw->config.route_lo == lower_32_bits(lookup->route) &&
+		       sw->config.route_hi == upper_32_bits(lookup->route);
+	}
 
 	/* Root switch is matched only by depth */
 	if (!lookup->depth)
@@ -1528,7 +1551,7 @@ struct tb_switch *tb_switch_find_by_link_depth(struct tb *tb, u8 link, u8 depth)
 }
 
 /**
- * tb_switch_find_by_link_depth() - Find switch by UUID
+ * tb_switch_find_by_uuid() - Find switch by UUID
  * @tb: Domain the switch belongs
  * @uuid: UUID to look for
  *
@@ -1543,6 +1566,33 @@ struct tb_switch *tb_switch_find_by_uuid(struct tb *tb, const uuid_t *uuid)
 	memset(&lookup, 0, sizeof(lookup));
 	lookup.tb = tb;
 	lookup.uuid = uuid;
+
+	dev = bus_find_device(&tb_bus_type, NULL, &lookup, tb_switch_match);
+	if (dev)
+		return tb_to_switch(dev);
+
+	return NULL;
+}
+
+/**
+ * tb_switch_find_by_route() - Find switch by route string
+ * @tb: Domain the switch belongs
+ * @route: Route string to look for
+ *
+ * Returned switch has reference count increased so the caller needs to
+ * call tb_switch_put() when done with the switch.
+ */
+struct tb_switch *tb_switch_find_by_route(struct tb *tb, u64 route)
+{
+	struct tb_sw_lookup lookup;
+	struct device *dev;
+
+	if (!route)
+		return tb_switch_get(tb->root_switch);
+
+	memset(&lookup, 0, sizeof(lookup));
+	lookup.tb = tb;
+	lookup.route = route;
 
 	dev = bus_find_device(&tb_bus_type, NULL, &lookup, tb_switch_match);
 	if (dev)

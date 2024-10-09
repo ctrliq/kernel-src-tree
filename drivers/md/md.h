@@ -374,6 +374,7 @@ struct mddev {
 #define MD_RECOVERY_RESHAPE	8
 #define	MD_RECOVERY_FROZEN	9
 #define	MD_RECOVERY_ERROR	10
+#define MD_RECOVERY_WAIT	11
 
 	unsigned long			recovery;
 	/* If a RAID personality determines that recovery (of a particular
@@ -476,6 +477,9 @@ struct mddev {
 	struct attribute_group		*to_remove;
 
 	struct bio_set			*bio_set;
+	struct bio_set			*sync_set; /* for sync operations like
+						   * metadata and bitmap writes
+						   */
 
 	/* Generic flush handling.
 	 * The last to finish preflush schedules a worker to submit
@@ -486,6 +490,9 @@ struct mddev {
 	struct work_struct flush_work;
 	struct work_struct event_work;	/* used by dm to report failure event */
 	void (*sync_super)(struct mddev *mddev, struct md_rdev *rdev);
+	unsigned int			good_device_nr;	/* good device num within cluster raid */
+
+	bool	has_superblocks:1;
 };
 
 static inline int __must_check mddev_lock(struct mddev *mddev)
@@ -519,7 +526,13 @@ struct md_personality
 	struct list_head list;
 	struct module *owner;
 	bool (*make_request)(struct mddev *mddev, struct bio *bio);
+	/*
+	 * start up works that do NOT require md_thread. tasks that
+	 * requires md_thread should go into start()
+	 */
 	int (*run)(struct mddev *mddev);
+	/* start up works that require md threads */
+	int (*start)(struct mddev *mddev);
 	void (*free)(struct mddev *mddev, void *priv);
 	void (*status)(struct seq_file *seq, struct mddev *mddev);
 	/* error_handler must set ->faulty and clear ->in_sync
@@ -535,12 +548,11 @@ struct md_personality
 	int (*check_reshape) (struct mddev *mddev);
 	int (*start_reshape) (struct mddev *mddev);
 	void (*finish_reshape) (struct mddev *mddev);
-	/* quiesce moves between quiescence states
-	 * 0 - fully active
-	 * 1 - no new requests allowed
-	 * others - reserved
+	/* quiesce suspends or resumes internal processing.
+	 * 1 - stop new actions and wait for action io to complete
+	 * 0 - return to normal behaviour
 	 */
-	void (*quiesce) (struct mddev *mddev, int state);
+	void (*quiesce) (struct mddev *mddev, int quiesce);
 	/* takeover is used to transition an array from one
 	 * personality to another.  The new personality must be able
 	 * to handle the data in the current layout.
@@ -682,6 +694,7 @@ extern int strict_strtoul_scaled(const char *cp, unsigned long *res, int scale);
 
 extern void mddev_init(struct mddev *mddev);
 extern int md_run(struct mddev *mddev);
+extern int md_start(struct mddev *mddev);
 extern void md_stop(struct mddev *mddev);
 extern void md_stop_writes(struct mddev *mddev);
 extern int md_rdev_init(struct md_rdev *rdev);
@@ -695,15 +708,9 @@ extern struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
 extern struct bio *bio_alloc_mddev(gfp_t gfp_mask, int nr_iovecs,
 				   struct mddev *mddev);
 
-extern void md_unplug(struct blk_plug_cb *cb, bool from_schedule);
 struct md_rdev *md_find_rdev_nr_rcu(struct mddev *mddev, int nr);
 extern void md_kick_rdev_from_array(struct md_rdev * rdev);
 extern void md_update_sb(struct mddev *mddev, int force);
-static inline int mddev_check_plugged(struct mddev *mddev)
-{
-	return !!blk_check_plugged(md_unplug, mddev,
-				   sizeof(struct blk_plug_cb));
-}
 
 static inline void rdev_dec_pending(struct md_rdev *rdev, struct mddev *mddev)
 {
@@ -720,4 +727,65 @@ static inline void mddev_clear_unsupported_flags(struct mddev *mddev,
 {
 	mddev->flags &= ~unsupported_flags;
 }
+
+static inline void mddev_check_writesame(struct mddev *mddev, struct bio *bio)
+{
+	if ((bio->bi_rw & REQ_WRITE_SAME) &&
+	    !bdev_get_queue(bio->bi_bdev)->limits.max_write_same_sectors)
+		mddev->queue->limits.max_write_same_sectors = 0;
+}
+
+/* Maximum size of each resync request */
+#define RESYNC_BLOCK_SIZE (64*1024)
+#define RESYNC_PAGES ((RESYNC_BLOCK_SIZE + PAGE_SIZE-1) / PAGE_SIZE)
+
+/* for managing resync I/O pages */
+struct resync_pages {
+	void		*raid_bio;
+	struct page	*pages[RESYNC_PAGES];
+};
+
+static inline int resync_alloc_pages(struct resync_pages *rp,
+				     gfp_t gfp_flags)
+{
+	int i;
+
+	for (i = 0; i < RESYNC_PAGES; i++) {
+		rp->pages[i] = alloc_page(gfp_flags);
+		if (!rp->pages[i])
+			goto out_free;
+	}
+
+	return 0;
+
+out_free:
+	while (--i >= 0)
+		put_page(rp->pages[i]);
+	return -ENOMEM;
+}
+
+static inline void resync_free_pages(struct resync_pages *rp)
+{
+	int i;
+
+	for (i = 0; i < RESYNC_PAGES; i++)
+		put_page(rp->pages[i]);
+}
+
+static inline void resync_get_all_pages(struct resync_pages *rp)
+{
+	int i;
+
+	for (i = 0; i < RESYNC_PAGES; i++)
+		get_page(rp->pages[i]);
+}
+
+static inline struct page *resync_fetch_page(struct resync_pages *rp,
+					     unsigned idx)
+{
+	if (WARN_ON_ONCE(idx >= RESYNC_PAGES))
+		return NULL;
+	return rp->pages[idx];
+}
+
 #endif /* _MD_MD_H */

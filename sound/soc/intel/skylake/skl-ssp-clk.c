@@ -270,7 +270,8 @@ static void unregister_parent_src_clk(struct skl_clk_parent *pclk,
 {
 	while (id--) {
 		clkdev_drop(pclk[id].lookup);
-		clk_hw_unregister_fixed_rate(pclk[id].hw);
+		if (pclk[id].hw)
+			clk_unregister(pclk[id].hw->clk);
 	}
 }
 
@@ -287,21 +288,23 @@ static int skl_register_parent_clks(struct device *dev,
 			struct skl_clk_parent_src *pclk)
 {
 	int i, ret;
+	struct clk *_clk;
 
 	for (i = 0; i < SKL_MAX_CLK_SRC; i++) {
 
 		/* Register Parent clock */
-		parent[i].hw = clk_hw_register_fixed_rate(dev, pclk[i].name,
+		_clk = clk_register_fixed_rate(dev, pclk[i].name,
 				pclk[i].parent_name, 0, pclk[i].rate);
-		if (IS_ERR(parent[i].hw)) {
-			ret = PTR_ERR(parent[i].hw);
+		if (IS_ERR(_clk)) {
+			ret = PTR_ERR(_clk);
 			goto err;
 		}
+		parent[i].hw = __clk_get_hw(_clk);
 
-		parent[i].lookup = clkdev_hw_create(parent[i].hw, pclk[i].name,
+		parent[i].lookup = clkdev_create(parent[i].hw->clk, pclk[i].name,
 									NULL);
 		if (!parent[i].lookup) {
-			clk_hw_unregister_fixed_rate(parent[i].hw);
+			clk_unregister(_clk);
 			ret = -ENOMEM;
 			goto err;
 		}
@@ -320,7 +323,7 @@ static struct skl_clk *register_skl_clk(struct device *dev,
 {
 	struct clk_init_data init;
 	struct skl_clk *clkdev;
-	int ret;
+	struct clk *_clk;
 
 	clkdev = devm_kzalloc(dev, sizeof(*clkdev), GFP_KERNEL);
 	if (!clkdev)
@@ -335,13 +338,11 @@ static struct skl_clk *register_skl_clk(struct device *dev,
 	clkdev->pdata = clk_pdata;
 
 	clkdev->id = id;
-	ret = devm_clk_hw_register(dev, &clkdev->hw);
-	if (ret) {
-		clkdev = ERR_PTR(ret);
-		return clkdev;
-	}
+	_clk = devm_clk_register(dev, &clkdev->hw);
+	if (IS_ERR(_clk))
+		return (void *)_clk;
 
-	clkdev->lookup = clkdev_hw_create(&clkdev->hw, init.name, NULL);
+	clkdev->lookup = clkdev_create(clkdev->hw.clk, init.name, NULL);
 	if (!clkdev->lookup)
 		clkdev = ERR_PTR(-ENOMEM);
 

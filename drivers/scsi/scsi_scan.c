@@ -354,6 +354,11 @@ static void scsi_target_dev_release(struct device *dev)
 	struct device *parent = dev->parent;
 	struct scsi_target *starget = to_scsi_target(dev);
 
+	/* undo scsi_alloc_target() call to device_initialize() */
+	if (dev->device_rh) {
+		kfree(dev->device_rh);
+		dev->device_rh = NULL;
+	}
 	kfree(starget);
 	put_device(parent);
 }

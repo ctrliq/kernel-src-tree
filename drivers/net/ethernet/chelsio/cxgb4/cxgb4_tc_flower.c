@@ -38,6 +38,7 @@
 #include <net/tc_act/tc_vlan.h>
 
 #include "cxgb4.h"
+#include "cxgb4_filter.h"
 #include "cxgb4_tc_flower.h"
 
 #define STATS_CHECK_PERIOD (HZ / 2)
@@ -296,8 +297,8 @@ static void offload_pedit(struct ch_filter_specification *fs, u32 val, u32 mask,
 			  u8 field)
 {
 	u32 set_val = val & ~mask;
-	u32 offset;
-	u8 size;
+	u32 offset = 0;
+	u8 size = 1;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(pedits); i++) {
@@ -412,9 +413,7 @@ static void cxgb4_process_flow_actions(struct net_device *in,
 		} else if (is_tcf_gact_shot(a)) {
 			fs->action = FILTER_DROP;
 		} else if (is_tcf_mirred_egress_redirect(a)) {
-			int ifindex = tcf_mirred_ifindex(a);
-			struct net_device *out = __dev_get_by_index(dev_net(in),
-								    ifindex);
+			struct net_device *out = tcf_mirred_dev(a);
 			struct port_info *pi = netdev_priv(out);
 
 			fs->action = FILTER_SWITCH;
@@ -589,14 +588,14 @@ static int cxgb4_validate_flow_actions(struct net_device *dev,
 			/* Do nothing */
 		} else if (is_tcf_mirred_egress_redirect(a)) {
 			struct adapter *adap = netdev2adap(dev);
-			struct net_device *n_dev;
-			unsigned int i, ifindex;
+			struct net_device *n_dev, *target_dev;
+			unsigned int i;
 			bool found = false;
 
-			ifindex = tcf_mirred_ifindex(a);
+			target_dev = tcf_mirred_dev(a);
 			for_each_port(adap, i) {
 				n_dev = adap->port[i];
-				if (ifindex == n_dev->ifindex) {
+				if (target_dev == n_dev) {
 					found = true;
 					break;
 				}
@@ -680,11 +679,16 @@ int cxgb4_tc_flower_replace(struct net_device *dev,
 	cxgb4_process_flow_match(dev, cls, fs);
 	cxgb4_process_flow_actions(dev, cls, fs);
 
-	fidx = cxgb4_get_free_ftid(dev, fs->type ? PF_INET6 : PF_INET);
-	if (fidx < 0) {
-		netdev_err(dev, "%s: No fidx for offload.\n", __func__);
-		ret = -ENOMEM;
-		goto free_entry;
+	fs->hash = is_filter_exact_match(adap, fs);
+	if (fs->hash) {
+		fidx = 0;
+	} else {
+		fidx = cxgb4_get_free_ftid(dev, fs->type ? PF_INET6 : PF_INET);
+		if (fidx < 0) {
+			netdev_err(dev, "%s: No fidx for offload.\n", __func__);
+			ret = -ENOMEM;
+			goto free_entry;
+		}
 	}
 
 	init_completion(&ctx.completion);
@@ -733,7 +737,7 @@ int cxgb4_tc_flower_destroy(struct net_device *dev,
 	if (!ch_flower)
 		return -ENOENT;
 
-	ret = cxgb4_del_filter(dev, ch_flower->filter_id);
+	ret = cxgb4_del_filter(dev, ch_flower->filter_id, &ch_flower->fs);
 	if (ret)
 		goto err;
 
@@ -744,9 +748,9 @@ err:
 	return ret;
 }
 
-static void ch_flower_stats_cb(unsigned long data)
+static void ch_flower_stats_cb(struct timer_list *t)
 {
-	struct adapter *adap = (struct adapter *)data;
+	struct adapter *adap = from_timer(adap, t, flower_stats_timer);
 	struct ch_tc_flower_entry *flower_entry;
 	struct ch_tc_flower_stats *ofld_stats;
 	unsigned int i;
@@ -820,8 +824,7 @@ err:
 void cxgb4_init_tc_flower(struct adapter *adap)
 {
 	hash_init(adap->flower_anymatch_tbl);
-	setup_timer(&adap->flower_stats_timer, ch_flower_stats_cb,
-		    (unsigned long)adap);
+	timer_setup(&adap->flower_stats_timer, ch_flower_stats_cb, 0);
 	mod_timer(&adap->flower_stats_timer, jiffies + STATS_CHECK_PERIOD);
 }
 

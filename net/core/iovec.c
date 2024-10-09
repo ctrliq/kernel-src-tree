@@ -120,6 +120,41 @@ int memcpy_toiovecend_partial(const struct iovec *iov, unsigned char *kdata,
 
 	return orig_len - len;
 }
+EXPORT_SYMBOL(memcpy_toiovecend_partial);
+
+#ifdef CONFIG_ARCH_HAS_UACCESS_MCSAFE
+static int copyout_mcsafe(void __user *to, const void *from, size_t n)
+{
+	if (access_ok(VERIFY_WRITE, to, n))
+		n = copy_to_user_mcsafe((__force void *) to, from, n);
+	return n;
+}
+
+int memcpy_toiovecend_partial_mcsafe(const struct iovec *iov,
+		unsigned char *kdata, int offset, int len)
+{
+	int copy, rem, orig_len = len;
+	for (; len > 0; ++iov) {
+		/* Skip over the finished iovecs */
+		if (unlikely(offset >= iov->iov_len)) {
+			offset -= iov->iov_len;
+			continue;
+		}
+		copy = min_t(unsigned int, iov->iov_len - offset, len);
+		rem = copyout_mcsafe(iov->iov_base + offset, kdata, copy);
+		if (rem != 0) {
+			copy -= rem;
+			return orig_len - len + copy;
+		}
+		offset = 0;
+		kdata += copy;
+		len -= copy;
+	}
+
+	return orig_len - len;
+}
+EXPORT_SYMBOL_GPL(memcpy_toiovecend_partial_mcsafe);
+#endif /* CONFIG_ARCH_HAS_UACCESS_MCSAFE */
 
 /*
  *	Copy iovec from kernel. Returns -EFAULT on error.

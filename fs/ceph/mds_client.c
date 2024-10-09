@@ -99,12 +99,35 @@ static int parse_reply_info_in(void **p, void *end,
 	} else
 		info->inline_version = CEPH_INLINE_NONE;
 
+	if (features & CEPH_FEATURE_MDS_QUOTA) {
+		u8 struct_v, struct_compat;
+		u32 struct_len;
+
+		/*
+		 * both struct_v and struct_compat are expected to be >= 1
+		 */
+		ceph_decode_8_safe(p, end, struct_v, bad);
+		ceph_decode_8_safe(p, end, struct_compat, bad);
+		if (!struct_v || !struct_compat)
+			goto bad;
+		ceph_decode_32_safe(p, end, struct_len, bad);
+		ceph_decode_need(p, end, struct_len, bad);
+		ceph_decode_64_safe(p, end, info->max_bytes, bad);
+		ceph_decode_64_safe(p, end, info->max_files, bad);
+	} else {
+		info->max_bytes = 0;
+		info->max_files = 0;
+	}
+
+	info->pool_ns_len = 0;
+	info->pool_ns_data = NULL;
 	if (features & CEPH_FEATURE_FS_FILE_LAYOUT_V2) {
 		ceph_decode_32_safe(p, end, info->pool_ns_len, bad);
-		ceph_decode_need(p, end, info->pool_ns_len, bad);
-		*p += info->pool_ns_len;
-	} else {
-		info->pool_ns_len = 0;
+		if (info->pool_ns_len > 0) {
+			ceph_decode_need(p, end, info->pool_ns_len, bad);
+			info->pool_ns_data = *p;
+			*p += info->pool_ns_len;
+		}
 	}
 
 	return 0;
@@ -380,7 +403,7 @@ static struct ceph_mds_session *get_session(struct ceph_mds_session *s)
 		     atomic_read(&s->s_ref)-1, atomic_read(&s->s_ref));
 		return s;
 	} else {
-		dout("mdsc get_session %p 0 -- FAIL", s);
+		dout("mdsc get_session %p 0 -- FAIL\n", s);
 		return NULL;
 	}
 }
@@ -1458,7 +1481,7 @@ static bool drop_negative_children(struct dentry *dentry)
 		goto out;
 
 	spin_lock(&dentry->d_lock);
-	list_for_each_entry(child, &dentry->d_subdirs, d_child) {
+	list_for_each_entry(child, &dentry->d_subdirs, d_u.d_child) {
 		if (d_really_is_positive(child)) {
 			all_negative = false;
 			break;
@@ -2383,14 +2406,6 @@ int ceph_mdsc_do_request(struct ceph_mds_client *mdsc,
 		ceph_get_cap_refs(ceph_inode(req->r_old_dentry_dir),
 				  CEPH_CAP_PIN);
 
-	/* deny access to directories with pool_ns layouts */
-	if (req->r_inode && S_ISDIR(req->r_inode->i_mode) &&
-	    ceph_inode(req->r_inode)->i_pool_ns_len)
-		return -EIO;
-	if (test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags) &&
-	    ceph_inode(req->r_parent)->i_pool_ns_len)
-		return -EIO;
-
 	/* issue */
 	mutex_lock(&mdsc->mutex);
 	__register_request(mdsc, req, dir);
@@ -2538,10 +2553,10 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
 	 * Otherwise we just have to return an ESTALE
 	 */
 	if (result == -ESTALE) {
-		dout("got ESTALE on request %llu", req->r_tid);
+		dout("got ESTALE on request %llu\n", req->r_tid);
 		req->r_resend_mds = -1;
 		if (req->r_direct_mode != USE_AUTH_MDS) {
-			dout("not using auth, setting for that now");
+			dout("not using auth, setting for that now\n");
 			req->r_direct_mode = USE_AUTH_MDS;
 			__do_request(mdsc, req);
 			mutex_unlock(&mdsc->mutex);
@@ -2549,13 +2564,13 @@ static void handle_reply(struct ceph_mds_session *session, struct ceph_msg *msg)
 		} else  {
 			int mds = __choose_mds(mdsc, req);
 			if (mds >= 0 && mds != req->r_session->s_mds) {
-				dout("but auth changed, so resending");
+				dout("but auth changed, so resending\n");
 				__do_request(mdsc, req);
 				mutex_unlock(&mdsc->mutex);
 				goto out;
 			}
 		}
-		dout("have to return ESTALE on request %llu", req->r_tid);
+		dout("have to return ESTALE on request %llu\n", req->r_tid);
 	}
 
 
@@ -3593,6 +3608,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	atomic_set(&mdsc->num_sessions, 0);
 	mdsc->max_sessions = 0;
 	mdsc->stopping = 0;
+	atomic64_set(&mdsc->quotarealms_count, 0);
 	mdsc->last_snap_seq = 0;
 	init_rwsem(&mdsc->snap_rwsem);
 	mdsc->snap_realms = RB_ROOT;
@@ -4085,6 +4101,9 @@ static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
 		break;
 	case CEPH_MSG_CLIENT_LEASE:
 		handle_lease(mdsc, s, msg);
+		break;
+	case CEPH_MSG_CLIENT_QUOTA:
+		ceph_handle_quota(mdsc, s, msg);
 		break;
 
 	default:

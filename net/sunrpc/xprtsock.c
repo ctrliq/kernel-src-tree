@@ -489,7 +489,7 @@ static int xs_nospace(struct rpc_task *task)
 
 		rcu_read_lock();
 		wq = rcu_dereference(sk->sk_wq);
-		set_bit(SOCKWQ_ASYNC_NOSPACE, &wq->flags);
+		set_bit(SOCK_ASYNC_NOSPACE, &transport->sock->flags);
 		rcu_read_unlock();
 
 		sk->sk_write_space(sk);

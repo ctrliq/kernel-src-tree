@@ -77,13 +77,12 @@ static acpi_status acpi_run_oshp(acpi_handle handle)
 /**
  * acpi_get_hp_hw_control_from_firmware
  * @dev: the pci_dev of the bridge that has a hotplug controller
- * @flags: requested control bits for _OSC
  *
  * Attempt to take hotplug control from firmware.
  */
-int acpi_get_hp_hw_control_from_firmware(struct pci_dev *pdev, u32 flags)
+int acpi_get_hp_hw_control_from_firmware(struct pci_dev *pdev)
 {
-	const struct pci_host_bridge *host;
+	struct pci_host_bridge *host;
 	const struct acpi_pci_root *root;
 	acpi_status status;
 	acpi_handle chandle, handle;
@@ -98,11 +97,11 @@ int acpi_get_hp_hw_control_from_firmware(struct pci_dev *pdev, u32 flags)
 	 * OSHP within the scope of the hotplug controller and its parents,
 	 * up to the host bridge under which this controller exists.
 	 */
-	host = pci_find_host_bridge(pdev->bus);
-	if (host->native_shpc_hotplug)
+	if (shpchp_is_native(pdev))
 		return 0;
 
 	/* If _OSC exists, we should not evaluate OSHP */
+	host = pci_find_host_bridge(pdev->bus);
 	root = acpi_pci_find_root(ACPI_HANDLE(&host->dev));
 	if (root->osc_support_set)
 		goto no_control;

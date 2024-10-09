@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for USB Host Controller Drivers
 #
@@ -39,9 +40,7 @@ endif
 
 obj-$(CONFIG_USB_WHCI_HCD)	+= whci/
 
-ifneq ($(CONFIG_USB), )
-	obj-$(CONFIG_PCI)	+= pci-quirks.o
-endif
+obj-$(CONFIG_USB_PCI)	+= pci-quirks.o
 
 obj-$(CONFIG_USB_EHCI_HCD)	+= ehci-hcd.o
 obj-$(CONFIG_USB_EHCI_PCI)	+= ehci-pci.o

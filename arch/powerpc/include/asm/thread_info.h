@@ -45,7 +45,9 @@ struct thread_info {
 						   <0 => BUG */
 	struct restart_block restart_block;
 	unsigned long	local_flags;		/* private flags for thread */
-
+#ifdef CONFIG_LIVEPATCH
+	unsigned long *livepatch_sp;
+#endif
 	/* low level flags - has atomic operations done on it */
 	unsigned long	flags ____cacheline_aligned_in_smp;
 };

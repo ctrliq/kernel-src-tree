@@ -141,6 +141,10 @@
 
 #define IPMI_WDOG_TIMER_NOT_INIT_RESP	0x80
 
+extern int __ipmi_get_version(ipmi_user_t   user,
+			      unsigned char *major,
+			      unsigned char *minor);
+
 static DEFINE_MUTEX(ipmi_watchdog_mutex);
 static bool nowayout = WATCHDOG_NOWAYOUT;
 
@@ -985,7 +989,7 @@ static void ipmi_wdog_pretimeout_handler(void *handler_data)
 	pretimeout_since_last_heartbeat = 1;
 }
 
-static const struct ipmi_user_hndl ipmi_hndlrs = {
+static RH_KABI_CONST struct ipmi_user_hndl ipmi_hndlrs = {
 	.ipmi_recv_hndl           = ipmi_wdog_msg_handler,
 	.ipmi_watchdog_pretimeout = ipmi_wdog_pretimeout_handler
 };
@@ -1008,7 +1012,7 @@ static void ipmi_register_watchdog(int ipmi_intf)
 		goto out;
 	}
 
-	rv = ipmi_get_version(watchdog_user,
+	rv = __ipmi_get_version(watchdog_user,
 			      &ipmi_version_major,
 			      &ipmi_version_minor);
 	if (rv) {

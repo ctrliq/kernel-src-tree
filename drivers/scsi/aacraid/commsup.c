@@ -33,6 +33,7 @@
 
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/crash_dump.h>
 #include <linux/types.h>
 #include <linux/sched.h>
 #include <linux/pci.h>
@@ -1644,6 +1645,15 @@ out:
 	aac->in_reset = 0;
 	scsi_unblock_requests(host);
 
+	/*
+	 * Issue bus rescan to catch any configuration that might have
+	 * occurred
+	 */
+	if (!retval && !is_kdump_kernel()) {
+		dev_info(&aac->pdev->dev, "Scheduling bus rescan\n");
+		aac_schedule_safw_scan_worker(aac);
+	}
+
 	if (jafo) {
 		spin_lock_irq(host->host_lock);
 	}
@@ -1907,7 +1917,7 @@ static int aac_is_safw_device_exposed(struct aac_dev *dev, int bus, int target)
 	return is_exposed;
 }
 
-static int aac_update_safw_host_devices(struct aac_dev *dev, int rescan)
+static int aac_update_safw_host_devices(struct aac_dev *dev)
 {
 	int i;
 	int bus;
@@ -1915,7 +1925,7 @@ static int aac_update_safw_host_devices(struct aac_dev *dev, int rescan)
 	int is_exposed = 0;
 	int rcode = 0;
 
-	rcode = aac_setup_safw_adapter(dev, rescan);
+	rcode = aac_setup_safw_adapter(dev);
 	if (unlikely(rcode < 0)) {
 		goto out;
 	}
@@ -1934,6 +1944,31 @@ static int aac_update_safw_host_devices(struct aac_dev *dev, int rescan)
 			aac_remove_safw_device(dev, bus, target);
 	}
 out:
+	return rcode;
+}
+
+static int aac_scan_safw_host(struct aac_dev *dev)
+{
+	int rcode = 0;
+
+	rcode = aac_update_safw_host_devices(dev);
+	if (rcode)
+		aac_schedule_safw_scan_worker(dev);
+
+	return rcode;
+}
+
+int aac_scan_host(struct aac_dev *dev)
+{
+	int rcode = 0;
+
+	mutex_lock(&dev->scan_mutex);
+	if (dev->sa_firmware)
+		rcode = aac_scan_safw_host(dev);
+	else
+		scsi_scan_host(dev->scsi_host_ptr);
+	mutex_unlock(&dev->scan_mutex);
+
 	return rcode;
 }
 
@@ -1970,9 +2005,8 @@ static void aac_handle_sa_aif(struct aac_dev *dev, struct fib *fibptr)
 	case SA_AIF_LDEV_CHANGE:
 	case SA_AIF_BPCFG_CHANGE:
 
-		mutex_lock(&dev->scan_mutex);
-		aac_update_safw_host_devices(dev, AAC_RESCAN);
-		mutex_unlock(&dev->scan_mutex);
+		aac_scan_host(dev);
+
 		break;
 
 	case SA_AIF_BPSTAT_CHANGE:
@@ -2559,10 +2593,7 @@ void aac_free_irq(struct aac_dev *dev)
 	int cpu;
 
 	cpu = cpumask_first(cpu_online_mask);
-	if (dev->pdev->device == PMC_DEVICE_S6 ||
-	    dev->pdev->device == PMC_DEVICE_S7 ||
-	    dev->pdev->device == PMC_DEVICE_S8 ||
-	    dev->pdev->device == PMC_DEVICE_S9) {
+	if (aac_is_src(dev)) {
 		if (dev->max_msix > 1) {
 			for (i = 0; i < dev->max_msix; i++) {
 				if (irq_set_affinity_hint(

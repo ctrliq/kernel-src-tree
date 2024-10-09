@@ -123,6 +123,7 @@ struct inet_timewait_sock {
 #define tw_num			__tw_common.skc_num
 
 	int			tw_timeout;
+	__u32			tw_mark;
 	volatile unsigned char	tw_substate;
 	unsigned char		tw_rcv_wscale;
 

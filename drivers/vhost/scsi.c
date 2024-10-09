@@ -335,16 +335,6 @@ static void tcm_vhost_release_cmd(struct se_cmd *se_cmd)
 	return;
 }
 
-static int tcm_vhost_shutdown_session(struct se_session *se_sess)
-{
-	return 0;
-}
-
-static void tcm_vhost_close_session(struct se_session *se_sess)
-{
-	return;
-}
-
 static u32 tcm_vhost_sess_get_index(struct se_session *se_sess)
 {
 	return 0;
@@ -1838,8 +1828,6 @@ static struct target_core_fabric_ops tcm_vhost_ops = {
 	.tpg_check_prod_mode_write_protect = tcm_vhost_check_false,
 	.tpg_get_inst_index		= tcm_vhost_tpg_get_inst_index,
 	.release_cmd			= tcm_vhost_release_cmd,
-	.shutdown_session		= tcm_vhost_shutdown_session,
-	.close_session			= tcm_vhost_close_session,
 	.sess_get_index			= tcm_vhost_sess_get_index,
 	.sess_get_initiator_sid		= NULL,
 	.write_pending			= tcm_vhost_write_pending,

@@ -65,6 +65,13 @@ static inline void switch_mm_irqs_off(struct mm_struct *prev,
 	/* Mark this context has been used on the new CPU */
 	cpumask_set_cpu(smp_processor_id(), mm_cpumask(next));
 
+	/*
+	 * This full barrier is needed by membarrier when switching
+	 * between processes after store to rq->curr, before user-space
+	 * memory accesses.
+	 */
+	smp_mb();
+
 	/* 32-bit keeps track of the current PGDIR in the thread struct */
 #ifdef CONFIG_PPC32
 	tsk->thread.pgdir = next->pgd;
@@ -101,6 +108,7 @@ static inline void switch_mm_irqs_off(struct mm_struct *prev,
 	else
 		switch_stab(tsk, next);
 #else
+	membarrier_arch_switch_mm(prev, next, tsk);
 	/* Out of line for now */
 	switch_mmu_context(prev, next);
 #endif

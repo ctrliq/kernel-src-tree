@@ -15,6 +15,7 @@
 #define _LINUX_PERF_EVENT_H
 
 #include <uapi/linux/perf_event.h>
+#include <uapi/linux/bpf_perf_event.h>
 
 /*
  * Kernel-internal data types and definitions:
@@ -65,9 +66,23 @@ struct perf_callchain_entry {
 	__u64				ip[PERF_MAX_STACK_DEPTH];
 };
 
-struct perf_raw_record {
-	u32				size;
+typedef unsigned long (*perf_copy_f)(void *dst, const void *src,
+				     unsigned long off, unsigned long len);
+
+struct perf_raw_frag {
+	union {
+		struct perf_raw_frag	*next;
+		unsigned long		pad;
+	};
+	perf_copy_f			copy;
 	void				*data;
+	u32				size;
+} __packed;
+
+struct perf_raw_record {
+	u32					size;
+	RH_KABI_DEPRECATE(void *,		data)
+	RH_KABI_EXTEND(struct perf_raw_frag	frag)
 };
 
 /*
@@ -125,11 +140,6 @@ struct hw_perf_event {
 			/* for tp_event->class */
 			struct list_head	tp_list;
 		};
-#ifndef __GENKSYMS__
-		struct { /* itrace */
-			int			itrace_started;
-		};
-#endif /* __GENKSYMS__ */
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 		struct { /* breakpoint */
 			/*
@@ -430,6 +440,7 @@ struct swevent_hlist {
 #define PERF_ATTACH_GROUP	0x02
 #define PERF_ATTACH_TASK	0x04
 #define PERF_ATTACH_TASK_DATA	0x08
+#define PERF_ATTACH_ITRACE	0x10
 
 struct perf_cgroup;
 struct ring_buffer;
@@ -479,26 +490,13 @@ struct perf_event {
 	 * has been enabled (i.e. eligible to run, and the task has
 	 * been scheduled in, if this is a per-task event)
 	 * and running (scheduled onto the CPU), respectively.
-	 *
-	 * They are computed from tstamp_enabled, tstamp_running and
-	 * tstamp_stopped when the event is in INACTIVE or ACTIVE state.
 	 */
 	u64				total_time_enabled;
 	u64				total_time_running;
-
-	/*
-	 * These are timestamps used for computing total_time_enabled
-	 * and total_time_running when the event is in INACTIVE or
-	 * ACTIVE state, measured in nanoseconds from an arbitrary point
-	 * in time.
-	 * tstamp_enabled: the notional time when the event was enabled
-	 * tstamp_running: the notional time when the event was scheduled on
-	 * tstamp_stopped: in INACTIVE state, the notional time when the
-	 *	event was scheduled off.
-	 */
-	u64				tstamp_enabled;
-	u64				tstamp_running;
-	u64				tstamp_stopped;
+	RH_KABI_DEPRECATE(u64,		tstamp_enabled)
+	RH_KABI_DEPRECATE(u64,		tstamp_running)
+	RH_KABI_REPLACE(u64		tstamp_stopped,
+			u64		tstamp)
 
 	/*
 	 * timestamp shadows the actual context timing but it can
@@ -570,14 +568,14 @@ struct perf_event {
 #ifdef CONFIG_EVENT_TRACING
 	struct ftrace_event_call	*tp_event;
 	struct event_filter		*filter;
-#if defined(CONFIG_FUNCTION_TRACER) && !defined(CONFIG_S390)
+#if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_X86_64)
 	struct ftrace_ops               ftrace_ops;
 #endif
 #endif
 
 #ifdef CONFIG_CGROUP_PERF
 	struct perf_cgroup		*cgrp; /* cgroup event is attach to */
-	int				cgrp_defer_enabled;
+	RH_KABI_DEPRECATE(int,		 cgrp_defer_enabled)
 #endif
 
 	/*
@@ -588,7 +586,7 @@ struct perf_event {
 	RH_KABI_EXTEND(struct list_head		migrate_entry)
 	RH_KABI_EXTEND(struct list_head		active_entry)
 	RH_KABI_EXTEND(void			*pmu_private)
-#if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_S390)
+#if defined(CONFIG_FUNCTION_TRACER) && !defined(CONFIG_X86_64)
 	RH_KABI_EXTEND(struct ftrace_ops	 ftrace_ops)
 #endif
 	/* address range filters */
@@ -600,12 +598,28 @@ struct perf_event {
 	RH_KABI_EXTEND(u64				(*clock)(void))
 	/* The cumulative AND of all event_caps for events in this group. */
 	RH_KABI_EXTEND(int				group_caps)
+	/*
+	 * Node on the pinned or flexible tree located at the event context;
+	 */
+	RH_KABI_EXTEND(struct rb_node			group_node)
+	RH_KABI_EXTEND(u64				group_index)
+	RH_KABI_EXTEND(struct list_head			active_list)
+
+#ifdef CONFIG_BPF_SYSCALL
+	RH_KABI_EXTEND(perf_overflow_handler_t		orig_overflow_handler)
+	RH_KABI_EXTEND(struct bpf_prog			*prog)
+#endif
 #endif /* CONFIG_PERF_EVENTS */
 };
 
 enum perf_event_context_type {
 	task_context,
 	cpu_context,
+};
+
+struct perf_event_groups {
+	struct rb_root	tree;
+	u64		index;
 };
 
 /**
@@ -628,9 +642,10 @@ struct perf_event_context {
 	 */
 	struct mutex			mutex;
 
-	struct list_head		pinned_groups;
-	struct list_head		flexible_groups;
+	RH_KABI_DEPRECATE(struct list_head, pinned_groups)
+	RH_KABI_DEPRECATE(struct list_head, flexible_groups)
 	struct list_head		event_list;
+
 	int				nr_events;
 	int				nr_active;
 	int				is_active;
@@ -659,6 +674,10 @@ struct perf_event_context {
 	struct rcu_head			rcu_head;
 	RH_KABI_EXTEND(struct list_head		active_ctx_list)
 	RH_KABI_EXTEND(void			*task_ctx_data) /* pmu specific data */
+	RH_KABI_EXTEND(struct perf_event_groups	pinned_groups)
+	RH_KABI_EXTEND(struct perf_event_groups	flexible_groups)
+	RH_KABI_EXTEND(struct list_head		pinned_active)
+	RH_KABI_EXTEND(struct list_head		flexible_active)
 };
 
 /*
@@ -698,6 +717,12 @@ struct perf_output_handle {
 		unsigned long		head;
 	};
 	int				page;
+};
+
+struct bpf_perf_event_data_kern {
+	bpf_user_pt_regs_t *regs;
+	struct perf_sample_data *data;
+	struct perf_event *event;
 };
 
 #ifdef CONFIG_CGROUP_PERF
@@ -741,6 +766,7 @@ extern int perf_aux_output_skip(struct perf_output_handle *handle,
 				unsigned long size);
 extern void *perf_get_aux(struct perf_output_handle *handle);
 extern void perf_aux_output_flag(struct perf_output_handle *handle, u64 flags);
+extern void perf_event_itrace_started(struct perf_event *event);
 
 extern int perf_pmu_register(struct pmu *pmu, const char *name, int type);
 extern void perf_pmu_unregister(struct pmu *pmu);
@@ -755,7 +781,7 @@ extern int perf_event_init_task(struct task_struct *child);
 extern void perf_event_exit_task(struct task_struct *child);
 extern void perf_event_free_task(struct task_struct *task);
 extern void perf_event_delayed_put(struct task_struct *task);
-extern struct perf_event *perf_event_get(unsigned int fd);
+extern struct file *perf_event_get(unsigned int fd);
 extern const struct perf_event_attr *perf_event_attrs(struct perf_event *event);
 extern void perf_event_print_debug(void);
 extern void perf_pmu_disable(struct pmu *pmu);
@@ -775,7 +801,8 @@ perf_event_create_kernel_counter(struct perf_event_attr *attr,
 				void *context);
 extern void perf_pmu_migrate_context(struct pmu *pmu,
 				int src_cpu, int dst_cpu);
-extern u64 perf_event_read_local(struct perf_event *event);
+int perf_event_read_local(struct perf_event *event, u64 *value,
+			  u64 *enabled, u64 *running);
 extern u64 perf_event_read_value(struct perf_event *event,
 				 u64 *enabled, u64 *running);
 
@@ -823,6 +850,9 @@ struct perf_sample_data {
 	 * on arch details.
 	 */
 	RH_KABI_EXTEND(struct pt_regs			regs_user_copy)
+
+	RH_KABI_EXTEND(u64				phys_addr)
+
 } ____cacheline_aligned;
 
 /* default value for data source */
@@ -1040,6 +1070,9 @@ extern void perf_bp_event(struct perf_event *event, void *data);
 		(user_mode(regs) ? PERF_RECORD_MISC_USER : PERF_RECORD_MISC_KERNEL)
 # define perf_instruction_pointer(regs)	instruction_pointer(regs)
 #endif
+#ifndef perf_arch_bpf_user_pt_regs
+# define perf_arch_bpf_user_pt_regs(regs) regs
+#endif
 
 static inline bool has_branch_stack(struct perf_event *event)
 {
@@ -1127,12 +1160,16 @@ static inline int perf_event_init_task(struct task_struct *child)	{ return 0; }
 static inline void perf_event_exit_task(struct task_struct *child)	{ }
 static inline void perf_event_free_task(struct task_struct *task)	{ }
 static inline void perf_event_delayed_put(struct task_struct *task)	{ }
-static inline struct perf_event *perf_event_get(unsigned int fd)	{ return ERR_PTR(-EINVAL); }
+static inline struct file *perf_event_get(unsigned int fd)	{ return ERR_PTR(-EINVAL); }
 static inline const struct perf_event_attr *perf_event_attrs(struct perf_event *event)
 {
 	return ERR_PTR(-EINVAL);
 }
-static inline u64 perf_event_read_local(struct perf_event *event)	{ return -EINVAL; }
+static inline int perf_event_read_local(struct perf_event *event, u64 *value,
+					u64 *enabled, u64 *running)
+{
+	return -EINVAL;
+}
 static inline void perf_event_print_debug(void)				{ }
 static inline int perf_event_task_disable(void)				{ return -EINVAL; }
 static inline int perf_event_task_enable(void)				{ return -EINVAL; }
@@ -1179,6 +1216,11 @@ extern void perf_restore_debug_store(void);
 #else
 static inline void perf_restore_debug_store(void)			{ }
 #endif
+
+static __always_inline bool perf_raw_frag_last(const struct perf_raw_frag *frag)
+{
+	return frag->pad < sizeof(u64);
+}
 
 #define perf_output_put(handle, x) perf_output_copy((handle), &(x), sizeof(x))
 

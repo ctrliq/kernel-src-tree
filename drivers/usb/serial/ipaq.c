@@ -1,13 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * USB Compaq iPAQ driver
  *
  *	Copyright (C) 2001 - 2002
  *	    Ganesh Varadarajan <ganesh@veritas.com>
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
  */
 
 #include <linux/kernel.h>
@@ -33,7 +29,8 @@ static int initial_wait;
 /* Function prototypes for an ipaq */
 static int  ipaq_open(struct tty_struct *tty,
 			struct usb_serial_port *port);
-static int  ipaq_calc_num_ports(struct usb_serial *serial);
+static int ipaq_calc_num_ports(struct usb_serial *serial,
+					struct usb_serial_endpoints *epds);
 static int  ipaq_startup(struct usb_serial *serial);
 
 static const struct usb_device_id ipaq_id_table[] = {
@@ -550,7 +547,8 @@ static int ipaq_open(struct tty_struct *tty,
 	return usb_serial_generic_open(tty, port);
 }
 
-static int ipaq_calc_num_ports(struct usb_serial *serial)
+static int ipaq_calc_num_ports(struct usb_serial *serial,
+					struct usb_serial_endpoints *epds)
 {
 	/*
 	 * Some of the devices in ipaq_id_table[] are composite, and we

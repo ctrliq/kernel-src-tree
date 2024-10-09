@@ -200,6 +200,24 @@ static void trace_destroy_fields(struct ftrace_event_call *call)
 	}
 }
 
+/*
+ * run-time version of trace_event_get_offsets_<call>() that returns the last
+ * accessible offset of trace fields excluding __dynamic_array bytes
+ */
+int trace_event_get_offsets(struct ftrace_event_call *call)
+{
+	struct ftrace_event_field *tail;
+	struct list_head *head;
+
+	head = trace_get_fields(call);
+	/*
+	 * head->next points to the last field with the largest offset,
+	 * since it was added last by trace_define_field()
+	 */
+	tail = list_first_entry(head, struct ftrace_event_field, link);
+	return tail->offset + tail->size;
+}
+
 int trace_event_raw_init(struct ftrace_event_call *call)
 {
 	int id;
@@ -1637,6 +1655,28 @@ static void event_remove(struct ftrace_event_call *call)
 	list_del(&call->list);
 }
 
+void destroy_rh_data(struct ftrace_event_call *call)
+{
+	struct ftrace_event_data *rh_data = call->rh_data;
+	void *ptr = rh_data->data;
+
+	kfree(rh_data);
+	call->rh_data = ptr;
+}
+
+int alloc_rh_data(struct ftrace_event_call *call)
+{
+	struct ftrace_event_data *rh_data;
+
+	rh_data = kzalloc(sizeof(*rh_data), GFP_KERNEL);
+	if (!rh_data)
+		return -ENOMEM;
+
+	rh_data->data = call->rh_data;
+	call->rh_data = rh_data;
+	return 0;
+}
+
 static int event_init(struct ftrace_event_call *call)
 {
 	int ret = 0;
@@ -1644,11 +1684,16 @@ static int event_init(struct ftrace_event_call *call)
 	if (WARN_ON(!call->name))
 		return -EINVAL;
 
+	if (alloc_rh_data(call))
+		return -ENOMEM;
+
 	if (call->class->raw_init) {
 		ret = call->class->raw_init(call);
 		if (ret < 0 && ret != -ENOSYS)
 			pr_warn("Could not initialize trace events/%s\n",
 				call->name);
+		if (ret < 0)
+			destroy_rh_data(call);
 	}
 
 	return ret;
@@ -1667,6 +1712,131 @@ __register_event(struct ftrace_event_call *call, struct module *mod)
 	call->mod = mod;
 
 	return 0;
+}
+
+static char *enum_replace(char *ptr, struct trace_enum_map *map, int len)
+{
+	int rlen;
+	int elen;
+
+	/* Find the length of the enum value as a string */
+	elen = snprintf(ptr, 0, "%ld", map->enum_value);
+	/* Make sure there's enough room to replace the string with the value */
+	if (len < elen)
+		return NULL;
+
+	snprintf(ptr, elen + 1, "%ld", map->enum_value);
+
+	/* Get the rest of the string of ptr */
+	rlen = strlen(ptr + len);
+	memmove(ptr + elen, ptr + len, rlen);
+	/* Make sure we end the new string */
+	ptr[elen + rlen] = 0;
+
+	return ptr + elen;
+}
+
+static void update_event_printk(struct ftrace_event_call *call,
+				struct trace_enum_map *map)
+{
+	char *ptr;
+	int quote = 0;
+	int len = strlen(map->enum_string);
+
+	for (ptr = call->print_fmt; *ptr; ptr++) {
+		if (*ptr == '\\') {
+			ptr++;
+			/* paranoid */
+			if (!*ptr)
+				break;
+			continue;
+		}
+		if (*ptr == '"') {
+			quote ^= 1;
+			continue;
+		}
+		if (quote)
+			continue;
+		if (isdigit(*ptr)) {
+			/* skip numbers */
+			do {
+				ptr++;
+				/* Check for alpha chars like ULL */
+			} while (isalnum(*ptr));
+			if (!*ptr)
+				break;
+			/*
+			 * A number must have some kind of delimiter after
+			 * it, and we can ignore that too.
+			 */
+			continue;
+		}
+		if (isalpha(*ptr) || *ptr == '_') {
+			if (strncmp(map->enum_string, ptr, len) == 0 &&
+			    !isalnum(ptr[len]) && ptr[len] != '_') {
+				ptr = enum_replace(ptr, map, len);
+				/* Hmm, enum string smaller than value */
+				if (WARN_ON_ONCE(!ptr))
+					return;
+				/*
+				 * No need to decrement here, as enum_replace()
+				 * returns the pointer to the character passed
+				 * the enum, and two enums can not be placed
+				 * back to back without something in between.
+				 * We can skip that something in between.
+				 */
+				continue;
+			}
+		skip_more:
+			do {
+				ptr++;
+			} while (isalnum(*ptr) || *ptr == '_');
+			if (!*ptr)
+				break;
+			/*
+			 * If what comes after this variable is a '.' or
+			 * '->' then we can continue to ignore that string.
+			 */
+			if (*ptr == '.' || (ptr[0] == '-' && ptr[1] == '>')) {
+				ptr += *ptr == '.' ? 1 : 2;
+				if (!*ptr)
+					break;
+				goto skip_more;
+			}
+			/*
+			 * Once again, we can skip the delimiter that came
+			 * after the string.
+			 */
+			continue;
+		}
+	}
+}
+
+void trace_event_enum_update(struct trace_enum_map **map, int len)
+{
+	struct ftrace_event_call *call, *p;
+	const char *last_system = NULL;
+	int last_i;
+	int i;
+
+	down_write(&trace_event_sem);
+	list_for_each_entry_safe(call, p, &ftrace_events, list) {
+		/* events are usually grouped together with systems */
+		if (!last_system || call->class->system != last_system) {
+			last_i = 0;
+			last_system = call->class->system;
+		}
+
+		for (i = last_i; i < len; i++) {
+			if (call->class->system == map[i]->system) {
+				/* Save the first system if need be */
+				if (!last_i)
+					last_i = i;
+				update_event_printk(call, map[i]);
+			}
+		}
+	}
+	up_write(&trace_event_sem);
 }
 
 static struct ftrace_event_file *
@@ -1752,6 +1922,7 @@ static void __trace_remove_event_call(struct ftrace_event_call *call)
 	event_remove(call);
 	trace_destroy_fields(call);
 	destroy_preds(call);
+	destroy_rh_data(call);
 }
 
 static int probe_remove_event_call(struct ftrace_event_call *call)

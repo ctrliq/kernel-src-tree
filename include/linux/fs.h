@@ -1803,7 +1803,6 @@ struct file_operations {
 	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
 	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
 	int (*mmap) (struct file *, struct vm_area_struct *);
-	unsigned long mmap_supported_flags;
 	int (*open) (struct inode *, struct file *);
 	int (*flush) (struct file *, fl_owner_t id);
 	int (*release) (struct inode *, struct file *);
@@ -1830,10 +1829,8 @@ struct file_operations_extend {
 	void (*mremap)(struct file *, struct vm_area_struct *);
 	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
 	int (*clone_file_range)(struct file *, loff_t, struct file *, loff_t, u64);
+	unsigned long mmap_supported_flags;
 };
-
-#define to_fop_extend(fop)	\
-	container_of((fop), struct file_operations_extend, kabi_fops)
 
 struct inode_operations {
 	struct dentry * (*lookup) (struct inode *,struct dentry *, unsigned int);
@@ -2152,7 +2149,6 @@ struct file_system_type {
 #define FS_HAS_DOPS_WRAPPER	4096	/* kabi: fs is using dentry_operations_wrapper. sb->s_d_op points to
 dentry_operations_wrapper */
 #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
-#define FS_HAS_FO_EXTEND	65536 	/* fs is using the file_operations_extend struture */
 #define FS_HAS_WBLIST		131072	/* KABI: fs has writeback list super ops */
 	struct dentry *(*mount) (struct file_system_type *, int,
 		       const char *, void *);
@@ -2174,8 +2170,6 @@ dentry_operations_wrapper */
 #define sb_has_rm_xquota(sb)	((sb)->s_type->fs_flags & FS_HAS_RM_XQUOTA)
 #define sb_has_nextdqblk(sb)	((sb)->s_type->fs_flags & FS_HAS_NEXTDQBLK)
 #define sb_has_dops_wrapper(sb)	((sb)->s_type->fs_flags & FS_HAS_DOPS_WRAPPER)
-#define fb_has_fo_extend(fb)	\
-	(file_inode(fp)->i_sb->s_type->fs_flags & FS_HAS_FO_EXTEND)
 #define sb_has_wblist(sb)	((sb)->s_type->fs_flags & FS_HAS_WBLIST)
 
 /*
@@ -2199,15 +2193,6 @@ static inline dop_real_t get_real_dop(struct dentry *dentry)
 		return NULL;
 
 	return (offsetof(struct dentry_operations_wrapper, d_real) < wrapper->size) ? wrapper->d_real : NULL;
-}
-
-static inline struct file_operations_extend *
-get_fo_extend(struct file *fp)
-{
-	if (!fb_has_fo_extend(fp))
-		return NULL;
-
-	return to_fop_extend(fp->f_op);
 }
 
 /**
@@ -2316,6 +2301,17 @@ extern struct dentry *mount_pseudo(struct file_system_type *, char *,
 
 extern int register_filesystem(struct file_system_type *);
 extern int unregister_filesystem(struct file_system_type *);
+/* Begin: Red Hat Internal Use Only */
+extern int register_fo_extend(const struct file_operations_extend *fop);
+extern void unregister_fo_extend(const struct file_operations_extend *fop);
+extern const struct file_operations_extend *lookup_fo_extend(
+	const struct file_operations *fops);
+static inline struct file_operations_extend *
+get_fo_extend(struct file *fp)
+{
+	return (struct file_operations_extend *)lookup_fo_extend(fp->f_op);
+}
+/* End: Red Hat Internal Use Only */
 extern struct vfsmount *kern_mount_data(struct file_system_type *, void *data);
 #define kern_mount(type) kern_mount_data(type, NULL)
 extern void kern_unmount(struct vfsmount *mnt);
@@ -3131,6 +3127,11 @@ extern int simple_unlink(struct inode *, struct dentry *);
 extern int simple_rmdir(struct inode *, struct dentry *);
 extern int simple_rename(struct inode *, struct dentry *, struct inode *, struct dentry *);
 extern int noop_fsync(struct file *, loff_t, loff_t, int);
+extern int noop_set_page_dirty(struct page *page);
+extern void noop_invalidatepage_range(struct page *page, unsigned int offset,
+		unsigned int length);
+extern ssize_t noop_direct_IO(int rw, struct kiocb *kiocb,
+		const struct iovec *iov, loff_t offset, unsigned long nr_segs);
 extern int simple_empty(struct dentry *);
 extern int simple_readpage(struct file *file, struct page *page);
 extern int simple_write_begin(struct file *file, struct address_space *mapping,
@@ -3190,6 +3191,20 @@ static inline bool io_is_direct(struct file *filp)
 static inline bool vma_is_dax(struct vm_area_struct *vma)
 {
 	return vma->vm_file && IS_DAX(vma->vm_file->f_mapping->host);
+}
+
+static inline bool vma_is_fsdax(struct vm_area_struct *vma)
+{
+	struct inode *inode;
+
+	if (!vma->vm_file)
+		return false;
+	if (!vma_is_dax(vma))
+		return false;
+	inode = file_inode(vma->vm_file);
+	if (S_ISCHR(inode->i_mode))
+		return false; /* device-dax */
+	return true;
 }
 
 static inline ino_t parent_ino(struct dentry *dentry)

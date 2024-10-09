@@ -3109,7 +3109,6 @@ static void dasd_setup_queue(struct dasd_block *block)
 		max_discard_sectors = max_bytes / logical_block_size;
 
 		blk_queue_max_discard_sectors(q, max_discard_sectors);
-		blk_queue_max_write_zeroes_sectors(q, max_discard_sectors);
 		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
 	}
 }

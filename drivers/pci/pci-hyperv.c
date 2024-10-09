@@ -851,7 +851,7 @@ static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
 		 */
 		var_size = 1 + HV_VP_SET_BANK_COUNT_MAX;
 
-		for_each_cpu_and(cpu, dest, cpu_online_mask) {
+		for_each_cpu_and(cpu, cfg->domain, cpu_online_mask) {
 			cpu_vmbus = hv_cpu_number_to_vp_number(cpu);
 
 			if (cpu_vmbus >= HV_VP_SET_BANK_COUNT_MAX * 64) {
@@ -864,7 +864,7 @@ static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
 				(1ULL << (cpu_vmbus & 63));
 		}
 	} else {
-		for_each_cpu_and(cpu, dest, cpu_online_mask) {
+		for_each_cpu_and(cpu, cfg->domain, cpu_online_mask) {
 			params->int_target.vp_mask |=
 				(1ULL << hv_cpu_number_to_vp_number(cpu));
 		}

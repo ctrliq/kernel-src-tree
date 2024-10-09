@@ -15,6 +15,8 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
+#define PS2_CMD_SETSCALE11	0x00e6
+#define PS2_CMD_SETRES		0x10e8
 #define PS2_CMD_GETID		0x02f2
 #define PS2_CMD_RESET_BAT	0x02ff
 
@@ -29,6 +31,7 @@
 #define PS2_FLAG_CMD1		BIT(2)	/* Waiting for the first byte of command response */
 #define PS2_FLAG_WAITID		BIT(3)	/* Command executing is GET ID */
 #define PS2_FLAG_NAK		BIT(4)	/* Last transmission was NAKed */
+#define PS2_FLAG_ACK_CMD	BIT(5)	/* Waiting to ACK the command (first) byte */
 
 struct ps2dev {
 	struct serio *serio;
@@ -52,6 +55,7 @@ void ps2_begin_command(struct ps2dev *ps2dev);
 void ps2_end_command(struct ps2dev *ps2dev);
 int __ps2_command(struct ps2dev *ps2dev, u8 *param, unsigned int command);
 int ps2_command(struct ps2dev *ps2dev, u8 *param, unsigned int command);
+int ps2_sliced_command(struct ps2dev *ps2dev, u8 command);
 bool ps2_handle_ack(struct ps2dev *ps2dev, u8 data);
 bool ps2_handle_response(struct ps2dev *ps2dev, u8 data);
 void ps2_cmd_aborted(struct ps2dev *ps2dev);

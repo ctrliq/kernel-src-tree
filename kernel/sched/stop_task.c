@@ -27,7 +27,7 @@ static struct task_struct *pick_next_task_stop(struct rq *rq)
 {
 	struct task_struct *stop = rq->stop;
 
-	if (stop && stop->on_rq) {
+	if (stop && task_on_rq_queued(stop)) {
 		stop->se.exec_start = rq_clock_task(rq);
 		return stop;
 	}

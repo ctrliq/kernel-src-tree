@@ -43,6 +43,8 @@ void vmbus_setevent(struct vmbus_channel *channel)
 {
 	struct hv_monitor_page *monitorpage;
 
+	trace_vmbus_setevent(channel);
+
 	/*
 	 * For channels marked as in "low latency" mode
 	 * bypass the monitor page mechanism.
@@ -657,22 +659,28 @@ void vmbus_close(struct vmbus_channel *channel)
 		 */
 		return;
 	}
-	mutex_lock(&vmbus_connection.channel_mutex);
 	/*
 	 * Close all the sub-channels first and then close the
 	 * primary channel.
 	 */
 	list_for_each_safe(cur, tmp, &channel->sc_list) {
 		cur_channel = list_entry(cur, struct vmbus_channel, sc_list);
-		vmbus_close_internal(cur_channel);
 		if (cur_channel->rescind) {
+			wait_for_completion(&cur_channel->rescind_event);
+			mutex_lock(&vmbus_connection.channel_mutex);
+			vmbus_close_internal(cur_channel);
 			hv_process_channel_removal(
 					   cur_channel->offermsg.child_relid);
+		} else {
+			mutex_lock(&vmbus_connection.channel_mutex);
+			vmbus_close_internal(cur_channel);
 		}
+		mutex_unlock(&vmbus_connection.channel_mutex);
 	}
 	/*
 	 * Now close the primary.
 	 */
+	mutex_lock(&vmbus_connection.channel_mutex);
 	vmbus_close_internal(channel);
 	mutex_unlock(&vmbus_connection.channel_mutex);
 }

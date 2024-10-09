@@ -984,6 +984,8 @@
  *	configured PMK for the authenticator address identified by
  *	&NL80211_ATTR_MAC.
  *
+ * @NL80211_CMD_RELOAD_REGDB: Request that the regdb firmware file is reloaded.
+ *
  * @NL80211_CMD_MAX: highest used command number
  * @__NL80211_CMD_AFTER_LAST: internal use
  */
@@ -1185,6 +1187,8 @@ enum nl80211_commands {
 
 	NL80211_CMD_SET_PMK,
 	NL80211_CMD_DEL_PMK,
+
+	NL80211_CMD_RELOAD_REGDB,
 
 	/* add new commands above here */
 

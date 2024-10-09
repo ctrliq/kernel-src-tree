@@ -504,9 +504,10 @@ extern int qedf_post_io_req(struct qedf_rport *fcport,
 extern void qedf_process_seq_cleanup_compl(struct qedf_ctx *qedf,
 	struct fcoe_cqe *cqe, struct qedf_ioreq *io_req);
 extern int qedf_send_flogi(struct qedf_ctx *qedf);
-extern void qedf_get_protocol_tlv_data(void *dev, void *data);
 extern void qedf_fp_io_handler(struct work_struct *work);
 extern void qedf_wq_grcdump(struct work_struct *work);
+extern void qedf_get_protocol_tlv_data(void *dev, void *data);
+extern void qedf_get_generic_tlv_data(void *dev, struct qed_generic_tlvs *data);
 
 #define FCOE_WORD_TO_BYTE  4
 #define QEDF_MAX_TASK_NUM	0xFFFF

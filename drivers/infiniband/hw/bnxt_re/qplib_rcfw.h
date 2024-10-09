@@ -168,7 +168,7 @@ struct bnxt_qplib_rcfw {
 #define FIRMWARE_TIMED_OUT		3
 	wait_queue_head_t	waitq;
 	int			(*aeq_handler)(struct bnxt_qplib_rcfw *,
-					       void *, void *);
+					       void *, void*);
 	u32			seq_num;
 
 	/* Bar region info */

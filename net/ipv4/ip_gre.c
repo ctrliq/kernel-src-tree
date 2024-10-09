@@ -519,6 +519,36 @@ free_skb:
 	return NETDEV_TX_OK;
 }
 
+static void ipgre_link_update(struct net_device *dev, bool set_mtu)
+{
+	struct ip_tunnel *tunnel = netdev_priv(dev);
+	int len;
+
+	len = tunnel->tun_hlen;
+	tunnel->tun_hlen = gre_calc_hlen(tunnel->parms.o_flags);
+	len = tunnel->tun_hlen - len;
+	tunnel->hlen = tunnel->hlen + len;
+
+	dev->needed_headroom = dev->needed_headroom + len;
+	if (set_mtu)
+		dev->mtu = max_t(int, dev->mtu - len, 68);
+
+	if (!(tunnel->parms.o_flags & TUNNEL_SEQ)) {
+		if (!(tunnel->parms.o_flags & TUNNEL_CSUM) ||
+		    tunnel->encap.type == TUNNEL_ENCAP_NONE) {
+			dev->features |= NETIF_F_GSO_SOFTWARE;
+			dev->hw_features |= NETIF_F_GSO_SOFTWARE;
+		} else {
+			dev->features &= ~NETIF_F_GSO_SOFTWARE;
+			dev->hw_features &= ~NETIF_F_GSO_SOFTWARE;
+		}
+		dev->features |= NETIF_F_LLTX;
+	} else {
+		dev->hw_features &= ~NETIF_F_GSO_SOFTWARE;
+		dev->features &= ~(NETIF_F_LLTX | NETIF_F_GSO_SOFTWARE);
+	}
+}
+
 static int ipgre_tunnel_ioctl(struct net_device *dev,
 			      struct ifreq *ifr, int cmd)
 {
@@ -705,9 +735,6 @@ static void __gre_tunnel_init(struct net_device *dev)
 	tunnel->hlen = tunnel->tun_hlen + tunnel->encap_hlen;
 
 	t_hlen = tunnel->hlen + sizeof(struct iphdr);
-
-	dev->needed_headroom	= LL_MAX_HEADER + t_hlen + 4;
-	dev->mtu		= ETH_DATA_LEN - t_hlen - 4;
 
 	dev->features		|= GRE_FEATURES;
 	dev->hw_features	|= GRE_FEATURES;
@@ -950,6 +977,12 @@ static void ipgre_tap_setup(struct net_device *dev)
 	ip_tunnel_setup(dev, gre_tap_net_id);
 }
 
+bool is_gretap_dev(const struct net_device *dev)
+{
+	return dev->netdev_ops == &gre_tap_netdev_ops;
+}
+EXPORT_SYMBOL_GPL(is_gretap_dev);
+
 static int ipgre_newlink(struct net *src_net, struct net_device *dev,
 			 struct nlattr *tb[], struct nlattr *data[])
 {
@@ -974,12 +1007,12 @@ static int ipgre_newlink(struct net *src_net, struct net_device *dev,
 static int ipgre_changelink(struct net_device *dev, struct nlattr *tb[],
 			    struct nlattr *data[])
 {
-	struct ip_tunnel_parm p;
+	struct ip_tunnel *t = netdev_priv(dev);
 	struct ip_tunnel_encap ipencap;
+	struct ip_tunnel_parm p;
 	int err;
 
 	if (ipgre_netlink_encap_parms(data, &ipencap)) {
-		struct ip_tunnel *t = netdev_priv(dev);
 		err = ip_tunnel_encap_setup(t, &ipencap);
 
 		if (err < 0)
@@ -989,7 +1022,18 @@ static int ipgre_changelink(struct net_device *dev, struct nlattr *tb[],
 	err = ipgre_netlink_parms(dev, data, tb, &p);
 	if (err < 0)
 		return err;
-	return ip_tunnel_changelink(dev, tb, &p);
+
+	err = ip_tunnel_changelink(dev, tb, &p);
+	if (err < 0)
+		return err;
+
+	t->parms.i_flags = p.i_flags;
+	t->parms.o_flags = p.o_flags;
+
+	if (strcmp(dev->rtnl_link_ops->kind, "erspan"))
+		ipgre_link_update(dev, !tb[IFLA_MTU]);
+
+	return 0;
 }
 
 static size_t ipgre_get_size(const struct net_device *dev)

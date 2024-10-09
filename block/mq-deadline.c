@@ -654,7 +654,6 @@ static struct elevator_mq_ops dd_ops = {
 static struct elevator_type mq_deadline = {
 	.elevator_attrs = deadline_attrs,
 	.elevator_name = "mq-deadline",
-	.elevator_alias = "deadline",
 	.elevator_owner = THIS_MODULE,
 };
 MODULE_ALIAS("mq-deadline-iosched");
@@ -670,6 +669,7 @@ static int __init deadline_init(void)
 	aux = elevator_aux_find(&mq_deadline);
 	memcpy(&aux->ops.mq, &dd_ops, sizeof(struct elevator_mq_ops));
 	aux->uses_mq = true;
+	aux->elevator_alias = "deadline",
 	aux->queue_debugfs_attrs = deadline_queue_debugfs_attrs;
 
 	return 0;

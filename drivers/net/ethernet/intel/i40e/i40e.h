@@ -1,29 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*******************************************************************************
- *
- * Intel Ethernet Controller XL710 Family Linux Driver
- * Copyright(c) 2013 - 2017 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- *
- ******************************************************************************/
+/* Copyright(c) 2013 - 2018 Intel Corporation. */
 
 #ifndef _I40E_H_
 #define _I40E_H_
@@ -159,9 +135,17 @@ enum i40e_state_t {
 	__I40E_BAD_EEPROM,
 	__I40E_DOWN_REQUESTED,
 	__I40E_FD_FLUSH_REQUESTED,
+	__I40E_FD_ATR_AUTO_DISABLED,
+	__I40E_FD_SB_AUTO_DISABLED,
 	__I40E_RESET_FAILED,
 	__I40E_PORT_SUSPENDED,
 	__I40E_VF_DISABLE,
+	__I40E_MACVLAN_SYNC_PENDING,
+	__I40E_UDP_FILTER_SYNC_PENDING,
+	__I40E_TEMP_LINK_POLLING,
+	__I40E_CLIENT_SERVICE_REQUESTED,
+	__I40E_CLIENT_L2_CHANGE,
+	__I40E_CLIENT_RESET,
 	/* This must be last as it determines the size of the BITMAP */
 	__I40E_STATE_SIZE__,
 };
@@ -326,10 +310,12 @@ struct i40e_tc_configuration {
 	struct i40e_tc_info tc_info[I40E_MAX_TRAFFIC_CLASS];
 };
 
+#define I40E_UDP_PORT_INDEX_UNUSED	255
 struct i40e_udp_port_config {
 	/* AdminQ command interface expects port number in Host byte order */
 	u16 port;
 	u8 type;
+	u8 filter_index;
 };
 
 /* macros related to FLX_PIT */
@@ -516,33 +502,26 @@ struct i40e_pf {
 #define I40E_FLAG_MSIX_ENABLED			BIT(2)
 #define I40E_FLAG_RSS_ENABLED			BIT(3)
 #define I40E_FLAG_VMDQ_ENABLED			BIT(4)
-#define I40E_FLAG_FILTER_SYNC			BIT(5)
-#define I40E_FLAG_SRIOV_ENABLED			BIT(6)
-#define I40E_FLAG_DCB_CAPABLE			BIT(7)
-#define I40E_FLAG_DCB_ENABLED			BIT(8)
-#define I40E_FLAG_FD_SB_ENABLED			BIT(9)
-#define I40E_FLAG_FD_ATR_ENABLED		BIT(10)
-#define I40E_FLAG_FD_SB_AUTO_DISABLED		BIT(11)
-#define I40E_FLAG_FD_ATR_AUTO_DISABLED		BIT(12)
-#define I40E_FLAG_MFP_ENABLED			BIT(13)
-#define I40E_FLAG_UDP_FILTER_SYNC		BIT(14)
-#define I40E_FLAG_HW_ATR_EVICT_ENABLED		BIT(15)
-#define I40E_FLAG_VEB_MODE_ENABLED		BIT(16)
-#define I40E_FLAG_VEB_STATS_ENABLED		BIT(17)
-#define I40E_FLAG_LINK_POLLING_ENABLED		BIT(18)
-#define I40E_FLAG_TRUE_PROMISC_SUPPORT		BIT(19)
-#define I40E_FLAG_TEMP_LINK_POLLING		BIT(20)
-#define I40E_FLAG_LEGACY_RX			BIT(21)
-#define I40E_FLAG_PTP				BIT(22)
-#define I40E_FLAG_IWARP_ENABLED			BIT(23)
-#define I40E_FLAG_SERVICE_CLIENT_REQUESTED	BIT(24)
-#define I40E_FLAG_CLIENT_L2_CHANGE		BIT(25)
-#define I40E_FLAG_CLIENT_RESET			BIT(26)
-#define I40E_FLAG_LINK_DOWN_ON_CLOSE_ENABLED	BIT(27)
-#define I40E_FLAG_SOURCE_PRUNING_DISABLED	BIT(28)
-#define I40E_FLAG_TC_MQPRIO			BIT(29)
-#define I40E_FLAG_FD_SB_INACTIVE		BIT(30)
-#define I40E_FLAG_FD_SB_TO_CLOUD_FILTER		BIT(31)
+#define I40E_FLAG_SRIOV_ENABLED			BIT(5)
+#define I40E_FLAG_DCB_CAPABLE			BIT(6)
+#define I40E_FLAG_DCB_ENABLED			BIT(7)
+#define I40E_FLAG_FD_SB_ENABLED			BIT(8)
+#define I40E_FLAG_FD_ATR_ENABLED		BIT(9)
+#define I40E_FLAG_MFP_ENABLED			BIT(10)
+#define I40E_FLAG_HW_ATR_EVICT_ENABLED		BIT(11)
+#define I40E_FLAG_VEB_MODE_ENABLED		BIT(12)
+#define I40E_FLAG_VEB_STATS_ENABLED		BIT(13)
+#define I40E_FLAG_LINK_POLLING_ENABLED		BIT(14)
+#define I40E_FLAG_TRUE_PROMISC_SUPPORT		BIT(15)
+#define I40E_FLAG_LEGACY_RX			BIT(16)
+#define I40E_FLAG_PTP				BIT(17)
+#define I40E_FLAG_IWARP_ENABLED			BIT(18)
+#define I40E_FLAG_LINK_DOWN_ON_CLOSE_ENABLED	BIT(19)
+#define I40E_FLAG_SOURCE_PRUNING_DISABLED       BIT(20)
+#define I40E_FLAG_TC_MQPRIO			BIT(21)
+#define I40E_FLAG_FD_SB_INACTIVE		BIT(22)
+#define I40E_FLAG_FD_SB_TO_CLOUD_FILTER		BIT(23)
+#define I40E_FLAG_DISABLE_FW_LLDP		BIT(24)
 
 	struct i40e_client_instance *cinst;
 	bool stat_offsets_loaded;
@@ -607,7 +586,7 @@ struct i40e_pf {
 	unsigned long ptp_tx_start;
 	struct hwtstamp_config tstamp_config;
 	struct mutex tmreg_lock; /* Used to protect the SYSTIME registers. */
-	u64 ptp_base_adj;
+	u32 ptp_adj_mult;
 	u32 tx_hwtstamp_timeouts;
 	u32 tx_hwtstamp_skipped;
 	u32 rx_hwtstamp_cleared;
@@ -733,6 +712,7 @@ struct i40e_vsi {
 	/* These are containers of ring pointers, allocated at run-time */
 	struct i40e_ring **rx_rings;
 	struct i40e_ring **tx_rings;
+	struct i40e_ring **xdp_rings; /* XDP Tx rings */
 
 	u32  active_filters;
 	u32  promisc_threshold;
@@ -824,6 +804,7 @@ struct i40e_q_vector {
 	struct i40e_ring_container rx;
 	struct i40e_ring_container tx;
 
+	u8 itr_countdown;	/* when 0 should adjust adaptive ITR */
 	u8 num_ringpairs;	/* total number of ring pairs in vector */
 
 	cpumask_t affinity_mask;
@@ -832,8 +813,6 @@ struct i40e_q_vector {
 	struct rcu_head rcu;	/* to avoid race with update stats on free */
 	char name[I40E_INT_NAME_STR_LEN];
 	bool arm_wb_state;
-#define ITR_COUNTDOWN_START 100
-	u8 itr_countdown;	/* when 0 should adjust ITR */
 } ____cacheline_internodealigned_in_smp;
 
 /* lan device */
@@ -1008,6 +987,9 @@ void i40e_service_event_schedule(struct i40e_pf *pf);
 void i40e_notify_client_of_vf_msg(struct i40e_vsi *vsi, u32 vf_id,
 				  u8 *msg, u16 len);
 
+int i40e_control_wait_tx_q(int seid, struct i40e_pf *pf, int pf_q, bool is_xdp,
+			   bool enable);
+int i40e_control_wait_rx_q(struct i40e_pf *pf, int pf_q, bool enable);
 int i40e_vsi_start_rings(struct i40e_vsi *vsi);
 void i40e_vsi_stop_rings(struct i40e_vsi *vsi);
 void i40e_vsi_stop_rings_no_wait(struct  i40e_vsi *vsi);
@@ -1110,4 +1092,10 @@ static inline bool i40e_enabled_xdp_vsi(struct i40e_vsi *vsi)
 
 int i40e_create_queue_channel(struct i40e_vsi *vsi, struct i40e_channel *ch);
 int i40e_set_bw_limit(struct i40e_vsi *vsi, u16 seid, u64 max_tx_rate);
+int i40e_add_del_cloud_filter(struct i40e_vsi *vsi,
+			      struct i40e_cloud_filter *filter,
+			      bool add);
+int i40e_add_del_cloud_filter_big_buf(struct i40e_vsi *vsi,
+				      struct i40e_cloud_filter *filter,
+				      bool add);
 #endif /* _I40E_H_ */

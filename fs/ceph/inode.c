@@ -440,8 +440,11 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
 	atomic64_set(&ci->i_complete_seq[1], 0);
 	ci->i_symlink = NULL;
 
+	ci->i_max_bytes = 0;
+	ci->i_max_files = 0;
+
 	memset(&ci->i_dir_layout, 0, sizeof(ci->i_dir_layout));
-	ci->i_pool_ns_len = 0;
+	RCU_INIT_POINTER(ci->i_layout.pool_ns, NULL);
 
 	ci->i_fragtree = RB_ROOT;
 	mutex_init(&ci->i_fragtree_mutex);
@@ -493,7 +496,7 @@ struct inode *ceph_alloc_inode(struct super_block *sb)
 	ci->i_wrbuffer_ref = 0;
 	ci->i_wrbuffer_ref_head = 0;
 	atomic_set(&ci->i_filelock_ref, 0);
-	ci->i_shared_gen = 0;
+	atomic_set(&ci->i_shared_gen, 0);
 	ci->i_rdcache_gen = 0;
 	ci->i_rdcache_revoking = 0;
 
@@ -531,6 +534,9 @@ void ceph_destroy_inode(struct inode *inode)
 
 	ceph_queue_caps_release(inode);
 
+	if (__ceph_has_any_quota(ci))
+		ceph_adjust_quota_realms_count(inode, false);
+
 	/*
 	 * we may still have a snap_realm reference if there are stray
 	 * caps in i_snap_caps.
@@ -543,6 +549,9 @@ void ceph_destroy_inode(struct inode *inode)
 		dout(" dropping residual ref to snap realm %p\n", realm);
 		spin_lock(&realm->inodes_with_caps_lock);
 		list_del_init(&ci->i_snap_realm_item);
+		ci->i_snap_realm = NULL;
+		if (realm->ino == ci->i_vino.ino)
+			realm->inode = NULL;
 		spin_unlock(&realm->inodes_with_caps_lock);
 		ceph_put_snap_realm(mdsc, realm);
 	}
@@ -560,6 +569,8 @@ void ceph_destroy_inode(struct inode *inode)
 		ceph_buffer_put(ci->i_xattrs.blob);
 	if (ci->i_xattrs.prealloc_blob)
 		ceph_buffer_put(ci->i_xattrs.prealloc_blob);
+
+	ceph_put_string(rcu_dereference_raw(ci->i_layout.pool_ns));
 
 	call_rcu(&inode->i_rcu, ceph_i_callback);
 }
@@ -722,6 +733,7 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
 	int issued = 0, implemented, new_issued;
 	struct timespec mtime, atime, ctime;
 	struct ceph_buffer *xattr_blob = NULL;
+	struct ceph_string *pool_ns = NULL;
 	struct ceph_cap *new_cap = NULL;
 	int err = 0;
 	bool wake = false;
@@ -749,6 +761,10 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
 			       iinfo->xattr_len);
 	}
 
+	if (iinfo->pool_ns_len > 0)
+		pool_ns = ceph_find_or_create_string(iinfo->pool_ns_data,
+						     iinfo->pool_ns_len);
+
 	spin_lock(&ci->i_ceph_lock);
 
 	/*
@@ -774,6 +790,8 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
 	/* update inode */
 	inode->i_rdev = le32_to_cpu(info->rdev);
 	inode->i_blkbits = fls(le32_to_cpu(info->layout.fl_stripe_unit)) - 1;
+
+	__ceph_update_quota(ci, iinfo->max_bytes, iinfo->max_files);
 
 	if ((new_version || (new_issued & CEPH_CAP_AUTH_SHARED)) &&
 	    (issued & CEPH_CAP_AUTH_EXCL) == 0) {
@@ -801,10 +819,18 @@ static int fill_inode(struct inode *inode, struct page *locked_page,
 
 	if (new_version ||
 	    (new_issued & (CEPH_CAP_ANY_FILE_RD | CEPH_CAP_ANY_FILE_WR))) {
-		if (ci->i_layout.fl_pg_pool != info->layout.fl_pg_pool)
+		s64 old_pool = ci->i_layout.pool_id;
+		struct ceph_string *old_ns;
+
+		ceph_file_layout_from_legacy(&ci->i_layout, &info->layout);
+		old_ns = rcu_dereference_protected(ci->i_layout.pool_ns,
+					lockdep_is_held(&ci->i_ceph_lock));
+		rcu_assign_pointer(ci->i_layout.pool_ns, pool_ns);
+
+		if (ci->i_layout.pool_id != old_pool || pool_ns != old_ns)
 			ci->i_ceph_flags &= ~CEPH_I_POOL_PERM;
-		ci->i_layout = info->layout;
-		ci->i_pool_ns_len = iinfo->pool_ns_len;
+
+		pool_ns = old_ns;
 
 		queue_trunc = ceph_fill_file_size(inode, issued,
 					le32_to_cpu(info->truncate_seq),
@@ -976,6 +1002,7 @@ out:
 		ceph_put_cap(mdsc, new_cap);
 	if (xattr_blob)
 		ceph_buffer_put(xattr_blob);
+	ceph_put_string(pool_ns);
 	return err;
 }
 
@@ -1021,7 +1048,7 @@ static void update_dentry_lease(struct dentry *dentry,
 	if (ceph_snap(dir) != CEPH_NOSNAP)
 		goto out_unlock;
 
-	di->lease_shared_gen = ceph_inode(dir)->i_shared_gen;
+	di->lease_shared_gen = atomic_read(&ceph_inode(dir)->i_shared_gen);
 
 	if (duration == 0)
 		goto out_unlock;
@@ -1064,6 +1091,27 @@ static struct dentry *splice_dentry(struct dentry *dn, struct inode *in,
 	struct dentry *realdn;
 
 	BUG_ON(dn->d_inode);
+
+	if (S_ISDIR(in->i_mode)) {
+		/* If inode is directory, d_splice_alias() below will remove
+		 * 'realdn' from its origin parent. We need to ensure that
+		 * origin parent's readdir cache will not reference 'realdn'
+		 */
+		realdn = d_find_any_alias(in);
+		if (realdn) {
+			struct ceph_dentry_info *di = ceph_dentry(realdn);
+			spin_lock(&realdn->d_lock);
+
+			realdn->d_op->d_prune(realdn);
+
+			di->time = jiffies;
+			di->lease_shared_gen = 0;
+			di->offset = 0;
+
+			spin_unlock(&realdn->d_lock);
+			dput(realdn);
+		}
+	}
 
 	/* dn must be unhashed */
 	if (!d_unhashed(dn))
@@ -1179,6 +1227,7 @@ retry_lookup:
 				    ceph_snap(dn->d_inode) != tvino.snap)) {
 				dout(" dn %p points to wrong inode %p\n",
 				     dn, dn->d_inode);
+				ceph_dir_clear_ordered(dir);
 				d_delete(dn);
 				dput(dn);
 				goto retry_lookup;
@@ -1288,8 +1337,8 @@ retry_lookup:
 		if (!rinfo->head->is_target) {
 			dout("fill_trace null dentry\n");
 			if (dn->d_inode) {
-				ceph_dir_clear_ordered(dir);
 				dout("d_delete %p\n", dn);
+				ceph_dir_clear_ordered(dir);
 				d_delete(dn);
 			} else if (have_lease) {
 				if (d_unhashed(dn))
@@ -1568,8 +1617,19 @@ retry_lookup:
 		} else if (dn->d_inode &&
 			   (ceph_ino(dn->d_inode) != tvino.ino ||
 			    ceph_snap(dn->d_inode) != tvino.snap)) {
+			struct ceph_dentry_info *di = ceph_dentry(dn);
 			dout(" dn %p points to wrong inode %p\n",
 			     dn, dn->d_inode);
+
+			spin_lock(&dn->d_lock);
+			if (di->offset > 0 &&
+			    di->lease_shared_gen ==
+			    atomic_read(&ci->i_shared_gen)) {
+				__ceph_dir_clear_ordered(ci);
+				di->offset = 0;
+			}
+			spin_unlock(&dn->d_lock);
+
 			d_delete(dn);
 			dput(dn);
 			goto retry_lookup;
@@ -1594,7 +1654,7 @@ retry_lookup:
 				 &req->r_caps_reservation);
 		if (ret < 0) {
 			pr_err("fill_inode badness on %p\n", in);
-			if (!dn->d_inode)
+			if (d_really_is_negative(dn))
 				iput(in);
 			d_drop(dn);
 			err = ret;
@@ -1830,20 +1890,9 @@ retry:
 	 * possibly truncate them.. so write AND block!
 	 */
 	if (ci->i_wrbuffer_ref_head < ci->i_wrbuffer_ref) {
-		struct ceph_cap_snap *capsnap;
-		to = ci->i_truncate_size;
-		list_for_each_entry(capsnap, &ci->i_cap_snaps, ci_item) {
-			// MDS should have revoked Frw caps
-			WARN_ON_ONCE(capsnap->writing);
-			if (capsnap->dirty_pages && capsnap->size > to)
-				to = capsnap->size;
-		}
 		spin_unlock(&ci->i_ceph_lock);
 		dout("__do_pending_vmtruncate %p flushing snaps first\n",
 		     inode);
-
-		truncate_pagecache(inode, to);
-
 		filemap_write_and_wait_range(&inode->i_data, 0,
 					     inode->i_sb->s_maxbytes);
 		goto retry;
@@ -2125,6 +2174,10 @@ int __ceph_setattr(struct dentry *dentry, struct iattr *attr)
 int ceph_setattr(struct dentry *dentry, struct iattr *attr)
 {
 	int err;
+
+	if ((attr->ia_valid & ATTR_SIZE) &&
+	    ceph_quota_is_max_bytes_exceeded(dentry->d_inode, attr->ia_size))
+		return -EDQUOT;
 
 	err = __ceph_setattr(dentry, attr);
 

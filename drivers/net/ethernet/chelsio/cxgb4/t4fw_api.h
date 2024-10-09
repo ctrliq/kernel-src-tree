@@ -101,6 +101,7 @@ enum fw_wr_opcodes {
 	FW_RI_BIND_MW_WR               = 0x18,
 	FW_RI_FR_NSMR_WR               = 0x19,
 	FW_RI_FR_NSMR_TPTE_WR	       = 0x20,
+	FW_RI_RDMA_WRITE_CMPL_WR       = 0x21,
 	FW_RI_INV_LSTAG_WR             = 0x1a,
 	FW_ISCSI_TX_DATA_WR	       = 0x45,
 	FW_PTP_TX_PKT_WR               = 0x46,
@@ -512,6 +513,13 @@ struct fw_ulptx_wr {
 	__be32 flowid_len16;
 	u64 cookie;
 };
+
+#define FW_ULPTX_WR_DATA_S      28
+#define FW_ULPTX_WR_DATA_M      0x1
+#define FW_ULPTX_WR_DATA_V(x)   ((x) << FW_ULPTX_WR_DATA_S)
+#define FW_ULPTX_WR_DATA_G(x)   \
+	(((x) >> FW_ULPTX_WR_DATA_S) & FW_ULPTX_WR_DATA_M)
+#define FW_ULPTX_WR_DATA_F      FW_ULPTX_WR_DATA_V(1U)
 
 struct fw_tp_wr {
 	__be32 op_to_immdlen;
@@ -1206,6 +1214,8 @@ enum fw_params_param_dev {
 	FW_PARAMS_PARAM_DEV_FILTER2_WR  = 0x1D,
 	FW_PARAMS_PARAM_DEV_MPSBGMAP	= 0x1E,
 	FW_PARAMS_PARAM_DEV_HMA_SIZE	= 0x20,
+	FW_PARAMS_PARAM_DEV_RDMA_WRITE_WITH_IMM = 0x21,
+	FW_PARAMS_PARAM_DEV_RI_WRITE_CMPL_WR    = 0x24,
 };
 
 /*
@@ -1256,6 +1266,8 @@ enum fw_params_param_pfvf {
 	FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP = 0x31,
 	FW_PARAMS_PARAM_PFVF_HPFILTER_START = 0x32,
 	FW_PARAMS_PARAM_PFVF_HPFILTER_END = 0x33,
+	FW_PARAMS_PARAM_PFVF_RAWF_START = 0x36,
+	FW_PARAMS_PARAM_PFVF_RAWF_END = 0x37,
 	FW_PARAMS_PARAM_PFVF_NCRYPTO_LOOKASIDE = 0x39,
 	FW_PARAMS_PARAM_PFVF_PORT_CAPS32 = 0x3A,
 };
@@ -2358,14 +2370,22 @@ struct fw_acl_vlan_cmd {
 #define FW_ACL_VLAN_CMD_VFN_S		0
 #define FW_ACL_VLAN_CMD_VFN_V(x)	((x) << FW_ACL_VLAN_CMD_VFN_S)
 
-#define FW_ACL_VLAN_CMD_EN_S	31
-#define FW_ACL_VLAN_CMD_EN_V(x)	((x) << FW_ACL_VLAN_CMD_EN_S)
+#define FW_ACL_VLAN_CMD_EN_S		31
+#define FW_ACL_VLAN_CMD_EN_M		0x1
+#define FW_ACL_VLAN_CMD_EN_V(x)		((x) << FW_ACL_VLAN_CMD_EN_S)
+#define FW_ACL_VLAN_CMD_EN_G(x)         \
+	(((x) >> S_FW_ACL_VLAN_CMD_EN_S) & FW_ACL_VLAN_CMD_EN_M)
+#define FW_ACL_VLAN_CMD_EN_F            FW_ACL_VLAN_CMD_EN_V(1U)
 
 #define FW_ACL_VLAN_CMD_DROPNOVLAN_S	7
 #define FW_ACL_VLAN_CMD_DROPNOVLAN_V(x)	((x) << FW_ACL_VLAN_CMD_DROPNOVLAN_S)
 
-#define FW_ACL_VLAN_CMD_FM_S	6
-#define FW_ACL_VLAN_CMD_FM_V(x)	((x) << FW_ACL_VLAN_CMD_FM_S)
+#define FW_ACL_VLAN_CMD_FM_S		6
+#define FW_ACL_VLAN_CMD_FM_M		0x1
+#define FW_ACL_VLAN_CMD_FM_V(x)         ((x) << FW_ACL_VLAN_CMD_FM_S)
+#define FW_ACL_VLAN_CMD_FM_G(x)         \
+	(((x) >> FW_ACL_VLAN_CMD_FM_S) & FW_ACL_VLAN_CMD_FM_M)
+#define FW_ACL_VLAN_CMD_FM_F            FW_ACL_VLAN_CMD_FM_V(1U)
 
 /* old 16-bit port capabilities bitmap (fw_port_cap16_t) */
 enum fw_port_cap {

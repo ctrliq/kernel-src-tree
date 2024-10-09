@@ -9,6 +9,7 @@
 #include "symbol.h"
 #include <strlist.h>
 #include <intlist.h>
+#include "rwsem.h"
 
 struct thread_stack;
 struct unwind_libunwind_ops;
@@ -29,6 +30,7 @@ struct thread {
 	int			comm_len;
 	bool			dead; /* if set thread has exited */
 	struct list_head	comm_list;
+	struct rw_semaphore	comm_lock;
 	u64			db_id;
 
 	void			*priv;

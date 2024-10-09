@@ -206,8 +206,8 @@ BEGIN_FTR_SECTION
 	b	data_access_check_stab
 data_access_not_stab:
 END_MMU_FTR_SECTION_IFCLR(MMU_FTR_SLB)
-	EXCEPTION_PROLOG_PSERIES(PACA_EXGEN, data_access_common, EXC_STD,
-				 KVMTEST, 0x300)
+	EXCEPTION_PROLOG_0(PACA_EXGEN)
+	b data_access_pSeries_OOL
 
 	. = 0x380
 	.globl data_access_slb_pSeries
@@ -306,9 +306,17 @@ hardware_interrupt_hv:
 	. = 0x900
 	.globl decrementer_pSeries
 decrementer_pSeries:
-	_MASKABLE_EXCEPTION_PSERIES(0x900, decrementer, EXC_STD, SOFTEN_TEST_PR)
+	SET_SCRATCH0(r13)
+	EXCEPTION_PROLOG_0(PACA_EXGEN)
+	b	decrementer_pSeries_OOL
 
-	STD_EXCEPTION_HV(0x980, 0x982, hdecrementer)
+	. = 0x980
+	.globl hv_hdecrementer_trampoline
+hv_hdecrementer_trampoline:
+	HMT_MEDIUM
+	SET_SCRATCH0(r13)
+	EXCEPTION_PROLOG_0(PACA_EXGEN)
+	b hdecrementer_hv
 
 	MASKABLE_EXCEPTION_PSERIES(0xa00, 0xa00, doorbell_super)
 	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0xa00)
@@ -326,8 +334,14 @@ system_call_pSeries:
 	std	r9,PACA_EXGEN+EX_R9(r13)
 	std	r10,PACA_EXGEN+EX_R10(r13)
 	mfcr	r9
+	INTERRUPT_TO_KERNEL
 	KVMTEST(0xc00)
 	GET_SCRATCH0(r13)
+#else
+	mr	r12,r13
+	GET_PACA(r13)
+	INTERRUPT_TO_KERNEL
+	mr	r13,r12
 #endif
 	SYSCALL_PSERIES_1
 	SYSCALL_PSERIES_2_RFID
@@ -539,6 +553,9 @@ machine_check_pSeries_0:
 	KVM_HANDLER_SKIP(PACA_EXMC, EXC_STD, 0x200)
 
 	/* moved from 0x300 */
+data_access_pSeries_OOL:
+	EXCEPTION_PROLOG_PSERIES_OOL(PACA_EXGEN, data_access_common, EXC_STD,
+				     KVMTEST, 0x300)
 data_access_check_stab:
 	GET_PACA(r13)
 	std	r9,PACA_EXSLB+EX_R9(r13)
@@ -753,6 +770,22 @@ masked_##_H##interrupt:					\
 	MASKED_INTERRUPT()
 	MASKED_INTERRUPT(H)
 
+	.globl stf_barrier_fallback
+stf_barrier_fallback:
+	ld	r13,PACA_AUX_PTR(r13)		/* r13 now = paca_aux pointer */
+	std	r9,PACA_AUX_EXRFI+EX_R9(r13)
+	std	r10,PACA_AUX_EXRFI+EX_R10(r13)
+	sync
+	ld	r9,PACA_AUX_EXRFI+EX_R9(r13)
+	ld	r10,PACA_AUX_EXRFI+EX_R10(r13)
+	ori	31,31,0
+	.rept 14
+	b	1f
+1:
+	.endr
+	GET_PACA(r13)
+	blr
+
 	.globl rfi_flush_fallback
 rfi_flush_fallback:
 	SET_SCRATCH0(r13);
@@ -953,7 +986,11 @@ kvmppc_skip_Hinterrupt:
 
 	STD_EXCEPTION_COMMON_ASYNC(0x500, hardware_interrupt, do_IRQ)
 	STD_EXCEPTION_COMMON_ASYNC(0x900, decrementer, timer_interrupt)
+.globl decrementer_pSeries_OOL
+decrementer_pSeries_OOL:
+	_MASKABLE_EXCEPTION_PSERIES_OOL(0x900, decrementer, EXC_STD, SOFTEN_TEST_PR)
 	STD_EXCEPTION_COMMON(0x980, hdecrementer, hdec_interrupt)
+	STD_EXCEPTION_HV_OOL(0x982, hdecrementer)
 #ifdef CONFIG_PPC_DOORBELL
 	STD_EXCEPTION_COMMON_ASYNC(0xa00, doorbell_super, doorbell_exception)
 #else
@@ -1065,6 +1102,10 @@ hardware_interrupt_relon_hv:
 	.globl system_call_relon_pSeries
 system_call_relon_pSeries:
 	HMT_MEDIUM
+	mr	r12,r13
+	GET_PACA(r13)
+	INTERRUPT_TO_KERNEL
+	mr	r13,r12
 	SYSCALL_PSERIES_1
 	SYSCALL_PSERIES_2_DIRECT
 	SYSCALL_PSERIES_3

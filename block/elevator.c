@@ -51,6 +51,29 @@ static LIST_HEAD(elv_aux_list);
  */
 #define rq_hash_key(rq)		(blk_rq_pos(rq) + blk_rq_sectors(rq))
 
+static struct elevator_type_aux *__elevator_aux_find(const struct elevator_type *e)
+{
+	struct elevator_type_aux *e_aux;
+
+	list_for_each_entry(e_aux, &elv_aux_list, list) {
+		if (e_aux->type == e)
+			return e_aux;
+	}
+	return NULL;
+}
+
+struct elevator_type_aux *elevator_aux_find(struct elevator_type *e)
+{
+	struct elevator_type_aux *e_aux;
+
+	spin_lock(&elv_list_lock);
+	e_aux = __elevator_aux_find(e);
+	spin_unlock(&elv_list_lock);
+
+	return e_aux;
+}
+EXPORT_SYMBOL(elevator_aux_find);
+
 /*
  * Query io scheduler to see if the current process issuing bio may be
  * merged with rq.
@@ -89,6 +112,36 @@ bool elv_rq_merge_ok(struct request *rq, struct bio *bio)
 }
 EXPORT_SYMBOL(elv_rq_merge_ok);
 
+/* called when elv_list_lock is held */
+static bool __elevator_match(const struct elevator_type *e, const char *name)
+{
+	struct elevator_type_aux *aux;
+
+	if (!strcmp(e->elevator_name, name))
+		return true;
+
+	aux = __elevator_aux_find(e);
+	if (!aux)
+		return false;
+
+	if (aux->elevator_alias && !strcmp(aux->elevator_alias, name))
+		return true;
+
+	return false;
+}
+
+/* called when elv_list_lock isn't held */
+static bool elevator_match(const struct elevator_type *e, const char *name)
+{
+	bool ret;
+
+	spin_lock(&elv_list_lock);
+	ret = __elevator_match(e, name);
+	spin_unlock(&elv_list_lock);
+
+	return ret;
+}
+
 /*
  * Return scheduler with name 'name' and with matching 'mq capability
  */
@@ -97,7 +150,7 @@ static struct elevator_type *elevator_find(const char *name, bool mq)
 	struct elevator_type *e;
 
 	list_for_each_entry(e, &elv_list, list) {
-		if (!strcmp(e->elevator_name, name) &&
+		if (__elevator_match(e, name) &&
 				(mq == !e->ops.elevator_init_fn))
 			return e;
 	}
@@ -908,29 +961,6 @@ void elv_unregister_queue(struct request_queue *q)
 }
 EXPORT_SYMBOL(elv_unregister_queue);
 
-static struct elevator_type_aux *__elevator_aux_find(struct elevator_type *e)
-{
-	struct elevator_type_aux *e_aux;
-
-	list_for_each_entry(e_aux, &elv_aux_list, list) {
-		if (e_aux->type == e)
-			return e_aux;
-	}
-	return NULL;
-}
-
-struct elevator_type_aux *elevator_aux_find(struct elevator_type *e)
-{
-	struct elevator_type_aux *e_aux;
-
-	spin_lock(&elv_list_lock);
-	e_aux = __elevator_aux_find(e);
-	spin_unlock(&elv_list_lock);
-
-	return e_aux;
-}
-EXPORT_SYMBOL(elevator_aux_find);
-
 static int elv_aux_register(struct elevator_type *e)
 {
 	struct elevator_type_aux *e_aux;
@@ -996,14 +1026,14 @@ int elv_register(struct elevator_type *e)
 	list_add_tail(&e->list, &elv_list);
 	spin_unlock(&elv_list_lock);
 
-	/* print pretty message */
-	if (!strcmp(e->elevator_name, chosen_elevator) ||
-			(!*chosen_elevator &&
-			 !strcmp(e->elevator_name, CONFIG_DEFAULT_IOSCHED)))
-				def = " (default)";
 	if (elv_aux_register(e))
 		return -ENOMEM;
 
+	/* print pretty message */
+	if (elevator_match(e, chosen_elevator) ||
+			(!*chosen_elevator &&
+			 elevator_match(e, CONFIG_DEFAULT_IOSCHED)))
+		def = " (default)";
 	printk(KERN_INFO "io scheduler %s registered%s\n", e->elevator_name,
 								def);
 	return 0;
@@ -1161,8 +1191,7 @@ static int __elevator_change(struct request_queue *q, const char *name)
 	if (!e)
 		return -EINVAL;
 
-	if (q->elevator &&
-	    !strcmp(elevator_name, q->elevator->type->elevator_name)) {
+	if (q->elevator && elevator_match(q->elevator->type, elevator_name)) {
 		elevator_put(e);
 		return 0;
 	}
@@ -1203,6 +1232,7 @@ ssize_t elv_iosched_show(struct request_queue *q, char *name)
 	struct elevator_queue *e = q->elevator;
 	struct elevator_type *elv = NULL;
 	struct elevator_type *__e;
+	bool uses_mq = q->mq_ops != NULL;
 	int len = 0;
 
 	if (!blk_queue_stackable(q))
@@ -1217,7 +1247,8 @@ ssize_t elv_iosched_show(struct request_queue *q, char *name)
 	list_for_each_entry(__e, &elv_list, list) {
 		struct elevator_type_aux *aux;
 
-		if (elv && !strcmp(elv->elevator_name, __e->elevator_name)) {
+		if (elv && __elevator_match(elv, __e->elevator_name) &&
+		    (uses_mq == !__e->ops.elevator_init_fn)) {
 			len += sprintf(name+len, "[%s] ", elv->elevator_name);
 			continue;
 		}

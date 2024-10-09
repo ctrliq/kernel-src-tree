@@ -402,15 +402,15 @@ cifs_proc_init(void)
 	proc_create("DebugData", 0, proc_fs_cifs, &cifs_debug_data_proc_fops);
 
 #ifdef CONFIG_CIFS_STATS
-	proc_create("Stats", 0, proc_fs_cifs, &cifs_stats_proc_fops);
+	proc_create("Stats", 0644, proc_fs_cifs, &cifs_stats_proc_fops);
 #endif /* STATS */
-	proc_create("cifsFYI", 0, proc_fs_cifs, &cifsFYI_proc_fops);
-	proc_create("traceSMB", 0, proc_fs_cifs, &traceSMB_proc_fops);
-	proc_create("LinuxExtensionsEnabled", 0, proc_fs_cifs,
+	proc_create("cifsFYI", 0644, proc_fs_cifs, &cifsFYI_proc_fops);
+	proc_create("traceSMB", 0644, proc_fs_cifs, &traceSMB_proc_fops);
+	proc_create("LinuxExtensionsEnabled", 0644, proc_fs_cifs,
 		    &cifs_linux_ext_proc_fops);
-	proc_create("SecurityFlags", 0, proc_fs_cifs,
+	proc_create("SecurityFlags", 0644, proc_fs_cifs,
 		    &cifs_security_flags_proc_fops);
-	proc_create("LookupCacheEnabled", 0, proc_fs_cifs,
+	proc_create("LookupCacheEnabled", 0644, proc_fs_cifs,
 		    &cifs_lookup_cache_proc_fops);
 }
 

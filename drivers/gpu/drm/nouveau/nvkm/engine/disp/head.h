@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __NVKM_DISP_HEAD_H__
 #define __NVKM_DISP_HEAD_H__
 #include "priv.h"
@@ -57,4 +58,8 @@ int nv50_head_new(struct nvkm_disp *, int id);
 
 int gf119_head_cnt(struct nvkm_disp *, unsigned long *);
 int gf119_head_new(struct nvkm_disp *, int id);
+void gf119_head_rgclk(struct nvkm_head *, int);
+
+int gv100_head_cnt(struct nvkm_disp *, unsigned long *);
+int gv100_head_new(struct nvkm_disp *, int id);
 #endif

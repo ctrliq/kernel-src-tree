@@ -597,8 +597,12 @@ out:
 static unsigned int sr_block_check_events(struct gendisk *disk,
 					  unsigned int clearing)
 {
-	struct scsi_cd *cd = scsi_cd(disk);
 	unsigned int ret;
+	struct scsi_cd *cd;
+
+	cd = scsi_cd_get(disk);
+	if (!cd)
+		return 0;
 
 	if (atomic_read(&cd->device->disk_events_disable_depth) == 0) {
 		scsi_autopm_get_device(cd->device);
@@ -608,13 +612,19 @@ static unsigned int sr_block_check_events(struct gendisk *disk,
 		ret = 0;
 	}
 
+	scsi_cd_put(cd);
+
 	return ret;
 }
 
 static int sr_block_revalidate_disk(struct gendisk *disk)
 {
-	struct scsi_cd *cd = scsi_cd(disk);
 	struct scsi_sense_hdr sshdr;
+	struct scsi_cd *cd;
+
+	cd = scsi_cd_get(disk);
+	if (!cd)
+		return -ENXIO;
 
 	scsi_autopm_get_device(cd->device);
 
@@ -626,6 +636,7 @@ static int sr_block_revalidate_disk(struct gendisk *disk)
 	get_sectorsize(cd);
 out:
 	scsi_autopm_put_device(cd->device);
+	scsi_cd_put(cd);
 	return 0;
 }
 

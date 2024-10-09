@@ -409,17 +409,16 @@ static int process_events(struct machine *machine, struct perf_evlist *evlist,
 {
 	union perf_event *event;
 	struct perf_mmap *md;
-	u64 end, start;
 	int i, ret;
 
 	for (i = 0; i < evlist->nr_mmaps; i++) {
 		md = &evlist->mmap[i];
-		if (perf_mmap__read_init(md, false, &start, &end) < 0)
+		if (perf_mmap__read_init(md) < 0)
 			continue;
 
-		while ((event = perf_mmap__read_event(md, false, &start, end)) != NULL) {
+		while ((event = perf_mmap__read_event(md)) != NULL) {
 			ret = process_event(machine, evlist, event, state);
-			perf_mmap__consume(md, false);
+			perf_mmap__consume(md);
 			if (ret < 0)
 				return ret;
 		}
@@ -645,7 +644,7 @@ static int do_test_code_reading(bool try_kcore)
 		break;
 	}
 
-	ret = perf_evlist__mmap(evlist, UINT_MAX, false);
+	ret = perf_evlist__mmap(evlist, UINT_MAX);
 	if (ret < 0) {
 		pr_debug("perf_evlist__mmap failed\n");
 		goto out_put;
@@ -685,7 +684,7 @@ out_err:
 	return err;
 }
 
-int test__code_reading(int subtest __maybe_unused)
+int test__code_reading(struct test *test __maybe_unused, int subtest __maybe_unused)
 {
 	int ret;
 

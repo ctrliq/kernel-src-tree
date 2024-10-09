@@ -67,7 +67,7 @@ static struct nd_blk_region *to_ndbr(struct nd_namespace_blk *nsblk)
 	return container_of(nd_region, struct nd_blk_region, nd_region);
 }
 
-#ifdef CONFIG_BLK_DEV_INTEGRITY
+#ifdef CONFIG_BLK_DEV_INTEGRITY__BROKEN__
 static int nd_blk_rw_integrity(struct nd_namespace_blk *nsblk,
 		struct bio_integrity_payload *bip, u64 lba, int rw)
 {
@@ -108,7 +108,7 @@ static int nd_blk_rw_integrity(struct nd_namespace_blk *nsblk,
 	return err;
 }
 
-#else /* CONFIG_BLK_DEV_INTEGRITY */
+#else /* CONFIG_BLK_DEV_INTEGRITY__BROKEN__ */
 static int nd_blk_rw_integrity(struct nd_namespace_blk *nsblk,
 		struct bio_integrity_payload *bip, u64 lba, int rw)
 {
@@ -283,21 +283,12 @@ static int nsblk_attach_disk(struct nd_namespace_blk *nsblk)
 	disk->queue		= q;
 	disk->flags		= GENHD_FL_EXT_DEVT;
 	nvdimm_namespace_disk_name(&nsblk->common, disk->disk_name);
-	set_capacity(disk, 0);
+	set_capacity(disk, available_disk_size >> SECTOR_SHIFT);
 	add_disk(disk);
 
 	if (devm_add_action_or_reset(dev, nd_blk_release_disk, disk))
 		return -ENOMEM;
 
-	if (nsblk_meta_size(nsblk)) {
-		int rc = nd_integrity_init(disk, nsblk_meta_size(nsblk));
-
-		if (rc)
-			return rc;
-	}
-
-	set_capacity(disk, available_disk_size >> SECTOR_SHIFT);
-	revalidate_disk(disk);
 	return 0;
 }
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
   USB Driver for Sierra Wireless
 
@@ -8,10 +9,6 @@
 
   IMPORTANT DISCLAIMER: This driver is not commercially supported by
   Sierra Wireless. Use at your own risk.
-
-  This driver is free software; you can redistribute it and/or modify
-  it under the terms of Version 2 of the GNU General Public License as
-  published by the Free Software Foundation.
 
   Portions based on the option driver by Matthias Urlichs <smurf@smurf.noris.de>
   Whom based his on the Keyspan driver by Hugh Blemings <hugh@blemings.org>
@@ -85,7 +82,8 @@ static int sierra_vsc_set_nmea(struct usb_device *udev, __u16 enable)
 			USB_CTRL_SET_TIMEOUT);		/* int timeout       */
 }
 
-static int sierra_calc_num_ports(struct usb_serial *serial)
+static int sierra_calc_num_ports(struct usb_serial *serial,
+					struct usb_serial_endpoints *epds)
 {
 	int num_ports = 0;
 	u8 ifnum, numendpoints;

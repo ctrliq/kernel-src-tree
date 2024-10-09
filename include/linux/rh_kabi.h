@@ -5,6 +5,15 @@
  *
  * This file is released under the GPLv2.
  * See the file COPYING for more details.
+ *
+ * "Anyone can make KABI pass, not everyone can fix it."
+ *						- Don Zickus
+ *
+ * The use of these macros does not guarantee that the usage and modification
+ * of code is correct.  As with all Red Hat only changes, an engineer must
+ * explain why the use of the macro is valid in the patch containing the
+ * changes.
+ *
  */
 
 #ifndef _LINUX_RH_KABI_H

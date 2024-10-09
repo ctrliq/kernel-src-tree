@@ -1,6 +1,8 @@
 #!/bin/sh
 
 HEADERS='
+include/uapi/drm/drm.h
+include/uapi/drm/i915_drm.h
 include/uapi/linux/fcntl.h
 include/uapi/linux/kvm.h
 include/uapi/linux/perf_event.h
@@ -39,7 +41,7 @@ include/uapi/asm-generic/mman-common.h
 
 check () {
   file=$1
-  opts=
+  opts="--ignore-blank-lines --ignore-space-change"
 
   shift
   while [ -n "$*" ]; do
@@ -65,5 +67,5 @@ for i in $HEADERS; do
 done
 
 # diff with extra ignore lines
-check include/uapi/asm-generic/mman.h -B -I "^#include <\(uapi/\)*asm-generic/mman-common.h>"
-check include/uapi/linux/mman.h       -B -I "^#include <\(uapi/\)*asm/mman.h>"
+check include/uapi/asm-generic/mman.h -I "^#include <\(uapi/\)*asm-generic/mman-common.h>"
+check include/uapi/linux/mman.h       -I "^#include <\(uapi/\)*asm/mman.h>"

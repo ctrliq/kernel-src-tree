@@ -732,6 +732,7 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 	bio->bi_sector = sector_offset + zone->dev_start +
 		tmp_dev->data_offset;
 
+	mddev_check_writesame(mddev, bio);
 	generic_make_request(bio);
 	return true;
 
@@ -910,7 +911,7 @@ static void *raid0_takeover(struct mddev *mddev)
 	return ERR_PTR(-EINVAL);
 }
 
-static void raid0_quiesce(struct mddev *mddev, int state)
+static void raid0_quiesce(struct mddev *mddev, int quiesce)
 {
 }
 

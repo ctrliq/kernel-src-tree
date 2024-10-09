@@ -88,7 +88,7 @@ struct pager_config {
 static int pager_command_config(const char *var, const char *value, void *data)
 {
 	struct pager_config *c = data;
-	if (!prefixcmp(var, "pager.") && !strcmp(var + 6, c->cmd))
+	if (strstarts(var, "pager.") && !strcmp(var + 6, c->cmd))
 		c->val = perf_config_bool(var, value);
 	return 0;
 }
@@ -107,9 +107,9 @@ static int check_pager_config(const char *cmd)
 static int browser_command_config(const char *var, const char *value, void *data)
 {
 	struct pager_config *c = data;
-	if (!prefixcmp(var, "tui.") && !strcmp(var + 4, c->cmd))
+	if (strstarts(var, "tui.") && !strcmp(var + 4, c->cmd))
 		c->val = perf_config_bool(var, value);
-	if (!prefixcmp(var, "gtk.") && !strcmp(var + 4, c->cmd))
+	if (strstarts(var, "gtk.") && !strcmp(var + 4, c->cmd))
 		c->val = perf_config_bool(var, value) ? 2 : 0;
 	return 0;
 }
@@ -191,7 +191,7 @@ static int handle_options(const char ***argv, int *argc, int *envchanged)
 		/*
 		 * Check remaining flags.
 		 */
-		if (!prefixcmp(cmd, CMD_EXEC_PATH)) {
+		if (strstarts(cmd, CMD_EXEC_PATH)) {
 			cmd += strlen(CMD_EXEC_PATH);
 			if (*cmd == '=')
 				set_argv_exec_path(cmd + 1);
@@ -228,7 +228,7 @@ static int handle_options(const char ***argv, int *argc, int *envchanged)
 				*envchanged = 1;
 			(*argv)++;
 			(*argc)--;
-		} else if (!prefixcmp(cmd, CMD_DEBUGFS_DIR)) {
+		} else if (strstarts(cmd, CMD_DEBUGFS_DIR)) {
 			tracing_path_set(cmd + strlen(CMD_DEBUGFS_DIR));
 			fprintf(stderr, "dir: %s\n", tracing_path);
 			if (envchanged)
@@ -467,7 +467,7 @@ int main(int argc, const char **argv)
 	 * that contains a dash in its name. To handle this scenario, we just
 	 * fall through and ignore the "xxxx" part of the command string.
 	 */
-	if (!prefixcmp(cmd, "perf-")) {
+	if (strstarts(cmd, "perf-")) {
 		cmd += 5;
 		argv[0] = cmd;
 		handle_internal_command(argc, argv);
@@ -478,7 +478,7 @@ int main(int argc, const char **argv)
 		cmd -= 5;
 		argv[0] = cmd;
 	}
-	if (!prefixcmp(cmd, "trace")) {
+	if (strstarts(cmd, "trace")) {
 #ifdef HAVE_LIBAUDIT_SUPPORT
 		setup_path();
 		argv[0] = "trace";
@@ -496,7 +496,7 @@ int main(int argc, const char **argv)
 	commit_pager_choice();
 
 	if (argc > 0) {
-		if (!prefixcmp(argv[0], "--"))
+		if (strstarts(argv[0], "--"))
 			argv[0] += 2;
 	} else {
 		/* The user didn't specify a command; give them help */

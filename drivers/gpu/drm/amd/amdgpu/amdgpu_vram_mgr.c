@@ -68,11 +68,6 @@ static int amdgpu_vram_mgr_fini(struct ttm_mem_type_manager *man)
 	struct amdgpu_vram_mgr *mgr = man->priv;
 
 	spin_lock(&mgr->lock);
-	if (!drm_mm_clean(&mgr->mm)) {
-		spin_unlock(&mgr->lock);
-		return -EBUSY;
-	}
-
 	drm_mm_takedown(&mgr->mm);
 	spin_unlock(&mgr->lock);
 	kfree(mgr);
@@ -94,11 +89,11 @@ static u64 amdgpu_vram_mgr_vis_size(struct amdgpu_device *adev,
 	uint64_t start = node->start << PAGE_SHIFT;
 	uint64_t end = (node->size + node->start) << PAGE_SHIFT;
 
-	if (start >= adev->mc.visible_vram_size)
+	if (start >= adev->gmc.visible_vram_size)
 		return 0;
 
-	return (end > adev->mc.visible_vram_size ?
-		adev->mc.visible_vram_size : end) - start;
+	return (end > adev->gmc.visible_vram_size ?
+		adev->gmc.visible_vram_size : end) - start;
 }
 
 /**

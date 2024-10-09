@@ -148,6 +148,7 @@ struct elevator_sq_ops_aux {
 struct elevator_type_aux {
 	struct list_head list;
 	struct elevator_type *type;
+	const char *elevator_alias;
 	bool uses_mq;
 	union {
 		struct elevator_sq_ops_aux sq;

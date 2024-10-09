@@ -186,6 +186,13 @@ struct net {
 	RH_KABI_EXTEND(struct fib_notifier_ops *ipv4_notifier_ops)
 	/* upstream has this as part of netns_ipv6 */
 	RH_KABI_EXTEND(struct fib_notifier_ops *ipv6_notifier_ops)
+#ifdef CONFIG_IP_ROUTE_MULTIPATH
+	RH_KABI_EXTEND(int ipv4_sysctl_fib_multipath_hash_policy)
+#endif
+	RH_KABI_EXTEND(int ipv4_sysctl_ip_default_ttl)
+	/* upstream has this as part of netns_ipv4 */
+	RH_KABI_EXTEND(struct fib_notifier_ops	*ipv4_ipmr_notifier_ops)
+	RH_KABI_EXTEND(unsigned int ipv4_ipmr_seq)	/* protected by rtnl_mutex */
 };
 
 /*

@@ -665,6 +665,19 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	qdisc_skb_head_init(&sch->q);
 	spin_lock_init(&sch->q.lock);
 
+	if (ops->static_flags & TCQ_F_CPUSTATS) {
+		sch->cpu_bstats =
+			netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+		if (!sch->cpu_bstats)
+			goto errout1;
+
+		sch->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
+		if (!sch->cpu_qstats) {
+			free_percpu(sch->cpu_bstats);
+			goto errout1;
+		}
+	}
+
 	spin_lock_init(&sch->busylock);
 	lockdep_set_class(&sch->busylock,
 			  dev->qdisc_tx_busylock ?: &qdisc_tx_busylock);
@@ -672,6 +685,7 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	seqcount_init(&sch->running);
 
 	sch->ops = ops;
+	sch->flags = ops->static_flags;
 	sch->enqueue = ops->enqueue;
 	sch->dequeue = ops->dequeue;
 	sch->dev_queue = dev_queue;
@@ -679,6 +693,8 @@ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
 	atomic_set(&sch->refcnt, 1);
 
 	return sch;
+errout1:
+	kfree(p);
 errout:
 	return ERR_PTR(err);
 }
@@ -728,7 +744,7 @@ void qdisc_reset(struct Qdisc *qdisc)
 }
 EXPORT_SYMBOL(qdisc_reset);
 
-static void qdisc_free(struct Qdisc *qdisc)
+void qdisc_free(struct Qdisc *qdisc)
 {
 	if (qdisc_is_percpu_stats(qdisc)) {
 		free_percpu(qdisc->cpu_bstats);
@@ -1057,3 +1073,51 @@ void psched_ratecfg_precompute(struct psched_ratecfg *r,
 	}
 }
 EXPORT_SYMBOL(psched_ratecfg_precompute);
+
+static void mini_qdisc_rcu_func(struct rcu_head *head)
+{
+}
+
+void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
+			  struct tcf_proto *tp_head)
+{
+	struct mini_Qdisc *miniq_old = rtnl_dereference(*miniqp->p_miniq);
+	struct mini_Qdisc *miniq;
+
+	if (!tp_head) {
+		RCU_INIT_POINTER(*miniqp->p_miniq, NULL);
+		/* Wait for flying RCU callback before it is freed. */
+		rcu_barrier_bh();
+		return;
+	}
+
+	miniq = !miniq_old || miniq_old == &miniqp->miniq2 ?
+		&miniqp->miniq1 : &miniqp->miniq2;
+
+	/* We need to make sure that readers won't see the miniq
+	 * we are about to modify. So wait until previous call_rcu_bh callback
+	 * is done.
+	 */
+	rcu_barrier_bh();
+	miniq->filter_list = tp_head;
+	rcu_assign_pointer(*miniqp->p_miniq, miniq);
+
+	if (miniq_old)
+		/* This is counterpart of the rcu barriers above. We need to
+		 * block potential new user of miniq_old until all readers
+		 * are not seeing it.
+		 */
+		call_rcu_bh(&miniq_old->rcu, mini_qdisc_rcu_func);
+}
+EXPORT_SYMBOL(mini_qdisc_pair_swap);
+
+void mini_qdisc_pair_init(struct mini_Qdisc_pair *miniqp, struct Qdisc *qdisc,
+			  struct mini_Qdisc __rcu **p_miniq)
+{
+	miniqp->miniq1.cpu_bstats = qdisc->cpu_bstats;
+	miniqp->miniq1.cpu_qstats = qdisc->cpu_qstats;
+	miniqp->miniq2.cpu_bstats = qdisc->cpu_bstats;
+	miniqp->miniq2.cpu_qstats = qdisc->cpu_qstats;
+	miniqp->p_miniq = p_miniq;
+}
+EXPORT_SYMBOL(mini_qdisc_pair_init);

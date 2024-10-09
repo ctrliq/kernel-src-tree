@@ -829,7 +829,13 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
 	if (!down_read_trylock(&cpufreq_rwsem))
 		return -EINVAL;
 
-	down_read(&policy->rwsem);
+	/*
+	 * Use trylok to avoid lockdep circular dependency warning.
+	 */
+	if (!down_read_trylock(&policy->rwsem)) {
+		ret = -EBUSY;
+		goto err_out;
+	}
 
 	if (fattr->show)
 		ret = fattr->show(policy, buf);
@@ -837,6 +843,7 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
 		ret = -EIO;
 
 	up_read(&policy->rwsem);
+err_out:
 	up_read(&cpufreq_rwsem);
 
 	return ret;
@@ -1783,13 +1790,8 @@ void cpufreq_resume(void)
 			pr_err("%s: Failed to start governor for policy: %p\n",
 				__func__, policy);
 
-		/*
-		 * schedule call cpufreq_update_policy() for boot CPU, i.e. last
-		 * policy in list. It will verify that the current freq is in
-		 * sync with what we believe it to be.
-		 */
-		if (list_is_last(&policy->policy_list, &cpufreq_policy_list))
-			schedule_work(&policy->update);
+		/* RHEL7: This must be called for all cpus */
+		schedule_work(&policy->update);
 	}
 }
 

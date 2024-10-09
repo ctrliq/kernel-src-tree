@@ -138,7 +138,7 @@ static int esw_set_global_vlan_pop(struct mlx5_eswitch *esw, u8 val)
 	esw_debug(esw->dev, "%s applying global %s policy\n", __func__, val ? "pop" : "none");
 	for (vf_vport = 1; vf_vport < esw->enabled_vports; vf_vport++) {
 		rep = &esw->offloads.vport_reps[vf_vport];
-		if (!rep->valid)
+		if (!rep->rep_if[REP_ETH].valid)
 			continue;
 
 		err = __mlx5_eswitch_set_vport_vlan(esw, rep->vport, 0, 0, val);
@@ -354,6 +354,7 @@ out:
 	kvfree(spec);
 	return flow_rule;
 }
+EXPORT_SYMBOL(mlx5_eswitch_add_send_to_vport_rule);
 
 void mlx5_eswitch_del_send_to_vport_rule(struct mlx5_flow_handle *rule)
 {
@@ -735,21 +736,31 @@ int esw_offloads_init_reps(struct mlx5_eswitch *esw)
 	return 0;
 }
 
-static void esw_offloads_unload_reps(struct mlx5_eswitch *esw, int nvports)
+static void esw_offloads_unload_reps_type(struct mlx5_eswitch *esw, int nvports,
+					  u8 rep_type)
 {
 	struct mlx5_eswitch_rep *rep;
 	int vport;
 
 	for (vport = nvports - 1; vport >= 0; vport--) {
 		rep = &esw->offloads.vport_reps[vport];
-		if (!rep->valid)
+		if (!rep->rep_if[rep_type].valid)
 			continue;
 
-		rep->unload(esw, rep);
+		rep->rep_if[rep_type].unload(rep);
 	}
 }
 
-static int esw_offloads_load_reps(struct mlx5_eswitch *esw, int nvports)
+static void esw_offloads_unload_reps(struct mlx5_eswitch *esw, int nvports)
+{
+	u8 rep_type = NUM_REP_TYPES;
+
+	while (rep_type-- > 0)
+		esw_offloads_unload_reps_type(esw, nvports, rep_type);
+}
+
+static int esw_offloads_load_reps_type(struct mlx5_eswitch *esw, int nvports,
+				       u8 rep_type)
 {
 	struct mlx5_eswitch_rep *rep;
 	int vport;
@@ -757,10 +768,10 @@ static int esw_offloads_load_reps(struct mlx5_eswitch *esw, int nvports)
 
 	for (vport = 0; vport < nvports; vport++) {
 		rep = &esw->offloads.vport_reps[vport];
-		if (!rep->valid)
+		if (!rep->rep_if[rep_type].valid)
 			continue;
 
-		err = rep->load(esw, rep);
+		err = rep->rep_if[rep_type].load(esw->dev, rep);
 		if (err)
 			goto err_reps;
 	}
@@ -768,7 +779,26 @@ static int esw_offloads_load_reps(struct mlx5_eswitch *esw, int nvports)
 	return 0;
 
 err_reps:
-	esw_offloads_unload_reps(esw, vport);
+	esw_offloads_unload_reps_type(esw, vport, rep_type);
+	return err;
+}
+
+static int esw_offloads_load_reps(struct mlx5_eswitch *esw, int nvports)
+{
+	u8 rep_type = 0;
+	int err;
+
+	for (rep_type = 0; rep_type < NUM_REP_TYPES; rep_type++) {
+		err = esw_offloads_load_reps_type(esw, nvports, rep_type);
+		if (err)
+			goto err_reps;
+	}
+
+	return err;
+
+err_reps:
+	while (rep_type-- > 0)
+		esw_offloads_unload_reps_type(esw, nvports, rep_type);
 	return err;
 }
 
@@ -1137,23 +1167,25 @@ int mlx5_devlink_eswitch_encap_mode_get(struct devlink *devlink, u8 *encap)
 
 void mlx5_eswitch_register_vport_rep(struct mlx5_eswitch *esw,
 				     int vport_index,
-				     struct mlx5_eswitch_rep *__rep)
+				     struct mlx5_eswitch_rep_if *__rep_if,
+				     u8 rep_type)
 {
 	struct mlx5_esw_offload *offloads = &esw->offloads;
-	struct mlx5_eswitch_rep *rep;
+	struct mlx5_eswitch_rep_if *rep_if;
 
-	rep = &offloads->vport_reps[vport_index];
+	rep_if = &offloads->vport_reps[vport_index].rep_if[rep_type];
 
-	rep->load   = __rep->load;
-	rep->unload = __rep->unload;
-	rep->netdev = __rep->netdev;
+	rep_if->load   = __rep_if->load;
+	rep_if->unload = __rep_if->unload;
+	rep_if->get_proto_dev = __rep_if->get_proto_dev;
+	rep_if->priv = __rep_if->priv;
 
-	INIT_LIST_HEAD(&rep->vport_sqs_list);
-	rep->valid = true;
+	rep_if->valid = true;
 }
+EXPORT_SYMBOL(mlx5_eswitch_register_vport_rep);
 
 void mlx5_eswitch_unregister_vport_rep(struct mlx5_eswitch *esw,
-				       int vport_index)
+				       int vport_index, u8 rep_type)
 {
 	struct mlx5_esw_offload *offloads = &esw->offloads;
 	struct mlx5_eswitch_rep *rep;
@@ -1161,17 +1193,50 @@ void mlx5_eswitch_unregister_vport_rep(struct mlx5_eswitch *esw,
 	rep = &offloads->vport_reps[vport_index];
 
 	if (esw->mode == SRIOV_OFFLOADS && esw->vports[vport_index].enabled)
-		rep->unload(esw, rep);
+		rep->rep_if[rep_type].unload(rep);
 
-	rep->valid = false;
+	rep->rep_if[rep_type].valid = false;
 }
+EXPORT_SYMBOL(mlx5_eswitch_unregister_vport_rep);
 
-struct net_device *mlx5_eswitch_get_uplink_netdev(struct mlx5_eswitch *esw)
+void *mlx5_eswitch_get_uplink_priv(struct mlx5_eswitch *esw, u8 rep_type)
 {
 #define UPLINK_REP_INDEX 0
 	struct mlx5_esw_offload *offloads = &esw->offloads;
 	struct mlx5_eswitch_rep *rep;
 
 	rep = &offloads->vport_reps[UPLINK_REP_INDEX];
-	return rep->netdev;
+	return rep->rep_if[rep_type].priv;
 }
+
+void *mlx5_eswitch_get_proto_dev(struct mlx5_eswitch *esw,
+				 int vport,
+				 u8 rep_type)
+{
+	struct mlx5_esw_offload *offloads = &esw->offloads;
+	struct mlx5_eswitch_rep *rep;
+
+	if (vport == FDB_UPLINK_VPORT)
+		vport = UPLINK_REP_INDEX;
+
+	rep = &offloads->vport_reps[vport];
+
+	if (rep->rep_if[rep_type].valid &&
+	    rep->rep_if[rep_type].get_proto_dev)
+		return rep->rep_if[rep_type].get_proto_dev(rep);
+	return NULL;
+}
+EXPORT_SYMBOL(mlx5_eswitch_get_proto_dev);
+
+void *mlx5_eswitch_uplink_get_proto_dev(struct mlx5_eswitch *esw, u8 rep_type)
+{
+	return mlx5_eswitch_get_proto_dev(esw, UPLINK_REP_INDEX, rep_type);
+}
+EXPORT_SYMBOL(mlx5_eswitch_uplink_get_proto_dev);
+
+struct mlx5_eswitch_rep *mlx5_eswitch_vport_rep(struct mlx5_eswitch *esw,
+						int vport)
+{
+	return &esw->offloads.vport_reps[vport];
+}
+EXPORT_SYMBOL(mlx5_eswitch_vport_rep);

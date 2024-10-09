@@ -153,8 +153,8 @@ struct c4iw_hw_queue {
 };
 
 struct wr_log_entry {
-	struct timespec post_host_ts;
-	struct timespec poll_host_ts;
+	ktime_t post_host_time;
+	ktime_t poll_host_time;
 	u64 post_sge_ts;
 	u64 cqe_sge_ts;
 	u64 poll_sge_ts;
@@ -185,6 +185,10 @@ struct c4iw_rdev {
 	struct wr_log_entry *wr_log;
 	int wr_log_size;
 	struct workqueue_struct *free_workq;
+	struct completion rqt_compl;
+	struct completion pbl_compl;
+	struct kref rqt_kref;
+	struct kref pbl_kref;
 };
 
 static inline int c4iw_fatal_error(struct c4iw_rdev *rdev)
@@ -543,7 +547,6 @@ struct c4iw_qp {
 	struct mutex mutex;
 	struct kref kref;
 	wait_queue_head_t wait;
-	struct timer_list timer;
 	int sq_sig_all;
 	struct work_struct free_work;
 	struct c4iw_ucontext *ucontext;

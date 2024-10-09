@@ -20,7 +20,6 @@
 #include <linux/security.h>
 #include <linux/syscalls.h>
 #include <linux/mmu_notifier.h>
-#include <linux/sched/sysctl.h>
 #include <linux/uaccess.h>
 #include <linux/mm-arch-hooks.h>
 #include <linux/userfaultfd_k.h>
@@ -93,13 +92,15 @@ static pte_t move_soft_dirty_pte(pte_t pte)
 static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 		unsigned long old_addr, unsigned long old_end,
 		struct vm_area_struct *new_vma, pmd_t *new_pmd,
-		unsigned long new_addr, bool need_rmap_locks)
+		unsigned long new_addr, bool need_rmap_locks, bool *need_flush)
 {
 	struct address_space *mapping = NULL;
 	struct anon_vma *anon_vma = NULL;
 	struct mm_struct *mm = vma->vm_mm;
 	pte_t *old_pte, *new_pte, pte;
 	spinlock_t *old_ptl, *new_ptl;
+	bool force_flush = false;
+	unsigned long len = old_end - old_addr;
 
 	/*
 	 * When need_rmap_locks is true, we take the i_mmap_mutex and anon_vma
@@ -146,6 +147,17 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 		if (pte_none(*old_pte))
 			continue;
 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
+		/*
+		 * If we are remapping a dirty PTE, make sure
+		 * to flush TLB before we drop the PTL for the
+		 * old PTE or we may race with page_mkclean().
+		 *
+		 * This check has to be done after we removed the
+		 * old PTE from page tables or another thread may
+		 * dirty it after the check and before the removal.
+		 */
+		if (pte_present(pte) && pte_dirty(pte))
+			force_flush = true;
 		pte = move_pte(pte, new_vma->vm_page_prot, old_addr, new_addr);
 		pte = move_soft_dirty_pte(pte);
 		set_pte_at(mm, new_addr, new_pte, pte);
@@ -155,6 +167,10 @@ static void move_ptes(struct vm_area_struct *vma, pmd_t *old_pmd,
 	if (new_ptl != old_ptl)
 		spin_unlock(new_ptl);
 	pte_unmap(new_pte - 1);
+	if (force_flush)
+		flush_tlb_range(vma, old_end - len, old_end);
+	else
+		*need_flush = true;
 	pte_unmap_unlock(old_pte - 1, old_ptl);
 	if (anon_vma)
 		anon_vma_unlock_write(anon_vma);
@@ -204,14 +220,14 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
 					anon_vma_lock_write(vma->anon_vma);
 				err = move_huge_pmd(vma, new_vma, old_addr,
 						    new_addr, old_end,
-						    old_pmd, new_pmd);
+						    old_pmd, new_pmd,
+						    &need_flush);
 				if (need_rmap_locks)
 					anon_vma_unlock_write(vma->anon_vma);
 			}
-			if (err > 0) {
-				need_flush = true;
+			if (err > 0)
 				continue;
-			} else if (!err) {
+			else if (!err) {
 				split_huge_page_pmd(vma, old_addr, old_pmd);
 			}
 			VM_BUG_ON(pmd_trans_huge(*old_pmd));
@@ -224,11 +240,10 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
 			extent = next - new_addr;
 		if (extent > LATENCY_LIMIT)
 			extent = LATENCY_LIMIT;
-		move_ptes(vma, old_pmd, old_addr, old_addr + extent,
-			  new_vma, new_pmd, new_addr, need_rmap_locks);
-		need_flush = true;
+		move_ptes(vma, old_pmd, old_addr, old_addr + extent, new_vma,
+			  new_pmd, new_addr, need_rmap_locks, &need_flush);
 	}
-	if (likely(need_flush))
+	if (need_flush)
 		flush_tlb_range(vma, old_end-len, old_addr);
 
 	mmu_notifier_invalidate_range_end(vma->vm_mm, mmun_start, mmun_end);
@@ -294,11 +309,10 @@ static unsigned long move_vma(struct vm_area_struct *vma,
 		new_addr = -ENOMEM;
 	} else {
 		mremap_userfaultfd_prep(new_vma, uf);
-		if (vm_flags & VM_FOP_EXTEND) {
-			struct file_operations_extend *fop = to_fop_extend(vma->vm_file->f_op);
-			if (fop->mremap)
+		if (vma->vm_file) {
+			struct file_operations_extend *fop = get_fo_extend(vma->vm_file);
+			if (fop && fop->mremap)
 				fop->mremap(vma->vm_file, new_vma);
-		
 		}
 		arch_remap(mm, old_addr, old_addr + old_len,
 			   new_addr, new_addr + new_len);

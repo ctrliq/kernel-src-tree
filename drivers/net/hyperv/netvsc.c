@@ -32,7 +32,6 @@
 #include <linux/vmalloc.h>
 #include <linux/rtnetlink.h>
 #include <linux/prefetch.h>
-#include <linux/reciprocal_div.h>
 
 #include <asm/sync_bitops.h>
 
@@ -91,6 +90,11 @@ static void free_netvsc_device(struct rcu_head *head)
 		= container_of(head, struct netvsc_device, rcu);
 	int i;
 
+	kfree(nvdev->extension);
+	vfree(nvdev->recv_buf);
+	vfree(nvdev->send_buf);
+	kfree(nvdev->send_section_map);
+
 	for (i = 0; i < VRSS_CHANNEL_MAX; i++)
 		vfree(nvdev->chan_table[i].mrc.slots);
 
@@ -103,10 +107,10 @@ static void free_netvsc_device_rcu(struct netvsc_device *nvdev)
 }
 
 static void netvsc_revoke_recv_buf(struct hv_device *device,
-				   struct netvsc_device *net_device)
+				   struct netvsc_device *net_device,
+				   struct net_device *ndev)
 {
 	struct nvsp_message *revoke_packet;
-	struct net_device *ndev = hv_get_drvdata(device);
 	int ret;
 
 	/*
@@ -151,10 +155,10 @@ static void netvsc_revoke_recv_buf(struct hv_device *device,
 }
 
 static void netvsc_revoke_send_buf(struct hv_device *device,
-				   struct netvsc_device *net_device)
+				   struct netvsc_device *net_device,
+				   struct net_device *ndev)
 {
 	struct nvsp_message *revoke_packet;
-	struct net_device *ndev = hv_get_drvdata(device);
 	int ret;
 
 	/* Deal with the send buffer we may have setup.
@@ -199,10 +203,10 @@ static void netvsc_revoke_send_buf(struct hv_device *device,
 	}
 }
 
-static void netvsc_teardown_recv_buf_gpadl(struct hv_device *device,
-					   struct netvsc_device *net_device)
+static void netvsc_teardown_recv_gpadl(struct hv_device *device,
+				       struct netvsc_device *net_device,
+				       struct net_device *ndev)
 {
-	struct net_device *ndev = hv_get_drvdata(device);
 	int ret;
 
 	if (net_device->recv_buf_gpadl_handle) {
@@ -219,18 +223,12 @@ static void netvsc_teardown_recv_buf_gpadl(struct hv_device *device,
 		}
 		net_device->recv_buf_gpadl_handle = 0;
 	}
-
-	if (net_device->recv_buf) {
-		/* Free up the receive buffer */
-		vfree(net_device->recv_buf);
-		net_device->recv_buf = NULL;
-	}
 }
 
-static void netvsc_teardown_send_buf_gpadl(struct hv_device *device,
-					   struct netvsc_device *net_device)
+static void netvsc_teardown_send_gpadl(struct hv_device *device,
+				       struct netvsc_device *net_device,
+				       struct net_device *ndev)
 {
-	struct net_device *ndev = hv_get_drvdata(device);
 	int ret;
 
 	if (net_device->send_buf_gpadl_handle) {
@@ -247,12 +245,6 @@ static void netvsc_teardown_send_buf_gpadl(struct hv_device *device,
 		}
 		net_device->send_buf_gpadl_handle = 0;
 	}
-	if (net_device->send_buf) {
-		/* Free up the send buffer */
-		vfree(net_device->send_buf);
-		net_device->send_buf = NULL;
-	}
-	kfree(net_device->send_section_map);
 }
 
 int netvsc_alloc_recv_comp_ring(struct netvsc_device *net_device, u32 q_idx)
@@ -297,6 +289,8 @@ static int netvsc_init_buf(struct hv_device *device,
 		ret = -ENOMEM;
 		goto cleanup;
 	}
+
+	net_device->recv_buf_size = buf_size;
 
 	/*
 	 * Establish the gpadl handle for this buffer on this
@@ -447,10 +441,10 @@ static int netvsc_init_buf(struct hv_device *device,
 	goto exit;
 
 cleanup:
-	netvsc_revoke_recv_buf(device, net_device);
-	netvsc_revoke_send_buf(device, net_device);
-	netvsc_teardown_recv_buf_gpadl(device, net_device);
-	netvsc_teardown_send_buf_gpadl(device, net_device);
+	netvsc_revoke_recv_buf(device, net_device, ndev);
+	netvsc_revoke_send_buf(device, net_device, ndev);
+	netvsc_teardown_recv_gpadl(device, net_device, ndev);
+	netvsc_teardown_send_gpadl(device, net_device, ndev);
 
 exit:
 	return ret;
@@ -580,19 +574,17 @@ void netvsc_device_remove(struct hv_device *device)
 		= rtnl_dereference(net_device_ctx->nvdev);
 	int i;
 
-	cancel_work_sync(&net_device->subchan_work);
-
 	/*
 	 * Revoke receive buffer. If host is pre-Win2016 then tear down
 	 * receive buffer GPADL. Do the same for send buffer.
 	 */
-	netvsc_revoke_recv_buf(device, net_device);
+	netvsc_revoke_recv_buf(device, net_device, ndev);
 	if (vmbus_proto_version < VERSION_WIN10)
-		netvsc_teardown_recv_buf_gpadl(device, net_device);
+		netvsc_teardown_recv_gpadl(device, net_device, ndev);
 
-	netvsc_revoke_send_buf(device, net_device);
+	netvsc_revoke_send_buf(device, net_device, ndev);
 	if (vmbus_proto_version < VERSION_WIN10)
-		netvsc_teardown_send_buf_gpadl(device, net_device);
+		netvsc_teardown_send_gpadl(device, net_device, ndev);
 
 	RCU_INIT_POINTER(net_device_ctx->nvdev, NULL);
 
@@ -611,11 +603,11 @@ void netvsc_device_remove(struct hv_device *device)
 
 	/*
 	 * If host is Win2016 or higher then we do the GPADL tear down
-	 * here after VMBus is closed, instead of doing it earlier.
-	 */
+	 * here after VMBus is closed.
+	*/
 	if (vmbus_proto_version >= VERSION_WIN10) {
-		netvsc_teardown_recv_buf_gpadl(device, net_device);
-		netvsc_teardown_send_buf_gpadl(device, net_device);
+		netvsc_teardown_recv_gpadl(device, net_device, ndev);
+		netvsc_teardown_send_gpadl(device, net_device, ndev);
 	}
 
 	/* Release all resources */
@@ -624,17 +616,6 @@ void netvsc_device_remove(struct hv_device *device)
 
 #define RING_AVAIL_PERCENT_HIWATER 20
 #define RING_AVAIL_PERCENT_LOWATER 10
-
-/*
- * Get the percentage of available bytes to write in the ring.
- * The return value is in range from 0 to 100.
- */
-static u32 hv_ringbuf_avail_percent(const struct hv_ring_buffer_info *ring_info)
-{
-	u32 avail_write = hv_get_bytes_to_write(ring_info);
-
-	return reciprocal_divide(avail_write  * 100, netvsc_ring_reciprocal);
-}
 
 static inline void netvsc_free_send_slot(struct netvsc_device *net_device,
 					 u32 index)
@@ -680,14 +661,18 @@ static void netvsc_send_tx_complete(struct netvsc_device *net_device,
 	queue_sends =
 		atomic_dec_return(&net_device->chan_table[q_idx].queue_sends);
 
-	if (net_device->destroy && queue_sends == 0)
-		wake_up(&net_device->wait_drain);
+	if (unlikely(net_device->destroy)) {
+		if (queue_sends == 0)
+			wake_up(&net_device->wait_drain);
+	} else {
+		struct netdev_queue *txq = netdev_get_tx_queue(ndev, q_idx);
 
-	if (netif_tx_queue_stopped(netdev_get_tx_queue(ndev, q_idx)) &&
-	    (hv_ringbuf_avail_percent(&channel->outbound) > RING_AVAIL_PERCENT_HIWATER ||
-	     queue_sends < 1)) {
-		netif_tx_wake_queue(netdev_get_tx_queue(ndev, q_idx));
-		ndev_ctx->eth_stats.wake_queue++;
+		if (netif_tx_queue_stopped(txq) &&
+		    (hv_get_avail_to_write_percent(&channel->outbound) >
+		     RING_AVAIL_PERCENT_HIWATER || queue_sends < 1)) {
+			netif_tx_wake_queue(txq);
+			ndev_ctx->eth_stats.wake_queue++;
+		}
 	}
 }
 
@@ -792,7 +777,7 @@ static inline int netvsc_send_pkt(
 	struct netdev_queue *txq = netdev_get_tx_queue(ndev, packet->q_idx);
 	u64 req_id;
 	int ret;
-	u32 ring_avail = hv_ringbuf_avail_percent(&out_channel->outbound);
+	u32 ring_avail = hv_get_avail_to_write_percent(&out_channel->outbound);
 
 	nvmsg.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
 	if (skb)
@@ -1110,10 +1095,21 @@ static int netvsc_receive(struct net_device *ndev,
 
 	/* Each range represents 1 RNDIS pkt that contains 1 ethernet frame */
 	for (i = 0; i < count; i++) {
-		void *data = recv_buf
-			+ vmxferpage_packet->ranges[i].byte_offset;
+		u32 offset = vmxferpage_packet->ranges[i].byte_offset;
 		u32 buflen = vmxferpage_packet->ranges[i].byte_count;
+		void *data;
 		int ret;
+
+		if (unlikely(offset + buflen > net_device->recv_buf_size)) {
+			status = NVSP_STAT_FAIL;
+			netif_err(net_device_ctx, rx_err, ndev,
+				  "Packet offset:%u + len:%u too big\n",
+				  offset, buflen);
+
+			continue;
+		}
+
+		data = recv_buf + offset;
 
 		/* Pass it to the upper layer */
 		ret = rndis_filter_receive(ndev, net_device,
@@ -1213,13 +1209,6 @@ static struct hv_device *netvsc_channel_to_device(struct vmbus_channel *channel)
 	return primary ? primary->device_obj : channel->device_obj;
 }
 
-/* RHEL-only: remove when 364b605573 is backported */
-static bool netvsc_napi_complete_done(struct napi_struct *n, int work_done)
-{
-	napi_complete_done(n, work_done);
-	return true;
-}
-
 /* Network processing softirq
  * Process data in incoming ring buffer from host
  * Stops when ring is empty or budget is met or exceeded.
@@ -1233,6 +1222,7 @@ int netvsc_poll(struct napi_struct *napi, int budget)
 	struct hv_device *device = netvsc_channel_to_device(channel);
 	struct net_device *ndev = hv_get_drvdata(device);
 	int work_done = 0;
+	int ret;
 
 	/* If starting a new interval */
 	if (!nvchan->desc)
@@ -1244,18 +1234,21 @@ int netvsc_poll(struct napi_struct *napi, int budget)
 		nvchan->desc = hv_pkt_iter_next(channel, nvchan->desc);
 	}
 
-	/* If send of pending receive completions suceeded
-	 *   and did not exhaust NAPI budget this time
-	 *   and not doing busy poll
+	/* Send any pending receive completions */
+	ret = send_recv_completions(ndev, net_device, nvchan);
+
+	/* If it did not exhaust NAPI budget this time
+	 *  and not doing busy poll
 	 * then re-enable host interrupts
-	 *     and reschedule if ring is not empty.
+	 *  and reschedule if ring is not empty
+	 *   or sending receive completion failed.
 	 */
-	if (send_recv_completions(ndev, net_device, nvchan) == 0 &&
-	    work_done < budget &&
-	    netvsc_napi_complete_done(napi, work_done) &&
-	    hv_end_read(&channel->inbound)) {
+	if (work_done < budget &&
+	    napi_complete_done(napi, work_done) &&
+	    (ret || hv_end_read(&channel->inbound)) &&
+	    napi_schedule_prep(napi)) {
 		hv_begin_read(&channel->inbound);
-		napi_reschedule(napi);
+		__napi_schedule(napi);
 	}
 
 	/* Driver may overshoot since multiple packets per descriptor */

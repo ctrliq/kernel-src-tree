@@ -34,6 +34,7 @@
 #include <engine/sw.h>
 
 #include <nvif/class.h>
+#include <nvif/cl0080.h>
 
 struct gk104_fifo_engine_status {
 	bool busy;
@@ -102,6 +103,10 @@ gk104_fifo_class_new(struct nvkm_fifo *base, const struct nvkm_oclass *oclass,
 	if (oclass->engn == &fifo->func->chan) {
 		const struct gk104_fifo_chan_user *user = oclass->engn;
 		return user->ctor(fifo, oclass, argv, argc, pobject);
+	} else
+	if (oclass->engn == &fifo->func->user) {
+		const struct gk104_fifo_user_user *user = oclass->engn;
+		return user->ctor(oclass, argv, argc, pobject);
 	}
 	WARN_ON(1);
 	return -EINVAL;
@@ -113,6 +118,12 @@ gk104_fifo_class_get(struct nvkm_fifo *base, int index,
 {
 	struct gk104_fifo *fifo = gk104_fifo(base);
 	int c = 0;
+
+	if (fifo->func->user.ctor && c++ == index) {
+		oclass->base =  fifo->func->user.user;
+		oclass->engn = &fifo->func->user;
+		return 0;
+	}
 
 	if (fifo->func->chan.ctor && c++ == index) {
 		oclass->base =  fifo->func->chan.user;
@@ -284,6 +295,32 @@ gk104_fifo_recover_runl(struct gk104_fifo *fifo, int runl)
 	schedule_work(&fifo->recover.work);
 }
 
+static struct gk104_fifo_chan *
+gk104_fifo_recover_chid(struct gk104_fifo *fifo, int runl, int chid)
+{
+	struct gk104_fifo_chan *chan;
+	struct nvkm_fifo_cgrp *cgrp;
+
+	list_for_each_entry(chan, &fifo->runlist[runl].chan, head) {
+		if (chan->base.chid == chid) {
+			list_del_init(&chan->head);
+			return chan;
+		}
+	}
+
+	list_for_each_entry(cgrp, &fifo->runlist[runl].cgrp, head) {
+		if (cgrp->id == chid) {
+			chan = list_first_entry(&cgrp->chan, typeof(*chan), head);
+			list_del_init(&chan->head);
+			if (!--cgrp->chan_nr)
+				list_del_init(&cgrp->head);
+			return chan;
+		}
+	}
+
+	return NULL;
+}
+
 static void
 gk104_fifo_recover_chan(struct nvkm_fifo *base, int chid)
 {
@@ -301,13 +338,10 @@ gk104_fifo_recover_chan(struct nvkm_fifo *base, int chid)
 		return;
 
 	/* Lookup SW state for channel, and mark it as dead. */
-	list_for_each_entry(chan, &fifo->runlist[runl].chan, head) {
-		if (chan->base.chid == chid) {
-			list_del_init(&chan->head);
-			chan->killed = true;
-			nvkm_fifo_kevent(&fifo->base, chid);
-			break;
-		}
+	chan = gk104_fifo_recover_chid(fifo, runl, chid);
+	if (chan) {
+		chan->killed = true;
+		nvkm_fifo_kevent(&fifo->base, chid);
 	}
 
 	/* Disable channel. */
@@ -832,11 +866,40 @@ gk104_fifo_fini(struct nvkm_fifo *base)
 }
 
 static int
+gk104_fifo_info(struct nvkm_fifo *base, u64 mthd, u64 *data)
+{
+	struct gk104_fifo *fifo = gk104_fifo(base);
+	switch (mthd) {
+	case NV_DEVICE_FIFO_RUNLISTS:
+		*data = (1ULL << fifo->runlist_nr) - 1;
+		return 0;
+	case NV_DEVICE_FIFO_RUNLIST_ENGINES(0)...
+	     NV_DEVICE_FIFO_RUNLIST_ENGINES(63): {
+		int runl = mthd - NV_DEVICE_FIFO_RUNLIST_ENGINES(0), engn;
+		if (runl < fifo->runlist_nr) {
+			unsigned long engm = fifo->runlist[runl].engm;
+			struct nvkm_engine *engine;
+			*data = 0;
+			for_each_set_bit(engn, &engm, fifo->engine_nr) {
+				if ((engine = fifo->engine[engn].engine))
+					*data |= BIT_ULL(engine->subdev.index);
+			}
+			return 0;
+		}
+	}
+		return -EINVAL;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int
 gk104_fifo_oneinit(struct nvkm_fifo *base)
 {
 	struct gk104_fifo *fifo = gk104_fifo(base);
 	struct nvkm_subdev *subdev = &fifo->base.engine.subdev;
 	struct nvkm_device *device = subdev->device;
+	struct nvkm_vmm *bar = nvkm_bar_bar1_vmm(device);
 	int engn, runl, pbid, ret, i, j;
 	enum nvkm_devidx engidx;
 	u32 *map;
@@ -899,13 +962,12 @@ gk104_fifo_oneinit(struct nvkm_fifo *base)
 	if (ret)
 		return ret;
 
-	ret = nvkm_bar_umap(device->bar, fifo->base.nr * 0x200, 12,
-			    &fifo->user.bar);
+	ret = nvkm_vmm_get(bar, 12, nvkm_memory_size(fifo->user.mem),
+			   &fifo->user.bar);
 	if (ret)
 		return ret;
 
-	nvkm_memory_map(fifo->user.mem, &fifo->user.bar, 0);
-	return 0;
+	return nvkm_memory_map(fifo->user.mem, 0, bar, fifo->user.bar, NULL, 0);
 }
 
 static void
@@ -931,7 +993,7 @@ gk104_fifo_init(struct nvkm_fifo *base)
 		nvkm_wr32(device, 0x04014c + (i * 0x2000), 0xffffffff); /* INTREN */
 	}
 
-	nvkm_wr32(device, 0x002254, 0x10000000 | fifo->user.bar.offset >> 12);
+	nvkm_wr32(device, 0x002254, 0x10000000 | fifo->user.bar->addr >> 12);
 
 	if (fifo->func->init_pbdma_timeout)
 		fifo->func->init_pbdma_timeout(fifo);
@@ -944,14 +1006,15 @@ static void *
 gk104_fifo_dtor(struct nvkm_fifo *base)
 {
 	struct gk104_fifo *fifo = gk104_fifo(base);
+	struct nvkm_device *device = fifo->base.engine.subdev.device;
 	int i;
 
-	nvkm_vm_put(&fifo->user.bar);
-	nvkm_memory_del(&fifo->user.mem);
+	nvkm_vmm_put(nvkm_bar_bar1_vmm(device), &fifo->user.bar);
+	nvkm_memory_unref(&fifo->user.mem);
 
 	for (i = 0; i < fifo->runlist_nr; i++) {
-		nvkm_memory_del(&fifo->runlist[i].mem[1]);
-		nvkm_memory_del(&fifo->runlist[i].mem[0]);
+		nvkm_memory_unref(&fifo->runlist[i].mem[1]);
+		nvkm_memory_unref(&fifo->runlist[i].mem[0]);
 	}
 
 	return fifo;
@@ -961,6 +1024,7 @@ static const struct nvkm_fifo_func
 gk104_fifo_ = {
 	.dtor = gk104_fifo_dtor,
 	.oneinit = gk104_fifo_oneinit,
+	.info = gk104_fifo_info,
 	.init = gk104_fifo_init,
 	.fini = gk104_fifo_fini,
 	.intr = gk104_fifo_intr,

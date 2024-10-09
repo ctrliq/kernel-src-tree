@@ -29,6 +29,7 @@
 #include <linux/err.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <linux/bpf.h>
 
 struct linux_binprm;
 struct cred;
@@ -1474,6 +1475,40 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  * 	@inode we wish to get the security context of.
  *	@ctx is a pointer in which to place the allocated security context.
  *	@ctxlen points to the place to put the length of @ctx.
+ *
+ * Security hooks for using the eBPF maps and programs functionalities through
+ * eBPF syscalls.
+ *
+ * @bpf:
+ *	Do a initial check for all bpf syscalls after the attribute is copied
+ *	into the kernel. The actual security module can implement their own
+ *	rules to check the specific cmd they need.
+ *
+ * @bpf_map:
+ *	Do a check when the kernel generate and return a file descriptor for
+ *	eBPF maps.
+ *
+ *	@map: bpf map that we want to access
+ *	@mask: the access flags
+ *
+ * @bpf_prog:
+ *	Do a check when the kernel generate and return a file descriptor for
+ *	eBPF programs.
+ *
+ *	@prog: bpf prog that userspace want to use.
+ *
+ * @bpf_map_alloc_security:
+ *	Initialize the security field inside bpf map.
+ *
+ * @bpf_map_free_security:
+ *	Clean up the security information stored inside bpf map.
+ *
+ * @bpf_prog_alloc_security:
+ *	Initialize the security field inside bpf program.
+ *
+ * @bpf_prog_free_security:
+ *	Clean up the security information stored inside bpf prog.
+ *
  * This is the main security structure.
  */
 struct security_operations {
@@ -1781,6 +1816,16 @@ struct security_operations {
 				 struct audit_context *actx);
 	void (*audit_rule_free) (void *lsmrule);
 #endif /* CONFIG_AUDIT */
+#ifdef CONFIG_BPF_SYSCALL
+	int (*bpf)(int cmd, union bpf_attr *attr,
+				 unsigned int size);
+	int (*bpf_map)(struct bpf_map *map, fmode_t fmode);
+	int (*bpf_prog)(struct bpf_prog *prog);
+	int (*bpf_map_alloc_security)(struct bpf_map *map);
+	void (*bpf_map_free_security)(struct bpf_map *map);
+	int (*bpf_prog_alloc_security)(struct bpf_prog_aux *aux);
+	void (*bpf_prog_free_security)(struct bpf_prog_aux *aux);
+#endif
 };
 
 /* prototypes */
@@ -3269,6 +3314,50 @@ static inline void securityfs_remove(struct dentry *dentry)
 {}
 
 #endif
+
+#ifdef CONFIG_BPF_SYSCALL
+#ifdef CONFIG_SECURITY
+extern int security_bpf(int cmd, union bpf_attr *attr, unsigned int size);
+extern int security_bpf_map(struct bpf_map *map, fmode_t fmode);
+extern int security_bpf_prog(struct bpf_prog *prog);
+extern int security_bpf_map_alloc(struct bpf_map *map);
+extern void security_bpf_map_free(struct bpf_map *map);
+extern int security_bpf_prog_alloc(struct bpf_prog_aux *aux);
+extern void security_bpf_prog_free(struct bpf_prog_aux *aux);
+#else
+static inline int security_bpf(int cmd, union bpf_attr *attr,
+					     unsigned int size)
+{
+	return 0;
+}
+
+static inline int security_bpf_map(struct bpf_map *map, fmode_t fmode)
+{
+	return 0;
+}
+
+static inline int security_bpf_prog(struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline int security_bpf_map_alloc(struct bpf_map *map)
+{
+	return 0;
+}
+
+static inline void security_bpf_map_free(struct bpf_map *map)
+{ }
+
+static inline int security_bpf_prog_alloc(struct bpf_prog_aux *aux)
+{
+	return 0;
+}
+
+static inline void security_bpf_prog_free(struct bpf_prog_aux *aux)
+{ }
+#endif /* CONFIG_SECURITY */
+#endif /* CONFIG_BPF_SYSCALL */
 
 #ifdef CONFIG_SECURITY
 

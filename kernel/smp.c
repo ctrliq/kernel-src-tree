@@ -561,6 +561,31 @@ void __init smp_init(void)
 	smp_cpus_done(setup_max_cpus);
 }
 
+static int __init nosmt_init(void)
+{
+	unsigned int cpu;
+
+	/*
+	 * SMT soft disabling on X86 requires to bring the CPU out of the BIOS
+	 * 'wait for SIPI' state in order to set the CR4.MCE bit.  The CPU
+	 * marked itself as booted_once in cpu_notify_starting() so the
+	 * cpu_smt_allowed() check will now return false if this is not the
+	 * primary sibling.
+	 */
+	for_each_present_cpu(cpu) {
+		if (!cpu_smt_allowed(cpu)) {
+			/*
+			 * Use the device interface so the cpu 'online' sysfs
+			 * file also gets updated.
+			 */
+			device_offline(get_cpu_device(cpu));
+		}
+	}
+
+	return 0;
+}
+late_initcall_sync(nosmt_init);
+
 /*
  * Call a function on all processors.  May be used during early boot while
  * early_boot_irqs_disabled is set.  Use local_irq_save/restore() instead

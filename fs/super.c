@@ -67,6 +67,18 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 	sb = container_of(shrink, struct super_block, s_shrink);
 
 	/*
+	 * If we are currently mounting the superblock, the underlying
+	 * filesystem might be in a state of partial construction and hence
+	 * it is dangerous to access it. Functions like grab_super() use a
+	 * MS_BORN check to avoid this situation, so do the same here. The
+	 * memory barrier is matched with the one in mount_fs() as we don't
+	 * hold locks here.
+	 */
+	if (!(sb->s_flags & MS_BORN))
+		return -1;
+	smp_rmb();
+
+	/*
 	 * Deadlock avoidance.  We may hold various FS locks, and we don't want
 	 * to recurse into the FS that called us in clear_inode() and friends..
 	 */
@@ -1189,6 +1201,14 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
 	BUG_ON(!sb);
 	WARN_ON(!sb->s_bdi);
 	WARN_ON(sb->s_bdi == &default_backing_dev_info);
+
+	/*
+	 * Write barrier is for prune_super(). We place it before setting
+	 * MS_BORN as the data dependency between the two functions is the
+	 * superblock structure contents that we just set up, not the MS_BORN
+	 * flag.
+	 */
+	smp_wmb();
 	sb->s_flags |= MS_BORN;
 
 	error = security_sb_kern_mount(sb, flags, secdata);

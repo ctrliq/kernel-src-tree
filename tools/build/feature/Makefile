@@ -44,6 +44,7 @@ FILES=                                          \
          test-compile-x32.bin                   \
          test-zlib.bin                          \
          test-lzma.bin                          \
+         test-bpf.bin                           \
          test-get_cpuid.bin                     \
          test-sdt.bin                           \
          test-cxx.bin                           \
@@ -221,6 +222,9 @@ $(OUTPUT)test-zlib.bin:
 
 $(OUTPUT)test-lzma.bin:
 	$(BUILD) -llzma
+
+$(OUTPUT)test-bpf.bin:
+	$(BUILD)
 
 $(OUTPUT)test-get_cpuid.bin:
 	$(BUILD)

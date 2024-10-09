@@ -642,7 +642,7 @@ void zfcp_dbf_scsi_eh(char *tag, struct zfcp_adapter *adapter,
 	unsigned long flags;
 	static int const level = 1;
 
-	if (unlikely(!debug_level_enabled(adapter->dbf->scsi, level)))
+	if (unlikely(level > adapter->dbf->scsi->level))
 		return;
 
 	spin_lock_irqsave(&dbf->scsi_lock, flags);
@@ -656,7 +656,6 @@ void zfcp_dbf_scsi_eh(char *tag, struct zfcp_adapter *adapter,
 	rec->fcp_rsp_info = ~0;
 	rec->scsi_id = scsi_id;
 	rec->scsi_lun = (u32)ZFCP_DBF_INVALID_LUN;
-	rec->scsi_lun_64_hi = (u32)(ZFCP_DBF_INVALID_LUN >> 32);
 	rec->host_scribble = ~0;
 	memset(rec->scsi_opcode, 0xff, ZFCP_DBF_SCSI_OPCODE);
 

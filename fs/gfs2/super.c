@@ -403,6 +403,7 @@ static int init_threads(struct gfs2_sbd *sdp)
 
 fail:
 	kthread_stop(sdp->sd_logd_process);
+	sdp->sd_logd_process = NULL;
 	return error;
 }
 
@@ -460,7 +461,9 @@ fail:
 	gfs2_glock_dq_uninit(&t_gh);
 fail_threads:
 	kthread_stop(sdp->sd_quotad_process);
+	sdp->sd_quotad_process = NULL;
 	kthread_stop(sdp->sd_logd_process);
+	sdp->sd_logd_process = NULL;
 	return error;
 }
 
@@ -850,8 +853,14 @@ static int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
 	struct gfs2_holder t_gh;
 	int error;
 
-	kthread_stop(sdp->sd_quotad_process);
-	kthread_stop(sdp->sd_logd_process);
+	if (sdp->sd_quotad_process) {
+		kthread_stop(sdp->sd_quotad_process);
+		sdp->sd_quotad_process = NULL;
+	}
+	if (sdp->sd_logd_process) {
+		kthread_stop(sdp->sd_logd_process);
+		sdp->sd_logd_process = NULL;
+	}
 
 	flush_workqueue(gfs2_delete_workqueue);
 	gfs2_quota_sync(sdp->sd_vfs, 0);
@@ -859,20 +868,20 @@ static int gfs2_make_fs_ro(struct gfs2_sbd *sdp)
 
 	error = gfs2_glock_nq_init(sdp->sd_trans_gl, LM_ST_SHARED, GL_NOCACHE,
 				   &t_gh);
-	if (error && !test_bit(SDF_SHUTDOWN, &sdp->sd_flags))
+	if (error && !test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) {
+		if (init_threads(sdp) != 0)
+			gfs2_io_error(sdp);
 		return error;
+	}
 
 	gfs2_meta_syncfs(sdp);
-	gfs2_log_shutdown(sdp);
-
-	clear_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags);
+	gfs2_log_shutdown(sdp, 1);
 
 	if (gfs2_holder_initialized(&t_gh))
 		gfs2_glock_dq_uninit(&t_gh);
 
 	gfs2_quota_cleanup(sdp);
-
-	return error;
+	return 0;
 }
 
 /**

@@ -713,9 +713,13 @@ void prune_icache_sb(struct super_block *sb, int nr_to_scan)
 	int nr_scanned;
 	unsigned long reap = 0;
 
+	cond_resched();
+
 	spin_lock(&sb->s_inode_lru_lock);
 	for (nr_scanned = nr_to_scan; nr_scanned >= 0; nr_scanned--) {
 		struct inode *inode;
+
+		cond_resched_lock(&sb->s_inode_lru_lock);
 
 		if (list_empty(&sb->s_inode_lru))
 			break;
