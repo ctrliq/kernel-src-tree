@@ -1,0 +1,145 @@
+net_sched: act_gact: remove spinlock in fast path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: act_gact: remove spinlock in fast path (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 95.74%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 56e5d1ca183d8616fab377d7d466c244b4dbb3b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/56e5d1ca.failed
+
+Final step for gact RCU operation :
+
+1) Use percpu stats
+2) update lastuse only every clock tick to avoid false sharing
+3) Remove spinlock acquisition, as it is no longer needed.
+
+Since this is the last contended lock in packet RX when tc gact is used,
+this gives impressive gain.
+
+My host with 8 RX queues was handling 5 Mpps before the patch,
+and more than 11 Mpps after patch.
+
+Tested:
+
+On receiver :
+
+dev=eth0
+tc qdisc del dev $dev ingress 2>/dev/null
+tc qdisc add dev $dev ingress
+tc filter del dev $dev root pref 10 2>/dev/null
+tc filter del dev $dev pref 10 2>/dev/null
+tc filter add dev $dev est 1sec 4sec parent ffff: protocol ip prio 1 \
+	u32 match ip src 7.0.0.0/8 flowid 1:15 action drop
+
+Sender sends packets flood from 7/8 network
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56e5d1ca183d8616fab377d7d466c244b4dbb3b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/act_gact.c
+diff --cc include/net/act_api.h
+index 11aac9abd0ca,8d2a707a9e87..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -46,6 -49,38 +46,41 @@@ static inline unsigned int tcf_hash(u3
+  	return index & hmask;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int tcf_hashinfo_init(struct tcf_hashinfo *hf, unsigned int mask)
++ {
++ 	int i;
++ 
++ 	spin_lock_init(&hf->lock);
++ 	hf->index = 0;
++ 	hf->hmask = mask;
++ 	hf->htab = kzalloc((mask + 1) * sizeof(struct hlist_head),
++ 			   GFP_KERNEL);
++ 	if (!hf->htab)
++ 		return -ENOMEM;
++ 	for (i = 0; i < mask + 1; i++)
++ 		INIT_HLIST_HEAD(&hf->htab[i]);
++ 	return 0;
++ }
++ 
++ static inline void tcf_hashinfo_destroy(struct tcf_hashinfo *hf)
++ {
++ 	kfree(hf->htab);
++ }
++ 
++ /* Update lastuse only if needed, to avoid dirtying a cache line.
++  * We use a temp variable to avoid fetching jiffies twice.
++  */
++ static inline void tcf_lastuse_update(struct tcf_t *tm)
++ {
++ 	unsigned long now = jiffies;
++ 
++ 	if (tm->lastuse != now)
++ 		tm->lastuse = now;
++ }
++ 
+++>>>>>>> 56e5d1ca183d (net_sched: act_gact: remove spinlock in fast path)
+  #ifdef CONFIG_NET_CLS_ACT
+  
+  #define ACT_P_CREATED 1
+diff --cc net/sched/act_gact.c
+index 3699c538e377,5c1b05170736..000000000000
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@@ -94,12 -88,11 +94,20 @@@ static int tcf_gact_init(struct net *ne
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	pc = tcf_hash_check(parm->index, a, bind, &gact_hash_info);
+ +	if (!pc) {
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*gact),
+ +				     bind, &gact_idx_gen, &gact_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 	if (!tcf_hash_check(parm->index, a, bind)) {
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*gact),
++ 				      bind, true);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 56e5d1ca183d (net_sched: act_gact: remove spinlock in fast path)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (bind)/* dont override defaults */
+@@@ -109,9 -102,9 +117,9 @@@
+  			return -EEXIST;
+  	}
+  
+ -	gact = to_gact(a);
+ +	gact = to_gact(pc);
+  
+- 	spin_lock_bh(&gact->tcf_lock);
++ 	ASSERT_RTNL();
+  	gact->tcf_action = parm->action;
+  #ifdef CONFIG_GACT_PROB
+  	if (p_parm) {
+@@@ -120,9 -117,8 +128,8 @@@
+  		gact->tcfg_ptype   = p_parm->ptype;
+  	}
+  #endif
+- 	spin_unlock_bh(&gact->tcf_lock);
+  	if (ret == ACT_P_CREATED)
+ -		tcf_hash_insert(a);
+ +		tcf_hash_insert(pc, &gact_hash_info);
+  	return ret;
+  }
+  
+* Unmerged path include/net/act_api.h
+* Unmerged path net/sched/act_gact.c
