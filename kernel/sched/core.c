@@ -1976,7 +1976,7 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->last_sum_exec_runtime = 0;
 
 	INIT_LIST_HEAD(&p->numa_entry);
-	p->numa_group = NULL;
+	RCU_INIT_POINTER(p->numa_group, NULL);
 #endif /* CONFIG_NUMA_BALANCING */
 }
 

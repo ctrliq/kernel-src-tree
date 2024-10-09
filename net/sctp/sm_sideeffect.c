@@ -1481,9 +1481,15 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
 			 * a timer, if the timer is already started, and just mod
 			 * the timer with the shorter of the two expiration times
 			 */
-			if (!timer_pending(timer))
+			if (!timer_pending(timer)) {
+				timer->expires = jiffies + timeout;
 				sctp_association_hold(asoc);
-			timer_reduce(timer, jiffies + timeout);
+				add_timer(timer);
+				break;
+			}
+
+			if (time_after(timer->expires, jiffies + timeout))
+				mod_timer(timer, jiffies + timeout);
 			break;
 
 		case SCTP_CMD_TIMER_RESTART:
