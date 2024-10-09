@@ -1,0 +1,188 @@
+mmc: dw_mmc: add reset support to dwmmc host controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mmc] dw_mmc: add reset support to dwmmc host controller (Don Zickus) [1430497]
+Rebuild_FUZZ: 95.24%
+commit-author Guodong Xu <guodong.xu@linaro.org>
+commit d6786fefe816ba60c794f8a41a73b0dd3a4df097
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d6786fef.failed
+
+Dwmmc host controller may in unknown state when entering kernel boot. One
+example is when booting from eMMC, bootloader need initialize MMC host
+controller into some state so it can read. In order to make sure MMC host
+controller in a clean initial state, this reset support is added.
+
+With this patch, a 'resets' property can be added into dw_mmc device
+tree node. The hardware logic is: dwmmc host controller IP receives a reset
+signal from a 'reset provider' (eg. power management unit). The 'resets'
+property points to this reset signal. So, during dwmmc driver probe,
+it can use this signal to reset itself.
+
+Refer to [1] for more information.
+
+[1] Documentation/devicetree/bindings/reset/reset.txt
+
+	Signed-off-by: Guodong Xu <guodong.xu@linaro.org>
+	Signed-off-by: Xinwei Kong <kong.kongxinwei@hisilicon.com>
+	Signed-off-by: Zhangfei Gao <zhangfei.gao@linaro.org>
+	Reviewed-by: Shawn Lin <shawn.lin@rock-chips.com>
+	Signed-off-by: Jaehoon Chung <jh80.chung@samsung.com>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit d6786fefe816ba60c794f8a41a73b0dd3a4df097)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/dw_mmc.c
+diff --cc drivers/mmc/host/dw_mmc.c
+index bc3a1bc4940f,e7eef75a65ef..000000000000
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@@ -2123,30 -2869,26 +2123,37 @@@ static struct dw_mci_board *dw_mci_pars
+  	struct device *dev = host->dev;
+  	struct device_node *np = dev->of_node;
+  	const struct dw_mci_drv_data *drv_data = host->drv_data;
+ -	int ret;
+ -	u32 clock_frequency;
+ +	int idx, ret;
+  
+  	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
+ -	if (!pdata)
+ +	if (!pdata) {
+ +		dev_err(dev, "could not allocate memory for pdata\n");
+  		return ERR_PTR(-ENOMEM);
+ +	}
+  
++ 	/* find reset controller when exist */
++ 	pdata->rstc = devm_reset_control_get_optional(dev, NULL);
++ 	if (IS_ERR(pdata->rstc)) {
++ 		if (PTR_ERR(pdata->rstc) == -EPROBE_DEFER)
++ 			return ERR_PTR(-EPROBE_DEFER);
++ 	}
++ 
+  	/* find out number of slots supported */
+ -	of_property_read_u32(np, "num-slots", &pdata->num_slots);
+ +	if (of_property_read_u32(dev->of_node, "num-slots",
+ +				&pdata->num_slots)) {
+ +		dev_info(dev, "num-slots property not found, "
+ +				"assuming 1 slot is available\n");
+ +		pdata->num_slots = 1;
+ +	}
+ +
+ +	/* get quirks */
+ +	for (idx = 0; idx < ARRAY_SIZE(of_quirks); idx++)
+ +		if (of_get_property(np, of_quirks[idx].quirk, NULL))
+ +			pdata->quirks |= of_quirks[idx].id;
+  
+  	if (of_property_read_u32(np, "fifo-depth", &pdata->fifo_depth))
+ -		dev_info(dev,
+ -			 "fifo-depth property not found, using value of FIFOTH register as default\n");
+ +		dev_info(dev, "fifo-depth property not found, using "
+ +				"value of FIFOTH register as default\n");
+  
+  	of_property_read_u32(np, "card-detect-delay", &pdata->detect_delay_ms);
+  
+@@@ -2236,9 -3001,29 +2245,32 @@@ int dw_mci_probe(struct dw_mci *host
+  		goto err_clk_ciu;
+  	}
+  
+++<<<<<<< HEAD
+ +	host->quirks = host->pdata->quirks;
+++=======
++ 	if (drv_data && drv_data->init) {
++ 		ret = drv_data->init(host);
++ 		if (ret) {
++ 			dev_err(host->dev,
++ 				"implementation specific init failed\n");
++ 			goto err_clk_ciu;
++ 		}
++ 	}
++ 
++ 	if (!IS_ERR(host->pdata->rstc)) {
++ 		reset_control_assert(host->pdata->rstc);
++ 		usleep_range(10, 50);
++ 		reset_control_deassert(host->pdata->rstc);
++ 	}
++ 
++ 	setup_timer(&host->cmd11_timer,
++ 		    dw_mci_cmd11_timer, (unsigned long)host);
++ 
++ 	setup_timer(&host->dto_timer,
++ 		    dw_mci_dto_timer, (unsigned long)host);
+++>>>>>>> d6786fefe816 (mmc: dw_mmc: add reset support to dwmmc host controller)
+  
+  	spin_lock_init(&host->lock);
+ -	spin_lock_init(&host->irq_lock);
+  	INIT_LIST_HEAD(&host->queue);
+  
+  	/*
+@@@ -2378,16 -3165,14 +2410,21 @@@ err_dmaunmap
+  	if (host->use_dma && host->dma_ops->exit)
+  		host->dma_ops->exit(host);
+  
+++<<<<<<< HEAD
+ +	if (host->vmmc)
+ +		regulator_disable(host->vmmc);
+++=======
++ 	if (!IS_ERR(host->pdata->rstc))
++ 		reset_control_assert(host->pdata->rstc);
+++>>>>>>> d6786fefe816 (mmc: dw_mmc: add reset support to dwmmc host controller)
+  
+  err_clk_ciu:
+ -	clk_disable_unprepare(host->ciu_clk);
+ +	if (!IS_ERR(host->ciu_clk))
+ +		clk_disable_unprepare(host->ciu_clk);
+  
+  err_clk_biu:
+ -	clk_disable_unprepare(host->biu_clk);
+ +	if (!IS_ERR(host->biu_clk))
+ +		clk_disable_unprepare(host->biu_clk);
+  
+  	return ret;
+  }
+@@@ -2415,14 -3198,11 +2452,22 @@@ void dw_mci_remove(struct dw_mci *host
+  	if (host->use_dma && host->dma_ops->exit)
+  		host->dma_ops->exit(host);
+  
+++<<<<<<< HEAD
+ +	if (host->vmmc)
+ +		regulator_disable(host->vmmc);
+ +
+ +	if (!IS_ERR(host->ciu_clk))
+ +		clk_disable_unprepare(host->ciu_clk);
+ +
+ +	if (!IS_ERR(host->biu_clk))
+ +		clk_disable_unprepare(host->biu_clk);
+++=======
++ 	if (!IS_ERR(host->pdata->rstc))
++ 		reset_control_assert(host->pdata->rstc);
++ 
++ 	clk_disable_unprepare(host->ciu_clk);
++ 	clk_disable_unprepare(host->biu_clk);
+++>>>>>>> d6786fefe816 (mmc: dw_mmc: add reset support to dwmmc host controller)
+  }
+  EXPORT_SYMBOL(dw_mci_remove);
+  
+* Unmerged path drivers/mmc/host/dw_mmc.c
+diff --git a/include/linux/mmc/dw_mmc.h b/include/linux/mmc/dw_mmc.h
+index 1f2636132520..2de062964c62 100644
+--- a/include/linux/mmc/dw_mmc.h
++++ b/include/linux/mmc/dw_mmc.h
+@@ -17,6 +17,7 @@
+ #include <linux/scatterlist.h>
+ #include <linux/mmc/core.h>
+ #include <linux/dmaengine.h>
++#include <linux/reset.h>
+ 
+ #define MAX_MCI_SLOTS	2
+ 
+@@ -264,6 +265,7 @@ struct dw_mci_board {
+ 	/* delay in mS before detecting cards after interrupt */
+ 	u32 detect_delay_ms;
+ 
++	struct reset_control *rstc;
+ 	struct dw_mci_dma_ops *dma_ops;
+ 	struct dma_pdata *data;
+ };
