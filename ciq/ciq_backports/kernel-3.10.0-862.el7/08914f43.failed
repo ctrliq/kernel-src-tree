@@ -1,0 +1,268 @@
+x86/platform/UV: Bring back the call to map_low_mmrs in uv_system_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] platform/uv: Bring back the call to map_low_mmrs in uv_system_init (Bhupesh Sharma) [1102454]
+Rebuild_FUZZ: 97.06%
+commit-author Alex Thorlton <athorlton@sgi.com>
+commit 08914f436bdd2ed60923f49cbc402307aba20fe4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/08914f43.failed
+
+A while back the following commit:
+
+  d394f2d9d8e1 ("x86/platform/UV: Remove EFI memmap quirk for UV2+")
+
+changed uv_system_init() to only call map_low_mmrs() on older UV1 hardware,
+which requires EFI_OLD_MEMMAP to be set in order to boot.
+
+The recent changes to the EFI memory mapping code in:
+
+  d2f7cbe7b26a ("x86/efi: Runtime services virtual mapping")
+
+exposed some issues with the fact that we were relying on the EFI memory
+mapping mechanisms to map in our MMRs for us, after commit d394f2d9d8e1.
+
+Rather than revert the entire commit and go back to forcing
+EFI_OLD_MEMMAP on all UVs, we're going to add the call to map_low_mmrs()
+back into uv_system_init(), and then fix up our EFI runtime calls to use
+the appropriate page table.
+
+For now, UV2+ will still need efi=old_map to boot, but there will be
+other changes soon that should eliminate the need for this.
+
+	Signed-off-by: Alex Thorlton <athorlton@sgi.com>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Adam Buchbinder <adam.buchbinder@gmail.com>
+	Cc: Len Brown <len.brown@intel.com>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Russ Anderson <rja@sgi.com>
+	Cc: Dimitri Sivanich <sivanich@sgi.com>
+Link: http://lkml.kernel.org/r/1462401592-120735-1-git-send-email-athorlton@sgi.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 08914f436bdd2ed60923f49cbc402307aba20fe4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/x2apic_uv_x.c
+diff --cc arch/x86/kernel/apic/x2apic_uv_x.c
+index cf70e71a6188,d7ce96a7daca..000000000000
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@@ -1426,107 -890,127 +1426,133 @@@ static void __init uv_system_init_hub(v
+  		return;
+  	}
+  	pr_info("UV: Found %s hub\n", hub);
+ +	map_low_mmrs();
+  
+++<<<<<<< HEAD
+ +	uv_bios_init();			/* get uv_systab for decoding */
+ +	if (decode_uv_systab() < 0)
+ +		return;			/* UVsystab problem, abort UV init */
+ +	build_socket_tables();
+ +	build_uv_gr_table();
+ +	uv_init_hub_info(&hub_info);
+ +	uv_possible_blades = num_possible_nodes();
+ +	if (!_node_to_pnode)
+ +		boot_init_possible_blades(&hub_info);
+++=======
++ 	map_low_mmrs();
++ 
++ 	m_n_config.v = uv_read_local_mmr(UVH_RH_GAM_CONFIG_MMR );
++ 	m_val = m_n_config.s.m_skt;
++ 	n_val = m_n_config.s.n_skt;
++ 	pnode_mask = (1 << n_val) - 1;
++ 	n_lshift = get_n_lshift(m_val);
++ 	mmr_base =
++ 	    uv_read_local_mmr(UVH_RH_GAM_MMR_OVERLAY_CONFIG_MMR) &
++ 	    ~UV_MMR_ENABLE;
++ 
++ 	node_id.v = uv_read_local_mmr(UVH_NODE_ID);
++ 	gnode_extra = (node_id.s.node_id & ~((1 << n_val) - 1)) >> 1;
++ 	gnode_upper = ((unsigned long)gnode_extra  << m_val);
++ 	pr_info("UV: N:%d M:%d pnode_mask:0x%x gnode_upper/extra:0x%lx/0x%x n_lshift 0x%x\n",
++ 			n_val, m_val, pnode_mask, gnode_upper, gnode_extra,
++ 			n_lshift);
++ 
++ 	pr_info("UV: global MMR base 0x%lx\n", mmr_base);
++ 
++ 	for(i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++)
++ 		uv_possible_blades +=
++ 		  hweight64(uv_read_local_mmr( UVH_NODE_PRESENT_TABLE + i * 8));
+++>>>>>>> 08914f436bdd (x86/platform/UV: Bring back the call to map_low_mmrs in uv_system_init)
+  
+  	/* uv_num_possible_blades() is really the hub count */
+ -	pr_info("UV: Found %d blades, %d hubs\n",
+ -			is_uv1_hub() ? uv_num_possible_blades() :
+ -			(uv_num_possible_blades() + 1) / 2,
+ -			uv_num_possible_blades());
+ -
+ -	bytes = sizeof(struct uv_blade_info) * uv_num_possible_blades();
+ -	uv_blade_info = kzalloc(bytes, GFP_KERNEL);
+ -	BUG_ON(!uv_blade_info);
+ -
+ -	for (blade = 0; blade < uv_num_possible_blades(); blade++)
+ -		uv_blade_info[blade].memory_nid = -1;
+ +	pr_info("UV: Found %d hubs, %d nodes, %d cpus\n",
+ +			uv_num_possible_blades(),
+ +			num_possible_nodes(),
+ +			num_possible_cpus());
+  
+ -	get_lowmem_redirect(&lowmem_redir_base, &lowmem_redir_size);
+ +	uv_bios_get_sn_info(0, &uv_type, &sn_partition_id, &sn_coherency_id,
+ +			    &sn_region_size, &system_serial_number);
+ +	hub_info.coherency_domain_number = sn_coherency_id;
+ +	uv_rtc_init();
+  
+ -	bytes = sizeof(uv_node_to_blade[0]) * num_possible_nodes();
+ -	uv_node_to_blade = kmalloc(bytes, GFP_KERNEL);
+ -	BUG_ON(!uv_node_to_blade);
+ -	memset(uv_node_to_blade, 255, bytes);
+ +	bytes = sizeof(void *) * uv_num_possible_blades();
+ +	__uv_hub_info_list = kzalloc(bytes, GFP_KERNEL);
+ +	BUG_ON(!__uv_hub_info_list);
+  
+ -	bytes = sizeof(uv_cpu_to_blade[0]) * num_possible_cpus();
+ -	uv_cpu_to_blade = kmalloc(bytes, GFP_KERNEL);
+ -	BUG_ON(!uv_cpu_to_blade);
+ -	memset(uv_cpu_to_blade, 255, bytes);
+ +	bytes = sizeof(struct uv_hub_info_s);
+ +	for_each_node(nodeid) {
+ +		struct uv_hub_info_s *new_hub;
+  
+ -	blade = 0;
+ -	for (i = 0; i < UVH_NODE_PRESENT_TABLE_DEPTH; i++) {
+ -		present = uv_read_local_mmr(UVH_NODE_PRESENT_TABLE + i * 8);
+ -		for (j = 0; j < 64; j++) {
+ -			if (!test_bit(j, &present))
+ -				continue;
+ -			pnode = (i * 64 + j) & pnode_mask;
+ -			uv_blade_info[blade].pnode = pnode;
+ -			uv_blade_info[blade].nr_possible_cpus = 0;
+ -			uv_blade_info[blade].nr_online_cpus = 0;
+ -			spin_lock_init(&uv_blade_info[blade].nmi_lock);
+ -			min_pnode = min(pnode, min_pnode);
+ -			max_pnode = max(pnode, max_pnode);
+ -			blade++;
+ +		if (__uv_hub_info_list[nodeid]) {
+ +			pr_err("UV: Node %d UV HUB already initialized!?\n",
+ +				nodeid);
+ +			BUG();
+  		}
+ -	}
+  
+ -	uv_bios_init();
+ -	uv_bios_get_sn_info(0, &uv_type, &sn_partition_id, &sn_coherency_id,
+ -			    &sn_region_size, &system_serial_number);
+ -	uv_rtc_init();
+ +		/* Allocate new per hub info list */
+ +		new_hub = (nodeid == 0) ?
+ +			&uv_hub_info_node0 :
+ +			kzalloc_node(bytes, GFP_KERNEL, nodeid);
+ +		BUG_ON(!new_hub);
+ +		__uv_hub_info_list[nodeid] = new_hub;
+ +		new_hub = uv_hub_info_list(nodeid);
+ +		BUG_ON(!new_hub);
+ +		*new_hub = hub_info;
+ +
+ +		/* Use information from GAM table if available */
+ +		if (_node_to_pnode)
+ +			new_hub->pnode = _node_to_pnode[nodeid];
+ +		else	/* Fill in during cpu loop */
+ +			new_hub->pnode = 0xffff;
+ +		new_hub->numa_blade_id = uv_node_to_blade_id(nodeid);
+ +		new_hub->memory_nid = -1;
+ +		new_hub->nr_possible_cpus = 0;
+ +		new_hub->nr_online_cpus = 0;
+ +	}
+  
+ -	for_each_present_cpu(cpu) {
+ +	/* Initialize per cpu info */
+ +	for_each_possible_cpu(cpu) {
+  		int apicid = per_cpu(x86_cpu_to_apicid, cpu);
+ +		int numa_node_id;
+ +		unsigned short pnode;
+  
+ -		nid = cpu_to_node(cpu);
+ -		/*
+ -		 * apic_pnode_shift must be set before calling uv_apicid_to_pnode();
+ -		 */
+ -		uv_cpu_hub_info(cpu)->pnode_mask = pnode_mask;
+ -		uv_cpu_hub_info(cpu)->apic_pnode_shift = uvh_apicid.s.pnode_shift;
+ -		uv_cpu_hub_info(cpu)->hub_revision = uv_hub_info->hub_revision;
+ -
+ -		uv_cpu_hub_info(cpu)->m_shift = 64 - m_val;
+ -		uv_cpu_hub_info(cpu)->n_lshift = n_lshift;
+ -
+ +		nodeid = cpu_to_node(cpu);
+ +		numa_node_id = numa_cpu_node(cpu);
+  		pnode = uv_apicid_to_pnode(apicid);
+ -		blade = boot_pnode_to_blade(pnode);
+ -		lcpu = uv_blade_info[blade].nr_possible_cpus;
+ -		uv_blade_info[blade].nr_possible_cpus++;
+ -
+ -		/* Any node on the blade, else will contain -1. */
+ -		uv_blade_info[blade].memory_nid = nid;
+ -
+ -		uv_cpu_hub_info(cpu)->lowmem_remap_base = lowmem_redir_base;
+ -		uv_cpu_hub_info(cpu)->lowmem_remap_top = lowmem_redir_size;
+ -		uv_cpu_hub_info(cpu)->m_val = m_val;
+ -		uv_cpu_hub_info(cpu)->n_val = n_val;
+ -		uv_cpu_hub_info(cpu)->numa_blade_id = blade;
+ -		uv_cpu_hub_info(cpu)->blade_processor_id = lcpu;
+ -		uv_cpu_hub_info(cpu)->pnode = pnode;
+ -		uv_cpu_hub_info(cpu)->gpa_mask = (1UL << (m_val + n_val)) - 1;
+ -		uv_cpu_hub_info(cpu)->gnode_upper = gnode_upper;
+ -		uv_cpu_hub_info(cpu)->gnode_extra = gnode_extra;
+ -		uv_cpu_hub_info(cpu)->global_mmr_base = mmr_base;
+ -		uv_cpu_hub_info(cpu)->coherency_domain_number = sn_coherency_id;
+ -		uv_cpu_hub_info(cpu)->scir.offset = uv_scir_offset(apicid);
+ -		uv_node_to_blade[nid] = blade;
+ -		uv_cpu_to_blade[cpu] = blade;
+ +
+ +		uv_cpu_info_per(cpu)->p_uv_hub_info = uv_hub_info_list(nodeid);
+ +		uv_cpu_info_per(cpu)->blade_cpu_id =
+ +			uv_cpu_hub_info(cpu)->nr_possible_cpus++;
+ +		if (uv_cpu_hub_info(cpu)->memory_nid == -1)
+ +			uv_cpu_hub_info(cpu)->memory_nid = cpu_to_node(cpu);
+ +		if (nodeid != numa_node_id &&	/* init memoryless node */
+ +		    uv_hub_info_list(numa_node_id)->pnode == 0xffff)
+ +			uv_hub_info_list(numa_node_id)->pnode = pnode;
+ +		else if (uv_cpu_hub_info(cpu)->pnode == 0xffff)
+ +			uv_cpu_hub_info(cpu)->pnode = pnode;
+ +		uv_cpu_scir_info(cpu)->offset = uv_scir_offset(apicid);
+  	}
+  
+ -	/* Add blade/pnode info for nodes without cpus */
+ -	for_each_online_node(nid) {
+ -		if (uv_node_to_blade[nid] >= 0)
+ -			continue;
+ -		paddr = node_start_pfn(nid) << PAGE_SHIFT;
+ -		pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
+ -		blade = boot_pnode_to_blade(pnode);
+ -		uv_node_to_blade[nid] = blade;
+ +	for_each_node(nodeid) {
+ +		unsigned short pnode = uv_hub_info_list(nodeid)->pnode;
+ +
+ +		/* Add pnode info for pre-GAM list nodes without cpus */
+ +		if (pnode == 0xffff) {
+ +			unsigned long paddr;
+ +
+ +			paddr = node_start_pfn(nodeid) << PAGE_SHIFT;
+ +			pnode = uv_gpa_to_pnode(uv_soc_phys_ram_to_gpa(paddr));
+ +			uv_hub_info_list(nodeid)->pnode = pnode;
+ +		}
+ +		min_pnode = min(pnode, min_pnode);
+ +		max_pnode = max(pnode, max_pnode);
+ +		pr_info("UV: UVHUB node:%2d pn:%02x nrcpus:%d\n",
+ +			nodeid,
+ +			uv_hub_info_list(nodeid)->pnode,
+ +			uv_hub_info_list(nodeid)->nr_possible_cpus);
+  	}
+  
+ +	pr_info("UV: min_pnode:%02x max_pnode:%02x\n", min_pnode, max_pnode);
+  	map_gru_high(max_pnode);
+  	map_mmr_high(max_pnode);
+  	map_mmioh_high(min_pnode, max_pnode);
+* Unmerged path arch/x86/kernel/apic/x2apic_uv_x.c
