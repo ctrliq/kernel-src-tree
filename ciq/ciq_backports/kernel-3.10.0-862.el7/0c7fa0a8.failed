@@ -1,0 +1,156 @@
+radix-tree: split node->path into offset and height
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthew Wilcox <willy@linux.intel.com>
+commit 0c7fa0a8418cbe0e8963fe36db9575d03b8589f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0c7fa0a8.failed
+
+Neither piece of information we're storing in node->path can be larger
+than 64, so store each in its own unsigned char instead of shifting and
+masking to store them both in an unsigned int.
+
+	Signed-off-by: Matthew Wilcox <willy@linux.intel.com>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Neil Brown <neilb@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0c7fa0a8418cbe0e8963fe36db9575d03b8589f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/radix-tree.c
+diff --cc lib/radix-tree.c
+index c40bb30382f1,dd04b51e5fbb..000000000000
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@@ -519,9 -543,11 +519,10 @@@ int __radix_tree_create(struct radix_tr
+  	while (shift > order) {
+  		if (slot == NULL) {
+  			/* Have to add a child node.  */
+ -			slot = radix_tree_node_alloc(root);
+ -			if (!slot)
+ +			if (!(slot = radix_tree_node_alloc(root)))
+  				return -ENOMEM;
+- 			slot->path = height;
++ 			slot->height = height;
++ 			slot->offset = offset;
+  			slot->parent = node;
+  			if (node) {
+  				rcu_assign_pointer(node->slots[offset],
+@@@ -1278,54 -1317,44 +1278,58 @@@ EXPORT_SYMBOL(radix_tree_gang_lookup_ta
+   * This linear search is at present only useful to shmem_unuse_inode().
+   */
+  static unsigned long __locate(struct radix_tree_node *slot, void *item,
+ -			      unsigned long index, struct locate_info *info)
+ +			      unsigned long index, unsigned long *found_index)
+  {
+- 	unsigned int shift, height;
++ 	unsigned int shift;
+  	unsigned long i;
+  
+++<<<<<<< HEAD
+ +	height = slot->path & RADIX_TREE_HEIGHT_MASK;
+ +	shift = (height-1) * RADIX_TREE_MAP_SHIFT;
+++=======
++ 	shift = slot->height * RADIX_TREE_MAP_SHIFT;
+++>>>>>>> 0c7fa0a8418c (radix-tree: split node->path into offset and height)
+  
+ -	do {
+ -		shift -= RADIX_TREE_MAP_SHIFT;
+ -
+ -		for (i = (index >> shift) & RADIX_TREE_MAP_MASK;
+ -		     i < RADIX_TREE_MAP_SIZE;
+ -		     i++, index += (1UL << shift)) {
+ -			struct radix_tree_node *node =
+ -					rcu_dereference_raw(slot->slots[i]);
+ -			if (node == RADIX_TREE_RETRY)
+ +	for ( ; height > 1; height--) {
+ +		i = (index >> shift) & RADIX_TREE_MAP_MASK;
+ +		for (;;) {
+ +			if (slot->slots[i] != NULL)
+ +				break;
+ +			index &= ~((1UL << shift) - 1);
+ +			index += 1UL << shift;
+ +			if (index == 0)
+ +				goto out;	/* 32-bit wraparound */
+ +			i++;
+ +			if (i == RADIX_TREE_MAP_SIZE)
+  				goto out;
+ -			if (!radix_tree_is_indirect_ptr(node)) {
+ -				if (node == item) {
+ -					info->found_index = index;
+ -					info->stop = true;
+ -					goto out;
+ -				}
+ -				continue;
+ +		}
+ +
+ +		slot = rcu_dereference_raw(slot->slots[i]);
+ +		if (slot == NULL)
+ +			goto out;
+ +		if (!radix_tree_is_indirect_ptr(slot)) {
+ +			if (slot == item) {
+ +				*found_index = index + i;
+ +				index = 0;
+ +			} else {
+ +				index += shift;
+  			}
+ -			node = indirect_to_ptr(node);
+ -			if (is_sibling_entry(slot, node))
+ -				continue;
+ -			slot = node;
+ -			break;
+ +			goto out;
+  		}
+ -		if (i == RADIX_TREE_MAP_SIZE)
+ -			break;
+ -	} while (shift);
+ +		slot = indirect_to_ptr(slot);
+ +		shift -= RADIX_TREE_MAP_SHIFT;
+ +	}
+  
+ +	/* Bottom level: check items */
+ +	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+ +		if (slot->slots[i] == item) {
+ +			*found_index = index + i;
+ +			index = 0;
+ +			goto out;
+ +		}
+ +	}
+ +	index += RADIX_TREE_MAP_SIZE;
+  out:
+ -	if ((index == 0) && (i == RADIX_TREE_MAP_SIZE))
+ -		info->stop = true;
+  	return index;
+  }
+  
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index f94b73d0f147..374f67930c26 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -77,16 +77,13 @@ static inline int radix_tree_is_indirect_ptr(void *ptr)
+ #define RADIX_TREE_MAX_PATH (DIV_ROUND_UP(RADIX_TREE_INDEX_BITS, \
+ 					  RADIX_TREE_MAP_SHIFT))
+ 
+-/* Height component in node->path */
+-#define RADIX_TREE_HEIGHT_SHIFT	(RADIX_TREE_MAX_PATH + 1)
+-#define RADIX_TREE_HEIGHT_MASK	((1UL << RADIX_TREE_HEIGHT_SHIFT) - 1)
+-
+ /* Internally used bits of node->count */
+ #define RADIX_TREE_COUNT_SHIFT	(RADIX_TREE_MAP_SHIFT + 1)
+ #define RADIX_TREE_COUNT_MASK	((1UL << RADIX_TREE_COUNT_SHIFT) - 1)
+ 
+ struct radix_tree_node {
+-	unsigned int	path;	/* Offset in parent & height from the bottom */
++	unsigned char	height;	/* From the bottom */
++	unsigned char	offset;	/* Slot offset in parent */
+ 	unsigned int	count;
+ 	union {
+ 		struct {
+* Unmerged path lib/radix-tree.c
