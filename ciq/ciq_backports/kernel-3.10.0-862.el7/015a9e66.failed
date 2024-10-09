@@ -1,0 +1,190 @@
+RDMA/netlink: clean up message validity array initializer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 015a9e66b9b8c1f28097ed09bf9350708e26249a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/015a9e66.failed
+
+The fix in the parent made me look at that function, and react to how
+illogical and illegible the array initializer was.
+
+Use named array indexes to make it clearer what is going on, and make
+the initializer not depend silently on the exact index numbers.
+
+[ The initializer now also shows an odd inconsistency in the naming:
+  note the IWCM vs IWPM..   - Linus ]
+
+	Cc: Leon Romanovsky <leonro@mellanox.com>
+	Cc: Doug Ledford <dledford@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 015a9e66b9b8c1f28097ed09bf9350708e26249a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/netlink.c
+diff --cc drivers/infiniband/core/netlink.c
+index ffb44107c49a,b12e58787c3d..000000000000
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@@ -41,76 -41,101 +41,102 @@@
+  #include <linux/module.h>
+  #include "core_priv.h"
+  
+ -#include "core_priv.h"
+ -
+ -static DEFINE_MUTEX(rdma_nl_mutex);
+ +struct ibnl_client {
+ +	struct list_head		list;
+ +	int				index;
+ +	int				nops;
+ +	const struct ibnl_client_cbs   *cb_table;
+ +};
+ +
+ +static DEFINE_MUTEX(ibnl_mutex);
+  static struct sock *nls;
+ -static struct {
+ -	const struct rdma_nl_cbs   *cb_table;
+ -} rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ +static LIST_HEAD(client_list);
+  
+ -int rdma_nl_chk_listeners(unsigned int group)
+ +int ibnl_chk_listeners(unsigned int group)
+  {
+++<<<<<<< HEAD
+ +	if (netlink_has_listeners(nls, group) == 0)
+ +		return -1;
+ +	return 0;
+++=======
++ 	return (netlink_has_listeners(nls, group)) ? 0 : -1;
++ }
++ EXPORT_SYMBOL(rdma_nl_chk_listeners);
++ 
++ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
++ {
++ 	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS] = {
++ 		[RDMA_NL_RDMA_CM] = RDMA_NL_RDMA_CM_NUM_OPS,
++ 		[RDMA_NL_IWCM] = RDMA_NL_IWPM_NUM_OPS,
++ 		[RDMA_NL_LS] = RDMA_NL_LS_NUM_OPS,
++ 		[RDMA_NL_NLDEV] = RDMA_NLDEV_NUM_OPS,
++ 	};
++ 
++ 	/*
++ 	 * This BUILD_BUG_ON is intended to catch addition of new
++ 	 * RDMA netlink protocol without updating the array above.
++ 	 */
++ 	BUILD_BUG_ON(RDMA_NL_NUM_CLIENTS != 6);
++ 
++ 	if (type >= RDMA_NL_NUM_CLIENTS)
++ 		return false;
++ 
++ 	return (op < max_num_ops[type]) ? true : false;
+++>>>>>>> 015a9e66b9b8 (RDMA/netlink: clean up message validity array initializer)
+  }
+  
+ -static bool is_nl_valid(unsigned int type, unsigned int op)
+ +int ibnl_add_client(int index, int nops,
+ +		    const struct ibnl_client_cbs cb_table[])
+  {
+ -	const struct rdma_nl_cbs *cb_table;
+ +	struct ibnl_client *cur;
+ +	struct ibnl_client *nl_client;
+  
+ -	if (!is_nl_msg_valid(type, op))
+ -		return false;
+ +	nl_client = kmalloc(sizeof *nl_client, GFP_KERNEL);
+ +	if (!nl_client)
+ +		return -ENOMEM;
+  
+ -	cb_table = rdma_nl_types[type].cb_table;
+ -#ifdef CONFIG_MODULES
+ -	if (!cb_table) {
+ -		mutex_unlock(&rdma_nl_mutex);
+ -		request_module("rdma-netlink-subsys-%d", type);
+ -		mutex_lock(&rdma_nl_mutex);
+ -		cb_table = rdma_nl_types[type].cb_table;
+ -	}
+ -#endif
+ +	nl_client->index	= index;
+ +	nl_client->nops		= nops;
+ +	nl_client->cb_table	= cb_table;
+  
+ -	if (!cb_table || (!cb_table[op].dump && !cb_table[op].doit))
+ -		return false;
+ -	return true;
+ -}
+ +	mutex_lock(&ibnl_mutex);
+  
+ -void rdma_nl_register(unsigned int index,
+ -		      const struct rdma_nl_cbs cb_table[])
+ -{
+ -	mutex_lock(&rdma_nl_mutex);
+ -	if (!is_nl_msg_valid(index, 0)) {
+ -		/*
+ -		 * All clients are not interesting in success/failure of
+ -		 * this call. They want to see the print to error log and
+ -		 * continue their initialization. Print warning for them,
+ -		 * because it is programmer's error to be here.
+ -		 */
+ -		mutex_unlock(&rdma_nl_mutex);
+ -		WARN(true,
+ -		     "The not-valid %u index was supplied to RDMA netlink\n",
+ -		     index);
+ -		return;
+ +	list_for_each_entry(cur, &client_list, list) {
+ +		if (cur->index == index) {
+ +			pr_warn("Client for %d already exists\n", index);
+ +			mutex_unlock(&ibnl_mutex);
+ +			kfree(nl_client);
+ +			return -EINVAL;
+ +		}
+  	}
+  
+ -	if (rdma_nl_types[index].cb_table) {
+ -		mutex_unlock(&rdma_nl_mutex);
+ -		WARN(true,
+ -		     "The %u index is already registered in RDMA netlink\n",
+ -		     index);
+ -		return;
+ -	}
+ +	list_add_tail(&nl_client->list, &client_list);
+ +
+ +	mutex_unlock(&ibnl_mutex);
+  
+ -	rdma_nl_types[index].cb_table = cb_table;
+ -	mutex_unlock(&rdma_nl_mutex);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(rdma_nl_register);
+ +EXPORT_SYMBOL(ibnl_add_client);
+  
+ -void rdma_nl_unregister(unsigned int index)
+ +int ibnl_remove_client(int index)
+  {
+ -	mutex_lock(&rdma_nl_mutex);
+ -	rdma_nl_types[index].cb_table = NULL;
+ -	mutex_unlock(&rdma_nl_mutex);
+ +	struct ibnl_client *cur, *next;
+ +
+ +	mutex_lock(&ibnl_mutex);
+ +	list_for_each_entry_safe(cur, next, &client_list, list) {
+ +		if (cur->index == index) {
+ +			list_del(&(cur->list));
+ +			mutex_unlock(&ibnl_mutex);
+ +			kfree(cur);
+ +			return 0;
+ +		}
+ +	}
+ +	pr_warn("Can't remove callback for client idx %d. Not found\n", index);
+ +	mutex_unlock(&ibnl_mutex);
+ +
+ +	return -EINVAL;
+  }
+ -EXPORT_SYMBOL(rdma_nl_unregister);
+ +EXPORT_SYMBOL(ibnl_remove_client);
+  
+  void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+  		   int len, int client, int op, int flags)
+* Unmerged path drivers/infiniband/core/netlink.c
