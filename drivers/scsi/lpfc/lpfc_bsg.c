@@ -3580,7 +3580,7 @@ lpfc_bsg_issue_mbox_ext_handle_job(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 		job->reply->result = 0;
 
 		lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
-				"2937 SLI_CONFIG ext-buffer maibox command "
+				"2937 SLI_CONFIG ext-buffer mailbox command "
 				"(x%x/x%x) complete bsg job done, bsize:%d\n",
 				phba->mbox_ext_buf_ctx.nembType,
 				phba->mbox_ext_buf_ctx.mboxType, size);
@@ -3591,7 +3591,7 @@ lpfc_bsg_issue_mbox_ext_handle_job(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 					phba->mbox_ext_buf_ctx.mbx_dmabuf, 0);
 	} else {
 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
-				"2938 SLI_CONFIG ext-buffer maibox "
+				"2938 SLI_CONFIG ext-buffer mailbox "
 				"command (x%x/x%x) failure, rc:x%x\n",
 				phba->mbox_ext_buf_ctx.nembType,
 				phba->mbox_ext_buf_ctx.mboxType, rc);
@@ -3624,7 +3624,7 @@ lpfc_bsg_issue_read_mbox_ext_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 		pmboxq->u.mb.mbxStatus = MBXERR_ERROR;
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
-			"2939 SLI_CONFIG ext-buffer rd maibox command "
+			"2939 SLI_CONFIG ext-buffer rd mailbox command "
 			"complete, ctxState:x%x, mbxStatus:x%x\n",
 			phba->mbox_ext_buf_ctx.state, pmboxq->u.mb.mbxStatus);
 
@@ -3661,7 +3661,7 @@ lpfc_bsg_issue_write_mbox_ext_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 		pmboxq->u.mb.mbxStatus = MBXERR_ERROR;
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
-			"2940 SLI_CONFIG ext-buffer wr maibox command "
+			"2940 SLI_CONFIG ext-buffer wr mailbox command "
 			"complete, ctxState:x%x, mbxStatus:x%x\n",
 			phba->mbox_ext_buf_ctx.state, pmboxq->u.mb.mbxStatus);
 
@@ -3939,12 +3939,12 @@ lpfc_bsg_sli_cfg_read_cmd_ext(struct lpfc_hba *phba, struct fc_bsg_job *job,
 	if ((rc == MBX_SUCCESS) || (rc == MBX_BUSY)) {
 		lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
 				"2947 Issued SLI_CONFIG ext-buffer "
-				"maibox command, rc:x%x\n", rc);
+				"mailbox command, rc:x%x\n", rc);
 		return SLI_CONFIG_HANDLED;
 	}
 	lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
 			"2948 Failed to issue SLI_CONFIG ext-buffer "
-			"maibox command, rc:x%x\n", rc);
+			"mailbox command, rc:x%x\n", rc);
 	rc = -EPIPE;
 
 job_error:
@@ -4096,12 +4096,12 @@ lpfc_bsg_sli_cfg_write_cmd_ext(struct lpfc_hba *phba, struct fc_bsg_job *job,
 		if ((rc == MBX_SUCCESS) || (rc == MBX_BUSY)) {
 			lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
 					"2955 Issued SLI_CONFIG ext-buffer "
-					"maibox command, rc:x%x\n", rc);
+					"mailbox command, rc:x%x\n", rc);
 			return SLI_CONFIG_HANDLED;
 		}
 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
 				"2956 Failed to issue SLI_CONFIG ext-buffer "
-				"maibox command, rc:x%x\n", rc);
+				"mailbox command, rc:x%x\n", rc);
 		rc = -EPIPE;
 		goto job_error;
 	}
@@ -4437,12 +4437,12 @@ lpfc_bsg_write_ebuf_set(struct lpfc_hba *phba, struct fc_bsg_job *job,
 		if ((rc == MBX_SUCCESS) || (rc == MBX_BUSY)) {
 			lpfc_printf_log(phba, KERN_INFO, LOG_LIBDFC,
 					"2969 Issued SLI_CONFIG ext-buffer "
-					"maibox command, rc:x%x\n", rc);
+					"mailbox command, rc:x%x\n", rc);
 			return SLI_CONFIG_HANDLED;
 		}
 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
 				"2970 Failed to issue SLI_CONFIG ext-buffer "
-				"maibox command, rc:x%x\n", rc);
+				"mailbox command, rc:x%x\n", rc);
 		rc = -EPIPE;
 		goto job_error;
 	}
