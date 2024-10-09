@@ -1,0 +1,243 @@
+gfs2: Issue revokes more intelligently
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 5e4c7632aae1cce137792647f4fb6f599d1da893
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/5e4c7632.failed
+
+Before this patch, function gfs2_write_revokes would call
+gfs2_ail1_empty, then traverse the sd_ail1_list looking for
+transactions that had bds which were no longer queued to a glock.
+And if it found some, it would try to issue revokes for them, up to
+a predetermined maximum. There were two problems with how it did
+this. First was the fact that gfs2_ail1_empty moves transactions
+which have nothing remaining on the ail1 list from the sd_ail1_list
+to the sd_ail2_list, thus making its traversal of sd_ail1_list
+miss them completely, and therefore, never issue revokes for them.
+Second was the fact that there were three traversals (or partial
+traversals) of the sd_ail1_list, each of which took and then
+released the sd_ail_lock lock: First inside gfs2_ail1_empty,
+second to determine if there are any revokes to be issued, and
+third to actually issue them. All this taking and releasing of the
+sd_ail_lock meant other processes could modify the lists and the
+conditions in which we're working.
+
+This patch simplies the whole process by adding a new parameter
+to function gfs2_ail1_empty, max_revokes. For normal calls, this
+is passed in as 0, meaning we don't want to issue any revokes.
+For function gfs2_write_revokes, we pass in the maximum number
+of revokes we can, thus allowing gfs2_ail1_empty to add the
+revokes where needed. This simplies the code, allows for a single
+holding of the sd_ail_lock, and allows gfs2_ail1_empty to add
+revokes for all the necessary bd items without missing any.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 5e4c7632aae1cce137792647f4fb6f599d1da893)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,578c1e0cd415..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -192,13 -206,35 +194,29 @@@ static void gfs2_ail1_empty_one(struct 
+  					 bd_ail_st_list) {
+  		bh = bd->bd_bh;
+  		gfs2_assert(sdp, bd->bd_tr == tr);
+ -		/*
+ -		 * If another process flagged an io error, e.g. writing to the
+ -		 * journal, error all other bhs and move them off the ail1 to
+ -		 * prevent a tight loop when unmount tries to flush ail1,
+ -		 * regardless of whether they're still busy. If no outside
+ -		 * errors were found and the buffer is busy, move to the next.
+ -		 * If the ail buffer is not busy and caught an error, flag it
+ -		 * for others.
+ -		 */
+ -		if (!sdp->sd_log_error && buffer_busy(bh))
+ +		if (buffer_busy(bh))
+  			continue;
+ -		if (!buffer_uptodate(bh) &&
+ -		    !cmpxchg(&sdp->sd_log_error, 0, -EIO)) {
+ +		if (!buffer_uptodate(bh))
+  			gfs2_io_error_bh(sdp, bh);
+++<<<<<<< HEAD
+++=======
++ 			gfs2_withdraw_delayed(sdp);
++ 		}
++ 		/*
++ 		 * If we have space for revokes and the bd is no longer on any
++ 		 * buf list, we can just add a revoke for it immediately and
++ 		 * avoid having to put it on the ail2 list, where it would need
++ 		 * to be revoked later.
++ 		 */
++ 		if (*max_revokes && list_empty(&bd->bd_list)) {
++ 			gfs2_add_revoke(sdp, bd);
++ 			(*max_revokes)--;
++ 			continue;
++ 		}
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  		list_move(&bd->bd_ail_st_list, &tr->tr_ail2_list);
+  	}
+ +
+  }
+  
+  /**
+@@@ -557,34 -626,39 +576,48 @@@ void gfs2_add_revoke(struct gfs2_sbd *s
+  	bd->bd_blkno = bh->b_blocknr;
+  	gfs2_remove_from_ail(bd); /* drops ref on bh */
+  	bd->bd_bh = NULL;
+ +	bd->bd_ops = &gfs2_revoke_lops;
+  	sdp->sd_log_num_revoke++;
+ -	if (atomic_inc_return(&gl->gl_revokes) == 1)
+ -		gfs2_glock_hold(gl);
+ +	atomic_inc(&gl->gl_revokes);
+  	set_bit(GLF_LFLUSH, &gl->gl_flags);
+ -	list_add(&bd->bd_list, &sdp->sd_log_revokes);
+ -}
+ -
+ -void gfs2_glock_remove_revoke(struct gfs2_glock *gl)
+ -{
+ -	if (atomic_dec_return(&gl->gl_revokes) == 0) {
+ -		clear_bit(GLF_LFLUSH, &gl->gl_flags);
+ -		gfs2_glock_queue_put(gl);
+ -	}
+ +	list_add(&bd->bd_list, &sdp->sd_log_le_revoke);
+  }
+  
++ /**
++  * gfs2_write_revokes - Add as many revokes to the system transaction as we can
++  * @sdp: The GFS2 superblock
++  *
++  * Our usual strategy is to defer writing revokes as much as we can in the hope
++  * that we'll eventually overwrite the journal, which will make those revokes
++  * go away.  This changes when we flush the log: at that point, there will
++  * likely be some left-over space in the last revoke block of that transaction.
++  * We can fill that space with additional revokes for blocks that have already
++  * been written back.  This will basically come at no cost now, and will save
++  * us from having to keep track of those blocks on the AIL2 list later.
++  */
+  void gfs2_write_revokes(struct gfs2_sbd *sdp)
+  {
+- 	struct gfs2_trans *tr;
+- 	struct gfs2_bufdata *bd, *tmp;
+- 	int have_revokes = 0;
++ 	/* number of revokes we still have room for */
+  	int max_revokes = (sdp->sd_sb.sb_bsize - sizeof(struct gfs2_log_descriptor)) / sizeof(u64);
+  
+++<<<<<<< HEAD
+ +	gfs2_ail1_empty(sdp);
+ +	spin_lock(&sdp->sd_ail_lock);
+ +	list_for_each_entry(tr, &sdp->sd_ail1_list, tr_list) {
+ +		list_for_each_entry(bd, &tr->tr_ail2_list, bd_ail_st_list) {
+ +			if (list_empty(&bd->bd_list)) {
+ +				have_revokes = 1;
+ +				goto done;
+ +			}
+ +		}
+ +	}
+ +done:
+ +	spin_unlock(&sdp->sd_ail_lock);
+ +	if (have_revokes == 0)
+ +		return;
+++=======
++ 	gfs2_log_lock(sdp);
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  	while (sdp->sd_log_num_revoke > max_revokes)
+  		max_revokes += (sdp->sd_sb.sb_bsize - sizeof(struct gfs2_meta_header)) / sizeof(u64);
+  	max_revokes -= sdp->sd_log_num_revoke;
+@@@ -595,20 -669,7 +628,24 @@@
+  		if (!sdp->sd_log_blks_reserved)
+  			atomic_dec(&sdp->sd_log_blks_free);
+  	}
+++<<<<<<< HEAD
+ +	gfs2_log_lock(sdp);
+ +	spin_lock(&sdp->sd_ail_lock);
+ +	list_for_each_entry(tr, &sdp->sd_ail1_list, tr_list) {
+ +		list_for_each_entry_safe(bd, tmp, &tr->tr_ail2_list, bd_ail_st_list) {
+ +			if (max_revokes == 0)
+ +				goto out_of_blocks;
+ +			if (!list_empty(&bd->bd_list))
+ +				continue;
+ +			gfs2_add_revoke(sdp, bd);
+ +			max_revokes--;
+ +		}
+ +	}
+ +out_of_blocks:
+ +	spin_unlock(&sdp->sd_ail_lock);
+++=======
++ 	gfs2_ail1_empty(sdp, max_revokes);
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  	gfs2_log_unlock(sdp);
+  
+  	if (!sdp->sd_log_num_revoke) {
+@@@ -725,7 -862,31 +762,35 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  	}
+  	spin_unlock(&sdp->sd_ail_lock);
+  	gfs2_log_unlock(sdp);
+++<<<<<<< HEAD
+ +	trace_gfs2_log_flush(sdp, 0);
+++=======
++ 
++ 	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
++ 		if (!sdp->sd_log_idle) {
++ 			for (;;) {
++ 				gfs2_ail1_start(sdp);
++ 				gfs2_ail1_wait(sdp);
++ 				if (gfs2_ail1_empty(sdp, 0))
++ 					break;
++ 			}
++ 			if (gfs2_withdrawn(sdp))
++ 				goto out;
++ 			atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
++ 			trace_gfs2_log_blocks(sdp, -1);
++ 			log_write_header(sdp, flags);
++ 			sdp->sd_log_head = sdp->sd_log_flush_head;
++ 		}
++ 		if (flags & (GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
++ 			     GFS2_LOG_HEAD_FLUSH_FREEZE))
++ 			gfs2_log_shutdown(sdp);
++ 		if (flags & GFS2_LOG_HEAD_FLUSH_FREEZE)
++ 			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 	}
++ 
++ out:
++ 	trace_gfs2_log_flush(sdp, 0, flags);
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  	up_write(&sdp->sd_log_flush_lock);
+  
+  	kfree(tr);
+@@@ -905,16 -1038,18 +970,28 @@@ int gfs2_logd(void *data
+  
+  		did_flush = false;
+  		if (gfs2_jrnl_flush_reqd(sdp) || t == 0) {
+++<<<<<<< HEAD
+ +			gfs2_ail1_empty(sdp);
+ +			gfs2_log_flush(sdp, NULL);
+++=======
++ 			gfs2_ail1_empty(sdp, 0);
++ 			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 				       GFS2_LFC_LOGD_JFLUSH_REQD);
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  			did_flush = true;
+  		}
+  
+  		if (gfs2_ail_flush_reqd(sdp)) {
+  			gfs2_ail1_start(sdp);
+  			gfs2_ail1_wait(sdp);
+++<<<<<<< HEAD
+ +			gfs2_ail1_empty(sdp);
+ +			gfs2_log_flush(sdp, NULL);
+++=======
++ 			gfs2_ail1_empty(sdp, 0);
++ 			gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 				       GFS2_LFC_LOGD_AIL_FLUSH_REQD);
+++>>>>>>> 5e4c7632aae1 (gfs2: Issue revokes more intelligently)
+  			did_flush = true;
+  		}
+  
+* Unmerged path fs/gfs2/log.c
