@@ -1,0 +1,325 @@
+alx: prepare interrupt functions for multiple queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit e0eac25460902a4eda07c0e9b3e749d198e074fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e0eac254.failed
+
+Extend the interrupt bringup code and the interrupt handler for msi-x
+interrupts in order to handle multiple queues.
+
+We must change the poll function because with multiple queues it is possible
+that an alx_napi structure has only a tx or only a rx queue pointer.
+
+Based on the downstream driver at github.com/qca/alx
+
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e0eac25460902a4eda07c0e9b3e749d198e074fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/alx/main.c
+diff --cc drivers/net/ethernet/atheros/alx/main.c
+index b165b9e58ad3,aeb42120910d..000000000000
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@@ -297,14 -282,17 +297,21 @@@ next_pkt
+  
+  static int alx_poll(struct napi_struct *napi, int budget)
+  {
+ -	struct alx_napi *np = container_of(napi, struct alx_napi, napi);
+ -	struct alx_priv *alx = np->alx;
+ +	struct alx_priv *alx = container_of(napi, struct alx_priv, napi);
+  	struct alx_hw *hw = &alx->hw;
+  	unsigned long flags;
+- 	bool tx_complete;
+- 	int work;
++ 	bool tx_complete = true;
++ 	int work = 0;
+  
+++<<<<<<< HEAD
+ +	tx_complete = alx_clean_tx_irq(alx);
+ +	work = alx_clean_rx_irq(alx, budget);
+++=======
++ 	if (np->txq)
++ 		tx_complete = alx_clean_tx_irq(np->txq);
++ 	if (np->rxq)
++ 		work = alx_clean_rx_irq(np->rxq, budget);
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  
+  	if (!tx_complete || work == budget)
+  		return budget;
+@@@ -382,15 -370,15 +389,15 @@@ static irqreturn_t alx_intr_handle(stru
+  
+  static irqreturn_t alx_intr_msix_ring(int irq, void *data)
+  {
+ -	struct alx_napi *np = data;
+ -	struct alx_hw *hw = &np->alx->hw;
+ +	struct alx_priv *alx = data;
+ +	struct alx_hw *hw = &alx->hw;
+  
+  	/* mask interrupt to ACK chip */
+- 	alx_mask_msix(hw, 1, true);
++ 	alx_mask_msix(hw, np->vec_idx, true);
+  	/* clear interrupt status */
+- 	alx_write_mem32(hw, ALX_ISR, (ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0));
++ 	alx_write_mem32(hw, ALX_ISR, np->vec_mask);
+  
+ -	napi_schedule(&np->napi);
+ +	napi_schedule(&alx->napi);
+  
+  	return IRQ_HANDLED;
+  }
+@@@ -646,54 -633,120 +653,148 @@@ static int alx_alloc_rings(struct alx_p
+  	BUILD_BUG_ON(sizeof(struct alx_txd) % 8);
+  	BUILD_BUG_ON(sizeof(struct alx_rrd) % 8);
+  
+ -	offset = alx_alloc_tx_ring(alx, alx->qnapi[0]->txq, offset);
+ +	offset = alx_alloc_tx_ring(alx, &alx->txq, offset);
+  	if (offset < 0) {
+  		netdev_err(alx->dev, "Allocation of tx buffer failed!\n");
+ -		return -ENOMEM;
+ +		goto out_free;
+  	}
+  
+ -	offset = alx_alloc_rx_ring(alx, alx->qnapi[0]->rxq, offset);
+ +	offset = alx_alloc_rx_ring(alx, &alx->rxq, offset);
+  	if (offset < 0) {
+  		netdev_err(alx->dev, "Allocation of rx buffer failed!\n");
+ -		return -ENOMEM;
+ +		goto out_free;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	alx_reinit_rings(alx);
++ 
++ 	return 0;
++ }
++ 
++ static void alx_free_rings(struct alx_priv *alx)
++ {
++ 
++ 	alx_free_buffers(alx);
++ 
++ 	kfree(alx->qnapi[0]->txq->bufs);
++ 	kfree(alx->qnapi[0]->rxq->bufs);
++ 
++ 	if (!alx->descmem.virt)
++ 		dma_free_coherent(&alx->hw.pdev->dev,
++ 				  alx->descmem.size,
++ 				  alx->descmem.virt,
++ 				  alx->descmem.dma);
++ }
++ 
++ static void alx_free_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 
++ 	np = alx->qnapi[0];
++ 	if (!np)
++ 		return;
++ 
++ 	netif_napi_del(&np->napi);
++ 	kfree(np->txq);
++ 	kfree(np->rxq);
++ 	kfree(np);
++ 	alx->qnapi[0] = NULL;
++ }
++ 
++ static const u32 tx_vect_mask[] = {ALX_ISR_TX_Q0, ALX_ISR_TX_Q1,
++ 				   ALX_ISR_TX_Q2, ALX_ISR_TX_Q3};
++ static const u32 rx_vect_mask[] = {ALX_ISR_RX_Q0, ALX_ISR_RX_Q1,
++ 				   ALX_ISR_RX_Q2, ALX_ISR_RX_Q3,
++ 				   ALX_ISR_RX_Q4, ALX_ISR_RX_Q5,
++ 				   ALX_ISR_RX_Q6, ALX_ISR_RX_Q7};
++ 
++ static int alx_alloc_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	struct alx_rx_queue *rxq;
++ 	struct alx_tx_queue *txq;
++ 
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
+- 	alx->int_mask |= ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0;
+  
+ -	/* allocate alx_napi structures */
+ -	np = kzalloc(sizeof(struct alx_napi), GFP_KERNEL);
+ -	if (!np)
+ -		goto err_out;
+ +	netif_napi_add(alx->dev, &alx->napi, alx_poll, 64);
+  
+++<<<<<<< HEAD
+ +	alx_reinit_rings(alx);
+++=======
++ 	np->alx = alx;
++ 	netif_napi_add(alx->dev, &np->napi, alx_poll, 64);
++ 	alx->qnapi[0] = np;
++ 
++ 	/* allocate tx queues */
++ 	np = alx->qnapi[0];
++ 	txq = kzalloc(sizeof(*txq), GFP_KERNEL);
++ 	if (!txq)
++ 		goto err_out;
++ 
++ 	np->txq = txq;
++ 	txq->queue_idx = 0;
++ 	txq->count = alx->tx_ringsz;
++ 	txq->netdev = alx->dev;
++ 	txq->dev = &alx->hw.pdev->dev;
++ 	np->vec_mask |= tx_vect_mask[0];
++ 	alx->int_mask |= tx_vect_mask[0];
++ 
++ 	/* allocate rx queues */
++ 	np = alx->qnapi[0];
++ 	rxq = kzalloc(sizeof(*rxq), GFP_KERNEL);
++ 	if (!rxq)
++ 		goto err_out;
++ 
++ 	np->rxq = rxq;
++ 	rxq->np = alx->qnapi[0];
++ 	rxq->queue_idx = 0;
++ 	rxq->count = alx->rx_ringsz;
++ 	rxq->netdev = alx->dev;
++ 	rxq->dev = &alx->hw.pdev->dev;
++ 	np->vec_mask |= rx_vect_mask[0];
++ 	alx->int_mask |= rx_vect_mask[0];
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  
+  	return 0;
+ -
+ -err_out:
+ -	netdev_err(alx->dev, "error allocating internal structures\n");
+ -	alx_free_napis(alx);
+ +out_free:
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static void alx_free_rings(struct alx_priv *alx)
+ +{
+ +	netif_napi_del(&alx->napi);
+ +	alx_free_buffers(alx);
+ +
+ +	kfree(alx->txq.bufs);
+ +	kfree(alx->rxq.bufs);
+ +
+ +	if (alx->rx_page) {
+ +		put_page(alx->rx_page);
+ +		alx->rx_page = NULL;
+ +	}
+ +
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+ +}
+++=======
++ static const int txq_vec_mapping_shift[] = {
++ 	0, ALX_MSI_MAP_TBL1_TXQ0_SHIFT,
++ 	0, ALX_MSI_MAP_TBL1_TXQ1_SHIFT,
++ 	1, ALX_MSI_MAP_TBL2_TXQ2_SHIFT,
++ 	1, ALX_MSI_MAP_TBL2_TXQ3_SHIFT,
++ };
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  
+  static void alx_config_vector_mapping(struct alx_priv *alx)
+  {
+@@@ -745,14 -814,29 +862,37 @@@ static int alx_request_msix(struct alx_
+  	if (err)
+  		goto out_err;
+  
+++<<<<<<< HEAD
+ +	vector++;
+ +	sprintf(alx->irq_lbl, "%s-TxRx-0", netdev->name);
+ +
+ +	err = request_irq(alx->msix_entries[vector].vector,
+ +			  alx_intr_msix_ring, 0, alx->irq_lbl, alx);
+++=======
++ 	for (i = 0; i < alx->num_napi; i++) {
++ 		struct alx_napi *np = alx->qnapi[i];
++ 
++ 		vector++;
++ 
++ 		if (np->txq && np->rxq)
++ 			sprintf(np->irq_lbl, "%s-TxRx-%u", netdev->name,
++ 				np->txq->queue_idx);
++ 		else if (np->txq)
++ 			sprintf(np->irq_lbl, "%s-tx-%u", netdev->name,
++ 				np->txq->queue_idx);
++ 		else if (np->rxq)
++ 			sprintf(np->irq_lbl, "%s-rx-%u", netdev->name,
++ 				np->rxq->queue_idx);
++ 		else
++ 			sprintf(np->irq_lbl, "%s-unused", netdev->name);
++ 
++ 		np->vec_idx = vector;
++ 		err = request_irq(alx->msix_entries[vector].vector,
++ 				  alx_intr_msix_ring, 0, np->irq_lbl, np);
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  		if (err)
+  			goto out_free;
+- 
++ 	}
+  	return 0;
+  
+  out_free:
+@@@ -760,7 -844,8 +900,12 @@@
+  
+  	vector--;
+  	for (i = 0; i < vector; i++)
+++<<<<<<< HEAD
+ +		free_irq(alx->msix_entries[free_vector++].vector, alx);
+++=======
++ 		free_irq(alx->msix_entries[free_vector++].vector,
++ 			 alx->qnapi[i]);
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  
+  out_err:
+  	return err;
+@@@ -877,12 -984,13 +1045,19 @@@ out
+  static void alx_free_irq(struct alx_priv *alx)
+  {
+  	struct pci_dev *pdev = alx->hw.pdev;
+ -	int i, vector = 0;
+ +	int i;
+  
+  	if (alx->flags & ALX_FLAG_USING_MSIX) {
+++<<<<<<< HEAD
+ +		/* we have only 2 vectors without multi queue support */
+ +		for (i = 0; i < 2; i++)
+ +			free_irq(alx->msix_entries[i].vector, alx);
+++=======
++ 		free_irq(alx->msix_entries[vector++].vector, alx);
++ 		for (i = 0; i < alx->num_napi; i++)
++ 			free_irq(alx->msix_entries[vector++].vector,
++ 				 alx->qnapi[i]);
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  	} else {
+  		free_irq(pdev->irq, alx);
+  	}
+@@@ -1458,7 -1558,8 +1634,12 @@@ static void alx_poll_controller(struct 
+  
+  	if (alx->flags & ALX_FLAG_USING_MSIX) {
+  		alx_intr_msix_misc(0, alx);
+++<<<<<<< HEAD
+ +		alx_intr_msix_ring(0, alx);
+++=======
++ 		for (i = 0; i < alx->num_txq; i++)
++ 			alx_intr_msix_ring(0, alx->qnapi[i]);
+++>>>>>>> e0eac2546090 (alx: prepare interrupt functions for multiple queues)
+  	} else if (alx->flags & ALX_FLAG_USING_MSI)
+  		alx_intr_msi(0, alx);
+  	else
+* Unmerged path drivers/net/ethernet/atheros/alx/main.c
