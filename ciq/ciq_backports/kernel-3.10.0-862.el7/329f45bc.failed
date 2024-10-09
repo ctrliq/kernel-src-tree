@@ -1,0 +1,138 @@
+openvswitch: add mac_proto field to the flow key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 329f45bc4f191c663dc156c510816411a4310578
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/329f45bc.failed
+
+Use a hole in the structure. We support only Ethernet so far and will add
+a support for L2-less packets shortly. We could use a bool to indicate
+whether the Ethernet header is present or not but the approach with the
+mac_proto field is more generic and occupies the same number of bytes in the
+struct, while allowing later extensibility. It also makes the code in the
+next patches more self explaining.
+
+It would be nice to use ARPHRD_ constants but those are u16 which would be
+waste. Thus define our own constants.
+
+Another upside of this is that we can overload this new field to also denote
+whether the flow key is valid. This has the advantage that on
+refragmentation, we don't have to reparse the packet but can rely on the
+stored eth.type. This is especially important for the next patches in this
+series - instead of adding another branch for L2-less packets before calling
+ovs_fragment, we can just remove all those branches completely.
+
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 329f45bc4f191c663dc156c510816411a4310578)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/actions.c
+diff --cc net/openvswitch/actions.c
+index 3e99057f11b4,44144f914920..000000000000
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@@ -791,16 -795,9 +791,22 @@@ static void do_output(struct datapath *
+  		           (skb->len <= mru + vport->dev->hard_header_len))) {
+  			ovs_vport_send(vport, skb);
+  		} else if (mru <= vport->dev->mtu) {
+++<<<<<<< HEAD
+ +			__be16 ethertype = key->eth.type;
+ +
+ +			if (!is_flow_key_valid(key)) {
+ +				if (eth_p_mpls(skb->protocol))
+ +					ethertype = skb->inner_protocol;
+ +				else
+ +					ethertype = vlan_get_protocol(skb);
+ +			}
+ +
+ +			ovs_fragment(vport, skb, mru, ethertype);
+++=======
++ 			struct net *net = read_pnet(&dp->net);
++ 
++ 			ovs_fragment(net, vport, skb, mru, key->eth.type);
+++>>>>>>> 329f45bc4f19 (openvswitch: add mac_proto field to the flow key)
+  		} else {
+  			kfree_skb(skb);
+  		}
+* Unmerged path net/openvswitch/actions.c
+diff --git a/net/openvswitch/flow.c b/net/openvswitch/flow.c
+index f677cc12bd8c..7d1728d04071 100644
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@ -749,6 +749,7 @@ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ 	key->phy.skb_mark = skb->mark;
+ 	ovs_ct_fill_key(skb, key);
+ 	key->ovs_flow_hash = 0;
++	key->mac_proto = MAC_PROTO_ETHERNET;
+ 	key->recirc_id = 0;
+ 
+ 	return key_extract(skb, key);
+diff --git a/net/openvswitch/flow.h b/net/openvswitch/flow.h
+index e8d49bec2ea0..05443b209b7f 100644
+--- a/net/openvswitch/flow.h
++++ b/net/openvswitch/flow.h
+@@ -37,6 +37,12 @@
+ 
+ struct sk_buff;
+ 
++enum sw_flow_mac_proto {
++	MAC_PROTO_NONE = 0,
++	MAC_PROTO_ETHERNET,
++};
++#define SW_FLOW_KEY_INVALID	0x80
++
+ /* Store options at the end of the array if they are less than the
+  * maximum size. This allows us to get the benefits of variable length
+  * matching for small options.
+@@ -68,6 +74,7 @@ struct sw_flow_key {
+ 		u32	skb_mark;	/* SKB mark. */
+ 		u16	in_port;	/* Input switch port (or DP_MAX_PORTS). */
+ 	} __packed phy; /* Safe when right after 'tun_key'. */
++	u8 mac_proto;			/* MAC layer protocol (e.g. Ethernet). */
+ 	u8 tun_proto;			/* Protocol of encapsulating tunnel. */
+ 	u32 ovs_flow_hash;		/* Datapath computed hash value.  */
+ 	u32 recirc_id;			/* Recirculation ID.  */
+@@ -206,6 +213,21 @@ struct arp_eth_header {
+ 	unsigned char       ar_tip[4];		/* target IP address        */
+ } __packed;
+ 
++static inline u8 ovs_key_mac_proto(const struct sw_flow_key *key)
++{
++	return key->mac_proto & ~SW_FLOW_KEY_INVALID;
++}
++
++static inline u16 __ovs_mac_header_len(u8 mac_proto)
++{
++	return mac_proto == MAC_PROTO_ETHERNET ? ETH_HLEN : 0;
++}
++
++static inline u16 ovs_mac_header_len(const struct sw_flow_key *key)
++{
++	return __ovs_mac_header_len(ovs_key_mac_proto(key));
++}
++
+ static inline bool ovs_identifier_is_ufid(const struct sw_flow_id *sfid)
+ {
+ 	return sfid->ufid_len;
+diff --git a/net/openvswitch/flow_netlink.c b/net/openvswitch/flow_netlink.c
+index ae25ded82b3b..ccb9900c5230 100644
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -1059,6 +1059,11 @@ static int metadata_from_nlattrs(struct net *net, struct sw_flow_match *match,
+ 				   sizeof(*cl), is_mask);
+ 		*attrs &= ~(1ULL << OVS_KEY_ATTR_CT_LABELS);
+ 	}
++
++	/* Always exact match mac_proto */
++	SW_FLOW_KEY_PUT(match, mac_proto, is_mask ? 0xff : MAC_PROTO_ETHERNET,
++			is_mask);
++
+ 	return 0;
+ }
+ 
