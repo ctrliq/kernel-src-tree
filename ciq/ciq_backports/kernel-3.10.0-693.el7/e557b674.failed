@@ -1,0 +1,125 @@
+perf script: Fix segfault when printing callchains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chris Phlipot <cphlipot0@gmail.com>
+commit e557b674a9470dae99916be6105e6780b3a072ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e557b674.failed
+
+This fixes a bug caused by an unitialized callchain cursor. The crash
+frist appeared in:
+
+6f736735e30f ("perf evsel: Require that callchains be resolved before
+calling fprintf_{sym,callchain}")
+
+The callchain cursor is a struct that contains pointers, that when
+uninitialized will cause unpredictable behavior (usually a crash)
+when trying to append to the callchain.
+
+The existing implementation has the following issues:
+
+1. The callchain cursor used is not initialized, resulting in
+	unpredictable behavior when used.
+2. The cursor is declared on the stack. Even if it is properly initalized,
+	the implmentation will leak memory when the function returns,
+	since all the references to the callchain_nodes allocated by
+	callchain_cursor_append will be lost when the cursor goes out of
+	scope.
+3. Storing the cursor on the stack is inefficient. Even if memory is
+	properly freed when it goes out of scope, a performance penalty
+	will be incurred due to reallocation of callchain nodes.
+	callchain_cursor_append is designed to avoid these reallocations
+	when an existing cursor is reused.
+
+This patch fixes the crash by replacing cursor_callchain with a reference
+to the global callchain_cursor which also resolves all 3 issues mentioned
+above.
+
+How to reproduce the crash:
+
+  $ perf record --call-graph=dwarf stress -t 1 -c 1
+  $ perf script > /dev/null
+  Segfault
+
+	Signed-off-by: Chris Phlipot <cphlipot0@gmail.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Fixes: 6f736735e30f ("perf evsel: Require that callchains be resolved before calling fprintf_{sym,callchain}")
+Link: http://lkml.kernel.org/r/1461119531-2529-1-git-send-email-cphlipot0@gmail.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit e557b674a9470dae99916be6105e6780b3a072ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/builtin-script.c
+index 4ad8f074e784,f43b0c6f88f4..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -568,18 -570,23 +568,31 @@@ static void print_sample_bts(struct per
+  	/* print branch_from information */
+  	if (PRINT_FIELD(IP)) {
+  		unsigned int print_opts = output[attr->type].print_ip_opts;
+++<<<<<<< HEAD
+ +
+ +		if (symbol_conf.use_callchain && sample->callchain) {
+ +			printf("\n");
+ +		} else {
+ +			printf(" ");
+ +			if (print_opts & PRINT_IP_OPT_SRCLINE) {
+++=======
++ 		struct callchain_cursor *cursor = NULL;
++ 
++ 		if (symbol_conf.use_callchain && sample->callchain &&
++ 		    thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
++ 					      sample, NULL, NULL, scripting_max_stack) == 0)
++ 			cursor = &callchain_cursor;
++ 
++ 		if (cursor == NULL) {
++ 			putchar(' ');
++ 			if (print_opts & EVSEL__PRINT_SRCLINE) {
+++>>>>>>> e557b674a947 (perf script: Fix segfault when printing callchains)
+  				print_srcline_last = true;
+ -				print_opts &= ~EVSEL__PRINT_SRCLINE;
+ +				print_opts &= ~PRINT_IP_OPT_SRCLINE;
+  			}
+ -		} else
+ -			putchar('\n');
+ -
+ -		sample__fprintf_sym(sample, al, 0, print_opts, cursor, stdout);
+ +		}
+ +		perf_evsel__print_ip(evsel, sample, al, 0, print_opts,
+ +				     scripting_max_stack, stdout);
+  	}
+  
+  	/* print branch_to information */
+@@@ -704,14 -789,15 +717,26 @@@ static void process_event(struct perf_s
+  		printf("%16" PRIu64, sample->weight);
+  
+  	if (PRINT_FIELD(IP)) {
+++<<<<<<< HEAD
+ +		if (!symbol_conf.use_callchain)
+ +			printf(" ");
+ +		else
+ +			printf("\n");
+ +
+ +		perf_evsel__print_ip(evsel, sample, al, 0,
+ +				     output[attr->type].print_ip_opts,
+ +				     scripting_max_stack, stdout);
+++=======
++ 		struct callchain_cursor *cursor = NULL;
++ 
++ 		if (symbol_conf.use_callchain && sample->callchain &&
++ 		    thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
++ 					      sample, NULL, NULL, scripting_max_stack) == 0)
++ 			cursor = &callchain_cursor;
++ 
++ 		putchar(cursor ? '\n' : ' ');
++ 		sample__fprintf_sym(sample, al, 0, output[attr->type].print_ip_opts, cursor, stdout);
+++>>>>>>> e557b674a947 (perf script: Fix segfault when printing callchains)
+  	}
+  
+  	if (PRINT_FIELD(IREGS))
+* Unmerged path tools/perf/builtin-script.c
