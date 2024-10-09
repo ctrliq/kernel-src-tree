@@ -1,0 +1,177 @@
+xfs: validate btree records on retrieval
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 9e6c08d4a8fc21fc496bf4543e5b2360fc610866
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/9e6c08d4.failed
+
+So we don't check the validity of records as we walk the btree. When
+there are corrupt records in the free space btree (e.g. zero
+startblock/length or beyond EOAG) we just blindly use it and things
+go bad from there. That leads to assert failures on debug kernels
+like this:
+
+XFS: Assertion failed: fs_is_ok, file: fs/xfs/libxfs/xfs_alloc.c, line: 450
+....
+Call Trace:
+ xfs_alloc_fixup_trees+0x368/0x5c0
+ xfs_alloc_ag_vextent_near+0x79a/0xe20
+ xfs_alloc_ag_vextent+0x1d3/0x330
+ xfs_alloc_vextent+0x5e9/0x870
+
+Or crashes like this:
+
+XFS (loop0): xfs_buf_find: daddr 0x7fb28 out of range, EOFS 0x8000
+.....
+BUG: unable to handle kernel NULL pointer dereference at 00000000000000c8
+....
+Call Trace:
+ xfs_bmap_add_extent_hole_real+0x67d/0x930
+ xfs_bmapi_write+0x934/0xc90
+ xfs_da_grow_inode_int+0x27e/0x2f0
+ xfs_dir2_grow_inode+0x55/0x130
+ xfs_dir2_sf_to_block+0x94/0x5d0
+ xfs_dir2_sf_addname+0xd0/0x590
+ xfs_dir_createname+0x168/0x1a0
+ xfs_rename+0x658/0x9b0
+
+By checking that free space records pulled from the trees are
+within the valid range, we catch many of these corruptions before
+they can do damage.
+
+This is a generic btree record checking deficiency. We need to
+validate the records we fetch from all the different btrees before
+we use them to catch corruptions like this.
+
+This patch results in a corrupt record emitting an error message and
+returning -EFSCORRUPTED, and the higher layers catch that and abort:
+
+ XFS (loop0): Size Freespace BTree record corruption in AG 0 detected!
+ XFS (loop0): start block 0x0 block count 0x0
+ XFS (loop0): Internal error xfs_trans_cancel at line 1012 of file fs/xfs/xfs_trans.c.  Caller xfs_create+0x42a/0x670
+ .....
+ Call Trace:
+  dump_stack+0x85/0xcb
+  xfs_trans_cancel+0x19f/0x1c0
+  xfs_create+0x42a/0x670
+  xfs_generic_create+0x1f6/0x2c0
+  vfs_create+0xf9/0x180
+  do_mknodat+0x1f9/0x210
+  do_syscall_64+0x5a/0x180
+  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+.....
+ XFS (loop0): xfs_do_force_shutdown(0x8) called from line 1013 of file fs/xfs/xfs_trans.c.  Return address = ffffffff81500868
+ XFS (loop0): Corruption of in-memory data detected.  Shutting down filesystem
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 9e6c08d4a8fc21fc496bf4543e5b2360fc610866)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_refcount.c
+#	fs/xfs/libxfs/xfs_rmap.c
+* Unmerged path fs/xfs/libxfs/xfs_refcount.c
+* Unmerged path fs/xfs/libxfs/xfs_rmap.c
+diff --git a/fs/xfs/libxfs/xfs_alloc.c b/fs/xfs/libxfs/xfs_alloc.c
+index 62634b101f26..8692093e67b2 100644
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@ -183,6 +183,8 @@ xfs_alloc_get_rec(
+ 	xfs_extlen_t		*len,	/* output: length of extent */
+ 	int			*stat)	/* output: success/failure */
+ {
++	struct xfs_mount	*mp = cur->bc_mp;
++	xfs_agnumber_t		agno = cur->bc_private.a.agno;
+ 	union xfs_btree_rec	*rec;
+ 	int			error;
+ 
+@@ -190,12 +192,28 @@ xfs_alloc_get_rec(
+ 	if (error || !(*stat))
+ 		return error;
+ 	if (rec->alloc.ar_blockcount == 0)
+-		return -EFSCORRUPTED;
++		goto out_bad_rec;
+ 
+ 	*bno = be32_to_cpu(rec->alloc.ar_startblock);
+ 	*len = be32_to_cpu(rec->alloc.ar_blockcount);
+ 
+-	return error;
++	/* check for valid extent range, including overflow */
++	if (!xfs_verify_agbno(mp, agno, *bno))
++		goto out_bad_rec;
++	if (*bno > *bno + *len)
++		goto out_bad_rec;
++	if (!xfs_verify_agbno(mp, agno, *bno + *len - 1))
++		goto out_bad_rec;
++
++	return 0;
++
++out_bad_rec:
++	xfs_warn(mp,
++		"%s Freespace BTree record corruption in AG %d detected!",
++		cur->bc_btnum == XFS_BTNUM_BNO ? "Block" : "Size", agno);
++	xfs_warn(mp,
++		"start block 0x%x block count 0x%x", *bno, *len);
++	return -EFSCORRUPTED;
+ }
+ 
+ /*
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index 8a6e2ce84589..0f9ecabf5577 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -132,16 +132,45 @@ xfs_inobt_get_rec(
+ 	struct xfs_inobt_rec_incore	*irec,
+ 	int				*stat)
+ {
++	struct xfs_mount		*mp = cur->bc_mp;
++	xfs_agnumber_t			agno = cur->bc_private.a.agno;
+ 	union xfs_btree_rec		*rec;
+ 	int				error;
++	uint64_t			realfree;
+ 
+ 	error = xfs_btree_get_rec(cur, &rec, stat);
+ 	if (error || *stat == 0)
+ 		return error;
+ 
+-	xfs_inobt_btrec_to_irec(cur->bc_mp, rec, irec);
++	xfs_inobt_btrec_to_irec(mp, rec, irec);
++
++	if (!xfs_verify_agino(mp, agno, irec->ir_startino))
++		goto out_bad_rec;
++	if (irec->ir_count < XFS_INODES_PER_HOLEMASK_BIT ||
++	    irec->ir_count > XFS_INODES_PER_CHUNK)
++		goto out_bad_rec;
++	if (irec->ir_freecount > XFS_INODES_PER_CHUNK)
++		goto out_bad_rec;
++
++	/* if there are no holes, return the first available offset */
++	if (!xfs_inobt_issparse(irec->ir_holemask))
++		realfree = irec->ir_free;
++	else
++		realfree = irec->ir_free & xfs_inobt_irec_to_allocmask(irec);
++	if (hweight64(realfree) != irec->ir_freecount)
++		goto out_bad_rec;
+ 
+ 	return 0;
++
++out_bad_rec:
++	xfs_warn(mp,
++		"%s Inode BTree record corruption in AG %d detected!",
++		cur->bc_btnum == XFS_BTNUM_INO ? "Used" : "Free", agno);
++	xfs_warn(mp,
++"start inode 0x%x, count 0x%x, free 0x%x freemask 0x%llx, holemask 0x%x",
++		irec->ir_startino, irec->ir_count, irec->ir_freecount,
++		irec->ir_free, irec->ir_holemask);
++	return -EFSCORRUPTED;
+ }
+ 
+ /*
+* Unmerged path fs/xfs/libxfs/xfs_refcount.c
+* Unmerged path fs/xfs/libxfs/xfs_rmap.c
