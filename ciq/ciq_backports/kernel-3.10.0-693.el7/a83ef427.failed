@@ -1,0 +1,233 @@
+amd-xgbe: Remove need for Tx path spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit a83ef427b7d97314df30d6e25abc7aa3a80ffcfd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a83ef427.failed
+
+Since the Tx ring cleanup can run at the same time that data is being
+transmitted, a spin lock was used to protect the ring. This patch
+eliminates the need for Tx spinlocks by updating the current ring
+position only after all ownership bits for data being transmitted have
+been set. This will insure that ring operations in the Tx cleanup path
+do not interfere with the ring operations in the Tx transmit path.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a83ef427b7d97314df30d6e25abc7aa3a80ffcfd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 36ca2f2bf69c,5dff127a0823..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -905,11 -1357,12 +905,12 @@@ static void xgbe_pre_xmit(struct xgbe_c
+  	struct xgbe_packet_data *packet = &ring->packet_data;
+  	unsigned int csum, tso, vlan;
+  	unsigned int tso_context, vlan_context;
+ -	unsigned int tx_set_ic;
+ +	unsigned int tx_coalesce, tx_frames;
+  	int start_index = ring->cur;
++ 	int cur_index = ring->cur;
+  	int i;
+  
+ -	DBGPR("-->xgbe_dev_xmit\n");
+ +	DBGPR("-->xgbe_pre_xmit\n");
+  
+  	csum = XGMAC_GET_BITS(packet->attributes, TX_PACKET_ATTRIBUTES,
+  			      CSUM_ENABLE);
+@@@ -928,12 -1381,28 +929,12 @@@
+  	else
+  		vlan_context = 0;
+  
+ -	/* Determine if an interrupt should be generated for this Tx:
+ -	 *   Interrupt:
+ -	 *     - Tx frame count exceeds the frame count setting
+ -	 *     - Addition of Tx frame count to the frame count since the
+ -	 *       last interrupt was set exceeds the frame count setting
+ -	 *   No interrupt:
+ -	 *     - No frame count setting specified (ethtool -C ethX tx-frames 0)
+ -	 *     - Addition of Tx frame count to the frame count since the
+ -	 *       last interrupt was set does not exceed the frame count setting
+ -	 */
+ -	ring->coalesce_count += packet->tx_packets;
+ -	if (!pdata->tx_frames)
+ -		tx_set_ic = 0;
+ -	else if (packet->tx_packets > pdata->tx_frames)
+ -		tx_set_ic = 1;
+ -	else if ((ring->coalesce_count % pdata->tx_frames) <
+ -		 packet->tx_packets)
+ -		tx_set_ic = 1;
+ -	else
+ -		tx_set_ic = 0;
+ +	tx_coalesce = (pdata->tx_usecs || pdata->tx_frames) ? 1 : 0;
+ +	tx_frames = pdata->tx_frames;
+ +	if (tx_coalesce && !channel->tx_timer_active)
+ +		ring->coalesce_count = 0;
+  
+- 	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 	rdata = XGBE_GET_DESC_DATA(ring, cur_index);
+  	rdesc = rdata->rdesc;
+  
+  	/* Create a context descriptor if this is a TSO packet */
+@@@ -1085,20 -1552,13 +1086,30 @@@
+  	/* Make sure ownership is written to the descriptor */
+  	wmb();
+  
+++<<<<<<< HEAD
+ +	/* Issue a poll command to Tx DMA by writing address
+ +	 * of next immediate free descriptor */
+ +	ring->cur++;
+ +	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ +	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDTR_LO,
+ +			  lower_32_bits(rdata->rdesc_dma));
+ +
+ +	/* Start the Tx coalescing timer */
+ +	if (tx_coalesce && !channel->tx_timer_active) {
+ +		channel->tx_timer_active = 1;
+ +		hrtimer_start(&channel->tx_timer,
+ +			      ktime_set(0, pdata->tx_usecs * NSEC_PER_USEC),
+ +			      HRTIMER_MODE_REL);
+ +	}
+++=======
++ 	ring->cur = cur_index + 1;
++ 	if (!packet->skb->xmit_more ||
++ 	    netif_xmit_stopped(netdev_get_tx_queue(pdata->netdev,
++ 						   channel->queue_index)))
++ 		xgbe_tx_start_xmit(channel, ring);
++ 	else
++ 		ring->tx.xmit_more = 1;
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  
+  	DBGPR("  %s: descriptors %u to %u written\n",
+  	      channel->name, start_index & (ring->rdesc_count - 1),
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index add1b5ac7b5d,c036a0e61bba..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -269,20 -415,22 +269,29 @@@ static enum hrtimer_restart xgbe_tx_tim
+  	struct xgbe_channel *channel = container_of(timer,
+  						    struct xgbe_channel,
+  						    tx_timer);
+- 	struct xgbe_ring *ring = channel->tx_ring;
+  	struct xgbe_prv_data *pdata = channel->pdata;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +
+ +	DBGPR("-->xgbe_tx_timer\n");
+ +
+ +	spin_lock_irqsave(&ring->lock, flags);
+ +
+ +	if (napi_schedule_prep(&pdata->napi)) {
+++=======
++ 	struct napi_struct *napi;
++ 
++ 	DBGPR("-->xgbe_tx_timer\n");
++ 
++ 	napi = (pdata->per_channel_irq) ? &channel->napi : &pdata->napi;
++ 
++ 	if (napi_schedule_prep(napi)) {
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  		/* Disable Tx and Rx interrupts */
+ -		if (pdata->per_channel_irq)
+ -			disable_irq(channel->dma_irq);
+ -		else
+ -			xgbe_disable_rx_tx_ints(pdata);
+ +		xgbe_disable_rx_tx_ints(pdata);
+  
+  		/* Turn on polling */
+ -		__napi_schedule(napi);
+ +		__napi_schedule(&pdata->napi);
+  	}
+  
+  	channel->tx_timer_active = 0;
+@@@ -852,7 -1443,7 +859,11 @@@ static int xgbe_xmit(struct sk_buff *sk
+  	struct xgbe_channel *channel;
+  	struct xgbe_ring *ring;
+  	struct xgbe_packet_data *packet;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	struct netdev_queue *txq;
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  	int ret;
+  
+  	DBGPR("-->xgbe_xmit: skb->len = %d\n", skb->len);
+@@@ -904,11 -1495,12 +913,7 @@@
+  	xgbe_print_pkt(netdev, skb, true);
+  #endif
+  
+ -	/* Stop the queue in advance if there may not be enough descriptors */
+ -	xgbe_maybe_stop_tx_queue(channel, ring, XGBE_TX_MAX_DESCS);
+ -
+ -	ret = NETDEV_TX_OK;
+ -
+  tx_netdev_return:
+- 	spin_unlock_irqrestore(&ring->lock, flags);
+- 
+- 	DBGPR("<--xgbe_xmit\n");
+- 
+  	return ret;
+  }
+  
+@@@ -1106,8 -1827,9 +1111,12 @@@ static int xgbe_tx_poll(struct xgbe_cha
+  	struct xgbe_ring_data *rdata;
+  	struct xgbe_ring_desc *rdesc;
+  	struct net_device *netdev = pdata->netdev;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	struct netdev_queue *txq;
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  	int processed = 0;
+ -	unsigned int tx_packets = 0, tx_bytes = 0;
+  
+  	DBGPR("-->xgbe_tx_poll\n");
+  
+@@@ -1115,7 -1837,7 +1124,11 @@@
+  	if (!ring)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ring->lock, flags);
+++=======
++ 	txq = netdev_get_tx_queue(netdev, channel->queue_index);
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  
+  	while ((processed < XGBE_TX_DESC_MAX_PROC) &&
+  	       (ring->dirty != ring->cur)) {
+@@@ -1141,6 -1868,11 +1154,14 @@@
+  		ring->dirty++;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!processed)
++ 		return 0;
++ 
++ 	netdev_tx_completed_queue(txq, tx_packets, tx_bytes);
++ 
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  	if ((ring->tx.queue_stopped == 1) &&
+  	    (xgbe_tx_avail_desc(ring) > XGBE_TX_DESC_MIN_FREE)) {
+  		ring->tx.queue_stopped = 0;
+@@@ -1149,8 -1881,6 +1170,11 @@@
+  
+  	DBGPR("<--xgbe_tx_poll: processed=%d\n", processed);
+  
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&ring->lock, flags);
+ +
+++=======
+++>>>>>>> a83ef427b7d9 (amd-xgbe: Remove need for Tx path spinlock)
+  	return processed;
+  }
+  
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
