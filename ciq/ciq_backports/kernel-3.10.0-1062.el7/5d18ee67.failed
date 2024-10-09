@@ -1,0 +1,1083 @@
+IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sebastian Sanchez <sebastian.sanchez@intel.com>
+commit 5d18ee67d4c1735f5c1f757e89228ec68e4f4ef3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5d18ee67.failed
+
+Currently the driver doesn't support completion vectors. These
+are used to indicate which sets of CQs should be grouped together
+into the same vector. A vector is a CQ processing thread that
+runs on a specific CPU.
+
+If an application has several CQs bound to different completion
+vectors, and each completion vector runs on different CPUs, then
+the completion queue workload is balanced. This helps scale as more
+nodes are used.
+
+Implement CQ completion vector support using a global workqueue
+where a CQ entry is queued to the CPU corresponding to the CQ's
+completion vector. Since the workqueue is global, it's guaranteed
+to always be there when queueing CQ entries; Therefore, the RCU
+locking for cq->rdi->worker in the hot path is superfluous.
+
+Each completion vector is assigned to a different CPU. The number of
+completion vectors available is computed by taking the number of
+online, physical CPUs from the local NUMA node and subtracting the
+CPUs used for kernel receive queues and the general interrupt.
+Special use cases:
+
+  * If there are no CPUs left for completion vectors, the same CPU
+    for the general interrupt is used; Therefore, there would only
+    be one completion vector available.
+
+  * For multi-HFI systems, the number of completion vectors available
+    for each device is the total number of completion vectors in
+    the local NUMA node divided by the number of devices in the same
+    NUMA node. If there's a division remainder, the first device to
+    get initialized gets an extra completion vector.
+
+Upon a CQ creation, an invalid completion vector could be specified.
+Handle it as follows:
+
+  * If the completion vector is less than 0, set it to 0.
+
+  * Set the completion vector to the result of the passed completion
+    vector moded with the number of device completion vectors
+    available.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 5d18ee67d4c1735f5c1f757e89228ec68e4f4ef3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/verbs.c
+#	drivers/infiniband/sw/rdmavt/cq.c
+#	include/rdma/rdma_vt.h
+diff --cc drivers/infiniband/hw/hfi1/verbs.c
+index 1eb855337269,fc2e44cde161..000000000000
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@@ -63,6 -63,8 +63,11 @@@
+  #include "verbs_txreq.h"
+  #include "debugfs.h"
+  #include "vnic.h"
+++<<<<<<< HEAD
+++=======
++ #include "fault.h"
++ #include "affinity.h"
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  
+  static unsigned int hfi1_lkey_table_size = 16;
+  module_param_named(lkey_table_size, hfi1_lkey_table_size, uint,
+diff --cc drivers/infiniband/sw/rdmavt/cq.c
+index 02f9b69a0946,4f1544ad4aff..000000000000
+--- a/drivers/infiniband/sw/rdmavt/cq.c
++++ b/drivers/infiniband/sw/rdmavt/cq.c
+@@@ -124,13 -125,10 +125,20 @@@ void rvt_cq_enter(struct rvt_cq *cq, st
+  		 * This will cause send_complete() to be called in
+  		 * another thread.
+  		 */
+++<<<<<<< HEAD
+ +		spin_lock(&cq->rdi->n_cqs_lock);
+ +		if (likely(cq->rdi->worker)) {
+ +			cq->notify = RVT_CQ_NONE;
+ +			cq->triggered++;
+ +			queue_kthread_work(cq->rdi->worker, &cq->comptask);
+ +		}
+ +		spin_unlock(&cq->rdi->n_cqs_lock);
+++=======
++ 		cq->notify = RVT_CQ_NONE;
++ 		cq->triggered++;
++ 		queue_work_on(cq->comp_vector_cpu, comp_vector_wq,
++ 			      &cq->comptask);
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  	}
+  
+  	spin_unlock_irqrestore(&cq->lock, flags);
+@@@ -267,7 -278,7 +288,11 @@@ struct ib_cq *rvt_create_cq(struct ib_d
+  	cq->ibcq.cqe = entries;
+  	cq->notify = RVT_CQ_NONE;
+  	spin_lock_init(&cq->lock);
+++<<<<<<< HEAD
+ +	init_kthread_work(&cq->comptask, send_complete);
+++=======
++ 	INIT_WORK(&cq->comptask, send_complete);
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  	cq->queue = wc;
+  
+  	ret = &cq->ibcq;
+@@@ -297,7 -309,7 +323,11 @@@ int rvt_destroy_cq(struct ib_cq *ibcq
+  	struct rvt_cq *cq = ibcq_to_rvtcq(ibcq);
+  	struct rvt_dev_info *rdi = cq->rdi;
+  
+++<<<<<<< HEAD
+ +	flush_kthread_work(&cq->comptask);
+++=======
++ 	flush_work(&cq->comptask);
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  	spin_lock_irq(&rdi->n_cqs_lock);
+  	rdi->n_cqs_allocated--;
+  	spin_unlock_irq(&rdi->n_cqs_lock);
+@@@ -507,56 -519,22 +537,70 @@@ int rvt_poll_cq(struct ib_cq *ibcq, in
+   *
+   * Return: 0 on success
+   */
+- int rvt_driver_cq_init(struct rvt_dev_info *rdi)
++ int rvt_driver_cq_init(void)
+  {
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +	int cpu;
+ +	struct task_struct *task;
+ +
+ +	if (rdi->worker)
+ +		return 0;
+ +	spin_lock_init(&rdi->n_cqs_lock);
+ +	rdi->worker = kzalloc(sizeof(*rdi->worker), GFP_KERNEL);
+ +	if (!rdi->worker)
+ +		return -ENOMEM;
+ +	init_kthread_worker(rdi->worker);
+ +	task = kthread_create_on_node(
+ +		kthread_worker_fn,
+ +		rdi->worker,
+ +		rdi->dparms.node,
+ +		"%s", rdi->dparms.cq_name);
+ +	if (IS_ERR(task)) {
+ +		kfree(rdi->worker);
+ +		rdi->worker = NULL;
+ +		return PTR_ERR(task);
+ +	}
+ +
+ +	set_user_nice(task, -20);
+ +	cpu = cpumask_first(cpumask_of_node(rdi->dparms.node));
+ +	kthread_bind(task, cpu);
+ +	wake_up_process(task);
+ +	return ret;
+++=======
++ 	comp_vector_wq = alloc_workqueue("%s", WQ_HIGHPRI | WQ_CPU_INTENSIVE,
++ 					 0, "rdmavt_cq");
++ 	if (!comp_vector_wq)
++ 		return -ENOMEM;
++ 
++ 	return 0;
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  }
+  
+  /**
+   * rvt_cq_exit - tear down cq reources
+   * @rdi: rvt dev structure
+   */
+- void rvt_cq_exit(struct rvt_dev_info *rdi)
++ void rvt_cq_exit(void)
+  {
+++<<<<<<< HEAD
+ +	struct kthread_worker *worker;
+ +
+ +	/* block future queuing from send_complete() */
+ +	spin_lock_irq(&rdi->n_cqs_lock);
+ +	worker = rdi->worker;
+ +	if (!worker) {
+ +		spin_unlock_irq(&rdi->n_cqs_lock);
+ +		return;
+ +	}
+ +	rdi->worker = NULL;
+ +	spin_unlock_irq(&rdi->n_cqs_lock);
+ +
+ +	flush_kthread_worker(worker);
+ +	kthread_stop(worker->task);
+ +	kfree(worker);
+++=======
++ 	destroy_workqueue(comp_vector_wq);
++ 	comp_vector_wq = NULL;
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  }
+diff --cc include/rdma/rdma_vt.h
+index d0e9083f9b9e,e79229a0cf01..000000000000
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@@ -402,7 -404,6 +404,10 @@@ struct rvt_dev_info 
+  	spinlock_t pending_lock; /* protect pending mmap list */
+  
+  	/* CQ */
+++<<<<<<< HEAD
+ +	struct kthread_worker *worker; /* per device cq worker */
+++=======
+++>>>>>>> 5d18ee67d4c1 (IB/{hfi1, rdmavt, qib}: Implement CQ completion vector support)
+  	u32 n_cqs_allocated;    /* number of CQs allocated for device */
+  	spinlock_t n_cqs_lock; /* protect count of in use cqs */
+  
+diff --git a/drivers/infiniband/hw/hfi1/affinity.c b/drivers/infiniband/hw/hfi1/affinity.c
+index d338a0536469..24a5056e7c21 100644
+--- a/drivers/infiniband/hw/hfi1/affinity.c
++++ b/drivers/infiniband/hw/hfi1/affinity.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -208,7 +208,13 @@ int node_affinity_init(void)
+ 	return 0;
+ }
+ 
+-void node_affinity_destroy(void)
++static void node_affinity_destroy(struct hfi1_affinity_node *entry)
++{
++	free_percpu(entry->comp_vect_affinity);
++	kfree(entry);
++}
++
++void node_affinity_destroy_all(void)
+ {
+ 	struct list_head *pos, *q;
+ 	struct hfi1_affinity_node *entry;
+@@ -218,7 +224,7 @@ void node_affinity_destroy(void)
+ 		entry = list_entry(pos, struct hfi1_affinity_node,
+ 				   list);
+ 		list_del(pos);
+-		kfree(entry);
++		node_affinity_destroy(entry);
+ 	}
+ 	mutex_unlock(&node_affinity.lock);
+ 	kfree(hfi1_per_node_cntr);
+@@ -232,6 +238,7 @@ static struct hfi1_affinity_node *node_affinity_allocate(int node)
+ 	if (!entry)
+ 		return NULL;
+ 	entry->node = node;
++	entry->comp_vect_affinity = alloc_percpu(u16);
+ 	INIT_LIST_HEAD(&entry->list);
+ 
+ 	return entry;
+@@ -261,6 +268,341 @@ static struct hfi1_affinity_node *node_affinity_lookup(int node)
+ 	return NULL;
+ }
+ 
++static int per_cpu_affinity_get(cpumask_var_t possible_cpumask,
++				u16 __percpu *comp_vect_affinity)
++{
++	int curr_cpu;
++	u16 cntr;
++	u16 prev_cntr;
++	int ret_cpu;
++
++	if (!possible_cpumask) {
++		ret_cpu = -EINVAL;
++		goto fail;
++	}
++
++	if (!comp_vect_affinity) {
++		ret_cpu = -EINVAL;
++		goto fail;
++	}
++
++	ret_cpu = cpumask_first(possible_cpumask);
++	if (ret_cpu >= nr_cpu_ids) {
++		ret_cpu = -EINVAL;
++		goto fail;
++	}
++
++	prev_cntr = *per_cpu_ptr(comp_vect_affinity, ret_cpu);
++	for_each_cpu(curr_cpu, possible_cpumask) {
++		cntr = *per_cpu_ptr(comp_vect_affinity, curr_cpu);
++
++		if (cntr < prev_cntr) {
++			ret_cpu = curr_cpu;
++			prev_cntr = cntr;
++		}
++	}
++
++	*per_cpu_ptr(comp_vect_affinity, ret_cpu) += 1;
++
++fail:
++	return ret_cpu;
++}
++
++static int per_cpu_affinity_put_max(cpumask_var_t possible_cpumask,
++				    u16 __percpu *comp_vect_affinity)
++{
++	int curr_cpu;
++	int max_cpu;
++	u16 cntr;
++	u16 prev_cntr;
++
++	if (!possible_cpumask)
++		return -EINVAL;
++
++	if (!comp_vect_affinity)
++		return -EINVAL;
++
++	max_cpu = cpumask_first(possible_cpumask);
++	if (max_cpu >= nr_cpu_ids)
++		return -EINVAL;
++
++	prev_cntr = *per_cpu_ptr(comp_vect_affinity, max_cpu);
++	for_each_cpu(curr_cpu, possible_cpumask) {
++		cntr = *per_cpu_ptr(comp_vect_affinity, curr_cpu);
++
++		if (cntr > prev_cntr) {
++			max_cpu = curr_cpu;
++			prev_cntr = cntr;
++		}
++	}
++
++	*per_cpu_ptr(comp_vect_affinity, max_cpu) -= 1;
++
++	return max_cpu;
++}
++
++/*
++ * Non-interrupt CPUs are used first, then interrupt CPUs.
++ * Two already allocated cpu masks must be passed.
++ */
++static int _dev_comp_vect_cpu_get(struct hfi1_devdata *dd,
++				  struct hfi1_affinity_node *entry,
++				  cpumask_var_t non_intr_cpus,
++				  cpumask_var_t available_cpus)
++	__must_hold(&node_affinity.lock)
++{
++	int cpu;
++	struct cpu_mask_set *set = dd->comp_vect;
++
++	lockdep_assert_held(&node_affinity.lock);
++	if (!non_intr_cpus) {
++		cpu = -1;
++		goto fail;
++	}
++
++	if (!available_cpus) {
++		cpu = -1;
++		goto fail;
++	}
++
++	/* Available CPUs for pinning completion vectors */
++	_cpu_mask_set_gen_inc(set);
++	cpumask_andnot(available_cpus, &set->mask, &set->used);
++
++	/* Available CPUs without SDMA engine interrupts */
++	cpumask_andnot(non_intr_cpus, available_cpus,
++		       &entry->def_intr.used);
++
++	/* If there are non-interrupt CPUs available, use them first */
++	if (!cpumask_empty(non_intr_cpus))
++		cpu = cpumask_first(non_intr_cpus);
++	else /* Otherwise, use interrupt CPUs */
++		cpu = cpumask_first(available_cpus);
++
++	if (cpu >= nr_cpu_ids) { /* empty */
++		cpu = -1;
++		goto fail;
++	}
++	cpumask_set_cpu(cpu, &set->used);
++
++fail:
++	return cpu;
++}
++
++static void _dev_comp_vect_cpu_put(struct hfi1_devdata *dd, int cpu)
++{
++	struct cpu_mask_set *set = dd->comp_vect;
++
++	if (cpu < 0)
++		return;
++
++	cpu_mask_set_put(set, cpu);
++}
++
++/* _dev_comp_vect_mappings_destroy() is reentrant */
++static void _dev_comp_vect_mappings_destroy(struct hfi1_devdata *dd)
++{
++	int i, cpu;
++
++	if (!dd->comp_vect_mappings)
++		return;
++
++	for (i = 0; i < dd->comp_vect_possible_cpus; i++) {
++		cpu = dd->comp_vect_mappings[i];
++		_dev_comp_vect_cpu_put(dd, cpu);
++		dd->comp_vect_mappings[i] = -1;
++		hfi1_cdbg(AFFINITY,
++			  "[%s] Release CPU %d from completion vector %d",
++			  rvt_get_ibdev_name(&(dd)->verbs_dev.rdi), cpu, i);
++	}
++
++	kfree(dd->comp_vect_mappings);
++	dd->comp_vect_mappings = NULL;
++}
++
++/*
++ * This function creates the table for looking up CPUs for completion vectors.
++ * num_comp_vectors needs to have been initilized before calling this function.
++ */
++static int _dev_comp_vect_mappings_create(struct hfi1_devdata *dd,
++					  struct hfi1_affinity_node *entry)
++	__must_hold(&node_affinity.lock)
++{
++	int i, cpu, ret;
++	cpumask_var_t non_intr_cpus;
++	cpumask_var_t available_cpus;
++
++	lockdep_assert_held(&node_affinity.lock);
++
++	if (!zalloc_cpumask_var(&non_intr_cpus, GFP_KERNEL))
++		return -ENOMEM;
++
++	if (!zalloc_cpumask_var(&available_cpus, GFP_KERNEL)) {
++		free_cpumask_var(non_intr_cpus);
++		return -ENOMEM;
++	}
++
++	dd->comp_vect_mappings = kcalloc(dd->comp_vect_possible_cpus,
++					 sizeof(*dd->comp_vect_mappings),
++					 GFP_KERNEL);
++	if (!dd->comp_vect_mappings) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	for (i = 0; i < dd->comp_vect_possible_cpus; i++)
++		dd->comp_vect_mappings[i] = -1;
++
++	for (i = 0; i < dd->comp_vect_possible_cpus; i++) {
++		cpu = _dev_comp_vect_cpu_get(dd, entry, non_intr_cpus,
++					     available_cpus);
++		if (cpu < 0) {
++			ret = -EINVAL;
++			goto fail;
++		}
++
++		dd->comp_vect_mappings[i] = cpu;
++		hfi1_cdbg(AFFINITY,
++			  "[%s] Completion Vector %d -> CPU %d",
++			  rvt_get_ibdev_name(&(dd)->verbs_dev.rdi), i, cpu);
++	}
++
++	return 0;
++
++fail:
++	free_cpumask_var(available_cpus);
++	free_cpumask_var(non_intr_cpus);
++	_dev_comp_vect_mappings_destroy(dd);
++
++	return ret;
++}
++
++int hfi1_comp_vectors_set_up(struct hfi1_devdata *dd)
++{
++	int ret;
++	struct hfi1_affinity_node *entry;
++
++	mutex_lock(&node_affinity.lock);
++	entry = node_affinity_lookup(dd->node);
++	if (!entry) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	ret = _dev_comp_vect_mappings_create(dd, entry);
++unlock:
++	mutex_unlock(&node_affinity.lock);
++
++	return ret;
++}
++
++void hfi1_comp_vectors_clean_up(struct hfi1_devdata *dd)
++{
++	_dev_comp_vect_mappings_destroy(dd);
++}
++
++int hfi1_comp_vect_mappings_lookup(struct rvt_dev_info *rdi, int comp_vect)
++{
++	struct hfi1_ibdev *verbs_dev = dev_from_rdi(rdi);
++	struct hfi1_devdata *dd = dd_from_dev(verbs_dev);
++
++	if (!dd->comp_vect_mappings)
++		return -EINVAL;
++	if (comp_vect >= dd->comp_vect_possible_cpus)
++		return -EINVAL;
++
++	return dd->comp_vect_mappings[comp_vect];
++}
++
++/*
++ * It assumes dd->comp_vect_possible_cpus is available.
++ */
++static int _dev_comp_vect_cpu_mask_init(struct hfi1_devdata *dd,
++					struct hfi1_affinity_node *entry,
++					bool first_dev_init)
++	__must_hold(&node_affinity.lock)
++{
++	int i, j, curr_cpu;
++	int possible_cpus_comp_vect = 0;
++	struct cpumask *dev_comp_vect_mask = &dd->comp_vect->mask;
++
++	lockdep_assert_held(&node_affinity.lock);
++	/*
++	 * If there's only one CPU available for completion vectors, then
++	 * there will only be one completion vector available. Othewise,
++	 * the number of completion vector available will be the number of
++	 * available CPUs divide it by the number of devices in the
++	 * local NUMA node.
++	 */
++	if (cpumask_weight(&entry->comp_vect_mask) == 1) {
++		possible_cpus_comp_vect = 1;
++		dd_dev_warn(dd,
++			    "Number of kernel receive queues is too large for completion vector affinity to be effective\n");
++	} else {
++		possible_cpus_comp_vect +=
++			cpumask_weight(&entry->comp_vect_mask) /
++				       hfi1_per_node_cntr[dd->node];
++
++		/*
++		 * If the completion vector CPUs available doesn't divide
++		 * evenly among devices, then the first device device to be
++		 * initialized gets an extra CPU.
++		 */
++		if (first_dev_init &&
++		    cpumask_weight(&entry->comp_vect_mask) %
++		    hfi1_per_node_cntr[dd->node] != 0)
++			possible_cpus_comp_vect++;
++	}
++
++	dd->comp_vect_possible_cpus = possible_cpus_comp_vect;
++
++	/* Reserving CPUs for device completion vector */
++	for (i = 0; i < dd->comp_vect_possible_cpus; i++) {
++		curr_cpu = per_cpu_affinity_get(&entry->comp_vect_mask,
++						entry->comp_vect_affinity);
++		if (curr_cpu < 0)
++			goto fail;
++
++		cpumask_set_cpu(curr_cpu, dev_comp_vect_mask);
++	}
++
++	hfi1_cdbg(AFFINITY,
++		  "[%s] Completion vector affinity CPU set(s) %*pbl",
++		  rvt_get_ibdev_name(&(dd)->verbs_dev.rdi),
++		  cpumask_pr_args(dev_comp_vect_mask));
++
++	return 0;
++
++fail:
++	for (j = 0; j < i; j++)
++		per_cpu_affinity_put_max(&entry->comp_vect_mask,
++					 entry->comp_vect_affinity);
++
++	return curr_cpu;
++}
++
++/*
++ * It assumes dd->comp_vect_possible_cpus is available.
++ */
++static void _dev_comp_vect_cpu_mask_clean_up(struct hfi1_devdata *dd,
++					     struct hfi1_affinity_node *entry)
++	__must_hold(&node_affinity.lock)
++{
++	int i, cpu;
++
++	lockdep_assert_held(&node_affinity.lock);
++	if (!dd->comp_vect_possible_cpus)
++		return;
++
++	for (i = 0; i < dd->comp_vect_possible_cpus; i++) {
++		cpu = per_cpu_affinity_put_max(&dd->comp_vect->mask,
++					       entry->comp_vect_affinity);
++		/* Clearing CPU in device completion vector cpu mask */
++		if (cpu >= 0)
++			cpumask_clear_cpu(cpu, &dd->comp_vect->mask);
++	}
++
++	dd->comp_vect_possible_cpus = 0;
++}
++
+ /*
+  * Interrupt affinity.
+  *
+@@ -277,7 +619,8 @@ int hfi1_dev_affinity_init(struct hfi1_devdata *dd)
+ 	int node = pcibus_to_node(dd->pcidev->bus);
+ 	struct hfi1_affinity_node *entry;
+ 	const struct cpumask *local_mask;
+-	int curr_cpu, possible, i;
++	int curr_cpu, possible, i, ret;
++	bool new_entry = false;
+ 
+ 	if (node < 0)
+ 		node = numa_node_id();
+@@ -299,11 +642,14 @@ int hfi1_dev_affinity_init(struct hfi1_devdata *dd)
+ 		if (!entry) {
+ 			dd_dev_err(dd,
+ 				   "Unable to allocate global affinity node\n");
+-			mutex_unlock(&node_affinity.lock);
+-			return -ENOMEM;
++			ret = -ENOMEM;
++			goto fail;
+ 		}
++		new_entry = true;
++
+ 		init_cpu_mask_set(&entry->def_intr);
+ 		init_cpu_mask_set(&entry->rcv_intr);
++		cpumask_clear(&entry->comp_vect_mask);
+ 		cpumask_clear(&entry->general_intr_mask);
+ 		/* Use the "real" cpu mask of this node as the default */
+ 		cpumask_and(&entry->def_intr.mask, &node_affinity.real_cpu_mask,
+@@ -356,10 +702,64 @@ int hfi1_dev_affinity_init(struct hfi1_devdata *dd)
+ 					     &entry->general_intr_mask);
+ 		}
+ 
+-		node_affinity_add_tail(entry);
++		/* Determine completion vector CPUs for the entire node */
++		cpumask_and(&entry->comp_vect_mask,
++			    &node_affinity.real_cpu_mask, local_mask);
++		cpumask_andnot(&entry->comp_vect_mask,
++			       &entry->comp_vect_mask,
++			       &entry->rcv_intr.mask);
++		cpumask_andnot(&entry->comp_vect_mask,
++			       &entry->comp_vect_mask,
++			       &entry->general_intr_mask);
++
++		/*
++		 * If there ends up being 0 CPU cores leftover for completion
++		 * vectors, use the same CPU core as the general/control
++		 * context.
++		 */
++		if (cpumask_weight(&entry->comp_vect_mask) == 0)
++			cpumask_copy(&entry->comp_vect_mask,
++				     &entry->general_intr_mask);
+ 	}
++
++	ret = _dev_comp_vect_cpu_mask_init(dd, entry, new_entry);
++	if (ret < 0)
++		goto fail;
++
++	if (new_entry)
++		node_affinity_add_tail(entry);
++
+ 	mutex_unlock(&node_affinity.lock);
++
+ 	return 0;
++
++fail:
++	if (new_entry)
++		node_affinity_destroy(entry);
++	mutex_unlock(&node_affinity.lock);
++	return ret;
++}
++
++void hfi1_dev_affinity_clean_up(struct hfi1_devdata *dd)
++{
++	struct hfi1_affinity_node *entry;
++
++	if (dd->node < 0)
++		return;
++
++	mutex_lock(&node_affinity.lock);
++	entry = node_affinity_lookup(dd->node);
++	if (!entry)
++		goto unlock;
++
++	/*
++	 * Free device completion vector CPUs to be used by future
++	 * completion vectors
++	 */
++	_dev_comp_vect_cpu_mask_clean_up(dd, entry);
++unlock:
++	mutex_unlock(&node_affinity.lock);
++	dd->node = -1;
+ }
+ 
+ /*
+diff --git a/drivers/infiniband/hw/hfi1/affinity.h b/drivers/infiniband/hw/hfi1/affinity.h
+index 2a1e374169c0..6a7e6ea4e426 100644
+--- a/drivers/infiniband/hw/hfi1/affinity.h
++++ b/drivers/infiniband/hw/hfi1/affinity.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -98,9 +98,11 @@ void hfi1_put_proc_affinity(int cpu);
+ 
+ struct hfi1_affinity_node {
+ 	int node;
++	u16 __percpu *comp_vect_affinity;
+ 	struct cpu_mask_set def_intr;
+ 	struct cpu_mask_set rcv_intr;
+ 	struct cpumask general_intr_mask;
++	struct cpumask comp_vect_mask;
+ 	struct list_head list;
+ };
+ 
+@@ -116,7 +118,11 @@ struct hfi1_affinity_node_list {
+ };
+ 
+ int node_affinity_init(void);
+-void node_affinity_destroy(void);
++void node_affinity_destroy_all(void);
+ extern struct hfi1_affinity_node_list node_affinity;
++void hfi1_dev_affinity_clean_up(struct hfi1_devdata *dd);
++int hfi1_comp_vect_mappings_lookup(struct rvt_dev_info *rdi, int comp_vect);
++int hfi1_comp_vectors_set_up(struct hfi1_devdata *dd);
++void hfi1_comp_vectors_clean_up(struct hfi1_devdata *dd);
+ 
+ #endif /* _HFI1_AFFINITY_H */
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index 2165f2991dcd..573e76006fc0 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -15252,6 +15252,10 @@ struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto bail_cleanup;
+ 
++	ret = hfi1_comp_vectors_set_up(dd);
++	if (ret)
++		goto bail_clear_intr;
++
+ 	/* set up LCB access - must be after set_up_interrupts() */
+ 	init_lcb_access(dd);
+ 
+@@ -15294,6 +15298,7 @@ bail_free_rcverr:
+ bail_free_cntrs:
+ 	free_cntrs(dd);
+ bail_clear_intr:
++	hfi1_comp_vectors_clean_up(dd);
+ 	hfi1_clean_up_interrupts(dd);
+ bail_cleanup:
+ 	hfi1_pcie_ddcleanup(dd);
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 87d2c4f2dfbf..2da53e97637f 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -1265,6 +1265,9 @@ struct hfi1_devdata {
+ 
+ 	/* Save the enabled LCB error bits */
+ 	u64 lcb_err_en;
++	struct cpu_mask_set *comp_vect;
++	int *comp_vect_mappings;
++	u32 comp_vect_possible_cpus;
+ 
+ 	/*
+ 	 * Capability to have different send engines simply by changing a
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index 90a8b20002ce..bc729ad4cd25 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015-2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -1244,6 +1244,8 @@ static void hfi1_clean_devdata(struct hfi1_devdata *dd)
+ 	dd->rcv_limit     = NULL;
+ 	dd->send_schedule = NULL;
+ 	dd->tx_opstats    = NULL;
++	kfree(dd->comp_vect);
++	dd->comp_vect = NULL;
+ 	sdma_clean(dd, dd->num_sdma);
+ 	rvt_dealloc_device(&dd->verbs_dev.rdi);
+ }
+@@ -1300,6 +1302,7 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
+ 		dd->unit = ret;
+ 		list_add(&dd->list, &hfi1_dev_list);
+ 	}
++	dd->node = -1;
+ 
+ 	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+ 	idr_preload_end();
+@@ -1352,6 +1355,12 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
+ 		goto bail;
+ 	}
+ 
++	dd->comp_vect = kzalloc(sizeof(*dd->comp_vect), GFP_KERNEL);
++	if (!dd->comp_vect) {
++		ret = -ENOMEM;
++		goto bail;
++	}
++
+ 	kobject_init(&dd->kobj, &hfi1_devdata_type);
+ 	return dd;
+ 
+@@ -1521,7 +1530,7 @@ module_init(hfi1_mod_init);
+ static void __exit hfi1_mod_cleanup(void)
+ {
+ 	pci_unregister_driver(&hfi1_pci_driver);
+-	node_affinity_destroy();
++	node_affinity_destroy_all();
+ 	hfi1_wss_exit();
+ 	hfi1_dbg_exit();
+ 
+@@ -1605,6 +1614,8 @@ static void cleanup_device_data(struct hfi1_devdata *dd)
+ static void postinit_cleanup(struct hfi1_devdata *dd)
+ {
+ 	hfi1_start_cleanup(dd);
++	hfi1_comp_vectors_clean_up(dd);
++	hfi1_dev_affinity_clean_up(dd);
+ 
+ 	hfi1_pcie_ddcleanup(dd);
+ 	hfi1_pcie_cleanup(dd->pcidev);
+diff --git a/drivers/infiniband/hw/hfi1/trace.c b/drivers/infiniband/hw/hfi1/trace.c
+index 89bd9851065b..332b9b7c554a 100644
+--- a/drivers/infiniband/hw/hfi1/trace.c
++++ b/drivers/infiniband/hw/hfi1/trace.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -374,6 +374,7 @@ const char *print_u32_array(
+ 	return ret;
+ }
+ 
++__hfi1_trace_fn(AFFINITY);
+ __hfi1_trace_fn(PKT);
+ __hfi1_trace_fn(PROC);
+ __hfi1_trace_fn(SDMA);
+diff --git a/drivers/infiniband/hw/hfi1/trace_dbg.h b/drivers/infiniband/hw/hfi1/trace_dbg.h
+index 0e7d929530c5..e62171fb7379 100644
+--- a/drivers/infiniband/hw/hfi1/trace_dbg.h
++++ b/drivers/infiniband/hw/hfi1/trace_dbg.h
+@@ -1,5 +1,5 @@
+ /*
+-* Copyright(c) 2015, 2016 Intel Corporation.
++* Copyright(c) 2015 - 2018 Intel Corporation.
+ *
+ * This file is provided under a dual BSD/GPLv2 license.  When using or
+ * redistributing this file, you may do so under either license.
+@@ -113,6 +113,7 @@ void __hfi1_trace_##lvl(const char *func, char *fmt, ...)		\
+  * hfi1_cdbg(LVL, fmt, ...); as well as take care of all
+  * the debugfs stuff.
+  */
++__hfi1_trace_def(AFFINITY);
+ __hfi1_trace_def(PKT);
+ __hfi1_trace_def(PROC);
+ __hfi1_trace_def(SDMA);
+* Unmerged path drivers/infiniband/hw/hfi1/verbs.c
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 021a776bffe6..181cc336ae24 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2012, 2013 Intel Corporation.  All rights reserved.
++ * Copyright (c) 2012 - 2018 Intel Corporation.  All rights reserved.
+  * Copyright (c) 2006 - 2012 QLogic Corporation. All rights reserved.
+  * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+  *
+@@ -1632,10 +1632,6 @@ int qib_register_ib_device(struct qib_devdata *dd)
+ 	dd->verbs_dev.rdi.dparms.core_cap_flags = RDMA_CORE_PORT_IBA_IB;
+ 	dd->verbs_dev.rdi.dparms.max_mad_size = IB_MGMT_MAD_SIZE;
+ 
+-	snprintf(dd->verbs_dev.rdi.dparms.cq_name,
+-		 sizeof(dd->verbs_dev.rdi.dparms.cq_name),
+-		 "qib_cq%d", dd->unit);
+-
+ 	qib_fill_device_attr(dd);
+ 
+ 	ppd = dd->pport;
+* Unmerged path drivers/infiniband/sw/rdmavt/cq.c
+diff --git a/drivers/infiniband/sw/rdmavt/cq.h b/drivers/infiniband/sw/rdmavt/cq.h
+index 6182c29eff66..72184b1c176b 100644
+--- a/drivers/infiniband/sw/rdmavt/cq.h
++++ b/drivers/infiniband/sw/rdmavt/cq.h
+@@ -2,7 +2,7 @@
+ #define DEF_RVTCQ_H
+ 
+ /*
+- * Copyright(c) 2016 Intel Corporation.
++ * Copyright(c) 2016 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -59,6 +59,6 @@ int rvt_destroy_cq(struct ib_cq *ibcq);
+ int rvt_req_notify_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags notify_flags);
+ int rvt_resize_cq(struct ib_cq *ibcq, int cqe, struct ib_udata *udata);
+ int rvt_poll_cq(struct ib_cq *ibcq, int num_entries, struct ib_wc *entry);
+-int rvt_driver_cq_init(struct rvt_dev_info *rdi);
+-void rvt_cq_exit(struct rvt_dev_info *rdi);
++int rvt_driver_cq_init(void);
++void rvt_cq_exit(void);
+ #endif          /* DEF_RVTCQ_H */
+diff --git a/drivers/infiniband/sw/rdmavt/trace_cq.h b/drivers/infiniband/sw/rdmavt/trace_cq.h
+index a315850aa9bb..df8e1adbef9d 100644
+--- a/drivers/infiniband/sw/rdmavt/trace_cq.h
++++ b/drivers/infiniband/sw/rdmavt/trace_cq.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2016 Intel Corporation.
++ * Copyright(c) 2016 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -71,6 +71,39 @@ __print_symbolic(opcode,                                      \
+ 	wc_opcode_name(RECV),                                 \
+ 	wc_opcode_name(RECV_RDMA_WITH_IMM))
+ 
++#define CQ_ATTR_PRINT \
++"[%s] user cq %s cqe %u comp_vector %d comp_vector_cpu %d flags %x"
++
++DECLARE_EVENT_CLASS(rvt_cq_template,
++		    TP_PROTO(struct rvt_cq *cq,
++			     const struct ib_cq_init_attr *attr),
++		    TP_ARGS(cq, attr),
++		    TP_STRUCT__entry(RDI_DEV_ENTRY(cq->rdi)
++				     __field(struct rvt_mmap_info *, ip)
++				     __field(unsigned int, cqe)
++				     __field(int, comp_vector)
++				     __field(int, comp_vector_cpu)
++				     __field(u32, flags)
++				     ),
++		    TP_fast_assign(RDI_DEV_ASSIGN(cq->rdi)
++				   __entry->ip = cq->ip;
++				   __entry->cqe = attr->cqe;
++				   __entry->comp_vector = attr->comp_vector;
++				   __entry->comp_vector_cpu =
++							cq->comp_vector_cpu;
++				   __entry->flags = attr->flags;
++				   ),
++		    TP_printk(CQ_ATTR_PRINT, __get_str(dev),
++			      __entry->ip ? "true" : "false", __entry->cqe,
++			      __entry->comp_vector, __entry->comp_vector_cpu,
++			      __entry->flags
++			      )
++);
++
++DEFINE_EVENT(rvt_cq_template, rvt_create_cq,
++	     TP_PROTO(struct rvt_cq *cq, const struct ib_cq_init_attr *attr),
++	     TP_ARGS(cq, attr));
++
+ #define CQ_PRN \
+ "[%s] idx %u wr_id %llx status %u opcode %u,%s length %u qpn %x"
+ 
+diff --git a/drivers/infiniband/sw/rdmavt/vt.c b/drivers/infiniband/sw/rdmavt/vt.c
+index 1dd5bf2fe602..7a14ae3c8dd7 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.c
++++ b/drivers/infiniband/sw/rdmavt/vt.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2016 Intel Corporation.
++ * Copyright(c) 2016 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -49,6 +49,7 @@
+ #include <linux/kernel.h>
+ #include <linux/dma-mapping.h>
+ #include "vt.h"
++#include "cq.h"
+ #include "trace.h"
+ 
+ #define RVT_UVERBS_ABI_VERSION 2
+@@ -58,21 +59,18 @@ MODULE_DESCRIPTION("RDMA Verbs Transport Library");
+ 
+ static int rvt_init(void)
+ {
+-	/*
+-	 * rdmavt does not need to do anything special when it starts up. All it
+-	 * needs to do is sit and wait until a driver attempts registration.
+-	 */
+-	return 0;
++	int ret = rvt_driver_cq_init();
++
++	if (ret)
++		pr_err("Error in driver CQ init.\n");
++
++	return ret;
+ }
+ module_init(rvt_init);
+ 
+ static void rvt_cleanup(void)
+ {
+-	/*
+-	 * Nothing to do at exit time either. The module won't be able to be
+-	 * removed until all drivers are gone which means all the dev structs
+-	 * are gone so there is really nothing to do.
+-	 */
++	rvt_cq_exit();
+ }
+ module_exit(rvt_cleanup);
+ 
+@@ -777,11 +775,7 @@ int rvt_register_device(struct rvt_dev_info *rdi)
+ 	}
+ 
+ 	/* Completion queues */
+-	ret = rvt_driver_cq_init(rdi);
+-	if (ret) {
+-		pr_err("Error in driver CQ init.\n");
+-		goto bail_mr;
+-	}
++	spin_lock_init(&rdi->n_cqs_lock);
+ 
+ 	/* DMA Operations */
+ 	rdi->ibdev.dev.device_rh->dma_ops = rdi->ibdev.dev.device_rh->dma_ops ? : &dma_virt_ops;
+@@ -829,13 +823,14 @@ int rvt_register_device(struct rvt_dev_info *rdi)
+ 		(1ull << IB_USER_VERBS_CMD_DESTROY_SRQ)         |
+ 		(1ull << IB_USER_VERBS_CMD_POST_SRQ_RECV);
+ 	rdi->ibdev.node_type = RDMA_NODE_IB_CA;
+-	rdi->ibdev.num_comp_vectors = 1;
++	if (!rdi->ibdev.num_comp_vectors)
++		rdi->ibdev.num_comp_vectors = 1;
+ 
+ 	/* We are now good to announce we exist */
+ 	ret =  ib_register_device(&rdi->ibdev, rdi->driver_f.port_callback);
+ 	if (ret) {
+ 		rvt_pr_err(rdi, "Failed to register driver with ib core.\n");
+-		goto bail_cq;
++		goto bail_mr;
+ 	}
+ 
+ 	rvt_create_mad_agents(rdi);
+@@ -843,9 +838,6 @@ int rvt_register_device(struct rvt_dev_info *rdi)
+ 	rvt_pr_info(rdi, "Registration with rdmavt done.\n");
+ 	return ret;
+ 
+-bail_cq:
+-	rvt_cq_exit(rdi);
+-
+ bail_mr:
+ 	rvt_mr_exit(rdi);
+ 
+@@ -869,7 +861,6 @@ void rvt_unregister_device(struct rvt_dev_info *rdi)
+ 	rvt_free_mad_agents(rdi);
+ 
+ 	ib_unregister_device(&rdi->ibdev);
+-	rvt_cq_exit(rdi);
+ 	rvt_mr_exit(rdi);
+ 	rvt_qp_exit(rdi);
+ }
+* Unmerged path include/rdma/rdma_vt.h
+diff --git a/include/rdma/rdmavt_cq.h b/include/rdma/rdmavt_cq.h
+index 51fd00b243d0..75dc65c0bfb8 100644
+--- a/include/rdma/rdmavt_cq.h
++++ b/include/rdma/rdmavt_cq.h
+@@ -8,7 +8,7 @@
+  *
+  * GPL LICENSE SUMMARY
+  *
+- * Copyright(c) 2016 Intel Corporation.
++ * Copyright(c) 2016 - 2018 Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of version 2 of the GNU General Public License as
+@@ -80,10 +80,11 @@ struct rvt_cq_wc {
+  */
+ struct rvt_cq {
+ 	struct ib_cq ibcq;
+-	struct kthread_work comptask;
++	struct work_struct comptask;
+ 	spinlock_t lock; /* protect changes in this struct */
+ 	u8 notify;
+ 	u8 triggered;
++	int comp_vector_cpu;
+ 	struct rvt_dev_info *rdi;
+ 	struct rvt_cq_wc *queue;
+ 	struct rvt_mmap_info *ip;
