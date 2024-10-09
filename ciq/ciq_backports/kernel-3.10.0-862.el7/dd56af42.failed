@@ -1,0 +1,285 @@
+rcu: Eliminate deadlock between CPU hotplug and expedited grace periods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+commit dd56af42bd829c6e770ed69812bd65a04eaeb1e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dd56af42.failed
+
+Currently, the expedited grace-period primitives do get_online_cpus().
+This greatly simplifies their implementation, but means that calls
+to them holding locks that are acquired by CPU-hotplug notifiers (to
+say nothing of calls to these primitives from CPU-hotplug notifiers)
+can deadlock.  But this is starting to become inconvenient, as can be
+seen here: https://lkml.org/lkml/2014/8/5/754.  The problem in this
+case is that some developers need to acquire a mutex from a CPU-hotplug
+notifier, but also need to hold it across a synchronize_rcu_expedited().
+As noted above, this currently results in deadlock.
+
+This commit avoids the deadlock and retains the simplicity by creating
+a try_get_online_cpus(), which returns false if the get_online_cpus()
+reference count could not immediately be incremented.  If a call to
+try_get_online_cpus() returns true, the expedited primitives operate as
+before.  If a call returns false, the expedited primitives fall back to
+normal grace-period operations.  This falling back of course results in
+increased grace-period latency, but only during times when CPU hotplug
+operations are actually in flight.  The effect should therefore be
+negligible during normal operation.
+
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+	Tested-by: Lan Tianyu <tianyu.lan@intel.com>
+(cherry picked from commit dd56af42bd829c6e770ed69812bd65a04eaeb1e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lockdep.h
+diff --cc include/linux/lockdep.h
+index 0bdb3e0d80fa,4f86465cc317..000000000000
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@@ -484,82 -478,35 +484,98 @@@ static inline void print_irqtrace_event
+   * on the per lock-class debug mode:
+   */
+  
+ -#define lock_acquire_exclusive(l, s, t, n, i)		lock_acquire(l, s, t, 0, 1, n, i)
+ -#define lock_acquire_shared(l, s, t, n, i)		lock_acquire(l, s, t, 1, 1, n, i)
+ -#define lock_acquire_shared_recursive(l, s, t, n, i)	lock_acquire(l, s, t, 2, 1, n, i)
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +# ifdef CONFIG_PROVE_LOCKING
+ +#  define spin_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
+ +#  define spin_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 2, n, i)
+ +# else
+ +#  define spin_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
+ +#  define spin_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 1, NULL, i)
+ +# endif
+ +# define spin_release(l, n, i)			lock_release(l, n, i)
+ +#else
+ +# define spin_acquire(l, s, t, i)		do { } while (0)
+ +# define spin_release(l, n, i)			do { } while (0)
+ +#endif
+  
+ -#define spin_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+ -#define spin_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
+ -#define spin_release(l, n, i)			lock_release(l, n, i)
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +# ifdef CONFIG_PROVE_LOCKING
+ +#  define rwlock_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
+ +#  define rwlock_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 2, 2, NULL, i)
+ +# else
+ +#  define rwlock_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
+ +#  define rwlock_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 2, 1, NULL, i)
+ +# endif
+ +# define rwlock_release(l, n, i)		lock_release(l, n, i)
+ +#else
+ +# define rwlock_acquire(l, s, t, i)		do { } while (0)
+ +# define rwlock_acquire_read(l, s, t, i)	do { } while (0)
+ +# define rwlock_release(l, n, i)		do { } while (0)
+ +#endif
+  
+ -#define rwlock_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+ -#define rwlock_acquire_read(l, s, t, i)		lock_acquire_shared_recursive(l, s, t, NULL, i)
+ -#define rwlock_release(l, n, i)			lock_release(l, n, i)
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +# ifdef CONFIG_PROVE_LOCKING
+ +#  define mutex_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
+ +#  define mutex_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 2, n, i)
+ +# else
+ +#  define mutex_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
+ +#  define mutex_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 1, n, i)
+ +# endif
+ +# define mutex_release(l, n, i)			lock_release(l, n, i)
+ +#else
+ +# define mutex_acquire(l, s, t, i)		do { } while (0)
+ +# define mutex_acquire_nest(l, s, t, n, i)	do { } while (0)
+ +# define mutex_release(l, n, i)			do { } while (0)
+ +#endif
+  
+ -#define seqcount_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+ -#define seqcount_acquire_read(l, s, t, i)	lock_acquire_shared_recursive(l, s, t, NULL, i)
+ -#define seqcount_release(l, n, i)		lock_release(l, n, i)
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +# ifdef CONFIG_PROVE_LOCKING
+ +#  define rwsem_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
+ +#  define rwsem_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 2, n, i)
+ +#  define rwsem_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 1, 2, NULL, i)
+ +# else
+ +#  define rwsem_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
+ +#  define rwsem_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 1, n, i)
+ +#  define rwsem_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 1, 1, NULL, i)
+ +# endif
+ +# define rwsem_release(l, n, i)			lock_release(l, n, i)
+ +#else
+ +# define rwsem_acquire(l, s, t, i)		do { } while (0)
+ +# define rwsem_acquire_nest(l, s, t, n, i)	do { } while (0)
+ +# define rwsem_acquire_read(l, s, t, i)		do { } while (0)
+ +# define rwsem_release(l, n, i)			do { } while (0)
+ +#endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ +# ifdef CONFIG_PROVE_LOCKING
+ +#  define lock_map_acquire(l)		lock_acquire(l, 0, 0, 0, 2, NULL, _THIS_IP_)
+ +#  define lock_map_acquire_read(l)	lock_acquire(l, 0, 0, 2, 2, NULL, _THIS_IP_)
+ +# else
+ +#  define lock_map_acquire(l)		lock_acquire(l, 0, 0, 0, 1, NULL, _THIS_IP_)
+ +#  define lock_map_acquire_read(l)	lock_acquire(l, 0, 0, 2, 1, NULL, _THIS_IP_)
+ +# endif
+ +# define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
+ +#else
+ +# define lock_map_acquire(l)			do { } while (0)
+ +# define lock_map_acquire_read(l)		do { } while (0)
+ +# define lock_map_release(l)			do { } while (0)
+ +#endif
+++=======
++ #define mutex_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
++ #define mutex_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
++ #define mutex_release(l, n, i)			lock_release(l, n, i)
++ 
++ #define rwsem_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
++ #define rwsem_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
++ #define rwsem_acquire_read(l, s, t, i)		lock_acquire_shared(l, s, t, NULL, i)
++ #define rwsem_release(l, n, i)			lock_release(l, n, i)
++ 
++ #define lock_map_acquire(l)			lock_acquire_exclusive(l, 0, 0, NULL, _THIS_IP_)
++ #define lock_map_acquire_read(l)		lock_acquire_shared_recursive(l, 0, 0, NULL, _THIS_IP_)
++ #define lock_map_acquire_tryread(l)		lock_acquire_shared_recursive(l, 0, 1, NULL, _THIS_IP_)
++ #define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
+++>>>>>>> dd56af42bd82 (rcu: Eliminate deadlock between CPU hotplug and expedited grace periods)
+  
+  #ifdef CONFIG_PROVE_LOCKING
+  # define might_lock(lock) 						\
+diff --git a/include/linux/cpu.h b/include/linux/cpu.h
+index e2bdd999bd70..faeb2eaaf268 100644
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -217,6 +217,7 @@ extern struct bus_type cpu_subsys;
+ /* Stop CPUs going up and down. */
+ 
+ extern void get_online_cpus(void);
++extern bool try_get_online_cpus(void);
+ extern void put_online_cpus(void);
+ extern void cpu_hotplug_disable(void);
+ extern void cpu_hotplug_enable(void);
+@@ -232,6 +233,7 @@ int cpu_down(unsigned int cpu);
+ #else		/* CONFIG_HOTPLUG_CPU */
+ 
+ #define get_online_cpus()	do { } while (0)
++#define try_get_online_cpus()	true
+ #define put_online_cpus()	do { } while (0)
+ #define cpu_hotplug_disable()	do { } while (0)
+ #define cpu_hotplug_enable()	do { } while (0)
+* Unmerged path include/linux/lockdep.h
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index 6442ecfa43a5..a84715db3a48 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -79,6 +79,8 @@ static struct {
+ 
+ /* Lockdep annotations for get/put_online_cpus() and cpu_hotplug_begin/end() */
+ #define cpuhp_lock_acquire_read() lock_map_acquire_read(&cpu_hotplug.dep_map)
++#define cpuhp_lock_acquire_tryread() \
++				  lock_map_acquire_tryread(&cpu_hotplug.dep_map)
+ #define cpuhp_lock_acquire()      lock_map_acquire(&cpu_hotplug.dep_map)
+ #define cpuhp_lock_release()      lock_map_release(&cpu_hotplug.dep_map)
+ 
+@@ -91,10 +93,22 @@ void get_online_cpus(void)
+ 	mutex_lock(&cpu_hotplug.lock);
+ 	cpu_hotplug.refcount++;
+ 	mutex_unlock(&cpu_hotplug.lock);
+-
+ }
+ EXPORT_SYMBOL_GPL(get_online_cpus);
+ 
++bool try_get_online_cpus(void)
++{
++	if (cpu_hotplug.active_writer == current)
++		return true;
++	if (!mutex_trylock(&cpu_hotplug.lock))
++		return false;
++	cpuhp_lock_acquire_tryread();
++	cpu_hotplug.refcount++;
++	mutex_unlock(&cpu_hotplug.lock);
++	return true;
++}
++EXPORT_SYMBOL_GPL(try_get_online_cpus);
++
+ void put_online_cpus(void)
+ {
+ 	if (cpu_hotplug.active_writer == current)
+diff --git a/kernel/rcutree.c b/kernel/rcutree.c
+index f46e3e44c0af..1f275dc9a80d 100644
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@ -2691,11 +2691,6 @@ static int synchronize_sched_expedited_cpu_stop(void *data)
+  * restructure your code to batch your updates, and then use a single
+  * synchronize_sched() instead.
+  *
+- * Note that it is illegal to call this function while holding any lock
+- * that is acquired by a CPU-hotplug notifier.  And yes, it is also illegal
+- * to call this function from a CPU-hotplug notifier.  Failing to observe
+- * these restriction will result in deadlock.
+- *
+  * This implementation can be thought of as an application of ticket
+  * locking to RCU, with sync_sched_expedited_started and
+  * sync_sched_expedited_done taking on the roles of the halves
+@@ -2745,7 +2740,12 @@ void synchronize_sched_expedited(void)
+ 	 */
+ 	snap = atomic_long_inc_return(&rsp->expedited_start);
+ 	firstsnap = snap;
+-	get_online_cpus();
++	if (!try_get_online_cpus()) {
++		/* CPU hotplug operation in flight, fall back to normal GP. */
++		wait_rcu_gp(call_rcu_sched);
++		atomic_long_inc(&rsp->expedited_normal);
++		return;
++	}
+ 	WARN_ON_ONCE(cpu_is_offline(raw_smp_processor_id()));
+ 
+ 	/*
+@@ -2792,7 +2792,12 @@ void synchronize_sched_expedited(void)
+ 		 * and they started after our first try, so their grace
+ 		 * period works for us.
+ 		 */
+-		get_online_cpus();
++		if (!try_get_online_cpus()) {
++			/* CPU hotplug operation in flight, use normal GP. */
++			wait_rcu_gp(call_rcu_sched);
++			atomic_long_inc(&rsp->expedited_normal);
++			return;
++		}
+ 		snap = atomic_long_read(&rsp->expedited_start);
+ 		smp_mb(); /* ensure read is before try_stop_cpus(). */
+ 	}
+diff --git a/kernel/rcutree_plugin.h b/kernel/rcutree_plugin.h
+index f9a668626722..7eab8601304e 100644
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@ -803,11 +803,6 @@ sync_rcu_preempt_exp_init(struct rcu_state *rsp, struct rcu_node *rnp)
+  * In fact, if you are using synchronize_rcu_expedited() in a loop,
+  * please restructure your code to batch your updates, and then Use a
+  * single synchronize_rcu() instead.
+- *
+- * Note that it is illegal to call this function while holding any lock
+- * that is acquired by a CPU-hotplug notifier.  And yes, it is also illegal
+- * to call this function from a CPU-hotplug notifier.  Failing to observe
+- * these restriction will result in deadlock.
+  */
+ void synchronize_rcu_expedited(void)
+ {
+@@ -829,7 +824,11 @@ void synchronize_rcu_expedited(void)
+ 	 * being boosted.  This simplifies the process of moving tasks
+ 	 * from leaf to root rcu_node structures.
+ 	 */
+-	get_online_cpus();
++	if (!try_get_online_cpus()) {
++		/* CPU-hotplug operation in flight, fall back to normal GP. */
++		wait_rcu_gp(call_rcu);
++		return;
++	}
+ 
+ 	/*
+ 	 * Acquire lock, falling back to synchronize_rcu() if too many
