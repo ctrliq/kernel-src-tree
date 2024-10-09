@@ -246,6 +246,8 @@ static void ib_device_release(struct device *device)
 		ib_cache_release_one(dev);
 		kfree(dev->port_immutable);
 	}
+	ib_security_release_port_pkey_list(dev);
+	kfree(dev->port_pkey_list);
 	kfree(dev);
 }
 
@@ -515,7 +517,6 @@ static void cleanup_device(struct ib_device *device)
 {
 	ib_cache_cleanup_one(device);
 	ib_cache_release_one(device);
-	kfree(device->port_pkey_list);
 	kfree(device->port_immutable);
 }
 
@@ -553,12 +554,10 @@ static int setup_device(struct ib_device *device)
 	if (ret) {
 		dev_warn(&device->dev,
 			 "Couldn't set up InfiniBand P_Key/GID cache\n");
-		goto pkey_cleanup;
+		return ret;
 	}
 	return 0;
 
-pkey_cleanup:
-	kfree(device->port_pkey_list);
 port_cleanup:
 	kfree(device->port_immutable);
 	return ret;
@@ -671,9 +670,6 @@ void ib_unregister_device(struct ib_device *device)
 	mutex_unlock(&device_mutex);
 
 	ib_cache_cleanup_one(device);
-
-	ib_security_destroy_port_pkey_list(device);
-	kfree(device->port_pkey_list);
 
 	down_write(&lists_rwsem);
 	write_lock_irqsave(&device->client_data_lock, flags);
