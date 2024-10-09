@@ -1941,6 +1941,7 @@ void ipoib_setup(struct net_device *dev)
 	spin_lock_init(&priv->lock);
 
 	init_rwsem(&priv->vlan_rwsem);
+	mutex_init(&priv->mcast_mutex);
 
 	INIT_LIST_HEAD(&priv->path_list);
 	INIT_LIST_HEAD(&priv->child_intfs);
