@@ -1,0 +1,394 @@
+Fix crash after issuing lip reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix crash after issuing lip reset (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 91.67%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 9d3d340d19d36b923d768f25c66cedc900d8ad90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9d3d340d.failed
+
+When RPI is not available, driver sends WQE with invalid RPI value and
+rejected by HBA.
+lpfc 0000:82:00.3: 1:3154 BLS ABORT RSP failed, data:  x3/xa0320008
+and
+lpfc :2753 PLOGI failure DID:FFFFFA Status:x3/xa0240008
+
+In this case, driver accesses rpi_ids array out of bounds.
+
+Fix:
+Check return value of lpfc_sli4_alloc_rpi(). Do not allocate
+lpfc_nodelist entry if RPI is not available.
+
+When RPI is not available, we will get discovery timeouts and
+command drops for some of the vports as seen below.
+
+lpfc :0273 Unexpected discovery timeout, vport State x0
+lpfc :0230 Unexpected timeout, hba link state x5
+lpfc :0111 Dropping received ELS cmd Data: x0 xc90c55 x0
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 9d3d340d19d36b923d768f25c66cedc900d8ad90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --cc drivers/scsi/lpfc/lpfc_hbadisc.c
+index c68ad89e3510,d313dde76963..000000000000
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@@ -4236,8 -4387,8 +4243,13 @@@ lpfc_enable_node(struct lpfc_vport *vpo
+  				"0277 lpfc_enable_node: ndlp:x%p "
+  				"usgmap:x%x refcnt:%d\n",
+  				(void *)ndlp, ndlp->nlp_usg_map,
+++<<<<<<< HEAD
+ +				atomic_read(&ndlp->kref.refcount));
+ +		return NULL;
+++=======
++ 				kref_read(&ndlp->kref));
++ 		goto free_rpi;
+++>>>>>>> 9d3d340d19d3 (Fix crash after issuing lip reset)
+  	}
+  	/* The ndlp should not already be in active mode */
+  	if (NLP_CHK_NODE_ACT(ndlp)) {
+@@@ -4246,8 -4397,8 +4258,13 @@@
+  				"0278 lpfc_enable_node: ndlp:x%p "
+  				"usgmap:x%x refcnt:%d\n",
+  				(void *)ndlp, ndlp->nlp_usg_map,
+++<<<<<<< HEAD
+ +				atomic_read(&ndlp->kref.refcount));
+ +		return NULL;
+++=======
++ 				kref_read(&ndlp->kref));
++ 		goto free_rpi;
+++>>>>>>> 9d3d340d19d3 (Fix crash after issuing lip reset)
+  	}
+  
+  	/* Keep the original DID */
+@@@ -4942,12 -5119,12 +4964,10 @@@ lpfc_setup_disc_node(struct lpfc_vport 
+  		if ((vport->fc_flag & FC_RSCN_MODE) != 0 &&
+  		    lpfc_rscn_payload_check(vport, did) == 0)
+  			return NULL;
+- 		ndlp = (struct lpfc_nodelist *)
+- 		     mempool_alloc(vport->phba->nlp_mem_pool, GFP_KERNEL);
++ 		ndlp = lpfc_nlp_init(vport, did);
+  		if (!ndlp)
+  			return NULL;
+- 		lpfc_nlp_init(vport, ndlp, did);
+  		lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
+ -		if (vport->phba->nvmet_support)
+ -			return ndlp;
+  		spin_lock_irq(shost->host_lock);
+  		ndlp->nlp_flag |= NLP_NPR_2B_DISC;
+  		spin_unlock_irq(shost->host_lock);
+diff --git a/drivers/scsi/lpfc/lpfc_bsg.c b/drivers/scsi/lpfc/lpfc_bsg.c
+index a59b81809442..277e9a990c02 100644
+--- a/drivers/scsi/lpfc/lpfc_bsg.c
++++ b/drivers/scsi/lpfc/lpfc_bsg.c
+@@ -2444,6 +2444,10 @@ static int lpfcdiag_loop_self_reg(struct lpfc_hba *phba, uint16_t *rpi)
+ 				mbox, *rpi);
+ 	else {
+ 		*rpi = lpfc_sli4_alloc_rpi(phba);
++		if (*rpi == LPFC_RPI_ALLOC_ERROR) {
++			mempool_free(mbox, phba->mbox_mem_pool);
++			return -EBUSY;
++		}
+ 		status = lpfc_reg_rpi(phba, phba->pport->vpi,
+ 				phba->pport->fc_myDID,
+ 				(uint8_t *)&phba->pport->fc_sparam,
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index 5c660beb66e2..4497ef4a7af2 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -96,7 +96,7 @@ void lpfc_issue_reg_vpi(struct lpfc_hba *, struct lpfc_vport *);
+ 
+ int lpfc_check_sli_ndlp(struct lpfc_hba *, struct lpfc_sli_ring *,
+ 			struct lpfc_iocbq *, struct lpfc_nodelist *);
+-void lpfc_nlp_init(struct lpfc_vport *, struct lpfc_nodelist *, uint32_t);
++struct lpfc_nodelist *lpfc_nlp_init(struct lpfc_vport *vport, uint32_t did);
+ struct lpfc_nodelist *lpfc_nlp_get(struct lpfc_nodelist *);
+ int  lpfc_nlp_put(struct lpfc_nodelist *);
+ int  lpfc_nlp_not_used(struct lpfc_nodelist *ndlp);
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 441942fc0354..233b41d7527c 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -894,10 +894,9 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 			 * Cannot find existing Fabric ndlp, so allocate a
+ 			 * new one
+ 			 */
+-			ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++			ndlp = lpfc_nlp_init(vport, PT2PT_RemoteID);
+ 			if (!ndlp)
+ 				goto fail;
+-			lpfc_nlp_init(vport, ndlp, PT2PT_RemoteID);
+ 		} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+ 			ndlp = lpfc_enable_node(vport, ndlp,
+ 						NLP_STE_UNUSED_NODE);
+@@ -1363,7 +1362,6 @@ lpfc_els_abort_flogi(struct lpfc_hba *phba)
+ int
+ lpfc_initial_flogi(struct lpfc_vport *vport)
+ {
+-	struct lpfc_hba *phba = vport->phba;
+ 	struct lpfc_nodelist *ndlp;
+ 
+ 	vport->port_state = LPFC_FLOGI;
+@@ -1373,10 +1371,9 @@ lpfc_initial_flogi(struct lpfc_vport *vport)
+ 	ndlp = lpfc_findnode_did(vport, Fabric_DID);
+ 	if (!ndlp) {
+ 		/* Cannot find existing Fabric ndlp, so allocate a new one */
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, Fabric_DID);
+ 		if (!ndlp)
+ 			return 0;
+-		lpfc_nlp_init(vport, ndlp, Fabric_DID);
+ 		/* Set the node type */
+ 		ndlp->nlp_type |= NLP_FABRIC;
+ 		/* Put ndlp onto node list */
+@@ -1417,17 +1414,15 @@ lpfc_initial_flogi(struct lpfc_vport *vport)
+ int
+ lpfc_initial_fdisc(struct lpfc_vport *vport)
+ {
+-	struct lpfc_hba *phba = vport->phba;
+ 	struct lpfc_nodelist *ndlp;
+ 
+ 	/* First look for the Fabric ndlp */
+ 	ndlp = lpfc_findnode_did(vport, Fabric_DID);
+ 	if (!ndlp) {
+ 		/* Cannot find existing Fabric ndlp, so allocate a new one */
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, Fabric_DID);
+ 		if (!ndlp)
+ 			return 0;
+-		lpfc_nlp_init(vport, ndlp, Fabric_DID);
+ 		/* Put ndlp onto node list */
+ 		lpfc_enqueue_node(vport, ndlp);
+ 	} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+@@ -1563,14 +1558,13 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
+ 					     phba->active_rrq_pool);
+ 			return ndlp;
+ 		}
+-		new_ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_ATOMIC);
++		new_ndlp = lpfc_nlp_init(vport, ndlp->nlp_DID);
+ 		if (!new_ndlp) {
+ 			if (active_rrqs_xri_bitmap)
+ 				mempool_free(active_rrqs_xri_bitmap,
+ 					     phba->active_rrq_pool);
+ 			return ndlp;
+ 		}
+-		lpfc_nlp_init(vport, new_ndlp, ndlp->nlp_DID);
+ 	} else if (!NLP_CHK_NODE_ACT(new_ndlp)) {
+ 		rc = memcmp(&ndlp->nlp_portname, name,
+ 			    sizeof(struct lpfc_name));
+@@ -2744,10 +2738,9 @@ lpfc_issue_els_scr(struct lpfc_vport *vport, uint32_t nportid, uint8_t retry)
+ 
+ 	ndlp = lpfc_findnode_did(vport, nportid);
+ 	if (!ndlp) {
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, nportid);
+ 		if (!ndlp)
+ 			return 1;
+-		lpfc_nlp_init(vport, ndlp, nportid);
+ 		lpfc_enqueue_node(vport, ndlp);
+ 	} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+ 		ndlp = lpfc_enable_node(vport, ndlp, NLP_STE_UNUSED_NODE);
+@@ -2837,10 +2830,9 @@ lpfc_issue_els_farpr(struct lpfc_vport *vport, uint32_t nportid, uint8_t retry)
+ 
+ 	ndlp = lpfc_findnode_did(vport, nportid);
+ 	if (!ndlp) {
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, nportid);
+ 		if (!ndlp)
+ 			return 1;
+-		lpfc_nlp_init(vport, ndlp, nportid);
+ 		lpfc_enqueue_node(vport, ndlp);
+ 	} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+ 		ndlp = lpfc_enable_node(vport, ndlp, NLP_STE_UNUSED_NODE);
+@@ -5949,7 +5941,6 @@ int
+ lpfc_els_handle_rscn(struct lpfc_vport *vport)
+ {
+ 	struct lpfc_nodelist *ndlp;
+-	struct lpfc_hba *phba = vport->phba;
+ 
+ 	/* Ignore RSCN if the port is being torn down. */
+ 	if (vport->load_flag & FC_UNLOADING) {
+@@ -5996,12 +5987,11 @@ lpfc_els_handle_rscn(struct lpfc_vport *vport)
+ 			}
+ 			ndlp->nlp_prev_state = NLP_STE_UNUSED_NODE;
+ 		} else {
+-			ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++			ndlp = lpfc_nlp_init(vport, NameServer_DID);
+ 			if (!ndlp) {
+ 				lpfc_els_flush_rscn(vport);
+ 				return 0;
+ 			}
+-			lpfc_nlp_init(vport, ndlp, NameServer_DID);
+ 			ndlp->nlp_prev_state = ndlp->nlp_state;
+ 			lpfc_nlp_set_state(vport, ndlp, NLP_STE_PLOGI_ISSUE);
+ 		}
+@@ -7559,11 +7549,9 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ 	ndlp = lpfc_findnode_did(vport, did);
+ 	if (!ndlp) {
+ 		/* Cannot find existing Fabric ndlp, so allocate a new one */
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, did);
+ 		if (!ndlp)
+ 			goto dropit;
+-
+-		lpfc_nlp_init(vport, ndlp, did);
+ 		lpfc_nlp_set_state(vport, ndlp, NLP_STE_NPR_NODE);
+ 		newnode = 1;
+ 		if ((did & Fabric_DID_MASK) == Fabric_DID_MASK)
+@@ -8005,7 +7993,6 @@ lpfc_els_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ static void
+ lpfc_start_fdmi(struct lpfc_vport *vport)
+ {
+-	struct lpfc_hba *phba = vport->phba;
+ 	struct lpfc_nodelist *ndlp;
+ 
+ 	/* If this is the first time, allocate an ndlp and initialize
+@@ -8014,9 +8001,8 @@ lpfc_start_fdmi(struct lpfc_vport *vport)
+ 	 */
+ 	ndlp = lpfc_findnode_did(vport, FDMI_DID);
+ 	if (!ndlp) {
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, FDMI_DID);
+ 		if (ndlp) {
+-			lpfc_nlp_init(vport, ndlp, FDMI_DID);
+ 			ndlp->nlp_type |= NLP_FABRIC;
+ 		} else {
+ 			return;
+@@ -8069,7 +8055,7 @@ lpfc_do_scr_ns_plogi(struct lpfc_hba *phba, struct lpfc_vport *vport)
+ 
+ 	ndlp = lpfc_findnode_did(vport, NameServer_DID);
+ 	if (!ndlp) {
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, NameServer_DID);
+ 		if (!ndlp) {
+ 			if (phba->fc_topology == LPFC_TOPOLOGY_LOOP) {
+ 				lpfc_disc_start(vport);
+@@ -8080,7 +8066,6 @@ lpfc_do_scr_ns_plogi(struct lpfc_hba *phba, struct lpfc_vport *vport)
+ 					 "0251 NameServer login: no memory\n");
+ 			return;
+ 		}
+-		lpfc_nlp_init(vport, ndlp, NameServer_DID);
+ 	} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+ 		ndlp = lpfc_enable_node(vport, ndlp, NLP_STE_UNUSED_NODE);
+ 		if (!ndlp) {
+* Unmerged path drivers/scsi/lpfc/lpfc_hbadisc.c
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 9316d7914982..544bb23b1d14 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -2830,34 +2830,38 @@ lpfc_sli4_node_prep(struct lpfc_hba *phba)
+ {
+ 	struct lpfc_nodelist  *ndlp, *next_ndlp;
+ 	struct lpfc_vport **vports;
+-	int i;
++	int i, rpi;
++	unsigned long flags;
+ 
+ 	if (phba->sli_rev != LPFC_SLI_REV4)
+ 		return;
+ 
+ 	vports = lpfc_create_vport_work_array(phba);
+-	if (vports != NULL) {
+-		for (i = 0; i <= phba->max_vports && vports[i] != NULL; i++) {
+-			if (vports[i]->load_flag & FC_UNLOADING)
+-				continue;
++	if (vports == NULL)
++		return;
+ 
+-			list_for_each_entry_safe(ndlp, next_ndlp,
+-						 &vports[i]->fc_nodes,
+-						 nlp_listp) {
+-				if (NLP_CHK_NODE_ACT(ndlp)) {
+-					ndlp->nlp_rpi =
+-						lpfc_sli4_alloc_rpi(phba);
+-					lpfc_printf_vlog(ndlp->vport, KERN_INFO,
+-							 LOG_NODE,
+-							 "0009 rpi:%x DID:%x "
+-							 "flg:%x map:%x %p\n",
+-							 ndlp->nlp_rpi,
+-							 ndlp->nlp_DID,
+-							 ndlp->nlp_flag,
+-							 ndlp->nlp_usg_map,
+-							 ndlp);
+-				}
++	for (i = 0; i <= phba->max_vports && vports[i] != NULL; i++) {
++		if (vports[i]->load_flag & FC_UNLOADING)
++			continue;
++
++		list_for_each_entry_safe(ndlp, next_ndlp,
++					 &vports[i]->fc_nodes,
++					 nlp_listp) {
++			if (!NLP_CHK_NODE_ACT(ndlp))
++				continue;
++			rpi = lpfc_sli4_alloc_rpi(phba);
++			if (rpi == LPFC_RPI_ALLOC_ERROR) {
++				spin_lock_irqsave(&phba->ndlp_lock, flags);
++				NLP_CLR_NODE_ACT(ndlp);
++				spin_unlock_irqrestore(&phba->ndlp_lock, flags);
++				continue;
+ 			}
++			ndlp->nlp_rpi = rpi;
++			lpfc_printf_vlog(ndlp->vport, KERN_INFO, LOG_NODE,
++					 "0009 rpi:%x DID:%x "
++					 "flg:%x map:%x %p\n", ndlp->nlp_rpi,
++					 ndlp->nlp_DID, ndlp->nlp_flag,
++					 ndlp->nlp_usg_map, ndlp);
+ 		}
+ 	}
+ 	lpfc_destroy_vport_work_array(phba, vports);
+@@ -4401,10 +4405,9 @@ lpfc_sli4_perform_vport_cvl(struct lpfc_vport *vport)
+ 	ndlp = lpfc_findnode_did(vport, Fabric_DID);
+ 	if (!ndlp) {
+ 		/* Cannot find existing Fabric ndlp, so allocate a new one */
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, Fabric_DID);
+ 		if (!ndlp)
+ 			return 0;
+-		lpfc_nlp_init(vport, ndlp, Fabric_DID);
+ 		/* Set the node type */
+ 		ndlp->nlp_type |= NLP_FABRIC;
+ 		/* Put ndlp onto node list */
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index a72e33b21d85..ee0ef3c5e980 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -15290,14 +15290,13 @@ lpfc_sli4_seq_abort_rsp(struct lpfc_vport *vport,
+ 
+ 	ndlp = lpfc_findnode_did(vport, sid);
+ 	if (!ndlp) {
+-		ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++		ndlp = lpfc_nlp_init(vport, sid);
+ 		if (!ndlp) {
+ 			lpfc_printf_vlog(vport, KERN_WARNING, LOG_ELS,
+ 					 "1268 Failed to allocate ndlp for "
+ 					 "oxid:x%x SID:x%x\n", oxid, sid);
+ 			return;
+ 		}
+-		lpfc_nlp_init(vport, ndlp, sid);
+ 		/* Put ndlp onto pport node list */
+ 		lpfc_enqueue_node(vport, ndlp);
+ 	} else if (!NLP_CHK_NODE_ACT(ndlp)) {
+diff --git a/drivers/scsi/lpfc/lpfc_vport.c b/drivers/scsi/lpfc/lpfc_vport.c
+index e18bbc66e83b..5f779ec58601 100644
+--- a/drivers/scsi/lpfc/lpfc_vport.c
++++ b/drivers/scsi/lpfc/lpfc_vport.c
+@@ -718,10 +718,9 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
+ 		ndlp = lpfc_findnode_did(vport, Fabric_DID);
+ 		if (!ndlp) {
+ 			/* Cannot find existing Fabric ndlp, allocate one */
+-			ndlp = mempool_alloc(phba->nlp_mem_pool, GFP_KERNEL);
++			ndlp = lpfc_nlp_init(vport, Fabric_DID);
+ 			if (!ndlp)
+ 				goto skip_logo;
+-			lpfc_nlp_init(vport, ndlp, Fabric_DID);
+ 			/* Indicate free memory when release */
+ 			NLP_SET_FREE_REQ(ndlp);
+ 		} else {
