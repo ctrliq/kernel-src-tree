@@ -1,0 +1,596 @@
+qla2xxx: added sess generations to detect RSCN update races
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit df673274fa4896f25f0bf348d2a3535d74b4cbec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/df673274.failed
+
+RSCN processing in qla2xxx driver can run in parallel with ELS/IO
+processing. As such the decision to remove disappeared fc port's
+session could be stale, because a new login sequence has occurred
+since and created a brand new session.
+
+Previous mechanism of dealing with this by delaying deletion request
+was prone to erroneous deletions if the event that was supposed to
+cancel the deletion never arrived or has been delayed in processing.
+
+New mechanism relies on a time-like generation counter to serialize
+RSCN updates relative to ELS/IO updates.
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit df673274fa4896f25f0bf348d2a3535d74b4cbec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 866e7a991a8e,8b011aef12bd..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -68,11 -66,11 +68,17 @@@
+   * |                              |                    | 0xd02a,0xd02e	|
+   * |                              |                    | 0xd031-0xd0ff	|
+   * |                              |                    | 0xd101-0xd1fe	|
+++<<<<<<< HEAD
+ + * |                              |                    | 0xd213-0xd2fe	|
+ + * | Target Mode		  |	  0xe070       | 0xe021		|
+ + * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
+++=======
++  * |                              |                    | 0xd214-0xd2fe	|
++  * | Target Mode		  |	  0xe080       |		|
++  * | Target Mode Management	  |	  0xf096       | 0xf002		|
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+   * |                              |                    | 0xf046-0xf049  |
+ - * | Target Mode Task Management  |	  0x1000d      |		|
+ + * | Target Mode Task Management  |	  0x1000b      |		|
+   * ----------------------------------------------------------------------
+   */
+  
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index ea8080a1a353,506621d814ab..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -2965,14 -2933,8 +2964,17 @@@ qla2x00_rport_del(void *data
+  	rport = fcport->drport ? fcport->drport: fcport->rport;
+  	fcport->drport = NULL;
+  	spin_unlock_irqrestore(fcport->vha->host->host_lock, flags);
+- 	if (rport) {
++ 	if (rport)
+  		fc_remote_port_delete(rport);
+++<<<<<<< HEAD
+ +		/*
+ +		 * Release the target mode FC NEXUS in qla_target.c code
+ +		 * if target mod is enabled.
+ +		 */
+ +		qlt_fc_port_deleted(vha, fcport);
+ +	}
+++=======
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  }
+  
+  /**
+@@@ -3496,20 -3468,44 +3507,61 @@@ qla2x00_configure_fabric(scsi_qla_host_
+  			if ((fcport->flags & FCF_FABRIC_DEVICE) == 0)
+  				continue;
+  
+++<<<<<<< HEAD
+ +			if (fcport->scan_state == QLA_FCPORT_SCAN &&
+ +			    atomic_read(&fcport->state) == FCS_ONLINE) {
+ +				qla2x00_mark_device_lost(vha, fcport,
+ +				    ql2xplogiabsentdevice, 0);
+ +				if (fcport->loop_id != FC_NO_LOOP_ID &&
+ +				    (fcport->flags & FCF_FCP2_DEVICE) == 0 &&
+ +				    fcport->port_type != FCT_INITIATOR &&
+ +				    fcport->port_type != FCT_BROADCAST) {
+ +					ha->isp_ops->fabric_logout(vha,
+ +					    fcport->loop_id,
+ +					    fcport->d_id.b.domain,
+ +					    fcport->d_id.b.area,
+ +					    fcport->d_id.b.al_pa);
+ +					qla2x00_clear_loop_id(fcport);
+++=======
++ 			if (fcport->scan_state == QLA_FCPORT_SCAN) {
++ 				if (qla_ini_mode_enabled(base_vha) &&
++ 				    atomic_read(&fcport->state) == FCS_ONLINE) {
++ 					qla2x00_mark_device_lost(vha, fcport,
++ 					    ql2xplogiabsentdevice, 0);
++ 					if (fcport->loop_id != FC_NO_LOOP_ID &&
++ 					    (fcport->flags & FCF_FCP2_DEVICE) == 0 &&
++ 					    fcport->port_type != FCT_INITIATOR &&
++ 					    fcport->port_type != FCT_BROADCAST) {
++ 						ha->isp_ops->fabric_logout(vha,
++ 						    fcport->loop_id,
++ 						    fcport->d_id.b.domain,
++ 						    fcport->d_id.b.area,
++ 						    fcport->d_id.b.al_pa);
++ 						qla2x00_clear_loop_id(fcport);
++ 					}
++ 				} else if (!qla_ini_mode_enabled(base_vha)) {
++ 					/*
++ 					 * In target mode, explicitly kill
++ 					 * sessions and log out of devices
++ 					 * that are gone, so that we don't
++ 					 * end up with an initiator using the
++ 					 * wrong ACL (if the fabric recycles
++ 					 * an FC address and we have a stale
++ 					 * session around) and so that we don't
++ 					 * report initiators that are no longer
++ 					 * on the fabric.
++ 					 */
++ 					ql_dbg(ql_dbg_tgt_mgt, vha, 0xf077,
++ 					    "port gone, logging out/killing session: "
++ 					    "%8phC state 0x%x flags 0x%x fc4_type 0x%x "
++ 					    "scan_state %d\n",
++ 					    fcport->port_name,
++ 					    atomic_read(&fcport->state),
++ 					    fcport->flags, fcport->fc4_type,
++ 					    fcport->scan_state);
++ 					qlt_fc_port_deleted(vha, fcport,
++ 					    discovery_gen);
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  				}
+  			}
+  		}
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,0b5bd9cd7f0d..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -462,16 -586,18 +472,25 @@@ static void qlt_schedule_sess_for_delet
+  	sess->expires = jiffies + dev_loss_tmo * HZ;
+  
+  	ql_dbg(ql_dbg_tgt, sess->vha, 0xe048,
+++<<<<<<< HEAD
+ +	    "qla_target(%d): session for port %8phC (loop ID %d) scheduled for "
+ +	    "deletion in %u secs (expires: %lu) immed: %d\n",
+ +	    sess->vha->vp_idx, sess->port_name, sess->loop_id, dev_loss_tmo,
+ +	    sess->expires, immediate);
+++=======
++ 	    "qla_target(%d): session for port %8phC (loop ID %d s_id %02x:%02x:%02x)"
++ 	    " scheduled for deletion in %u secs (expires: %lu) immed: %d, logout: %d, gen: %#x\n",
++ 	    sess->vha->vp_idx, sess->port_name, sess->loop_id,
++ 	    sess->s_id.b.domain, sess->s_id.b.area, sess->s_id.b.al_pa,
++ 	    dev_loss_tmo, sess->expires, immediate, sess->logout_on_delete,
++ 	    sess->generation);
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  
+  	if (immediate)
+ -		mod_delayed_work(system_wq, &tgt->sess_del_work, 0);
+ +		schedule_delayed_work(&tgt->sess_del_work, 0);
+  	else
+  		schedule_delayed_work(&tgt->sess_del_work,
+ -		    sess->expires - jiffies);
+ +		    jiffies - sess->expires);
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+@@@ -787,8 -808,9 +809,14 @@@ static struct qla_tgt_sess *qlt_create_
+  	memcpy(sess->port_name, fcport->port_name, sizeof(sess->port_name));
+  
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+ +	list_add_tail(&sess->sess_list_entry, &ha->tgt.qla_tgt->sess_list);
+ +	ha->tgt.qla_tgt->sess_count++;
+++=======
++ 	list_add_tail(&sess->sess_list_entry, &vha->vha_tgt.qla_tgt->sess_list);
++ 	vha->vha_tgt.qla_tgt->sess_count++;
++ 	qlt_do_generation_tick(vha, &sess->generation);
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf04b,
+@@@ -857,17 -886,19 +885,22 @@@ void qlt_fc_port_added(struct scsi_qla_
+  		    fcport->port_name, sess->loop_id);
+  		sess->local = 0;
+  	}
+ -	ha->tgt.tgt_ops->put_sess(sess);
+  	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+ +	ha->tgt.tgt_ops->put_sess(sess);
+  }
+  
+- void qlt_fc_port_deleted(struct scsi_qla_host *vha, fc_port_t *fcport)
++ /*
++  * max_gen - specifies maximum session generation
++  * at which this deletion requestion is still valid
++  */
++ void
++ qlt_fc_port_deleted(struct scsi_qla_host *vha, fc_port_t *fcport, int max_gen)
+  {
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+  	struct qla_tgt_sess *sess;
+ +	unsigned long flags;
+  
+  	if (!vha->hw->tgt.tgt_ops)
+  		return;
+@@@ -2955,23 -3996,280 +2997,280 @@@ static int qlt_abort_task(struct scsi_q
+  	return __qlt_abort_task(vha, iocb, sess);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void qlt_logo_completion_handler(fc_port_t *fcport, int rc)
++ {
++ 	if (fcport->tgt_session) {
++ 		if (rc != MBS_COMMAND_COMPLETE) {
++ 			ql_dbg(ql_dbg_tgt_mgt, fcport->vha, 0xf093,
++ 				"%s: se_sess %p / sess %p from"
++ 				" port %8phC loop_id %#04x s_id %02x:%02x:%02x"
++ 				" LOGO failed: %#x\n",
++ 				__func__,
++ 				fcport->tgt_session->se_sess,
++ 				fcport->tgt_session,
++ 				fcport->port_name, fcport->loop_id,
++ 				fcport->d_id.b.domain, fcport->d_id.b.area,
++ 				fcport->d_id.b.al_pa, rc);
++ 		}
++ 
++ 		fcport->tgt_session->logout_completed = 1;
++ 	}
++ }
++ 
++ static void qlt_swap_imm_ntfy_iocb(struct imm_ntfy_from_isp *a,
++     struct imm_ntfy_from_isp *b)
++ {
++ 	struct imm_ntfy_from_isp tmp;
++ 	memcpy(&tmp, a, sizeof(struct imm_ntfy_from_isp));
++ 	memcpy(a, b, sizeof(struct imm_ntfy_from_isp));
++ 	memcpy(b, &tmp, sizeof(struct imm_ntfy_from_isp));
++ }
++ 
++ /*
++ * ha->hardware_lock supposed to be held on entry (to protect tgt->sess_list)
++ *
++ * Schedules sessions with matching port_id/loop_id but different wwn for
++ * deletion. Returns existing session with matching wwn if present.
++ * Null otherwise.
++ */
++ static struct qla_tgt_sess *
++ qlt_find_sess_invalidate_other(struct qla_tgt *tgt, uint64_t wwn,
++     port_id_t port_id, uint16_t loop_id)
++ {
++ 	struct qla_tgt_sess *sess = NULL, *other_sess;
++ 	uint64_t other_wwn;
++ 
++ 	list_for_each_entry(other_sess, &tgt->sess_list, sess_list_entry) {
++ 
++ 		other_wwn = wwn_to_u64(other_sess->port_name);
++ 
++ 		if (wwn == other_wwn) {
++ 			WARN_ON(sess);
++ 			sess = other_sess;
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport_id collision */
++ 		if (port_id.b24 == other_sess->s_id.b24) {
++ 			if (loop_id != other_sess->loop_id) {
++ 				ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000c,
++ 				    "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 				    other_sess, other_sess->loop_id, other_wwn);
++ 
++ 				/*
++ 				 * logout_on_delete is set by default, but another
++ 				 * session that has the same s_id/loop_id combo
++ 				 * might have cleared it when requested this session
++ 				 * deletion, so don't touch it
++ 				 */
++ 				qlt_schedule_sess_for_deletion(other_sess, true);
++ 			} else {
++ 				/*
++ 				 * Another wwn used to have our s_id/loop_id
++ 				 * combo - kill the session, but don't log out
++ 				 */
++ 				sess->logout_on_delete = 0;
++ 				qlt_schedule_sess_for_deletion(other_sess,
++ 				    true);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport handle collision */
++ 		if (loop_id == other_sess->loop_id) {
++ 			ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000d,
++ 			       "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 			       other_sess, other_sess->loop_id, other_wwn);
++ 
++ 			/* Same loop_id but different s_id
++ 			 * Ok to kill and logout */
++ 			qlt_schedule_sess_for_deletion(other_sess, true);
++ 		}
++ 	}
++ 
++ 	return sess;
++ }
++ 
++ /* Abort any commands for this s_id waiting on qla_tgt_wq workqueue */
++ static int abort_cmds_for_s_id(struct scsi_qla_host *vha, port_id_t *s_id)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	uint32_t key;
++ 	int count = 0;
++ 
++ 	key = (((u32)s_id->b.domain << 16) |
++ 	       ((u32)s_id->b.area   <<  8) |
++ 	       ((u32)s_id->b.al_pa));
++ 
++ 	spin_lock(&vha->cmd_list_lock);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		uint32_t op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		if (op_key == key) {
++ 			op->aborted = true;
++ 			count++;
++ 		}
++ 	}
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		uint32_t cmd_key = sid_to_key(cmd->atio.u.isp24.fcp_hdr.s_id);
++ 		if (cmd_key == key) {
++ 			cmd->state = QLA_TGT_STATE_ABORTED;
++ 			count++;
++ 		}
++ 	}
++ 	spin_unlock(&vha->cmd_list_lock);
++ 
++ 	return count;
++ }
++ 
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  /*
+   * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+   */
+  static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+  	struct imm_ntfy_from_isp *iocb)
+  {
+++<<<<<<< HEAD
+ +	struct qla_hw_data *ha = vha->hw;
+++=======
++ 	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_tgt_sess *sess = NULL;
++ 	uint64_t wwn;
++ 	port_id_t port_id;
++ 	uint16_t loop_id;
++ 	uint16_t wd3_lo;
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  	int res = 0;
+  
+ -	wwn = wwn_to_u64(iocb->u.isp24.port_name);
+ -
+ -	port_id.b.domain = iocb->u.isp24.port_id[2];
+ -	port_id.b.area   = iocb->u.isp24.port_id[1];
+ -	port_id.b.al_pa  = iocb->u.isp24.port_id[0];
+ -	port_id.b.rsvd_1 = 0;
+ -
+ -	loop_id = le16_to_cpu(iocb->u.isp24.nport_handle);
+ -
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf026,
+  	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+  	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+  
+ -	/* res = 1 means ack at the end of thread
+ -	 * res = 0 means ack async/later.
+ -	 */
+  	switch (iocb->u.isp24.status_subcode) {
+  	case ELS_PLOGI:
+++<<<<<<< HEAD
+ +	case ELS_FLOGI:
+ +	case ELS_PRLI:
+++=======
++ 
++ 		/* Mark all stale commands in qla_tgt_wq for deletion */
++ 		abort_cmds_for_s_id(vha, &port_id);
++ 
++ 		if (wwn)
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn,
++ 			    port_id, loop_id);
++ 
++ 		if (!sess || IS_SW_RESV_ADDR(sess->s_id)) {
++ 			res = 1;
++ 			break;
++ 		}
++ 
++ 		if (sess->plogi_ack_needed) {
++ 			/*
++ 			 * Initiator sent another PLOGI before last PLOGI could
++ 			 * finish. Swap plogi iocbs and terminate old one
++ 			 * without acking, new one will get acked when session
++ 			 * deletion completes.
++ 			 */
++ 			ql_log(ql_log_warn, sess->vha, 0xf094,
++ 			    "sess %p received double plogi.\n", sess);
++ 
++ 			qlt_swap_imm_ntfy_iocb(iocb, &sess->tm_iocb);
++ 
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		res = 0;
++ 
++ 		/*
++ 		 * Save immediate Notif IOCB for Ack when sess is done
++ 		 * and being deleted.
++ 		 */
++ 		memcpy(&sess->tm_iocb, iocb, sizeof(sess->tm_iocb));
++ 		sess->plogi_ack_needed  = 1;
++ 
++ 		 /*
++ 		  * Under normal circumstances we want to release nport handle
++ 		  * during LOGO process to avoid nport handle leaks inside FW.
++ 		  * The exception is when LOGO is done while another PLOGI with
++ 		  * the same nport handle is waiting as might be the case here.
++ 		  * Note: there is always a possibily of a race where session
++ 		  * deletion has already started for other reasons (e.g. ACL
++ 		  * removal) and now PLOGI arrives:
++ 		  * 1. if PLOGI arrived in FW after nport handle has been freed,
++ 		  *    FW must have assigned this PLOGI a new/same handle and we
++ 		  *    can proceed ACK'ing it as usual when session deletion
++ 		  *    completes.
++ 		  * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
++ 		  *    bit reached it, the handle has now been released. We'll
++ 		  *    get an error when we ACK this PLOGI. Nothing will be sent
++ 		  *    back to initiator. Initiator should eventually retry
++ 		  *    PLOGI and situation will correct itself.
++ 		  */
++ 		sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
++ 					   (sess->s_id.b24 == port_id.b24));
++ 		qlt_schedule_sess_for_deletion(sess, true);
++ 		break;
++ 
++ 	case ELS_PRLI:
++ 		wd3_lo = le16_to_cpu(iocb->u.isp24.u.prli.wd3_lo);
++ 
++ 		if (wwn)
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn, port_id,
++ 			    loop_id);
++ 
++ 		if (sess != NULL) {
++ 			if (sess->deleted) {
++ 				/*
++ 				 * Impatient initiator sent PRLI before last
++ 				 * PLOGI could finish. Will force him to re-try,
++ 				 * while last one finishes.
++ 				 */
++ 				ql_log(ql_log_warn, sess->vha, 0xf095,
++ 				    "sess %p PRLI received, before plogi ack.\n",
++ 				    sess);
++ 				qlt_send_term_imm_notif(vha, iocb, 1);
++ 				res = 0;
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * This shouldn't happen under normal circumstances,
++ 			 * since we have deleted the old session during PLOGI
++ 			 */
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf096,
++ 			    "PRLI (loop_id %#04x) for existing sess %p (loop_id %#04x)\n",
++ 			    sess->loop_id, sess, iocb->u.isp24.nport_handle);
++ 
++ 			sess->local = 0;
++ 			sess->loop_id = loop_id;
++ 			sess->s_id = port_id;
++ 
++ 			if (wd3_lo & BIT_7)
++ 				sess->conf_compl_supported = 1;
++ 
++ 		}
++ 		res = 1; /* send notify ack */
++ 
++ 		/* Make session global (not used in fabric mode) */
++ 		if (ha->current_topology != ISP_CFG_F) {
++ 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
++ 			set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
++ 			qla2xxx_wake_dpc(vha);
++ 		} else {
++ 			/* todo: else - create sess here. */
++ 			res = 1; /* send notify ack */
++ 		}
++ 
++ 		break;
++ 
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  	case ELS_LOGO:
+  	case ELS_PRLO:
+  		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,2ceb60ffc5e9..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -813,9 -911,16 +813,11 @@@ struct qla_tgt_sess 
+  	port_id_t s_id;
+  
+  	unsigned int conf_compl_supported:1;
+ -	unsigned int deleted:2;
+ +	unsigned int deleted:1;
+  	unsigned int local:1;
+ -	unsigned int logout_on_delete:1;
+ -	unsigned int plogi_ack_needed:1;
+ -	unsigned int keep_nport_handle:1;
+ -
+ -	unsigned char logout_completed;
+  
++ 	int generation;
++ 
+  	struct se_session *se_sess;
+  	struct scsi_qla_host *vha;
+  	struct qla_tgt *tgt;
+@@@ -937,9 -1088,7 +939,13 @@@ extern int qlt_lport_register(struct ql
+  extern void qlt_lport_deregister(struct scsi_qla_host *);
+  extern void qlt_unreg_sess(struct qla_tgt_sess *);
+  extern void qlt_fc_port_added(struct scsi_qla_host *, fc_port_t *);
+++<<<<<<< HEAD
+ +extern void qlt_fc_port_deleted(struct scsi_qla_host *, fc_port_t *);
+ +extern void qlt_set_mode(struct scsi_qla_host *ha);
+ +extern void qlt_clear_mode(struct scsi_qla_host *ha);
+++=======
++ extern void qlt_fc_port_deleted(struct scsi_qla_host *, fc_port_t *, int);
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  extern int __init qlt_init(void);
+  extern void qlt_exit(void);
+  extern void qlt_update_vp_map(struct scsi_qla_host *, int);
+@@@ -1006,5 -1163,8 +1012,11 @@@ extern void qlt_stop_phase1(struct qla_
+  extern void qlt_stop_phase2(struct qla_tgt *);
+  extern irqreturn_t qla83xx_msix_atio_q(int, void *);
+  extern void qlt_83xx_iospace_config(struct qla_hw_data *);
+++<<<<<<< HEAD
+++=======
++ extern int qlt_free_qfull_cmds(struct scsi_qla_host *);
++ extern void qlt_logo_completion_handler(fc_port_t *, int);
++ extern void qlt_do_generation_tick(struct scsi_qla_host *, int *);
+++>>>>>>> df673274fa48 (qla2xxx: added sess generations to detect RSCN update races)
+  
+  #endif /* __QLA_TARGET_H */
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112..0a29933c3fb0 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3658,6 +3658,11 @@ typedef struct scsi_qla_host {
+ 
+ 	struct list_head	qp_list;
+ 
++	/* Counter to detect races between ELS and RSCN events */
++	atomic_t		generation_tick;
++	/* Time when global fcport update has been scheduled */
++	int			total_fcport_update_gen;
++
+ 	uint32_t	vp_abort_cnt;
+ 
+ 	struct fc_vport	*fc_vport;	/* holds fc_vport * for each vport */
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index c679c5766696..cf93e2fb7f19 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -3585,11 +3585,14 @@ qla2x00_schedule_rport_del(struct scsi_qla_host *vha, fc_port_t *fcport,
+ 		spin_lock_irqsave(vha->host->host_lock, flags);
+ 		fcport->drport = rport;
+ 		spin_unlock_irqrestore(vha->host->host_lock, flags);
++		qlt_do_generation_tick(vha, &base_vha->total_fcport_update_gen);
+ 		set_bit(FCPORT_UPDATE_NEEDED, &base_vha->dpc_flags);
+ 		qla2xxx_wake_dpc(base_vha);
+ 	} else {
++		int now;
+ 		fc_remote_port_delete(rport);
+-		qlt_fc_port_deleted(vha, fcport);
++		qlt_do_generation_tick(vha, &now);
++		qlt_fc_port_deleted(vha, fcport, now);
+ 	}
+ }
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
