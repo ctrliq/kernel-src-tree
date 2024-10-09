@@ -302,7 +302,6 @@ static void domain_add_cpu(int cpu, struct rdt_resource *r, bool notifier)
 
 	cpumask_set_cpu(cpu, &d->cpu_mask);
 	list_add_tail(&d->list, add_pos);
-	r->num_domains++;
 }
 
 static void domain_remove_cpu(int cpu, struct rdt_resource *r)
@@ -318,7 +317,6 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
 
 	cpumask_clear_cpu(cpu, &d->cpu_mask);
 	if (cpumask_empty(&d->cpu_mask)) {
-		r->num_domains--;
 		kfree(d->cbm);
 		list_del(&d->list);
 		kfree(d);
