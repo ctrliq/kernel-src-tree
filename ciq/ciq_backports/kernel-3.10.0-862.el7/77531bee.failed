@@ -1,0 +1,803 @@
+ALSA: x86: Rearrange defines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 77531beeb97d079fb422d2b78a0d75c564384310
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/77531bee.failed
+
+We have two header files and everything is mixed up chaotically.
+Move the chip-specific definitions like the hardware registers to
+intel_hdmi_lpe_audio.h, and the rest, the implementation specific
+stuff into intel_hdmi_audio.h.
+
+In addition, put some more comments to the register fields, and fix
+the incorrect name prefix for AUD_HDMI_STATUS bits, too.
+
+The whole changes are merely a code shuffling, and there is no
+functional change.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 77531beeb97d079fb422d2b78a0d75c564384310)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/x86/intel_hdmi_audio.c
+#	sound/x86/intel_hdmi_audio.h
+#	sound/x86/intel_hdmi_lpe_audio.h
+diff --cc sound/x86/intel_hdmi_audio.c
+index deee9904a0f9,34750c54663a..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -254,32 -224,40 +254,38 @@@ static int had_read_modify_aud_config_v
+  	 * If substream is NULL, there is no active stream.
+  	 * In this case just set channels to 2
+  	 */
+ -	channels = substream ? substream->runtime->channels : 2;
+ -	dev_dbg(intelhaddata->dev, "enable %d, ch=%d\n", enable, channels);
+ -
+ -	cfg_val.regx.num_ch = channels - 2;
+ -	if (enable)
+ -		cfg_val.regx.aud_en = 1;
+ -	mask = AUD_CONFIG_CH_MASK | 1;
+ -
+ -	had_read_register(intelhaddata, AUD_CONFIG, &val);
+ -	val &= ~mask;
+ -	val |= cfg_val.regval;
+ -	had_write_register(intelhaddata, AUD_CONFIG, val);
+ +	if (substream)
+ +		channels = substream->runtime->channels;
+ +	else
+ +		channels = 2;
+ +	cfg_val.cfg_regx_v2.num_ch = channels - 2;
+ +
+ +	data = data | cfg_val.cfg_regval;
+ +	mask = mask | AUD_CONFIG_CH_MASK_V2;
+ +
+ +	pr_debug("%s : data = %x, mask =%x\n", __func__, data, mask);
+ +
+ +	return had_read_modify(intelhaddata, AUD_CONFIG, data, mask);
+  }
+  
+ -/* forcibly ACKs to both BUFFER_DONE and BUFFER_UNDERRUN interrupts */
+ -static void had_ack_irqs(struct snd_intelhad *ctx)
+ +void snd_intelhad_enable_audio(struct snd_pcm_substream *substream, u8 enable)
+  {
+ -	u32 status_reg;
+ -
+ -	had_read_register(ctx, AUD_HDMI_STATUS, &status_reg);
+ -	status_reg |= HDMI_AUDIO_BUFFER_DONE | HDMI_AUDIO_UNDERRUN;
+ -	had_write_register(ctx, AUD_HDMI_STATUS, status_reg);
+ -	had_read_register(ctx, AUD_HDMI_STATUS, &status_reg);
+ +	had_read_modify_aud_config_v2(substream, enable, BIT(0));
+  }
+  
+ -/* Reset buffer pointers */
+ -static void had_reset_audio(struct snd_intelhad *intelhaddata)
+ +static void snd_intelhad_reset_audio(struct snd_intelhad *intelhaddata,
+ +				     u8 reset)
+  {
+++<<<<<<< HEAD
+ +	had_write_register(intelhaddata, AUD_HDMI_STATUS_v2, reset);
+++=======
++ 	had_write_register(intelhaddata, AUD_HDMI_STATUS,
++ 			   AUD_HDMI_STATUSG_MASK_FUNCRST);
++ 	had_write_register(intelhaddata, AUD_HDMI_STATUS, 0);
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  }
+  
+ -/*
+ +/**
+   * initialize audio channel status registers
+   * This function is called in the prepare callback
+   */
+@@@ -916,9 -807,200 +922,164 @@@ static int snd_intelhad_prog_n(u32 aud_
+  	return 0;
+  }
+  
+ -/*
+ - * PCM ring buffer handling
+ - *
+ - * The hardware provides a ring buffer with the fixed 4 buffer descriptors
+ - * (BDs).  The driver maps these 4 BDs onto the PCM ring buffer.  The mapping
+ - * moves at each period elapsed.  The below illustrates how it works:
+ - *
+ - * At time=0
+ - *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
+ - *  BD  | 0 | 1 | 2 | 3 |
+ - *
+ - * At time=1 (period elapsed)
+ - *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
+ - *  BD      | 1 | 2 | 3 | 0 |
+ - *
+ - * At time=2 (second period elapsed)
+ - *  PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
+ - *  BD          | 2 | 3 | 0 | 1 |
+ - *
+ - * The bd_head field points to the index of the BD to be read.  It's also the
+ - * position to be filled at next.  The pcm_head and the pcm_filled fields
+ - * point to the indices of the current position and of the next position to
+ - * be filled, respectively.  For PCM buffer there are both _head and _filled
+ - * because they may be difference when nperiods > 4.  For example, in the
+ - * example above at t=1, bd_head=1 and pcm_head=1 while pcm_filled=5:
+ - *
+ - * pcm_head (=1) --v               v-- pcm_filled (=5)
+ - *       PCM | 0 | 1 | 2 | 3 | 4 | 5 | .... |n-1|
+ - *       BD      | 1 | 2 | 3 | 0 |
+ - *  bd_head (=1) --^               ^-- next to fill (= bd_head)
+ - *
+ - * For nperiods < 4, the remaining BDs out of 4 are marked as invalid, so that
+ - * the hardware skips those BDs in the loop.
+ - */
+ -
+ -#define AUD_BUF_ADDR(x)		(AUD_BUF_A_ADDR + (x) * HAD_REG_WIDTH)
+ -#define AUD_BUF_LEN(x)		(AUD_BUF_A_LENGTH + (x) * HAD_REG_WIDTH)
+ -
+ -/* Set up a buffer descriptor at the "filled" position */
+ -static void had_prog_bd(struct snd_pcm_substream *substream,
+ -			struct snd_intelhad *intelhaddata)
+ +void snd_intelhad_handle_underrun(struct snd_intelhad *intelhaddata)
+  {
+++<<<<<<< HEAD
+ +	u32 hdmi_status, i = 0;
+++=======
++ 	int idx = intelhaddata->bd_head;
++ 	int ofs = intelhaddata->pcmbuf_filled * intelhaddata->period_bytes;
++ 	u32 addr = substream->runtime->dma_addr + ofs;
++ 
++ 	addr |= AUD_BUF_VALID | AUD_BUF_INTR_EN;
++ 	had_write_register(intelhaddata, AUD_BUF_ADDR(idx), addr);
++ 	had_write_register(intelhaddata, AUD_BUF_LEN(idx),
++ 			   intelhaddata->period_bytes);
++ 
++ 	/* advance the indices to the next */
++ 	intelhaddata->bd_head++;
++ 	intelhaddata->bd_head %= intelhaddata->num_bds;
++ 	intelhaddata->pcmbuf_filled++;
++ 	intelhaddata->pcmbuf_filled %= substream->runtime->periods;
++ }
++ 
++ /* invalidate a buffer descriptor with the given index */
++ static void had_invalidate_bd(struct snd_intelhad *intelhaddata,
++ 			      int idx)
++ {
++ 	had_write_register(intelhaddata, AUD_BUF_ADDR(idx), 0);
++ 	had_write_register(intelhaddata, AUD_BUF_LEN(idx), 0);
++ }
++ 
++ /* Initial programming of ring buffer */
++ static void had_init_ringbuf(struct snd_pcm_substream *substream,
++ 			     struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_runtime *runtime = substream->runtime;
++ 	int i, num_periods;
++ 
++ 	num_periods = runtime->periods;
++ 	intelhaddata->num_bds = min(num_periods, HAD_NUM_OF_RING_BUFS);
++ 	intelhaddata->period_bytes =
++ 		frames_to_bytes(runtime, runtime->period_size);
++ 	WARN_ON(intelhaddata->period_bytes & 0x3f);
++ 
++ 	intelhaddata->bd_head = 0;
++ 	intelhaddata->pcmbuf_head = 0;
++ 	intelhaddata->pcmbuf_filled = 0;
++ 
++ 	for (i = 0; i < HAD_NUM_OF_RING_BUFS; i++) {
++ 		if (i < num_periods)
++ 			had_prog_bd(substream, intelhaddata);
++ 		else /* invalidate the rest */
++ 			had_invalidate_bd(intelhaddata, i);
++ 	}
++ 
++ 	intelhaddata->bd_head = 0; /* reset at head again before starting */
++ }
++ 
++ /* process a bd, advance to the next */
++ static void had_advance_ringbuf(struct snd_pcm_substream *substream,
++ 				struct snd_intelhad *intelhaddata)
++ {
++ 	int num_periods = substream->runtime->periods;
++ 
++ 	/* reprogram the next buffer */
++ 	had_prog_bd(substream, intelhaddata);
++ 
++ 	/* proceed to next */
++ 	intelhaddata->pcmbuf_head++;
++ 	intelhaddata->pcmbuf_head %= num_periods;
++ }
++ 
++ /* process the current BD(s);
++  * returns the current PCM buffer byte position, or -EPIPE for underrun.
++  */
++ static int had_process_ringbuf(struct snd_pcm_substream *substream,
++ 			       struct snd_intelhad *intelhaddata)
++ {
++ 	int len, processed;
++ 	unsigned long flags;
++ 
++ 	processed = 0;
++ 	spin_lock_irqsave(&intelhaddata->had_spinlock, flags);
++ 	for (;;) {
++ 		/* get the remaining bytes on the buffer */
++ 		had_read_register(intelhaddata,
++ 				  AUD_BUF_LEN(intelhaddata->bd_head),
++ 				  &len);
++ 		if (len < 0 || len > intelhaddata->period_bytes) {
++ 			dev_dbg(intelhaddata->dev, "Invalid buf length %d\n",
++ 				len);
++ 			len = -EPIPE;
++ 			goto out;
++ 		}
++ 
++ 		if (len > 0) /* OK, this is the current buffer */
++ 			break;
++ 
++ 		/* len=0 => already empty, check the next buffer */
++ 		if (++processed >= intelhaddata->num_bds) {
++ 			len = -EPIPE; /* all empty? - report underrun */
++ 			goto out;
++ 		}
++ 		had_advance_ringbuf(substream, intelhaddata);
++ 	}
++ 
++ 	len = intelhaddata->period_bytes - len;
++ 	len += intelhaddata->period_bytes * intelhaddata->pcmbuf_head;
++  out:
++ 	spin_unlock_irqrestore(&intelhaddata->had_spinlock, flags);
++ 	return len;
++ }
++ 
++ /* called from irq handler */
++ static void had_process_buffer_done(struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_substream *substream;
++ 
++ 	if (!intelhaddata->connected)
++ 		return; /* disconnected? - bail out */
++ 
++ 	substream = had_substream_get(intelhaddata);
++ 	if (!substream)
++ 		return; /* no stream? - bail out */
++ 
++ 	/* process or stop the stream */
++ 	if (had_process_ringbuf(substream, intelhaddata) < 0)
++ 		snd_pcm_stop_xrun(substream);
++ 	else
++ 		snd_pcm_period_elapsed(substream);
++ 
++ 	had_substream_put(intelhaddata);
++ }
++ 
++ #define MAX_CNT			0xFF
++ 
++ /*
++  * The interrupt status 'sticky' bits might not be cleared by
++  * setting '1' to that bit once...
++  */
++ static void wait_clear_underrun_bit(struct snd_intelhad *intelhaddata)
++ {
++ 	int i;
++ 	u32 val;
++ 
++ 	for (i = 0; i < MAX_CNT; i++) {
++ 		/* clear bit30, 31 AUD_HDMI_STATUS */
++ 		had_read_register(intelhaddata, AUD_HDMI_STATUS, &val);
++ 		if (!(val & AUD_HDMI_STATUS_MASK_UNDERRUN))
++ 			return;
++ 		had_write_register(intelhaddata, AUD_HDMI_STATUS, val);
++ 	}
++ 	dev_err(intelhaddata->dev, "Unable to clear UNDERRUN bits\n");
++ }
++ 
++ /* called from irq handler */
++ static void had_process_buffer_underrun(struct snd_intelhad *intelhaddata)
++ {
++ 	struct snd_pcm_substream *substream;
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  
+  	/* Handle Underrun interrupt within Audio Unit */
+  	had_write_register(intelhaddata, AUD_CONFIG, 0);
+diff --cc sound/x86/intel_hdmi_audio.h
+index 32a2fb766e47,fe8d99cb839f..000000000000
+--- a/sound/x86/intel_hdmi_audio.h
++++ b/sound/x86/intel_hdmi_audio.h
+@@@ -44,62 -35,58 +44,101 @@@ struct platform_device
+  #define PCM_INDEX		0
+  #define MAX_PB_STREAMS		1
+  #define MAX_CAP_STREAMS		0
+++<<<<<<< HEAD
+ +#define HDMI_AUDIO_DRIVER	"hdmi-audio"
+ +
+ +#define HDMI_INFO_FRAME_WORD1	0x000a0184
+ +#define DP_INFO_FRAME_WORD1	0x00441b84
+ +#define FIFO_THRESHOLD		0xFE
+ +#define DMA_FIFO_THRESHOLD	0x7
+++=======
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  #define BYTES_PER_WORD		0x4
++ #define INTEL_HAD		"HdmiLpeAudio"
+  
+- /* Sampling rate as per IEC60958 Ver 3 */
+- #define CH_STATUS_MAP_32KHZ	0x3
+- #define CH_STATUS_MAP_44KHZ	0x0
+- #define CH_STATUS_MAP_48KHZ	0x2
+- #define CH_STATUS_MAP_88KHZ	0x8
+- #define CH_STATUS_MAP_96KHZ	0xA
+- #define CH_STATUS_MAP_176KHZ	0xC
+- #define CH_STATUS_MAP_192KHZ	0xE
++ /*
++  *	CEA speaker placement:
++  *
++  *	FL  FLC   FC   FRC   FR
++  *
++  *						LFE
++  *
++  *	RL  RLC   RC   RRC   RR
++  *
++  *	The Left/Right Surround channel _notions_ LS/RS in SMPTE 320M
++  *	corresponds to CEA RL/RR; The SMPTE channel _assignment_ C/LFE is
++  *	swapped to CEA LFE/FC.
++  */
++ enum cea_speaker_placement {
++ 	FL  = (1 <<  0),        /* Front Left           */
++ 	FC  = (1 <<  1),        /* Front Center         */
++ 	FR  = (1 <<  2),        /* Front Right          */
++ 	FLC = (1 <<  3),        /* Front Left Center    */
++ 	FRC = (1 <<  4),        /* Front Right Center   */
++ 	RL  = (1 <<  5),        /* Rear Left            */
++ 	RC  = (1 <<  6),        /* Rear Center          */
++ 	RR  = (1 <<  7),        /* Rear Right           */
++ 	RLC = (1 <<  8),        /* Rear Left Center     */
++ 	RRC = (1 <<  9),        /* Rear Right Center    */
++ 	LFE = (1 << 10),        /* Low Frequency Effect */
++ };
+  
+++<<<<<<< HEAD
+ +#define MAX_SMPL_WIDTH_20	0x0
+ +#define MAX_SMPL_WIDTH_24	0x1
+ +#define SMPL_WIDTH_16BITS	0x1
+ +#define SMPL_WIDTH_24BITS	0x5
+ +#define CHANNEL_ALLOCATION	0x1F
+ +#define MASK_BYTE0		0x000000FF
+ +#define VALID_DIP_WORDS		3
+ +#define LAYOUT0			0
+ +#define LAYOUT1			1
+ +#define SWAP_LFE_CENTER		0x00fac4c8
+ +#define AUD_CONFIG_CH_MASK_V2	0x70
+++=======
++ struct cea_channel_speaker_allocation {
++ 	int ca_index;
++ 	int speakers[8];
++ 
++ 	/* derived values, just for convenience */
++ 	int channels;
++ 	int spk_mask;
++ };
++ 
++ struct channel_map_table {
++ 	unsigned char map;              /* ALSA API channel map position */
++ 	unsigned char cea_slot;         /* CEA slot value */
++ 	int spk_mask;                   /* speaker position bit mask */
++ };
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  
+  struct pcm_stream_info {
+ -	struct snd_pcm_substream *substream;
+ -	int substream_refcount;
+ -	bool running;
+ +	int		str_id;
+ +	void	*had_substream;
+ +	void	(*period_elapsed)(void *had_substream);
+ +	u32		buffer_ptr;
+ +	u64		buffer_rendered;
+ +	u32		ring_buf_size;
+ +	int		sfreq;
+  };
+  
+ -/*
+ +struct ring_buf_info {
+ +	u32	buf_addr;
+ +	u32	buf_size;
+ +	u8	is_valid;
+ +};
+ +
+ +struct had_stream_pvt {
+ +	enum had_stream_status		stream_status;
+ +	int				stream_ops;
+ +	ssize_t				dbg_cum_bytes;
+ +};
+ +
+ +struct had_pvt_data {
+ +	enum had_status_stream		stream_type;
+ +};
+ +
+ +/**
+   * struct snd_intelhad - intelhad driver structure
+   *
+   * @card: ptr to hold card details
+diff --cc sound/x86/intel_hdmi_lpe_audio.h
+index a1c3aa0fbc57,97bbca19333a..000000000000
+--- a/sound/x86/intel_hdmi_lpe_audio.h
++++ b/sound/x86/intel_hdmi_lpe_audio.h
+@@@ -23,20 -23,6 +23,23 @@@
+  #ifndef __INTEL_HDMI_LPE_AUDIO_H
+  #define __INTEL_HDMI_LPE_AUDIO_H
+  
+++<<<<<<< HEAD
+ +#include <linux/types.h>
+ +#include <sound/initval.h>
+ +#include <linux/version.h>
+ +#include <linux/pm_runtime.h>
+ +#include <sound/asoundef.h>
+ +#include <sound/control.h>
+ +#include <sound/pcm.h>
+ +
+ +#define AUD_CONFIG_VALID_BIT			(1<<9)
+ +#define AUD_CONFIG_DP_MODE			(1<<15)
+ +#define AUD_CONFIG_BLOCK_BIT			(1<<7)
+ +
+ +#define HMDI_LPE_AUDIO_DRIVER_NAME		"intel-hdmi-lpe-audio"
+ +#define HAD_MAX_DEVICES		1
+++=======
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  #define HAD_MIN_CHANNEL		2
+  #define HAD_MAX_CHANNEL		8
+  #define HAD_NUM_OF_RING_BUFS	4
+@@@ -68,9 -54,7 +71,11 @@@
+  #define DIS_SAMPLE_RATE_74_25	74250
+  #define DIS_SAMPLE_RATE_148_5	148500
+  #define HAD_REG_WIDTH		0x08
+- #define HAD_MAX_HW_BUFS		0x04
+  #define HAD_MAX_DIP_WORDS		16
+++<<<<<<< HEAD
+ +#define INTEL_HAD		"IntelHdmiLpeAudio"
+++=======
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  
+  /* DP Link Rates */
+  #define DP_2_7_GHZ			270000
+@@@ -294,69 -105,11 +299,73 @@@ enum hdmi_ctrl_reg_offset_v1 
+  	AUD_BUF_D_ADDR		= 0x58,
+  	AUD_BUF_D_LENGTH	= 0x5c,
+  	AUD_CNTL_ST		= 0x60,
+ -	AUD_HDMI_STATUS		= 0x64, /* v2 */
+ -	AUD_HDMIW_INFOFR	= 0x68, /* v2 */
+ +	AUD_HDMI_STATUS		= 0x68,
+ +	AUD_HDMIW_INFOFR	= 0x114,
+ +};
+ +
+ +/*
+ + * Delta changes in HDMI controller register offsets
+ + * compare to v1 version
+ + */
+ +
+ +enum hdmi_ctrl_reg_offset_v2 {
+ +	AUD_HDMI_STATUS_v2	= 0x64,
+ +	AUD_HDMIW_INFOFR_v2	= 0x68,
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + *	CEA speaker placement:
+ + *
+ + *	FL  FLC   FC   FRC   FR
+ + *
+ + *						LFE
+ + *
+ + *	RL  RLC   RC   RRC   RR
+ + *
+ + *	The Left/Right Surround channel _notions_ LS/RS in SMPTE 320M
+ + *	corresponds to CEA RL/RR; The SMPTE channel _assignment_ C/LFE is
+ + *	swapped to CEA LFE/FC.
+ + */
+ +enum cea_speaker_placement {
+ +	FL  = (1 <<  0),        /* Front Left           */
+ +	FC  = (1 <<  1),        /* Front Center         */
+ +	FR  = (1 <<  2),        /* Front Right          */
+ +	FLC = (1 <<  3),        /* Front Left Center    */
+ +	FRC = (1 <<  4),        /* Front Right Center   */
+ +	RL  = (1 <<  5),        /* Rear Left            */
+ +	RC  = (1 <<  6),        /* Rear Center          */
+ +	RR  = (1 <<  7),        /* Rear Right           */
+ +	RLC = (1 <<  8),        /* Rear Left Center     */
+ +	RRC = (1 <<  9),        /* Rear Right Center    */
+ +	LFE = (1 << 10),        /* Low Frequency Effect */
+ +};
+ +
+ +struct cea_channel_speaker_allocation {
+ +	int ca_index;
+ +	int speakers[8];
+ +
+ +	/* derived values, just for convenience */
+ +	int channels;
+ +	int spk_mask;
+ +};
+ +
+ +struct channel_map_table {
+ +	unsigned char map;              /* ALSA API channel map position */
+ +	unsigned char cea_slot;         /* CEA slot value */
+ +	int spk_mask;                   /* speaker position bit mask */
+ +};
+ +
+ +/**
+ + * union aud_cfg - Audio configuration
+ + *
+ + * @cfg_regx: individual register bits
+ + * @cfg_regval: full register value
+ + *
+ + */
+++=======
++ /* Audio configuration */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_cfg {
+  	struct {
+  		u32 aud_en:1;
+@@@ -367,23 -120,25 +376,35 @@@
+  		u32 flat:1;
+  		u32 val_bit:1;
+  		u32 user_bit:1;
+- 		u32 underrun:1;
+- 		u32 packet_mode:1;
+- 		u32 left_align:1;
+- 		u32 bogus_sample:1;
+- 		u32 dp_modei:1;
++ 		u32 underrun:1;		/* 0: send null packets,
++ 					 * 1: send silence stream
++ 					 */
++ 		u32 packet_mode:1;	/* 0: 32bit container, 1: 16bit */
++ 		u32 left_align:1;	/* 0: MSB bits 0-23, 1: bits 8-31 */
++ 		u32 bogus_sample:1;	/* bogus sample for odd channels */
++ 		u32 dp_modei:1;		/* 0: HDMI, 1: DP */
+  		u32 rsvd:16;
+ -	} regx;
+ -	u32 regval;
+ +	} cfg_regx_v2;
+ +	u32 cfg_regval;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_ch_status_0 - Audio Channel Status 0 Attributes
+ + *
+ + * @status_0_regx:individual register bits
+ + * @status_0_regval:full register value
+ + *
+ + */
+++=======
++ #define AUD_CONFIG_VALID_BIT			(1 << 9)
++ #define AUD_CONFIG_DP_MODE			(1 << 15)
++ #define AUD_CONFIG_CH_MASK	0x70
++ #define LAYOUT0			0		/* interleaved stereo */
++ #define LAYOUT1			1		/* for channels > 2 */
++ 
++ /* Audio Channel Status 0 Attributes */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_ch_status_0 {
+  	struct {
+  		u32 ch_status:1;
+@@@ -394,36 -149,38 +415,58 @@@
+  		u32 ctg_code:8;
+  		u32 src_num:4;
+  		u32 ch_num:4;
+- 		u32 samp_freq:4;
++ 		u32 samp_freq:4;	/* CH_STATUS_MAP_XXX */
+  		u32 clk_acc:2;
+  		u32 rsvd:2;
+ -	} regx;
+ -	u32 regval;
+ +	} status_0_regx;
+ +	u32 status_0_regval;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_ch_status_1 - Audio Channel Status 1 Attributes
+ + *
+ + * @status_1_regx: individual register bits
+ + * @status_1_regval: full register value
+ + *
+ + */
+++=======
++ /* samp_freq values - Sampling rate as per IEC60958 Ver 3 */
++ #define CH_STATUS_MAP_32KHZ	0x3
++ #define CH_STATUS_MAP_44KHZ	0x0
++ #define CH_STATUS_MAP_48KHZ	0x2
++ #define CH_STATUS_MAP_88KHZ	0x8
++ #define CH_STATUS_MAP_96KHZ	0xA
++ #define CH_STATUS_MAP_176KHZ	0xC
++ #define CH_STATUS_MAP_192KHZ	0xE
++ 
++ /* Audio Channel Status 1 Attributes */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_ch_status_1 {
+  	struct {
+  		u32 max_wrd_len:1;
+  		u32 wrd_len:3;
+  		u32 rsvd:28;
+ -	} regx;
+ -	u32 regval;
+ +		} status_1_regx;
+ +	u32 status_1_regval;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_hdmi_cts - CTS register
+ + *
+ + * @cts_regx: individual register bits
+ + * @cts_regval: full register value
+ + *
+ + */
+++=======
++ #define MAX_SMPL_WIDTH_20	0x0
++ #define MAX_SMPL_WIDTH_24	0x1
++ #define SMPL_WIDTH_16BITS	0x1
++ #define SMPL_WIDTH_24BITS	0x5
++ 
++ /* CTS register */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_hdmi_cts {
+  	struct {
+  		u32 cts_val:24;
+@@@ -463,17 -208,14 +506,24 @@@ union aud_buf_config 
+  		u32 rsvd0:5;
+  		u32 aud_delay:8;
+  		u32 rsvd1:8;
+ -	} regx;
+ -	u32 regval;
+ +	} buf_cfg_regx_v2;
+ +	u32 buf_cfgval;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_buf_ch_swap - Audio Sample Swapping offset
+ + *
+ + * @buf_ch_swap_regx: individual register bits
+ + * @buf_ch_swap_val: full register value
+ + *
+ + */
+++=======
++ #define FIFO_THRESHOLD		0xFE
++ #define DMA_FIFO_THRESHOLD	0x7
++ 
++ /* Audio Sample Swapping offset */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_buf_ch_swap {
+  	struct {
+  		u32 first_0:3;
+@@@ -485,17 -227,13 +535,23 @@@
+  		u32 first_3:3;
+  		u32 second_3:3;
+  		u32 rsvd:8;
+ -	} regx;
+ -	u32 regval;
+ +	} buf_ch_swap_regx;
+ +	u32 buf_ch_swap_val;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_buf_addr - Address for Audio Buffer
+ + *
+ + * @buf_addr_regx: individual register bits
+ + * @buf_addr_val: full register value
+ + *
+ + */
+++=======
++ #define SWAP_LFE_CENTER		0x00fac4c8	/* octal 76543210 */
++ 
++ /* Address for Audio Buffer */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_buf_addr {
+  	struct {
+  		u32 valid:1;
+@@@ -557,17 -280,14 +613,24 @@@ union aud_info_frame1 
+  		u32 ver_num:8;
+  		u32 len:5;
+  		u32 rsvd:11;
+ -	} regx;
+ -	u32 regval;
+ +	} fr1_regx;
+ +	u32 fr1_val;
+  };
+  
+++<<<<<<< HEAD
+ +/**
+ + * union aud_info_frame2 - DIP frame 2
+ + *
+ + * @fr2_regx: individual register bits
+ + * @fr2_val: full register value
+ + *
+ + */
+++=======
++ #define HDMI_INFO_FRAME_WORD1	0x000a0184
++ #define DP_INFO_FRAME_WORD1	0x00441b84
++ 
++ /* DIP frame 2 */
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  union aud_info_frame2 {
+  	struct {
+  		u32 chksum:8;
+@@@ -596,61 -310,19 +659,74 @@@ union aud_info_frame3 
+  		u32 lsv:4;
+  		u32 dm_inh:1;
+  		u32 rsvd1:16;
+ -	} regx;
+ -	u32 regval;
+ +	} fr3_regx;
+ +	u32 fr3_val;
+ +};
+ +
+++<<<<<<< HEAD
+ +enum hdmi_connector_status {
+ +	hdmi_connector_status_connected = 1,
+ +	hdmi_connector_status_disconnected = 2,
+ +	hdmi_connector_status_unknown = 3,
+  };
+  
+ +#define HDMI_AUDIO_UNDERRUN     (1UL<<31)
+ +#define HDMI_AUDIO_BUFFER_DONE  (1UL<<29)
+ +
+ +
+ +#define PORT_ENABLE			(1 << 31)
+ +#define SDVO_AUDIO_ENABLE	(1 << 6)
+ +
+ +enum had_caps_list {
+ +	HAD_GET_ELD = 1,
+ +	HAD_GET_DISPLAY_RATE,
+ +	HAD_GET_DP_OUTPUT,
+ +	HAD_GET_LINK_RATE,
+ +	HAD_SET_ENABLE_AUDIO,
+ +	HAD_SET_DISABLE_AUDIO,
+ +	HAD_SET_ENABLE_AUDIO_INT,
+ +	HAD_SET_DISABLE_AUDIO_INT,
+ +};
+ +
+ +enum had_event_type {
+ +	HAD_EVENT_HOT_PLUG = 1,
+ +	HAD_EVENT_HOT_UNPLUG,
+ +	HAD_EVENT_MODE_CHANGING,
+ +	HAD_EVENT_AUDIO_BUFFER_DONE,
+ +	HAD_EVENT_AUDIO_BUFFER_UNDERRUN,
+ +	HAD_EVENT_QUERY_IS_AUDIO_BUSY,
+ +	HAD_EVENT_QUERY_IS_AUDIO_SUSPENDED,
+ +};
+ +
+ +/*
+ + * HDMI Display Controller Audio Interface
+ + *
+ + */
+ +struct hdmi_audio_event {
+ +	int type;
+ +};
+ +
+ +void mid_hdmi_audio_signal_event(enum had_event_type event);
+ +
+ +int mid_hdmi_audio_read(u32 reg, u32 *val);
+ +int mid_hdmi_audio_write(u32 reg, u32 val);
+ +int mid_hdmi_audio_rmw(u32 reg, u32 val, u32 mask);
+ +
+ +int mid_hdmi_audio_get_caps(enum had_caps_list get_element,
+ +			    void *capabilities);
+ +int mid_hdmi_audio_set_caps(enum had_caps_list set_element,
+ +			    void *capabilties);
+++=======
++ #define VALID_DIP_WORDS		3
++ 
++ /* AUD_HDMI_STATUS bits */
++ #define HDMI_AUDIO_UNDERRUN		(1U << 31)
++ #define HDMI_AUDIO_BUFFER_DONE		(1U << 29)
++ 
++ /* AUD_HDMI_STATUS register mask */
++ #define AUD_HDMI_STATUS_MASK_UNDERRUN	0xC0000000
++ #define AUD_HDMI_STATUS_MASK_SRDBG	0x00000002
++ #define AUD_HDMI_STATUSG_MASK_FUNCRST	0x00000001
+++>>>>>>> 77531beeb97d (ALSA: x86: Rearrange defines)
+  
+  #endif
+* Unmerged path sound/x86/intel_hdmi_audio.c
+* Unmerged path sound/x86/intel_hdmi_audio.h
+* Unmerged path sound/x86/intel_hdmi_lpe_audio.h
