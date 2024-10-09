@@ -1,0 +1,215 @@
+Drivers: hv: ring_buffer: wrap around mappings for ring buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hv] ring_buffer: wrap around mappings for ring buffers (Vitaly Kuznetsov) [1406404 1418889]
+Rebuild_FUZZ: 88.50%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 9988ce685676cebe0b14dc128f00e1ae9cd1a4fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9988ce68.failed
+
+Make it possible to always use a single memcpy() or to provide a direct
+link to a packet on the ring buffer by creating virtual mapping for two
+copies of the ring buffer with vmap(). Utilize currently empty
+hv_ringbuffer_cleanup() to do the unmap.
+
+While on it, replace sizeof(struct hv_ring_buffer) check
+in hv_ringbuffer_init() with BUILD_BUG_ON() as it is a compile time check.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Tested-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9988ce685676cebe0b14dc128f00e1ae9cd1a4fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel.c
+diff --cc drivers/hv/channel.c
+index 3d2150792769,16f91c8490fe..000000000000
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@@ -75,12 -75,14 +75,11 @@@ int vmbus_open(struct vmbus_channel *ne
+  {
+  	struct vmbus_channel_open_channel *open_msg;
+  	struct vmbus_channel_msginfo *open_info = NULL;
+- 	void *in, *out;
+  	unsigned long flags;
+  	int ret, err = 0;
+ +	unsigned long t;
+  	struct page *page;
+  
+ -	if (send_ringbuffer_size % PAGE_SIZE ||
+ -	    recv_ringbuffer_size % PAGE_SIZE)
+ -		return -EINVAL;
+ -
+  	spin_lock_irqsave(&newchannel->lock, flags);
+  	if (newchannel->state == CHANNEL_OPEN_STATE) {
+  		newchannel->state = CHANNEL_OPENING_STATE;
+@@@ -100,20 -102,16 +99,24 @@@
+  				recv_ringbuffer_size));
+  
+  	if (!page)
+ -		page = alloc_pages(GFP_KERNEL|__GFP_ZERO,
+ -				   get_order(send_ringbuffer_size +
+ -					     recv_ringbuffer_size));
+ +		out = (void *)__get_free_pages(GFP_KERNEL|__GFP_ZERO,
+ +					       get_order(send_ringbuffer_size +
+ +					       recv_ringbuffer_size));
+ +	else
+ +		out = (void *)page_address(page);
+  
+ -	if (!page) {
+ +	if (!out) {
+  		err = -ENOMEM;
+ -		goto error_set_chnstate;
+ +		goto error0;
+  	}
+  
+++<<<<<<< HEAD
+ +	in = (void *)((unsigned long)out + send_ringbuffer_size);
+ +
+ +	newchannel->ringbuffer_pages = out;
+++=======
++ 	newchannel->ringbuffer_pages = page_address(page);
+++>>>>>>> 9988ce685676 (Drivers: hv: ring_buffer: wrap around mappings for ring buffers)
+  	newchannel->ringbuffer_pagecount = (send_ringbuffer_size +
+  					   recv_ringbuffer_size) >> PAGE_SHIFT;
+  
+@@@ -122,14 -120,15 +125,15 @@@
+  
+  	if (ret != 0) {
+  		err = ret;
+ -		goto error_free_pages;
+ +		goto error0;
+  	}
+  
+- 	ret = hv_ringbuffer_init(
+- 		&newchannel->inbound, in, recv_ringbuffer_size);
++ 	ret = hv_ringbuffer_init(&newchannel->inbound,
++ 				 &page[send_ringbuffer_size >> PAGE_SHIFT],
++ 				 recv_ringbuffer_size >> PAGE_SHIFT);
+  	if (ret != 0) {
+  		err = ret;
+ -		goto error_free_pages;
+ +		goto error0;
+  	}
+  
+  
+@@@ -212,13 -207,15 +216,23 @@@ error1
+  	list_del(&open_info->msglistentry);
+  	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
+  
+ -error_free_gpadl:
+ +error_gpadl:
+  	vmbus_teardown_gpadl(newchannel, newchannel->ringbuffer_gpadlhandle);
+++<<<<<<< HEAD
+ +
+ +error0:
+ +	free_pages((unsigned long)out,
+ +		get_order(send_ringbuffer_size + recv_ringbuffer_size));
+ +	kfree(open_info);
+++=======
++ 	kfree(open_info);
++ error_free_pages:
++ 	hv_ringbuffer_cleanup(&newchannel->outbound);
++ 	hv_ringbuffer_cleanup(&newchannel->inbound);
++ 	__free_pages(page,
++ 		     get_order(send_ringbuffer_size + recv_ringbuffer_size));
++ error_set_chnstate:
+++>>>>>>> 9988ce685676 (Drivers: hv: ring_buffer: wrap around mappings for ring buffers)
+  	newchannel->state = CHANNEL_OPEN_STATE;
+  	return err;
+  }
+* Unmerged path drivers/hv/channel.c
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 93373f350590..b4c9dd402234 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -614,8 +614,8 @@ extern unsigned int host_info_edx;
+ /* Interface */
+ 
+ 
+-int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info, void *buffer,
+-		   u32 buflen);
++int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info,
++		       struct page *pages, u32 pagecnt);
+ 
+ void hv_ringbuffer_cleanup(struct hv_ring_buffer_info *ring_info);
+ 
+diff --git a/drivers/hv/ring_buffer.c b/drivers/hv/ring_buffer.c
+index 85a74955797f..d527f54cb680 100644
+--- a/drivers/hv/ring_buffer.c
++++ b/drivers/hv/ring_buffer.c
+@@ -27,6 +27,8 @@
+ #include <linux/mm.h>
+ #include <linux/hyperv.h>
+ #include <linux/uio.h>
++#include <linux/vmalloc.h>
++#include <linux/slab.h>
+ 
+ #include "hyperv_vmbus.h"
+ 
+@@ -297,22 +299,46 @@ void hv_ringbuffer_get_debuginfo(struct hv_ring_buffer_info *ring_info,
+ 
+ /* Initialize the ring buffer. */
+ int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info,
+-		   void *buffer, u32 buflen)
++		       struct page *pages, u32 page_cnt)
+ {
+-	if (sizeof(struct hv_ring_buffer) != PAGE_SIZE)
+-		return -EINVAL;
++	int i;
++	struct page **pages_wraparound;
++
++	BUILD_BUG_ON((sizeof(struct hv_ring_buffer) != PAGE_SIZE));
+ 
+ 	memset(ring_info, 0, sizeof(struct hv_ring_buffer_info));
+ 
+-	ring_info->ring_buffer = (struct hv_ring_buffer *)buffer;
++	/*
++	 * First page holds struct hv_ring_buffer, do wraparound mapping for
++	 * the rest.
++	 */
++	pages_wraparound = kzalloc(sizeof(struct page *) * (page_cnt * 2 - 1),
++				   GFP_KERNEL);
++	if (!pages_wraparound)
++		return -ENOMEM;
++
++	pages_wraparound[0] = pages;
++	for (i = 0; i < 2 * (page_cnt - 1); i++)
++		pages_wraparound[i + 1] = &pages[i % (page_cnt - 1) + 1];
++
++	ring_info->ring_buffer = (struct hv_ring_buffer *)
++		vmap(pages_wraparound, page_cnt * 2 - 1, VM_MAP, PAGE_KERNEL);
++
++	kfree(pages_wraparound);
++
++
++	if (!ring_info->ring_buffer)
++		return -ENOMEM;
++
+ 	ring_info->ring_buffer->read_index =
+ 		ring_info->ring_buffer->write_index = 0;
+ 
+ 	/* Set the feature bit for enabling flow control. */
+ 	ring_info->ring_buffer->feature_bits.value = 1;
+ 
+-	ring_info->ring_size = buflen;
+-	ring_info->ring_datasize = buflen - sizeof(struct hv_ring_buffer);
++	ring_info->ring_size = page_cnt << PAGE_SHIFT;
++	ring_info->ring_datasize = ring_info->ring_size -
++		sizeof(struct hv_ring_buffer);
+ 
+ 	spin_lock_init(&ring_info->ring_lock);
+ 
+@@ -322,6 +348,7 @@ int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info,
+ /* Cleanup the ring buffer. */
+ void hv_ringbuffer_cleanup(struct hv_ring_buffer_info *ring_info)
+ {
++	vunmap(ring_info->ring_buffer);
+ }
+ 
+ /* Write to the ring buffer. */
