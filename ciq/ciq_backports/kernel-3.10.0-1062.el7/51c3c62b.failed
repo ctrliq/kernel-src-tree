@@ -1,0 +1,115 @@
+powerpc: Avoid code patching freed init sections
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] Avoid code patching freed init sections (Desnes Augusto Nunes do Rosario) [1637841]
+Rebuild_FUZZ: 89.66%
+commit-author Michael Neuling <mikey@neuling.org>
+commit 51c3c62b58b357e8d35e4cc32f7b4ec907426fe3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/51c3c62b.failed
+
+This stops us from doing code patching in init sections after they've
+been freed.
+
+In this chain:
+  kvm_guest_init() ->
+    kvm_use_magic_page() ->
+      fault_in_pages_readable() ->
+	 __get_user() ->
+	   __get_user_nocheck() ->
+	     barrier_nospec();
+
+We have a code patching location at barrier_nospec() and
+kvm_guest_init() is an init function. This whole chain gets inlined,
+so when we free the init section (hence kvm_guest_init()), this code
+goes away and hence should no longer be patched.
+
+We seen this as userspace memory corruption when using a memory
+checker while doing partition migration testing on powervm (this
+starts the code patching post migration via
+/sys/kernel/mobility/migration). In theory, it could also happen when
+using /sys/kernel/debug/powerpc/barrier_nospec.
+
+	Cc: stable@vger.kernel.org # 4.13+
+	Signed-off-by: Michael Neuling <mikey@neuling.org>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Reviewed-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 51c3c62b58b357e8d35e4cc32f7b4ec907426fe3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/lib/code-patching.c
+#	arch/powerpc/mm/mem.c
+diff --cc arch/powerpc/lib/code-patching.c
+index 74b351ac15dc,6ae2777c220d..000000000000
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@@ -20,10 -28,19 +20,20 @@@ int patch_instruction(unsigned int *add
+  {
+  	int err;
+  
+++<<<<<<< HEAD
+ +	__put_user_size(instr, addr, 4, err);
+++=======
++ 	/* Make sure we aren't patching a freed init section */
++ 	if (init_mem_is_free && init_section_contains(exec_addr, 4)) {
++ 		pr_debug("Skipping init section patching addr: 0x%px\n", exec_addr);
++ 		return 0;
++ 	}
++ 
++ 	__put_user_size(instr, patch_addr, 4, err);
+++>>>>>>> 51c3c62b58b3 (powerpc: Avoid code patching freed init sections)
+  	if (err)
+  		return err;
+ -
+ -	asm ("dcbst 0, %0; sync; icbi 0,%1; sync; isync" :: "r" (patch_addr),
+ -							    "r" (exec_addr));
+ -
+ +	asm ("dcbst 0, %0; sync; icbi 0,%0; sync; isync" : : "r" (addr));
+  	return 0;
+  }
+  
+diff --cc arch/powerpc/mm/mem.c
+index 46165fd7ef30,04ccb274a620..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -61,9 -62,8 +61,10 @@@
+  #define CPU_FTR_NOEXECUTE	0
+  #endif
+  
+ +int init_bootmem_done;
+ +int mem_init_done;
+  unsigned long long memory_limit;
++ bool init_mem_is_free;
+  
+  #ifdef CONFIG_HIGHMEM
+  pte_t *kmap_pte;
+@@@ -431,6 -396,8 +432,11 @@@ void __init mem_init(void
+  void free_initmem(void)
+  {
+  	ppc_md.progress = ppc_printk_progress;
+++<<<<<<< HEAD
+++=======
++ 	mark_initmem_nx();
++ 	init_mem_is_free = true;
+++>>>>>>> 51c3c62b58b3 (powerpc: Avoid code patching freed init sections)
+  	free_initmem_default(POISON_FREE_INITMEM);
+  }
+  
+diff --git a/arch/powerpc/include/asm/setup.h b/arch/powerpc/include/asm/setup.h
+index cb1e56079d12..9ceec554cc41 100644
+--- a/arch/powerpc/include/asm/setup.h
++++ b/arch/powerpc/include/asm/setup.h
+@@ -10,6 +10,7 @@ extern unsigned int rtas_data;
+ extern int mem_init_done;	/* set on boot once kmalloc can be called */
+ extern int init_bootmem_done;	/* set once bootmem is available */
+ extern unsigned long long memory_limit;
++extern bool init_mem_is_free;
+ extern unsigned long klimit;
+ extern void *zalloc_maybe_bootmem(size_t size, gfp_t mask);
+ 
+* Unmerged path arch/powerpc/lib/code-patching.c
+* Unmerged path arch/powerpc/mm/mem.c
