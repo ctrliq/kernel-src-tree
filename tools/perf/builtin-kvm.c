@@ -1385,8 +1385,7 @@ out:
 	if (kvm->session)
 		perf_session__delete(kvm->session);
 	kvm->session = NULL;
-	if (kvm->evlist)
-		perf_evlist__delete(kvm->evlist);
+	perf_evlist__delete(kvm->evlist);
 
 	return err;
 }
