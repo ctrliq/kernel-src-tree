@@ -12,6 +12,9 @@
 #ifndef _TOOLS_LINUX_LOG2_H
 #define _TOOLS_LINUX_LOG2_H
 
+#include <linux/bitops.h>
+#include <linux/types.h>
+
 /*
  * deal with unrepresentable constant logarithms
  */
