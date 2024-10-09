@@ -1,0 +1,206 @@
+livepatch: Remove signal sysfs attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Miroslav Benes <mbenes@suse.cz>
+commit 0b3d52790e1cfd6b80b826a245d24859e89632f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0b3d5279.failed
+
+The fake signal is send automatically now. We can rely on it completely
+and remove the sysfs attribute.
+
+	Signed-off-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 0b3d52790e1cfd6b80b826a245d24859e89632f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/livepatch/transition.c
+diff --cc kernel/livepatch/transition.c
+index 25bcd508e364,183b2086ba03..000000000000
+--- a/kernel/livepatch/transition.c
++++ b/kernel/livepatch/transition.c
+@@@ -588,47 -628,6 +629,50 @@@ void klp_copy_process(struct task_struc
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Sends a fake signal to all non-kthread tasks with TIF_PATCH_PENDING set.
+ + * Kthreads with TIF_PATCH_PENDING set are woken up.
+ + */
+ +void klp_send_signals(void)
+ +{
+ +	struct task_struct *g, *task;
+ +
+ +	if (klp_signals_cnt == SIGNALS_TIMEOUT)
+ +		pr_notice("signaling remaining tasks\n");
+ +
+ +	qread_lock(&tasklist_lock);
+ +	for_each_process_thread(g, task) {
+ +		if (!klp_patch_pending(task))
+ +			continue;
+ +
+ +		/*
+ +		 * There is a small race here. We could see TIF_PATCH_PENDING
+ +		 * set and decide to wake up a kthread or send a fake signal.
+ +		 * Meanwhile the task could migrate itself and the action
+ +		 * would be meaningless. It is not serious though.
+ +		 */
+ +		if (task->flags & PF_KTHREAD) {
+ +			/*
+ +			 * Wake up a kthread which sleeps interruptedly and
+ +			 * still has not been migrated.
+ +			 */
+ +			wake_up_state(task, TASK_INTERRUPTIBLE);
+ +		} else {
+ +			/*
+ +			 * Send fake signal to all non-kthread tasks which are
+ +			 * still not migrated.
+ +			 */
+ +			spin_lock_irq(&task->sighand->siglock);
+ +			signal_wake_up(task, 0);
+ +			spin_unlock_irq(&task->sighand->siglock);
+ +		}
+ +	}
+ +	qread_unlock(&tasklist_lock);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 0b3d52790e1c (livepatch: Remove signal sysfs attribute)
+   * Drop TIF_PATCH_PENDING of all tasks on admin's request. This forces an
+   * existing transition to finish.
+   *
+diff --git a/Documentation/ABI/testing/sysfs-kernel-livepatch b/Documentation/ABI/testing/sysfs-kernel-livepatch
+index dac7e1e62a8b..85db352f68f9 100644
+--- a/Documentation/ABI/testing/sysfs-kernel-livepatch
++++ b/Documentation/ABI/testing/sysfs-kernel-livepatch
+@@ -33,18 +33,6 @@ Description:
+ 		An attribute which indicates whether the patch is currently in
+ 		transition.
+ 
+-What:		/sys/kernel/livepatch/<patch>/signal
+-Date:		Nov 2017
+-KernelVersion:	4.15.0
+-Contact:	live-patching@vger.kernel.org
+-Description:
+-		A writable attribute that allows administrator to affect the
+-		course of an existing transition. Writing 1 sends a fake
+-		signal to all remaining blocking tasks. The fake signal
+-		means that no proper signal is delivered (there is no data in
+-		signal pending structures). Tasks are interrupted or woken up,
+-		and forced to change their patched state.
+-
+ What:		/sys/kernel/livepatch/<patch>/force
+ Date:		Nov 2017
+ KernelVersion:	4.15.0
+diff --git a/Documentation/livepatch/livepatch.txt b/Documentation/livepatch/livepatch.txt
+index e082b171dd02..754cad98fca1 100644
+--- a/Documentation/livepatch/livepatch.txt
++++ b/Documentation/livepatch/livepatch.txt
+@@ -158,13 +158,11 @@ If a patch is in transition, this file shows 0 to indicate the task is
+ unpatched and 1 to indicate it's patched.  Otherwise, if no patch is in
+ transition, it shows -1.  Any tasks which are blocking the transition
+ can be signaled with SIGSTOP and SIGCONT to force them to change their
+-patched state. This may be harmful to the system though.
+-/sys/kernel/livepatch/<patch>/signal attribute provides a better alternative.
+-Writing 1 to the attribute sends a fake signal to all remaining blocking
+-tasks. No proper signal is actually delivered (there is no data in signal
+-pending structures). Tasks are interrupted or woken up, and forced to change
+-their patched state. Despite the sysfs attribute the fake signal is also sent
+-every 15 seconds automatically.
++patched state. This may be harmful to the system though. Sending a fake signal
++to all remaining blocking tasks is a better alternative. No proper signal is
++actually delivered (there is no data in signal pending structures). Tasks are
++interrupted or woken up, and forced to change their patched state. The fake
++signal is automatically sent every 15 seconds.
+ 
+ Administrator can also affect a transition through
+ /sys/kernel/livepatch/<patch>/force attribute. Writing 1 there clears
+@@ -412,8 +410,8 @@ Information about the registered patches can be found under
+ /sys/kernel/livepatch. The patches could be enabled and disabled
+ by writing there.
+ 
+-/sys/kernel/livepatch/<patch>/signal and /sys/kernel/livepatch/<patch>/force
+-attributes allow administrator to affect a patching operation.
++/sys/kernel/livepatch/<patch>/force attributes allow administrator to affect a
++patching operation.
+ 
+ See Documentation/ABI/testing/sysfs-kernel-livepatch for more details.
+ 
+diff --git a/kernel/livepatch/core.c b/kernel/livepatch/core.c
+index f195456206be..8b45238e6135 100644
+--- a/kernel/livepatch/core.c
++++ b/kernel/livepatch/core.c
+@@ -320,7 +320,6 @@ static int klp_write_object_relocations(struct module *pmod,
+  * /sys/kernel/livepatch/<patch>
+  * /sys/kernel/livepatch/<patch>/enabled
+  * /sys/kernel/livepatch/<patch>/transition
+- * /sys/kernel/livepatch/<patch>/signal
+  * /sys/kernel/livepatch/<patch>/force
+  * /sys/kernel/livepatch/<patch>/<object>
+  * /sys/kernel/livepatch/<patch>/<object>/<function,sympos>
+@@ -389,35 +388,6 @@ static ssize_t transition_show(struct kobject *kobj,
+ 			patch == klp_transition_patch);
+ }
+ 
+-static ssize_t signal_store(struct kobject *kobj, struct kobj_attribute *attr,
+-			    const char *buf, size_t count)
+-{
+-	struct klp_patch *patch;
+-	int ret;
+-	bool val;
+-
+-	ret = kstrtobool(buf, &val);
+-	if (ret)
+-		return ret;
+-
+-	if (!val)
+-		return count;
+-
+-	mutex_lock(&klp_mutex);
+-
+-	patch = container_of(kobj, struct klp_patch, kobj);
+-	if (patch != klp_transition_patch) {
+-		mutex_unlock(&klp_mutex);
+-		return -EINVAL;
+-	}
+-
+-	klp_send_signals();
+-
+-	mutex_unlock(&klp_mutex);
+-
+-	return count;
+-}
+-
+ static ssize_t force_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 			   const char *buf, size_t count)
+ {
+@@ -449,12 +419,10 @@ static ssize_t force_store(struct kobject *kobj, struct kobj_attribute *attr,
+ 
+ static struct kobj_attribute enabled_kobj_attr = __ATTR_RW(enabled);
+ static struct kobj_attribute transition_kobj_attr = __ATTR_RO(transition);
+-static struct kobj_attribute signal_kobj_attr = __ATTR_WO(signal);
+ static struct kobj_attribute force_kobj_attr = __ATTR_WO(force);
+ static struct attribute *klp_patch_attrs[] = {
+ 	&enabled_kobj_attr.attr,
+ 	&transition_kobj_attr.attr,
+-	&signal_kobj_attr.attr,
+ 	&force_kobj_attr.attr,
+ 	NULL
+ };
+* Unmerged path kernel/livepatch/transition.c
+diff --git a/kernel/livepatch/transition.h b/kernel/livepatch/transition.h
+index 837e51ee30fd..4cb10f1c1820 100644
+--- a/kernel/livepatch/transition.h
++++ b/kernel/livepatch/transition.h
+@@ -10,7 +10,6 @@ void klp_cancel_transition(void);
+ void klp_start_transition(void);
+ void klp_try_complete_transition(void);
+ void klp_reverse_transition(void);
+-void klp_send_signals(void);
+ void klp_force_transition(void);
+ 
+ #endif /* _LIVEPATCH_TRANSITION_H */
