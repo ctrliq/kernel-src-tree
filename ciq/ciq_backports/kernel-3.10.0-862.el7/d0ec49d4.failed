@@ -1,0 +1,272 @@
+kvm/x86/svm: Support Secure Memory Encryption within KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit d0ec49d4de90806755e17289bd48464a1a515823
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d0ec49d4.failed
+
+Update the KVM support to work with SME. The VMCB has a number of fields
+where physical addresses are used and these addresses must contain the
+memory encryption mask in order to properly access the encrypted memory.
+Also, use the memory encryption mask when creating and using the nested
+page tables.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/89146eccfa50334409801ff20acd52a90fb5efcf.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d0ec49d4de90806755e17289bd48464a1a515823)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index ab2d8132f390,7cbaab523f22..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -987,7 -1077,8 +987,12 @@@ void kvm_mmu_setup(struct kvm_vcpu *vcp
+  void kvm_mmu_init_vm(struct kvm *kvm);
+  void kvm_mmu_uninit_vm(struct kvm *kvm);
+  void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+++<<<<<<< HEAD
+ +		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask);
+++=======
++ 		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask,
++ 		u64 acc_track_mask, u64 me_mask);
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  
+  void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+diff --cc arch/x86/kvm/mmu.c
+index 170fcfd65360,ccb70b8d16cc..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -175,8 -184,28 +175,9 @@@ static u64 __read_mostly shadow_user_ma
+  static u64 __read_mostly shadow_accessed_mask;
+  static u64 __read_mostly shadow_dirty_mask;
+  static u64 __read_mostly shadow_mmio_mask;
+ -static u64 __read_mostly shadow_mmio_value;
+  static u64 __read_mostly shadow_present_mask;
++ static u64 __read_mostly shadow_me_mask;
+  
+ -/*
+ - * SPTEs used by MMUs without A/D bits are marked with shadow_acc_track_value.
+ - * Non-present SPTEs with shadow_acc_track_value set are in place for access
+ - * tracking.
+ - */
+ -static u64 __read_mostly shadow_acc_track_mask;
+ -static const u64 shadow_acc_track_value = SPTE_SPECIAL_MASK;
+ -
+ -/*
+ - * The mask/shift to use for saving the original R/X bits when marking the PTE
+ - * as not-present for access tracking purposes. We do not save the W bit as the
+ - * PTEs being access tracked also need to be dirty tracked, so the W bit will be
+ - * restored only when a write is attempted to the page.
+ - */
+ -static const u64 shadow_acc_track_saved_bits_mask = PT64_EPT_READABLE_MASK |
+ -						    PT64_EPT_EXECUTABLE_MASK;
+ -static const u64 shadow_acc_track_saved_bits_shift = PT64_SECOND_AVAIL_BITS_SHIFT;
+ -
+  static void mmu_spte_set(u64 *sptep, u64 spte);
+  static void mmu_free_roots(struct kvm_vcpu *vcpu);
+  
+@@@ -282,15 -341,29 +283,25 @@@ static bool check_mmio_spte(struct kvm_
+  	return likely(kvm_gen == spte_gen);
+  }
+  
+ -/*
+ - * Sets the shadow PTE masks used by the MMU.
+ - *
+ - * Assumptions:
+ - *  - Setting either @accessed_mask or @dirty_mask requires setting both
+ - *  - At least one of @accessed_mask or @acc_track_mask must be set
+ - */
+  void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+++<<<<<<< HEAD
+ +		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask)
+++=======
++ 		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask,
++ 		u64 acc_track_mask, u64 me_mask)
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  {
+ -	BUG_ON(!dirty_mask != !accessed_mask);
+ -	BUG_ON(!accessed_mask && !acc_track_mask);
+ -	BUG_ON(acc_track_mask & shadow_acc_track_value);
+ -
+  	shadow_user_mask = user_mask;
+  	shadow_accessed_mask = accessed_mask;
+  	shadow_dirty_mask = dirty_mask;
+  	shadow_nx_mask = nx_mask;
+  	shadow_x_mask = x_mask;
+  	shadow_present_mask = p_mask;
+++<<<<<<< HEAD
+++=======
++ 	shadow_acc_track_mask = acc_track_mask;
++ 	shadow_me_mask = me_mask;
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_set_mask_ptes);
+  
+@@@ -2265,9 -2435,19 +2276,18 @@@ static void link_shadow_page(u64 *sptep
+  	BUILD_BUG_ON(VMX_EPT_WRITABLE_MASK != PT_WRITABLE_MASK);
+  
+  	spte = __pa(sp->spt) | shadow_present_mask | PT_WRITABLE_MASK |
+++<<<<<<< HEAD
+ +	       shadow_user_mask | shadow_x_mask | shadow_accessed_mask;
+++=======
++ 	       shadow_user_mask | shadow_x_mask | shadow_me_mask;
++ 
++ 	if (sp_ad_disabled(sp))
++ 		spte |= shadow_acc_track_value;
++ 	else
++ 		spte |= shadow_accessed_mask;
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  
+  	mmu_spte_set(sptep, spte);
+ -
+ -	mmu_page_add_parent_pte(vcpu, sp, sptep);
+ -
+ -	if (sp->unsync_children || sp->unsync)
+ -		mark_unsync(sptep);
+  }
+  
+  static void validate_direct_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+diff --cc arch/x86/kvm/svm.c
+index 4ab2fa9467cb,6af04dd5426c..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1141,12 -1225,15 +1141,22 @@@ static void init_vmcb(struct vcpu_svm *
+  	set_intercept(svm, INTERCEPT_CLGI);
+  	set_intercept(svm, INTERCEPT_SKINIT);
+  	set_intercept(svm, INTERCEPT_WBINVD);
+ +	set_intercept(svm, INTERCEPT_MONITOR);
+ +	set_intercept(svm, INTERCEPT_MWAIT);
+  	set_intercept(svm, INTERCEPT_XSETBV);
+  
+++<<<<<<< HEAD
+ +	control->iopm_base_pa = iopm_base;
+ +	control->msrpm_base_pa = __pa(svm->msrpm);
+++=======
++ 	if (!kvm_mwait_in_guest()) {
++ 		set_intercept(svm, INTERCEPT_MONITOR);
++ 		set_intercept(svm, INTERCEPT_MWAIT);
++ 	}
++ 
++ 	control->iopm_base_pa = __sme_set(iopm_base);
++ 	control->msrpm_base_pa = __sme_set(__pa(svm->msrpm));
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  	control->int_ctl = V_INTR_MASKING_MASK;
+  
+  	init_seg(&save->es);
+diff --cc arch/x86/kvm/vmx.c
+index 9e322d5ffbcf,ffd469ecad57..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -6160,6 -6485,19 +6160,22 @@@ static void wakeup_handler(void
+  	spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void vmx_enable_tdp(void)
++ {
++ 	kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
++ 		enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull,
++ 		enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++ 		0ull, VMX_EPT_EXECUTABLE_MASK,
++ 		cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK,
++ 		VMX_EPT_RWX_MASK, 0ull);
++ 
++ 	ept_set_mmio_spte_mask();
++ 	kvm_enable_tdp();
++ }
++ 
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  static __init int hardware_setup(void)
+  {
+  	int r = -ENOMEM, i, msr;
+diff --cc arch/x86/kvm/x86.c
+index 99e230533b87,88be1aabc8d7..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -53,11 -53,11 +53,17 @@@
+  #include <linux/pvclock_gtod.h>
+  #include <linux/kvm_irqfd.h>
+  #include <linux/irqbypass.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/sched/stat.h>
++ #include <linux/mem_encrypt.h>
++ 
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  #include <trace/events/kvm.h>
+  
+ +#define CREATE_TRACE_POINTS
+ +#include "trace.h"
+ +
+  #include <asm/debugreg.h>
+  #include <asm/msr.h>
+  #include <asm/desc.h>
+@@@ -5914,7 -6114,7 +5920,11 @@@ int kvm_arch_init(void *opaque
+  
+  	kvm_mmu_set_mask_ptes(PT_USER_MASK, PT_ACCESSED_MASK,
+  			PT_DIRTY_MASK, PT64_NX_MASK, 0,
+++<<<<<<< HEAD
+ +			PT_PRESENT_MASK);
+++=======
++ 			PT_PRESENT_MASK, 0, sme_me_mask);
+++>>>>>>> d0ec49d4de90 (kvm/x86/svm: Support Secure Memory Encryption within KVM)
+  	kvm_timer_init();
+  
+  	perf_register_guest_info_callbacks(&kvm_guest_cbs);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index e005cc55a387..ff0e3dc0957b 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -48,7 +48,7 @@
+ 
+ static inline u64 rsvd_bits(int s, int e)
+ {
+-	return ((1ULL << (e - s + 1)) - 1) << s;
++	return __sme_clr(((1ULL << (e - s + 1)) - 1) << s);
+ }
+ 
+ void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask);
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
+* Unmerged path arch/x86/kvm/x86.c
