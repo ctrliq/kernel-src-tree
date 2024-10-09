@@ -1,0 +1,231 @@
+tcm_fc: Convert acl lookup to modern get_initiator_node_acl usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 7fbef3d0c2f6063ed12e7f3d74ba2a49111154f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7fbef3d0.failed
+
+This patch does a simple conversion of tcm_fc code to use
+proper modern core_tpg_get_initiator_node_acl() lookup using
+se_node_acl->acl_kref, and drops the legacy list walk from
+ft_acl_get().
+
+Note the original lookup also took node_name into account,
+but since ft_init_nodeacl() only ever sets port_name for
+se_node_acl->acl_group within configfs, this is purely
+a mechanical change.
+
+As per HCH, go ahead and fold ft_acl_get() into original
+caller.
+
+	Cc: Vasu Dev <vasu.dev@linux.intel.com>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7fbef3d0c2f6063ed12e7f3d74ba2a49111154f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/tcm_fc/tfc_conf.c
+diff --cc drivers/target/tcm_fc/tfc_conf.c
+index 8f5b91a74d09,4d375e95841b..000000000000
+--- a/drivers/target/tcm_fc/tfc_conf.c
++++ b/drivers/target/tcm_fc/tfc_conf.c
+@@@ -198,98 -207,19 +198,101 @@@ static struct configfs_attribute *ft_na
+   * Add ACL for an initiator.  The ACL is named arbitrarily.
+   * The port_name and/or node_name are attributes.
+   */
+ -static int ft_init_nodeacl(struct se_node_acl *nacl, const char *name)
+ +static struct se_node_acl *ft_add_acl(
+ +	struct se_portal_group *se_tpg,
+ +	struct config_group *group,
+ +	const char *name)
+  {
+ -	struct ft_node_acl *acl =
+ -		container_of(nacl, struct ft_node_acl, se_node_acl);
+ +	struct ft_node_acl *acl;
+ +	struct ft_tpg *tpg;
+  	u64 wwpn;
+ +	u32 q_depth;
+ +
+ +	pr_debug("add acl %s\n", name);
+ +	tpg = container_of(se_tpg, struct ft_tpg, se_tpg);
+  
+  	if (ft_parse_wwn(name, &wwpn, 1) < 0)
+ -		return -EINVAL;
+ +		return ERR_PTR(-EINVAL);
+  
+ +	acl = kzalloc(sizeof(struct ft_node_acl), GFP_KERNEL);
+ +	if (!acl)
+ +		return ERR_PTR(-ENOMEM);
+  	acl->node_auth.port_name = wwpn;
+ -	return 0;
+ +
+ +	q_depth = 32;		/* XXX bogus default - get from tpg? */
+ +	return core_tpg_add_initiator_node_acl(&tpg->se_tpg,
+ +				&acl->se_node_acl, name, q_depth);
+ +}
+ +
+ +static void ft_del_acl(struct se_node_acl *se_acl)
+ +{
+ +	struct se_portal_group *se_tpg = se_acl->se_tpg;
+ +	struct ft_tpg *tpg;
+ +	struct ft_node_acl *acl = container_of(se_acl,
+ +				struct ft_node_acl, se_node_acl);
+ +
+ +	pr_debug("del acl %s\n",
+ +		config_item_name(&se_acl->acl_group.cg_item));
+ +
+ +	tpg = container_of(se_tpg, struct ft_tpg, se_tpg);
+ +	pr_debug("del acl %p se_acl %p tpg %p se_tpg %p\n",
+ +		    acl, se_acl, tpg, &tpg->se_tpg);
+ +
+ +	core_tpg_del_initiator_node_acl(&tpg->se_tpg, se_acl, 1);
+ +	kfree(acl);
+ +}
+ +
+++<<<<<<< HEAD
+ +struct ft_node_acl *ft_acl_get(struct ft_tpg *tpg, struct fc_rport_priv *rdata)
+ +{
+ +	struct ft_node_acl *found = NULL;
+ +	struct ft_node_acl *acl;
+ +	struct se_portal_group *se_tpg = &tpg->se_tpg;
+ +	struct se_node_acl *se_acl;
+ +
+ +	spin_lock_irq(&se_tpg->acl_node_lock);
+ +	list_for_each_entry(se_acl, &se_tpg->acl_node_list, acl_list) {
+ +		acl = container_of(se_acl, struct ft_node_acl, se_node_acl);
+ +		pr_debug("acl %p port_name %llx\n",
+ +			acl, (unsigned long long)acl->node_auth.port_name);
+ +		if (acl->node_auth.port_name == rdata->ids.port_name ||
+ +		    acl->node_auth.node_name == rdata->ids.node_name) {
+ +			pr_debug("acl %p port_name %llx matched\n", acl,
+ +				    (unsigned long long)rdata->ids.port_name);
+ +			found = acl;
+ +			/* XXX need to hold onto ACL */
+ +			break;
+ +		}
+ +	}
+ +	spin_unlock_irq(&se_tpg->acl_node_lock);
+ +	return found;
+ +}
+ +
+ +static struct se_node_acl *ft_tpg_alloc_fabric_acl(struct se_portal_group *se_tpg)
+ +{
+ +	struct ft_node_acl *acl;
+ +
+ +	acl = kzalloc(sizeof(*acl), GFP_KERNEL);
+ +	if (!acl) {
+ +		pr_err("Unable to allocate struct ft_node_acl\n");
+ +		return NULL;
+ +	}
+ +	pr_debug("acl %p\n", acl);
+ +	return &acl->se_node_acl;
+ +}
+ +
+ +static void ft_tpg_release_fabric_acl(struct se_portal_group *se_tpg,
+ +				      struct se_node_acl *se_acl)
+ +{
+ +	struct ft_node_acl *acl = container_of(se_acl,
+ +				struct ft_node_acl, se_node_acl);
+ +
+ +	pr_debug("acl %p\n", acl);
+ +	kfree(acl);
+  }
+  
+++=======
+++>>>>>>> 7fbef3d0c2f6 (tcm_fc: Convert acl lookup to modern get_initiator_node_acl usage)
+  /*
+   * local_port port_group (tpg) ops.
+   */
+diff --git a/drivers/target/tcm_fc/tcm_fc.h b/drivers/target/tcm_fc/tcm_fc.h
+index a0bcfd3e7e7d..46e0f0955205 100644
+--- a/drivers/target/tcm_fc/tcm_fc.h
++++ b/drivers/target/tcm_fc/tcm_fc.h
+@@ -168,7 +168,6 @@ void ft_aborted_task(struct se_cmd *);
+  */
+ void ft_recv_req(struct ft_sess *, struct fc_frame *);
+ struct ft_tpg *ft_lport_find_tpg(struct fc_lport *);
+-struct ft_node_acl *ft_acl_get(struct ft_tpg *, struct fc_rport_priv *);
+ 
+ void ft_recv_write_data(struct ft_cmd *, struct fc_frame *);
+ void ft_dump_cmd(struct ft_cmd *, const char *caller);
+* Unmerged path drivers/target/tcm_fc/tfc_conf.c
+diff --git a/drivers/target/tcm_fc/tfc_sess.c b/drivers/target/tcm_fc/tfc_sess.c
+index 42573f7a077b..28b789a563ed 100644
+--- a/drivers/target/tcm_fc/tfc_sess.c
++++ b/drivers/target/tcm_fc/tfc_sess.c
+@@ -197,10 +197,15 @@ out:
+  * Caller holds ft_lport_lock.
+  */
+ static struct ft_sess *ft_sess_create(struct ft_tport *tport, u32 port_id,
+-				      struct ft_node_acl *acl)
++				      struct fc_rport_priv *rdata)
+ {
++	struct se_portal_group *se_tpg = &tport->tpg->se_tpg;
++	struct se_node_acl *se_acl;
+ 	struct ft_sess *sess;
+ 	struct hlist_head *head;
++	unsigned char initiatorname[TRANSPORT_IQN_LEN];
++
++	ft_format_wwn(&initiatorname[0], TRANSPORT_IQN_LEN, rdata->ids.port_name);
+ 
+ 	head = &tport->hash[ft_sess_hash(port_id)];
+ 	hlist_for_each_entry_rcu(sess, head, hash)
+@@ -218,7 +223,14 @@ static struct ft_sess *ft_sess_create(struct ft_tport *tport, u32 port_id,
+ 		kfree(sess);
+ 		return NULL;
+ 	}
+-	sess->se_sess->se_node_acl = &acl->se_node_acl;
++
++	se_acl = core_tpg_get_initiator_node_acl(se_tpg, &initiatorname[0]);
++	if (!se_acl) {
++		transport_free_session(sess->se_sess);
++		kfree(sess);
++		return NULL;
++	}
++	sess->se_sess->se_node_acl = se_acl;
+ 	sess->tport = tport;
+ 	sess->port_id = port_id;
+ 	kref_init(&sess->kref);	/* ref for table entry */
+@@ -227,7 +239,7 @@ static struct ft_sess *ft_sess_create(struct ft_tport *tport, u32 port_id,
+ 
+ 	pr_debug("port_id %x sess %p\n", port_id, sess);
+ 
+-	transport_register_session(&tport->tpg->se_tpg, &acl->se_node_acl,
++	transport_register_session(&tport->tpg->se_tpg, se_acl,
+ 				   sess->se_sess, sess);
+ 	return sess;
+ }
+@@ -355,17 +367,12 @@ static int ft_prli_locked(struct fc_rport_priv *rdata, u32 spp_len,
+ {
+ 	struct ft_tport *tport;
+ 	struct ft_sess *sess;
+-	struct ft_node_acl *acl;
+ 	u32 fcp_parm;
+ 
+ 	tport = ft_tport_get(rdata->local_port);
+ 	if (!tport)
+ 		goto not_target;	/* not a target for this local port */
+ 
+-	acl = ft_acl_get(tport->tpg, rdata);
+-	if (!acl)
+-		goto not_target;	/* no target for this remote */
+-
+ 	if (!rspp)
+ 		goto fill;
+ 
+@@ -387,7 +394,7 @@ static int ft_prli_locked(struct fc_rport_priv *rdata, u32 spp_len,
+ 		spp->spp_flags |= FC_SPP_EST_IMG_PAIR;
+ 		if (!(fcp_parm & FCP_SPPF_INIT_FCN))
+ 			return FC_SPP_RESP_CONF;
+-		sess = ft_sess_create(tport, rdata->ids.port_id, acl);
++		sess = ft_sess_create(tport, rdata->ids.port_id, rdata);
+ 		if (!sess)
+ 			return FC_SPP_RESP_RES;
+ 		if (!sess->params)
