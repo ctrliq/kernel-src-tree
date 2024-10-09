@@ -1,0 +1,137 @@
+mld: do not remove mld souce list info when set link down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 1666d49e1d416fcc2cce708242a52fe3317ea8ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1666d49e.failed
+
+This is an IPv6 version of commit 24803f38a5c0 ("igmp: do not remove igmp
+souce list..."). In mld_del_delrec(), we will restore back all source filter
+info instead of flush them.
+
+Move mld_clear_delrec() from ipv6_mc_down() to ipv6_mc_destroy_dev() since
+we should not remove source list info when set link down. Remove
+igmp6_group_dropped() in ipv6_mc_destroy_dev() since we have called it in
+ipv6_mc_down().
+
+Also clear all source info after igmp6_group_dropped() instead of in it
+because ipv6_mc_down() will call igmp6_group_dropped().
+
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1666d49e1d416fcc2cce708242a52fe3317ea8ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/mcast.c
+diff --cc net/ipv6/mcast.c
+index 945e2d6cbe13,7139fffd61b6..000000000000
+--- a/net/ipv6/mcast.c
++++ b/net/ipv6/mcast.c
+@@@ -780,14 -767,20 +779,26 @@@ static void mld_del_delrec(struct inet6
+  	}
+  	spin_unlock_bh(&idev->mc_lock);
+  
++ 	spin_lock_bh(&im->mca_lock);
+  	if (pmc) {
+++<<<<<<< HEAD
+ +		for (psf=pmc->mca_tomb; psf; psf=psf_next) {
+ +			psf_next = psf->sf_next;
+ +			kfree(psf);
+++=======
++ 		im->idev = pmc->idev;
++ 		im->mca_crcount = idev->mc_qrv;
++ 		im->mca_sfmode = pmc->mca_sfmode;
++ 		if (pmc->mca_sfmode == MCAST_INCLUDE) {
++ 			im->mca_tomb = pmc->mca_tomb;
++ 			im->mca_sources = pmc->mca_sources;
++ 			for (psf = im->mca_sources; psf; psf = psf->sf_next)
++ 				psf->sf_crcount = im->mca_crcount;
+++>>>>>>> 1666d49e1d41 (mld: do not remove mld souce list info when set link down)
+  		}
+  		in6_dev_put(pmc->idev);
+- 		kfree(pmc);
+  	}
++ 	spin_unlock_bh(&im->mca_lock);
+  }
+  
+  static void mld_clear_delrec(struct inet6_dev *idev)
+@@@ -870,29 -900,16 +881,29 @@@ int ipv6_dev_mc_inc(struct net_device *
+  		return -ENOMEM;
+  	}
+  
+ +	setup_timer(&mc->mca_timer, igmp6_timer_handler, (unsigned long)mc);
+ +
+ +	mc->mca_addr = *addr;
+ +	mc->idev = idev; /* (reference taken) */
+ +	mc->mca_users = 1;
+ +	/* mca_stamp should be updated upon changes */
+ +	mc->mca_cstamp = mc->mca_tstamp = jiffies;
+ +	atomic_set(&mc->mca_refcnt, 2);
+ +	spin_lock_init(&mc->mca_lock);
+ +
+ +	/* initial mode is (EX, empty) */
+ +	mc->mca_sfmode = MCAST_EXCLUDE;
+ +	mc->mca_sfcount[MCAST_EXCLUDE] = 1;
+ +
+ +	if (ipv6_addr_is_ll_all_nodes(&mc->mca_addr) ||
+ +	    IPV6_ADDR_MC_SCOPE(&mc->mca_addr) < IPV6_ADDR_SCOPE_LINKLOCAL)
+ +		mc->mca_flags |= MAF_NOREPORT;
+ +
+  	mc->next = idev->mc_list;
+  	idev->mc_list = mc;
+ -
+ -	/* Hold this for the code below before we unlock,
+ -	 * it is already exposed via idev->mc_list.
+ -	 */
+ -	mca_get(mc);
+  	write_unlock_bh(&idev->lock);
+  
+- 	mld_del_delrec(idev, &mc->mca_addr);
++ 	mld_del_delrec(idev, mc);
+  	igmp6_group_added(mc);
+  	ma_put(mc);
+  	return 0;
+@@@ -2491,15 -2507,17 +2503,17 @@@ void ipv6_mc_down(struct inet6_dev *ide
+  	/* Withdraw multicast list */
+  
+  	read_lock_bh(&idev->lock);
+- 	mld_ifc_stop_timer(idev);
+- 	mld_gq_stop_timer(idev);
+- 	mld_dad_stop_timer(idev);
+  
+ -	for (i = idev->mc_list; i; i = i->next)
+ +	for (i = idev->mc_list; i; i=i->next)
+  		igmp6_group_dropped(i);
+- 	read_unlock_bh(&idev->lock);
+  
+- 	mld_clear_delrec(idev);
++ 	/* Should stop timer after group drop. or we will
++ 	 * start timer again in mld_ifc_event()
++ 	 */
++ 	mld_ifc_stop_timer(idev);
++ 	mld_gq_stop_timer(idev);
++ 	mld_dad_stop_timer(idev);
++ 	read_unlock_bh(&idev->lock);
+  }
+  
+  static void ipv6_mc_reset(struct inet6_dev *idev)
+@@@ -2521,8 -2539,10 +2535,14 @@@ void ipv6_mc_up(struct inet6_dev *idev
+  
+  	read_lock_bh(&idev->lock);
+  	ipv6_mc_reset(idev);
+++<<<<<<< HEAD
+ +	for (i = idev->mc_list; i; i=i->next)
+++=======
++ 	for (i = idev->mc_list; i; i = i->next) {
++ 		mld_del_delrec(idev, i);
+++>>>>>>> 1666d49e1d41 (mld: do not remove mld souce list info when set link down)
+  		igmp6_group_added(i);
++ 	}
+  	read_unlock_bh(&idev->lock);
+  }
+  
+* Unmerged path net/ipv6/mcast.c
