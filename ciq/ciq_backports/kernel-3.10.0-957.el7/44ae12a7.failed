@@ -1,0 +1,711 @@
+net: sched: move the can_offload check from binding phase to rule insertion phase
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: move the can_offload check from binding phase to rule insertion phase (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 96.82%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 44ae12a768b7212976a362c590075716a77e8f28
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/44ae12a7.failed
+
+This restores the original behaviour before the block callbacks were
+introduced. Allow the drivers to do binding of block always, no matter
+if the NETIF_F_HW_TC feature is on or off. Move the check to the block
+callback which is called for rule insertion.
+
+	Reported-by: Alexander Duyck <alexander.duyck@gmail.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 44ae12a768b7212976a362c590075716a77e8f28)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+#	net/dsa/slave.c
+#	net/sched/cls_api.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f9f9996c2b9e,28ae00b3eb88..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2933,10 -3100,47 +2933,50 @@@ static int mlx5e_setup_tc_cls_flower(st
+  		return -EOPNOTSUPP;
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++ 			    void *cb_priv)
++ {
++ 	struct mlx5e_priv *priv = cb_priv;
++ 
++ 	if (!tc_can_offload(priv->netdev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return mlx5e_setup_tc_cls_flower(priv, type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int mlx5e_setup_tc_block(struct net_device *dev,
++ 				struct tc_block_offload *f)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, mlx5e_setup_tc_block_cb,
++ 					     priv, priv);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, mlx5e_setup_tc_block_cb,
++ 					priv);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
+++>>>>>>> 44ae12a768b7 (net: sched: move the can_offload check from binding phase to rule insertion phase)
+  #endif
+  
+ -int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ -		   void *type_data)
+ +static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ +			  void *type_data)
+  {
+  	switch (type) {
+  #ifdef CONFIG_MLX5_ESWITCH
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178,04424db24b80..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -114,6 -115,50 +114,53 @@@ static void nfp_bpf_vnic_free(struct nf
+  	kfree(nn->app_priv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
++ {
++ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
++ 	struct nfp_net *nn = cb_priv;
++ 
++ 	if (!tc_can_offload(nn->dp.netdev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSBPF:
++ 		if (!nfp_net_ebpf_capable(nn) ||
++ 		    cls_bpf->common.protocol != htons(ETH_P_ALL) ||
++ 		    cls_bpf->common.chain_index)
++ 			return -EOPNOTSUPP;
++ 		return nfp_net_bpf_offload(nn, cls_bpf);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int nfp_bpf_setup_tc_block(struct net_device *netdev,
++ 				  struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_bpf_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_bpf_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
+++>>>>>>> 44ae12a768b7 (net: sched: move the can_offload check from binding phase to rule insertion phase)
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+  			    enum tc_setup_type type, void *type_data)
+  {
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 0e039508dc42,7c6cab176293..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -463,6 -465,46 +463,49 @@@ nfp_flower_repr_offload(struct nfp_app 
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nfp_flower_setup_tc_block_cb(enum tc_setup_type type,
++ 					void *type_data, void *cb_priv)
++ {
++ 	struct nfp_net *nn = cb_priv;
++ 
++ 	if (!tc_can_offload(nn->dp.netdev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return nfp_flower_repr_offload(nn->app, nn->port->netdev,
++ 					       type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int nfp_flower_setup_tc_block(struct net_device *netdev,
++ 				     struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_flower_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_flower_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
+++>>>>>>> 44ae12a768b7 (net: sched: move the can_offload check from binding phase to rule insertion phase)
+  int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+  			enum tc_setup_type type, void *type_data)
+  {
+diff --cc net/dsa/slave.c
+index f3efc3546e20,9b75d0ac4092..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -290,12 -554,369 +290,369 @@@ static int dsa_slave_get_sset_count(str
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void dsa_slave_get_wol(struct net_device *dev, struct ethtool_wolinfo *w)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (ds->ops->get_wol)
++ 		ds->ops->get_wol(ds, dp->index, w);
++ }
++ 
++ static int dsa_slave_set_wol(struct net_device *dev, struct ethtool_wolinfo *w)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->ops->set_wol)
++ 		ret = ds->ops->set_wol(ds, dp->index, w);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_set_eee(struct net_device *dev, struct ethtool_eee *e)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret;
++ 
++ 	/* Port's PHY and MAC both need to be EEE capable */
++ 	if (!dev->phydev)
++ 		return -ENODEV;
++ 
++ 	if (!ds->ops->set_mac_eee)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = ds->ops->set_mac_eee(ds, dp->index, e);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (e->eee_enabled) {
++ 		ret = phy_init_eee(dev->phydev, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return phy_ethtool_set_eee(dev->phydev, e);
++ }
++ 
++ static int dsa_slave_get_eee(struct net_device *dev, struct ethtool_eee *e)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	int ret;
++ 
++ 	/* Port's PHY and MAC both need to be EEE capable */
++ 	if (!dev->phydev)
++ 		return -ENODEV;
++ 
++ 	if (!ds->ops->get_mac_eee)
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = ds->ops->get_mac_eee(ds, dp->index, e);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return phy_ethtool_get_eee(dev->phydev, e);
++ }
++ 
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ static int dsa_slave_netpoll_setup(struct net_device *dev,
++ 				   struct netpoll_info *ni)
++ {
++ 	struct net_device *master = dsa_slave_to_master(dev);
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct netpoll *netpoll;
++ 	int err = 0;
++ 
++ 	netpoll = kzalloc(sizeof(*netpoll), GFP_KERNEL);
++ 	if (!netpoll)
++ 		return -ENOMEM;
++ 
++ 	err = __netpoll_setup(netpoll, master);
++ 	if (err) {
++ 		kfree(netpoll);
++ 		goto out;
++ 	}
++ 
++ 	p->netpoll = netpoll;
++ out:
++ 	return err;
++ }
++ 
++ static void dsa_slave_netpoll_cleanup(struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct netpoll *netpoll = p->netpoll;
++ 
++ 	if (!netpoll)
++ 		return;
++ 
++ 	p->netpoll = NULL;
++ 
++ 	__netpoll_free_async(netpoll);
++ }
++ 
++ static void dsa_slave_poll_controller(struct net_device *dev)
++ {
++ }
++ #endif
++ 
++ static int dsa_slave_get_phys_port_name(struct net_device *dev,
++ 					char *name, size_t len)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 
++ 	if (snprintf(name, len, "p%d", dp->index) >= len)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static struct dsa_mall_tc_entry *
++ dsa_slave_mall_tc_entry_find(struct net_device *dev, unsigned long cookie)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 
++ 	list_for_each_entry(mall_tc_entry, &p->mall_tc_list, list)
++ 		if (mall_tc_entry->cookie == cookie)
++ 			return mall_tc_entry;
++ 
++ 	return NULL;
++ }
++ 
++ static int dsa_slave_add_cls_matchall(struct net_device *dev,
++ 				      struct tc_cls_matchall_offload *cls,
++ 				      bool ingress)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 	__be16 protocol = cls->common.protocol;
++ 	struct net *net = dev_net(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 	struct net_device *to_dev;
++ 	const struct tc_action *a;
++ 	struct dsa_port *to_dp;
++ 	int err = -EOPNOTSUPP;
++ 	LIST_HEAD(actions);
++ 	int ifindex;
++ 
++ 	if (!ds->ops->port_mirror_add)
++ 		return err;
++ 
++ 	if (!tcf_exts_has_one_action(cls->exts))
++ 		return err;
++ 
++ 	tcf_exts_to_list(cls->exts, &actions);
++ 	a = list_first_entry(&actions, struct tc_action, list);
++ 
++ 	if (is_tcf_mirred_egress_mirror(a) && protocol == htons(ETH_P_ALL)) {
++ 		struct dsa_mall_mirror_tc_entry *mirror;
++ 
++ 		ifindex = tcf_mirred_ifindex(a);
++ 		to_dev = __dev_get_by_index(net, ifindex);
++ 		if (!to_dev)
++ 			return -EINVAL;
++ 
++ 		if (!dsa_slave_dev_check(to_dev))
++ 			return -EOPNOTSUPP;
++ 
++ 		mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
++ 		if (!mall_tc_entry)
++ 			return -ENOMEM;
++ 
++ 		mall_tc_entry->cookie = cls->cookie;
++ 		mall_tc_entry->type = DSA_PORT_MALL_MIRROR;
++ 		mirror = &mall_tc_entry->mirror;
++ 
++ 		to_dp = dsa_slave_to_port(to_dev);
++ 
++ 		mirror->to_local_port = to_dp->index;
++ 		mirror->ingress = ingress;
++ 
++ 		err = ds->ops->port_mirror_add(ds, dp->index, mirror, ingress);
++ 		if (err) {
++ 			kfree(mall_tc_entry);
++ 			return err;
++ 		}
++ 
++ 		list_add_tail(&mall_tc_entry->list, &p->mall_tc_list);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void dsa_slave_del_cls_matchall(struct net_device *dev,
++ 				       struct tc_cls_matchall_offload *cls)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_mall_tc_entry *mall_tc_entry;
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->port_mirror_del)
++ 		return;
++ 
++ 	mall_tc_entry = dsa_slave_mall_tc_entry_find(dev, cls->cookie);
++ 	if (!mall_tc_entry)
++ 		return;
++ 
++ 	list_del(&mall_tc_entry->list);
++ 
++ 	switch (mall_tc_entry->type) {
++ 	case DSA_PORT_MALL_MIRROR:
++ 		ds->ops->port_mirror_del(ds, dp->index, &mall_tc_entry->mirror);
++ 		break;
++ 	default:
++ 		WARN_ON(1);
++ 	}
++ 
++ 	kfree(mall_tc_entry);
++ }
++ 
++ static int dsa_slave_setup_tc_cls_matchall(struct net_device *dev,
++ 					   struct tc_cls_matchall_offload *cls,
++ 					   bool ingress)
++ {
++ 	if (cls->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (cls->command) {
++ 	case TC_CLSMATCHALL_REPLACE:
++ 		return dsa_slave_add_cls_matchall(dev, cls, ingress);
++ 	case TC_CLSMATCHALL_DESTROY:
++ 		dsa_slave_del_cls_matchall(dev, cls);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++ 				       void *cb_priv, bool ingress)
++ {
++ 	struct net_device *dev = cb_priv;
++ 
++ 	if (!tc_can_offload(dev))
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSMATCHALL:
++ 		return dsa_slave_setup_tc_cls_matchall(dev, type_data, ingress);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb_ig(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	return dsa_slave_setup_tc_block_cb(type, type_data, cb_priv, true);
++ }
++ 
++ static int dsa_slave_setup_tc_block_cb_eg(enum tc_setup_type type,
++ 					  void *type_data, void *cb_priv)
++ {
++ 	return dsa_slave_setup_tc_block_cb(type, type_data, cb_priv, false);
++ }
++ 
++ static int dsa_slave_setup_tc_block(struct net_device *dev,
++ 				    struct tc_block_offload *f)
++ {
++ 	tc_setup_cb_t *cb;
++ 
++ 	if (f->binder_type == TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		cb = dsa_slave_setup_tc_block_cb_ig;
++ 	else if (f->binder_type == TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
++ 		cb = dsa_slave_setup_tc_block_cb_eg;
++ 	else
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, cb, dev, dev);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, cb, dev);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int dsa_slave_setup_tc(struct net_device *dev, enum tc_setup_type type,
++ 			      void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return dsa_slave_setup_tc_block(dev, type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static void dsa_slave_get_stats64(struct net_device *dev,
++ 				  struct rtnl_link_stats64 *stats)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct pcpu_sw_netstats *s;
++ 	unsigned int start;
++ 	int i;
++ 
++ 	netdev_stats_to_stats64(stats, &dev->stats);
++ 	for_each_possible_cpu(i) {
++ 		u64 tx_packets, tx_bytes, rx_packets, rx_bytes;
++ 
++ 		s = per_cpu_ptr(p->stats64, i);
++ 		do {
++ 			start = u64_stats_fetch_begin_irq(&s->syncp);
++ 			tx_packets = s->tx_packets;
++ 			tx_bytes = s->tx_bytes;
++ 			rx_packets = s->rx_packets;
++ 			rx_bytes = s->rx_bytes;
++ 		} while (u64_stats_fetch_retry_irq(&s->syncp, start));
++ 
++ 		stats->tx_packets += tx_packets;
++ 		stats->tx_bytes += tx_bytes;
++ 		stats->rx_packets += rx_packets;
++ 		stats->rx_bytes += rx_bytes;
++ 	}
++ }
++ 
++ static int dsa_slave_get_rxnfc(struct net_device *dev,
++ 			       struct ethtool_rxnfc *nfc, u32 *rule_locs)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->get_rxnfc)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ds->ops->get_rxnfc(ds, dp->index, nfc, rule_locs);
++ }
++ 
++ static int dsa_slave_set_rxnfc(struct net_device *dev,
++ 			       struct ethtool_rxnfc *nfc)
++ {
++ 	struct dsa_port *dp = dsa_slave_to_port(dev);
++ 	struct dsa_switch *ds = dp->ds;
++ 
++ 	if (!ds->ops->set_rxnfc)
++ 		return -EOPNOTSUPP;
++ 
++ 	return ds->ops->set_rxnfc(ds, dp->index, nfc);
++ }
++ 
+++>>>>>>> 44ae12a768b7 (net: sched: move the can_offload check from binding phase to rule insertion phase)
+  static const struct ethtool_ops dsa_slave_ethtool_ops = {
+ +	.get_settings		= dsa_slave_get_settings,
+ +	.set_settings		= dsa_slave_set_settings,
+  	.get_drvinfo		= dsa_slave_get_drvinfo,
+ -	.get_regs_len		= dsa_slave_get_regs_len,
+ -	.get_regs		= dsa_slave_get_regs,
+ -	.nway_reset		= phy_ethtool_nway_reset,
+ +	.nway_reset		= dsa_slave_nway_reset,
+  	.get_link		= dsa_slave_get_link,
+ -	.get_eeprom_len		= dsa_slave_get_eeprom_len,
+ -	.get_eeprom		= dsa_slave_get_eeprom,
+ -	.set_eeprom		= dsa_slave_set_eeprom,
+  	.get_strings		= dsa_slave_get_strings,
+  	.get_ethtool_stats	= dsa_slave_get_ethtool_stats,
+  	.get_sset_count		= dsa_slave_get_sset_count,
+diff --cc net/sched/cls_api.c
+index 0e9c21220742,15e3216ef25d..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -254,8 -249,36 +254,41 @@@ tcf_chain_filter_chain_ptr_set(struct t
+  	chain->p_filter_chain = p_filter_chain;
+  }
+  
+++<<<<<<< HEAD
+ +int tcf_block_get(struct tcf_block **p_block,
+ +		  struct tcf_proto __rcu **p_filter_chain)
+++=======
++ static void tcf_block_offload_cmd(struct tcf_block *block, struct Qdisc *q,
++ 				  struct tcf_block_ext_info *ei,
++ 				  enum tc_block_command command)
++ {
++ 	struct net_device *dev = q->dev_queue->dev;
++ 	struct tc_block_offload bo = {};
++ 
++ 	if (!dev->netdev_ops->ndo_setup_tc)
++ 		return;
++ 	bo.command = command;
++ 	bo.binder_type = ei->binder_type;
++ 	bo.block = block;
++ 	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
++ }
++ 
++ static void tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
++ 				   struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_BIND);
++ }
++ 
++ static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
++ 				     struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_UNBIND);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block,
++ 		      struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei)
+++>>>>>>> 44ae12a768b7 (net: sched: move the can_offload check from binding phase to rule insertion phase)
+  {
+  	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
+  	struct tcf_chain *chain;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index d1e80d4c22df..34998b700dde 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -7330,7 +7330,7 @@ static int bnxt_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+ {
+ 	struct bnxt *bp = cb_priv;
+ 
+-	if (!bnxt_tc_flower_enabled(bp))
++	if (!bnxt_tc_flower_enabled(bp) || !tc_can_offload(bp->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	switch (type) {
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+index be4d8b510abb..a75978bb1ecf 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+@@ -124,7 +124,7 @@ static int bnxt_vf_rep_setup_tc_block_cb(enum tc_setup_type type,
+ 	struct bnxt *bp = vf_rep->bp;
+ 	int vf_fid = bp->pf.vf[vf_rep->vf_idx].fw_fid;
+ 
+-	if (!bnxt_tc_flower_enabled(vf_rep->bp))
++	if (!bnxt_tc_flower_enabled(vf_rep->bp) || !tc_can_offload(bp->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	switch (type) {
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index df3df86da091..bc3f67702449 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -2941,6 +2941,9 @@ static int cxgb_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!tc_can_offload(dev))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_CLSU32:
+ 		return cxgb_setup_tc_cls_u32(dev, type_data);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 90f60ed0b65b..11a88fd39a93 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -9025,6 +9025,9 @@ static int ixgbe_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+ {
+ 	struct ixgbe_adapter *adapter = cb_priv;
+ 
++	if (!tc_can_offload(adapter->netdev))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_CLSU32:
+ 		return ixgbe_setup_tc_cls_u32(adapter, type_data);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 1f6b50ed685e..1dca5296fe2f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -748,6 +748,9 @@ static int mlx5e_rep_setup_tc_cb(enum tc_setup_type type, void *type_data,
+ {
+ 	struct mlx5e_priv *priv = cb_priv;
+ 
++	if (!tc_can_offload(priv->netdev))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_CLSFLOWER:
+ 		return mlx5e_rep_setup_tc_cls_flower(priv, type_data);
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 6957213219f7..6583633a7103 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -1737,6 +1737,9 @@ static int mlxsw_sp_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+ {
+ 	struct mlxsw_sp_port *mlxsw_sp_port = cb_priv;
+ 
++	if (!tc_can_offload(mlxsw_sp_port->dev))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_CLSMATCHALL:
+ 		return mlxsw_sp_setup_tc_cls_matchall(mlxsw_sp_port, type_data,
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/sched/cls_api.c
