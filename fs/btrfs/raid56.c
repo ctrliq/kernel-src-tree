@@ -1177,7 +1177,6 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
 {
 	struct btrfs_bio *bbio = rbio->bbio;
 	void *pointers[rbio->real_stripes];
-	int stripe_len = rbio->stripe_len;
 	int nr_data = rbio->nr_data;
 	int stripe;
 	int pagenr;
@@ -1185,7 +1184,6 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
 	int q_stripe = -1;
 	struct bio_list bio_list;
 	struct bio *bio;
-	int pages_per_stripe = stripe_len >> PAGE_CACHE_SHIFT;
 	int ret;
 
 	bio_list_init(&bio_list);
@@ -1228,7 +1226,7 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
 	else
 		clear_bit(RBIO_CACHE_READY_BIT, &rbio->flags);
 
-	for (pagenr = 0; pagenr < pages_per_stripe; pagenr++) {
+	for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 		struct page *p;
 		/* first collect one page from each data stripe */
 		for (stripe = 0; stripe < nr_data; stripe++) {
@@ -1270,7 +1268,7 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
 	 * everything else.
 	 */
 	for (stripe = 0; stripe < rbio->real_stripes; stripe++) {
-		for (pagenr = 0; pagenr < pages_per_stripe; pagenr++) {
+		for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 			struct page *page;
 			if (stripe < rbio->nr_data) {
 				page = page_in_rbio(rbio, stripe, pagenr, 1);
@@ -1294,7 +1292,7 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
 		if (!bbio->tgtdev_map[stripe])
 			continue;
 
-		for (pagenr = 0; pagenr < pages_per_stripe; pagenr++) {
+		for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 			struct page *page;
 			if (stripe < rbio->nr_data) {
 				page = page_in_rbio(rbio, stripe, pagenr, 1);
@@ -1510,7 +1508,6 @@ static int raid56_rmw_stripe(struct btrfs_raid_bio *rbio)
 	int bios_to_read = 0;
 	struct bio_list bio_list;
 	int ret;
-	int nr_pages = DIV_ROUND_UP(rbio->stripe_len, PAGE_CACHE_SIZE);
 	int pagenr;
 	int stripe;
 	struct bio *bio;
@@ -1529,7 +1526,7 @@ static int raid56_rmw_stripe(struct btrfs_raid_bio *rbio)
 	 * stripe
 	 */
 	for (stripe = 0; stripe < rbio->nr_data; stripe++) {
-		for (pagenr = 0; pagenr < nr_pages; pagenr++) {
+		for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 			struct page *page;
 			/*
 			 * we want to find all the pages missing from
@@ -1806,7 +1803,6 @@ static void __raid_recover_end_io(struct btrfs_raid_bio *rbio)
 	int pagenr, stripe;
 	void **pointers;
 	int faila = -1, failb = -1;
-	int nr_pages = DIV_ROUND_UP(rbio->stripe_len, PAGE_CACHE_SIZE);
 	struct page *page;
 	int err;
 	int i;
@@ -1829,7 +1825,7 @@ static void __raid_recover_end_io(struct btrfs_raid_bio *rbio)
 
 	index_rbio_pages(rbio);
 
-	for (pagenr = 0; pagenr < nr_pages; pagenr++) {
+	for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 		/*
 		 * Now we just use bitmap to mark the horizontal stripes in
 		 * which we have data when doing parity scrub.
@@ -1940,7 +1936,7 @@ pstripe:
 		 * other endio functions will fiddle the uptodate bits
 		 */
 		if (rbio->operation == BTRFS_RBIO_WRITE) {
-			for (i = 0;  i < nr_pages; i++) {
+			for (i = 0;  i < rbio->stripe_npages; i++) {
 				if (faila != -1) {
 					page = rbio_stripe_page(rbio, faila, i);
 					SetPageUptodate(page);
@@ -2036,7 +2032,6 @@ static int __raid56_parity_recover(struct btrfs_raid_bio *rbio)
 	int bios_to_read = 0;
 	struct bio_list bio_list;
 	int ret;
-	int nr_pages = DIV_ROUND_UP(rbio->stripe_len, PAGE_CACHE_SIZE);
 	int pagenr;
 	int stripe;
 	struct bio *bio;
@@ -2060,7 +2055,7 @@ static int __raid56_parity_recover(struct btrfs_raid_bio *rbio)
 			continue;
 		}
 
-		for (pagenr = 0; pagenr < nr_pages; pagenr++) {
+		for (pagenr = 0; pagenr < rbio->stripe_npages; pagenr++) {
 			struct page *p;
 
 			/*
