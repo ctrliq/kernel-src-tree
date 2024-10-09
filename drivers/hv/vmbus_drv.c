@@ -43,6 +43,7 @@
 #include <linux/screen_info.h>
 #include <linux/kdebug.h>
 #include <linux/efi.h>
+#include <linux/random.h>
 #include "hyperv_vmbus.h"
 
 
@@ -810,6 +811,8 @@ static void vmbus_isr(void)
 		else
 			tasklet_schedule(hv_context.msg_dpc[cpu]);
 	}
+
+	add_interrupt_randomness(HYPERVISOR_CALLBACK_VECTOR, 0);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU

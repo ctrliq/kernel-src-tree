@@ -852,6 +852,7 @@ void add_interrupt_randomness(int irq, int irq_flags)
 	}
 	credit_entropy_bits(r, 1);
 }
+EXPORT_SYMBOL_GPL(add_interrupt_randomness);
 
 #ifdef CONFIG_BLOCK
 void add_disk_randomness(struct gendisk *disk)
