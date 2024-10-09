@@ -1655,6 +1655,8 @@ static void ipoib_dev_uninit_default(struct net_device *dev)
 
 	ipoib_transport_dev_cleanup(dev);
 
+	netif_napi_del(&priv->napi);
+
 	ipoib_cm_dev_cleanup(dev);
 
 	kfree(priv->rx_ring);
@@ -1701,6 +1703,7 @@ out_rx_ring_cleanup:
 	kfree(priv->rx_ring);
 
 out:
+	netif_napi_del(&priv->napi);
 	return -ENOMEM;
 }
 
