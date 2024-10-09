@@ -1,0 +1,129 @@
+KVM: PPC: Book3S HV: Send IPI to host core to wake VCPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suresh E. Warrier <warrier@linux.vnet.ibm.com>
+commit e17769eb8c897101e2c6df62ec397e450b6e53b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e17769eb.failed
+
+This patch adds support to real-mode KVM to search for a core
+running in the host partition and send it an IPI message with
+VCPU to be woken. This avoids having to switch to the host
+partition to complete an H_IPI hypercall when the VCPU which
+is the target of the the H_IPI is not loaded (is not running
+in the guest).
+
+The patch also includes the support in the IPI handler running
+in the host to do the wakeup by calling kvmppc_xics_ipi_action
+for the PPC_MSG_RM_HOST_ACTION message.
+
+When a guest is being destroyed, we need to ensure that there
+are no pending IPIs waiting to wake up a VCPU before we free
+the VCPUs of the guest. This is accomplished by:
+- Forces a PPC_MSG_CALL_FUNCTION IPI to be completed by all CPUs
+  before freeing any VCPUs in kvm_arch_destroy_vm().
+- Any PPC_MSG_RM_HOST_ACTION messages must be executed first
+  before any other PPC_MSG_CALL_FUNCTION messages.
+
+	Signed-off-by: Suresh Warrier <warrier@linux.vnet.ibm.com>
+	Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Paul Mackerras <paulus@samba.org>
+(cherry picked from commit e17769eb8c897101e2c6df62ec397e450b6e53b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 1ec9b5d6ad10,e673fb9fee98..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -623,3 -708,40 +707,43 @@@ int kvmppc_rm_h_eoi(struct kvm_vcpu *vc
+   bail:
+  	return check_too_hard(xics, icp);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*  --- Non-real mode XICS-related built-in routines ---  */
++ 
++ /**
++  * Host Operations poked by RM KVM
++  */
++ static void rm_host_ipi_action(int action, void *data)
++ {
++ 	switch (action) {
++ 	case XICS_RM_KICK_VCPU:
++ 		kvmppc_host_rm_ops_hv->vcpu_kick(data);
++ 		break;
++ 	default:
++ 		WARN(1, "Unexpected rm_action=%d data=%p\n", action, data);
++ 		break;
++ 	}
++ 
++ }
++ 
++ void kvmppc_xics_ipi_action(void)
++ {
++ 	int core;
++ 	unsigned int cpu = smp_processor_id();
++ 	struct kvmppc_host_rm_core *rm_corep;
++ 
++ 	core = cpu >> threads_shift;
++ 	rm_corep = &kvmppc_host_rm_ops_hv->rm_core[core];
++ 
++ 	if (rm_corep->rm_data) {
++ 		rm_host_ipi_action(rm_corep->rm_state.rm_action,
++ 							rm_corep->rm_data);
++ 		/* Order these stores against the real mode KVM */
++ 		rm_corep->rm_data = NULL;
++ 		smp_wmb();
++ 		rm_corep->rm_state.rm_action = 0;
++ 	}
++ }
+++>>>>>>> e17769eb8c89 (KVM: PPC: Book3S HV: Send IPI to host core to wake VCPU)
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index 38423e0def43..9c3e1fa4bc13 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -256,6 +256,17 @@ irqreturn_t smp_ipi_demux(void)
+ 
+ 	do {
+ 		all = xchg(&info->messages, 0);
++#if defined(CONFIG_KVM_XICS) && defined(CONFIG_KVM_BOOK3S_HV_POSSIBLE)
++		/*
++		 * Must check for PPC_MSG_RM_HOST_ACTION messages
++		 * before PPC_MSG_CALL_FUNCTION messages because when
++		 * a VM is destroyed, we call kick_all_cpus_sync()
++		 * to ensure that any pending PPC_MSG_RM_HOST_ACTION
++		 * messages have completed before we free any VCPUs.
++		 */
++		if (all & IPI_MESSAGE(PPC_MSG_RM_HOST_ACTION))
++			kvmppc_xics_ipi_action();
++#endif
+ 		if (all & IPI_MESSAGE(PPC_MSG_CALL_FUNCTION))
+ 			generic_smp_call_function_interrupt();
+ 		if (all & IPI_MESSAGE(PPC_MSG_RESCHEDULE))
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 64a0fde48c79..bd5108ab0d02 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -446,6 +446,16 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 	unsigned int i;
+ 	struct kvm_vcpu *vcpu;
+ 
++#ifdef CONFIG_KVM_XICS
++	/*
++	 * We call kick_all_cpus_sync() to ensure that all
++	 * CPUs have executed any pending IPIs before we
++	 * continue and free VCPUs structures below.
++	 */
++	if (is_kvmppc_hv_enabled(kvm))
++		kick_all_cpus_sync();
++#endif
++
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+ 		kvm_arch_vcpu_free(vcpu);
+ 
