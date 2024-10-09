@@ -515,7 +515,7 @@ static void sctp_do_8_2_transport_strike(sctp_cmd_seq_t *commands,
 	 */
 	if (net->sctp_pf_enable &&
 	   (transport->state == SCTP_ACTIVE) &&
-	   (asoc->pf_retrans < transport->pathmaxrxt) &&
+	   (transport->error_count < transport->pathmaxrxt) &&
 	   (transport->error_count > asoc->pf_retrans)) {
 
 		sctp_assoc_control_transport(asoc, transport,
