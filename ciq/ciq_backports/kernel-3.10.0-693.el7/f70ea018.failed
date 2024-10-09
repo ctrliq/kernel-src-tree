@@ -1,0 +1,247 @@
+net: Add functions to get skb->hash based on flow structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] flow_dissector: Add functions to get skb->hash based on flow structures (Jonathan Toppins) [1428557]
+Rebuild_FUZZ: 90.08%
+commit-author Tom Herbert <tom@herbertland.com>
+commit f70ea018da0631e10c26a02f5a82d626ffef5bd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f70ea018.failed
+
+Add skb_get_hash_flowi6 and skb_get_hash_flowi4 which derive an sk_buff
+hash from flowi6 and flowi4 structures respectively. These functions
+can be called when creating a packet in the output path where the new
+sk_buff does not yet contain a fully formed packet that is parsable by
+flow dissector.
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f70ea018da0631e10c26a02f5a82d626ffef5bd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/flow_dissector.c
+diff --cc include/linux/skbuff.h
+index dcb8575fa615,b7c1286e247d..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -33,11 -34,11 +33,12 @@@
+  #include <linux/dma-mapping.h>
+  #include <linux/netdev_features.h>
+  #include <linux/sched.h>
+ -#include <net/flow_dissector.h>
+ -#include <linux/splice.h>
+ +#include <net/flow_keys.h>
+  #include <linux/in6.h>
++ #include <net/flow.h>
+  
+ +#include <linux/rh_kabi.h>
+ +
+  /* A. Checksumming of received packets by device.
+   *
+   * CHECKSUM_NONE:
+@@@ -984,6 -946,28 +985,31 @@@ static inline __u32 skb_get_hash(struc
+  	return skb->hash;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ __u32 __skb_get_hash_flowi6(struct sk_buff *skb, struct flowi6 *fl6);
++ 
++ static inline __u32 skb_get_hash_flowi6(struct sk_buff *skb, struct flowi6 *fl6)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash)
++ 		__skb_get_hash_flowi6(skb, fl6);
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 __skb_get_hash_flowi4(struct sk_buff *skb, struct flowi4 *fl);
++ 
++ static inline __u32 skb_get_hash_flowi4(struct sk_buff *skb, struct flowi4 *fl4)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash)
++ 		__skb_get_hash_flowi4(skb, fl4);
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb);
++ 
+++>>>>>>> f70ea018da06 (net: Add functions to get skb->hash based on flow structures)
+  static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
+  {
+  	return skb->hash;
+diff --cc net/core/flow_dissector.c
+index c177964713d3,11e6540fa386..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -342,8 -554,56 +342,61 @@@ u32 flow_hash_from_keys(struct flow_key
+  }
+  EXPORT_SYMBOL(flow_hash_from_keys);
+  
+++<<<<<<< HEAD
+ +/*
+ + * __skb_get_hash: calculate a flow hash based on src/dst addresses
+++=======
++ static inline u32 ___skb_get_hash(const struct sk_buff *skb,
++ 				  struct flow_keys *keys, u32 keyval)
++ {
++ 	if (!skb_flow_dissect_flow_keys(skb, keys))
++ 		return 0;
++ 
++ 	return __flow_hash_from_keys(keys, keyval);
++ }
++ 
++ struct _flow_keys_digest_data {
++ 	__be16	n_proto;
++ 	u8	ip_proto;
++ 	u8	padding;
++ 	__be32	ports;
++ 	__be32	src;
++ 	__be32	dst;
++ };
++ 
++ void make_flow_keys_digest(struct flow_keys_digest *digest,
++ 			   const struct flow_keys *flow)
++ {
++ 	struct _flow_keys_digest_data *data =
++ 	    (struct _flow_keys_digest_data *)digest;
++ 
++ 	BUILD_BUG_ON(sizeof(*data) > sizeof(*digest));
++ 
++ 	memset(digest, 0, sizeof(*digest));
++ 
++ 	data->n_proto = flow->basic.n_proto;
++ 	data->ip_proto = flow->basic.ip_proto;
++ 	data->ports = flow->ports.ports;
++ 	data->src = flow->addrs.v4addrs.src;
++ 	data->dst = flow->addrs.v4addrs.dst;
++ }
++ EXPORT_SYMBOL(make_flow_keys_digest);
++ 
++ static inline void __skb_set_sw_hash(struct sk_buff *skb, u32 hash,
++ 				     struct flow_keys *keys)
++ {
++ 	if (keys->ports.ports)
++ 		skb->l4_hash = 1;
++ 	skb->sw_hash = 1;
++ 	skb->hash = hash;
++ }
++ 
++ /**
++  * __skb_get_hash: calculate a flow hash
++  * @skb: sk_buff to calculate flow hash from
++  *
++  * This function calculates a flow hash based on src/dst addresses
+++>>>>>>> f70ea018da06 (net: Add functions to get skb->hash based on flow structures)
+   * and src/dst port numbers.  Sets hash in skb to non-zero hash value
+   * on success, zero indicates no valid hash.  Also, sets l4_hash in skb
+   * if hash is a canonical 4-tuple hash over transport ports.
+@@@ -351,45 -611,69 +404,92 @@@
+  void __skb_get_hash(struct sk_buff *skb)
+  {
+  	struct flow_keys keys;
+ -	u32 hash;
+  
+ -	__flow_hash_secret_init();
+ -
+ -	hash = ___skb_get_hash(skb, &keys, hashrnd);
+ -	if (!hash)
+ +	if (!skb_flow_dissect(skb, &keys))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (keys.ports)
+ +		skb->l4_hash = 1;
+ +
+ +	skb->hash = __flow_hash_from_keys(&keys);
+++=======
++ 	__skb_set_sw_hash(skb, hash, &keys);
+++>>>>>>> f70ea018da06 (net: Add functions to get skb->hash based on flow structures)
+  }
+  EXPORT_SYMBOL(__skb_get_hash);
+  
+ -__u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb)
+ +/*
+ + * Returns a Tx hash based on the given packet descriptor a Tx queues' number
+ + * to be used as a distribution range.
+ + */
+ +u16 __skb_tx_hash(const struct net_device *dev, struct sk_buff *skb,
+ +		  unsigned int num_tx_queues)
+  {
+ -	struct flow_keys keys;
+ +	u32 hash;
+ +	u16 qoffset = 0;
+ +	u16 qcount = num_tx_queues;
+ +
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		hash = skb_get_rx_queue(skb);
+ +		while (unlikely(hash >= num_tx_queues))
+ +			hash -= num_tx_queues;
+ +		return hash;
+ +	}
+  
+ -	return ___skb_get_hash(skb, &keys, perturb);
+ +	if (dev->num_tc) {
+ +		u8 tc = netdev_get_prio_tc_map(dev, skb->priority);
+ +		qoffset = dev->tc_to_txq[tc].offset;
+ +		qcount = dev->tc_to_txq[tc].count;
+ +	}
+ +
+ +	return (u16) reciprocal_scale(skb_get_hash(skb), qcount) + qoffset;
+  }
+ -EXPORT_SYMBOL(skb_get_hash_perturb);
+ +EXPORT_SYMBOL(__skb_tx_hash);
+  
++ __u32 __skb_get_hash_flowi6(struct sk_buff *skb, struct flowi6 *fl6)
++ {
++ 	struct flow_keys keys;
++ 
++ 	memset(&keys, 0, sizeof(keys));
++ 
++ 	memcpy(&keys.addrs.v6addrs.src, &fl6->saddr,
++ 	       sizeof(keys.addrs.v6addrs.src));
++ 	memcpy(&keys.addrs.v6addrs.dst, &fl6->daddr,
++ 	       sizeof(keys.addrs.v6addrs.dst));
++ 	keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++ 	keys.ports.src = fl6->fl6_sport;
++ 	keys.ports.dst = fl6->fl6_dport;
++ 	keys.keyid.keyid = fl6->fl6_gre_key;
++ 	keys.tags.flow_label = (__force u32)fl6->flowlabel;
++ 	keys.basic.ip_proto = fl6->flowi6_proto;
++ 
++ 	__skb_set_sw_hash(skb, flow_hash_from_keys(&keys), &keys);
++ 
++ 	return skb->hash;
++ }
++ EXPORT_SYMBOL(__skb_get_hash_flowi6);
++ 
++ __u32 __skb_get_hash_flowi4(struct sk_buff *skb, struct flowi4 *fl4)
++ {
++ 	struct flow_keys keys;
++ 
++ 	memset(&keys, 0, sizeof(keys));
++ 
++ 	keys.addrs.v4addrs.src = fl4->saddr;
++ 	keys.addrs.v4addrs.dst = fl4->daddr;
++ 	keys.control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++ 	keys.ports.src = fl4->fl4_sport;
++ 	keys.ports.dst = fl4->fl4_dport;
++ 	keys.keyid.keyid = fl4->fl4_gre_key;
++ 	keys.basic.ip_proto = fl4->flowi4_proto;
++ 
++ 	__skb_set_sw_hash(skb, flow_hash_from_keys(&keys), &keys);
++ 
++ 	return skb->hash;
++ }
++ EXPORT_SYMBOL(__skb_get_hash_flowi4);
++ 
+  u32 __skb_get_poff(const struct sk_buff *skb, void *data,
+  		   const struct flow_keys *keys, int hlen)
+  {
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/flow_dissector.c
