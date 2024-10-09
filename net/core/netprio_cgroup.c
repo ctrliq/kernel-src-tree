@@ -36,7 +36,7 @@ static inline struct cgroup_netprio_state *cgrp_netprio_state(struct cgroup *cgr
 }
 
 /*
- * Extend @dev->priomap so that it's large enough to accomodate
+ * Extend @dev->priomap so that it's large enough to accommodate
  * @target_idx.  @dev->priomap.priomap_len > @target_idx after successful
  * return.  Must be called under rtnl lock.
  */
