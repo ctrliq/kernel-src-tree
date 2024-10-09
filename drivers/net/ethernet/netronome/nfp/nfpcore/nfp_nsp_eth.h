@@ -78,4 +78,28 @@ struct nfp_eth_table *
 __nfp_eth_read_ports(struct nfp_cpp *cpp, struct nfp_nsp *nsp);
 int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable);
 
+/**
+ * struct nfp_nsp_identify - NSP static information
+ * @version:      opaque version string
+ * @flags:        version flags
+ * @br_primary:   branch id of primary bootloader
+ * @br_secondary: branch id of secondary bootloader
+ * @br_nsp:       branch id of NSP
+ * @primary:      version of primarary bootloader
+ * @secondary:    version id of secondary bootloader
+ * @nsp:          version id of NSP
+ */
+struct nfp_nsp_identify {
+	char version[40];
+	u8 flags;
+	u8 br_primary;
+	u8 br_secondary;
+	u8 br_nsp;
+	u16 primary;
+	u16 secondary;
+	u16 nsp;
+};
+
+struct nfp_nsp_identify *__nfp_nsp_identify(struct nfp_nsp *nsp);
+
 #endif

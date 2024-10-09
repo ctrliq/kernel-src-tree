@@ -63,6 +63,7 @@ int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw);
 int nfp_nsp_read_eth_table(struct nfp_nsp *state, void *buf, unsigned int size);
 int nfp_nsp_write_eth_table(struct nfp_nsp *state,
 			    const void *buf, unsigned int size);
+int nfp_nsp_read_identify(struct nfp_nsp *state, void *buf, unsigned int size);
 
 /* Implemented in nfp_resource.c */
 
