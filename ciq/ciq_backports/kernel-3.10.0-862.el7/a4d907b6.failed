@@ -1,0 +1,252 @@
+blk-mq: streamline blk_mq_make_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit a4d907b6a33ba22adbbfc443e22eb3c1aa2c73f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a4d907b6.failed
+
+Turn the different ways of merging or issuing I/O into a series of if/else
+statements instead of the current maze of gotos.  Note that this means we
+pin the CPU a little longer for some cases as the CTX put is moved to
+common code at the end of the function.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit a4d907b6a33ba22adbbfc443e22eb3c1aa2c73f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index f1314e27e331,45b9bebf8436..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1402,124 -1504,44 +1402,138 @@@ static void blk_mq_make_request(struct 
+  	blk_queue_bounce(q, &bio);
+  
+  	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, -EIO);
+ +		return;
+  	}
+  
+ -	blk_queue_split(q, &bio, q->bio_split);
+ -
+  	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+  	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
+ -		return BLK_QC_T_NONE;
+ +		return;
+ +
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+ +
+++<<<<<<< HEAD
+ +	if (unlikely(is_flush_fua)) {
+ +		blk_mq_bio_to_request(rq, bio);
+ +		blk_insert_flush(rq);
+ +		goto run_queue;
+ +	}
+ +
+ +	plug = current->plug;
+ +	/*
+ +	 * If the driver supports defer issued based on 'last', then
+ +	 * queue it up like normal since we can potentially save some
+ +	 * CPU this way.
+ +	 */
+ +	if (((plug && !blk_queue_nomerges(q)) || is_sync) &&
+ +	    !(data.hctx->flags & BLK_MQ_F_DEFER_ISSUE)) {
+ +		struct request *old_rq = NULL;
+  
+ -	if (blk_mq_sched_bio_merge(q, bio))
+ -		return BLK_QC_T_NONE;
+ +		blk_mq_bio_to_request(rq, bio);
+  
+ -	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
+ +		/*
+ +		 * We do limited plugging. If the bio can be merged, do that.
+ +		 * Otherwise the existing request in the plug list will be
+ +		 * issued. So the plug list will have one request at most
+ +		 */
+ +		if (plug) {
+ +			/*
+ +			 * The plug list might get flushed before this. If that
+ +			 * happens, same_queue_rq is invalid and plug list is
+ +			 * empty
+ +			 */
+ +			if (same_queue_rq && !list_empty(&plug->mq_list)) {
+ +				old_rq = same_queue_rq;
+ +				list_del_init(&old_rq->queuelist);
+ +			}
+ +			list_add_tail(&rq->queuelist, &plug->mq_list);
+ +		} else /* is_sync */
+ +			old_rq = rq;
+ +		blk_mq_put_ctx(data.ctx);
+ +		if (!old_rq)
+ +			return;
+  
+ -	trace_block_getrq(q, bio, bio->bi_opf);
+ +		if (!(data.hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +			rcu_read_lock();
+ +			blk_mq_try_issue_directly(old_rq);
+ +			rcu_read_unlock();
+ +		} else {
+ +			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
+ +			blk_mq_try_issue_directly(old_rq);
+ +			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
+ +		}
+ +		return;
+ +	}
+  
+ -	rq = blk_mq_sched_get_request(q, bio, bio->bi_opf, &data);
+ -	if (unlikely(!rq)) {
+ -		__wbt_done(q->rq_wb, wb_acct);
+ -		return BLK_QC_T_NONE;
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ +		/*
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+ +		 */
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+  	}
+ +	blk_mq_put_ctx(data.ctx);
+ +}
+ +
+ +/*
+ + * Single hardware queue variant. This will attempt to use any per-process
+ + * plug for merging and IO deferral.
+ + */
+ +static void blk_sq_make_request(struct request_queue *q, struct bio *bio)
+ +{
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_plug *plug;
+ +	unsigned int request_count = 0;
+ +	struct blk_map_ctx data;
+ +	struct request *rq;
+ +
+ +	blk_queue_bounce(q, &bio);
+  
+ -	wbt_track(&rq->issue_stat, wb_acct);
+ +	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ +		bio_endio(bio, -EIO);
+ +		return;
+ +	}
+ +
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ +		return;
+  
+ -	cookie = request_to_qc_t(data.hctx, rq);
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+ +
+ +	if (unlikely(is_flush_fua)) {
+ +		blk_mq_bio_to_request(rq, bio);
+ +		blk_insert_flush(rq);
+ +		goto run_queue;
+ +	}
+  
+ +	/*
+ +	 * A task plug currently exists. Since this is completely lockless,
+ +	 * utilize that to temporarily store requests until the task is
+ +	 * either done or scheduled away.
+ +	 */
+ +	plug = current->plug;
+ +	if (plug) {
+++=======
++ 	plug = current->plug;
++ 	if (unlikely(is_flush_fua)) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		if (q->elevator) {
++ 			blk_mq_sched_insert_request(rq, false, true, true,
++ 					true);
++ 		} else {
++ 			blk_insert_flush(rq);
++ 			blk_mq_run_hw_queue(data.hctx, true);
++ 		}
++ 	} else if (plug && q->nr_hw_queues == 1) {
+++>>>>>>> a4d907b6a33b (blk-mq: streamline blk_mq_make_request)
+  		struct request *last = NULL;
+  
+  		blk_mq_bio_to_request(rq, bio);
+@@@ -1544,34 -1567,41 +1556,68 @@@
+  		}
+  
+  		list_add_tail(&rq->queuelist, &plug->mq_list);
+++<<<<<<< HEAD
+ +		return;
+ +	}
+ +
+ +	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+ +		/*
+ +		 * For a SYNC request, send it to the hardware immediately. For
+ +		 * an ASYNC request, just ensure that we run it later on. The
+ +		 * latter allows for merging opportunities and more efficient
+ +		 * dispatching.
+ +		 */
+ +run_queue:
+ +		blk_mq_run_hw_queue(data.hctx, !is_sync || is_flush_fua);
+ +	}
+ +
+ +	blk_mq_put_ctx(data.ctx);
+++=======
++ 	} else if (plug && !blk_queue_nomerges(q)) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 
++ 		/*
++ 		 * We do limited plugging. If the bio can be merged, do that.
++ 		 * Otherwise the existing request in the plug list will be
++ 		 * issued. So the plug list will have one request at most
++ 		 * The plug list might get flushed before this. If that happens,
++ 		 * the plug list is empty, and same_queue_rq is invalid.
++ 		 */
++ 		if (list_empty(&plug->mq_list))
++ 			same_queue_rq = NULL;
++ 		if (same_queue_rq)
++ 			list_del_init(&same_queue_rq->queuelist);
++ 		list_add_tail(&rq->queuelist, &plug->mq_list);
++ 
++ 		if (same_queue_rq)
++ 			blk_mq_try_issue_directly(data.hctx, same_queue_rq,
++ 					&cookie);
++ 	} else if (q->nr_hw_queues > 1 && is_sync) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_try_issue_directly(data.hctx, rq, &cookie);
++ 	} else if (q->elevator) {
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true, true, true);
++ 	} else if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
++ 		blk_mq_run_hw_queue(data.hctx, true);
++ 	}
++ 
++ 	blk_mq_put_ctx(data.ctx);
++ 	return cookie;
+++>>>>>>> a4d907b6a33b (blk-mq: streamline blk_mq_make_request)
+ +}
+ +
+ +/*
+ + * Default mapping to a software queue, since we use one per CPU.
+ + */
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ +{
+ +	return q->queue_hw_ctx[q->mq_map[cpu]];
+  }
+ +EXPORT_SYMBOL(blk_mq_map_queue);
+  
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx)
+ +static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ +		struct blk_mq_tags *tags, unsigned int hctx_idx)
+  {
+  	struct page *page;
+  
+* Unmerged path block/blk-mq.c
