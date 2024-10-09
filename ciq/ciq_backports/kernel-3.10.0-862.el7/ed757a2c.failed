@@ -1,0 +1,167 @@
+cpufreq: acpi-cpufreq: Make read and write operations more efficient
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] acpi-cpufreq: Make read and write operations more efficient (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 92.91%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit ed757a2c7bf7aa99d219b78349b4a0334851dc38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ed757a2c.failed
+
+Setting a new CPU frequency and reading the current request value
+in the ACPI cpufreq driver involves each at least two switch
+instructions (there's more if the policy is shared).  One of
+them is present in drv_read/write() that prepares a command
+structure and the other happens in subsequent do_drv_read/write()
+when that structure is interpreted.  However, all of those switches
+may be avoided by using function pointers.
+
+To that end, add two function pointers to struct acpi_cpufreq_data
+to represent read and write operations on the frequency register
+and set them up during policy intitialization to point to the pair
+of routines suitable for the given processor (Intel/AMD MSR access
+or I/O port access).  Then, use those pointers in do_drv_read/write()
+and modify drv_read/write() to prepare the command structure for
+them without any checks.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit ed757a2c7bf7aa99d219b78349b4a0334851dc38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/acpi-cpufreq.c
+diff --cc drivers/cpufreq/acpi-cpufreq.c
+index b0c18ed8d83f,59a7b380fbe2..000000000000
+--- a/drivers/cpufreq/acpi-cpufreq.c
++++ b/drivers/cpufreq/acpi-cpufreq.c
+@@@ -69,11 -68,12 +69,13 @@@ struct acpi_cpufreq_data 
+  	struct cpufreq_frequency_table *freq_table;
+  	unsigned int resume;
+  	unsigned int cpu_feature;
+ -	unsigned int acpi_perf_cpu;
+  	cpumask_var_t freqdomain_cpus;
++ 	void (*cpu_freq_write)(struct acpi_pct_register *reg, u32 val);
++ 	u32 (*cpu_freq_read)(struct acpi_pct_register *reg);
+  };
+  
+ +static DEFINE_PER_CPU(struct acpi_cpufreq_data *, acfreq_data);
+ +
+  /* acpi_perf_data is a pointer to percpu data. */
+  static struct acpi_processor_performance __percpu *acpi_perf_data;
+  
+@@@ -327,39 -346,18 +345,43 @@@ static void drv_write(struct acpi_cpufr
+  	put_cpu();
+  }
+  
+++<<<<<<< HEAD
+ +static u32 get_cur_val(const struct cpumask *mask)
+++=======
++ static u32 get_cur_val(const struct cpumask *mask, struct acpi_cpufreq_data *data)
+++>>>>>>> ed757a2c7bf7 (cpufreq: acpi-cpufreq: Make read and write operations more efficient)
+  {
+- 	struct acpi_processor_performance *perf;
+- 	struct drv_cmd cmd;
++ 	u32 val;
+  
+  	if (unlikely(cpumask_empty(mask)))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	switch (per_cpu(acfreq_data, cpumask_first(mask))->cpu_feature) {
+ +	case SYSTEM_INTEL_MSR_CAPABLE:
+ +		cmd.type = SYSTEM_INTEL_MSR_CAPABLE;
+ +		cmd.addr.msr.reg = MSR_IA32_PERF_CTL;
+ +		break;
+ +	case SYSTEM_AMD_MSR_CAPABLE:
+ +		cmd.type = SYSTEM_AMD_MSR_CAPABLE;
+ +		cmd.addr.msr.reg = MSR_AMD_PERF_CTL;
+ +		break;
+ +	case SYSTEM_IO_CAPABLE:
+ +		cmd.type = SYSTEM_IO_CAPABLE;
+ +		perf = per_cpu(acfreq_data, cpumask_first(mask))->acpi_data;
+ +		cmd.addr.io.port = perf->control_register.address;
+ +		cmd.addr.io.bit_width = perf->control_register.bit_width;
+ +		break;
+ +	default:
+ +		return 0;
+ +	}
+++=======
++ 	val = drv_read(data, mask);
+++>>>>>>> ed757a2c7bf7 (cpufreq: acpi-cpufreq: Make read and write operations more efficient)
+  
+- 	cmd.mask = mask;
+- 	drv_read(&cmd);
+- 
+- 	pr_debug("get_cur_val = %u\n", cmd.val);
++ 	pr_debug("get_cur_val = %u\n", val);
+  
+- 	return cmd.val;
++ 	return val;
+  }
+  
+  static unsigned int get_cur_freq_on_cpu(unsigned int cpu)
+@@@ -408,9 -410,9 +430,9 @@@ static unsigned int check_freqs(const s
+  static int acpi_cpufreq_target(struct cpufreq_policy *policy,
+  			       unsigned int index)
+  {
+ -	struct acpi_cpufreq_data *data = policy->driver_data;
+ +	struct acpi_cpufreq_data *data = per_cpu(acfreq_data, policy->cpu);
+  	struct acpi_processor_performance *perf;
+- 	struct drv_cmd cmd;
++ 	const struct cpumask *mask;
+  	unsigned int next_perf_state = 0; /* Index into perf table */
+  	int result = 0;
+  
+@@@ -433,38 -434,17 +455,41 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	switch (data->cpu_feature) {
+ +	case SYSTEM_INTEL_MSR_CAPABLE:
+ +		cmd.type = SYSTEM_INTEL_MSR_CAPABLE;
+ +		cmd.addr.msr.reg = MSR_IA32_PERF_CTL;
+ +		cmd.val = (u32) perf->states[next_perf_state].control;
+ +		break;
+ +	case SYSTEM_AMD_MSR_CAPABLE:
+ +		cmd.type = SYSTEM_AMD_MSR_CAPABLE;
+ +		cmd.addr.msr.reg = MSR_AMD_PERF_CTL;
+ +		cmd.val = (u32) perf->states[next_perf_state].control;
+ +		break;
+ +	case SYSTEM_IO_CAPABLE:
+ +		cmd.type = SYSTEM_IO_CAPABLE;
+ +		cmd.addr.io.port = perf->control_register.address;
+ +		cmd.addr.io.bit_width = perf->control_register.bit_width;
+ +		cmd.val = (u32) perf->states[next_perf_state].control;
+ +		break;
+ +	default:
+ +		result = -ENODEV;
+ +		goto out;
+ +	}
+++=======
++ 	/*
++ 	 * The core won't allow CPUs to go away until the governor has been
++ 	 * stopped, so we can rely on the stability of policy->cpus.
++ 	 */
++ 	mask = policy->shared_type == CPUFREQ_SHARED_TYPE_ANY ?
++ 		cpumask_of(policy->cpu) : policy->cpus;
+++>>>>>>> ed757a2c7bf7 (cpufreq: acpi-cpufreq: Make read and write operations more efficient)
+  
+- 	/* cpufreq holds the hotplug lock, so we are safe from here on */
+- 	if (policy->shared_type != CPUFREQ_SHARED_TYPE_ANY)
+- 		cmd.mask = policy->cpus;
+- 	else
+- 		cmd.mask = cpumask_of(policy->cpu);
+- 
+- 	drv_write(&cmd);
++ 	drv_write(data, mask, perf->states[next_perf_state].control);
+  
+  	if (acpi_pstate_strict) {
+- 		if (!check_freqs(cmd.mask, data->freq_table[index].frequency,
++ 		if (!check_freqs(mask, data->freq_table[index].frequency,
+  					data)) {
+  			pr_debug("acpi_cpufreq_target failed (%d)\n",
+  				policy->cpu);
+* Unmerged path drivers/cpufreq/acpi-cpufreq.c
