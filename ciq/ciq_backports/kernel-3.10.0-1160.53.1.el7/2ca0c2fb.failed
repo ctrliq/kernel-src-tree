@@ -1,0 +1,157 @@
+gfs2: drain the ail2 list after io errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 2ca0c2fbf3ed7f9609333a996149d02f70e8a6f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/2ca0c2fb.failed
+
+Before this patch, gfs2_logd continually tried to flush its journal
+log, after the file system is withdrawn. We don't want to write anything
+to the journal, lest we add corruption. Best course of action is to
+drain the ail1 into the ail2 list (via gfs2_ail1_empty) then drain the
+ail2 list with a new function, ail2_drain.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 2ca0c2fbf3ed7f9609333a996149d02f70e8a6f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,010c319caade..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -671,9 -839,11 +702,14 @@@ static void ail_drain(struct gfs2_sbd *
+   *
+   */
+  
+ -void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl, u32 flags)
+ +void gfs2_log_flush(struct gfs2_sbd *sdp, struct gfs2_glock *gl)
+  {
+++<<<<<<< HEAD
+ +	struct gfs2_trans *tr;
+++=======
++ 	struct gfs2_trans *tr = NULL;
++ 	enum gfs2_freeze_state state = atomic_read(&sdp->sd_freeze_state);
+++>>>>>>> 2ca0c2fbf3ed (gfs2: drain the ail2 list after io errors)
+  
+  	down_write(&sdp->sd_log_flush_lock);
+  
+@@@ -689,19 -870,25 +732,29 @@@
+  		sdp->sd_log_tr = NULL;
+  		INIT_LIST_HEAD(&tr->tr_ail1_list);
+  		INIT_LIST_HEAD(&tr->tr_ail2_list);
+ -		tr->tr_first = sdp->sd_log_flush_head;
+ -		if (unlikely (state == SFS_FROZEN))
+ -			gfs2_assert_withdraw(sdp, !tr->tr_num_buf_new && !tr->tr_num_databuf_new);
+  	}
+  
+ -	if (unlikely(state == SFS_FROZEN))
+ -		gfs2_assert_withdraw(sdp, !sdp->sd_log_num_revoke);
+  	gfs2_assert_withdraw(sdp,
+ -			sdp->sd_log_num_revoke == sdp->sd_log_committed_revoke);
+ +			sdp->sd_log_num_revoke == sdp->sd_log_commited_revoke);
+ +
+ +	sdp->sd_log_flush_head = sdp->sd_log_head;
+ +	sdp->sd_log_flush_wrapped = 0;
+ +	if (tr)
+ +		tr->tr_first = sdp->sd_log_flush_head;
+  
+  	gfs2_ordered_write(sdp);
++ 	if (gfs2_withdrawn(sdp))
++ 		goto out;
+  	lops_before_commit(sdp, tr);
+++<<<<<<< HEAD
+ +	gfs2_log_submit_bio(&sdp->sd_log_bio, WRITE);
+++=======
++ 	if (gfs2_withdrawn(sdp))
++ 		goto out;
++ 	gfs2_log_submit_bio(&sdp->sd_log_bio, REQ_OP_WRITE);
++ 	if (gfs2_withdrawn(sdp))
++ 		goto out;
+++>>>>>>> 2ca0c2fbf3ed (gfs2: drain the ail2 list after io errors)
+  
+  	if (sdp->sd_log_head != sdp->sd_log_flush_head) {
+  		log_flush_wait(sdp);
+@@@ -709,8 -896,10 +762,10 @@@
+  	} else if (sdp->sd_log_tail != current_tail(sdp) && !sdp->sd_log_idle){
+  		atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
+  		trace_gfs2_log_blocks(sdp, -1);
+ -		log_write_header(sdp, flags);
+ +		log_write_header(sdp, 0);
+  	}
++ 	if (gfs2_withdrawn(sdp))
++ 		goto out;
+  	lops_after_commit(sdp, tr);
+  
+  	gfs2_log_lock(sdp);
+@@@ -725,7 -914,36 +780,40 @@@
+  	}
+  	spin_unlock(&sdp->sd_ail_lock);
+  	gfs2_log_unlock(sdp);
+++<<<<<<< HEAD
+ +	trace_gfs2_log_flush(sdp, 0);
+++=======
++ 
++ 	if (!(flags & GFS2_LOG_HEAD_FLUSH_NORMAL)) {
++ 		if (!sdp->sd_log_idle) {
++ 			for (;;) {
++ 				gfs2_ail1_start(sdp);
++ 				gfs2_ail1_wait(sdp);
++ 				if (gfs2_ail1_empty(sdp, 0))
++ 					break;
++ 			}
++ 			if (gfs2_withdrawn(sdp))
++ 				goto out;
++ 			atomic_dec(&sdp->sd_log_blks_free); /* Adjust for unreserved buffer */
++ 			trace_gfs2_log_blocks(sdp, -1);
++ 			log_write_header(sdp, flags);
++ 			sdp->sd_log_head = sdp->sd_log_flush_head;
++ 		}
++ 		if (flags & (GFS2_LOG_HEAD_FLUSH_SHUTDOWN |
++ 			     GFS2_LOG_HEAD_FLUSH_FREEZE))
++ 			gfs2_log_shutdown(sdp);
++ 		if (flags & GFS2_LOG_HEAD_FLUSH_FREEZE)
++ 			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
++ 	}
++ 
++ out:
++ 	if (gfs2_withdrawn(sdp)) {
++ 		ail_drain(sdp); /* frees all transactions */
++ 		tr = NULL;
++ 	}
++ 
++ 	trace_gfs2_log_flush(sdp, 0, flags);
+++>>>>>>> 2ca0c2fbf3ed (gfs2: drain the ail2 list after io errors)
+  	up_write(&sdp->sd_log_flush_lock);
+  
+  	kfree(tr);
+diff --cc fs/gfs2/trans.c
+index bd93fa2d7186,ffe840505082..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -255,6 -224,14 +255,17 @@@ void gfs2_trans_add_meta(struct gfs2_gl
+  		       (unsigned long long)bd->bd_bh->b_blocknr);
+  		BUG();
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(state == SFS_FROZEN)) {
++ 		fs_info(sdp, "GFS2:adding buf while frozen\n");
++ 		gfs2_assert_withdraw(sdp, 0);
++ 	}
++ 	if (unlikely(gfs2_withdrawn(sdp))) {
++ 		fs_info(sdp, "GFS2:adding buf while withdrawn! 0x%llx\n",
++ 			(unsigned long long)bd->bd_bh->b_blocknr);
++ 	}
+++>>>>>>> 2ca0c2fbf3ed (gfs2: drain the ail2 list after io errors)
+  	gfs2_pin(sdp, bd->bd_bh);
+  	mh->__pad0 = cpu_to_be64(0);
+  	mh->mh_jid = cpu_to_be32(sdp->sd_jdesc->jd_jid);
+* Unmerged path fs/gfs2/log.c
+* Unmerged path fs/gfs2/trans.c
