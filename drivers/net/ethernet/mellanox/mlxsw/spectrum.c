@@ -569,7 +569,7 @@ static void mlxsw_sp_span_entry_destroy(struct mlxsw_sp *mlxsw_sp,
 	span_entry->used = false;
 }
 
-static struct mlxsw_sp_span_entry *
+struct mlxsw_sp_span_entry *
 mlxsw_sp_span_entry_find(struct mlxsw_sp *mlxsw_sp, u8 local_port)
 {
 	int i;
@@ -670,13 +670,28 @@ mlxsw_sp_span_entry_bound_port_find(struct mlxsw_sp_port *port,
 static int
 mlxsw_sp_span_inspected_port_bind(struct mlxsw_sp_port *port,
 				  struct mlxsw_sp_span_entry *span_entry,
-				  enum mlxsw_sp_span_type type)
+				  enum mlxsw_sp_span_type type,
+				  bool bind)
+{
+	struct mlxsw_sp *mlxsw_sp = port->mlxsw_sp;
+	char mpar_pl[MLXSW_REG_MPAR_LEN];
+	int pa_id = span_entry->id;
+
+	/* bind the port to the SPAN entry */
+	mlxsw_reg_mpar_pack(mpar_pl, port->local_port,
+			    (enum mlxsw_reg_mpar_i_e) type, bind, pa_id);
+	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(mpar), mpar_pl);
+}
+
+static int
+mlxsw_sp_span_inspected_port_add(struct mlxsw_sp_port *port,
+				 struct mlxsw_sp_span_entry *span_entry,
+				 enum mlxsw_sp_span_type type,
+				 bool bind)
 {
 	struct mlxsw_sp_span_inspected_port *inspected_port;
 	struct mlxsw_sp *mlxsw_sp = port->mlxsw_sp;
-	char mpar_pl[MLXSW_REG_MPAR_LEN];
 	char sbib_pl[MLXSW_REG_SBIB_LEN];
-	int pa_id = span_entry->id;
 	int err;
 
 	/* if it is an egress SPAN, bind a shared buffer to it */
@@ -692,12 +707,12 @@ mlxsw_sp_span_inspected_port_bind(struct mlxsw_sp_port *port,
 		}
 	}
 
-	/* bind the port to the SPAN entry */
-	mlxsw_reg_mpar_pack(mpar_pl, port->local_port,
-			    (enum mlxsw_reg_mpar_i_e) type, true, pa_id);
-	err = mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(mpar), mpar_pl);
-	if (err)
-		goto err_mpar_reg_write;
+	if (bind) {
+		err = mlxsw_sp_span_inspected_port_bind(port, span_entry, type,
+							true);
+		if (err)
+			goto err_port_bind;
+	}
 
 	inspected_port = kzalloc(sizeof(*inspected_port), GFP_KERNEL);
 	if (!inspected_port) {
@@ -710,8 +725,11 @@ mlxsw_sp_span_inspected_port_bind(struct mlxsw_sp_port *port,
 
 	return 0;
 
-err_mpar_reg_write:
 err_inspected_port_alloc:
+	if (bind)
+		mlxsw_sp_span_inspected_port_bind(port, span_entry, type,
+						  false);
+err_port_bind:
 	if (type == MLXSW_SP_SPAN_EGRESS) {
 		mlxsw_reg_sbib_pack(sbib_pl, port->local_port, 0);
 		mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(sbib), sbib_pl);
@@ -720,25 +738,22 @@ err_inspected_port_alloc:
 }
 
 static void
-mlxsw_sp_span_inspected_port_unbind(struct mlxsw_sp_port *port,
-				    struct mlxsw_sp_span_entry *span_entry,
-				    enum mlxsw_sp_span_type type)
+mlxsw_sp_span_inspected_port_del(struct mlxsw_sp_port *port,
+				 struct mlxsw_sp_span_entry *span_entry,
+				 enum mlxsw_sp_span_type type,
+				 bool bind)
 {
 	struct mlxsw_sp_span_inspected_port *inspected_port;
 	struct mlxsw_sp *mlxsw_sp = port->mlxsw_sp;
-	char mpar_pl[MLXSW_REG_MPAR_LEN];
 	char sbib_pl[MLXSW_REG_SBIB_LEN];
-	int pa_id = span_entry->id;
 
 	inspected_port = mlxsw_sp_span_entry_bound_port_find(port, span_entry);
 	if (!inspected_port)
 		return;
 
-	/* remove the inspected port */
-	mlxsw_reg_mpar_pack(mpar_pl, port->local_port,
-			    (enum mlxsw_reg_mpar_i_e) type, false, pa_id);
-	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(mpar), mpar_pl);
-
+	if (bind)
+		mlxsw_sp_span_inspected_port_bind(port, span_entry, type,
+						  false);
 	/* remove the SBIB buffer if it was egress SPAN */
 	if (type == MLXSW_SP_SPAN_EGRESS) {
 		mlxsw_reg_sbib_pack(sbib_pl, port->local_port, 0);
@@ -751,9 +766,9 @@ mlxsw_sp_span_inspected_port_unbind(struct mlxsw_sp_port *port,
 	kfree(inspected_port);
 }
 
-static int mlxsw_sp_span_mirror_add(struct mlxsw_sp_port *from,
-				    struct mlxsw_sp_port *to,
-				    enum mlxsw_sp_span_type type)
+int mlxsw_sp_span_mirror_add(struct mlxsw_sp_port *from,
+			     struct mlxsw_sp_port *to,
+			     enum mlxsw_sp_span_type type, bool bind)
 {
 	struct mlxsw_sp *mlxsw_sp = from->mlxsw_sp;
 	struct mlxsw_sp_span_entry *span_entry;
@@ -766,7 +781,7 @@ static int mlxsw_sp_span_mirror_add(struct mlxsw_sp_port *from,
 	netdev_dbg(from->dev, "Adding inspected port to SPAN entry %d\n",
 		   span_entry->id);
 
-	err = mlxsw_sp_span_inspected_port_bind(from, span_entry, type);
+	err = mlxsw_sp_span_inspected_port_add(from, span_entry, type, bind);
 	if (err)
 		goto err_port_bind;
 
@@ -777,9 +792,8 @@ err_port_bind:
 	return err;
 }
 
-static void mlxsw_sp_span_mirror_remove(struct mlxsw_sp_port *from,
-					u8 destination_port,
-					enum mlxsw_sp_span_type type)
+void mlxsw_sp_span_mirror_del(struct mlxsw_sp_port *from, u8 destination_port,
+			      enum mlxsw_sp_span_type type, bool bind)
 {
 	struct mlxsw_sp_span_entry *span_entry;
 
@@ -792,7 +806,7 @@ static void mlxsw_sp_span_mirror_remove(struct mlxsw_sp_port *from,
 
 	netdev_dbg(from->dev, "removing inspected port from SPAN entry %d\n",
 		   span_entry->id);
-	mlxsw_sp_span_inspected_port_unbind(from, span_entry, type);
+	mlxsw_sp_span_inspected_port_del(from, span_entry, type, bind);
 }
 
 static int mlxsw_sp_port_sample_set(struct mlxsw_sp_port *mlxsw_sp_port,
@@ -1586,7 +1600,8 @@ mlxsw_sp_port_add_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
 	mirror->to_local_port = to_port->local_port;
 	mirror->ingress = ingress;
 	span_type = ingress ? MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
-	return mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_port, span_type);
+	return mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_port, span_type,
+					true);
 }
 
 static void
@@ -1597,8 +1612,8 @@ mlxsw_sp_port_del_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
 
 	span_type = mirror->ingress ?
 			MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
-	mlxsw_sp_span_mirror_remove(mlxsw_sp_port, mirror->to_local_port,
-				    span_type);
+	mlxsw_sp_span_mirror_del(mlxsw_sp_port, mirror->to_local_port,
+				 span_type, true);
 }
 
 static int
