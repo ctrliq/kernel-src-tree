@@ -1,0 +1,339 @@
+IB/hfi1: Modify handling of physical link state by Host Driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Byczkowski, Jakub <jakub.byczkowski@intel.com>
+commit bec7c79cd8f764ba84c8ec6d8c402b8a7cd3a54f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bec7c79c.failed
+
+Ensure states returned to the Fabric Manager are consistent with
+the OPA specification by caching the physical state along with the
+logical state.
+
+	Reviewed-by: Stuart Summers <john.s.summers@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Andrzej Kotlowski <andrzej.kotlowski@intel.com>
+	Signed-off-by: Jakub Byczkowski <jakub.byczkowski@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit bec7c79cd8f764ba84c8ec6d8c402b8a7cd3a54f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/driver.c
+diff --cc drivers/infiniband/hw/hfi1/driver.c
+index 500b129ed565,e64e9e28c936..000000000000
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@@ -932,16 -897,21 +932,28 @@@ static inline int set_armed_to_active(s
+  				      struct hfi1_devdata *dd)
+  {
+  	struct work_struct *lsaw = &rcd->ppd->linkstate_active_work;
+ +	struct ib_header *hdr = hfi1_get_msgheader(packet->rcd->dd,
+ +						   packet->rhf_addr);
+  	u8 etype = rhf_rcv_type(packet->rhf);
+ -	u8 sc = SC15_PACKET;
+  
+++<<<<<<< HEAD
+ +	if (etype == RHF_RCV_TYPE_IB &&
+ +	    hfi1_9B_get_sc5(hdr, packet->rhf) != 0xf) {
+ +		int hwstate = read_logical_state(dd);
+- 
+- 		if (hwstate != LSTATE_ACTIVE) {
+- 			dd_dev_info(dd, "Unexpected link state %d\n", hwstate);
+++=======
++ 	if (etype == RHF_RCV_TYPE_IB) {
++ 		struct ib_header *hdr = hfi1_get_msgheader(packet->rcd->dd,
++ 							   packet->rhf_addr);
++ 		sc = hfi1_9B_get_sc5(hdr, packet->rhf);
++ 	}
++ 	if (sc != SC15_PACKET) {
++ 		int hwstate = driver_lstate(rcd->ppd);
+++>>>>>>> bec7c79cd8f7 (IB/hfi1: Modify handling of physical link state by Host Driver)
++ 
++ 		if (hwstate != IB_PORT_ACTIVE) {
++ 			dd_dev_info(dd,
++ 				    "Unexpected link state %s\n",
++ 				    opa_lstate_name(hwstate));
+  			return 0;
+  		}
+  
+diff --git a/drivers/infiniband/hw/hfi1/chip.c b/drivers/infiniband/hw/hfi1/chip.c
+index da70f6bad3be..ed59d1ba2c27 100644
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -1066,6 +1066,8 @@ static int thermal_init(struct hfi1_devdata *dd);
+ 
+ static int wait_logical_linkstate(struct hfi1_pportdata *ppd, u32 state,
+ 				  int msecs);
++static int wait_physical_linkstate(struct hfi1_pportdata *ppd, u32 state,
++				   int msecs);
+ static void read_planned_down_reason_code(struct hfi1_devdata *dd, u8 *pdrrc);
+ static void read_link_down_reason(struct hfi1_devdata *dd, u8 *ldr);
+ static void handle_temp_err(struct hfi1_devdata *);
+@@ -10037,28 +10039,6 @@ static void set_lidlmc(struct hfi1_pportdata *ppd)
+ 	sdma_update_lmc(dd, mask, ppd->lid);
+ }
+ 
+-static int wait_phy_linkstate(struct hfi1_devdata *dd, u32 state, u32 msecs)
+-{
+-	unsigned long timeout;
+-	u32 curr_state;
+-
+-	timeout = jiffies + msecs_to_jiffies(msecs);
+-	while (1) {
+-		curr_state = read_physical_state(dd);
+-		if (curr_state == state)
+-			break;
+-		if (time_after(jiffies, timeout)) {
+-			dd_dev_err(dd,
+-				   "timeout waiting for phy link state 0x%x, current state is 0x%x\n",
+-				   state, curr_state);
+-			return -ETIMEDOUT;
+-		}
+-		usleep_range(1950, 2050); /* sleep 2ms-ish */
+-	}
+-
+-	return 0;
+-}
+-
+ static const char *state_completed_string(u32 completed)
+ {
+ 	static const char * const state_completed[] = {
+@@ -10292,7 +10272,7 @@ static int goto_offline(struct hfi1_pportdata *ppd, u8 rem_reason)
+ 
+ 	if (do_wait) {
+ 		/* it can take a while for the link to go down */
+-		ret = wait_phy_linkstate(dd, PLS_OFFLINE, 10000);
++		ret = wait_physical_linkstate(ppd, PLS_OFFLINE, 10000);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -10545,6 +10525,19 @@ int set_link_state(struct hfi1_pportdata *ppd, u32 state)
+ 			goto unexpected;
+ 		}
+ 
++		/*
++		 * Wait for Link_Up physical state.
++		 * Physical and Logical states should already be
++		 * be transitioned to LinkUp and LinkInit respectively.
++		 */
++		ret = wait_physical_linkstate(ppd, PLS_LINKUP, 1000);
++		if (ret) {
++			dd_dev_err(dd,
++				   "%s: physical state did not change to LINK-UP\n",
++				   __func__);
++			break;
++		}
++
+ 		ret = wait_logical_linkstate(ppd, IB_PORT_INIT, 1000);
+ 		if (ret) {
+ 			dd_dev_err(dd,
+@@ -10658,6 +10651,8 @@ int set_link_state(struct hfi1_pportdata *ppd, u32 state)
+ 		 */
+ 		if (ret)
+ 			goto_offline(ppd, 0);
++		else
++			cache_physical_state(ppd);
+ 		break;
+ 	case HLS_DN_DISABLE:
+ 		/* link is disabled */
+@@ -10682,6 +10677,13 @@ int set_link_state(struct hfi1_pportdata *ppd, u32 state)
+ 				ret = -EINVAL;
+ 				break;
+ 			}
++			ret = wait_physical_linkstate(ppd, PLS_DISABLED, 10000);
++			if (ret) {
++				dd_dev_err(dd,
++					   "%s: physical state did not change to DISABLED\n",
++					   __func__);
++				break;
++			}
+ 			dc_shutdown(dd);
+ 		}
+ 		ppd->host_link_state = HLS_DN_DISABLE;
+@@ -10699,6 +10701,7 @@ int set_link_state(struct hfi1_pportdata *ppd, u32 state)
+ 		if (ppd->host_link_state != HLS_DN_POLL)
+ 			goto unexpected;
+ 		ppd->host_link_state = HLS_VERIFY_CAP;
++		cache_physical_state(ppd);
+ 		break;
+ 	case HLS_GOING_UP:
+ 		if (ppd->host_link_state != HLS_VERIFY_CAP)
+@@ -12672,21 +12675,56 @@ static int wait_logical_linkstate(struct hfi1_pportdata *ppd, u32 state,
+ 	return -ETIMEDOUT;
+ }
+ 
+-u8 hfi1_ibphys_portstate(struct hfi1_pportdata *ppd)
++/*
++ * Read the physical hardware link state and set the driver's cached value
++ * of it.
++ */
++void cache_physical_state(struct hfi1_pportdata *ppd)
+ {
+-	u32 pstate;
++	u32 read_pstate;
+ 	u32 ib_pstate;
+ 
+-	pstate = read_physical_state(ppd->dd);
+-	ib_pstate = chip_to_opa_pstate(ppd->dd, pstate);
+-	if (ppd->last_pstate != ib_pstate) {
++	read_pstate = read_physical_state(ppd->dd);
++	ib_pstate = chip_to_opa_pstate(ppd->dd, read_pstate);
++	/* check if OPA pstate changed */
++	if (chip_to_opa_pstate(ppd->dd, ppd->pstate) != ib_pstate) {
+ 		dd_dev_info(ppd->dd,
+ 			    "%s: physical state changed to %s (0x%x), phy 0x%x\n",
+ 			    __func__, opa_pstate_name(ib_pstate), ib_pstate,
+-			    pstate);
+-		ppd->last_pstate = ib_pstate;
++			    read_pstate);
++	}
++	ppd->pstate = read_pstate;
++}
++
++/*
++ * wait_physical_linkstate - wait for an physical link state change to occur
++ * @ppd: port device
++ * @state: the state to wait for
++ * @msecs: the number of milliseconds to wait
++ *
++ * Wait up to msecs milliseconds for physical link state change to occur.
++ * Returns 0 if state reached, otherwise -ETIMEDOUT.
++ */
++static int wait_physical_linkstate(struct hfi1_pportdata *ppd, u32 state,
++				   int msecs)
++{
++	unsigned long timeout;
++
++	timeout = jiffies + msecs_to_jiffies(msecs);
++	while (1) {
++		cache_physical_state(ppd);
++		if (ppd->pstate == state)
++			break;
++		if (time_after(jiffies, timeout)) {
++			dd_dev_err(ppd->dd,
++				   "timeout waiting for phy link state 0x%x, current state is 0x%x\n",
++				   state, ppd->pstate);
++			return -ETIMEDOUT;
++		}
++		usleep_range(1950, 2050); /* sleep 2ms-ish */
+ 	}
+-	return ib_pstate;
++
++	return 0;
+ }
+ 
+ #define CLEAR_STATIC_RATE_CONTROL_SMASK(r) \
+@@ -14794,7 +14832,7 @@ struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+ 		/* start in offline */
+ 		ppd->host_link_state = HLS_DN_OFFLINE;
+ 		init_vl_arb_caches(ppd);
+-		ppd->last_pstate = 0xff; /* invalid value */
++		ppd->pstate = PLS_OFFLINE;
+ 	}
+ 
+ 	dd->link_default = HLS_DN_POLL;
+diff --git a/drivers/infiniband/hw/hfi1/chip.h b/drivers/infiniband/hw/hfi1/chip.h
+index 8a7b218d745f..933b333c5858 100644
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@ -742,6 +742,7 @@ int is_bx(struct hfi1_devdata *dd);
+ u32 read_physical_state(struct hfi1_devdata *dd);
+ u32 chip_to_opa_pstate(struct hfi1_devdata *dd, u32 chip_pstate);
+ u32 get_logical_state(struct hfi1_pportdata *ppd);
++void cache_physical_state(struct hfi1_pportdata *ppd);
+ const char *opa_lstate_name(u32 lstate);
+ const char *opa_pstate_name(u32 pstate);
+ u32 driver_physical_state(struct hfi1_pportdata *ppd);
+@@ -1354,7 +1355,6 @@ void hfi1_quiet_serdes(struct hfi1_pportdata *ppd);
+ void hfi1_rcvctrl(struct hfi1_devdata *dd, unsigned int op, int ctxt);
+ u32 hfi1_read_cntrs(struct hfi1_devdata *dd, char **namep, u64 **cntrp);
+ u32 hfi1_read_portcntrs(struct hfi1_pportdata *ppd, char **namep, u64 **cntrp);
+-u8 hfi1_ibphys_portstate(struct hfi1_pportdata *ppd);
+ int hfi1_get_ib_cfg(struct hfi1_pportdata *ppd, int which);
+ int hfi1_set_ib_cfg(struct hfi1_pportdata *ppd, int which, u32 val);
+ int hfi1_set_ctxt_jkey(struct hfi1_devdata *dd, unsigned ctxt, u16 jkey);
+* Unmerged path drivers/infiniband/hw/hfi1/driver.c
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 9e4a63b05006..4485ba4f36d8 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -661,7 +661,7 @@ struct hfi1_pportdata {
+ 	u8 link_enabled;	/* link enabled? */
+ 	u8 linkinit_reason;
+ 	u8 local_tx_rate;	/* rate given to 8051 firmware */
+-	u8 last_pstate;		/* info only */
++	u8 pstate;		/* info only */
+ 	u8 qsfp_retry_count;
+ 
+ 	/* placeholders for IB MAD packet settings */
+@@ -1327,6 +1327,22 @@ static inline u32 driver_lstate(struct hfi1_pportdata *ppd)
+ 		return ppd->lstate;
+ }
+ 
++/* return the driver's idea of the physical OPA port state */
++static inline u32 driver_pstate(struct hfi1_pportdata *ppd)
++{
++	/*
++	 * The driver does some processing from the time the physical
++	 * link state is at LINKUP to the time the SM can be notified
++	 * as such. Return IB_PORTPHYSSTATE_TRAINING until the software
++	 * state is ready.
++	 */
++	if (ppd->pstate == PLS_LINKUP &&
++	    !(ppd->host_link_state & HLS_UP))
++		return IB_PORTPHYSSTATE_TRAINING;
++	else
++		return chip_to_opa_pstate(ppd->dd, ppd->pstate);
++}
++
+ void receive_interrupt_work(struct work_struct *work);
+ 
+ /* extract service channel from header and rhf */
+diff --git a/drivers/infiniband/hw/hfi1/mad.c b/drivers/infiniband/hw/hfi1/mad.c
+index d59426fb9866..a989f201fab6 100644
+--- a/drivers/infiniband/hw/hfi1/mad.c
++++ b/drivers/infiniband/hw/hfi1/mad.c
+@@ -113,7 +113,7 @@ static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
+ 		return;
+ 
+ 	/* o14-3.2.1 */
+-	if (ppd_from_ibp(ibp)->lstate != IB_PORT_ACTIVE)
++	if (driver_lstate(ppd_from_ibp(ibp)) != IB_PORT_ACTIVE)
+ 		return;
+ 
+ 	/* o14-2 */
+@@ -615,7 +615,7 @@ static int __subn_get_opa_portinfo(struct opa_smp *smp, u32 am, u8 *data,
+ 		ppd->offline_disabled_reason;
+ 
+ 	pi->port_states.portphysstate_portstate =
+-		(hfi1_ibphys_portstate(ppd) << 4) | state;
++		(driver_pstate(ppd) << 4) | state;
+ 
+ 	pi->mkeyprotect_lmc = (ibp->rvp.mkeyprot << 6) | ppd->lmc;
+ 
+@@ -1791,7 +1791,7 @@ static int __subn_get_opa_psi(struct opa_smp *smp, u32 am, u8 *data,
+ 		ppd->offline_disabled_reason;
+ 
+ 	psi->port_states.portphysstate_portstate =
+-		(hfi1_ibphys_portstate(ppd) << 4) | (lstate & 0xf);
++		(driver_pstate(ppd) << 4) | (lstate & 0xf);
+ 	psi->link_width_downgrade_tx_active =
+ 		cpu_to_be16(ppd->link_width_downgrade_tx_active);
+ 	psi->link_width_downgrade_rx_active =
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index 06ac08cf82a6..ff5500e7a507 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -1366,7 +1366,7 @@ static int query_port(struct rvt_dev_info *rdi, u8 port_num,
+ 	props->lmc = ppd->lmc;
+ 	/* OPA logical states match IB logical states */
+ 	props->state = driver_lstate(ppd);
+-	props->phys_state = hfi1_ibphys_portstate(ppd);
++	props->phys_state = driver_pstate(ppd);
+ 	props->gid_tbl_len = HFI1_GUIDS_PER_PORT;
+ 	props->active_width = (u8)opa_width_to_ib(ppd->link_width_active);
+ 	/* see rate_show() in ib core/sysfs.c */
