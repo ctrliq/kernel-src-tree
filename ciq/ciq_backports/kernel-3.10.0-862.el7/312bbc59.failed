@@ -1,0 +1,249 @@
+SMB3: Rename clone_range to copychunk_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sachin Prabhu <sprabhu@redhat.com>
+commit 312bbc5946c4b73dfc1d64c1dd5b0f9df8016587
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/312bbc59.failed
+
+Server side copy is one of the most important mechanisms smb2/smb3
+supports and it was unintentionally disabled for most use cases.
+
+Renaming calls to reflect the underlying smb2 ioctl called. This is
+similar to the name duplicate_extents used for a similar ioctl which is
+also used to duplicate files by reusing fs blocks. The name change is to
+avoid confusion.
+
+	Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
+CC: Stable <stable@vger.kernel.org>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+	Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
+(cherry picked from commit 312bbc5946c4b73dfc1d64c1dd5b0f9df8016587)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/ioctl.c
+diff --cc fs/cifs/ioctl.c
+index 22af9a25cf09,9bf0f94fae63..000000000000
+--- a/fs/cifs/ioctl.c
++++ b/fs/cifs/ioctl.c
+@@@ -34,20 -34,71 +34,82 @@@
+  #include "cifs_ioctl.h"
+  #include <linux/btrfs.h>
+  
+++<<<<<<< HEAD
+ +static long cifs_ioctl_clone(unsigned int xid, struct file *dst_file,
+ +			unsigned long srcfd, u64 off, u64 len, u64 destoff,
+ +			bool dup_extents)
+++=======
++ static int cifs_file_copychunk_range(unsigned int xid, struct file *src_file,
++ 			  struct file *dst_file)
++ {
++ 	struct inode *src_inode = file_inode(src_file);
++ 	struct inode *target_inode = file_inode(dst_file);
++ 	struct cifsFileInfo *smb_file_src;
++ 	struct cifsFileInfo *smb_file_target;
++ 	struct cifs_tcon *src_tcon;
++ 	struct cifs_tcon *target_tcon;
++ 	int rc;
++ 
++ 	cifs_dbg(FYI, "ioctl copychunk range\n");
++ 
++ 	if (!src_file->private_data || !dst_file->private_data) {
++ 		rc = -EBADF;
++ 		cifs_dbg(VFS, "missing cifsFileInfo on copy range src file\n");
++ 		goto out;
++ 	}
++ 
++ 	rc = -EXDEV;
++ 	smb_file_target = dst_file->private_data;
++ 	smb_file_src = src_file->private_data;
++ 	src_tcon = tlink_tcon(smb_file_src->tlink);
++ 	target_tcon = tlink_tcon(smb_file_target->tlink);
++ 
++ 	if (src_tcon->ses != target_tcon->ses) {
++ 		cifs_dbg(VFS, "source and target of copy not on same server\n");
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Note: cifs case is easier than btrfs since server responsible for
++ 	 * checks for proper open modes and file type and if it wants
++ 	 * server could even support copy of range where source = target
++ 	 */
++ 	lock_two_nondirectories(target_inode, src_inode);
++ 
++ 	cifs_dbg(FYI, "about to flush pages\n");
++ 	/* should we flush first and last page first */
++ 	truncate_inode_pages(&target_inode->i_data, 0);
++ 
++ 	if (target_tcon->ses->server->ops->copychunk_range)
++ 		rc = target_tcon->ses->server->ops->copychunk_range(xid,
++ 			smb_file_src, smb_file_target, 0, src_inode->i_size, 0);
++ 	else
++ 		rc = -EOPNOTSUPP;
++ 
++ 	/* force revalidate of size and timestamps of target file now
++ 	   that target is updated on the server */
++ 	CIFS_I(target_inode)->time = 0;
++ 	/* although unlocking in the reverse order from locking is not
++ 	   strictly necessary here it is a little cleaner to be consistent */
++ 	unlock_two_nondirectories(src_inode, target_inode);
++ out:
++ 	return rc;
++ }
++ 
++ static long cifs_ioctl_copychunk(unsigned int xid, struct file *dst_file,
++ 			unsigned long srcfd)
+++>>>>>>> 312bbc5946c4 (SMB3: Rename clone_range to copychunk_range)
+  {
+  	int rc;
+ +	struct cifsFileInfo *smb_file_target = dst_file->private_data;
+ +	struct inode *target_inode = file_inode(dst_file);
+ +	struct cifs_tcon *target_tcon;
+  	struct fd src_file;
+ +	struct cifsFileInfo *smb_file_src;
+  	struct inode *src_inode;
+ +	struct cifs_tcon *src_tcon;
+  
+- 	cifs_dbg(FYI, "ioctl clone range\n");
++ 	cifs_dbg(FYI, "ioctl copychunk range\n");
+  	/* the destination must be opened for writing */
+  	if (!(dst_file->f_mode & FMODE_WRITE)) {
+  		cifs_dbg(FYI, "file target not open for write\n");
+@@@ -101,41 -129,8 +163,45 @@@
+  	if (S_ISDIR(src_inode->i_mode))
+  		goto out_fput;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Note: cifs case is easier than btrfs since server responsible for
+ +	 * checks for proper open modes and file type and if it wants
+ +	 * server could even support copy of range where source = target
+ +	 */
+ +	lock_two_nondirectories(target_inode, src_inode);
+++=======
++ 	rc = cifs_file_copychunk_range(xid, src_file.file, dst_file);
+++>>>>>>> 312bbc5946c4 (SMB3: Rename clone_range to copychunk_range)
+ +
+ +	/* determine range to clone */
+ +	rc = -EINVAL;
+ +	if (off + len > src_inode->i_size || off + len < off)
+ +		goto out_unlock;
+ +	if (len == 0)
+ +		len = src_inode->i_size - off;
+ +
+ +	cifs_dbg(FYI, "about to flush pages\n");
+ +	/* should we flush first and last page first */
+ +	truncate_inode_pages_range(&target_inode->i_data, destoff,
+ +				   PAGE_CACHE_ALIGN(destoff + len)-1);
+  
+ +	if (dup_extents && target_tcon->ses->server->ops->duplicate_extents)
+ +		rc = target_tcon->ses->server->ops->duplicate_extents(xid,
+ +			smb_file_src, smb_file_target, off, len, destoff);
+ +	else if (!dup_extents && target_tcon->ses->server->ops->clone_range)
+ +		rc = target_tcon->ses->server->ops->clone_range(xid,
+ +			smb_file_src, smb_file_target, off, len, destoff);
+ +	else
+ +		rc = -EOPNOTSUPP;
+ +
+ +	/* force revalidate of size and timestamps of target file now
+ +	   that target is updated on the server */
+ +	CIFS_I(target_inode)->time = 0;
+ +out_unlock:
+ +	/* although unlocking in the reverse order from locking is not
+ +	   strictly necessary here it is a little cleaner to be consistent */
+ +	unlock_two_nondirectories(src_inode, target_inode);
+  out_fput:
+  	fdput(src_file);
+  out_drop_write:
+@@@ -256,10 -251,7 +322,14 @@@ long cifs_ioctl(struct file *filep, uns
+  			}
+  			break;
+  		case CIFS_IOC_COPYCHUNK_FILE:
+++<<<<<<< HEAD
+ +			rc = cifs_ioctl_clone(xid, filep, arg, 0, 0, 0, false);
+ +			break;
+ +		case BTRFS_IOC_CLONE:
+ +			rc = cifs_ioctl_clone(xid, filep, arg, 0, 0, 0, true);
+++=======
++ 			rc = cifs_ioctl_copychunk(xid, filep, arg);
+++>>>>>>> 312bbc5946c4 (SMB3: Rename clone_range to copychunk_range)
+  			break;
+  		case CIFS_IOC_SET_INTEGRITY:
+  			if (pSMBFile == NULL)
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index 2d53c6a224e6..692cfdc5999e 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -406,7 +406,8 @@ struct smb_version_operations {
+ 	char * (*create_lease_buf)(u8 *, u8);
+ 	/* parse lease context buffer and return oplock/epoch info */
+ 	__u8 (*parse_lease_buf)(void *, unsigned int *);
+-	int (*clone_range)(const unsigned int, struct cifsFileInfo *src_file,
++	int (*copychunk_range)(const unsigned int,
++			struct cifsFileInfo *src_file,
+ 			struct cifsFileInfo *target_file, u64 src_off, u64 len,
+ 			u64 dest_off);
+ 	int (*duplicate_extents)(const unsigned int, struct cifsFileInfo *src,
+* Unmerged path fs/cifs/ioctl.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 5d456ebb3813..3dfd9258c8ec 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -587,7 +587,7 @@ req_res_key_exit:
+ }
+ 
+ static int
+-smb2_clone_range(const unsigned int xid,
++smb2_copychunk_range(const unsigned int xid,
+ 			struct cifsFileInfo *srcfile,
+ 			struct cifsFileInfo *trgtfile, u64 src_off,
+ 			u64 len, u64 dest_off)
+@@ -605,7 +605,7 @@ smb2_clone_range(const unsigned int xid,
+ 	if (pcchunk == NULL)
+ 		return -ENOMEM;
+ 
+-	cifs_dbg(FYI, "in smb2_clone_range - about to call request res key\n");
++	cifs_dbg(FYI, "in smb2_copychunk_range - about to call request res key\n");
+ 	/* Request a key from the server to identify the source of the copy */
+ 	rc = SMB2_request_res_key(xid, tlink_tcon(srcfile->tlink),
+ 				srcfile->fid.persistent_fid,
+@@ -1620,7 +1620,7 @@ struct smb_version_operations smb20_operations = {
+ 	.set_oplock_level = smb2_set_oplock_level,
+ 	.create_lease_buf = smb2_create_lease_buf,
+ 	.parse_lease_buf = smb2_parse_lease_buf,
+-	.clone_range = smb2_clone_range,
++	.copychunk_range = smb2_copychunk_range,
+ 	.wp_retry_size = smb2_wp_retry_size,
+ 	.dir_needs_close = smb2_dir_needs_close,
+ };
+@@ -1700,7 +1700,7 @@ struct smb_version_operations smb21_operations = {
+ 	.set_oplock_level = smb21_set_oplock_level,
+ 	.create_lease_buf = smb2_create_lease_buf,
+ 	.parse_lease_buf = smb2_parse_lease_buf,
+-	.clone_range = smb2_clone_range,
++	.copychunk_range = smb2_copychunk_range,
+ 	.wp_retry_size = smb2_wp_retry_size,
+ 	.dir_needs_close = smb2_dir_needs_close,
+ 	.enum_snapshots = smb3_enum_snapshots,
+@@ -1784,7 +1784,7 @@ struct smb_version_operations smb30_operations = {
+ 	.set_oplock_level = smb3_set_oplock_level,
+ 	.create_lease_buf = smb3_create_lease_buf,
+ 	.parse_lease_buf = smb3_parse_lease_buf,
+-	.clone_range = smb2_clone_range,
++	.copychunk_range = smb2_copychunk_range,
+ 	.duplicate_extents = smb2_duplicate_extents,
+ 	.validate_negotiate = smb3_validate_negotiate,
+ 	.wp_retry_size = smb2_wp_retry_size,
+@@ -1872,7 +1872,7 @@ struct smb_version_operations smb311_operations = {
+ 	.set_oplock_level = smb3_set_oplock_level,
+ 	.create_lease_buf = smb3_create_lease_buf,
+ 	.parse_lease_buf = smb3_parse_lease_buf,
+-	.clone_range = smb2_clone_range,
++	.copychunk_range = smb2_copychunk_range,
+ 	.duplicate_extents = smb2_duplicate_extents,
+ /*	.validate_negotiate = smb3_validate_negotiate, */ /* not used in 3.11 */
+ 	.wp_retry_size = smb2_wp_retry_size,
