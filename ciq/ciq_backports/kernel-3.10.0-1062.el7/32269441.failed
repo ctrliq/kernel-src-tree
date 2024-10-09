@@ -1,0 +1,435 @@
+IB/mlx5: Introduce driver create and destroy flow methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 32269441240064c7475241ae28fee787fcdf55b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/32269441.failed
+
+Introduce driver create and destroy flow methods on the uverbs flow
+object.
+
+This allows the driver to get its specific device attributes to match the
+underlay specification while still using the generic ib_flow object for
+cleanup and code sharing.
+
+The IB object's attributes are set via the ib_set_flow() helper function.
+
+The specific implementation for the given specification is added in
+downstream patches.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 32269441240064c7475241ae28fee787fcdf55b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/infiniband/hw/mlx5/flow.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	include/rdma/uverbs_named_ioctl.h
+#	include/uapi/rdma/mlx5_user_ioctl_cmds.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 71eefd2f6d5f,6c8b4745fb0b..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3325,6 -3641,179 +3325,182 @@@ unlock
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ib_flow_handler *
++ mlx5_ib_raw_fs_rule_add(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_flow_matcher *fs_matcher,
++ 			void *cmd_in, int inlen, int dest_id,
++ 			int dest_type)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static u32 mlx5_ib_flow_action_flags_to_accel_xfrm_flags(u32 mlx5_flags)
++ {
++ 	u32 flags = 0;
++ 
++ 	if (mlx5_flags & MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA)
++ 		flags |= MLX5_ACCEL_XFRM_FLAG_REQUIRE_METADATA;
++ 
++ 	return flags;
++ }
++ 
++ #define MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED	MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA
++ static struct ib_flow_action *
++ mlx5_ib_create_flow_action_esp(struct ib_device *device,
++ 			       const struct ib_flow_action_attrs_esp *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_dev *mdev = to_mdev(device);
++ 	struct ib_uverbs_flow_action_esp_keymat_aes_gcm *aes_gcm;
++ 	struct mlx5_accel_esp_xfrm_attrs accel_attrs = {};
++ 	struct mlx5_ib_flow_action *action;
++ 	u64 action_flags;
++ 	u64 flags;
++ 	int err = 0;
++ 
++ 	if (IS_UVERBS_COPY_ERR(uverbs_copy_from(&action_flags, attrs,
++ 						MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS)))
++ 		return ERR_PTR(-EFAULT);
++ 
++ 	if (action_flags >= (MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED << 1))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	flags = mlx5_ib_flow_action_flags_to_accel_xfrm_flags(action_flags);
++ 
++ 	/* We current only support a subset of the standard features. Only a
++ 	 * keymat of type AES_GCM, with icv_len == 16, iv_algo == SEQ and esn
++ 	 * (with overlap). Full offload mode isn't supported.
++ 	 */
++ 	if (!attr->keymat || attr->replay || attr->encap ||
++ 	    attr->spi || attr->seq || attr->tfc_pad ||
++ 	    attr->hard_limit_pkts ||
++ 	    (attr->flags & ~(IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			     IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (attr->keymat->protocol !=
++ 	    IB_UVERBS_FLOW_ACTION_ESP_KEYMAT_AES_GCM)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	aes_gcm = &attr->keymat->keymat.aes_gcm;
++ 
++ 	if (aes_gcm->icv_len != 16 ||
++ 	    aes_gcm->iv_algo != IB_UVERBS_FLOW_ACTION_IV_ALGO_SEQ)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	action = kmalloc(sizeof(*action), GFP_KERNEL);
++ 	if (!action)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	action->esp_aes_gcm.ib_flags = attr->flags;
++ 	memcpy(&accel_attrs.keymat.aes_gcm.aes_key, &aes_gcm->aes_key,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.aes_key));
++ 	accel_attrs.keymat.aes_gcm.key_len = aes_gcm->key_len * 8;
++ 	memcpy(&accel_attrs.keymat.aes_gcm.salt, &aes_gcm->salt,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.salt));
++ 	memcpy(&accel_attrs.keymat.aes_gcm.seq_iv, &aes_gcm->iv,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.seq_iv));
++ 	accel_attrs.keymat.aes_gcm.icv_len = aes_gcm->icv_len * 8;
++ 	accel_attrs.keymat.aes_gcm.iv_algo = MLX5_ACCEL_ESP_AES_GCM_IV_ALGO_SEQ;
++ 	accel_attrs.keymat_type = MLX5_ACCEL_ESP_KEYMAT_AES_GCM;
++ 
++ 	accel_attrs.esn = attr->esn;
++ 	if (attr->flags & IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_TRIGGERED;
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)
++ 		accel_attrs.action |= MLX5_ACCEL_ESP_ACTION_ENCRYPT;
++ 
++ 	action->esp_aes_gcm.ctx =
++ 		mlx5_accel_esp_create_xfrm(mdev->mdev, &accel_attrs, flags);
++ 	if (IS_ERR(action->esp_aes_gcm.ctx)) {
++ 		err = PTR_ERR(action->esp_aes_gcm.ctx);
++ 		goto err_parse;
++ 	}
++ 
++ 	action->esp_aes_gcm.ib_flags = attr->flags;
++ 
++ 	return &action->ib_action;
++ 
++ err_parse:
++ 	kfree(action);
++ 	return ERR_PTR(err);
++ }
++ 
++ static int
++ mlx5_ib_modify_flow_action_esp(struct ib_flow_action *action,
++ 			       const struct ib_flow_action_attrs_esp *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_flow_action *maction = to_mflow_act(action);
++ 	struct mlx5_accel_esp_xfrm_attrs accel_attrs;
++ 	int err = 0;
++ 
++ 	if (attr->keymat || attr->replay || attr->encap ||
++ 	    attr->spi || attr->seq || attr->tfc_pad ||
++ 	    attr->hard_limit_pkts ||
++ 	    (attr->flags & ~(IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			     IB_FLOW_ACTION_ESP_FLAGS_MOD_ESP_ATTRS |
++ 			     IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)))
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Only the ESN value or the MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP can
++ 	 * be modified.
++ 	 */
++ 	if (!(maction->esp_aes_gcm.ib_flags &
++ 	      IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED) &&
++ 	    attr->flags & (IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			   IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW))
++ 		return -EINVAL;
++ 
++ 	memcpy(&accel_attrs, &maction->esp_aes_gcm.ctx->attrs,
++ 	       sizeof(accel_attrs));
++ 
++ 	accel_attrs.esn = attr->esn;
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 	else
++ 		accel_attrs.flags &= ~MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 
++ 	err = mlx5_accel_esp_modify_xfrm(maction->esp_aes_gcm.ctx,
++ 					 &accel_attrs);
++ 	if (err)
++ 		return err;
++ 
++ 	maction->esp_aes_gcm.ib_flags &=
++ 		~IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW;
++ 	maction->esp_aes_gcm.ib_flags |=
++ 		attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW;
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5_ib_destroy_flow_action(struct ib_flow_action *action)
++ {
++ 	struct mlx5_ib_flow_action *maction = to_mflow_act(action);
++ 
++ 	switch (action->type) {
++ 	case IB_FLOW_ACTION_ESP:
++ 		/*
++ 		 * We only support aes_gcm by now, so we implicitly know this is
++ 		 * the underline crypto.
++ 		 */
++ 		mlx5_accel_esp_destroy_xfrm(maction->esp_aes_gcm.ctx);
++ 		break;
++ 	default:
++ 		WARN_ON(true);
++ 		break;
++ 	}
++ 
++ 	kfree(maction);
++ 	return 0;
++ }
++ 
+++>>>>>>> 322694412400 (IB/mlx5: Introduce driver create and destroy flow methods)
+  static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+  {
+  	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 71b1991d86b3,324f4ea5fce6..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -1092,6 -1224,36 +1092,39 @@@ struct mlx5_core_dev *mlx5_ib_get_nativ
+  void mlx5_ib_put_native_port_mdev(struct mlx5_ib_dev *dev,
+  				  u8 port_num);
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
++ int mlx5_ib_devx_create(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_ucontext *context);
++ void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev,
++ 			  struct mlx5_ib_ucontext *context);
++ const struct uverbs_object_tree_def *mlx5_ib_get_devx_tree(void);
++ struct mlx5_ib_flow_handler *mlx5_ib_raw_fs_rule_add(
++ 	struct mlx5_ib_dev *dev, struct mlx5_ib_flow_matcher *fs_matcher,
++ 	void *cmd_in, int inlen, int dest_id, int dest_type);
++ bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id, int *dest_type);
++ #else
++ static inline int
++ mlx5_ib_devx_create(struct mlx5_ib_dev *dev,
++ 		    struct mlx5_ib_ucontext *context) { return -EOPNOTSUPP; };
++ static inline void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev,
++ 					struct mlx5_ib_ucontext *context) {}
++ static inline const struct uverbs_object_tree_def *
++ mlx5_ib_get_devx_tree(void) { return NULL; }
++ static inline struct mlx5_ib_flow_handler *mlx5_ib_raw_fs_rule_add(
++ 	struct mlx5_ib_dev *dev, struct mlx5_ib_flow_matcher *fs_matcher,
++ 	void *cmd_in, int inlen, int dest_id, int dest_type)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ static inline bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id,
++ 					     int *dest_type)
++ {
++ 	return false;
++ }
++ #endif
+++>>>>>>> 322694412400 (IB/mlx5: Introduce driver create and destroy flow methods)
+  static inline void init_query_mad(struct ib_smp *mad)
+  {
+  	mad->base_version  = 1;
+diff --cc include/rdma/uverbs_named_ioctl.h
+index 228421f2a427,b3b21733cc55..000000000000
+--- a/include/rdma/uverbs_named_ioctl.h
++++ b/include/rdma/uverbs_named_ioctl.h
+@@@ -45,50 -45,87 +45,92 @@@
+  #define UVERBS_HANDLER(id)	_UVERBS_NAME(UVERBS_MODULE_NAME, _handler_##id)
+  #define UVERBS_OBJECT(id)	_UVERBS_NAME(UVERBS_MOUDLE_NAME, _object_##id)
+  
+ -/* These are static so they do not need to be qualified */
+ -#define UVERBS_METHOD_ATTRS(method_id) _method_attrs_##method_id
+ -#define UVERBS_OBJECT_METHODS(object_id) _object_methods_##object_id
+ +#define DECLARE_UVERBS_NAMED_METHOD(id, ...)	\
+ +	DECLARE_UVERBS_METHOD(UVERBS_METHOD(id), id, UVERBS_HANDLER(id), ##__VA_ARGS__)
+  
+ -#define DECLARE_UVERBS_NAMED_METHOD(_method_id, ...)                           \
+ -	static const struct uverbs_attr_def *const UVERBS_METHOD_ATTRS(        \
+ -		_method_id)[] = { __VA_ARGS__ };                               \
+ -	static const struct uverbs_method_def UVERBS_METHOD(_method_id) = {    \
+ -		.id = _method_id,                                              \
+ -		.handler = UVERBS_HANDLER(_method_id),                         \
+ -		.num_attrs = ARRAY_SIZE(UVERBS_METHOD_ATTRS(_method_id)),      \
+ -		.attrs = &UVERBS_METHOD_ATTRS(_method_id),                     \
+ -	}
+ +#define DECLARE_UVERBS_NAMED_METHOD_WITH_HANDLER(id, handler, ...)	\
+ +	DECLARE_UVERBS_METHOD(UVERBS_METHOD(id), id, handler, ##__VA_ARGS__)
+  
+ -/* Create a standard destroy method using the default handler. The handle_attr
+ - * argument must be the attribute specifying the handle to destroy, the
+ - * default handler does not support any other attributes.
+ - */
+ -#define DECLARE_UVERBS_NAMED_METHOD_DESTROY(_method_id, _handle_attr)          \
+ -	static const struct uverbs_attr_def *const UVERBS_METHOD_ATTRS(        \
+ -		_method_id)[] = { _handle_attr };                              \
+ -	static const struct uverbs_method_def UVERBS_METHOD(_method_id) = {    \
+ -		.id = _method_id,                                              \
+ -		.handler = uverbs_destroy_def_handler,                         \
+ -		.num_attrs = ARRAY_SIZE(UVERBS_METHOD_ATTRS(_method_id)),      \
+ -		.attrs = &UVERBS_METHOD_ATTRS(_method_id),                     \
+ -	}
+ +#define DECLARE_UVERBS_NAMED_METHOD_NO_OVERRIDE(id, handler, ...)	\
+ +	DECLARE_UVERBS_METHOD(UVERBS_METHOD(id), id, NULL, ##__VA_ARGS__)
+  
+ -#define DECLARE_UVERBS_NAMED_OBJECT(_object_id, _type_attrs, ...)              \
+ -	static const struct uverbs_method_def *const UVERBS_OBJECT_METHODS(    \
+ -		_object_id)[] = { __VA_ARGS__ };                               \
+ -	const struct uverbs_object_def UVERBS_OBJECT(_object_id) = {           \
+ -		.id = _object_id,                                              \
+ -		.type_attrs = &_type_attrs,                                    \
+ -		.num_methods = ARRAY_SIZE(UVERBS_OBJECT_METHODS(_object_id)),  \
+ -		.methods = &UVERBS_OBJECT_METHODS(_object_id)                  \
+ -	}
+ +#define DECLARE_UVERBS_NAMED_OBJECT(id, ...)	\
+ +	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT(id), id, ##__VA_ARGS__)
+  
+ -/*
+ - * Declare global methods. These still have a unique object_id because we
+ - * identify all uapi methods with a (object,method) tuple. However, they have
+ - * no type pointer.
+ +#define DECLARE_UVERBS_GLOBAL_METHODS(_name, ...)	\
+ +	DECLARE_UVERBS_NAMED_OBJECT(_name, NULL, ##__VA_ARGS__)
+ +
+ +#define _UVERBS_COMP_NAME(x, y, z) _UVERBS_NAME(_UVERBS_NAME(x, y), z)
+ +
+ +#define UVERBS_NO_OVERRIDE	NULL
+ +
+ +/* This declares a parsing tree with one object and one method. This is usually
+ + * used for merging driver attributes to the common attributes. The driver has
+ + * a chance to override the handler and type attrs of the original object.
+ + * The __VA_ARGS__ just contains a list of attributes.
+ + */
+ +#define ADD_UVERBS_ATTRIBUTES(_name, _object, _method, _type_attrs, _handler, ...) \
+ +static DECLARE_UVERBS_METHOD(_UVERBS_COMP_NAME(UVERBS_MODULE_NAME,	     \
+ +					       _method_, _name),	     \
+ +			     _method, _handler, ##__VA_ARGS__);		     \
+ +									     \
+ +static DECLARE_UVERBS_OBJECT(_UVERBS_COMP_NAME(UVERBS_MODULE_NAME,	     \
+ +					       _object_, _name),	     \
+ +			     _object, _type_attrs,			     \
+ +			     &_UVERBS_COMP_NAME(UVERBS_MODULE_NAME,	     \
+ +					       _method_, _name));	     \
+ +									     \
+ +static DECLARE_UVERBS_OBJECT_TREE(_name,				     \
+ +				  &_UVERBS_COMP_NAME(UVERBS_MODULE_NAME,     \
+ +						     _object_, _name))
+ +
+ +/* A very common use case is that the driver doesn't override the handler and
+ + * type_attrs. Therefore, we provide a simplified macro for this common case.
+   */
+++<<<<<<< HEAD
+ +#define ADD_UVERBS_ATTRIBUTES_SIMPLE(_name, _object, _method, ...)	     \
+ +	ADD_UVERBS_ATTRIBUTES(_name, _object, _method, UVERBS_NO_OVERRIDE,   \
+ +			      UVERBS_NO_OVERRIDE, ##__VA_ARGS__)
+++=======
++ #define DECLARE_UVERBS_GLOBAL_METHODS(_object_id, ...)	\
++ 	static const struct uverbs_method_def *const UVERBS_OBJECT_METHODS(    \
++ 		_object_id)[] = { __VA_ARGS__ };                               \
++ 	const struct uverbs_object_def UVERBS_OBJECT(_object_id) = {           \
++ 		.id = _object_id,                                              \
++ 		.num_methods = ARRAY_SIZE(UVERBS_OBJECT_METHODS(_object_id)),  \
++ 		.methods = &UVERBS_OBJECT_METHODS(_object_id)                  \
++ 	}
++ 
++ /* Used by drivers to declare a complete parsing tree for new methods
++  */
++ #define ADD_UVERBS_METHODS(_name, _object_id, ...)                             \
++ 	static const struct uverbs_method_def *const UVERBS_OBJECT_METHODS(    \
++ 		_object_id)[] = { __VA_ARGS__ };                               \
++ 	static const struct uverbs_object_def _name##_struct = {               \
++ 		.id = _object_id,                                              \
++ 		.num_methods = ARRAY_SIZE(UVERBS_OBJECT_METHODS(_object_id)),  \
++ 		.methods = &UVERBS_OBJECT_METHODS(_object_id)                  \
++ 	};                                                                     \
++ 	static const struct uverbs_object_def *const _name##_ptrs[] = {        \
++ 		&_name##_struct,                                               \
++ 	};                                                                     \
++ 	static const struct uverbs_object_tree_def _name = {                   \
++ 		.num_objects = 1,                                              \
++ 		.objects = &_name##_ptrs,                                      \
++ 	}
++ 
++ /* Used by drivers to declare a complete parsing tree for a single method that
++  * differs only in having additional driver specific attributes.
++  */
++ #define ADD_UVERBS_ATTRIBUTES_SIMPLE(_name, _object_id, _method_id, ...)       \
++ 	static const struct uverbs_attr_def *const UVERBS_METHOD_ATTRS(        \
++ 		_method_id)[] = { __VA_ARGS__ };                               \
++ 	static const struct uverbs_method_def UVERBS_METHOD(_method_id) = {    \
++ 		.id = _method_id,                                              \
++ 		.num_attrs = ARRAY_SIZE(UVERBS_METHOD_ATTRS(_method_id)),      \
++ 		.attrs = &UVERBS_METHOD_ATTRS(_method_id),                     \
++ 	};                                                                     \
++ 	ADD_UVERBS_METHODS(_name, _object_id, &UVERBS_METHOD(_method_id))
+++>>>>>>> 322694412400 (IB/mlx5: Introduce driver create and destroy flow methods)
+  
+  #endif
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_cmds.h
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index b950ea239071..6362a9cc20d3 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -4062,6 +4062,20 @@ ib_get_vector_affinity(struct ib_device *device, int comp_vector)
+ 
+ }
+ 
++static inline void ib_set_flow(struct ib_uobject *uobj, struct ib_flow *ibflow,
++			       struct ib_qp *qp, struct ib_device *device)
++{
++	uobj->object = ibflow;
++	ibflow->uobject = uobj;
++
++	if (qp) {
++		atomic_inc(&qp->usecnt);
++		ibflow->qp = qp;
++	}
++
++	ibflow->device = device;
++}
++
+ /**
+  * rdma_roce_rescan_device - Rescan all of the network devices in the system
+  * and add their gids, as needed, to the relevant RoCE devices.
+* Unmerged path include/rdma/uverbs_named_ioctl.h
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_cmds.h
