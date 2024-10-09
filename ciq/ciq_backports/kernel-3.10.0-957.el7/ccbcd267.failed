@@ -1,0 +1,316 @@
+x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL
+
+jira LE-1907
+cve CVE-2018-3639
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] bugs, kvm: Extend speculation control for VIRT_SPEC_CTRL (Waiman Long) [1584569] {CVE-2018-3639}
+Rebuild_FUZZ: 96.55%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit ccbcd2674472a978b48c91c1fbfb66c0ff959f24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ccbcd267.failed
+
+AMD is proposing a VIRT_SPEC_CTRL MSR to handle the Speculative Store
+Bypass Disable via MSR_AMD64_LS_CFG so that guests do not have to care
+about the bit position of the SSBD bit and thus facilitate migration.
+Also, the sibling coordination on Family 17H CPUs can only be done on
+the host.
+
+Extend x86_spec_ctrl_set_guest() and x86_spec_ctrl_restore_host() with an
+extra argument for the VIRT_SPEC_CTRL MSR.
+
+Hand in 0 from VMX and in SVM add a new virt_spec_ctrl member to the CPU
+data structure which is going to be used in later patches for the actual
+implementation.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit ccbcd2674472a978b48c91c1fbfb66c0ff959f24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/spec-ctrl.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 29b8876b1f95,d3afd38f30d1..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -104,6 -129,124 +104,127 @@@ enum spectre_v2_mitigation_cmd spectre_
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+++<<<<<<< HEAD
+++=======
++ static enum spectre_v2_mitigation spectre_v2_enabled __ro_after_init =
++ 	SPECTRE_V2_NONE;
++ 
++ void x86_spec_ctrl_set(u64 val)
++ {
++ 	if (val & x86_spec_ctrl_mask)
++ 		WARN_ONCE(1, "SPEC_CTRL MSR value 0x%16llx is unknown.\n", val);
++ 	else
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base | val);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set);
++ 
++ u64 x86_spec_ctrl_get_default(void)
++ {
++ 	u64 msrval = x86_spec_ctrl_base;
++ 
++ 	if (static_cpu_has(X86_FEATURE_SPEC_CTRL))
++ 		msrval |= ssbd_tif_to_spec_ctrl(current_thread_info()->flags);
++ 	return msrval;
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_get_default);
++ 
++ /**
++  * x86_spec_ctrl_set_guest - Set speculation control registers for the guest
++  * @guest_spec_ctrl:		The guest content of MSR_SPEC_CTRL
++  * @guest_virt_spec_ctrl:	The guest controlled bits of MSR_VIRT_SPEC_CTRL
++  *				(may get translated to MSR_AMD64_LS_CFG bits)
++  *
++  * Avoids writing to the MSR if the content/bits are the same
++  */
++ void x86_spec_ctrl_set_guest(u64 guest_spec_ctrl, u64 guest_virt_spec_ctrl)
++ {
++ 	u64 host = x86_spec_ctrl_base;
++ 
++ 	/* Is MSR_SPEC_CTRL implemented ? */
++ 	if (!static_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
++ 		return;
++ 
++ 	/* SSBD controlled in MSR_SPEC_CTRL */
++ 	if (static_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD))
++ 		host |= ssbd_tif_to_spec_ctrl(current_thread_info()->flags);
++ 
++ 	if (host != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, guest_spec_ctrl);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set_guest);
++ 
++ /**
++  * x86_spec_ctrl_restore_host - Restore host speculation control registers
++  * @guest_spec_ctrl:		The guest content of MSR_SPEC_CTRL
++  * @guest_virt_spec_ctrl:	The guest controlled bits of MSR_VIRT_SPEC_CTRL
++  *				(may get translated to MSR_AMD64_LS_CFG bits)
++  *
++  * Avoids writing to the MSR if the content/bits are the same
++  */
++ void x86_spec_ctrl_restore_host(u64 guest_spec_ctrl, u64 guest_virt_spec_ctrl)
++ {
++ 	u64 host = x86_spec_ctrl_base;
++ 
++ 	/* Is MSR_SPEC_CTRL implemented ? */
++ 	if (!static_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
++ 		return;
++ 
++ 	/* SSBD controlled in MSR_SPEC_CTRL */
++ 	if (static_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD))
++ 		host |= ssbd_tif_to_spec_ctrl(current_thread_info()->flags);
++ 
++ 	if (host != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, host);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_restore_host);
++ 
++ static void x86_amd_ssb_disable(void)
++ {
++ 	u64 msrval = x86_amd_ls_cfg_base | x86_amd_ls_cfg_ssbd_mask;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_LS_CFG_SSBD))
++ 		wrmsrl(MSR_AMD64_LS_CFG, msrval);
++ }
++ 
++ #ifdef RETPOLINE
++ static bool spectre_v2_bad_module;
++ 
++ bool retpoline_module_ok(bool has_retpoline)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_NONE || has_retpoline)
++ 		return true;
++ 
++ 	pr_err("System may be vulnerable to spectre v2\n");
++ 	spectre_v2_bad_module = true;
++ 	return false;
++ }
++ 
++ static inline const char *spectre_v2_module_string(void)
++ {
++ 	return spectre_v2_bad_module ? " - vulnerable module loaded" : "";
++ }
++ #else
++ static inline const char *spectre_v2_module_string(void) { return ""; }
++ #endif
++ 
++ static void __init spec2_print_if_insecure(const char *reason)
++ {
++ 	if (boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static void __init spec2_print_if_secure(const char *reason)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static inline bool retp_compiler(void)
++ {
++ 	return __is_defined(RETPOLINE);
++ }
++ 
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  static inline bool match_option(const char *arg, int arglen, const char *opt)
+  {
+  	int len = strlen(opt);
+diff --cc arch/x86/kvm/svm.c
+index 6bd91543d358,c07dbcc6d449..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1608,6 -2064,10 +1614,13 @@@ static void svm_vcpu_reset(struct kvm_v
+  	u32 dummy;
+  	u32 eax = 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	vcpu->arch.microcode_version = 0x01000065;
++ 	svm->spec_ctrl = 0;
++ 	svm->virt_spec_ctrl = 0;
++ 
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  	if (!init_event) {
+  		svm->vcpu.arch.apic_base = APIC_DEFAULT_PHYS_BASE |
+  					   MSR_IA32_APICBASE_ENABLE;
+@@@ -5002,7 -5558,13 +5015,17 @@@ static void svm_vcpu_run(struct kvm_vcp
+  
+  	local_irq_enable();
+  
+++<<<<<<< HEAD
+ +	host_ibrs = spec_ctrl_vmenter_ibrs(svm->spec_ctrl);
+++=======
++ 	/*
++ 	 * If this vCPU has touched SPEC_CTRL, restore the guest's value if
++ 	 * it's non-zero. Since vmentry is serialising on affected CPUs, there
++ 	 * is no need to worry about the conditional branch over the wrmsr
++ 	 * being speculatively taken.
++ 	 */
++ 	x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  
+  	asm volatile (
+  		"push %%" _ASM_BP "; \n\t"
+@@@ -5105,13 -5670,25 +5128,17 @@@
+  #endif
+  #endif
+  
+ -	/*
+ -	 * We do not use IBRS in the kernel. If this vCPU has used the
+ -	 * SPEC_CTRL MSR it may have left it on; save the value and
+ -	 * turn it off. This is much more efficient than blindly adding
+ -	 * it to the atomic save/restore list. Especially as the former
+ -	 * (Saving guest MSRs on vmexit) doesn't even exist in KVM.
+ -	 *
+ -	 * For non-nested case:
+ -	 * If the L01 MSR bitmap does not intercept the MSR, then we need to
+ -	 * save it.
+ -	 *
+ -	 * For nested case:
+ -	 * If the L02 MSR bitmap does not intercept the MSR, then we need to
+ -	 * save it.
+ -	 */
+ -	if (unlikely(!msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL)))
+ +	if (cpu_has_spec_ctrl()) {
+  		svm->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
+ +		__spec_ctrl_vmexit_ibrs(host_ibrs, svm->spec_ctrl);
+ +	}
+  
+++<<<<<<< HEAD
+ +	/* Eliminate branch target predictions from guest mode */
+ +	fill_RSB();
+++=======
++ 	x86_spec_ctrl_restore_host(svm->spec_ctrl, svm->virt_spec_ctrl);
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  
+  	reload_tss(vcpu);
+  
+diff --cc arch/x86/kvm/vmx.c
+index bb5a385ea422,5d733a03a6fa..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -8888,9 -9711,19 +8888,19 @@@ static void __noclone vmx_vcpu_run(stru
+  
+  	vmx_arm_hv_timer(vcpu);
+  
+++<<<<<<< HEAD
+ +	host_ibrs = spec_ctrl_vmenter_ibrs(vmx->spec_ctrl);
+++=======
++ 	/*
++ 	 * If this vCPU has touched SPEC_CTRL, restore the guest's value if
++ 	 * it's non-zero. Since vmentry is serialising on affected CPUs, there
++ 	 * is no need to worry about the conditional branch over the wrmsr
++ 	 * being speculatively taken.
++ 	 */
++ 	x86_spec_ctrl_set_guest(vmx->spec_ctrl, 0);
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  
+  	vmx->__launched = vmx->loaded_vmcs->launched;
+ -
+ -	evmcs_rsp = static_branch_unlikely(&enable_evmcs) ?
+ -		(unsigned long)&current_evmcs->host_rsp : 0;
+ -
+  	asm(
+  		/* Store host registers */
+  		"push %%" _ASM_DX "; push %%" _ASM_BP ";"
+@@@ -9013,15 -9847,33 +9023,37 @@@
+  #endif
+  	      );
+  
+++<<<<<<< HEAD
+ +	if (cpu_has_spec_ctrl()) {
+ +		/* lfence is included in __spec_ctrl_vmexit_ibrs.  */
+ +		if (unlikely(!msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL)))
+ +			vmx->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
+ +		__spec_ctrl_vmexit_ibrs(host_ibrs, vmx->spec_ctrl);
+ +	}
+++=======
++ 	/*
++ 	 * We do not use IBRS in the kernel. If this vCPU has used the
++ 	 * SPEC_CTRL MSR it may have left it on; save the value and
++ 	 * turn it off. This is much more efficient than blindly adding
++ 	 * it to the atomic save/restore list. Especially as the former
++ 	 * (Saving guest MSRs on vmexit) doesn't even exist in KVM.
++ 	 *
++ 	 * For non-nested case:
++ 	 * If the L01 MSR bitmap does not intercept the MSR, then we need to
++ 	 * save it.
++ 	 *
++ 	 * For nested case:
++ 	 * If the L02 MSR bitmap does not intercept the MSR, then we need to
++ 	 * save it.
++ 	 */
++ 	if (unlikely(!msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL)))
++ 		vmx->spec_ctrl = native_read_msr(MSR_IA32_SPEC_CTRL);
++ 
++ 	x86_spec_ctrl_restore_host(vmx->spec_ctrl, 0);
+++>>>>>>> ccbcd2674472 (x86/bugs, KVM: Extend speculation control for VIRT_SPEC_CTRL)
+  
+  	/* Eliminate branch target predictions from guest mode */
+ -	vmexit_fill_RSB();
+ -
+ -	/* All fields are clean at this point */
+ -	if (static_branch_unlikely(&enable_evmcs))
+ -		current_evmcs->hv_clean_fields |=
+ -			HV_VMX_ENLIGHTENED_CLEAN_FIELD_ALL;
+ +	fill_RSB();
+  
+  	/* MSR_IA32_DEBUGCTLMSR is zeroed on vmexit. Restore it if needed */
+  	if (vmx->host_debugctlmsr)
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
