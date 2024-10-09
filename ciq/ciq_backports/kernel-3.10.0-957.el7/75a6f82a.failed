@@ -1,0 +1,197 @@
+freeing unlinked file indefinitely delayed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Al Viro <viro@ZenIV.linux.org.uk>
+commit 75a6f82a0d10ef8f13cd8fe7212911a0252ab99e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/75a6f82a.failed
+
+	Normally opening a file, unlinking it and then closing will have
+the inode freed upon close() (provided that it's not otherwise busy and
+has no remaining links, of course).  However, there's one case where that
+does *not* happen.  Namely, if you open it by fhandle with cold dcache,
+then unlink() and close().
+
+	In normal case you get d_delete() in unlink(2) notice that dentry
+is busy and unhash it; on the final dput() it will be forcibly evicted from
+dcache, triggering iput() and inode removal.  In this case, though, we end
+up with *two* dentries - disconnected (created by open-by-fhandle) and
+regular one (used by unlink()).  The latter will have its reference to inode
+dropped just fine, but the former will not - it's considered hashed (it
+is on the ->s_anon list), so it will stay around until the memory pressure
+will finally do it in.  As the result, we have the final iput() delayed
+indefinitely.  It's trivial to reproduce -
+
+void flush_dcache(void)
+{
+        system("mount -o remount,rw /");
+}
+
+static char buf[20 * 1024 * 1024];
+
+main()
+{
+        int fd;
+        union {
+                struct file_handle f;
+                char buf[MAX_HANDLE_SZ];
+        } x;
+        int m;
+
+        x.f.handle_bytes = sizeof(x);
+        chdir("/root");
+        mkdir("foo", 0700);
+        fd = open("foo/bar", O_CREAT | O_RDWR, 0600);
+        close(fd);
+        name_to_handle_at(AT_FDCWD, "foo/bar", &x.f, &m, 0);
+        flush_dcache();
+        fd = open_by_handle_at(AT_FDCWD, &x.f, O_RDWR);
+        unlink("foo/bar");
+        write(fd, buf, sizeof(buf));
+        system("df .");			/* 20Mb eaten */
+        close(fd);
+        system("df .");			/* should've freed those 20Mb */
+        flush_dcache();
+        system("df .");			/* should be the same as #2 */
+}
+
+will spit out something like
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 303843      1131 100% /
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 303843      1131 100% /
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 283282     21692  93% /
+- inode gets freed only when dentry is finally evicted (here we trigger
+than by remount; normally it would've happened in response to memory
+pressure hell knows when).
+
+	Cc: stable@vger.kernel.org # v2.6.38+; earlier ones need s/kill_it/unhash_it/
+	Acked-by: J. Bruce Fields <bfields@fieldses.org>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 75a6f82a0d10ef8f13cd8fe7212911a0252ab99e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+diff --cc fs/dcache.c
+index 656269cc223e,5c8ea15e73a5..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -551,6 -627,110 +551,113 @@@ again
+  	return parent;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Try to do a lockless dput(), and return whether that was successful.
++  *
++  * If unsuccessful, we return false, having already taken the dentry lock.
++  *
++  * The caller needs to hold the RCU read lock, so that the dentry is
++  * guaranteed to stay around even if the refcount goes down to zero!
++  */
++ static inline bool fast_dput(struct dentry *dentry)
++ {
++ 	int ret;
++ 	unsigned int d_flags;
++ 
++ 	/*
++ 	 * If we have a d_op->d_delete() operation, we sould not
++ 	 * let the dentry count go to zero, so use "put_or_lock".
++ 	 */
++ 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE))
++ 		return lockref_put_or_lock(&dentry->d_lockref);
++ 
++ 	/*
++ 	 * .. otherwise, we can try to just decrement the
++ 	 * lockref optimistically.
++ 	 */
++ 	ret = lockref_put_return(&dentry->d_lockref);
++ 
++ 	/*
++ 	 * If the lockref_put_return() failed due to the lock being held
++ 	 * by somebody else, the fast path has failed. We will need to
++ 	 * get the lock, and then check the count again.
++ 	 */
++ 	if (unlikely(ret < 0)) {
++ 		spin_lock(&dentry->d_lock);
++ 		if (dentry->d_lockref.count > 1) {
++ 			dentry->d_lockref.count--;
++ 			spin_unlock(&dentry->d_lock);
++ 			return 1;
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * If we weren't the last ref, we're done.
++ 	 */
++ 	if (ret)
++ 		return 1;
++ 
++ 	/*
++ 	 * Careful, careful. The reference count went down
++ 	 * to zero, but we don't hold the dentry lock, so
++ 	 * somebody else could get it again, and do another
++ 	 * dput(), and we need to not race with that.
++ 	 *
++ 	 * However, there is a very special and common case
++ 	 * where we don't care, because there is nothing to
++ 	 * do: the dentry is still hashed, it does not have
++ 	 * a 'delete' op, and it's referenced and already on
++ 	 * the LRU list.
++ 	 *
++ 	 * NOTE! Since we aren't locked, these values are
++ 	 * not "stable". However, it is sufficient that at
++ 	 * some point after we dropped the reference the
++ 	 * dentry was hashed and the flags had the proper
++ 	 * value. Other dentry users may have re-gotten
++ 	 * a reference to the dentry and change that, but
++ 	 * our work is done - we can leave the dentry
++ 	 * around with a zero refcount.
++ 	 */
++ 	smp_rmb();
++ 	d_flags = ACCESS_ONCE(dentry->d_flags);
++ 	d_flags &= DCACHE_REFERENCED | DCACHE_LRU_LIST | DCACHE_DISCONNECTED;
++ 
++ 	/* Nothing to do? Dropping the reference was all we needed? */
++ 	if (d_flags == (DCACHE_REFERENCED | DCACHE_LRU_LIST) && !d_unhashed(dentry))
++ 		return 1;
++ 
++ 	/*
++ 	 * Not the fast normal case? Get the lock. We've already decremented
++ 	 * the refcount, but we'll need to re-check the situation after
++ 	 * getting the lock.
++ 	 */
++ 	spin_lock(&dentry->d_lock);
++ 
++ 	/*
++ 	 * Did somebody else grab a reference to it in the meantime, and
++ 	 * we're no longer the last user after all? Alternatively, somebody
++ 	 * else could have killed it and marked it dead. Either way, we
++ 	 * don't need to do anything else.
++ 	 */
++ 	if (dentry->d_lockref.count) {
++ 		spin_unlock(&dentry->d_lock);
++ 		return 1;
++ 	}
++ 
++ 	/*
++ 	 * Re-get the reference we optimistically dropped. We hold the
++ 	 * lock, and we just tested that it was zero, so we can just
++ 	 * set it to 1.
++ 	 */
++ 	dentry->d_lockref.count = 1;
++ 	return 0;
++ }
++ 
++ 
+++>>>>>>> 75a6f82a0d10 (freeing unlinked file indefinitely delayed)
+  /* 
+   * This is dput
+   *
+* Unmerged path fs/dcache.c
