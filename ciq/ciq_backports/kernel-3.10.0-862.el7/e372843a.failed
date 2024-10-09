@@ -1,0 +1,202 @@
+xfs: refactor xfs_setfilesize
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit e372843a407ddff1e4c4acc7cdf3df9987bf48cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e372843a.failed
+
+Rename the current function to __xfs_setfilesize and add a non-static
+wrapper that also takes care of creating the transaction.  This new
+helper will be used by the new iomap-based DAX path.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit e372843a407ddff1e4c4acc7cdf3df9987bf48cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_aops.h
+diff --cc fs/xfs/xfs_aops.c
+index e68aed48cb56,4a28fa91e3b1..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1442,43 -1333,49 +1459,58 @@@ xfs_get_blocks_dax_fault
+  	return __xfs_get_blocks(inode, iblock, bh_result, create, true, true);
+  }
+  
+ -/*
+ - * Complete a direct I/O write request.
+ - *
+ - * xfs_map_direct passes us some flags in the private data to tell us what to
+ - * do.  If no flags are set, then the write IO is an overwrite wholly within
+ - * the existing allocated file size and so there is nothing for us to do.
+ - *
+ - * Note that in this case the completion can be called in interrupt context,
+ - * whereas if we have flags set we will always be called in task context
+ - * (i.e. from a workqueue).
+ - */
+ -int
+ -xfs_end_io_direct_write(
+ -	struct kiocb		*iocb,
+ +static void
+ +__xfs_end_io_direct_write(
+ +	struct inode		*inode,
+ +	struct xfs_ioend	*ioend,
+  	loff_t			offset,
+ -	ssize_t			size,
+ -	void			*private)
+ +	ssize_t			size)
+  {
+++<<<<<<< HEAD
+ +	struct xfs_mount	*mp = XFS_I(inode)->i_mount;
+ +	unsigned long		flags;
+ +
+ +	if (XFS_FORCED_SHUTDOWN(mp) || ioend->io_error)
+ +		goto out_end_io;
+++=======
++ 	struct inode		*inode = file_inode(iocb->ki_filp);
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	uintptr_t		flags = (uintptr_t)private;
++ 	int			error = 0;
++ 
++ 	trace_xfs_end_io_direct_write(ip, offset, size);
++ 
++ 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
++ 		return -EIO;
++ 
++ 	if (size <= 0)
++ 		return size;
+++>>>>>>> e372843a407d (xfs: refactor xfs_setfilesize)
+  
+  	/*
+ -	 * The flags tell us whether we are doing unwritten extent conversions
+ -	 * or an append transaction that updates the on-disk file size. These
+ -	 * cases are the only cases where we should *potentially* be needing
+ -	 * to update the VFS inode size.
+ +	 * dio completion end_io functions are only called on writes if more
+ +	 * than 0 bytes was written.
+  	 */
+ -	if (flags == 0) {
+ -		ASSERT(offset + size <= i_size_read(inode));
+ -		return 0;
+ -	}
+ +	ASSERT(size > 0);
+ +
+ +	/*
+ +	 * The ioend only maps whole blocks, while the IO may be sector aligned.
+ +	 * Hence the ioend offset/size may not match the IO offset/size exactly.
+ +	 * Because we don't map overwrites within EOF into the ioend, the offset
+ +	 * may not match, but only if the endio spans EOF.  Either way, write
+ +	 * the IO sizes into the ioend so that completion processing does the
+ +	 * right thing.
+ +	 */
+ +	ASSERT(offset + size <= ioend->io_offset + ioend->io_size);
+ +	ioend->io_size = size;
+ +	ioend->io_offset = offset;
+  
+  	/*
+ +	 * The ioend tells us whether we are doing unwritten extent conversion
+ +	 * or an append transaction that updates the on-disk file size. These
+ +	 * cases are the only cases where we should *potentially* be needing
+ +	 * to update the VFS inode size.
+ +	 *
+  	 * We need to update the in-core inode size here so that we don't end up
+  	 * with the on-disk inode size being outside the in-core inode size. We
+  	 * have no other method of updating EOF for AIO, so always do it here
+@@@ -1489,56 -1386,22 +1521,64 @@@
+  	 * here can result in EOF moving backwards and Bad Things Happen when
+  	 * that occurs.
+  	 */
+ -	spin_lock(&ip->i_flags_lock);
+ +	spin_lock_irqsave(&XFS_I(inode)->i_size_lock, flags);
+  	if (offset + size > i_size_read(inode))
+  		i_size_write(inode, offset + size);
+ -	spin_unlock(&ip->i_flags_lock);
+ +	spin_unlock_irqrestore(&XFS_I(inode)->i_size_lock, flags);
+ +
+ +	/*
+ +	 * If we are doing an append IO that needs to update the EOF on disk,
+ +	 * do the transaction reserve now so we can use common end io
+ +	 * processing. Stashing the error (if there is one) in the ioend will
+ +	 * result in the ioend processing passing on the error if it is
+ +	 * possible as we can't return it from here.
+ +	 */
+ +	if (ioend->io_type == XFS_IO_OVERWRITE)
+ +		ioend->io_error = xfs_setfilesize_trans_alloc(ioend);
+ +
+++<<<<<<< HEAD
+ +out_end_io:
+ +	xfs_end_io(&ioend->io_work);
+ +	return;
+ +}
+ +
+ +/*
+ + * Complete a direct I/O write request.
+ + *
+ + * The ioend structure is passed from __xfs_get_blocks() to tell us what to do.
+ + * If no ioend exists (i.e. @private == NULL) then the write IO is an overwrite
+ + * wholly within the EOF and so there is nothing for us to do. Note that in this
+ + * case the completion can be called in interrupt context, whereas if we have an
+ + * ioend we will always be called in task context (i.e. from a workqueue).
+ + */
+ +void
+ +xfs_end_io_direct_write(
+ +	struct kiocb		*iocb,
+ +	loff_t			offset,
+ +	ssize_t			size,
+ +	void			*private,
+ +	int			__attribute__((unused))ret,
+ +	bool			__attribute__((unused))is_async)
+ +{
+ +	struct inode		*inode = file_inode(iocb->ki_filp);
+ +	struct xfs_ioend	*ioend = private;
+  
+ -	if (flags & XFS_DIO_FLAG_UNWRITTEN) {
+ -		trace_xfs_end_io_direct_write_unwritten(ip, offset, size);
+ +	trace_xfs_gbmap_direct_endio(XFS_I(inode), offset, size,
+ +				     ioend ? ioend->io_type : 0, NULL);
+  
+ +	if (!ioend) {
+ +		ASSERT(offset + size <= i_size_read(inode));
+ +		return;
+++=======
++ 		error = xfs_iomap_write_unwritten(ip, offset, size);
++ 	} else if (flags & XFS_DIO_FLAG_APPEND) {
++ 		trace_xfs_end_io_direct_write_append(ip, offset, size);
++ 
++ 		error = xfs_setfilesize(ip, offset, size);
+++>>>>>>> e372843a407d (xfs: refactor xfs_setfilesize)
+  	}
+  
+ -	return error;
+ +	__xfs_end_io_direct_write(inode, ioend, offset, size);
+  }
+  
+  STATIC ssize_t
+diff --cc fs/xfs/xfs_aops.h
+index c70a99747be1,1950e3bca2ac..000000000000
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@@ -61,8 -60,9 +61,14 @@@ int	xfs_get_blocks_direct(struct inode 
+  int	xfs_get_blocks_dax_fault(struct inode *inode, sector_t offset,
+  			         struct buffer_head *map_bh, int create);
+  
+++<<<<<<< HEAD
+ +void	xfs_end_io_direct_write(struct kiocb *iocb, loff_t offset,
+ +		ssize_t size, void *private, int ret, bool is_async);
+++=======
++ int	xfs_end_io_direct_write(struct kiocb *iocb, loff_t offset,
++ 		ssize_t size, void *private);
++ int	xfs_setfilesize(struct xfs_inode *ip, xfs_off_t offset, size_t size);
+++>>>>>>> e372843a407d (xfs: refactor xfs_setfilesize)
+  
+  extern void xfs_count_page_state(struct page *, int *, int *);
+  extern struct block_device *xfs_find_bdev_for_inode(struct inode *);
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_aops.h
