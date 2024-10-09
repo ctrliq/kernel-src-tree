@@ -1,0 +1,124 @@
+NFS: Fix inode corruption in nfs_prime_dcache()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 7dc72d5f7a0ec97a53e126c46e2cbd2560757955
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7dc72d5f.failed
+
+Due to inode number reuse in filesystems, we can end up corrupting the
+inode on our client if we apply the file attributes without ensuring that
+the filehandle matches.
+Typical symptoms include spurious "mode changed" reports in the syslog.
+
+We still do want to ensure that we don't invalidate the dentry if the
+inode number matches, but we don't have a filehandle.
+
+Fixes: fa9233699cc1 ("NFS: Don't require a filehandle to refresh...")
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Cc: stable@vger.kernel.org # v4.0+
+	Tested-by: Oleg Drokin <green@linuxhacker.ru>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7dc72d5f7a0ec97a53e126c46e2cbd2560757955)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+diff --cc fs/nfs/dir.c
+index 8cabfa5feb35,2bade7909dec..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -413,18 -424,22 +413,31 @@@ static int xdr_decode(nfs_readdir_descr
+  static
+  int nfs_same_file(struct dentry *dentry, struct nfs_entry *entry)
+  {
+ -	struct inode *inode;
+  	struct nfs_inode *nfsi;
+  
+ -	if (d_really_is_negative(dentry))
+ -		return 0;
+ +	if (dentry->d_inode == NULL)
+ +		goto different;
+  
+++<<<<<<< HEAD
+ +	nfsi = NFS_I(dentry->d_inode);
+ +	if (entry->fattr->fileid == nfsi->fileid)
+ +		return 1;
+ +	if (nfs_compare_fh(entry->fh, &nfsi->fh) == 0)
+ +		return 1;
+ +different:
+ +	return 0;
+++=======
++ 	inode = d_inode(dentry);
++ 	if (is_bad_inode(inode) || NFS_STALE(inode))
++ 		return 0;
++ 
++ 	nfsi = NFS_I(inode);
++ 	if (entry->fattr->fileid != nfsi->fileid)
++ 		return 0;
++ 	if (entry->fh->size && nfs_compare_fh(entry->fh, &nfsi->fh) != 0)
++ 		return 0;
++ 	return 1;
+++>>>>>>> 7dc72d5f7a0e (NFS: Fix inode corruption in nfs_prime_dcache())
+  }
+  
+  static
+@@@ -495,35 -525,35 +508,41 @@@ void nfs_prime_dcache(struct dentry *pa
+  					&entry->fattr->fsid))
+  			goto out;
+  		if (nfs_same_file(dentry, entry)) {
++ 			if (!entry->fh->size)
++ 				goto out;
+  			nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
+ -			status = nfs_refresh_inode(d_inode(dentry), entry->fattr);
+ +			status = nfs_refresh_inode(dentry->d_inode, entry->fattr);
+  			if (!status)
+ -				nfs_setsecurity(d_inode(dentry), entry->fattr, entry->label);
+ +				nfs_setsecurity(dentry->d_inode, entry->fattr, entry->label);
+  			goto out;
+  		} else {
+ -			d_invalidate(dentry);
+ +			if (d_invalidate(dentry) != 0)
+ +				goto out;
+  			dput(dentry);
+ -			dentry = NULL;
+ -			goto again;
+  		}
+  	}
++ 	if (!entry->fh->size) {
++ 		d_lookup_done(dentry);
++ 		goto out;
++ 	}
+  
+ +	dentry = d_alloc(parent, &filename);
+ +	if (dentry == NULL)
+ +		return;
+ +
+  	inode = nfs_fhget(dentry->d_sb, entry->fh, entry->fattr, entry->label);
+ -	alias = d_splice_alias(inode, dentry);
+ -	d_lookup_done(dentry);
+ -	if (alias) {
+ -		if (IS_ERR(alias))
+ -			goto out;
+ -		dput(dentry);
+ -		dentry = alias;
+ -	}
+ -	nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
+ +	if (IS_ERR(inode))
+ +		goto out;
+ +
+ +	alias = d_materialise_unique(dentry, inode);
+ +	if (IS_ERR(alias))
+ +		goto out;
+ +	else if (alias) {
+ +		nfs_set_verifier(alias, nfs_save_change_attribute(dir));
+ +		dput(alias);
+ +	} else
+ +		nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
+ +
+  out:
+  	dput(dentry);
+  }
+* Unmerged path fs/nfs/dir.c
