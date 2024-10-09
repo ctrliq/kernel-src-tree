@@ -1,0 +1,671 @@
+net-tc: convert tc_verd to integer bitfields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] tc: convert tc_verd to integer bitfields (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 95.24%
+commit-author Willem de Bruijn <willemb@google.com>
+commit a5135bcfba7345031df45e02cd150a45add47cf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a5135bcf.failed
+
+Extract the remaining two fields from tc_verd and remove the __u16
+completely. TC_AT and TC_FROM are converted to equivalent two-bit
+integer fields tc_at and tc_from. Where possible, use existing
+helper skb_at_tc_ingress when reading tc_at. Introduce helper
+skb_reset_tc to clear fields.
+
+Not documenting tc_from and tc_at, because they will be replaced
+with single bit fields in follow-on patches.
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5135bcfba7345031df45e02cd150a45add47cf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ifb.c
+#	include/linux/skbuff.h
+#	include/net/sch_generic.h
+#	include/uapi/linux/pkt_cls.h
+#	net/core/dev.c
+#	net/core/pktgen.c
+#	net/sched/act_ife.c
+#	net/sched/act_mirred.c
+#	net/sched/sch_netem.c
+diff --cc drivers/net/ifb.c
+index c69ebf414c33,b73b6b6c066b..000000000000
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@@ -67,30 -68,28 +67,38 @@@ static void ri_tasklet(unsigned long de
+  	struct netdev_queue *txq;
+  	struct sk_buff *skb;
+  
+ -	txq = netdev_get_tx_queue(txp->dev, txp->txqnum);
+ -	skb = skb_peek(&txp->tq);
+ -	if (!skb) {
+ -		if (!__netif_tx_trylock(txq))
+ +	txq = netdev_get_tx_queue(_dev, 0);
+ +	if ((skb = skb_peek(&dp->tq)) == NULL) {
+ +		if (__netif_tx_trylock(txq)) {
+ +			skb_queue_splice_tail_init(&dp->rq, &dp->tq);
+ +			__netif_tx_unlock(txq);
+ +		} else {
+ +			/* reschedule */
+  			goto resched;
+ -		skb_queue_splice_tail_init(&txp->rq, &txp->tq);
+ -		__netif_tx_unlock(txq);
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	while ((skb = __skb_dequeue(&dp->tq)) != NULL) {
+ +		u32 from = G_TC_FROM(skb->tc_verd);
+ +
+ +		skb->tc_verd = 0;
+ +		skb->tc_verd = SET_TC_NCLS(skb->tc_verd);
+++=======
++ 	while ((skb = __skb_dequeue(&txp->tq)) != NULL) {
++ 		u32 from = skb->tc_from;
++ 
++ 		skb_reset_tc(skb);
++ 		skb->tc_skip_classify = 1;
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+ -		u64_stats_update_begin(&txp->tsync);
+ -		txp->tx_packets++;
+ -		txp->tx_bytes += skb->len;
+ -		u64_stats_update_end(&txp->tsync);
+ +		u64_stats_update_begin(&dp->tsync);
+ +		dp->tx_packets++;
+ +		dp->tx_bytes += skb->len;
+ +		u64_stats_update_end(&dp->tsync);
+  
+  		rcu_read_lock();
+ -		skb->dev = dev_get_by_index_rcu(dev_net(txp->dev), skb->skb_iif);
+ +		skb->dev = dev_get_by_index_rcu(dev_net(_dev), skb->skb_iif);
+  		if (!skb->dev) {
+  			rcu_read_unlock();
+  			dev_kfree_skb(skb);
+@@@ -191,15 -238,15 +199,20 @@@ static void ifb_setup(struct net_devic
+  
+  static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct ifb_private *dp = netdev_priv(dev);
+ +	u32 from = G_TC_FROM(skb->tc_verd);
+++=======
++ 	struct ifb_dev_private *dp = netdev_priv(dev);
++ 	struct ifb_q_private *txp = dp->tx_private + skb_get_queue_mapping(skb);
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+ -	u64_stats_update_begin(&txp->rsync);
+ -	txp->rx_packets++;
+ -	txp->rx_bytes += skb->len;
+ -	u64_stats_update_end(&txp->rsync);
+ +	u64_stats_update_begin(&dp->rsync);
+ +	dp->rx_packets++;
+ +	dp->rx_bytes += skb->len;
+ +	u64_stats_update_end(&dp->rsync);
+  
+- 	if (!(from & (AT_INGRESS|AT_EGRESS)) || !skb->skb_iif) {
++ 	if (skb->tc_from == AT_STACK || !skb->skb_iif) {
+  		dev_kfree_skb(skb);
+  		dev->stats.rx_dropped++;
+  		return NETDEV_TX_OK;
+diff --cc include/linux/skbuff.h
+index 7b6fa7405c56,f738d09947b2..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -628,9 -599,9 +628,8 @@@ static inline u32 skb_mstamp_us_delta(c
+   *	@nf_bridge: Saved data about a bridged frame - see br_netfilter.c
+   *	@skb_iif: ifindex of device we arrived on
+   *	@tc_index: Traffic control index
+-  *	@tc_verd: traffic control verdict
+   *	@hash: the packet hash
+   *	@queue_mapping: Queue mapping for multiqueue devices
+ - *	@xmit_more: More SKBs are pending for this queue
+   *	@ndisc_nodetype: router type (from link layer)
+   *	@ooo_okay: allow the mapping of a socket to a queue to be changed
+   *	@l4_hash: indicate hash is a canonical 4-tuple hash over transport
+@@@ -694,6 -677,88 +693,91 @@@ struct sk_buff 
+  				data_len;
+  	__u16			mac_len,
+  				hdr_len;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Following fields are _not_ copied in __copy_skb_header()
++ 	 * Note that queue_mapping is here mostly to fill a hole.
++ 	 */
++ 	kmemcheck_bitfield_begin(flags1);
++ 	__u16			queue_mapping;
++ 
++ /* if you move cloned around you also must adapt those constants */
++ #ifdef __BIG_ENDIAN_BITFIELD
++ #define CLONED_MASK	(1 << 7)
++ #else
++ #define CLONED_MASK	1
++ #endif
++ #define CLONED_OFFSET()		offsetof(struct sk_buff, __cloned_offset)
++ 
++ 	__u8			__cloned_offset[0];
++ 	__u8			cloned:1,
++ 				nohdr:1,
++ 				fclone:2,
++ 				peeked:1,
++ 				head_frag:1,
++ 				xmit_more:1,
++ 				__unused:1; /* one bit hole */
++ 	kmemcheck_bitfield_end(flags1);
++ 
++ 	/* fields enclosed in headers_start/headers_end are copied
++ 	 * using a single memcpy() in __copy_skb_header()
++ 	 */
++ 	/* private: */
++ 	__u32			headers_start[0];
++ 	/* public: */
++ 
++ /* if you move pkt_type around you also must adapt those constants */
++ #ifdef __BIG_ENDIAN_BITFIELD
++ #define PKT_TYPE_MAX	(7 << 5)
++ #else
++ #define PKT_TYPE_MAX	7
++ #endif
++ #define PKT_TYPE_OFFSET()	offsetof(struct sk_buff, __pkt_type_offset)
++ 
++ 	__u8			__pkt_type_offset[0];
++ 	__u8			pkt_type:3;
++ 	__u8			pfmemalloc:1;
++ 	__u8			ignore_df:1;
++ 	__u8			nfctinfo:3;
++ 
++ 	__u8			nf_trace:1;
++ 	__u8			ip_summed:2;
++ 	__u8			ooo_okay:1;
++ 	__u8			l4_hash:1;
++ 	__u8			sw_hash:1;
++ 	__u8			wifi_acked_valid:1;
++ 	__u8			wifi_acked:1;
++ 
++ 	__u8			no_fcs:1;
++ 	/* Indicates the inner headers are valid in the skbuff. */
++ 	__u8			encapsulation:1;
++ 	__u8			encap_hdr_csum:1;
++ 	__u8			csum_valid:1;
++ 	__u8			csum_complete_sw:1;
++ 	__u8			csum_level:2;
++ 	__u8			csum_bad:1;
++ 
++ #ifdef CONFIG_IPV6_NDISC_NODETYPE
++ 	__u8			ndisc_nodetype:2;
++ #endif
++ 	__u8			ipvs_property:1;
++ 	__u8			inner_protocol_type:1;
++ 	__u8			remcsum_offload:1;
++ #ifdef CONFIG_NET_SWITCHDEV
++ 	__u8			offload_fwd_mark:1;
++ #endif
++ #ifdef CONFIG_NET_CLS_ACT
++ 	__u8			tc_skip_classify:1;
++ 	__u8			tc_at:2;
++ 	__u8			tc_from:2;
++ #endif
++ 
++ #ifdef CONFIG_NET_SCHED
++ 	__u16			tc_index;	/* traffic control index */
++ #endif
++ 
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  	union {
+  		__wsum		csum;
+  		struct {
+diff --cc include/net/sch_generic.h
+index e957def28d63,f80dba516964..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -410,6 -407,35 +410,38 @@@ void __qdisc_calculate_pkt_len(struct s
+  			       const struct qdisc_size_table *stab);
+  bool tcf_destroy(struct tcf_proto *tp, bool force);
+  void tcf_destroy_chain(struct tcf_proto __rcu **fl);
+++<<<<<<< HEAD
+++=======
++ int skb_do_redirect(struct sk_buff *);
++ 
++ static inline void skb_reset_tc(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	skb->tc_at = 0;
++ 	skb->tc_from = 0;
++ #endif
++ }
++ 
++ static inline bool skb_at_tc_ingress(const struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	return skb->tc_at & AT_INGRESS;
++ #else
++ 	return false;
++ #endif
++ }
++ 
++ static inline bool skb_skip_tc_classify(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	if (skb->tc_skip_classify) {
++ 		skb->tc_skip_classify = 0;
++ 		return true;
++ 	}
++ #endif
++ 	return false;
++ }
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+  /* Reset all TX qdiscs greater then index of a device.  */
+  static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
+diff --cc include/uapi/linux/pkt_cls.h
+index 0d022fe21c56,cee753a7a40c..000000000000
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@@ -4,82 -4,11 +4,90 @@@
+  #include <linux/types.h>
+  #include <linux/pkt_sched.h>
+  
+++<<<<<<< HEAD
+ +/* I think i could have done better macros ; for now this is stolen from
+ + * some arch/mips code - jhs
+ +*/
+ +#define _TC_MAKE32(x) ((x))
+ +
+ +#define _TC_MAKEMASK1(n) (_TC_MAKE32(1) << _TC_MAKE32(n))
+ +#define _TC_MAKEMASK(v,n) (_TC_MAKE32((_TC_MAKE32(1)<<(v))-1) << _TC_MAKE32(n))
+ +#define _TC_MAKEVALUE(v,n) (_TC_MAKE32(v) << _TC_MAKE32(n))
+ +#define _TC_GETVALUE(v,n,m) ((_TC_MAKE32(v) & _TC_MAKE32(m)) >> _TC_MAKE32(n))
+ +
+ +/* verdict bit breakdown 
+ + *
+ +bit 0: when set -> this packet has been munged already
+ +
+ +bit 1: when set -> It is ok to munge this packet
+ +
+ +bit 2,3,4,5: Reclassify counter - sort of reverse TTL - if exceeded
+ +assume loop
+ +
+ +bit 6,7: Where this packet was last seen 
+ +0: Above the transmit example at the socket level
+ +1: on the Ingress
+ +2: on the Egress
+ +
+ +bit 8: when set --> Request not to classify on ingress. 
+ +
+ +bits 9,10,11: redirect counter -  redirect TTL. Loop avoidance
+ +
+ + *
+ + * */
+ +
+ +#ifndef __KERNEL__
+ +/* backwards compat for userspace only */
+ +#define TC_MUNGED          _TC_MAKEMASK1(0)
+ +#define SET_TC_MUNGED(v)   ( TC_MUNGED | (v & ~TC_MUNGED))
+ +#define CLR_TC_MUNGED(v)   ( v & ~TC_MUNGED)
+ +
+ +#define TC_OK2MUNGE        _TC_MAKEMASK1(1)
+ +#define SET_TC_OK2MUNGE(v)   ( TC_OK2MUNGE | (v & ~TC_OK2MUNGE))
+ +#define CLR_TC_OK2MUNGE(v)   ( v & ~TC_OK2MUNGE)
+ +
+ +#define S_TC_VERD          _TC_MAKE32(2)
+ +#define M_TC_VERD          _TC_MAKEMASK(4,S_TC_VERD)
+ +#define G_TC_VERD(x)       _TC_GETVALUE(x,S_TC_VERD,M_TC_VERD)
+ +#define V_TC_VERD(x)       _TC_MAKEVALUE(x,S_TC_VERD)
+ +#define SET_TC_VERD(v,n)   ((V_TC_VERD(n)) | (v & ~M_TC_VERD))
+ +#endif
+ +
+ +#define S_TC_FROM          _TC_MAKE32(6)
+ +#define M_TC_FROM          _TC_MAKEMASK(2,S_TC_FROM)
+ +#define G_TC_FROM(x)       _TC_GETVALUE(x,S_TC_FROM,M_TC_FROM)
+ +#define V_TC_FROM(x)       _TC_MAKEVALUE(x,S_TC_FROM)
+ +#define SET_TC_FROM(v,n)   ((V_TC_FROM(n)) | (v & ~M_TC_FROM))
+ +#define AT_STACK	0x0
+ +#define AT_INGRESS	0x1
+ +#define AT_EGRESS	0x2
+ +
+ +#define TC_NCLS          _TC_MAKEMASK1(8)
+ +#define SET_TC_NCLS(v)   ( TC_NCLS | (v & ~TC_NCLS))
+ +#define CLR_TC_NCLS(v)   ( v & ~TC_NCLS)
+ +
+ +#ifndef __KERNEL__
+ +#define S_TC_RTTL          _TC_MAKE32(9)
+ +#define M_TC_RTTL          _TC_MAKEMASK(3,S_TC_RTTL)
+ +#define G_TC_RTTL(x)       _TC_GETVALUE(x,S_TC_RTTL,M_TC_RTTL)
+ +#define V_TC_RTTL(x)       _TC_MAKEVALUE(x,S_TC_RTTL)
+ +#define SET_TC_RTTL(v,n)   ((V_TC_RTTL(n)) | (v & ~M_TC_RTTL))
+ +#endif
+ +
+ +#define S_TC_AT          _TC_MAKE32(12)
+ +#define M_TC_AT          _TC_MAKEMASK(2,S_TC_AT)
+ +#define G_TC_AT(x)       _TC_GETVALUE(x,S_TC_AT,M_TC_AT)
+ +#define V_TC_AT(x)       _TC_MAKEVALUE(x,S_TC_AT)
+ +#define SET_TC_AT(v,n)   ((V_TC_AT(n)) | (v & ~M_TC_AT))
+ +
+ +#define TC_COOKIE_MAX_SIZE 16
+++=======
++ #ifdef __KERNEL__
++ #define AT_STACK	0x0
++ #define AT_INGRESS	0x1
++ #define AT_EGRESS	0x2
++ #endif
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+  /* Action attributes */
+  enum {
+diff --cc net/core/dev.c
+index 54ad82302512,8b5d6d033473..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3135,6 -3143,49 +3135,52 @@@ int dev_loopback_xmit(struct sock *sk, 
+  }
+  EXPORT_SYMBOL(dev_loopback_xmit);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_EGRESS
++ static struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	struct tcf_proto *cl = rcu_dereference_bh(dev->egress_cl_list);
++ 	struct tcf_result cl_res;
++ 
++ 	if (!cl)
++ 		return skb;
++ 
++ 	/* skb->tc_at and qdisc_skb_cb(skb)->pkt_len were already set
++ 	 * earlier by the caller.
++ 	 */
++ 	qdisc_bstats_cpu_update(cl->q, skb);
++ 
++ 	switch (tc_classify(skb, cl, &cl_res, false)) {
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(cl_res.classid);
++ 		break;
++ 	case TC_ACT_SHOT:
++ 		qdisc_qstats_cpu_drop(cl->q);
++ 		*ret = NET_XMIT_DROP;
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 		*ret = NET_XMIT_SUCCESS;
++ 		consume_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_REDIRECT:
++ 		/* No need to push/pop skb's mac_header here on egress! */
++ 		skb_do_redirect(skb);
++ 		*ret = NET_XMIT_SUCCESS;
++ 		return NULL;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return skb;
++ }
++ #endif /* CONFIG_NET_EGRESS */
++ 
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
+  {
+  #ifdef CONFIG_XPS
+@@@ -3256,6 -3318,17 +3302,20 @@@ int __dev_queue_xmit(struct sk_buff *sk
+  
+  	skb_update_prio(skb);
+  
+++<<<<<<< HEAD
+++=======
++ 	qdisc_pkt_len_init(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	skb->tc_at = AT_EGRESS;
++ # ifdef CONFIG_NET_EGRESS
++ 	if (static_key_false(&egress_needed)) {
++ 		skb = sch_handle_egress(skb, &rc, dev);
++ 		if (!skb)
++ 			goto out;
++ 	}
++ # endif
++ #endif
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  	/* If device/qdisc don't need skb->dst, release it right now while
+  	 * its hot in this cpu cache.
+  	 */
+@@@ -3976,15 -4114,16 +4036,20 @@@ another_round
+  skip_taps:
+  #ifdef CONFIG_NET_INGRESS
+  	if (static_key_false(&ingress_needed)) {
+ -		skb = sch_handle_ingress(skb, &pt_prev, &ret, orig_dev);
+ +		skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+  		if (!skb)
+  			goto out;
+ -
+ -		if (nf_ingress(skb, &pt_prev, &ret, orig_dev) < 0)
+ -			goto out;
+  	}
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	skb->tc_verd = 0;
+ +ncls:
+ +#endif
+++=======
++ 	skb_reset_tc(skb);
++ skip_classify:
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  	if (pfmemalloc && !skb_pfmemalloc_protocol(skb))
+  		goto drop;
+  
+diff --cc net/core/pktgen.c
+index 22d5c06199fd,96947f5d41e4..000000000000
+--- a/net/core/pktgen.c
++++ b/net/core/pktgen.c
+@@@ -3326,11 -3415,72 +3326,73 @@@ static void pktgen_xmit(struct pktgen_d
+  	if (pkt_dev->delay && pkt_dev->last_ok)
+  		spin(pkt_dev, pkt_dev->next_tx);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (pkt_dev->xmit_mode == M_NETIF_RECEIVE) {
++ 		skb = pkt_dev->skb;
++ 		skb->protocol = eth_type_trans(skb, skb->dev);
++ 		atomic_add(burst, &skb->users);
++ 		local_bh_disable();
++ 		do {
++ 			ret = netif_receive_skb(skb);
++ 			if (ret == NET_RX_DROP)
++ 				pkt_dev->errors++;
++ 			pkt_dev->sofar++;
++ 			pkt_dev->seq_num++;
++ 			if (atomic_read(&skb->users) != burst) {
++ 				/* skb was queued by rps/rfs or taps,
++ 				 * so cannot reuse this skb
++ 				 */
++ 				atomic_sub(burst - 1, &skb->users);
++ 				/* get out of the loop and wait
++ 				 * until skb is consumed
++ 				 */
++ 				break;
++ 			}
++ 			/* skb was 'freed' by stack, so clean few
++ 			 * bits and reuse it
++ 			 */
++ 			skb_reset_tc(skb);
++ 		} while (--burst > 0);
++ 		goto out; /* Skips xmit_mode M_START_XMIT */
++ 	} else if (pkt_dev->xmit_mode == M_QUEUE_XMIT) {
++ 		local_bh_disable();
++ 		atomic_inc(&pkt_dev->skb->users);
++ 
++ 		ret = dev_queue_xmit(pkt_dev->skb);
++ 		switch (ret) {
++ 		case NET_XMIT_SUCCESS:
++ 			pkt_dev->sofar++;
++ 			pkt_dev->seq_num++;
++ 			pkt_dev->tx_bytes += pkt_dev->last_pkt_size;
++ 			break;
++ 		case NET_XMIT_DROP:
++ 		case NET_XMIT_CN:
++ 		/* These are all valid return codes for a qdisc but
++ 		 * indicate packets are being dropped or will likely
++ 		 * be dropped soon.
++ 		 */
++ 		case NETDEV_TX_BUSY:
++ 		/* qdisc may call dev_hard_start_xmit directly in cases
++ 		 * where no queues exist e.g. loopback device, virtual
++ 		 * devices, etc. In this case we need to handle
++ 		 * NETDEV_TX_ codes.
++ 		 */
++ 		default:
++ 			pkt_dev->errors++;
++ 			net_info_ratelimited("%s xmit error: %d\n",
++ 					     pkt_dev->odevname, ret);
++ 			break;
++ 		}
++ 		goto out;
++ 	}
++ 
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  	txq = skb_get_tx_queue(odev, pkt_dev->skb);
+  
+ -	local_bh_disable();
+ +	__netif_tx_lock_bh(txq);
+  
+ -	HARD_TX_LOCK(odev, txq, smp_processor_id());
+ -
+ -	if (unlikely(netif_xmit_frozen_or_drv_stopped(txq))) {
+ +	if (unlikely(netif_xmit_frozen_or_stopped(txq))) {
+  		ret = NETDEV_TX_BUSY;
+  		pkt_dev->last_ok = 0;
+  		goto unlock;
+diff --cc net/sched/act_mirred.c
+index 80554d23769d,8543279bba49..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -140,11 -163,13 +140,17 @@@ static int tcf_mirred_init(struct net *
+  static int tcf_mirred(struct sk_buff *skb, const struct tc_action *a,
+  		      struct tcf_result *res)
+  {
+ -	struct tcf_mirred *m = to_mirred(a);
+ -	bool m_mac_header_xmit;
+ +	struct tcf_mirred *m = a->priv;
+  	struct net_device *dev;
+  	struct sk_buff *skb2;
+++<<<<<<< HEAD
+ +	int retval, err;
+ +	u32 at;
+++=======
++ 	int retval, err = 0;
++ 	int m_eaction;
++ 	int mac_len;
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+  	tcf_lastuse_update(&m->tcf_tm);
+  	bstats_cpu_update(this_cpu_ptr(m->common.cpu_bstats), skb);
+@@@ -168,14 -194,25 +173,34 @@@
+  	if (!skb2)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (!(at & AT_EGRESS)) {
+ +		if (m->tcfm_ok_push)
+++=======
++ 	/* If action's target direction differs than filter's direction,
++ 	 * and devices expect a mac header on xmit, then mac push/pull is
++ 	 * needed.
++ 	 */
++ 	if (skb->tc_at != tcf_mirred_act_direction(m_eaction) &&
++ 	    m_mac_header_xmit) {
++ 		if (!skb_at_tc_ingress(skb)) {
++ 			/* caught at egress, act ingress: pull mac */
++ 			mac_len = skb_network_header(skb) - skb_mac_header(skb);
++ 			skb_pull_rcsum(skb2, mac_len);
++ 		} else {
++ 			/* caught at ingress, act egress: push mac */
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  			skb_push_rcsum(skb2, skb->mac_len);
+ -		}
+  	}
+  
+  	/* mirror is always swallowed */
+++<<<<<<< HEAD
+ +	if (m->tcfm_eaction != TCA_EGRESS_MIRROR)
+ +		skb2->tc_verd = SET_TC_FROM(skb2->tc_verd, at);
+++=======
++ 	if (tcf_mirred_is_act_redirect(m_eaction))
++ 		skb2->tc_from = skb2->tc_at;
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  
+  	skb2->skb_iif = skb->dev->ifindex;
+  	skb2->dev = dev;
+diff --cc net/sched/sch_netem.c
+index e8a216075f50,bb5c638b6852..000000000000
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@@ -652,8 -626,8 +652,13 @@@ deliver
+  			 * If it's at ingress let's pretend the delay is
+  			 * from the network (tstamp will be updated).
+  			 */
+++<<<<<<< HEAD
+ +			if (G_TC_FROM(skb->tc_verd) & AT_INGRESS)
+ +				skb->tstamp.tv64 = 0;
+++=======
++ 			if (skb->tc_from & AT_INGRESS)
++ 				skb->tstamp = 0;
+++>>>>>>> a5135bcfba73 (net-tc: convert tc_verd to integer bitfields)
+  #endif
+  
+  			if (q->qdisc) {
+* Unmerged path net/sched/act_ife.c
+* Unmerged path drivers/net/ifb.c
+diff --git a/drivers/staging/octeon/ethernet-tx.c b/drivers/staging/octeon/ethernet-tx.c
+index 5631dd9f8201..658e430bece4 100644
+--- a/drivers/staging/octeon/ethernet-tx.c
++++ b/drivers/staging/octeon/ethernet-tx.c
+@@ -40,6 +40,7 @@
+ #endif /* CONFIG_XFRM */
+ 
+ #include <linux/atomic.h>
++#include <net/sch_generic.h>
+ 
+ #include <asm/octeon/octeon.h>
+ 
+@@ -375,9 +376,7 @@ int cvm_oct_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ #ifdef CONFIG_NET_SCHED
+ 	skb->tc_index = 0;
+-#ifdef CONFIG_NET_CLS_ACT
+-	skb->tc_verd = 0;
+-#endif /* CONFIG_NET_CLS_ACT */
++	skb_reset_tc(skb);
+ #endif /* CONFIG_NET_SCHED */
+ #endif /* REUSE_SKBUFFS_WITHOUT_FREE */
+ 
+* Unmerged path include/linux/skbuff.h
+* Unmerged path include/net/sch_generic.h
+* Unmerged path include/uapi/linux/pkt_cls.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/pktgen.c
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 7ec68a93af9a..5e8b50ebeee9 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -904,9 +904,6 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ #endif
+ #ifdef CONFIG_NET_SCHED
+ 	CHECK_SKB_FIELD(tc_index);
+-#ifdef CONFIG_NET_CLS_ACT
+-	CHECK_SKB_FIELD(tc_verd);
+-#endif
+ #endif
+ 
+ 	/* RHEL: the following fields are placed between headers_start and
+* Unmerged path net/sched/act_ife.c
+* Unmerged path net/sched/act_mirred.c
+* Unmerged path net/sched/sch_netem.c
