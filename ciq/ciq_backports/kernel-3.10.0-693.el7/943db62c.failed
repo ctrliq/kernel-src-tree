@@ -1,0 +1,208 @@
+powerpc/pseries: Revert 'Auto-online hotplugged memory'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Revert 'Auto-online hotplugged memory' (Thomas Huth) [1323417]
+Rebuild_FUZZ: 92.16%
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 943db62c316c578f8e2cc6fb81a5f641096b29bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/943db62c.failed
+
+This reverts commit ec999072442a ("powerpc/pseries: Auto-online
+hotplugged memory"), and 9dc512819e4b ("powerpc: Fix unused function
+warning 'lmb_to_memblock'").
+
+Using the auto-online acpability does online added memory but does not
+update the associated device struct to indicate that the memory is
+online. This causes the pseries memory DLPAR code to fail when trying to
+remove a LMB that was previously removed and added back. This happens
+when validating that the LMB is removable.
+
+This patch reverts to the previous behavior of calling device_online()
+to online the LMB when it is DLPAR added and moves the lmb_to_memblock()
+routine out of CONFIG_MEMORY_HOTREMOVE now that we call it for add.
+
+Fixes: ec999072442a ("powerpc/pseries: Auto-online hotplugged memory")
+	Cc: stable@vger.kernel.org # v4.8+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 943db62c316c578f8e2cc6fb81a5f641096b29bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/configs/pseries_defconfig
+#	arch/powerpc/platforms/pseries/hotplug-memory.c
+diff --cc arch/powerpc/configs/pseries_defconfig
+index f61d88bb2863,4ff68b752618..000000000000
+--- a/arch/powerpc/configs/pseries_defconfig
++++ b/arch/powerpc/configs/pseries_defconfig
+@@@ -49,6 -57,9 +49,11 @@@ CONFIG_KEXEC=
+  CONFIG_IRQ_ALL_CPUS=y
+  CONFIG_MEMORY_HOTPLUG=y
+  CONFIG_MEMORY_HOTREMOVE=y
+++<<<<<<< HEAD
+++=======
++ CONFIG_KSM=y
++ CONFIG_TRANSPARENT_HUGEPAGE=y
+++>>>>>>> 943db62c316c (powerpc/pseries: Revert 'Auto-online hotplugged memory')
+  CONFIG_PPC_64K_PAGES=y
+  CONFIG_PPC_SUBPAGE_PROT=y
+  CONFIG_SCHED_SMT=y
+diff --cc arch/powerpc/platforms/pseries/hotplug-memory.c
+index a96025209e16,e104c71ea44a..000000000000
+--- a/arch/powerpc/platforms/pseries/hotplug-memory.c
++++ b/arch/powerpc/platforms/pseries/hotplug-memory.c
+@@@ -320,23 -320,20 +320,36 @@@ static int dlpar_remove_device_tree_lmb
+  	return dlpar_update_device_tree_lmb(lmb);
+  }
+  
++ static struct memory_block *lmb_to_memblock(struct of_drconf_cell *lmb)
++ {
++ 	unsigned long section_nr;
++ 	struct mem_section *mem_sect;
++ 	struct memory_block *mem_block;
++ 
++ 	section_nr = pfn_to_section_nr(PFN_DOWN(lmb->base_addr));
++ 	mem_sect = __nr_to_section(section_nr);
++ 
++ 	mem_block = find_memory_block(mem_sect);
++ 	return mem_block;
++ }
++ 
+  #ifdef CONFIG_MEMORY_HOTREMOVE
+ +static int pseries_remove_memory(u64 start, u64 size)
+ +{
+ +	int ret;
+ +
+ +	/* Remove htab bolted mappings for this section of memory */
+ +	start = (unsigned long)__va(start);
+ +	ret = remove_section_mapping(start, start + size);
+ +
+ +	/* Ensure all vmalloc mappings are flushed in case they also
+ +	 * hit that section of memory
+ +	 */
+ +	vm_unmap_aliases();
+ +
+ +	return ret;
+ +}
+ +
+  static int pseries_remove_memblock(unsigned long base, unsigned int memblock_size)
+  {
+  	unsigned long block_sz, start_pfn;
+@@@ -604,53 -716,37 +604,72 @@@ static int dlpar_memory_remove_by_index
+  {
+  	return -EOPNOTSUPP;
+  }
+ -static int dlpar_memory_readd_by_index(u32 drc_index, struct property *prop)
+ -{
+ -	return -EOPNOTSUPP;
+ -}
+  
+ -static int dlpar_memory_remove_by_ic(u32 lmbs_to_remove, u32 drc_index,
+ -				     struct property *prop)
+ -{
+ -	return -EOPNOTSUPP;
+ -}
+  #endif /* CONFIG_MEMORY_HOTREMOVE */
+  
+++<<<<<<< HEAD
+ +static int dlpar_add_lmb_memory(struct of_drconf_cell *lmb)
+++=======
++ static int dlpar_online_lmb(struct of_drconf_cell *lmb)
++ {
++ 	struct memory_block *mem_block;
++ 	int rc;
++ 
++ 	mem_block = lmb_to_memblock(lmb);
++ 	if (!mem_block)
++ 		return -EINVAL;
++ 
++ 	rc = device_online(&mem_block->dev);
++ 	put_device(&mem_block->dev);
++ 	return rc;
++ }
++ 
++ static int dlpar_add_lmb(struct of_drconf_cell *lmb)
+++>>>>>>> 943db62c316c (powerpc/pseries: Revert 'Auto-online hotplugged memory')
+  {
+ +	struct memory_block *mem_block;
+  	unsigned long block_sz;
+  	int nid, rc;
+  
+ +	block_sz = memory_block_size_bytes();
+ +
+ +	/* Find the node id for this address */
+ +	nid = memory_add_physaddr_to_nid(lmb->base_addr);
+ +
+ +	/* Add the memory */
+ +	rc = add_memory(nid, lmb->base_addr, block_sz);
+++<<<<<<< HEAD
+ +	if (rc)
+ +		return rc;
+ +
+ +	/* Register this block of memory */
+ +	rc = memblock_add(lmb->base_addr, block_sz);
+ +	if (rc) {
+ +		remove_memory(nid, lmb->base_addr, block_sz);
+ +		return rc;
+ +	}
+ +
+ +	mem_block = lmb_to_memblock(lmb);
+ +	if (!mem_block) {
+ +		remove_memory(nid, lmb->base_addr, block_sz);
+ +		return -EINVAL;
+ +	}
+ +
+ +	rc = device_online(&mem_block->dev);
+ +	put_device(&mem_block->dev);
+ +	if (rc) {
+ +		remove_memory(nid, lmb->base_addr, block_sz);
+ +		return rc;
+ +	}
+ +
+ +	lmb->flags |= DRCONF_MEM_ASSIGNED;
+ +	return 0;
+ +}
+ +
+ +static int dlpar_add_lmb(struct of_drconf_cell *lmb)
+ +{
+ +	int rc;
+ +
+  	if (lmb->flags & DRCONF_MEM_ASSIGNED)
+  		return -EINVAL;
+  
+@@@ -666,10 -758,24 +685,23 @@@
+  		return rc;
+  	}
+  
+ -	block_sz = memory_block_size_bytes();
+ -
+ -	/* Find the node id for this address */
+ -	nid = memory_add_physaddr_to_nid(lmb->base_addr);
+ -
+ -	/* Add the memory */
+ -	rc = add_memory(nid, lmb->base_addr, block_sz);
+ +	rc = dlpar_add_lmb_memory(lmb);
+ +	if (rc) {
+ +		dlpar_remove_device_tree_lmb(lmb);
+ +		dlpar_release_drc(lmb->drc_index);
+++=======
++ 	if (rc) {
++ 		dlpar_remove_device_tree_lmb(lmb);
++ 		return rc;
++ 	}
++ 
++ 	rc = dlpar_online_lmb(lmb);
++ 	if (rc) {
++ 		remove_memory(nid, lmb->base_addr, block_sz);
++ 		dlpar_remove_device_tree_lmb(lmb);
++ 	} else {
++ 		lmb->flags |= DRCONF_MEM_ASSIGNED;
+++>>>>>>> 943db62c316c (powerpc/pseries: Revert 'Auto-online hotplugged memory')
+  	}
+  
+  	return rc;
+* Unmerged path arch/powerpc/configs/pseries_defconfig
+* Unmerged path arch/powerpc/platforms/pseries/hotplug-memory.c
