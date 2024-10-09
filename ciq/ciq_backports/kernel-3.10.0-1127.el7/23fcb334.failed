@@ -1,0 +1,155 @@
+xfs: More robust inode extent count validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 23fcb3340d033d9f081e21e6c12c2db7eaa541d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/23fcb334.failed
+
+When the inode is in extent format, it can't have more extents that
+fit in the inode fork. We don't currenty check this, and so this
+corruption goes unnoticed by the inode verifiers. This can lead to
+crashes operating on invalid in-memory structures.
+
+Attempts to access such a inode will now error out in the verifier
+rather than allowing modification operations to proceed.
+
+	Reported-by: Wen Xu <wen.xu@gatech.edu>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+[darrick: fix a typedef, add some braces and breaks to shut up compiler warnings]
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 23fcb3340d033d9f081e21e6c12c2db7eaa541d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_inode_buf.c
+diff --cc fs/xfs/libxfs/xfs_inode_buf.c
+index fe255e3e31b3,33dc34655ac3..000000000000
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@@ -374,7 -374,48 +374,52 @@@ xfs_log_dinode_to_disk
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +bool
+++=======
++ static xfs_failaddr_t
++ xfs_dinode_verify_fork(
++ 	struct xfs_dinode	*dip,
++ 	struct xfs_mount	*mp,
++ 	int			whichfork)
++ {
++ 	uint32_t		di_nextents = XFS_DFORK_NEXTENTS(dip, whichfork);
++ 
++ 	switch (XFS_DFORK_FORMAT(dip, whichfork)) {
++ 	case XFS_DINODE_FMT_LOCAL:
++ 		/*
++ 		 * no local regular files yet
++ 		 */
++ 		if (whichfork == XFS_DATA_FORK) {
++ 			if (S_ISREG(be16_to_cpu(dip->di_mode)))
++ 				return __this_address;
++ 			if (be64_to_cpu(dip->di_size) >
++ 					XFS_DFORK_SIZE(dip, mp, whichfork))
++ 				return __this_address;
++ 		}
++ 		if (di_nextents)
++ 			return __this_address;
++ 		break;
++ 	case XFS_DINODE_FMT_EXTENTS:
++ 		if (di_nextents > XFS_DFORK_MAXEXT(dip, mp, whichfork))
++ 			return __this_address;
++ 		break;
++ 	case XFS_DINODE_FMT_BTREE:
++ 		if (whichfork == XFS_ATTR_FORK) {
++ 			if (di_nextents > MAXAEXTNUM)
++ 				return __this_address;
++ 		} else if (di_nextents > MAXEXTNUM) {
++ 			return __this_address;
++ 		}
++ 		break;
++ 	default:
++ 		return __this_address;
++ 	}
++ 	return NULL;
++ }
++ 
++ xfs_failaddr_t
+++>>>>>>> 23fcb3340d03 (xfs: More robust inode extent count validation)
+  xfs_dinode_verify(
+  	struct xfs_mount	*mp,
+  	xfs_ino_t		ino,
+@@@ -426,24 -482,9 +471,30 @@@
+  	case S_IFREG:
+  	case S_IFLNK:
+  	case S_IFDIR:
+++<<<<<<< HEAD
+ +		switch (dip->di_format) {
+ +		case XFS_DINODE_FMT_LOCAL:
+ +			/*
+ +			 * no local regular files yet
+ +			 */
+ +			if (S_ISREG(mode))
+ +				return false;
+ +			if (di_size > XFS_DFORK_DSIZE(dip, mp))
+ +				return false;
+ +			if (dip->di_nextents)
+ +				return false;
+ +			/* fall through */
+ +		case XFS_DINODE_FMT_EXTENTS:
+ +		case XFS_DINODE_FMT_BTREE:
+ +			break;
+ +		default:
+ +			return false;
+ +		}
+++=======
++ 		fa = xfs_dinode_verify_fork(dip, mp, XFS_DATA_FORK);
++ 		if (fa)
++ 			return fa;
+++>>>>>>> 23fcb3340d03 (xfs: More robust inode extent count validation)
+  		break;
+  	case 0:
+  		/* Uninitialized inode ok. */
+@@@ -453,17 -494,9 +504,23 @@@
+  	}
+  
+  	if (XFS_DFORK_Q(dip)) {
+++<<<<<<< HEAD
+ +		switch (dip->di_aformat) {
+ +		case XFS_DINODE_FMT_LOCAL:
+ +			if (dip->di_anextents)
+ +				return false;
+ +		/* fall through */
+ +		case XFS_DINODE_FMT_EXTENTS:
+ +		case XFS_DINODE_FMT_BTREE:
+ +			break;
+ +		default:
+ +			return false;
+ +		}
+++=======
++ 		fa = xfs_dinode_verify_fork(dip, mp, XFS_ATTR_FORK);
++ 		if (fa)
++ 			return fa;
+++>>>>>>> 23fcb3340d03 (xfs: More robust inode extent count validation)
+  	} else {
+  		/*
+  		 * If there is no fork offset, this may be a freshly-made inode
+diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+index dfaac88e3baa..2f13d501b76f 100644
+--- a/fs/xfs/libxfs/xfs_format.h
++++ b/fs/xfs/libxfs/xfs_format.h
+@@ -951,6 +951,9 @@ typedef enum xfs_dinode_fmt {
+ 		XFS_DFORK_DSIZE(dip, mp) : \
+ 		XFS_DFORK_ASIZE(dip, mp))
+ 
++#define XFS_DFORK_MAXEXT(dip, mp, w) \
++	(XFS_DFORK_SIZE(dip, mp, w) / sizeof(struct xfs_bmbt_rec))
++
+ /*
+  * Return pointers to the data or attribute forks.
+  */
+* Unmerged path fs/xfs/libxfs/xfs_inode_buf.c
