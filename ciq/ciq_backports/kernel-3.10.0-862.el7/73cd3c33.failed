@@ -1,0 +1,97 @@
+fsnotify: Avoid double locking in fsnotify_detach_from_object()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 73cd3c33ab793325ebaae27fa58b4f713c16f12c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/73cd3c33.failed
+
+We lock object list lock in fsnotify_detach_from_object() twice - once
+to detach mark and second time to recalculate mask. That is unnecessary
+and later it will become problematic as we will free the connector as
+soon as there is no mark in it. So move recalculation of fsnotify mask
+into the same critical section that is detaching mark.
+
+This also removes recalculation of child dentry flags from
+fsnotify_detach_from_object(). That is however fine. Those marks will
+get recalculated once some event happens on a child.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 73cd3c33ab793325ebaae27fa58b4f713c16f12c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/mark.c
+diff --cc fs/notify/mark.c
+index 44836e539169,416ba91750a9..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -109,9 -110,59 +109,63 @@@ u32 fsnotify_recalc_mask(struct hlist_h
+  	u32 new_mask = 0;
+  	struct fsnotify_mark *mark;
+  
+ -	hlist_for_each_entry(mark, &conn->list, obj_list)
+ +	hlist_for_each_entry(mark, head, obj_list)
+  		new_mask |= mark->mask;
+++<<<<<<< HEAD
+ +	return new_mask;
+++=======
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		conn->inode->i_fsnotify_mask = new_mask;
++ 	else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ 		real_mount(conn->mnt)->mnt_fsnotify_mask = new_mask;
++ }
++ 
++ /*
++  * Calculate mask of events for a list of marks. The caller must make sure
++  * connector cannot disappear under us (usually by holding a mark->lock or
++  * mark->group->mark_mutex for a mark on this list).
++  */
++ void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
++ {
++ 	if (!conn)
++ 		return;
++ 
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		spin_lock(&conn->inode->i_lock);
++ 	else
++ 		spin_lock(&conn->mnt->mnt_root->d_lock);
++ 	__fsnotify_recalc_mask(conn);
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE) {
++ 		spin_unlock(&conn->inode->i_lock);
++ 		__fsnotify_update_child_dentry_flags(conn->inode);
++ 	} else {
++ 		spin_unlock(&conn->mnt->mnt_root->d_lock);
++ 	}
++ }
++ 
++ static struct inode *fsnotify_detach_from_object(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_mark_connector *conn;
++ 	struct inode *inode = NULL;
++ 	spinlock_t *lock;
++ 
++ 	conn = mark->connector;
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		lock = &conn->inode->i_lock;
++ 	else
++ 		lock = &conn->mnt->mnt_root->d_lock;
++ 	spin_lock(lock);
++ 	hlist_del_init_rcu(&mark->obj_list);
++ 	if (hlist_empty(&conn->list)) {
++ 		if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 			inode = conn->inode;
++ 	}
++ 	__fsnotify_recalc_mask(conn);
++ 	mark->connector = NULL;
++ 	spin_unlock(lock);
++ 
++ 	return inode;
+++>>>>>>> 73cd3c33ab79 (fsnotify: Avoid double locking in fsnotify_detach_from_object())
+  }
+  
+  /*
+* Unmerged path fs/notify/mark.c
