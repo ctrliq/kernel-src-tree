@@ -1,0 +1,284 @@
+RDMA/core: Fix panic when port_data isn't initialized
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.66.1.el7
+Rebuild_CHGLOG: - RDMA/core: Fix panic when port_pkey_list isn't initialized (Kamal Heib) [2046571]
+Rebuild_FUZZ: 90.09%
+commit-author Kamal Heib <kamalheib1@gmail.com>
+commit 46bdf370f671c90573e8b683d9a14bb335057a36
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.66.1.el7/46bdf370.failed
+
+This happens if assign_name() returns failure when called from
+ib_register_device(), that will lead to the following panic in every time
+that someone touches the port_data's data members.
+
+ BUG: unable to handle kernel NULL pointer dereference at 00000000000000c0
+ PGD 0 P4D 0
+ Oops: 0002 [#1] SMP PTI
+ CPU: 19 PID: 1994 Comm: systemd-udevd Not tainted 5.1.0-rc5+ #1
+ Hardware name: HP ProLiant DL360p Gen8, BIOS P71 12/20/2013
+ RIP: 0010:_raw_spin_lock_irqsave+0x1e/0x40
+ Code: 85 ff 66 2e 0f 1f 84 00 00 00 00 00 66 66 66 66 90 53 9c 58 66 66 90
+ 66 90 48 89 c3 fa 66 66 90 66 66 90 31 c0 ba 01 00 00 00 <f0> 0f b1 17 0f
+ 94 c2 84 d2 74 05 48 89 d8 5b c3 89 c6 e8 b4 85 8a
+ RSP: 0018:ffffa8d7079a7c08 EFLAGS: 00010046
+ RAX: 0000000000000000 RBX: 0000000000000202 RCX: ffffa8d7079a7bf8
+ RDX: 0000000000000001 RSI: ffff93607c990000 RDI: 00000000000000c0
+ RBP: 0000000000000001 R08: 0000000000000000 R09: ffffffffc08c4dd8
+ R10: 0000000000000000 R11: 0000000000000001 R12: 00000000000000c0
+ R13: ffff93607c990000 R14: ffffffffc05a9740 R15: ffffa8d7079a7e98
+ FS:  00007f1c6ee438c0(0000) GS:ffff93609f6c0000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00000000000000c0 CR3: 0000000819fca002 CR4: 00000000000606e0
+ Call Trace:
+  free_netdevs+0x4d/0xe0 [ib_core]
+  ib_dealloc_device+0x51/0xb0 [ib_core]
+  __mlx5_ib_add+0x5e/0x70 [mlx5_ib]
+  mlx5_add_device+0x57/0xe0 [mlx5_core]
+  mlx5_register_interface+0x85/0xc0 [mlx5_core]
+  ? 0xffffffffc0474000
+  do_one_initcall+0x4e/0x1d4
+  ? _cond_resched+0x15/0x30
+  ? kmem_cache_alloc_trace+0x15f/0x1c0
+  do_init_module+0x5a/0x218
+  load_module+0x186b/0x1e40
+  ? m_show+0x1c0/0x1c0
+  __do_sys_finit_module+0x94/0xe0
+  do_syscall_64+0x5b/0x180
+  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fixes: 8ceb1357b337 ("RDMA/device: Consolidate ib_device per_port data into one place")
+	Signed-off-by: Kamal Heib <kamalheib1@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 46bdf370f671c90573e8b683d9a14bb335057a36)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index 56415acae6de,29f7b15c81d9..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -236,12 -489,18 +236,27 @@@ static void ib_device_release(struct de
+  {
+  	struct ib_device *dev = container_of(device, struct ib_device, dev);
+  
+++<<<<<<< HEAD
+ +	WARN_ON(dev->reg_state == IB_DEV_REGISTERED);
+ +	ib_cache_release_one(dev);
+ +	ib_security_release_port_pkey_list(dev);
+ +	kfree(dev->port_pkey_list);
+ +	kfree(dev->port_immutable);
+ +	kfree(dev);
+++=======
++ 	free_netdevs(dev);
++ 	WARN_ON(refcount_read(&dev->refcount));
++ 	if (dev->port_data) {
++ 		ib_cache_release_one(dev);
++ 		ib_security_release_port_pkey_list(dev);
++ 		kfree_rcu(container_of(dev->port_data, struct ib_port_data_rcu,
++ 				       pdata[0]),
++ 			  rcu_head);
++ 	}
++ 	xa_destroy(&dev->compat_devs);
++ 	xa_destroy(&dev->client_data);
++ 	kfree_rcu(dev, rcu_head);
+++>>>>>>> 46bdf370f671 (RDMA/core: Fix panic when port_data isn't initialized)
+  }
+  
+  static int ib_device_uevent(struct device *device,
+@@@ -895,6 -1869,188 +910,191 @@@ int ib_query_port(struct ib_device *dev
+  }
+  EXPORT_SYMBOL(ib_query_port);
+  
+++<<<<<<< HEAD
+++=======
++ static void add_ndev_hash(struct ib_port_data *pdata)
++ {
++ 	unsigned long flags;
++ 
++ 	might_sleep();
++ 
++ 	spin_lock_irqsave(&ndev_hash_lock, flags);
++ 	if (hash_hashed(&pdata->ndev_hash_link)) {
++ 		hash_del_rcu(&pdata->ndev_hash_link);
++ 		spin_unlock_irqrestore(&ndev_hash_lock, flags);
++ 		/*
++ 		 * We cannot do hash_add_rcu after a hash_del_rcu until the
++ 		 * grace period
++ 		 */
++ 		synchronize_rcu();
++ 		spin_lock_irqsave(&ndev_hash_lock, flags);
++ 	}
++ 	if (pdata->netdev)
++ 		hash_add_rcu(ndev_hash, &pdata->ndev_hash_link,
++ 			     (uintptr_t)pdata->netdev);
++ 	spin_unlock_irqrestore(&ndev_hash_lock, flags);
++ }
++ 
++ /**
++  * ib_device_set_netdev - Associate the ib_dev with an underlying net_device
++  * @ib_dev: Device to modify
++  * @ndev: net_device to affiliate, may be NULL
++  * @port: IB port the net_device is connected to
++  *
++  * Drivers should use this to link the ib_device to a netdev so the netdev
++  * shows up in interfaces like ib_enum_roce_netdev. Only one netdev may be
++  * affiliated with any port.
++  *
++  * The caller must ensure that the given ndev is not unregistered or
++  * unregistering, and that either the ib_device is unregistered or
++  * ib_device_set_netdev() is called with NULL when the ndev sends a
++  * NETDEV_UNREGISTER event.
++  */
++ int ib_device_set_netdev(struct ib_device *ib_dev, struct net_device *ndev,
++ 			 unsigned int port)
++ {
++ 	struct net_device *old_ndev;
++ 	struct ib_port_data *pdata;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	/*
++ 	 * Drivers wish to call this before ib_register_driver, so we have to
++ 	 * setup the port data early.
++ 	 */
++ 	ret = alloc_port_data(ib_dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!rdma_is_port_valid(ib_dev, port))
++ 		return -EINVAL;
++ 
++ 	pdata = &ib_dev->port_data[port];
++ 	spin_lock_irqsave(&pdata->netdev_lock, flags);
++ 	old_ndev = rcu_dereference_protected(
++ 		pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 	if (old_ndev == ndev) {
++ 		spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 		return 0;
++ 	}
++ 
++ 	if (ndev)
++ 		dev_hold(ndev);
++ 	rcu_assign_pointer(pdata->netdev, ndev);
++ 	spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 
++ 	add_ndev_hash(pdata);
++ 	if (old_ndev)
++ 		dev_put(old_ndev);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(ib_device_set_netdev);
++ 
++ static void free_netdevs(struct ib_device *ib_dev)
++ {
++ 	unsigned long flags;
++ 	unsigned int port;
++ 
++ 	if (!ib_dev->port_data)
++ 		return;
++ 
++ 	rdma_for_each_port (ib_dev, port) {
++ 		struct ib_port_data *pdata = &ib_dev->port_data[port];
++ 		struct net_device *ndev;
++ 
++ 		spin_lock_irqsave(&pdata->netdev_lock, flags);
++ 		ndev = rcu_dereference_protected(
++ 			pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 		if (ndev) {
++ 			spin_lock(&ndev_hash_lock);
++ 			hash_del_rcu(&pdata->ndev_hash_link);
++ 			spin_unlock(&ndev_hash_lock);
++ 
++ 			/*
++ 			 * If this is the last dev_put there is still a
++ 			 * synchronize_rcu before the netdev is kfreed, so we
++ 			 * can continue to rely on unlocked pointer
++ 			 * comparisons after the put
++ 			 */
++ 			rcu_assign_pointer(pdata->netdev, NULL);
++ 			dev_put(ndev);
++ 		}
++ 		spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 	}
++ }
++ 
++ struct net_device *ib_device_get_netdev(struct ib_device *ib_dev,
++ 					unsigned int port)
++ {
++ 	struct ib_port_data *pdata;
++ 	struct net_device *res;
++ 
++ 	if (!rdma_is_port_valid(ib_dev, port))
++ 		return NULL;
++ 
++ 	pdata = &ib_dev->port_data[port];
++ 
++ 	/*
++ 	 * New drivers should use ib_device_set_netdev() not the legacy
++ 	 * get_netdev().
++ 	 */
++ 	if (ib_dev->ops.get_netdev)
++ 		res = ib_dev->ops.get_netdev(ib_dev, port);
++ 	else {
++ 		spin_lock(&pdata->netdev_lock);
++ 		res = rcu_dereference_protected(
++ 			pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 		if (res)
++ 			dev_hold(res);
++ 		spin_unlock(&pdata->netdev_lock);
++ 	}
++ 
++ 	/*
++ 	 * If we are starting to unregister expedite things by preventing
++ 	 * propagation of an unregistering netdev.
++ 	 */
++ 	if (res && res->reg_state != NETREG_REGISTERED) {
++ 		dev_put(res);
++ 		return NULL;
++ 	}
++ 
++ 	return res;
++ }
++ 
++ /**
++  * ib_device_get_by_netdev - Find an IB device associated with a netdev
++  * @ndev: netdev to locate
++  * @driver_id: The driver ID that must match (RDMA_DRIVER_UNKNOWN matches all)
++  *
++  * Find and hold an ib_device that is associated with a netdev via
++  * ib_device_set_netdev(). The caller must call ib_device_put() on the
++  * returned pointer.
++  */
++ struct ib_device *ib_device_get_by_netdev(struct net_device *ndev,
++ 					  enum rdma_driver_id driver_id)
++ {
++ 	struct ib_device *res = NULL;
++ 	struct ib_port_data *cur;
++ 
++ 	rcu_read_lock();
++ 	hash_for_each_possible_rcu (ndev_hash, cur, ndev_hash_link,
++ 				    (uintptr_t)ndev) {
++ 		if (rcu_access_pointer(cur->netdev) == ndev &&
++ 		    (driver_id == RDMA_DRIVER_UNKNOWN ||
++ 		     cur->ib_dev->driver_id == driver_id) &&
++ 		    ib_device_try_get(cur->ib_dev)) {
++ 			res = cur->ib_dev;
++ 			break;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return res;
++ }
++ EXPORT_SYMBOL(ib_device_get_by_netdev);
++ 
+++>>>>>>> 46bdf370f671 (RDMA/core: Fix panic when port_data isn't initialized)
+  /**
+   * ib_enum_roce_netdev - enumerate all RoCE ports
+   * @ib_dev : IB device we want to query
+* Unmerged path drivers/infiniband/core/device.c
