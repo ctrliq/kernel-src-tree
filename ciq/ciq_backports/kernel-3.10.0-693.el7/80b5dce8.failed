@@ -1,0 +1,105 @@
+vfs: Add a function to lazily unmount all mounts from any dentry.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [fs] vfs: Add a function to lazily unmount all mounts from any dentry ("Eric W. Biederman") [1247935]
+Rebuild_FUZZ: 99.22%
+commit-author Eric W. Biederman <ebiederman@twitter.com>
+commit 80b5dce8c59b0de1ed6e403b8298e02dcb4db64b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/80b5dce8.failed
+
+The new function detach_mounts comes in two pieces.  The first piece
+is a static inline test of d_mounpoint that returns immediately
+without taking any locks if d_mounpoint is not set.  In the common
+case when mountpoints are absent this allows the vfs to continue
+running with it's same cacheline foot print.
+
+The second piece of detach_mounts __detach_mounts actually does the
+work and it assumes that a mountpoint is present so it is slow and
+takes namespace_sem for write, and then locks the mount hash (aka
+mount_lock) after a struct mountpoint has been found.
+
+With those two locks held each entry on the list of mounts on a
+mountpoint is selected and lazily unmounted until all of the mount
+have been lazily unmounted.
+
+v7: Wrote a proper change description and removed the changelog
+    documenting deleted wrong turns.
+
+	Signed-off-by: Eric W. Biederman <ebiederman@twitter.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 80b5dce8c59b0de1ed6e403b8298e02dcb4db64b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/mount.h
+diff --cc fs/mount.h
+index e343bfffd887,f82c62840905..000000000000
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@@ -79,6 -85,17 +79,20 @@@ static inline int is_mounted(struct vfs
+  extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+  extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+  
+++<<<<<<< HEAD
+++=======
++ extern bool legitimize_mnt(struct vfsmount *, unsigned);
++ 
++ extern void __detach_mounts(struct dentry *dentry);
++ 
++ static inline void detach_mounts(struct dentry *dentry)
++ {
++ 	if (!d_mountpoint(dentry))
++ 		return;
++ 	__detach_mounts(dentry);
++ }
++ 
+++>>>>>>> 80b5dce8c59b (vfs: Add a function to lazily unmount all mounts from any dentry.)
+  static inline void get_mnt_ns(struct mnt_namespace *ns)
+  {
+  	atomic_inc(&ns->count);
+* Unmerged path fs/mount.h
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 07e51358b239..d5f7d37cea8f 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1335,6 +1335,37 @@ static int do_umount(struct mount *mnt, int flags)
+ 	return retval;
+ }
+ 
++/*
++ * __detach_mounts - lazily unmount all mounts on the specified dentry
++ *
++ * During unlink, rmdir, and d_drop it is possible to loose the path
++ * to an existing mountpoint, and wind up leaking the mount.
++ * detach_mounts allows lazily unmounting those mounts instead of
++ * leaking them.
++ *
++ * The caller may hold dentry->d_inode->i_mutex.
++ */
++void __detach_mounts(struct dentry *dentry)
++{
++	struct mountpoint *mp;
++	struct mount *mnt;
++
++	namespace_lock();
++	mp = lookup_mountpoint(dentry);
++	if (!mp)
++		goto out_unlock;
++
++	lock_mount_hash();
++	while (!hlist_empty(&mp->m_list)) {
++		mnt = hlist_entry(mp->m_list.first, struct mount, mnt_mp_list);
++		umount_tree(mnt, 2);
++	}
++	unlock_mount_hash();
++	put_mountpoint(mp);
++out_unlock:
++	namespace_unlock();
++}
++
+ /* 
+  * Is the caller allowed to modify his namespace?
+  */
