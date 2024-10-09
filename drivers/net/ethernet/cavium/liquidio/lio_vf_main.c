@@ -527,7 +527,7 @@ static void update_link_status(struct net_device *netdev,
 			wake_txqs(netdev);
 		} else {
 			netif_carrier_off(netdev);
-			txqs_stop(netdev);
+			stop_txqs(netdev);
 		}
 
 		if (lio->linfo.link.s.mtu != netdev->extended->max_mtu) {
@@ -1211,7 +1211,7 @@ static int liquidio_stop(struct net_device *netdev)
 
 	ifstate_reset(lio, LIO_IFSTATE_RUNNING);
 
-	txqs_stop(netdev);
+	stop_txqs(netdev);
 
 	dev_info(&oct->pci_dev->dev, "%s interface is stopped\n", netdev->name);
 

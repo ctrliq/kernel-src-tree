@@ -785,7 +785,7 @@ static inline void update_link_status(struct net_device *netdev,
 			wake_txqs(netdev);
 		} else {
 			netif_carrier_off(netdev);
-			txqs_stop(netdev);
+			stop_txqs(netdev);
 		}
 	}
 }
