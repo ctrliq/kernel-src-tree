@@ -1,0 +1,283 @@
+bridge: add vlan filtering change notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Elad Raz <eladr@mellanox.com>
+commit 6b72a770202a0ad843312436dd50ed4690d7cc65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6b72a770.failed
+
+Notifying hardware about bridge vlan-aware changes.
+
+	Signed-off-by: Elad Raz <eladr@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6b72a770202a0ad843312436dd50ed4690d7cc65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,190fb3372ab5..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -355,99 -578,75 +355,123 @@@ int br_vlan_delete(struct net_bridge *b
+  
+  void br_vlan_flush(struct net_bridge *br)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ +	struct net_port_vlans *pv;
+  
+  	ASSERT_RTNL();
+ +	pv = rtnl_dereference(br->vlan_info);
+ +	if (!pv)
+ +		return;
+  
+ -	vg = br_vlan_group(br);
+ -	__vlan_flush(vg);
+ -	RCU_INIT_POINTER(br->vlgrp, NULL);
+ -	synchronize_rcu();
+ -	__vlan_group_free(vg);
+ +	__vlan_flush(pv);
+  }
+  
+ -struct net_bridge_vlan *br_vlan_find(struct net_bridge_vlan_group *vg, u16 vid)
+ +bool br_vlan_find(struct net_bridge *br, u16 vid)
+  {
+ -	if (!vg)
+ -		return NULL;
+ +	struct net_port_vlans *pv;
+ +	bool found = false;
+ +
+ +	rcu_read_lock();
+ +	pv = rcu_dereference(br->vlan_info);
+ +
+ +	if (!pv)
+ +		goto out;
+ +
+ +	if (test_bit(vid, pv->vlan_bitmap))
+ +		found = true;
+  
+ -	return br_vlan_lookup(&vg->vlan_hash, vid);
+ +out:
+ +	rcu_read_unlock();
+ +	return found;
+  }
+  
+ -/* Must be protected by RTNL. */
+ -static void recalculate_group_addr(struct net_bridge *br)
+ +static void br_set_hw_filters(struct net_bridge *br)
+  {
+ -	if (br->group_addr_set)
+ -		return;
+ +	struct net_bridge_port *p;
+ +	struct net_port_vlans *pv;
+ +	u16 vid, errvid;
+ +	int err;
+ +
+ +	/* For each port, walk the vlan bitmap and write the vlan
+ +	 * info to port driver.
+ +	 */
+ +	list_for_each_entry(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID) {
+ +			err = vlan_vid_add(p->dev, br->vlan_proto, vid);
+ +			if (err)
+ +				goto err_flt;
+ +		}
+ +	}
+ +
+ +	return;
+ +
+ +err_flt:
+ +	errvid = vid;
+ +	for_each_set_bit(vid, pv->vlan_bitmap, errvid)
+ +		vlan_vid_del(p->dev, br->vlan_proto, vid);
+  
+ -	spin_lock_bh(&br->lock);
+ -	if (!br->vlan_enabled || br->vlan_proto == htons(ETH_P_8021Q)) {
+ -		/* Bridge Group Address */
+ -		br->group_addr[5] = 0x00;
+ -	} else { /* vlan_enabled && ETH_P_8021AD */
+ -		/* Provider Bridge Group Address */
+ -		br->group_addr[5] = 0x08;
+ +	list_for_each_entry_continue_reverse(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
+ +			vlan_vid_del(p->dev, br->vlan_proto, vid);
+  	}
+ -	spin_unlock_bh(&br->lock);
+  }
+  
+ -/* Must be protected by RTNL. */
+ -void br_recalculate_fwd_mask(struct net_bridge *br)
+ +static void br_clear_hw_filters(struct net_bridge *br)
+  {
+ -	if (!br->vlan_enabled || br->vlan_proto == htons(ETH_P_8021Q))
+ -		br->group_fwd_mask_required = BR_GROUPFWD_DEFAULT;
+ -	else /* vlan_enabled && ETH_P_8021AD */
+ -		br->group_fwd_mask_required = BR_GROUPFWD_8021AD &
+ -					      ~(1u << br->group_addr[5]);
+ +	struct net_bridge_port *p;
+ +	struct net_port_vlans *pv;
+ +	u16 vid;
+ +
+ +	/* For each port, walk the vlan bitmap and clear
+ +	 * the vlan info from the port driver.
+ +	 */
+ +	list_for_each_entry(p, &br->port_list, list) {
+ +		pv = rtnl_dereference(p->vlan_info);
+ +		if (!pv)
+ +			continue;
+ +
+ +		for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID)
+ +			vlan_vid_del(p->dev, br->vlan_proto, vid);
+ +	}
+  }
+  
+ -int __br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ +static void br_manage_vlans(struct net_bridge *br)
+  {
+++<<<<<<< HEAD
+ +	if (br->vlan_enabled)
+ +		br_set_hw_filters(br);
+ +	else
+ +		br_clear_hw_filters(br);
+++=======
++ 	struct switchdev_attr attr = {
++ 		.orig_dev = br->dev,
++ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING,
++ 		.flags = SWITCHDEV_F_SKIP_EOPNOTSUPP,
++ 		.u.vlan_filtering = val,
++ 	};
++ 	int err;
++ 
++ 	if (br->vlan_enabled == val)
++ 		return 0;
++ 
++ 	err = switchdev_port_attr_set(br->dev, &attr);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	br->vlan_enabled = val;
++ 	br_manage_promisc(br);
++ 	recalculate_group_addr(br);
++ 	br_recalculate_fwd_mask(br);
++ 
++ 	return 0;
+++>>>>>>> 6b72a770202a (bridge: add vlan filtering change notification)
+  }
+  
+  int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+@@@ -455,21 -656,90 +481,28 @@@
+  	if (!rtnl_trylock())
+  		return restart_syscall();
+  
+ -	err = __br_vlan_filter_toggle(br, val);
+ -	rtnl_unlock();
+ -
+ -	return err;
+ -}
+ -
+ -int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
+ -{
+ -	int err = 0;
+ -	struct net_bridge_port *p;
+ -	struct net_bridge_vlan *vlan;
+ -	struct net_bridge_vlan_group *vg;
+ -	__be16 oldproto;
+ -
+ -	if (br->vlan_proto == proto)
+ -		return 0;
+ -
+ -	/* Add VLANs for the new proto to the device filter. */
+ -	list_for_each_entry(p, &br->port_list, list) {
+ -		vg = nbp_vlan_group(p);
+ -		list_for_each_entry(vlan, &vg->vlan_list, vlist) {
+ -			err = vlan_vid_add(p->dev, proto, vlan->vid);
+ -			if (err)
+ -				goto err_filt;
+ -		}
+ -	}
+ -
+ -	oldproto = br->vlan_proto;
+ -	br->vlan_proto = proto;
+ -
+ -	recalculate_group_addr(br);
+ -	br_recalculate_fwd_mask(br);
+++<<<<<<< HEAD
+ +	if (br->vlan_enabled == val)
+ +		goto unlock;
+  
+ -	/* Delete VLANs for the old proto from the device filter. */
+ -	list_for_each_entry(p, &br->port_list, list) {
+ -		vg = nbp_vlan_group(p);
+ -		list_for_each_entry(vlan, &vg->vlan_list, vlist)
+ -			vlan_vid_del(p->dev, oldproto, vlan->vid);
+ -	}
+ +	br->vlan_enabled = val;
+ +	br_manage_vlans(br);
+ +	br_manage_promisc(br);
+  
+ +unlock:
+ +	rtnl_unlock();
+  	return 0;
+ -
+ -err_filt:
+ -	list_for_each_entry_continue_reverse(vlan, &vg->vlan_list, vlist)
+ -		vlan_vid_del(p->dev, proto, vlan->vid);
+ -
+ -	list_for_each_entry_continue_reverse(p, &br->port_list, list) {
+ -		vg = nbp_vlan_group(p);
+ -		list_for_each_entry(vlan, &vg->vlan_list, vlist)
+ -			vlan_vid_del(p->dev, proto, vlan->vid);
+ -	}
+ -
+ -	return err;
+ -}
+ -
+ -int br_vlan_set_proto(struct net_bridge *br, unsigned long val)
+ -{
+ -	int err;
+ -
+ -	if (val != ETH_P_8021Q && val != ETH_P_8021AD)
+ -		return -EPROTONOSUPPORT;
+ -
+ -	if (!rtnl_trylock())
+ -		return restart_syscall();
+ -
+ -	err = __br_vlan_set_proto(br, htons(val));
+++=======
+++	err = __br_vlan_filter_toggle(br, val);
++ 	rtnl_unlock();
++ 
++ 	return err;
+++>>>>>>> 6b72a770202a (bridge: add vlan filtering change notification)
+  }
+  
+ -static bool vlan_default_pvid(struct net_bridge_vlan_group *vg, u16 vid)
+ +static bool vlan_default_pvid(struct net_port_vlans *pv, u16 vid)
+  {
+ -	struct net_bridge_vlan *v;
+ -
+ -	if (vid != vg->pvid)
+ -		return false;
+ -
+ -	v = br_vlan_lookup(&vg->vlan_hash, vid);
+ -	if (v && br_vlan_should_use(v) &&
+ -	    (v->flags & BRIDGE_VLAN_INFO_UNTAGGED))
+ -		return true;
+ -
+ -	return false;
+ +	return pv && vid == pv->pvid && test_bit(vid, pv->untagged_bitmap);
+  }
+  
+  static void br_vlan_disable_default_pvid(struct net_bridge *br)
+* Unmerged path net/bridge/br_vlan.c
