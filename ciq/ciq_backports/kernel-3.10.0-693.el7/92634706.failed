@@ -1,0 +1,355 @@
+target: break up free_device callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [target] tcmu: break up free_device callback (Mike Christie) [1430225]
+Rebuild_FUZZ: 88.89%
+commit-author Mike Christie <mchristi@redhat.com>
+commit 926347061ef1f4d3873829fd1960c6e4b965aa9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/92634706.failed
+
+With this patch free_device is now used to free what is allocated in the
+alloc_device callback and destroy_device tears down the resources that are
+setup in the configure_device callback.
+
+This patch will be needed in the next patch where tcmu needs
+to be able to look up the device in the destroy callback.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 926347061ef1f4d3873829fd1960c6e4b965aa9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_file.c
+#	drivers/target/target_core_iblock.c
+#	drivers/target/target_core_pscsi.c
+#	drivers/target/target_core_rd.c
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_file.c
+index 350a3b68b1de,50f235580546..000000000000
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@@ -246,7 -227,20 +246,12 @@@ fail
+  	return ret;
+  }
+  
+ -static void fd_dev_call_rcu(struct rcu_head *p)
+ -{
+ -	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ -	struct fd_dev *fd_dev = FD_DEV(dev);
+ -
+ -	kfree(fd_dev);
+ -}
+ -
+  static void fd_free_device(struct se_device *dev)
++ {
++ 	call_rcu(&dev->rcu_head, fd_dev_call_rcu);
++ }
++ 
++ static void fd_destroy_device(struct se_device *dev)
+  {
+  	struct fd_dev *fd_dev = FD_DEV(dev);
+  
+@@@ -254,82 -248,21 +259,85 @@@
+  		filp_close(fd_dev->fd_file, NULL);
+  		fd_dev->fd_file = NULL;
+  	}
+++<<<<<<< HEAD
+ +
+ +	kfree(fd_dev);
+++=======
+++>>>>>>> 926347061ef1 (target: break up free_device callback)
+ +}
+ +
+ +static int fd_do_prot_rw(struct se_cmd *cmd, struct fd_prot *fd_prot,
+ +			 int is_write)
+ +{
+ +	struct se_device *se_dev = cmd->se_dev;
+ +	struct fd_dev *dev = FD_DEV(se_dev);
+ +	struct file *prot_fd = dev->fd_prot_file;
+ +	loff_t pos = (cmd->t_task_lba * se_dev->prot_length);
+ +	unsigned char *buf;
+ +	u32 prot_size;
+ +	int rc, ret = 1;
+ +
+ +	prot_size = (cmd->data_length / se_dev->dev_attrib.block_size) *
+ +		     se_dev->prot_length;
+ +
+ +	if (!is_write) {
+ +		fd_prot->prot_buf = kzalloc(prot_size, GFP_KERNEL);
+ +		if (!fd_prot->prot_buf) {
+ +			pr_err("Unable to allocate fd_prot->prot_buf\n");
+ +			return -ENOMEM;
+ +		}
+ +		buf = fd_prot->prot_buf;
+ +
+ +		fd_prot->prot_sg_nents = 1;
+ +		fd_prot->prot_sg = kzalloc(sizeof(struct scatterlist),
+ +					   GFP_KERNEL);
+ +		if (!fd_prot->prot_sg) {
+ +			pr_err("Unable to allocate fd_prot->prot_sg\n");
+ +			kfree(fd_prot->prot_buf);
+ +			return -ENOMEM;
+ +		}
+ +		sg_init_table(fd_prot->prot_sg, fd_prot->prot_sg_nents);
+ +		sg_set_buf(fd_prot->prot_sg, buf, prot_size);
+ +	}
+ +
+ +	if (is_write) {
+ +		rc = kernel_write(prot_fd, fd_prot->prot_buf, prot_size, pos);
+ +		if (rc < 0 || prot_size != rc) {
+ +			pr_err("kernel_write() for fd_do_prot_rw failed:"
+ +			       " %d\n", rc);
+ +			ret = -EINVAL;
+ +		}
+ +	} else {
+ +		rc = kernel_read(prot_fd, pos, fd_prot->prot_buf, prot_size);
+ +		if (rc < 0) {
+ +			pr_err("kernel_read() for fd_do_prot_rw failed:"
+ +			       " %d\n", rc);
+ +			ret = -EINVAL;
+ +		}
+ +	}
+ +
+ +	if (is_write || ret < 0) {
+ +		kfree(fd_prot->prot_sg);
+ +		kfree(fd_prot->prot_buf);
+ +	}
+ +
+ +	return ret;
+  }
+  
+ -static int fd_do_rw(struct se_cmd *cmd, struct file *fd,
+ -		    u32 block_size, struct scatterlist *sgl,
+ -		    u32 sgl_nents, u32 data_length, int is_write)
+ +static int fd_do_rw(struct se_cmd *cmd, struct scatterlist *sgl,
+ +		u32 sgl_nents, int is_write)
+  {
+ +	struct se_device *se_dev = cmd->se_dev;
+ +	struct fd_dev *dev = FD_DEV(se_dev);
+ +	struct file *fd = dev->fd_file;
+  	struct scatterlist *sg;
+ -	struct iov_iter iter;
+ -	struct bio_vec *bvec;
+ -	ssize_t len = 0;
+ -	loff_t pos = (cmd->t_task_lba * block_size);
+ +	struct iovec *iov;
+ +	mm_segment_t old_fs;
+ +	loff_t pos = (cmd->t_task_lba * se_dev->dev_attrib.block_size);
+  	int ret = 0, i;
+  
+ -	bvec = kcalloc(sgl_nents, sizeof(struct bio_vec), GFP_KERNEL);
+ -	if (!bvec) {
+ +	iov = kzalloc(sizeof(struct iovec) * sgl_nents, GFP_KERNEL);
+ +	if (!iov) {
+  		pr_err("Unable to allocate fd_do_readv iov[]\n");
+  		return -ENOMEM;
+  	}
+diff --cc drivers/target/target_core_iblock.c
+index 60ff43416820,a5e16f715392..000000000000
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@@ -198,7 -180,20 +198,12 @@@ out
+  	return ret;
+  }
+  
+ -static void iblock_dev_call_rcu(struct rcu_head *p)
+ -{
+ -	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ -	struct iblock_dev *ib_dev = IBLOCK_DEV(dev);
+ -
+ -	kfree(ib_dev);
+ -}
+ -
+  static void iblock_free_device(struct se_device *dev)
++ {
++ 	call_rcu(&dev->rcu_head, iblock_dev_call_rcu);
++ }
++ 
++ static void iblock_destroy_device(struct se_device *dev)
+  {
+  	struct iblock_dev *ib_dev = IBLOCK_DEV(dev);
+  
+@@@ -206,8 -201,6 +211,11 @@@
+  		blkdev_put(ib_dev->ibd_bd, FMODE_WRITE|FMODE_READ|FMODE_EXCL);
+  	if (ib_dev->ibd_bio_set != NULL)
+  		bioset_free(ib_dev->ibd_bio_set);
+++<<<<<<< HEAD
+ +
+ +	kfree(ib_dev);
+++=======
+++>>>>>>> 926347061ef1 (target: break up free_device callback)
+  }
+  
+  static unsigned long long iblock_emulate_read_cap_with_block_size(
+diff --cc drivers/target/target_core_pscsi.c
+index a18411484b3c,7d944b23aeee..000000000000
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@@ -581,7 -554,20 +581,12 @@@ static int pscsi_configure_device(struc
+  	return -ENODEV;
+  }
+  
+ -static void pscsi_dev_call_rcu(struct rcu_head *p)
+ -{
+ -	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ -	struct pscsi_dev_virt *pdv = PSCSI_DEV(dev);
+ -
+ -	kfree(pdv);
+ -}
+ -
+  static void pscsi_free_device(struct se_device *dev)
++ {
++ 	call_rcu(&dev->rcu_head, pscsi_dev_call_rcu);
++ }
++ 
++ static void pscsi_destroy_device(struct se_device *dev)
+  {
+  	struct pscsi_dev_virt *pdv = PSCSI_DEV(dev);
+  	struct pscsi_hba_virt *phv = dev->se_hba->hba_ptr;
+@@@ -612,8 -597,6 +617,11 @@@
+  
+  		pdv->pdv_sd = NULL;
+  	}
+++<<<<<<< HEAD
+ +
+ +	kfree(pdv);
+++=======
+++>>>>>>> 926347061ef1 (target: break up free_device callback)
+  }
+  
+  static void pscsi_transport_complete(struct se_cmd *cmd, struct scatterlist *sg,
+diff --cc drivers/target/target_core_rd.c
+index d27d58861ede,a6e8106abd6f..000000000000
+--- a/drivers/target/target_core_rd.c
++++ b/drivers/target/target_core_rd.c
+@@@ -334,12 -329,24 +334,20 @@@ fail
+  	return ret;
+  }
+  
+ -static void rd_dev_call_rcu(struct rcu_head *p)
+ -{
+ -	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ -	struct rd_dev *rd_dev = RD_DEV(dev);
+ -
+ -	kfree(rd_dev);
+ -}
+ -
+  static void rd_free_device(struct se_device *dev)
++ {
++ 	call_rcu(&dev->rcu_head, rd_dev_call_rcu);
++ }
++ 
++ static void rd_destroy_device(struct se_device *dev)
+  {
+  	struct rd_dev *rd_dev = RD_DEV(dev);
+  
+  	rd_release_device_space(rd_dev);
+++<<<<<<< HEAD
+ +	kfree(rd_dev);
+++=======
+++>>>>>>> 926347061ef1 (target: break up free_device callback)
+  }
+  
+  static struct rd_dev_sg_table *rd_get_sg_table(struct rd_dev *rd_dev, u32 page)
+diff --cc drivers/target/target_core_user.c
+index 0879cc8822f7,e58127b8db8a..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1000,7 -1356,37 +1000,15 @@@ static int tcmu_check_and_free_pending_
+  	return -EINVAL;
+  }
+  
+ -static bool tcmu_dev_configured(struct tcmu_dev *udev)
+ -{
+ -	return udev->uio_info.uio_dev ? true : false;
+ -}
+ -
+ -static void tcmu_blocks_release(struct tcmu_dev *udev)
+ -{
+ -	int i;
+ -	struct page *page;
+ -
+ -	/* Try to release all block pages */
+ -	mutex_lock(&udev->cmdr_lock);
+ -	for (i = 0; i <= udev->dbi_max; i++) {
+ -		page = radix_tree_delete(&udev->data_blocks, i);
+ -		if (page) {
+ -			__free_page(page);
+ -			atomic_dec(&global_db_count);
+ -		}
+ -	}
+ -	mutex_unlock(&udev->cmdr_lock);
+ -}
+ -
+  static void tcmu_free_device(struct se_device *dev)
++ {
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
++ 	/* release ref from init */
++ 	kref_put(&udev->kref, tcmu_dev_kref_release);
++ }
++ 
++ static void tcmu_destroy_device(struct se_device *dev)
+  {
+  	struct tcmu_dev *udev = TCMU_DEV(dev);
+  	struct tcmu_cmd *cmd;
+@@@ -1021,17 -1411,14 +1029,20 @@@
+  	spin_unlock_irq(&udev->commands_lock);
+  	WARN_ON(!all_expired);
+  
+ -	tcmu_blocks_release(udev);
+ -
+ -	if (tcmu_dev_configured(udev)) {
+ +	/* Device was configured */
+ +	if (udev->uio_info.uio_dev) {
+  		tcmu_netlink_event(TCMU_CMD_REMOVED_DEVICE, udev->uio_info.name,
+ -				   udev->uio_info.uio_dev->minor, 0, NULL);
+ +				   udev->uio_info.uio_dev->minor);
+  
+  		uio_unregister_device(&udev->uio_info);
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+  	}
+++<<<<<<< HEAD
+ +
+ +	kfree(udev);
+++=======
+++>>>>>>> 926347061ef1 (target: break up free_device callback)
+  }
+  
+  enum {
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 6193b54dc4c8..f544339d072b 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -1662,6 +1662,8 @@ void target_free_device(struct se_device *dev)
+ 	if (dev->dev_flags & DF_CONFIGURED) {
+ 		destroy_workqueue(dev->tmr_wq);
+ 
++		dev->transport->destroy_device(dev);
++
+ 		mutex_lock(&g_device_mutex);
+ 		idr_remove(&devices_idr, dev->dev_index);
+ 		list_del(&dev->g_dev_node);
+* Unmerged path drivers/target/target_core_file.c
+* Unmerged path drivers/target/target_core_iblock.c
+* Unmerged path drivers/target/target_core_pscsi.c
+* Unmerged path drivers/target/target_core_rd.c
+* Unmerged path drivers/target/target_core_user.c
+diff --git a/include/target/target_core_backend.h b/include/target/target_core_backend.h
+index 3254006d8d2e..bce1bb2145c8 100644
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -28,6 +28,7 @@ struct se_subsystem_api {
+ 
+ 	struct se_device *(*alloc_device)(struct se_hba *, const char *);
+ 	int (*configure_device)(struct se_device *);
++	void (*destroy_device)(struct se_device *);
+ 	void (*free_device)(struct se_device *device);
+ 
+ 	ssize_t (*set_configfs_dev_params)(struct se_device *,
