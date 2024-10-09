@@ -1,0 +1,1387 @@
+userfaultfd: non-cooperative: add event for memory unmaps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] userfaultfd: non-cooperative: add event for memory unmap to mm/fremap.c (Andrea Arcangeli) [1373606]
+Rebuild_FUZZ: 87.50%
+commit-author Mike Rapoport <rppt@linux.vnet.ibm.com>
+commit 897ab3e0c49e24b62e2d54d165c7afec6bbca65b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/897ab3e0.failed
+
+When a non-cooperative userfaultfd monitor copies pages in the
+background, it may encounter regions that were already unmapped.
+Addition of UFFD_EVENT_UNMAP allows the uffd monitor to track precisely
+changes in the virtual memory layout.
+
+Since there might be different uffd contexts for the affected VMAs, we
+first should create a temporary representation for the unmap event for
+each uffd context and then notify them one by one to the appropriate
+userfault file descriptors.
+
+The event notification occurs after the mmap_sem has been released.
+
+[arnd@arndb.de: fix nommu build]
+  Link: http://lkml.kernel.org/r/20170203165141.3665284-1-arnd@arndb.de
+[mhocko@suse.com: fix nommu build]
+  Link: http://lkml.kernel.org/r/20170202091503.GA22823@dhcp22.suse.cz
+Link: http://lkml.kernel.org/r/1485542673-24387-3-git-send-email-rppt@linux.vnet.ibm.com
+	Signed-off-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Pavel Emelyanov <xemul@virtuozzo.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 897ab3e0c49e24b62e2d54d165c7afec6bbca65b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/mips/kernel/vdso.c
+#	arch/x86/entry/vdso/vma.c
+#	arch/x86/mm/mpx.c
+#	fs/proc/vmcore.c
+#	fs/userfaultfd.c
+#	include/linux/mm.h
+#	include/linux/userfaultfd_k.h
+#	include/uapi/linux/userfaultfd.h
+#	ipc/shm.c
+#	mm/mmap.c
+#	mm/mremap.c
+#	mm/nommu.c
+diff --cc arch/mips/kernel/vdso.c
+index 0f1af58b036a,093517e85a6c..000000000000
+--- a/arch/mips/kernel/vdso.c
++++ b/arch/mips/kernel/vdso.c
+@@@ -72,31 -97,90 +72,42 @@@ static unsigned long vdso_addr(unsigne
+  
+  int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+  {
+ -	struct mips_vdso_image *image = current->thread.abi->vdso;
+ -	struct mm_struct *mm = current->mm;
+ -	unsigned long gic_size, vvar_size, size, base, data_addr, vdso_addr;
+ -	struct vm_area_struct *vma;
+ -	struct resource gic_res;
+  	int ret;
+ +	unsigned long addr;
+ +	struct mm_struct *mm = current->mm;
+  
+ -	if (down_write_killable(&mm->mmap_sem))
+ -		return -EINTR;
+ +	down_write(&mm->mmap_sem);
+  
+++<<<<<<< HEAD
+ +	addr = vdso_addr(mm->start_stack);
+ +
+ +	addr = get_unmapped_area(NULL, addr, PAGE_SIZE, 0, 0);
+ +	if (IS_ERR_VALUE(addr)) {
+ +		ret = addr;
+ +		goto up_fail;
+++=======
++ 	/* Map delay slot emulation page */
++ 	base = mmap_region(NULL, STACK_TOP, PAGE_SIZE,
++ 			   VM_READ|VM_WRITE|VM_EXEC|
++ 			   VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
++ 			   0, NULL);
++ 	if (IS_ERR_VALUE(base)) {
++ 		ret = base;
++ 		goto out;
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  	}
+  
+ -	/*
+ -	 * Determine total area size. This includes the VDSO data itself, the
+ -	 * data page, and the GIC user page if present. Always create a mapping
+ -	 * for the GIC user area if the GIC is present regardless of whether it
+ -	 * is the current clocksource, in case it comes into use later on. We
+ -	 * only map a page even though the total area is 64K, as we only need
+ -	 * the counter registers at the start.
+ -	 */
+ -	gic_size = gic_present ? PAGE_SIZE : 0;
+ -	vvar_size = gic_size + PAGE_SIZE;
+ -	size = vvar_size + image->size;
+ -
+ -	base = get_unmapped_area(NULL, 0, size, 0, 0);
+ -	if (IS_ERR_VALUE(base)) {
+ -		ret = base;
+ -		goto out;
+ -	}
+ -
+ -	data_addr = base + gic_size;
+ -	vdso_addr = data_addr + PAGE_SIZE;
+ +	ret = install_special_mapping(mm, addr, PAGE_SIZE,
+ +				      VM_READ|VM_EXEC|
+ +				      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
+ +				      &vdso_page);
+  
+ -	vma = _install_special_mapping(mm, base, vvar_size,
+ -				       VM_READ | VM_MAYREAD,
+ -				       &vdso_vvar_mapping);
+ -	if (IS_ERR(vma)) {
+ -		ret = PTR_ERR(vma);
+ -		goto out;
+ -	}
+ -
+ -	/* Map GIC user page. */
+ -	if (gic_size) {
+ -		ret = gic_get_usm_range(&gic_res);
+ -		if (ret)
+ -			goto out;
+ -
+ -		ret = io_remap_pfn_range(vma, base,
+ -					 gic_res.start >> PAGE_SHIFT,
+ -					 gic_size,
+ -					 pgprot_noncached(PAGE_READONLY));
+ -		if (ret)
+ -			goto out;
+ -	}
+ -
+ -	/* Map data page. */
+ -	ret = remap_pfn_range(vma, data_addr,
+ -			      virt_to_phys(&vdso_data) >> PAGE_SHIFT,
+ -			      PAGE_SIZE, PAGE_READONLY);
+  	if (ret)
+ -		goto out;
+ -
+ -	/* Map VDSO image. */
+ -	vma = _install_special_mapping(mm, vdso_addr, image->size,
+ -				       VM_READ | VM_EXEC |
+ -				       VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
+ -				       &image->mapping);
+ -	if (IS_ERR(vma)) {
+ -		ret = PTR_ERR(vma);
+ -		goto out;
+ -	}
+ +		goto up_fail;
+  
+ -	mm->context.vdso = (void *)vdso_addr;
+ -	ret = 0;
+ +	mm->context.vdso = (void *)addr;
+  
+ -out:
+ +up_fail:
+  	up_write(&mm->mmap_sem);
+  	return ret;
+  }
+diff --cc arch/x86/mm/mpx.c
+index d29d88a93b82,c98079684bdb..000000000000
+--- a/arch/x86/mm/mpx.c
++++ b/arch/x86/mm/mpx.c
+@@@ -54,47 -50,13 +54,55 @@@ static __maybe_unused unsigned long mpx
+  		return -EINVAL;
+  
+  	down_write(&mm->mmap_sem);
+++<<<<<<< HEAD
+++=======
++ 	addr = do_mmap(NULL, 0, len, PROT_READ | PROT_WRITE,
++ 		       MAP_ANONYMOUS | MAP_PRIVATE, VM_MPX, 0, &populate, NULL);
++ 	up_write(&mm->mmap_sem);
++ 	if (populate)
++ 		mm_populate(addr, populate);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+ +
+ +	/* Too many mappings? */
+ +	if (mm->map_count > sysctl_max_map_count) {
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	/* Obtain the address to map to. we verify (or select) it and ensure
+ +	 * that it represents a valid section of the address space.
+ +	 */
+ +	addr = get_unmapped_area(NULL, 0, len, 0, MAP_ANONYMOUS | MAP_PRIVATE);
+ +	if (addr & ~PAGE_MASK) {
+ +		ret = addr;
+ +		goto out;
+ +	}
+ +
+ +	vm_flags = VM_READ | VM_WRITE | VM_MPX |
+ +			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+ +
+ +	/* Set pgoff according to addr for anon_vma */
+ +	pgoff = addr >> PAGE_SHIFT;
+ +
+ +	ret = mmap_region(NULL, addr, len, vm_flags, pgoff);
+ +	if (IS_ERR_VALUE(ret))
+ +		goto out;
+  
+ -	return addr;
+ +	vma = find_vma(mm, ret);
+ +	if (!vma) {
+ +		ret = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	if (vm_flags & VM_LOCKED) {
+ +		up_write(&mm->mmap_sem);
+ +		mm_populate(ret, len);
+ +		return ret;
+ +	}
+ +
+ +out:
+ +	up_write(&mm->mmap_sem);
+ +	return ret;
+  }
+  
+  enum reg_type {
+diff --cc fs/proc/vmcore.c
+index 909319b1232b,885d445afa0d..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -328,6 -330,82 +328,85 @@@ static inline char *alloc_elfnotes_buf(
+   * virtually contiguous user-space in ELF layout.
+   */
+  #ifdef CONFIG_MMU
+++<<<<<<< HEAD
+++=======
++ /*
++  * remap_oldmem_pfn_checked - do remap_oldmem_pfn_range replacing all pages
++  * reported as not being ram with the zero page.
++  *
++  * @vma: vm_area_struct describing requested mapping
++  * @from: start remapping from
++  * @pfn: page frame number to start remapping to
++  * @size: remapping size
++  * @prot: protection bits
++  *
++  * Returns zero on success, -EAGAIN on failure.
++  */
++ static int remap_oldmem_pfn_checked(struct vm_area_struct *vma,
++ 				    unsigned long from, unsigned long pfn,
++ 				    unsigned long size, pgprot_t prot)
++ {
++ 	unsigned long map_size;
++ 	unsigned long pos_start, pos_end, pos;
++ 	unsigned long zeropage_pfn = my_zero_pfn(0);
++ 	size_t len = 0;
++ 
++ 	pos_start = pfn;
++ 	pos_end = pfn + (size >> PAGE_SHIFT);
++ 
++ 	for (pos = pos_start; pos < pos_end; ++pos) {
++ 		if (!pfn_is_ram(pos)) {
++ 			/*
++ 			 * We hit a page which is not ram. Remap the continuous
++ 			 * region between pos_start and pos-1 and replace
++ 			 * the non-ram page at pos with the zero page.
++ 			 */
++ 			if (pos > pos_start) {
++ 				/* Remap continuous region */
++ 				map_size = (pos - pos_start) << PAGE_SHIFT;
++ 				if (remap_oldmem_pfn_range(vma, from + len,
++ 							   pos_start, map_size,
++ 							   prot))
++ 					goto fail;
++ 				len += map_size;
++ 			}
++ 			/* Remap the zero page */
++ 			if (remap_oldmem_pfn_range(vma, from + len,
++ 						   zeropage_pfn,
++ 						   PAGE_SIZE, prot))
++ 				goto fail;
++ 			len += PAGE_SIZE;
++ 			pos_start = pos + 1;
++ 		}
++ 	}
++ 	if (pos > pos_start) {
++ 		/* Remap the rest */
++ 		map_size = (pos - pos_start) << PAGE_SHIFT;
++ 		if (remap_oldmem_pfn_range(vma, from + len, pos_start,
++ 					   map_size, prot))
++ 			goto fail;
++ 	}
++ 	return 0;
++ fail:
++ 	do_munmap(vma->vm_mm, from, len, NULL);
++ 	return -EAGAIN;
++ }
++ 
++ static int vmcore_remap_oldmem_pfn(struct vm_area_struct *vma,
++ 			    unsigned long from, unsigned long pfn,
++ 			    unsigned long size, pgprot_t prot)
++ {
++ 	/*
++ 	 * Check if oldmem_pfn_is_ram was registered to avoid
++ 	 * looping over all pages without a reason.
++ 	 */
++ 	if (oldmem_pfn_is_ram)
++ 		return remap_oldmem_pfn_checked(vma, from, pfn, size, prot);
++ 	else
++ 		return remap_oldmem_pfn_range(vma, from, pfn, size, prot);
++ }
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  static int mmap_vmcore(struct file *file, struct vm_area_struct *vma)
+  {
+  	size_t size = vma->vm_end - vma->vm_start;
+diff --cc fs/userfaultfd.c
+index 0eadec862028,4c78458ea78d..000000000000
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@@ -65,6 -65,19 +65,22 @@@ struct userfaultfd_ctx 
+  	struct mm_struct *mm;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct userfaultfd_fork_ctx {
++ 	struct userfaultfd_ctx *orig;
++ 	struct userfaultfd_ctx *new;
++ 	struct list_head list;
++ };
++ 
++ struct userfaultfd_unmap_ctx {
++ 	struct userfaultfd_ctx *ctx;
++ 	unsigned long start;
++ 	unsigned long end;
++ 	struct list_head list;
++ };
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  struct userfaultfd_wait_queue {
+  	struct uffd_msg msg;
+  	wait_queue_t wq;
+@@@ -517,6 -578,202 +533,205 @@@ static void userfaultfd_event_complete(
+  	__remove_wait_queue(&ctx->event_wqh, &ewq->wq);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dup_userfaultfd(struct vm_area_struct *vma, struct list_head *fcs)
++ {
++ 	struct userfaultfd_ctx *ctx = NULL, *octx;
++ 	struct userfaultfd_fork_ctx *fctx;
++ 
++ 	octx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!octx || !(octx->features & UFFD_FEATURE_EVENT_FORK)) {
++ 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
++ 		vma->vm_flags &= ~(VM_UFFD_WP | VM_UFFD_MISSING);
++ 		return 0;
++ 	}
++ 
++ 	list_for_each_entry(fctx, fcs, list)
++ 		if (fctx->orig == octx) {
++ 			ctx = fctx->new;
++ 			break;
++ 		}
++ 
++ 	if (!ctx) {
++ 		fctx = kmalloc(sizeof(*fctx), GFP_KERNEL);
++ 		if (!fctx)
++ 			return -ENOMEM;
++ 
++ 		ctx = kmem_cache_alloc(userfaultfd_ctx_cachep, GFP_KERNEL);
++ 		if (!ctx) {
++ 			kfree(fctx);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		atomic_set(&ctx->refcount, 1);
++ 		ctx->flags = octx->flags;
++ 		ctx->state = UFFD_STATE_RUNNING;
++ 		ctx->features = octx->features;
++ 		ctx->released = false;
++ 		ctx->mm = vma->vm_mm;
++ 		atomic_inc(&ctx->mm->mm_count);
++ 
++ 		userfaultfd_ctx_get(octx);
++ 		fctx->orig = octx;
++ 		fctx->new = ctx;
++ 		list_add_tail(&fctx->list, fcs);
++ 	}
++ 
++ 	vma->vm_userfaultfd_ctx.ctx = ctx;
++ 	return 0;
++ }
++ 
++ static int dup_fctx(struct userfaultfd_fork_ctx *fctx)
++ {
++ 	struct userfaultfd_ctx *ctx = fctx->orig;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_FORK;
++ 	ewq.msg.arg.reserved.reserved1 = (unsigned long)fctx->new;
++ 
++ 	return userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void dup_userfaultfd_complete(struct list_head *fcs)
++ {
++ 	int ret = 0;
++ 	struct userfaultfd_fork_ctx *fctx, *n;
++ 
++ 	list_for_each_entry_safe(fctx, n, fcs, list) {
++ 		if (!ret)
++ 			ret = dup_fctx(fctx);
++ 		list_del(&fctx->list);
++ 		kfree(fctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 			     struct vm_userfaultfd_ctx *vm_ctx)
++ {
++ 	struct userfaultfd_ctx *ctx;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (ctx && (ctx->features & UFFD_FEATURE_EVENT_REMAP)) {
++ 		vm_ctx->ctx = ctx;
++ 		userfaultfd_ctx_get(ctx);
++ 	}
++ }
++ 
++ void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *vm_ctx,
++ 				 unsigned long from, unsigned long to,
++ 				 unsigned long len)
++ {
++ 	struct userfaultfd_ctx *ctx = vm_ctx->ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	if (!ctx)
++ 		return;
++ 
++ 	if (to & ~PAGE_MASK) {
++ 		userfaultfd_ctx_put(ctx);
++ 		return;
++ 	}
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMAP;
++ 	ewq.msg.arg.remap.from = from;
++ 	ewq.msg.arg.remap.to = to;
++ 	ewq.msg.arg.remap.len = len;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ }
++ 
++ void userfaultfd_remove(struct vm_area_struct *vma,
++ 			struct vm_area_struct **prev,
++ 			unsigned long start, unsigned long end)
++ {
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	struct userfaultfd_ctx *ctx;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	ctx = vma->vm_userfaultfd_ctx.ctx;
++ 	if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_REMOVE))
++ 		return;
++ 
++ 	userfaultfd_ctx_get(ctx);
++ 	up_read(&mm->mmap_sem);
++ 
++ 	*prev = NULL; /* We wait for ACK w/o the mmap semaphore */
++ 
++ 	msg_init(&ewq.msg);
++ 
++ 	ewq.msg.event = UFFD_EVENT_REMOVE;
++ 	ewq.msg.arg.remove.start = start;
++ 	ewq.msg.arg.remove.end = end;
++ 
++ 	userfaultfd_event_wait_completion(ctx, &ewq);
++ 
++ 	down_read(&mm->mmap_sem);
++ }
++ 
++ static bool has_unmap_ctx(struct userfaultfd_ctx *ctx, struct list_head *unmaps,
++ 			  unsigned long start, unsigned long end)
++ {
++ 	struct userfaultfd_unmap_ctx *unmap_ctx;
++ 
++ 	list_for_each_entry(unmap_ctx, unmaps, list)
++ 		if (unmap_ctx->ctx == ctx && unmap_ctx->start == start &&
++ 		    unmap_ctx->end == end)
++ 			return true;
++ 
++ 	return false;
++ }
++ 
++ int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 			   unsigned long start, unsigned long end,
++ 			   struct list_head *unmaps)
++ {
++ 	for ( ; vma && vma->vm_start < end; vma = vma->vm_next) {
++ 		struct userfaultfd_unmap_ctx *unmap_ctx;
++ 		struct userfaultfd_ctx *ctx = vma->vm_userfaultfd_ctx.ctx;
++ 
++ 		if (!ctx || !(ctx->features & UFFD_FEATURE_EVENT_UNMAP) ||
++ 		    has_unmap_ctx(ctx, unmaps, start, end))
++ 			continue;
++ 
++ 		unmap_ctx = kzalloc(sizeof(*unmap_ctx), GFP_KERNEL);
++ 		if (!unmap_ctx)
++ 			return -ENOMEM;
++ 
++ 		userfaultfd_ctx_get(ctx);
++ 		unmap_ctx->ctx = ctx;
++ 		unmap_ctx->start = start;
++ 		unmap_ctx->end = end;
++ 		list_add_tail(&unmap_ctx->list, unmaps);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void userfaultfd_unmap_complete(struct mm_struct *mm, struct list_head *uf)
++ {
++ 	struct userfaultfd_unmap_ctx *ctx, *n;
++ 	struct userfaultfd_wait_queue ewq;
++ 
++ 	list_for_each_entry_safe(ctx, n, uf, list) {
++ 		msg_init(&ewq.msg);
++ 
++ 		ewq.msg.event = UFFD_EVENT_UNMAP;
++ 		ewq.msg.arg.remove.start = ctx->start;
++ 		ewq.msg.arg.remove.end = ctx->end;
++ 
++ 		userfaultfd_event_wait_completion(ctx->ctx, &ewq);
++ 
++ 		list_del(&ctx->list);
++ 		kfree(ctx);
++ 	}
++ }
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  static int userfaultfd_release(struct inode *inode, struct file *file)
+  {
+  	struct userfaultfd_ctx *ctx = file->private_data;
+diff --cc include/linux/mm.h
+index f440959dd698,c6fcba1d1ae5..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -1912,12 -2090,24 +1912,33 @@@ extern int install_special_mapping(stru
+  extern unsigned long get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+  
+  extern unsigned long mmap_region(struct file *file, unsigned long addr,
+++<<<<<<< HEAD
+ +	unsigned long len, vm_flags_t vm_flags, unsigned long pgoff);
+ +extern unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+ +	unsigned long len, unsigned long prot, unsigned long flags,
+ +	unsigned long pgoff, unsigned long *populate);
+ +extern int do_munmap(struct mm_struct *, unsigned long, size_t);
+ +
+++=======
++ 	unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
++ 	struct list_head *uf);
++ extern unsigned long do_mmap(struct file *file, unsigned long addr,
++ 	unsigned long len, unsigned long prot, unsigned long flags,
++ 	vm_flags_t vm_flags, unsigned long pgoff, unsigned long *populate,
++ 	struct list_head *uf);
++ extern int do_munmap(struct mm_struct *, unsigned long, size_t,
++ 		     struct list_head *uf);
++ 
++ static inline unsigned long
++ do_mmap_pgoff(struct file *file, unsigned long addr,
++ 	unsigned long len, unsigned long prot, unsigned long flags,
++ 	unsigned long pgoff, unsigned long *populate,
++ 	struct list_head *uf)
++ {
++ 	return do_mmap(file, addr, len, prot, flags, 0, pgoff, populate, uf);
++ }
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  #ifdef CONFIG_MMU
+  extern int __mm_populate(unsigned long addr, unsigned long len,
+  			 int ignore_errors);
+diff --cc include/linux/userfaultfd_k.h
+index 587480ad41b7,a40be5d0661b..000000000000
+--- a/include/linux/userfaultfd_k.h
++++ b/include/linux/userfaultfd_k.h
+@@@ -53,6 -52,26 +53,29 @@@ static inline bool userfaultfd_armed(st
+  	return vma->vm_flags & (VM_UFFD_MISSING | VM_UFFD_WP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
++ extern void dup_userfaultfd_complete(struct list_head *);
++ 
++ extern void mremap_userfaultfd_prep(struct vm_area_struct *,
++ 				    struct vm_userfaultfd_ctx *);
++ extern void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *,
++ 					unsigned long from, unsigned long to,
++ 					unsigned long len);
++ 
++ extern void userfaultfd_remove(struct vm_area_struct *vma,
++ 			       struct vm_area_struct **prev,
++ 			       unsigned long start,
++ 			       unsigned long end);
++ 
++ extern int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 				  unsigned long start, unsigned long end,
++ 				  struct list_head *uf);
++ extern void userfaultfd_unmap_complete(struct mm_struct *mm,
++ 				       struct list_head *uf);
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  #else /* CONFIG_USERFAULTFD */
+  
+  /* mm helpers */
+@@@ -80,6 -96,46 +103,49 @@@ static inline bool userfaultfd_armed(st
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int dup_userfaultfd(struct vm_area_struct *vma,
++ 				  struct list_head *l)
++ {
++ 	return 0;
++ }
++ 
++ static inline void dup_userfaultfd_complete(struct list_head *l)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_prep(struct vm_area_struct *vma,
++ 					   struct vm_userfaultfd_ctx *ctx)
++ {
++ }
++ 
++ static inline void mremap_userfaultfd_complete(struct vm_userfaultfd_ctx *ctx,
++ 					       unsigned long from,
++ 					       unsigned long to,
++ 					       unsigned long len)
++ {
++ }
++ 
++ static inline void userfaultfd_remove(struct vm_area_struct *vma,
++ 				      struct vm_area_struct **prev,
++ 				      unsigned long start,
++ 				      unsigned long end)
++ {
++ }
++ 
++ static inline int userfaultfd_unmap_prep(struct vm_area_struct *vma,
++ 					 unsigned long start, unsigned long end,
++ 					 struct list_head *uf)
++ {
++ 	return 0;
++ }
++ 
++ static inline void userfaultfd_unmap_complete(struct mm_struct *mm,
++ 					      struct list_head *uf)
++ {
++ }
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  #endif /* CONFIG_USERFAULTFD */
+  
+  #endif /* _LINUX_USERFAULTFD_K_H */
+diff --cc include/uapi/linux/userfaultfd.h
+index abfce32281cc,3b059530dac9..000000000000
+--- a/include/uapi/linux/userfaultfd.h
++++ b/include/uapi/linux/userfaultfd.h
+@@@ -18,12 -18,12 +18,21 @@@
+   * means the userland is reading).
+   */
+  #define UFFD_API ((__u64)0xAA)
+++<<<<<<< HEAD
+ +/*
+ + * After implementing the respective features it will become:
+ + * #define UFFD_API_FEATURES (UFFD_FEATURE_PAGEFAULT_FLAG_WP | \
+ + *			      UFFD_FEATURE_EVENT_FORK)
+ + */
+ +#define UFFD_API_FEATURES (0)
+++=======
++ #define UFFD_API_FEATURES (UFFD_FEATURE_EVENT_FORK |		\
++ 			   UFFD_FEATURE_EVENT_REMAP |		\
++ 			   UFFD_FEATURE_EVENT_REMOVE |	\
++ 			   UFFD_FEATURE_EVENT_UNMAP |		\
++ 			   UFFD_FEATURE_MISSING_HUGETLBFS |	\
++ 			   UFFD_FEATURE_MISSING_SHMEM)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  #define UFFD_API_IOCTLS				\
+  	((__u64)1 << _UFFDIO_REGISTER |		\
+  	 (__u64)1 << _UFFDIO_UNREGISTER |	\
+@@@ -93,9 -108,10 +102,15 @@@ struct uffd_msg 
+   * Start at 0x12 and not at 0 to be more strict against bugs.
+   */
+  #define UFFD_EVENT_PAGEFAULT	0x12
+ +#if 0 /* not available yet */
+  #define UFFD_EVENT_FORK		0x13
+++<<<<<<< HEAD
+ +#endif
+++=======
++ #define UFFD_EVENT_REMAP	0x14
++ #define UFFD_EVENT_REMOVE	0x15
++ #define UFFD_EVENT_UNMAP	0x16
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  
+  /* flags for UFFD_EVENT_PAGEFAULT */
+  #define UFFD_PAGEFAULT_FLAG_WRITE	(1<<0)	/* If this was a write fault */
+@@@ -113,11 -129,38 +128,19 @@@ struct uffdio_api 
+  	 * Note: UFFD_EVENT_PAGEFAULT and UFFD_PAGEFAULT_FLAG_WRITE
+  	 * are to be considered implicitly always enabled in all kernels as
+  	 * long as the uffdio_api.api requested matches UFFD_API.
+ -	 *
+ -	 * UFFD_FEATURE_MISSING_HUGETLBFS means an UFFDIO_REGISTER
+ -	 * with UFFDIO_REGISTER_MODE_MISSING mode will succeed on
+ -	 * hugetlbfs virtual memory ranges. Adding or not adding
+ -	 * UFFD_FEATURE_MISSING_HUGETLBFS to uffdio_api.features has
+ -	 * no real functional effect after UFFDIO_API returns, but
+ -	 * it's only useful for an initial feature set probe at
+ -	 * UFFDIO_API time. There are two ways to use it:
+ -	 *
+ -	 * 1) by adding UFFD_FEATURE_MISSING_HUGETLBFS to the
+ -	 *    uffdio_api.features before calling UFFDIO_API, an error
+ -	 *    will be returned by UFFDIO_API on a kernel without
+ -	 *    hugetlbfs missing support
+ -	 *
+ -	 * 2) the UFFD_FEATURE_MISSING_HUGETLBFS can not be added in
+ -	 *    uffdio_api.features and instead it will be set by the
+ -	 *    kernel in the uffdio_api.features if the kernel supports
+ -	 *    it, so userland can later check if the feature flag is
+ -	 *    present in uffdio_api.features after UFFDIO_API
+ -	 *    succeeded.
+ -	 *
+ -	 * UFFD_FEATURE_MISSING_SHMEM works the same as
+ -	 * UFFD_FEATURE_MISSING_HUGETLBFS, but it applies to shmem
+ -	 * (i.e. tmpfs and other shmem based APIs).
+  	 */
+ +#if 0 /* not available yet */
+  #define UFFD_FEATURE_PAGEFAULT_FLAG_WP		(1<<0)
+  #define UFFD_FEATURE_EVENT_FORK			(1<<1)
+++<<<<<<< HEAD
+ +#endif
+++=======
++ #define UFFD_FEATURE_EVENT_REMAP		(1<<2)
++ #define UFFD_FEATURE_EVENT_REMOVE		(1<<3)
++ #define UFFD_FEATURE_MISSING_HUGETLBFS		(1<<4)
++ #define UFFD_FEATURE_MISSING_SHMEM		(1<<5)
++ #define UFFD_FEATURE_EVENT_UNMAP		(1<<6)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  	__u64 features;
+  
+  	__u64 ioctls;
+diff --cc ipc/shm.c
+index 8436c267997d,d7805acb44fd..000000000000
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@@ -1158,21 -1208,21 +1158,21 @@@ long do_shmat(int shmid, char __user *s
+  	if (err)
+  		goto out_fput;
+  
+ -	if (down_write_killable(&current->mm->mmap_sem)) {
+ -		err = -EINTR;
+ -		goto out_fput;
+ -	}
+ -
+ +	down_write(&current->mm->mmap_sem);
+  	if (addr && !(shmflg & SHM_REMAP)) {
+  		err = -EINVAL;
+ -		if (addr + size < addr)
+ -			goto invalid;
+ -
+  		if (find_vma_intersection(current->mm, addr, addr + size))
+  			goto invalid;
+ +		/*
+ +		 * If shm segment goes below stack, make sure there is some
+ +		 * space left for the stack to grow (at least 4 pages).
+ +		 */
+ +		if (addr < current->mm->start_stack &&
+ +		    addr > current->mm->start_stack - size - PAGE_SIZE * 5)
+ +			goto invalid;
+  	}
+  
+- 	addr = do_mmap_pgoff(file, addr, size, prot, flags, 0, &populate);
++ 	addr = do_mmap_pgoff(file, addr, size, prot, flags, 0, &populate, NULL);
+  	*raddr = addr;
+  	err = 0;
+  	if (IS_ERR_VALUE(addr))
+@@@ -1269,9 -1321,15 +1269,21 @@@ SYSCALL_DEFINE1(shmdt, char __user *, s
+  		if ((vma->vm_ops == &shm_vm_ops) &&
+  			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) {
+  
+++<<<<<<< HEAD
+ +
+ +			size = file_inode(vma->vm_file)->i_size;
+ +			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+++=======
++ 			/*
++ 			 * Record the file of the shm segment being
++ 			 * unmapped.  With mremap(), someone could place
++ 			 * page from another segment but with equal offsets
++ 			 * in the range we are unmapping.
++ 			 */
++ 			file = vma->vm_file;
++ 			size = i_size_read(file_inode(vma->vm_file));
++ 			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  			/*
+  			 * We discovered the size of the shm segment, so
+  			 * break out of here and fall through to the next
+@@@ -1296,17 -1354,18 +1308,23 @@@
+  
+  		/* finding a matching vma now does not alter retval */
+  		if ((vma->vm_ops == &shm_vm_ops) &&
+++<<<<<<< HEAD
+ +			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff)
+ +
+ +			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+++=======
++ 		    ((vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff) &&
++ 		    (vma->vm_file == file))
++ 			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  		vma = next;
+  	}
+  
+ -#else	/* CONFIG_MMU */
+ +#else /* CONFIG_MMU */
+  	/* under NOMMU conditions, the exact address to be destroyed must be
+ -	 * given
+ -	 */
+ +	 * given */
+  	if (vma && vma->vm_start == addr && vma->vm_ops == &shm_vm_ops) {
+- 		do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
++ 		do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
+  		retval = 0;
+  	}
+  
+diff --cc mm/mmap.c
+index 2cc2556c0b9f,1cec28d20583..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -275,7 -176,7 +275,11 @@@ static struct vm_area_struct *remove_vm
+  	return next;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned long do_brk(unsigned long addr, unsigned long len);
+++=======
++ static int do_brk(unsigned long addr, unsigned long len, struct list_head *uf);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  
+  SYSCALL_DEFINE1(brk, unsigned long, brk)
+  {
+@@@ -284,8 -185,10 +288,9 @@@
+  	struct mm_struct *mm = current->mm;
+  	unsigned long min_brk;
+  	bool populate;
++ 	LIST_HEAD(uf);
+  
+ -	if (down_write_killable(&mm->mmap_sem))
+ -		return -EINTR;
+ +	down_write(&mm->mmap_sem);
+  
+  #ifdef CONFIG_COMPAT_BRK
+  	/*
+@@@ -331,7 -233,7 +336,11 @@@
+  		goto out;
+  
+  	/* Ok, looks good - let it rip. */
+++<<<<<<< HEAD
+ +	if (do_brk(oldbrk, newbrk-oldbrk) != oldbrk)
+++=======
++ 	if (do_brk(oldbrk, newbrk-oldbrk, &uf) < 0)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  		goto out;
+  
+  set_brk:
+@@@ -1234,15 -1285,32 +1244,21 @@@ static inline unsigned long round_hint_
+  /*
+   * The caller must hold down_write(&current->mm->mmap_sem).
+   */
+ -unsigned long do_mmap(struct file *file, unsigned long addr,
+ +
+ +unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+  			unsigned long len, unsigned long prot,
+++<<<<<<< HEAD
+ +			unsigned long flags, unsigned long pgoff,
+ +			unsigned long *populate)
+++=======
++ 			unsigned long flags, vm_flags_t vm_flags,
++ 			unsigned long pgoff, unsigned long *populate,
++ 			struct list_head *uf)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+ -	struct mm_struct *mm = current->mm;
+ -	int pkey = 0;
+ +	struct mm_struct * mm = current->mm;
+ +	struct inode *inode;
+ +	vm_flags_t vm_flags;
+  
+  	*populate = 0;
+  
+@@@ -1541,12 -1611,10 +1558,18 @@@ unsigned long mmap_region(struct file *
+  	}
+  
+  	/* Clear old maps */
+++<<<<<<< HEAD
+ +	error = -ENOMEM;
+ +munmap_back:
+ +	if (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent)) {
+ +		if (do_munmap(mm, addr, len))
+++=======
++ 	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
++ 			      &rb_parent)) {
++ 		if (do_munmap(mm, addr, len, uf))
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  			return -ENOMEM;
+ +		goto munmap_back;
+  	}
+  
+  	/*
+@@@ -2634,10 -2680,14 +2665,19 @@@ int vm_munmap(unsigned long start, size
+  {
+  	int ret;
+  	struct mm_struct *mm = current->mm;
++ 	LIST_HEAD(uf);
+  
+++<<<<<<< HEAD
+ +	down_write(&mm->mmap_sem);
+ +	ret = do_munmap(mm, start, len);
+++=======
++ 	if (down_write_killable(&mm->mmap_sem))
++ 		return -EINTR;
++ 
++ 	ret = do_munmap(mm, start, len, &uf);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  	up_write(&mm->mmap_sem);
++ 	userfaultfd_unmap_complete(mm, &uf);
+  	return ret;
+  }
+  EXPORT_SYMBOL(vm_munmap);
+@@@ -2648,6 -2698,106 +2688,109 @@@ SYSCALL_DEFINE2(munmap, unsigned long, 
+  	return vm_munmap(addr, len);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Emulation of deprecated remap_file_pages() syscall.
++  */
++ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
++ 		unsigned long, prot, unsigned long, pgoff, unsigned long, flags)
++ {
++ 
++ 	struct mm_struct *mm = current->mm;
++ 	struct vm_area_struct *vma;
++ 	unsigned long populate = 0;
++ 	unsigned long ret = -EINVAL;
++ 	struct file *file;
++ 
++ 	pr_warn_once("%s (%d) uses deprecated remap_file_pages() syscall. See Documentation/vm/remap_file_pages.txt.\n",
++ 		     current->comm, current->pid);
++ 
++ 	if (prot)
++ 		return ret;
++ 	start = start & PAGE_MASK;
++ 	size = size & PAGE_MASK;
++ 
++ 	if (start + size <= start)
++ 		return ret;
++ 
++ 	/* Does pgoff wrap? */
++ 	if (pgoff + (size >> PAGE_SHIFT) < pgoff)
++ 		return ret;
++ 
++ 	if (down_write_killable(&mm->mmap_sem))
++ 		return -EINTR;
++ 
++ 	vma = find_vma(mm, start);
++ 
++ 	if (!vma || !(vma->vm_flags & VM_SHARED))
++ 		goto out;
++ 
++ 	if (start < vma->vm_start)
++ 		goto out;
++ 
++ 	if (start + size > vma->vm_end) {
++ 		struct vm_area_struct *next;
++ 
++ 		for (next = vma->vm_next; next; next = next->vm_next) {
++ 			/* hole between vmas ? */
++ 			if (next->vm_start != next->vm_prev->vm_end)
++ 				goto out;
++ 
++ 			if (next->vm_file != vma->vm_file)
++ 				goto out;
++ 
++ 			if (next->vm_flags != vma->vm_flags)
++ 				goto out;
++ 
++ 			if (start + size <= next->vm_end)
++ 				break;
++ 		}
++ 
++ 		if (!next)
++ 			goto out;
++ 	}
++ 
++ 	prot |= vma->vm_flags & VM_READ ? PROT_READ : 0;
++ 	prot |= vma->vm_flags & VM_WRITE ? PROT_WRITE : 0;
++ 	prot |= vma->vm_flags & VM_EXEC ? PROT_EXEC : 0;
++ 
++ 	flags &= MAP_NONBLOCK;
++ 	flags |= MAP_SHARED | MAP_FIXED | MAP_POPULATE;
++ 	if (vma->vm_flags & VM_LOCKED) {
++ 		struct vm_area_struct *tmp;
++ 		flags |= MAP_LOCKED;
++ 
++ 		/* drop PG_Mlocked flag for over-mapped range */
++ 		for (tmp = vma; tmp->vm_start >= start + size;
++ 				tmp = tmp->vm_next) {
++ 			/*
++ 			 * Split pmd and munlock page on the border
++ 			 * of the range.
++ 			 */
++ 			vma_adjust_trans_huge(tmp, start, start + size, 0);
++ 
++ 			munlock_vma_pages_range(tmp,
++ 					max(tmp->vm_start, start),
++ 					min(tmp->vm_end, start + size));
++ 		}
++ 	}
++ 
++ 	file = get_file(vma->vm_file);
++ 	ret = do_mmap_pgoff(vma->vm_file, start, size,
++ 			prot, flags, pgoff, &populate, NULL);
++ 	fput(file);
++ out:
++ 	up_write(&mm->mmap_sem);
++ 	if (populate)
++ 		mm_populate(ret, populate);
++ 	if (!IS_ERR_VALUE(ret))
++ 		ret = 0;
++ 	return ret;
++ }
++ 
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  static inline void verify_mm_writelocked(struct mm_struct *mm)
+  {
+  #ifdef CONFIG_DEBUG_VM
+@@@ -2663,12 -2813,12 +2806,16 @@@
+   *  anonymous maps.  eventually we may be able to do some
+   *  brk-specific accounting here.
+   */
+++<<<<<<< HEAD
+ +static unsigned long do_brk(unsigned long addr, unsigned long len)
+++=======
++ static int do_brk_flags(unsigned long addr, unsigned long request, unsigned long flags, struct list_head *uf)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+ -	struct mm_struct *mm = current->mm;
+ -	struct vm_area_struct *vma, *prev;
+ -	unsigned long len;
+ -	struct rb_node **rb_link, *rb_parent;
+ +	struct mm_struct * mm = current->mm;
+ +	struct vm_area_struct * vma, * prev;
+ +	unsigned long flags;
+ +	struct rb_node ** rb_link, * rb_parent;
+  	pgoff_t pgoff = addr >> PAGE_SHIFT;
+  	int error;
+  
+@@@ -2704,11 -2850,10 +2851,17 @@@
+  	/*
+  	 * Clear old maps.  this also does some error checking for us
+  	 */
+++<<<<<<< HEAD
+ + munmap_back:
+ +	if (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent)) {
+ +		if (do_munmap(mm, addr, len))
+++=======
++ 	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
++ 			      &rb_parent)) {
++ 		if (do_munmap(mm, addr, len, uf))
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  			return -ENOMEM;
+ +		goto munmap_back;
+  	}
+  
+  	/* Check against address space limits *after* clearing old maps... */
+@@@ -2750,20 -2895,30 +2903,41 @@@ out
+  	if (flags & VM_LOCKED)
+  		mm->locked_vm += (len >> PAGE_SHIFT);
+  	vma->vm_flags |= VM_SOFTDIRTY;
+ -	return 0;
+ +	return addr;
+  }
+  
+++<<<<<<< HEAD
+ +unsigned long vm_brk(unsigned long addr, unsigned long len)
+++=======
++ static int do_brk(unsigned long addr, unsigned long len, struct list_head *uf)
++ {
++ 	return do_brk_flags(addr, len, 0, uf);
++ }
++ 
++ int vm_brk_flags(unsigned long addr, unsigned long len, unsigned long flags)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+  	struct mm_struct *mm = current->mm;
+ -	int ret;
+ +	unsigned long ret;
+  	bool populate;
++ 	LIST_HEAD(uf);
+  
+++<<<<<<< HEAD
+ +	down_write(&mm->mmap_sem);
+ +	ret = do_brk(addr, len);
+ +	populate = ((mm->def_flags & VM_LOCKED) != 0);
+ +	up_write(&mm->mmap_sem);
+ +	if (populate)
+++=======
++ 	if (down_write_killable(&mm->mmap_sem))
++ 		return -EINTR;
++ 
++ 	ret = do_brk_flags(addr, len, flags, &uf);
++ 	populate = ((mm->def_flags & VM_LOCKED) != 0);
++ 	up_write(&mm->mmap_sem);
++ 	userfaultfd_unmap_complete(mm, &uf);
++ 	if (populate && !ret)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  		mm_populate(addr, len);
+  	return ret;
+  }
+diff --cc mm/mremap.c
+index 4ee507690d73,8233b0105c82..000000000000
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@@ -237,7 -251,9 +237,13 @@@ unsigned long move_page_tables(struct v
+  
+  static unsigned long move_vma(struct vm_area_struct *vma,
+  		unsigned long old_addr, unsigned long old_len,
+++<<<<<<< HEAD
+ +		unsigned long new_len, unsigned long new_addr, bool *locked)
+++=======
++ 		unsigned long new_len, unsigned long new_addr,
++ 		bool *locked, struct vm_userfaultfd_ctx *uf,
++ 		struct list_head *uf_unmap)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+  	struct mm_struct *mm = vma->vm_mm;
+  	struct vm_area_struct *new_vma;
+@@@ -407,7 -417,9 +413,13 @@@ Eagain
+  }
+  
+  static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
+++<<<<<<< HEAD
+ +		unsigned long new_addr, unsigned long new_len, bool *locked)
+++=======
++ 		unsigned long new_addr, unsigned long new_len, bool *locked,
++ 		struct vm_userfaultfd_ctx *uf,
++ 		struct list_head *uf_unmap)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+  	struct mm_struct *mm = current->mm;
+  	struct vm_area_struct *vma;
+@@@ -421,16 -433,11 +433,16 @@@
+  	if (new_len > TASK_SIZE || new_addr > TASK_SIZE - new_len)
+  		goto out;
+  
+ -	/* Ensure the old/new locations do not overlap */
+ -	if (addr + old_len > new_addr && new_addr + new_len > addr)
+ +	/* Check if the location we're moving into overlaps the
+ +	 * old location at all, and fail if it does.
+ +	 */
+ +	if ((new_addr <= addr) && (new_addr+new_len) > addr)
+ +		goto out;
+ +
+ +	if ((addr <= new_addr) && (addr+old_len) > new_addr)
+  		goto out;
+  
+- 	ret = do_munmap(mm, new_addr, new_len);
++ 	ret = do_munmap(mm, new_addr, new_len, NULL);
+  	if (ret)
+  		goto out;
+  
+@@@ -454,11 -461,12 +466,17 @@@
+  	ret = get_unmapped_area(vma->vm_file, new_addr, new_len, vma->vm_pgoff +
+  				((addr - vma->vm_start) >> PAGE_SHIFT),
+  				map_flags);
+ -	if (offset_in_page(ret))
+ +	if (ret & ~PAGE_MASK)
+  		goto out1;
+  
+++<<<<<<< HEAD
+ +	ret = move_vma(vma, addr, old_len, new_len, new_addr, locked);
+ +	if (!(ret & ~PAGE_MASK))
+++=======
++ 	ret = move_vma(vma, addr, old_len, new_len, new_addr, locked, uf,
++ 		       uf_unmap);
++ 	if (!(offset_in_page(ret)))
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  		goto out;
+  out1:
+  	vm_unacct_memory(charged);
+@@@ -496,14 -504,17 +514,19 @@@ SYSCALL_DEFINE5(mremap, unsigned long, 
+  	unsigned long ret = -EINVAL;
+  	unsigned long charged = 0;
+  	bool locked = false;
+++<<<<<<< HEAD
+ +
+ +	down_write(&current->mm->mmap_sem);
+++=======
++ 	struct vm_userfaultfd_ctx uf = NULL_VM_UFFD_CTX;
++ 	LIST_HEAD(uf_unmap);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  
+  	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE))
+ -		return ret;
+ -
+ -	if (flags & MREMAP_FIXED && !(flags & MREMAP_MAYMOVE))
+ -		return ret;
+ +		goto out;
+  
+ -	if (offset_in_page(addr))
+ -		return ret;
+ +	if (addr & ~PAGE_MASK)
+ +		goto out;
+  
+  	old_len = PAGE_ALIGN(old_len);
+  	new_len = PAGE_ALIGN(new_len);
+@@@ -514,12 -525,14 +537,17 @@@
+  	 * a zero new-len is nonsensical.
+  	 */
+  	if (!new_len)
+ -		return ret;
+ -
+ -	if (down_write_killable(&current->mm->mmap_sem))
+ -		return -EINTR;
+ +		goto out;
+  
+  	if (flags & MREMAP_FIXED) {
+++<<<<<<< HEAD
+ +		if (flags & MREMAP_MAYMOVE)
+ +			ret = mremap_to(addr, old_len, new_addr, new_len,
+ +					&locked);
+++=======
++ 		ret = mremap_to(addr, old_len, new_addr, new_len,
++ 				&locked, &uf, &uf_unmap);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  		goto out;
+  	}
+  
+@@@ -588,13 -601,18 +616,23 @@@
+  			goto out;
+  		}
+  
+++<<<<<<< HEAD
+ +		ret = move_vma(vma, addr, old_len, new_len, new_addr, &locked);
+++=======
++ 		ret = move_vma(vma, addr, old_len, new_len, new_addr,
++ 			       &locked, &uf, &uf_unmap);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  	}
+  out:
+ -	if (offset_in_page(ret)) {
+ +	if (ret & ~PAGE_MASK)
+  		vm_unacct_memory(charged);
+ -		locked = 0;
+ -	}
+  	up_write(&current->mm->mmap_sem);
+  	if (locked && new_len > old_len)
+  		mm_populate(new_addr + old_len, new_len - old_len);
+++<<<<<<< HEAD
+++=======
++ 	mremap_userfaultfd_complete(&uf, addr, new_addr, old_len);
++ 	userfaultfd_unmap_complete(mm, &uf_unmap);
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  	return ret;
+  }
+diff --cc mm/nommu.c
+index 33d45217ae7b,fe9f4fa4a7a7..000000000000
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@@ -1281,13 -1198,15 +1281,25 @@@ enomem
+  /*
+   * handle mapping creation for uClinux
+   */
+++<<<<<<< HEAD
+ +unsigned long do_mmap_pgoff(struct file *file,
+ +			    unsigned long addr,
+ +			    unsigned long len,
+ +			    unsigned long prot,
+ +			    unsigned long flags,
+ +			    unsigned long pgoff,
+ +			    unsigned long *populate)
+++=======
++ unsigned long do_mmap(struct file *file,
++ 			unsigned long addr,
++ 			unsigned long len,
++ 			unsigned long prot,
++ 			unsigned long flags,
++ 			vm_flags_t vm_flags,
++ 			unsigned long pgoff,
++ 			unsigned long *populate,
++ 			struct list_head *uf)
+++>>>>>>> 897ab3e0c49e (userfaultfd: non-cooperative: add event for memory unmaps)
+  {
+  	struct vm_area_struct *vma;
+  	struct vm_region *region;
+* Unmerged path arch/x86/entry/vdso/vma.c
+* Unmerged path arch/mips/kernel/vdso.c
+diff --git a/arch/tile/mm/elf.c b/arch/tile/mm/elf.c
+index 743c951c61b0..e48fbb8fa34a 100644
+--- a/arch/tile/mm/elf.c
++++ b/arch/tile/mm/elf.c
+@@ -131,7 +131,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 		unsigned long addr = MEM_USER_INTRPT;
+ 		addr = mmap_region(NULL, addr, INTRPT_SIZE,
+ 				   VM_READ|VM_EXEC|
+-				   VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC, 0);
++				   VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC, 0, NULL);
+ 		if (addr > (unsigned long) -PAGE_SIZE)
+ 			retval = (int) addr;
+ 	}
+* Unmerged path arch/x86/entry/vdso/vma.c
+* Unmerged path arch/x86/mm/mpx.c
+diff --git a/fs/aio.c b/fs/aio.c
+index 865ebb8e7c0f..71fa4084a115 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -435,7 +435,7 @@ static int aio_setup_ring(struct kioctx *ctx)
+ 	down_write(&mm->mmap_sem);
+ 	ctx->mmap_base = do_mmap_pgoff(ctx->aio_ring_file, 0, ctx->mmap_size,
+ 				       PROT_READ | PROT_WRITE,
+-				       MAP_SHARED, 0, &unused);
++				       MAP_SHARED, 0, &unused, NULL);
+ 	up_write(&mm->mmap_sem);
+ 	if (IS_ERR((void *)ctx->mmap_base)) {
+ 		ctx->mmap_size = 0;
+* Unmerged path fs/proc/vmcore.c
+* Unmerged path fs/userfaultfd.c
+* Unmerged path include/linux/mm.h
+* Unmerged path include/linux/userfaultfd_k.h
+* Unmerged path include/uapi/linux/userfaultfd.h
+* Unmerged path ipc/shm.c
+* Unmerged path mm/mmap.c
+* Unmerged path mm/mremap.c
+* Unmerged path mm/nommu.c
+diff --git a/mm/util.c b/mm/util.c
+index c13190fa2ed4..50ec220be775 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -10,6 +10,7 @@
+ #include <linux/mman.h>
+ #include <linux/hugetlb.h>
+ #include <linux/vmalloc.h>
++#include <linux/userfaultfd_k.h>
+ 
+ #include <asm/sections.h>
+ #include <asm/uaccess.h>
+@@ -422,13 +423,15 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+ 	unsigned long ret;
+ 	struct mm_struct *mm = current->mm;
+ 	unsigned long populate;
++	LIST_HEAD(uf);
+ 
+ 	ret = security_mmap_file(file, prot, flag);
+ 	if (!ret) {
+ 		down_write(&mm->mmap_sem);
+ 		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
+-				    &populate);
++				    &populate, &uf);
+ 		up_write(&mm->mmap_sem);
++		userfaultfd_unmap_complete(mm, &uf);
+ 		if (populate)
+ 			mm_populate(ret, populate);
+ 	}
