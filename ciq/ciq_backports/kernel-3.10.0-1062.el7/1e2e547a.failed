@@ -1,0 +1,680 @@
+do d_instantiate/unlock_new_inode combinations safely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 1e2e547a93a00ebc21582c06ca3c6cfea2a309ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1e2e547a.failed
+
+For anything NFS-exported we do _not_ want to unlock new inode
+before it has grown an alias; original set of fixes got the
+ordering right, but missed the nasty complication in case of
+lockdep being enabled - unlock_new_inode() does
+	lockdep_annotate_inode_mutex_key(inode)
+which can only be done before anyone gets a chance to touch
+->i_mutex.  Unfortunately, flipping the order and doing
+unlock_new_inode() before d_instantiate() opens a window when
+mkdir can race with open-by-fhandle on a guessed fhandle, leading
+to multiple aliases for a directory inode and all the breakage
+that follows from that.
+
+	Correct solution: a new primitive (d_instantiate_new())
+combining these two in the right order - lockdep annotate, then
+d_instantiate(), then the rest of unlock_new_inode().  All
+combinations of d_instantiate() with unlock_new_inode() should
+be converted to that.
+
+	Cc: stable@kernel.org	# 2.6.29 and later
+	Tested-by: Mike Marshall <hubcap@omnibond.com>
+	Reviewed-by: Andreas Dilger <adilger@dilger.ca>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 1e2e547a93a00ebc21582c06ca3c6cfea2a309ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/f2fs/namei.c
+#	fs/nilfs2/namei.c
+#	fs/orangefs/namei.c
+#	fs/reiserfs/namei.c
+#	fs/udf/namei.c
+#	fs/ufs/namei.c
+diff --cc fs/f2fs/namei.c
+index 47abc9722b17,75e37fd720b2..000000000000
+--- a/fs/f2fs/namei.c
++++ b/fs/f2fs/namei.c
+@@@ -149,16 -293,16 +149,25 @@@ static int f2fs_create(struct inode *di
+  
+  	alloc_nid_done(sbi, ino);
+  
+++<<<<<<< HEAD
+ +	if (!sbi->por_doing)
+ +		d_instantiate(dentry, inode);
+ +	unlock_new_inode(inode);
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 
++ 	if (IS_DIRSYNC(dir))
++ 		f2fs_sync_fs(sbi->sb, 1);
++ 
++ 	f2fs_balance_fs(sbi, true);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  	return 0;
+  out:
+ -	handle_failed_inode(inode);
+ +	clear_nlink(inode);
+ +	unlock_new_inode(inode);
+ +	make_bad_inode(inode);
+ +	iput(inode);
+ +	alloc_nid_failed(sbi, ino);
+  	return err;
+  }
+  
+@@@ -280,27 -575,56 +289,66 @@@ static int f2fs_symlink(struct inode *d
+  	if (IS_ERR(inode))
+  		return PTR_ERR(inode);
+  
+ -	if (IS_ENCRYPTED(inode))
+ -		inode->i_op = &f2fs_encrypted_symlink_inode_operations;
+ -	else
+ -		inode->i_op = &f2fs_symlink_inode_operations;
+ -	inode_nohighmem(inode);
+ +	inode->i_op = &f2fs_symlink_inode_operations;
+  	inode->i_mapping->a_ops = &f2fs_dblock_aops;
+  
+ -	f2fs_lock_op(sbi);
+ +	ilock = mutex_lock_op(sbi);
+  	err = f2fs_add_link(dentry, inode);
+ +	mutex_unlock_op(sbi, ilock);
+  	if (err)
+ -		goto out_handle_failed_inode;
+ -	f2fs_unlock_op(sbi);
+ +		goto out;
+ +
+ +	err = page_symlink(inode, symname, symlen);
+  	alloc_nid_done(sbi, inode->i_ino);
+  
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+ +	unlock_new_inode(inode);
+ +	return err;
+ +out:
+ +	clear_nlink(inode);
+ +	unlock_new_inode(inode);
+ +	make_bad_inode(inode);
+ +	iput(inode);
+ +	alloc_nid_failed(sbi, inode->i_ino);
+++=======
++ 	err = fscrypt_encrypt_symlink(inode, symname, len, &disk_link);
++ 	if (err)
++ 		goto err_out;
++ 
++ 	err = page_symlink(inode, disk_link.name, disk_link.len);
++ 
++ err_out:
++ 	d_instantiate_new(dentry, inode);
++ 
++ 	/*
++ 	 * Let's flush symlink data in order to avoid broken symlink as much as
++ 	 * possible. Nevertheless, fsyncing is the best way, but there is no
++ 	 * way to get a file descriptor in order to flush that.
++ 	 *
++ 	 * Note that, it needs to do dir->fsync to make this recoverable.
++ 	 * If the symlink path is stored into inline_data, there is no
++ 	 * performance regression.
++ 	 */
++ 	if (!err) {
++ 		filemap_write_and_wait_range(inode->i_mapping, 0,
++ 							disk_link.len - 1);
++ 
++ 		if (IS_DIRSYNC(dir))
++ 			f2fs_sync_fs(sbi->sb, 1);
++ 	} else {
++ 		f2fs_unlink(dir, dentry);
++ 	}
++ 
++ 	f2fs_balance_fs(sbi, true);
++ 	goto out_free_encrypted_link;
++ 
++ out_handle_failed_inode:
++ 	handle_failed_inode(inode);
++ out_free_encrypted_link:
++ 	if (disk_link.name != (unsigned char *)symname)
++ 		kfree(disk_link.name);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  	return err;
+  }
+  
+@@@ -330,9 -658,13 +378,8 @@@ static int f2fs_mkdir(struct inode *dir
+  
+  	alloc_nid_done(sbi, inode->i_ino);
+  
+- 	d_instantiate(dentry, inode);
+- 	unlock_new_inode(inode);
++ 	d_instantiate_new(dentry, inode);
+  
+ -	if (IS_DIRSYNC(dir))
+ -		f2fs_sync_fs(sbi->sb, 1);
+ -
+ -	f2fs_balance_fs(sbi, true);
+  	return 0;
+  
+  out_fail:
+@@@ -374,22 -702,83 +421,32 @@@ static int f2fs_mknod(struct inode *dir
+  	init_special_inode(inode, inode->i_mode, rdev);
+  	inode->i_op = &f2fs_special_inode_operations;
+  
+ -	f2fs_lock_op(sbi);
+ +	ilock = mutex_lock_op(sbi);
+  	err = f2fs_add_link(dentry, inode);
+ +	mutex_unlock_op(sbi, ilock);
+  	if (err)
+  		goto out;
+ -	f2fs_unlock_op(sbi);
+  
+  	alloc_nid_done(sbi, inode->i_ino);
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+ +	unlock_new_inode(inode);
+++=======
++ 
++ 	d_instantiate_new(dentry, inode);
++ 
++ 	if (IS_DIRSYNC(dir))
++ 		f2fs_sync_fs(sbi->sb, 1);
++ 
++ 	f2fs_balance_fs(sbi, true);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  	return 0;
+  out:
+ -	handle_failed_inode(inode);
+ -	return err;
+ -}
+ -
+ -static int __f2fs_tmpfile(struct inode *dir, struct dentry *dentry,
+ -					umode_t mode, struct inode **whiteout)
+ -{
+ -	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
+ -	struct inode *inode;
+ -	int err;
+ -
+ -	err = dquot_initialize(dir);
+ -	if (err)
+ -		return err;
+ -
+ -	inode = f2fs_new_inode(dir, mode);
+ -	if (IS_ERR(inode))
+ -		return PTR_ERR(inode);
+ -
+ -	if (whiteout) {
+ -		init_special_inode(inode, inode->i_mode, WHITEOUT_DEV);
+ -		inode->i_op = &f2fs_special_inode_operations;
+ -	} else {
+ -		inode->i_op = &f2fs_file_inode_operations;
+ -		inode->i_fop = &f2fs_file_operations;
+ -		inode->i_mapping->a_ops = &f2fs_dblock_aops;
+ -	}
+ -
+ -	f2fs_lock_op(sbi);
+ -	err = acquire_orphan_inode(sbi);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = f2fs_do_tmpfile(inode, dir);
+ -	if (err)
+ -		goto release_out;
+ -
+ -	/*
+ -	 * add this non-linked tmpfile to orphan list, in this way we could
+ -	 * remove all unused data of tmpfile after abnormal power-off.
+ -	 */
+ -	add_orphan_inode(inode);
+ -	alloc_nid_done(sbi, inode->i_ino);
+ -
+ -	if (whiteout) {
+ -		f2fs_i_links_write(inode, false);
+ -		*whiteout = inode;
+ -	} else {
+ -		d_tmpfile(dentry, inode);
+ -	}
+ -	/* link_count was changed by d_tmpfile as well. */
+ -	f2fs_unlock_op(sbi);
+ +	clear_nlink(inode);
+  	unlock_new_inode(inode);
+ -
+ -	f2fs_balance_fs(sbi, true);
+ -	return 0;
+ -
+ -release_out:
+ -	release_orphan_inode(sbi);
+ -out:
+ -	handle_failed_inode(inode);
+ +	make_bad_inode(inode);
+ +	iput(inode);
+ +	alloc_nid_failed(sbi, inode->i_ino);
+  	return err;
+  }
+  
+diff --cc fs/nilfs2/namei.c
+index 9de78f08989e,dd52d3f82e8d..000000000000
+--- a/fs/nilfs2/namei.c
++++ b/fs/nilfs2/namei.c
+@@@ -49,8 -44,9 +49,12 @@@
+  static inline int nilfs_add_nondir(struct dentry *dentry, struct inode *inode)
+  {
+  	int err = nilfs_add_link(dentry, inode);
+ -
+  	if (!err) {
+++<<<<<<< HEAD
+ +		d_instantiate(dentry, inode);
+++=======
++ 		d_instantiate_new(dentry, inode);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  		return 0;
+  	}
+  	inode_dec_link_count(inode);
+@@@ -242,7 -242,7 +246,11 @@@ static int nilfs_mkdir(struct inode *di
+  		goto out_fail;
+  
+  	nilfs_mark_inode_dirty(inode);
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+++=======
++ 	d_instantiate_new(dentry, inode);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  out:
+  	if (!err)
+  		err = nilfs_transaction_commit(dir->i_sb);
+diff --cc fs/reiserfs/namei.c
+index 8567fb847601,5089dac02660..000000000000
+--- a/fs/reiserfs/namei.c
++++ b/fs/reiserfs/namei.c
+@@@ -634,11 -687,10 +634,16 @@@ static int reiserfs_create(struct inod
+  	reiserfs_update_inode_transaction(inode);
+  	reiserfs_update_inode_transaction(dir);
+  
+++<<<<<<< HEAD
+ +	unlock_new_inode(inode);
+ +	d_instantiate(dentry, inode);
+ +	retval = journal_end(&th, dir->i_sb, jbegin_count);
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 	retval = journal_end(&th);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  
+ -out_failed:
+ +      out_failed:
+  	reiserfs_write_unlock(dir->i_sb);
+  	return retval;
+  }
+@@@ -712,11 -770,10 +717,16 @@@ static int reiserfs_mknod(struct inode 
+  		goto out_failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	unlock_new_inode(inode);
+ +	d_instantiate(dentry, inode);
+ +	retval = journal_end(&th, dir->i_sb, jbegin_count);
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 	retval = journal_end(&th);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  
+ -out_failed:
+ +      out_failed:
+  	reiserfs_write_unlock(dir->i_sb);
+  	return retval;
+  }
+@@@ -797,14 -866,13 +807,19 @@@ static int reiserfs_mkdir(struct inode 
+  		iput(inode);
+  		goto out_failed;
+  	}
+ -	/* the above add_entry did not update dir's stat data */
+ +	// the above add_entry did not update dir's stat data
+  	reiserfs_update_sd(&th, dir);
+  
+++<<<<<<< HEAD
+ +	unlock_new_inode(inode);
+ +	d_instantiate(dentry, inode);
+ +	retval = journal_end(&th, dir->i_sb, jbegin_count);
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 	retval = journal_end(&th);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  out_failed:
+ -	reiserfs_write_unlock(dir->i_sb);
+ +	reiserfs_write_unlock_once(dir->i_sb, lock_depth);
+  	return retval;
+  }
+  
+@@@ -1096,10 -1184,9 +1111,16 @@@ static int reiserfs_symlink(struct inod
+  		goto out_failed;
+  	}
+  
+++<<<<<<< HEAD
+ +	unlock_new_inode(inode);
+ +	d_instantiate(dentry, inode);
+ +	retval = journal_end(&th, parent_dir->i_sb, jbegin_count);
+ +      out_failed:
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 	retval = journal_end(&th);
++ out_failed:
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  	reiserfs_write_unlock(parent_dir->i_sb);
+  	return retval;
+  }
+diff --cc fs/udf/namei.c
+index 102c072c6bbf,c586026508db..000000000000
+--- a/fs/udf/namei.c
++++ b/fs/udf/namei.c
+@@@ -589,7 -622,7 +589,11 @@@ static int udf_create(struct inode *dir
+  	if (fibh.sbh != fibh.ebh)
+  		brelse(fibh.ebh);
+  	brelse(fibh.sbh);
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+++=======
++ 	d_instantiate_new(dentry, inode);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  
+  	return 0;
+  }
+@@@ -686,8 -730,9 +690,12 @@@ static int udf_mkdir(struct inode *dir
+  	cfi.fileCharacteristics |= FID_FILE_CHAR_DIRECTORY;
+  	udf_write_fi(dir, &cfi, fi, &fibh, NULL, NULL);
+  	inc_nlink(dir);
+ -	dir->i_ctime = dir->i_mtime = current_time(dir);
+  	mark_inode_dirty(dir);
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+++=======
++ 	d_instantiate_new(dentry, inode);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  	if (fibh.sbh != fibh.ebh)
+  		brelse(fibh.ebh);
+  	brelse(fibh.sbh);
+diff --cc fs/ufs/namei.c
+index 90d74b8f8eba,d5f43ba76c59..000000000000
+--- a/fs/ufs/namei.c
++++ b/fs/ufs/namei.c
+@@@ -38,7 -39,7 +38,11 @@@ static inline int ufs_add_nondir(struc
+  {
+  	int err = ufs_add_link(dentry, inode);
+  	if (!err) {
+++<<<<<<< HEAD
+ +		d_instantiate(dentry, inode);
+++=======
++ 		d_instantiate_new(dentry, inode);
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  		return 0;
+  	}
+  	inode_dec_link_count(inode);
+@@@ -202,11 -191,9 +206,16 @@@ static int ufs_mkdir(struct inode * dir
+  	err = ufs_add_link(dentry, inode);
+  	if (err)
+  		goto out_fail;
+ +	unlock_ufs(dir->i_sb);
+  
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+ +out:
+ +	return err;
+++=======
++ 	d_instantiate_new(dentry, inode);
++ 	return 0;
+++>>>>>>> 1e2e547a93a0 (do d_instantiate/unlock_new_inode combinations safely)
+  
+  out_fail:
+  	inode_dec_link_count(inode);
+* Unmerged path fs/orangefs/namei.c
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 658c0445d5cd..a53b91daae1b 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6481,8 +6481,7 @@ static int btrfs_mknod(struct inode *dir, struct dentry *dentry,
+ 		goto out_unlock_inode;
+ 	} else {
+ 		btrfs_update_inode(trans, root, inode);
+-		unlock_new_inode(inode);
+-		d_instantiate(dentry, inode);
++		d_instantiate_new(dentry, inode);
+ 	}
+ 
+ out_unlock:
+@@ -6558,8 +6557,7 @@ static int btrfs_create(struct inode *dir, struct dentry *dentry,
+ 		goto out_unlock_inode;
+ 
+ 	BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 
+ out_unlock:
+ 	btrfs_end_transaction(trans, root);
+@@ -6694,12 +6692,7 @@ static int btrfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	if (err)
+ 		goto out_fail_inode;
+ 
+-	d_instantiate(dentry, inode);
+-	/*
+-	 * mkdir is special.  We're unlocking after we call d_instantiate
+-	 * to avoid a race with nfsd calling d_instantiate.
+-	 */
+-	unlock_new_inode(inode);
++	d_instantiate_new(dentry, inode);
+ 	drop_on_err = 0;
+ 
+ out_fail:
+@@ -10005,8 +9998,7 @@ static int btrfs_symlink(struct inode *dir, struct dentry *dentry,
+ 		goto out_unlock_inode;
+ 	}
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 
+ out_unlock:
+ 	btrfs_end_transaction(trans, root);
+diff --git a/fs/dcache.c b/fs/dcache.c
+index f8f0822c6dd1..202bdbe50996 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1683,6 +1683,28 @@ void d_instantiate(struct dentry *entry, struct inode * inode)
+ }
+ EXPORT_SYMBOL(d_instantiate);
+ 
++/*
++ * This should be equivalent to d_instantiate() + unlock_new_inode(),
++ * with lockdep-related part of unlock_new_inode() done before
++ * anything else.  Use that instead of open-coding d_instantiate()/
++ * unlock_new_inode() combinations.
++ */
++void d_instantiate_new(struct dentry *entry, struct inode *inode)
++{
++	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
++	BUG_ON(!inode);
++	lockdep_annotate_inode_mutex_key(inode);
++	security_d_instantiate(entry, inode);
++	spin_lock(&inode->i_lock);
++	__d_instantiate(entry, inode);
++	WARN_ON(!(inode->i_state & I_NEW));
++	inode->i_state &= ~I_NEW;
++	smp_mb();
++	wake_up_bit(&inode->i_state, __I_NEW);
++	spin_unlock(&inode->i_lock);
++}
++EXPORT_SYMBOL(d_instantiate_new);
++
+ /**
+  * d_instantiate_unique - instantiate a non-aliased dentry
+  * @entry: dentry to instantiate
+diff --git a/fs/ecryptfs/inode.c b/fs/ecryptfs/inode.c
+index 1648908cf236..f09dd73e6a7c 100644
+--- a/fs/ecryptfs/inode.c
++++ b/fs/ecryptfs/inode.c
+@@ -298,8 +298,7 @@ ecryptfs_create(struct inode *directory_inode, struct dentry *ecryptfs_dentry,
+ 		iput(ecryptfs_inode);
+ 		goto out;
+ 	}
+-	unlock_new_inode(ecryptfs_inode);
+-	d_instantiate(ecryptfs_dentry, ecryptfs_inode);
++	d_instantiate_new(ecryptfs_dentry, ecryptfs_inode);
+ out:
+ 	return rc;
+ }
+diff --git a/fs/ext2/namei.c b/fs/ext2/namei.c
+index a5775955ca7b..736c89b7c6eb 100644
+--- a/fs/ext2/namei.c
++++ b/fs/ext2/namei.c
+@@ -40,8 +40,7 @@ static inline int ext2_add_nondir(struct dentry *dentry, struct inode *inode)
+ {
+ 	int err = ext2_add_link(dentry, inode);
+ 	if (!err) {
+-		unlock_new_inode(inode);
+-		d_instantiate(dentry, inode);
++		d_instantiate_new(dentry, inode);
+ 		return 0;
+ 	}
+ 	inode_dec_link_count(inode);
+@@ -259,8 +258,7 @@ static int ext2_mkdir(struct inode * dir, struct dentry * dentry, umode_t mode)
+ 	if (err)
+ 		goto out_fail;
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ out:
+ 	return err;
+ 
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index 604020e336e0..9c0558b5dfcb 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -2228,8 +2228,7 @@ static int ext4_add_nondir(handle_t *handle,
+ 	int err = ext4_add_entry(handle, dentry, inode);
+ 	if (!err) {
+ 		ext4_mark_inode_dirty(handle, inode);
+-		unlock_new_inode(inode);
+-		d_instantiate(dentry, inode);
++		d_instantiate_new(dentry, inode);
+ 		return 0;
+ 	}
+ 	drop_nlink(inode);
+@@ -2464,8 +2463,7 @@ out_clear_inode:
+ 	err = ext4_mark_inode_dirty(handle, dir);
+ 	if (err)
+ 		goto out_clear_inode;
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 	if (IS_DIRSYNC(dir))
+ 		ext4_handle_sync(handle);
+ 
+* Unmerged path fs/f2fs/namei.c
+diff --git a/fs/jffs2/dir.c b/fs/jffs2/dir.c
+index acd46a4160cb..fa713a388b77 100644
+--- a/fs/jffs2/dir.c
++++ b/fs/jffs2/dir.c
+@@ -226,8 +226,7 @@ static int jffs2_create(struct inode *dir_i, struct dentry *dentry,
+ 		  __func__, inode->i_ino, inode->i_mode, inode->i_nlink,
+ 		  f->inocache->pino_nlink, inode->i_mapping->nrpages);
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 	return 0;
+ 
+  fail:
+@@ -446,8 +445,7 @@ static int jffs2_symlink (struct inode *dir_i, struct dentry *dentry, const char
+ 	mutex_unlock(&dir_f->sem);
+ 	jffs2_complete_reservation(c);
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 	return 0;
+ 
+  fail:
+@@ -591,8 +589,7 @@ static int jffs2_mkdir (struct inode *dir_i, struct dentry *dentry, umode_t mode
+ 	mutex_unlock(&dir_f->sem);
+ 	jffs2_complete_reservation(c);
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 	return 0;
+ 
+  fail:
+@@ -766,8 +763,7 @@ static int jffs2_mknod (struct inode *dir_i, struct dentry *dentry, umode_t mode
+ 	mutex_unlock(&dir_f->sem);
+ 	jffs2_complete_reservation(c);
+ 
+-	unlock_new_inode(inode);
+-	d_instantiate(dentry, inode);
++	d_instantiate_new(dentry, inode);
+ 	return 0;
+ 
+  fail:
+diff --git a/fs/jfs/namei.c b/fs/jfs/namei.c
+index 25e171702de6..7408fb912724 100644
+--- a/fs/jfs/namei.c
++++ b/fs/jfs/namei.c
+@@ -176,8 +176,7 @@ static int jfs_create(struct inode *dip, struct dentry *dentry, umode_t mode,
+ 		unlock_new_inode(ip);
+ 		iput(ip);
+ 	} else {
+-		unlock_new_inode(ip);
+-		d_instantiate(dentry, ip);
++		d_instantiate_new(dentry, ip);
+ 	}
+ 
+       out2:
+@@ -309,8 +308,7 @@ static int jfs_mkdir(struct inode *dip, struct dentry *dentry, umode_t mode)
+ 		unlock_new_inode(ip);
+ 		iput(ip);
+ 	} else {
+-		unlock_new_inode(ip);
+-		d_instantiate(dentry, ip);
++		d_instantiate_new(dentry, ip);
+ 	}
+ 
+       out2:
+@@ -1043,8 +1041,7 @@ static int jfs_symlink(struct inode *dip, struct dentry *dentry,
+ 		unlock_new_inode(ip);
+ 		iput(ip);
+ 	} else {
+-		unlock_new_inode(ip);
+-		d_instantiate(dentry, ip);
++		d_instantiate_new(dentry, ip);
+ 	}
+ 
+       out2:
+@@ -1424,8 +1421,7 @@ static int jfs_mknod(struct inode *dir, struct dentry *dentry,
+ 		unlock_new_inode(ip);
+ 		iput(ip);
+ 	} else {
+-		unlock_new_inode(ip);
+-		d_instantiate(dentry, ip);
++		d_instantiate_new(dentry, ip);
+ 	}
+ 
+       out1:
+* Unmerged path fs/nilfs2/namei.c
+* Unmerged path fs/orangefs/namei.c
+* Unmerged path fs/reiserfs/namei.c
+* Unmerged path fs/udf/namei.c
+* Unmerged path fs/ufs/namei.c
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index d021d2f76e5c..4e7db76ce14c 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -241,6 +241,7 @@ static inline int dname_external(struct dentry *dentry)
+  * These are the low-level FS interfaces to the dcache..
+  */
+ extern void d_instantiate(struct dentry *, struct inode *);
++extern void d_instantiate_new(struct dentry *, struct inode *);
+ extern struct dentry * d_instantiate_unique(struct dentry *, struct inode *);
+ extern struct dentry * d_materialise_unique(struct dentry *, struct inode *);
+ extern void __d_drop(struct dentry *dentry);
