@@ -1,0 +1,195 @@
+iommu/amd: Copy old trans table from old kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Copy old trans table from old kernel (Jerry Snitselaar) [1062729]
+Rebuild_FUZZ: 93.18%
+commit-author Baoquan He <bhe@redhat.com>
+commit 3ac3e5ee5ed56b07448f295902e44916eb6979fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3ac3e5ee.failed
+
+Here several things need be done:
+- If iommu is pre-enabled in a normal kernel, just disable it and print
+  warning.
+
+- If any one of IOMMUs is not pre-enabled in kdump kernel, just continue
+  as it does in normal kernel.
+
+- If failed to copy dev table of old kernel, continue to proceed as
+  it does in normal kernel.
+
+- Only if all IOMMUs are pre-enabled and copy dev table is done well, free
+  the dev table allocated in early_amd_iommu_init() and make amd_iommu_dev_table
+  point to the copied one.
+
+- Disable and Re-enable event/cmd buffer,  install the copied DTE table
+  to reg, and detect and enable guest vapic.
+
+- Flush all caches
+
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 3ac3e5ee5ed56b07448f295902e44916eb6979fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu_init.c
+diff --cc drivers/iommu/amd_iommu_init.c
+index 7961fd9385cc,959c25d997e1..000000000000
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@@ -249,6 -263,27 +250,30 @@@ static int amd_iommu_enable_interrupts(
+  static int __init iommu_go_to_state(enum iommu_init_state state);
+  static void init_device_table_dma(void);
+  
+++<<<<<<< HEAD
+++=======
++ static bool __initdata amd_iommu_pre_enabled = true;
++ 
++ bool translation_pre_enabled(struct amd_iommu *iommu)
++ {
++ 	return (iommu->flags & AMD_IOMMU_FLAG_TRANS_PRE_ENABLED);
++ }
++ 
++ static void clear_translation_pre_enabled(struct amd_iommu *iommu)
++ {
++ 	iommu->flags &= ~AMD_IOMMU_FLAG_TRANS_PRE_ENABLED;
++ }
++ 
++ static void init_translation_status(struct amd_iommu *iommu)
++ {
++ 	u32 ctrl;
++ 
++ 	ctrl = readl(iommu->mmio_base + MMIO_CONTROL_OFFSET);
++ 	if (ctrl & (1<<CONTROL_IOMMU_EN))
++ 		iommu->flags |= AMD_IOMMU_FLAG_TRANS_PRE_ENABLED;
++ }
++ 
+++>>>>>>> 3ac3e5ee5ed5 (iommu/amd: Copy old trans table from old kernel)
+  static inline void update_last_devid(u16 devid)
+  {
+  	if (devid > amd_iommu_last_bdf)
+@@@ -1315,6 -1500,16 +1342,19 @@@ static int __init init_iommu_one(struc
+  
+  	iommu->int_enabled = false;
+  
+++<<<<<<< HEAD
+++=======
++ 	init_translation_status(iommu);
++ 	if (translation_pre_enabled(iommu) && !is_kdump_kernel()) {
++ 		iommu_disable(iommu);
++ 		clear_translation_pre_enabled(iommu);
++ 		pr_warn("Translation was enabled for IOMMU:%d but we are not in kdump mode\n",
++ 			iommu->index);
++ 	}
++ 	if (amd_iommu_pre_enabled)
++ 		amd_iommu_pre_enabled = translation_pre_enabled(iommu);
++ 
+++>>>>>>> 3ac3e5ee5ed5 (iommu/amd: Copy old trans table from old kernel)
+  	ret = init_iommu_from_acpi(iommu, h);
+  	if (ret)
+  		return ret;
+@@@ -1862,24 -2106,86 +1901,68 @@@ static void iommu_apply_resume_quirks(s
+  			       iommu->stored_addr_lo | 1);
+  }
+  
+ -static void iommu_enable_ga(struct amd_iommu *iommu)
+ -{
+ -#ifdef CONFIG_IRQ_REMAP
+ -	switch (amd_iommu_guest_ir) {
+ -	case AMD_IOMMU_GUEST_IR_VAPIC:
+ -		iommu_feature_enable(iommu, CONTROL_GAM_EN);
+ -		/* Fall through */
+ -	case AMD_IOMMU_GUEST_IR_LEGACY_GA:
+ -		iommu_feature_enable(iommu, CONTROL_GA_EN);
+ -		iommu->irte_ops = &irte_128_ops;
+ -		break;
+ -	default:
+ -		iommu->irte_ops = &irte_32_ops;
+ -		break;
+ -	}
+ -#endif
+ -}
+ -
+ -static void early_enable_iommu(struct amd_iommu *iommu)
+ -{
+ -	iommu_disable(iommu);
+ -	iommu_init_flags(iommu);
+ -	iommu_set_device_table(iommu);
+ -	iommu_enable_command_buffer(iommu);
+ -	iommu_enable_event_buffer(iommu);
+ -	iommu_set_exclusion_range(iommu);
+ -	iommu_enable_ga(iommu);
+ -	iommu_enable(iommu);
+ -	iommu_flush_all_caches(iommu);
+ -}
+ -
+  /*
+   * This function finally enables all IOMMUs found in the system after
+-  * they have been initialized
++  * they have been initialized.
++  *
++  * Or if in kdump kernel and IOMMUs are all pre-enabled, try to copy
++  * the old content of device table entries. Not this case or copy failed,
++  * just continue as normal kernel does.
+   */
+  static void early_enable_iommus(void)
+  {
+  	struct amd_iommu *iommu;
+  
+++<<<<<<< HEAD
+ +	for_each_iommu(iommu) {
+ +		iommu_disable(iommu);
+ +		iommu_init_flags(iommu);
+ +		iommu_set_device_table(iommu);
+ +		iommu_enable_command_buffer(iommu);
+ +		iommu_enable_event_buffer(iommu);
+ +		iommu_set_exclusion_range(iommu);
+ +		iommu_enable(iommu);
+ +		iommu_flush_all_caches(iommu);
+ +	}
+++=======
++ 
++ 	if (!copy_device_table()) {
++ 		/*
++ 		 * If come here because of failure in copying device table from old
++ 		 * kernel with all IOMMUs enabled, print error message and try to
++ 		 * free allocated old_dev_tbl_cpy.
++ 		 */
++ 		if (amd_iommu_pre_enabled)
++ 			pr_err("Failed to copy DEV table from previous kernel.\n");
++ 		if (old_dev_tbl_cpy != NULL)
++ 			free_pages((unsigned long)old_dev_tbl_cpy,
++ 					get_order(dev_table_size));
++ 
++ 		for_each_iommu(iommu) {
++ 			clear_translation_pre_enabled(iommu);
++ 			early_enable_iommu(iommu);
++ 		}
++ 	} else {
++ 		pr_info("Copied DEV table from previous kernel.\n");
++ 		free_pages((unsigned long)amd_iommu_dev_table,
++ 				get_order(dev_table_size));
++ 		amd_iommu_dev_table = old_dev_tbl_cpy;
++ 		for_each_iommu(iommu) {
++ 			iommu_disable_command_buffer(iommu);
++ 			iommu_disable_event_buffer(iommu);
++ 			iommu_enable_command_buffer(iommu);
++ 			iommu_enable_event_buffer(iommu);
++ 			iommu_enable_ga(iommu);
++ 			iommu_set_device_table(iommu);
++ 			iommu_flush_all_caches(iommu);
++ 		}
++ 	}
++ 
++ #ifdef CONFIG_IRQ_REMAP
++ 	if (AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
++ 		amd_iommu_irq_ops.capability |= (1 << IRQ_POSTING_CAP);
++ #endif
+++>>>>>>> 3ac3e5ee5ed5 (iommu/amd: Copy old trans table from old kernel)
+  }
+  
+  static void enable_iommus_v2(void)
+* Unmerged path drivers/iommu/amd_iommu_init.c
