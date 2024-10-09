@@ -1,0 +1,269 @@
+x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/cqm: Add RMID (Resource monitoring ID) management (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 96.72%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit edf6fa1c4a951b3a03e94b63e6483c5d9da3ab11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/edf6fa1c.failed
+
+Hardware uses RMID(Resource monitoring ID) to keep track of each of the
+RDT events associated with tasks. The number of RMIDs is dependent on
+the SKU and is enumerated via CPUID. We add support to manage the RMIDs
+which include managing the RMID allocation and reading LLC occupancy
+for an RMID.
+
+RMID allocation is managed by keeping a free list which is initialized
+to all available RMIDs except for RMID 0 which is always reserved for
+root group. RMIDs goto a limbo list once they are
+freed since the RMIDs are still tagged to cache lines of the tasks which
+were using them - thereby still having some occupancy. They continue to
+be in limbo list until the occupancy < threshold_occupancy. The
+threshold_occupancy is a user configurable value.
+OS uses IA32_QM_CTR MSR to read the occupancy associated with an RMID
+after programming the IA32_EVENTSEL MSR with the RMID.
+
+[Tony: Improved limbo search]
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-10-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit edf6fa1c4a951b3a03e94b63e6483c5d9da3ab11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,d30830a8eafd..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -165,68 -271,73 +165,113 @@@ static void rdt_get_cdp_l3_config(int t
+  	 * By default, CDP is disabled. CDP can be enabled by mount parameter
+  	 * "cdp" during resctrl file system mount time.
+  	 */
+ -	r->alloc_enabled = false;
+ +	r->enabled = false;
+  }
+  
+ -static int get_cache_id(int cpu, int level)
+ +/**
+ + * Choose a width for the resource name
+ + * and resource data based on the resource that has
+ + * widest name and cbm.
+ + */
+ +static void rdt_init_padding(void)
+  {
+ -	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
+ -	int i;
+ +	struct rdt_resource *r;
+ +	int cl;
+ +
+ +	for_each_enabled_rdt_resource(r) {
+ +		cl = strlen(r->name);
+ +		if (cl > max_name_width)
+ +			max_name_width = cl;
+  
+ -	for (i = 0; i < ci->num_leaves; i++) {
+ -		if (ci->info_list[i].level == level)
+ -			return ci->info_list[i].id;
+ +		if (r->data_width > max_data_width)
+ +			max_data_width = r->data_width;
+  	}
+ +}
+ +
+ +static inline bool get_rdt_resources(void)
+ +{
+ +	bool ret = false;
+ +
+ +	if (cache_alloc_hsw_probe())
+ +		return true;
+  
+ -	return -1;
+ +	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ +		return false;
+ +
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ +		rdt_get_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ +		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +		}
+ +		ret = true;
+ +	}
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ +		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ +		rdt_get_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ +		ret = true;
+ +	}
+ +
+ +	rdt_init_padding();
+ +
+ +	return ret;
+  }
+  
+ -/*
+ - * Map the memory b/w percentage value to delay values
+ - * that can be written to QOS_MSRs.
+ - * There are currently no SKUs which support non linear delay values.
+ - */
+ -static u32 delay_bw_map(unsigned long bw, struct rdt_resource *r)
+ +static int get_cache_id(int cpu, int level)
+ +{
+ +	return get_cpu_cache_id(cpu, level);
+ +}
+ +
+ +void rdt_cbm_update(void *arg)
+  {
+++<<<<<<< HEAD
+ +	struct msr_param *m = (struct msr_param *)arg;
+++=======
++ 	if (r->membw.delay_linear)
++ 		return MAX_MBA_BW - bw;
++ 
++ 	pr_warn_once("Non Linear delay-bw map not supported but queried\n");
++ 	return r->default_ctrl;
++ }
++ 
++ static void
++ mba_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r)
++ {
++ 	unsigned int i;
++ 
++ 	/*  Write the delay values for mba. */
++ 	for (i = m->low; i < m->high; i++)
++ 		wrmsrl(r->msr_base + i, delay_bw_map(d->ctrl_val[i], r));
++ }
++ 
++ static void
++ cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = m->low; i < m->high; i++)
++ 		wrmsrl(r->msr_base + cbm_idx(r, i), d->ctrl_val[i]);
++ }
++ 
++ struct rdt_domain *get_domain_from_cpu(int cpu, struct rdt_resource *r)
++ {
++ 	struct rdt_domain *d;
++ 
++ 	list_for_each_entry(d, &r->domains, list) {
++ 		/* Find the domain that contains this CPU */
++ 		if (cpumask_test_cpu(cpu, &d->cpu_mask))
++ 			return d;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ void rdt_ctrl_update(void *arg)
++ {
++ 	struct msr_param *m = arg;
+++>>>>>>> edf6fa1c4a95 (x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management)
+  	struct rdt_resource *r = m->res;
+ -	int cpu = smp_processor_id();
+ +	int i, cpu = smp_processor_id();
+  	struct rdt_domain *d;
+  
+  	list_for_each_entry(d, &r->domains, list) {
+@@@ -280,6 -384,45 +325,48 @@@ static struct rdt_domain *rdt_find_doma
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct msr_param m;
++ 	u32 *dc;
++ 	int i;
++ 
++ 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	d->ctrl_val = dc;
++ 
++ 	/*
++ 	 * Initialize the Control MSRs to having no control.
++ 	 * For Cache Allocation: Set all bits in cbm
++ 	 * For Memory Allocation: Set b/w requested to 100
++ 	 */
++ 	for (i = 0; i < r->num_closid; i++, dc++)
++ 		*dc = r->default_ctrl;
++ 
++ 	m.low = 0;
++ 	m.high = r->num_closid;
++ 	r->msr_update(d, &m, r);
++ 	return 0;
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++ 					   sizeof(unsigned long),
++ 					   GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> edf6fa1c4a95 (x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management)
+  /*
+   * domain_add_cpu - Add a cpu to a resource's domain list.
+   *
+@@@ -322,12 -464,9 +409,18 @@@ static void domain_add_cpu(int cpu, str
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < r->num_closid; i++) {
+ +		int idx = cbm_idx(r, i);
+ +
+ +		d->cbm[i] = r->max_cbm;
+ +		if (notifier)
+ +			wrmsrl(r->msr_base + idx, d->cbm[i]);
+++=======
++ 	if (r->mon_capable && domain_setup_mon_state(r, d)) {
++ 		kfree(d);
++ 		return;
+++>>>>>>> edf6fa1c4a95 (x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management)
+  	}
+  
+  	cpumask_set_cpu(cpu, &d->cpu_mask);
+@@@ -347,7 -486,8 +440,12 @@@ static void domain_remove_cpu(int cpu, 
+  
+  	cpumask_clear_cpu(cpu, &d->cpu_mask);
+  	if (cpumask_empty(&d->cpu_mask)) {
+++<<<<<<< HEAD
+ +		kfree(d->cbm);
+++=======
++ 		kfree(d->ctrl_val);
++ 		kfree(d->rmid_busy_llc);
+++>>>>>>> edf6fa1c4a95 (x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management)
+  		list_del(&d->list);
+  		kfree(d);
+  	}
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
