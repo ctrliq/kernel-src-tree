@@ -1,0 +1,141 @@
+nvme_fc: correct abort race condition on resets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit 3efd6e8ebe19f0774c82de582849539b60cc4d97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3efd6e8e.failed
+
+During reset handling, there is live io completing while the reset
+is taking place. The reset path attempts to abort all outstanding io,
+counting the number of ios that were reset. It then waits for those
+ios to be reclaimed from the lldd before continuing.
+
+The transport's logic on io state and flag setting was poor, allowing
+ios to complete simultaneous to the abort request. The completed ios
+were counted, but as the completion had already occurred, the
+completion never reduced the count. As the count never zeros, the
+reset/delete never completes.
+
+Tighten it up by unconditionally changing the op state to completed
+when the io done handler is called.  The reset/abort path now changes
+the op state to aborted, but the abort only continues if the op
+state was live priviously. If complete, the abort is backed out.
+Thus proper counting of io aborts and their completions is working
+again.
+
+Also removed the TERMIO state on the op as it's redundant with the
+op's aborted state.
+
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 3efd6e8ebe19f0774c82de582849539b60cc4d97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index 6e7bb75ba7ba,4673882ce152..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1546,37 -1538,10 +1552,41 @@@ static voi
+  nvme_fc_abort_aen_ops(struct nvme_fc_ctrl *ctrl)
+  {
+  	struct nvme_fc_fcp_op *aen_op = ctrl->aen_ops;
+- 	unsigned long flags;
+- 	int i, ret;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < NVME_FC_NR_AEN_COMMANDS; i++, aen_op++) {
+ +		if (atomic_read(&aen_op->state) != FCPOP_STATE_ACTIVE)
+ +			continue;
+ +
+ +		spin_lock_irqsave(&ctrl->lock, flags);
+ +		if (ctrl->flags & FCCTRL_TERMIO) {
+ +			ctrl->iocnt++;
+ +			aen_op->flags |= FCOP_FLAGS_TERMIO;
+ +		}
+ +		spin_unlock_irqrestore(&ctrl->lock, flags);
+ +
+ +		ret = __nvme_fc_abort_op(ctrl, aen_op);
+ +		if (ret) {
+ +			/*
+ +			 * if __nvme_fc_abort_op failed the io wasn't
+ +			 * active. Thus this call path is running in
+ +			 * parallel to the io complete. Treat as non-error.
+ +			 */
+ +
+ +			/* back out the flags/counters */
+ +			spin_lock_irqsave(&ctrl->lock, flags);
+ +			if (ctrl->flags & FCCTRL_TERMIO)
+ +				ctrl->iocnt--;
+ +			aen_op->flags &= ~FCOP_FLAGS_TERMIO;
+ +			spin_unlock_irqrestore(&ctrl->lock, flags);
+ +			return;
+ +		}
+ +	}
+++=======
++ 	for (i = 0; i < NVME_NR_AEN_COMMANDS; i++, aen_op++)
++ 		__nvme_fc_abort_op(ctrl, aen_op);
+++>>>>>>> 3efd6e8ebe19 (nvme_fc: correct abort race condition on resets)
+  }
+  
+  static inline int
+@@@ -1736,10 -1701,10 +1746,10 @@@ done
+  	if (status &&
+  	    (blk_queue_dying(rq->q) ||
+  	     ctrl->ctrl.state == NVME_CTRL_NEW ||
+ -	     ctrl->ctrl.state == NVME_CTRL_CONNECTING))
+ +	     ctrl->ctrl.state == NVME_CTRL_RECONNECTING))
+  		status |= cpu_to_le16(NVME_SC_DNR << 1);
+  
+- 	if (__nvme_fc_fcpop_chk_teardowns(ctrl, op))
++ 	if (__nvme_fc_fcpop_chk_teardowns(ctrl, op, opstate))
+  		__nvme_fc_final_op_cleanup(rq);
+  	else
+  		nvme_end_request(rq, status, result);
+@@@ -2472,37 -2458,11 +2479,15 @@@ nvme_fc_terminate_exchange(struct reque
+  	if (!blk_mq_request_started(req))
+  		return;
+  
+- 	spin_lock_irqsave(&ctrl->lock, flags);
+- 	if (ctrl->flags & FCCTRL_TERMIO) {
+- 		ctrl->iocnt++;
+- 		op->flags |= FCOP_FLAGS_TERMIO;
+- 	}
+- 	spin_unlock_irqrestore(&ctrl->lock, flags);
+- 
+- 	status = __nvme_fc_abort_op(ctrl, op);
+- 	if (status) {
+- 		/*
+- 		 * if __nvme_fc_abort_op failed the io wasn't
+- 		 * active. Thus this call path is running in
+- 		 * parallel to the io complete. Treat as non-error.
+- 		 */
+- 
+- 		/* back out the flags/counters */
+- 		spin_lock_irqsave(&ctrl->lock, flags);
+- 		if (ctrl->flags & FCCTRL_TERMIO)
+- 			ctrl->iocnt--;
+- 		op->flags &= ~FCOP_FLAGS_TERMIO;
+- 		spin_unlock_irqrestore(&ctrl->lock, flags);
+- 		return;
+- 	}
++ 	__nvme_fc_abort_op(ctrl, op);
+  }
+  
+ +static struct blk_mq_aux_ops nvme_fc_mq_aux_ops = {
+ +	.reinit_request	= nvme_fc_reinit_request,
+ +};
+  
+ -static const struct blk_mq_ops nvme_fc_mq_ops = {
+ +static struct blk_mq_ops nvme_fc_mq_ops = {
+ +	.aux_ops	= &nvme_fc_mq_aux_ops,
+  	.queue_rq	= nvme_fc_queue_rq,
+  	.complete	= nvme_fc_complete_rq,
+  	.init_request	= nvme_fc_init_request,
+* Unmerged path drivers/nvme/host/fc.c
