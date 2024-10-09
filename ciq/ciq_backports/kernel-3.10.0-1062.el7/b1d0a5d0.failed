@@ -1,0 +1,181 @@
+netfilter: x_tables: add and use xt_check_proc_name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit b1d0a5d0cba4597c0394997b2d5fced3e3841b4e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b1d0a5d0.failed
+
+recent and hashlimit both create /proc files, but only check that
+name is 0 terminated.
+
+This can trigger WARN() from procfs when name is "" or "/".
+Add helper for this and then use it for both.
+
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Reported-by: Eric Dumazet <eric.dumazet@gmail.com>
+	Reported-by: <syzbot+0502b00edac2a0680b61@syzkaller.appspotmail.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit b1d0a5d0cba4597c0394997b2d5fced3e3841b4e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/xt_hashlimit.c
+diff --cc net/netfilter/xt_hashlimit.c
+index 91945c2ac9d2,3360f13dc208..000000000000
+--- a/net/netfilter/xt_hashlimit.c
++++ b/net/netfilter/xt_hashlimit.c
+@@@ -707,9 -910,75 +707,77 @@@ static int hashlimit_mt_check(const str
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int hashlimit_mt_check_v1(const struct xt_mtchk_param *par)
++ {
++ 	struct xt_hashlimit_mtinfo1 *info = par->matchinfo;
++ 	struct hashlimit_cfg3 cfg = {};
++ 	int ret;
++ 
++ 	ret = xt_check_proc_name(info->name, sizeof(info->name));
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = cfg_copy(&cfg, (void *)&info->cfg, 1);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	return hashlimit_mt_check_common(par, &info->hinfo,
++ 					 &cfg, info->name, 1);
++ }
++ 
++ static int hashlimit_mt_check_v2(const struct xt_mtchk_param *par)
++ {
++ 	struct xt_hashlimit_mtinfo2 *info = par->matchinfo;
++ 	struct hashlimit_cfg3 cfg = {};
++ 	int ret;
++ 
++ 	ret = xt_check_proc_name(info->name, sizeof(info->name));
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = cfg_copy(&cfg, (void *)&info->cfg, 2);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	return hashlimit_mt_check_common(par, &info->hinfo,
++ 					 &cfg, info->name, 2);
++ }
++ 
++ static int hashlimit_mt_check(const struct xt_mtchk_param *par)
++ {
++ 	struct xt_hashlimit_mtinfo3 *info = par->matchinfo;
++ 	int ret;
++ 
++ 	ret = xt_check_proc_name(info->name, sizeof(info->name));
++ 	if (ret)
++ 		return ret;
++ 
++ 	return hashlimit_mt_check_common(par, &info->hinfo, &info->cfg,
++ 					 info->name, 3);
++ }
++ 
++ static void hashlimit_mt_destroy_v2(const struct xt_mtdtor_param *par)
++ {
++ 	const struct xt_hashlimit_mtinfo2 *info = par->matchinfo;
++ 
++ 	htable_put(info->hinfo);
++ }
++ 
++ static void hashlimit_mt_destroy_v1(const struct xt_mtdtor_param *par)
++ {
++ 	const struct xt_hashlimit_mtinfo1 *info = par->matchinfo;
++ 
++ 	htable_put(info->hinfo);
++ }
++ 
+++>>>>>>> b1d0a5d0cba4 (netfilter: x_tables: add and use xt_check_proc_name)
+  static void hashlimit_mt_destroy(const struct xt_mtdtor_param *par)
+  {
+ -	const struct xt_hashlimit_mtinfo3 *info = par->matchinfo;
+ +	const struct xt_hashlimit_mtinfo1 *info = par->matchinfo;
+  
+  	htable_put(info->hinfo);
+  }
+diff --git a/include/linux/netfilter/x_tables.h b/include/linux/netfilter/x_tables.h
+index c07aca6ea5d3..c445882f7a8f 100644
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@ -253,6 +253,8 @@ unsigned int *xt_alloc_entry_offsets(unsigned int size);
+ bool xt_find_jump_offset(const unsigned int *offsets,
+ 			 unsigned int target, unsigned int size);
+ 
++int xt_check_proc_name(const char *name, unsigned int size);
++
+ int xt_check_match(struct xt_mtchk_param *, unsigned int size, u_int8_t proto,
+ 		   bool inv_proto);
+ int xt_check_target(struct xt_tgchk_param *, unsigned int size, u_int8_t proto,
+diff --git a/net/netfilter/x_tables.c b/net/netfilter/x_tables.c
+index aba72ac7a97f..7177faebe9af 100644
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -381,6 +381,36 @@ textify_hooks(char *buf, size_t size, unsigned int mask, uint8_t nfproto)
+ 	return buf;
+ }
+ 
++/**
++ * xt_check_proc_name - check that name is suitable for /proc file creation
++ *
++ * @name: file name candidate
++ * @size: length of buffer
++ *
++ * some x_tables modules wish to create a file in /proc.
++ * This function makes sure that the name is suitable for this
++ * purpose, it checks that name is NUL terminated and isn't a 'special'
++ * name, like "..".
++ *
++ * returns negative number on error or 0 if name is useable.
++ */
++int xt_check_proc_name(const char *name, unsigned int size)
++{
++	if (name[0] == '\0')
++		return -EINVAL;
++
++	if (strnlen(name, size) == size)
++		return -ENAMETOOLONG;
++
++	if (strcmp(name, ".") == 0 ||
++	    strcmp(name, "..") == 0 ||
++	    strchr(name, '/'))
++		return -EINVAL;
++
++	return 0;
++}
++EXPORT_SYMBOL(xt_check_proc_name);
++
+ int xt_check_match(struct xt_mtchk_param *par,
+ 		   unsigned int size, u_int8_t proto, bool inv_proto)
+ {
+* Unmerged path net/netfilter/xt_hashlimit.c
+diff --git a/net/netfilter/xt_recent.c b/net/netfilter/xt_recent.c
+index 31c5e0046dd0..7c9624bb98c1 100644
+--- a/net/netfilter/xt_recent.c
++++ b/net/netfilter/xt_recent.c
+@@ -355,9 +355,9 @@ static int recent_mt_check(const struct xt_mtchk_param *par,
+ 			info->hit_count, ip_pkt_list_tot);
+ 		return -EINVAL;
+ 	}
+-	if (info->name[0] == '\0' ||
+-	    strnlen(info->name, XT_RECENT_NAME_LEN) == XT_RECENT_NAME_LEN)
+-		return -EINVAL;
++	ret = xt_check_proc_name(info->name, sizeof(info->name));
++	if (ret)
++		return ret;
+ 
+ 	mutex_lock(&recent_mutex);
+ 	t = recent_table_lookup(recent_net, info->name);
