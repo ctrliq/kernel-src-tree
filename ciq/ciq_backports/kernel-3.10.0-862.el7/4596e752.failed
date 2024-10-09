@@ -1,0 +1,182 @@
+nvme-fc: remove double put reference if admin connect fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit 4596e752db02d47038cd7c965419789ab15d1985
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4596e752.failed
+
+There are two put references in the failure case of initial
+create_association. The first put actually frees the controller, thus the
+second put references freed memory.
+
+Remove the unnecessary 2nd put.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 4596e752db02d47038cd7c965419789ab15d1985)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index bbc0c7f6abc6,794e66e4aa20..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -2510,63 -3141,105 +2510,89 @@@ __nvme_fc_create_ctrl(struct device *de
+  	ctrl->ctrl.kato = opts->kato;
+  
+  	ret = -ENOMEM;
+ -	ctrl->queues = kcalloc(ctrl->ctrl.queue_count,
+ -				sizeof(struct nvme_fc_queue), GFP_KERNEL);
+ +	ctrl->queues = kcalloc(ctrl->queue_count, sizeof(struct nvme_fc_queue),
+ +				GFP_KERNEL);
+  	if (!ctrl->queues)
+ -		goto out_free_ida;
+ -
+ -	memset(&ctrl->admin_tag_set, 0, sizeof(ctrl->admin_tag_set));
+ -	ctrl->admin_tag_set.ops = &nvme_fc_admin_mq_ops;
+ -	ctrl->admin_tag_set.queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+ -	ctrl->admin_tag_set.reserved_tags = 2; /* fabric connect + Keep-Alive */
+ -	ctrl->admin_tag_set.numa_node = NUMA_NO_NODE;
+ -	ctrl->admin_tag_set.cmd_size = sizeof(struct nvme_fc_fcp_op) +
+ -					(SG_CHUNK_SIZE *
+ -						sizeof(struct scatterlist)) +
+ -					ctrl->lport->ops->fcprqst_priv_sz;
+ -	ctrl->admin_tag_set.driver_data = ctrl;
+ -	ctrl->admin_tag_set.nr_hw_queues = 1;
+ -	ctrl->admin_tag_set.timeout = ADMIN_TIMEOUT;
+ -	ctrl->admin_tag_set.flags = BLK_MQ_F_NO_SCHED;
+ +		goto out_uninit_ctrl;
+  
+ -	ret = blk_mq_alloc_tag_set(&ctrl->admin_tag_set);
+ +	ret = nvme_fc_configure_admin_queue(ctrl);
+  	if (ret)
+ -		goto out_free_queues;
+ -	ctrl->ctrl.admin_tagset = &ctrl->admin_tag_set;
+ +		goto out_uninit_ctrl;
+  
+ -	ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
+ -	if (IS_ERR(ctrl->ctrl.admin_q)) {
+ -		ret = PTR_ERR(ctrl->ctrl.admin_q);
+ -		goto out_free_admin_tag_set;
+ -	}
+ +	/* sanity checks */
+  
+ -	/*
+ -	 * Would have been nice to init io queues tag set as well.
+ -	 * However, we require interaction from the controller
+ -	 * for max io queue count before we can do so.
+ -	 * Defer this to the connect path.
+ -	 */
+ +	/* FC-NVME supports 64-byte SQE only */
+ +	if (ctrl->ctrl.ioccsz != 4) {
+ +		dev_err(ctrl->ctrl.device, "ioccsz %d is not supported!\n",
+ +				ctrl->ctrl.ioccsz);
+ +		goto out_remove_admin_queue;
+ +	}
+ +	/* FC-NVME supports 16-byte CQE only */
+ +	if (ctrl->ctrl.iorcsz != 1) {
+ +		dev_err(ctrl->ctrl.device, "iorcsz %d is not supported!\n",
+ +				ctrl->ctrl.iorcsz);
+ +		goto out_remove_admin_queue;
+ +	}
+ +	/* FC-NVME does not have other data in the capsule */
+ +	if (ctrl->ctrl.icdoff) {
+ +		dev_err(ctrl->ctrl.device, "icdoff %d is not supported!\n",
+ +				ctrl->ctrl.icdoff);
+ +		goto out_remove_admin_queue;
+ +	}
+  
+ -	ret = nvme_init_ctrl(&ctrl->ctrl, dev, &nvme_fc_ctrl_ops, 0);
+ -	if (ret)
+ -		goto out_cleanup_admin_q;
+ +	/* FC-NVME supports normal SGL Data Block Descriptors */
+  
+ -	/* at this point, teardown path changes to ref counting on nvme ctrl */
+ +	if (opts->queue_size > ctrl->ctrl.maxcmd) {
+ +		/* warn if maxcmd is lower than queue_size */
+ +		dev_warn(ctrl->ctrl.device,
+ +			"queue_size %zu > ctrl maxcmd %u, reducing "
+ +			"to queue_size\n",
+ +			opts->queue_size, ctrl->ctrl.maxcmd);
+ +		opts->queue_size = ctrl->ctrl.maxcmd;
+ +	}
+  
+ -	spin_lock_irqsave(&rport->lock, flags);
+ -	list_add_tail(&ctrl->ctrl_list, &rport->ctrl_list);
+ -	spin_unlock_irqrestore(&rport->lock, flags);
+ +	ret = nvme_fc_init_aen_ops(ctrl);
+ +	if (ret)
+ +		goto out_exit_aen_ops;
+  
+ -	/*
+ -	 * It's possible that transactions used to create the association
+ -	 * may fail. Examples: CreateAssociation LS or CreateIOConnection
+ -	 * LS gets dropped/corrupted/fails; or a frame gets dropped or a
+ -	 * command times out for one of the actions to init the controller
+ -	 * (Connect, Get/Set_Property, Set_Features, etc). Many of these
+ -	 * transport errors (frame drop, LS failure) inherently must kill
+ -	 * the association. The transport is coded so that any command used
+ -	 * to create the association (prior to a LIVE state transition
+ -	 * while NEW or RECONNECTING) will fail if it completes in error or
+ -	 * times out.
+ -	 *
+ -	 * As such: as the connect request was mostly likely due to a
+ -	 * udev event that discovered the remote port, meaning there is
+ -	 * not an admin or script there to restart if the connect
+ -	 * request fails, retry the initial connection creation up to
+ -	 * three times before giving up and declaring failure.
+ -	 */
+ -	for (retry = 0; retry < 3; retry++) {
+ -		ret = nvme_fc_create_association(ctrl);
+ -		if (!ret)
+ -			break;
+ +	if (ctrl->queue_count > 1) {
+ +		ret = nvme_fc_create_io_queues(ctrl);
+ +		if (ret)
+ +			goto out_exit_aen_ops;
+  	}
+  
+ -	if (ret) {
+ -		/* couldn't schedule retry - fail out */
+ -		dev_err(ctrl->ctrl.device,
+ -			"NVME-FC{%d}: Connect retry failed\n", ctrl->cnum);
+ +	spin_lock_irqsave(&ctrl->lock, flags);
+ +	ctrl->state = FCCTRL_ACTIVE;
+ +	spin_unlock_irqrestore(&ctrl->lock, flags);
+  
+++<<<<<<< HEAD
+ +	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+ +	WARN_ON_ONCE(!changed);
+++=======
++ 		ctrl->ctrl.opts = NULL;
++ 
++ 		/* initiate nvme ctrl ref counting teardown */
++ 		nvme_uninit_ctrl(&ctrl->ctrl);
++ 
++ 		/* Remove core ctrl ref. */
++ 		nvme_put_ctrl(&ctrl->ctrl);
++ 
++ 		/* as we're past the point where we transition to the ref
++ 		 * counting teardown path, if we return a bad pointer here,
++ 		 * the calling routine, thinking it's prior to the
++ 		 * transition, will do an rport put. Since the teardown
++ 		 * path also does a rport put, we do an extra get here to
++ 		 * so proper order/teardown happens.
++ 		 */
++ 		nvme_fc_rport_get(rport);
++ 
++ 		if (ret > 0)
++ 			ret = -EIO;
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	nvme_get_ctrl(&ctrl->ctrl);
+++>>>>>>> 4596e752db02 (nvme-fc: remove double put reference if admin connect fails)
+  
+  	dev_info(ctrl->ctrl.device,
+  		"NVME-FC{%d}: new ctrl: NQN \"%s\"\n",
+* Unmerged path drivers/nvme/host/fc.c
