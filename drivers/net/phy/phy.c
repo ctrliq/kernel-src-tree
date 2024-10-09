@@ -383,7 +383,6 @@ int phy_start_aneg(struct phy_device *phydev)
 		phy_sanitize_settings(phydev);
 
 	err = phydev->drv->config_aneg(phydev);
-
 	if (err < 0)
 		goto out_unlock;
 
@@ -402,7 +401,6 @@ out_unlock:
 	return err;
 }
 EXPORT_SYMBOL(phy_start_aneg);
-
 
 /**
  * phy_start_machine - start PHY state machine tracking
@@ -513,13 +511,11 @@ static int phy_disable_interrupts(struct phy_device *phydev)
 
 	/* Disable PHY interrupts */
 	err = phy_config_interrupt(phydev, PHY_INTERRUPT_DISABLED);
-
 	if (err)
 		goto phy_err;
 
 	/* Clear the interrupt */
 	err = phy_clear_interrupt(phydev);
-
 	if (err)
 		goto phy_err;
 
@@ -586,7 +582,6 @@ int phy_stop_interrupts(struct phy_device *phydev)
 }
 EXPORT_SYMBOL(phy_stop_interrupts);
 
-
 /**
  * phy_change - Scheduled by the phy_interrupt/timer to handle PHY changes
  * @work: work_struct that describes the work to be done
@@ -619,7 +614,6 @@ void phy_change(struct work_struct *work)
 	/* reschedule state queue work to run as soon as possible */
 	cancel_delayed_work_sync(&phydev->state_queue);
 	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue, 0);
-
 	return;
 
 ignore:
@@ -664,7 +658,6 @@ out_unlock:
 	 */
 }
 EXPORT_SYMBOL(phy_stop);
-
 
 /**
  * phy_start - start or restart a PHY device
@@ -727,7 +720,6 @@ void phy_state_machine(struct work_struct *work)
 		break;
 	case PHY_AN:
 		err = phy_read_status(phydev);
-
 		if (err < 0)
 			break;
 
@@ -759,7 +751,6 @@ void phy_state_machine(struct work_struct *work)
 		break;
 	case PHY_NOLINK:
 		err = phy_read_status(phydev);
-
 		if (err)
 			break;
 
@@ -771,7 +762,6 @@ void phy_state_machine(struct work_struct *work)
 		break;
 	case PHY_FORCING:
 		err = genphy_update_link(phydev);
-
 		if (err)
 			break;
 
@@ -794,7 +784,6 @@ void phy_state_machine(struct work_struct *work)
 		break;
 	case PHY_CHANGELINK:
 		err = phy_read_status(phydev);
-
 		if (err)
 			break;
 
@@ -821,14 +810,11 @@ void phy_state_machine(struct work_struct *work)
 		}
 		break;
 	case PHY_RESUMING:
-
 		err = phy_clear_interrupt(phydev);
-
 		if (err)
 			break;
 
 		err = phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED);
-
 		if (err)
 			break;
 
