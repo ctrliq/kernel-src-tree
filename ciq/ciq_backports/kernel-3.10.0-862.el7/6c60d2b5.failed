@@ -1,0 +1,458 @@
+fs/fs-writeback.c: add a new writeback list for sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 6c60d2b5746cf23025ffe71bd7ff9075048fc90c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6c60d2b5.failed
+
+wait_sb_inodes() currently does a walk of all inodes in the filesystem
+to find dirty one to wait on during sync.  This is highly inefficient
+and wastes a lot of CPU when there are lots of clean cached inodes that
+we don't need to wait on.
+
+To avoid this "all inode" walk, we need to track inodes that are
+currently under writeback that we need to wait for.  We do this by
+adding inodes to a writeback list on the sb when the mapping is first
+tagged as having pages under writeback.  wait_sb_inodes() can then walk
+this list of "inodes under IO" and wait specifically just for the inodes
+that the current sync(2) needs to wait for.
+
+Define a couple helpers to add/remove an inode from the writeback list
+and call them when the overall mapping is tagged for or cleared from
+writeback.  Update wait_sb_inodes() to walk only the inodes under
+writeback due to the sync.
+
+With this change, filesystem sync times are significantly reduced for
+fs' with largely populated inode caches and otherwise no other work to
+do.  For example, on a 16xcpu 2GHz x86-64 server, 10TB XFS filesystem
+with a ~10m entry inode cache, sync times are reduced from ~7.3s to less
+than 0.1s when the filesystem is fully clean.
+
+Link: http://lkml.kernel.org/r/1466594593-6757-2-git-send-email-bfoster@redhat.com
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Tested-by: Holger Hoffstätte <holger.hoffstaette@applied-asynchrony.com>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6c60d2b5746cf23025ffe71bd7ff9075048fc90c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs-writeback.c
+#	fs/inode.c
+#	fs/super.c
+#	include/linux/fs.h
+#	mm/page-writeback.c
+diff --cc fs/fs-writeback.c
+index 204141e64775,1fcce8345da3..000000000000
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@@ -172,15 -971,46 +172,46 @@@ void bdi_start_background_writeback(str
+  /*
+   * Remove the inode from the writeback list it is on.
+   */
+ -void inode_io_list_del(struct inode *inode)
+ +void inode_wb_list_del(struct inode *inode)
+  {
+ -	struct bdi_writeback *wb;
+ +	struct backing_dev_info *bdi = inode_to_bdi(inode);
+  
+ -	wb = inode_to_wb_and_lock_list(inode);
+ -	inode_io_list_del_locked(inode, wb);
+ -	spin_unlock(&wb->list_lock);
+ +	spin_lock(&bdi->wb.list_lock);
+ +	list_del_init(&inode->i_wb_list);
+ +	spin_unlock(&bdi->wb.list_lock);
+  }
+  
++ /*
++  * mark an inode as under writeback on the sb
++  */
++ void sb_mark_inode_writeback(struct inode *inode)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	unsigned long flags;
++ 
++ 	if (list_empty(&inode->i_wb_list)) {
++ 		spin_lock_irqsave(&sb->s_inode_wblist_lock, flags);
++ 		if (list_empty(&inode->i_wb_list))
++ 			list_add_tail(&inode->i_wb_list, &sb->s_inodes_wb);
++ 		spin_unlock_irqrestore(&sb->s_inode_wblist_lock, flags);
++ 	}
++ }
++ 
++ /*
++  * clear an inode as under writeback on the sb
++  */
++ void sb_clear_inode_writeback(struct inode *inode)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	unsigned long flags;
++ 
++ 	if (!list_empty(&inode->i_wb_list)) {
++ 		spin_lock_irqsave(&sb->s_inode_wblist_lock, flags);
++ 		list_del_init(&inode->i_wb_list);
++ 		spin_unlock_irqrestore(&sb->s_inode_wblist_lock, flags);
++ 	}
++ }
++ 
+  /*
+   * Redirty an inode: set its when-it-was dirtied timestamp and move it to the
+   * furthest end of its superblock's dirty-inode list.
+@@@ -1214,9 -2173,19 +1245,9 @@@ out_unlock_inode
+  }
+  EXPORT_SYMBOL(__mark_inode_dirty);
+  
+ -/*
+ - * The @s_sync_lock is used to serialise concurrent sync operations
+ - * to avoid lock contention problems with concurrent wait_sb_inodes() calls.
+ - * Concurrent callers will block on the s_sync_lock rather than doing contending
+ - * walks. The queueing maintains sync(2) required behaviour as all the IO that
+ - * has been issued up to the time this function is enter is guaranteed to be
+ - * completed by the time we have gained the lock and waited for all IO that is
+ - * in progress regardless of the order callers are granted the lock.
+ - */
+  static void wait_sb_inodes(struct super_block *sb)
+  {
+- 	struct inode *inode, *old_inode = NULL;
++ 	LIST_HEAD(sync_list);
+  
+  	/*
+  	 * We need to be protected against the filesystem going from
+@@@ -1224,38 -2193,61 +1255,80 @@@
+  	 */
+  	WARN_ON(!rwsem_is_locked(&sb->s_umount));
+  
+++<<<<<<< HEAD
+ +	spin_lock(&inode_sb_list_lock);
+++=======
++ 	mutex_lock(&sb->s_sync_lock);
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
++ 
++ 	/*
++ 	 * Splice the writeback list onto a temporary list to avoid waiting on
++ 	 * inodes that have started writeback after this point.
++ 	 *
++ 	 * Use rcu_read_lock() to keep the inodes around until we have a
++ 	 * reference. s_inode_wblist_lock protects sb->s_inodes_wb as well as
++ 	 * the local list because inodes can be dropped from either by writeback
++ 	 * completion.
++ 	 */
++ 	rcu_read_lock();
++ 	spin_lock_irq(&sb->s_inode_wblist_lock);
++ 	list_splice_init(&sb->s_inodes_wb, &sync_list);
+  
+  	/*
+- 	 * Data integrity sync. Must wait for all pages under writeback,
+- 	 * because there may have been pages dirtied before our sync
+- 	 * call, but which had writeout started before we write it out.
+- 	 * In which case, the inode may not be on the dirty list, but
+- 	 * we still have to wait for that writeout.
++ 	 * Data integrity sync. Must wait for all pages under writeback, because
++ 	 * there may have been pages dirtied before our sync call, but which had
++ 	 * writeout started before we write it out.  In which case, the inode
++ 	 * may not be on the dirty list, but we still have to wait for that
++ 	 * writeout.
+  	 */
+- 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
++ 	while (!list_empty(&sync_list)) {
++ 		struct inode *inode = list_first_entry(&sync_list, struct inode,
++ 						       i_wb_list);
+  		struct address_space *mapping = inode->i_mapping;
+  
++ 		/*
++ 		 * Move each inode back to the wb list before we drop the lock
++ 		 * to preserve consistency between i_wb_list and the mapping
++ 		 * writeback tag. Writeback completion is responsible to remove
++ 		 * the inode from either list once the writeback tag is cleared.
++ 		 */
++ 		list_move_tail(&inode->i_wb_list, &sb->s_inodes_wb);
++ 
++ 		/*
++ 		 * The mapping can appear untagged while still on-list since we
++ 		 * do not have the mapping lock. Skip it here, wb completion
++ 		 * will remove it.
++ 		 */
++ 		if (!mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK))
++ 			continue;
++ 
++ 		spin_unlock_irq(&sb->s_inode_wblist_lock);
++ 
+  		spin_lock(&inode->i_lock);
+- 		if ((inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) ||
+- 		    (mapping->nrpages == 0)) {
++ 		if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) {
+  			spin_unlock(&inode->i_lock);
++ 
++ 			spin_lock_irq(&sb->s_inode_wblist_lock);
+  			continue;
+  		}
+  		__iget(inode);
+  		spin_unlock(&inode->i_lock);
+++<<<<<<< HEAD
+ +		spin_unlock(&inode_sb_list_lock);
+ +
+ +		/*
+ +		 * We hold a reference to 'inode' so it couldn't have been
+ +		 * removed from s_inodes list while we dropped the
+ +		 * inode_sb_list_lock.  We cannot iput the inode now as we can
+ +		 * be holding the last reference and we cannot iput it under
+ +		 * inode_sb_list_lock. So we keep the reference and iput it
+ +		 * later.
+ +		 */
+ +		iput(old_inode);
+ +		old_inode = inode;
+++=======
++ 		rcu_read_unlock();
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  
+  		/*
+  		 * We keep the error status of individual mapping so that
+@@@ -1266,10 -2258,36 +1339,43 @@@
+  
+  		cond_resched();
+  
+++<<<<<<< HEAD
+ +		spin_lock(&inode_sb_list_lock);
+ +	}
+ +	spin_unlock(&inode_sb_list_lock);
+ +	iput(old_inode);
+++=======
++ 		iput(inode);
++ 
++ 		rcu_read_lock();
++ 		spin_lock_irq(&sb->s_inode_wblist_lock);
++ 	}
++ 	spin_unlock_irq(&sb->s_inode_wblist_lock);
++ 	rcu_read_unlock();
++ 	mutex_unlock(&sb->s_sync_lock);
++ }
++ 
++ static void __writeback_inodes_sb_nr(struct super_block *sb, unsigned long nr,
++ 				     enum wb_reason reason, bool skip_if_busy)
++ {
++ 	DEFINE_WB_COMPLETION_ONSTACK(done);
++ 	struct wb_writeback_work work = {
++ 		.sb			= sb,
++ 		.sync_mode		= WB_SYNC_NONE,
++ 		.tagged_writepages	= 1,
++ 		.done			= &done,
++ 		.nr_pages		= nr,
++ 		.reason			= reason,
++ 	};
++ 	struct backing_dev_info *bdi = sb->s_bdi;
++ 
++ 	if (!bdi_has_dirty_io(bdi) || bdi == &noop_backing_dev_info)
++ 		return;
++ 	WARN_ON(!rwsem_is_locked(&sb->s_umount));
++ 
++ 	bdi_split_work_to_wbs(sb->s_bdi, &work, skip_if_busy);
++ 	wb_wait_for_completion(bdi, &done);
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  }
+  
+  /**
+diff --cc fs/inode.c
+index aaf9ae90702b,e171f7b5f9e4..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -371,6 -364,7 +371,10 @@@ void inode_init_once(struct inode *inod
+  	memset(inode, 0, sizeof(*inode));
+  	INIT_HLIST_NODE(&inode->i_hash);
+  	INIT_LIST_HEAD(&inode->i_devices);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&inode->i_io_list);
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  	INIT_LIST_HEAD(&inode->i_wb_list);
+  	INIT_LIST_HEAD(&inode->i_lru);
+  	address_space_init_once(&inode->i_data);
+diff --cc fs/super.c
+index 985ae62de171,5806ffd45563..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -142,26 -187,33 +142,38 @@@ static struct super_block *alloc_super(
+  	if (!s)
+  		return NULL;
+  
+ -	INIT_LIST_HEAD(&s->s_mounts);
+ -
+  	if (security_sb_alloc(s))
+  		goto fail;
+ -
+  	for (i = 0; i < SB_FREEZE_LEVELS; i++) {
+ -		if (__percpu_init_rwsem(&s->s_writers.rw_sem[i],
+ -					sb_writers_name[i],
+ -					&type->s_writers_key[i]))
+ +		if (percpu_counter_init(&s->s_writers.counter[i], 0,
+ +					GFP_KERNEL) < 0)
+  			goto fail;
+ +		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
+ +				 &type->s_writers_key[i], 0);
+  	}
+ +	init_waitqueue_head(&s->s_writers.wait);
+  	init_waitqueue_head(&s->s_writers.wait_unfrozen);
+ -	s->s_bdi = &noop_backing_dev_info;
+  	s->s_flags = flags;
+ +	s->s_bdi = &default_backing_dev_info;
+  	INIT_HLIST_NODE(&s->s_instances);
+  	INIT_HLIST_BL_HEAD(&s->s_anon);
+ -	mutex_init(&s->s_sync_lock);
+  	INIT_LIST_HEAD(&s->s_inodes);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&s->s_dentry_lru);
+ +	INIT_LIST_HEAD(&s->s_inode_lru);
+ +	spin_lock_init(&s->s_inode_lru_lock);
+ +	INIT_LIST_HEAD(&s->s_mounts);
+++=======
++ 	spin_lock_init(&s->s_inode_list_lock);
++ 	INIT_LIST_HEAD(&s->s_inodes_wb);
++ 	spin_lock_init(&s->s_inode_wblist_lock);
++ 
++ 	if (list_lru_init_memcg(&s->s_dentry_lru))
++ 		goto fail;
++ 	if (list_lru_init_memcg(&s->s_inode_lru))
++ 		goto fail;
++ 
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  	init_rwsem(&s->s_umount);
+  	lockdep_set_class(&s->s_umount, &type->s_umount_key);
+  	/*
+diff --cc include/linux/fs.h
+index 4086333a0708,0c9ebf530d9e..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -630,14 -648,24 +630,15 @@@ struct inode 
+  
+  	/* Misc */
+  	unsigned long		i_state;
+ -	struct rw_semaphore	i_rwsem;
+ +	struct mutex		i_mutex;
+  
+  	unsigned long		dirtied_when;	/* jiffies of first dirtying */
+ -	unsigned long		dirtied_time_when;
+  
+  	struct hlist_node	i_hash;
+ -	struct list_head	i_io_list;	/* backing dev IO list */
+ -#ifdef CONFIG_CGROUP_WRITEBACK
+ -	struct bdi_writeback	*i_wb;		/* the associated cgroup wb */
+ -
+ -	/* foreign inode detection, see wbc_detach_inode() */
+ -	int			i_wb_frn_winner;
+ -	u16			i_wb_frn_avg_time;
+ -	u16			i_wb_frn_history;
+ -#endif
+ +	struct list_head	i_wb_list;	/* backing dev IO list */
+  	struct list_head	i_lru;		/* inode LRU list */
+  	struct list_head	i_sb_list;
++ 	struct list_head	i_wb_list;	/* backing dev writeback list */
+  	union {
+  		struct hlist_head	i_dentry;
+  		struct rcu_head		i_rcu;
+@@@ -1538,30 -1446,14 +1539,39 @@@ struct super_block_wrapper 
+  	 */
+  	int s_stack_depth;
+  
+++<<<<<<< HEAD
+ +	/* -- Wrapper version 1 -- */
+++=======
++ 	/* s_inode_list_lock protects s_inodes */
++ 	spinlock_t		s_inode_list_lock ____cacheline_aligned_in_smp;
++ 	struct list_head	s_inodes;	/* all inodes */
++ 
++ 	spinlock_t		s_inode_wblist_lock;
++ 	struct list_head	s_inodes_wb;	/* writeback inodes */
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  };
+  
+ +static inline struct super_block_wrapper *get_sb_wrapper(struct super_block *sb,
+ +							 unsigned version)
+ +{
+ +	/* Make sure we get a link failure if this function is used against an
+ +	 * older kernel that doesn't have the superblock wrapper.
+ +	 */
+ +	if (super_block_wrapper_version < version)
+ +		return NULL;
+ +	return container_of(sb, struct super_block_wrapper, sb);
+ +}
+ +
+ +static inline int *get_s_stack_depth(struct super_block *sb)
+ +{
+ +	struct super_block_wrapper *wrapper = get_sb_wrapper(sb, 0);
+ +	return wrapper ? &wrapper->s_stack_depth : NULL;
+ +}
+ +
+ +/* superblock cache pruning functions */
+ +extern void prune_icache_sb(struct super_block *sb, int nr_to_scan);
+ +extern void prune_dcache_sb(struct super_block *sb, int nr_to_scan);
+ +
+  extern struct timespec current_fs_time(struct super_block *sb);
+  
+  /*
+diff --cc mm/page-writeback.c
+index e90d9c5e28b9,8195eb454411..000000000000
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@@ -2375,10 -2741,17 +2375,15 @@@ int test_clear_page_writeback(struct pa
+  						page_index(page),
+  						PAGECACHE_TAG_WRITEBACK);
+  			if (bdi_cap_account_writeback(bdi)) {
+ -				struct bdi_writeback *wb = inode_to_wb(inode);
+ -
+ -				__dec_wb_stat(wb, WB_WRITEBACK);
+ -				__wb_writeout_inc(wb);
+ +				__dec_bdi_stat(bdi, BDI_WRITEBACK);
+ +				__bdi_writeout_inc(bdi);
+  			}
+  		}
++ 
++ 		if (mapping->host && !mapping_tagged(mapping,
++ 						     PAGECACHE_TAG_WRITEBACK))
++ 			sb_clear_inode_writeback(mapping->host);
++ 
+  		spin_unlock_irqrestore(&mapping->tree_lock, flags);
+  	} else {
+  		ret = TestClearPageWriteback(page);
+@@@ -2406,7 -2788,15 +2416,19 @@@ int __test_set_page_writeback(struct pa
+  						page_index(page),
+  						PAGECACHE_TAG_WRITEBACK);
+  			if (bdi_cap_account_writeback(bdi))
+++<<<<<<< HEAD
+ +				__inc_bdi_stat(bdi, BDI_WRITEBACK);
+++=======
++ 				__inc_wb_stat(inode_to_wb(inode), WB_WRITEBACK);
++ 
++ 			/*
++ 			 * We can come through here when swapping anonymous
++ 			 * pages, so we don't necessarily have an inode to track
++ 			 * for sync.
++ 			 */
++ 			if (mapping->host && !on_wblist)
++ 				sb_mark_inode_writeback(mapping->host);
+++>>>>>>> 6c60d2b5746c (fs/fs-writeback.c: add a new writeback list for sync)
+  		}
+  		if (!PageDirty(page))
+  			radix_tree_tag_clear(&mapping->page_tree,
+* Unmerged path fs/fs-writeback.c
+* Unmerged path fs/inode.c
+* Unmerged path fs/super.c
+* Unmerged path include/linux/fs.h
+diff --git a/include/linux/writeback.h b/include/linux/writeback.h
+index 2303ec6ce910..e30591696e46 100644
+--- a/include/linux/writeback.h
++++ b/include/linux/writeback.h
+@@ -185,4 +185,7 @@ void tag_pages_for_writeback(struct address_space *mapping,
+ 
+ void account_page_redirty(struct page *page);
+ 
++void sb_mark_inode_writeback(struct inode *inode);
++void sb_clear_inode_writeback(struct inode *inode);
++
+ #endif		/* WRITEBACK_H */
+* Unmerged path mm/page-writeback.c
