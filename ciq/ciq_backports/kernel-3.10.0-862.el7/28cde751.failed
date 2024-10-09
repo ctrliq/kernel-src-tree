@@ -1,0 +1,377 @@
+ibmvnic: Reset the CRQ queue during driver reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 28cde751021abb16458b858da3403bd7c511c0d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/28cde751.failed
+
+When a driver reset operation occurs there is not a need to release
+the CRQ resources and re-allocate them. Instead a reset of the CRQ
+will suffice.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 28cde751021abb16458b858da3403bd7c511c0d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 89c749947fa9,b9b0c693ce01..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -971,15 -1229,183 +971,80 @@@ static int ibmvnic_set_mac(struct net_d
+  	return 0;
+  }
+  
+ -/**
+ - * do_reset returns zero if we are able to keep processing reset events, or
+ - * non-zero if we hit a fatal error and must halt.
+ - */
+ -static int do_reset(struct ibmvnic_adapter *adapter,
+ -		    struct ibmvnic_rwi *rwi, u32 reset_state)
+ +static int ibmvnic_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int i, rc;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  
+ -	netif_carrier_off(netdev);
+ -	adapter->reset_reason = rwi->reset_reason;
+ +	if (new_mtu > adapter->req_mtu || new_mtu < adapter->min_mtu)
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	netdev->mtu = new_mtu;
+++=======
++ 	if (rwi->reset_reason == VNIC_RESET_MOBILITY) {
++ 		rc = ibmvnic_reenable_crq_queue(adapter);
++ 		if (rc)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_close(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_NON_FATAL) {
++ 		/* remove the closed state so when we call open it appears
++ 		 * we are coming from the probed state.
++ 		 */
++ 		adapter->state = VNIC_PROBED;
++ 
++ 		release_resources(adapter);
++ 		release_sub_crqs(adapter);
++ 
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return 0;
++ 
++ 		/* If the adapter was in PROBE state prior to the reset,
++ 		 * exit here.
++ 		 */
++ 		if (reset_state == VNIC_PROBED)
++ 			return 0;
++ 
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			adapter->state = VNIC_PROBED;
++ 			return 0;
++ 		}
++ 
++ 		rtnl_lock();
++ 		rc = init_resources(adapter);
++ 		rtnl_unlock();
++ 		if (rc)
++ 			return rc;
++ 
++ 		if (reset_state == VNIC_CLOSED)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_open(netdev);
++ 	if (rc) {
++ 		if (list_empty(&adapter->rwi_list))
++ 			adapter->state = VNIC_CLOSED;
++ 		else
++ 			adapter->state = reset_state;
++ 
++ 		return 0;
++ 	}
++ 
+ -	netif_carrier_on(netdev);
+ -
+ -	/* kick napi */
+ -	for (i = 0; i < adapter->req_rx_queues; i++)
+ -		napi_schedule(&adapter->napi[i]);
+ -
+ -	netdev_notify_peers(netdev);
+ -	return 0;
+ -}
+ -
+ -static struct ibmvnic_rwi *get_next_rwi(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -
+ -	mutex_lock(&adapter->rwi_lock);
+ -
+ -	if (!list_empty(&adapter->rwi_list)) {
+ -		rwi = list_first_entry(&adapter->rwi_list, struct ibmvnic_rwi,
+ -				       list);
+ -		list_del(&rwi->list);
+ -	} else {
+ -		rwi = NULL;
+ -	}
+ -
+ -	mutex_unlock(&adapter->rwi_lock);
+ -	return rwi;
+ -}
+ -
+ -static void free_all_rwi(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -
+ -	rwi = get_next_rwi(adapter);
+ -	while (rwi) {
+ -		kfree(rwi);
+ -		rwi = get_next_rwi(adapter);
+ -	}
+ -}
+ -
+ -static void __ibmvnic_reset(struct work_struct *work)
+ -{
+ -	struct ibmvnic_rwi *rwi;
+ -	struct ibmvnic_adapter *adapter;
+ -	struct net_device *netdev;
+ -	u32 reset_state;
+ -	int rc;
+ -
+ -	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
+ -	netdev = adapter->netdev;
+ -
+ -	mutex_lock(&adapter->reset_lock);
+ -	adapter->resetting = true;
+ -	reset_state = adapter->state;
+ -
+ -	rwi = get_next_rwi(adapter);
+ -	while (rwi) {
+ -		rc = do_reset(adapter, rwi, reset_state);
+ -		kfree(rwi);
+ -		if (rc)
+ -			break;
+ -
+ -		rwi = get_next_rwi(adapter);
+ -	}
+ -
+ -	if (rc) {
+ -		free_all_rwi(adapter);
+ -		mutex_unlock(&adapter->reset_lock);
+ -		return;
+ -	}
+ -
+ -	adapter->resetting = false;
+ -	mutex_unlock(&adapter->reset_lock);
+ -}
+ -
+ -static void ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ -			  enum ibmvnic_reset_reason reason)
+ -{
+ -	struct ibmvnic_rwi *rwi, *tmp;
+ -	struct net_device *netdev = adapter->netdev;
+ -	struct list_head *entry;
+ -
+ -	if (adapter->state == VNIC_REMOVING ||
+ -	    adapter->state == VNIC_REMOVED) {
+ -		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
+ -		return;
+ -	}
+ -
+ -	mutex_lock(&adapter->rwi_lock);
+ -
+ -	list_for_each(entry, &adapter->rwi_list) {
+ -		tmp = list_entry(entry, struct ibmvnic_rwi, list);
+ -		if (tmp->reset_reason == reason) {
+ -			netdev_err(netdev, "Matching reset found, skipping\n");
+ -			mutex_unlock(&adapter->rwi_lock);
+ -			return;
+ -		}
+ -	}
+ -
+ -	rwi = kzalloc(sizeof(*rwi), GFP_KERNEL);
+ -	if (!rwi) {
+ -		mutex_unlock(&adapter->rwi_lock);
+ -		ibmvnic_close(netdev);
+ -		return;
+ -	}
+ -
+ -	rwi->reset_reason = reason;
+ -	list_add_tail(&rwi->list, &adapter->rwi_list);
+ -	mutex_unlock(&adapter->rwi_lock);
+ -	schedule_work(&adapter->ibmvnic_reset);
+++	netif_carrier_on(netdev);
+++
+++	/* kick napi */
+++	for (i = 0; i < adapter->req_rx_queues; i++)
+++		napi_schedule(&adapter->napi[i]);
+++
+++	netdev_notify_peers(netdev);
+++>>>>>>> 28cde751021a (ibmvnic: Reset the CRQ queue during driver reset)
+ +	return 0;
+  }
+  
+  static void ibmvnic_tx_timeout(struct net_device *dev)
+@@@ -3713,121 -3509,48 +3778,135 @@@ map_failed
+  	return retrc;
+  }
+  
+ -static int ibmvnic_init(struct ibmvnic_adapter *adapter)
+ +/* debugfs for dump */
+ +static int ibmvnic_dump_show(struct seq_file *seq, void *v)
+ +{
+ +	struct net_device *netdev = seq->private;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ +	struct device *dev = &adapter->vdev->dev;
+ +	union ibmvnic_crq crq;
+ +
+ +	memset(&crq, 0, sizeof(crq));
+ +	crq.request_dump_size.first = IBMVNIC_CRQ_CMD;
+ +	crq.request_dump_size.cmd = REQUEST_DUMP_SIZE;
+ +
+ +	init_completion(&adapter->fw_done);
+ +	ibmvnic_send_crq(adapter, &crq);
+ +	wait_for_completion(&adapter->fw_done);
+ +
+ +	seq_write(seq, adapter->dump_data, adapter->dump_data_size);
+ +
+ +	dma_unmap_single(dev, adapter->dump_data_token, adapter->dump_data_size,
+ +			 DMA_BIDIRECTIONAL);
+ +
+ +	kfree(adapter->dump_data);
+ +
+ +	return 0;
+ +}
+ +
+ +static int ibmvnic_dump_open(struct inode *inode, struct file *file)
+ +{
+ +	return single_open(file, ibmvnic_dump_show, inode->i_private);
+ +}
+ +
+ +static const struct file_operations ibmvnic_dump_ops = {
+ +	.owner          = THIS_MODULE,
+ +	.open           = ibmvnic_dump_open,
+ +	.read           = seq_read,
+ +	.llseek         = seq_lseek,
+ +	.release        = single_release,
+ +};
+ +
+ +static void handle_crq_init_rsp(struct work_struct *work)
+  {
+ +	struct ibmvnic_adapter *adapter = container_of(work,
+ +						       struct ibmvnic_adapter,
+ +						       vnic_crq_init);
+  	struct device *dev = &adapter->vdev->dev;
+ +	struct net_device *netdev = adapter->netdev;
+  	unsigned long timeout = msecs_to_jiffies(30000);
+ +	bool restart = false;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (adapter->failover) {
+ +		release_sub_crqs(adapter);
+ +		if (netif_running(netdev)) {
+ +			netif_tx_disable(netdev);
+ +			ibmvnic_close(netdev);
+ +			restart = true;
+ +		}
+++=======
++ 	if (adapter->resetting) {
++ 		rc = ibmvnic_reset_crq(adapter);
++ 		if (!rc)
++ 			rc = vio_enable_interrupts(adapter->vdev);
++ 	} else {
++ 		rc = init_crq_queue(adapter);
++ 	}
++ 
++ 	if (rc) {
++ 		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
++ 		return rc;
+++>>>>>>> 28cde751021a (ibmvnic: Reset the CRQ queue during driver reset)
+  	}
+  
+ -	adapter->from_passive_init = false;
+ -
+ -	init_completion(&adapter->init_done);
+ -	ibmvnic_send_crq_init(adapter);
+ +	reinit_completion(&adapter->init_done);
+ +	send_version_xchg(adapter);
+  	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
+ -		dev_err(dev, "Initialization sequence timed out\n");
+ -		return -1;
+ +		dev_err(dev, "Passive init timeout\n");
+ +		goto task_failed;
+  	}
+  
+ -	if (adapter->from_passive_init) {
+ -		adapter->state = VNIC_OPEN;
+ -		adapter->from_passive_init = false;
+ -		return -1;
+ +	do {
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout)) {
+ +				dev_err(dev, "Passive init timeout\n");
+ +				goto task_failed;
+ +			}
+ +		}
+ +	} while (adapter->renegotiate);
+ +	rc = init_sub_crq_irqs(adapter);
+ +
+ +	if (rc)
+ +		goto task_failed;
+ +
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+ +	if (adapter->failover) {
+ +		adapter->failover = false;
+ +		if (restart) {
+ +			rc = ibmvnic_open(netdev);
+ +			if (rc)
+ +				goto restart_failed;
+ +		}
+ +		netif_carrier_on(netdev);
+ +		return;
+  	}
+  
+ -	rc = init_sub_crqs(adapter);
+ +	rc = register_netdev(netdev);
+  	if (rc) {
+ -		dev_err(dev, "Initialization of sub crqs failed\n");
+ -		release_crq_queue(adapter);
+ +		dev_err(dev,
+ +			"failed to register netdev rc=%d\n", rc);
+ +		goto register_failed;
+  	}
+ +	dev_info(dev, "ibmvnic registered\n");
+  
+ -	return rc;
+ +	return;
+ +
+ +restart_failed:
+ +	dev_err(dev, "Failed to restart ibmvnic, rc=%d\n", rc);
+ +register_failed:
+ +	release_sub_crqs(adapter);
+ +task_failed:
+ +	dev_err(dev, "Passive initialization was not successful\n");
+  }
+  
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
