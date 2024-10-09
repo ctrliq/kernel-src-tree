@@ -1,0 +1,179 @@
+nfsd: special case truncates some more
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 41f53350a0f36a7b8e31bec0d0ca907e028ab4cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/41f53350.failed
+
+Both the NFS protocols and the Linux VFS use a setattr operation with a
+bitmap of attributs to set to set various file attributes including the
+file size and the uid/gid.
+
+The Linux syscalls never mixes size updates with unrelated updates like
+the uid/gid, and some file systems like XFS and GFS2 rely on the fact
+that truncates might not update random other attributes, and many other
+file systems handle the case but do not update the different attributes
+in the same transaction.  NFSD on the other hand passes the attributes
+it gets on the wire more or less directly through to the VFS, leading to
+updates the file systems don't expect.  XFS at least has an assert on
+the allowed attributes, which caught an unusual NFS client setting the
+size and group at the same time.
+
+To handle this issue properly this switches nfsd to call vfs_truncate
+for size changes, and then handle all other attributes through
+notify_change.  As a side effect this also means less boilerplace code
+around the size change as we can now reuse the VFS code.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 41f53350a0f36a7b8e31bec0d0ca907e028ab4cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/vfs.c
+diff --cc fs/nfsd/vfs.c
+index fd127b55d9b7,ca13236dbb1f..000000000000
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@@ -332,37 -332,6 +332,40 @@@ nfsd_sanitize_attrs(struct inode *inode
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static __be32
+ +nfsd_get_write_access(struct svc_rqst *rqstp, struct svc_fh *fhp,
+ +		struct iattr *iap)
+ +{
+ +	struct inode *inode = fhp->fh_dentry->d_inode;
+ +	int host_err;
+ +
+ +	if (iap->ia_size < inode->i_size) {
+ +		__be32 err;
+ +
+ +		err = nfsd_permission(rqstp, fhp->fh_export, fhp->fh_dentry,
+ +				NFSD_MAY_TRUNC | NFSD_MAY_OWNER_OVERRIDE);
+ +		if (err)
+ +			return err;
+ +	}
+ +
+ +	host_err = get_write_access(inode);
+ +	if (host_err)
+ +		goto out_nfserrno;
+ +
+ +	host_err = locks_verify_truncate(inode, NULL, iap->ia_size);
+ +	if (host_err)
+ +		goto out_put_write_access;
+ +	return 0;
+ +
+ +out_put_write_access:
+ +	put_write_access(inode);
+ +out_nfserrno:
+ +	return nfserrno(host_err);
+ +}
+ +
+++=======
+++>>>>>>> 41f53350a0f3 (nfsd: special case truncates some more)
+  /*
+   * Set various file attributes.  After this call fhp needs an fh_put.
+   */
+@@@ -377,7 -346,6 +380,10 @@@ nfsd_setattr(struct svc_rqst *rqstp, st
+  	__be32		err;
+  	int		host_err;
+  	bool		get_write_count;
+++<<<<<<< HEAD
+ +	bool		size_change = (iap->ia_valid & ATTR_SIZE);
+++=======
+++>>>>>>> 41f53350a0f3 (nfsd: special case truncates some more)
+  
+  	if (iap->ia_valid & (ATTR_ATIME | ATTR_MTIME | ATTR_SIZE))
+  		accmode |= NFSD_MAY_WRITE|NFSD_MAY_OWNER_OVERRIDE;
+@@@ -394,7 -362,7 +400,11 @@@
+  	if (get_write_count) {
+  		host_err = fh_want_write(fhp);
+  		if (host_err)
+++<<<<<<< HEAD
+ +			goto out;
+++=======
++ 			goto out_host_err;
+++>>>>>>> 41f53350a0f3 (nfsd: special case truncates some more)
+  	}
+  
+  	dentry = fhp->fh_dentry;
+@@@ -414,22 -382,36 +424,43 @@@
+  
+  	/*
+  	 * The size case is special, it changes the file in addition to the
+- 	 * attributes.
++ 	 * attributes, and file systems don't expect it to be mixed with
++ 	 * "random" attribute changes.  We thus split out the size change
++ 	 * into a separate call for vfs_truncate, and do the rest as a
++ 	 * a separate setattr call.
+  	 */
+++<<<<<<< HEAD
+ +	if (size_change) {
+ +		err = nfsd_get_write_access(rqstp, fhp, iap);
+ +		if (err)
+ +			return err;
+++=======
++ 	if (iap->ia_valid & ATTR_SIZE) {
++ 		struct path path = {
++ 			.mnt	= fhp->fh_export->ex_path.mnt,
++ 			.dentry	= dentry,
++ 		};
++ 		bool implicit_mtime = false;
+++>>>>>>> 41f53350a0f3 (nfsd: special case truncates some more)
+  
+  		/*
+- 		 * RFC5661, Section 18.30.4:
+- 		 *   Changing the size of a file with SETATTR indirectly
+- 		 *   changes the time_modify and change attributes.
+- 		 *
+- 		 * (and similar for the older RFCs)
++ 		 * vfs_truncate implicity updates the mtime IFF the file size
++ 		 * actually changes.  Avoid the additional seattr call below if
++ 		 * the only other attribute that the client sends is the mtime.
+  		 */
+- 		if (iap->ia_size != i_size_read(inode))
+- 			iap->ia_valid |= ATTR_MTIME;
++ 		if (iap->ia_size != i_size_read(inode) &&
++ 		    ((iap->ia_valid & ~(ATTR_SIZE | ATTR_MTIME)) == 0))
++ 			implicit_mtime = true;
++ 
++ 		host_err = vfs_truncate(&path, iap->ia_size);
++ 		if (host_err)
++ 			goto out_host_err;
++ 
++ 		iap->ia_valid &= ~ATTR_SIZE;
++ 		if (implicit_mtime)
++ 			iap->ia_valid &= ~ATTR_MTIME;
++ 		if (!iap->ia_valid)
++ 			goto done;
+  	}
+  
+  	iap->ia_valid |= ATTR_CTIME;
+@@@ -437,12 -419,12 +468,21 @@@
+  	fh_lock(fhp);
+  	host_err = notify_change(dentry, iap, NULL);
+  	fh_unlock(fhp);
+++<<<<<<< HEAD
+ +
+ +	if (size_change)
+ +		put_write_access(inode);
+ +out:
+ +	if (!host_err)
+ +		host_err = commit_metadata(fhp);
+++=======
++ 	if (host_err)
++ 		goto out_host_err;
++ 
++ done:
++ 	host_err = commit_metadata(fhp);
++ out_host_err:
+++>>>>>>> 41f53350a0f3 (nfsd: special case truncates some more)
+  	return nfserrno(host_err);
+  }
+  
+* Unmerged path fs/nfsd/vfs.c
