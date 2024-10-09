@@ -1,0 +1,160 @@
+netvsc: remove unnecessary indirection of page_buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 02b6de01af1d116c107d61fa3e8583be3b97ac3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/02b6de01.failed
+
+The internal API was passing struct hv_page_buffer **
+when only simple struct hv_page_buffer * was necessary
+for passing an array.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 02b6de01af1d116c107d61fa3e8583be3b97ac3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+#	drivers/net/hyperv/rndis_filter.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index d4dc9c189b85,8ff4cbf582cc..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -381,15 -357,10 +380,14 @@@ static int netvsc_start_xmit(struct sk_
+  	struct rndis_packet *rndis_pkt;
+  	u32 rndis_msg_size;
+  	struct rndis_per_packet_info *ppi;
+ +	struct ndis_tcp_ip_checksum_info *csum_info;
+ +	int  hdr_offset = 0; /* silence GCC4.8 complains in RHEL7 */
+ +	u32 net_trans_info;
+  	u32 hash;
+- 	struct hv_page_buffer page_buf[MAX_PAGE_BUFFER_COUNT];
+- 	struct hv_page_buffer *pb = page_buf;
++ 	struct hv_page_buffer pb[MAX_PAGE_BUFFER_COUNT];
+  
+ -	/* We can only transmit MAX_PAGE_BUFFER_COUNT number
+ +	/* We will atmost need two pages to describe the rndis
+ +	 * header. We can only transmit MAX_PAGE_BUFFER_COUNT number
+  	 * of pages in a single packet. If skb is scattered around
+  	 * more pages we try linearizing it.
+  	 */
+@@@ -530,8 -505,8 +528,13 @@@
+  
+  	/* timestamp packet in software */
+  	skb_tx_timestamp(skb);
+++<<<<<<< HEAD
+ +	ret = netvsc_send(net_device_ctx->device_ctx, packet,
+ +			  rndis_msg, &pb, skb);
+++=======
++ 
++ 	ret = netvsc_send(net_device_ctx, packet, rndis_msg, pb, skb);
+++>>>>>>> 02b6de01af1d (netvsc: remove unnecessary indirection of page_buffer)
+  	if (likely(ret == 0))
+  		return NETDEV_TX_OK;
+  
+diff --cc drivers/net/hyperv/rndis_filter.c
+index b6bc44dd1f92,d80e9e3f433e..000000000000
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@@ -241,7 -244,10 +241,14 @@@ static int rndis_filter_send_request(st
+  			pb[0].len;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = netvsc_send(net_device_ctx->device_ctx, packet, NULL, &pb, NULL);
+++=======
++ 	rcu_read_lock_bh();
++ 	ret = netvsc_send(net_device_ctx, packet, NULL, pb, NULL);
++ 	rcu_read_unlock_bh();
++ 
+++>>>>>>> 02b6de01af1d (netvsc: remove unnecessary indirection of page_buffer)
+  	return ret;
+  }
+  
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505..b1fad2318a9a 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -185,7 +185,7 @@ void netvsc_device_remove(struct hv_device *device);
+ int netvsc_send(struct hv_device *device,
+ 		struct hv_netvsc_packet *packet,
+ 		struct rndis_message *rndis_msg,
+-		struct hv_page_buffer **page_buffer,
++		struct hv_page_buffer *page_buffer,
+ 		struct sk_buff *skb);
+ void netvsc_linkstatus_callback(struct hv_device *device_obj,
+ 				struct rndis_message *resp);
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index 52667f48ba1c..b3a4c739a328 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -719,7 +719,7 @@ static u32 netvsc_copy_to_send_buf(struct netvsc_device *net_device,
+ 				   u32 pend_size,
+ 				   struct hv_netvsc_packet *packet,
+ 				   struct rndis_message *rndis_msg,
+-				   struct hv_page_buffer **pb,
++				   struct hv_page_buffer *pb,
+ 				   struct sk_buff *skb)
+ {
+ 	char *start = net_device->send_buf;
+@@ -740,9 +740,9 @@ static u32 netvsc_copy_to_send_buf(struct netvsc_device *net_device,
+ 	}
+ 
+ 	for (i = 0; i < page_count; i++) {
+-		char *src = phys_to_virt((*pb)[i].pfn << PAGE_SHIFT);
+-		u32 offset = (*pb)[i].offset;
+-		u32 len = (*pb)[i].len;
++		char *src = phys_to_virt(pb[i].pfn << PAGE_SHIFT);
++		u32 offset = pb[i].offset;
++		u32 len = pb[i].len;
+ 
+ 		memcpy(dest, (src + offset), len);
+ 		msg_size += len;
+@@ -761,7 +761,7 @@ static inline int netvsc_send_pkt(
+ 	struct hv_device *device,
+ 	struct hv_netvsc_packet *packet,
+ 	struct netvsc_device *net_device,
+-	struct hv_page_buffer **pb,
++	struct hv_page_buffer *pb,
+ 	struct sk_buff *skb)
+ {
+ 	struct nvsp_message nvmsg;
+@@ -770,7 +770,6 @@ static inline int netvsc_send_pkt(
+ 	struct net_device *ndev = hv_get_drvdata(device);
+ 	u64 req_id;
+ 	int ret;
+-	struct hv_page_buffer *pgbuf;
+ 	u32 ring_avail = hv_ringbuf_avail_percent(&out_channel->outbound);
+ 
+ 	nvmsg.hdr.msg_type = NVSP_MSG1_TYPE_SEND_RNDIS_PKT;
+@@ -796,11 +795,11 @@ static inline int netvsc_send_pkt(
+ 		return -ENODEV;
+ 
+ 	if (packet->page_buf_cnt) {
+-		pgbuf = packet->cp_partial ? (*pb) +
+-			packet->rmsg_pgcnt : (*pb);
++		if (packet->cp_partial)
++			pb += packet->rmsg_pgcnt;
++
+ 		ret = vmbus_sendpacket_pagebuffer_ctl(out_channel,
+-						      pgbuf,
+-						      packet->page_buf_cnt,
++						      pb, packet->page_buf_cnt,
+ 						      &nvmsg,
+ 						      sizeof(struct nvsp_message),
+ 						      req_id,
+@@ -858,7 +857,7 @@ static inline void move_pkt_msd(struct hv_netvsc_packet **msd_send,
+ int netvsc_send(struct hv_device *device,
+ 		struct hv_netvsc_packet *packet,
+ 		struct rndis_message *rndis_msg,
+-		struct hv_page_buffer **pb,
++		struct hv_page_buffer *pb,
+ 		struct sk_buff *skb)
+ {
+ 	struct netvsc_device *net_device;
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
+* Unmerged path drivers/net/hyperv/rndis_filter.c
