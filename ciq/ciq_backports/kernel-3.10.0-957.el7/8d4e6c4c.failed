@@ -1,0 +1,134 @@
+perf/core, pt, bts: Get rid of itrace_started
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexander Shishkin <alexander.shishkin@linux.intel.com>
+commit 8d4e6c4caa12dafbcba138e5450b7af17b0b2194
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8d4e6c4c.failed
+
+I just noticed that hw.itrace_started and hw.config are aliased to the
+same location. Now, the PT driver happens to use both, which works out
+fine by sheer luck:
+
+ - STORE(hw.itrace_start) is ordered before STORE(hw.config), in the
+    program order, although there are no compiler barriers to ensure that,
+
+ - to the perf_log_itrace_start() hw.itrace_start looks set at the same
+   time as when it is intended to be set because both stores happen in the
+   same path,
+
+ - hw.config is never reset to zero in the PT driver.
+
+Now, the use of hw.config by the PT driver makes more sense (it being a
+HW PMU) than messing around with itrace_started, which is an awkward API
+to begin with.
+
+This patch replaces hw.itrace_started with an attach_state bit and an
+API call for the PMU drivers to use to communicate the condition.
+
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/20170330153956.25994-1-alexander.shishkin@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8d4e6c4caa12dafbcba138e5450b7af17b0b2194)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+diff --cc include/linux/perf_event.h
+index c93e5f6b30d7,adda0aaae6c8..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -125,11 -139,18 +125,26 @@@ struct hw_perf_event 
+  			/* for tp_event->class */
+  			struct list_head	tp_list;
+  		};
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +		struct { /* itrace */
+ +			int			itrace_started;
+ +		};
+ +#endif /* __GENKSYMS__ */
+++=======
++ 		struct { /* intel_cqm */
++ 			int			cqm_state;
++ 			u32			cqm_rmid;
++ 			int			is_group_event;
++ 			struct list_head	cqm_events_entry;
++ 			struct list_head	cqm_groups_entry;
++ 			struct list_head	cqm_group_entry;
++ 		};
++ 		struct { /* amd_power */
++ 			u64	pwr_acc;
++ 			u64	ptsc;
++ 		};
+++>>>>>>> 8d4e6c4caa12 (perf/core, pt, bts: Get rid of itrace_started)
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  		struct { /* breakpoint */
+  			/*
+diff --git a/arch/x86/events/intel/bts.c b/arch/x86/events/intel/bts.c
+index ddd8d3516bfc..16076eb34699 100644
+--- a/arch/x86/events/intel/bts.c
++++ b/arch/x86/events/intel/bts.c
+@@ -268,7 +268,7 @@ static void bts_event_start(struct perf_event *event, int flags)
+ 	bts->ds_back.bts_absolute_maximum = cpuc->ds->bts_absolute_maximum;
+ 	bts->ds_back.bts_interrupt_threshold = cpuc->ds->bts_interrupt_threshold;
+ 
+-	event->hw.itrace_started = 1;
++	perf_event_itrace_started(event);
+ 	event->hw.state = 0;
+ 
+ 	__bts_event_start(event);
+diff --git a/arch/x86/events/intel/pt.c b/arch/x86/events/intel/pt.c
+index ae8324d65e61..81fd41d5a0d9 100644
+--- a/arch/x86/events/intel/pt.c
++++ b/arch/x86/events/intel/pt.c
+@@ -471,8 +471,9 @@ static void pt_config(struct perf_event *event)
+ 	struct pt *pt = this_cpu_ptr(&pt_ctx);
+ 	u64 reg;
+ 
+-	if (!event->hw.itrace_started) {
+-		event->hw.itrace_started = 1;
++	/* First round: clear STATUS, in particular the PSB byte counter. */
++	if (!event->hw.config) {
++		perf_event_itrace_started(event);
+ 		wrmsrl(MSR_IA32_RTIT_STATUS, 0);
+ 	}
+ 
+* Unmerged path include/linux/perf_event.h
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 81e1181610c7..fa7b04bbd916 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7011,6 +7011,11 @@ static void perf_log_throttle(struct perf_event *event, int enable)
+ 	perf_output_end(&handle);
+ }
+ 
++void perf_event_itrace_started(struct perf_event *event)
++{
++	event->attach_state |= PERF_ATTACH_ITRACE;
++}
++
+ static void perf_log_itrace_start(struct perf_event *event)
+ {
+ 	struct perf_output_handle handle;
+@@ -7026,7 +7031,7 @@ static void perf_log_itrace_start(struct perf_event *event)
+ 		event = event->parent;
+ 
+ 	if (!(event->pmu->capabilities & PERF_PMU_CAP_ITRACE) ||
+-	    event->hw.itrace_started)
++	    event->attach_state & PERF_ATTACH_ITRACE)
+ 		return;
+ 
+ 	rec.header.type	= PERF_RECORD_ITRACE_START;
