@@ -1,0 +1,174 @@
+xfs: refactor inode verifier corruption error printing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 22431bf3dfbf44d7356933776eb486a6a01dea6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/22431bf3.failed
+
+Refactor inode verifier error reporting into a non-libxfs function so
+that we aren't encoding the message format in libxfs.  This also
+changes the kernel dmesg output to resemble buffer verifier errors
+more closely.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 22431bf3dfbf44d7356933776eb486a6a01dea6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_inode_buf.c
+#	fs/xfs/xfs_error.h
+#	fs/xfs/xfs_inode.c
+diff --cc fs/xfs/libxfs/xfs_inode_buf.c
+index 3aebe5129937,d7e7e58f0ee2..000000000000
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@@ -570,11 -576,10 +570,18 @@@ xfs_iread
+  		return error;
+  
+  	/* even unallocated inodes are verified */
+++<<<<<<< HEAD
+ +	if (!xfs_dinode_verify(mp, ip->i_ino, dip)) {
+ +		xfs_alert(mp, "%s: validation failed for inode %lld",
+ +				__func__, ip->i_ino);
+ +
+ +		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, dip);
+++=======
++ 	fa = xfs_dinode_verify(mp, ip->i_ino, dip);
++ 	if (fa) {
++ 		xfs_inode_verifier_error(ip, -EFSCORRUPTED, "dinode", dip,
++ 				sizeof(*dip), fa);
+++>>>>>>> 22431bf3dfbf (xfs: refactor inode verifier corruption error printing)
+  		error = -EFSCORRUPTED;
+  		goto out_brelse;
+  	}
+diff --cc fs/xfs/xfs_error.h
+index ea816c1bf8db,7e728c5a46b8..000000000000
+--- a/fs/xfs/xfs_error.h
++++ b/fs/xfs/xfs_error.h
+@@@ -21,11 -21,16 +21,20 @@@
+  struct xfs_mount;
+  
+  extern void xfs_error_report(const char *tag, int level, struct xfs_mount *mp,
+ -			const char *filename, int linenum,
+ -			xfs_failaddr_t failaddr);
+ +			const char *filename, int linenum, void *ra);
+  extern void xfs_corruption_error(const char *tag, int level,
+  			struct xfs_mount *mp, void *p, const char *filename,
+++<<<<<<< HEAD
+ +			int linenum, void *ra);
+ +extern void xfs_verifier_error(struct xfs_buf *bp);
+++=======
++ 			int linenum, xfs_failaddr_t failaddr);
++ extern void xfs_verifier_error(struct xfs_buf *bp, int error,
++ 			xfs_failaddr_t failaddr);
++ extern void xfs_inode_verifier_error(struct xfs_inode *ip, int error,
++ 			const char *name, void *buf, size_t bufsz,
++ 			xfs_failaddr_t failaddr);
+++>>>>>>> 22431bf3dfbf (xfs: refactor inode verifier corruption error printing)
+  
+  #define	XFS_ERROR_REPORT(e, lvl, mp)	\
+  	xfs_error_report(e, lvl, mp, __FILE__, __LINE__, __return_address)
+diff --cc fs/xfs/xfs_inode.c
+index 9967b377f603,5366fb619db6..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -3419,6 -3478,36 +3419,39 @@@ abort_out
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * If there are inline format data / attr forks attached to this inode,
++  * make sure they're not corrupt.
++  */
++ bool
++ xfs_inode_verify_forks(
++ 	struct xfs_inode	*ip)
++ {
++ 	struct xfs_ifork	*ifp;
++ 	xfs_failaddr_t		fa;
++ 
++ 	fa = xfs_ifork_verify_data(ip, &xfs_default_ifork_ops);
++ 	if (fa) {
++ 		ifp = XFS_IFORK_PTR(ip, XFS_DATA_FORK);
++ 		xfs_inode_verifier_error(ip, -EFSCORRUPTED, "data fork",
++ 				ifp->if_u1.if_data, ifp->if_bytes, fa);
++ 		return false;
++ 	}
++ 
++ 	fa = xfs_ifork_verify_attr(ip, &xfs_default_ifork_ops);
++ 	if (fa) {
++ 		ifp = XFS_IFORK_PTR(ip, XFS_ATTR_FORK);
++ 		xfs_inode_verifier_error(ip, -EFSCORRUPTED, "attr fork",
++ 				ifp ? ifp->if_u1.if_data : NULL,
++ 				ifp ? ifp->if_bytes : 0, fa);
++ 		return false;
++ 	}
++ 	return true;
++ }
++ 
+++>>>>>>> 22431bf3dfbf (xfs: refactor inode verifier corruption error printing)
+  STATIC int
+  xfs_iflush_int(
+  	struct xfs_inode	*ip,
+* Unmerged path fs/xfs/libxfs/xfs_inode_buf.c
+diff --git a/fs/xfs/xfs_error.c b/fs/xfs/xfs_error.c
+index 388ce630c4b7..ad171f6e8071 100644
+--- a/fs/xfs/xfs_error.c
++++ b/fs/xfs/xfs_error.c
+@@ -24,6 +24,7 @@
+ #include "xfs_errortag.h"
+ #include "xfs_error.h"
+ #include "xfs_sysfs.h"
++#include "xfs_inode.h"
+ 
+ #ifdef DEBUG
+ 
+@@ -350,3 +351,39 @@ xfs_verifier_error(
+ 	if (xfs_error_level >= XFS_ERRLEVEL_HIGH)
+ 		xfs_stack_trace();
+ }
++
++/*
++ * Warnings for inode corruption problems.  Don't bother with the stack
++ * trace unless the error level is turned up high.
++ */
++void
++xfs_inode_verifier_error(
++	struct xfs_inode	*ip,
++	int			error,
++	const char		*name,
++	void			*buf,
++	size_t			bufsz,
++	xfs_failaddr_t		failaddr)
++{
++	struct xfs_mount	*mp = ip->i_mount;
++	xfs_failaddr_t		fa;
++	int			sz;
++
++	fa = failaddr ? failaddr : __return_address;
++
++	xfs_alert(mp, "Metadata %s detected at %pS, inode 0x%llx %s",
++		  error == -EFSBADCRC ? "CRC error" : "corruption",
++		  fa, ip->i_ino, name);
++
++	xfs_alert(mp, "Unmount and run xfs_repair");
++
++	if (buf && xfs_error_level >= XFS_ERRLEVEL_LOW) {
++		sz = min_t(size_t, XFS_CORRUPTION_DUMP_LEN, bufsz);
++		xfs_alert(mp, "First %d bytes of corrupted metadata buffer:",
++				sz);
++		xfs_hex_dump(buf, sz);
++	}
++
++	if (xfs_error_level >= XFS_ERRLEVEL_HIGH)
++		xfs_stack_trace();
++}
+* Unmerged path fs/xfs/xfs_error.h
+* Unmerged path fs/xfs/xfs_inode.c
