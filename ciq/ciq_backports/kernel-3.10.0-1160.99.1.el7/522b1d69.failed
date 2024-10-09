@@ -1,0 +1,665 @@
+x86/cpu/amd: Add a Zenbleed fix
+
+jira LE-1907
+cve CVE-2023-20593
+Rebuild_History Non-Buildable kernel-3.10.0-1160.99.1.el7
+commit-author Borislav Petkov (AMD) <bp@alien8.de>
+commit 522b1d69219d8f083173819fde04f994aa051a98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.99.1.el7/522b1d69.failed
+
+Add a fix for the Zen2 VZEROUPPER data corruption bug where under
+certain circumstances executing VZEROUPPER can cause register
+corruption or leak data.
+
+The optimal fix is through microcode but in the case the proper
+microcode revision has not been applied, enable a fallback fix using
+a chicken bit.
+
+	Signed-off-by: Borislav Petkov (AMD) <bp@alien8.de>
+(cherry picked from commit 522b1d69219d8f083173819fde04f994aa051a98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/microcode_amd.h
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/kernel/cpu/amd.c
+#	arch/x86/kernel/cpu/common.c
+diff --cc arch/x86/include/asm/microcode_amd.h
+index 2b907ec59364,9675c621c1ca..000000000000
+--- a/arch/x86/include/asm/microcode_amd.h
++++ b/arch/x86/include/asm/microcode_amd.h
+@@@ -44,15 -45,16 +44,29 @@@ struct microcode_amd 
+  
+  #ifdef CONFIG_MICROCODE_AMD
+  extern void __init load_ucode_amd_bsp(unsigned int family);
+++<<<<<<< HEAD
+ +extern void load_ucode_amd_ap(void);
+ +extern int __init save_microcode_in_initrd_amd(void);
+ +void reload_ucode_amd(void);
+ +#else
+ +static inline void __init load_ucode_amd_bsp(unsigned int family) {}
+ +static inline void load_ucode_amd_ap(void) {}
+ +static inline int __init save_microcode_in_initrd_amd(void) { return -EINVAL; }
+ +void reload_ucode_amd(void) {}
+++=======
++ extern void load_ucode_amd_ap(unsigned int family);
++ extern int __init save_microcode_in_initrd_amd(unsigned int family);
++ void reload_ucode_amd(unsigned int cpu);
++ extern void amd_check_microcode(void);
++ #else
++ static inline void __init load_ucode_amd_bsp(unsigned int family) {}
++ static inline void load_ucode_amd_ap(unsigned int family) {}
++ static inline int __init
++ save_microcode_in_initrd_amd(unsigned int family) { return -EINVAL; }
++ static inline void reload_ucode_amd(unsigned int cpu) {}
++ static inline void amd_check_microcode(void) {}
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+  #endif
+ +
+ +extern bool check_current_patch_level(u32 *rev, bool early);
+  #endif /* _ASM_X86_MICROCODE_AMD_H */
+diff --cc arch/x86/include/asm/msr-index.h
+index 381107911851,a00a53e15ab7..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -390,11 -531,22 +390,20 @@@
+  #define MSR_AMD64_TSC_RATIO		0xc0000104
+  #define MSR_AMD64_NB_CFG		0xc001001f
+  #define MSR_AMD64_PATCH_LOADER		0xc0010020
+ -#define MSR_AMD_PERF_CTL		0xc0010062
+ -#define MSR_AMD_PERF_STATUS		0xc0010063
+ -#define MSR_AMD_PSTATE_DEF_BASE		0xc0010064
+ +#define MSR_AMD64_VIRT_SPEC_CTRL	0xc001011f
+  #define MSR_AMD64_OSVW_ID_LENGTH	0xc0010140
+  #define MSR_AMD64_OSVW_STATUS		0xc0010141
+ -#define MSR_AMD_PPIN_CTL		0xc00102f0
+ -#define MSR_AMD_PPIN			0xc00102f1
+ -#define MSR_AMD64_CPUID_FN_1		0xc0011004
+  #define MSR_AMD64_LS_CFG		0xc0011020
+  #define MSR_AMD64_DC_CFG		0xc0011022
+++<<<<<<< HEAD
+++=======
++ 
++ #define MSR_AMD64_DE_CFG		0xc0011029
++ #define MSR_AMD64_DE_CFG_LFENCE_SERIALIZE_BIT	 1
++ #define MSR_AMD64_DE_CFG_LFENCE_SERIALIZE	BIT_ULL(MSR_AMD64_DE_CFG_LFENCE_SERIALIZE_BIT)
++ #define MSR_AMD64_DE_CFG_ZEN2_FP_BACKUP_FIX_BIT 9
++ 
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+  #define MSR_AMD64_BU_CFG2		0xc001102a
+  #define MSR_AMD64_IBSFETCHCTL		0xc0011030
+  #define MSR_AMD64_IBSFETCHLINAD		0xc0011031
+diff --cc arch/x86/kernel/cpu/amd.c
+index 619851c677bd,26ad7ca423e7..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -28,6 -34,78 +28,81 @@@
+   */
+  static u32 nodes_per_socket = 1;
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * AMD errata checking
++  *
++  * Errata are defined as arrays of ints using the AMD_LEGACY_ERRATUM() or
++  * AMD_OSVW_ERRATUM() macros. The latter is intended for newer errata that
++  * have an OSVW id assigned, which it takes as first argument. Both take a
++  * variable number of family-specific model-stepping ranges created by
++  * AMD_MODEL_RANGE().
++  *
++  * Example:
++  *
++  * const int amd_erratum_319[] =
++  *	AMD_LEGACY_ERRATUM(AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0x4, 0x2),
++  *			   AMD_MODEL_RANGE(0x10, 0x8, 0x0, 0x8, 0x0),
++  *			   AMD_MODEL_RANGE(0x10, 0x9, 0x0, 0x9, 0x0));
++  */
++ 
++ #define AMD_LEGACY_ERRATUM(...)		{ -1, __VA_ARGS__, 0 }
++ #define AMD_OSVW_ERRATUM(osvw_id, ...)	{ osvw_id, __VA_ARGS__, 0 }
++ #define AMD_MODEL_RANGE(f, m_start, s_start, m_end, s_end) \
++ 	((f << 24) | (m_start << 16) | (s_start << 12) | (m_end << 4) | (s_end))
++ #define AMD_MODEL_RANGE_FAMILY(range)	(((range) >> 24) & 0xff)
++ #define AMD_MODEL_RANGE_START(range)	(((range) >> 12) & 0xfff)
++ #define AMD_MODEL_RANGE_END(range)	((range) & 0xfff)
++ 
++ static const int amd_erratum_400[] =
++ 	AMD_OSVW_ERRATUM(1, AMD_MODEL_RANGE(0xf, 0x41, 0x2, 0xff, 0xf),
++ 			    AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0xff, 0xf));
++ 
++ static const int amd_erratum_383[] =
++ 	AMD_OSVW_ERRATUM(3, AMD_MODEL_RANGE(0x10, 0, 0, 0xff, 0xf));
++ 
++ /* #1054: Instructions Retired Performance Counter May Be Inaccurate */
++ static const int amd_erratum_1054[] =
++ 	AMD_LEGACY_ERRATUM(AMD_MODEL_RANGE(0x17, 0, 0, 0x2f, 0xf));
++ 
++ static const int amd_zenbleed[] =
++ 	AMD_LEGACY_ERRATUM(AMD_MODEL_RANGE(0x17, 0x30, 0x0, 0x4f, 0xf),
++ 			   AMD_MODEL_RANGE(0x17, 0x60, 0x0, 0x7f, 0xf),
++ 			   AMD_MODEL_RANGE(0x17, 0xa0, 0x0, 0xaf, 0xf));
++ 
++ static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum)
++ {
++ 	int osvw_id = *erratum++;
++ 	u32 range;
++ 	u32 ms;
++ 
++ 	if (osvw_id >= 0 && osvw_id < 65536 &&
++ 	    cpu_has(cpu, X86_FEATURE_OSVW)) {
++ 		u64 osvw_len;
++ 
++ 		rdmsrl(MSR_AMD64_OSVW_ID_LENGTH, osvw_len);
++ 		if (osvw_id < osvw_len) {
++ 			u64 osvw_bits;
++ 
++ 			rdmsrl(MSR_AMD64_OSVW_STATUS + (osvw_id >> 6),
++ 			    osvw_bits);
++ 			return osvw_bits & (1ULL << (osvw_id & 0x3f));
++ 		}
++ 	}
++ 
++ 	/* OSVW unavailable or ID unknown, match family-model-stepping range */
++ 	ms = (cpu->x86_model << 4) | cpu->x86_stepping;
++ 	while ((range = *erratum++))
++ 		if ((cpu->x86 == AMD_MODEL_RANGE_FAMILY(range)) &&
++ 		    (ms >= AMD_MODEL_RANGE_START(range)) &&
++ 		    (ms <= AMD_MODEL_RANGE_END(range)))
++ 			return true;
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+  static inline int rdmsrl_amd_safe(unsigned msr, unsigned long long *p)
+  {
+  	u32 gprs[8] = { 0 };
+@@@ -689,24 -983,49 +764,65 @@@ static void init_amd_zn(struct cpuinfo_
+  	}
+  }
+  
++ static bool cpu_has_zenbleed_microcode(void)
++ {
++ 	u32 good_rev = 0;
++ 
++ 	switch (boot_cpu_data.x86_model) {
++ 	case 0x30 ... 0x3f: good_rev = 0x0830107a; break;
++ 	case 0x60 ... 0x67: good_rev = 0x0860010b; break;
++ 	case 0x68 ... 0x6f: good_rev = 0x08608105; break;
++ 	case 0x70 ... 0x7f: good_rev = 0x08701032; break;
++ 	case 0xa0 ... 0xaf: good_rev = 0x08a00008; break;
++ 
++ 	default:
++ 		return false;
++ 		break;
++ 	}
++ 
++ 	if (boot_cpu_data.microcode < good_rev)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void zenbleed_check(struct cpuinfo_x86 *c)
++ {
++ 	if (!cpu_has_amd_erratum(c, amd_zenbleed))
++ 		return;
++ 
++ 	if (cpu_has(c, X86_FEATURE_HYPERVISOR))
++ 		return;
++ 
++ 	if (!cpu_has(c, X86_FEATURE_AVX))
++ 		return;
++ 
++ 	if (!cpu_has_zenbleed_microcode()) {
++ 		pr_notice_once("Zenbleed: please update your microcode for the most optimal fix\n");
++ 		msr_set_bit(MSR_AMD64_DE_CFG, MSR_AMD64_DE_CFG_ZEN2_FP_BACKUP_FIX_BIT);
++ 	} else {
++ 		msr_clear_bit(MSR_AMD64_DE_CFG, MSR_AMD64_DE_CFG_ZEN2_FP_BACKUP_FIX_BIT);
++ 	}
++ }
++ 
+  static void init_amd(struct cpuinfo_x86 *c)
+  {
+ +	unsigned long long value;
+ +
+ +#ifdef CONFIG_SMP
+ +	/*
+ +	 * Disable TLB flush filter by setting HWCR.FFDIS on K8
+ +	 * bit 6 of msr C001_0015
+ +	 *
+ +	 * Errata 63 for SH-B3 steppings
+ +	 * Errata 122 for all steppings (F+ have it disabled by default)
+ +	 */
+ +	if (c->x86 == 0xf) {
+ +		rdmsrl(MSR_K7_HWCR, value);
+ +		value |= 1 << 6;
+ +		wrmsrl(MSR_K7_HWCR, value);
+ +	}
+ +#endif
+  	early_init_amd(c);
+  
+  	/*
+@@@ -860,49 -1098,38 +976,64 @@@
+  	if (c->x86 > 0x11)
+  		set_cpu_cap(c, X86_FEATURE_ARAT);
+  
+ -	/* 3DNow or LM implies PREFETCHW */
+ -	if (!cpu_has(c, X86_FEATURE_3DNOWPREFETCH))
+ -		if (cpu_has(c, X86_FEATURE_3DNOW) || cpu_has(c, X86_FEATURE_LM))
+ -			set_cpu_cap(c, X86_FEATURE_3DNOWPREFETCH);
+ +	if (c->x86 == 0x10) {
+ +		/*
+ +		 * Disable GART TLB Walk Errors on Fam10h. We do this here
+ +		 * because this is always needed when GART is enabled, even in a
+ +		 * kernel which has no MCE support built in.
+ +		 * BIOS should disable GartTlbWlk Errors themself. If
+ +		 * it doesn't do it here as suggested by the BKDG.
+ +		 *
+ +		 * Fixes: https://bugzilla.kernel.org/show_bug.cgi?id=33012
+ +		 */
+ +		u64 mask;
+ +		int err;
+  
+ -	/* AMD CPUs don't reset SS attributes on SYSRET, Xen does. */
+ -	if (!cpu_feature_enabled(X86_FEATURE_XENPV))
+ -		set_cpu_bug(c, X86_BUG_SYSRET_SS_ATTRS);
+ +		err = rdmsrl_safe(MSR_AMD64_MCx_MASK(4), &mask);
+ +		if (err == 0) {
+ +			mask |= (1 << 10);
+ +			wrmsrl_safe(MSR_AMD64_MCx_MASK(4), mask);
+ +		}
+  
+ -	/*
+ -	 * Turn on the Instructions Retired free counter on machines not
+ -	 * susceptible to erratum #1054 "Instructions Retired Performance
+ -	 * Counter May Be Inaccurate".
+ -	 */
+ -	if (cpu_has(c, X86_FEATURE_IRPERF) &&
+ -	    !cpu_has_amd_erratum(c, amd_erratum_1054))
+ -		msr_set_bit(MSR_K7_HWCR, MSR_K7_HWCR_IRPERF_EN_BIT);
+ +		/*
+ +		 * On family 10h BIOS may not have properly enabled WC+ support,
+ +		 * causing it to be converted to CD memtype. This may result in
+ +		 * performance degradation for certain nested-paging guests.
+ +		 * Prevent this conversion by clearing bit 24 in
+ +		 * MSR_AMD64_BU_CFG2.
+ +		 *
+ +		 * NOTE: we want to use the _safe accessors so as not to #GP kvm
+ +		 * guests on older kvm hosts.
+ +		 */
+ +
+ +		rdmsrl_safe(MSR_AMD64_BU_CFG2, &value);
+ +		value &= ~(1ULL << 24);
+ +		wrmsrl_safe(MSR_AMD64_BU_CFG2, value);
+ +
+++<<<<<<< HEAD
+ +		if (cpu_has_amd_erratum(c, amd_erratum_383))
+ +			set_cpu_bug(c, X86_BUG_AMD_TLB_MMATCH);
+ +	}
+  
+ -	check_null_seg_clears_base(c);
+ +	if (cpu_has_amd_erratum(c, amd_erratum_400))
+ +		set_cpu_bug(c, X86_BUG_AMD_APIC_C1E);
+  
+ +	if (c->x86 == 0x10 || c->x86 == 0x12)
+ +		set_cpu_cap(c, X86_FEATURE_IBP_DISABLE);
+++=======
++ 	/*
++ 	 * Make sure EFER[AIBRSE - Automatic IBRS Enable] is set. The APs are brought up
++ 	 * using the trampoline code and as part of it, MSR_EFER gets prepared there in
++ 	 * order to be replicated onto them. Regardless, set it here again, if not set,
++ 	 * to protect against any future refactoring/code reorganization which might
++ 	 * miss setting this important bit.
++ 	 */
++ 	if (spectre_v2_in_eibrs_mode(spectre_v2_enabled) &&
++ 	    cpu_has(c, X86_FEATURE_AUTOIBRS))
++ 		WARN_ON_ONCE(msr_set_bit(MSR_EFER, _EFER_AUTOIBRS));
++ 
++ 	zenbleed_check(c);
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+  }
+  
+  #ifdef CONFIG_X86_32
+@@@ -1009,85 -1225,68 +1140,117 @@@ static const struct cpu_dev amd_cpu_de
+  
+  cpu_dev_register(amd_cpu_dev);
+  
+ -static DEFINE_PER_CPU_READ_MOSTLY(unsigned long[4], amd_dr_addr_mask);
+ +/*
+ + * AMD errata checking
+ + *
+ + * Errata are defined as arrays of ints using the AMD_LEGACY_ERRATUM() or
+ + * AMD_OSVW_ERRATUM() macros. The latter is intended for newer errata that
+ + * have an OSVW id assigned, which it takes as first argument. Both take a
+ + * variable number of family-specific model-stepping ranges created by
+ + * AMD_MODEL_RANGE().
+ + *
+ + * Example:
+ + *
+ + * const int amd_erratum_319[] =
+ + *	AMD_LEGACY_ERRATUM(AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0x4, 0x2),
+ + *			   AMD_MODEL_RANGE(0x10, 0x8, 0x0, 0x8, 0x0),
+ + *			   AMD_MODEL_RANGE(0x10, 0x9, 0x0, 0x9, 0x0));
+ + */
+  
+ -static unsigned int amd_msr_dr_addr_masks[] = {
+ -	MSR_F16H_DR0_ADDR_MASK,
+ -	MSR_F16H_DR1_ADDR_MASK,
+ -	MSR_F16H_DR1_ADDR_MASK + 1,
+ -	MSR_F16H_DR1_ADDR_MASK + 2
+ -};
+ +#define AMD_LEGACY_ERRATUM(...)		{ -1, __VA_ARGS__, 0 }
+ +#define AMD_OSVW_ERRATUM(osvw_id, ...)	{ osvw_id, __VA_ARGS__, 0 }
+ +#define AMD_MODEL_RANGE(f, m_start, s_start, m_end, s_end) \
+ +	((f << 24) | (m_start << 16) | (s_start << 12) | (m_end << 4) | (s_end))
+ +#define AMD_MODEL_RANGE_FAMILY(range)	(((range) >> 24) & 0xff)
+ +#define AMD_MODEL_RANGE_START(range)	(((range) >> 12) & 0xfff)
+ +#define AMD_MODEL_RANGE_END(range)	((range) & 0xfff)
+  
+ -void amd_set_dr_addr_mask(unsigned long mask, unsigned int dr)
+ +static const int amd_erratum_400[] =
+ +	AMD_OSVW_ERRATUM(1, AMD_MODEL_RANGE(0xf, 0x41, 0x2, 0xff, 0xf),
+ +			    AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0xff, 0xf));
+ +
+ +static const int amd_erratum_383[] =
+ +	AMD_OSVW_ERRATUM(3, AMD_MODEL_RANGE(0x10, 0, 0, 0xff, 0xf));
+ +
+ +
+ +static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum)
+  {
+ -	int cpu = smp_processor_id();
+ +	int osvw_id = *erratum++;
+ +	u32 range;
+ +	u32 ms;
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_BPEXT))
+ -		return;
+ +	if (osvw_id >= 0 && osvw_id < 65536 &&
+ +	    cpu_has(cpu, X86_FEATURE_OSVW)) {
+ +		u64 osvw_len;
+  
+ -	if (WARN_ON_ONCE(dr >= ARRAY_SIZE(amd_msr_dr_addr_masks)))
+ -		return;
+ +		rdmsrl(MSR_AMD64_OSVW_ID_LENGTH, osvw_len);
+ +		if (osvw_id < osvw_len) {
+ +			u64 osvw_bits;
+  
+ -	if (per_cpu(amd_dr_addr_mask, cpu)[dr] == mask)
+ -		return;
+ +			rdmsrl(MSR_AMD64_OSVW_STATUS + (osvw_id >> 6),
+ +			    osvw_bits);
+ +			return osvw_bits & (1ULL << (osvw_id & 0x3f));
+ +		}
+ +	}
+ +
+ +	/* OSVW unavailable or ID unknown, match family-model-stepping range */
+ +	ms = (cpu->x86_model << 4) | cpu->x86_mask;
+ +	while ((range = *erratum++))
+ +		if ((cpu->x86 == AMD_MODEL_RANGE_FAMILY(range)) &&
+ +		    (ms >= AMD_MODEL_RANGE_START(range)) &&
+ +		    (ms <= AMD_MODEL_RANGE_END(range)))
+ +			return true;
+  
+ -	wrmsr(amd_msr_dr_addr_masks[dr], mask, 0);
+ -	per_cpu(amd_dr_addr_mask, cpu)[dr] = mask;
+ +	return false;
+  }
+  
+ -unsigned long amd_get_dr_addr_mask(unsigned int dr)
+ +void set_dr_addr_mask(unsigned long mask, int dr)
+  {
+ -	if (!cpu_feature_enabled(X86_FEATURE_BPEXT))
+ -		return 0;
+ -
+ -	if (WARN_ON_ONCE(dr >= ARRAY_SIZE(amd_msr_dr_addr_masks)))
+ -		return 0;
+ +	if (!cpu_has_bpext)
+ +		return;
+  
+ -	return per_cpu(amd_dr_addr_mask[dr], smp_processor_id());
+ +	switch (dr) {
+ +	case 0:
+ +		wrmsr(MSR_F16H_DR0_ADDR_MASK, mask, 0);
+ +		break;
+ +	case 1:
+ +	case 2:
+ +	case 3:
+ +		wrmsr(MSR_F16H_DR1_ADDR_MASK - 1 + dr, mask, 0);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(amd_get_dr_addr_mask);
++ 
++ u32 amd_get_highest_perf(void)
++ {
++ 	struct cpuinfo_x86 *c = &boot_cpu_data;
++ 
++ 	if (c->x86 == 0x17 && ((c->x86_model >= 0x30 && c->x86_model < 0x40) ||
++ 			       (c->x86_model >= 0x70 && c->x86_model < 0x80)))
++ 		return 166;
++ 
++ 	if (c->x86 == 0x19 && ((c->x86_model >= 0x20 && c->x86_model < 0x30) ||
++ 			       (c->x86_model >= 0x40 && c->x86_model < 0x70)))
++ 		return 166;
++ 
++ 	return 255;
++ }
++ EXPORT_SYMBOL_GPL(amd_get_highest_perf);
++ 
++ static void zenbleed_check_cpu(void *unused)
++ {
++ 	struct cpuinfo_x86 *c = &cpu_data(smp_processor_id());
++ 
++ 	zenbleed_check(c);
++ }
++ 
++ void amd_check_microcode(void)
++ {
++ 	on_each_cpu(zenbleed_check_cpu, NULL, 1);
++ }
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+diff --cc arch/x86/kernel/cpu/common.c
+index 2b156d5eaaea,0ba1067f4e5f..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -1899,63 -2248,131 +1899,69 @@@ void cpu_init(void
+  	if (is_uv_system())
+  		uv_cpu_init();
+  
+ -	load_fixmap_gdt(cpu);
+ +	WARN_ON((unsigned long) &t->x86_tss & ~PAGE_MASK);
+  }
+  
+ -#ifdef CONFIG_MICROCODE_LATE_LOADING
+ -/**
+ - * store_cpu_caps() - Store a snapshot of CPU capabilities
+ - * @curr_info: Pointer where to store it
+ - *
+ - * Returns: None
+ - */
+ -void store_cpu_caps(struct cpuinfo_x86 *curr_info)
+ +#else
+ +
+ +void cpu_init(void)
+  {
+ -	/* Reload CPUID max function as it might've changed. */
+ -	curr_info->cpuid_level = cpuid_eax(0);
+ +	int cpu = smp_processor_id();
+ +	struct task_struct *curr = current;
+ +	struct tss_struct *t = &per_cpu(init_tss, cpu);
+ +	struct thread_struct *thread = &curr->thread;
+  
+ -	/* Copy all capability leafs and pick up the synthetic ones. */
+ -	memcpy(&curr_info->x86_capability, &boot_cpu_data.x86_capability,
+ -	       sizeof(curr_info->x86_capability));
+ +	wait_for_master_cpu(cpu);
+  
+ -	/* Get the hardware CPUID leafs */
+ -	get_cpu_cap(curr_info);
+ -}
+ +	show_ucode_info_early();
+  
+ -/**
+ - * microcode_check() - Check if any CPU capabilities changed after an update.
+ - * @prev_info:	CPU capabilities stored before an update.
+ - *
+ - * The microcode loader calls this upon late microcode load to recheck features,
+ - * only when microcode has been updated. Caller holds microcode_mutex and CPU
+ - * hotplug lock.
+ - *
+ - * Return: None
+ - */
+ -void microcode_check(struct cpuinfo_x86 *prev_info)
+ -{
+ -	struct cpuinfo_x86 curr_info;
+ +	printk(KERN_INFO "Initializing CPU#%d\n", cpu);
+  
+ -	perf_check_microcode();
+ +	if (cpu_feature_enabled(X86_FEATURE_VME) || cpu_has_tsc || cpu_has_de)
+ +		clear_in_cr4(X86_CR4_VME|X86_CR4_PVI|X86_CR4_TSD|X86_CR4_DE);
+  
+++<<<<<<< HEAD
+ +	load_current_idt();
+ +	switch_to_new_gdt(cpu);
+++=======
++ 	amd_check_microcode();
++ 
++ 	store_cpu_caps(&curr_info);
+ -
+ -	if (!memcmp(&prev_info->x86_capability, &curr_info.x86_capability,
+ -		    sizeof(prev_info->x86_capability)))
+ -		return;
+ -
+ -	pr_warn("x86/CPU: CPU features have changed after loading microcode, but might not take effect.\n");
+ -	pr_warn("x86/CPU: Please consider either early loading through initrd/built-in or a potential BIOS update.\n");
+ -}
+ -#endif
+ -
+ -/*
+ - * Invoked from core CPU hotplug code after hotplug operations
+ - */
+ -void arch_smt_update(void)
+ -{
+ -	/* Handle the speculative execution misfeatures */
+ -	cpu_bugs_smt_update();
+ -	/* Check whether IPI broadcasting can be enabled */
+ -	apic_smt_update();
+ -}
+ -
+ -void __init arch_cpu_finalize_init(void)
+ -{
+ -	identify_boot_cpu();
+++>>>>>>> 522b1d69219d (x86/cpu/amd: Add a Zenbleed fix)
+  
+  	/*
+ -	 * identify_boot_cpu() initialized SMT support information, let the
+ -	 * core code know.
+ +	 * Set up and load the per-CPU TSS and LDT
+  	 */
+ -	cpu_smt_check_topology();
+ -
+ -	if (!IS_ENABLED(CONFIG_SMP)) {
+ -		pr_info("CPU: ");
+ -		print_cpu_info(&boot_cpu_data);
+ -	}
+ -
+ -	cpu_select_mitigations();
+ -
+ -	arch_smt_update();
+ +	atomic_inc(&init_mm.mm_count);
+ +	curr->active_mm = &init_mm;
+ +	BUG_ON(curr->mm);
+ +	enter_lazy_tlb(&init_mm, curr);
+  
+ -	if (IS_ENABLED(CONFIG_X86_32)) {
+ -		/*
+ -		 * Check whether this is a real i386 which is not longer
+ -		 * supported and fixup the utsname.
+ -		 */
+ -		if (boot_cpu_data.x86 < 4)
+ -			panic("Kernel requires i486+ for 'invlpg' and other features");
+ +	load_sp0(t, thread);
+ +	set_tss_desc(cpu, t);
+ +	load_TR_desc();
+ +	load_mm_ldt(&init_mm);
+  
+ -		init_utsname()->machine[1] =
+ -			'0' + (boot_cpu_data.x86 > 6 ? 6 : boot_cpu_data.x86);
+ -	}
+ +	t->x86_tss.io_bitmap_base = offsetof(struct tss_struct, io_bitmap);
+  
+ -	/*
+ -	 * Must be before alternatives because it might set or clear
+ -	 * feature bits.
+ -	 */
+ -	fpu__init_system();
+ -	fpu__init_cpu();
+ +#ifdef CONFIG_DOUBLEFAULT
+ +	/* Set up doublefault TSS pointer in the GDT */
+ +	__set_tss_desc(cpu, GDT_ENTRY_DOUBLEFAULT_TSS, &doublefault_tss);
+ +#endif
+  
+ -	alternative_instructions();
+ +	clear_all_debug_regs();
+ +	dbg_restore_debug_regs();
+  
+ -	if (IS_ENABLED(CONFIG_X86_64)) {
+ -		/*
+ -		 * Make sure the first 2MB area is not mapped by huge pages
+ -		 * There are typically fixed size MTRRs in there and overlapping
+ -		 * MTRRs into large pages causes slow downs.
+ -		 *
+ -		 * Right now we don't do that with gbpages because there seems
+ -		 * very little benefit for that case.
+ -		 */
+ -		if (!direct_gbpages)
+ -			set_memory_4k((unsigned long)__va(0), 1);
+ -	} else {
+ -		fpu__init_check_bugs();
+ -	}
+ +	fpu_init();
+ +}
+ +#endif
+  
+ -	/*
+ -	 * This needs to be called before any devices perform DMA
+ -	 * operations that might use the SWIOTLB bounce buffers. It will
+ -	 * mark the bounce buffers as decrypted so that their usage will
+ -	 * not cause "plain-text" data to be decrypted when accessed. It
+ -	 * must be called after late_time_init() so that Hyper-V x86/x64
+ -	 * hypercalls work when the SWIOTLB bounce buffers are decrypted.
+ -	 */
+ -	mem_encrypt_init();
+ +/*
+ + * The microcode loader calls this upon late microcode load to recheck features,
+ + * only when microcode has been updated. Caller holds microcode_mutex and CPU
+ + * hotplug lock.
+ + */
+ +void microcode_check(void)
+ +{
+ +	perf_check_microcode();
+  }
+diff --git a/arch/x86/include/asm/microcode.h b/arch/x86/include/asm/microcode.h
+index a4ae5260f1f8..bb1deda13536 100644
+--- a/arch/x86/include/asm/microcode.h
++++ b/arch/x86/include/asm/microcode.h
+@@ -4,6 +4,7 @@
+ #include <asm/cpu.h>
+ #include <linux/earlycpio.h>
+ #include <linux/initrd.h>
++#include <asm/microcode_amd.h>
+ 
+ #define native_rdmsr(msr, val1, val2)			\
+ do {							\
+* Unmerged path arch/x86/include/asm/microcode_amd.h
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/kernel/cpu/amd.c
+* Unmerged path arch/x86/kernel/cpu/common.c
