@@ -1,0 +1,355 @@
+fsnotify: remove redundant arguments to handle_event()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 5b0457ad021f3f7e3d9f4b84e7c3080748f383f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5b0457ad.failed
+
+inode_mark and vfsmount_mark arguments are passed to handle_event()
+operation as function arguments as well as on iter_info struct.
+The difference is that iter_info struct may contain marks that should
+not be handled and are represented as NULL arguments to inode_mark or
+vfsmount_mark.
+
+Instead of passing the inode_mark and vfsmount_mark arguments, add
+a report_mask member to iter_info struct to indicate which marks should
+be handled, versus marks that should only be kept alive during user
+wait.
+
+This change is going to be used for passing more mark types
+with handle_event() (i.e. super block marks).
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 5b0457ad021f3f7e3d9f4b84e7c3080748f383f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fsnotify_backend.h
+diff --cc include/linux/fsnotify_backend.h
+index 68286d820069,9da5edf4ac0f..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -200,6 -199,35 +198,38 @@@ struct fsnotify_group 
+  #define FSNOTIFY_EVENT_PATH	1
+  #define FSNOTIFY_EVENT_INODE	2
+  
+++<<<<<<< HEAD
+++=======
++ enum fsnotify_obj_type {
++ 	FSNOTIFY_OBJ_TYPE_INODE,
++ 	FSNOTIFY_OBJ_TYPE_VFSMOUNT,
++ 	FSNOTIFY_OBJ_TYPE_COUNT,
++ 	FSNOTIFY_OBJ_TYPE_DETACHED = FSNOTIFY_OBJ_TYPE_COUNT
++ };
++ 
++ #define FSNOTIFY_OBJ_TYPE_INODE_FL	(1U << FSNOTIFY_OBJ_TYPE_INODE)
++ #define FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL	(1U << FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ #define FSNOTIFY_OBJ_ALL_TYPES_MASK	((1U << FSNOTIFY_OBJ_TYPE_COUNT) - 1)
++ 
++ struct fsnotify_iter_info {
++ 	struct fsnotify_mark *inode_mark;
++ 	struct fsnotify_mark *vfsmount_mark;
++ 	unsigned int report_mask;
++ 	int srcu_idx;
++ };
++ 
++ #define FSNOTIFY_ITER_FUNCS(name, NAME) \
++ static inline struct fsnotify_mark *fsnotify_iter_##name##_mark( \
++ 		struct fsnotify_iter_info *iter_info) \
++ { \
++ 	return (iter_info->report_mask & FSNOTIFY_OBJ_TYPE_##NAME##_FL) ? \
++ 		iter_info->name##_mark : NULL; \
++ }
++ 
++ FSNOTIFY_ITER_FUNCS(inode, INODE)
++ FSNOTIFY_ITER_FUNCS(vfsmount, VFSMOUNT)
++ 
+++>>>>>>> 5b0457ad021f (fsnotify: remove redundant arguments to handle_event())
+  /*
+   * Inode / vfsmount point to this structure which tracks all marks attached to
+   * the inode / vfsmount. The reference to inode / vfsmount is held by this
+diff --git a/fs/notify/dnotify/dnotify.c b/fs/notify/dnotify/dnotify.c
+index 743564da4656..26b9a0faead3 100644
+--- a/fs/notify/dnotify/dnotify.c
++++ b/fs/notify/dnotify/dnotify.c
+@@ -79,12 +79,11 @@ static void dnotify_recalc_inode_mask(struct fsnotify_mark *fsn_mark)
+  */
+ static int dnotify_handle_event(struct fsnotify_group *group,
+ 				struct inode *inode,
+-				struct fsnotify_mark *inode_mark,
+-				struct fsnotify_mark *vfsmount_mark,
+ 				u32 mask, const void *data, int data_type,
+ 				const unsigned char *file_name, u32 cookie,
+ 				struct fsnotify_iter_info *iter_info)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
+ 	struct dnotify_mark *dn_mark;
+ 	struct dnotify_struct *dn;
+ 	struct dnotify_struct **prev;
+@@ -95,7 +94,8 @@ static int dnotify_handle_event(struct fsnotify_group *group,
+ 	if (!S_ISDIR(inode->i_mode))
+ 		return 0;
+ 
+-	BUG_ON(vfsmount_mark);
++	if (WARN_ON(fsnotify_iter_vfsmount_mark(iter_info)))
++		return 0;
+ 
+ 	dn_mark = container_of(inode_mark, struct dnotify_mark, fsn_mark);
+ 
+diff --git a/fs/notify/fanotify/fanotify.c b/fs/notify/fanotify/fanotify.c
+index 7b7b7e9ce6ed..a0d761cde9e0 100644
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@ -89,11 +89,12 @@ static int fanotify_get_response(struct fsnotify_group *group,
+ }
+ #endif
+ 
+-static bool fanotify_should_send_event(struct fsnotify_mark *inode_mark,
+-				       struct fsnotify_mark *vfsmnt_mark,
+-				       u32 event_mask,
+-				       const void *data, int data_type)
++static bool fanotify_should_send_event(struct fsnotify_iter_info *iter_info,
++				       u32 event_mask, const void *data,
++				       int data_type)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
++	struct fsnotify_mark *vfsmnt_mark = fsnotify_iter_vfsmount_mark(iter_info);
+ 	__u32 marks_mask = 0, marks_ignored_mask = 0;
+ 	const struct path *path = data;
+ 
+@@ -173,8 +174,6 @@ init: __maybe_unused
+ 
+ static int fanotify_handle_event(struct fsnotify_group *group,
+ 				 struct inode *inode,
+-				 struct fsnotify_mark *inode_mark,
+-				 struct fsnotify_mark *fanotify_mark,
+ 				 u32 mask, const void *data, int data_type,
+ 				 const unsigned char *file_name, u32 cookie,
+ 				 struct fsnotify_iter_info *iter_info)
+@@ -194,8 +193,7 @@ static int fanotify_handle_event(struct fsnotify_group *group,
+ 	BUILD_BUG_ON(FAN_ACCESS_PERM != FS_ACCESS_PERM);
+ 	BUILD_BUG_ON(FAN_ONDIR != FS_ISDIR);
+ 
+-	if (!fanotify_should_send_event(inode_mark, fanotify_mark, mask, data,
+-					data_type))
++	if (!fanotify_should_send_event(iter_info, mask, data, data_type))
+ 		return 0;
+ 
+ 	pr_debug("%s: group=%p inode=%p mask=%x\n", __func__, group, inode,
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 0a2346cb87c4..4ab0585db3fe 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -184,22 +184,20 @@ int __fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask
+ EXPORT_SYMBOL_GPL(__fsnotify_parent);
+ 
+ static int send_to_group(struct inode *to_tell,
+-			 struct fsnotify_mark *inode_mark,
+-			 struct fsnotify_mark *vfsmount_mark,
+ 			 __u32 mask, const void *data,
+ 			 int data_is, u32 cookie,
+ 			 const unsigned char *file_name,
+ 			 struct fsnotify_iter_info *iter_info)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
++	struct fsnotify_mark *vfsmount_mark = fsnotify_iter_vfsmount_mark(iter_info);
+ 	struct fsnotify_group *group = NULL;
+ 	__u32 test_mask = (mask & ~FS_EVENT_ON_CHILD);
+ 	__u32 marks_mask = 0;
+ 	__u32 marks_ignored_mask = 0;
+ 
+-	if (unlikely(!inode_mark && !vfsmount_mark)) {
+-		BUG();
++	if (WARN_ON(!iter_info->report_mask))
+ 		return 0;
+-	}
+ 
+ 	/* clear ignored on inode modification */
+ 	if (mask & FS_MODIFY) {
+@@ -235,8 +233,7 @@ static int send_to_group(struct inode *to_tell,
+ 	if (!(test_mask & marks_mask & ~marks_ignored_mask))
+ 		return 0;
+ 
+-	return group->ops->handle_event(group, to_tell, inode_mark,
+-					vfsmount_mark, mask, data, data_is,
++	return group->ops->handle_event(group, to_tell, mask, data, data_is,
+ 					file_name, cookie, iter_info);
+ }
+ 
+@@ -327,27 +324,32 @@ int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+ 	while (iter_info.inode_mark || iter_info.vfsmount_mark) {
+ 		struct fsnotify_mark *inode_mark = iter_info.inode_mark;
+ 		struct fsnotify_mark *vfsmount_mark = iter_info.vfsmount_mark;
++		int cmp;
+ 
+ 		if (inode_mark && vfsmount_mark) {
+-			int cmp = fsnotify_compare_groups(inode_mark->group,
+-							  vfsmount_mark->group);
+-			if (cmp > 0)
+-				inode_mark = NULL;
+-			else if (cmp < 0)
+-				vfsmount_mark = NULL;
++			cmp = fsnotify_compare_groups(inode_mark->group,
++						      vfsmount_mark->group);
++		} else {
++			cmp = inode_mark ? -1 : 1;
+ 		}
+ 
+-		ret = send_to_group(to_tell, inode_mark, vfsmount_mark, mask,
+-				    data, data_is, cookie, file_name,
+-				    &iter_info);
++		iter_info.report_mask = 0;
++		if (cmp <= 0)
++			iter_info.report_mask |= FSNOTIFY_OBJ_TYPE_INODE_FL;
++		if (cmp >= 0)
++			iter_info.report_mask |= FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL;
++
++		ret = send_to_group(to_tell, mask, data, data_is, cookie,
++				    file_name, &iter_info);
+ 
+ 		if (ret && (mask & ALL_FSNOTIFY_PERM_EVENTS))
+ 			goto out;
+ 
+-		if (inode_mark)
++		if (iter_info.report_mask & FSNOTIFY_OBJ_TYPE_INODE_FL)
+ 			iter_info.inode_mark =
+ 				fsnotify_next_mark(iter_info.inode_mark);
+-		if (vfsmount_mark)
++
++		if (iter_info.report_mask & FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL)
+ 			iter_info.vfsmount_mark =
+ 				fsnotify_next_mark(iter_info.vfsmount_mark);
+ 	}
+diff --git a/fs/notify/fsnotify.h b/fs/notify/fsnotify.h
+index bf012e8ecd14..15f224fac669 100644
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@ -8,12 +8,6 @@
+ 
+ #include "../mount.h"
+ 
+-struct fsnotify_iter_info {
+-	struct fsnotify_mark *inode_mark;
+-	struct fsnotify_mark *vfsmount_mark;
+-	int srcu_idx;
+-};
+-
+ /* destroy all events sitting in this groups notification queue */
+ extern void fsnotify_flush_notify(struct fsnotify_group *group);
+ 
+diff --git a/fs/notify/inotify/inotify.h b/fs/notify/inotify/inotify.h
+index 29bbd7a5c57c..582296665adf 100644
+--- a/fs/notify/inotify/inotify.h
++++ b/fs/notify/inotify/inotify.h
+@@ -24,8 +24,6 @@ extern void inotify_ignored_and_remove_idr(struct fsnotify_mark *fsn_mark,
+ 					   struct fsnotify_group *group);
+ extern int inotify_handle_event(struct fsnotify_group *group,
+ 				struct inode *inode,
+-				struct fsnotify_mark *inode_mark,
+-				struct fsnotify_mark *vfsmount_mark,
+ 				u32 mask, const void *data, int data_type,
+ 				const unsigned char *file_name, u32 cookie,
+ 				struct fsnotify_iter_info *iter_info);
+diff --git a/fs/notify/inotify/inotify_fsnotify.c b/fs/notify/inotify/inotify_fsnotify.c
+index 5bfd473c4669..d82076b9d7ca 100644
+--- a/fs/notify/inotify/inotify_fsnotify.c
++++ b/fs/notify/inotify/inotify_fsnotify.c
+@@ -64,12 +64,11 @@ static int inotify_merge(struct list_head *list,
+ 
+ int inotify_handle_event(struct fsnotify_group *group,
+ 			 struct inode *inode,
+-			 struct fsnotify_mark *inode_mark,
+-			 struct fsnotify_mark *vfsmount_mark,
+ 			 u32 mask, const void *data, int data_type,
+ 			 const unsigned char *file_name, u32 cookie,
+ 			 struct fsnotify_iter_info *iter_info)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
+ 	struct inotify_inode_mark *i_mark;
+ 	struct inotify_event_info *event;
+ 	struct fsnotify_event *fsn_event;
+@@ -77,7 +76,8 @@ int inotify_handle_event(struct fsnotify_group *group,
+ 	int len = 0;
+ 	int alloc_len = sizeof(struct inotify_event_info);
+ 
+-	BUG_ON(vfsmount_mark);
++	if (WARN_ON(fsnotify_iter_vfsmount_mark(iter_info)))
++		return 0;
+ 
+ 	if ((inode_mark->mask & FS_EXCL_UNLINK) &&
+ 	    (data_type == FSNOTIFY_EVENT_PATH)) {
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 9b45f7086122..7e59920e2390 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -473,10 +473,14 @@ void inotify_ignored_and_remove_idr(struct fsnotify_mark *fsn_mark,
+ 				    struct fsnotify_group *group)
+ {
+ 	struct inotify_inode_mark *i_mark;
++	struct fsnotify_iter_info iter_info = {
++		.inode_mark = fsn_mark,
++		.report_mask = FSNOTIFY_OBJ_TYPE_INODE_FL,
++	};
+ 
+ 	/* Queue ignore event for the watch */
+-	inotify_handle_event(group, NULL, fsn_mark, NULL, FS_IN_IGNORED,
+-			     NULL, FSNOTIFY_EVENT_NONE, NULL, 0, NULL);
++	inotify_handle_event(group, NULL, FS_IN_IGNORED, NULL,
++			     FSNOTIFY_EVENT_NONE, NULL, 0, &iter_info);
+ 
+ 	i_mark = container_of(fsn_mark, struct inotify_inode_mark, fsn_mark);
+ 	/* remove this mark from the idr */
+* Unmerged path include/linux/fsnotify_backend.h
+diff --git a/kernel/audit_fsnotify.c b/kernel/audit_fsnotify.c
+index c945bcd6d10c..908e7b53b236 100644
+--- a/kernel/audit_fsnotify.c
++++ b/kernel/audit_fsnotify.c
+@@ -165,12 +165,11 @@ static void audit_autoremove_mark_rule(struct audit_fsnotify_mark *audit_mark)
+ /* Update mark data in audit rules based on fsnotify events. */
+ static int audit_mark_handle_event(struct fsnotify_group *group,
+ 				    struct inode *to_tell,
+-				    struct fsnotify_mark *inode_mark,
+-				    struct fsnotify_mark *vfsmount_mark,
+ 				    u32 mask, const void *data, int data_type,
+ 				    const unsigned char *dname, u32 cookie,
+ 				    struct fsnotify_iter_info *iter_info)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
+ 	struct audit_fsnotify_mark *audit_mark;
+ 	const struct inode *inode = NULL;
+ 
+diff --git a/kernel/audit_tree.c b/kernel/audit_tree.c
+index 3b994bb0637d..e75c8801d416 100644
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@ -957,8 +957,6 @@ static void evict_chunk(struct audit_chunk *chunk)
+ 
+ static int audit_tree_handle_event(struct fsnotify_group *group,
+ 				   struct inode *to_tell,
+-				   struct fsnotify_mark *inode_mark,
+-				   struct fsnotify_mark *vfsmount_mark,
+ 				   u32 mask, const void *data, int data_type,
+ 				   const unsigned char *file_name, u32 cookie,
+ 				   struct fsnotify_iter_info *iter_info)
+diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
+index a45ae99d0416..7357187cbdf4 100644
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@ -471,12 +471,11 @@ void audit_remove_watch_rule(struct audit_krule *krule)
+ /* Update watch data in audit rules based on fsnotify events. */
+ static int audit_watch_handle_event(struct fsnotify_group *group,
+ 				    struct inode *to_tell,
+-				    struct fsnotify_mark *inode_mark,
+-				    struct fsnotify_mark *vfsmount_mark,
+ 				    u32 mask, const void *data, int data_type,
+ 				    const unsigned char *dname, u32 cookie,
+ 				    struct fsnotify_iter_info *iter_info)
+ {
++	struct fsnotify_mark *inode_mark = fsnotify_iter_inode_mark(iter_info);
+ 	const struct inode *inode;
+ 	struct audit_parent *parent;
+ 
