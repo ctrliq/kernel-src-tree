@@ -32,6 +32,7 @@
 extern int verbose;
 
 static char *dir;
+static bool ready;
 
 void test_attr__init(void)
 {
@@ -62,6 +63,9 @@ static int store_event(struct perf_event_attr *attr, pid_t pid, int cpu,
 {
 	FILE *file;
 	char path[PATH_MAX];
+
+	if (!ready)
+		return 0;
 
 	snprintf(path, PATH_MAX, "%s/event-%d-%llu-%d", dir,
 		 attr->type, attr->config, fd);
@@ -136,6 +140,12 @@ void test_attr__open(struct perf_event_attr *attr, pid_t pid, int cpu,
 		die("test attr FAILED");
 
 	errno = errno_saved;
+}
+
+void test_attr__ready(void)
+{
+	if (unlikely(test_attr__enabled) && !ready)
+		ready = true;
 }
 
 static int run_dir(const char *d, const char *perf)
