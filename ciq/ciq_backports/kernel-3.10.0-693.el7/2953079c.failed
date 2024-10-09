@@ -1,0 +1,883 @@
+md: separate flags for superblock changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] separate flags for superblock changes (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 94.87%
+commit-author Shaohua Li <shli@fb.com>
+commit 2953079c692da067aeb6345659875b97378f9b0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2953079c.failed
+
+The mddev->flags are used for different purposes. There are a lot of
+places we check/change the flags without masking unrelated flags, we
+could check/change unrelated flags. These usage are most for superblock
+write, so spearate superblock related flags. This should make the code
+clearer and also fix real bugs.
+
+	Reviewed-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 2953079c692da067aeb6345659875b97378f9b0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+#	drivers/md/multipath.c
+#	drivers/md/raid1.c
+#	drivers/md/raid10.c
+#	drivers/md/raid5-cache.c
+#	drivers/md/raid5.c
+diff --cc drivers/md/md.c
+index efc1b3243366,c15e2344e7c8..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -722,12 -724,16 +722,22 @@@ static void super_written(struct bio *b
+  	struct md_rdev *rdev = bio->bi_private;
+  	struct mddev *mddev = rdev->mddev;
+  
+ -	if (bio->bi_error) {
+ -		pr_err("md: super_written gets error=%d\n", bio->bi_error);
+ +	if (error || !test_bit(BIO_UPTODATE, &bio->bi_flags)) {
+ +		printk("md: super_written gets error=%d, uptodate=%d\n",
+ +		       error, test_bit(BIO_UPTODATE, &bio->bi_flags));
+ +		WARN_ON(test_bit(BIO_UPTODATE, &bio->bi_flags));
+  		md_error(mddev, rdev);
+++<<<<<<< HEAD
+ +	}
+++=======
++ 		if (!test_bit(Faulty, &rdev->flags)
++ 		    && (bio->bi_opf & MD_FAILFAST)) {
++ 			set_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags);
++ 			set_bit(LastDev, &rdev->flags);
++ 		}
++ 	} else
++ 		clear_bit(LastDev, &rdev->flags);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  
+  	if (atomic_dec_and_test(&mddev->pending_writes))
+  		wake_up(&mddev->sb_wait);
+@@@ -762,6 -780,9 +772,12 @@@ void md_super_wait(struct mddev *mddev
+  {
+  	/* wait for all superblock writes that were scheduled to complete */
+  	wait_event(mddev->sb_wait, atomic_read(&mddev->pending_writes)==0);
+++<<<<<<< HEAD
+++=======
++ 	if (test_and_clear_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags))
++ 		return -EAGAIN;
++ 	return 0;
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  }
+  
+  int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
+@@@ -2257,10 -2321,29 +2273,30 @@@ void md_update_sb(struct mddev *mddev, 
+  
+  	if (mddev->ro) {
+  		if (force_change)
+- 			set_bit(MD_CHANGE_DEVS, &mddev->flags);
++ 			set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+  		return;
+  	}
+ -
+  repeat:
+++<<<<<<< HEAD
+++=======
++ 	if (mddev_is_clustered(mddev)) {
++ 		if (test_and_clear_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags))
++ 			force_change = 1;
++ 		if (test_and_clear_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags))
++ 			nospares = 1;
++ 		ret = md_cluster_ops->metadata_update_start(mddev);
++ 		/* Has someone else has updated the sb */
++ 		if (!does_sb_need_changing(mddev)) {
++ 			if (ret == 0)
++ 				md_cluster_ops->metadata_update_cancel(mddev);
++ 			bit_clear_unless(&mddev->sb_flags, BIT(MD_SB_CHANGE_PENDING),
++ 							 BIT(MD_SB_CHANGE_DEVS) |
++ 							 BIT(MD_SB_CHANGE_CLEAN));
++ 			return;
++ 		}
++ 	}
++ 
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	/* First make sure individual recovery_offsets are correct */
+  	rdev_for_each(rdev, mddev) {
+  		if (rdev->raid_disk >= 0 &&
+@@@ -2293,11 -2376,11 +2329,11 @@@
+  
+  	spin_lock(&mddev->lock);
+  
+ -	mddev->utime = ktime_get_real_seconds();
+ +	mddev->utime = get_seconds();
+  
+- 	if (test_and_clear_bit(MD_CHANGE_DEVS, &mddev->flags))
++ 	if (test_and_clear_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags))
+  		force_change = 1;
+- 	if (test_and_clear_bit(MD_CHANGE_CLEAN, &mddev->flags))
++ 	if (test_and_clear_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags))
+  		/* just a clean<-> dirty transition, possibly leave spares alone,
+  		 * though if events isn't the right even/odd, we will have to do
+  		 * spares after all
+@@@ -2384,18 -2470,18 +2420,29 @@@
+  			/* only need to write one superblock... */
+  			break;
+  	}
+++<<<<<<< HEAD
+ +	md_super_wait(mddev);
+ +	/* if there was a failure, MD_CHANGE_DEVS was set, and we re-write super */
+++=======
++ 	if (md_super_wait(mddev) < 0)
++ 		goto rewrite;
++ 	/* if there was a failure, MD_SB_CHANGE_DEVS was set, and we re-write super */
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  
+ -	if (mddev_is_clustered(mddev) && ret == 0)
+ -		md_cluster_ops->metadata_update_finish(mddev);
+ -
+ +	spin_lock(&mddev->lock);
+  	if (mddev->in_sync != sync_req ||
+++<<<<<<< HEAD
+ +	    test_bit(MD_CHANGE_DEVS, &mddev->flags)) {
+++=======
++ 	    !bit_clear_unless(&mddev->sb_flags, BIT(MD_SB_CHANGE_PENDING),
++ 			       BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_CLEAN)))
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  		/* have to write it out again */
+ +		spin_unlock(&mddev->lock);
+  		goto repeat;
+ +	}
+ +	clear_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +	spin_unlock(&mddev->lock);
+  	wake_up(&mddev->sb_wait);
+  	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+  		sysfs_notify(&mddev->kobj, NULL, "sync_completed");
+@@@ -2556,11 -2633,18 +2603,25 @@@ state_store(struct md_rdev *rdev, cons
+  			err = -EBUSY;
+  		else {
+  			struct mddev *mddev = rdev->mddev;
+ +			md_kick_rdev_from_array(rdev);
+ +			if (mddev->pers)
+ +				md_update_sb(mddev, 1);
+ +			md_new_event(mddev);
+  			err = 0;
+++<<<<<<< HEAD
+++=======
++ 			if (mddev_is_clustered(mddev))
++ 				err = md_cluster_ops->remove_disk(mddev, rdev);
++ 
++ 			if (err == 0) {
++ 				md_kick_rdev_from_array(rdev);
++ 				if (mddev->pers) {
++ 					set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++ 					md_wakeup_thread(mddev->thread);
++ 				}
++ 				md_new_event(mddev);
++ 			}
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  		}
+  	} else if (cmd_match(buf, "writemostly")) {
+  		set_bit(WriteMostly, &rdev->flags);
+@@@ -5414,9 -5525,11 +5476,14 @@@ static void __md_stop_writes(struct mdd
+  	bitmap_flush(mddev);
+  
+  	if (mddev->ro == 0 &&
+++<<<<<<< HEAD
+ +	    (!mddev->in_sync || (mddev->flags & MD_UPDATE_SB_FLAGS))) {
+++=======
++ 	    ((!mddev->in_sync && !mddev_is_clustered(mddev)) ||
++ 	     mddev->sb_flags)) {
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  		/* mark array as shutdown cleanly */
+ -		if (!mddev_is_clustered(mddev))
+ -			mddev->in_sync = 1;
+ +		mddev->in_sync = 1;
+  		md_update_sb(mddev, 1);
+  	}
+  }
+@@@ -6083,8 -6231,15 +6150,16 @@@ static int hot_remove_disk(struct mdde
+  		goto busy;
+  
+  kick_rdev:
+ -	if (mddev_is_clustered(mddev))
+ -		md_cluster_ops->remove_disk(mddev, rdev);
+ -
+  	md_kick_rdev_from_array(rdev);
+++<<<<<<< HEAD
+ +	md_update_sb(mddev, 1);
+++=======
++ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++ 	if (mddev->thread)
++ 		md_wakeup_thread(mddev->thread);
++ 	else
++ 		md_update_sb(mddev, 1);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	md_new_event(mddev);
+  
+  	return 0;
+@@@ -6152,8 -6304,9 +6227,14 @@@ static int hot_add_disk(struct mddev *m
+  
+  	rdev->raid_disk = -1;
+  
+++<<<<<<< HEAD
+ +	md_update_sb(mddev, 1);
+ +
+++=======
++ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++ 	if (!mddev->thread)
++ 		md_update_sb(mddev, 1);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	/*
+  	 * Kick recovery, maybe this spare has to be added to the
+  	 * array immediately.
+@@@ -7953,7 -8206,11 +8036,15 @@@ void md_do_sync(struct md_thread *threa
+  		}
+  	}
+   skip:
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+++=======
++ 	/* set CHANGE_PENDING here since maybe another update is needed,
++ 	 * so other nodes are informed. It should be harmless for normal
++ 	 * raid */
++ 	set_mask_bits(&mddev->sb_flags, 0,
++ 		      BIT(MD_SB_CHANGE_PENDING) | BIT(MD_SB_CHANGE_DEVS));
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  
+  	spin_lock(&mddev->lock);
+  	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery)) {
+@@@ -8107,9 -8388,10 +8198,9 @@@ void md_check_recovery(struct mddev *md
+  	if (mddev->ro && !test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))
+  		return;
+  	if ( ! (
+- 		(mddev->flags & MD_UPDATE_SB_FLAGS & ~ (1<<MD_CHANGE_PENDING)) ||
++ 		(mddev->sb_flags & ~ (1<<MD_SB_CHANGE_PENDING)) ||
+  		test_bit(MD_RECOVERY_NEEDED, &mddev->recovery) ||
+  		test_bit(MD_RECOVERY_DONE, &mddev->recovery) ||
+ -		test_bit(MD_RELOAD_SB, &mddev->flags) ||
+  		(mddev->external == 0 && mddev->safemode == 1) ||
+  		(mddev->safemode == 2 && ! atomic_read(&mddev->writes_pending)
+  		 && !mddev->in_sync && mddev->recovery_cp == MaxSector)
+@@@ -8277,6 -8574,11 +8368,14 @@@ void md_reap_sync_thread(struct mddev *
+  			rdev->saved_raid_disk = -1;
+  
+  	md_update_sb(mddev, 1);
+++<<<<<<< HEAD
+++=======
++ 	/* MD_SB_CHANGE_PENDING should be cleared by md_update_sb, so we can
++ 	 * call resync_finish here if MD_CLUSTER_RESYNC_LOCKED is set by
++ 	 * clustered raid */
++ 	if (test_and_clear_bit(MD_CLUSTER_RESYNC_LOCKED, &mddev->flags))
++ 		md_cluster_ops->resync_finish(mddev);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	clear_bit(MD_RECOVERY_RUNNING, &mddev->recovery);
+  	clear_bit(MD_RECOVERY_DONE, &mddev->recovery);
+  	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+@@@ -8333,9 -8636,12 +8432,14 @@@ int rdev_set_badblocks(struct md_rdev *
+  	rv = badblocks_set(&rdev->badblocks, s, sectors, 0);
+  	if (rv == 0) {
+  		/* Make sure they get written out promptly */
+ -		if (test_bit(ExternalBbl, &rdev->flags))
+ -			sysfs_notify(&rdev->kobj, NULL,
+ -				     "unacknowledged_bad_blocks");
+  		sysfs_notify_dirent_safe(rdev->sysfs_state);
+++<<<<<<< HEAD
+ +		set_bit(MD_CHANGE_CLEAN, &rdev->mddev->flags);
+ +		set_bit(MD_CHANGE_PENDING, &rdev->mddev->flags);
+++=======
++ 		set_mask_bits(&mddev->sb_flags, 0,
++ 			      BIT(MD_SB_CHANGE_CLEAN) | BIT(MD_SB_CHANGE_PENDING));
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  		md_wakeup_thread(rdev->mddev->thread);
+  		return 1;
+  	} else
+diff --cc drivers/md/md.h
+index 07747899ac17,e38936d05df1..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -182,7 -210,33 +182,35 @@@ extern int rdev_set_badblocks(struct md
+  			      int is_new);
+  extern int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
+  				int is_new);
+ -struct md_cluster_info;
+  
+++<<<<<<< HEAD
+++=======
++ enum mddev_flags {
++ 	MD_ARRAY_FIRST_USE,	/* First use of array, needs initialization */
++ 	MD_CLOSING,		/* If set, we are closing the array, do not open
++ 				 * it then */
++ 	MD_JOURNAL_CLEAN,	/* A raid with journal is already clean */
++ 	MD_HAS_JOURNAL,		/* The raid array has journal feature set */
++ 	MD_RELOAD_SB,		/* Reload the superblock because another node
++ 				 * updated it.
++ 				 */
++ 	MD_CLUSTER_RESYNC_LOCKED, /* cluster raid only, which means node
++ 				   * already took resync lock, need to
++ 				   * release the lock */
++ 	MD_FAILFAST_SUPPORTED,	/* Using MD_FAILFAST on metadata writes is
++ 				 * supported as calls to md_error() will
++ 				 * never cause the array to become failed.
++ 				 */
++ };
++ 
++ enum mddev_sb_flags {
++ 	MD_SB_CHANGE_DEVS,		/* Some device status has changed */
++ 	MD_SB_CHANGE_CLEAN,	/* transition to or from 'clean' */
++ 	MD_SB_CHANGE_PENDING,	/* switch from 'clean' to 'active' in progress */
++ 	MD_SB_NEED_REWRITE,	/* metadata write needs to be repeated */
++ };
++ 
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  struct mddev {
+  	void				*private;
+  	struct md_personality		*pers;
+@@@ -190,15 -244,7 +218,19 @@@
+  	int				md_minor;
+  	struct list_head		disks;
+  	unsigned long			flags;
+++<<<<<<< HEAD
+ +#define MD_CHANGE_DEVS	0	/* Some device status has changed */
+ +#define MD_CHANGE_CLEAN 1	/* transition to or from 'clean' */
+ +#define MD_CHANGE_PENDING 2	/* switch from 'clean' to 'active' in progress */
+ +#define MD_UPDATE_SB_FLAGS (1 | 2 | 4)	/* If these are set, md_update_sb needed */
+ +#define MD_ARRAY_FIRST_USE 3    /* First use of array, needs initialization */
+ +#define MD_CLOSING	4	/* If set, we are closing the array, do not open
+ +				 * it then */
+ +#define MD_JOURNAL_CLEAN 5	/* A raid with journal is already clean */
+ +#define MD_HAS_JOURNAL	6	/* The raid array has journal feature set */
+++=======
++ 	unsigned long			sb_flags;
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  
+  	int				suspended;
+  	atomic_t			active_io;
+diff --cc drivers/md/multipath.c
+index 2469a87c423b,9fa2d6c5d996..000000000000
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@@ -206,11 -208,9 +206,17 @@@ static void multipath_error (struct mdd
+  		spin_unlock_irqrestore(&conf->device_lock, flags);
+  	}
+  	set_bit(Faulty, &rdev->flags);
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +	printk(KERN_ALERT "multipath: IO failure on %s,"
+ +	       " disabling IO path.\n"
+ +	       "multipath: Operation continuing"
+ +	       " on %d IO paths.\n",
+++=======
++ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++ 	pr_err("multipath: IO failure on %s, disabling IO path.\n"
++ 	       "multipath: Operation continuing on %d IO paths.\n",
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	       bdevname(rdev->bdev, b),
+  	       conf->raid_disks - mddev->degraded);
+  }
+diff --cc drivers/md/raid1.c
+index e588c32492da,a1f3fbed9100..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1486,13 -1517,12 +1486,22 @@@ static void raid1_error(struct mddev *m
+  	 * if recovery is running, make sure it aborts.
+  	 */
+  	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +	set_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +	printk(KERN_ALERT
+ +	       "md/raid1:%s: Disk failure on %s, disabling device.\n"
+ +	       "md/raid1:%s: Operation continuing on %d devices.\n",
+ +	       mdname(mddev), bdevname(rdev->bdev, b),
+ +	       mdname(mddev), conf->raid_disks - mddev->degraded);
+++=======
++ 	set_mask_bits(&mddev->sb_flags, 0,
++ 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
++ 	pr_crit("md/raid1:%s: Disk failure on %s, disabling device.\n"
++ 		"md/raid1:%s: Operation continuing on %d devices.\n",
++ 		mdname(mddev), bdevname(rdev->bdev, b),
++ 		mdname(mddev), conf->raid_disks - mddev->degraded);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  }
+  
+  static void print_conf(struct r1conf *conf)
+diff --cc drivers/md/raid10.c
+index 9848c5d0edf0,ab5e86209322..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -1235,17 -1132,18 +1235,22 @@@ static void raid10_make_request(struct 
+  	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+  	    bio_data_dir(bio) == WRITE &&
+  	    (mddev->reshape_backwards
+ -	     ? (bio->bi_iter.bi_sector < conf->reshape_safe &&
+ -		bio->bi_iter.bi_sector + sectors > conf->reshape_progress)
+ -	     : (bio->bi_iter.bi_sector + sectors > conf->reshape_safe &&
+ -		bio->bi_iter.bi_sector < conf->reshape_progress))) {
+ +	     ? (bio->bi_sector < conf->reshape_safe &&
+ +		bio->bi_sector + sectors > conf->reshape_progress)
+ +	     : (bio->bi_sector + sectors > conf->reshape_safe &&
+ +		bio->bi_sector < conf->reshape_progress))) {
+  		/* Need to update reshape_position in metadata */
+  		mddev->reshape_position = conf->reshape_progress;
+++<<<<<<< HEAD
+ +		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +		set_bit(MD_CHANGE_PENDING, &mddev->flags);
+++=======
++ 		set_mask_bits(&mddev->sb_flags, 0,
++ 			      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  		md_wakeup_thread(mddev->thread);
+ -		raid10_log(conf->mddev, "wait reshape metadata");
+  		wait_event(mddev->sb_wait,
+- 			   !test_bit(MD_CHANGE_PENDING, &mddev->flags));
++ 			   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
+  
+  		conf->reshape_safe = mddev->reshape_position;
+  	}
+@@@ -1693,8 -1652,8 +1698,13 @@@ static void raid10_error(struct mddev *
+  	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+  	set_bit(Blocked, &rdev->flags);
+  	set_bit(Faulty, &rdev->flags);
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +	set_bit(MD_CHANGE_PENDING, &mddev->flags);
+++=======
++ 	set_mask_bits(&mddev->sb_flags, 0,
++ 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  	spin_unlock_irqrestore(&conf->device_lock, flags);
+  	pr_crit("md/raid10:%s: Disk failure on %s, disabling device.\n"
+  		"md/raid10:%s: Operation continuing on %d devices.\n",
+diff --cc drivers/md/raid5-cache.c
+index c6ed6dc6889f,6d1a150eacd6..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -703,31 -1196,22 +703,40 @@@ static void r5l_write_super_and_discard
+  
+  	mddev = log->rdev->mddev;
+  	/*
+ -	 * Discard could zero data, so before discard we must make sure
+ -	 * superblock is updated to new log tail. Updating superblock (either
+ -	 * directly call md_update_sb() or depend on md thread) must hold
+ -	 * reconfig mutex. On the other hand, raid5_quiesce is called with
+ -	 * reconfig_mutex hold. The first step of raid5_quiesce() is waitting
+ -	 * for all IO finish, hence waitting for reclaim thread, while reclaim
+ -	 * thread is calling this function and waitting for reconfig mutex. So
+ -	 * there is a deadlock. We workaround this issue with a trylock.
+ -	 * FIXME: we could miss discard if we can't take reconfig mutex
+ +	 * This is to avoid a deadlock. r5l_quiesce holds reconfig_mutex and
+ +	 * wait for this thread to finish. This thread waits for
+ +	 * MD_CHANGE_PENDING clear, which is supposed to be done in
+ +	 * md_check_recovery(). md_check_recovery() tries to get
+ +	 * reconfig_mutex. Since r5l_quiesce already holds the mutex,
+ +	 * md_check_recovery() fails, so the PENDING never get cleared. The
+ +	 * in_teardown check workaround this issue.
+  	 */
+++<<<<<<< HEAD
+ +	if (!log->in_teardown) {
+ +		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +		set_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +		md_wakeup_thread(mddev->thread);
+ +		wait_event(mddev->sb_wait,
+ +			!test_bit(MD_CHANGE_PENDING, &mddev->flags) ||
+ +			log->in_teardown);
+ +		/*
+ +		 * r5l_quiesce could run after in_teardown check and hold
+ +		 * mutex first. Superblock might get updated twice.
+ +		 */
+ +		if (log->in_teardown)
+ +			md_update_sb(mddev, 1);
+ +	} else {
+ +		WARN_ON(!mddev_is_locked(mddev));
+ +		md_update_sb(mddev, 1);
+ +	}
+++=======
++ 	set_mask_bits(&mddev->sb_flags, 0,
++ 		BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
++ 	if (!mddev_trylock(mddev))
++ 		return;
++ 	md_update_sb(mddev, 1);
++ 	mddev_unlock(mddev);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  
+  	/* discard IO error really doesn't matter, ignore it */
+  	if (log->last_checkpoint < end) {
+@@@ -1719,9 -2197,295 +1728,9 @@@ static void r5l_write_super(struct r5l_
+  	struct mddev *mddev = log->rdev->mddev;
+  
+  	log->rdev->journal_tail = cp;
+- 	set_bit(MD_CHANGE_DEVS, &mddev->flags);
++ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+  }
+  
+ -static ssize_t r5c_journal_mode_show(struct mddev *mddev, char *page)
+ -{
+ -	struct r5conf *conf = mddev->private;
+ -	int ret;
+ -
+ -	if (!conf->log)
+ -		return 0;
+ -
+ -	switch (conf->log->r5c_journal_mode) {
+ -	case R5C_JOURNAL_MODE_WRITE_THROUGH:
+ -		ret = snprintf(
+ -			page, PAGE_SIZE, "[%s] %s\n",
+ -			r5c_journal_mode_str[R5C_JOURNAL_MODE_WRITE_THROUGH],
+ -			r5c_journal_mode_str[R5C_JOURNAL_MODE_WRITE_BACK]);
+ -		break;
+ -	case R5C_JOURNAL_MODE_WRITE_BACK:
+ -		ret = snprintf(
+ -			page, PAGE_SIZE, "%s [%s]\n",
+ -			r5c_journal_mode_str[R5C_JOURNAL_MODE_WRITE_THROUGH],
+ -			r5c_journal_mode_str[R5C_JOURNAL_MODE_WRITE_BACK]);
+ -		break;
+ -	default:
+ -		ret = 0;
+ -	}
+ -	return ret;
+ -}
+ -
+ -static ssize_t r5c_journal_mode_store(struct mddev *mddev,
+ -				      const char *page, size_t length)
+ -{
+ -	struct r5conf *conf = mddev->private;
+ -	struct r5l_log *log = conf->log;
+ -	int val = -1, i;
+ -	int len = length;
+ -
+ -	if (!log)
+ -		return -ENODEV;
+ -
+ -	if (len && page[len - 1] == '\n')
+ -		len -= 1;
+ -	for (i = 0; i < ARRAY_SIZE(r5c_journal_mode_str); i++)
+ -		if (strlen(r5c_journal_mode_str[i]) == len &&
+ -		    strncmp(page, r5c_journal_mode_str[i], len) == 0) {
+ -			val = i;
+ -			break;
+ -		}
+ -	if (val < R5C_JOURNAL_MODE_WRITE_THROUGH ||
+ -	    val > R5C_JOURNAL_MODE_WRITE_BACK)
+ -		return -EINVAL;
+ -
+ -	mddev_suspend(mddev);
+ -	conf->log->r5c_journal_mode = val;
+ -	mddev_resume(mddev);
+ -
+ -	pr_debug("md/raid:%s: setting r5c cache mode to %d: %s\n",
+ -		 mdname(mddev), val, r5c_journal_mode_str[val]);
+ -	return length;
+ -}
+ -
+ -struct md_sysfs_entry
+ -r5c_journal_mode = __ATTR(journal_mode, 0644,
+ -			  r5c_journal_mode_show, r5c_journal_mode_store);
+ -
+ -/*
+ - * Try handle write operation in caching phase. This function should only
+ - * be called in write-back mode.
+ - *
+ - * If all outstanding writes can be handled in caching phase, returns 0
+ - * If writes requires write-out phase, call r5c_make_stripe_write_out()
+ - * and returns -EAGAIN
+ - */
+ -int r5c_try_caching_write(struct r5conf *conf,
+ -			  struct stripe_head *sh,
+ -			  struct stripe_head_state *s,
+ -			  int disks)
+ -{
+ -	struct r5l_log *log = conf->log;
+ -	int i;
+ -	struct r5dev *dev;
+ -	int to_cache = 0;
+ -
+ -	BUG_ON(!r5c_is_writeback(log));
+ -
+ -	if (!test_bit(STRIPE_R5C_CACHING, &sh->state)) {
+ -		/*
+ -		 * There are two different scenarios here:
+ -		 *  1. The stripe has some data cached, and it is sent to
+ -		 *     write-out phase for reclaim
+ -		 *  2. The stripe is clean, and this is the first write
+ -		 *
+ -		 * For 1, return -EAGAIN, so we continue with
+ -		 * handle_stripe_dirtying().
+ -		 *
+ -		 * For 2, set STRIPE_R5C_CACHING and continue with caching
+ -		 * write.
+ -		 */
+ -
+ -		/* case 1: anything injournal or anything in written */
+ -		if (s->injournal > 0 || s->written > 0)
+ -			return -EAGAIN;
+ -		/* case 2 */
+ -		set_bit(STRIPE_R5C_CACHING, &sh->state);
+ -	}
+ -
+ -	for (i = disks; i--; ) {
+ -		dev = &sh->dev[i];
+ -		/* if non-overwrite, use writing-out phase */
+ -		if (dev->towrite && !test_bit(R5_OVERWRITE, &dev->flags) &&
+ -		    !test_bit(R5_InJournal, &dev->flags)) {
+ -			r5c_make_stripe_write_out(sh);
+ -			return -EAGAIN;
+ -		}
+ -	}
+ -
+ -	for (i = disks; i--; ) {
+ -		dev = &sh->dev[i];
+ -		if (dev->towrite) {
+ -			set_bit(R5_Wantwrite, &dev->flags);
+ -			set_bit(R5_Wantdrain, &dev->flags);
+ -			set_bit(R5_LOCKED, &dev->flags);
+ -			to_cache++;
+ -		}
+ -	}
+ -
+ -	if (to_cache) {
+ -		set_bit(STRIPE_OP_BIODRAIN, &s->ops_request);
+ -		/*
+ -		 * set STRIPE_LOG_TRAPPED, which triggers r5c_cache_data()
+ -		 * in ops_run_io(). STRIPE_LOG_TRAPPED will be cleared in
+ -		 * r5c_handle_data_cached()
+ -		 */
+ -		set_bit(STRIPE_LOG_TRAPPED, &sh->state);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -/*
+ - * free extra pages (orig_page) we allocated for prexor
+ - */
+ -void r5c_release_extra_page(struct stripe_head *sh)
+ -{
+ -	struct r5conf *conf = sh->raid_conf;
+ -	int i;
+ -	bool using_disk_info_extra_page;
+ -
+ -	using_disk_info_extra_page =
+ -		sh->dev[0].orig_page == conf->disks[0].extra_page;
+ -
+ -	for (i = sh->disks; i--; )
+ -		if (sh->dev[i].page != sh->dev[i].orig_page) {
+ -			struct page *p = sh->dev[i].orig_page;
+ -
+ -			sh->dev[i].orig_page = sh->dev[i].page;
+ -			if (!using_disk_info_extra_page)
+ -				put_page(p);
+ -		}
+ -
+ -	if (using_disk_info_extra_page) {
+ -		clear_bit(R5C_EXTRA_PAGE_IN_USE, &conf->cache_state);
+ -		md_wakeup_thread(conf->mddev->thread);
+ -	}
+ -}
+ -
+ -void r5c_use_extra_page(struct stripe_head *sh)
+ -{
+ -	struct r5conf *conf = sh->raid_conf;
+ -	int i;
+ -	struct r5dev *dev;
+ -
+ -	for (i = sh->disks; i--; ) {
+ -		dev = &sh->dev[i];
+ -		if (dev->orig_page != dev->page)
+ -			put_page(dev->orig_page);
+ -		dev->orig_page = conf->disks[i].extra_page;
+ -	}
+ -}
+ -
+ -/*
+ - * clean up the stripe (clear R5_InJournal for dev[pd_idx] etc.) after the
+ - * stripe is committed to RAID disks.
+ - */
+ -void r5c_finish_stripe_write_out(struct r5conf *conf,
+ -				 struct stripe_head *sh,
+ -				 struct stripe_head_state *s)
+ -{
+ -	int i;
+ -	int do_wakeup = 0;
+ -
+ -	if (!conf->log ||
+ -	    !test_bit(R5_InJournal, &sh->dev[sh->pd_idx].flags))
+ -		return;
+ -
+ -	WARN_ON(test_bit(STRIPE_R5C_CACHING, &sh->state));
+ -	clear_bit(R5_InJournal, &sh->dev[sh->pd_idx].flags);
+ -
+ -	if (conf->log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_THROUGH)
+ -		return;
+ -
+ -	for (i = sh->disks; i--; ) {
+ -		clear_bit(R5_InJournal, &sh->dev[i].flags);
+ -		if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
+ -			do_wakeup = 1;
+ -	}
+ -
+ -	/*
+ -	 * analyse_stripe() runs before r5c_finish_stripe_write_out(),
+ -	 * We updated R5_InJournal, so we also update s->injournal.
+ -	 */
+ -	s->injournal = 0;
+ -
+ -	if (test_and_clear_bit(STRIPE_FULL_WRITE, &sh->state))
+ -		if (atomic_dec_and_test(&conf->pending_full_writes))
+ -			md_wakeup_thread(conf->mddev->thread);
+ -
+ -	if (do_wakeup)
+ -		wake_up(&conf->wait_for_overlap);
+ -
+ -	if (conf->log->r5c_journal_mode == R5C_JOURNAL_MODE_WRITE_THROUGH)
+ -		return;
+ -
+ -	spin_lock_irq(&conf->log->stripe_in_journal_lock);
+ -	list_del_init(&sh->r5c);
+ -	spin_unlock_irq(&conf->log->stripe_in_journal_lock);
+ -	sh->log_start = MaxSector;
+ -	atomic_dec(&conf->log->stripe_in_journal_count);
+ -	r5c_update_log_state(conf->log);
+ -}
+ -
+ -int
+ -r5c_cache_data(struct r5l_log *log, struct stripe_head *sh,
+ -	       struct stripe_head_state *s)
+ -{
+ -	struct r5conf *conf = sh->raid_conf;
+ -	int pages = 0;
+ -	int reserve;
+ -	int i;
+ -	int ret = 0;
+ -
+ -	BUG_ON(!log);
+ -
+ -	for (i = 0; i < sh->disks; i++) {
+ -		void *addr;
+ -
+ -		if (!test_bit(R5_Wantwrite, &sh->dev[i].flags))
+ -			continue;
+ -		addr = kmap_atomic(sh->dev[i].page);
+ -		sh->dev[i].log_checksum = crc32c_le(log->uuid_checksum,
+ -						    addr, PAGE_SIZE);
+ -		kunmap_atomic(addr);
+ -		pages++;
+ -	}
+ -	WARN_ON(pages == 0);
+ -
+ -	/*
+ -	 * The stripe must enter state machine again to call endio, so
+ -	 * don't delay.
+ -	 */
+ -	clear_bit(STRIPE_DELAYED, &sh->state);
+ -	atomic_inc(&sh->count);
+ -
+ -	mutex_lock(&log->io_mutex);
+ -	/* meta + data */
+ -	reserve = (1 + pages) << (PAGE_SHIFT - 9);
+ -
+ -	if (test_bit(R5C_LOG_CRITICAL, &conf->cache_state) &&
+ -	    sh->log_start == MaxSector)
+ -		r5l_add_no_space_stripe(log, sh);
+ -	else if (!r5l_has_free_space(log, reserve)) {
+ -		if (sh->log_start == log->last_checkpoint)
+ -			BUG();
+ -		else
+ -			r5l_add_no_space_stripe(log, sh);
+ -	} else {
+ -		ret = r5l_log_stripe(log, sh, pages, 0);
+ -		if (ret) {
+ -			spin_lock_irq(&log->io_list_lock);
+ -			list_add_tail(&sh->log_list, &log->no_mem_stripes);
+ -			spin_unlock_irq(&log->io_list_lock);
+ -		}
+ -	}
+ -
+ -	mutex_unlock(&log->io_mutex);
+ -	return 0;
+ -}
+ -
+  static int r5l_load_log(struct r5l_log *log)
+  {
+  	struct md_rdev *rdev = log->rdev;
+diff --cc drivers/md/raid5.c
+index 896a84d8eff0,d40e94d56410..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -2533,15 -2547,14 +2533,26 @@@ static void raid5_error(struct mddev *m
+  
+  	set_bit(Blocked, &rdev->flags);
+  	set_bit(Faulty, &rdev->flags);
+++<<<<<<< HEAD
+ +	set_bit(MD_CHANGE_DEVS, &mddev->flags);
+ +	set_bit(MD_CHANGE_PENDING, &mddev->flags);
+ +	printk(KERN_ALERT
+ +	       "md/raid:%s: Disk failure on %s, disabling device.\n"
+ +	       "md/raid:%s: Operation continuing on %d devices.\n",
+ +	       mdname(mddev),
+ +	       bdevname(rdev->bdev, b),
+ +	       mdname(mddev),
+ +	       conf->raid_disks - mddev->degraded);
+++=======
++ 	set_mask_bits(&mddev->sb_flags, 0,
++ 		      BIT(MD_SB_CHANGE_DEVS) | BIT(MD_SB_CHANGE_PENDING));
++ 	pr_crit("md/raid:%s: Disk failure on %s, disabling device.\n"
++ 		"md/raid:%s: Operation continuing on %d devices.\n",
++ 		mdname(mddev),
++ 		bdevname(rdev->bdev, b),
++ 		mdname(mddev),
++ 		conf->raid_disks - mddev->degraded);
+++>>>>>>> 2953079c692d (md: separate flags for superblock changes)
+  }
+  
+  /*
+diff --git a/drivers/md/bitmap.c b/drivers/md/bitmap.c
+index b2cd760b2877..3eb82794eedb 100644
+--- a/drivers/md/bitmap.c
++++ b/drivers/md/bitmap.c
+@@ -1509,7 +1509,7 @@ void bitmap_cond_end_sync(struct bitmap *bitmap, sector_t sector)
+ 		   atomic_read(&bitmap->mddev->recovery_active) == 0);
+ 
+ 	bitmap->mddev->curr_resync_completed = sector;
+-	set_bit(MD_CHANGE_CLEAN, &bitmap->mddev->flags);
++	set_bit(MD_SB_CHANGE_CLEAN, &bitmap->mddev->sb_flags);
+ 	sector &= ~((1ULL << bitmap->counts.chunkshift) - 1);
+ 	s = 0;
+ 	while (s < sector && s < bitmap->mddev->resync_max_sectors) {
+@@ -2046,7 +2046,7 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
+ 		/* Ensure new bitmap info is stored in
+ 		 * metadata promptly.
+ 		 */
+-		set_bit(MD_CHANGE_DEVS, &mddev->flags);
++		set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+ 		md_wakeup_thread(mddev->thread);
+ 	}
+ 	return len;
+diff --git a/drivers/md/dm-raid.c b/drivers/md/dm-raid.c
+index 977c9e8b5e2a..c9fb5aefdf08 100644
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -2009,7 +2009,7 @@ static int super_load(struct md_rdev *rdev, struct md_rdev *refdev)
+ 		sb->compat_features = cpu_to_le32(FEATURE_FLAG_SUPPORTS_V190);
+ 
+ 		/* Force writing of superblocks to disk */
+-		set_bit(MD_CHANGE_DEVS, &rdev->mddev->flags);
++		set_bit(MD_SB_CHANGE_DEVS, &rdev->mddev->sb_flags);
+ 
+ 		/* Any superblock is better than none, choose that if given */
+ 		return refdev ? 0 : 1;
+@@ -3504,7 +3504,7 @@ static void rs_update_sbs(struct raid_set *rs)
+ 	struct mddev *mddev = &rs->md;
+ 	int ro = mddev->ro;
+ 
+-	set_bit(MD_CHANGE_DEVS, &mddev->flags);
++	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+ 	mddev->ro = 0;
+ 	md_update_sb(mddev, 1);
+ 	mddev->ro = ro;
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
+* Unmerged path drivers/md/multipath.c
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid10.c
+* Unmerged path drivers/md/raid5-cache.c
+* Unmerged path drivers/md/raid5.c
