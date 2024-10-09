@@ -1,0 +1,497 @@
+locking/rwsem: Convert sem->count to 'atomic_long_t'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jason Low <jason.low2@hpe.com>
+commit 8ee62b1870be8e630158701632a533d0378e15b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8ee62b18.failed
+
+Convert the rwsem count variable to an atomic_long_t since we use it
+as an atomic variable. This also allows us to remove the
+rwsem_atomic_{add,update}() "abstraction" which would now be an unnecesary
+level of indirection. In follow up patches, we also remove the
+rwsem_atomic_{add,update}() definitions across the various architectures.
+
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Jason Low <jason.low2@hpe.com>
+[ Build warning fixes on various architectures. ]
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Fenghua Yu <fenghua.yu@intel.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Jason Low <jason.low2@hp.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Hurley <peter@hurleysoftware.com>
+	Cc: Terry Rudd <terry.rudd@hpe.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Waiman Long <Waiman.Long@hpe.com>
+Link: http://lkml.kernel.org/r/1465017963-4839-2-git-send-email-jason.low2@hpe.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8ee62b1870be8e630158701632a533d0378e15b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/rwsem.h
+#	include/linux/rwsem.h
+#	lib/rwsem.c
+diff --cc include/asm-generic/rwsem.h
+index bb1e2cdeb9bf,a3a93eca766c..000000000000
+--- a/include/asm-generic/rwsem.h
++++ b/include/asm-generic/rwsem.h
+@@@ -41,8 -41,8 +41,13 @@@ static inline int __down_read_trylock(s
+  {
+  	long tmp;
+  
+++<<<<<<< HEAD
+ +	while ((tmp = sem->count) >= 0) {
+ +		if (tmp == cmpxchg(&sem->count, tmp,
+++=======
++ 	while ((tmp = atomic_long_read(&sem->count)) >= 0) {
++ 		if (tmp == atomic_long_cmpxchg_acquire(&sem->count, tmp,
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t')
+  				   tmp + RWSEM_ACTIVE_READ_BIAS)) {
+  			return 1;
+  		}
+@@@ -72,7 -79,7 +77,11 @@@ static inline int __down_write_trylock(
+  {
+  	long tmp;
+  
+++<<<<<<< HEAD
+ +	tmp = cmpxchg(&sem->count, RWSEM_UNLOCKED_VALUE,
+++=======
++ 	tmp = atomic_long_cmpxchg_acquire(&sem->count, RWSEM_UNLOCKED_VALUE,
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t')
+  		      RWSEM_ACTIVE_WRITE_BIAS);
+  	return tmp == RWSEM_UNLOCKED_VALUE;
+  }
+diff --cc include/linux/rwsem.h
+index 8d79708146aa,dd1d14250340..000000000000
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@@ -24,10 -27,11 +25,15 @@@ struct rw_semaphore
+  #else
+  /* All arch specific implementations share the same struct */
+  struct rw_semaphore {
+++<<<<<<< HEAD
+ +	long count;
+++=======
++ 	atomic_long_t count;
++ 	struct list_head wait_list;
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t')
+  	raw_spinlock_t wait_lock;
+ -#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ -	struct optimistic_spin_queue osq; /* spinner MCS lock */
+ +	struct list_head wait_list;
+ +#ifdef CONFIG_SMP
+  	/*
+  	 * Write owner. Used as a speculative check to see
+  	 * if the owner is running on the cpu.
+@@@ -64,21 -69,18 +71,35 @@@ static inline int rwsem_is_locked(struc
+  # define __RWSEM_DEP_MAP_INIT(lockname)
+  #endif
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_SMP) && !defined(CONFIG_RWSEM_GENERIC_SPINLOCK)
+ +#define __RWSEM_INITIALIZER(name)			\
+ +	{ RWSEM_UNLOCKED_VALUE,				\
+ +	  __RAW_SPIN_LOCK_UNLOCKED(name.wait_lock),	\
+ +	  LIST_HEAD_INIT((name).wait_list),		\
+ +	  NULL, /* owner */				\
+ +	  NULL /* mcs lock */                           \
+++=======
++ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
++ #define __RWSEM_OPT_INIT(lockname) , .osq = OSQ_LOCK_UNLOCKED, .owner = NULL
++ #else
++ #define __RWSEM_OPT_INIT(lockname)
++ #endif
++ 
++ #define __RWSEM_INITIALIZER(name)				\
++ 	{ __RWSEM_INIT_COUNT(name),				\
++ 	  .wait_list = LIST_HEAD_INIT((name).wait_list),	\
++ 	  .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(name.wait_lock)	\
++ 	  __RWSEM_OPT_INIT(name)				\
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t')
+ +	  __RWSEM_DEP_MAP_INIT(name) }
+ +#else
+ +#define __RWSEM_INITIALIZER(name)			\
+ +	{ RWSEM_UNLOCKED_VALUE,				\
+ +	  __RAW_SPIN_LOCK_UNLOCKED(name.wait_lock),	\
+ +	  LIST_HEAD_INIT((name).wait_list)		\
+  	  __RWSEM_DEP_MAP_INIT(name) }
+ +#endif
+  
+  #define DECLARE_RWSEM(name) \
+  	struct rw_semaphore name = __RWSEM_INITIALIZER(name)
+diff --cc lib/rwsem.c
+index 09d8c2da4ff3,63b40a5c62ec..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -79,12 -80,12 +79,12 @@@ void __init_rwsem(struct rw_semaphore *
+  	debug_check_no_locks_freed((void *)sem, sizeof(*sem));
+  	lockdep_init_map(&sem->dep_map, name, key, 0);
+  #endif
+- 	sem->count = RWSEM_UNLOCKED_VALUE;
++ 	atomic_long_set(&sem->count, RWSEM_UNLOCKED_VALUE);
+  	raw_spin_lock_init(&sem->wait_lock);
+  	INIT_LIST_HEAD(&sem->wait_list);
+ -#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ +#ifdef CONFIG_SMP
+  	sem->owner = NULL;
+ -	osq_lock_init(&sem->osq);
+ +	sem->osq = NULL;
+  #endif
+  }
+  
+@@@ -257,14 -265,27 +258,31 @@@ EXPORT_SYMBOL(rwsem_down_read_failed)
+  static inline bool rwsem_try_write_lock(long count, struct rw_semaphore *sem)
+  {
+  	/*
+ -	 * Avoid trying to acquire write lock if count isn't RWSEM_WAITING_BIAS.
+ +	 * Try acquiring the write lock. Check count first in order
+ +	 * to reduce unnecessary expensive cmpxchg() operations.
+  	 */
+++<<<<<<< HEAD:lib/rwsem.c
+ +	if (count == RWSEM_WAITING_BIAS &&
+ +	    cmpxchg(&sem->count, RWSEM_WAITING_BIAS,
+ +		    RWSEM_ACTIVE_WRITE_BIAS) == RWSEM_WAITING_BIAS) {
+ +		if (!list_is_singular(&sem->wait_list))
+ +			rwsem_atomic_update(RWSEM_WAITING_BIAS, sem);
+++=======
++ 	if (count != RWSEM_WAITING_BIAS)
++ 		return false;
++ 
++ 	/*
++ 	 * Acquire the lock by trying to set it to ACTIVE_WRITE_BIAS. If there
++ 	 * are other tasks on the wait list, we need to add on WAITING_BIAS.
++ 	 */
++ 	count = list_is_singular(&sem->wait_list) ?
++ 			RWSEM_ACTIVE_WRITE_BIAS :
++ 			RWSEM_ACTIVE_WRITE_BIAS + RWSEM_WAITING_BIAS;
++ 
++ 	if (atomic_long_cmpxchg_acquire(&sem->count, RWSEM_WAITING_BIAS, count)
++ 							== RWSEM_WAITING_BIAS) {
++ 		rwsem_set_owner(sem);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  		return true;
+  	}
+  
+@@@ -277,15 -298,18 +295,26 @@@
+   */
+  static inline bool rwsem_try_write_lock_unqueued(struct rw_semaphore *sem)
+  {
+++<<<<<<< HEAD:lib/rwsem.c
+ +	long old, count = ACCESS_ONCE(sem->count);
+++=======
++ 	long old, count = atomic_long_read(&sem->count);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  
+  	while (true) {
+  		if (!(count == 0 || count == RWSEM_WAITING_BIAS))
+  			return false;
+  
+++<<<<<<< HEAD:lib/rwsem.c
+ +		old = cmpxchg(&sem->count, count, count + RWSEM_ACTIVE_WRITE_BIAS);
+ +		if (old == count)
+++=======
++ 		old = atomic_long_cmpxchg_acquire(&sem->count, count,
++ 				      count + RWSEM_ACTIVE_WRITE_BIAS);
++ 		if (old == count) {
++ 			rwsem_set_owner(sem);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  			return true;
+ -		}
+  
+  		count = old;
+  	}
+@@@ -300,9 -324,9 +329,13 @@@ static inline bool rwsem_can_spin_on_ow
+  		return false;
+  
+  	rcu_read_lock();
+ -	owner = READ_ONCE(sem->owner);
+ +	owner = ACCESS_ONCE(sem->owner);
+  	if (!owner) {
+++<<<<<<< HEAD:lib/rwsem.c
+ +		long count = ACCESS_ONCE(sem->count);
+++=======
++ 		long count = atomic_long_read(&sem->count);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  		/*
+  		 * If sem->owner is not set, yet we have just recently entered the
+  		 * slowpath with the lock being active, then there is a possibility
+@@@ -421,9 -458,11 +454,9 @@@ struct rw_semaphore __sched *rwsem_down
+  	long count;
+  	bool waiting = true; /* any queued threads before us */
+  	struct rwsem_waiter waiter;
+ -	struct rw_semaphore *ret = sem;
+ -	WAKE_Q(wake_q);
+  
+  	/* undo write bias from down_write operation, stop active locking */
+- 	count = rwsem_atomic_update(-RWSEM_ACTIVE_WRITE_BIAS, sem);
++ 	count = atomic_long_sub_return(RWSEM_ACTIVE_WRITE_BIAS, &sem->count);
+  
+  	/* do optimistic spinning and steal lock if possible */
+  	if (rwsem_optimistic_spin(sem))
+@@@ -446,21 -485,32 +479,25 @@@
+  
+  	/* we're now waiting on the lock, but no longer actively locking */
+  	if (waiting) {
+++<<<<<<< HEAD:lib/rwsem.c
+ +		count = ACCESS_ONCE(sem->count);
+++=======
++ 		count = atomic_long_read(&sem->count);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  
+  		/*
+  		 * If there were already threads queued before us and there are
+  		 * no active writers, the lock must be read owned; so we try to
+  		 * wake any read locks that were queued ahead of us.
+  		 */
+ -		if (count > RWSEM_WAITING_BIAS) {
+ -			WAKE_Q(wake_q);
+ -
+ -			sem = __rwsem_mark_wake(sem, RWSEM_WAKE_READERS, &wake_q);
+ -			/*
+ -			 * The wakeup is normally called _after_ the wait_lock
+ -			 * is released, but given that we are proactively waking
+ -			 * readers we can deal with the wake_q overhead as it is
+ -			 * similar to releasing and taking the wait_lock again
+ -			 * for attempting rwsem_try_write_lock().
+ -			 */
+ -			wake_up_q(&wake_q);
+ -		}
+ +		if (count > RWSEM_WAITING_BIAS)
+ +			sem = __rwsem_do_wake(sem, RWSEM_WAKE_READERS);
+  
+  	} else
+- 		count = rwsem_atomic_update(RWSEM_WAITING_BIAS, sem);
++ 		count = atomic_long_add_return(RWSEM_WAITING_BIAS, &sem->count);
+  
+  	/* wait until we successfully acquire the lock */
+ -	set_current_state(state);
+ +	set_current_state(TASK_UNINTERRUPTIBLE);
+  	while (true) {
+  		if (rwsem_try_write_lock(count, sem))
+  			break;
+@@@ -468,9 -518,12 +505,14 @@@
+  
+  		/* Block until there are no active lockers. */
+  		do {
+ -			if (signal_pending_state(state, current))
+ -				goto out_nolock;
+ -
+  			schedule();
+++<<<<<<< HEAD:lib/rwsem.c
+ +			set_current_state(TASK_UNINTERRUPTIBLE);
+ +		} while ((count = sem->count) & RWSEM_ACTIVE_MASK);
+++=======
++ 			set_current_state(state);
++ 		} while ((count = atomic_long_read(&sem->count)) & RWSEM_ACTIVE_MASK);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  
+  		raw_spin_lock_irq(&sem->wait_lock);
+  	}
+@@@ -479,7 -531,26 +521,30 @@@
+  	list_del(&waiter.list);
+  	raw_spin_unlock_irq(&sem->wait_lock);
+  
+++<<<<<<< HEAD:lib/rwsem.c
+ +	return sem;
+++=======
++ 	return ret;
++ 
++ out_nolock:
++ 	__set_current_state(TASK_RUNNING);
++ 	raw_spin_lock_irq(&sem->wait_lock);
++ 	list_del(&waiter.list);
++ 	if (list_empty(&sem->wait_list))
++ 		atomic_long_add(-RWSEM_WAITING_BIAS, &sem->count);
++ 	else
++ 		__rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
++ 	raw_spin_unlock_irq(&sem->wait_lock);
++ 	wake_up_q(&wake_q);
++ 
++ 	return ERR_PTR(-EINTR);
++ }
++ 
++ __visible struct rw_semaphore * __sched
++ rwsem_down_write_failed(struct rw_semaphore *sem)
++ {
++ 	return __rwsem_down_write_failed_common(sem, TASK_UNINTERRUPTIBLE);
+++>>>>>>> 8ee62b1870be (locking/rwsem: Convert sem->count to 'atomic_long_t'):kernel/locking/rwsem-xadd.c
+  }
+  EXPORT_SYMBOL(rwsem_down_write_failed);
+  
+diff --git a/arch/alpha/include/asm/rwsem.h b/arch/alpha/include/asm/rwsem.h
+index a83bbea62c67..d04acbbdf3dc 100644
+--- a/arch/alpha/include/asm/rwsem.h
++++ b/arch/alpha/include/asm/rwsem.h
+@@ -25,8 +25,8 @@ static inline void __down_read(struct rw_semaphore *sem)
+ {
+ 	long oldcount;
+ #ifndef	CONFIG_SMP
+-	oldcount = sem->count;
+-	sem->count += RWSEM_ACTIVE_READ_BIAS;
++	oldcount = sem->count.counter;
++	sem->count.counter += RWSEM_ACTIVE_READ_BIAS;
+ #else
+ 	long temp;
+ 	__asm__ __volatile__(
+@@ -52,13 +52,13 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
+ {
+ 	long old, new, res;
+ 
+-	res = sem->count;
++	res = atomic_long_read(&sem->count);
+ 	do {
+ 		new = res + RWSEM_ACTIVE_READ_BIAS;
+ 		if (new <= 0)
+ 			break;
+ 		old = res;
+-		res = cmpxchg(&sem->count, old, new);
++		res = atomic_long_cmpxchg(&sem->count, old, new);
+ 	} while (res != old);
+ 	return res >= 0 ? 1 : 0;
+ }
+@@ -67,8 +67,8 @@ static inline void __down_write(struct rw_semaphore *sem)
+ {
+ 	long oldcount;
+ #ifndef	CONFIG_SMP
+-	oldcount = sem->count;
+-	sem->count += RWSEM_ACTIVE_WRITE_BIAS;
++	oldcount = sem->count.counter;
++	sem->count.counter += RWSEM_ACTIVE_WRITE_BIAS;
+ #else
+ 	long temp;
+ 	__asm__ __volatile__(
+@@ -92,7 +92,7 @@ static inline void __down_write(struct rw_semaphore *sem)
+  */
+ static inline int __down_write_trylock(struct rw_semaphore *sem)
+ {
+-	long ret = cmpxchg(&sem->count, RWSEM_UNLOCKED_VALUE,
++	long ret = atomic_long_cmpxchg(&sem->count, RWSEM_UNLOCKED_VALUE,
+ 			   RWSEM_ACTIVE_WRITE_BIAS);
+ 	if (ret == RWSEM_UNLOCKED_VALUE)
+ 		return 1;
+@@ -103,8 +103,8 @@ static inline void __up_read(struct rw_semaphore *sem)
+ {
+ 	long oldcount;
+ #ifndef	CONFIG_SMP
+-	oldcount = sem->count;
+-	sem->count -= RWSEM_ACTIVE_READ_BIAS;
++	oldcount = sem->count.counter;
++	sem->count.counter -= RWSEM_ACTIVE_READ_BIAS;
+ #else
+ 	long temp;
+ 	__asm__ __volatile__(
+@@ -128,8 +128,8 @@ static inline void __up_write(struct rw_semaphore *sem)
+ {
+ 	long count;
+ #ifndef	CONFIG_SMP
+-	sem->count -= RWSEM_ACTIVE_WRITE_BIAS;
+-	count = sem->count;
++	sem->count.counter -= RWSEM_ACTIVE_WRITE_BIAS;
++	count = sem->count.counter;
+ #else
+ 	long temp;
+ 	__asm__ __volatile__(
+@@ -157,8 +157,8 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
+ {
+ 	long oldcount;
+ #ifndef	CONFIG_SMP
+-	oldcount = sem->count;
+-	sem->count -= RWSEM_WAITING_BIAS;
++	oldcount = sem->count.counter;
++	sem->count.counter -= RWSEM_WAITING_BIAS;
+ #else
+ 	long temp;
+ 	__asm__ __volatile__(
+diff --git a/arch/ia64/include/asm/rwsem.h b/arch/ia64/include/asm/rwsem.h
+index 3027e7516d85..9c925aeeb109 100644
+--- a/arch/ia64/include/asm/rwsem.h
++++ b/arch/ia64/include/asm/rwsem.h
+@@ -40,7 +40,7 @@
+ static inline void
+ __down_read (struct rw_semaphore *sem)
+ {
+-	long result = ia64_fetchadd8_acq((unsigned long *)&sem->count, 1);
++	long result = ia64_fetchadd8_acq((unsigned long *)&sem->count.counter, 1);
+ 
+ 	if (result < 0)
+ 		rwsem_down_read_failed(sem);
+@@ -55,9 +55,9 @@ __down_write (struct rw_semaphore *sem)
+ 	long old, new;
+ 
+ 	do {
+-		old = sem->count;
++		old = atomic_long_read(&sem->count);
+ 		new = old + RWSEM_ACTIVE_WRITE_BIAS;
+-	} while (cmpxchg_acq(&sem->count, old, new) != old);
++	} while (atomic_long_cmpxchg_acquire(&sem->count, old, new) != old);
+ 
+ 	if (old != 0)
+ 		rwsem_down_write_failed(sem);
+@@ -69,7 +69,7 @@ __down_write (struct rw_semaphore *sem)
+ static inline void
+ __up_read (struct rw_semaphore *sem)
+ {
+-	long result = ia64_fetchadd8_rel((unsigned long *)&sem->count, -1);
++	long result = ia64_fetchadd8_rel((unsigned long *)&sem->count.counter, -1);
+ 
+ 	if (result < 0 && (--result & RWSEM_ACTIVE_MASK) == 0)
+ 		rwsem_wake(sem);
+@@ -84,9 +84,9 @@ __up_write (struct rw_semaphore *sem)
+ 	long old, new;
+ 
+ 	do {
+-		old = sem->count;
++		old = atomic_long_read(&sem->count);
+ 		new = old - RWSEM_ACTIVE_WRITE_BIAS;
+-	} while (cmpxchg_rel(&sem->count, old, new) != old);
++	} while (atomic_long_cmpxchg_release(&sem->count, old, new) != old);
+ 
+ 	if (new < 0 && (new & RWSEM_ACTIVE_MASK) == 0)
+ 		rwsem_wake(sem);
+@@ -99,8 +99,8 @@ static inline int
+ __down_read_trylock (struct rw_semaphore *sem)
+ {
+ 	long tmp;
+-	while ((tmp = sem->count) >= 0) {
+-		if (tmp == cmpxchg_acq(&sem->count, tmp, tmp+1)) {
++	while ((tmp = atomic_long_read(&sem->count)) >= 0) {
++		if (tmp == atomic_long_cmpxchg_acquire(&sem->count, tmp, tmp+1)) {
+ 			return 1;
+ 		}
+ 	}
+@@ -113,8 +113,8 @@ __down_read_trylock (struct rw_semaphore *sem)
+ static inline int
+ __down_write_trylock (struct rw_semaphore *sem)
+ {
+-	long tmp = cmpxchg_acq(&sem->count, RWSEM_UNLOCKED_VALUE,
+-			      RWSEM_ACTIVE_WRITE_BIAS);
++	long tmp = atomic_long_cmpxchg_acquire(&sem->count,
++			RWSEM_UNLOCKED_VALUE, RWSEM_ACTIVE_WRITE_BIAS);
+ 	return tmp == RWSEM_UNLOCKED_VALUE;
+ }
+ 
+@@ -127,9 +127,9 @@ __downgrade_write (struct rw_semaphore *sem)
+ 	long old, new;
+ 
+ 	do {
+-		old = sem->count;
++		old = atomic_long_read(&sem->count);
+ 		new = old - RWSEM_WAITING_BIAS;
+-	} while (cmpxchg_rel(&sem->count, old, new) != old);
++	} while (atomic_long_cmpxchg_release(&sem->count, old, new) != old);
+ 
+ 	if (old < 0)
+ 		rwsem_downgrade_wake(sem);
+* Unmerged path include/asm-generic/rwsem.h
+* Unmerged path include/linux/rwsem.h
+* Unmerged path lib/rwsem.c
