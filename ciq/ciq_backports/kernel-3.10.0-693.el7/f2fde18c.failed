@@ -1,0 +1,143 @@
+net/mlx5e: Don't wait for RQ completions on close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Don't wait for RQ completions on close (Don Dutile) [1417284]
+Rebuild_FUZZ: 95.74%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit f2fde18c52a7367a8f6cf6855e2a7174e601c8ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f2fde18c.failed
+
+This will significantly reduce receive queue flush time on interface
+down.
+
+Instead of asking the firmware to flush the RQ (Receive Queue) via
+asynchronous completions when moved to error, we handle RQ flush
+manually (mlx5e_free_rx_descs) same as we did when RQ flush got timed
+out.
+
+This will reduce RQs flush time and speedup interface down procedure
+(ifconfig down) from 6 sec to 0.3 sec on a 48 cores system.
+
+Moved mlx5e_free_rx_descs en_main.c where it is needed, to keep en_rx.c
+free form non critical data path code for better code locality.
+
+Fixes: 6cd392a082de ('net/mlx5e: Handle RQ flush in error cases')
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f2fde18c52a7367a8f6cf6855e2a7174e601c8ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index a1c912683912,26a7ec7073f2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -206,9 -223,9 +206,13 @@@ struct mlx5e_tstamp 
+  };
+  
+  enum {
+- 	MLX5E_RQ_STATE_POST_WQES_ENABLE,
++ 	MLX5E_RQ_STATE_FLUSH,
+  	MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS,
+++<<<<<<< HEAD
+ +	MLX5E_RQ_STATE_FLUSH_TIMEOUT,
+++=======
++ 	MLX5E_RQ_STATE_AM,
+++>>>>>>> f2fde18c52a7 (net/mlx5e: Don't wait for RQ completions on close)
+  };
+  
+  struct mlx5e_cq {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 03cb4d7e741a,2463eba75125..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -517,7 -564,8 +533,12 @@@ static int mlx5e_open_rq(struct mlx5e_c
+  	if (err)
+  		goto err_disable_rq;
+  
+++<<<<<<< HEAD
+ +	set_bit(MLX5E_RQ_STATE_POST_WQES_ENABLE, &rq->state);
+++=======
++ 	if (param->am_enabled)
++ 		set_bit(MLX5E_RQ_STATE_AM, &c->rq.state);
+++>>>>>>> f2fde18c52a7 (net/mlx5e: Don't wait for RQ completions on close)
+  
+  	sq->ico_wqe_info[pi].opcode     = MLX5_OPCODE_NOP;
+  	sq->ico_wqe_info[pi].num_wqebbs = 1;
+@@@ -535,22 -583,9 +556,23 @@@ err_destroy_rq
+  
+  static void mlx5e_close_rq(struct mlx5e_rq *rq)
+  {
+- 	int tout = 0;
+- 	int err;
+- 
+- 	clear_bit(MLX5E_RQ_STATE_POST_WQES_ENABLE, &rq->state);
++ 	set_bit(MLX5E_RQ_STATE_FLUSH, &rq->state);
+  	napi_synchronize(&rq->channel->napi); /* prevent mlx5e_post_rx_wqes */
+++<<<<<<< HEAD
+ +
+ +	err = mlx5e_modify_rq_state(rq, MLX5_RQC_STATE_RDY, MLX5_RQC_STATE_ERR);
+ +	while (!mlx5_wq_ll_is_empty(&rq->wq) && !err &&
+ +	       tout++ < MLX5_EN_QP_FLUSH_MAX_ITER)
+ +		msleep(MLX5_EN_QP_FLUSH_MSLEEP_QUANT);
+ +
+ +	if (err || tout == MLX5_EN_QP_FLUSH_MAX_ITER)
+ +		set_bit(MLX5E_RQ_STATE_FLUSH_TIMEOUT, &rq->state);
+ +
+ +	/* avoid destroying rq before mlx5e_poll_rx_cq() is done with it */
+ +	napi_synchronize(&rq->channel->napi);
+++=======
++ 	cancel_work_sync(&rq->am.work);
+++>>>>>>> f2fde18c52a7 (net/mlx5e: Don't wait for RQ completions on close)
+  
+  	mlx5e_disable_rq(rq);
+  	mlx5e_free_rx_descs(rq);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index cfbbe9c677e6..18e6f3be79c3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -595,26 +595,9 @@ void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ 	wi->free_wqe(rq, wi);
+ }
+ 
+-void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
+-{
+-	struct mlx5_wq_ll *wq = &rq->wq;
+-	struct mlx5e_rx_wqe *wqe;
+-	__be16 wqe_ix_be;
+-	u16 wqe_ix;
+-
+-	while (!mlx5_wq_ll_is_empty(wq)) {
+-		wqe_ix_be = *wq->tail_next;
+-		wqe_ix    = be16_to_cpu(wqe_ix_be);
+-		wqe       = mlx5_wq_ll_get_wqe(&rq->wq, wqe_ix);
+-		rq->dealloc_wqe(rq, wqe_ix);
+-		mlx5_wq_ll_pop(&rq->wq, wqe_ix_be,
+-			       &wqe->next.next_wqe_index);
+-	}
+-}
+-
+ #define RQ_CANNOT_POST(rq) \
+-		(!test_bit(MLX5E_RQ_STATE_POST_WQES_ENABLE, &rq->state) || \
+-		 test_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state))
++	(test_bit(MLX5E_RQ_STATE_FLUSH, &rq->state) || \
++	 test_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state))
+ 
+ bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
+ {
+@@ -914,7 +897,7 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+ 	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
+ 	int work_done = 0;
+ 
+-	if (unlikely(test_bit(MLX5E_RQ_STATE_FLUSH_TIMEOUT, &rq->state)))
++	if (unlikely(test_bit(MLX5E_RQ_STATE_FLUSH, &rq->state)))
+ 		return 0;
+ 
+ 	if (cq->decmprs_left)
