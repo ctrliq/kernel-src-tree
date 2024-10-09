@@ -1,0 +1,137 @@
+net: phy: add paged phy register accessors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] phy: add paged phy register accessors (Ivan Vecera) [1685646]
+Rebuild_FUZZ: 93.67%
+commit-author Russell King <rmk+kernel@armlinux.org.uk>
+commit 78ffc4acceff48522b92d8fbf8f4a0ffe78838b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/78ffc4ac.failed
+
+Add a set of paged phy register accessors which are inherently safe in
+their design against other accesses interfering with the paged access.
+
+	Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 78ffc4acceff48522b92d8fbf8f4a0ffe78838b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/phy-core.c
+#	include/linux/phy.h
+diff --cc include/linux/phy.h
+index 2a7a15321caa,af1a740dafd4..000000000000
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@@ -523,16 -601,67 +523,70 @@@ struct phy_driver 
+  	/* See set_wol, but for checking whether Wake on LAN is enabled. */
+  	void (*get_wol)(struct phy_device *dev, struct ethtool_wolinfo *wol);
+  
+ -	/*
+ -	 * Called to inform a PHY device driver when the core is about to
+ -	 * change the link state. This callback is supposed to be used as
+ -	 * fixup hook for drivers that need to take action when the link
+ -	 * state changes. Drivers are by no means allowed to mess with the
+ -	 * PHY device structure in their implementations.
+ +	struct device_driver driver;
+ +
+ +	/* Determines the auto negotiation result */
+ +	RH_KABI_EXTEND(int (*aneg_done)(struct phy_device *phydev))
+ +
+ +	/* PHY API is not on symbol whitelist now so we can extend
+ +	 * this structure directly via simple RH_KABI_EXTEND.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	void (*link_change_notify)(struct phy_device *dev);
++ 
++ 	/*
++ 	 * Phy specific driver override for reading a MMD register.
++ 	 * This function is optional for PHY specific drivers.  When
++ 	 * not provided, the default MMD read function will be used
++ 	 * by phy_read_mmd(), which will use either a direct read for
++ 	 * Clause 45 PHYs or an indirect read for Clause 22 PHYs.
++ 	 *  devnum is the MMD device number within the PHY device,
++ 	 *  regnum is the register within the selected MMD device.
++ 	 */
++ 	int (*read_mmd)(struct phy_device *dev, int devnum, u16 regnum);
++ 
++ 	/*
++ 	 * Phy specific driver override for writing a MMD register.
++ 	 * This function is optional for PHY specific drivers.  When
++ 	 * not provided, the default MMD write function will be used
++ 	 * by phy_write_mmd(), which will use either a direct write for
++ 	 * Clause 45 PHYs, or an indirect write for Clause 22 PHYs.
++ 	 *  devnum is the MMD device number within the PHY device,
++ 	 *  regnum is the register within the selected MMD device.
++ 	 *  val is the value to be written.
++ 	 */
++ 	int (*write_mmd)(struct phy_device *dev, int devnum, u16 regnum,
++ 			 u16 val);
++ 
++ 	int (*read_page)(struct phy_device *dev);
++ 	int (*write_page)(struct phy_device *dev, int page);
++ 
++ 	/* Get the size and type of the eeprom contained within a plug-in
++ 	 * module */
++ 	int (*module_info)(struct phy_device *dev,
++ 			   struct ethtool_modinfo *modinfo);
++ 
++ 	/* Get the eeprom information from the plug-in module */
++ 	int (*module_eeprom)(struct phy_device *dev,
++ 			     struct ethtool_eeprom *ee, u8 *data);
++ 
++ 	/* Get statistics from the phy using ethtool */
++ 	int (*get_sset_count)(struct phy_device *dev);
++ 	void (*get_strings)(struct phy_device *dev, u8 *data);
++ 	void (*get_stats)(struct phy_device *dev,
++ 			  struct ethtool_stats *stats, u64 *data);
++ 
++ 	/* Get and Set PHY tunables */
++ 	int (*get_tunable)(struct phy_device *dev,
++ 			   struct ethtool_tunable *tuna, void *data);
++ 	int (*set_tunable)(struct phy_device *dev,
++ 			    struct ethtool_tunable *tuna,
++ 			    const void *data);
++ 	int (*set_loopback)(struct phy_device *dev, bool enable);
+++>>>>>>> 78ffc4acceff (net: phy: add paged phy register accessors)
+  };
+ -#define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
+ -				      struct phy_driver, mdiodrv)
+ +#define to_phy_driver(d) container_of(d, struct phy_driver, driver)
+  
+  #define PHY_ANY_ID "MATCH ANY PHY"
+  #define PHY_ANY_UID 0xffffffff
+@@@ -624,17 -839,16 +678,25 @@@ static inline bool phy_is_internal(stru
+   *
+   * Same rules as for phy_write();
+   */
+ -int phy_write_mmd(struct phy_device *phydev, int devad, u32 regnum, u16 val);
+ +static inline int phy_write_mmd(struct phy_device *phydev, int devad,
+ +				u32 regnum, u16 val)
+ +{
+ +	if (!phydev->is_c45)
+ +		return -EOPNOTSUPP;
+ +
+ +	regnum = MII_ADDR_C45 | ((devad & 0x1f) << 16) | (regnum & 0xffff);
+ +
+ +	return mdiobus_write(phydev->bus, phydev->addr, regnum, val);
+ +}
+  
++ int phy_save_page(struct phy_device *phydev);
++ int phy_select_page(struct phy_device *phydev, int page);
++ int phy_restore_page(struct phy_device *phydev, int oldpage, int ret);
++ int phy_read_paged(struct phy_device *phydev, int page, u32 regnum);
++ int phy_write_paged(struct phy_device *phydev, int page, u32 regnum, u16 val);
++ int phy_modify_paged(struct phy_device *phydev, int page, u32 regnum,
++ 		     u16 mask, u16 set);
++ 
+  struct phy_device *phy_device_create(struct mii_bus *bus, int addr, int phy_id,
+  				     bool is_c45,
+  				     struct phy_c45_device_ids *c45_ids);
+* Unmerged path drivers/net/phy/phy-core.c
+* Unmerged path drivers/net/phy/phy-core.c
+* Unmerged path include/linux/phy.h
