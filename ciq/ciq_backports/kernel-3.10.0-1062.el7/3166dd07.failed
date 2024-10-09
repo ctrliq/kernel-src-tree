@@ -1,0 +1,276 @@
+nfp: flower: offload tunnel decap rules via indirect TC blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit 3166dd07a9cba5447a9d7507a988e2eb37a04f95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3166dd07.failed
+
+Previously, TC block tunnel decap rules were only offloaded when a
+callback was triggered through registration of the rules egress device.
+This meant that the driver had no access to the ingress netdev and so
+could not verify it was the same tunnel type that the rule implied.
+
+Register tunnel devices for indirect TC block offloads in NFP, giving
+access to new rules based on the ingress device rather than egress. Use
+this to verify the netdev type of VXLAN and Geneve based rules and offload
+the rules to HW if applicable.
+
+Tunnel registration is done via a netdev notifier. On notifier
+registration, this is triggered for already existing netdevs. This means
+that NFP can register for offloads from devices that exist before it is
+loaded (filter rules will be replayed from the TC core). Similarly, on
+notifier unregister, a call is triggered for each currently active netdev.
+This allows the driver to unregister any indirect block callbacks that may
+still be active.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3166dd07a9cba5447a9d7507a988e2eb37a04f95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.c
+index 171014032993,d1c3c2081461..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@@ -689,13 -669,28 +691,21 @@@ static int nfp_flower_start(struct nfp_
+  }
+  
+  static void nfp_flower_stop(struct nfp_app *app)
+ -{
+ -	nfp_tunnel_config_stop(app);
+ -}
+ -
+ -static int
+ -nfp_flower_netdev_event(struct nfp_app *app, struct net_device *netdev,
+ -			unsigned long event, void *ptr)
+  {
+  	struct nfp_flower_priv *app_priv = app->priv;
+ -	int ret;
+  
+ -	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
+ -		ret = nfp_flower_lag_netdev_event(app_priv, netdev, event, ptr);
+ -		if (ret & NOTIFY_STOP_MASK)
+ -			return ret;
+ -	}
+ +	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG)
+ +		unregister_netdevice_notifier(&app_priv->nfp_lag.lag_nb);
+  
+++<<<<<<< HEAD
+ +	nfp_tunnel_config_stop(app);
+++=======
++ 	ret = nfp_flower_reg_indir_block_handler(app, netdev, event);
++ 	if (ret & NOTIFY_STOP_MASK)
++ 		return ret;
++ 
++ 	return nfp_tunnel_mac_event_handler(app, netdev, event, ptr);
+++>>>>>>> 3166dd07a9cb (nfp: flower: offload tunnel decap rules via indirect TC blocks)
+  }
+  
+  const struct nfp_app_type app_flower = {
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,8c84829ebd21..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -293,6 -264,17 +295,17 @@@ int nfp_flower_setup_tc_egress_cb(enum 
+  void nfp_flower_lag_init(struct nfp_fl_lag *lag);
+  void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag);
+  int nfp_flower_lag_reset(struct nfp_fl_lag *lag);
+ -int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
+ -				struct net_device *netdev,
+ -				unsigned long event, void *ptr);
+  bool nfp_flower_lag_unprocessed_msg(struct nfp_app *app, struct sk_buff *skb);
+++<<<<<<< HEAD
+++=======
++ int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
++ 				       struct net_device *master,
++ 				       struct nfp_fl_pre_lag *pre_act);
++ int nfp_flower_lag_get_output_id(struct nfp_app *app,
++ 				 struct net_device *master);
++ int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
++ 				       struct net_device *netdev,
++ 				       unsigned long event);
+++>>>>>>> 3166dd07a9cb (nfp: flower: offload tunnel decap rules via indirect TC blocks)
+  
+  #endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/offload.c b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 970ddbd64602..8ab593aee574 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -159,6 +159,7 @@ nfp_flower_calc_opt_layer(struct flow_dissector_key_enc_opts *enc_opts,
+ 
+ static int
+ nfp_flower_calculate_key_layers(struct nfp_app *app,
++				struct net_device *netdev,
+ 				struct nfp_fl_key_ls *ret_key_ls,
+ 				struct tc_cls_flower_offload *flow,
+ 				bool egress,
+@@ -217,8 +218,6 @@ nfp_flower_calculate_key_layers(struct nfp_app *app,
+ 			skb_flow_dissector_target(flow->dissector,
+ 						  FLOW_DISSECTOR_KEY_ENC_CONTROL,
+ 						  flow->key);
+-		if (!egress)
+-			return -EOPNOTSUPP;
+ 
+ 		if (mask_enc_ctl->addr_type != 0xffff ||
+ 		    enc_ctl->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+@@ -281,6 +280,10 @@ nfp_flower_calculate_key_layers(struct nfp_app *app,
+ 		default:
+ 			return -EOPNOTSUPP;
+ 		}
++
++		/* Ensure the ingress netdev matches the expected tun type. */
++		if (!nfp_fl_netdev_is_tunnel_type(netdev, *tun_type))
++			return -EOPNOTSUPP;
+ 	} else if (egress) {
+ 		/* Reject non tunnel matches offloaded to egress repr. */
+ 		return -EOPNOTSUPP;
+@@ -468,8 +471,8 @@ nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
+ 	if (!key_layer)
+ 		return -ENOMEM;
+ 
+-	err = nfp_flower_calculate_key_layers(app, key_layer, flow, egress,
+-					      &tun_type);
++	err = nfp_flower_calculate_key_layers(app, netdev, key_layer, flow,
++					      egress, &tun_type);
+ 	if (err)
+ 		goto err_free_key_ls;
+ 
+@@ -679,3 +682,129 @@ int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+ 		return -EOPNOTSUPP;
+ 	}
+ }
++
++struct nfp_flower_indr_block_cb_priv {
++	struct net_device *netdev;
++	struct nfp_app *app;
++	struct list_head list;
++};
++
++static struct nfp_flower_indr_block_cb_priv *
++nfp_flower_indr_block_cb_priv_lookup(struct nfp_app *app,
++				     struct net_device *netdev)
++{
++	struct nfp_flower_indr_block_cb_priv *cb_priv;
++	struct nfp_flower_priv *priv = app->priv;
++
++	/* All callback list access should be protected by RTNL. */
++	ASSERT_RTNL();
++
++	list_for_each_entry(cb_priv, &priv->indr_block_cb_priv, list)
++		if (cb_priv->netdev == netdev)
++			return cb_priv;
++
++	return NULL;
++}
++
++static int nfp_flower_setup_indr_block_cb(enum tc_setup_type type,
++					  void *type_data, void *cb_priv)
++{
++	struct nfp_flower_indr_block_cb_priv *priv = cb_priv;
++	struct tc_cls_flower_offload *flower = type_data;
++
++	if (flower->common.chain_index)
++		return -EOPNOTSUPP;
++
++	switch (type) {
++	case TC_SETUP_CLSFLOWER:
++		return nfp_flower_repr_offload(priv->app, priv->netdev,
++					       type_data, false);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static int
++nfp_flower_setup_indr_tc_block(struct net_device *netdev, struct nfp_app *app,
++			       struct tc_block_offload *f)
++{
++	struct nfp_flower_indr_block_cb_priv *cb_priv;
++	struct nfp_flower_priv *priv = app->priv;
++	int err;
++
++	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case TC_BLOCK_BIND:
++		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
++		if (!cb_priv)
++			return -ENOMEM;
++
++		cb_priv->netdev = netdev;
++		cb_priv->app = app;
++		list_add(&cb_priv->list, &priv->indr_block_cb_priv);
++
++		err = tcf_block_cb_register(f->block,
++					    nfp_flower_setup_indr_block_cb,
++					    netdev, cb_priv, f->extack);
++		if (err) {
++			list_del(&cb_priv->list);
++			kfree(cb_priv);
++		}
++
++		return err;
++	case TC_BLOCK_UNBIND:
++		tcf_block_cb_unregister(f->block,
++					nfp_flower_setup_indr_block_cb, netdev);
++		cb_priv = nfp_flower_indr_block_cb_priv_lookup(app, netdev);
++		if (cb_priv) {
++			list_del(&cb_priv->list);
++			kfree(cb_priv);
++		}
++
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++	return 0;
++}
++
++static int
++nfp_flower_indr_setup_tc_cb(struct net_device *netdev, void *cb_priv,
++			    enum tc_setup_type type, void *type_data)
++{
++	switch (type) {
++	case TC_SETUP_BLOCK:
++		return nfp_flower_setup_indr_tc_block(netdev, cb_priv,
++						      type_data);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
++				       struct net_device *netdev,
++				       unsigned long event)
++{
++	int err;
++
++	if (!nfp_fl_is_netdev_to_offload(netdev))
++		return NOTIFY_OK;
++
++	if (event == NETDEV_REGISTER) {
++		err = __tc_indr_block_cb_register(netdev, app,
++						  nfp_flower_indr_setup_tc_cb,
++						  netdev);
++		if (err)
++			nfp_flower_cmsg_warn(app,
++					     "Indirect block reg failed - %s\n",
++					     netdev->name);
++	} else if (event == NETDEV_UNREGISTER) {
++		__tc_indr_block_cb_unregister(netdev,
++					      nfp_flower_indr_setup_tc_cb,
++					      netdev);
++	}
++
++	return NOTIFY_OK;
++}
