@@ -1,0 +1,270 @@
+sysfs: make sysfs_file_ops() follow ignore_lockdep flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 785a162d147a547bc7a577c1c28f6fb9dbeb4f16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/785a162d.failed
+
+375b611e60 ("sysfs: remove sysfs_buffer->ops") introduced
+sysfs_file_ops() which determines the associated file operation of a
+given sysfs_dirent.  As file ops access should be protected by an
+active reference, the new function includes a lockdep assertion on the
+sysfs_dirent; unfortunately, I forgot to take attr->ignore_lockdep
+flag into account and the lockdep assertion trips spuriously for files
+which opt out from active reference lockdep checking.
+
+# cat /sys/devices/pci0000:00/0000:00:01.2/usb1/authorized
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 1 PID: 540 at /work/os/work/fs/sysfs/file.c:79 sysfs_file_ops+0x4e/0x60()
+ Modules linked in:
+ CPU: 1 PID: 540 Comm: cat Not tainted 3.11.0-work+ #3
+ Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+  0000000000000009 ffff880016205c08 ffffffff81ca0131 0000000000000000
+  ffff880016205c40 ffffffff81096d0d ffff8800166cb898 ffff8800166f6f60
+  ffffffff8125a220 ffff880011ab1ec0 ffff88000aff0c78 ffff880016205c50
+ Call Trace:
+  [<ffffffff81ca0131>] dump_stack+0x4e/0x82
+  [<ffffffff81096d0d>] warn_slowpath_common+0x7d/0xa0
+  [<ffffffff81096dea>] warn_slowpath_null+0x1a/0x20
+  [<ffffffff8125994e>] sysfs_file_ops+0x4e/0x60
+  [<ffffffff8125a274>] sysfs_open_file+0x54/0x300
+  [<ffffffff811df612>] do_dentry_open.isra.17+0x182/0x280
+  [<ffffffff811df820>] finish_open+0x30/0x40
+  [<ffffffff811f0623>] do_last+0x503/0xd90
+  [<ffffffff811f0f6b>] path_openat+0xbb/0x6d0
+  [<ffffffff811f23ba>] do_filp_open+0x3a/0x90
+  [<ffffffff811e09a9>] do_sys_open+0x129/0x220
+  [<ffffffff811e0abe>] SyS_open+0x1e/0x20
+  [<ffffffff81caf3c2>] system_call_fastpath+0x16/0x1b
+ ---[ end trace aa48096b111dafdb ]---
+
+Rename fs/sysfs/dir.c::ignore_lockdep() to sysfs_ignore_lockdep() and
+move it to fs/sysfs/sysfs.h and make sysfs_file_ops() skip lockdep
+assertion if sysfs_ignore_lockdep() is true.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reported-by: Yinghai Lu <yinghai@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 785a162d147a547bc7a577c1c28f6fb9dbeb4f16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,c324ee906df0..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -41,52 -44,91 +41,73 @@@ struct sysfs_open_dirent 
+  	atomic_t		refcnt;
+  	atomic_t		event;
+  	wait_queue_head_t	poll;
+ -	struct list_head	files; /* goes through sysfs_open_file.list */
+ +	struct list_head	buffers; /* goes through sysfs_buffer.list */
+  };
+  
+ -struct sysfs_open_file {
+ -	struct sysfs_dirent	*sd;
+ -	struct file		*file;
+ +struct sysfs_buffer {
+ +	size_t			count;
+ +	loff_t			pos;
+ +	char			* page;
+ +	const struct sysfs_ops	* ops;
+  	struct mutex		mutex;
+ +	int			needs_read_fill;
+  	int			event;
+  	struct list_head	list;
+ -
+ -	bool			mmapped;
+ -	const struct vm_operations_struct *vm_ops;
+  };
+  
+ -static bool sysfs_is_bin(struct sysfs_dirent *sd)
+ -{
+ -	return sysfs_type(sd) == SYSFS_KOBJ_BIN_ATTR;
+ -}
+ -
+ -static struct sysfs_open_file *sysfs_of(struct file *file)
+ -{
+ -	return ((struct seq_file *)file->private_data)->private;
+ -}
+ -
+ -/*
+ - * Determine ktype->sysfs_ops for the given sysfs_dirent.  This function
+ - * must be called while holding an active reference.
+ +/**
+ + *	fill_read_buffer - allocate and fill buffer from object.
+ + *	@dentry:	dentry pointer.
+ + *	@buffer:	data buffer for file.
+ + *
+ + *	Allocate @buffer->page, if it hasn't been already, then call the
+ + *	kobject's show() method to fill the buffer with this attribute's
+ + *	data.
+ + *	This is called only once, on the file's first read unless an error
+ + *	is returned.
+   */
+ -static const struct sysfs_ops *sysfs_file_ops(struct sysfs_dirent *sd)
+ +static int fill_read_buffer(struct dentry * dentry, struct sysfs_buffer * buffer)
+  {
+++<<<<<<< HEAD
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+ +	int ret = 0;
+++=======
++ 	struct kobject *kobj = sd->s_parent->s_dir.kobj;
++ 
++ 	if (!sysfs_ignore_lockdep(sd))
++ 		lockdep_assert_held(sd);
++ 	return kobj->ktype ? kobj->ktype->sysfs_ops : NULL;
++ }
++ 
++ /*
++  * Reads on sysfs are handled through seq_file, which takes care of hairy
++  * details like buffering and seeking.  The following function pipes
++  * sysfs_ops->show() result through seq_file.
++  */
++ static int sysfs_seq_show(struct seq_file *sf, void *v)
++ {
++ 	struct sysfs_open_file *of = sf->private;
++ 	struct kobject *kobj = of->sd->s_parent->s_dir.kobj;
++ 	const struct sysfs_ops *ops;
++ 	char *buf;
+++>>>>>>> 785a162d147a (sysfs: make sysfs_file_ops() follow ignore_lockdep flag)
+  	ssize_t count;
+  
+ -	/* acquire buffer and ensure that it's >= PAGE_SIZE */
+ -	count = seq_get_buf(sf, &buf);
+ -	if (count < PAGE_SIZE) {
+ -		seq_commit(sf, -1);
+ -		return 0;
+ -	}
+ +	if (!buffer->page)
+ +		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -	/*
+ -	 * Need @of->sd for attr and ops, its parent for kobj.  @of->mutex
+ -	 * nests outside active ref and is just to ensure that the ops
+ -	 * aren't called concurrently for the same open file.
+ -	 */
+ -	mutex_lock(&of->mutex);
+ -	if (!sysfs_get_active(of->sd)) {
+ -		mutex_unlock(&of->mutex);
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+  		return -ENODEV;
+ -	}
+ -
+ -	of->event = atomic_read(&of->sd->s_attr.open->event);
+ -
+ -	/*
+ -	 * Lookup @ops and invoke show().  Control may reach here via seq
+ -	 * file lseek even if @ops->show() isn't implemented.
+ -	 */
+ -	ops = sysfs_file_ops(of->sd);
+ -	if (ops->show)
+ -		count = ops->show(kobj, of->sd->s_attr.attr, buf);
+ -	else
+ -		count = 0;
+  
+ -	sysfs_put_active(of->sd);
+ -	mutex_unlock(&of->mutex);
+ +	buffer->event = atomic_read(&attr_sd->s_attr.open->event);
+ +	count = ops->show(kobj, attr_sd->s_attr.attr, buffer->page);
+  
+ -	if (count < 0)
+ -		return count;
+ +	sysfs_put_active(attr_sd);
+  
+  	/*
+  	 * The code works fine with PAGE_SIZE return but it's likely to
+diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
+index fd502d3fc9fc..922e3efeb87f 100644
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -132,24 +132,6 @@ static void sysfs_unlink_sibling(struct sysfs_dirent *sd)
+ 	rb_erase(&sd->s_rb, &sd->s_parent->s_dir.children);
+ }
+ 
+-#ifdef CONFIG_DEBUG_LOCK_ALLOC
+-
+-/* Test for attributes that want to ignore lockdep for read-locking */
+-static bool ignore_lockdep(struct sysfs_dirent *sd)
+-{
+-	return sysfs_type(sd) == SYSFS_KOBJ_ATTR &&
+-			sd->s_attr.attr->ignore_lockdep;
+-}
+-
+-#else
+-
+-static inline bool ignore_lockdep(struct sysfs_dirent *sd)
+-{
+-	return true;
+-}
+-
+-#endif
+-
+ /**
+  *	sysfs_get_active - get an active reference to sysfs_dirent
+  *	@sd: sysfs_dirent to get an active reference to
+@@ -168,7 +150,7 @@ struct sysfs_dirent *sysfs_get_active(struct sysfs_dirent *sd)
+ 	if (!atomic_inc_unless_negative(&sd->s_active))
+ 		return NULL;
+ 
+-	if (likely(!ignore_lockdep(sd)))
++	if (likely(!sysfs_ignore_lockdep(sd)))
+ 		rwsem_acquire_read(&sd->dep_map, 0, 1, _RET_IP_);
+ 	return sd;
+ }
+@@ -187,7 +169,7 @@ void sysfs_put_active(struct sysfs_dirent *sd)
+ 	if (unlikely(!sd))
+ 		return;
+ 
+-	if (likely(!ignore_lockdep(sd)))
++	if (likely(!sysfs_ignore_lockdep(sd)))
+ 		rwsem_release(&sd->dep_map, 1, _RET_IP_);
+ 	v = atomic_dec_return(&sd->s_active);
+ 	if (likely(v != SD_DEACTIVATED_BIAS))
+* Unmerged path fs/sysfs/file.c
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index b6deca3e301d..e8a1e8e8e18e 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -115,6 +115,7 @@ static inline enum kobj_ns_type sysfs_ns_type(struct sysfs_dirent *sd)
+ }
+ 
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++
+ #define sysfs_dirent_init_lockdep(sd)				\
+ do {								\
+ 	struct attribute *attr = sd->s_attr.attr;		\
+@@ -124,8 +125,23 @@ do {								\
+ 								\
+ 	lockdep_init_map(&sd->dep_map, "s_active", key, 0);	\
+ } while (0)
++
++/* Test for attributes that want to ignore lockdep for read-locking */
++static inline bool sysfs_ignore_lockdep(struct sysfs_dirent *sd)
++{
++	return sysfs_type(sd) == SYSFS_KOBJ_ATTR &&
++		sd->s_attr.attr->ignore_lockdep;
++}
++
+ #else
++
+ #define sysfs_dirent_init_lockdep(sd) do {} while (0)
++
++static inline bool sysfs_ignore_lockdep(struct sysfs_dirent *sd)
++{
++	return true;
++}
++
+ #endif
+ 
+ /*
