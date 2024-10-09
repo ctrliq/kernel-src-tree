@@ -1,0 +1,1056 @@
+scsi: qla2xxx: Replace usage of spin_lock with spin_lock_irqsave
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Replace usage of spin_lock with spin_lock_irqsave (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 95.08%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 8b631d87ba55f43dbd29b9e8b477301539c08815
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b631d87.failed
+
+Convert usage of spin_lock to spin_lock_irqsave because qla2xxx driver
+can access all the data structures in an interrupt context.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Bart Van Assche <Bart.VanAssche@sandisk.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8b631d87ba55f43dbd29b9e8b477301539c08815)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index f10c075d97ef,a2e17a5794ab..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1238,9 -1758,94 +1238,97 @@@ static void qlt_24xx_retry_term_exchang
+  	    FCP_TMF_CMPL, true);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int abort_cmd_for_tag(struct scsi_qla_host *vha, uint32_t tag)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		if (tag == op->atio.u.isp24.exchange_addr) {
++ 			op->aborted = true;
++ 			spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 			return 1;
++ 		}
++ 	}
++ 
++ 	list_for_each_entry(op, &vha->unknown_atio_list, cmd_list) {
++ 		if (tag == op->atio.u.isp24.exchange_addr) {
++ 			op->aborted = true;
++ 			spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 			return 1;
++ 		}
++ 	}
++ 
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		if (tag == cmd->atio.u.isp24.exchange_addr) {
++ 			cmd->aborted = 1;
++ 			spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 			return 1;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 	return 0;
++ }
++ 
++ /* drop cmds for the given lun
++  * XXX only looks for cmds on the port through which lun reset was recieved
++  * XXX does not go through the list of other port (which may have cmds
++  *     for the same lun)
++  */
++ static void abort_cmds_for_lun(struct scsi_qla_host *vha,
++ 				uint32_t lun, uint8_t *s_id)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	uint32_t key;
++ 	unsigned long flags;
++ 
++ 	key = sid_to_key(s_id);
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		uint32_t op_key;
++ 		uint32_t op_lun;
++ 
++ 		op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		op_lun = scsilun_to_int(
++ 			(struct scsi_lun *)&op->atio.u.isp24.fcp_cmnd.lun);
++ 		if (op_key == key && op_lun == lun)
++ 			op->aborted = true;
++ 	}
++ 
++ 	list_for_each_entry(op, &vha->unknown_atio_list, cmd_list) {
++ 		uint32_t op_key;
++ 		u64 op_lun;
++ 
++ 		op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		op_lun = scsilun_to_int(
++ 			(struct scsi_lun *)&op->atio.u.isp24.fcp_cmnd.lun);
++ 		if (op_key == key && op_lun == lun)
++ 			op->aborted = true;
++ 	}
++ 
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		uint32_t cmd_key;
++ 		uint32_t cmd_lun;
++ 
++ 		cmd_key = sid_to_key(cmd->atio.u.isp24.fcp_hdr.s_id);
++ 		cmd_lun = scsilun_to_int(
++ 			(struct scsi_lun *)&cmd->atio.u.isp24.fcp_cmnd.lun);
++ 		if (cmd_key == key && cmd_lun == lun)
++ 			cmd->aborted = 1;
++ 	}
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ }
++ 
+++>>>>>>> 8b631d87ba55 (scsi: qla2xxx: Replace usage of spin_lock with spin_lock_irqsave)
+  /* ha->hardware_lock supposed to be held on entry */
+  static int __qlt_24xx_handle_abts(struct scsi_qla_host *vha,
+ -	struct abts_recv_from_24xx *abts, struct fc_port *sess)
+ +	struct abts_recv_from_24xx *abts, struct qla_tgt_sess *sess)
+  {
+  	struct qla_hw_data *ha = vha->hw;
+  	struct se_session *se_sess = sess->se_sess;
+@@@ -2737,10 -4207,52 +2825,53 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+ +	cmd = kmem_cache_zalloc(qla_tgt_cmd_cachep, GFP_ATOMIC);
+++=======
++ 	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha, atio->u.isp24.fcp_hdr.s_id);
++ 	if (unlikely(!sess)) {
++ 		struct qla_tgt_sess_op *op = kzalloc(sizeof(struct qla_tgt_sess_op),
++ 						     GFP_ATOMIC);
++ 		if (!op)
++ 			return -ENOMEM;
++ 
++ 		memcpy(&op->atio, atio, sizeof(*atio));
++ 		op->vha = vha;
++ 
++ 		spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 		list_add_tail(&op->cmd_list, &vha->qla_sess_op_cmd_list);
++ 		spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
++ 		INIT_WORK(&op->work, qlt_create_sess_from_atio);
++ 		queue_work(qla_tgt_wq, &op->work);
++ 		return 0;
++ 	}
++ 
++ 	/* Another WWN used to have our s_id. Our PLOGI scheduled its
++ 	 * session deletion, but it's still in sess_del_work wq */
++ 	if (sess->deleted) {
++ 		ql_dbg(ql_dbg_io, vha, 0x3061,
++ 		    "New command while old session %p is being deleted\n",
++ 		    sess);
++ 		return -EFAULT;
++ 	}
++ 
++ 	/*
++ 	 * Do kref_get() before returning + dropping qla_hw_data->hardware_lock.
++ 	 */
++ 	if (!kref_get_unless_zero(&sess->sess_kref)) {
++ 		ql_dbg(ql_dbg_tgt, vha, 0xffff,
++ 		    "%s: kref_get fail, %8phC oxid %x \n",
++ 		    __func__, sess->port_name,
++ 		     be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id));
++ 		return -EFAULT;
++ 	}
++ 
++ 	cmd = qlt_get_tag(vha, sess, atio);
+++>>>>>>> 8b631d87ba55 (scsi: qla2xxx: Replace usage of spin_lock with spin_lock_irqsave)
+  	if (!cmd) {
+ -		ql_dbg(ql_dbg_io, vha, 0x3062,
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05e,
+  		    "qla_target(%d): Allocation of cmd failed\n", vha->vp_idx);
+ -		spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+ -		ha->tgt.tgt_ops->put_sess(sess);
+ -		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+  		return -ENOMEM;
+  	}
+  
+@@@ -2955,493 -4431,420 +3086,631 @@@ static int qlt_abort_task(struct scsi_q
+  	return __qlt_abort_task(vha, iocb, sess);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void qlt_logo_completion_handler(fc_port_t *fcport, int rc)
++ {
++ 	if (rc != MBS_COMMAND_COMPLETE) {
++ 		ql_dbg(ql_dbg_tgt_mgt, fcport->vha, 0xf093,
++ 			"%s: se_sess %p / sess %p from"
++ 			" port %8phC loop_id %#04x s_id %02x:%02x:%02x"
++ 			" LOGO failed: %#x\n",
++ 			__func__,
++ 			fcport->se_sess,
++ 			fcport,
++ 			fcport->port_name, fcport->loop_id,
++ 			fcport->d_id.b.domain, fcport->d_id.b.area,
++ 			fcport->d_id.b.al_pa, rc);
++ 	}
++ 
++ 	fcport->logout_completed = 1;
++ }
++ 
++ /*
++ * ha->hardware_lock supposed to be held on entry (to protect tgt->sess_list)
++ *
++ * Schedules sessions with matching port_id/loop_id but different wwn for
++ * deletion. Returns existing session with matching wwn if present.
++ * Null otherwise.
++ */
++ struct fc_port *
++ qlt_find_sess_invalidate_other(scsi_qla_host_t *vha, uint64_t wwn,
++     port_id_t port_id, uint16_t loop_id, struct fc_port **conflict_sess)
++ {
++ 	struct fc_port *sess = NULL, *other_sess;
++ 	uint64_t other_wwn;
++ 
++ 	*conflict_sess = NULL;
++ 
++ 	list_for_each_entry(other_sess, &vha->vp_fcports, list) {
++ 
++ 		other_wwn = wwn_to_u64(other_sess->port_name);
++ 
++ 		if (wwn == other_wwn) {
++ 			WARN_ON(sess);
++ 			sess = other_sess;
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport_id collision */
++ 		if (port_id.b24 == other_sess->d_id.b24) {
++ 			if (loop_id != other_sess->loop_id) {
++ 				ql_dbg(ql_dbg_tgt_tmr, vha, 0x1000c,
++ 				    "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 				    other_sess, other_sess->loop_id, other_wwn);
++ 
++ 				/*
++ 				 * logout_on_delete is set by default, but another
++ 				 * session that has the same s_id/loop_id combo
++ 				 * might have cleared it when requested this session
++ 				 * deletion, so don't touch it
++ 				 */
++ 				qlt_schedule_sess_for_deletion(other_sess, true);
++ 			} else {
++ 				/*
++ 				 * Another wwn used to have our s_id/loop_id
++ 				 * kill the session, but don't free the loop_id
++ 				 */
++ 				ql_dbg(ql_dbg_tgt_tmr, vha, 0xffff,
++ 				    "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 				    other_sess, other_sess->loop_id, other_wwn);
++ 
++ 
++ 				other_sess->keep_nport_handle = 1;
++ 				*conflict_sess = other_sess;
++ 				qlt_schedule_sess_for_deletion(other_sess,
++ 				    true);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport handle collision */
++ 		if ((loop_id == other_sess->loop_id) &&
++ 			(loop_id != FC_NO_LOOP_ID)) {
++ 			ql_dbg(ql_dbg_tgt_tmr, vha, 0x1000d,
++ 			       "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 			       other_sess, other_sess->loop_id, other_wwn);
++ 
++ 			/* Same loop_id but different s_id
++ 			 * Ok to kill and logout */
++ 			qlt_schedule_sess_for_deletion(other_sess, true);
++ 		}
++ 	}
++ 
++ 	return sess;
++ }
++ 
++ /* Abort any commands for this s_id waiting on qla_tgt_wq workqueue */
++ static int abort_cmds_for_s_id(struct scsi_qla_host *vha, port_id_t *s_id)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	uint32_t key;
++ 	int count = 0;
++ 	unsigned long flags;
++ 
++ 	key = (((u32)s_id->b.domain << 16) |
++ 	       ((u32)s_id->b.area   <<  8) |
++ 	       ((u32)s_id->b.al_pa));
++ 
++ 	spin_lock_irqsave(&vha->cmd_list_lock, flags);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		uint32_t op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 
++ 		if (op_key == key) {
++ 			op->aborted = true;
++ 			count++;
++ 		}
++ 	}
++ 
++ 	list_for_each_entry(op, &vha->unknown_atio_list, cmd_list) {
++ 		uint32_t op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		if (op_key == key) {
++ 			op->aborted = true;
++ 			count++;
++ 		}
++ 	}
++ 
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		uint32_t cmd_key = sid_to_key(cmd->atio.u.isp24.fcp_hdr.s_id);
++ 		if (cmd_key == key) {
++ 			cmd->aborted = 1;
++ 			count++;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&vha->cmd_list_lock, flags);
++ 
+ -	return count;
+++	return count;
+++}
+++
+++>>>>>>> 8b631d87ba55 (scsi: qla2xxx: Replace usage of spin_lock with spin_lock_irqsave)
+ +/*
+ + * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+ + */
+ +static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ +	struct imm_ntfy_from_isp *iocb)
+ +{
+ +	struct qla_hw_data *ha = vha->hw;
+ +	int res = 0;
+ +
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf026,
+ +	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+ +	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+ +
+ +	switch (iocb->u.isp24.status_subcode) {
+ +	case ELS_PLOGI:
+ +	case ELS_FLOGI:
+ +	case ELS_PRLI:
+ +	case ELS_LOGO:
+ +	case ELS_PRLO:
+ +		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+ +		break;
+ +	case ELS_PDISC:
+ +	case ELS_ADISC:
+ +	{
+ +		struct qla_tgt *tgt = ha->tgt.qla_tgt;
+ +		if (tgt->link_reinit_iocb_pending) {
+ +			qlt_send_notify_ack(vha, &tgt->link_reinit_iocb,
+ +			    0, 0, 0, 0, 0, 0);
+ +			tgt->link_reinit_iocb_pending = 0;
+ +		}
+ +		res = 1; /* send notify ack */
+ +		break;
+ +	}
+ +
+ +	default:
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf061,
+ +		    "qla_target(%d): Unsupported ELS command %x "
+ +		    "received\n", vha->vp_idx, iocb->u.isp24.status_subcode);
+ +		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+ +		break;
+ +	}
+ +
+ +	return res;
+ +}
+ +
+ +static int qlt_set_data_offset(struct qla_tgt_cmd *cmd, uint32_t offset)
+ +{
+ +#if 1
+ +	/*
+ +	 * FIXME: Reject non zero SRR relative offset until we can test
+ +	 * this code properly.
+ +	 */
+ +	pr_debug("Rejecting non zero SRR rel_offs: %u\n", offset);
+ +	return -1;
+ +#else
+ +	struct scatterlist *sg, *sgp, *sg_srr, *sg_srr_start = NULL;
+ +	size_t first_offset = 0, rem_offset = offset, tmp = 0;
+ +	int i, sg_srr_cnt, bufflen = 0;
+ +
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe023,
+ +	    "Entering qla_tgt_set_data_offset: cmd: %p, cmd->sg: %p, "
+ +	    "cmd->sg_cnt: %u, direction: %d\n",
+ +	    cmd, cmd->sg, cmd->sg_cnt, cmd->dma_data_direction);
+ +
+ +	if (!cmd->sg || !cmd->sg_cnt) {
+ +		ql_dbg(ql_dbg_tgt, cmd->vha, 0xe055,
+ +		    "Missing cmd->sg or zero cmd->sg_cnt in"
+ +		    " qla_tgt_set_data_offset\n");
+ +		return -EINVAL;
+ +	}
+ +	/*
+ +	 * Walk the current cmd->sg list until we locate the new sg_srr_start
+ +	 */
+ +	for_each_sg(cmd->sg, sg, cmd->sg_cnt, i) {
+ +		ql_dbg(ql_dbg_tgt, cmd->vha, 0xe024,
+ +		    "sg[%d]: %p page: %p, length: %d, offset: %d\n",
+ +		    i, sg, sg_page(sg), sg->length, sg->offset);
+ +
+ +		if ((sg->length + tmp) > offset) {
+ +			first_offset = rem_offset;
+ +			sg_srr_start = sg;
+ +			ql_dbg(ql_dbg_tgt, cmd->vha, 0xe025,
+ +			    "Found matching sg[%d], using %p as sg_srr_start, "
+ +			    "and using first_offset: %zu\n", i, sg,
+ +			    first_offset);
+ +			break;
+ +		}
+ +		tmp += sg->length;
+ +		rem_offset -= sg->length;
+ +	}
+ +
+ +	if (!sg_srr_start) {
+ +		ql_dbg(ql_dbg_tgt, cmd->vha, 0xe056,
+ +		    "Unable to locate sg_srr_start for offset: %u\n", offset);
+ +		return -EINVAL;
+ +	}
+ +	sg_srr_cnt = (cmd->sg_cnt - i);
+ +
+ +	sg_srr = kzalloc(sizeof(struct scatterlist) * sg_srr_cnt, GFP_KERNEL);
+ +	if (!sg_srr) {
+ +		ql_dbg(ql_dbg_tgt, cmd->vha, 0xe057,
+ +		    "Unable to allocate sgp\n");
+ +		return -ENOMEM;
+ +	}
+ +	sg_init_table(sg_srr, sg_srr_cnt);
+ +	sgp = &sg_srr[0];
+ +	/*
+ +	 * Walk the remaining list for sg_srr_start, mapping to the newly
+ +	 * allocated sg_srr taking first_offset into account.
+ +	 */
+ +	for_each_sg(sg_srr_start, sg, sg_srr_cnt, i) {
+ +		if (first_offset) {
+ +			sg_set_page(sgp, sg_page(sg),
+ +			    (sg->length - first_offset), first_offset);
+ +			first_offset = 0;
+ +		} else {
+ +			sg_set_page(sgp, sg_page(sg), sg->length, 0);
+ +		}
+ +		bufflen += sgp->length;
+ +
+ +		sgp = sg_next(sgp);
+ +		if (!sgp)
+ +			break;
+ +	}
+ +
+ +	cmd->sg = sg_srr;
+ +	cmd->sg_cnt = sg_srr_cnt;
+ +	cmd->bufflen = bufflen;
+ +	cmd->offset += offset;
+ +	cmd->free_sg = 1;
+ +
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe026, "New cmd->sg: %p\n", cmd->sg);
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe027, "New cmd->sg_cnt: %u\n",
+ +	    cmd->sg_cnt);
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe028, "New cmd->bufflen: %u\n",
+ +	    cmd->bufflen);
+ +	ql_dbg(ql_dbg_tgt, cmd->vha, 0xe029, "New cmd->offset: %u\n",
+ +	    cmd->offset);
+ +
+ +	if (cmd->sg_cnt < 0)
+ +		BUG();
+ +
+ +	if (cmd->bufflen < 0)
+ +		BUG();
+ +
+ +	return 0;
+ +#endif
+  }
+  
+ -/*
+ - * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+ - */
+ -static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ -	struct imm_ntfy_from_isp *iocb)
+ +static inline int qlt_srr_adjust_data(struct qla_tgt_cmd *cmd,
+ +	uint32_t srr_rel_offs, int *xmit_type)
+  {
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+ -	struct qla_hw_data *ha = vha->hw;
+ -	struct fc_port *sess = NULL, *conflict_sess = NULL;
+ -	uint64_t wwn;
+ -	port_id_t port_id;
+ -	uint16_t loop_id;
+ -	uint16_t wd3_lo;
+ -	int res = 0;
+ -	struct qlt_plogi_ack_t *pla;
+ -	unsigned long flags;
+ +	int res = 0, rel_offs;
+  
+ -	wwn = wwn_to_u64(iocb->u.isp24.port_name);
+ +	rel_offs = srr_rel_offs - cmd->offset;
+ +	ql_dbg(ql_dbg_tgt_mgt, cmd->vha, 0xf027, "srr_rel_offs=%d, rel_offs=%d",
+ +	    srr_rel_offs, rel_offs);
+  
+ -	port_id.b.domain = iocb->u.isp24.port_id[2];
+ -	port_id.b.area   = iocb->u.isp24.port_id[1];
+ -	port_id.b.al_pa  = iocb->u.isp24.port_id[0];
+ -	port_id.b.rsvd_1 = 0;
+ +	*xmit_type = QLA_TGT_XMIT_ALL;
+  
+ -	loop_id = le16_to_cpu(iocb->u.isp24.nport_handle);
+ +	if (rel_offs < 0) {
+ +		ql_dbg(ql_dbg_tgt_mgt, cmd->vha, 0xf062,
+ +		    "qla_target(%d): SRR rel_offs (%d) < 0",
+ +		    cmd->vha->vp_idx, rel_offs);
+ +		res = -1;
+ +	} else if (rel_offs == cmd->bufflen)
+ +		*xmit_type = QLA_TGT_XMIT_STATUS;
+ +	else if (rel_offs > 0)
+ +		res = qlt_set_data_offset(cmd, rel_offs);
+  
+ -	ql_dbg(ql_dbg_disc, vha, 0xf026,
+ -	    "qla_target(%d): Port ID: %02x:%02x:%02x ELS opcode: 0x%02x lid %d %8phC\n",
+ -	    vha->vp_idx, iocb->u.isp24.port_id[2],
+ -		iocb->u.isp24.port_id[1], iocb->u.isp24.port_id[0],
+ -		   iocb->u.isp24.status_subcode, loop_id,
+ -		iocb->u.isp24.port_name);
+ +	return res;
+ +}
+  
+ -	/* res = 1 means ack at the end of thread
+ -	 * res = 0 means ack async/later.
+ -	 */
+ -	switch (iocb->u.isp24.status_subcode) {
+ -	case ELS_PLOGI:
+ +/* No locks, thread context */
+ +static void qlt_handle_srr(struct scsi_qla_host *vha,
+ +	struct qla_tgt_srr_ctio *sctio, struct qla_tgt_srr_imm *imm)
+ +{
+ +	struct imm_ntfy_from_isp *ntfy =
+ +	    (struct imm_ntfy_from_isp *)&imm->imm_ntfy;
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct qla_tgt_cmd *cmd = sctio->cmd;
+ +	struct se_cmd *se_cmd = &cmd->se_cmd;
+ +	unsigned long flags;
+ +	int xmit_type = 0, resp = 0;
+ +	uint32_t offset;
+ +	uint16_t srr_ui;
+  
+ -		/* Mark all stale commands in qla_tgt_wq for deletion */
+ -		abort_cmds_for_s_id(vha, &port_id);
+ +	offset = le32_to_cpu(ntfy->u.isp24.srr_rel_offs);
+ +	srr_ui = ntfy->u.isp24.srr_ui;
+  
+ -		if (wwn) {
+ -			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
+ -			sess = qlt_find_sess_invalidate_other(vha, wwn,
+ -				port_id, loop_id, &conflict_sess);
+ -			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
+ -		}
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf028, "SRR cmd %p, srr_ui %x\n",
+ +	    cmd, srr_ui);
+  
+ -		if (IS_SW_RESV_ADDR(port_id)) {
+ -			res = 1;
+ -			break;
+ +	switch (srr_ui) {
+ +	case SRR_IU_STATUS:
+ +		spin_lock_irqsave(&ha->hardware_lock, flags);
+ +		qlt_send_notify_ack(vha, ntfy,
+ +		    0, 0, 0, NOTIFY_ACK_SRR_FLAGS_ACCEPT, 0, 0);
+ +		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +		xmit_type = QLA_TGT_XMIT_STATUS;
+ +		resp = 1;
+ +		break;
+ +	case SRR_IU_DATA_IN:
+ +		if (!cmd->sg || !cmd->sg_cnt) {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf063,
+ +			    "Unable to process SRR_IU_DATA_IN due to"
+ +			    " missing cmd->sg, state: %d\n", cmd->state);
+ +			dump_stack();
+ +			goto out_reject;
+  		}
+ -
+ -		pla = qlt_plogi_ack_find_add(vha, &port_id, iocb);
+ -		if (!pla) {
+ -			qlt_send_term_imm_notif(vha, iocb, 1);
+ -			break;
+ +		if (se_cmd->scsi_status != 0) {
+ +			ql_dbg(ql_dbg_tgt, vha, 0xe02a,
+ +			    "Rejecting SRR_IU_DATA_IN with non GOOD "
+ +			    "scsi_status\n");
+ +			goto out_reject;
+  		}
+ +		cmd->bufflen = se_cmd->data_length;
+  
+ -		res = 0;
+ -
+ -		if (conflict_sess) {
+ -			conflict_sess->login_gen++;
+ -			qlt_plogi_ack_link(vha, pla, conflict_sess,
+ -				QLT_PLOGI_LINK_CONFLICT);
+ +		if (qlt_has_data(cmd)) {
+ +			if (qlt_srr_adjust_data(cmd, offset, &xmit_type) != 0)
+ +				goto out_reject;
+ +			spin_lock_irqsave(&ha->hardware_lock, flags);
+ +			qlt_send_notify_ack(vha, ntfy,
+ +			    0, 0, 0, NOTIFY_ACK_SRR_FLAGS_ACCEPT, 0, 0);
+ +			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +			resp = 1;
+ +		} else {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf064,
+ +			    "qla_target(%d): SRR for in data for cmd "
+ +			    "without them (tag %d, SCSI status %d), "
+ +			    "reject", vha->vp_idx, cmd->tag,
+ +			    cmd->se_cmd.scsi_status);
+ +			goto out_reject;
+ +		}
+ +		break;
+ +	case SRR_IU_DATA_OUT:
+ +		if (!cmd->sg || !cmd->sg_cnt) {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf065,
+ +			    "Unable to process SRR_IU_DATA_OUT due to"
+ +			    " missing cmd->sg\n");
+ +			dump_stack();
+ +			goto out_reject;
+ +		}
+ +		if (se_cmd->scsi_status != 0) {
+ +			ql_dbg(ql_dbg_tgt, vha, 0xe02b,
+ +			    "Rejecting SRR_IU_DATA_OUT"
+ +			    " with non GOOD scsi_status\n");
+ +			goto out_reject;
+  		}
+ +		cmd->bufflen = se_cmd->data_length;
+  
+ -		if (!sess) {
+ -			pla->ref_count++;
+ -			qla24xx_post_newsess_work(vha, &port_id,
+ -				iocb->u.isp24.port_name, pla);
+ -			res = 0;
+ -			break;
+ +		if (qlt_has_data(cmd)) {
+ +			if (qlt_srr_adjust_data(cmd, offset, &xmit_type) != 0)
+ +				goto out_reject;
+ +			spin_lock_irqsave(&ha->hardware_lock, flags);
+ +			qlt_send_notify_ack(vha, ntfy,
+ +			    0, 0, 0, NOTIFY_ACK_SRR_FLAGS_ACCEPT, 0, 0);
+ +			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +			if (xmit_type & QLA_TGT_XMIT_DATA)
+ +				qlt_rdy_to_xfer(cmd);
+ +		} else {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf066,
+ +			    "qla_target(%d): SRR for out data for cmd "
+ +			    "without them (tag %d, SCSI status %d), "
+ +			    "reject", vha->vp_idx, cmd->tag,
+ +			    cmd->se_cmd.scsi_status);
+ +			goto out_reject;
+  		}
+ +		break;
+ +	default:
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf067,
+ +		    "qla_target(%d): Unknown srr_ui value %x",
+ +		    vha->vp_idx, srr_ui);
+ +		goto out_reject;
+ +	}
+  
+ -		qlt_plogi_ack_link(vha, pla, sess, QLT_PLOGI_LINK_SAME_WWN);
+ -		sess->fw_login_state = DSC_LS_PLOGI_PEND;
+ -		sess->d_id = port_id;
+ -		sess->login_gen++;
+ +	/* Transmit response in case of status and data-in cases */
+ +	if (resp)
+ +		qlt_xmit_response(cmd, xmit_type, se_cmd->scsi_status);
+  
+ -		switch (sess->disc_state) {
+ -		case DSC_DELETED:
+ -			qlt_plogi_ack_unref(vha, pla);
+ -			break;
+ +	return;
+  
+ -		default:
+ -			/*
+ -			 * Under normal circumstances we want to release nport handle
+ -			 * during LOGO process to avoid nport handle leaks inside FW.
+ -			 * The exception is when LOGO is done while another PLOGI with
+ -			 * the same nport handle is waiting as might be the case here.
+ -			 * Note: there is always a possibily of a race where session
+ -			 * deletion has already started for other reasons (e.g. ACL
+ -			 * removal) and now PLOGI arrives:
+ -			 * 1. if PLOGI arrived in FW after nport handle has been freed,
+ -			 *    FW must have assigned this PLOGI a new/same handle and we
+ -			 *    can proceed ACK'ing it as usual when session deletion
+ -			 *    completes.
+ -			 * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
+ -			 *    bit reached it, the handle has now been released. We'll
+ -			 *    get an error when we ACK this PLOGI. Nothing will be sent
+ -			 *    back to initiator. Initiator should eventually retry
+ -			 *    PLOGI and situation will correct itself.
+ -			 */
+ -			sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
+ -			   (sess->d_id.b24 == port_id.b24));
+ +out_reject:
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	qlt_send_notify_ack(vha, ntfy, 0, 0, 0,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT,
+ +	    NOTIFY_ACK_SRR_REJECT_REASON_UNABLE_TO_PERFORM,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT_EXPL_NO_EXPL);
+ +	if (cmd->state == QLA_TGT_STATE_NEED_DATA) {
+ +		cmd->state = QLA_TGT_STATE_DATA_IN;
+ +		dump_stack();
+ +	} else
+ +		qlt_send_term_exchange(vha, cmd, &cmd->atio, 1);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +}
+  
+ -			ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				   "%s %d %8phC post del sess\n",
+ -				   __func__, __LINE__, sess->port_name);
+ +static void qlt_reject_free_srr_imm(struct scsi_qla_host *vha,
+ +	struct qla_tgt_srr_imm *imm, int ha_locked)
+ +{
+ +	struct qla_hw_data *ha = vha->hw;
+ +	unsigned long flags = 0;
+  
+ +#ifndef __CHECKER__
+ +	if (!ha_locked)
+ +		spin_lock_irqsave(&ha->hardware_lock, flags);
+ +#endif
+  
+ -			qlt_schedule_sess_for_deletion_lock(sess);
+ -			break;
+ -		}
+ +	qlt_send_notify_ack(vha, (void *)&imm->imm_ntfy, 0, 0, 0,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT,
+ +	    NOTIFY_ACK_SRR_REJECT_REASON_UNABLE_TO_PERFORM,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT_EXPL_NO_EXPL);
+  
+ -		break;
+ +#ifndef __CHECKER__
+ +	if (!ha_locked)
+ +		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +#endif
+  
+ -	case ELS_PRLI:
+ -		wd3_lo = le16_to_cpu(iocb->u.isp24.u.prli.wd3_lo);
+ +	kfree(imm);
+ +}
+  
+ -		if (wwn) {
+ -			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
+ -			sess = qlt_find_sess_invalidate_other(vha, wwn, port_id,
+ -				loop_id, &conflict_sess);
+ -			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
+ -		}
+ +static void qlt_handle_srr_work(struct work_struct *work)
+ +{
+ +	struct qla_tgt *tgt = container_of(work, struct qla_tgt, srr_work);
+ +	struct scsi_qla_host *vha = tgt->vha;
+ +	struct qla_tgt_srr_ctio *sctio;
+ +	unsigned long flags;
+  
+ -		if (conflict_sess) {
+ -			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09b,
+ -			    "PRLI with conflicting sess %p port %8phC\n",
+ -			    conflict_sess, conflict_sess->port_name);
+ -			qlt_send_term_imm_notif(vha, iocb, 1);
+ -			res = 0;
+ -			break;
+ -		}
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf029, "Entering SRR work (tgt %p)\n",
+ +	    tgt);
+  
+ -		if (sess != NULL) {
+ -			if (sess->fw_login_state != DSC_LS_PLOGI_PEND &&
+ -			    sess->fw_login_state != DSC_LS_PLOGI_COMP) {
+ -				/*
+ -				 * Impatient initiator sent PRLI before last
+ -				 * PLOGI could finish. Will force him to re-try,
+ -				 * while last one finishes.
+ -				 */
+ -				ql_log(ql_log_warn, sess->vha, 0xf095,
+ -				    "sess %p PRLI received, before plogi ack.\n",
+ -				    sess);
+ -				qlt_send_term_imm_notif(vha, iocb, 1);
+ -				res = 0;
+ -				break;
+ +restart:
+ +	spin_lock_irqsave(&tgt->srr_lock, flags);
+ +	list_for_each_entry(sctio, &tgt->srr_ctio_list, srr_list_entry) {
+ +		struct qla_tgt_srr_imm *imm, *i, *ti;
+ +		struct qla_tgt_cmd *cmd;
+ +		struct se_cmd *se_cmd;
+ +
+ +		imm = NULL;
+ +		list_for_each_entry_safe(i, ti, &tgt->srr_imm_list,
+ +						srr_list_entry) {
+ +			if (i->srr_id == sctio->srr_id) {
+ +				list_del(&i->srr_list_entry);
+ +				if (imm) {
+ +					ql_dbg(ql_dbg_tgt_mgt, vha, 0xf068,
+ +					  "qla_target(%d): There must be "
+ +					  "only one IMM SRR per CTIO SRR "
+ +					  "(IMM SRR %p, id %d, CTIO %p\n",
+ +					  vha->vp_idx, i, i->srr_id, sctio);
+ +					qlt_reject_free_srr_imm(tgt->vha, i, 0);
+ +				} else
+ +					imm = i;
+  			}
+ +		}
+  
+ -			/*
+ -			 * This shouldn't happen under normal circumstances,
+ -			 * since we have deleted the old session during PLOGI
+ -			 */
+ -			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf096,
+ -			    "PRLI (loop_id %#04x) for existing sess %p (loop_id %#04x)\n",
+ -			    sess->loop_id, sess, iocb->u.isp24.nport_handle);
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02a,
+ +		    "IMM SRR %p, CTIO SRR %p (id %d)\n", imm, sctio,
+ +		    sctio->srr_id);
+  
+ -			sess->local = 0;
+ -			sess->loop_id = loop_id;
+ -			sess->d_id = port_id;
+ -			sess->fw_login_state = DSC_LS_PRLI_PEND;
+ +		if (imm == NULL) {
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02b,
+ +			    "Not found matching IMM for SRR CTIO (id %d)\n",
+ +			    sctio->srr_id);
+ +			continue;
+ +		} else
+ +			list_del(&sctio->srr_list_entry);
+  
+ -			if (wd3_lo & BIT_7)
+ -				sess->conf_compl_supported = 1;
+ +		spin_unlock_irqrestore(&tgt->srr_lock, flags);
+  
+ -			if ((wd3_lo & BIT_4) == 0)
+ -				sess->port_type = FCT_INITIATOR;
+ -			else
+ -				sess->port_type = FCT_TARGET;
+ +		cmd = sctio->cmd;
+ +		/*
+ +		 * Reset qla_tgt_cmd SRR values and SGL pointer+count to follow
+ +		 * tcm_qla2xxx_write_pending() and tcm_qla2xxx_queue_data_in()
+ +		 * logic..
+ +		 */
+ +		cmd->offset = 0;
+ +		if (cmd->free_sg) {
+ +			kfree(cmd->sg);
+ +			cmd->sg = NULL;
+ +			cmd->free_sg = 0;
+  		}
+ -		res = 1; /* send notify ack */
+ +		se_cmd = &cmd->se_cmd;
+  
+ -		/* Make session global (not used in fabric mode) */
+ -		if (ha->current_topology != ISP_CFG_F) {
+ -			if (sess) {
+ -				ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				    "%s %d %8phC post nack\n",
+ -				    __func__, __LINE__, sess->port_name);
+ -				qla24xx_post_nack_work(vha, sess, iocb,
+ -					SRB_NACK_PRLI);
+ -				res = 0;
+ -			} else {
+ -				set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ -				set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
+ -				qla2xxx_wake_dpc(vha);
+ -			}
+ -		} else {
+ -			if (sess) {
+ -				ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				    "%s %d %8phC post nack\n",
+ -				    __func__, __LINE__, sess->port_name);
+ -				qla24xx_post_nack_work(vha, sess, iocb,
+ -					SRB_NACK_PRLI);
+ -				res = 0;
+ -			}
+ -		}
+ -		break;
+ +		cmd->sg_cnt = se_cmd->t_data_nents;
+ +		cmd->sg = se_cmd->t_data_sg;
+  
+ -	case ELS_TPRLO:
+ -		if (le16_to_cpu(iocb->u.isp24.flags) &
+ -			NOTIFY24XX_FLAGS_GLOBAL_TPRLO) {
+ -			loop_id = 0xFFFF;
+ -			qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS);
+ -			res = 1;
+ -			break;
+ -		}
+ -		/* drop through */
+ -	case ELS_LOGO:
+ -	case ELS_PRLO:
+ -		spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+ -		sess = qla2x00_find_fcport_by_loopid(vha, loop_id);
+ -		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ -
+ -		if (sess) {
+ -			sess->login_gen++;
+ -			sess->fw_login_state = DSC_LS_LOGO_PEND;
+ -			sess->logo_ack_needed = 1;
+ -			memcpy(sess->iocb, iocb, IOCB_SIZE);
+ -		}
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02c,
+ +		    "SRR cmd %p (se_cmd %p, tag %d, op %x), "
+ +		    "sg_cnt=%d, offset=%d", cmd, &cmd->se_cmd, cmd->tag,
+ +		    se_cmd->t_task_cdb ? se_cmd->t_task_cdb[0] : 0,
+ +		    cmd->sg_cnt, cmd->offset);
+  
+ -		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+ +		qlt_handle_srr(vha, sctio, imm);
+  
+ -		ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -		    "%s: logo %llx res %d sess %p ",
+ -		    __func__, wwn, res, sess);
+ -		if (res == 0) {
+ -			/*
+ -			 * cmd went upper layer, look for qlt_xmit_tm_rsp()
+ -			 * for LOGO_ACK & sess delete
+ -			 */
+ -			BUG_ON(!sess);
+ -			res = 0;
+ -		} else {
+ -			/* cmd did not go to upper layer. */
+ -			if (sess) {
+ -				qlt_schedule_sess_for_deletion_lock(sess);
+ -				res = 0;
+ +		kfree(imm);
+ +		kfree(sctio);
+ +		goto restart;
+ +	}
+ +	spin_unlock_irqrestore(&tgt->srr_lock, flags);
+ +}
+ +
+ +/* ha->hardware_lock supposed to be held on entry */
+ +static void qlt_prepare_srr_imm(struct scsi_qla_host *vha,
+ +	struct imm_ntfy_from_isp *iocb)
+ +{
+ +	struct qla_tgt_srr_imm *imm;
+ +	struct qla_hw_data *ha = vha->hw;
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+ +	struct qla_tgt_srr_ctio *sctio;
+ +
+ +	tgt->imm_srr_id++;
+ +
+ +	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02d, "qla_target(%d): SRR received\n",
+ +	    vha->vp_idx);
+ +
+ +	imm = kzalloc(sizeof(*imm), GFP_ATOMIC);
+ +	if (imm != NULL) {
+ +		memcpy(&imm->imm_ntfy, iocb, sizeof(imm->imm_ntfy));
+ +
+ +		/* IRQ is already OFF */
+ +		spin_lock(&tgt->srr_lock);
+ +		imm->srr_id = tgt->imm_srr_id;
+ +		list_add_tail(&imm->srr_list_entry,
+ +		    &tgt->srr_imm_list);
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02e,
+ +		    "IMM NTFY SRR %p added (id %d, ui %x)\n",
+ +		    imm, imm->srr_id, iocb->u.isp24.srr_ui);
+ +		if (tgt->imm_srr_id == tgt->ctio_srr_id) {
+ +			int found = 0;
+ +			list_for_each_entry(sctio, &tgt->srr_ctio_list,
+ +			    srr_list_entry) {
+ +				if (sctio->srr_id == imm->srr_id) {
+ +					found = 1;
+ +					break;
+ +				}
+ +			}
+ +			if (found) {
+ +				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf02f, "%s",
+ +				    "Scheduling srr work\n");
+ +				schedule_work(&tgt->srr_work);
+ +			} else {
+ +				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf030,
+ +				    "qla_target(%d): imm_srr_id "
+ +				    "== ctio_srr_id (%d), but there is no "
+ +				    "corresponding SRR CTIO, deleting IMM "
+ +				    "SRR %p\n", vha->vp_idx, tgt->ctio_srr_id,
+ +				    imm);
+ +				list_del(&imm->srr_list_entry);
+ +
+ +				kfree(imm);
+ +
+ +				spin_unlock(&tgt->srr_lock);
+ +				goto out_reject;
+  			}
+ -			/* else logo will be ack */
+ -		}
+ -		break;
+ -	case ELS_PDISC:
+ -	case ELS_ADISC:
+ -	{
+ -		struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+ -		if (tgt->link_reinit_iocb_pending) {
+ -			qlt_send_notify_ack(vha, &tgt->link_reinit_iocb,
+ -			    0, 0, 0, 0, 0, 0);
+ -			tgt->link_reinit_iocb_pending = 0;
+  		}
+ -
+ -		sess = qla2x00_find_fcport_by_wwpn(vha,
+ -		    iocb->u.isp24.port_name, 1);
+ -		if (sess) {
+ -			ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				"sess %p lid %d|%d DS %d LS %d\n",
+ -				sess, sess->loop_id, loop_id,
+ -				sess->disc_state, sess->fw_login_state);
+ +		spin_unlock(&tgt->srr_lock);
+ +	} else {
+ +		struct qla_tgt_srr_ctio *ts;
+ +
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf069,
+ +		    "qla_target(%d): Unable to allocate SRR IMM "
+ +		    "entry, SRR request will be rejected\n", vha->vp_idx);
+ +
+ +		/* IRQ is already OFF */
+ +		spin_lock(&tgt->srr_lock);
+ +		list_for_each_entry_safe(sctio, ts, &tgt->srr_ctio_list,
+ +		    srr_list_entry) {
+ +			if (sctio->srr_id == tgt->imm_srr_id) {
+ +				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf031,
+ +				    "CTIO SRR %p deleted (id %d)\n",
+ +				    sctio, sctio->srr_id);
+ +				list_del(&sctio->srr_list_entry);
+ +				qlt_send_term_exchange(vha, sctio->cmd,
+ +				    &sctio->cmd->atio, 1);
+ +				kfree(sctio);
+ +			}
+  		}
+ -
+ -		res = 1; /* send notify ack */
+ -		break;
+ +		spin_unlock(&tgt->srr_lock);
+ +		goto out_reject;
+  	}
+  
+ -	case ELS_FLOGI:	/* should never happen */
+ -	default:
+ -		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf061,
+ -		    "qla_target(%d): Unsupported ELS command %x "
+ -		    "received\n", vha->vp_idx, iocb->u.isp24.status_subcode);
+ -		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+ -		break;
+ -	}
+ +	return;
+  
+ -	return res;
+ +out_reject:
+ +	qlt_send_notify_ack(vha, iocb, 0, 0, 0,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT,
+ +	    NOTIFY_ACK_SRR_REJECT_REASON_UNABLE_TO_PERFORM,
+ +	    NOTIFY_ACK_SRR_FLAGS_REJECT_EXPL_NO_EXPL);
+  }
+  
+  /*
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
