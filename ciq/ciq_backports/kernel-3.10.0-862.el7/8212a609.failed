@@ -1,0 +1,260 @@
+fsnotify: Remove indirection from fsnotify_detach_mark()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 8212a6097a720896b4cdbe516487ad47f4296599
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8212a609.failed
+
+fsnotify_detach_mark() calls fsnotify_destroy_inode_mark() or
+fsnotify_destroy_vfsmount_mark() to remove mark from object list. These
+two functions are however very similar and differ only in the lock they
+use to protect the object list of marks. Simplify the code by removing
+the indirection and removing mark from the object list in a common
+function.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 8212a6097a720896b4cdbe516487ad47f4296599)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.h
+#	fs/notify/inode_mark.c
+#	fs/notify/mark.c
+#	fs/notify/vfsmount_mark.c
+diff --cc fs/notify/fsnotify.h
+index 0a3bc2cf192c,510f027bdf0f..000000000000
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@@ -21,30 -18,12 +21,33 @@@ extern u32 fsnotify_recalc_mask(struct 
+  extern int fsnotify_compare_groups(struct fsnotify_group *a,
+  				   struct fsnotify_group *b);
+  
+++<<<<<<< HEAD
+ +extern void fsnotify_set_inode_mark_mask_locked(struct fsnotify_mark *fsn_mark,
+ +						__u32 mask);
+ +/* Add mark to a proper place in mark list */
+ +extern int fsnotify_add_mark_list(struct hlist_head *head,
+ +				  struct fsnotify_mark *mark,
+ +				  int allow_dups);
+ +/* add a mark to an inode */
+ +extern int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ +				   struct fsnotify_group *group, struct inode *inode,
+ +				   int allow_dups);
+ +/* add a mark to a vfsmount */
+ +extern int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ +				      struct fsnotify_group *group, struct vfsmount *mnt,
+ +				      int allow_dups);
+ +
+ +/* vfsmount specific destruction of a mark */
+ +extern void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark);
+ +/* inode specific destruction of a mark */
+ +extern void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark);
+++=======
+++>>>>>>> 8212a6097a72 (fsnotify: Remove indirection from fsnotify_detach_mark())
+  /* Find mark belonging to given group in the list of marks */
+ -extern struct fsnotify_mark *fsnotify_find_mark(
+ -					struct fsnotify_mark_connector *conn,
+ -					struct fsnotify_group *group);
+ -/* Destroy all marks connected via given connector */
+ -extern void fsnotify_destroy_marks(struct fsnotify_mark_connector *conn);
+ +extern struct fsnotify_mark *fsnotify_find_mark(struct hlist_head *head,
+ +						struct fsnotify_group *group);
+ +/* Destroy all marks in the given list protected by 'lock' */
+ +extern void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock);
+  /* run the list of all marks associated with inode and destroy them */
+  static inline void fsnotify_clear_marks_by_inode(struct inode *inode)
+  {
+diff --cc fs/notify/inode_mark.c
+index 1168d71dbf85,080b6d8b9973..000000000000
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@@ -30,40 -30,11 +30,43 @@@
+  
+  #include "../internal.h"
+  
+ +/*
+ + * Recalculate the inode->i_fsnotify_mask, or the mask of all FS_* event types
+ + * any notifier is interested in hearing for this inode.
+ + */
+  void fsnotify_recalc_inode_mask(struct inode *inode)
+  {
+ -	fsnotify_recalc_mask(inode->i_fsnotify_marks);
+ +	spin_lock(&inode->i_lock);
+ +	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	__fsnotify_update_child_dentry_flags(inode);
+ +}
+ +
+++<<<<<<< HEAD
+ +void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark)
+ +{
+ +	struct inode *inode = mark->inode;
+ +
+ +	BUG_ON(!mutex_is_locked(&mark->group->mark_mutex));
+ +	assert_spin_locked(&mark->lock);
+ +
+ +	spin_lock(&inode->i_lock);
+ +
+ +	hlist_del_init_rcu(&mark->obj_list);
+ +	mark->inode = NULL;
+ +
+ +	/*
+ +	 * this mark is now off the inode->i_fsnotify_marks list and we
+ +	 * hold the inode->i_lock, so this is the perfect time to update the
+ +	 * inode->i_fsnotify_mask
+ +	 */
+ +	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
+ +	spin_unlock(&inode->i_lock);
+  }
+  
+++=======
+++>>>>>>> 8212a6097a72 (fsnotify: Remove indirection from fsnotify_detach_mark())
+  /*
+   * Given a group clear all of the inode marks associated with that group.
+   */
+diff --cc fs/notify/mark.c
+index 44836e539169,08ab7b252322..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -109,11 -110,61 +109,35 @@@ u32 fsnotify_recalc_mask(struct hlist_h
+  	u32 new_mask = 0;
+  	struct fsnotify_mark *mark;
+  
+ -	hlist_for_each_entry(mark, &conn->list, obj_list)
+ +	hlist_for_each_entry(mark, head, obj_list)
+  		new_mask |= mark->mask;
+ -	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
+ -		conn->inode->i_fsnotify_mask = new_mask;
+ -	else if (conn->flags & FSNOTIFY_OBJ_TYPE_VFSMOUNT)
+ -		real_mount(conn->mnt)->mnt_fsnotify_mask = new_mask;
+ -}
+ -
+ -/*
+ - * Calculate mask of events for a list of marks. The caller must make sure
+ - * connector cannot disappear under us (usually by holding a mark->lock or
+ - * mark->group->mark_mutex for a mark on this list).
+ - */
+ -void fsnotify_recalc_mask(struct fsnotify_mark_connector *conn)
+ -{
+ -	if (!conn)
+ -		return;
+ -
+ -	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
+ -		spin_lock(&conn->inode->i_lock);
+ -	else
+ -		spin_lock(&conn->mnt->mnt_root->d_lock);
+ -	__fsnotify_recalc_mask(conn);
+ -	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE) {
+ -		spin_unlock(&conn->inode->i_lock);
+ -		__fsnotify_update_child_dentry_flags(conn->inode);
+ -	} else {
+ -		spin_unlock(&conn->mnt->mnt_root->d_lock);
+ -	}
+ +	return new_mask;
+  }
+  
++ static struct inode *fsnotify_detach_from_object(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_mark_connector *conn;
++ 	struct inode *inode = NULL;
++ 	spinlock_t *lock;
++ 
++ 	conn = mark->connector;
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		lock = &conn->inode->i_lock;
++ 	else
++ 		lock = &conn->mnt->mnt_root->d_lock;
++ 	spin_lock(lock);
++ 	hlist_del_init_rcu(&mark->obj_list);
++ 	if (hlist_empty(&conn->list)) {
++ 		if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 			inode = conn->inode;
++ 	}
++ 	mark->connector = NULL;
++ 	spin_unlock(lock);
++ 	fsnotify_recalc_mask(conn);
++ 
++ 	return inode;
++ }
++ 
+  /*
+   * Remove mark from inode / vfsmount list, group list, drop inode reference
+   * if we got one.
+@@@ -137,13 -188,8 +161,18 @@@ void fsnotify_detach_mark(struct fsnoti
+  
+  	mark->flags &= ~FSNOTIFY_MARK_FLAG_ATTACHED;
+  
+++<<<<<<< HEAD
+ +	if (mark->flags & FSNOTIFY_MARK_FLAG_INODE) {
+ +		inode = mark->inode;
+ +		fsnotify_destroy_inode_mark(mark);
+ +	} else if (mark->flags & FSNOTIFY_MARK_FLAG_VFSMOUNT)
+ +		fsnotify_destroy_vfsmount_mark(mark);
+ +	else
+ +		BUG();
+++=======
++ 	inode = fsnotify_detach_from_object(mark);
++ 
+++>>>>>>> 8212a6097a72 (fsnotify: Remove indirection from fsnotify_detach_mark())
+  	/*
+  	 * Note that we didn't update flags telling whether inode cares about
+  	 * what's happening with children. We update these flags from
+diff --cc fs/notify/vfsmount_mark.c
+index a8fcab68faef,26da5c209944..000000000000
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@@ -31,39 -31,14 +31,42 @@@
+  
+  void fsnotify_clear_vfsmount_marks_by_group(struct fsnotify_group *group)
+  {
+ -	fsnotify_clear_marks_by_group_flags(group, FSNOTIFY_OBJ_TYPE_VFSMOUNT);
+ +	fsnotify_clear_marks_by_group_flags(group, FSNOTIFY_MARK_FLAG_VFSMOUNT);
+  }
+  
+ +/*
+ + * Recalculate the mnt->mnt_fsnotify_mask, or the mask of all FS_* event types
+ + * any notifier is interested in hearing for this mount point
+ + */
+  void fsnotify_recalc_vfsmount_mask(struct vfsmount *mnt)
+  {
+ -	fsnotify_recalc_mask(real_mount(mnt)->mnt_fsnotify_marks);
+ +	struct mount *m = real_mount(mnt);
+ +
+ +	spin_lock(&mnt->mnt_root->d_lock);
+ +	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
+ +	spin_unlock(&mnt->mnt_root->d_lock);
+ +}
+ +
+++<<<<<<< HEAD
+ +void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark)
+ +{
+ +	struct vfsmount *mnt = mark->mnt;
+ +	struct mount *m = real_mount(mnt);
+ +
+ +	BUG_ON(!mutex_is_locked(&mark->group->mark_mutex));
+ +	assert_spin_locked(&mark->lock);
+ +
+ +	spin_lock(&mnt->mnt_root->d_lock);
+ +
+ +	hlist_del_init_rcu(&mark->obj_list);
+ +	mark->mnt = NULL;
+ +
+ +	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
+ +	spin_unlock(&mnt->mnt_root->d_lock);
+  }
+  
+++=======
+++>>>>>>> 8212a6097a72 (fsnotify: Remove indirection from fsnotify_detach_mark())
+  /*
+   * given a group and vfsmount, find the mark associated with that combination.
+   * if found take a reference to that mark and return it, else return NULL
+* Unmerged path fs/notify/fsnotify.h
+* Unmerged path fs/notify/inode_mark.c
+* Unmerged path fs/notify/mark.c
+* Unmerged path fs/notify/vfsmount_mark.c
