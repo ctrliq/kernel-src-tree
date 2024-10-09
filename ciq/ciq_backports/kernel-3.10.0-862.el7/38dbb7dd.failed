@@ -1,0 +1,158 @@
+blk-cgroup: don't quiesce the queue on policy activate/deactivate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 38dbb7dd4db184da4d2673f4bb963f7006465c37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/38dbb7dd.failed
+
+There's no potential harm in quiescing the queue, but it also doesn't
+buy us anything. And we can't run the queue async for policy
+deactivate, since we could be in the path of tearing the queue down.
+If we schedule an async run of the queue at that time, we're racing
+with queue teardown AFTER having we've already torn most of it down.
+
+	Reported-by: Omar Sandoval <osandov@fb.com>
+Fixes: 4d199c6f1c84 ("blk-cgroup: ensure that we clear the stop bit on quiesced queues")
+	Tested-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 38dbb7dd4db184da4d2673f4bb963f7006465c37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-cgroup.c
+diff --cc block/blk-cgroup.c
+index 61f595f4525f,fb59a3edc778..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -946,59 -1223,19 +946,70 @@@ int blkcg_activate_policy(struct reques
+  	if (blkcg_policy_enabled(q, pol))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/* preallocations for root blkg */
+ +	new_blkg = blkg_alloc(&blkcg_root, q, GFP_KERNEL);
+ +	if (!new_blkg)
+ +		return -ENOMEM;
+ +
+ +	blk_queue_bypass_start(q);
+ +
+ +	preloaded = !radix_tree_preload(GFP_KERNEL);
+ +
+ +	/*
+ +	 * Make sure the root blkg exists and count the existing blkgs.  As
+ +	 * @q is bypassing at this point, blkg_lookup_create() can't be
+ +	 * used.  Open code it.
+ +	 */
+ +	spin_lock_irq(q->queue_lock);
+ +
+ +	rcu_read_lock();
+ +	blkg = __blkg_lookup(&blkcg_root, q, false);
+ +	if (blkg)
+ +		blkg_free(new_blkg);
+ +	else
+ +		blkg = blkg_create(&blkcg_root, q, new_blkg);
+ +	rcu_read_unlock();
+ +
+ +	if (preloaded)
+ +		radix_tree_preload_end();
+ +
+ +	if (IS_ERR(blkg)) {
+ +		ret = PTR_ERR(blkg);
+ +		goto out_unlock;
+ +	}
+ +	q->root_blkg = blkg;
+ +	q->root_rl.blkg = blkg;
+ +
+ +	list_for_each_entry(blkg, &q->blkg_list, q_node)
+ +		cnt++;
+ +
+ +	spin_unlock_irq(q->queue_lock);
+ +
+ +	/* allocate policy_data for all existing blkgs */
+ +	while (cnt--) {
+ +		pd = kzalloc_node(pol->pd_size, GFP_KERNEL, q->node);
+ +		if (!pd) {
+++=======
++ 	if (q->mq_ops)
++ 		blk_mq_freeze_queue(q);
++ 	else
++ 		blk_queue_bypass_start(q);
++ pd_prealloc:
++ 	if (!pd_prealloc) {
++ 		pd_prealloc = pol->pd_alloc_fn(GFP_KERNEL, q->node);
++ 		if (!pd_prealloc) {
+++>>>>>>> 38dbb7dd4db1 (blk-cgroup: don't quiesce the queue on policy activate/deactivate)
+  			ret = -ENOMEM;
+ -			goto out_bypass_end;
+ +			goto out_free;
+  		}
+ +		list_add_tail(&pd->alloc_node, &pds);
+  	}
+  
+ +	/*
+ +	 * Install the allocated pds.  With @q bypassing, no new blkg
+ +	 * should have been created while the queue lock was dropped.
+ +	 */
+  	spin_lock_irq(q->queue_lock);
+  
+  	list_for_each_entry(blkg, &q->blkg_list, q_node) {
+@@@ -1023,12 -1261,15 +1034,22 @@@
+  
+  	__set_bit(pol->plid, q->blkcg_pols);
+  	ret = 0;
+ -
+ +out_unlock:
+  	spin_unlock_irq(q->queue_lock);
+++<<<<<<< HEAD
+ +out_free:
+ +	blk_queue_bypass_end(q);
+ +	list_for_each_entry_safe(pd, n, &pds, alloc_node)
+ +		kfree(pd);
+++=======
++ out_bypass_end:
++ 	if (q->mq_ops)
++ 		blk_mq_unfreeze_queue(q);
++ 	else
++ 		blk_queue_bypass_end(q);
++ 	if (pd_prealloc)
++ 		pol->pd_free_fn(pd_prealloc);
+++>>>>>>> 38dbb7dd4db1 (blk-cgroup: don't quiesce the queue on policy activate/deactivate)
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(blkcg_activate_policy);
+@@@ -1049,7 -1290,11 +1070,15 @@@ void blkcg_deactivate_policy(struct req
+  	if (!blkcg_policy_enabled(q, pol))
+  		return;
+  
+++<<<<<<< HEAD
+ +	blk_queue_bypass_start(q);
+++=======
++ 	if (q->mq_ops)
++ 		blk_mq_freeze_queue(q);
++ 	else
++ 		blk_queue_bypass_start(q);
++ 
+++>>>>>>> 38dbb7dd4db1 (blk-cgroup: don't quiesce the queue on policy activate/deactivate)
+  	spin_lock_irq(q->queue_lock);
+  
+  	__clear_bit(pol->plid, q->blkcg_pols);
+@@@ -1074,7 -1314,11 +1103,15 @@@
+  	}
+  
+  	spin_unlock_irq(q->queue_lock);
+++<<<<<<< HEAD
+ +	blk_queue_bypass_end(q);
+++=======
++ 
++ 	if (q->mq_ops)
++ 		blk_mq_unfreeze_queue(q);
++ 	else
++ 		blk_queue_bypass_end(q);
+++>>>>>>> 38dbb7dd4db1 (blk-cgroup: don't quiesce the queue on policy activate/deactivate)
+  }
+  EXPORT_SYMBOL_GPL(blkcg_deactivate_policy);
+  
+* Unmerged path block/blk-cgroup.c
