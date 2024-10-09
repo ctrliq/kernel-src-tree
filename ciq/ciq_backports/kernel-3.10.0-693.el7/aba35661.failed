@@ -1,0 +1,163 @@
+ipcns: Add a  limit on the number of ipc namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [kernel] ipcns: Add a limit on the number of ipc namespaces ("Eric W. Biederman") [1340238]
+Rebuild_FUZZ: 99.01%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit aba356616386e6e573a34c6d64ed12443686e5c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aba35661.failed
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit aba356616386e6e573a34c6d64ed12443686e5c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	ipc/namespace.c
+#	kernel/ucount.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,e1d672186f00..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -22,6 -22,16 +22,19 @@@ struct uid_gid_map {	/* 64 bytes -- 1 c
+  
+  #define USERNS_INIT_FLAGS USERNS_SETGROUPS_ALLOWED
+  
+++<<<<<<< HEAD
+++=======
++ struct ucounts;
++ 
++ enum ucount_type {
++ 	UCOUNT_USER_NAMESPACES,
++ 	UCOUNT_PID_NAMESPACES,
++ 	UCOUNT_UTS_NAMESPACES,
++ 	UCOUNT_IPC_NAMESPACES,
++ 	UCOUNT_COUNTS,
++ };
++ 
+++>>>>>>> aba356616386 (ipcns: Add a  limit on the number of ipc namespaces)
+  struct user_namespace {
+  	struct uid_gid_map	uid_map;
+  	struct uid_gid_map	gid_map;
+diff --cc ipc/namespace.c
+index b54468e48e32,730914214135..000000000000
+--- a/ipc/namespace.c
++++ b/ipc/namespace.c
+@@@ -20,42 -30,47 +30,74 @@@ static struct ipc_namespace *create_ipc
+  					   struct ipc_namespace *old_ns)
+  {
+  	struct ipc_namespace *ns;
++ 	struct ucounts *ucounts;
+  	int err;
+  
++ 	err = -ENFILE;
++ 	ucounts = inc_ipc_namespaces(user_ns);
++ 	if (!ucounts)
++ 		goto fail;
++ 
++ 	err = -ENOMEM;
+  	ns = kmalloc(sizeof(struct ipc_namespace), GFP_KERNEL);
+  	if (ns == NULL)
+- 		return ERR_PTR(-ENOMEM);
++ 		goto fail_dec;
+  
+++<<<<<<< HEAD
+ +	err = proc_alloc_inum(&ns->proc_inum);
+ +	if (err) {
+ +		kfree(ns);
+ +		return ERR_PTR(err);
+ +	}
+ +
+ +	atomic_set(&ns->count, 1);
+ +	err = mq_init_ns(ns);
+ +	if (err) {
+ +		proc_free_inum(ns->proc_inum);
+ +		kfree(ns);
+ +		return ERR_PTR(err);
+ +	}
+ +	atomic_inc(&nr_ipc_ns);
+++=======
++ 	err = ns_alloc_inum(&ns->ns);
++ 	if (err)
++ 		goto fail_free;
++ 	ns->ns.ops = &ipcns_operations;
++ 
++ 	atomic_set(&ns->count, 1);
++ 	ns->user_ns = get_user_ns(user_ns);
++ 	ns->ucounts = ucounts;
++ 
++ 	err = mq_init_ns(ns);
++ 	if (err)
++ 		goto fail_put;
+++>>>>>>> aba356616386 (ipcns: Add a  limit on the number of ipc namespaces)
+  
+  	sem_init_ns(ns);
+  	msg_init_ns(ns);
+  	shm_init_ns(ns);
+  
+ +	/*
+ +	 * msgmni has already been computed for the new ipc ns.
+ +	 * Thus, do the ipcns creation notification before registering that
+ +	 * new ipcns in the chain.
+ +	 */
+ +	ipcns_notify(IPCNS_CREATED);
+ +	register_ipcns_notifier(ns);
+ +
+ +	ns->user_ns = get_user_ns(user_ns);
+ +
+  	return ns;
++ 
++ fail_put:
++ 	put_user_ns(ns->user_ns);
++ 	ns_free_inum(&ns->ns);
++ fail_free:
++ 	kfree(ns);
++ fail_dec:
++ 	dec_ipc_namespaces(ucounts);
++ fail:
++ 	return ERR_PTR(err);
+  }
+  
+  struct ipc_namespace *copy_ipcs(unsigned long flags,
+@@@ -111,15 -117,10 +153,19 @@@ static void free_ipc_ns(struct ipc_name
+  	sem_exit_ns(ns);
+  	msg_exit_ns(ns);
+  	shm_exit_ns(ns);
+ -
+ +	atomic_dec(&nr_ipc_ns);
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * Do the ipcns removal notification after decrementing nr_ipc_ns in
+ +	 * order to have a correct value when recomputing msgmni.
+ +	 */
+ +	ipcns_notify(IPCNS_REMOVED);
+++=======
++ 	dec_ipc_namespaces(ns->ucounts);
+++>>>>>>> aba356616386 (ipcns: Add a  limit on the number of ipc namespaces)
+  	put_user_ns(ns->user_ns);
+ -	ns_free_inum(&ns->ns);
+ +	proc_free_inum(ns->proc_inum);
+  	kfree(ns);
+  }
+  
+* Unmerged path kernel/ucount.c
+diff --git a/include/linux/ipc_namespace.h b/include/linux/ipc_namespace.h
+index d6ad91f26038..82e1e7ff12fa 100644
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@ -68,6 +68,7 @@ struct ipc_namespace {
+ 
+ 	/* user_ns which owns the ipc ns */
+ 	struct user_namespace *user_ns;
++	struct ucounts *ucounts;
+ 
+ 	unsigned int	proc_inum;
+ };
+* Unmerged path include/linux/user_namespace.h
+* Unmerged path ipc/namespace.c
+* Unmerged path kernel/ucount.c
