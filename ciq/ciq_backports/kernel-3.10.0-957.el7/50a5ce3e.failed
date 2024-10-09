@@ -1,0 +1,231 @@
+vmxnet3: add receive data ring support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Shrikrishna Khare <skhare@vmware.com>
+commit 50a5ce3e7116a70edb7a1d1d209e3bc537752427
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/50a5ce3e.failed
+
+vmxnet3 driver preallocates buffers for receiving packets and posts the
+buffers to the emulation. In order to deliver a received packet to the
+guest, the emulation must map buffer(s) and copy the packet into it.
+
+To avoid this memory mapping overhead, this patch introduces the receive
+data ring - a set of small sized buffers that are always mapped by
+the emulation. If a packet fits into the receive data ring buffer, the
+emulation delivers the packet via the receive data ring (which must be
+copied by the guest driver), or else the usual receive path is used.
+
+Receive Data Ring buffer length is configurable via ethtool -G ethX rx-mini
+
+	Signed-off-by: Shrikrishna Khare <skhare@vmware.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 50a5ce3e7116a70edb7a1d1d209e3bc537752427)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vmxnet3/vmxnet3_defs.h
+#	drivers/net/vmxnet3/vmxnet3_drv.c
+#	drivers/net/vmxnet3/vmxnet3_ethtool.c
+#	drivers/net/vmxnet3/vmxnet3_int.h
+diff --cc drivers/net/vmxnet3/vmxnet3_defs.h
+index 72ba8ae7f09a,f3b31c2d8abc..000000000000
+--- a/drivers/net/vmxnet3/vmxnet3_defs.h
++++ b/drivers/net/vmxnet3/vmxnet3_defs.h
+@@@ -373,6 -380,14 +375,17 @@@ union Vmxnet3_GenericDesc 
+  #define VMXNET3_RING_SIZE_ALIGN 32
+  #define VMXNET3_RING_SIZE_MASK  (VMXNET3_RING_SIZE_ALIGN - 1)
+  
+++<<<<<<< HEAD
+++=======
++ /* Tx Data Ring buffer size must be a multiple of 64 */
++ #define VMXNET3_TXDATA_DESC_SIZE_ALIGN 64
++ #define VMXNET3_TXDATA_DESC_SIZE_MASK  (VMXNET3_TXDATA_DESC_SIZE_ALIGN - 1)
++ 
++ /* Rx Data Ring buffer size must be a multiple of 64 */
++ #define VMXNET3_RXDATA_DESC_SIZE_ALIGN 64
++ #define VMXNET3_RXDATA_DESC_SIZE_MASK  (VMXNET3_RXDATA_DESC_SIZE_ALIGN - 1)
++ 
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  /* Max ring size */
+  #define VMXNET3_TX_RING_MAX_SIZE   4096
+  #define VMXNET3_TC_RING_MAX_SIZE   4096
+@@@ -380,6 -395,11 +393,14 @@@
+  #define VMXNET3_RX_RING2_MAX_SIZE  4096
+  #define VMXNET3_RC_RING_MAX_SIZE   8192
+  
+++<<<<<<< HEAD
+++=======
++ #define VMXNET3_TXDATA_DESC_MIN_SIZE 128
++ #define VMXNET3_TXDATA_DESC_MAX_SIZE 2048
++ 
++ #define VMXNET3_RXDATA_DESC_MAX_SIZE 2048
++ 
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  /* a list of reasons for queue stop */
+  
+  enum {
+diff --cc drivers/net/vmxnet3/vmxnet3_drv.c
+index 26d44f7e6b9a,6449d2e6d94f..000000000000
+--- a/drivers/net/vmxnet3/vmxnet3_drv.c
++++ b/drivers/net/vmxnet3/vmxnet3_drv.c
+@@@ -1358,12 -1391,7 +1390,16 @@@ vmxnet3_rq_rx_complete(struct vmxnet3_r
+  #endif
+  			skb_put(ctx->skb, rcd->len);
+  
+++<<<<<<< HEAD
+ +			/* Immediate refill */
+ +			rbi->skb = new_skb;
+ +			rbi->dma_addr = new_dma_addr;
+ +			rxd->addr = cpu_to_le64(rbi->dma_addr);
+ +			rxd->len = rbi->len;
+ +			if (adapter->version == 2 &&
+++=======
++ 			if (VMXNET3_VERSION_GE_2(adapter) &&
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  			    rcd->type == VMXNET3_CDTYPE_RXCOMP_LRO) {
+  				struct Vmxnet3_RxCompDescExt *rcdlro;
+  				rcdlro = (struct Vmxnet3_RxCompDescExt *)rcd;
+@@@ -1586,8 -1614,16 +1622,15 @@@ static void vmxnet3_rq_destroy(struct v
+  					  rq->rx_ring[i].basePA);
+  			rq->rx_ring[i].base = NULL;
+  		}
+ -		rq->buf_info[i] = NULL;
+  	}
+  
++ 	if (rq->data_ring.base) {
++ 		dma_free_coherent(&adapter->pdev->dev,
++ 				  rq->rx_ring[0].size * rq->data_ring.desc_size,
++ 				  rq->data_ring.base, rq->data_ring.basePA);
++ 		rq->data_ring.base = NULL;
++ 	}
++ 
+  	if (rq->comp_ring.base) {
+  		dma_free_coherent(&adapter->pdev->dev, rq->comp_ring.size
+  				  * sizeof(struct Vmxnet3_RxCompDesc),
+@@@ -2696,7 -2771,8 +2785,12 @@@ vmxnet3_adjust_rx_ring_size(struct vmxn
+  
+  int
+  vmxnet3_create_queues(struct vmxnet3_adapter *adapter, u32 tx_ring_size,
+++<<<<<<< HEAD
+ +		      u32 rx_ring_size, u32 rx_ring2_size)
+++=======
++ 		      u32 rx_ring_size, u32 rx_ring2_size,
++ 		      u16 txdata_desc_size, u16 rxdata_desc_size)
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  {
+  	int err = 0, i;
+  
+@@@ -2761,9 -2845,35 +2862,15 @@@ vmxnet3_open(struct net_device *netdev
+  	for (i = 0; i < adapter->num_tx_queues; i++)
+  		spin_lock_init(&adapter->tx_queue[i].tx_lock);
+  
+ -	if (VMXNET3_VERSION_GE_3(adapter)) {
+ -		unsigned long flags;
+ -		u16 txdata_desc_size;
+ -
+ -		spin_lock_irqsave(&adapter->cmd_lock, flags);
+ -		VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
+ -				       VMXNET3_CMD_GET_TXDATA_DESC_SIZE);
+ -		txdata_desc_size = VMXNET3_READ_BAR1_REG(adapter,
+ -							 VMXNET3_REG_CMD);
+ -		spin_unlock_irqrestore(&adapter->cmd_lock, flags);
+ -
+ -		if ((txdata_desc_size < VMXNET3_TXDATA_DESC_MIN_SIZE) ||
+ -		    (txdata_desc_size > VMXNET3_TXDATA_DESC_MAX_SIZE) ||
+ -		    (txdata_desc_size & VMXNET3_TXDATA_DESC_SIZE_MASK)) {
+ -			adapter->txdata_desc_size =
+ -				sizeof(struct Vmxnet3_TxDataDesc);
+ -		} else {
+ -			adapter->txdata_desc_size = txdata_desc_size;
+ -		}
+ -	} else {
+ -		adapter->txdata_desc_size = sizeof(struct Vmxnet3_TxDataDesc);
+ -	}
+ -
+ -	err = vmxnet3_create_queues(adapter,
+ -				    adapter->tx_ring_size,
+ +	err = vmxnet3_create_queues(adapter, adapter->tx_ring_size,
+  				    adapter->rx_ring_size,
+++<<<<<<< HEAD
+ +				    adapter->rx_ring2_size);
+++=======
++ 				    adapter->rx_ring2_size,
++ 				    adapter->txdata_desc_size,
++ 				    adapter->rxdata_desc_size);
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  	if (err)
+  		goto queue_err;
+  
+diff --cc drivers/net/vmxnet3/vmxnet3_ethtool.c
+index 922d4a818bce,38f7c7975e1f..000000000000
+--- a/drivers/net/vmxnet3/vmxnet3_ethtool.c
++++ b/drivers/net/vmxnet3/vmxnet3_ethtool.c
+@@@ -589,8 -611,9 +610,14 @@@ vmxnet3_set_ringparam(struct net_devic
+  		vmxnet3_rq_destroy_all(adapter);
+  
+  		err = vmxnet3_create_queues(adapter, new_tx_ring_size,
+++<<<<<<< HEAD
+ +			new_rx_ring_size, new_rx_ring2_size);
+ +
+++=======
++ 					    new_rx_ring_size, new_rx_ring2_size,
++ 					    adapter->txdata_desc_size,
++ 					    new_rxdata_desc_size);
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  		if (err) {
+  			/* failed, most likely because of OOM, try default
+  			 * size */
+@@@ -602,7 -628,9 +632,13 @@@
+  			err = vmxnet3_create_queues(adapter,
+  						    new_tx_ring_size,
+  						    new_rx_ring_size,
+++<<<<<<< HEAD
+ +						    new_rx_ring2_size);
+++=======
++ 						    new_rx_ring2_size,
++ 						    adapter->txdata_desc_size,
++ 						    new_rxdata_desc_size);
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  			if (err) {
+  				netdev_err(netdev, "failed to create queues "
+  					   "with default sizes. Closing it\n");
+diff --cc drivers/net/vmxnet3/vmxnet3_int.h
+index e737c6723851,c46bf09ade5a..000000000000
+--- a/drivers/net/vmxnet3/vmxnet3_int.h
++++ b/drivers/net/vmxnet3/vmxnet3_int.h
+@@@ -358,6 -372,12 +366,15 @@@ struct vmxnet3_adapter 
+  	u32 rx_ring_size;
+  	u32 rx_ring2_size;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Size of buffer in the data ring */
++ 	u16 txdata_desc_size;
++ 	u16 rxdata_desc_size;
++ 
++ 	bool rxdataring_enabled;
++ 
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  	struct work_struct work;
+  
+  	unsigned long  state;    /* VMXNET3_STATE_BIT_xxx */
+@@@ -417,7 -452,8 +444,12 @@@ vmxnet3_set_features(struct net_device 
+  
+  int
+  vmxnet3_create_queues(struct vmxnet3_adapter *adapter,
+++<<<<<<< HEAD
+ +		      u32 tx_ring_size, u32 rx_ring_size, u32 rx_ring2_size);
+++=======
++ 		      u32 tx_ring_size, u32 rx_ring_size, u32 rx_ring2_size,
++ 		      u16 txdata_desc_size, u16 rxdata_desc_size);
+++>>>>>>> 50a5ce3e7116 (vmxnet3: add receive data ring support)
+  
+  void vmxnet3_set_ethtool_ops(struct net_device *netdev);
+  
+* Unmerged path drivers/net/vmxnet3/vmxnet3_defs.h
+* Unmerged path drivers/net/vmxnet3/vmxnet3_drv.c
+* Unmerged path drivers/net/vmxnet3/vmxnet3_ethtool.c
+* Unmerged path drivers/net/vmxnet3/vmxnet3_int.h
