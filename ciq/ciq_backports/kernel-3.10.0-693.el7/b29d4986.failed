@@ -1,0 +1,4124 @@
+dm cache: significant rework to leverage dm-bio-prison-v2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit b29d4986d0da1a27cd35917cdb433672f5c95d7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b29d4986.failed
+
+The cache policy interfaces have been updated to work well with the new
+bio-prison v2 interface's ability to queue work immediately (promotion,
+demotion, etc) -- overriding benefit being reduced latency on processing
+IO through the cache.  Previously such work would be left for the DM
+cache core to queue on various lists and then process in batches later
+-- this caused a serious delay in latency for IO driven by the cache.
+
+The background tracker code was factored out so that all cache policies
+can make use of it.
+
+Also, the "cleaner" policy has been removed and is now a variant of the
+smq policy that simply disallows migrations.
+
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit b29d4986d0da1a27cd35917cdb433672f5c95d7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index e614b257365d,b7de289a10bb..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -679,95 -826,18 +826,18 @@@ static bool is_discarded_oblock(struct 
+  	return r;
+  }
+  
+- /*----------------------------------------------------------------*/
+- 
+- static void load_stats(struct cache *cache)
++ /*----------------------------------------------------------------
++  * Remapping
++  *--------------------------------------------------------------*/
++ static void remap_to_origin(struct cache *cache, struct bio *bio)
+  {
+- 	struct dm_cache_statistics stats;
+- 
+- 	dm_cache_metadata_get_stats(cache->cmd, &stats);
+- 	atomic_set(&cache->stats.read_hit, stats.read_hits);
+- 	atomic_set(&cache->stats.read_miss, stats.read_misses);
+- 	atomic_set(&cache->stats.write_hit, stats.write_hits);
+- 	atomic_set(&cache->stats.write_miss, stats.write_misses);
++ 	bio->bi_bdev = cache->origin_dev->bdev;
+  }
+  
+- static void save_stats(struct cache *cache)
+- {
+- 	struct dm_cache_statistics stats;
+- 
+- 	if (get_cache_mode(cache) >= CM_READ_ONLY)
+- 		return;
+- 
+- 	stats.read_hits = atomic_read(&cache->stats.read_hit);
+- 	stats.read_misses = atomic_read(&cache->stats.read_miss);
+- 	stats.write_hits = atomic_read(&cache->stats.write_hit);
+- 	stats.write_misses = atomic_read(&cache->stats.write_miss);
+- 
+- 	dm_cache_metadata_set_stats(cache->cmd, &stats);
+- }
+- 
+- /*----------------------------------------------------------------
+-  * Per bio data
+-  *--------------------------------------------------------------*/
+- 
+- /*
+-  * If using writeback, leave out struct per_bio_data's writethrough fields.
+-  */
+- #define PB_DATA_SIZE_WB (offsetof(struct per_bio_data, cache))
+- #define PB_DATA_SIZE_WT (sizeof(struct per_bio_data))
+- 
+- static bool writethrough_mode(struct cache_features *f)
+- {
+- 	return f->io_mode == CM_IO_WRITETHROUGH;
+- }
+- 
+- static bool writeback_mode(struct cache_features *f)
+- {
+- 	return f->io_mode == CM_IO_WRITEBACK;
+- }
+- 
+- static bool passthrough_mode(struct cache_features *f)
+- {
+- 	return f->io_mode == CM_IO_PASSTHROUGH;
+- }
+- 
+- static size_t get_per_bio_data_size(struct cache *cache)
+- {
+- 	return writethrough_mode(&cache->features) ? PB_DATA_SIZE_WT : PB_DATA_SIZE_WB;
+- }
+- 
+- static struct per_bio_data *get_per_bio_data(struct bio *bio, size_t data_size)
+- {
+- 	struct per_bio_data *pb = dm_per_bio_data(bio, data_size);
+- 	BUG_ON(!pb);
+- 	return pb;
+- }
+- 
+- static struct per_bio_data *init_per_bio_data(struct bio *bio, size_t data_size)
+- {
+- 	struct per_bio_data *pb = get_per_bio_data(bio, data_size);
+- 
+- 	pb->tick = false;
+- 	pb->req_nr = dm_bio_get_target_bio_nr(bio);
+- 	pb->all_io_entry = NULL;
+- 	pb->len = 0;
+- 
+- 	return pb;
+- }
+- 
+- /*----------------------------------------------------------------
+-  * Remapping
+-  *--------------------------------------------------------------*/
+- static void remap_to_origin(struct cache *cache, struct bio *bio)
+- {
+- 	bio->bi_bdev = cache->origin_dev->bdev;
+- }
+- 
+- static void remap_to_cache(struct cache *cache, struct bio *bio,
+- 			   dm_cblock_t cblock)
++ static void remap_to_cache(struct cache *cache, struct bio *bio,
++ 			   dm_cblock_t cblock)
+  {
+ -	sector_t bi_sector = bio->bi_iter.bi_sector;
+ +	sector_t bi_sector = bio->bi_sector;
+  	sector_t block = from_cblock(cblock);
+  
+  	bio->bi_bdev = cache->cache_dev->bdev;
+@@@ -828,27 -899,6 +899,30 @@@ static dm_oblock_t get_bio_block(struc
+  	return to_oblock(block_nr);
+  }
+  
+++<<<<<<< HEAD
+ +static int bio_triggers_commit(struct cache *cache, struct bio *bio)
+ +{
+ +	return bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +}
+ +
+ +/*
+ + * You must increment the deferred set whilst the prison cell is held.  To
+ + * encourage this, we ask for 'cell' to be passed in.
+ + */
+ +static void inc_ds(struct cache *cache, struct bio *bio,
+ +		   struct dm_bio_prison_cell *cell)
+ +{
+ +	size_t pb_data_size = get_per_bio_data_size(cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+ +
+ +	BUG_ON(!cell);
+ +	BUG_ON(pb->all_io_entry);
+ +
+ +	pb->all_io_entry = dm_deferred_entry_inc(cache->all_io_ds);
+ +}
+ +
+++=======
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
+  static bool accountable_bio(struct cache *cache, struct bio *bio)
+  {
+  	return ((bio->bi_bdev == cache->origin_dev->bdev) &&
+@@@ -880,29 -930,10 +954,34 @@@ static void accounted_request(struct ca
+  	generic_make_request(bio);
+  }
+  
+- static void issue(struct cache *cache, struct bio *bio)
++ static void issue_op(struct bio *bio, void *context)
+  {
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +
+ +	if (!bio_triggers_commit(cache, bio)) {
+ +		accounted_request(cache, bio);
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * Batch together any bios that trigger commits and then issue a
+ +	 * single commit for them in do_worker().
+ +	 */
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	cache->commit_requested = true;
+ +	bio_list_add(&cache->deferred_flush_bios, bio);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +}
+ +
+ +static void inc_and_issue(struct cache *cache, struct bio *bio, struct dm_bio_prison_cell *cell)
+ +{
+ +	inc_ds(cache, bio, cell);
+ +	issue(cache, bio);
+++=======
++ 	struct cache *cache = context;
++ 	accounted_request(cache, bio);
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
+  }
+  
+  static void defer_writethrough_bio(struct cache *cache, struct bio *bio)
+@@@ -913,10 -944,10 +992,10 @@@
+  	bio_list_add(&cache->deferred_writethrough_bios, bio);
+  	spin_unlock_irqrestore(&cache->lock, flags);
+  
+- 	wake_worker(cache);
++ 	wake_deferred_writethrough_worker(cache);
+  }
+  
+ -static void writethrough_endio(struct bio *bio)
+ +static void writethrough_endio(struct bio *bio, int err)
+  {
+  	struct per_bio_data *pb = get_per_bio_data(bio, PB_DATA_SIZE_WT);
+  
+@@@ -1069,267 -1147,9 +1195,270 @@@ static void dec_io_migrations(struct ca
+  
+  static bool discard_or_flush(struct bio *bio)
+  {
+ -	return bio_op(bio) == REQ_OP_DISCARD || op_is_flush(bio->bi_opf);
+ +	return bio->bi_rw & (REQ_FLUSH | REQ_FUA | REQ_DISCARD);
+ +}
+ +
+++<<<<<<< HEAD
+ +static void __cell_defer(struct cache *cache, struct dm_bio_prison_cell *cell)
+ +{
+ +	if (discard_or_flush(cell->holder)) {
+ +		/*
+ +		 * We have to handle these bios individually.
+ +		 */
+ +		dm_cell_release(cache->prison, cell, &cache->deferred_bios);
+ +		free_prison_cell(cache, cell);
+ +	} else
+ +		list_add_tail(&cell->user_list, &cache->deferred_cells);
+ +}
+ +
+ +static void cell_defer(struct cache *cache, struct dm_bio_prison_cell *cell, bool holder)
+ +{
+ +	unsigned long flags;
+ +
+ +	if (!holder && dm_cell_promote_or_release(cache->prison, cell)) {
+ +		/*
+ +		 * There was no prisoner to promote to holder, the
+ +		 * cell has been released.
+ +		 */
+ +		free_prison_cell(cache, cell);
+ +		return;
+ +	}
+ +
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	__cell_defer(cache, cell);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +
+ +	wake_worker(cache);
+ +}
+ +
+ +static void cell_error_with_code(struct cache *cache, struct dm_bio_prison_cell *cell, int err)
+ +{
+ +	dm_cell_error(cache->prison, cell, err);
+ +	free_prison_cell(cache, cell);
+ +}
+ +
+ +static void cell_requeue(struct cache *cache, struct dm_bio_prison_cell *cell)
+ +{
+ +	cell_error_with_code(cache, cell, DM_ENDIO_REQUEUE);
+ +}
+ +
+ +static void free_io_migration(struct dm_cache_migration *mg)
+ +{
+ +	struct cache *cache = mg->cache;
+ +
+ +	dec_io_migrations(cache);
+ +	free_migration(mg);
+ +	wake_worker(cache);
+ +}
+ +
+ +static void migration_failure(struct dm_cache_migration *mg)
+ +{
+ +	struct cache *cache = mg->cache;
+ +	const char *dev_name = cache_device_name(cache);
+ +
+ +	if (mg->writeback) {
+ +		DMERR_LIMIT("%s: writeback failed; couldn't copy block", dev_name);
+ +		set_dirty(cache, mg->old_oblock, mg->cblock);
+ +		cell_defer(cache, mg->old_ocell, false);
+ +
+ +	} else if (mg->demote) {
+ +		DMERR_LIMIT("%s: demotion failed; couldn't copy block", dev_name);
+ +		policy_force_mapping(cache->policy, mg->new_oblock, mg->old_oblock);
+ +
+ +		cell_defer(cache, mg->old_ocell, mg->promote ? false : true);
+ +		if (mg->promote)
+ +			cell_defer(cache, mg->new_ocell, true);
+ +	} else {
+ +		DMERR_LIMIT("%s: promotion failed; couldn't copy block", dev_name);
+ +		policy_remove_mapping(cache->policy, mg->new_oblock);
+ +		cell_defer(cache, mg->new_ocell, true);
+ +	}
+ +
+ +	free_io_migration(mg);
+ +}
+ +
+ +static void migration_success_pre_commit(struct dm_cache_migration *mg)
+ +{
+ +	int r;
+ +	unsigned long flags;
+ +	struct cache *cache = mg->cache;
+ +
+ +	if (mg->writeback) {
+ +		clear_dirty(cache, mg->old_oblock, mg->cblock);
+ +		cell_defer(cache, mg->old_ocell, false);
+ +		free_io_migration(mg);
+ +		return;
+ +
+ +	} else if (mg->demote) {
+ +		r = dm_cache_remove_mapping(cache->cmd, mg->cblock);
+ +		if (r) {
+ +			DMERR_LIMIT("%s: demotion failed; couldn't update on disk metadata",
+ +				    cache_device_name(cache));
+ +			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
+ +			policy_force_mapping(cache->policy, mg->new_oblock,
+ +					     mg->old_oblock);
+ +			if (mg->promote)
+ +				cell_defer(cache, mg->new_ocell, true);
+ +			free_io_migration(mg);
+ +			return;
+ +		}
+ +	} else {
+ +		r = dm_cache_insert_mapping(cache->cmd, mg->cblock, mg->new_oblock);
+ +		if (r) {
+ +			DMERR_LIMIT("%s: promotion failed; couldn't update on disk metadata",
+ +				    cache_device_name(cache));
+ +			metadata_operation_failed(cache, "dm_cache_insert_mapping", r);
+ +			policy_remove_mapping(cache->policy, mg->new_oblock);
+ +			free_io_migration(mg);
+ +			return;
+ +		}
+ +	}
+ +
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	list_add_tail(&mg->list, &cache->need_commit_migrations);
+ +	cache->commit_requested = true;
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +}
+ +
+ +static void migration_success_post_commit(struct dm_cache_migration *mg)
+ +{
+ +	unsigned long flags;
+ +	struct cache *cache = mg->cache;
+ +
+ +	if (mg->writeback) {
+ +		DMWARN_LIMIT("%s: writeback unexpectedly triggered commit",
+ +			     cache_device_name(cache));
+ +		return;
+ +
+ +	} else if (mg->demote) {
+ +		cell_defer(cache, mg->old_ocell, mg->promote ? false : true);
+ +
+ +		if (mg->promote) {
+ +			mg->demote = false;
+ +
+ +			spin_lock_irqsave(&cache->lock, flags);
+ +			list_add_tail(&mg->list, &cache->quiesced_migrations);
+ +			spin_unlock_irqrestore(&cache->lock, flags);
+ +
+ +		} else {
+ +			if (mg->invalidate)
+ +				policy_remove_mapping(cache->policy, mg->old_oblock);
+ +			free_io_migration(mg);
+ +		}
+ +
+ +	} else {
+ +		if (mg->requeue_holder) {
+ +			clear_dirty(cache, mg->new_oblock, mg->cblock);
+ +			cell_defer(cache, mg->new_ocell, true);
+ +		} else {
+ +			/*
+ +			 * The block was promoted via an overwrite, so it's dirty.
+ +			 */
+ +			set_dirty(cache, mg->new_oblock, mg->cblock);
+ +			bio_endio(mg->new_ocell->holder, 0);
+ +			cell_defer(cache, mg->new_ocell, false);
+ +		}
+ +		free_io_migration(mg);
+ +	}
+ +}
+ +
+ +static void copy_complete(int read_err, unsigned long write_err, void *context)
+ +{
+ +	unsigned long flags;
+ +	struct dm_cache_migration *mg = (struct dm_cache_migration *) context;
+ +	struct cache *cache = mg->cache;
+ +
+ +	if (read_err || write_err)
+ +		mg->err = true;
+ +
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	list_add_tail(&mg->list, &cache->completed_migrations);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +
+ +	wake_worker(cache);
+ +}
+ +
+ +static void issue_copy(struct dm_cache_migration *mg)
+ +{
+ +	int r;
+ +	struct dm_io_region o_region, c_region;
+ +	struct cache *cache = mg->cache;
+ +	sector_t cblock = from_cblock(mg->cblock);
+ +
+ +	o_region.bdev = cache->origin_dev->bdev;
+ +	o_region.count = cache->sectors_per_block;
+ +
+ +	c_region.bdev = cache->cache_dev->bdev;
+ +	c_region.sector = cblock * cache->sectors_per_block;
+ +	c_region.count = cache->sectors_per_block;
+ +
+ +	if (mg->writeback || mg->demote) {
+ +		/* demote */
+ +		o_region.sector = from_oblock(mg->old_oblock) * cache->sectors_per_block;
+ +		r = dm_kcopyd_copy(cache->copier, &c_region, 1, &o_region, 0, copy_complete, mg);
+ +	} else {
+ +		/* promote */
+ +		o_region.sector = from_oblock(mg->new_oblock) * cache->sectors_per_block;
+ +		r = dm_kcopyd_copy(cache->copier, &o_region, 1, &c_region, 0, copy_complete, mg);
+ +	}
+ +
+ +	if (r < 0) {
+ +		DMERR_LIMIT("%s: issuing migration failed", cache_device_name(cache));
+ +		migration_failure(mg);
+ +	}
+ +}
+ +
+ +static void overwrite_endio(struct bio *bio, int err)
+ +{
+ +	struct dm_cache_migration *mg = bio->bi_private;
+ +	struct cache *cache = mg->cache;
+ +	size_t pb_data_size = get_per_bio_data_size(cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+ +	unsigned long flags;
+ +
+ +	dm_unhook_bio(&pb->hook_info, bio);
+ +
+ +	if (err)
+ +		mg->err = true;
+ +
+ +	mg->requeue_holder = false;
+ +
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	list_add_tail(&mg->list, &cache->completed_migrations);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +
+ +	wake_worker(cache);
+ +}
+ +
+ +static void issue_overwrite(struct dm_cache_migration *mg, struct bio *bio)
+ +{
+ +	size_t pb_data_size = get_per_bio_data_size(mg->cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+ +
+ +	dm_hook_bio(&pb->hook_info, bio, overwrite_endio, mg);
+ +	remap_to_cache_dirty(mg->cache, bio, mg->new_oblock, mg->cblock);
+ +
+ +	/*
+ +	 * No need to inc_ds() here, since the cell will be held for the
+ +	 * duration of the io.
+ +	 */
+ +	accounted_request(mg->cache, bio);
+ +}
+ +
+ +static bool bio_writes_complete_block(struct cache *cache, struct bio *bio)
+ +{
+ +	return (bio_data_dir(bio) == WRITE) &&
+ +		(bio->bi_size == (cache->sectors_per_block << SECTOR_SHIFT));
+ +}
+ +
+ +static void avoid_copy(struct dm_cache_migration *mg)
+ +{
+ +	atomic_inc(&mg->cache->stats.copies_avoided);
+ +	migration_success_pre_commit(mg);
+  }
+  
+++=======
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
+  static void calc_discard_block_range(struct cache *cache, struct bio *bio,
+  				     dm_dblock_t *b, dm_dblock_t *e)
+  {
+@@@ -1344,311 -1164,572 +1473,646 @@@
+  		*e = to_dblock(block_div(se, cache->discard_block_size));
+  }
+  
+- static void issue_discard(struct dm_cache_migration *mg)
++ /*----------------------------------------------------------------*/
++ 
++ static void prevent_background_work(struct cache *cache)
+  {
+++<<<<<<< HEAD
+ +	dm_dblock_t b, e;
+ +	struct bio *bio = mg->new_ocell->holder;
+ +	struct cache *cache = mg->cache;
+ +
+ +	calc_discard_block_range(cache, bio, &b, &e);
+ +	while (b != e) {
+ +		set_discard(cache, b);
+ +		b = to_dblock(from_dblock(b) + 1);
+ +	}
+ +
+ +	bio_endio(bio, 0);
+ +	cell_defer(cache, mg->new_ocell, false);
+ +	free_migration(mg);
+ +	wake_worker(cache);
+++=======
++ 	lockdep_off();
++ 	down_write(&cache->background_work_lock);
++ 	lockdep_on();
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
++ }
++ 
++ static void allow_background_work(struct cache *cache)
++ {
++ 	lockdep_off();
++ 	up_write(&cache->background_work_lock);
++ 	lockdep_on();
+  }
+  
+- static void issue_copy_or_discard(struct dm_cache_migration *mg)
++ static bool background_work_begin(struct cache *cache)
+  {
+- 	bool avoid;
++ 	bool r;
++ 
++ 	lockdep_off();
++ 	r = down_read_trylock(&cache->background_work_lock);
++ 	lockdep_on();
++ 
++ 	return r;
++ }
++ 
++ static void background_work_end(struct cache *cache)
++ {
++ 	lockdep_off();
++ 	up_read(&cache->background_work_lock);
++ 	lockdep_on();
++ }
++ 
++ /*----------------------------------------------------------------*/
++ 
++ static void quiesce(struct dm_cache_migration *mg,
++ 		    void (*continuation)(struct work_struct *))
++ {
++ 	init_continuation(&mg->k, continuation);
++ 	dm_cell_quiesce_v2(mg->cache->prison, mg->cell, &mg->k.ws);
++ }
++ 
++ static struct dm_cache_migration *ws_to_mg(struct work_struct *ws)
++ {
++ 	struct continuation *k = container_of(ws, struct continuation, ws);
++ 	return container_of(k, struct dm_cache_migration, k);
++ }
++ 
++ static void copy_complete(int read_err, unsigned long write_err, void *context)
++ {
++ 	struct dm_cache_migration *mg = container_of(context, struct dm_cache_migration, k);
++ 
++ 	if (read_err || write_err)
++ 		mg->k.input = -EIO;
++ 
++ 	queue_continuation(mg->cache->wq, &mg->k);
++ }
++ 
++ static int copy(struct dm_cache_migration *mg, bool promote)
++ {
++ 	int r;
++ 	struct dm_io_region o_region, c_region;
+  	struct cache *cache = mg->cache;
+  
+- 	if (mg->discard) {
+- 		issue_discard(mg);
+- 		return;
++ 	o_region.bdev = cache->origin_dev->bdev;
++ 	o_region.sector = from_oblock(mg->op->oblock) * cache->sectors_per_block;
++ 	o_region.count = cache->sectors_per_block;
++ 
++ 	c_region.bdev = cache->cache_dev->bdev;
++ 	c_region.sector = from_cblock(mg->op->cblock) * cache->sectors_per_block;
++ 	c_region.count = cache->sectors_per_block;
++ 
++ 	if (promote)
++ 		r = dm_kcopyd_copy(cache->copier, &o_region, 1, &c_region, 0, copy_complete, &mg->k);
++ 	else
++ 		r = dm_kcopyd_copy(cache->copier, &c_region, 1, &o_region, 0, copy_complete, &mg->k);
++ 
++ 	return r;
++ }
++ 
++ static void bio_drop_shared_lock(struct cache *cache, struct bio *bio)
++ {
++ 	size_t pb_data_size = get_per_bio_data_size(cache);
++ 	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
++ 
++ 	if (pb->cell && dm_cell_put_v2(cache->prison, pb->cell))
++ 		free_prison_cell(cache, pb->cell);
++ 	pb->cell = NULL;
++ }
++ 
++ static void overwrite_endio(struct bio *bio)
++ {
++ 	struct dm_cache_migration *mg = bio->bi_private;
++ 	struct cache *cache = mg->cache;
++ 	size_t pb_data_size = get_per_bio_data_size(cache);
++ 	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
++ 
++ 	dm_unhook_bio(&pb->hook_info, bio);
++ 
++ 	if (bio->bi_error)
++ 		mg->k.input = bio->bi_error;
++ 
++ 	queue_continuation(mg->cache->wq, &mg->k);
++ }
++ 
++ static void overwrite(struct dm_cache_migration *mg,
++ 		      void (*continuation)(struct work_struct *))
++ {
++ 	struct bio *bio = mg->overwrite_bio;
++ 	size_t pb_data_size = get_per_bio_data_size(mg->cache);
++ 	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
++ 
++ 	dm_hook_bio(&pb->hook_info, bio, overwrite_endio, mg);
++ 
++ 	/*
++ 	 * The overwrite bio is part of the copy operation, as such it does
++ 	 * not set/clear discard or dirty flags.
++ 	 */
++ 	if (mg->op->op == POLICY_PROMOTE)
++ 		remap_to_cache(mg->cache, bio, mg->op->cblock);
++ 	else
++ 		remap_to_origin(mg->cache, bio);
++ 
++ 	init_continuation(&mg->k, continuation);
++ 	accounted_request(mg->cache, bio);
++ }
++ 
++ /*
++  * Migration steps:
++  *
++  * 1) exclusive lock preventing WRITEs
++  * 2) quiesce
++  * 3) copy or issue overwrite bio
++  * 4) upgrade to exclusive lock preventing READs and WRITEs
++  * 5) quiesce
++  * 6) update metadata and commit
++  * 7) unlock
++  */
++ static void mg_complete(struct dm_cache_migration *mg, bool success)
++ {
++ 	struct bio_list bios;
++ 	struct cache *cache = mg->cache;
++ 	struct policy_work *op = mg->op;
++ 	dm_cblock_t cblock = op->cblock;
++ 
++ 	if (success)
++ 		update_stats(&cache->stats, op->op);
++ 
++ 	switch (op->op) {
++ 	case POLICY_PROMOTE:
++ 		clear_discard(cache, oblock_to_dblock(cache, op->oblock));
++ 		policy_complete_background_work(cache->policy, op, success);
++ 
++ 		if (mg->overwrite_bio) {
++ 			if (success)
++ 				force_set_dirty(cache, cblock);
++ 			else
++ 				mg->overwrite_bio->bi_error = (mg->k.input ? : -EIO);
++ 			bio_endio(mg->overwrite_bio);
++ 		} else {
++ 			if (success)
++ 				force_clear_dirty(cache, cblock);
++ 			dec_io_migrations(cache);
++ 		}
++ 		break;
++ 
++ 	case POLICY_DEMOTE:
++ 		/*
++ 		 * We clear dirty here to update the nr_dirty counter.
++ 		 */
++ 		if (success)
++ 			force_clear_dirty(cache, cblock);
++ 		policy_complete_background_work(cache->policy, op, success);
++ 		dec_io_migrations(cache);
++ 		break;
++ 
++ 	case POLICY_WRITEBACK:
++ 		if (success)
++ 			force_clear_dirty(cache, cblock);
++ 		policy_complete_background_work(cache->policy, op, success);
++ 		dec_io_migrations(cache);
++ 		break;
+  	}
+  
+- 	if (mg->writeback || mg->demote)
+- 		avoid = !is_dirty(cache, mg->cblock) ||
+- 			is_discarded_oblock(cache, mg->old_oblock);
+- 	else {
+- 		struct bio *bio = mg->new_ocell->holder;
++ 	bio_list_init(&bios);
++ 	if (mg->cell) {
++ 		if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
++ 			free_prison_cell(cache, mg->cell);
++ 	}
++ 
++ 	free_migration(mg);
++ 	defer_bios(cache, &bios);
++ 	wake_migration_worker(cache);
++ 
++ 	background_work_end(cache);
++ }
++ 
++ static void mg_success(struct work_struct *ws)
++ {
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 	mg_complete(mg, mg->k.input == 0);
++ }
++ 
++ static void mg_update_metadata(struct work_struct *ws)
++ {
++ 	int r;
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 	struct cache *cache = mg->cache;
++ 	struct policy_work *op = mg->op;
++ 
++ 	switch (op->op) {
++ 	case POLICY_PROMOTE:
++ 		r = dm_cache_insert_mapping(cache->cmd, op->cblock, op->oblock);
++ 		if (r) {
++ 			DMERR_LIMIT("%s: migration failed; couldn't insert mapping",
++ 				    cache_device_name(cache));
++ 			metadata_operation_failed(cache, "dm_cache_insert_mapping", r);
+  
+- 		avoid = is_discarded_oblock(cache, mg->new_oblock);
++ 			mg_complete(mg, false);
++ 			return;
++ 		}
++ 		mg_complete(mg, true);
++ 		break;
++ 
++ 	case POLICY_DEMOTE:
++ 		r = dm_cache_remove_mapping(cache->cmd, op->cblock);
++ 		if (r) {
++ 			DMERR_LIMIT("%s: migration failed; couldn't update on disk metadata",
++ 				    cache_device_name(cache));
++ 			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
+  
+- 		if (writeback_mode(&cache->features) &&
+- 		    !avoid && bio_writes_complete_block(cache, bio)) {
+- 			issue_overwrite(mg, bio);
++ 			mg_complete(mg, false);
+  			return;
+  		}
+- 	}
+  
+- 	avoid ? avoid_copy(mg) : issue_copy(mg);
++ 		/*
++ 		 * It would be nice if we only had to commit when a REQ_FLUSH
++ 		 * comes through.  But there's one scenario that we have to
++ 		 * look out for:
++ 		 *
++ 		 * - vblock x in a cache block
++ 		 * - domotion occurs
++ 		 * - cache block gets reallocated and over written
++ 		 * - crash
++ 		 *
++ 		 * When we recover, because there was no commit the cache will
++ 		 * rollback to having the data for vblock x in the cache block.
++ 		 * But the cache block has since been overwritten, so it'll end
++ 		 * up pointing to data that was never in 'x' during the history
++ 		 * of the device.
++ 		 *
++ 		 * To avoid this issue we require a commit as part of the
++ 		 * demotion operation.
++ 		 */
++ 		init_continuation(&mg->k, mg_success);
++ 		continue_after_commit(&cache->committer, &mg->k);
++ 		schedule_commit(&cache->committer);
++ 		break;
++ 
++ 	case POLICY_WRITEBACK:
++ 		mg_complete(mg, true);
++ 		break;
++ 	}
+  }
+  
+- static void complete_migration(struct dm_cache_migration *mg)
++ static void mg_update_metadata_after_copy(struct work_struct *ws)
+  {
+- 	if (mg->err)
+- 		migration_failure(mg);
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 
++ 	/*
++ 	 * Did the copy succeed?
++ 	 */
++ 	if (mg->k.input)
++ 		mg_complete(mg, false);
+  	else
+- 		migration_success_pre_commit(mg);
++ 		mg_update_metadata(ws);
+  }
+  
+- static void process_migrations(struct cache *cache, struct list_head *head,
+- 			       void (*fn)(struct dm_cache_migration *))
++ static void mg_upgrade_lock(struct work_struct *ws)
+  {
+- 	unsigned long flags;
+- 	struct list_head list;
+- 	struct dm_cache_migration *mg, *tmp;
++ 	int r;
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
+  
+- 	INIT_LIST_HEAD(&list);
+- 	spin_lock_irqsave(&cache->lock, flags);
+- 	list_splice_init(head, &list);
+- 	spin_unlock_irqrestore(&cache->lock, flags);
++ 	/*
++ 	 * Did the copy succeed?
++ 	 */
++ 	if (mg->k.input)
++ 		mg_complete(mg, false);
+  
+- 	list_for_each_entry_safe(mg, tmp, &list, list)
+- 		fn(mg);
++ 	else {
++ 		/*
++ 		 * Now we want the lock to prevent both reads and writes.
++ 		 */
++ 		r = dm_cell_lock_promote_v2(mg->cache->prison, mg->cell,
++ 					    READ_WRITE_LOCK_LEVEL);
++ 		if (r < 0)
++ 			mg_complete(mg, false);
++ 
++ 		else if (r)
++ 			quiesce(mg, mg_update_metadata);
++ 
++ 		else
++ 			mg_update_metadata(ws);
++ 	}
+  }
+  
+- static void __queue_quiesced_migration(struct dm_cache_migration *mg)
++ static void mg_copy(struct work_struct *ws)
+  {
+- 	list_add_tail(&mg->list, &mg->cache->quiesced_migrations);
++ 	int r;
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 
++ 	if (mg->overwrite_bio) {
++ 		/*
++ 		 * It's safe to do this here, even though it's new data
++ 		 * because all IO has been locked out of the block.
++ 		 *
++ 		 * mg_lock_writes() already took READ_WRITE_LOCK_LEVEL
++ 		 * so _not_ using mg_upgrade_lock() as continutation.
++ 		 */
++ 		overwrite(mg, mg_update_metadata_after_copy);
++ 
++ 	} else {
++ 		struct cache *cache = mg->cache;
++ 		struct policy_work *op = mg->op;
++ 		bool is_policy_promote = (op->op == POLICY_PROMOTE);
++ 
++ 		if ((!is_policy_promote && !is_dirty(cache, op->cblock)) ||
++ 		    is_discarded_oblock(cache, op->oblock)) {
++ 			mg_upgrade_lock(ws);
++ 			return;
++ 		}
++ 
++ 		init_continuation(&mg->k, mg_upgrade_lock);
++ 
++ 		r = copy(mg, is_policy_promote);
++ 		if (r) {
++ 			DMERR_LIMIT("%s: migration copy failed", cache_device_name(cache));
++ 			mg->k.input = -EIO;
++ 			mg_complete(mg, false);
++ 		}
++ 	}
+  }
+  
+- static void queue_quiesced_migration(struct dm_cache_migration *mg)
++ static int mg_lock_writes(struct dm_cache_migration *mg)
+  {
+- 	unsigned long flags;
++ 	int r;
++ 	struct dm_cell_key_v2 key;
+  	struct cache *cache = mg->cache;
++ 	struct dm_bio_prison_cell_v2 *prealloc;
+  
+- 	spin_lock_irqsave(&cache->lock, flags);
+- 	__queue_quiesced_migration(mg);
+- 	spin_unlock_irqrestore(&cache->lock, flags);
++ 	prealloc = alloc_prison_cell(cache);
++ 	if (!prealloc) {
++ 		DMERR_LIMIT("%s: alloc_prison_cell failed", cache_device_name(cache));
++ 		mg_complete(mg, false);
++ 		return -ENOMEM;
++ 	}
+  
+- 	wake_worker(cache);
++ 	/*
++ 	 * Prevent writes to the block, but allow reads to continue.
++ 	 * Unless we're using an overwrite bio, in which case we lock
++ 	 * everything.
++ 	 */
++ 	build_key(mg->op->oblock, oblock_succ(mg->op->oblock), &key);
++ 	r = dm_cell_lock_v2(cache->prison, &key,
++ 			    mg->overwrite_bio ?  READ_WRITE_LOCK_LEVEL : WRITE_LOCK_LEVEL,
++ 			    prealloc, &mg->cell);
++ 	if (r < 0) {
++ 		free_prison_cell(cache, prealloc);
++ 		mg_complete(mg, false);
++ 		return r;
++ 	}
++ 
++ 	if (mg->cell != prealloc)
++ 		free_prison_cell(cache, prealloc);
++ 
++ 	if (r == 0)
++ 		mg_copy(&mg->k.ws);
++ 	else
++ 		quiesce(mg, mg_copy);
++ 
++ 	return 0;
+  }
+  
+- static void queue_quiesced_migrations(struct cache *cache, struct list_head *work)
++ static int mg_start(struct cache *cache, struct policy_work *op, struct bio *bio)
+  {
+- 	unsigned long flags;
+- 	struct dm_cache_migration *mg, *tmp;
++ 	struct dm_cache_migration *mg;
+  
+- 	spin_lock_irqsave(&cache->lock, flags);
+- 	list_for_each_entry_safe(mg, tmp, work, list)
+- 		__queue_quiesced_migration(mg);
+- 	spin_unlock_irqrestore(&cache->lock, flags);
++ 	if (!background_work_begin(cache)) {
++ 		policy_complete_background_work(cache->policy, op, false);
++ 		return -EPERM;
++ 	}
+  
+- 	wake_worker(cache);
++ 	mg = alloc_migration(cache);
++ 	if (!mg) {
++ 		policy_complete_background_work(cache->policy, op, false);
++ 		background_work_end(cache);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	memset(mg, 0, sizeof(*mg));
++ 
++ 	mg->cache = cache;
++ 	mg->op = op;
++ 	mg->overwrite_bio = bio;
++ 
++ 	if (!bio)
++ 		inc_io_migrations(cache);
++ 
++ 	return mg_lock_writes(mg);
+  }
+  
+- static void check_for_quiesced_migrations(struct cache *cache,
+- 					  struct per_bio_data *pb)
++ /*----------------------------------------------------------------
++  * invalidation processing
++  *--------------------------------------------------------------*/
++ 
++ static void invalidate_complete(struct dm_cache_migration *mg, bool success)
+  {
+- 	struct list_head work;
++ 	struct bio_list bios;
++ 	struct cache *cache = mg->cache;
+  
+- 	if (!pb->all_io_entry)
+- 		return;
++ 	bio_list_init(&bios);
++ 	if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
++ 		free_prison_cell(cache, mg->cell);
+  
+- 	INIT_LIST_HEAD(&work);
+- 	dm_deferred_entry_dec(pb->all_io_entry, &work);
++ 	if (!success && mg->overwrite_bio)
++ 		bio_io_error(mg->overwrite_bio);
+  
+- 	if (!list_empty(&work))
+- 		queue_quiesced_migrations(cache, &work);
++ 	free_migration(mg);
++ 	defer_bios(cache, &bios);
++ 
++ 	background_work_end(cache);
+  }
+  
+- static void quiesce_migration(struct dm_cache_migration *mg)
++ static void invalidate_completed(struct work_struct *ws)
+  {
+- 	if (!dm_deferred_set_add_work(mg->cache->all_io_ds, &mg->list))
+- 		queue_quiesced_migration(mg);
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 	invalidate_complete(mg, !mg->k.input);
+  }
+  
+- static void promote(struct cache *cache, struct prealloc *structs,
+- 		    dm_oblock_t oblock, dm_cblock_t cblock,
+- 		    struct dm_bio_prison_cell *cell)
++ static int invalidate_cblock(struct cache *cache, dm_cblock_t cblock)
+  {
+- 	struct dm_cache_migration *mg = prealloc_get_migration(structs);
++ 	int r = policy_invalidate_mapping(cache->policy, cblock);
++ 	if (!r) {
++ 		r = dm_cache_remove_mapping(cache->cmd, cblock);
++ 		if (r) {
++ 			DMERR_LIMIT("%s: invalidation failed; couldn't update on disk metadata",
++ 				    cache_device_name(cache));
++ 			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
++ 		}
+  
+- 	mg->err = false;
+- 	mg->discard = false;
+- 	mg->writeback = false;
+- 	mg->demote = false;
+- 	mg->promote = true;
+- 	mg->requeue_holder = true;
+- 	mg->invalidate = false;
+- 	mg->cache = cache;
+- 	mg->new_oblock = oblock;
+- 	mg->cblock = cblock;
+- 	mg->old_ocell = NULL;
+- 	mg->new_ocell = cell;
+- 	mg->start_jiffies = jiffies;
++ 	} else if (r == -ENODATA) {
++ 		/*
++ 		 * Harmless, already unmapped.
++ 		 */
++ 		r = 0;
++ 
++ 	} else
++ 		DMERR("%s: policy_invalidate_mapping failed", cache_device_name(cache));
+  
+- 	inc_io_migrations(cache);
+- 	quiesce_migration(mg);
++ 	return r;
+  }
+  
+- static void writeback(struct cache *cache, struct prealloc *structs,
+- 		      dm_oblock_t oblock, dm_cblock_t cblock,
+- 		      struct dm_bio_prison_cell *cell)
++ static void invalidate_remove(struct work_struct *ws)
+  {
+- 	struct dm_cache_migration *mg = prealloc_get_migration(structs);
++ 	int r;
++ 	struct dm_cache_migration *mg = ws_to_mg(ws);
++ 	struct cache *cache = mg->cache;
+  
+- 	mg->err = false;
+- 	mg->discard = false;
+- 	mg->writeback = true;
+- 	mg->demote = false;
+- 	mg->promote = false;
+- 	mg->requeue_holder = true;
+- 	mg->invalidate = false;
+- 	mg->cache = cache;
+- 	mg->old_oblock = oblock;
+- 	mg->cblock = cblock;
+- 	mg->old_ocell = cell;
+- 	mg->new_ocell = NULL;
+- 	mg->start_jiffies = jiffies;
+- 
+- 	inc_io_migrations(cache);
+- 	quiesce_migration(mg);
+- }
+- 
+- static void demote_then_promote(struct cache *cache, struct prealloc *structs,
+- 				dm_oblock_t old_oblock, dm_oblock_t new_oblock,
+- 				dm_cblock_t cblock,
+- 				struct dm_bio_prison_cell *old_ocell,
+- 				struct dm_bio_prison_cell *new_ocell)
+- {
+- 	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+- 
+- 	mg->err = false;
+- 	mg->discard = false;
+- 	mg->writeback = false;
+- 	mg->demote = true;
+- 	mg->promote = true;
+- 	mg->requeue_holder = true;
+- 	mg->invalidate = false;
+- 	mg->cache = cache;
+- 	mg->old_oblock = old_oblock;
+- 	mg->new_oblock = new_oblock;
+- 	mg->cblock = cblock;
+- 	mg->old_ocell = old_ocell;
+- 	mg->new_ocell = new_ocell;
+- 	mg->start_jiffies = jiffies;
++ 	r = invalidate_cblock(cache, mg->invalidate_cblock);
++ 	if (r) {
++ 		invalidate_complete(mg, false);
++ 		return;
++ 	}
+  
+- 	inc_io_migrations(cache);
+- 	quiesce_migration(mg);
++ 	init_continuation(&mg->k, invalidate_completed);
++ 	continue_after_commit(&cache->committer, &mg->k);
++ 	remap_to_origin_clear_discard(cache, mg->overwrite_bio, mg->invalidate_oblock);
++ 	mg->overwrite_bio = NULL;
++ 	schedule_commit(&cache->committer);
+  }
+  
+- /*
+-  * Invalidate a cache entry.  No writeback occurs; any changes in the cache
+-  * block are thrown away.
+-  */
+- static void invalidate(struct cache *cache, struct prealloc *structs,
+- 		       dm_oblock_t oblock, dm_cblock_t cblock,
+- 		       struct dm_bio_prison_cell *cell)
+- {
+- 	struct dm_cache_migration *mg = prealloc_get_migration(structs);
+- 
+- 	mg->err = false;
+- 	mg->discard = false;
+- 	mg->writeback = false;
+- 	mg->demote = true;
+- 	mg->promote = false;
+- 	mg->requeue_holder = true;
+- 	mg->invalidate = true;
+- 	mg->cache = cache;
+- 	mg->old_oblock = oblock;
+- 	mg->cblock = cblock;
+- 	mg->old_ocell = cell;
+- 	mg->new_ocell = NULL;
+- 	mg->start_jiffies = jiffies;
++ static int invalidate_lock(struct dm_cache_migration *mg)
++ {
++ 	int r;
++ 	struct dm_cell_key_v2 key;
++ 	struct cache *cache = mg->cache;
++ 	struct dm_bio_prison_cell_v2 *prealloc;
++ 
++ 	prealloc = alloc_prison_cell(cache);
++ 	if (!prealloc) {
++ 		invalidate_complete(mg, false);
++ 		return -ENOMEM;
++ 	}
+  
+- 	inc_io_migrations(cache);
+- 	quiesce_migration(mg);
++ 	build_key(mg->invalidate_oblock, oblock_succ(mg->invalidate_oblock), &key);
++ 	r = dm_cell_lock_v2(cache->prison, &key,
++ 			    READ_WRITE_LOCK_LEVEL, prealloc, &mg->cell);
++ 	if (r < 0) {
++ 		free_prison_cell(cache, prealloc);
++ 		invalidate_complete(mg, false);
++ 		return r;
++ 	}
++ 
++ 	if (mg->cell != prealloc)
++ 		free_prison_cell(cache, prealloc);
++ 
++ 	if (r)
++ 		quiesce(mg, invalidate_remove);
++ 
++ 	else {
++ 		/*
++ 		 * We can't call invalidate_remove() directly here because we
++ 		 * might still be in request context.
++ 		 */
++ 		init_continuation(&mg->k, invalidate_remove);
++ 		queue_work(cache->wq, &mg->k.ws);
++ 	}
++ 
++ 	return 0;
+  }
+  
+- static void discard(struct cache *cache, struct prealloc *structs,
+- 		    struct dm_bio_prison_cell *cell)
++ static int invalidate_start(struct cache *cache, dm_cblock_t cblock,
++ 			    dm_oblock_t oblock, struct bio *bio)
+  {
+- 	struct dm_cache_migration *mg = prealloc_get_migration(structs);
++ 	struct dm_cache_migration *mg;
++ 
++ 	if (!background_work_begin(cache))
++ 		return -EPERM;
++ 
++ 	mg = alloc_migration(cache);
++ 	if (!mg) {
++ 		background_work_end(cache);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	memset(mg, 0, sizeof(*mg));
+  
+- 	mg->err = false;
+- 	mg->discard = true;
+- 	mg->writeback = false;
+- 	mg->demote = false;
+- 	mg->promote = false;
+- 	mg->requeue_holder = false;
+- 	mg->invalidate = false;
+  	mg->cache = cache;
+- 	mg->old_ocell = NULL;
+- 	mg->new_ocell = cell;
+- 	mg->start_jiffies = jiffies;
++ 	mg->overwrite_bio = bio;
++ 	mg->invalidate_cblock = cblock;
++ 	mg->invalidate_oblock = oblock;
+  
+- 	quiesce_migration(mg);
++ 	return invalidate_lock(mg);
+  }
+  
+  /*----------------------------------------------------------------
+   * bio processing
+   *--------------------------------------------------------------*/
+++<<<<<<< HEAD
+ +static void defer_bio(struct cache *cache, struct bio *bio)
+ +{
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&cache->lock, flags);
+ +	bio_list_add(&cache->deferred_bios, bio);
+ +	spin_unlock_irqrestore(&cache->lock, flags);
+ +
+ +	wake_worker(cache);
+ +}
+ +
+ +static void process_flush_bio(struct cache *cache, struct bio *bio)
+ +{
+ +	size_t pb_data_size = get_per_bio_data_size(cache);
+ +	struct per_bio_data *pb = get_per_bio_data(bio, pb_data_size);
+ +
+ +	BUG_ON(bio->bi_size);
+ +	if (!pb->req_nr)
+ +		remap_to_origin(cache, bio);
+ +	else
+ +		remap_to_cache(cache, bio, 0);
+ +
+ +	/*
+ +	 * REQ_FLUSH is not directed at any particular block so we don't
+ +	 * need to inc_ds().  REQ_FUA's are split into a write + REQ_FLUSH
+ +	 * by dm-core.
+ +	 */
+ +	issue(cache, bio);
+ +}
+ +
+ +static void process_discard_bio(struct cache *cache, struct prealloc *structs,
+ +				struct bio *bio)
+ +{
+ +	int r;
+ +	dm_dblock_t b, e;
+ +	struct dm_bio_prison_cell *cell_prealloc, *new_ocell;
+ +
+ +	calc_discard_block_range(cache, bio, &b, &e);
+ +	if (b == e) {
+ +		bio_endio(bio, 0);
+ +		return;
+ +	}
+ +
+ +	cell_prealloc = prealloc_get_cell(structs);
+ +	r = bio_detain_range(cache, dblock_to_oblock(cache, b), dblock_to_oblock(cache, e), bio, cell_prealloc,
+ +			     (cell_free_fn) prealloc_put_cell,
+ +			     structs, &new_ocell);
+ +	if (r > 0)
+ +		return;
+ +
+ +	discard(cache, structs, new_ocell);
+ +}
+ +
+ +static bool spare_migration_bandwidth(struct cache *cache)
+++=======
++ 
++ enum busy {
++ 	IDLE,
++ 	MODERATE,
++ 	BUSY
++ };
++ 
++ static enum busy spare_migration_bandwidth(struct cache *cache)
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
+  {
++ 	bool idle = iot_idle_for(&cache->origin_tracker, HZ);
+  	sector_t current_volume = (atomic_read(&cache->nr_io_migrations) + 1) *
+  		cache->sectors_per_block;
+- 	return current_volume < cache->migration_threshold;
++ 
++ 	if (current_volume <= cache->migration_threshold)
++ 		return idle ? IDLE : MODERATE;
++ 	else
++ 		return idle ? MODERATE : BUSY;
+  }
+  
+  static void inc_hit_counter(struct cache *cache, struct bio *bio)
+@@@ -1964,93 -1966,25 +2349,48 @@@ static void process_deferred_bios(struc
+  	bio_list_init(&cache->deferred_bios);
+  	spin_unlock_irqrestore(&cache->lock, flags);
+  
+++<<<<<<< HEAD
+ +	while (!bio_list_empty(&bios)) {
+ +		/*
+ +		 * If we've got no free migration structs, and processing
+ +		 * this bio might require one, we pause until there are some
+ +		 * prepared mappings to process.
+ +		 */
+ +		prealloc_used = true;
+ +		if (prealloc_data_structs(cache, &structs)) {
+ +			spin_lock_irqsave(&cache->lock, flags);
+ +			bio_list_merge(&cache->deferred_bios, &bios);
+ +			spin_unlock_irqrestore(&cache->lock, flags);
+ +			break;
+ +		}
+ +
+ +		bio = bio_list_pop(&bios);
+ +
+ +		if (bio->bi_rw & REQ_FLUSH)
+ +			process_flush_bio(cache, bio);
+ +		else if (bio->bi_rw & REQ_DISCARD)
+ +			process_discard_bio(cache, &structs, bio);
+- 		else
+- 			process_bio(cache, &structs, bio);
+- 	}
+- 
+- 	if (prealloc_used)
+- 		prealloc_free_structs(cache, &structs);
+- }
+- 
+- static void process_deferred_cells(struct cache *cache)
+- {
+- 	bool prealloc_used = false;
+- 	unsigned long flags;
+- 	struct dm_bio_prison_cell *cell, *tmp;
+- 	struct list_head cells;
+- 	struct prealloc structs;
+- 
+- 	memset(&structs, 0, sizeof(structs));
+- 
+- 	INIT_LIST_HEAD(&cells);
+- 
+- 	spin_lock_irqsave(&cache->lock, flags);
+- 	list_splice_init(&cache->deferred_cells, &cells);
+- 	spin_unlock_irqrestore(&cache->lock, flags);
+++=======
++ 	while ((bio = bio_list_pop(&bios))) {
++ 		if (bio->bi_opf & REQ_PREFLUSH)
++ 			commit_needed = process_flush_bio(cache, bio) || commit_needed;
+  
+- 	list_for_each_entry_safe(cell, tmp, &cells, user_list) {
+- 		/*
+- 		 * If we've got no free migration structs, and processing
+- 		 * this bio might require one, we pause until there are some
+- 		 * prepared mappings to process.
+- 		 */
+- 		prealloc_used = true;
+- 		if (prealloc_data_structs(cache, &structs)) {
+- 			spin_lock_irqsave(&cache->lock, flags);
+- 			list_splice(&cells, &cache->deferred_cells);
+- 			spin_unlock_irqrestore(&cache->lock, flags);
+- 			break;
+- 		}
++ 		else if (bio_op(bio) == REQ_OP_DISCARD)
++ 			commit_needed = process_discard_bio(cache, bio) || commit_needed;
+  
+- 		process_cell(cache, &structs, cell);
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
++ 		else
++ 			commit_needed = process_bio(cache, bio) || commit_needed;
+  	}
+  
+- 	if (prealloc_used)
+- 		prealloc_free_structs(cache, &structs);
++ 	if (commit_needed)
++ 		schedule_commit(&cache->committer);
+  }
+  
+- static void process_deferred_flush_bios(struct cache *cache, bool submit_bios)
++ static void process_deferred_writethrough_bios(struct work_struct *ws)
+  {
+- 	unsigned long flags;
+- 	struct bio_list bios;
+- 	struct bio *bio;
+- 
+- 	bio_list_init(&bios);
+- 
+- 	spin_lock_irqsave(&cache->lock, flags);
+- 	bio_list_merge(&bios, &cache->deferred_flush_bios);
+- 	bio_list_init(&cache->deferred_flush_bios);
+- 	spin_unlock_irqrestore(&cache->lock, flags);
+- 
+- 	/*
+- 	 * These bios have already been through inc_ds()
+- 	 */
+- 	while ((bio = bio_list_pop(&bios)))
+- 		submit_bios ? accounted_request(cache, bio) : bio_io_error(bio);
+- }
++ 	struct cache *cache = container_of(ws, struct cache, deferred_writethrough_worker);
+  
+- static void process_deferred_writethrough_bios(struct cache *cache)
+- {
+  	unsigned long flags;
+  	struct bio_list bios;
+  	struct bio *bio;
+@@@ -2220,57 -2016,12 +2422,10 @@@ static void requeue_deferred_bios(struc
+  	bio_list_merge(&bios, &cache->deferred_bios);
+  	bio_list_init(&cache->deferred_bios);
+  
+ -	while ((bio = bio_list_pop(&bios))) {
+ -		bio->bi_error = DM_ENDIO_REQUEUE;
+ -		bio_endio(bio);
+ -	}
+ +	while ((bio = bio_list_pop(&bios)))
+ +		bio_endio(bio, DM_ENDIO_REQUEUE);
+  }
+  
+- static int more_work(struct cache *cache)
+- {
+- 	if (is_quiescing(cache))
+- 		return !list_empty(&cache->quiesced_migrations) ||
+- 			!list_empty(&cache->completed_migrations) ||
+- 			!list_empty(&cache->need_commit_migrations);
+- 	else
+- 		return !bio_list_empty(&cache->deferred_bios) ||
+- 			!list_empty(&cache->deferred_cells) ||
+- 			!bio_list_empty(&cache->deferred_flush_bios) ||
+- 			!bio_list_empty(&cache->deferred_writethrough_bios) ||
+- 			!list_empty(&cache->quiesced_migrations) ||
+- 			!list_empty(&cache->completed_migrations) ||
+- 			!list_empty(&cache->need_commit_migrations) ||
+- 			cache->invalidate;
+- }
+- 
+- static void do_worker(struct work_struct *ws)
+- {
+- 	struct cache *cache = container_of(ws, struct cache, worker);
+- 
+- 	do {
+- 		if (!is_quiescing(cache)) {
+- 			writeback_some_dirty_blocks(cache);
+- 			process_deferred_writethrough_bios(cache);
+- 			process_deferred_bios(cache);
+- 			process_deferred_cells(cache);
+- 			process_invalidation_requests(cache);
+- 		}
+- 
+- 		process_migrations(cache, &cache->quiesced_migrations, issue_copy_or_discard);
+- 		process_migrations(cache, &cache->completed_migrations, complete_migration);
+- 
+- 		if (commit_if_needed(cache)) {
+- 			process_deferred_flush_bios(cache, false);
+- 			process_migrations(cache, &cache->need_commit_migrations, migration_failure);
+- 		} else {
+- 			process_deferred_flush_bios(cache, true);
+- 			process_migrations(cache, &cache->need_commit_migrations,
+- 					   migration_success_post_commit);
+- 		}
+- 
+- 		ack_quiescing(cache);
+- 
+- 	} while (more_work(cache));
+- }
+- 
+  /*
+   * We want to commit periodically so that not too much
+   * unwritten metadata builds up.
+@@@ -2283,20 -2036,32 +2440,38 @@@ static void do_waker(struct work_struc
+  	queue_delayed_work(cache->wq, &cache->waker, COMMIT_PERIOD);
+  }
+  
+- /*----------------------------------------------------------------*/
+- 
+- static int is_congested(struct dm_dev *dev, int bdi_bits)
++ static void check_migrations(struct work_struct *ws)
+  {
+++<<<<<<< HEAD
+ +	struct request_queue *q = bdev_get_queue(dev->bdev);
+ +	return bdi_congested(&q->backing_dev_info, bdi_bits);
+ +}
+++=======
++ 	int r;
++ 	struct policy_work *op;
++ 	struct cache *cache = container_of(ws, struct cache, migration_worker);
++ 	enum busy b;
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
++ 
++ 	for (;;) {
++ 		b = spare_migration_bandwidth(cache);
++ 		if (b == BUSY)
++ 			break;
+  
+- static int cache_is_congested(struct dm_target_callbacks *cb, int bdi_bits)
+- {
+- 	struct cache *cache = container_of(cb, struct cache, callbacks);
++ 		r = policy_get_background_work(cache->policy, b == IDLE, &op);
++ 		if (r == -ENODATA)
++ 			break;
+  
+- 	return is_congested(cache->origin_dev, bdi_bits) ||
+- 		is_congested(cache->cache_dev, bdi_bits);
++ 		if (r) {
++ 			DMERR_LIMIT("%s: policy_background_work failed",
++ 				    cache_device_name(cache));
++ 			break;
++ 		}
++ 
++ 		r = mg_start(cache, op, NULL);
++ 		if (r)
++ 			break;
++ 	}
+  }
+  
+  /*----------------------------------------------------------------
+@@@ -3052,101 -2815,9 +3225,107 @@@ static int cache_map(struct dm_target *
+  		return DM_MAPIO_SUBMITTED;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check to see if that block is currently migrating.
+ +	 */
+ +	cell = alloc_prison_cell(cache);
+ +	if (!cell) {
+ +		defer_bio(cache, bio);
+ +		return DM_MAPIO_SUBMITTED;
+ +	}
+ +
+ +	r = bio_detain(cache, block, bio, cell,
+ +		       (cell_free_fn) free_prison_cell,
+ +		       cache, &cell);
+ +	if (r) {
+ +		if (r < 0)
+ +			defer_bio(cache, bio);
+ +
+ +		return DM_MAPIO_SUBMITTED;
+ +	}
+ +
+ +	fast_promotion = is_discarded_oblock(cache, block) || bio_writes_complete_block(cache, bio);
+ +
+ +	r = policy_map(cache->policy, block, false, can_migrate, fast_promotion,
+ +		       bio, &ool.locker, &lookup_result);
+ +	if (r == -EWOULDBLOCK) {
+ +		cell_defer(cache, cell, true);
+ +		return DM_MAPIO_SUBMITTED;
+ +
+ +	} else if (r) {
+ +		DMERR_LIMIT("%s: Unexpected return from cache replacement policy: %d",
+ +			    cache_device_name(cache), r);
+ +		cell_defer(cache, cell, false);
+ +		bio_io_error(bio);
+ +		return DM_MAPIO_SUBMITTED;
+ +	}
+ +
+ +	r = DM_MAPIO_REMAPPED;
+ +	switch (lookup_result.op) {
+ +	case POLICY_HIT:
+ +		if (passthrough_mode(&cache->features)) {
+ +			if (bio_data_dir(bio) == WRITE) {
+ +				/*
+ +				 * We need to invalidate this block, so
+ +				 * defer for the worker thread.
+ +				 */
+ +				cell_defer(cache, cell, true);
+ +				r = DM_MAPIO_SUBMITTED;
+ +
+ +			} else {
+ +				inc_miss_counter(cache, bio);
+ +				remap_to_origin_clear_discard(cache, bio, block);
+ +				accounted_begin(cache, bio);
+ +				inc_ds(cache, bio, cell);
+ +				// FIXME: we want to remap hits or misses straight
+ +				// away rather than passing over to the worker.
+ +				cell_defer(cache, cell, false);
+ +			}
+ +
+ +		} else {
+ +			inc_hit_counter(cache, bio);
+ +			if (bio_data_dir(bio) == WRITE && writethrough_mode(&cache->features) &&
+ +			    !is_dirty(cache, lookup_result.cblock)) {
+ +				remap_to_origin_then_cache(cache, bio, block, lookup_result.cblock);
+ +				accounted_begin(cache, bio);
+ +				inc_ds(cache, bio, cell);
+ +				cell_defer(cache, cell, false);
+ +
+ +			} else
+ +				remap_cell_to_cache_dirty(cache, cell, block, lookup_result.cblock, false);
+ +		}
+ +		break;
+ +
+ +	case POLICY_MISS:
+ +		inc_miss_counter(cache, bio);
+ +		if (pb->req_nr != 0) {
+ +			/*
+ +			 * This is a duplicate writethrough io that is no
+ +			 * longer needed because the block has been demoted.
+ +			 */
+ +			bio_endio(bio, 0);
+ +			// FIXME: remap everything as a miss
+ +			cell_defer(cache, cell, false);
+ +			r = DM_MAPIO_SUBMITTED;
+ +
+ +		} else
+ +			remap_cell_to_origin_clear_discard(cache, cell, block, false);
+ +		break;
+ +
+ +	default:
+ +		DMERR_LIMIT("%s: %s: erroring bio: unknown policy op: %u",
+ +			    cache_device_name(cache), __func__,
+ +			    (unsigned) lookup_result.op);
+ +		cell_defer(cache, cell, false);
+ +		bio_io_error(bio);
+ +		r = DM_MAPIO_SUBMITTED;
+ +	}
+++=======
++ 	r = map_bio(cache, bio, block, &commit_needed);
++ 	if (commit_needed)
++ 		schedule_commit(&cache->committer);
+++>>>>>>> b29d4986d0da (dm cache: significant rework to leverage dm-bio-prison-v2)
+  
+  	return r;
+  }
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index b74c2ec3b0a4..115bfbd56603 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -299,14 +299,6 @@ config DM_CACHE_SMQ
+          of less memory utilization, improved performance and increased
+          adaptability in the face of changing workloads.
+ 
+-config DM_CACHE_CLEANER
+-       tristate "Cleaner Cache Policy (EXPERIMENTAL)"
+-       depends on DM_CACHE
+-       default y
+-       ---help---
+-         A simple cache policy that writes back all data to the
+-         origin.  Used when decommissioning a dm-cache.
+-
+ config DM_ERA
+        tristate "Era target (EXPERIMENTAL)"
+        depends on BLK_DEV_DM
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index e48e991f8667..547a27d69285 100644
+--- a/drivers/md/Makefile
++++ b/drivers/md/Makefile
+@@ -13,9 +13,9 @@ dm-log-userspace-y \
+ 		+= dm-log-userspace-base.o dm-log-userspace-transfer.o
+ dm-bio-prison-y += dm-bio-prison-v1.o dm-bio-prison-v2.o
+ dm-thin-pool-y	+= dm-thin.o dm-thin-metadata.o
+-dm-cache-y	+= dm-cache-target.o dm-cache-metadata.o dm-cache-policy.o
++dm-cache-y	+= dm-cache-target.o dm-cache-metadata.o dm-cache-policy.o \
++		    dm-cache-background-tracker.o
+ dm-cache-smq-y   += dm-cache-policy-smq.o
+-dm-cache-cleaner-y += dm-cache-policy-cleaner.o
+ dm-era-y	+= dm-era-target.o
+ dm-verity-y	+= dm-verity-target.o
+ md-mod-y	+= md.o bitmap.o
+@@ -56,7 +56,6 @@ obj-$(CONFIG_DM_THIN_PROVISIONING)	+= dm-thin-pool.o
+ obj-$(CONFIG_DM_VERITY)		+= dm-verity.o
+ obj-$(CONFIG_DM_CACHE)		+= dm-cache.o
+ obj-$(CONFIG_DM_CACHE_SMQ)	+= dm-cache-smq.o
+-obj-$(CONFIG_DM_CACHE_CLEANER)	+= dm-cache-cleaner.o
+ obj-$(CONFIG_DM_ERA)		+= dm-era.o
+ 
+ ifeq ($(CONFIG_DM_UEVENT),y)
+diff --git a/drivers/md/dm-cache-background-tracker.c b/drivers/md/dm-cache-background-tracker.c
+new file mode 100644
+index 000000000000..9b1afdfb13f0
+--- /dev/null
++++ b/drivers/md/dm-cache-background-tracker.c
+@@ -0,0 +1,238 @@
++/*
++ * Copyright (C) 2017 Red Hat. All rights reserved.
++ *
++ * This file is released under the GPL.
++ */
++
++#include "dm-cache-background-tracker.h"
++
++/*----------------------------------------------------------------*/
++
++#define DM_MSG_PREFIX "dm-background-tracker"
++
++struct bt_work {
++	struct list_head list;
++	struct rb_node node;
++	struct policy_work work;
++};
++
++struct background_tracker {
++	unsigned max_work;
++	atomic_t pending_promotes;
++	atomic_t pending_writebacks;
++	atomic_t pending_demotes;
++
++	struct list_head issued;
++	struct list_head queued;
++	struct rb_root pending;
++
++	struct kmem_cache *work_cache;
++};
++
++struct background_tracker *btracker_create(unsigned max_work)
++{
++	struct background_tracker *b = kmalloc(sizeof(*b), GFP_KERNEL);
++
++	b->max_work = max_work;
++	atomic_set(&b->pending_promotes, 0);
++	atomic_set(&b->pending_writebacks, 0);
++	atomic_set(&b->pending_demotes, 0);
++
++	INIT_LIST_HEAD(&b->issued);
++	INIT_LIST_HEAD(&b->queued);
++
++	b->pending = RB_ROOT;
++	b->work_cache = KMEM_CACHE(bt_work, 0);
++	if (!b->work_cache) {
++		DMERR("couldn't create mempool for background work items");
++		kfree(b);
++		b = NULL;
++	}
++
++	return b;
++}
++EXPORT_SYMBOL_GPL(btracker_create);
++
++void btracker_destroy(struct background_tracker *b)
++{
++	kmem_cache_destroy(b->work_cache);
++	kfree(b);
++}
++EXPORT_SYMBOL_GPL(btracker_destroy);
++
++static int cmp_oblock(dm_oblock_t lhs, dm_oblock_t rhs)
++{
++	if (from_oblock(lhs) < from_oblock(rhs))
++		return -1;
++
++	if (from_oblock(rhs) < from_oblock(lhs))
++		return 1;
++
++	return 0;
++}
++
++static bool __insert_pending(struct background_tracker *b,
++			     struct bt_work *nw)
++{
++	int cmp;
++	struct bt_work *w;
++	struct rb_node **new = &b->pending.rb_node, *parent = NULL;
++
++	while (*new) {
++		w = container_of(*new, struct bt_work, node);
++
++		parent = *new;
++		cmp = cmp_oblock(w->work.oblock, nw->work.oblock);
++		if (cmp < 0)
++			new = &((*new)->rb_left);
++
++		else if (cmp > 0)
++			new = &((*new)->rb_right);
++
++		else
++			/* already present */
++			return false;
++	}
++
++	rb_link_node(&nw->node, parent, new);
++	rb_insert_color(&nw->node, &b->pending);
++
++	return true;
++}
++
++static struct bt_work *__find_pending(struct background_tracker *b,
++				      dm_oblock_t oblock)
++{
++	int cmp;
++	struct bt_work *w;
++	struct rb_node **new = &b->pending.rb_node;
++
++	while (*new) {
++		w = container_of(*new, struct bt_work, node);
++
++		cmp = cmp_oblock(w->work.oblock, oblock);
++		if (cmp < 0)
++			new = &((*new)->rb_left);
++
++		else if (cmp > 0)
++			new = &((*new)->rb_right);
++
++		else
++			break;
++	}
++
++	return *new ? w : NULL;
++}
++
++
++static void update_stats(struct background_tracker *b, struct policy_work *w, int delta)
++{
++	switch (w->op) {
++	case POLICY_PROMOTE:
++		atomic_add(delta, &b->pending_promotes);
++		break;
++
++	case POLICY_DEMOTE:
++		atomic_add(delta, &b->pending_demotes);
++		break;
++
++	case POLICY_WRITEBACK:
++		atomic_add(delta, &b->pending_writebacks);
++		break;
++	}
++}
++
++unsigned btracker_nr_writebacks_queued(struct background_tracker *b)
++{
++	return atomic_read(&b->pending_writebacks);
++}
++EXPORT_SYMBOL_GPL(btracker_nr_writebacks_queued);
++
++unsigned btracker_nr_demotions_queued(struct background_tracker *b)
++{
++	return atomic_read(&b->pending_demotes);
++}
++EXPORT_SYMBOL_GPL(btracker_nr_demotions_queued);
++
++static bool max_work_reached(struct background_tracker *b)
++{
++	// FIXME: finish
++	return false;
++}
++
++int btracker_queue(struct background_tracker *b,
++		   struct policy_work *work,
++		   struct policy_work **pwork)
++{
++	struct bt_work *w;
++
++	if (pwork)
++		*pwork = NULL;
++
++	if (max_work_reached(b))
++		return -ENOMEM;
++
++	w = kmem_cache_alloc(b->work_cache, GFP_NOWAIT);
++	if (!w)
++		return -ENOMEM;
++
++	memcpy(&w->work, work, sizeof(*work));
++
++	if (!__insert_pending(b, w)) {
++		/*
++		 * There was a race, we'll just ignore this second
++		 * bit of work for the same oblock.
++		 */
++		kmem_cache_free(b->work_cache, w);
++		return -EINVAL;
++	}
++
++	if (pwork) {
++		*pwork = &w->work;
++		list_add(&w->list, &b->issued);
++	} else
++		list_add(&w->list, &b->queued);
++	update_stats(b, &w->work, 1);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(btracker_queue);
++
++/*
++ * Returns -ENODATA if there's no work.
++ */
++int btracker_issue(struct background_tracker *b, struct policy_work **work)
++{
++	struct bt_work *w;
++
++	if (list_empty(&b->queued))
++		return -ENODATA;
++
++	w = list_first_entry(&b->queued, struct bt_work, list);
++	list_move(&w->list, &b->issued);
++	*work = &w->work;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(btracker_issue);
++
++void btracker_complete(struct background_tracker *b,
++		       struct policy_work *op)
++{
++	struct bt_work *w = container_of(op, struct bt_work, work);
++
++	update_stats(b, &w->work, -1);
++	rb_erase(&w->node, &b->pending);
++	list_del(&w->list);
++	kmem_cache_free(b->work_cache, w);
++}
++EXPORT_SYMBOL_GPL(btracker_complete);
++
++bool btracker_promotion_already_present(struct background_tracker *b,
++					dm_oblock_t oblock)
++{
++	return __find_pending(b, oblock) != NULL;
++}
++EXPORT_SYMBOL_GPL(btracker_promotion_already_present);
++
++/*----------------------------------------------------------------*/
+diff --git a/drivers/md/dm-cache-background-tracker.h b/drivers/md/dm-cache-background-tracker.h
+new file mode 100644
+index 000000000000..27ab90dbc275
+--- /dev/null
++++ b/drivers/md/dm-cache-background-tracker.h
+@@ -0,0 +1,46 @@
++/*
++ * Copyright (C) 2017 Red Hat. All rights reserved.
++ *
++ * This file is released under the GPL.
++ */
++
++#ifndef DM_CACHE_BACKGROUND_WORK_H
++#define DM_CACHE_BACKGROUND_WORK_H
++
++#include <linux/vmalloc.h>
++#include "dm-cache-policy.h"
++
++/*----------------------------------------------------------------*/
++
++struct background_work;
++struct background_tracker;
++
++/*
++ * FIXME: discuss lack of locking in all methods.
++ */
++struct background_tracker *btracker_create(unsigned max_work);
++void btracker_destroy(struct background_tracker *b);
++
++unsigned btracker_nr_writebacks_queued(struct background_tracker *b);
++unsigned btracker_nr_demotions_queued(struct background_tracker *b);
++
++/*
++ * returns -EINVAL iff the work is already queued.  -ENOMEM if the work
++ * couldn't be queued for another reason.
++ */
++int btracker_queue(struct background_tracker *b,
++		   struct policy_work *work,
++		   struct policy_work **pwork);
++
++/*
++ * Returns -ENODATA if there's no work.
++ */
++int btracker_issue(struct background_tracker *b, struct policy_work **work);
++void btracker_complete(struct background_tracker *b,
++		       struct policy_work *op);
++bool btracker_promotion_already_present(struct background_tracker *b,
++					dm_oblock_t oblock);
++
++/*----------------------------------------------------------------*/
++
++#endif
+diff --git a/drivers/md/dm-cache-metadata.h b/drivers/md/dm-cache-metadata.h
+index 4f07c08cf107..179ed5bf81a3 100644
+--- a/drivers/md/dm-cache-metadata.h
++++ b/drivers/md/dm-cache-metadata.h
+@@ -50,6 +50,8 @@
+ #define DM_CACHE_FEATURE_COMPAT_RO_SUPP	  0UL
+ #define DM_CACHE_FEATURE_INCOMPAT_SUPP	  0UL
+ 
++struct dm_cache_metadata;
++
+ /*
+  * Reopens or creates a new, empty metadata volume.  Returns an ERR_PTR on
+  * failure.  If reopening then features must match.
+diff --git a/drivers/md/dm-cache-policy-cleaner.c b/drivers/md/dm-cache-policy-cleaner.c
+deleted file mode 100644
+index 2e8a8f1d8358..000000000000
+--- a/drivers/md/dm-cache-policy-cleaner.c
++++ /dev/null
+@@ -1,469 +0,0 @@
+-/*
+- * Copyright (C) 2012 Red Hat. All rights reserved.
+- *
+- * writeback cache policy supporting flushing out dirty cache blocks.
+- *
+- * This file is released under the GPL.
+- */
+-
+-#include "dm-cache-policy.h"
+-#include "dm.h"
+-
+-#include <linux/hash.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/vmalloc.h>
+-
+-/*----------------------------------------------------------------*/
+-
+-#define DM_MSG_PREFIX "cache cleaner"
+-
+-/* Cache entry struct. */
+-struct wb_cache_entry {
+-	struct list_head list;
+-	struct hlist_node hlist;
+-
+-	dm_oblock_t oblock;
+-	dm_cblock_t cblock;
+-	bool dirty:1;
+-	bool pending:1;
+-};
+-
+-struct hash {
+-	struct hlist_head *table;
+-	dm_block_t hash_bits;
+-	unsigned nr_buckets;
+-};
+-
+-struct policy {
+-	struct dm_cache_policy policy;
+-	spinlock_t lock;
+-
+-	struct list_head free;
+-	struct list_head clean;
+-	struct list_head clean_pending;
+-	struct list_head dirty;
+-
+-	/*
+-	 * We know exactly how many cblocks will be needed,
+-	 * so we can allocate them up front.
+-	 */
+-	dm_cblock_t cache_size, nr_cblocks_allocated;
+-	struct wb_cache_entry *cblocks;
+-	struct hash chash;
+-};
+-
+-/*----------------------------------------------------------------------------*/
+-
+-/*
+- * Low-level functions.
+- */
+-static unsigned next_power(unsigned n, unsigned min)
+-{
+-	return roundup_pow_of_two(max(n, min));
+-}
+-
+-static struct policy *to_policy(struct dm_cache_policy *p)
+-{
+-	return container_of(p, struct policy, policy);
+-}
+-
+-static struct list_head *list_pop(struct list_head *q)
+-{
+-	struct list_head *r = q->next;
+-
+-	list_del(r);
+-
+-	return r;
+-}
+-
+-/*----------------------------------------------------------------------------*/
+-
+-/* Allocate/free various resources. */
+-static int alloc_hash(struct hash *hash, unsigned elts)
+-{
+-	hash->nr_buckets = next_power(elts >> 4, 16);
+-	hash->hash_bits = __ffs(hash->nr_buckets);
+-	hash->table = vzalloc(sizeof(*hash->table) * hash->nr_buckets);
+-
+-	return hash->table ? 0 : -ENOMEM;
+-}
+-
+-static void free_hash(struct hash *hash)
+-{
+-	vfree(hash->table);
+-}
+-
+-static int alloc_cache_blocks_with_hash(struct policy *p, dm_cblock_t cache_size)
+-{
+-	int r = -ENOMEM;
+-
+-	p->cblocks = vzalloc(sizeof(*p->cblocks) * from_cblock(cache_size));
+-	if (p->cblocks) {
+-		unsigned u = from_cblock(cache_size);
+-
+-		while (u--)
+-			list_add(&p->cblocks[u].list, &p->free);
+-
+-		p->nr_cblocks_allocated = 0;
+-
+-		/* Cache entries hash. */
+-		r = alloc_hash(&p->chash, from_cblock(cache_size));
+-		if (r)
+-			vfree(p->cblocks);
+-	}
+-
+-	return r;
+-}
+-
+-static void free_cache_blocks_and_hash(struct policy *p)
+-{
+-	free_hash(&p->chash);
+-	vfree(p->cblocks);
+-}
+-
+-static struct wb_cache_entry *alloc_cache_entry(struct policy *p)
+-{
+-	struct wb_cache_entry *e;
+-
+-	BUG_ON(from_cblock(p->nr_cblocks_allocated) >= from_cblock(p->cache_size));
+-
+-	e = list_entry(list_pop(&p->free), struct wb_cache_entry, list);
+-	p->nr_cblocks_allocated = to_cblock(from_cblock(p->nr_cblocks_allocated) + 1);
+-
+-	return e;
+-}
+-
+-/*----------------------------------------------------------------------------*/
+-
+-/* Hash functions (lookup, insert, remove). */
+-static struct wb_cache_entry *lookup_cache_entry(struct policy *p, dm_oblock_t oblock)
+-{
+-	struct hash *hash = &p->chash;
+-	unsigned h = hash_64(from_oblock(oblock), hash->hash_bits);
+-	struct wb_cache_entry *cur;
+-	struct hlist_head *bucket = &hash->table[h];
+-
+-	hlist_for_each_entry(cur, bucket, hlist) {
+-		if (cur->oblock == oblock) {
+-			/* Move upfront bucket for faster access. */
+-			hlist_del(&cur->hlist);
+-			hlist_add_head(&cur->hlist, bucket);
+-			return cur;
+-		}
+-	}
+-
+-	return NULL;
+-}
+-
+-static void insert_cache_hash_entry(struct policy *p, struct wb_cache_entry *e)
+-{
+-	unsigned h = hash_64(from_oblock(e->oblock), p->chash.hash_bits);
+-
+-	hlist_add_head(&e->hlist, &p->chash.table[h]);
+-}
+-
+-static void remove_cache_hash_entry(struct wb_cache_entry *e)
+-{
+-	hlist_del(&e->hlist);
+-}
+-
+-/* Public interface (see dm-cache-policy.h */
+-static int wb_map(struct dm_cache_policy *pe, dm_oblock_t oblock,
+-		  bool can_block, bool can_migrate, bool discarded_oblock,
+-		  struct bio *bio, struct policy_locker *locker,
+-		  struct policy_result *result)
+-{
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-	unsigned long flags;
+-
+-	result->op = POLICY_MISS;
+-
+-	if (can_block)
+-		spin_lock_irqsave(&p->lock, flags);
+-
+-	else if (!spin_trylock_irqsave(&p->lock, flags))
+-		return -EWOULDBLOCK;
+-
+-	e = lookup_cache_entry(p, oblock);
+-	if (e) {
+-		result->op = POLICY_HIT;
+-		result->cblock = e->cblock;
+-
+-	}
+-
+-	spin_unlock_irqrestore(&p->lock, flags);
+-
+-	return 0;
+-}
+-
+-static int wb_lookup(struct dm_cache_policy *pe, dm_oblock_t oblock, dm_cblock_t *cblock)
+-{
+-	int r;
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-	unsigned long flags;
+-
+-	if (!spin_trylock_irqsave(&p->lock, flags))
+-		return -EWOULDBLOCK;
+-
+-	e = lookup_cache_entry(p, oblock);
+-	if (e) {
+-		*cblock = e->cblock;
+-		r = 0;
+-
+-	} else
+-		r = -ENOENT;
+-
+-	spin_unlock_irqrestore(&p->lock, flags);
+-
+-	return r;
+-}
+-
+-static void __set_clear_dirty(struct dm_cache_policy *pe, dm_oblock_t oblock, bool set)
+-{
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-
+-	e = lookup_cache_entry(p, oblock);
+-	BUG_ON(!e);
+-
+-	if (set) {
+-		if (!e->dirty) {
+-			e->dirty = true;
+-			list_move(&e->list, &p->dirty);
+-		}
+-
+-	} else {
+-		if (e->dirty) {
+-			e->pending = false;
+-			e->dirty = false;
+-			list_move(&e->list, &p->clean);
+-		}
+-	}
+-}
+-
+-static void wb_set_dirty(struct dm_cache_policy *pe, dm_oblock_t oblock)
+-{
+-	struct policy *p = to_policy(pe);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&p->lock, flags);
+-	__set_clear_dirty(pe, oblock, true);
+-	spin_unlock_irqrestore(&p->lock, flags);
+-}
+-
+-static void wb_clear_dirty(struct dm_cache_policy *pe, dm_oblock_t oblock)
+-{
+-	struct policy *p = to_policy(pe);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&p->lock, flags);
+-	__set_clear_dirty(pe, oblock, false);
+-	spin_unlock_irqrestore(&p->lock, flags);
+-}
+-
+-static void add_cache_entry(struct policy *p, struct wb_cache_entry *e)
+-{
+-	insert_cache_hash_entry(p, e);
+-	if (e->dirty)
+-		list_add(&e->list, &p->dirty);
+-	else
+-		list_add(&e->list, &p->clean);
+-}
+-
+-static int wb_load_mapping(struct dm_cache_policy *pe,
+-			   dm_oblock_t oblock, dm_cblock_t cblock,
+-			   uint32_t hint, bool hint_valid)
+-{
+-	int r;
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e = alloc_cache_entry(p);
+-
+-	if (e) {
+-		e->cblock = cblock;
+-		e->oblock = oblock;
+-		e->dirty = false; /* blocks default to clean */
+-		add_cache_entry(p, e);
+-		r = 0;
+-
+-	} else
+-		r = -ENOMEM;
+-
+-	return r;
+-}
+-
+-static void wb_destroy(struct dm_cache_policy *pe)
+-{
+-	struct policy *p = to_policy(pe);
+-
+-	free_cache_blocks_and_hash(p);
+-	kfree(p);
+-}
+-
+-static struct wb_cache_entry *__wb_force_remove_mapping(struct policy *p, dm_oblock_t oblock)
+-{
+-	struct wb_cache_entry *r = lookup_cache_entry(p, oblock);
+-
+-	BUG_ON(!r);
+-
+-	remove_cache_hash_entry(r);
+-	list_del(&r->list);
+-
+-	return r;
+-}
+-
+-static void wb_remove_mapping(struct dm_cache_policy *pe, dm_oblock_t oblock)
+-{
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&p->lock, flags);
+-	e = __wb_force_remove_mapping(p, oblock);
+-	list_add_tail(&e->list, &p->free);
+-	BUG_ON(!from_cblock(p->nr_cblocks_allocated));
+-	p->nr_cblocks_allocated = to_cblock(from_cblock(p->nr_cblocks_allocated) - 1);
+-	spin_unlock_irqrestore(&p->lock, flags);
+-}
+-
+-static void wb_force_mapping(struct dm_cache_policy *pe,
+-				dm_oblock_t current_oblock, dm_oblock_t oblock)
+-{
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&p->lock, flags);
+-	e = __wb_force_remove_mapping(p, current_oblock);
+-	e->oblock = oblock;
+-	add_cache_entry(p, e);
+-	spin_unlock_irqrestore(&p->lock, flags);
+-}
+-
+-static struct wb_cache_entry *get_next_dirty_entry(struct policy *p)
+-{
+-	struct list_head *l;
+-	struct wb_cache_entry *r;
+-
+-	if (list_empty(&p->dirty))
+-		return NULL;
+-
+-	l = list_pop(&p->dirty);
+-	r = container_of(l, struct wb_cache_entry, list);
+-	list_add(l, &p->clean_pending);
+-
+-	return r;
+-}
+-
+-static int wb_writeback_work(struct dm_cache_policy *pe,
+-			     dm_oblock_t *oblock,
+-			     dm_cblock_t *cblock,
+-			     bool critical_only)
+-{
+-	int r = -ENOENT;
+-	struct policy *p = to_policy(pe);
+-	struct wb_cache_entry *e;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&p->lock, flags);
+-
+-	e = get_next_dirty_entry(p);
+-	if (e) {
+-		*oblock = e->oblock;
+-		*cblock = e->cblock;
+-		r = 0;
+-	}
+-
+-	spin_unlock_irqrestore(&p->lock, flags);
+-
+-	return r;
+-}
+-
+-static dm_cblock_t wb_residency(struct dm_cache_policy *pe)
+-{
+-	return to_policy(pe)->nr_cblocks_allocated;
+-}
+-
+-/* Init the policy plugin interface function pointers. */
+-static void init_policy_functions(struct policy *p)
+-{
+-	p->policy.destroy = wb_destroy;
+-	p->policy.map = wb_map;
+-	p->policy.lookup = wb_lookup;
+-	p->policy.set_dirty = wb_set_dirty;
+-	p->policy.clear_dirty = wb_clear_dirty;
+-	p->policy.load_mapping = wb_load_mapping;
+-	p->policy.get_hint = NULL;
+-	p->policy.remove_mapping = wb_remove_mapping;
+-	p->policy.writeback_work = wb_writeback_work;
+-	p->policy.force_mapping = wb_force_mapping;
+-	p->policy.residency = wb_residency;
+-	p->policy.tick = NULL;
+-}
+-
+-static struct dm_cache_policy *wb_create(dm_cblock_t cache_size,
+-					 sector_t origin_size,
+-					 sector_t cache_block_size)
+-{
+-	int r;
+-	struct policy *p = kzalloc(sizeof(*p), GFP_KERNEL);
+-
+-	if (!p)
+-		return NULL;
+-
+-	init_policy_functions(p);
+-	INIT_LIST_HEAD(&p->free);
+-	INIT_LIST_HEAD(&p->clean);
+-	INIT_LIST_HEAD(&p->clean_pending);
+-	INIT_LIST_HEAD(&p->dirty);
+-
+-	p->cache_size = cache_size;
+-	spin_lock_init(&p->lock);
+-
+-	/* Allocate cache entry structs and add them to free list. */
+-	r = alloc_cache_blocks_with_hash(p, cache_size);
+-	if (!r)
+-		return &p->policy;
+-
+-	kfree(p);
+-
+-	return NULL;
+-}
+-/*----------------------------------------------------------------------------*/
+-
+-static struct dm_cache_policy_type wb_policy_type = {
+-	.name = "cleaner",
+-	.version = {1, 0, 0},
+-	.hint_size = 4,
+-	.owner = THIS_MODULE,
+-	.create = wb_create
+-};
+-
+-static int __init wb_init(void)
+-{
+-	int r = dm_cache_policy_register(&wb_policy_type);
+-
+-	if (r < 0)
+-		DMERR("register failed %d", r);
+-	else
+-		DMINFO("version %u.%u.%u loaded",
+-		       wb_policy_type.version[0],
+-		       wb_policy_type.version[1],
+-		       wb_policy_type.version[2]);
+-
+-	return r;
+-}
+-
+-static void __exit wb_exit(void)
+-{
+-	dm_cache_policy_unregister(&wb_policy_type);
+-}
+-
+-module_init(wb_init);
+-module_exit(wb_exit);
+-
+-MODULE_AUTHOR("Heinz Mauelshagen <dm-devel@redhat.com>");
+-MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("cleaner cache policy");
+diff --git a/drivers/md/dm-cache-policy-internal.h b/drivers/md/dm-cache-policy-internal.h
+index 808ee0e2b2c4..56f0a23f698c 100644
+--- a/drivers/md/dm-cache-policy-internal.h
++++ b/drivers/md/dm-cache-policy-internal.h
+@@ -12,70 +12,65 @@
+ 
+ /*----------------------------------------------------------------*/
+ 
+-/*
+- * Little inline functions that simplify calling the policy methods.
+- */
+-static inline int policy_map(struct dm_cache_policy *p, dm_oblock_t oblock,
+-			     bool can_block, bool can_migrate, bool discarded_oblock,
+-			     struct bio *bio, struct policy_locker *locker,
+-			     struct policy_result *result)
++static inline int policy_lookup(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock,
++				int data_dir, bool fast_copy, bool *background_queued)
+ {
+-	return p->map(p, oblock, can_block, can_migrate, discarded_oblock, bio, locker, result);
++	return p->lookup(p, oblock, cblock, data_dir, fast_copy, background_queued);
+ }
+ 
+-static inline int policy_lookup(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock)
++static inline int policy_lookup_with_work(struct dm_cache_policy *p,
++					  dm_oblock_t oblock, dm_cblock_t *cblock,
++					  int data_dir, bool fast_copy,
++					  struct policy_work **work)
+ {
+-	BUG_ON(!p->lookup);
+-	return p->lookup(p, oblock, cblock);
+-}
++	if (!p->lookup_with_work) {
++		*work = NULL;
++		return p->lookup(p, oblock, cblock, data_dir, fast_copy, NULL);
++	}
+ 
+-static inline void policy_set_dirty(struct dm_cache_policy *p, dm_oblock_t oblock)
+-{
+-	if (p->set_dirty)
+-		p->set_dirty(p, oblock);
++	return p->lookup_with_work(p, oblock, cblock, data_dir, fast_copy, work);
+ }
+ 
+-static inline void policy_clear_dirty(struct dm_cache_policy *p, dm_oblock_t oblock)
++static inline int policy_get_background_work(struct dm_cache_policy *p,
++					     bool idle, struct policy_work **result)
+ {
+-	if (p->clear_dirty)
+-		p->clear_dirty(p, oblock);
++	return p->get_background_work(p, idle, result);
+ }
+ 
+-static inline int policy_load_mapping(struct dm_cache_policy *p,
+-				      dm_oblock_t oblock, dm_cblock_t cblock,
+-				      uint32_t hint, bool hint_valid)
++static inline void policy_complete_background_work(struct dm_cache_policy *p,
++						   struct policy_work *work,
++						   bool success)
+ {
+-	return p->load_mapping(p, oblock, cblock, hint, hint_valid);
++	return p->complete_background_work(p, work, success);
+ }
+ 
+-static inline uint32_t policy_get_hint(struct dm_cache_policy *p,
+-				       dm_cblock_t cblock)
++static inline void policy_set_dirty(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	return p->get_hint ? p->get_hint(p, cblock) : 0;
++	p->set_dirty(p, cblock);
+ }
+ 
+-static inline int policy_writeback_work(struct dm_cache_policy *p,
+-					dm_oblock_t *oblock,
+-					dm_cblock_t *cblock,
+-					bool critical_only)
++static inline void policy_clear_dirty(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	return p->writeback_work ? p->writeback_work(p, oblock, cblock, critical_only) : -ENOENT;
++	p->clear_dirty(p, cblock);
+ }
+ 
+-static inline void policy_remove_mapping(struct dm_cache_policy *p, dm_oblock_t oblock)
++static inline int policy_load_mapping(struct dm_cache_policy *p,
++				      dm_oblock_t oblock, dm_cblock_t cblock,
++				      bool dirty, uint32_t hint, bool hint_valid)
+ {
+-	p->remove_mapping(p, oblock);
++	return p->load_mapping(p, oblock, cblock, dirty, hint, hint_valid);
+ }
+ 
+-static inline int policy_remove_cblock(struct dm_cache_policy *p, dm_cblock_t cblock)
++static inline int policy_invalidate_mapping(struct dm_cache_policy *p,
++					    dm_cblock_t cblock)
+ {
+-	return p->remove_cblock(p, cblock);
++	return p->invalidate_mapping(p, cblock);
+ }
+ 
+-static inline void policy_force_mapping(struct dm_cache_policy *p,
+-					dm_oblock_t current_oblock, dm_oblock_t new_oblock)
++static inline uint32_t policy_get_hint(struct dm_cache_policy *p,
++				       dm_cblock_t cblock)
+ {
+-	return p->force_mapping(p, current_oblock, new_oblock);
++	return p->get_hint ? p->get_hint(p, cblock) : 0;
+ }
+ 
+ static inline dm_cblock_t policy_residency(struct dm_cache_policy *p)
+@@ -107,6 +102,11 @@ static inline int policy_set_config_value(struct dm_cache_policy *p,
+ 	return p->set_config_value ? p->set_config_value(p, key, value) : -EINVAL;
+ }
+ 
++static inline void policy_allow_migrations(struct dm_cache_policy *p, bool allow)
++{
++	return p->allow_migrations(p, allow);
++}
++
+ /*----------------------------------------------------------------*/
+ 
+ /*
+diff --git a/drivers/md/dm-cache-policy-smq.c b/drivers/md/dm-cache-policy-smq.c
+index c33f4a6e1d7d..b57bc6d3d5b4 100644
+--- a/drivers/md/dm-cache-policy-smq.c
++++ b/drivers/md/dm-cache-policy-smq.c
+@@ -4,8 +4,9 @@
+  * This file is released under the GPL.
+  */
+ 
+-#include "dm-cache-policy.h"
++#include "dm-cache-background-tracker.h"
+ #include "dm-cache-policy-internal.h"
++#include "dm-cache-policy.h"
+ #include "dm.h"
+ 
+ #include <linux/hash.h>
+@@ -38,10 +39,11 @@ struct entry {
+ 	unsigned hash_next:28;
+ 	unsigned prev:28;
+ 	unsigned next:28;
+-	unsigned level:7;
++	unsigned level:6;
+ 	bool dirty:1;
+ 	bool allocated:1;
+ 	bool sentinel:1;
++	bool pending_work:1;
+ 
+ 	dm_oblock_t oblock;
+ };
+@@ -279,14 +281,28 @@ static unsigned q_size(struct queue *q)
+  */
+ static void q_push(struct queue *q, struct entry *e)
+ {
++	BUG_ON(e->pending_work);
++
+ 	if (!e->sentinel)
+ 		q->nr_elts++;
+ 
+ 	l_add_tail(q->es, q->qs + e->level, e);
+ }
+ 
++static void q_push_front(struct queue *q, struct entry *e)
++{
++	BUG_ON(e->pending_work);
++
++	if (!e->sentinel)
++		q->nr_elts++;
++
++	l_add_head(q->es, q->qs + e->level, e);
++}
++
+ static void q_push_before(struct queue *q, struct entry *old, struct entry *e)
+ {
++	BUG_ON(e->pending_work);
++
+ 	if (!e->sentinel)
+ 		q->nr_elts++;
+ 
+@@ -335,19 +351,6 @@ static struct entry *q_pop(struct queue *q)
+ 	return e;
+ }
+ 
+-/*
+- * Pops an entry from a level that is not past a sentinel.
+- */
+-static struct entry *q_pop_old(struct queue *q, unsigned max_level)
+-{
+-	struct entry *e = q_peek(q, max_level, false);
+-
+-	if (e)
+-		q_del(q, e);
+-
+-	return e;
+-}
+-
+ /*
+  * This function assumes there is a non-sentinel entry to pop.  It's only
+  * used by redistribute, so we know this is true.  It also doesn't adjust
+@@ -446,45 +449,49 @@ static void q_redistribute(struct queue *q)
+ 				break;
+ 
+ 			e->level = level + 1u;
+-			l_add_head(q->es, l_above, e);
++			l_add_tail(q->es, l_above, e);
+ 		}
+ 	}
+ }
+ 
+-static void q_requeue_before(struct queue *q, struct entry *dest, struct entry *e, unsigned extra_levels)
++static void q_requeue(struct queue *q, struct entry *e, unsigned extra_levels,
++		      struct entry *s1, struct entry *s2)
+ {
+ 	struct entry *de;
+-	unsigned new_level;
+-
+-	q_del(q, e);
++	unsigned sentinels_passed = 0;
++	unsigned new_level = min(q->nr_levels - 1u, e->level + extra_levels);
+ 
++	/* try and find an entry to swap with */
+ 	if (extra_levels && (e->level < q->nr_levels - 1u)) {
+-		new_level = min(q->nr_levels - 1u, e->level + extra_levels);
+-		for (de = l_head(q->es, q->qs + new_level); de; de = l_next(q->es, de)) {
+-			if (de->sentinel)
+-				continue;
++		for (de = l_head(q->es, q->qs + new_level); de && de->sentinel; de = l_next(q->es, de))
++			sentinels_passed++;
+ 
++		if (de) {
+ 			q_del(q, de);
+ 			de->level = e->level;
++			if (s1) {
++				switch (sentinels_passed) {
++				case 0:
++					q_push_before(q, s1, de);
++					break;
++
++				case 1:
++					q_push_before(q, s2, de);
++					break;
+ 
+-			if (dest)
+-				q_push_before(q, dest, de);
+-			else
++				default:
++					q_push(q, de);
++				}
++			} else
+ 				q_push(q, de);
+-			break;
+ 		}
+-
+-		e->level = new_level;
+ 	}
+ 
++	q_del(q, e);
++	e->level = new_level;
+ 	q_push(q, e);
+ }
+ 
+-static void q_requeue(struct queue *q, struct entry *e, unsigned extra_levels)
+-{
+-	q_requeue_before(q, NULL, e, extra_levels);
+-}
+-
+ /*----------------------------------------------------------------*/
+ 
+ #define FP_SHIFT 8
+@@ -550,7 +557,7 @@ static enum performance stats_assess(struct stats *s)
+ 
+ /*----------------------------------------------------------------*/
+ 
+-struct hash_table {
++struct smq_hash_table {
+ 	struct entry_space *es;
+ 	unsigned long long hash_bits;
+ 	unsigned *buckets;
+@@ -560,7 +567,7 @@ struct hash_table {
+  * All cache entries are stored in a chained hash table.  To save space we
+  * use indexing again, and only store indexes to the next entry.
+  */
+-static int h_init(struct hash_table *ht, struct entry_space *es, unsigned nr_entries)
++static int h_init(struct smq_hash_table *ht, struct entry_space *es, unsigned nr_entries)
+ {
+ 	unsigned i, nr_buckets;
+ 
+@@ -578,34 +585,34 @@ static int h_init(struct hash_table *ht, struct entry_space *es, unsigned nr_ent
+ 	return 0;
+ }
+ 
+-static void h_exit(struct hash_table *ht)
++static void h_exit(struct smq_hash_table *ht)
+ {
+ 	vfree(ht->buckets);
+ }
+ 
+-static struct entry *h_head(struct hash_table *ht, unsigned bucket)
++static struct entry *h_head(struct smq_hash_table *ht, unsigned bucket)
+ {
+ 	return to_entry(ht->es, ht->buckets[bucket]);
+ }
+ 
+-static struct entry *h_next(struct hash_table *ht, struct entry *e)
++static struct entry *h_next(struct smq_hash_table *ht, struct entry *e)
+ {
+ 	return to_entry(ht->es, e->hash_next);
+ }
+ 
+-static void __h_insert(struct hash_table *ht, unsigned bucket, struct entry *e)
++static void __h_insert(struct smq_hash_table *ht, unsigned bucket, struct entry *e)
+ {
+ 	e->hash_next = ht->buckets[bucket];
+ 	ht->buckets[bucket] = to_index(ht->es, e);
+ }
+ 
+-static void h_insert(struct hash_table *ht, struct entry *e)
++static void h_insert(struct smq_hash_table *ht, struct entry *e)
+ {
+ 	unsigned h = hash_64(from_oblock(e->oblock), ht->hash_bits);
+ 	__h_insert(ht, h, e);
+ }
+ 
+-static struct entry *__h_lookup(struct hash_table *ht, unsigned h, dm_oblock_t oblock,
++static struct entry *__h_lookup(struct smq_hash_table *ht, unsigned h, dm_oblock_t oblock,
+ 				struct entry **prev)
+ {
+ 	struct entry *e;
+@@ -621,7 +628,7 @@ static struct entry *__h_lookup(struct hash_table *ht, unsigned h, dm_oblock_t o
+ 	return NULL;
+ }
+ 
+-static void __h_unlink(struct hash_table *ht, unsigned h,
++static void __h_unlink(struct smq_hash_table *ht, unsigned h,
+ 		       struct entry *e, struct entry *prev)
+ {
+ 	if (prev)
+@@ -633,7 +640,7 @@ static void __h_unlink(struct hash_table *ht, unsigned h,
+ /*
+  * Also moves each entry to the front of the bucket.
+  */
+-static struct entry *h_lookup(struct hash_table *ht, dm_oblock_t oblock)
++static struct entry *h_lookup(struct smq_hash_table *ht, dm_oblock_t oblock)
+ {
+ 	struct entry *e, *prev;
+ 	unsigned h = hash_64(from_oblock(oblock), ht->hash_bits);
+@@ -651,7 +658,7 @@ static struct entry *h_lookup(struct hash_table *ht, dm_oblock_t oblock)
+ 	return e;
+ }
+ 
+-static void h_remove(struct hash_table *ht, struct entry *e)
++static void h_remove(struct smq_hash_table *ht, struct entry *e)
+ {
+ 	unsigned h = hash_64(from_oblock(e->oblock), ht->hash_bits);
+ 	struct entry *prev;
+@@ -699,7 +706,10 @@ static void init_entry(struct entry *e)
+ 	e->next = INDEXER_NULL;
+ 	e->prev = INDEXER_NULL;
+ 	e->level = 0u;
++	e->dirty = true;	/* FIXME: audit */
+ 	e->allocated = true;
++	e->sentinel = false;
++	e->pending_work = false;
+ }
+ 
+ static struct entry *alloc_entry(struct entry_alloc *ea)
+@@ -762,11 +772,11 @@ static struct entry *get_entry(struct entry_alloc *ea, unsigned index)
+ #define NR_HOTSPOT_LEVELS 64u
+ #define NR_CACHE_LEVELS 64u
+ 
+-#define WRITEBACK_PERIOD (10 * HZ)
+-#define DEMOTE_PERIOD (60 * HZ)
++#define WRITEBACK_PERIOD (10ul * HZ)
++#define DEMOTE_PERIOD (60ul * HZ)
+ 
+ #define HOTSPOT_UPDATE_PERIOD (HZ)
+-#define CACHE_UPDATE_PERIOD (10u * HZ)
++#define CACHE_UPDATE_PERIOD (60ul * HZ)
+ 
+ struct smq_policy {
+ 	struct dm_cache_policy policy;
+@@ -814,8 +824,8 @@ struct smq_policy {
+ 	 * The hash tables allows us to quickly find an entry by origin
+ 	 * block.
+ 	 */
+-	struct hash_table table;
+-	struct hash_table hotspot_table;
++	struct smq_hash_table table;
++	struct smq_hash_table hotspot_table;
+ 
+ 	bool current_writeback_sentinels;
+ 	unsigned long next_writeback_period;
+@@ -828,6 +838,10 @@ struct smq_policy {
+ 
+ 	unsigned long next_hotspot_period;
+ 	unsigned long next_cache_period;
++
++	struct background_tracker *bg_work;
++
++	bool migrations_allowed;
+ };
+ 
+ /*----------------------------------------------------------------*/
+@@ -876,15 +890,15 @@ static void __update_demote_sentinels(struct smq_policy *mq)
+ static void update_sentinels(struct smq_policy *mq)
+ {
+ 	if (time_after(jiffies, mq->next_writeback_period)) {
+-		__update_writeback_sentinels(mq);
+ 		mq->next_writeback_period = jiffies + WRITEBACK_PERIOD;
+ 		mq->current_writeback_sentinels = !mq->current_writeback_sentinels;
++		__update_writeback_sentinels(mq);
+ 	}
+ 
+ 	if (time_after(jiffies, mq->next_demote_period)) {
+-		__update_demote_sentinels(mq);
+ 		mq->next_demote_period = jiffies + DEMOTE_PERIOD;
+ 		mq->current_demote_sentinels = !mq->current_demote_sentinels;
++		__update_demote_sentinels(mq);
+ 	}
+ }
+ 
+@@ -920,55 +934,40 @@ static void sentinels_init(struct smq_policy *mq)
+ 
+ /*----------------------------------------------------------------*/
+ 
+-/*
+- * These methods tie together the dirty queue, clean queue and hash table.
+- */
+-static void push_new(struct smq_policy *mq, struct entry *e)
++static void del_queue(struct smq_policy *mq, struct entry *e)
+ {
+-	struct queue *q = e->dirty ? &mq->dirty : &mq->clean;
+-	h_insert(&mq->table, e);
+-	q_push(q, e);
++	q_del(e->dirty ? &mq->dirty : &mq->clean, e);
+ }
+ 
+-static void push(struct smq_policy *mq, struct entry *e)
++static void push_queue(struct smq_policy *mq, struct entry *e)
+ {
+-	struct entry *sentinel;
+-
+-	h_insert(&mq->table, e);
+-
+-	/*
+-	 * Punch this into the queue just in front of the sentinel, to
+-	 * ensure it's cleaned straight away.
+-	 */
+-	if (e->dirty) {
+-		sentinel = writeback_sentinel(mq, e->level);
+-		q_push_before(&mq->dirty, sentinel, e);
+-	} else {
+-		sentinel = demote_sentinel(mq, e->level);
+-		q_push_before(&mq->clean, sentinel, e);
+-	}
++	if (e->dirty)
++		q_push(&mq->dirty, e);
++	else
++		q_push(&mq->clean, e);
+ }
+ 
+-/*
+- * Removes an entry from cache.  Removes from the hash table.
+- */
+-static void __del(struct smq_policy *mq, struct queue *q, struct entry *e)
++// !h, !q, a -> h, q, a
++static void push(struct smq_policy *mq, struct entry *e)
+ {
+-	q_del(q, e);
+-	h_remove(&mq->table, e);
++	h_insert(&mq->table, e);
++	if (!e->pending_work)
++		push_queue(mq, e);
+ }
+ 
+-static void del(struct smq_policy *mq, struct entry *e)
++static void push_queue_front(struct smq_policy *mq, struct entry *e)
+ {
+-	__del(mq, e->dirty ? &mq->dirty : &mq->clean, e);
++	if (e->dirty)
++		q_push_front(&mq->dirty, e);
++	else
++		q_push_front(&mq->clean, e);
+ }
+ 
+-static struct entry *pop_old(struct smq_policy *mq, struct queue *q, unsigned max_level)
++static void push_front(struct smq_policy *mq, struct entry *e)
+ {
+-	struct entry *e = q_pop_old(q, max_level);
+-	if (e)
+-		h_remove(&mq->table, e);
+-	return e;
++	h_insert(&mq->table, e);
++	if (!e->pending_work)
++		push_queue_front(mq, e);
+ }
+ 
+ static dm_cblock_t infer_cblock(struct smq_policy *mq, struct entry *e)
+@@ -978,16 +977,21 @@ static dm_cblock_t infer_cblock(struct smq_policy *mq, struct entry *e)
+ 
+ static void requeue(struct smq_policy *mq, struct entry *e)
+ {
+-	struct entry *sentinel;
++	/*
++	 * Pending work has temporarily been taken out of the queues.
++	 */
++	if (e->pending_work)
++		return;
+ 
+ 	if (!test_and_set_bit(from_cblock(infer_cblock(mq, e)), mq->cache_hit_bits)) {
+-		if (e->dirty) {
+-			sentinel = writeback_sentinel(mq, e->level);
+-			q_requeue_before(&mq->dirty, sentinel, e, 1u);
+-		} else {
+-			sentinel = demote_sentinel(mq, e->level);
+-			q_requeue_before(&mq->clean, sentinel, e, 1u);
++		if (!e->dirty) {
++			q_requeue(&mq->clean, e, 1u, NULL, NULL);
++			return;
+ 		}
++
++		q_requeue(&mq->dirty, e, 1u,
++			  get_sentinel(&mq->writeback_sentinel_alloc, e->level, !mq->current_writeback_sentinels),
++			  get_sentinel(&mq->writeback_sentinel_alloc, e->level, mq->current_writeback_sentinels));
+ 	}
+ }
+ 
+@@ -1026,6 +1030,8 @@ static void update_promote_levels(struct smq_policy *mq)
+ 	unsigned threshold_level = allocator_empty(&mq->cache_alloc) ?
+ 		default_promote_level(mq) : (NR_HOTSPOT_LEVELS / 2u);
+ 
++	threshold_level = max(threshold_level, NR_HOTSPOT_LEVELS);
++
+ 	/*
+ 	 * If the hotspot queue is performing badly then we have little
+ 	 * confidence that we know which blocks to promote.  So we cut down
+@@ -1045,7 +1051,7 @@ static void update_promote_levels(struct smq_policy *mq)
+ 	}
+ 
+ 	mq->read_promote_level = NR_HOTSPOT_LEVELS - threshold_level;
+-	mq->write_promote_level = (NR_HOTSPOT_LEVELS - threshold_level) + 2u;
++	mq->write_promote_level = (NR_HOTSPOT_LEVELS - threshold_level);
+ }
+ 
+ /*
+@@ -1095,34 +1101,142 @@ static void end_cache_period(struct smq_policy *mq)
+ 	}
+ }
+ 
+-static int demote_cblock(struct smq_policy *mq,
+-			 struct policy_locker *locker,
+-			 dm_oblock_t *oblock)
++/*----------------------------------------------------------------*/
++
++/*
++ * Targets are given as a percentage.
++ */
++#define CLEAN_TARGET 25u
++#define FREE_TARGET 25u
++
++static unsigned percent_to_target(struct smq_policy *mq, unsigned p)
+ {
+-	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false);
+-	if (!demoted)
+-		/*
+-		 * We could get a block from mq->dirty, but that
+-		 * would add extra latency to the triggering bio as it
+-		 * waits for the writeback.  Better to not promote this
+-		 * time and hope there's a clean block next time this block
+-		 * is hit.
+-		 */
+-		return -ENOSPC;
++	return from_cblock(mq->cache_size) * p / 100u;
++}
++
++static bool clean_target_met(struct smq_policy *mq, bool idle)
++{
++	/*
++	 * Cache entries may not be populated.  So we cannot rely on the
++	 * size of the clean queue.
++	 */
++	unsigned nr_clean = from_cblock(mq->cache_size) - q_size(&mq->dirty);
+ 
+-	if (locker->fn(locker, demoted->oblock))
++	if (idle)
+ 		/*
+-		 * We couldn't lock this block.
++		 * We'd like to clean everything.
+ 		 */
+-		return -EBUSY;
++		return q_size(&mq->dirty) == 0u;
++	else
++		return (nr_clean + btracker_nr_writebacks_queued(mq->bg_work)) >=
++		       percent_to_target(mq, CLEAN_TARGET);
++}
+ 
+-	del(mq, demoted);
+-	*oblock = demoted->oblock;
+-	free_entry(&mq->cache_alloc, demoted);
++static bool free_target_met(struct smq_policy *mq, bool idle)
++{
++	unsigned nr_free = from_cblock(mq->cache_size) -
++			   mq->cache_alloc.nr_allocated;
+ 
+-	return 0;
++	if (idle)
++		return (nr_free + btracker_nr_demotions_queued(mq->bg_work)) >=
++		       percent_to_target(mq, FREE_TARGET);
++	else
++		return true;
+ }
+ 
++/*----------------------------------------------------------------*/
++
++static void mark_pending(struct smq_policy *mq, struct entry *e)
++{
++	BUG_ON(e->sentinel);
++	BUG_ON(!e->allocated);
++	BUG_ON(e->pending_work);
++	e->pending_work = true;
++}
++
++static void clear_pending(struct smq_policy *mq, struct entry *e)
++{
++	BUG_ON(!e->pending_work);
++	e->pending_work = false;
++}
++
++static void queue_writeback(struct smq_policy *mq)
++{
++	int r;
++	struct policy_work work;
++	struct entry *e;
++
++	e = q_peek(&mq->dirty, mq->dirty.nr_levels, false);
++	if (e) {
++		mark_pending(mq, e);
++		q_del(&mq->dirty, e);
++
++		work.op = POLICY_WRITEBACK;
++		work.oblock = e->oblock;
++		work.cblock = infer_cblock(mq, e);
++
++		r = btracker_queue(mq->bg_work, &work, NULL);
++		WARN_ON_ONCE(r); // FIXME: finish, I think we have to get rid of this race.
++	}
++}
++
++static void queue_demotion(struct smq_policy *mq)
++{
++	struct policy_work work;
++	struct entry *e;
++
++	if (unlikely(WARN_ON_ONCE(!mq->migrations_allowed)))
++		return;
++
++	e = q_peek(&mq->clean, mq->clean.nr_levels, true);
++	if (!e) {
++		if (!clean_target_met(mq, false))
++			queue_writeback(mq);
++		return;
++	}
++
++	mark_pending(mq, e);
++	q_del(&mq->clean, e);
++
++	work.op = POLICY_DEMOTE;
++	work.oblock = e->oblock;
++	work.cblock = infer_cblock(mq, e);
++	btracker_queue(mq->bg_work, &work, NULL);
++}
++
++static void queue_promotion(struct smq_policy *mq, dm_oblock_t oblock,
++			    struct policy_work **workp)
++{
++	struct entry *e;
++	struct policy_work work;
++
++	if (!mq->migrations_allowed)
++		return;
++
++	if (allocator_empty(&mq->cache_alloc)) {
++		if (!free_target_met(mq, false))
++			queue_demotion(mq);
++		return;
++	}
++
++	if (btracker_promotion_already_present(mq->bg_work, oblock))
++		return;
++
++	/*
++	 * We allocate the entry now to reserve the cblock.  If the
++	 * background work is aborted we must remember to free it.
++	 */
++	e = alloc_entry(&mq->cache_alloc);
++	BUG_ON(!e);
++	e->pending_work = true;
++	work.op = POLICY_PROMOTE;
++	work.oblock = oblock;
++	work.cblock = infer_cblock(mq, e);
++	btracker_queue(mq->bg_work, &work, workp);
++}
++
++/*----------------------------------------------------------------*/
++
+ enum promote_result {
+ 	PROMOTE_NOT,
+ 	PROMOTE_TEMPORARY,
+@@ -1137,49 +1251,18 @@ static enum promote_result maybe_promote(bool promote)
+ 	return promote ? PROMOTE_PERMANENT : PROMOTE_NOT;
+ }
+ 
+-static enum promote_result should_promote(struct smq_policy *mq, struct entry *hs_e, struct bio *bio,
+-					  bool fast_promote)
++static enum promote_result should_promote(struct smq_policy *mq, struct entry *hs_e,
++					  int data_dir, bool fast_promote)
+ {
+-	if (bio_data_dir(bio) == WRITE) {
++	if (data_dir == WRITE) {
+ 		if (!allocator_empty(&mq->cache_alloc) && fast_promote)
+ 			return PROMOTE_TEMPORARY;
+ 
+-		else
+-			return maybe_promote(hs_e->level >= mq->write_promote_level);
++		return maybe_promote(hs_e->level >= mq->write_promote_level);
+ 	} else
+ 		return maybe_promote(hs_e->level >= mq->read_promote_level);
+ }
+ 
+-static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
+-			    struct policy_locker *locker,
+-			    struct policy_result *result, enum promote_result pr)
+-{
+-	int r;
+-	struct entry *e;
+-
+-	if (allocator_empty(&mq->cache_alloc)) {
+-		result->op = POLICY_REPLACE;
+-		r = demote_cblock(mq, locker, &result->old_oblock);
+-		if (r) {
+-			result->op = POLICY_MISS;
+-			return;
+-		}
+-
+-	} else
+-		result->op = POLICY_NEW;
+-
+-	e = alloc_entry(&mq->cache_alloc);
+-	BUG_ON(!e);
+-	e->oblock = oblock;
+-
+-	if (pr == PROMOTE_TEMPORARY)
+-		push(mq, e);
+-	else
+-		push_new(mq, e);
+-
+-	result->cblock = infer_cblock(mq, e);
+-}
+-
+ static dm_oblock_t to_hblock(struct smq_policy *mq, dm_oblock_t b)
+ {
+ 	sector_t r = from_oblock(b);
+@@ -1187,7 +1270,7 @@ static dm_oblock_t to_hblock(struct smq_policy *mq, dm_oblock_t b)
+ 	return to_oblock(r);
+ }
+ 
+-static struct entry *update_hotspot_queue(struct smq_policy *mq, dm_oblock_t b, struct bio *bio)
++static struct entry *update_hotspot_queue(struct smq_policy *mq, dm_oblock_t b)
+ {
+ 	unsigned hi;
+ 	dm_oblock_t hb = to_hblock(mq, b);
+@@ -1199,7 +1282,8 @@ static struct entry *update_hotspot_queue(struct smq_policy *mq, dm_oblock_t b,
+ 		hi = get_index(&mq->hotspot_alloc, e);
+ 		q_requeue(&mq->hotspot, e,
+ 			  test_and_set_bit(hi, mq->hotspot_hit_bits) ?
+-			  0u : mq->hotspot_level_jump);
++			  0u : mq->hotspot_level_jump,
++			  NULL, NULL);
+ 
+ 	} else {
+ 		stats_miss(&mq->hotspot_stats);
+@@ -1225,47 +1309,6 @@ static struct entry *update_hotspot_queue(struct smq_policy *mq, dm_oblock_t b,
+ 	return e;
+ }
+ 
+-/*
+- * Looks the oblock up in the hash table, then decides whether to put in
+- * pre_cache, or cache etc.
+- */
+-static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
+-	       bool can_migrate, bool fast_promote,
+-	       struct policy_locker *locker, struct policy_result *result)
+-{
+-	struct entry *e, *hs_e;
+-	enum promote_result pr;
+-
+-	hs_e = update_hotspot_queue(mq, oblock, bio);
+-
+-	e = h_lookup(&mq->table, oblock);
+-	if (e) {
+-		stats_level_accessed(&mq->cache_stats, e->level);
+-
+-		requeue(mq, e);
+-		result->op = POLICY_HIT;
+-		result->cblock = infer_cblock(mq, e);
+-
+-	} else {
+-		stats_miss(&mq->cache_stats);
+-
+-		pr = should_promote(mq, hs_e, bio, fast_promote);
+-		if (pr == PROMOTE_NOT)
+-			result->op = POLICY_MISS;
+-
+-		else {
+-			if (!can_migrate) {
+-				result->op = POLICY_MISS;
+-				return -EWOULDBLOCK;
+-			}
+-
+-			insert_in_cache(mq, oblock, locker, result, pr);
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ /*----------------------------------------------------------------*/
+ 
+ /*
+@@ -1282,6 +1325,7 @@ static void smq_destroy(struct dm_cache_policy *p)
+ {
+ 	struct smq_policy *mq = to_smq_policy(p);
+ 
++	btracker_destroy(mq->bg_work);
+ 	h_exit(&mq->hotspot_table);
+ 	h_exit(&mq->table);
+ 	free_bitset(mq->hotspot_hit_bits);
+@@ -1290,234 +1334,247 @@ static void smq_destroy(struct dm_cache_policy *p)
+ 	kfree(mq);
+ }
+ 
+-static int smq_map(struct dm_cache_policy *p, dm_oblock_t oblock,
+-		   bool can_block, bool can_migrate, bool fast_promote,
+-		   struct bio *bio, struct policy_locker *locker,
+-		   struct policy_result *result)
+-{
+-	int r;
+-	unsigned long flags;
+-	struct smq_policy *mq = to_smq_policy(p);
+-
+-	result->op = POLICY_MISS;
+-
+-	spin_lock_irqsave(&mq->lock, flags);
+-	r = map(mq, bio, oblock, can_migrate, fast_promote, locker, result);
+-	spin_unlock_irqrestore(&mq->lock, flags);
+-
+-	return r;
+-}
++/*----------------------------------------------------------------*/
+ 
+-static int smq_lookup(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock)
++static int __lookup(struct smq_policy *mq, dm_oblock_t oblock, dm_cblock_t *cblock,
++		    int data_dir, bool fast_copy,
++		    struct policy_work **work, bool *background_work)
+ {
+-	int r;
+-	unsigned long flags;
+-	struct smq_policy *mq = to_smq_policy(p);
+-	struct entry *e;
++	struct entry *e, *hs_e;
++	enum promote_result pr;
++
++	*background_work = false;
+ 
+-	spin_lock_irqsave(&mq->lock, flags);
+ 	e = h_lookup(&mq->table, oblock);
+ 	if (e) {
++		stats_level_accessed(&mq->cache_stats, e->level);
++
++		requeue(mq, e);
+ 		*cblock = infer_cblock(mq, e);
+-		r = 0;
+-	} else
+-		r = -ENOENT;
+-	spin_unlock_irqrestore(&mq->lock, flags);
++		return 0;
+ 
+-	return r;
+-}
++	} else {
++		stats_miss(&mq->cache_stats);
+ 
+-static void __smq_set_clear_dirty(struct smq_policy *mq, dm_oblock_t oblock, bool set)
+-{
+-	struct entry *e;
++		/*
++		 * The hotspot queue only gets updated with misses.
++		 */
++		hs_e = update_hotspot_queue(mq, oblock);
+ 
+-	e = h_lookup(&mq->table, oblock);
+-	BUG_ON(!e);
++		pr = should_promote(mq, hs_e, data_dir, fast_copy);
++		if (pr != PROMOTE_NOT) {
++			queue_promotion(mq, oblock, work);
++			*background_work = true;
++		}
+ 
+-	del(mq, e);
+-	e->dirty = set;
+-	push(mq, e);
++		return -ENOENT;
++	}
+ }
+ 
+-static void smq_set_dirty(struct dm_cache_policy *p, dm_oblock_t oblock)
++static int smq_lookup(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock,
++		      int data_dir, bool fast_copy,
++		      bool *background_work)
+ {
++	int r;
+ 	unsigned long flags;
+ 	struct smq_policy *mq = to_smq_policy(p);
+ 
+ 	spin_lock_irqsave(&mq->lock, flags);
+-	__smq_set_clear_dirty(mq, oblock, true);
++	r = __lookup(mq, oblock, cblock,
++		     data_dir, fast_copy,
++		     NULL, background_work);
+ 	spin_unlock_irqrestore(&mq->lock, flags);
++
++	return r;
+ }
+ 
+-static void smq_clear_dirty(struct dm_cache_policy *p, dm_oblock_t oblock)
++static int smq_lookup_with_work(struct dm_cache_policy *p,
++				dm_oblock_t oblock, dm_cblock_t *cblock,
++				int data_dir, bool fast_copy,
++				struct policy_work **work)
+ {
+-	struct smq_policy *mq = to_smq_policy(p);
++	int r;
++	bool background_queued;
+ 	unsigned long flags;
++	struct smq_policy *mq = to_smq_policy(p);
+ 
+ 	spin_lock_irqsave(&mq->lock, flags);
+-	__smq_set_clear_dirty(mq, oblock, false);
++	r = __lookup(mq, oblock, cblock, data_dir, fast_copy, work, &background_queued);
+ 	spin_unlock_irqrestore(&mq->lock, flags);
+-}
+ 
+-static unsigned random_level(dm_cblock_t cblock)
+-{
+-	return hash_32_generic(from_cblock(cblock), 9) & (NR_CACHE_LEVELS - 1);
++	return r;
+ }
+ 
+-static int smq_load_mapping(struct dm_cache_policy *p,
+-			    dm_oblock_t oblock, dm_cblock_t cblock,
+-			    uint32_t hint, bool hint_valid)
++static int smq_get_background_work(struct dm_cache_policy *p, bool idle,
++				   struct policy_work **result)
+ {
++	int r;
++	unsigned long flags;
+ 	struct smq_policy *mq = to_smq_policy(p);
+-	struct entry *e;
+ 
+-	e = alloc_particular_entry(&mq->cache_alloc, from_cblock(cblock));
+-	e->oblock = oblock;
+-	e->dirty = false;	/* this gets corrected in a minute */
+-	e->level = hint_valid ? min(hint, NR_CACHE_LEVELS - 1) : random_level(cblock);
+-	push(mq, e);
+-
+-	return 0;
+-}
++	spin_lock_irqsave(&mq->lock, flags);
++	r = btracker_issue(mq->bg_work, result);
++	if (r == -ENODATA) {
++		/* find some writeback work to do */
++		if (mq->migrations_allowed && !free_target_met(mq, idle))
++			queue_demotion(mq);
+ 
+-static uint32_t smq_get_hint(struct dm_cache_policy *p, dm_cblock_t cblock)
+-{
+-	struct smq_policy *mq = to_smq_policy(p);
+-	struct entry *e = get_entry(&mq->cache_alloc, from_cblock(cblock));
++		else if (!clean_target_met(mq, idle))
++			queue_writeback(mq);
+ 
+-	if (!e->allocated)
+-		return 0;
++		r = btracker_issue(mq->bg_work, result);
++	}
++	spin_unlock_irqrestore(&mq->lock, flags);
+ 
+-	return e->level;
++	return r;
+ }
+ 
+-static void __remove_mapping(struct smq_policy *mq, dm_oblock_t oblock)
+-{
+-	struct entry *e;
++/*
++ * We need to clear any pending work flags that have been set, and in the
++ * case of promotion free the entry for the destination cblock.
++ */
++static void __complete_background_work(struct smq_policy *mq,
++				       struct policy_work *work,
++				       bool success)
++{
++	struct entry *e = get_entry(&mq->cache_alloc,
++				    from_cblock(work->cblock));
++
++	switch (work->op) {
++	case POLICY_PROMOTE:
++		// !h, !q, a
++		clear_pending(mq, e);
++		if (success) {
++			e->oblock = work->oblock;
++			push(mq, e);
++			// h, q, a
++		} else {
++			free_entry(&mq->cache_alloc, e);
++			// !h, !q, !a
++		}
++		break;
+ 
+-	e = h_lookup(&mq->table, oblock);
+-	BUG_ON(!e);
++	case POLICY_DEMOTE:
++		// h, !q, a
++		if (success) {
++			h_remove(&mq->table, e);
++			free_entry(&mq->cache_alloc, e);
++			// !h, !q, !a
++		} else {
++			clear_pending(mq, e);
++			push_queue(mq, e);
++			// h, q, a
++		}
++		break;
+ 
+-	del(mq, e);
+-	free_entry(&mq->cache_alloc, e);
++	case POLICY_WRITEBACK:
++		// h, !q, a
++		clear_pending(mq, e);
++		push_queue(mq, e);
++		// h, q, a
++		break;
++	}
++
++	btracker_complete(mq->bg_work, work);
+ }
+ 
+-static void smq_remove_mapping(struct dm_cache_policy *p, dm_oblock_t oblock)
++static void smq_complete_background_work(struct dm_cache_policy *p,
++					 struct policy_work *work,
++					 bool success)
+ {
+-	struct smq_policy *mq = to_smq_policy(p);
+ 	unsigned long flags;
++	struct smq_policy *mq = to_smq_policy(p);
+ 
+ 	spin_lock_irqsave(&mq->lock, flags);
+-	__remove_mapping(mq, oblock);
++	__complete_background_work(mq, work, success);
+ 	spin_unlock_irqrestore(&mq->lock, flags);
+ }
+ 
+-static int __remove_cblock(struct smq_policy *mq, dm_cblock_t cblock)
++// in_hash(oblock) -> in_hash(oblock)
++static void __smq_set_clear_dirty(struct smq_policy *mq, dm_cblock_t cblock, bool set)
+ {
+ 	struct entry *e = get_entry(&mq->cache_alloc, from_cblock(cblock));
+ 
+-	if (!e || !e->allocated)
+-		return -ENODATA;
+-
+-	del(mq, e);
+-	free_entry(&mq->cache_alloc, e);
+-
+-	return 0;
++	if (e->pending_work)
++		e->dirty = set;
++	else {
++		del_queue(mq, e);
++		e->dirty = set;
++		push_queue(mq, e);
++	}
+ }
+ 
+-static int smq_remove_cblock(struct dm_cache_policy *p, dm_cblock_t cblock)
++static void smq_set_dirty(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	int r;
+ 	unsigned long flags;
+ 	struct smq_policy *mq = to_smq_policy(p);
+ 
+ 	spin_lock_irqsave(&mq->lock, flags);
+-	r = __remove_cblock(mq, cblock);
++	__smq_set_clear_dirty(mq, cblock, true);
+ 	spin_unlock_irqrestore(&mq->lock, flags);
+-
+-	return r;
+ }
+ 
+-
+-#define CLEAN_TARGET_CRITICAL 5u /* percent */
+-
+-static bool clean_target_met(struct smq_policy *mq, bool critical)
++static void smq_clear_dirty(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	if (critical) {
+-		/*
+-		 * Cache entries may not be populated.  So we're cannot rely on the
+-		 * size of the clean queue.
+-		 */
+-		unsigned nr_clean = from_cblock(mq->cache_size) - q_size(&mq->dirty);
+-		unsigned target = from_cblock(mq->cache_size) * CLEAN_TARGET_CRITICAL / 100u;
++	struct smq_policy *mq = to_smq_policy(p);
++	unsigned long flags;
+ 
+-		return nr_clean >= target;
+-	} else
+-		return !q_size(&mq->dirty);
++	spin_lock_irqsave(&mq->lock, flags);
++	__smq_set_clear_dirty(mq, cblock, false);
++	spin_unlock_irqrestore(&mq->lock, flags);
+ }
+ 
+-static int __smq_writeback_work(struct smq_policy *mq, dm_oblock_t *oblock,
+-				dm_cblock_t *cblock, bool critical_only)
++static unsigned random_level(dm_cblock_t cblock)
+ {
+-	struct entry *e = NULL;
+-	bool target_met = clean_target_met(mq, critical_only);
+-
+-	if (critical_only)
+-		/*
+-		 * Always try and keep the bottom level clean.
+-		 */
+-		e = pop_old(mq, &mq->dirty, target_met ? 1u : mq->dirty.nr_levels);
++	return hash_32_generic(from_cblock(cblock), 9) & (NR_CACHE_LEVELS - 1);
++}
+ 
+-	else
+-		e = pop_old(mq, &mq->dirty, mq->dirty.nr_levels);
++static int smq_load_mapping(struct dm_cache_policy *p,
++			    dm_oblock_t oblock, dm_cblock_t cblock,
++			    bool dirty, uint32_t hint, bool hint_valid)
++{
++	struct smq_policy *mq = to_smq_policy(p);
++	struct entry *e;
+ 
+-	if (!e)
+-		return -ENODATA;
++	e = alloc_particular_entry(&mq->cache_alloc, from_cblock(cblock));
++	e->oblock = oblock;
++	e->dirty = dirty;
++	e->level = hint_valid ? min(hint, NR_CACHE_LEVELS - 1) : random_level(cblock);
++	e->pending_work = false;
+ 
+-	*oblock = e->oblock;
+-	*cblock = infer_cblock(mq, e);
+-	e->dirty = false;
+-	push_new(mq, e);
++	/*
++	 * When we load mappings we push ahead of both sentinels in order to
++	 * allow demotions and cleaning to occur immediately.
++	 */
++	push_front(mq, e);
+ 
+ 	return 0;
+ }
+ 
+-static int smq_writeback_work(struct dm_cache_policy *p, dm_oblock_t *oblock,
+-			      dm_cblock_t *cblock, bool critical_only)
++static int smq_invalidate_mapping(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	int r;
+-	unsigned long flags;
+ 	struct smq_policy *mq = to_smq_policy(p);
++	struct entry *e = get_entry(&mq->cache_alloc, from_cblock(cblock));
+ 
+-	spin_lock_irqsave(&mq->lock, flags);
+-	r = __smq_writeback_work(mq, oblock, cblock, critical_only);
+-	spin_unlock_irqrestore(&mq->lock, flags);
+-
+-	return r;
+-}
+-
+-static void __force_mapping(struct smq_policy *mq,
+-			    dm_oblock_t current_oblock, dm_oblock_t new_oblock)
+-{
+-	struct entry *e = h_lookup(&mq->table, current_oblock);
++	if (!e->allocated)
++		return -ENODATA;
+ 
+-	if (e) {
+-		del(mq, e);
+-		e->oblock = new_oblock;
+-		e->dirty = true;
+-		push(mq, e);
+-	}
++	// FIXME: what if this block has pending background work?
++	del_queue(mq, e);
++	h_remove(&mq->table, e);
++	free_entry(&mq->cache_alloc, e);
++	return 0;
+ }
+ 
+-static void smq_force_mapping(struct dm_cache_policy *p,
+-			      dm_oblock_t current_oblock, dm_oblock_t new_oblock)
++static uint32_t smq_get_hint(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+-	unsigned long flags;
+ 	struct smq_policy *mq = to_smq_policy(p);
++	struct entry *e = get_entry(&mq->cache_alloc, from_cblock(cblock));
+ 
+-	spin_lock_irqsave(&mq->lock, flags);
+-	__force_mapping(mq, current_oblock, new_oblock);
+-	spin_unlock_irqrestore(&mq->lock, flags);
++	if (!e->allocated)
++		return 0;
++
++	return e->level;
+ }
+ 
+ static dm_cblock_t smq_residency(struct dm_cache_policy *p)
+@@ -1546,6 +1603,12 @@ static void smq_tick(struct dm_cache_policy *p, bool can_block)
+ 	spin_unlock_irqrestore(&mq->lock, flags);
+ }
+ 
++static void smq_allow_migrations(struct dm_cache_policy *p, bool allow)
++{
++	struct smq_policy *mq = to_smq_policy(p);
++	mq->migrations_allowed = allow;
++}
++
+ /*
+  * smq has no config values, but the old mq policy did.  To avoid breaking
+  * software we continue to accept these configurables for the mq policy,
+@@ -1590,18 +1653,18 @@ static int mq_emit_config_values(struct dm_cache_policy *p, char *result,
+ static void init_policy_functions(struct smq_policy *mq, bool mimic_mq)
+ {
+ 	mq->policy.destroy = smq_destroy;
+-	mq->policy.map = smq_map;
+ 	mq->policy.lookup = smq_lookup;
++	mq->policy.lookup_with_work = smq_lookup_with_work;
++	mq->policy.get_background_work = smq_get_background_work;
++	mq->policy.complete_background_work = smq_complete_background_work;
+ 	mq->policy.set_dirty = smq_set_dirty;
+ 	mq->policy.clear_dirty = smq_clear_dirty;
+ 	mq->policy.load_mapping = smq_load_mapping;
++	mq->policy.invalidate_mapping = smq_invalidate_mapping;
+ 	mq->policy.get_hint = smq_get_hint;
+-	mq->policy.remove_mapping = smq_remove_mapping;
+-	mq->policy.remove_cblock = smq_remove_cblock;
+-	mq->policy.writeback_work = smq_writeback_work;
+-	mq->policy.force_mapping = smq_force_mapping;
+ 	mq->policy.residency = smq_residency;
+ 	mq->policy.tick = smq_tick;
++	mq->policy.allow_migrations = smq_allow_migrations;
+ 
+ 	if (mimic_mq) {
+ 		mq->policy.set_config_value = mq_set_config_value;
+@@ -1633,7 +1696,8 @@ static void calc_hotspot_params(sector_t origin_size,
+ static struct dm_cache_policy *__smq_create(dm_cblock_t cache_size,
+ 					    sector_t origin_size,
+ 					    sector_t cache_block_size,
+-					    bool mimic_mq)
++					    bool mimic_mq,
++					    bool migrations_allowed)
+ {
+ 	unsigned i;
+ 	unsigned nr_sentinels_per_queue = 2u * NR_CACHE_LEVELS;
+@@ -1658,11 +1722,11 @@ static struct dm_cache_policy *__smq_create(dm_cblock_t cache_size,
+ 	}
+ 
+ 	init_allocator(&mq->writeback_sentinel_alloc, &mq->es, 0, nr_sentinels_per_queue);
+-        for (i = 0; i < nr_sentinels_per_queue; i++)
++	for (i = 0; i < nr_sentinels_per_queue; i++)
+ 		get_entry(&mq->writeback_sentinel_alloc, i)->sentinel = true;
+ 
+ 	init_allocator(&mq->demote_sentinel_alloc, &mq->es, nr_sentinels_per_queue, total_sentinels);
+-        for (i = 0; i < nr_sentinels_per_queue; i++)
++	for (i = 0; i < nr_sentinels_per_queue; i++)
+ 		get_entry(&mq->demote_sentinel_alloc, i)->sentinel = true;
+ 
+ 	init_allocator(&mq->hotspot_alloc, &mq->es, total_sentinels,
+@@ -1715,8 +1779,16 @@ static struct dm_cache_policy *__smq_create(dm_cblock_t cache_size,
+ 	mq->next_hotspot_period = jiffies;
+ 	mq->next_cache_period = jiffies;
+ 
++	mq->bg_work = btracker_create(10240); /* FIXME: hard coded value */
++	if (!mq->bg_work)
++		goto bad_btracker;
++
++	mq->migrations_allowed = migrations_allowed;
++
+ 	return &mq->policy;
+ 
++bad_btracker:
++	h_exit(&mq->hotspot_table);
+ bad_alloc_hotspot_table:
+ 	h_exit(&mq->table);
+ bad_alloc_table:
+@@ -1735,21 +1807,28 @@ static struct dm_cache_policy *smq_create(dm_cblock_t cache_size,
+ 					  sector_t origin_size,
+ 					  sector_t cache_block_size)
+ {
+-	return __smq_create(cache_size, origin_size, cache_block_size, false);
++	return __smq_create(cache_size, origin_size, cache_block_size, false, true);
+ }
+ 
+ static struct dm_cache_policy *mq_create(dm_cblock_t cache_size,
+ 					 sector_t origin_size,
+ 					 sector_t cache_block_size)
+ {
+-	return __smq_create(cache_size, origin_size, cache_block_size, true);
++	return __smq_create(cache_size, origin_size, cache_block_size, true, true);
++}
++
++static struct dm_cache_policy *cleaner_create(dm_cblock_t cache_size,
++					      sector_t origin_size,
++					      sector_t cache_block_size)
++{
++	return __smq_create(cache_size, origin_size, cache_block_size, false, false);
+ }
+ 
+ /*----------------------------------------------------------------*/
+ 
+ static struct dm_cache_policy_type smq_policy_type = {
+ 	.name = "smq",
+-	.version = {1, 5, 0},
++	.version = {2, 0, 0},
+ 	.hint_size = 4,
+ 	.owner = THIS_MODULE,
+ 	.create = smq_create
+@@ -1757,15 +1836,23 @@ static struct dm_cache_policy_type smq_policy_type = {
+ 
+ static struct dm_cache_policy_type mq_policy_type = {
+ 	.name = "mq",
+-	.version = {1, 5, 0},
++	.version = {2, 0, 0},
+ 	.hint_size = 4,
+ 	.owner = THIS_MODULE,
+ 	.create = mq_create,
+ };
+ 
++static struct dm_cache_policy_type cleaner_policy_type = {
++	.name = "cleaner",
++	.version = {2, 0, 0},
++	.hint_size = 4,
++	.owner = THIS_MODULE,
++	.create = cleaner_create,
++};
++
+ static struct dm_cache_policy_type default_policy_type = {
+ 	.name = "default",
+-	.version = {1, 5, 0},
++	.version = {2, 0, 0},
+ 	.hint_size = 4,
+ 	.owner = THIS_MODULE,
+ 	.create = smq_create,
+@@ -1785,23 +1872,36 @@ static int __init smq_init(void)
+ 	r = dm_cache_policy_register(&mq_policy_type);
+ 	if (r) {
+ 		DMERR("register failed (as mq) %d", r);
+-		dm_cache_policy_unregister(&smq_policy_type);
+-		return -ENOMEM;
++		goto out_mq;
++	}
++
++	r = dm_cache_policy_register(&cleaner_policy_type);
++	if (r) {
++		DMERR("register failed (as cleaner) %d", r);
++		goto out_cleaner;
+ 	}
+ 
+ 	r = dm_cache_policy_register(&default_policy_type);
+ 	if (r) {
+ 		DMERR("register failed (as default) %d", r);
+-		dm_cache_policy_unregister(&mq_policy_type);
+-		dm_cache_policy_unregister(&smq_policy_type);
+-		return -ENOMEM;
++		goto out_default;
+ 	}
+ 
+ 	return 0;
++
++out_default:
++	dm_cache_policy_unregister(&cleaner_policy_type);
++out_cleaner:
++	dm_cache_policy_unregister(&mq_policy_type);
++out_mq:
++	dm_cache_policy_unregister(&smq_policy_type);
++
++	return -ENOMEM;
+ }
+ 
+ static void __exit smq_exit(void)
+ {
++	dm_cache_policy_unregister(&cleaner_policy_type);
+ 	dm_cache_policy_unregister(&smq_policy_type);
+ 	dm_cache_policy_unregister(&mq_policy_type);
+ 	dm_cache_policy_unregister(&default_policy_type);
+@@ -1816,3 +1916,4 @@ MODULE_DESCRIPTION("smq cache policy");
+ 
+ MODULE_ALIAS("dm-cache-default");
+ MODULE_ALIAS("dm-cache-mq");
++MODULE_ALIAS("dm-cache-cleaner");
+diff --git a/drivers/md/dm-cache-policy.h b/drivers/md/dm-cache-policy.h
+index aa10b1493f34..c05fc3436cef 100644
+--- a/drivers/md/dm-cache-policy.h
++++ b/drivers/md/dm-cache-policy.h
+@@ -13,183 +13,100 @@
+ 
+ /*----------------------------------------------------------------*/
+ 
+-/* FIXME: make it clear which methods are optional.  Get debug policy to
+- * double check this at start.
+- */
+-
+ /*
+  * The cache policy makes the important decisions about which blocks get to
+  * live on the faster cache device.
+- *
+- * When the core target has to remap a bio it calls the 'map' method of the
+- * policy.  This returns an instruction telling the core target what to do.
+- *
+- * POLICY_HIT:
+- *   That block is in the cache.  Remap to the cache and carry on.
+- *
+- * POLICY_MISS:
+- *   This block is on the origin device.  Remap and carry on.
+- *
+- * POLICY_NEW:
+- *   This block is currently on the origin device, but the policy wants to
+- *   move it.  The core should:
+- *
+- *   - hold any further io to this origin block
+- *   - copy the origin to the given cache block
+- *   - release all the held blocks
+- *   - remap the original block to the cache
+- *
+- * POLICY_REPLACE:
+- *   This block is currently on the origin device.  The policy wants to
+- *   move it to the cache, with the added complication that the destination
+- *   cache block needs a writeback first.  The core should:
+- *
+- *   - hold any further io to this origin block
+- *   - hold any further io to the origin block that's being written back
+- *   - writeback
+- *   - copy new block to cache
+- *   - release held blocks
+- *   - remap bio to cache and reissue.
+- *
+- * Should the core run into trouble while processing a POLICY_NEW or
+- * POLICY_REPLACE instruction it will roll back the policies mapping using
+- * remove_mapping() or force_mapping().  These methods must not fail.  This
+- * approach avoids having transactional semantics in the policy (ie, the
+- * core informing the policy when a migration is complete), and hence makes
+- * it easier to write new policies.
+- *
+- * In general policy methods should never block, except in the case of the
+- * map function when can_migrate is set.  So be careful to implement using
+- * bounded, preallocated memory.
+  */
+ enum policy_operation {
+-	POLICY_HIT,
+-	POLICY_MISS,
+-	POLICY_NEW,
+-	POLICY_REPLACE
+-};
+-
+-/*
+- * When issuing a POLICY_REPLACE the policy needs to make a callback to
+- * lock the block being demoted.  This doesn't need to occur during a
+- * writeback operation since the block remains in the cache.
+- */
+-struct policy_locker;
+-typedef int (*policy_lock_fn)(struct policy_locker *l, dm_oblock_t oblock);
+-
+-struct policy_locker {
+-	policy_lock_fn fn;
++	POLICY_PROMOTE,
++	POLICY_DEMOTE,
++	POLICY_WRITEBACK
+ };
+ 
+ /*
+  * This is the instruction passed back to the core target.
+  */
+-struct policy_result {
++struct policy_work {
+ 	enum policy_operation op;
+-	dm_oblock_t old_oblock;	/* POLICY_REPLACE */
+-	dm_cblock_t cblock;	/* POLICY_HIT, POLICY_NEW, POLICY_REPLACE */
++	dm_oblock_t oblock;
++	dm_cblock_t cblock;
+ };
+ 
+ /*
+- * The cache policy object.  Just a bunch of methods.  It is envisaged that
+- * this structure will be embedded in a bigger, policy specific structure
+- * (ie. use container_of()).
++ * The cache policy object.  It is envisaged that this structure will be
++ * embedded in a bigger, policy specific structure (ie. use container_of()).
+  */
+ struct dm_cache_policy {
+-
+-	/*
+-	 * FIXME: make it clear which methods are optional, and which may
+-	 * block.
+-	 */
+-
+ 	/*
+ 	 * Destroys this object.
+ 	 */
+ 	void (*destroy)(struct dm_cache_policy *p);
+ 
+ 	/*
+-	 * See large comment above.
+-	 *
+-	 * oblock      - the origin block we're interested in.
+-	 *
+-	 * can_block - indicates whether the current thread is allowed to
+-	 *             block.  -EWOULDBLOCK returned if it can't and would.
+-	 *
+-	 * can_migrate - gives permission for POLICY_NEW or POLICY_REPLACE
+-	 *               instructions.  If denied and the policy would have
+-	 *               returned one of these instructions it should
+-	 *               return -EWOULDBLOCK.
++	 * Find the location of a block.
+ 	 *
+-	 * discarded_oblock - indicates whether the whole origin block is
+-	 *               in a discarded state (FIXME: better to tell the
+-	 *               policy about this sooner, so it can recycle that
+-	 *               cache block if it wants.)
+-	 * bio         - the bio that triggered this call.
+-	 * result      - gets filled in with the instruction.
++	 * Must not block.
+ 	 *
+-	 * May only return 0, or -EWOULDBLOCK (if !can_migrate)
++	 * Returns 0 if in cache (cblock will be set), -ENOENT if not, < 0 for
++	 * other errors (-EWOULDBLOCK would be typical).  data_dir should be
++	 * READ or WRITE. fast_copy should be set if migrating this block would
++	 * be 'cheap' somehow (eg, discarded data). background_queued will be set
++	 * if a migration has just been queued.
+ 	 */
+-	int (*map)(struct dm_cache_policy *p, dm_oblock_t oblock,
+-		   bool can_block, bool can_migrate, bool discarded_oblock,
+-		   struct bio *bio, struct policy_locker *locker,
+-		   struct policy_result *result);
++	int (*lookup)(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock,
++		      int data_dir, bool fast_copy, bool *background_queued);
+ 
+ 	/*
+-	 * Sometimes we want to see if a block is in the cache, without
+-	 * triggering any update of stats.  (ie. it's not a real hit).
+-	 *
+-	 * Must not block.
++	 * Sometimes the core target can optimise a migration, eg, the
++	 * block may be discarded, or the bio may cover an entire block.
++	 * In order to optimise it needs the migration immediately though
++	 * so it knows to do something different with the bio.
+ 	 *
+-	 * Returns 0 if in cache, -ENOENT if not, < 0 for other errors
+-	 * (-EWOULDBLOCK would be typical).
++	 * This method is optional (policy-internal will fallback to using
++	 * lookup).
+ 	 */
+-	int (*lookup)(struct dm_cache_policy *p, dm_oblock_t oblock, dm_cblock_t *cblock);
+-
+-	void (*set_dirty)(struct dm_cache_policy *p, dm_oblock_t oblock);
+-	void (*clear_dirty)(struct dm_cache_policy *p, dm_oblock_t oblock);
++	int (*lookup_with_work)(struct dm_cache_policy *p,
++				dm_oblock_t oblock, dm_cblock_t *cblock,
++				int data_dir, bool fast_copy,
++				struct policy_work **work);
+ 
+ 	/*
+-	 * Called when a cache target is first created.  Used to load a
+-	 * mapping from the metadata device into the policy.
++	 * Retrieves background work.  Returns -ENODATA when there's no
++	 * background work.
+ 	 */
+-	int (*load_mapping)(struct dm_cache_policy *p, dm_oblock_t oblock,
+-			    dm_cblock_t cblock, uint32_t hint, bool hint_valid);
++	int (*get_background_work)(struct dm_cache_policy *p, bool idle,
++			           struct policy_work **result);
+ 
+ 	/*
+-	 * Gets the hint for a given cblock.  Called in a single threaded
+-	 * context.  So no locking required.
++	 * You must pass in the same work pointer that you were given, not
++	 * a copy.
+ 	 */
+-	uint32_t (*get_hint)(struct dm_cache_policy *p, dm_cblock_t cblock);
++	void (*complete_background_work)(struct dm_cache_policy *p,
++					 struct policy_work *work,
++					 bool success);
++
++	void (*set_dirty)(struct dm_cache_policy *p, dm_cblock_t cblock);
++	void (*clear_dirty)(struct dm_cache_policy *p, dm_cblock_t cblock);
+ 
+ 	/*
+-	 * Override functions used on the error paths of the core target.
+-	 * They must succeed.
++	 * Called when a cache target is first created.  Used to load a
++	 * mapping from the metadata device into the policy.
+ 	 */
+-	void (*remove_mapping)(struct dm_cache_policy *p, dm_oblock_t oblock);
+-	void (*force_mapping)(struct dm_cache_policy *p, dm_oblock_t current_oblock,
+-			      dm_oblock_t new_oblock);
++	int (*load_mapping)(struct dm_cache_policy *p, dm_oblock_t oblock,
++			    dm_cblock_t cblock, bool dirty,
++			    uint32_t hint, bool hint_valid);
+ 
+ 	/*
+-	 * This is called via the invalidate_cblocks message.  It is
+-	 * possible the particular cblock has already been removed due to a
+-	 * write io in passthrough mode.  In which case this should return
+-	 * -ENODATA.
++	 * Drops the mapping, irrespective of whether it's clean or dirty.
++	 * Returns -ENODATA if cblock is not mapped.
+ 	 */
+-	int (*remove_cblock)(struct dm_cache_policy *p, dm_cblock_t cblock);
++	int (*invalidate_mapping)(struct dm_cache_policy *p, dm_cblock_t cblock);
+ 
+ 	/*
+-	 * Provide a dirty block to be written back by the core target.  If
+-	 * critical_only is set then the policy should only provide work if
+-	 * it urgently needs it.
+-	 *
+-	 * Returns:
+-	 *
+-	 * 0 and @cblock,@oblock: block to write back provided
+-	 *
+-	 * -ENODATA: no dirty blocks available
++	 * Gets the hint for a given cblock.  Called in a single threaded
++	 * context.  So no locking required.
+ 	 */
+-	int (*writeback_work)(struct dm_cache_policy *p, dm_oblock_t *oblock, dm_cblock_t *cblock,
+-			      bool critical_only);
++	uint32_t (*get_hint)(struct dm_cache_policy *p, dm_cblock_t cblock);
+ 
+ 	/*
+ 	 * How full is the cache?
+@@ -202,6 +119,8 @@ struct dm_cache_policy {
+ 	 * queue merging has occurred).  To stop the policy being fooled by
+ 	 * these, the core target sends regular tick() calls to the policy.
+ 	 * The policy should only count an entry as hit once per tick.
++	 *
++	 * This method is optional.
+ 	 */
+ 	void (*tick)(struct dm_cache_policy *p, bool can_block);
+ 
+@@ -213,6 +132,8 @@ struct dm_cache_policy {
+ 	int (*set_config_value)(struct dm_cache_policy *p,
+ 				const char *key, const char *value);
+ 
++	void (*allow_migrations)(struct dm_cache_policy *p, bool allow);
++
+ 	/*
+ 	 * Book keeping ptr for the policy register, not for general use.
+ 	 */
+* Unmerged path drivers/md/dm-cache-target.c
