@@ -1,0 +1,460 @@
+ip6_tunnel: add collect_md mode to IPv6 tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 8d79266bc48c6ab6477d04e159cabf1e7809cb72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8d79266b.failed
+
+Similar to gre, vxlan, geneve tunnels allow IPIP6 and IP6IP6 tunnels
+to operate in 'collect metadata' mode.
+Unlike ipv4 code here it's possible to reuse ip6_tnl_xmit() function
+for both collect_md and traditional tunnels.
+bpf_skb_[gs]et_tunnel_key() helpers and ovs (in the future) are the users.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d79266bc48c6ab6477d04e159cabf1e7809cb72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_tunnel.c
+diff --cc net/ipv6/ip6_tunnel.c
+index d340df0483f7,6a66adba0c22..000000000000
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@@ -1012,44 -1030,41 +1032,57 @@@ int ip6_tnl_xmit(struct sk_buff *skb, s
+  	struct dst_entry *dst = NULL, *ndst = NULL;
+  	struct net_device *tdev;
+  	int mtu;
+++<<<<<<< HEAD
+ +	unsigned int max_headroom = sizeof(struct ipv6hdr);
+ +	unsigned int eth_hlen = t->dev->type == ARPHRD_ETHER ? ETH_HLEN : 0;
+ +	bool use_cache = false;
+++=======
++ 	unsigned int psh_hlen = sizeof(struct ipv6hdr) + t->encap_hlen;
++ 	unsigned int max_headroom = psh_hlen;
++ 	u8 hop_limit;
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  	int err = -1;
+  
++ 	if (t->parms.collect_md) {
++ 		hop_limit = skb_tunnel_info(skb)->key.ttl;
++ 		goto route_lookup;
++ 	} else {
++ 		hop_limit = t->parms.hop_limit;
++ 	}
++ 
+  	/* NBMA tunnel */
+  	if (ipv6_addr_any(&t->parms.raddr)) {
+ -		struct in6_addr *addr6;
+ -		struct neighbour *neigh;
+ -		int addr_type;
+ +		if (skb->protocol == htons(ETH_P_IPV6)) {
+ +			struct in6_addr *addr6;
+ +			struct neighbour *neigh;
+ +			int addr_type;
+  
+ -		if (!skb_dst(skb))
+ -			goto tx_err_link_failure;
+ +			if (!skb_dst(skb))
+ +				goto tx_err_link_failure;
+  
+ -		neigh = dst_neigh_lookup(skb_dst(skb),
+ -					 &ipv6_hdr(skb)->daddr);
+ -		if (!neigh)
+ -			goto tx_err_link_failure;
+ +			neigh = dst_neigh_lookup(skb_dst(skb),
+ +						 &ipv6_hdr(skb)->daddr);
+ +			if (!neigh)
+ +				goto tx_err_link_failure;
+ +
+ +			addr6 = (struct in6_addr *)&neigh->primary_key;
+ +			addr_type = ipv6_addr_type(addr6);
+  
+ -		addr6 = (struct in6_addr *)&neigh->primary_key;
+ -		addr_type = ipv6_addr_type(addr6);
+ +			if (addr_type == IPV6_ADDR_ANY)
+ +				addr6 = &ipv6_hdr(skb)->daddr;
+  
+ -		if (addr_type == IPV6_ADDR_ANY)
+ -			addr6 = &ipv6_hdr(skb)->daddr;
+ +			memcpy(&fl6->daddr, addr6, sizeof(fl6->daddr));
+ +			neigh_release(neigh);
+ +		}
+ +	} else if (!(t->parms.flags &
+ +		     (IP6_TNL_F_USE_ORIG_TCLASS | IP6_TNL_F_USE_ORIG_FWMARK))) {
+ +		/* enable the cache only only if the routing decision does
+ +		 * not depend on the current inner header value
+ +		 */
+ +		use_cache = true;
+ +	}
+  
+ -		memcpy(&fl6->daddr, addr6, sizeof(fl6->daddr));
+ -		neigh_release(neigh);
+ -	} else if (!fl6->flowi6_mark)
+ +	if (use_cache)
+  		dst = dst_cache_get(&t->dst_cache);
+  
+  	if (!ip6_tnl_xmit_ctl(t, &fl6->saddr, &fl6->daddr))
+@@@ -1082,11 -1102,11 +1120,19 @@@ route_lookup
+  		max_headroom += 8;
+  		mtu -= 8;
+  	}
+++<<<<<<< HEAD
+ +	mtu = max(mtu, skb->protocol == htons(ETH_P_IPV6) ?
+ +		       IPV6_MIN_MTU : IPV4_MIN_MTU);
+ +
+ +	skb_dst_update_pmtu(skb, mtu);
+ +	if (skb->len - t->tun_hlen - eth_hlen > mtu && !skb_is_gso(skb)) {
+++=======
++ 	if (mtu < IPV6_MIN_MTU)
++ 		mtu = IPV6_MIN_MTU;
++ 	if (skb_dst(skb) && !t->parms.collect_md)
++ 		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
++ 	if (skb->len > mtu && !skb_is_gso(skb)) {
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  		*pmtu = mtu;
+  		err = -EMSGSIZE;
+  		goto tx_err_dst_release;
+@@@ -1123,12 -1144,15 +1169,22 @@@
+  		skb = new_skb;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (use_cache && ndst)
+ +		dst_cache_set_ip6(&t->dst_cache, ndst, &fl6->saddr);
+++=======
++ 	if (t->parms.collect_md) {
++ 		if (t->encap.type != TUNNEL_ENCAP_NONE)
++ 			goto tx_err_dst_release;
++ 	} else {
++ 		if (!fl6->flowi6_mark && ndst)
++ 			dst_cache_set_ip6(&t->dst_cache, ndst, &fl6->saddr);
++ 	}
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  	skb_dst_set(skb, dst);
+  
+ +	skb->transport_header = skb->network_header;
+ +
+  	if (encap_limit >= 0) {
+  		init_tel_txopt(&opt, encap_limit);
+  		ipv6_push_nfrag_opts(skb, &opt.ops, &proto, NULL);
+@@@ -1147,8 -1169,13 +1203,14 @@@
+  	skb_push(skb, sizeof(struct ipv6hdr));
+  	skb_reset_network_header(skb);
+  	ipv6h = ipv6_hdr(skb);
+++<<<<<<< HEAD
+ +	ip6_flow_hdr(ipv6h, INET_ECN_encapsulate(0, dsfield), fl6->flowlabel);
+ +	ipv6h->hop_limit = t->parms.hop_limit;
+++=======
++ 	ip6_flow_hdr(ipv6h, INET_ECN_encapsulate(0, dsfield),
++ 		     ip6_make_flowlabel(net, skb, fl6->flowlabel, true, fl6));
++ 	ipv6h->hop_limit = hop_limit;
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  	ipv6h->nexthdr = proto;
+  	ipv6h->saddr = fl6->saddr;
+  	ipv6h->daddr = fl6->daddr;
+@@@ -1186,20 -1208,40 +1248,35 @@@ ip4ip6_tnl_xmit(struct sk_buff *skb, st
+  	if (tproto != IPPROTO_IPIP && tproto != 0)
+  		return -1;
+  
+- 	if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
+- 		encap_limit = t->parms.encap_limit;
++ 	dsfield = ipv4_get_dsfield(iph);
+  
+- 	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
+- 	fl6.flowi6_proto = IPPROTO_IPIP;
++ 	if (t->parms.collect_md) {
++ 		struct ip_tunnel_info *tun_info;
++ 		const struct ip_tunnel_key *key;
+  
+- 	dsfield = ipv4_get_dsfield(iph);
++ 		tun_info = skb_tunnel_info(skb);
++ 		if (unlikely(!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX) ||
++ 			     ip_tunnel_info_af(tun_info) != AF_INET6))
++ 			return -1;
++ 		key = &tun_info->key;
++ 		memset(&fl6, 0, sizeof(fl6));
++ 		fl6.flowi6_proto = IPPROTO_IPIP;
++ 		fl6.daddr = key->u.ipv6.dst;
++ 		fl6.flowlabel = key->label;
++ 	} else {
++ 		if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
++ 			encap_limit = t->parms.encap_limit;
+  
+- 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
+- 		fl6.flowlabel |= htonl((__u32)iph->tos << IPV6_TCLASS_SHIFT)
+- 					  & IPV6_TCLASS_MASK;
+- 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
+- 		fl6.flowi6_mark = skb->mark;
++ 		memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
++ 		fl6.flowi6_proto = IPPROTO_IPIP;
++ 
++ 		if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
++ 			fl6.flowlabel |= htonl((__u32)iph->tos << IPV6_TCLASS_SHIFT)
++ 					 & IPV6_TCLASS_MASK;
++ 		if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
++ 			fl6.flowi6_mark = skb->mark;
++ 	}
+  
+ -	if (iptunnel_handle_offloads(skb, SKB_GSO_IPXIP6))
+ -		return -1;
+ -
+ -	skb_set_inner_ipproto(skb, IPPROTO_IPIP);
+ -
+  	err = ip6_tnl_xmit(skb, dev, dsfield, &fl6, encap_limit, &mtu,
+  			   IPPROTO_IPIP);
+  	if (err != 0) {
+@@@ -1235,32 -1273,53 +1312,69 @@@ ip6ip6_tnl_xmit(struct sk_buff *skb, st
+  	    ip6_tnl_addr_conflict(t, ipv6h))
+  		return -1;
+  
+++<<<<<<< HEAD
+ +	offset = ip6_tnl_parse_tlv_enc_lim(skb, skb_network_header(skb));
+ +	/* ip6_tnl_parse_tlv_enc_lim() might have reallocated skb->head */
+ +	ipv6h = ipv6_hdr(skb);
+ +	if (offset > 0) {
+ +		struct ipv6_tlv_tnl_enc_lim *tel;
+ +		tel = (struct ipv6_tlv_tnl_enc_lim *)&skb_network_header(skb)[offset];
+ +		if (tel->encap_limit == 0) {
+ +			icmpv6_send(skb, ICMPV6_PARAMPROB,
+ +				    ICMPV6_HDR_FIELD, offset + 2);
+ +			return -1;
+ +		}
+ +		encap_limit = tel->encap_limit - 1;
+ +	} else if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
+ +		encap_limit = t->parms.encap_limit;
+ +
+ +	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
+ +	fl6.flowi6_proto = IPPROTO_IPV6;
+ +
+++=======
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  	dsfield = ipv6_get_dsfield(ipv6h);
+- 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
+- 		fl6.flowlabel |= (*(__be32 *) ipv6h & IPV6_TCLASS_MASK);
+- 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FLOWLABEL)
+- 		fl6.flowlabel |= ip6_flowlabel(ipv6h);
+- 	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
+- 		fl6.flowi6_mark = skb->mark;
++ 
++ 	if (t->parms.collect_md) {
++ 		struct ip_tunnel_info *tun_info;
++ 		const struct ip_tunnel_key *key;
++ 
++ 		tun_info = skb_tunnel_info(skb);
++ 		if (unlikely(!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX) ||
++ 			     ip_tunnel_info_af(tun_info) != AF_INET6))
++ 			return -1;
++ 		key = &tun_info->key;
++ 		memset(&fl6, 0, sizeof(fl6));
++ 		fl6.flowi6_proto = IPPROTO_IPV6;
++ 		fl6.daddr = key->u.ipv6.dst;
++ 		fl6.flowlabel = key->label;
++ 	} else {
++ 		offset = ip6_tnl_parse_tlv_enc_lim(skb, skb_network_header(skb));
++ 		if (offset > 0) {
++ 			struct ipv6_tlv_tnl_enc_lim *tel;
++ 
++ 			tel = (void *)&skb_network_header(skb)[offset];
++ 			if (tel->encap_limit == 0) {
++ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
++ 					    ICMPV6_HDR_FIELD, offset + 2);
++ 				return -1;
++ 			}
++ 			encap_limit = tel->encap_limit - 1;
++ 		} else if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT)) {
++ 			encap_limit = t->parms.encap_limit;
++ 		}
++ 
++ 		memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
++ 		fl6.flowi6_proto = IPPROTO_IPV6;
++ 
++ 		if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
++ 			fl6.flowlabel |= (*(__be32 *)ipv6h & IPV6_TCLASS_MASK);
++ 		if (t->parms.flags & IP6_TNL_F_USE_ORIG_FLOWLABEL)
++ 			fl6.flowlabel |= ip6_flowlabel(ipv6h);
++ 		if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
++ 			fl6.flowi6_mark = skb->mark;
++ 	}
+  
+ -	if (iptunnel_handle_offloads(skb, SKB_GSO_IPXIP6))
+ -		return -1;
+ -
+ -	skb_set_inner_ipproto(skb, IPPROTO_IPV6);
+ -
+  	err = ip6_tnl_xmit(skb, dev, dsfield, &fl6, encap_limit, &mtu,
+  			   IPPROTO_IPV6);
+  	if (err != 0) {
+@@@ -1755,27 -1886,73 +1873,36 @@@ static void ip6_tnl_netlink_parms(struc
+  
+  	if (data[IFLA_IPTUN_PROTO])
+  		parms->proto = nla_get_u8(data[IFLA_IPTUN_PROTO]);
++ 
++ 	if (data[IFLA_IPTUN_COLLECT_METADATA])
++ 		parms->collect_md = true;
+  }
+  
+ -static bool ip6_tnl_netlink_encap_parms(struct nlattr *data[],
+ -					struct ip_tunnel_encap *ipencap)
+ -{
+ -	bool ret = false;
+ -
+ -	memset(ipencap, 0, sizeof(*ipencap));
+ -
+ -	if (!data)
+ -		return ret;
+ -
+ -	if (data[IFLA_IPTUN_ENCAP_TYPE]) {
+ -		ret = true;
+ -		ipencap->type = nla_get_u16(data[IFLA_IPTUN_ENCAP_TYPE]);
+ -	}
+ -
+ -	if (data[IFLA_IPTUN_ENCAP_FLAGS]) {
+ -		ret = true;
+ -		ipencap->flags = nla_get_u16(data[IFLA_IPTUN_ENCAP_FLAGS]);
+ -	}
+ -
+ -	if (data[IFLA_IPTUN_ENCAP_SPORT]) {
+ -		ret = true;
+ -		ipencap->sport = nla_get_be16(data[IFLA_IPTUN_ENCAP_SPORT]);
+ -	}
+ -
+ -	if (data[IFLA_IPTUN_ENCAP_DPORT]) {
+ -		ret = true;
+ -		ipencap->dport = nla_get_be16(data[IFLA_IPTUN_ENCAP_DPORT]);
+ -	}
+ -
+ -	return ret;
+ -}
+ -
+  static int ip6_tnl_newlink(struct net *src_net, struct net_device *dev,
+  			   struct nlattr *tb[], struct nlattr *data[])
+  {
+  	struct net *net = dev_net(dev);
++ 	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
+  	struct ip6_tnl *nt, *t;
+ -	struct ip_tunnel_encap ipencap;
+ +	int err;
+  
+  	nt = netdev_priv(dev);
+ -
+ -	if (ip6_tnl_netlink_encap_parms(data, &ipencap)) {
+ -		int err = ip6_tnl_encap_setup(nt, &ipencap);
+ -
+ -		if (err < 0)
+ -			return err;
+ -	}
+ -
+  	ip6_tnl_netlink_parms(data, &nt->parms);
+  
+- 	t = ip6_tnl_locate(net, &nt->parms, 0);
+- 	if (!IS_ERR(t))
+- 		return -EEXIST;
++ 	if (nt->parms.collect_md) {
++ 		if (rtnl_dereference(ip6n->collect_md_tun))
++ 			return -EEXIST;
++ 	} else {
++ 		t = ip6_tnl_locate(net, &nt->parms, 0);
++ 		if (!IS_ERR(t))
++ 			return -EEXIST;
++ 	}
+  
+ -	return ip6_tnl_create2(dev);
+ +	err = ip6_tnl_create2(dev);
+ +	if (!err && tb[IFLA_MTU])
+ +		ip6_tnl_change_mtu(dev, nla_get_u32(tb[IFLA_MTU]));
+ +
+ +	return err;
+  }
+  
+  static int ip6_tnl_changelink(struct net_device *dev, struct nlattr *tb[],
+@@@ -1789,7 -1967,15 +1916,9 @@@
+  	if (dev == ip6n->fb_tnl_dev)
+  		return -EINVAL;
+  
+ -	if (ip6_tnl_netlink_encap_parms(data, &ipencap)) {
+ -		int err = ip6_tnl_encap_setup(t, &ipencap);
+ -
+ -		if (err < 0)
+ -			return err;
+ -	}
+  	ip6_tnl_netlink_parms(data, &p);
++ 	if (p.collect_md)
++ 		return -EINVAL;
+  
+  	t = ip6_tnl_locate(net, &p, 0);
+  	if (!IS_ERR(t)) {
+@@@ -1829,6 -2015,16 +1958,19 @@@ static size_t ip6_tnl_get_size(const st
+  		nla_total_size(4) +
+  		/* IFLA_IPTUN_PROTO */
+  		nla_total_size(1) +
+++<<<<<<< HEAD
+++=======
++ 		/* IFLA_IPTUN_ENCAP_TYPE */
++ 		nla_total_size(2) +
++ 		/* IFLA_IPTUN_ENCAP_FLAGS */
++ 		nla_total_size(2) +
++ 		/* IFLA_IPTUN_ENCAP_SPORT */
++ 		nla_total_size(2) +
++ 		/* IFLA_IPTUN_ENCAP_DPORT */
++ 		nla_total_size(2) +
++ 		/* IFLA_IPTUN_COLLECT_METADATA */
++ 		nla_total_size(0) +
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  		0;
+  }
+  
+@@@ -1846,6 -2042,16 +1988,19 @@@ static int ip6_tnl_fill_info(struct sk_
+  	    nla_put_u32(skb, IFLA_IPTUN_FLAGS, parm->flags) ||
+  	    nla_put_u8(skb, IFLA_IPTUN_PROTO, parm->proto))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (nla_put_u16(skb, IFLA_IPTUN_ENCAP_TYPE, tunnel->encap.type) ||
++ 	    nla_put_be16(skb, IFLA_IPTUN_ENCAP_SPORT, tunnel->encap.sport) ||
++ 	    nla_put_be16(skb, IFLA_IPTUN_ENCAP_DPORT, tunnel->encap.dport) ||
++ 	    nla_put_u16(skb, IFLA_IPTUN_ENCAP_FLAGS, tunnel->encap.flags))
++ 		goto nla_put_failure;
++ 
++ 	if (parm->collect_md)
++ 		if (nla_put_flag(skb, IFLA_IPTUN_COLLECT_METADATA))
++ 			goto nla_put_failure;
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  	return 0;
+  
+  nla_put_failure:
+@@@ -1869,6 -2075,11 +2024,14 @@@ static const struct nla_policy ip6_tnl_
+  	[IFLA_IPTUN_FLOWINFO]		= { .type = NLA_U32 },
+  	[IFLA_IPTUN_FLAGS]		= { .type = NLA_U32 },
+  	[IFLA_IPTUN_PROTO]		= { .type = NLA_U8 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_IPTUN_ENCAP_TYPE]		= { .type = NLA_U16 },
++ 	[IFLA_IPTUN_ENCAP_FLAGS]	= { .type = NLA_U16 },
++ 	[IFLA_IPTUN_ENCAP_SPORT]	= { .type = NLA_U16 },
++ 	[IFLA_IPTUN_ENCAP_DPORT]	= { .type = NLA_U16 },
++ 	[IFLA_IPTUN_COLLECT_METADATA]	= { .type = NLA_FLAG },
+++>>>>>>> 8d79266bc48c (ip6_tunnel: add collect_md mode to IPv6 tunnels)
+  };
+  
+  static struct rtnl_link_ops ip6_link_ops __read_mostly = {
+diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
+index 420606764f5d..243054b1c006 100644
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@ -23,6 +23,7 @@ struct __ip6_tnl_parm {
+ 	__u8 proto;		/* tunnel protocol */
+ 	__u8 encap_limit;	/* encapsulation limit for tunnel */
+ 	__u8 hop_limit;		/* hop limit for tunnel */
++	bool collect_md;
+ 	__be32 flowinfo;	/* traffic class and flowlabel for tunnel */
+ 	__u32 flags;		/* tunnel flags */
+ 	struct in6_addr laddr;	/* local tunnel end-point address */
+* Unmerged path net/ipv6/ip6_tunnel.c
