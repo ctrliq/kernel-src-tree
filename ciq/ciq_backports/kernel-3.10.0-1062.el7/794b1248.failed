@@ -1,0 +1,310 @@
+memcg, slab: separate memcg vs root cache creation paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 794b1248be4e7e157f5535c3ee49168aa4643349
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/794b1248.failed
+
+Memcg-awareness turned kmem_cache_create() into a dirty interweaving of
+memcg-only and except-for-memcg calls.  To clean this up, let's move the
+code responsible for memcg cache creation to a separate function.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 794b1248be4e7e157f5535c3ee49168aa4643349)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+#	mm/slab_common.c
+diff --cc mm/memcontrol.c
+index c2be36e1df50,451523c3bd4e..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3512,14 -3384,20 +3512,23 @@@ static void mem_cgroup_destroy_all_cach
+  	mutex_unlock(&memcg->slab_caches_mutex);
+  }
+  
+ -struct create_work {
+ -	struct mem_cgroup *memcg;
+ -	struct kmem_cache *cachep;
+ -	struct work_struct work;
+ -};
+ -
+  static void memcg_create_cache_work_func(struct work_struct *w)
+  {
+++<<<<<<< HEAD
+ +	struct create_work *cw;
+ +
+ +	cw = container_of(w, struct create_work, work);
+ +	memcg_create_kmem_cache(cw->memcg, cw->cachep);
+ +	/* Drop the reference gotten when we enqueued. */
+ +	css_put(&cw->memcg->css);
+++=======
++ 	struct create_work *cw = container_of(w, struct create_work, work);
++ 	struct mem_cgroup *memcg = cw->memcg;
++ 	struct kmem_cache *cachep = cw->cachep;
++ 
++ 	kmem_cache_create_memcg(memcg, cachep);
++ 	css_put(&memcg->css);
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  	kfree(cw);
+  }
+  
+diff --cc mm/slab_common.c
+index 84ed8dc5b2d8,ccc012f00126..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -55,14 -55,8 +54,19 @@@ static int kmem_cache_sanity_check(cons
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +#if !defined(CONFIG_SLUB)
+ +		/*
+ +		 * For simplicity, we won't check this in the list of memcg
+ +		 * caches. We have control over memcg naming, and if there
+ +		 * aren't duplicates in the global list, there won't be any
+ +		 * duplicates in the memcg lists as well.
+ +		 */
+ +		if (!memcg && !strcmp(s->name, name)) {
+++=======
++ #if !defined(CONFIG_SLUB) || !defined(CONFIG_SLUB_DEBUG_ON)
++ 		if (!strcmp(s->name, name)) {
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  			pr_err("%s (%s): Cache name already exists.\n",
+  			       __func__, name);
+  			dump_stack();
+@@@ -205,33 -196,21 +248,44 @@@ out_free_cache
+   * cacheline.  This can be beneficial if you're counting cycles as closely
+   * as davem.
+   */
+- 
+  struct kmem_cache *
+- kmem_cache_create_memcg(struct mem_cgroup *memcg, const char *name, size_t size,
+- 			size_t align, unsigned long flags, void (*ctor)(void *),
+- 			struct kmem_cache *parent_cache)
++ kmem_cache_create(const char *name, size_t size, size_t align,
++ 		  unsigned long flags, void (*ctor)(void *))
+  {
+++<<<<<<< HEAD
+ +	struct kmem_cache *s = NULL;
+ +	int err = 0;
+++=======
++ 	struct kmem_cache *s;
++ 	char *cache_name;
++ 	int err;
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  
+  	get_online_cpus();
+  	mutex_lock(&slab_mutex);
+  
+++<<<<<<< HEAD
+ +	if (!kmem_cache_sanity_check(memcg, name, size) == 0)
+ +		goto out_locked;
+ +
+ +	if (memcg) {
+ +		/*
+ +		 * Since per-memcg caches are created asynchronously on first
+ +		 * allocation (see memcg_kmem_get_cache()), several threads can
+ +		 * try to create the same cache, but only one of them may
+ +		 * succeed. Therefore if we get here and see the cache has
+ +		 * already been created, we silently return NULL.
+ +		 */
+ +		if (cache_from_memcg(parent_cache, memcg_cache_id(memcg)))
+ +			goto out_locked;
+ +	}
+ +
+++=======
++ 	err = kmem_cache_sanity_check(name, size);
++ 	if (err)
++ 		goto out_unlock;
++ 
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  	/*
+  	 * Some allocators will constraint the set of valid flags to a subset
+  	 * of all flags. We expect them to define CACHE_CREATE_MASK in this
+@@@ -240,51 -219,29 +294,76 @@@
+  	 */
+  	flags &= CACHE_CREATE_MASK;
+  
+++<<<<<<< HEAD
+ +	if (!memcg) {
+ +		s = __kmem_cache_alias(name, size, align, flags, ctor);
+ +		if (s)
+ +			goto out_locked;
+ +	}
+ +
+ +	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+ +	if (s) {
+ +		s->object_size = s->size = size;
+ +		s->align = calculate_alignment(flags, align, size);
+ +		s->ctor = ctor;
+ +
+ +		err = memcg_alloc_cache_params(memcg, s, parent_cache);
+ +		if (err) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			goto out_locked;
+ +		}
+ +
+ +		s->name = kstrdup(name, GFP_KERNEL);
+ +		if (!s->name) {
+ +			memcg_free_cache_params(s);
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+ +
+ +		err = __kmem_cache_create(s, flags);
+ +		if (!err) {
+ +			s->refcount = 1;
+ +			list_add(&s->list, &slab_caches);
+ +			memcg_register_cache(s);
+ +		} else {
+ +			memcg_free_cache_params(s);
+ +			kfree(s->name);
+ +			kmem_cache_free(kmem_cache, s);
+ +		}
+ +	} else
+ +		err = -ENOMEM;
+ +
+ +out_locked:
+++=======
++ 	s = __kmem_cache_alias(name, size, align, flags, ctor);
++ 	if (s)
++ 		goto out_unlock;
++ 
++ 	cache_name = kstrdup(name, GFP_KERNEL);
++ 	if (!cache_name) {
++ 		err = -ENOMEM;
++ 		goto out_unlock;
++ 	}
++ 
++ 	s = do_kmem_cache_create(cache_name, size, size,
++ 				 calculate_alignment(flags, align, size),
++ 				 flags, ctor, NULL, NULL);
++ 	if (IS_ERR(s)) {
++ 		err = PTR_ERR(s);
++ 		kfree(cache_name);
++ 	}
++ 
++ out_unlock:
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  	mutex_unlock(&slab_mutex);
+  	put_online_cpus();
+  
+  	if (err) {
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+  		if (flags & SLAB_PANIC)
+  			panic("kmem_cache_create: Failed to create slab '%s'. Error %d\n",
+  				name, err);
+@@@ -293,25 -250,63 +372,76 @@@
+  				name, err);
+  			dump_stack();
+  		}
+ +
+  		return NULL;
+  	}
+++<<<<<<< HEAD
+ +
+  	return s;
+  }
+ +
+ +struct kmem_cache *
+ +kmem_cache_create(const char *name, size_t size, size_t align,
+ +		  unsigned long flags, void (*ctor)(void *))
+ +{
+ +	return kmem_cache_create_memcg(NULL, name, size, align, flags, ctor, NULL);
+++=======
+++	return s;
+++>>>>>>> 794b1248be4e (memcg, slab: separate memcg vs root cache creation paths)
+ +}
+  EXPORT_SYMBOL(kmem_cache_create);
+  
++ #ifdef CONFIG_MEMCG_KMEM
++ /*
++  * kmem_cache_create_memcg - Create a cache for a memory cgroup.
++  * @memcg: The memory cgroup the new cache is for.
++  * @root_cache: The parent of the new cache.
++  *
++  * This function attempts to create a kmem cache that will serve allocation
++  * requests going from @memcg to @root_cache. The new cache inherits properties
++  * from its parent.
++  */
++ void kmem_cache_create_memcg(struct mem_cgroup *memcg, struct kmem_cache *root_cache)
++ {
++ 	struct kmem_cache *s;
++ 	char *cache_name;
++ 
++ 	get_online_cpus();
++ 	mutex_lock(&slab_mutex);
++ 
++ 	/*
++ 	 * Since per-memcg caches are created asynchronously on first
++ 	 * allocation (see memcg_kmem_get_cache()), several threads can try to
++ 	 * create the same cache, but only one of them may succeed.
++ 	 */
++ 	if (cache_from_memcg_idx(root_cache, memcg_cache_id(memcg)))
++ 		goto out_unlock;
++ 
++ 	cache_name = memcg_create_cache_name(memcg, root_cache);
++ 	if (!cache_name)
++ 		goto out_unlock;
++ 
++ 	s = do_kmem_cache_create(cache_name, root_cache->object_size,
++ 				 root_cache->size, root_cache->align,
++ 				 root_cache->flags, root_cache->ctor,
++ 				 memcg, root_cache);
++ 	if (IS_ERR(s)) {
++ 		kfree(cache_name);
++ 		goto out_unlock;
++ 	}
++ 
++ 	s->allocflags |= __GFP_KMEMCG;
++ 
++ out_unlock:
++ 	mutex_unlock(&slab_mutex);
++ 	put_online_cpus();
++ }
++ #endif /* CONFIG_MEMCG_KMEM */
++ 
+  void kmem_cache_destroy(struct kmem_cache *s)
+  {
+ -	/* Destroy all the children caches if we aren't a memcg cache */
+ -	kmem_cache_destroy_memcg_children(s);
+ +	if (unlikely(!s))
+ +		return;
+  
+  	get_online_cpus();
+  	mutex_lock(&slab_mutex);
+diff --git a/include/linux/slab.h b/include/linux/slab.h
+index eab8fa5b7846..d98095c8ed41 100644
+--- a/include/linux/slab.h
++++ b/include/linux/slab.h
+@@ -106,9 +106,9 @@ int slab_is_available(void);
+ struct kmem_cache *kmem_cache_create(const char *, size_t, size_t,
+ 			unsigned long,
+ 			void (*)(void *));
+-struct kmem_cache *
+-kmem_cache_create_memcg(struct mem_cgroup *, const char *, size_t, size_t,
+-			unsigned long, void (*)(void *), struct kmem_cache *);
++#ifdef CONFIG_MEMCG_KMEM
++void kmem_cache_create_memcg(struct mem_cgroup *, struct kmem_cache *);
++#endif
+ void kmem_cache_destroy(struct kmem_cache *);
+ int kmem_cache_shrink(struct kmem_cache *);
+ void kmem_cache_free(struct kmem_cache *, void *);
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab_common.c
