@@ -1,0 +1,157 @@
+efi: Implement mandatory locking for UEFI Runtime Services
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ard Biesheuvel <ard.biesheuvel@linaro.org>
+commit 161485e8273001e56b2f20755ad9b6217b601fb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/161485e8.failed
+
+According to section 7.1 of the UEFI spec, Runtime Services are not fully
+reentrant, and there are particular combinations of calls that need to be
+serialized. Use a spinlock to serialize all Runtime Services with respect
+to all others, even if this is more than strictly needed.
+
+We've managed to get away without requiring a runtime services lock
+until now because most of the interactions with EFI involve EFI
+variables, and those operations are already serialised with
+__efivars->lock.
+
+Some of the assumptions underlying the decision whether locks are
+needed or not (e.g., SetVariable() against ResetSystem()) may not
+apply universally to all [new] architectures that implement UEFI.
+Rather than try to reason our way out of this, let's just implement at
+least what the spec requires in terms of locking.
+
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+(cherry picked from commit 161485e8273001e56b2f20755ad9b6217b601fb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/runtime-wrappers.c
+diff --cc drivers/firmware/efi/runtime-wrappers.c
+index 35a4b4cc226a,9694cba665c4..000000000000
+--- a/drivers/firmware/efi/runtime-wrappers.c
++++ b/drivers/firmware/efi/runtime-wrappers.c
+@@@ -19,31 -21,77 +21,105 @@@
+  #include <asm/efi.h>
+  
+  /*
+++<<<<<<< HEAD
+ + * Wrap around the new efi_call_virt_generic() macros so that the
+ + * code doesn't get too cluttered:
+ + */
+ +#define efi_call_virt(f, args...)   \
+ +	efi_call_virt_pointer(efi.systab->runtime, f, args)
+ +#define __efi_call_virt(f, args...) \
+ +	__efi_call_virt_pointer(efi.systab->runtime, f, args)
+ +
+ +void efi_call_virt_check_flags(unsigned long flags, const char *call)
+ +{
+ +	unsigned long cur_flags, mismatch;
+ +
+ +	local_save_flags(cur_flags);
+ +
+ +	mismatch = flags ^ cur_flags;
+ +	if (!WARN_ON_ONCE(mismatch & ARCH_EFI_IRQ_FLAGS_MASK))
+ +		return;
+ +
+ +	add_taint(TAINT_FIRMWARE_WORKAROUND, LOCKDEP_NOW_UNRELIABLE);
+ +	pr_err_ratelimited(FW_BUG "IRQ flags corrupted (0x%08lx=>0x%08lx) by EFI %s\n",
+ +			   flags, cur_flags, call);
+ +	local_irq_restore(flags);
+ +}
+ +
+ +/* As per commit ef68c8f87ed1 ("x86: Serialize EFI time accesses on rtc_lock"),
+++=======
++  * According to section 7.1 of the UEFI spec, Runtime Services are not fully
++  * reentrant, and there are particular combinations of calls that need to be
++  * serialized. (source: UEFI Specification v2.4A)
++  *
++  * Table 31. Rules for Reentry Into Runtime Services
++  * +------------------------------------+-------------------------------+
++  * | If previous call is busy in	| Forbidden to call		|
++  * +------------------------------------+-------------------------------+
++  * | Any				| SetVirtualAddressMap()	|
++  * +------------------------------------+-------------------------------+
++  * | ConvertPointer()			| ConvertPointer()		|
++  * +------------------------------------+-------------------------------+
++  * | SetVariable()			| ResetSystem()			|
++  * | UpdateCapsule()			|				|
++  * | SetTime()				|				|
++  * | SetWakeupTime()			|				|
++  * | GetNextHighMonotonicCount()	|				|
++  * +------------------------------------+-------------------------------+
++  * | GetVariable()			| GetVariable()			|
++  * | GetNextVariableName()		| GetNextVariableName()		|
++  * | SetVariable()			| SetVariable()			|
++  * | QueryVariableInfo()		| QueryVariableInfo()		|
++  * | UpdateCapsule()			| UpdateCapsule()		|
++  * | QueryCapsuleCapabilities()		| QueryCapsuleCapabilities()	|
++  * | GetNextHighMonotonicCount()	| GetNextHighMonotonicCount()	|
++  * +------------------------------------+-------------------------------+
++  * | GetTime()				| GetTime()			|
++  * | SetTime()				| SetTime()			|
++  * | GetWakeupTime()			| GetWakeupTime()		|
++  * | SetWakeupTime()			| SetWakeupTime()		|
++  * +------------------------------------+-------------------------------+
++  *
++  * Due to the fact that the EFI pstore may write to the variable store in
++  * interrupt context, we need to use a spinlock for at least the groups that
++  * contain SetVariable() and QueryVariableInfo(). That leaves little else, as
++  * none of the remaining functions are actually ever called at runtime.
++  * So let's just use a single spinlock to serialize all Runtime Services calls.
++  */
++ static DEFINE_SPINLOCK(efi_runtime_lock);
++ 
++ /*
++  * Some runtime services calls can be reentrant under NMI, even if the table
++  * above says they are not. (source: UEFI Specification v2.4A)
++  *
++  * Table 32. Functions that may be called after Machine Check, INIT and NMI
++  * +----------------------------+------------------------------------------+
++  * | Function			| Called after Machine Check, INIT and NMI |
++  * +----------------------------+------------------------------------------+
++  * | GetTime()			| Yes, even if previously busy.		   |
++  * | GetVariable()		| Yes, even if previously busy		   |
++  * | GetNextVariableName()	| Yes, even if previously busy		   |
++  * | QueryVariableInfo()	| Yes, even if previously busy		   |
++  * | SetVariable()		| Yes, even if previously busy		   |
++  * | UpdateCapsule()		| Yes, even if previously busy		   |
++  * | QueryCapsuleCapabilities()	| Yes, even if previously busy		   |
++  * | ResetSystem()		| Yes, even if previously busy		   |
++  * +----------------------------+------------------------------------------+
++  *
++  * In order to prevent deadlocks under NMI, the wrappers for these functions
++  * may only grab the efi_runtime_lock or rtc_lock spinlocks if !efi_in_nmi().
++  * However, not all of the services listed are reachable through NMI code paths,
++  * so the the special handling as suggested by the UEFI spec is only implemented
++  * for QueryVariableInfo() and SetVariable(), as these can be reached in NMI
++  * context through efi_pstore_write().
++  */
++ #ifndef efi_in_nmi
++ #define efi_in_nmi()	(0)
++ #endif
++ 
++ /*
++  * As per commit ef68c8f87ed1 ("x86: Serialize EFI time accesses on rtc_lock"),
+++>>>>>>> 161485e82730 (efi: Implement mandatory locking for UEFI Runtime Services)
+   * the EFI specification requires that callers of the time related runtime
+   * functions serialize with other CMOS accesses in the kernel, as the EFI time
+   * functions may choose to also use the legacy CMOS RTC.
+diff --git a/arch/x86/include/asm/efi.h b/arch/x86/include/asm/efi.h
+index b2df06f6136e..536b751ed796 100644
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@ -112,6 +112,8 @@ extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
+ 
+ #endif /* CONFIG_X86_32 */
+ 
++#define efi_in_nmi()	in_nmi()
++
+ extern int add_efi_memmap;
+ extern struct efi_scratch efi_scratch;
+ extern void __init efi_set_executable(efi_memory_desc_t *md, bool executable);
+* Unmerged path drivers/firmware/efi/runtime-wrappers.c
