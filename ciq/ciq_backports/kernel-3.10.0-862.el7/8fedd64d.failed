@@ -1,0 +1,209 @@
+drm/i915: Fix vblank timestamp/frame counter jumps on gen2
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 8fedd64dabc86d0f31a0d1e152be3aa23c323553
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8fedd64d.failed
+
+Previously I was under the impression that the scanline counter
+reads 0 when the pipe is off. Turns out that's not correct, and
+instead the scanline counter simply stops when the pipe stops, and
+it retains it's last value until the pipe starts up again, at which
+point the scanline counter jumps to vblank start.
+
+These jumps can cause the timestamp to jump backwards by one frame.
+Since we use the timestamps to guesstimage also the frame counter
+value on gen2, that would cause the frame counter to also jump
+backwards, which leads to a massice difference from the previous value.
+The end result is that flips/vblank events don't appear to complete as
+they're stuck waiting for the frame counter to catch up to that massive
+difference.
+
+Fix the problem properly by actually making sure the scanline counter
+has started to move before we assume that it's safe to enable vblank
+processing.
+
+v2: Less pointless duplication in the code (Chris)
+
+	Cc: stable@vger.kernel.org
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Fixes: b7792d8b54cc ("drm/i915: Wait for pipe to start before sampling vblank timestamps on gen2")
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171129153732.3612-1-ville.syrjala@linux.intel.com
+(cherry picked from commit 8fedd64dabc86d0f31a0d1e152be3aa23c323553)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index e6cdc82fc02a,f712418594ed..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -16568,46 -14716,125 +16586,92 @@@ int intel_modeset_init(struct drm_devic
+  	return 0;
+  }
+  
+ -void i830_enable_pipe(struct drm_i915_private *dev_priv, enum pipe pipe)
+ +static void intel_enable_pipe_a(struct drm_device *dev)
+  {
+ -	/* 640x480@60Hz, ~25175 kHz */
+ -	struct dpll clock = {
+ -		.m1 = 18,
+ -		.m2 = 7,
+ -		.p1 = 13,
+ -		.p2 = 4,
+ -		.n = 2,
+ -	};
+ -	u32 dpll, fp;
+ -	int i;
+ -
+ -	WARN_ON(i9xx_calc_dpll_params(48000, &clock) != 25154);
+ -
+ -	DRM_DEBUG_KMS("enabling pipe %c due to force quirk (vco=%d dot=%d)\n",
+ -		      pipe_name(pipe), clock.vco, clock.dot);
+ -
+ -	fp = i9xx_dpll_compute_fp(&clock);
+ -	dpll = (I915_READ(DPLL(pipe)) & DPLL_DVO_2X_MODE) |
+ -		DPLL_VGA_MODE_DIS |
+ -		((clock.p1 - 2) << DPLL_FPA01_P1_POST_DIV_SHIFT) |
+ -		PLL_P2_DIVIDE_BY_4 |
+ -		PLL_REF_INPUT_DREFCLK |
+ -		DPLL_VCO_ENABLE;
+ -
+ -	I915_WRITE(FP0(pipe), fp);
+ -	I915_WRITE(FP1(pipe), fp);
+ -
+ -	I915_WRITE(HTOTAL(pipe), (640 - 1) | ((800 - 1) << 16));
+ -	I915_WRITE(HBLANK(pipe), (640 - 1) | ((800 - 1) << 16));
+ -	I915_WRITE(HSYNC(pipe), (656 - 1) | ((752 - 1) << 16));
+ -	I915_WRITE(VTOTAL(pipe), (480 - 1) | ((525 - 1) << 16));
+ -	I915_WRITE(VBLANK(pipe), (480 - 1) | ((525 - 1) << 16));
+ -	I915_WRITE(VSYNC(pipe), (490 - 1) | ((492 - 1) << 16));
+ -	I915_WRITE(PIPESRC(pipe), ((640 - 1) << 16) | (480 - 1));
+ -
+ -	/*
+ -	 * Apparently we need to have VGA mode enabled prior to changing
+ -	 * the P1/P2 dividers. Otherwise the DPLL will keep using the old
+ -	 * dividers, even though the register value does change.
+ -	 */
+ -	I915_WRITE(DPLL(pipe), dpll & ~DPLL_VGA_MODE_DIS);
+ -	I915_WRITE(DPLL(pipe), dpll);
+ -
+ -	/* Wait for the clocks to stabilize. */
+ -	POSTING_READ(DPLL(pipe));
+ -	udelay(150);
+ -
+ -	/* The pixel multiplier can only be updated once the
+ -	 * DPLL is enabled and the clocks are stable.
+ -	 *
+ -	 * So write it again.
+ -	 */
+ -	I915_WRITE(DPLL(pipe), dpll);
+ -
+ -	/* We do this three times for luck */
+ -	for (i = 0; i < 3 ; i++) {
+ -		I915_WRITE(DPLL(pipe), dpll);
+ -		POSTING_READ(DPLL(pipe));
+ -		udelay(150); /* wait for warmup */
+ +	struct intel_connector *connector;
+ +	struct drm_connector *crt = NULL;
+ +	struct intel_load_detect_pipe load_detect_temp;
+ +	struct drm_modeset_acquire_ctx *ctx = dev->mode_config.acquire_ctx;
+ +
+ +	/* We can't just switch on the pipe A, we need to set things up with a
+ +	 * proper mode and output configuration. As a gross hack, enable pipe A
+ +	 * by enabling the load detect pipe once. */
+ +	for_each_intel_connector(dev, connector) {
+ +		if (connector->encoder->type == INTEL_OUTPUT_ANALOG) {
+ +			crt = &connector->base;
+ +			break;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!crt)
+++=======
++ 	I915_WRITE(PIPECONF(pipe), PIPECONF_ENABLE | PIPECONF_PROGRESSIVE);
++ 	POSTING_READ(PIPECONF(pipe));
++ }
++ 
++ void i830_disable_pipe(struct drm_i915_private *dev_priv, enum pipe pipe)
++ {
++ 	struct intel_crtc *crtc = intel_get_crtc_for_pipe(dev_priv, pipe);
++ 
++ 	DRM_DEBUG_KMS("disabling pipe %c due to force quirk\n",
++ 		      pipe_name(pipe));
++ 
++ 	WARN_ON(I915_READ(DSPCNTR(PLANE_A)) & DISPLAY_PLANE_ENABLE);
++ 	WARN_ON(I915_READ(DSPCNTR(PLANE_B)) & DISPLAY_PLANE_ENABLE);
++ 	WARN_ON(I915_READ(DSPCNTR(PLANE_C)) & DISPLAY_PLANE_ENABLE);
++ 	WARN_ON(I915_READ(CURCNTR(PIPE_A)) & CURSOR_MODE);
++ 	WARN_ON(I915_READ(CURCNTR(PIPE_B)) & CURSOR_MODE);
++ 
++ 	I915_WRITE(PIPECONF(pipe), 0);
++ 	POSTING_READ(PIPECONF(pipe));
++ 
++ 	intel_wait_for_pipe_scanline_stopped(crtc);
++ 
++ 	I915_WRITE(DPLL(pipe), DPLL_VGA_MODE_DIS);
++ 	POSTING_READ(DPLL(pipe));
++ }
++ 
++ static bool intel_plane_mapping_ok(struct intel_crtc *crtc,
++ 				   struct intel_plane *plane)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++ 	enum i9xx_plane_id i9xx_plane = plane->i9xx_plane;
++ 	u32 val = I915_READ(DSPCNTR(i9xx_plane));
++ 
++ 	return (val & DISPLAY_PLANE_ENABLE) == 0 ||
++ 		(val & DISPPLANE_SEL_PIPE_MASK) == DISPPLANE_SEL_PIPE(crtc->pipe);
++ }
++ 
++ static void
++ intel_sanitize_plane_mapping(struct drm_i915_private *dev_priv)
++ {
++ 	struct intel_crtc *crtc;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 4)
+++>>>>>>> 8fedd64dabc8 (drm/i915: Fix vblank timestamp/frame counter jumps on gen2)
+  		return;
+  
+ -	for_each_intel_crtc(&dev_priv->drm, crtc) {
+ -		struct intel_plane *plane =
+ -			to_intel_plane(crtc->base.primary);
+ +	if (intel_get_load_detect_pipe(crt, NULL, &load_detect_temp, ctx))
+ +		intel_release_load_detect_pipe(crt, &load_detect_temp, ctx);
+ +}
+  
+ -		if (intel_plane_mapping_ok(crtc, plane))
+ -			continue;
+ +static bool
+ +intel_check_plane_mapping(struct intel_crtc *crtc)
+ +{
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +	u32 val;
+  
+ -		DRM_DEBUG_KMS("%s attached to the wrong pipe, disabling plane\n",
+ -			      plane->base.name);
+ -		intel_plane_disable_noatomic(crtc, plane);
+ -	}
+ +	if (INTEL_INFO(dev_priv)->num_pipes == 1)
+ +		return true;
+ +
+ +	val = I915_READ(DSPCNTR(!crtc->plane));
+ +
+ +	if ((val & DISPLAY_PLANE_ENABLE) &&
+ +	    (!!(val & DISPPLANE_SEL_PIPE_MASK) == crtc->pipe))
+ +		return false;
+ +
+ +	return true;
+  }
+  
+  static bool intel_crtc_has_encoders(struct intel_crtc *crtc)
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
