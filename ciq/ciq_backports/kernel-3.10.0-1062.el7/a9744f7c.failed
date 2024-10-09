@@ -1,0 +1,69 @@
+xsk: fix potential race in SKB TX completion code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Magnus Karlsson <magnus.karlsson@intel.com>
+commit a9744f7ca200c756e6f8c65b633770a2da711651
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a9744f7c.failed
+
+There is a potential race in the TX completion code for the SKB
+case. One process enters the sendmsg code of an AF_XDP socket in order
+to send a frame. The execution eventually trickles down to the driver
+that is told to send the packet. However, it decides to drop the
+packet due to some error condition (e.g., rings full) and frees the
+SKB. This will trigger the SKB destructor and a completion will be
+sent to the AF_XDP user space through its
+single-producer/single-consumer queues.
+
+At the same time a TX interrupt has fired on another core and it
+dispatches the TX completion code in the driver. It does its HW
+specific things and ends up freeing the SKB associated with the
+transmitted packet. This will trigger the SKB destructor and a
+completion will be sent to the AF_XDP user space through its
+single-producer/single-consumer queues. With a pseudo call stack, it
+would look like this:
+
+Core 1:
+sendmsg() being called in the application
+  netdev_start_xmit()
+    Driver entered through ndo_start_xmit
+      Driver decides to free the SKB for some reason (e.g., rings full)
+        Destructor of SKB called
+          xskq_produce_addr() is called to signal completion to user space
+
+Core 2:
+TX completion irq
+  NAPI loop
+    Driver irq handler for TX completions
+      Frees the SKB
+        Destructor of SKB called
+          xskq_produce_addr() is called to signal completion to user space
+
+We now have a violation of the single-producer/single-consumer
+principle for our queues as there are two threads trying to produce at
+the same time on the same queue.
+
+Fixed by introducing a spin_lock in the destructor. In regards to the
+performance, I get around 1.74 Mpps for txonly before and after the
+introduction of the spinlock. There is of course some impact due to
+the spin lock but it is in the less significant digits that are too
+noisy for me to measure. But let us say that the version without the
+spin lock got 1.745 Mpps in the best case and the version with 1.735
+Mpps in the worst case, then that would mean a maximum drop in
+performance of 0.5%.
+
+Fixes: 35fcde7f8deb ("xsk: support for Tx")
+	Signed-off-by: Magnus Karlsson <magnus.karlsson@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit a9744f7ca200c756e6f8c65b633770a2da711651)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xdp_sock.h
+#	net/xdp/xsk.c
+* Unmerged path include/net/xdp_sock.h
+* Unmerged path net/xdp/xsk.c
+* Unmerged path include/net/xdp_sock.h
+* Unmerged path net/xdp/xsk.c
