@@ -1,0 +1,134 @@
+dm cache: add support for discard passdown to the origin device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit de7180ff908b2bc0342e832dbdaa9a5f1ecaa33a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/de7180ff.failed
+
+DM cache now defaults to passing discards down to the origin device.
+User may disable this using the "no_discard_passdown" feature when
+creating the cache device.
+
+If the cache's underlying origin device doesn't support discards then
+passdown is disabled (with warning).  Similarly, if the underlying
+origin device's max_discard_sectors is less than a cache block discard
+passdown will be disabled (this is required because sizing of the cache
+internal discard bitset depends on it).
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit de7180ff908b2bc0342e832dbdaa9a5f1ecaa33a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-target.c
+diff --cc drivers/md/dm-cache-target.c
+index 2cd6c065099f,d249cf8ac277..000000000000
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@@ -1962,7 -1900,11 +1963,15 @@@ static bool process_discard_bio(struct 
+  		b = to_dblock(from_dblock(b) + 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	bio_endio(bio, 0);
+++=======
++ 	if (cache->features.discard_passdown) {
++ 		remap_to_origin(cache, bio);
++ 		generic_make_request(bio);
++ 	} else
++ 		bio_endio(bio);
+++>>>>>>> de7180ff908b (dm cache: add support for discard passdown to the origin device)
+  
+  	return false;
+  }
+@@@ -2320,10 -2245,10 +2330,10 @@@ static int parse_features(struct cache_
+  			  char **error)
+  {
+  	static const struct dm_arg _args[] = {
+- 		{0, 2, "Invalid number of cache feature arguments"},
++ 		{0, 3, "Invalid number of cache feature arguments"},
+  	};
+  
+ -	int r, mode_ctr = 0;
+ +	int r;
+  	unsigned argc;
+  	const char *arg;
+  	struct cache_features *cf = &ca->features;
+@@@ -3496,24 -3456,38 +3524,59 @@@ static int cache_iterate_devices(struc
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * We assume I/O is going to the origin (which is the volume
+ + * more likely to have restrictions e.g. by being striped).
+ + * (Looking up the exact location of the data would be expensive
+ + * and could always be out of date by the time the bio is submitted.)
+ + */
+ +static int cache_bvec_merge(struct dm_target *ti,
+ +			    struct bvec_merge_data *bvm,
+ +			    struct bio_vec *biovec, int max_size)
+ +{
+ +	struct cache *cache = ti->private;
+ +	struct request_queue *q = bdev_get_queue(cache->origin_dev->bdev);
+ +
+ +	if (!q->merge_bvec_fn)
+ +		return max_size;
+ +
+ +	bvm->bi_bdev = cache->origin_dev->bdev;
+ +	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
+++=======
++ static bool origin_dev_supports_discard(struct block_device *origin_bdev)
++ {
++ 	struct request_queue *q = bdev_get_queue(origin_bdev);
++ 
++ 	return q && blk_queue_discard(q);
++ }
++ 
++ /*
++  * If discard_passdown was enabled verify that the origin device
++  * supports discards.  Disable discard_passdown if not.
++  */
++ static void disable_passdown_if_not_supported(struct cache *cache)
++ {
++ 	struct block_device *origin_bdev = cache->origin_dev->bdev;
++ 	struct queue_limits *origin_limits = &bdev_get_queue(origin_bdev)->limits;
++ 	const char *reason = NULL;
++ 	char buf[BDEVNAME_SIZE];
++ 
++ 	if (!cache->features.discard_passdown)
++ 		return;
++ 
++ 	if (!origin_dev_supports_discard(origin_bdev))
++ 		reason = "discard unsupported";
++ 
++ 	else if (origin_limits->max_discard_sectors < cache->sectors_per_block)
++ 		reason = "max discard sectors smaller than a block";
++ 
++ 	if (reason) {
++ 		DMWARN("Origin device (%s) %s: Disabling discard passdown.",
++ 		       bdevname(origin_bdev, buf), reason);
++ 		cache->features.discard_passdown = false;
++ 	}
+++>>>>>>> de7180ff908b (dm cache: add support for discard passdown to the origin device)
+  }
+  
+  static void set_discard_limits(struct cache *cache, struct queue_limits *limits)
+diff --git a/Documentation/device-mapper/cache.txt b/Documentation/device-mapper/cache.txt
+index cfaaa13fc8da..dea0330ef39e 100644
+--- a/Documentation/device-mapper/cache.txt
++++ b/Documentation/device-mapper/cache.txt
+@@ -210,6 +210,9 @@ Optional feature arguments are:
+                   in a separate btree, which improves speed of shutting
+ 		  down the cache.
+ 
++   no_discard_passdown	: disable passing down discards from the cache
++			  to the origin's data device.
++
+ A policy called 'default' is always registered.  This is an alias for
+ the policy we currently think is giving best all round performance.
+ 
+* Unmerged path drivers/md/dm-cache-target.c
