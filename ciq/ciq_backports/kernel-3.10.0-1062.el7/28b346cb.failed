@@ -1,0 +1,87 @@
+tcp: fastopen: fix rcv_wup initialization for TFO server on SYN/data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Neal Cardwell <ncardwell@google.com>
+commit 28b346cbc0715ae45b2814d857f1d8a7e6817ed8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/28b346cb.failed
+
+Yuchung noticed that on the first TFO server data packet sent after
+the (TFO) handshake, the server echoed the TCP timestamp value in the
+SYN/data instead of the timestamp value in the final ACK of the
+handshake. This problem did not happen on regular opens.
+
+The tcp_replace_ts_recent() logic that decides whether to remember an
+incoming TS value needs tp->rcv_wup to hold the latest receive
+sequence number that we have ACKed (latest tp->rcv_nxt we have
+ACKed). This commit fixes this issue by ensuring that a TFO server
+properly updates tp->rcv_wup to match tp->rcv_nxt at the time it sends
+a SYN/ACK for the SYN/data.
+
+	Reported-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Soheil Hassas Yeganeh <soheil@google.com>
+Fixes: 168a8f58059a ("tcp: TCP Fast Open Server - main code path")
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 28b346cbc0715ae45b2814d857f1d8a7e6817ed8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_fastopen.c
+diff --cc net/ipv4/tcp_fastopen.c
+index 39316c1633b4,62a5751d4fe1..000000000000
+--- a/net/ipv4/tcp_fastopen.c
++++ b/net/ipv4/tcp_fastopen.c
+@@@ -183,35 -221,17 +183,46 @@@ static bool tcp_fastopen_create_child(s
+  	tcp_init_metrics(child);
+  	tcp_init_buffer_space(child);
+  
+++<<<<<<< HEAD
+ +	/* Queue the data carried in the SYN packet. We need to first
+ +	 * bump skb's refcnt because the caller will attempt to free it.
+ +	 *
+ +	 * XXX (TFO) - we honor a zero-payload TFO request for now,
+ +	 * (any reason not to?) but no need to queue the skb since
+ +	 * there is no data. How about SYN+FIN?
+++=======
++ 	tp->rcv_nxt = TCP_SKB_CB(skb)->seq + 1;
++ 
++ 	tcp_fastopen_add_skb(child, skb);
++ 
++ 	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt;
++ 	tp->rcv_wup = tp->rcv_nxt;
++ 	/* tcp_conn_request() is sending the SYNACK,
++ 	 * and queues the child into listener accept queue.
+++>>>>>>> 28b346cbc071 (tcp: fastopen: fix rcv_wup initialization for TFO server on SYN/data)
+  	 */
+ -	return child;
+ +	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
+ +		skb = skb_get(skb);
+ +		skb_dst_drop(skb);
+ +		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
+ +		skb_set_owner_r(skb, child);
+ +		__skb_queue_tail(&child->sk_receive_queue, skb);
+ +		tp->syn_data_acked = 1;
+ +
+ +		/* u64_stats_update_begin(&tp->syncp) not needed here,
+ +		 * as we certainly are not changing upper 32bit value (0)
+ +		 */
+ +		tp->bytes_received = TCP_SKB_CB(skb)->end_seq -
+ +				     TCP_SKB_CB(skb)->seq - 1;
+ +	}
+ +	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+ +	sk->sk_data_ready(sk, 0);
+ +	bh_unlock_sock(child);
+ +	sock_put(child);
+ +	WARN_ON(req->sk == NULL);
+ +	return true;
+  }
+ +EXPORT_SYMBOL(tcp_fastopen_create_child);
+  
+  static bool tcp_fastopen_queue_check(struct sock *sk)
+  {
+* Unmerged path net/ipv4/tcp_fastopen.c
