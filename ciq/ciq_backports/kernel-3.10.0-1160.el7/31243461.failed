@@ -1,0 +1,147 @@
+sctp: cache netns in sctp_ep_common
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 312434617cb16be5166316cf9d08ba760b1042a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/31243461.failed
+
+This patch is to fix a data-race reported by syzbot:
+
+  BUG: KCSAN: data-race in sctp_assoc_migrate / sctp_hash_obj
+
+  write to 0xffff8880b67c0020 of 8 bytes by task 18908 on cpu 1:
+    sctp_assoc_migrate+0x1a6/0x290 net/sctp/associola.c:1091
+    sctp_sock_migrate+0x8aa/0x9b0 net/sctp/socket.c:9465
+    sctp_accept+0x3c8/0x470 net/sctp/socket.c:4916
+    inet_accept+0x7f/0x360 net/ipv4/af_inet.c:734
+    __sys_accept4+0x224/0x430 net/socket.c:1754
+    __do_sys_accept net/socket.c:1795 [inline]
+    __se_sys_accept net/socket.c:1792 [inline]
+    __x64_sys_accept+0x4e/0x60 net/socket.c:1792
+    do_syscall_64+0xcc/0x370 arch/x86/entry/common.c:290
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+  read to 0xffff8880b67c0020 of 8 bytes by task 12003 on cpu 0:
+    sctp_hash_obj+0x4f/0x2d0 net/sctp/input.c:894
+    rht_key_get_hash include/linux/rhashtable.h:133 [inline]
+    rht_key_hashfn include/linux/rhashtable.h:159 [inline]
+    rht_head_hashfn include/linux/rhashtable.h:174 [inline]
+    head_hashfn lib/rhashtable.c:41 [inline]
+    rhashtable_rehash_one lib/rhashtable.c:245 [inline]
+    rhashtable_rehash_chain lib/rhashtable.c:276 [inline]
+    rhashtable_rehash_table lib/rhashtable.c:316 [inline]
+    rht_deferred_worker+0x468/0xab0 lib/rhashtable.c:420
+    process_one_work+0x3d4/0x890 kernel/workqueue.c:2269
+    worker_thread+0xa0/0x800 kernel/workqueue.c:2415
+    kthread+0x1d4/0x200 drivers/block/aoe/aoecmd.c:1253
+    ret_from_fork+0x1f/0x30 arch/x86/entry/entry_64.S:352
+
+It was caused by rhashtable access asoc->base.sk when sctp_assoc_migrate
+is changing its value. However, what rhashtable wants is netns from asoc
+base.sk, and for an asoc, its netns won't change once set. So we can
+simply fix it by caching netns since created.
+
+Fixes: d6c0256a60e6 ("sctp: add the rhashtable apis for sctp global transport hashtable")
+	Reported-by: syzbot+e3b35fe7918ff0ee474e@syzkaller.appspotmail.com
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+(cherry picked from commit 312434617cb16be5166316cf9d08ba760b1042a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+diff --cc net/sctp/input.c
+index 41dcccf5622c,4d2bcfc9d7f8..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -829,38 -893,20 +829,44 @@@ out
+  	return err;
+  }
+  
+ -static inline __u32 sctp_hash_obj(const void *data, u32 len, u32 seed)
+ +static inline u32 sctp_hash_obj(const void *data, u32 len, u32 seed)
+  {
+  	const struct sctp_transport *t = data;
+ +	const union sctp_addr *paddr = &t->ipaddr;
+ +	struct net *net = sock_net(t->asoc->base.sk);
+ +	u16 lport = htons(t->asoc->base.bind_addr.port);
+ +	u32 addr;
+ +
+++<<<<<<< HEAD
+ +	if (paddr->sa.sa_family == AF_INET6)
+ +		addr = jhash(&paddr->v6.sin6_addr, 16, seed);
+ +	else
+ +		addr = paddr->v4.sin_addr.s_addr;
+  
+ +	return  jhash_3words(addr, ((__u32)paddr->v4.sin_port) << 16 |
+ +			     (__force __u32)lport, net_hash_mix(net), seed);
+++=======
++ 	return sctp_hashfn(t->asoc->base.net,
++ 			   htons(t->asoc->base.bind_addr.port),
++ 			   &t->ipaddr, seed);
+++>>>>>>> 312434617cb1 (sctp: cache netns in sctp_ep_common)
+  }
+  
+ -static inline __u32 sctp_hash_key(const void *data, u32 len, u32 seed)
+ +static inline u32 sctp_hash_key(const void *data, u32 len, u32 seed)
+  {
+  	const struct sctp_hash_cmp_arg *x = data;
+ +	const union sctp_addr *paddr = x->paddr;
+ +	struct net *net = (struct net *)x->net;
+ +	u16 lport = x->lport;
+ +	u32 addr;
+ +
+ +	if (paddr->sa.sa_family == AF_INET6)
+ +		addr = jhash(&paddr->v6.sin6_addr, 16, seed);
+ +	else
+ +		addr = paddr->v4.sin_addr.s_addr;
+  
+ -	return sctp_hashfn(x->net, x->lport, x->paddr, seed);
+ +	return  jhash_3words(addr, ((__u32)paddr->v4.sin_port) << 16 |
+ +			     (__force __u32)lport, net_hash_mix(net), seed);
+  }
+  
+  static const struct rhashtable_params sctp_hash_params = {
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index d11731a5c652..67c5cb260c1b 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1215,6 +1215,9 @@ struct sctp_ep_common {
+ 	/* What socket does this endpoint belong to?  */
+ 	struct sock *sk;
+ 
++	/* Cache netns and it won't change once set */
++	struct net *net;
++
+ 	/* This is where we receive inbound chunks.  */
+ 	struct sctp_inq	  inqueue;
+ 
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index a6346997db8f..7e46c4bad76d 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -88,6 +88,7 @@ static struct sctp_association *sctp_association_init(struct sctp_association *a
+ 	/* Discarding const is appropriate here.  */
+ 	asoc->ep = (struct sctp_endpoint *)ep;
+ 	asoc->base.sk = (struct sock *)sk;
++	asoc->base.net = sock_net(sk);
+ 
+ 	sctp_endpoint_hold(asoc->ep);
+ 	sock_hold(asoc->base.sk);
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index 7adc562d1caa..79b1ef32dc62 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -173,6 +173,7 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
+ 
+ 	/* Remember who we are attached to.  */
+ 	ep->base.sk = sk;
++	ep->base.net = sock_net(sk);
+ 	sock_hold(ep->base.sk);
+ 
+ 	return ep;
+* Unmerged path net/sctp/input.c
