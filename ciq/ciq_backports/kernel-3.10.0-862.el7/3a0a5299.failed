@@ -1,0 +1,487 @@
+block, scsi: Make SCSI quiesce and resume work reliably
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] scsi: Make SCSI quiesce and resume work reliably (Ming Lei) [1491296]
+Rebuild_FUZZ: 93.20%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit 3a0a529971ec4e2d933e9c7798db101dfb6b1aec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3a0a5299.failed
+
+The contexts from which a SCSI device can be quiesced or resumed are:
+* Writing into /sys/class/scsi_device/*/device/state.
+* SCSI parallel (SPI) domain validation.
+* The SCSI device power management methods. See also scsi_bus_pm_ops.
+
+It is essential during suspend and resume that neither the filesystem
+state nor the filesystem metadata in RAM changes. This is why while
+the hibernation image is being written or restored that SCSI devices
+are quiesced. The SCSI core quiesces devices through scsi_device_quiesce()
+and scsi_device_resume(). In the SDEV_QUIESCE state execution of
+non-preempt requests is deferred. This is realized by returning
+BLKPREP_DEFER from inside scsi_prep_state_check() for quiesced SCSI
+devices. Avoid that a full queue prevents power management requests
+to be submitted by deferring allocation of non-preempt requests for
+devices in the quiesced state. This patch has been tested by running
+the following commands and by verifying that after each resume the
+fio job was still running:
+
+for ((i=0; i<10; i++)); do
+  (
+    cd /sys/block/md0/md &&
+    while true; do
+      [ "$(<sync_action)" = "idle" ] && echo check > sync_action
+      sleep 1
+    done
+  ) &
+  pids=($!)
+  for d in /sys/class/block/sd*[a-z]; do
+    bdev=${d#/sys/class/block/}
+    hcil=$(readlink "$d/device")
+    hcil=${hcil#../../../}
+    echo 4 > "$d/queue/nr_requests"
+    echo 1 > "/sys/class/scsi_device/$hcil/device/queue_depth"
+    fio --name="$bdev" --filename="/dev/$bdev" --buffered=0 --bs=512 \
+      --rw=randread --ioengine=libaio --numjobs=4 --iodepth=16       \
+      --iodepth_batch=1 --thread --loops=$((2**31)) &
+    pids+=($!)
+  done
+  sleep 1
+  echo "$(date) Hibernating ..." >>hibernate-test-log.txt
+  systemctl hibernate
+  sleep 10
+  kill "${pids[@]}"
+  echo idle > /sys/block/md0/md/sync_action
+  wait
+  echo "$(date) Done." >>hibernate-test-log.txt
+done
+
+	Reported-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+References: "I/O hangs after resuming from suspend-to-ram" (https://marc.info/?l=linux-block&m=150340235201348).
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Tested-by: Martin Steigerwald <martin@lichtvoll.de>
+	Tested-by: Oleksandr Natalenko <oleksandr@natalenko.name>
+	Cc: Martin K. Petersen <martin.petersen@oracle.com>
+	Cc: Ming Lei <ming.lei@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3a0a529971ec4e2d933e9c7798db101dfb6b1aec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	drivers/scsi/scsi_lib.c
+#	include/linux/blkdev.h
+#	include/scsi/scsi_device.h
+diff --cc block/blk-core.c
+index df55e6267498,29b08428ae45..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -260,6 -349,37 +260,40 @@@ void blk_sync_queue(struct request_queu
+  EXPORT_SYMBOL(blk_sync_queue);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * blk_set_preempt_only - set QUEUE_FLAG_PREEMPT_ONLY
++  * @q: request queue pointer
++  *
++  * Returns the previous value of the PREEMPT_ONLY flag - 0 if the flag was not
++  * set and 1 if the flag was already set.
++  */
++ int blk_set_preempt_only(struct request_queue *q)
++ {
++ 	unsigned long flags;
++ 	int res;
++ 
++ 	spin_lock_irqsave(q->queue_lock, flags);
++ 	res = queue_flag_test_and_set(QUEUE_FLAG_PREEMPT_ONLY, q);
++ 	spin_unlock_irqrestore(q->queue_lock, flags);
++ 
++ 	return res;
++ }
++ EXPORT_SYMBOL_GPL(blk_set_preempt_only);
++ 
++ void blk_clear_preempt_only(struct request_queue *q)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(q->queue_lock, flags);
++ 	queue_flag_clear(QUEUE_FLAG_PREEMPT_ONLY, q);
++ 	wake_up_all(&q->mq_freeze_wq);
++ 	spin_unlock_irqrestore(q->queue_lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(blk_clear_preempt_only);
++ 
++ /**
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+   * __blk_run_queue_uncond - run a queue whether or not it has been stopped
+   * @q:	The queue to run
+   *
+@@@ -605,24 -796,38 +639,51 @@@ struct request_queue *blk_alloc_queue(g
+  }
+  EXPORT_SYMBOL(blk_alloc_queue);
+  
+++<<<<<<< HEAD
+ +static void queue_limits_init_aux(struct request_queue *q, struct queue_limits_aux *limits_aux)
+ +{
+ +	if (!limits_aux)
+ +	    return;
+ +
+ +	memset(limits_aux, 0, sizeof(*limits_aux));
+ +	q->limits.limits_aux = limits_aux;
+ +}
+ +
+ +int blk_queue_enter(struct request_queue *q, bool nowait)
+++=======
++ /**
++  * blk_queue_enter() - try to increase q->q_usage_counter
++  * @q: request queue pointer
++  * @flags: BLK_MQ_REQ_NOWAIT and/or BLK_MQ_REQ_PREEMPT
++  */
++ int blk_queue_enter(struct request_queue *q, unsigned int flags)
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  {
++ 	const bool preempt = flags & BLK_MQ_REQ_PREEMPT;
++ 
+  	while (true) {
++ 		bool success = false;
+  		int ret;
+  
+- 		if (percpu_ref_tryget_live(&q->q_usage_counter))
++ 		rcu_read_lock_sched();
++ 		if (percpu_ref_tryget_live(&q->q_usage_counter)) {
++ 			/*
++ 			 * The code that sets the PREEMPT_ONLY flag is
++ 			 * responsible for ensuring that that flag is globally
++ 			 * visible before the queue is unfrozen.
++ 			 */
++ 			if (preempt || !blk_queue_preempt_only(q)) {
++ 				success = true;
++ 			} else {
++ 				percpu_ref_put(&q->q_usage_counter);
++ 			}
++ 		}
++ 		rcu_read_unlock_sched();
++ 
++ 		if (success)
+  			return 0;
+  
+- 		if (nowait)
++ 		if (flags & BLK_MQ_REQ_NOWAIT)
+  			return -EBUSY;
+  
+  		/*
+@@@ -1277,12 -1470,21 +1339,18 @@@ static struct request *blk_old_get_requ
+  	/* create ioc upfront */
+  	create_io_context(gfp_mask, q->node);
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = blk_queue_enter(q, flags);
++ 	if (ret)
++ 		return ERR_PTR(ret);
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  	spin_lock_irq(q->queue_lock);
+ -	rq = get_request(q, op, NULL, flags);
+ -	if (IS_ERR(rq)) {
+ +	rq = get_request(q, rw, NULL, gfp_mask);
+ +	if (IS_ERR(rq))
+  		spin_unlock_irq(q->queue_lock);
+ -		blk_queue_exit(q);
+ -		return rq;
+ -	}
+ -
+  	/* q->queue_lock is unlocked at this point */
+ -	rq->__data_len = 0;
+ -	rq->__sector = (sector_t) -1;
+ -	rq->bio = rq->biotail = NULL;
+ +
+  	return rq;
+  }
+  
+@@@ -2050,9 -2290,11 +2118,17 @@@ void generic_make_request(struct bio *b
+  	bio_list_init(&bio_list_on_stack[0]);
+  	current->bio_list = bio_list_on_stack;
+  	do {
+++<<<<<<< HEAD
+ +		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ +
+ +		if (likely(blk_queue_enter(q, false) == 0)) {
+++=======
++ 		struct request_queue *q = bio->bi_disk->queue;
++ 		unsigned int flags = bio->bi_opf & REQ_NOWAIT ?
++ 			BLK_MQ_REQ_NOWAIT : 0;
++ 
++ 		if (likely(blk_queue_enter(q, flags) == 0)) {
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  			struct bio_list lower, same;
+  
+  			/* Create a fresh bio_list for all subordinate requests */
+@@@ -2086,8 -2335,41 +2162,45 @@@
+  EXPORT_SYMBOL(generic_make_request);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * direct_make_request - hand a buffer directly to its device driver for I/O
++  * @bio:  The bio describing the location in memory and on the device.
++  *
++  * This function behaves like generic_make_request(), but does not protect
++  * against recursion.  Must only be used if the called driver is known
++  * to not call generic_make_request (or direct_make_request) again from
++  * its make_request function.  (Calling direct_make_request again from
++  * a workqueue is perfectly fine as that doesn't recurse).
++  */
++ blk_qc_t direct_make_request(struct bio *bio)
++ {
++ 	struct request_queue *q = bio->bi_disk->queue;
++ 	bool nowait = bio->bi_opf & REQ_NOWAIT;
++ 	blk_qc_t ret;
++ 
++ 	if (!generic_make_request_checks(bio))
++ 		return BLK_QC_T_NONE;
++ 
++ 	if (unlikely(blk_queue_enter(q, nowait ? BLK_MQ_REQ_NOWAIT : 0))) {
++ 		if (nowait && !blk_queue_dying(q))
++ 			bio->bi_status = BLK_STS_AGAIN;
++ 		else
++ 			bio->bi_status = BLK_STS_IOERR;
++ 		bio_endio(bio);
++ 		return BLK_QC_T_NONE;
++ 	}
++ 
++ 	ret = q->make_request_fn(q, bio);
++ 	blk_queue_exit(q);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(direct_make_request);
++ 
++ /**
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+   * submit_bio - submit a bio to the block device layer for I/O
+ + * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
+   * @bio: The &struct bio which describes the I/O
+   *
+   * submit_bio() is very similar in purpose to generic_make_request(), and
+diff --cc drivers/scsi/scsi_lib.c
+index 540886abddcc,f907e2f8c1dd..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -2702,16 -2947,37 +2702,50 @@@ static void scsi_wait_for_queuecommand(
+  int
+  scsi_device_quiesce(struct scsi_device *sdev)
+  {
+++<<<<<<< HEAD
+ +	int err = scsi_device_set_state(sdev, SDEV_QUIESCE);
+ +	if (err)
+ +		return err;
+ +
+ +	scsi_run_queue(sdev->request_queue);
+ +	while (atomic_read(&sdev->device_busy)) {
+ +		msleep_interruptible(200);
+ +		scsi_run_queue(sdev->request_queue);
+ +	}
+ +	return 0;
+++=======
++ 	struct request_queue *q = sdev->request_queue;
++ 	int err;
++ 
++ 	/*
++ 	 * It is allowed to call scsi_device_quiesce() multiple times from
++ 	 * the same context but concurrent scsi_device_quiesce() calls are
++ 	 * not allowed.
++ 	 */
++ 	WARN_ON_ONCE(sdev->quiesced_by && sdev->quiesced_by != current);
++ 
++ 	blk_set_preempt_only(q);
++ 
++ 	blk_mq_freeze_queue(q);
++ 	/*
++ 	 * Ensure that the effect of blk_set_preempt_only() will be visible
++ 	 * for percpu_ref_tryget() callers that occur after the queue
++ 	 * unfreeze even if the queue was already frozen before this function
++ 	 * was called. See also https://lwn.net/Articles/573497/.
++ 	 */
++ 	synchronize_rcu();
++ 	blk_mq_unfreeze_queue(q);
++ 
++ 	mutex_lock(&sdev->state_mutex);
++ 	err = scsi_device_set_state(sdev, SDEV_QUIESCE);
++ 	if (err == 0)
++ 		sdev->quiesced_by = current;
++ 	else
++ 		blk_clear_preempt_only(q);
++ 	mutex_unlock(&sdev->state_mutex);
++ 
++ 	return err;
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  }
+  EXPORT_SYMBOL(scsi_device_quiesce);
+  
+@@@ -2730,10 -2996,13 +2764,20 @@@ void scsi_device_resume(struct scsi_dev
+  	 * so assume the state is being managed elsewhere (for example
+  	 * device deleted during suspend)
+  	 */
+++<<<<<<< HEAD
+ +	if (sdev->sdev_state != SDEV_QUIESCE ||
+ +	    scsi_device_set_state(sdev, SDEV_RUNNING))
+ +		return;
+ +	scsi_run_queue(sdev->request_queue);
+++=======
++ 	mutex_lock(&sdev->state_mutex);
++ 	WARN_ON_ONCE(!sdev->quiesced_by);
++ 	sdev->quiesced_by = NULL;
++ 	blk_clear_preempt_only(sdev->request_queue);
++ 	if (sdev->sdev_state == SDEV_QUIESCE)
++ 		scsi_device_set_state(sdev, SDEV_RUNNING);
++ 	mutex_unlock(&sdev->state_mutex);
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  }
+  EXPORT_SYMBOL(scsi_device_resume);
+  
+diff --cc include/linux/blkdev.h
+index 2d7fe01dd7d2,402c9d536ae1..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -893,30 -959,10 +893,34 @@@ extern int scsi_cmd_ioctl(struct reques
+  extern int sg_scsi_ioctl(struct request_queue *, struct gendisk *, fmode_t,
+  			 struct scsi_ioctl_command __user *);
+  
+++<<<<<<< HEAD
+ +extern void blk_queue_bio(struct request_queue *q, struct bio *bio);
+ +
+ +/*
+ + * A queue has just exitted congestion.  Note this in the global counter of
+ + * congested queues, and wake up anyone who was waiting for requests to be
+ + * put back.
+ + */
+ +static inline void blk_clear_queue_congested(struct request_queue *q, int sync)
+ +{
+ +	clear_bdi_congested(&q->backing_dev_info, sync);
+ +}
+ +
+ +/*
+ + * A queue has just entered congestion.  Flag that in the queue's VM-visible
+ + * state flags and increment the global gounter of congested queues.
+ + */
+ +static inline void blk_set_queue_congested(struct request_queue *q, int sync)
+ +{
+ +	set_bdi_congested(&q->backing_dev_info, sync);
+ +}
+ +
+ +extern int blk_queue_enter(struct request_queue *q, bool nowait);
+++=======
++ extern int blk_queue_enter(struct request_queue *q, unsigned int flags);
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  extern void blk_queue_exit(struct request_queue *q);
+  extern void blk_start_queue(struct request_queue *q);
+ -extern void blk_start_queue_async(struct request_queue *q);
+  extern void blk_stop_queue(struct request_queue *q);
+  extern void blk_sync_queue(struct request_queue *q);
+  extern void __blk_stop_queue(struct request_queue *q);
+diff --cc include/scsi/scsi_device.h
+index 7232be872027,6f0f1e242e23..000000000000
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@@ -213,39 -213,13 +213,43 @@@ struct scsi_device 
+  	struct execute_work	ew; /* used to get process context on put */
+  	struct work_struct	requeue_work;
+  
+ -	struct scsi_device_handler *handler;
+ -	void			*handler_data;
+ -
+ -	unsigned char		access_state;
+ -	struct mutex		state_mutex;
+ +	struct scsi_dh_data	*scsi_dh_data;
+  	enum scsi_device_state sdev_state;
+++<<<<<<< HEAD
+ +
+ +	/* FOR RH USE ONLY
+ +	 *
+ +	 * The following padding has been inserted before ABI freeze to
+ +	 * allow extending the structure while preserve ABI.
+ +	 */
+ +
+ +#define SCSI_VPD_PG_LEN                255
+ +
+ +	RH_KABI_REPLACE(void *vpd_reserved1, unsigned char __rcu *vpd_pg83)
+ +	RH_KABI_REPLACE(void *vpd_reserved2, int vpd_pg83_len)
+ +	RH_KABI_REPLACE(void *vpd_reserved3, unsigned char __rcu *vpd_pg80)
+ +	RH_KABI_REPLACE(void *vpd_reserved4, int vpd_pg80_len)
+ +	char	vpd_reserved5;
+ +	char	vpd_reserved6;
+ +	char	vpd_reserved7;
+ +	char	vpd_reserved8;
+ +
+ +	/* Lock on updates to inquiry and VPD attribute data */
+ +	RH_KABI_REPLACE(spinlock_t vpd_reserved9, spinlock_t inquiry_lock)
+ +
+ +	RH_KABI_RESERVE_P(1)
+ +	RH_KABI_RESERVE_P(2)
+ +	RH_KABI_RESERVE_P(3)
+ +	RH_KABI_RESERVE_P(4)
+ +	RH_KABI_RESERVE_P(5)
+ +	RH_KABI_RESERVE_P(6)
+ +
+ +	atomic_t scsi_mq_reserved1;
+ +	atomic_t scsi_mq_reserved2;
+ +
+++=======
++ 	struct task_struct	*quiesced_by;
+++>>>>>>> 3a0a529971ec (block, scsi: Make SCSI quiesce and resume work reliably)
+  	unsigned long		sdev_data[0];
+  } __attribute__((aligned(sizeof(unsigned long))));
+  
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index d9bfe0c6bc0e..97c62d0dc228 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -275,7 +275,7 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+ 	struct blk_mq_alloc_data alloc_data;
+ 	int ret;
+ 
+-	ret = blk_queue_enter(q, flags & BLK_MQ_REQ_NOWAIT);
++	ret = blk_queue_enter(q, flags);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+@@ -324,7 +324,7 @@ struct request *blk_mq_alloc_request_hctx(struct request_queue *q, int rw,
+ 	if (hctx_idx >= q->nr_hw_queues)
+ 		return ERR_PTR(-EIO);
+ 
+-	ret = blk_queue_enter(q, true);
++	ret = blk_queue_enter(q, flags);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index ed7207dfa086..0cb9c3601dab 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -477,7 +477,7 @@ int bdev_read_page(struct block_device *bdev, sector_t sector,
+ 	if (!ops->rw_page || bdev_get_integrity(bdev))
+ 		return result;
+ 
+-	result = blk_queue_enter(bdev->bd_queue, false);
++	result = blk_queue_enter(bdev->bd_queue, 0);
+ 	if (result)
+ 		return result;
+ 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
+@@ -514,7 +514,7 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
+ 
+ 	if (!ops->rw_page || bdev_get_integrity(bdev))
+ 		return -EOPNOTSUPP;
+-	result = blk_queue_enter(bdev->bd_queue, false);
++	result = blk_queue_enter(bdev->bd_queue, 0);
+ 	if (result)
+ 		return result;
+ 
+* Unmerged path include/linux/blkdev.h
+* Unmerged path include/scsi/scsi_device.h
