@@ -1,0 +1,176 @@
+s390/zcrypt: remove VLA usage from the AP bus
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] zcrypt: remove VLA usage from the AP bus (Hendrik Brueckner) [1641030]
+Rebuild_FUZZ: 94.12%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit fa108f95c6769ec15ea59b7db00454b82afc6121
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/fa108f95.failed
+
+The use of variable length arrays on the stack is deprecated.
+git commit 3d8f60d38e249f989a7fca9c2370c31c3d5487e1
+"s390/zcrypt: hex string mask improvements for apmask and aqmask."
+added three new VLA arrays. Remove them again.
+
+	Reviewed-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit fa108f95c6769ec15ea59b7db00454b82afc6121)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index eec227533e4a,f039266b275d..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -792,8 -857,143 +792,145 @@@ void ap_bus_force_rescan(void
+  EXPORT_SYMBOL(ap_bus_force_rescan);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * hex2bitmap() - parse hex mask string and set bitmap.
++  * Valid strings are "0x012345678" with at least one valid hex number.
++  * Rest of the bitmap to the right is padded with 0. No spaces allowed
++  * within the string, the leading 0x may be omitted.
++  * Returns the bitmask with exactly the bits set as given by the hex
++  * string (both in big endian order).
++  */
++ static int hex2bitmap(const char *str, unsigned long *bitmap, int bits)
++ {
++ 	int i, n, b;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	if (str[0] == '0' && str[1] == 'x')
++ 		str++;
++ 	if (*str == 'x')
++ 		str++;
++ 
++ 	for (i = 0; isxdigit(*str) && i < bits; str++) {
++ 		b = hex_to_bin(*str);
++ 		for (n = 0; n < 4; n++)
++ 			if (b & (0x08 >> n))
++ 				set_bit_inv(i + n, bitmap);
++ 		i += 4;
++ 	}
++ 
++ 	if (*str == '\n')
++ 		str++;
++ 	if (*str)
++ 		return -EINVAL;
++ 	return 0;
++ }
++ 
++ /*
++  * modify_bitmap() - parse bitmask argument and modify an existing
++  * bit mask accordingly. A concatenation (done with ',') of these
++  * terms is recognized:
++  *   +<bitnr>[-<bitnr>] or -<bitnr>[-<bitnr>]
++  * <bitnr> may be any valid number (hex, decimal or octal) in the range
++  * 0...bits-1; the leading + or - is required. Here are some examples:
++  *   +0-15,+32,-128,-0xFF
++  *   -0-255,+1-16,+0x128
++  *   +1,+2,+3,+4,-5,-7-10
++  * Returns the new bitmap after all changes have been applied. Every
++  * positive value in the string will set a bit and every negative value
++  * in the string will clear a bit. As a bit may be touched more than once,
++  * the last 'operation' wins:
++  * +0-255,-128 = first bits 0-255 will be set, then bit 128 will be
++  * cleared again. All other bits are unmodified.
++  */
++ static int modify_bitmap(const char *str, unsigned long *bitmap, int bits)
++ {
++ 	int a, i, z;
++ 	char *np, sign;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	while (*str) {
++ 		sign = *str++;
++ 		if (sign != '+' && sign != '-')
++ 			return -EINVAL;
++ 		a = z = simple_strtoul(str, &np, 0);
++ 		if (str == np || a >= bits)
++ 			return -EINVAL;
++ 		str = np;
++ 		if (*str == '-') {
++ 			z = simple_strtoul(++str, &np, 0);
++ 			if (str == np || a > z || z >= bits)
++ 				return -EINVAL;
++ 			str = np;
++ 		}
++ 		for (i = a; i <= z; i++)
++ 			if (sign == '+')
++ 				set_bit_inv(i, bitmap);
++ 			else
++ 				clear_bit_inv(i, bitmap);
++ 		while (*str == ',' || *str == '\n')
++ 			str++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * process_mask_arg() - parse a bitmap string and clear/set the
++  * bits in the bitmap accordingly. The string may be given as
++  * absolute value, a hex string like 0x1F2E3D4C5B6A" simple over-
++  * writing the current content of the bitmap. Or as relative string
++  * like "+1-16,-32,-0x40,+128" where only single bits or ranges of
++  * bits are cleared or set. Distinction is done based on the very
++  * first character which may be '+' or '-' for the relative string
++  * and othewise assume to be an absolute value string. If parsing fails
++  * a negative errno value is returned. All arguments and bitmaps are
++  * big endian order.
++  */
++ static int process_mask_arg(const char *str,
++ 			    unsigned long *bitmap, int bits,
++ 			    struct mutex *lock)
++ {
++ 	unsigned long *newmap, size;
++ 	int rc;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	size = BITS_TO_LONGS(bits)*sizeof(unsigned long);
++ 	newmap = kmalloc(size, GFP_KERNEL);
++ 	if (!newmap)
++ 		return -ENOMEM;
++ 	if (mutex_lock_interruptible(lock)) {
++ 		kfree(newmap);
++ 		return -ERESTARTSYS;
++ 	}
++ 
++ 	if (*str == '+' || *str == '-') {
++ 		memcpy(newmap, bitmap, size);
++ 		rc = modify_bitmap(str, newmap, bits);
++ 	} else {
++ 		memset(newmap, 0, size);
++ 		rc = hex2bitmap(str, newmap, bits);
++ 	}
++ 	if (rc == 0)
++ 		memcpy(bitmap, newmap, size);
++ 	mutex_unlock(lock);
++ 	kfree(newmap);
++ 	return rc;
++ }
++ 
++ /*
+++>>>>>>> fa108f95c676 (s390/zcrypt: remove VLA usage from the AP bus)
+   * AP bus attributes.
+   */
+ -
+  static ssize_t ap_domain_show(struct bus_type *bus, char *buf)
+  {
+  	return snprintf(buf, PAGE_SIZE, "%d\n", ap_domain_index);
+* Unmerged path drivers/s390/crypto/ap_bus.c
