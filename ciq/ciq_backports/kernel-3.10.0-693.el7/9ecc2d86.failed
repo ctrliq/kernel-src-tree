@@ -1,0 +1,530 @@
+net/mlx4_en: add xdp forwarding and data write support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: add xdp forwarding and data write support (Don Dutile) [1385329 1417286]
+Rebuild_FUZZ: 96.15%
+commit-author Brenden Blanco <bblanco@plumgrid.com>
+commit 9ecc2d86171adf23796133c89610987a14624875
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9ecc2d86.failed
+
+A user will now be able to loop packets back out of the same port using
+a bpf program attached to xdp hook. Updates to the packet contents from
+the bpf program is also supported.
+
+For the packet write feature to work, the rx buffers are now mapped as
+bidirectional when the page is allocated. This occurs only when the xdp
+hook is active.
+
+When the program returns a TX action, enqueue the packet directly to a
+dedicated tx ring, so as to avoid completely any locking. This requires
+the tx ring to be allocated 1:1 for each rx ring, as well as the tx
+completion running in the same softirq.
+
+Upon tx completion, this dedicated tx ring recycles pages without
+unmapping directly back to the original rx ring. In steady state tx/drop
+workload, effectively 0 page allocs/frees will occur.
+
+In order to separate out the paths between free and recycle, a
+free_tx_desc func pointer is introduced that is optionally updated
+whenever recycle_ring is activated. By default the original free
+function is always initialized.
+
+	Signed-off-by: Brenden Blanco <bblanco@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9ecc2d86171adf23796133c89610987a14624875)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+index 17c15ed3db70,f32e272c83dd..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+@@@ -1729,28 -1722,32 +1729,37 @@@ static int mlx4_en_set_channels(struct 
+  	    !channel->tx_count || !channel->rx_count)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
+ +	if (!tmp)
+ +		return -ENOMEM;
+++=======
++ 	if (channel->tx_count * MLX4_EN_NUM_UP <= priv->xdp_ring_num) {
++ 		en_err(priv, "Minimum %d tx channels required with XDP on\n",
++ 		       priv->xdp_ring_num / MLX4_EN_NUM_UP + 1);
++ 		return -EINVAL;
++ 	}
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  
+  	mutex_lock(&mdev->state_lock);
+ +	memcpy(&new_prof, priv->prof, sizeof(struct mlx4_en_port_profile));
+ +	new_prof.num_tx_rings_p_up = channel->tx_count;
+ +	new_prof.tx_ring_num = channel->tx_count * MLX4_EN_NUM_UP;
+ +	new_prof.rx_ring_num = channel->rx_count;
+ +
+ +	err = mlx4_en_try_alloc_resources(priv, tmp, &new_prof);
+ +	if (err)
+ +		goto out;
+ +
+  	if (priv->port_up) {
+  		port_up = 1;
+  		mlx4_en_stop_port(dev, 1);
+  	}
+  
+ -	mlx4_en_free_resources(priv);
+ -
+ -	priv->num_tx_rings_p_up = channel->tx_count;
+ -	priv->tx_ring_num = channel->tx_count * MLX4_EN_NUM_UP;
+ -	priv->rx_ring_num = channel->rx_count;
+ -
+ -	err = mlx4_en_alloc_resources(priv);
+ -	if (err) {
+ -		en_err(priv, "Failed reallocating port resources\n");
+ -		goto out;
+ -	}
+ +	mlx4_en_safe_replace_resources(priv, tmp);
+  
+- 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num);
++ 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num -
++ 							priv->xdp_ring_num);
+  	netif_set_real_num_rx_queues(dev, priv->rx_ring_num);
+  
+  	if (dev->num_tc)
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index b5fcade5597f,9abbba6c1475..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@@ -2573,8 -2546,104 +2593,108 @@@ static int mlx4_en_set_tx_maxrate(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx4_xdp_set(struct net_device *dev, struct bpf_prog *prog)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	struct bpf_prog *old_prog;
++ 	int xdp_ring_num;
++ 	int port_up = 0;
++ 	int err;
++ 	int i;
++ 
++ 	xdp_ring_num = prog ? ALIGN(priv->rx_ring_num, MLX4_EN_NUM_UP) : 0;
++ 
++ 	/* No need to reconfigure buffers when simply swapping the
++ 	 * program for a new one.
++ 	 */
++ 	if (priv->xdp_ring_num == xdp_ring_num) {
++ 		if (prog) {
++ 			prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 			if (IS_ERR(prog))
++ 				return PTR_ERR(prog);
++ 		}
++ 		for (i = 0; i < priv->rx_ring_num; i++) {
++ 			/* This xchg is paired with READ_ONCE in the fastpath */
++ 			old_prog = xchg(&priv->rx_ring[i]->xdp_prog, prog);
++ 			if (old_prog)
++ 				bpf_prog_put(old_prog);
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	if (priv->num_frags > 1) {
++ 		en_err(priv, "Cannot set XDP if MTU requires multiple frags\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (priv->tx_ring_num < xdp_ring_num + MLX4_EN_NUM_UP) {
++ 		en_err(priv,
++ 		       "Minimum %d tx channels required to run XDP\n",
++ 		       (xdp_ring_num + MLX4_EN_NUM_UP) / MLX4_EN_NUM_UP);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (prog) {
++ 		prog = bpf_prog_add(prog, priv->rx_ring_num - 1);
++ 		if (IS_ERR(prog))
++ 			return PTR_ERR(prog);
++ 	}
++ 
++ 	mutex_lock(&mdev->state_lock);
++ 	if (priv->port_up) {
++ 		port_up = 1;
++ 		mlx4_en_stop_port(dev, 1);
++ 	}
++ 
++ 	priv->xdp_ring_num = xdp_ring_num;
++ 	netif_set_real_num_tx_queues(dev, priv->tx_ring_num -
++ 							priv->xdp_ring_num);
++ 
++ 	for (i = 0; i < priv->rx_ring_num; i++) {
++ 		old_prog = xchg(&priv->rx_ring[i]->xdp_prog, prog);
++ 		if (old_prog)
++ 			bpf_prog_put(old_prog);
++ 	}
++ 
++ 	if (port_up) {
++ 		err = mlx4_en_start_port(dev);
++ 		if (err) {
++ 			en_err(priv, "Failed starting port %d for XDP change\n",
++ 			       priv->port);
++ 			queue_work(mdev->workqueue, &priv->watchdog_task);
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&mdev->state_lock);
++ 	return 0;
++ }
++ 
++ static bool mlx4_xdp_attached(struct net_device *dev)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 
++ 	return !!priv->xdp_ring_num;
++ }
++ 
++ static int mlx4_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return mlx4_xdp_set(dev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = mlx4_xdp_attached(dev);
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  static const struct net_device_ops mlx4_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= mlx4_en_open,
+  	.ndo_stop		= mlx4_en_close,
+  	.ndo_start_xmit		= mlx4_en_xmit,
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 3629069532c8,11d88c817137..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -739,7 -782,10 +739,13 @@@ int mlx4_en_process_rx_cq(struct net_de
+  	struct mlx4_en_rx_ring *ring = priv->rx_ring[cq->ring];
+  	struct mlx4_en_rx_alloc *frags;
+  	struct mlx4_en_rx_desc *rx_desc;
+++<<<<<<< HEAD
+++=======
++ 	struct bpf_prog *xdp_prog;
++ 	int doorbell_pending;
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  	struct sk_buff *skb;
++ 	int tx_index;
+  	int index;
+  	int nr;
+  	unsigned int length;
+@@@ -755,6 -801,10 +761,13 @@@
+  	if (budget <= 0)
+  		return polled;
+  
+++<<<<<<< HEAD
+++=======
++ 	xdp_prog = READ_ONCE(ring->xdp_prog);
++ 	doorbell_pending = 0;
++ 	tx_index = (priv->tx_ring_num - priv->xdp_ring_num) + cq->ring;
++ 
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  	/* We assume a 1:1 mapping between CQEs and Rx descriptors, so Rx
+  	 * descriptor offset can be deduced from the CQE index instead of
+  	 * reading 'cqe->index' */
+@@@ -831,6 -881,43 +844,46 @@@
+  		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+  			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+  
+++<<<<<<< HEAD
+++=======
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			u32 act;
++ 
++ 			dma = be64_to_cpu(rx_desc->data[0].addr);
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data = page_address(frags[0].page) +
++ 							frags[0].page_offset;
++ 			xdp.data_end = xdp.data + length;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (!mlx4_en_xmit_frame(frags, dev,
++ 							length, tx_index,
++ 							&doorbell_pending))
++ 					goto consumed;
++ 				break;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 			case XDP_DROP:
++ 				if (mlx4_en_rx_recycle(ring, frags))
++ 					goto consumed;
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+  						      MLX4_CQE_STATUS_UDP)) {
+@@@ -1079,7 -1156,20 +1135,22 @@@ void mlx4_en_calc_rx_buf(struct net_dev
+  	int buf_size = 0;
+  	int i = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* bpf requires buffers to be set up as 1 packet per page.
++ 	 * This only works when num_frags == 1.
++ 	 */
++ 	if (priv->xdp_ring_num) {
++ 		dma_dir = PCI_DMA_BIDIRECTIONAL;
++ 		/* This will gain efficient xdp frame recycling at the expense
++ 		 * of more costly truesize accounting
++ 		 */
++ 		align = PAGE_SIZE;
++ 		order = 0;
++ 	}
++ 
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  	while (buf_size < eff_mtu) {
+ -		priv->frag_info[i].order = order;
+  		priv->frag_info[i].frag_size =
+  			(eff_mtu > buf_size + frag_sizes[i]) ?
+  				frag_sizes[i] : eff_mtu - buf_size;
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index ee5e9137296c,29c81d26f9f5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -261,6 -263,14 +265,17 @@@ struct mlx4_en_rx_alloc 
+  	u32		page_size;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX4_EN_CACHE_SIZE (2 * NAPI_POLL_WEIGHT)
++ struct mlx4_en_page_cache {
++ 	u32 index;
++ 	struct mlx4_en_rx_alloc buf[MLX4_EN_CACHE_SIZE];
++ };
++ 
++ struct mlx4_en_priv;
++ 
+++>>>>>>> 9ecc2d86171a (net/mlx4_en: add xdp forwarding and data write support)
+  struct mlx4_en_tx_ring {
+  	/* cache line used and dirtied in tx completion
+  	 * (mlx4_en_free_tx_buf())
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index b3a7a69913f7..d7092023db8a 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -196,6 +196,7 @@ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
+ 	ring->last_nr_txbb = 1;
+ 	memset(ring->tx_info, 0, ring->size * sizeof(struct mlx4_en_tx_info));
+ 	memset(ring->buf, 0, ring->buf_size);
++	ring->free_tx_desc = mlx4_en_free_tx_desc;
+ 
+ 	ring->qp_state = MLX4_QP_STATE_RST;
+ 	ring->doorbell_qpn = cpu_to_be32(ring->qp.qpn << 8);
+@@ -265,10 +266,10 @@ static void mlx4_en_stamp_wqe(struct mlx4_en_priv *priv,
+ }
+ 
+ 
+-static u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
+-				struct mlx4_en_tx_ring *ring,
+-				int index, u8 owner, u64 timestamp,
+-				int napi_mode)
++u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
++			 struct mlx4_en_tx_ring *ring,
++			 int index, u8 owner, u64 timestamp,
++			 int napi_mode)
+ {
+ 	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
+ 	struct mlx4_en_tx_desc *tx_desc = ring->buf + index * TXBB_SIZE;
+@@ -344,6 +345,27 @@ static u32 mlx4_en_free_tx_desc(struct mlx4_en_priv *priv,
+ 	return tx_info->nr_txbb;
+ }
+ 
++u32 mlx4_en_recycle_tx_desc(struct mlx4_en_priv *priv,
++			    struct mlx4_en_tx_ring *ring,
++			    int index, u8 owner, u64 timestamp,
++			    int napi_mode)
++{
++	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
++	struct mlx4_en_rx_alloc frame = {
++		.page = tx_info->page,
++		.dma = tx_info->map0_dma,
++		.page_offset = 0,
++		.page_size = PAGE_SIZE,
++	};
++
++	if (!mlx4_en_rx_recycle(ring->recycle_ring, &frame)) {
++		dma_unmap_page(priv->ddev, tx_info->map0_dma,
++			       PAGE_SIZE, priv->frag_info[0].dma_dir);
++		put_page(tx_info->page);
++	}
++
++	return tx_info->nr_txbb;
++}
+ 
+ int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
+ {
+@@ -362,7 +384,7 @@ int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
+ 	}
+ 
+ 	while (ring->cons != ring->prod) {
+-		ring->last_nr_txbb = mlx4_en_free_tx_desc(priv, ring,
++		ring->last_nr_txbb = ring->free_tx_desc(priv, ring,
+ 						ring->cons & ring->size_mask,
+ 						!!(ring->cons & ring->size), 0,
+ 						0 /* Non-NAPI caller */);
+@@ -444,7 +466,7 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
+ 				timestamp = mlx4_en_get_cqe_ts(cqe);
+ 
+ 			/* free next descriptor */
+-			last_nr_txbb = mlx4_en_free_tx_desc(
++			last_nr_txbb = ring->free_tx_desc(
+ 					priv, ring, ring_index,
+ 					!!((ring_cons + txbbs_skipped) &
+ 					ring->size), timestamp, napi_budget);
+@@ -476,6 +498,9 @@ static bool mlx4_en_process_tx_cq(struct net_device *dev,
+ 	ACCESS_ONCE(ring->last_nr_txbb) = last_nr_txbb;
+ 	ACCESS_ONCE(ring->cons) = ring_cons + txbbs_skipped;
+ 
++	if (ring->free_tx_desc == mlx4_en_recycle_tx_desc)
++		return done < budget;
++
+ 	netdev_tx_completed_queue(ring->tx_queue, packets, bytes);
+ 
+ 	/* Wakeup Tx queue if this stopped, and ring is not full.
+@@ -1052,3 +1077,106 @@ tx_drop:
+ 	return NETDEV_TX_OK;
+ }
+ 
++netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_alloc *frame,
++			       struct net_device *dev, unsigned int length,
++			       int tx_ind, int *doorbell_pending)
++{
++	struct mlx4_en_priv *priv = netdev_priv(dev);
++	union mlx4_wqe_qpn_vlan	qpn_vlan = {};
++	struct mlx4_en_tx_ring *ring;
++	struct mlx4_en_tx_desc *tx_desc;
++	struct mlx4_wqe_data_seg *data;
++	struct mlx4_en_tx_info *tx_info;
++	int index, bf_index;
++	bool send_doorbell;
++	int nr_txbb = 1;
++	bool stop_queue;
++	dma_addr_t dma;
++	int real_size;
++	__be32 op_own;
++	u32 ring_cons;
++	bool bf_ok;
++
++	BUILD_BUG_ON_MSG(ALIGN(CTRL_SIZE + DS_SIZE, TXBB_SIZE) != TXBB_SIZE,
++			 "mlx4_en_xmit_frame requires minimum size tx desc");
++
++	ring = priv->tx_ring[tx_ind];
++
++	if (!priv->port_up)
++		goto tx_drop;
++
++	if (mlx4_en_is_tx_ring_full(ring))
++		goto tx_drop;
++
++	/* fetch ring->cons far ahead before needing it to avoid stall */
++	ring_cons = READ_ONCE(ring->cons);
++
++	index = ring->prod & ring->size_mask;
++	tx_info = &ring->tx_info[index];
++
++	bf_ok = ring->bf_enabled;
++
++	/* Track current inflight packets for performance analysis */
++	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++			 (u32)(ring->prod - ring_cons - 1));
++
++	bf_index = ring->prod;
++	tx_desc = ring->buf + index * TXBB_SIZE;
++	data = &tx_desc->data;
++
++	dma = frame->dma;
++
++	tx_info->page = frame->page;
++	frame->page = NULL;
++	tx_info->map0_dma = dma;
++	tx_info->map0_byte_count = length;
++	tx_info->nr_txbb = nr_txbb;
++	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++	tx_info->data_offset = (void *)data - (void *)tx_desc;
++	tx_info->ts_requested = 0;
++	tx_info->nr_maps = 1;
++	tx_info->linear = 1;
++	tx_info->inl = 0;
++
++	dma_sync_single_for_device(priv->ddev, dma, length, PCI_DMA_TODEVICE);
++
++	data->addr = cpu_to_be64(dma);
++	data->lkey = ring->mr_key;
++	dma_wmb();
++	data->byte_count = cpu_to_be32(length);
++
++	/* tx completion can avoid cache line miss for common cases */
++	tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++
++	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++		((ring->prod & ring->size) ?
++		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++
++	ring->packets++;
++	ring->bytes += tx_info->nr_bytes;
++	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++
++	ring->prod += nr_txbb;
++
++	stop_queue = mlx4_en_is_tx_ring_full(ring);
++	send_doorbell = stop_queue ||
++				*doorbell_pending > MLX4_EN_DOORBELL_BUDGET;
++	bf_ok &= send_doorbell;
++
++	real_size = ((CTRL_SIZE + nr_txbb * DS_SIZE) / 16) & 0x3f;
++
++	if (bf_ok)
++		qpn_vlan.bf_qpn = ring->doorbell_qpn | cpu_to_be32(real_size);
++	else
++		qpn_vlan.fence_size = real_size;
++
++	mlx4_en_tx_write_desc(ring, tx_desc, qpn_vlan, TXBB_SIZE, bf_index,
++			      op_own, bf_ok, send_doorbell);
++	*doorbell_pending = send_doorbell ? 0 : *doorbell_pending + 1;
++
++	return NETDEV_TX_OK;
++
++tx_drop:
++	ring->tx_dropped++;
++	return NETDEV_TX_BUSY;
++}
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
