@@ -1,0 +1,108 @@
+mlx4: avoid unnecessary dirtying of critical fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit dad42c3038a59d27fced28ee4ec1d4a891b28155
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dad42c30.failed
+
+While stressing a 40Gbit mlx4 NIC with busy polling, I found false
+sharing in mlx4 driver that can be easily avoided.
+
+This patch brings an additional 7 % performance improvement in UDP_RR
+workload.
+
+1) If we received no frame during one mlx4_en_process_rx_cq()
+   invocation, no need to call mlx4_cq_set_ci() and/or dirty ring->cons
+
+2) Do not refill rx buffers if we have plenty of them.
+   This avoids false sharing and allows some bulk/batch optimizations.
+   Page allocator and its locks will thank us.
+
+Finally, mlx4_en_poll_rx_cq() should not return 0 if it determined
+cpu handling NIC IRQ should be changed. We should return budget-1
+instead, to not fool net_rx_action() and its netdev_budget.
+
+v2: keep AVG_PERF_COUNTER(... polled) even if polled is 0
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dad42c3038a59d27fced28ee4ec1d4a891b28155)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 3629069532c8,6562f78b07f4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -990,12 -1085,21 +995,24 @@@ next
+  	}
+  
+  out:
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_unlock();
++ 
++ 	if (polled) {
++ 		if (doorbell_pending)
++ 			mlx4_en_xmit_doorbell(priv->tx_ring[TX_XDP][cq->ring]);
++ 
++ 		mlx4_cq_set_ci(&cq->mcq);
++ 		wmb(); /* ensure HW sees CQ consumer before we post new buffers */
++ 		ring->cons = cq->mcq.cons_index;
++ 	}
+++>>>>>>> dad42c3038a5 (mlx4: avoid unnecessary dirtying of critical fields)
+  	AVG_PERF_COUNTER(priv->pstats.rx_coal_avg, polled);
+- 	mlx4_cq_set_ci(&cq->mcq);
+- 	wmb(); /* ensure HW sees CQ consumer before we post new buffers */
+- 	ring->cons = cq->mcq.cons_index;
+- 	mlx4_en_refill_rx_buffers(priv, ring);
+- 	mlx4_en_update_rx_prod_db(ring);
++ 
++ 	if (mlx4_en_refill_rx_buffers(priv, ring))
++ 		mlx4_en_update_rx_prod_db(ring);
++ 
+  	return polled;
+  }
+  
+@@@ -1042,23 -1141,17 +1059,30 @@@ int mlx4_en_poll_rx_cq(struct napi_stru
+  			return budget;
+  
+  		/* Current cpu is not according to smp_irq_affinity -
+- 		 * probably affinity changed. need to stop this NAPI
+- 		 * poll, and restart it on the right CPU
++ 		 * probably affinity changed. Need to stop this NAPI
++ 		 * poll, and restart it on the right CPU.
++ 		 * Try to avoid returning a too small value (like 0),
++ 		 * to not fool net_rx_action() and its netdev_budget
+  		 */
+++<<<<<<< HEAD
+ +		done = 0;
+ +#else
+ +		if (cq->tot_rx < MLX4_EN_MIN_RX_ARM)
+ +			return budget;
+ +
+ +		cq->tot_rx = 0;
+ +		done = 0;
+ +	} else {
+ +		cq->tot_rx = 0;
+ +#endif
+++=======
++ 		if (done)
++ 			done--;
+++>>>>>>> dad42c3038a5 (mlx4: avoid unnecessary dirtying of critical fields)
+  	}
+  	/* Done for now */
+ -	if (napi_complete_done(napi, done))
+ -		mlx4_en_arm_cq(priv, cq);
+ +	napi_complete_done(napi, done);
+ +	mlx4_en_arm_cq(priv, cq);
+  	return done;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
