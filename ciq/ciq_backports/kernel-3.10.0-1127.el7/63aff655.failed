@@ -1,0 +1,132 @@
+kvm: x86: vmx: fix vpid leak
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Roman Kagan <rkagan@virtuozzo.com>
+commit 63aff65573d73eb8dda4732ad4ef222dd35e4862
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/63aff655.failed
+
+VPID for the nested vcpu is allocated at vmx_create_vcpu whenever nested
+vmx is turned on with the module parameter.
+
+However, it's only freed if the L1 guest has executed VMXON which is not
+a given.
+
+As a result, on a system with nested==on every creation+deletion of an
+L1 vcpu without running an L2 guest results in leaking one vpid.  Since
+the total number of vpids is limited to 64k, they can eventually get
+exhausted, preventing L2 from starting.
+
+Delay allocation of the L2 vpid until VMXON emulation, thus matching its
+freeing.
+
+Fixes: 5c614b3583e7b6dab0c86356fa36c2bcbb8322a0
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 63aff65573d73eb8dda4732ad4ef222dd35e4862)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 0288e33ce3ec,5d8e317c2b04..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -7288,43 -7956,43 +7288,45 @@@ static int handle_vmon(struct kvm_vcpu 
+  		return 1;
+  	}
+  
+ -	if (nested_vmx_get_vmptr(vcpu, &vmptr))
+ -		return 1;
+ +	r = alloc_loaded_vmcs(&vmx->nested.vmcs02);
+ +	if (r < 0)
+ +		goto out_vmcs02;
+  
+ -	/*
+ -	 * SDM 3: 24.11.5
+ -	 * The first 4 bytes of VMXON region contain the supported
+ -	 * VMCS revision identifier
+ -	 *
+ -	 * Note - IA32_VMX_BASIC[48] will never be 1 for the nested case;
+ -	 * which replaces physical address width with 32
+ -	 */
+ -	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu))) {
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ -	}
+ +	vmx->nested.cached_vmcs12 = kmalloc(VMCS12_SIZE, GFP_KERNEL);
+ +	if (!vmx->nested.cached_vmcs12)
+ +		goto out_cached_vmcs12;
+  
+ -	page = kvm_vcpu_gpa_to_page(vcpu, vmptr);
+ -	if (is_error_page(page)) {
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ -	}
+ -	if (*(u32 *)kmap(page) != VMCS12_REVISION) {
+ -		kunmap(page);
+ -		kvm_release_page_clean(page);
+ -		nested_vmx_failInvalid(vcpu);
+ -		return kvm_skip_emulated_instruction(vcpu);
+ +	if (enable_shadow_vmcs) {
+ +		shadow_vmcs = alloc_vmcs();
+ +		if (!shadow_vmcs)
+ +			goto out_shadow_vmcs;
+ +		/* mark vmcs as shadow */
+ +		shadow_vmcs->revision_id |= (1u << 31);
+ +		/* init shadow vmcs */
+ +		vmcs_clear(shadow_vmcs);
+ +		vmx->vmcs01.shadow_vmcs = shadow_vmcs;
+  	}
+ -	kunmap(page);
+ -	kvm_release_page_clean(page);
+  
+ -	vmx->nested.vmxon_ptr = vmptr;
+ -	ret = enter_vmx_operation(vcpu);
+ -	if (ret)
+ -		return ret;
+ +	hrtimer_init(&vmx->nested.preemption_timer, CLOCK_MONOTONIC,
+ +		     HRTIMER_MODE_REL);
+ +	vmx->nested.preemption_timer.function = vmx_preemption_timer_fn;
+ +
+++	vmx->nested.vpid02 = allocate_vpid();
+++
+ +	vmx->nested.vmxon = true;
+  
+ +	skip_emulated_instruction(vcpu);
+  	nested_vmx_succeed(vcpu);
+ -	return kvm_skip_emulated_instruction(vcpu);
+ +	return 1;
+ +
+ +out_shadow_vmcs:
+ +	kfree(vmx->nested.cached_vmcs12);
+ +
+ +out_cached_vmcs12:
+ +	free_loaded_vmcs(&vmx->nested.vmcs02);
+ +
+ +out_vmcs02:
+ +	return -ENOMEM;
+  }
+  
+  /*
+@@@ -9645,10 -10371,9 +9647,16 @@@ static struct kvm_vcpu *vmx_create_vcpu
+  			goto free_vmcs;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (nested) {
+ +		nested_vmx_setup_ctls_msrs(vmx);
+ +		vmx->nested.vpid02 = allocate_vpid();
+ +	}
+++=======
++ 	if (nested)
++ 		nested_vmx_setup_ctls_msrs(&vmx->nested.msrs,
++ 					   kvm_vcpu_apicv_active(&vmx->vcpu));
+++>>>>>>> 63aff65573d7 (kvm: x86: vmx: fix vpid leak)
+  
+  	vmx->nested.posted_intr_nv = -1;
+  	vmx->nested.current_vmptr = -1ull;
+* Unmerged path arch/x86/kvm/vmx.c
