@@ -1,0 +1,412 @@
+IB/mlx4: Fix possible vl/sl field mismatch in LRH header in QP1 packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jack Morgenstein <jackm@dev.mellanox.co.il>
+commit fd10ed8e6f4246ac5e18b921ba50562959502117
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fd10ed8e.failed
+
+In MLX qp packets, the LRH (built by the driver) has both a VL field
+and an SL field. When building a QP1 packet, the VL field should
+reflect the SLtoVL mapping and not arbitrarily contain zero (as is
+done now). This bug causes credit problems in IB switches at
+high rates of QP1 packets.
+
+The fix is to cache the SL to VL mapping in the driver, and look up
+the VL mapped to the SL provided in the send request when sending
+QP1 packets.
+
+For FW versions which support generating a port_management_config_change
+event with subtype sl-to-vl-table-change, the driver uses that event
+to update its sl-to-vl mapping cache.  Otherwise, the driver snoops
+incoming SMP mads to update the cache.
+
+There remains the case where the FW is running in secure-host mode
+(so no QP0 packets are delivered to the driver), and the FW does not
+generate the sl2vl mapping change event. To support this case, the
+driver updates (via querying the FW) its sl2vl mapping cache when
+running in secure-host mode when it receives either a Port Up event
+or a client-reregister event (where the port is still up, but there
+may have been an opensm failover).
+OpenSM modifies the sl2vl mapping before Port Up and Client-reregister
+events occur, so if there is a mapping change the driver's cache will
+be properly updated.
+
+Fixes: 225c7b1feef1 ("IB/mlx4: Add a driver Mellanox ConnectX InfiniBand adapters")
+	Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit fd10ed8e6f4246ac5e18b921ba50562959502117)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/fw.c
+#	include/linux/mlx4/device.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/fw.c
+index 07b41b238aa0,d87bbe65c2b0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/fw.c
++++ b/drivers/net/ethernet/mellanox/mlx4/fw.c
+@@@ -159,7 -159,7 +159,11 @@@ static void dump_dev_cap_flags2(struct 
+  		[32] = "Loopback source checks support",
+  		[33] = "RoCEv2 support",
+  		[34] = "DMFS Sniffer support (UC & MC)",
+++<<<<<<< HEAD
+ +		[35] = "QinQ VST mode support",
+++=======
++ 		[36] = "sl to vl mapping table change event support"
+++>>>>>>> fd10ed8e6f42 (IB/mlx4: Fix possible vl/sl field mismatch in LRH header in QP1 packets)
+  	};
+  	int i;
+  
+diff --cc include/linux/mlx4/device.h
+index 86285f3742a0,062d10aaf5cb..000000000000
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@@ -221,7 -222,7 +222,11 @@@ enum 
+  	MLX4_DEV_CAP_FLAG2_ROCE_V1_V2		= 1ULL <<  33,
+  	MLX4_DEV_CAP_FLAG2_DMFS_UC_MC_SNIFFER   = 1ULL <<  34,
+  	MLX4_DEV_CAP_FLAG2_DIAG_PER_PORT	= 1ULL <<  35,
+++<<<<<<< HEAD
+ +	MLX4_DEV_CAP_FLAG2_SVLAN_BY_QP          = 1ULL <<  36,
+++=======
++ 	MLX4_DEV_CAP_FLAG2_SL_TO_VL_CHANGE_EVENT = 1ULL << 36,
+++>>>>>>> fd10ed8e6f42 (IB/mlx4: Fix possible vl/sl field mismatch in LRH header in QP1 packets)
+  };
+  
+  enum {
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 812296249730..1202e588b170 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -230,6 +230,8 @@ static void smp_snoop(struct ib_device *ibdev, u8 port_num, const struct ib_mad
+ 	    mad->mad_hdr.method == IB_MGMT_METHOD_SET)
+ 		switch (mad->mad_hdr.attr_id) {
+ 		case IB_SMP_ATTR_PORT_INFO:
++			if (dev->dev->caps.flags & MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV)
++				return;
+ 			pinfo = (struct ib_port_info *) ((struct ib_smp *) mad)->data;
+ 			lid = be16_to_cpu(pinfo->lid);
+ 
+@@ -245,6 +247,8 @@ static void smp_snoop(struct ib_device *ibdev, u8 port_num, const struct ib_mad
+ 			break;
+ 
+ 		case IB_SMP_ATTR_PKEY_TABLE:
++			if (dev->dev->caps.flags & MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV)
++				return;
+ 			if (!mlx4_is_mfunc(dev->dev)) {
+ 				mlx4_ib_dispatch_event(dev, port_num,
+ 						       IB_EVENT_PKEY_CHANGE);
+@@ -281,6 +285,8 @@ static void smp_snoop(struct ib_device *ibdev, u8 port_num, const struct ib_mad
+ 			break;
+ 
+ 		case IB_SMP_ATTR_GUID_INFO:
++			if (dev->dev->caps.flags & MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV)
++				return;
+ 			/* paravirtualized master's guid is guid 0 -- does not change */
+ 			if (!mlx4_is_master(dev->dev))
+ 				mlx4_ib_dispatch_event(dev, port_num,
+@@ -296,6 +302,26 @@ static void smp_snoop(struct ib_device *ibdev, u8 port_num, const struct ib_mad
+ 			}
+ 			break;
+ 
++		case IB_SMP_ATTR_SL_TO_VL_TABLE:
++			/* cache sl to vl mapping changes for use in
++			 * filling QP1 LRH VL field when sending packets
++			 */
++			if (dev->dev->caps.flags & MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV &&
++			    dev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SL_TO_VL_CHANGE_EVENT)
++				return;
++			if (!mlx4_is_slave(dev->dev)) {
++				union sl2vl_tbl_to_u64 sl2vl64;
++				int jj;
++
++				for (jj = 0; jj < 8; jj++) {
++					sl2vl64.sl8[jj] = ((struct ib_smp *)mad)->data[jj];
++					pr_debug("port %u, sl2vl[%d] = %02x\n",
++						 port_num, jj, sl2vl64.sl8[jj]);
++				}
++				atomic64_set(&dev->sl2vl[port_num - 1], sl2vl64.sl64);
++			}
++			break;
++
+ 		default:
+ 			break;
+ 		}
+@@ -806,8 +832,7 @@ static int ib_process_mad(struct ib_device *ibdev, int mad_flags, u8 port_num,
+ 		return IB_MAD_RESULT_FAILURE;
+ 
+ 	if (!out_mad->mad_hdr.status) {
+-		if (!(to_mdev(ibdev)->dev->caps.flags & MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV))
+-			smp_snoop(ibdev, port_num, in_mad, prev_lid);
++		smp_snoop(ibdev, port_num, in_mad, prev_lid);
+ 		/* slaves get node desc from FW */
+ 		if (!mlx4_is_slave(to_mdev(ibdev)->dev))
+ 			node_desc_override(ibdev, out_mad);
+@@ -1038,6 +1063,23 @@ static void handle_client_rereg_event(struct mlx4_ib_dev *dev, u8 port_num)
+ 						    MLX4_EQ_PORT_INFO_CLIENT_REREG_MASK);
+ 		}
+ 	}
++
++	/* Update the sl to vl table from inside client rereg
++	 * only if in secure-host mode (snooping is not possible)
++	 * and the sl-to-vl change event is not generated by FW.
++	 */
++	if (!mlx4_is_slave(dev->dev) &&
++	    dev->dev->flags & MLX4_FLAG_SECURE_HOST &&
++	    !(dev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SL_TO_VL_CHANGE_EVENT)) {
++		if (mlx4_is_master(dev->dev))
++			/* already in work queue from mlx4_ib_event queueing
++			 * mlx4_handle_port_mgmt_change_event, which calls
++			 * this procedure. Therefore, call sl2vl_update directly.
++			 */
++			mlx4_ib_sl2vl_update(dev, port_num);
++		else
++			mlx4_sched_ib_sl2vl_update_work(dev, port_num);
++	}
+ 	mlx4_ib_dispatch_event(dev, port_num, IB_EVENT_CLIENT_REREGISTER);
+ }
+ 
+@@ -1177,6 +1219,24 @@ void handle_port_mgmt_change_event(struct work_struct *work)
+ 			handle_slaves_guid_change(dev, port, tbl_block, change_bitmap);
+ 		}
+ 		break;
++
++	case MLX4_DEV_PMC_SUBTYPE_SL_TO_VL_MAP:
++		/* cache sl to vl mapping changes for use in
++		 * filling QP1 LRH VL field when sending packets
++		 */
++		if (!mlx4_is_slave(dev->dev)) {
++			union sl2vl_tbl_to_u64 sl2vl64;
++			int jj;
++
++			for (jj = 0; jj < 8; jj++) {
++				sl2vl64.sl8[jj] =
++					eqe->event.port_mgmt_change.params.sl2vl_tbl_change_info.sl2vl_table[jj];
++				pr_debug("port %u, sl2vl[%d] = %02x\n",
++					 port, jj, sl2vl64.sl8[jj]);
++			}
++			atomic64_set(&dev->sl2vl[port - 1], sl2vl64.sl64);
++		}
++		break;
+ 	default:
+ 		pr_warn("Unsupported subtype 0x%x for "
+ 			"Port Management Change event\n", eqe->subtype);
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index 8b278beb4f4c..3bb616229b0c 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -832,6 +832,66 @@ static int mlx4_ib_query_gid(struct ib_device *ibdev, u8 port, int index,
+ 	return ret;
+ }
+ 
++static int mlx4_ib_query_sl2vl(struct ib_device *ibdev, u8 port, u64 *sl2vl_tbl)
++{
++	union sl2vl_tbl_to_u64 sl2vl64;
++	struct ib_smp *in_mad  = NULL;
++	struct ib_smp *out_mad = NULL;
++	int mad_ifc_flags = MLX4_MAD_IFC_IGNORE_KEYS;
++	int err = -ENOMEM;
++	int jj;
++
++	if (mlx4_is_slave(to_mdev(ibdev)->dev)) {
++		*sl2vl_tbl = 0;
++		return 0;
++	}
++
++	in_mad  = kzalloc(sizeof(*in_mad), GFP_KERNEL);
++	out_mad = kmalloc(sizeof(*out_mad), GFP_KERNEL);
++	if (!in_mad || !out_mad)
++		goto out;
++
++	init_query_mad(in_mad);
++	in_mad->attr_id  = IB_SMP_ATTR_SL_TO_VL_TABLE;
++	in_mad->attr_mod = 0;
++
++	if (mlx4_is_mfunc(to_mdev(ibdev)->dev))
++		mad_ifc_flags |= MLX4_MAD_IFC_NET_VIEW;
++
++	err = mlx4_MAD_IFC(to_mdev(ibdev), mad_ifc_flags, port, NULL, NULL,
++			   in_mad, out_mad);
++	if (err)
++		goto out;
++
++	for (jj = 0; jj < 8; jj++)
++		sl2vl64.sl8[jj] = ((struct ib_smp *)out_mad)->data[jj];
++	*sl2vl_tbl = sl2vl64.sl64;
++
++out:
++	kfree(in_mad);
++	kfree(out_mad);
++	return err;
++}
++
++static void mlx4_init_sl2vl_tbl(struct mlx4_ib_dev *mdev)
++{
++	u64 sl2vl;
++	int i;
++	int err;
++
++	for (i = 1; i <= mdev->dev->caps.num_ports; i++) {
++		if (mdev->dev->caps.port_type[i] == MLX4_PORT_TYPE_ETH)
++			continue;
++		err = mlx4_ib_query_sl2vl(&mdev->ib_dev, i, &sl2vl);
++		if (err) {
++			pr_err("Unable to get default sl to vl mapping for port %d.  Using all zeroes (%d)\n",
++			       i, err);
++			sl2vl = 0;
++		}
++		atomic64_set(&mdev->sl2vl[i - 1], sl2vl);
++	}
++}
++
+ int __mlx4_ib_query_pkey(struct ib_device *ibdev, u8 port, u16 index,
+ 			 u16 *pkey, int netw_view)
+ {
+@@ -2679,6 +2739,7 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+ 
+ 	if (init_node_data(ibdev))
+ 		goto err_map;
++	mlx4_init_sl2vl_tbl(ibdev);
+ 
+ 	for (i = 0; i < ibdev->num_ports; ++i) {
+ 		mutex_init(&ibdev->counters_table[i].mutex);
+@@ -3127,6 +3188,47 @@ static void handle_bonded_port_state_event(struct work_struct *work)
+ 	ib_dispatch_event(&ibev);
+ }
+ 
++void mlx4_ib_sl2vl_update(struct mlx4_ib_dev *mdev, int port)
++{
++	u64 sl2vl;
++	int err;
++
++	err = mlx4_ib_query_sl2vl(&mdev->ib_dev, port, &sl2vl);
++	if (err) {
++		pr_err("Unable to get current sl to vl mapping for port %d.  Using all zeroes (%d)\n",
++		       port, err);
++		sl2vl = 0;
++	}
++	atomic64_set(&mdev->sl2vl[port - 1], sl2vl);
++}
++
++static void ib_sl2vl_update_work(struct work_struct *work)
++{
++	struct ib_event_work *ew = container_of(work, struct ib_event_work, work);
++	struct mlx4_ib_dev *mdev = ew->ib_dev;
++	int port = ew->port;
++
++	mlx4_ib_sl2vl_update(mdev, port);
++
++	kfree(ew);
++}
++
++void mlx4_sched_ib_sl2vl_update_work(struct mlx4_ib_dev *ibdev,
++				     int port)
++{
++	struct ib_event_work *ew;
++
++	ew = kmalloc(sizeof(*ew), GFP_ATOMIC);
++	if (ew) {
++		INIT_WORK(&ew->work, ib_sl2vl_update_work);
++		ew->port = port;
++		ew->ib_dev = ibdev;
++		queue_work(wq, &ew->work);
++	} else {
++		pr_err("failed to allocate memory for sl2vl update work\n");
++	}
++}
++
+ static void mlx4_ib_event(struct mlx4_dev *dev, void *ibdev_ptr,
+ 			  enum mlx4_dev_event event, unsigned long param)
+ {
+@@ -3157,10 +3259,14 @@ static void mlx4_ib_event(struct mlx4_dev *dev, void *ibdev_ptr,
+ 	case MLX4_DEV_EVENT_PORT_UP:
+ 		if (p > ibdev->num_ports)
+ 			return;
+-		if (mlx4_is_master(dev) &&
++		if (!mlx4_is_slave(dev) &&
+ 		    rdma_port_get_link_layer(&ibdev->ib_dev, p) ==
+ 			IB_LINK_LAYER_INFINIBAND) {
+-			mlx4_ib_invalidate_all_guid_record(ibdev, p);
++			if (mlx4_is_master(dev))
++				mlx4_ib_invalidate_all_guid_record(ibdev, p);
++			if (ibdev->dev->flags & MLX4_FLAG_SECURE_HOST &&
++			    !(ibdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SL_TO_VL_CHANGE_EVENT))
++				mlx4_sched_ib_sl2vl_update_work(ibdev, p);
+ 		}
+ 		ibev.event = IB_EVENT_PORT_ACTIVE;
+ 		break;
+diff --git a/drivers/infiniband/hw/mlx4/mlx4_ib.h b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+index 686ab48ff644..35141f451e5c 100644
+--- a/drivers/infiniband/hw/mlx4/mlx4_ib.h
++++ b/drivers/infiniband/hw/mlx4/mlx4_ib.h
+@@ -570,6 +570,7 @@ struct mlx4_ib_dev {
+ 	struct ib_mad_agent    *send_agent[MLX4_MAX_PORTS][2];
+ 	struct ib_ah	       *sm_ah[MLX4_MAX_PORTS];
+ 	spinlock_t		sm_lock;
++	atomic64_t		sl2vl[MLX4_MAX_PORTS];
+ 	struct mlx4_ib_sriov	sriov;
+ 
+ 	struct mutex		cap_mask_mutex;
+@@ -600,6 +601,7 @@ struct ib_event_work {
+ 	struct work_struct	work;
+ 	struct mlx4_ib_dev	*ib_dev;
+ 	struct mlx4_eqe		ib_eqe;
++	int			port;
+ };
+ 
+ struct mlx4_ib_qp_tunnel_init_attr {
+@@ -883,4 +885,9 @@ int mlx4_ib_rereg_user_mr(struct ib_mr *mr, int flags,
+ int mlx4_ib_gid_index_to_real_index(struct mlx4_ib_dev *ibdev,
+ 				    u8 port_num, int index);
+ 
++void mlx4_sched_ib_sl2vl_update_work(struct mlx4_ib_dev *ibdev,
++				     int port);
++
++void mlx4_ib_sl2vl_update(struct mlx4_ib_dev *mdev, int port);
++
+ #endif /* MLX4_IB_H */
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 7fb9629bd12b..19cee231272a 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2405,6 +2405,22 @@ static int build_sriov_qp0_header(struct mlx4_ib_sqp *sqp,
+ 	return 0;
+ }
+ 
++static u8 sl_to_vl(struct mlx4_ib_dev *dev, u8 sl, int port_num)
++{
++	union sl2vl_tbl_to_u64 tmp_vltab;
++	u8 vl;
++
++	if (sl > 15)
++		return 0xf;
++	tmp_vltab.sl64 = atomic64_read(&dev->sl2vl[port_num - 1]);
++	vl = tmp_vltab.sl8[sl >> 1];
++	if (sl & 1)
++		vl &= 0x0f;
++	else
++		vl >>= 4;
++	return vl;
++}
++
+ #define MLX4_ROCEV2_QP1_SPORT 0xC000
+ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_ud_wr *wr,
+ 			    void *wqe, unsigned *mlx_seg_len)
+@@ -2590,7 +2606,12 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_ud_wr *wr,
+ 			sqp->ud_header.vlan.tag = cpu_to_be16(vlan | pcp);
+ 		}
+ 	} else {
+-		sqp->ud_header.lrh.virtual_lane    = !sqp->qp.ibqp.qp_num ? 15 : 0;
++		sqp->ud_header.lrh.virtual_lane    = !sqp->qp.ibqp.qp_num ? 15 :
++							sl_to_vl(to_mdev(ib_dev),
++								 sqp->ud_header.lrh.service_level,
++								 sqp->qp.port);
++		if (sqp->qp.ibqp.qp_num && sqp->ud_header.lrh.virtual_lane == 15)
++			return -EINVAL;
+ 		if (sqp->ud_header.lrh.destination_lid == IB_LID_PERMISSIVE)
+ 			sqp->ud_header.lrh.source_lid = IB_LID_PERMISSIVE;
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/fw.c
+* Unmerged path include/linux/mlx4/device.h
