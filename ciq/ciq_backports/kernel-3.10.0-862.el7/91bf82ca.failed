@@ -1,0 +1,347 @@
+nfp: add support for tx/rx with metadata portid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Simon Horman <simon.horman@netronome.com>
+commit 91bf82ca9eed1aa3e700a1b9fcaaa7922df6a4c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/91bf82ca.failed
+
+Allow tx/rx with metadata port id. This will be used for tx/rx of
+representor netdevs acting as upper-devices while a pf netdev acts
+as a lower-device.
+
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 91bf82ca9eed1aa3e700a1b9fcaaa7922df6a4c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,b1fa77bd708b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -275,6 -311,17 +275,20 @@@ struct nfp_net_rx_desc 
+  	};
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_NET_META_FIELD_MASK GENMASK(NFP_NET_META_FIELD_SIZE - 1, 0)
++ 
++ struct nfp_meta_parsed {
++ 	u8 hash_type;
++ 	u8 csum_type;
++ 	u32 hash;
++ 	u32 mark;
++ 	u32 portid;
++ 	__wsum csum;
++ };
++ 
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  struct nfp_net_rx_hash {
+  	__be32 hash_type;
+  	__be32 hash;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7,2e728543e840..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -730,6 -748,33 +730,36 @@@ static void nfp_net_tx_csum(struct nfp_
+  	u64_stats_update_end(&r_vec->tx_sync);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nfp_net_tx_xmit_more_flush(struct nfp_net_tx_ring *tx_ring)
++ {
++ 	wmb();
++ 	nfp_qcp_wr_ptr_add(tx_ring->qcp_q, tx_ring->wr_ptr_add);
++ 	tx_ring->wr_ptr_add = 0;
++ }
++ 
++ static int nfp_net_prep_port_id(struct sk_buff *skb)
++ {
++ 	struct metadata_dst *md_dst = skb_metadata_dst(skb);
++ 	unsigned char *data;
++ 
++ 	if (likely(!md_dst))
++ 		return 0;
++ 	if (unlikely(md_dst->type != METADATA_HW_PORT_MUX))
++ 		return 0;
++ 
++ 	if (unlikely(skb_cow_head(skb, 8)))
++ 		return -ENOMEM;
++ 
++ 	data = skb_push(skb, 8);
++ 	put_unaligned_be32(NFP_NET_META_PORTID, data);
++ 	put_unaligned_be32(md_dst->u.port_info.port_id, data + 4);
++ 
++ 	return 8;
++ }
++ 
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  /**
+   * nfp_net_tx() - Main transmit entry point
+   * @skb:    SKB to transmit
+@@@ -746,16 -792,16 +777,14 @@@ static int nfp_net_tx(struct sk_buff *s
+  	struct nfp_net_r_vector *r_vec;
+  	struct nfp_net_tx_buf *txbuf;
+  	struct netdev_queue *nd_q;
+ -	struct nfp_net_dp *dp;
+  	dma_addr_t dma_addr;
+  	unsigned int fsize;
+- 	int f, nr_frags;
+- 	int wr_idx;
+  	u16 qidx;
+  
+ -	dp = &nn->dp;
+  	qidx = skb_get_queue_mapping(skb);
+ -	tx_ring = &dp->tx_rings[qidx];
+ +	tx_ring = &nn->tx_rings[qidx];
+  	r_vec = tx_ring->r_vec;
+ -	nd_q = netdev_get_tx_queue(dp->netdev, qidx);
+ +	nd_q = netdev_get_tx_queue(nn->netdev, qidx);
+  
+  	nr_frags = skb_shinfo(skb)->nr_frags;
+  
+@@@ -769,13 -816,20 +798,20 @@@
+  		return NETDEV_TX_BUSY;
+  	}
+  
++ 	md_bytes = nfp_net_prep_port_id(skb);
++ 	if (unlikely(md_bytes < 0)) {
++ 		nfp_net_tx_xmit_more_flush(tx_ring);
++ 		dev_kfree_skb_any(skb);
++ 		return NETDEV_TX_OK;
++ 	}
++ 
+  	/* Start with the head skbuf */
+ -	dma_addr = dma_map_single(dp->dev, skb->data, skb_headlen(skb),
+ +	dma_addr = dma_map_single(&nn->pdev->dev, skb->data, skb_headlen(skb),
+  				  DMA_TO_DEVICE);
+ -	if (dma_mapping_error(dp->dev, dma_addr))
+ +	if (dma_mapping_error(&nn->pdev->dev, dma_addr))
+  		goto err_free;
+  
+ -	wr_idx = D_IDX(tx_ring, tx_ring->wr_p);
+ +	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
+  
+  	/* Stash the soft descriptor of the head then initialize it */
+  	txbuf = &tx_ring->txbufs[wr_idx];
+@@@ -1341,9 -1450,50 +1377,52 @@@ nfp_net_set_hash_desc(struct net_devic
+  	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+  		return;
+  
+ -	nfp_net_set_hash(netdev, meta, get_unaligned_be32(&rx_hash->hash_type),
+ -			 &rx_hash->hash);
+ -}
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+  
+++<<<<<<< HEAD
+ +	nfp_net_set_hash(netdev, skb, rxd);
+++=======
++ static void *
++ nfp_net_parse_meta(struct net_device *netdev, struct nfp_meta_parsed *meta,
++ 		   void *data, int meta_len)
++ {
++ 	u32 meta_info;
++ 
++ 	meta_info = get_unaligned_be32(data);
++ 	data += 4;
++ 
++ 	while (meta_info) {
++ 		switch (meta_info & NFP_NET_META_FIELD_MASK) {
++ 		case NFP_NET_META_HASH:
++ 			meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 			nfp_net_set_hash(netdev, meta,
++ 					 meta_info & NFP_NET_META_FIELD_MASK,
++ 					 (__be32 *)data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_MARK:
++ 			meta->mark = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_PORTID:
++ 			meta->portid = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_CSUM:
++ 			meta->csum_type = CHECKSUM_COMPLETE;
++ 			meta->csum =
++ 				(__force __wsum)__get_unaligned_cpu32(data);
++ 			data += 4;
++ 			break;
++ 		default:
++ 			return NULL;
++ 		}
++ 
++ 		meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 	}
++ 
++ 	return data;
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  }
+  
+  static void
+@@@ -1384,10 -1614,17 +1463,15 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	int pkts_polled = 0;
+  	int idx;
+  
+ -	rcu_read_lock();
+ -	xdp_prog = READ_ONCE(dp->xdp_prog);
+ -	true_bufsz = xdp_prog ? PAGE_SIZE : dp->fl_bufsz;
+ -	tx_ring = r_vec->xdp_ring;
+ -
+  	while (pkts_polled < budget) {
+ -		unsigned int meta_len, data_len, meta_off, pkt_len, pkt_off;
+ +		unsigned int meta_len, data_len, data_off, pkt_len, pkt_off;
+  		struct nfp_net_rx_buf *rxbuf;
+  		struct nfp_net_rx_desc *rxd;
+++<<<<<<< HEAD
+++=======
++ 		struct nfp_meta_parsed meta;
++ 		struct net_device *netdev;
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  		dma_addr_t new_dma_addr;
+  		void *new_frag;
+  
+@@@ -1434,34 -1674,109 +1518,124 @@@
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		if (unlikely(meta_len > NFP_NET_MAX_PREPEND ||
++ 			     (dp->rx_offset && meta_len > dp->rx_offset))) {
++ 			nn_dp_warn(dp, "oversized RX packet metadata %u\n",
++ 				   meta_len);
++ 			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 
++ 		nfp_net_dma_sync_cpu_rx(dp, rxbuf->dma_addr + meta_off,
++ 					data_len);
++ 
++ 		if (!dp->chained_metadata_format) {
++ 			nfp_net_set_hash_desc(dp->netdev, &meta,
++ 					      rxbuf->frag + meta_off, rxd);
++ 		} else if (meta_len) {
++ 			void *end;
++ 
++ 			end = nfp_net_parse_meta(dp->netdev, &meta,
++ 						 rxbuf->frag + meta_off,
++ 						 meta_len);
++ 			if (unlikely(end != rxbuf->frag + pkt_off)) {
++ 				nn_dp_warn(dp, "invalid RX packet metadata\n");
++ 				nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf,
++ 						NULL);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  dp->bpf_offload_xdp) && !meta.portid) {
++ 			unsigned int dma_off;
++ 			void *hard_start;
++ 			int act;
++ 
++ 			hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
++ 
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag, hard_start,
++ 					      &pkt_off, &pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				dma_off = pkt_off - NFP_NET_RX_BUF_HEADROOM;
++ 				if (unlikely(!nfp_net_tx_xdp_buf(dp, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 dma_off,
++ 								 pkt_len,
++ 								 &xdp_tx_cmpl)))
++ 					trace_xdp_exception(dp->netdev,
++ 							    xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 				/* fall through */
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dp->netdev, xdp_prog, act);
++ 				/* fall through */
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(dp, rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  		if (unlikely(!skb)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+  		}
+ -		new_frag = nfp_net_napi_alloc_one(dp, &new_dma_addr);
+ +
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+ +
+ +		new_frag = nfp_net_napi_alloc_one(nn, &new_dma_addr);
+  		if (unlikely(!new_frag)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, skb);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+++=======
++ 		if (likely(!meta.portid)) {
++ 			netdev = dp->netdev;
++ 		} else {
++ 			struct nfp_net *nn;
++ 
++ 			nn = netdev_priv(dp->netdev);
++ 			netdev = nfp_app_repr_get(nn->app, meta.portid);
++ 			if (unlikely(!netdev)) {
++ 				nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, skb);
++ 				continue;
++ 			}
++ 			nfp_repr_inc_rx_stats(netdev, pkt_len);
++ 		}
++ 
++ 		nfp_net_dma_unmap_rx(dp, rxbuf->dma_addr);
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  
+ -		nfp_net_rx_give_one(dp, rx_ring, new_frag, new_dma_addr);
+ +		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+  
+ -		skb_reserve(skb, pkt_off);
+ +		skb_reserve(skb, data_off);
+  		skb_put(skb, pkt_len);
+  
+ -		skb->mark = meta.mark;
+ -		skb_set_hash(skb, meta.hash, meta.hash_type);
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+++<<<<<<< HEAD
+ +		skb->protocol = eth_type_trans(skb, nn->netdev);
+++=======
++ 		skb->protocol = eth_type_trans(skb, netdev);
+++>>>>>>> 91bf82ca9eed (nfp: add support for tx/rx with metadata portid)
+  
+ -		nfp_net_rx_csum(dp, r_vec, rxd, &meta, skb);
+ +		nfp_net_rx_csum(nn, r_vec, rxd, skb);
+  
+  		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
