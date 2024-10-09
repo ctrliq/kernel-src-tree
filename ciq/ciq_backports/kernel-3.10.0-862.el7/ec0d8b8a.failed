@@ -1,0 +1,256 @@
+IB/hfi1: Stricter bounds checking of MAD trap index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kamenee Arumugame <kamenee.arumugam@intel.com>
+commit ec0d8b8a63ee760bca1bccc6769d6210e05ded29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ec0d8b8a.failed
+
+The macro size is valid. This change makes it less ambiguous.
+Bounds check trap type for better security.
+
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Kamenee Arumugam <kamenee.arumugam@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ec0d8b8a63ee760bca1bccc6769d6210e05ded29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/mad.c
+#	include/rdma/rdma_vt.h
+diff --cc drivers/infiniband/hw/hfi1/mad.c
+index d59426fb9866,661ba707fc60..000000000000
+--- a/drivers/infiniband/hw/hfi1/mad.c
++++ b/drivers/infiniband/hw/hfi1/mad.c
+@@@ -97,7 -108,199 +97,203 @@@ void hfi1_event_pkey_change(struct hfi1
+  	ib_dispatch_event(&event);
+  }
+  
+++<<<<<<< HEAD
+ +static void send_trap(struct hfi1_ibport *ibp, void *data, unsigned len)
+++=======
++ /*
++  * If the port is down, clean up all pending traps.  We need to be careful
++  * with the given trap, because it may be queued.
++  */
++ static void cleanup_traps(struct hfi1_ibport *ibp, struct trap_node *trap)
++ {
++ 	struct trap_node *node, *q;
++ 	unsigned long flags;
++ 	struct list_head trap_list;
++ 	int i;
++ 
++ 	for (i = 0; i < RVT_MAX_TRAP_LISTS; i++) {
++ 		spin_lock_irqsave(&ibp->rvp.lock, flags);
++ 		list_replace_init(&ibp->rvp.trap_lists[i].list, &trap_list);
++ 		ibp->rvp.trap_lists[i].list_len = 0;
++ 		spin_unlock_irqrestore(&ibp->rvp.lock, flags);
++ 
++ 		/*
++ 		 * Remove all items from the list, freeing all the non-given
++ 		 * traps.
++ 		 */
++ 		list_for_each_entry_safe(node, q, &trap_list, list) {
++ 			list_del(&node->list);
++ 			if (node != trap)
++ 				kfree(node);
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * If this wasn't on one of the lists it would not be freed.  If it
++ 	 * was on the list, it is now safe to free.
++ 	 */
++ 	kfree(trap);
++ }
++ 
++ static struct trap_node *check_and_add_trap(struct hfi1_ibport *ibp,
++ 					    struct trap_node *trap)
++ {
++ 	struct trap_node *node;
++ 	struct trap_list *trap_list;
++ 	unsigned long flags;
++ 	unsigned long timeout;
++ 	int found = 0;
++ 	unsigned int queue_id;
++ 	static int trap_count;
++ 
++ 	queue_id = trap->data.generic_type & 0x0F;
++ 	if (queue_id >= RVT_MAX_TRAP_LISTS) {
++ 		trap_count++;
++ 		pr_err_ratelimited("hfi1: Invalid trap 0x%0x dropped. Total dropped: %d\n",
++ 				  trap->data.generic_type, trap_count);
++ 		kfree(trap);
++ 		return NULL;
++ 	}
++ 
++ 	/*
++ 	 * Since the retry (handle timeout) does not remove a trap request
++ 	 * from the list, all we have to do is compare the node.
++ 	 */
++ 	spin_lock_irqsave(&ibp->rvp.lock, flags);
++ 	trap_list = &ibp->rvp.trap_lists[queue_id];
++ 
++ 	list_for_each_entry(node, &trap_list->list, list) {
++ 		if (node == trap) {
++ 			node->retry++;
++ 			found = 1;
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* If it is not on the list, add it, limited to RVT-MAX_TRAP_LEN. */
++ 	if (!found) {
++ 		if (trap_list->list_len < RVT_MAX_TRAP_LEN) {
++ 			trap_list->list_len++;
++ 			list_add_tail(&trap->list, &trap_list->list);
++ 		} else {
++ 			pr_warn_ratelimited("hfi1: Maximum trap limit reached for 0x%0x traps\n",
++ 					    trap->data.generic_type);
++ 			kfree(trap);
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Next check to see if there is a timer pending.  If not, set it up
++ 	 * and get the first trap from the list.
++ 	 */
++ 	node = NULL;
++ 	if (!timer_pending(&ibp->rvp.trap_timer)) {
++ 		/*
++ 		 * o14-2
++ 		 * If the time out is set we have to wait until it expires
++ 		 * before the trap can be sent.
++ 		 * This should be > RVT_TRAP_TIMEOUT
++ 		 */
++ 		timeout = (RVT_TRAP_TIMEOUT *
++ 			   (1UL << ibp->rvp.subnet_timeout)) / 1000;
++ 		mod_timer(&ibp->rvp.trap_timer,
++ 			  jiffies + usecs_to_jiffies(timeout));
++ 		node = list_first_entry(&trap_list->list, struct trap_node,
++ 					list);
++ 		node->in_use = 1;
++ 	}
++ 	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
++ 
++ 	return node;
++ }
++ 
++ static void subn_handle_opa_trap_repress(struct hfi1_ibport *ibp,
++ 					 struct opa_smp *smp)
++ {
++ 	struct trap_list *trap_list;
++ 	struct trap_node *trap;
++ 	unsigned long flags;
++ 	int i;
++ 
++ 	if (smp->attr_id != IB_SMP_ATTR_NOTICE)
++ 		return;
++ 
++ 	spin_lock_irqsave(&ibp->rvp.lock, flags);
++ 	for (i = 0; i < RVT_MAX_TRAP_LISTS; i++) {
++ 		trap_list = &ibp->rvp.trap_lists[i];
++ 		trap = list_first_entry_or_null(&trap_list->list,
++ 						struct trap_node, list);
++ 		if (trap && trap->tid == smp->tid) {
++ 			if (trap->in_use) {
++ 				trap->repress = 1;
++ 			} else {
++ 				trap_list->list_len--;
++ 				list_del(&trap->list);
++ 				kfree(trap);
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&ibp->rvp.lock, flags);
++ }
++ 
++ static void hfi1_update_sm_ah_attr(struct hfi1_ibport *ibp,
++ 				   struct rdma_ah_attr *attr, u32 dlid)
++ {
++ 	rdma_ah_set_dlid(attr, dlid);
++ 	rdma_ah_set_port_num(attr, ppd_from_ibp(ibp)->port);
++ 	if (dlid >= be16_to_cpu(IB_MULTICAST_LID_BASE)) {
++ 		struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
++ 
++ 		rdma_ah_set_ah_flags(attr, IB_AH_GRH);
++ 		grh->sgid_index = 0;
++ 		grh->hop_limit = 1;
++ 		grh->dgid.global.subnet_prefix =
++ 			ibp->rvp.gid_prefix;
++ 		grh->dgid.global.interface_id = OPA_MAKE_ID(dlid);
++ 	}
++ }
++ 
++ static int hfi1_modify_qp0_ah(struct hfi1_ibport *ibp,
++ 			      struct rvt_ah *ah, u32 dlid)
++ {
++ 	struct rdma_ah_attr attr;
++ 	struct rvt_qp *qp0;
++ 	int ret = -EINVAL;
++ 
++ 	memset(&attr, 0, sizeof(attr));
++ 	attr.type = ah->ibah.type;
++ 	hfi1_update_sm_ah_attr(ibp, &attr, dlid);
++ 	rcu_read_lock();
++ 	qp0 = rcu_dereference(ibp->rvp.qp[0]);
++ 	if (qp0)
++ 		ret = rdma_modify_ah(&ah->ibah, &attr);
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ 
++ static struct ib_ah *hfi1_create_qp0_ah(struct hfi1_ibport *ibp, u32 dlid)
++ {
++ 	struct rdma_ah_attr attr;
++ 	struct ib_ah *ah = ERR_PTR(-EINVAL);
++ 	struct rvt_qp *qp0;
++ 	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
++ 	struct hfi1_devdata *dd = dd_from_ppd(ppd);
++ 	u8 port_num = ppd->port;
++ 
++ 	memset(&attr, 0, sizeof(attr));
++ 	attr.type = rdma_ah_find_type(&dd->verbs_dev.rdi.ibdev, port_num);
++ 	hfi1_update_sm_ah_attr(ibp, &attr, dlid);
++ 	rcu_read_lock();
++ 	qp0 = rcu_dereference(ibp->rvp.qp[0]);
++ 	if (qp0)
++ 		ah = rdma_create_ah(qp0->ibqp.pd, &attr);
++ 	rcu_read_unlock();
++ 	return ah;
++ }
++ 
++ static void send_trap(struct hfi1_ibport *ibp, struct trap_node *trap)
+++>>>>>>> ec0d8b8a63ee (IB/hfi1: Stricter bounds checking of MAD trap index)
+  {
+  	struct ib_mad_send_buf *send_buf;
+  	struct ib_mad_agent *agent;
+diff --cc include/rdma/rdma_vt.h
+index 2b925099bac5,1ba84a78f1c5..000000000000
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@@ -62,6 -63,15 +62,18 @@@
+  
+  #define RVT_MAX_PKEY_VALUES 16
+  
+++<<<<<<< HEAD
+++=======
++ #define RVT_MAX_TRAP_LEN 100 /* Limit pending trap list */
++ #define RVT_MAX_TRAP_LISTS 5 /*((IB_NOTICE_TYPE_INFO & 0x0F) + 1)*/
++ #define RVT_TRAP_TIMEOUT 4096 /* 4.096 usec */
++ 
++ struct trap_list {
++ 	u32 list_len;
++ 	struct list_head list;
++ };
++ 
+++>>>>>>> ec0d8b8a63ee (IB/hfi1: Stricter bounds checking of MAD trap index)
+  struct rvt_ibport {
+  	struct rvt_qp __rcu *qp[2];
+  	struct ib_mad_agent *send_agent;	/* agent for SMI (traps) */
+* Unmerged path drivers/infiniband/hw/hfi1/mad.c
+* Unmerged path include/rdma/rdma_vt.h
