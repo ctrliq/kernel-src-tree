@@ -1,0 +1,163 @@
+target/pr: Use atomic bitop for se_dev_entry->deve_flags reservation check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 80bfdfa92481d431b199eff72788588d13a3988f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/80bfdfa9.failed
+
+This patch converts the core_scsi3_pr_seq_non_holder() check for non
+reservation holding registrations to use an atomic bitop in ->deve_flags
+to determine if a registration is currently active.
+
+It also includes associated a set_bit() in __core_scsi3_add_registration()
+and clear_bit() in __core_scsi3_free_registration(), if se_dev_entry still
+exists, and has not already been released via se_dev_entry shutdown path
+in core_disable_device_list_for_node().
+
+Also, clear_bit in core_disable_device_list_for_node as well to ensure
+the read-critical path in core_scsi3_pr_seq_non_holder() picks up the
+new state, preceeding the final kfree_rcu() call.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 80bfdfa92481d431b199eff72788588d13a3988f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+#	drivers/target/target_core_pr.c
+#	include/target/target_core_base.h
+diff --cc drivers/target/target_core_device.c
+index 53dcefb982bc,97792cc81fe4..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -411,16 -410,25 +411,36 @@@ int core_disable_device_list_for_node
+  	/*
+  	 * Disable struct se_dev_entry LUN ACL mapping
+  	 */
+++<<<<<<< HEAD
+ +	core_scsi3_ua_release_all(deve);
+ +	deve->se_lun = NULL;
+ +	deve->se_lun_acl = NULL;
+ +	deve->lun_flags = 0;
+ +	deve->creation_time = 0;
+ +	deve->attach_count--;
+ +	spin_unlock_irq(&nacl->device_list_lock);
+++=======
++ 	core_scsi3_ua_release_all(orig);
++ 
++ 	hlist_del_rcu(&orig->link);
++ 	clear_bit(DEF_PR_REG_ACTIVE, &orig->deve_flags);
++ 	rcu_assign_pointer(orig->se_lun, NULL);
++ 	rcu_assign_pointer(orig->se_lun_acl, NULL);
++ 	orig->lun_flags = 0;
++ 	orig->creation_time = 0;
++ 	orig->attach_count--;
++ 	/*
++ 	 * Before firing off RCU callback, wait for any in process SPEC_I_PT=1
++ 	 * or REGISTER_AND_MOVE PR operation to complete.
++ 	 */
++ 	kref_put(&orig->pr_kref, target_pr_kref_release);
++ 	wait_for_completion(&orig->pr_comp);
++ 
++ 	kfree_rcu(orig, rcu_head);
+++>>>>>>> 80bfdfa92481 (target/pr: Use atomic bitop for se_dev_entry->deve_flags reservation check)
+  
+  	core_scsi3_free_pr_reg_from_nacl(lun->lun_se_dev, nacl);
+ +	return 0;
+  }
+  
+  /*      core_clear_lun_from_tpg():
+diff --cc drivers/target/target_core_pr.c
+index a255afc452a9,66e686bdf894..000000000000
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@@ -327,8 -327,13 +327,17 @@@ static int core_scsi3_pr_seq_non_holder
+  	int we = 0; /* Write Exclusive */
+  	int legacy = 0; /* Act like a legacy device and return
+  			 * RESERVATION CONFLICT on some CDBs */
++ 	bool registered = false;
+  
+++<<<<<<< HEAD
+ +	se_deve = se_sess->se_node_acl->device_list[cmd->orig_fe_lun];
+++=======
++ 	rcu_read_lock();
++ 	se_deve = target_nacl_find_deve(nacl, cmd->orig_fe_lun);
++ 	if (se_deve)
++ 		registered = test_bit(DEF_PR_REG_ACTIVE, &se_deve->deve_flags);
++ 	rcu_read_unlock();
+++>>>>>>> 80bfdfa92481 (target/pr: Use atomic bitop for se_dev_entry->deve_flags reservation check)
+  	/*
+  	 * Determine if the registration should be ignored due to
+  	 * non-matching ISIDs in target_scsi3_pr_reservation_check().
+@@@ -1020,9 -1018,10 +1025,10 @@@ static void __core_scsi3_add_registrati
+  	enum register_type register_type,
+  	int register_move)
+  {
+ -	const struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+ +	struct target_core_fabric_ops *tfo = nacl->se_tpg->se_tpg_tfo;
+  	struct t10_pr_registration *pr_reg_tmp, *pr_reg_tmp_safe;
+  	struct t10_reservation *pr_tmpl = &dev->t10_pr;
++ 	struct se_dev_entry *deve;
+  
+  	/*
+  	 * Increment PRgeneration counter for struct se_device upon a successful
+@@@ -1236,10 -1248,14 +1255,12 @@@ static void __core_scsi3_free_registrat
+  	struct t10_pr_registration *pr_reg,
+  	struct list_head *preempt_and_abort_list,
+  	int dec_holders)
+ -	__releases(&pr_tmpl->registration_lock)
+ -	__acquires(&pr_tmpl->registration_lock)
+  {
+ -	const struct target_core_fabric_ops *tfo =
+ +	struct target_core_fabric_ops *tfo =
+  			pr_reg->pr_reg_nacl->se_tpg->se_tpg_tfo;
+  	struct t10_reservation *pr_tmpl = &dev->t10_pr;
++ 	struct se_node_acl *nacl = pr_reg->pr_reg_nacl;
++ 	struct se_dev_entry *deve;
+  	char i_buf[PR_REG_ISID_ID_LEN];
+  
+  	memset(i_buf, 0, PR_REG_ISID_ID_LEN);
+diff --cc include/target/target_core_base.h
+index 7bcf92529421,508528a5e927..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -657,16 -644,22 +656,22 @@@ struct se_dev_entry 
+  	u64			pr_res_key;
+  	u64			creation_time;
+  	u32			attach_count;
+ -	atomic_long_t		total_cmds;
+ -	atomic_long_t		read_bytes;
+ -	atomic_long_t		write_bytes;
+ +	u64			read_bytes;
+ +	u64			write_bytes;
+  	atomic_t		ua_count;
+  	/* Used for PR SPEC_I_PT=1 and REGISTER_AND_MOVE */
+ -	struct kref		pr_kref;
+ -	struct completion	pr_comp;
+ -	struct se_lun_acl __rcu	*se_lun_acl;
+ +	atomic_t		pr_ref_count;
+ +	struct se_lun_acl	*se_lun_acl;
+  	spinlock_t		ua_lock;
+++<<<<<<< HEAD
+ +	struct se_lun		*se_lun;
+++=======
++ 	struct se_lun __rcu	*se_lun;
++ #define DEF_PR_REG_ACTIVE		1
++ 	unsigned long		deve_flags;
+++>>>>>>> 80bfdfa92481 (target/pr: Use atomic bitop for se_dev_entry->deve_flags reservation check)
+  	struct list_head	alua_port_list;
+  	struct list_head	ua_list;
+ -	struct hlist_node	link;
+ -	struct rcu_head		rcu_head;
+  };
+  
+  struct se_dev_attrib {
+* Unmerged path drivers/target/target_core_device.c
+* Unmerged path drivers/target/target_core_pr.c
+* Unmerged path include/target/target_core_base.h
