@@ -1,0 +1,230 @@
+IB/hfi1: Refactor reset_ctxt() IOCTL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit ecf799852bde85ae9c1713b2a68dce4a03054f1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ecf79985.failed
+
+The IOCTL is a bit unwieldy.  Refactor reset_ctxt() to be a bit more
+manageable.
+
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ecf799852bde85ae9c1713b2a68dce4a03054f1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index bf663d06d4e1,2b7144e0405e..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -106,11 -105,12 +106,17 @@@ static void deallocate_ctxt(struct hfi1
+  static unsigned int poll_urgent(struct file *fp, struct poll_table_struct *pt);
+  static unsigned int poll_next(struct file *fp, struct poll_table_struct *pt);
+  static int user_event_ack(struct hfi1_ctxtdata *uctxt, u16 subctxt,
+++<<<<<<< HEAD
+ +			  unsigned long events);
+ +static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, u16 subctxt, u16 pkey);
+++=======
++ 			  unsigned long arg);
++ static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, unsigned long arg);
++ static int ctxt_reset(struct hfi1_ctxtdata *uctxt);
+++>>>>>>> ecf799852bde (IB/hfi1: Refactor reset_ctxt() IOCTL)
+  static int manage_rcvq(struct hfi1_ctxtdata *uctxt, u16 subctxt,
+ -		       unsigned long arg);
+ -static int vma_fault(struct vm_fault *vmf);
+ +		       int start_stop);
+ +static int vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+  static long hfi1_file_ioctl(struct file *fp, unsigned int cmd,
+  			    unsigned long arg);
+  
+@@@ -289,72 -280,12 +295,18 @@@ static long hfi1_file_ioctl(struct fil
+  		break;
+  
+  	case HFI1_IOCTL_SET_PKEY:
+ -		ret = set_ctxt_pkey(uctxt, arg);
+ +		ret = get_user(uval16, (u16 __user *)arg);
+ +		if (ret != 0)
+ +			return -EFAULT;
+ +		if (HFI1_CAP_IS_USET(PKEY_CHECK))
+ +			ret = set_ctxt_pkey(uctxt, fd->subctxt, uval16);
+ +		else
+ +			return -EPERM;
+  		break;
+  
+- 	case HFI1_IOCTL_CTXT_RESET: {
+- 		struct send_context *sc;
+- 		struct hfi1_devdata *dd;
+- 
+- 		if (!uctxt || !uctxt->dd || !uctxt->sc)
+- 			return -EINVAL;
+- 
+- 		/*
+- 		 * There is no protection here. User level has to
+- 		 * guarantee that no one will be writing to the send
+- 		 * context while it is being re-initialized.
+- 		 * If user level breaks that guarantee, it will break
+- 		 * it's own context and no one else's.
+- 		 */
+- 		dd = uctxt->dd;
+- 		sc = uctxt->sc;
+- 		/*
+- 		 * Wait until the interrupt handler has marked the
+- 		 * context as halted or frozen. Report error if we time
+- 		 * out.
+- 		 */
+- 		wait_event_interruptible_timeout(
+- 			sc->halt_wait, (sc->flags & SCF_HALTED),
+- 			msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
+- 		if (!(sc->flags & SCF_HALTED))
+- 			return -ENOLCK;
+- 
+- 		/*
+- 		 * If the send context was halted due to a Freeze,
+- 		 * wait until the device has been "unfrozen" before
+- 		 * resetting the context.
+- 		 */
+- 		if (sc->flags & SCF_FROZEN) {
+- 			wait_event_interruptible_timeout(
+- 				dd->event_queue,
+- 				!(ACCESS_ONCE(dd->flags) & HFI1_FROZEN),
+- 				msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
+- 			if (dd->flags & HFI1_FROZEN)
+- 				return -ENOLCK;
+- 
+- 			if (dd->flags & HFI1_FORCED_FREEZE)
+- 				/*
+- 				 * Don't allow context reset if we are into
+- 				 * forced freeze
+- 				 */
+- 				return -ENODEV;
+- 
+- 			sc_disable(sc);
+- 			ret = sc_enable(sc);
+- 			hfi1_rcvctrl(dd, HFI1_RCVCTRL_CTXT_ENB, uctxt);
+- 		} else {
+- 			ret = sc_restart(sc);
+- 		}
+- 		if (!ret)
+- 			sc_return_credits(sc);
++ 	case HFI1_IOCTL_CTXT_RESET:
++ 		ret = ctxt_reset(uctxt);
+  		break;
+- 	}
+  
+  	case HFI1_IOCTL_GET_VERS:
+  		uval = HFI1_USER_SWVERSION;
+@@@ -1642,29 -1579,92 +1594,92 @@@ static int user_event_ack(struct hfi1_c
+  	return 0;
+  }
+  
+ -static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, unsigned long arg)
+ +static int set_ctxt_pkey(struct hfi1_ctxtdata *uctxt, u16 subctxt, u16 pkey)
+  {
+ -	int i;
+ +	int ret = -ENOENT, i, intable = 0;
+  	struct hfi1_pportdata *ppd = uctxt->ppd;
+  	struct hfi1_devdata *dd = uctxt->dd;
+ -	u16 pkey;
+  
+ -	if (!HFI1_CAP_IS_USET(PKEY_CHECK))
+ -		return -EPERM;
+ -
+ -	if (get_user(pkey, (u16 __user *)arg))
+ -		return -EFAULT;
+ -
+ -	if (pkey == LIM_MGMT_P_KEY || pkey == FULL_MGMT_P_KEY)
+ -		return -EINVAL;
+ +	if (pkey == LIM_MGMT_P_KEY || pkey == FULL_MGMT_P_KEY) {
+ +		ret = -EINVAL;
+ +		goto done;
+ +	}
+  
+  	for (i = 0; i < ARRAY_SIZE(ppd->pkeys); i++)
+ -		if (pkey == ppd->pkeys[i])
+ -			return hfi1_set_ctxt_pkey(dd, uctxt, pkey);
+ +		if (pkey == ppd->pkeys[i]) {
+ +			intable = 1;
+ +			break;
+ +		}
+  
+ -	return -ENOENT;
+ +	if (intable)
+ +		ret = hfi1_set_ctxt_pkey(dd, uctxt, pkey);
+ +done:
+ +	return ret;
+  }
+  
++ /**
++  * ctxt_reset - Reset the user context
++  * @uctxt: valid user context
++  */
++ static int ctxt_reset(struct hfi1_ctxtdata *uctxt)
++ {
++ 	struct send_context *sc;
++ 	struct hfi1_devdata *dd;
++ 	int ret = 0;
++ 
++ 	if (!uctxt || !uctxt->dd || !uctxt->sc)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * There is no protection here. User level has to guarantee that
++ 	 * no one will be writing to the send context while it is being
++ 	 * re-initialized.  If user level breaks that guarantee, it will
++ 	 * break it's own context and no one else's.
++ 	 */
++ 	dd = uctxt->dd;
++ 	sc = uctxt->sc;
++ 
++ 	/*
++ 	 * Wait until the interrupt handler has marked the context as
++ 	 * halted or frozen. Report error if we time out.
++ 	 */
++ 	wait_event_interruptible_timeout(
++ 		sc->halt_wait, (sc->flags & SCF_HALTED),
++ 		msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
++ 	if (!(sc->flags & SCF_HALTED))
++ 		return -ENOLCK;
++ 
++ 	/*
++ 	 * If the send context was halted due to a Freeze, wait until the
++ 	 * device has been "unfrozen" before resetting the context.
++ 	 */
++ 	if (sc->flags & SCF_FROZEN) {
++ 		wait_event_interruptible_timeout(
++ 			dd->event_queue,
++ 			!(READ_ONCE(dd->flags) & HFI1_FROZEN),
++ 			msecs_to_jiffies(SEND_CTXT_HALT_TIMEOUT));
++ 		if (dd->flags & HFI1_FROZEN)
++ 			return -ENOLCK;
++ 
++ 		if (dd->flags & HFI1_FORCED_FREEZE)
++ 			/*
++ 			 * Don't allow context reset if we are into
++ 			 * forced freeze
++ 			 */
++ 			return -ENODEV;
++ 
++ 		sc_disable(sc);
++ 		ret = sc_enable(sc);
++ 		hfi1_rcvctrl(dd, HFI1_RCVCTRL_CTXT_ENB, uctxt);
++ 	} else {
++ 		ret = sc_restart(sc);
++ 	}
++ 	if (!ret)
++ 		sc_return_credits(sc);
++ 
++ 	return ret;
++ }
++ 
+  static void user_remove(struct hfi1_devdata *dd)
+  {
+  
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
