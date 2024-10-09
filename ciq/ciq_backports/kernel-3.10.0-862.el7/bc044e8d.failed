@@ -1,0 +1,293 @@
+udp: perform source validation for mcast early demux
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit bc044e8db7962e727a75b591b9851ff2ac5cf846
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bc044e8d.failed
+
+The UDP early demux can leverate the rx dst cache even for
+multicast unconnected sockets.
+
+In such scenario the ipv4 source address is validated only on
+the first packet in the given flow. After that, when we fetch
+the dst entry  from the socket rx cache, we stop enforcing
+the rp_filter and we even start accepting any kind of martian
+addresses.
+
+Disabling the dst cache for unconnected multicast socket will
+cause large performace regression, nearly reducing by half the
+max ingress tput.
+
+Instead we factor out a route helper to completely validate an
+skb source address for multicast packets and we call it from
+the UDP early demux for mcast packets landing on unconnected
+sockets, after successful fetching the related cached dst entry.
+
+This still gives a measurable, but limited performance
+regression:
+
+		rp_filter = 0		rp_filter = 1
+edmux disabled:	1182 Kpps		1127 Kpps
+edmux before:	2238 Kpps		2238 Kpps
+edmux after:	2037 Kpps		2019 Kpps
+
+The above figures are on top of current net tree.
+Applying the net-next commit 6e617de84e87 ("net: avoid a full
+fib lookup when rp_filter is disabled.") the delta with
+rp_filter == 0 will decrease even more.
+
+Fixes: 421b3885bf6d ("udp: ipv4: Add udp early demux")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bc044e8db7962e727a75b591b9851ff2ac5cf846)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/route.h
+#	net/ipv4/route.c
+#	net/ipv4/udp.c
+diff --cc include/net/route.h
+index 63a3f873a8e7,d538e6db1afe..000000000000
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@@ -165,9 -175,14 +165,20 @@@ static inline struct rtable *ip_route_o
+  	fl4->fl4_gre_key = gre_key;
+  	return ip_route_output_key(net, fl4);
+  }
+++<<<<<<< HEAD
+ +
+ +extern int ip_route_input_noref(struct sk_buff *skb, __be32 dst, __be32 src,
+ +				u8 tos, struct net_device *devin);
+++=======
++ int ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++ 			  u8 tos, struct net_device *dev,
++ 			  struct in_device *in_dev, u32 *itag);
++ int ip_route_input_noref(struct sk_buff *skb, __be32 dst, __be32 src,
++ 			 u8 tos, struct net_device *devin);
++ int ip_route_input_rcu(struct sk_buff *skb, __be32 dst, __be32 src,
++ 		       u8 tos, struct net_device *devin,
++ 		       struct fib_result *res);
+++>>>>>>> bc044e8db796 (udp: perform source validation for mcast early demux)
+  
+  static inline int ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
+  				 u8 tos, struct net_device *devin)
+diff --cc net/ipv4/route.c
+index e9a2b0663f57,ac6fde5d45f1..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -1437,50 -1487,89 +1437,87 @@@ static void rt_set_nexthop(struct rtabl
+  #endif
+  }
+  
+ -struct rtable *rt_dst_alloc(struct net_device *dev,
+ -			    unsigned int flags, u16 type,
+ -			    bool nopolicy, bool noxfrm, bool will_cache)
+ +static struct rtable *rt_dst_alloc(struct net_device *dev,
+ +				   bool nopolicy, bool noxfrm, bool will_cache)
+  {
+ -	struct rtable *rt;
+ -
+ -	rt = dst_alloc(&ipv4_dst_ops, dev, 1, DST_OBSOLETE_FORCE_CHK,
+ -		       (will_cache ? 0 : DST_HOST) |
+ -		       (nopolicy ? DST_NOPOLICY : 0) |
+ -		       (noxfrm ? DST_NOXFRM : 0));
+ -
+ -	if (rt) {
+ -		rt->rt_genid = rt_genid_ipv4(dev_net(dev));
+ -		rt->rt_flags = flags;
+ -		rt->rt_type = type;
+ -		rt->rt_is_input = 0;
+ -		rt->rt_iif = 0;
+ -		rt->rt_pmtu = 0;
+ -		rt->rt_gateway = 0;
+ -		rt->rt_uses_gateway = 0;
+ -		rt->rt_table_id = 0;
+ -		INIT_LIST_HEAD(&rt->rt_uncached);
+ -
+ -		rt->dst.output = ip_output;
+ -		if (flags & RTCF_LOCAL)
+ -			rt->dst.input = ip_local_deliver;
+ -	}
+ -
+ -	return rt;
+ +	return dst_alloc(&ipv4_dst_ops, dev, 1, DST_OBSOLETE_FORCE_CHK,
+ +			 (will_cache ? 0 : (DST_HOST | DST_NOCACHE)) |
+ +			 (nopolicy ? DST_NOPOLICY : 0) |
+ +			 (noxfrm ? DST_NOXFRM : 0));
+  }
+ -EXPORT_SYMBOL(rt_dst_alloc);
+  
+  /* called in rcu_read_lock() section */
+- static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+- 				u8 tos, struct net_device *dev, int our)
++ int ip_mc_validate_source(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++ 			  u8 tos, struct net_device *dev,
++ 			  struct in_device *in_dev, u32 *itag)
+  {
+++<<<<<<< HEAD
+ +	struct rtable *rth;
+ +	struct in_device *in_dev = __in_dev_get_rcu(dev);
+ +	u32 itag = 0;
+ +	int err;
+ +
+ +	/* Primary sanity checks. */
+ +
+ +	if (in_dev == NULL)
+++=======
++ 	int err;
++ 
++ 	/* Primary sanity checks. */
++ 	if (!in_dev)
+++>>>>>>> bc044e8db796 (udp: perform source validation for mcast early demux)
+  		return -EINVAL;
+  
+  	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr) ||
+  	    skb->protocol != htons(ETH_P_IP))
+- 		goto e_inval;
++ 		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (likely(!IN_DEV_ROUTE_LOCALNET(in_dev)))
+ +		if (ipv4_is_loopback(saddr))
+ +			goto e_inval;
+++=======
++ 	if (ipv4_is_loopback(saddr) && !IN_DEV_ROUTE_LOCALNET(in_dev))
++ 		return -EINVAL;
+++>>>>>>> bc044e8db796 (udp: perform source validation for mcast early demux)
+  
+  	if (ipv4_is_zeronet(saddr)) {
+  		if (!ipv4_is_local_multicast(daddr))
+- 			goto e_inval;
++ 			return -EINVAL;
+  	} else {
+  		err = fib_validate_source(skb, saddr, 0, tos, 0, dev,
+- 					  in_dev, &itag);
++ 					  in_dev, itag);
+  		if (err < 0)
+- 			goto e_err;
++ 			return err;
+  	}
+++<<<<<<< HEAD
+ +	rth = rt_dst_alloc(dev_net(dev)->loopback_dev,
+++=======
++ 	return 0;
++ }
++ 
++ /* called in rcu_read_lock() section */
++ static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
++ 			     u8 tos, struct net_device *dev, int our)
++ {
++ 	struct in_device *in_dev = __in_dev_get_rcu(dev);
++ 	unsigned int flags = RTCF_MULTICAST;
++ 	struct rtable *rth;
++ 	u32 itag = 0;
++ 	int err;
++ 
++ 	err = ip_mc_validate_source(skb, daddr, saddr, tos, dev, in_dev, &itag);
++ 	if (err)
++ 		return err;
++ 
++ 	if (our)
++ 		flags |= RTCF_LOCAL;
++ 
++ 	rth = rt_dst_alloc(dev_net(dev)->loopback_dev, flags, RTN_MULTICAST,
+++>>>>>>> bc044e8db796 (udp: perform source validation for mcast early demux)
+  			   IN_DEV_CONF_GET(in_dev, NOPOLICY), false, false);
+  	if (!rth)
+- 		goto e_nobufs;
++ 		return -ENOBUFS;
+  
+  #ifdef CONFIG_IP_ROUTE_CLASSID
+  	rth->dst.tclassid = itag;
+diff --cc net/ipv4/udp.c
+index c6e2b198be79,5676237d2b0f..000000000000
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@@ -2028,29 -2218,19 +2028,30 @@@ static struct sock *__udp4_lib_demux_lo
+  		/* Only check first socket in chain */
+  		break;
+  	}
+ -	return NULL;
+ +
+ +	if (result) {
+ +		if (unlikely(!atomic_inc_not_zero_hint(&result->sk_refcnt, 2)))
+ +			result = NULL;
+ +		else if (unlikely(!INET_MATCH(sk, net, acookie,
+ +					      rmt_addr, loc_addr,
+ +					      ports, dif))) {
+ +			sock_put(result);
+ +			result = NULL;
+ +		}
+ +	}
+ +	rcu_read_unlock();
+ +	return result;
+  }
+  
+ -int udp_v4_early_demux(struct sk_buff *skb)
+ +void udp_v4_early_demux(struct sk_buff *skb)
+  {
+  	struct net *net = dev_net(skb->dev);
++ 	struct in_device *in_dev = NULL;
+  	const struct iphdr *iph;
+  	const struct udphdr *uh;
+ -	struct sock *sk = NULL;
+ +	struct sock *sk;
+  	struct dst_entry *dst;
+  	int dif = skb->dev->ifindex;
+ -	int sdif = inet_sdif(skb);
+  	int ours;
+  
+  	/* validate the packet */
+@@@ -2062,10 -2242,10 +2063,10 @@@
+  
+  	if (skb->pkt_type == PACKET_BROADCAST ||
+  	    skb->pkt_type == PACKET_MULTICAST) {
+- 		struct in_device *in_dev = __in_dev_get_rcu(skb->dev);
++ 		in_dev = __in_dev_get_rcu(skb->dev);
+  
+  		if (!in_dev)
+ -			return 0;
+ +			return;
+  
+  		/* we are supposed to accept bcast packets */
+  		if (skb->pkt_type == PACKET_MULTICAST) {
+@@@ -2094,14 -2273,23 +2095,32 @@@
+  	if (dst)
+  		dst = dst_check(dst, 0);
+  	if (dst) {
+++<<<<<<< HEAD
+ +		/* DST_NOCACHE can not be used without taking a reference */
+ +		if (dst->flags & DST_NOCACHE) {
+ +			if (likely(atomic_inc_not_zero(&dst->__refcnt)))
+ +				skb_dst_set(skb, dst);
+ +		} else {
+ +			skb_dst_set_noref(skb, dst);
+ +		}
+++=======
++ 		u32 itag = 0;
++ 
++ 		/* set noref for now.
++ 		 * any place which wants to hold dst has to call
++ 		 * dst_hold_safe()
++ 		 */
++ 		skb_dst_set_noref(skb, dst);
++ 
++ 		/* for unconnected multicast sockets we need to validate
++ 		 * the source on each packet
++ 		 */
++ 		if (!inet_sk(sk)->inet_daddr && in_dev)
++ 			return ip_mc_validate_source(skb, iph->daddr,
++ 						     iph->saddr, iph->tos,
++ 						     skb->dev, in_dev, &itag);
+++>>>>>>> bc044e8db796 (udp: perform source validation for mcast early demux)
+  	}
+ -	return 0;
+  }
+  
+  int udp_rcv(struct sk_buff *skb)
+* Unmerged path include/net/route.h
+* Unmerged path net/ipv4/route.c
+* Unmerged path net/ipv4/udp.c
