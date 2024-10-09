@@ -1,0 +1,178 @@
+i40e: update data pointer directly when copying to the buffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit e08696dcd988dbe5fe8e51753e23d16ee7e75f3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e08696dc.failed
+
+A future patch is going to add a helper function i40e_add_ethtool_stats
+that will help lower the amount of boiler plate code in the
+i40e_get_ethtool_stats function.
+
+This conversion will take place over many patches, and the helper
+function will work by directly updating a reference to the data pointer.
+
+Since this would not work combined with the current method of accessing
+data like an array, update all the code that copies stats into the data
+buffer to use direct updates to the pointer instead of array accesses.
+
+This will prevent incorrect stat updates for patches in between the
+conversion.
+
+Similarly, when copying strings, we used a separate char *p pointer.
+Instead, use the data pointer directly as it's already a (u8 *) type
+which is the same size.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit e08696dcd988dbe5fe8e51753e23d16ee7e75f3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index 07042090c395,44a2803cb1ec..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@@ -1641,11 -1716,19 +1640,22 @@@ static void i40e_get_ethtool_stats(stru
+  			    sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
+  	}
+  	rcu_read_lock();
+ -	for (j = 0; j < I40E_MAX_NUM_QUEUES(netdev) ; j++) {
+ -		tx_ring = READ_ONCE(vsi->tx_rings[j]);
+ +	for (j = 0; j < vsi->num_queue_pairs; j++) {
+ +		tx_ring = ACCESS_ONCE(vsi->tx_rings[j]);
+  
+++<<<<<<< HEAD
+ +		if (!tx_ring)
+++=======
++ 		if (!tx_ring) {
++ 			/* Bump the stat counter to skip these stats, and make
++ 			 * sure the memory is zero'd
++ 			 */
++ 			*(data++) = 0;
++ 			*(data++) = 0;
++ 			*(data++) = 0;
++ 			*(data++) = 0;
+++>>>>>>> e08696dcd988 (i40e: update data pointer directly when copying to the buffer)
+  			continue;
+ -		}
+  
+  		/* process Tx ring statistics */
+  		do {
+@@@ -1693,19 -1776,100 +1703,105 @@@
+  			     sizeof(u64)) ? *(u64 *)p : *(u32 *)p;
+  	}
+  	for (j = 0; j < I40E_MAX_USER_PRIORITY; j++) {
+- 		data[i++] = pf->stats.priority_xon_tx[j];
+- 		data[i++] = pf->stats.priority_xoff_tx[j];
++ 		*(data++) = pf->stats.priority_xon_tx[j];
++ 		*(data++) = pf->stats.priority_xoff_tx[j];
+  	}
+  	for (j = 0; j < I40E_MAX_USER_PRIORITY; j++) {
+- 		data[i++] = pf->stats.priority_xon_rx[j];
+- 		data[i++] = pf->stats.priority_xoff_rx[j];
++ 		*(data++) = pf->stats.priority_xon_rx[j];
++ 		*(data++) = pf->stats.priority_xoff_rx[j];
+  	}
+  	for (j = 0; j < I40E_MAX_USER_PRIORITY; j++)
+- 		data[i++] = pf->stats.priority_xon_2_xoff[j];
++ 		*(data++) = pf->stats.priority_xon_2_xoff[j];
+  }
+  
+++<<<<<<< HEAD
+ +static void i40e_get_strings(struct net_device *netdev, u32 stringset,
+ +			     u8 *data)
+++=======
++ static void i40e_get_stat_strings(struct net_device *netdev, u8 *data)
++ {
++ 	struct i40e_netdev_priv *np = netdev_priv(netdev);
++ 	struct i40e_vsi *vsi = np->vsi;
++ 	struct i40e_pf *pf = vsi->back;
++ 	unsigned int i;
++ 	u8 *p = data;
++ 
++ 	for (i = 0; i < I40E_NETDEV_STATS_LEN; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN, "%s",
++ 			 i40e_gstrings_net_stats[i].stat_string);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MISC_STATS_LEN; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN, "%s",
++ 			 i40e_gstrings_misc_stats[i].stat_string);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MAX_NUM_QUEUES(netdev); i++) {
++ 		snprintf(data, ETH_GSTRING_LEN, "tx-%u.tx_packets", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN, "tx-%u.tx_bytes", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN, "rx-%u.rx_packets", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN, "rx-%u.rx_bytes", i);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	if (vsi != pf->vsi[pf->lan_vsi] || pf->hw.partition_id != 1)
++ 		return;
++ 
++ 	for (i = 0; i < I40E_VEB_STATS_LEN; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN, "%s",
++ 			 i40e_gstrings_veb_stats[i].stat_string);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MAX_TRAFFIC_CLASS; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "veb.tc_%u_tx_packets", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "veb.tc_%u_tx_bytes", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "veb.tc_%u_rx_packets", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "veb.tc_%u_rx_bytes", i);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 
++ 	for (i = 0; i < I40E_GLOBAL_STATS_LEN; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN, "%s",
++ 			 i40e_gstrings_stats[i].stat_string);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MAX_USER_PRIORITY; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "port.tx_priority_%u_xon", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "port.tx_priority_%u_xoff", i);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MAX_USER_PRIORITY; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "port.rx_priority_%u_xon", i);
++ 		data += ETH_GSTRING_LEN;
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "port.rx_priority_%u_xoff", i);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 	for (i = 0; i < I40E_MAX_USER_PRIORITY; i++) {
++ 		snprintf(data, ETH_GSTRING_LEN,
++ 			 "port.rx_priority_%u_xon_2_xoff", i);
++ 		data += ETH_GSTRING_LEN;
++ 	}
++ 
++ 	WARN_ONCE(p - data != i40e_get_stats_count(netdev) * ETH_GSTRING_LEN,
++ 		  "stat strings count mismatch!");
++ }
++ 
++ static void i40e_get_priv_flag_strings(struct net_device *netdev, u8 *data)
+++>>>>>>> e08696dcd988 (i40e: update data pointer directly when copying to the buffer)
+  {
+  	struct i40e_netdev_priv *np = netdev_priv(netdev);
+  	struct i40e_vsi *vsi = np->vsi;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_ethtool.c
