@@ -1,0 +1,164 @@
+IB/mlx5: Merge vports flow steering during LAG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Aviv Heller <avivh@mellanox.com>
+commit 9ef9c640f4c5376189d8ca70f51a50a3d0b16914
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9ef9c640.failed
+
+This is done in two steps:
+1) Issuing CREATE_VPORT_LAG in order to have Ethernet traffic from
+both ports arriving on PF0 root flowtable, so we will be able to catch
+all raw-eth traffic on PF0.
+2) Creation of LAG demux flowtable in order to direct all non-raw-eth
+traffic back to its source port, assuring that normal Ethernet
+traffic "jumps" to the root flowtable of its RX port (non-LAG behavior).
+
+	Signed-off-by: Aviv Heller <avivh@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9ef9c640f4c5376189d8ca70f51a50a3d0b16914)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 0662b3b06b3e,70e7c8dcd4e0..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2603,6 -2703,55 +2603,58 @@@ static void get_dev_fw_str(struct ib_de
+  		       fw_rev_min(dev->mdev), fw_rev_sub(dev->mdev));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_roce_lag_init(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	struct mlx5_flow_namespace *ns = mlx5_get_flow_namespace(mdev,
++ 								 MLX5_FLOW_NAMESPACE_LAG);
++ 	struct mlx5_flow_table *ft;
++ 	int err;
++ 
++ 	if (!ns || !mlx5_lag_is_active(mdev))
++ 		return 0;
++ 
++ 	err = mlx5_cmd_create_vport_lag(mdev);
++ 	if (err)
++ 		return err;
++ 
++ 	ft = mlx5_create_lag_demux_flow_table(ns, 0, 0);
++ 	if (IS_ERR(ft)) {
++ 		err = PTR_ERR(ft);
++ 		goto err_destroy_vport_lag;
++ 	}
++ 
++ 	dev->flow_db.lag_demux_ft = ft;
++ 	return 0;
++ 
++ err_destroy_vport_lag:
++ 	mlx5_cmd_destroy_vport_lag(mdev);
++ 	return err;
++ }
++ 
++ static void mlx5_roce_lag_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 
++ 	if (dev->flow_db.lag_demux_ft) {
++ 		mlx5_destroy_flow_table(dev->flow_db.lag_demux_ft);
++ 		dev->flow_db.lag_demux_ft = NULL;
++ 
++ 		mlx5_cmd_destroy_vport_lag(mdev);
++ 	}
++ }
++ 
++ static void mlx5_remove_roce_notifier(struct mlx5_ib_dev *dev)
++ {
++ 	if (dev->roce.nb.notifier_call) {
++ 		unregister_netdevice_notifier(&dev->roce.nb);
++ 		dev->roce.nb.notifier_call = NULL;
++ 	}
++ }
++ 
+++>>>>>>> 9ef9c640f4c5 (IB/mlx5: Merge vports flow steering during LAG)
+  static int mlx5_enable_roce(struct mlx5_ib_dev *dev)
+  {
+  	int err;
+@@@ -2616,17 -2767,59 +2668,25 @@@
+  	if (err)
+  		goto err_unregister_netdevice_notifier;
+  
++ 	err = mlx5_roce_lag_init(dev);
++ 	if (err)
++ 		goto err_disable_roce;
++ 
+  	return 0;
+  
++ err_disable_roce:
++ 	mlx5_nic_vport_disable_roce(dev->mdev);
++ 
+  err_unregister_netdevice_notifier:
+ -	mlx5_remove_roce_notifier(dev);
+ +	unregister_netdevice_notifier_rh(&dev->roce.nb);
+  	return err;
+  }
+  
+  static void mlx5_disable_roce(struct mlx5_ib_dev *dev)
+  {
++ 	mlx5_roce_lag_cleanup(dev);
+  	mlx5_nic_vport_disable_roce(dev->mdev);
+ -}
+ -
+ -static void mlx5_ib_dealloc_q_counters(struct mlx5_ib_dev *dev)
+ -{
+ -	unsigned int i;
+ -
+ -	for (i = 0; i < dev->num_ports; i++)
+ -		mlx5_core_dealloc_q_counter(dev->mdev,
+ -					    dev->port[i].q_cnt_id);
+ -}
+ -
+ -static int mlx5_ib_alloc_q_counters(struct mlx5_ib_dev *dev)
+ -{
+ -	int i;
+ -	int ret;
+ -
+ -	for (i = 0; i < dev->num_ports; i++) {
+ -		ret = mlx5_core_alloc_q_counter(dev->mdev,
+ -						&dev->port[i].q_cnt_id);
+ -		if (ret) {
+ -			mlx5_ib_warn(dev,
+ -				     "couldn't allocate queue counter for port %d, err %d\n",
+ -				     i + 1, ret);
+ -			goto dealloc_counters;
+ -		}
+ -	}
+ -
+ -	return 0;
+ -
+ -dealloc_counters:
+ -	while (--i >= 0)
+ -		mlx5_core_dealloc_q_counter(dev->mdev,
+ -					    dev->port[i].q_cnt_id);
+ -
+ -	return ret;
+ +	unregister_netdevice_notifier_rh(&dev->roce.nb);
+  }
+  
+  static const char * const names[] = {
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 31e9d3e994da..8d6841de1c42 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -158,6 +158,7 @@ struct mlx5_ib_flow_handler {
+ struct mlx5_ib_flow_db {
+ 	struct mlx5_ib_flow_prio	prios[MLX5_IB_NUM_FLOW_FT];
+ 	struct mlx5_ib_flow_prio	sniffer[MLX5_IB_NUM_SNIFFER_FTS];
++	struct mlx5_flow_table		*lag_demux_ft;
+ 	/* Protect flow steering bypass flow tables
+ 	 * when add/del flow rules.
+ 	 * only single add/removal of flow steering rule could be done
