@@ -1,0 +1,292 @@
+ceph: ignore wbc->range_{start,end} when write back snapshot data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [fs] ceph: ignore wbc->range_(start, end) when write back snapshot data (Ilya Dryomov) [1580500]
+Rebuild_FUZZ: 96.18%
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 2a2d927e35dd8dc4faf8fbc211533cf5f8840f5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2a2d927e.failed
+
+writepages() needs to write dirty pages to OSD in strict order of
+snapshot context. It must first write dirty pages associated with
+the oldest snapshot context. In the write range case, dirty pages
+in the specified range can be associated with newer snapc. They
+are not writeable until we write all dirty pages associated with
+the oldest snapc.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 2a2d927e35dd8dc4faf8fbc211533cf5f8840f5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+diff --cc fs/ceph/addr.c
+index 2c8328a70fdb,201e529e8a6c..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -436,6 -463,15 +436,18 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct ceph_writeback_ctl
++ {
++ 	loff_t i_size;
++ 	u64 truncate_size;
++ 	u32 truncate_seq;
++ 	bool size_stable;
++ 	bool head_snapc;
++ };
++ 
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  /*
+   * Get ref for the oldest snapc for an inode with dirty data... that is, the
+   * only snap context we are allowed to write back.
+@@@ -453,25 -488,46 +465,56 @@@ static struct ceph_snap_context *get_ol
+  	list_for_each_entry(capsnap, &ci->i_cap_snaps, ci_item) {
+  		dout(" cap_snap %p snapc %p has %d dirty pages\n", capsnap,
+  		     capsnap->context, capsnap->dirty_pages);
+++<<<<<<< HEAD
+ +		if (capsnap->dirty_pages) {
+ +			snapc = ceph_get_snap_context(capsnap->context);
+ +			if (snap_size)
+ +				*snap_size = capsnap->size;
+ +			if (truncate_size)
+ +				*truncate_size = capsnap->truncate_size;
+ +			if (truncate_seq)
+ +				*truncate_seq = capsnap->truncate_seq;
+ +			break;
+++=======
++ 		if (!capsnap->dirty_pages)
++ 			continue;
++ 
++ 		/* get i_size, truncate_{seq,size} for page_snapc? */
++ 		if (snapc && capsnap->context != page_snapc)
++ 			continue;
++ 
++ 		if (ctl) {
++ 			if (capsnap->writing) {
++ 				ctl->i_size = i_size_read(inode);
++ 				ctl->size_stable = false;
++ 			} else {
++ 				ctl->i_size = capsnap->size;
++ 				ctl->size_stable = true;
++ 			}
++ 			ctl->truncate_size = capsnap->truncate_size;
++ 			ctl->truncate_seq = capsnap->truncate_seq;
++ 			ctl->head_snapc = false;
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  		}
+ -
+ -		if (snapc)
+ -			break;
+ -
+ -		snapc = ceph_get_snap_context(capsnap->context);
+ -		if (!page_snapc ||
+ -		    page_snapc == snapc ||
+ -		    page_snapc->seq > snapc->seq)
+ -			break;
+  	}
+  	if (!snapc && ci->i_wrbuffer_ref_head) {
+  		snapc = ceph_get_snap_context(ci->i_head_snapc);
+  		dout(" head snapc %p has %d dirty pages\n",
+  		     snapc, ci->i_wrbuffer_ref_head);
+++<<<<<<< HEAD
+ +		if (truncate_size)
+ +			*truncate_size = ci->i_truncate_size;
+ +		if (truncate_seq)
+ +			*truncate_seq = ci->i_truncate_seq;
+++=======
++ 		if (ctl) {
++ 			ctl->i_size = i_size_read(inode);
++ 			ctl->truncate_size = ci->i_truncate_size;
++ 			ctl->truncate_seq = ci->i_truncate_seq;
++ 			ctl->size_stable = false;
++ 			ctl->head_snapc = true;
++ 		}
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  	}
+  	spin_unlock(&ci->i_ceph_lock);
+  	return snapc;
+@@@ -710,19 -784,15 +753,23 @@@ static int ceph_writepages_start(struc
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+  	struct ceph_vino vino = ceph_vino(inode);
+++<<<<<<< HEAD
+ +	pgoff_t index, start, end;
+ +	int range_whole = 0;
+ +	int should_loop = 1;
+ +	pgoff_t max_pages = 0, max_pages_ever = 0;
+++=======
++ 	pgoff_t index, start_index, end = -1;
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  	struct ceph_snap_context *snapc = NULL, *last_snapc = NULL, *pgsnapc;
+  	struct pagevec pvec;
+ +	int done = 0;
+  	int rc = 0;
+ -	unsigned int wsize = i_blocksize(inode);
+ +	unsigned wsize = 1 << inode->i_blkbits;
+  	struct ceph_osd_request *req = NULL;
+ -	struct ceph_writeback_ctl ceph_wbc;
+ -	bool should_loop, range_whole = false;
+ -	bool stop, done = false;
+ +	loff_t snap_size, i_size;
+ +	u64 truncate_size;
+ +	u32 truncate_seq;
+  
+  	dout("writepages_start %p (mode=%s)\n", inode,
+  	     wbc->sync_mode == WB_SYNC_NONE ? "NONE" :
+@@@ -743,27 -812,12 +790,36 @@@
+  
+  	pagevec_init(&pvec, 0);
+  
+++<<<<<<< HEAD
+ +	/* where to start/end? */
+ +	if (wbc->range_cyclic) {
+ +		start = mapping->writeback_index; /* Start from prev offset */
+ +		end = -1;
+ +		dout(" cyclic, start at %lu\n", start);
+ +	} else {
+ +		start = wbc->range_start >> PAGE_CACHE_SHIFT;
+ +		end = wbc->range_end >> PAGE_CACHE_SHIFT;
+ +		if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
+ +			range_whole = 1;
+ +		should_loop = 0;
+ +		dout(" not cyclic, %lu to %lu\n", start, end);
+ +	}
+ +	index = start;
+ +
+ +retry:
+ +	/* find oldest snap context with dirty data */
+ +	ceph_put_snap_context(snapc);
+ +	snap_size = -1;
+ +	snapc = get_oldest_context(inode, &snap_size,
+ +				   &truncate_size, &truncate_seq);
+++=======
++ 	start_index = wbc->range_cyclic ? mapping->writeback_index : 0;
++ 	index = start_index;
++ 
++ retry:
++ 	/* find oldest snap context with dirty data */
++ 	snapc = get_oldest_context(inode, &ceph_wbc, NULL);
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  	if (!snapc) {
+  		/* hmm, why does writepages get called when there
+  		   is no dirty data? */
+@@@ -773,23 -827,39 +829,52 @@@
+  	dout(" oldest snapc is %p seq %lld (%d snaps)\n",
+  	     snapc, snapc->seq, snapc->num_snaps);
+  
+++<<<<<<< HEAD
+ +	i_size = i_size_read(inode);
+ +
+ +	if (last_snapc && snapc != last_snapc) {
+ +		/* if we switched to a newer snapc, restart our scan at the
+ +		 * start of the original file range. */
+ +		dout("  snapc differs from last pass, restarting at %lu\n",
+ +		     index);
+ +		index = start;
+++=======
++ 	should_loop = false;
++ 	if (ceph_wbc.head_snapc && snapc != last_snapc) {
++ 		/* where to start/end? */
++ 		if (wbc->range_cyclic) {
++ 			index = start_index;
++ 			end = -1;
++ 			if (index > 0)
++ 				should_loop = true;
++ 			dout(" cyclic, start at %lu\n", index);
++ 		} else {
++ 			index = wbc->range_start >> PAGE_SHIFT;
++ 			end = wbc->range_end >> PAGE_SHIFT;
++ 			if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
++ 				range_whole = true;
++ 			dout(" not cyclic, %lu to %lu\n", index, end);
++ 		}
++ 	} else if (!ceph_wbc.head_snapc) {
++ 		/* Do not respect wbc->range_{start,end}. Dirty pages
++ 		 * in that range can be associated with newer snapc.
++ 		 * They are not writeable until we write all dirty pages
++ 		 * associated with 'snapc' get written */
++ 		if (index > 0 || wbc->sync_mode != WB_SYNC_NONE)
++ 			should_loop = true;
++ 		dout(" non-head snapc, range whole\n");
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  	}
++ 
++ 	ceph_put_snap_context(last_snapc);
+  	last_snapc = snapc;
+  
+ -	stop = false;
+ -	while (!stop && index <= end) {
+ +	while (!done && index <= end) {
+ +		unsigned i;
+ +		int first;
+ +		pgoff_t strip_unit_end = 0;
+  		int num_ops = 0, op_idx;
+ -		unsigned i, pvec_pages, max_pages, locked_pages = 0;
+ +		int pvec_pages, locked_pages = 0;
+  		struct page **pages = NULL, **data_pages;
+  		mempool_t *pool = NULL;	/* Becomes non-null if mempool used */
+  		struct page *page;
+@@@ -823,11 -893,15 +908,19 @@@ get_more_pages
+  			    unlikely(page->mapping != mapping)) {
+  				dout("!dirty or !mapping %p\n", page);
+  				unlock_page(page);
+ -				continue;
+ +				break;
+  			}
+ -			if (page->index > end) {
+ +			if (!wbc->range_cyclic && page->index > end) {
+  				dout("end of range %p\n", page);
+++<<<<<<< HEAD
+ +				done = 1;
+++=======
++ 				/* can't be range_cyclic (1st pass) because
++ 				 * end == -1 in that case. */
++ 				stop = true;
++ 				if (ceph_wbc.head_snapc)
++ 					done = true;
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  				unlock_page(page);
+  				break;
+  			}
+@@@ -1074,8 -1146,14 +1167,19 @@@ new_request
+  		if (pages)
+  			goto new_request;
+  
+++<<<<<<< HEAD
+ +		if (wbc->nr_to_write <= 0)
+ +			done = 1;
+++=======
++ 		/*
++ 		 * We stop writing back only if we are not doing
++ 		 * integrity sync. In case of integrity sync we have to
++ 		 * keep going until we have written all the pages
++ 		 * we tagged for writeback prior to entering this loop.
++ 		 */
++ 		if (wbc->nr_to_write <= 0 && wbc->sync_mode == WB_SYNC_NONE)
++ 			done = stop = true;
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  
+  release_pvec_pages:
+  		dout("pagevec_release on %d pages (%p)\n", (int)pvec.nr,
+@@@ -1089,7 -1164,8 +1190,12 @@@
+  	if (should_loop && !done) {
+  		/* more to do; loop back to beginning of file */
+  		dout("writepages looping back to beginning of file\n");
+++<<<<<<< HEAD
+ +		should_loop = 0;
+++=======
++ 		end = start_index - 1; /* OK even when start_index == 0 */
++ 		start_index = 0;
+++>>>>>>> 2a2d927e35dd (ceph: ignore wbc->range_{start,end} when write back snapshot data)
+  		index = 0;
+  		goto retry;
+  	}
+* Unmerged path fs/ceph/addr.c
