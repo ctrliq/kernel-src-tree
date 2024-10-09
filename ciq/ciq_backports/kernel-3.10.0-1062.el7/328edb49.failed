@@ -1,0 +1,140 @@
+net/mlx5: Split FDB fast path prio to multiple namespaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Split FDB fast path prio to multiple namespaces (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.36%
+commit-author Paul Blakey <paulb@mellanox.com>
+commit 328edb499f99126946845ece477c9c1afe8631af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/328edb49.failed
+
+Towards supporting multi-chains and priorities, split the FDB fast path
+to multiple namespaces (sub namespaces), each with multiple priorities.
+
+This patch adds a new flow steering type, FS_TYPE_PRIO_CHAINS, which is
+like current FS_TYPE_PRIO, but may contain only namespaces, and those
+will be in parallel to one another in terms of managing of the flow
+tables connections inside them. Meaning, while searching for the next
+or previous flow table to connect for a new table inside such namespace
+we skip the parallel namespaces in the same level under the
+FS_TYPE_PRIO_CHAINS prio we originated from.
+
+We use this new type for splitting the fast path prio into multiple
+parallel namespaces, each containing normal prios.
+The prios inside them (and their tables) will be connected to one
+another, but not from one parallel namespace to another, instead the
+last prio in each namespace will be connected to the next prio in
+the containing FDB namespace, which is the slow path prio.
+
+	Signed-off-by: Paul Blakey <paulb@mellanox.com>
+	Acked-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 328edb499f99126946845ece477c9c1afe8631af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index 72297c31a849,7eb6d58733ac..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -39,6 -39,8 +39,11 @@@
+  #include "fs_cmd.h"
+  #include "diag/fs_tracepoint.h"
+  #include "accel/ipsec.h"
+++<<<<<<< HEAD
+++=======
++ #include "fpga/ipsec.h"
++ #include "eswitch.h"
+++>>>>>>> 328edb499f99 (net/mlx5: Split FDB fast path prio to multiple namespaces)
+  
+  #define INIT_TREE_NODE_ARRAY_SIZE(...)	(sizeof((struct init_tree_node[]){__VA_ARGS__}) /\
+  					 sizeof(struct init_tree_node))
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 8798f4084ee6..2d701d34886a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -263,7 +263,7 @@ static int esw_create_legacy_fdb_table(struct mlx5_eswitch *esw)
+ 	esw_debug(dev, "Create FDB log_max_size(%d)\n",
+ 		  MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size));
+ 
+-	root_ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_FDB);
++	root_ns = mlx5_get_fdb_sub_ns(dev, 0);
+ 	if (!root_ns) {
+ 		esw_warn(dev, "Failed to get FDB flow namespace\n");
+ 		return -EOPNOTSUPP;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 21bc97b70ed9..1bb7d9781d06 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -59,6 +59,9 @@
+ #define mlx5_esw_has_fwd_fdb(dev) \
+ 	MLX5_CAP_ESW_FLOWTABLE(dev, fdb_multi_path_to_table)
+ 
++#define FDB_MAX_CHAIN 3
++#define FDB_MAX_PRIO 16
++
+ struct vport_ingress {
+ 	struct mlx5_flow_table *acl;
+ 	struct mlx5_flow_group *allow_untagged_spoofchk_grp;
+@@ -297,6 +300,10 @@ static inline void mlx5_eswitch_cleanup(struct mlx5_eswitch *esw) {}
+ static inline void mlx5_eswitch_vport_event(struct mlx5_eswitch *esw, struct mlx5_eqe *eqe) {}
+ static inline int  mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode) { return 0; }
+ static inline void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw) {}
++
++#define FDB_MAX_CHAIN 1
++#define FDB_MAX_PRIO 1
++
+ #endif /* CONFIG_MLX5_ESWITCH */
+ 
+ #endif /* __MLX5_ESWITCH_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+index a06f83c0c2b6..b51ad217da32 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -38,9 +38,21 @@
+ #include <linux/rhashtable.h>
+ #include <linux/llist.h>
+ 
++/* FS_TYPE_PRIO_CHAINS is a PRIO that will have namespaces only,
++ * and those are in parallel to one another when going over them to connect
++ * a new flow table. Meaning the last flow table in a TYPE_PRIO prio in one
++ * parallel namespace will not automatically connect to the first flow table
++ * found in any prio in any next namespace, but skip the entire containing
++ * TYPE_PRIO_CHAINS prio.
++ *
++ * This is used to implement tc chains, each chain of prios is a different
++ * namespace inside a containing TYPE_PRIO_CHAINS prio.
++ */
++
+ enum fs_node_type {
+ 	FS_TYPE_NAMESPACE,
+ 	FS_TYPE_PRIO,
++	FS_TYPE_PRIO_CHAINS,
+ 	FS_TYPE_FLOW_TABLE,
+ 	FS_TYPE_FLOW_GROUP,
+ 	FS_TYPE_FLOW_ENTRY,
+@@ -73,6 +85,7 @@ struct mlx5_flow_steering {
+ 	struct kmem_cache               *ftes_cache;
+ 	struct mlx5_flow_root_namespace *root_ns;
+ 	struct mlx5_flow_root_namespace *fdb_root_ns;
++	struct mlx5_flow_namespace	**fdb_sub_ns;
+ 	struct mlx5_flow_root_namespace **esw_egress_root_ns;
+ 	struct mlx5_flow_root_namespace **esw_ingress_root_ns;
+ 	struct mlx5_flow_root_namespace	*sniffer_tx_root_ns;
+diff --git a/include/linux/mlx5/fs.h b/include/linux/mlx5/fs.h
+index 7035fec2adf8..08ea67bc5bee 100644
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -99,6 +99,8 @@ struct mlx5_flow_destination {
+ 	};
+ };
+ 
++struct mlx5_flow_namespace *
++mlx5_get_fdb_sub_ns(struct mlx5_core_dev *dev, int n);
+ struct mlx5_flow_namespace *
+ mlx5_get_flow_namespace(struct mlx5_core_dev *dev,
+ 			enum mlx5_flow_namespace_type type);
