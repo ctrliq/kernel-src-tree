@@ -1,0 +1,291 @@
+ceph: add a new flag to indicate whether parent is locked
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 3dd69aabcef3d835446a9a1e11d2eab0e6e35e95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3dd69aab.failed
+
+struct ceph_mds_request has an r_locked_dir pointer, which is set to
+indicate the parent inode and that its i_rwsem is locked.  In some
+critical places, we need to be able to indicate the parent inode to the
+request handling code, even when its i_rwsem may not be locked.
+
+Most of the code that operates on r_locked_dir doesn't require that the
+i_rwsem be locked. We only really need it to handle manipulation of the
+dcache. The rest (filling of the inode, updating dentry leases, etc.)
+already has its own locking.
+
+Add a new r_req_flags bit that indicates whether the parent is locked
+when doing the request, and rename the pointer to "r_parent". For now,
+all the places that set r_parent also set this flag, but that will
+change in a later patch.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: Yan, Zheng <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 3dd69aabcef3d835446a9a1e11d2eab0e6e35e95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/export.c
+#	fs/ceph/mds_client.c
+diff --cc fs/ceph/export.c
+index 0ca783ec1f0c,e8f11fa565c5..000000000000
+--- a/fs/ceph/export.c
++++ b/fs/ceph/export.c
+@@@ -224,12 -202,13 +224,20 @@@ static int ceph_get_name(struct dentry 
+  	if (IS_ERR(req))
+  		return PTR_ERR(req);
+  
+ -	inode_lock(d_inode(parent));
+ +	mutex_lock(&parent->d_inode->i_mutex);
+  
+++<<<<<<< HEAD
+ +	req->r_inode = child->d_inode;
+ +	ihold(child->d_inode);
+ +	req->r_ino2 = ceph_vino(parent->d_inode);
+ +	req->r_locked_dir = parent->d_inode;
+++=======
++ 	req->r_inode = d_inode(child);
++ 	ihold(d_inode(child));
++ 	req->r_ino2 = ceph_vino(d_inode(parent));
++ 	req->r_parent = d_inode(parent);
++ 	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+++>>>>>>> 3dd69aabcef3 (ceph: add a new flag to indicate whether parent is locked)
+  	req->r_num_caps = 2;
+  	err = ceph_mdsc_do_request(mdsc, NULL, req);
+  
+diff --cc fs/ceph/mds_client.c
+index d4c871d87952,52521f339745..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -713,14 -727,21 +713,26 @@@ static int __choose_mds(struct ceph_mds
+  	inode = NULL;
+  	if (req->r_inode) {
+  		inode = req->r_inode;
+ -		ihold(inode);
+  	} else if (req->r_dentry) {
+  		/* ignore race with rename; old or new d_parent is okay */
+ -		struct dentry *parent;
+ -		struct inode *dir;
+ -
+ +		struct dentry *parent = req->r_dentry->d_parent;
+ +		struct inode *dir = parent->d_inode;
+ +
+++<<<<<<< HEAD
+ +		if (dir->i_sb != mdsc->fsc->sb) {
+ +			/* not this fs! */
+ +			inode = req->r_dentry->d_inode;
+++=======
++ 		rcu_read_lock();
++ 		parent = req->r_dentry->d_parent;
++ 		dir = req->r_parent ? : d_inode_rcu(parent);
++ 
++ 		if (!dir || dir->i_sb != mdsc->fsc->sb) {
++ 			/*  not this fs or parent went negative */
++ 			inode = d_inode(req->r_dentry);
++ 			if (inode)
++ 				ihold(inode);
+++>>>>>>> 3dd69aabcef3 (ceph: add a new flag to indicate whether parent is locked)
+  		} else if (ceph_snap(dir) != CEPH_NOSNAP) {
+  			/* direct snapped/virtual snapdir requests
+  			 * based on parent dir inode */
+@@@ -1863,7 -1894,7 +1875,11 @@@ static struct ceph_msg *create_request_
+  	int ret;
+  
+  	ret = set_request_path_attr(req->r_inode, req->r_dentry,
+++<<<<<<< HEAD
+ +			      req->r_path1, req->r_ino1.ino,
+++=======
++ 			      req->r_parent, req->r_path1, req->r_ino1.ino,
+++>>>>>>> 3dd69aabcef3 (ceph: add a new flag to indicate whether parent is locked)
+  			      &path1, &pathlen1, &ino1, &freepath1);
+  	if (ret < 0) {
+  		msg = ERR_PTR(ret);
+@@@ -1924,13 -1956,16 +1940,18 @@@
+  		      mds, req->r_inode_drop, req->r_inode_unless, 0);
+  	if (req->r_dentry_drop)
+  		releases += ceph_encode_dentry_release(&p, req->r_dentry,
+++<<<<<<< HEAD
+ +		       mds, req->r_dentry_drop, req->r_dentry_unless);
+++=======
++ 				req->r_parent, mds, req->r_dentry_drop,
++ 				req->r_dentry_unless);
+++>>>>>>> 3dd69aabcef3 (ceph: add a new flag to indicate whether parent is locked)
+  	if (req->r_old_dentry_drop)
+  		releases += ceph_encode_dentry_release(&p, req->r_old_dentry,
+ -				req->r_old_dentry_dir, mds,
+ -				req->r_old_dentry_drop,
+ -				req->r_old_dentry_unless);
+ +		       mds, req->r_old_dentry_drop, req->r_old_dentry_unless);
+  	if (req->r_old_inode_drop)
+  		releases += ceph_encode_inode_release(&p,
+ -		      d_inode(req->r_old_dentry),
+ +		      req->r_old_dentry->d_inode,
+  		      mds, req->r_old_inode_drop, req->r_old_inode_unless, 0);
+  
+  	if (drop_cap_releases) {
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index dbbc67ba4d86..e6da6d5383a9 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -658,7 +658,8 @@ static struct dentry *ceph_lookup(struct inode *dir, struct dentry *dentry,
+ 		mask |= CEPH_CAP_XATTR_SHARED;
+ 	req->r_args.getattr.mask = cpu_to_le32(mask);
+ 
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	err = ceph_mdsc_do_request(mdsc, NULL, req);
+ 	err = ceph_handle_snapdir(req, dentry, err);
+ 	dentry = ceph_finish_lookup(req, dentry, err);
+@@ -719,7 +720,8 @@ static int ceph_mknod(struct inode *dir, struct dentry *dentry,
+ 	}
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_args.mknod.mode = cpu_to_le32(mode);
+ 	req->r_args.mknod.rdev = cpu_to_le32(rdev);
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+@@ -770,7 +772,8 @@ static int ceph_symlink(struct inode *dir, struct dentry *dentry,
+ 		ceph_mdsc_put_request(req);
+ 		goto out;
+ 	}
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+@@ -819,7 +822,8 @@ static int ceph_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_args.mkdir.mode = cpu_to_le32(mode);
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+ 	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+@@ -863,7 +867,8 @@ static int ceph_link(struct dentry *old_dentry, struct inode *dir,
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+ 	req->r_old_dentry = dget(old_dentry);
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+ 	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+ 	/* release LINK_SHARED on source inode (mds will lock it) */
+@@ -930,7 +935,8 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 	}
+ 	req->r_dentry = dget(dentry);
+ 	req->r_num_caps = 2;
+-	req->r_locked_dir = dir;
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+ 	req->r_dentry_unless = CEPH_CAP_FILE_EXCL;
+ 	req->r_inode_drop = drop_caps_for_unlink(inode);
+@@ -969,7 +975,8 @@ static int ceph_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	req->r_num_caps = 2;
+ 	req->r_old_dentry = dget(old_dentry);
+ 	req->r_old_dentry_dir = old_dir;
+-	req->r_locked_dir = new_dir;
++	req->r_parent = new_dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	req->r_old_dentry_drop = CEPH_CAP_FILE_SHARED;
+ 	req->r_old_dentry_unless = CEPH_CAP_FILE_EXCL;
+ 	req->r_dentry_drop = CEPH_CAP_FILE_SHARED;
+* Unmerged path fs/ceph/export.c
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 2674bf972b21..da28c4a593d8 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -385,7 +385,8 @@ int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+                mask |= CEPH_CAP_XATTR_SHARED;
+        req->r_args.open.mask = cpu_to_le32(mask);
+ 
+-	req->r_locked_dir = dir;           /* caller holds dir->i_mutex */
++	req->r_parent = dir;
++	set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+ 	err = ceph_mdsc_do_request(mdsc,
+ 				   (flags & (O_CREAT|O_TRUNC)) ? dir : NULL,
+ 				   req);
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 93baa9be80ac..67737848844f 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1107,13 +1107,13 @@ int ceph_fill_trace(struct super_block *sb, struct ceph_mds_request *req)
+ 
+ 	if (!rinfo->head->is_target && !rinfo->head->is_dentry) {
+ 		dout("fill_trace reply is empty!\n");
+-		if (rinfo->head->result == 0 && req->r_locked_dir)
++		if (rinfo->head->result == 0 && req->r_parent)
+ 			ceph_invalidate_dir_request(req);
+ 		return 0;
+ 	}
+ 
+ 	if (rinfo->head->is_dentry) {
+-		struct inode *dir = req->r_locked_dir;
++		struct inode *dir = req->r_parent;
+ 
+ 		if (dir) {
+ 			err = fill_inode(dir, NULL,
+@@ -1203,8 +1203,9 @@ retry_lookup:
+ 	 * ignore null lease/binding on snapdir ENOENT, or else we
+ 	 * will have trouble splicing in the virtual snapdir later
+ 	 */
+-	if (rinfo->head->is_dentry && req->r_locked_dir &&
+-	    !test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags) &&
++	if (rinfo->head->is_dentry &&
++            !test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags) &&
++	    test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags) &&
+ 	    (rinfo->head->is_target || strncmp(req->r_dentry->d_name.name,
+ 					       fsc->mount_options->snapdir_name,
+ 					       req->r_dentry->d_name.len))) {
+@@ -1213,7 +1214,7 @@ retry_lookup:
+ 		 * mknod symlink mkdir  : null -> new inode
+ 		 * unlink               : linked -> null
+ 		 */
+-		struct inode *dir = req->r_locked_dir;
++		struct inode *dir = req->r_parent;
+ 		struct dentry *dn = req->r_dentry;
+ 		bool have_dir_cap, have_lease;
+ 
+@@ -1313,7 +1314,7 @@ retry_lookup:
+ 		    req->r_op == CEPH_MDS_OP_MKSNAP) &&
+ 		   !test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags)) {
+ 		struct dentry *dn = req->r_dentry;
+-		struct inode *dir = req->r_locked_dir;
++		struct inode *dir = req->r_parent;
+ 
+ 		/* fill out a snapdir LOOKUPSNAP dentry */
+ 		BUG_ON(!dn);
+* Unmerged path fs/ceph/mds_client.c
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index de2a0169112c..72f908eb05e8 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -194,7 +194,7 @@ struct ceph_mds_request {
+ 	char *r_path1, *r_path2;
+ 	struct ceph_vino r_ino1, r_ino2;
+ 
+-	struct inode *r_locked_dir; /* dir (if any) i_mutex locked by vfs */
++	struct inode *r_parent;		    /* parent dir inode */
+ 	struct inode *r_target_inode;       /* resulting inode */
+ 
+ #define CEPH_MDS_R_DIRECT_IS_HASH	(1) /* r_direct_hash is valid */
+@@ -203,6 +203,7 @@ struct ceph_mds_request {
+ #define CEPH_MDS_R_GOT_SAFE		(4) /* got a safe reply */
+ #define CEPH_MDS_R_GOT_RESULT		(5) /* got a result */
+ #define CEPH_MDS_R_DID_PREPOPULATE	(6) /* prepopulated readdir */
++#define CEPH_MDS_R_PARENT_LOCKED	(7) /* is r_parent->i_rwsem wlocked? */
+ 	unsigned long	r_req_flags;
+ 
+ 	struct mutex r_fill_mutex;
