@@ -1,0 +1,168 @@
+net: phy: Fix the issue that netif always links up after resuming
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] phy: Fix the issue that netif always links up after resuming (Ivan Vecera) [1685646]
+Rebuild_FUZZ: 96.00%
+commit-author Kunihiko Hayashi <hayashi.kunihiko@socionext.com>
+commit 8742beb50f2db903d3b6d69ddd81d67ce9914453
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8742beb5.failed
+
+Even though the link is down before entering hibernation,
+there is an issue that the network interface always links up after resuming
+from hibernation.
+
+If the link is still down before enabling the network interface,
+and after resuming from hibernation, the phydev->state is forcibly set
+to PHY_UP in mdio_bus_phy_restore(), and the link becomes up.
+
+In suspend sequence, only if the PHY is attached, mdio_bus_phy_suspend()
+calls phy_stop_machine(), and mdio_bus_phy_resume() calls
+phy_start_machine().
+In resume sequence, it's enough to do the same as mdio_bus_phy_resume()
+because the state has been preserved.
+
+This patch fixes the issue by calling phy_start_machine() in
+mdio_bus_phy_restore() in the same way as mdio_bus_phy_resume().
+
+Fixes: bc87922ff59d ("phy: Move PHY PM operations into phy_device")
+	Suggested-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Signed-off-by: Kunihiko Hayashi <hayashi.kunihiko@socionext.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8742beb50f2db903d3b6d69ddd81d67ce9914453)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/phy_device.c
+diff --cc drivers/net/phy/phy_device.c
+index f7f4abfd4a6f,26c41ede54a4..000000000000
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@@ -62,9 -219,120 +62,123 @@@ static struct phy_driver genphy_driver[
+  static LIST_HEAD(phy_fixup_list);
+  static DEFINE_MUTEX(phy_fixup_lock);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM
++ static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
++ {
++ 	struct device_driver *drv = phydev->mdio.dev.driver;
++ 	struct phy_driver *phydrv = to_phy_driver(drv);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 
++ 	if (!drv || !phydrv->suspend)
++ 		return false;
++ 
++ 	/* PHY not attached? May suspend if the PHY has not already been
++ 	 * suspended as part of a prior call to phy_disconnect() ->
++ 	 * phy_detach() -> phy_suspend() because the parent netdev might be the
++ 	 * MDIO bus driver and clock gated at this point.
++ 	 */
++ 	if (!netdev)
++ 		return !phydev->suspended;
++ 
++ 	if (netdev->wol_enabled)
++ 		return false;
++ 
++ 	/* As long as not all affected network drivers support the
++ 	 * wol_enabled flag, let's check for hints that WoL is enabled.
++ 	 * Don't suspend PHY if the attached netdev parent may wake up.
++ 	 * The parent may point to a PCI device, as in tg3 driver.
++ 	 */
++ 	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
++ 		return false;
++ 
++ 	/* Also don't suspend PHY if the netdev itself may wakeup. This
++ 	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
++ 	 * e.g. SoC devices.
++ 	 */
++ 	if (device_may_wakeup(&netdev->dev))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int mdio_bus_phy_suspend(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 
++ 	/* We must stop the state machine manually, otherwise it stops out of
++ 	 * control, possibly with the phydev->lock held. Upon resume, netdev
++ 	 * may call phy routines that try to grab the same lock, and that may
++ 	 * lead to a deadlock.
++ 	 */
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_stop_machine(phydev);
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		return 0;
++ 
++ 	return phy_suspend(phydev);
++ }
++ 
++ static int mdio_bus_phy_resume(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	int ret;
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		goto no_resume;
++ 
++ 	ret = phy_resume(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ no_resume:
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static int mdio_bus_phy_restore(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 	int ret;
++ 
++ 	if (!netdev)
++ 		return 0;
++ 
++ 	ret = phy_init_hw(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static const struct dev_pm_ops mdio_bus_phy_pm_ops = {
++ 	.suspend = mdio_bus_phy_suspend,
++ 	.resume = mdio_bus_phy_resume,
++ 	.freeze = mdio_bus_phy_suspend,
++ 	.thaw = mdio_bus_phy_resume,
++ 	.restore = mdio_bus_phy_restore,
++ };
++ 
++ #define MDIO_BUS_PHY_PM_OPS (&mdio_bus_phy_pm_ops)
++ 
++ #else
++ 
++ #define MDIO_BUS_PHY_PM_OPS NULL
++ 
++ #endif /* CONFIG_PM */
++ 
+++>>>>>>> 8742beb50f2d (net: phy: Fix the issue that netif always links up after resuming)
+  /**
+   * phy_register_fixup - creates a new phy_fixup and adds it to the list
+ - * @bus_id: A string which matches phydev->mdio.dev.bus_id (or PHY_ANY_ID)
+ + * @bus_id: A string which matches phydev->dev.bus_id (or PHY_ANY_ID)
+   * @phy_uid: Used to match against phydev->phy_id (the UID of the PHY)
+   *	It can also be PHY_ANY_UID
+   * @phy_uid_mask: Applied to phydev->phy_id and fixup->phy_uid before
+* Unmerged path drivers/net/phy/phy_device.c
