@@ -2128,7 +2128,8 @@ static struct pmu pmu = {
 	.task_ctx_size          = sizeof(struct x86_perf_task_context),
 };
 
-void arch_perf_update_userpage(struct perf_event_mmap_page *userpg, u64 now)
+void arch_perf_update_userpage(struct perf_event *event,
+			       struct perf_event_mmap_page *userpg, u64 now)
 {
 	struct cyc2ns_data *data;
 
