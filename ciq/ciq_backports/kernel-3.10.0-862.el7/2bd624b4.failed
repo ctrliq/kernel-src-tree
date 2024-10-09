@@ -1,0 +1,145 @@
+packet: Do not call fanout_release from atomic contexts
+
+jira LE-1907
+cve CVE-2017-15649
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Anoob Soman <anoob.soman@citrix.com>
+commit 2bd624b4611ffee36422782d16e1c944d1351e98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2bd624b4.failed
+
+Commit 6664498280cf ("packet: call fanout_release, while UNREGISTERING a
+netdev"), unfortunately, introduced the following issues.
+
+1. calling mutex_lock(&fanout_mutex) (fanout_release()) from inside
+rcu_read-side critical section. rcu_read_lock disables preemption, most often,
+which prohibits calling sleeping functions.
+
+[  ] include/linux/rcupdate.h:560 Illegal context switch in RCU read-side critical section!
+[  ]
+[  ] rcu_scheduler_active = 1, debug_locks = 0
+[  ] 4 locks held by ovs-vswitchd/1969:
+[  ]  #0:  (cb_lock){++++++}, at: [<ffffffff8158a6c9>] genl_rcv+0x19/0x40
+[  ]  #1:  (ovs_mutex){+.+.+.}, at: [<ffffffffa04878ca>] ovs_vport_cmd_del+0x4a/0x100 [openvswitch]
+[  ]  #2:  (rtnl_mutex){+.+.+.}, at: [<ffffffff81564157>] rtnl_lock+0x17/0x20
+[  ]  #3:  (rcu_read_lock){......}, at: [<ffffffff81614165>] packet_notifier+0x5/0x3f0
+[  ]
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff810c9077>] lockdep_rcu_suspicious+0x107/0x110
+[  ]  [<ffffffff810a2da7>] ___might_sleep+0x57/0x210
+[  ]  [<ffffffff810a2fd0>] __might_sleep+0x70/0x90
+[  ]  [<ffffffff8162e80c>] mutex_lock_nested+0x3c/0x3a0
+[  ]  [<ffffffff810de93f>] ? vprintk_default+0x1f/0x30
+[  ]  [<ffffffff81186e88>] ? printk+0x4d/0x4f
+[  ]  [<ffffffff816106dd>] fanout_release+0x1d/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+2. calling mutex_lock(&fanout_mutex) inside spin_lock(&po->bind_lock).
+"sleeping function called from invalid context"
+
+[  ] BUG: sleeping function called from invalid context at kernel/locking/mutex.c:620
+[  ] in_atomic(): 1, irqs_disabled(): 0, pid: 1969, name: ovs-vswitchd
+[  ] INFO: lockdep is turned off.
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff810a2f52>] ___might_sleep+0x202/0x210
+[  ]  [<ffffffff810a2fd0>] __might_sleep+0x70/0x90
+[  ]  [<ffffffff8162e80c>] mutex_lock_nested+0x3c/0x3a0
+[  ]  [<ffffffff816106dd>] fanout_release+0x1d/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+3. calling dev_remove_pack(&fanout->prot_hook), from inside
+spin_lock(&po->bind_lock) or rcu_read-side critical-section. dev_remove_pack()
+-> synchronize_net(), which might sleep.
+
+[  ] BUG: scheduling while atomic: ovs-vswitchd/1969/0x00000002
+[  ] INFO: lockdep is turned off.
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff81186274>] __schedule_bug+0x64/0x73
+[  ]  [<ffffffff8162b8cb>] __schedule+0x6b/0xd10
+[  ]  [<ffffffff8162c5db>] schedule+0x6b/0x80
+[  ]  [<ffffffff81630b1d>] schedule_timeout+0x38d/0x410
+[  ]  [<ffffffff810ea3fd>] synchronize_sched_expedited+0x53d/0x810
+[  ]  [<ffffffff810ea6de>] synchronize_rcu_expedited+0xe/0x10
+[  ]  [<ffffffff8154eab5>] synchronize_net+0x35/0x50
+[  ]  [<ffffffff8154eae3>] dev_remove_pack+0x13/0x20
+[  ]  [<ffffffff8161077e>] fanout_release+0xbe/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+4. fanout_release() races with calls from different CPU.
+
+To fix the above problems, remove the call to fanout_release() under
+rcu_read_lock(). Instead, call __dev_remove_pack(&fanout->prot_hook) and
+netdev_run_todo will be happy that &dev->ptype_specific list is empty. In order
+to achieve this, I moved dev_{add,remove}_pack() out of fanout_{add,release} to
+__fanout_{link,unlink}. So, call to {,__}unregister_prot_hook() will make sure
+fanout->prot_hook is removed as well.
+
+Fixes: 6664498280cf ("packet: call fanout_release, while UNREGISTERING a netdev")
+	Reported-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Anoob Soman <anoob.soman@citrix.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2bd624b4611ffee36422782d16e1c944d1351e98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 4908358f9312,70f5b6a4683c..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -1441,21 -1731,38 +1449,30 @@@ static struct packet_fanout *fanout_rel
+  	struct packet_sock *po = pkt_sk(sk);
+  	struct packet_fanout *f;
+  
+ -	mutex_lock(&fanout_mutex);
+  	f = po->fanout;
+ -	if (f) {
+ -		po->fanout = NULL;
+ +	if (!f)
+ +		return;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&fanout_mutex);
+ +	po->fanout = NULL;
+++=======
++ 		if (atomic_dec_and_test(&f->sk_ref))
++ 			list_del(&f->list);
++ 		else
++ 			f = NULL;
+++>>>>>>> 2bd624b4611f (packet: Do not call fanout_release from atomic contexts)
+  
+ -		if (po->rollover)
+ -			kfree_rcu(po->rollover, rcu);
+ +	if (atomic_dec_and_test(&f->sk_ref)) {
+ +		list_del(&f->list);
+ +		dev_remove_pack(&f->prot_hook);
+ +		kfree(f);
+  	}
+  	mutex_unlock(&fanout_mutex);
++ 
++ 	return f;
+  }
+  
+ -static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
+ -					  struct sk_buff *skb)
+ -{
+ -	/* Earlier code assumed this would be a VLAN pkt, double-check
+ -	 * this now that we have the actual packet in hand. We can only
+ -	 * do this check on Ethernet devices.
+ -	 */
+ -	if (unlikely(dev->type != ARPHRD_ETHER))
+ -		return false;
+ -
+ -	skb_reset_mac_header(skb);
+ -	return likely(eth_hdr(skb)->h_proto == htons(ETH_P_8021Q));
+ -}
+ -
+  static const struct proto_ops packet_ops;
+  
+  static const struct proto_ops packet_ops_spkt;
+* Unmerged path net/packet/af_packet.c
