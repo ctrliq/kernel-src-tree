@@ -1,0 +1,485 @@
+IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Niranjana Vishwanathapura <niranjana.vishwanathapura@intel.com>
+commit 8e959601996dc645f4ed7004482a1667c27deb39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8e959601.failed
+
+IPOIB is calling free_rdma_netdev even though alloc_rdma_netdev has
+returned -EOPNOTSUPP.
+Move free_rdma_netdev from ib_device structure to rdma_netdev structure
+thus ensuring proper cleanup function is called for the rdma net device.
+
+Fix the following trace:
+
+ib0: Failed to modify QP to ERROR state
+BUG: unable to handle kernel paging request at 0000000000001d20
+IP: hfi1_vnic_free_rn+0x26/0xb0 [hfi1]
+Call Trace:
+ ipoib_remove_one+0xbe/0x160 [ib_ipoib]
+ ib_unregister_device+0xd0/0x170 [ib_core]
+ rvt_unregister_device+0x29/0x90 [rdmavt]
+ hfi1_unregister_ib_device+0x1a/0x100 [hfi1]
+ remove_one+0x4b/0x220 [hfi1]
+ pci_device_remove+0x39/0xc0
+ device_release_driver_internal+0x141/0x200
+ driver_detach+0x3f/0x80
+ bus_remove_driver+0x55/0xd0
+ driver_unregister+0x2c/0x50
+ pci_unregister_driver+0x2a/0xa0
+ hfi1_mod_cleanup+0x10/0xf65 [hfi1]
+ SyS_delete_module+0x171/0x250
+ do_syscall_64+0x67/0x150
+ entry_SYSCALL64_slow_path+0x25/0x25
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Niranjana Vishwanathapura <niranjana.vishwanathapura@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 8e959601996dc645f4ed7004482a1667c27deb39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index ab5c8fee5236,afa5f6e88e1d..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3236,6 -3443,133 +3236,136 @@@ dealloc_counters
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rdma_hw_stats *mlx5_ib_alloc_hw_stats(struct ib_device *ibdev,
++ 						    u8 port_num)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 
++ 	/* We support only per port stats */
++ 	if (port_num == 0)
++ 		return NULL;
++ 
++ 	return rdma_alloc_hw_stats_struct(port->cnts.names,
++ 					  port->cnts.num_q_counters +
++ 					  port->cnts.num_cong_counters,
++ 					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
++ }
++ 
++ static int mlx5_ib_query_q_counters(struct mlx5_ib_dev *dev,
++ 				    struct mlx5_ib_port *port,
++ 				    struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_q_counter_out);
++ 	void *out;
++ 	__be32 val;
++ 	int ret, i;
++ 
++ 	out = mlx5_vzalloc(outlen);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_core_query_q_counter(dev->mdev,
++ 					port->cnts.set_id, 0,
++ 					out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_q_counters; i++) {
++ 		val = *(__be32 *)(out + port->cnts.offsets[i]);
++ 		stats->value[i] = (u64)be32_to_cpu(val);
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_query_cong_counters(struct mlx5_ib_dev *dev,
++ 				       struct mlx5_ib_port *port,
++ 				       struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_cong_statistics_out);
++ 	void *out;
++ 	int ret, i;
++ 	int offset = port->cnts.num_q_counters;
++ 
++ 	out = mlx5_vzalloc(outlen);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_cmd_query_cong_counter(dev->mdev, false, out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_cong_counters; i++) {
++ 		stats->value[i + offset] =
++ 			be64_to_cpup((__be64 *)(out +
++ 				     port->cnts.offsets[i + offset]));
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
++ 				struct rdma_hw_stats *stats,
++ 				u8 port_num, int index)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 	int ret, num_counters;
++ 
++ 	if (!stats)
++ 		return -EINVAL;
++ 
++ 	ret = mlx5_ib_query_q_counters(dev, port, stats);
++ 	if (ret)
++ 		return ret;
++ 	num_counters = port->cnts.num_q_counters;
++ 
++ 	if (MLX5_CAP_GEN(dev->mdev, cc_query_allowed)) {
++ 		ret = mlx5_ib_query_cong_counters(dev, port, stats);
++ 		if (ret)
++ 			return ret;
++ 		num_counters += port->cnts.num_cong_counters;
++ 	}
++ 
++ 	return num_counters;
++ }
++ 
++ static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
++ {
++ 	return mlx5_rdma_netdev_free(netdev);
++ }
++ 
++ static struct net_device*
++ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
++ 			  u8 port_num,
++ 			  enum rdma_netdev_t type,
++ 			  const char *name,
++ 			  unsigned char name_assign_type,
++ 			  void (*setup)(struct net_device *))
++ {
++ 	struct net_device *netdev;
++ 	struct rdma_netdev *rn;
++ 
++ 	if (type != RDMA_NETDEV_IPOIB)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	netdev = mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
++ 					name, setup);
++ 	if (likely(!IS_ERR_OR_NULL(netdev))) {
++ 		rn = netdev_priv(netdev);
++ 		rn->free_rdma_netdev = mlx5_ib_free_rdma_netdev;
++ 	}
++ 	return netdev;
++ }
++ 
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+  {
+  	struct mlx5_ib_dev *dev;
+@@@ -3368,6 -3700,9 +3498,12 @@@
+  	dev->ib_dev.check_mr_status	= mlx5_ib_check_mr_status;
+  	dev->ib_dev.get_port_immutable  = mlx5_port_immutable;
+  	dev->ib_dev.get_dev_fw_str      = get_dev_fw_str;
+++<<<<<<< HEAD
+++=======
++ 	if (MLX5_CAP_GEN(mdev, ipoib_enhanced_offloads))
++ 		dev->ib_dev.alloc_rdma_netdev	= mlx5_ib_alloc_rdma_netdev;
++ 
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  	if (mlx5_core_is_pf(mdev)) {
+  		dev->ib_dev.get_vf_config	= mlx5_ib_get_vf_config;
+  		dev->ib_dev.set_vf_link_state	= mlx5_ib_set_vf_link_state;
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 276f436108b6,9ec0dbea3b6b..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1939,7 -1888,71 +1939,75 @@@ struct ipoib_dev_priv *ipoib_intf_alloc
+  	if (!dev)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	return netdev_priv(dev);
+++=======
++ 	rn = netdev_priv(dev);
++ 
++ 	rn->send = ipoib_send;
++ 	rn->attach_mcast = ipoib_mcast_attach;
++ 	rn->detach_mcast = ipoib_mcast_detach;
++ 	rn->free_rdma_netdev = free_netdev;
++ 	rn->hca = hca;
++ 
++ 	dev->netdev_ops = &ipoib_netdev_default_pf;
++ 
++ 	return dev;
++ }
++ 
++ static struct net_device *ipoib_get_netdev(struct ib_device *hca, u8 port,
++ 					   const char *name)
++ {
++ 	struct net_device *dev;
++ 
++ 	if (hca->alloc_rdma_netdev) {
++ 		dev = hca->alloc_rdma_netdev(hca, port,
++ 					     RDMA_NETDEV_IPOIB, name,
++ 					     NET_NAME_UNKNOWN,
++ 					     ipoib_setup_common);
++ 		if (IS_ERR_OR_NULL(dev) && PTR_ERR(dev) != -EOPNOTSUPP)
++ 			return NULL;
++ 	}
++ 
++ 	if (!hca->alloc_rdma_netdev || PTR_ERR(dev) == -EOPNOTSUPP)
++ 		dev = ipoib_create_netdev_default(hca, name, NET_NAME_UNKNOWN,
++ 						  ipoib_setup_common);
++ 
++ 	return dev;
++ }
++ 
++ struct ipoib_dev_priv *ipoib_intf_alloc(struct ib_device *hca, u8 port,
++ 					const char *name)
++ {
++ 	struct net_device *dev;
++ 	struct ipoib_dev_priv *priv;
++ 	struct rdma_netdev *rn;
++ 
++ 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++ 	if (!priv)
++ 		return NULL;
++ 
++ 	dev = ipoib_get_netdev(hca, port, name);
++ 	if (!dev)
++ 		goto free_priv;
++ 
++ 	priv->rn_ops = dev->netdev_ops;
++ 
++ 	/* fixme : should be after the query_cap */
++ 	if (priv->hca_caps & IB_DEVICE_VIRTUAL_FUNCTION)
++ 		dev->netdev_ops	= &ipoib_netdev_ops_vf;
++ 	else
++ 		dev->netdev_ops	= &ipoib_netdev_ops_pf;
++ 
++ 	rn = netdev_priv(dev);
++ 	rn->clnt_priv = priv;
++ 	ipoib_build_priv(dev);
++ 
++ 	return priv;
++ free_priv:
++ 	kfree(priv);
++ 	return NULL;
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  }
+  
+  static ssize_t show_pkey(struct device *dev,
+@@@ -2290,7 -2307,12 +2360,16 @@@ static void ipoib_remove_one(struct ib_
+  		flush_workqueue(priv->wq);
+  
+  		unregister_netdev(priv->dev);
+++<<<<<<< HEAD
+ +		free_netdev(priv->dev);
+++=======
++ 		rn->free_rdma_netdev(priv->dev);
++ 
++ 		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs, list)
++ 			kfree(cpriv);
++ 
++ 		kfree(priv);
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  	}
+  
+  	kfree(dev_list);
+diff --cc include/rdma/ib_verbs.h
+index 137c4686969e,71313d5ca1c8..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -1911,7 -1912,39 +1911,41 @@@ struct ib_port_immutable 
+  	u32                           max_mad_size;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* rdma netdev type - specifies protocol type */
++ enum rdma_netdev_t {
++ 	RDMA_NETDEV_OPA_VNIC,
++ 	RDMA_NETDEV_IPOIB,
++ };
++ 
++ /**
++  * struct rdma_netdev - rdma netdev
++  * For cases where netstack interfacing is required.
++  */
++ struct rdma_netdev {
++ 	void              *clnt_priv;
++ 	struct ib_device  *hca;
++ 	u8                 port_num;
++ 
++ 	/* cleanup function must be specified */
++ 	void (*free_rdma_netdev)(struct net_device *netdev);
++ 
++ 	/* control functions */
++ 	void (*set_id)(struct net_device *netdev, int id);
++ 	/* send packet */
++ 	int (*send)(struct net_device *dev, struct sk_buff *skb,
++ 		    struct ib_ah *address, u32 dqpn);
++ 	/* multicast */
++ 	int (*attach_mcast)(struct net_device *dev, struct ib_device *hca,
++ 			    union ib_gid *gid, u16 mlid,
++ 			    int set_qkey, u32 qkey);
++ 	int (*detach_mcast)(struct net_device *dev, struct ib_device *hca,
++ 			    union ib_gid *gid, u16 mlid);
++ };
++ 
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  struct ib_device {
+ -	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+  	struct device                *dma_device;
+  
+  	char                          name[IB_DEVICE_NAME_MAX];
+@@@ -2161,10 -2196,19 +2195,26 @@@
+  							   struct ib_rwq_ind_table_init_attr *init_attr,
+  							   struct ib_udata *udata);
+  	int                        (*destroy_rwq_ind_table)(struct ib_rwq_ind_table *wq_ind_table);
+++<<<<<<< HEAD
+ +	void			   (*drain_rq)(struct ib_qp *qp);
+ +	void			   (*drain_sq)(struct ib_qp *qp);
+ +
+ +	struct ib_dma_mapping_ops   *dma_ops;
+++=======
++ 	/**
++ 	 * rdma netdev operation
++ 	 *
++ 	 * Driver implementing alloc_rdma_netdev must return -EOPNOTSUPP if it
++ 	 * doesn't support the specified rdma netdev type.
++ 	 */
++ 	struct net_device *(*alloc_rdma_netdev)(
++ 					struct ib_device *device,
++ 					u8 port_num,
++ 					enum rdma_netdev_t type,
++ 					const char *name,
++ 					unsigned char name_assign_type,
++ 					void (*setup)(struct net_device *));
+++>>>>>>> 8e959601996d (IB/core, opa_vnic, hfi1, mlx5: Properly free rdma_netdev)
+  
+  	struct module               *owner;
+  	struct device                dev;
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index 1cf5f1c1aa2f..59621194a95b 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -1774,7 +1774,6 @@ int hfi1_register_ib_device(struct hfi1_devdata *dd)
+ 	ibdev->alloc_hw_stats = alloc_hw_stats;
+ 	ibdev->get_hw_stats = get_hw_stats;
+ 	ibdev->alloc_rdma_netdev = hfi1_vnic_alloc_rn;
+-	ibdev->free_rdma_netdev = hfi1_vnic_free_rn;
+ 
+ 	/* keep process mad in the driver */
+ 	ibdev->process_mad = hfi1_process_mad;
+diff --git a/drivers/infiniband/hw/hfi1/vnic.h b/drivers/infiniband/hw/hfi1/vnic.h
+index e2c455299b53..4a621cde4abb 100644
+--- a/drivers/infiniband/hw/hfi1/vnic.h
++++ b/drivers/infiniband/hw/hfi1/vnic.h
+@@ -176,7 +176,6 @@ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
+ 				      const char *name,
+ 				      unsigned char name_assign_type,
+ 				      void (*setup)(struct net_device *));
+-void hfi1_vnic_free_rn(struct net_device *netdev);
+ int hfi1_vnic_send_dma(struct hfi1_devdata *dd, u8 q_idx,
+ 		       struct hfi1_vnic_vport_info *vinfo,
+ 		       struct sk_buff *skb, u64 pbc, u8 plen);
+diff --git a/drivers/infiniband/hw/hfi1/vnic_main.c b/drivers/infiniband/hw/hfi1/vnic_main.c
+index b1572c795c35..8d198b15a078 100644
+--- a/drivers/infiniband/hw/hfi1/vnic_main.c
++++ b/drivers/infiniband/hw/hfi1/vnic_main.c
+@@ -837,6 +837,15 @@ static const struct net_device_ops hfi1_netdev_ops = {
+ 	.ndo_get_stats64 = hfi1_vnic_get_stats64,
+ };
+ 
++static void hfi1_vnic_free_rn(struct net_device *netdev)
++{
++	struct hfi1_vnic_vport_info *vinfo = opa_vnic_dev_priv(netdev);
++
++	hfi1_vnic_deinit(vinfo);
++	mutex_destroy(&vinfo->lock);
++	free_netdev(netdev);
++}
++
+ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
+ 				      u8 port_num,
+ 				      enum rdma_netdev_t type,
+@@ -868,6 +877,7 @@ struct net_device *hfi1_vnic_alloc_rn(struct ib_device *device,
+ 	vinfo->num_tx_q = dd->chip_sdma_engines;
+ 	vinfo->num_rx_q = HFI1_NUM_VNIC_CTXT;
+ 	vinfo->netdev = netdev;
++	rn->free_rdma_netdev = hfi1_vnic_free_rn;
+ 	rn->set_id = hfi1_vnic_set_vesw_id;
+ 
+ 	netdev->features = NETIF_F_HIGHDMA | NETIF_F_SG;
+@@ -896,12 +906,3 @@ init_fail:
+ 	free_netdev(netdev);
+ 	return ERR_PTR(rc);
+ }
+-
+-void hfi1_vnic_free_rn(struct net_device *netdev)
+-{
+-	struct hfi1_vnic_vport_info *vinfo = opa_vnic_dev_priv(netdev);
+-
+-	hfi1_vnic_deinit(vinfo);
+-	mutex_destroy(&vinfo->lock);
+-	free_netdev(netdev);
+-}
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+diff --git a/drivers/infiniband/ulp/opa_vnic/opa_vnic_netdev.c b/drivers/infiniband/ulp/opa_vnic/opa_vnic_netdev.c
+index 78d9007bc2f6..1a89c6033358 100644
+--- a/drivers/infiniband/ulp/opa_vnic/opa_vnic_netdev.c
++++ b/drivers/infiniband/ulp/opa_vnic/opa_vnic_netdev.c
+@@ -323,13 +323,13 @@ struct opa_vnic_adapter *opa_vnic_add_netdev(struct ib_device *ibdev,
+ 	else if (IS_ERR(netdev))
+ 		return ERR_CAST(netdev);
+ 
++	rn = netdev_priv(netdev);
+ 	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
+ 	if (!adapter) {
+ 		rc = -ENOMEM;
+ 		goto adapter_err;
+ 	}
+ 
+-	rn = netdev_priv(netdev);
+ 	rn->clnt_priv = adapter;
+ 	rn->hca = ibdev;
+ 	rn->port_num = port_num;
+@@ -366,7 +366,7 @@ netdev_err:
+ 	mutex_destroy(&adapter->mactbl_lock);
+ 	kfree(adapter);
+ adapter_err:
+-	ibdev->free_rdma_netdev(netdev);
++	rn->free_rdma_netdev(netdev);
+ 
+ 	return ERR_PTR(rc);
+ }
+@@ -375,7 +375,7 @@ adapter_err:
+ void opa_vnic_rem_netdev(struct opa_vnic_adapter *adapter)
+ {
+ 	struct net_device *netdev = adapter->netdev;
+-	struct ib_device *ibdev = adapter->ibdev;
++	struct rdma_netdev *rn = netdev_priv(netdev);
+ 
+ 	v_info("removing\n");
+ 	unregister_netdev(netdev);
+@@ -383,5 +383,5 @@ void opa_vnic_rem_netdev(struct opa_vnic_adapter *adapter)
+ 	mutex_destroy(&adapter->lock);
+ 	mutex_destroy(&adapter->mactbl_lock);
+ 	kfree(adapter);
+-	ibdev->free_rdma_netdev(netdev);
++	rn->free_rdma_netdev(netdev);
+ }
+* Unmerged path include/rdma/ib_verbs.h
