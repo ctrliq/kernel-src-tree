@@ -430,7 +430,6 @@ const char *mei_pg_state_str(enum mei_pg_state state);
  * @me_clients  : list of FW clients
  * @me_clients_map : FW clients bit map
  * @host_clients_map : host clients id pool
- * @me_client_index : last FW client index in enumeration
  *
  * @allow_fixed_address: allow user space to connect a fixed client
  *
@@ -525,7 +524,6 @@ struct mei_device {
 	struct list_head me_clients;
 	DECLARE_BITMAP(me_clients_map, MEI_CLIENTS_MAX);
 	DECLARE_BITMAP(host_clients_map, MEI_CLIENTS_MAX);
-	unsigned long me_client_index;
 
 	u32 allow_fixed_address;
 
