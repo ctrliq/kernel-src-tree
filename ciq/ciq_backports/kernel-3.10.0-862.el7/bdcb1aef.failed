@@ -1,0 +1,1862 @@
+powerpc/64s: Improve RFI L1-D cache flush fallback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [powerpc] 64s: Improve RFI L1-D cache flush fallback (Mauricio Oliveira) [1543067]
+Rebuild_FUZZ: 91.30%
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit bdcb1aefc5b3f7d0f1dc8b02673602bca2ff7a4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bdcb1aef.failed
+
+The fallback RFI flush is used when firmware does not provide a way
+to flush the cache. It's a "displacement flush" that evicts useful
+data by displacing it with an uninteresting buffer.
+
+The flush has to take care to work with implementation specific cache
+replacment policies, so the recipe has been in flux. The initial
+slow but conservative approach is to touch all lines of a congruence
+class, with dependencies between each load. It has since been
+determined that a linear pattern of loads without dependencies is
+sufficient, and is significantly faster.
+
+Measuring the speed of a null syscall with RFI fallback flush enabled
+gives the relative improvement:
+
+P8 - 1.83x
+P9 - 1.75x
+
+The flush also becomes simpler and more adaptable to different cache
+geometries.
+
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit bdcb1aefc5b3f7d0f1dc8b02673602bca2ff7a4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/paca.h
+#	arch/powerpc/kernel/asm-offsets.c
+#	arch/powerpc/kernel/exceptions-64s.S
+#	arch/powerpc/kernel/setup_64.c
+#	arch/powerpc/xmon/xmon.c
+diff --cc arch/powerpc/include/asm/paca.h
+index 1e5fd781231c,b62c31037cad..000000000000
+--- a/arch/powerpc/include/asm/paca.h
++++ b/arch/powerpc/include/asm/paca.h
+@@@ -197,6 -224,22 +197,25 @@@ struct paca_struct 
+  	struct kvmppc_book3s_shadow_vcpu shadow_vcpu;
+  #endif
+  	struct kvmppc_host_state kvm_hstate;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
++ 	/*
++ 	 * Bitmap for sibling subcore status. See kvm/book3s_hv_ras.c for
++ 	 * more details
++ 	 */
++ 	struct sibling_subcore_state *sibling_subcore_state;
++ #endif
++ #endif
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	/*
++ 	 * rfi fallback flush must be in its own cacheline to prevent
++ 	 * other paca data leaking into the L1d
++ 	 */
++ 	u64 exrfi[EX_SIZE] __aligned(0x80);
++ 	void *rfi_flush_fallback_area;
++ 	u64 l1d_flush_size;
+++>>>>>>> bdcb1aefc5b3 (powerpc/64s: Improve RFI L1-D cache flush fallback)
+  #endif
+  };
+  
+diff --cc arch/powerpc/kernel/asm-offsets.c
+index 41fbf9923b9d,88b84ac76b53..000000000000
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@@ -157,97 -153,112 +157,125 @@@ int main(void
+  	       sizeof(struct pt_regs) + 16);
+  #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+  
+ -	OFFSET(TI_FLAGS, thread_info, flags);
+ -	OFFSET(TI_LOCAL_FLAGS, thread_info, local_flags);
+ -	OFFSET(TI_PREEMPT, thread_info, preempt_count);
+ -	OFFSET(TI_TASK, thread_info, task);
+ -	OFFSET(TI_CPU, thread_info, cpu);
+ +	DEFINE(TI_FLAGS, offsetof(struct thread_info, flags));
+ +	DEFINE(TI_LOCAL_FLAGS, offsetof(struct thread_info, local_flags));
+ +	DEFINE(TI_PREEMPT, offsetof(struct thread_info, preempt_count));
+ +	DEFINE(TI_TASK, offsetof(struct thread_info, task));
+ +	DEFINE(TI_CPU, offsetof(struct thread_info, cpu));
+  
+  #ifdef CONFIG_PPC64
+ -	OFFSET(DCACHEL1BLOCKSIZE, ppc64_caches, l1d.block_size);
+ -	OFFSET(DCACHEL1LOGBLOCKSIZE, ppc64_caches, l1d.log_block_size);
+ -	OFFSET(DCACHEL1BLOCKSPERPAGE, ppc64_caches, l1d.blocks_per_page);
+ -	OFFSET(ICACHEL1BLOCKSIZE, ppc64_caches, l1i.block_size);
+ -	OFFSET(ICACHEL1LOGBLOCKSIZE, ppc64_caches, l1i.log_block_size);
+ -	OFFSET(ICACHEL1BLOCKSPERPAGE, ppc64_caches, l1i.blocks_per_page);
+ +	DEFINE(DCACHEL1LINESIZE, offsetof(struct ppc64_caches, dline_size));
+ +	DEFINE(DCACHEL1LOGLINESIZE, offsetof(struct ppc64_caches, log_dline_size));
+ +	DEFINE(DCACHEL1LINESPERPAGE, offsetof(struct ppc64_caches, dlines_per_page));
+ +	DEFINE(ICACHEL1LINESIZE, offsetof(struct ppc64_caches, iline_size));
+ +	DEFINE(ICACHEL1LOGLINESIZE, offsetof(struct ppc64_caches, log_iline_size));
+ +	DEFINE(ICACHEL1LINESPERPAGE, offsetof(struct ppc64_caches, ilines_per_page));
+  	/* paca */
+  	DEFINE(PACA_SIZE, sizeof(struct paca_struct));
+ -	OFFSET(PACAPACAINDEX, paca_struct, paca_index);
+ -	OFFSET(PACAPROCSTART, paca_struct, cpu_start);
+ -	OFFSET(PACAKSAVE, paca_struct, kstack);
+ -	OFFSET(PACACURRENT, paca_struct, __current);
+ -	OFFSET(PACASAVEDMSR, paca_struct, saved_msr);
+ -	OFFSET(PACASTABRR, paca_struct, stab_rr);
+ -	OFFSET(PACAR1, paca_struct, saved_r1);
+ -	OFFSET(PACATOC, paca_struct, kernel_toc);
+ -	OFFSET(PACAKBASE, paca_struct, kernelbase);
+ -	OFFSET(PACAKMSR, paca_struct, kernel_msr);
+ -	OFFSET(PACAIRQSOFTMASK, paca_struct, irq_soft_mask);
+ -	OFFSET(PACAIRQHAPPENED, paca_struct, irq_happened);
+ -#ifdef CONFIG_PPC_BOOK3S
+ -	OFFSET(PACACONTEXTID, paca_struct, mm_ctx_id);
+ +	DEFINE(PACA_LOCK_TOKEN, offsetof(struct paca_struct, lock_token));
+ +	DEFINE(PACAPACAINDEX, offsetof(struct paca_struct, paca_index));
+ +	DEFINE(PACAPROCSTART, offsetof(struct paca_struct, cpu_start));
+ +	DEFINE(PACAKSAVE, offsetof(struct paca_struct, kstack));
+ +	DEFINE(PACACURRENT, offsetof(struct paca_struct, __current));
+ +	DEFINE(PACASAVEDMSR, offsetof(struct paca_struct, saved_msr));
+ +	DEFINE(PACASTABRR, offsetof(struct paca_struct, stab_rr));
+ +	DEFINE(PACAR1, offsetof(struct paca_struct, saved_r1));
+ +	DEFINE(PACATOC, offsetof(struct paca_struct, kernel_toc));
+ +	DEFINE(PACAKBASE, offsetof(struct paca_struct, kernelbase));
+ +	DEFINE(PACAKMSR, offsetof(struct paca_struct, kernel_msr));
+ +	DEFINE(PACASOFTIRQEN, offsetof(struct paca_struct, soft_enabled));
+ +	DEFINE(PACAIRQHAPPENED, offsetof(struct paca_struct, irq_happened));
+ +	DEFINE(PACACONTEXTID, offsetof(struct paca_struct, context.id));
+  #ifdef CONFIG_PPC_MM_SLICES
+ -	OFFSET(PACALOWSLICESPSIZE, paca_struct, mm_ctx_low_slices_psize);
+ -	OFFSET(PACAHIGHSLICEPSIZE, paca_struct, mm_ctx_high_slices_psize);
+ -	OFFSET(PACA_SLB_ADDR_LIMIT, paca_struct, mm_ctx_slb_addr_limit);
+ +	DEFINE(PACALOWSLICESPSIZE, offsetof(struct paca_struct,
+ +					    context.low_slices_psize));
+ +	DEFINE(PACAHIGHSLICEPSIZE, offsetof(struct paca_struct,
+ +					    context.high_slices_psize));
+  	DEFINE(MMUPSIZEDEFSIZE, sizeof(struct mmu_psize_def));
+  #endif /* CONFIG_PPC_MM_SLICES */
+ -#endif
+  
+  #ifdef CONFIG_PPC_BOOK3E
+ -	OFFSET(PACAPGD, paca_struct, pgd);
+ -	OFFSET(PACA_KERNELPGD, paca_struct, kernel_pgd);
+ -	OFFSET(PACA_EXGEN, paca_struct, exgen);
+ -	OFFSET(PACA_EXTLB, paca_struct, extlb);
+ -	OFFSET(PACA_EXMC, paca_struct, exmc);
+ -	OFFSET(PACA_EXCRIT, paca_struct, excrit);
+ -	OFFSET(PACA_EXDBG, paca_struct, exdbg);
+ -	OFFSET(PACA_MC_STACK, paca_struct, mc_kstack);
+ -	OFFSET(PACA_CRIT_STACK, paca_struct, crit_kstack);
+ -	OFFSET(PACA_DBG_STACK, paca_struct, dbg_kstack);
+ -	OFFSET(PACA_TCD_PTR, paca_struct, tcd_ptr);
+ -
+ -	OFFSET(TCD_ESEL_NEXT, tlb_core_data, esel_next);
+ -	OFFSET(TCD_ESEL_MAX, tlb_core_data, esel_max);
+ -	OFFSET(TCD_ESEL_FIRST, tlb_core_data, esel_first);
+ +	DEFINE(PACAPGD, offsetof(struct paca_struct, pgd));
+ +	DEFINE(PACA_KERNELPGD, offsetof(struct paca_struct, kernel_pgd));
+ +	DEFINE(PACA_EXGEN, offsetof(struct paca_struct, exgen));
+ +	DEFINE(PACA_EXTLB, offsetof(struct paca_struct, extlb));
+ +	DEFINE(PACA_EXMC, offsetof(struct paca_struct, exmc));
+ +	DEFINE(PACA_EXCRIT, offsetof(struct paca_struct, excrit));
+ +	DEFINE(PACA_EXDBG, offsetof(struct paca_struct, exdbg));
+ +	DEFINE(PACA_MC_STACK, offsetof(struct paca_struct, mc_kstack));
+ +	DEFINE(PACA_CRIT_STACK, offsetof(struct paca_struct, crit_kstack));
+ +	DEFINE(PACA_DBG_STACK, offsetof(struct paca_struct, dbg_kstack));
+  #endif /* CONFIG_PPC_BOOK3E */
+  
+ -#ifdef CONFIG_PPC_BOOK3S_64
+ -	OFFSET(PACASLBCACHE, paca_struct, slb_cache);
+ -	OFFSET(PACASLBCACHEPTR, paca_struct, slb_cache_ptr);
+ -	OFFSET(PACAVMALLOCSLLP, paca_struct, vmalloc_sllp);
+ +#ifdef CONFIG_PPC_STD_MMU_64
+ +	DEFINE(PACASTABREAL, offsetof(struct paca_struct, stab_real));
+ +	DEFINE(PACASTABVIRT, offsetof(struct paca_struct, stab_addr));
+ +	DEFINE(PACASLBCACHE, offsetof(struct paca_struct, slb_cache));
+ +	DEFINE(PACASLBCACHEPTR, offsetof(struct paca_struct, slb_cache_ptr));
+ +	DEFINE(PACAVMALLOCSLLP, offsetof(struct paca_struct, vmalloc_sllp));
+  #ifdef CONFIG_PPC_MM_SLICES
+ -	OFFSET(MMUPSIZESLLP, mmu_psize_def, sllp);
+ +	DEFINE(MMUPSIZESLLP, offsetof(struct mmu_psize_def, sllp));
+  #else
+ -	OFFSET(PACACONTEXTSLLP, paca_struct, mm_ctx_sllp);
+ +	DEFINE(PACACONTEXTSLLP, offsetof(struct paca_struct, context.sllp));
+  #endif /* CONFIG_PPC_MM_SLICES */
+ -	OFFSET(PACA_EXGEN, paca_struct, exgen);
+ -	OFFSET(PACA_EXMC, paca_struct, exmc);
+ -	OFFSET(PACA_EXSLB, paca_struct, exslb);
+ -	OFFSET(PACA_EXNMI, paca_struct, exnmi);
+ -	OFFSET(PACALPPACAPTR, paca_struct, lppaca_ptr);
+ -	OFFSET(PACA_SLBSHADOWPTR, paca_struct, slb_shadow_ptr);
+ -	OFFSET(SLBSHADOW_STACKVSID, slb_shadow, save_area[SLB_NUM_BOLTED - 1].vsid);
+ -	OFFSET(SLBSHADOW_STACKESID, slb_shadow, save_area[SLB_NUM_BOLTED - 1].esid);
+ -	OFFSET(SLBSHADOW_SAVEAREA, slb_shadow, save_area);
+ -	OFFSET(LPPACA_PMCINUSE, lppaca, pmcregs_in_use);
+ -	OFFSET(LPPACA_DTLIDX, lppaca, dtl_idx);
+ -	OFFSET(LPPACA_YIELDCOUNT, lppaca, yield_count);
+ -	OFFSET(PACA_DTL_RIDX, paca_struct, dtl_ridx);
+ -#endif /* CONFIG_PPC_BOOK3S_64 */
+ -	OFFSET(PACAEMERGSP, paca_struct, emergency_sp);
+ +	DEFINE(PACA_EXGEN, offsetof(struct paca_struct, exgen));
+ +	DEFINE(PACA_EXMC, offsetof(struct paca_struct, exmc));
+ +	DEFINE(PACA_EXSLB, offsetof(struct paca_struct, exslb));
+ +	DEFINE(PACALPPACAPTR, offsetof(struct paca_struct, lppaca_ptr));
+ +	DEFINE(PACA_SLBSHADOWPTR, offsetof(struct paca_struct, slb_shadow_ptr));
+ +	DEFINE(SLBSHADOW_STACKVSID,
+ +	       offsetof(struct slb_shadow, save_area[SLB_NUM_BOLTED - 1].vsid));
+ +	DEFINE(SLBSHADOW_STACKESID,
+ +	       offsetof(struct slb_shadow, save_area[SLB_NUM_BOLTED - 1].esid));
+ +	DEFINE(SLBSHADOW_SAVEAREA, offsetof(struct slb_shadow, save_area));
+ +	DEFINE(LPPACA_PMCINUSE, offsetof(struct lppaca, pmcregs_in_use));
+ +	DEFINE(LPPACA_DTLIDX, offsetof(struct lppaca, dtl_idx));
+ +	DEFINE(LPPACA_YIELDCOUNT, offsetof(struct lppaca, yield_count));
+ +	DEFINE(PACA_DTL_RIDX, offsetof(struct paca_struct, dtl_ridx));
+ +#endif /* CONFIG_PPC_STD_MMU_64 */
+ +	DEFINE(PACAEMERGSP, offsetof(struct paca_struct, emergency_sp));
+  #ifdef CONFIG_PPC_BOOK3S_64
+++<<<<<<< HEAD
+ +	DEFINE(PACAMCEMERGSP, offsetof(struct paca_struct, mc_emergency_sp));
+ +	DEFINE(PACA_IN_MCE, offsetof(struct paca_struct, in_mce));
+++=======
++ 	OFFSET(PACAMCEMERGSP, paca_struct, mc_emergency_sp);
++ 	OFFSET(PACA_NMI_EMERG_SP, paca_struct, nmi_emergency_sp);
++ 	OFFSET(PACA_IN_MCE, paca_struct, in_mce);
++ 	OFFSET(PACA_IN_NMI, paca_struct, in_nmi);
++ 	OFFSET(PACA_RFI_FLUSH_FALLBACK_AREA, paca_struct, rfi_flush_fallback_area);
++ 	OFFSET(PACA_EXRFI, paca_struct, exrfi);
++ 	OFFSET(PACA_L1D_FLUSH_SIZE, paca_struct, l1d_flush_size);
++ 
++ #endif
++ 	OFFSET(PACAHWCPUID, paca_struct, hw_cpu_id);
++ 	OFFSET(PACAKEXECSTATE, paca_struct, kexec_state);
++ 	OFFSET(PACA_DSCR_DEFAULT, paca_struct, dscr_default);
++ 	OFFSET(ACCOUNT_STARTTIME, paca_struct, accounting.starttime);
++ 	OFFSET(ACCOUNT_STARTTIME_USER, paca_struct, accounting.starttime_user);
++ 	OFFSET(ACCOUNT_USER_TIME, paca_struct, accounting.utime);
++ 	OFFSET(ACCOUNT_SYSTEM_TIME, paca_struct, accounting.stime);
++ 	OFFSET(PACA_TRAP_SAVE, paca_struct, trap_save);
++ 	OFFSET(PACA_NAPSTATELOST, paca_struct, nap_state_lost);
++ 	OFFSET(PACA_SPRG_VDSO, paca_struct, sprg_vdso);
++ #else /* CONFIG_PPC64 */
++ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
++ 	OFFSET(ACCOUNT_STARTTIME, thread_info, accounting.starttime);
++ 	OFFSET(ACCOUNT_STARTTIME_USER, thread_info, accounting.starttime_user);
++ 	OFFSET(ACCOUNT_USER_TIME, thread_info, accounting.utime);
++ 	OFFSET(ACCOUNT_SYSTEM_TIME, thread_info, accounting.stime);
+ -#endif
+++>>>>>>> bdcb1aefc5b3 (powerpc/64s: Improve RFI L1-D cache flush fallback)
+ +#endif
+ +	DEFINE(PACAHWCPUID, offsetof(struct paca_struct, hw_cpu_id));
+ +	DEFINE(PACAKEXECSTATE, offsetof(struct paca_struct, kexec_state));
+ +	DEFINE(PACA_DSCR, offsetof(struct paca_struct, dscr_default));
+ +	DEFINE(PACA_STARTTIME, offsetof(struct paca_struct, starttime));
+ +	DEFINE(PACA_STARTTIME_USER, offsetof(struct paca_struct, starttime_user));
+ +	DEFINE(PACA_USER_TIME, offsetof(struct paca_struct, user_time));
+ +	DEFINE(PACA_SYSTEM_TIME, offsetof(struct paca_struct, system_time));
+ +	DEFINE(PACA_TRAP_SAVE, offsetof(struct paca_struct, trap_save));
+ +	DEFINE(PACA_NAPSTATELOST, offsetof(struct paca_struct, nap_state_lost));
+ +	DEFINE(PACA_SPRG3, offsetof(struct paca_struct, sprg3));
+  #endif /* CONFIG_PPC64 */
+  
+  	/* RTAS */
+diff --cc arch/powerpc/kernel/exceptions-64s.S
+index 25859016a79a,243d072a225a..000000000000
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@@ -525,619 -278,756 +525,713 @@@ machine_check_fwnmi
+  	SET_SCRATCH0(r13)		/* save r13 */
+  	EXCEPTION_PROLOG_0(PACA_EXMC)
+  machine_check_pSeries_0:
+ -	EXCEPTION_PROLOG_1(PACA_EXMC, KVMTEST_PR, 0x200)
+ -	/*
+ -	 * MSR_RI is not enabled, because PACA_EXMC is being used, so a
+ -	 * nested machine check corrupts it. machine_check_common enables
+ -	 * MSR_RI.
+ -	 */
+ -	EXCEPTION_PROLOG_PSERIES_1_NORI(machine_check_common, EXC_STD)
+ -
+ -TRAMP_KVM_SKIP(PACA_EXMC, 0x200)
+ -
+ -EXC_COMMON_BEGIN(machine_check_common)
+ -	/*
+ -	 * Machine check is different because we use a different
+ -	 * save area: PACA_EXMC instead of PACA_EXGEN.
+ -	 */
+ +	EXCEPTION_PROLOG_1(PACA_EXMC, KVMTEST, 0x200)
+ +	EXCEPTION_PROLOG_PSERIES_1(machine_check_common, EXC_STD)
+ +	KVM_HANDLER_SKIP(PACA_EXMC, EXC_STD, 0x200)
+ +
+ +	/* moved from 0x300 */
+ +data_access_check_stab:
+ +	GET_PACA(r13)
+ +	std	r9,PACA_EXSLB+EX_R9(r13)
+ +	std	r10,PACA_EXSLB+EX_R10(r13)
+  	mfspr	r10,SPRN_DAR
+ -	std	r10,PACA_EXMC+EX_DAR(r13)
+ -	mfspr	r10,SPRN_DSISR
+ -	stw	r10,PACA_EXMC+EX_DSISR(r13)
+ -	EXCEPTION_PROLOG_COMMON(0x200, PACA_EXMC)
+ -	FINISH_NAP
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	ld	r3,PACA_EXMC+EX_DAR(r13)
+ -	lwz	r4,PACA_EXMC+EX_DSISR(r13)
+ -	/* Enable MSR_RI when finished with PACA_EXMC */
+ -	li	r10,MSR_RI
+ -	mtmsrd 	r10,1
+ -	std	r3,_DAR(r1)
+ -	std	r4,_DSISR(r1)
+ -	bl	save_nvgprs
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	machine_check_exception
+ -	b	ret_from_except
+ -
+ -#define MACHINE_CHECK_HANDLER_WINDUP			\
+ -	/* Clear MSR_RI before setting SRR0 and SRR1. */\
+ -	li	r0,MSR_RI;				\
+ -	mfmsr	r9;		/* get MSR value */	\
+ -	andc	r9,r9,r0;				\
+ -	mtmsrd	r9,1;		/* Clear MSR_RI */	\
+ -	/* Move original SRR0 and SRR1 into the respective regs */	\
+ -	ld	r9,_MSR(r1);				\
+ -	mtspr	SPRN_SRR1,r9;				\
+ -	ld	r3,_NIP(r1);				\
+ -	mtspr	SPRN_SRR0,r3;				\
+ -	ld	r9,_CTR(r1);				\
+ -	mtctr	r9;					\
+ -	ld	r9,_XER(r1);				\
+ -	mtxer	r9;					\
+ -	ld	r9,_LINK(r1);				\
+ -	mtlr	r9;					\
+ -	REST_GPR(0, r1);				\
+ -	REST_8GPRS(2, r1);				\
+ -	REST_GPR(10, r1);				\
+ -	ld	r11,_CCR(r1);				\
+ -	mtcr	r11;					\
+ -	/* Decrement paca->in_mce. */			\
+ -	lhz	r12,PACA_IN_MCE(r13);			\
+ -	subi	r12,r12,1;				\
+ -	sth	r12,PACA_IN_MCE(r13);			\
+ -	REST_GPR(11, r1);				\
+ -	REST_2GPRS(12, r1);				\
+ -	/* restore original r1. */			\
+ -	ld	r1,GPR1(r1)
+ +	mfspr	r9,SPRN_DSISR
+ +	srdi	r10,r10,60
+ +	rlwimi	r10,r9,16,0x20
+ +#ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
+ +	lbz	r9,HSTATE_IN_GUEST(r13)
+ +	rlwimi	r10,r9,8,0x300
+ +#endif
+ +	mfcr	r9
+ +	cmpwi	r10,0x2c
+ +	beq	do_stab_bolted_pSeries
+ +	mtcrf	0x80,r9
+ +	ld	r9,PACA_EXSLB+EX_R9(r13)
+ +	ld	r10,PACA_EXSLB+EX_R10(r13)
+ +	b	data_access_not_stab
+ +do_stab_bolted_pSeries:
+ +	std	r11,PACA_EXSLB+EX_R11(r13)
+ +	std	r12,PACA_EXSLB+EX_R12(r13)
+ +	GET_SCRATCH0(r10)
+ +	std	r10,PACA_EXSLB+EX_R13(r13)
+ +	EXCEPTION_PROLOG_PSERIES_1(do_stab_bolted, EXC_STD)
+ +
+ +	KVM_HANDLER_SKIP(PACA_EXGEN, EXC_STD, 0x300)
+ +	KVM_HANDLER_SKIP(PACA_EXSLB, EXC_STD, 0x380)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0x400)
+ +	KVM_HANDLER_PR(PACA_EXSLB, EXC_STD, 0x480)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0x900)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0x982)
+  
+ -#ifdef CONFIG_PPC_P7_NAP
+ +#ifdef CONFIG_PPC_DENORMALISATION
+ +denorm_assist:
+ +BEGIN_FTR_SECTION
+  /*
+ - * This is an idle wakeup. Low level machine check has already been
+ - * done. Queue the event then call the idle code to do the wake up.
+ + * To denormalise we need to move a copy of the register to itself.
+ + * For POWER6 do that here for all FP regs.
+   */
+ -EXC_COMMON_BEGIN(machine_check_idle_common)
+ -	bl	machine_check_queue_event
+ -
+ -	/*
+ -	 * We have not used any non-volatile GPRs here, and as a rule
+ -	 * most exception code including machine check does not.
+ -	 * Therefore PACA_NAPSTATELOST does not need to be set. Idle
+ -	 * wakeup will restore volatile registers.
+ -	 *
+ -	 * Load the original SRR1 into r3 for pnv_powersave_wakeup_mce.
+ -	 *
+ -	 * Then decrement MCE nesting after finishing with the stack.
+ -	 */
+ -	ld	r3,_MSR(r1)
+ -
+ -	lhz	r11,PACA_IN_MCE(r13)
+ -	subi	r11,r11,1
+ -	sth	r11,PACA_IN_MCE(r13)
+ +	mfmsr	r10
+ +	ori	r10,r10,(MSR_FP|MSR_FE0|MSR_FE1)
+ +	xori	r10,r10,(MSR_FE0|MSR_FE1)
+ +	mtmsrd	r10
+ +	sync
+  
+ -	/* Turn off the RI bit because SRR1 is used by idle wakeup code. */
+ -	/* Recoverability could be improved by reducing the use of SRR1. */
+ -	li	r11,0
+ -	mtmsrd	r11,1
+ +#define FMR2(n)  fmr (n), (n) ; fmr n+1, n+1
+ +#define FMR4(n)  FMR2(n) ; FMR2(n+2)
+ +#define FMR8(n)  FMR4(n) ; FMR4(n+4)
+ +#define FMR16(n) FMR8(n) ; FMR8(n+8)
+ +#define FMR32(n) FMR16(n) ; FMR16(n+16)
+ +	FMR32(0)
+  
+ -	b	pnv_powersave_wakeup_mce
+ -#endif
+ -	/*
+ -	 * Handle machine check early in real mode. We come here with
+ -	 * ME=1, MMU (IR=0 and DR=0) off and using MC emergency stack.
+ -	 */
+ -EXC_COMMON_BEGIN(machine_check_handle_early)
+ -	std	r0,GPR0(r1)	/* Save r0 */
+ -	EXCEPTION_PROLOG_COMMON_3(0x200)
+ -	bl	save_nvgprs
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	machine_check_early
+ -	std	r3,RESULT(r1)	/* Save result */
+ -	ld	r12,_MSR(r1)
+ +FTR_SECTION_ELSE
+ +/*
+ + * To denormalise we need to move a copy of the register to itself.
+ + * For POWER7 do that here for the first 32 VSX registers only.
+ + */
+ +	mfmsr	r10
+ +	oris	r10,r10,MSR_VSX@h
+ +	mtmsrd	r10
+ +	sync
+  
+ -#ifdef	CONFIG_PPC_P7_NAP
+ -	/*
+ -	 * Check if thread was in power saving mode. We come here when any
+ -	 * of the following is true:
+ -	 * a. thread wasn't in power saving mode
+ -	 * b. thread was in power saving mode with no state loss,
+ -	 *    supervisor state loss or hypervisor state loss.
+ -	 *
+ -	 * Go back to nap/sleep/winkle mode again if (b) is true.
+ -	 */
+ -	BEGIN_FTR_SECTION
+ -	rlwinm.	r11,r12,47-31,30,31
+ -	bne	machine_check_idle_common
+ -	END_FTR_SECTION_IFSET(CPU_FTR_HVMODE | CPU_FTR_ARCH_206)
+ -#endif
+ +#define XVCPSGNDP2(n) XVCPSGNDP(n,n,n) ; XVCPSGNDP(n+1,n+1,n+1)
+ +#define XVCPSGNDP4(n) XVCPSGNDP2(n) ; XVCPSGNDP2(n+2)
+ +#define XVCPSGNDP8(n) XVCPSGNDP4(n) ; XVCPSGNDP4(n+4)
+ +#define XVCPSGNDP16(n) XVCPSGNDP8(n) ; XVCPSGNDP8(n+8)
+ +#define XVCPSGNDP32(n) XVCPSGNDP16(n) ; XVCPSGNDP16(n+16)
+ +	XVCPSGNDP32(0)
+  
+ -	/*
+ -	 * Check if we are coming from hypervisor userspace. If yes then we
+ -	 * continue in host kernel in V mode to deliver the MC event.
+ -	 */
+ -	rldicl.	r11,r12,4,63		/* See if MC hit while in HV mode. */
+ -	beq	5f
+ -	andi.	r11,r12,MSR_PR		/* See if coming from user. */
+ -	bne	9f			/* continue in V mode if we are. */
+ +ALT_FTR_SECTION_END_IFCLR(CPU_FTR_ARCH_206)
+  
+ -5:
+ -#ifdef CONFIG_KVM_BOOK3S_64_HANDLER
+ -	/*
+ -	 * We are coming from kernel context. Check if we are coming from
+ -	 * guest. if yes, then we can continue. We will fall through
+ -	 * do_kvm_200->kvmppc_interrupt to deliver the MC event to guest.
+ -	 */
+ -	lbz	r11,HSTATE_IN_GUEST(r13)
+ -	cmpwi	r11,0			/* Check if coming from guest */
+ -	bne	9f			/* continue if we are. */
+ -#endif
+ -	/*
+ -	 * At this point we are not sure about what context we come from.
+ -	 * Queue up the MCE event and return from the interrupt.
+ -	 * But before that, check if this is an un-recoverable exception.
+ -	 * If yes, then stay on emergency stack and panic.
+ -	 */
+ -	andi.	r11,r12,MSR_RI
+ -	bne	2f
+ -1:	mfspr	r11,SPRN_SRR0
+ -	LOAD_HANDLER(r10,unrecover_mce)
+ -	mtspr	SPRN_SRR0,r10
+ -	ld	r10,PACAKMSR(r13)
+ -	/*
+ -	 * We are going down. But there are chances that we might get hit by
+ -	 * another MCE during panic path and we may run into unstable state
+ -	 * with no way out. Hence, turn ME bit off while going down, so that
+ -	 * when another MCE is hit during panic path, system will checkstop
+ -	 * and hypervisor will get restarted cleanly by SP.
+ -	 */
+ -	li	r3,MSR_ME
+ -	andc	r10,r10,r3		/* Turn off MSR_ME */
+ -	mtspr	SPRN_SRR1,r10
+ -	RFI_TO_KERNEL
+ +BEGIN_FTR_SECTION
+ +	b	denorm_done
+ +END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ +/*
+ + * To denormalise we need to move a copy of the register to itself.
+ + * For POWER8 we need to do that for all 64 VSX registers
+ + */
+ +	XVCPSGNDP32(32)
+ +denorm_done:
+ +	mtspr	SPRN_HSRR0,r11
+ +	mtcrf	0x80,r9
+ +	ld	r9,PACA_EXGEN+EX_R9(r13)
+ +	RESTORE_PPR_PACA(PACA_EXGEN, r10)
+ +BEGIN_FTR_SECTION
+ +	ld	r10,PACA_EXGEN+EX_CFAR(r13)
+ +	mtspr	SPRN_CFAR,r10
+ +END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+ +	ld	r10,PACA_EXGEN+EX_R10(r13)
+ +	ld	r11,PACA_EXGEN+EX_R11(r13)
+ +	ld	r12,PACA_EXGEN+EX_R12(r13)
+ +	ld	r13,PACA_EXGEN+EX_R13(r13)
+ +	HRFID
+  	b	.
+ -2:
+ -	/*
+ -	 * Check if we have successfully handled/recovered from error, if not
+ -	 * then stay on emergency stack and panic.
+ -	 */
+ -	ld	r3,RESULT(r1)	/* Load result */
+ -	cmpdi	r3,0		/* see if we handled MCE successfully */
+ -
+ -	beq	1b		/* if !handled then panic */
+ -	/*
+ -	 * Return from MC interrupt.
+ -	 * Queue up the MCE event so that we can log it later, while
+ -	 * returning from kernel or opal call.
+ -	 */
+ -	bl	machine_check_queue_event
+ -	MACHINE_CHECK_HANDLER_WINDUP
+ -	RFI_TO_USER_OR_KERNEL
+ -9:
+ -	/* Deliver the machine check to host kernel in V mode. */
+ -	MACHINE_CHECK_HANDLER_WINDUP
+ -	b	machine_check_pSeries
+ +#endif
+  
+ -EXC_COMMON_BEGIN(unrecover_mce)
+ -	/* Invoke machine_check_exception to print MCE event and panic. */
+ +	.align	7
+ +	/* moved from 0xe00 */
+ +	STD_EXCEPTION_HV_OOL(0xe02, h_data_storage)
+ +	KVM_HANDLER_SKIP(PACA_EXGEN, EXC_HV, 0xe02)
+ +	STD_EXCEPTION_HV_OOL(0xe22, h_instr_storage)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe22)
+ +	STD_EXCEPTION_HV_OOL(0xe42, emulation_assist)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe42)
+ +	MASKABLE_EXCEPTION_HV_OOL(0xe62, hmi_exception)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe62)
+ +
+ +	.globl hmi_exception_early
+ +hmi_exception_early:
+ +	EXCEPTION_PROLOG_1(PACA_EXGEN, KVMTEST, 0xe62)
+ +	mr	r10,r1			/* Save r1			*/
+ +	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
+ +	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
+ +	std	r9,_CCR(r1)		/* save CR in stackframe	*/
+ +	mfspr	r11,SPRN_HSRR0		/* Save HSRR0 */
+ +	std	r11,_NIP(r1)		/* save HSRR0 in stackframe	*/
+ +	mfspr	r12,SPRN_HSRR1		/* Save SRR1 */
+ +	std	r12,_MSR(r1)		/* save SRR1 in stackframe	*/
+ +	std	r10,0(r1)		/* make stack chain pointer	*/
+ +	std	r0,GPR0(r1)		/* save r0 in stackframe	*/
+ +	std	r10,GPR1(r1)		/* save r1 in stackframe	*/
+ +	EXCEPTION_PROLOG_COMMON_2(PACA_EXGEN)
+ +	EXCEPTION_PROLOG_COMMON_3(0xe60)
+  	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	machine_check_exception
+ -	/*
+ -	 * We will not reach here. Even if we did, there is no way out. Call
+ -	 * unrecoverable_exception and die.
+ -	 */
+ -1:	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	unrecoverable_exception
+ -	b	1b
+ -
+ -
+ -EXC_REAL(data_access, 0x300, 0x80)
+ -EXC_VIRT(data_access, 0x4300, 0x80, 0x300)
+ -TRAMP_KVM_SKIP(PACA_EXGEN, 0x300)
+ +	bl	hmi_exception_realmode
+ +	/* Windup the stack. */
+ +	/* Move original HSRR0 and HSRR1 into the respective regs */
+ +	ld	r9,_MSR(r1)
+ +	mtspr	SPRN_HSRR1,r9
+ +	ld	r3,_NIP(r1)
+ +	mtspr	SPRN_HSRR0,r3
+ +	ld	r9,_CTR(r1)
+ +	mtctr	r9
+ +	ld	r9,_XER(r1)
+ +	mtxer	r9
+ +	ld	r9,_LINK(r1)
+ +	mtlr	r9
+ +	REST_GPR(0, r1)
+ +	REST_8GPRS(2, r1)
+ +	REST_GPR(10, r1)
+ +	ld	r11,_CCR(r1)
+ +	mtcr	r11
+ +	REST_GPR(11, r1)
+ +	REST_2GPRS(12, r1)
+ +	/* restore original r1. */
+ +	ld	r1,GPR1(r1)
+  
+ -EXC_COMMON_BEGIN(data_access_common)
+  	/*
+ -	 * Here r13 points to the paca, r9 contains the saved CR,
+ -	 * SRR0 and SRR1 are saved in r11 and r12,
+ -	 * r9 - r13 are saved in paca->exgen.
+ +	 * Go to virtual mode and pull the HMI event information from
+ +	 * firmware.
+  	 */
+ -	mfspr	r10,SPRN_DAR
+ -	std	r10,PACA_EXGEN+EX_DAR(r13)
+ -	mfspr	r10,SPRN_DSISR
+ -	stw	r10,PACA_EXGEN+EX_DSISR(r13)
+ -	EXCEPTION_PROLOG_COMMON(0x300, PACA_EXGEN)
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	ld	r12,_MSR(r1)
+ -	ld	r3,PACA_EXGEN+EX_DAR(r13)
+ -	lwz	r4,PACA_EXGEN+EX_DSISR(r13)
+ -	li	r5,0x300
+ -	std	r3,_DAR(r1)
+ -	std	r4,_DSISR(r1)
+ -BEGIN_MMU_FTR_SECTION
+ -	b	do_hash_page		/* Try to handle as hpte fault */
+ -MMU_FTR_SECTION_ELSE
+ -	b	handle_page_fault
+ -ALT_MMU_FTR_SECTION_END_IFCLR(MMU_FTR_TYPE_RADIX)
+ -
+ -
+ -EXC_REAL_BEGIN(data_access_slb, 0x380, 0x80)
+ -	SET_SCRATCH0(r13)
+ -	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ -	EXCEPTION_PROLOG_1(PACA_EXSLB, KVMTEST_PR, 0x380)
+ -	mr	r12,r3	/* save r3 */
+ -	mfspr	r3,SPRN_DAR
+ -	mfspr	r11,SPRN_SRR1
+ -	crset	4*cr6+eq
+ -	BRANCH_TO_COMMON(r10, slb_miss_common)
+ -EXC_REAL_END(data_access_slb, 0x380, 0x80)
+ -
+ -EXC_VIRT_BEGIN(data_access_slb, 0x4380, 0x80)
+ -	SET_SCRATCH0(r13)
+ -	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ -	EXCEPTION_PROLOG_1(PACA_EXSLB, NOTEST, 0x380)
+ -	mr	r12,r3	/* save r3 */
+ -	mfspr	r3,SPRN_DAR
+ -	mfspr	r11,SPRN_SRR1
+ -	crset	4*cr6+eq
+ -	BRANCH_TO_COMMON(r10, slb_miss_common)
+ -EXC_VIRT_END(data_access_slb, 0x4380, 0x80)
+ -TRAMP_KVM_SKIP(PACA_EXSLB, 0x380)
+ -
+ -
+ -EXC_REAL(instruction_access, 0x400, 0x80)
+ -EXC_VIRT(instruction_access, 0x4400, 0x80, 0x400)
+ -TRAMP_KVM(PACA_EXGEN, 0x400)
+ -
+ -EXC_COMMON_BEGIN(instruction_access_common)
+ -	EXCEPTION_PROLOG_COMMON(0x400, PACA_EXGEN)
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	ld	r12,_MSR(r1)
+ -	ld	r3,_NIP(r1)
+ -	andis.	r4,r12,DSISR_SRR1_MATCH_64S@h
+ -	li	r5,0x400
+ -	std	r3,_DAR(r1)
+ -	std	r4,_DSISR(r1)
+ -BEGIN_MMU_FTR_SECTION
+ -	b	do_hash_page		/* Try to handle as hpte fault */
+ -MMU_FTR_SECTION_ELSE
+ -	b	handle_page_fault
+ -ALT_MMU_FTR_SECTION_END_IFCLR(MMU_FTR_TYPE_RADIX)
+ -
+ -
+ -EXC_REAL_BEGIN(instruction_access_slb, 0x480, 0x80)
+ -	SET_SCRATCH0(r13)
+ -	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ -	EXCEPTION_PROLOG_1(PACA_EXSLB, KVMTEST_PR, 0x480)
+ -	mr	r12,r3	/* save r3 */
+ -	mfspr	r3,SPRN_SRR0		/* SRR0 is faulting address */
+ -	mfspr	r11,SPRN_SRR1
+ -	crclr	4*cr6+eq
+ -	BRANCH_TO_COMMON(r10, slb_miss_common)
+ -EXC_REAL_END(instruction_access_slb, 0x480, 0x80)
+ -
+ -EXC_VIRT_BEGIN(instruction_access_slb, 0x4480, 0x80)
+ +	.globl hmi_exception_after_realmode
+ +hmi_exception_after_realmode:
+  	SET_SCRATCH0(r13)
+ -	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ -	EXCEPTION_PROLOG_1(PACA_EXSLB, NOTEST, 0x480)
+ -	mr	r12,r3	/* save r3 */
+ -	mfspr	r3,SPRN_SRR0		/* SRR0 is faulting address */
+ -	mfspr	r11,SPRN_SRR1
+ -	crclr	4*cr6+eq
+ -	BRANCH_TO_COMMON(r10, slb_miss_common)
+ -EXC_VIRT_END(instruction_access_slb, 0x4480, 0x80)
+ -TRAMP_KVM(PACA_EXSLB, 0x480)
+ -
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	hmi_exception_hv
+ +
+ +	MASKABLE_EXCEPTION_HV_OOL(0xe82, h_doorbell)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xe82)
+ +
+ +	/* moved from 0xf00 */
+ +	STD_EXCEPTION_PSERIES_OOL(0xf00, performance_monitor)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0xf00)
+ +	STD_EXCEPTION_PSERIES_OOL(0xf20, altivec_unavailable)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0xf20)
+ +	STD_EXCEPTION_PSERIES_OOL(0xf40, vsx_unavailable)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0xf40)
+ +	STD_EXCEPTION_PSERIES_OOL(0xf60, facility_unavailable)
+ +	KVM_HANDLER_PR(PACA_EXGEN, EXC_STD, 0xf60)
+ +	STD_EXCEPTION_HV_OOL(0xf82, facility_unavailable)
+ +	KVM_HANDLER(PACA_EXGEN, EXC_HV, 0xf82)
+  
+  /*
+ - * This handler is used by the 0x380 and 0x480 SLB miss interrupts, as well as
+ - * the virtual mode 0x4380 and 0x4480 interrupts if AIL is enabled.
+ + * An interrupt came in while soft-disabled. We set paca->irq_happened, then:
+ + * - If it was a decrementer interrupt, we bump the dec to max and and return.
+ + * - If it was a doorbell we return immediately since doorbells are edge
+ + *   triggered and won't automatically refire.
+ + * - If it was a HMI we return immediately since we handled it in realmode
+ + *   and it won't refire.
+ + * - else we hard disable and return.
+ + * This is called with r10 containing the value to OR to the paca field.
+   */
+ -EXC_COMMON_BEGIN(slb_miss_common)
+ -	/*
+ -	 * r13 points to the PACA, r9 contains the saved CR,
+ -	 * r12 contains the saved r3,
+ -	 * r11 contain the saved SRR1, SRR0 is still ready for return
+ -	 * r3 has the faulting address
+ -	 * r9 - r13 are saved in paca->exslb.
+ - 	 * cr6.eq is set for a D-SLB miss, clear for a I-SLB miss
+ -	 * We assume we aren't going to take any exceptions during this
+ -	 * procedure.
+ -	 */
+ -	mflr	r10
+ -	stw	r9,PACA_EXSLB+EX_CCR(r13)	/* save CR in exc. frame */
+ -	std	r10,PACA_EXSLB+EX_LR(r13)	/* save LR */
+ +#define MASKED_INTERRUPT(_H)				\
+ +masked_##_H##interrupt:					\
+ +	std	r11,PACA_EXGEN+EX_R11(r13);		\
+ +	lbz	r11,PACAIRQHAPPENED(r13);		\
+ +	or	r11,r11,r10;				\
+ +	stb	r11,PACAIRQHAPPENED(r13);		\
+ +	cmpwi	r10,PACA_IRQ_DEC;			\
+ +	bne	1f;					\
+ +	lis	r10,0x7fff;				\
+ +	ori	r10,r10,0xffff;				\
+ +	mtspr	SPRN_DEC,r10;				\
+ +	b	2f;					\
+ +1:	cmpwi	r10,PACA_IRQ_DBELL;			\
+ +	beq	2f;					\
+ +	cmpwi	r10,PACA_IRQ_HMI;			\
+ +	beq	2f;					\
+ +	mfspr	r10,SPRN_##_H##SRR1;			\
+ +	rldicl	r10,r10,48,1; /* clear MSR_EE */	\
+ +	rotldi	r10,r10,16;				\
+ +	mtspr	SPRN_##_H##SRR1,r10;			\
+ +2:	mtcrf	0x80,r9;				\
+ +	ld	r9,PACA_EXGEN+EX_R9(r13);		\
+ +	ld	r10,PACA_EXGEN+EX_R10(r13);		\
+ +	ld	r11,PACA_EXGEN+EX_R11(r13);		\
+++<<<<<<< HEAD
+ +	GET_SCRATCH0(r13);				\
+ +	##_H##rfid;					\
+ +	b	.
+ +	
+++=======
+++	/* returns to kernel where r13 must be set up, so don't restore it */ \
+++	##_H##RFI_TO_KERNEL;				\
+++	b	.;					\
+++	MASKED_DEC_HANDLER(_H)
+++
+++TRAMP_REAL_BEGIN(rfi_flush_fallback)
+++	SET_SCRATCH0(r13);
+++	GET_PACA(r13);
+++	std	r9,PACA_EXRFI+EX_R9(r13)
+++	std	r10,PACA_EXRFI+EX_R10(r13)
+++	std	r11,PACA_EXRFI+EX_R11(r13)
+++	mfctr	r9
+++	ld	r10,PACA_RFI_FLUSH_FALLBACK_AREA(r13)
+++	ld	r11,PACA_L1D_FLUSH_SIZE(r13)
+++	srdi	r11,r11,(7 + 3) /* 128 byte lines, unrolled 8x */
+++	mtctr	r11
+++	DCBT_STOP_ALL_STREAM_IDS(r11) /* Stop prefetch streams */
++ 
+ -	andi.	r9,r11,MSR_PR	// Check for exception from userspace
+ -	cmpdi	cr4,r9,MSR_PR	// And save the result in CR4 for later
+++	/* order ld/st prior to dcbt stop all streams with flushing */
+++	sync
++ 
++ 	/*
+ -	 * Test MSR_RI before calling slb_allocate_realmode, because the
+ -	 * MSR in r11 gets clobbered. However we still want to allocate
+ -	 * SLB in case MSR_RI=0, to minimise the risk of getting stuck in
+ -	 * recursive SLB faults. So use cr5 for this, which is preserved.
+++	 * The load adresses are at staggered offsets within cachelines,
+++	 * which suits some pipelines better (on others it should not
+++	 * hurt).
++ 	 */
+ -	andi.	r11,r11,MSR_RI	/* check for unrecoverable exception */
+ -	cmpdi	cr5,r11,MSR_RI
+ -
+ -	crset	4*cr0+eq
+ -#ifdef CONFIG_PPC_BOOK3S_64
+ -BEGIN_MMU_FTR_SECTION
+ -	bl	slb_allocate
+ -END_MMU_FTR_SECTION_IFCLR(MMU_FTR_TYPE_RADIX)
+ -#endif
+ -
+ -	ld	r10,PACA_EXSLB+EX_LR(r13)
+ -	lwz	r9,PACA_EXSLB+EX_CCR(r13)	/* get saved CR */
+ -	mtlr	r10
+ -
+ -	beq-	8f		/* if bad address, make full stack frame */
+ -
+ -	bne-	cr5,2f		/* if unrecoverable exception, oops */
+++1:
+++	ld	r11,(0x80 + 8)*0(r10)
+++	ld	r11,(0x80 + 8)*1(r10)
+++	ld	r11,(0x80 + 8)*2(r10)
+++	ld	r11,(0x80 + 8)*3(r10)
+++	ld	r11,(0x80 + 8)*4(r10)
+++	ld	r11,(0x80 + 8)*5(r10)
+++	ld	r11,(0x80 + 8)*6(r10)
+++	ld	r11,(0x80 + 8)*7(r10)
+++	addi	r10,r10,0x80*8
+++	bdnz	1b
++ 
+ -	/* All done -- return from exception. */
+++	mtctr	r9
+++	ld	r9,PACA_EXRFI+EX_R9(r13)
+++	ld	r10,PACA_EXRFI+EX_R10(r13)
+++	ld	r11,PACA_EXRFI+EX_R11(r13)
+++	GET_SCRATCH0(r13);
+++	rfid
++ 
+ -	bne	cr4,1f		/* returning to kernel */
+++TRAMP_REAL_BEGIN(hrfi_flush_fallback)
+++	SET_SCRATCH0(r13);
+++	GET_PACA(r13);
+++	std	r9,PACA_EXRFI+EX_R9(r13)
+++	std	r10,PACA_EXRFI+EX_R10(r13)
+++	std	r11,PACA_EXRFI+EX_R11(r13)
+++	mfctr	r9
+++	ld	r10,PACA_RFI_FLUSH_FALLBACK_AREA(r13)
+++	ld	r11,PACA_L1D_FLUSH_SIZE(r13)
+++	srdi	r11,r11,(7 + 3) /* 128 byte lines, unrolled 8x */
+++	mtctr	r11
+++	DCBT_STOP_ALL_STREAM_IDS(r11) /* Stop prefetch streams */
++ 
+ -.machine	push
+ -.machine	"power4"
+ -	mtcrf	0x80,r9
+ -	mtcrf	0x08,r9		/* MSR[PR] indication is in cr4 */
+ -	mtcrf	0x04,r9		/* MSR[RI] indication is in cr5 */
+ -	mtcrf	0x02,r9		/* I/D indication is in cr6 */
+ -	mtcrf	0x01,r9		/* slb_allocate uses cr0 and cr7 */
+ -.machine	pop
+++	/* order ld/st prior to dcbt stop all streams with flushing */
+++	sync
++ 
+ -	RESTORE_CTR(r9, PACA_EXSLB)
+ -	RESTORE_PPR_PACA(PACA_EXSLB, r9)
+ -	mr	r3,r12
+ -	ld	r9,PACA_EXSLB+EX_R9(r13)
+ -	ld	r10,PACA_EXSLB+EX_R10(r13)
+ -	ld	r11,PACA_EXSLB+EX_R11(r13)
+ -	ld	r12,PACA_EXSLB+EX_R12(r13)
+ -	ld	r13,PACA_EXSLB+EX_R13(r13)
+ -	RFI_TO_USER
+ -	b	.	/* prevent speculative execution */
+++	/*
+++	 * The load adresses are at staggered offsets within cachelines,
+++	 * which suits some pipelines better (on others it should not
+++	 * hurt).
+++	 */
++ 1:
+ -.machine	push
+ -.machine	"power4"
+ -	mtcrf	0x80,r9
+ -	mtcrf	0x08,r9		/* MSR[PR] indication is in cr4 */
+ -	mtcrf	0x04,r9		/* MSR[RI] indication is in cr5 */
+ -	mtcrf	0x02,r9		/* I/D indication is in cr6 */
+ -	mtcrf	0x01,r9		/* slb_allocate uses cr0 and cr7 */
+ -.machine	pop
+ -
+ -	RESTORE_CTR(r9, PACA_EXSLB)
+ -	RESTORE_PPR_PACA(PACA_EXSLB, r9)
+ -	mr	r3,r12
+ -	ld	r9,PACA_EXSLB+EX_R9(r13)
+ -	ld	r10,PACA_EXSLB+EX_R10(r13)
+ -	ld	r11,PACA_EXSLB+EX_R11(r13)
+ -	ld	r12,PACA_EXSLB+EX_R12(r13)
+ -	ld	r13,PACA_EXSLB+EX_R13(r13)
+ -	RFI_TO_KERNEL
+ -	b	.	/* prevent speculative execution */
+++	ld	r11,(0x80 + 8)*0(r10)
+++	ld	r11,(0x80 + 8)*1(r10)
+++	ld	r11,(0x80 + 8)*2(r10)
+++	ld	r11,(0x80 + 8)*3(r10)
+++	ld	r11,(0x80 + 8)*4(r10)
+++	ld	r11,(0x80 + 8)*5(r10)
+++	ld	r11,(0x80 + 8)*6(r10)
+++	ld	r11,(0x80 + 8)*7(r10)
+++	addi	r10,r10,0x80*8
+++	bdnz	1b
++ 
+++	mtctr	r9
+++	ld	r9,PACA_EXRFI+EX_R9(r13)
+++	ld	r10,PACA_EXRFI+EX_R10(r13)
+++	ld	r11,PACA_EXRFI+EX_R11(r13)
+++	GET_SCRATCH0(r13);
+++	hrfid
++ 
+ -2:	std     r3,PACA_EXSLB+EX_DAR(r13)
+ -	mr	r3,r12
+ -	mfspr	r11,SPRN_SRR0
+ -	mfspr	r12,SPRN_SRR1
+ -	LOAD_HANDLER(r10,unrecov_slb)
+ -	mtspr	SPRN_SRR0,r10
+ -	ld	r10,PACAKMSR(r13)
+ -	mtspr	SPRN_SRR1,r10
+ -	RFI_TO_KERNEL
+ -	b	.
+++/*
+++ * Real mode exceptions actually use this too, but alternate
+++ * instruction code patches (which end up in the common .text area)
+++ * cannot reach these if they are put there.
+++ */
+++USE_FIXED_SECTION(virt_trampolines)
+++>>>>>>> bdcb1aefc5b3 (powerpc/64s: Improve RFI L1-D cache flush fallback)
+ +	MASKED_INTERRUPT()
+ +	MASKED_INTERRUPT(H)
+  
+ -8:	std     r3,PACA_EXSLB+EX_DAR(r13)
+ -	mr	r3,r12
+ -	mfspr	r11,SPRN_SRR0
+ -	mfspr	r12,SPRN_SRR1
+ -	LOAD_HANDLER(r10,bad_addr_slb)
+ -	mtspr	SPRN_SRR0,r10
+ -	ld	r10,PACAKMSR(r13)
+ -	mtspr	SPRN_SRR1,r10
+ -	RFI_TO_KERNEL
+ -	b	.
+ +/*
+ + * Called from arch_local_irq_enable when an interrupt needs
+ + * to be resent. r3 contains 0x500, 0x900, 0xa00 or 0xe80 to indicate
+ + * which kind of interrupt. MSR:EE is already off. We generate a
+ + * stackframe like if a real interrupt had happened.
+ + *
+ + * Note: While MSR:EE is off, we need to make sure that _MSR
+ + * in the generated frame has EE set to 1 or the exception
+ + * handler will not properly re-enable them.
+ + */
+ +_GLOBAL(__replay_interrupt)
+ +	/* We are going to jump to the exception common code which
+ +	 * will retrieve various register values from the PACA which
+ +	 * we don't give a damn about, so we don't bother storing them.
+ +	 */
+ +	mfmsr	r12
+ +	mflr	r11
+ +	mfcr	r9
+ +	ori	r12,r12,MSR_EE
+ +	cmpwi	r3,0x900
+ +	beq	decrementer_common
+ +	cmpwi	r3,0x500
+ +	beq	hardware_interrupt_common
+ +BEGIN_FTR_SECTION
+ +	cmpwi	r3,0xe80
+ +	beq	h_doorbell_common
+ +	cmpwi	r3,0xe60
+ +	beq	hmi_exception_common
+ +FTR_SECTION_ELSE
+ +	cmpwi	r3,0xa00
+ +	beq	doorbell_super_common
+ +ALT_FTR_SECTION_END_IFSET(CPU_FTR_HVMODE)
+ +	blr
+  
+ -EXC_COMMON_BEGIN(unrecov_slb)
+ -	EXCEPTION_PROLOG_COMMON(0x4100, PACA_EXSLB)
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	bl	save_nvgprs
+ -1:	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	unrecoverable_exception
+ -	b	1b
+ +#ifdef CONFIG_PPC_PSERIES
+ +/*
+ + * Vectors for the FWNMI option.  Share common code.
+ + */
+ +	.globl system_reset_fwnmi
+ +      .align 7
+ +system_reset_fwnmi:
+ +	HMT_MEDIUM_PPR_DISCARD
+ +	SET_SCRATCH0(r13)		/* save r13 */
+ +	EXCEPTION_PROLOG_PSERIES(PACA_EXGEN, system_reset_common, EXC_STD,
+ +				 NOTEST, 0x100)
+  
+ -EXC_COMMON_BEGIN(bad_addr_slb)
+ -	EXCEPTION_PROLOG_COMMON(0x380, PACA_EXSLB)
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	ld	r3, PACA_EXSLB+EX_DAR(r13)
+ -	std	r3, _DAR(r1)
+ -	beq	cr6, 2f
+ -	li	r10, 0x480		/* fix trap number for I-SLB miss */
+ -	std	r10, _TRAP(r1)
+ -2:	bl	save_nvgprs
+ -	addi	r3, r1, STACK_FRAME_OVERHEAD
+ -	bl	slb_miss_bad_addr
+ -	b	ret_from_except
+ +#endif /* CONFIG_PPC_PSERIES */
+  
+ -EXC_REAL_BEGIN(hardware_interrupt, 0x500, 0x100)
+ -	.globl hardware_interrupt_hv;
+ -hardware_interrupt_hv:
+ -	BEGIN_FTR_SECTION
+ -		_MASKABLE_EXCEPTION_PSERIES(0x500, hardware_interrupt_common,
+ -					    EXC_HV, SOFTEN_TEST_HV,
+ -					    IRQS_DISABLED)
+ -	FTR_SECTION_ELSE
+ -		_MASKABLE_EXCEPTION_PSERIES(0x500, hardware_interrupt_common,
+ -					    EXC_STD, SOFTEN_TEST_PR,
+ -					    IRQS_DISABLED)
+ -	ALT_FTR_SECTION_END_IFSET(CPU_FTR_HVMODE | CPU_FTR_ARCH_206)
+ -EXC_REAL_END(hardware_interrupt, 0x500, 0x100)
+ +#ifdef __DISABLED__
+ +/*
+ + * This is used for when the SLB miss handler has to go virtual,
+ + * which doesn't happen for now anymore but will once we re-implement
+ + * dynamic VSIDs for shared page tables
+ + */
+ +slb_miss_user_pseries:
+ +	std	r10,PACA_EXGEN+EX_R10(r13)
+ +	std	r11,PACA_EXGEN+EX_R11(r13)
+ +	std	r12,PACA_EXGEN+EX_R12(r13)
+ +	GET_SCRATCH0(r10)
+ +	ld	r11,PACA_EXSLB+EX_R9(r13)
+ +	ld	r12,PACA_EXSLB+EX_R3(r13)
+ +	std	r10,PACA_EXGEN+EX_R13(r13)
+ +	std	r11,PACA_EXGEN+EX_R9(r13)
+ +	std	r12,PACA_EXGEN+EX_R3(r13)
+ +	clrrdi	r12,r13,32
+ +	mfmsr	r10
+ +	mfspr	r11,SRR0			/* save SRR0 */
+ +	ori	r12,r12,slb_miss_user_common@l	/* virt addr of handler */
+ +	ori	r10,r10,MSR_IR|MSR_DR|MSR_RI
+ +	mtspr	SRR0,r12
+ +	mfspr	r12,SRR1			/* and SRR1 */
+ +	mtspr	SRR1,r10
+ +	rfid
+ +	b	.				/* prevent spec. execution */
+ +#endif /* __DISABLED__ */
+  
+ -EXC_VIRT_BEGIN(hardware_interrupt, 0x4500, 0x100)
+ -	.globl hardware_interrupt_relon_hv;
+ -hardware_interrupt_relon_hv:
+ -	BEGIN_FTR_SECTION
+ -		_MASKABLE_RELON_EXCEPTION_PSERIES(0x500, hardware_interrupt_common,
+ -						  EXC_HV, SOFTEN_TEST_HV,
+ -						  IRQS_DISABLED)
+ -	FTR_SECTION_ELSE
+ -		_MASKABLE_RELON_EXCEPTION_PSERIES(0x500, hardware_interrupt_common,
+ -						  EXC_STD, SOFTEN_TEST_PR,
+ -						  IRQS_DISABLED)
+ -	ALT_FTR_SECTION_END_IFSET(CPU_FTR_HVMODE)
+ -EXC_VIRT_END(hardware_interrupt, 0x4500, 0x100)
+ +#ifdef CONFIG_KVM_BOOK3S_64_HANDLER
+ +kvmppc_skip_interrupt:
+ +	/*
+ +	 * Here all GPRs are unchanged from when the interrupt happened
+ +	 * except for r13, which is saved in SPRG_SCRATCH0.
+ +	 */
+ +	mfspr	r13, SPRN_SRR0
+ +	addi	r13, r13, 4
+ +	mtspr	SPRN_SRR0, r13
+ +	GET_SCRATCH0(r13)
+ +	rfid
+ +	b	.
+  
+ -TRAMP_KVM(PACA_EXGEN, 0x500)
+ -TRAMP_KVM_HV(PACA_EXGEN, 0x500)
+ -EXC_COMMON_ASYNC(hardware_interrupt_common, 0x500, do_IRQ)
+ +kvmppc_skip_Hinterrupt:
+ +	/*
+ +	 * Here all GPRs are unchanged from when the interrupt happened
+ +	 * except for r13, which is saved in SPRG_SCRATCH0.
+ +	 */
+ +	mfspr	r13, SPRN_HSRR0
+ +	addi	r13, r13, 4
+ +	mtspr	SPRN_HSRR0, r13
+ +	GET_SCRATCH0(r13)
+ +	hrfid
+ +	b	.
+ +#endif
+  
+ +/*
+ + * Code from here down to __end_handlers is invoked from the
+ + * exception prologs above.  Because the prologs assemble the
+ + * addresses of these handlers using the LOAD_HANDLER macro,
+ + * which uses an ori instruction, these handlers must be in
+ + * the first 64k of the kernel image.
+ + */
+  
+ -EXC_REAL(alignment, 0x600, 0x100)
+ -EXC_VIRT(alignment, 0x4600, 0x100, 0x600)
+ -TRAMP_KVM(PACA_EXGEN, 0x600)
+ -EXC_COMMON_BEGIN(alignment_common)
+ -	mfspr	r10,SPRN_DAR
+ -	std	r10,PACA_EXGEN+EX_DAR(r13)
+ -	mfspr	r10,SPRN_DSISR
+ -	stw	r10,PACA_EXGEN+EX_DSISR(r13)
+ -	EXCEPTION_PROLOG_COMMON(0x600, PACA_EXGEN)
+ -	ld	r3,PACA_EXGEN+EX_DAR(r13)
+ -	lwz	r4,PACA_EXGEN+EX_DSISR(r13)
+ -	std	r3,_DAR(r1)
+ -	std	r4,_DSISR(r1)
+ -	bl	save_nvgprs
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	alignment_exception
+ -	b	ret_from_except
+ +/*** Common interrupt handlers ***/
+ +
+ +	STD_EXCEPTION_COMMON(0x100, system_reset, system_reset_exception)
+  
+ +	STD_EXCEPTION_COMMON_ASYNC(0x500, hardware_interrupt, do_IRQ)
+ +	STD_EXCEPTION_COMMON_ASYNC(0x900, decrementer, timer_interrupt)
+ +	STD_EXCEPTION_COMMON(0x980, hdecrementer, hdec_interrupt)
+ +#ifdef CONFIG_PPC_DOORBELL
+ +	STD_EXCEPTION_COMMON_ASYNC(0xa00, doorbell_super, doorbell_exception)
+ +#else
+ +	STD_EXCEPTION_COMMON_ASYNC(0xa00, doorbell_super, unknown_exception)
+ +#endif
+ +	STD_EXCEPTION_COMMON(0xb00, trap_0b, unknown_exception)
+ +	STD_EXCEPTION_COMMON(0xd00, single_step, single_step_exception)
+ +	STD_EXCEPTION_COMMON(0xe00, trap_0e, unknown_exception)
+ +	STD_EXCEPTION_COMMON(0xe40, emulation_assist, emulation_assist_interrupt)
+ +	STD_EXCEPTION_COMMON_ASYNC(0xe60, hmi_exception, handle_hmi_exception)
+ +#ifdef CONFIG_PPC_DOORBELL
+ +	STD_EXCEPTION_COMMON_ASYNC(0xe80, h_doorbell, doorbell_exception)
+ +#else
+ +	STD_EXCEPTION_COMMON_ASYNC(0xe80, h_doorbell, unknown_exception)
+ +#endif
+ +	STD_EXCEPTION_COMMON_ASYNC(0xf00, performance_monitor, performance_monitor_exception)
+ +	STD_EXCEPTION_COMMON(0x1300, instruction_breakpoint, instruction_breakpoint_exception)
+ +	STD_EXCEPTION_COMMON(0x1502, denorm, unknown_exception)
+ +#ifdef CONFIG_ALTIVEC
+ +	STD_EXCEPTION_COMMON(0x1700, altivec_assist, altivec_assist_exception)
+ +#else
+ +	STD_EXCEPTION_COMMON(0x1700, altivec_assist, unknown_exception)
+ +#endif
+ +#ifdef CONFIG_CBE_RAS
+ +	STD_EXCEPTION_COMMON(0x1200, cbe_system_error, cbe_system_error_exception)
+ +	STD_EXCEPTION_COMMON(0x1600, cbe_maintenance, cbe_maintenance_exception)
+ +	STD_EXCEPTION_COMMON(0x1800, cbe_thermal, cbe_thermal_exception)
+ +#endif /* CONFIG_CBE_RAS */
+  
+ -EXC_REAL(program_check, 0x700, 0x100)
+ -EXC_VIRT(program_check, 0x4700, 0x100, 0x700)
+ -TRAMP_KVM(PACA_EXGEN, 0x700)
+ -EXC_COMMON_BEGIN(program_check_common)
+  	/*
+ -	 * It's possible to receive a TM Bad Thing type program check with
+ -	 * userspace register values (in particular r1), but with SRR1 reporting
+ -	 * that we came from the kernel. Normally that would confuse the bad
+ -	 * stack logic, and we would report a bad kernel stack pointer. Instead
+ -	 * we switch to the emergency stack if we're taking a TM Bad Thing from
+ -	 * the kernel.
+ +	 * Relocation-on interrupts: A subset of the interrupts can be delivered
+ +	 * with IR=1/DR=1, if AIL==2 and MSR.HV won't be changed by delivering
+ +	 * it.  Addresses are the same as the original interrupt addresses, but
+ +	 * offset by 0xc000000000004000.
+ +	 * It's impossible to receive interrupts below 0x300 via this mechanism.
+ +	 * KVM: None of these traps are from the guest ; anything that escalated
+ +	 * to HV=1 from HV=0 is delivered via real mode handlers.
+  	 */
+ -	li	r10,MSR_PR		/* Build a mask of MSR_PR ..	*/
+ -	oris	r10,r10,0x200000@h	/* .. and SRR1_PROGTM		*/
+ -	and	r10,r10,r12		/* Mask SRR1 with that.		*/
+ -	srdi	r10,r10,8		/* Shift it so we can compare	*/
+ -	cmpldi	r10,(0x200000 >> 8)	/* .. with an immediate.	*/
+ -	bne 1f				/* If != go to normal path.	*/
+ -
+ -	/* SRR1 had PR=0 and SRR1_PROGTM=1, so use the emergency stack	*/
+ -	andi.	r10,r12,MSR_PR;		/* Set CR0 correctly for label	*/
+ -					/* 3 in EXCEPTION_PROLOG_COMMON	*/
+ -	mr	r10,r1			/* Save r1			*/
+ -	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
+ -	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
+ -	b 3f				/* Jump into the macro !!	*/
+ -1:	EXCEPTION_PROLOG_COMMON(0x700, PACA_EXGEN)
+ -	bl	save_nvgprs
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	program_check_exception
+ -	b	ret_from_except
+  
+ -
+ -EXC_REAL(fp_unavailable, 0x800, 0x100)
+ -EXC_VIRT(fp_unavailable, 0x4800, 0x100, 0x800)
+ -TRAMP_KVM(PACA_EXGEN, 0x800)
+ -EXC_COMMON_BEGIN(fp_unavailable_common)
+ -	EXCEPTION_PROLOG_COMMON(0x800, PACA_EXGEN)
+ -	bne	1f			/* if from user, just load it up */
+ -	bl	save_nvgprs
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	kernel_fp_unavailable_exception
+ -	BUG_OPCODE
+ -1:
+ -#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ -BEGIN_FTR_SECTION
+ -	/* Test if 2 TM state bits are zero.  If non-zero (ie. userspace was in
+ -	 * transaction), go do TM stuff
+ +	/*
+ +	 * This uses the standard macro, since the original 0x300 vector
+ +	 * only has extra guff for STAB-based processors -- which never
+ +	 * come here.
+  	 */
+ -	rldicl.	r0, r12, (64-MSR_TS_LG), (64-2)
+ -	bne-	2f
+ -END_FTR_SECTION_IFSET(CPU_FTR_TM)
+ -#endif
+ -	bl	load_up_fpu
+ -	b	fast_exception_return
+ -#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ -2:	/* User process was in a transaction */
+ -	bl	save_nvgprs
+ -	RECONCILE_IRQ_STATE(r10, r11)
+ -	addi	r3,r1,STACK_FRAME_OVERHEAD
+ -	bl	fp_unavailable_tm
+ -	b	ret_from_except
+ +	STD_RELON_EXCEPTION_PSERIES(0x4300, 0x300, data_access)
+ +	. = 0x4380
+ +	.globl data_access_slb_relon_pSeries
+ +data_access_slb_relon_pSeries:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ +	EXCEPTION_PROLOG_1(PACA_EXSLB, NOTEST, 0x380)
+ +	std	r3,PACA_EXSLB+EX_R3(r13)
+ +	mfspr	r3,SPRN_DAR
+ +	mfspr	r12,SPRN_SRR1
+ +#ifndef CONFIG_RELOCATABLE
+ +	b	slb_miss_realmode
+ +#else
+ +	/*
+ +	 * We can't just use a direct branch to slb_miss_realmode
+ +	 * because the distance from here to there depends on where
+ +	 * the kernel ends up being put.
+ +	 */
+ +	mfctr	r11
+ +	ld	r10,PACAKBASE(r13)
+ +	LOAD_HANDLER(r10, slb_miss_realmode)
+ +	mtctr	r10
+ +	bctr
+  #endif
+  
+ +	STD_RELON_EXCEPTION_PSERIES(0x4400, 0x400, instruction_access)
+ +	. = 0x4480
+ +	.globl instruction_access_slb_relon_pSeries
+ +instruction_access_slb_relon_pSeries:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXSLB)
+ +	EXCEPTION_PROLOG_1(PACA_EXSLB, NOTEST, 0x480)
+ +	std	r3,PACA_EXSLB+EX_R3(r13)
+ +	mfspr	r3,SPRN_SRR0		/* SRR0 is faulting address */
+ +	mfspr	r12,SPRN_SRR1
+ +#ifndef CONFIG_RELOCATABLE
+ +	b	slb_miss_realmode
+ +#else
+ +	mfctr	r11
+ +	ld	r10,PACAKBASE(r13)
+ +	LOAD_HANDLER(r10, slb_miss_realmode)
+ +	mtctr	r10
+ +	bctr
+ +#endif
+  
+ -EXC_REAL_MASKABLE(decrementer, 0x900, 0x80, IRQS_DISABLED)
+ -EXC_VIRT_MASKABLE(decrementer, 0x4900, 0x80, 0x900, IRQS_DISABLED)
+ -TRAMP_KVM(PACA_EXGEN, 0x900)
+ -EXC_COMMON_ASYNC(decrementer_common, 0x900, timer_interrupt)
+ +	. = 0x4500
+ +	.globl hardware_interrupt_relon_pSeries;
+ +	.globl hardware_interrupt_relon_hv;
+ +hardware_interrupt_relon_pSeries:
+ +hardware_interrupt_relon_hv:
+ +	BEGIN_FTR_SECTION
+ +		_MASKABLE_RELON_EXCEPTION_PSERIES(0x502, hardware_interrupt, EXC_HV, SOFTEN_TEST_HV)
+ +	FTR_SECTION_ELSE
+ +		_MASKABLE_RELON_EXCEPTION_PSERIES(0x500, hardware_interrupt, EXC_STD, SOFTEN_TEST_PR)
+ +	ALT_FTR_SECTION_END_IFSET(CPU_FTR_HVMODE)
+ +	STD_RELON_EXCEPTION_PSERIES(0x4600, 0x600, alignment)
+ +	STD_RELON_EXCEPTION_PSERIES(0x4700, 0x700, program_check)
+ +	STD_RELON_EXCEPTION_PSERIES(0x4800, 0x800, fp_unavailable)
+ +	MASKABLE_RELON_EXCEPTION_PSERIES(0x4900, 0x900, decrementer)
+ +	STD_RELON_EXCEPTION_HV(0x4980, 0x982, hdecrementer)
+ +	MASKABLE_RELON_EXCEPTION_PSERIES(0x4a00, 0xa00, doorbell_super)
+ +	STD_RELON_EXCEPTION_PSERIES(0x4b00, 0xb00, trap_0b)
+ +
+ +	. = 0x4c00
+ +	.globl system_call_relon_pSeries
+ +system_call_relon_pSeries:
+ +	HMT_MEDIUM
+ +	SYSCALL_PSERIES_1
+ +	SYSCALL_PSERIES_2_DIRECT
+ +	SYSCALL_PSERIES_3
+  
+ +	STD_RELON_EXCEPTION_PSERIES(0x4d00, 0xd00, single_step)
+  
+ -EXC_REAL_HV(hdecrementer, 0x980, 0x80)
+ -EXC_VIRT_HV(hdecrementer, 0x4980, 0x80, 0x980)
+ -TRAMP_KVM_HV(PACA_EXGEN, 0x980)
+ -EXC_COMMON(hdecrementer_common, 0x980, hdec_interrupt)
+ +	. = 0x4e00
+ +	b	.	/* Can't happen, see v2.07 Book III-S section 6.5 */
+  
+ +	. = 0x4e20
+ +	b	.	/* Can't happen, see v2.07 Book III-S section 6.5 */
+  
+ -EXC_REAL_MASKABLE(doorbell_super, 0xa00, 0x100, IRQS_DISABLED)
+ -EXC_VIRT_MASKABLE(doorbell_super, 0x4a00, 0x100, 0xa00, IRQS_DISABLED)
+ -TRAMP_KVM(PACA_EXGEN, 0xa00)
+ -#ifdef CONFIG_PPC_DOORBELL
+ -EXC_COMMON_ASYNC(doorbell_super_common, 0xa00, doorbell_exception)
+ -#else
+ -EXC_COMMON_ASYNC(doorbell_super_common, 0xa00, unknown_exception)
+ -#endif
+ +	. = 0x4e40
+ +emulation_assist_relon_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	emulation_assist_relon_hv
+  
+ +	. = 0x4e60
+ +	b	.	/* Can't happen, see v2.07 Book III-S section 6.5 */
+  
+ -EXC_REAL(trap_0b, 0xb00, 0x100)
+ -EXC_VIRT(trap_0b, 0x4b00, 0x100, 0xb00)
+ -TRAMP_KVM(PACA_EXGEN, 0xb00)
+ -EXC_COMMON(trap_0b_common, 0xb00, unknown_exception)
+ +	. = 0x4e80
+ +h_doorbell_relon_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	h_doorbell_relon_hv
+  
+ -/*
+ - * system call / hypercall (0xc00, 0x4c00)
+ - *
+ - * The system call exception is invoked with "sc 0" and does not alter HV bit.
+ - * There is support for kernel code to invoke system calls but there are no
+ - * in-tree users.
+ - *
+ - * The hypercall is invoked with "sc 1" and sets HV=1.
+ - *
+ - * In HPT, sc 1 always goes to 0xc00 real mode. In RADIX, sc 1 can go to
+ - * 0x4c00 virtual mode.
+ - *
+ - * Call convention:
+ - *
+ - * syscall register convention is in Documentation/powerpc/syscall64-abi.txt
+ - *
+ - * For hypercalls, the register convention is as follows:
+ - * r0 volatile
+ - * r1-2 nonvolatile
+ - * r3 volatile parameter and return value for status
+ - * r4-r10 volatile input and output value
+ - * r11 volatile hypercall number and output value
+ - * r12 volatile input and output value
+ - * r13-r31 nonvolatile
+ - * LR nonvolatile
+ - * CTR volatile
+ - * XER volatile
+ - * CR0-1 CR5-7 volatile
+ - * CR2-4 nonvolatile
+ - * Other registers nonvolatile
+ - *
+ - * The intersection of volatile registers that don't contain possible
+ - * inputs is: cr0, xer, ctr. We may use these as scratch regs upon entry
+ - * without saving, though xer is not a good idea to use, as hardware may
+ - * interpret some bits so it may be costly to change them.
+ - */
+ -#ifdef CONFIG_KVM_BOOK3S_64_HANDLER
+ -	/*
+ -	 * There is a little bit of juggling to get syscall and hcall
+ -	 * working well. Save r13 in ctr to avoid using SPRG scratch
+ -	 * register.
+ -	 *
+ -	 * Userspace syscalls have already saved the PPR, hcalls must save
+ -	 * it before setting HMT_MEDIUM.
+ -	 */
+ -#define SYSCALL_KVMTEST							\
+ -	mtctr	r13;							\
+ -	GET_PACA(r13);							\
+ -	std	r10,PACA_EXGEN+EX_R10(r13);				\
+ -	KVMTEST_PR(0xc00); /* uses r10, branch to do_kvm_0xc00_system_call */ \
+ -	HMT_MEDIUM;							\
+ -	mfctr	r9;
+ +	. = 0x4f00
+ +performance_monitor_relon_pseries_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	performance_monitor_relon_pSeries
+  
+ -#else
+ -#define SYSCALL_KVMTEST							\
+ -	HMT_MEDIUM;							\
+ -	mr	r9,r13;							\
+ -	GET_PACA(r13);
+ -#endif
+ -	
+ -#define LOAD_SYSCALL_HANDLER(reg)					\
+ -	__LOAD_HANDLER(reg, system_call_common)
+ +	. = 0x4f20
+ +altivec_unavailable_relon_pseries_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	altivec_unavailable_relon_pSeries
+  
+ -/*
+ - * After SYSCALL_KVMTEST, we reach here with PACA in r13, r13 in r9,
+ - * and HMT_MEDIUM.
+ - */
+ -#define SYSCALL_REAL	 					\
+ -	mfspr	r11,SPRN_SRR0 ;					\
+ -	mfspr	r12,SPRN_SRR1 ;					\
+ -	LOAD_SYSCALL_HANDLER(r10) ; 				\
+ -	mtspr	SPRN_SRR0,r10 ; 				\
+ -	ld	r10,PACAKMSR(r13) ;				\
+ -	mtspr	SPRN_SRR1,r10 ; 				\
+ -	RFI_TO_KERNEL ;						\
+ -	b	. ;	/* prevent speculative execution */
+ +	. = 0x4f40
+ +vsx_unavailable_relon_pseries_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	vsx_unavailable_relon_pSeries
+  
+ -#ifdef CONFIG_PPC_FAST_ENDIAN_SWITCH
+ -#define SYSCALL_FASTENDIAN_TEST					\
+ -BEGIN_FTR_SECTION						\
+ -	cmpdi	r0,0x1ebe ; 					\
+ -	beq-	1f ;						\
+ -END_FTR_SECTION_IFSET(CPU_FTR_REAL_LE)				\
+ +	. = 0x4f60
+ +facility_unavailable_relon_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	facility_unavailable_relon_pSeries
+  
+ -#define SYSCALL_FASTENDIAN					\
+ -	/* Fast LE/BE switch system call */			\
+ -1:	mfspr	r12,SPRN_SRR1 ;					\
+ -	xori	r12,r12,MSR_LE ;				\
+ -	mtspr	SPRN_SRR1,r12 ;					\
+ -	mr	r13,r9 ;					\
+ -	RFI_TO_USER ;	/* return to userspace */		\
+ -	b	. ;	/* prevent speculative execution */
+ -#else
+ -#define SYSCALL_FASTENDIAN_TEST
+ -#define SYSCALL_FASTENDIAN
+ -#endif /* CONFIG_PPC_FAST_ENDIAN_SWITCH */
+ +	. = 0x4f80
+ +hv_facility_unavailable_relon_trampoline:
+ +	SET_SCRATCH0(r13)
+ +	EXCEPTION_PROLOG_0(PACA_EXGEN)
+ +	b	hv_facility_unavailable_relon_hv
+  
+ -#if defined(CONFIG_RELOCATABLE)
+ -	/*
+ -	 * We can't branch directly so we do it via the CTR which
+ -	 * is volatile across system calls.
+ -	 */
+ -#define SYSCALL_VIRT						\
+ -	LOAD_SYSCALL_HANDLER(r10) ;				\
+ -	mtctr	r10 ;						\
+ -	mfspr	r11,SPRN_SRR0 ;					\
+ -	mfspr	r12,SPRN_SRR1 ;					\
+ -	li	r10,MSR_RI ;					\
+ -	mtmsrd 	r10,1 ;						\
+ -	bctr ;
+ -#else
+ -	/* We can branch directly */
+ -#define SYSCALL_VIRT						\
+ -	mfspr	r11,SPRN_SRR0 ;					\
+ -	mfspr	r12,SPRN_SRR1 ;					\
+ -	li	r10,MSR_RI ;					\
+ -	mtmsrd 	r10,1 ;			/* Set RI (EE=0) */	\
+ -	b	system_call_common ;
+ +	STD_RELON_EXCEPTION_PSERIES(0x5300, 0x1300, instruction_breakpoint)
+ +#ifdef CONFIG_PPC_DENORMALISATION
+ +	. = 0x5500
+ +	b	denorm_exception_hv
+  #endif
+ +	STD_RELON_EXCEPTION_PSERIES(0x5700, 0x1700, altivec_assist)
+  
+ -EXC_REAL_BEGIN(system_call, 0xc00, 0x100)
+ -	SYSCALL_KVMTEST /* loads PACA into r13, and saves r13 to r9 */
+ -	SYSCALL_FASTENDIAN_TEST
+ -	SYSCALL_REAL
+ -	SYSCALL_FASTENDIAN
+ -EXC_REAL_END(system_call, 0xc00, 0x100)
+ -
+ -EXC_VIRT_BEGIN(system_call, 0x4c00, 0x100)
+ -	SYSCALL_KVMTEST /* loads PACA into r13, and saves r13 to r9 */
+ -	SYSCALL_FASTENDIAN_TEST
+ -	SYSCALL_VIRT
+ -	SYSCALL_FASTENDIAN
+ -EXC_VIRT_END(system_call, 0x4c00, 0x100)
+ +	/* Other future vectors */
+ +	.align	7
+ +	.globl	__end_interrupts
+ +__end_interrupts:
+  
+ -#ifdef CONFIG_KVM_BOOK3S_64_HANDLER
+ -	/*
+ -	 * This is a hcall, so register convention is as above, with these
+ -	 * differences:
+ -	 * r13 = PACA
+ -	 * ctr = orig r13
+ -	 * orig r10 saved in PACA
+ +	.align	7
+ +system_call_entry_direct:
+ +#if defined(CONFIG_RELOCATABLE)
+ +	/* The first level prologue may have used LR to get here, saving
+ +	 * orig in r10.  To save hacking/ifdeffing common code, restore here.
+  	 */
+ -TRAMP_KVM_BEGIN(do_kvm_0xc00)
+ -	 /*
+ -	  * Save the PPR (on systems that support it) before changing to
+ -	  * HMT_MEDIUM. That allows the KVM code to save that value into the
+ -	  * guest state (it is the guest's PPR value).
+ -	  */
+ -	OPT_GET_SPR(r10, SPRN_PPR, CPU_FTR_HAS_PPR)
+ -	HMT_MEDIUM
+ -	OPT_SAVE_REG_TO_PACA(PACA_EXGEN+EX_PPR, r10, CPU_FTR_HAS_PPR)
+ -	mfctr	r10
+ -	SET_SCRATCH0(r10)
+ -	std	r9,PACA_EXGEN+EX_R9(r13)
+ -	mfcr	r9
+ -	KVM_HANDLER(PACA_EXGEN, EXC_STD, 0xc00)
+ +	mtlr	r10
+  #endif
+ +system_call_entry:
+ +	b	system_call_common
+  
+ +ppc64_runlatch_on_trampoline:
+ +	b	__ppc64_runlatch_on
+ +
+ +/*
+ + * Here we have detected that the kernel stack pointer is bad.
+ + * R9 contains the saved CR, r13 points to the paca,
+ + * r10 contains the (bad) kernel stack pointer,
+ + * r11 and r12 contain the saved SRR0 and SRR1.
+ + * We switch to using an emergency stack, save the registers there,
+ + * and call kernel_bad_stack(), which panics.
+ + */
+ +bad_stack:
+ +	ld	r1,PACAEMERGSP(r13)
+ +	subi	r1,r1,64+INT_FRAME_SIZE
+ +	std	r9,_CCR(r1)
+ +	std	r10,GPR1(r1)
+ +	std	r11,_NIP(r1)
+ +	std	r12,_MSR(r1)
+ +	mfspr	r11,SPRN_DAR
+ +	mfspr	r12,SPRN_DSISR
+ +	std	r11,_DAR(r1)
+ +	std	r12,_DSISR(r1)
+ +	mflr	r10
+ +	mfctr	r11
+ +	mfxer	r12
+ +	std	r10,_LINK(r1)
+ +	std	r11,_CTR(r1)
+ +	std	r12,_XER(r1)
+ +	SAVE_GPR(0,r1)
+ +	SAVE_GPR(2,r1)
+ +	ld	r10,EX_R3(r3)
+ +	std	r10,GPR3(r1)
+ +	SAVE_GPR(4,r1)
+ +	SAVE_4GPRS(5,r1)
+ +	ld	r9,EX_R9(r3)
+ +	ld	r10,EX_R10(r3)
+ +	SAVE_2GPRS(9,r1)
+ +	ld	r9,EX_R11(r3)
+ +	ld	r10,EX_R12(r3)
+ +	ld	r11,EX_R13(r3)
+ +	std	r9,GPR11(r1)
+ +	std	r10,GPR12(r1)
+ +	std	r11,GPR13(r1)
+ +BEGIN_FTR_SECTION
+ +	ld	r10,EX_CFAR(r3)
+ +	std	r10,ORIG_GPR3(r1)
+ +END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+ +	SAVE_8GPRS(14,r1)
+ +	SAVE_10GPRS(22,r1)
+ +	lhz	r12,PACA_TRAP_SAVE(r13)
+ +	std	r12,_TRAP(r1)
+ +	addi	r11,r1,INT_FRAME_SIZE
+ +	std	r11,0(r1)
+ +	li	r12,0
+ +	std	r12,0(r11)
+ +	ld	r2,PACATOC(r13)
+ +	ld	r11,exception_marker@toc(r2)
+ +	std	r12,RESULT(r1)
+ +	std	r11,STACK_FRAME_OVERHEAD-16(r1)
+ +1:	addi	r3,r1,STACK_FRAME_OVERHEAD
+ +	bl	kernel_bad_stack
+ +	b	1b
+  
+ -EXC_REAL(single_step, 0xd00, 0x100)
+ -EXC_VIRT(single_step, 0x4d00, 0x100, 0xd00)
+ -TRAMP_KVM(PACA_EXGEN, 0xd00)
+ -EXC_COMMON(single_step_common, 0xd00, single_step_exception)
+ +/*
+ + * Here r13 points to the paca, r9 contains the saved CR,
+ + * SRR0 and SRR1 are saved in r11 and r12,
+ + * r9 - r13 are saved in paca->exgen.
+ + */
+ +	.align	7
+ +	.globl data_access_common
+ +data_access_common:
+ +	mfspr	r10,SPRN_DAR
+ +	std	r10,PACA_EXGEN+EX_DAR(r13)
+ +	mfspr	r10,SPRN_DSISR
+ +	stw	r10,PACA_EXGEN+EX_DSISR(r13)
+ +	EXCEPTION_PROLOG_COMMON(0x300, PACA_EXGEN)
+ +	DISABLE_INTS
+ +	ld	r12,_MSR(r1)
+ +	ld	r3,PACA_EXGEN+EX_DAR(r13)
+ +	lwz	r4,PACA_EXGEN+EX_DSISR(r13)
+ +	li	r5,0x300
+ +	b	do_hash_page		/* Try to handle as hpte fault */
+  
+ -EXC_REAL_OOL_HV(h_data_storage, 0xe00, 0x20)
+ -EXC_VIRT_OOL_HV(h_data_storage, 0x4e00, 0x20, 0xe00)
+ -TRAMP_KVM_HV_SKIP(PACA_EXGEN, 0xe00)
+ -EXC_COMMON_BEGIN(h_data_storage_common)
+ +	.align  7
+ +	.globl  h_data_storage_common
+ +h_data_storage_common:
+  	mfspr   r10,SPRN_HDAR
+  	std     r10,PACA_EXGEN+EX_DAR(r13)
+  	mfspr   r10,SPRN_HDSISR
+diff --cc arch/powerpc/kernel/setup_64.c
+index 93417594708c,c388cc3357fa..000000000000
+--- a/arch/powerpc/kernel/setup_64.c
++++ b/arch/powerpc/kernel/setup_64.c
+@@@ -767,4 -809,130 +767,124 @@@ static int __init disable_hardlockup_de
+  	return 0;
+  }
+  early_initcall(disable_hardlockup_detector);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_PPC_BOOK3S_64
++ static enum l1d_flush_type enabled_flush_types;
++ static void *l1d_flush_fallback_area;
++ static bool no_rfi_flush;
++ bool rfi_flush;
++ 
++ static int __init handle_no_rfi_flush(char *p)
++ {
++ 	pr_info("rfi-flush: disabled on command line.");
++ 	no_rfi_flush = true;
++ 	return 0;
++ }
++ early_param("no_rfi_flush", handle_no_rfi_flush);
++ 
++ /*
++  * The RFI flush is not KPTI, but because users will see doco that says to use
++  * nopti we hijack that option here to also disable the RFI flush.
++  */
++ static int __init handle_no_pti(char *p)
++ {
++ 	pr_info("rfi-flush: disabling due to 'nopti' on command line.\n");
++ 	handle_no_rfi_flush(NULL);
++ 	return 0;
++ }
++ early_param("nopti", handle_no_pti);
++ 
++ static void do_nothing(void *unused)
++ {
++ 	/*
++ 	 * We don't need to do the flush explicitly, just enter+exit kernel is
++ 	 * sufficient, the RFI exit handlers will do the right thing.
++ 	 */
++ }
++ 
++ void rfi_flush_enable(bool enable)
++ {
++ 	if (rfi_flush == enable)
++ 		return;
++ 
++ 	if (enable) {
++ 		do_rfi_flush_fixups(enabled_flush_types);
++ 		on_each_cpu(do_nothing, NULL, 1);
++ 	} else
++ 		do_rfi_flush_fixups(L1D_FLUSH_NONE);
++ 
++ 	rfi_flush = enable;
++ }
++ 
++ static void init_fallback_flush(void)
++ {
++ 	u64 l1d_size, limit;
++ 	int cpu;
++ 
++ 	l1d_size = ppc64_caches.l1d.size;
++ 	limit = min(ppc64_bolted_size(), ppc64_rma_size);
++ 
++ 	/*
++ 	 * Align to L1d size, and size it at 2x L1d size, to catch possible
++ 	 * hardware prefetch runoff. We don't have a recipe for load patterns to
++ 	 * reliably avoid the prefetcher.
++ 	 */
++ 	l1d_flush_fallback_area = __va(memblock_alloc_base(l1d_size * 2, l1d_size, limit));
++ 	memset(l1d_flush_fallback_area, 0, l1d_size * 2);
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		paca[cpu].rfi_flush_fallback_area = l1d_flush_fallback_area;
++ 		paca[cpu].l1d_flush_size = l1d_size;
++ 	}
++ }
++ 
++ void __init setup_rfi_flush(enum l1d_flush_type types, bool enable)
++ {
++ 	if (types & L1D_FLUSH_FALLBACK) {
++ 		pr_info("rfi-flush: Using fallback displacement flush\n");
++ 		init_fallback_flush();
++ 	}
++ 
++ 	if (types & L1D_FLUSH_ORI)
++ 		pr_info("rfi-flush: Using ori type flush\n");
++ 
++ 	if (types & L1D_FLUSH_MTTRIG)
++ 		pr_info("rfi-flush: Using mttrig type flush\n");
++ 
++ 	enabled_flush_types = types;
++ 
++ 	if (!no_rfi_flush)
++ 		rfi_flush_enable(enable);
++ }
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static int rfi_flush_set(void *data, u64 val)
++ {
++ 	if (val == 1)
++ 		rfi_flush_enable(true);
++ 	else if (val == 0)
++ 		rfi_flush_enable(false);
++ 	else
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int rfi_flush_get(void *data, u64 *val)
++ {
++ 	*val = rfi_flush ? 1 : 0;
++ 	return 0;
++ }
++ 
++ DEFINE_SIMPLE_ATTRIBUTE(fops_rfi_flush, rfi_flush_get, rfi_flush_set, "%llu\n");
++ 
++ static __init int rfi_flush_debugfs_init(void)
++ {
++ 	debugfs_create_file("rfi_flush", 0600, powerpc_debugfs_root, NULL, &fops_rfi_flush);
++ 	return 0;
++ }
++ device_initcall(rfi_flush_debugfs_init);
+++>>>>>>> bdcb1aefc5b3 (powerpc/64s: Improve RFI L1-D cache flush fallback)
+  #endif
+ -
+ -ssize_t cpu_show_meltdown(struct device *dev, struct device_attribute *attr, char *buf)
+ -{
+ -	if (rfi_flush)
+ -		return sprintf(buf, "Mitigation: RFI Flush\n");
+ -
+ -	return sprintf(buf, "Vulnerable\n");
+ -}
+ -#endif /* CONFIG_PPC_BOOK3S_64 */
+diff --cc arch/powerpc/xmon/xmon.c
+index dfc109daa74c,82e1a3ee6e0f..000000000000
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@@ -2077,8 -2356,40 +2077,43 @@@ static void dump_one_paca(int cpu
+  	DUMP(p, hw_cpu_id, "x");
+  	DUMP(p, cpu_start, "x");
+  	DUMP(p, kexec_state, "x");
+++<<<<<<< HEAD
+ +	DUMP(p, __current, "p");
+++=======
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	for (i = 0; i < SLB_NUM_BOLTED; i++) {
++ 		u64 esid, vsid;
++ 
++ 		if (!p->slb_shadow_ptr)
++ 			continue;
++ 
++ 		esid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].esid);
++ 		vsid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].vsid);
++ 
++ 		if (esid || vsid) {
++ 			printf(" slb_shadow[%d]:       = 0x%016lx 0x%016lx\n",
++ 				i, esid, vsid);
++ 		}
++ 	}
++ 	DUMP(p, vmalloc_sllp, "x");
++ 	DUMP(p, slb_cache_ptr, "x");
++ 	for (i = 0; i < SLB_CACHE_ENTRIES; i++)
++ 		printf(" slb_cache[%d]:        = 0x%016lx\n", i, p->slb_cache[i]);
++ 
++ 	DUMP(p, rfi_flush_fallback_area, "px");
++ #endif
++ 	DUMP(p, dscr_default, "llx");
++ #ifdef CONFIG_PPC_BOOK3E
++ 	DUMP(p, pgd, "px");
++ 	DUMP(p, kernel_pgd, "px");
++ 	DUMP(p, tcd_ptr, "px");
++ 	DUMP(p, mc_kstack, "px");
++ 	DUMP(p, crit_kstack, "px");
++ 	DUMP(p, dbg_kstack, "px");
++ #endif
++ 	DUMP(p, __current, "px");
+++>>>>>>> bdcb1aefc5b3 (powerpc/64s: Improve RFI L1-D cache flush fallback)
+  	DUMP(p, kstack, "lx");
+ -	printf(" kstack_base          = 0x%016lx\n", p->kstack & ~(THREAD_SIZE - 1));
+  	DUMP(p, stab_rr, "lx");
+  	DUMP(p, saved_r1, "lx");
+  	DUMP(p, trap_save, "x");
+* Unmerged path arch/powerpc/include/asm/paca.h
+* Unmerged path arch/powerpc/kernel/asm-offsets.c
+* Unmerged path arch/powerpc/kernel/exceptions-64s.S
+* Unmerged path arch/powerpc/kernel/setup_64.c
+* Unmerged path arch/powerpc/xmon/xmon.c
