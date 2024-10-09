@@ -1,0 +1,352 @@
+net/mlx5e: Non-atomic indicator for ring enabled state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Non-atomic indicator for ring enabled state (Kamal Heib) [1456694]
+Rebuild_FUZZ: 96.15%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit a1eaba4c5c29b6b5196b2237ce3a8d7d97622b2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a1eaba4c.failed
+
+Rings enabled state change occurs in control path only, and is always
+followed by a napi_sychronize(), so that following NAPIs read the
+new value. This read does not need to be atomic.
+
+The RQ auto-moderation bit is not set/cleared in data-path.
+No need for atomic read, a regular read operation is sufficient.
+In RQ creation time as well, there's no multiple threads trying
+to access it yet, hence a regular read can be used.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit a1eaba4c5c29b6b5196b2237ce3a8d7d97622b2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d8b64a5a33e7,411fb68794bc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -837,21 -920,16 +837,26 @@@ static int mlx5e_open_rq(struct mlx5e_c
+  	if (err)
+  		return err;
+  
+ -	err = mlx5e_create_rq(rq, param);
+ +	err = mlx5e_enable_rq(rq, param);
+  	if (err)
+ -		goto err_free_rq;
+ +		goto err_destroy_rq;
+  
+++<<<<<<< HEAD
+ +	set_bit(MLX5E_RQ_STATE_ENABLED, &rq->state);
+  	err = mlx5e_modify_rq_state(rq, MLX5_RQC_STATE_RST, MLX5_RQC_STATE_RDY);
+  	if (err)
+ -		goto err_destroy_rq;
+ +		goto err_disable_rq;
+  
+ +	if (param->am_enabled)
+ +		set_bit(MLX5E_RQ_STATE_AM, &c->rq.state);
+++=======
++ 	if (params->rx_am_enabled)
++ 		c->rq.state |= BIT(MLX5E_RQ_STATE_AM);
+++>>>>>>> a1eaba4c5c29 (net/mlx5e: Non-atomic indicator for ring enabled state)
+ +
+ +	sq->db.ico_wqe[pi].opcode     = MLX5_OPCODE_NOP;
+ +	sq->db.ico_wqe[pi].num_wqebbs = 1;
+ +	mlx5e_send_nop(sq, true); /* trigger mlx5e_post_rx_wqes() */
+  
+  	return 0;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d6a4d3219a46,a5522c3992a2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -442,10 -459,14 +442,10 @@@ void mlx5e_dealloc_rx_mpwqe(struct mlx5
+  bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
+  {
+  	struct mlx5_wq_ll *wq = &rq->wq;
+ -	int err;
+  
+- 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
++ 	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+  		return false;
+  
+ -	if (mlx5_wq_ll_is_full(wq))
+ -		return false;
+ -
+  	if (test_bit(MLX5E_RQ_STATE_UMR_WQE_IN_PROGRESS, &rq->state))
+  		return true;
+  
+@@@ -808,9 -979,11 +808,9 @@@ mpwrq_cqe_out
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+  {
+  	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
+ -	struct mlx5e_xdpsq *xdpsq;
+ -	struct mlx5_cqe64 *cqe;
+  	int work_done = 0;
+  
+- 	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
++ 	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+  		return 0;
+  
+  	if (cq->decmprs_left)
+@@@ -841,3 -1020,202 +841,205 @@@
+  
+  	return work_done;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
++ {
++ 	struct mlx5e_xdpsq *sq;
++ 	struct mlx5_cqe64 *cqe;
++ 	struct mlx5e_rq *rq;
++ 	u16 sqcc;
++ 	int i;
++ 
++ 	sq = container_of(cq, struct mlx5e_xdpsq, cq);
++ 
++ 	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_ENABLED)))
++ 		return false;
++ 
++ 	cqe = mlx5_cqwq_get_cqe(&cq->wq);
++ 	if (!cqe)
++ 		return false;
++ 
++ 	rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 
++ 	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++ 	 * otherwise a cq overrun may occur
++ 	 */
++ 	sqcc = sq->cc;
++ 
++ 	i = 0;
++ 	do {
++ 		u16 wqe_counter;
++ 		bool last_wqe;
++ 
++ 		mlx5_cqwq_pop(&cq->wq);
++ 
++ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++ 
++ 		do {
++ 			struct mlx5e_dma_info *di;
++ 			u16 ci;
++ 
++ 			last_wqe = (sqcc == wqe_counter);
++ 
++ 			ci = sqcc & sq->wq.sz_m1;
++ 			di = &sq->db.di[ci];
++ 
++ 			sqcc++;
++ 			/* Recycle RX page */
++ 			mlx5e_page_release(rq, di, true);
++ 		} while (!last_wqe);
++ 	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
++ 
++ 	mlx5_cqwq_update_db_record(&cq->wq);
++ 
++ 	/* ensure cq space is freed before enabling more cqes */
++ 	wmb();
++ 
++ 	sq->cc = sqcc;
++ 	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++ }
++ 
++ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 	struct mlx5e_dma_info *di;
++ 	u16 ci;
++ 
++ 	while (sq->cc != sq->pc) {
++ 		ci = sq->cc & sq->wq.sz_m1;
++ 		di = &sq->db.di[ci];
++ 		sq->cc++;
++ 
++ 		mlx5e_page_release(rq, di, false);
++ 	}
++ }
++ 
++ #ifdef CONFIG_MLX5_CORE_IPOIB
++ 
++ #define MLX5_IB_GRH_DGID_OFFSET 24
++ #define MLX5_GID_SIZE           16
++ 
++ static inline void mlx5i_complete_rx_cqe(struct mlx5e_rq *rq,
++ 					 struct mlx5_cqe64 *cqe,
++ 					 u32 cqe_bcnt,
++ 					 struct sk_buff *skb)
++ {
++ 	struct net_device *netdev = rq->netdev;
++ 	struct mlx5e_tstamp *tstamp = rq->tstamp;
++ 	char *pseudo_header;
++ 	u8 *dgid;
++ 	u8 g;
++ 
++ 	g = (be32_to_cpu(cqe->flags_rqpn) >> 28) & 3;
++ 	dgid = skb->data + MLX5_IB_GRH_DGID_OFFSET;
++ 	if ((!g) || dgid[0] != 0xff)
++ 		skb->pkt_type = PACKET_HOST;
++ 	else if (memcmp(dgid, netdev->broadcast + 4, MLX5_GID_SIZE) == 0)
++ 		skb->pkt_type = PACKET_BROADCAST;
++ 	else
++ 		skb->pkt_type = PACKET_MULTICAST;
++ 
++ 	/* TODO: IB/ipoib: Allow mcast packets from other VFs
++ 	 * 68996a6e760e5c74654723eeb57bf65628ae87f4
++ 	 */
++ 
++ 	skb_pull(skb, MLX5_IB_GRH_BYTES);
++ 
++ 	skb->protocol = *((__be16 *)(skb->data));
++ 
++ 	skb->ip_summed = CHECKSUM_COMPLETE;
++ 	skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
++ 
++ 	if (unlikely(mlx5e_rx_hw_stamp(tstamp)))
++ 		mlx5e_fill_hwstamp(tstamp, get_cqe_ts(cqe), skb_hwtstamps(skb));
++ 
++ 	skb_record_rx_queue(skb, rq->ix);
++ 
++ 	if (likely(netdev->features & NETIF_F_RXHASH))
++ 		mlx5e_skb_set_hash(cqe, skb);
++ 
++ 	/* 20 bytes of ipoib header and 4 for encap existing */
++ 	pseudo_header = skb_push(skb, MLX5_IPOIB_PSEUDO_LEN);
++ 	memset(pseudo_header, 0, MLX5_IPOIB_PSEUDO_LEN);
++ 	skb_reset_mac_header(skb);
++ 	skb_pull(skb, MLX5_IPOIB_HARD_LEN);
++ 
++ 	skb->dev = netdev;
++ 
++ 	rq->stats.csum_complete++;
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += cqe_bcnt;
++ }
++ 
++ void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_wqe_frag_info *wi;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	wi             = &rq->wqe.frag_info[wqe_counter];
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
++ 	if (!skb)
++ 		goto wq_free_wqe;
++ 
++ 	mlx5i_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ wq_free_wqe:
++ 	mlx5e_free_rx_wqe_reuse(rq, wi);
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_CORE_IPOIB */
++ 
++ #ifdef CONFIG_MLX5_EN_IPSEC
++ 
++ void mlx5e_ipsec_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_wqe_frag_info *wi;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	wi             = &rq->wqe.frag_info[wqe_counter];
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
++ 	if (unlikely(!skb)) {
++ 		/* a DROP, save the page-reuse checks */
++ 		mlx5e_free_rx_wqe(rq, wi);
++ 		goto wq_ll_pop;
++ 	}
++ 	skb = mlx5e_ipsec_handle_rx_skb(rq->netdev, skb);
++ 	if (unlikely(!skb)) {
++ 		mlx5e_free_rx_wqe(rq, wi);
++ 		goto wq_ll_pop;
++ 	}
++ 
++ 	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ 	mlx5e_free_rx_wqe_reuse(rq, wi);
++ wq_ll_pop:
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_EN_IPSEC */
+++>>>>>>> a1eaba4c5c29 (net/mlx5e: Non-atomic indicator for ring enabled state)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 819a88f4cbad..f87caa94bb18 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -274,6 +274,8 @@ enum {
+ 	MLX5E_RQ_STATE_AM,
+ };
+ 
++#define MLX5E_TEST_BIT(state, nr) (state & BIT(nr))
++
+ struct mlx5e_cq {
+ 	/* data path - accessed per cqe */
+ 	struct mlx5_cqwq           wq;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 46d0d61188dc..f4606401151e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -414,7 +414,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+ 
+ 	sq = container_of(cq, struct mlx5e_sq, cq);
+ 
+-	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_ENABLED)))
+ 		return false;
+ 
+ 	npkts = 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index a75c0268e502..1fcf59659595 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -56,7 +56,7 @@ static void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+ 	struct mlx5_cqe64 *cqe;
+ 	u16 sqcc;
+ 
+-	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_ENABLED)))
+ 		return;
+ 
+ 	cqe = mlx5e_get_cqe(cq);
+@@ -139,7 +139,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	for (i = 0; i < c->num_tc; i++)
+ 		mlx5e_cq_arm(&c->sq[i].cq);
+ 
+-	if (test_bit(MLX5E_RQ_STATE_AM, &c->rq.state))
++	if (MLX5E_TEST_BIT(c->rq.state, MLX5E_RQ_STATE_AM))
+ 		mlx5e_rx_am(&c->rq);
+ 
+ 	mlx5e_cq_arm(&c->rq.cq);
