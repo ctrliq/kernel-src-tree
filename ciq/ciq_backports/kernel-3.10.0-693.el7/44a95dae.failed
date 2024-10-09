@@ -1,0 +1,141 @@
+KVM: x86: Detect and Initialize AVIC support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+commit 44a95dae1d229a4967bbfcc56fb2116a9b4fe942
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/44a95dae.failed
+
+This patch introduces AVIC-related data structure, and AVIC
+initialization code.
+
+There are three main data structures for AVIC:
+    * Virtual APIC (vAPIC) backing page (per-VCPU)
+    * Physical APIC ID table (per-VM)
+    * Logical APIC ID table (per-VM)
+
+Currently, AVIC is disabled by default. Users can manually
+enable AVIC via kernel boot option kvm-amd.avic=1 or during
+kvm-amd module loading with parameter avic=1.
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+[Avoid extra indentation (Boris). - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 44a95dae1d229a4967bbfcc56fb2116a9b4fe942)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index e9b71b8ce24b,337e13b0d01d..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -677,8 -774,9 +677,14 @@@ struct kvm_arch 
+  
+  	bool disabled_lapic_found;
+  
+++<<<<<<< HEAD
+ +	bool x2apic_format;
+ +	bool x2apic_broadcast_quirk_disabled;
+++=======
++ 	/* Struct members for AVIC */
++ 	struct page *avic_logical_id_table_page;
++ 	struct page *avic_physical_id_table_page;
+++>>>>>>> 44a95dae1d22 (KVM: x86: Detect and Initialize AVIC support)
+  };
+  
+  struct kvm_vm_stat {
+diff --cc arch/x86/kvm/svm.c
+index b645837920e7,192cad25d321..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -200,9 -224,13 +222,13 @@@ static int npt = true
+  module_param(npt, int, S_IRUGO);
+  
+  /* allow nested virtualization in KVM/SVM */
+ -static int nested = true;
+ +static int nested = false;
+  module_param(nested, int, S_IRUGO);
+  
++ /* enable / disable AVIC */
++ static int avic;
++ module_param(avic, int, S_IRUGO);
++ 
+  static void svm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
+  static void svm_flush_tlb(struct kvm_vcpu *vcpu);
+  static void svm_complete_interrupts(struct vcpu_svm *svm);
+@@@ -3545,12 -3805,33 +3746,40 @@@ static void svm_set_virtual_x2apic_mode
+  	return;
+  }
+  
+ -static bool svm_get_enable_apicv(void)
+ +static int svm_cpu_uses_apicv(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	return 0;
+ +}
+ +
+ +static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+++=======
++ 	return avic;
++ }
++ 
++ static void svm_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr)
++ {
++ }
++ 
++ static void svm_hwapic_isr_update(struct kvm *kvm, int isr)
++ {
++ }
++ 
++ /* Note: Currently only used by Hyper-V. */
++ static void svm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	struct vmcb *vmcb = svm->vmcb;
++ 
++ 	if (!avic)
++ 		return;
++ 
++ 	vmcb->control.int_ctl &= ~AVIC_ENABLE_MASK;
++ 	mark_dirty(vmcb, VMCB_INTR);
++ }
++ 
++ static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+++>>>>>>> 44a95dae1d22 (KVM: x86: Detect and Initialize AVIC support)
+  {
+  	return;
+  }
+@@@ -4307,9 -4599,12 +4539,11 @@@ static struct kvm_x86_ops svm_x86_ops 
+  	.enable_irq_window = enable_irq_window,
+  	.update_cr8_intercept = update_cr8_intercept,
+  	.set_virtual_x2apic_mode = svm_set_virtual_x2apic_mode,
+ -	.get_enable_apicv = svm_get_enable_apicv,
+ -	.refresh_apicv_exec_ctrl = svm_refresh_apicv_exec_ctrl,
+ +	.cpu_uses_apicv = svm_cpu_uses_apicv,
+  	.load_eoi_exitmap = svm_load_eoi_exitmap,
+  	.sync_pir_to_irr = svm_sync_pir_to_irr,
++ 	.hwapic_irr_update = svm_hwapic_irr_update,
++ 	.hwapic_isr_update = svm_hwapic_isr_update,
+  
+  	.set_tss_addr = svm_set_tss_addr,
+  	.get_tdp_level = get_npt_level,
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/include/asm/svm.h b/arch/x86/include/asm/svm.h
+index 4711fa4457f3..d0fe23ec7e98 100644
+--- a/arch/x86/include/asm/svm.h
++++ b/arch/x86/include/asm/svm.h
+@@ -116,6 +116,9 @@ struct __attribute__ ((__packed__)) vmcb_control_area {
+ #define V_INTR_MASKING_SHIFT 24
+ #define V_INTR_MASKING_MASK (1 << V_INTR_MASKING_SHIFT)
+ 
++#define AVIC_ENABLE_SHIFT 31
++#define AVIC_ENABLE_MASK (1 << AVIC_ENABLE_SHIFT)
++
+ #define SVM_INTERRUPT_SHADOW_MASK 1
+ 
+ #define SVM_IOIO_STR_SHIFT 2
+* Unmerged path arch/x86/kvm/svm.c
