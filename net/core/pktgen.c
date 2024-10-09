@@ -487,6 +487,9 @@ static ssize_t pgctrl_write(struct file *file, const char __user *buf,
 		goto out;
 	}
 
+	if (count == 0)
+		return -EINVAL;
+
 	if (count > sizeof(data))
 		count = sizeof(data);
 
@@ -494,7 +497,7 @@ static ssize_t pgctrl_write(struct file *file, const char __user *buf,
 		err = -EFAULT;
 		goto out;
 	}
-	data[count - 1] = 0;	/* Make string */
+	data[count - 1] = 0;	/* Strip trailing '\n' and terminate string */
 
 	if (!strcmp(data, "stop"))
 		pktgen_stop_all_threads_ifs(pn);
