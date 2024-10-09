@@ -1,0 +1,226 @@
+fs: Add user namespace member to struct super_block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] Add user namespace member to struct super_block ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 95.92%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 6e4eab577a0cae15b3da9b888cff16fe57981b3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6e4eab57.failed
+
+Start marking filesystems with a user namespace owner, s_user_ns.  In
+this change this is only used for permission checks of who may mount a
+filesystem.  Ultimately s_user_ns will be used for translating ids and
+checking capabilities for filesystems mounted from user namespaces.
+
+The default policy for setting s_user_ns is implemented in sget(),
+which arranges for s_user_ns to be set to current_user_ns() and to
+ensure that the mounter of the filesystem has CAP_SYS_ADMIN in that
+user_ns.
+
+The guts of sget are split out into another function sget_userns().
+The function sget_userns calls alloc_super with the specified user
+namespace or it verifies the existing superblock that was found
+has the expected user namespace, and fails with EBUSY when it is not.
+This failing prevents users with the wrong privileges mounting a
+filesystem.
+
+The reason for the split of sget_userns from sget is that in some
+cases such as mount_ns and kernfs_mount_ns a different policy for
+permission checking of mounts and setting s_user_ns is necessary, and
+the existence of sget_userns() allows those policies to be
+implemented.
+
+The helper mount_ns is expected to be used for filesystems such as
+proc and mqueuefs which present per namespace information.  The
+function mount_ns is modified to call sget_userns instead of sget to
+ensure the user namespace owner of the namespace whose information is
+presented by the filesystem is used on the superblock.
+
+For sysfs and cgroup the appropriate permission checks are already in
+place, and kernfs_mount_ns is modified to call sget_userns so that
+the init_user_ns is the only user namespace used.
+
+For the cgroup filesystem cgroup namespace mounts are bind mounts of a
+subset of the full cgroup filesystem and as such s_user_ns must be the
+same for all of them as there is only a single superblock.
+
+Mounts of sysfs that vary based on the network namespace could in principle
+change s_user_ns but it keeps the analysis and implementation of kernfs
+simpler if that is not supported, and at present there appear to be no
+benefits from supporting a different s_user_ns on any sysfs mount.
+
+Getting the details of setting s_user_ns correct has been
+a long process.  Thanks to Pavel Tikhorirorv who spotted a leak
+in sget_userns.  Thanks to Seth Forshee who has kept the work alive.
+
+Thanks-to: Seth Forshee <seth.forshee@canonical.com>
+Thanks-to: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+(cherry picked from commit 6e4eab577a0cae15b3da9b888cff16fe57981b3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+#	include/linux/fs.h
+diff --cc fs/super.c
+index 9dcc169c24b2,874c7e3ebb8f..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -33,14 -33,12 +33,15 @@@
+  #include <linux/cleancache.h>
+  #include <linux/fsnotify.h>
+  #include <linux/lockdep.h>
++ #include <linux/user_namespace.h>
+  #include "internal.h"
+  
+ +static int thaw_super_locked(struct super_block *sb);
+  
+ -static LIST_HEAD(super_blocks);
+ -static DEFINE_SPINLOCK(sb_lock);
+ +const unsigned super_block_wrapper_version = 0;
+ +
+ +LIST_HEAD(super_blocks);
+ +DEFINE_SPINLOCK(sb_lock);
+  
+  static char *sb_writers_name[SB_FREEZE_LEVELS] = {
+  	"sb_writers",
+@@@ -115,14 -162,14 +116,15 @@@ static int prune_super(struct shrinker 
+   */
+  static void destroy_super(struct super_block *s)
+  {
+ -	list_lru_destroy(&s->s_dentry_lru);
+ -	list_lru_destroy(&s->s_inode_lru);
+ +	int i;
+ +	for (i = 0; i < SB_FREEZE_LEVELS; i++)
+ +		percpu_counter_destroy(&s->s_writers.counter[i]);
+  	security_sb_free(s);
+  	WARN_ON(!list_empty(&s->s_mounts));
++ 	put_user_ns(s->s_user_ns);
+  	kfree(s->s_subtype);
+  	kfree(s->s_options);
+ -	call_rcu(&s->rcu, destroy_super_rcu);
+ +	kfree_rcu(s, rcu);
+  }
+  
+  /**
+@@@ -133,35 -181,42 +136,42 @@@
+   *	Allocates and initializes a new &struct super_block.  alloc_super()
+   *	returns a pointer new superblock or %NULL if allocation had failed.
+   */
+- static struct super_block *alloc_super(struct file_system_type *type, int flags)
++ static struct super_block *alloc_super(struct file_system_type *type, int flags,
++ 				       struct user_namespace *user_ns)
+  {
+ -	struct super_block *s = kzalloc(sizeof(struct super_block),  GFP_USER);
+ +	struct super_block *s = kzalloc(sizeof(struct super_block_wrapper),  GFP_USER);
+  	static const struct super_operations default_op;
+  	int i;
+  
+  	if (!s)
+  		return NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&s->s_mounts);
++ 	s->s_user_ns = get_user_ns(user_ns);
++ 
+++>>>>>>> 6e4eab577a0c (fs: Add user namespace member to struct super_block)
+  	if (security_sb_alloc(s))
+  		goto fail;
+ -
+  	for (i = 0; i < SB_FREEZE_LEVELS; i++) {
+ -		if (__percpu_init_rwsem(&s->s_writers.rw_sem[i],
+ -					sb_writers_name[i],
+ -					&type->s_writers_key[i]))
+ +		if (percpu_counter_init(&s->s_writers.counter[i], 0,
+ +					GFP_KERNEL) < 0)
+  			goto fail;
+ +		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
+ +				 &type->s_writers_key[i], 0);
+  	}
+ +	init_waitqueue_head(&s->s_writers.wait);
+  	init_waitqueue_head(&s->s_writers.wait_unfrozen);
+ -	s->s_bdi = &noop_backing_dev_info;
+  	s->s_flags = flags;
+ +	s->s_bdi = &default_backing_dev_info;
+  	INIT_HLIST_NODE(&s->s_instances);
+  	INIT_HLIST_BL_HEAD(&s->s_anon);
+ -	mutex_init(&s->s_sync_lock);
+  	INIT_LIST_HEAD(&s->s_inodes);
+ -	spin_lock_init(&s->s_inode_list_lock);
+ -
+ -	if (list_lru_init_memcg(&s->s_dentry_lru))
+ -		goto fail;
+ -	if (list_lru_init_memcg(&s->s_inode_lru))
+ -		goto fail;
+ -
+ +	INIT_LIST_HEAD(&s->s_dentry_lru);
+ +	INIT_LIST_HEAD(&s->s_inode_lru);
+ +	spin_lock_init(&s->s_inode_lru_lock);
+ +	INIT_LIST_HEAD(&s->s_mounts);
+  	init_rwsem(&s->s_umount);
+  	lockdep_set_class(&s->s_umount, &type->s_umount_key);
+  	/*
+diff --cc include/linux/fs.h
+index 24213ce025a6,9eef64f23a75..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1523,16 -1429,27 +1523,36 @@@ struct super_block 
+  	int s_readonly_remount;
+  
+  	/* AIO completions deferred from interrupt context */
+ -	struct workqueue_struct *s_dio_done_wq;
+ -	struct hlist_head s_pins;
+ +	RH_KABI_EXTEND(struct workqueue_struct *s_dio_done_wq)
+ +	RH_KABI_EXTEND(struct rcu_head rcu)
+ +	RH_KABI_EXTEND(struct hlist_head s_pins)
+ +};
+  
+++<<<<<<< HEAD
+ +extern const unsigned super_block_wrapper_version;
+ +struct super_block_wrapper {
+ +	struct super_block sb;
+++=======
++ 	/*
++ 	 * Owning user namespace and default context in which to
++ 	 * interpret filesystem uids, gids, quotas, device nodes,
++ 	 * xattrs and security labels.
++ 	 */
++ 	struct user_namespace *s_user_ns;
++ 
++ 	/*
++ 	 * Keep the lru lists last in the structure so they always sit on their
++ 	 * own individual cachelines.
++ 	 */
++ 	struct list_lru		s_dentry_lru ____cacheline_aligned_in_smp;
++ 	struct list_lru		s_inode_lru ____cacheline_aligned_in_smp;
++ 	struct rcu_head		rcu;
++ 	struct work_struct	destroy_work;
++ 
++ 	struct mutex		s_sync_lock;	/* sync serialisation lock */
+++>>>>>>> 6e4eab577a0c (fs: Add user namespace member to struct super_block)
+  
+ +	/* -- Wrapper version 0 -- */
+  	/*
+  	 * Indicates how deep in a filesystem stack this SB is
+  	 */
+diff --git a/fs/kernfs/mount.c b/fs/kernfs/mount.c
+index 642fe1db4ffa..2bf41527b7b8 100644
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@ -157,7 +157,8 @@ struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
+ 	info->root = root;
+ 	info->ns = ns;
+ 
+-	sb = sget(fs_type, kernfs_test_super, kernfs_set_super, flags, info);
++	sb = sget_userns(fs_type, kernfs_test_super, kernfs_set_super, flags,
++			 &init_user_ns, info);
+ 	if (IS_ERR(sb) || sb->s_fs_info != info)
+ 		kfree(info);
+ 	if (IS_ERR(sb))
+* Unmerged path fs/super.c
+* Unmerged path include/linux/fs.h
