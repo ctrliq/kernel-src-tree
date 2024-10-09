@@ -981,7 +981,7 @@ xfs_file_iomap_begin(
 	lockmode = xfs_ilock_data_map_shared(ip);
 
 	ASSERT(offset <= mp->m_super->s_maxbytes);
-	if ((xfs_fsize_t)offset + length > mp->m_super->s_maxbytes)
+	if (offset > mp->m_super->s_maxbytes - length)
 		length = mp->m_super->s_maxbytes - offset;
 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
 	end_fsb = XFS_B_TO_FSB(mp, offset + length);

@@ -372,7 +372,7 @@ xfs_map_blocks(
 	       (ip->i_df.if_flags & XFS_IFEXTENTS));
 	ASSERT(offset <= mp->m_super->s_maxbytes);
 
-	if ((xfs_ufsize_t)offset + count > mp->m_super->s_maxbytes)
+	if (offset > mp->m_super->s_maxbytes - count)
 		count = mp->m_super->s_maxbytes - offset;
 	end_fsb = XFS_B_TO_FSB(mp, (xfs_ufsize_t)offset + count);
 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
@@ -1263,7 +1263,7 @@ __xfs_get_blocks(
 	}
 
 	ASSERT(offset <= mp->m_super->s_maxbytes);
-	if ((xfs_ufsize_t)offset + size > mp->m_super->s_maxbytes)
+	if (offset > mp->m_super->s_maxbytes - size)
 		size = mp->m_super->s_maxbytes - offset;
 	end_fsb = XFS_B_TO_FSB(mp, (xfs_ufsize_t)offset + size);
 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
