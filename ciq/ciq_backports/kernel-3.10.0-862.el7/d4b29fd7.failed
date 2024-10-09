@@ -1,0 +1,410 @@
+block: remove block_device_operations ->direct_access()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit d4b29fd78ea6fc2be219be3af1a992149b4ff0f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d4b29fd7.failed
+
+Now that all the producers and consumers of dax interfaces have been
+converted to using dax_operations on a dax_device, remove the block
+device direct_access enabling.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit d4b29fd78ea6fc2be219be3af1a992149b4ff0f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/brd.c
+#	drivers/md/dm.c
+#	drivers/nvdimm/pmem.c
+#	drivers/s390/block/dcssblk.c
+#	fs/block_dev.c
+#	include/linux/blkdev.h
+diff --cc drivers/block/brd.c
+index 779aabf7a791,bfa4ed2c75ef..000000000000
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@@ -387,51 -392,25 +387,69 @@@ static long brd_direct_access(struct bl
+  	*kaddr = page_address(page);
+  	*pfn = page_to_pfn_t(page);
+  
+ -	return 1;
+ +	return PAGE_SIZE;
+  }
+++<<<<<<< HEAD
+ +#else
+ +#define brd_direct_access NULL
+++=======
++ 
++ static long brd_dax_direct_access(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct brd_device *brd = dax_get_private(dax_dev);
++ 
++ 	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
++ }
++ 
++ static const struct dax_operations brd_dax_ops = {
++ 	.direct_access = brd_dax_direct_access,
++ };
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  #endif
+  
+ +static int brd_ioctl(struct block_device *bdev, fmode_t mode,
+ +			unsigned int cmd, unsigned long arg)
+ +{
+ +	int error;
+ +	struct brd_device *brd = bdev->bd_disk->private_data;
+ +
+ +	if (cmd != BLKFLSBUF)
+ +		return -ENOTTY;
+ +
+ +	/*
+ +	 * ram device BLKFLSBUF has special semantics, we want to actually
+ +	 * release and destroy the ramdisk data.
+ +	 */
+ +	mutex_lock(&brd_mutex);
+ +	mutex_lock(&bdev->bd_mutex);
+ +	error = -EBUSY;
+ +	if (bdev->bd_openers <= 1) {
+ +		/*
+ +		 * Kill the cache first, so it isn't written back to the
+ +		 * device.
+ +		 *
+ +		 * Another thread might instantiate more buffercache here,
+ +		 * but there is not much we can do to close that race.
+ +		 */
+ +		kill_bdev(bdev);
+ +		brd_free_pages(brd);
+ +		error = 0;
+ +	}
+ +	mutex_unlock(&bdev->bd_mutex);
+ +	mutex_unlock(&brd_mutex);
+ +
+ +	return error;
+ +}
+ +
+  static const struct block_device_operations brd_fops = {
+  	.owner =		THIS_MODULE,
+  	.rw_page =		brd_rw_page,
+++<<<<<<< HEAD
+ +	.ioctl =		brd_ioctl,
+ +	.direct_access =	brd_direct_access,
+++=======
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  };
+  
+  /*
+diff --cc drivers/md/dm.c
+index 3a3e56a9c437,79d5f5fd823e..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -916,18 -924,79 +916,61 @@@ static long dm_blk_direct_access(struc
+  
+  	ti = dm_table_find_target(map, sector);
+  	if (!dm_target_is_valid(ti))
+ -		return NULL;
+ -
+ -	return ti;
+ -}
+ -
+ -static long dm_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+ -		long nr_pages, void **kaddr, pfn_t *pfn)
+ -{
+ -	struct mapped_device *md = dax_get_private(dax_dev);
+ -	sector_t sector = pgoff * PAGE_SECTORS;
+ -	struct dm_target *ti;
+ -	long len, ret = -EIO;
+ -	int srcu_idx;
+ +		goto out;
+  
+ -	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
+ +	len = max_io_len(sector, ti) << SECTOR_SHIFT;
+ +	size = min(len, size);
+  
+ -	if (!ti)
+ -		goto out;
+ -	if (!ti->type->direct_access)
+ -		goto out;
+ -	len = max_io_len(sector, ti) / PAGE_SECTORS;
+ -	if (len < 1)
+ -		goto out;
+ -	nr_pages = min(len, nr_pages);
+  	if (ti->type->direct_access)
+ -		ret = ti->type->direct_access(ti, pgoff, nr_pages, kaddr, pfn);
+ -
+ - out:
+ +		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
+ +out:
+  	dm_put_live_table(md, srcu_idx);
+ -
+ -	return ret;
+ +	return min(ret, size);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * A target may call dm_accept_partial_bio only from the map routine.  It is
++  * allowed for all bio types except REQ_PREFLUSH.
++  *
++  * dm_accept_partial_bio informs the dm that the target only wants to process
++  * additional n_sectors sectors of the bio and the rest of the data should be
++  * sent in a next bio.
++  *
++  * A diagram that explains the arithmetics:
++  * +--------------------+---------------+-------+
++  * |         1          |       2       |   3   |
++  * +--------------------+---------------+-------+
++  *
++  * <-------------- *tio->len_ptr --------------->
++  *                      <------- bi_size ------->
++  *                      <-- n_sectors -->
++  *
++  * Region 1 was already iterated over with bio_advance or similar function.
++  *	(it may be empty if the target doesn't use bio_advance)
++  * Region 2 is the remaining bio size that the target wants to process.
++  *	(it may be empty if region 1 is non-empty, although there is no reason
++  *	 to make it empty)
++  * The target requires that region 3 is to be sent in the next bio.
++  *
++  * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
++  * the partially processed part (the sum of regions 1+2) must be the same for all
++  * copies of the bio.
++  */
++ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
++ {
++ 	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
++ 	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
++ 	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
++ 	BUG_ON(bi_size > *tio->len_ptr);
++ 	BUG_ON(n_sectors > bi_size);
++ 	*tio->len_ptr -= bi_size - n_sectors;
++ 	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
++ }
++ EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
++ 
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  /*
+   * Flush current->bio_list when the target map method blocks.
+   * This fixes deadlocks in snapshot and possibly in other targets.
+diff --cc drivers/nvdimm/pmem.c
+index a63d1c76771a,85b85633d674..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -209,14 -216,13 +209,22 @@@ __weak long pmem_direct_access(struct b
+  	 * requested range.
+  	 */
+  	if (unlikely(pmem->bb.count))
+++<<<<<<< HEAD
+ +		return size;
+ +	return pmem->size - pmem->pfn_pad - offset;
+++=======
++ 		return nr_pages;
++ 	return PHYS_PFN(pmem->size - pmem->pfn_pad - offset);
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  }
+  
+  static const struct block_device_operations pmem_fops = {
+  	.owner =		THIS_MODULE,
+  	.rw_page =		pmem_rw_page,
+++<<<<<<< HEAD
+ +	.direct_access =	pmem_direct_access,
+++=======
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  	.revalidate_disk =	nvdimm_revalidate_disk,
+  };
+  
+diff --cc drivers/s390/block/dcssblk.c
+index 9b09806c7f1c,36e5280af3e4..000000000000
+--- a/drivers/s390/block/dcssblk.c
++++ b/drivers/s390/block/dcssblk.c
+@@@ -28,9 -29,10 +28,16 @@@
+  
+  static int dcssblk_open(struct block_device *bdev, fmode_t mode);
+  static void dcssblk_release(struct gendisk *disk, fmode_t mode);
+++<<<<<<< HEAD
+ +static void dcssblk_make_request(struct request_queue *q, struct bio *bio);
+ +static long dcssblk_direct_access(struct block_device *bdev, sector_t secnum,
+ +			void **kaddr, pfn_t *pfn, long size);
+++=======
++ static blk_qc_t dcssblk_make_request(struct request_queue *q,
++ 						struct bio *bio);
++ static long dcssblk_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn);
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  
+  static char dcssblk_segments[DCSSBLK_PARM_LEN] = "\0";
+  
+@@@ -39,7 -41,10 +46,14 @@@ static const struct block_device_operat
+  	.owner   	= THIS_MODULE,
+  	.open    	= dcssblk_open,
+  	.release 	= dcssblk_release,
+++<<<<<<< HEAD
+ +	.direct_access 	= dcssblk_direct_access,
+++=======
++ };
++ 
++ static const struct dax_operations dcssblk_dax_ops = {
++ 	.direct_access = dcssblk_dax_direct_access,
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  };
+  
+  struct dcssblk_dev_info {
+@@@ -868,21 -898,27 +882,44 @@@ fail
+  }
+  
+  static long
+++<<<<<<< HEAD
+ +dcssblk_direct_access (struct block_device *bdev, sector_t secnum,
+ +			void **kaddr, pfn_t *pfn, long size)
+ +{
+ +	struct dcssblk_dev_info *dev_info;
+ +	unsigned long offset, dev_sz;
+ +
+ +	dev_info = bdev->bd_disk->private_data;
+ +	if (!dev_info)
+ +		return -ENODEV;
+ +	dev_sz = dev_info->end - dev_info->start + 1;
+ +	offset = secnum * 512;
+ +	*kaddr = (void *) dev_info->start + offset;
+ +	*pfn = __pfn_to_pfn_t(PFN_DOWN(dev_info->start + offset), PFN_DEV);
+ +
+ +	return dev_sz - offset;
+++=======
++ __dcssblk_direct_access(struct dcssblk_dev_info *dev_info, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	resource_size_t offset = pgoff * PAGE_SIZE;
++ 	unsigned long dev_sz;
++ 
++ 	dev_sz = dev_info->end - dev_info->start + 1;
++ 	*kaddr = (void *) dev_info->start + offset;
++ 	*pfn = __pfn_to_pfn_t(PFN_DOWN(dev_info->start + offset), PFN_DEV);
++ 
++ 	return (dev_sz - offset) / PAGE_SIZE;
++ }
++ 
++ static long
++ dcssblk_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct dcssblk_dev_info *dev_info = dax_get_private(dax_dev);
++ 
++ 	return __dcssblk_direct_access(dev_info, pgoff, nr_pages, kaddr, pfn);
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  }
+  
+  static void
+diff --cc fs/block_dev.c
+index ffe27563b65c,10e21465d5a9..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -529,6 -718,19 +529,22 @@@ int bdev_write_page(struct block_devic
+  }
+  EXPORT_SYMBOL_GPL(bdev_write_page);
+  
+++<<<<<<< HEAD
+++=======
++ int bdev_dax_pgoff(struct block_device *bdev, sector_t sector, size_t size,
++ 		pgoff_t *pgoff)
++ {
++ 	phys_addr_t phys_off = (get_start_sect(bdev) + sector) * 512;
++ 
++ 	if (pgoff)
++ 		*pgoff = PHYS_PFN(phys_off);
++ 	if (phys_off % PAGE_SIZE || size % PAGE_SIZE)
++ 		return -EINVAL;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(bdev_dax_pgoff);
++ 
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  /**
+   * bdev_dax_supported() - Check if the device supports dax for filesystem
+   * @sb: The superblock of the device
+diff --cc include/linux/blkdev.h
+index 2d7fe01dd7d2,848f87eb1905..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1785,26 -1919,9 +1785,15 @@@ static inline bool blk_integrity_is_ini
+  struct block_device_operations {
+  	int (*open) (struct block_device *, fmode_t);
+  	void (*release) (struct gendisk *, fmode_t);
+ -	int (*rw_page)(struct block_device *, sector_t, struct page *, bool);
+  	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+  	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(int (*direct_access) (struct block_device *, sector_t,
+ +						void **, unsigned long *),
+ +			long (*direct_access)(struct block_device *, sector_t,
+ +						void **, pfn_t *, long))
+++=======
+++>>>>>>> d4b29fd78ea6 (block: remove block_device_operations ->direct_access())
+  	unsigned int (*check_events) (struct gendisk *disk,
+  				      unsigned int clearing);
+  	/* ->media_changed() is DEPRECATED, use ->check_events() instead */
+@@@ -1832,9 -1940,12 +1821,8 @@@ extern int __blkdev_driver_ioctl(struc
+  extern int bdev_read_page(struct block_device *, sector_t, struct page *);
+  extern int bdev_write_page(struct block_device *, sector_t, struct page *,
+  						struct writeback_control *);
+- extern long bdev_direct_access(struct block_device *, struct blk_dax_ctl *);
+  extern int bdev_dax_supported(struct super_block *, int);
+ -int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+  #else /* CONFIG_BLOCK */
+ -
+ -struct block_device;
+ -
+  /*
+   * stubs for when the block layer is configured out
+   */
+diff --git a/arch/powerpc/sysdev/axonram.c b/arch/powerpc/sysdev/axonram.c
+index a122e3932442..b4f8e8514229 100644
+--- a/arch/powerpc/sysdev/axonram.c
++++ b/arch/powerpc/sysdev/axonram.c
+@@ -137,6 +137,10 @@ axon_ram_make_request(struct request_queue *queue, struct bio *bio)
+ 	bio_endio(bio, 0);
+ }
+ 
++static const struct block_device_operations axon_ram_devops = {
++	.owner		= THIS_MODULE,
++};
++
+ static long
+ __axon_ram_direct_access(struct axon_ram_bank *bank, pgoff_t pgoff, long nr_pages,
+ 		       void **kaddr, pfn_t *pfn)
+@@ -148,25 +152,6 @@ __axon_ram_direct_access(struct axon_ram_bank *bank, pgoff_t pgoff, long nr_page
+ 	return (bank->size - offset) / PAGE_SIZE;
+ }
+ 
+-/**
+- * axon_ram_direct_access - direct_access() method for block device
+- * @device, @sector, @data: see block_device_operations method
+- */
+-static long
+-axon_ram_blk_direct_access(struct block_device *device, sector_t sector,
+-		       void **kaddr, pfn_t *pfn, long size)
+-{
+-	struct axon_ram_bank *bank = device->bd_disk->private_data;
+-
+-	return __axon_ram_direct_access(bank, (sector * 512) / PAGE_SIZE,
+-			size / PAGE_SIZE, kaddr, pfn) * PAGE_SIZE;
+-}
+-
+-static const struct block_device_operations axon_ram_devops = {
+-	.owner		= THIS_MODULE,
+-	.direct_access	= axon_ram_blk_direct_access
+-};
+-
+ static long
+ axon_ram_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+ 		       void **kaddr, pfn_t *pfn)
+* Unmerged path drivers/block/brd.c
+* Unmerged path drivers/md/dm.c
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path drivers/s390/block/dcssblk.c
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/blkdev.h
