@@ -1,0 +1,406 @@
+qed: Introduce iWARP personality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kalderon, Michal <Michal.Kalderon@cavium.com>
+commit c851a9dc4359c6b19722de568e9f543c1c23481c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c851a9dc.failed
+
+iWARP personality introduced the need for differentiating in several
+places in the code whether we are RoCE, iWARP or either. This
+leads to introducing new macros for querying the personality.
+
+	Signed-off-by: Michal Kalderon <Michal.Kalderon@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: Ariel Elior <Ariel.Elior@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c851a9dc4359c6b19722de568e9f543c1c23481c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_dev.c
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+#	drivers/net/ethernet/qlogic/qed/qed_main.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 1b5a3d62b9f3,68e61823bfc0..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@@ -2047,11 -2050,14 +2047,11 @@@ static void get_function_id(struct qed_
+  static void qed_hw_set_feat(struct qed_hwfn *p_hwfn)
+  {
+  	u32 *feat_num = p_hwfn->hw_info.feat_num;
+ -	struct qed_sb_cnt_info sb_cnt;
+ +	struct qed_sb_cnt_info sb_cnt_info;
+  	u32 non_l2_sbs = 0;
+  
+ -	memset(&sb_cnt, 0, sizeof(sb_cnt));
+ -	qed_int_get_num_sbs(p_hwfn, &sb_cnt);
+ -
+  	if (IS_ENABLED(CONFIG_QED_RDMA) &&
+- 	    p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE) {
++ 	    QED_IS_RDMA_PERSONALITY(p_hwfn)) {
+  		/* Roce CNQ each requires: 1 status block + 1 CNQ. We divide
+  		 * the status blocks equally between L2 / RoCE but with
+  		 * consideration as to how many l2 queues / cnqs we have.
+@@@ -2062,27 -2068,31 +2062,37 @@@
+  
+  		non_l2_sbs = feat_num[QED_RDMA_CNQ];
+  	}
+- 
+- 	if (p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE ||
+- 	    p_hwfn->hw_info.personality == QED_PCI_ETH) {
++ 	if (QED_IS_L2_PERSONALITY(p_hwfn)) {
+  		/* Start by allocating VF queues, then PF's */
+ +		memset(&sb_cnt_info, 0, sizeof(sb_cnt_info));
+ +		qed_int_get_num_sbs(p_hwfn, &sb_cnt_info);
+  		feat_num[QED_VF_L2_QUE] = min_t(u32,
+  						RESC_NUM(p_hwfn, QED_L2_QUEUE),
+ -						sb_cnt.iov_cnt);
+ +						sb_cnt_info.sb_iov_cnt);
+  		feat_num[QED_PF_L2_QUE] = min_t(u32,
+ -						sb_cnt.cnt - non_l2_sbs,
+ +						RESC_NUM(p_hwfn, QED_SB) -
+ +						non_l2_sbs,
+  						RESC_NUM(p_hwfn,
+  							 QED_L2_QUEUE) -
+  						FEAT_NUM(p_hwfn,
+  							 QED_VF_L2_QUE));
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (QED_IS_FCOE_PERSONALITY(p_hwfn))
++ 		feat_num[QED_FCOE_CQ] =  min_t(u32, sb_cnt.cnt,
++ 					       RESC_NUM(p_hwfn,
++ 							QED_CMDQS_CQS));
++ 
++ 	if (QED_IS_ISCSI_PERSONALITY(p_hwfn))
++ 		feat_num[QED_ISCSI_CQ] = min_t(u32, sb_cnt.cnt,
++ 					       RESC_NUM(p_hwfn,
++ 							QED_CMDQS_CQS));
+++>>>>>>> c851a9dc4359 (qed: Introduce iWARP personality)
+  	DP_VERBOSE(p_hwfn,
+  		   NETIF_MSG_PROBE,
+ -		   "#PF_L2_QUEUES=%d VF_L2_QUEUES=%d #ROCE_CNQ=%d FCOE_CQ=%d ISCSI_CQ=%d #SBS=%d\n",
+ +		   "#PF_L2_QUEUES=%d VF_L2_QUEUES=%d #ROCE_CNQ=%d #SBS=%d\n",
+  		   (int)FEAT_NUM(p_hwfn, QED_PF_L2_QUE),
+  		   (int)FEAT_NUM(p_hwfn, QED_VF_L2_QUE),
+  		   (int)FEAT_NUM(p_hwfn, QED_RDMA_CNQ),
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922,27ea54ba7e1b..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -65,6 -65,135 +65,138 @@@
+  #define QED_MAX_SGES_NUM 16
+  #define CRC32_POLY 0x1edc6f41
+  
+++<<<<<<< HEAD
+++=======
++ struct qed_l2_info {
++ 	u32 queues;
++ 	unsigned long **pp_qid_usage;
++ 
++ 	/* The lock is meant to synchronize access to the qid usage */
++ 	struct mutex lock;
++ };
++ 
++ int qed_l2_alloc(struct qed_hwfn *p_hwfn)
++ {
++ 	struct qed_l2_info *p_l2_info;
++ 	unsigned long **pp_qids;
++ 	u32 i;
++ 
++ 	if (!QED_IS_L2_PERSONALITY(p_hwfn))
++ 		return 0;
++ 
++ 	p_l2_info = kzalloc(sizeof(*p_l2_info), GFP_KERNEL);
++ 	if (!p_l2_info)
++ 		return -ENOMEM;
++ 	p_hwfn->p_l2_info = p_l2_info;
++ 
++ 	if (IS_PF(p_hwfn->cdev)) {
++ 		p_l2_info->queues = RESC_NUM(p_hwfn, QED_L2_QUEUE);
++ 	} else {
++ 		u8 rx = 0, tx = 0;
++ 
++ 		qed_vf_get_num_rxqs(p_hwfn, &rx);
++ 		qed_vf_get_num_txqs(p_hwfn, &tx);
++ 
++ 		p_l2_info->queues = max_t(u8, rx, tx);
++ 	}
++ 
++ 	pp_qids = kzalloc(sizeof(unsigned long *) * p_l2_info->queues,
++ 			  GFP_KERNEL);
++ 	if (!pp_qids)
++ 		return -ENOMEM;
++ 	p_l2_info->pp_qid_usage = pp_qids;
++ 
++ 	for (i = 0; i < p_l2_info->queues; i++) {
++ 		pp_qids[i] = kzalloc(MAX_QUEUES_PER_QZONE / 8, GFP_KERNEL);
++ 		if (!pp_qids[i])
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void qed_l2_setup(struct qed_hwfn *p_hwfn)
++ {
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	mutex_init(&p_hwfn->p_l2_info->lock);
++ }
++ 
++ void qed_l2_free(struct qed_hwfn *p_hwfn)
++ {
++ 	u32 i;
++ 
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info->pp_qid_usage)
++ 		goto out_l2_info;
++ 
++ 	/* Free until hit first uninitialized entry */
++ 	for (i = 0; i < p_hwfn->p_l2_info->queues; i++) {
++ 		if (!p_hwfn->p_l2_info->pp_qid_usage[i])
++ 			break;
++ 		kfree(p_hwfn->p_l2_info->pp_qid_usage[i]);
++ 	}
++ 
++ 	kfree(p_hwfn->p_l2_info->pp_qid_usage);
++ 
++ out_l2_info:
++ 	kfree(p_hwfn->p_l2_info);
++ 	p_hwfn->p_l2_info = NULL;
++ }
++ 
++ static bool qed_eth_queue_qid_usage_add(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_l2_info *p_l2_info = p_hwfn->p_l2_info;
++ 	u16 queue_id = p_cid->rel.queue_id;
++ 	bool b_rc = true;
++ 	u8 first;
++ 
++ 	mutex_lock(&p_l2_info->lock);
++ 
++ 	if (queue_id >= p_l2_info->queues) {
++ 		DP_NOTICE(p_hwfn,
++ 			  "Requested to increase usage for qzone %04x out of %08x\n",
++ 			  queue_id, p_l2_info->queues);
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	first = (u8)find_first_zero_bit(p_l2_info->pp_qid_usage[queue_id],
++ 					MAX_QUEUES_PER_QZONE);
++ 	if (first >= MAX_QUEUES_PER_QZONE) {
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	__set_bit(first, p_l2_info->pp_qid_usage[queue_id]);
++ 	p_cid->qid_usage_idx = first;
++ 
++ out:
++ 	mutex_unlock(&p_l2_info->lock);
++ 	return b_rc;
++ }
++ 
++ static void qed_eth_queue_qid_usage_del(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	mutex_lock(&p_hwfn->p_l2_info->lock);
++ 
++ 	clear_bit(p_cid->qid_usage_idx,
++ 		  p_hwfn->p_l2_info->pp_qid_usage[p_cid->rel.queue_id]);
++ 
++ 	mutex_unlock(&p_hwfn->p_l2_info->lock);
++ }
++ 
+++>>>>>>> c851a9dc4359 (qed: Introduce iWARP personality)
+  void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+  			       struct qed_queue_cid *p_cid)
+  {
+diff --cc drivers/net/ethernet/qlogic/qed/qed_main.c
+index 545e79f7504c,b11399606990..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@@ -228,6 -237,9 +228,12 @@@ err0
+  int qed_fill_dev_info(struct qed_dev *cdev,
+  		      struct qed_dev_info *dev_info)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
++ 	struct qed_hw_info *hw_info = &p_hwfn->hw_info;
++ 	struct qed_tunnel_info *tun = &cdev->tunnel;
+++>>>>>>> c851a9dc4359 (qed: Introduce iWARP personality)
+  	struct qed_ptt  *ptt;
+  
+  	memset(dev_info, 0, sizeof(struct qed_dev_info));
+@@@ -250,9 -275,10 +255,8 @@@
+  		dev_info->mf_mode = cdev->mf_mode;
+  		dev_info->tx_switching = true;
+  
+- 		if (QED_LEADING_HWFN(cdev)->hw_info.b_wol_support ==
+- 		    QED_WOL_SUPPORT_PME)
++ 		if (hw_info->b_wol_support == QED_WOL_SUPPORT_PME)
+  			dev_info->wol_support = true;
+ -
+ -		dev_info->abs_pf_id = QED_LEADING_HWFN(cdev)->abs_pf_id;
+  	} else {
+  		qed_vf_get_fw_version(&cdev->hwfns[0], &dev_info->fw_major,
+  				      &dev_info->fw_minor, &dev_info->fw_rev,
+@@@ -885,11 -925,13 +889,10 @@@ static void qed_update_pf_params(struc
+  		params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
+  	}
+  
+ -	if (cdev->num_hwfns > 1 || IS_VF(cdev))
+ -		params->eth_pf_params.num_arfs_filters = 0;
+ -
+  	/* In case we might support RDMA, don't allow qede to be greedy
+ -	 * with the L2 contexts. Allow for 64 queues [rx, tx, xdp] per hwfn.
+ +	 * with the L2 contexts. Allow for 64 queues [rx, tx] per hwfn.
+  	 */
+- 	if (QED_LEADING_HWFN(cdev)->hw_info.personality ==
+- 	    QED_PCI_ETH_ROCE) {
++ 	if (QED_IS_RDMA_PERSONALITY(QED_LEADING_HWFN(cdev))) {
+  		u16 *num_cons;
+  
+  		num_cons = &params->eth_pf_params.num_cons;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed.h b/drivers/net/ethernet/qlogic/qed/qed.h
+index 848905e401aa..c6838ae512fa 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -189,14 +189,16 @@ struct qed_tunn_update_params {
+ 
+ /* The PCI personality is not quite synonymous to protocol ID:
+  * 1. All personalities need CORE connections
+- * 2. The Ethernet personality may support also the RoCE protocol
++ * 2. The Ethernet personality may support also the RoCE/iWARP protocol
+  */
+ enum qed_pci_personality {
+ 	QED_PCI_ETH,
+ 	QED_PCI_FCOE,
+ 	QED_PCI_ISCSI,
+ 	QED_PCI_ETH_ROCE,
+-	QED_PCI_DEFAULT /* default in shmem */
++	QED_PCI_ETH_IWARP,
++	QED_PCI_ETH_RDMA,
++	QED_PCI_DEFAULT, /* default in shmem */
+ };
+ 
+ /* All VFs are symmetric, all counters are PF + all VFs */
+@@ -254,6 +256,7 @@ enum qed_dev_cap {
+ 	QED_DEV_CAP_FCOE,
+ 	QED_DEV_CAP_ISCSI,
+ 	QED_DEV_CAP_ROCE,
++	QED_DEV_CAP_IWARP,
+ };
+ 
+ enum qed_wol_support {
+@@ -263,7 +266,24 @@ enum qed_wol_support {
+ 
+ struct qed_hw_info {
+ 	/* PCI personality */
+-	enum qed_pci_personality	personality;
++	enum qed_pci_personality personality;
++#define QED_IS_RDMA_PERSONALITY(dev)			    \
++	((dev)->hw_info.personality == QED_PCI_ETH_ROCE ||  \
++	 (dev)->hw_info.personality == QED_PCI_ETH_IWARP || \
++	 (dev)->hw_info.personality == QED_PCI_ETH_RDMA)
++#define QED_IS_ROCE_PERSONALITY(dev)			   \
++	((dev)->hw_info.personality == QED_PCI_ETH_ROCE || \
++	 (dev)->hw_info.personality == QED_PCI_ETH_RDMA)
++#define QED_IS_IWARP_PERSONALITY(dev)			    \
++	((dev)->hw_info.personality == QED_PCI_ETH_IWARP || \
++	 (dev)->hw_info.personality == QED_PCI_ETH_RDMA)
++#define QED_IS_L2_PERSONALITY(dev)		      \
++	((dev)->hw_info.personality == QED_PCI_ETH || \
++	 QED_IS_RDMA_PERSONALITY(dev))
++#define QED_IS_FCOE_PERSONALITY(dev) \
++	((dev)->hw_info.personality == QED_PCI_FCOE)
++#define QED_IS_ISCSI_PERSONALITY(dev) \
++	((dev)->hw_info.personality == QED_PCI_ISCSI)
+ 
+ 	/* Resource Allocation scheme results */
+ 	u32				resc_start[QED_MAX_RESC];
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_cxt.c b/drivers/net/ethernet/qlogic/qed/qed_cxt.c
+index 642f498d1845..3bb2c502a1a5 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_cxt.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_cxt.c
+@@ -847,7 +847,7 @@ u32 qed_cxt_cfg_ilt_compute_excess(struct qed_hwfn *p_hwfn, u32 used_lines)
+ 	if (!excess_lines)
+ 		return 0;
+ 
+-	if (p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++	if (!QED_IS_RDMA_PERSONALITY(p_hwfn))
+ 		return 0;
+ 
+ 	p_mngr = p_hwfn->p_cxt_mngr;
+@@ -1027,7 +1027,7 @@ static int qed_ilt_blk_alloc(struct qed_hwfn *p_hwfn,
+ 	u32 lines, line, sz_left, lines_to_skip = 0;
+ 
+ 	/* Special handling for RoCE that supports dynamic allocation */
+-	if ((p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE) &&
++	if (QED_IS_RDMA_PERSONALITY(p_hwfn) &&
+ 	    ((ilt_client == ILT_CLI_CDUT) || ilt_client == ILT_CLI_TSDM))
+ 		return 0;
+ 
+@@ -1827,7 +1827,7 @@ static void qed_tm_init_pf(struct qed_hwfn *p_hwfn)
+ 		tm_offset += tm_iids.pf_tids[i];
+ 	}
+ 
+-	if (p_hwfn->hw_info.personality == QED_PCI_ETH_ROCE)
++	if (QED_IS_RDMA_PERSONALITY(p_hwfn))
+ 		active_seg_mask = 0;
+ 
+ 	STORE_RT_REG(p_hwfn, TM_REG_PF_ENABLE_TASK_RT_OFFSET, active_seg_mask);
+@@ -2333,7 +2333,7 @@ qed_cxt_dynamic_ilt_alloc(struct qed_hwfn *p_hwfn,
+ 		       last_cid_allocated - 1);
+ 
+ 		if (!p_hwfn->b_rdma_enabled_in_prs) {
+-			/* Enable RoCE search */
++			/* Enable RDMA search */
+ 			qed_wr(p_hwfn, p_ptt, p_hwfn->rdma_prs_search_reg, 1);
+ 			p_hwfn->b_rdma_enabled_in_prs = true;
+ 		}
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dev.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_ll2.c b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+index 6b0af0a3aa1a..4e351b446538 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_ll2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+@@ -1499,7 +1499,7 @@ int qed_ll2_establish_connection(struct qed_hwfn *p_hwfn, u8 connection_handle)
+ 	if (rc)
+ 		goto out;
+ 
+-	if (p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++	if (!QED_IS_RDMA_PERSONALITY(p_hwfn))
+ 		qed_wr(p_hwfn, p_ptt, PRS_REG_USE_LIGHT_L2, 1);
+ 
+ 	qed_ll2_establish_connection_ooo(p_hwfn, p_ll2_conn);
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_main.c
+diff --git a/include/linux/qed/common_hsi.h b/include/linux/qed/common_hsi.h
+index fbab6e0514f0..b89aef9c2f83 100644
+--- a/include/linux/qed/common_hsi.h
++++ b/include/linux/qed/common_hsi.h
+@@ -764,7 +764,7 @@ enum protocol_type {
+ 	PROTOCOLID_ROCE,
+ 	PROTOCOLID_CORE,
+ 	PROTOCOLID_ETH,
+-	PROTOCOLID_RESERVED4,
++	PROTOCOLID_IWARP,
+ 	PROTOCOLID_RESERVED5,
+ 	PROTOCOLID_PREROCE,
+ 	PROTOCOLID_COMMON,
