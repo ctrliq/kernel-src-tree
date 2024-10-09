@@ -1,0 +1,687 @@
+liquidio: add support for ndo_get_stats64 instead of ndo_get_stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Pradeep Nalla <pradeep.nalla@cavium.com>
+commit 80002347d6f51c45e49eb545ec7ae7077d46faf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/80002347.failed
+
+Support ndo_get_stats64 instead of ndo_get_stats.  Also add stats for
+multicast and broadcast packets.
+
+	Signed-off-by: Pradeep Nalla <pradeep.nalla@cavium.com>
+	Acked-by: Raghu Vatsavayi <raghu.vatsavayi@cavium.com>
+	Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 80002347d6f51c45e49eb545ec7ae7077d46faf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/liquidio/lio_core.c
+diff --cc drivers/net/ethernet/cavium/liquidio/lio_core.c
+index 5c6599c797a0,844e288d60fe..000000000000
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@@ -1070,3 -1061,267 +1070,270 @@@ int octeon_setup_interrupt(struct octeo
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void liquidio_change_mtu_completion(struct octeon_device *oct,
++ 					   u32 status, void *buf)
++ {
++ 	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
++ 	struct liquidio_if_cfg_context *ctx;
++ 
++ 	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++ 
++ 	if (status) {
++ 		dev_err(&oct->pci_dev->dev, "MTU change failed. Status: %llx\n",
++ 			CVM_CAST64(status));
++ 		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_FAIL);
++ 	} else {
++ 		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_SUCCESS);
++ 	}
++ 
++ 	/* This barrier is required to be sure that the response has been
++ 	 * written fully before waking up the handler
++ 	 */
++ 	wmb();
++ 
++ 	wake_up_interruptible(&ctx->wc);
++ }
++ 
++ /**
++  * \brief Net device change_mtu
++  * @param netdev network device
++  */
++ int liquidio_change_mtu(struct net_device *netdev, int new_mtu)
++ {
++ 	struct lio *lio = GET_LIO(netdev);
++ 	struct octeon_device *oct = lio->oct_dev;
++ 	struct liquidio_if_cfg_context *ctx;
++ 	struct octeon_soft_command *sc;
++ 	union octnet_cmd *ncmd;
++ 	int ctx_size;
++ 	int ret = 0;
++ 
++ 	ctx_size = sizeof(struct liquidio_if_cfg_context);
++ 	sc = (struct octeon_soft_command *)
++ 		octeon_alloc_soft_command(oct, OCTNET_CMD_SIZE, 16, ctx_size);
++ 
++ 	ncmd = (union octnet_cmd *)sc->virtdptr;
++ 	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++ 
++ 	WRITE_ONCE(ctx->cond, 0);
++ 	ctx->octeon_id = lio_get_device_id(oct);
++ 	init_waitqueue_head(&ctx->wc);
++ 
++ 	ncmd->u64 = 0;
++ 	ncmd->s.cmd = OCTNET_CMD_CHANGE_MTU;
++ 	ncmd->s.param1 = new_mtu;
++ 
++ 	octeon_swap_8B_data((u64 *)ncmd, (OCTNET_CMD_SIZE >> 3));
++ 
++ 	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++ 
++ 	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
++ 				    OPCODE_NIC_CMD, 0, 0, 0);
++ 
++ 	sc->callback = liquidio_change_mtu_completion;
++ 	sc->callback_arg = sc;
++ 	sc->wait_time = 100;
++ 
++ 	ret = octeon_send_soft_command(oct, sc);
++ 	if (ret == IQ_SEND_FAILED) {
++ 		netif_info(lio, rx_err, lio->netdev, "Failed to change MTU\n");
++ 		return -EINVAL;
++ 	}
++ 	/* Sleep on a wait queue till the cond flag indicates that the
++ 	 * response arrived or timed-out.
++ 	 */
++ 	if (sleep_cond(&ctx->wc, &ctx->cond) == -EINTR ||
++ 	    ctx->cond == LIO_CHANGE_MTU_FAIL) {
++ 		octeon_free_soft_command(oct, sc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	netdev->mtu = new_mtu;
++ 	lio->mtu = new_mtu;
++ 
++ 	octeon_free_soft_command(oct, sc);
++ 	return 0;
++ }
++ 
++ int lio_wait_for_clean_oq(struct octeon_device *oct)
++ {
++ 	int retry = 100, pending_pkts = 0;
++ 	int idx;
++ 
++ 	do {
++ 		pending_pkts = 0;
++ 
++ 		for (idx = 0; idx < MAX_OCTEON_OUTPUT_QUEUES(oct); idx++) {
++ 			if (!(oct->io_qmask.oq & BIT_ULL(idx)))
++ 				continue;
++ 			pending_pkts +=
++ 				atomic_read(&oct->droq[idx]->pkts_pending);
++ 		}
++ 
++ 		if (pending_pkts > 0)
++ 			schedule_timeout_uninterruptible(1);
++ 
++ 	} while (retry-- && pending_pkts);
++ 
++ 	return pending_pkts;
++ }
++ 
++ static void
++ octnet_nic_stats_callback(struct octeon_device *oct_dev,
++ 			  u32 status, void *ptr)
++ {
++ 	struct octeon_soft_command *sc = (struct octeon_soft_command *)ptr;
++ 	struct oct_nic_stats_resp *resp =
++ 	    (struct oct_nic_stats_resp *)sc->virtrptr;
++ 	struct oct_nic_stats_ctrl *ctrl =
++ 	    (struct oct_nic_stats_ctrl *)sc->ctxptr;
++ 	struct nic_rx_stats *rsp_rstats = &resp->stats.fromwire;
++ 	struct nic_tx_stats *rsp_tstats = &resp->stats.fromhost;
++ 	struct nic_rx_stats *rstats = &oct_dev->link_stats.fromwire;
++ 	struct nic_tx_stats *tstats = &oct_dev->link_stats.fromhost;
++ 
++ 	if (status != OCTEON_REQUEST_TIMEOUT && !resp->status) {
++ 		octeon_swap_8B_data((u64 *)&resp->stats,
++ 				    (sizeof(struct oct_link_stats)) >> 3);
++ 
++ 		/* RX link-level stats */
++ 		rstats->total_rcvd = rsp_rstats->total_rcvd;
++ 		rstats->bytes_rcvd = rsp_rstats->bytes_rcvd;
++ 		rstats->total_bcst = rsp_rstats->total_bcst;
++ 		rstats->total_mcst = rsp_rstats->total_mcst;
++ 		rstats->runts      = rsp_rstats->runts;
++ 		rstats->ctl_rcvd   = rsp_rstats->ctl_rcvd;
++ 		/* Accounts for over/under-run of buffers */
++ 		rstats->fifo_err  = rsp_rstats->fifo_err;
++ 		rstats->dmac_drop = rsp_rstats->dmac_drop;
++ 		rstats->fcs_err   = rsp_rstats->fcs_err;
++ 		rstats->jabber_err = rsp_rstats->jabber_err;
++ 		rstats->l2_err    = rsp_rstats->l2_err;
++ 		rstats->frame_err = rsp_rstats->frame_err;
++ 		rstats->red_drops = rsp_rstats->red_drops;
++ 
++ 		/* RX firmware stats */
++ 		rstats->fw_total_rcvd = rsp_rstats->fw_total_rcvd;
++ 		rstats->fw_total_fwd = rsp_rstats->fw_total_fwd;
++ 		rstats->fw_total_mcast = rsp_rstats->fw_total_mcast;
++ 		rstats->fw_total_bcast = rsp_rstats->fw_total_bcast;
++ 		rstats->fw_err_pko = rsp_rstats->fw_err_pko;
++ 		rstats->fw_err_link = rsp_rstats->fw_err_link;
++ 		rstats->fw_err_drop = rsp_rstats->fw_err_drop;
++ 		rstats->fw_rx_vxlan = rsp_rstats->fw_rx_vxlan;
++ 		rstats->fw_rx_vxlan_err = rsp_rstats->fw_rx_vxlan_err;
++ 
++ 		/* Number of packets that are LROed      */
++ 		rstats->fw_lro_pkts = rsp_rstats->fw_lro_pkts;
++ 		/* Number of octets that are LROed       */
++ 		rstats->fw_lro_octs = rsp_rstats->fw_lro_octs;
++ 		/* Number of LRO packets formed          */
++ 		rstats->fw_total_lro = rsp_rstats->fw_total_lro;
++ 		/* Number of times lRO of packet aborted */
++ 		rstats->fw_lro_aborts = rsp_rstats->fw_lro_aborts;
++ 		rstats->fw_lro_aborts_port = rsp_rstats->fw_lro_aborts_port;
++ 		rstats->fw_lro_aborts_seq = rsp_rstats->fw_lro_aborts_seq;
++ 		rstats->fw_lro_aborts_tsval = rsp_rstats->fw_lro_aborts_tsval;
++ 		rstats->fw_lro_aborts_timer = rsp_rstats->fw_lro_aborts_timer;
++ 		/* intrmod: packet forward rate */
++ 		rstats->fwd_rate = rsp_rstats->fwd_rate;
++ 
++ 		/* TX link-level stats */
++ 		tstats->total_pkts_sent = rsp_tstats->total_pkts_sent;
++ 		tstats->total_bytes_sent = rsp_tstats->total_bytes_sent;
++ 		tstats->mcast_pkts_sent = rsp_tstats->mcast_pkts_sent;
++ 		tstats->bcast_pkts_sent = rsp_tstats->bcast_pkts_sent;
++ 		tstats->ctl_sent = rsp_tstats->ctl_sent;
++ 		/* Packets sent after one collision*/
++ 		tstats->one_collision_sent = rsp_tstats->one_collision_sent;
++ 		/* Packets sent after multiple collision*/
++ 		tstats->multi_collision_sent = rsp_tstats->multi_collision_sent;
++ 		/* Packets not sent due to max collisions */
++ 		tstats->max_collision_fail = rsp_tstats->max_collision_fail;
++ 		/* Packets not sent due to max deferrals */
++ 		tstats->max_deferral_fail = rsp_tstats->max_deferral_fail;
++ 		/* Accounts for over/under-run of buffers */
++ 		tstats->fifo_err = rsp_tstats->fifo_err;
++ 		tstats->runts = rsp_tstats->runts;
++ 		/* Total number of collisions detected */
++ 		tstats->total_collisions = rsp_tstats->total_collisions;
++ 
++ 		/* firmware stats */
++ 		tstats->fw_total_sent = rsp_tstats->fw_total_sent;
++ 		tstats->fw_total_fwd = rsp_tstats->fw_total_fwd;
++ 		tstats->fw_total_mcast_sent = rsp_tstats->fw_total_mcast_sent;
++ 		tstats->fw_total_bcast_sent = rsp_tstats->fw_total_bcast_sent;
++ 		tstats->fw_err_pko = rsp_tstats->fw_err_pko;
++ 		tstats->fw_err_pki = rsp_tstats->fw_err_pki;
++ 		tstats->fw_err_link = rsp_tstats->fw_err_link;
++ 		tstats->fw_err_drop = rsp_tstats->fw_err_drop;
++ 		tstats->fw_tso = rsp_tstats->fw_tso;
++ 		tstats->fw_tso_fwd = rsp_tstats->fw_tso_fwd;
++ 		tstats->fw_err_tso = rsp_tstats->fw_err_tso;
++ 		tstats->fw_tx_vxlan = rsp_tstats->fw_tx_vxlan;
++ 
++ 		resp->status = 1;
++ 	} else {
++ 		resp->status = -1;
++ 	}
++ 	complete(&ctrl->complete);
++ }
++ 
++ int octnet_get_link_stats(struct net_device *netdev)
++ {
++ 	struct lio *lio = GET_LIO(netdev);
++ 	struct octeon_device *oct_dev = lio->oct_dev;
++ 	struct octeon_soft_command *sc;
++ 	struct oct_nic_stats_ctrl *ctrl;
++ 	struct oct_nic_stats_resp *resp;
++ 	int retval;
++ 
++ 	/* Alloc soft command */
++ 	sc = (struct octeon_soft_command *)
++ 		octeon_alloc_soft_command(oct_dev,
++ 					  0,
++ 					  sizeof(struct oct_nic_stats_resp),
++ 					  sizeof(struct octnic_ctrl_pkt));
++ 
++ 	if (!sc)
++ 		return -ENOMEM;
++ 
++ 	resp = (struct oct_nic_stats_resp *)sc->virtrptr;
++ 	memset(resp, 0, sizeof(struct oct_nic_stats_resp));
++ 
++ 	ctrl = (struct oct_nic_stats_ctrl *)sc->ctxptr;
++ 	memset(ctrl, 0, sizeof(struct oct_nic_stats_ctrl));
++ 	ctrl->netdev = netdev;
++ 	init_completion(&ctrl->complete);
++ 
++ 	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++ 
++ 	octeon_prepare_soft_command(oct_dev, sc, OPCODE_NIC,
++ 				    OPCODE_NIC_PORT_STATS, 0, 0, 0);
++ 
++ 	sc->callback = octnet_nic_stats_callback;
++ 	sc->callback_arg = sc;
++ 	sc->wait_time = 500;	/*in milli seconds*/
++ 
++ 	retval = octeon_send_soft_command(oct_dev, sc);
++ 	if (retval == IQ_SEND_FAILED) {
++ 		octeon_free_soft_command(oct_dev, sc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	wait_for_completion_timeout(&ctrl->complete, msecs_to_jiffies(1000));
++ 
++ 	if (resp->status != 1) {
++ 		octeon_free_soft_command(oct_dev, sc);
++ 
++ 		return -EINVAL;
++ 	}
++ 
++ 	octeon_free_soft_command(oct_dev, sc);
++ 
++ 	return 0;
++ }
+++>>>>>>> 80002347d6f5 (liquidio: add support for ndo_get_stats64 instead of ndo_get_stats)
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_core.c
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+index 9926a12dd805..d0259e05cbc6 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+@@ -113,6 +113,9 @@ static const char oct_stats_strings[][ETH_GSTRING_LEN] = {
+ 	"tx_tso_err",
+ 	"tx_vxlan",
+ 
++	"tx_mcast",
++	"tx_bcast",
++
+ 	"mac_tx_total_pkts",
+ 	"mac_tx_total_bytes",
+ 	"mac_tx_mcast_pkts",
+@@ -128,6 +131,8 @@ static const char oct_stats_strings[][ETH_GSTRING_LEN] = {
+ 
+ 	"rx_total_rcvd",
+ 	"rx_total_fwd",
++	"rx_mcast",
++	"rx_bcast",
+ 	"rx_jabber_err",
+ 	"rx_l2_err",
+ 	"rx_frame_err",
+@@ -172,6 +177,10 @@ static const char oct_vf_stats_strings[][ETH_GSTRING_LEN] = {
+ 	"tx_errors",
+ 	"rx_dropped",
+ 	"tx_dropped",
++	"rx_mcast",
++	"tx_mcast",
++	"rx_bcast",
++	"tx_bcast",
+ 	"link_state_changes",
+ };
+ 
+@@ -1057,50 +1066,48 @@ lio_get_ethtool_stats(struct net_device *netdev,
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+ 	struct octeon_device *oct_dev = lio->oct_dev;
+-	struct net_device_stats *netstats = &netdev->stats;
++	struct rtnl_link_stats64 lstats;
+ 	int i = 0, j;
+ 
+ 	if (ifstate_check(lio, LIO_IFSTATE_RESETTING))
+ 		return;
+ 
+-	netdev->netdev_ops->ndo_get_stats(netdev);
+-	octnet_get_link_stats(netdev);
+-
++	netdev->netdev_ops->ndo_get_stats64(netdev, &lstats);
+ 	/*sum of oct->droq[oq_no]->stats->rx_pkts_received */
+-	data[i++] = CVM_CAST64(netstats->rx_packets);
++	data[i++] = lstats.rx_packets;
+ 	/*sum of oct->instr_queue[iq_no]->stats.tx_done */
+-	data[i++] = CVM_CAST64(netstats->tx_packets);
++	data[i++] = lstats.tx_packets;
+ 	/*sum of oct->droq[oq_no]->stats->rx_bytes_received */
+-	data[i++] = CVM_CAST64(netstats->rx_bytes);
++	data[i++] = lstats.rx_bytes;
+ 	/*sum of oct->instr_queue[iq_no]->stats.tx_tot_bytes */
+-	data[i++] = CVM_CAST64(netstats->tx_bytes);
+-	data[i++] = CVM_CAST64(netstats->rx_errors +
+-			       oct_dev->link_stats.fromwire.fcs_err +
+-			       oct_dev->link_stats.fromwire.jabber_err +
+-			       oct_dev->link_stats.fromwire.l2_err +
+-			       oct_dev->link_stats.fromwire.frame_err);
+-	data[i++] = CVM_CAST64(netstats->tx_errors);
++	data[i++] = lstats.tx_bytes;
++	data[i++] = lstats.rx_errors +
++			oct_dev->link_stats.fromwire.fcs_err +
++			oct_dev->link_stats.fromwire.jabber_err +
++			oct_dev->link_stats.fromwire.l2_err +
++			oct_dev->link_stats.fromwire.frame_err;
++	data[i++] = lstats.tx_errors;
+ 	/*sum of oct->droq[oq_no]->stats->rx_dropped +
+ 	 *oct->droq[oq_no]->stats->dropped_nodispatch +
+ 	 *oct->droq[oq_no]->stats->dropped_toomany +
+ 	 *oct->droq[oq_no]->stats->dropped_nomem
+ 	 */
+-	data[i++] = CVM_CAST64(netstats->rx_dropped +
+-			       oct_dev->link_stats.fromwire.fifo_err +
+-			       oct_dev->link_stats.fromwire.dmac_drop +
+-			       oct_dev->link_stats.fromwire.red_drops +
+-			       oct_dev->link_stats.fromwire.fw_err_pko +
+-			       oct_dev->link_stats.fromwire.fw_err_link +
+-			       oct_dev->link_stats.fromwire.fw_err_drop);
++	data[i++] = lstats.rx_dropped +
++			oct_dev->link_stats.fromwire.fifo_err +
++			oct_dev->link_stats.fromwire.dmac_drop +
++			oct_dev->link_stats.fromwire.red_drops +
++			oct_dev->link_stats.fromwire.fw_err_pko +
++			oct_dev->link_stats.fromwire.fw_err_link +
++			oct_dev->link_stats.fromwire.fw_err_drop;
+ 	/*sum of oct->instr_queue[iq_no]->stats.tx_dropped */
+-	data[i++] = CVM_CAST64(netstats->tx_dropped +
+-			       oct_dev->link_stats.fromhost.max_collision_fail +
+-			       oct_dev->link_stats.fromhost.max_deferral_fail +
+-			       oct_dev->link_stats.fromhost.total_collisions +
+-			       oct_dev->link_stats.fromhost.fw_err_pko +
+-			       oct_dev->link_stats.fromhost.fw_err_link +
+-			       oct_dev->link_stats.fromhost.fw_err_drop +
+-			       oct_dev->link_stats.fromhost.fw_err_pki);
++	data[i++] = lstats.tx_dropped +
++			oct_dev->link_stats.fromhost.max_collision_fail +
++			oct_dev->link_stats.fromhost.max_deferral_fail +
++			oct_dev->link_stats.fromhost.total_collisions +
++			oct_dev->link_stats.fromhost.fw_err_pko +
++			oct_dev->link_stats.fromhost.fw_err_link +
++			oct_dev->link_stats.fromhost.fw_err_drop +
++			oct_dev->link_stats.fromhost.fw_err_pki;
+ 
+ 	/* firmware tx stats */
+ 	/*per_core_stats[cvmx_get_core_num()].link_stats[mdata->from_ifidx].
+@@ -1135,6 +1142,10 @@ lio_get_ethtool_stats(struct net_device *netdev,
+ 	 */
+ 	data[i++] = CVM_CAST64(oct_dev->link_stats.fromhost.fw_tx_vxlan);
+ 
++	/* Multicast packets sent by this port */
++	data[i++] = oct_dev->link_stats.fromhost.fw_total_mcast_sent;
++	data[i++] = oct_dev->link_stats.fromhost.fw_total_bcast_sent;
++
+ 	/* mac tx statistics */
+ 	/*CVMX_BGXX_CMRX_TX_STAT5 */
+ 	data[i++] = CVM_CAST64(oct_dev->link_stats.fromhost.total_pkts_sent);
+@@ -1171,6 +1182,9 @@ lio_get_ethtool_stats(struct net_device *netdev,
+ 	 *fw_total_fwd
+ 	 */
+ 	data[i++] = CVM_CAST64(oct_dev->link_stats.fromwire.fw_total_fwd);
++	/* Multicast packets received on this port */
++	data[i++] = oct_dev->link_stats.fromwire.fw_total_mcast;
++	data[i++] = oct_dev->link_stats.fromwire.fw_total_bcast;
+ 	/*per_core_stats[core_id].link_stats[ifidx].fromwire.jabber_err */
+ 	data[i++] = CVM_CAST64(oct_dev->link_stats.fromwire.jabber_err);
+ 	/*per_core_stats[core_id].link_stats[ifidx].fromwire.l2_err */
+@@ -1339,7 +1353,7 @@ static void lio_vf_get_ethtool_stats(struct net_device *netdev,
+ 				     __attribute__((unused)),
+ 				     u64 *data)
+ {
+-	struct net_device_stats *netstats = &netdev->stats;
++	struct rtnl_link_stats64 lstats;
+ 	struct lio *lio = GET_LIO(netdev);
+ 	struct octeon_device *oct_dev = lio->oct_dev;
+ 	int i = 0, j, vj;
+@@ -1347,25 +1361,31 @@ static void lio_vf_get_ethtool_stats(struct net_device *netdev,
+ 	if (ifstate_check(lio, LIO_IFSTATE_RESETTING))
+ 		return;
+ 
+-	netdev->netdev_ops->ndo_get_stats(netdev);
++	netdev->netdev_ops->ndo_get_stats64(netdev, &lstats);
+ 	/* sum of oct->droq[oq_no]->stats->rx_pkts_received */
+-	data[i++] = CVM_CAST64(netstats->rx_packets);
++	data[i++] = lstats.rx_packets;
+ 	/* sum of oct->instr_queue[iq_no]->stats.tx_done */
+-	data[i++] = CVM_CAST64(netstats->tx_packets);
++	data[i++] = lstats.tx_packets;
+ 	/* sum of oct->droq[oq_no]->stats->rx_bytes_received */
+-	data[i++] = CVM_CAST64(netstats->rx_bytes);
++	data[i++] = lstats.rx_bytes;
+ 	/* sum of oct->instr_queue[iq_no]->stats.tx_tot_bytes */
+-	data[i++] = CVM_CAST64(netstats->tx_bytes);
+-	data[i++] = CVM_CAST64(netstats->rx_errors);
+-	data[i++] = CVM_CAST64(netstats->tx_errors);
++	data[i++] = lstats.tx_bytes;
++	data[i++] = lstats.rx_errors;
++	data[i++] = lstats.tx_errors;
+ 	 /* sum of oct->droq[oq_no]->stats->rx_dropped +
+ 	  * oct->droq[oq_no]->stats->dropped_nodispatch +
+ 	  * oct->droq[oq_no]->stats->dropped_toomany +
+ 	  * oct->droq[oq_no]->stats->dropped_nomem
+ 	  */
+-	data[i++] = CVM_CAST64(netstats->rx_dropped);
++	data[i++] = lstats.rx_dropped;
+ 	/* sum of oct->instr_queue[iq_no]->stats.tx_dropped */
+-	data[i++] = CVM_CAST64(netstats->tx_dropped);
++	data[i++] = lstats.tx_dropped;
++
++	data[i++] = oct_dev->link_stats.fromwire.fw_total_mcast;
++	data[i++] = oct_dev->link_stats.fromhost.fw_total_mcast_sent;
++	data[i++] = oct_dev->link_stats.fromwire.fw_total_bcast;
++	data[i++] = oct_dev->link_stats.fromhost.fw_total_bcast_sent;
++
+ 	/* lio->link_changes */
+ 	data[i++] = CVM_CAST64(lio->link_changes);
+ 
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index e1450948d50e..51366c84b918 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -2234,14 +2234,11 @@ static int liquidio_set_mac(struct net_device *netdev, void *p)
+ 	return 0;
+ }
+ 
+-/**
+- * \brief Net device get_stats
+- * @param netdev network device
+- */
+-static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
++static void
++liquidio_get_stats64(struct net_device *netdev,
++		     struct rtnl_link_stats64 *lstats)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+-	struct net_device_stats *stats = &netdev->stats;
+ 	struct octeon_device *oct;
+ 	u64 pkts = 0, drop = 0, bytes = 0;
+ 	struct oct_droq_stats *oq_stats;
+@@ -2251,7 +2248,7 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 	oct = lio->oct_dev;
+ 
+ 	if (ifstate_check(lio, LIO_IFSTATE_RESETTING))
+-		return stats;
++		return;
+ 
+ 	for (i = 0; i < oct->num_iqs; i++) {
+ 		iq_no = lio->linfo.txpciq[i].s.q_no;
+@@ -2261,9 +2258,9 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 		bytes += iq_stats->tx_tot_bytes;
+ 	}
+ 
+-	stats->tx_packets = pkts;
+-	stats->tx_bytes = bytes;
+-	stats->tx_dropped = drop;
++	lstats->tx_packets = pkts;
++	lstats->tx_bytes = bytes;
++	lstats->tx_dropped = drop;
+ 
+ 	pkts = 0;
+ 	drop = 0;
+@@ -2280,11 +2277,34 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 		bytes += oq_stats->rx_bytes_received;
+ 	}
+ 
+-	stats->rx_bytes = bytes;
+-	stats->rx_packets = pkts;
+-	stats->rx_dropped = drop;
+-
+-	return stats;
++	lstats->rx_bytes = bytes;
++	lstats->rx_packets = pkts;
++	lstats->rx_dropped = drop;
++
++	octnet_get_link_stats(netdev);
++	lstats->multicast = oct->link_stats.fromwire.fw_total_mcast;
++	lstats->collisions = oct->link_stats.fromhost.total_collisions;
++
++	/* detailed rx_errors: */
++	lstats->rx_length_errors = oct->link_stats.fromwire.l2_err;
++	/* recved pkt with crc error    */
++	lstats->rx_crc_errors = oct->link_stats.fromwire.fcs_err;
++	/* recv'd frame alignment error */
++	lstats->rx_frame_errors = oct->link_stats.fromwire.frame_err;
++	/* recv'r fifo overrun */
++	lstats->rx_fifo_errors = oct->link_stats.fromwire.fifo_err;
++
++	lstats->rx_errors = lstats->rx_length_errors + lstats->rx_crc_errors +
++		lstats->rx_frame_errors + lstats->rx_fifo_errors;
++
++	/* detailed tx_errors */
++	lstats->tx_aborted_errors = oct->link_stats.fromhost.fw_err_pko;
++	lstats->tx_carrier_errors = oct->link_stats.fromhost.fw_err_link;
++	lstats->tx_fifo_errors = oct->link_stats.fromhost.fifo_err;
++
++	lstats->tx_errors = lstats->tx_aborted_errors +
++		lstats->tx_carrier_errors +
++		lstats->tx_fifo_errors;
+ }
+ 
+ /**
+@@ -3260,7 +3280,7 @@ static const struct net_device_ops lionetdevops = {
+ 	.ndo_open		= liquidio_open,
+ 	.ndo_stop		= liquidio_stop,
+ 	.ndo_start_xmit		= liquidio_xmit,
+-	.ndo_get_stats		= liquidio_get_stats,
++	.ndo_get_stats64	= liquidio_get_stats64,
+ 	.ndo_set_mac_address	= liquidio_set_mac,
+ 	.ndo_set_rx_mode	= liquidio_set_mcast_list,
+ 	.ndo_tx_timeout		= liquidio_tx_timeout,
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 75996d8e9970..0c535d5624f0 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -1356,24 +1356,21 @@ static int liquidio_set_mac(struct net_device *netdev, void *p)
+ 	return 0;
+ }
+ 
+-/**
+- * \brief Net device get_stats
+- * @param netdev network device
+- */
+-static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
++static void
++liquidio_get_stats64(struct net_device *netdev,
++		     struct rtnl_link_stats64 *lstats)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+-	struct net_device_stats *stats = &netdev->stats;
++	struct octeon_device *oct;
+ 	u64 pkts = 0, drop = 0, bytes = 0;
+ 	struct oct_droq_stats *oq_stats;
+ 	struct oct_iq_stats *iq_stats;
+-	struct octeon_device *oct;
+ 	int i, iq_no, oq_no;
+ 
+ 	oct = lio->oct_dev;
+ 
+ 	if (ifstate_check(lio, LIO_IFSTATE_RESETTING))
+-		return stats;
++		return;
+ 
+ 	for (i = 0; i < oct->num_iqs; i++) {
+ 		iq_no = lio->linfo.txpciq[i].s.q_no;
+@@ -1383,9 +1380,9 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 		bytes += iq_stats->tx_tot_bytes;
+ 	}
+ 
+-	stats->tx_packets = pkts;
+-	stats->tx_bytes = bytes;
+-	stats->tx_dropped = drop;
++	lstats->tx_packets = pkts;
++	lstats->tx_bytes = bytes;
++	lstats->tx_dropped = drop;
+ 
+ 	pkts = 0;
+ 	drop = 0;
+@@ -1402,11 +1399,29 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 		bytes += oq_stats->rx_bytes_received;
+ 	}
+ 
+-	stats->rx_bytes = bytes;
+-	stats->rx_packets = pkts;
+-	stats->rx_dropped = drop;
++	lstats->rx_bytes = bytes;
++	lstats->rx_packets = pkts;
++	lstats->rx_dropped = drop;
++
++	octnet_get_link_stats(netdev);
++	lstats->multicast = oct->link_stats.fromwire.fw_total_mcast;
++
++	/* detailed rx_errors: */
++	lstats->rx_length_errors = oct->link_stats.fromwire.l2_err;
++	/* recved pkt with crc error */
++	lstats->rx_crc_errors = oct->link_stats.fromwire.fcs_err;
++	/* recv'd frame alignment error */
++	lstats->rx_frame_errors = oct->link_stats.fromwire.frame_err;
++
++	lstats->rx_errors = lstats->rx_length_errors + lstats->rx_crc_errors +
++			    lstats->rx_frame_errors;
++
++	/* detailed tx_errors */
++	lstats->tx_aborted_errors = oct->link_stats.fromhost.fw_err_pko;
++	lstats->tx_carrier_errors = oct->link_stats.fromhost.fw_err_link;
+ 
+-	return stats;
++	lstats->tx_errors = lstats->tx_aborted_errors +
++		lstats->tx_carrier_errors;
+ }
+ 
+ /**
+@@ -2090,7 +2105,7 @@ static const struct net_device_ops lionetdevops = {
+ 	.ndo_open		= liquidio_open,
+ 	.ndo_stop		= liquidio_stop,
+ 	.ndo_start_xmit		= liquidio_xmit,
+-	.ndo_get_stats		= liquidio_get_stats,
++	.ndo_get_stats64	= liquidio_get_stats64,
+ 	.ndo_set_mac_address	= liquidio_set_mac,
+ 	.ndo_set_rx_mode	= liquidio_set_mcast_list,
+ 	.ndo_tx_timeout		= liquidio_tx_timeout,
+diff --git a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+index 60b529626276..a103b664f1da 100644
+--- a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
++++ b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+@@ -800,6 +800,9 @@ struct nic_rx_stats {
+ 	u64 fw_total_rcvd;
+ 	u64 fw_total_fwd;
+ 	u64 fw_total_fwd_bytes;
++	u64 fw_total_mcast;
++	u64 fw_total_bcast;
++
+ 	u64 fw_err_pko;
+ 	u64 fw_err_link;
+ 	u64 fw_err_drop;
+@@ -856,6 +859,8 @@ struct nic_tx_stats {
+ 	u64 fw_total_sent;
+ 	u64 fw_total_fwd;
+ 	u64 fw_total_fwd_bytes;
++	u64 fw_total_mcast_sent;
++	u64 fw_total_bcast_sent;
+ 	u64 fw_err_pko;
+ 	u64 fw_err_link;
+ 	u64 fw_err_drop;
