@@ -1439,6 +1439,8 @@ gf100_grctx_generate_main(struct gf100_gr *gr, struct gf100_grctx *info)
 		grctx->r418e94(gr);
 	if (grctx->r419a3c)
 		grctx->r419a3c(gr);
+	if (grctx->r408840)
+		grctx->r408840(gr);
 }
 
 int

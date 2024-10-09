@@ -69,6 +69,7 @@ struct gf100_grctx_func {
 	void (*r419e00)(struct gf100_gr *);
 	void (*r418e94)(struct gf100_gr *);
 	void (*r419a3c)(struct gf100_gr *);
+	void (*r408840)(struct gf100_gr *);
 };
 
 extern const struct gf100_grctx_func gf100_grctx;
@@ -141,6 +142,8 @@ void gp100_grctx_generate_smid_config(struct gf100_gr *);
 
 extern const struct gf100_grctx_func gp102_grctx;
 void gp102_grctx_generate_attrib(struct gf100_grctx *);
+
+extern const struct gf100_grctx_func gp104_grctx;
 
 extern const struct gf100_grctx_func gp107_grctx;
 
