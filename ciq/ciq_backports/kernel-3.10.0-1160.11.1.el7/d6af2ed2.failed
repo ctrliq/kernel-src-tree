@@ -1,0 +1,179 @@
+PCI: hv: Fix a timing issue which causes kdump to fail occasionally
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.11.1.el7
+Rebuild_CHGLOG: - [pci] hv: Fix a timing issue which causes kdump to fail occasionally (Mohammed Gamal) [1846667]
+Rebuild_FUZZ: 96.12%
+commit-author Wei Hu <weh@microsoft.com>
+commit d6af2ed29c7c1c311b96dac989dcb991e90ee195
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.11.1.el7/d6af2ed2.failed
+
+Kdump could fail sometime on Hyper-V guest because the retry in
+hv_pci_enter_d0() releases child device structures in hv_pci_bus_exit().
+
+Although there is a second asynchronous device relations message sending
+from the host, if this message arrives to the guest after
+hv_send_resource_allocated() is called, the retry would fail.
+
+Fix the problem by moving retry to hv_pci_probe() and start the retry
+from hv_pci_query_relations() call.  This will cause a device relations
+message to arrive to the guest synchronously; the guest would then be
+able to rebuild the child device structures before calling
+hv_send_resource_allocated().
+
+Link: https://lore.kernel.org/r/20200727071731.18516-1-weh@microsoft.com
+Fixes: c81992e7f4aa ("PCI: hv: Retry PCI bus D0 entry on invalid device state")
+	Signed-off-by: Wei Hu <weh@microsoft.com>
+[lorenzo.pieralisi@arm.com: fixed a comment and commit log]
+	Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+(cherry picked from commit d6af2ed29c7c1c311b96dac989dcb991e90ee195)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-hyperv.c
+diff --cc drivers/pci/pci-hyperv.c
+index de9560f8f53e,d0033ff6c143..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -2243,10 -2759,8 +2243,12 @@@ static int hv_pci_enter_d0(struct hv_de
+  	struct pci_bus_d0_entry *d0_entry;
+  	struct hv_pci_compl comp_pkt;
+  	struct pci_packet *pkt;
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	bool enter_d0_retry = true;
+++=======
+++>>>>>>> d6af2ed29c7c (PCI: hv: Fix a timing issue which causes kdump to fail occasionally):drivers/pci/controller/pci-hyperv.c
+  	int ret;
+  
+- enter_d0_retry:
+  	/*
+  	 * Tell the host that the bus is ready to use, and moved into the
+  	 * powered-on state.  This includes telling the host which region
+@@@ -2273,32 -2787,6 +2275,35 @@@
+  	if (ret)
+  		goto exit;
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	/*
+ +	 * In certain case (Kdump) the pci device of interest was
+ +	 * not cleanly shut down and resource is still held on host
+ +	 * side, the host could return invalid device status.
+ +	 * We need to explicitly request host to release the resource
+ +	 * and try to enter D0 again.
+ +	 */
+ +	if (ret == -EPROTO && enter_d0_retry) {
+ +		enter_d0_retry = false;
+ +
+ +		dev_err(&hdev->device, "Retrying D0 Entry\n");
+ +
+ +		/*
+ +		 * Hv_pci_bus_exit() calls hv_send_resource_released()
+ +		 * to free up resources of its child devices.
+ +		 * In the kdump kernel we need to set the
+ +		 * wslot_res_allocated to 255 so it scans all child
+ +		 * devices to release resources allocated in the
+ +		 * normal kernel before panic happened.
+ +		 */
+ +		hbus->wslot_res_allocated = 255;
+ +		hv_pci_bus_exit(hdev);
+ +
+ +		goto enter_d0_retry;
+ +	}
+ +
+++=======
+++>>>>>>> d6af2ed29c7c (PCI: hv: Fix a timing issue which causes kdump to fail occasionally):drivers/pci/controller/pci-hyperv.c
+  	if (comp_pkt.completion_status < 0) {
+  		dev_err(&hdev->device,
+  			"PCI Pass-through VSP failed D0 Entry with status %x\n",
+@@@ -2535,6 -3023,8 +2540,11 @@@ static int hv_pci_probe(struct hv_devic
+  {
+  	struct hv_pcibus_device *hbus;
+  	u16 dom_req, dom;
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ 	char *name;
++ 	bool enter_d0_retry = true;
+++>>>>>>> d6af2ed29c7c (PCI: hv: Fix a timing issue which causes kdump to fail occasionally):drivers/pci/controller/pci-hyperv.c
+  	int ret;
+  
+  	/*
+@@@ -2616,16 -3125,69 +2626,72 @@@
+  		dev_err(&hdev->device,
+  			"Unable to map a virtual address for config space\n");
+  		ret = -ENOMEM;
+ -		goto free_config;
+ +		goto release;
+  	}
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ 	name = kasprintf(GFP_KERNEL, "%pUL", &hdev->dev_instance);
++ 	if (!name) {
++ 		ret = -ENOMEM;
++ 		goto unmap;
++ 	}
++ 
++ 	hbus->sysdata.fwnode = irq_domain_alloc_named_fwnode(name);
++ 	kfree(name);
++ 	if (!hbus->sysdata.fwnode) {
++ 		ret = -ENOMEM;
++ 		goto unmap;
++ 	}
++ 
++ 	ret = hv_pcie_init_irq_domain(hbus);
++ 	if (ret)
++ 		goto free_fwnode;
++ 
++ retry:
+++>>>>>>> d6af2ed29c7c (PCI: hv: Fix a timing issue which causes kdump to fail occasionally):drivers/pci/controller/pci-hyperv.c
+  	ret = hv_pci_query_relations(hdev);
+  	if (ret)
+ -		goto free_irq_domain;
+ +		goto unmap;
+  
+  	ret = hv_pci_enter_d0(hdev);
++ 	/*
++ 	 * In certain case (Kdump) the pci device of interest was
++ 	 * not cleanly shut down and resource is still held on host
++ 	 * side, the host could return invalid device status.
++ 	 * We need to explicitly request host to release the resource
++ 	 * and try to enter D0 again.
++ 	 * Since the hv_pci_bus_exit() call releases structures
++ 	 * of all its child devices, we need to start the retry from
++ 	 * hv_pci_query_relations() call, requesting host to send
++ 	 * the synchronous child device relations message before this
++ 	 * information is needed in hv_send_resources_allocated()
++ 	 * call later.
++ 	 */
++ 	if (ret == -EPROTO && enter_d0_retry) {
++ 		enter_d0_retry = false;
++ 
++ 		dev_err(&hdev->device, "Retrying D0 Entry\n");
++ 
++ 		/*
++ 		 * Hv_pci_bus_exit() calls hv_send_resources_released()
++ 		 * to free up resources of its child devices.
++ 		 * In the kdump kernel we need to set the
++ 		 * wslot_res_allocated to 255 so it scans all child
++ 		 * devices to release resources allocated in the
++ 		 * normal kernel before panic happened.
++ 		 */
++ 		hbus->wslot_res_allocated = 255;
++ 		ret = hv_pci_bus_exit(hdev, true);
++ 
++ 		if (ret == 0)
++ 			goto retry;
++ 
++ 		dev_err(&hdev->device,
++ 			"Retrying D0 failed with ret %d\n", ret);
++ 	}
+  	if (ret)
+ -		goto free_irq_domain;
+ +		goto unmap;
+  
+  	ret = hv_pci_allocate_bridge_windows(hbus);
+  	if (ret)
+* Unmerged path drivers/pci/pci-hyperv.c
