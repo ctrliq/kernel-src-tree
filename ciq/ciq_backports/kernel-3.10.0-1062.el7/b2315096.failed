@@ -1,0 +1,148 @@
+udf: fix the udf_iget() vs. udf_new_inode() races
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit b231509616feb911c2a7a8814d58c0014ef5b17f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b2315096.failed
+
+Currently udf_iget() (triggered by NFS) can race with udf_new_inode()
+leading to two inode structures with the same inode number:
+
+nfsd: iget_locked() creates inode
+nfsd: try to read from disk, block on that.
+udf_new_inode(): allocate inode with that inumber
+udf_new_inode(): insert it into icache, set it up and dirty
+udf_write_inode(): write inode into buffer cache
+nfsd: get CPU again, look into buffer cache, see nice and sane on-disk
+  inode, set the in-core inode from it
+
+Fix the problem by putting inode into icache in locked state (I_NEW set)
+and unlocking it only after it's fully set up.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit b231509616feb911c2a7a8814d58c0014ef5b17f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/udf/namei.c
+diff --cc fs/udf/namei.c
+index 102c072c6bbf,d106fdd1bef7..000000000000
+--- a/fs/udf/namei.c
++++ b/fs/udf/namei.c
+@@@ -550,32 -548,18 +550,33 @@@ static int udf_delete_entry(struct inod
+  	return udf_write_fi(inode, cfi, fi, fibh, NULL, NULL);
+  }
+  
+ -static int udf_add_nondir(struct dentry *dentry, struct inode *inode)
+ +static int udf_create(struct inode *dir, struct dentry *dentry, umode_t mode,
+ +		      bool excl)
+  {
+ -	struct udf_inode_info *iinfo = UDF_I(inode);
+ -	struct inode *dir = dentry->d_parent->d_inode;
+  	struct udf_fileident_bh fibh;
+ +	struct inode *inode;
+  	struct fileIdentDesc cfi, *fi;
+  	int err;
+ +	struct udf_inode_info *iinfo;
+ +
+ +	inode = udf_new_inode(dir, mode, &err);
+ +	if (!inode) {
+ +		return err;
+ +	}
+ +
+ +	iinfo = UDF_I(inode);
+ +	if (iinfo->i_alloc_type == ICBTAG_FLAG_AD_IN_ICB)
+ +		inode->i_data.a_ops = &udf_adinicb_aops;
+ +	else
+ +		inode->i_data.a_ops = &udf_aops;
+ +	inode->i_op = &udf_file_inode_operations;
+ +	inode->i_fop = &udf_file_operations;
+ +	mark_inode_dirty(inode);
+  
+  	fi = udf_add_entry(dir, dentry, &fibh, &cfi, &err);
+ -	if (unlikely(!fi)) {
+ +	if (!fi) {
+  		inode_dec_link_count(inode);
++ 		unlock_new_inode(inode);
+  		iput(inode);
+  		return err;
+  	}
+@@@ -594,6 -579,52 +596,55 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int udf_create(struct inode *dir, struct dentry *dentry, umode_t mode,
++ 		      bool excl)
++ {
++ 	struct inode *inode;
++ 	int err;
++ 
++ 	inode = udf_new_inode(dir, mode, &err);
++ 	if (!inode) {
++ 		return err;
++ 	}
++ 
++ 	if (UDF_I(inode)->i_alloc_type == ICBTAG_FLAG_AD_IN_ICB)
++ 		inode->i_data.a_ops = &udf_adinicb_aops;
++ 	else
++ 		inode->i_data.a_ops = &udf_aops;
++ 	inode->i_op = &udf_file_inode_operations;
++ 	inode->i_fop = &udf_file_operations;
++ 	mark_inode_dirty(inode);
++ 
++ 	return udf_add_nondir(dentry, inode);
++ }
++ 
++ static int udf_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
++ {
++ 	struct inode *inode;
++ 	struct udf_inode_info *iinfo;
++ 	int err;
++ 
++ 	inode = udf_new_inode(dir, mode, &err);
++ 	if (!inode)
++ 		return err;
++ 
++ 	iinfo = UDF_I(inode);
++ 	if (iinfo->i_alloc_type == ICBTAG_FLAG_AD_IN_ICB)
++ 		inode->i_data.a_ops = &udf_adinicb_aops;
++ 	else
++ 		inode->i_data.a_ops = &udf_aops;
++ 	inode->i_op = &udf_file_inode_operations;
++ 	inode->i_fop = &udf_file_operations;
++ 	mark_inode_dirty(inode);
++ 
++ 	d_tmpfile(dentry, inode);
++ 	unlock_new_inode(inode);
++ 	return 0;
++ }
++ 
+++>>>>>>> b231509616fe (udf: fix the udf_iget() vs. udf_new_inode() races)
+  static int udf_mknod(struct inode *dir, struct dentry *dentry, umode_t mode,
+  		     dev_t rdev)
+  {
+diff --git a/fs/udf/ialloc.c b/fs/udf/ialloc.c
+index 7e5aae4bf46f..15a6ffb1d731 100644
+--- a/fs/udf/ialloc.c
++++ b/fs/udf/ialloc.c
+@@ -125,7 +125,12 @@ struct inode *udf_new_inode(struct inode *dir, umode_t mode, int *err)
+ 		iinfo->i_alloc_type = ICBTAG_FLAG_AD_LONG;
+ 	inode->i_mtime = inode->i_atime = inode->i_ctime =
+ 		iinfo->i_crtime = current_fs_time(inode->i_sb);
+-	insert_inode_hash(inode);
++	if (unlikely(insert_inode_locked(inode) < 0)) {
++		make_bad_inode(inode);
++		iput(inode);
++		*err = -EIO;
++		return NULL;
++	}
+ 	mark_inode_dirty(inode);
+ 
+ 	*err = 0;
+* Unmerged path fs/udf/namei.c
