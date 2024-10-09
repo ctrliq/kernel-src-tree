@@ -2824,6 +2824,28 @@ genlmsg_cancel:
 	return -EMSGSIZE;
 }
 
+static void devlink_param_notify(struct devlink *devlink,
+				 struct devlink_param_item *param_item,
+				 enum devlink_command cmd)
+{
+	struct sk_buff *msg;
+	int err;
+
+	WARN_ON(cmd != DEVLINK_CMD_PARAM_NEW && cmd != DEVLINK_CMD_PARAM_DEL);
+
+	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+	if (!msg)
+		return;
+	err = devlink_nl_param_fill(msg, devlink, param_item, cmd, 0, 0, 0);
+	if (err) {
+		nlmsg_free(msg);
+		return;
+	}
+
+	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
+				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
+}
+
 static int devlink_nl_cmd_param_get_dumpit(struct sk_buff *msg,
 					   struct netlink_callback *cb)
 {
@@ -3015,6 +3037,7 @@ static int devlink_nl_cmd_param_set_doit(struct sk_buff *skb,
 			return err;
 	}
 
+	devlink_param_notify(devlink, param_item, DEVLINK_CMD_PARAM_NEW);
 	return 0;
 }
 
@@ -3038,6 +3061,7 @@ static int devlink_param_register_one(struct devlink *devlink,
 	param_item->param = param;
 
 	list_add_tail(&param_item->list, &devlink->param_list);
+	devlink_param_notify(devlink, param_item, DEVLINK_CMD_PARAM_NEW);
 	return 0;
 }
 
@@ -3049,6 +3073,7 @@ static void devlink_param_unregister_one(struct devlink *devlink,
 	param_item = devlink_param_find_by_name(&devlink->param_list,
 						param->name);
 	WARN_ON(!param_item);
+	devlink_param_notify(devlink, param_item, DEVLINK_CMD_PARAM_DEL);
 	list_del(&param_item->list);
 	kfree(param_item);
 }
@@ -4034,9 +4059,34 @@ int devlink_param_driverinit_value_set(struct devlink *devlink, u32 param_id,
 	param_item->driverinit_value = init_val;
 	param_item->driverinit_value_valid = true;
 
+	devlink_param_notify(devlink, param_item, DEVLINK_CMD_PARAM_NEW);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(devlink_param_driverinit_value_set);
+
+/**
+ *	devlink_param_value_changed - notify devlink on a parameter's value
+ *				      change. Should be called by the driver
+ *				      right after the change.
+ *
+ *	@devlink: devlink
+ *	@param_id: parameter ID
+ *
+ *	This function should be used by the driver to notify devlink on value
+ *	change, excluding driverinit configuration mode.
+ *	For driverinit configuration mode driver should use the function
+ *	devlink_param_driverinit_value_set() instead.
+ */
+void devlink_param_value_changed(struct devlink *devlink, u32 param_id)
+{
+	struct devlink_param_item *param_item;
+
+	param_item = devlink_param_find_by_id(&devlink->param_list, param_id);
+	WARN_ON(!param_item);
+
+	devlink_param_notify(devlink, param_item, DEVLINK_CMD_PARAM_NEW);
+}
+EXPORT_SYMBOL_GPL(devlink_param_value_changed);
 
 static int __init devlink_module_init(void)
 {
