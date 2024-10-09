@@ -1,0 +1,169 @@
+CIFS: fix circular locking dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] core: Fix circular locking dependency (David Arcari) [1576173]
+Rebuild_FUZZ: 91.89%
+commit-author Rabin Vincent <rabinv@axis.com>
+commit 966681c9f029afd5decee069b7658bb58ad0a863
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/966681c9.failed
+
+When a CIFS filesystem is mounted with the forcemand option and the
+following command is run on it, lockdep warns about a circular locking
+dependency between CifsInodeInfo::lock_sem and the inode lock.
+
+ while echo foo > hello; do :; done & while touch -c hello; do :; done
+
+cifs_writev() takes the locks in the wrong order, but note that we can't
+only flip the order around because it releases the inode lock before the
+call to generic_write_sync() while it holds the lock_sem across that
+call.
+
+But, AFAICS, there is no need to hold the CifsInodeInfo::lock_sem across
+the generic_write_sync() call either, so we can release both the locks
+before generic_write_sync(), and change the order.
+
+ ======================================================
+ WARNING: possible circular locking dependency detected
+ 4.12.0-rc7+ #9 Not tainted
+ ------------------------------------------------------
+ touch/487 is trying to acquire lock:
+  (&cifsi->lock_sem){++++..}, at: cifsFileInfo_put+0x88f/0x16a0
+
+ but task is already holding lock:
+  (&sb->s_type->i_mutex_key#11){+.+.+.}, at: utimes_common+0x3ad/0x870
+
+ which lock already depends on the new lock.
+
+ the existing dependency chain (in reverse order) is:
+
+ -> #1 (&sb->s_type->i_mutex_key#11){+.+.+.}:
+        __lock_acquire+0x1f74/0x38f0
+        lock_acquire+0x1cc/0x600
+        down_write+0x74/0x110
+        cifs_strict_writev+0x3cb/0x8c0
+        __vfs_write+0x4c1/0x930
+        vfs_write+0x14c/0x2d0
+        SyS_write+0xf7/0x240
+        entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+ -> #0 (&cifsi->lock_sem){++++..}:
+        check_prevs_add+0xfa0/0x1d10
+        __lock_acquire+0x1f74/0x38f0
+        lock_acquire+0x1cc/0x600
+        down_write+0x74/0x110
+        cifsFileInfo_put+0x88f/0x16a0
+        cifs_setattr+0x992/0x1680
+        notify_change+0x61a/0xa80
+        utimes_common+0x3d4/0x870
+        do_utimes+0x1c1/0x220
+        SyS_utimensat+0x84/0x1a0
+        entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+ other info that might help us debug this:
+
+  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock(&sb->s_type->i_mutex_key#11);
+                                lock(&cifsi->lock_sem);
+                                lock(&sb->s_type->i_mutex_key#11);
+   lock(&cifsi->lock_sem);
+
+  *** DEADLOCK ***
+
+ 2 locks held by touch/487:
+  #0:  (sb_writers#10){.+.+.+}, at: mnt_want_write+0x41/0xb0
+  #1:  (&sb->s_type->i_mutex_key#11){+.+.+.}, at: utimes_common+0x3ad/0x870
+
+ stack backtrace:
+ CPU: 0 PID: 487 Comm: touch Not tainted 4.12.0-rc7+ #9
+ Call Trace:
+  dump_stack+0xdb/0x185
+  print_circular_bug+0x45b/0x790
+  __lock_acquire+0x1f74/0x38f0
+  lock_acquire+0x1cc/0x600
+  down_write+0x74/0x110
+  cifsFileInfo_put+0x88f/0x16a0
+  cifs_setattr+0x992/0x1680
+  notify_change+0x61a/0xa80
+  utimes_common+0x3d4/0x870
+  do_utimes+0x1c1/0x220
+  SyS_utimensat+0x84/0x1a0
+  entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+Fixes: 19dfc1f5f2ef03a52 ("cifs: fix the race in cifs_writev()")
+	Signed-off-by: Rabin Vincent <rabinv@axis.com>
+	Signed-off-by: Steve French <smfrench@gmail.com>
+	Acked-by: Pavel Shilovsky <pshilov@microsoft.com>
+(cherry picked from commit 966681c9f029afd5decee069b7658bb58ad0a863)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/file.c
+diff --cc fs/cifs/file.c
+index 236079b60f70,bc09df6b473a..000000000000
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@@ -2760,35 -2810,31 +2760,56 @@@ cifs_writev(struct kiocb *iocb, const s
+  	struct inode *inode = file->f_mapping->host;
+  	struct cifsInodeInfo *cinode = CIFS_I(inode);
+  	struct TCP_Server_Info *server = tlink_tcon(cfile->tlink)->ses->server;
+ -	ssize_t rc;
+ +	ssize_t rc = -EACCES;
+ +	loff_t lock_pos = iocb->ki_pos;
+  
++ 	inode_lock(inode);
+  	/*
+  	 * We need to hold the sem to be sure nobody modifies lock list
+  	 * with a brlock that prevents writing.
+  	 */
+  	down_read(&cinode->lock_sem);
+++<<<<<<< HEAD
+ +	inode_lock(inode);
+ +	if (file->f_flags & O_APPEND)
+ +		lock_pos = i_size_read(inode);
+ +	if (!cifs_find_lock_conflict(cfile, lock_pos, iov_length(iov, nr_segs),
+ +				     server->vals->exclusive_lock_type, NULL,
+ +				     CIFS_WRITE_OP)) {
+ +		rc = __generic_file_aio_write(iocb, iov, nr_segs,
+ +						&iocb->ki_pos);
+ +		inode_unlock(inode);
+ +
+ +		if (rc > 0) {
+ +			ssize_t err;
+ +
+ +			err = generic_write_sync(file, iocb->ki_pos - rc, rc);
+ +			if (err < 0)
+ +				rc = err;
+ +		}
+ +	} else {
+ +		inode_unlock(inode);
+ +	}
+ +	up_read(&cinode->lock_sem);
+++=======
++ 
++ 	rc = generic_write_checks(iocb, from);
++ 	if (rc <= 0)
++ 		goto out;
++ 
++ 	if (!cifs_find_lock_conflict(cfile, iocb->ki_pos, iov_iter_count(from),
++ 				     server->vals->exclusive_lock_type, NULL,
++ 				     CIFS_WRITE_OP))
++ 		rc = __generic_file_write_iter(iocb, from);
++ 	else
++ 		rc = -EACCES;
++ out:
++ 	up_read(&cinode->lock_sem);
++ 	inode_unlock(inode);
++ 
++ 	if (rc > 0)
++ 		rc = generic_write_sync(iocb, rc);
+++>>>>>>> 966681c9f029 (CIFS: fix circular locking dependency)
+  	return rc;
+  }
+  
+* Unmerged path fs/cifs/file.c
