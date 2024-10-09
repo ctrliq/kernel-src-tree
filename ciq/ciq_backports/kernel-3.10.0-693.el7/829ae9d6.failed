@@ -1,0 +1,609 @@
+net-timestamp: allow reading recv cmsg on errqueue with origin tstamp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] timestamp: allow reading recv cmsg on errqueue with origin tstamp (Hangbin Liu) [1389283]
+Rebuild_FUZZ: 97.01%
+commit-author Willem de Bruijn <willemb@google.com>
+commit 829ae9d611651467fe6cd7be834bd33ca6b28dfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/829ae9d6.failed
+
+Allow reading of timestamps and cmsg at the same time on all relevant
+socket families. One use is to correlate timestamps with egress
+device, by asking for cmsg IP_PKTINFO.
+
+on AF_INET sockets, call the relevant function (ip_cmsg_recv). To
+avoid changing legacy expectations, only do so if the caller sets a
+new timestamping flag SOF_TIMESTAMPING_OPT_CMSG.
+
+on AF_INET6 sockets, IPV6_PKTINFO and all other recv cmsg are already
+returned for all origins. only change is to set ifindex, which is
+not initialized for all error origins.
+
+In both cases, only generate the pktinfo message if an ifindex is
+known. This is not the case for ACK timestamps.
+
+The difference between the protocol families is probably a historical
+accident as a result of the different conditions for generating cmsg
+in the relevant ip(v6)_recv_error function:
+
+ipv4:        if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP) {
+ipv6:        if (serr->ee.ee_origin != SO_EE_ORIGIN_LOCAL) {
+
+At one time, this was the same test bar for the ICMP/ICMP6
+distinction. This is no longer true.
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+
+----
+
+Changes
+  v1 -> v2
+    large rewrite
+    - integrate with existing pktinfo cmsg generation code
+    - on ipv4: only send with new flag, to maintain legacy behavior
+    - on ipv6: send at most a single pktinfo cmsg
+    - on ipv6: initialize fields if not yet initialized
+
+The recv cmsg interfaces are also relevant to the discussion of
+whether looping packet headers is problematic. For v6, cmsgs that
+identify many headers are already returned. This patch expands
+that to v4. If it sounds reasonable, I will follow with patches
+
+1. request timestamps without payload with SOF_TIMESTAMPING_OPT_TSONLY
+   (http://patchwork.ozlabs.org/patch/366967/)
+2. sysctl to conditionally drop all timestamps that have payload or
+   cmsg from users without CAP_NET_RAW.
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+
+(cherry picked from commit 829ae9d611651467fe6cd7be834bd33ca6b28dfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/timestamping.txt
+#	include/uapi/linux/net_tstamp.h
+#	net/ipv6/datagram.c
+diff --cc Documentation/networking/timestamping.txt
+index b8d8e2e1b184,b08e27261ff9..000000000000
+--- a/Documentation/networking/timestamping.txt
++++ b/Documentation/networking/timestamping.txt
+@@@ -1,103 -1,317 +1,217 @@@
+ -
+ -1. Control Interfaces
+ -
+ -The interfaces for receiving network packages timestamps are:
+ +The existing interfaces for getting network packages time stamped are:
+  
+  * SO_TIMESTAMP
+ -  Generates a timestamp for each incoming packet in (not necessarily
+ -  monotonic) system time. Reports the timestamp via recvmsg() in a
+ -  control message as struct timeval (usec resolution).
+ +  Generate time stamp for each incoming packet using the (not necessarily
+ +  monotonous!) system time. Result is returned via recv_msg() in a
+ +  control message as timeval (usec resolution).
+  
+  * SO_TIMESTAMPNS
+ -  Same timestamping mechanism as SO_TIMESTAMP, but reports the
+ -  timestamp as struct timespec (nsec resolution).
+ +  Same time stamping mechanism as SO_TIMESTAMP, but returns result as
+ +  timespec (nsec resolution).
+  
+  * IP_MULTICAST_LOOP + SO_TIMESTAMP[NS]
+ -  Only for multicast:approximate transmit timestamp obtained by
+ -  reading the looped packet receive timestamp.
+ -
+ -* SO_TIMESTAMPING
+ -  Generates timestamps on reception, transmission or both. Supports
+ -  multiple timestamp sources, including hardware. Supports generating
+ -  timestamps for stream sockets.
+ -
+ -
+ -1.1 SO_TIMESTAMP:
+ -
+ -This socket option enables timestamping of datagrams on the reception
+ -path. Because the destination socket, if any, is not known early in
+ -the network stack, the feature has to be enabled for all packets. The
+ -same is true for all early receive timestamp options.
+ -
+ -For interface details, see `man 7 socket`.
+ -
+ -
+ -1.2 SO_TIMESTAMPNS:
+ -
+ -This option is identical to SO_TIMESTAMP except for the returned data type.
+ -Its struct timespec allows for higher resolution (ns) timestamps than the
+ -timeval of SO_TIMESTAMP (ms).
+ -
+ -
+ -1.3 SO_TIMESTAMPING:
+ +  Only for multicasts: approximate send time stamp by receiving the looped
+ +  packet and using its receive time stamp.
+  
+ -Supports multiple types of timestamp requests. As a result, this
+ -socket option takes a bitmap of flags, not a boolean. In
+ +The following interface complements the existing ones: receive time
+ +stamps can be generated and returned for arbitrary packets and much
+ +closer to the point where the packet is really sent. Time stamps can
+ +be generated in software (as before) or in hardware (if the hardware
+ +has such a feature).
+  
+ -  err = setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING, (void *) val, &val);
+ +SO_TIMESTAMPING:
+  
+ -val is an integer with any of the following bits set. Setting other
+ -bit returns EINVAL and does not change the current state.
+ +Instructs the socket layer which kind of information should be collected
+ +and/or reported.  The parameter is an integer with some of the following
+ +bits set. Setting other bits is an error and doesn't change the current
+ +state.
+  
+ +Four of the bits are requests to the stack to try to generate
+ +timestamps.  Any combination of them is valid.
+  
+ -1.3.1 Timestamp Generation
+ -
+ -Some bits are requests to the stack to try to generate timestamps. Any
+ -combination of them is valid. Changes to these bits apply to newly
+ -created packets, not to packets already in the stack. As a result, it
+ -is possible to selectively request timestamps for a subset of packets
+ -(e.g., for sampling) by embedding an send() call within two setsockopt
+ -calls, one to enable timestamp generation and one to disable it.
+ -Timestamps may also be generated for reasons other than being
+ -requested by a particular socket, such as when receive timestamping is
+ -enabled system wide, as explained earlier.
+ -
+ -SOF_TIMESTAMPING_RX_HARDWARE:
+ -  Request rx timestamps generated by the network adapter.
+ -
+ -SOF_TIMESTAMPING_RX_SOFTWARE:
+ -  Request rx timestamps when data enters the kernel. These timestamps
+ -  are generated just after a device driver hands a packet to the
+ -  kernel receive stack.
+ -
+ -SOF_TIMESTAMPING_TX_HARDWARE:
+ -  Request tx timestamps generated by the network adapter.
+ -
+ -SOF_TIMESTAMPING_TX_SOFTWARE:
+ -  Request tx timestamps when data leaves the kernel. These timestamps
+ -  are generated in the device driver as close as possible, but always
+ -  prior to, passing the packet to the network interface. Hence, they
+ -  require driver support and may not be available for all devices.
+ -
+ -SOF_TIMESTAMPING_TX_SCHED:
+ -  Request tx timestamps prior to entering the packet scheduler. Kernel
+ -  transmit latency is, if long, often dominated by queuing delay. The
+ -  difference between this timestamp and one taken at
+ -  SOF_TIMESTAMPING_TX_SOFTWARE will expose this latency independent
+ -  of protocol processing. The latency incurred in protocol
+ -  processing, if any, can be computed by subtracting a userspace
+ -  timestamp taken immediately before send() from this timestamp. On
+ -  machines with virtual devices where a transmitted packet travels
+ -  through multiple devices and, hence, multiple packet schedulers,
+ -  a timestamp is generated at each layer. This allows for fine
+ -  grained measurement of queuing delay.
+ -
+ -SOF_TIMESTAMPING_TX_ACK:
+ -  Request tx timestamps when all data in the send buffer has been
+ -  acknowledged. This only makes sense for reliable protocols. It is
+ -  currently only implemented for TCP. For that protocol, it may
+ -  over-report measurement, because the timestamp is generated when all
+ -  data up to and including the buffer at send() was acknowledged: the
+ -  cumulative acknowledgment. The mechanism ignores SACK and FACK.
+ -
+ -
+ -1.3.2 Timestamp Reporting
+ +SOF_TIMESTAMPING_TX_HARDWARE:  try to obtain send time stamps in hardware
+ +SOF_TIMESTAMPING_TX_SOFTWARE:  try to obtain send time stamps in software
+ +SOF_TIMESTAMPING_RX_HARDWARE:  try to obtain receive time stamps in hardware
+ +SOF_TIMESTAMPING_RX_SOFTWARE:  try to obtain receive time stamps in software
+  
+  The other three bits control which timestamps will be reported in a
+ -generated control message. Changes to the bits take immediate
+ -effect at the timestamp reporting locations in the stack. Timestamps
+ -are only reported for packets that also have the relevant timestamp
+ -generation request set.
+ -
+ -SOF_TIMESTAMPING_SOFTWARE:
+ -  Report any software timestamps when available.
+ -
+ -SOF_TIMESTAMPING_SYS_HARDWARE:
+ -  This option is deprecated and ignored.
+ -
+ +generated control message.  If none of these bits are set or if none of
+ +the set bits correspond to data that is available, then the control
+ +message will not be generated:
+ +
+ +SOF_TIMESTAMPING_SOFTWARE:     report systime if available
+ +SOF_TIMESTAMPING_SYS_HARDWARE: report hwtimetrans if available
+ +SOF_TIMESTAMPING_RAW_HARDWARE: report hwtimeraw if available
+ +
+ +It is worth noting that timestamps may be collected for reasons other
+ +than being requested by a particular socket with
+ +SOF_TIMESTAMPING_[TR]X_(HARD|SOFT)WARE.  For example, most drivers that
+ +can generate hardware receive timestamps ignore
+ +SOF_TIMESTAMPING_RX_HARDWARE.  It is still a good idea to set that flag
+ +in case future drivers pay attention.
+ +
+++<<<<<<< HEAD
+ +If timestamps are reported, they will appear in a control message with
+ +cmsg_level==SOL_SOCKET, cmsg_type==SO_TIMESTAMPING, and a payload like
+ +this:
+++=======
++ SOF_TIMESTAMPING_RAW_HARDWARE:
++   Report hardware timestamps as generated by
++   SOF_TIMESTAMPING_TX_HARDWARE when available.
++ 
++ 
++ 1.3.3 Timestamp Options
++ 
++ The interface supports the options
++ 
++ SOF_TIMESTAMPING_OPT_ID:
++ 
++   Generate a unique identifier along with each packet. A process can
++   have multiple concurrent timestamping requests outstanding. Packets
++   can be reordered in the transmit path, for instance in the packet
++   scheduler. In that case timestamps will be queued onto the error
++   queue out of order from the original send() calls. This option
++   embeds a counter that is incremented at send() time, to order
++   timestamps within a flow.
++ 
++   This option is implemented only for transmit timestamps. There, the
++   timestamp is always looped along with a struct sock_extended_err.
++   The option modifies field ee_data to pass an id that is unique
++   among all possibly concurrently outstanding timestamp requests for
++   that socket. In practice, it is a monotonically increasing u32
++   (that wraps).
++ 
++   In datagram sockets, the counter increments on each send call. In
++   stream sockets, it increments with every byte.
++ 
++ 
++ SOF_TIMESTAMPING_OPT_CMSG:
++ 
++   Support recv() cmsg for all timestamped packets. Control messages
++   are already supported unconditionally on all packets with receive
++   timestamps and on IPv6 packets with transmit timestamp. This option
++   extends them to IPv4 packets with transmit timestamp. One use case
++   is to correlate packets with their egress device, by enabling socket
++   option IP_PKTINFO simultaneously.
++ 
++ 
++ 1.4 Bytestream Timestamps
++ 
++ The SO_TIMESTAMPING interface supports timestamping of bytes in a
++ bytestream. Each request is interpreted as a request for when the
++ entire contents of the buffer has passed a timestamping point. That
++ is, for streams option SOF_TIMESTAMPING_TX_SOFTWARE will record
++ when all bytes have reached the device driver, regardless of how
++ many packets the data has been converted into.
++ 
++ In general, bytestreams have no natural delimiters and therefore
++ correlating a timestamp with data is non-trivial. A range of bytes
++ may be split across segments, any segments may be merged (possibly
++ coalescing sections of previously segmented buffers associated with
++ independent send() calls). Segments can be reordered and the same
++ byte range can coexist in multiple segments for protocols that
++ implement retransmissions.
++ 
++ It is essential that all timestamps implement the same semantics,
++ regardless of these possible transformations, as otherwise they are
++ incomparable. Handling "rare" corner cases differently from the
++ simple case (a 1:1 mapping from buffer to skb) is insufficient
++ because performance debugging often needs to focus on such outliers.
++ 
++ In practice, timestamps can be correlated with segments of a
++ bytestream consistently, if both semantics of the timestamp and the
++ timing of measurement are chosen correctly. This challenge is no
++ different from deciding on a strategy for IP fragmentation. There, the
++ definition is that only the first fragment is timestamped. For
++ bytestreams, we chose that a timestamp is generated only when all
++ bytes have passed a point. SOF_TIMESTAMPING_TX_ACK as defined is easy to
++ implement and reason about. An implementation that has to take into
++ account SACK would be more complex due to possible transmission holes
++ and out of order arrival.
++ 
++ On the host, TCP can also break the simple 1:1 mapping from buffer to
++ skbuff as a result of Nagle, cork, autocork, segmentation and GSO. The
++ implementation ensures correctness in all cases by tracking the
++ individual last byte passed to send(), even if it is no longer the
++ last byte after an skbuff extend or merge operation. It stores the
++ relevant sequence number in skb_shinfo(skb)->tskey. Because an skbuff
++ has only one such field, only one timestamp can be generated.
++ 
++ In rare cases, a timestamp request can be missed if two requests are
++ collapsed onto the same skb. A process can detect this situation by
++ enabling SOF_TIMESTAMPING_OPT_ID and comparing the byte offset at
++ send time with the value returned for each timestamp. It can prevent
++ the situation by always flushing the TCP stack in between requests,
++ for instance by enabling TCP_NODELAY and disabling TCP_CORK and
++ autocork.
++ 
++ These precautions ensure that the timestamp is generated only when all
++ bytes have passed a timestamp point, assuming that the network stack
++ itself does not reorder the segments. The stack indeed tries to avoid
++ reordering. The one exception is under administrator control: it is
++ possible to construct a packet scheduler configuration that delays
++ segments from the same stream differently. Such a setup would be
++ unusual.
++ 
++ 
++ 2 Data Interfaces
++ 
++ Timestamps are read using the ancillary data feature of recvmsg().
++ See `man 3 cmsg` for details of this interface. The socket manual
++ page (`man 7 socket`) describes how timestamps generated with
++ SO_TIMESTAMP and SO_TIMESTAMPNS records can be retrieved.
++ 
++ 
++ 2.1 SCM_TIMESTAMPING records
++ 
++ These timestamps are returned in a control message with cmsg_level
++ SOL_SOCKET, cmsg_type SCM_TIMESTAMPING, and payload of type
+++>>>>>>> 829ae9d61165 (net-timestamp: allow reading recv cmsg on errqueue with origin tstamp)
+  
+  struct scm_timestamping {
+ -	struct timespec ts[3];
+ +	struct timespec systime;
+ +	struct timespec hwtimetrans;
+ +	struct timespec hwtimeraw;
+  };
+  
+ -The structure can return up to three timestamps. This is a legacy
+ -feature. Only one field is non-zero at any time. Most timestamps
+ -are passed in ts[0]. Hardware timestamps are passed in ts[2].
+ -
+ -ts[1] used to hold hardware timestamps converted to system time.
+ -Instead, expose the hardware clock device on the NIC directly as
+ -a HW PTP clock source, to allow time conversion in userspace and
+ -optionally synchronize system time with a userspace PTP stack such
+ -as linuxptp. For the PTP clock API, see Documentation/ptp/ptp.txt.
+ -
+ -2.1.1 Transmit timestamps with MSG_ERRQUEUE
+ -
+ -For transmit timestamps the outgoing packet is looped back to the
+ -socket's error queue with the send timestamp(s) attached. A process
+ -receives the timestamps by calling recvmsg() with flag MSG_ERRQUEUE
+ -set and with a msg_control buffer sufficiently large to receive the
+ -relevant metadata structures. The recvmsg call returns the original
+ -outgoing data packet with two ancillary messages attached.
+ -
+ -A message of cm_level SOL_IP(V6) and cm_type IP(V6)_RECVERR
+ -embeds a struct sock_extended_err. This defines the error type. For
+ -timestamps, the ee_errno field is ENOMSG. The other ancillary message
+ -will have cm_level SOL_SOCKET and cm_type SCM_TIMESTAMPING. This
+ -embeds the struct scm_timestamping.
+ -
+ -
+ -2.1.1.2 Timestamp types
+ -
+ -The semantics of the three struct timespec are defined by field
+ -ee_info in the extended error structure. It contains a value of
+ -type SCM_TSTAMP_* to define the actual timestamp passed in
+ -scm_timestamping.
+ -
+ -The SCM_TSTAMP_* types are 1:1 matches to the SOF_TIMESTAMPING_*
+ -control fields discussed previously, with one exception. For legacy
+ -reasons, SCM_TSTAMP_SND is equal to zero and can be set for both
+ -SOF_TIMESTAMPING_TX_HARDWARE and SOF_TIMESTAMPING_TX_SOFTWARE. It
+ -is the first if ts[2] is non-zero, the second otherwise, in which
+ -case the timestamp is stored in ts[0].
+ -
+ -
+ -2.1.1.3 Fragmentation
+ -
+ -Fragmentation of outgoing datagrams is rare, but is possible, e.g., by
+ -explicitly disabling PMTU discovery. If an outgoing packet is fragmented,
+ -then only the first fragment is timestamped and returned to the sending
+ -socket.
+ -
+ -
+ -2.1.1.4 Packet Payload
+ -
+ -The calling application is often not interested in receiving the whole
+ -packet payload that it passed to the stack originally: the socket
+ -error queue mechanism is just a method to piggyback the timestamp on.
+ -In this case, the application can choose to read datagrams with a
+ -smaller buffer, possibly even of length 0. The payload is truncated
+ -accordingly. Until the process calls recvmsg() on the error queue,
+ -however, the full packet is queued, taking up budget from SO_RCVBUF.
+ -
+ -
+ -2.1.1.5 Blocking Read
+ -
+ -Reading from the error queue is always a non-blocking operation. To
+ -block waiting on a timestamp, use poll or select. poll() will return
+ -POLLERR in pollfd.revents if any data is ready on the error queue.
+ -There is no need to pass this flag in pollfd.events. This flag is
+ -ignored on request. See also `man 2 poll`.
+ -
+ -
+ -2.1.2 Receive timestamps
+ -
+ -On reception, there is no reason to read from the socket error queue.
+ -The SCM_TIMESTAMPING ancillary data is sent along with the packet data
+ -on a normal recvmsg(). Since this is not a socket error, it is not
+ -accompanied by a message SOL_IP(V6)/IP(V6)_RECVERROR. In this case,
+ -the meaning of the three fields in struct scm_timestamping is
+ -implicitly defined. ts[0] holds a software timestamp if set, ts[1]
+ -is again deprecated and ts[2] holds a hardware timestamp if set.
+ -
+ -
+ -3. Hardware Timestamping configuration: SIOCSHWTSTAMP and SIOCGHWTSTAMP
+ +recvmsg() can be used to get this control message for regular incoming
+ +packets. For send time stamps the outgoing packet is looped back to
+ +the socket's error queue with the send time stamp(s) attached. It can
+ +be received with recvmsg(flags=MSG_ERRQUEUE). The call returns the
+ +original outgoing packet data including all headers preprended down to
+ +and including the link layer, the scm_timestamping control message and
+ +a sock_extended_err control message with ee_errno==ENOMSG and
+ +ee_origin==SO_EE_ORIGIN_TIMESTAMPING. A socket with such a pending
+ +bounced packet is ready for reading as far as select() is concerned.
+ +If the outgoing packet has to be fragmented, then only the first
+ +fragment is time stamped and returned to the sending socket.
+ +
+ +All three values correspond to the same event in time, but were
+ +generated in different ways. Each of these values may be empty (= all
+ +zero), in which case no such value was available. If the application
+ +is not interested in some of these values, they can be left blank to
+ +avoid the potential overhead of calculating them.
+ +
+ +systime is the value of the system time at that moment. This
+ +corresponds to the value also returned via SO_TIMESTAMP[NS]. If the
+ +time stamp was generated by hardware, then this field is
+ +empty. Otherwise it is filled in if SOF_TIMESTAMPING_SOFTWARE is
+ +set.
+ +
+ +hwtimeraw is the original hardware time stamp. Filled in if
+ +SOF_TIMESTAMPING_RAW_HARDWARE is set. No assumptions about its
+ +relation to system time should be made.
+ +
+ +hwtimetrans is the hardware time stamp transformed so that it
+ +corresponds as good as possible to system time. This correlation is
+ +not perfect; as a consequence, sorting packets received via different
+ +NICs by their hwtimetrans may differ from the order in which they were
+ +received. hwtimetrans may be non-monotonic even for the same NIC.
+ +Filled in if SOF_TIMESTAMPING_SYS_HARDWARE is set. Requires support
+ +by the network device and will be empty without that support.
+ +
+ +
+ +SIOCSHWTSTAMP, SIOCGHWTSTAMP:
+  
+  Hardware time stamping must also be initialized for each device driver
+  that is expected to do hardware time stamping. The parameter is defined in
+diff --cc include/uapi/linux/net_tstamp.h
+index f53879c0f590,edbc888ceb51..000000000000
+--- a/include/uapi/linux/net_tstamp.h
++++ b/include/uapi/linux/net_tstamp.h
+@@@ -20,9 -20,14 +20,20 @@@ enum 
+  	SOF_TIMESTAMPING_SOFTWARE = (1<<4),
+  	SOF_TIMESTAMPING_SYS_HARDWARE = (1<<5),
+  	SOF_TIMESTAMPING_RAW_HARDWARE = (1<<6),
+++<<<<<<< HEAD
+ +	SOF_TIMESTAMPING_MASK =
+ +	(SOF_TIMESTAMPING_RAW_HARDWARE - 1) |
+ +	SOF_TIMESTAMPING_RAW_HARDWARE
+++=======
++ 	SOF_TIMESTAMPING_OPT_ID = (1<<7),
++ 	SOF_TIMESTAMPING_TX_SCHED = (1<<8),
++ 	SOF_TIMESTAMPING_TX_ACK = (1<<9),
++ 	SOF_TIMESTAMPING_OPT_CMSG = (1<<10),
++ 
++ 	SOF_TIMESTAMPING_LAST = SOF_TIMESTAMPING_OPT_CMSG,
++ 	SOF_TIMESTAMPING_MASK = (SOF_TIMESTAMPING_LAST - 1) |
++ 				 SOF_TIMESTAMPING_LAST
+++>>>>>>> 829ae9d61165 (net-timestamp: allow reading recv cmsg on errqueue with origin tstamp)
+  };
+  
+  /**
+diff --cc net/ipv6/datagram.c
+index 053beb286c7e,2464a00e36ab..000000000000
+--- a/net/ipv6/datagram.c
++++ b/net/ipv6/datagram.c
+@@@ -427,6 -398,12 +437,15 @@@ int ipv6_recv_error(struct sock *sk, st
+  		sin->sin6_family = AF_INET6;
+  		sin->sin6_flowinfo = 0;
+  		sin->sin6_port = 0;
+++<<<<<<< HEAD
+++=======
++ 		if (np->rxopt.all) {
++ 			if (serr->ee.ee_origin != SO_EE_ORIGIN_ICMP &&
++ 			    serr->ee.ee_origin != SO_EE_ORIGIN_ICMP6)
++ 				ip6_datagram_prepare_pktinfo_errqueue(skb);
++ 			ip6_datagram_recv_common_ctl(sk, msg, skb);
++ 		}
+++>>>>>>> 829ae9d61165 (net-timestamp: allow reading recv cmsg on errqueue with origin tstamp)
+  		if (skb->protocol == htons(ETH_P_IPV6)) {
+  			sin->sin6_addr = ipv6_hdr(skb)->saddr;
+  			if (np->rxopt.all)
+@@@ -522,8 -487,33 +541,38 @@@ out
+  }
+  
+  
+++<<<<<<< HEAD
+ +int ip6_datagram_recv_ctl(struct sock *sk, struct msghdr *msg,
+ +			  struct sk_buff *skb)
+++=======
++ void ip6_datagram_recv_common_ctl(struct sock *sk, struct msghdr *msg,
++ 				 struct sk_buff *skb)
++ {
++ 	struct ipv6_pinfo *np = inet6_sk(sk);
++ 	bool is_ipv6 = skb->protocol == htons(ETH_P_IPV6);
++ 
++ 	if (np->rxopt.bits.rxinfo) {
++ 		struct in6_pktinfo src_info;
++ 
++ 		if (is_ipv6) {
++ 			src_info.ipi6_ifindex = IP6CB(skb)->iif;
++ 			src_info.ipi6_addr = ipv6_hdr(skb)->daddr;
++ 		} else {
++ 			src_info.ipi6_ifindex =
++ 				PKTINFO_SKB_CB(skb)->ipi_ifindex;
++ 			ipv6_addr_set_v4mapped(ip_hdr(skb)->daddr,
++ 					       &src_info.ipi6_addr);
++ 		}
++ 
++ 		if (src_info.ipi6_ifindex >= 0)
++ 			put_cmsg(msg, SOL_IPV6, IPV6_PKTINFO,
++ 				 sizeof(src_info), &src_info);
++ 	}
++ }
++ 
++ void ip6_datagram_recv_specific_ctl(struct sock *sk, struct msghdr *msg,
++ 				    struct sk_buff *skb)
+++>>>>>>> 829ae9d61165 (net-timestamp: allow reading recv cmsg on errqueue with origin tstamp)
+  {
+  	struct ipv6_pinfo *np = inet6_sk(sk);
+  	struct inet6_skb_parm *opt = IP6CB(skb);
+* Unmerged path Documentation/networking/timestamping.txt
+* Unmerged path include/uapi/linux/net_tstamp.h
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 29d411fe019d..c490aa4d774d 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -383,6 +383,22 @@ void ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 port, u32 inf
+ 		kfree_skb(skb);
+ }
+ 
++static bool ipv4_pktinfo_prepare_errqueue(const struct sock *sk,
++					  const struct sk_buff *skb,
++					  int ee_origin)
++{
++	struct in_pktinfo *info = PKTINFO_SKB_CB(skb);
++
++	if ((ee_origin != SO_EE_ORIGIN_TIMESTAMPING) ||
++	    (!(sk->sk_tsflags & SOF_TIMESTAMPING_OPT_CMSG)) ||
++	    (!skb->dev))
++		return false;
++
++	info->ipi_spec_dst.s_addr = ip_hdr(skb)->saddr;
++	info->ipi_ifindex = skb->dev->ifindex;
++	return true;
++}
++
+ /*
+  *	Handle MSG_ERRQUEUE
+  */
+@@ -429,7 +445,9 @@ int ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
+ 	memcpy(&errhdr.ee, &serr->ee, sizeof(struct sock_extended_err));
+ 	sin = &errhdr.offender;
+ 	sin->sin_family = AF_UNSPEC;
+-	if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP) {
++
++	if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP ||
++	    ipv4_pktinfo_prepare_errqueue(sk, skb, serr->ee.ee_origin)) {
+ 		struct inet_sock *inet = inet_sk(sk);
+ 
+ 		sin->sin_family = AF_INET;
+@@ -1073,7 +1091,7 @@ e_inval:
+ }
+ 
+ /**
+- * ipv4_pktinfo_prepare - transfert some info from rtable to skb
++ * ipv4_pktinfo_prepare - transfer some info from rtable to skb
+  * @sk: socket
+  * @skb: buffer
+  *
+* Unmerged path net/ipv6/datagram.c
