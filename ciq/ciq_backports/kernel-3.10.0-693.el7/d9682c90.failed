@@ -1,0 +1,663 @@
+amd-xgbe: Fix formatting of PCS register dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit d9682c90cf5468bd7277d85ae7d80911f25c5edf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d9682c90.failed
+
+Fix the length value used for the PCS register dump so that the full
+value can be displayed.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d9682c90cf5468bd7277d85ae7d80911f25c5edf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index 8514b5841ecd,e9b01fc88098..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@@ -223,206 -903,459 +223,238 @@@ static void xgbe_adjust_link(struct net
+  		pdata->phy_speed = SPEED_UNKNOWN;
+  	}
+  
+ -	if (new_state && netif_msg_link(pdata))
+ -		xgbe_phy_print_status(pdata);
+ -}
+ -
+ -static int xgbe_phy_config_fixed(struct xgbe_prv_data *pdata)
+ -{
+ -	netif_dbg(pdata, link, pdata->netdev, "fixed PHY configuration\n");
+ -
+ -	/* Disable auto-negotiation */
+ -	xgbe_disable_an(pdata);
+ -
+ -	/* Validate/Set specified speed */
+ -	switch (pdata->phy.speed) {
+ -	case SPEED_10000:
+ -		xgbe_set_mode(pdata, XGBE_MODE_KR);
+ -		break;
+ -
+ -	case SPEED_2500:
+ -	case SPEED_1000:
+ -		xgbe_set_mode(pdata, XGBE_MODE_KX);
+ -		break;
+ -
+ -	default:
+ -		return -EINVAL;
+ -	}
+ -
+ -	/* Validate duplex mode */
+ -	if (pdata->phy.duplex != DUPLEX_FULL)
+ -		return -EINVAL;
+ -
+ -	return 0;
+ -}
+ -
+ -static int __xgbe_phy_config_aneg(struct xgbe_prv_data *pdata)
+ -{
+ -	set_bit(XGBE_LINK_INIT, &pdata->dev_state);
+ -	pdata->link_check = jiffies;
+ -
+ -	if (pdata->phy.autoneg != AUTONEG_ENABLE)
+ -		return xgbe_phy_config_fixed(pdata);
+ -
+ -	netif_dbg(pdata, link, pdata->netdev, "AN PHY configuration\n");
+ -
+ -	/* Disable auto-negotiation interrupt */
+ -	disable_irq(pdata->an_irq);
+ -
+ -	/* Start auto-negotiation in a supported mode */
+ -	if (pdata->phy.advertising & ADVERTISED_10000baseKR_Full) {
+ -		xgbe_set_mode(pdata, XGBE_MODE_KR);
+ -	} else if ((pdata->phy.advertising & ADVERTISED_1000baseKX_Full) ||
+ -		   (pdata->phy.advertising & ADVERTISED_2500baseX_Full)) {
+ -		xgbe_set_mode(pdata, XGBE_MODE_KX);
+ -	} else {
+ -		enable_irq(pdata->an_irq);
+ -		return -EINVAL;
+ -	}
+ -
+ -	/* Disable and stop any in progress auto-negotiation */
+ -	xgbe_disable_an(pdata);
+ -
+ -	/* Clear any auto-negotitation interrupts */
+ -	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INT, 0);
+ -
+ -	pdata->an_result = XGBE_AN_READY;
+ -	pdata->an_state = XGBE_AN_READY;
+ -	pdata->kr_state = XGBE_RX_BPA;
+ -	pdata->kx_state = XGBE_RX_BPA;
+ -
+ -	/* Re-enable auto-negotiation interrupt */
+ -	enable_irq(pdata->an_irq);
+ -
+ -	/* Set up advertisement registers based on current settings */
+ -	xgbe_an_init(pdata);
+ -
+ -	/* Enable and start auto-negotiation */
+ -	xgbe_restart_an(pdata);
+ -
+ -	return 0;
+ -}
+ -
+ -static int xgbe_phy_config_aneg(struct xgbe_prv_data *pdata)
+ -{
+ -	int ret;
+ -
+ -	mutex_lock(&pdata->an_mutex);
+ -
+ -	ret = __xgbe_phy_config_aneg(pdata);
+ -	if (ret)
+ -		set_bit(XGBE_LINK_ERR, &pdata->dev_state);
+ -	else
+ -		clear_bit(XGBE_LINK_ERR, &pdata->dev_state);
+ -
+ -	mutex_unlock(&pdata->an_mutex);
+ -
+ -	return ret;
+ -}
+ -
+ -static bool xgbe_phy_aneg_done(struct xgbe_prv_data *pdata)
+ -{
+ -	return (pdata->an_result == XGBE_AN_COMPLETE);
+ -}
+ -
+ -static void xgbe_check_link_timeout(struct xgbe_prv_data *pdata)
+ -{
+ -	unsigned long link_timeout;
+ -
+ -	link_timeout = pdata->link_check + (XGBE_LINK_TIMEOUT * HZ);
+ -	if (time_after(jiffies, link_timeout)) {
+ -		netif_dbg(pdata, link, pdata->netdev, "AN link timeout\n");
+ -		xgbe_phy_config_aneg(pdata);
+ -	}
+ -}
+ -
+ -static void xgbe_phy_status_force(struct xgbe_prv_data *pdata)
+ -{
+ -	if (xgbe_in_kr_mode(pdata)) {
+ -		pdata->phy.speed = SPEED_10000;
+ -	} else {
+ -		switch (pdata->speed_set) {
+ -		case XGBE_SPEEDSET_1000_10000:
+ -			pdata->phy.speed = SPEED_1000;
+ -			break;
+ -
+ -		case XGBE_SPEEDSET_2500_10000:
+ -			pdata->phy.speed = SPEED_2500;
+ -			break;
+ -		}
+ -	}
+ -	pdata->phy.duplex = DUPLEX_FULL;
+ -}
+ -
+ -static void xgbe_phy_status_aneg(struct xgbe_prv_data *pdata)
+ -{
+ -	unsigned int ad_reg, lp_reg;
+ -
+ -	pdata->phy.lp_advertising = 0;
+ -
+ -	if ((pdata->phy.autoneg != AUTONEG_ENABLE) || pdata->parallel_detect)
+ -		return xgbe_phy_status_force(pdata);
+ -
+ -	pdata->phy.lp_advertising |= ADVERTISED_Autoneg;
+ -	pdata->phy.lp_advertising |= ADVERTISED_Backplane;
+ -
+ -	/* Compare Advertisement and Link Partner register 1 */
+ -	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
+ -	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA);
+ -	if (lp_reg & 0x400)
+ -		pdata->phy.lp_advertising |= ADVERTISED_Pause;
+ -	if (lp_reg & 0x800)
+ -		pdata->phy.lp_advertising |= ADVERTISED_Asym_Pause;
+ -
+ -	if (pdata->phy.pause_autoneg) {
+ -		/* Set flow control based on auto-negotiation result */
+ -		pdata->phy.tx_pause = 0;
+ -		pdata->phy.rx_pause = 0;
+ -
+ -		if (ad_reg & lp_reg & 0x400) {
+ -			pdata->phy.tx_pause = 1;
+ -			pdata->phy.rx_pause = 1;
+ -		} else if (ad_reg & lp_reg & 0x800) {
+ -			if (ad_reg & 0x400)
+ -				pdata->phy.rx_pause = 1;
+ -			else if (lp_reg & 0x400)
+ -				pdata->phy.tx_pause = 1;
+ -		}
+ -	}
+ -
+ -	/* Compare Advertisement and Link Partner register 2 */
+ -	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1);
+ -	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA + 1);
+ -	if (lp_reg & 0x80)
+ -		pdata->phy.lp_advertising |= ADVERTISED_10000baseKR_Full;
+ -	if (lp_reg & 0x20) {
+ -		switch (pdata->speed_set) {
+ -		case XGBE_SPEEDSET_1000_10000:
+ -			pdata->phy.lp_advertising |= ADVERTISED_1000baseKX_Full;
+ -			break;
+ -		case XGBE_SPEEDSET_2500_10000:
+ -			pdata->phy.lp_advertising |= ADVERTISED_2500baseX_Full;
+ -			break;
+ -		}
+ -	}
+ -
+ -	ad_reg &= lp_reg;
+ -	if (ad_reg & 0x80) {
+ -		pdata->phy.speed = SPEED_10000;
+ -		xgbe_set_mode(pdata, XGBE_MODE_KR);
+ -	} else if (ad_reg & 0x20) {
+ -		switch (pdata->speed_set) {
+ -		case XGBE_SPEEDSET_1000_10000:
+ -			pdata->phy.speed = SPEED_1000;
+ -			break;
+ -
+ -		case XGBE_SPEEDSET_2500_10000:
+ -			pdata->phy.speed = SPEED_2500;
+ -			break;
+ -		}
+ -
+ -		xgbe_set_mode(pdata, XGBE_MODE_KX);
+ -	} else {
+ -		pdata->phy.speed = SPEED_UNKNOWN;
+ -	}
+ -
+ -	/* Compare Advertisement and Link Partner register 3 */
+ -	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2);
+ -	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA + 2);
+ -	if (lp_reg & 0xc000)
+ -		pdata->phy.lp_advertising |= ADVERTISED_10000baseR_FEC;
+ -
+ -	pdata->phy.duplex = DUPLEX_FULL;
+ -}
+ -
+ -static void xgbe_phy_status(struct xgbe_prv_data *pdata)
+ -{
+ -	unsigned int reg, link_aneg;
+ -
+ -	if (test_bit(XGBE_LINK_ERR, &pdata->dev_state)) {
+ -		netif_carrier_off(pdata->netdev);
+ -
+ -		pdata->phy.link = 0;
+ -		goto adjust_link;
+ -	}
+ -
+ -	link_aneg = (pdata->phy.autoneg == AUTONEG_ENABLE);
+ -
+ -	/* Get the link status. Link status is latched low, so read
+ -	 * once to clear and then read again to get current state
+ -	 */
+ -	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1);
+ -	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1);
+ -	pdata->phy.link = (reg & MDIO_STAT1_LSTATUS) ? 1 : 0;
+ -
+ -	if (pdata->phy.link) {
+ -		if (link_aneg && !xgbe_phy_aneg_done(pdata)) {
+ -			xgbe_check_link_timeout(pdata);
+ -			return;
+ -		}
+ -
+ -		xgbe_phy_status_aneg(pdata);
+ -
+ -		if (test_bit(XGBE_LINK_INIT, &pdata->dev_state))
+ -			clear_bit(XGBE_LINK_INIT, &pdata->dev_state);
+ -
+ -		netif_carrier_on(pdata->netdev);
+ -	} else {
+ -		if (test_bit(XGBE_LINK_INIT, &pdata->dev_state)) {
+ -			xgbe_check_link_timeout(pdata);
+ +	if (new_state)
+ +		phy_print_status(phydev);
+  
+ -			if (link_aneg)
+ -				return;
+ -		}
+ -
+ -		xgbe_phy_status_aneg(pdata);
+ -
+ -		netif_carrier_off(pdata->netdev);
+ -	}
+ -
+ -adjust_link:
+ -	xgbe_phy_adjust_link(pdata);
+ +	DBGPR_MDIO("<--xgbe_adjust_link\n");
+  }
+  
+ -static void xgbe_phy_stop(struct xgbe_prv_data *pdata)
+ -{
+ -	netif_dbg(pdata, link, pdata->netdev, "stopping PHY\n");
+ -
+ -	/* Disable auto-negotiation */
+ -	xgbe_disable_an(pdata);
+ -
+ -	/* Disable auto-negotiation interrupts */
+ -	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK, 0);
+ -
+ -	devm_free_irq(pdata->dev, pdata->an_irq, pdata);
+ -
+ -	pdata->phy.link = 0;
+ -	netif_carrier_off(pdata->netdev);
+ -
+ -	xgbe_phy_adjust_link(pdata);
+ -}
+ -
+ -static int xgbe_phy_start(struct xgbe_prv_data *pdata)
+ -{
+ -	struct net_device *netdev = pdata->netdev;
+ -	int ret;
+ -
+ -	netif_dbg(pdata, link, pdata->netdev, "starting PHY\n");
+ -
+ -	ret = devm_request_irq(pdata->dev, pdata->an_irq,
+ -			       xgbe_an_isr, 0, pdata->an_name,
+ -			       pdata);
+ -	if (ret) {
+ -		netdev_err(netdev, "phy irq request failed\n");
+ -		return ret;
+ -	}
+ -
+ -	/* Set initial mode - call the mode setting routines
+ -	 * directly to insure we are properly configured
+ -	 */
+ -	if (xgbe_use_xgmii_mode(pdata)) {
+ -		xgbe_xgmii_mode(pdata);
+ -	} else if (xgbe_use_gmii_mode(pdata)) {
+ -		xgbe_gmii_mode(pdata);
+ -	} else if (xgbe_use_gmii_2500_mode(pdata)) {
+ -		xgbe_gmii_2500_mode(pdata);
+ -	} else {
+ -		ret = -EINVAL;
+ -		goto err_irq;
+ -	}
+ -
+ -	/* Set up advertisement registers based on current settings */
+ -	xgbe_an_init(pdata);
+ -
+ -	/* Enable auto-negotiation interrupts */
+ -	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK, 0x07);
+ -
+ -	return xgbe_phy_config_aneg(pdata);
+ -
+ -err_irq:
+ -	devm_free_irq(pdata->dev, pdata->an_irq, pdata);
+ -
+ -	return ret;
+ -}
+ -
+ -static int xgbe_phy_reset(struct xgbe_prv_data *pdata)
+ -{
+ -	unsigned int count, reg;
+ -
+ -	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
+ -	reg |= MDIO_CTRL1_RESET;
+ -	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
+ -
+ -	count = 50;
+ -	do {
+ -		msleep(20);
+ -		reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
+ -	} while ((reg & MDIO_CTRL1_RESET) && --count);
+ -
+ -	if (reg & MDIO_CTRL1_RESET)
+ -		return -ETIMEDOUT;
+ -
+ -	/* Disable auto-negotiation for now */
+ -	xgbe_disable_an(pdata);
+ -
+ -	/* Clear auto-negotiation interrupts */
+ -	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INT, 0);
+ -
+ -	return 0;
+ -}
+ -
+ -static void xgbe_dump_phy_registers(struct xgbe_prv_data *pdata)
+ +void xgbe_dump_phy_registers(struct xgbe_prv_data *pdata)
+  {
+  	struct device *dev = pdata->dev;
+ -
+ -	dev_dbg(dev, "\n************* PHY Reg dump **********************\n");
+ -
+ +	struct phy_device *phydev = pdata->mii->phy_map[XGBE_PRTAD];
+ +	int i;
+ +
+ +	dev_alert(dev, "\n************* PHY Reg dump **********************\n");
+ +
+++<<<<<<< HEAD
+ +	dev_alert(dev, "PCS Control Reg (%#04x) = %#04x\n", MDIO_CTRL1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1));
+ +	dev_alert(dev, "PCS Status Reg (%#04x) = %#04x\n", MDIO_STAT1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1));
+ +	dev_alert(dev, "Phy Id (PHYS ID 1 %#04x)= %#04x\n", MDIO_DEVID1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVID1));
+ +	dev_alert(dev, "Phy Id (PHYS ID 2 %#04x)= %#04x\n", MDIO_DEVID2,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVID2));
+ +	dev_alert(dev, "Devices in Package (%#04x)= %#04x\n", MDIO_DEVS1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVS1));
+ +	dev_alert(dev, "Devices in Package (%#04x)= %#04x\n", MDIO_DEVS2,
+ +		  XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVS2));
+ +
+ +	dev_alert(dev, "Auto-Neg Control Reg (%#04x) = %#04x\n", MDIO_CTRL1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_CTRL1));
+ +	dev_alert(dev, "Auto-Neg Status Reg (%#04x) = %#04x\n", MDIO_STAT1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_STAT1));
+ +	dev_alert(dev, "Auto-Neg Ad Reg 1 (%#04x) = %#04x\n",
+ +		  MDIO_AN_ADVERTISE,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE));
+ +	dev_alert(dev, "Auto-Neg Ad Reg 2 (%#04x) = %#04x\n",
+ +		  MDIO_AN_ADVERTISE + 1,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1));
+ +	dev_alert(dev, "Auto-Neg Ad Reg 3 (%#04x) = %#04x\n",
+ +		  MDIO_AN_ADVERTISE + 2,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2));
+ +	dev_alert(dev, "Auto-Neg Completion Reg (%#04x) = %#04x\n",
+ +		  MDIO_AN_COMP_STAT,
+ +		  XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_COMP_STAT));
+++=======
++ 	dev_dbg(dev, "PCS Control Reg (%#06x) = %#06x\n", MDIO_CTRL1,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1));
++ 	dev_dbg(dev, "PCS Status Reg (%#06x) = %#06x\n", MDIO_STAT1,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_STAT1));
++ 	dev_dbg(dev, "Phy Id (PHYS ID 1 %#06x)= %#06x\n", MDIO_DEVID1,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVID1));
++ 	dev_dbg(dev, "Phy Id (PHYS ID 2 %#06x)= %#06x\n", MDIO_DEVID2,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVID2));
++ 	dev_dbg(dev, "Devices in Package (%#06x)= %#06x\n", MDIO_DEVS1,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVS1));
++ 	dev_dbg(dev, "Devices in Package (%#06x)= %#06x\n", MDIO_DEVS2,
++ 		XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_DEVS2));
++ 
++ 	dev_dbg(dev, "Auto-Neg Control Reg (%#06x) = %#06x\n", MDIO_CTRL1,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_CTRL1));
++ 	dev_dbg(dev, "Auto-Neg Status Reg (%#06x) = %#06x\n", MDIO_STAT1,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_STAT1));
++ 	dev_dbg(dev, "Auto-Neg Ad Reg 1 (%#06x) = %#06x\n",
++ 		MDIO_AN_ADVERTISE,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE));
++ 	dev_dbg(dev, "Auto-Neg Ad Reg 2 (%#06x) = %#06x\n",
++ 		MDIO_AN_ADVERTISE + 1,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1));
++ 	dev_dbg(dev, "Auto-Neg Ad Reg 3 (%#06x) = %#06x\n",
++ 		MDIO_AN_ADVERTISE + 2,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2));
++ 	dev_dbg(dev, "Auto-Neg Completion Reg (%#06x) = %#06x\n",
++ 		MDIO_AN_COMP_STAT,
++ 		XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_COMP_STAT));
+++>>>>>>> d9682c90cf54 (amd-xgbe: Fix formatting of PCS register dump)
+  
+ -	dev_dbg(dev, "\n*************************************************\n");
+ +	dev_alert(dev, "MMD Device Mask = %#x\n",
+ +		  phydev->c45_ids.devices_in_package);
+ +	for (i = 0; i < ARRAY_SIZE(phydev->c45_ids.device_ids); i++)
+ +		dev_alert(dev, "  MMD %d: ID = %#08x\n", i,
+ +			  phydev->c45_ids.device_ids[i]);
+ +
+ +	dev_alert(dev, "\n*************************************************\n");
+  }
+  
+ -static void xgbe_phy_init(struct xgbe_prv_data *pdata)
+ +int xgbe_mdio_register(struct xgbe_prv_data *pdata)
+  {
+ -	mutex_init(&pdata->an_mutex);
+ -	INIT_WORK(&pdata->an_irq_work, xgbe_an_irq_work);
+ -	INIT_WORK(&pdata->an_work, xgbe_an_state_machine);
+ -	pdata->mdio_mmd = MDIO_MMD_PCS;
+ +	struct net_device *netdev = pdata->netdev;
+ +	struct device_node *phy_node;
+ +	struct mii_bus *mii;
+ +	struct phy_device *phydev;
+ +	int ret = 0;
+ +
+ +	DBGPR("-->xgbe_mdio_register\n");
+ +
+ +	/* Retrieve the phy-handle */
+ +	phy_node = of_parse_phandle(pdata->dev->of_node, "phy-handle", 0);
+ +	if (!phy_node) {
+ +		dev_err(pdata->dev, "unable to parse phy-handle\n");
+ +		return -EINVAL;
+ +	}
+  
+ -	/* Initialize supported features */
+ -	pdata->phy.supported = SUPPORTED_Autoneg;
+ -	pdata->phy.supported |= SUPPORTED_Pause | SUPPORTED_Asym_Pause;
+ -	pdata->phy.supported |= SUPPORTED_Backplane;
+ -	pdata->phy.supported |= SUPPORTED_10000baseKR_Full;
+ -	switch (pdata->speed_set) {
+ -	case XGBE_SPEEDSET_1000_10000:
+ -		pdata->phy.supported |= SUPPORTED_1000baseKX_Full;
+ -		break;
+ -	case XGBE_SPEEDSET_2500_10000:
+ -		pdata->phy.supported |= SUPPORTED_2500baseX_Full;
+ -		break;
+ +	/* Register with the MDIO bus */
+ +	mii = mdiobus_alloc();
+ +	if (mii == NULL) {
+ +		dev_err(pdata->dev, "mdiobus_alloc failed\n");
+ +		ret = -ENOMEM;
+ +		goto err_node_get;
+  	}
+  
+ -	pdata->fec_ability = XMDIO_READ(pdata, MDIO_MMD_PMAPMD,
+ -					MDIO_PMA_10GBR_FECABLE);
+ -	pdata->fec_ability &= (MDIO_PMA_10GBR_FECABLE_ABLE |
+ -			       MDIO_PMA_10GBR_FECABLE_ERRABLE);
+ -	if (pdata->fec_ability & MDIO_PMA_10GBR_FECABLE_ABLE)
+ -		pdata->phy.supported |= SUPPORTED_10000baseR_FEC;
+ +	/* Register on the MDIO bus (don't probe any PHYs) */
+ +	mii->name = XGBE_PHY_NAME;
+ +	mii->read = xgbe_mdio_read;
+ +	mii->write = xgbe_mdio_write;
+ +	snprintf(mii->id, sizeof(mii->id), "%s", pdata->mii_bus_id);
+ +	mii->priv = pdata;
+ +	mii->phy_mask = ~0;
+ +	mii->parent = pdata->dev;
+ +	ret = mdiobus_register(mii);
+ +	if (ret) {
+ +		dev_err(pdata->dev, "mdiobus_register failed\n");
+ +		goto err_mdiobus_alloc;
+ +	}
+ +	DBGPR("  mdiobus_register succeeded for %s\n", pdata->mii_bus_id);
+ +
+ +	/* Probe the PCS using Clause 45 */
+ +	phydev = get_phy_device(mii, XGBE_PRTAD, true);
+ +	if (IS_ERR(phydev) || !phydev ||
+ +	    !phydev->c45_ids.device_ids[MDIO_MMD_PCS]) {
+ +		dev_err(pdata->dev, "get_phy_device failed\n");
+ +		ret = phydev ? PTR_ERR(phydev) : -ENOLINK;
+ +		goto err_mdiobus_register;
+ +	}
+ +	request_module(MDIO_MODULE_PREFIX MDIO_ID_FMT,
+ +		       MDIO_ID_ARGS(phydev->c45_ids.device_ids[MDIO_MMD_PCS]));
+ +
+ +	of_node_get(phy_node);
+ +	phydev->dev.of_node = phy_node;
+ +	ret = phy_device_register(phydev);
+ +	if (ret) {
+ +		dev_err(pdata->dev, "phy_device_register failed\n");
+ +		of_node_put(phy_node);
+ +		goto err_phy_device;
+ +	}
+ +	if (!phydev->dev.driver) {
+ +		dev_err(pdata->dev, "phy driver probe failed\n");
+ +		ret = -EIO;
+ +		goto err_phy_device;
+ +	}
+  
+ -	pdata->phy.advertising = pdata->phy.supported;
+ +	/* Add a reference to the PHY driver so it can't be unloaded */
+ +	pdata->phy_module = phydev->dev.driver->owner;
+ +	if (!try_module_get(pdata->phy_module)) {
+ +		dev_err(pdata->dev, "try_module_get failed\n");
+ +		ret = -EIO;
+ +		goto err_phy_device;
+ +	}
+  
+ -	pdata->phy.address = 0;
+ +	pdata->mii = mii;
+ +	pdata->mdio_mmd = MDIO_MMD_PCS;
+  
+ -	pdata->phy.autoneg = AUTONEG_ENABLE;
+ -	pdata->phy.speed = SPEED_UNKNOWN;
+ -	pdata->phy.duplex = DUPLEX_UNKNOWN;
+ +	pdata->phy_link = -1;
+ +	pdata->phy_speed = SPEED_UNKNOWN;
+ +	pdata->phy_tx_pause = pdata->tx_pause;
+ +	pdata->phy_rx_pause = pdata->rx_pause;
+  
+ -	pdata->phy.link = 0;
+ +	ret = phy_connect_direct(netdev, phydev, &xgbe_adjust_link,
+ +				 pdata->phy_mode);
+ +	if (ret) {
+ +		netdev_err(netdev, "phy_connect_direct failed\n");
+ +		goto err_phy_device;
+ +	}
+  
+ -	pdata->phy.pause_autoneg = pdata->pause_autoneg;
+ -	pdata->phy.tx_pause = pdata->tx_pause;
+ -	pdata->phy.rx_pause = pdata->rx_pause;
+ +	if (!phydev->drv || (phydev->drv->phy_id == 0)) {
+ +		netdev_err(netdev, "phy_id not valid\n");
+ +		ret = -ENODEV;
+ +		goto err_phy_connect;
+ +	}
+ +	DBGPR("  phy_connect_direct succeeded for PHY %s, link=%d\n",
+ +	      dev_name(&phydev->dev), phydev->link);
+  
+ -	/* Fix up Flow Control advertising */
+ -	pdata->phy.advertising &= ~ADVERTISED_Pause;
+ -	pdata->phy.advertising &= ~ADVERTISED_Asym_Pause;
+ +	phydev->autoneg = pdata->default_autoneg;
+ +	if (phydev->autoneg == AUTONEG_DISABLE) {
+ +		phydev->speed = pdata->default_speed;
+ +		phydev->duplex = DUPLEX_FULL;
+  
+ -	if (pdata->rx_pause) {
+ -		pdata->phy.advertising |= ADVERTISED_Pause;
+ -		pdata->phy.advertising |= ADVERTISED_Asym_Pause;
+ +		phydev->advertising &= ~ADVERTISED_Autoneg;
+  	}
+  
+ -	if (pdata->tx_pause)
+ -		pdata->phy.advertising ^= ADVERTISED_Asym_Pause;
+ +	pdata->phydev = phydev;
+ +
+ +	of_node_put(phy_node);
+ +
+ +	DBGPHY_REGS(pdata);
+  
+ -	if (netif_msg_drv(pdata))
+ -		xgbe_dump_phy_registers(pdata);
+ +	DBGPR("<--xgbe_mdio_register\n");
+ +
+ +	return 0;
+ +
+ +err_phy_connect:
+ +	phy_disconnect(phydev);
+ +
+ +err_phy_device:
+ +	phy_device_free(phydev);
+ +
+ +err_mdiobus_register:
+ +	mdiobus_unregister(mii);
+ +
+ +err_mdiobus_alloc:
+ +	mdiobus_free(mii);
+ +
+ +err_node_get:
+ +	of_node_put(phy_node);
+ +
+ +	return ret;
+  }
+  
+ -void xgbe_init_function_ptrs_phy(struct xgbe_phy_if *phy_if)
+ +void xgbe_mdio_unregister(struct xgbe_prv_data *pdata)
+  {
+ -	phy_if->phy_init        = xgbe_phy_init;
+ +	DBGPR("-->xgbe_mdio_unregister\n");
+ +
+ +	phy_disconnect(pdata->phydev);
+ +	pdata->phydev = NULL;
+ +
+ +	module_put(pdata->phy_module);
+ +	pdata->phy_module = NULL;
+ +
+ +	mdiobus_unregister(pdata->mii);
+ +	pdata->mii->priv = NULL;
+  
+ -	phy_if->phy_reset       = xgbe_phy_reset;
+ -	phy_if->phy_start       = xgbe_phy_start;
+ -	phy_if->phy_stop        = xgbe_phy_stop;
+ +	mdiobus_free(pdata->mii);
+ +	pdata->mii = NULL;
+  
+ -	phy_if->phy_status      = xgbe_phy_status;
+ -	phy_if->phy_config_aneg = xgbe_phy_config_aneg;
+ +	DBGPR("<--xgbe_mdio_unregister\n");
+  }
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
