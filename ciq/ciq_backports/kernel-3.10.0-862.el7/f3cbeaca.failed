@@ -1,0 +1,336 @@
+x86/intel_rdt/cqm: Add rmdir support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/cqm: Add rmdir support (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 94.12%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit f3cbeacaa06e2b8c2f3ce8531e9aa3fe1f2762cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f3cbeaca.failed
+
+Resource groups (ctrl_mon and monitor groups) are represented by
+directories in resctrl fs. Add support to remove the directories.
+
+When a ctrl_mon directory is removed all the cpus and tasks are assigned
+back to the root rdtgroup. When a monitor group is removed the cpus and
+tasks are returned to the parent control group.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-22-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit f3cbeacaa06e2b8c2f3ce8531e9aa3fe1f2762cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+diff --cc arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 1c3603d97e9d,e61908169dca..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@@ -853,10 -1155,13 +865,13 @@@ static void rdt_move_group_tasks(struc
+  {
+  	struct task_struct *p, *t;
+  
+ -	read_lock(&tasklist_lock);
+ +	qread_lock(&tasklist_lock);
+  	for_each_process_thread(p, t) {
+- 		if (!from || t->closid == from->closid) {
++ 		if (!from || is_closid_match(t, from) ||
++ 		    is_rmid_match(t, from)) {
+  			t->closid = to->closid;
++ 			t->rmid = to->mon.rmid;
++ 
+  #ifdef CONFIG_SMP
+  			/*
+  			 * This is safe on x86 w/o barriers as the ordering
+@@@ -872,9 -1177,22 +887,22 @@@
+  #endif
+  		}
+  	}
+ -	read_unlock(&tasklist_lock);
+ +	qread_unlock(&tasklist_lock);
+  }
+  
++ static void free_all_child_rdtgrp(struct rdtgroup *rdtgrp)
++ {
++ 	struct rdtgroup *sentry, *stmp;
++ 	struct list_head *head;
++ 
++ 	head = &rdtgrp->mon.crdtgrp_list;
++ 	list_for_each_entry_safe(sentry, stmp, head, mon.crdtgrp_list) {
++ 		free_rmid(sentry->mon.rmid);
++ 		list_del(&sentry->mon.crdtgrp_list);
++ 		kfree(sentry);
++ 	}
++ }
++ 
+  /*
+   * Forcibly remove all of subdirectories under root.
+   */
+@@@ -1009,20 -1465,176 +1037,83 @@@ out_unlock
+  	return ret;
+  }
+  
+ -static void mkdir_rdt_prepare_clean(struct rdtgroup *rgrp)
+ -{
+ -	kernfs_remove(rgrp->kn);
+ -	free_rmid(rgrp->mon.rmid);
+ -	kfree(rgrp);
+ -}
+ -
+ -/*
+ - * Create a monitor group under "mon_groups" directory of a control
+ - * and monitor group(ctrl_mon). This is a resource group
+ - * to monitor a subset of tasks and cpus in its parent ctrl_mon group.
+ - */
+ -static int rdtgroup_mkdir_mon(struct kernfs_node *parent_kn,
+ -			      struct kernfs_node *prgrp_kn,
+ -			      const char *name,
+ -			      umode_t mode)
+ -{
+ -	struct rdtgroup *rdtgrp, *prgrp;
+ -	int ret;
+ -
+ -	ret = mkdir_rdt_prepare(parent_kn, prgrp_kn, name, mode, RDTMON_GROUP,
+ -				&rdtgrp);
+ -	if (ret)
+ -		return ret;
+ -
+ -	prgrp = rdtgrp->mon.parent;
+ -	rdtgrp->closid = prgrp->closid;
+ -
+ -	/*
+ -	 * Add the rdtgrp to the list of rdtgrps the parent
+ -	 * ctrl_mon group has to track.
+ -	 */
+ -	list_add_tail(&rdtgrp->mon.crdtgrp_list, &prgrp->mon.crdtgrp_list);
+ -
+ -	rdtgroup_kn_unlock(prgrp_kn);
+ -	return ret;
+ -}
+ -
+ -/*
+ - * These are rdtgroups created under the root directory. Can be used
+ - * to allocate and monitor resources.
+ - */
+ -static int rdtgroup_mkdir_ctrl_mon(struct kernfs_node *parent_kn,
+ -				   struct kernfs_node *prgrp_kn,
+ -				   const char *name, umode_t mode)
+ +static int rdtgroup_rmdir(struct kernfs_node *kn)
+  {
+ +	int ret, cpu, closid = rdtgroup_default.closid;
+  	struct rdtgroup *rdtgrp;
+ -	struct kernfs_node *kn;
+ -	u32 closid;
+ -	int ret;
+ -
+ -	ret = mkdir_rdt_prepare(parent_kn, prgrp_kn, name, mode, RDTCTRL_GROUP,
+ -				&rdtgrp);
+ -	if (ret)
+ -		return ret;
+ -
+ -	kn = rdtgrp->kn;
+ -	ret = closid_alloc();
+ -	if (ret < 0)
+ -		goto out_common_fail;
+ -	closid = ret;
+ +	cpumask_var_t tmpmask;
+  
+ -	rdtgrp->closid = closid;
+ -	list_add(&rdtgrp->rdtgroup_list, &rdt_all_groups);
+ +	if (!zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
+ +		return -ENOMEM;
+  
+ -	if (rdt_mon_capable) {
+ -		/*
+ -		 * Create an empty mon_groups directory to hold the subset
+ -		 * of tasks and cpus to monitor.
+ -		 */
+ -		ret = mongroup_create_dir(kn, NULL, "mon_groups", NULL);
+ -		if (ret)
+ -			goto out_id_free;
+++<<<<<<< HEAD
+ +	rdtgrp = rdtgroup_kn_lock_live(kn);
+ +	if (!rdtgrp) {
+ +		ret = -EPERM;
+ +		goto out;
+  	}
+ -
+ -	goto out_unlock;
+ -
+ -out_id_free:
+ -	closid_free(closid);
+ -	list_del(&rdtgrp->rdtgroup_list);
+ -out_common_fail:
+ -	mkdir_rdt_prepare_clean(rdtgrp);
+ -out_unlock:
+ -	rdtgroup_kn_unlock(prgrp_kn);
+ -	return ret;
+ -}
+ -
+ -/*
+ - * We allow creating mon groups only with in a directory called "mon_groups"
+ - * which is present in every ctrl_mon group. Check if this is a valid
+ - * "mon_groups" directory.
+ - *
+ - * 1. The directory should be named "mon_groups".
+ - * 2. The mon group itself should "not" be named "mon_groups".
+ - *   This makes sure "mon_groups" directory always has a ctrl_mon group
+ - *   as parent.
+ - */
+ -static bool is_mon_groups(struct kernfs_node *kn, const char *name)
+ -{
+ -	return (!strcmp(kn->name, "mon_groups") &&
+ -		strcmp(name, "mon_groups"));
+ -}
+ -
+ -static int rdtgroup_mkdir(struct kernfs_node *parent_kn, const char *name,
+ -			  umode_t mode)
+ -{
+ -	/* Do not accept '\n' to avoid unparsable situation. */
+ -	if (strchr(name, '\n'))
+ -		return -EINVAL;
+ -
+++=======
++ 	/*
++ 	 * If the parent directory is the root directory and RDT
++ 	 * allocation is supported, add a control and monitoring
++ 	 * subdirectory
++ 	 */
++ 	if (rdt_alloc_capable && parent_kn == rdtgroup_default.kn)
++ 		return rdtgroup_mkdir_ctrl_mon(parent_kn, parent_kn, name, mode);
++ 
++ 	/*
++ 	 * If RDT monitoring is supported and the parent directory is a valid
++ 	 * "mon_groups" directory, add a monitoring subdirectory.
++ 	 */
++ 	if (rdt_mon_capable && is_mon_groups(parent_kn, name))
++ 		return rdtgroup_mkdir_mon(parent_kn, parent_kn->parent, name, mode);
++ 
++ 	return -EPERM;
++ }
++ 
++ static int rdtgroup_rmdir_mon(struct kernfs_node *kn, struct rdtgroup *rdtgrp,
++ 			      cpumask_var_t tmpmask)
++ {
++ 	struct rdtgroup *prdtgrp = rdtgrp->mon.parent;
++ 	int cpu;
++ 
++ 	/* Give any tasks back to the parent group */
++ 	rdt_move_group_tasks(rdtgrp, prdtgrp, tmpmask);
++ 
++ 	/* Update per cpu rmid of the moved CPUs first */
++ 	for_each_cpu(cpu, &rdtgrp->cpu_mask)
++ 		per_cpu(rdt_cpu_default.rmid, cpu) = prdtgrp->mon.rmid;
++ 	/*
++ 	 * Update the MSR on moved CPUs and CPUs which have moved
++ 	 * task running on them.
++ 	 */
++ 	cpumask_or(tmpmask, tmpmask, &rdtgrp->cpu_mask);
++ 	update_closid_rmid(tmpmask, NULL);
++ 
++ 	rdtgrp->flags = RDT_DELETED;
++ 	free_rmid(rdtgrp->mon.rmid);
++ 
++ 	/*
++ 	 * Remove the rdtgrp from the parent ctrl_mon group's list
++ 	 */
++ 	WARN_ON(list_empty(&prdtgrp->mon.crdtgrp_list));
++ 	list_del(&rdtgrp->mon.crdtgrp_list);
++ 
++ 	/*
++ 	 * one extra hold on this, will drop when we kfree(rdtgrp)
++ 	 * in rdtgroup_kn_unlock()
++ 	 */
++ 	kernfs_get(kn);
++ 	kernfs_remove(rdtgrp->kn);
++ 
++ 	return 0;
++ }
++ 
++ static int rdtgroup_rmdir_ctrl(struct kernfs_node *kn, struct rdtgroup *rdtgrp,
++ 			       cpumask_var_t tmpmask)
++ {
++ 	int cpu;
+++>>>>>>> f3cbeacaa06e (x86/intel_rdt/cqm: Add rmdir support)
+  
+  	/* Give any tasks back to the default group */
+  	rdt_move_group_tasks(rdtgrp, &rdtgroup_default, tmpmask);
+@@@ -1031,9 -1643,12 +1122,18 @@@
+  	cpumask_or(&rdtgroup_default.cpu_mask,
+  		   &rdtgroup_default.cpu_mask, &rdtgrp->cpu_mask);
+  
+++<<<<<<< HEAD
+ +	/* Update per cpu closid of the moved CPUs first */
+ +	for_each_cpu(cpu, &rdtgrp->cpu_mask)
+ +		per_cpu(cpu_closid, cpu) = closid;
+++=======
++ 	/* Update per cpu closid and rmid of the moved CPUs first */
++ 	for_each_cpu(cpu, &rdtgrp->cpu_mask) {
++ 		per_cpu(rdt_cpu_default.closid, cpu) = rdtgroup_default.closid;
++ 		per_cpu(rdt_cpu_default.rmid, cpu) = rdtgroup_default.mon.rmid;
++ 	}
++ 
+++>>>>>>> f3cbeacaa06e (x86/intel_rdt/cqm: Add rmdir support)
+  	/*
+  	 * Update the MSR on moved CPUs and CPUs which have moved
+  	 * task running on them.
+@@@ -1051,7 -1673,41 +1158,45 @@@
+  	 */
+  	kernfs_get(kn);
+  	kernfs_remove(rdtgrp->kn);
+++<<<<<<< HEAD
+ +	ret = 0;
+++=======
++ 
++ 	return 0;
++ }
++ 
++ static int rdtgroup_rmdir(struct kernfs_node *kn)
++ {
++ 	struct kernfs_node *parent_kn = kn->parent;
++ 	struct rdtgroup *rdtgrp;
++ 	cpumask_var_t tmpmask;
++ 	int ret = 0;
++ 
++ 	if (!zalloc_cpumask_var(&tmpmask, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	rdtgrp = rdtgroup_kn_lock_live(kn);
++ 	if (!rdtgrp) {
++ 		ret = -EPERM;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * If the rdtgroup is a ctrl_mon group and parent directory
++ 	 * is the root directory, remove the ctrl_mon group.
++ 	 *
++ 	 * If the rdtgroup is a mon group and parent directory
++ 	 * is a valid "mon_groups" directory, remove the mon group.
++ 	 */
++ 	if (rdtgrp->type == RDTCTRL_GROUP && parent_kn == rdtgroup_default.kn)
++ 		ret = rdtgroup_rmdir_ctrl(kn, rdtgrp, tmpmask);
++ 	else if (rdtgrp->type == RDTMON_GROUP &&
++ 		 is_mon_groups(parent_kn, kn->name))
++ 		ret = rdtgroup_rmdir_mon(kn, rdtgrp, tmpmask);
++ 	else
++ 		ret = -EPERM;
++ 
+++>>>>>>> f3cbeacaa06e (x86/intel_rdt/cqm: Add rmdir support)
+  out:
+  	rdtgroup_kn_unlock(kn);
+  	free_cpumask_var(tmpmask);
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
