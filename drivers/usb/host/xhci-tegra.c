@@ -1106,6 +1106,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
 						 tegra->hcd);
 	if (!xhci->shared_hcd) {
 		dev_err(&pdev->dev, "failed to create shared HCD\n");
+		err = -ENOMEM;
 		goto remove_usb2;
 	}
 
