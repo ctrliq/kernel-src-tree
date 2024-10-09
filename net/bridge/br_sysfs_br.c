@@ -157,28 +157,21 @@ static ssize_t show_group_fwd_mask(struct device *d,
 	return sprintf(buf, "%#x\n", br->group_fwd_mask);
 }
 
-
-static ssize_t store_group_fwd_mask(struct device *d,
-			       struct device_attribute *attr, const char *buf,
-			       size_t len)
+static int set_group_fwd_mask(struct net_bridge *br, unsigned long val)
 {
-	struct net_bridge *br = to_bridge(d);
-	char *endp;
-	unsigned long val;
-
-	if (!ns_capable(dev_net(br->dev)->user_ns, CAP_NET_ADMIN))
-		return -EPERM;
-
-	val = simple_strtoul(buf, &endp, 0);
-	if (endp == buf)
-		return -EINVAL;
-
 	if (val & BR_GROUPFWD_RESTRICTED)
 		return -EINVAL;
 
 	br->group_fwd_mask = val;
 
-	return len;
+	return 0;
+}
+
+static ssize_t store_group_fwd_mask(struct device *d,
+			       struct device_attribute *attr, const char *buf,
+			       size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_group_fwd_mask);
 }
 static DEVICE_ATTR(group_fwd_mask, S_IRUGO | S_IWUSR, show_group_fwd_mask,
 		   store_group_fwd_mask);
