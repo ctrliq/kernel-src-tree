@@ -4,6 +4,13 @@
 
 #include <asm/thread_info.h>
 #include <asm/page.h>
+
+/*
+ * Put .bss..swapper_pg_dir as the first thing in .bss. This will
+ * make sure it has 16k alignment.
+ */
+#define BSS_FIRST_SECTIONS *(.bss..swapper_pg_dir)
+
 #include <asm-generic/vmlinux.lds.h>
 
 #ifndef CONFIG_64BIT
@@ -94,7 +101,7 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);
 	__init_end = .;		/* freed after init ends here */
 
-	BSS_SECTION(0, 2, 0)
+	BSS_SECTION(PAGE_SIZE, 4 * PAGE_SIZE, PAGE_SIZE)
 
 	_end = . ;
 
