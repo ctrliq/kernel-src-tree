@@ -1,0 +1,218 @@
+md/raid1: add failfast handling for reads.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid1: add failfast handling for reads (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 95.00%
+commit-author NeilBrown <neilb@suse.com>
+commit 2e52d449bcec31cb66d80aa8c798b15f76f1f5e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2e52d449.failed
+
+If a device is marked FailFast and it is not the only device
+we can read from, we mark the bio with REQ_FAILFAST_* flags.
+
+If this does fail, we don't try read repair but just allow
+failure.  If it was the last device it doesn't fail of
+course, so the retry happens on the same device - this time
+without FAILFAST.  A subsequent failure will not retry but
+will just pass up the error.
+
+During resync we may use FAILFAST requests and on a failure
+we will simply use the other device(s).
+
+During recovery we will only use FAILFAST in the unusual
+case were there are multiple places to read from - i.e. if
+there are > 2 devices.  If we get a failure we will fail the
+device and complete the resync/recovery with remaining
+devices.
+
+The new R1BIO_FailFast flag is set on read reqest to suggest
+the a FAILFAST request might be acceptable.  The rdev needs
+to have FailFast set as well for the read to actually use
+REQ_FAILFAST_*.
+
+We need to know there are at least two working devices
+before we can set R1BIO_FailFast, so we mustn't stop looking
+at the first device we find.  So the "min_pending == 0"
+handling to not exit early, but too always choose the
+best_pending_disk if min_pending == 0.
+
+The spinlocked region in raid1_error() in enlarged to ensure
+that if two bios, reading from two different devices, fail
+at the same time, then there is no risk that both devices
+will be marked faulty, leaving zero "In_sync" devices.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 2e52d449bcec31cb66d80aa8c798b15f76f1f5e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid1.h
+diff --cc drivers/md/raid1.c
+index 61555b115942,1f22df0e5f3d..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -540,8 -540,15 +545,9 @@@ static int read_balance(struct r1conf *
+  	best_good_sectors = 0;
+  	has_nonrot_disk = 0;
+  	choose_next_idle = 0;
++ 	clear_bit(R1BIO_FailFast, &r1_bio->state);
+  
+ -	if ((conf->mddev->recovery_cp < this_sector + sectors) ||
+ -	    (mddev_is_clustered(conf->mddev) &&
+ -	    md_cluster_ops->area_resyncing(conf->mddev, READ, this_sector,
+ -		    this_sector + sectors)))
+ -		choose_first = 1;
+ -	else
+ -		choose_first = 0;
+ +	choose_first = (conf->mddev->recovery_cp < this_sector + sectors);
+  
+  	for (disk = 0 ; disk < conf->raid_disks * 2 ; disk++) {
+  		sector_t dist;
+@@@ -1175,12 -1167,21 +1180,19 @@@ read_again
+  
+  		r1_bio->bios[rdisk] = read_bio;
+  
+ -		read_bio->bi_iter.bi_sector = r1_bio->sector +
+ -			mirror->rdev->data_offset;
+ +		read_bio->bi_sector = r1_bio->sector + mirror->rdev->data_offset;
+  		read_bio->bi_bdev = mirror->rdev->bdev;
+  		read_bio->bi_end_io = raid1_end_read_request;
+++<<<<<<< HEAD
+ +		read_bio->bi_rw = READ | do_sync;
+++=======
++ 		bio_set_op_attrs(read_bio, op, do_sync);
++ 		if (test_bit(FailFast, &mirror->rdev->flags) &&
++ 		    test_bit(R1BIO_FailFast, &r1_bio->state))
++ 			read_bio->bi_opf |= MD_FAILFAST;
+++>>>>>>> 2e52d449bcec (md/raid1: add failfast handling for reads.)
+  		read_bio->bi_private = r1_bio;
+  
+ -		if (mddev->gendisk)
+ -			trace_block_bio_remap(bdev_get_queue(read_bio->bi_bdev),
+ -					      read_bio, disk_devt(mddev->gendisk),
+ -					      r1_bio->sector);
+ -
+  		if (max_sectors < r1_bio->sectors) {
+  			/* could not read all from this device, so we will
+  			 * need another r1_bio.
+@@@ -2330,17 -2344,27 +2355,39 @@@ static void handle_read_error(struct r1
+  	 * This is all done synchronously while the array is
+  	 * frozen
+  	 */
+++<<<<<<< HEAD
+ +	if (mddev->ro == 0) {
+++=======
++ 
++ 	bio = r1_bio->bios[r1_bio->read_disk];
++ 	bdevname(bio->bi_bdev, b);
++ 	bio_dev = bio->bi_bdev->bd_dev;
++ 	bio_sector = conf->mirrors[r1_bio->read_disk].rdev->data_offset + r1_bio->sector;
++ 	bio_put(bio);
++ 	r1_bio->bios[r1_bio->read_disk] = NULL;
++ 
++ 	rdev = conf->mirrors[r1_bio->read_disk].rdev;
++ 	if (mddev->ro == 0
++ 	    && !test_bit(FailFast, &rdev->flags)) {
+++>>>>>>> 2e52d449bcec (md/raid1: add failfast handling for reads.)
+  		freeze_array(conf, 1);
+  		fix_read_error(conf, r1_bio->read_disk,
+  			       r1_bio->sector, r1_bio->sectors);
+  		unfreeze_array(conf);
+++<<<<<<< HEAD
+ +	} else
+ +		md_error(mddev, conf->mirrors[r1_bio->read_disk].rdev);
+ +	rdev_dec_pending(conf->mirrors[r1_bio->read_disk].rdev, conf->mddev);
+++=======
++ 	} else {
++ 		r1_bio->bios[r1_bio->read_disk] = IO_BLOCKED;
++ 	}
++ 
++ 	rdev_dec_pending(rdev, conf->mddev);
+++>>>>>>> 2e52d449bcec (md/raid1: add failfast handling for reads.)
+  
+ +	bio = r1_bio->bios[r1_bio->read_disk];
+ +	bdevname(bio->bi_bdev, b);
+  read_more:
+  	disk = read_balance(conf, r1_bio, &max_sectors);
+  	if (disk == -1) {
+@@@ -2350,27 -2373,24 +2397,34 @@@
+  		raid_end_bio_io(r1_bio);
+  	} else {
+  		const unsigned long do_sync
+ -			= r1_bio->master_bio->bi_opf & REQ_SYNC;
+ +			= r1_bio->master_bio->bi_rw & REQ_SYNC;
+ +		if (bio) {
+ +			r1_bio->bios[r1_bio->read_disk] =
+ +				mddev->ro ? IO_BLOCKED : NULL;
+ +			bio_put(bio);
+ +		}
+  		r1_bio->read_disk = disk;
+  		bio = bio_clone_mddev(r1_bio->master_bio, GFP_NOIO, mddev);
+ -		bio_trim(bio, r1_bio->sector - bio->bi_iter.bi_sector,
+ -			 max_sectors);
+ +		bio_trim(bio, r1_bio->sector - bio->bi_sector, max_sectors);
+  		r1_bio->bios[r1_bio->read_disk] = bio;
+  		rdev = conf->mirrors[disk].rdev;
+ -		pr_info_ratelimited("md/raid1:%s: redirecting sector %llu to other mirror: %s\n",
+ -				    mdname(mddev),
+ -				    (unsigned long long)r1_bio->sector,
+ -				    bdevname(rdev->bdev, b));
+ -		bio->bi_iter.bi_sector = r1_bio->sector + rdev->data_offset;
+ +		printk_ratelimited(KERN_ERR
+ +				   "md/raid1:%s: redirecting sector %llu"
+ +				   " to other mirror: %s\n",
+ +				   mdname(mddev),
+ +				   (unsigned long long)r1_bio->sector,
+ +				   bdevname(rdev->bdev, b));
+ +		bio->bi_sector = r1_bio->sector + rdev->data_offset;
+  		bio->bi_bdev = rdev->bdev;
+  		bio->bi_end_io = raid1_end_read_request;
+++<<<<<<< HEAD
+ +		bio->bi_rw = READ | do_sync;
+++=======
++ 		bio_set_op_attrs(bio, REQ_OP_READ, do_sync);
++ 		if (test_bit(FailFast, &rdev->flags) &&
++ 		    test_bit(R1BIO_FailFast, &r1_bio->state))
++ 			bio->bi_opf |= MD_FAILFAST;
+++>>>>>>> 2e52d449bcec (md/raid1: add failfast handling for reads.)
+  		bio->bi_private = r1_bio;
+  		if (max_sectors < r1_bio->sectors) {
+  			/* Drat - have to split this up more */
+@@@ -2640,9 -2676,11 +2694,11 @@@ static sector_t raid1_sync_request(stru
+  		}
+  		if (bio->bi_end_io) {
+  			atomic_inc(&rdev->nr_pending);
+ -			bio->bi_iter.bi_sector = sector_nr + rdev->data_offset;
+ +			bio->bi_sector = sector_nr + rdev->data_offset;
+  			bio->bi_bdev = rdev->bdev;
+  			bio->bi_private = r1_bio;
++ 			if (test_bit(FailFast, &rdev->flags))
++ 				bio->bi_opf |= MD_FAILFAST;
+  		}
+  	}
+  	rcu_read_unlock();
+diff --cc drivers/md/raid1.h
+index c52d7139c5d7,c52ef424a24b..000000000000
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@@ -173,6 -181,8 +173,13 @@@ struct r1bio 
+  /* If a write for this request means we can clear some
+   * known-bad-block records, we set this flag
+   */
+++<<<<<<< HEAD
+ +#define	R1BIO_MadeGood 7
+ +#define	R1BIO_WriteError 8
+++=======
++ 	R1BIO_MadeGood,
++ 	R1BIO_WriteError,
++ 	R1BIO_FailFast,
++ };
+++>>>>>>> 2e52d449bcec (md/raid1: add failfast handling for reads.)
+  #endif
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid1.h
