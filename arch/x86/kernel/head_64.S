@@ -330,7 +330,6 @@ ENDPROC(start_cpu0)
 
 	GLOBAL(stack_start)
 	.quad  init_thread_union+THREAD_SIZE-8
-	.word  0
 	__FINITDATA
 
 bad_address:
