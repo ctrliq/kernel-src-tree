@@ -1,0 +1,218 @@
+scsi: qla2xxx: Correctly retrieve and interpret active flash region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Himanshu Madhani <hmadhani@marvell.com>
+commit 4e71dcae0c4cd1e9d19b8b3d80214a4bcdca5a42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/4e71dcae.failed
+
+ISP27XX/28XX supports multiple flash regions. This patch fixes issue where
+active flash region was not interpreted correctly during secure flash
+update process.
+
+[mkp: typo]
+
+Fixes: 5fa8774c7f38c ("scsi: qla2xxx: Add 28xx flash primary/secondary status/image mechanism")
+	Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/20191203223657.22109-2-hmadhani@marvell.com
+	Signed-off-by: Michael Hernandez <mhernandez@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4e71dcae0c4cd1e9d19b8b3d80214a4bcdca5a42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_attr.c
+#	drivers/scsi/qla2xxx/qla_bsg.c
+#	drivers/scsi/qla2xxx/qla_sup.c
+diff --cc drivers/scsi/qla2xxx/qla_attr.c
+index 6d78a2d9df63,d7e7043f9eab..000000000000
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@@ -164,11 -171,22 +164,27 @@@ qla2x00_sysfs_read_nvram(struct file *f
+  		return -EAGAIN;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (IS_NOCACHE_VPD_TYPE(ha))
+ +		ha->isp_ops->read_optrom(vha, ha->nvram, ha->flt_region_nvram << 2,
+ +		    ha->nvram_size);
+++=======
++ 	if (!IS_NOCACHE_VPD_TYPE(ha)) {
++ 		mutex_unlock(&ha->optrom_mutex);
++ 		goto skip;
++ 	}
++ 
++ 	faddr = ha->flt_region_nvram;
++ 	if (IS_QLA28XX(ha)) {
++ 		qla28xx_get_aux_images(vha, &active_regions);
++ 		if (active_regions.aux.vpd_nvram == QLA27XX_SECONDARY_IMAGE)
++ 			faddr = ha->flt_region_nvram_sec;
++ 	}
++ 	ha->isp_ops->read_optrom(vha, ha->nvram, faddr << 2, ha->nvram_size);
++ 
+++>>>>>>> 4e71dcae0c4c (scsi: qla2xxx: Correctly retrieve and interpret active flash region)
+  	mutex_unlock(&ha->optrom_mutex);
+  
+ -skip:
+  	return memory_read_from_buffer(buf, count, &off, ha->nvram,
+  					ha->nvram_size);
+  }
+diff --cc drivers/scsi/qla2xxx/qla_bsg.c
+index 2b37947e446c,cbaf178fc979..000000000000
+--- a/drivers/scsi/qla2xxx/qla_bsg.c
++++ b/drivers/scsi/qla2xxx/qla_bsg.c
+@@@ -2334,9 -2391,50 +2334,54 @@@ qla2x00_do_dport_diagnostics(struct fc_
+  }
+  
+  static int
+ -qla2x00_get_flash_image_status(struct bsg_job *bsg_job)
+ +qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
+  {
+++<<<<<<< HEAD
+ +	switch (bsg_job->request->rqst_data.h_vendor.vendor_cmd[0]) {
+++=======
++ 	scsi_qla_host_t *vha = shost_priv(fc_bsg_to_shost(bsg_job));
++ 	struct fc_bsg_reply *bsg_reply = bsg_job->reply;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct qla_active_regions regions = { };
++ 	struct active_regions active_regions = { };
++ 
++ 	qla27xx_get_active_image(vha, &active_regions);
++ 	regions.global_image = active_regions.global;
++ 
++ 	if (IS_QLA28XX(ha)) {
++ 		qla27xx_get_active_image(vha, &active_regions);
++ 		regions.board_config = active_regions.aux.board_config;
++ 		regions.vpd_nvram = active_regions.aux.vpd_nvram;
++ 		regions.npiv_config_0_1 = active_regions.aux.npiv_config_0_1;
++ 		regions.npiv_config_2_3 = active_regions.aux.npiv_config_2_3;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_user, vha, 0x70e1,
++ 	    "%s(%lu): FW=%u BCFG=%u VPDNVR=%u NPIV01=%u NPIV02=%u\n",
++ 	    __func__, vha->host_no, regions.global_image,
++ 	    regions.board_config, regions.vpd_nvram,
++ 	    regions.npiv_config_0_1, regions.npiv_config_2_3);
++ 
++ 	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
++ 	    bsg_job->reply_payload.sg_cnt, &regions, sizeof(regions));
++ 
++ 	bsg_reply->reply_data.vendor_reply.vendor_rsp[0] = EXT_STATUS_OK;
++ 	bsg_reply->reply_payload_rcv_len = sizeof(regions);
++ 	bsg_reply->result = DID_OK << 16;
++ 	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
++ 	bsg_job_done(bsg_job, bsg_reply->result,
++ 	    bsg_reply->reply_payload_rcv_len);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ qla2x00_process_vendor_specific(struct bsg_job *bsg_job)
++ {
++ 	struct fc_bsg_request *bsg_request = bsg_job->request;
++ 
++ 	switch (bsg_request->rqst_data.h_vendor.vendor_cmd[0]) {
+++>>>>>>> 4e71dcae0c4c (scsi: qla2xxx: Correctly retrieve and interpret active flash region)
+  	case QL_VND_LOOPBACK:
+  		return qla2x00_process_loopback(bsg_job);
+  
+diff --cc drivers/scsi/qla2xxx/qla_sup.c
+index d78d2bdfd652,b93a0d99e573..000000000000
+--- a/drivers/scsi/qla2xxx/qla_sup.c
++++ b/drivers/scsi/qla2xxx/qla_sup.c
+@@@ -851,7 -847,7 +851,8 @@@ qla2xxx_get_flt_info(scsi_qla_host_t *v
+  				ha->flt_region_img_status_pri = start;
+  			break;
+  		case FLT_REG_IMG_SEC_27XX:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+++<<<<<<< HEAD
+ +			if (IS_QLA27XX(ha))
+  				ha->flt_region_img_status_sec = start;
+  			break;
+  		case FLT_REG_FW_SEC_27XX:
+@@@ -859,24 -855,62 +860,35 @@@
+  				ha->flt_region_fw_sec = start;
+  			break;
+  		case FLT_REG_BOOTLOAD_SEC_27XX:
+ +			if (IS_QLA27XX(ha))
+++=======
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				ha->flt_region_boot_sec = start;
+ -			break;
+ -		case FLT_REG_AUX_IMG_PRI_28XX:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				ha->flt_region_aux_img_status_pri = start;
+ -			break;
+ -		case FLT_REG_AUX_IMG_SEC_28XX:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				ha->flt_region_aux_img_status_sec = start;
+ -			break;
+ -		case FLT_REG_NVRAM_SEC_28XX_0:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 0)
+ -					ha->flt_region_nvram_sec = start;
+ -			break;
+ -		case FLT_REG_NVRAM_SEC_28XX_1:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 1)
+ -					ha->flt_region_nvram_sec = start;
+++				ha->flt_region_img_status_sec = start;
++ 			break;
+ -		case FLT_REG_NVRAM_SEC_28XX_2:
+++		case FLT_REG_FW_SEC_27XX:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 2)
+ -					ha->flt_region_nvram_sec = start;
+++				ha->flt_region_fw_sec = start;
++ 			break;
+ -		case FLT_REG_NVRAM_SEC_28XX_3:
+++		case FLT_REG_BOOTLOAD_SEC_27XX:
++ 			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 3)
+ -					ha->flt_region_nvram_sec = start;
+++>>>>>>> 4e71dcae0c4c (scsi: qla2xxx: Correctly retrieve and interpret active flash region)
+ +				ha->flt_region_boot_sec = start;
+  			break;
+  		case FLT_REG_VPD_SEC_27XX_0:
+ -		case FLT_REG_VPD_SEC_28XX_0:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha)) {
+ -				ha->flt_region_vpd_nvram_sec = start;
+ -				if (ha->port_no == 0)
+ -					ha->flt_region_vpd_sec = start;
+ -			}
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+  			break;
+  		case FLT_REG_VPD_SEC_27XX_1:
+ -		case FLT_REG_VPD_SEC_28XX_1:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 1)
+ -					ha->flt_region_vpd_sec = start;
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+  			break;
+  		case FLT_REG_VPD_SEC_27XX_2:
+ -		case FLT_REG_VPD_SEC_28XX_2:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 2)
+ -					ha->flt_region_vpd_sec = start;
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+  			break;
+  		case FLT_REG_VPD_SEC_27XX_3:
+ -		case FLT_REG_VPD_SEC_28XX_3:
+ -			if (IS_QLA27XX(ha) || IS_QLA28XX(ha))
+ -				if (ha->port_no == 3)
+ -					ha->flt_region_vpd_sec = start;
+ +			if (IS_QLA27XX(ha))
+ +				ha->flt_region_vpd_sec = start;
+  			break;
+  		}
+  	}
+* Unmerged path drivers/scsi/qla2xxx/qla_attr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_bsg.c
+* Unmerged path drivers/scsi/qla2xxx/qla_sup.c
