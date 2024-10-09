@@ -1307,7 +1307,7 @@ static int trace__validate_ev_qualifier(struct trace *trace)
 
 	i = 0;
 
-	strlist__for_each(pos, trace->ev_qualifier) {
+	strlist__for_each_entry(pos, trace->ev_qualifier) {
 		const char *sc = pos->s;
 		int id = audit_name_to_syscall(sc, trace->audit.machine);
 
