@@ -1,0 +1,279 @@
+block: Add 'lock' as third argument to blk_alloc_queue_node()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [block] Add 'lock' as third argument to blk_alloc_queue_node() (Ming Lei) [1568817]
+Rebuild_FUZZ: 93.91%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit 5ee0524ba137fe928a88b440d014e3c8451fb32c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5ee0524b.failed
+
+This patch does not change any functionality.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Philipp Reisner <philipp.reisner@linbit.com>
+	Cc: Ulf Hansson <ulf.hansson@linaro.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5ee0524ba137fe928a88b440d014e3c8451fb32c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	drivers/block/null_blk.c
+#	drivers/ide/ide-probe.c
+#	drivers/lightnvm/core.c
+#	drivers/nvme/host/multipath.c
+#	drivers/scsi/scsi_lib.c
+diff --cc block/blk-core.c
+index 3c1e8c52cafa,e873a24bf82d..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -741,11 -888,10 +741,12 @@@ static void blk_rq_timed_out_timer(unsi
+  	kblockd_schedule_work(&q->timeout_work);
+  }
+  
+- struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
++ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id,
++ 					   spinlock_t *lock)
+  {
+  	struct request_queue *q;
+ +	struct queue_limits_aux *limits_aux = NULL;
+ +	int err;
+  
+  	q = kmem_cache_alloc_node(blk_requestq_cachep,
+  				gfp_mask | __GFP_ZERO, node_id);
+@@@ -882,15 -1029,19 +883,19 @@@ EXPORT_SYMBOL(blk_init_queue)
+  struct request_queue *
+  blk_init_queue_node(request_fn_proc *rfn, spinlock_t *lock, int node_id)
+  {
+ -	struct request_queue *q;
+ +	struct request_queue *uninit_q, *q;
+  
+ -	q = blk_alloc_queue_node(GFP_KERNEL, node_id, NULL);
+ -	if (!q)
+++<<<<<<< HEAD
+ +	uninit_q = blk_alloc_queue_node(GFP_KERNEL, node_id);
+ +	if (!uninit_q)
+  		return NULL;
+  
+ -	q->request_fn = rfn;
+ -	if (lock)
+ -		q->queue_lock = lock;
+ -	if (blk_init_allocated_queue(q) < 0) {
+ -		blk_cleanup_queue(q);
+ -		return NULL;
+ -	}
+ +	q = blk_init_allocated_queue(uninit_q, rfn, lock);
+++=======
+++	q = blk_alloc_queue_node(GFP_KERNEL, node_id, NULL);
+++>>>>>>> 5ee0524ba137 (block: Add 'lock' as third argument to blk_alloc_queue_node())
+ +	if (!q)
+ +		blk_cleanup_queue(uninit_q);
+  
+  	return q;
+  }
+diff --cc drivers/block/null_blk.c
+index 974f570db9ee,6dc7e7cfca4a..000000000000
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@@ -496,8 -1758,10 +496,15 @@@ static int null_add_dev(void
+  			rv = -ENOMEM;
+  			goto out_cleanup_tags;
+  		}
+++<<<<<<< HEAD
+ +	} else if (queue_mode == NULL_Q_BIO) {
+ +		nullb->q = blk_alloc_queue_node(GFP_KERNEL, home_node);
+++=======
++ 		null_init_queues(nullb);
++ 	} else if (dev->queue_mode == NULL_Q_BIO) {
++ 		nullb->q = blk_alloc_queue_node(GFP_KERNEL, dev->home_node,
++ 						NULL);
+++>>>>>>> 5ee0524ba137 (block: Add 'lock' as third argument to blk_alloc_queue_node())
+  		if (!nullb->q) {
+  			rv = -ENOMEM;
+  			goto out_cleanup_queues;
+diff --cc drivers/ide/ide-probe.c
+index 1a926e7a9ddc,d6b8c7e1545d..000000000000
+--- a/drivers/ide/ide-probe.c
++++ b/drivers/ide/ide-probe.c
+@@@ -758,8 -766,7 +758,12 @@@ static int ide_init_queue(ide_drive_t *
+  	 *	limits and LBA48 we could raise it but as yet
+  	 *	do not.
+  	 */
+++<<<<<<< HEAD
+ +
+ +	q = blk_init_queue_node(do_ide_request, NULL, hwif_to_node(hwif));
+++=======
++ 	q = blk_alloc_queue_node(GFP_KERNEL, hwif_to_node(hwif), NULL);
+++>>>>>>> 5ee0524ba137 (block: Add 'lock' as third argument to blk_alloc_queue_node())
+  	if (!q)
+  		return 1;
+  
+diff --cc drivers/scsi/scsi_lib.c
+index e0f2e99b8896,71d1135f94d0..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1992,34 -2167,78 +1992,38 @@@ static void __scsi_init_queue(struct Sc
+  		q->limits.cluster = 0;
+  
+  	/*
+ -	 * Set a reasonable default alignment:  The larger of 32-byte (dword),
+ -	 * which is a common minimum for HBAs, and the minimum DMA alignment,
+ -	 * which is set by the platform.
+ -	 *
+ -	 * Devices that require a bigger alignment can increase it later.
+ +	 * set a reasonable default alignment on word boundaries: the
+ +	 * host and device may alter it using
+ +	 * blk_queue_update_dma_alignment() later.
+  	 */
+ -	blk_queue_dma_alignment(q, max(4, dma_get_cache_alignment()) - 1);
+ +	blk_queue_dma_alignment(q, 0x03);
+  }
+ -EXPORT_SYMBOL_GPL(__scsi_init_queue);
+  
+ -static int scsi_old_init_rq(struct request_queue *q, struct request *rq,
+ -			    gfp_t gfp)
+ +struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
+ +					 request_fn_proc *request_fn)
+  {
+ -	struct Scsi_Host *shost = q->rq_alloc_data;
+ -	const bool unchecked_isa_dma = shost->unchecked_isa_dma;
+ -	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+ -
+ -	memset(cmd, 0, sizeof(*cmd));
+ -
+ -	if (unchecked_isa_dma)
+ -		cmd->flags |= SCMD_UNCHECKED_ISA_DMA;
+ -	cmd->sense_buffer = scsi_alloc_sense_buffer(unchecked_isa_dma, gfp,
+ -						    NUMA_NO_NODE);
+ -	if (!cmd->sense_buffer)
+ -		goto fail;
+ -	cmd->req.sense = cmd->sense_buffer;
+ -
+ -	if (scsi_host_get_prot(shost) >= SHOST_DIX_TYPE0_PROTECTION) {
+ -		cmd->prot_sdb = kmem_cache_zalloc(scsi_sdb_cache, gfp);
+ -		if (!cmd->prot_sdb)
+ -			goto fail_free_sense;
+ -	}
+ -
+ -	return 0;
+ -
+ -fail_free_sense:
+ -	scsi_free_sense_buffer(unchecked_isa_dma, cmd->sense_buffer);
+ -fail:
+ -	return -ENOMEM;
+ -}
+ -
+ -static void scsi_old_exit_rq(struct request_queue *q, struct request *rq)
+ -{
+ -	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
+ +	struct request_queue *q;
+  
+ -	if (cmd->prot_sdb)
+ -		kmem_cache_free(scsi_sdb_cache, cmd->prot_sdb);
+ -	scsi_free_sense_buffer(cmd->flags & SCMD_UNCHECKED_ISA_DMA,
+ -			       cmd->sense_buffer);
+++<<<<<<< HEAD
+ +	q = blk_init_queue(request_fn, NULL);
+++=======
+++	q = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE, NULL);
+++>>>>>>> 5ee0524ba137 (block: Add 'lock' as third argument to blk_alloc_queue_node())
+ +	if (!q)
+ +		return NULL;
+ +	__scsi_init_queue(shost, q);
+ +	return q;
+  }
+ +EXPORT_SYMBOL(__scsi_alloc_queue);
+  
+ -struct request_queue *scsi_old_alloc_queue(struct scsi_device *sdev)
+ +struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
+  {
+ -	struct Scsi_Host *shost = sdev->host;
+  	struct request_queue *q;
+  
+ -	q = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE, NULL);
+ +	q = __scsi_alloc_queue(sdev->host, scsi_request_fn);
+  	if (!q)
+  		return NULL;
+ -	q->cmd_size = sizeof(struct scsi_cmnd) + shost->hostt->cmd_size;
+ -	q->rq_alloc_data = shost;
+ -	q->request_fn = scsi_request_fn;
+ -	q->init_rq_fn = scsi_old_init_rq;
+ -	q->exit_rq_fn = scsi_old_exit_rq;
+ -	q->initialize_rq_fn = scsi_initialize_rq;
+ -
+ -	if (blk_init_allocated_queue(q) < 0) {
+ -		blk_cleanup_queue(q);
+ -		return NULL;
+ -	}
+  
+ -	__scsi_init_queue(shost, q);
+  	blk_queue_prep_rq(q, scsi_prep_fn);
+  	blk_queue_unprep_rq(q, scsi_unprep_fn);
+  	blk_queue_softirq_done(q, scsi_softirq_done);
+* Unmerged path drivers/lightnvm/core.c
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 3661ea1c03f1..f9140ee76465 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2289,7 +2289,7 @@ struct request_queue *blk_mq_init_queue(struct blk_mq_tag_set *set)
+ {
+ 	struct request_queue *uninit_q, *q;
+ 
+-	uninit_q = blk_alloc_queue_node(GFP_KERNEL, set->numa_node);
++	uninit_q = blk_alloc_queue_node(GFP_KERNEL, set->numa_node, NULL);
+ 	if (!uninit_q)
+ 		return ERR_PTR(-ENOMEM);
+ 
+* Unmerged path drivers/block/null_blk.c
+* Unmerged path drivers/ide/ide-probe.c
+* Unmerged path drivers/lightnvm/core.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 14d7215727e9..43362ca46754 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1760,7 +1760,7 @@ static struct mapped_device *alloc_dev(int minor)
+ 	INIT_LIST_HEAD(&md->table_devices);
+ 	spin_lock_init(&md->uevent_lock);
+ 
+-	md->queue = blk_alloc_queue_node(GFP_KERNEL, numa_node_id);
++	md->queue = blk_alloc_queue_node(GFP_KERNEL, numa_node_id, NULL);
+ 	if (!md->queue)
+ 		goto bad;
+ 
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index 49eeb1950ba6..659a349da505 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -301,7 +301,7 @@ static int pmem_attach_disk(struct device *dev,
+ 		return -EBUSY;
+ 	}
+ 
+-	q = blk_alloc_queue_node(GFP_KERNEL, dev_to_node(dev));
++	q = blk_alloc_queue_node(GFP_KERNEL, dev_to_node(dev), NULL);
+ 	if (!q)
+ 		return -ENOMEM;
+ 
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/scsi/scsi_lib.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 2b624b97bb35..50eb47ffa63e 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1182,7 +1182,8 @@ extern long nr_blockdev_pages(void);
+ 
+ bool __must_check blk_get_queue(struct request_queue *);
+ struct request_queue *blk_alloc_queue(gfp_t);
+-struct request_queue *blk_alloc_queue_node(gfp_t, int);
++struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id,
++					   spinlock_t *lock);
+ extern void blk_put_queue(struct request_queue *);
+ extern void blk_set_queue_dying(struct request_queue *);
+ 
