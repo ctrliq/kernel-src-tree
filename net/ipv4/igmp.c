@@ -1126,6 +1126,7 @@ static void igmpv3_del_delrec(struct in_device *in_dev, struct ip_mc_list *im)
 				psf->sf_crcount = im->crcount;
 		}
 		in_dev_put(pmc->interface);
+		kfree(pmc);
 	}
 	spin_unlock_bh(&im->lock);
 }
