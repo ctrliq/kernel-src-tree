@@ -1,0 +1,184 @@
+gfs2: Inode dirtying fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 706cb5492c8c459199fa0ab3b5fd2ba54ee53b0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/706cb549.failed
+
+With the recent iomap write page reclaim deadlock fix, it turns out that the
+GLF_DIRTY flag isn't always set when it needs to be anymore: previously, this
+happened as a side effect of always adding the inode buffer head to the current
+transaction with gfs2_trans_add_meta, but this isn't happening consistently
+anymore.  Fix by removing an additional unnecessary gfs2_trans_add_meta call
+and by setting the GLF_DIRTY flag in gfs2_iomap_end.
+
+(The GLF_DIRTY flag causes inode_go_sync to flush the transaction log when
+syncing out the glock of that inode.  When the flag isn't set, inode_go_sync
+will skip inodes, including ones with an i_state of I_DIRTY_PAGES, which will
+lead to cluster incoherency.)
+
+In addition, in gfs2_iomap_page_done, if the metadata has changed, mark the
+inode as I_DIRTY_DATASYNC to have the inode added to the current transaction:
+we don't expect metadata to change here, but let's err on the safe side.
+
+Fixes: d0a22a4b03b8 ("gfs2: Fix iomap write page reclaim deadlock");
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 706cb5492c8c459199fa0ab3b5fd2ba54ee53b0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index cbb60a8063dc,4df26ef2b2b1..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -958,17 -987,42 +958,28 @@@ static void gfs2_write_unlock(struct in
+  	gfs2_glock_dq_uninit(&ip->i_gh);
+  }
+  
+ -static int gfs2_iomap_page_prepare(struct inode *inode, loff_t pos,
+ -				   unsigned len, struct iomap *iomap)
+ -{
+ -	unsigned int blockmask = i_blocksize(inode) - 1;
+ -	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ -	unsigned int blocks;
+ -
+ -	blocks = ((pos & blockmask) + len + blockmask) >> inode->i_blkbits;
+ -	return gfs2_trans_begin(sdp, RES_DINODE + blocks, 0);
+ -}
+ -
+ -static void gfs2_iomap_page_done(struct inode *inode, loff_t pos,
+ -				 unsigned copied, struct page *page,
+ -				 struct iomap *iomap)
+ +static void gfs2_iomap_journaled_page_done(struct inode *inode, loff_t pos,
+ +					   unsigned copied, struct page *page,
+ +					   struct iomap *iomap)
+  {
++ 	struct gfs2_trans *tr = current->journal_info;
+  	struct gfs2_inode *ip = GFS2_I(inode);
+ -	struct gfs2_sbd *sdp = GFS2_SB(inode);
+  
+++<<<<<<< HEAD
+ +	gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
+++=======
++ 	if (page && !gfs2_is_stuffed(ip))
++ 		gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
++ 
++ 	if (tr->tr_num_buf_new)
++ 		__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
++ 
++ 	gfs2_trans_end(sdp);
+++>>>>>>> 706cb5492c8c (gfs2: Inode dirtying fix)
+  }
+  
+ -static const struct iomap_page_ops gfs2_iomap_page_ops = {
+ -	.page_prepare = gfs2_iomap_page_prepare,
+ -	.page_done = gfs2_iomap_page_done,
+ -};
+ -
+ -static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos,
+ -				  loff_t length, unsigned flags,
+ -				  struct iomap *iomap,
+ +static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos, loff_t length,
+ +				  unsigned flags, struct iomap *iomap,
+  				  struct metapath *mp)
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
+@@@ -1018,32 -1072,44 +1029,63 @@@
+  	if (alloc_required)
+  		rblocks += gfs2_rg_blocks(ip, data_blocks + ind_blocks);
+  
+ -	if (unstuff || iomap->type == IOMAP_HOLE) {
+ -		struct gfs2_trans *tr;
+ +	ret = gfs2_trans_begin(sdp, rblocks, iomap->length >> inode->i_blkbits);
+ +	if (ret)
+ +		goto out_trans_fail;
+  
+ -		ret = gfs2_trans_begin(sdp, rblocks,
+ -				       iomap->length >> inode->i_blkbits);
+ +	if (unstuff) {
+ +		ret = gfs2_unstuff_dinode(ip, NULL);
+  		if (ret)
+++<<<<<<< HEAD
+ +			goto out_trans_end;
+ +		release_metapath(mp);
+ +		ret = gfs2_iomap_get(inode, iomap->offset, iomap->length,
+ +				     flags, iomap, mp);
+ +		if (ret)
+ +			goto out_trans_end;
+++=======
++ 			goto out_trans_fail;
++ 
++ 		if (unstuff) {
++ 			ret = gfs2_unstuff_dinode(ip, NULL);
++ 			if (ret)
++ 				goto out_trans_end;
++ 			release_metapath(mp);
++ 			ret = gfs2_iomap_get(inode, iomap->offset,
++ 					     iomap->length, flags, iomap, mp);
++ 			if (ret)
++ 				goto out_trans_end;
++ 		}
++ 
++ 		if (iomap->type == IOMAP_HOLE) {
++ 			ret = gfs2_iomap_alloc(inode, iomap, mp);
++ 			if (ret) {
++ 				gfs2_trans_end(sdp);
++ 				gfs2_inplace_release(ip);
++ 				punch_hole(ip, iomap->offset, iomap->length);
++ 				goto out_qunlock;
++ 			}
++ 		}
++ 
++ 		tr = current->journal_info;
++ 		if (tr->tr_num_buf_new)
++ 			__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
++ 
++ 		gfs2_trans_end(sdp);
+++>>>>>>> 706cb5492c8c (gfs2: Inode dirtying fix)
+  	}
+  
+ -	if (gfs2_is_stuffed(ip) || gfs2_is_jdata(ip))
+ -		iomap->page_ops = &gfs2_iomap_page_ops;
+ +	if (iomap->type == IOMAP_HOLE) {
+ +		ret = gfs2_iomap_alloc(inode, iomap, flags, mp);
+ +		if (ret) {
+ +			gfs2_trans_end(sdp);
+ +			gfs2_inplace_release(ip);
+ +			punch_hole(ip, iomap->offset, iomap->length);
+ +			goto out_qunlock;
+ +		}
+ +	}
+ +	if (!gfs2_is_stuffed(ip) && gfs2_is_jdata(ip))
+ +		iomap->page_done = gfs2_iomap_journaled_page_done;
+  	return 0;
+  
+  out_trans_end:
+@@@ -1122,11 -1184,17 +1164,23 @@@ static int gfs2_iomap_end(struct inode 
+  
+  	if (ip->i_qadata && ip->i_qadata->qa_qd_num)
+  		gfs2_quota_unlock(ip);
+++<<<<<<< HEAD
+ +	gfs2_write_unlock(inode);
+++=======
++ 
++ 	if (unlikely(!written))
++ 		goto out_unlock;
++ 
++ 	if (iomap->flags & IOMAP_F_SIZE_CHANGED)
++ 		mark_inode_dirty(inode);
++ 	set_bit(GLF_DIRTY, &ip->i_gl->gl_flags);
+++>>>>>>> 706cb5492c8c (gfs2: Inode dirtying fix)
+  
++ out_unlock:
++ 	gfs2_write_unlock(inode);
+  out:
+ +	if (dibh)
+ +		brelse(dibh);
+  	return 0;
+  }
+  
+* Unmerged path fs/gfs2/bmap.c
