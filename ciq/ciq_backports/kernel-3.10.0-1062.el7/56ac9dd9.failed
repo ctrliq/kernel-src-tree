@@ -1,0 +1,215 @@
+RDMA/umem: Avoid synchronize_srcu in the ODP MR destruction path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 56ac9dd9177ce451ac8176311915b29e8b5f0ac2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/56ac9dd9.failed
+
+synchronize_rcu is slow enough that it should be avoided on the syscall
+path when user space is destroying MRs. After all the rework we can now
+trivially do this by having call_srcu kfree the per_mm.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 56ac9dd9177ce451ac8176311915b29e8b5f0ac2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem_odp.c
+#	include/rdma/ib_umem_odp.h
+diff --cc drivers/infiniband/core/umem_odp.c
+index 505862826f1c,2b4c5e7dd5a1..000000000000
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@@ -257,11 -213,144 +257,147 @@@ static const struct mmu_notifier_ops ib
+  	.invalidate_range_end       = ib_umem_notifier_invalidate_range_end,
+  };
+  
+++<<<<<<< HEAD
+ +struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext *context,
+++=======
++ static void add_umem_to_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_umem *umem = &umem_odp->umem;
++ 
++ 	down_write(&per_mm->umem_rwsem);
++ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
++ 		rbt_ib_umem_insert(&umem_odp->interval_tree,
++ 				   &per_mm->umem_tree);
++ 	up_write(&per_mm->umem_rwsem);
++ }
++ 
++ static void remove_umem_from_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_umem *umem = &umem_odp->umem;
++ 
++ 	down_write(&per_mm->umem_rwsem);
++ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
++ 		rbt_ib_umem_remove(&umem_odp->interval_tree,
++ 				   &per_mm->umem_tree);
++ 	complete_all(&umem_odp->notifier_completion);
++ 
++ 	up_write(&per_mm->umem_rwsem);
++ }
++ 
++ static struct ib_ucontext_per_mm *alloc_per_mm(struct ib_ucontext *ctx,
++ 					       struct mm_struct *mm)
++ {
++ 	struct ib_ucontext_per_mm *per_mm;
++ 	int ret;
++ 
++ 	per_mm = kzalloc(sizeof(*per_mm), GFP_KERNEL);
++ 	if (!per_mm)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	per_mm->context = ctx;
++ 	per_mm->mm = mm;
++ 	per_mm->umem_tree = RB_ROOT_CACHED;
++ 	init_rwsem(&per_mm->umem_rwsem);
++ 	per_mm->active = ctx->invalidate_range;
++ 
++ 	rcu_read_lock();
++ 	per_mm->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
++ 	rcu_read_unlock();
++ 
++ 	WARN_ON(mm != current->mm);
++ 
++ 	per_mm->mn.ops = &ib_umem_notifiers;
++ 	ret = mmu_notifier_register(&per_mm->mn, per_mm->mm);
++ 	if (ret) {
++ 		dev_err(&ctx->device->dev,
++ 			"Failed to register mmu_notifier %d\n", ret);
++ 		goto out_pid;
++ 	}
++ 
++ 	list_add(&per_mm->ucontext_list, &ctx->per_mm_list);
++ 	return per_mm;
++ 
++ out_pid:
++ 	put_pid(per_mm->tgid);
++ 	kfree(per_mm);
++ 	return ERR_PTR(ret);
++ }
++ 
++ static int get_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext *ctx = umem_odp->umem.context;
++ 	struct ib_ucontext_per_mm *per_mm;
++ 
++ 	/*
++ 	 * Generally speaking we expect only one or two per_mm in this list,
++ 	 * so no reason to optimize this search today.
++ 	 */
++ 	mutex_lock(&ctx->per_mm_list_lock);
++ 	list_for_each_entry(per_mm, &ctx->per_mm_list, ucontext_list) {
++ 		if (per_mm->mm == umem_odp->umem.owning_mm)
++ 			goto found;
++ 	}
++ 
++ 	per_mm = alloc_per_mm(ctx, umem_odp->umem.owning_mm);
++ 	if (IS_ERR(per_mm)) {
++ 		mutex_unlock(&ctx->per_mm_list_lock);
++ 		return PTR_ERR(per_mm);
++ 	}
++ 
++ found:
++ 	umem_odp->per_mm = per_mm;
++ 	per_mm->odp_mrs_count++;
++ 	mutex_unlock(&ctx->per_mm_list_lock);
++ 
++ 	return 0;
++ }
++ 
++ static void free_per_mm(struct rcu_head *rcu)
++ {
++ 	kfree(container_of(rcu, struct ib_ucontext_per_mm, rcu));
++ }
++ 
++ void put_per_mm(struct ib_umem_odp *umem_odp)
++ {
++ 	struct ib_ucontext_per_mm *per_mm = umem_odp->per_mm;
++ 	struct ib_ucontext *ctx = umem_odp->umem.context;
++ 	bool need_free;
++ 
++ 	mutex_lock(&ctx->per_mm_list_lock);
++ 	umem_odp->per_mm = NULL;
++ 	per_mm->odp_mrs_count--;
++ 	need_free = per_mm->odp_mrs_count == 0;
++ 	if (need_free)
++ 		list_del(&per_mm->ucontext_list);
++ 	mutex_unlock(&ctx->per_mm_list_lock);
++ 
++ 	if (!need_free)
++ 		return;
++ 
++ 	/*
++ 	 * NOTE! mmu_notifier_unregister() can happen between a start/end
++ 	 * callback, resulting in an start/end, and thus an unbalanced
++ 	 * lock. This doesn't really matter to us since we are about to kfree
++ 	 * the memory that holds the lock, however LOCKDEP doesn't like this.
++ 	 */
++ 	down_write(&per_mm->umem_rwsem);
++ 	per_mm->active = false;
++ 	up_write(&per_mm->umem_rwsem);
++ 
++ 	WARN_ON(!RB_EMPTY_ROOT(&per_mm->umem_tree.rb_root));
++ 	mmu_notifier_unregister_no_release(&per_mm->mn, per_mm->mm);
++ 	put_pid(per_mm->tgid);
++ 	mmu_notifier_call_srcu(&per_mm->rcu, free_per_mm);
++ }
++ 
++ struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext_per_mm *per_mm,
+++>>>>>>> 56ac9dd9177c (RDMA/umem: Avoid synchronize_srcu in the ODP MR destruction path)
+  				      unsigned long addr, size_t size)
+  {
+ -	struct ib_ucontext *ctx = per_mm->context;
+ -	struct ib_umem_odp *odp_data;
+  	struct ib_umem *umem;
+ +	struct ib_umem_odp *odp_data;
+  	int pages = size >> PAGE_SHIFT;
+  	int ret;
+  
+diff --cc include/rdma/ib_umem_odp.h
+index cbe16c505673,0b1446fe2fab..000000000000
+--- a/include/rdma/ib_umem_odp.h
++++ b/include/rdma/ib_umem_odp.h
+@@@ -89,9 -85,25 +89,31 @@@ static inline struct ib_umem_odp *to_ib
+  
+  #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+  
+++<<<<<<< HEAD
+ +int ib_umem_odp_get(struct ib_ucontext *context, struct ib_umem *umem,
+ +		    int access);
+ +struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext *context,
+++=======
++ struct ib_ucontext_per_mm {
++ 	struct ib_ucontext *context;
++ 	struct mm_struct *mm;
++ 	struct pid *tgid;
++ 	bool active;
++ 
++ 	struct rb_root_cached umem_tree;
++ 	/* Protects umem_tree */
++ 	struct rw_semaphore umem_rwsem;
++ 
++ 	struct mmu_notifier mn;
++ 	unsigned int odp_mrs_count;
++ 
++ 	struct list_head ucontext_list;
++ 	struct rcu_head rcu;
++ };
++ 
++ int ib_umem_odp_get(struct ib_umem_odp *umem_odp, int access);
++ struct ib_umem_odp *ib_alloc_odp_umem(struct ib_ucontext_per_mm *per_mm,
+++>>>>>>> 56ac9dd9177c (RDMA/umem: Avoid synchronize_srcu in the ODP MR destruction path)
+  				      unsigned long addr, size_t size);
+  void ib_umem_odp_release(struct ib_umem_odp *umem_odp);
+  
+* Unmerged path drivers/infiniband/core/umem_odp.c
+* Unmerged path include/rdma/ib_umem_odp.h
