@@ -1,0 +1,210 @@
+nfp: abm: enable advanced queuing on demand
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 055ee0d69887af1d511246d745610bdf9d627e75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/055ee0d6.failed
+
+ABM NIC FW has a cut-through mode where the PCIe queuing
+is bypassed, thus working like our standard NIC FWs.  Use this
+mode by default and only enable queuing in switchdev mode where
+users can configure it.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 055ee0d69887af1d511246d745610bdf9d627e75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_abi.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_abi.h
+index ce3935d6729b,8b56c27931bf..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_abi.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_abi.h
+@@@ -51,9 -51,93 +51,99 @@@
+   *
+   * @NFP_MBOX_NO_CMD:	null command
+   * Used to indicate previous command has finished.
+++<<<<<<< HEAD
+ + */
+ +enum nfp_mbox_cmd {
+ +	NFP_MBOX_NO_CMD			= 0x00,
+++=======
++  *
++  * @NFP_MBOX_POOL_GET:	get shared buffer pool info/config
++  * Input  - struct nfp_shared_buf_pool_id
++  * Output - struct nfp_shared_buf_pool_info_get
++  *
++  * @NFP_MBOX_POOL_SET:	set shared buffer pool info/config
++  * Input  - struct nfp_shared_buf_pool_info_set
++  * Output - None
++  *
++  * @NFP_MBOX_PCIE_ABM_ENABLE:	enable PCIe-side advanced buffer management
++  * Enable advanced buffer management of the PCIe block.  If ABM is disabled
++  * PCIe block maintains a very short queue of buffers and does tail drop.
++  * ABM allows more advanced buffering and priority control.
++  * Input  - None
++  * Output - None
++  *
++  * @NFP_MBOX_PCIE_ABM_DISABLE:	disable PCIe-side advanced buffer management
++  * Input  - None
++  * Output - None
++  */
++ enum nfp_mbox_cmd {
++ 	NFP_MBOX_NO_CMD			= 0x00,
++ 
++ 	NFP_MBOX_POOL_GET		= 0x01,
++ 	NFP_MBOX_POOL_SET		= 0x02,
++ 
++ 	NFP_MBOX_PCIE_ABM_ENABLE	= 0x03,
++ 	NFP_MBOX_PCIE_ABM_DISABLE	= 0x04,
++ };
++ 
++ #define NFP_SHARED_BUF_COUNT_SYM_NAME	"_abi_nfd_pf%u_sb_cnt"
++ #define NFP_SHARED_BUF_TABLE_SYM_NAME	"_abi_nfd_pf%u_sb_tbl"
++ 
++ /**
++  * struct nfp_shared_buf - NFP shared buffer description
++  * @id:				numerical user-visible id of the shared buffer
++  * @size:			size in bytes of the buffer
++  * @ingress_pools_count:	number of ingress pools
++  * @egress_pools_count:		number of egress pools
++  * @ingress_tc_count:		number of ingress trafic classes
++  * @egress_tc_count:		number of egress trafic classes
++  * @pool_size_unit:		pool size may be in credits, each credit is
++  *				@pool_size_unit bytes
++  */
++ struct nfp_shared_buf {
++ 	__le32 id;
++ 	__le32 size;
++ 	__le16 ingress_pools_count;
++ 	__le16 egress_pools_count;
++ 	__le16 ingress_tc_count;
++ 	__le16 egress_tc_count;
++ 
++ 	__le32 pool_size_unit;
++ };
++ 
++ /**
++  * struct nfp_shared_buf_pool_id - shared buffer pool identification
++  * @shared_buf:		shared buffer id
++  * @pool:		pool index
++  */
++ struct nfp_shared_buf_pool_id {
++ 	__le32 shared_buf;
++ 	__le32 pool;
++ };
++ 
++ /**
++  * struct nfp_shared_buf_pool_info_get - struct devlink_sb_pool_info mirror
++  * @pool_type:		one of enum devlink_sb_pool_type
++  * @size:		pool size in units of SB's @pool_size_unit
++  * @threshold_type:	one of enum devlink_sb_threshold_type
++  */
++ struct nfp_shared_buf_pool_info_get {
++ 	__le32 pool_type;
++ 	__le32 size;
++ 	__le32 threshold_type;
++ };
++ 
++ /**
++  * struct nfp_shared_buf_pool_info_set - packed args of sb_pool_set
++  * @id:			pool identification info
++  * @size:		pool size in units of SB's @pool_size_unit
++  * @threshold_type:	one of enum devlink_sb_threshold_type
++  */
++ struct nfp_shared_buf_pool_info_set {
++ 	struct nfp_shared_buf_pool_id id;
++ 	__le32 size;
++ 	__le32 threshold_type;
+++>>>>>>> 055ee0d69887 (nfp: abm: enable advanced queuing on demand)
+  };
+  
+  #endif
+diff --git a/drivers/net/ethernet/netronome/nfp/abm/ctrl.c b/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+index e40f6f06417b..676d3afc9bdd 100644
+--- a/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
++++ b/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+@@ -36,10 +36,23 @@
+ 
+ #include "../nfpcore/nfp_cpp.h"
+ #include "../nfp_app.h"
++#include "../nfp_abi.h"
+ #include "../nfp_main.h"
+ #include "../nfp_net.h"
+ #include "main.h"
+ 
++int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm)
++{
++	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_ENABLE,
++			    NULL, 0, NULL, 0);
++}
++
++int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm)
++{
++	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_DISABLE,
++			    NULL, 0, NULL, 0);
++}
++
+ void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink)
+ {
+ 	alink->queue_base = nn_readl(alink->vnic, NFP_NET_CFG_START_RXQ);
+diff --git a/drivers/net/ethernet/netronome/nfp/abm/main.c b/drivers/net/ethernet/netronome/nfp/abm/main.c
+index 5a12bb20bced..28a18ac62040 100644
+--- a/drivers/net/ethernet/netronome/nfp/abm/main.c
++++ b/drivers/net/ethernet/netronome/nfp/abm/main.c
+@@ -182,6 +182,7 @@ static enum devlink_eswitch_mode nfp_abm_eswitch_mode_get(struct nfp_app *app)
+ static int nfp_abm_eswitch_set_legacy(struct nfp_abm *abm)
+ {
+ 	nfp_abm_kill_reprs_all(abm);
++	nfp_abm_ctrl_qm_disable(abm);
+ 
+ 	abm->eswitch_mode = DEVLINK_ESWITCH_MODE_LEGACY;
+ 	return 0;
+@@ -200,6 +201,10 @@ static int nfp_abm_eswitch_set_switchdev(struct nfp_abm *abm)
+ 	struct nfp_net *nn;
+ 	int err;
+ 
++	err = nfp_abm_ctrl_qm_enable(abm);
++	if (err)
++		return err;
++
+ 	list_for_each_entry(nn, &pf->vnics, vnic_list) {
+ 		struct nfp_abm_link *alink = nn->app_priv;
+ 
+@@ -217,6 +222,7 @@ static int nfp_abm_eswitch_set_switchdev(struct nfp_abm *abm)
+ 
+ err_kill_all_reprs:
+ 	nfp_abm_kill_reprs_all(abm);
++	nfp_abm_ctrl_qm_disable(abm);
+ 	return err;
+ }
+ 
+@@ -350,6 +356,11 @@ static int nfp_abm_init(struct nfp_app *app)
+ 	if (err)
+ 		goto err_free_abm;
+ 
++	/* We start in legacy mode, make sure advanced queuing is disabled */
++	err = nfp_abm_ctrl_qm_disable(abm);
++	if (err)
++		goto err_free_abm;
++
+ 	err = -ENOMEM;
+ 	reprs = nfp_reprs_alloc(pf->max_data_vnics);
+ 	if (!reprs)
+diff --git a/drivers/net/ethernet/netronome/nfp/abm/main.h b/drivers/net/ethernet/netronome/nfp/abm/main.h
+index 5938b69b8a84..7d129b205535 100644
+--- a/drivers/net/ethernet/netronome/nfp/abm/main.h
++++ b/drivers/net/ethernet/netronome/nfp/abm/main.h
+@@ -72,4 +72,6 @@ struct nfp_abm_link {
+ 
+ void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink);
+ int nfp_abm_ctrl_find_addrs(struct nfp_abm *abm);
++int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm);
++int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm);
+ #endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_abi.h
