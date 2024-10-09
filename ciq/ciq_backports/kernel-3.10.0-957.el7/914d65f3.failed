@@ -1,0 +1,187 @@
+watchdog: Fix kref imbalance seen if handle_boot_enabled=0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] Fix kref imbalance seen if handle_boot_enabled=0 (David Arcari) [1576173]
+Rebuild_FUZZ: 90.57%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit 914d65f3f013ba2556c7beec5d3baac7b3292504
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/914d65f3.failed
+
+If handle_boot_enabled is set to 0, the watchdog driver module use
+counter will not be increased and kref_get() will not be called when
+registering the watchdog. Subsequently, on open, this does not happen
+either because the code believes that it was already done because the
+hardware watchdog is marked as running.
+
+We could introduce a state variable to indicate this state, but let's
+just increase the module use counter and call kref_get() unconditionally
+if the hardware watchdog is running when a driver is registering itself
+to keep the code simple.
+
+Fixes: 2501b015313fe ("watchdog: core: add option to avoid early ...")
+	Cc: Sebastian Reichel <sebastian.reichel@collabora.co.uk>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Wim Van Sebroeck <wim@iguana.be>
+(cherry picked from commit 914d65f3f013ba2556c7beec5d3baac7b3292504)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/watchdog/watchdog_dev.c
+diff --cc drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2,95b96f3cb36f..000000000000
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@@ -628,6 -898,146 +628,149 @@@ static struct miscdevice watchdog_miscd
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *	watchdog_cdev_register: register watchdog character device
++  *	@wdd: watchdog device
++  *	@devno: character device number
++  *
++  *	Register a watchdog character device including handling the legacy
++  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++  *	thus we set it up like that.
++  */
++ 
++ static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
++ {
++ 	struct watchdog_core_data *wd_data;
++ 	int err;
++ 
++ 	wd_data = kzalloc(sizeof(struct watchdog_core_data), GFP_KERNEL);
++ 	if (!wd_data)
++ 		return -ENOMEM;
++ 	kref_init(&wd_data->kref);
++ 	mutex_init(&wd_data->lock);
++ 
++ 	wd_data->wdd = wdd;
++ 	wdd->wd_data = wd_data;
++ 
++ 	if (!watchdog_wq)
++ 		return -ENODEV;
++ 
++ 	INIT_DELAYED_WORK(&wd_data->work, watchdog_ping_work);
++ 
++ 	if (wdd->id == 0) {
++ 		old_wd_data = wd_data;
++ 		watchdog_miscdev.parent = wdd->parent;
++ 		err = misc_register(&watchdog_miscdev);
++ 		if (err != 0) {
++ 			pr_err("%s: cannot register miscdev on minor=%d (err=%d).\n",
++ 				wdd->info->identity, WATCHDOG_MINOR, err);
++ 			if (err == -EBUSY)
++ 				pr_err("%s: a legacy watchdog module is probably present.\n",
++ 					wdd->info->identity);
++ 			old_wd_data = NULL;
++ 			kfree(wd_data);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	/* Fill in the data structures */
++ 	cdev_init(&wd_data->cdev, &watchdog_fops);
++ 	wd_data->cdev.owner = wdd->ops->owner;
++ 
++ 	/* Add the device */
++ 	err = cdev_add(&wd_data->cdev, devno, 1);
++ 	if (err) {
++ 		pr_err("watchdog%d unable to add device %d:%d\n",
++ 			wdd->id,  MAJOR(watchdog_devt), wdd->id);
++ 		if (wdd->id == 0) {
++ 			misc_deregister(&watchdog_miscdev);
++ 			old_wd_data = NULL;
++ 			kref_put(&wd_data->kref, watchdog_core_data_release);
++ 		}
++ 		return err;
++ 	}
++ 
++ 	/* Record time of most recent heartbeat as 'just before now'. */
++ 	wd_data->last_hw_keepalive = jiffies - 1;
++ 
++ 	/*
++ 	 * If the watchdog is running, prevent its driver from being unloaded,
++ 	 * and schedule an immediate ping.
++ 	 */
++ 	if (watchdog_hw_running(wdd)) {
++ 		__module_get(wdd->ops->owner);
++ 		kref_get(&wd_data->kref);
++ 		if (handle_boot_enabled)
++ 			queue_delayed_work(watchdog_wq, &wd_data->work, 0);
++ 		else
++ 			pr_info("watchdog%d running and kernel based pre-userspace handler disabled\n",
++ 				wdd->id);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  *	watchdog_cdev_unregister: unregister watchdog character device
++  *	@watchdog: watchdog device
++  *
++  *	Unregister watchdog character device and if needed the legacy
++  *	/dev/watchdog device.
++  */
++ 
++ static void watchdog_cdev_unregister(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	cdev_del(&wd_data->cdev);
++ 	if (wdd->id == 0) {
++ 		misc_deregister(&watchdog_miscdev);
++ 		old_wd_data = NULL;
++ 	}
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wd_data->wdd = NULL;
++ 	wdd->wd_data = NULL;
++ 	mutex_unlock(&wd_data->lock);
++ 
++ 	if (watchdog_active(wdd) &&
++ 	    test_bit(WDOG_STOP_ON_UNREGISTER, &wdd->status)) {
++ 		watchdog_stop(wdd);
++ 	}
++ 
++ 	cancel_delayed_work_sync(&wd_data->work);
++ 
++ 	kref_put(&wd_data->kref, watchdog_core_data_release);
++ }
++ 
++ static struct class watchdog_class = {
++ 	.name =		"watchdog",
++ 	.owner =	THIS_MODULE,
++ 	.dev_groups =	wdt_groups,
++ };
++ 
++ static int watchdog_reboot_notifier(struct notifier_block *nb,
++ 				    unsigned long code, void *data)
++ {
++ 	struct watchdog_device *wdd;
++ 
++ 	wdd = container_of(nb, struct watchdog_device, reboot_nb);
++ 	if (code == SYS_DOWN || code == SYS_HALT) {
++ 		if (watchdog_active(wdd)) {
++ 			int ret;
++ 
++ 			ret = wdd->ops->stop(wdd);
++ 			if (ret)
++ 				return NOTIFY_BAD;
++ 		}
++ 	}
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ /*
+++>>>>>>> 914d65f3f013 (watchdog: Fix kref imbalance seen if handle_boot_enabled=0)
+   *	watchdog_dev_register: register a watchdog device
+   *	@wdd: watchdog device
+   *
+* Unmerged path drivers/watchdog/watchdog_dev.c
