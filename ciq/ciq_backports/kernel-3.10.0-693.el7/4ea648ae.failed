@@ -1,0 +1,276 @@
+perf record: Add --tail-synthesize option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 4ea648aec01982d5a57816a95c4665d6081e78f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4ea648ae.failed
+
+When working with overwritable ring buffer there's a inconvenience
+problem: if perf dumps data after a long period after it starts,
+non-sample events may lost, which makes following 'perf report' unable
+to identify proc name and mmap layout. For example:
+
+ # perf record -m 4 -e raw_syscalls:* -g --overwrite --switch-output \
+        dd if=/dev/zero of=/dev/null
+
+send SIGUSR2 after dd runs long enough. The resuling perf.data lost
+correct comm and mmap events:
+
+ # perf script -i perf.data.2016061522374354
+ perf 24478 [004] 2581325.601789:  raw_syscalls:sys_exit: NR 0 = 512
+ ^^^^
+ Should be 'dd'
+                   27b2e8 syscall_slow_exit_work+0xfe2000e3 (/lib/modules/4.6.0-rc3+/build/vmlinux)
+                   203cc7 do_syscall_64+0xfe200117 (/lib/modules/4.6.0-rc3+/build/vmlinux)
+                   b18d83 return_from_SYSCALL_64+0xfe200000 (/lib/modules/4.6.0-rc3+/build/vmlinux)
+             7f47c417edf0 [unknown] ([unknown])
+             ^^^^^^^^^^^^
+             Fail to unwind
+
+This patch provides a '--tail-synthesize' option, allows perf to collect
+system status when finalizing output file. In resuling output file, the
+non-sample events reflect system status when dumping data.
+
+After this patch:
+ # perf record -m 4 -e raw_syscalls:* -g --overwrite --switch-output --tail-synthesize \
+        dd if=/dev/zero of=/dev/null
+
+ # perf script -i perf.data.2016061600544998
+ dd 27364 [004] 2583244.994464: raw_syscalls:sys_enter: NR 1 (1, ...
+ ^^
+ Correct comm
+                   203a18 syscall_trace_enter_phase2+0xfe2001a8 ([kernel.kallsyms])
+                   203aa5 syscall_trace_enter+0xfe200055 ([kernel.kallsyms])
+                   203caa do_syscall_64+0xfe2000fa ([kernel.kallsyms])
+                   b18d83 return_from_SYSCALL_64+0xfe200000 ([kernel.kallsyms])
+                    d8e50 __GI___libc_write+0xffff01d9639f4010 (/tmp/oxygen_root-w00229757/lib64/libc-2.18.so)
+                    ^^^^^
+                    Correct unwind
+
+This option doesn't aim to solve this problem completely. If a process
+terminates before SIGUSR2, we still lost its COMM and MMAP events. For
+example, we can't unwind correctly from the final perf.data we get from
+the previous example, because when perf collects the final output file
+(when we press C-c), 'dd' has been terminated so its '/proc/<pid>/mmap'
+becomes empty.
+
+However, this is a cheaper choice. To completely solve this problem we
+need to continously output non-sample events. To satisify the
+requirement of daemonization, we need to merge them periodically. It is
+possible but requires much more code and cycles.
+
+Automatically select --tail-synthesize when --overwrite is provided.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1468485287-33422-16-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4ea648aec01982d5a57816a95c4665d6081e78f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-record.txt
+#	tools/perf/builtin-record.c
+#	tools/perf/perf.h
+diff --cc tools/perf/Documentation/perf-record.txt
+index 20052ecd742e,69966abf65d1..000000000000
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@@ -328,6 -347,48 +328,51 @@@ Configure all used events to run in ker
+  --all-user::
+  Configure all used events to run in user space.
+  
+++<<<<<<< HEAD
+++=======
++ --timestamp-filename
++ Append timestamp to output file name.
++ 
++ --switch-output::
++ Generate multiple perf.data files, timestamp prefixed, switching to a new one
++ when receiving a SIGUSR2.
++ 
++ A possible use case is to, given an external event, slice the perf.data file
++ that gets then processed, possibly via a perf script, to decide if that
++ particular perf.data snapshot should be kept or not.
++ 
++ Implies --timestamp-filename, --no-buildid and --no-buildid-cache.
++ 
++ --dry-run::
++ Parse options then exit. --dry-run can be used to detect errors in cmdline
++ options.
++ 
++ 'perf record --dry-run -e' can act as a BPF script compiler if llvm.dump-obj
++ in config file is set to true.
++ 
++ --tail-synthesize::
++ Instead of collecting non-sample events (for example, fork, comm, mmap) at
++ the beginning of record, collect them during finalizing an output file.
++ The collected non-sample events reflects the status of the system when
++ record is finished.
++ 
++ --overwrite::
++ Makes all events use an overwritable ring buffer. An overwritable ring
++ buffer works like a flight recorder: when it gets full, the kernel will
++ overwrite the oldest records, that thus will never make it to the
++ perf.data file.
++ 
++ When '--overwrite' and '--switch-output' are used perf records and drops
++ events until it receives a signal, meaning that something unusual was
++ detected that warrants taking a snapshot of the most current events,
++ those fitting in the ring buffer at that moment.
++ 
++ 'overwrite' attribute can also be set or canceled for an event using
++ config terms. For example: 'cycles/overwrite/' and 'instructions/no-overwrite/'.
++ 
++ Implies --tail-synthesize.
++ 
+++>>>>>>> 4ea648aec019 (perf record: Add --tail-synthesize option)
+  SEE ALSO
+  --------
+  linkperf:perf-stat[1], linkperf:perf-list[1]
+diff --cc tools/perf/builtin-record.c
+index 5f9433ee7668,8f2c16d9275f..000000000000
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@@ -628,6 -604,28 +628,31 @@@ record__finish_output(struct record *re
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int record__synthesize_workload(struct record *rec, bool tail)
++ {
++ 	struct {
++ 		struct thread_map map;
++ 		struct thread_map_data map_data;
++ 	} thread_map;
++ 
++ 	if (rec->opts.tail_synthesize != tail)
++ 		return 0;
++ 
++ 	thread_map.map.nr = 1;
++ 	thread_map.map.map[0].pid = rec->evlist->workload.pid;
++ 	thread_map.map.map[0].comm = NULL;
++ 	return perf_event__synthesize_thread_map(&rec->tool, &thread_map.map,
++ 						 process_synthesized_event,
++ 						 &rec->session->machines.host,
++ 						 rec->opts.sample_address,
++ 						 rec->opts.proc_map_timeout);
++ }
++ 
++ static int record__synthesize(struct record *rec, bool tail);
++ 
+++>>>>>>> 4ea648aec019 (perf record: Add --tail-synthesize option)
+  static int
+  record__switch_output(struct record *rec, bool at_exit)
+  {
+@@@ -656,6 -658,23 +685,26 @@@
+  	if (!quiet)
+  		fprintf(stderr, "[ perf record: Dump %s.%s ]\n",
+  			file->path, timestamp);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Output tracking events */
++ 	if (!at_exit) {
++ 		record__synthesize(rec, false);
++ 
++ 		/*
++ 		 * In 'perf record --switch-output' without -a,
++ 		 * record__synthesize() in record__switch_output() won't
++ 		 * generate tracking events because there's no thread_map
++ 		 * in evlist. Which causes newly created perf.data doesn't
++ 		 * contain map and comm information.
++ 		 * Create a fake thread_map and directly call
++ 		 * perf_event__synthesize_thread_map() for those events.
++ 		 */
++ 		if (target__none(&rec->opts.target))
++ 			record__synthesize_workload(rec, false);
++ 	}
+++>>>>>>> 4ea648aec019 (perf record: Add --tail-synthesize option)
+  	return fd;
+  }
+  
+@@@ -1237,6 -1413,9 +1293,12 @@@ struct option __record_options[] = 
+  	OPT_BOOLEAN_SET('i', "no-inherit", &record.opts.no_inherit,
+  			&record.opts.no_inherit_set,
+  			"child tasks do not inherit counters"),
+++<<<<<<< HEAD
+++=======
++ 	OPT_BOOLEAN(0, "tail-synthesize", &record.opts.tail_synthesize,
++ 		    "synthesize non-sample events at the end of output"),
++ 	OPT_BOOLEAN(0, "overwrite", &record.opts.overwrite, "use overwrite mode"),
+++>>>>>>> 4ea648aec019 (perf record: Add --tail-synthesize option)
+  	OPT_UINTEGER('F', "freq", &record.opts.user_freq, "profile at this frequency"),
+  	OPT_CALLBACK('m', "mmap-pages", &record.opts, "pages[,pages]",
+  		     "number of mmap data pages and AUX area tracing mmap pages",
+@@@ -1375,9 -1595,40 +1437,12 @@@ int cmd_record(int argc, const char **a
+  "If some relocation was applied (e.g. kexec) symbols may be misresolved\n"
+  "even with a suitable vmlinux or kallsyms file.\n\n");
+  
+ -	if (rec->no_buildid_cache || rec->no_buildid) {
+ +	if (rec->no_buildid_cache || rec->no_buildid)
+  		disable_buildid_cache();
+ -	} else if (rec->switch_output) {
+ -		/*
+ -		 * In 'perf record --switch-output', disable buildid
+ -		 * generation by default to reduce data file switching
+ -		 * overhead. Still generate buildid if they are required
+ -		 * explicitly using
+ -		 *
+ -		 *  perf record --signal-trigger --no-no-buildid \
+ -		 *              --no-no-buildid-cache
+ -		 *
+ -		 * Following code equals to:
+ -		 *
+ -		 * if ((rec->no_buildid || !rec->no_buildid_set) &&
+ -		 *     (rec->no_buildid_cache || !rec->no_buildid_cache_set))
+ -		 *         disable_buildid_cache();
+ -		 */
+ -		bool disable = true;
+ -
+ -		if (rec->no_buildid_set && !rec->no_buildid)
+ -			disable = false;
+ -		if (rec->no_buildid_cache_set && !rec->no_buildid_cache)
+ -			disable = false;
+ -		if (disable) {
+ -			rec->no_buildid = true;
+ -			rec->no_buildid_cache = true;
+ -			disable_buildid_cache();
+ -		}
+ -	}
+  
++ 	if (record.opts.overwrite)
++ 		record.opts.tail_synthesize = true;
++ 
+  	if (rec->evlist->nr_entries == 0 &&
+  	    perf_evlist__add_default(rec->evlist) < 0) {
+  		pr_err("Not enough memory for event selector list\n");
+diff --cc tools/perf/perf.h
+index 693cda7dcc6f,a7e0f1497244..000000000000
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@@ -60,6 -59,8 +60,11 @@@ struct record_opts 
+  	bool	     record_switch_events;
+  	bool	     all_kernel;
+  	bool	     all_user;
+++<<<<<<< HEAD
+++=======
++ 	bool	     tail_synthesize;
++ 	bool	     overwrite;
+++>>>>>>> 4ea648aec019 (perf record: Add --tail-synthesize option)
+  	unsigned int freq;
+  	unsigned int mmap_pages;
+  	unsigned int auxtrace_mmap_pages;
+* Unmerged path tools/perf/Documentation/perf-record.txt
+* Unmerged path tools/perf/builtin-record.c
+* Unmerged path tools/perf/perf.h
