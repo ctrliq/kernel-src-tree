@@ -1,0 +1,89 @@
+KVM: nVMX: Fix loss of L2's NMI blocking state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wanpeng Li <kernellwp@gmail.com>
+commit 2d6144e366fb39609aecf7a658e2e10af37627e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2d6144e3.failed
+
+Run kvm-unit-tests/eventinj.flat in L1 w/ ept=0 on both L0 and L1:
+
+Before NMI IRET test
+Sending NMI to self
+NMI isr running stack 0x461000
+Sending nested NMI to self
+After nested NMI to self
+Nested NMI isr running rip=40038e
+After iret
+After NMI to self
+FAIL: NMI
+
+Commit 4c4a6f790ee862 (KVM: nVMX: track NMI blocking state separately
+for each VMCS) tracks NMI blocking state separately for vmcs01 and
+vmcs02. However it is not enough:
+
+ - The L2 (kvm-unit-tests/eventinj.flat) generates NMI that will fault
+   on IRET, so the L2 can generate #PF which can be intercepted by L0.
+ - L0 walks L1's guest page table and sees the mapping is invalid, it
+   resumes the L1 guest and injects the #PF into L1.  At this point the
+   vmcs02 has nmi_known_unmasked=true.
+ - L1 sets set bit 3 (blocking by NMI) in the interruptibility-state field
+   of vmcs12 (and fixes the shadow page table) before resuming L2 guest.
+ - L1 executes VMRESUME to resume L2, causing a vmexit to L0
+ - during VMRESUME emulation, prepare_vmcs02 sets bit 3 in the
+   interruptibility-state field of vmcs02, but nmi_known_unmasked is
+   still true.
+ - L2 immediately exits to L0 with another page fault, because L0 still has
+   not updated the NGVA->HPA page tables.  However, nmi_known_unmasked is
+   true so vmx_recover_nmi_blocking does not do anything.
+
+The fix is to update nmi_known_unmasked when preparing vmcs02 from vmcs12.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2d6144e366fb39609aecf7a658e2e10af37627e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 2e8522c4beef,39a6222bf968..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -9599,14 -10033,20 +9599,31 @@@ static int prepare_vmcs02(struct kvm_vc
+  		kvm_set_dr(vcpu, 7, vcpu->arch.dr7);
+  		vmcs_write64(GUEST_IA32_DEBUGCTL, vmx->nested.vmcs01_debugctl);
+  	}
+++<<<<<<< HEAD
+ +	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD,
+ +		vmcs12->vm_entry_intr_info_field);
+ +	vmcs_write32(VM_ENTRY_EXCEPTION_ERROR_CODE,
+ +		vmcs12->vm_entry_exception_error_code);
+ +	vmcs_write32(VM_ENTRY_INSTRUCTION_LEN,
+ +		vmcs12->vm_entry_instruction_len);
+ +	vmcs_write32(GUEST_INTERRUPTIBILITY_INFO,
+ +		vmcs12->guest_interruptibility_info);
+++=======
++ 	if (from_vmentry) {
++ 		vmcs_write32(VM_ENTRY_INTR_INFO_FIELD,
++ 			     vmcs12->vm_entry_intr_info_field);
++ 		vmcs_write32(VM_ENTRY_EXCEPTION_ERROR_CODE,
++ 			     vmcs12->vm_entry_exception_error_code);
++ 		vmcs_write32(VM_ENTRY_INSTRUCTION_LEN,
++ 			     vmcs12->vm_entry_instruction_len);
++ 		vmcs_write32(GUEST_INTERRUPTIBILITY_INFO,
++ 			     vmcs12->guest_interruptibility_info);
++ 		vmx->loaded_vmcs->nmi_known_unmasked =
++ 			!(vmcs12->guest_interruptibility_info & GUEST_INTR_STATE_NMI);
++ 	} else {
++ 		vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, 0);
++ 	}
+++>>>>>>> 2d6144e366fb (KVM: nVMX: Fix loss of L2's NMI blocking state)
+  	vmcs_write32(GUEST_SYSENTER_CS, vmcs12->guest_sysenter_cs);
+  	vmx_set_rflags(vcpu, vmcs12->guest_rflags);
+  	vmcs_writel(GUEST_PENDING_DBG_EXCEPTIONS,
+* Unmerged path arch/x86/kvm/vmx.c
