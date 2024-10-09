@@ -1494,6 +1494,7 @@ struct nfs_renamedata {
 	struct nfs_fattr	new_fattr;
 	void (*complete)(struct rpc_task *, struct nfs_renamedata *);
 	long timeout;
+	bool cancelled;
 };
 
 struct nfs_access_entry;
