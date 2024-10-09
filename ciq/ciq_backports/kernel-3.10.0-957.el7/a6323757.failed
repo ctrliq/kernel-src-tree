@@ -1,0 +1,229 @@
+x86/ldt/64: Refresh DS and ES when modify_ldt changes an entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] ldt/64: Refresh DS and ES when modify_ldt changes an entry (Gopal Tiwari) [1456572]
+Rebuild_FUZZ: 96.67%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit a632375764aa25c97b78beb56c71b0ba59d1cf83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a6323757.failed
+
+On x86_32, modify_ldt() implicitly refreshes the cached DS and ES
+segments because they are refreshed on return to usermode.
+
+On x86_64, they're not refreshed on return to usermode.  To improve
+determinism and match x86_32's behavior, refresh them when we update
+the LDT.
+
+This avoids a situation in which the DS points to a descriptor that is
+changed but the old cached segment persists until the next reschedule.
+If this happens, then the user-visible state will change
+nondeterministically some time after modify_ldt() returns, which is
+unfortunate.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bpetkov@suse.de>
+	Cc: Chang Seok <chang.seok.bae@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit a632375764aa25c97b78beb56c71b0ba59d1cf83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/ldt.c
+diff --cc arch/x86/kernel/ldt.c
+index 6b6d22561e6f,f0e64db18ac8..000000000000
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@@ -21,97 -21,104 +21,131 @@@
+  #include <asm/mmu_context.h>
+  #include <asm/syscalls.h>
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+ +static void flush_ldt(void *current_mm)
+++=======
++ static void refresh_ldt_segments(void)
++ {
++ #ifdef CONFIG_X86_64
++ 	unsigned short sel;
++ 
++ 	/*
++ 	 * Make sure that the cached DS and ES descriptors match the updated
++ 	 * LDT.
++ 	 */
++ 	savesegment(ds, sel);
++ 	if ((sel & SEGMENT_TI_MASK) == SEGMENT_LDT)
++ 		loadsegment(ds, sel);
++ 
++ 	savesegment(es, sel);
++ 	if ((sel & SEGMENT_TI_MASK) == SEGMENT_LDT)
++ 		loadsegment(es, sel);
++ #endif
++ }
++ 
++ /* context.lock is held for us, so we don't need any locking. */
++ static void flush_ldt(void *__mm)
+++>>>>>>> a632375764aa (x86/ldt/64: Refresh DS and ES when modify_ldt changes an entry)
+  {
+ -	struct mm_struct *mm = __mm;
+ -	mm_context_t *pc;
+ +	if (current->active_mm == current_mm)
+ +		load_LDT(&current->active_mm->context);
+ +}
+ +#endif
+  
+++<<<<<<< HEAD
+ +static void free_ldt(void *ldt, int size)
+ +{
+ +	if (size * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +		vfree(ldt);
+ +	else
+ +		put_page(virt_to_page(ldt));
+++=======
++ 	if (this_cpu_read(cpu_tlbstate.loaded_mm) != mm)
++ 		return;
++ 
++ 	pc = &mm->context;
++ 	set_ldt(pc->ldt->entries, pc->ldt->nr_entries);
++ 
++ 	refresh_ldt_segments();
+++>>>>>>> a632375764aa (x86/ldt/64: Refresh DS and ES when modify_ldt changes an entry)
+  }
+  
+ -/* The caller must call finalize_ldt_struct on the result. LDT starts zeroed. */
+ -static struct ldt_struct *alloc_ldt_struct(unsigned int num_entries)
+ +static int alloc_ldt(mm_context_t *pc, int mincount, int reload)
+  {
+ -	struct ldt_struct *new_ldt;
+ -	unsigned int alloc_size;
+ -
+ -	if (num_entries > LDT_ENTRIES)
+ -		return NULL;
+ +	void *oldldt, *newldt;
+ +	int oldsize;
+ +	int ret;
+  
+ -	new_ldt = kmalloc(sizeof(struct ldt_struct), GFP_KERNEL);
+ -	if (!new_ldt)
+ -		return NULL;
+ -
+ -	BUILD_BUG_ON(LDT_ENTRY_SIZE != sizeof(struct desc_struct));
+ -	alloc_size = num_entries * LDT_ENTRY_SIZE;
+ -
+ -	/*
+ -	 * Xen is very picky: it requires a page-aligned LDT that has no
+ -	 * trailing nonzero bytes in any page that contains LDT descriptors.
+ -	 * Keep it simple: zero the whole allocation and never allocate less
+ -	 * than PAGE_SIZE.
+ -	 */
+ -	if (alloc_size > PAGE_SIZE)
+ -		new_ldt->entries = vzalloc(alloc_size);
+ +	if (mincount <= pc->size)
+ +		return 0;
+ +	oldsize = pc->size;
+ +	mincount = (mincount + (PAGE_SIZE / LDT_ENTRY_SIZE - 1)) &
+ +			(~(PAGE_SIZE / LDT_ENTRY_SIZE - 1));
+ +	if (mincount * LDT_ENTRY_SIZE > PAGE_SIZE)
+ +		newldt = vmalloc(mincount * LDT_ENTRY_SIZE);
+  	else
+ -		new_ldt->entries = (void *)get_zeroed_page(GFP_KERNEL);
+ -
+ -	if (!new_ldt->entries) {
+ -		kfree(new_ldt);
+ -		return NULL;
+ +		newldt = (void *)__get_free_page(GFP_KERNEL);
+ +
+ +	if (!newldt)
+ +		return -ENOMEM;
+ +	ret = kaiser_add_mapping((unsigned long)newldt,
+ +				 mincount * LDT_ENTRY_SIZE,
+ +				 __PAGE_KERNEL | _PAGE_GLOBAL);
+ +	if (ret) {
+ +		free_ldt(newldt, mincount);
+ +		return -ENOMEM;
+  	}
+  
+ -	new_ldt->nr_entries = num_entries;
+ -	return new_ldt;
+ -}
+ -
+ -/* After calling this, the LDT is immutable. */
+ -static void finalize_ldt_struct(struct ldt_struct *ldt)
+ -{
+ -	paravirt_alloc_ldt(ldt->entries, ldt->nr_entries);
+ -}
+ +	if (oldsize)
+ +		memcpy(newldt, pc->ldt, oldsize * LDT_ENTRY_SIZE);
+ +	oldldt = pc->ldt;
+ +	memset(newldt + oldsize * LDT_ENTRY_SIZE, 0,
+ +	       (mincount - oldsize) * LDT_ENTRY_SIZE);
+  
+ -/* context.lock is held */
+ -static void install_ldt(struct mm_struct *current_mm,
+ -			struct ldt_struct *ldt)
+ -{
+ -	/* Synchronizes with lockless_dereference in load_mm_ldt. */
+ -	smp_store_release(&current_mm->context.ldt, ldt);
+ +	paravirt_alloc_ldt(newldt, mincount);
+  
+ -	/* Activate the LDT for all CPUs using current_mm. */
+ -	on_each_cpu_mask(mm_cpumask(current_mm), flush_ldt, current_mm, true);
+ +#ifdef CONFIG_X86_64
+ +	/* CHECKME: Do we really need this ? */
+ +	wmb();
+ +#endif
+ +	pc->ldt = newldt;
+ +	wmb();
+ +	pc->size = mincount;
+ +	wmb();
+ +
+ +	if (reload) {
+ +#ifdef CONFIG_SMP
+ +		preempt_disable();
+ +		load_LDT(pc);
+ +		if (!cpumask_equal(mm_cpumask(current->mm),
+ +				   cpumask_of(smp_processor_id())))
+ +			smp_call_function(flush_ldt, current->mm, 1);
+ +		preempt_enable();
+ +#else
+ +		load_LDT(pc);
+ +#endif
+ +	}
+ +	if (oldsize) {
+ +		kaiser_remove_mapping((unsigned long)oldldt,
+ +				      oldsize * LDT_ENTRY_SIZE);
+ +		paravirt_free_ldt(oldldt, oldsize);
+ +		free_ldt(oldldt, oldsize);
+ +	}
+ +	return 0;
+  }
+  
+ -static void free_ldt_struct(struct ldt_struct *ldt)
+ +static inline int copy_ldt(mm_context_t *new, mm_context_t *old)
+  {
+ -	if (likely(!ldt))
+ -		return;
+ +	int err = alloc_ldt(new, old->size, 0);
+ +	int i;
+  
+ -	paravirt_free_ldt(ldt->entries, ldt->nr_entries);
+ -	if (ldt->nr_entries * LDT_ENTRY_SIZE > PAGE_SIZE)
+ -		vfree_atomic(ldt->entries);
+ -	else
+ -		free_page((unsigned long)ldt->entries);
+ -	kfree(ldt);
+ +	if (err < 0)
+ +		return err;
+ +
+ +	for (i = 0; i < old->size; i++)
+ +		write_ldt_entry(new->ldt, i, old->ldt + i * LDT_ENTRY_SIZE);
+ +	return 0;
+  }
+  
+  /*
+* Unmerged path arch/x86/kernel/ldt.c
