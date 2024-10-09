@@ -1,0 +1,203 @@
+bnxt_en: Re-structure doorbells.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Re-structure doorbells (Jonathan Toppins) [1643317]
+Rebuild_FUZZ: 98.41%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 697197e5a1735325c0e1ef85dde2b2986354beb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/697197e5.failed
+
+The 57500 series chips have a new 64-bit doorbell format.  Use a new
+bnxt_db_info structure to unify the new and the old 32-bit doorbells.
+Add a new bnxt_set_db() function to set up the doorbell addreses and
+doorbell keys ahead of time.  Modify and introduce new doorbell
+helpers to help abstract and unify the old and new doorbells.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 697197e5a1735325c0e1ef85dde2b2986354beb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 52a028500477,56439a44bd21..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -2002,16 -2035,15 +2031,20 @@@ static int bnxt_poll_nitroa0(struct nap
+  	}
+  
+  	cpr->cp_raw_cons = raw_cons;
+- 	BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
+- 	bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rxr->rx_prod);
++ 	BNXT_DB_CQ(&cpr->cp_db, cpr->cp_raw_cons);
++ 	bnxt_db_write(bp, &rxr->rx_db, rxr->rx_prod);
+  
+  	if (event & BNXT_AGG_EVENT)
+- 		bnxt_db_write(bp, rxr->rx_agg_doorbell,
+- 			      DB_KEY_RX | rxr->rx_agg_prod);
++ 		bnxt_db_write(bp, &rxr->rx_agg_db, rxr->rx_agg_prod);
+  
+  	if (!bnxt_has_work(bp, cpr) && rx_pkts < budget) {
+++<<<<<<< HEAD
+ +		napi_complete(napi);
+ +		BNXT_CP_DB_REARM(cpr->cp_doorbell, cpr->cp_raw_cons);
+++=======
++ 		napi_complete_done(napi, rx_pkts);
++ 		BNXT_DB_CQ_ARM(&cpr->cp_db, cpr->cp_raw_cons);
+++>>>>>>> 697197e5a173 (bnxt_en: Re-structure doorbells.)
+  	}
+  	return rx_pkts;
+  }
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index c4ff3d66cbe2..25d592d0f304 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -649,12 +649,20 @@ struct tx_push_buffer {
+ 	u32			data[25];
+ };
+ 
++struct bnxt_db_info {
++	void __iomem		*doorbell;
++	union {
++		u64		db_key64;
++		u32		db_key32;
++	};
++};
++
+ struct bnxt_tx_ring_info {
+ 	struct bnxt_napi	*bnapi;
+ 	u16			tx_prod;
+ 	u16			tx_cons;
+ 	u16			txq_index;
+-	void __iomem		*tx_doorbell;
++	struct bnxt_db_info	tx_db;
+ 
+ 	struct tx_bd		*tx_desc_ring[MAX_TX_PAGES];
+ 	struct bnxt_sw_tx_bd	*tx_buf_ring;
+@@ -751,8 +759,8 @@ struct bnxt_rx_ring_info {
+ 	u16			rx_agg_prod;
+ 	u16			rx_sw_agg_prod;
+ 	u16			rx_next_cons;
+-	void __iomem		*rx_doorbell;
+-	void __iomem		*rx_agg_doorbell;
++	struct bnxt_db_info	rx_db;
++	struct bnxt_db_info	rx_agg_db;
+ 
+ 	struct bpf_prog		*xdp_prog;
+ 
+@@ -780,7 +788,7 @@ struct bnxt_rx_ring_info {
+ 
+ struct bnxt_cp_ring_info {
+ 	u32			cp_raw_cons;
+-	void __iomem		*cp_doorbell;
++	struct bnxt_db_info	cp_db;
+ 
+ 	struct bnxt_coal	rx_ring_coal;
+ 	u64			rx_packets;
+@@ -836,6 +844,7 @@ struct bnxt_irq {
+ #define HWRM_RING_ALLOC_RX	0x2
+ #define HWRM_RING_ALLOC_AGG	0x4
+ #define HWRM_RING_ALLOC_CMPL	0x8
++#define HWRM_RING_ALLOC_NQ	0x10
+ 
+ #define INVALID_STATS_CTX_ID	-1
+ 
+@@ -1523,6 +1532,11 @@ struct bnxt {
+ 	struct mutex		sriov_lock;
+ #endif
+ 
++#if BITS_PER_LONG == 32
++	/* ensure atomic 64-bit doorbell writes on 32-bit systems. */
++	spinlock_t		db_lock;
++#endif
++
+ #define BNXT_NTP_FLTR_MAX_FLTR	4096
+ #define BNXT_NTP_FLTR_HASH_SIZE	512
+ #define BNXT_NTP_FLTR_HASH_MASK	(BNXT_NTP_FLTR_HASH_SIZE - 1)
+@@ -1595,21 +1609,46 @@ static inline u32 bnxt_tx_avail(struct bnxt *bp, struct bnxt_tx_ring_info *txr)
+ 		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
+ }
+ 
++#if BITS_PER_LONG == 32
++#define writeq(val64, db)			\
++do {						\
++	spin_lock(&bp->db_lock);		\
++	writel((val64) & 0xffffffff, db);	\
++	writel((val64) >> 32, (db) + 4);	\
++	spin_unlock(&bp->db_lock);		\
++} while (0)
++
++#define writeq_relaxed writeq
++#endif
++
+ /* For TX and RX ring doorbells with no ordering guarantee*/
+-static inline void bnxt_db_write_relaxed(struct bnxt *bp, void __iomem *db,
+-					 u32 val)
++static inline void bnxt_db_write_relaxed(struct bnxt *bp,
++					 struct bnxt_db_info *db, u32 idx)
+ {
+-	writel_relaxed(val, db);
+-	if (bp->flags & BNXT_FLAG_DOUBLE_DB)
+-		writel_relaxed(val, db);
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		writeq_relaxed(db->db_key64 | idx, db->doorbell);
++	} else {
++		u32 db_val = db->db_key32 | idx;
++
++		writel_relaxed(db_val, db->doorbell);
++		if (bp->flags & BNXT_FLAG_DOUBLE_DB)
++			writel_relaxed(db_val, db->doorbell);
++	}
+ }
+ 
+ /* For TX and RX ring doorbells */
+-static inline void bnxt_db_write(struct bnxt *bp, void __iomem *db, u32 val)
++static inline void bnxt_db_write(struct bnxt *bp, struct bnxt_db_info *db,
++				 u32 idx)
+ {
+-	writel(val, db);
+-	if (bp->flags & BNXT_FLAG_DOUBLE_DB)
+-		writel(val, db);
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		writeq(db->db_key64 | idx, db->doorbell);
++	} else {
++		u32 db_val = db->db_key32 | idx;
++
++		writel(db_val, db->doorbell);
++		if (bp->flags & BNXT_FLAG_DOUBLE_DB)
++			writel(db_val, db->doorbell);
++	}
+ }
+ 
+ extern const u16 bnxt_lhint_arr[];
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index 0ab34a9b01d4..4e2c3df7cb6a 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2599,7 +2599,7 @@ static int bnxt_run_loopback(struct bnxt *bp)
+ 	/* Sync BD data before updating doorbell */
+ 	wmb();
+ 
+-	bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | txr->tx_prod);
++	bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
+ 	rc = bnxt_poll_loopback(bp, pkt_size);
+ 
+ 	dma_unmap_single(&bp->pdev->dev, map, pkt_size, PCI_DMA_TODEVICE);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index f128b13244c8..590ba440e159 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -65,7 +65,7 @@ void bnxt_tx_int_xdp(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
+ 		tx_buf = &txr->tx_buf_ring[last_tx_cons];
+ 		rx_prod = tx_buf->rx_prod;
+ 	}
+-	bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rx_prod);
++	bnxt_db_write(bp, &rxr->rx_db, rx_prod);
+ }
+ 
+ /* returns the following:
