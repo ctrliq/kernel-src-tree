@@ -1,0 +1,298 @@
+ovl: allow redirect_dir to default to "on"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 688ea0e5a0e2278e2fcd0014324ab1ba68e70ad7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/688ea0e5.failed
+
+This patch introduces a kernel config option and a module param.  Both can
+be used independently to turn the default value of redirect_dir on or off.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 688ea0e5a0e2278e2fcd0014324ab1ba68e70ad7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/super.c
+index 32484e92dfd8,2750aef24d16..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -49,244 -26,12 +49,251 @@@ struct ovl_fs 
+  
+  struct ovl_dir_cache;
+  
+ +/* private information held for every overlayfs dentry */
+ +struct ovl_entry {
+ +	struct dentry *__upperdentry;
+ +	struct ovl_dir_cache *cache;
+ +	union {
+ +		struct {
+ +			u64 version;
+ +			bool opaque;
+ +		};
+ +		struct rcu_head rcu;
+ +	};
+ +	unsigned numlower;
+ +	struct path lowerstack[];
+ +};
+ +
+  #define OVL_MAX_STACK 500
+  
+++<<<<<<< HEAD
+ +static struct dentry *__ovl_dentry_lower(struct ovl_entry *oe)
+ +{
+ +	return oe->numlower ? oe->lowerstack[0].dentry : NULL;
+ +}
+ +
+ +enum ovl_path_type ovl_path_type(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	enum ovl_path_type type = 0;
+ +
+ +	if (oe->__upperdentry) {
+ +		type = __OVL_PATH_UPPER;
+ +
+ +		/*
+ +		 * Non-dir dentry can hold lower dentry from previous
+ +		 * location.
+ +		 */
+ +		if (oe->numlower && d_is_dir(dentry))
+ +			type |= __OVL_PATH_MERGE;
+ +	} else {
+ +		if (oe->numlower > 1)
+ +			type |= __OVL_PATH_MERGE;
+ +	}
+ +	return type;
+ +}
+ +
+ +static struct dentry *ovl_upperdentry_dereference(struct ovl_entry *oe)
+ +{
+ +	return lockless_dereference(oe->__upperdentry);
+ +}
+ +
+ +void ovl_path_upper(struct dentry *dentry, struct path *path)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	path->mnt = ofs->upper_mnt;
+ +	path->dentry = ovl_upperdentry_dereference(oe);
+ +}
+ +
+ +enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path)
+ +{
+ +	enum ovl_path_type type = ovl_path_type(dentry);
+ +
+ +	if (!OVL_TYPE_UPPER(type))
+ +		ovl_path_lower(dentry, path);
+ +	else
+ +		ovl_path_upper(dentry, path);
+ +
+ +	return type;
+ +}
+ +
+ +struct dentry *ovl_dentry_upper(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return ovl_upperdentry_dereference(oe);
+ +}
+ +
+ +struct dentry *ovl_dentry_lower(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return __ovl_dentry_lower(oe);
+ +}
+ +
+ +struct dentry *ovl_dentry_real(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	struct dentry *realdentry;
+ +
+ +	realdentry = ovl_upperdentry_dereference(oe);
+ +	if (!realdentry)
+ +		realdentry = __ovl_dentry_lower(oe);
+ +
+ +	return realdentry;
+ +}
+ +
+ +static void ovl_inode_init(struct inode *inode, struct inode *realinode,
+ +			   bool is_upper)
+ +{
+ +	WRITE_ONCE(inode->i_private, (void *) ((unsigned long) realinode |
+ +		   (is_upper ? OVL_ISUPPER_MASK : 0)));
+ +}
+ +
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper)
+ +{
+ +	if (is_upper) {
+ +		struct ovl_fs *ofs = inode->i_sb->s_fs_info;
+ +
+ +		return ofs->upper_mnt;
+ +	} else {
+ +		return oe->numlower ? oe->lowerstack[0].mnt : NULL;
+ +	}
+ +}
+ +
+ +struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return oe->cache;
+ +}
+ +
+ +void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	oe->cache = cache;
+ +}
+ +
+ +void ovl_path_lower(struct dentry *dentry, struct path *path)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	*path = oe->numlower ? oe->lowerstack[0] : (struct path) { NULL, NULL };
+ +}
+ +
+ +int ovl_want_write(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	return mnt_want_write(ofs->upper_mnt);
+ +}
+ +
+ +void ovl_drop_write(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	mnt_drop_write(ofs->upper_mnt);
+ +}
+ +
+ +struct dentry *ovl_workdir(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	return ofs->workdir;
+ +}
+ +
+ +bool ovl_dentry_is_opaque(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	return oe->opaque;
+ +}
+ +
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry)
+ +{
+ +	return !dentry->d_inode && ovl_dentry_is_opaque(dentry);
+ +}
+ +
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	oe->opaque = opaque;
+ +}
+ +
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&upperdentry->d_parent->d_inode->i_mutex));
+ +	WARN_ON(oe->__upperdentry);
+ +	/*
+ +	 * Make sure upperdentry is consistent before making it visible to
+ +	 * ovl_upperdentry_dereference().
+ +	 */
+ +	smp_wmb();
+ +	oe->__upperdentry = upperdentry;
+ +}
+ +
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode)
+ +{
+ +	WARN_ON(!upperinode);
+ +	WARN_ON(!inode_unhashed(inode));
+ +	WRITE_ONCE(inode->i_private,
+ +		   (void *) ((unsigned long) upperinode | OVL_ISUPPER_MASK));
+ +	if (!S_ISDIR(upperinode->i_mode))
+ +		__insert_inode_hash(inode, (unsigned long) upperinode);
+ +}
+ +
+ +void ovl_dentry_version_inc(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+ +	oe->version++;
+ +}
+ +
+ +u64 ovl_dentry_version_get(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+ +	return oe->version;
+ +}
+ +
+ +bool ovl_is_whiteout(struct dentry *dentry)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +
+ +	return inode && IS_WHITEOUT(inode);
+ +}
+ +
+ +const struct cred *ovl_override_creds(struct super_block *sb)
+ +{
+ +	struct ovl_fs *ofs = sb->s_fs_info;
+ +
+ +	return override_creds(ofs->creator_cred);
+ +}
+ +
+ +static bool ovl_is_opaquedir(struct dentry *dentry)
+ +{
+ +	int res;
+ +	char val;
+ +
+ +	if (!d_is_dir(dentry))
+ +		return false;
+ +
+ +	res = vfs_getxattr(dentry, OVL_XATTR_OPAQUE, &val, 1);
+ +	if (res == 1 && val == 'y')
+ +		return true;
+ +
+ +	return false;
+ +}
+++=======
++ static bool ovl_redirect_dir_def = IS_ENABLED(CONFIG_OVERLAY_FS_REDIRECT_DIR);
++ module_param_named(redirect_dir, ovl_redirect_dir_def, bool, 0644);
++ MODULE_PARM_DESC(ovl_redirect_dir_def,
++ 		 "Default to on or off for the redirect_dir feature");
+++>>>>>>> 688ea0e5a0e2 (ovl: allow redirect_dir to default to "on")
+  
+  static void ovl_dentry_release(struct dentry *dentry)
+  {
+diff --git a/fs/overlayfs/Kconfig b/fs/overlayfs/Kconfig
+index 34355818a2e0..0daac5112f7a 100644
+--- a/fs/overlayfs/Kconfig
++++ b/fs/overlayfs/Kconfig
+@@ -8,3 +8,17 @@ config OVERLAY_FS
+ 	  merged with the 'upper' object.
+ 
+ 	  For more information see Documentation/filesystems/overlayfs.txt
++
++config OVERLAY_FS_REDIRECT_DIR
++	bool "Overlayfs: turn on redirect dir feature by default"
++	depends on OVERLAY_FS
++	help
++	  If this config option is enabled then overlay filesystems will use
++	  redirects when renaming directories by default.  In this case it is
++	  still possible to turn off redirects globally with the
++	  "redirect_dir=off" module option or on a filesystem instance basis
++	  with the "redirect_dir=off" mount option.
++
++	  Note, that redirects are not backward compatible.  That is, mounting
++	  an overlay which has redirects on a kernel that doesn't support this
++	  feature will have unexpected results.
+* Unmerged path fs/overlayfs/super.c
