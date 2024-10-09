@@ -1,0 +1,587 @@
+GSO: Support partial segmentation offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 802ab55adc39a06940a1b384e9fd0387fc762d7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/802ab55a.failed
+
+This patch adds support for something I am referring to as GSO partial.
+The basic idea is that we can support a broader range of devices for
+segmentation if we use fixed outer headers and have the hardware only
+really deal with segmenting the inner header.  The idea behind the naming
+is due to the fact that everything before csum_start will be fixed headers,
+and everything after will be the region that is handled by hardware.
+
+With the current implementation it allows us to add support for the
+following GSO types with an inner TSO_MANGLEID or TSO6 offload:
+NETIF_F_GSO_GRE
+NETIF_F_GSO_GRE_CSUM
+NETIF_F_GSO_IPIP
+NETIF_F_GSO_SIT
+NETIF_F_UDP_TUNNEL
+NETIF_F_UDP_TUNNEL_CSUM
+
+In the case of hardware that already supports tunneling we may be able to
+extend this further to support TSO_TCPV4 without TSO_MANGLEID if the
+hardware can support updating inner IPv4 headers.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 802ab55adc39a06940a1b384e9fd0387fc762d7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdev_features.h
+#	include/linux/netdevice.h
+#	include/linux/skbuff.h
+#	net/core/dev.c
+#	net/core/ethtool.c
+#	net/core/skbuff.c
+#	net/ipv4/af_inet.c
+#	net/ipv4/gre_offload.c
+#	net/ipv6/ip6_offload.c
+diff --cc include/linux/netdev_features.h
+index 733a4fde7215,9fc79df0e561..000000000000
+--- a/include/linux/netdev_features.h
++++ b/include/linux/netdev_features.h
+@@@ -45,9 -46,15 +45,18 @@@ enum 
+  	NETIF_F_GSO_IPIP_BIT,		/* ... IPIP tunnel with TSO */
+  	NETIF_F_GSO_SIT_BIT,		/* ... SIT tunnel with TSO */
+  	NETIF_F_GSO_UDP_TUNNEL_BIT,	/* ... UDP TUNNEL with TSO */
+++<<<<<<< HEAD
+ +	NETIF_F_GSO_MPLS_BIT,		/* ... MPLS segmentation */
+++=======
++ 	NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT,/* ... UDP TUNNEL with TSO & CSUM */
++ 	NETIF_F_GSO_PARTIAL_BIT,	/* ... Only segment inner-most L4
++ 					 *     in hardware and all other
++ 					 *     headers in software.
++ 					 */
++ 	NETIF_F_GSO_TUNNEL_REMCSUM_BIT, /* ... TUNNEL with TSO & REMCSUM */
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  	/**/NETIF_F_GSO_LAST =		/* last bit, see GSO_MASK */
+ -		NETIF_F_GSO_TUNNEL_REMCSUM_BIT,
+ +		NETIF_F_GSO_MPLS_BIT,
+  
+  	NETIF_F_FCOE_CRC_BIT,		/* FCoE CRC32 */
+  	NETIF_F_SCTP_CRC_BIT,		/* SCTP checksum offload */
+@@@ -144,9 -125,9 +153,14 @@@
+  #define NETIF_F_GSO_SIT		__NETIF_F(GSO_SIT)
+  #define NETIF_F_GSO_UDP_TUNNEL	__NETIF_F(GSO_UDP_TUNNEL)
+  #define NETIF_F_GSO_UDP_TUNNEL_CSUM __NETIF_F(GSO_UDP_TUNNEL_CSUM)
+++<<<<<<< HEAD
+ +#define NETIF_F_GSO_MPLS	__NETIF_F(GSO_MPLS)
+++=======
++ #define NETIF_F_TSO_MANGLEID	__NETIF_F(TSO_MANGLEID)
++ #define NETIF_F_GSO_PARTIAL	 __NETIF_F(GSO_PARTIAL)
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  #define NETIF_F_GSO_TUNNEL_REMCSUM __NETIF_F(GSO_TUNNEL_REMCSUM)
+ +#define NETIF_F_GSO_SCTP	__NETIF_F(GSO_SCTP)
+  #define NETIF_F_HW_VLAN_STAG_FILTER __NETIF_F(HW_VLAN_STAG_FILTER)
+  #define NETIF_F_HW_VLAN_STAG_RX	__NETIF_F(HW_VLAN_STAG_RX)
+  #define NETIF_F_HW_VLAN_STAG_TX	__NETIF_F(HW_VLAN_STAG_TX)
+diff --cc include/linux/netdevice.h
+index 0c457a76a538,a3bb534576a3..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1492,69 -1634,68 +1492,70 @@@ struct net_device 
+  	struct list_head	dev_list;
+  	struct list_head	napi_list;
+  	struct list_head	unreg_list;
+ -	struct list_head	close_list;
+ -	struct list_head	ptype_all;
+ -	struct list_head	ptype_specific;
+ +	struct list_head	upper_dev_list; /* List of upper devices */
+  
+ -	struct {
+ -		struct list_head upper;
+ -		struct list_head lower;
+ -	} adj_list;
+ -
+ -	struct {
+ -		struct list_head upper;
+ -		struct list_head lower;
+ -	} all_adj_list;
+  
+ +	/* currently active device features */
+  	netdev_features_t	features;
+ +	/* user-changeable features */
+  	netdev_features_t	hw_features;
+ +	/* user-requested features */
+  	netdev_features_t	wanted_features;
+ +	/* mask of features inheritable by VLAN devices */
+  	netdev_features_t	vlan_features;
+ +	/* mask of features inherited by encapsulating devices
+ +	 * This field indicates what encapsulation offloads
+ +	 * the hardware is capable of doing, and drivers will
+ +	 * need to set them appropriately.
+ +	 */
+  	netdev_features_t	hw_enc_features;
+ +	/* mask of fetures inheritable by MPLS */
+  	netdev_features_t	mpls_features;
++ 	netdev_features_t	gso_partial_features;
+  
+ +	/* Interface index. Unique device identifier	*/
+  	int			ifindex;
+ -	int			group;
+ +	int			iflink;
+  
+  	struct net_device_stats	stats;
+ -
+ -	atomic_long_t		rx_dropped;
+ -	atomic_long_t		tx_dropped;
+ -	atomic_long_t		rx_nohandler;
+ +	atomic_long_t		rx_dropped; /* dropped packets by core network
+ +					     * Do not use this in drivers.
+ +					     */
+  
+  #ifdef CONFIG_WIRELESS_EXT
+ -	const struct iw_handler_def *wireless_handlers;
+ -	struct iw_public_data	*wireless_data;
+ +	/* List of functions to handle Wireless Extensions (instead of ioctl).
+ +	 * See <net/iw_handler.h> for details. Jean II */
+ +	const struct iw_handler_def *	wireless_handlers;
+ +	/* Instance data managed by the core of Wireless Extensions. */
+ +	struct iw_public_data *	wireless_data;
+  #endif
+ +	/* Management operations */
+  	const struct net_device_ops *netdev_ops;
+  	const struct ethtool_ops *ethtool_ops;
+ -#ifdef CONFIG_NET_SWITCHDEV
+ -	const struct switchdev_ops *switchdev_ops;
+ -#endif
+ -#ifdef CONFIG_NET_L3_MASTER_DEV
+ -	const struct l3mdev_ops	*l3mdev_ops;
+ -#endif
+  
+ +	/* Hardware header description */
+  	const struct header_ops *header_ops;
+  
+ -	unsigned int		flags;
+ -	unsigned int		priv_flags;
+ -
+ +	unsigned int		flags;	/* interface flags (a la BSD)	*/
+ +	unsigned int		priv_flags; /* Like 'flags' but invisible to userspace.
+ +					     * See if.h for definitions. */
+  	unsigned short		gflags;
+ -	unsigned short		padded;
+ +	unsigned short		padded;	/* How much padding added by alloc_netdev() */
+  
+ -	unsigned char		operstate;
+ -	unsigned char		link_mode;
+ +	unsigned char		operstate; /* RFC2863 operstate */
+ +	unsigned char		link_mode; /* mapping policy to operstate */
+  
+ -	unsigned char		if_port;
+ -	unsigned char		dma;
+ +	unsigned char		if_port;	/* Selectable AUI, TP,..*/
+ +	unsigned char		dma;		/* DMA channel		*/
+  
+ -	unsigned int		mtu;
+ -	unsigned short		type;
+ -	unsigned short		hard_header_len;
+ +	unsigned int		mtu;	/* interface MTU value		*/
+ +	unsigned short		type;	/* interface hardware type	*/
+ +	unsigned short		hard_header_len;	/* hardware hdr length	*/
+  
+ +	/* extra head- and tailroom the hardware may need, but not in all cases
+ +	 * can this be guaranteed, especially tailroom. Some cases also use
+ +	 * LL_MAX_HEADER instead to allocate the skb.
+ +	 */
+  	unsigned short		needed_headroom;
+  	unsigned short		needed_tailroom;
+  
+@@@ -3897,13 -4003,10 +3898,19 @@@ static inline bool net_gso_ok(netdev_fe
+  	BUILD_BUG_ON(SKB_GSO_IPIP    != (NETIF_F_GSO_IPIP >> NETIF_F_GSO_SHIFT));
+  	BUILD_BUG_ON(SKB_GSO_SIT     != (NETIF_F_GSO_SIT >> NETIF_F_GSO_SHIFT));
+  	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL != (NETIF_F_GSO_UDP_TUNNEL >> NETIF_F_GSO_SHIFT));
+++<<<<<<< HEAD
+ +	BUILD_BUG_ON(SKB_GSO_MPLS    != (NETIF_F_GSO_MPLS >> NETIF_F_GSO_SHIFT));
+ +
+ +	/* GSO2 flags, see netdev_features.h */
+ +	BUILD_BUG_ON(SKB_GSO_GRE_CSUM != (NETIF_F_GSO_GRE_CSUM >> NETIF_F_GSO2_SHIFT));
+ +	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO2_SHIFT));
+ +	BUILD_BUG_ON(SKB_GSO_TUNNEL_REMCSUM != (NETIF_F_GSO_TUNNEL_REMCSUM >> NETIF_F_GSO2_SHIFT));
+ +	BUILD_BUG_ON(SKB_GSO_SCTP    != (NETIF_F_GSO_SCTP >> NETIF_F_GSO2_SHIFT));
+++=======
++ 	BUILD_BUG_ON(SKB_GSO_UDP_TUNNEL_CSUM != (NETIF_F_GSO_UDP_TUNNEL_CSUM >> NETIF_F_GSO_SHIFT));
++ 	BUILD_BUG_ON(SKB_GSO_PARTIAL != (NETIF_F_GSO_PARTIAL >> NETIF_F_GSO_SHIFT));
++ 	BUILD_BUG_ON(SKB_GSO_TUNNEL_REMCSUM != (NETIF_F_GSO_TUNNEL_REMCSUM >> NETIF_F_GSO_SHIFT));
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  
+  	return (features & feature) == feature;
+  }
+diff --cc include/linux/skbuff.h
+index 49c3fe129351,da0ace389fec..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -431,16 -483,11 +431,22 @@@ enum 
+  
+  	SKB_GSO_UDP_TUNNEL_CSUM = 1 << 12,
+  
+++<<<<<<< HEAD
+ +	SKB_GSO_TUNNEL_REMCSUM = 1 << 13,
+ +
+ +	SKB_GSO_SCTP = 1 << 14,
+++=======
++ 	SKB_GSO_PARTIAL = 1 << 13,
++ 
++ 	SKB_GSO_TUNNEL_REMCSUM = 1 << 14,
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  };
+  
+ +/* NETIF_F_GSO flags are no longer part of a single range */
+ +#define SKB_GSO1_MASK (SKB_GSO_GRE_CSUM - 1)
+ +#define SKB_GSO2_MASK (SKB_GSO_GRE_CSUM|SKB_GSO_UDP_TUNNEL_CSUM|\
+ +		       SKB_GSO_TUNNEL_REMCSUM|SKB_GSO_SCTP)
+ +
+  #if BITS_PER_LONG > 32
+  #define NET_SKBUFF_DATA_USES_OFFSET 1
+  #endif
+diff --cc net/core/dev.c
+index e2ceb23207bd,556dd09af3b8..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -2653,6 -2838,38 +2666,41 @@@ static netdev_features_t dflt_features_
+  	return vlan_features_check(skb, features);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static netdev_features_t gso_features_check(const struct sk_buff *skb,
++ 					    struct net_device *dev,
++ 					    netdev_features_t features)
++ {
++ 	u16 gso_segs = skb_shinfo(skb)->gso_segs;
++ 
++ 	if (gso_segs > dev->gso_max_segs)
++ 		return features & ~NETIF_F_GSO_MASK;
++ 
++ 	/* Support for GSO partial features requires software
++ 	 * intervention before we can actually process the packets
++ 	 * so we need to strip support for any partial features now
++ 	 * and we can pull them back in after we have partially
++ 	 * segmented the frame.
++ 	 */
++ 	if (!(skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL))
++ 		features &= ~dev->gso_partial_features;
++ 
++ 	/* Make sure to clear the IPv4 ID mangling feature if the
++ 	 * IPv4 header has the potential to be fragmented.
++ 	 */
++ 	if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV4) {
++ 		struct iphdr *iph = skb->encapsulation ?
++ 				    inner_ip_hdr(skb) : ip_hdr(skb);
++ 
++ 		if (!(iph->frag_off & htons(IP_DF)))
++ 			features &= ~NETIF_F_TSO_MANGLEID;
++ 	}
++ 
++ 	return features;
++ }
++ 
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  netdev_features_t netif_skb_features(struct sk_buff *skb)
+  {
+  	struct net_device *dev = skb->dev;
+diff --cc net/core/ethtool.c
+index 939c077f6470,e0cf20a3b3dd..000000000000
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@@ -85,8 -86,9 +85,13 @@@ static const char netdev_features_strin
+  	[NETIF_F_GSO_IPIP_BIT] =	 "tx-ipip-segmentation",
+  	[NETIF_F_GSO_SIT_BIT] =		 "tx-sit-segmentation",
+  	[NETIF_F_GSO_UDP_TUNNEL_BIT] =	 "tx-udp_tnl-segmentation",
+++<<<<<<< HEAD
+ +	[NETIF_F_GSO_MPLS_BIT] =	 "tx-mpls-segmentation",
+ +	[NETIF_F_GSO_SCTP_BIT] =	 "tx-sctp-segmentation",
+++=======
++ 	[NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT] = "tx-udp_tnl-csum-segmentation",
++ 	[NETIF_F_GSO_PARTIAL_BIT] =	 "tx-gso-partial",
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  
+  	[NETIF_F_FCOE_CRC_BIT] =         "tx-checksum-fcoe-crc",
+  	[NETIF_F_SCTP_CRC_BIT] =        "tx-checksum-sctp",
+diff --cc net/core/skbuff.c
+index c7043c783fdb,4cc594cdaada..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3299,6 -3285,38 +3309,41 @@@ perform_csum_check
+  		}
+  	} while ((offset += len) < head_skb->len);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Some callers want to get the end of the list.
++ 	 * Put it in segs->prev to avoid walking the list.
++ 	 * (see validate_xmit_skb_list() for example)
++ 	 */
++ 	segs->prev = tail;
++ 
++ 	/* Update GSO info on first skb in partial sequence. */
++ 	if (partial_segs) {
++ 		int type = skb_shinfo(head_skb)->gso_type;
++ 
++ 		/* Update type to add partial and then remove dodgy if set */
++ 		type |= SKB_GSO_PARTIAL;
++ 		type &= ~SKB_GSO_DODGY;
++ 
++ 		/* Update GSO info and prepare to start updating headers on
++ 		 * our way back down the stack of protocols.
++ 		 */
++ 		skb_shinfo(segs)->gso_size = skb_shinfo(head_skb)->gso_size;
++ 		skb_shinfo(segs)->gso_segs = partial_segs;
++ 		skb_shinfo(segs)->gso_type = type;
++ 		SKB_GSO_CB(segs)->data_offset = skb_headroom(segs) + doffset;
++ 	}
++ 
++ 	/* Following permits correct backpressure, for protocols
++ 	 * using skb_set_owner_w().
++ 	 * Idea is to tranfert ownership from head_skb to last segment.
++ 	 */
++ 	if (head_skb->destructor == sock_wfree) {
++ 		swap(tail->truesize, head_skb->truesize);
++ 		swap(tail->destructor, head_skb->destructor);
++ 		swap(tail->sk, head_skb->sk);
++ 	}
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  	return segs;
+  
+  err:
+diff --cc net/ipv4/af_inet.c
+index 3068a0e54f0b,2e6e65fc4d20..000000000000
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@@ -1209,13 -1198,31 +1209,34 @@@ static struct sk_buff *inet_gso_segment
+  	struct sk_buff *segs = ERR_PTR(-EINVAL);
+  	const struct net_offload *ops;
+  	unsigned int offset = 0;
+ +	bool udpfrag, encap;
+  	struct iphdr *iph;
+- 	int proto;
++ 	int proto, tot_len;
+  	int nhoff;
+  	int ihl;
+  	int id;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(skb_shinfo(skb)->gso_type &
++ 		     ~(SKB_GSO_TCPV4 |
++ 		       SKB_GSO_UDP |
++ 		       SKB_GSO_DODGY |
++ 		       SKB_GSO_TCP_ECN |
++ 		       SKB_GSO_GRE |
++ 		       SKB_GSO_GRE_CSUM |
++ 		       SKB_GSO_IPIP |
++ 		       SKB_GSO_SIT |
++ 		       SKB_GSO_TCPV6 |
++ 		       SKB_GSO_UDP_TUNNEL |
++ 		       SKB_GSO_UDP_TUNNEL_CSUM |
++ 		       SKB_GSO_TCP_FIXEDID |
++ 		       SKB_GSO_TUNNEL_REMCSUM |
++ 		       SKB_GSO_PARTIAL |
++ 		       0)))
++ 		goto out;
++ 
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  	skb_reset_network_header(skb);
+  	nhoff = skb_network_header(skb) - skb_mac_header(skb);
+  	if (unlikely(!pskb_may_pull(skb, sizeof(*iph))))
+@@@ -1260,15 -1270,25 +1281,31 @@@
+  	do {
+  		iph = (struct iphdr *)(skb_mac_header(skb) + nhoff);
+  		if (udpfrag) {
+ +			iph->id = htons(id);
+  			iph->frag_off = htons(offset >> 3);
+ -			if (skb->next)
+ +			if (skb->next != NULL)
+  				iph->frag_off |= htons(IP_MF);
+  			offset += skb->len - nhoff - ihl;
+++<<<<<<< HEAD
+ +		} else {
+ +			iph->id = htons(id++);
+++=======
++ 			tot_len = skb->len - nhoff;
++ 		} else if (skb_is_gso(skb)) {
++ 			if (!fixedid) {
++ 				iph->id = htons(id);
++ 				id += skb_shinfo(skb)->gso_segs;
++ 			}
++ 			tot_len = skb_shinfo(skb)->gso_size +
++ 				  SKB_GSO_CB(skb)->data_offset +
++ 				  skb->head - (unsigned char *)iph;
++ 		} else {
++ 			if (!fixedid)
++ 				iph->id = htons(id++);
++ 			tot_len = skb->len - nhoff;
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  		}
+- 		iph->tot_len = htons(skb->len - nhoff);
++ 		iph->tot_len = htons(tot_len);
+  		ip_send_check(iph);
+  		if (encap)
+  			skb_reset_inner_headers(skb);
+diff --cc net/ipv4/gre_offload.c
+index b0328bedf364,20557f211408..000000000000
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@@ -26,6 -26,20 +26,23 @@@ static struct sk_buff *gre_gso_segment(
+  	int gre_offset, outer_hlen;
+  	bool need_csum, ufo;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(skb_shinfo(skb)->gso_type &
++ 				~(SKB_GSO_TCPV4 |
++ 				  SKB_GSO_TCPV6 |
++ 				  SKB_GSO_UDP |
++ 				  SKB_GSO_DODGY |
++ 				  SKB_GSO_TCP_ECN |
++ 				  SKB_GSO_TCP_FIXEDID |
++ 				  SKB_GSO_GRE |
++ 				  SKB_GSO_GRE_CSUM |
++ 				  SKB_GSO_IPIP |
++ 				  SKB_GSO_SIT |
++ 				  SKB_GSO_PARTIAL)))
++ 		goto out;
++ 
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  	if (!skb->encapsulation)
+  		goto out;
+  
+diff --cc net/ipv6/ip6_offload.c
+index 3facfa14ba14,f5eb184e1093..000000000000
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@@ -67,6 -69,24 +68,27 @@@ static struct sk_buff *ipv6_gso_segment
+  	bool encap, udpfrag;
+  	int nhoff;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (unlikely(skb_shinfo(skb)->gso_type &
++ 		     ~(SKB_GSO_TCPV4 |
++ 		       SKB_GSO_UDP |
++ 		       SKB_GSO_DODGY |
++ 		       SKB_GSO_TCP_ECN |
++ 		       SKB_GSO_TCP_FIXEDID |
++ 		       SKB_GSO_TCPV6 |
++ 		       SKB_GSO_GRE |
++ 		       SKB_GSO_GRE_CSUM |
++ 		       SKB_GSO_IPIP |
++ 		       SKB_GSO_SIT |
++ 		       SKB_GSO_UDP_TUNNEL |
++ 		       SKB_GSO_UDP_TUNNEL_CSUM |
++ 		       SKB_GSO_TUNNEL_REMCSUM |
++ 		       SKB_GSO_PARTIAL |
++ 		       0)))
++ 		goto out;
++ 
+++>>>>>>> 802ab55adc39 (GSO: Support partial segmentation offload)
+  	skb_reset_network_header(skb);
+  	nhoff = skb_network_header(skb) - skb_mac_header(skb);
+  	if (unlikely(!pskb_may_pull(skb, sizeof(*ipv6h))))
+* Unmerged path include/linux/netdev_features.h
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/ethtool.c
+* Unmerged path net/core/skbuff.c
+* Unmerged path net/ipv4/af_inet.c
+* Unmerged path net/ipv4/gre_offload.c
+diff --git a/net/ipv4/tcp_offload.c b/net/ipv4/tcp_offload.c
+index 64b23b193f30..7838d5aed142 100644
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -75,6 +75,12 @@ struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+ 		goto out;
+ 	}
+ 
++	/* GSO partial only requires splitting the frame into an MSS
++	 * multiple and possibly a remainder.  So update the mss now.
++	 */
++	if (features & NETIF_F_GSO_PARTIAL)
++		mss = skb->len - (skb->len % mss);
++
+ 	copy_destructor = gso_skb->destructor == tcp_wfree;
+ 	ooo_okay = gso_skb->ooo_okay;
+ 	/* All segments but the first should have ooo_okay cleared */
+@@ -96,7 +102,7 @@ struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+ 	newcheck = ~csum_fold((__force __wsum)((__force u32)th->check +
+ 					       (__force u32)delta));
+ 
+-	do {
++	while (skb->next) {
+ 		th->fin = th->psh = 0;
+ 		th->check = newcheck;
+ 
+@@ -116,7 +122,7 @@ struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+ 
+ 		th->seq = htonl(seq);
+ 		th->cwr = 0;
+-	} while (skb->next);
++	}
+ 
+ 	/* Following permits TCP Small Queues to work well with GSO :
+ 	 * The callback to TCP stack will be called at the time last frag
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index 8dac20280d1e..2ad5accf9c07 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -39,8 +39,11 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
+ 	 * 16 bit length field due to the header being added outside of an
+ 	 * IP or IPv6 frame that was already limited to 64K - 1.
+ 	 */
+-	partial = csum_sub(csum_unfold(uh->check),
+-			   (__force __wsum)htonl(skb->len));
++	if (skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL)
++		partial = (__force __wsum)uh->len;
++	else
++		partial = (__force __wsum)htonl(skb->len);
++	partial = csum_sub(csum_unfold(uh->check), partial);
+ 
+ 	/* setup inner skb. */
+ 	skb->encapsulation = 0;
+@@ -89,7 +92,7 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
+ 	udp_offset = outer_hlen - tnl_hlen;
+ 	skb = segs;
+ 	do {
+-		__be16 len;
++		unsigned int len;
+ 
+ 		if (remcsum)
+ 			skb->ip_summed = CHECKSUM_NONE;
+@@ -107,14 +110,26 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
+ 		skb_reset_mac_header(skb);
+ 		skb_set_network_header(skb, mac_len);
+ 		skb_set_transport_header(skb, udp_offset);
+-		len = htons(skb->len - udp_offset);
++		len = skb->len - udp_offset;
+ 		uh = udp_hdr(skb);
+-		uh->len = len;
++
++		/* If we are only performing partial GSO the inner header
++		 * will be using a length value equal to only one MSS sized
++		 * segment instead of the entire frame.
++		 */
++		if (skb_is_gso(skb)) {
++			uh->len = htons(skb_shinfo(skb)->gso_size +
++					SKB_GSO_CB(skb)->data_offset +
++					skb->head - (unsigned char *)uh);
++		} else {
++			uh->len = htons(len);
++		}
+ 
+ 		if (!need_csum)
+ 			continue;
+ 
+-		uh->check = ~csum_fold(csum_add(partial, (__force __wsum)len));
++		uh->check = ~csum_fold(csum_add(partial,
++				       (__force __wsum)htonl(len)));
+ 
+ 		if (skb->encapsulation || !offload_csum) {
+ 			uh->check = gso_make_checksum(skb, ~uh->check);
+* Unmerged path net/ipv6/ip6_offload.c
