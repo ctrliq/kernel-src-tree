@@ -1,0 +1,307 @@
+net/sched: properly assign RCU pointer in tcf_chain_tp_insert/remove
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: properly assign RCU pointer in tcf_chain_tp_insert/remove (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 96.97%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 31efcc250a1dea96edca6595a9639d898cf99ae5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/31efcc25.failed
+
+*p_filter_chain is rcu-dereferenced on reader path. So here in writer,
+property assign the pointer.
+
+Fixes: 2190d1d0944f ("net: sched: introduce helpers to work with filter chains")
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 31efcc250a1dea96edca6595a9639d898cf99ae5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,85088ed07f6a..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -124,7 -124,274 +124,278 @@@ static inline u32 tcf_auto_prio(struct 
+  	if (tp)
+  		first = tp->prio - 1;
+  
+++<<<<<<< HEAD
+ +	return first;
+++=======
++ 	return TC_H_MAJ(first);
++ }
++ 
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->chain = chain;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
++ 					  u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
++ 	if (!chain)
++ 		return NULL;
++ 	list_add_tail(&chain->list, &block->chain_list);
++ 	chain->block = block;
++ 	chain->index = chain_index;
++ 	chain->refcnt = 1;
++ 	return chain;
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	list_del(&chain->list);
++ 	while ((tp = rtnl_dereference(chain->filter_chain)) != NULL) {
++ 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
++ 		tcf_proto_destroy(tp);
++ 	}
++ 	kfree(chain);
++ }
++ 
++ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	list_for_each_entry(chain, &block->chain_list, list) {
++ 		if (chain->index == chain_index) {
++ 			chain->refcnt++;
++ 			return chain;
++ 		}
++ 	}
++ 	return tcf_chain_create(block, chain_index);
++ }
++ EXPORT_SYMBOL(tcf_chain_get);
++ 
++ void tcf_chain_put(struct tcf_chain *chain)
++ {
++ 	/* Destroy unused chain, with exception of chain 0, which is the
++ 	 * default one and has to be always present.
++ 	 */
++ 	if (--chain->refcnt == 0 && !chain->filter_chain && chain->index != 0)
++ 		tcf_chain_destroy(chain);
++ }
++ EXPORT_SYMBOL(tcf_chain_put);
++ 
++ static void
++ tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
++ 			       struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	chain->p_filter_chain = p_filter_chain;
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	struct tcf_chain *chain, *tmp;
++ 
++ 	if (!block)
++ 		return;
++ 
++ 	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
++ 		tcf_chain_destroy(chain);
++ 	kfree(block);
++ }
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *old_tp = tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode)) {
++ 			goto reset;
++ 		} else if (unlikely(TC_ACT_EXT_CMP(err, TC_ACT_GOTO_CHAIN))) {
++ 			old_tp = res->goto_tp;
++ 			goto reset;
++ 		}
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = old_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
++ struct tcf_chain_info {
++ 	struct tcf_proto __rcu **pprev;
++ 	struct tcf_proto __rcu *next;
++ };
++ 
++ static struct tcf_proto *tcf_chain_tp_prev(struct tcf_chain_info *chain_info)
++ {
++ 	return rtnl_dereference(*chain_info->pprev);
++ }
++ 
++ static void tcf_chain_tp_insert(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	if (chain->p_filter_chain &&
++ 	    *chain_info->pprev == chain->filter_chain)
++ 		rcu_assign_pointer(*chain->p_filter_chain, tp);
++ 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain_info));
++ 	rcu_assign_pointer(*chain_info->pprev, tp);
++ }
++ 
++ static void tcf_chain_tp_remove(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	struct tcf_proto *next = rtnl_dereference(chain_info->next);
++ 
++ 	if (chain->p_filter_chain && tp == chain->filter_chain)
++ 		RCU_INIT_POINTER(*chain->p_filter_chain, next);
++ 	RCU_INIT_POINTER(*chain_info->pprev, next);
++ }
++ 
++ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
++ 					   struct tcf_chain_info *chain_info,
++ 					   u32 protocol, u32 prio,
++ 					   bool prio_allocate)
++ {
++ 	struct tcf_proto **pprev;
++ 	struct tcf_proto *tp;
++ 
++ 	/* Check the chain for existence of proto-tcf with this priority */
++ 	for (pprev = &chain->filter_chain;
++ 	     (tp = rtnl_dereference(*pprev)); pprev = &tp->next) {
++ 		if (tp->prio >= prio) {
++ 			if (tp->prio == prio) {
++ 				if (prio_allocate ||
++ 				    (tp->protocol != protocol && protocol))
++ 					return ERR_PTR(-EINVAL);
++ 			} else {
++ 				tp = NULL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	chain_info->pprev = pprev;
++ 	chain_info->next = tp ? tp->next : NULL;
++ 	return tp;
+++>>>>>>> 31efcc250a1d (net/sched: properly assign RCU pointer in tcf_chain_tp_insert/remove)
+  }
+  
+  /* Add/change/delete/get a filter node */
+* Unmerged path net/sched/cls_api.c
