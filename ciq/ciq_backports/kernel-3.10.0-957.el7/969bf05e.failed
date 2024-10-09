@@ -1,0 +1,150 @@
+bpf: direct packet access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 969bf05eb3cedd5a8d4b7c346a85c2ede87a6d6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/969bf05e.failed
+
+Extended BPF carried over two instructions from classic to access
+packet data: LD_ABS and LD_IND. They're highly optimized in JITs,
+but due to their design they have to do length check for every access.
+When BPF is processing 20M packets per second single LD_ABS after JIT
+is consuming 3% cpu. Hence the need to optimize it further by amortizing
+the cost of 'off < skb_headlen' over multiple packet accesses.
+One option is to introduce two new eBPF instructions LD_ABS_DW and LD_IND_DW
+with similar usage as skb_header_pointer().
+The kernel part for interpreter and x64 JIT was implemented in [1], but such
+new insns behave like old ld_abs and abort the program with 'return 0' if
+access is beyond linear data. Such hidden control flow is hard to workaround
+plus changing JITs and rolling out new llvm is incovenient.
+
+Therefore allow cls_bpf/act_bpf program access skb->data directly:
+int bpf_prog(struct __sk_buff *skb)
+{
+  struct iphdr *ip;
+
+  if (skb->data + sizeof(struct iphdr) + ETH_HLEN > skb->data_end)
+      /* packet too small */
+      return 0;
+
+  ip = skb->data + ETH_HLEN;
+
+  /* access IP header fields with direct loads */
+  if (ip->version != 4 || ip->saddr == 0x7f000001)
+      return 1;
+  [...]
+}
+
+This solution avoids introduction of new instructions. llvm stays
+the same and all JITs stay the same, but verifier has to work extra hard
+to prove safety of the above program.
+
+For XDP the direct store instructions can be allowed as well.
+
+The skb->data is NET_IP_ALIGNED, so for common cases the verifier can check
+the alignment. The complex packet parsers where packet pointer is adjusted
+incrementally cannot be tracked for alignment, so allow byte access in such cases
+and misaligned access on architectures that define efficient_unaligned_access
+
+[1] https://git.kernel.org/cgit/linux/kernel/git/ast/bpf.git/?h=ld_abs_dw
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 969bf05eb3cedd5a8d4b7c346a85c2ede87a6d6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/core.c
+#	kernel/bpf/verifier.c
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,406459b935a2..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -165,4 -148,242 +165,77 @@@ enum bpf_func_id 
+  	__BPF_FUNC_MAX_ID,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* All flags used by eBPF helper functions, placed here. */
++ 
++ /* BPF_FUNC_skb_store_bytes flags. */
++ #define BPF_F_RECOMPUTE_CSUM		(1ULL << 0)
++ #define BPF_F_INVALIDATE_HASH		(1ULL << 1)
++ 
++ /* BPF_FUNC_l3_csum_replace and BPF_FUNC_l4_csum_replace flags.
++  * First 4 bits are for passing the header field size.
++  */
++ #define BPF_F_HDR_FIELD_MASK		0xfULL
++ 
++ /* BPF_FUNC_l4_csum_replace flags. */
++ #define BPF_F_PSEUDO_HDR		(1ULL << 4)
++ #define BPF_F_MARK_MANGLED_0		(1ULL << 5)
++ 
++ /* BPF_FUNC_clone_redirect and BPF_FUNC_redirect flags. */
++ #define BPF_F_INGRESS			(1ULL << 0)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key and BPF_FUNC_skb_get_tunnel_key flags. */
++ #define BPF_F_TUNINFO_IPV6		(1ULL << 0)
++ 
++ /* BPF_FUNC_get_stackid flags. */
++ #define BPF_F_SKIP_FIELD_MASK		0xffULL
++ #define BPF_F_USER_STACK		(1ULL << 8)
++ #define BPF_F_FAST_STACK_CMP		(1ULL << 9)
++ #define BPF_F_REUSE_STACKID		(1ULL << 10)
++ 
++ /* BPF_FUNC_skb_set_tunnel_key flags. */
++ #define BPF_F_ZERO_CSUM_TX		(1ULL << 1)
++ #define BPF_F_DONT_FRAGMENT		(1ULL << 2)
++ 
++ /* BPF_FUNC_perf_event_output flags. */
++ #define BPF_F_INDEX_MASK		0xffffffffULL
++ #define BPF_F_CURRENT_CPU		BPF_F_INDEX_MASK
++ 
++ /* user accessible mirror of in-kernel sk_buff.
++  * new fields can only be added to the end of this structure
++  */
++ struct __sk_buff {
++ 	__u32 len;
++ 	__u32 pkt_type;
++ 	__u32 mark;
++ 	__u32 queue_mapping;
++ 	__u32 protocol;
++ 	__u32 vlan_present;
++ 	__u32 vlan_tci;
++ 	__u32 vlan_proto;
++ 	__u32 priority;
++ 	__u32 ingress_ifindex;
++ 	__u32 ifindex;
++ 	__u32 tc_index;
++ 	__u32 cb[5];
++ 	__u32 hash;
++ 	__u32 tc_classid;
++ 	__u32 data;
++ 	__u32 data_end;
++ };
++ 
++ struct bpf_tunnel_key {
++ 	__u32 tunnel_id;
++ 	union {
++ 		__u32 remote_ipv4;
++ 		__u32 remote_ipv6[4];
++ 	};
++ 	__u8 tunnel_tos;
++ 	__u8 tunnel_ttl;
++ 	__u16 tunnel_ext;
++ 	__u32 tunnel_label;
++ };
++ 
+++>>>>>>> 969bf05eb3ce (bpf: direct packet access)
+  #endif /* _UAPI__LINUX_BPF_H__ */
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/verifier.c
