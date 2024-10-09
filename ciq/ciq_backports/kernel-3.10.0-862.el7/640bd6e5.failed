@@ -1,0 +1,170 @@
+KVM: SVM: Enable Virtual GIF feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Janakarajan Natarajan <Janakarajan.Natarajan@amd.com>
+commit 640bd6e5752274f7dbd2a0a6642fe2db85813bd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/640bd6e5.failed
+
+Enable the Virtual GIF feature. This is done by setting bit 25 at position
+60h in the vmcb.
+
+With this feature enabled, the processor uses bit 9 at position 60h as the
+virtual GIF when executing STGI/CLGI instructions.
+
+Since the execution of STGI by the L1 hypervisor does not cause a return to
+the outermost (L0) hypervisor, the enable_irq_window and enable_nmi_window
+are modified.
+
+The IRQ window will be opened even if GIF is not set, under the assumption
+that on resuming the L1 hypervisor the IRQ will be held pending until the
+processor executes the STGI instruction.
+
+For the NMI window, the STGI intercept is set. This will assist in opening
+the window only when GIF=1.
+
+	Signed-off-by: Janakarajan Natarajan <Janakarajan.Natarajan@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 640bd6e5752274f7dbd2a0a6642fe2db85813bd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 2903c7585682,7e190b21a30b..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -274,9 -280,9 +274,15 @@@ module_param(avic, int, S_IRUGO)
+  static int vls = true;
+  module_param(vls, int, 0444);
+  
+++<<<<<<< HEAD
+ +/* AVIC VM ID bit masks and lock */
+ +static DECLARE_BITMAP(avic_vm_id_bitmap, AVIC_VM_ID_NR);
+ +static DEFINE_SPINLOCK(avic_vm_id_lock);
+++=======
++ /* enable/disable Virtual GIF */
++ static int vgif = true;
++ module_param(vgif, int, 0444);
+++>>>>>>> 640bd6e57522 (KVM: SVM: Enable Virtual GIF feature)
+  
+  static void svm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
+  static void svm_flush_tlb(struct kvm_vcpu *vcpu);
+@@@ -964,6 -984,70 +984,73 @@@ static void svm_disable_lbrv(struct vcp
+  	set_msr_interception(msrpm, MSR_IA32_LASTINTTOIP, 0, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void disable_nmi_singlestep(struct vcpu_svm *svm)
++ {
++ 	svm->nmi_singlestep = false;
++ 
++ 	if (!(svm->vcpu.guest_debug & KVM_GUESTDBG_SINGLESTEP)) {
++ 		/* Clear our flags if they were not set by the guest */
++ 		if (!(svm->nmi_singlestep_guest_rflags & X86_EFLAGS_TF))
++ 			svm->vmcb->save.rflags &= ~X86_EFLAGS_TF;
++ 		if (!(svm->nmi_singlestep_guest_rflags & X86_EFLAGS_RF))
++ 			svm->vmcb->save.rflags &= ~X86_EFLAGS_RF;
++ 	}
++ }
++ 
++ /* Note:
++  * This hash table is used to map VM_ID to a struct kvm_arch,
++  * when handling AMD IOMMU GALOG notification to schedule in
++  * a particular vCPU.
++  */
++ #define SVM_VM_DATA_HASH_BITS	8
++ static DEFINE_HASHTABLE(svm_vm_data_hash, SVM_VM_DATA_HASH_BITS);
++ static u32 next_vm_id = 0;
++ static bool next_vm_id_wrapped = 0;
++ static DEFINE_SPINLOCK(svm_vm_data_hash_lock);
++ 
++ /* Note:
++  * This function is called from IOMMU driver to notify
++  * SVM to schedule in a particular vCPU of a particular VM.
++  */
++ static int avic_ga_log_notifier(u32 ga_tag)
++ {
++ 	unsigned long flags;
++ 	struct kvm_arch *ka = NULL;
++ 	struct kvm_vcpu *vcpu = NULL;
++ 	u32 vm_id = AVIC_GATAG_TO_VMID(ga_tag);
++ 	u32 vcpu_id = AVIC_GATAG_TO_VCPUID(ga_tag);
++ 
++ 	pr_debug("SVM: %s: vm_id=%#x, vcpu_id=%#x\n", __func__, vm_id, vcpu_id);
++ 
++ 	spin_lock_irqsave(&svm_vm_data_hash_lock, flags);
++ 	hash_for_each_possible(svm_vm_data_hash, ka, hnode, vm_id) {
++ 		struct kvm *kvm = container_of(ka, struct kvm, arch);
++ 		struct kvm_arch *vm_data = &kvm->arch;
++ 
++ 		if (vm_data->avic_vm_id != vm_id)
++ 			continue;
++ 		vcpu = kvm_get_vcpu_by_id(kvm, vcpu_id);
++ 		break;
++ 	}
++ 	spin_unlock_irqrestore(&svm_vm_data_hash_lock, flags);
++ 
++ 	if (!vcpu)
++ 		return 0;
++ 
++ 	/* Note:
++ 	 * At this point, the IOMMU should have already set the pending
++ 	 * bit in the vAPIC backing page. So, we just need to schedule
++ 	 * in the vcpu.
++ 	 */
++ 	if (vcpu->mode == OUTSIDE_GUEST_MODE)
++ 		kvm_vcpu_wake_up(vcpu);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 640bd6e57522 (KVM: SVM: Enable Virtual GIF feature)
+  static __init int svm_hardware_setup(void)
+  {
+  	int cpu;
+@@@ -3081,8 -3163,17 +3181,15 @@@ static int stgi_interception(struct vcp
+  	if (nested_svm_check_permissions(svm))
+  		return 1;
+  
++ 	/*
++ 	 * If VGIF is enabled, the STGI intercept is only added to
++ 	 * detect the opening of the NMI window; remove it now.
++ 	 */
++ 	if (vgif_enabled(svm))
++ 		clr_intercept(svm, INTERCEPT_STGI);
++ 
+  	svm->next_rip = kvm_rip_read(&svm->vcpu) + 3;
+ -	ret = kvm_skip_emulated_instruction(&svm->vcpu);
+ +	skip_emulated_instruction(&svm->vcpu);
+  	kvm_make_request(KVM_REQ_EVENT, &svm->vcpu);
+  
+  	enable_gif(svm);
+diff --git a/arch/x86/include/asm/svm.h b/arch/x86/include/asm/svm.h
+index 1ab0c6bdcfa2..18ae670f7bc6 100644
+--- a/arch/x86/include/asm/svm.h
++++ b/arch/x86/include/asm/svm.h
+@@ -107,6 +107,9 @@ struct __attribute__ ((__packed__)) vmcb_control_area {
+ #define V_IRQ_SHIFT 8
+ #define V_IRQ_MASK (1 << V_IRQ_SHIFT)
+ 
++#define V_GIF_SHIFT 9
++#define V_GIF_MASK (1 << V_GIF_SHIFT)
++
+ #define V_INTR_PRIO_SHIFT 16
+ #define V_INTR_PRIO_MASK (0x0f << V_INTR_PRIO_SHIFT)
+ 
+@@ -116,6 +119,9 @@ struct __attribute__ ((__packed__)) vmcb_control_area {
+ #define V_INTR_MASKING_SHIFT 24
+ #define V_INTR_MASKING_MASK (1 << V_INTR_MASKING_SHIFT)
+ 
++#define V_GIF_ENABLE_SHIFT 25
++#define V_GIF_ENABLE_MASK (1 << V_GIF_ENABLE_SHIFT)
++
+ #define AVIC_ENABLE_SHIFT 31
+ #define AVIC_ENABLE_MASK (1 << AVIC_ENABLE_SHIFT)
+ 
+* Unmerged path arch/x86/kvm/svm.c
