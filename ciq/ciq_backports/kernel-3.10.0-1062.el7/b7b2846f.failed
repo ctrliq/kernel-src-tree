@@ -1,0 +1,112 @@
+xfs: add the ability to join a held buffer to a defer_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit b7b2846fe26f2c0d7f317c874a13d3ecf22670ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b7b2846f.failed
+
+In certain cases, defer_ops callers will lock a buffer and want to hold
+the lock across transaction rolls.  Similar to ijoined inodes, we want
+to dirty & join the buffer with each transaction roll in defer_finish so
+that afterwards the caller still owns the buffer lock and we haven't
+inadvertently pinned the log.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b7b2846fe26f2c0d7f317c874a13d3ecf22670ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_defer.h
+diff --cc fs/xfs/libxfs/xfs_defer.h
+index 9319f67487ea,045beacdd37d..000000000000
+--- a/fs/xfs/libxfs/xfs_defer.h
++++ b/fs/xfs/libxfs/xfs_defer.h
+@@@ -74,7 -78,8 +76,12 @@@ int xfs_defer_finish(struct xfs_trans *
+  void xfs_defer_cancel(struct xfs_defer_ops *dop);
+  void xfs_defer_init(struct xfs_defer_ops *dop, xfs_fsblock_t *fbp);
+  bool xfs_defer_has_unfinished_work(struct xfs_defer_ops *dop);
+++<<<<<<< HEAD
+ +int xfs_defer_join(struct xfs_defer_ops *dop, struct xfs_inode *ip);
+++=======
++ int xfs_defer_ijoin(struct xfs_defer_ops *dop, struct xfs_inode *ip);
++ int xfs_defer_bjoin(struct xfs_defer_ops *dop, struct xfs_buf *bp);
+++>>>>>>> b7b2846fe26f (xfs: add the ability to join a held buffer to a defer_ops)
+  
+  /* Description of a deferred type. */
+  struct xfs_defer_op_type {
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 4ea2f068d95c..fb717a4e76e8 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -249,6 +249,10 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+ 
++	/* Hold the (previously bjoin'd) buffer locked across the roll. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++)
++		xfs_trans_dirty_buf(*tp, dop->dop_bufs[i]);
++
+ 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
+ 
+ 	/* Roll the transaction. */
+@@ -264,6 +268,12 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+ 
++	/* Rejoin the buffers and dirty them so the log moves forward. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++) {
++		xfs_trans_bjoin(*tp, dop->dop_bufs[i]);
++		xfs_trans_bhold(*tp, dop->dop_bufs[i]);
++	}
++
+ 	return error;
+ }
+ 
+@@ -296,6 +306,31 @@ xfs_defer_join(
+ 		}
+ 	}
+ 
++	ASSERT(0);
++	return -EFSCORRUPTED;
++}
++
++/*
++ * Add this buffer to the deferred op.  Each joined buffer is relogged
++ * each time we roll the transaction.
++ */
++int
++xfs_defer_bjoin(
++	struct xfs_defer_ops		*dop,
++	struct xfs_buf			*bp)
++{
++	int				i;
++
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS; i++) {
++		if (dop->dop_bufs[i] == bp)
++			return 0;
++		else if (dop->dop_bufs[i] == NULL) {
++			dop->dop_bufs[i] = bp;
++			return 0;
++		}
++	}
++
++	ASSERT(0);
+ 	return -EFSCORRUPTED;
+ }
+ 
+@@ -497,9 +532,7 @@ xfs_defer_init(
+ 	struct xfs_defer_ops		*dop,
+ 	xfs_fsblock_t			*fbp)
+ {
+-	dop->dop_committed = false;
+-	dop->dop_low = false;
+-	memset(&dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++	memset(dop, 0, sizeof(struct xfs_defer_ops));
+ 	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
+* Unmerged path fs/xfs/libxfs/xfs_defer.h
