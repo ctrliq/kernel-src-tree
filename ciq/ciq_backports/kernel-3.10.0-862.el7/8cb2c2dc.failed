@@ -1,0 +1,187 @@
+livepatch: Fix subtle race with coming and going modules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Petr Mladek <pmladek@suse.cz>
+commit 8cb2c2dc472775479a1a7e78180955f6f1cb0b0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8cb2c2dc.failed
+
+There is a notifier that handles live patches for coming and going modules.
+It takes klp_mutex lock to avoid races with coming and going patches but
+it does not keep the lock all the time. Therefore the following races are
+possible:
+
+  1. The notifier is called sometime in STATE_MODULE_COMING. The module
+     is visible by find_module() in this state all the time. It means that
+     new patch can be registered and enabled even before the notifier is
+     called. It might create wrong order of stacked patches, see below
+     for an example.
+
+   2. New patch could still see the module in the GOING state even after
+      the notifier has been called. It will try to initialize the related
+      object structures but the module could disappear at any time. There
+      will stay mess in the structures. It might even cause an invalid
+      memory access.
+
+This patch solves the problem by adding a boolean variable into struct module.
+The value is true after the coming and before the going handler is called.
+New patches need to be applied when the value is true and they need to ignore
+the module when the value is false.
+
+Note that we need to know state of all modules on the system. The races are
+related to new patches. Therefore we do not know what modules will get
+patched.
+
+Also note that we could not simply ignore going modules. The code from the
+module could be called even in the GOING state until mod->exit() finishes.
+If we start supporting patches with semantic changes between function
+calls, we need to apply new patches to any still usable code.
+See below for an example.
+
+Finally note that the patch solves only the situation when a new patch is
+registered. There are no such problems when the patch is being removed.
+It does not matter who disable the patch first, whether the normal
+disable_patch() or the module notifier. There is nothing to do
+once the patch is disabled.
+
+Alternative solutions:
+======================
+
++ reject new patches when a patched module is coming or going; this is ugly
+
++ wait with adding new patch until the module leaves the COMING and GOING
+  states; this might be dangerous and complicated; we would need to release
+  kgr_lock in the middle of the patch registration to avoid a deadlock
+  with the coming and going handlers; also we might need a waitqueue for
+  each module which seems to be even bigger overhead than the boolean
+
++ stop modules from entering COMING and GOING states; wait until modules
+  leave these states when they are already there; looks complicated; we would
+  need to ignore the module that asked to stop the others to avoid a deadlock;
+  also it is unclear what to do when two modules asked to stop others and
+  both are in COMING state (situation when two new patches are applied)
+
++ always register/enable new patches and fix up the potential mess (registered
+  patches order) in klp_module_init(); this is nasty and prone to regressions
+  in the future development
+
++ add another MODULE_STATE where the kallsyms are visible but the module is not
+  used yet; this looks too complex; the module states are checked on "many"
+  locations
+
+Example of patch stacking breakage:
+===================================
+
+The notifier could _not_ _simply_ ignore already initialized module objects.
+For example, let's have three patches (P1, P2, P3) for functions a() and b()
+where a() is from vmcore and b() is from a module M. Something like:
+
+	a()	b()
+P1	a1()	b1()
+P2	a2()	b2()
+P3	a3()	b3(3)
+
+If you load the module M after all patches are registered and enabled.
+The ftrace ops for function a() and b() has listed the functions in this
+order:
+
+	ops_a->func_stack -> list(a3,a2,a1)
+	ops_b->func_stack -> list(b3,b2,b1)
+
+, so the pointer to b3() is the first and will be used.
+
+Then you might have the following scenario. Let's start with state when patches
+P1 and P2 are registered and enabled but the module M is not loaded. Then ftrace
+ops for b() does not exist. Then we get into the following race:
+
+CPU0					CPU1
+
+load_module(M)
+
+  complete_formation()
+
+  mod->state = MODULE_STATE_COMING;
+  mutex_unlock(&module_mutex);
+
+					klp_register_patch(P3);
+					klp_enable_patch(P3);
+
+					# STATE 1
+
+  klp_module_notify(M)
+    klp_module_notify_coming(P1);
+    klp_module_notify_coming(P2);
+    klp_module_notify_coming(P3);
+
+					# STATE 2
+
+The ftrace ops for a() and b() then looks:
+
+  STATE1:
+
+	ops_a->func_stack -> list(a3,a2,a1);
+	ops_b->func_stack -> list(b3);
+
+  STATE2:
+	ops_a->func_stack -> list(a3,a2,a1);
+	ops_b->func_stack -> list(b2,b1,b3);
+
+therefore, b2() is used for the module but a3() is used for vmcore
+because they were the last added.
+
+Example of the race with going modules:
+=======================================
+
+CPU0					CPU1
+
+delete_module()  #SYSCALL
+
+   try_stop_module()
+     mod->state = MODULE_STATE_GOING;
+
+   mutex_unlock(&module_mutex);
+
+					klp_register_patch()
+					klp_enable_patch()
+
+					#save place to switch universe
+
+					b()     # from module that is going
+					  a()   # from core (patched)
+
+   mod->exit();
+
+Note that the function b() can be called until we call mod->exit().
+
+If we do not apply patch against b() because it is in MODULE_STATE_GOING,
+it will call patched a() with modified semantic and things might get wrong.
+
+[jpoimboe@redhat.com: use one boolean instead of two]
+	Signed-off-by: Petr Mladek <pmladek@suse.cz>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 8cb2c2dc472775479a1a7e78180955f6f1cb0b0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/livepatch/core.c
+* Unmerged path kernel/livepatch/core.c
+diff --git a/include/linux/module.h b/include/linux/module.h
+index cb24355b2d5e..ee9bba9151ac 100644
+--- a/include/linux/module.h
++++ b/include/linux/module.h
+@@ -375,6 +375,10 @@ struct module
+ 	unsigned long *ftrace_callsites;
+ #endif
+ 
++#ifdef CONFIG_LIVEPATCH
++	bool klp_alive;
++#endif
++
+ #ifdef CONFIG_MODULE_UNLOAD
+ 	/* What modules depend on me? */
+ 	struct list_head source_list;
+* Unmerged path kernel/livepatch/core.c
