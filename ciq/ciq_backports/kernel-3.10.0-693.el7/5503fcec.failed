@@ -1,0 +1,320 @@
+tun: rx batching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit 5503fcecd49f599e52d10f82057fe0c9d53c8f03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5503fcec.failed
+
+We can only process 1 packet at one time during sendmsg(). This often
+lead bad cache utilization under heavy load. So this patch tries to do
+some batching during rx before submitting them to host network
+stack. This is done through accepting MSG_MORE as a hint from
+sendmsg() caller, if it was set, batch the packet temporarily in a
+linked list and submit them all once MSG_MORE were cleared.
+
+Tests were done by pktgen (burst=128) in guest over mlx4(noqueue) on host:
+
+                                 Mpps  -+%
+    rx-frames = 0                0.91  +0%
+    rx-frames = 4                1.00  +9.8%
+    rx-frames = 8                1.00  +9.8%
+    rx-frames = 16               1.01  +10.9%
+    rx-frames = 32               1.07  +17.5%
+    rx-frames = 48               1.07  +17.5%
+    rx-frames = 64               1.08  +18.6%
+    rx-frames = 64 (no MSG_MORE) 0.91  +0%
+
+User were allowed to change per device batched packets through
+ethtool -C rx-frames. NAPI_POLL_WEIGHT were used as upper limitation
+to prevent bh from being disabled too long.
+
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5503fcecd49f599e52d10f82057fe0c9d53c8f03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index 30139619c52b,13890ac3cb37..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -498,6 -516,17 +499,20 @@@ static struct tun_struct *tun_enable_qu
+  	return tun;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tun_queue_purge(struct tun_file *tfile)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	while ((skb = skb_array_consume(&tfile->tx_array)) != NULL)
++ 		kfree_skb(skb);
++ 
++ 	skb_queue_purge(&tfile->sk.sk_write_queue);
++ 	skb_queue_purge(&tfile->sk.sk_error_queue);
++ }
++ 
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  static void __tun_detach(struct tun_file *tfile, bool clean)
+  {
+  	struct tun_file *ntfile;
+@@@ -1105,113 -1141,46 +1120,155 @@@ static struct sk_buff *tun_alloc_skb(st
+  	return skb;
+  }
+  
+++<<<<<<< HEAD
+ +/* set skb frags from iovec, this can move to core network code for reuse */
+ +static int zerocopy_sg_from_iovec(struct sk_buff *skb, const struct iovec *from,
+ +				  int offset, size_t count)
+ +{
+ +	int len = iov_length(from, count) - offset;
+ +	int copy = skb_headlen(skb);
+ +	int size, offset1 = 0;
+ +	int i = 0;
+ +
+ +	/* Skip over from offset */
+ +	while (count && (offset >= from->iov_len)) {
+ +		offset -= from->iov_len;
+ +		++from;
+ +		--count;
+ +	}
+ +
+ +	/* copy up to skb headlen */
+ +	while (count && (copy > 0)) {
+ +		size = min_t(unsigned int, copy, from->iov_len - offset);
+ +		if (copy_from_user(skb->data + offset1, from->iov_base + offset,
+ +				   size))
+ +			return -EFAULT;
+ +		if (copy > size) {
+ +			++from;
+ +			--count;
+ +			offset = 0;
+ +		} else
+ +			offset += size;
+ +		copy -= size;
+ +		offset1 += size;
+ +	}
+ +
+ +	if (len == offset1)
+ +		return 0;
+ +
+ +	while (count--) {
+ +		struct page *page[MAX_SKB_FRAGS];
+ +		int num_pages;
+ +		unsigned long base;
+ +		unsigned long truesize;
+ +
+ +		len = from->iov_len - offset;
+ +		if (!len) {
+ +			offset = 0;
+ +			++from;
+ +			continue;
+ +		}
+ +		base = (unsigned long)from->iov_base + offset;
+ +		size = ((base & ~PAGE_MASK) + len + ~PAGE_MASK) >> PAGE_SHIFT;
+ +		if (i + size > MAX_SKB_FRAGS)
+ +			return -EMSGSIZE;
+ +		num_pages = get_user_pages_fast(base, size, 0, &page[i]);
+ +		if (num_pages != size) {
+ +			int j;
+ +
+ +			for (j = 0; j < num_pages; j++)
+ +				put_page(page[i + j]);
+ +			return -EFAULT;
+ +		}
+ +		truesize = size * PAGE_SIZE;
+ +		skb->data_len += len;
+ +		skb->len += len;
+ +		skb->truesize += truesize;
+ +		atomic_add(truesize, &skb->sk->sk_wmem_alloc);
+ +		while (len) {
+ +			int off = base & ~PAGE_MASK;
+ +			int size = min_t(int, len, PAGE_SIZE - off);
+ +			__skb_fill_page_desc(skb, i, page[i], off, size);
+ +			skb_shinfo(skb)->nr_frags++;
+ +			/* increase sk_wmem_alloc */
+ +			base += size;
+ +			len -= size;
+ +			i++;
+ +		}
+ +		offset = 0;
+ +		++from;
+ +	}
+ +	return 0;
+ +}
+ +
+ +static unsigned long iov_pages(const struct iovec *iv, int offset,
+ +			       unsigned long nr_segs)
+ +{
+ +	unsigned long seg, base;
+ +	int pages = 0, len, size;
+ +
+ +	while (nr_segs && (offset >= iv->iov_len)) {
+ +		offset -= iv->iov_len;
+ +		++iv;
+ +		--nr_segs;
+ +	}
+ +
+ +	for (seg = 0; seg < nr_segs; seg++) {
+ +		base = (unsigned long)iv[seg].iov_base + offset;
+ +		len = iv[seg].iov_len - offset;
+ +		size = ((base & ~PAGE_MASK) + len + ~PAGE_MASK) >> PAGE_SHIFT;
+ +		pages += size;
+ +		offset = 0;
+ +	}
+ +
+ +	return pages;
+++=======
++ static void tun_rx_batched(struct tun_struct *tun, struct tun_file *tfile,
++ 			   struct sk_buff *skb, int more)
++ {
++ 	struct sk_buff_head *queue = &tfile->sk.sk_write_queue;
++ 	struct sk_buff_head process_queue;
++ 	u32 rx_batched = tun->rx_batched;
++ 	bool rcv = false;
++ 
++ 	if (!rx_batched || (!more && skb_queue_empty(queue))) {
++ 		local_bh_disable();
++ 		netif_receive_skb(skb);
++ 		local_bh_enable();
++ 		return;
++ 	}
++ 
++ 	spin_lock(&queue->lock);
++ 	if (!more || skb_queue_len(queue) == rx_batched) {
++ 		__skb_queue_head_init(&process_queue);
++ 		skb_queue_splice_tail_init(queue, &process_queue);
++ 		rcv = true;
++ 	} else {
++ 		__skb_queue_tail(queue, skb);
++ 	}
++ 	spin_unlock(&queue->lock);
++ 
++ 	if (rcv) {
++ 		struct sk_buff *nskb;
++ 
++ 		local_bh_disable();
++ 		while ((nskb = __skb_dequeue(&process_queue)))
++ 			netif_receive_skb(nskb);
++ 		netif_receive_skb(skb);
++ 		local_bh_enable();
++ 	}
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  }
+  
+  /* Get packet from user space buffer */
+  static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
+++<<<<<<< HEAD
+ +			    void *msg_control, const struct iovec *iv,
+ +			    size_t total_len, size_t count, int noblock)
+++=======
++ 			    void *msg_control, struct iov_iter *from,
++ 			    int noblock, bool more)
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  {
+  	struct tun_pi pi = { 0, cpu_to_be16(ETH_P_IP) };
+  	struct sk_buff *skb;
+@@@ -1414,10 -1347,8 +1469,15 @@@ static ssize_t tun_chr_aio_write(struc
+  	if (!tun)
+  		return -EBADFD;
+  
+++<<<<<<< HEAD
+ +	tun_debug(KERN_INFO, tun, "tun_chr_write %ld\n", count);
+ +
+ +	result = tun_get_user(tun, tfile, NULL, iv, iov_length(iv, count),
+ +			      count, file->f_flags & O_NONBLOCK);
+++=======
++ 	result = tun_get_user(tun, tfile, NULL, from,
++ 			      file->f_flags & O_NONBLOCK, false);
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  
+  	tun_put(tun);
+  	return result;
+@@@ -1691,8 -1604,10 +1751,15 @@@ static int tun_sendmsg(struct kiocb *io
+  
+  	if (!tun)
+  		return -EBADFD;
+++<<<<<<< HEAD
+ +	ret = tun_get_user(tun, tfile, m->msg_control, m->msg_iov, total_len,
+ +			   m->msg_iovlen, m->msg_flags & MSG_DONTWAIT);
+++=======
++ 
++ 	ret = tun_get_user(tun, tfile, m->msg_control, &m->msg_iter,
++ 			   m->msg_flags & MSG_DONTWAIT,
++ 			   m->msg_flags & MSG_MORE);
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  	tun_put(tun);
+  	return ret;
+  }
+@@@ -2527,8 -2506,61 +2618,14 @@@ static const struct ethtool_ops tun_eth
+  	.get_msglevel	= tun_get_msglevel,
+  	.set_msglevel	= tun_set_msglevel,
+  	.get_link	= ethtool_op_get_link,
+++<<<<<<< HEAD
+++=======
++ 	.get_ts_info	= ethtool_op_get_ts_info,
++ 	.get_coalesce   = tun_get_coalesce,
++ 	.set_coalesce   = tun_set_coalesce,
+++>>>>>>> 5503fcecd49f (tun: rx batching)
+  };
+  
+ -static int tun_queue_resize(struct tun_struct *tun)
+ -{
+ -	struct net_device *dev = tun->dev;
+ -	struct tun_file *tfile;
+ -	struct skb_array **arrays;
+ -	int n = tun->numqueues + tun->numdisabled;
+ -	int ret, i;
+ -
+ -	arrays = kmalloc(sizeof *arrays * n, GFP_KERNEL);
+ -	if (!arrays)
+ -		return -ENOMEM;
+ -
+ -	for (i = 0; i < tun->numqueues; i++) {
+ -		tfile = rtnl_dereference(tun->tfiles[i]);
+ -		arrays[i] = &tfile->tx_array;
+ -	}
+ -	list_for_each_entry(tfile, &tun->disabled, next)
+ -		arrays[i++] = &tfile->tx_array;
+ -
+ -	ret = skb_array_resize_multiple(arrays, n,
+ -					dev->tx_queue_len, GFP_KERNEL);
+ -
+ -	kfree(arrays);
+ -	return ret;
+ -}
+ -
+ -static int tun_device_event(struct notifier_block *unused,
+ -			    unsigned long event, void *ptr)
+ -{
+ -	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ -	struct tun_struct *tun = netdev_priv(dev);
+ -
+ -	if (dev->rtnl_link_ops != &tun_link_ops)
+ -		return NOTIFY_DONE;
+ -
+ -	switch (event) {
+ -	case NETDEV_CHANGE_TX_QUEUE_LEN:
+ -		if (tun_queue_resize(tun))
+ -			return NOTIFY_BAD;
+ -		break;
+ -	default:
+ -		break;
+ -	}
+ -
+ -	return NOTIFY_DONE;
+ -}
+ -
+ -static struct notifier_block tun_notifier_block __read_mostly = {
+ -	.notifier_call	= tun_device_event,
+ -};
+  
+  static int __init tun_init(void)
+  {
+* Unmerged path drivers/net/tun.c
