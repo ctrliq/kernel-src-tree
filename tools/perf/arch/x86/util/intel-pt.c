@@ -707,6 +707,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 				perf_evsel__set_sample_bit(switch_evsel, TID);
 				perf_evsel__set_sample_bit(switch_evsel, TIME);
 				perf_evsel__set_sample_bit(switch_evsel, CPU);
+				perf_evsel__reset_sample_bit(switch_evsel, BRANCH_STACK);
 
 				opts->record_switch_events = false;
 				ptr->have_sched_switch = 3;
@@ -768,6 +769,7 @@ static int intel_pt_recording_options(struct auxtrace_record *itr,
 			/* And the CPU for switch events */
 			perf_evsel__set_sample_bit(tracking_evsel, CPU);
 		}
+		perf_evsel__reset_sample_bit(tracking_evsel, BRANCH_STACK);
 	}
 
 	/*
