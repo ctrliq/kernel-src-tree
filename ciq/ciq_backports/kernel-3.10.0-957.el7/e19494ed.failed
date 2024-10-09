@@ -1,0 +1,178 @@
+bpf: introduce percpu_freelist
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit e19494edab82f55a633911f25094581891bdc351
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e19494ed.failed
+
+Introduce simple percpu_freelist to keep single list of elements
+spread across per-cpu singly linked lists.
+
+/* push element into the list */
+void pcpu_freelist_push(struct pcpu_freelist *, struct pcpu_freelist_node *);
+
+/* pop element from the list */
+struct pcpu_freelist_node *pcpu_freelist_pop(struct pcpu_freelist *);
+
+The object is pushed to the current cpu list.
+Pop first trying to get the object from the current cpu list,
+if it's empty goes to the neigbour cpu list.
+
+For bpf program usage pattern the collision rate is very low,
+since programs push and pop the objects typically on the same cpu.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e19494edab82f55a633911f25094581891bdc351)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/Makefile
+* Unmerged path kernel/bpf/Makefile
+* Unmerged path kernel/bpf/Makefile
+diff --git a/kernel/bpf/percpu_freelist.c b/kernel/bpf/percpu_freelist.c
+new file mode 100644
+index 000000000000..5c51d1985b51
+--- /dev/null
++++ b/kernel/bpf/percpu_freelist.c
+@@ -0,0 +1,100 @@
++/* Copyright (c) 2016 Facebook
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ */
++#include "percpu_freelist.h"
++
++int pcpu_freelist_init(struct pcpu_freelist *s)
++{
++	int cpu;
++
++	s->freelist = alloc_percpu(struct pcpu_freelist_head);
++	if (!s->freelist)
++		return -ENOMEM;
++
++	for_each_possible_cpu(cpu) {
++		struct pcpu_freelist_head *head = per_cpu_ptr(s->freelist, cpu);
++
++		raw_spin_lock_init(&head->lock);
++		head->first = NULL;
++	}
++	return 0;
++}
++
++void pcpu_freelist_destroy(struct pcpu_freelist *s)
++{
++	free_percpu(s->freelist);
++}
++
++static inline void __pcpu_freelist_push(struct pcpu_freelist_head *head,
++					struct pcpu_freelist_node *node)
++{
++	raw_spin_lock(&head->lock);
++	node->next = head->first;
++	head->first = node;
++	raw_spin_unlock(&head->lock);
++}
++
++void pcpu_freelist_push(struct pcpu_freelist *s,
++			struct pcpu_freelist_node *node)
++{
++	struct pcpu_freelist_head *head = this_cpu_ptr(s->freelist);
++
++	__pcpu_freelist_push(head, node);
++}
++
++void pcpu_freelist_populate(struct pcpu_freelist *s, void *buf, u32 elem_size,
++			    u32 nr_elems)
++{
++	struct pcpu_freelist_head *head;
++	unsigned long flags;
++	int i, cpu, pcpu_entries;
++
++	pcpu_entries = nr_elems / num_possible_cpus() + 1;
++	i = 0;
++
++	/* disable irq to workaround lockdep false positive
++	 * in bpf usage pcpu_freelist_populate() will never race
++	 * with pcpu_freelist_push()
++	 */
++	local_irq_save(flags);
++	for_each_possible_cpu(cpu) {
++again:
++		head = per_cpu_ptr(s->freelist, cpu);
++		__pcpu_freelist_push(head, buf);
++		i++;
++		buf += elem_size;
++		if (i == nr_elems)
++			break;
++		if (i % pcpu_entries)
++			goto again;
++	}
++	local_irq_restore(flags);
++}
++
++struct pcpu_freelist_node *pcpu_freelist_pop(struct pcpu_freelist *s)
++{
++	struct pcpu_freelist_head *head;
++	struct pcpu_freelist_node *node;
++	int orig_cpu, cpu;
++
++	orig_cpu = cpu = raw_smp_processor_id();
++	while (1) {
++		head = per_cpu_ptr(s->freelist, cpu);
++		raw_spin_lock(&head->lock);
++		node = head->first;
++		if (node) {
++			head->first = node->next;
++			raw_spin_unlock(&head->lock);
++			return node;
++		}
++		raw_spin_unlock(&head->lock);
++		cpu = cpumask_next(cpu, cpu_possible_mask);
++		if (cpu >= nr_cpu_ids)
++			cpu = 0;
++		if (cpu == orig_cpu)
++			return NULL;
++	}
++}
+diff --git a/kernel/bpf/percpu_freelist.h b/kernel/bpf/percpu_freelist.h
+new file mode 100644
+index 000000000000..3049aae8ea1e
+--- /dev/null
++++ b/kernel/bpf/percpu_freelist.h
+@@ -0,0 +1,31 @@
++/* Copyright (c) 2016 Facebook
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ */
++#ifndef __PERCPU_FREELIST_H__
++#define __PERCPU_FREELIST_H__
++#include <linux/spinlock.h>
++#include <linux/percpu.h>
++
++struct pcpu_freelist_head {
++	struct pcpu_freelist_node *first;
++	raw_spinlock_t lock;
++};
++
++struct pcpu_freelist {
++	struct pcpu_freelist_head __percpu *freelist;
++};
++
++struct pcpu_freelist_node {
++	struct pcpu_freelist_node *next;
++};
++
++void pcpu_freelist_push(struct pcpu_freelist *, struct pcpu_freelist_node *);
++struct pcpu_freelist_node *pcpu_freelist_pop(struct pcpu_freelist *);
++void pcpu_freelist_populate(struct pcpu_freelist *s, void *buf, u32 elem_size,
++			    u32 nr_elems);
++int pcpu_freelist_init(struct pcpu_freelist *);
++void pcpu_freelist_destroy(struct pcpu_freelist *s);
++#endif
