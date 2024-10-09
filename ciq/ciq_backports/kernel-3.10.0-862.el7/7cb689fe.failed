@@ -1,0 +1,279 @@
+scsi: scsi_dh_alua: Ensure that alua_activate() calls the completion function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] scsi_dh_alua: Ensure that alua_activate() calls the completion function (Mike Snitzer) [1499107]
+Rebuild_FUZZ: 95.95%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 7cb689fe42927281b8d98606ae5450173fcc66a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7cb689fe.failed
+
+Callers of scsi_dh_activate(), e.g. dm-mpath, assume that this function
+either returns an error code or calls the completion function. Make
+alua_activate() call the completion function even if scsi_device_get()
+fails.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Tang Junhui <tang.junhui@zte.com.cn>
+	Cc: <stable@vger.kernel.org>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7cb689fe42927281b8d98606ae5450173fcc66a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/device_handler/scsi_dh_alua.c
+diff --cc drivers/scsi/device_handler/scsi_dh_alua.c
+index 2f054f24112a,b6849d3ecefe..000000000000
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@@ -84,26 -112,23 +84,34 @@@ struct alua_dh_data 
+  #define ALUA_POLICY_SWITCH_CURRENT	0
+  #define ALUA_POLICY_SWITCH_ALL		1
+  
+++<<<<<<< HEAD
+ +static char print_alua_state(int);
+++=======
++ static void alua_rtpg_work(struct work_struct *work);
++ static bool alua_rtpg_queue(struct alua_port_group *pg,
++ 			    struct scsi_device *sdev,
++ 			    struct alua_queue_data *qdata, bool force);
++ static void alua_check(struct scsi_device *sdev, bool force);
+++>>>>>>> 7cb689fe4292 (scsi: scsi_dh_alua: Ensure that alua_activate() calls the completion function)
+  
+ -static void release_port_group(struct kref *kref)
+ +static inline struct alua_dh_data *get_alua_data(struct scsi_device *sdev)
+  {
+ -	struct alua_port_group *pg;
+ -
+ -	pg = container_of(kref, struct alua_port_group, kref);
+ -	if (pg->rtpg_sdev)
+ -		flush_delayed_work(&pg->rtpg_work);
+ -	spin_lock(&port_group_lock);
+ -	list_del(&pg->node);
+ -	spin_unlock(&port_group_lock);
+ -	kfree_rcu(pg, rcu);
+ +	return container_of(sdev->scsi_dh_data, struct alua_dh_data, dh_data);
+ +}
+ +
+ +static int realloc_buffer(struct alua_dh_data *h, unsigned len)
+ +{
+ +	if (h->buff && h->buff != h->inq)
+ +		kfree(h->buff);
+ +
+ +	h->buff = kmalloc(len, GFP_NOIO);
+ +	if (!h->buff) {
+ +		h->buff = h->inq;
+ +		h->bufflen = ALUA_INQUIRY_SIZE;
+ +		return 1;
+ +	}
+ +	h->bufflen = len;
+ +	return 0;
+  }
+  
+  /*
+@@@ -541,6 -776,147 +549,150 @@@ static unsigned alua_stpg(struct scsi_d
+  	return SCSI_DH_RETRY;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void alua_rtpg_work(struct work_struct *work)
++ {
++ 	struct alua_port_group *pg =
++ 		container_of(work, struct alua_port_group, rtpg_work.work);
++ 	struct scsi_device *sdev;
++ 	LIST_HEAD(qdata_list);
++ 	int err = SCSI_DH_OK;
++ 	struct alua_queue_data *qdata, *tmp;
++ 	unsigned long flags;
++ 	struct workqueue_struct *alua_wq = kaluad_wq;
++ 
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	sdev = pg->rtpg_sdev;
++ 	if (!sdev) {
++ 		WARN_ON(pg->flags & ALUA_PG_RUN_RTPG);
++ 		WARN_ON(pg->flags & ALUA_PG_RUN_STPG);
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		kref_put(&pg->kref, release_port_group);
++ 		return;
++ 	}
++ 	if (pg->flags & ALUA_SYNC_STPG)
++ 		alua_wq = kaluad_sync_wq;
++ 	pg->flags |= ALUA_PG_RUNNING;
++ 	if (pg->flags & ALUA_PG_RUN_RTPG) {
++ 		int state = pg->state;
++ 
++ 		pg->flags &= ~ALUA_PG_RUN_RTPG;
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		if (state == SCSI_ACCESS_STATE_TRANSITIONING) {
++ 			if (alua_tur(sdev) == SCSI_DH_RETRY) {
++ 				spin_lock_irqsave(&pg->lock, flags);
++ 				pg->flags &= ~ALUA_PG_RUNNING;
++ 				pg->flags |= ALUA_PG_RUN_RTPG;
++ 				spin_unlock_irqrestore(&pg->lock, flags);
++ 				queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 						   pg->interval * HZ);
++ 				return;
++ 			}
++ 			/* Send RTPG on failure or if TUR indicates SUCCESS */
++ 		}
++ 		err = alua_rtpg(sdev, pg);
++ 		spin_lock_irqsave(&pg->lock, flags);
++ 		if (err == SCSI_DH_RETRY || pg->flags & ALUA_PG_RUN_RTPG) {
++ 			pg->flags &= ~ALUA_PG_RUNNING;
++ 			pg->flags |= ALUA_PG_RUN_RTPG;
++ 			spin_unlock_irqrestore(&pg->lock, flags);
++ 			queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 					   pg->interval * HZ);
++ 			return;
++ 		}
++ 		if (err != SCSI_DH_OK)
++ 			pg->flags &= ~ALUA_PG_RUN_STPG;
++ 	}
++ 	if (pg->flags & ALUA_PG_RUN_STPG) {
++ 		pg->flags &= ~ALUA_PG_RUN_STPG;
++ 		spin_unlock_irqrestore(&pg->lock, flags);
++ 		err = alua_stpg(sdev, pg);
++ 		spin_lock_irqsave(&pg->lock, flags);
++ 		if (err == SCSI_DH_RETRY || pg->flags & ALUA_PG_RUN_RTPG) {
++ 			pg->flags |= ALUA_PG_RUN_RTPG;
++ 			pg->interval = 0;
++ 			pg->flags &= ~ALUA_PG_RUNNING;
++ 			spin_unlock_irqrestore(&pg->lock, flags);
++ 			queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 					   pg->interval * HZ);
++ 			return;
++ 		}
++ 	}
++ 
++ 	list_splice_init(&pg->rtpg_list, &qdata_list);
++ 	pg->rtpg_sdev = NULL;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 
++ 	list_for_each_entry_safe(qdata, tmp, &qdata_list, entry) {
++ 		list_del(&qdata->entry);
++ 		if (qdata->callback_fn)
++ 			qdata->callback_fn(qdata->callback_data, err);
++ 		kfree(qdata);
++ 	}
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	pg->flags &= ~ALUA_PG_RUNNING;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 	scsi_device_put(sdev);
++ 	kref_put(&pg->kref, release_port_group);
++ }
++ 
++ /**
++  * alua_rtpg_queue() - cause RTPG to be submitted asynchronously
++  *
++  * Returns true if and only if alua_rtpg_work() will be called asynchronously.
++  * That function is responsible for calling @qdata->fn().
++  */
++ static bool alua_rtpg_queue(struct alua_port_group *pg,
++ 			    struct scsi_device *sdev,
++ 			    struct alua_queue_data *qdata, bool force)
++ {
++ 	int start_queue = 0;
++ 	unsigned long flags;
++ 	struct workqueue_struct *alua_wq = kaluad_wq;
++ 
++ 	if (!pg || scsi_device_get(sdev))
++ 		return false;
++ 
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	if (qdata) {
++ 		list_add_tail(&qdata->entry, &pg->rtpg_list);
++ 		pg->flags |= ALUA_PG_RUN_STPG;
++ 		force = true;
++ 	}
++ 	if (pg->rtpg_sdev == NULL) {
++ 		pg->interval = 0;
++ 		pg->flags |= ALUA_PG_RUN_RTPG;
++ 		kref_get(&pg->kref);
++ 		pg->rtpg_sdev = sdev;
++ 		start_queue = 1;
++ 	} else if (!(pg->flags & ALUA_PG_RUN_RTPG) && force) {
++ 		pg->flags |= ALUA_PG_RUN_RTPG;
++ 		/* Do not queue if the worker is already running */
++ 		if (!(pg->flags & ALUA_PG_RUNNING)) {
++ 			kref_get(&pg->kref);
++ 			start_queue = 1;
++ 		}
++ 	}
++ 
++ 	if (pg->flags & ALUA_SYNC_STPG)
++ 		alua_wq = kaluad_sync_wq;
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 
++ 	if (start_queue) {
++ 		if (queue_delayed_work(alua_wq, &pg->rtpg_work,
++ 				msecs_to_jiffies(ALUA_RTPG_DELAY_MSECS)))
++ 			sdev = NULL;
++ 		else
++ 			kref_put(&pg->kref, release_port_group);
++ 	}
++ 	if (sdev)
++ 		scsi_device_put(sdev);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 7cb689fe4292 (scsi: scsi_dh_alua: Ensure that alua_activate() calls the completion function)
+  /*
+   * alua_initialize - Initialize ALUA state
+   * @sdev: the device to be initialized
+@@@ -616,19 -992,37 +768,40 @@@ MODULE_PARM_DESC(optimize_stpg, "Allow 
+  static int alua_activate(struct scsi_device *sdev,
+  			activate_complete fn, void *data)
+  {
+ -	struct alua_dh_data *h = sdev->handler_data;
+ +	struct alua_dh_data *h = get_alua_data(sdev);
+  	int err = SCSI_DH_OK;
+ -	struct alua_queue_data *qdata;
+ -	struct alua_port_group *pg;
+  
+ -	qdata = kzalloc(sizeof(*qdata), GFP_KERNEL);
+ -	if (!qdata) {
+ -		err = SCSI_DH_RES_TEMP_UNAVAIL;
+ +	err = alua_rtpg(sdev, h, 1);
+ +	if (err != SCSI_DH_OK)
+  		goto out;
+ -	}
+ -	qdata->callback_fn = fn;
+ -	qdata->callback_data = data;
+  
+++<<<<<<< HEAD
+ +	if (optimize_stpg)
+ +		h->flags |= ALUA_OPTIMIZE_STPG;
+ +
+ +	err = alua_stpg(sdev, h);
+ +	if (err == SCSI_DH_RETRY)
+ +		err = alua_rtpg(sdev, h, 1);
+++=======
++ 	mutex_lock(&h->init_mutex);
++ 	rcu_read_lock();
++ 	pg = rcu_dereference(h->pg);
++ 	if (!pg || !kref_get_unless_zero(&pg->kref)) {
++ 		rcu_read_unlock();
++ 		kfree(qdata);
++ 		err = h->init_error;
++ 		mutex_unlock(&h->init_mutex);
++ 		goto out;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_unlock(&h->init_mutex);
++ 
++ 	if (alua_rtpg_queue(pg, sdev, qdata, true))
++ 		fn = NULL;
++ 	else
++ 		err = SCSI_DH_DEV_OFFLINED;
++ 	kref_put(&pg->kref, release_port_group);
+++>>>>>>> 7cb689fe4292 (scsi: scsi_dh_alua: Ensure that alua_activate() calls the completion function)
+  out:
+  	if (fn)
+  		fn(data, err);
+* Unmerged path drivers/scsi/device_handler/scsi_dh_alua.c
