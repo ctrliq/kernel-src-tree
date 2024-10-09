@@ -1,0 +1,104 @@
+sctp: check duplicate node before inserting a new transport
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit cd2b708750582e327789d8fb07c6eb5f79f7759f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cd2b7087.failed
+
+sctp has changed to use rhlist for transport rhashtable since commit
+7fda702f9315 ("sctp: use new rhlist interface on sctp transport
+rhashtable").
+
+But rhltable_insert_key doesn't check the duplicate node when inserting
+a node, unlike rhashtable_lookup_insert_key. It may cause duplicate
+assoc/transport in rhashtable. like:
+
+ client (addr A, B)                 server (addr X, Y)
+    connect to X           INIT (1)
+                        ------------>
+    connect to Y           INIT (2)
+                        ------------>
+                         INIT_ACK (1)
+                        <------------
+                         INIT_ACK (2)
+                        <------------
+
+After sending INIT (2), one transport will be created and hashed into
+rhashtable. But when receiving INIT_ACK (1) and processing the address
+params, another transport will be created and hashed into rhashtable
+with the same addr Y and EP as the last transport. This will confuse
+the assoc/transport's lookup.
+
+This patch is to fix it by returning err if any duplicate node exists
+before inserting it.
+
+Fixes: 7fda702f9315 ("sctp: use new rhlist interface on sctp transport rhashtable")
+	Reported-by: Fabio M. Di Nitto <fdinitto@redhat.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cd2b708750582e327789d8fb07c6eb5f79f7759f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/input.c
+diff --cc net/sctp/input.c
+index 9cdbec2d525c,fc458968fe4b..000000000000
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@@ -884,24 -867,40 +884,46 @@@ int sctp_transport_hashtable_init(void
+  
+  void sctp_transport_hashtable_destroy(void)
+  {
+ -	rhltable_destroy(&sctp_transport_hashtable);
+ +	rhashtable_destroy(&sctp_transport_hashtable);
+  }
+  
+ -int sctp_hash_transport(struct sctp_transport *t)
+ +void sctp_hash_transport(struct sctp_transport *t)
+  {
++ 	struct sctp_transport *transport;
++ 	struct rhlist_head *tmp, *list;
+  	struct sctp_hash_cmp_arg arg;
+ -	int err;
+  
+  	if (t->asoc->temp)
+ -		return 0;
+ +		return;
+  
+ -	arg.net   = sock_net(t->asoc->base.sk);
+ +	arg.ep = t->asoc->ep;
+  	arg.paddr = &t->ipaddr;
+ -	arg.lport = htons(t->asoc->base.bind_addr.port);
+ +	arg.net   = sock_net(t->asoc->base.sk);
+  
+++<<<<<<< HEAD
+ +reinsert:
+ +	if (rhashtable_lookup_insert_key(&sctp_transport_hashtable, &arg,
+ +					 &t->node, sctp_hash_params) == -EBUSY)
+ +		goto reinsert;
+++=======
++ 	list = rhltable_lookup(&sctp_transport_hashtable, &arg,
++ 			       sctp_hash_params);
++ 
++ 	rhl_for_each_entry_rcu(transport, tmp, list, node)
++ 		if (transport->asoc->ep == t->asoc->ep) {
++ 			err = -EEXIST;
++ 			goto out;
++ 		}
++ 
++ 	err = rhltable_insert_key(&sctp_transport_hashtable, &arg,
++ 				  &t->node, sctp_hash_params);
++ 
++ out:
++ 	if (err)
++ 		pr_err_once("insert transport fail, errno %d\n", err);
++ 
++ 	return err;
+++>>>>>>> cd2b70875058 (sctp: check duplicate node before inserting a new transport)
+  }
+  
+  void sctp_unhash_transport(struct sctp_transport *t)
+* Unmerged path net/sctp/input.c
