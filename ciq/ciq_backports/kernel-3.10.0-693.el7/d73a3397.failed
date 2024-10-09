@@ -1,0 +1,140 @@
+locking/qspinlock, x86: Enable x86-64 to use queued spinlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Waiman Long <Waiman.Long@hp.com>
+commit d73a33973f16ab6703e75ea00edee857afa3406e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d73a3397.failed
+
+This patch makes the necessary changes at the x86 architecture
+specific layer to enable the use of queued spinlocks for x86-64. As
+x86-32 machines are typically not multi-socket. The benefit of queue
+spinlock may not be apparent. So queued spinlocks are not enabled.
+
+Currently, there is some incompatibilities between the para-virtualized
+spinlock code (which hard-codes the use of ticket spinlock) and the
+queued spinlocks. Therefore, the use of queued spinlocks is disabled
+when the para-virtualized spinlock is enabled.
+
+The arch/x86/include/asm/qspinlock.h header file includes some x86
+specific optimization which will make the queueds spinlock code
+perform better than the generic implementation.
+
+	Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Daniel J Blueman <daniel@numascale.com>
+	Cc: David Vrabel <david.vrabel@citrix.com>
+	Cc: Douglas Hatch <doug.hatch@hp.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paolo Bonzini <paolo.bonzini@gmail.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Scott J Norton <scott.norton@hp.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: virtualization@lists.linux-foundation.org
+	Cc: xen-devel@lists.xenproject.org
+Link: http://lkml.kernel.org/r/1429901803-29771-3-git-send-email-Waiman.Long@hp.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d73a33973f16ab6703e75ea00edee857afa3406e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+diff --cc arch/x86/Kconfig
+index d30a5322b64f,90b1b54f4f38..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -124,6 -127,8 +124,11 @@@ config X8
+  	select MODULES_USE_ELF_RELA if X86_64
+  	select CLONE_BACKWARDS if X86_32
+  	select ARCH_USE_BUILTIN_BSWAP
+++<<<<<<< HEAD
+++=======
++ 	select ARCH_USE_QUEUED_SPINLOCK
++ 	select ARCH_USE_QUEUE_RWLOCK
+++>>>>>>> d73a33973f16 (locking/qspinlock, x86: Enable x86-64 to use queued spinlocks)
+  	select OLD_SIGSUSPEND3 if X86_32 || IA32_EMULATION
+  	select OLD_SIGACTION if X86_32
+  	select COMPAT_OLD_SIGACTION if IA32_EMULATION
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/qspinlock.h b/arch/x86/include/asm/qspinlock.h
+new file mode 100644
+index 000000000000..e2aee8273664
+--- /dev/null
++++ b/arch/x86/include/asm/qspinlock.h
+@@ -0,0 +1,20 @@
++#ifndef _ASM_X86_QSPINLOCK_H
++#define _ASM_X86_QSPINLOCK_H
++
++#include <asm-generic/qspinlock_types.h>
++
++#define	queued_spin_unlock queued_spin_unlock
++/**
++ * queued_spin_unlock - release a queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ *
++ * A smp_store_release() on the least-significant byte.
++ */
++static inline void queued_spin_unlock(struct qspinlock *lock)
++{
++	smp_store_release((u8 *)lock, 0);
++}
++
++#include <asm-generic/qspinlock.h>
++
++#endif /* _ASM_X86_QSPINLOCK_H */
+diff --git a/arch/x86/include/asm/spinlock.h b/arch/x86/include/asm/spinlock.h
+index 9b4f7b005289..1b618382ee48 100644
+--- a/arch/x86/include/asm/spinlock.h
++++ b/arch/x86/include/asm/spinlock.h
+@@ -47,6 +47,10 @@ static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
+ extern struct static_key paravirt_ticketlocks_enabled;
+ static __always_inline bool static_key_false(struct static_key *key);
+ 
++#ifdef CONFIG_QUEUED_SPINLOCK
++#include <asm/qspinlock.h>
++#else
++
+ #ifdef CONFIG_PARAVIRT_SPINLOCKS
+ 
+ static inline void __ticket_enter_slowpath(arch_spinlock_t *lock)
+@@ -186,6 +190,7 @@ static inline void arch_spin_unlock_wait(arch_spinlock_t *lock)
+ 	while (arch_spin_is_locked(lock))
+ 		cpu_relax();
+ }
++#endif /* CONFIG_QUEUED_SPINLOCK */
+ 
+ /*
+  * Read-write spinlocks, allowing multiple readers
+diff --git a/arch/x86/include/asm/spinlock_types.h b/arch/x86/include/asm/spinlock_types.h
+index c7cf2f532f65..964acccea684 100644
+--- a/arch/x86/include/asm/spinlock_types.h
++++ b/arch/x86/include/asm/spinlock_types.h
+@@ -23,6 +23,9 @@ typedef u32 __ticketpair_t;
+ 
+ #define TICKET_SHIFT	(sizeof(__ticket_t) * 8)
+ 
++#ifdef CONFIG_QUEUED_SPINLOCK
++#include <asm-generic/qspinlock_types.h>
++#else
+ typedef struct arch_spinlock {
+ 	union {
+ 		__ticketpair_t head_tail;
+@@ -33,6 +36,7 @@ typedef struct arch_spinlock {
+ } arch_spinlock_t;
+ 
+ #define __ARCH_SPIN_LOCK_UNLOCKED	{ { 0 } }
++#endif /* CONFIG_QUEUED_SPINLOCK */
+ 
+ #include <asm/rwlock.h>
+ 
