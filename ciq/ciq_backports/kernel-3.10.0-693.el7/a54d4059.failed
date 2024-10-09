@@ -1,0 +1,130 @@
+xprtrdma: Chunk list encoders must not return zero
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit a54d4059e5f356c522aabfd38563ab6e64773263
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a54d4059.failed
+
+Clean up, based on code audit: Remove the possibility that the
+chunk list XDR encoders can return zero, which would be interpreted
+as a NULL.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit a54d4059e5f356c522aabfd38563ab6e64773263)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,bc5f4a1e3122..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -213,9 -244,19 +213,16 @@@ fmr_op_map(struct rpcrdma_xprt *r_xprt
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+  			break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	mw->mw_nents = i;
++ 	mw->mw_dir = rpcrdma_data_dir(writing);
++ 	if (i == 0)
++ 		goto out_dmamap_err;
+++>>>>>>> a54d4059e5f3 (xprtrdma: Chunk list encoders must not return zero)
+  
+ -	if (!ib_dma_map_sg(r_xprt->rx_ia.ri_device,
+ -			   mw->mw_sg, mw->mw_nents, mw->mw_dir))
+ -		goto out_dmamap_err;
+ -
+ -	for (i = 0, dma_pages = mw->fmr.fm_physaddrs; i < mw->mw_nents; i++)
+ -		dma_pages[i] = sg_dma_address(&mw->mw_sg[i]);
+ -	rc = ib_map_phys_fmr(mw->fmr.fm_mr, dma_pages, mw->mw_nents,
+ -			     dma_pages[0]);
+ +	rc = ib_map_phys_fmr(mw->fmr.fmr, mw->fmr.physaddrs,
+ +			     i, seg1->mr_dma);
+  	if (rc)
+  		goto out_maperr;
+  
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,f3a06faf0a18..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -415,25 -409,22 +415,32 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  		    offset_in_page((seg-1)->mr_offset + (seg-1)->mr_len))
+  			break;
+  	}
+++<<<<<<< HEAD
+ +	frmr->sg_nents = i;
+++=======
++ 	mw->mw_nents = i;
++ 	mw->mw_dir = rpcrdma_data_dir(writing);
++ 	if (i == 0)
++ 		goto out_dmamap_err;
+++>>>>>>> a54d4059e5f3 (xprtrdma: Chunk list encoders must not return zero)
+  
+ -	dma_nents = ib_dma_map_sg(ia->ri_device,
+ -				  mw->mw_sg, mw->mw_nents, mw->mw_dir);
+ -	if (!dma_nents)
+ -		goto out_dmamap_err;
+ +	dma_nents = ib_dma_map_sg(device, frmr->sg, frmr->sg_nents, direction);
+ +	if (!dma_nents) {
+ +		pr_err("RPC:       %s: failed to dma map sg %p sg_nents %u\n",
+ +		       __func__, frmr->sg, frmr->sg_nents);
+ +		return -ENOMEM;
+ +	}
+  
+ -	n = ib_map_mr_sg(mr, mw->mw_sg, mw->mw_nents, NULL, PAGE_SIZE);
+ -	if (unlikely(n != mw->mw_nents))
+ -		goto out_mapmr_err;
+ +	n = ib_map_mr_sg(mr, frmr->sg, frmr->sg_nents, NULL, PAGE_SIZE);
+ +	if (unlikely(n != frmr->sg_nents)) {
+ +		pr_err("RPC:       %s: failed to map mr %p (%u/%u)\n",
+ +		       __func__, frmr->fr_mr, n, frmr->sg_nents);
+ +		rc = n < 0 ? n : -EINVAL;
+ +		goto out_senderr;
+ +	}
+  
+  	dprintk("RPC:       %s: Using frmr %p to map %u segments (%u bytes)\n",
+ -		__func__, mw, mw->mw_nents, mr->length);
+ +		__func__, mw, frmr->sg_nents, mr->length);
+  
+  	key = (u8)(mr->rkey & 0x000000FF);
+  	ib_update_fast_reg_key(mr, ++key);
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index d2719e1b5171..ba35f408ab56 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -480,7 +480,7 @@ rpcrdma_encode_read_list(struct rpcrdma_xprt *r_xprt,
+ 
+ 	do {
+ 		n = r_xprt->rx_ia.ri_ops->ro_map(r_xprt, seg, nsegs, false);
+-		if (n <= 0)
++		if (n < 0)
+ 			return ERR_PTR(n);
+ 
+ 		*iptr++ = xdr_one;	/* item present */
+@@ -548,7 +548,7 @@ rpcrdma_encode_write_list(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
+ 	nchunks = 0;
+ 	do {
+ 		n = r_xprt->rx_ia.ri_ops->ro_map(r_xprt, seg, nsegs, true);
+-		if (n <= 0)
++		if (n < 0)
+ 			return ERR_PTR(n);
+ 
+ 		iptr = xdr_encode_rdma_segment(iptr, seg);
+@@ -613,7 +613,7 @@ rpcrdma_encode_reply_chunk(struct rpcrdma_xprt *r_xprt,
+ 	nchunks = 0;
+ 	do {
+ 		n = r_xprt->rx_ia.ri_ops->ro_map(r_xprt, seg, nsegs, true);
+-		if (n <= 0)
++		if (n < 0)
+ 			return ERR_PTR(n);
+ 
+ 		iptr = xdr_encode_rdma_segment(iptr, seg);
