@@ -1,0 +1,119 @@
+perf evsel: Allow to ignore missing pid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Olsa <jolsa@redhat.com>
+commit a359c17a7e1a9c99384499cf7b43d80867080789
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a359c17a.failed
+
+Adding perf_evsel::ignore_missing_cpu_thread bool.
+
+When set true, it allows perf to ignore error of missing pid of perf
+event syscall.
+
+We remove missing thread id from the thread_map, so the rest of the
+processing like ioctl and mmap won't get disturbed with -1 fd.
+
+The reason for supporting this is to ease up monitoring group of pids,
+that 'disappear' before perf opens their event. This currently leads
+perf to report error and exit and makes perf record's -u option unusable
+under certain setup.
+
+With this change we will allow this race and ignore such failure with
+following warning:
+
+  WARNING: Ignored open failure for pid 8605
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20161213074622.GA3084@krava
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit a359c17a7e1a9c99384499cf7b43d80867080789)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/perf.h
+#	tools/perf/util/evsel.c
+diff --cc tools/perf/perf.h
+index 693cda7dcc6f,1c27d947c2fe..000000000000
+--- a/tools/perf/perf.h
++++ b/tools/perf/perf.h
+@@@ -60,6 -53,9 +60,12 @@@ struct record_opts 
+  	bool	     record_switch_events;
+  	bool	     all_kernel;
+  	bool	     all_user;
+++<<<<<<< HEAD
+++=======
++ 	bool	     tail_synthesize;
++ 	bool	     overwrite;
++ 	bool	     ignore_missing_thread;
+++>>>>>>> a359c17a7e1a (perf evsel: Allow to ignore missing pid)
+  	unsigned int freq;
+  	unsigned int mmap_pages;
+  	unsigned int auxtrace_mmap_pages;
+diff --cc tools/perf/util/evsel.c
+index f76f126b80c9,04e536ae4d88..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -1428,16 -1510,32 +1457,35 @@@ retry_sample_id
+  
+  			group_fd = get_group_fd(evsel, cpu, thread);
+  retry_open:
+ -			pr_debug2("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx",
+ +			pr_debug2("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx\n",
+  				  pid, cpus->map[cpu], group_fd, flags);
+  
+ -			fd = sys_perf_event_open(&evsel->attr, pid, cpus->map[cpu],
+ -						 group_fd, flags);
+ -
+ -			FD(evsel, cpu, thread) = fd;
+ -
+ -			if (fd < 0) {
+ +			FD(evsel, cpu, thread) = sys_perf_event_open(&evsel->attr,
+ +								     pid,
+ +								     cpus->map[cpu],
+ +								     group_fd, flags);
+ +			if (FD(evsel, cpu, thread) < 0) {
+  				err = -errno;
+++<<<<<<< HEAD
+ +				pr_debug2("sys_perf_event_open failed, error %d\n",
+++=======
++ 
++ 				if (ignore_missing_thread(evsel, threads, thread, err)) {
++ 					/*
++ 					 * We just removed 1 thread, so take a step
++ 					 * back on thread index and lower the upper
++ 					 * nthreads limit.
++ 					 */
++ 					nthreads--;
++ 					thread--;
++ 
++ 					/* ... and pretend like nothing have happened. */
++ 					err = 0;
++ 					continue;
++ 				}
++ 
++ 				pr_debug2("\nsys_perf_event_open failed, error %d\n",
+++>>>>>>> a359c17a7e1a (perf evsel: Allow to ignore missing pid)
+  					  err);
+  				goto try_fallback;
+  			}
+* Unmerged path tools/perf/perf.h
+* Unmerged path tools/perf/util/evsel.c
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index 686af5a4b625..e29471a319f7 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -112,6 +112,7 @@ struct perf_evsel {
+ 	bool			tracking;
+ 	bool			per_pkg;
+ 	bool			precise_max;
++	bool			ignore_missing_thread;
+ 	/* parse modifier helper */
+ 	int			exclude_GH;
+ 	int			nr_members;
