@@ -1,0 +1,338 @@
+x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots() (Vitaly Kuznetsov) [1565739 1497611]
+Rebuild_FUZZ: 96.55%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 6a82cd1c7b1e38d3b940fcb35a81e902dd52fb35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6a82cd1c.failed
+
+Add an option to specify which MMU root we want to free. This will
+be used when nested and non-nested MMUs for L1 are split.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+(cherry picked from commit 6a82cd1c7b1e38d3b940fcb35a81e902dd52fb35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a,586ef144e564..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1168,6 -1339,8 +1168,11 @@@ void __kvm_mmu_free_some_pages(struct k
+  int kvm_mmu_load(struct kvm_vcpu *vcpu);
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu);
+  void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+++=======
++ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
++ 			ulong roots_to_free);
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+  			   struct x86_exception *exception);
+  gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+diff --cc arch/x86/kvm/mmu.c
+index e7052d2c946d,96c753746b3b..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -3319,34 -3460,44 +3319,55 @@@ static int nonpaging_map(struct kvm_vcp
+  out_unlock:
+  	spin_unlock(&vcpu->kvm->mmu_lock);
+  	kvm_release_pfn_clean(pfn);
+ -	return RET_PF_RETRY;
+ +	return 0;
+  }
+  
+ -static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
+ -			       struct list_head *invalid_list)
+ -{
+ -	struct kvm_mmu_page *sp;
+  
+++<<<<<<< HEAD
+ +static void mmu_free_roots(struct kvm_vcpu *vcpu)
+++=======
++ 	if (!VALID_PAGE(*root_hpa))
++ 		return;
++ 
++ 	sp = page_header(*root_hpa & PT64_BASE_ADDR_MASK);
++ 	--sp->root_count;
++ 	if (!sp->root_count && sp->role.invalid)
++ 		kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
++ 
++ 	*root_hpa = INVALID_PAGE;
++ }
++ 
++ /* roots_to_free must be some combination of the KVM_MMU_ROOT_* flags */
++ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
++ 			ulong roots_to_free)
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  {
+  	int i;
+ +	struct kvm_mmu_page *sp;
+  	LIST_HEAD(invalid_list);
+++<<<<<<< HEAD
+++=======
++ 	bool free_active_root = roots_to_free & KVM_MMU_ROOT_CURRENT;
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  
+ -	BUILD_BUG_ON(KVM_MMU_NUM_PREV_ROOTS >= BITS_PER_LONG);
+ +	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+ +		return;
+  
+ -	/* Before acquiring the MMU lock, see if we need to do any real work. */
+ -	if (!(free_active_root && VALID_PAGE(mmu->root_hpa))) {
+ -		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+ -			if ((roots_to_free & KVM_MMU_ROOT_PREVIOUS(i)) &&
+ -			    VALID_PAGE(mmu->prev_roots[i].hpa))
+ -				break;
+ +	if (vcpu->arch.mmu.shadow_root_level == PT64_ROOT_LEVEL &&
+ +	    (vcpu->arch.mmu.root_level == PT64_ROOT_LEVEL ||
+ +	     vcpu->arch.mmu.direct_map)) {
+ +		hpa_t root = vcpu->arch.mmu.root_hpa;
+  
+ -		if (i == KVM_MMU_NUM_PREV_ROOTS)
+ -			return;
+ +		spin_lock(&vcpu->kvm->mmu_lock);
+ +		sp = page_header(root);
+ +		--sp->root_count;
+ +		if (!sp->root_count && sp->role.invalid) {
+ +			kvm_mmu_prepare_zap_page(vcpu->kvm, sp, &invalid_list);
+ +			kvm_mmu_commit_zap_page(vcpu->kvm, &invalid_list);
+ +		}
+ +		spin_unlock(&vcpu->kvm->mmu_lock);
+ +		vcpu->arch.mmu.root_hpa = INVALID_PAGE;
+ +		return;
+  	}
+  
+  	spin_lock(&vcpu->kvm->mmu_lock);
+@@@ -3914,11 -4113,104 +3935,80 @@@ static void nonpaging_init_context(stru
+  	context->nx = false;
+  }
+  
+ -/*
+ - * Find out if a previously cached root matching the new CR3/role is available.
+ - * The current root is also inserted into the cache.
+ - * If a matching root was found, it is assigned to kvm_mmu->root_hpa and true is
+ - * returned.
+ - * Otherwise, the LRU root from the cache is assigned to kvm_mmu->root_hpa and
+ - * false is returned. This root should now be freed by the caller.
+ - */
+ -static bool cached_root_available(struct kvm_vcpu *vcpu, gpa_t new_cr3,
+ -				  union kvm_mmu_page_role new_role)
+ +void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu)
+  {
+ -	uint i;
+ -	struct kvm_mmu_root_info root;
+ -	struct kvm_mmu *mmu = vcpu->arch.mmu;
+ -
+ -	root.cr3 = mmu->get_cr3(vcpu);
+ -	root.hpa = mmu->root_hpa;
+ -
+ -	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
+ -		swap(root, mmu->prev_roots[i]);
+ -
+ -		if (new_cr3 == root.cr3 && VALID_PAGE(root.hpa) &&
+ -		    page_header(root.hpa) != NULL &&
+ -		    new_role.word == page_header(root.hpa)->role.word)
+ -			break;
+ -	}
+ -
+ -	mmu->root_hpa = root.hpa;
+ -
+ -	return i < KVM_MMU_NUM_PREV_ROOTS;
+ +	mmu_free_roots(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool fast_cr3_switch(struct kvm_vcpu *vcpu, gpa_t new_cr3,
++ 			    union kvm_mmu_page_role new_role,
++ 			    bool skip_tlb_flush)
++ {
++ 	struct kvm_mmu *mmu = vcpu->arch.mmu;
++ 
++ 	/*
++ 	 * For now, limit the fast switch to 64-bit hosts+VMs in order to avoid
++ 	 * having to deal with PDPTEs. We may add support for 32-bit hosts/VMs
++ 	 * later if necessary.
++ 	 */
++ 	if (mmu->shadow_root_level >= PT64_ROOT_4LEVEL &&
++ 	    mmu->root_level >= PT64_ROOT_4LEVEL) {
++ 		if (mmu_check_root(vcpu, new_cr3 >> PAGE_SHIFT))
++ 			return false;
++ 
++ 		if (cached_root_available(vcpu, new_cr3, new_role)) {
++ 			/*
++ 			 * It is possible that the cached previous root page is
++ 			 * obsolete because of a change in the MMU
++ 			 * generation number. However, that is accompanied by
++ 			 * KVM_REQ_MMU_RELOAD, which will free the root that we
++ 			 * have set here and allocate a new one.
++ 			 */
++ 
++ 			kvm_make_request(KVM_REQ_LOAD_CR3, vcpu);
++ 			if (!skip_tlb_flush) {
++ 				kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
++ 				kvm_x86_ops->tlb_flush(vcpu, true);
++ 			}
++ 
++ 			/*
++ 			 * The last MMIO access's GVA and GPA are cached in the
++ 			 * VCPU. When switching to a new CR3, that GVA->GPA
++ 			 * mapping may no longer be valid. So clear any cached
++ 			 * MMIO info even when we don't need to sync the shadow
++ 			 * page tables.
++ 			 */
++ 			vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
++ 
++ 			__clear_sp_write_flooding_count(
++ 				page_header(mmu->root_hpa));
++ 
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void __kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3,
++ 			      union kvm_mmu_page_role new_role,
++ 			      bool skip_tlb_flush)
++ {
++ 	if (!fast_cr3_switch(vcpu, new_cr3, new_role, skip_tlb_flush))
++ 		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu,
++ 				   KVM_MMU_ROOT_CURRENT);
++ }
++ 
++ void kvm_mmu_new_cr3(struct kvm_vcpu *vcpu, gpa_t new_cr3, bool skip_tlb_flush)
++ {
++ 	__kvm_mmu_new_cr3(vcpu, new_cr3, kvm_mmu_calc_root_page_role(vcpu),
++ 			  skip_tlb_flush);
++ }
++ EXPORT_SYMBOL_GPL(kvm_mmu_new_cr3);
++ 
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  static unsigned long get_cr3(struct kvm_vcpu *vcpu)
+  {
+  	return kvm_read_cr3(vcpu);
+@@@ -4614,8 -4982,8 +4704,13 @@@ EXPORT_SYMBOL_GPL(kvm_mmu_load)
+  
+  void kvm_mmu_unload(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	mmu_free_roots(vcpu);
+ +	WARN_ON(VALID_PAGE(vcpu->arch.mmu.root_hpa));
+++=======
++ 	kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, KVM_MMU_ROOTS_ALL);
++ 	WARN_ON(VALID_PAGE(vcpu->arch.mmu->root_hpa));
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  }
+  EXPORT_SYMBOL_GPL(kvm_mmu_unload);
+  
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,a0c3992a5e88..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -7897,11 -9074,84 +7897,89 @@@ static int handle_invvpid(struct kvm_vc
+  		return 1;
+  	}
+  
+ -	vmx_instruction_info = vmcs_read32(VMX_INSTRUCTION_INFO);
+ -	type = kvm_register_readl(vcpu, (vmx_instruction_info >> 28) & 0xf);
+ +	__vmx_flush_tlb(vcpu, vmx->nested.vpid02);
+ +	nested_vmx_succeed(vcpu);
+  
+++<<<<<<< HEAD
+ +	skip_emulated_instruction(vcpu);
+ +	return 1;
+++=======
++ 	if (type > 3) {
++ 		kvm_inject_gp(vcpu, 0);
++ 		return 1;
++ 	}
++ 
++ 	/* According to the Intel instruction reference, the memory operand
++ 	 * is read even if it isn't needed (e.g., for type==all)
++ 	 */
++ 	if (get_vmx_mem_address(vcpu, vmcs_readl(EXIT_QUALIFICATION),
++ 				vmx_instruction_info, false, &gva))
++ 		return 1;
++ 
++ 	if (kvm_read_guest_virt(vcpu, gva, &operand, sizeof(operand), &e)) {
++ 		kvm_inject_page_fault(vcpu, &e);
++ 		return 1;
++ 	}
++ 
++ 	if (operand.pcid >> 12 != 0) {
++ 		kvm_inject_gp(vcpu, 0);
++ 		return 1;
++ 	}
++ 
++ 	pcid_enabled = kvm_read_cr4_bits(vcpu, X86_CR4_PCIDE);
++ 
++ 	switch (type) {
++ 	case INVPCID_TYPE_INDIV_ADDR:
++ 		if ((!pcid_enabled && (operand.pcid != 0)) ||
++ 		    is_noncanonical_address(operand.gla, vcpu)) {
++ 			kvm_inject_gp(vcpu, 0);
++ 			return 1;
++ 		}
++ 		kvm_mmu_invpcid_gva(vcpu, operand.gla, operand.pcid);
++ 		return kvm_skip_emulated_instruction(vcpu);
++ 
++ 	case INVPCID_TYPE_SINGLE_CTXT:
++ 		if (!pcid_enabled && (operand.pcid != 0)) {
++ 			kvm_inject_gp(vcpu, 0);
++ 			return 1;
++ 		}
++ 
++ 		if (kvm_get_active_pcid(vcpu) == operand.pcid) {
++ 			kvm_mmu_sync_roots(vcpu);
++ 			kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
++ 		}
++ 
++ 		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
++ 			if (kvm_get_pcid(vcpu, vcpu->arch.mmu->prev_roots[i].cr3)
++ 			    == operand.pcid)
++ 				roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
++ 
++ 		kvm_mmu_free_roots(vcpu, vcpu->arch.mmu, roots_to_free);
++ 		/*
++ 		 * If neither the current cr3 nor any of the prev_roots use the
++ 		 * given PCID, then nothing needs to be done here because a
++ 		 * resync will happen anyway before switching to any other CR3.
++ 		 */
++ 
++ 		return kvm_skip_emulated_instruction(vcpu);
++ 
++ 	case INVPCID_TYPE_ALL_NON_GLOBAL:
++ 		/*
++ 		 * Currently, KVM doesn't mark global entries in the shadow
++ 		 * page tables, so a non-global flush just degenerates to a
++ 		 * global flush. If needed, we could optimize this later by
++ 		 * keeping track of global entries in shadow page tables.
++ 		 */
++ 
++ 		/* fall-through */
++ 	case INVPCID_TYPE_ALL_INCL_GLOBAL:
++ 		kvm_mmu_unload(vcpu);
++ 		return kvm_skip_emulated_instruction(vcpu);
++ 
++ 	default:
++ 		BUG(); /* We have already checked above that type <= 3 */
++ 	}
+++>>>>>>> 6a82cd1c7b1e (x86/kvm/mmu.c: add kvm_mmu parameter to kvm_mmu_free_roots())
+  }
+  
+  static int handle_pml_full(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/vmx.c
