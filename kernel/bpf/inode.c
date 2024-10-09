@@ -141,17 +141,16 @@ static int bpf_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	return 0;
 }
 
-static int bpf_mkobj_ops(struct inode *dir, struct dentry *dentry,
-			 umode_t mode, const struct inode_operations *iops)
+static int bpf_mkobj_ops(struct dentry *dentry, umode_t mode, void *raw,
+			 const struct inode_operations *iops)
 {
-	struct inode *inode;
-
-	inode = bpf_get_inode(dir->i_sb, dir, mode | S_IFREG);
+	struct inode *dir = dentry->d_parent->d_inode;
+	struct inode *inode = bpf_get_inode(dir->i_sb, dir, mode);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
 	inode->i_op = iops;
-	inode->i_private = dentry->d_fsdata;
+	inode->i_private = raw;
 
 	d_instantiate(dentry, inode);
 	dget(dentry);
@@ -159,23 +158,14 @@ static int bpf_mkobj_ops(struct inode *dir, struct dentry *dentry,
 	return 0;
 }
 
-static int bpf_mkobj(struct inode *dir, struct dentry *dentry, umode_t mode,
-		     dev_t devt)
+static int bpf_mkprog(struct dentry *dentry, umode_t mode, void *arg)
 {
-	enum bpf_type type = MINOR(devt);
+	return bpf_mkobj_ops(dentry, mode, arg, &bpf_prog_iops);
+}
 
-	if (MAJOR(devt) != UNNAMED_MAJOR || !S_ISREG(mode) ||
-	    dentry->d_fsdata == NULL)
-		return -EPERM;
-
-	switch (type) {
-	case BPF_TYPE_PROG:
-		return bpf_mkobj_ops(dir, dentry, mode, &bpf_prog_iops);
-	case BPF_TYPE_MAP:
-		return bpf_mkobj_ops(dir, dentry, mode, &bpf_map_iops);
-	default:
-		return -EPERM;
-	}
+static int bpf_mkmap(struct dentry *dentry, umode_t mode, void *arg)
+{
+	return bpf_mkobj_ops(dentry, mode, arg, &bpf_map_iops);
 }
 
 static struct dentry *
@@ -191,7 +181,6 @@ bpf_lookup(struct inode *dir, struct dentry *dentry, unsigned flags)
 
 static const struct inode_operations bpf_dir_iops = {
 	.lookup		= bpf_lookup,
-	.mknod		= bpf_mkobj,
 	.mkdir		= bpf_mkdir,
 	.rmdir		= simple_rmdir,
 	.rename		= simple_rename,
@@ -206,7 +195,6 @@ static int bpf_obj_do_pin(const struct filename *pathname, void *raw,
 	struct inode *dir;
 	struct path path;
 	umode_t mode;
-	dev_t devt;
 	int ret;
 
 	dentry = kern_path_create(AT_FDCWD, pathname->name, &path, 0);
@@ -214,9 +202,8 @@ static int bpf_obj_do_pin(const struct filename *pathname, void *raw,
 		return PTR_ERR(dentry);
 
 	mode = S_IFREG | ((S_IRUSR | S_IWUSR) & ~current_umask());
-	devt = MKDEV(UNNAMED_MAJOR, type);
 
-	ret = security_path_mknod(&path, dentry, mode, devt);
+	ret = security_path_mknod(&path, dentry, mode, 0);
 	if (ret)
 		goto out;
 
@@ -226,9 +213,16 @@ static int bpf_obj_do_pin(const struct filename *pathname, void *raw,
 		goto out;
 	}
 
-	dentry->d_fsdata = raw;
-	ret = vfs_mknod(dir, dentry, mode, devt);
-	dentry->d_fsdata = NULL;
+	switch (type) {
+	case BPF_TYPE_PROG:
+		ret = vfs_mkobj(dentry, mode, bpf_mkprog, raw);
+		break;
+	case BPF_TYPE_MAP:
+		ret = vfs_mkobj(dentry, mode, bpf_mkmap, raw);
+		break;
+	default:
+		ret = -EPERM;
+	}
 out:
 	done_path_create(&path, dentry);
 	return ret;
