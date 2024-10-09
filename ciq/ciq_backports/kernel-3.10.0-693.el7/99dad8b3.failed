@@ -1,0 +1,216 @@
+i40e: Drop redundant Rx descriptor processing code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Duyck <alexander.h.duyck@intel.com>
+commit 99dad8b34c687cb8c4975fbabced76db35f88c14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/99dad8b3.failed
+
+This patch cleans up several pieces of redundant code in the Rx clean-up
+paths.
+
+The first bit is that hdr_addr and the status_err_len portions of the Rx
+descriptor represent the same value.  As such there is no point in setting
+them to 0 before setting them to 0.  I'm dropping the second spot where we
+are updating the value to 0 so that we only have 1 write for this value
+instead of 2.
+
+The second piece is the checking for the DD bit in the packet.  We only
+need to check for a non-zero value for the status_err_len because if the
+device is done with the descriptor it will have written something back and
+the DD is just one piece of it.  In addition I have moved the reading of
+the Rx descriptor bits related to rx_ptype down so that they are actually
+below the dma_rmb() call so that we are guaranteed that we don't have any
+funky 64b on 32b calls causing any ordering issues.
+
+Change-ID: I256e44a025d3c64a7224aaaec37c852bfcb1871b
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 99dad8b34c687cb8c4975fbabced76db35f88c14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 720b2fdc697f,daade4fe80d6..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -1349,6 -1193,65 +1349,68 @@@ static void i40e_receive_skb(struct i40
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i40e_alloc_rx_buffers - Replace used receive buffers
++  * @rx_ring: ring to place buffers on
++  * @cleaned_count: number of buffers to replace
++  *
++  * Returns false if all allocations were successful, true if any fail
++  **/
++ bool i40e_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
++ {
++ 	u16 ntu = rx_ring->next_to_use;
++ 	union i40e_rx_desc *rx_desc;
++ 	struct i40e_rx_buffer *bi;
++ 
++ 	/* do nothing if no valid netdev defined */
++ 	if (!rx_ring->netdev || !cleaned_count)
++ 		return false;
++ 
++ 	rx_desc = I40E_RX_DESC(rx_ring, ntu);
++ 	bi = &rx_ring->rx_bi[ntu];
++ 
++ 	do {
++ 		if (!i40e_alloc_mapped_page(rx_ring, bi))
++ 			goto no_buffers;
++ 
++ 		/* Refresh the desc even if buffer_addrs didn't change
++ 		 * because each write-back erases this info.
++ 		 */
++ 		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
++ 
++ 		rx_desc++;
++ 		bi++;
++ 		ntu++;
++ 		if (unlikely(ntu == rx_ring->count)) {
++ 			rx_desc = I40E_RX_DESC(rx_ring, 0);
++ 			bi = rx_ring->rx_bi;
++ 			ntu = 0;
++ 		}
++ 
++ 		/* clear the status bits for the next_to_use descriptor */
++ 		rx_desc->wb.qword1.status_error_len = 0;
++ 
++ 		cleaned_count--;
++ 	} while (cleaned_count);
++ 
++ 	if (rx_ring->next_to_use != ntu)
++ 		i40e_release_rx_desc(rx_ring, ntu);
++ 
++ 	return false;
++ 
++ no_buffers:
++ 	if (rx_ring->next_to_use != ntu)
++ 		i40e_release_rx_desc(rx_ring, ntu);
++ 
++ 	/* make sure to come back via polling to try again after
++ 	 * allocation failure
++ 	 */
++ 	return true;
++ }
++ 
++ /**
+++>>>>>>> 99dad8b34c68 (i40e: Drop redundant Rx descriptor processing code)
+   * i40e_rx_checksum - Indicate in skb if hw indicated a good cksum
+   * @vsi: the VSI we care about
+   * @skb: skb currently being received and modified
+@@@ -1505,13 -1751,15 +1567,25 @@@ static int i40e_clean_rx_irq_1buf(struc
+  			cleaned_count = 0;
+  		}
+  
+++<<<<<<< HEAD
+ +		i = rx_ring->next_to_clean;
+ +		rx_desc = I40E_RX_DESC(rx_ring, i);
+ +		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
+ +		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
+ +			I40E_RXD_QW1_STATUS_SHIFT;
+ +
+ +		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
+++=======
++ 		rx_desc = I40E_RX_DESC(rx_ring, rx_ring->next_to_clean);
++ 
++ 		/* status_error_len will always be zero for unused descriptors
++ 		 * because it's cleared in cleanup, and overlaps with hdr_addr
++ 		 * which is always zero because packet split isn't used, if the
++ 		 * hardware wrote DD then it will be non-zero
++ 		 */
++ 		if (!i40e_test_staterr(rx_desc,
++ 				       BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
+++>>>>>>> 99dad8b34c68 (i40e: Drop redundant Rx descriptor processing code)
+  			break;
+  
+  		/* This memory barrier is needed to keep us from reading
+@@@ -1573,15 -1792,14 +1647,24 @@@
+  
+  		/* probably a little skewed due to removing CRC */
+  		total_rx_bytes += skb->len;
+ +		total_rx_packets++;
+  
+++<<<<<<< HEAD
+ +		skb->protocol = eth_type_trans(skb, rx_ring->netdev);
+++=======
++ 		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
++ 		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
++ 			   I40E_RXD_QW1_PTYPE_SHIFT;
++ 
++ 		/* populate checksum, VLAN, and protocol */
++ 		i40e_process_skb_fields(rx_ring, rx_desc, skb, rx_ptype);
+++>>>>>>> 99dad8b34c68 (i40e: Drop redundant Rx descriptor processing code)
+ +
+ +		i40e_rx_checksum(vsi, skb, rx_status, rx_error, rx_ptype);
+  
+ +		vlan_tag = rx_status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
+ +			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
+ +			 : 0;
+  #ifdef I40E_FCOE
+  		if (unlikely(
+  		    i40e_rx_is_fcoe(rx_ptype) &&
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index 85865b72670c..3374c2ffc633 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@ -705,7 +705,6 @@ bool i40evf_alloc_rx_buffers(struct i40e_ring *rx_ring, u16 cleaned_count)
+ 		 * because each write-back erases this info.
+ 		 */
+ 		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma + bi->page_offset);
+-		rx_desc->read.hdr_addr = 0;
+ 
+ 		rx_desc++;
+ 		bi++;
+@@ -1205,7 +1204,6 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
+ 	while (likely(total_rx_packets < budget)) {
+ 		union i40e_rx_desc *rx_desc;
+ 		struct sk_buff *skb;
+-		u32 rx_status;
+ 		u16 vlan_tag;
+ 		u8 rx_ptype;
+ 		u64 qword;
+@@ -1219,21 +1217,13 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
+ 
+ 		rx_desc = I40E_RX_DESC(rx_ring, rx_ring->next_to_clean);
+ 
+-		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
+-		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
+-			   I40E_RXD_QW1_PTYPE_SHIFT;
+-		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
+-			    I40E_RXD_QW1_STATUS_SHIFT;
+-
+-		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
+-			break;
+-
+ 		/* status_error_len will always be zero for unused descriptors
+ 		 * because it's cleared in cleanup, and overlaps with hdr_addr
+ 		 * which is always zero because packet split isn't used, if the
+ 		 * hardware wrote DD then it will be non-zero
+ 		 */
+-		if (!rx_desc->wb.qword1.status_error_len)
++		if (!i40e_test_staterr(rx_desc,
++				       BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
+ 			break;
+ 
+ 		/* This memory barrier is needed to keep us from reading
+@@ -1267,6 +1257,10 @@ static int i40e_clean_rx_irq(struct i40e_ring *rx_ring, int budget)
+ 		/* probably a little skewed due to removing CRC */
+ 		total_rx_bytes += skb->len;
+ 
++		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
++		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
++			   I40E_RXD_QW1_PTYPE_SHIFT;
++
+ 		/* populate checksum, VLAN, and protocol */
+ 		i40evf_process_skb_fields(rx_ring, rx_desc, skb, rx_ptype);
+ 
