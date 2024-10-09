@@ -365,15 +365,21 @@ static const struct nla_policy flow_policy[TCA_FLOW_MAX + 1] = {
 	[TCA_FLOW_PERTURB]	= { .type = NLA_U32 },
 };
 
+static void __flow_destroy_filter(struct flow_filter *f)
+{
+	del_timer_sync(&f->perturb_timer);
+	tcf_exts_destroy(&f->exts);
+	tcf_em_tree_destroy(&f->ematches);
+	tcf_exts_put_net(&f->exts);
+	kfree(f);
+}
+
 static void flow_destroy_filter_work(struct work_struct *work)
 {
 	struct flow_filter *f = container_of(work, struct flow_filter, work);
 
 	rtnl_lock();
-	del_timer_sync(&f->perturb_timer);
-	tcf_exts_destroy(&f->exts);
-	tcf_em_tree_destroy(&f->ematches);
-	kfree(f);
+	__flow_destroy_filter(f);
 	rtnl_unlock();
 }
 
@@ -550,8 +556,10 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
 
 	*arg = (unsigned long)fnew;
 
-	if (fold)
+	if (fold) {
+		tcf_exts_get_net(&fold->exts);
 		call_rcu(&fold->rcu, flow_destroy_filter);
+	}
 	return 0;
 
 err2:
@@ -567,6 +575,7 @@ static int flow_delete(struct tcf_proto *tp, unsigned long arg)
 	struct flow_filter *f = (struct flow_filter *)arg;
 
 	list_del_rcu(&f->list);
+	tcf_exts_get_net(&f->exts);
 	call_rcu(&f->rcu, flow_destroy_filter);
 	return 0;
 }
@@ -593,7 +602,10 @@ static bool flow_destroy(struct tcf_proto *tp, bool force)
 
 	list_for_each_entry_safe(f, next, &head->filters, list) {
 		list_del_rcu(&f->list);
-		call_rcu(&f->rcu, flow_destroy_filter);
+		if (tcf_exts_get_net(&f->exts))
+			call_rcu(&f->rcu, flow_destroy_filter);
+		else
+			__flow_destroy_filter(f);
 	}
 	kfree_rcu(head, rcu);
 	return true;
