@@ -1,0 +1,138 @@
+ibmvnic: fix missing unlock on error in __ibmvnic_reset()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wei Yongjun <weiyongjun1@huawei.com>
+commit 6d0af07d5f4579ed8d43eb2de91c84c79c780755
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6d0af07d.failed
+
+Add the missing unlock before return from function __ibmvnic_reset()
+in the error handling case.
+
+Fixes: ed651a10875f ("ibmvnic: Updated reset handling")
+	Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+	Reviewed-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d0af07d5f4579ed8d43eb2de91c84c79c780755)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 0a15141d22b3,27f79339e9a8..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -955,6 -1257,107 +955,110 @@@ static int ibmvnic_change_mtu(struct ne
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ibmvnic_rwi *get_next_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	if (!list_empty(&adapter->rwi_list)) {
++ 		rwi = list_first_entry(&adapter->rwi_list, struct ibmvnic_rwi,
++ 				       list);
++ 		list_del(&rwi->list);
++ 	} else {
++ 		rwi = NULL;
++ 	}
++ 
++ 	mutex_unlock(&adapter->rwi_lock);
++ 	return rwi;
++ }
++ 
++ static void free_all_rwi(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		kfree(rwi);
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ }
++ 
++ static void __ibmvnic_reset(struct work_struct *work)
++ {
++ 	struct ibmvnic_rwi *rwi;
++ 	struct ibmvnic_adapter *adapter;
++ 	struct net_device *netdev;
++ 	u32 reset_state;
++ 	int rc;
++ 
++ 	adapter = container_of(work, struct ibmvnic_adapter, ibmvnic_reset);
++ 	netdev = adapter->netdev;
++ 
++ 	mutex_lock(&adapter->reset_lock);
++ 	adapter->resetting = true;
++ 	reset_state = adapter->state;
++ 
++ 	rwi = get_next_rwi(adapter);
++ 	while (rwi) {
++ 		rc = do_reset(adapter, rwi, reset_state);
++ 		kfree(rwi);
++ 		if (rc)
++ 			break;
++ 
++ 		rwi = get_next_rwi(adapter);
++ 	}
++ 
++ 	if (rc) {
++ 		free_all_rwi(adapter);
++ 		mutex_unlock(&adapter->reset_lock);
++ 		return;
++ 	}
++ 
++ 	adapter->resetting = false;
++ 	mutex_unlock(&adapter->reset_lock);
++ }
++ 
++ static void ibmvnic_reset(struct ibmvnic_adapter *adapter,
++ 			  enum ibmvnic_reset_reason reason)
++ {
++ 	struct ibmvnic_rwi *rwi, *tmp;
++ 	struct net_device *netdev = adapter->netdev;
++ 	struct list_head *entry;
++ 
++ 	if (adapter->state == VNIC_REMOVING ||
++ 	    adapter->state == VNIC_REMOVED) {
++ 		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
++ 		return;
++ 	}
++ 
++ 	mutex_lock(&adapter->rwi_lock);
++ 
++ 	list_for_each(entry, &adapter->rwi_list) {
++ 		tmp = list_entry(entry, struct ibmvnic_rwi, list);
++ 		if (tmp->reset_reason == reason) {
++ 			netdev_err(netdev, "Matching reset found, skipping\n");
++ 			mutex_unlock(&adapter->rwi_lock);
++ 			return;
++ 		}
++ 	}
++ 
++ 	rwi = kzalloc(sizeof(*rwi), GFP_KERNEL);
++ 	if (!rwi) {
++ 		mutex_unlock(&adapter->rwi_lock);
++ 		ibmvnic_close(netdev);
++ 		return;
++ 	}
++ 
++ 	rwi->reset_reason = reason;
++ 	list_add_tail(&rwi->list, &adapter->rwi_list);
++ 	mutex_unlock(&adapter->rwi_lock);
++ 	schedule_work(&adapter->ibmvnic_reset);
++ }
++ 
+++>>>>>>> 6d0af07d5f45 (ibmvnic: fix missing unlock on error in __ibmvnic_reset())
+  static void ibmvnic_tx_timeout(struct net_device *dev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(dev);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
