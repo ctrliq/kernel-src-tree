@@ -1,0 +1,190 @@
+crypto: ccp - fix lock acquisition code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [crypto] ccp - fix lock acquisition code (Suravee Suthikulpanit) [1390820]
+Rebuild_FUZZ: 88.57%
+commit-author Gary R Hook <gary.hook@amd.com>
+commit 03a6f29000fdc13adc2bb2e22efd07a51d334154
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/03a6f290.failed
+
+This patch simplifies an unneeded read-write lock.
+
+	Signed-off-by: Gary R Hook <gary.hook@amd.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 03a6f29000fdc13adc2bb2e22efd07a51d334154)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/ccp/ccp-dev.c
+diff --cc drivers/crypto/ccp/ccp-dev.c
+index 2777dc97b570,4dbc18727235..000000000000
+--- a/drivers/crypto/ccp/ccp-dev.c
++++ b/drivers/crypto/ccp/ccp-dev.c
+@@@ -35,23 -39,150 +35,101 @@@ struct ccp_tasklet_data 
+  	struct ccp_cmd *cmd;
+  };
+  
+ -/* List of CCPs, CCP count, read-write access lock, and access functions
+ - *
+ - * Lock structure: get ccp_unit_lock for reading whenever we need to
+ - * examine the CCP list. While holding it for reading we can acquire
+ - * the RR lock to update the round-robin next-CCP pointer. The unit lock
+ - * must be acquired before the RR lock.
+ - *
+ - * If the unit-lock is acquired for writing, we have total control over
+ - * the list, so there's no value in getting the RR lock.
+ - */
+ -static DEFINE_RWLOCK(ccp_unit_lock);
+ -static LIST_HEAD(ccp_units);
+  
+++<<<<<<< HEAD
+ +static struct ccp_device *ccp_dev;
+ +static inline struct ccp_device *ccp_get_device(void)
+++=======
++ /* Round-robin counter */
++ static DEFINE_SPINLOCK(ccp_rr_lock);
++ static struct ccp_device *ccp_rr;
++ 
++ /* Ever-increasing value to produce unique unit numbers */
++ static atomic_t ccp_unit_ordinal;
++ unsigned int ccp_increment_unit_ordinal(void)
+++>>>>>>> 03a6f29000fd (crypto: ccp - fix lock acquisition code)
+  {
+ -	return atomic_inc_return(&ccp_unit_ordinal);
+ +	return ccp_dev;
+  }
+  
+ -/**
+ - * ccp_add_device - add a CCP device to the list
+ - *
+ - * @ccp: ccp_device struct pointer
+ - *
+ - * Put this CCP on the unit list, which makes it available
+ - * for use.
+ - *
+ - * Returns zero if a CCP device is present, -ENODEV otherwise.
+ - */
+ -void ccp_add_device(struct ccp_device *ccp)
+ +static inline void ccp_add_device(struct ccp_device *ccp)
+  {
+ -	unsigned long flags;
+ -
+ -	write_lock_irqsave(&ccp_unit_lock, flags);
+ -	list_add_tail(&ccp->entry, &ccp_units);
+ -	if (!ccp_rr)
+ -		/* We already have the list lock (we're first) so this
+ -		 * pointer can't change on us. Set its initial value.
+ -		 */
+ -		ccp_rr = ccp;
+ -	write_unlock_irqrestore(&ccp_unit_lock, flags);
+ +	ccp_dev = ccp;
+  }
+  
+ -/**
+ - * ccp_del_device - remove a CCP device from the list
+ - *
+ - * @ccp: ccp_device struct pointer
+ - *
+ - * Remove this unit from the list of devices. If the next device
+ - * up for use is this one, adjust the pointer. If this is the last
+ - * device, NULL the pointer.
+ - */
+ -void ccp_del_device(struct ccp_device *ccp)
+ +static inline void ccp_del_device(struct ccp_device *ccp)
+  {
+ -	unsigned long flags;
+ -
+ -	write_lock_irqsave(&ccp_unit_lock, flags);
+ -	if (ccp_rr == ccp) {
+ -		/* ccp_unit_lock is read/write; any read access
+ -		 * will be suspended while we make changes to the
+ -		 * list and RR pointer.
+ -		 */
+ -		if (list_is_last(&ccp_rr->entry, &ccp_units))
+ -			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
+ -						  entry);
+ -		else
+ -			ccp_rr = list_next_entry(ccp_rr, entry);
+ -	}
+ -	list_del(&ccp->entry);
+ -	if (list_empty(&ccp_units))
+ -		ccp_rr = NULL;
+ -	write_unlock_irqrestore(&ccp_unit_lock, flags);
+ +	ccp_dev = NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ccp_device *ccp_get_device(void)
++ {
++ 	unsigned long flags;
++ 	struct ccp_device *dp = NULL;
++ 
++ 	/* We round-robin through the unit list.
++ 	 * The (ccp_rr) pointer refers to the next unit to use.
++ 	 */
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	if (!list_empty(&ccp_units)) {
++ 		spin_lock(&ccp_rr_lock);
++ 		dp = ccp_rr;
++ 		if (list_is_last(&ccp_rr->entry, &ccp_units))
++ 			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
++ 						  entry);
++ 		else
++ 			ccp_rr = list_next_entry(ccp_rr, entry);
++ 		spin_unlock(&ccp_rr_lock);
++ 	}
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return dp;
++ }
++ 
++ /**
++  * ccp_present - check if a CCP device is present
++  *
++  * Returns zero if a CCP device is present, -ENODEV otherwise.
++  */
++ int ccp_present(void)
++ {
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	ret = list_empty(&ccp_units);
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return ret ? -ENODEV : 0;
++ }
++ EXPORT_SYMBOL_GPL(ccp_present);
++ 
++ /**
++  * ccp_version - get the version of the CCP device
++  *
++  * Returns the version from the first unit on the list;
++  * otherwise a zero if no CCP device is present
++  */
++ unsigned int ccp_version(void)
++ {
++ 	struct ccp_device *dp;
++ 	unsigned long flags;
++ 	int ret = 0;
++ 
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	if (!list_empty(&ccp_units)) {
++ 		dp = list_first_entry(&ccp_units, struct ccp_device, entry);
++ 		ret = dp->vdata->version;
++ 	}
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(ccp_version);
++ 
+++>>>>>>> 03a6f29000fd (crypto: ccp - fix lock acquisition code)
+  /**
+   * ccp_enqueue_cmd - queue an operation for processing by the CCP
+   *
+* Unmerged path drivers/crypto/ccp/ccp-dev.c
