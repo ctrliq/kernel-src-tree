@@ -1,0 +1,95 @@
+fs/file.c: __fget() and dup2() atomicity rules
+
+jira LE-1907
+cve CVE-2021-4083
+Rebuild_History Non-Buildable kernel-3.10.0-1160.62.1.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 5ba97d2832f87943c43bb69cb1ef86dbc59df5bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.62.1.el7/5ba97d28.failed
+
+__fget() does lockless fetch of pointer from the descriptor
+table, attempts to grab a reference and treats "it was already
+zero" as "it's already gone from the table, we just hadn't
+seen the store, let's fail".  Unfortunately, that breaks the
+atomicity of dup2() - __fget() might see the old pointer,
+notice that it's been already dropped and treat that as
+"it's closed".  What we should be getting is either the
+old file or new one, depending whether we come before or after
+dup2().
+
+Dmitry had following test failing sometimes :
+
+int fd;
+void *Thread(void *x) {
+  char buf;
+  int n = read(fd, &buf, 1);
+  if (n != 1)
+    exit(printf("read failed: n=%d errno=%d\n", n, errno));
+  return 0;
+}
+
+int main()
+{
+  fd = open("/dev/urandom", O_RDONLY);
+  int fd2 = open("/dev/urandom", O_RDONLY);
+  if (fd == -1 || fd2 == -1)
+    exit(printf("open failed\n"));
+  pthread_t th;
+  pthread_create(&th, 0, Thread, 0);
+  if (dup2(fd2, fd) == -1)
+    exit(printf("dup2 failed\n"));
+  pthread_join(th, 0);
+  if (close(fd) == -1)
+    exit(printf("close failed\n"));
+  if (close(fd2) == -1)
+    exit(printf("close failed\n"));
+  printf("DONE\n");
+  return 0;
+}
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5ba97d2832f87943c43bb69cb1ef86dbc59df5bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file.c
+diff --cc fs/file.c
+index 44bd634b636a,6c672ad329e9..000000000000
+--- a/fs/file.c
++++ b/fs/file.c
+@@@ -718,17 -658,23 +718,28 @@@ void do_close_on_exec(struct files_stru
+  	spin_unlock(&files->file_lock);
+  }
+  
+ -static struct file *__fget(unsigned int fd, fmode_t mask)
+ +struct file *fget(unsigned int fd)
+  {
+ -	struct files_struct *files = current->files;
+  	struct file *file;
+ +	struct files_struct *files = current->files;
+  
+  	rcu_read_lock();
++ loop:
+  	file = fcheck_files(files, fd);
+  	if (file) {
+++<<<<<<< HEAD
+ +		/* File object ref couldn't be taken */
+ +		if (file->f_mode & FMODE_PATH || !get_file_rcu(file))
+++=======
++ 		/* File object ref couldn't be taken.
++ 		 * dup2() atomicity guarantee is the reason
++ 		 * we loop to catch the new file (or NULL pointer)
++ 		 */
++ 		if (file->f_mode & mask)
+++>>>>>>> 5ba97d2832f8 (fs/file.c: __fget() and dup2() atomicity rules)
+  			file = NULL;
++ 		else if (!get_file_rcu(file))
++ 			goto loop;
+  	}
+  	rcu_read_unlock();
+  
+* Unmerged path fs/file.c
