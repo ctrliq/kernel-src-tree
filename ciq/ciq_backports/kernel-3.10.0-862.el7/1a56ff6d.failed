@@ -1,0 +1,272 @@
+IB/core: Separate CQ handle in SRQ context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Artemy Kovalyov <artemyko@mellanox.com>
+commit 1a56ff6daab1e062aadec582eb10e7090f0b370a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1a56ff6d.failed
+
+Before this change CQ attached to SRQ was part of XRC specific extension.
+Moving CQ handle out makes it available to other types extending SRQ
+functionality.
+
+	Signed-off-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Reviewed-by: Yossi Itigin <yosefe@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 1a56ff6daab1e062aadec582eb10e7090f0b370a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 4761b0709900,9f690af46a7e..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -4028,9 -3497,12 +4028,17 @@@ static int __uverbs_create_xsrq(struct 
+  
+  		obj->uxrcd = container_of(xrcd_uobj, struct ib_uxrcd_object, uobject);
+  		atomic_inc(&obj->uxrcd->refcnt);
++ 	}
+  
+++<<<<<<< HEAD
+ +		attr.ext.xrc.cq  = idr_read_cq(cmd->cq_handle, file->ucontext, 0);
+ +		if (!attr.ext.xrc.cq) {
+++=======
++ 	if (ib_srq_has_cq(cmd->srq_type)) {
++ 		attr.ext.cq  = uobj_get_obj_read(cq, cmd->cq_handle,
++ 						 file->ucontext);
++ 		if (!attr.ext.cq) {
+++>>>>>>> 1a56ff6daab1 (IB/core: Separate CQ handle in SRQ context)
+  			ret = -EINVAL;
+  			goto err_put_xrcd;
+  		}
+@@@ -4093,19 -3566,14 +4104,30 @@@
+  		goto err_copy;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (cmd->srq_type == IB_SRQT_XRC) {
+ +		put_uobj_read(xrcd_uobj);
+ +		put_cq_read(attr.ext.xrc.cq);
+ +	}
+ +	put_pd_read(pd);
+ +
+ +	mutex_lock(&file->mutex);
+ +	list_add_tail(&obj->uevent.uobject.list, &file->ucontext->srq_list);
+ +	mutex_unlock(&file->mutex);
+ +
+ +	obj->uevent.uobject.live = 1;
+ +
+ +	up_write(&obj->uevent.uobject.mutex);
+++=======
++ 	if (cmd->srq_type == IB_SRQT_XRC)
++ 		uobj_put_read(xrcd_uobj);
++ 
++ 	if (ib_srq_has_cq(cmd->srq_type))
++ 		uobj_put_obj_read(attr.ext.cq);
++ 
++ 	uobj_put_obj_read(pd);
++ 	uobj_alloc_commit(&obj->uevent.uobject);
+++>>>>>>> 1a56ff6daab1 (IB/core: Separate CQ handle in SRQ context)
+  
+  	return 0;
+  
+@@@ -4116,11 -3581,11 +4138,16 @@@ err_destroy
+  	ib_destroy_srq(srq);
+  
+  err_put:
+ -	uobj_put_obj_read(pd);
+ +	put_pd_read(pd);
+  
+  err_put_cq:
+++<<<<<<< HEAD
+ +	if (cmd->srq_type == IB_SRQT_XRC)
+ +		put_cq_read(attr.ext.xrc.cq);
+++=======
++ 	if (ib_srq_has_cq(cmd->srq_type))
++ 		uobj_put_obj_read(attr.ext.cq);
+++>>>>>>> 1a56ff6daab1 (IB/core: Separate CQ handle in SRQ context)
+  
+  err_put_xrcd:
+  	if (cmd->srq_type == IB_SRQT_XRC) {
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 701892bca8b9..525cecd59d9e 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -623,11 +623,13 @@ struct ib_srq *ib_create_srq(struct ib_pd *pd,
+ 		srq->event_handler = srq_init_attr->event_handler;
+ 		srq->srq_context   = srq_init_attr->srq_context;
+ 		srq->srq_type      = srq_init_attr->srq_type;
++		if (ib_srq_has_cq(srq->srq_type)) {
++			srq->ext.cq   = srq_init_attr->ext.cq;
++			atomic_inc(&srq->ext.cq->usecnt);
++		}
+ 		if (srq->srq_type == IB_SRQT_XRC) {
+ 			srq->ext.xrc.xrcd = srq_init_attr->ext.xrc.xrcd;
+-			srq->ext.xrc.cq   = srq_init_attr->ext.xrc.cq;
+ 			atomic_inc(&srq->ext.xrc.xrcd->usecnt);
+-			atomic_inc(&srq->ext.xrc.cq->usecnt);
+ 		}
+ 		atomic_inc(&pd->usecnt);
+ 		atomic_set(&srq->usecnt, 0);
+@@ -668,18 +670,18 @@ int ib_destroy_srq(struct ib_srq *srq)
+ 
+ 	pd = srq->pd;
+ 	srq_type = srq->srq_type;
+-	if (srq_type == IB_SRQT_XRC) {
++	if (ib_srq_has_cq(srq_type))
++		cq = srq->ext.cq;
++	if (srq_type == IB_SRQT_XRC)
+ 		xrcd = srq->ext.xrc.xrcd;
+-		cq = srq->ext.xrc.cq;
+-	}
+ 
+ 	ret = srq->device->destroy_srq(srq);
+ 	if (!ret) {
+ 		atomic_dec(&pd->usecnt);
+-		if (srq_type == IB_SRQT_XRC) {
++		if (srq_type == IB_SRQT_XRC)
+ 			atomic_dec(&xrcd->usecnt);
++		if (ib_srq_has_cq(srq_type))
+ 			atomic_dec(&cq->usecnt);
+-		}
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/infiniband/hw/mlx4/srq.c b/drivers/infiniband/hw/mlx4/srq.c
+index bc1910dad0fd..a20f3680dddd 100644
+--- a/drivers/infiniband/hw/mlx4/srq.c
++++ b/drivers/infiniband/hw/mlx4/srq.c
+@@ -183,8 +183,8 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 		}
+ 	}
+ 
+-	cqn = (init_attr->srq_type == IB_SRQT_XRC) ?
+-		to_mcq(init_attr->ext.xrc.cq)->mcq.cqn : 0;
++	cqn = ib_srq_has_cq(init_attr->srq_type) ?
++		to_mcq(init_attr->ext.cq)->mcq.cqn : 0;
+ 	xrcdn = (init_attr->srq_type == IB_SRQT_XRC) ?
+ 		to_mxrcd(init_attr->ext.xrc.xrcd)->xrcdn :
+ 		(u16) dev->dev->caps.reserved_xrcds;
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 07280121ba52..049617c7a1bf 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -3005,7 +3005,7 @@ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ 	attr.attr.max_sge = 1;
+ 	attr.attr.max_wr = 1;
+ 	attr.srq_type = IB_SRQT_XRC;
+-	attr.ext.xrc.cq = devr->c0;
++	attr.ext.cq = devr->c0;
+ 	attr.ext.xrc.xrcd = devr->x0;
+ 
+ 	devr->s0 = mlx5_ib_create_srq(devr->p0, &attr, NULL);
+@@ -3020,9 +3020,9 @@ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ 	devr->s0->srq_context   = NULL;
+ 	devr->s0->srq_type      = IB_SRQT_XRC;
+ 	devr->s0->ext.xrc.xrcd	= devr->x0;
+-	devr->s0->ext.xrc.cq	= devr->c0;
++	devr->s0->ext.cq	= devr->c0;
+ 	atomic_inc(&devr->s0->ext.xrc.xrcd->usecnt);
+-	atomic_inc(&devr->s0->ext.xrc.cq->usecnt);
++	atomic_inc(&devr->s0->ext.cq->usecnt);
+ 	atomic_inc(&devr->p0->usecnt);
+ 	atomic_set(&devr->s0->usecnt, 0);
+ 
+@@ -3041,9 +3041,9 @@ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ 	devr->s1->event_handler = NULL;
+ 	devr->s1->srq_context   = NULL;
+ 	devr->s1->srq_type      = IB_SRQT_BASIC;
+-	devr->s1->ext.xrc.cq	= devr->c0;
++	devr->s1->ext.cq	= devr->c0;
+ 	atomic_inc(&devr->p0->usecnt);
+-	atomic_set(&devr->s0->usecnt, 0);
++	atomic_set(&devr->s1->usecnt, 0);
+ 
+ 	for (port = 0; port < ARRAY_SIZE(devr->ports); ++port) {
+ 		INIT_WORK(&devr->ports[port].pkey_change_work,
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 7cb145f9a6db..f3fd29a94b54 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -292,13 +292,16 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+ 	in.wqe_shift = srq->msrq.wqe_shift - 4;
+ 	if (srq->wq_sig)
+ 		in.flags |= MLX5_SRQ_FLAG_WQ_SIG;
+-	if (init_attr->srq_type == IB_SRQT_XRC) {
++
++	if (init_attr->srq_type == IB_SRQT_XRC)
+ 		in.xrcd = to_mxrcd(init_attr->ext.xrc.xrcd)->xrcdn;
+-		in.cqn = to_mcq(init_attr->ext.xrc.cq)->mcq.cqn;
+-	} else if (init_attr->srq_type == IB_SRQT_BASIC) {
++	else
+ 		in.xrcd = to_mxrcd(dev->devr.x0)->xrcdn;
++
++	if (ib_srq_has_cq(init_attr->srq_type))
++		in.cqn = to_mcq(init_attr->ext.cq)->mcq.cqn;
++	else
+ 		in.cqn = to_mcq(dev->devr.c0)->mcq.cqn;
+-	}
+ 
+ 	in.pd = to_mpd(pd)->pdn;
+ 	in.db_record = srq->db.dma;
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 4d1f48778a52..173a0757b994 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -963,6 +963,11 @@ enum ib_srq_type {
+ 	IB_SRQT_XRC
+ };
+ 
++static inline bool ib_srq_has_cq(enum ib_srq_type srq_type)
++{
++	return srq_type == IB_SRQT_XRC;
++}
++
+ enum ib_srq_attr_mask {
+ 	IB_SRQ_MAX_WR	= 1 << 0,
+ 	IB_SRQ_LIMIT	= 1 << 1,
+@@ -980,11 +985,13 @@ struct ib_srq_init_attr {
+ 	struct ib_srq_attr	attr;
+ 	enum ib_srq_type	srq_type;
+ 
+-	union {
+-		struct {
+-			struct ib_xrcd *xrcd;
+-			struct ib_cq   *cq;
+-		} xrc;
++	struct {
++		struct ib_cq   *cq;
++		union {
++			struct {
++				struct ib_xrcd *xrcd;
++			} xrc;
++		};
+ 	} ext;
+ };
+ 
+@@ -1498,12 +1505,14 @@ struct ib_srq {
+ 	enum ib_srq_type	srq_type;
+ 	atomic_t		usecnt;
+ 
+-	union {
+-		struct {
+-			struct ib_xrcd *xrcd;
+-			struct ib_cq   *cq;
+-			u32		srq_num;
+-		} xrc;
++	struct {
++		struct ib_cq   *cq;
++		union {
++			struct {
++				struct ib_xrcd *xrcd;
++				u32		srq_num;
++			} xrc;
++		};
+ 	} ext;
+ };
+ 
