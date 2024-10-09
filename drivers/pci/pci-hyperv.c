@@ -55,6 +55,7 @@
 #include <linux/irqdomain.h>
 #include <linux/msi.h>
 #include <linux/hyperv.h>
+#include <linux/refcount.h>
 #include <asm/mshyperv.h>
 
 /*
@@ -500,7 +501,7 @@ enum hv_pcidev_ref_reason {
 struct hv_pci_dev {
 	/* List protected by pci_rescan_remove_lock */
 	struct list_head list_entry;
-	atomic_t refs;
+	refcount_t refs;
 	enum hv_pcichild_state state;
 	struct pci_function_description desc;
 	bool reported_missing;
@@ -1459,13 +1460,13 @@ static void q_resource_requirements(void *context, struct pci_response *resp,
 static void get_pcichild(struct hv_pci_dev *hpdev,
 			    enum hv_pcidev_ref_reason reason)
 {
-	atomic_inc(&hpdev->refs);
+	refcount_inc(&hpdev->refs);
 }
 
 static void put_pcichild(struct hv_pci_dev *hpdev,
 			    enum hv_pcidev_ref_reason reason)
 {
-	if (atomic_dec_and_test(&hpdev->refs))
+	if (refcount_dec_and_test(&hpdev->refs))
 		kfree(hpdev);
 }
 
@@ -1520,7 +1521,7 @@ static struct hv_pci_dev *new_pcichild_device(struct hv_pcibus_device *hbus,
 		goto error;
 
 	hpdev->desc = *desc;
-	get_pcichild(hpdev, hv_pcidev_ref_initial);
+	refcount_set(&hpdev->refs, 1);
 	get_pcichild(hpdev, hv_pcidev_ref_childlist);
 	spin_lock_irqsave(&hbus->device_list_lock, flags);
 
