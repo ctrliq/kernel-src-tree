@@ -1,0 +1,146 @@
+vhost/vsock: split packets to send using multiple buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [vhost] vsock: split packets to send using multiple buffers (Stefano Garzarella) [1777349]
+Rebuild_FUZZ: 94.44%
+commit-author Stefano Garzarella <sgarzare@redhat.com>
+commit 6dbd3e66e7785a2f055bf84d98de9b8fd31ff3f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/6dbd3e66.failed
+
+If the packets to sent to the guest are bigger than the buffer
+available, we can split them, using multiple buffers and fixing
+the length in the packet header.
+This is safe since virtio-vsock supports only stream sockets.
+
+	Signed-off-by: Stefano Garzarella <sgarzare@redhat.com>
+	Reviewed-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6dbd3e66e7785a2f055bf84d98de9b8fd31ff3f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vsock.c
+#	net/vmw_vsock/virtio_transport_common.c
+diff --cc drivers/vhost/vsock.c
+index 280124945d12,9f57736fe15e..000000000000
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@@ -101,8 -99,10 +101,13 @@@ vhost_transport_do_send_pkt(struct vhos
+  
+  	do {
+  		struct virtio_vsock_pkt *pkt;
+ -		struct iov_iter iov_iter;
+  		unsigned out, in;
+++<<<<<<< HEAD
+ +		size_t len;
+++=======
++ 		size_t nbytes;
++ 		size_t iov_len, payload_len;
+++>>>>>>> 6dbd3e66e778 (vhost/vsock: split packets to send using multiple buffers)
+  		int head;
+  
+  		spin_lock_bh(&vsock->send_pkt_list_lock);
+@@@ -147,23 -147,35 +152,50 @@@
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		len = iov_length(&vq->iov[out], in);
+ +		if (len < sizeof(pkt->hdr) + pkt->len) {
+ +			virtio_transport_free_pkt(pkt);
+ +			vq_err(vq, "Got %zu byte rx packet buffers, need %zu bytes\n",
+ +			       len, sizeof(pkt->hdr) + pkt->len);
+ +			break;
+ +		}
+++=======
++ 		iov_len = iov_length(&vq->iov[out], in);
++ 		if (iov_len < sizeof(pkt->hdr)) {
++ 			virtio_transport_free_pkt(pkt);
++ 			vq_err(vq, "Buffer len [%zu] too small\n", iov_len);
++ 			break;
++ 		}
++ 
++ 		iov_iter_init(&iov_iter, READ, &vq->iov[out], in, iov_len);
++ 		payload_len = pkt->len - pkt->off;
++ 
++ 		/* If the packet is greater than the space available in the
++ 		 * buffer, we split it using multiple buffers.
++ 		 */
++ 		if (payload_len > iov_len - sizeof(pkt->hdr))
++ 			payload_len = iov_len - sizeof(pkt->hdr);
++ 
++ 		/* Set the correct length in the header */
++ 		pkt->hdr.len = cpu_to_le32(payload_len);
+++>>>>>>> 6dbd3e66e778 (vhost/vsock: split packets to send using multiple buffers)
+  
+ -		nbytes = copy_to_iter(&pkt->hdr, sizeof(pkt->hdr), &iov_iter);
+ -		if (nbytes != sizeof(pkt->hdr)) {
+ +		if (memcpy_toiovecend(&vq->iov[out], (unsigned char *)&pkt->hdr, 0,
+ +				      sizeof(pkt->hdr)) < 0) {
+  			virtio_transport_free_pkt(pkt);
+  			vq_err(vq, "Faulted on copying pkt hdr\n");
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (memcpy_toiovecend(&vq->iov[out], (unsigned char *)pkt->buf,
+ +				      sizeof(pkt->hdr), pkt->len) < 0) {
+++=======
++ 		nbytes = copy_to_iter(pkt->buf + pkt->off, payload_len,
++ 				      &iov_iter);
++ 		if (nbytes != payload_len) {
+++>>>>>>> 6dbd3e66e778 (vhost/vsock: split packets to send using multiple buffers)
+  			virtio_transport_free_pkt(pkt);
+  			vq_err(vq, "Faulted on copying pkt buf\n");
+  			break;
+diff --cc net/vmw_vsock/virtio_transport_common.c
+index 15ed772fa7ed,56fab3f03d0e..000000000000
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@@ -88,11 -95,19 +88,20 @@@ out_pkt
+  static struct sk_buff *virtio_transport_build_skb(void *opaque)
+  {
+  	struct virtio_vsock_pkt *pkt = opaque;
+ +	unsigned char *t_hdr, *payload;
+  	struct af_vsockmon_hdr *hdr;
+  	struct sk_buff *skb;
++ 	size_t payload_len;
++ 	void *payload_buf;
+  
+- 	skb = alloc_skb(sizeof(*hdr) + sizeof(pkt->hdr) + pkt->len,
++ 	/* A packet could be split to fit the RX buffer, so we can retrieve
++ 	 * the payload length from the header and the buffer pointer taking
++ 	 * care of the offset in the original packet.
++ 	 */
++ 	payload_len = le32_to_cpu(pkt->hdr.len);
++ 	payload_buf = pkt->buf + pkt->off;
++ 
++ 	skb = alloc_skb(sizeof(*hdr) + sizeof(pkt->hdr) + payload_len,
+  			GFP_ATOMIC);
+  	if (!skb)
+  		return NULL;
+@@@ -130,12 -145,10 +139,17 @@@
+  		break;
+  	}
+  
+ -	skb_put_data(skb, &pkt->hdr, sizeof(pkt->hdr));
+ +	t_hdr = skb_put(skb, sizeof(pkt->hdr));
+ +	memcpy(t_hdr, &pkt->hdr, sizeof(pkt->hdr));
+  
+++<<<<<<< HEAD
+ +	if (pkt->len) {
+ +		payload = skb_put(skb, pkt->len);
+ +		memcpy(payload, pkt->buf, pkt->len);
+++=======
++ 	if (payload_len) {
++ 		skb_put_data(skb, payload_buf, payload_len);
+++>>>>>>> 6dbd3e66e778 (vhost/vsock: split packets to send using multiple buffers)
+  	}
+  
+  	return skb;
+* Unmerged path drivers/vhost/vsock.c
+* Unmerged path net/vmw_vsock/virtio_transport_common.c
