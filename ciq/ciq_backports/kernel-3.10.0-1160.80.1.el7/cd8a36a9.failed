@@ -1,0 +1,243 @@
+scsi: lpfc: Fix FCP I/O flush functionality for TMF routines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit cd8a36a90babf958082b87bc6b4df5dd70901eba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/cd8a36a9.failed
+
+A prior patch inadvertently caused lpfc_sli_sum_iocb() to exclude counting
+of outstanding aborted I/Os and ABORT IOCBs.  Thus,
+lpfc_reset_flush_io_context() called from any TMF routine does not properly
+wait to flush all outstanding FCP IOCBs leading to a block layer crash on
+an invalid scsi_cmnd->request pointer.
+
+  kernel BUG at ../block/blk-core.c:1489!
+  RIP: 0010:blk_requeue_request+0xaf/0xc0
+  ...
+  Call Trace:
+  <IRQ>
+  __scsi_queue_insert+0x90/0xe0 [scsi_mod]
+  blk_done_softirq+0x7e/0x90
+  __do_softirq+0xd2/0x280
+  irq_exit+0xd5/0xe0
+  do_IRQ+0x4c/0xd0
+  common_interrupt+0x87/0x87
+  </IRQ>
+
+Fix by separating out the LPFC_IO_FCP, LPFC_IO_ON_TXCMPLQ,
+LPFC_DRIVER_ABORTED, and CMD_ABORT_XRI_CN || CMD_CLOSE_XRI_CN checks into a
+new lpfc_sli_validate_fcp_iocb_for_abort() routine when determining to
+build an ABORT iocb.
+
+Restore lpfc_reset_flush_io_context() functionality by including counting
+of outstanding aborted IOCBs and ABORT IOCBs in lpfc_sli_sum_iocb().
+
+Link: https://lore.kernel.org/r/20210910233159.115896-9-jsmart2021@gmail.com
+Fixes: e1364711359f ("scsi: lpfc: Fix illegal memory access on Abort IOCBs")
+	Cc: <stable@vger.kernel.org> # v5.12+
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cd8a36a90babf958082b87bc6b4df5dd70901eba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index bb1cf126c14f,e8f6ad484768..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -11266,103 -12456,73 +11266,140 @@@ lpfc_sli_abort_iotag_issue(struct lpfc_
+  }
+  
+  /**
+ - * lpfc_sli_hba_iocb_abort - Abort all iocbs to an hba.
+ - * @phba: pointer to lpfc HBA data structure.
+ + * lpfc_sli_issue_abort_iotag - Abort function for a command iocb
+ + * @phba: Pointer to HBA context object.
+ + * @pring: Pointer to driver SLI ring object.
+ + * @cmdiocb: Pointer to driver command iocb object.
+   *
+ - * This routine will abort all pending and outstanding iocbs to an HBA.
+ + * This function issues an abort iocb for the provided command iocb. In case
+ + * of unloading, the abort iocb will not be issued to commands on the ELS
+ + * ring. Instead, the callback function shall be changed to those commands
+ + * so that nothing happens when them finishes. This function is called with
+ + * hbalock held. The function returns 0 when the command iocb is an abort
+ + * request.
+   **/
+ -void
+ -lpfc_sli_hba_iocb_abort(struct lpfc_hba *phba)
+ +int
+ +lpfc_sli_issue_abort_iotag(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ +			   struct lpfc_iocbq *cmdiocb)
+  {
+ -	struct lpfc_sli *psli = &phba->sli;
+ -	struct lpfc_sli_ring *pring;
+ -	struct lpfc_queue *qp = NULL;
+ -	int i;
+ +	struct lpfc_vport *vport = cmdiocb->vport;
+ +	int retval = IOCB_ERROR;
+ +	IOCB_t *icmd = NULL;
+  
+ -	if (phba->sli_rev != LPFC_SLI_REV4) {
+ -		for (i = 0; i < psli->num_rings; i++) {
+ -			pring = &psli->sli3_ring[i];
+ -			lpfc_sli_abort_iocb_ring(phba, pring);
+ -		}
+ -		return;
+ -	}
+ -	list_for_each_entry(qp, &phba->sli4_hba.lpfc_wq_list, wq_list) {
+ -		pring = qp->pring;
+ -		if (!pring)
+ -			continue;
+ -		lpfc_sli_abort_iocb_ring(phba, pring);
+ +	lockdep_assert_held(&phba->hbalock);
+ +
+ +	/*
+ +	 * There are certain command types we don't want to abort.  And we
+ +	 * don't want to abort commands that are already in the process of
+ +	 * being aborted.
+ +	 */
+ +	icmd = &cmdiocb->iocb;
+ +	if (icmd->ulpCommand == CMD_ABORT_XRI_CN ||
+ +	    icmd->ulpCommand == CMD_CLOSE_XRI_CN ||
+ +	    (cmdiocb->iocb_flag & LPFC_DRIVER_ABORTED) != 0)
+ +		return 0;
+ +
+ +	if (!pring) {
+ +		if (cmdiocb->iocb_flag & LPFC_IO_FABRIC)
+ +			cmdiocb->fabric_iocb_cmpl = lpfc_ignore_els_cmpl;
+ +		else
+ +			cmdiocb->iocb_cmpl = lpfc_ignore_els_cmpl;
+ +		goto abort_iotag_exit;
+  	}
+ -}
+ +
+ +	/*
+ +	 * If we're unloading, don't abort iocb on the ELS ring, but change
+ +	 * the callback so that nothing happens when it finishes.
+ +	 */
+ +	if ((vport->load_flag & FC_UNLOADING) &&
+ +	    (pring->ringno == LPFC_ELS_RING)) {
+ +		if (cmdiocb->iocb_flag & LPFC_IO_FABRIC)
+ +			cmdiocb->fabric_iocb_cmpl = lpfc_ignore_els_cmpl;
+ +		else
+ +			cmdiocb->iocb_cmpl = lpfc_ignore_els_cmpl;
+ +		goto abort_iotag_exit;
+ +	}
+ +
+ +	/* Now, we try to issue the abort to the cmdiocb out */
+ +	retval = lpfc_sli_abort_iotag_issue(phba, pring, cmdiocb);
+ +
+ +abort_iotag_exit:
+ +	/*
+ +	 * Caller to this routine should check for IOCB_ERROR
+ +	 * and handle it properly.  This routine no longer removes
+ +	 * iocb off txcmplq and call compl in case of IOCB_ERROR.
+ +	 */
+ +	return retval;
+ +}
+ +
+ +/**
+ + * lpfc_sli_hba_iocb_abort - Abort all iocbs to an hba.
+ + * @phba: pointer to lpfc HBA data structure.
+ + *
+ + * This routine will abort all pending and outstanding iocbs to an HBA.
+ + **/
+ +void
+ +lpfc_sli_hba_iocb_abort(struct lpfc_hba *phba)
+ +{
+ +	struct lpfc_sli *psli = &phba->sli;
+ +	struct lpfc_sli_ring *pring;
+ +	struct lpfc_queue *qp = NULL;
+ +	int i;
+ +
+ +	if (phba->sli_rev != LPFC_SLI_REV4) {
+ +		for (i = 0; i < psli->num_rings; i++) {
+ +			pring = &psli->sli3_ring[i];
+ +			lpfc_sli_abort_iocb_ring(phba, pring);
+ +		}
+ +		return;
+ +	}
+ +	list_for_each_entry(qp, &phba->sli4_hba.lpfc_wq_list, wq_list) {
+ +		pring = qp->pring;
+ +		if (!pring)
+ +			continue;
+ +		lpfc_sli_abort_iocb_ring(phba, pring);
+ +	}
+ +}
+  
+  /**
+-  * lpfc_sli_validate_fcp_iocb - find commands associated with a vport or LUN
++  * lpfc_sli_validate_fcp_iocb_for_abort - filter iocbs appropriate for FCP aborts
++  * @iocbq: Pointer to iocb object.
++  * @vport: Pointer to driver virtual port object.
++  *
++  * This function acts as an iocb filter for functions which abort FCP iocbs.
++  *
++  * Return values
++  * -ENODEV, if a null iocb or vport ptr is encountered
++  * -EINVAL, if the iocb is not an FCP I/O, not on the TX cmpl queue, premarked as
++  *          driver already started the abort process, or is an abort iocb itself
++  * 0, passes criteria for aborting the FCP I/O iocb
++  **/
++ static int
++ lpfc_sli_validate_fcp_iocb_for_abort(struct lpfc_iocbq *iocbq,
++ 				     struct lpfc_vport *vport)
++ {
++ 	IOCB_t *icmd = NULL;
++ 
++ 	/* No null ptr vports */
++ 	if (!iocbq || iocbq->vport != vport)
++ 		return -ENODEV;
++ 
++ 	/* iocb must be for FCP IO, already exists on the TX cmpl queue,
++ 	 * can't be premarked as driver aborted, nor be an ABORT iocb itself
++ 	 */
++ 	icmd = &iocbq->iocb;
++ 	if (!(iocbq->iocb_flag & LPFC_IO_FCP) ||
++ 	    !(iocbq->iocb_flag & LPFC_IO_ON_TXCMPLQ) ||
++ 	    (iocbq->iocb_flag & LPFC_DRIVER_ABORTED) ||
++ 	    (icmd->ulpCommand == CMD_ABORT_XRI_CN ||
++ 	     icmd->ulpCommand == CMD_CLOSE_XRI_CN))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * lpfc_sli_validate_fcp_iocb - validate commands associated with a SCSI target
+   * @iocbq: Pointer to driver iocb object.
+   * @vport: Pointer to driver virtual port object.
+   * @tgt_id: SCSI ID of the target.
+@@@ -11388,17 -12550,10 +11427,24 @@@ lpfc_sli_validate_fcp_iocb(struct lpfc_
+  			   uint16_t tgt_id, uint64_t lun_id,
+  			   lpfc_ctx_cmd ctx_cmd)
+  {
+++<<<<<<< HEAD
+ +	struct lpfc_scsi_buf *lpfc_cmd;
+ +	int rc = 1;
+ +
+ +	if (iocbq->vport != vport)
+ +		return rc;
+ +
+ +	if (!(iocbq->iocb_flag &  LPFC_IO_FCP) ||
+ +	    !(iocbq->iocb_flag & LPFC_IO_ON_TXCMPLQ))
+ +		return rc;
+ +
+ +	lpfc_cmd = container_of(iocbq, struct lpfc_scsi_buf, cur_iocbq);
+++=======
++ 	struct lpfc_io_buf *lpfc_cmd;
++ 	int rc = 1;
++ 
++ 	lpfc_cmd = container_of(iocbq, struct lpfc_io_buf, cur_iocbq);
+++>>>>>>> cd8a36a90bab (scsi: lpfc: Fix FCP I/O flush functionality for TMF routines)
+  
+  	if (lpfc_cmd->pCmd == NULL)
+  		return rc;
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
