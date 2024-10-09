@@ -1,0 +1,248 @@
+blk-mq-sched: remove unused 'can_block' arg from blk_mq_sched_insert_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 9e97d2951a7e6ee6e204f87f6bda4ff754a8cede
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9e97d295.failed
+
+After commit:
+
+923218f6166a ("blk-mq: don't allocate driver tag upfront for flush rq")
+
+we no longer use the 'can_block' argument in
+blk_mq_sched_insert_request(). Kill it.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+
+Added actual commit message as to why it's being removed.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9e97d2951a7e6ee6e204f87f6bda4ff754a8cede)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1eaa154c3ecb,c418858a60ef..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -585,19 -734,18 +585,19 @@@ static void blk_mq_requeue_work(struct 
+  		container_of(work, struct request_queue, requeue_work.work);
+  	LIST_HEAD(rq_list);
+  	struct request *rq, *next;
+ +	unsigned long flags;
+  
+ -	spin_lock_irq(&q->requeue_lock);
+ +	spin_lock_irqsave(&q->requeue_lock, flags);
+  	list_splice_init(&q->requeue_list, &rq_list);
+ -	spin_unlock_irq(&q->requeue_lock);
+ +	spin_unlock_irqrestore(&q->requeue_lock, flags);
+  
+  	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
+ -		if (!(rq->rq_flags & RQF_SOFTBARRIER))
+ +		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+  			continue;
+  
+ -		rq->rq_flags &= ~RQF_SOFTBARRIER;
+ +		rq->cmd_flags &= ~REQ_SOFTBARRIER;
+  		list_del_init(&rq->queuelist);
+- 		blk_mq_sched_insert_request(rq, true, false, false, true);
++ 		blk_mq_sched_insert_request(rq, true, false, false);
+  	}
+  
+  	while (!list_empty(&rq_list)) {
+@@@ -1535,13 -1745,53 +1535,57 @@@ static void __blk_mq_try_issue_directly
+  	struct request_queue *q = rq->q;
+  	struct blk_mq_queue_data bd = {
+  		.rq = rq,
+ +		.list = NULL,
+  		.last = true,
+  	};
+++<<<<<<< HEAD
+ +	int ret;
+++=======
++ 	blk_qc_t new_cookie;
++ 	blk_status_t ret;
++ 
++ 	new_cookie = request_to_qc_t(hctx, rq);
++ 
++ 	/*
++ 	 * For OK queue, we are done. For error, caller may kill it.
++ 	 * Any other error (busy), just add it to our list as we
++ 	 * previously would have done.
++ 	 */
++ 	ret = q->mq_ops->queue_rq(hctx, &bd);
++ 	switch (ret) {
++ 	case BLK_STS_OK:
++ 		*cookie = new_cookie;
++ 		break;
++ 	case BLK_STS_RESOURCE:
++ 		__blk_mq_requeue_request(rq);
++ 		break;
++ 	default:
++ 		*cookie = BLK_QC_T_NONE;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void __blk_mq_fallback_to_insert(struct request *rq,
++ 					bool run_queue, bool bypass_insert)
++ {
++ 	if (!bypass_insert)
++ 		blk_mq_sched_insert_request(rq, false, run_queue, false);
++ 	else
++ 		blk_mq_request_bypass_insert(rq, run_queue);
++ }
++ 
++ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
++ 						struct request *rq,
++ 						blk_qc_t *cookie,
++ 						bool bypass_insert)
++ {
++ 	struct request_queue *q = rq->q;
+++>>>>>>> 9e97d2951a7e (blk-mq-sched: remove unused 'can_block' arg from blk_mq_sched_insert_request)
+  	bool run_queue = true;
+  
+ -	/* RCU or SRCU read lock is needed before checking quiesced flag */
+ -	if (blk_mq_hctx_stopped(hctx) || blk_queue_quiesced(q)) {
+ +	if (blk_mq_hctx_stopped(hctx)) {
+  		run_queue = false;
+  		goto insert;
+  	}
+@@@ -1557,48 -1807,53 +1601,68 @@@
+  		goto insert;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * For OK queue, we are done. For error, kill it. Any other
+ +	 * error (busy), just add it to our list as we previously
+ +	 * would have done
+ +	 */
+ +	ret = q->mq_ops->queue_rq(hctx, &bd);
+ +	if (ret == BLK_MQ_RQ_QUEUE_OK)
+ +		return;
+++=======
++ 	return __blk_mq_issue_directly(hctx, rq, cookie);
++ insert:
++ 	__blk_mq_fallback_to_insert(rq, run_queue, bypass_insert);
++ 	if (bypass_insert)
++ 		return BLK_STS_RESOURCE;
+++>>>>>>> 9e97d2951a7e (blk-mq-sched: remove unused 'can_block' arg from blk_mq_sched_insert_request)
+ +
+ +	if (ret == BLK_MQ_RQ_QUEUE_ERROR) {
+ +		rq->errors = -EIO;
+ +		blk_mq_end_request(rq, rq->errors);
+ +		return;
+ +	}
+  
+ -	return BLK_STS_OK;
+ +	__blk_mq_requeue_request(rq);
+ +insert:
+ +	blk_mq_sched_insert_request(rq, false, run_queue, false, may_sleep);
+  }
+  
+  static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ -		struct request *rq, blk_qc_t *cookie)
+ +				      struct request *rq)
+  {
+ -	blk_status_t ret;
+ -	int srcu_idx;
+ +	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
+ +		rcu_read_lock();
+ +		__blk_mq_try_issue_directly(hctx, rq, false);
+ +		rcu_read_unlock();
+ +	} else {
+ +		unsigned int srcu_idx;
+  
+ -	might_sleep_if(hctx->flags & BLK_MQ_F_BLOCKING);
+ +		might_sleep();
+  
+++<<<<<<< HEAD
+ +		srcu_idx = srcu_read_lock(&hctx->queue_rq_srcu);
+ +		__blk_mq_try_issue_directly(hctx, rq, true);
+ +		srcu_read_unlock(&hctx->queue_rq_srcu, srcu_idx);
+ +	}
+++=======
++ 	hctx_lock(hctx, &srcu_idx);
++ 
++ 	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
++ 	if (ret == BLK_STS_RESOURCE)
++ 		__blk_mq_fallback_to_insert(rq, true, false);
++ 	else if (ret != BLK_STS_OK)
++ 		blk_mq_end_request(rq, ret);
++ 
++ 	hctx_unlock(hctx, srcu_idx);
+++>>>>>>> 9e97d2951a7e (blk-mq-sched: remove unused 'can_block' arg from blk_mq_sched_insert_request)
+  }
+  
+ -blk_status_t blk_mq_request_direct_issue(struct request *rq)
+ -{
+ -	blk_status_t ret;
+ -	int srcu_idx;
+ -	blk_qc_t unused_cookie;
+ -	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ -	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(rq->q, ctx->cpu);
+ -
+ -	hctx_lock(hctx, &srcu_idx);
+ -	ret = __blk_mq_try_issue_directly(hctx, rq, &unused_cookie, true);
+ -	hctx_unlock(hctx, srcu_idx);
+ -
+ -	return ret;
+ -}
+ -
+ -static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	const int is_sync = op_is_sync(bio->bi_opf);
+ -	const int is_flush_fua = op_is_flush(bio->bi_opf);
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+  	struct blk_mq_alloc_data data = { .flags = 0 };
+  	struct request *rq;
+  	unsigned int request_count = 0;
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index fc80f85231f2..ee5766e6c499 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -67,7 +67,7 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
+ 	 * be resued after dying flag is set
+ 	 */
+ 	if (q->mq_ops) {
+-		blk_mq_sched_insert_request(rq, at_head, true, false, false);
++		blk_mq_sched_insert_request(rq, at_head, true, false);
+ 		return;
+ 	}
+ 
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 0f68e0e660f2..e67d8dd831cd 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -473,7 +473,7 @@ done:
+ }
+ 
+ void blk_mq_sched_insert_request(struct request *rq, bool at_head,
+-				 bool run_queue, bool async, bool can_block)
++				 bool run_queue, bool async)
+ {
+ 	struct request_queue *q = rq->q;
+ 	struct elevator_queue *e = q->elevator;
+diff --git a/block/blk-mq-sched.h b/block/blk-mq-sched.h
+index cafaf6f9a156..a8e6c988ca7c 100644
+--- a/block/blk-mq-sched.h
++++ b/block/blk-mq-sched.h
+@@ -15,7 +15,7 @@ bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq);
+ void blk_mq_sched_restart(struct blk_mq_hw_ctx *hctx);
+ 
+ void blk_mq_sched_insert_request(struct request *rq, bool at_head,
+-				 bool run_queue, bool async, bool can_block);
++				 bool run_queue, bool async);
+ void blk_mq_sched_insert_requests(struct request_queue *q,
+ 				  struct blk_mq_ctx *ctx,
+ 				  struct list_head *list, bool run_queue_async);
+* Unmerged path block/blk-mq.c
