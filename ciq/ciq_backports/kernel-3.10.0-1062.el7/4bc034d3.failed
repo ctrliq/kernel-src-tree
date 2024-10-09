@@ -1,0 +1,160 @@
+Revert "MD: fix lock contention for flush bios"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author NeilBrown <neilb@suse.com>
+commit 4bc034d35377196c854236133b07730a777c4aba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4bc034d3.failed
+
+This reverts commit 5a409b4f56d50b212334f338cb8465d65550cd85.
+
+This patch has two problems.
+
+1/ it make multiple calls to submit_bio() from inside a make_request_fn.
+ The bios thus submitted will be queued on current->bio_list and not
+ submitted immediately.  As the bios are allocated from a mempool,
+ this can theoretically result in a deadlock - all the pool of requests
+ could be in various ->bio_list queues and a subsequent mempool_alloc
+ could block waiting for one of them to be released.
+
+2/ It aims to handle a case when there are many concurrent flush requests.
+  It handles this by submitting many requests in parallel - all of which
+  are identical and so most of which do nothing useful.
+  It would be more efficient to just send one lower-level request, but
+  allow that to satisfy multiple upper-level requests.
+
+Fixes: 5a409b4f56d5 ("MD: fix lock contention for flush bios")
+	Cc: <stable@vger.kernel.org> # v4.19+
+	Tested-by: Xiao Ni <xni@redhat.com>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4bc034d35377196c854236133b07730a777c4aba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+diff --cc drivers/md/md.c
+index c487b2c6f765,021e522001c1..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -431,7 -406,7 +431,11 @@@ static int md_mergeable_bvec(struct req
+   * Generic flush handling for md
+   */
+  
+++<<<<<<< HEAD
+ +static void md_end_flush(struct bio *bio, int err)
+++=======
++ static void md_end_flush(struct bio *bio)
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  {
+  	struct md_rdev *rdev = bio->bi_private;
+  	struct mddev *mddev = rdev->mddev;
+@@@ -469,9 -444,10 +473,16 @@@ static void submit_flushes(struct work_
+  			bi = bio_alloc_mddev(GFP_NOIO, 0, mddev);
+  			bi->bi_end_io = md_end_flush;
+  			bi->bi_private = rdev;
+++<<<<<<< HEAD
+ +			bi->bi_bdev = rdev->bdev;
+ +			atomic_inc(&mddev->flush_pending);
+ +			submit_bio(WRITE_FLUSH, bi);
+++=======
++ 			bio_set_dev(bi, rdev->bdev);
++ 			bi->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
++ 			atomic_inc(&mddev->flush_pending);
++ 			submit_bio(bi);
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  			rcu_read_lock();
+  			rdev_dec_pending(rdev, mddev);
+  		}
+@@@ -494,11 -470,11 +505,19 @@@ static void md_submit_flush_data(struc
+  	mddev->flush_bio = NULL;
+  	wake_up(&mddev->sb_wait);
+  
+++<<<<<<< HEAD
+ +	if (bio->bi_size == 0)
+ +		/* an empty barrier - all done */
+ +		bio_endio(bio, 0);
+ +	else {
+ +		bio->bi_rw &= ~REQ_FLUSH;
+++=======
++ 	if (bio->bi_iter.bi_size == 0) {
++ 		/* an empty barrier - all done */
++ 		bio_endio(bio);
++ 	} else {
++ 		bio->bi_opf &= ~REQ_PREFLUSH;
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  		md_handle_request(mddev, bio);
+  	}
+  }
+@@@ -5425,17 -5479,15 +5444,24 @@@ int md_run(struct mddev *mddev
+  		sysfs_notify_dirent_safe(rdev->sysfs_state);
+  	}
+  
+ -	if (!bioset_initialized(&mddev->bio_set)) {
+ -		err = bioset_init(&mddev->bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+ -		if (err)
+ -			return err;
+ +	if (mddev->bio_set == NULL) {
+ +		mddev->bio_set = bioset_create(BIO_POOL_SIZE, 0);
+ +		if (!mddev->bio_set)
+ +			return -ENOMEM;
+  	}
+++<<<<<<< HEAD
+ +	if (mddev->sync_set == NULL) {
+ +		mddev->sync_set = bioset_create(BIO_POOL_SIZE, 0);
+ +		if (!mddev->sync_set) {
+ +			err = -ENOMEM;
+ +			goto abort;
+ +		}
+++=======
++ 	if (!bioset_initialized(&mddev->sync_set)) {
++ 		err = bioset_init(&mddev->sync_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
++ 		if (err)
++ 			return err;
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  	}
+  
+  	spin_lock(&pers_lock);
+@@@ -5590,15 -5648,8 +5616,20 @@@
+  	return 0;
+  
+  abort:
+++<<<<<<< HEAD
+ +	if (mddev->bio_set) {
+ +		bioset_free(mddev->bio_set);
+ +		mddev->bio_set = NULL;
+ +	}
+ +	if (mddev->sync_set) {
+ +		bioset_free(mddev->sync_set);
+ +		mddev->sync_set = NULL;
+ +	}
+ +
+++=======
++ 	bioset_exit(&mddev->bio_set);
++ 	bioset_exit(&mddev->sync_set);
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  	return err;
+  }
+  EXPORT_SYMBOL_GPL(md_run);
+diff --cc drivers/md/md.h
+index 94c72c13bbab,2deb84fa93f9..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -483,7 -459,7 +483,11 @@@ struct mddev 
+  
+  	/* Generic flush handling.
+  	 * The last to finish preflush schedules a worker to submit
+++<<<<<<< HEAD
+ +	 * the rest of the request (without the REQ_FLUSH flag).
+++=======
++ 	 * the rest of the request (without the REQ_PREFLUSH flag).
+++>>>>>>> 4bc034d35377 (Revert "MD: fix lock contention for flush bios")
+  	 */
+  	struct bio *flush_bio;
+  	atomic_t flush_pending;
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
