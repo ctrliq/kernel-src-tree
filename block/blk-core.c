@@ -675,7 +675,6 @@ int blk_queue_enter(struct request_queue *q, unsigned int flags)
 
 	while (true) {
 		bool success = false;
-		int ret;
 
 		rcu_read_lock_sched();
 		if (percpu_ref_tryget_live(&q->q_usage_counter)) {
@@ -707,14 +706,12 @@ int blk_queue_enter(struct request_queue *q, unsigned int flags)
 		 */
 		smp_rmb();
 
-		ret = wait_event_interruptible(q->mq_freeze_wq,
-				(atomic_read(&q->mq_freeze_depth) == 0 &&
-				 (preempt || !blk_queue_preempt_only(q))) ||
-				blk_queue_dying(q));
+		wait_event(q->mq_freeze_wq,
+			   (atomic_read(&q->mq_freeze_depth) == 0 &&
+			    (preempt || !blk_queue_preempt_only(q))) ||
+			   blk_queue_dying(q));
 		if (blk_queue_dying(q))
 			return -ENODEV;
-		if (ret)
-			return ret;
 	}
 
 	/* Make blk_queue_enter() reexamine the DYING flag. */
