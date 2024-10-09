@@ -1,0 +1,164 @@
+dev: advertise the new ifindex when the netns iface changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit 38e01b30563a5b5ade7b54e5d739d16a2b02fe82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/38e01b30.failed
+
+The goal is to let the user follow an interface that moves to another
+netns.
+
+CC: Jiri Benc <jbenc@redhat.com>
+CC: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Reviewed-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 38e01b30563a5b5ade7b54e5d739d16a2b02fe82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/if_link.h
+#	net/core/dev.c
+#	net/core/rtnetlink.c
+diff --cc include/uapi/linux/if_link.h
+index b13efc34f208,6d9447700e18..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -164,6 -161,9 +164,12 @@@ enum 
+  	IFLA_EVENT,
+  	IFLA_NEW_NETNSID,
+  	IFLA_IF_NETNSID,
+++<<<<<<< HEAD
+++=======
++ 	IFLA_CARRIER_UP_COUNT,
++ 	IFLA_CARRIER_DOWN_COUNT,
++ 	IFLA_NEW_IFINDEX,
+++>>>>>>> 38e01b30563a (dev: advertise the new ifindex when the netns iface changes)
+  	__IFLA_MAX
+  };
+  
+diff --cc net/core/dev.c
+index bb0aceac6913,858501b12869..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -8346,14 -8552,7 +8354,18 @@@ int dev_change_net_namespace(struct net
+  
+  	/* Actually switch the network namespace */
+  	dev_net_set(dev, net);
+++<<<<<<< HEAD
+ +
+ +	/* If there is an ifindex conflict assign a new one */
+ +	if (__dev_get_by_index(net, dev->ifindex)) {
+ +		int iflink = (dev_get_iflink(dev) == dev->ifindex);
+ +		dev->ifindex = dev_new_index(net);
+ +		if (iflink)
+ +			dev->iflink = dev->ifindex;
+ +	}
+++=======
++ 	dev->ifindex = new_ifindex;
+++>>>>>>> 38e01b30563a (dev: advertise the new ifindex when the netns iface changes)
+  
+  	/* Send a netdev-add uevent to the new namespace */
+  	kobject_uevent(&dev->dev.kobj, KOBJ_ADD);
+diff --cc net/core/rtnetlink.c
+index 23f16bfda6ca,e04af7b7f448..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -1023,10 -985,14 +1023,11 @@@ static noinline size_t if_nlmsg_size(co
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_PORT_ID */
+  	       + nla_total_size(MAX_PHYS_ITEM_ID_LEN) /* IFLA_PHYS_SWITCH_ID */
+  	       + nla_total_size(IFNAMSIZ) /* IFLA_PHYS_PORT_NAME */
+ -	       + rtnl_xdp_size() /* IFLA_XDP */
+  	       + nla_total_size(4)  /* IFLA_EVENT */
+  	       + nla_total_size(4)  /* IFLA_NEW_NETNSID */
++ 	       + nla_total_size(4)  /* IFLA_NEW_IFINDEX */
+  	       + nla_total_size(1)  /* IFLA_PROTO_DOWN */
+  	       + nla_total_size(4)  /* IFLA_IF_NETNSID */
+ -	       + nla_total_size(4)  /* IFLA_CARRIER_UP_COUNT */
+ -	       + nla_total_size(4)  /* IFLA_CARRIER_DOWN_COUNT */
+  	       + 0;
+  }
+  
+@@@ -1490,36 -1610,15 +1492,40 @@@ static int rtnl_fill_ifinfo(struct sk_b
+  	if (new_nsid &&
+  	    nla_put_s32(skb, IFLA_NEW_NETNSID, *new_nsid) < 0)
+  		goto nla_put_failure;
++ 	if (new_ifindex &&
++ 	    nla_put_s32(skb, IFLA_NEW_IFINDEX, new_ifindex) < 0)
++ 		goto nla_put_failure;
++ 
+  
+ -	rcu_read_lock();
+ -	if (rtnl_fill_link_af(skb, dev, ext_filter_mask))
+ -		goto nla_put_failure_rcu;
+ -	rcu_read_unlock();
+ +	if (!(af_spec = nla_nest_start(skb, IFLA_AF_SPEC)))
+ +		goto nla_put_failure;
+ +
+ +	list_for_each_entry(af_ops, &rtnl_af_ops, list) {
+ +		if (af_ops->fill_link_af) {
+ +			struct nlattr *af;
+ +			int err;
+ +
+ +			if (!(af = nla_nest_start(skb, af_ops->family)))
+ +				goto nla_put_failure;
+ +
+ +			err = af_ops->fill_link_af(skb, dev);
+ +
+ +			/*
+ +			 * Caller may return ENODATA to indicate that there
+ +			 * was no data to be dumped. This is not an error, it
+ +			 * means we should trim the attribute header and
+ +			 * continue.
+ +			 */
+ +			if (err == -ENODATA)
+ +				nla_nest_cancel(skb, af);
+ +			else if (err < 0)
+ +				goto nla_put_failure;
+ +
+ +			nla_nest_end(skb, af);
+ +		}
+ +	}
+ +
+ +	nla_nest_end(skb, af_spec);
+  
+  	nlmsg_end(skb, nlh);
+  	return 0;
+@@@ -1678,8 -1858,8 +1684,13 @@@ static int rtnl_dump_ifinfo(struct sk_b
+  					       RTM_NEWLINK,
+  					       NETLINK_CB(cb->skb).portid,
+  					       cb->nlh->nlmsg_seq, 0,
+++<<<<<<< HEAD
+ +					       NLM_F_MULTI,
+ +					       ext_filter_mask, 0, NULL,
+++=======
++ 					       flags,
++ 					       ext_filter_mask, 0, NULL, 0,
+++>>>>>>> 38e01b30563a (dev: advertise the new ifindex when the netns iface changes)
+  					       netnsid);
+  
+  			if (err < 0) {
+diff --git a/include/linux/rtnetlink.h b/include/linux/rtnetlink.h
+index 1251638e60d3..10c5fae799ee 100644
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -18,10 +18,11 @@ extern int rtnl_put_cacheinfo(struct sk_buff *skb, struct dst_entry *dst,
+ 
+ void rtmsg_ifinfo(int type, struct net_device *dev, unsigned change, gfp_t flags);
+ void rtmsg_ifinfo_newnet(int type, struct net_device *dev, unsigned int change,
+-			 gfp_t flags, int *new_nsid);
++			 gfp_t flags, int *new_nsid, int new_ifindex);
+ struct sk_buff *rtmsg_ifinfo_build_skb(int type, struct net_device *dev,
+ 				       unsigned change, u32 event,
+-				       gfp_t flags, int *new_nsid);
++				       gfp_t flags, int *new_nsid,
++				       int new_ifindex);
+ void rtmsg_ifinfo_send(struct sk_buff *skb, struct net_device *dev,
+ 		       gfp_t flags);
+ 
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/rtnetlink.c
