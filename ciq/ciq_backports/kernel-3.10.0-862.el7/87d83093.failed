@@ -1,0 +1,517 @@
+net: sched: move tc_classify function to cls_api.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: move tc_classify function to cls_api.c (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 94.74%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 87d83093bfc2f4938ff21524ebb50ecf53c15a64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/87d83093.failed
+
+Move tc_classify function to cls_api.c where it belongs, rename it to
+fit the namespace.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 87d83093bfc2f4938ff21524ebb50ecf53c15a64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	net/core/dev.c
+#	net/sched/cls_api.c
+#	net/sched/sch_api.c
+diff --cc include/net/pkt_cls.h
+index ddbf01b80b4c,cb745067feb3..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -17,6 -17,23 +17,26 @@@ struct tcf_walker 
+  int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+  int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_CLS
++ void tcf_destroy_chain(struct tcf_proto __rcu **fl);
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode);
++ 
++ #else
++ static inline void tcf_destroy_chain(struct tcf_proto __rcu **fl)
++ {
++ }
++ 
++ static inline int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 			       struct tcf_result *res, bool compat_mode)
++ {
++ 	return TC_ACT_UNSPEC;
++ }
++ #endif
++ 
+++>>>>>>> 87d83093bfc2 (net: sched: move tc_classify function to cls_api.c)
+  static inline unsigned long
+  __cls_set_class(unsigned long *clp, unsigned long cl)
+  {
+diff --cc net/core/dev.c
+index 54ad82302512,acd594c56f0a..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3135,6 -3166,47 +3136,50 @@@ int dev_loopback_xmit(struct sock *sk, 
+  }
+  EXPORT_SYMBOL(dev_loopback_xmit);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_EGRESS
++ static struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	struct tcf_proto *cl = rcu_dereference_bh(dev->egress_cl_list);
++ 	struct tcf_result cl_res;
++ 
++ 	if (!cl)
++ 		return skb;
++ 
++ 	/* qdisc_skb_cb(skb)->pkt_len was already set by the caller. */
++ 	qdisc_bstats_cpu_update(cl->q, skb);
++ 
++ 	switch (tcf_classify(skb, cl, &cl_res, false)) {
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(cl_res.classid);
++ 		break;
++ 	case TC_ACT_SHOT:
++ 		qdisc_qstats_cpu_drop(cl->q);
++ 		*ret = NET_XMIT_DROP;
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 		*ret = NET_XMIT_SUCCESS;
++ 		consume_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_REDIRECT:
++ 		/* No need to push/pop skb's mac_header here on egress! */
++ 		skb_do_redirect(skb);
++ 		*ret = NET_XMIT_SUCCESS;
++ 		return NULL;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return skb;
++ }
++ #endif /* CONFIG_NET_EGRESS */
++ 
+++>>>>>>> 87d83093bfc2 (net: sched: move tc_classify function to cls_api.c)
+  static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
+  {
+  #ifdef CONFIG_XPS
+@@@ -3809,10 -3946,10 +3854,10 @@@ static inline struct sk_buff *handle_in
+  	}
+  
+  	qdisc_skb_cb(skb)->pkt_len = skb->len;
+ -	skb->tc_at_ingress = 1;
+ +	skb->tc_verd = SET_TC_AT(skb->tc_verd, AT_INGRESS);
+  	qdisc_bstats_cpu_update(cl->q, skb);
+  
+- 	switch (tc_classify(skb, cl, &cl_res, false)) {
++ 	switch (tcf_classify(skb, cl, &cl_res, false)) {
+  	case TC_ACT_OK:
+  	case TC_ACT_RECLASSIFY:
+  		skb->tc_index = TC_H_MIN(cl_res.classid);
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,af58bbef6610..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -127,9 -128,126 +127,128 @@@ static inline u32 tcf_auto_prio(struct 
+  	return first;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ void tcf_destroy_chain(struct tcf_proto __rcu **fl)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	while ((tp = rtnl_dereference(*fl)) != NULL) {
++ 		RCU_INIT_POINTER(*fl, tp->next);
++ 		tcf_proto_destroy(tp);
++ 	}
++ }
++ EXPORT_SYMBOL(tcf_destroy_chain);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *old_tp = tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode))
++ 			goto reset;
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = old_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
+++>>>>>>> 87d83093bfc2 (net: sched: move tc_classify function to cls_api.c)
+  /* Add/change/delete/get a filter node */
+  
+ -static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ -			  struct netlink_ext_ack *extack)
+ +static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
+  {
+  	struct net *net = sock_net(skb->sk);
+  	struct nlattr *tca[TCA_MAX + 1];
+diff --cc net/sched/sch_api.c
+index ed3bc037a800,a3bcd972d940..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -1822,75 -1878,6 +1822,78 @@@ done
+  	return skb->len;
+  }
+  
+++<<<<<<< HEAD
+ +/* Main classifier routine: scans classifier chain attached
+ + * to this qdisc, (optionally) tests for protocol and asks
+ + * specific classifiers.
+ + */
+ +int tc_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ +		struct tcf_result *res, bool compat_mode)
+ +{
+ +	__be16 protocol = tc_skb_protocol(skb);
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	const struct tcf_proto *old_tp = tp;
+ +	int limit = 0;
+ +
+ +reclassify:
+ +#endif
+ +	for (; tp; tp = rcu_dereference_bh(tp->next)) {
+ +		int err;
+ +
+ +		if (tp->protocol != protocol &&
+ +		    tp->protocol != htons(ETH_P_ALL))
+ +			continue;
+ +
+ +		err = tp->classify(skb, tp, res);
+ +#ifdef CONFIG_NET_CLS_ACT
+ +		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode))
+ +			goto reset;
+ +#endif
+ +		if (err >= 0)
+ +			return err;
+ +	}
+ +
+ +	return TC_ACT_UNSPEC; /* signal: continue lookup */
+ +#ifdef CONFIG_NET_CLS_ACT
+ +reset:
+ +	if (unlikely(limit++ >= MAX_REC_LOOP)) {
+ +		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
+ +				       tp->q->ops->id, tp->prio & 0xffff,
+ +				       ntohs(tp->protocol));
+ +		return TC_ACT_SHOT;
+ +	}
+ +
+ +	tp = old_tp;
+ +	protocol = tc_skb_protocol(skb);
+ +	goto reclassify;
+ +#endif
+ +}
+ +EXPORT_SYMBOL(tc_classify);
+ +
+ +bool tcf_proto_destroy(struct tcf_proto *tp, bool force)
+ +{
+ +	if (tp->ops->destroy(tp, force)) {
+ +		module_put(tp->ops->owner);
+ +		kfree_rcu(tp, rcu);
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +void tcf_destroy_chain(struct tcf_proto __rcu **fl)
+ +{
+ +	struct tcf_proto *tp;
+ +
+ +	while ((tp = rtnl_dereference(*fl)) != NULL) {
+ +		RCU_INIT_POINTER(*fl, tp->next);
+ +		tcf_proto_destroy(tp, true);
+ +	}
+ +}
+ +EXPORT_SYMBOL(tcf_destroy_chain);
+ +
+++=======
+++>>>>>>> 87d83093bfc2 (net: sched: move tc_classify function to cls_api.c)
+  #ifdef CONFIG_PROC_FS
+  static int psched_show(struct seq_file *seq, void *v)
+  {
+* Unmerged path include/net/pkt_cls.h
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index 7caa99b482c6..8563f4563ae9 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -111,9 +111,6 @@ static inline void qdisc_run(struct Qdisc *q)
+ 		__qdisc_run(q);
+ }
+ 
+-int tc_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+-		struct tcf_result *res, bool compat_mode);
+-
+ static inline __be16 tc_skb_protocol(const struct sk_buff *skb)
+ {
+ 	/* We need to take extra care in case the skb came via
+* Unmerged path net/core/dev.c
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/sch_api.c
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index 74e837f9d79a..9b952bb9a232 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -375,7 +375,7 @@ static int atm_tc_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		list_for_each_entry(flow, &p->flows, list) {
+ 			fl = rcu_dereference_bh(flow->filter_list);
+ 			if (fl) {
+-				result = tc_classify(skb, fl, &res, true);
++				result = tcf_classify(skb, fl, &res, true);
+ 				if (result < 0)
+ 					continue;
+ 				flow = (struct atm_flow_data *)res.class;
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 24f30ccfced6..e4e3693f0f3d 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -232,7 +232,7 @@ cbq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 		/*
+ 		 * Step 2+n. Apply classifier.
+ 		 */
+-		result = tc_classify(skb, fl, &res, true);
++		result = tcf_classify(skb, fl, &res, true);
+ 		if (!fl || result < 0)
+ 			goto fallback;
+ 
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index c44f9d3bf69e..0b2056deae66 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -331,7 +331,7 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	fl = rcu_dereference_bh(q->filter_list);
+-	result = tc_classify(skb, fl, &res, false);
++	result = tcf_classify(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 7f6319e334db..089c2f9fac42 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -231,7 +231,7 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	else {
+ 		struct tcf_result res;
+ 		struct tcf_proto *fl = rcu_dereference_bh(p->filter_list);
+-		int result = tc_classify(skb, fl, &res, false);
++		int result = tcf_classify(skb, fl, &res, false);
+ 
+ 		pr_debug("result %d class 0x%04x\n", result, res.classid);
+ 
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 7d8847dc1983..16b5876aaa49 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -95,7 +95,7 @@ static unsigned int fq_codel_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		return fq_codel_hash(q, skb) + 1;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tc_classify(skb, filter, &res, false);
++	result = tcf_classify(skb, filter, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index 4ffeb7ff2b61..774ef6224ea9 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1140,7 +1140,7 @@ hfsc_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	head = &q->root;
+ 	tcf = rcu_dereference_bh(q->root.filter_list);
+-	while (tcf && (result = tc_classify(skb, tcf, &res, false)) >= 0) {
++	while (tcf && (result = tcf_classify(skb, tcf, &res, false)) >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2abcfb74a823..ad15f3b78f54 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -230,7 +230,7 @@ static struct htb_class *htb_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 	}
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	while (tcf && (result = tc_classify(skb, tcf, &res, false)) >= 0) {
++	while (tcf && (result = tcf_classify(skb, tcf, &res, false)) >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index 759faafd074d..75a4a280c5d9 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -47,7 +47,7 @@ multiq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 	int err;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	err = tc_classify(skb, fl, &res, false);
++	err = tcf_classify(skb, fl, &res, false);
+ #ifdef CONFIG_NET_CLS_ACT
+ 	switch (err) {
+ 	case TC_ACT_STOLEN:
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index bda93ee4f685..ee03b4f27cf4 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -42,7 +42,7 @@ prio_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	if (TC_H_MAJ(skb->priority) != sch->handle) {
+ 		fl = rcu_dereference_bh(q->filter_list);
+-		err = tc_classify(skb, fl, &res, false);
++		err = tcf_classify(skb, fl, &res, false);
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (err) {
+ 		case TC_ACT_STOLEN:
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index c65d929a9687..5d1537be246f 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -717,7 +717,7 @@ static struct qfq_class *qfq_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+ 	fl = rcu_dereference_bh(q->filter_list);
+-	result = tc_classify(skb, fl, &res, false);
++	result = tcf_classify(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index ba31a5b026c4..24482380c01d 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -258,7 +258,7 @@ static bool sfb_classify(struct sk_buff *skb, struct tcf_proto *fl,
+ 	struct tcf_result res;
+ 	int result;
+ 
+-	result = tc_classify(skb, fl, &res, false);
++	result = tcf_classify(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index 24f2e8978693..8344f5cc6948 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -179,7 +179,7 @@ static unsigned int sfq_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		return sfq_hash(q, skb) + 1;
+ 
+ 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
+-	result = tc_classify(skb, fl, &res, false);
++	result = tcf_classify(skb, fl, &res, false);
+ 	if (result >= 0) {
+ #ifdef CONFIG_NET_CLS_ACT
+ 		switch (result) {
