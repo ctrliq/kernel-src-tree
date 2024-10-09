@@ -1,0 +1,241 @@
+nfp: flower: use host context count provided by firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit 12ecf61529dc51b4dd03a15bed34c7d317c137ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/12ecf615.failed
+
+Read the host context count symbols provided by firmware and use
+it to determine the number of allocated stats ids. Previously it
+won't be possible to offload more than 2^17 filter even if FW was
+able to do so.
+
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 12ecf61529dc51b4dd03a15bed34c7d317c137ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+#	drivers/net/ethernet/netronome/nfp/flower/metadata.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,fd92bda1c0fa..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -49,10 -50,9 +49,16 @@@ struct tc_to_netdev
+  struct net_device;
+  struct nfp_app;
+  
+++<<<<<<< HEAD
+ +#define NFP_FL_STATS_ENTRY_RS		BIT(20)
+ +#define NFP_FL_STATS_ELEM_RS		4
+ +#define NFP_FL_REPEATED_HASH_MAX	BIT(17)
+ +#define NFP_FLOWER_HASH_BITS		19
+++=======
++ #define NFP_FL_STATS_CTX_DONT_CARE	cpu_to_be32(0xffffffff)
++ #define NFP_FL_STATS_ELEM_RS		FIELD_SIZEOF(struct nfp_fl_stats_id, \
++ 						     init_unalloc)
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  #define NFP_FLOWER_MASK_ENTRY_RS	256
+  #define NFP_FLOWER_MASK_ELEMENT_RS	1
+  #define NFP_FLOWER_MASK_HASH_BITS	10
+@@@ -140,7 -137,10 +146,8 @@@ struct nfp_fl_lag 
+   * @stats_ids:		List of free stats ids
+   * @mask_ids:		List of free mask ids
+   * @mask_table:		Hash table used to store masks
++  * @stats_ring_size:	Maximum number of allowed stats ids
+   * @flow_table:		Hash table used to store flower rules
+ - * @stats:		Stored stats updates for flower rules
+ - * @stats_lock:		Lock for flower rule stats updates
+   * @cmsg_work:		Workqueue for control messages processing
+   * @cmsg_skbs_high:	List of higher priority skbs for control message
+   *			processing
+@@@ -173,7 -173,10 +180,14 @@@ struct nfp_flower_priv 
+  	struct nfp_fl_stats_id stats_ids;
+  	struct nfp_fl_mask_id mask_ids;
+  	DECLARE_HASHTABLE(mask_table, NFP_FLOWER_MASK_HASH_BITS);
+++<<<<<<< HEAD
+ +	DECLARE_HASHTABLE(flow_table, NFP_FLOWER_HASH_BITS);
+++=======
++ 	u32 stats_ring_size;
++ 	struct rhashtable flow_table;
++ 	struct nfp_fl_stats *stats;
++ 	spinlock_t stats_lock; /* lock stats */
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  	struct work_struct cmsg_work;
+  	struct sk_buff_head cmsg_skbs_high;
+  	struct sk_buff_head cmsg_skbs_low;
+@@@ -246,16 -251,7 +260,20 @@@ struct nfp_fl_stats_frame 
+  	__be64 stats_cookie;
+  };
+  
+++<<<<<<< HEAD
+ +static inline unsigned long nfp_flower_fl_key(unsigned long tc_flower_cookie)
+ +{
+ +#if BITS_PER_LONG == 64
+ +	return tc_flower_cookie * NFP_FLOWER_GOLDEN_RATIO_64;
+ +#else
+ +	return tc_flower_cookie * NFP_FLOWER_GOLDEN_RATIO_32;
+ +#endif
+ +}
+ +
+ +int nfp_flower_metadata_init(struct nfp_app *app);
+++=======
++ int nfp_flower_metadata_init(struct nfp_app *app, u64 host_ctx_count);
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  void nfp_flower_metadata_cleanup(struct nfp_app *app);
+  
+  int nfp_flower_setup_tc(struct nfp_app *app, struct net_device *netdev,
+diff --cc drivers/net/ethernet/netronome/nfp/flower/metadata.c
+index c748aceb17bb,a4cce9a30830..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/metadata.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+@@@ -386,12 -376,56 +386,55 @@@ int nfp_modify_flow_metadata(struct nfp
+  	return nfp_release_stats_entry(app, temp_ctx_id);
+  }
+  
+++<<<<<<< HEAD
+ +int nfp_flower_metadata_init(struct nfp_app *app)
+++=======
++ static int nfp_fl_obj_cmpfn(struct rhashtable_compare_arg *arg,
++ 			    const void *obj)
++ {
++ 	const struct nfp_fl_flow_table_cmp_arg *cmp_arg = arg->key;
++ 	const struct nfp_fl_payload *flow_entry = obj;
++ 
++ 	if ((!cmp_arg->netdev || flow_entry->ingress_dev == cmp_arg->netdev) &&
++ 	    (cmp_arg->host_ctx == NFP_FL_STATS_CTX_DONT_CARE ||
++ 	     flow_entry->meta.host_ctx_id == cmp_arg->host_ctx))
++ 		return flow_entry->tc_flower_cookie != cmp_arg->cookie;
++ 
++ 	return 1;
++ }
++ 
++ static u32 nfp_fl_obj_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nfp_fl_payload *flower_entry = data;
++ 
++ 	return jhash2((u32 *)&flower_entry->tc_flower_cookie,
++ 		      sizeof(flower_entry->tc_flower_cookie) / sizeof(u32),
++ 		      seed);
++ }
++ 
++ static u32 nfp_fl_key_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nfp_fl_flow_table_cmp_arg *cmp_arg = data;
++ 
++ 	return jhash2((u32 *)&cmp_arg->cookie,
++ 		      sizeof(cmp_arg->cookie) / sizeof(u32), seed);
++ }
++ 
++ const struct rhashtable_params nfp_flower_table_params = {
++ 	.head_offset		= offsetof(struct nfp_fl_payload, fl_node),
++ 	.hashfn			= nfp_fl_key_hashfn,
++ 	.obj_cmpfn		= nfp_fl_obj_cmpfn,
++ 	.obj_hashfn		= nfp_fl_obj_hashfn,
++ 	.automatic_shrinking	= true,
++ };
++ 
++ int nfp_flower_metadata_init(struct nfp_app *app, u64 host_ctx_count)
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  {
+  	struct nfp_flower_priv *priv = app->priv;
+ -	int err;
+  
+  	hash_init(priv->mask_table);
+ -
+ -	err = rhashtable_init(&priv->flow_table, &nfp_flower_table_params);
+ -	if (err)
+ -		return err;
+ -
+ +	hash_init(priv->flow_table);
+  	get_random_bytes(&priv->mask_id_seed, sizeof(priv->mask_id_seed));
+  
+  	/* Init ring buffer and unallocated mask_ids. */
+@@@ -412,14 -446,24 +455,29 @@@
+  
+  	/* Init ring buffer and unallocated stats_ids. */
+  	priv->stats_ids.free_list.buf =
+++<<<<<<< HEAD
+ +		vmalloc(NFP_FL_STATS_ENTRY_RS * NFP_FL_STATS_ELEM_RS);
+++=======
++ 		vmalloc(array_size(NFP_FL_STATS_ELEM_RS,
++ 				   priv->stats_ring_size));
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  	if (!priv->stats_ids.free_list.buf)
+  		goto err_free_last_used;
+  
+- 	priv->stats_ids.init_unalloc = NFP_FL_REPEATED_HASH_MAX;
++ 	priv->stats_ids.init_unalloc = host_ctx_count;
++ 
+++<<<<<<< HEAD
+++=======
++ 	priv->stats = kvmalloc_array(priv->stats_ring_size,
++ 				     sizeof(struct nfp_fl_stats), GFP_KERNEL);
++ 	if (!priv->stats)
++ 		goto err_free_ring_buf;
++ 
++ 	spin_lock_init(&priv->stats_lock);
+  
+++>>>>>>> 12ecf61529dc (nfp: flower: use host context count provided by firmware)
+  	return 0;
+  
+ -err_free_ring_buf:
+ -	vfree(priv->stats_ids.free_list.buf);
+  err_free_last_used:
+  	kfree(priv->mask_ids.last_used);
+  err_free_mask_id:
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index 171014032993..4403f82bdf55 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -517,8 +517,8 @@ err_clear_nn:
+ static int nfp_flower_init(struct nfp_app *app)
+ {
+ 	const struct nfp_pf *pf = app->pf;
++	u64 version, features, ctx_count;
+ 	struct nfp_flower_priv *app_priv;
+-	u64 version, features;
+ 	int err;
+ 
+ 	if (!pf->eth_tbl) {
+@@ -542,6 +542,16 @@ static int nfp_flower_init(struct nfp_app *app)
+ 		return err;
+ 	}
+ 
++	ctx_count = nfp_rtsym_read_le(app->pf->rtbl, "CONFIG_FC_HOST_CTX_COUNT",
++				      &err);
++	if (err) {
++		nfp_warn(app->cpp,
++			 "FlowerNIC: unsupported host context count: %d\n",
++			 err);
++		err = 0;
++		ctx_count = BIT(17);
++	}
++
+ 	/* We need to ensure hardware has enough flower capabilities. */
+ 	if (version != NFP_FLOWER_ALLOWED_VER) {
+ 		nfp_warn(app->cpp, "FlowerNIC: unsupported firmware version\n");
+@@ -552,6 +562,7 @@ static int nfp_flower_init(struct nfp_app *app)
+ 	if (!app_priv)
+ 		return -ENOMEM;
+ 
++	app_priv->stats_ring_size = roundup_pow_of_two(ctx_count);
+ 	app->priv = app_priv;
+ 	app_priv->app = app;
+ 	skb_queue_head_init(&app_priv->cmsg_skbs_high);
+@@ -562,7 +573,7 @@ static int nfp_flower_init(struct nfp_app *app)
+ 	init_waitqueue_head(&app_priv->mtu_conf.wait_q);
+ 	spin_lock_init(&app_priv->mtu_conf.lock);
+ 
+-	err = nfp_flower_metadata_init(app);
++	err = nfp_flower_metadata_init(app, ctx_count);
+ 	if (err)
+ 		goto err_free_app_priv;
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/metadata.c
