@@ -1,0 +1,160 @@
+powerpc/process: Add the function flush_tmregs_to_thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] process: Add the function flush_tmregs_to_thread (Gustavo Duarte) [1187582]
+Rebuild_FUZZ: 92.31%
+commit-author Anshuman Khandual <khandual@linux.vnet.ibm.com>
+commit 8d460f6156cd55d981d109f01b82cbea8cf80e57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8d460f61.failed
+
+This patch creates a function flush_tmregs_to_thread which
+will then be used by subsequent patches in this series. The
+function checks for self tracing ptrace interface attempts
+while in the TM context and logs appropriate warning message.
+
+	Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+	Signed-off-by: Simon Guo <wei.guo.simon@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8d460f6156cd55d981d109f01b82cbea8cf80e57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/process.c
+diff --cc arch/powerpc/kernel/process.c
+index 7f3a6ffc29aa,58ccf86415b4..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -759,6 -993,107 +759,110 @@@ void restore_tm_state(struct pt_regs *r
+  #define __switch_to_tm(prev)
+  #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+  
+++<<<<<<< HEAD
+++=======
++ static inline void save_sprs(struct thread_struct *t)
++ {
++ #ifdef CONFIG_ALTIVEC
++ 	if (cpu_has_feature(CPU_FTR_ALTIVEC))
++ 		t->vrsave = mfspr(SPRN_VRSAVE);
++ #endif
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	if (cpu_has_feature(CPU_FTR_DSCR))
++ 		t->dscr = mfspr(SPRN_DSCR);
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S)) {
++ 		t->bescr = mfspr(SPRN_BESCR);
++ 		t->ebbhr = mfspr(SPRN_EBBHR);
++ 		t->ebbrr = mfspr(SPRN_EBBRR);
++ 
++ 		t->fscr = mfspr(SPRN_FSCR);
++ 
++ 		/*
++ 		 * Note that the TAR is not available for use in the kernel.
++ 		 * (To provide this, the TAR should be backed up/restored on
++ 		 * exception entry/exit instead, and be in pt_regs.  FIXME,
++ 		 * this should be in pt_regs anyway (for debug).)
++ 		 */
++ 		t->tar = mfspr(SPRN_TAR);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_300)) {
++ 		/* Conditionally save Load Monitor registers, if enabled */
++ 		if (t->fscr & FSCR_LM) {
++ 			t->lmrr = mfspr(SPRN_LMRR);
++ 			t->lmser = mfspr(SPRN_LMSER);
++ 		}
++ 	}
++ #endif
++ }
++ 
++ static inline void restore_sprs(struct thread_struct *old_thread,
++ 				struct thread_struct *new_thread)
++ {
++ #ifdef CONFIG_ALTIVEC
++ 	if (cpu_has_feature(CPU_FTR_ALTIVEC) &&
++ 	    old_thread->vrsave != new_thread->vrsave)
++ 		mtspr(SPRN_VRSAVE, new_thread->vrsave);
++ #endif
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	if (cpu_has_feature(CPU_FTR_DSCR)) {
++ 		u64 dscr = get_paca()->dscr_default;
++ 		if (new_thread->dscr_inherit)
++ 			dscr = new_thread->dscr;
++ 
++ 		if (old_thread->dscr != dscr)
++ 			mtspr(SPRN_DSCR, dscr);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_207S)) {
++ 		if (old_thread->bescr != new_thread->bescr)
++ 			mtspr(SPRN_BESCR, new_thread->bescr);
++ 		if (old_thread->ebbhr != new_thread->ebbhr)
++ 			mtspr(SPRN_EBBHR, new_thread->ebbhr);
++ 		if (old_thread->ebbrr != new_thread->ebbrr)
++ 			mtspr(SPRN_EBBRR, new_thread->ebbrr);
++ 
++ 		if (old_thread->fscr != new_thread->fscr)
++ 			mtspr(SPRN_FSCR, new_thread->fscr);
++ 
++ 		if (old_thread->tar != new_thread->tar)
++ 			mtspr(SPRN_TAR, new_thread->tar);
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_ARCH_300)) {
++ 		/* Conditionally restore Load Monitor registers, if enabled */
++ 		if (new_thread->fscr & FSCR_LM) {
++ 			if (old_thread->lmrr != new_thread->lmrr)
++ 				mtspr(SPRN_LMRR, new_thread->lmrr);
++ 			if (old_thread->lmser != new_thread->lmser)
++ 				mtspr(SPRN_LMSER, new_thread->lmser);
++ 		}
++ 	}
++ #endif
++ }
++ 
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ void flush_tmregs_to_thread(struct task_struct *tsk)
++ {
++ 	/*
++ 	 * Process self tracing is not yet supported through
++ 	 * ptrace interface. Ptrace generic code should have
++ 	 * prevented this from happening in the first place.
++ 	 * Warn once here with the message, if some how it
++ 	 * is attempted.
++ 	 */
++ 	WARN_ONCE(tsk == current,
++ 		"Not expecting ptrace on self: TM regs may be incorrect\n");
++ 
++ 	/*
++ 	 * If task is not current, it should have been flushed
++ 	 * already to it's thread_struct during __switch_to().
++ 	 */
++ }
++ #endif
++ 
+++>>>>>>> 8d460f6156cd (powerpc/process: Add the function flush_tmregs_to_thread)
+  struct task_struct *__switch_to(struct task_struct *prev,
+  	struct task_struct *new)
+  {
+diff --git a/arch/powerpc/include/asm/switch_to.h b/arch/powerpc/include/asm/switch_to.h
+index 92b3db2429b0..6cb10d312cbe 100644
+--- a/arch/powerpc/include/asm/switch_to.h
++++ b/arch/powerpc/include/asm/switch_to.h
+@@ -82,6 +82,14 @@ static inline void flush_spe_to_thread(struct task_struct *t)
+ }
+ #endif
+ 
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++extern void flush_tmregs_to_thread(struct task_struct *);
++#else
++static inline void flush_tmregs_to_thread(struct task_struct *t)
++{
++}
++#endif
++
+ static inline void clear_task_ebb(struct task_struct *t)
+ {
+ #ifdef CONFIG_PPC_BOOK3S_64
+* Unmerged path arch/powerpc/kernel/process.c
