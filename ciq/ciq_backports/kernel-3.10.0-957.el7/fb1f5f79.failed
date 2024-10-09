@@ -1,0 +1,122 @@
+net: Introduce NETIF_F_GRO_HW.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] Introduce NETIF_F_GRO_HW (Ivan Vecera) [1554456]
+Rebuild_FUZZ: 88.89%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit fb1f5f79ae96331a0201b4080d34f3bc3b5c0b1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fb1f5f79.failed
+
+Introduce NETIF_F_GRO_HW feature flag for NICs that support hardware
+GRO.  With this flag, we can now independently turn on or off hardware
+GRO when GRO is on.  Previously, drivers were using NETIF_F_GRO to
+control hardware GRO and so it cannot be independently turned on or
+off without affecting GRO.
+
+Hardware GRO (just like GRO) guarantees that packets can be re-segmented
+by TSO/GSO to reconstruct the original packet stream.  Logically,
+GRO_HW should depend on GRO since it a subset, but we will let
+individual drivers enforce this dependency as they see fit.
+
+Since NETIF_F_GRO is not propagated between upper and lower devices,
+NETIF_F_GRO_HW should follow suit since it is a subset of GRO.  In other
+words, a lower device can independent have GRO/GRO_HW enabled or disabled
+and no feature propagation is required.  This will preserve the current
+GRO behavior.  This can be changed later if we decide to propagate GRO/
+GRO_HW/RXCSUM from upper to lower devices.
+
+	Cc: Ariel Elior <Ariel.Elior@cavium.com>
+	Cc: everest-linux-l2@cavium.com
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Acked-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fb1f5f79ae96331a0201b4080d34f3bc3b5c0b1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 92d6c5903634,4b43f5dcabcd..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -7257,12 -7424,17 +7257,26 @@@ static netdev_features_t netdev_fix_fea
+  		features &= ~dev->gso_partial_features;
+  	}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_NET_RX_BUSY_POLL
+ +	if (dev->netdev_ops->ndo_busy_poll)
+ +		features |= NETIF_F_BUSY_POLL;
+ +	else
+ +#endif
+ +		features &= ~NETIF_F_BUSY_POLL;
+++=======
++ 	if (!(features & NETIF_F_RXCSUM)) {
++ 		/* NETIF_F_GRO_HW implies doing RXCSUM since every packet
++ 		 * successfully merged by hardware must also have the
++ 		 * checksum verified by hardware.  If the user does not
++ 		 * want to enable RXCSUM, logically, we should disable GRO_HW.
++ 		 */
++ 		if (features & NETIF_F_GRO_HW) {
++ 			netdev_dbg(dev, "Dropping NETIF_F_GRO_HW since no RXCSUM feature.\n");
++ 			features &= ~NETIF_F_GRO_HW;
++ 		}
++ 	}
+++>>>>>>> fb1f5f79ae96 (net: Introduce NETIF_F_GRO_HW.)
+  
+  	return features;
+  }
+diff --git a/Documentation/networking/netdev-features.txt b/Documentation/networking/netdev-features.txt
+index f310edec8a77..65397360d8ca 100644
+--- a/Documentation/networking/netdev-features.txt
++++ b/Documentation/networking/netdev-features.txt
+@@ -165,3 +165,12 @@ This requests that the NIC receive all possible frames, including errored
+ frames (such as bad FCS, etc).  This can be helpful when sniffing a link with
+ bad packets on it.  Some NICs may receive more packets if also put into normal
+ PROMISC mode.
++
++*  rx-gro-hw
++
++This requests that the NIC enables Hardware GRO (generic receive offload).
++Hardware GRO is basically the exact reverse of TSO, and is generally
++stricter than Hardware LRO.  A packet stream merged by Hardware GRO must
++be re-segmentable by GSO or TSO back to the exact original packet stream.
++Hardware GRO is dependent on RXCSUM since every packet successfully merged
++by hardware must also have the checksum verified by hardware.
+diff --git a/include/linux/netdev_features.h b/include/linux/netdev_features.h
+index 1ecb3c4c3f04..e18fbb05a51c 100644
+--- a/include/linux/netdev_features.h
++++ b/include/linux/netdev_features.h
+@@ -97,6 +97,8 @@ enum {
+ 	NETIF_F_HW_TC_BIT,		/* Offload TC infrastructure */
+ 	NETIF_F_RX_UDP_TUNNEL_PORT_BIT, /* Offload of RX port for UDP tunnels */
+ 
++	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
++
+ 	/*
+ 	 * Add your fresh new feature above and remember to update
+ 	 * netdev_features_strings[] in net/core/ethtool.c and maybe
+@@ -116,6 +118,7 @@ enum {
+ #define NETIF_F_FRAGLIST	__NETIF_F(FRAGLIST)
+ #define NETIF_F_FSO		__NETIF_F(FSO)
+ #define NETIF_F_GRO		__NETIF_F(GRO)
++#define NETIF_F_GRO_HW		__NETIF_F(GRO_HW)
+ #define NETIF_F_GSO		__NETIF_F(GSO)
+ #define NETIF_F_GSO_ROBUST	__NETIF_F(GSO_ROBUST)
+ #define NETIF_F_HIGHDMA		__NETIF_F(HIGHDMA)
+* Unmerged path net/core/dev.c
+diff --git a/net/core/ethtool.c b/net/core/ethtool.c
+index b9ca78f7b907..1170e2df1159 100644
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@ -73,6 +73,7 @@ static const char netdev_features_strings[NETDEV_FEATURE_COUNT][ETH_GSTRING_LEN]
+ 	[NETIF_F_LLTX_BIT] =             "tx-lockless",
+ 	[NETIF_F_NETNS_LOCAL_BIT] =      "netns-local",
+ 	[NETIF_F_GRO_BIT] =              "rx-gro",
++	[NETIF_F_GRO_HW_BIT] =           "rx-gro-hw",
+ 	[NETIF_F_LRO_BIT] =              "rx-lro",
+ 
+ 	[NETIF_F_TSO_BIT] =              "tx-tcp-segmentation",
