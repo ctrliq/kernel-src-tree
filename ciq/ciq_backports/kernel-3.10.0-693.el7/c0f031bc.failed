@@ -1,0 +1,292 @@
+nfp: use alloc_frag() and build_skb()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit c0f031bc88660e8b96060b76aa72fbe8859bdcc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c0f031bc.failed
+
+Speed up RX processing by moving to the alloc_frag()/build_skb()
+paradigm.  Since we're no longer mapping the entire buffer for
+DMA add helpers which take care of calculating offsets and
+lengths.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c0f031bc88660e8b96060b76aa72fbe8859bdcc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 8344e8e82257,449ec798a9b7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1058,9 -1047,26 +1075,29 @@@ static void nfp_net_tx_timeout(struct n
+  
+  /* Receive processing
+   */
+++<<<<<<< HEAD
+++=======
++ static unsigned int
++ nfp_net_calc_fl_bufsz(struct nfp_net *nn, unsigned int mtu)
++ {
++ 	unsigned int fl_bufsz;
++ 
++ 	fl_bufsz = NFP_NET_RX_BUF_HEADROOM;
++ 	if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
++ 		fl_bufsz += NFP_NET_MAX_PREPEND;
++ 	else
++ 		fl_bufsz += nn->rx_offset;
++ 	fl_bufsz += ETH_HLEN + VLAN_HLEN * 2 + mtu;
++ 
++ 	fl_bufsz = SKB_DATA_ALIGN(fl_bufsz);
++ 	fl_bufsz += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 
++ 	return fl_bufsz;
++ }
+++>>>>>>> c0f031bc8866 (nfp: use alloc_frag() and build_skb())
+  
+  /**
+-  * nfp_net_rx_alloc_one() - Allocate and map skb for RX
++  * nfp_net_rx_alloc_one() - Allocate and map page frag for RX
+   * @rx_ring:	RX ring structure of the skb
+   * @dma_addr:	Pointer to storage for DMA address (output param)
+   * @fl_bufsz:	size of freelist buffers
+@@@ -1303,12 -1293,79 +1338,36 @@@ static void nfp_net_set_hash(struct net
+  	case NFP_NET_RSS_IPV4:
+  	case NFP_NET_RSS_IPV6:
+  	case NFP_NET_RSS_IPV6_EX:
+ -		skb_set_hash(skb, get_unaligned_be32(hash), PKT_HASH_TYPE_L3);
+ +		skb_set_hash(skb, be32_to_cpu(rx_hash->hash), PKT_HASH_TYPE_L3);
+  		break;
+  	default:
+ -		skb_set_hash(skb, get_unaligned_be32(hash), PKT_HASH_TYPE_L4);
+ +		skb_set_hash(skb, be32_to_cpu(rx_hash->hash), PKT_HASH_TYPE_L4);
+  		break;
+  	}
+ -}
+ -
+ -static void
+ -nfp_net_set_hash_desc(struct net_device *netdev, struct sk_buff *skb,
+ -		      struct nfp_net_rx_desc *rxd)
+ -{
+ -	struct nfp_net_rx_hash *rx_hash;
+ -
+ -	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+ -		return;
+ -
+ -	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ -
+ -	nfp_net_set_hash(netdev, skb, get_unaligned_be32(&rx_hash->hash_type),
+ -			 &rx_hash->hash);
+ -}
+ -
+ -static void *
+ -nfp_net_parse_meta(struct net_device *netdev, struct sk_buff *skb,
+ -		   int meta_len)
+ -{
+ -	u8 *data = skb->data - meta_len;
+ -	u32 meta_info;
+ -
+ -	meta_info = get_unaligned_be32(data);
+ -	data += 4;
+ -
+ -	while (meta_info) {
+ -		switch (meta_info & NFP_NET_META_FIELD_MASK) {
+ -		case NFP_NET_META_HASH:
+ -			meta_info >>= NFP_NET_META_FIELD_SIZE;
+ -			nfp_net_set_hash(netdev, skb,
+ -					 meta_info & NFP_NET_META_FIELD_MASK,
+ -					 (__be32 *)data);
+ -			data += 4;
+ -			break;
+ -		case NFP_NET_META_MARK:
+ -			skb->mark = get_unaligned_be32(data);
+ -			data += 4;
+ -			break;
+ -		default:
+ -			return NULL;
+ -		}
+ -
+ -		meta_info >>= NFP_NET_META_FIELD_SIZE;
+ -	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	return data;
++ }
++ 
++ static void
++ nfp_net_rx_drop(struct nfp_net_r_vector *r_vec, struct nfp_net_rx_ring *rx_ring,
++ 		struct nfp_net_rx_buf *rxbuf, struct sk_buff *skb)
++ {
++ 	u64_stats_update_begin(&r_vec->rx_sync);
++ 	r_vec->rx_drops++;
++ 	u64_stats_update_end(&r_vec->rx_sync);
++ 
++ 	/* skb is build based on the frag, free_skb() would free the frag
++ 	 * so to be able to reuse it we need an extra ref.
++ 	 */
++ 	if (skb && rxbuf && skb->head == rxbuf->frag)
++ 		page_ref_inc(virt_to_head_page(rxbuf->frag));
++ 	if (rxbuf)
++ 		nfp_net_rx_give_one(rx_ring, rxbuf->frag, rxbuf->dma_addr);
++ 	if (skb)
++ 		dev_kfree_skb_any(skb);
+++>>>>>>> c0f031bc8866 (nfp: use alloc_frag() and build_skb())
+  }
+  
+  /**
+@@@ -1341,31 -1384,15 +1400,40 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
+  	struct nfp_net *nn = r_vec->nfp_net;
+  	unsigned int data_len, meta_len;
+++<<<<<<< HEAD
+ +	int avail = 0, pkts_polled = 0;
+ +	struct sk_buff *skb, *new_skb;
+ +	struct nfp_net_rx_desc *rxd;
+ +	dma_addr_t new_dma_addr;
+ +	u32 qcp_wr_p;
+++=======
++ 	struct nfp_net_rx_buf *rxbuf;
++ 	struct nfp_net_rx_desc *rxd;
++ 	dma_addr_t new_dma_addr;
++ 	struct sk_buff *skb;
++ 	int pkts_polled = 0;
++ 	void *new_frag;
+++>>>>>>> c0f031bc8866 (nfp: use alloc_frag() and build_skb())
+  	int idx;
+  
+ -	while (pkts_polled < budget) {
+ +	if (nn->is_nfp3200) {
+ +		/* Work out how many packets arrived */
+ +		qcp_wr_p = nfp_qcp_wr_ptr_read(rx_ring->qcp_rx);
+ +		idx = rx_ring->rd_p % rx_ring->cnt;
+ +
+ +		if (qcp_wr_p == idx)
+ +			/* No new packets */
+ +			return 0;
+ +
+ +		if (qcp_wr_p > idx)
+ +			avail = qcp_wr_p - idx;
+ +		else
+ +			avail = qcp_wr_p + rx_ring->cnt - idx;
+ +	} else {
+ +		avail = budget + 1;
+ +	}
+ +
+ +	while (avail > 0 && pkts_polled < budget) {
+  		idx = rx_ring->rd_p % rx_ring->cnt;
+  
+  		rxd = &rx_ring->rxds[idx];
+@@@ -1383,18 -1406,17 +1451,31 @@@
+  
+  		rx_ring->rd_p++;
+  		pkts_polled++;
+ -
+ +		avail--;
+ +
+++<<<<<<< HEAD
+ +		skb = rx_ring->rxbufs[idx].skb;
+ +
+ +		new_skb = nfp_net_rx_alloc_one(rx_ring, &new_dma_addr,
+ +					       nn->fl_bufsz);
+ +		if (!new_skb) {
+ +			nfp_net_rx_give_one(rx_ring, rx_ring->rxbufs[idx].skb,
+ +					    rx_ring->rxbufs[idx].dma_addr);
+ +			u64_stats_update_begin(&r_vec->rx_sync);
+ +			r_vec->rx_drops++;
+ +			u64_stats_update_end(&r_vec->rx_sync);
+++=======
++ 		rxbuf =	&rx_ring->rxbufs[idx];
++ 		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
++ 		if (unlikely(!skb)) {
++ 			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 		new_frag = nfp_net_rx_alloc_one(rx_ring, &new_dma_addr,
++ 						nn->fl_bufsz);
++ 		if (unlikely(!new_frag)) {
++ 			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+++>>>>>>> c0f031bc8866 (nfp: use alloc_frag() and build_skb())
+  			continue;
+  		}
+  
+@@@ -1420,13 -1441,12 +1500,14 @@@
+  		data_len = le16_to_cpu(rxd->rxd.data_len);
+  
+  		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
+- 			skb_reserve(skb, meta_len);
++ 			skb_reserve(skb, NFP_NET_RX_BUF_HEADROOM + meta_len);
+  		else
+- 			skb_reserve(skb, nn->rx_offset);
++ 			skb_reserve(skb,
++ 				    NFP_NET_RX_BUF_HEADROOM + nn->rx_offset);
+  		skb_put(skb, data_len - meta_len);
+  
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+ +
+  		/* Stats update */
+  		u64_stats_update_begin(&r_vec->rx_sync);
+  		r_vec->rx_pkts++;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index b7c0ef360c21..b255a81e3c9d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -99,6 +99,10 @@
+ /* Offload definitions */
+ #define NFP_NET_N_VXLAN_PORTS	(NFP_NET_CFG_VXLAN_SZ / sizeof(__be16))
+ 
++#define NFP_NET_RX_BUF_HEADROOM	(NET_SKB_PAD + NET_IP_ALIGN)
++#define NFP_NET_RX_BUF_NON_DATA	(NFP_NET_RX_BUF_HEADROOM +		\
++				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++
+ /* Forward declarations */
+ struct nfp_net;
+ struct nfp_net_r_vector;
+@@ -273,11 +277,11 @@ struct nfp_net_rx_hash {
+ 
+ /**
+  * struct nfp_net_rx_buf - software RX buffer descriptor
+- * @skb:	sk_buff associated with this buffer
++ * @frag:	page fragment buffer
+  * @dma_addr:	DMA mapping address of the buffer
+  */
+ struct nfp_net_rx_buf {
+-	struct sk_buff *skb;
++	void *frag;
+ 	dma_addr_t dma_addr;
+ };
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_debugfs.c b/drivers/net/ethernet/netronome/nfp/nfp_net_debugfs.c
+index f7c9a5bc4aa3..180cf70f0093 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_debugfs.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_debugfs.c
+@@ -44,8 +44,8 @@ static int nfp_net_debugfs_rx_q_read(struct seq_file *file, void *data)
+ 	struct nfp_net_r_vector *r_vec = file->private;
+ 	struct nfp_net_rx_ring *rx_ring;
+ 	struct nfp_net_rx_desc *rxd;
+-	struct sk_buff *skb;
+ 	struct nfp_net *nn;
++	void *frag;
+ 	int i;
+ 
+ 	rtnl_lock();
+@@ -73,10 +73,9 @@ static int nfp_net_debugfs_rx_q_read(struct seq_file *file, void *data)
+ 		seq_printf(file, "%04d: 0x%08x 0x%08x", i,
+ 			   rxd->vals[0], rxd->vals[1]);
+ 
+-		skb = READ_ONCE(rx_ring->rxbufs[i].skb);
+-		if (skb)
+-			seq_printf(file, " skb->head=%p skb->data=%p",
+-				   skb->head, skb->data);
++		frag = READ_ONCE(rx_ring->rxbufs[i].frag);
++		if (frag)
++			seq_printf(file, " frag=%p", frag);
+ 
+ 		if (rx_ring->rxbufs[i].dma_addr)
+ 			seq_printf(file, " dma_addr=%pad",
