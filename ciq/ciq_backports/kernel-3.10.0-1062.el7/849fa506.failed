@@ -1,0 +1,130 @@
+bpf/verifier: refine retval R0 state for bpf_get_stack helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yonghong Song <yhs@fb.com>
+commit 849fa50662fbc8b476d652f8a4e6bdda17b37859
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/849fa506.failed
+
+The special property of return values for helpers bpf_get_stack
+and bpf_probe_read_str are captured in verifier.
+Both helpers return a negative error code or
+a length, which is equal to or smaller than the buffer
+size argument. This additional information in the
+verifier can avoid the condition such as "retval > bufsize"
+in the bpf program. For example, for the code blow,
+    usize = bpf_get_stack(ctx, raw_data, max_len, BPF_F_USER_STACK);
+    if (usize < 0 || usize > max_len)
+        return 0;
+The verifier may have the following errors:
+    52: (85) call bpf_get_stack#65
+     R0=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R1_w=ctx(id=0,off=0,imm=0)
+     R2_w=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R3_w=inv800 R4_w=inv256
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R9_w=inv800 R10=fp0,call_-1
+    53: (bf) r8 = r0
+    54: (bf) r1 = r8
+    55: (67) r1 <<= 32
+    56: (bf) r2 = r1
+    57: (77) r2 >>= 32
+    58: (25) if r2 > 0x31f goto pc+33
+     R0=inv(id=0) R1=inv(id=0,smax_value=9223372032559808512,
+                         umax_value=18446744069414584320,
+                         var_off=(0x0; 0xffffffff00000000))
+     R2=inv(id=0,umax_value=799,var_off=(0x0; 0x3ff))
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R8=inv(id=0) R9=inv800 R10=fp0,call_-1
+    59: (1f) r9 -= r8
+    60: (c7) r1 s>>= 32
+    61: (bf) r2 = r7
+    62: (0f) r2 += r1
+    math between map_value pointer and register with unbounded
+    min value is not allowed
+The failure is due to llvm compiler optimization where register "r2",
+which is a copy of "r1", is tested for condition while later on "r1"
+is used for map_ptr operation. The verifier is not able to track such
+inst sequence effectively.
+
+Without the "usize > max_len" condition, there is no llvm optimization
+and the below generated code passed verifier:
+    52: (85) call bpf_get_stack#65
+     R0=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R1_w=ctx(id=0,off=0,imm=0)
+     R2_w=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R3_w=inv800 R4_w=inv256
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R9_w=inv800 R10=fp0,call_-1
+    53: (b7) r1 = 0
+    54: (bf) r8 = r0
+    55: (67) r8 <<= 32
+    56: (c7) r8 s>>= 32
+    57: (6d) if r1 s> r8 goto pc+24
+     R0=inv(id=0,umax_value=800,var_off=(0x0; 0x3ff))
+     R1=inv0 R6=ctx(id=0,off=0,imm=0)
+     R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R8=inv(id=0,umax_value=800,var_off=(0x0; 0x3ff)) R9=inv800
+     R10=fp0,call_-1
+    58: (bf) r2 = r7
+    59: (0f) r2 += r8
+    60: (1f) r9 -= r8
+    61: (bf) r1 = r6
+
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 849fa50662fbc8b476d652f8a4e6bdda17b37859)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 5cb5e92d5f64,988400e283b7..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -2324,27 -2332,21 +2332,45 @@@ static int prepare_func_exit(struct bpf
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +record_func_map(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
+ +		int func_id, int insn_idx)
+ +{
+ +	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+ +
+ +	if (func_id != BPF_FUNC_tail_call &&
+ +	    func_id != BPF_FUNC_map_lookup_elem)
+ +		return 0;
+ +	if (meta->map_ptr == NULL) {
+ +		verbose(env, "kernel subsystem misconfigured verifier\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (!BPF_MAP_PTR(aux->map_state))
+ +		bpf_map_ptr_store(aux, meta->map_ptr,
+ +				  meta->map_ptr->unpriv_array);
+ +	else if (BPF_MAP_PTR(aux->map_state) != meta->map_ptr)
+ +		bpf_map_ptr_store(aux, BPF_MAP_PTR_POISON,
+ +				  meta->map_ptr->unpriv_array);
+ +	return 0;
+++=======
++ static void do_refine_retval_range(struct bpf_reg_state *regs, int ret_type,
++ 				   int func_id,
++ 				   struct bpf_call_arg_meta *meta)
++ {
++ 	struct bpf_reg_state *ret_reg = &regs[BPF_REG_0];
++ 
++ 	if (ret_type != RET_INTEGER ||
++ 	    (func_id != BPF_FUNC_get_stack &&
++ 	     func_id != BPF_FUNC_probe_read_str))
++ 		return;
++ 
++ 	ret_reg->smax_value = meta->msize_smax_value;
++ 	ret_reg->umax_value = meta->msize_umax_value;
++ 	__reg_deduce_bounds(ret_reg);
++ 	__reg_bound_offset(ret_reg);
+++>>>>>>> 849fa50662fb (bpf/verifier: refine retval R0 state for bpf_get_stack helper)
+  }
+  
+  static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
+* Unmerged path kernel/bpf/verifier.c
