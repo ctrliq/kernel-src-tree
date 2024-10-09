@@ -1,0 +1,123 @@
+i40e/i40evf: Fix i40e_rx_checksum
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Duyck <aduyck@mirantis.com>
+commit 858296c8784bf98450765cbc6b1bc2e44175cc01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/858296c8.failed
+
+There are a couple of issues I found in i40e_rx_checksum while doing some
+recent testing.  As a result I have found the Rx checksum logic is pretty
+much broken and returning that the checksum is valid for tunnels in cases
+where it is not.
+
+First the inner types are not the correct values to use to test for if a
+tunnel is present or not.  In addition the inner protocol types are not a
+bitmask as such performing an OR of the values doesn't make sense.  I have
+instead changed the code so that the inner protocol types are used to
+determine if we report CHECKSUM_UNNECESSARY or not.  For anything that does
+not end in UDP, TCP, or SCTP it doesn't make much sense to report a
+checksum offload since it won't contain a checksum anyway.
+
+This leaves us with the need to set the csum_level based on some value.
+For that purpose I am using the tunnel_type field.  If the tunnel type is
+GRENAT or greater then this means we have a GRE or UDP tunnel with an inner
+header.  In the case of GRE or UDP we will have a possible checksum present
+so for this reason it should be safe to set the csum_level to 1 to indicate
+that we are reporting the state of the inner header.
+
+	Signed-off-by: Alexander Duyck <aduyck@mirantis.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 858296c8784bf98450765cbc6b1bc2e44175cc01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 1b463805199a,a8868e1bf832..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -1361,12 -1277,21 +1361,28 @@@ static void i40e_receive_skb(struct i40
+   **/
+  static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
+  				    struct sk_buff *skb,
+ -				    union i40e_rx_desc *rx_desc)
+ +				    u32 rx_status,
+ +				    u32 rx_error,
+ +				    u16 rx_ptype)
+  {
+++<<<<<<< HEAD
+ +	struct i40e_rx_ptype_decoded decoded = decode_rx_desc_ptype(rx_ptype);
+ +	bool ipv4, ipv6, tunnel = false;
+++=======
++ 	struct i40e_rx_ptype_decoded decoded;
++ 	u32 rx_error, rx_status;
++ 	bool ipv4, ipv6;
++ 	u8 ptype;
++ 	u64 qword;
++ 
++ 	qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
++ 	ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >> I40E_RXD_QW1_PTYPE_SHIFT;
++ 	rx_error = (qword & I40E_RXD_QW1_ERROR_MASK) >>
++ 		   I40E_RXD_QW1_ERROR_SHIFT;
++ 	rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
++ 		    I40E_RXD_QW1_STATUS_SHIFT;
++ 	decoded = decode_rx_desc_ptype(ptype);
+++>>>>>>> 858296c8784b (i40e/i40evf: Fix i40e_rx_checksum)
+  
+  	skb->ip_summed = CHECKSUM_NONE;
+  
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index db09ef05d866..145010844b76 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@ -752,8 +752,8 @@ static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
+ 				    union i40e_rx_desc *rx_desc)
+ {
+ 	struct i40e_rx_ptype_decoded decoded;
+-	bool ipv4, ipv6, tunnel = false;
+ 	u32 rx_error, rx_status;
++	bool ipv4, ipv6;
+ 	u8 ptype;
+ 	u64 qword;
+ 
+@@ -808,19 +808,23 @@ static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
+ 	if (rx_error & BIT(I40E_RX_DESC_ERROR_PPRS_SHIFT))
+ 		return;
+ 
+-	/* The hardware supported by this driver does not validate outer
+-	 * checksums for tunneled VXLAN or GENEVE frames.  I don't agree
+-	 * with it but the specification states that you "MAY validate", it
+-	 * doesn't make it a hard requirement so if we have validated the
+-	 * inner checksum report CHECKSUM_UNNECESSARY.
++	/* If there is an outer header present that might contain a checksum
++	 * we need to bump the checksum level by 1 to reflect the fact that
++	 * we are indicating we validated the inner checksum.
+ 	 */
+-	if (decoded.inner_prot & (I40E_RX_PTYPE_INNER_PROT_TCP |
+-				  I40E_RX_PTYPE_INNER_PROT_UDP |
+-				  I40E_RX_PTYPE_INNER_PROT_SCTP))
+-		tunnel = true;
+-
+-	skb->ip_summed = CHECKSUM_UNNECESSARY;
+-	skb->csum_level = tunnel ? 1 : 0;
++	if (decoded.tunnel_type >= I40E_RX_PTYPE_TUNNEL_IP_GRENAT)
++		skb->csum_level = 1;
++
++	/* Only report checksum unnecessary for TCP, UDP, or SCTP */
++	switch (decoded.inner_prot) {
++	case I40E_RX_PTYPE_INNER_PROT_TCP:
++	case I40E_RX_PTYPE_INNER_PROT_UDP:
++	case I40E_RX_PTYPE_INNER_PROT_SCTP:
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		/* fall though */
++	default:
++		break;
++	}
+ 
+ 	return;
+ 
