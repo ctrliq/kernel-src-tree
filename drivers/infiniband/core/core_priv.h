@@ -308,4 +308,7 @@ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
 				 u8 *dmac, const struct net_device *ndev,
 				 int *hoplimit);
 
+struct sa_path_rec;
+int roce_resolve_route_from_path(struct sa_path_rec *rec,
+				 const struct ib_gid_attr *attr);
 #endif /* _CORE_PRIV_H */
