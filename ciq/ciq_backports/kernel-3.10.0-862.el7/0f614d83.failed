@@ -1,0 +1,172 @@
+i2c: Add generic support passing secondary devices addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [i2c] Add generic support passing secondary devices addresses (Gopal Tiwari) [1456705]
+Rebuild_FUZZ: 95.65%
+commit-author Jean-Michel Hautbois <jhautbois@gmail.com>
+commit 0f614d834bccd3537881c5d0933803b407ce3283
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0f614d83.failed
+
+Some I2C devices have multiple addresses assigned, for example each address
+corresponding to a different internal register map page of the device.
+So far drivers which need support for this have handled this with a driver
+specific and non-generic implementation, e.g. passing the additional address
+via platform data.
+
+This patch provides a new helper function called i2c_new_secondary_device()
+which is intended to provide a generic way to get the secondary address
+as well as instantiate a struct i2c_client for the secondary address.
+
+The function expects a pointer to the primary i2c_client, a name
+for the secondary address and an optional default address. The name is used
+as a handle to specify which secondary address to get.
+
+The default address is used as a fallback in case no secondary address
+was explicitly specified. In case no secondary address and no default
+address were specified the function returns NULL.
+
+For now the function only supports look-up of the secondary address
+from devicetree, but it can be extended in the future
+to for example support board files and/or ACPI.
+
+	Signed-off-by: Jean-Michel Hautbois <jean-michel.hautbois@veo-labs.com>
+	Acked-by: Rob Herring <robh@kernel.org>
+	Acked-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+(cherry picked from commit 0f614d834bccd3537881c5d0933803b407ce3283)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/devicetree/bindings/i2c/i2c.txt
+diff --cc Documentation/devicetree/bindings/i2c/i2c.txt
+index 1175efed4a41,f31b2ad1552b..000000000000
+--- a/Documentation/devicetree/bindings/i2c/i2c.txt
++++ b/Documentation/devicetree/bindings/i2c/i2c.txt
+@@@ -29,5 -29,50 +29,55 @@@ Optional propertie
+  These properties may not be supported by all drivers. However, if a driver
+  wants to support one of the below features, it should adapt the bindings below.
+  
+++<<<<<<< HEAD
+ +- clock-frequency	- frequency of bus clock in Hz
+ +- wakeup-source		- device can be used as a wakeup source.
+++=======
++ - clock-frequency
++ 	frequency of bus clock in Hz.
++ 
++ - i2c-scl-falling-time-ns
++ 	Number of nanoseconds the SCL signal takes to fall; t(f) in the I2C
++ 	specification.
++ 
++ - i2c-scl-internal-delay-ns
++ 	Number of nanoseconds the IP core additionally needs to setup SCL.
++ 
++ - i2c-scl-rising-time-ns
++ 	Number of nanoseconds the SCL signal takes to rise; t(r) in the I2C
++ 	specification.
++ 
++ - i2c-sda-falling-time-ns
++ 	Number of nanoseconds the SDA signal takes to fall; t(f) in the I2C
++ 	specification.
++ 
++ - interrupts
++ 	interrupts used by the device.
++ 
++ - interrupt-names
++ 	"irq" and "wakeup" names are recognized by I2C core, other names are
++ 	left to individual drivers.
++ 
++ - multi-master
++ 	states that there is another master active on this bus. The OS can use
++ 	this information to adapt power management to keep the arbitration awake
++ 	all the time, for example.
++ 
++ - wakeup-source
++ 	device can be used as a wakeup source.
++ 
++ - reg
++ 	I2C slave addresses
++ 
++ - reg-names
++ 	Names of map programmable addresses.
++ 	It can contain any map needing another address than default one.
++ 
++ Binding may contain optional "interrupts" property, describing interrupts
++ used by the device. I2C core will assign "irq" interrupt (or the very first
++ interrupt if not using interrupt names) as primary interrupt for the slave.
++ 
++ Also, if device is marked as a wakeup source, I2C core will set up "wakeup"
++ interrupt for the device. If "wakeup" interrupt name is not present in the
++ binding, then primary interrupt will be used as wakeup interrupt.
+++>>>>>>> 0f614d834bcc (i2c: Add generic support passing secondary devices addresses)
+* Unmerged path Documentation/devicetree/bindings/i2c/i2c.txt
+diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
+index bb2f4e756021..862ef3a3e06f 100644
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -799,6 +799,47 @@ struct i2c_client *i2c_new_dummy(struct i2c_adapter *adapter, u16 address)
+ }
+ EXPORT_SYMBOL_GPL(i2c_new_dummy);
+ 
++/**
++ * i2c_new_secondary_device - Helper to get the instantiated secondary address
++ * and create the associated device
++ * @client: Handle to the primary client
++ * @name: Handle to specify which secondary address to get
++ * @default_addr: Used as a fallback if no secondary address was specified
++ * Context: can sleep
++ *
++ * I2C clients can be composed of multiple I2C slaves bound together in a single
++ * component. The I2C client driver then binds to the master I2C slave and needs
++ * to create I2C dummy clients to communicate with all the other slaves.
++ *
++ * This function creates and returns an I2C dummy client whose I2C address is
++ * retrieved from the platform firmware based on the given slave name. If no
++ * address is specified by the firmware default_addr is used.
++ *
++ * On DT-based platforms the address is retrieved from the "reg" property entry
++ * cell whose "reg-names" value matches the slave name.
++ *
++ * This returns the new i2c client, which should be saved for later use with
++ * i2c_unregister_device(); or NULL to indicate an error.
++ */
++struct i2c_client *i2c_new_secondary_device(struct i2c_client *client,
++						const char *name,
++						u16 default_addr)
++{
++	struct device_node *np = client->dev.of_node;
++	u32 addr = default_addr;
++	int i;
++
++	if (np) {
++		i = of_property_match_string(np, "reg-names", name);
++		if (i >= 0)
++			of_property_read_u32_index(np, "reg", i, &addr);
++	}
++
++	dev_dbg(&client->adapter->dev, "Address for %s : 0x%x\n", name, addr);
++	return i2c_new_dummy(client->adapter, addr);
++}
++EXPORT_SYMBOL_GPL(i2c_new_secondary_device);
++
+ /* ------------------------------------------------------------------------- */
+ 
+ /* I2C bus adapters -- one roots each I2C or SMBUS segment */
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index c1f71528c72e..33fefe8c15d4 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -322,6 +322,11 @@ extern int i2c_probe_func_quick_read(struct i2c_adapter *, unsigned short addr);
+ extern struct i2c_client *
+ i2c_new_dummy(struct i2c_adapter *adap, u16 address);
+ 
++extern struct i2c_client *
++i2c_new_secondary_device(struct i2c_client *client,
++				const char *name,
++				u16 default_addr);
++
+ extern void i2c_unregister_device(struct i2c_client *);
+ #endif /* I2C */
+ 
