@@ -1,0 +1,157 @@
+perf record: Enable arbitrary event names thru name= modifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit f92da71280fb8da3a7c489e08a096f0b8715f939
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f92da712.failed
+
+Enable complex event names containing [.:=,] symbols to be encoded into Perf
+trace using name= modifier e.g. like this:
+
+  perf record -e cpu/name=\'OFFCORE_RESPONSE:request=DEMAND_RFO:response=L3_HIT.SNOOP_HITM\',\
+		  period=0x3567e0,event=0x3c,cmask=0x1/Duk ./futex
+
+Below is how it looks like in the report output. Please note explicit escaped
+quoting at cmdline string in the header so that thestring can be directly reused
+for another collection in shell:
+
+perf report --header
+
+  # ========
+  ...
+  # cmdline : /root/abudanko/kernel/tip/tools/perf/perf record -v -e cpu/name=\'OFFCORE_RESPONSE:request=DEMAND_RFO:response=L3_HIT.SNOOP_HITM\',period=0x3567e0,event=0x3c,cmask=0x1/Duk ./futex
+  # event : name = OFFCORE_RESPONSE:request=DEMAND_RFO:response=L3_HIT.SNOOP_HITM, , type = 4, size = 112, config = 0x100003c, { sample_period, sample_freq } = 3500000, sample_type = IP|TID|TIME, disabled = 1, inh
+  ...
+  # ========
+  #
+  #
+  # Total Lost Samples: 0
+  #
+  # Samples: 24K of event 'OFFCORE_RESPONSE:request=DEMAND_RFO:response=L3_HIT.SNOOP_HITM'
+  # Event count (approx.): 86492000000
+  #
+  # Overhead  Command  Shared Object     Symbol
+  # ........  .......  ................  ..............................................
+  #
+      14.75%  futex    [kernel.vmlinux]  [k] __entry_trampoline_start
+...
+
+  perf stat -e cpu/name=\'CPU_CLK_UNHALTED.THREAD:cmask=0x1\',period=0x3567e0,event=0x3c,cmask=0x1/Duk ./futex
+
+  10000000 process context switches in 16678890291ns (1667.9ns/ctxsw)
+
+   Performance counter stats for './futex':
+
+      88,095,770,571      CPU_CLK_UNHALTED.THREAD:cmask=0x1
+
+        16.679542407 seconds time elapsed
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Acked-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/c194b060-761d-0d50-3b21-bb4ed680002d@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f92da71280fb8da3a7c489e08a096f0b8715f939)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/parse-events.l
+diff --cc tools/perf/util/parse-events.l
+index 32c8c241ab5c,5f761f3ed0f3..000000000000
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@@ -139,8 -189,9 +153,14 @@@ event		[^,{}/]
+  num_dec		[0-9]+
+  num_hex		0x[a-fA-F0-9]+
+  num_raw_hex	[a-fA-F0-9]+
+++<<<<<<< HEAD
+ +name		[a-zA-Z_*?][a-zA-Z0-9_*?.]*
+ +name_minus	[a-zA-Z_*?][a-zA-Z0-9\-_*?.]*
+++=======
++ name		[a-zA-Z_*?\[\]][a-zA-Z0-9_*?.\[\]]*
++ name_tag	[\'][a-zA-Z_*?\[\]][a-zA-Z0-9_*?\-,\.\[\]:=]*[\']
++ name_minus	[a-zA-Z_*?][a-zA-Z0-9\-_*?.:]*
+++>>>>>>> f92da71280fb (perf record: Enable arbitrary event names thru name= modifier)
+  drv_cfg_term	[a-zA-Z0-9_\.]+(=[a-zA-Z0-9_*?\.:]+)?
+  /* If you add a modifier you need to update check_modifier() */
+  modifier_event	[ukhpPGHSDIW]+
+@@@ -291,7 -356,10 +311,8 @@@ r{num_raw_hex}		{ return raw(yyscanner)
+  {num_hex}		{ return value(yyscanner, 16); }
+  
+  {modifier_event}	{ return str(yyscanner, PE_MODIFIER_EVENT); }
+ -{bpf_object}		{ if (!isbpf(yyscanner)) { USER_REJECT }; return str(yyscanner, PE_BPF_OBJECT); }
+ -{bpf_source}		{ if (!isbpf(yyscanner)) { USER_REJECT }; return str(yyscanner, PE_BPF_SOURCE); }
+  {name}			{ return pmu_str_check(yyscanner); }
++ {name_tag}		{ return str(yyscanner, PE_NAME); }
+  "/"			{ BEGIN(config); return '/'; }
+  -			{ return '-'; }
+  ,			{ BEGIN(event); return ','; }
+diff --git a/tools/perf/Documentation/perf-list.txt b/tools/perf/Documentation/perf-list.txt
+index e2a897ae3596..d0b5bada1c7a 100644
+--- a/tools/perf/Documentation/perf-list.txt
++++ b/tools/perf/Documentation/perf-list.txt
+@@ -124,7 +124,11 @@ The available PMUs and their raw parameters can be listed with
+ For example the raw event "LSD.UOPS" core pmu event above could
+ be specified as
+ 
+-  perf stat -e cpu/event=0xa8,umask=0x1,name=LSD.UOPS_CYCLES,cmask=1/ ...
++  perf stat -e cpu/event=0xa8,umask=0x1,name=LSD.UOPS_CYCLES,cmask=0x1/ ...
++
++  or using extended name syntax
++
++  perf stat -e cpu/event=0xa8,umask=0x1,cmask=0x1,name=\'LSD.UOPS_CYCLES:cmask=0x1\'/ ...
+ 
+ PER SOCKET PMUS
+ ---------------
+diff --git a/tools/perf/Documentation/perf-record.txt b/tools/perf/Documentation/perf-record.txt
+index 1b282c4c95e5..cf9263792260 100644
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@ -57,6 +57,9 @@ OPTIONS
+ 			 FP mode, "dwarf" for DWARF mode, "lbr" for LBR mode and
+ 			 "no" for disable callgraph.
+ 	  - 'stack-size': user stack size for dwarf mode
++	  - 'name' : User defined event name. Single quotes (') may be used to
++		    escape symbols in the name from parsing by shell and tool
++		    like this: name=\'CPU_CLK_UNHALTED.THREAD:cmask=0x1\'.
+ 
+           See the linkperf:perf-list[1] man page for more parameters.
+ 
+diff --git a/tools/perf/util/header.c b/tools/perf/util/header.c
+index bbfb45938073..c7c4b04d2250 100644
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@ -1458,8 +1458,24 @@ static void print_cmdline(struct feat_fd *ff, FILE *fp)
+ 
+ 	fprintf(fp, "# cmdline : ");
+ 
+-	for (i = 0; i < nr; i++)
+-		fprintf(fp, "%s ", ff->ph->env.cmdline_argv[i]);
++	for (i = 0; i < nr; i++) {
++		char *argv_i = strdup(ff->ph->env.cmdline_argv[i]);
++		if (!argv_i) {
++			fprintf(fp, "%s ", ff->ph->env.cmdline_argv[i]);
++		} else {
++			char *mem = argv_i;
++			do {
++				char *quote = strchr(argv_i, '\'');
++				if (!quote)
++					break;
++				*quote++ = '\0';
++				fprintf(fp, "%s\\\'", argv_i);
++				argv_i = quote;
++			} while (1);
++			fprintf(fp, "%s ", argv_i);
++			free(mem);
++		}
++	}
+ 	fputc('\n', fp);
+ }
+ 
+* Unmerged path tools/perf/util/parse-events.l
