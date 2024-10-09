@@ -1,0 +1,103 @@
+posix-timers: Use sighand lock instead of tasklist_lock on timer deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit 3d7a1427e4ce545e949e9bccb75d0ca8d941d93c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/3d7a1427.failed
+
+Timer deletion doesn't need the tasklist lock.
+We need to protect against:
+
+* concurrent access to the lists p->cputime_expires and
+  p->sighand->cputime_expires
+
+* task reaping that may also delete the timer list entry
+
+* timer firing
+
+We already hold the timer lock which protects us against concurrent
+timer firing.
+
+The rest only need the targets sighand to be locked.
+So hold it and drop the use of tasklist_lock there.
+
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Kosaki Motohiro <kosaki.motohiro@jp.fujitsu.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 3d7a1427e4ce545e949e9bccb75d0ca8d941d93c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/posix-cpu-timers.c
+diff --cc kernel/posix-cpu-timers.c
+index 9aab0941718b,9641958ddb3e..000000000000
+--- a/kernel/posix-cpu-timers.c
++++ b/kernel/posix-cpu-timers.c
+@@@ -416,30 -377,35 +416,57 @@@ static int posix_cpu_timer_create(struc
+   */
+  static int posix_cpu_timer_del(struct k_itimer *timer)
+  {
+- 	struct task_struct *p = timer->it.cpu.task;
+  	int ret = 0;
++ 	unsigned long flags;
++ 	struct sighand_struct *sighand;
++ 	struct task_struct *p = timer->it.cpu.task;
+  
+ -	WARN_ON_ONCE(p == NULL);
+ +	if (likely(p != NULL)) {
+ +		qread_lock(&tasklist_lock);
+ +		if (unlikely(p->sighand == NULL)) {
+ +			/*
+ +			 * We raced with the reaping of the task.
+ +			 * The deletion should have cleared us off the list.
+ +			 */
+ +			BUG_ON(!list_empty(&timer->it.cpu.entry));
+ +		} else {
+ +			spin_lock(&p->sighand->siglock);
+ +			if (timer->it.cpu.firing)
+ +				ret = TIMER_RETRY;
+ +			else
+ +				list_del(&timer->it.cpu.entry);
+ +			spin_unlock(&p->sighand->siglock);
+ +		}
+ +		qread_unlock(&tasklist_lock);
+  
+++<<<<<<< HEAD
+ +		if (!ret)
+ +			put_task_struct(p);
+ +	}
+++=======
++ 	/*
++ 	 * Protect against sighand release/switch in exit/exec and process/
++ 	 * thread timer list entry concurrent read/writes.
++ 	 */
++ 	sighand = lock_task_sighand(p, &flags);
++ 	if (unlikely(sighand == NULL)) {
++ 		/*
++ 		 * We raced with the reaping of the task.
++ 		 * The deletion should have cleared us off the list.
++ 		 */
++ 		BUG_ON(!list_empty(&timer->it.cpu.entry));
++ 	} else {
++ 		if (timer->it.cpu.firing)
++ 			ret = TIMER_RETRY;
++ 		else
++ 			list_del(&timer->it.cpu.entry);
++ 
++ 		unlock_task_sighand(p, &flags);
++ 	}
++ 
++ 	if (!ret)
++ 		put_task_struct(p);
+++>>>>>>> 3d7a1427e4ce (posix-timers: Use sighand lock instead of tasklist_lock on timer deletion)
+  
+  	return ret;
+  }
+* Unmerged path kernel/posix-cpu-timers.c
