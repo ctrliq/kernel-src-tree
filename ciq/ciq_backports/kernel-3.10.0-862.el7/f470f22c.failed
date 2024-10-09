@@ -1,0 +1,200 @@
+qed: Add support for MFW resource locking.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] qed: Add support for MFW resource locking (Don Dutile) [1462433 1499362]
+Rebuild_FUZZ: 98.80%
+commit-author sudarsana.kalluru@cavium.com <sudarsana.kalluru@cavium.com>
+commit f470f22cfa3d42f357ed404a06ec77aa09ddb05b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f470f22c.failed
+
+The patch adds API for default initialization of the MFW resource
+locking.
+
+	Signed-off-by: Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f470f22cfa3d42f357ed404a06ec77aa09ddb05b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_dev.c
+#	drivers/net/ethernet/qlogic/qed/qed_mcp.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_dev.c
+index c54b5c213337,2a3ae00bbd42..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@@ -2310,16 -2333,75 +2310,82 @@@ out
+  	return 0;
+  }
+  
+ -static int qed_hw_set_resc_info(struct qed_hwfn *p_hwfn)
+ +static int qed_hw_get_resc(struct qed_hwfn *p_hwfn)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int rc;
++ 	u8 res_id;
++ 
++ 	for (res_id = 0; res_id < QED_MAX_RESC; res_id++) {
++ 		rc = __qed_hw_set_resc_info(p_hwfn, res_id);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int qed_hw_get_resc(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++ {
++ 	struct qed_resc_unlock_params resc_unlock_params;
++ 	struct qed_resc_lock_params resc_lock_params;
+++>>>>>>> f470f22cfa3d (qed: Add support for MFW resource locking.)
+  	bool b_ah = QED_IS_AH(p_hwfn->cdev);
+  	u8 res_id;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	for (res_id = 0; res_id < QED_MAX_RESC; res_id++) {
+ +		rc = qed_hw_set_resc_info(p_hwfn, res_id);
+++=======
++ 	/* Setting the max values of the soft resources and the following
++ 	 * resources allocation queries should be atomic. Since several PFs can
++ 	 * run in parallel - a resource lock is needed.
++ 	 * If either the resource lock or resource set value commands are not
++ 	 * supported - skip the the max values setting, release the lock if
++ 	 * needed, and proceed to the queries. Other failures, including a
++ 	 * failure to acquire the lock, will cause this function to fail.
++ 	 */
++ 	qed_mcp_resc_lock_default_init(&resc_lock_params, &resc_unlock_params,
++ 				       QED_RESC_LOCK_RESC_ALLOC, false);
++ 
++ 	rc = qed_mcp_resc_lock(p_hwfn, p_ptt, &resc_lock_params);
++ 	if (rc && rc != -EINVAL) {
++ 		return rc;
++ 	} else if (rc == -EINVAL) {
++ 		DP_INFO(p_hwfn,
++ 			"Skip the max values setting of the soft resources since the resource lock is not supported by the MFW\n");
++ 	} else if (!rc && !resc_lock_params.b_granted) {
++ 		DP_NOTICE(p_hwfn,
++ 			  "Failed to acquire the resource lock for the resource allocation commands\n");
++ 		return -EBUSY;
++ 	} else {
++ 		rc = qed_hw_set_soft_resc_size(p_hwfn, p_ptt);
++ 		if (rc && rc != -EINVAL) {
++ 			DP_NOTICE(p_hwfn,
++ 				  "Failed to set the max values of the soft resources\n");
++ 			goto unlock_and_exit;
++ 		} else if (rc == -EINVAL) {
++ 			DP_INFO(p_hwfn,
++ 				"Skip the max values setting of the soft resources since it is not supported by the MFW\n");
++ 			rc = qed_mcp_resc_unlock(p_hwfn, p_ptt,
++ 						 &resc_unlock_params);
++ 			if (rc)
++ 				DP_INFO(p_hwfn,
++ 					"Failed to release the resource lock for the resource allocation commands\n");
++ 		}
++ 	}
++ 
++ 	rc = qed_hw_set_resc_info(p_hwfn);
++ 	if (rc)
++ 		goto unlock_and_exit;
++ 
++ 	if (resc_lock_params.b_granted && !resc_unlock_params.b_released) {
++ 		rc = qed_mcp_resc_unlock(p_hwfn, p_ptt, &resc_unlock_params);
+++>>>>>>> f470f22cfa3d (qed: Add support for MFW resource locking.)
+  		if (rc)
+ -			DP_INFO(p_hwfn,
+ -				"Failed to release the resource lock for the resource allocation commands\n");
+ +			return rc;
+  	}
+  
+  	/* Sanity for ILT */
+diff --cc drivers/net/ethernet/qlogic/qed/qed_mcp.h
+index 18c783a25451,e8cf59774f43..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@@ -709,10 -753,12 +709,11 @@@ int qed_mcp_mask_parities(struct qed_hw
+   *
+   * @return int - 0 - operation was successful.
+   */
+ -int
+ -qed_mcp_set_resc_max_val(struct qed_hwfn *p_hwfn,
+ -			 struct qed_ptt *p_ptt,
+ -			 enum qed_resources res_id,
+ -			 u32 resc_max_val, u32 *p_mcp_resp);
+ +int qed_mcp_ov_update_eswitch(struct qed_hwfn *p_hwfn,
+ +			      struct qed_ptt *p_ptt,
+ +			      enum qed_ov_eswitch eswitch);
+  
+++<<<<<<< HEAD
+  /**
+   * @brief - Gets the MFW allocation info for the given resource
+   *
+@@@ -724,10 -786,18 +725,20 @@@
+   *
+   * @return int - 0 - operation was successful.
+   */
+ -int qed_mcp_ov_update_eswitch(struct qed_hwfn *p_hwfn,
+ -			      struct qed_ptt *p_ptt,
+ -			      enum qed_ov_eswitch eswitch);
+ -
+ +int qed_mcp_get_resc_info(struct qed_hwfn *p_hwfn,
+ +			  struct qed_ptt *p_ptt,
+ +			  struct resource_info *p_resc_info,
+ +			  u32 *p_mcp_resp, u32 *p_mcp_param);
+++=======
++ #define QED_MCP_RESC_LOCK_MIN_VAL       RESOURCE_DUMP
++ #define QED_MCP_RESC_LOCK_MAX_VAL       31
++ 
++ enum qed_resc_lock {
++ 	QED_RESC_LOCK_DBG_DUMP = QED_MCP_RESC_LOCK_MIN_VAL,
++ 	QED_RESC_LOCK_RESC_ALLOC = QED_MCP_RESC_LOCK_MAX_VAL,
++ 	QED_RESC_LOCK_RESC_INVALID
++ };
+++>>>>>>> f470f22cfa3d (qed: Add support for MFW resource locking.)
+  
+  /**
+   * @brief - Initiates PF FLR
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_dev.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.c b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index ab5be3bfbe79..ac53734dbd1e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1947,3 +1947,33 @@ qed_mcp_resc_unlock(struct qed_hwfn *p_hwfn,
+ 
+ 	return 0;
+ }
++
++void qed_mcp_resc_lock_default_init(struct qed_resc_lock_params *p_lock,
++				    struct qed_resc_unlock_params *p_unlock,
++				    enum qed_resc_lock
++				    resource, bool b_is_permanent)
++{
++	if (p_lock) {
++		memset(p_lock, 0, sizeof(*p_lock));
++
++		/* Permanent resources don't require aging, and there's no
++		 * point in trying to acquire them more than once since it's
++		 * unexpected another entity would release them.
++		 */
++		if (b_is_permanent) {
++			p_lock->timeout = QED_MCP_RESC_LOCK_TO_NONE;
++		} else {
++			p_lock->retry_num = QED_MCP_RESC_LOCK_RETRY_CNT_DFLT;
++			p_lock->retry_interval =
++			    QED_MCP_RESC_LOCK_RETRY_VAL_DFLT;
++			p_lock->sleep_b4_retry = true;
++		}
++
++		p_lock->resource = resource;
++	}
++
++	if (p_unlock) {
++		memset(p_unlock, 0, sizeof(*p_unlock));
++		p_unlock->resource = resource;
++	}
++}
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_mcp.h
