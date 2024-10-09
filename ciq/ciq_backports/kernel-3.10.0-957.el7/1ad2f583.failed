@@ -1,0 +1,139 @@
+bpf: fix incorrect pruning decision when alignment must be tracked
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 1ad2f5838d345e1c102bd1cd27c4f4c1349b0dc8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1ad2f583.failed
+
+Currently, when we enforce alignment tracking on direct packet access,
+the verifier lets the following program pass despite doing a packet
+write with unaligned access:
+
+  0: (61) r2 = *(u32 *)(r1 +76)
+  1: (61) r3 = *(u32 *)(r1 +80)
+  2: (61) r7 = *(u32 *)(r1 +8)
+  3: (bf) r0 = r2
+  4: (07) r0 += 14
+  5: (25) if r7 > 0x1 goto pc+4
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=0,max_value=1 R10=fp
+  6: (2d) if r0 > r3 goto pc+1
+   R0=pkt(id=0,off=14,r=14) R1=ctx R2=pkt(id=0,off=0,r=14)
+   R3=pkt_end R7=inv,min_value=0,max_value=1 R10=fp
+  7: (63) *(u32 *)(r0 -4) = r0
+  8: (b7) r0 = 0
+  9: (95) exit
+
+  from 6 to 8:
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=0,max_value=1 R10=fp
+  8: (b7) r0 = 0
+  9: (95) exit
+
+  from 5 to 10:
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=2 R10=fp
+  10: (07) r0 += 1
+  11: (05) goto pc-6
+  6: safe                           <----- here, wrongly found safe
+  processed 15 insns
+
+However, if we enforce a pruning mismatch by adding state into r8
+which is then being mismatched in states_equal(), we find that for
+the otherwise same program, the verifier detects a misaligned packet
+access when actually walking that path:
+
+  0: (61) r2 = *(u32 *)(r1 +76)
+  1: (61) r3 = *(u32 *)(r1 +80)
+  2: (61) r7 = *(u32 *)(r1 +8)
+  3: (b7) r8 = 1
+  4: (bf) r0 = r2
+  5: (07) r0 += 14
+  6: (25) if r7 > 0x1 goto pc+4
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=0,max_value=1
+   R8=imm1,min_value=1,max_value=1,min_align=1 R10=fp
+  7: (2d) if r0 > r3 goto pc+1
+   R0=pkt(id=0,off=14,r=14) R1=ctx R2=pkt(id=0,off=0,r=14)
+   R3=pkt_end R7=inv,min_value=0,max_value=1
+   R8=imm1,min_value=1,max_value=1,min_align=1 R10=fp
+  8: (63) *(u32 *)(r0 -4) = r0
+  9: (b7) r0 = 0
+  10: (95) exit
+
+  from 7 to 9:
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=0,max_value=1
+   R8=imm1,min_value=1,max_value=1,min_align=1 R10=fp
+  9: (b7) r0 = 0
+  10: (95) exit
+
+  from 6 to 11:
+   R0=pkt(id=0,off=14,r=0) R1=ctx R2=pkt(id=0,off=0,r=0)
+   R3=pkt_end R7=inv,min_value=2
+   R8=imm1,min_value=1,max_value=1,min_align=1 R10=fp
+  11: (07) r0 += 1
+  12: (b7) r8 = 0
+  13: (05) goto pc-7                <----- mismatch due to r8
+  7: (2d) if r0 > r3 goto pc+1
+   R0=pkt(id=0,off=15,r=15) R1=ctx R2=pkt(id=0,off=0,r=15)
+   R3=pkt_end R7=inv,min_value=2
+   R8=imm0,min_value=0,max_value=0,min_align=2147483648 R10=fp
+  8: (63) *(u32 *)(r0 -4) = r0
+  misaligned packet access off 2+15+-4 size 4
+
+The reason why we fail to see it in states_equal() is that the
+third test in compare_ptrs_to_packet() ...
+
+  if (old->off <= cur->off &&
+      old->off >= old->range && cur->off >= cur->range)
+          return true;
+
+... will let the above pass. The situation we run into is that
+old->off <= cur->off (14 <= 15), meaning that prior walked paths
+went with smaller offset, which was later used in the packet
+access after successful packet range check and found to be safe
+already.
+
+For example: Given is R0=pkt(id=0,off=0,r=0). Adding offset 14
+as in above program to it, results in R0=pkt(id=0,off=14,r=0)
+before the packet range test. Now, testing this against R3=pkt_end
+with 'if r0 > r3 goto out' will transform R0 into R0=pkt(id=0,off=14,r=14)
+for the case when we're within bounds. A write into the packet
+at offset *(u32 *)(r0 -4), that is, 2 + 14 -4, is valid and
+aligned (2 is for NET_IP_ALIGN). After processing this with
+all fall-through paths, we later on check paths from branches.
+When the above skb->mark test is true, then we jump near the
+end of the program, perform r0 += 1, and jump back to the
+'if r0 > r3 goto out' test we've visited earlier already. This
+time, R0 is of type R0=pkt(id=0,off=15,r=0), and we'll prune
+that part because this time we'll have a larger safe packet
+range, and we already found that with off=14 all further insn
+were already safe, so it's safe as well with a larger off.
+However, the problem is that the subsequent write into the packet
+with 2 + 15 -4 is then unaligned, and not caught by the alignment
+tracking. Note that min_align, aux_off, and aux_off_align were
+all 0 in this example.
+
+Since we cannot tell at this time what kind of packet access was
+performed in the prior walk and what minimal requirements it has
+(we might do so in the future, but that requires more complexity),
+fix it to disable this pruning case for strict alignment for now,
+and let the verifier do check such paths instead. With that applied,
+the test cases pass and reject the program due to misalignment.
+
+Fixes: d1174416747d ("bpf: Track alignment of register values in the verifier.")
+Reference: http://patchwork.ozlabs.org/patch/761909/
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1ad2f5838d345e1c102bd1cd27c4f4c1349b0dc8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
