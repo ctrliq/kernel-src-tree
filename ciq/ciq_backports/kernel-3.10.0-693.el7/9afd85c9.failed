@@ -1,0 +1,847 @@
+net: Export IGMP/MLD message validation code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] Export IGMP/MLD message validation code (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 93.98%
+commit-author Linus Lüssing <linus.luessing@c0d3.blue>
+commit 9afd85c9e4552b276e2f4cfefd622bdeeffbbf26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9afd85c9.failed
+
+With this patch, the IGMP and MLD message validation functions are moved
+from the bridge code to IPv4/IPv6 multicast files. Some small
+refactoring was done to enhance readibility and to iron out some
+differences in behaviour between the IGMP and MLD parsing code (e.g. the
+skb-cloning of MLD messages is now only done if necessary, just like the
+IGMP part always did).
+
+Finally, these IGMP and MLD message validation functions are exported so
+that not only the bridge can use it but batman-adv later, too.
+
+	Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9afd85c9e4552b276e2f4cfefd622bdeeffbbf26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/bridge/br_multicast.c
+#	net/core/skbuff.c
+diff --cc include/linux/skbuff.h
+index 41e38df51a24,9c2f793573fa..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -3505,6 -3418,11 +3505,14 @@@ static inline void skb_checksum_none_as
+  
+  bool skb_partial_csum_set(struct sk_buff *skb, u16 start, u16 off);
+  
+++<<<<<<< HEAD
+++=======
++ int skb_checksum_setup(struct sk_buff *skb, bool recalculate);
++ struct sk_buff *skb_checksum_trimmed(struct sk_buff *skb,
++ 				     unsigned int transport_len,
++ 				     __sum16(*skb_chkf)(struct sk_buff *skb));
++ 
+++>>>>>>> 9afd85c9e455 (net: Export IGMP/MLD message validation code)
+  u32 skb_get_poff(const struct sk_buff *skb);
+  u32 __skb_get_poff(const struct sk_buff *skb, void *data,
+  		   const struct flow_keys *keys, int hlen);
+diff --cc net/bridge/br_multicast.c
+index 010adfd5d9b4,2d69d5cab52f..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -1288,20 -1338,16 +1268,26 @@@ static int br_ip6_multicast_query(struc
+  
+  	is_general_query = group && ipv6_addr_any(group);
+  
+++<<<<<<< HEAD
+ +	/* RFC2710+RFC3810 (MLDv1+MLDv2) require the multicast link layer
+ +	 * all-nodes destination address (ff02::1) for general queries
+ +	 */
+ +	if (is_general_query && !ipv6_addr_is_ll_all_nodes(&ip6h->daddr)) {
+ +		err = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +	br_multicast_query_received(br, port, &br->ip6_other_query,
+ +				    !ipv6_addr_any(&ip6h->saddr),
+ +				    is_general_query, max_delay);
+++=======
++ 	if (is_general_query) {
++ 		saddr.proto = htons(ETH_P_IPV6);
++ 		saddr.u.ip6 = ip6h->saddr;
+++>>>>>>> 9afd85c9e455 (net: Export IGMP/MLD message validation code)
+  
+ -		br_multicast_query_received(br, port, &br->ip6_other_query,
+ -					    &saddr, max_delay);
+ -		goto out;
+ -	} else if (!group) {
+ +	if (!group)
+  		goto out;
+ -	}
+  
+  	mp = br_mdb_ip6_get(mlock_dereference(br->mdb, br), group, vid);
+  	if (!mp)
+diff --cc net/core/skbuff.c
+index c7043c783fdb,1e4278a4dd7e..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3770,6 -3798,325 +3770,328 @@@ bool skb_partial_csum_set(struct sk_buf
+  }
+  EXPORT_SYMBOL_GPL(skb_partial_csum_set);
+  
+++<<<<<<< HEAD
+++=======
++ static int skb_maybe_pull_tail(struct sk_buff *skb, unsigned int len,
++ 			       unsigned int max)
++ {
++ 	if (skb_headlen(skb) >= len)
++ 		return 0;
++ 
++ 	/* If we need to pullup then pullup to the max, so we
++ 	 * won't need to do it again.
++ 	 */
++ 	if (max > skb->len)
++ 		max = skb->len;
++ 
++ 	if (__pskb_pull_tail(skb, max - skb_headlen(skb)) == NULL)
++ 		return -ENOMEM;
++ 
++ 	if (skb_headlen(skb) < len)
++ 		return -EPROTO;
++ 
++ 	return 0;
++ }
++ 
++ #define MAX_TCP_HDR_LEN (15 * 4)
++ 
++ static __sum16 *skb_checksum_setup_ip(struct sk_buff *skb,
++ 				      typeof(IPPROTO_IP) proto,
++ 				      unsigned int off)
++ {
++ 	switch (proto) {
++ 		int err;
++ 
++ 	case IPPROTO_TCP:
++ 		err = skb_maybe_pull_tail(skb, off + sizeof(struct tcphdr),
++ 					  off + MAX_TCP_HDR_LEN);
++ 		if (!err && !skb_partial_csum_set(skb, off,
++ 						  offsetof(struct tcphdr,
++ 							   check)))
++ 			err = -EPROTO;
++ 		return err ? ERR_PTR(err) : &tcp_hdr(skb)->check;
++ 
++ 	case IPPROTO_UDP:
++ 		err = skb_maybe_pull_tail(skb, off + sizeof(struct udphdr),
++ 					  off + sizeof(struct udphdr));
++ 		if (!err && !skb_partial_csum_set(skb, off,
++ 						  offsetof(struct udphdr,
++ 							   check)))
++ 			err = -EPROTO;
++ 		return err ? ERR_PTR(err) : &udp_hdr(skb)->check;
++ 	}
++ 
++ 	return ERR_PTR(-EPROTO);
++ }
++ 
++ /* This value should be large enough to cover a tagged ethernet header plus
++  * maximally sized IP and TCP or UDP headers.
++  */
++ #define MAX_IP_HDR_LEN 128
++ 
++ static int skb_checksum_setup_ipv4(struct sk_buff *skb, bool recalculate)
++ {
++ 	unsigned int off;
++ 	bool fragment;
++ 	__sum16 *csum;
++ 	int err;
++ 
++ 	fragment = false;
++ 
++ 	err = skb_maybe_pull_tail(skb,
++ 				  sizeof(struct iphdr),
++ 				  MAX_IP_HDR_LEN);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	if (ip_hdr(skb)->frag_off & htons(IP_OFFSET | IP_MF))
++ 		fragment = true;
++ 
++ 	off = ip_hdrlen(skb);
++ 
++ 	err = -EPROTO;
++ 
++ 	if (fragment)
++ 		goto out;
++ 
++ 	csum = skb_checksum_setup_ip(skb, ip_hdr(skb)->protocol, off);
++ 	if (IS_ERR(csum))
++ 		return PTR_ERR(csum);
++ 
++ 	if (recalculate)
++ 		*csum = ~csum_tcpudp_magic(ip_hdr(skb)->saddr,
++ 					   ip_hdr(skb)->daddr,
++ 					   skb->len - off,
++ 					   ip_hdr(skb)->protocol, 0);
++ 	err = 0;
++ 
++ out:
++ 	return err;
++ }
++ 
++ /* This value should be large enough to cover a tagged ethernet header plus
++  * an IPv6 header, all options, and a maximal TCP or UDP header.
++  */
++ #define MAX_IPV6_HDR_LEN 256
++ 
++ #define OPT_HDR(type, skb, off) \
++ 	(type *)(skb_network_header(skb) + (off))
++ 
++ static int skb_checksum_setup_ipv6(struct sk_buff *skb, bool recalculate)
++ {
++ 	int err;
++ 	u8 nexthdr;
++ 	unsigned int off;
++ 	unsigned int len;
++ 	bool fragment;
++ 	bool done;
++ 	__sum16 *csum;
++ 
++ 	fragment = false;
++ 	done = false;
++ 
++ 	off = sizeof(struct ipv6hdr);
++ 
++ 	err = skb_maybe_pull_tail(skb, off, MAX_IPV6_HDR_LEN);
++ 	if (err < 0)
++ 		goto out;
++ 
++ 	nexthdr = ipv6_hdr(skb)->nexthdr;
++ 
++ 	len = sizeof(struct ipv6hdr) + ntohs(ipv6_hdr(skb)->payload_len);
++ 	while (off <= len && !done) {
++ 		switch (nexthdr) {
++ 		case IPPROTO_DSTOPTS:
++ 		case IPPROTO_HOPOPTS:
++ 		case IPPROTO_ROUTING: {
++ 			struct ipv6_opt_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct ipv6_opt_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct ipv6_opt_hdr, skb, off);
++ 			nexthdr = hp->nexthdr;
++ 			off += ipv6_optlen(hp);
++ 			break;
++ 		}
++ 		case IPPROTO_AH: {
++ 			struct ip_auth_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct ip_auth_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct ip_auth_hdr, skb, off);
++ 			nexthdr = hp->nexthdr;
++ 			off += ipv6_authlen(hp);
++ 			break;
++ 		}
++ 		case IPPROTO_FRAGMENT: {
++ 			struct frag_hdr *hp;
++ 
++ 			err = skb_maybe_pull_tail(skb,
++ 						  off +
++ 						  sizeof(struct frag_hdr),
++ 						  MAX_IPV6_HDR_LEN);
++ 			if (err < 0)
++ 				goto out;
++ 
++ 			hp = OPT_HDR(struct frag_hdr, skb, off);
++ 
++ 			if (hp->frag_off & htons(IP6_OFFSET | IP6_MF))
++ 				fragment = true;
++ 
++ 			nexthdr = hp->nexthdr;
++ 			off += sizeof(struct frag_hdr);
++ 			break;
++ 		}
++ 		default:
++ 			done = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	err = -EPROTO;
++ 
++ 	if (!done || fragment)
++ 		goto out;
++ 
++ 	csum = skb_checksum_setup_ip(skb, nexthdr, off);
++ 	if (IS_ERR(csum))
++ 		return PTR_ERR(csum);
++ 
++ 	if (recalculate)
++ 		*csum = ~csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 					 &ipv6_hdr(skb)->daddr,
++ 					 skb->len - off, nexthdr, 0);
++ 	err = 0;
++ 
++ out:
++ 	return err;
++ }
++ 
++ /**
++  * skb_checksum_setup - set up partial checksum offset
++  * @skb: the skb to set up
++  * @recalculate: if true the pseudo-header checksum will be recalculated
++  */
++ int skb_checksum_setup(struct sk_buff *skb, bool recalculate)
++ {
++ 	int err;
++ 
++ 	switch (skb->protocol) {
++ 	case htons(ETH_P_IP):
++ 		err = skb_checksum_setup_ipv4(skb, recalculate);
++ 		break;
++ 
++ 	case htons(ETH_P_IPV6):
++ 		err = skb_checksum_setup_ipv6(skb, recalculate);
++ 		break;
++ 
++ 	default:
++ 		err = -EPROTO;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL(skb_checksum_setup);
++ 
++ /**
++  * skb_checksum_maybe_trim - maybe trims the given skb
++  * @skb: the skb to check
++  * @transport_len: the data length beyond the network header
++  *
++  * Checks whether the given skb has data beyond the given transport length.
++  * If so, returns a cloned skb trimmed to this transport length.
++  * Otherwise returns the provided skb. Returns NULL in error cases
++  * (e.g. transport_len exceeds skb length or out-of-memory).
++  *
++  * Caller needs to set the skb transport header and release the returned skb.
++  * Provided skb is consumed.
++  */
++ static struct sk_buff *skb_checksum_maybe_trim(struct sk_buff *skb,
++ 					       unsigned int transport_len)
++ {
++ 	struct sk_buff *skb_chk;
++ 	unsigned int len = skb_transport_offset(skb) + transport_len;
++ 	int ret;
++ 
++ 	if (skb->len < len) {
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	} else if (skb->len == len) {
++ 		return skb;
++ 	}
++ 
++ 	skb_chk = skb_clone(skb, GFP_ATOMIC);
++ 	kfree_skb(skb);
++ 
++ 	if (!skb_chk)
++ 		return NULL;
++ 
++ 	ret = pskb_trim_rcsum(skb_chk, len);
++ 	if (ret) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	return skb_chk;
++ }
++ 
++ /**
++  * skb_checksum_trimmed - validate checksum of an skb
++  * @skb: the skb to check
++  * @transport_len: the data length beyond the network header
++  * @skb_chkf: checksum function to use
++  *
++  * Applies the given checksum function skb_chkf to the provided skb.
++  * Returns a checked and maybe trimmed skb. Returns NULL on error.
++  *
++  * If the skb has data beyond the given transport length, then a
++  * trimmed & cloned skb is checked and returned.
++  *
++  * Caller needs to set the skb transport header and release the returned skb.
++  * Provided skb is consumed.
++  */
++ struct sk_buff *skb_checksum_trimmed(struct sk_buff *skb,
++ 				     unsigned int transport_len,
++ 				     __sum16(*skb_chkf)(struct sk_buff *skb))
++ {
++ 	struct sk_buff *skb_chk;
++ 	unsigned int offset = skb_transport_offset(skb);
++ 	int ret;
++ 
++ 	skb_chk = skb_checksum_maybe_trim(skb, transport_len);
++ 	if (!skb_chk)
++ 		return NULL;
++ 
++ 	if (!pskb_may_pull(skb_chk, offset)) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	__skb_pull(skb_chk, offset);
++ 	ret = skb_chkf(skb_chk);
++ 	__skb_push(skb_chk, offset);
++ 
++ 	if (ret) {
++ 		kfree_skb(skb_chk);
++ 		return NULL;
++ 	}
++ 
++ 	return skb_chk;
++ }
++ EXPORT_SYMBOL(skb_checksum_trimmed);
++ 
+++>>>>>>> 9afd85c9e455 (net: Export IGMP/MLD message validation code)
+  void __skb_warn_lro_forwarding(const struct sk_buff *skb)
+  {
+  	net_warn_ratelimited("%s: received packets cannot be forwarded while LRO is enabled\n",
+diff --git a/include/linux/igmp.h b/include/linux/igmp.h
+index 753fa14e7905..67f1579fbbb6 100644
+--- a/include/linux/igmp.h
++++ b/include/linux/igmp.h
+@@ -129,5 +129,6 @@ extern void ip_mc_unmap(struct in_device *);
+ extern void ip_mc_remap(struct in_device *);
+ extern void ip_mc_dec_group(struct in_device *in_dev, __be32 addr);
+ extern void ip_mc_inc_group(struct in_device *in_dev, __be32 addr);
++int ip_mc_check_igmp(struct sk_buff *skb, struct sk_buff **skb_trimmed);
+ 
+ #endif
+* Unmerged path include/linux/skbuff.h
+diff --git a/include/net/addrconf.h b/include/net/addrconf.h
+index b9f981413f76..e96e9f660916 100644
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@ -169,6 +169,7 @@ void ipv6_mc_unmap(struct inet6_dev *idev);
+ void ipv6_mc_remap(struct inet6_dev *idev);
+ void ipv6_mc_init_dev(struct inet6_dev *idev);
+ void ipv6_mc_destroy_dev(struct inet6_dev *idev);
++int ipv6_mc_check_mld(struct sk_buff *skb, struct sk_buff **skb_trimmed);
+ void addrconf_dad_failure(struct inet6_ifaddr *ifp);
+ 
+ bool ipv6_chk_mcast_addr(struct net_device *dev, const struct in6_addr *group,
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/core/skbuff.c
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index bfef4eb42f41..09d3c69fdba2 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -1287,6 +1287,168 @@ out:
+ }
+ EXPORT_SYMBOL(ip_mc_inc_group);
+ 
++static int ip_mc_check_iphdr(struct sk_buff *skb)
++{
++	const struct iphdr *iph;
++	unsigned int len;
++	unsigned int offset = skb_network_offset(skb) + sizeof(*iph);
++
++	if (!pskb_may_pull(skb, offset))
++		return -EINVAL;
++
++	iph = ip_hdr(skb);
++
++	if (iph->version != 4 || ip_hdrlen(skb) < sizeof(*iph))
++		return -EINVAL;
++
++	offset += ip_hdrlen(skb) - sizeof(*iph);
++
++	if (!pskb_may_pull(skb, offset))
++		return -EINVAL;
++
++	iph = ip_hdr(skb);
++
++	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
++		return -EINVAL;
++
++	len = skb_network_offset(skb) + ntohs(iph->tot_len);
++	if (skb->len < len || len < offset)
++		return -EINVAL;
++
++	skb_set_transport_header(skb, offset);
++
++	return 0;
++}
++
++static int ip_mc_check_igmp_reportv3(struct sk_buff *skb)
++{
++	unsigned int len = skb_transport_offset(skb);
++
++	len += sizeof(struct igmpv3_report);
++
++	return pskb_may_pull(skb, len) ? 0 : -EINVAL;
++}
++
++static int ip_mc_check_igmp_query(struct sk_buff *skb)
++{
++	unsigned int len = skb_transport_offset(skb);
++
++	len += sizeof(struct igmphdr);
++	if (skb->len < len)
++		return -EINVAL;
++
++	/* IGMPv{1,2}? */
++	if (skb->len != len) {
++		/* or IGMPv3? */
++		len += sizeof(struct igmpv3_query) - sizeof(struct igmphdr);
++		if (skb->len < len || !pskb_may_pull(skb, len))
++			return -EINVAL;
++	}
++
++	/* RFC2236+RFC3376 (IGMPv2+IGMPv3) require the multicast link layer
++	 * all-systems destination addresses (224.0.0.1) for general queries
++	 */
++	if (!igmp_hdr(skb)->group &&
++	    ip_hdr(skb)->daddr != htonl(INADDR_ALLHOSTS_GROUP))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int ip_mc_check_igmp_msg(struct sk_buff *skb)
++{
++	switch (igmp_hdr(skb)->type) {
++	case IGMP_HOST_LEAVE_MESSAGE:
++	case IGMP_HOST_MEMBERSHIP_REPORT:
++	case IGMPV2_HOST_MEMBERSHIP_REPORT:
++		/* fall through */
++		return 0;
++	case IGMPV3_HOST_MEMBERSHIP_REPORT:
++		return ip_mc_check_igmp_reportv3(skb);
++	case IGMP_HOST_MEMBERSHIP_QUERY:
++		return ip_mc_check_igmp_query(skb);
++	default:
++		return -ENOMSG;
++	}
++}
++
++static inline __sum16 ip_mc_validate_checksum(struct sk_buff *skb)
++{
++	return skb_checksum_simple_validate(skb);
++}
++
++static int __ip_mc_check_igmp(struct sk_buff *skb, struct sk_buff **skb_trimmed)
++
++{
++	struct sk_buff *skb_chk;
++	unsigned int transport_len;
++	unsigned int len = skb_transport_offset(skb) + sizeof(struct igmphdr);
++	int ret;
++
++	transport_len = ntohs(ip_hdr(skb)->tot_len) - ip_hdrlen(skb);
++
++	skb_get(skb);
++	skb_chk = skb_checksum_trimmed(skb, transport_len,
++				       ip_mc_validate_checksum);
++	if (!skb_chk)
++		return -EINVAL;
++
++	if (!pskb_may_pull(skb_chk, len)) {
++		kfree_skb(skb_chk);
++		return -EINVAL;
++	}
++
++	ret = ip_mc_check_igmp_msg(skb_chk);
++	if (ret) {
++		kfree_skb(skb_chk);
++		return ret;
++	}
++
++	if (skb_trimmed)
++		*skb_trimmed = skb_chk;
++	else
++		kfree_skb(skb_chk);
++
++	return 0;
++}
++
++/**
++ * ip_mc_check_igmp - checks whether this is a sane IGMP packet
++ * @skb: the skb to validate
++ * @skb_trimmed: to store an skb pointer trimmed to IPv4 packet tail (optional)
++ *
++ * Checks whether an IPv4 packet is a valid IGMP packet. If so sets
++ * skb network and transport headers accordingly and returns zero.
++ *
++ * -EINVAL: A broken packet was detected, i.e. it violates some internet
++ *  standard
++ * -ENOMSG: IP header validation succeeded but it is not an IGMP packet.
++ * -ENOMEM: A memory allocation failure happened.
++ *
++ * Optionally, an skb pointer might be provided via skb_trimmed (or set it
++ * to NULL): After parsing an IGMP packet successfully it will point to
++ * an skb which has its tail aligned to the IP packet end. This might
++ * either be the originally provided skb or a trimmed, cloned version if
++ * the skb frame had data beyond the IP packet. A cloned skb allows us
++ * to leave the original skb and its full frame unchanged (which might be
++ * desirable for layer 2 frame jugglers).
++ *
++ * The caller needs to release a reference count from any returned skb_trimmed.
++ */
++int ip_mc_check_igmp(struct sk_buff *skb, struct sk_buff **skb_trimmed)
++{
++	int ret = ip_mc_check_iphdr(skb);
++
++	if (ret < 0)
++		return ret;
++
++	if (ip_hdr(skb)->protocol != IPPROTO_IGMP)
++		return -ENOMSG;
++
++	return __ip_mc_check_igmp(skb, skb_trimmed);
++}
++EXPORT_SYMBOL(ip_mc_check_igmp);
++
+ /*
+  *	Resend IGMP JOIN report; used by netdev notifier.
+  */
+diff --git a/net/ipv6/Makefile b/net/ipv6/Makefile
+index f13eb2f59315..3fb5da100c4f 100644
+--- a/net/ipv6/Makefile
++++ b/net/ipv6/Makefile
+@@ -49,4 +49,5 @@ obj-$(subst m,y,$(CONFIG_IPV6)) += inet6_hashtables.o
+ 
+ ifneq ($(CONFIG_IPV6),)
+ obj-$(CONFIG_NET_UDP_TUNNEL) += ip6_udp_tunnel.o
++obj-y += mcast_snoop.o
+ endif
+diff --git a/net/ipv6/mcast_snoop.c b/net/ipv6/mcast_snoop.c
+new file mode 100644
+index 000000000000..1a2cbc13a7d3
+--- /dev/null
++++ b/net/ipv6/mcast_snoop.c
+@@ -0,0 +1,213 @@
++/* Copyright (C) 2010: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
++ * Copyright (C) 2015: Linus Lüssing <linus.luessing@c0d3.blue>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ *
++ *
++ * Based on the MLD support added to br_multicast.c by YOSHIFUJI Hideaki.
++ */
++
++#include <linux/skbuff.h>
++#include <net/ipv6.h>
++#include <net/mld.h>
++#include <net/addrconf.h>
++#include <net/ip6_checksum.h>
++
++static int ipv6_mc_check_ip6hdr(struct sk_buff *skb)
++{
++	const struct ipv6hdr *ip6h;
++	unsigned int len;
++	unsigned int offset = skb_network_offset(skb) + sizeof(*ip6h);
++
++	if (!pskb_may_pull(skb, offset))
++		return -EINVAL;
++
++	ip6h = ipv6_hdr(skb);
++
++	if (ip6h->version != 6)
++		return -EINVAL;
++
++	len = offset + ntohs(ip6h->payload_len);
++	if (skb->len < len || len <= offset)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int ipv6_mc_check_exthdrs(struct sk_buff *skb)
++{
++	const struct ipv6hdr *ip6h;
++	unsigned int offset;
++	u8 nexthdr;
++	__be16 frag_off;
++
++	ip6h = ipv6_hdr(skb);
++
++	if (ip6h->nexthdr != IPPROTO_HOPOPTS)
++		return -ENOMSG;
++
++	nexthdr = ip6h->nexthdr;
++	offset = skb_network_offset(skb) + sizeof(*ip6h);
++	offset = ipv6_skip_exthdr(skb, offset, &nexthdr, &frag_off);
++
++	if (offset < 0)
++		return -EINVAL;
++
++	if (nexthdr != IPPROTO_ICMPV6)
++		return -ENOMSG;
++
++	skb_set_transport_header(skb, offset);
++
++	return 0;
++}
++
++static int ipv6_mc_check_mld_reportv2(struct sk_buff *skb)
++{
++	unsigned int len = skb_transport_offset(skb);
++
++	len += sizeof(struct mld2_report);
++
++	return pskb_may_pull(skb, len) ? 0 : -EINVAL;
++}
++
++static int ipv6_mc_check_mld_query(struct sk_buff *skb)
++{
++	struct mld_msg *mld;
++	unsigned int len = skb_transport_offset(skb);
++
++	/* RFC2710+RFC3810 (MLDv1+MLDv2) require link-local source addresses */
++	if (!(ipv6_addr_type(&ipv6_hdr(skb)->saddr) & IPV6_ADDR_LINKLOCAL))
++		return -EINVAL;
++
++	len += sizeof(struct mld_msg);
++	if (skb->len < len)
++		return -EINVAL;
++
++	/* MLDv1? */
++	if (skb->len != len) {
++		/* or MLDv2? */
++		len += sizeof(struct mld2_query) - sizeof(struct mld_msg);
++		if (skb->len < len || !pskb_may_pull(skb, len))
++			return -EINVAL;
++	}
++
++	mld = (struct mld_msg *)skb_transport_header(skb);
++
++	/* RFC2710+RFC3810 (MLDv1+MLDv2) require the multicast link layer
++	 * all-nodes destination address (ff02::1) for general queries
++	 */
++	if (ipv6_addr_any(&mld->mld_mca) &&
++	    !ipv6_addr_is_ll_all_nodes(&ipv6_hdr(skb)->daddr))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int ipv6_mc_check_mld_msg(struct sk_buff *skb)
++{
++	struct mld_msg *mld = (struct mld_msg *)skb_transport_header(skb);
++
++	switch (mld->mld_type) {
++	case ICMPV6_MGM_REDUCTION:
++	case ICMPV6_MGM_REPORT:
++		/* fall through */
++		return 0;
++	case ICMPV6_MLD2_REPORT:
++		return ipv6_mc_check_mld_reportv2(skb);
++	case ICMPV6_MGM_QUERY:
++		return ipv6_mc_check_mld_query(skb);
++	default:
++		return -ENOMSG;
++	}
++}
++
++static inline __sum16 ipv6_mc_validate_checksum(struct sk_buff *skb)
++{
++	return skb_checksum_validate(skb, IPPROTO_ICMPV6, ip6_compute_pseudo);
++}
++
++static int __ipv6_mc_check_mld(struct sk_buff *skb,
++			       struct sk_buff **skb_trimmed)
++
++{
++	struct sk_buff *skb_chk = NULL;
++	unsigned int transport_len;
++	unsigned int len = skb_transport_offset(skb) + sizeof(struct mld_msg);
++	int ret;
++
++	transport_len = ntohs(ipv6_hdr(skb)->payload_len);
++	transport_len -= skb_transport_offset(skb) - sizeof(struct ipv6hdr);
++
++	skb_get(skb);
++	skb_chk = skb_checksum_trimmed(skb, transport_len,
++				       ipv6_mc_validate_checksum);
++	if (!skb_chk)
++		return -EINVAL;
++
++	if (!pskb_may_pull(skb_chk, len)) {
++		kfree_skb(skb_chk);
++		return -EINVAL;
++	}
++
++	ret = ipv6_mc_check_mld_msg(skb_chk);
++	if (ret) {
++		kfree_skb(skb_chk);
++		return ret;
++	}
++
++	if (skb_trimmed)
++		*skb_trimmed = skb_chk;
++	else
++		kfree_skb(skb_chk);
++
++	return 0;
++}
++
++/**
++ * ipv6_mc_check_mld - checks whether this is a sane MLD packet
++ * @skb: the skb to validate
++ * @skb_trimmed: to store an skb pointer trimmed to IPv6 packet tail (optional)
++ *
++ * Checks whether an IPv6 packet is a valid MLD packet. If so sets
++ * skb network and transport headers accordingly and returns zero.
++ *
++ * -EINVAL: A broken packet was detected, i.e. it violates some internet
++ *  standard
++ * -ENOMSG: IP header validation succeeded but it is not an MLD packet.
++ * -ENOMEM: A memory allocation failure happened.
++ *
++ * Optionally, an skb pointer might be provided via skb_trimmed (or set it
++ * to NULL): After parsing an MLD packet successfully it will point to
++ * an skb which has its tail aligned to the IP packet end. This might
++ * either be the originally provided skb or a trimmed, cloned version if
++ * the skb frame had data beyond the IP packet. A cloned skb allows us
++ * to leave the original skb and its full frame unchanged (which might be
++ * desirable for layer 2 frame jugglers).
++ *
++ * The caller needs to release a reference count from any returned skb_trimmed.
++ */
++int ipv6_mc_check_mld(struct sk_buff *skb, struct sk_buff **skb_trimmed)
++{
++	int ret;
++
++	ret = ipv6_mc_check_ip6hdr(skb);
++	if (ret < 0)
++		return ret;
++
++	ret = ipv6_mc_check_exthdrs(skb);
++	if (ret < 0)
++		return ret;
++
++	return __ipv6_mc_check_mld(skb, skb_trimmed);
++}
++EXPORT_SYMBOL(ipv6_mc_check_mld);
