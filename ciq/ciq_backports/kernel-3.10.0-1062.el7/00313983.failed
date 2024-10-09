@@ -1,0 +1,610 @@
+RDMA/nldev: provide detailed CM_ID information
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Steve Wise <swise@opengridcomputing.com>
+commit 00313983cda6f37f747058e58c1cb8fba02bc134
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/00313983.failed
+
+Implement RDMA nldev netlink interface to get detailed CM_ID information.
+
+Because cm_id's are attached to rdma devices in various work queue
+contexts, the pid and task information at restrak_add() time is sometimes
+not useful.  For example, an nvme/f host connection cm_id ends up being
+bound to a device in a work queue context and the resulting pid at attach
+time no longer exists after connection setup.  So instead we mark all
+cm_id's created via the rdma_ucm as "user", and all others as "kernel".
+This required tweaking the restrack code a little.  It also required
+wrapping some rdma_cm functions to allow passing the module name string.
+
+	Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 00313983cda6f37f747058e58c1cb8fba02bc134)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/ucma.c
+diff --cc drivers/infiniband/core/ucma.c
+index 0c569ac983a1,476462639ea8..000000000000
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@@ -482,10 -476,10 +482,17 @@@ static ssize_t ucma_create_id(struct uc
+  		return -ENOMEM;
+  
+  	ctx->uid = cmd.uid;
+++<<<<<<< HEAD
+ +	cm_id = rdma_create_id(current->nsproxy->net_ns,
+ +			       ucma_event_handler, ctx, cmd.ps, qp_type);
+ +	if (IS_ERR(cm_id)) {
+ +		ret = PTR_ERR(cm_id);
+++=======
++ 	ctx->cm_id = __rdma_create_id(current->nsproxy->net_ns,
++ 			      ucma_event_handler, ctx, cmd.ps, qp_type, NULL);
++ 	if (IS_ERR(ctx->cm_id)) {
++ 		ret = PTR_ERR(ctx->cm_id);
+++>>>>>>> 00313983cda6 (RDMA/nldev: provide detailed CM_ID information)
+  		goto err1;
+  	}
+  
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 4d2590593dd1..d9da59ba8480 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -468,6 +468,8 @@ static void _cma_attach_to_dev(struct rdma_id_private *id_priv,
+ 	id_priv->id.route.addr.dev_addr.transport =
+ 		rdma_node_get_transport(cma_dev->device->node_type);
+ 	list_add_tail(&id_priv->list, &cma_dev->id_list);
++	id_priv->res.type = RDMA_RESTRACK_CM_ID;
++	rdma_restrack_add(&id_priv->res);
+ }
+ 
+ static void cma_attach_to_dev(struct rdma_id_private *id_priv,
+@@ -740,10 +742,10 @@ static void cma_deref_id(struct rdma_id_private *id_priv)
+ 		complete(&id_priv->comp);
+ }
+ 
+-struct rdma_cm_id *rdma_create_id(struct net *net,
+-				  rdma_cm_event_handler event_handler,
+-				  void *context, enum rdma_port_space ps,
+-				  enum ib_qp_type qp_type)
++struct rdma_cm_id *__rdma_create_id(struct net *net,
++				    rdma_cm_event_handler event_handler,
++				    void *context, enum rdma_port_space ps,
++				    enum ib_qp_type qp_type, const char *caller)
+ {
+ 	struct rdma_id_private *id_priv;
+ 
+@@ -751,7 +753,10 @@ struct rdma_cm_id *rdma_create_id(struct net *net,
+ 	if (!id_priv)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	id_priv->owner = task_pid_nr(current);
++	if (caller)
++		id_priv->res.kern_name = caller;
++	else
++		rdma_restrack_set_task(&id_priv->res, current);
+ 	id_priv->state = RDMA_CM_IDLE;
+ 	id_priv->id.context = context;
+ 	id_priv->id.event_handler = event_handler;
+@@ -771,7 +776,7 @@ struct rdma_cm_id *rdma_create_id(struct net *net,
+ 
+ 	return &id_priv->id;
+ }
+-EXPORT_SYMBOL(rdma_create_id);
++EXPORT_SYMBOL(__rdma_create_id);
+ 
+ static int cma_init_ud_qp(struct rdma_id_private *id_priv, struct ib_qp *qp)
+ {
+@@ -1655,6 +1660,7 @@ void rdma_destroy_id(struct rdma_cm_id *id)
+ 	mutex_unlock(&id_priv->handler_mutex);
+ 
+ 	if (id_priv->cma_dev) {
++		rdma_restrack_del(&id_priv->res);
+ 		if (rdma_cap_ib_cm(id_priv->id.device, 1)) {
+ 			if (id_priv->cm_id.ib)
+ 				ib_destroy_cm_id(id_priv->cm_id.ib);
+@@ -1804,6 +1810,7 @@ static struct rdma_id_private *cma_new_conn_id(struct rdma_cm_id *listen_id,
+ 					       struct ib_cm_event *ib_event,
+ 					       struct net_device *net_dev)
+ {
++	struct rdma_id_private *listen_id_priv;
+ 	struct rdma_id_private *id_priv;
+ 	struct rdma_cm_id *id;
+ 	struct rdma_route *rt;
+@@ -1813,9 +1820,11 @@ static struct rdma_id_private *cma_new_conn_id(struct rdma_cm_id *listen_id,
+ 		ib_event->param.req_rcvd.primary_path->service_id;
+ 	int ret;
+ 
+-	id = rdma_create_id(listen_id->route.addr.dev_addr.net,
++	listen_id_priv = container_of(listen_id, struct rdma_id_private, id);
++	id = __rdma_create_id(listen_id->route.addr.dev_addr.net,
+ 			    listen_id->event_handler, listen_id->context,
+-			    listen_id->ps, ib_event->param.req_rcvd.qp_type);
++			    listen_id->ps, ib_event->param.req_rcvd.qp_type,
++			    listen_id_priv->res.kern_name);
+ 	if (IS_ERR(id))
+ 		return NULL;
+ 
+@@ -1864,14 +1873,17 @@ static struct rdma_id_private *cma_new_udp_id(struct rdma_cm_id *listen_id,
+ 					      struct ib_cm_event *ib_event,
+ 					      struct net_device *net_dev)
+ {
++	struct rdma_id_private *listen_id_priv;
+ 	struct rdma_id_private *id_priv;
+ 	struct rdma_cm_id *id;
+ 	const sa_family_t ss_family = listen_id->route.addr.src_addr.ss_family;
+ 	struct net *net = listen_id->route.addr.dev_addr.net;
+ 	int ret;
+ 
+-	id = rdma_create_id(net, listen_id->event_handler, listen_id->context,
+-			    listen_id->ps, IB_QPT_UD);
++	listen_id_priv = container_of(listen_id, struct rdma_id_private, id);
++	id = __rdma_create_id(net, listen_id->event_handler, listen_id->context,
++			      listen_id->ps, IB_QPT_UD,
++			      listen_id_priv->res.kern_name);
+ 	if (IS_ERR(id))
+ 		return NULL;
+ 
+@@ -2137,10 +2149,11 @@ static int iw_conn_req_handler(struct iw_cm_id *cm_id,
+ 		goto out;
+ 
+ 	/* Create a new RDMA id for the new IW CM ID */
+-	new_cm_id = rdma_create_id(listen_id->id.route.addr.dev_addr.net,
+-				   listen_id->id.event_handler,
+-				   listen_id->id.context,
+-				   RDMA_PS_TCP, IB_QPT_RC);
++	new_cm_id = __rdma_create_id(listen_id->id.route.addr.dev_addr.net,
++				     listen_id->id.event_handler,
++				     listen_id->id.context,
++				     RDMA_PS_TCP, IB_QPT_RC,
++				     listen_id->res.kern_name);
+ 	if (IS_ERR(new_cm_id)) {
+ 		ret = -ENOMEM;
+ 		goto out;
+@@ -2265,8 +2278,8 @@ static void cma_listen_on_dev(struct rdma_id_private *id_priv,
+ 	if (cma_family(id_priv) == AF_IB && !rdma_cap_ib_cm(cma_dev->device, 1))
+ 		return;
+ 
+-	id = rdma_create_id(net, cma_listen_handler, id_priv, id_priv->id.ps,
+-			    id_priv->id.qp_type);
++	id = __rdma_create_id(net, cma_listen_handler, id_priv, id_priv->id.ps,
++			      id_priv->id.qp_type, id_priv->res.kern_name);
+ 	if (IS_ERR(id))
+ 		return;
+ 
+@@ -3376,8 +3389,10 @@ int rdma_bind_addr(struct rdma_cm_id *id, struct sockaddr *addr)
+ 
+ 	return 0;
+ err2:
+-	if (id_priv->cma_dev)
++	if (id_priv->cma_dev) {
++		rdma_restrack_del(&id_priv->res);
+ 		cma_release_dev(id_priv);
++	}
+ err1:
+ 	cma_comp_exch(id_priv, RDMA_CM_ADDR_BOUND, RDMA_CM_IDLE);
+ 	return ret;
+@@ -3760,14 +3775,18 @@ static int cma_send_sidr_rep(struct rdma_id_private *id_priv,
+ 	return ib_send_cm_sidr_rep(id_priv->cm_id.ib, &rep);
+ }
+ 
+-int rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param)
++int __rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param,
++		  const char *caller)
+ {
+ 	struct rdma_id_private *id_priv;
+ 	int ret;
+ 
+ 	id_priv = container_of(id, struct rdma_id_private, id);
+ 
+-	id_priv->owner = task_pid_nr(current);
++	if (caller)
++		id_priv->res.kern_name = caller;
++	else
++		rdma_restrack_set_task(&id_priv->res, current);
+ 
+ 	if (!cma_comp(id_priv, RDMA_CM_CONNECT))
+ 		return -EINVAL;
+@@ -3807,7 +3826,7 @@ reject:
+ 	rdma_reject(id, NULL, 0);
+ 	return ret;
+ }
+-EXPORT_SYMBOL(rdma_accept);
++EXPORT_SYMBOL(__rdma_accept);
+ 
+ int rdma_notify(struct rdma_cm_id *id, enum ib_event_type event)
+ {
+@@ -4488,7 +4507,7 @@ static int cma_get_id_stats(struct sk_buff *skb, struct netlink_callback *cb)
+ 					  RDMA_NL_RDMA_CM_ATTR_DST_ADDR))
+ 				goto out;
+ 
+-			id_stats->pid		= id_priv->owner;
++			id_stats->pid	= task_pid_vnr(id_priv->res.task);
+ 			id_stats->port_space	= id->ps;
+ 			id_stats->cm_state	= id_priv->state;
+ 			id_stats->qp_num	= id_priv->qp_num;
+diff --git a/drivers/infiniband/core/cma_priv.h b/drivers/infiniband/core/cma_priv.h
+index 11a41bef32ed..56f52b70c346 100644
+--- a/drivers/infiniband/core/cma_priv.h
++++ b/drivers/infiniband/core/cma_priv.h
+@@ -67,7 +67,6 @@ struct rdma_id_private {
+ 	u32			seq_num;
+ 	u32			qkey;
+ 	u32			qp_num;
+-	pid_t			owner;
+ 	u32			options;
+ 	u8			srq;
+ 	u8			tos;
+@@ -75,5 +74,10 @@ struct rdma_id_private {
+ 	u8			reuseaddr;
+ 	u8			afonly;
+ 	enum ib_gid_type	gid_type;
++
++	/*
++	 * Internal to RDMA/core, don't use in the drivers
++	 */
++	struct rdma_restrack_entry     res;
+ };
+ #endif /* _CMA_PRIV_H */
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index 67368b6847cb..2f04c1c39ae2 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -34,9 +34,11 @@
+ #include <linux/pid.h>
+ #include <linux/pid_namespace.h>
+ #include <net/netlink.h>
++#include <rdma/rdma_cm.h>
+ #include <rdma/rdma_netlink.h>
+ 
+ #include "core_priv.h"
++#include "cma_priv.h"
+ 
+ static const struct nla_policy nldev_policy[RDMA_NLDEV_ATTR_MAX] = {
+ 	[RDMA_NLDEV_ATTR_DEV_INDEX]     = { .type = NLA_U32 },
+@@ -71,6 +73,13 @@ static const struct nla_policy nldev_policy[RDMA_NLDEV_ATTR_MAX] = {
+ 	[RDMA_NLDEV_ATTR_RES_PID]		= { .type = NLA_U32 },
+ 	[RDMA_NLDEV_ATTR_RES_KERN_NAME]		= { .type = NLA_NUL_STRING,
+ 						    .len = TASK_COMM_LEN },
++	[RDMA_NLDEV_ATTR_RES_CM_ID]		= { .type = NLA_NESTED },
++	[RDMA_NLDEV_ATTR_RES_CM_ID_ENTRY]	= { .type = NLA_NESTED },
++	[RDMA_NLDEV_ATTR_RES_PS]		= { .type = NLA_U32 },
++	[RDMA_NLDEV_ATTR_RES_SRC_ADDR]	= {
++			.len = sizeof(struct __kernel_sockaddr_storage) },
++	[RDMA_NLDEV_ATTR_RES_DST_ADDR]	= {
++			.len = sizeof(struct __kernel_sockaddr_storage) },
+ };
+ 
+ static int fill_nldev_handle(struct sk_buff *msg, struct ib_device *device)
+@@ -182,6 +191,7 @@ static int fill_res_info(struct sk_buff *msg, struct ib_device *device)
+ 		[RDMA_RESTRACK_PD] = "pd",
+ 		[RDMA_RESTRACK_CQ] = "cq",
+ 		[RDMA_RESTRACK_QP] = "qp",
++		[RDMA_RESTRACK_CM_ID] = "cm_id",
+ 	};
+ 
+ 	struct rdma_restrack_root *res = &device->res;
+@@ -212,6 +222,25 @@ err:
+ 	return ret;
+ }
+ 
++static int fill_res_name_pid(struct sk_buff *msg,
++			     struct rdma_restrack_entry *res)
++{
++	/*
++	 * For user resources, user is should read /proc/PID/comm to get the
++	 * name of the task file.
++	 */
++	if (rdma_is_kernel_res(res)) {
++		if (nla_put_string(msg, RDMA_NLDEV_ATTR_RES_KERN_NAME,
++		    res->kern_name))
++			return -EMSGSIZE;
++	} else {
++		if (nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PID,
++		    task_pid_vnr(res->task)))
++			return -EMSGSIZE;
++	}
++	return 0;
++}
++
+ static int fill_res_qp_entry(struct sk_buff *msg, struct netlink_callback *cb,
+ 			     struct rdma_restrack_entry *res, uint32_t port)
+ {
+@@ -262,19 +291,65 @@ static int fill_res_qp_entry(struct sk_buff *msg, struct netlink_callback *cb,
+ 	if (nla_put_u8(msg, RDMA_NLDEV_ATTR_RES_STATE, qp_attr.qp_state))
+ 		goto err;
+ 
+-	/*
+-	 * Existence of task means that it is user QP and netlink
+-	 * user is invited to go and read /proc/PID/comm to get name
+-	 * of the task file and res->task_com should be NULL.
+-	 */
+-	if (rdma_is_kernel_res(res)) {
+-		if (nla_put_string(msg, RDMA_NLDEV_ATTR_RES_KERN_NAME, res->kern_name))
++	if (fill_res_name_pid(msg, res))
++		goto err;
++
++	nla_nest_end(msg, entry_attr);
++	return 0;
++
++err:
++	nla_nest_cancel(msg, entry_attr);
++out:
++	return -EMSGSIZE;
++}
++
++static int fill_res_cm_id_entry(struct sk_buff *msg,
++				struct netlink_callback *cb,
++				struct rdma_restrack_entry *res, uint32_t port)
++{
++	struct rdma_id_private *id_priv =
++				container_of(res, struct rdma_id_private, res);
++	struct rdma_cm_id *cm_id = &id_priv->id;
++	struct nlattr *entry_attr;
++
++	if (port && port != cm_id->port_num)
++		return 0;
++
++	entry_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_RES_CM_ID_ENTRY);
++	if (!entry_attr)
++		goto out;
++
++	if (cm_id->port_num &&
++	    nla_put_u32(msg, RDMA_NLDEV_ATTR_PORT_INDEX, cm_id->port_num))
++		goto err;
++
++	if (id_priv->qp_num) {
++		if (nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_LQPN, id_priv->qp_num))
+ 			goto err;
+-	} else {
+-		if (nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PID, task_pid_vnr(res->task)))
++		if (nla_put_u8(msg, RDMA_NLDEV_ATTR_RES_TYPE, cm_id->qp_type))
+ 			goto err;
+ 	}
+ 
++	if (nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_PS, cm_id->ps))
++		goto err;
++
++	if (nla_put_u8(msg, RDMA_NLDEV_ATTR_RES_STATE, id_priv->state))
++		goto err;
++
++	if (cm_id->route.addr.src_addr.ss_family &&
++	    nla_put(msg, RDMA_NLDEV_ATTR_RES_SRC_ADDR,
++		    sizeof(cm_id->route.addr.src_addr),
++		    &cm_id->route.addr.src_addr))
++		goto err;
++	if (cm_id->route.addr.dst_addr.ss_family &&
++	    nla_put(msg, RDMA_NLDEV_ATTR_RES_DST_ADDR,
++		    sizeof(cm_id->route.addr.dst_addr),
++		    &cm_id->route.addr.dst_addr))
++		goto err;
++
++	if (fill_res_name_pid(msg, res))
++		goto err;
++
+ 	nla_nest_end(msg, entry_attr);
+ 	return 0;
+ 
+@@ -568,6 +643,11 @@ static const struct nldev_fill_res_entry fill_entries[RDMA_RESTRACK_MAX] = {
+ 		.nldev_cmd = RDMA_NLDEV_CMD_RES_QP_GET,
+ 		.nldev_attr = RDMA_NLDEV_ATTR_RES_QP,
+ 	},
++	[RDMA_RESTRACK_CM_ID] = {
++		.fill_res_func = fill_res_cm_id_entry,
++		.nldev_cmd = RDMA_NLDEV_CMD_RES_CM_ID_GET,
++		.nldev_attr = RDMA_NLDEV_ATTR_RES_CM_ID,
++	},
+ };
+ 
+ static int res_get_common_dumpit(struct sk_buff *skb,
+@@ -710,6 +790,12 @@ static int nldev_res_get_qp_dumpit(struct sk_buff *skb,
+ 	return res_get_common_dumpit(skb, cb, RDMA_RESTRACK_QP);
+ }
+ 
++static int nldev_res_get_cm_id_dumpit(struct sk_buff *skb,
++				      struct netlink_callback *cb)
++{
++	return res_get_common_dumpit(skb, cb, RDMA_RESTRACK_CM_ID);
++}
++
+ static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+ 	[RDMA_NLDEV_CMD_GET] = {
+ 		.doit = nldev_get_doit,
+@@ -736,6 +822,9 @@ static const struct rdma_nl_cbs nldev_cb_table[RDMA_NLDEV_NUM_OPS] = {
+ 		 * too.
+ 		 */
+ 	},
++	[RDMA_NLDEV_CMD_RES_CM_ID_GET] = {
++		.dump = nldev_res_get_cm_id_dumpit,
++	},
+ };
+ 
+ void __init nldev_init(void)
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+index 08f5acef0a0e..ffc30b7741e2 100644
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@ -3,12 +3,15 @@
+  * Copyright (c) 2017-2018 Mellanox Technologies. All rights reserved.
+  */
+ 
++#include <rdma/rdma_cm.h>
+ #include <rdma/ib_verbs.h>
+ #include <rdma/restrack.h>
+ #include <linux/mutex.h>
+ #include <linux/sched.h>
+ #include <linux/pid_namespace.h>
+ 
++#include "cma_priv.h"
++
+ void rdma_restrack_init(struct rdma_restrack_root *res)
+ {
+ 	init_rwsem(&res->rwsem);
+@@ -44,7 +47,7 @@ static void set_kern_name(struct rdma_restrack_entry *res)
+ 	struct ib_qp *qp;
+ 
+ 	if (type != RDMA_RESTRACK_QP)
+-		/* PD and CQ types already have this name embedded in */
++		/* Other types already have this name embedded in */
+ 		return;
+ 
+ 	qp = container_of(res, struct ib_qp, res);
+@@ -67,6 +70,9 @@ static struct ib_device *res_to_dev(struct rdma_restrack_entry *res)
+ 		return container_of(res, struct ib_cq, res)->device;
+ 	case RDMA_RESTRACK_QP:
+ 		return container_of(res, struct ib_qp, res)->device;
++	case RDMA_RESTRACK_CM_ID:
++		return container_of(res, struct rdma_id_private,
++				    res)->id.device;
+ 	default:
+ 		WARN_ONCE(true, "Wrong resource tracking type %u\n", res->type);
+ 		return NULL;
+@@ -82,6 +88,8 @@ static bool res_is_user(struct rdma_restrack_entry *res)
+ 		return container_of(res, struct ib_cq, res)->uobject;
+ 	case RDMA_RESTRACK_QP:
+ 		return container_of(res, struct ib_qp, res)->uobject;
++	case RDMA_RESTRACK_CM_ID:
++		return !res->kern_name;
+ 	default:
+ 		WARN_ONCE(true, "Wrong resource tracking type %u\n", res->type);
+ 		return false;
+@@ -96,8 +104,8 @@ void rdma_restrack_add(struct rdma_restrack_entry *res)
+ 		return;
+ 
+ 	if (res_is_user(res)) {
+-		get_task_struct(current);
+-		res->task = current;
++		if (!res->task)
++			rdma_restrack_set_task(res, current);
+ 		res->kern_name = NULL;
+ 	} else {
+ 		set_kern_name(res);
+* Unmerged path drivers/infiniband/core/ucma.c
+diff --git a/include/rdma/rdma_cm.h b/include/rdma/rdma_cm.h
+index 6538a5cc27b6..62caae818173 100644
+--- a/include/rdma/rdma_cm.h
++++ b/include/rdma/rdma_cm.h
+@@ -157,6 +157,11 @@ struct rdma_cm_id {
+ 	u8			 port_num;
+ };
+ 
++struct rdma_cm_id *__rdma_create_id(struct net *net,
++				  rdma_cm_event_handler event_handler,
++				  void *context, enum rdma_port_space ps,
++				  enum ib_qp_type qp_type, const char *caller);
++
+ /**
+  * rdma_create_id - Create an RDMA identifier.
+  *
+@@ -169,10 +174,9 @@ struct rdma_cm_id {
+  *
+  * The id holds a reference on the network namespace until it is destroyed.
+  */
+-struct rdma_cm_id *rdma_create_id(struct net *net,
+-				  rdma_cm_event_handler event_handler,
+-				  void *context, enum rdma_port_space ps,
+-				  enum ib_qp_type qp_type);
++#define rdma_create_id(net, event_handler, context, ps, qp_type) \
++	__rdma_create_id((net), (event_handler), (context), (ps), (qp_type), \
++			 KBUILD_MODNAME)
+ 
+ /**
+   * rdma_destroy_id - Destroys an RDMA identifier.
+@@ -284,6 +288,9 @@ int rdma_connect(struct rdma_cm_id *id, struct rdma_conn_param *conn_param);
+  */
+ int rdma_listen(struct rdma_cm_id *id, int backlog);
+ 
++int __rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param,
++		  const char *caller);
++
+ /**
+  * rdma_accept - Called to accept a connection request or response.
+  * @id: Connection identifier associated with the request.
+@@ -299,7 +306,8 @@ int rdma_listen(struct rdma_cm_id *id, int backlog);
+  * state of the qp associated with the id is modified to error, such that any
+  * previously posted receive buffers would be flushed.
+  */
+-int rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param);
++#define rdma_accept(id, conn_param) \
++	__rdma_accept((id), (conn_param),  KBUILD_MODNAME)
+ 
+ /**
+  * rdma_notify - Notifies the RDMA CM of an asynchronous event that has
+diff --git a/include/rdma/restrack.h b/include/rdma/restrack.h
+index 2cdf8dcf4bdc..af886670af85 100644
+--- a/include/rdma/restrack.h
++++ b/include/rdma/restrack.h
+@@ -11,6 +11,7 @@
+ #include <linux/sched.h>
+ #include <linux/kref.h>
+ #include <linux/completion.h>
++#include <linux/sched/task.h>
+ 
+ /**
+  * enum rdma_restrack_type - HW objects to track
+@@ -28,6 +29,10 @@ enum rdma_restrack_type {
+ 	 * @RDMA_RESTRACK_QP: Queue pair (QP)
+ 	 */
+ 	RDMA_RESTRACK_QP,
++	/**
++	 * @RDMA_RESTRACK_CM_ID: Connection Manager ID (CM_ID)
++	 */
++	RDMA_RESTRACK_CM_ID,
+ 	/**
+ 	 * @RDMA_RESTRACK_MAX: Last entry, used for array dclarations
+ 	 */
+@@ -150,4 +155,19 @@ int __must_check rdma_restrack_get(struct rdma_restrack_entry *res);
+  * @res:  resource entry
+  */
+ int rdma_restrack_put(struct rdma_restrack_entry *res);
++
++/**
++ * rdma_restrack_set_task() - set the task for this resource
++ * @res:  resource entry
++ * @task: task struct
++ */
++static inline void rdma_restrack_set_task(struct rdma_restrack_entry *res,
++					  struct task_struct *task)
++{
++	if (res->task)
++		put_task_struct(res->task);
++	get_task_struct(task);
++	res->task = task;
++}
++
+ #endif /* _RDMA_RESTRACK_H_ */
+diff --git a/include/uapi/rdma/rdma_netlink.h b/include/uapi/rdma/rdma_netlink.h
+index b90c8cd4c303..55bc31a092a6 100644
+--- a/include/uapi/rdma/rdma_netlink.h
++++ b/include/uapi/rdma/rdma_netlink.h
+@@ -237,6 +237,8 @@ enum rdma_nldev_command {
+ 
+ 	RDMA_NLDEV_CMD_RES_QP_GET, /* can dump */
+ 
++	RDMA_NLDEV_CMD_RES_CM_ID_GET, /* can dump */
++
+ 	RDMA_NLDEV_NUM_OPS
+ };
+ 
+@@ -349,6 +351,18 @@ enum rdma_nldev_attr {
+ 	 */
+ 	RDMA_NLDEV_ATTR_RES_KERN_NAME,		/* string */
+ 
++	RDMA_NLDEV_ATTR_RES_CM_ID,		/* nested table */
++	RDMA_NLDEV_ATTR_RES_CM_ID_ENTRY,	/* nested table */
++	/*
++	 * rdma_cm_id port space.
++	 */
++	RDMA_NLDEV_ATTR_RES_PS,			/* u32 */
++	/*
++	 * Source and destination socket addresses
++	 */
++	RDMA_NLDEV_ATTR_RES_SRC_ADDR,		/* __kernel_sockaddr_storage */
++	RDMA_NLDEV_ATTR_RES_DST_ADDR,		/* __kernel_sockaddr_storage */
++
+ 	RDMA_NLDEV_ATTR_MAX
+ };
+ #endif /* _UAPI_RDMA_NETLINK_H */
