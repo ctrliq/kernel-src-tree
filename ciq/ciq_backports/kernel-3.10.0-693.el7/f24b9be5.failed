@@ -1,0 +1,142 @@
+net-timestamp: extend SCM_TIMESTAMPING ancillary data struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] timestamp: extend SCM_TIMESTAMPING ancillary data struct (Hangbin Liu) [1389283]
+Rebuild_FUZZ: 96.55%
+commit-author Willem de Bruijn <willemb@google.com>
+commit f24b9be5957b38bb420b838115040dc2031b7d0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f24b9be5.failed
+
+Applications that request kernel tx timestamps with SO_TIMESTAMPING
+read timestamps as recvmsg() ancillary data. The response is defined
+implicitly as timespec[3].
+
+1) define struct scm_timestamping explicitly and
+
+2) add support for new tstamp types. On tx, scm_timestamping always
+   accompanies a sock_extended_err. Define previously unused field
+   ee_info to signal the type of ts[0]. Introduce SCM_TSTAMP_SND to
+   define the existing behavior.
+
+The reception path is not modified. On rx, no struct similar to
+sock_extended_err is passed along with SCM_TIMESTAMPING.
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f24b9be5957b38bb420b838115040dc2031b7d0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/socket.c
+diff --cc net/socket.c
+index 29a2111ee79f,dc0cc5d95ee5..000000000000
+--- a/net/socket.c
++++ b/net/socket.c
+@@@ -698,22 -722,18 +700,29 @@@ void __sock_recv_timestamp(struct msghd
+  		}
+  	}
+  
+- 
+- 	memset(ts, 0, sizeof(ts));
+- 	if (sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE) &&
+- 	    ktime_to_timespec_cond(skb->tstamp, ts + 0))
++ 	memset(&tss, 0, sizeof(tss));
++ 	if ((sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE) ||
++ 	     skb_shinfo(skb)->tx_flags & SKBTX_ANY_SW_TSTAMP) &&
++ 	    ktime_to_timespec_cond(skb->tstamp, tss.ts + 0))
+  		empty = 0;
+++<<<<<<< HEAD
+ +	if (shhwtstamps) {
+ +		if (sock_flag(sk, SOCK_TIMESTAMPING_SYS_HARDWARE) &&
+ +		    ktime_to_timespec_cond(shhwtstamps->syststamp, ts + 1))
+ +			empty = 0;
+ +		if (sock_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE) &&
+ +		    ktime_to_timespec_cond(shhwtstamps->hwtstamp, ts + 2))
+ +			empty = 0;
+ +	}
+++=======
++ 	if (shhwtstamps &&
++ 	    sock_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE) &&
++ 	    ktime_to_timespec_cond(shhwtstamps->hwtstamp, tss.ts + 2))
++ 		empty = 0;
+++>>>>>>> f24b9be5957b (net-timestamp: extend SCM_TIMESTAMPING ancillary data struct)
+  	if (!empty)
+  		put_cmsg(msg, SOL_SOCKET,
+- 			 SCM_TIMESTAMPING, sizeof(ts), &ts);
++ 			 SCM_TIMESTAMPING, sizeof(tss), &tss);
+  }
+  EXPORT_SYMBOL_GPL(__sock_recv_timestamp);
+  
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 449d0a455cd2..18e61079934a 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -340,6 +340,9 @@ enum {
+ 	SKBTX_SHARED_FRAG = 1 << 5,
+ };
+ 
++#define SKBTX_ANY_SW_TSTAMP	SKBTX_SW_TSTAMP
++#define SKBTX_ANY_TSTAMP	(SKBTX_HW_TSTAMP | SKBTX_ANY_SW_TSTAMP)
++
+ /*
+  * The callback notifies userspace to release buffers when skb DMA is done in
+  * lower device, the skb last reference should be 0 when calling this.
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 66e87003d1ca..715cc24bd720 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -2250,7 +2250,9 @@ sock_recv_timestamp(struct msghdr *msg, struct sock *sk, struct sk_buff *skb)
+ 	 */
+ 	if (sock_flag(sk, SOCK_RCVTSTAMP) ||
+ 	    sock_flag(sk, SOCK_TIMESTAMPING_RX_SOFTWARE) ||
+-	    (kt.tv64 && sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE)) ||
++	    (kt.tv64 &&
++	     (sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE) ||
++	      skb_shinfo(skb)->tx_flags & SKBTX_ANY_SW_TSTAMP)) ||
+ 	    (hwtstamps->hwtstamp.tv64 &&
+ 	     sock_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE)) ||
+ 	    (hwtstamps->syststamp.tv64 &&
+diff --git a/include/uapi/linux/errqueue.h b/include/uapi/linux/errqueue.h
+index aacd4fb7102a..accee72cae7c 100644
+--- a/include/uapi/linux/errqueue.h
++++ b/include/uapi/linux/errqueue.h
+@@ -22,5 +22,23 @@ struct sock_extended_err {
+ 
+ #define SO_EE_OFFENDER(ee)	((struct sockaddr*)((ee)+1))
+ 
++/**
++ *	struct scm_timestamping - timestamps exposed through cmsg
++ *
++ *	The timestamping interfaces SO_TIMESTAMPING, MSG_TSTAMP_*
++ *	communicate network timestamps by passing this struct in a cmsg with
++ *	recvmsg(). See Documentation/networking/timestamping.txt for details.
++ */
++struct scm_timestamping {
++	struct timespec ts[3];
++};
++
++/* The type of scm_timestamping, passed in sock_extended_err ee_info.
++ * This defines the type of ts[0]. For SCM_TSTAMP_SND only, if ts[0]
++ * is zero, then this is a hardware timestamp and recorded in ts[2].
++ */
++enum {
++	SCM_TSTAMP_SND,		/* driver passed skb to NIC, or HW */
++};
+ 
+ #endif /* _UAPI_LINUX_ERRQUEUE_H */
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index c7043c783fdb..866bf33792be 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3713,6 +3713,7 @@ void skb_tstamp_tx(struct sk_buff *orig_skb,
+ 	memset(serr, 0, sizeof(*serr));
+ 	serr->ee.ee_errno = ENOMSG;
+ 	serr->ee.ee_origin = SO_EE_ORIGIN_TIMESTAMPING;
++	serr->ee.ee_info = SCM_TSTAMP_SND;
+ 
+ 	err = sock_queue_err_skb(sk, skb);
+ 
+* Unmerged path net/socket.c
