@@ -1,0 +1,389 @@
+packet: Use symmetric hash for PACKET_FANOUT_HASH.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author David S. Miller <davem@davemloft.net>
+commit eb70db8756717b90c01ccc765fdefc4dd969fc74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/eb70db87.failed
+
+People who use PACKET_FANOUT_HASH want a symmetric hash, meaning that
+they want packets going in both directions on a flow to hash to the
+same bucket.
+
+The core kernel SKB hash became non-symmetric when the ipv6 flow label
+and other entities were incorporated into the standard flow hash order
+to increase entropy.
+
+But there are no users of PACKET_FANOUT_HASH who want an assymetric
+hash, they all want a symmetric one.
+
+Therefore, use the flow dissector to compute a flat symmetric hash
+over only the protocol, addresses and ports.  This hash does not get
+installed into and override the normal skb hash, so this change has
+no effect whatsoever on the rest of the stack.
+
+	Reported-by: Eric Leblond <eric@regit.org>
+	Tested-by: Eric Leblond <eric@regit.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb70db8756717b90c01ccc765fdefc4dd969fc74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/flow_dissector.c
+diff --cc include/linux/skbuff.h
+index dcb8575fa615,24859d40acde..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1001,6 -1040,121 +1001,124 @@@ static inline void skb_clear_hash_if_no
+  		skb_clear_hash(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void
++ __skb_set_hash(struct sk_buff *skb, __u32 hash, bool is_sw, bool is_l4)
++ {
++ 	skb->l4_hash = is_l4;
++ 	skb->sw_hash = is_sw;
++ 	skb->hash = hash;
++ }
++ 
++ static inline void
++ skb_set_hash(struct sk_buff *skb, __u32 hash, enum pkt_hash_types type)
++ {
++ 	/* Used by drivers to set hash from HW */
++ 	__skb_set_hash(skb, hash, false, type == PKT_HASH_TYPE_L4);
++ }
++ 
++ static inline void
++ __skb_set_sw_hash(struct sk_buff *skb, __u32 hash, bool is_l4)
++ {
++ 	__skb_set_hash(skb, hash, true, is_l4);
++ }
++ 
++ void __skb_get_hash(struct sk_buff *skb);
++ u32 __skb_get_hash_symmetric(struct sk_buff *skb);
++ u32 skb_get_poff(const struct sk_buff *skb);
++ u32 __skb_get_poff(const struct sk_buff *skb, void *data,
++ 		   const struct flow_keys *keys, int hlen);
++ __be32 __skb_flow_get_ports(const struct sk_buff *skb, int thoff, u8 ip_proto,
++ 			    void *data, int hlen_proto);
++ 
++ static inline __be32 skb_flow_get_ports(const struct sk_buff *skb,
++ 					int thoff, u8 ip_proto)
++ {
++ 	return __skb_flow_get_ports(skb, thoff, ip_proto, NULL, 0);
++ }
++ 
++ void skb_flow_dissector_init(struct flow_dissector *flow_dissector,
++ 			     const struct flow_dissector_key *key,
++ 			     unsigned int key_count);
++ 
++ bool __skb_flow_dissect(const struct sk_buff *skb,
++ 			struct flow_dissector *flow_dissector,
++ 			void *target_container,
++ 			void *data, __be16 proto, int nhoff, int hlen,
++ 			unsigned int flags);
++ 
++ static inline bool skb_flow_dissect(const struct sk_buff *skb,
++ 				    struct flow_dissector *flow_dissector,
++ 				    void *target_container, unsigned int flags)
++ {
++ 	return __skb_flow_dissect(skb, flow_dissector, target_container,
++ 				  NULL, 0, 0, 0, flags);
++ }
++ 
++ static inline bool skb_flow_dissect_flow_keys(const struct sk_buff *skb,
++ 					      struct flow_keys *flow,
++ 					      unsigned int flags)
++ {
++ 	memset(flow, 0, sizeof(*flow));
++ 	return __skb_flow_dissect(skb, &flow_keys_dissector, flow,
++ 				  NULL, 0, 0, 0, flags);
++ }
++ 
++ static inline bool skb_flow_dissect_flow_keys_buf(struct flow_keys *flow,
++ 						  void *data, __be16 proto,
++ 						  int nhoff, int hlen,
++ 						  unsigned int flags)
++ {
++ 	memset(flow, 0, sizeof(*flow));
++ 	return __skb_flow_dissect(NULL, &flow_keys_buf_dissector, flow,
++ 				  data, proto, nhoff, hlen, flags);
++ }
++ 
++ static inline __u32 skb_get_hash(struct sk_buff *skb)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash)
++ 		__skb_get_hash(skb);
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 __skb_get_hash_flowi6(struct sk_buff *skb, const struct flowi6 *fl6);
++ 
++ static inline __u32 skb_get_hash_flowi6(struct sk_buff *skb, const struct flowi6 *fl6)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash) {
++ 		struct flow_keys keys;
++ 		__u32 hash = __get_hash_from_flowi6(fl6, &keys);
++ 
++ 		__skb_set_sw_hash(skb, hash, flow_keys_have_l4(&keys));
++ 	}
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 __skb_get_hash_flowi4(struct sk_buff *skb, const struct flowi4 *fl);
++ 
++ static inline __u32 skb_get_hash_flowi4(struct sk_buff *skb, const struct flowi4 *fl4)
++ {
++ 	if (!skb->l4_hash && !skb->sw_hash) {
++ 		struct flow_keys keys;
++ 		__u32 hash = __get_hash_from_flowi4(fl4, &keys);
++ 
++ 		__skb_set_sw_hash(skb, hash, flow_keys_have_l4(&keys));
++ 	}
++ 
++ 	return skb->hash;
++ }
++ 
++ __u32 skb_get_hash_perturb(const struct sk_buff *skb, u32 perturb);
++ 
++ static inline __u32 skb_get_hash_raw(const struct sk_buff *skb)
++ {
++ 	return skb->hash;
++ }
++ 
+++>>>>>>> eb70db875671 (packet: Use symmetric hash for PACKET_FANOUT_HASH.)
+  static inline void skb_copy_hash(struct sk_buff *to, const struct sk_buff *from)
+  {
+  	to->hash = from->hash;
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,61ad43f61c5e..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -367,8 -615,64 +367,69 @@@ u32 flow_hash_from_keys(struct flow_key
+  }
+  EXPORT_SYMBOL(flow_hash_from_keys);
+  
+++<<<<<<< HEAD
+ +/*
+ + * __skb_get_hash: calculate a flow hash based on src/dst addresses
+++=======
++ static inline u32 ___skb_get_hash(const struct sk_buff *skb,
++ 				  struct flow_keys *keys, u32 keyval)
++ {
++ 	skb_flow_dissect_flow_keys(skb, keys,
++ 				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++ 
++ 	return __flow_hash_from_keys(keys, keyval);
++ }
++ 
++ struct _flow_keys_digest_data {
++ 	__be16	n_proto;
++ 	u8	ip_proto;
++ 	u8	padding;
++ 	__be32	ports;
++ 	__be32	src;
++ 	__be32	dst;
++ };
++ 
++ void make_flow_keys_digest(struct flow_keys_digest *digest,
++ 			   const struct flow_keys *flow)
++ {
++ 	struct _flow_keys_digest_data *data =
++ 	    (struct _flow_keys_digest_data *)digest;
++ 
++ 	BUILD_BUG_ON(sizeof(*data) > sizeof(*digest));
++ 
++ 	memset(digest, 0, sizeof(*digest));
++ 
++ 	data->n_proto = flow->basic.n_proto;
++ 	data->ip_proto = flow->basic.ip_proto;
++ 	data->ports = flow->ports.ports;
++ 	data->src = flow->addrs.v4addrs.src;
++ 	data->dst = flow->addrs.v4addrs.dst;
++ }
++ EXPORT_SYMBOL(make_flow_keys_digest);
++ 
++ static struct flow_dissector flow_keys_dissector_symmetric __read_mostly;
++ 
++ u32 __skb_get_hash_symmetric(struct sk_buff *skb)
++ {
++ 	struct flow_keys keys;
++ 
++ 	__flow_hash_secret_init();
++ 
++ 	memset(&keys, 0, sizeof(keys));
++ 	__skb_flow_dissect(skb, &flow_keys_dissector_symmetric, &keys,
++ 			   NULL, 0, 0, 0,
++ 			   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++ 
++ 	return __flow_hash_from_keys(&keys, hashrnd);
++ }
++ EXPORT_SYMBOL_GPL(__skb_get_hash_symmetric);
++ 
++ /**
++  * __skb_get_hash: calculate a flow hash
++  * @skb: sk_buff to calculate flow hash from
++  *
++  * This function calculates a flow hash based on src/dst addresses
+++>>>>>>> eb70db875671 (packet: Use symmetric hash for PACKET_FANOUT_HASH.)
+   * and src/dst port numbers.  Sets hash in skb to non-zero hash value
+   * on success, zero indicates no valid hash.  Also, sets l4_hash in skb
+   * if hash is a canonical 4-tuple hash over transport ports.
+@@@ -478,3 -810,132 +539,135 @@@ u32 skb_get_poff(const struct sk_buff *
+  
+  	return __skb_get_poff(skb, skb->data, &keys, skb_headlen(skb));
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ __u32 __get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys)
++ {
++ 	memset(keys, 0, sizeof(*keys));
++ 
++ 	memcpy(&keys->addrs.v6addrs.src, &fl6->saddr,
++ 	    sizeof(keys->addrs.v6addrs.src));
++ 	memcpy(&keys->addrs.v6addrs.dst, &fl6->daddr,
++ 	    sizeof(keys->addrs.v6addrs.dst));
++ 	keys->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++ 	keys->ports.src = fl6->fl6_sport;
++ 	keys->ports.dst = fl6->fl6_dport;
++ 	keys->keyid.keyid = fl6->fl6_gre_key;
++ 	keys->tags.flow_label = (__force u32)fl6->flowlabel;
++ 	keys->basic.ip_proto = fl6->flowi6_proto;
++ 
++ 	return flow_hash_from_keys(keys);
++ }
++ EXPORT_SYMBOL(__get_hash_from_flowi6);
++ 
++ __u32 __get_hash_from_flowi4(const struct flowi4 *fl4, struct flow_keys *keys)
++ {
++ 	memset(keys, 0, sizeof(*keys));
++ 
++ 	keys->addrs.v4addrs.src = fl4->saddr;
++ 	keys->addrs.v4addrs.dst = fl4->daddr;
++ 	keys->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++ 	keys->ports.src = fl4->fl4_sport;
++ 	keys->ports.dst = fl4->fl4_dport;
++ 	keys->keyid.keyid = fl4->fl4_gre_key;
++ 	keys->basic.ip_proto = fl4->flowi4_proto;
++ 
++ 	return flow_hash_from_keys(keys);
++ }
++ EXPORT_SYMBOL(__get_hash_from_flowi4);
++ 
++ static const struct flow_dissector_key flow_keys_dissector_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v4addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v6addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_TIPC_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.tipcaddrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_PORTS,
++ 		.offset = offsetof(struct flow_keys, ports),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_VLANID,
++ 		.offset = offsetof(struct flow_keys, tags),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_FLOW_LABEL,
++ 		.offset = offsetof(struct flow_keys, tags),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_GRE_KEYID,
++ 		.offset = offsetof(struct flow_keys, keyid),
++ 	},
++ };
++ 
++ static const struct flow_dissector_key flow_keys_dissector_symmetric_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v4addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++ 		.offset = offsetof(struct flow_keys, addrs.v6addrs),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_PORTS,
++ 		.offset = offsetof(struct flow_keys, ports),
++ 	},
++ };
++ 
++ static const struct flow_dissector_key flow_keys_buf_dissector_keys[] = {
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_CONTROL,
++ 		.offset = offsetof(struct flow_keys, control),
++ 	},
++ 	{
++ 		.key_id = FLOW_DISSECTOR_KEY_BASIC,
++ 		.offset = offsetof(struct flow_keys, basic),
++ 	},
++ };
++ 
++ struct flow_dissector flow_keys_dissector __read_mostly;
++ EXPORT_SYMBOL(flow_keys_dissector);
++ 
++ struct flow_dissector flow_keys_buf_dissector __read_mostly;
++ 
++ static int __init init_default_flow_dissectors(void)
++ {
++ 	skb_flow_dissector_init(&flow_keys_dissector,
++ 				flow_keys_dissector_keys,
++ 				ARRAY_SIZE(flow_keys_dissector_keys));
++ 	skb_flow_dissector_init(&flow_keys_dissector_symmetric,
++ 				flow_keys_dissector_symmetric_keys,
++ 				ARRAY_SIZE(flow_keys_dissector_symmetric_keys));
++ 	skb_flow_dissector_init(&flow_keys_buf_dissector,
++ 				flow_keys_buf_dissector_keys,
++ 				ARRAY_SIZE(flow_keys_buf_dissector_keys));
++ 	return 0;
++ }
++ 
++ late_initcall_sync(init_default_flow_dissectors);
+++>>>>>>> eb70db875671 (packet: Use symmetric hash for PACKET_FANOUT_HASH.)
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/flow_dissector.c
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 4839c0b7b9bc..20bc5702ddd4 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1216,7 +1216,7 @@ static unsigned int fanout_demux_hash(struct packet_fanout *f,
+ 				      struct sk_buff *skb,
+ 				      unsigned int num)
+ {
+-	return reciprocal_scale(skb_get_hash(skb), num);
++	return reciprocal_scale(__skb_get_hash_symmetric(skb), num);
+ }
+ 
+ static unsigned int fanout_demux_lb(struct packet_fanout *f,
