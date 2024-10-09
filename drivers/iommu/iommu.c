@@ -806,14 +806,6 @@ struct iommu_group *pci_device_group(struct device *dev)
 	if (IS_ERR(group))
 		return NULL;
 
-	/*
-	 * Try to allocate a default domain - needs support from the
-	 * IOMMU driver.
-	 */
-	group->default_domain = __iommu_domain_alloc(pdev->dev.bus,
-						     IOMMU_DOMAIN_DMA);
-	group->domain = group->default_domain;
-
 	return group;
 }
 
@@ -844,6 +836,16 @@ struct iommu_group *iommu_group_get_for_dev(struct device *dev)
 
 	if (IS_ERR(group))
 		return group;
+
+	/*
+	 * Try to allocate a default domain - needs support from the
+	 * IOMMU driver.
+	 */
+	if (!group->default_domain) {
+		group->default_domain = __iommu_domain_alloc(dev->bus,
+							     IOMMU_DOMAIN_DMA);
+		group->domain = group->default_domain;
+	}
 
 	ret = iommu_group_add_device(group, dev);
 	if (ret) {
