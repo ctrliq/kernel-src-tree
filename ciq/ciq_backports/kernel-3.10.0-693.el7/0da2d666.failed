@@ -1,0 +1,204 @@
+net/mlx5: Properly remove all steering objects
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Properly remove all steering objects (Don Dutile) [1383601 1417284]
+Rebuild_FUZZ: 95.45%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit 0da2d66666d32769fa0aebb5f1d2d0a86be6c5d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0da2d666.failed
+
+Instead of explicitly cleaning up the well known parts of the steering
+tree, we use the generic tree structure to traverse for cleanup.
+No functional changes.
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0da2d66666d32769fa0aebb5f1d2d0a86be6c5d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index 3b6147aebe10,3e9577537b52..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -1572,124 -1663,42 +1572,156 @@@ cleanup
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static void cleanup_single_prio_root_ns(struct mlx5_core_dev *dev,
+ +					struct mlx5_flow_root_namespace *root_ns)
+++=======
++ static void clean_tree(struct fs_node *node)
+++>>>>>>> 0da2d66666d3 (net/mlx5: Properly remove all steering objects)
+  {
+- 	struct fs_node *prio;
++ 	if (node) {
++ 		struct fs_node *iter;
++ 		struct fs_node *temp;
++ 
++ 		list_for_each_entry_safe(iter, temp, &node->children, list)
++ 			clean_tree(iter);
++ 		tree_remove_node(node);
++ 	}
++ }
+  
++ static void cleanup_root_ns(struct mlx5_flow_root_namespace *root_ns)
++ {
+  	if (!root_ns)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(&root_ns->ns.node.children)) {
+ +		prio = list_first_entry(&root_ns->ns.node.children,
+ +					struct fs_node,
+ +				 list);
+ +		if (tree_remove_node(prio))
+ +			mlx5_core_warn(dev,
+ +				       "Flow steering priority wasn't destroyed, refcount > 1\n");
+ +	}
+ +	if (tree_remove_node(&root_ns->ns.node))
+ +		mlx5_core_warn(dev,
+ +			       "Flow steering namespace wasn't destroyed, refcount > 1\n");
+ +	root_ns = NULL;
+ +}
+ +
+ +static void destroy_flow_tables(struct fs_prio *prio)
+ +{
+ +	struct mlx5_flow_table *iter;
+ +	struct mlx5_flow_table *tmp;
+ +
+ +	fs_for_each_ft_safe(iter, tmp, prio)
+ +		mlx5_destroy_flow_table(iter);
+ +}
+ +
+ +static void cleanup_root_ns(struct mlx5_core_dev *dev)
+ +{
+ +	struct mlx5_flow_root_namespace *root_ns = dev->priv.root_ns;
+ +	struct fs_prio *iter_prio;
+ +
+ +	if (!MLX5_CAP_GEN(dev, nic_flow_table))
+ +		return;
+ +
+ +	if (!root_ns)
+ +		return;
+ +
+ +	/* stage 1 */
+ +	fs_for_each_prio(iter_prio, &root_ns->ns) {
+ +		struct fs_node *node;
+ +		struct mlx5_flow_namespace *iter_ns;
+ +
+ +		fs_for_each_ns_or_ft(node, iter_prio) {
+ +			if (node->type == FS_TYPE_FLOW_TABLE)
+ +				continue;
+ +			fs_get_obj(iter_ns, node);
+ +			while (!list_empty(&iter_ns->node.children)) {
+ +				struct fs_prio *obj_iter_prio2;
+ +				struct fs_node *iter_prio2 =
+ +					list_first_entry(&iter_ns->node.children,
+ +							 struct fs_node,
+ +							 list);
+ +
+ +				fs_get_obj(obj_iter_prio2, iter_prio2);
+ +				destroy_flow_tables(obj_iter_prio2);
+ +				if (tree_remove_node(iter_prio2)) {
+ +					mlx5_core_warn(dev,
+ +						       "Priority %d wasn't destroyed, refcount > 1\n",
+ +						       obj_iter_prio2->prio);
+ +					return;
+ +				}
+ +			}
+ +		}
+ +	}
+ +
+ +	/* stage 2 */
+ +	fs_for_each_prio(iter_prio, &root_ns->ns) {
+ +		while (!list_empty(&iter_prio->node.children)) {
+ +			struct fs_node *iter_ns =
+ +				list_first_entry(&iter_prio->node.children,
+ +						 struct fs_node,
+ +						 list);
+ +			if (tree_remove_node(iter_ns)) {
+ +				mlx5_core_warn(dev,
+ +					       "Namespace wasn't destroyed, refcount > 1\n");
+ +				return;
+ +			}
+ +		}
+ +	}
+ +
+ +	/* stage 3 */
+ +	while (!list_empty(&root_ns->ns.node.children)) {
+ +		struct fs_prio *obj_prio_node;
+ +		struct fs_node *prio_node =
+ +			list_first_entry(&root_ns->ns.node.children,
+ +					 struct fs_node,
+ +					 list);
+ +
+ +		fs_get_obj(obj_prio_node, prio_node);
+ +		if (tree_remove_node(prio_node)) {
+ +			mlx5_core_warn(dev,
+ +				       "Priority %d wasn't destroyed, refcount > 1\n",
+ +				       obj_prio_node->prio);
+ +			return;
+ +		}
+ +	}
+ +
+ +	if (tree_remove_node(&root_ns->ns.node)) {
+ +		mlx5_core_warn(dev,
+ +			       "root namespace wasn't destroyed, refcount > 1\n");
+ +		return;
+ +	}
+ +
+ +	dev->priv.root_ns = NULL;
+++=======
++ 	clean_tree(&root_ns->ns.node);
+++>>>>>>> 0da2d66666d3 (net/mlx5: Properly remove all steering objects)
+  }
+  
+  void mlx5_cleanup_fs(struct mlx5_core_dev *dev)
+  {
+++<<<<<<< HEAD
+ +	cleanup_root_ns(dev);
+ +	cleanup_single_prio_root_ns(dev, dev->priv.fdb_root_ns);
+++=======
++ 	struct mlx5_flow_steering *steering = dev->priv.steering;
++ 
++ 	if (MLX5_CAP_GEN(dev, port_type) != MLX5_CAP_PORT_TYPE_ETH)
++ 		return;
++ 
++ 	cleanup_root_ns(steering->root_ns);
++ 	cleanup_root_ns(steering->esw_egress_root_ns);
++ 	cleanup_root_ns(steering->esw_ingress_root_ns);
++ 	cleanup_root_ns(steering->fdb_root_ns);
++ 	mlx5_cleanup_fc_stats(dev);
++ 	kfree(steering);
+++>>>>>>> 0da2d66666d3 (net/mlx5: Properly remove all steering objects)
+  }
+  
+ -static int init_fdb_root_ns(struct mlx5_flow_steering *steering)
+ +static int init_fdb_root_ns(struct mlx5_core_dev *dev)
+  {
+  	struct fs_prio *prio;
+  
+@@@ -1698,9 -1707,10 +1730,14 @@@
+  		return -ENOMEM;
+  
+  	/* Create single prio */
+ -	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 1);
+ +	prio = fs_create_prio(&dev->priv.fdb_root_ns->ns, 0, 1);
+  	if (IS_ERR(prio)) {
+++<<<<<<< HEAD
+ +		cleanup_single_prio_root_ns(dev, dev->priv.fdb_root_ns);
+++=======
++ 		cleanup_root_ns(steering->fdb_root_ns);
++ 		steering->fdb_root_ns = NULL;
+++>>>>>>> 0da2d66666d3 (net/mlx5: Properly remove all steering objects)
+  		return PTR_ERR(prio);
+  	} else {
+  		return 0;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
