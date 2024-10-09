@@ -1,0 +1,160 @@
+xfs: lobotomise xfs_trans_read_buf_map()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 2d3d0c53df99587e1d58759f805c3aae79fac453
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2d3d0c53.failed
+
+There's a case in that code where it checks for a buffer match in a
+transaction where the buffer is not marked done. i.e. trying to
+catch a buffer we have locked in the transaction but have not
+completed IO on.
+
+The only way we can find a buffer that has not had IO completed on
+it is if it had readahead issued on it, but we never do readahead on
+buffers that we have already joined into a transaction. Hence this
+condition cannot occur, and buffers locked and joined into a
+transaction should always be marked done and not under IO.
+
+Remove this code and re-order xfs_trans_read_buf_map() to remove
+duplicated IO dispatch and error handling code.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 2d3d0c53df99587e1d58759f805c3aae79fac453)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_buf.c
+diff --cc fs/xfs/xfs_trans_buf.c
+index 0621767a06d9,2f363cdd1e14..000000000000
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@@ -261,41 -255,6 +254,44 @@@ xfs_trans_read_buf_map
+  	int			error;
+  
+  	*bpp = NULL;
+++<<<<<<< HEAD
+ +	if (!tp) {
+ +		bp = xfs_buf_read_map(target, map, nmaps, flags, ops);
+ +		if (!bp)
+ +			return (flags & XBF_TRYLOCK) ?
+ +					-EAGAIN : -ENOMEM;
+ +
+ +		if (bp->b_error) {
+ +			error = bp->b_error;
+ +			xfs_buf_ioerror_alert(bp, __func__);
+ +			bp->b_flags &= ~XBF_DONE;
+ +			xfs_buf_stale(bp);
+ +			xfs_buf_relse(bp);
+ +
+ +			/* bad CRC means corrupted metadata */
+ +			if (error == -EFSBADCRC)
+ +				error = -EFSCORRUPTED;
+ +			return error;
+ +		}
+ +#ifdef DEBUG
+ +		if (xfs_do_error) {
+ +			if (xfs_error_target == target) {
+ +				if (((xfs_req_num++) % xfs_error_mod) == 0) {
+ +					xfs_buf_relse(bp);
+ +					xfs_debug(mp, "Returning error!");
+ +					return -EIO;
+ +				}
+ +			}
+ +		}
+ +#endif
+ +		if (XFS_FORCED_SHUTDOWN(mp))
+ +			goto shutdown_abort;
+ +		*bpp = bp;
+ +		return 0;
+ +	}
+ +
+++=======
+++>>>>>>> 2d3d0c53df99 (xfs: lobotomise xfs_trans_read_buf_map())
+  	/*
+  	 * If we find the buffer in the cache with this transaction
+  	 * pointer in its b_fsprivate2 field, then we know we already
+@@@ -310,32 -270,8 +307,17 @@@
+  		ASSERT(bp->b_transp == tp);
+  		ASSERT(bp->b_fspriv != NULL);
+  		ASSERT(!bp->b_error);
+++<<<<<<< HEAD
+ +		if (!(bp->b_flags & XBF_DONE)) {
+ +			trace_xfs_trans_read_buf_io(bp, _RET_IP_);
+ +			ASSERT(!(bp->b_flags & XBF_ASYNC));
+ +			ASSERT(bp->b_iodone == NULL);
+ +			bp->b_flags |= XBF_READ;
+ +			bp->b_ops = ops;
+++=======
++ 		ASSERT(bp->b_flags & XBF_DONE);
+++>>>>>>> 2d3d0c53df99 (xfs: lobotomise xfs_trans_read_buf_map())
+  
+- 			error = xfs_buf_submit_wait(bp);
+- 			if (error) {
+- 				if (!XFS_FORCED_SHUTDOWN(mp))
+- 					xfs_buf_ioerror_alert(bp, __func__);
+- 				xfs_buf_relse(bp);
+- 				/*
+- 				 * We can gracefully recover from most read
+- 				 * errors. Ones we can't are those that happen
+- 				 * after the transaction's already dirty.
+- 				 */
+- 				if (tp->t_flags & XFS_TRANS_DIRTY)
+- 					xfs_force_shutdown(tp->t_mountp,
+- 							SHUTDOWN_META_IO_ERROR);
+- 				/* bad CRC means corrupted metadata */
+- 				if (error == -EFSBADCRC)
+- 					error = -EFSCORRUPTED;
+- 				return error;
+- 			}
+- 		}
+  		/*
+  		 * We never locked this buf ourselves, so we shouldn't
+  		 * brelse it either. Just get out.
+@@@ -357,17 -291,29 +337,35 @@@
+  	}
+  
+  	bp = xfs_buf_read_map(target, map, nmaps, flags, ops);
+- 	if (bp == NULL) {
+- 		*bpp = NULL;
+- 		return (flags & XBF_TRYLOCK) ?
+- 					0 : -ENOMEM;
++ 	if (!bp) {
++ 		if (!(flags & XBF_TRYLOCK))
++ 			return -ENOMEM;
++ 		return tp ? 0 : -EAGAIN;
+  	}
++ 
++ 	/*
++ 	 * If we've had a read error, then the contents of the buffer are
++ 	 * invalid and should not be used. To ensure that a followup read tries
++ 	 * to pull the buffer from disk again, we clear the XBF_DONE flag and
++ 	 * mark the buffer stale. This ensures that anyone who has a current
++ 	 * reference to the buffer will interpret it's contents correctly and
++ 	 * future cache lookups will also treat it as an empty, uninitialised
++ 	 * buffer.
++ 	 */
+  	if (bp->b_error) {
+  		error = bp->b_error;
++ 		if (!XFS_FORCED_SHUTDOWN(mp))
++ 			xfs_buf_ioerror_alert(bp, __func__);
++ 		bp->b_flags &= ~XBF_DONE;
+  		xfs_buf_stale(bp);
+++<<<<<<< HEAD
+ +		bp->b_flags |= XBF_DONE;
+ +		xfs_buf_ioerror_alert(bp, __func__);
+ +		if (tp->t_flags & XFS_TRANS_DIRTY)
+++=======
++ 
++ 		if (tp && (tp->t_flags & XFS_TRANS_DIRTY))
+++>>>>>>> 2d3d0c53df99 (xfs: lobotomise xfs_trans_read_buf_map())
+  			xfs_force_shutdown(tp->t_mountp, SHUTDOWN_META_IO_ERROR);
+  		xfs_buf_relse(bp);
+  
+* Unmerged path fs/xfs/xfs_trans_buf.c
