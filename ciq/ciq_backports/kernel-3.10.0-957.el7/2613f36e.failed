@@ -1,0 +1,445 @@
+x86/microcode: Attempt late loading only when new microcode is present
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] microcode: Attempt late loading only when new microcode is present (Prarit Bhargava) [1568249]
+Rebuild_FUZZ: 97.06%
+commit-author Borislav Petkov <bp@suse.de>
+commit 2613f36ed965d0e5a595a1d931fd3b480e82d6fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2613f36e.failed
+
+Return UCODE_NEW from the scanning functions to denote that new microcode
+was found and only then attempt the expensive synchronization dance.
+
+	Reported-by: Emanuel Czirai <xftroxgpx@protonmail.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Emanuel Czirai <xftroxgpx@protonmail.com>
+	Tested-by: Ashok Raj <ashok.raj@intel.com>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lkml.kernel.org/r/20180314183615.17629-1-bp@alien8.de
+
+(cherry picked from commit 2613f36ed965d0e5a595a1d931fd3b480e82d6fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/microcode.h
+#	arch/x86/kernel/cpu/microcode/amd.c
+#	arch/x86/kernel/cpu/microcode/core.c
+diff --cc arch/x86/include/asm/microcode.h
+index ca2af7ed6cbf,6cf0e4cb7b97..000000000000
+--- a/arch/x86/include/asm/microcode.h
++++ b/arch/x86/include/asm/microcode.h
+@@@ -28,7 -37,13 +28,17 @@@ struct cpu_signature 
+  
+  struct device;
+  
+++<<<<<<< HEAD
+ +enum ucode_state { UCODE_ERROR, UCODE_OK, UCODE_NFOUND };
+++=======
++ enum ucode_state {
++ 	UCODE_OK	= 0,
++ 	UCODE_NEW,
++ 	UCODE_UPDATED,
++ 	UCODE_NFOUND,
++ 	UCODE_ERROR,
++ };
+++>>>>>>> 2613f36ed965 (x86/microcode: Attempt late loading only when new microcode is present)
+  
+  struct microcode_ops {
+  	enum ucode_state (*request_microcode_user) (int cpu,
+diff --cc arch/x86/kernel/cpu/microcode/amd.c
+index 0d1af0efc84a,48179928ff38..000000000000
+--- a/arch/x86/kernel/cpu/microcode/amd.c
++++ b/arch/x86/kernel/cpu/microcode/amd.c
+@@@ -280,190 -251,98 +280,196 @@@ static bool __init load_builtin_amd_mic
+  #endif
+  }
+  
+ -static void __load_ucode_amd(unsigned int cpuid_1_eax, struct cpio_data *ret)
+ +void __init load_ucode_amd_bsp(unsigned int family)
+  {
+ -	struct ucode_cpu_info *uci;
+  	struct cpio_data cp;
+ -	const char *path;
+ -	bool use_pa;
+ +	bool *builtin;
+ +	void **data;
+ +	size_t *size;
+  
+ -	if (IS_ENABLED(CONFIG_X86_32)) {
+ -		uci	= (struct ucode_cpu_info *)__pa_nodebug(ucode_cpu_info);
+ -		path	= (const char *)__pa_nodebug(ucode_path);
+ -		use_pa	= true;
+ -	} else {
+ -		uci     = ucode_cpu_info;
+ -		path	= ucode_path;
+ -		use_pa	= false;
+ -	}
+ +#ifdef CONFIG_X86_32
+ +	data =  (void **)__pa_nodebug(&ucode_cpio.data);
+ +	size = (size_t *)__pa_nodebug(&ucode_cpio.size);
+ +	builtin = (bool *)__pa_nodebug(&ucode_builtin);
+ +#else
+ +	data = &ucode_cpio.data;
+ +	size = &ucode_cpio.size;
+ +	builtin = &ucode_builtin;
+ +#endif
+  
+ -	if (!get_builtin_microcode(&cp, x86_family(cpuid_1_eax)))
+ -		cp = find_microcode_in_initrd(path, use_pa);
+ +	*builtin = load_builtin_amd_microcode(&cp, family);
+ +	if (!*builtin)
+ +		cp = find_ucode_in_initrd();
+  
+ -	/* Needed in load_microcode_amd() */
+ -	uci->cpu_sig.sig = cpuid_1_eax;
+ +	if (!(cp.data && cp.size))
+ +		return;
+ +
+ +	*data = cp.data;
+ +	*size = cp.size;
+  
+ -	*ret = cp;
+ +	apply_ucode_in_initrd(cp.data, cp.size, true);
+  }
+  
+ -void __init load_ucode_amd_bsp(unsigned int cpuid_1_eax)
+ +#ifdef CONFIG_X86_32
+ +/*
+ + * On 32-bit, since AP's early load occurs before paging is turned on, we
+ + * cannot traverse cpu_equiv_table and pcache in kernel heap memory. So during
+ + * cold boot, AP will apply_ucode_in_initrd() just like the BSP. During
+ + * save_microcode_in_initrd_amd() BSP's patch is copied to amd_ucode_patch,
+ + * which is used upon resume from suspend.
+ + */
+ +void load_ucode_amd_ap(void)
+  {
+ -	struct cpio_data cp = { };
+ +	struct microcode_amd *mc;
+ +	size_t *usize;
+ +	void **ucode;
+  
+ -	__load_ucode_amd(cpuid_1_eax, &cp);
+ -	if (!(cp.data && cp.size))
+ +	mc = (struct microcode_amd *)__pa_nodebug(amd_ucode_patch);
+ +	if (mc->hdr.patch_id && mc->hdr.processor_rev_id) {
+ +		__apply_microcode_amd(mc);
+ +		return;
+ +	}
+ +
+ +	ucode = (void *)__pa_nodebug(&container);
+ +	usize = (size_t *)__pa_nodebug(&container_size);
+ +
+ +	if (!*ucode || !*usize)
+  		return;
+  
+ -	apply_microcode_early_amd(cpuid_1_eax, cp.data, cp.size, true);
+ +	apply_ucode_in_initrd(*ucode, *usize, false);
+ +}
+ +
+ +static void __init collect_cpu_sig_on_bsp(void *arg)
+ +{
+ +	unsigned int cpu = smp_processor_id();
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+ +
+ +	uci->cpu_sig.sig = cpuid_eax(0x00000001);
+  }
+  
+ -void load_ucode_amd_ap(unsigned int cpuid_1_eax)
+ +static void __init get_bsp_sig(void)
+  {
+ +	unsigned int bsp = boot_cpu_data.cpu_index;
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + bsp;
+ +
+ +	if (!uci->cpu_sig.sig)
+ +		smp_call_function_single(bsp, collect_cpu_sig_on_bsp, NULL, 1);
+ +}
+ +#else
+ +void load_ucode_amd_ap(void)
+ +{
+ +	unsigned int cpu = smp_processor_id();
+ +	struct equiv_cpu_entry *eq;
+  	struct microcode_amd *mc;
+ -	struct cpio_data cp;
+ -	u32 *new_rev, rev, dummy;
+ +	u8 *cont = container;
+ +	u32 rev, eax;
+ +	u16 eq_id;
+  
+ -	if (IS_ENABLED(CONFIG_X86_32)) {
+ -		mc	= (struct microcode_amd *)__pa_nodebug(amd_ucode_patch);
+ -		new_rev = (u32 *)__pa_nodebug(&ucode_new_rev);
+ -	} else {
+ -		mc	= (struct microcode_amd *)amd_ucode_patch;
+ -		new_rev = &ucode_new_rev;
+ -	}
+ +	/* Exit if called on the BSP. */
+ +	if (!cpu)
+ +		return;
+  
+ -	native_rdmsr(MSR_AMD64_PATCH_LEVEL, rev, dummy);
+ +	if (!container)
+ +		return;
+  
+ -	/* Check whether we have saved a new patch already: */
+ -	if (*new_rev && rev < mc->hdr.patch_id) {
+ -		if (!__apply_microcode_amd(mc)) {
+ -			*new_rev = mc->hdr.patch_id;
+ -			return;
+ -		}
+ -	}
+ +	/*
+ +	 * 64-bit runs with paging enabled, thus early==false.
+ +	 */
+ +	if (check_current_patch_level(&rev, false))
+ +		return;
+  
+ -	__load_ucode_amd(cpuid_1_eax, &cp);
+ -	if (!(cp.data && cp.size))
+ +	/* Add CONFIG_RANDOMIZE_MEMORY offset. */
+ +	if (!ucode_builtin)
+ +		cont += PAGE_OFFSET - __PAGE_OFFSET_BASE;
+ +
+ +	eax = cpuid_eax(0x00000001);
+ +	eq  = (struct equiv_cpu_entry *)(cont + CONTAINER_HDR_SZ);
+ +
+ +	eq_id = find_equiv_id(eq, eax);
+ +	if (!eq_id)
+  		return;
+  
+ -	apply_microcode_early_amd(cpuid_1_eax, cp.data, cp.size, false);
+ -}
+ +	if (eq_id == this_equiv_id) {
+ +		mc = (struct microcode_amd *)amd_ucode_patch;
+  
+ -static enum ucode_state
+ -load_microcode_amd(bool save, u8 family, const u8 *data, size_t size);
+ +		if (mc && rev < mc->hdr.patch_id) {
+ +			if (!__apply_microcode_amd(mc))
+ +				ucode_new_rev = mc->hdr.patch_id;
+ +		}
+  
+ -int __init save_microcode_in_initrd_amd(unsigned int cpuid_1_eax)
+ +	} else {
+ +		if (!ucode_cpio.data)
+ +			return;
+ +
+ +		/*
+ +		 * AP has a different equivalence ID than BSP, looks like
+ +		 * mixed-steppings silicon so go through the ucode blob anew.
+ +		 */
+ +		apply_ucode_in_initrd(ucode_cpio.data, ucode_cpio.size, false);
+ +	}
+ +}
+ +#endif
+ +
+ +int __init save_microcode_in_initrd_amd(void)
+  {
+ -	struct cont_desc desc = { 0 };
+ +	unsigned long cont;
+ +	int retval = 0;
+  	enum ucode_state ret;
+ -	struct cpio_data cp;
+ +	u8 *cont_va;
+ +	u32 eax;
+  
+ -	cp = find_microcode_in_initrd(ucode_path, false);
+ -	if (!(cp.data && cp.size))
+ +	if (!container)
+  		return -EINVAL;
+  
+ -	desc.cpuid_1_eax = cpuid_1_eax;
+ -
+ -	scan_containers(cp.data, cp.size, &desc);
+ -	if (!desc.mc)
+ -		return -EINVAL;
+ +#ifdef CONFIG_X86_32
+ +	get_bsp_sig();
+ +	cont	= (unsigned long)container;
+ +	cont_va = __va(container);
+ +#else
+ +	/*
+ +	 * We need the physical address of the container for both bitness since
+ +	 * boot_params.hdr.ramdisk_image is a physical address.
+ +	 */
+ +	cont    = __pa(container);
+ +	cont_va = container;
+ +#endif
+  
+ +	/*
+ +	 * Take into account the fact that the ramdisk might get relocated and
+ +	 * therefore we need to recompute the container's position in virtual
+ +	 * memory space.
+ +	 */
+ +	if (relocated_ramdisk)
+ +		container = (u8 *)(__va(relocated_ramdisk) +
+ +			     (cont - boot_params.hdr.ramdisk_image));
+ +	else
+ +		container = cont_va;
+ +
+++<<<<<<< HEAD
+ +	/* Add CONFIG_RANDOMIZE_MEMORY offset. */
+ +	if (!ucode_builtin)
+ +		container += PAGE_OFFSET - __PAGE_OFFSET_BASE;
+ +
+ +	eax   = cpuid_eax(0x00000001);
+ +	eax   = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+ +
+ +	ret = load_microcode_amd(smp_processor_id(), eax, container, container_size);
+ +	if (ret != UCODE_OK)
+ +		retval = -EINVAL;
+++=======
++ 	ret = load_microcode_amd(true, x86_family(cpuid_1_eax), desc.data, desc.size);
++ 	if (ret > UCODE_UPDATED)
++ 		return -EINVAL;
+++>>>>>>> 2613f36ed965 (x86/microcode: Attempt late loading only when new microcode is present)
+  
+ -	return 0;
+ +	/*
+ +	 * This will be freed any msec now, stash patches for the current
+ +	 * family and switch to patch cache for cpu hotplug, etc later.
+ +	 */
+ +	container = NULL;
+ +	container_size = 0;
+ +
+ +	return retval;
+  }
+  
+  void reload_ucode_amd(void)
+@@@ -865,29 -680,38 +871,50 @@@ static enum ucode_state __load_microcod
+  	return UCODE_OK;
+  }
+  
+ -static enum ucode_state
+ -load_microcode_amd(bool save, u8 family, const u8 *data, size_t size)
+ +enum ucode_state load_microcode_amd(int cpu, u8 family, const u8 *data, size_t size)
+  {
++ 	struct ucode_patch *p;
+  	enum ucode_state ret;
+  
+  	/* free old equiv table */
+  	free_equiv_cpu_table();
+  
+  	ret = __load_microcode_amd(family, data, size);
+- 
+- 	if (ret != UCODE_OK)
++ 	if (ret != UCODE_OK) {
+  		cleanup();
+++<<<<<<< HEAD
+ +
+ +#ifdef CONFIG_X86_32
+ +	/* save BSP's matching patch for early load */
+ +	if (cpu_data(cpu).cpu_index == boot_cpu_data.cpu_index) {
+ +		struct ucode_patch *p = find_patch(cpu);
+ +		if (p) {
+ +			memset(amd_ucode_patch, 0, PATCH_MAX_SIZE);
+ +			memcpy(amd_ucode_patch, p->data, min_t(u32, ksize(p->data),
+ +							       PATCH_MAX_SIZE));
+ +		}
+++=======
++ 		return ret;
+++>>>>>>> 2613f36ed965 (x86/microcode: Attempt late loading only when new microcode is present)
+  	}
+- #endif
++ 
++ 	p = find_patch(0);
++ 	if (!p) {
++ 		return ret;
++ 	} else {
++ 		if (boot_cpu_data.microcode == p->patch_id)
++ 			return ret;
++ 
++ 		ret = UCODE_NEW;
++ 	}
++ 
++ 	/* save BSP's matching patch for early load */
++ 	if (!save)
++ 		return ret;
++ 
++ 	memset(amd_ucode_patch, 0, PATCH_MAX_SIZE);
++ 	memcpy(amd_ucode_patch, p->data, min_t(u32, ksize(p->data), PATCH_MAX_SIZE));
++ 
+  	return ret;
+  }
+  
+diff --cc arch/x86/kernel/cpu/microcode/core.c
+index 1b81185d9250,9f0fe5bb450d..000000000000
+--- a/arch/x86/kernel/cpu/microcode/core.c
++++ b/arch/x86/kernel/cpu/microcode/core.c
+@@@ -402,25 -606,24 +402,32 @@@ static ssize_t reload_store(struct devi
+  	if (val != 1)
+  		return size;
+  
+++<<<<<<< HEAD
+++=======
++ 	tmp_ret = microcode_ops->request_microcode_fw(bsp, &microcode_pdev->dev, true);
++ 	if (tmp_ret != UCODE_NEW)
++ 		return size;
++ 
+++>>>>>>> 2613f36ed965 (x86/microcode: Attempt late loading only when new microcode is present)
+  	get_online_cpus();
+ -
+ -	ret = check_online_cpus();
+ -	if (ret)
+ -		goto put;
+ -
+  	mutex_lock(&microcode_mutex);
+ -	ret = microcode_reload_late();
+ -	mutex_unlock(&microcode_mutex);
+ +	for_each_online_cpu(cpu) {
+ +		tmp_ret = reload_for_cpu(cpu);
+ +		if (tmp_ret != 0)
+ +			pr_warn("Error reloading microcode on CPU %d\n", cpu);
+  
+ -put:
+ +		/* save retval of the first encountered reload error */
+ +		if (!ret)
+ +			ret = tmp_ret;
+ +	}
+ +	if (!ret) {
+ +		perf_check_microcode();
+ +		spec_ctrl_rescan_cpuid();
+ +	}
+ +	mutex_unlock(&microcode_mutex);
+  	put_online_cpus();
+  
+ -	if (ret >= 0)
+ +	if (!ret)
+  		ret = size;
+  
+  	return ret;
+* Unmerged path arch/x86/include/asm/microcode.h
+* Unmerged path arch/x86/kernel/cpu/microcode/amd.c
+* Unmerged path arch/x86/kernel/cpu/microcode/core.c
+diff --git a/arch/x86/kernel/cpu/microcode/intel.c b/arch/x86/kernel/cpu/microcode/intel.c
+index c7e50a8f4783..d79c8d5bb863 100644
+--- a/arch/x86/kernel/cpu/microcode/intel.c
++++ b/arch/x86/kernel/cpu/microcode/intel.c
+@@ -968,6 +968,7 @@ static enum ucode_state generic_load_microcode(int cpu, void *data, size_t size,
+ 	unsigned int leftover = size;
+ 	unsigned int curr_mc_size = 0;
+ 	unsigned int csig, cpf;
++	enum ucode_state ret = UCODE_OK;
+ 
+ 	while (leftover) {
+ 		struct microcode_header_intel mc_header;
+@@ -1008,6 +1009,7 @@ static enum ucode_state generic_load_microcode(int cpu, void *data, size_t size,
+ 			new_rev = mc_header.rev;
+ 			new_mc  = mc;
+ 			mc = NULL;	/* trigger new vmalloc */
++			ret = UCODE_NEW;
+ 		}
+ 
+ 		ucode_ptr += mc_size;
+@@ -1037,7 +1039,7 @@ static enum ucode_state generic_load_microcode(int cpu, void *data, size_t size,
+ 	pr_debug("CPU%d found a matching microcode update with version 0x%x (current=0x%x)\n",
+ 		 cpu, new_rev, uci->cpu_sig.rev);
+ 
+-	return UCODE_OK;
++	return ret;
+ }
+ 
+ static int get_ucode_fw(void *to, const void *from, size_t n)
