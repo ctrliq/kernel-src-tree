@@ -1,0 +1,100 @@
+mmc: card: do away with indirection pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mmc] card: do away with indirection pointer (Don Zickus) [1430497]
+Rebuild_FUZZ: 93.83%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 29eb7bd01e80df316ab9d1da1a4ee580fae89188
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/29eb7bd0.failed
+
+We have enough vtables in the kernel as it is, we don't need
+this one to create even more artificial separation of concerns.
+
+As is proved by the Makefile:
+
+obj-$(CONFIG_MMC_BLOCK)         += mmc_block.o
+mmc_block-objs                  := block.o queue.o
+
+block.c and queue.c are baked into the same mmc_block.o object.
+So why would one of these objects access a function in the
+other object by dereferencing a pointer?
+
+Create a new block.h header file for the single shared function
+from block to queue and remove the function pointer and just
+call the queue request function.
+
+Apart from making the code more readable, this also makes link
+optimizations possible and probably speeds up the call as well.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 29eb7bd01e80df316ab9d1da1a4ee580fae89188)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/card/queue.c
+diff --cc drivers/mmc/card/queue.c
+index d747d14ee4c1,8037f73a109a..000000000000
+--- a/drivers/mmc/card/queue.c
++++ b/drivers/mmc/card/queue.c
+@@@ -64,9 -67,10 +66,13 @@@ static int mmc_queue_thread(void *d
+  		spin_unlock_irq(q->queue_lock);
+  
+  		if (req || mq->mqrq_prev->req) {
+ -			bool req_is_special = mmc_req_is_special(req);
+ -
+  			set_current_state(TASK_RUNNING);
+++<<<<<<< HEAD
+ +			cmd_flags = req ? req->cmd_flags : 0;
+ +			mq->issue_fn(mq, req);
+++=======
++ 			mmc_blk_issue_rq(mq, req);
+++>>>>>>> 29eb7bd01e80 (mmc: card: do away with indirection pointer)
+  			cond_resched();
+  			if (mq->flags & MMC_QUEUE_NEW_REQUEST) {
+  				mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index faf851088ee5..4e53a47ac5c1 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -2142,7 +2142,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+ 	return 0;
+ }
+ 
+-static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
++int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ {
+ 	int ret;
+ 	struct mmc_blk_data *md = mq->data;
+@@ -2262,7 +2262,6 @@ again:
+ 	if (ret)
+ 		goto err_putdisk;
+ 
+-	md->queue.issue_fn = mmc_blk_issue_rq;
+ 	md->queue.data = md;
+ 
+ 	md->disk->major	= MMC_BLOCK_MAJOR;
+diff --git a/drivers/mmc/card/block.h b/drivers/mmc/card/block.h
+new file mode 100644
+index 000000000000..cdabb2ee74be
+--- /dev/null
++++ b/drivers/mmc/card/block.h
+@@ -0,0 +1 @@
++int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req);
+* Unmerged path drivers/mmc/card/queue.c
+diff --git a/drivers/mmc/card/queue.h b/drivers/mmc/card/queue.h
+index 36cddab57d77..14b550b484e3 100644
+--- a/drivers/mmc/card/queue.h
++++ b/drivers/mmc/card/queue.h
+@@ -51,8 +51,6 @@ struct mmc_queue {
+ 	unsigned int		flags;
+ #define MMC_QUEUE_SUSPENDED	(1 << 0)
+ #define MMC_QUEUE_NEW_REQUEST	(1 << 1)
+-
+-	int			(*issue_fn)(struct mmc_queue *, struct request *);
+ 	void			*data;
+ 	struct request_queue	*queue;
+ 	struct mmc_queue_req	mqrq[2];
