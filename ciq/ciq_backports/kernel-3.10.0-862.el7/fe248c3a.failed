@@ -1,0 +1,426 @@
+IB/mlx5: Add delay drop configuration and statistics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit fe248c3a5837848717ed566fb4aefe66f43a5e53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fe248c3a.failed
+
+Add debugfs interface for monitor the number of delay drop timeout
+events and the number of existing dropless RQs in the system.
+
+In addition add debugfs interface for configuring the global timeout value
+which is used in the SET_DELAY_DROP command.
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit fe248c3a5837848717ed566fb4aefe66f43a5e53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 6fac05a1178c,7455f95bf679..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2588,6 -2757,26 +2589,29 @@@ static void mlx5_ib_handle_internal_err
+  	spin_unlock_irqrestore(&ibdev->reset_flow_resource_lock, flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void delay_drop_handler(struct work_struct *work)
++ {
++ 	int err;
++ 	struct mlx5_ib_delay_drop *delay_drop =
++ 		container_of(work, struct mlx5_ib_delay_drop,
++ 			     delay_drop_work);
++ 
++ 	atomic_inc(&delay_drop->events_cnt);
++ 
++ 	mutex_lock(&delay_drop->lock);
++ 	err = mlx5_core_set_delay_drop(delay_drop->dev->mdev,
++ 				       delay_drop->timeout);
++ 	if (err) {
++ 		mlx5_ib_warn(delay_drop->dev, "Failed to set delay drop, timeout=%u\n",
++ 			     delay_drop->timeout);
++ 		delay_drop->activate = false;
++ 	}
++ 	mutex_unlock(&delay_drop->lock);
++ }
++ 
+++>>>>>>> fe248c3a5837 (IB/mlx5: Add delay drop configuration and statistics)
+  static void mlx5_ib_event(struct mlx5_core_dev *dev, void *context,
+  			  enum mlx5_dev_event event, unsigned long param)
+  {
+@@@ -3270,6 -3527,253 +3294,256 @@@ dealloc_counters
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rdma_hw_stats *mlx5_ib_alloc_hw_stats(struct ib_device *ibdev,
++ 						    u8 port_num)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 
++ 	/* We support only per port stats */
++ 	if (port_num == 0)
++ 		return NULL;
++ 
++ 	return rdma_alloc_hw_stats_struct(port->cnts.names,
++ 					  port->cnts.num_q_counters +
++ 					  port->cnts.num_cong_counters,
++ 					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
++ }
++ 
++ static int mlx5_ib_query_q_counters(struct mlx5_ib_dev *dev,
++ 				    struct mlx5_ib_port *port,
++ 				    struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_q_counter_out);
++ 	void *out;
++ 	__be32 val;
++ 	int ret, i;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_core_query_q_counter(dev->mdev,
++ 					port->cnts.set_id, 0,
++ 					out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_q_counters; i++) {
++ 		val = *(__be32 *)(out + port->cnts.offsets[i]);
++ 		stats->value[i] = (u64)be32_to_cpu(val);
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_query_cong_counters(struct mlx5_ib_dev *dev,
++ 				       struct mlx5_ib_port *port,
++ 				       struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_cong_statistics_out);
++ 	void *out;
++ 	int ret, i;
++ 	int offset = port->cnts.num_q_counters;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_cmd_query_cong_counter(dev->mdev, false, out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_cong_counters; i++) {
++ 		stats->value[i + offset] =
++ 			be64_to_cpup((__be64 *)(out +
++ 				     port->cnts.offsets[i + offset]));
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
++ 				struct rdma_hw_stats *stats,
++ 				u8 port_num, int index)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 	int ret, num_counters;
++ 
++ 	if (!stats)
++ 		return -EINVAL;
++ 
++ 	ret = mlx5_ib_query_q_counters(dev, port, stats);
++ 	if (ret)
++ 		return ret;
++ 	num_counters = port->cnts.num_q_counters;
++ 
++ 	if (MLX5_CAP_GEN(dev->mdev, cc_query_allowed)) {
++ 		ret = mlx5_ib_query_cong_counters(dev, port, stats);
++ 		if (ret)
++ 			return ret;
++ 		num_counters += port->cnts.num_cong_counters;
++ 	}
++ 
++ 	return num_counters;
++ }
++ 
++ static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
++ {
++ 	return mlx5_rdma_netdev_free(netdev);
++ }
++ 
++ static struct net_device*
++ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
++ 			  u8 port_num,
++ 			  enum rdma_netdev_t type,
++ 			  const char *name,
++ 			  unsigned char name_assign_type,
++ 			  void (*setup)(struct net_device *))
++ {
++ 	struct net_device *netdev;
++ 	struct rdma_netdev *rn;
++ 
++ 	if (type != RDMA_NETDEV_IPOIB)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	netdev = mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
++ 					name, setup);
++ 	if (likely(!IS_ERR_OR_NULL(netdev))) {
++ 		rn = netdev_priv(netdev);
++ 		rn->free_rdma_netdev = mlx5_ib_free_rdma_netdev;
++ 	}
++ 	return netdev;
++ }
++ 
++ static void delay_drop_debugfs_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	if (!dev->delay_drop.dbg)
++ 		return;
++ 	debugfs_remove_recursive(dev->delay_drop.dbg->dir_debugfs);
++ 	kfree(dev->delay_drop.dbg);
++ 	dev->delay_drop.dbg = NULL;
++ }
++ 
++ static void cancel_delay_drop(struct mlx5_ib_dev *dev)
++ {
++ 	if (!(dev->ib_dev.attrs.raw_packet_caps & IB_RAW_PACKET_CAP_DELAY_DROP))
++ 		return;
++ 
++ 	cancel_work_sync(&dev->delay_drop.delay_drop_work);
++ 	delay_drop_debugfs_cleanup(dev);
++ }
++ 
++ static ssize_t delay_drop_timeout_read(struct file *filp, char __user *buf,
++ 				       size_t count, loff_t *pos)
++ {
++ 	struct mlx5_ib_delay_drop *delay_drop = filp->private_data;
++ 	char lbuf[20];
++ 	int len;
++ 
++ 	len = snprintf(lbuf, sizeof(lbuf), "%u\n", delay_drop->timeout);
++ 	return simple_read_from_buffer(buf, count, pos, lbuf, len);
++ }
++ 
++ static ssize_t delay_drop_timeout_write(struct file *filp, const char __user *buf,
++ 					size_t count, loff_t *pos)
++ {
++ 	struct mlx5_ib_delay_drop *delay_drop = filp->private_data;
++ 	u32 timeout;
++ 	u32 var;
++ 
++ 	if (kstrtouint_from_user(buf, count, 0, &var))
++ 		return -EFAULT;
++ 
++ 	timeout = min_t(u32, roundup(var, 100), MLX5_MAX_DELAY_DROP_TIMEOUT_MS *
++ 			1000);
++ 	if (timeout != var)
++ 		mlx5_ib_dbg(delay_drop->dev, "Round delay drop timeout to %u usec\n",
++ 			    timeout);
++ 
++ 	delay_drop->timeout = timeout;
++ 
++ 	return count;
++ }
++ 
++ static const struct file_operations fops_delay_drop_timeout = {
++ 	.owner	= THIS_MODULE,
++ 	.open	= simple_open,
++ 	.write	= delay_drop_timeout_write,
++ 	.read	= delay_drop_timeout_read,
++ };
++ 
++ static int delay_drop_debugfs_init(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_ib_dbg_delay_drop *dbg;
++ 
++ 	if (!mlx5_debugfs_root)
++ 		return 0;
++ 
++ 	dbg = kzalloc(sizeof(*dbg), GFP_KERNEL);
++ 	if (!dbg)
++ 		return -ENOMEM;
++ 
++ 	dbg->dir_debugfs =
++ 		debugfs_create_dir("delay_drop",
++ 				   dev->mdev->priv.dbg_root);
++ 	if (!dbg->dir_debugfs)
++ 		return -ENOMEM;
++ 
++ 	dbg->events_cnt_debugfs =
++ 		debugfs_create_atomic_t("num_timeout_events", 0400,
++ 					dbg->dir_debugfs,
++ 					&dev->delay_drop.events_cnt);
++ 	if (!dbg->events_cnt_debugfs)
++ 		goto out_debugfs;
++ 
++ 	dbg->rqs_cnt_debugfs =
++ 		debugfs_create_atomic_t("num_rqs", 0400,
++ 					dbg->dir_debugfs,
++ 					&dev->delay_drop.rqs_cnt);
++ 	if (!dbg->rqs_cnt_debugfs)
++ 		goto out_debugfs;
++ 
++ 	dbg->timeout_debugfs =
++ 		debugfs_create_file("timeout", 0600,
++ 				    dbg->dir_debugfs,
++ 				    &dev->delay_drop,
++ 				    &fops_delay_drop_timeout);
++ 	if (!dbg->timeout_debugfs)
++ 		goto out_debugfs;
++ 
++ 	return 0;
++ 
++ out_debugfs:
++ 	delay_drop_debugfs_cleanup(dev);
++ 	return -ENOMEM;
++ }
++ 
++ static void init_delay_drop(struct mlx5_ib_dev *dev)
++ {
++ 	if (!(dev->ib_dev.attrs.raw_packet_caps & IB_RAW_PACKET_CAP_DELAY_DROP))
++ 		return;
++ 
++ 	mutex_init(&dev->delay_drop.lock);
++ 	dev->delay_drop.dev = dev;
++ 	dev->delay_drop.activate = false;
++ 	dev->delay_drop.timeout = MLX5_MAX_DELAY_DROP_TIMEOUT_MS * 1000;
++ 	INIT_WORK(&dev->delay_drop.delay_drop_work, delay_drop_handler);
++ 	atomic_set(&dev->delay_drop.rqs_cnt, 0);
++ 	atomic_set(&dev->delay_drop.events_cnt, 0);
++ 
++ 	if (delay_drop_debugfs_init(dev))
++ 		mlx5_ib_warn(dev, "Failed to init delay drop debugfs\n");
++ }
++ 
+++>>>>>>> fe248c3a5837 (IB/mlx5: Add delay drop configuration and statistics)
+  static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+  {
+  	struct mlx5_ib_dev *dev;
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 83418c5208ab,0316147a39a8..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -620,6 -624,62 +620,65 @@@ struct mlx5_roce 
+  	enum ib_port_state last_port_state;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ib_dbg_param {
++ 	int			offset;
++ 	struct mlx5_ib_dev	*dev;
++ 	struct dentry		*dentry;
++ };
++ 
++ enum mlx5_ib_dbg_cc_types {
++ 	MLX5_IB_DBG_CC_RP_CLAMP_TGT_RATE,
++ 	MLX5_IB_DBG_CC_RP_CLAMP_TGT_RATE_ATI,
++ 	MLX5_IB_DBG_CC_RP_TIME_RESET,
++ 	MLX5_IB_DBG_CC_RP_BYTE_RESET,
++ 	MLX5_IB_DBG_CC_RP_THRESHOLD,
++ 	MLX5_IB_DBG_CC_RP_AI_RATE,
++ 	MLX5_IB_DBG_CC_RP_HAI_RATE,
++ 	MLX5_IB_DBG_CC_RP_MIN_DEC_FAC,
++ 	MLX5_IB_DBG_CC_RP_MIN_RATE,
++ 	MLX5_IB_DBG_CC_RP_RATE_TO_SET_ON_FIRST_CNP,
++ 	MLX5_IB_DBG_CC_RP_DCE_TCP_G,
++ 	MLX5_IB_DBG_CC_RP_DCE_TCP_RTT,
++ 	MLX5_IB_DBG_CC_RP_RATE_REDUCE_MONITOR_PERIOD,
++ 	MLX5_IB_DBG_CC_RP_INITIAL_ALPHA_VALUE,
++ 	MLX5_IB_DBG_CC_RP_GD,
++ 	MLX5_IB_DBG_CC_NP_CNP_DSCP,
++ 	MLX5_IB_DBG_CC_NP_CNP_PRIO_MODE,
++ 	MLX5_IB_DBG_CC_NP_CNP_PRIO,
++ 	MLX5_IB_DBG_CC_MAX,
++ };
++ 
++ struct mlx5_ib_dbg_cc_params {
++ 	struct dentry			*root;
++ 	struct mlx5_ib_dbg_param	params[MLX5_IB_DBG_CC_MAX];
++ };
++ 
++ enum {
++ 	MLX5_MAX_DELAY_DROP_TIMEOUT_MS = 100,
++ };
++ 
++ struct mlx5_ib_dbg_delay_drop {
++ 	struct dentry		*dir_debugfs;
++ 	struct dentry		*rqs_cnt_debugfs;
++ 	struct dentry		*events_cnt_debugfs;
++ 	struct dentry		*timeout_debugfs;
++ };
++ 
++ struct mlx5_ib_delay_drop {
++ 	struct mlx5_ib_dev     *dev;
++ 	struct work_struct	delay_drop_work;
++ 	/* serialize setting of delay drop */
++ 	struct mutex		lock;
++ 	u32			timeout;
++ 	bool			activate;
++ 	atomic_t		events_cnt;
++ 	atomic_t		rqs_cnt;
++ 	struct mlx5_ib_dbg_delay_drop *dbg;
++ };
++ 
+++>>>>>>> fe248c3a5837 (IB/mlx5: Add delay drop configuration and statistics)
+  struct mlx5_ib_dev {
+  	struct ib_device		ib_dev;
+  	struct mlx5_core_dev		*mdev;
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 50a7f77d9dee,c5d8ec839e99..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -4688,6 -4601,27 +4692,30 @@@ static void mlx5_ib_wq_event(struct mlx
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int set_delay_drop(struct mlx5_ib_dev *dev)
++ {
++ 	int err = 0;
++ 
++ 	mutex_lock(&dev->delay_drop.lock);
++ 	if (dev->delay_drop.activate)
++ 		goto out;
++ 
++ 	err = mlx5_core_set_delay_drop(dev->mdev, dev->delay_drop.timeout);
++ 	if (err)
++ 		goto out;
++ 
++ 	dev->delay_drop.activate = true;
++ out:
++ 	mutex_unlock(&dev->delay_drop.lock);
++ 
++ 	if (!err)
++ 		atomic_inc(&dev->delay_drop.rqs_cnt);
++ 	return err;
++ }
++ 
+++>>>>>>> fe248c3a5837 (IB/mlx5: Add delay drop configuration and statistics)
+  static int  create_rq(struct mlx5_ib_rwq *rwq, struct ib_pd *pd,
+  		      struct ib_wq_init_attr *init_attr)
+  {
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
