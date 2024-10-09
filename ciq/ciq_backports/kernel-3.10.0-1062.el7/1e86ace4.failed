@@ -1,0 +1,125 @@
+net/mlx5: EQ, Use the right place to store/read IRQ affinity hint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: EQ, Use the right place to store/read IRQ affinity hint (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.83%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 1e86ace4c140fd5a693e266c9b23409358f25381
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1e86ace4.failed
+
+Currently the cpu affinity hint mask for completion EQs is stored and
+read from the wrong place, since reading and storing is done from the
+same index, there is no actual issue with that, but internal irq_info
+for completion EQs stars at MLX5_EQ_VEC_COMP_BASE offset in irq_info
+array, this patch changes the code to use the correct offset to store
+and read the IRQ affinity hint.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 1e86ace4c140fd5a693e266c9b23409358f25381)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mlx5/driver.h
+diff --cc include/linux/mlx5/driver.h
+index 0cfe53d806a7,7d4ed995b4ce..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -1281,30 -1307,9 +1281,34 @@@ enum 
+  };
+  
+  static inline const struct cpumask *
+ -mlx5_get_vector_affinity_hint(struct mlx5_core_dev *dev, int vector)
+ +mlx5_get_vector_affinity(struct mlx5_core_dev *dev, int vector)
+  {
+++<<<<<<< HEAD
+ +/* calling irq_to_desc will result to undefinded irq_desc symbol */
+ +#ifndef CONFIG_GENERIC_HARDIRQS
+ +	return cpu_possible_mask;
+ +#else
+ +	const struct cpumask *mask;
+ +	struct irq_desc *desc;
+ +	unsigned int irq;
+ +	int eqn;
+ +	int err;
+ +
+ +	err = mlx5_vector2eqn(dev, MLX5_EQ_VEC_COMP_BASE + vector, &eqn, &irq);
+ +	if (err)
+ +		return NULL;
+ +
+ +	desc = irq_to_desc(irq);
+ +#ifdef CONFIG_GENERIC_IRQ_EFFECTIVE_AFF_MASK
+ +	mask = irq_data_get_effective_affinity_mask(&desc->irq_data);
+ +#else
+ +	mask = desc->irq_data.affinity;
+ +#endif
+ +	return mask;
+ +#endif
+++=======
++ 	return dev->priv.irq_info[vector + MLX5_EQ_VEC_COMP_BASE].mask;
+++>>>>>>> 1e86ace4c140 (net/mlx5: EQ, Use the right place to store/read IRQ affinity hint)
+  }
+  
+  #endif /* MLX5_DRIVER_H */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 48dde39aa588..53af899bcfc9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1477,7 +1477,7 @@ static void mlx5e_close_cq(struct mlx5e_cq *cq)
+ 
+ static int mlx5e_get_cpu(struct mlx5e_priv *priv, int ix)
+ {
+-	return cpumask_first(priv->mdev->priv.irq_info[ix].mask);
++	return cpumask_first(priv->mdev->priv.irq_info[ix + MLX5_EQ_VEC_COMP_BASE].mask);
+ }
+ 
+ static int mlx5e_open_tx_cqs(struct mlx5e_channel *c,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index cf33ab5b3cb8..da9c839f4fdb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -636,18 +636,19 @@ u64 mlx5_read_internal_timer(struct mlx5_core_dev *dev)
+ static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
+ {
+ 	struct mlx5_priv *priv  = &mdev->priv;
+-	int irq = pci_irq_vector(mdev->pdev, MLX5_EQ_VEC_COMP_BASE + i);
++	int vecidx = MLX5_EQ_VEC_COMP_BASE + i;
++	int irq = pci_irq_vector(mdev->pdev, vecidx);
+ 
+-	if (!zalloc_cpumask_var(&priv->irq_info[i].mask, GFP_KERNEL)) {
++	if (!zalloc_cpumask_var(&priv->irq_info[vecidx].mask, GFP_KERNEL)) {
+ 		mlx5_core_warn(mdev, "zalloc_cpumask_var failed");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	cpumask_set_cpu(cpumask_local_spread(i, priv->numa_node),
+-			priv->irq_info[i].mask);
++			priv->irq_info[vecidx].mask);
+ 
+ 	if (IS_ENABLED(CONFIG_SMP) &&
+-	    irq_set_affinity_hint(irq, priv->irq_info[i].mask))
++	    irq_set_affinity_hint(irq, priv->irq_info[vecidx].mask))
+ 		mlx5_core_warn(mdev, "irq_set_affinity_hint failed, irq 0x%.4x", irq);
+ 
+ 	return 0;
+@@ -655,11 +656,12 @@ static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
+ 
+ static void mlx5_irq_clear_affinity_hint(struct mlx5_core_dev *mdev, int i)
+ {
++	int vecidx = MLX5_EQ_VEC_COMP_BASE + i;
+ 	struct mlx5_priv *priv  = &mdev->priv;
+-	int irq = pci_irq_vector(mdev->pdev, MLX5_EQ_VEC_COMP_BASE + i);
++	int irq = pci_irq_vector(mdev->pdev, vecidx);
+ 
+ 	irq_set_affinity_hint(irq, NULL);
+-	free_cpumask_var(priv->irq_info[i].mask);
++	free_cpumask_var(priv->irq_info[vecidx].mask);
+ }
+ 
+ static int mlx5_irq_set_affinity_hints(struct mlx5_core_dev *mdev)
+* Unmerged path include/linux/mlx5/driver.h
