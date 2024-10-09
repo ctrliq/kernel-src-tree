@@ -1,0 +1,688 @@
+net/mlx5e: Move XDP related code into new XDP files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Move XDP related code into new XDP files (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.92%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 159d21313423b5ffe301834273cba79e915c65ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/159d2131.failed
+
+Take XDP code out of the general EN header and RX file into
+new XDP files.
+
+Currently, XDP-SQ resides only within an RQ and used from a
+single flow (XDP_TX) triggered upon RX completions.
+In a downstream patch, additional type of XDP-SQ instances will be
+presented and used for the XDP_REDIRECT flow, totally unrelated to
+the RX context.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 159d21313423b5ffe301834273cba79e915c65ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 7500fab9286b,ae2bdcb1647c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -13,8 -14,8 +13,13 @@@ mlx5_core-$(CONFIG_MLX5_FPGA) += fpga/c
+  		fpga/ipsec.o fpga/tls.o
+  
+  mlx5_core-$(CONFIG_MLX5_CORE_EN) += en_main.o en_common.o en_fs.o en_ethtool.o \
+++<<<<<<< HEAD
+ +		en_tx.o en_rx.o en_dim.o en_txrx.o en_stats.o vxlan.o \
+ +		en_arfs.o en_fs_ethtool.o en_selftest.o
+++=======
++ 		en_tx.o en_rx.o en_dim.o en_txrx.o en/xdp.o en_stats.o vxlan.o \
++ 		en_arfs.o en_fs_ethtool.o en_selftest.o en/port.o
+++>>>>>>> 159d21313423 (net/mlx5e: Move XDP related code into new XDP files)
+  
+  mlx5_core-$(CONFIG_MLX5_MPFS) += lib/mpfs.o
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 6cb0654a5d0a,dd5eec923766..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -52,6 -46,8 +52,11 @@@
+  #include "accel/ipsec.h"
+  #include "accel/tls.h"
+  #include "vxlan.h"
+++<<<<<<< HEAD
+++=======
++ #include "en/port.h"
++ #include "en/xdp.h"
+++>>>>>>> 159d21313423 (net/mlx5e: Move XDP related code into new XDP files)
+  
+  struct mlx5e_rq_param {
+  	u32			rqc[MLX5_ST_SZ_DW(rqc)];
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 3631c4f3022b,70b984c4e8a4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -34,16 -34,18 +34,16 @@@
+  #include <linux/ip.h>
+  #include <linux/ipv6.h>
+  #include <linux/tcp.h>
+- #include <linux/bpf_trace.h>
+  #include <net/busy_poll.h>
+  #include <net/ip6_checksum.h>
+ -#include <net/page_pool.h>
+  #include "en.h"
+  #include "en_tc.h"
+  #include "eswitch.h"
+  #include "en_rep.h"
+  #include "ipoib/ipoib.h"
+  #include "en_accel/ipsec_rxtx.h"
+ -#include "en_accel/tls_rxtx.h"
+  #include "lib/clock.h"
++ #include "en/xdp.h"
+  
+  static inline bool mlx5e_rx_hw_stamp(struct hwtstamp_config *config)
+  {
+@@@ -238,11 -239,9 +238,10 @@@ static inline int mlx5e_page_alloc_mapp
+  	return 0;
+  }
+  
+- static void mlx5e_page_dma_unmap(struct mlx5e_rq *rq,
+- 					struct mlx5e_dma_info *dma_info)
++ void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info)
+  {
+ -	dma_unmap_page(rq->pdev, dma_info->addr, PAGE_SIZE, rq->buff.map_dir);
+ +	dma_unmap_page(rq->pdev, dma_info->addr, RQ_PAGE_SIZE(rq),
+ +		       rq->buff.map_dir);
+  }
+  
+  void mlx5e_page_release(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info,
+@@@ -748,138 -849,29 +747,141 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+ -static inline
+ -struct sk_buff *mlx5e_build_linear_skb(struct mlx5e_rq *rq, void *va,
+ -				       u32 frag_size, u16 headroom,
+ -				       u32 cqe_bcnt)
+++<<<<<<< HEAD
+ +static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+  {
+ -	struct sk_buff *skb = build_skb(va, frag_size);
+ +	struct mlx5_wq_cyc *wq = &sq->wq;
+ +	struct mlx5e_tx_wqe *wqe;
+ +	u16 pi = (sq->pc - 1) & wq->sz_m1; /* last pi */
+  
+ -	if (unlikely(!skb)) {
+ -		rq->stats->buff_alloc_err++;
+ -		return NULL;
+ +	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+ +
+ +	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
+ +}
+ +
+ +static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
+ +					struct mlx5e_dma_info *di,
+ +					const struct xdp_buff *xdp)
+ +{
+ +	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
+ +	struct mlx5_wq_cyc       *wq   = &sq->wq;
+ +	u16                       pi   = sq->pc & wq->sz_m1;
+ +	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+ +
+ +	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
+ +	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
+ +	struct mlx5_wqe_data_seg *dseg;
+ +
+ +	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
+ +	dma_addr_t dma_addr  = di->addr + data_offset;
+ +	unsigned int dma_len = xdp->data_end - xdp->data;
+ +
+ +	struct mlx5e_rq_stats *stats = rq->stats;
+ +
+ +	prefetchw(wqe);
+ +
+ +	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || rq->hw_mtu < dma_len)) {
+ +		stats->xdp_drop++;
+ +		return false;
+  	}
+  
+ -	skb_reserve(skb, headroom);
+ -	skb_put(skb, cqe_bcnt);
+ +	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, 1))) {
+ +		if (sq->db.doorbell) {
+ +			/* SQ is full, ring doorbell */
+ +			mlx5e_xmit_xdp_doorbell(sq);
+ +			sq->db.doorbell = false;
+ +		}
+ +		stats->xdp_tx_full++;
+ +		return false;
+ +	}
+  
+ -	return skb;
+ +	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
+ +
+ +	cseg->fm_ce_se = 0;
+ +
+ +	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
+ +
+ +	/* copy the inline part if required */
+ +	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
+ +		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
+ +		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
+ +		dma_len  -= MLX5E_XDP_MIN_INLINE;
+ +		dma_addr += MLX5E_XDP_MIN_INLINE;
+ +		dseg++;
+ +	}
+ +
+ +	/* write the dma part */
+ +	dseg->addr       = cpu_to_be64(dma_addr);
+ +	dseg->byte_count = cpu_to_be32(dma_len);
+ +
+ +	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
+ +
+ +	/* move page to reference to sq responsibility,
+ +	 * and mark so it's not put back in page-cache.
+ +	 */
+ +	__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags); /* non-atomic */
+ +	sq->db.di[pi] = *di;
+ +	sq->pc++;
+ +
+ +	sq->db.doorbell = true;
+ +
+ +	stats->xdp_tx++;
+ +	return true;
+  }
+  
+ -struct sk_buff *
+ -mlx5e_skb_from_cqe_linear(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+ -			  struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+ +/* returns true if packet was consumed by xdp */
+ +static inline bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
+ +				    struct mlx5e_dma_info *di,
+ +				    void *va, u16 *rx_headroom, u32 *len)
+  {
+ -	struct mlx5e_dma_info *di = wi->di;
+ +	struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
+ +	struct xdp_buff xdp;
+ +	u32 act;
+ +	int err;
+ +
+ +	if (!prog)
+ +		return false;
+ +
+ +	xdp.data = va + *rx_headroom;
+ +	xdp.data_end = xdp.data + *len;
+ +	xdp.data_hard_start = va;
+ +
+ +	act = bpf_prog_run_xdp(prog, &xdp);
+ +	switch (act) {
+ +	case XDP_PASS:
+ +		*rx_headroom = xdp.data - xdp.data_hard_start;
+ +		*len = xdp.data_end - xdp.data;
+ +		return false;
+ +	case XDP_TX:
+ +		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
+ +			trace_xdp_exception(rq->netdev, prog, act);
+ +		return true;
+ +	case XDP_REDIRECT:
+ +		/* When XDP enabled then page-refcnt==1 here */
+ +		err = xdp_do_redirect(rq->netdev, &xdp, prog);
+ +		if (!err) {
+ +			__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
+ +			rq->xdpsq.db.redirect_flush = true;
+ +			mlx5e_page_dma_unmap(rq, di);
+ +		}
+ +		return true;
+ +	default:
+ +		bpf_warn_invalid_xdp_action(act);
+ +	case XDP_ABORTED:
+ +		trace_xdp_exception(rq->netdev, prog, act);
+ +	case XDP_DROP:
+ +		rq->stats->xdp_drop++;
+ +		return true;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 159d21313423 (net/mlx5e: Move XDP related code into new XDP files)
+ +static inline
+ +struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+ +			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+ +{
+ +	struct mlx5e_dma_info *di = &wi->di;
+  	u16 rx_headroom = rq->buff.headroom;
+  	struct sk_buff *skb;
+  	void *va, *data;
+@@@ -1142,80 -1219,6 +1144,83 @@@ int mlx5e_poll_rx_cq(struct mlx5e_cq *c
+  	return work_done;
+  }
+  
+++<<<<<<< HEAD
+ +bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
+ +{
+ +	struct mlx5e_xdpsq *sq;
+ +	struct mlx5_cqe64 *cqe;
+ +	struct mlx5e_rq *rq;
+ +	u16 sqcc;
+ +	int i;
+ +
+ +	sq = container_of(cq, struct mlx5e_xdpsq, cq);
+ +
+ +	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_ENABLED)))
+ +		return false;
+ +
+ +	cqe = mlx5_cqwq_get_cqe(&cq->wq);
+ +	if (!cqe)
+ +		return false;
+ +
+ +	rq = container_of(sq, struct mlx5e_rq, xdpsq);
+ +
+ +	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
+ +	 * otherwise a cq overrun may occur
+ +	 */
+ +	sqcc = sq->cc;
+ +
+ +	i = 0;
+ +	do {
+ +		u16 wqe_counter;
+ +		bool last_wqe;
+ +
+ +		mlx5_cqwq_pop(&cq->wq);
+ +
+ +		wqe_counter = be16_to_cpu(cqe->wqe_counter);
+ +
+ +		do {
+ +			struct mlx5e_dma_info *di;
+ +			u16 ci;
+ +
+ +			last_wqe = (sqcc == wqe_counter);
+ +
+ +			ci = sqcc & sq->wq.sz_m1;
+ +			di = &sq->db.di[ci];
+ +
+ +			sqcc++;
+ +			/* Recycle RX page */
+ +			mlx5e_page_release(rq, di, true);
+ +		} while (!last_wqe);
+ +	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
+ +
+ +	rq->stats->xdp_tx_cqe += i;
+ +
+ +	mlx5_cqwq_update_db_record(&cq->wq);
+ +
+ +	/* ensure cq space is freed before enabling more cqes */
+ +	wmb();
+ +
+ +	sq->cc = sqcc;
+ +	return (i == MLX5E_TX_CQ_POLL_BUDGET);
+ +}
+ +
+ +void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
+ +{
+ +	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
+ +	struct mlx5e_dma_info *di;
+ +	u16 ci;
+ +
+ +	while (sq->cc != sq->pc) {
+ +		ci = sq->cc & sq->wq.sz_m1;
+ +		di = &sq->db.di[ci];
+ +		sq->cc++;
+ +
+ +		mlx5e_page_release(rq, di, false);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 159d21313423 (net/mlx5e: Move XDP related code into new XDP files)
+  #ifdef CONFIG_MLX5_CORE_IPOIB
+  
+  #define MLX5_IB_GRH_DGID_OFFSET 24
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index d500f9aa1bd7..08936b85a2c4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -126,10 +126,6 @@
+ #define MLX5E_ICOSQ_MAX_WQEBBS \
+ 	(DIV_ROUND_UP(sizeof(struct mlx5e_umr_wqe), MLX5_SEND_WQE_BB))
+ 
+-#define MLX5E_XDP_MIN_INLINE (ETH_HLEN + VLAN_HLEN)
+-#define MLX5E_XDP_TX_DS_COUNT \
+-	((sizeof(struct mlx5e_tx_wqe) / MLX5_SEND_WQE_DS) + 1 /* SG DS */)
+-
+ #define MLX5E_NUM_MAIN_GROUPS 9
+ 
+ #define MLX5E_MSG_LEVEL			NETIF_MSG_LINK
+@@ -832,14 +828,13 @@ void mlx5e_cq_error_event(struct mlx5_core_cq *mcq, enum mlx5_event event);
+ int mlx5e_napi_poll(struct napi_struct *napi, int budget);
+ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget);
+ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget);
+-bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
+ void mlx5e_free_txqsq_descs(struct mlx5e_txqsq *sq);
+-void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+ 
+ bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev);
+ bool mlx5e_striding_rq_possible(struct mlx5_core_dev *mdev,
+ 				struct mlx5e_params *params);
+ 
++void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info);
+ void mlx5e_page_release(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info,
+ 			bool recycle);
+ void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+new file mode 100644
+index 000000000000..649675c1af61
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -0,0 +1,225 @@
++/*
++ * Copyright (c) 2018, Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/bpf_trace.h>
++#include "en/xdp.h"
++
++/* returns true if packet was consumed by xdp */
++bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
++		      void *va, u16 *rx_headroom, u32 *len)
++{
++	struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++	struct xdp_buff xdp;
++	u32 act;
++	int err;
++
++	if (!prog)
++		return false;
++
++	xdp.data = va + *rx_headroom;
++	xdp_set_data_meta_invalid(&xdp);
++	xdp.data_end = xdp.data + *len;
++	xdp.data_hard_start = va;
++	xdp.rxq = &rq->xdp_rxq;
++
++	act = bpf_prog_run_xdp(prog, &xdp);
++	switch (act) {
++	case XDP_PASS:
++		*rx_headroom = xdp.data - xdp.data_hard_start;
++		*len = xdp.data_end - xdp.data;
++		return false;
++	case XDP_TX:
++		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++			trace_xdp_exception(rq->netdev, prog, act);
++		return true;
++	case XDP_REDIRECT:
++		/* When XDP enabled then page-refcnt==1 here */
++		err = xdp_do_redirect(rq->netdev, &xdp, prog);
++		if (!err) {
++			__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
++			rq->xdpsq.db.redirect_flush = true;
++			mlx5e_page_dma_unmap(rq, di);
++		}
++		return true;
++	default:
++		bpf_warn_invalid_xdp_action(act);
++	case XDP_ABORTED:
++		trace_xdp_exception(rq->netdev, prog, act);
++	case XDP_DROP:
++		rq->stats->xdp_drop++;
++		return true;
++	}
++}
++
++bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
++			  const struct xdp_buff *xdp)
++{
++	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
++	struct mlx5_wq_cyc       *wq   = &sq->wq;
++	u16                       pi   = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
++	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++
++	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++	struct mlx5_wqe_data_seg *dseg;
++
++	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++	dma_addr_t dma_addr  = di->addr + data_offset;
++	unsigned int dma_len = xdp->data_end - xdp->data;
++
++	struct mlx5e_rq_stats *stats = rq->stats;
++
++	prefetchw(wqe);
++
++	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || rq->hw_mtu < dma_len)) {
++		stats->xdp_drop++;
++		return false;
++	}
++
++	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, 1))) {
++		if (sq->db.doorbell) {
++			/* SQ is full, ring doorbell */
++			mlx5e_xmit_xdp_doorbell(sq);
++			sq->db.doorbell = false;
++		}
++		stats->xdp_tx_full++;
++		return false;
++	}
++
++	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
++
++	cseg->fm_ce_se = 0;
++
++	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
++
++	/* copy the inline part if required */
++	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
++		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++		dma_len  -= MLX5E_XDP_MIN_INLINE;
++		dma_addr += MLX5E_XDP_MIN_INLINE;
++		dseg++;
++	}
++
++	/* write the dma part */
++	dseg->addr       = cpu_to_be64(dma_addr);
++	dseg->byte_count = cpu_to_be32(dma_len);
++
++	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++
++	/* move page to reference to sq responsibility,
++	 * and mark so it's not put back in page-cache.
++	 */
++	__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags); /* non-atomic */
++	sq->db.di[pi] = *di;
++	sq->pc++;
++
++	sq->db.doorbell = true;
++
++	stats->xdp_tx++;
++	return true;
++}
++
++bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
++{
++	struct mlx5e_xdpsq *sq;
++	struct mlx5_cqe64 *cqe;
++	struct mlx5e_rq *rq;
++	u16 sqcc;
++	int i;
++
++	sq = container_of(cq, struct mlx5e_xdpsq, cq);
++
++	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++		return false;
++
++	cqe = mlx5_cqwq_get_cqe(&cq->wq);
++	if (!cqe)
++		return false;
++
++	rq = container_of(sq, struct mlx5e_rq, xdpsq);
++
++	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++	 * otherwise a cq overrun may occur
++	 */
++	sqcc = sq->cc;
++
++	i = 0;
++	do {
++		u16 wqe_counter;
++		bool last_wqe;
++
++		mlx5_cqwq_pop(&cq->wq);
++
++		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++
++		do {
++			struct mlx5e_dma_info *di;
++			u16 ci;
++
++			last_wqe = (sqcc == wqe_counter);
++
++			ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
++			di = &sq->db.di[ci];
++
++			sqcc++;
++			/* Recycle RX page */
++			mlx5e_page_release(rq, di, true);
++		} while (!last_wqe);
++	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
++
++	rq->stats->xdp_tx_cqe += i;
++
++	mlx5_cqwq_update_db_record(&cq->wq);
++
++	/* ensure cq space is freed before enabling more cqes */
++	wmb();
++
++	sq->cc = sqcc;
++	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++}
++
++void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
++{
++	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++	struct mlx5e_dma_info *di;
++	u16 ci;
++
++	while (sq->cc != sq->pc) {
++		ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sq->cc);
++		di = &sq->db.di[ci];
++		sq->cc++;
++
++		mlx5e_page_release(rq, di, false);
++	}
++}
++
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+new file mode 100644
+index 000000000000..a8a856a82c63
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (c) 2018, Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef __MLX5_EN_XDP_H__
++#define __MLX5_EN_XDP_H__
++
++#include "en.h"
++
++#define MLX5E_XDP_MAX_MTU ((int)(PAGE_SIZE - \
++				 MLX5_SKB_FRAG_SZ(XDP_PACKET_HEADROOM)))
++#define MLX5E_XDP_MIN_INLINE (ETH_HLEN + VLAN_HLEN)
++#define MLX5E_XDP_TX_DS_COUNT \
++	((sizeof(struct mlx5e_tx_wqe) / MLX5_SEND_WQE_DS) + 1 /* SG DS */)
++
++bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
++		      void *va, u16 *rx_headroom, u32 *len);
++bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
++void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
++
++bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
++			  const struct xdp_buff *xdp);
++
++static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
++{
++	struct mlx5_wq_cyc *wq = &sq->wq;
++	struct mlx5e_tx_wqe *wqe;
++	u16 pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc - 1); /* last pi */
++
++	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++
++	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
++}
++
++#endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index b54d059b5bf3..cd8c723faa61 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -32,6 +32,7 @@
+ 
+ #include <linux/irq.h>
+ #include "en.h"
++#include "en/xdp.h"
+ 
+ #ifdef CONFIG_GENERIC_HARDIRQS
+ static inline bool mlx5e_channel_no_affinity_change(struct mlx5e_channel *c)
