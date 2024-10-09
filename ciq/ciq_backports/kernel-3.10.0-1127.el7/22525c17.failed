@@ -1,0 +1,441 @@
+xfs: log item flags are racy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 22525c17ed133202088f6f05acd9c53790a7121d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/22525c17.failed
+
+The log item flags contain a field that is protected by the AIL
+lock - the XFS_LI_IN_AIL flag. We use non-atomic RMW operations to
+set and clear these flags, but most of the updates and checks are
+not done with the AIL lock held and so are susceptible to update
+races.
+
+Fix this by changing the log item flags to use atomic bitops rather
+than be reliant on the AIL lock for update serialisation.
+
+Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 22525c17ed133202088f6f05acd9c53790a7121d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_item.c
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_extfree_item.c
+#	fs/xfs/xfs_inode.c
+#	fs/xfs/xfs_refcount_item.c
+#	fs/xfs/xfs_rmap_item.c
+#	fs/xfs/xfs_trans_ail.c
+#	fs/xfs/xfs_trans_priv.h
+diff --cc fs/xfs/xfs_dquot.c
+index 7f1b77dc77fa,4ca9c39879ae..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -923,12 -913,12 +923,12 @@@ xfs_qm_dqflush_done
+  	 * since it's cheaper, and then we recheck while
+  	 * holding the lock before removing the dquot from the AIL.
+  	 */
+- 	if ((lip->li_flags & XFS_LI_IN_AIL) &&
++ 	if (test_bit(XFS_LI_IN_AIL, &lip->li_flags) &&
+  	    ((lip->li_lsn == qip->qli_flush_lsn) ||
+- 	     (lip->li_flags & XFS_LI_FAILED))) {
++ 	     test_bit(XFS_LI_FAILED, &lip->li_flags))) {
+  
+  		/* xfs_trans_ail_delete() drops the AIL lock. */
+ -		spin_lock(&ailp->ail_lock);
+ +		spin_lock(&ailp->xa_lock);
+  		if (lip->li_lsn == qip->qli_flush_lsn) {
+  			xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
+  		} else {
+@@@ -936,9 -926,8 +936,14 @@@
+  			 * Clear the failed state since we are about to drop the
+  			 * flush lock
+  			 */
+++<<<<<<< HEAD
+ +			if (lip->li_flags & XFS_LI_FAILED)
+ +				xfs_clear_li_failed(lip);
+ +			spin_unlock(&ailp->xa_lock);
+++=======
++ 			xfs_clear_li_failed(lip);
++ 			spin_unlock(&ailp->ail_lock);
+++>>>>>>> 22525c17ed13 (xfs: log item flags are racy)
+  		}
+  	}
+  
+diff --cc fs/xfs/xfs_extfree_item.c
+index afa324ce19d9,70b7d48af6d6..000000000000
+--- a/fs/xfs/xfs_extfree_item.c
++++ b/fs/xfs/xfs_extfree_item.c
+@@@ -148,8 -168,8 +148,13 @@@ STATIC voi
+  xfs_efi_item_unlock(
+  	struct xfs_log_item	*lip)
+  {
+++<<<<<<< HEAD
+ +	if (lip->li_flags & XFS_LI_ABORTED)
+ +		xfs_efi_item_free(EFI_ITEM(lip));
+++=======
++ 	if (test_bit(XFS_LI_ABORTED, &lip->li_flags))
++ 		xfs_efi_release(EFI_ITEM(lip));
+++>>>>>>> 22525c17ed13 (xfs: log item flags are racy)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_inode.c
+index 505f3ec0700e,42781bae6794..000000000000
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@@ -561,9 -598,9 +561,15 @@@ xfs_lock_two_inodes
+  	 * and try again.
+  	 */
+  	lp = (xfs_log_item_t *)ip0->i_itemp;
+++<<<<<<< HEAD
+ +	if (lp && (lp->li_flags & XFS_LI_IN_AIL)) {
+ +		if (!xfs_ilock_nowait(ip1, xfs_lock_inumorder(lock_mode, 1))) {
+ +			xfs_iunlock(ip0, lock_mode);
+++=======
++ 	if (lp && test_bit(XFS_LI_IN_AIL, &lp->li_flags)) {
++ 		if (!xfs_ilock_nowait(ip1, xfs_lock_inumorder(ip1_mode, 1))) {
++ 			xfs_iunlock(ip0, ip0_mode);
+++>>>>>>> 22525c17ed13 (xfs: log item flags are racy)
+  			if ((++attempts % 5) == 0)
+  				delay(1); /* Don't just spin the CPU */
+  			goto again;
+diff --cc fs/xfs/xfs_trans_ail.c
+index cef89f7127d3,50611d2bcbc2..000000000000
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@@ -46,9 -46,9 +46,9 @@@ xfs_ail_check
+  	/*
+  	 * Check the next and previous entries are valid.
+  	 */
+- 	ASSERT((lip->li_flags & XFS_LI_IN_AIL) != 0);
++ 	ASSERT(test_bit(XFS_LI_IN_AIL, &lip->li_flags));
+  	prev_lip = list_entry(lip->li_ail.prev, xfs_log_item_t, li_ail);
+ -	if (&prev_lip->li_ail != &ailp->ail_head)
+ +	if (&prev_lip->li_ail != &ailp->xa_ail)
+  		ASSERT(XFS_LSN_CMP(prev_lip->li_lsn, lip->li_lsn) <= 0);
+  
+  	prev_lip = list_entry(lip->li_ail.next, xfs_log_item_t, li_ail);
+@@@ -756,13 -755,13 +755,18 @@@ voi
+  xfs_trans_ail_delete(
+  	struct xfs_ail		*ailp,
+  	struct xfs_log_item	*lip,
+ -	int			shutdown_type) __releases(ailp->ail_lock)
+ +	int			shutdown_type) __releases(ailp->xa_lock)
+  {
+ -	struct xfs_mount	*mp = ailp->ail_mount;
+ +	struct xfs_mount	*mp = ailp->xa_mount;
+  	bool			mlip_changed;
+  
+++<<<<<<< HEAD
+ +	if (!(lip->li_flags & XFS_LI_IN_AIL)) {
+ +		spin_unlock(&ailp->xa_lock);
+++=======
++ 	if (!test_bit(XFS_LI_IN_AIL, &lip->li_flags)) {
++ 		spin_unlock(&ailp->ail_lock);
+++>>>>>>> 22525c17ed13 (xfs: log item flags are racy)
+  		if (!XFS_FORCED_SHUTDOWN(mp)) {
+  			xfs_alert_tag(mp, XFS_PTAG_AILDELETE,
+  	"%s: attempting to delete a log item that is not in the AIL",
+diff --cc fs/xfs/xfs_trans_priv.h
+index b317a3644c00,43f773297b9d..000000000000
+--- a/fs/xfs/xfs_trans_priv.h
++++ b/fs/xfs/xfs_trans_priv.h
+@@@ -117,12 -117,12 +117,12 @@@ xfs_trans_ail_remove
+  {
+  	struct xfs_ail		*ailp = lip->li_ailp;
+  
+ -	spin_lock(&ailp->ail_lock);
+ +	spin_lock(&ailp->xa_lock);
+  	/* xfs_trans_ail_delete() drops the AIL lock */
+- 	if (lip->li_flags & XFS_LI_IN_AIL)
++ 	if (test_bit(XFS_LI_IN_AIL, &lip->li_flags))
+  		xfs_trans_ail_delete(ailp, lip, shutdown_type);
+  	else
+ -		spin_unlock(&ailp->ail_lock);
+ +		spin_unlock(&ailp->xa_lock);
+  }
+  
+  void			xfs_ail_push(struct xfs_ail *, xfs_lsn_t);
+@@@ -171,11 -171,10 +171,15 @@@ xfs_clear_li_failed
+  {
+  	struct xfs_buf	*bp = lip->li_buf;
+  
+++<<<<<<< HEAD
+ +	ASSERT(lip->li_flags & XFS_LI_IN_AIL);
+ +	lockdep_assert_held(&lip->li_ailp->xa_lock);
+++=======
++ 	ASSERT(test_bit(XFS_LI_IN_AIL, &lip->li_flags));
++ 	lockdep_assert_held(&lip->li_ailp->ail_lock);
+++>>>>>>> 22525c17ed13 (xfs: log item flags are racy)
+  
+- 	if (lip->li_flags & XFS_LI_FAILED) {
+- 		lip->li_flags &= ~XFS_LI_FAILED;
++ 	if (test_and_clear_bit(XFS_LI_FAILED, &lip->li_flags)) {
+  		lip->li_buf = NULL;
+  		xfs_buf_rele(bp);
+  	}
+@@@ -186,11 -185,10 +190,10 @@@ xfs_set_li_failed
+  	struct xfs_log_item	*lip,
+  	struct xfs_buf		*bp)
+  {
+ -	lockdep_assert_held(&lip->li_ailp->ail_lock);
+ +	lockdep_assert_held(&lip->li_ailp->xa_lock);
+  
+- 	if (!(lip->li_flags & XFS_LI_FAILED)) {
++ 	if (!test_and_set_bit(XFS_LI_FAILED, &lip->li_flags)) {
+  		xfs_buf_hold(bp);
+- 		lip->li_flags |= XFS_LI_FAILED;
+  		lip->li_buf = bp;
+  	}
+  }
+* Unmerged path fs/xfs/xfs_bmap_item.c
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_rmap_item.c
+* Unmerged path fs/xfs/xfs_bmap_item.c
+diff --git a/fs/xfs/xfs_buf_item.c b/fs/xfs/xfs_buf_item.c
+index 8afcfa3ed976..e5716ce86e0d 100644
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@ -567,13 +567,15 @@ xfs_buf_item_unlock(
+ {
+ 	struct xfs_buf_log_item	*bip = BUF_ITEM(lip);
+ 	struct xfs_buf		*bp = bip->bli_buf;
+-	bool			aborted = !!(lip->li_flags & XFS_LI_ABORTED);
++	bool			aborted;
+ 	bool			hold = !!(bip->bli_flags & XFS_BLI_HOLD);
+ 	bool			dirty = !!(bip->bli_flags & XFS_BLI_DIRTY);
+ #if defined(DEBUG) || defined(XFS_WARN)
+ 	bool			ordered = !!(bip->bli_flags & XFS_BLI_ORDERED);
+ #endif
+ 
++	aborted = test_bit(XFS_LI_ABORTED, &lip->li_flags);
++
+ 	/* Clear the buffer's association with this transaction. */
+ 	bp->b_transp = NULL;
+ 
+* Unmerged path fs/xfs/xfs_dquot.c
+diff --git a/fs/xfs/xfs_dquot_item.c b/fs/xfs/xfs_dquot_item.c
+index 850fb2e227da..07c498839c27 100644
+--- a/fs/xfs/xfs_dquot_item.c
++++ b/fs/xfs/xfs_dquot_item.c
+@@ -172,7 +172,7 @@ xfs_qm_dquot_logitem_push(
+ 	 * The buffer containing this item failed to be written back
+ 	 * previously. Resubmit the buffer for IO
+ 	 */
+-	if (lip->li_flags & XFS_LI_FAILED) {
++	if (test_bit(XFS_LI_FAILED, &lip->li_flags)) {
+ 		if (!xfs_buf_trylock(bp))
+ 			return XFS_ITEM_LOCKED;
+ 
+* Unmerged path fs/xfs/xfs_extfree_item.c
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 560d2a2caa0e..1f4a06914f1e 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -102,7 +102,8 @@ xfs_inode_free_callback(
+ 		xfs_idestroy_fork(ip, XFS_ATTR_FORK);
+ 
+ 	if (ip->i_itemp) {
+-		ASSERT(!(ip->i_itemp->ili_item.li_flags & XFS_LI_IN_AIL));
++		ASSERT(!test_bit(XFS_LI_IN_AIL,
++				 &ip->i_itemp->ili_item.li_flags));
+ 		xfs_inode_item_destroy(ip);
+ 		ip->i_itemp = NULL;
+ 	}
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 865ad1373e5e..a99a0f8aa528 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -91,7 +91,7 @@ xfs_icreate_item_unlock(
+ {
+ 	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+ 
+-	if (icp->ic_item.li_flags & XFS_LI_ABORTED)
++	if (test_bit(XFS_LI_ABORTED, &lip->li_flags))
+ 		kmem_zone_free(xfs_icreate_zone, icp);
+ 	return;
+ }
+* Unmerged path fs/xfs/xfs_inode.c
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index ffe312e80420..9d12a383e1e3 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -517,7 +517,7 @@ xfs_inode_item_push(
+ 	 * The buffer containing this item failed to be written back
+ 	 * previously. Resubmit the buffer for IO.
+ 	 */
+-	if (lip->li_flags & XFS_LI_FAILED) {
++	if (test_bit(XFS_LI_FAILED, &lip->li_flags)) {
+ 		if (!xfs_buf_trylock(bp))
+ 			return XFS_ITEM_LOCKED;
+ 
+@@ -742,7 +742,7 @@ xfs_iflush_done(
+ 		 */
+ 		iip = INODE_ITEM(blip);
+ 		if ((iip->ili_logged && blip->li_lsn == iip->ili_flush_lsn) ||
+-		    (blip->li_flags & XFS_LI_FAILED))
++		    test_bit(XFS_LI_FAILED, &blip->li_flags))
+ 			need_ail++;
+ 
+ 		blip = next;
+@@ -751,7 +751,7 @@ xfs_iflush_done(
+ 	/* make sure we capture the state of the initial inode. */
+ 	iip = INODE_ITEM(lip);
+ 	if ((iip->ili_logged && lip->li_lsn == iip->ili_flush_lsn) ||
+-	    lip->li_flags & XFS_LI_FAILED)
++	    test_bit(XFS_LI_FAILED, &lip->li_flags))
+ 		need_ail++;
+ 
+ 	/*
+@@ -819,7 +819,7 @@ xfs_iflush_abort(
+ 	xfs_inode_log_item_t	*iip = ip->i_itemp;
+ 
+ 	if (iip) {
+-		if (iip->ili_item.li_flags & XFS_LI_IN_AIL) {
++		if (test_bit(XFS_LI_IN_AIL, &iip->ili_item.li_flags)) {
+ 			xfs_trans_ail_remove(&iip->ili_item,
+ 					     stale ? SHUTDOWN_LOG_IO_ERROR :
+ 						     SHUTDOWN_CORRUPT_INCORE);
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 46290f1a31eb..1d7434965e98 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -2109,7 +2109,7 @@ xlog_print_trans(
+ 
+ 		xfs_warn(mp, "log item: ");
+ 		xfs_warn(mp, "  type	= 0x%x", lip->li_type);
+-		xfs_warn(mp, "  flags	= 0x%x", lip->li_flags);
++		xfs_warn(mp, "  flags	= 0x%lx", lip->li_flags);
+ 		if (!lv)
+ 			continue;
+ 		xfs_warn(mp, "  niovecs	= %d", lv->lv_niovecs);
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index f3f3d4e5a473..6e0487cd02f3 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -172,7 +172,7 @@ xfs_qm_dqpurge(
+ 
+ 	ASSERT(atomic_read(&dqp->q_pincount) == 0);
+ 	ASSERT(XFS_FORCED_SHUTDOWN(mp) ||
+-	       !(dqp->q_logitem.qli_item.li_flags & XFS_LI_IN_AIL));
++		!test_bit(XFS_LI_IN_AIL, &dqp->q_logitem.qli_item.li_flags));
+ 
+ 	xfs_dqfunlock(dqp);
+ 	xfs_dqunlock(dqp);
+* Unmerged path fs/xfs/xfs_refcount_item.c
+* Unmerged path fs/xfs/xfs_rmap_item.c
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index dbcbabcee284..586ce9a2acbb 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -436,7 +436,7 @@ DECLARE_EVENT_CLASS(xfs_buf_item_class,
+ 		__field(int, bli_refcount)
+ 		__field(unsigned, bli_flags)
+ 		__field(void *, li_desc)
+-		__field(unsigned, li_flags)
++		__field(unsigned long, li_flags)
+ 	),
+ 	TP_fast_assign(
+ 		__entry->dev = bip->bli_buf->b_target->bt_dev;
+@@ -1009,7 +1009,7 @@ DECLARE_EVENT_CLASS(xfs_log_item_class,
+ 		__field(dev_t, dev)
+ 		__field(void *, lip)
+ 		__field(uint, type)
+-		__field(uint, flags)
++		__field(unsigned long, flags)
+ 		__field(xfs_lsn_t, lsn)
+ 	),
+ 	TP_fast_assign(
+@@ -1061,7 +1061,7 @@ DECLARE_EVENT_CLASS(xfs_ail_class,
+ 		__field(dev_t, dev)
+ 		__field(void *, lip)
+ 		__field(uint, type)
+-		__field(uint, flags)
++		__field(unsigned long, flags)
+ 		__field(xfs_lsn_t, old_lsn)
+ 		__field(xfs_lsn_t, new_lsn)
+ 	),
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 7489319ad0b8..8917490fb88d 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -747,7 +747,7 @@ xfs_trans_free_items(
+ 		if (commit_lsn != NULLCOMMITLSN)
+ 			lip->li_ops->iop_committing(lip, commit_lsn);
+ 		if (abort)
+-			lip->li_flags |= XFS_LI_ABORTED;
++			set_bit(XFS_LI_ABORTED, &lip->li_flags);
+ 		lip->li_ops->iop_unlock(lip);
+ 
+ 		xfs_trans_free_item_desc(lidp);
+@@ -818,7 +818,7 @@ xfs_trans_committed_bulk(
+ 		xfs_lsn_t		item_lsn;
+ 
+ 		if (aborted)
+-			lip->li_flags |= XFS_LI_ABORTED;
++			set_bit(XFS_LI_ABORTED, &lip->li_flags);
+ 		item_lsn = lip->li_ops->iop_committed(lip, commit_lsn);
+ 
+ 		/* item_lsn of -1 means the item needs no further processing */
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index ea0c951470ba..36890806693e 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -40,7 +40,7 @@ typedef struct xfs_log_item {
+ 	struct xfs_mount		*li_mountp;	/* ptr to fs mount */
+ 	struct xfs_ail			*li_ailp;	/* ptr to AIL */
+ 	uint				li_type;	/* item type */
+-	uint				li_flags;	/* misc flags */
++	unsigned long			li_flags;	/* misc flags */
+ 	struct xfs_buf			*li_buf;	/* real buffer pointer */
+ 	struct xfs_log_item		*li_bio_list;	/* buffer item list */
+ 	void				(*li_cb)(struct xfs_buf *,
+@@ -56,14 +56,19 @@ typedef struct xfs_log_item {
+ 	xfs_lsn_t			li_seq;		/* CIL commit seq */
+ } xfs_log_item_t;
+ 
+-#define	XFS_LI_IN_AIL	0x1
+-#define	XFS_LI_ABORTED	0x2
+-#define	XFS_LI_FAILED	0x4
++/*
++ * li_flags use the (set/test/clear)_bit atomic interfaces because updates can
++ * race with each other and we don't want to have to use the AIL lock to
++ * serialise all updates.
++ */
++#define	XFS_LI_IN_AIL	0
++#define	XFS_LI_ABORTED	1
++#define	XFS_LI_FAILED	2
+ 
+ #define XFS_LI_FLAGS \
+-	{ XFS_LI_IN_AIL,	"IN_AIL" }, \
+-	{ XFS_LI_ABORTED,	"ABORTED" }, \
+-	{ XFS_LI_FAILED,	"FAILED" }
++	{ (1 << XFS_LI_IN_AIL),		"IN_AIL" }, \
++	{ (1 << XFS_LI_ABORTED),	"ABORTED" }, \
++	{ (1 << XFS_LI_FAILED),		"FAILED" }
+ 
+ struct xfs_item_ops {
+ 	void (*iop_size)(xfs_log_item_t *, int *, int *);
+* Unmerged path fs/xfs/xfs_trans_ail.c
+diff --git a/fs/xfs/xfs_trans_buf.c b/fs/xfs/xfs_trans_buf.c
+index 0621767a06d9..4a63470acdff 100644
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@ -510,7 +510,7 @@ xfs_trans_brelse(
+ 		ASSERT(bp->b_pincount == 0);
+ ***/
+ 		ASSERT(atomic_read(&bip->bli_refcount) == 0);
+-		ASSERT(!(bip->bli_item.li_flags & XFS_LI_IN_AIL));
++		ASSERT(!test_bit(XFS_LI_IN_AIL, &bip->bli_item.li_flags));
+ 		ASSERT(!(bip->bli_flags & XFS_BLI_INODE_ALLOC_BUF));
+ 		xfs_buf_item_relse(bp);
+ 	}
+* Unmerged path fs/xfs/xfs_trans_priv.h
