@@ -2551,6 +2551,8 @@ state_store(struct md_rdev *rdev, const char *buf, size_t len)
 		else
 			err = -EBUSY;
 	} else if (cmd_match(buf, "remove")) {
+		clear_bit(Blocked, &rdev->flags);
+		remove_and_add_spares(rdev->mddev, rdev);
 		if (rdev->raid_disk >= 0)
 			err = -EBUSY;
 		else {
