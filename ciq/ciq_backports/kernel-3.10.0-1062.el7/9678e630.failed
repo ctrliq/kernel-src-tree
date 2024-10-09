@@ -1,0 +1,123 @@
+ovl: fix inconsistent d_ino for legacy merge dir
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 9678e630305724487f1fc101d6b83c383ff9cc90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9678e630.failed
+
+For a merge dir that was copied up before v4.12 or that was hand crafted
+offline (e.g. mkdir {upper/lower}/dir), upper dir does not contain the
+'trusted.overlay.origin' xattr.  In that case, stat(2) on the merge dir
+returns the lower dir st_ino, but getdents(2) returns the upper dir d_ino.
+
+After this change, on merge dir lookup, missing origin xattr on upper
+dir will be fixed and 'impure' xattr will be fixed on parent of the legacy
+merge dir.
+
+	Suggested-by: zhangyi (F) <yi.zhang@huawei.com>
+	Reviewed-by: zhangyi (F) <yi.zhang@huawei.com>
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 9678e630305724487f1fc101d6b83c383ff9cc90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/namei.c
+diff --cc fs/overlayfs/namei.c
+index 0afb8ae29e9b,69f4f19659fc..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -572,6 -572,39 +572,42 @@@ int ovl_path_next(int idx, struct dentr
+  	return (idx < oe->numlower) ? idx + 1 : -1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ovl_find_layer(struct ovl_fs *ofs, struct ovl_path *path)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ofs->numlower; i++) {
++ 		if (ofs->lower_layers[i].mnt == path->layer->mnt)
++ 			break;
++ 	}
++ 
++ 	return i;
++ }
++ 
++ /* Fix missing 'origin' xattr */
++ static int ovl_fix_origin(struct dentry *dentry, struct dentry *lower,
++ 			  struct dentry *upper)
++ {
++ 	int err;
++ 
++ 	if (ovl_check_origin_xattr(upper))
++ 		return 0;
++ 
++ 	err = ovl_want_write(dentry);
++ 	if (err)
++ 		return err;
++ 
++ 	err = ovl_set_origin(dentry, lower, upper);
++ 	if (!err)
++ 		err = ovl_set_impure(dentry->d_parent, upper->d_parent);
++ 
++ 	ovl_drop_write(dentry);
++ 	return err;
++ }
++ 
+++>>>>>>> 9678e6303057 (ovl: fix inconsistent d_ino for legacy merge dir)
+  struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+  			  unsigned int flags)
+  {
+@@@ -662,8 -695,20 +698,20 @@@
+  		if (!this)
+  			continue;
+  
++ 		/*
++ 		 * If no origin fh is stored in upper of a merge dir, store fh
++ 		 * of lower dir and set upper parent "impure".
++ 		 */
++ 		if (upperdentry && !ctr && !ofs->noxattr) {
++ 			err = ovl_fix_origin(dentry, this, upperdentry);
++ 			if (err) {
++ 				dput(this);
++ 				goto out_put;
++ 			}
++ 		}
++ 
+  		stack[ctr].dentry = this;
+ -		stack[ctr].layer = lower.layer;
+ +		stack[ctr].mnt = lowerpath.mnt;
+  		ctr++;
+  
+  		if (d.stop)
+diff --git a/fs/overlayfs/copy_up.c b/fs/overlayfs/copy_up.c
+index fa73bcccdc24..981ef5668df1 100644
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@ -321,8 +321,8 @@ out:
+ 	return fh;
+ }
+ 
+-static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
+-			  struct dentry *upper)
++int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
++		   struct dentry *upper)
+ {
+ 	const struct ovl_fh *fh = NULL;
+ 	int err;
+* Unmerged path fs/overlayfs/namei.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 79baeaeaf3d6..ea7cc3a9bfff 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -319,3 +319,5 @@ int ovl_copy_up_flags(struct dentry *dentry, int flags);
+ int ovl_copy_xattr(struct dentry *old, struct dentry *new);
+ int ovl_set_attr(struct dentry *upper, struct kstat *stat);
+ struct ovl_fh *ovl_encode_fh(struct dentry *lower, bool is_upper);
++int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
++		   struct dentry *upper);
