@@ -1,0 +1,211 @@
+net/mlx4_en: Replace netdev parameter with priv in XDP xmit function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx4_en: Replace netdev parameter with priv in XDP xmit function (Erez Alfasi) [1520295]
+Rebuild_FUZZ: 96.97%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 5dad61b83840d7eceaba5bf316419be11bbb993a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5dad61b8.failed
+
+The struct net_device parameter was passed only to extract
+struct mlx4_en_priv out of it.
+Here we pass the priv parameter directly.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5dad61b83840d7eceaba5bf316419be11bbb993a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 89563ab5d62e,92aec17f4b4d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -732,6 -744,59 +732,62 @@@ int mlx4_en_process_rx_cq(struct net_de
+  		 */
+  		length = be32_to_cpu(cqe->byte_cnt);
+  		length -= ring->fcs_del;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			void *orig_data;
++ 			u32 act;
++ 
++ 			dma = frags[0].dma + frags[0].page_offset;
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data_hard_start = va - frags[0].page_offset;
++ 			xdp.data = va;
++ 			xdp_set_data_meta_invalid(&xdp);
++ 			xdp.data_end = xdp.data + length;
++ 			orig_data = xdp.data;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 			if (xdp.data != orig_data) {
++ 				length = xdp.data_end - xdp.data;
++ 				frags[0].page_offset = xdp.data -
++ 					xdp.data_hard_start;
++ 				va = xdp.data;
++ 			}
++ 
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(ring, frags, priv,
++ 							length, cq_ring,
++ 							&doorbell_pending))) {
++ 					frags[0].page = NULL;
++ 					goto next;
++ 				}
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 				goto xdp_drop_no_cnt; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				ring->xdp_drop++;
++ xdp_drop_no_cnt:
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> 5dad61b83840 (net/mlx4_en: Replace netdev parameter with priv in XDP xmit function)
+  		ring->bytes += length;
+  		ring->packets++;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index 0949c7934152,f16774c9c347..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -1058,3 -1081,87 +1058,90 @@@ tx_drop
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX4_EN_XDP_TX_NRTXBB  1
++ #define MLX4_EN_XDP_TX_REAL_SZ (((CTRL_SIZE + MLX4_EN_XDP_TX_NRTXBB * DS_SIZE) \
++ 				 / 16) & 0x3f)
++ 
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
++ 			       struct mlx4_en_rx_alloc *frame,
++ 			       struct mlx4_en_priv *priv, unsigned int length,
++ 			       int tx_ind, bool *doorbell_pending)
++ {
++ 	union mlx4_wqe_qpn_vlan	qpn_vlan = {};
++ 	struct mlx4_en_tx_desc *tx_desc;
++ 	struct mlx4_en_tx_info *tx_info;
++ 	struct mlx4_wqe_data_seg *data;
++ 	struct mlx4_en_tx_ring *ring;
++ 	dma_addr_t dma;
++ 	__be32 op_own;
++ 	int index;
++ 
++ 	if (unlikely(!priv->port_up))
++ 		goto tx_drop;
++ 
++ 	ring = priv->tx_ring[TX_XDP][tx_ind];
++ 
++ 	if (unlikely(mlx4_en_is_tx_ring_full(ring)))
++ 		goto tx_drop_count;
++ 
++ 	index = ring->prod & ring->size_mask;
++ 	tx_info = &ring->tx_info[index];
++ 
++ 	/* Track current inflight packets for performance analysis */
++ 	AVG_PERF_COUNTER(priv->pstats.inflight_avg,
++ 			 (u32)(ring->prod - READ_ONCE(ring->cons) - 1));
++ 
++ 	tx_desc = ring->buf + (index << LOG_TXBB_SIZE);
++ 	data = &tx_desc->data;
++ 
++ 	dma = frame->dma;
++ 
++ 	tx_info->page = frame->page;
++ 	frame->page = NULL;
++ 	tx_info->map0_dma = dma;
++ 	tx_info->map0_byte_count = PAGE_SIZE;
++ 	tx_info->nr_txbb = MLX4_EN_XDP_TX_NRTXBB;
++ 	tx_info->nr_bytes = max_t(unsigned int, length, ETH_ZLEN);
++ 	tx_info->data_offset = offsetof(struct mlx4_en_tx_desc, data);
++ 	tx_info->ts_requested = 0;
++ 	tx_info->nr_maps = 1;
++ 	tx_info->linear = 1;
++ 	tx_info->inl = 0;
++ 
++ 	dma_sync_single_range_for_device(priv->ddev, dma, frame->page_offset,
++ 					 length, PCI_DMA_TODEVICE);
++ 
++ 	data->addr = cpu_to_be64(dma + frame->page_offset);
++ 	data->lkey = ring->mr_key;
++ 	dma_wmb();
++ 	data->byte_count = cpu_to_be32(length);
++ 
++ 	/* tx completion can avoid cache line miss for common cases */
++ 	tx_desc->ctrl.srcrb_flags = priv->ctrl_flags;
++ 
++ 	op_own = cpu_to_be32(MLX4_OPCODE_SEND) |
++ 		((ring->prod & ring->size) ?
++ 		 cpu_to_be32(MLX4_EN_BIT_DESC_OWN) : 0);
++ 
++ 	rx_ring->xdp_tx++;
++ 	AVG_PERF_COUNTER(priv->pstats.tx_pktsz_avg, length);
++ 
++ 	ring->prod += MLX4_EN_XDP_TX_NRTXBB;
++ 
++ 	qpn_vlan.fence_size = MLX4_EN_XDP_TX_REAL_SZ;
++ 
++ 	mlx4_en_tx_write_desc(ring, tx_desc, qpn_vlan, TXBB_SIZE, 0,
++ 			      op_own, false, false);
++ 	*doorbell_pending = true;
++ 
++ 	return NETDEV_TX_OK;
++ 
++ tx_drop_count:
++ 	rx_ring->xdp_tx_full++;
++ 	*doorbell_pending = true;
++ tx_drop:
++ 	return NETDEV_TX_BUSY;
++ }
+++>>>>>>> 5dad61b83840 (net/mlx4_en: Replace netdev parameter with priv in XDP xmit function)
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 3d28addafaf4,8cad9b4f1936..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -690,6 -691,13 +690,16 @@@ void mlx4_en_tx_irq(struct mlx4_cq *mcq
+  u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb,
+  			 void *accel_priv, select_queue_fallback_t fallback);
+  netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev);
+++<<<<<<< HEAD
+++=======
++ netdev_tx_t mlx4_en_xmit_frame(struct mlx4_en_rx_ring *rx_ring,
++ 			       struct mlx4_en_rx_alloc *frame,
++ 			       struct mlx4_en_priv *priv, unsigned int length,
++ 			       int tx_ind, bool *doorbell_pending);
++ void mlx4_en_xmit_doorbell(struct mlx4_en_tx_ring *ring);
++ bool mlx4_en_rx_recycle(struct mlx4_en_rx_ring *ring,
++ 			struct mlx4_en_rx_alloc *frame);
+++>>>>>>> 5dad61b83840 (net/mlx4_en: Replace netdev parameter with priv in XDP xmit function)
+  
+  int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+  			   struct mlx4_en_tx_ring **pring,
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
