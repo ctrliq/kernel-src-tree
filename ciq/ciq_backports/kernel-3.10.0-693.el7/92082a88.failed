@@ -1,0 +1,273 @@
+ACPI: add AMD ACPI2Platform device support for x86 system
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ken Xue <Ken.Xue@amd.com>
+commit 92082a8886f30a1c492a31ac4b5a4966bb64b1a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/92082a88.failed
+
+This new feature is to interpret AMD specific ACPI device to
+platform device such as I2C, UART, GPIO found on AMD CZ and
+later chipsets. It based on example intel LPSS. Now, it can
+support AMD I2C, UART and GPIO.
+
+	Signed-off-by: Ken Xue <Ken.Xue@amd.com>
+	Acked-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 92082a8886f30a1c492a31ac4b5a4966bb64b1a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+diff --cc arch/x86/Kconfig
+index d30a5322b64f,3e15cee34aee..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -493,6 -496,47 +493,50 @@@ config X86_INTEL_LPS
+  	  things like clock tree (common clock framework) and pincontrol
+  	  which are needed by the LPSS peripheral drivers.
+  
+++<<<<<<< HEAD
+++=======
++ config X86_AMD_PLATFORM_DEVICE
++ 	bool "AMD ACPI2Platform devices support"
++ 	depends on ACPI
++ 	select COMMON_CLK
++ 	select PINCTRL
++ 	---help---
++ 	  Select to interpret AMD specific ACPI device to platform device
++ 	  such as I2C, UART, GPIO found on AMD Carrizo and later chipsets.
++ 	  I2C and UART depend on COMMON_CLK to set clock. GPIO driver is
++ 	  implemented under PINCTRL subsystem.
++ 
++ config IOSF_MBI
++ 	tristate "Intel SoC IOSF Sideband support for SoC platforms"
++ 	depends on PCI
++ 	---help---
++ 	  This option enables sideband register access support for Intel SoC
++ 	  platforms. On these platforms the IOSF sideband is used in lieu of
++ 	  MSR's for some register accesses, mostly but not limited to thermal
++ 	  and power. Drivers may query the availability of this device to
++ 	  determine if they need the sideband in order to work on these
++ 	  platforms. The sideband is available on the following SoC products.
++ 	  This list is not meant to be exclusive.
++ 	   - BayTrail
++ 	   - Braswell
++ 	   - Quark
++ 
++ 	  You should say Y if you are running a kernel on one of these SoC's.
++ 
++ config IOSF_MBI_DEBUG
++ 	bool "Enable IOSF sideband access through debugfs"
++ 	depends on IOSF_MBI && DEBUG_FS
++ 	---help---
++ 	  Select this option to expose the IOSF sideband access registers (MCR,
++ 	  MDR, MCRX) through debugfs to write and read register information from
++ 	  different units on the SoC. This is most useful for obtaining device
++ 	  state information for debug and analysis. As this is a general access
++ 	  mechanism, users of this option would have specific knowledge of the
++ 	  device they want to access.
++ 
++ 	  If you don't require the option or are in doubt, say N.
++ 
+++>>>>>>> 92082a8886f3 (ACPI: add AMD ACPI2Platform device support for x86 system)
+  config X86_RDC321X
+  	bool "RDC R-321x SoC"
+  	depends on X86_32
+* Unmerged path arch/x86/Kconfig
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index 92b6ceaf3cc2..1736c6cd81eb 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -39,7 +39,7 @@ acpi-y				+= processor_core.o
+ acpi-y				+= ec.o
+ acpi-$(CONFIG_ACPI_DOCK)	+= dock.o
+ acpi-y				+= pci_root.o pci_link.o pci_irq.o
+-acpi-y				+= acpi_lpss.o
++acpi-y				+= acpi_lpss.o acpi_apd.o
+ acpi-y				+= acpi_platform.o
+ acpi-y				+= acpi_pnp.o
+ acpi-y				+= int340x_thermal.o
+diff --git a/drivers/acpi/acpi_apd.c b/drivers/acpi/acpi_apd.c
+new file mode 100644
+index 000000000000..3984ea96e5f7
+--- /dev/null
++++ b/drivers/acpi/acpi_apd.c
+@@ -0,0 +1,150 @@
++/*
++ * AMD ACPI support for ACPI2platform device.
++ *
++ * Copyright (c) 2014,2015 AMD Corporation.
++ * Authors: Ken Xue <Ken.Xue@amd.com>
++ *	Wu, Jeff <Jeff.Wu@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/clkdev.h>
++#include <linux/acpi.h>
++#include <linux/err.h>
++#include <linux/clk.h>
++#include <linux/pm.h>
++
++#include "internal.h"
++
++ACPI_MODULE_NAME("acpi_apd");
++struct apd_private_data;
++
++/**
++ * ACPI_APD_SYSFS : add device attributes in sysfs
++ * ACPI_APD_PM : attach power domain to device
++ */
++#define ACPI_APD_SYSFS	BIT(0)
++#define ACPI_APD_PM	BIT(1)
++
++/**
++ * struct apd_device_desc - a descriptor for apd device
++ * @flags: device flags like %ACPI_APD_SYSFS, %ACPI_APD_PM
++ * @fixed_clk_rate: fixed rate input clock source for acpi device;
++ *			0 means no fixed rate input clock source
++ * @setup: a hook routine to set device resource during create platform device
++ *
++ * Device description defined as acpi_device_id.driver_data
++ */
++struct apd_device_desc {
++	unsigned int flags;
++	unsigned int fixed_clk_rate;
++	int (*setup)(struct apd_private_data *pdata);
++};
++
++struct apd_private_data {
++	struct clk *clk;
++	struct acpi_device *adev;
++	const struct apd_device_desc *dev_desc;
++};
++
++#ifdef CONFIG_X86_AMD_PLATFORM_DEVICE
++#define APD_ADDR(desc)	((unsigned long)&desc)
++
++static int acpi_apd_setup(struct apd_private_data *pdata)
++{
++	const struct apd_device_desc *dev_desc = pdata->dev_desc;
++	struct clk *clk = ERR_PTR(-ENODEV);
++
++	if (dev_desc->fixed_clk_rate) {
++		clk = clk_register_fixed_rate(&pdata->adev->dev,
++					dev_name(&pdata->adev->dev),
++					NULL, CLK_IS_ROOT,
++					dev_desc->fixed_clk_rate);
++		clk_register_clkdev(clk, NULL, dev_name(&pdata->adev->dev));
++		pdata->clk = clk;
++	}
++
++	return 0;
++}
++
++static struct apd_device_desc cz_i2c_desc = {
++	.setup = acpi_apd_setup,
++	.fixed_clk_rate = 133000000,
++};
++
++static struct apd_device_desc cz_uart_desc = {
++	.setup = acpi_apd_setup,
++	.fixed_clk_rate = 48000000,
++};
++
++#else
++
++#define APD_ADDR(desc) (0UL)
++
++#endif /* CONFIG_X86_AMD_PLATFORM_DEVICE */
++
++/**
++* Create platform device during acpi scan attach handle.
++* Return value > 0 on success of creating device.
++*/
++static int acpi_apd_create_device(struct acpi_device *adev,
++				   const struct acpi_device_id *id)
++{
++	const struct apd_device_desc *dev_desc = (void *)id->driver_data;
++	struct apd_private_data *pdata;
++	struct platform_device *pdev;
++	int ret;
++
++	if (!dev_desc) {
++		pdev = acpi_create_platform_device(adev);
++		return IS_ERR_OR_NULL(pdev) ? PTR_ERR(pdev) : 1;
++	}
++
++	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		return -ENOMEM;
++
++	pdata->adev = adev;
++	pdata->dev_desc = dev_desc;
++
++	if (dev_desc->setup) {
++		ret = dev_desc->setup(pdata);
++		if (ret)
++			goto err_out;
++	}
++
++	adev->driver_data = pdata;
++	pdev = acpi_create_platform_device(adev);
++	if (!IS_ERR_OR_NULL(pdev))
++		return 1;
++
++	ret = PTR_ERR(pdev);
++	adev->driver_data = NULL;
++
++ err_out:
++	kfree(pdata);
++	return ret;
++}
++
++static const struct acpi_device_id acpi_apd_device_ids[] = {
++	/* Generic apd devices */
++	{ "AMD0010", APD_ADDR(cz_i2c_desc) },
++	{ "AMD0020", APD_ADDR(cz_uart_desc) },
++	{ "AMD0030", },
++	{ }
++};
++
++static struct acpi_scan_handler apd_handler = {
++	.ids = acpi_apd_device_ids,
++	.attach = acpi_apd_create_device,
++};
++
++void __init acpi_apd_init(void)
++{
++	acpi_scan_add_handler(&apd_handler);
++}
+diff --git a/drivers/acpi/internal.h b/drivers/acpi/internal.h
+index 3cde2ab07388..89492f3bf8ce 100644
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -76,6 +76,8 @@ static inline void acpi_debugfs_init(void) { return; }
+ #endif
+ void acpi_lpss_init(void);
+ 
++void acpi_apd_init(void);
++
+ acpi_status acpi_hotplug_schedule(struct acpi_device *adev, u32 src);
+ bool acpi_queue_hotplug_work(struct work_struct *work);
+ void acpi_device_hotplug(struct acpi_device *adev, u32 src);
+diff --git a/drivers/acpi/scan.c b/drivers/acpi/scan.c
+index 2227221e8672..d7206d82db36 100644
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -1952,6 +1952,7 @@ int __init acpi_scan_init(void)
+ 	acpi_processor_init();
+ 	acpi_platform_init();
+ 	acpi_lpss_init();
++	acpi_apd_init();
+ 	acpi_cmos_rtc_init();
+ 	acpi_container_init();
+ 	acpi_memory_hotplug_init();
