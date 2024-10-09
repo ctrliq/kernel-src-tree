@@ -1,0 +1,268 @@
+locking/rwlocks: Introduce 'qrwlocks' - fair, queued rwlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Waiman Long <Waiman.Long@hp.com>
+commit 70af2f8a4f48d6cebdf92d533d3aef37853ce6de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/70af2f8a.failed
+
+This rwlock uses the arch_spin_lock_t as a waitqueue, and assuming the
+arch_spin_lock_t is a fair lock (ticket,mcs etc..) the resulting
+rwlock is a fair lock.
+
+It fits in the same 8 bytes as the regular rwlock_t by folding the
+reader and writer count into a single integer, using the remaining 4
+bytes for the arch_spinlock_t.
+
+Architectures that can single-copy adress bytes can optimize
+queue_write_unlock() with a 0 write to the LSB (the write count).
+
+Performance as measured by Davidlohr Bueso (rwlock_t -> qrwlock_t):
+
+ +--------------+-------------+---------------+
+ |   Workload   |   #users    |     delta     |
+ +--------------+-------------+---------------+
+ | alltests     | > 1400      | -4.83%        |
+ | custom       | 0-100,> 100 | +1.43%,-1.57% |
+ | high_systime | > 1000      | -2.61         |
+ | shared       | all         | +0.32         |
+ +--------------+-------------+---------------+
+
+http://www.stgolabs.net/qrwlock-stuff/aim7-results-vs-rwsem_optsin/
+
+	Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+[peterz: near complete rewrite]
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: "Paul E.McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/n/tip-gac1nnl3wvs2ij87zv2xkdzq@git.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 70af2f8a4f48d6cebdf92d533d3aef37853ce6de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/Makefile
+#	kernel/qrwlock.c
+* Unmerged path kernel/locking/Makefile
+* Unmerged path kernel/qrwlock.c
+diff --git a/include/asm-generic/qrwlock.h b/include/asm-generic/qrwlock.h
+new file mode 100644
+index 000000000000..6383d54bf983
+--- /dev/null
++++ b/include/asm-generic/qrwlock.h
+@@ -0,0 +1,166 @@
++/*
++ * Queue read/write lock
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * (C) Copyright 2013-2014 Hewlett-Packard Development Company, L.P.
++ *
++ * Authors: Waiman Long <waiman.long@hp.com>
++ */
++#ifndef __ASM_GENERIC_QRWLOCK_H
++#define __ASM_GENERIC_QRWLOCK_H
++
++#include <linux/atomic.h>
++#include <asm/barrier.h>
++#include <asm/processor.h>
++
++#include <asm-generic/qrwlock_types.h>
++
++/*
++ * Writer states & reader shift and bias
++ */
++#define	_QW_WAITING	1		/* A writer is waiting	   */
++#define	_QW_LOCKED	0xff		/* A writer holds the lock */
++#define	_QW_WMASK	0xff		/* Writer mask		   */
++#define	_QR_SHIFT	8		/* Reader count shift	   */
++#define _QR_BIAS	(1U << _QR_SHIFT)
++
++/*
++ * External function declarations
++ */
++extern void queue_read_lock_slowpath(struct qrwlock *lock);
++extern void queue_write_lock_slowpath(struct qrwlock *lock);
++
++/**
++ * queue_read_can_lock- would read_trylock() succeed?
++ * @lock: Pointer to queue rwlock structure
++ */
++static inline int queue_read_can_lock(struct qrwlock *lock)
++{
++	return !(atomic_read(&lock->cnts) & _QW_WMASK);
++}
++
++/**
++ * queue_write_can_lock- would write_trylock() succeed?
++ * @lock: Pointer to queue rwlock structure
++ */
++static inline int queue_write_can_lock(struct qrwlock *lock)
++{
++	return !atomic_read(&lock->cnts);
++}
++
++/**
++ * queue_read_trylock - try to acquire read lock of a queue rwlock
++ * @lock : Pointer to queue rwlock structure
++ * Return: 1 if lock acquired, 0 if failed
++ */
++static inline int queue_read_trylock(struct qrwlock *lock)
++{
++	u32 cnts;
++
++	cnts = atomic_read(&lock->cnts);
++	if (likely(!(cnts & _QW_WMASK))) {
++		cnts = (u32)atomic_add_return(_QR_BIAS, &lock->cnts);
++		if (likely(!(cnts & _QW_WMASK)))
++			return 1;
++		atomic_sub(_QR_BIAS, &lock->cnts);
++	}
++	return 0;
++}
++
++/**
++ * queue_write_trylock - try to acquire write lock of a queue rwlock
++ * @lock : Pointer to queue rwlock structure
++ * Return: 1 if lock acquired, 0 if failed
++ */
++static inline int queue_write_trylock(struct qrwlock *lock)
++{
++	u32 cnts;
++
++	cnts = atomic_read(&lock->cnts);
++	if (unlikely(cnts))
++		return 0;
++
++	return likely(atomic_cmpxchg(&lock->cnts,
++				     cnts, cnts | _QW_LOCKED) == cnts);
++}
++/**
++ * queue_read_lock - acquire read lock of a queue rwlock
++ * @lock: Pointer to queue rwlock structure
++ */
++static inline void queue_read_lock(struct qrwlock *lock)
++{
++	u32 cnts;
++
++	cnts = atomic_add_return(_QR_BIAS, &lock->cnts);
++	if (likely(!(cnts & _QW_WMASK)))
++		return;
++
++	/* The slowpath will decrement the reader count, if necessary. */
++	queue_read_lock_slowpath(lock);
++}
++
++/**
++ * queue_write_lock - acquire write lock of a queue rwlock
++ * @lock : Pointer to queue rwlock structure
++ */
++static inline void queue_write_lock(struct qrwlock *lock)
++{
++	/* Optimize for the unfair lock case where the fair flag is 0. */
++	if (atomic_cmpxchg(&lock->cnts, 0, _QW_LOCKED) == 0)
++		return;
++
++	queue_write_lock_slowpath(lock);
++}
++
++/**
++ * queue_read_unlock - release read lock of a queue rwlock
++ * @lock : Pointer to queue rwlock structure
++ */
++static inline void queue_read_unlock(struct qrwlock *lock)
++{
++	/*
++	 * Atomically decrement the reader count
++	 */
++	smp_mb__before_atomic();
++	atomic_sub(_QR_BIAS, &lock->cnts);
++}
++
++#ifndef queue_write_unlock
++/**
++ * queue_write_unlock - release write lock of a queue rwlock
++ * @lock : Pointer to queue rwlock structure
++ */
++static inline void queue_write_unlock(struct qrwlock *lock)
++{
++	/*
++	 * If the writer field is atomic, it can be cleared directly.
++	 * Otherwise, an atomic subtraction will be used to clear it.
++	 */
++	smp_mb__before_atomic();
++	atomic_sub(_QW_LOCKED, &lock->cnts);
++}
++#endif
++
++/*
++ * Remapping rwlock architecture specific functions to the corresponding
++ * queue rwlock functions.
++ */
++#define arch_read_can_lock(l)	queue_read_can_lock(l)
++#define arch_write_can_lock(l)	queue_write_can_lock(l)
++#define arch_read_lock(l)	queue_read_lock(l)
++#define arch_write_lock(l)	queue_write_lock(l)
++#define arch_read_trylock(l)	queue_read_trylock(l)
++#define arch_write_trylock(l)	queue_write_trylock(l)
++#define arch_read_unlock(l)	queue_read_unlock(l)
++#define arch_write_unlock(l)	queue_write_unlock(l)
++
++#endif /* __ASM_GENERIC_QRWLOCK_H */
+diff --git a/include/asm-generic/qrwlock_types.h b/include/asm-generic/qrwlock_types.h
+new file mode 100644
+index 000000000000..4d76f24df518
+--- /dev/null
++++ b/include/asm-generic/qrwlock_types.h
+@@ -0,0 +1,21 @@
++#ifndef __ASM_GENERIC_QRWLOCK_TYPES_H
++#define __ASM_GENERIC_QRWLOCK_TYPES_H
++
++#include <linux/types.h>
++#include <asm/spinlock_types.h>
++
++/*
++ * The queue read/write lock data structure
++ */
++
++typedef struct qrwlock {
++	atomic_t		cnts;
++	arch_spinlock_t		lock;
++} arch_rwlock_t;
++
++#define	__ARCH_RW_LOCK_UNLOCKED {		\
++	.cnts = ATOMIC_INIT(0),			\
++	.lock = __ARCH_SPIN_LOCK_UNLOCKED,	\
++}
++
++#endif /* __ASM_GENERIC_QRWLOCK_TYPES_H */
+diff --git a/kernel/Kconfig.locks b/kernel/Kconfig.locks
+index 44511d100eaa..b8aad2d2926e 100644
+--- a/kernel/Kconfig.locks
++++ b/kernel/Kconfig.locks
+@@ -223,3 +223,10 @@ endif
+ config MUTEX_SPIN_ON_OWNER
+ 	def_bool y
+ 	depends on SMP && !DEBUG_MUTEXES
++
++config ARCH_USE_QUEUE_RWLOCK
++	bool
++
++config QUEUE_RWLOCK
++	def_bool y if ARCH_USE_QUEUE_RWLOCK
++	depends on SMP
+* Unmerged path kernel/locking/Makefile
+* Unmerged path kernel/qrwlock.c
