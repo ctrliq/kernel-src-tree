@@ -1,0 +1,125 @@
+mlx4: factorize page_address() calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 02e6fd3e5598bace683e05ee783f134722cb21b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/02e6fd3e.failed
+
+We need to compute the frame virtual address at different points.
+Do it once.
+
+Following patch will use the new va address for validate_loopback()
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 02e6fd3e5598bace683e05ee783f134722cb21b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 984f22166c89,b5aa3f986508..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -824,10 -734,10 +824,15 @@@ int mlx4_en_process_rx_cq(struct net_de
+  	/* Process all completed CQEs */
+  	while (XNOR(cqe->owner_sr_opcode & MLX4_CQE_OWNER_MASK,
+  		    cq->mcq.cons_index & cq->size)) {
++ 		void *va;
+  
+  		frags = ring->rx_info + (index << priv->log_rx_info);
+++<<<<<<< HEAD
+ +		rx_desc = ring->buf + (index << ring->log_stride);
+ +
+++=======
++ 		va = page_address(frags[0].page) + frags[0].page_offset;
+++>>>>>>> 02e6fd3e5598 (mlx4: factorize page_address() calls)
+  		/*
+  		 * make sure we read the CQE after we read the ownership bit
+  		 */
+@@@ -855,11 -765,9 +860,9 @@@
+  			/* Get pointer to first fragment since we haven't
+  			 * skb yet and cast it to ethhdr struct
+  			 */
+ -			dma = frags[0].dma + frags[0].page_offset;
+ +			dma = be64_to_cpu(rx_desc->data[0].addr);
+  			dma_sync_single_for_cpu(priv->ddev, dma, sizeof(*ethh),
+  						DMA_FROM_DEVICE);
+- 			ethh = (struct ethhdr *)(page_address(frags[0].page) +
+- 						 frags[0].page_offset);
+  
+  			if (is_multicast_ether_addr(ethh->h_dest)) {
+  				struct mlx4_mac_entry *entry;
+@@@ -886,10 -790,62 +889,67 @@@
+  		 */
+  		length = be32_to_cpu(cqe->byte_cnt);
+  		length -= ring->fcs_del;
+++<<<<<<< HEAD
+++=======
++ 		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
++ 			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
++ 
++ 		/* A bpf program gets first chance to drop the packet. It may
++ 		 * read bytes but not past the end of the frag.
++ 		 */
++ 		if (xdp_prog) {
++ 			struct xdp_buff xdp;
++ 			dma_addr_t dma;
++ 			void *orig_data;
++ 			u32 act;
++ 
++ 			dma = frags[0].dma + frags[0].page_offset;
++ 			dma_sync_single_for_cpu(priv->ddev, dma,
++ 						priv->frag_info[0].frag_size,
++ 						DMA_FROM_DEVICE);
++ 
++ 			xdp.data_hard_start = va - frags[0].page_offset;
++ 			xdp.data = va;
++ 			xdp.data_end = xdp.data + length;
++ 			orig_data = xdp.data;
++ 
++ 			act = bpf_prog_run_xdp(xdp_prog, &xdp);
++ 
++ 			if (xdp.data != orig_data) {
++ 				length = xdp.data_end - xdp.data;
++ 				frags[0].page_offset = xdp.data -
++ 					xdp.data_hard_start;
++ 				va = xdp.data;
++ 			}
++ 
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (likely(!mlx4_en_xmit_frame(ring, frags, dev,
++ 							length, cq->ring,
++ 							&doorbell_pending))) {
++ 					frags[0].page = NULL;
++ 					goto next;
++ 				}
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 				goto xdp_drop_no_cnt; /* Drop on xmit failure */
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				ring->xdp_drop++;
++ xdp_drop_no_cnt:
++ 				goto next;
++ 			}
++ 		}
++ 
+++>>>>>>> 02e6fd3e5598 (mlx4: factorize page_address() calls)
+  		ring->bytes += length;
+  		ring->packets++;
+ +		l2_tunnel = (dev->hw_enc_features & NETIF_F_RXCSUM) &&
+ +			(cqe->vlan_my_qpn & cpu_to_be32(MLX4_CQE_L2_TUNNEL));
+  
+  		if (likely(dev->features & NETIF_F_RXCSUM)) {
+  			if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_TCP |
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
