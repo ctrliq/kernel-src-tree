@@ -1465,7 +1465,7 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 
 	res = fuse_direct_io(io, iov, nr_segs, count, ppos, 0);
 
-	fuse_invalidate_attr(inode);
+	fuse_invalidate_atime(inode);
 
 	return res;
 }
