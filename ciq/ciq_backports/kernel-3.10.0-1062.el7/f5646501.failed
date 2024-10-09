@@ -1,0 +1,510 @@
+netfilter: check if the socket netns is correct.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Flavio Leitner <fbl@redhat.com>
+commit f564650106a6e85702660fefd59fdff0877ab46a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f5646501.failed
+
+Netfilter assumes that if the socket is present in the skb, then
+it can be used because that reference is cleaned up while the skb
+is crossing netns.
+
+We want to change that to preserve the socket reference in a future
+patch, so this is a preparation updating netfilter to check if the
+socket netns matches before use it.
+
+	Signed-off-by: Flavio Leitner <fbl@redhat.com>
+	Acked-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f564650106a6e85702660fefd59fdff0877ab46a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/nf_log_ipv4.c
+#	net/ipv6/netfilter/nf_log_ipv6.c
+#	net/netfilter/nft_socket.c
+#	net/netfilter/xt_cgroup.c
+#	net/netfilter/xt_recent.c
+#	net/netfilter/xt_socket.c
+diff --cc net/ipv4/netfilter/nf_log_ipv4.c
+index f4a968e2a985,1e6f28c97d3a..000000000000
+--- a/net/ipv4/netfilter/nf_log_ipv4.c
++++ b/net/ipv4/netfilter/nf_log_ipv4.c
+@@@ -248,8 -250,8 +248,13 @@@ static void dump_ipv4_packet(struct ne
+  	}
+  
+  	/* Max length: 15 "UID=4294967295 " */
+++<<<<<<< HEAD
+ +	if ((logflags & XT_LOG_UID) && !iphoff)
+ +		nf_log_dump_sk_uid_gid(m, skb->sk);
+++=======
++ 	if ((logflags & NF_LOG_UID) && !iphoff)
++ 		nf_log_dump_sk_uid_gid(net, m, skb->sk);
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  
+  	/* Max length: 16 "MARK=0xFFFFFFFF " */
+  	if (!iphoff && skb->mark)
+diff --cc net/ipv6/netfilter/nf_log_ipv6.c
+index 00d0089702d7,c6bf580d0f33..000000000000
+--- a/net/ipv6/netfilter/nf_log_ipv6.c
++++ b/net/ipv6/netfilter/nf_log_ipv6.c
+@@@ -275,8 -277,8 +275,13 @@@ static void dump_ipv6_packet(struct ne
+  	}
+  
+  	/* Max length: 15 "UID=4294967295 " */
+++<<<<<<< HEAD
+ +	if ((logflags & XT_LOG_UID) && recurse)
+ +		nf_log_dump_sk_uid_gid(m, skb->sk);
+++=======
++ 	if ((logflags & NF_LOG_UID) && recurse)
++ 		nf_log_dump_sk_uid_gid(net, m, skb->sk);
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  
+  	/* Max length: 16 "MARK=0xFFFFFFFF " */
+  	if (recurse && skb->mark)
+diff --cc net/netfilter/xt_cgroup.c
+index b84640f525b7,5d92e1781980..000000000000
+--- a/net/netfilter/xt_cgroup.c
++++ b/net/netfilter/xt_cgroup.c
+@@@ -35,26 -69,71 +35,87 @@@ static int cgroup_mt_check(const struc
+  }
+  
+  static bool
+ -cgroup_mt_v0(const struct sk_buff *skb, struct xt_action_param *par)
+ +cgroup_mt(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+++<<<<<<< HEAD
+ +	const struct xt_cgroup_info *info = par->matchinfo;
+++=======
++ 	const struct xt_cgroup_info_v0 *info = par->matchinfo;
++ 	struct sock *sk = skb->sk;
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  
+- 	if (skb->sk == NULL || !sk_fullsock(skb->sk))
++ 	if (!sk || !sk_fullsock(sk) || !net_eq(xt_net(par), sock_net(sk)))
+  		return false;
+  
+ -	return (info->id == sock_cgroup_classid(&skb->sk->sk_cgrp_data)) ^
+ -		info->invert;
+ +	return (info->id == skb->sk->sk_classid) ^ info->invert;
+  }
+  
+++<<<<<<< HEAD
+ +static struct xt_match cgroup_mt_reg __read_mostly = {
+ +	.name       = "cgroup",
+ +	.revision   = 0,
+ +	.family     = NFPROTO_UNSPEC,
+ +	.checkentry = cgroup_mt_check,
+ +	.match      = cgroup_mt,
+ +	.matchsize  = sizeof(struct xt_cgroup_info),
+ +	.me         = THIS_MODULE,
+ +	.hooks      = (1 << NF_INET_LOCAL_OUT) |
+ +		      (1 << NF_INET_POST_ROUTING),
+++=======
++ static bool cgroup_mt_v1(const struct sk_buff *skb, struct xt_action_param *par)
++ {
++ 	const struct xt_cgroup_info_v1 *info = par->matchinfo;
++ 	struct sock_cgroup_data *skcd = &skb->sk->sk_cgrp_data;
++ 	struct cgroup *ancestor = info->priv;
++ 	struct sock *sk = skb->sk;
++ 
++ 	if (!sk || !sk_fullsock(sk) || !net_eq(xt_net(par), sock_net(sk)))
++ 		return false;
++ 
++ 	if (ancestor)
++ 		return cgroup_is_descendant(sock_cgroup_ptr(skcd), ancestor) ^
++ 			info->invert_path;
++ 	else
++ 		return (info->classid == sock_cgroup_classid(skcd)) ^
++ 			info->invert_classid;
++ }
++ 
++ static void cgroup_mt_destroy_v1(const struct xt_mtdtor_param *par)
++ {
++ 	struct xt_cgroup_info_v1 *info = par->matchinfo;
++ 
++ 	if (info->priv)
++ 		cgroup_put(info->priv);
++ }
++ 
++ static struct xt_match cgroup_mt_reg[] __read_mostly = {
++ 	{
++ 		.name		= "cgroup",
++ 		.revision	= 0,
++ 		.family		= NFPROTO_UNSPEC,
++ 		.checkentry	= cgroup_mt_check_v0,
++ 		.match		= cgroup_mt_v0,
++ 		.matchsize	= sizeof(struct xt_cgroup_info_v0),
++ 		.me		= THIS_MODULE,
++ 		.hooks		= (1 << NF_INET_LOCAL_OUT) |
++ 				  (1 << NF_INET_POST_ROUTING) |
++ 				  (1 << NF_INET_LOCAL_IN),
++ 	},
++ 	{
++ 		.name		= "cgroup",
++ 		.revision	= 1,
++ 		.family		= NFPROTO_UNSPEC,
++ 		.checkentry	= cgroup_mt_check_v1,
++ 		.match		= cgroup_mt_v1,
++ 		.matchsize	= sizeof(struct xt_cgroup_info_v1),
++ 		.usersize	= offsetof(struct xt_cgroup_info_v1, priv),
++ 		.destroy	= cgroup_mt_destroy_v1,
++ 		.me		= THIS_MODULE,
++ 		.hooks		= (1 << NF_INET_LOCAL_OUT) |
++ 				  (1 << NF_INET_POST_ROUTING) |
++ 				  (1 << NF_INET_LOCAL_IN),
++ 	},
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  };
+  
+  static int __init cgroup_mt_init(void)
+diff --cc net/netfilter/xt_recent.c
+index 31c5e0046dd0,f44de4bc2100..000000000000
+--- a/net/netfilter/xt_recent.c
++++ b/net/netfilter/xt_recent.c
+@@@ -258,7 -265,8 +258,12 @@@ recent_mt(const struct sk_buff *skb, st
+  	}
+  
+  	/* use TTL as seen before forwarding */
+++<<<<<<< HEAD
+ +	if (par->out != NULL && skb->sk == NULL)
+++=======
++ 	if (xt_out(par) != NULL &&
++ 	    (!skb->sk || !net_eq(net, sock_net(skb->sk))))
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  		ttl++;
+  
+  	spin_lock_bh(&recent_lock);
+diff --cc net/netfilter/xt_socket.c
+index 1ba67931eb1b,0472f3472842..000000000000
+--- a/net/netfilter/xt_socket.c
++++ b/net/netfilter/xt_socket.c
+@@@ -133,60 -53,15 +133,68 @@@ static boo
+  socket_match(const struct sk_buff *skb, struct xt_action_param *par,
+  	     const struct xt_socket_mtinfo1 *info)
+  {
+ -	struct sk_buff *pskb = (struct sk_buff *)skb;
+ +	const struct iphdr *iph = ip_hdr(skb);
+ +	struct udphdr _hdr, *hp = NULL;
+  	struct sock *sk = skb->sk;
+ +	__be32 uninitialized_var(daddr), uninitialized_var(saddr);
+ +	__be16 uninitialized_var(dport), uninitialized_var(sport);
+ +	u8 uninitialized_var(protocol);
+ +#ifdef XT_SOCKET_HAVE_CONNTRACK
+ +	struct nf_conn const *ct;
+ +	enum ip_conntrack_info ctinfo;
+ +#endif
+ +
+ +	if (iph->protocol == IPPROTO_UDP || iph->protocol == IPPROTO_TCP) {
+ +		hp = skb_header_pointer(skb, ip_hdrlen(skb),
+ +					sizeof(_hdr), &_hdr);
+ +		if (hp == NULL)
+ +			return false;
+ +
+ +		protocol = iph->protocol;
+ +		saddr = iph->saddr;
+ +		sport = hp->source;
+ +		daddr = iph->daddr;
+ +		dport = hp->dest;
+ +
+ +	} else if (iph->protocol == IPPROTO_ICMP) {
+ +		if (extract_icmp4_fields(skb, &protocol, &saddr, &daddr,
+ +					&sport, &dport))
+ +			return false;
+ +	} else {
+ +		return false;
+ +	}
+ +
+ +#ifdef XT_SOCKET_HAVE_CONNTRACK
+ +	/* Do the lookup with the original socket address in case this is a
+ +	 * reply packet of an established SNAT-ted connection. */
+ +
+ +	ct = nf_ct_get(skb, &ctinfo);
+ +	if (ct && !nf_ct_is_untracked(ct) &&
+ +	    ((iph->protocol != IPPROTO_ICMP &&
+ +	      ctinfo == IP_CT_ESTABLISHED_REPLY) ||
+ +	     (iph->protocol == IPPROTO_ICMP &&
+ +	      ctinfo == IP_CT_RELATED_REPLY)) &&
+ +	    (ct->status & IPS_SRC_NAT_DONE)) {
+ +
+ +		daddr = ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip;
+ +		dport = (iph->protocol == IPPROTO_TCP) ?
+ +			ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.tcp.port :
+ +			ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.udp.port;
+ +	}
+ +#endif
+  
++ 	if (!net_eq(xt_net(par), sock_net(sk)))
++ 		sk = NULL;
++ 
+  	if (!sk)
+++<<<<<<< HEAD
+ +		sk = xt_socket_get_sock_v4(dev_net(skb->dev), protocol,
+ +					   saddr, daddr, sport, dport,
+ +					   par->in);
+++=======
++ 		sk = nf_sk_lookup_slow_v4(xt_net(par), skb, xt_in(par));
++ 
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  	if (sk) {
+  		bool wildcard;
+  		bool transparent = true;
+@@@ -237,121 -109,20 +245,129 @@@ socket_mt4_v1_v2(const struct sk_buff *
+  	return socket_match(skb, par, par->matchinfo);
+  }
+  
+ -#if IS_ENABLED(CONFIG_IP6_NF_IPTABLES)
+ +#ifdef XT_SOCKET_HAVE_IPV6
+ +
+ +static int
+ +extract_icmp6_fields(const struct sk_buff *skb,
+ +		     unsigned int outside_hdrlen,
+ +		     int *protocol,
+ +		     struct in6_addr **raddr,
+ +		     struct in6_addr **laddr,
+ +		     __be16 *rport,
+ +		     __be16 *lport)
+ +{
+ +	struct ipv6hdr *inside_iph, _inside_iph;
+ +	struct icmp6hdr *icmph, _icmph;
+ +	__be16 *ports, _ports[2];
+ +	u8 inside_nexthdr;
+ +	__be16 inside_fragoff;
+ +	int inside_hdrlen;
+ +
+ +	icmph = skb_header_pointer(skb, outside_hdrlen,
+ +				   sizeof(_icmph), &_icmph);
+ +	if (icmph == NULL)
+ +		return 1;
+ +
+ +	if (icmph->icmp6_type & ICMPV6_INFOMSG_MASK)
+ +		return 1;
+ +
+ +	inside_iph = skb_header_pointer(skb, outside_hdrlen + sizeof(_icmph), sizeof(_inside_iph), &_inside_iph);
+ +	if (inside_iph == NULL)
+ +		return 1;
+ +	inside_nexthdr = inside_iph->nexthdr;
+ +
+ +	inside_hdrlen = ipv6_skip_exthdr(skb, outside_hdrlen + sizeof(_icmph) + sizeof(_inside_iph),
+ +					 &inside_nexthdr, &inside_fragoff);
+ +	if (inside_hdrlen < 0)
+ +		return 1; /* hjm: Packet has no/incomplete transport layer headers. */
+ +
+ +	if (inside_nexthdr != IPPROTO_TCP &&
+ +	    inside_nexthdr != IPPROTO_UDP)
+ +		return 1;
+ +
+ +	ports = skb_header_pointer(skb, inside_hdrlen,
+ +				   sizeof(_ports), &_ports);
+ +	if (ports == NULL)
+ +		return 1;
+ +
+ +	/* the inside IP packet is the one quoted from our side, thus
+ +	 * its saddr is the local address */
+ +	*protocol = inside_nexthdr;
+ +	*laddr = &inside_iph->saddr;
+ +	*lport = ports[0];
+ +	*raddr = &inside_iph->daddr;
+ +	*rport = ports[1];
+ +
+ +	return 0;
+ +}
+ +
+ +static struct sock *
+ +xt_socket_get_sock_v6(struct net *net, const u8 protocol,
+ +		      const struct in6_addr *saddr, const struct in6_addr *daddr,
+ +		      const __be16 sport, const __be16 dport,
+ +		      const struct net_device *in)
+ +{
+ +	switch (protocol) {
+ +	case IPPROTO_TCP:
+ +		return inet6_lookup(net, &tcp_hashinfo,
+ +				    saddr, sport, daddr, dport,
+ +				    in->ifindex);
+ +	case IPPROTO_UDP:
+ +		return udp6_lib_lookup(net, saddr, sport, daddr, dport,
+ +				       in->ifindex);
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+  static bool
+ -socket_mt6_v1_v2_v3(const struct sk_buff *skb, struct xt_action_param *par)
+ +socket_mt6_v1_v2(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+ -	const struct xt_socket_mtinfo1 *info = (struct xt_socket_mtinfo1 *) par->matchinfo;
+ -	struct sk_buff *pskb = (struct sk_buff *)skb;
+ +	struct ipv6hdr *iph = ipv6_hdr(skb);
+ +	struct udphdr _hdr, *hp = NULL;
+  	struct sock *sk = skb->sk;
+ +	struct in6_addr *daddr = NULL, *saddr = NULL;
+ +	__be16 uninitialized_var(dport), uninitialized_var(sport);
+ +	int thoff = 0, uninitialized_var(tproto);
+ +	const struct xt_socket_mtinfo1 *info = (struct xt_socket_mtinfo1 *) par->matchinfo;
+ +
+ +	tproto = ipv6_find_hdr(skb, &thoff, -1, NULL, NULL);
+ +	if (tproto < 0) {
+ +		pr_debug("unable to find transport header in IPv6 packet, dropping\n");
+ +		return NF_DROP;
+ +	}
+ +
+ +	if (tproto == IPPROTO_UDP || tproto == IPPROTO_TCP) {
+ +		hp = skb_header_pointer(skb, thoff,
+ +					sizeof(_hdr), &_hdr);
+ +		if (hp == NULL)
+ +			return false;
+ +
+ +		saddr = &iph->saddr;
+ +		sport = hp->source;
+ +		daddr = &iph->daddr;
+ +		dport = hp->dest;
+ +
+ +	} else if (tproto == IPPROTO_ICMPV6) {
+ +		if (extract_icmp6_fields(skb, thoff, &tproto, &saddr, &daddr,
+ +					 &sport, &dport))
+ +			return false;
+ +	} else {
+ +		return false;
+ +	}
+  
++ 	if (!net_eq(xt_net(par), sock_net(sk)))
++ 		sk = NULL;
++ 
+  	if (!sk)
+++<<<<<<< HEAD
+ +		sk = xt_socket_get_sock_v6(dev_net(skb->dev), tproto,
+ +					   saddr, daddr, sport, dport,
+ +					   par->in);
+++=======
++ 		sk = nf_sk_lookup_slow_v6(xt_net(par), skb, xt_in(par));
++ 
+++>>>>>>> f564650106a6 (netfilter: check if the socket netns is correct.)
+  	if (sk) {
+  		bool wildcard;
+  		bool transparent = true;
+* Unmerged path net/netfilter/nft_socket.c
+diff --git a/include/net/netfilter/nf_log.h b/include/net/netfilter/nf_log.h
+index 8c4b018eef72..7ac9b602d5bb 100644
+--- a/include/net/netfilter/nf_log.h
++++ b/include/net/netfilter/nf_log.h
+@@ -104,7 +104,8 @@ int nf_log_dump_udp_header(struct nf_log_buf *m, const struct sk_buff *skb,
+ int nf_log_dump_tcp_header(struct nf_log_buf *m, const struct sk_buff *skb,
+ 			   u8 proto, int fragment, unsigned int offset,
+ 			   unsigned int logflags);
+-void nf_log_dump_sk_uid_gid(struct nf_log_buf *m, struct sock *sk);
++void nf_log_dump_sk_uid_gid(struct net *net, struct nf_log_buf *m,
++			    struct sock *sk);
+ void nf_log_dump_packet_common(struct nf_log_buf *m, u_int8_t pf,
+ 			       unsigned int hooknum, const struct sk_buff *skb,
+ 			       const struct net_device *in,
+* Unmerged path net/ipv4/netfilter/nf_log_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_log_ipv6.c
+diff --git a/net/netfilter/nf_conntrack_broadcast.c b/net/netfilter/nf_conntrack_broadcast.c
+index 4e99cca61612..c4aef4f465bc 100644
+--- a/net/netfilter/nf_conntrack_broadcast.c
++++ b/net/netfilter/nf_conntrack_broadcast.c
+@@ -33,7 +33,7 @@ int nf_conntrack_broadcast_help(struct sk_buff *skb,
+ 	__be32 mask = 0;
+ 
+ 	/* we're only interested in locally generated packets */
+-	if (skb->sk == NULL)
++	if (skb->sk == NULL || !net_eq(nf_ct_net(ct), sock_net(skb->sk)))
+ 		goto out;
+ 	if (rt == NULL || !(rt->rt_flags & RTCF_BROADCAST))
+ 		goto out;
+diff --git a/net/netfilter/nf_log_common.c b/net/netfilter/nf_log_common.c
+index a5aa5967b8e1..dfe16bea0283 100644
+--- a/net/netfilter/nf_log_common.c
++++ b/net/netfilter/nf_log_common.c
+@@ -132,9 +132,10 @@ int nf_log_dump_tcp_header(struct nf_log_buf *m, const struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL_GPL(nf_log_dump_tcp_header);
+ 
+-void nf_log_dump_sk_uid_gid(struct nf_log_buf *m, struct sock *sk)
++void nf_log_dump_sk_uid_gid(struct net *net, struct nf_log_buf *m,
++			    struct sock *sk)
+ {
+-	if (!sk || !sk_fullsock(sk))
++	if (!sk || !sk_fullsock(sk) || !net_eq(net, sock_net(sk)))
+ 		return;
+ 
+ 	read_lock_bh(&sk->sk_callback_lock);
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index e27cb2a1f56a..992d6e3ab6e9 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -88,6 +88,7 @@ int nf_xfrm_me_harder(struct net *net, struct sk_buff *skb, unsigned int family)
+ 	struct flowi fl;
+ 	unsigned int hh_len;
+ 	struct dst_entry *dst;
++	struct sock *sk = skb->sk;
+ 	int err;
+ 
+ 	err = xfrm_decode_session(skb, &fl, family);
+@@ -99,7 +100,10 @@ int nf_xfrm_me_harder(struct net *net, struct sk_buff *skb, unsigned int family)
+ 		dst = ((struct xfrm_dst *)dst)->route;
+ 	dst_hold(dst);
+ 
+-	dst = xfrm_lookup(net, dst, &fl, skb->sk, 0);
++	if (sk && !net_eq(net, sock_net(sk)))
++		sk = NULL;
++
++	dst = xfrm_lookup(net, dst, &fl, sk, 0);
+ 	if (IS_ERR(dst))
+ 		return PTR_ERR(dst);
+ 
+diff --git a/net/netfilter/nft_meta.c b/net/netfilter/nft_meta.c
+index 5c2aa110f022..572c784d8a97 100644
+--- a/net/netfilter/nft_meta.c
++++ b/net/netfilter/nft_meta.c
+@@ -89,7 +89,8 @@ void nft_meta_get_eval(const struct nft_expr *expr,
+ 		break;
+ 	case NFT_META_SKUID:
+ 		sk = skb_to_full_sk(skb);
+-		if (!sk || !sk_fullsock(sk))
++		if (!sk || !sk_fullsock(sk) ||
++		    !net_eq(nft_net(pkt), sock_net(sk)))
+ 			goto err;
+ 
+ 		read_lock_bh(&sk->sk_callback_lock);
+@@ -105,7 +106,8 @@ void nft_meta_get_eval(const struct nft_expr *expr,
+ 		break;
+ 	case NFT_META_SKGID:
+ 		sk = skb_to_full_sk(skb);
+-		if (!sk || !sk_fullsock(sk))
++		if (!sk || !sk_fullsock(sk) ||
++		    !net_eq(nft_net(pkt), sock_net(sk)))
+ 			goto err;
+ 
+ 		read_lock_bh(&sk->sk_callback_lock);
+@@ -172,7 +174,8 @@ void nft_meta_get_eval(const struct nft_expr *expr,
+ 		break;
+ 	case NFT_META_CGROUP:
+ 		sk = skb_to_full_sk(skb);
+-		if (!sk || !sk_fullsock(sk))
++		if (!sk || !sk_fullsock(sk) ||
++		    !net_eq(nft_net(pkt), sock_net(sk)))
+ 			goto err;
+ 		*dest = sk->sk_classid;
+ 		break;
+* Unmerged path net/netfilter/nft_socket.c
+* Unmerged path net/netfilter/xt_cgroup.c
+diff --git a/net/netfilter/xt_owner.c b/net/netfilter/xt_owner.c
+index 1302b475abcb..626799f11342 100644
+--- a/net/netfilter/xt_owner.c
++++ b/net/netfilter/xt_owner.c
+@@ -36,7 +36,7 @@ owner_mt(const struct sk_buff *skb, struct xt_action_param *par)
+ 	const struct file *filp;
+ 	struct sock *sk = skb_to_full_sk(skb);
+ 
+-	if (sk == NULL || sk->sk_socket == NULL)
++	if (!sk || !sk->sk_socket || !net_eq(net, sock_net(sk)))
+ 		return (info->match ^ info->invert) == 0;
+ 	else if (info->match & info->invert & XT_OWNER_SOCKET)
+ 		/*
+* Unmerged path net/netfilter/xt_recent.c
+* Unmerged path net/netfilter/xt_socket.c
