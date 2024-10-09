@@ -1,0 +1,119 @@
+perf evlist: Drop redundant evsel->overwrite indicator
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 32a951b4fd6bbe60ef5d65930b1712321e241b27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/32a951b4.failed
+
+evsel->overwrite indicator means an event should be put into
+overwritable ring buffer. In current implementation, it equals to
+evsel->attr.write_backward. To reduce compliexity, remove
+evsel->overwrite, use evsel->attr.write_backward instead.
+
+In addition, in __perf_evsel__open(), if kernel doesn't support
+write_backward and user explicitly set it in evsel, don't fallback
+like other missing feature, since it is meaningless to fall back to
+a forward ring buffer in this case: we are unable to stably read
+from an forward overwritable ring buffer.
+
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1468485287-33422-2-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 32a951b4fd6bbe60ef5d65930b1712321e241b27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+diff --cc tools/perf/util/evsel.c
+index c914890ab3f1,9ac2f92ce88d..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -1437,7 -1505,20 +1440,24 @@@ try_fallback
+  	if (err != -EINVAL || cpu > 0 || thread > 0)
+  		goto out_close;
+  
+++<<<<<<< HEAD
+ +	if (!perf_missing_features.cloexec && (flags & PERF_FLAG_FD_CLOEXEC)) {
+++=======
++ 	/*
++ 	 * Must probe features in the order they were added to the
++ 	 * perf_event_attr interface.
++ 	 */
++ 	if (!perf_missing_features.write_backward && evsel->attr.write_backward) {
++ 		perf_missing_features.write_backward = true;
++ 		goto out_close;
++ 	} else if (!perf_missing_features.clockid_wrong && evsel->attr.use_clockid) {
++ 		perf_missing_features.clockid_wrong = true;
++ 		goto fallback_missing_features;
++ 	} else if (!perf_missing_features.clockid && evsel->attr.use_clockid) {
++ 		perf_missing_features.clockid = true;
++ 		goto fallback_missing_features;
++ 	} else if (!perf_missing_features.cloexec && (flags & PERF_FLAG_FD_CLOEXEC)) {
+++>>>>>>> 32a951b4fd6b (perf evlist: Drop redundant evsel->overwrite indicator)
+  		perf_missing_features.cloexec = true;
+  		goto fallback_missing_features;
+  	} else if (!perf_missing_features.mmap2 && evsel->attr.mmap2) {
+@@@ -2423,6 -2419,14 +2443,17 @@@ int perf_evsel__open_strerror(struct pe
+  	"The PMU counters are busy/taken by another profiler.\n"
+  	"We found oprofile daemon running, please stop it and try again.");
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case EINVAL:
++ 		if (evsel->attr.write_backward && perf_missing_features.write_backward)
++ 			return scnprintf(msg, size, "Reading from overwrite event is not supported by this kernel.");
++ 		if (perf_missing_features.clockid)
++ 			return scnprintf(msg, size, "clockid feature not supported.");
++ 		if (perf_missing_features.clockid_wrong)
++ 			return scnprintf(msg, size, "wrong clockid (%d).", clockid);
++ 		break;
+++>>>>>>> 32a951b4fd6b (perf evlist: Drop redundant evsel->overwrite indicator)
+  	default:
+  		break;
+  	}
+diff --git a/tools/perf/tests/backward-ring-buffer.c b/tools/perf/tests/backward-ring-buffer.c
+index d9ba991a9a30..3eeaac5485cf 100644
+--- a/tools/perf/tests/backward-ring-buffer.c
++++ b/tools/perf/tests/backward-ring-buffer.c
+@@ -101,6 +101,7 @@ int test__backward_ring_buffer(int subtest __maybe_unused)
+ 		return TEST_FAIL;
+ 	}
+ 
++	evlist->backward = true;
+ 	err = perf_evlist__create_maps(evlist, &opts.target);
+ 	if (err < 0) {
+ 		pr_debug("Not enough memory to create thread/cpu maps\n");
+diff --git a/tools/perf/util/evlist.c b/tools/perf/util/evlist.c
+index a05dccbd41f4..2f320d2c36dc 100644
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@ -1003,7 +1003,7 @@ static bool
+ perf_evlist__should_poll(struct perf_evlist *evlist __maybe_unused,
+ 			 struct perf_evsel *evsel)
+ {
+-	if (evsel->overwrite)
++	if (evsel->attr.write_backward)
+ 		return false;
+ 	return true;
+ }
+@@ -1018,7 +1018,7 @@ static int perf_evlist__mmap_per_evsel(struct perf_evlist *evlist, int idx,
+ 	evlist__for_each(evlist, evsel) {
+ 		int fd;
+ 
+-		if (evsel->overwrite != (evlist->overwrite && evlist->backward))
++		if (!!evsel->attr.write_backward != (evlist->overwrite && evlist->backward))
+ 			continue;
+ 
+ 		if (evsel->system_wide && thread)
+* Unmerged path tools/perf/util/evsel.c
