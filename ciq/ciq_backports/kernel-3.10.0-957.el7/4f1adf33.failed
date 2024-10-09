@@ -1,0 +1,305 @@
+xfs: more do_div cleanups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Eric Sandeen <sandeen@redhat.com>
+commit 4f1adf3373f072246c14119b2aa6dfb4d6510a43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4f1adf33.failed
+
+On some architectures do_div does the pointer compare
+trick to make sure that we've sent it an unsigned 64-bit
+number.  (Why unsigned?  I don't know.)
+
+Fix up the few places that squawk about this; in
+xfs_bmap_wants_extents() we just used a bare int64_t so change
+that to unsigned.
+
+In xfs_adjust_extent_unmap_boundaries() all we wanted was the
+mod, and we have an xfs-specific function to handle that w/o
+side effects, which includes proper casting for do_div.
+
+In xfs_daddr_to_ag[b]no, we were using the wrong type anyway;
+XFS_BB_TO_FSBT returns a block in the filesystem, so use
+xfs_rfsblock_t not xfs_daddr_t, and gain the unsignedness
+from that type as a bonus.
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 4f1adf3373f072246c14119b2aa6dfb4d6510a43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 0b8885f65b8b,0fdff08145c1..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -4716,6 -4855,222 +4716,225 @@@ xfs_bmap_split_indlen
+  	return stolen;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int
++ xfs_bmap_del_extent_delay(
++ 	struct xfs_inode	*ip,
++ 	int			whichfork,
++ 	xfs_extnum_t		*idx,
++ 	struct xfs_bmbt_irec	*got,
++ 	struct xfs_bmbt_irec	*del)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	struct xfs_bmbt_irec	new;
++ 	int64_t			da_old, da_new, da_diff = 0;
++ 	xfs_fileoff_t		del_endoff, got_endoff;
++ 	xfs_filblks_t		got_indlen, new_indlen, stolen;
++ 	int			error = 0, state = 0;
++ 	bool			isrt;
++ 
++ 	XFS_STATS_INC(mp, xs_del_exlist);
++ 
++ 	isrt = (whichfork == XFS_DATA_FORK) && XFS_IS_REALTIME_INODE(ip);
++ 	del_endoff = del->br_startoff + del->br_blockcount;
++ 	got_endoff = got->br_startoff + got->br_blockcount;
++ 	da_old = startblockval(got->br_startblock);
++ 	da_new = 0;
++ 
++ 	ASSERT(*idx >= 0);
++ 	ASSERT(*idx <= xfs_iext_count(ifp));
++ 	ASSERT(del->br_blockcount > 0);
++ 	ASSERT(got->br_startoff <= del->br_startoff);
++ 	ASSERT(got_endoff >= del_endoff);
++ 
++ 	if (isrt) {
++ 		uint64_t rtexts = XFS_FSB_TO_B(mp, del->br_blockcount);
++ 
++ 		do_div(rtexts, mp->m_sb.sb_rextsize);
++ 		xfs_mod_frextents(mp, rtexts);
++ 	}
++ 
++ 	/*
++ 	 * Update the inode delalloc counter now and wait to update the
++ 	 * sb counters as we might have to borrow some blocks for the
++ 	 * indirect block accounting.
++ 	 */
++ 	error = xfs_trans_reserve_quota_nblks(NULL, ip,
++ 			-((long)del->br_blockcount), 0,
++ 			isrt ? XFS_QMOPT_RES_RTBLKS : XFS_QMOPT_RES_REGBLKS);
++ 	if (error)
++ 		return error;
++ 	ip->i_delayed_blks -= del->br_blockcount;
++ 
++ 	if (whichfork == XFS_COW_FORK)
++ 		state |= BMAP_COWFORK;
++ 
++ 	if (got->br_startoff == del->br_startoff)
++ 		state |= BMAP_LEFT_CONTIG;
++ 	if (got_endoff == del_endoff)
++ 		state |= BMAP_RIGHT_CONTIG;
++ 
++ 	switch (state & (BMAP_LEFT_CONTIG | BMAP_RIGHT_CONTIG)) {
++ 	case BMAP_LEFT_CONTIG | BMAP_RIGHT_CONTIG:
++ 		/*
++ 		 * Matches the whole extent.  Delete the entry.
++ 		 */
++ 		xfs_iext_remove(ip, *idx, 1, state);
++ 		--*idx;
++ 		break;
++ 	case BMAP_LEFT_CONTIG:
++ 		/*
++ 		 * Deleting the first part of the extent.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 		got->br_startoff = del_endoff;
++ 		got->br_blockcount -= del->br_blockcount;
++ 		da_new = XFS_FILBLKS_MIN(xfs_bmap_worst_indlen(ip,
++ 				got->br_blockcount), da_old);
++ 		got->br_startblock = nullstartblock((int)da_new);
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, state, _THIS_IP_);
++ 		break;
++ 	case BMAP_RIGHT_CONTIG:
++ 		/*
++ 		 * Deleting the last part of the extent.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 		got->br_blockcount = got->br_blockcount - del->br_blockcount;
++ 		da_new = XFS_FILBLKS_MIN(xfs_bmap_worst_indlen(ip,
++ 				got->br_blockcount), da_old);
++ 		got->br_startblock = nullstartblock((int)da_new);
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, state, _THIS_IP_);
++ 		break;
++ 	case 0:
++ 		/*
++ 		 * Deleting the middle of the extent.
++ 		 *
++ 		 * Distribute the original indlen reservation across the two new
++ 		 * extents.  Steal blocks from the deleted extent if necessary.
++ 		 * Stealing blocks simply fudges the fdblocks accounting below.
++ 		 * Warn if either of the new indlen reservations is zero as this
++ 		 * can lead to delalloc problems.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 
++ 		got->br_blockcount = del->br_startoff - got->br_startoff;
++ 		got_indlen = xfs_bmap_worst_indlen(ip, got->br_blockcount);
++ 
++ 		new.br_blockcount = got_endoff - del_endoff;
++ 		new_indlen = xfs_bmap_worst_indlen(ip, new.br_blockcount);
++ 
++ 		WARN_ON_ONCE(!got_indlen || !new_indlen);
++ 		stolen = xfs_bmap_split_indlen(da_old, &got_indlen, &new_indlen,
++ 						       del->br_blockcount);
++ 
++ 		got->br_startblock = nullstartblock((int)got_indlen);
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, 0, _THIS_IP_);
++ 
++ 		new.br_startoff = del_endoff;
++ 		new.br_state = got->br_state;
++ 		new.br_startblock = nullstartblock((int)new_indlen);
++ 
++ 		++*idx;
++ 		xfs_iext_insert(ip, *idx, 1, &new, state);
++ 
++ 		da_new = got_indlen + new_indlen - stolen;
++ 		del->br_blockcount -= stolen;
++ 		break;
++ 	}
++ 
++ 	ASSERT(da_old >= da_new);
++ 	da_diff = da_old - da_new;
++ 	if (!isrt)
++ 		da_diff += del->br_blockcount;
++ 	if (da_diff)
++ 		xfs_mod_fdblocks(mp, da_diff, false);
++ 	return error;
++ }
++ 
++ void
++ xfs_bmap_del_extent_cow(
++ 	struct xfs_inode	*ip,
++ 	xfs_extnum_t		*idx,
++ 	struct xfs_bmbt_irec	*got,
++ 	struct xfs_bmbt_irec	*del)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, XFS_COW_FORK);
++ 	struct xfs_bmbt_irec	new;
++ 	xfs_fileoff_t		del_endoff, got_endoff;
++ 	int			state = BMAP_COWFORK;
++ 
++ 	XFS_STATS_INC(mp, xs_del_exlist);
++ 
++ 	del_endoff = del->br_startoff + del->br_blockcount;
++ 	got_endoff = got->br_startoff + got->br_blockcount;
++ 
++ 	ASSERT(*idx >= 0);
++ 	ASSERT(*idx <= xfs_iext_count(ifp));
++ 	ASSERT(del->br_blockcount > 0);
++ 	ASSERT(got->br_startoff <= del->br_startoff);
++ 	ASSERT(got_endoff >= del_endoff);
++ 	ASSERT(!isnullstartblock(got->br_startblock));
++ 
++ 	if (got->br_startoff == del->br_startoff)
++ 		state |= BMAP_LEFT_CONTIG;
++ 	if (got_endoff == del_endoff)
++ 		state |= BMAP_RIGHT_CONTIG;
++ 
++ 	switch (state & (BMAP_LEFT_CONTIG | BMAP_RIGHT_CONTIG)) {
++ 	case BMAP_LEFT_CONTIG | BMAP_RIGHT_CONTIG:
++ 		/*
++ 		 * Matches the whole extent.  Delete the entry.
++ 		 */
++ 		xfs_iext_remove(ip, *idx, 1, state);
++ 		--*idx;
++ 		break;
++ 	case BMAP_LEFT_CONTIG:
++ 		/*
++ 		 * Deleting the first part of the extent.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 		got->br_startoff = del_endoff;
++ 		got->br_blockcount -= del->br_blockcount;
++ 		got->br_startblock = del->br_startblock + del->br_blockcount;
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, state, _THIS_IP_);
++ 		break;
++ 	case BMAP_RIGHT_CONTIG:
++ 		/*
++ 		 * Deleting the last part of the extent.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 		got->br_blockcount -= del->br_blockcount;
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, state, _THIS_IP_);
++ 		break;
++ 	case 0:
++ 		/*
++ 		 * Deleting the middle of the extent.
++ 		 */
++ 		trace_xfs_bmap_pre_update(ip, *idx, state, _THIS_IP_);
++ 		got->br_blockcount = del->br_startoff - got->br_startoff;
++ 		xfs_bmbt_set_all(xfs_iext_get_ext(ifp, *idx), got);
++ 		trace_xfs_bmap_post_update(ip, *idx, state, _THIS_IP_);
++ 
++ 		new.br_startoff = del_endoff;
++ 		new.br_blockcount = got_endoff - del_endoff;
++ 		new.br_state = got->br_state;
++ 		new.br_startblock = del->br_startblock + del->br_blockcount;
++ 
++ 		++*idx;
++ 		xfs_iext_insert(ip, *idx, 1, &new, state);
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 4f1adf3373f0 (xfs: more do_div cleanups)
+  /*
+   * Called by xfs_bmapi to update file extent records and the btree
+   * after removing space (or undoing a delayed allocation).
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 20f90814b349..62c9b8c5b1d7 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -1067,11 +1067,8 @@ xfs_adjust_extent_unmap_boundaries(
+ 		return error;
+ 
+ 	if (nimap && imap.br_startblock != HOLESTARTBLOCK) {
+-		xfs_daddr_t	block;
+-
+ 		ASSERT(imap.br_startblock != DELAYSTARTBLOCK);
+-		block = imap.br_startblock;
+-		mod = do_div(block, mp->m_sb.sb_rextsize);
++		mod = do_mod(imap.br_startblock, mp->m_sb.sb_rextsize);
+ 		if (mod)
+ 			*startoffset_fsb += mp->m_sb.sb_rextsize - mod;
+ 	}
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index 364cc3b0b7a2..3310dafbd633 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -300,7 +300,7 @@ void xfs_do_force_shutdown(struct xfs_mount *mp, int flags, char *fname,
+ static inline xfs_agnumber_t
+ xfs_daddr_to_agno(struct xfs_mount *mp, xfs_daddr_t d)
+ {
+-	xfs_daddr_t ld = XFS_BB_TO_FSBT(mp, d);
++	xfs_rfsblock_t ld = XFS_BB_TO_FSBT(mp, d);
+ 	do_div(ld, mp->m_sb.sb_agblocks);
+ 	return (xfs_agnumber_t) ld;
+ }
+@@ -308,7 +308,7 @@ xfs_daddr_to_agno(struct xfs_mount *mp, xfs_daddr_t d)
+ static inline xfs_agblock_t
+ xfs_daddr_to_agbno(struct xfs_mount *mp, xfs_daddr_t d)
+ {
+-	xfs_daddr_t ld = XFS_BB_TO_FSBT(mp, d);
++	xfs_rfsblock_t ld = XFS_BB_TO_FSBT(mp, d);
+ 	return (xfs_agblock_t) do_div(ld, mp->m_sb.sb_agblocks);
+ }
+ 
