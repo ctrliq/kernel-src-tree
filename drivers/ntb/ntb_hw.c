@@ -1209,7 +1209,7 @@ static int ntb_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			dev_warn(&pdev->dev, "Cannot remap BAR %d\n",
 				 MW_TO_BAR(i));
 			rc = -EIO;
-			goto err3;
+			goto err4;
 		}
 	}
 
