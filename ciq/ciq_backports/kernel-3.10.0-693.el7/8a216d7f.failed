@@ -1,0 +1,770 @@
+ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [acpi] acpica: tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags (Prarit Bhargava) [1425180]
+Rebuild_FUZZ: 99.03%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit 8a216d7f6aa94c3e252bbfdb2c422e2d0380084e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8a216d7f.failed
+
+This patch refines ACPI_TABLE_ORIGIN_xxx flags.  No functional changes.
+
+The previous commits have introduced the following internal APIs:
+1. acpi_tb_acquire_table: Acquire struct acpi_table_header according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+2. acpi_tb_release_table: Release struct acpi_table_header according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+3. acpi_tb_install_table: Make struct acpi_table_desc.Address not NULL according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+4. acpi_tb_uninstall_table: Make struct acpi_table_desc.Address NULL according to
+                         ACPI_TABLE_ORIGIN_xxx flags.
+5. acpi_tb_validate_table: Make struct acpi_table_desc.Pointer not NULL according to
+                        ACPI_TABLE_ORIGIN_xxx flags.
+6. acpi_tb_invalidate_table: Make struct acpi_table_desc.Pointer NULL according to
+                          ACPI_TABLE_ORIGIN_xxx flags.
+It thus detects that the ACPI_TABLE_ORIGIN_UNKNOWN is redundant to
+ACPI_TABLE_ORIGIN_OVERRIDE.
+
+The ACPI_TABLE_ORIGIN_xxTERN_VIRTUAL flags are named as VIRTUAL in order
+not to confuse with x86 logical address, this patch also renames all
+"logical override" into "virtual override".
+
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Bob Moore <robert.moore@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 8a216d7f6aa94c3e252bbfdb2c422e2d0380084e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/exconfig.c
+#	drivers/acpi/acpica/tbinstal.c
+#	drivers/acpi/acpica/tbutils.c
+#	drivers/acpi/acpica/tbxfload.c
+diff --cc drivers/acpi/acpica/exconfig.c
+index 5bff332aa0f0,4dfe6c07b004..000000000000
+--- a/drivers/acpi/acpica/exconfig.c
++++ b/drivers/acpi/acpica/exconfig.c
+@@@ -484,22 -478,14 +484,31 @@@ acpi_ex_load_op(union acpi_operand_obje
+  		return_ACPI_STATUS(AE_AML_OPERAND_TYPE);
+  	}
+  
+ +	/* Validate table checksum (will not get validated in tb_add_table) */
+ +
+ +	status = acpi_tb_verify_checksum(table_desc.pointer, length);
+ +	if (ACPI_FAILURE(status)) {
+ +		ACPI_FREE(table_desc.pointer);
+ +		return_ACPI_STATUS(status);
+ +	}
+ +
+ +	/* Complete the table descriptor */
+ +
+ +	table_desc.length = length;
+ +	table_desc.flags = ACPI_TABLE_ORIGIN_ALLOCATED;
+ +
+  	/* Install the new table into the local data structures */
+  
+++<<<<<<< HEAD
+ +	status = acpi_tb_add_table(&table_desc, &table_index);
+++=======
++ 	ACPI_INFO((AE_INFO, "Dynamic OEM Table Load:"));
++ 	(void)acpi_ut_acquire_mutex(ACPI_MTX_TABLES);
++ 	status = acpi_tb_install_non_fixed_table(ACPI_PTR_TO_PHYSADDR(table),
++ 						 ACPI_TABLE_ORIGIN_INTERN_VIRTUAL,
++ 						 TRUE, &table_index);
++ 	(void)acpi_ut_release_mutex(ACPI_MTX_TABLES);
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  	if (ACPI_FAILURE(status)) {
+  
+  		/* Delete allocated table buffer */
+diff --cc drivers/acpi/acpica/tbinstal.c
+index 4024bfc5fa21,cf1ccc576629..000000000000
+--- a/drivers/acpi/acpica/tbinstal.c
++++ b/drivers/acpi/acpica/tbinstal.c
+@@@ -49,6 -49,173 +49,176 @@@
+  #define _COMPONENT          ACPI_TABLES
+  ACPI_MODULE_NAME("tbinstal")
+  
+++<<<<<<< HEAD
+++=======
++ /* Local prototypes */
++ static acpi_status
++ acpi_tb_acquire_temporal_table(struct acpi_table_desc *table_desc,
++ 			       acpi_physical_address address, u8 flags);
++ 
++ static void acpi_tb_release_temporal_table(struct acpi_table_desc *table_desc);
++ 
++ static acpi_status acpi_tb_acquire_root_table_entry(u32 *table_index);
++ 
++ static u8
++ acpi_tb_is_equivalent_table(struct acpi_table_desc *table_desc,
++ 			    u32 table_index);
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_acquire_table
++  *
++  * PARAMETERS:  table_desc          - Table descriptor
++  *              table_ptr           - Where table is returned
++  *              table_length        - Where table length is returned
++  *              table_flags         - Where table allocation flags are returned
++  *
++  * RETURN:      Status
++  *
++  * DESCRIPTION: Acquire a table. It can be used for tables not maintained in
++  *              acpi_gbl_root_table_list.
++  *
++  ******************************************************************************/
++ 
++ acpi_status
++ acpi_tb_acquire_table(struct acpi_table_desc *table_desc,
++ 		      struct acpi_table_header **table_ptr,
++ 		      u32 *table_length, u8 *table_flags)
++ {
++ 	struct acpi_table_header *table = NULL;
++ 
++ 	switch (table_desc->flags & ACPI_TABLE_ORIGIN_MASK) {
++ 	case ACPI_TABLE_ORIGIN_INTERN_PHYSICAL:
++ 
++ 		table =
++ 		    acpi_os_map_memory(table_desc->address, table_desc->length);
++ 		break;
++ 
++ 	case ACPI_TABLE_ORIGIN_INTERN_VIRTUAL:
++ 	case ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL:
++ 
++ 		table =
++ 		    ACPI_CAST_PTR(struct acpi_table_header,
++ 				  table_desc->address);
++ 		break;
++ 
++ 	default:
++ 
++ 		break;
++ 	}
++ 
++ 	/* Table is not valid yet */
++ 
++ 	if (!table) {
++ 		return (AE_NO_MEMORY);
++ 	}
++ 
++ 	/* Fill the return values */
++ 
++ 	*table_ptr = table;
++ 	*table_length = table_desc->length;
++ 	*table_flags = table_desc->flags;
++ 
++ 	return (AE_OK);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_release_table
++  *
++  * PARAMETERS:  table               - Pointer for the table
++  *              table_length        - Length for the table
++  *              table_flags         - Allocation flags for the table
++  *
++  * RETURN:      None
++  *
++  * DESCRIPTION: Release a table. The reversal of acpi_tb_acquire_table().
++  *
++  ******************************************************************************/
++ 
++ void
++ acpi_tb_release_table(struct acpi_table_header *table,
++ 		      u32 table_length, u8 table_flags)
++ {
++ 	switch (table_flags & ACPI_TABLE_ORIGIN_MASK) {
++ 	case ACPI_TABLE_ORIGIN_INTERN_PHYSICAL:
++ 
++ 		acpi_os_unmap_memory(table, table_length);
++ 		break;
++ 
++ 	case ACPI_TABLE_ORIGIN_INTERN_VIRTUAL:
++ 	case ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL:
++ 	default:
++ 
++ 		break;
++ 	}
++ }
++ 
++ /******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_validate_table
++  *
++  * PARAMETERS:  table_desc          - Table descriptor
++  *
++  * RETURN:      Status
++  *
++  * DESCRIPTION: This function is called to validate the table, the returned
++  *              table descriptor is in "VALIDATED" state.
++  *
++  *****************************************************************************/
++ 
++ acpi_status acpi_tb_validate_table(struct acpi_table_desc *table_desc)
++ {
++ 	acpi_status status = AE_OK;
++ 
++ 	ACPI_FUNCTION_TRACE(tb_validate_table);
++ 
++ 	/* Validate the table if necessary */
++ 
++ 	if (!table_desc->pointer) {
++ 		status = acpi_tb_acquire_table(table_desc, &table_desc->pointer,
++ 					       &table_desc->length,
++ 					       &table_desc->flags);
++ 		if (!table_desc->pointer) {
++ 			status = AE_NO_MEMORY;
++ 		}
++ 	}
++ 
++ 	return_ACPI_STATUS(status);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_invalidate_table
++  *
++  * PARAMETERS:  table_desc          - Table descriptor
++  *
++  * RETURN:      None
++  *
++  * DESCRIPTION: Invalidate one internal ACPI table, this is reversal of
++  *              acpi_tb_validate_table().
++  *
++  ******************************************************************************/
++ 
++ void acpi_tb_invalidate_table(struct acpi_table_desc *table_desc)
++ {
++ 
++ 	ACPI_FUNCTION_TRACE(tb_invalidate_table);
++ 
++ 	/* Table must be validated */
++ 
++ 	if (!table_desc->pointer) {
++ 		return_VOID;
++ 	}
++ 
++ 	acpi_tb_release_table(table_desc->pointer, table_desc->length,
++ 			      table_desc->flags);
++ 	table_desc->pointer = NULL;
++ 
++ 	return_VOID;
++ }
++ 
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  /******************************************************************************
+   *
+   * FUNCTION:    acpi_tb_verify_table
+@@@ -112,9 -278,275 +282,279 @@@ acpi_status acpi_tb_verify_table(struc
+  
+  /*******************************************************************************
+   *
+ - * FUNCTION:    acpi_tb_install_table
+ + * FUNCTION:    acpi_tb_add_table
+   *
+++<<<<<<< HEAD
+ + * PARAMETERS:  table_desc          - Table descriptor
+++=======
++  * PARAMETERS:  table_desc              - Table descriptor
++  *              address                 - Physical address of the table
++  *              flags                   - Allocation flags of the table
++  *              table                   - Pointer to the table
++  *
++  * RETURN:      None
++  *
++  * DESCRIPTION: Install an ACPI table into the global data structure.
++  *
++  ******************************************************************************/
++ 
++ void
++ acpi_tb_install_table(struct acpi_table_desc *table_desc,
++ 		      acpi_physical_address address,
++ 		      u8 flags, struct acpi_table_header *table)
++ {
++ 	/*
++ 	 * Initialize the table entry. Set the pointer to NULL, since the
++ 	 * table is not fully mapped at this time.
++ 	 */
++ 	ACPI_MEMSET(table_desc, 0, sizeof(struct acpi_table_desc));
++ 	table_desc->address = address;
++ 	table_desc->length = table->length;
++ 	table_desc->flags = flags;
++ 	ACPI_MOVE_32_TO_32(table_desc->signature.ascii, table->signature);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_acquire_temporal_table
++  *
++  * PARAMETERS:  table_desc          - Table descriptor to be acquired
++  *              address             - Address of the table
++  *              flags               - Allocation flags of the table
++  *
++  * RETURN:      Status
++  *
++  * DESCRIPTION: This function validates the table header to obtain the length
++  *              of a table and fills the table descriptor to make its state as
++  *              "INSTALLED".  Such table descriptor is only used for verified
++  *              installation.
++  *
++  ******************************************************************************/
++ 
++ static acpi_status
++ acpi_tb_acquire_temporal_table(struct acpi_table_desc *table_desc,
++ 			       acpi_physical_address address, u8 flags)
++ {
++ 	struct acpi_table_header *table_header;
++ 
++ 	switch (flags & ACPI_TABLE_ORIGIN_MASK) {
++ 	case ACPI_TABLE_ORIGIN_INTERN_PHYSICAL:
++ 
++ 		/* Try to obtain the length of the table */
++ 
++ 		table_header =
++ 		    acpi_os_map_memory(address,
++ 				       sizeof(struct acpi_table_header));
++ 		if (!table_header) {
++ 			return (AE_NO_MEMORY);
++ 		}
++ 		acpi_tb_install_table(table_desc, address, flags, table_header);
++ 		acpi_os_unmap_memory(table_header,
++ 				     sizeof(struct acpi_table_header));
++ 		return (AE_OK);
++ 
++ 	case ACPI_TABLE_ORIGIN_INTERN_VIRTUAL:
++ 	case ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL:
++ 
++ 		table_header = ACPI_CAST_PTR(struct acpi_table_header, address);
++ 		if (!table_header) {
++ 			return (AE_NO_MEMORY);
++ 		}
++ 		acpi_tb_install_table(table_desc, address, flags, table_header);
++ 		return (AE_OK);
++ 
++ 	default:
++ 
++ 		break;
++ 	}
++ 
++ 	/* Table is not valid yet */
++ 
++ 	return (AE_NO_MEMORY);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_release_temporal_table
++  *
++  * PARAMETERS:  table_desc          - Table descriptor to be released
++  *
++  * RETURN:      Status
++  *
++  * DESCRIPTION: The reversal of acpi_tb_acquire_temporal_table().
++  *
++  ******************************************************************************/
++ 
++ static void acpi_tb_release_temporal_table(struct acpi_table_desc *table_desc)
++ {
++ 	/*
++ 	 * Note that the .Address is maintained by the callers of
++ 	 * acpi_tb_acquire_temporal_table(), thus do not invoke acpi_tb_uninstall_table()
++ 	 * where .Address will be freed.
++ 	 */
++ 	acpi_tb_invalidate_table(table_desc);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_install_and_override_table
++  *
++  * PARAMETERS:  table_index             - Index into root table array
++  *              new_table_desc          - New table descriptor to install
++  *
++  * RETURN:      None
++  *
++  * DESCRIPTION: Install an ACPI table into the global data structure. The
++  *              table override mechanism is called to allow the host
++  *              OS to replace any table before it is installed in the root
++  *              table array.
++  *
++  ******************************************************************************/
++ 
++ void
++ acpi_tb_install_and_override_table(u32 table_index,
++ 				   struct acpi_table_desc *new_table_desc)
++ {
++ 	if (table_index >= acpi_gbl_root_table_list.current_table_count) {
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * ACPI Table Override:
++ 	 *
++ 	 * Before we install the table, let the host OS override it with a new
++ 	 * one if desired. Any table within the RSDT/XSDT can be replaced,
++ 	 * including the DSDT which is pointed to by the FADT.
++ 	 */
++ 	acpi_tb_override_table(new_table_desc);
++ 
++ 	acpi_tb_install_table(&acpi_gbl_root_table_list.tables[table_index],
++ 			      new_table_desc->address, new_table_desc->flags,
++ 			      new_table_desc->pointer);
++ 
++ 	acpi_tb_print_table_header(new_table_desc->address,
++ 				   new_table_desc->pointer);
++ 
++ 	/* Set the global integer width (based upon revision of the DSDT) */
++ 
++ 	if (table_index == ACPI_TABLE_INDEX_DSDT) {
++ 		acpi_ut_set_integer_width(new_table_desc->pointer->revision);
++ 	}
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_install_fixed_table
++  *
++  * PARAMETERS:  address                 - Physical address of DSDT or FACS
++  *              signature               - Table signature, NULL if no need to
++  *                                        match
++  *              table_index             - Index into root table array
++  *
++  * RETURN:      Status
++  *
++  * DESCRIPTION: Install a fixed ACPI table (DSDT/FACS) into the global data
++  *              structure.
++  *
++  ******************************************************************************/
++ 
++ acpi_status
++ acpi_tb_install_fixed_table(acpi_physical_address address,
++ 			    char *signature, u32 table_index)
++ {
++ 	struct acpi_table_desc new_table_desc;
++ 	acpi_status status;
++ 
++ 	ACPI_FUNCTION_TRACE(tb_install_fixed_table);
++ 
++ 	if (!address) {
++ 		ACPI_ERROR((AE_INFO,
++ 			    "Null physical address for ACPI table [%s]",
++ 			    signature));
++ 		return (AE_NO_MEMORY);
++ 	}
++ 
++ 	/* Fill a table descriptor for validation */
++ 
++ 	status = acpi_tb_acquire_temporal_table(&new_table_desc, address,
++ 						ACPI_TABLE_ORIGIN_INTERN_PHYSICAL);
++ 	if (ACPI_FAILURE(status)) {
++ 		ACPI_ERROR((AE_INFO, "Could not acquire table length at %p",
++ 			    ACPI_CAST_PTR(void, address)));
++ 		return_ACPI_STATUS(status);
++ 	}
++ 
++ 	/* Validate and verify a table before installation */
++ 
++ 	status = acpi_tb_verify_table(&new_table_desc, signature);
++ 	if (ACPI_FAILURE(status)) {
++ 		goto release_and_exit;
++ 	}
++ 
++ 	acpi_tb_install_and_override_table(table_index, &new_table_desc);
++ 
++ release_and_exit:
++ 
++ 	/* Release the temporal table descriptor */
++ 
++ 	acpi_tb_release_temporal_table(&new_table_desc);
++ 	return_ACPI_STATUS(status);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_is_equivalent_table
++  *
++  * PARAMETERS:  table_desc          - Table 1 descriptor to be compared
++  *              table_index         - Index of table 2 to be compared
++  *
++  * RETURN:      TRUE if 2 tables are equivalent
++  *
++  * DESCRIPTION: This function is called to compare a table with what have
++  *              already been installed in the root table list.
++  *
++  ******************************************************************************/
++ 
++ static u8
++ acpi_tb_is_equivalent_table(struct acpi_table_desc *table_desc, u32 table_index)
++ {
++ 	acpi_status status = AE_OK;
++ 	u8 is_equivalent;
++ 	struct acpi_table_header *table;
++ 	u32 table_length;
++ 	u8 table_flags;
++ 
++ 	status =
++ 	    acpi_tb_acquire_table(&acpi_gbl_root_table_list.tables[table_index],
++ 				  &table, &table_length, &table_flags);
++ 	if (ACPI_FAILURE(status)) {
++ 		return (FALSE);
++ 	}
++ 
++ 	/*
++ 	 * Check for a table match on the entire table length,
++ 	 * not just the header.
++ 	 */
++ 	is_equivalent = (u8)((table_desc->length != table_length ||
++ 			      ACPI_MEMCMP(table_desc->pointer, table,
++ 					  table_length)) ? FALSE : TRUE);
++ 
++ 	/* Release the acquired table */
++ 
++ 	acpi_tb_release_table(table, table_length, table_flags);
++ 
++ 	return (is_equivalent);
++ }
++ 
++ /*******************************************************************************
++  *
++  * FUNCTION:    acpi_tb_install_non_fixed_table
++  *
++  * PARAMETERS:  address             - Address of the table (might be a virtual
++  *                                    address depending on the table_flags)
++  *              flags               - Flags for the table
++  *              reload              - Whether reload should be performed
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+   *              table_index         - Where the table index is returned
+   *
+   * RETURN:      Status
+@@@ -289,36 -709,27 +729,52 @@@ struct acpi_table_header *acpi_tb_table
+  
+  	/* (1) Attempt logical override (returns a logical address) */
+  
+++<<<<<<< HEAD
+ +	status = acpi_os_table_override(table_header, &new_table);
+ +	if (ACPI_SUCCESS(status) && new_table) {
+ +		new_address = ACPI_PTR_TO_PHYSADDR(new_table);
+ +		new_table_length = new_table->length;
+ +		new_flags = ACPI_TABLE_ORIGIN_OVERRIDE;
+++=======
++ 	status = acpi_os_table_override(old_table_desc->pointer, &table);
++ 	if (ACPI_SUCCESS(status) && table) {
++ 		acpi_tb_acquire_temporal_table(&new_table_desc,
++ 					       ACPI_PTR_TO_PHYSADDR(table),
++ 					       ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL);
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  		override_type = "Logical";
+  		goto finish_override;
+  	}
+  
+  	/* (2) Attempt physical override (returns a physical address) */
+  
+++<<<<<<< HEAD
+ +	status = acpi_os_physical_table_override(table_header,
+ +						 &new_address,
+ +						 &new_table_length);
+ +	if (ACPI_SUCCESS(status) && new_address && new_table_length) {
+ +
+ +		/* Map the entire new table */
+ +
+ +		new_table = acpi_os_map_memory(new_address, new_table_length);
+ +		if (!new_table) {
+ +			ACPI_EXCEPTION((AE_INFO, AE_NO_MEMORY,
+ +					"%4.4s %p Attempted physical table override failed",
+ +					table_header->signature,
+ +					ACPI_CAST_PTR(void,
+ +						      table_desc->address)));
+ +			return (NULL);
+ +		}
+ +
+++=======
++ 	status = acpi_os_physical_table_override(old_table_desc->pointer,
++ 						 &address, &length);
++ 	if (ACPI_SUCCESS(status) && address && length) {
++ 		acpi_tb_acquire_temporal_table(&new_table_desc, address,
++ 					       ACPI_TABLE_ORIGIN_INTERN_PHYSICAL);
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  		override_type = "Physical";
+ +		new_flags = ACPI_TABLE_ORIGIN_MAPPED;
+  		goto finish_override;
+  	}
+  
+@@@ -474,35 -911,27 +930,41 @@@ acpi_tb_store_table(acpi_physical_addre
+   *
+   ******************************************************************************/
+  
+ -void acpi_tb_uninstall_table(struct acpi_table_desc *table_desc)
+ +void acpi_tb_delete_table(struct acpi_table_desc *table_desc)
+  {
+  
+ -	ACPI_FUNCTION_TRACE(tb_uninstall_table);
+ -
+ -	/* Table must be installed */
+ +	/* Table must be mapped or allocated */
+  
+ -	if (!table_desc->address) {
+ -		return_VOID;
+ +	if (!table_desc->pointer) {
+ +		return;
+  	}
+  
+ -	acpi_tb_invalidate_table(table_desc);
+ +	switch (table_desc->flags & ACPI_TABLE_ORIGIN_MASK) {
+ +	case ACPI_TABLE_ORIGIN_MAPPED:
+  
+++<<<<<<< HEAD
+ +		acpi_os_unmap_memory(table_desc->pointer, table_desc->length);
+ +		break;
+ +
+ +	case ACPI_TABLE_ORIGIN_ALLOCATED:
+ +
+ +		ACPI_FREE(table_desc->pointer);
+ +		table_desc->address = ACPI_PTR_TO_PHYSADDR(NULL);
+ +		break;
+ +
+ +		/* Not mapped or allocated, there is nothing we can do */
+ +
+ +	default:
+ +
+ +		return;
+++=======
++ 	if ((table_desc->flags & ACPI_TABLE_ORIGIN_MASK) ==
++ 	    ACPI_TABLE_ORIGIN_INTERN_VIRTUAL) {
++ 		ACPI_FREE(ACPI_CAST_PTR(void, table_desc->address));
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  	}
+  
+ -	table_desc->address = ACPI_PTR_TO_PHYSADDR(NULL);
+ -
+ -	return_VOID;
+ +	table_desc->pointer = NULL;
+  }
+  
+  /*******************************************************************************
+diff --cc drivers/acpi/acpica/tbutils.c
+index 61ffb069ecd5,1bf9de7c6636..000000000000
+--- a/drivers/acpi/acpica/tbutils.c
++++ b/drivers/acpi/acpica/tbutils.c
+@@@ -236,10 -178,11 +236,18 @@@ struct acpi_table_header *acpi_tb_copy_
+  	}
+  
+  	ACPI_MEMCPY(new_table, table_desc->pointer, table_desc->length);
+++<<<<<<< HEAD
+ +	acpi_tb_delete_table(table_desc);
+ +	table_desc->address = ACPI_PTR_TO_PHYSADDR(new_table);
+ +	table_desc->pointer = new_table;
+ +	table_desc->flags = ACPI_TABLE_ORIGIN_ALLOCATED;
+++=======
++ 	acpi_tb_uninstall_table(table_desc);
++ 	acpi_tb_install_table(&acpi_gbl_root_table_list.
++ 			      tables[ACPI_TABLE_INDEX_DSDT],
++ 			      ACPI_PTR_TO_PHYSADDR(new_table),
++ 			      ACPI_TABLE_ORIGIN_INTERN_VIRTUAL, new_table);
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  
+  	ACPI_INFO((AE_INFO,
+  		   "Forced DSDT copy: length 0x%05X copied locally, original unmapped",
+@@@ -564,12 -469,21 +572,28 @@@ acpi_tb_parse_root_table(acpi_physical_
+  
+  		/* Get the table physical address (32-bit for RSDT, 64-bit for XSDT) */
+  
+++<<<<<<< HEAD
+ +		acpi_gbl_root_table_list.tables[acpi_gbl_root_table_list.
+ +						current_table_count].address =
+ +		    acpi_tb_get_root_table_entry(table_entry, table_entry_size);
+++=======
++ 		status =
++ 		    acpi_tb_install_non_fixed_table(acpi_tb_get_root_table_entry
++ 						    (table_entry,
++ 						     table_entry_size),
++ 						    ACPI_TABLE_ORIGIN_INTERN_PHYSICAL,
++ 						    FALSE, &table_index);
++ 
++ 		if (ACPI_SUCCESS(status) &&
++ 		    ACPI_COMPARE_NAME(&acpi_gbl_root_table_list.
++ 				      tables[table_index].signature,
++ 				      ACPI_SIG_FADT)) {
++ 			acpi_tb_parse_fadt(table_index);
++ 		}
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  
+  		table_entry += table_entry_size;
+ +		acpi_gbl_root_table_list.current_table_count++;
+  	}
+  
+  	/*
+diff --cc drivers/acpi/acpica/tbxfload.c
+index 2620dbe96cfa,62bbd384ac49..000000000000
+--- a/drivers/acpi/acpica/tbxfload.c
++++ b/drivers/acpi/acpica/tbxfload.c
+@@@ -255,7 -246,22 +255,26 @@@ acpi_status acpi_load_table(struct acpi
+  	/* Install the table and load it into the namespace */
+  
+  	ACPI_INFO((AE_INFO, "Host-directed Dynamic ACPI Table Load:"));
+++<<<<<<< HEAD
+ +	status = acpi_tb_add_table(&table_desc, &table_index);
+++=======
++ 	(void)acpi_ut_acquire_mutex(ACPI_MTX_TABLES);
++ 	status = acpi_tb_install_non_fixed_table(ACPI_PTR_TO_PHYSADDR(table),
++ 						 ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL,
++ 						 TRUE, &table_index);
++ 	(void)acpi_ut_release_mutex(ACPI_MTX_TABLES);
++ 	if (ACPI_FAILURE(status)) {
++ 		goto unlock_and_exit;
++ 	}
++ 
++ 	/*
++ 	 * Note: Now table is "INSTALLED", it must be validated before
++ 	 * using.
++ 	 */
++ 	status =
++ 	    acpi_tb_validate_table(&acpi_gbl_root_table_list.
++ 				   tables[table_index]);
+++>>>>>>> 8a216d7f6aa9 (ACPICA: Tables: Cleanup ACPI_TABLE_ORIGIN_xxx flags.)
+  	if (ACPI_FAILURE(status)) {
+  		goto unlock_and_exit;
+  	}
+* Unmerged path drivers/acpi/acpica/exconfig.c
+* Unmerged path drivers/acpi/acpica/tbinstal.c
+* Unmerged path drivers/acpi/acpica/tbutils.c
+diff --git a/drivers/acpi/acpica/tbxface.c b/drivers/acpi/acpica/tbxface.c
+index ba6e31d96bc1..65ce85ef6ab0 100644
+--- a/drivers/acpi/acpica/tbxface.c
++++ b/drivers/acpi/acpica/tbxface.c
+@@ -229,7 +229,7 @@ acpi_get_table_header(char *signature,
+ 		if (!acpi_gbl_root_table_list.tables[i].pointer) {
+ 			if ((acpi_gbl_root_table_list.tables[i].flags &
+ 			     ACPI_TABLE_ORIGIN_MASK) ==
+-			    ACPI_TABLE_ORIGIN_MAPPED) {
++			    ACPI_TABLE_ORIGIN_INTERN_PHYSICAL) {
+ 				header =
+ 				    acpi_os_map_memory(acpi_gbl_root_table_list.
+ 						       tables[i].address,
+* Unmerged path drivers/acpi/acpica/tbxfload.c
+diff --git a/include/acpi/actbl.h b/include/acpi/actbl.h
+index 9b58a8f43771..bc282e22422b 100644
+--- a/include/acpi/actbl.h
++++ b/include/acpi/actbl.h
+@@ -347,12 +347,11 @@ struct acpi_table_desc {
+ 
+ /* Masks for Flags field above */
+ 
+-#define ACPI_TABLE_ORIGIN_UNKNOWN       (0)
+-#define ACPI_TABLE_ORIGIN_MAPPED        (1)
+-#define ACPI_TABLE_ORIGIN_ALLOCATED     (2)
+-#define ACPI_TABLE_ORIGIN_OVERRIDE      (4)
+-#define ACPI_TABLE_ORIGIN_MASK          (7)
+-#define ACPI_TABLE_IS_LOADED            (8)
++#define ACPI_TABLE_ORIGIN_EXTERN_VIRTUAL    (0)	/* Virtual address, external maintained */
++#define ACPI_TABLE_ORIGIN_INTERN_PHYSICAL   (1)	/* Physical address, internal mapped */
++#define ACPI_TABLE_ORIGIN_INTERN_VIRTUAL    (2)	/* Virtual address, internal allocated */
++#define ACPI_TABLE_ORIGIN_MASK              (3)
++#define ACPI_TABLE_IS_LOADED                (8)
+ 
+ /*
+  * Get the remaining ACPI tables
