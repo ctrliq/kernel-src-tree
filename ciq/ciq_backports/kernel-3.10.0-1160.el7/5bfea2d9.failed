@@ -1,0 +1,123 @@
+mm: Fix mremap not considering huge pmd devmap
+
+jira LE-1907
+cve CVE-2020-10757
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Fan Yang <Fan_Yang@sjtu.edu.cn>
+commit 5bfea2d9b17f1034a68147a8b03b9789af5700f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/5bfea2d9.failed
+
+The original code in mm/mremap.c checks huge pmd by:
+
+		if (is_swap_pmd(*old_pmd) || pmd_trans_huge(*old_pmd)) {
+
+However, a DAX mapped nvdimm is mapped as huge page (by default) but it
+is not transparent huge page (_PAGE_PSE | PAGE_DEVMAP).  This commit
+changes the condition to include the case.
+
+This addresses CVE-2020-10757.
+
+Fixes: 5c7fb56e5e3f ("mm, dax: dax-pmd vs thp-pmd vs hugetlbfs-pmd")
+	Cc: <stable@vger.kernel.org>
+	Reported-by: Fan Yang <Fan_Yang@sjtu.edu.cn>
+	Signed-off-by: Fan Yang <Fan_Yang@sjtu.edu.cn>
+	Tested-by: Fan Yang <Fan_Yang@sjtu.edu.cn>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5bfea2d9b17f1034a68147a8b03b9789af5700f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pgtable.h
+#	mm/mremap.c
+diff --cc arch/x86/include/asm/pgtable.h
+index f19fbbc8ad8e,b8f46bbe69f4..000000000000
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@@ -210,11 -257,7 +210,15 @@@ static inline int pmd_large(pmd_t pte
+  }
+  
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+++<<<<<<< HEAD
+ +static inline int pmd_trans_splitting(pmd_t pmd)
+ +{
+ +	return pmd_val(pmd) & _PAGE_SPLITTING;
+ +}
+ +
+++=======
++ /* NOTE: when predicate huge page, consider also pmd_devmap, or use pmd_large */
+++>>>>>>> 5bfea2d9b17f (mm: Fix mremap not considering huge pmd devmap)
+  static inline int pmd_trans_huge(pmd_t pmd)
+  {
+  	return (pmd_val(pmd) & (_PAGE_PSE|_PAGE_DEVMAP)) == _PAGE_PSE;
+diff --cc mm/mremap.c
+index 793a0391c137,57b1f999f789..000000000000
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@@ -211,28 -266,42 +211,32 @@@ unsigned long move_page_tables(struct v
+  		new_pmd = alloc_new_pmd(vma->vm_mm, vma, new_addr);
+  		if (!new_pmd)
+  			break;
+++<<<<<<< HEAD
+ +		if (pmd_trans_huge(*old_pmd)) {
+ +			int err = 0;
+++=======
++ 		if (is_swap_pmd(*old_pmd) || pmd_trans_huge(*old_pmd) || pmd_devmap(*old_pmd)) {
+++>>>>>>> 5bfea2d9b17f (mm: Fix mremap not considering huge pmd devmap)
+  			if (extent == HPAGE_PMD_SIZE) {
+ -				bool moved;
+ +				VM_BUG_ON(vma->vm_file || !vma->anon_vma);
+  				/* See comment in move_ptes() */
+  				if (need_rmap_locks)
+ -					take_rmap_locks(vma);
+ -				moved = move_huge_pmd(vma, old_addr, new_addr,
+ -						    old_end, old_pmd, new_pmd);
+ +					anon_vma_lock_write(vma->anon_vma);
+ +				err = move_huge_pmd(vma, new_vma, old_addr,
+ +						    new_addr, old_end,
+ +						    old_pmd, new_pmd);
+  				if (need_rmap_locks)
+ -					drop_rmap_locks(vma);
+ -				if (moved)
+ -					continue;
+ +					anon_vma_unlock_write(vma->anon_vma);
+  			}
+ -			split_huge_pmd(vma, old_pmd, old_addr);
+ -			if (pmd_trans_unstable(old_pmd))
+ -				continue;
+ -		} else if (extent == PMD_SIZE) {
+ -#ifdef CONFIG_HAVE_MOVE_PMD
+ -			/*
+ -			 * If the extent is PMD-sized, try to speed the move by
+ -			 * moving at the PMD level if possible.
+ -			 */
+ -			bool moved;
+ -
+ -			if (need_rmap_locks)
+ -				take_rmap_locks(vma);
+ -			moved = move_normal_pmd(vma, old_addr, new_addr,
+ -					old_end, old_pmd, new_pmd);
+ -			if (need_rmap_locks)
+ -				drop_rmap_locks(vma);
+ -			if (moved)
+ +			if (err > 0)
+  				continue;
+ -#endif
+ +			else if (!err) {
+ +				split_huge_page_pmd(vma, old_addr, old_pmd);
+ +			}
+ +			VM_BUG_ON(pmd_trans_huge(*old_pmd));
+  		}
+ -
+ -		if (pte_alloc(new_vma->vm_mm, new_pmd))
+ +		if (pmd_none(*new_pmd) && __pte_alloc(new_vma->vm_mm, new_vma,
+ +						      new_pmd, new_addr))
+  			break;
+  		next = (new_addr + PMD_SIZE) & PMD_MASK;
+  		if (extent > next - new_addr)
+* Unmerged path arch/x86/include/asm/pgtable.h
+* Unmerged path mm/mremap.c
