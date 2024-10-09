@@ -1,0 +1,189 @@
+xprtrdma: Per-connection pad optimization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b5f0afbea4f2ea52c613ac2b06cb6de2ea18cb6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b5f0afbe.failed
+
+Pad optimization is changed by echoing into
+/proc/sys/sunrpc/rdma_pad_optimize. This is a global setting,
+affecting all RPC-over-RDMA connections to all servers.
+
+The marshaling code picks up that value and uses it for decisions
+about how to construct each RPC-over-RDMA frame. Having it change
+suddenly in mid-operation can result in unexpected failures. And
+some servers a client mounts might need chunk round-up, while
+others don't.
+
+So instead, copy the pad_optimize setting into each connection's
+rpcrdma_ia when the transport is created, and use the copy, which
+can't change during the life of the connection, instead.
+
+This also removes a hack: rpcrdma_convert_iovs was using
+the remote-invalidation-expected flag to predict when it could leave
+out Write chunk padding. This is because the Linux server handles
+implicit XDR padding on Write chunks correctly, and only Linux
+servers can set the connection's remote-invalidation-expected flag.
+
+It's more sensible to use the pad optimization setting instead.
+
+Fixes: 677eb17e94ed ("xprtrdma: Fix XDR tail buffer marshalling")
+	Cc: stable@vger.kernel.org # v4.9+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b5f0afbea4f2ea52c613ac2b06cb6de2ea18cb6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 83e624c2ef04,c634f0f3f9ce..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -231,17 -186,18 +231,23 @@@ rpcrdma_convert_kvec(struct kvec *vec, 
+   */
+  
+  static int
+++<<<<<<< HEAD
+ +rpcrdma_convert_iovs(struct xdr_buf *xdrbuf, unsigned int pos,
+ +	enum rpcrdma_chunktype type, struct rpcrdma_mr_seg *seg, int nsegs)
+++=======
++ rpcrdma_convert_iovs(struct rpcrdma_xprt *r_xprt, struct xdr_buf *xdrbuf,
++ 		     unsigned int pos, enum rpcrdma_chunktype type,
++ 		     struct rpcrdma_mr_seg *seg)
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  {
+ -	int len, n, p, page_base;
+ +	int len, n = 0, p;
+ +	int page_base;
+  	struct page **ppages;
+  
+ -	n = 0;
+  	if (pos == 0) {
+ -		n = rpcrdma_convert_kvec(&xdrbuf->head[0], seg, n);
+ -		if (n == RPCRDMA_MAX_SEGS)
+ -			goto out_overflow;
+ +		n = rpcrdma_convert_kvec(&xdrbuf->head[0], seg, n, nsegs);
+ +		if (n == nsegs)
+ +			return -EIO;
+  	}
+  
+  	len = xdrbuf->page_len;
+@@@ -267,11 -223,21 +273,26 @@@
+  	}
+  
+  	/* Message overflows the seg array */
+ -	if (len && n == RPCRDMA_MAX_SEGS)
+ -		goto out_overflow;
+ +	if (len && n == nsegs)
+ +		return -EIO;
+  
+++<<<<<<< HEAD
+ +	/* When encoding the read list, the tail is always sent inline */
+ +	if (type == rpcrdma_readch)
+++=======
++ 	/* When encoding a Read chunk, the tail iovec contains an
++ 	 * XDR pad and may be omitted.
++ 	 */
++ 	if (type == rpcrdma_readch && r_xprt->rx_ia.ri_implicit_roundup)
++ 		return n;
++ 
++ 	/* When encoding a Write chunk, some servers need to see an
++ 	 * extra segment for non-XDR-aligned Write chunks. The upper
++ 	 * layer provides space in the tail iovec that may be used
++ 	 * for this purpose.
++ 	 */
++ 	if (type == rpcrdma_writech && r_xprt->rx_ia.ri_implicit_roundup)
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  		return n;
+  
+  	if (xdrbuf->tail[0].iov_len) {
+@@@ -475,8 -291,9 +496,14 @@@ rpcrdma_encode_read_list(struct rpcrdma
+  	pos = rqst->rq_snd_buf.head[0].iov_len;
+  	if (rtype == rpcrdma_areadch)
+  		pos = 0;
+++<<<<<<< HEAD
+ +	nsegs = rpcrdma_convert_iovs(&rqst->rq_snd_buf, pos, rtype, seg,
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 	seg = req->rl_segments;
++ 	nsegs = rpcrdma_convert_iovs(r_xprt, &rqst->rq_snd_buf, pos,
++ 				     rtype, seg);
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+@@@ -537,10 -354,10 +564,17 @@@ rpcrdma_encode_write_list(struct rpcrdm
+  		return iptr;
+  	}
+  
+++<<<<<<< HEAD
+ +	nsegs = rpcrdma_convert_iovs(&rqst->rq_rcv_buf,
+ +				     rqst->rq_rcv_buf.head[0].iov_len,
+ +				     wtype, seg,
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 	seg = req->rl_segments;
++ 	nsegs = rpcrdma_convert_iovs(r_xprt, &rqst->rq_rcv_buf,
++ 				     rqst->rq_rcv_buf.head[0].iov_len,
++ 				     wtype, seg);
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+@@@ -604,8 -421,8 +638,13 @@@ rpcrdma_encode_reply_chunk(struct rpcrd
+  		return iptr;
+  	}
+  
+++<<<<<<< HEAD
+ +	nsegs = rpcrdma_convert_iovs(&rqst->rq_rcv_buf, 0, wtype, seg,
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 	seg = req->rl_segments;
++ 	nsegs = rpcrdma_convert_iovs(r_xprt, &rqst->rq_rcv_buf, 0, wtype, seg);
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index dc48dad17dcd,2a6a367a2dac..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -212,6 -206,9 +212,12 @@@ rpcrdma_update_connect_private(struct r
+  	const struct rpcrdma_connect_private *pmsg = param->private_data;
+  	unsigned int rsize, wsize;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Default settings for RPC-over-RDMA Version One */
++ 	r_xprt->rx_ia.ri_reminv_expected = false;
++ 	r_xprt->rx_ia.ri_implicit_roundup = xprt_rdma_pad_optimize;
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  	rsize = RPCRDMA_V1_DEF_INLINE_SIZE;
+  	wsize = RPCRDMA_V1_DEF_INLINE_SIZE;
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6,c13715431419..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -75,6 -74,9 +75,12 @@@ struct rpcrdma_ia 
+  	unsigned int		ri_max_frmr_depth;
+  	unsigned int		ri_max_inline_write;
+  	unsigned int		ri_max_inline_read;
+++<<<<<<< HEAD
+++=======
++ 	bool			ri_reminv_expected;
++ 	bool			ri_implicit_roundup;
++ 	enum ib_mr_type		ri_mrtype;
+++>>>>>>> b5f0afbea4f2 (xprtrdma: Per-connection pad optimization)
+  	struct ib_qp_attr	ri_qp_attr;
+  	struct ib_qp_init_attr	ri_qp_init_attr;
+  };
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
