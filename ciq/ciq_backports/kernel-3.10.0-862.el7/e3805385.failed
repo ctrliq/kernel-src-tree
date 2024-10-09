@@ -1,0 +1,287 @@
+power_supply: fix return value of get_property
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rhyland Klein <rklein@nvidia.com>
+commit e380538529e83c5d3fd27e8cbfcc1f9799cb6bbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e3805385.failed
+
+power_supply_get_property() should ideally return -EAGAIN if it is
+called while the power_supply is being registered. There was no way
+previously to determine if use_cnt == 0 meant that the power_supply
+wasn't fully registered yet, or if it had already been unregistered.
+
+Add a new boolean to the power_supply struct to simply show if
+registration is completed. Lastly, modify the check in
+power_supply_show_property() to also ignore -EAGAIN when so it
+doesn't complain about not returning the property.
+
+	Signed-off-by: Rhyland Klein <rklein@nvidia.com>
+	Signed-off-by: Sebastian Reichel <sre@kernel.org>
+(cherry picked from commit e380538529e83c5d3fd27e8cbfcc1f9799cb6bbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/power/power_supply_core.c
+#	drivers/power/power_supply_sysfs.c
+#	include/linux/power_supply.h
+diff --cc drivers/power/power_supply_core.c
+index 0d8164e2f763,c2ef0c0dfa9d..000000000000
+--- a/drivers/power/power_supply_core.c
++++ b/drivers/power/power_supply_core.c
+@@@ -331,9 -388,154 +331,157 @@@ struct power_supply *power_supply_get_b
+  }
+  EXPORT_SYMBOL_GPL(power_supply_get_by_name);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * power_supply_put() - Drop reference obtained with power_supply_get_by_name
++  * @psy: Reference to put
++  *
++  * The reference to power supply should be put before unregistering
++  * the power supply.
++  */
++ void power_supply_put(struct power_supply *psy)
++ {
++ 	might_sleep();
++ 
++ 	atomic_dec(&psy->use_cnt);
++ 	put_device(&psy->dev);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_put);
++ 
++ #ifdef CONFIG_OF
++ static int power_supply_match_device_node(struct device *dev, const void *data)
++ {
++ 	return dev->parent && dev->parent->of_node == data;
++ }
++ 
++ /**
++  * power_supply_get_by_phandle() - Search for a power supply and returns its ref
++  * @np: Pointer to device node holding phandle property
++  * @phandle_name: Name of property holding a power supply name
++  *
++  * If power supply was found, it increases reference count for the
++  * internal power supply's device. The user should power_supply_put()
++  * after usage.
++  *
++  * Return: On success returns a reference to a power supply with
++  * matching name equals to value under @property, NULL or ERR_PTR otherwise.
++  */
++ struct power_supply *power_supply_get_by_phandle(struct device_node *np,
++ 							const char *property)
++ {
++ 	struct device_node *power_supply_np;
++ 	struct power_supply *psy = NULL;
++ 	struct device *dev;
++ 
++ 	power_supply_np = of_parse_phandle(np, property, 0);
++ 	if (!power_supply_np)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	dev = class_find_device(power_supply_class, NULL, power_supply_np,
++ 						power_supply_match_device_node);
++ 
++ 	of_node_put(power_supply_np);
++ 
++ 	if (dev) {
++ 		psy = dev_get_drvdata(dev);
++ 		atomic_inc(&psy->use_cnt);
++ 	}
++ 
++ 	return psy;
++ }
++ EXPORT_SYMBOL_GPL(power_supply_get_by_phandle);
++ 
++ static void devm_power_supply_put(struct device *dev, void *res)
++ {
++ 	struct power_supply **psy = res;
++ 
++ 	power_supply_put(*psy);
++ }
++ 
++ /**
++  * devm_power_supply_get_by_phandle() - Resource managed version of
++  *  power_supply_get_by_phandle()
++  * @dev: Pointer to device holding phandle property
++  * @phandle_name: Name of property holding a power supply phandle
++  *
++  * Return: On success returns a reference to a power supply with
++  * matching name equals to value under @property, NULL or ERR_PTR otherwise.
++  */
++ struct power_supply *devm_power_supply_get_by_phandle(struct device *dev,
++ 						      const char *property)
++ {
++ 	struct power_supply **ptr, *psy;
++ 
++ 	if (!dev->of_node)
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	ptr = devres_alloc(devm_power_supply_put, sizeof(*ptr), GFP_KERNEL);
++ 	if (!ptr)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	psy = power_supply_get_by_phandle(dev->of_node, property);
++ 	if (IS_ERR_OR_NULL(psy)) {
++ 		devres_free(ptr);
++ 	} else {
++ 		*ptr = psy;
++ 		devres_add(dev, ptr);
++ 	}
++ 	return psy;
++ }
++ EXPORT_SYMBOL_GPL(devm_power_supply_get_by_phandle);
++ #endif /* CONFIG_OF */
++ 
++ int power_supply_get_property(struct power_supply *psy,
++ 			    enum power_supply_property psp,
++ 			    union power_supply_propval *val)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0) {
++ 		if (!psy->initialized)
++ 			return -EAGAIN;
++ 		return -ENODEV;
++ 	}
++ 
++ 	return psy->desc->get_property(psy, psp, val);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_get_property);
++ 
++ int power_supply_set_property(struct power_supply *psy,
++ 			    enum power_supply_property psp,
++ 			    const union power_supply_propval *val)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 || !psy->desc->set_property)
++ 		return -ENODEV;
++ 
++ 	return psy->desc->set_property(psy, psp, val);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_set_property);
++ 
++ int power_supply_property_is_writeable(struct power_supply *psy,
++ 					enum power_supply_property psp)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 ||
++ 			!psy->desc->property_is_writeable)
++ 		return -ENODEV;
++ 
++ 	return psy->desc->property_is_writeable(psy, psp);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_property_is_writeable);
++ 
++ void power_supply_external_power_changed(struct power_supply *psy)
++ {
++ 	if (atomic_read(&psy->use_cnt) <= 0 ||
++ 			!psy->desc->external_power_changed)
++ 		return;
++ 
++ 	psy->desc->external_power_changed(psy);
++ }
++ EXPORT_SYMBOL_GPL(power_supply_external_power_changed);
++ 
+++>>>>>>> e380538529e8 (power_supply: fix return value of get_property)
+  int power_supply_powers(struct power_supply *psy, struct device *dev)
+  {
+ -	return sysfs_create_link(&psy->dev.kobj, &dev->kobj, "powers");
+ +	return sysfs_create_link(&psy->dev->kobj, &dev->kobj, "powers");
+  }
+  EXPORT_SYMBOL_GPL(power_supply_powers);
+  
+@@@ -540,9 -773,23 +688,23 @@@ int __power_supply_register(struct devi
+  	if (rc)
+  		goto create_triggers_failed;
+  
+++<<<<<<< HEAD
+ +	power_supply_changed(psy);
+++=======
++ 	/*
++ 	 * Update use_cnt after any uevents (most notably from device_add()).
++ 	 * We are here still during driver's probe but
++ 	 * the power_supply_uevent() calls back driver's get_property
++ 	 * method so:
++ 	 * 1. Driver did not assigned the returned struct power_supply,
++ 	 * 2. Driver could not finish initialization (anything in its probe
++ 	 *    after calling power_supply_register()).
++ 	 */
++ 	atomic_inc(&psy->use_cnt);
++ 	psy->initialized = true;
+++>>>>>>> e380538529e8 (power_supply: fix return value of get_property)
+  
+ -	queue_delayed_work(system_power_efficient_wq,
+ -			   &psy->deferred_register_work,
+ -			   POWER_SUPPLY_DEFERRED_REGISTER_TIME);
+ -
+ -	return psy;
+ +	goto success;
+  
+  create_triggers_failed:
+  	psy_unregister_cooler(psy);
+diff --cc drivers/power/power_supply_sysfs.c
+index 29178f78d73c,bcde8d13476a..000000000000
+--- a/drivers/power/power_supply_sysfs.c
++++ b/drivers/power/power_supply_sysfs.c
+@@@ -73,19 -74,20 +73,31 @@@ static ssize_t power_supply_show_proper
+  	const ptrdiff_t off = attr - power_supply_attrs;
+  	union power_supply_propval value;
+  
+ -	if (off == POWER_SUPPLY_PROP_TYPE) {
+ -		value.intval = psy->desc->type;
+ -	} else {
+ -		ret = power_supply_get_property(psy, off, &value);
+ -
+ +	if (off == POWER_SUPPLY_PROP_TYPE)
+ +		value.intval = psy->type;
+ +	else
+ +		ret = psy->get_property(psy, off, &value);
+ +
+++<<<<<<< HEAD
+ +	if (ret < 0) {
+ +		if (ret == -ENODATA)
+ +			dev_dbg(dev, "driver has no data for `%s' property\n",
+ +				attr->attr.name);
+ +		else if (ret != -ENODEV)
+ +			dev_err(dev, "driver failed to report `%s' property: %zd\n",
+ +				attr->attr.name, ret);
+ +		return ret;
+++=======
++ 		if (ret < 0) {
++ 			if (ret == -ENODATA)
++ 				dev_dbg(dev, "driver has no data for `%s' property\n",
++ 					attr->attr.name);
++ 			else if (ret != -ENODEV && ret != -EAGAIN)
++ 				dev_err(dev, "driver failed to report `%s' property: %zd\n",
++ 					attr->attr.name, ret);
++ 			return ret;
++ 		}
+++>>>>>>> e380538529e8 (power_supply: fix return value of get_property)
+  	}
+  
+  	if (off == POWER_SUPPLY_PROP_STATUS)
+diff --cc include/linux/power_supply.h
+index b5a0d5291835,3965503315ef..000000000000
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@@ -196,10 -243,13 +196,15 @@@ struct power_supply 
+  	void *drv_data;
+  
+  	/* private */
+ -	struct device dev;
+ +	struct device *dev;
+  	struct work_struct changed_work;
+ -	struct delayed_work deferred_register_work;
+  	spinlock_t changed_lock;
+  	bool changed;
+++<<<<<<< HEAD
+++=======
++ 	bool initialized;
++ 	atomic_t use_cnt;
+++>>>>>>> e380538529e8 (power_supply: fix return value of get_property)
+  #ifdef CONFIG_THERMAL
+  	struct thermal_zone_device *tzd;
+  	struct thermal_cooling_device *tcd;
+* Unmerged path drivers/power/power_supply_core.c
+* Unmerged path drivers/power/power_supply_sysfs.c
+* Unmerged path include/linux/power_supply.h
