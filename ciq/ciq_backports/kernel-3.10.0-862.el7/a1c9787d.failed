@@ -1,0 +1,204 @@
+intel_pstate: Clarify average performance computation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit a1c9787dc38097d554f9da8372031b3d6f8c140a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a1c9787d.failed
+
+The core_pct_busy field of struct sample actually contains the
+average performace during the last sampling period (in percent)
+and not the utilization of the core as suggested by its name
+which is confusing.
+
+For this reason, change the name of that field to core_avg_perf
+and rename the function that computes its value accordingly.
+
+Also notice that storing this value as percentage requires a costly
+integer multiplication to be carried out in a hot path, so instead
+store it as an "extended fixed point" value with more fraction bits
+and update the code using it accordingly (it is better to change the
+name of the field along with its meaning in one go than to make those
+two changes separately, as that would likely lead to more
+confusion).
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit a1c9787dc38097d554f9da8372031b3d6f8c140a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 18143602d790,19712e27ad50..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1121,27 -1161,18 +1134,30 @@@ static void intel_pstate_get_cpu_pstate
+  
+  	if (pstate_funcs.get_vid)
+  		pstate_funcs.get_vid(cpu);
+ -
+ -	intel_pstate_set_min_pstate(cpu);
+ +	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+  }
+  
+- static inline void intel_pstate_calc_busy(struct cpudata *cpu)
++ static inline void intel_pstate_calc_avg_perf(struct cpudata *cpu)
+  {
+  	struct sample *sample = &cpu->sample;
+- 	int64_t core_pct;
+  
+++<<<<<<< HEAD
+ +	core_pct = int_tofp(sample->aperf) * int_tofp(100);
+ +	core_pct = div64_u64(core_pct, int_tofp(sample->mperf));
+ +
+ +	sample->freq = fp_toint(
+ +		mul_fp(int_tofp(
+ +			cpu->pstate.max_pstate_physical *
+ +			cpu->pstate.scaling / 100),
+ +			core_pct));
+ +
+ +	sample->core_pct_busy = (int32_t)core_pct;
+++=======
++ 	sample->core_avg_perf = div_ext_fp(sample->aperf, sample->mperf);
+++>>>>>>> a1c9787dc380 (intel_pstate: Clarify average performance computation)
+  }
+  
+ -static inline bool intel_pstate_sample(struct cpudata *cpu, u64 time)
+ +static inline void intel_pstate_sample(struct cpudata *cpu)
+  {
+  	u64 aperf, mperf;
+  	unsigned long flags;
+@@@ -1170,22 -1200,20 +1186,27 @@@
+  	cpu->prev_aperf = aperf;
+  	cpu->prev_mperf = mperf;
+  	cpu->prev_tsc = tsc;
+ -	/*
+ -	 * First time this function is invoked in a given cycle, all of the
+ -	 * previous sample data fields are equal to zero or stale and they must
+ -	 * be populated with meaningful numbers for things to work, so assume
+ -	 * that sample.time will always be reset before setting the utilization
+ -	 * update hook and make the caller skip the sample then.
+ -	 */
+ -	return !!cpu->last_sample_time;
+  }
+  
+ -static inline int32_t get_avg_frequency(struct cpudata *cpu)
+ +static inline void intel_hwp_set_sample_time(struct cpudata *cpu)
+  {
+++<<<<<<< HEAD
+ +	int delay;
+ +
+ +	delay = msecs_to_jiffies(50);
+ +	mod_timer_pinned(&cpu->timer, jiffies + delay);
+ +}
+ +
+ +static inline void intel_pstate_set_sample_time(struct cpudata *cpu)
+ +{
+ +	int delay;
+ +
+ +	delay = msecs_to_jiffies(pid_params.sample_rate_ms);
+ +	mod_timer_pinned(&cpu->timer, jiffies + delay);
+++=======
++ 	return mul_ext_fp(cpu->sample.core_avg_perf,
++ 			  cpu->pstate.max_pstate_physical * cpu->pstate.scaling);
+++>>>>>>> a1c9787dc380 (intel_pstate: Clarify average performance computation)
+  }
+  
+  static inline int32_t get_avg_pstate(struct cpudata *cpu)
+@@@ -1248,24 -1273,20 +1269,31 @@@ static inline int32_t get_target_pstate
+  	 * period. The result will be a percentage of busy at a
+  	 * specified pstate.
+  	 */
+++<<<<<<< HEAD
+ +	core_busy = cpu->sample.core_pct_busy;
+ +	max_pstate = int_tofp(cpu->pstate.max_pstate_physical);
+ +	current_pstate = int_tofp(cpu->pstate.current_pstate);
+ +	core_busy = mul_fp(core_busy, div_fp(max_pstate, current_pstate));
+++=======
++ 	max_pstate = cpu->pstate.max_pstate_physical;
++ 	current_pstate = cpu->pstate.current_pstate;
++ 	core_busy = mul_ext_fp(cpu->sample.core_avg_perf,
++ 			       div_fp(100 * max_pstate, current_pstate));
+++>>>>>>> a1c9787dc380 (intel_pstate: Clarify average performance computation)
+  
+  	/*
+ -	 * Since our utilization update callback will not run unless we are
+ -	 * in C0, check if the actual elapsed time is significantly greater (3x)
+ -	 * than our sample interval.  If it is, then we were idle for a long
+ -	 * enough period of time to adjust our busyness.
+ +	 * Since we have a deferred timer, it will not fire unless
+ +	 * we are in C0.  So, determine if the actual elapsed time
+ +	 * is significantly greater (3x) than our sample interval.  If it
+ +	 * is, then we were idle for a long enough period of time
+ +	 * to adjust our busyness.
+  	 */
+ -	duration_ns = cpu->sample.time - cpu->last_sample_time;
+ -	if ((s64)duration_ns > pid_params.sample_rate_ns * 3) {
+ -		sample_ratio = div_fp(pid_params.sample_rate_ns, duration_ns);
+ +	sample_time = pid_params.sample_rate_ms  * USEC_PER_MSEC;
+ +	duration_us = ktime_us_delta(cpu->sample.time,
+ +				     cpu->last_sample_time);
+ +	if (duration_us > sample_time * 3) {
+ +		sample_ratio = div_fp(int_tofp(sample_time),
+ +				      int_tofp(duration_us));
+  		core_busy = mul_fp(core_busy, sample_ratio);
+  	} else {
+  		sample_ratio = div_fp(100 * cpu->sample.mperf, cpu->sample.tsc);
+@@@ -1286,36 -1322,34 +1314,45 @@@ static inline void intel_pstate_adjust_
+  
+  	target_pstate = pstate_funcs.get_target_pstate(cpu);
+  
+ -	intel_pstate_update_pstate(cpu, target_pstate);
+ +	intel_pstate_set_pstate(cpu, target_pstate);
+  
+  	sample = &cpu->sample;
+- 	trace_pstate_sample(fp_toint(sample->core_pct_busy),
++ 	trace_pstate_sample(mul_ext_fp(100, sample->core_avg_perf),
+  		fp_toint(sample->busy_scaled),
+  		from,
+  		cpu->pstate.current_pstate,
+  		sample->mperf,
+  		sample->aperf,
+  		sample->tsc,
+ -		get_avg_frequency(cpu));
+ +		sample->freq);
+  }
+  
+ -static void intel_pstate_update_util(struct update_util_data *data, u64 time,
+ -				     unsigned long util, unsigned long max)
+ +static void intel_hwp_timer_func(unsigned long __data)
+  {
+ -	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ -	u64 delta_ns = time - cpu->sample.time;
+ +	struct cpudata *cpu = (struct cpudata *) __data;
+  
+ -	if ((s64)delta_ns >= pid_params.sample_rate_ns) {
+ -		bool sample_taken = intel_pstate_sample(cpu, time);
+ +	intel_pstate_sample(cpu);
+ +	intel_hwp_set_sample_time(cpu);
+ +}
+  
+++<<<<<<< HEAD
+ +static void intel_pstate_timer_func(unsigned long __data)
+ +{
+ +	struct cpudata *cpu = (struct cpudata *) __data;
+ +
+ +	intel_pstate_sample(cpu);
+ +
+ +	intel_pstate_adjust_busy_pstate(cpu);
+ +
+ +	intel_pstate_set_sample_time(cpu);
+++=======
++ 		if (sample_taken) {
++ 			intel_pstate_calc_avg_perf(cpu);
++ 			if (!hwp_active)
++ 				intel_pstate_adjust_busy_pstate(cpu);
++ 		}
++ 	}
+++>>>>>>> a1c9787dc380 (intel_pstate: Clarify average performance computation)
+  }
+  
+  #define ICPU(model, policy) \
+* Unmerged path drivers/cpufreq/intel_pstate.c
