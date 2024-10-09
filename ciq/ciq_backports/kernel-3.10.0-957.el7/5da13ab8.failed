@@ -1,0 +1,178 @@
+perf/core: Fix perf_kprobe_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Masami Hiramatsu <mhiramat@kernel.org>
+commit 5da13ab8b0dcaa984c45ae43edf5a4d148603d42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5da13ab8.failed
+
+Fix error handling in perf_kprobe_init():
+
+	==================================================================
+	BUG: KASAN: slab-out-of-bounds in strlen+0x8e/0xa0 lib/string.c:482
+	Read of size 1 at addr ffff88003f9cc5c0 by task syz-executor2/23095
+
+	CPU: 0 PID: 23095 Comm: syz-executor2 Not tainted 4.16.0+ #24
+	Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Ubuntu-1.8.2-1ubuntu1 04/01/2014
+	Call Trace:
+	 __dump_stack lib/dump_stack.c:77 [inline]
+	 dump_stack+0xca/0x13e lib/dump_stack.c:113
+	 print_address_description+0x6e/0x2c0 mm/kasan/report.c:256
+	 kasan_report_error mm/kasan/report.c:354 [inline]
+	 kasan_report+0x256/0x380 mm/kasan/report.c:412
+	 strlen+0x8e/0xa0 lib/string.c:482
+	 kstrdup+0x21/0x70 mm/util.c:55
+	 alloc_trace_kprobe+0xc8/0x930 kernel/trace/trace_kprobe.c:325
+	 create_local_trace_kprobe+0x4f/0x3a0 kernel/trace/trace_kprobe.c:1438
+	 perf_kprobe_init+0x149/0x1f0 kernel/trace/trace_event_perf.c:264
+	 perf_kprobe_event_init+0xa8/0x120 kernel/events/core.c:8407
+	 perf_try_init_event+0xcb/0x2a0 kernel/events/core.c:9719
+	 perf_init_event kernel/events/core.c:9750 [inline]
+	 perf_event_alloc+0x1367/0x1e20 kernel/events/core.c:10022
+	 SYSC_perf_event_open+0x242/0x2330 kernel/events/core.c:10477
+	 do_syscall_64+0x198/0x640 arch/x86/entry/common.c:287
+	 entry_SYSCALL_64_after_hwframe+0x42/0xb7
+
+	Reported-by: 范龙飞 <long7573@126.com>
+	Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Song Liu <songliubraving@fb.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: e12f03d7031a ("perf/core: Implement the 'perf_kprobe' PMU")
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5da13ab8b0dcaa984c45ae43edf5a4d148603d42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_event_perf.c
+diff --cc kernel/trace/trace_event_perf.c
+index ae2877cbe443,94600f1f7efa..000000000000
+--- a/kernel/trace/trace_event_perf.c
++++ b/kernel/trace/trace_event_perf.c
+@@@ -213,15 -238,112 +213,121 @@@ void perf_trace_destroy(struct perf_eve
+  	mutex_unlock(&event_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KPROBE_EVENTS
++ int perf_kprobe_init(struct perf_event *p_event, bool is_retprobe)
++ {
++ 	int ret;
++ 	char *func = NULL;
++ 	struct trace_event_call *tp_event;
++ 
++ 	if (p_event->attr.kprobe_func) {
++ 		func = kzalloc(KSYM_NAME_LEN, GFP_KERNEL);
++ 		if (!func)
++ 			return -ENOMEM;
++ 		ret = strncpy_from_user(
++ 			func, u64_to_user_ptr(p_event->attr.kprobe_func),
++ 			KSYM_NAME_LEN);
++ 		if (ret == KSYM_NAME_LEN)
++ 			ret = -E2BIG;
++ 		if (ret < 0)
++ 			goto out;
++ 
++ 		if (func[0] == '\0') {
++ 			kfree(func);
++ 			func = NULL;
++ 		}
++ 	}
++ 
++ 	tp_event = create_local_trace_kprobe(
++ 		func, (void *)(unsigned long)(p_event->attr.kprobe_addr),
++ 		p_event->attr.probe_offset, is_retprobe);
++ 	if (IS_ERR(tp_event)) {
++ 		ret = PTR_ERR(tp_event);
++ 		goto out;
++ 	}
++ 
++ 	ret = perf_trace_event_init(tp_event, p_event);
++ 	if (ret)
++ 		destroy_local_trace_kprobe(tp_event);
++ out:
++ 	kfree(func);
++ 	return ret;
++ }
++ 
++ void perf_kprobe_destroy(struct perf_event *p_event)
++ {
++ 	perf_trace_event_close(p_event);
++ 	perf_trace_event_unreg(p_event);
++ 
++ 	destroy_local_trace_kprobe(p_event->tp_event);
++ }
++ #endif /* CONFIG_KPROBE_EVENTS */
++ 
++ #ifdef CONFIG_UPROBE_EVENTS
++ int perf_uprobe_init(struct perf_event *p_event, bool is_retprobe)
++ {
++ 	int ret;
++ 	char *path = NULL;
++ 	struct trace_event_call *tp_event;
++ 
++ 	if (!p_event->attr.uprobe_path)
++ 		return -EINVAL;
++ 	path = kzalloc(PATH_MAX, GFP_KERNEL);
++ 	if (!path)
++ 		return -ENOMEM;
++ 	ret = strncpy_from_user(
++ 		path, u64_to_user_ptr(p_event->attr.uprobe_path), PATH_MAX);
++ 	if (ret < 0)
++ 		goto out;
++ 	if (path[0] == '\0') {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	tp_event = create_local_trace_uprobe(
++ 		path, p_event->attr.probe_offset, is_retprobe);
++ 	if (IS_ERR(tp_event)) {
++ 		ret = PTR_ERR(tp_event);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * local trace_uprobe need to hold event_mutex to call
++ 	 * uprobe_buffer_enable() and uprobe_buffer_disable().
++ 	 * event_mutex is not required for local trace_kprobes.
++ 	 */
++ 	mutex_lock(&event_mutex);
++ 	ret = perf_trace_event_init(tp_event, p_event);
++ 	if (ret)
++ 		destroy_local_trace_uprobe(tp_event);
++ 	mutex_unlock(&event_mutex);
++ out:
++ 	kfree(path);
++ 	return ret;
++ }
++ 
++ void perf_uprobe_destroy(struct perf_event *p_event)
++ {
++ 	mutex_lock(&event_mutex);
++ 	perf_trace_event_close(p_event);
++ 	perf_trace_event_unreg(p_event);
++ 	mutex_unlock(&event_mutex);
++ 	destroy_local_trace_uprobe(p_event->tp_event);
++ }
++ #endif /* CONFIG_UPROBE_EVENTS */
++ 
+++>>>>>>> 5da13ab8b0dc (perf/core: Fix perf_kprobe_init())
+  int perf_trace_add(struct perf_event *p_event, int flags)
+  {
+ -	struct trace_event_call *tp_event = p_event->tp_event;
+ +	struct ftrace_event_call *tp_event = p_event->tp_event;
+ +	struct hlist_head __percpu *pcpu_list;
+ +	struct hlist_head *list;
+ +
+ +	pcpu_list = tp_event->perf_events;
+ +	if (WARN_ON_ONCE(!pcpu_list))
+ +		return -EINVAL;
+  
+  	if (!(flags & PERF_EF_START))
+  		p_event->hw.state = PERF_HES_STOPPED;
+* Unmerged path kernel/trace/trace_event_perf.c
