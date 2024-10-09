@@ -1,0 +1,274 @@
+cpufreq: intel_pstate: Do not reinit performance limits in ->setpolicy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Do not reinit performance limits in ->setpolicy (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 93.13%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit a240c4aa5d0f9c8bb0db380ab9c1ec1f68b923ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a240c4aa.failed
+
+If the current P-state selection algorithm is set to "performance"
+in intel_pstate_set_policy(), the limits may be initialized from
+scratch, but only if no_turbo is not set and the maximum frequency
+allowed for the given CPU (i.e. the policy object representing it)
+is at least equal to the max frequency supported by the CPU.  In all
+of the other cases, the limits will not be updated.
+
+For example, the following can happen:
+
+ # cat intel_pstate/status
+ active
+ # echo performance > cpufreq/policy0/scaling_governor
+ # cat intel_pstate/min_perf_pct
+ 100
+ # echo 94 > intel_pstate/min_perf_pct
+ # cat intel_pstate/min_perf_pct
+ 100
+ # cat cpufreq/policy0/scaling_max_freq
+ 3100000
+ echo 3000000 > cpufreq/policy0/scaling_max_freq
+ # cat intel_pstate/min_perf_pct
+ 94
+ # echo 95 > intel_pstate/min_perf_pct
+ # cat intel_pstate/min_perf_pct
+ 95
+
+That is confusing for two reasons.  First, the initial attempt to
+change min_perf_pct to 94 seems to have no effect, even though
+setting the global limits should always work.  Second, after
+changing scaling_max_freq for policy0 the global min_perf_pct
+attribute shows 94, even though it should have not been affected
+by that operation in principle.
+
+Moreover, the final attempt to change min_perf_pct to 95 worked
+as expected, because scaling_max_freq for the only policy with
+scaling_governor equal to "performance" was different from the
+maximum at that time.
+
+To make all that confusion go away, modify intel_pstate_set_policy()
+so that it doesn't reinitialize the limits at all.
+
+At the same time, change intel_pstate_set_performance_limits() to
+set min_sysfs_pct to 100 in the "performance" limits set so that
+switching the P-state selection algorithm to "performance" causes
+intel_pstate/min_perf_pct in sysfs to go to 100 (or whatever value
+min_sysfs_pct in the "performance" limits is set to later).
+
+That requires per-CPU limits to be initialized explicitly rather
+than by copying the global limits to avoid setting min_sysfs_pct
+in the per-CPU limits to 100.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit a240c4aa5d0f9c8bb0db380ab9c1ec1f68b923ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b681c02dda0f,f1f8fbe0b4c4..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -270,77 -364,29 +270,87 @@@ static int hwp_active __read_mostly
+  static bool acpi_ppc;
+  #endif
+  
+ -static struct perf_limits performance_limits;
+ -static struct perf_limits powersave_limits;
+ -static struct perf_limits *limits;
+ +/**
+ + * struct perf_limits - Store user and policy limits
+ + * @no_turbo:		User requested turbo state from intel_pstate sysfs
+ + * @turbo_disabled:	Platform turbo status either from msr
+ + *			MSR_IA32_MISC_ENABLE or when maximum available pstate
+ + *			matches the maximum turbo pstate
+ + * @max_perf_pct:	Effective maximum performance limit in percentage, this
+ + *			is minimum of either limits enforced by cpufreq policy
+ + *			or limits from user set limits via intel_pstate sysfs
+ + * @min_perf_pct:	Effective minimum performance limit in percentage, this
+ + *			is maximum of either limits enforced by cpufreq policy
+ + *			or limits from user set limits via intel_pstate sysfs
+ + * @max_perf:		This is a scaled value between 0 to 255 for max_perf_pct
+ + *			This value is used to limit max pstate
+ + * @min_perf:		This is a scaled value between 0 to 255 for min_perf_pct
+ + *			This value is used to limit min pstate
+ + * @max_policy_pct:	The maximum performance in percentage enforced by
+ + *			cpufreq setpolicy interface
+ + * @max_sysfs_pct:	The maximum performance in percentage enforced by
+ + *			intel pstate sysfs interface
+ + * @min_policy_pct:	The minimum performance in percentage enforced by
+ + *			cpufreq setpolicy interface
+ + * @min_sysfs_pct:	The minimum performance in percentage enforced by
+ + *			intel pstate sysfs interface
+ + *
+ + * Storage for user and policy defined limits.
+ + */
+ +struct perf_limits {
+ +	int no_turbo;
+ +	int turbo_disabled;
+ +	int max_perf_pct;
+ +	int min_perf_pct;
+ +	int32_t max_perf;
+ +	int32_t min_perf;
+ +	int max_policy_pct;
+ +	int max_sysfs_pct;
+ +	int min_policy_pct;
+ +	int min_sysfs_pct;
+ +};
+  
+ -static void intel_pstate_init_limits(struct perf_limits *limits)
+ -{
+ -	memset(limits, 0, sizeof(*limits));
+ -	limits->max_perf_pct = 100;
+ -	limits->max_perf = int_ext_tofp(1);
+ -	limits->max_policy_pct = 100;
+ -	limits->max_sysfs_pct = 100;
+ -}
+ +static struct perf_limits performance_limits = {
+ +	.no_turbo = 0,
+ +	.turbo_disabled = 0,
+ +	.max_perf_pct = 100,
+ +	.max_perf = int_tofp(1),
+ +	.min_perf_pct = 100,
+ +	.min_perf = int_tofp(1),
+ +	.max_policy_pct = 100,
+ +	.max_sysfs_pct = 100,
+ +	.min_policy_pct = 0,
+ +	.min_sysfs_pct = 0,
+ +};
+  
+++<<<<<<< HEAD
+ +static struct perf_limits powersave_limits = {
+ +	.no_turbo = 0,
+ +	.turbo_disabled = 0,
+ +	.max_perf_pct = 100,
+ +	.max_perf = int_tofp(1),
+ +	.min_perf_pct = 0,
+ +	.min_perf = 0,
+ +	.max_policy_pct = 100,
+ +	.max_sysfs_pct = 100,
+ +	.min_policy_pct = 0,
+ +	.min_sysfs_pct = 0,
+ +};
+++=======
++ static void intel_pstate_set_performance_limits(struct perf_limits *limits)
++ {
++ 	intel_pstate_init_limits(limits);
++ 	limits->min_perf_pct = 100;
++ 	limits->min_perf = int_ext_tofp(1);
++ 	limits->min_sysfs_pct = 100;
++ }
+++>>>>>>> a240c4aa5d0f (cpufreq: intel_pstate: Do not reinit performance limits in ->setpolicy)
+  
+ -static DEFINE_MUTEX(intel_pstate_driver_lock);
+ -static DEFINE_MUTEX(intel_pstate_limits_lock);
+ +#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE
+ +static struct perf_limits *limits = &performance_limits;
+ +#else
+ +static struct perf_limits *limits = &powersave_limits;
+ +#endif
+  
+  #ifdef CONFIG_ACPI
+  
+@@@ -1471,14 -2111,72 +1481,78 @@@ static int intel_pstate_set_policy(stru
+  	/* Make sure min_perf_pct <= max_perf_pct */
+  	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
+  
+ -	limits->min_perf = div_ext_fp(limits->min_perf_pct, 100);
+ -	limits->max_perf = div_ext_fp(limits->max_perf_pct, 100);
+ -	limits->max_perf = round_up(limits->max_perf, EXT_FRAC_BITS);
+ -	limits->min_perf = round_up(limits->min_perf, EXT_FRAC_BITS);
+ +	limits->min_perf = div_fp(int_tofp(limits->min_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
+ +				  int_tofp(100));
+ +	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
+  
+++<<<<<<< HEAD
+ +	if (hwp_active)
+ +		intel_pstate_hwp_set(policy->cpus);
+++=======
++ 	pr_debug("cpu:%d max_perf_pct:%d min_perf_pct:%d\n", policy->cpu,
++ 		 limits->max_perf_pct, limits->min_perf_pct);
++ }
++ 
++ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	struct perf_limits *perf_limits = NULL;
++ 
++ 	if (!policy->cpuinfo.max_freq)
++ 		return -ENODEV;
++ 
++ 	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
++ 		 policy->cpuinfo.max_freq, policy->max);
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	cpu->policy = policy->policy;
++ 
++ 	if (cpu->pstate.max_pstate_physical > cpu->pstate.max_pstate &&
++ 	    policy->max < policy->cpuinfo.max_freq &&
++ 	    policy->max > cpu->pstate.max_pstate * cpu->pstate.scaling) {
++ 		pr_debug("policy->max > max non turbo frequency\n");
++ 		policy->max = policy->cpuinfo.max_freq;
++ 	}
++ 
++ 	if (per_cpu_limits)
++ 		perf_limits = cpu->perf_limits;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		pr_debug("set performance\n");
++ 		if (!perf_limits) {
++ 			limits = &performance_limits;
++ 			perf_limits = limits;
++ 		}
++ 	} else {
++ 		pr_debug("set powersave\n");
++ 		if (!perf_limits) {
++ 			limits = &powersave_limits;
++ 			perf_limits = limits;
++ 		}
++ 
++ 	}
++ 
++ 	intel_pstate_update_perf_limits(policy, perf_limits);
++ 
++ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE) {
++ 		/*
++ 		 * NOHZ_FULL CPUs need this as the governor callback may not
++ 		 * be invoked on them.
++ 		 */
++ 		intel_pstate_clear_update_util_hook(policy->cpu);
++ 		intel_pstate_max_within_limits(cpu);
++ 	}
++ 
++ 	intel_pstate_set_update_util_hook(policy->cpu);
++ 
++ 	intel_pstate_hwp_set_policy(policy);
++ 
++ 	mutex_unlock(&intel_pstate_limits_lock);
+++>>>>>>> a240c4aa5d0f (cpufreq: intel_pstate: Do not reinit performance limits in ->setpolicy)
+  
+  	return 0;
+  }
+@@@ -1533,10 -2253,8 +1607,15 @@@ static int intel_pstate_cpu_init(struc
+  
+  	cpu = all_cpu_data[policy->cpu];
+  
+++<<<<<<< HEAD
+ +	if (limits->min_perf_pct == 100 && limits->max_perf_pct == 100)
+ +		policy->policy = CPUFREQ_POLICY_PERFORMANCE;
+ +	else
+ +		policy->policy = CPUFREQ_POLICY_POWERSAVE;
+++=======
++ 	if (per_cpu_limits)
++ 		intel_pstate_init_limits(cpu->perf_limits);
+++>>>>>>> a240c4aa5d0f (cpufreq: intel_pstate: Do not reinit performance limits in ->setpolicy)
+  
+  	policy->min = cpu->pstate.min_pstate * cpu->pstate.scaling;
+  	policy->max = cpu->pstate.turbo_pstate * cpu->pstate.scaling;
+* Unmerged path drivers/cpufreq/intel_pstate.c
