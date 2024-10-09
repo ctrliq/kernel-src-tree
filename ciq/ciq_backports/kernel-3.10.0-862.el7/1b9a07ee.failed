@@ -1,0 +1,1494 @@
+{net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit 1b9a07ee25049724ab7f7c32282fbf5452530cea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1b9a07ee.failed
+
+Commit a7c3e901a46f ("mm: introduce kv[mz]alloc helpers") added
+proper implementation of mlx5_vzalloc function to the MM core.
+
+This made the mlx5_vzalloc function useless, so let's remove it.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 1b9a07ee25049724ab7f7c32282fbf5452530cea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+#	include/linux/mlx5/driver.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 9a7070605698,b6991204e5df..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3237,6 -3431,125 +3237,128 @@@ dealloc_counters
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rdma_hw_stats *mlx5_ib_alloc_hw_stats(struct ib_device *ibdev,
++ 						    u8 port_num)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 
++ 	/* We support only per port stats */
++ 	if (port_num == 0)
++ 		return NULL;
++ 
++ 	return rdma_alloc_hw_stats_struct(port->cnts.names,
++ 					  port->cnts.num_q_counters +
++ 					  port->cnts.num_cong_counters,
++ 					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
++ }
++ 
++ static int mlx5_ib_query_q_counters(struct mlx5_ib_dev *dev,
++ 				    struct mlx5_ib_port *port,
++ 				    struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_q_counter_out);
++ 	void *out;
++ 	__be32 val;
++ 	int ret, i;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_core_query_q_counter(dev->mdev,
++ 					port->cnts.set_id, 0,
++ 					out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_q_counters; i++) {
++ 		val = *(__be32 *)(out + port->cnts.offsets[i]);
++ 		stats->value[i] = (u64)be32_to_cpu(val);
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_query_cong_counters(struct mlx5_ib_dev *dev,
++ 				       struct mlx5_ib_port *port,
++ 				       struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_cong_statistics_out);
++ 	void *out;
++ 	int ret, i;
++ 	int offset = port->cnts.num_q_counters;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_cmd_query_cong_counter(dev->mdev, false, out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_cong_counters; i++) {
++ 		stats->value[i + offset] =
++ 			be64_to_cpup((__be64 *)(out +
++ 				     port->cnts.offsets[i + offset]));
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
++ 				struct rdma_hw_stats *stats,
++ 				u8 port_num, int index)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 	int ret, num_counters;
++ 
++ 	if (!stats)
++ 		return -EINVAL;
++ 
++ 	ret = mlx5_ib_query_q_counters(dev, port, stats);
++ 	if (ret)
++ 		return ret;
++ 	num_counters = port->cnts.num_q_counters;
++ 
++ 	if (MLX5_CAP_GEN(dev->mdev, cc_query_allowed)) {
++ 		ret = mlx5_ib_query_cong_counters(dev, port, stats);
++ 		if (ret)
++ 			return ret;
++ 		num_counters += port->cnts.num_cong_counters;
++ 	}
++ 
++ 	return num_counters;
++ }
++ 
++ static struct net_device*
++ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
++ 			  u8 port_num,
++ 			  enum rdma_netdev_t type,
++ 			  const char *name,
++ 			  unsigned char name_assign_type,
++ 			  void (*setup)(struct net_device *))
++ {
++ 	if (type != RDMA_NETDEV_IPOIB)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	return mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
++ 				      name, setup);
++ }
++ 
++ static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
++ {
++ 	return mlx5_rdma_netdev_free(netdev);
++ }
++ 
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+  {
+  	struct mlx5_ib_dev *dev;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index e2c448703ea8,edc485e489cc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -751,7 -775,36 +750,38 @@@ static int mlx5e_modify_rq_vsd(struct m
+  	int err;
+  
+  	inlen = MLX5_ST_SZ_BYTES(modify_rq_in);
+- 	in = mlx5_vzalloc(inlen);
++ 	in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!in)
++ 		return -ENOMEM;
++ 
++ 	rqc = MLX5_ADDR_OF(modify_rq_in, in, ctx);
++ 
++ 	MLX5_SET(modify_rq_in, in, rq_state, MLX5_RQC_STATE_RDY);
++ 	MLX5_SET64(modify_rq_in, in, modify_bitmask,
+++<<<<<<< HEAD
+++=======
++ 		   MLX5_MODIFY_RQ_IN_MODIFY_BITMASK_SCATTER_FCS);
++ 	MLX5_SET(rqc, rqc, scatter_fcs, enable);
++ 	MLX5_SET(rqc, rqc, state, MLX5_RQC_STATE_RDY);
++ 
++ 	err = mlx5_core_modify_rq(mdev, rq->rqn, in, inlen);
++ 
++ 	kvfree(in);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_modify_rq_vsd(struct mlx5e_rq *rq, bool vsd)
++ {
++ 	struct mlx5e_channel *c = rq->channel;
++ 	struct mlx5_core_dev *mdev = c->mdev;
++ 	void *in;
++ 	void *rqc;
++ 	int inlen;
++ 	int err;
++ 
++ 	inlen = MLX5_ST_SZ_BYTES(modify_rq_in);
++ 	in = kvzalloc(inlen, GFP_KERNEL);
+  	if (!in)
+  		return -ENOMEM;
+  
+@@@ -759,6 -812,6 +789,7 @@@
+  
+  	MLX5_SET(modify_rq_in, in, rq_state, MLX5_RQC_STATE_RDY);
+  	MLX5_SET64(modify_rq_in, in, modify_bitmask,
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  		   MLX5_MODIFY_RQ_IN_MODIFY_BITMASK_VSD);
+  	MLX5_SET(rqc, rqc, vsd, vsd);
+  	MLX5_SET(rqc, rqc, state, MLX5_RQC_STATE_RDY);
+@@@ -1030,8 -1132,8 +1061,13 @@@ static int mlx5e_enable_sq(struct mlx5e
+  	int err;
+  
+  	inlen = MLX5_ST_SZ_BYTES(create_sq_in) +
+++<<<<<<< HEAD
+ +		sizeof(u64) * sq->wq_ctrl.buf.npages;
+ +	in = mlx5_vzalloc(inlen);
+++=======
++ 		sizeof(u64) * csp->wq_ctrl->buf.npages;
++ 	in = kvzalloc(inlen, GFP_KERNEL);
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  	if (!in)
+  		return -ENOMEM;
+  
+@@@ -1783,17 -2064,98 +1819,104 @@@ static void mlx5e_close_channels(struc
+  {
+  	int i;
+  
+ -	for (i = 0; i < chs->num; i++)
+ -		mlx5e_deactivate_channel(chs->c[i]);
+ -}
+ +	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
+ +	 * polling for inactive tx queues.
+ +	 */
+ +	netif_tx_stop_all_queues(priv->netdev);
+ +	netif_tx_disable(priv->netdev);
+  
+ -void mlx5e_close_channels(struct mlx5e_channels *chs)
+ -{
+ -	int i;
+ +	for (i = 0; i < priv->params.num_channels; i++)
+ +		mlx5e_close_channel(priv->channel[i]);
+  
+++<<<<<<< HEAD
+ +	kfree(priv->txq_to_sq_map);
+ +	kfree(priv->channel);
+++=======
++ 	for (i = 0; i < chs->num; i++)
++ 		mlx5e_close_channel(chs->c[i]);
++ 
++ 	kfree(chs->c);
++ 	chs->num = 0;
++ }
++ 
++ static int
++ mlx5e_create_rqt(struct mlx5e_priv *priv, int sz, struct mlx5e_rqt *rqt)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	void *rqtc;
++ 	int inlen;
++ 	int err;
++ 	u32 *in;
++ 	int i;
++ 
++ 	inlen = MLX5_ST_SZ_BYTES(create_rqt_in) + sizeof(u32) * sz;
++ 	in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!in)
++ 		return -ENOMEM;
++ 
++ 	rqtc = MLX5_ADDR_OF(create_rqt_in, in, rqt_context);
++ 
++ 	MLX5_SET(rqtc, rqtc, rqt_actual_size, sz);
++ 	MLX5_SET(rqtc, rqtc, rqt_max_size, sz);
++ 
++ 	for (i = 0; i < sz; i++)
++ 		MLX5_SET(rqtc, rqtc, rq_num[i], priv->drop_rq.rqn);
++ 
++ 	err = mlx5_core_create_rqt(mdev, in, inlen, &rqt->rqtn);
++ 	if (!err)
++ 		rqt->enabled = true;
++ 
++ 	kvfree(in);
++ 	return err;
++ }
++ 
++ void mlx5e_destroy_rqt(struct mlx5e_priv *priv, struct mlx5e_rqt *rqt)
++ {
++ 	rqt->enabled = false;
++ 	mlx5_core_destroy_rqt(priv->mdev, rqt->rqtn);
++ }
++ 
++ int mlx5e_create_indirect_rqt(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_rqt *rqt = &priv->indir_rqt;
++ 	int err;
++ 
++ 	err = mlx5e_create_rqt(priv, MLX5E_INDIR_RQT_SIZE, rqt);
++ 	if (err)
++ 		mlx5_core_warn(priv->mdev, "create indirect rqts failed, %d\n", err);
++ 	return err;
++ }
++ 
++ int mlx5e_create_direct_rqts(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_rqt *rqt;
++ 	int err;
++ 	int ix;
++ 
++ 	for (ix = 0; ix < priv->profile->max_nch(priv->mdev); ix++) {
++ 		rqt = &priv->direct_tir[ix].rqt;
++ 		err = mlx5e_create_rqt(priv, 1 /*size */, rqt);
++ 		if (err)
++ 			goto err_destroy_rqts;
++ 	}
++ 
++ 	return 0;
++ 
++ err_destroy_rqts:
++ 	mlx5_core_warn(priv->mdev, "create direct rqts failed, %d\n", err);
++ 	for (ix--; ix >= 0; ix--)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[ix].rqt);
++ 
++ 	return err;
++ }
++ 
++ void mlx5e_destroy_direct_rqts(struct mlx5e_priv *priv)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  }
+  
+  static int mlx5e_rx_hash_fn(int hfunc)
+@@@ -1875,92 -2224,78 +1998,92 @@@ static int mlx5e_create_rqt(struct mlx5
+  	return err;
+  }
+  
+ -static u32 mlx5e_get_direct_rqn(struct mlx5e_priv *priv, int ix,
+ -				struct mlx5e_redirect_rqt_param rrp)
+ +void mlx5e_destroy_rqt(struct mlx5e_priv *priv, struct mlx5e_rqt *rqt)
+  {
+ -	if (!rrp.is_rss)
+ -		return rrp.rqn;
+ +	rqt->enabled = false;
+ +	mlx5_core_destroy_rqt(priv->mdev, rqt->rqtn);
+ +}
+  
+ -	if (ix >= rrp.rss.channels->num)
+ -		return priv->drop_rq.rqn;
+ +static int mlx5e_create_indirect_rqts(struct mlx5e_priv *priv)
+ +{
+ +	struct mlx5e_rqt *rqt = &priv->indir_rqt;
+  
+ -	return rrp.rss.channels->c[ix]->rq.rqn;
+ +	return mlx5e_create_rqt(priv, MLX5E_INDIR_RQT_SIZE, 0, rqt);
+  }
+  
+ -static void mlx5e_redirect_rqts(struct mlx5e_priv *priv,
+ -				struct mlx5e_redirect_rqt_param rrp)
+ +int mlx5e_create_direct_rqts(struct mlx5e_priv *priv)
+  {
+ -	u32 rqtn;
+ +	struct mlx5e_rqt *rqt;
+ +	int err;
+  	int ix;
+  
+ -	if (priv->indir_rqt.enabled) {
+ -		/* RSS RQ table */
+ -		rqtn = priv->indir_rqt.rqtn;
+ -		mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, rrp);
+ +	for (ix = 0; ix < priv->profile->max_nch(priv->mdev); ix++) {
+ +		rqt = &priv->direct_tir[ix].rqt;
+ +		err = mlx5e_create_rqt(priv, 1 /*size */, ix, rqt);
+ +		if (err)
+ +			goto err_destroy_rqts;
+  	}
+  
+ -	for (ix = 0; ix < priv->profile->max_nch(priv->mdev); ix++) {
+ -		struct mlx5e_redirect_rqt_param direct_rrp = {
+ -			.is_rss = false,
+ -			{
+ -				.rqn    = mlx5e_get_direct_rqn(priv, ix, rrp)
+ -			},
+ -		};
+ -
+ -		/* Direct RQ Tables */
+ -		if (!priv->direct_tir[ix].rqt.enabled)
+ -			continue;
+ +	return 0;
+  
+ -		rqtn = priv->direct_tir[ix].rqt.rqtn;
+ -		mlx5e_redirect_rqt(priv, rqtn, 1, direct_rrp);
+ -	}
+ +err_destroy_rqts:
+ +	for (ix--; ix >= 0; ix--)
+ +		mlx5e_destroy_rqt(priv, &priv->direct_tir[ix].rqt);
+ +
+ +	return err;
+  }
+  
+ -static void mlx5e_redirect_rqts_to_channels(struct mlx5e_priv *priv,
+ -					    struct mlx5e_channels *chs)
+ +int mlx5e_redirect_rqt(struct mlx5e_priv *priv, u32 rqtn, int sz, int ix)
+  {
+ -	struct mlx5e_redirect_rqt_param rrp = {
+ -		.is_rss        = true,
+ -		{
+ -			.rss = {
+ -				.channels  = chs,
+ -				.hfunc     = chs->params.rss_hfunc,
+ -			}
+ -		},
+ -	};
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +	void *rqtc;
+ +	int inlen;
+ +	u32 *in;
+ +	int err;
+ +
+ +	inlen = MLX5_ST_SZ_BYTES(modify_rqt_in) + sizeof(u32) * sz;
+- 	in = mlx5_vzalloc(inlen);
+++	in = kvzalloc(inlen, GFP_KERNEL);
+ +	if (!in)
+ +		return -ENOMEM;
+ +
+ +	rqtc = MLX5_ADDR_OF(modify_rqt_in, in, ctx);
+ +
+ +	MLX5_SET(rqtc, rqtc, rqt_actual_size, sz);
+ +	if (sz > 1) /* RSS */
+ +		mlx5e_fill_indir_rqt_rqns(priv, rqtc);
+ +	else
+ +		mlx5e_fill_direct_rqt_rqn(priv, rqtc, ix);
+ +
+ +	MLX5_SET(modify_rqt_in, in, bitmask.rqn_list, 1);
+ +
+ +	err = mlx5_core_modify_rqt(mdev, rqtn, in, inlen);
+  
+ -	mlx5e_redirect_rqts(priv, rrp);
+ +	kvfree(in);
+ +
+ +	return err;
+  }
+  
+ -static void mlx5e_redirect_rqts_to_drop(struct mlx5e_priv *priv)
+ +static void mlx5e_redirect_rqts(struct mlx5e_priv *priv)
+  {
+ -	struct mlx5e_redirect_rqt_param drop_rrp = {
+ -		.is_rss = false,
+ -		{
+ -			.rqn = priv->drop_rq.rqn,
+ -		},
+ -	};
+ +	u32 rqtn;
+ +	int ix;
+  
+ -	mlx5e_redirect_rqts(priv, drop_rrp);
+ +	if (priv->indir_rqt.enabled) {
+ +		rqtn = priv->indir_rqt.rqtn;
+ +		mlx5e_redirect_rqt(priv, rqtn, MLX5E_INDIR_RQT_SIZE, 0);
+ +	}
+ +
+ +	for (ix = 0; ix < priv->params.num_channels; ix++) {
+ +		if (!priv->direct_tir[ix].rqt.enabled)
+ +			continue;
+ +		rqtn = priv->direct_tir[ix].rqt.rqtn;
+ +		mlx5e_redirect_rqt(priv, rqtn, 1, ix);
+ +	}
+  }
+  
+ -static void mlx5e_build_tir_ctx_lro(struct mlx5e_params *params, void *tirc)
+ +static void mlx5e_build_tir_ctx_lro(void *tirc, struct mlx5e_priv *priv)
+  {
+ -	if (!params->lro_en)
+ +	if (!priv->params.lro_en)
+  		return;
+  
+  #define ROUGH_MAX_L2_L3_HDR_SZ 256
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+index 4180820bcac0,9b397fe3f159..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+@@@ -54,10 -86,96 +54,86 @@@ static void mlx5i_cleanup(struct mlx5e_
+  	/* Do nothing .. */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define MLX5_QP_ENHANCED_ULP_STATELESS_MODE 2
++ 
++ static int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
++ {
++ 	struct mlx5_qp_context *context = NULL;
++ 	u32 *in = NULL;
++ 	void *addr_path;
++ 	int ret = 0;
++ 	int inlen;
++ 	void *qpc;
++ 
++ 	inlen = MLX5_ST_SZ_BYTES(create_qp_in);
++ 	in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!in)
++ 		return -ENOMEM;
++ 
++ 	qpc = MLX5_ADDR_OF(create_qp_in, in, qpc);
++ 	MLX5_SET(qpc, qpc, st, MLX5_QP_ST_UD);
++ 	MLX5_SET(qpc, qpc, pm_state, MLX5_QP_PM_MIGRATED);
++ 	MLX5_SET(qpc, qpc, ulp_stateless_offload_mode,
++ 		 MLX5_QP_ENHANCED_ULP_STATELESS_MODE);
++ 
++ 	addr_path = MLX5_ADDR_OF(qpc, qpc, primary_address_path);
++ 	MLX5_SET(ads, addr_path, port, 1);
++ 	MLX5_SET(ads, addr_path, grh, 1);
++ 
++ 	ret = mlx5_core_create_qp(mdev, qp, in, inlen);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed creating IPoIB QP err : %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ 	/* QP states */
++ 	context = kzalloc(sizeof(*context), GFP_KERNEL);
++ 	if (!context) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	context->flags = cpu_to_be32(MLX5_QP_PM_MIGRATED << 11);
++ 	context->pri_path.port = 1;
++ 	context->qkey = cpu_to_be32(IB_DEFAULT_Q_KEY);
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_RST2INIT_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp RST2INIT, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 	memset(context, 0, sizeof(*context));
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_INIT2RTR_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp INIT2RTR, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_RTR2RTS_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp RTR2RTS, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ out:
++ 	kfree(context);
++ 	kvfree(in);
++ 	return ret;
++ }
++ 
++ static void mlx5i_destroy_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
++ {
++ 	mlx5_core_destroy_qp(mdev, qp);
++ }
++ 
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  static int mlx5i_init_tx(struct mlx5e_priv *priv)
+  {
+ -	struct mlx5i_priv *ipriv = priv->ppriv;
+ -	int err;
+ -
+ -	err = mlx5i_create_underlay_qp(priv->mdev, &ipriv->qp);
+ -	if (err) {
+ -		mlx5_core_warn(priv->mdev, "create underlay QP failed, %d\n", err);
+ -		return err;
+ -	}
+ -
+ -	err = mlx5e_create_tis(priv->mdev, 0 /* tc */, ipriv->qp.qpn, &priv->tisn[0]);
+ -	if (err) {
+ -		mlx5_core_warn(priv->mdev, "create tis failed, %d\n", err);
+ -		return err;
+ -	}
+ -
+ +	/* TODO: Create IPoIB underlay QP */
+ +	/* TODO: create IPoIB TX HW TIS */
+  	return 0;
+  }
+  
+diff --cc include/linux/mlx5/driver.h
+index 61d8bec93f9f,c2740688d679..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -806,16 -890,6 +806,19 @@@ static inline u16 cmdif_rev(struct mlx5
+  	return ioread32be(&dev->iseg->cmdif_rev_fw_sub) >> 16;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void *mlx5_vzalloc(unsigned long size)
+ +{
+ +	void *rtn;
+ +
+ +	rtn = kzalloc(size, GFP_KERNEL | __GFP_NOWARN);
+ +	if (!rtn)
+ +		rtn = vzalloc(size);
+ +	return rtn;
+ +}
+ +
+++=======
+++>>>>>>> 1b9a07ee2504 ({net, IB}/mlx5: Replace mlx5_vzalloc with kvzalloc)
+  static inline u32 mlx5_base_mkey(const u32 key)
+  {
+  	return key & 0xffffff00u;
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index 52a50ee29b2f..c5fd7375ff0e 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -790,7 +790,7 @@ static int create_cq_user(struct mlx5_ib_dev *dev, struct ib_udata *udata,
+ 
+ 	*inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+ 		 MLX5_FLD_SZ_BYTES(create_cq_in, pas[0]) * ncont;
+-	*cqb = mlx5_vzalloc(*inlen);
++	*cqb = kvzalloc(*inlen, GFP_KERNEL);
+ 	if (!*cqb) {
+ 		err = -ENOMEM;
+ 		goto err_db;
+@@ -886,7 +886,7 @@ static int create_cq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_cq *cq,
+ 
+ 	*inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+ 		 MLX5_FLD_SZ_BYTES(create_cq_in, pas[0]) * cq->buf.buf.npages;
+-	*cqb = mlx5_vzalloc(*inlen);
++	*cqb = kvzalloc(*inlen, GFP_KERNEL);
+ 	if (!*cqb) {
+ 		err = -ENOMEM;
+ 		goto err_buf;
+@@ -1316,7 +1316,7 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq, int entries, struct ib_udata *udata)
+ 	inlen = MLX5_ST_SZ_BYTES(modify_cq_in) +
+ 		MLX5_FLD_SZ_BYTES(modify_cq_in, pas[0]) * npas;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		goto ex_resize;
+diff --git a/drivers/infiniband/hw/mlx5/mad.c b/drivers/infiniband/hw/mlx5/mad.c
+index 57d77c97c8c4..a8903d1d223c 100644
+--- a/drivers/infiniband/hw/mlx5/mad.c
++++ b/drivers/infiniband/hw/mlx5/mad.c
+@@ -218,7 +218,7 @@ static int process_pma_cmd(struct ib_device *ibdev, u8 port_num,
+ 			(struct ib_pma_portcounters_ext *)(out_mad->data + 40);
+ 		int sz = MLX5_ST_SZ_BYTES(query_vport_counter_out);
+ 
+-		out_cnt = mlx5_vzalloc(sz);
++		out_cnt = kvzalloc(sz, GFP_KERNEL);
+ 		if (!out_cnt)
+ 			return IB_MAD_RESULT_FAILURE;
+ 
+@@ -231,7 +231,7 @@ static int process_pma_cmd(struct ib_device *ibdev, u8 port_num,
+ 			(struct ib_pma_portcounters *)(out_mad->data + 40);
+ 		int sz = MLX5_ST_SZ_BYTES(ppcnt_reg);
+ 
+-		out_cnt = mlx5_vzalloc(sz);
++		out_cnt = kvzalloc(sz, GFP_KERNEL);
+ 		if (!out_cnt)
+ 			return IB_MAD_RESULT_FAILURE;
+ 
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index a8e670ca9d43..838b4c252d96 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1124,7 +1124,7 @@ static struct mlx5_ib_mr *reg_create(struct ib_mr *ibmr, struct ib_pd *pd,
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_mkey_in) +
+ 		sizeof(*pas) * ((npages + 1) / 2) * 2;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		goto err_1;
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 5d46e93692b2..0cff43dae3be 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -838,7 +838,7 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 
+ 	*inlen = MLX5_ST_SZ_BYTES(create_qp_in) +
+ 		 MLX5_FLD_SZ_BYTES(create_qp_in, pas[0]) * ncont;
+-	*in = mlx5_vzalloc(*inlen);
++	*in = kvzalloc(*inlen, GFP_KERNEL);
+ 	if (!*in) {
+ 		err = -ENOMEM;
+ 		goto err_umem;
+@@ -951,7 +951,7 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
+ 	qp->sq.qend = mlx5_get_send_wqe(qp, qp->sq.wqe_cnt);
+ 	*inlen = MLX5_ST_SZ_BYTES(create_qp_in) +
+ 		 MLX5_FLD_SZ_BYTES(create_qp_in, pas[0]) * qp->buf.npages;
+-	*in = mlx5_vzalloc(*inlen);
++	*in = kvzalloc(*inlen, GFP_KERNEL);
+ 	if (!*in) {
+ 		err = -ENOMEM;
+ 		goto err_buf;
+@@ -1084,7 +1084,7 @@ static int create_raw_packet_qp_sq(struct mlx5_ib_dev *dev,
+ 		return err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_sq_in) + sizeof(u64) * ncont;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		goto err_umem;
+@@ -1164,7 +1164,7 @@ static int create_raw_packet_qp_rq(struct mlx5_ib_dev *dev,
+ 	u32 rq_pas_size = get_rq_pas_size(qpc);
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_rq_in) + rq_pas_size;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -1217,7 +1217,7 @@ static int create_raw_packet_qp_tir(struct mlx5_ib_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_tir_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -1396,7 +1396,7 @@ static int create_rss_raw_qp_tir(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ 	}
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_tir_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -1660,7 +1660,7 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ 		if (err)
+ 			return err;
+ 	} else {
+-		in = mlx5_vzalloc(inlen);
++		in = kvzalloc(inlen, GFP_KERNEL);
+ 		if (!in)
+ 			return -ENOMEM;
+ 
+@@ -2192,7 +2192,7 @@ static int modify_raw_packet_eth_prio(struct mlx5_core_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_tis_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -2217,7 +2217,7 @@ static int modify_raw_packet_tx_affinity(struct mlx5_core_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_tis_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -2460,7 +2460,7 @@ static int modify_raw_packet_qp_rq(struct mlx5_ib_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_rq_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -2505,7 +2505,7 @@ static int modify_raw_packet_qp_sq(struct mlx5_core_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_sq_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -4364,7 +4364,7 @@ static int query_raw_packet_qp_sq_state(struct mlx5_ib_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(query_sq_out);
+-	out = mlx5_vzalloc(inlen);
++	out = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -4391,7 +4391,7 @@ static int query_raw_packet_qp_rq_state(struct mlx5_ib_dev *dev,
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(query_rq_out);
+-	out = mlx5_vzalloc(inlen);
++	out = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -4702,7 +4702,7 @@ static int  create_rq(struct mlx5_ib_rwq *rwq, struct ib_pd *pd,
+ 	dev = to_mdev(pd->device);
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_rq_in) + sizeof(u64) * rwq->rq_num_pas;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -4932,7 +4932,7 @@ struct ib_rwq_ind_table *mlx5_ib_create_rwq_ind_table(struct ib_device *device,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_rqt_in) + sizeof(u32) * sz;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		goto err;
+@@ -5011,7 +5011,7 @@ int mlx5_ib_modify_wq(struct ib_wq *wq, struct ib_wq_attr *wq_attr,
+ 		return -EOPNOTSUPP;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_rq_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index 7cb145f9a6db..43707b101f47 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -127,7 +127,7 @@ static int create_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq,
+ 		goto err_umem;
+ 	}
+ 
+-	in->pas = mlx5_vzalloc(sizeof(*in->pas) * ncont);
++	in->pas = kvzalloc(sizeof(*in->pas) * ncont, GFP_KERNEL);
+ 	if (!in->pas) {
+ 		err = -ENOMEM;
+ 		goto err_umem;
+@@ -189,7 +189,7 @@ static int create_srq_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_srq *srq,
+ 	}
+ 
+ 	mlx5_ib_dbg(dev, "srq->buf.page_shift = %d\n", srq->buf.page_shift);
+-	in->pas = mlx5_vzalloc(sizeof(*in->pas) * srq->buf.npages);
++	in->pas = kvzalloc(sizeof(*in->pas) * srq->buf.npages, GFP_KERNEL);
+ 	if (!in->pas) {
+ 		err = -ENOMEM;
+ 		goto err_buf;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/debugfs.c b/drivers/net/ethernet/mellanox/mlx5/core/debugfs.c
+index e94a9532e218..de40b6cfee95 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/debugfs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/debugfs.c
+@@ -405,7 +405,7 @@ static u64 cq_read_field(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+ 	u32 *out;
+ 	int err;
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return param;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+index c8a005326e30..f4017c06ddd2 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+@@ -180,9 +180,8 @@ static int arfs_add_default_rule(struct mlx5e_priv *priv,
+ 	struct mlx5_flow_spec *spec;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+-		netdev_err(priv->netdev, "%s: alloc failed\n", __func__);
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+@@ -237,7 +236,7 @@ static int arfs_create_groups(struct mlx5e_flow_table *ft,
+ 
+ 	ft->g = kcalloc(MLX5E_ARFS_NUM_GROUPS,
+ 			sizeof(*ft->g), GFP_KERNEL);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if  (!in || !ft->g) {
+ 		kvfree(ft->g);
+ 		kvfree(in);
+@@ -481,9 +480,8 @@ static struct mlx5_flow_handle *arfs_add_rule(struct mlx5e_priv *priv,
+ 	struct mlx5_flow_table *ft;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+-		netdev_err(priv->netdev, "%s: alloc failed\n", __func__);
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+index f175518ff07a..85a2b42dde2f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_common.c
+@@ -65,7 +65,7 @@ static int mlx5e_create_mkey(struct mlx5_core_dev *mdev, u32 pdn,
+ 	u32 *in;
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -146,7 +146,7 @@ int mlx5e_refresh_tirs_self_loopback(struct mlx5_core_dev *mdev,
+ 	int err = 0;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(modify_tir_in);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 31e05fa6243c..3428dfe811cc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -1028,7 +1028,7 @@ static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
+ 	    (hfunc != ETH_RSS_HASH_TOP))
+ 		return -EINVAL;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+index 729904c43801..37a85b7d855b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@ -218,11 +218,9 @@ static int mlx5e_add_vlan_rule(struct mlx5e_priv *priv,
+ 	struct mlx5_flow_spec *spec;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
+-	if (!spec) {
+-		netdev_err(priv->netdev, "%s: alloc failed\n", __func__);
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++	if (!spec)
+ 		return -ENOMEM;
+-	}
+ 
+ 	if (rule_type == MLX5E_VLAN_RULE_TYPE_MATCH_VID)
+ 		mlx5e_vport_context_update_vlans(priv);
+@@ -660,11 +658,9 @@ mlx5e_generate_ttc_rule(struct mlx5e_priv *priv,
+ 	struct mlx5_flow_spec *spec;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
+-	if (!spec) {
+-		netdev_err(priv->netdev, "%s: alloc failed\n", __func__);
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++	if (!spec)
+ 		return ERR_PTR(-ENOMEM);
+-	}
+ 
+ 	if (proto) {
+ 		spec->match_criteria_enable = MLX5_MATCH_OUTER_HEADERS;
+@@ -742,7 +738,7 @@ static int mlx5e_create_ttc_table_groups(struct mlx5e_ttc_table *ttc)
+ 			sizeof(*ft->g), GFP_KERNEL);
+ 	if (!ft->g)
+ 		return -ENOMEM;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		kfree(ft->g);
+ 		return -ENOMEM;
+@@ -852,11 +848,9 @@ static int mlx5e_add_l2_flow_rule(struct mlx5e_priv *priv,
+ 	u8 *mc_dmac;
+ 	u8 *mv_dmac;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
+-	if (!spec) {
+-		netdev_err(priv->netdev, "%s: alloc failed\n", __func__);
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++	if (!spec)
+ 		return -ENOMEM;
+-	}
+ 
+ 	mc_dmac = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+ 			       outer_headers.dmac_47_16);
+@@ -916,7 +910,7 @@ static int mlx5e_create_l2_table_groups(struct mlx5e_l2_table *l2_table)
+ 	ft->g = kcalloc(MLX5E_NUM_L2_GROUPS, sizeof(*ft->g), GFP_KERNEL);
+ 	if (!ft->g)
+ 		return -ENOMEM;
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		kfree(ft->g);
+ 		return -ENOMEM;
+@@ -1071,7 +1065,7 @@ static int mlx5e_create_vlan_table_groups(struct mlx5e_flow_table *ft)
+ 	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+index 26fc77e80f7b..ea9200855790 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs_ethtool.c
+@@ -296,7 +296,7 @@ add_ethtool_flow_rule(struct mlx5e_priv *priv,
+ 	struct mlx5_flow_handle *rule;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec)
+ 		return ERR_PTR(-ENOMEM);
+ 	err = set_flow_attrs(spec->match_criteria, spec->match_value,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index d3c637b0294b..1abcdfb8207f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -1210,7 +1210,7 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv, __be16 protocol,
+ 	}
+ 
+ 	flow = kzalloc(sizeof(*flow) + attr_size, GFP_KERNEL);
+-	parse_attr = mlx5_vzalloc(sizeof(*parse_attr));
++	parse_attr = kvzalloc(sizeof(*parse_attr), GFP_KERNEL);
+ 	if (!parse_attr || !flow) {
+ 		err = -ENOMEM;
+ 		goto err_free;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eq.c b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index 634e6e3dfa90..12a9daa93a6a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -372,7 +372,7 @@ int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
+ 	inlen = MLX5_ST_SZ_BYTES(create_eq_in) +
+ 		MLX5_FLD_SZ_BYTES(create_eq_in, pas[0]) * eq->buf.npages;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		goto err_buf;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index a8f2c4a96a9b..78929297f95c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -248,11 +248,10 @@ __esw_fdb_set_vport_rule(struct mlx5_eswitch *esw, u32 vport, bool rx_rule,
+ 	if (rx_rule)
+ 		match_header |= MLX5_MATCH_MISC_PARAMETERS;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
+-	if (!spec) {
+-		esw_warn(esw->dev, "FDB: Failed to alloc match parameters\n");
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++	if (!spec)
+ 		return NULL;
+-	}
++
+ 	dmac_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
+ 			      outer_headers.dmac_47_16);
+ 	dmac_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+@@ -350,10 +349,9 @@ static int esw_create_legacy_fdb_table(struct mlx5_eswitch *esw, int nvports)
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	flow_group_in = mlx5_vzalloc(inlen);
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!flow_group_in)
+ 		return -ENOMEM;
+-	memset(flow_group_in, 0, inlen);
+ 
+ 	table_size = BIT(MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size));
+ 
+@@ -961,7 +959,7 @@ static int esw_vport_enable_egress_acl(struct mlx5_eswitch *esw,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	flow_group_in = mlx5_vzalloc(inlen);
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!flow_group_in)
+ 		return -ENOMEM;
+ 
+@@ -1078,7 +1076,7 @@ static int esw_vport_enable_ingress_acl(struct mlx5_eswitch *esw,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	flow_group_in = mlx5_vzalloc(inlen);
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!flow_group_in)
+ 		return -ENOMEM;
+ 
+@@ -1241,11 +1239,9 @@ static int esw_vport_ingress_config(struct mlx5_eswitch *esw,
+ 		  "vport[%d] configure ingress rules, vlan(%d) qos(%d)\n",
+ 		  vport->vport, vport->info.vlan, vport->info.qos);
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+ 		err = -ENOMEM;
+-		esw_warn(esw->dev, "vport[%d] configure ingress rules failed, err(%d)\n",
+-			 vport->vport, err);
+ 		goto out;
+ 	}
+ 
+@@ -1322,11 +1318,9 @@ static int esw_vport_egress_config(struct mlx5_eswitch *esw,
+ 		  "vport[%d] configure egress rules, vlan(%d) qos(%d)\n",
+ 		  vport->vport, vport->info.vlan, vport->info.qos);
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+ 		err = -ENOMEM;
+-		esw_warn(esw->dev, "vport[%d] configure egress rules failed, err(%d)\n",
+-			 vport->vport, err);
+ 		goto out;
+ 	}
+ 
+@@ -2159,7 +2153,7 @@ int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
+ 	if (!LEGAL_VPORT(esw, vport))
+ 		return -EINVAL;
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 7ae663b670c1..4550b431f606 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -308,9 +308,8 @@ mlx5_eswitch_add_send_to_vport_rule(struct mlx5_eswitch *esw, int vport, u32 sqn
+ 	struct mlx5_flow_spec *spec;
+ 	void *misc;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+-		esw_warn(esw->dev, "FDB: Failed to alloc match parameters\n");
+ 		flow_rule = ERR_PTR(-ENOMEM);
+ 		goto out;
+ 	}
+@@ -398,9 +397,8 @@ static int esw_add_fdb_miss_rule(struct mlx5_eswitch *esw)
+ 	struct mlx5_flow_spec *spec;
+ 	int err = 0;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+-		esw_warn(esw->dev, "FDB: Failed to alloc match parameters\n");
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+@@ -485,7 +483,7 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
+ 	u32 *flow_group_in;
+ 
+ 	esw_debug(esw->dev, "Create offloads FDB Tables\n");
+-	flow_group_in = mlx5_vzalloc(inlen);
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!flow_group_in)
+ 		return -ENOMEM;
+ 
+@@ -628,7 +626,7 @@ static int esw_create_vport_rx_group(struct mlx5_eswitch *esw)
+ 	int err = 0;
+ 	int nvports = priv->sriov.num_vfs + 2;
+ 
+-	flow_group_in = mlx5_vzalloc(inlen);
++	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!flow_group_in)
+ 		return -ENOMEM;
+ 
+@@ -672,9 +670,8 @@ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, int vport, u32 tirn)
+ 	struct mlx5_flow_spec *spec;
+ 	void *misc;
+ 
+-	spec = mlx5_vzalloc(sizeof(*spec));
++	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
+ 	if (!spec) {
+-		esw_warn(esw->dev, "Failed to alloc match parameters\n");
+ 		flow_rule = ERR_PTR(-ENOMEM);
+ 		goto out;
+ 	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+index 19e3d2fc2099..b27c59af9640 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@ -235,11 +235,9 @@ static int mlx5_cmd_set_fte(struct mlx5_core_dev *dev,
+ 	u32 *in;
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
+-	if (!in) {
+-		mlx5_core_warn(dev, "failed to allocate inbox\n");
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
+ 		return -ENOMEM;
+-	}
+ 
+ 	MLX5_SET(set_fte_in, in, opcode, MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY);
+ 	MLX5_SET(set_fte_in, in, op_mod, opmod);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index bdd564dcef53..7fe2fe4987a6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -376,11 +376,9 @@ static void del_rule(struct fs_node *node)
+ 	int err;
+ 	bool update_fte = false;
+ 
+-	match_value = mlx5_vzalloc(match_len);
+-	if (!match_value) {
+-		mlx5_core_warn(dev, "failed to allocate inbox\n");
++	match_value = kvzalloc(match_len, GFP_KERNEL);
++	if (!match_value)
+ 		return;
+-	}
+ 
+ 	fs_get_obj(rule, node);
+ 	fs_get_obj(fte, rule->node.parent);
+@@ -1159,7 +1157,7 @@ static struct mlx5_flow_group *create_autogroup(struct mlx5_flow_table *ft,
+ 	if (!ft->autogroup.active)
+ 		return ERR_PTR(-ENOENT);
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -1778,7 +1776,7 @@ static struct mlx5_flow_root_namespace *create_root_ns(struct mlx5_flow_steering
+ 	struct mlx5_flow_namespace *ns;
+ 
+ 	/* Create the root namespace */
+-	root_ns = mlx5_vzalloc(sizeof(*root_ns));
++	root_ns = kvzalloc(sizeof(*root_ns), GFP_KERNEL);
+ 	if (!root_ns)
+ 		return NULL;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/pagealloc.c b/drivers/net/ethernet/mellanox/mlx5/core/pagealloc.c
+index a57d5a81eb05..efcded7ca27a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/pagealloc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/pagealloc.c
+@@ -279,7 +279,7 @@ static int give_pages(struct mlx5_core_dev *dev, u16 func_id, int npages,
+ 	int i;
+ 
+ 	inlen += npages * MLX5_FLD_SZ_BYTES(manage_pages_in, pas[0]);
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		mlx5_core_warn(dev, "vzalloc failed %d\n", inlen);
+@@ -376,7 +376,7 @@ static int reclaim_pages(struct mlx5_core_dev *dev, u32 func_id, int npages,
+ 		*nclaimed = 0;
+ 
+ 	outlen += npages * MLX5_FLD_SZ_BYTES(manage_pages_out, pas[0]);
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/port.c b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+index 141583daf5a2..1975d4388d4f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+@@ -47,8 +47,8 @@ int mlx5_core_access_reg(struct mlx5_core_dev *dev, void *data_in,
+ 	u32 *in = NULL;
+ 	void *data;
+ 
+-	in = mlx5_vzalloc(inlen);
+-	out = mlx5_vzalloc(outlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!in || !out)
+ 		goto out;
+ 
+@@ -454,7 +454,7 @@ int mlx5_core_query_ib_ppcnt(struct mlx5_core_dev *dev,
+ 	u32 *in;
+ 	int err;
+ 
+-	in  = mlx5_vzalloc(sz);
++	in  = kvzalloc(sz, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		return err;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/qp.c b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+index 5378a5f74bdc..53accba83adc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/qp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+@@ -635,7 +635,7 @@ int mlx5_core_query_out_of_buffer(struct mlx5_core_dev *dev, u16 counter_id,
+ 	void *out;
+ 	int err;
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/srq.c b/drivers/net/ethernet/mellanox/mlx5/core/srq.c
+index 3099630015d7..f774de6f5fcb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/srq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/srq.c
+@@ -162,7 +162,7 @@ static int create_srq_cmd(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+ 
+ 	pas_size  = get_pas_size(in);
+ 	inlen	  = MLX5_ST_SZ_BYTES(create_srq_in) + pas_size;
+-	create_in = mlx5_vzalloc(inlen);
++	create_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!create_in)
+ 		return -ENOMEM;
+ 
+@@ -221,7 +221,7 @@ static int query_srq_cmd(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+ 	void *srqc;
+ 	int err;
+ 
+-	srq_out = mlx5_vzalloc(MLX5_ST_SZ_BYTES(query_srq_out));
++	srq_out = kvzalloc(MLX5_ST_SZ_BYTES(query_srq_out), GFP_KERNEL);
+ 	if (!srq_out)
+ 		return -ENOMEM;
+ 
+@@ -256,7 +256,7 @@ static int create_xrc_srq_cmd(struct mlx5_core_dev *dev,
+ 
+ 	pas_size  = get_pas_size(in);
+ 	inlen	  = MLX5_ST_SZ_BYTES(create_xrc_srq_in) + pas_size;
+-	create_in = mlx5_vzalloc(inlen);
++	create_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!create_in)
+ 		return -ENOMEM;
+ 
+@@ -320,7 +320,7 @@ static int query_xrc_srq_cmd(struct mlx5_core_dev *dev,
+ 	void *xrc_srqc;
+ 	int err;
+ 
+-	xrcsrq_out = mlx5_vzalloc(MLX5_ST_SZ_BYTES(query_xrc_srq_out));
++	xrcsrq_out = kvzalloc(MLX5_ST_SZ_BYTES(query_xrc_srq_out), GFP_KERNEL);
+ 	if (!xrcsrq_out)
+ 		return -ENOMEM;
+ 	memset(xrcsrq_in, 0, sizeof(xrcsrq_in));
+@@ -357,7 +357,7 @@ static int create_rmp_cmd(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+ 
+ 	pas_size = get_pas_size(in);
+ 	inlen = MLX5_ST_SZ_BYTES(create_rmp_in) + pas_size;
+-	create_in = mlx5_vzalloc(inlen);
++	create_in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!create_in)
+ 		return -ENOMEM;
+ 
+@@ -390,7 +390,7 @@ static int arm_rmp_cmd(struct mlx5_core_dev *dev,
+ 	void *bitmask;
+ 	int err;
+ 
+-	in = mlx5_vzalloc(MLX5_ST_SZ_BYTES(modify_rmp_in));
++	in = kvzalloc(MLX5_ST_SZ_BYTES(modify_rmp_in), GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -417,7 +417,7 @@ static int query_rmp_cmd(struct mlx5_core_dev *dev, struct mlx5_core_srq *srq,
+ 	void *rmpc;
+ 	int err;
+ 
+-	rmp_out =  mlx5_vzalloc(MLX5_ST_SZ_BYTES(query_rmp_out));
++	rmp_out =  kvzalloc(MLX5_ST_SZ_BYTES(query_rmp_out), GFP_KERNEL);
+ 	if (!rmp_out)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/transobj.c b/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
+index a00ff49eec18..5e128d7a9ffd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/transobj.c
+@@ -284,7 +284,7 @@ int mlx5_core_arm_rmp(struct mlx5_core_dev *dev, u32 rmpn, u16 lwm)
+ 	void *bitmask;
+ 	int  err;
+ 
+-	in = mlx5_vzalloc(MLX5_ST_SZ_BYTES(modify_rmp_in));
++	in = kvzalloc(MLX5_ST_SZ_BYTES(modify_rmp_in), GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/vport.c b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+index db79391a6718..9f6d512610e7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vport.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+@@ -172,7 +172,7 @@ int mlx5_query_nic_vport_mac_address(struct mlx5_core_dev *mdev,
+ 	u8 *out_addr;
+ 	int err;
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -200,11 +200,9 @@ int mlx5_modify_nic_vport_mac_address(struct mlx5_core_dev *mdev,
+ 	void *nic_vport_ctx;
+ 	u8 *perm_mac;
+ 
+-	in = mlx5_vzalloc(inlen);
+-	if (!in) {
+-		mlx5_core_warn(mdev, "failed to allocate inbox\n");
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
+ 		return -ENOMEM;
+-	}
+ 
+ 	MLX5_SET(modify_nic_vport_context_in, in,
+ 		 field_select.permanent_address, 1);
+@@ -234,7 +232,7 @@ int mlx5_query_nic_vport_mtu(struct mlx5_core_dev *mdev, u16 *mtu)
+ 	u32 *out;
+ 	int err;
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -254,7 +252,7 @@ int mlx5_modify_nic_vport_mtu(struct mlx5_core_dev *mdev, u16 mtu)
+ 	void *in;
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -504,7 +502,7 @@ int mlx5_query_nic_vport_system_image_guid(struct mlx5_core_dev *mdev,
+ 	u32 *out;
+ 	int outlen = MLX5_ST_SZ_BYTES(query_nic_vport_context_out);
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -524,7 +522,7 @@ int mlx5_query_nic_vport_node_guid(struct mlx5_core_dev *mdev, u64 *node_guid)
+ 	u32 *out;
+ 	int outlen = MLX5_ST_SZ_BYTES(query_nic_vport_context_out);
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -554,7 +552,7 @@ int mlx5_modify_nic_vport_node_guid(struct mlx5_core_dev *mdev,
+ 	if (!MLX5_CAP_ESW(mdev, nic_vport_node_guid_modify))
+ 		return -EOPNOTSUPP;
+ 
+-	in = mlx5_vzalloc(inlen);
++	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+@@ -580,7 +578,7 @@ int mlx5_query_nic_vport_qkey_viol_cntr(struct mlx5_core_dev *mdev,
+ 	u32 *out;
+ 	int outlen = MLX5_ST_SZ_BYTES(query_nic_vport_context_out);
+ 
+-	out = mlx5_vzalloc(outlen);
++	out = kvzalloc(outlen, GFP_KERNEL);
+ 	if (!out)
+ 		return -ENOMEM;
+ 
+@@ -882,11 +880,9 @@ int mlx5_modify_nic_vport_promisc(struct mlx5_core_dev *mdev,
+ 	int inlen = MLX5_ST_SZ_BYTES(modify_nic_vport_context_in);
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
+-	if (!in) {
+-		mlx5_core_err(mdev, "failed to allocate inbox\n");
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
+ 		return -ENOMEM;
+-	}
+ 
+ 	MLX5_SET(modify_nic_vport_context_in, in, field_select.promisc, 1);
+ 	MLX5_SET(modify_nic_vport_context_in, in,
+@@ -916,11 +912,9 @@ static int mlx5_nic_vport_update_roce_state(struct mlx5_core_dev *mdev,
+ 	int inlen = MLX5_ST_SZ_BYTES(modify_nic_vport_context_in);
+ 	int err;
+ 
+-	in = mlx5_vzalloc(inlen);
+-	if (!in) {
+-		mlx5_core_warn(mdev, "failed to allocate inbox\n");
++	in = kvzalloc(inlen, GFP_KERNEL);
++	if (!in)
+ 		return -ENOMEM;
+-	}
+ 
+ 	MLX5_SET(modify_nic_vport_context_in, in, field_select.roce_en, 1);
+ 	MLX5_SET(modify_nic_vport_context_in, in, nic_vport_context.roce_en,
+@@ -955,7 +949,7 @@ int mlx5_core_query_vport_counter(struct mlx5_core_dev *dev, u8 other_vport,
+ 	int	err;
+ 
+ 	is_group_manager = MLX5_CAP_GEN(dev, vport_group_manager);
+-	in = mlx5_vzalloc(in_sz);
++	in = kvzalloc(in_sz, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+ 		return err;
+* Unmerged path include/linux/mlx5/driver.h
