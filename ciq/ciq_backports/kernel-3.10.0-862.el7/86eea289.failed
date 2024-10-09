@@ -1,0 +1,166 @@
+nvme-pci: Remove nvme_setup_prps BUG_ON
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] pci: Remove nvme_setup_prps BUG_ON (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 93.15%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 86eea2895d11dde9bf43fa2046331e84154e00f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/86eea289.failed
+
+This patch replaces the invalid nvme SGL kernel panic with a warning,
+and returns an appropriate error. The warning will occur only on the
+first occurance, and sgl details will be printed to help debug how the
+request was allowed to form.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 86eea2895d11dde9bf43fa2046331e84154e00f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index bdee6de6e811,1e5c9f2ddba6..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -353,8 -472,74 +353,79 @@@ static void nvme_free_iod(struct nvme_d
+  		kfree(iod->sg);
+  }
+  
+++<<<<<<< HEAD
+ +static bool nvme_setup_prps(struct nvme_dev *dev, struct request *req,
+ +		int total_len)
+++=======
++ #ifdef CONFIG_BLK_DEV_INTEGRITY
++ static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == v)
++ 		pi->ref_tag = cpu_to_be32(p);
++ }
++ 
++ static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ 	if (be32_to_cpu(pi->ref_tag) == p)
++ 		pi->ref_tag = cpu_to_be32(v);
++ }
++ 
++ /**
++  * nvme_dif_remap - remaps ref tags to bip seed and physical lba
++  *
++  * The virtual start sector is the one that was originally submitted by the
++  * block layer.	Due to partitioning, MD/DM cloning, etc. the actual physical
++  * start sector may be different. Remap protection information to match the
++  * physical LBA on writes, and back to the original seed on reads.
++  *
++  * Type 0 and 3 do not have a ref tag, so no remapping required.
++  */
++ static void nvme_dif_remap(struct request *req,
++ 			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
++ {
++ 	struct nvme_ns *ns = req->rq_disk->private_data;
++ 	struct bio_integrity_payload *bip;
++ 	struct t10_pi_tuple *pi;
++ 	void *p, *pmap;
++ 	u32 i, nlb, ts, phys, virt;
++ 
++ 	if (!ns->pi_type || ns->pi_type == NVME_NS_DPS_PI_TYPE3)
++ 		return;
++ 
++ 	bip = bio_integrity(req->bio);
++ 	if (!bip)
++ 		return;
++ 
++ 	pmap = kmap_atomic(bip->bip_vec->bv_page) + bip->bip_vec->bv_offset;
++ 
++ 	p = pmap;
++ 	virt = bip_get_seed(bip);
++ 	phys = nvme_block_nr(ns, blk_rq_pos(req));
++ 	nlb = (blk_rq_bytes(req) >> ns->lba_shift);
++ 	ts = ns->disk->queue->integrity.tuple_size;
++ 
++ 	for (i = 0; i < nlb; i++, virt++, phys++) {
++ 		pi = (struct t10_pi_tuple *)p;
++ 		dif_swap(phys, virt, pi);
++ 		p += ts;
++ 	}
++ 	kunmap_atomic(pmap);
++ }
++ #else /* CONFIG_BLK_DEV_INTEGRITY */
++ static void nvme_dif_remap(struct request *req,
++ 			void (*dif_swap)(u32 p, u32 v, struct t10_pi_tuple *pi))
++ {
++ }
++ static void nvme_dif_prep(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ }
++ static void nvme_dif_complete(u32 p, u32 v, struct t10_pi_tuple *pi)
++ {
++ }
++ #endif
++ 
++ static blk_status_t nvme_setup_prps(struct nvme_dev *dev, struct request *req)
+++>>>>>>> 86eea2895d11 (nvme-pci: Remove nvme_setup_prps BUG_ON)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+  	struct dma_pool *pool;
+@@@ -430,11 -616,26 +502,26 @@@
+  		dma_len = sg_dma_len(sg);
+  	}
+  
+- 	return true;
++ 	return BLK_STS_OK;
++ 
++  bad_sgl:
++ 	if (WARN_ONCE(1, "Invalid SGL for payload:%d nents:%d\n",
++ 				blk_rq_payload_bytes(req), iod->nents)) {
++ 		for_each_sg(iod->sg, sg, iod->nents, i) {
++ 			dma_addr_t phys = sg_phys(sg);
++ 			pr_warn("sg[%d] phys_addr:%pad offset:%d length:%d "
++ 			       "dma_address:%pad dma_length:%d\n", i, &phys,
++ 					sg->offset, sg->length,
++ 					&sg_dma_address(sg),
++ 					sg_dma_len(sg));
++ 		}
++ 	}
++ 	return BLK_STS_IOERR;
++ 
+  }
+  
+ -static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ -		struct nvme_command *cmnd)
+ +static int nvme_map_data(struct nvme_dev *dev, struct request *req,
+ +		unsigned size, struct nvme_command *cmnd)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+  	struct request_queue *q = req->q;
+@@@ -447,14 -648,16 +534,19 @@@
+  	if (!iod->nents)
+  		goto out;
+  
+ -	ret = BLK_STS_RESOURCE;
+ -	if (!dma_map_sg_attrs(dev->dev, iod->sg, iod->nents, dma_dir,
+ -				DMA_ATTR_NO_WARN))
+ +	ret = BLK_MQ_RQ_QUEUE_BUSY;
+ +	if (!dma_map_sg(dev->dev, iod->sg, iod->nents, dma_dir))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (!nvme_setup_prps(dev, req, size))
+++=======
++ 	ret = nvme_setup_prps(dev, req);
++ 	if (ret != BLK_STS_OK)
+++>>>>>>> 86eea2895d11 (nvme-pci: Remove nvme_setup_prps BUG_ON)
+  		goto out_unmap;
+  
+ -	ret = BLK_STS_IOERR;
+ +	ret = BLK_MQ_RQ_QUEUE_ERROR;
+  	if (blk_integrity_rq(req)) {
+  		if (blk_rq_count_integrity_sg(q, req->bio) != 1)
+  			goto out_unmap;
+* Unmerged path drivers/nvme/host/pci.c
