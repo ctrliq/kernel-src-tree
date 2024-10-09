@@ -1,0 +1,193 @@
+virtio_pci: Use the DMA API if enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 7a5589b240b405d55b2b395554082ec284f414bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7a5589b2.failed
+
+This switches to vring_create_virtqueue, simplifying the driver and
+adding DMA API support.
+
+This fixes virtio-pci on platforms and busses that have IOMMUs.  This
+will break the experimental QEMU Q35 IOMMU support until QEMU is
+fixed.  In exchange, it fixes physical virtio hardware as well as
+virtio-pci running under Xen.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 7a5589b240b405d55b2b395554082ec284f414bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/virtio/virtio_pci_modern.c
+diff --cc drivers/virtio/virtio_pci_modern.c
+index 31bf8542fe42,f6f28cc7eb45..000000000000
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@@ -348,29 -318,22 +323,27 @@@ static struct virtqueue *setup_vq(struc
+  	/* get offset of notification word for this vq */
+  	off = vp_ioread16(&cfg->queue_notify_off);
+  
+- 	info->num = num;
+  	info->msix_vector = msix_vec;
+  
+- 	info->queue = alloc_virtqueue_pages(&info->num);
+- 	if (info->queue == NULL)
+- 		return ERR_PTR(-ENOMEM);
+- 
+  	/* create the vring */
+- 	vq = vring_new_virtqueue(index, info->num,
+- 				 SMP_CACHE_BYTES, &vp_dev->vdev,
+- 				 true, info->queue, vp_notify, callback, name);
+- 	if (!vq) {
+- 		err = -ENOMEM;
+- 		goto err_new_queue;
+- 	}
++ 	vq = vring_create_virtqueue(index, num,
++ 				    SMP_CACHE_BYTES, &vp_dev->vdev,
++ 				    true, true, vp_notify, callback, name);
++ 	if (!vq)
++ 		return ERR_PTR(-ENOMEM);
+  
+  	/* activate the queue */
+++<<<<<<< HEAD
+ +	vp_iowrite16(info->num, &cfg->queue_size);
+ +	vp_iowrite64_twopart(virt_to_phys(info->queue),
+++=======
++ 	vp_iowrite16(virtqueue_get_vring_size(vq), &cfg->queue_size);
++ 	vp_iowrite64_twopart(virtqueue_get_desc_addr(vq),
+++>>>>>>> 7a5589b240b4 (virtio_pci: Use the DMA API if enabled)
+  			     &cfg->queue_desc_lo, &cfg->queue_desc_hi);
+- 	vp_iowrite64_twopart(virt_to_phys(virtqueue_get_avail(vq)),
++ 	vp_iowrite64_twopart(virtqueue_get_avail_addr(vq),
+  			     &cfg->queue_avail_lo, &cfg->queue_avail_hi);
+- 	vp_iowrite64_twopart(virt_to_phys(virtqueue_get_used(vq)),
++ 	vp_iowrite64_twopart(virtqueue_get_used_addr(vq),
+  			     &cfg->queue_used_lo, &cfg->queue_used_hi);
+  
+  	if (vp_dev->notify_base) {
+diff --git a/drivers/virtio/virtio_pci_common.h b/drivers/virtio/virtio_pci_common.h
+index b976d968e793..1a3c689d1b9e 100644
+--- a/drivers/virtio/virtio_pci_common.h
++++ b/drivers/virtio/virtio_pci_common.h
+@@ -35,12 +35,6 @@ struct virtio_pci_vq_info {
+ 	/* the actual virtqueue */
+ 	struct virtqueue *vq;
+ 
+-	/* the number of entries in the queue */
+-	int num;
+-
+-	/* the virtual address of the ring queue */
+-	void *queue;
+-
+ 	/* the list node for the virtqueues list */
+ 	struct list_head node;
+ 
+diff --git a/drivers/virtio/virtio_pci_legacy.c b/drivers/virtio/virtio_pci_legacy.c
+index 48bc9797e530..8c4e61783441 100644
+--- a/drivers/virtio/virtio_pci_legacy.c
++++ b/drivers/virtio/virtio_pci_legacy.c
+@@ -119,7 +119,6 @@ static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+ 				  u16 msix_vec)
+ {
+ 	struct virtqueue *vq;
+-	unsigned long size;
+ 	u16 num;
+ 	int err;
+ 
+@@ -131,27 +130,19 @@ static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+ 	if (!num || ioread32(vp_dev->ioaddr + VIRTIO_PCI_QUEUE_PFN))
+ 		return ERR_PTR(-ENOENT);
+ 
+-	info->num = num;
+ 	info->msix_vector = msix_vec;
+ 
+-	size = PAGE_ALIGN(vring_size(num, VIRTIO_PCI_VRING_ALIGN));
+-	info->queue = alloc_pages_exact(size, GFP_KERNEL|__GFP_ZERO);
+-	if (info->queue == NULL)
++	/* create the vring */
++	vq = vring_create_virtqueue(index, num,
++				    VIRTIO_PCI_VRING_ALIGN, &vp_dev->vdev,
++				    true, false, vp_notify, callback, name);
++	if (!vq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	/* activate the queue */
+-	iowrite32(virt_to_phys(info->queue) >> VIRTIO_PCI_QUEUE_ADDR_SHIFT,
++	iowrite32(virtqueue_get_desc_addr(vq) >> VIRTIO_PCI_QUEUE_ADDR_SHIFT,
+ 		  vp_dev->ioaddr + VIRTIO_PCI_QUEUE_PFN);
+ 
+-	/* create the vring */
+-	vq = vring_new_virtqueue(index, info->num,
+-				 VIRTIO_PCI_VRING_ALIGN, &vp_dev->vdev,
+-				 true, info->queue, vp_notify, callback, name);
+-	if (!vq) {
+-		err = -ENOMEM;
+-		goto out_activate_queue;
+-	}
+-
+ 	vq->priv = (void __force *)vp_dev->ioaddr + VIRTIO_PCI_QUEUE_NOTIFY;
+ 
+ 	if (msix_vec != VIRTIO_MSI_NO_VECTOR) {
+@@ -159,17 +150,15 @@ static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+ 		msix_vec = ioread16(vp_dev->ioaddr + VIRTIO_MSI_QUEUE_VECTOR);
+ 		if (msix_vec == VIRTIO_MSI_NO_VECTOR) {
+ 			err = -EBUSY;
+-			goto out_assign;
++			goto out_deactivate;
+ 		}
+ 	}
+ 
+ 	return vq;
+ 
+-out_assign:
+-	vring_del_virtqueue(vq);
+-out_activate_queue:
++out_deactivate:
+ 	iowrite32(0, vp_dev->ioaddr + VIRTIO_PCI_QUEUE_PFN);
+-	free_pages_exact(info->queue, size);
++	vring_del_virtqueue(vq);
+ 	return ERR_PTR(err);
+ }
+ 
+@@ -177,7 +166,6 @@ static void del_vq(struct virtio_pci_vq_info *info)
+ {
+ 	struct virtqueue *vq = info->vq;
+ 	struct virtio_pci_device *vp_dev = to_vp_device(vq->vdev);
+-	unsigned long size;
+ 
+ 	iowrite16(vq->index, vp_dev->ioaddr + VIRTIO_PCI_QUEUE_SEL);
+ 
+@@ -188,13 +176,10 @@ static void del_vq(struct virtio_pci_vq_info *info)
+ 		ioread8(vp_dev->ioaddr + VIRTIO_PCI_ISR);
+ 	}
+ 
+-	vring_del_virtqueue(vq);
+-
+ 	/* Select and deactivate the queue */
+ 	iowrite32(0, vp_dev->ioaddr + VIRTIO_PCI_QUEUE_PFN);
+ 
+-	size = PAGE_ALIGN(vring_size(info->num, VIRTIO_PCI_VRING_ALIGN));
+-	free_pages_exact(info->queue, size);
++	vring_del_virtqueue(vq);
+ }
+ 
+ static const struct virtio_config_ops virtio_pci_config_ops = {
+@@ -227,6 +212,13 @@ int virtio_pci_legacy_probe(struct virtio_pci_device *vp_dev)
+ 		return -ENODEV;
+ 	}
+ 
++	rc = dma_set_mask_and_coherent(&pci_dev->dev, DMA_BIT_MASK(64));
++	if (rc)
++		rc = dma_set_mask_and_coherent(&pci_dev->dev,
++						DMA_BIT_MASK(32));
++	if (rc)
++		dev_warn(&pci_dev->dev, "Failed to enable 64-bit or 32-bit DMA.  Trying to continue, but this might not work.\n");
++
+ 	rc = pci_request_region(pci_dev, 0, "virtio-pci-legacy");
+ 	if (rc)
+ 		return rc;
+* Unmerged path drivers/virtio/virtio_pci_modern.c
