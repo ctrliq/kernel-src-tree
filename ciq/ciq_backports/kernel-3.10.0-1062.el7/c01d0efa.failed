@@ -1,0 +1,183 @@
+nfp: flower: use rhashtable for flow caching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit c01d0efa5136c3eaec3ae26d1e0c8c25d3a69c65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c01d0efa.failed
+
+Make use of relativistic hash tables for tracking flows instead
+of fixed sized hash tables.
+
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c01d0efa5136c3eaec3ae26d1e0c8c25d3a69c65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/metadata.c
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/metadata.c
+index c748aceb17bb,2427c994c91d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/metadata.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+@@@ -99,18 -105,18 +105,28 @@@ static int nfp_get_stats_entry(struct n
+  
+  /* Must be called with either RTNL or rcu_read_lock */
+  struct nfp_fl_payload *
+ -nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie,
+ -			   struct net_device *netdev, __be32 host_ctx)
+ +nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie)
+  {
+++<<<<<<< HEAD
+ +	unsigned long fl_key = nfp_flower_fl_key(tc_flower_cookie);
+++=======
++ 	struct nfp_fl_flow_table_cmp_arg flower_cmp_arg;
+++>>>>>>> c01d0efa5136 (nfp: flower: use rhashtable for flow caching)
+  	struct nfp_flower_priv *priv = app->priv;
+- 	struct nfp_fl_payload *flower_entry;
+  
+++<<<<<<< HEAD
+ +	hash_for_each_possible_rcu(priv->flow_table, flower_entry, link,
+ +				   fl_key)
+ +		if (flower_entry->tc_flower_cookie == tc_flower_cookie)
+ +			return flower_entry;
+- 
+- 	return NULL;
+++=======
++ 	flower_cmp_arg.netdev = netdev;
++ 	flower_cmp_arg.cookie = tc_flower_cookie;
++ 	flower_cmp_arg.host_ctx = host_ctx;
+++>>>>>>> c01d0efa5136 (nfp: flower: use rhashtable for flow caching)
++ 
++ 	return rhashtable_lookup_fast(&priv->flow_table, &flower_cmp_arg,
++ 				      nfp_flower_table_params);
+  }
+  
+  static void
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 970ddbd64602,cd9f13695bc7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -497,10 -513,12 +497,17 @@@ nfp_flower_add_offload(struct nfp_app *
+  	if (err)
+  		goto err_destroy_flow;
+  
+- 	INIT_HLIST_NODE(&flow_pay->link);
+  	flow_pay->tc_flower_cookie = flow->cookie;
+++<<<<<<< HEAD
+ +	fl_key = nfp_flower_fl_key(flow->cookie);
+ +	hash_add_rcu(priv->flow_table, &flow_pay->link, fl_key);
+++=======
++ 	err = rhashtable_insert_fast(&priv->flow_table, &flow_pay->fl_node,
++ 				     nfp_flower_table_params);
++ 	if (err)
++ 		goto err_destroy_flow;
++ 
+++>>>>>>> c01d0efa5136 (nfp: flower: use rhashtable for flow caching)
+  	port->tc_offload_cnt++;
+  
+  	/* Deallocate flow payload when flower rule has been destroyed. */
+@@@ -531,15 -550,19 +538,16 @@@ err_free_key_ls
+   */
+  static int
+  nfp_flower_del_offload(struct nfp_app *app, struct net_device *netdev,
+ -		       struct tc_cls_flower_offload *flow, bool egress)
+ +		       struct tc_cls_flower_offload *flow)
+  {
+  	struct nfp_port *port = nfp_port_from_netdev(netdev);
++ 	struct nfp_flower_priv *priv = app->priv;
+  	struct nfp_fl_payload *nfp_flow;
+ -	struct net_device *ingr_dev;
+  	int err;
+  
+ -	ingr_dev = egress ? NULL : netdev;
+ -	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie, ingr_dev,
+ -					      NFP_FL_STATS_CTX_DONT_CARE);
+ +	nfp_flow = nfp_flower_search_fl_table(app, flow->cookie);
+  	if (!nfp_flow)
+ -		return egress ? 0 : -ENOENT;
+ +		return -ENOENT;
+  
+  	err = nfp_modify_flow_metadata(app, nfp_flow);
+  	if (err)
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4..506761ace7fd 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -38,6 +38,7 @@
+ 
+ #include <linux/circ_buf.h>
+ #include <linux/hashtable.h>
++#include <linux/rhashtable.h>
+ #include <linux/time64.h>
+ #include <linux/types.h>
+ #include <net/pkt_cls.h>
+@@ -52,7 +53,6 @@ struct nfp_app;
+ #define NFP_FL_STATS_ENTRY_RS		BIT(20)
+ #define NFP_FL_STATS_ELEM_RS		4
+ #define NFP_FL_REPEATED_HASH_MAX	BIT(17)
+-#define NFP_FLOWER_HASH_BITS		19
+ #define NFP_FLOWER_MASK_ENTRY_RS	256
+ #define NFP_FLOWER_MASK_ELEMENT_RS	1
+ #define NFP_FLOWER_MASK_HASH_BITS	10
+@@ -173,7 +173,7 @@ struct nfp_flower_priv {
+ 	struct nfp_fl_stats_id stats_ids;
+ 	struct nfp_fl_mask_id mask_ids;
+ 	DECLARE_HASHTABLE(mask_table, NFP_FLOWER_MASK_HASH_BITS);
+-	DECLARE_HASHTABLE(flow_table, NFP_FLOWER_HASH_BITS);
++	struct rhashtable flow_table;
+ 	struct work_struct cmsg_work;
+ 	struct sk_buff_head cmsg_skbs_high;
+ 	struct sk_buff_head cmsg_skbs_low;
+@@ -229,7 +229,7 @@ struct nfp_fl_stats {
+ struct nfp_fl_payload {
+ 	struct nfp_fl_rule_metadata meta;
+ 	unsigned long tc_flower_cookie;
+-	struct hlist_node link;
++	struct rhash_head fl_node;
+ 	struct rcu_head rcu;
+ 	spinlock_t lock; /* lock stats */
+ 	struct nfp_fl_stats stats;
+@@ -239,6 +239,8 @@ struct nfp_fl_payload {
+ 	char *action_data;
+ };
+ 
++extern const struct rhashtable_params nfp_flower_table_params;
++
+ struct nfp_fl_stats_frame {
+ 	__be32 stats_con_id;
+ 	__be32 pkt_count;
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/metadata.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app.c b/drivers/net/ethernet/netronome/nfp/nfp_app.c
+index 2d4f99167654..6a35039e7e6d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.c
+@@ -62,6 +62,11 @@ static const struct nfp_app_type *apps[] = {
+ #endif
+ };
+ 
++void nfp_check_rhashtable_empty(void *ptr, void *arg)
++{
++	WARN_ON_ONCE(1);
++}
++
+ struct nfp_app *nfp_app_from_netdev(struct net_device *netdev)
+ {
+ 	if (nfp_netdev_is_nfp_net(netdev)) {
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app.h b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+index d80862f1ef64..e0b7f7e47763 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@ -192,6 +192,7 @@ struct nfp_app {
+ 	void *priv;
+ };
+ 
++void nfp_check_rhashtable_empty(void *ptr, void *arg);
+ bool __nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
+ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
+ 
