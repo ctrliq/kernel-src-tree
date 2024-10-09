@@ -1,0 +1,193 @@
+xfs: initialize default acls for ->tmpfile()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit d540e43b0ab134b22f015f725ce6e070d12b0244
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d540e43b.failed
+
+The current tmpfile handler does not initialize default ACLs. Doing so
+within xfs_vn_tmpfile() makes it roughly equivalent to xfs_vn_mknod(),
+which is already used as a common create handler.
+
+xfs_vn_mknod() does not currently have a mechanism to determine whether
+to link the file into the namespace. Therefore, further abstract
+xfs_vn_mknod() into a new xfs_generic_create() handler with a tmpfile
+parameter. This new handler calls xfs_create_tmpfile() and d_tmpfile()
+on the dentry when called via ->tmpfile().
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+(cherry picked from commit d540e43b0ab134b22f015f725ce6e070d12b0244)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_iops.c
+diff --cc fs/xfs/xfs_iops.c
+index 4c6e1d5b88f5,301ecbfcc0be..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -149,17 -152,16 +149,21 @@@ xfs_generic_create
+  		rdev = 0;
+  	}
+  
+ -	error = posix_acl_create(dir, &mode, &default_acl, &acl);
+ -	if (error)
+ -		return error;
+ +	if (IS_POSIXACL(dir)) {
+ +		default_acl = xfs_get_acl(dir, ACL_TYPE_DEFAULT);
+ +		if (IS_ERR(default_acl))
+ +			return PTR_ERR(default_acl);
+ +
+ +		if (!default_acl)
+ +			mode &= ~current_umask();
+ +	}
+  
+- 	xfs_dentry_to_name(&name, dentry, mode);
+- 	error = xfs_create(XFS_I(dir), &name, mode, rdev, &ip);
++ 	if (!tmpfile) {
++ 		xfs_dentry_to_name(&name, dentry, mode);
++ 		error = xfs_create(XFS_I(dir), &name, mode, rdev, &ip);
++ 	} else {
++ 		error = xfs_create_tmpfile(XFS_I(dir), dentry, mode, &ip);
++ 	}
+  	if (unlikely(error))
+  		goto out_free_acl;
+  
+@@@ -169,25 -171,46 +173,55 @@@
+  	if (unlikely(error))
+  		goto out_cleanup_inode;
+  
+ -#ifdef CONFIG_XFS_POSIX_ACL
+  	if (default_acl) {
+ -		error = xfs_set_acl(inode, default_acl, ACL_TYPE_DEFAULT);
+ -		if (error)
+ +		error = xfs_inherit_acl(inode, default_acl);
+ +		default_acl = NULL;
+ +		if (unlikely(error))
+  			goto out_cleanup_inode;
+  	}
+ -	if (acl) {
+ -		error = xfs_set_acl(inode, acl, ACL_TYPE_ACCESS);
+ -		if (error)
+ -			goto out_cleanup_inode;
+ -	}
+ -#endif
+  
+ +	xfs_setup_iops(ip);
+ +
+++<<<<<<< HEAD
+ +	d_instantiate(dentry, inode);
+ +	xfs_finish_inode_setup(ip);
+ +	return error;
+ +
+ + out_cleanup_inode:
+ +	xfs_finish_inode_setup(ip);
+ +	xfs_cleanup_inode(dir, inode, dentry);
+ + out_free_acl:
+ +	posix_acl_release(default_acl);
+ +	return error;
+++=======
++ 	if (tmpfile)
++ 		d_tmpfile(dentry, inode);
++ 	else
++ 		d_instantiate(dentry, inode);
++ 
++  out_free_acl:
++ 	if (default_acl)
++ 		posix_acl_release(default_acl);
++ 	if (acl)
++ 		posix_acl_release(acl);
++ 	return -error;
++ 
++  out_cleanup_inode:
++ 	if (!tmpfile)
++ 		xfs_cleanup_inode(dir, inode, dentry);
++ 	iput(inode);
++ 	goto out_free_acl;
+++>>>>>>> d540e43b0ab1 (xfs: initialize default acls for ->tmpfile())
++ }
++ 
++ STATIC int
++ xfs_vn_mknod(
++ 	struct inode	*dir,
++ 	struct dentry	*dentry,
++ 	umode_t		mode,
++ 	dev_t		rdev)
++ {
++ 	return xfs_generic_create(dir, dentry, mode, rdev, false);
+  }
+  
+  STATIC int
+@@@ -352,10 -372,10 +386,11 @@@ xfs_vn_symlink
+  	return 0;
+  
+   out_cleanup_inode:
+ +	xfs_finish_inode_setup(cip);
+  	xfs_cleanup_inode(dir, inode, dentry);
++ 	iput(inode);
+   out:
+ -	return -error;
+ +	return error;
+  }
+  
+  STATIC int
+@@@ -994,13 -1034,47 +1029,49 @@@ xfs_vn_fiemap
+  	u64			start,
+  	u64			length)
+  {
+ -	xfs_inode_t		*ip = XFS_I(inode);
+ -	struct getbmapx		bm;
+  	int			error;
+  
+ -	error = fiemap_check_flags(fieinfo, XFS_FIEMAP_FLAGS);
+ -	if (error)
+ -		return error;
+ +	xfs_ilock(XFS_I(inode), XFS_IOLOCK_SHARED);
+ +	error = iomap_fiemap(inode, fieinfo, start, length, &xfs_iomap_ops);
+ +	xfs_iunlock(XFS_I(inode), XFS_IOLOCK_SHARED);
+  
+++<<<<<<< HEAD
+ +	return error;
+++=======
++ 	/* Set up bmap header for xfs internal routine */
++ 	bm.bmv_offset = BTOBB(start);
++ 	/* Special case for whole file */
++ 	if (length == FIEMAP_MAX_OFFSET)
++ 		bm.bmv_length = -1LL;
++ 	else
++ 		bm.bmv_length = BTOBB(length);
++ 
++ 	/* We add one because in getbmap world count includes the header */
++ 	bm.bmv_count = !fieinfo->fi_extents_max ? MAXEXTNUM :
++ 					fieinfo->fi_extents_max + 1;
++ 	bm.bmv_count = min_t(__s32, bm.bmv_count,
++ 			     (PAGE_SIZE * 16 / sizeof(struct getbmapx)));
++ 	bm.bmv_iflags = BMV_IF_PREALLOC | BMV_IF_NO_HOLES;
++ 	if (fieinfo->fi_flags & FIEMAP_FLAG_XATTR)
++ 		bm.bmv_iflags |= BMV_IF_ATTRFORK;
++ 	if (!(fieinfo->fi_flags & FIEMAP_FLAG_SYNC))
++ 		bm.bmv_iflags |= BMV_IF_DELALLOC;
++ 
++ 	error = xfs_getbmap(ip, &bm, xfs_fiemap_format, fieinfo);
++ 	if (error)
++ 		return -error;
++ 
++ 	return 0;
++ }
++ 
++ STATIC int
++ xfs_vn_tmpfile(
++ 	struct inode	*dir,
++ 	struct dentry	*dentry,
++ 	umode_t		mode)
++ {
++ 	return xfs_generic_create(dir, dentry, mode, 0, true);
+++>>>>>>> d540e43b0ab1 (xfs: initialize default acls for ->tmpfile())
+  }
+  
+  static const struct inode_operations xfs_inode_operations = {
+* Unmerged path fs/xfs/xfs_iops.c
