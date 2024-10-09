@@ -265,6 +265,13 @@ struct nfp_flower_tp_ports {
 	__be16 port_dst;
 };
 
+struct nfp_flower_ip_ext {
+	u8 tos;
+	u8 proto;
+	u8 ttl;
+	u8 flags;
+};
+
 /* L3 IPv4 details (3W/12B)
  *    3                   2                   1
  *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
@@ -277,10 +284,7 @@ struct nfp_flower_tp_ports {
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  */
 struct nfp_flower_ipv4 {
-	u8 tos;
-	u8 proto;
-	u8 ttl;
-	u8 flags;
+	struct nfp_flower_ip_ext ip_ext;
 	__be32 ipv4_src;
 	__be32 ipv4_dst;
 };
@@ -289,7 +293,7 @@ struct nfp_flower_ipv4 {
  *    3                   2                   1
  *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |    DSCP   |ECN|   protocol    |          reserved             |
+ * |    DSCP   |ECN|   protocol    |      ttl      |     flags     |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |   ipv6_exthdr   | res |            ipv6_flow_label            |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -311,10 +315,7 @@ struct nfp_flower_ipv4 {
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  */
 struct nfp_flower_ipv6 {
-	u8 tos;
-	u8 proto;
-	u8 ttl;
-	u8 reserved;
+	struct nfp_flower_ip_ext ip_ext;
 	__be32 ipv6_flow_label_exthdr;
 	struct in6_addr ipv6_src;
 	struct in6_addr ipv6_dst;
