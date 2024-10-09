@@ -1,0 +1,292 @@
+xfs: make xfs btree stats less huge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 11ef38afe98cc7ad1a46ef24945232ec1760d5e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/11ef38af.failed
+
+Embedding a switch statement in every btree stats inc/add adds a lot
+of code overhead to the core btree infrastructure paths. Stats are
+supposed to be small and lightweight, but the btree stats have
+become big and bloated as we've added more btrees. It needs fixing
+because the reflink code will just add more overhead again.
+
+Convert the v2 btree stats to arrays instead of independent
+variables, and instead use the type to index the specific btree
+array via an enum. This allows us to use array based indexing
+to update the stats, rather than having to derefence variables
+specific to the btree type.
+
+If we then wrap the xfsstats structure in a union and place uint32_t
+array beside it, and calculate the correct btree stats array base
+array index when creating a btree cursor,  we can easily access
+entries in the stats structure without having to switch names based
+on the btree type.
+
+We then replace with the switch statement with a simple set of stats
+wrapper macros, resulting in a significant simplification of the
+btree stats code, and:
+
+   text	   data	    bss	    dec	    hex	filename
+  48905	    144	      8	  49057	   bfa1	fs/xfs/libxfs/xfs_btree.o.old
+  36793	    144	      8	  36945	   9051	fs/xfs/libxfs/xfs_btree.o
+
+it reduces the core btree infrastructure code size by close to 25%!
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 11ef38afe98cc7ad1a46ef24945232ec1760d5e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_btree.h
+#	fs/xfs/libxfs/xfs_refcount_btree.c
+#	fs/xfs/libxfs/xfs_rmap_btree.c
+#	fs/xfs/xfs_stats.h
+diff --cc fs/xfs/libxfs/xfs_btree.h
+index 81b7db8af251,b69b947c4c1b..000000000000
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@@ -84,42 -96,12 +84,46 @@@ union xfs_btree_rec 
+  /*
+   * Generic stats interface
+   */
+- #define __XFS_BTREE_STATS_INC(mp, type, stat) \
+- 	XFS_STATS_INC(mp, xs_ ## type ## _2_ ## stat)
+  #define XFS_BTREE_STATS_INC(cur, stat)	\
+++<<<<<<< HEAD
+ +do {    \
+ +	struct xfs_mount *__mp = cur->bc_mp; \
+ +	switch (cur->bc_btnum) {  \
+ +	case XFS_BTNUM_BNO: __XFS_BTREE_STATS_INC(__mp, abtb, stat); break; \
+ +	case XFS_BTNUM_CNT: __XFS_BTREE_STATS_INC(__mp, abtc, stat); break; \
+ +	case XFS_BTNUM_BMAP: __XFS_BTREE_STATS_INC(__mp, bmbt, stat); break; \
+ +	case XFS_BTNUM_INO: __XFS_BTREE_STATS_INC(__mp, ibt, stat); break; \
+ +	case XFS_BTNUM_FINO: __XFS_BTREE_STATS_INC(__mp, fibt, stat); break; \
+ +	case XFS_BTNUM_MAX: ASSERT(0); /* fucking gcc */ ; break;	\
+ +	}       \
+ +} while (0)
+ +
+ +#define __XFS_BTREE_STATS_ADD(mp, type, stat, val) \
+ +	XFS_STATS_ADD(mp, xs_ ## type ## _2_ ## stat, val)
+ +#define XFS_BTREE_STATS_ADD(cur, stat, val)  \
+ +do {    \
+ +	struct xfs_mount *__mp = cur->bc_mp; \
+ +	switch (cur->bc_btnum) {  \
+ +	case XFS_BTNUM_BNO:	\
+ +		__XFS_BTREE_STATS_ADD(__mp, abtb, stat, val); break; \
+ +	case XFS_BTNUM_CNT:	\
+ +		__XFS_BTREE_STATS_ADD(__mp, abtc, stat, val); break; \
+ +	case XFS_BTNUM_BMAP:	\
+ +		__XFS_BTREE_STATS_ADD(__mp, bmbt, stat, val); break; \
+ +	case XFS_BTNUM_INO:	\
+ +		__XFS_BTREE_STATS_ADD(__mp, ibt, stat, val); break; \
+ +	case XFS_BTNUM_FINO:	\
+ +		__XFS_BTREE_STATS_ADD(__mp, fibt, stat, val); break; \
+ +	case XFS_BTNUM_MAX: ASSERT(0); /* fucking gcc */ ; break; \
+ +	}       \
+ +} while (0)
+++=======
++ 	XFS_STATS_INC_OFF((cur)->bc_mp, (cur)->bc_statoff + __XBTS_ ## stat)
++ #define XFS_BTREE_STATS_ADD(cur, stat, val)	\
++ 	XFS_STATS_ADD_OFF((cur)->bc_mp, (cur)->bc_statoff + __XBTS_ ## stat, val)
+++>>>>>>> 11ef38afe98c (xfs: make xfs btree stats less huge)
+  
+ -#define	XFS_BTREE_MAXLEVELS	9	/* max of all btrees */
+ +#define	XFS_BTREE_MAXLEVELS	8	/* max of all btrees */
+  
+  struct xfs_btree_ops {
+  	/* size of the key and record structures */
+diff --cc fs/xfs/xfs_stats.h
+index 483b0eff1988,375840f5a99a..000000000000
+--- a/fs/xfs/xfs_stats.h
++++ b/fs/xfs/xfs_stats.h
+@@@ -117,87 -145,21 +145,105 @@@ struct __xfsstats 
+  	__uint32_t		xb_page_found;
+  	__uint32_t		xb_get_read;
+  /* Version 2 btree counters */
+++<<<<<<< HEAD
+ +#define XFSSTAT_END_ABTB_V2		(XFSSTAT_END_BUF+15)
+ +	__uint32_t		xs_abtb_2_lookup;
+ +	__uint32_t		xs_abtb_2_compare;
+ +	__uint32_t		xs_abtb_2_insrec;
+ +	__uint32_t		xs_abtb_2_delrec;
+ +	__uint32_t		xs_abtb_2_newroot;
+ +	__uint32_t		xs_abtb_2_killroot;
+ +	__uint32_t		xs_abtb_2_increment;
+ +	__uint32_t		xs_abtb_2_decrement;
+ +	__uint32_t		xs_abtb_2_lshift;
+ +	__uint32_t		xs_abtb_2_rshift;
+ +	__uint32_t		xs_abtb_2_split;
+ +	__uint32_t		xs_abtb_2_join;
+ +	__uint32_t		xs_abtb_2_alloc;
+ +	__uint32_t		xs_abtb_2_free;
+ +	__uint32_t		xs_abtb_2_moves;
+ +#define XFSSTAT_END_ABTC_V2		(XFSSTAT_END_ABTB_V2+15)
+ +	__uint32_t		xs_abtc_2_lookup;
+ +	__uint32_t		xs_abtc_2_compare;
+ +	__uint32_t		xs_abtc_2_insrec;
+ +	__uint32_t		xs_abtc_2_delrec;
+ +	__uint32_t		xs_abtc_2_newroot;
+ +	__uint32_t		xs_abtc_2_killroot;
+ +	__uint32_t		xs_abtc_2_increment;
+ +	__uint32_t		xs_abtc_2_decrement;
+ +	__uint32_t		xs_abtc_2_lshift;
+ +	__uint32_t		xs_abtc_2_rshift;
+ +	__uint32_t		xs_abtc_2_split;
+ +	__uint32_t		xs_abtc_2_join;
+ +	__uint32_t		xs_abtc_2_alloc;
+ +	__uint32_t		xs_abtc_2_free;
+ +	__uint32_t		xs_abtc_2_moves;
+ +#define XFSSTAT_END_BMBT_V2		(XFSSTAT_END_ABTC_V2+15)
+ +	__uint32_t		xs_bmbt_2_lookup;
+ +	__uint32_t		xs_bmbt_2_compare;
+ +	__uint32_t		xs_bmbt_2_insrec;
+ +	__uint32_t		xs_bmbt_2_delrec;
+ +	__uint32_t		xs_bmbt_2_newroot;
+ +	__uint32_t		xs_bmbt_2_killroot;
+ +	__uint32_t		xs_bmbt_2_increment;
+ +	__uint32_t		xs_bmbt_2_decrement;
+ +	__uint32_t		xs_bmbt_2_lshift;
+ +	__uint32_t		xs_bmbt_2_rshift;
+ +	__uint32_t		xs_bmbt_2_split;
+ +	__uint32_t		xs_bmbt_2_join;
+ +	__uint32_t		xs_bmbt_2_alloc;
+ +	__uint32_t		xs_bmbt_2_free;
+ +	__uint32_t		xs_bmbt_2_moves;
+ +#define XFSSTAT_END_IBT_V2		(XFSSTAT_END_BMBT_V2+15)
+ +	__uint32_t		xs_ibt_2_lookup;
+ +	__uint32_t		xs_ibt_2_compare;
+ +	__uint32_t		xs_ibt_2_insrec;
+ +	__uint32_t		xs_ibt_2_delrec;
+ +	__uint32_t		xs_ibt_2_newroot;
+ +	__uint32_t		xs_ibt_2_killroot;
+ +	__uint32_t		xs_ibt_2_increment;
+ +	__uint32_t		xs_ibt_2_decrement;
+ +	__uint32_t		xs_ibt_2_lshift;
+ +	__uint32_t		xs_ibt_2_rshift;
+ +	__uint32_t		xs_ibt_2_split;
+ +	__uint32_t		xs_ibt_2_join;
+ +	__uint32_t		xs_ibt_2_alloc;
+ +	__uint32_t		xs_ibt_2_free;
+ +	__uint32_t		xs_ibt_2_moves;
+ +#define XFSSTAT_END_FIBT_V2		(XFSSTAT_END_IBT_V2+15)
+ +	__uint32_t		xs_fibt_2_lookup;
+ +	__uint32_t		xs_fibt_2_compare;
+ +	__uint32_t		xs_fibt_2_insrec;
+ +	__uint32_t		xs_fibt_2_delrec;
+ +	__uint32_t		xs_fibt_2_newroot;
+ +	__uint32_t		xs_fibt_2_killroot;
+ +	__uint32_t		xs_fibt_2_increment;
+ +	__uint32_t		xs_fibt_2_decrement;
+ +	__uint32_t		xs_fibt_2_lshift;
+ +	__uint32_t		xs_fibt_2_rshift;
+ +	__uint32_t		xs_fibt_2_split;
+ +	__uint32_t		xs_fibt_2_join;
+ +	__uint32_t		xs_fibt_2_alloc;
+ +	__uint32_t		xs_fibt_2_free;
+ +	__uint32_t		xs_fibt_2_moves;
+ +#define XFSSTAT_END_XQMSTAT		(XFSSTAT_END_FIBT_V2+6)
+++=======
++ #define XFSSTAT_END_ABTB_V2		(XFSSTAT_END_BUF + __XBTS_MAX)
++ 	__uint32_t		xs_abtb_2[__XBTS_MAX];
++ #define XFSSTAT_END_ABTC_V2		(XFSSTAT_END_ABTB_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_abtc_2[__XBTS_MAX];
++ #define XFSSTAT_END_BMBT_V2		(XFSSTAT_END_ABTC_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_bmbt_2[__XBTS_MAX];
++ #define XFSSTAT_END_IBT_V2		(XFSSTAT_END_BMBT_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_ibt_2[__XBTS_MAX];
++ #define XFSSTAT_END_FIBT_V2		(XFSSTAT_END_IBT_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_fibt_2[__XBTS_MAX];
++ #define XFSSTAT_END_RMAP_V2		(XFSSTAT_END_FIBT_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_rmap_2[__XBTS_MAX];
++ #define XFSSTAT_END_REFCOUNT		(XFSSTAT_END_RMAP_V2 + __XBTS_MAX)
++ 	__uint32_t		xs_refcbt_2[__XBTS_MAX];
++ #define XFSSTAT_END_XQMSTAT		(XFSSTAT_END_REFCOUNT + 6)
+++>>>>>>> 11ef38afe98c (xfs: make xfs btree stats less huge)
+  	__uint32_t		xs_qm_dqreclaims;
+  	__uint32_t		xs_qm_dqreclaim_misses;
+  	__uint32_t		xs_qm_dquot_dups;
+* Unmerged path fs/xfs/libxfs/xfs_refcount_btree.c
+* Unmerged path fs/xfs/libxfs/xfs_rmap_btree.c
+diff --git a/fs/xfs/libxfs/xfs_alloc_btree.c b/fs/xfs/libxfs/xfs_alloc_btree.c
+index a2ae2e9137f4..a6a50c86567a 100644
+--- a/fs/xfs/libxfs/xfs_alloc_btree.c
++++ b/fs/xfs/libxfs/xfs_alloc_btree.c
+@@ -432,6 +432,10 @@ xfs_allocbt_init_cursor(
+ 	cur->bc_btnum = btnum;
+ 	cur->bc_blocklog = mp->m_sb.sb_blocklog;
+ 	cur->bc_ops = &xfs_allocbt_ops;
++	if (btnum == XFS_BTNUM_BNO)
++		cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_abtb_2);
++	else
++		cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_abtc_2);
+ 
+ 	if (btnum == XFS_BTNUM_CNT) {
+ 		cur->bc_nlevels = be32_to_cpu(agf->agf_levels[XFS_BTNUM_CNT]);
+diff --git a/fs/xfs/libxfs/xfs_bmap_btree.c b/fs/xfs/libxfs/xfs_bmap_btree.c
+index fad1ff3fa8a2..93f52110ddb6 100644
+--- a/fs/xfs/libxfs/xfs_bmap_btree.c
++++ b/fs/xfs/libxfs/xfs_bmap_btree.c
+@@ -784,6 +784,7 @@ xfs_bmbt_init_cursor(
+ 	cur->bc_nlevels = be16_to_cpu(ifp->if_broot->bb_level) + 1;
+ 	cur->bc_btnum = XFS_BTNUM_BMAP;
+ 	cur->bc_blocklog = mp->m_sb.sb_blocklog;
++	cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_bmbt_2);
+ 
+ 	cur->bc_ops = &xfs_bmbt_ops;
+ 	cur->bc_flags = XFS_BTREE_LONG_PTRS | XFS_BTREE_ROOT_IN_INODE;
+* Unmerged path fs/xfs/libxfs/xfs_btree.h
+diff --git a/fs/xfs/libxfs/xfs_ialloc_btree.c b/fs/xfs/libxfs/xfs_ialloc_btree.c
+index 1002677e914d..105d82f32602 100644
+--- a/fs/xfs/libxfs/xfs_ialloc_btree.c
++++ b/fs/xfs/libxfs/xfs_ialloc_btree.c
+@@ -367,9 +367,11 @@ xfs_inobt_init_cursor(
+ 	if (btnum == XFS_BTNUM_INO) {
+ 		cur->bc_nlevels = be32_to_cpu(agi->agi_level);
+ 		cur->bc_ops = &xfs_inobt_ops;
++		cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_ibt_2);
+ 	} else {
+ 		cur->bc_nlevels = be32_to_cpu(agi->agi_free_level);
+ 		cur->bc_ops = &xfs_finobt_ops;
++		cur->bc_statoff = XFS_STATS_CALC_INDEX(xs_fibt_2);
+ 	}
+ 
+ 	cur->bc_blocklog = mp->m_sb.sb_blocklog;
+* Unmerged path fs/xfs/libxfs/xfs_refcount_btree.c
+* Unmerged path fs/xfs/libxfs/xfs_rmap_btree.c
+diff --git a/fs/xfs/xfs_stats.c b/fs/xfs/xfs_stats.c
+index 8686df6c7609..a671b771afc4 100644
+--- a/fs/xfs/xfs_stats.c
++++ b/fs/xfs/xfs_stats.c
+@@ -78,9 +78,9 @@ int xfs_stats_format(struct xfsstats __percpu *stats, char *buf)
+ 	}
+ 	/* extra precision counters */
+ 	for_each_possible_cpu(i) {
+-		xs_xstrat_bytes += per_cpu_ptr(stats, i)->xs_xstrat_bytes;
+-		xs_write_bytes += per_cpu_ptr(stats, i)->xs_write_bytes;
+-		xs_read_bytes += per_cpu_ptr(stats, i)->xs_read_bytes;
++		xs_xstrat_bytes += per_cpu_ptr(stats, i)->s.xs_xstrat_bytes;
++		xs_write_bytes += per_cpu_ptr(stats, i)->s.xs_write_bytes;
++		xs_read_bytes += per_cpu_ptr(stats, i)->s.xs_read_bytes;
+ 	}
+ 
+ 	len += snprintf(buf + len, PATH_MAX-len, "xpc %Lu %Lu %Lu\n",
+@@ -104,9 +104,9 @@ void xfs_stats_clearall(struct xfsstats __percpu *stats)
+ 	for_each_possible_cpu(c) {
+ 		preempt_disable();
+ 		/* save vn_active, it's a universal truth! */
+-		vn_active = per_cpu_ptr(stats, c)->vn_active;
++		vn_active = per_cpu_ptr(stats, c)->s.vn_active;
+ 		memset(per_cpu_ptr(stats, c), 0, sizeof(*stats));
+-		per_cpu_ptr(stats, c)->vn_active = vn_active;
++		per_cpu_ptr(stats, c)->s.vn_active = vn_active;
+ 		preempt_enable();
+ 	}
+ }
+* Unmerged path fs/xfs/xfs_stats.h
