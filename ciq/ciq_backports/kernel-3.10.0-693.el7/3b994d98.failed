@@ -1,0 +1,233 @@
+get rid of the second argument of acct_kill()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 3b994d98a815d934ab6a77a380882865982c14f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3b994d98.failed
+
+Replace the old ns->bacct only with NULL and only if it still points
+to acct.  And assign the new value to it *before* calling acct_kill()
+in acct_on().  That way we don't need to pass the new acct to acct_kill().
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 3b994d98a815d934ab6a77a380882865982c14f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/acct.c
+diff --cc kernel/acct.c
+index 7ffb48430dba,cf6588ab517b..000000000000
+--- a/kernel/acct.c
++++ b/kernel/acct.c
+@@@ -183,32 -158,53 +183,77 @@@ again
+  	return res;
+  }
+  
+++<<<<<<< HEAD
+ +static void acct_kill(struct bsd_acct_struct *acct,
+ +		      struct bsd_acct_struct *new)
+++=======
++ static void close_work(struct work_struct *work)
++ {
++ 	struct bsd_acct_struct *acct = container_of(work, struct bsd_acct_struct, work);
++ 	struct file *file = acct->file;
++ 	if (file->f_op->flush)
++ 		file->f_op->flush(file, NULL);
++ 	__fput_sync(file);
++ 	complete(&acct->done);
++ }
++ 
++ static void acct_kill(struct bsd_acct_struct *acct)
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  {
+  	if (acct) {
+ +		struct file *file = acct->file;
+  		struct pid_namespace *ns = acct->ns;
+ +		spin_lock(&acct_lock);
+ +		list_del(&acct->list);
+ +		mnt_unpin(file->f_path.mnt);
+ +		spin_unlock(&acct_lock);
+  		do_acct_process(acct);
+++<<<<<<< HEAD
+ +		filp_close(file, NULL);
+ +		spin_lock(&acct_lock);
+ +		ns->bacct = new;
+ +		if (new) {
+ +			mnt_pin(new->file->f_path.mnt);
+ +			list_add(&new->list, &acct_list);
+ +		}
+++=======
++ 		INIT_WORK(&acct->work, close_work);
++ 		init_completion(&acct->done);
++ 		schedule_work(&acct->work);
++ 		wait_for_completion(&acct->done);
++ 		pin_remove(&acct->pin);
++ 		cmpxchg(&ns->bacct, acct, NULL);
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  		acct->ns = NULL;
+ -		atomic_long_dec(&acct->count);
+  		mutex_unlock(&acct->lock);
+ -		acct_put(acct);
+ +		if (!(acct->count -= 2))
+ +			kfree(acct);
+ +		spin_unlock(&acct_lock);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void acct_pin_kill(struct fs_pin *pin)
++ {
++ 	struct bsd_acct_struct *acct;
++ 	acct = container_of(pin, struct bsd_acct_struct, pin);
++ 	if (!atomic_long_inc_not_zero(&acct->count)) {
++ 		rcu_read_unlock();
++ 		cpu_relax();
++ 		return;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_lock(&acct->lock);
++ 	if (!acct->ns) {
++ 		mutex_unlock(&acct->lock);
++ 		acct_put(acct);
++ 		acct = NULL;
++ 	}
++ 	acct_kill(acct);
++ }
++ 
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  static int acct_on(struct filename *pathname)
+  {
+  	struct file *file;
+@@@ -244,19 -257,15 +289,28 @@@
+  	acct->needcheck = jiffies;
+  	acct->ns = ns;
+  	mutex_init(&acct->lock);
+ -	mutex_lock_nested(&acct->lock, 1);	/* nobody has seen it yet */
+ -	pin_insert(&acct->pin, mnt);
+ +	mnt = file->f_path.mnt;
+  
+++<<<<<<< HEAD
+ +	old = acct_get(&ns->bacct);
+ +	if (old) {
+ +		acct_kill(old, acct);
+ +	} else {
+ +		spin_lock(&acct_lock);
+ +		ns->bacct = acct;
+ +		mnt_pin(mnt);
+ +		list_add(&acct->list, &acct_list);
+ +		spin_unlock(&acct_lock);
+ +	}
+ +	mntput(mnt); /* it's pinned, now give up active reference */
+++=======
++ 	old = acct_get(ns);
++ 	ns->bacct = acct;
++ 	acct_kill(old);
++ 	mutex_unlock(&acct->lock);
++ 	mnt_drop_write(mnt);
++ 	mntput(mnt);
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  	return 0;
+  }
+  
+@@@ -280,84 -291,23 +334,92 @@@ SYSCALL_DEFINE1(acct, const char __use
+  
+  	if (name) {
+  		struct filename *tmp = getname(name);
+ -
+  		if (IS_ERR(tmp))
+ -			return PTR_ERR(tmp);
+ -		mutex_lock(&acct_on_mutex);
+ +			return (PTR_ERR(tmp));
+  		error = acct_on(tmp);
+ -		mutex_unlock(&acct_on_mutex);
+  		putname(tmp);
+  	} else {
+++<<<<<<< HEAD
+ +		acct_kill(acct_get(&task_active_pid_ns(current)->bacct), NULL);
+++=======
++ 		acct_kill(acct_get(task_active_pid_ns(current)));
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  	}
+  
+  	return error;
+  }
+  
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @m: vfsmount being shut down
+ + *
+ + * If the accounting is turned on for a file in the subtree pointed to
+ + * to by m, turn accounting off.  Done when m is about to die.
+ + */
+ +void acct_auto_close_mnt(struct vfsmount *m)
+ +{
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.mnt == m) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+ +}
+ +
+ +/**
+ + * acct_auto_close - turn off a filesystem's accounting if it is on
+ + * @sb: super block for the filesystem
+ + *
+ + * If the accounting is turned on for a file in the filesystem pointed
+ + * to by sb, turn accounting off.
+ + */
+ +void acct_auto_close(struct super_block *sb)
+ +{
+ +	struct bsd_acct_struct *acct;
+ +
+ +	spin_lock(&acct_lock);
+ +restart:
+ +	list_for_each_entry(acct, &acct_list, list)
+ +		if (acct->file->f_path.dentry->d_sb == sb) {
+ +			acct->count++;
+ +			spin_unlock(&acct_lock);
+ +			mutex_lock(&acct->lock);
+ +			if (!acct->ns) {
+ +				mutex_unlock(&acct->lock);
+ +				spin_lock(&acct_lock);
+ +				if (!--acct->count)
+ +					kfree(acct);
+ +				goto restart;
+ +			}
+ +			acct_kill(acct, NULL);
+ +			spin_lock(&acct_lock);
+ +			goto restart;
+ +		}
+ +	spin_unlock(&acct_lock);
+ +}
+ +
+  void acct_exit_ns(struct pid_namespace *ns)
+  {
+++<<<<<<< HEAD
+ +	acct_kill(acct_get(&ns->bacct), NULL);
+++=======
++ 	acct_kill(acct_get(ns));
+++>>>>>>> 3b994d98a815 (get rid of the second argument of acct_kill())
+  }
+  
+  /*
+* Unmerged path kernel/acct.c
