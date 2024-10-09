@@ -1,0 +1,235 @@
+scsi: qla2xxx: ensure async flags are reset correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: ensure async flags are reset correctly (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.00%
+commit-author Hannes Reinecke <hare@suse.de>
+commit fa83e65885b9147e2f2b89fdd4ecf7b4ff91571d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fa83e658.failed
+
+The fcport flags FCF_ASYNC_ACTIVE and FCF_ASYNC_SENT are used to
+throttle the state machine, so we need to ensure to always set and unset
+them correctly. Not doing so will lead to the state machine getting
+confused and no login attempt into remote ports.
+
+	Cc: Quinn Tran <quinn.tran@cavium.com>
+	Cc: Himanshu Madhani <himanshu.madhani@cavium.com>
+Fixes: 3dbec59bdf63 ("scsi: qla2xxx: Prevent multiple active discovery commands per session")
+	Signed-off-by: Hannes Reinecke <hare@suse.com>
+	Acked-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fa83e65885b9147e2f2b89fdd4ecf7b4ff91571d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_gs.c
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_gs.c
+index 0dfd63fae4b1,21eff2d30266..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@@ -2942,8 -3177,9 +2942,12 @@@ int qla24xx_async_gidpn(scsi_qla_host_
+  
+  done_free_sp:
+  	sp->free(sp);
+ -	fcport->flags &= ~FCF_ASYNC_SENT;
+  done:
+++<<<<<<< HEAD
+ +	fcport->flags &= ~FCF_ASYNC_SENT;
+++=======
++ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  	return rval;
+  }
+  
+@@@ -3101,8 -3369,9 +3105,12 @@@ int qla24xx_async_gpsc(scsi_qla_host_t 
+  
+  done_free_sp:
+  	sp->free(sp);
+ -	fcport->flags &= ~FCF_ASYNC_SENT;
+  done:
+++<<<<<<< HEAD
+ +	fcport->flags &= ~FCF_ASYNC_SENT;
+++=======
++ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  	return rval;
+  }
+  
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 12e11bcce844,d5a45c4981ec..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -220,8 -211,9 +220,12 @@@ qla2x00_async_login(struct scsi_qla_hos
+  
+  done_free_sp:
+  	sp->free(sp);
+ -	fcport->flags &= ~FCF_ASYNC_SENT;
+  done:
+++<<<<<<< HEAD
+ +	fcport->flags &= ~FCF_ASYNC_SENT;
+++=======
++ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  	return rval;
+  }
+  
+@@@ -276,16 -268,131 +280,139 @@@ done
+  	return rval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void
++ qla2x00_async_prlo_done(struct scsi_qla_host *vha, fc_port_t *fcport,
++     uint16_t *data)
++ {
++ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
++ 	/* Don't re-login in target mode */
++ 	if (!fcport->tgt_session)
++ 		qla2x00_mark_device_lost(vha, fcport, 1, 0);
++ 	qlt_logo_completion_handler(fcport, data[0]);
++ }
++ 
++ static void
++ qla2x00_async_prlo_sp_done(void *s, int res)
++ {
++ 	srb_t *sp = (srb_t *)s;
++ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
++ 	struct scsi_qla_host *vha = sp->vha;
++ 
++ 	sp->fcport->flags &= ~FCF_ASYNC_ACTIVE;
++ 	if (!test_bit(UNLOADING, &vha->dpc_flags))
++ 		qla2x00_post_async_prlo_done_work(sp->fcport->vha, sp->fcport,
++ 		    lio->u.logio.data);
++ 	sp->free(sp);
++ }
++ 
++ int
++ qla2x00_async_prlo(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	srb_t *sp;
++ 	struct srb_iocb *lio;
++ 	int rval;
++ 
++ 	rval = QLA_FUNCTION_FAILED;
++ 	sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
++ 	if (!sp)
++ 		goto done;
++ 
++ 	sp->type = SRB_PRLO_CMD;
++ 	sp->name = "prlo";
++ 	qla2x00_init_timer(sp, qla2x00_get_async_timeout(vha) + 2);
++ 
++ 	lio = &sp->u.iocb_cmd;
++ 	lio->timeout = qla2x00_async_iocb_timeout;
++ 	sp->done = qla2x00_async_prlo_sp_done;
++ 	rval = qla2x00_start_sp(sp);
++ 	if (rval != QLA_SUCCESS)
++ 		goto done_free_sp;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x2070,
++ 	    "Async-prlo - hdl=%x loop-id=%x portid=%02x%02x%02x.\n",
++ 	    sp->handle, fcport->loop_id, fcport->d_id.b.domain,
++ 	    fcport->d_id.b.area, fcport->d_id.b.al_pa);
++ 	return rval;
++ 
++ done_free_sp:
++ 	sp->free(sp);
++ done:
++ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
++ 	return rval;
++ }
++ 
++ static
++ void qla24xx_handle_adisc_event(scsi_qla_host_t *vha, struct event_arg *ea)
++ {
++ 	struct fc_port *fcport = ea->fcport;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x20d2,
++ 	    "%s %8phC DS %d LS %d rc %d login %d|%d rscn %d|%d lid %d\n",
++ 	    __func__, fcport->port_name, fcport->disc_state,
++ 	    fcport->fw_login_state, ea->rc, fcport->login_gen, ea->sp->gen2,
++ 	    fcport->rscn_gen, ea->sp->gen1, fcport->loop_id);
++ 
++ 	if (ea->data[0] != MBS_COMMAND_COMPLETE) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x2066,
++ 		    "%s %8phC: adisc fail: post delete\n",
++ 		    __func__, ea->fcport->port_name);
++ 		qlt_schedule_sess_for_deletion(ea->fcport);
++ 		return;
++ 	}
++ 
++ 	if (ea->fcport->disc_state == DSC_DELETE_PEND)
++ 		return;
++ 
++ 	if (ea->sp->gen2 != ea->fcport->login_gen) {
++ 		/* target side must have changed it. */
++ 		ql_dbg(ql_dbg_disc, vha, 0x20d3,
++ 		    "%s %8phC generation changed\n",
++ 		    __func__, ea->fcport->port_name);
++ 		return;
++ 	} else if (ea->sp->gen1 != ea->fcport->rscn_gen) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x20d4, "%s %d %8phC post gidpn\n",
++ 		    __func__, __LINE__, ea->fcport->port_name);
++ 		qla24xx_post_gidpn_work(vha, ea->fcport);
++ 		return;
++ 	}
++ 
++ 	__qla24xx_handle_gpdb_event(vha, ea);
++ }
++ 
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  static void
+  qla2x00_async_adisc_sp_done(void *ptr, int res)
+  {
+  	srb_t *sp = ptr;
+  	struct scsi_qla_host *vha = sp->vha;
+ -	struct event_arg ea;
+  	struct srb_iocb *lio = &sp->u.iocb_cmd;
+  
+++<<<<<<< HEAD
+ +	if (!test_bit(UNLOADING, &vha->dpc_flags))
+ +		qla2x00_post_async_adisc_done_work(sp->vha, sp->fcport,
+ +		    lio->u.logio.data);
+++=======
++ 	ql_dbg(ql_dbg_disc, vha, 0x2066,
++ 	    "Async done-%s res %x %8phC\n",
++ 	    sp->name, res, sp->fcport->port_name);
++ 
++ 	sp->fcport->flags &= ~FCF_ASYNC_SENT;
++ 
++ 	memset(&ea, 0, sizeof(ea));
++ 	ea.event = FCME_ADISC_DONE;
++ 	ea.rc = res;
++ 	ea.data[0] = lio->u.logio.data[0];
++ 	ea.data[1] = lio->u.logio.data[1];
++ 	ea.iop[0] = lio->u.logio.iop[0];
++ 	ea.iop[1] = lio->u.logio.iop[1];
++ 	ea.fcport = sp->fcport;
++ 	ea.sp = sp;
++ 
++ 	qla2x00_fcport_event_handler(vha, &ea);
++ 
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  	sp->free(sp);
+  }
+  
+@@@ -325,7 -431,8 +452,12 @@@ qla2x00_async_adisc(struct scsi_qla_hos
+  done_free_sp:
+  	sp->free(sp);
+  done:
+++<<<<<<< HEAD
+ +	fcport->flags &= ~FCF_ASYNC_SENT;
+++=======
++ 	fcport->flags &= ~(FCF_ASYNC_SENT | FCF_ASYNC_ACTIVE);
++ 	qla2x00_post_async_adisc_work(vha, fcport, data);
+++>>>>>>> fa83e65885b9 (scsi: qla2xxx: ensure async flags are reset correctly)
+  	return rval;
+  }
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_gs.c
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
