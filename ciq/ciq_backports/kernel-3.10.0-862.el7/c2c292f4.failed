@@ -1,0 +1,212 @@
+scsi: cxlflash: Handle AFU sync failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Handle AFU sync failures (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 91.89%
+commit-author Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+commit c2c292f45029a6850cd14c7c2fa4fc479b8f74aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c2c292f4.failed
+
+AFU sync operations are not currently evaluated for failure. This is
+acceptable for paths where there is not a dependency on the AFU being
+consistent with the host. Examples include link reset events and LUN
+cleanup operations. On paths where there is a dependency, such as a LUN
+open, a sync failure should be acted upon.
+
+In the event of AFU sync failures, either log or cleanup as appropriate for
+operations that are dependent on a successful sync completion.
+
+Update documentation to reflect behavior in the event of an AFU sync
+failure.
+
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c2c292f45029a6850cd14c7c2fa4fc479b8f74aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/vlun.c
+diff --cc drivers/scsi/cxlflash/vlun.c
+index 90c5d7f5278e,0800bcba5a00..000000000000
+--- a/drivers/scsi/cxlflash/vlun.c
++++ b/drivers/scsi/cxlflash/vlun.c
+@@@ -1047,10 -1102,15 +1067,19 @@@ static int clone_lxt(struct afu *afu
+  		     struct sisl_rht_entry *rhte,
+  		     struct sisl_rht_entry *rhte_src)
+  {
+++<<<<<<< HEAD
+ +	struct sisl_lxt_entry *lxt;
+++=======
++ 	struct cxlflash_cfg *cfg = afu->parent;
++ 	struct device *dev = &cfg->dev->dev;
++ 	struct sisl_lxt_entry *lxt = NULL;
++ 	bool locked = false;
+++>>>>>>> c2c292f45029 (scsi: cxlflash: Handle AFU sync failures)
+  	u32 ngrps;
+  	u64 aun;		/* chunk# allocated by block allocator */
+- 	int i, j;
++ 	int j;
++ 	int i = 0;
++ 	int rc = 0;
+  
+  	ngrps = LXT_NUM_GROUPS(rhte_src->lxt_cnt);
+  
+@@@ -1099,10 -1155,31 +1124,36 @@@
+  	rhte->lxt_cnt = rhte_src->lxt_cnt;
+  	dma_wmb(); /* Make RHT entry's LXT table size update visible */
+  
+- 	cxlflash_afu_sync(afu, ctxid, rhndl, AFU_LW_SYNC);
++ 	rc = cxlflash_afu_sync(afu, ctxid, rhndl, AFU_LW_SYNC);
++ 	if (unlikely(rc)) {
++ 		rc = -EAGAIN;
++ 		goto err2;
++ 	}
+  
+++<<<<<<< HEAD
+ +	pr_debug("%s: returning\n", __func__);
+ +	return 0;
+++=======
++ out:
++ 	if (locked)
++ 		mutex_unlock(&blka->mutex);
++ 	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
++ 	return rc;
++ err2:
++ 	/* Reset the RHTE */
++ 	rhte->lxt_cnt = 0;
++ 	dma_wmb();
++ 	rhte->lxt_start = NULL;
++ 	dma_wmb();
++ err:
++ 	/* free the clones already made */
++ 	for (j = 0; j < i; j++) {
++ 		aun = (lxt[j].rlba_base >> MC_CHUNK_SHIFT);
++ 		ba_free(&blka->ba_lun, aun);
++ 	}
++ 	kfree(lxt);
++ 	goto out;
+++>>>>>>> c2c292f45029 (scsi: cxlflash: Handle AFU sync failures)
+  }
+  
+  /**
+diff --git a/Documentation/powerpc/cxlflash.txt b/Documentation/powerpc/cxlflash.txt
+index 6d9a2ed32cad..9d9c43b77978 100644
+--- a/Documentation/powerpc/cxlflash.txt
++++ b/Documentation/powerpc/cxlflash.txt
+@@ -252,6 +252,12 @@ DK_CXLFLASH_VLUN_RESIZE
+     operating in the virtual mode and used to program a LUN translation
+     table that the AFU references when provided with a resource handle.
+ 
++    This ioctl can return -EAGAIN if an AFU sync operation takes too long.
++    In addition to returning a failure to user, cxlflash will also schedule
++    an asynchronous AFU reset. Should the user choose to retry the operation,
++    it is expected to succeed. If this ioctl fails with -EAGAIN, the user
++    can either retry the operation or treat it as a failure.
++
+ DK_CXLFLASH_RELEASE
+ -------------------
+     This ioctl is responsible for releasing a previously obtained
+@@ -304,6 +310,12 @@ DK_CXLFLASH_VLUN_CLONE
+     clone. This is to avoid a stale entry in the file descriptor table of the
+     child process.
+ 
++    This ioctl can return -EAGAIN if an AFU sync operation takes too long.
++    In addition to returning a failure to user, cxlflash will also schedule
++    an asynchronous AFU reset. Should the user choose to retry the operation,
++    it is expected to succeed. If this ioctl fails with -EAGAIN, the user
++    can either retry the operation or treat it as a failure.
++
+ DK_CXLFLASH_VERIFY
+ ------------------
+     This ioctl is used to detect various changes such as the capacity of
+diff --git a/drivers/scsi/cxlflash/superpipe.c b/drivers/scsi/cxlflash/superpipe.c
+index a4dd3ca7c750..6338bd6dc1bd 100644
+--- a/drivers/scsi/cxlflash/superpipe.c
++++ b/drivers/scsi/cxlflash/superpipe.c
+@@ -56,6 +56,19 @@ static void marshal_det_to_rele(struct dk_cxlflash_detach *detach,
+ 	release->context_id = detach->context_id;
+ }
+ 
++/**
++ * marshal_udir_to_rele() - translate udirect to release structure
++ * @udirect:	Source structure from which to translate/copy.
++ * @release:	Destination structure for the translate/copy.
++ */
++static void marshal_udir_to_rele(struct dk_cxlflash_udirect *udirect,
++				 struct dk_cxlflash_release *release)
++{
++	release->hdr = udirect->hdr;
++	release->context_id = udirect->context_id;
++	release->rsrc_handle = udirect->rsrc_handle;
++}
++
+ /**
+  * cxlflash_free_errpage() - frees resources associated with global error page
+  */
+@@ -616,6 +629,7 @@ int _cxlflash_disk_release(struct scsi_device *sdev,
+ 	res_hndl_t rhndl = release->rsrc_handle;
+ 
+ 	int rc = 0;
++	int rcr = 0;
+ 	u64 ctxid = DECODE_CTXID(release->context_id),
+ 	    rctxid = release->context_id;
+ 
+@@ -680,8 +694,12 @@ int _cxlflash_disk_release(struct scsi_device *sdev,
+ 		rhte_f1->dw = 0;
+ 		dma_wmb(); /* Make RHT entry bottom-half clearing visible */
+ 
+-		if (!ctxi->err_recovery_active)
+-			cxlflash_afu_sync(afu, ctxid, rhndl, AFU_HW_SYNC);
++		if (!ctxi->err_recovery_active) {
++			rcr = cxlflash_afu_sync(afu, ctxid, rhndl, AFU_HW_SYNC);
++			if (unlikely(rcr))
++				dev_dbg(dev, "%s: AFU sync failed rc=%d\n",
++					__func__, rcr);
++		}
+ 		break;
+ 	default:
+ 		WARN(1, "Unsupported LUN mode!");
+@@ -1912,6 +1930,7 @@ static int cxlflash_disk_direct_open(struct scsi_device *sdev, void *arg)
+ 	struct afu *afu = cfg->afu;
+ 	struct llun_info *lli = sdev->hostdata;
+ 	struct glun_info *gli = lli->parent;
++	struct dk_cxlflash_release rel = { { 0 }, 0 };
+ 
+ 	struct dk_cxlflash_udirect *pphys = (struct dk_cxlflash_udirect *)arg;
+ 
+@@ -1953,13 +1972,18 @@ static int cxlflash_disk_direct_open(struct scsi_device *sdev, void *arg)
+ 	rsrc_handle = (rhte - ctxi->rht_start);
+ 
+ 	rht_format1(rhte, lli->lun_id[sdev->channel], ctxi->rht_perms, port);
+-	cxlflash_afu_sync(afu, ctxid, rsrc_handle, AFU_LW_SYNC);
+ 
+ 	last_lba = gli->max_lba;
+ 	pphys->hdr.return_flags = 0;
+ 	pphys->last_lba = last_lba;
+ 	pphys->rsrc_handle = rsrc_handle;
+ 
++	rc = cxlflash_afu_sync(afu, ctxid, rsrc_handle, AFU_LW_SYNC);
++	if (unlikely(rc)) {
++		dev_dbg(dev, "%s: AFU sync failed rc=%d\n", __func__, rc);
++		goto err2;
++	}
++
+ out:
+ 	if (likely(ctxi))
+ 		put_context(ctxi);
+@@ -1967,6 +1991,10 @@ out:
+ 		__func__, rsrc_handle, rc, last_lba);
+ 	return rc;
+ 
++err2:
++	marshal_udir_to_rele(pphys, &rel);
++	_cxlflash_disk_release(sdev, ctxi, &rel);
++	goto out;
+ err1:
+ 	cxlflash_lun_detach(gli);
+ 	goto out;
+* Unmerged path drivers/scsi/cxlflash/vlun.c
