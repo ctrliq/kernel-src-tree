@@ -1,0 +1,147 @@
+xfs: clean up xfs_trans_brelse()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 23420d05e67d23728e116321c4afe084ebfa6427
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/23420d05.failed
+
+xfs_trans_brelse() is a bit of a historical mess, similar to
+xfs_buf_item_unlock(). It is unnecessarily verbose, has snippets of
+commented out code, inconsistency with regard to stale items, etc.
+
+Clean up xfs_trans_brelse() to use similar logic and flow as
+xfs_buf_item_unlock() with regard to bli reference count handling.
+This patch makes no functional changes, but facilitates further
+refactoring of the common bli reference count handling code.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 23420d05e67d23728e116321c4afe084ebfa6427)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_buf.c
+diff --cc fs/xfs/xfs_trans_buf.c
+index 0621767a06d9,7498f87ceed3..000000000000
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@@ -437,18 -349,13 +433,18 @@@ xfs_trans_brelse
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	ASSERT(bp->b_transp == tp);
+ +	bip = bp->b_fspriv;
+++=======
++ 	trace_xfs_trans_brelse(bip);
+++>>>>>>> 23420d05e67d (xfs: clean up xfs_trans_brelse())
+  	ASSERT(bip->bli_item.li_type == XFS_LI_BUF);
+- 	ASSERT(!(bip->bli_flags & XFS_BLI_STALE));
+- 	ASSERT(!(bip->__bli_format.blf_flags & XFS_BLF_CANCEL));
+  	ASSERT(atomic_read(&bip->bli_refcount) > 0);
+  
+- 	trace_xfs_trans_brelse(bip);
+- 
+  	/*
+- 	 * If the release is just for a recursive lock,
+- 	 * then decrement the count and return.
++ 	 * If the release is for a recursive lookup, then decrement the count
++ 	 * and return.
+  	 */
+  	if (bip->bli_recur > 0) {
+  		bip->bli_recur--;
+@@@ -456,63 -363,40 +452,65 @@@
+  	}
+  
+  	/*
+- 	 * If the buffer is dirty within this transaction, we can't
++ 	 * If the buffer is invalidated or dirty in this transaction, we can't
+  	 * release it until we commit.
+  	 */
+ -	if (test_bit(XFS_LI_DIRTY, &bip->bli_item.li_flags))
+ +	if (bip->bli_item.li_desc->lid_flags & XFS_LID_DIRTY)
+  		return;
+- 
+- 	/*
+- 	 * If the buffer has been invalidated, then we can't release
+- 	 * it until the transaction commits to disk unless it is re-dirtied
+- 	 * as part of this transaction.  This prevents us from pulling
+- 	 * the item from the AIL before we should.
+- 	 */
+  	if (bip->bli_flags & XFS_BLI_STALE)
+  		return;
+  
+- 	ASSERT(!(bip->bli_flags & XFS_BLI_LOGGED));
+- 
+  	/*
+- 	 * Free up the log item descriptor tracking the released item.
++ 	 * Unlink the log item from the transaction and clear the hold flag, if
++ 	 * set. We wouldn't want the next user of the buffer to get confused.
+  	 */
++ 	ASSERT(!(bip->bli_flags & XFS_BLI_LOGGED));
+  	xfs_trans_del_item(&bip->bli_item);
++ 	bip->bli_flags &= ~XFS_BLI_HOLD;
+  
+  	/*
+- 	 * Clear the hold flag in the buf log item if it is set.
+- 	 * We wouldn't want the next user of the buffer to
+- 	 * get confused.
+- 	 */
+- 	if (bip->bli_flags & XFS_BLI_HOLD) {
+- 		bip->bli_flags &= ~XFS_BLI_HOLD;
+- 	}
+- 
+- 	/*
+- 	 * Drop our reference to the buf log item.
++ 	 * Drop the reference to the bli. At this point, the bli must be either
++ 	 * freed or dirty (or both). If freed, there are a couple cases where we
++ 	 * are responsible to free the item. If the bli is clean, we're the last
++ 	 * user of it. If the fs has shut down, the bli may be dirty and AIL
++ 	 * resident, but won't ever be written back. We therefore may also need
++ 	 * to remove it from the AIL before freeing it.
+  	 */
+  	freed = atomic_dec_and_test(&bip->bli_refcount);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * If the buf item is not tracking data in the log, then we must free it
+ +	 * before releasing the buffer back to the free pool.
+ +	 *
+ +	 * If the fs has shutdown and we dropped the last reference, it may fall
+ +	 * on us to release a (possibly dirty) bli if it never made it to the
+ +	 * AIL (e.g., the aborted unpin already happened and didn't release it
+ +	 * due to our reference). Since we're already shutdown and need xa_lock,
+ +	 * just force remove from the AIL and release the bli here.
+ +	 */
+ +	if (XFS_FORCED_SHUTDOWN(tp->t_mountp) && freed) {
+ +		xfs_trans_ail_remove(&bip->bli_item, SHUTDOWN_LOG_IO_ERROR);
+ +		xfs_buf_item_relse(bp);
+ +	} else if (!(bip->bli_flags & XFS_BLI_DIRTY)) {
+ +/***
+ +		ASSERT(bp->b_pincount == 0);
+ +***/
+ +		ASSERT(atomic_read(&bip->bli_refcount) == 0);
+ +		ASSERT(!(bip->bli_item.li_flags & XFS_LI_IN_AIL));
+ +		ASSERT(!(bip->bli_flags & XFS_BLI_INODE_ALLOC_BUF));
+ +		xfs_buf_item_relse(bp);
+++=======
++ 	dirty = bip->bli_flags & XFS_BLI_DIRTY;
++ 	ASSERT(freed || dirty);
++ 	if (freed) {
++ 		bool abort = XFS_FORCED_SHUTDOWN(tp->t_mountp);
++ 		ASSERT(abort || !test_bit(XFS_LI_IN_AIL, &bip->bli_item.li_flags));
++ 		if (abort)
++ 			xfs_trans_ail_remove(&bip->bli_item, SHUTDOWN_LOG_IO_ERROR);
++ 		if (!dirty || abort)
++ 			xfs_buf_item_relse(bp);
+++>>>>>>> 23420d05e67d (xfs: clean up xfs_trans_brelse())
+  	}
+  
+  	bp->b_transp = NULL;
+* Unmerged path fs/xfs/xfs_trans_buf.c
