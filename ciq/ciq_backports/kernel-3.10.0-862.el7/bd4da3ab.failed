@@ -1,0 +1,130 @@
+nvme: Add a quirk mechanism that uses identify_ctrl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] Add a quirk mechanism that uses identify_ctrl (David Milburn) [1454365 1456486 1457880]
+Rebuild_FUZZ: 93.75%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit bd4da3abaabffdd2472fb7085fcadd5d1d8c2153
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd4da3ab.failed
+
+Currently, all NVMe quirks are based on PCI IDs.  Add a mechanism to
+define quirks based on identify_ctrl's vendor id, model number,
+and/or firmware revision.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit bd4da3abaabffdd2472fb7085fcadd5d1d8c2153)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index bd223cb63595,38efe4f752a1..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1162,11 -1246,56 +1162,55 @@@ static void nvme_set_queue_limits(struc
+  	}
+  	if (ctrl->quirks & NVME_QUIRK_STRIPE_SIZE)
+  		blk_queue_chunk_sectors(q, ctrl->max_hw_sectors);
+ -	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+  	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+ -		vwc = true;
+ -	blk_queue_write_cache(q, vwc, vwc);
+ +		blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
+ +	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+  }
+  
++ struct nvme_core_quirk_entry {
++ 	/*
++ 	 * NVMe model and firmware strings are padded with spaces.  For
++ 	 * simplicity, strings in the quirk table are padded with NULLs
++ 	 * instead.
++ 	 */
++ 	u16 vid;
++ 	const char *mn;
++ 	const char *fr;
++ 	unsigned long quirks;
++ };
++ 
++ static const struct nvme_core_quirk_entry core_quirks[] = {
++ };
++ 
++ /* match is null-terminated but idstr is space-padded. */
++ static bool string_matches(const char *idstr, const char *match, size_t len)
++ {
++ 	size_t matchlen;
++ 
++ 	if (!match)
++ 		return true;
++ 
++ 	matchlen = strlen(match);
++ 	WARN_ON_ONCE(matchlen > len);
++ 
++ 	if (memcmp(idstr, match, matchlen))
++ 		return false;
++ 
++ 	for (; matchlen < len; matchlen++)
++ 		if (idstr[matchlen] != ' ')
++ 			return false;
++ 
++ 	return true;
++ }
++ 
++ static bool quirk_matches(const struct nvme_id_ctrl *id,
++ 			  const struct nvme_core_quirk_entry *q)
++ {
++ 	return q->vid == le16_to_cpu(id->vid) &&
++ 		string_matches(id->mn, q->mn, sizeof(id->mn)) &&
++ 		string_matches(id->fr, q->fr, sizeof(id->fr));
++ }
++ 
+  /*
+   * Initialize the cached copies of the Identify data and various controller
+   * register in our nvme_ctrl structure.  This should be called as soon as
+@@@ -1201,6 -1330,25 +1245,28 @@@ int nvme_init_identify(struct nvme_ctr
+  		return -EIO;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!ctrl->identified) {
++ 		/*
++ 		 * Check for quirks.  Quirk can depend on firmware version,
++ 		 * so, in principle, the set of quirks present can change
++ 		 * across a reset.  As a possible future enhancement, we
++ 		 * could re-scan for quirks every time we reinitialize
++ 		 * the device, but we'd have to make sure that the driver
++ 		 * behaves intelligently if the quirks change.
++ 		 */
++ 
++ 		int i;
++ 
++ 		for (i = 0; i < ARRAY_SIZE(core_quirks); i++) {
++ 			if (quirk_matches(id, &core_quirks[i]))
++ 				ctrl->quirks |= core_quirks[i].quirks;
++ 		}
++ 	}
++ 
++ 	ctrl->oacs = le16_to_cpu(id->oacs);
+++>>>>>>> bd4da3abaabf (nvme: Add a quirk mechanism that uses identify_ctrl)
+  	ctrl->vid = le16_to_cpu(id->vid);
+  	ctrl->oncs = le16_to_cpup(&id->oncs);
+  	atomic_set(&ctrl->abort_limit, id->acl + 1);
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index edb3488b21b7..0dd66577bd6a 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -106,6 +106,7 @@ enum nvme_ctrl_state {
+ 
+ struct nvme_ctrl {
+ 	enum nvme_ctrl_state state;
++	bool identified;
+ 	spinlock_t lock;
+ 	const struct nvme_ctrl_ops *ops;
+ 	struct request_queue *admin_q;
