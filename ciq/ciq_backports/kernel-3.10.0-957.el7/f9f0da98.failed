@@ -1,0 +1,272 @@
+mmc: block: Ensure that debugfs files are removed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Ensure that debugfs files are removed (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.62%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit f9f0da98819503b06b35e61869d18cf3a8cd3323
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f9f0da98.failed
+
+The card is not necessarily being removed, but the debugfs files must be
+removed when the driver is removed, otherwise they will continue to exist
+after unbinding the card from the driver. e.g.
+
+  # echo "mmc1:0001" > /sys/bus/mmc/drivers/mmcblk/unbind
+  # cat /sys/kernel/debug/mmc1/mmc1\:0001/ext_csd
+  [  173.634584] BUG: unable to handle kernel NULL pointer dereference at 0000000000000050
+  [  173.643356] IP: mmc_ext_csd_open+0x5e/0x170
+
+A complication is that the debugfs_root may have already been removed, so
+check for that too.
+
+Fixes: 627c3ccfb46a ("mmc: debugfs: Move block debugfs into block module")
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Cc: stable@vger.kernel.org # 4.14+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit f9f0da98819503b06b35e61869d18cf3a8cd3323)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index bf17147e2808,ccfa98af1dd3..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -110,8 -122,38 +110,12 @@@ struct mmc_blk_data 
+  	struct device_attribute force_ro;
+  	struct device_attribute power_ro_lock;
+  	int	area_type;
++ 
++ 	/* debugfs files (only in main mmc_blk_data) */
++ 	struct dentry *status_dentry;
++ 	struct dentry *ext_csd_dentry;
+  };
+  
+ -/* Device type for RPMB character devices */
+ -static dev_t mmc_rpmb_devt;
+ -
+ -/* Bus type for RPMB character devices */
+ -static struct bus_type mmc_rpmb_bus_type = {
+ -	.name = "mmc_rpmb",
+ -};
+ -
+ -/**
+ - * struct mmc_rpmb_data - special RPMB device type for these areas
+ - * @dev: the device for the RPMB area
+ - * @chrdev: character device for the RPMB area
+ - * @id: unique device ID number
+ - * @part_index: partition index (0 on first)
+ - * @md: parent MMC block device
+ - * @node: list item, so we can put this device on a list
+ - */
+ -struct mmc_rpmb_data {
+ -	struct device dev;
+ -	struct cdev chrdev;
+ -	int id;
+ -	unsigned int part_index;
+ -	struct mmc_blk_data *md;
+ -	struct list_head node;
+ -};
+ -
+  static DEFINE_MUTEX(open_lock);
+  
+  module_param(perdev_minors, int, 0444);
+@@@ -2155,6 -2555,167 +2159,170 @@@ force_ro_fail
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DEBUG_FS
++ 
++ static int mmc_dbg_card_status_get(void *data, u64 *val)
++ {
++ 	struct mmc_card *card = data;
++ 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
++ 	struct mmc_queue *mq = &md->queue;
++ 	struct request *req;
++ 	int ret;
++ 
++ 	/* Ask the block layer about the card status */
++ 	req = blk_get_request(mq->queue, REQ_OP_DRV_IN, __GFP_RECLAIM);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_GET_CARD_STATUS;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ret = req_to_mmc_queue_req(req)->drv_op_result;
++ 	if (ret >= 0) {
++ 		*val = ret;
++ 		ret = 0;
++ 	}
++ 	blk_put_request(req);
++ 
++ 	return ret;
++ }
++ DEFINE_SIMPLE_ATTRIBUTE(mmc_dbg_card_status_fops, mmc_dbg_card_status_get,
++ 		NULL, "%08llx\n");
++ 
++ /* That is two digits * 512 + 1 for newline */
++ #define EXT_CSD_STR_LEN 1025
++ 
++ static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
++ {
++ 	struct mmc_card *card = inode->i_private;
++ 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
++ 	struct mmc_queue *mq = &md->queue;
++ 	struct request *req;
++ 	char *buf;
++ 	ssize_t n = 0;
++ 	u8 *ext_csd;
++ 	int err, i;
++ 
++ 	buf = kmalloc(EXT_CSD_STR_LEN + 1, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/* Ask the block layer for the EXT CSD */
++ 	req = blk_get_request(mq->queue, REQ_OP_DRV_IN, __GFP_RECLAIM);
++ 	if (IS_ERR(req)) {
++ 		err = PTR_ERR(req);
++ 		goto out_free;
++ 	}
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_GET_EXT_CSD;
++ 	req_to_mmc_queue_req(req)->drv_op_data = &ext_csd;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	err = req_to_mmc_queue_req(req)->drv_op_result;
++ 	blk_put_request(req);
++ 	if (err) {
++ 		pr_err("FAILED %d\n", err);
++ 		goto out_free;
++ 	}
++ 
++ 	for (i = 0; i < 512; i++)
++ 		n += sprintf(buf + n, "%02x", ext_csd[i]);
++ 	n += sprintf(buf + n, "\n");
++ 
++ 	if (n != EXT_CSD_STR_LEN) {
++ 		err = -EINVAL;
++ 		goto out_free;
++ 	}
++ 
++ 	filp->private_data = buf;
++ 	kfree(ext_csd);
++ 	return 0;
++ 
++ out_free:
++ 	kfree(buf);
++ 	return err;
++ }
++ 
++ static ssize_t mmc_ext_csd_read(struct file *filp, char __user *ubuf,
++ 				size_t cnt, loff_t *ppos)
++ {
++ 	char *buf = filp->private_data;
++ 
++ 	return simple_read_from_buffer(ubuf, cnt, ppos,
++ 				       buf, EXT_CSD_STR_LEN);
++ }
++ 
++ static int mmc_ext_csd_release(struct inode *inode, struct file *file)
++ {
++ 	kfree(file->private_data);
++ 	return 0;
++ }
++ 
++ static const struct file_operations mmc_dbg_ext_csd_fops = {
++ 	.open		= mmc_ext_csd_open,
++ 	.read		= mmc_ext_csd_read,
++ 	.release	= mmc_ext_csd_release,
++ 	.llseek		= default_llseek,
++ };
++ 
++ static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
++ {
++ 	struct dentry *root;
++ 
++ 	if (!card->debugfs_root)
++ 		return 0;
++ 
++ 	root = card->debugfs_root;
++ 
++ 	if (mmc_card_mmc(card) || mmc_card_sd(card)) {
++ 		md->status_dentry =
++ 			debugfs_create_file("status", S_IRUSR, root, card,
++ 					    &mmc_dbg_card_status_fops);
++ 		if (!md->status_dentry)
++ 			return -EIO;
++ 	}
++ 
++ 	if (mmc_card_mmc(card)) {
++ 		md->ext_csd_dentry =
++ 			debugfs_create_file("ext_csd", S_IRUSR, root, card,
++ 					    &mmc_dbg_ext_csd_fops);
++ 		if (!md->ext_csd_dentry)
++ 			return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void mmc_blk_remove_debugfs(struct mmc_card *card,
++ 				   struct mmc_blk_data *md)
++ {
++ 	if (!card->debugfs_root)
++ 		return;
++ 
++ 	if (!IS_ERR_OR_NULL(md->status_dentry)) {
++ 		debugfs_remove(md->status_dentry);
++ 		md->status_dentry = NULL;
++ 	}
++ 
++ 	if (!IS_ERR_OR_NULL(md->ext_csd_dentry)) {
++ 		debugfs_remove(md->ext_csd_dentry);
++ 		md->ext_csd_dentry = NULL;
++ 	}
++ }
++ 
++ #else
++ 
++ static int mmc_blk_add_debugfs(struct mmc_card *card, struct mmc_blk_data *md)
++ {
++ 	return 0;
++ }
++ 
++ static void mmc_blk_remove_debugfs(struct mmc_card *card,
++ 				   struct mmc_blk_data *md)
++ {
++ }
++ 
++ #endif /* CONFIG_DEBUG_FS */
++ 
+++>>>>>>> f9f0da988195 (mmc: block: Ensure that debugfs files are removed)
+  static int mmc_blk_probe(struct mmc_card *card)
+  {
+  	struct mmc_blk_data *md, *part_md;
+@@@ -2191,6 -2752,9 +2359,12 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Add two debugfs entries */
++ 	mmc_blk_add_debugfs(card, md);
++ 
+++>>>>>>> f9f0da988195 (mmc: block: Ensure that debugfs files are removed)
+  	pm_runtime_set_autosuspend_delay(&card->dev, 3000);
+  	pm_runtime_use_autosuspend(&card->dev);
+  
+* Unmerged path drivers/mmc/core/block.c
+diff --git a/drivers/mmc/core/debugfs.c b/drivers/mmc/core/debugfs.c
+index 30623b8b86a4..3a17a5894034 100644
+--- a/drivers/mmc/core/debugfs.c
++++ b/drivers/mmc/core/debugfs.c
+@@ -401,4 +401,5 @@ err:
+ void mmc_remove_card_debugfs(struct mmc_card *card)
+ {
+ 	debugfs_remove_recursive(card->debugfs_root);
++	card->debugfs_root = NULL;
+ }
