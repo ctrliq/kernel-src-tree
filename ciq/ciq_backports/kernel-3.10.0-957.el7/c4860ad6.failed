@@ -1,0 +1,280 @@
+lib/scatterlist: Fix offset type in sg_alloc_table_from_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+commit c4860ad60564838994b74e7ee7dd12ceeda0f520
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c4860ad6.failed
+
+Scatterlist entries have an unsigned int for the offset so
+correct the sg_alloc_table_from_pages function accordingly.
+
+Since these are offsets withing a page, unsigned int is
+wide enough.
+
+Also converts callers which were using unsigned long locally
+with the lower_32_bits annotation to make it explicitly
+clear what is happening.
+
+v2: Use offset_in_page. (Chris Wilson)
+
+	Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Cc: Masahiro Yamada <yamada.masahiro@socionext.com>
+	Cc: Pawel Osciak <pawel@osciak.com>
+	Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+	Cc: Kyungmin Park <kyungmin.park@samsung.com>
+	Cc: Tomasz Stanislawski <t.stanislaws@samsung.com>
+	Cc: Matt Porter <mporter@kernel.crashing.org>
+	Cc: Alexandre Bounine <alexandre.bounine@idt.com>
+	Cc: linux-media@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com> (v1)
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Reviewed-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170731185512.20010-1-tvrtko.ursulin@linux.intel.com
+(cherry picked from commit c4860ad60564838994b74e7ee7dd12ceeda0f520)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/media/v4l2-core/videobuf2-dma-contig.c
+#	drivers/rapidio/devices/rio_mport_cdev.c
+diff --cc drivers/media/v4l2-core/videobuf2-dma-contig.c
+index fd56f2563201,2405077fdc71..000000000000
+--- a/drivers/media/v4l2-core/videobuf2-dma-contig.c
++++ b/drivers/media/v4l2-core/videobuf2-dma-contig.c
+@@@ -418,78 -417,71 +418,84 @@@ static struct dma_buf *vb2_dc_get_dmabu
+  /*       callbacks for USERPTR buffers       */
+  /*********************************************/
+  
+ -static void vb2_dc_put_userptr(void *buf_priv)
+ +static inline int vma_is_io(struct vm_area_struct *vma)
+  {
+ -	struct vb2_dc_buf *buf = buf_priv;
+ -	struct sg_table *sgt = buf->dma_sgt;
+ -	int i;
+ -	struct page **pages;
+ -
+ -	if (sgt) {
+ -		/*
+ -		 * No need to sync to CPU, it's already synced to the CPU
+ -		 * since the finish() memop will have been called before this.
+ -		 */
+ -		dma_unmap_sg_attrs(buf->dev, sgt->sgl, sgt->orig_nents,
+ -				   buf->dma_dir, DMA_ATTR_SKIP_CPU_SYNC);
+ -		pages = frame_vector_pages(buf->vec);
+ -		/* sgt should exist only if vector contains pages... */
+ -		BUG_ON(IS_ERR(pages));
+ -		for (i = 0; i < frame_vector_count(buf->vec); i++)
+ -			set_page_dirty_lock(pages[i]);
+ -		sg_free_table(sgt);
+ -		kfree(sgt);
+ -	}
+ -	vb2_destroy_framevec(buf->vec);
+ -	kfree(buf);
+ +	return !!(vma->vm_flags & (VM_IO | VM_PFNMAP));
+  }
+  
+ -/*
+ - * For some kind of reserved memory there might be no struct page available,
+ - * so all that can be done to support such 'pages' is to try to convert
+ - * pfn to dma address or at the last resort just assume that
+ - * dma address == physical address (like it has been assumed in earlier version
+ - * of videobuf2-dma-contig
+ - */
+ -
+ -#ifdef __arch_pfn_to_dma
+ -static inline dma_addr_t vb2_dc_pfn_to_dma(struct device *dev, unsigned long pfn)
+ -{
+ -	return (dma_addr_t)__arch_pfn_to_dma(dev, pfn);
+ -}
+ -#elif defined(__pfn_to_bus)
+ -static inline dma_addr_t vb2_dc_pfn_to_dma(struct device *dev, unsigned long pfn)
+ +static int vb2_dc_get_user_pages(unsigned long start, struct page **pages,
+ +	int n_pages, struct vm_area_struct *vma, int write)
+  {
+ -	return (dma_addr_t)__pfn_to_bus(pfn);
+ +	if (vma_is_io(vma)) {
+ +		unsigned int i;
+ +
+ +		for (i = 0; i < n_pages; ++i, start += PAGE_SIZE) {
+ +			unsigned long pfn;
+ +			int ret = follow_pfn(vma, start, &pfn);
+ +
+ +			if (ret) {
+ +				pr_err("no page for address %lu\n", start);
+ +				return ret;
+ +			}
+ +			pages[i] = pfn_to_page(pfn);
+ +		}
+ +	} else {
+ +		int n;
+ +
+ +		n = get_user_pages(current, current->mm, start & PAGE_MASK,
+ +			n_pages, write, 1, pages, NULL);
+ +		/* negative error means that no page was pinned */
+ +		n = max(n, 0);
+ +		if (n != n_pages) {
+ +			pr_err("got only %d of %d user pages\n", n, n_pages);
+ +			while (n)
+ +				put_page(pages[--n]);
+ +			return -EFAULT;
+ +		}
+ +	}
+ +
+ +	return 0;
+  }
+ -#elif defined(__pfn_to_phys)
+ -static inline dma_addr_t vb2_dc_pfn_to_dma(struct device *dev, unsigned long pfn)
+ +
+ +static void vb2_dc_put_dirty_page(struct page *page)
+  {
+ -	return (dma_addr_t)__pfn_to_phys(pfn);
+ +	set_page_dirty_lock(page);
+ +	put_page(page);
+  }
+ -#else
+ -static inline dma_addr_t vb2_dc_pfn_to_dma(struct device *dev, unsigned long pfn)
+ +
+ +static void vb2_dc_put_userptr(void *buf_priv)
+  {
+ -	/* really, we cannot do anything better at this point */
+ -	return (dma_addr_t)(pfn) << PAGE_SHIFT;
+ +	struct vb2_dc_buf *buf = buf_priv;
+ +	struct sg_table *sgt = buf->dma_sgt;
+ +
+ +	dma_unmap_sg(buf->dev, sgt->sgl, sgt->orig_nents, buf->dma_dir);
+ +	if (!vma_is_io(buf->vma))
+ +		vb2_dc_sgt_foreach_page(sgt, vb2_dc_put_dirty_page);
+ +
+ +	sg_free_table(sgt);
+ +	kfree(sgt);
+ +	vb2_put_vma(buf->vma);
+ +	kfree(buf);
+  }
+ -#endif
+  
+ -static void *vb2_dc_get_userptr(struct device *dev, unsigned long vaddr,
+ -	unsigned long size, enum dma_data_direction dma_dir)
+ +static void *vb2_dc_get_userptr(void *alloc_ctx, unsigned long vaddr,
+ +	unsigned long size, int write)
+  {
+ +	struct vb2_dc_conf *conf = alloc_ctx;
+  	struct vb2_dc_buf *buf;
+++<<<<<<< HEAD
+ +	unsigned long start;
+ +	unsigned long end;
+ +	unsigned long offset;
+ +	struct page **pages;
+ +	int n_pages;
+++=======
++ 	struct frame_vector *vec;
++ 	unsigned int offset;
++ 	int n_pages, i;
+++>>>>>>> c4860ad60564 (lib/scatterlist: Fix offset type in sg_alloc_table_from_pages)
+  	int ret = 0;
+ +	struct vm_area_struct *vma;
+  	struct sg_table *sgt;
+  	unsigned long contig_size;
+  	unsigned long dma_align = dma_get_cache_alignment();
+@@@ -509,47 -504,30 +515,54 @@@
+  	if (!buf)
+  		return ERR_PTR(-ENOMEM);
+  
+ -	buf->dev = dev;
+ -	buf->dma_dir = dma_dir;
+ +	buf->dev = conf->dev;
+ +	buf->dma_dir = write ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+ +
+++<<<<<<< HEAD
+ +	start = vaddr & PAGE_MASK;
+ +	offset = vaddr & ~PAGE_MASK;
+ +	end = PAGE_ALIGN(vaddr + size);
+ +	n_pages = (end - start) >> PAGE_SHIFT;
+  
+ +	pages = kmalloc(n_pages * sizeof(pages[0]), GFP_KERNEL);
+ +	if (!pages) {
+ +		ret = -ENOMEM;
+ +		pr_err("failed to allocate pages table\n");
+++=======
++ 	offset = lower_32_bits(offset_in_page(vaddr));
++ 	vec = vb2_create_framevec(vaddr, size, dma_dir == DMA_FROM_DEVICE);
++ 	if (IS_ERR(vec)) {
++ 		ret = PTR_ERR(vec);
+++>>>>>>> c4860ad60564 (lib/scatterlist: Fix offset type in sg_alloc_table_from_pages)
+  		goto fail_buf;
+  	}
+ -	buf->vec = vec;
+ -	n_pages = frame_vector_count(vec);
+ -	ret = frame_vector_to_pages(vec);
+ -	if (ret < 0) {
+ -		unsigned long *nums = frame_vector_pfns(vec);
+  
+ -		/*
+ -		 * Failed to convert to pages... Check the memory is physically
+ -		 * contiguous and use direct mapping
+ -		 */
+ -		for (i = 1; i < n_pages; i++)
+ -			if (nums[i-1] + 1 != nums[i])
+ -				goto fail_pfnvec;
+ -		buf->dma_addr = vb2_dc_pfn_to_dma(buf->dev, nums[0]);
+ -		goto out;
+ +	/* current->mm->mmap_sem is taken by videobuf2 core */
+ +	vma = find_vma(current->mm, vaddr);
+ +	if (!vma) {
+ +		pr_err("no vma for address %lu\n", vaddr);
+ +		ret = -EFAULT;
+ +		goto fail_pages;
+ +	}
+ +
+ +	if (vma->vm_end < vaddr + size) {
+ +		pr_err("vma at %lu is too small for %lu bytes\n", vaddr, size);
+ +		ret = -EFAULT;
+ +		goto fail_pages;
+ +	}
+ +
+ +	buf->vma = vb2_get_vma(vma);
+ +	if (!buf->vma) {
+ +		pr_err("failed to copy vma\n");
+ +		ret = -ENOMEM;
+ +		goto fail_pages;
+ +	}
+ +
+ +	/* extract page list from userspace mapping */
+ +	ret = vb2_dc_get_user_pages(start, pages, n_pages, vma, write);
+ +	if (ret) {
+ +		pr_err("failed to get user pages\n");
+ +		goto fail_vma;
+  	}
+  
+  	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+* Unmerged path drivers/rapidio/devices/rio_mport_cdev.c
+* Unmerged path drivers/media/v4l2-core/videobuf2-dma-contig.c
+* Unmerged path drivers/rapidio/devices/rio_mport_cdev.c
+diff --git a/include/linux/scatterlist.h b/include/linux/scatterlist.h
+index c057e0ebe7b9..9c1f678ad8a1 100644
+--- a/include/linux/scatterlist.h
++++ b/include/linux/scatterlist.h
+@@ -237,7 +237,7 @@ int __sg_alloc_table(struct sg_table *, unsigned int, unsigned int,
+ int sg_alloc_table(struct sg_table *, unsigned int, gfp_t);
+ int sg_alloc_table_from_pages(struct sg_table *sgt,
+ 	struct page **pages, unsigned int n_pages,
+-	unsigned long offset, unsigned long size,
++	unsigned int offset, unsigned long size,
+ 	gfp_t gfp_mask);
+ 
+ size_t sg_copy_buffer(struct scatterlist *sgl, unsigned int nents, void *buf,
+diff --git a/lib/scatterlist.c b/lib/scatterlist.c
+index c736fa14d666..56a89a9d7b91 100644
+--- a/lib/scatterlist.c
++++ b/lib/scatterlist.c
+@@ -393,7 +393,7 @@ EXPORT_SYMBOL(sg_alloc_table);
+  */
+ int sg_alloc_table_from_pages(struct sg_table *sgt,
+ 	struct page **pages, unsigned int n_pages,
+-	unsigned long offset, unsigned long size,
++	unsigned int offset, unsigned long size,
+ 	gfp_t gfp_mask)
+ {
+ 	unsigned int chunks;
