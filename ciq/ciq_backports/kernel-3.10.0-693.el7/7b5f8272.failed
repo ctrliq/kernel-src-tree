@@ -1,0 +1,126 @@
+KVM: PPC: Book3S HV: Change vcore element runnable_threads from linked-list to array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+commit 7b5f8272c792d49da73d98e9ca32f4cbb6d53808
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7b5f8272.failed
+
+The struct kvmppc_vcore is a structure used to store various information
+about a virtual core for a kvm guest. The runnable_threads element of the
+struct provides a list of all of the currently runnable vcpus on the core
+(those in the KVMPPC_VCPU_RUNNABLE state). The previous implementation of
+this list was a linked_list. The next patch requires that the list be able
+to be iterated over without holding the vcore lock.
+
+Reimplement the runnable_threads list in the kvmppc_vcore struct as an
+array. Implement function to iterate over valid entries in the array and
+update access sites accordingly.
+
+	Signed-off-by: Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 7b5f8272c792d49da73d98e9ca32f4cbb6d53808)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index 8f39796c9da8,151f8173e596..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -69,6 -69,41 +69,44 @@@ struct hpte_cache 
+  	int pagesize;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Struct for a virtual core.
++  * Note: entry_exit_map combines a bitmap of threads that have entered
++  * in the bottom 8 bits and a bitmap of threads that have exited in the
++  * next 8 bits.  This is so that we can atomically set the entry bit
++  * iff the exit map is 0 without taking a lock.
++  */
++ struct kvmppc_vcore {
++ 	int n_runnable;
++ 	int num_threads;
++ 	int entry_exit_map;
++ 	int napping_threads;
++ 	int first_vcpuid;
++ 	u16 pcpu;
++ 	u16 last_cpu;
++ 	u8 vcore_state;
++ 	u8 in_guest;
++ 	struct kvmppc_vcore *master_vcore;
++ 	struct kvm_vcpu *runnable_threads[MAX_SMT_THREADS];
++ 	struct list_head preempt_list;
++ 	spinlock_t lock;
++ 	struct swait_queue_head wq;
++ 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
++ 	u64 stolen_tb;
++ 	u64 preempt_tb;
++ 	struct kvm_vcpu *runner;
++ 	struct kvm *kvm;
++ 	u64 tb_offset;		/* guest timebase - host timebase */
++ 	ulong lpcr;
++ 	u32 arch_compat;
++ 	ulong pcr;
++ 	ulong dpdes;		/* doorbell state (POWER8) */
++ 	ulong conferring_threads;
++ };
++ 
+++>>>>>>> 7b5f8272c792 (KVM: PPC: Book3S HV: Change vcore element runnable_threads from linked-list to array)
+  struct kvmppc_vcpu_book3s {
+  	struct kvmppc_sid_map sid_map[SID_MAP_NUM];
+  	struct {
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b,ebbab1b2206c..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -1468,10 -1514,9 +1489,9 @@@ static struct kvmppc_vcore *kvmppc_vcor
+  	if (vcore == NULL)
+  		return NULL;
+  
+- 	INIT_LIST_HEAD(&vcore->runnable_threads);
+  	spin_lock_init(&vcore->lock);
+  	spin_lock_init(&vcore->stoltb_lock);
+ -	init_swait_queue_head(&vcore->wq);
+ +	init_waitqueue_head(&vcore->wq);
+  	vcore->preempt_tb = TB_NIL;
+  	vcore->lpcr = kvm->arch.lpcr;
+  	vcore->first_vcpuid = core * threads_per_subcore;
+@@@ -2586,11 -2628,10 +2603,16 @@@ static void kvmppc_wait_for_exec(struc
+  static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
+  {
+  	struct kvm_vcpu *vcpu;
+++<<<<<<< HEAD
+ +	int do_sleep = 1;
+++=======
++ 	int do_sleep = 1, i;
++ 	DECLARE_SWAITQUEUE(wait);
+++>>>>>>> 7b5f8272c792 (KVM: PPC: Book3S HV: Change vcore element runnable_threads from linked-list to array)
+  
+ -	prepare_to_swait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+ +	DEFINE_WAIT(wait);
+ +
+ +	prepare_to_wait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+  
+  	/*
+  	 * Check one last time for pending exceptions and ceded state after
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8841a038084f..0de03a67faf4 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -672,7 +672,6 @@ struct kvm_vcpu_arch {
+ 	long pgfault_index;
+ 	unsigned long pgfault_hpte[2];
+ 
+-	struct list_head run_list;
+ 	struct task_struct *run_task;
+ 	struct kvm_run *kvm_run;
+ 	pgd_t *pgdir;
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
