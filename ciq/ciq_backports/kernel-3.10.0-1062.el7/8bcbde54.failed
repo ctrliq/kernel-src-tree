@@ -1,0 +1,205 @@
+sched/preempt, mm/fault: Count pagefault_disable() levels in pagefault_disabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author David Hildenbrand <dahi@linux.vnet.ibm.com>
+commit 8bcbde5480f9777f8b74d71493722c663e22c21b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8bcbde54.failed
+
+Until now, pagefault_disable()/pagefault_enabled() used the preempt
+count to track whether in an environment with pagefaults disabled (can
+be queried via in_atomic()).
+
+This patch introduces a separate counter in task_struct to count the
+level of pagefault_disable() calls. We'll keep manipulating the preempt
+count to retain compatibility to existing pagefault handlers.
+
+It is now possible to verify whether in a pagefault_disable() envionment
+by calling pagefault_disabled(). In contrast to in_atomic() it will not
+be influenced by preempt_enable()/preempt_disable().
+
+This patch is based on a patch from Ingo Molnar.
+
+Reviewed-and-tested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: David.Laight@ACULAB.COM
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: airlied@linux.ie
+	Cc: akpm@linux-foundation.org
+	Cc: benh@kernel.crashing.org
+	Cc: bigeasy@linutronix.de
+	Cc: borntraeger@de.ibm.com
+	Cc: daniel.vetter@intel.com
+	Cc: heiko.carstens@de.ibm.com
+	Cc: herbert@gondor.apana.org.au
+	Cc: hocko@suse.cz
+	Cc: hughd@google.com
+	Cc: mst@redhat.com
+	Cc: paulus@samba.org
+	Cc: ralf@linux-mips.org
+	Cc: schwidefsky@de.ibm.com
+	Cc: yang.shi@windriver.com
+Link: http://lkml.kernel.org/r/1431359540-32227-2-git-send-email-dahi@linux.vnet.ibm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8bcbde5480f9777f8b74d71493722c663e22c21b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	include/linux/uaccess.h
+diff --cc include/linux/sched.h
+index 83cd9508a135,dd07ac03f82a..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1810,32 -1778,17 +1810,36 @@@ struct task_struct 
+  		unsigned int may_oom:1;
+  	} memcg_oom;
+  #endif
+ -#ifdef CONFIG_UPROBES
+ -	struct uprobe_task *utask;
+ -#endif
+ -#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
+ -	unsigned int	sequential_io;
+ -	unsigned int	sequential_io_avg;
+ +#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ +	struct tlbflush_unmap_batch tlb_ubc;
+  #endif
+ -#ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ -	unsigned long	task_state_change;
+ +#if defined(CONFIG_FUNCTION_GRAPH_TRACER) && !defined(CONFIG_X86_64)
+ +	/* Index of current stored address in ret_stack */
+ +	int curr_ret_stack;
+ +	/* Stack of return addresses for return function tracing */
+ +	struct ftrace_ret_stack	*ret_stack;
+ +	/* time stamp for last schedule */
+ +	unsigned long long ftrace_timestamp;
+ +	/*
+ +	 * Number of functions that haven't been traced
+ +	 * because of depth overrun.
+ +	 */
+ +	atomic_t trace_overrun;
+ +	/* Pause for the tracing */
+ +	atomic_t tracing_graph_pause;
+  #endif
+++<<<<<<< HEAD
+ +	struct sched_dl_entity dl;
+ +	#ifdef CONFIG_SMP
+ +		struct rb_node pushable_dl_tasks;
+ +	#endif
+ +	struct sched_statistics statistics;
+ +	struct wake_q_node wake_q;
+ +	struct prev_cputime prev_cputime;
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	int pagefault_disabled;
+++>>>>>>> 8bcbde5480f9 (sched/preempt, mm/fault: Count pagefault_disable() levels in pagefault_disabled)
+  };
+  
+  /* Future-safe accessor for struct task_struct's cpus_allowed. */
+diff --cc include/linux/uaccess.h
+index 0497c0dedb93,23290cc93a24..000000000000
+--- a/include/linux/uaccess.h
++++ b/include/linux/uaccess.h
+@@@ -2,23 -2,36 +2,46 @@@
+  #define __LINUX_UACCESS_H__
+  
+  #include <linux/preempt.h>
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+  #include <linux/sched.h>
+ +#endif
+++=======
+++#include <linux/sched.h>
+++>>>>>>> 8bcbde5480f9 (sched/preempt, mm/fault: Count pagefault_disable() levels in pagefault_disabled)
+  #include <asm/uaccess.h>
+  
++ static __always_inline void pagefault_disabled_inc(void)
++ {
++ 	current->pagefault_disabled++;
++ }
++ 
++ static __always_inline void pagefault_disabled_dec(void)
++ {
++ 	current->pagefault_disabled--;
++ 	WARN_ON(current->pagefault_disabled < 0);
++ }
++ 
+  /*
+-  * These routines enable/disable the pagefault handler in that
+-  * it will not take any locks and go straight to the fixup table.
++  * These routines enable/disable the pagefault handler. If disabled, it will
++  * not take any locks and go straight to the fixup table.
++  *
++  * We increase the preempt and the pagefault count, to be able to distinguish
++  * whether we run in simple atomic context or in a real pagefault_disable()
++  * context.
++  *
++  * For now, after pagefault_disabled() has been called, we run in atomic
++  * context. User access methods will not sleep.
+   *
+-  * They have great resemblance to the preempt_disable/enable calls
+-  * and in fact they are identical; this is because currently there is
+-  * no other way to make the pagefault handlers do this. So we do
+-  * disable preemption but we don't necessarily care about that.
+   */
+  static inline void pagefault_disable(void)
+  {
+++<<<<<<< HEAD
+ +	inc_preempt_count();
+++=======
++ 	preempt_count_inc();
++ 	pagefault_disabled_inc();
+++>>>>>>> 8bcbde5480f9 (sched/preempt, mm/fault: Count pagefault_disable() levels in pagefault_disabled)
+  	/*
+  	 * make sure to have issued the store before a pagefault
+  	 * can hit.
+@@@ -33,14 -46,19 +56,28 @@@ static inline void pagefault_enable(voi
+  	 * the pagefault handler again.
+  	 */
+  	barrier();
+++<<<<<<< HEAD
+ +	dec_preempt_count();
+ +	/*
+ +	 * make sure we do..
+ +	 */
+ +	barrier();
+ +	preempt_check_resched();
+++=======
++ 	pagefault_disabled_dec();
++ #ifndef CONFIG_PREEMPT
++ 	preempt_count_dec();
++ #else
++ 	preempt_enable();
++ #endif
+++>>>>>>> 8bcbde5480f9 (sched/preempt, mm/fault: Count pagefault_disable() levels in pagefault_disabled)
+  }
+  
++ /*
++  * Is the pagefault handler disabled? If so, user access methods will not sleep.
++  */
++ #define pagefault_disabled() (current->pagefault_disabled != 0)
++ 
+  #ifndef ARCH_HAS_NOCACHE_UACCESS
+  
+  static inline unsigned long __copy_from_user_inatomic_nocache(void *to,
+* Unmerged path include/linux/sched.h
+* Unmerged path include/linux/uaccess.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9bff3b28c357..822d31bf8a89 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1460,6 +1460,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 	p->hardirq_context = 0;
+ 	p->softirq_context = 0;
+ #endif
++
++	p->pagefault_disabled = 0;
++
+ #ifdef CONFIG_LOCKDEP
+ 	p->lockdep_depth = 0; /* no locks held yet */
+ 	p->curr_chain_key = 0;
