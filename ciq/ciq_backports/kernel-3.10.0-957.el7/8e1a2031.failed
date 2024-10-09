@@ -1,0 +1,286 @@
+perf/cor: Use RB trees for pinned/flexible groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit 8e1a2031e4b556b01ca53cd1fb2d83d811a6605b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8e1a2031.failed
+
+Change event groups into RB trees sorted by CPU and then by a 64bit
+index, so that multiplexing hrtimer interrupt handler would be able
+skipping to the current CPU's list and ignore groups allocated for the
+other CPUs.
+
+New API for manipulating event groups in the trees is implemented as well
+as adoption on the API in the current implementation.
+
+pinned_group_sched_in() and flexible_group_sched_in() API are
+introduced to consolidate code enabling the whole group from pinned
+and flexible groups appropriately.
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: David Carrillo-Cisneros <davidcc@google.com>
+	Cc: Dmitri Prokhorov <Dmitry.Prohorov@intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Valery Cherepennikov <valery.cherepennikov@intel.com>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/372f9c8b-0cfe-4240-e44d-83d863d40813@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8e1a2031e4b556b01ca53cd1fb2d83d811a6605b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index c93e5f6b30d7,6e3f854a34d8..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -453,14 -557,21 +453,23 @@@ struct perf_event 
+  	 * either sufficies for read.
+  	 */
+  	struct list_head		group_entry;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head		sibling_list;
++ 	/*
++ 	 * Node on the pinned or flexible tree located at the event context;
++ 	 */
++ 	struct rb_node			group_node;
++ 	u64				group_index;
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  	/*
+ -	 * We need storage to track the entries in perf_pmu_migrate_context; we
+ -	 * cannot use the event_entry because of RCU and we want to keep the
+ -	 * group in tact which avoids us using the other two entries.
+ +	 * entry onto perf_event_context::event_list;
+ +	 *   modifications require ctx->lock
+ +	 *   RCU safe iterations.
+  	 */
+ -	struct list_head		migrate_entry;
+ -
+ +	struct list_head		event_entry;
+ +	struct list_head		sibling_list;
+  	struct hlist_node		hlist_entry;
+ -	struct list_head		active_entry;
+  	int				nr_siblings;
+  
+  	/* Not serialized. Only written during event initialization. */
+@@@ -603,9 -694,10 +612,16 @@@
+  #endif /* CONFIG_PERF_EVENTS */
+  };
+  
+++<<<<<<< HEAD
+ +enum perf_event_context_type {
+ +	task_context,
+ +	cpu_context,
+++=======
++ 
++ struct perf_event_groups {
++ 	struct rb_root	tree;
++ 	u64		index;
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  };
+  
+  /**
+@@@ -628,8 -719,9 +644,14 @@@ struct perf_event_context 
+  	 */
+  	struct mutex			mutex;
+  
+++<<<<<<< HEAD
+ +	struct list_head		pinned_groups;
+ +	struct list_head		flexible_groups;
+++=======
++ 	struct list_head		active_ctx_list;
++ 	struct perf_event_groups	pinned_groups;
++ 	struct perf_event_groups	flexible_groups;
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  	struct list_head		event_list;
+  	int				nr_events;
+  	int				nr_active;
+diff --cc kernel/events/core.c
+index e490cd411934,c9fee3640f40..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -1457,16 -1665,11 +1633,12 @@@ list_add_event(struct perf_event *event
+  	 * perf_group_detach can, at all times, locate all siblings.
+  	 */
+  	if (event->group_leader == event) {
+- 		struct list_head *list;
+- 
+  		event->group_caps = event->event_caps;
+- 
+- 		list = ctx_group_list(event, ctx);
+- 		list_add_tail(&event->group_entry, list);
++ 		add_event_to_groups(event, ctx);
+  	}
+  
+ -	list_update_cgroup_event(event, ctx, true);
+ +	if (is_cgroup_event(event))
+ +		ctx->nr_cgroups++;
+  
+  	list_add_rcu(&event->event_entry, &ctx->event_list);
+  	ctx->nr_events++;
+@@@ -1669,10 -1860,8 +1841,10 @@@ list_del_event(struct perf_event *event
+  	list_del_rcu(&event->event_entry);
+  
+  	if (event->group_leader == event)
+- 		list_del_init(&event->group_entry);
++ 		del_event_from_groups(event, ctx);
+  
+ +	update_group_times(event);
+ +
+  	/*
+  	 * If event was in error state, then keep it
+  	 * that way, otherwise bogus counts will be
+@@@ -2173,31 -2358,20 +2345,48 @@@ static int group_can_go_on(struct perf_
+  	return can_add_hw;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Complement to update_event_times(). This computes the tstamp_* values to
+ + * continue 'enabled' state from @now, and effectively discards the time
+ + * between the prior tstamp_stopped and now (as we were in the OFF state, or
+ + * just switched (context) time base).
+ + *
+ + * This further assumes '@event->state == INACTIVE' (we just came from OFF) and
+ + * cannot have been scheduled in yet. And going into INACTIVE state means
+ + * '@event->tstamp_stopped = @now'.
+ + *
+ + * Thus given the rules of update_event_times():
+ + *
+ + *   total_time_enabled = tstamp_stopped - tstamp_enabled
+ + *   total_time_running = tstamp_stopped - tstamp_running
+ + *
+ + * We can insert 'tstamp_stopped == now' and reverse them to compute new
+ + * tstamp_* values.
+ + */
+ +static void __perf_event_enable_time(struct perf_event *event, u64 now)
+ +{
+ +	WARN_ON_ONCE(event->state != PERF_EVENT_STATE_INACTIVE);
+ +
+ +	event->tstamp_stopped = now;
+ +	event->tstamp_enabled = now - event->total_time_enabled;
+ +	event->tstamp_running = now - event->total_time_running;
+++=======
++ static int
++ flexible_group_sched_in(struct perf_event *event,
++ 			struct perf_event_context *ctx,
++ 		        struct perf_cpu_context *cpuctx,
++ 			int *can_add_hw)
++ {
++ 	if (event->state <= PERF_EVENT_STATE_OFF || !event_filter_match(event))
++ 		return 0;
++ 
++ 	if (group_can_go_on(event, cpuctx, *can_add_hw))
++ 		if (group_sched_in(event, cpuctx, ctx))
++ 			*can_add_hw = 0;
++ 
++ 	return 1;
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  }
+  
+  static void add_event_to_ctx(struct perf_event *event,
+@@@ -3047,28 -3193,27 +3245,44 @@@ static voi
+  ctx_pinned_sched_in(struct perf_event_context *ctx,
+  		    struct perf_cpu_context *cpuctx)
+  {
++ 	int sw = -1, cpu = smp_processor_id();
+  	struct perf_event *event;
++ 	int can_add_hw;
++ 
++ 	perf_event_groups_for_each_cpu(event, sw,
++ 			&ctx->pinned_groups, group_node) {
++ 		can_add_hw = 1;
++ 		if (flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw)) {
++ 			if (event->state == PERF_EVENT_STATE_INACTIVE)
++ 				perf_event_set_state(event,
++ 						PERF_EVENT_STATE_ERROR);
++ 		}
++ 	}
+  
+- 	list_for_each_entry(event, &ctx->pinned_groups, group_entry) {
+- 		if (event->state <= PERF_EVENT_STATE_OFF)
+- 			continue;
+- 		if (!event_filter_match(event))
+- 			continue;
+- 
+++<<<<<<< HEAD
+ +		/* may need to reset tstamp_enabled */
+ +		if (is_cgroup_event(event))
+ +			perf_cgroup_mark_enabled(event, ctx);
+ +
+ +		if (group_can_go_on(event, cpuctx, 1))
+ +			group_sched_in(event, cpuctx, ctx);
+ +
+ +		/*
+ +		 * If this pinned group hasn't been scheduled,
+ +		 * put it in error state.
+ +		 */
+ +		if (event->state == PERF_EVENT_STATE_INACTIVE) {
+ +			update_group_times(event);
+ +			event->state = PERF_EVENT_STATE_ERROR;
+++=======
++ 	perf_event_groups_for_each_cpu(event, cpu,
++ 			&ctx->pinned_groups, group_node) {
++ 		can_add_hw = 1;
++ 		if (flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw)) {
++ 			if (event->state == PERF_EVENT_STATE_INACTIVE)
++ 				perf_event_set_state(event,
++ 						PERF_EVENT_STATE_ERROR);
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  		}
+  	}
+  }
+@@@ -3080,26 -3226,15 +3295,27 @@@ ctx_flexible_sched_in(struct perf_event
+  	struct perf_event *event;
+  	int can_add_hw = 1;
+  
+- 	list_for_each_entry(event, &ctx->flexible_groups, group_entry) {
+- 		/* Ignore events in OFF or ERROR state */
+- 		if (event->state <= PERF_EVENT_STATE_OFF)
+- 			continue;
+- 		/*
+- 		 * Listen to the 'cpu' scheduling filter constraint
+- 		 * of events:
+- 		 */
+- 		if (!event_filter_match(event))
+- 			continue;
++ 	perf_event_groups_for_each_cpu(event, sw,
++ 			&ctx->flexible_groups, group_node)
++ 		flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw);
+  
++ 	can_add_hw = 1;
++ 	perf_event_groups_for_each_cpu(event, cpu,
++ 			&ctx->flexible_groups, group_node)
++ 		flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw);
++ 
+++<<<<<<< HEAD
+ +		/* may need to reset tstamp_enabled */
+ +		if (is_cgroup_event(event))
+ +			perf_cgroup_mark_enabled(event, ctx);
+ +
+ +		if (group_can_go_on(event, cpuctx, can_add_hw)) {
+ +			if (group_sched_in(event, cpuctx, ctx))
+ +				can_add_hw = 0;
+ +		}
+ +	}
+++=======
+++>>>>>>> 8e1a2031e4b5 (perf/cor: Use RB trees for pinned/flexible groups)
+  }
+  
+  static void
+* Unmerged path include/linux/perf_event.h
+* Unmerged path kernel/events/core.c
