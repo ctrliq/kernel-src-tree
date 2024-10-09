@@ -475,7 +475,8 @@ static int rds_ib_setup_qp(struct rds_connection *conn)
 		goto out;
 	}
 
-	ic->i_sends = vzalloc_node(ic->i_send_ring.w_nr * sizeof(struct rds_ib_send_work),
+	ic->i_sends = vzalloc_node(array_size(sizeof(struct rds_ib_send_work),
+					      ic->i_send_ring.w_nr),
 				   ibdev_to_node(dev));
 	if (!ic->i_sends) {
 		ret = -ENOMEM;
@@ -483,7 +484,8 @@ static int rds_ib_setup_qp(struct rds_connection *conn)
 		goto out;
 	}
 
-	ic->i_recvs = vzalloc_node(ic->i_recv_ring.w_nr * sizeof(struct rds_ib_recv_work),
+	ic->i_recvs = vzalloc_node(array_size(sizeof(struct rds_ib_recv_work),
+					      ic->i_recv_ring.w_nr),
 				   ibdev_to_node(dev));
 	if (!ic->i_recvs) {
 		ret = -ENOMEM;
