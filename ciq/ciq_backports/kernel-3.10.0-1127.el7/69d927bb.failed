@@ -1,0 +1,169 @@
+x86/atomic: Fix smp_mb__{before,after}_atomic()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 69d927bba39517d0980462efc051875b7f4db185
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/69d927bb.failed
+
+Recent probing at the Linux Kernel Memory Model uncovered a
+'surprise'. Strongly ordered architectures where the atomic RmW
+primitive implies full memory ordering and
+smp_mb__{before,after}_atomic() are a simple barrier() (such as x86)
+fail for:
+
+	*x = 1;
+	atomic_inc(u);
+	smp_mb__after_atomic();
+	r0 = *y;
+
+Because, while the atomic_inc() implies memory order, it
+(surprisingly) does not provide a compiler barrier. This then allows
+the compiler to re-order like so:
+
+	atomic_inc(u);
+	*x = 1;
+	smp_mb__after_atomic();
+	r0 = *y;
+
+Which the CPU is then allowed to re-order (under TSO rules) like:
+
+	atomic_inc(u);
+	r0 = *y;
+	*x = 1;
+
+And this very much was not intended. Therefore strengthen the atomic
+RmW ops to include a compiler barrier.
+
+NOTE: atomic_{or,and,xor} and the bitops already had the compiler
+barrier.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 69d927bba39517d0980462efc051875b7f4db185)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/atomic_t.txt
+#	arch/x86/include/asm/barrier.h
+diff --cc arch/x86/include/asm/barrier.h
+index b9a9641bc14a,84f848c2541a..000000000000
+--- a/arch/x86/include/asm/barrier.h
++++ b/arch/x86/include/asm/barrier.h
+@@@ -112,23 -79,9 +112,28 @@@ do {									
+  	___p1;								\
+  })
+  
+ +#endif
+ +
+  /* Atomic operations are already serializing on x86 */
+++<<<<<<< HEAD
+ +#define smp_mb__before_atomic()	barrier()
+ +#define smp_mb__after_atomic()	barrier()
+ +
+ +/*
+ + * Stop RDTSC speculation. This is needed when you need to use RDTSC
+ + * (or get_cycles or vread that possibly accesses the TSC) in a defined
+ + * code region.
+ + *
+ + * (Could use an alternative three way for this if there was one.)
+ + */
+ +static __always_inline void rdtsc_barrier(void)
+ +{
+ +	alternative(ASM_NOP3, "lfence", X86_FEATURE_LFENCE_RDTSC);
+ +}
+++=======
++ #define __smp_mb__before_atomic()	do { } while (0)
++ #define __smp_mb__after_atomic()	do { } while (0)
+++>>>>>>> 69d927bba395 (x86/atomic: Fix smp_mb__{before,after}_atomic())
+  
+  #include <asm-generic/barrier.h>
+  
+* Unmerged path Documentation/atomic_t.txt
+* Unmerged path Documentation/atomic_t.txt
+diff --git a/arch/x86/include/asm/atomic.h b/arch/x86/include/asm/atomic.h
+index 72e8184bc20f..4defee9735fb 100644
+--- a/arch/x86/include/asm/atomic.h
++++ b/arch/x86/include/asm/atomic.h
+@@ -48,7 +48,7 @@ static __always_inline void atomic_add(int i, atomic_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "addl %1,%0"
+ 		     : "+m" (v->counter)
+-		     : "ir" (i));
++		     : "ir" (i) : "memory");
+ }
+ 
+ /**
+@@ -62,7 +62,7 @@ static __always_inline void atomic_sub(int i, atomic_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "subl %1,%0"
+ 		     : "+m" (v->counter)
+-		     : "ir" (i));
++		     : "ir" (i) : "memory");
+ }
+ 
+ /**
+@@ -93,7 +93,7 @@ static __always_inline int atomic_sub_and_test(int i, atomic_t *v)
+ static __always_inline void atomic_inc(atomic_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "incl %0"
+-		     : "+m" (v->counter));
++		     : "+m" (v->counter) :: "memory");
+ }
+ 
+ /**
+@@ -105,7 +105,7 @@ static __always_inline void atomic_inc(atomic_t *v)
+ static __always_inline void atomic_dec(atomic_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "decl %0"
+-		     : "+m" (v->counter));
++		     : "+m" (v->counter) :: "memory");
+ }
+ 
+ /**
+diff --git a/arch/x86/include/asm/atomic64_64.h b/arch/x86/include/asm/atomic64_64.h
+index 79141f12b6ec..d4c9091f5645 100644
+--- a/arch/x86/include/asm/atomic64_64.h
++++ b/arch/x86/include/asm/atomic64_64.h
+@@ -44,7 +44,7 @@ static __always_inline void atomic64_add(long i, atomic64_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "addq %1,%0"
+ 		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter));
++		     : "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ /**
+@@ -58,7 +58,7 @@ static inline void atomic64_sub(long i, atomic64_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "subq %1,%0"
+ 		     : "=m" (v->counter)
+-		     : "er" (i), "m" (v->counter));
++		     : "er" (i), "m" (v->counter) : "memory");
+ }
+ 
+ /**
+@@ -90,7 +90,7 @@ static __always_inline void atomic64_inc(atomic64_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "incq %0"
+ 		     : "=m" (v->counter)
+-		     : "m" (v->counter));
++		     : "m" (v->counter) : "memory");
+ }
+ 
+ /**
+@@ -103,7 +103,7 @@ static __always_inline void atomic64_dec(atomic64_t *v)
+ {
+ 	asm volatile(LOCK_PREFIX "decq %0"
+ 		     : "=m" (v->counter)
+-		     : "m" (v->counter));
++		     : "m" (v->counter) : "memory");
+ }
+ 
+ /**
+* Unmerged path arch/x86/include/asm/barrier.h
