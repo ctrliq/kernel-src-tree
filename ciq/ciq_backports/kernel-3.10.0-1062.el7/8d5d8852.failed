@@ -1,0 +1,506 @@
+xdp: rhashtable with allocator ID to pointer mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 8d5d88527587516bd58ff0f3810f07c38e65e2be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8d5d8852.failed
+
+Use the IDA infrastructure for getting a cyclic increasing ID number,
+that is used for keeping track of each registered allocator per
+RX-queue xdp_rxq_info.  Instead of using the IDR infrastructure, which
+uses a radix tree, use a dynamic rhashtable, for creating ID to
+pointer lookup table, because this is faster.
+
+The problem that is being solved here is that, the xdp_rxq_info
+pointer (stored in xdp_buff) cannot be used directly, as the
+guaranteed lifetime is too short.  The info is needed on a
+(potentially) remote CPU during DMA-TX completion time . In an
+xdp_frame the xdp_mem_info is stored, when it got converted from an
+xdp_buff, which is sufficient for the simple page refcnt based recycle
+schemes.
+
+For more advanced allocators there is a need to store a pointer to the
+registered allocator.  Thus, there is a need to guard the lifetime or
+validity of the allocator pointer, which is done through this
+rhashtable ID map to pointer. The removal and validity of of the
+allocator and helper struct xdp_mem_allocator is guarded by RCU.  The
+allocator will be created by the driver, and registered with
+xdp_rxq_info_reg_mem_model().
+
+It is up-to debate who is responsible for freeing the allocator
+pointer or invoking the allocator destructor function.  In any case,
+this must happen via RCU freeing.
+
+Use the IDA infrastructure for getting a cyclic increasing ID number,
+that is used for keeping track of each registered allocator per
+RX-queue xdp_rxq_info.
+
+V4: Per req of Jason Wang
+- Use xdp_rxq_info_reg_mem_model() in all drivers implementing
+  XDP_REDIRECT, even-though it's not strictly necessary when
+  allocator==NULL for type MEM_TYPE_PAGE_SHARED (given it's zero).
+
+V6: Per req of Alex Duyck
+- Introduce rhashtable_lookup() call in later patch
+
+V8: Address sparse should be static warnings (from kbuild test robot)
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d5d88527587516bd58ff0f3810f07c38e65e2be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	include/net/xdp.h
+#	net/core/xdp.c
+diff --cc drivers/net/tun.c
+index 35cc09f13a24,283bde85c455..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -656,6 -840,29 +656,32 @@@ static int tun_attach(struct tun_struc
+  	}
+  
+  	tfile->queue_index = tun->numqueues;
+++<<<<<<< HEAD
+++=======
++ 	tfile->socket.sk->sk_shutdown &= ~RCV_SHUTDOWN;
++ 
++ 	if (tfile->detached) {
++ 		/* Re-attach detached tfile, updating XDP queue_index */
++ 		WARN_ON(!xdp_rxq_info_is_reg(&tfile->xdp_rxq));
++ 
++ 		if (tfile->xdp_rxq.queue_index    != tfile->queue_index)
++ 			tfile->xdp_rxq.queue_index = tfile->queue_index;
++ 	} else {
++ 		/* Setup XDP RX-queue info, for new tfile getting attached */
++ 		err = xdp_rxq_info_reg(&tfile->xdp_rxq,
++ 				       tun->dev, tfile->queue_index);
++ 		if (err < 0)
++ 			goto out;
++ 		err = xdp_rxq_info_reg_mem_model(&tfile->xdp_rxq,
++ 						 MEM_TYPE_PAGE_SHARED, NULL);
++ 		if (err < 0) {
++ 			xdp_rxq_info_unreg(&tfile->xdp_rxq);
++ 			goto out;
++ 		}
++ 		err = 0;
++ 	}
++ 
+++>>>>>>> 8d5d88527587 (xdp: rhashtable with allocator ID to pointer mapping)
+  	rcu_assign_pointer(tfile->tun, tun);
+  	rcu_assign_pointer(tun->tfiles[tun->numqueues], tfile);
+  	tun->numqueues++;
+diff --cc drivers/net/virtio_net.c
+index da63bcba4f5b,42d338fe9a8d..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -675,17 -1222,98 +675,34 @@@ static int virtnet_poll(struct napi_str
+  	return received;
+  }
+  
+ -static void free_old_xmit_skbs(struct send_queue *sq)
+ +static int virtnet_open(struct net_device *dev)
+  {
+ -	struct sk_buff *skb;
+ -	unsigned int len;
+ -	unsigned int packets = 0;
+ -	unsigned int bytes = 0;
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +	int i;
+  
+ -	while ((skb = virtqueue_get_buf(sq->vq, &len)) != NULL) {
+ -		pr_debug("Sent skb %p\n", skb);
+ +	for (i = 0; i < vi->max_queue_pairs; i++) {
+ +		if (i < vi->curr_queue_pairs)
+ +			/* Make sure we have some buffers: if oom use wq. */
+ +			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+ +				schedule_delayed_work(&vi->refill, 0);
+++<<<<<<< HEAD
+ +		virtnet_napi_enable(&vi->rq[i]);
+++=======
+++
+++		err = xdp_rxq_info_reg(&vi->rq[i].xdp_rxq, dev, i);
+++		if (err < 0)
+++			return err;
++ 
+ -		bytes += skb->len;
+ -		packets++;
+++		err = xdp_rxq_info_reg_mem_model(&vi->rq[i].xdp_rxq,
+++						 MEM_TYPE_PAGE_SHARED, NULL);
+++		if (err < 0) {
+++			xdp_rxq_info_unreg(&vi->rq[i].xdp_rxq);
+++			return err;
+++		}
++ 
+ -		dev_consume_skb_any(skb);
+ -	}
+ -
+ -	/* Avoid overhead when no packets have been processed
+ -	 * happens when called speculatively from start_xmit.
+ -	 */
+ -	if (!packets)
+ -		return;
+ -
+ -	u64_stats_update_begin(&sq->stats.syncp);
+ -	sq->stats.bytes += bytes;
+ -	sq->stats.packets += packets;
+ -	u64_stats_update_end(&sq->stats.syncp);
+ -}
+ -
+ -static void virtnet_poll_cleantx(struct receive_queue *rq)
+ -{
+ -	struct virtnet_info *vi = rq->vq->vdev->priv;
+ -	unsigned int index = vq2rxq(rq->vq);
+ -	struct send_queue *sq = &vi->sq[index];
+ -	struct netdev_queue *txq = netdev_get_tx_queue(vi->dev, index);
+ -
+ -	if (!sq->napi.weight)
+ -		return;
+ -
+ -	if (__netif_tx_trylock(txq)) {
+ -		free_old_xmit_skbs(sq);
+ -		__netif_tx_unlock(txq);
+ -	}
+ -
+ -	if (sq->vq->num_free >= 2 + MAX_SKB_FRAGS)
+ -		netif_tx_wake_queue(txq);
+ -}
+ -
+ -static int virtnet_poll(struct napi_struct *napi, int budget)
+ -{
+ -	struct receive_queue *rq =
+ -		container_of(napi, struct receive_queue, napi);
+ -	unsigned int received;
+ -	bool xdp_xmit = false;
+ -
+ -	virtnet_poll_cleantx(rq);
+ -
+ -	received = virtnet_receive(rq, budget, &xdp_xmit);
+ -
+ -	/* Out of packets? */
+ -	if (received < budget)
+ -		virtqueue_napi_complete(napi, rq->vq, received);
+ -
+ -	if (xdp_xmit)
+ -		xdp_do_flush_map();
+ -
+ -	return received;
+ -}
+ -
+ -static int virtnet_open(struct net_device *dev)
+ -{
+ -	struct virtnet_info *vi = netdev_priv(dev);
+ -	int i, err;
+ -
+ -	for (i = 0; i < vi->max_queue_pairs; i++) {
+ -		if (i < vi->curr_queue_pairs)
+ -			/* Make sure we have some buffers: if oom use wq. */
+ -			if (!try_fill_recv(vi, &vi->rq[i], GFP_KERNEL))
+ -				schedule_delayed_work(&vi->refill, 0);
+ -
+ -		err = xdp_rxq_info_reg(&vi->rq[i].xdp_rxq, dev, i);
+ -		if (err < 0)
+ -			return err;
+ -
+ -		err = xdp_rxq_info_reg_mem_model(&vi->rq[i].xdp_rxq,
+ -						 MEM_TYPE_PAGE_SHARED, NULL);
+ -		if (err < 0) {
+ -			xdp_rxq_info_unreg(&vi->rq[i].xdp_rxq);
+ -			return err;
+ -		}
+ -
+ -		virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
+ -		virtnet_napi_tx_enable(vi, vi->sq[i].vq, &vi->sq[i].napi);
+++		virtnet_napi_enable(vi->rq[i].vq, &vi->rq[i].napi);
+++		virtnet_napi_tx_enable(vi, vi->sq[i].vq, &vi->sq[i].napi);
+++>>>>>>> 8d5d88527587 (xdp: rhashtable with allocator ID to pointer mapping)
+  	}
+  
+  	return 0;
+diff --cc include/net/xdp.h
+index 6ac69520ed7c,5f67c62540aa..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -73,14 -75,32 +74,18 @@@ struct xdp_frame 
+  static inline
+  struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
+  {
+ -	struct xdp_frame *xdp_frame;
+ -	int metasize;
+ -	int headroom;
+ -
+ -	/* Assure headroom is available for storing info */
+ -	headroom = xdp->data - xdp->data_hard_start;
+ -	metasize = xdp->data - xdp->data_meta;
+ -	metasize = metasize > 0 ? metasize : 0;
+ -	if (unlikely((headroom - metasize) < sizeof(*xdp_frame)))
+ -		return NULL;
+ -
+ -	/* Store info in top of packet */
+ -	xdp_frame = xdp->data_hard_start;
+ -
+ -	xdp_frame->data = xdp->data;
+ -	xdp_frame->len  = xdp->data_end - xdp->data;
+ -	xdp_frame->headroom = headroom - sizeof(*xdp_frame);
+ -	xdp_frame->metasize = metasize;
+ -
+ -	/* rxq only valid until napi_schedule ends, convert to xdp_mem_info */
+ -	xdp_frame->mem = xdp->rxq->mem;
+ -
+ -	return xdp_frame;
+ +	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +void xdp_return_frame(struct xdp_frame *xdpf)
+ +{
+ +	return;
+ +}
+++=======
++ void xdp_return_frame(void *data, struct xdp_mem_info *mem);
+++>>>>>>> 8d5d88527587 (xdp: rhashtable with allocator ID to pointer mapping)
+  
+  int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+  		     struct net_device *dev, u32 queue_index);
+diff --cc net/core/xdp.c
+index e553510efc2e,8b2cb79b5de0..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -13,9 -16,115 +16,119 @@@
+  #define REG_STATE_UNREGISTERED	0x2
+  #define REG_STATE_UNUSED	0x3
+  
++ static DEFINE_IDA(mem_id_pool);
++ static DEFINE_MUTEX(mem_id_lock);
++ #define MEM_ID_MAX 0xFFFE
++ #define MEM_ID_MIN 1
++ static int mem_id_next = MEM_ID_MIN;
++ 
++ static bool mem_id_init; /* false */
++ static struct rhashtable *mem_id_ht;
++ 
++ struct xdp_mem_allocator {
++ 	struct xdp_mem_info mem;
++ 	void *allocator;
++ 	struct rhash_head node;
++ 	struct rcu_head rcu;
++ };
++ 
++ static u32 xdp_mem_id_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const u32 *k = data;
++ 	const u32 key = *k;
++ 
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct xdp_mem_allocator, mem.id)
++ 		     != sizeof(u32));
++ 
++ 	/* Use cyclic increasing ID as direct hash key, see rht_bucket_index */
++ 	return key << RHT_HASH_RESERVED_SPACE;
++ }
++ 
++ static int xdp_mem_id_cmp(struct rhashtable_compare_arg *arg,
++ 			  const void *ptr)
++ {
++ 	const struct xdp_mem_allocator *xa = ptr;
++ 	u32 mem_id = *(u32 *)arg->key;
++ 
++ 	return xa->mem.id != mem_id;
++ }
++ 
++ static const struct rhashtable_params mem_id_rht_params = {
++ 	.nelem_hint = 64,
++ 	.head_offset = offsetof(struct xdp_mem_allocator, node),
++ 	.key_offset  = offsetof(struct xdp_mem_allocator, mem.id),
++ 	.key_len = FIELD_SIZEOF(struct xdp_mem_allocator, mem.id),
++ 	.max_size = MEM_ID_MAX,
++ 	.min_size = 8,
++ 	.automatic_shrinking = true,
++ 	.hashfn    = xdp_mem_id_hashfn,
++ 	.obj_cmpfn = xdp_mem_id_cmp,
++ };
++ 
++ static void __xdp_mem_allocator_rcu_free(struct rcu_head *rcu)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 
++ 	xa = container_of(rcu, struct xdp_mem_allocator, rcu);
++ 
++ 	/* Allow this ID to be reused */
++ 	ida_simple_remove(&mem_id_pool, xa->mem.id);
++ 
++ 	/* TODO: Depending on allocator type/pointer free resources */
++ 
++ 	/* Poison memory */
++ 	xa->mem.id = 0xFFFF;
++ 	xa->mem.type = 0xF0F0;
++ 	xa->allocator = (void *)0xDEAD9001;
++ 
++ 	kfree(xa);
++ }
++ 
++ static void __xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	int id = xdp_rxq->mem.id;
++ 	int err;
++ 
++ 	if (id == 0)
++ 		return;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup(mem_id_ht, &id, mem_id_rht_params);
++ 	if (!xa) {
++ 		mutex_unlock(&mem_id_lock);
++ 		return;
++ 	}
++ 
++ 	err = rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params);
++ 	WARN_ON(err);
++ 
++ 	call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ }
++ 
+  void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq)
+  {
+++<<<<<<< HEAD
+ +	return;
+++=======
++ 	/* Simplify driver cleanup code paths, allow unreg "unused" */
++ 	if (xdp_rxq->reg_state == REG_STATE_UNUSED)
++ 		return;
++ 
++ 	WARN(!(xdp_rxq->reg_state == REG_STATE_REGISTERED), "Driver BUG");
++ 
++ 	__xdp_rxq_info_unreg_mem_model(xdp_rxq);
++ 
++ 	xdp_rxq->reg_state = REG_STATE_UNREGISTERED;
++ 	xdp_rxq->dev = NULL;
++ 
++ 	/* Reset mem info to defaults */
++ 	xdp_rxq->mem.id = 0;
++ 	xdp_rxq->mem.type = 0;
+++>>>>>>> 8d5d88527587 (xdp: rhashtable with allocator ID to pointer mapping)
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg);
+  
+@@@ -42,6 -228,77 +206,80 @@@ again
+  int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
+  			       enum xdp_mem_type type, void *allocator)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct xdp_mem_allocator *xdp_alloc;
++ 	gfp_t gfp = GFP_KERNEL;
++ 	int id, errno, ret;
++ 	void *ptr;
++ 
++ 	if (xdp_rxq->reg_state != REG_STATE_REGISTERED) {
++ 		WARN(1, "Missing register, driver bug");
++ 		return -EFAULT;
++ 	}
++ 
++ 	if (type >= MEM_TYPE_MAX)
++ 		return -EINVAL;
++ 
++ 	xdp_rxq->mem.type = type;
++ 
++ 	if (!allocator)
++ 		return 0;
++ 
++ 	/* Delay init of rhashtable to save memory if feature isn't used */
++ 	if (!mem_id_init) {
++ 		mutex_lock(&mem_id_lock);
++ 		ret = __mem_id_init_hash_table();
++ 		mutex_unlock(&mem_id_lock);
++ 		if (ret < 0) {
++ 			WARN_ON(1);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	xdp_alloc = kzalloc(sizeof(*xdp_alloc), gfp);
++ 	if (!xdp_alloc)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 	id = __mem_id_cyclic_get(gfp);
++ 	if (id < 0) {
++ 		errno = id;
++ 		goto err;
++ 	}
++ 	xdp_rxq->mem.id = id;
++ 	xdp_alloc->mem  = xdp_rxq->mem;
++ 	xdp_alloc->allocator = allocator;
++ 
++ 	/* Insert allocator into ID lookup table */
++ 	ptr = rhashtable_insert_slow(mem_id_ht, &id, &xdp_alloc->node);
++ 	if (IS_ERR(ptr)) {
++ 		errno = PTR_ERR(ptr);
++ 		goto err;
++ 	}
++ 
++ 	mutex_unlock(&mem_id_lock);
++ 
+++>>>>>>> 8d5d88527587 (xdp: rhashtable with allocator ID to pointer mapping)
+  	return 0;
++ err:
++ 	mutex_unlock(&mem_id_lock);
++ 	kfree(xdp_alloc);
++ 	return errno;
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
++ 
++ void xdp_return_frame(void *data, struct xdp_mem_info *mem)
++ {
++ 	if (mem->type == MEM_TYPE_PAGE_SHARED) {
++ 		page_frag_free(data);
++ 		return;
++ 	}
++ 
++ 	if (mem->type == MEM_TYPE_PAGE_ORDER0) {
++ 		struct page *page = virt_to_page(data); /* Assumes order0 page*/
++ 
++ 		put_page(page);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(xdp_return_frame);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 3bced659a341..812f4f78ba29 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -6292,7 +6292,7 @@ int ixgbe_setup_rx_resources(struct ixgbe_adapter *adapter,
+ 	struct device *dev = rx_ring->dev;
+ 	int orig_node = dev_to_node(dev);
+ 	int ring_node = -1;
+-	int size;
++	int size, err;
+ 
+ 	size = sizeof(struct ixgbe_rx_buffer) * rx_ring->count;
+ 
+@@ -6329,6 +6329,13 @@ int ixgbe_setup_rx_resources(struct ixgbe_adapter *adapter,
+ 			     rx_ring->queue_index) < 0)
+ 		goto err;
+ 
++	err = xdp_rxq_info_reg_mem_model(&rx_ring->xdp_rxq,
++					 MEM_TYPE_PAGE_SHARED, NULL);
++	if (err) {
++		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
++		goto err;
++	}
++
+ 	rx_ring->xdp_prog = adapter->xdp_prog;
+ 
+ 	return 0;
+* Unmerged path drivers/net/tun.c
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path include/net/xdp.h
+* Unmerged path net/core/xdp.c
