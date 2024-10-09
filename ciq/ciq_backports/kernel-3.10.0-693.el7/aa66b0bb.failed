@@ -1,0 +1,124 @@
+btrfs: fix memory leak of fs_info in block group cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Kinglong Mee <kinglongmee@gmail.com>
+commit aa66b0bb08869d93492bd817d2eae694ca743a3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aa66b0bb.failed
+
+When starting up linux with btrfs filesystem, I got many memory leak
+messages by kmemleak as,
+
+unreferenced object 0xffff880066882000 (size 4096):
+  comm "modprobe", pid 730, jiffies 4294690024 (age 196.599s)
+  hex dump (first 32 bytes):
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  backtrace:
+    [<ffffffff8174d52e>] kmemleak_alloc+0x4e/0xb0
+    [<ffffffff811d09aa>] kmem_cache_alloc_trace+0xea/0x1e0
+    [<ffffffffa03620fb>] btrfs_alloc_dummy_fs_info+0x6b/0x2a0 [btrfs]
+    [<ffffffffa03624fc>] btrfs_alloc_dummy_block_group+0x5c/0x120 [btrfs]
+    [<ffffffffa0360aa9>] btrfs_test_free_space_cache+0x39/0xed0 [btrfs]
+    [<ffffffffa03b5a74>] trace_raw_output_xfs_attr_class+0x54/0xe0 [xfs]
+    [<ffffffff81002122>] do_one_initcall+0xb2/0x1f0
+    [<ffffffff811765aa>] do_init_module+0x5e/0x1e9
+    [<ffffffff810fec09>] load_module+0x20a9/0x2690
+    [<ffffffff810ff439>] SyS_finit_module+0xb9/0xf0
+    [<ffffffff81757daf>] entry_SYSCALL_64_fastpath+0x12/0x76
+    [<ffffffffffffffff>] 0xffffffffffffffff
+unreferenced object 0xffff8800573f8000 (size 10256):
+  comm "modprobe", pid 730, jiffies 4294690185 (age 196.460s)
+  hex dump (first 32 bytes):
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  backtrace:
+    [<ffffffff8174d52e>] kmemleak_alloc+0x4e/0xb0
+    [<ffffffff8119ca6e>] kmalloc_order+0x5e/0x70
+    [<ffffffff8119caa4>] kmalloc_order_trace+0x24/0x90
+    [<ffffffffa03620b3>] btrfs_alloc_dummy_fs_info+0x23/0x2a0 [btrfs]
+    [<ffffffffa03624fc>] btrfs_alloc_dummy_block_group+0x5c/0x120 [btrfs]
+    [<ffffffffa036603d>] run_test+0xfd/0x320 [btrfs]
+    [<ffffffffa0366f34>] btrfs_test_free_space_tree+0x94/0xee [btrfs]
+    [<ffffffffa03b5aab>] trace_raw_output_xfs_attr_class+0x8b/0xe0 [xfs]
+    [<ffffffff81002122>] do_one_initcall+0xb2/0x1f0
+    [<ffffffff811765aa>] do_init_module+0x5e/0x1e9
+    [<ffffffff810fec09>] load_module+0x20a9/0x2690
+    [<ffffffff810ff439>] SyS_finit_module+0xb9/0xf0
+    [<ffffffff81757daf>] entry_SYSCALL_64_fastpath+0x12/0x76
+    [<ffffffffffffffff>] 0xffffffffffffffff
+
+This patch lets btrfs using fs_info stored in btrfs_root for
+block group cache directly without allocating a new one.
+
+Fixes: d0bd456074 ("Btrfs: add fragment=* debug mount option")
+	Signed-off-by: Kinglong Mee <kinglongmee@gmail.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit aa66b0bb08869d93492bd817d2eae694ca743a3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/tests/btrfs-tests.c
+#	fs/btrfs/tests/free-space-tree-tests.c
+diff --cc fs/btrfs/tests/btrfs-tests.c
+index 9626252ee6b4,d39f714dabeb..000000000000
+--- a/fs/btrfs/tests/btrfs-tests.c
++++ b/fs/btrfs/tests/btrfs-tests.c
+@@@ -169,3 -175,49 +169,52 @@@ void btrfs_free_dummy_root(struct btrfs
+  	kfree(root);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct btrfs_block_group_cache *
++ btrfs_alloc_dummy_block_group(unsigned long length)
++ {
++ 	struct btrfs_block_group_cache *cache;
++ 
++ 	cache = kzalloc(sizeof(*cache), GFP_KERNEL);
++ 	if (!cache)
++ 		return NULL;
++ 	cache->free_space_ctl = kzalloc(sizeof(*cache->free_space_ctl),
++ 					GFP_KERNEL);
++ 	if (!cache->free_space_ctl) {
++ 		kfree(cache);
++ 		return NULL;
++ 	}
++ 
++ 	cache->key.objectid = 0;
++ 	cache->key.offset = length;
++ 	cache->key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
++ 	cache->sectorsize = 4096;
++ 	cache->full_stripe_len = 4096;
++ 
++ 	INIT_LIST_HEAD(&cache->list);
++ 	INIT_LIST_HEAD(&cache->cluster_list);
++ 	INIT_LIST_HEAD(&cache->bg_list);
++ 	btrfs_init_free_space_ctl(cache);
++ 	mutex_init(&cache->free_space_lock);
++ 
++ 	return cache;
++ }
++ 
++ void btrfs_free_dummy_block_group(struct btrfs_block_group_cache *cache)
++ {
++ 	if (!cache)
++ 		return;
++ 	__btrfs_remove_free_space_cache(cache->free_space_ctl);
++ 	kfree(cache->free_space_ctl);
++ 	kfree(cache);
++ }
++ 
++ void btrfs_init_dummy_trans(struct btrfs_trans_handle *trans)
++ {
++ 	memset(trans, 0, sizeof(*trans));
++ 	trans->transid = 1;
++ 	INIT_LIST_HEAD(&trans->qgroup_ref_list);
++ 	trans->type = __TRANS_DUMMY;
++ }
+++>>>>>>> aa66b0bb0886 (btrfs: fix memory leak of fs_info in block group cache)
+* Unmerged path fs/btrfs/tests/free-space-tree-tests.c
+* Unmerged path fs/btrfs/tests/btrfs-tests.c
+* Unmerged path fs/btrfs/tests/free-space-tree-tests.c
