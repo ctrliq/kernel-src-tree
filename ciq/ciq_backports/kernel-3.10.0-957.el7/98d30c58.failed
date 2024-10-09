@@ -1,0 +1,227 @@
+md: raid1: don't use bio's vec table to manage resync pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid1: don't use bio's vec table to manage resync pages (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 96.49%
+commit-author Ming Lei <tom.leiming@gmail.com>
+commit 98d30c5812c343c970b5997369b4f6b197c29b3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/98d30c58.failed
+
+Now we allocate one page array for managing resync pages, instead
+of using bio's vec table to do that, and the old way is very hacky
+and won't work any more if multipage bvec is enabled.
+
+The introduced cost is that we need to allocate (128 + 16) * raid_disks
+bytes per r1_bio, and it is fine because the inflight r1_bio for
+resync shouldn't be much, as pointed by Shaohua.
+
+Also the bio_reset() in raid1_sync_request() is removed because
+all bios are freshly new now and not necessary to reset any more.
+
+This patch can be thought as a cleanup too
+
+	Suggested-by: Shaohua Li <shli@kernel.org>
+	Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 98d30c5812c343c970b5997369b4f6b197c29b3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+diff --cc drivers/md/raid1.c
+index adeb56feeb3d,89a384bdae29..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -75,6 -78,27 +75,30 @@@ static int max_queued_requests = 1024
+  static void allow_barrier(struct r1conf *conf, sector_t sector_nr);
+  static void lower_barrier(struct r1conf *conf, sector_t sector_nr);
+  
+++<<<<<<< HEAD
+++=======
++ #define raid1_log(md, fmt, args...)				\
++ 	do { if ((md)->queue) blk_add_trace_msg((md)->queue, "raid1 " fmt, ##args); } while (0)
++ 
++ /*
++  * 'strct resync_pages' stores actual pages used for doing the resync
++  *  IO, and it is per-bio, so make .bi_private points to it.
++  */
++ static inline struct resync_pages *get_resync_pages(struct bio *bio)
++ {
++ 	return bio->bi_private;
++ }
++ 
++ /*
++  * for resync bio, r1bio pointer can be retrieved from the per-bio
++  * 'struct resync_pages'.
++  */
++ static inline struct r1bio *get_resync_r1bio(struct bio *bio)
++ {
++ 	return get_resync_pages(bio)->raid_bio;
++ }
++ 
+++>>>>>>> 98d30c5812c3 (md: raid1: don't use bio's vec table to manage resync pages)
+  static void * r1bio_pool_alloc(gfp_t gfp_flags, void *data)
+  {
+  	struct pool_info *pi = data;
+@@@ -150,12 -180,8 +180,17 @@@ static void * r1buf_pool_alloc(gfp_t gf
+  	return r1_bio;
+  
+  out_free_pages:
+++<<<<<<< HEAD
+ +	while (--j >= 0) {
+ +		struct bio_vec *bv;
+ +
+ +		bio_for_each_segment_all(bv, r1_bio->bios[j], i)
+ +			__free_page(bv->bv_page);
+ +	}
+++=======
++ 	while (--j >= 0)
++ 		resync_free_pages(&rps[j]);
+++>>>>>>> 98d30c5812c3 (md: raid1: don't use bio's vec table to manage resync pages)
+  
+  out_free_bio:
+  	while (++j < pi->raid_disks)
+@@@ -1810,9 -1873,9 +1852,9 @@@ abort
+  	return err;
+  }
+  
+ -static void end_sync_read(struct bio *bio)
+ +static void end_sync_read(struct bio *bio, int error)
+  {
+- 	struct r1bio *r1_bio = bio->bi_private;
++ 	struct r1bio *r1_bio = get_resync_r1bio(bio);
+  
+  	update_head_pos(r1_bio->read_disk, r1_bio);
+  
+@@@ -1828,10 -1891,10 +1870,15 @@@
+  		reschedule_retry(r1_bio);
+  }
+  
+ -static void end_sync_write(struct bio *bio)
+ +static void end_sync_write(struct bio *bio, int error)
+  {
+++<<<<<<< HEAD
+ +	int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+ +	struct r1bio *r1_bio = bio->bi_private;
+++=======
++ 	int uptodate = !bio->bi_error;
++ 	struct r1bio *r1_bio = get_resync_r1bio(bio);
+++>>>>>>> 98d30c5812c3 (md: raid1: don't use bio's vec table to manage resync pages)
+  	struct mddev *mddev = r1_bio->mddev;
+  	struct r1conf *conf = mddev->private;
+  	sector_t first_bad;
+@@@ -2046,24 -2109,25 +2093,26 @@@ static void process_checks(struct r1bi
+  	for (i = 0; i < conf->raid_disks * 2; i++) {
+  		int j;
+  		int size;
+ -		int error;
+ +		int uptodate;
+  		struct bio *b = r1_bio->bios[i];
++ 		struct resync_pages *rp = get_resync_pages(b);
+  		if (b->bi_end_io != end_sync_read)
+  			continue;
+ -		/* fixup the bio for reuse, but preserve errno */
+ -		error = b->bi_error;
+ +		/* fixup the bio for reuse, but preserve BIO_UPTODATE */
+ +		uptodate = test_bit(BIO_UPTODATE, &b->bi_flags);
+  		bio_reset(b);
+ -		b->bi_error = error;
+ +		if (!uptodate)
+ +			clear_bit(BIO_UPTODATE, &b->bi_flags);
+  		b->bi_vcnt = vcnt;
+ -		b->bi_iter.bi_size = r1_bio->sectors << 9;
+ -		b->bi_iter.bi_sector = r1_bio->sector +
+ +		b->bi_size = r1_bio->sectors << 9;
+ +		b->bi_sector = r1_bio->sector +
+  			conf->mirrors[i].rdev->data_offset;
+  		b->bi_bdev = conf->mirrors[i].rdev->bdev;
+  		b->bi_end_io = end_sync_read;
+- 		b->bi_private = r1_bio;
++ 		rp->raid_bio = r1_bio;
++ 		b->bi_private = rp;
+  
+ -		size = b->bi_iter.bi_size;
+ +		size = b->bi_size;
+  		for (j = 0; j < vcnt ; j++) {
+  			struct bio_vec *bi;
+  			bi = &b->bi_io_vec[j];
+@@@ -2746,11 -2832,10 +2794,10 @@@ static sector_t raid1_sync_request(stru
+  		}
+  		if (bio->bi_end_io) {
+  			atomic_inc(&rdev->nr_pending);
+ -			bio->bi_iter.bi_sector = sector_nr + rdev->data_offset;
+ +			bio->bi_sector = sector_nr + rdev->data_offset;
+  			bio->bi_bdev = rdev->bdev;
+- 			bio->bi_private = r1_bio;
+  			if (test_bit(FailFast, &rdev->flags))
+ -				bio->bi_opf |= MD_FAILFAST;
+ +				bio->bi_rw |= MD_FAILFAST;
+  		}
+  	}
+  	rcu_read_unlock();
+@@@ -2834,33 -2919,37 +2881,51 @@@
+  		}
+  
+  		for (i = 0 ; i < conf->raid_disks * 2; i++) {
++ 			struct resync_pages *rp;
++ 
+  			bio = r1_bio->bios[i];
++ 			rp = get_resync_pages(bio);
+  			if (bio->bi_end_io) {
+++<<<<<<< HEAD
+ +				page = bio->bi_io_vec[bio->bi_vcnt].bv_page;
+ +				if (bio_add_page(bio, page, len, 0) == 0) {
+ +					/* stop here */
+ +					bio->bi_io_vec[bio->bi_vcnt].bv_page = page;
+ +					while (i > 0) {
+ +						i--;
+ +						bio = r1_bio->bios[i];
+ +						if (bio->bi_end_io==NULL)
+ +							continue;
+ +						/* remove last page from this bio */
+ +						bio->bi_vcnt--;
+ +						bio->bi_size -= len;
+ +						__clear_bit(BIO_SEG_VALID, &bio->bi_flags);
+ +					}
+ +					goto bio_full;
+ +				}
+++=======
++ 				page = resync_fetch_page(rp, rp->idx++);
++ 
++ 				/*
++ 				 * won't fail because the vec table is big
++ 				 * enough to hold all these pages
++ 				 */
++ 				bio_add_page(bio, page, len, 0);
+++>>>>>>> 98d30c5812c3 (md: raid1: don't use bio's vec table to manage resync pages)
+  			}
+  		}
+  		nr_sectors += len>>9;
+  		sector_nr += len>>9;
+  		sync_blocks -= (len>>9);
+++<<<<<<< HEAD
+ +	} while (r1_bio->bios[disk]->bi_vcnt < RESYNC_PAGES);
+ + bio_full:
+++=======
++ 	} while (get_resync_pages(r1_bio->bios[disk]->bi_private)->idx < RESYNC_PAGES);
++ 
+++>>>>>>> 98d30c5812c3 (md: raid1: don't use bio's vec table to manage resync pages)
+  	r1_bio->sectors = nr_sectors;
+  
+ -	if (mddev_is_clustered(mddev) &&
+ -			conf->cluster_sync_high < sector_nr + nr_sectors) {
+ -		conf->cluster_sync_low = mddev->curr_resync_completed;
+ -		conf->cluster_sync_high = conf->cluster_sync_low + CLUSTER_RESYNC_WINDOW_SECTORS;
+ -		/* Send resync message */
+ -		md_cluster_ops->resync_info_update(mddev,
+ -				conf->cluster_sync_low,
+ -				conf->cluster_sync_high);
+ -	}
+ -
+  	/* For a user-requested sync, we read all readable devices and do a
+  	 * compare
+  	 */
+* Unmerged path drivers/md/raid1.c
