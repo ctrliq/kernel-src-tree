@@ -1,0 +1,122 @@
+nvme: ensure forward progress during Admin passthru
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [nvme] ensure forward progress during Admin passthru (David Milburn) [1642873 1642670 1641542]
+Rebuild_FUZZ: 93.75%
+commit-author Scott Bauer <scott.bauer@intel.com>
+commit cf39a6bc342b980f10f344d88035829638a89a48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cf39a6bc.failed
+
+If the controller supports effects and goes down during the passthru admin
+command we will deadlock during namespace revalidation.
+
+[  363.488275] INFO: task kworker/u16:5:231 blocked for more than 120 seconds.
+[  363.488290]       Not tainted 4.17.0+ #2
+[  363.488296] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  363.488303] kworker/u16:5   D    0   231      2 0x80000000
+[  363.488331] Workqueue: nvme-reset-wq nvme_reset_work [nvme]
+[  363.488338] Call Trace:
+[  363.488385]  schedule+0x75/0x190
+[  363.488396]  rwsem_down_read_failed+0x1c3/0x2f0
+[  363.488481]  call_rwsem_down_read_failed+0x14/0x30
+[  363.488504]  down_read+0x1d/0x80
+[  363.488523]  nvme_stop_queues+0x1e/0xa0 [nvme_core]
+[  363.488536]  nvme_dev_disable+0xae4/0x1620 [nvme]
+[  363.488614]  nvme_reset_work+0xd1e/0x49d9 [nvme]
+[  363.488911]  process_one_work+0x81a/0x1400
+[  363.488934]  worker_thread+0x87/0xe80
+[  363.488955]  kthread+0x2db/0x390
+[  363.488977]  ret_from_fork+0x35/0x40
+
+Fixes: 84fef62d135b6 ("nvme: check admin passthru command effects")
+	Signed-off-by: Scott Bauer <scott.bauer@intel.com>
+	Reviewed-by: Keith Busch <keith.busch@linux.intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit cf39a6bc342b980f10f344d88035829638a89a48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index dd00a2f39e02,e7668c4bb4dd..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -88,6 -98,24 +88,26 @@@ static struct class *nvme_class
+  
+  static void nvme_ns_remove(struct nvme_ns *ns);
+  static int nvme_revalidate_disk(struct gendisk *disk);
+++<<<<<<< HEAD
+++=======
++ static void nvme_put_subsystem(struct nvme_subsystem *subsys);
++ static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
++ 					   unsigned nsid);
++ 
++ static void nvme_set_queue_dying(struct nvme_ns *ns)
++ {
++ 	/*
++ 	 * Revalidating a dead namespace sets capacity to 0. This will end
++ 	 * buffered writers dirtying pages that can't be synced.
++ 	 */
++ 	if (!ns->disk || test_and_set_bit(NVME_NS_DEAD, &ns->flags))
++ 		return;
++ 	revalidate_disk(ns->disk);
++ 	blk_set_queue_dying(ns->queue);
++ 	/* Forcibly unquiesce queues to avoid blocking dispatch */
++ 	blk_mq_unquiesce_queue(ns->queue);
++ }
+++>>>>>>> cf39a6bc342b (nvme: ensure forward progress during Admin passthru)
+  
+  static void nvme_queue_scan(struct nvme_ctrl *ctrl)
+  {
+@@@ -2475,7 -3150,7 +2491,11 @@@ static void nvme_remove_invalid_namespa
+  
+  	down_write(&ctrl->namespaces_rwsem);
+  	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list) {
+++<<<<<<< HEAD
+ +		if (ns->ns_id > nsid)
+++=======
++ 		if (ns->head->ns_id > nsid || test_bit(NVME_NS_DEAD, &ns->flags))
+++>>>>>>> cf39a6bc342b (nvme: ensure forward progress during Admin passthru)
+  			list_move_tail(&ns->list, &rm_list);
+  	}
+  	up_write(&ctrl->namespaces_rwsem);
+@@@ -2873,27 -3550,13 +2893,33 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  
+  	down_read(&ctrl->namespaces_rwsem);
+  
+ -	/* Forcibly unquiesce queues to avoid blocking dispatch */
+ +	/* Forcibly start all queues to avoid having stuck requests */
+  	if (ctrl->admin_q)
+ -		blk_mq_unquiesce_queue(ctrl->admin_q);
+ +		blk_mq_start_hw_queues(ctrl->admin_q);
+ +
+++<<<<<<< HEAD
+ +	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ +		/*
+ +		 * Revalidating a dead namespace sets capacity to 0. This will
+ +		 * end buffered writers dirtying pages that can't be synced.
+ +		 */
+ +		if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ +			continue;
+ +		revalidate_disk(ns->disk);
+ +		blk_set_queue_dying(ns->queue);
+  
+ +		/*
+ +		 * Forcibly start all queues to avoid having stuck requests.
+ +		 * Note that we must ensure the queues are not stopped
+ +		 * when the final removal happens.
+ +		 */
+ +		blk_mq_start_hw_queues(ns->queue);
+ +	}
+++=======
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		nvme_set_queue_dying(ns);
++ 
+++>>>>>>> cf39a6bc342b (nvme: ensure forward progress during Admin passthru)
+  	up_read(&ctrl->namespaces_rwsem);
+  }
+  EXPORT_SYMBOL_GPL(nvme_kill_queues);
+* Unmerged path drivers/nvme/host/core.c
