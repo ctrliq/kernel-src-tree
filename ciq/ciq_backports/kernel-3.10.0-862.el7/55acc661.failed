@@ -1,0 +1,282 @@
+ovl: add flag for upper in ovl_entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 55acc6618259c8ff0a400a131f0f4b613e96010a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/55acc661.failed
+
+For rename, we need to ensure that an upper alias exists for hard links
+before attempting the operation.  Introduce a flag in ovl_entry to track
+the state of the upper alias.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 55acc6618259c8ff0a400a131f0f4b613e96010a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/copy_up.c
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/ovl_entry.h
+#	fs/overlayfs/super.c
+#	fs/overlayfs/util.c
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,58c06bd58a96..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -305,49 -398,84 +305,88 @@@ static int ovl_copy_up_locked(struct de
+  		put_cred(new_creds);
+  	}
+  
+ -	return err;
+ -
+ -temp_err:
+ -	err = PTR_ERR(temp);
+ -	goto out;
+ -}
+ -
+ -static int ovl_copy_up_inode(struct ovl_copy_up_ctx *c, struct dentry *temp)
+ -{
+ -	int err;
+ +	if (err)
+ +		goto out2;
+  
+ -	if (S_ISREG(c->stat.mode)) {
+ +	if (S_ISREG(stat->mode)) {
+  		struct path upperpath;
+  
+ -		ovl_path_upper(c->dentry, &upperpath);
+ +		ovl_path_upper(dentry, &upperpath);
+  		BUG_ON(upperpath.dentry != NULL);
+ -		upperpath.dentry = temp;
+ +		upperpath.dentry = newdentry;
+  
+ -		err = ovl_copy_up_data(&c->lowerpath, &upperpath, c->stat.size);
+ +		err = ovl_copy_up_data(lowerpath, &upperpath, stat->size);
+  		if (err)
+ -			return err;
+ +			goto out_cleanup;
+  	}
+  
+ -	err = ovl_copy_xattr(c->lowerpath.dentry, temp);
+ +	err = ovl_copy_xattr(lowerpath->dentry, newdentry);
+  	if (err)
+ -		return err;
+ +		goto out_cleanup;
+  
+ -	inode_lock(temp->d_inode);
+ -	err = ovl_set_attr(temp, &c->stat);
+ -	inode_unlock(temp->d_inode);
+ +	mutex_lock(&newdentry->d_inode->i_mutex);
+ +	err = ovl_set_attr(newdentry, stat);
+ +	mutex_unlock(&newdentry->d_inode->i_mutex);
+  	if (err)
+ -		return err;
+ +		goto out_cleanup;
+ +
+ +	err = ovl_do_rename(wdir, newdentry, udir, upper, 0);
+ +	if (err)
+ +		goto out_cleanup;
+ +
+ +	ovl_dentry_update(dentry, newdentry);
+ +	ovl_inode_update(d_inode(dentry), d_inode(newdentry));
+ +	newdentry = NULL;
+  
+  	/*
+ -	 * Store identifier of lower inode in upper inode xattr to
+ -	 * allow lookup of the copy up origin inode.
+ -	 *
+ -	 * Don't set origin when we are breaking the association with a lower
+ -	 * hard link.
+ +	 * Non-directores become opaque when copied up.
+  	 */
+++<<<<<<< HEAD
+ +	if (!S_ISDIR(stat->mode))
+ +		ovl_dentry_set_opaque(dentry, true);
+ +out2:
+ +	dput(upper);
+ +out1:
+ +	dput(newdentry);
+++=======
++ 	if (S_ISDIR(c->stat.mode) || c->stat.nlink == 1) {
++ 		err = ovl_set_origin(c->dentry, c->lowerpath.dentry, temp);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int ovl_copy_up_locked(struct ovl_copy_up_ctx *c)
++ {
++ 	struct inode *udir = c->upperdir->d_inode;
++ 	struct dentry *newdentry = NULL;
++ 	struct dentry *temp = NULL;
++ 	int err;
++ 
++ 	err = ovl_get_tmpfile(c, &temp);
++ 	if (err)
++ 		goto out;
++ 
++ 	err = ovl_copy_up_inode(c, temp);
++ 	if (err)
++ 		goto out_cleanup;
++ 
++ 	if (c->tmpfile) {
++ 		inode_lock_nested(udir, I_MUTEX_PARENT);
++ 		err = ovl_install_temp(c, temp, &newdentry);
++ 		inode_unlock(udir);
++ 	} else {
++ 		err = ovl_install_temp(c, temp, &newdentry);
++ 	}
++ 	if (err)
++ 		goto out_cleanup;
++ 
++ 	ovl_dentry_set_upper_alias(c->dentry);
++ 	ovl_inode_update(d_inode(c->dentry), newdentry);
+++>>>>>>> 55acc6618259 (ovl: add flag for upper in ovl_entry)
+  out:
+ -	dput(temp);
+  	return err;
+  
+  out_cleanup:
+diff --cc fs/overlayfs/dir.c
+index 709c8eb662f9,8b2b23181b19..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -160,12 -156,13 +160,16 @@@ static void ovl_instantiate(struct dent
+  			    struct dentry *newdentry, bool hardlink)
+  {
+  	ovl_dentry_version_inc(dentry->d_parent);
+++<<<<<<< HEAD
+ +	ovl_dentry_update(dentry, newdentry);
+++=======
++ 	ovl_dentry_set_upper_alias(dentry);
+++>>>>>>> 55acc6618259 (ovl: add flag for upper in ovl_entry)
+  	if (!hardlink) {
+ -		ovl_inode_update(inode, newdentry);
+ +		ovl_inode_update(inode, d_inode(newdentry));
+  		ovl_copyattr(newdentry->d_inode, inode);
+  	} else {
+ -		WARN_ON(ovl_inode_real(inode) != d_inode(newdentry));
+ -		dput(newdentry);
+ +		WARN_ON(ovl_inode_real(inode, NULL) != d_inode(newdentry));
+  		inc_nlink(inode);
+  	}
+  	d_instantiate(dentry, inode);
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,751b36a5c22f..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -151,27 -198,53 +151,70 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+ -struct inode *ovl_inode_upper(struct inode *inode);
+ -struct inode *ovl_inode_lower(struct inode *inode);
+ -struct inode *ovl_inode_real(struct inode *inode);
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper);
+  struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+  void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
+ +struct dentry *ovl_workdir(struct dentry *dentry);
+ +int ovl_want_write(struct dentry *dentry);
+ +void ovl_drop_write(struct dentry *dentry);
+  bool ovl_dentry_is_opaque(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ bool ovl_dentry_is_whiteout(struct dentry *dentry);
++ void ovl_dentry_set_opaque(struct dentry *dentry);
++ bool ovl_dentry_has_upper_alias(struct dentry *dentry);
++ void ovl_dentry_set_upper_alias(struct dentry *dentry);
++ bool ovl_redirect_dir(struct super_block *sb);
++ const char *ovl_dentry_get_redirect(struct dentry *dentry);
++ void ovl_dentry_set_redirect(struct dentry *dentry, const char *redirect);
++ void ovl_inode_init(struct inode *inode, struct dentry *upperdentry,
++ 		    struct dentry *lowerdentry);
++ void ovl_inode_update(struct inode *inode, struct dentry *upperdentry);
++ void ovl_dentry_version_inc(struct dentry *dentry);
++ u64 ovl_dentry_version_get(struct dentry *dentry);
++ bool ovl_is_whiteout(struct dentry *dentry);
++ struct file *ovl_path_open(struct path *path, int flags);
++ int ovl_copy_up_start(struct dentry *dentry);
++ void ovl_copy_up_end(struct dentry *dentry);
++ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name);
++ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
++ 		       const char *name, const void *value, size_t size,
++ 		       int xerr);
++ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry);
++ void ovl_set_flag(unsigned long flag, struct inode *inode);
++ bool ovl_test_flag(unsigned long flag, struct inode *inode);
++ bool ovl_inuse_trylock(struct dentry *dentry);
++ void ovl_inuse_unlock(struct dentry *dentry);
++ 
++ static inline bool ovl_is_impuredir(struct dentry *dentry)
++ {
++ 	return ovl_check_dir_xattr(dentry, OVL_XATTR_IMPURE);
++ }
++ 
++ 
++ /* namei.c */
++ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
++ 		      struct dentry *origin, bool is_upper, bool set);
++ int ovl_verify_index(struct dentry *index, struct path *lowerstack,
++ 		     unsigned int numlower);
++ int ovl_get_index_name(struct dentry *origin, struct qstr *name);
++ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
++ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+++>>>>>>> 55acc6618259 (ovl: add flag for upper in ovl_entry)
+  bool ovl_lower_positive(struct dentry *dentry);
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry);
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
+ +bool ovl_is_whiteout(struct dentry *dentry);
+ +const struct cred *ovl_override_creds(struct super_block *sb);
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags);
+ +struct file *ovl_path_open(struct path *path, int flags);
+ +
+ +struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
+ +				struct kstat *stat, const char *link);
+  
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+diff --cc fs/overlayfs/super.c
+index aaf06952d88f,f29ee08cf99f..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -1465,10 -1115,14 +1465,18 @@@ static int ovl_fill_super(struct super_
+  	mntput(upperpath.mnt);
+  	for (i = 0; i < numlower; i++)
+  		mntput(stack[i].mnt);
+ -	mntput(workpath.mnt);
+ +	path_put(&workpath);
+  	kfree(lowertmp);
+  
+++<<<<<<< HEAD
+ +	oe->__upperdentry = upperpath.dentry;
+++=======
++ 	if (upperpath.dentry) {
++ 		oe->has_upper = true;
++ 		if (ovl_is_impuredir(upperpath.dentry))
++ 			ovl_set_flag(OVL_IMPURE, d_inode(root_dentry));
++ 	}
+++>>>>>>> 55acc6618259 (ovl: add flag for upper in ovl_entry)
+  	for (i = 0; i < numlower; i++) {
+  		oe->lowerstack[i].dentry = stack[i].dentry;
+  		oe->lowerstack[i].mnt = ufs->lower_mnt[i];
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/util.c
+* Unmerged path fs/overlayfs/copy_up.c
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/super.c
+* Unmerged path fs/overlayfs/util.c
