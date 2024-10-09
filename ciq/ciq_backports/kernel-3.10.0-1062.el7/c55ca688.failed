@@ -1,0 +1,147 @@
+nfp: don't depend on eth_tbl being available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit c55ca688ed99a9cb79367aee2ed2ff6cb80fc039
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c55ca688.failed
+
+For very very old generation of the management FW Ethernet port
+information table may theoretically not be available.  This in
+turn will cause the nfp_port structures to not be allocated.
+
+Make sure we don't crash the kernel when there is no eth_tbl:
+
+RIP: 0010:nfp_net_pci_probe+0xf2/0xb40 [nfp]
+...
+Call Trace:
+  nfp_pci_probe+0x6de/0xab0 [nfp]
+  local_pci_probe+0x47/0xa0
+  work_for_cpu_fn+0x1a/0x30
+  process_one_work+0x1de/0x3e0
+
+Found while working with broken/development version of management FW.
+
+Fixes: a5950182c00e ("nfp: map mac_stats and vf_cfg BARs")
+Fixes: 93da7d9660ee ("nfp: provide nfp_port to of nfp_net_get_mac_addr()")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c55ca688ed99a9cb79367aee2ed2ff6cb80fc039)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 793245ae45dc,42211083b51f..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -161,7 -168,12 +161,16 @@@ extern const struct devlink_ops nfp_dev
+  int nfp_net_pci_probe(struct nfp_pf *pf);
+  void nfp_net_pci_remove(struct nfp_pf *pf);
+  
+++<<<<<<< HEAD
+ +void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port);
+++=======
++ int nfp_hwmon_register(struct nfp_pf *pf);
++ void nfp_hwmon_unregister(struct nfp_pf *pf);
++ 
++ void
++ nfp_net_get_mac_addr(struct nfp_pf *pf, struct net_device *netdev,
++ 		     struct nfp_port *port);
+++>>>>>>> c55ca688ed99 (nfp: don't depend on eth_tbl being available)
+  
+  bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index 4e1dbb554af0..84e3b9f5abb1 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -358,7 +358,7 @@ nfp_flower_spawn_phy_reprs(struct nfp_app *app, struct nfp_flower_priv *priv)
+ 		}
+ 
+ 		SET_NETDEV_DEV(repr, &priv->nn->pdev->dev);
+-		nfp_net_get_mac_addr(app->pf, port);
++		nfp_net_get_mac_addr(app->pf, repr, port);
+ 
+ 		cmsg_port_id = nfp_flower_cmsg_phys_port(phys_port);
+ 		err = nfp_repr_init(app, repr,
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app_nic.c b/drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
+index 2a2f2fbc8850..b9618c37403f 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
+@@ -69,7 +69,7 @@ int nfp_app_nic_vnic_alloc(struct nfp_app *app, struct nfp_net *nn,
+ 	if (err)
+ 		return err < 0 ? err : 0;
+ 
+-	nfp_net_get_mac_addr(app->pf, nn->port);
++	nfp_net_get_mac_addr(app->pf, nn->dp.netdev, nn->port);
+ 
+ 	return 0;
+ }
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 15fa47f622aa..45cd2092e498 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -67,23 +67,26 @@
+ /**
+  * nfp_net_get_mac_addr() - Get the MAC address.
+  * @pf:       NFP PF handle
++ * @netdev:   net_device to set MAC address on
+  * @port:     NFP port structure
+  *
+  * First try to get the MAC address from NSP ETH table. If that
+  * fails generate a random address.
+  */
+-void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port)
++void
++nfp_net_get_mac_addr(struct nfp_pf *pf, struct net_device *netdev,
++		     struct nfp_port *port)
+ {
+ 	struct nfp_eth_table_port *eth_port;
+ 
+ 	eth_port = __nfp_port_get_eth_port(port);
+ 	if (!eth_port) {
+-		eth_hw_addr_random(port->netdev);
++		eth_hw_addr_random(netdev);
+ 		return;
+ 	}
+ 
+-	ether_addr_copy(port->netdev->dev_addr, eth_port->mac_addr);
+-	ether_addr_copy(port->netdev->perm_addr, eth_port->mac_addr);
++	ether_addr_copy(netdev->dev_addr, eth_port->mac_addr);
++	ether_addr_copy(netdev->perm_addr, eth_port->mac_addr);
+ }
+ 
+ static struct nfp_eth_table_port *
+@@ -511,16 +514,18 @@ static int nfp_net_pci_map_mem(struct nfp_pf *pf)
+ 		return PTR_ERR(mem);
+ 	}
+ 
+-	min_size =  NFP_MAC_STATS_SIZE * (pf->eth_tbl->max_index + 1);
+-	pf->mac_stats_mem = nfp_rtsym_map(pf->rtbl, "_mac_stats",
+-					  "net.macstats", min_size,
+-					  &pf->mac_stats_bar);
+-	if (IS_ERR(pf->mac_stats_mem)) {
+-		if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
+-			err = PTR_ERR(pf->mac_stats_mem);
+-			goto err_unmap_ctrl;
++	if (pf->eth_tbl) {
++		min_size =  NFP_MAC_STATS_SIZE * (pf->eth_tbl->max_index + 1);
++		pf->mac_stats_mem = nfp_rtsym_map(pf->rtbl, "_mac_stats",
++						  "net.macstats", min_size,
++						  &pf->mac_stats_bar);
++		if (IS_ERR(pf->mac_stats_mem)) {
++			if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
++				err = PTR_ERR(pf->mac_stats_mem);
++				goto err_unmap_ctrl;
++			}
++			pf->mac_stats_mem = NULL;
+ 		}
+-		pf->mac_stats_mem = NULL;
+ 	}
+ 
+ 	pf->vf_cfg_mem = nfp_net_pf_map_rtsym(pf, "net.vfcfg",
