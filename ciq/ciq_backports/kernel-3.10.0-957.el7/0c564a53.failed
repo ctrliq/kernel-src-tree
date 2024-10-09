@@ -1,0 +1,449 @@
+tracing: Add TRACE_DEFINE_ENUM() macro to map enums to their values
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Steven Rostedt (Red Hat) <rostedt@goodmis.org>
+commit 0c564a538aa934ad15b2145aaf8b64f3feb0be63
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0c564a53.failed
+
+Several tracepoints use the helper functions __print_symbolic() or
+__print_flags() and pass in enums that do the mapping between the
+binary data stored and the value to print. This works well for reading
+the ASCII trace files, but when the data is read via userspace tools
+such as perf and trace-cmd, the conversion of the binary value to a
+human string format is lost if an enum is used, as userspace does not
+have access to what the ENUM is.
+
+For example, the tracepoint trace_tlb_flush() has:
+
+ __print_symbolic(REC->reason,
+    { TLB_FLUSH_ON_TASK_SWITCH, "flush on task switch" },
+    { TLB_REMOTE_SHOOTDOWN, "remote shootdown" },
+    { TLB_LOCAL_SHOOTDOWN, "local shootdown" },
+    { TLB_LOCAL_MM_SHOOTDOWN, "local mm shootdown" })
+
+Which maps the enum values to the strings they represent. But perf and
+trace-cmd do no know what value TLB_LOCAL_MM_SHOOTDOWN is, and would
+not be able to map it.
+
+With TRACE_DEFINE_ENUM(), developers can place these in the event header
+files and ftrace will convert the enums to their values:
+
+By adding:
+
+ TRACE_DEFINE_ENUM(TLB_FLUSH_ON_TASK_SWITCH);
+ TRACE_DEFINE_ENUM(TLB_REMOTE_SHOOTDOWN);
+ TRACE_DEFINE_ENUM(TLB_LOCAL_SHOOTDOWN);
+ TRACE_DEFINE_ENUM(TLB_LOCAL_MM_SHOOTDOWN);
+
+ $ cat /sys/kernel/debug/tracing/events/tlb/tlb_flush/format
+[...]
+ __print_symbolic(REC->reason,
+    { 0, "flush on task switch" },
+    { 1, "remote shootdown" },
+    { 2, "local shootdown" },
+    { 3, "local mm shootdown" })
+
+The above is what userspace expects to see, and tools do not need to
+be modified to parse them.
+
+Link: http://lkml.kernel.org/r/20150403013802.220157513@goodmis.org
+
+	Cc: Guilherme Cox <cox@computer.org>
+	Cc: Tony Luck <tony.luck@gmail.com>
+	Cc: Xie XiuQi <xiexiuqi@huawei.com>
+	Acked-by: Namhyung Kim <namhyung@kernel.org>
+	Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Tested-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit 0c564a538aa934ad15b2145aaf8b64f3feb0be63)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/tracepoint.h
+#	kernel/trace/trace.c
+#	kernel/trace/trace.h
+diff --cc include/linux/tracepoint.h
+index a70c0e486b1a,a5f7f3ecafa3..000000000000
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@@ -35,24 -36,19 +35,33 @@@ struct tracepoint 
+  	struct tracepoint_func __rcu *funcs;
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * Connect a probe to a tracepoint.
+ + * Internal API, should not be used directly.
+ + */
+ +extern int tracepoint_probe_register(const char *name, void *probe, void *data);
+ +
+ +/*
+ + * Disconnect a probe from a tracepoint.
+ + * Internal API, should not be used directly.
+ + */
+++=======
++ struct trace_enum_map {
++ 	const char		*system;
++ 	const char		*enum_string;
++ 	unsigned long		enum_value;
++ };
++ 
+++>>>>>>> 0c564a538aa9 (tracing: Add TRACE_DEFINE_ENUM() macro to map enums to their values)
+  extern int
+ -tracepoint_probe_register(struct tracepoint *tp, void *probe, void *data);
+ -extern int
+ -tracepoint_probe_unregister(struct tracepoint *tp, void *probe, void *data);
+ -extern void
+ -for_each_kernel_tracepoint(void (*fct)(struct tracepoint *tp, void *priv),
+ -		void *priv);
+ +tracepoint_probe_unregister(const char *name, void *probe, void *data);
+ +
+ +extern int tracepoint_probe_register_noupdate(const char *name, void *probe,
+ +					      void *data);
+ +extern int tracepoint_probe_unregister_noupdate(const char *name, void *probe,
+ +						void *data);
+ +extern void tracepoint_probe_update_all(void);
+  
+  #ifdef CONFIG_MODULES
+  struct tp_module {
+@@@ -90,8 -86,15 +99,10 @@@ static inline void tracepoint_synchroni
+  	synchronize_sched();
+  }
+  
+ -#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+ -extern void syscall_regfunc(void);
+ -extern void syscall_unregfunc(void);
+ -#endif /* CONFIG_HAVE_SYSCALL_TRACEPOINTS */
+ -
+  #define PARAMS(args...) args
+  
++ #define TRACE_DEFINE_ENUM(x)
++ 
+  #endif /* _LINUX_TRACEPOINT_H */
+  
+  /*
+diff --cc kernel/trace/trace.c
+index 76ffa906d42f,ebf49649534c..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -6388,6 -6529,41 +6402,44 @@@ init_tracer_debugfs(struct trace_array 
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * tracing_init_dentry - initialize top level trace array
++  *
++  * This is called when creating files or directories in the tracing
++  * directory. It is called via fs_initcall() by any of the boot up code
++  * and expects to return the dentry of the top level tracing directory.
++  */
++ struct dentry *tracing_init_dentry(void)
++ {
++ 	struct trace_array *tr = &global_trace;
++ 
++ 	if (tr->dir)
++ 		return tr->dir;
++ 
++ 	if (WARN_ON(!debugfs_initialized()))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	tr->dir = debugfs_create_dir("tracing", NULL);
++ 
++ 	if (!tr->dir) {
++ 		pr_warn_once("Could not create debugfs directory 'tracing'\n");
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	return tr->dir;
++ }
++ 
++ extern struct trace_enum_map *__start_ftrace_enum_maps[];
++ extern struct trace_enum_map *__stop_ftrace_enum_maps[];
++ 
++ static void __init trace_enum_init(void)
++ {
++ 	trace_insert_enum_map(__start_ftrace_enum_maps, __stop_ftrace_enum_maps);
++ }
++ 
+++>>>>>>> 0c564a538aa9 (tracing: Add TRACE_DEFINE_ENUM() macro to map enums to their values)
+  static __init int tracer_init_debugfs(void)
+  {
+  	struct dentry *d_tracer;
+@@@ -6697,6 -6903,18 +6751,21 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void __init trace_init(void)
++ {
++ 	if (tracepoint_printk) {
++ 		tracepoint_print_iter =
++ 			kmalloc(sizeof(*tracepoint_print_iter), GFP_KERNEL);
++ 		if (WARN_ON(!tracepoint_print_iter))
++ 			tracepoint_printk = 0;
++ 	}
++ 	tracer_alloc_buffers();
++ 	trace_event_init();
++ }
++ 
+++>>>>>>> 0c564a538aa9 (tracing: Add TRACE_DEFINE_ENUM() macro to map enums to their values)
+  __init static int clear_boot_tracer(void)
+  {
+  	/*
+diff --cc kernel/trace/trace.h
+index 4d4d21b84af4,b48d4b08f691..000000000000
+--- a/kernel/trace/trace.h
++++ b/kernel/trace/trace.h
+@@@ -1076,4 -1301,20 +1076,23 @@@ int perf_ftrace_event_register(struct f
+  #define perf_ftrace_event_register NULL
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FTRACE_SYSCALLS
++ void init_ftrace_syscalls(void);
++ #else
++ static inline void init_ftrace_syscalls(void) { }
++ #endif
++ 
++ #ifdef CONFIG_EVENT_TRACING
++ void trace_event_init(void);
++ void trace_event_enum_update(struct trace_enum_map **map, int len);
++ #else
++ static inline void __init trace_event_init(void) { }
++ static inlin void trace_event_enum_update(struct trace_enum_map **map, int len) { }
++ #endif
++ 
++ extern struct trace_iterator *tracepoint_print_iter;
++ 
+++>>>>>>> 0c564a538aa9 (tracing: Add TRACE_DEFINE_ENUM() macro to map enums to their values)
+  #endif /* _LINUX_KERNEL_TRACE_H */
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 26d63191e7fa..03fdd91890f1 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -113,7 +113,10 @@
+ #define FTRACE_EVENTS()	. = ALIGN(8);					\
+ 			VMLINUX_SYMBOL(__start_ftrace_events) = .;	\
+ 			*(_ftrace_events)				\
+-			VMLINUX_SYMBOL(__stop_ftrace_events) = .;
++			VMLINUX_SYMBOL(__stop_ftrace_events) = .;	\
++			VMLINUX_SYMBOL(__start_ftrace_enum_maps) = .;	\
++			*(_ftrace_enum_map)				\
++			VMLINUX_SYMBOL(__stop_ftrace_enum_maps) = .;
+ #else
+ #define FTRACE_EVENTS()
+ #endif
+diff --git a/include/linux/ftrace_event.h b/include/linux/ftrace_event.h
+index 5be378c489c1..e837f7a23732 100644
+--- a/include/linux/ftrace_event.h
++++ b/include/linux/ftrace_event.h
+@@ -248,7 +248,7 @@ struct ftrace_event_call {
+ 	struct ftrace_event_class *class;
+ 	char			*name;
+ 	struct trace_event	event;
+-	const char		*print_fmt;
++	char			*print_fmt;
+ 	struct event_filter	*filter;
+ 	struct list_head	*files;
+ 	void			*mod;
+* Unmerged path include/linux/tracepoint.h
+diff --git a/include/trace/ftrace.h b/include/trace/ftrace.h
+index 0941f9f66227..9ae9840a1016 100644
+--- a/include/trace/ftrace.h
++++ b/include/trace/ftrace.h
+@@ -33,6 +33,19 @@
+ 
+ TRACE_MAKE_SYSTEM_STR();
+ 
++#undef TRACE_DEFINE_ENUM
++#define TRACE_DEFINE_ENUM(a)				\
++	static struct trace_enum_map __used __initdata	\
++	__##TRACE_SYSTEM##_##a =			\
++	{						\
++		.system = TRACE_SYSTEM_STRING,		\
++		.enum_string = #a,			\
++		.enum_value = a				\
++	};						\
++	static struct trace_enum_map __used		\
++	__attribute__((section("_ftrace_enum_map")))	\
++	*TRACE_SYSTEM##_##a = &__##TRACE_SYSTEM##_##a
++
+ /*
+  * DECLARE_EVENT_CLASS can be used to add a generic function
+  * handlers for events. That is, if all events have the same
+@@ -129,6 +142,9 @@ TRACE_MAKE_SYSTEM_STR();
+  * The size of an array is also encoded, in the higher 16 bits of <item>.
+  */
+ 
++#undef TRACE_DEFINE_ENUM
++#define TRACE_DEFINE_ENUM(a)
++
+ #undef __field
+ #define __field(type, item)
+ 
+@@ -501,7 +517,7 @@ static inline notrace int ftrace_get_offsets_##call(			\
+  *	.trace			= ftrace_raw_output_<call>, <-- stage 2
+  * };
+  *
+- * static const char print_fmt_<call>[] = <TP_printk>;
++ * static char print_fmt_<call>[] = <TP_printk>;
+  *
+  * static struct ftrace_event_class __used event_class_<template> = {
+  *	.system			= "<system>",
+@@ -643,7 +659,7 @@ static inline void ftrace_test_probe_##call(void)			\
+ #undef DECLARE_EVENT_CLASS
+ #define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
+ _TRACE_PERF_PROTO(call, PARAMS(proto));					\
+-static const char print_fmt_##call[] = print;				\
++static char print_fmt_##call[] = print;					\
+ static struct ftrace_event_class __used __refdata event_class_##call = { \
+ 	.system			= TRACE_SYSTEM_STRING,			\
+ 	.define_fields		= ftrace_define_fields_##call,		\
+@@ -669,7 +685,7 @@ __attribute__((section("_ftrace_events"))) *__event_##call = &event_##call
+ #undef DEFINE_EVENT_PRINT
+ #define DEFINE_EVENT_PRINT(template, call, proto, args, print)		\
+ 									\
+-static const char print_fmt_##call[] = print;				\
++static char print_fmt_##call[] = print;					\
+ 									\
+ static struct ftrace_event_call __used event_##call = {			\
+ 	.name			= #call,				\
+* Unmerged path kernel/trace/trace.c
+* Unmerged path kernel/trace/trace.h
+diff --git a/kernel/trace/trace_events.c b/kernel/trace/trace_events.c
+index 066ceef073dc..c0e9eb201e1f 100644
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -1669,6 +1669,125 @@ __register_event(struct ftrace_event_call *call, struct module *mod)
+ 	return 0;
+ }
+ 
++static char *enum_replace(char *ptr, struct trace_enum_map *map, int len)
++{
++	int rlen;
++	int elen;
++
++	/* Find the length of the enum value as a string */
++	elen = snprintf(ptr, 0, "%ld", map->enum_value);
++	/* Make sure there's enough room to replace the string with the value */
++	if (len < elen)
++		return NULL;
++
++	snprintf(ptr, elen + 1, "%ld", map->enum_value);
++
++	/* Get the rest of the string of ptr */
++	rlen = strlen(ptr + len);
++	memmove(ptr + elen, ptr + len, rlen);
++	/* Make sure we end the new string */
++	ptr[elen + rlen] = 0;
++
++	return ptr + elen;
++}
++
++static void update_event_printk(struct ftrace_event_call *call,
++				struct trace_enum_map *map)
++{
++	char *ptr;
++	int quote = 0;
++	int len = strlen(map->enum_string);
++
++	for (ptr = call->print_fmt; *ptr; ptr++) {
++		if (*ptr == '\\') {
++			ptr++;
++			/* paranoid */
++			if (!*ptr)
++				break;
++			continue;
++		}
++		if (*ptr == '"') {
++			quote ^= 1;
++			continue;
++		}
++		if (quote)
++			continue;
++		if (isdigit(*ptr)) {
++			/* skip numbers */
++			do {
++				ptr++;
++				/* Check for alpha chars like ULL */
++			} while (isalnum(*ptr));
++			/*
++			 * A number must have some kind of delimiter after
++			 * it, and we can ignore that too.
++			 */
++			continue;
++		}
++		if (isalpha(*ptr) || *ptr == '_') {
++			if (strncmp(map->enum_string, ptr, len) == 0 &&
++			    !isalnum(ptr[len]) && ptr[len] != '_') {
++				ptr = enum_replace(ptr, map, len);
++				/* Hmm, enum string smaller than value */
++				if (WARN_ON_ONCE(!ptr))
++					return;
++				/*
++				 * No need to decrement here, as enum_replace()
++				 * returns the pointer to the character passed
++				 * the enum, and two enums can not be placed
++				 * back to back without something in between.
++				 * We can skip that something in between.
++				 */
++				continue;
++			}
++		skip_more:
++			do {
++				ptr++;
++			} while (isalnum(*ptr) || *ptr == '_');
++			/*
++			 * If what comes after this variable is a '.' or
++			 * '->' then we can continue to ignore that string.
++			 */
++			if (*ptr == '.' || (ptr[0] == '-' && ptr[1] == '>')) {
++				ptr += *ptr == '.' ? 1 : 2;
++				goto skip_more;
++			}
++			/*
++			 * Once again, we can skip the delimiter that came
++			 * after the string.
++			 */
++			continue;
++		}
++	}
++}
++
++void trace_event_enum_update(struct trace_enum_map **map, int len)
++{
++	struct ftrace_event_call *call, *p;
++	const char *last_system = NULL;
++	int last_i;
++	int i;
++
++	down_write(&trace_event_sem);
++	list_for_each_entry_safe(call, p, &ftrace_events, list) {
++		/* events are usually grouped together with systems */
++		if (!last_system || call->class->system != last_system) {
++			last_i = 0;
++			last_system = call->class->system;
++		}
++
++		for (i = last_i; i < len; i++) {
++			if (call->class->system == map[i]->system) {
++				/* Save the first system if need be */
++				if (!last_i)
++					last_i = i;
++				update_event_printk(call, map[i]);
++			}
++		}
++	}
++	up_write(&trace_event_sem);
++}
++
+ static struct ftrace_event_file *
+ trace_create_new_event(struct ftrace_event_call *call,
+ 		       struct trace_array *tr)
