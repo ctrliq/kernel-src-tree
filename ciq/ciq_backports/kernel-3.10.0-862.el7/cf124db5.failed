@@ -1,0 +1,1678 @@
+net: Fix inconsistent teardown and release of private netdev state.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] Fix inconsistent teardown and release of private netdev state (Sabrina Dubroca) [1497100]
+Rebuild_FUZZ: 95.31%
+commit-author David S. Miller <davem@davemloft.net>
+commit cf124db566e6b036b8bcbe8decbed740bdfac8c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cf124db5.failed
+
+Network devices can allocate reasources and private memory using
+netdev_ops->ndo_init().  However, the release of these resources
+can occur in one of two different places.
+
+Either netdev_ops->ndo_uninit() or netdev->destructor().
+
+The decision of which operation frees the resources depends upon
+whether it is necessary for all netdev refs to be released before it
+is safe to perform the freeing.
+
+netdev_ops->ndo_uninit() presumably can occur right after the
+NETDEV_UNREGISTER notifier completes and the unicast and multicast
+address lists are flushed.
+
+netdev->destructor(), on the other hand, does not run until the
+netdev references all go away.
+
+Further complicating the situation is that netdev->destructor()
+almost universally does also a free_netdev().
+
+This creates a problem for the logic in register_netdevice().
+Because all callers of register_netdevice() manage the freeing
+of the netdev, and invoke free_netdev(dev) if register_netdevice()
+fails.
+
+If netdev_ops->ndo_init() succeeds, but something else fails inside
+of register_netdevice(), it does call ndo_ops->ndo_uninit().  But
+it is not able to invoke netdev->destructor().
+
+This is because netdev->destructor() will do a free_netdev() and
+then the caller of register_netdevice() will do the same.
+
+However, this means that the resources that would normally be released
+by netdev->destructor() will not be.
+
+Over the years drivers have added local hacks to deal with this, by
+invoking their destructor parts by hand when register_netdevice()
+fails.
+
+Many drivers do not try to deal with this, and instead we have leaks.
+
+Let's close this hole by formalizing the distinction between what
+private things need to be freed up by netdev->destructor() and whether
+the driver needs unregister_netdevice() to perform the free_netdev().
+
+netdev->priv_destructor() performs all actions to free up the private
+resources that used to be freed by netdev->destructor(), except for
+free_netdev().
+
+netdev->needs_free_netdev is a boolean that indicates whether
+free_netdev() should be done at the end of unregister_netdevice().
+
+Now, register_netdevice() can sanely release all resources after
+ndo_ops->ndo_init() succeeds, by invoking both ndo_ops->ndo_uninit()
+and netdev->priv_destructor().
+
+And at the end of unregister_netdevice(), we invoke
+netdev->priv_destructor() and optionally call free_netdev().
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf124db566e6b036b8bcbe8decbed740bdfac8c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/caif/caif_hsi.c
+#	drivers/net/caif/caif_serial.c
+#	drivers/net/can/vxcan.c
+#	drivers/net/dummy.c
+#	drivers/net/gtp.c
+#	drivers/net/ifb.c
+#	drivers/net/ipvlan/ipvlan_main.c
+#	drivers/net/macsec.c
+#	drivers/net/macvlan.c
+#	drivers/net/usb/qmi_wwan.c
+#	drivers/net/veth.c
+#	drivers/net/vrf.c
+#	drivers/net/vsockmon.c
+#	drivers/staging/rtl8188eu/os_dep/mon.c
+#	include/linux/netdevice.h
+#	net/8021q/vlan_dev.c
+#	net/batman-adv/soft-interface.c
+#	net/hsr/hsr_device.c
+#	net/ipv4/ipmr.c
+#	net/ipv6/sit.c
+#	net/irda/irlan/irlan_eth.c
+diff --cc drivers/net/caif/caif_hsi.c
+index 5e40a8b68cbe,71a7c3b44fdd..000000000000
+--- a/drivers/net/caif/caif_hsi.c
++++ b/drivers/net/caif/caif_hsi.c
+@@@ -1120,8 -1120,8 +1120,13 @@@ static void cfhsi_setup(struct net_devi
+  	dev->type = ARPHRD_CAIF;
+  	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
+  	dev->mtu = CFHSI_MAX_CAIF_FRAME_SZ;
+++<<<<<<< HEAD
+ +	dev->tx_queue_len = 0;
+ +	dev->destructor = free_netdev;
+++=======
++ 	dev->priv_flags |= IFF_NO_QUEUE;
++ 	dev->needs_free_netdev = true;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  	dev->netdev_ops = &cfhsi_netdevops;
+  	for (i = 0; i < CFHSI_PRIO_LAST; ++i)
+  		skb_queue_head_init(&cfhsi->qhead[i]);
+diff --cc drivers/net/caif/caif_serial.c
+index 77be3cb0b5fe,76e1d3545105..000000000000
+--- a/drivers/net/caif/caif_serial.c
++++ b/drivers/net/caif/caif_serial.c
+@@@ -404,8 -427,8 +404,13 @@@ static void caifdev_setup(struct net_de
+  	dev->type = ARPHRD_CAIF;
+  	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
+  	dev->mtu = CAIF_MAX_MTU;
+++<<<<<<< HEAD
+ +	dev->tx_queue_len = 0;
+ +	dev->destructor = free_netdev;
+++=======
++ 	dev->priv_flags |= IFF_NO_QUEUE;
++ 	dev->needs_free_netdev = true;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  	skb_queue_head_init(&serdev->head);
+  	serdev->common.link_select = CAIF_LINK_LOW_LATENCY;
+  	serdev->common.use_frag = true;
+diff --cc drivers/net/dummy.c
+index d6fe87b9dfd7,9905b52fe293..000000000000
+--- a/drivers/net/dummy.c
++++ b/drivers/net/dummy.c
+@@@ -118,15 -289,56 +118,55 @@@ static const struct net_device_ops dumm
+  	.ndo_set_mac_address	= eth_mac_addr,
+  	.ndo_get_stats64	= dummy_get_stats64,
+  	.ndo_change_carrier	= dummy_change_carrier,
+ -	.ndo_set_vf_mac		= dummy_set_vf_mac,
+ -	.ndo_set_vf_vlan	= dummy_set_vf_vlan,
+ -	.ndo_set_vf_rate	= dummy_set_vf_rate,
+ -	.ndo_set_vf_spoofchk	= dummy_set_vf_spoofchk,
+ -	.ndo_set_vf_trust	= dummy_set_vf_trust,
+ -	.ndo_get_vf_config	= dummy_get_vf_config,
+ -	.ndo_set_vf_link_state	= dummy_set_vf_link_state,
+ -	.ndo_set_vf_rss_query_en = dummy_set_vf_rss_query_en,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void dummy_get_drvinfo(struct net_device *dev,
++ 			      struct ethtool_drvinfo *info)
++ {
++ 	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
++ 	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
++ }
++ 
++ static int dummy_get_ts_info(struct net_device *dev,
++ 			      struct ethtool_ts_info *ts_info)
++ {
++ 	ts_info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
++ 				   SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				   SOF_TIMESTAMPING_SOFTWARE;
++ 
++ 	ts_info->phc_index = -1;
++ 
++ 	return 0;
++ };
++ 
++ static const struct ethtool_ops dummy_ethtool_ops = {
++ 	.get_drvinfo            = dummy_get_drvinfo,
++ 	.get_ts_info		= dummy_get_ts_info,
++ };
++ 
++ static void dummy_free_netdev(struct net_device *dev)
++ {
++ 	struct dummy_priv *priv = netdev_priv(dev);
++ 
++ 	kfree(priv->vfinfo);
++ }
++ 
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  static void dummy_setup(struct net_device *dev)
+  {
+  	ether_setup(dev);
+  
+  	/* Initialize the device structure. */
+  	dev->netdev_ops = &dummy_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor = free_netdev;
+++=======
++ 	dev->ethtool_ops = &dummy_ethtool_ops;
++ 	dev->needs_free_netdev = true;
++ 	dev->priv_destructor = dummy_free_netdev;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	/* Fill in device structure with ethernet-generic values. */
+  	dev->flags |= IFF_NOARP;
+diff --cc drivers/net/ifb.c
+index c69ebf414c33,144ea5ae8ab4..000000000000
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@@ -169,6 -194,21 +169,23 @@@ static const struct net_device_ops ifb_
+  		      NETIF_F_HIGHDMA | NETIF_F_HW_VLAN_CTAG_TX		| \
+  		      NETIF_F_HW_VLAN_STAG_TX)
+  
+++<<<<<<< HEAD
+++=======
++ static void ifb_dev_free(struct net_device *dev)
++ {
++ 	struct ifb_dev_private *dp = netdev_priv(dev);
++ 	struct ifb_q_private *txp = dp->tx_private;
++ 	int i;
++ 
++ 	for (i = 0; i < dev->num_tx_queues; i++,txp++) {
++ 		tasklet_kill(&txp->ifb_tasklet);
++ 		__skb_queue_purge(&txp->rq);
++ 		__skb_queue_purge(&txp->tq);
++ 	}
++ 	kfree(dp->tx_private);
++ }
++ 
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  static void ifb_setup(struct net_device *dev)
+  {
+  	/* Initialize the device structure. */
+@@@ -187,6 -229,8 +204,11 @@@
+  	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+  	netif_keep_dst(dev);
+  	eth_hw_addr_random(dev);
+++<<<<<<< HEAD
+++=======
++ 	dev->needs_free_netdev = true;
++ 	dev->priv_destructor = ifb_dev_free;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  }
+  
+  static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev)
+diff --cc drivers/net/macsec.c
+index 8665a14a86f9,79411675f0e6..000000000000
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@@ -2990,9 -3001,13 +2989,15 @@@ static void macsec_free_netdev(struct n
+  static void macsec_setup(struct net_device *dev)
+  {
+  	ether_setup(dev);
+ -	dev->min_mtu = 0;
+ -	dev->max_mtu = ETH_MAX_MTU;
+  	dev->priv_flags |= IFF_NO_QUEUE;
+  	dev->netdev_ops = &macsec_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor = macsec_free_netdev;
+++=======
++ 	dev->needs_free_netdev = true;
++ 	dev->priv_destructor = macsec_free_netdev;
++ 	SET_NETDEV_DEVTYPE(dev, &macsec_type);
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	eth_zero_addr(dev->broadcast);
+  }
+diff --cc drivers/net/macvlan.c
+index 615c47dc710b,67bf7ebae5c6..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -818,8 -1092,8 +818,13 @@@ void macvlan_common_setup(struct net_de
+  	netif_keep_dst(dev);
+  	dev->priv_flags	       |= IFF_UNICAST_FLT;
+  	dev->netdev_ops		= &macvlan_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor		= free_netdev;
+ +	dev->header_ops		= &macvlan_hard_header_ops,
+++=======
++ 	dev->needs_free_netdev	= true;
++ 	dev->header_ops		= &macvlan_hard_header_ops;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  	dev->ethtool_ops	= &macvlan_ethtool_ops;
+  }
+  EXPORT_SYMBOL_GPL(macvlan_common_setup);
+diff --cc drivers/net/usb/qmi_wwan.c
+index 24d5272cdce5,949671ce4039..000000000000
+--- a/drivers/net/usb/qmi_wwan.c
++++ b/drivers/net/usb/qmi_wwan.c
+@@@ -63,6 -65,191 +63,194 @@@ enum qmi_wwan_quirks 
+  	QMI_WWAN_QUIRK_DTR = 1 << 0,	/* needs "set DTR" request */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct qmimux_hdr {
++ 	u8 pad;
++ 	u8 mux_id;
++ 	__be16 pkt_len;
++ };
++ 
++ struct qmimux_priv {
++ 	struct net_device *real_dev;
++ 	u8 mux_id;
++ };
++ 
++ static int qmimux_open(struct net_device *dev)
++ {
++ 	struct qmimux_priv *priv = netdev_priv(dev);
++ 	struct net_device *real_dev = priv->real_dev;
++ 
++ 	if (!(priv->real_dev->flags & IFF_UP))
++ 		return -ENETDOWN;
++ 
++ 	if (netif_carrier_ok(real_dev))
++ 		netif_carrier_on(dev);
++ 	return 0;
++ }
++ 
++ static int qmimux_stop(struct net_device *dev)
++ {
++ 	netif_carrier_off(dev);
++ 	return 0;
++ }
++ 
++ static netdev_tx_t qmimux_start_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct qmimux_priv *priv = netdev_priv(dev);
++ 	unsigned int len = skb->len;
++ 	struct qmimux_hdr *hdr;
++ 
++ 	hdr = (struct qmimux_hdr *)skb_push(skb, sizeof(struct qmimux_hdr));
++ 	hdr->pad = 0;
++ 	hdr->mux_id = priv->mux_id;
++ 	hdr->pkt_len = cpu_to_be16(len);
++ 	skb->dev = priv->real_dev;
++ 	return dev_queue_xmit(skb);
++ }
++ 
++ static const struct net_device_ops qmimux_netdev_ops = {
++ 	.ndo_open       = qmimux_open,
++ 	.ndo_stop       = qmimux_stop,
++ 	.ndo_start_xmit = qmimux_start_xmit,
++ };
++ 
++ static void qmimux_setup(struct net_device *dev)
++ {
++ 	dev->header_ops      = NULL;  /* No header */
++ 	dev->type            = ARPHRD_NONE;
++ 	dev->hard_header_len = 0;
++ 	dev->addr_len        = 0;
++ 	dev->flags           = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
++ 	dev->netdev_ops      = &qmimux_netdev_ops;
++ 	dev->needs_free_netdev = true;
++ }
++ 
++ static struct net_device *qmimux_find_dev(struct usbnet *dev, u8 mux_id)
++ {
++ 	struct qmimux_priv *priv;
++ 	struct list_head *iter;
++ 	struct net_device *ldev;
++ 
++ 	rcu_read_lock();
++ 	netdev_for_each_upper_dev_rcu(dev->net, ldev, iter) {
++ 		priv = netdev_priv(ldev);
++ 		if (priv->mux_id == mux_id) {
++ 			rcu_read_unlock();
++ 			return ldev;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 	return NULL;
++ }
++ 
++ static bool qmimux_has_slaves(struct usbnet *dev)
++ {
++ 	return !list_empty(&dev->net->adj_list.upper);
++ }
++ 
++ static int qmimux_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
++ {
++ 	unsigned int len, offset = sizeof(struct qmimux_hdr);
++ 	struct qmimux_hdr *hdr;
++ 	struct net_device *net;
++ 	struct sk_buff *skbn;
++ 
++ 	while (offset < skb->len) {
++ 		hdr = (struct qmimux_hdr *)skb->data;
++ 		len = be16_to_cpu(hdr->pkt_len);
++ 
++ 		/* drop the packet, bogus length */
++ 		if (offset + len > skb->len)
++ 			return 0;
++ 
++ 		/* control packet, we do not know what to do */
++ 		if (hdr->pad & 0x80)
++ 			goto skip;
++ 
++ 		net = qmimux_find_dev(dev, hdr->mux_id);
++ 		if (!net)
++ 			goto skip;
++ 		skbn = netdev_alloc_skb(net, len);
++ 		if (!skbn)
++ 			return 0;
++ 		skbn->dev = net;
++ 
++ 		switch (skb->data[offset] & 0xf0) {
++ 		case 0x40:
++ 			skbn->protocol = htons(ETH_P_IP);
++ 			break;
++ 		case 0x60:
++ 			skbn->protocol = htons(ETH_P_IPV6);
++ 			break;
++ 		default:
++ 			/* not ip - do not know what to do */
++ 			goto skip;
++ 		}
++ 
++ 		memcpy(skb_put(skbn, len), skb->data + offset, len);
++ 		if (netif_rx(skbn) != NET_RX_SUCCESS)
++ 			return 0;
++ 
++ skip:
++ 		offset += len + sizeof(struct qmimux_hdr);
++ 	}
++ 	return 1;
++ }
++ 
++ static int qmimux_register_device(struct net_device *real_dev, u8 mux_id)
++ {
++ 	struct net_device *new_dev;
++ 	struct qmimux_priv *priv;
++ 	int err;
++ 
++ 	new_dev = alloc_netdev(sizeof(struct qmimux_priv),
++ 			       "qmimux%d", NET_NAME_UNKNOWN, qmimux_setup);
++ 	if (!new_dev)
++ 		return -ENOBUFS;
++ 
++ 	dev_net_set(new_dev, dev_net(real_dev));
++ 	priv = netdev_priv(new_dev);
++ 	priv->mux_id = mux_id;
++ 	priv->real_dev = real_dev;
++ 
++ 	err = register_netdevice(new_dev);
++ 	if (err < 0)
++ 		goto out_free_newdev;
++ 
++ 	/* Account for reference in struct qmimux_priv_priv */
++ 	dev_hold(real_dev);
++ 
++ 	err = netdev_upper_dev_link(real_dev, new_dev);
++ 	if (err)
++ 		goto out_unregister_netdev;
++ 
++ 	netif_stacked_transfer_operstate(real_dev, new_dev);
++ 
++ 	return 0;
++ 
++ out_unregister_netdev:
++ 	unregister_netdevice(new_dev);
++ 	dev_put(real_dev);
++ 
++ out_free_newdev:
++ 	free_netdev(new_dev);
++ 	return err;
++ }
++ 
++ static void qmimux_unregister_device(struct net_device *dev)
++ {
++ 	struct qmimux_priv *priv = netdev_priv(dev);
++ 	struct net_device *real_dev = priv->real_dev;
++ 
++ 	netdev_upper_dev_unlink(real_dev, dev);
++ 	unregister_netdevice(dev);
++ 
++ 	/* Get rid of the reference to real_dev */
++ 	dev_put(real_dev);
++ }
++ 
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  static void qmi_wwan_netdev_setup(struct net_device *net)
+  {
+  	struct usbnet *dev = netdev_priv(net);
+diff --cc drivers/net/veth.c
+index 81422091c337,0156fe8cac17..000000000000
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@@ -236,9 -222,23 +236,8 @@@ static int veth_dev_init(struct net_dev
+  static void veth_dev_free(struct net_device *dev)
+  {
+  	free_percpu(dev->vstats);
+- 	free_netdev(dev);
+  }
+  
+ -#ifdef CONFIG_NET_POLL_CONTROLLER
+ -static void veth_poll_controller(struct net_device *dev)
+ -{
+ -	/* veth only receives frames when its peer sends one
+ -	 * Since it's a synchronous operation, we are guaranteed
+ -	 * never to have pending data when we poll for it so
+ -	 * there is nothing to do here.
+ -	 *
+ -	 * We need this though so netpoll recognizes us as an interface that
+ -	 * supports polling, which enables bridge devices in virt setups to
+ -	 * still use netconsole
+ -	 */
+ -}
+ -#endif	/* CONFIG_NET_POLL_CONTROLLER */
+ -
+  static int veth_get_iflink(const struct net_device *dev)
+  {
+  	struct veth_priv *priv = netdev_priv(dev);
+@@@ -309,8 -312,13 +308,18 @@@ static void veth_setup(struct net_devic
+  	dev->features |= NETIF_F_LLTX;
+  	dev->features |= VETH_FEATURES;
+  	dev->vlan_features = dev->features &
+++<<<<<<< HEAD
+ +			     ~(NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX);
+ +	dev->destructor = veth_dev_free;
+++=======
++ 			     ~(NETIF_F_HW_VLAN_CTAG_TX |
++ 			       NETIF_F_HW_VLAN_STAG_TX |
++ 			       NETIF_F_HW_VLAN_CTAG_RX |
++ 			       NETIF_F_HW_VLAN_STAG_RX);
++ 	dev->needs_free_netdev = true;
++ 	dev->priv_destructor = veth_dev_free;
++ 	dev->max_mtu = ETH_MAX_MTU;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	dev->hw_features = VETH_FEATURES;
+  	dev->hw_enc_features = VETH_FEATURES;
+diff --cc include/linux/netdevice.h
+index f2e995a93118,ab7ca3fdc495..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1524,11 -1431,209 +1524,217 @@@ enum netdev_priv_flags 
+  #define IFF_RXFH_CONFIGURED		IFF_RXFH_CONFIGURED
+  #define IFF_MACSEC			IFF_MACSEC
+  
+++<<<<<<< HEAD
+ +/*
+ + *	The DEVICE structure.
+ + *	Actually, this whole structure is a big mistake.  It mixes I/O
+ + *	data with strictly "high-level" data, and it has to know about
+ + *	almost every data structure used in the INET module.
+++=======
++ /**
++  *	struct net_device - The DEVICE structure.
++  *		Actually, this whole structure is a big mistake.  It mixes I/O
++  *		data with strictly "high-level" data, and it has to know about
++  *		almost every data structure used in the INET module.
++  *
++  *	@name:	This is the first field of the "visible" part of this structure
++  *		(i.e. as seen by users in the "Space.c" file).  It is the name
++  *	 	of the interface.
++  *
++  *	@name_hlist: 	Device name hash chain, please keep it close to name[]
++  *	@ifalias:	SNMP alias
++  *	@mem_end:	Shared memory end
++  *	@mem_start:	Shared memory start
++  *	@base_addr:	Device I/O address
++  *	@irq:		Device IRQ number
++  *
++  *	@carrier_changes:	Stats to monitor carrier on<->off transitions
++  *
++  *	@state:		Generic network queuing layer state, see netdev_state_t
++  *	@dev_list:	The global list of network devices
++  *	@napi_list:	List entry used for polling NAPI devices
++  *	@unreg_list:	List entry  when we are unregistering the
++  *			device; see the function unregister_netdev
++  *	@close_list:	List entry used when we are closing the device
++  *	@ptype_all:     Device-specific packet handlers for all protocols
++  *	@ptype_specific: Device-specific, protocol-specific packet handlers
++  *
++  *	@adj_list:	Directly linked devices, like slaves for bonding
++  *	@features:	Currently active device features
++  *	@hw_features:	User-changeable features
++  *
++  *	@wanted_features:	User-requested features
++  *	@vlan_features:		Mask of features inheritable by VLAN devices
++  *
++  *	@hw_enc_features:	Mask of features inherited by encapsulating devices
++  *				This field indicates what encapsulation
++  *				offloads the hardware is capable of doing,
++  *				and drivers will need to set them appropriately.
++  *
++  *	@mpls_features:	Mask of features inheritable by MPLS
++  *
++  *	@ifindex:	interface index
++  *	@group:		The group the device belongs to
++  *
++  *	@stats:		Statistics struct, which was left as a legacy, use
++  *			rtnl_link_stats64 instead
++  *
++  *	@rx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@tx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@rx_nohandler:	nohandler dropped packets by core network on
++  *			inactive devices, do not use this in drivers
++  *
++  *	@wireless_handlers:	List of functions to handle Wireless Extensions,
++  *				instead of ioctl,
++  *				see <net/iw_handler.h> for details.
++  *	@wireless_data:	Instance data managed by the core of wireless extensions
++  *
++  *	@netdev_ops:	Includes several pointers to callbacks,
++  *			if one wants to override the ndo_*() functions
++  *	@ethtool_ops:	Management operations
++  *	@ndisc_ops:	Includes callbacks for different IPv6 neighbour
++  *			discovery handling. Necessary for e.g. 6LoWPAN.
++  *	@header_ops:	Includes callbacks for creating,parsing,caching,etc
++  *			of Layer 2 headers.
++  *
++  *	@flags:		Interface flags (a la BSD)
++  *	@priv_flags:	Like 'flags' but invisible to userspace,
++  *			see if.h for the definitions
++  *	@gflags:	Global flags ( kept as legacy )
++  *	@padded:	How much padding added by alloc_netdev()
++  *	@operstate:	RFC2863 operstate
++  *	@link_mode:	Mapping policy to operstate
++  *	@if_port:	Selectable AUI, TP, ...
++  *	@dma:		DMA channel
++  *	@mtu:		Interface MTU value
++  *	@min_mtu:	Interface Minimum MTU value
++  *	@max_mtu:	Interface Maximum MTU value
++  *	@type:		Interface hardware type
++  *	@hard_header_len: Maximum hardware header length.
++  *	@min_header_len:  Minimum hardware header length
++  *
++  *	@needed_headroom: Extra headroom the hardware may need, but not in all
++  *			  cases can this be guaranteed
++  *	@needed_tailroom: Extra tailroom the hardware may need, but not in all
++  *			  cases can this be guaranteed. Some cases also use
++  *			  LL_MAX_HEADER instead to allocate the skb
++  *
++  *	interface address info:
++  *
++  * 	@perm_addr:		Permanent hw address
++  * 	@addr_assign_type:	Hw address assignment type
++  * 	@addr_len:		Hardware address length
++  *	@neigh_priv_len:	Used in neigh_alloc()
++  * 	@dev_id:		Used to differentiate devices that share
++  * 				the same link layer address
++  * 	@dev_port:		Used to differentiate devices that share
++  * 				the same function
++  *	@addr_list_lock:	XXX: need comments on this one
++  *	@uc_promisc:		Counter that indicates promiscuous mode
++  *				has been enabled due to the need to listen to
++  *				additional unicast addresses in a device that
++  *				does not implement ndo_set_rx_mode()
++  *	@uc:			unicast mac addresses
++  *	@mc:			multicast mac addresses
++  *	@dev_addrs:		list of device hw addresses
++  *	@queues_kset:		Group of all Kobjects in the Tx and RX queues
++  *	@promiscuity:		Number of times the NIC is told to work in
++  *				promiscuous mode; if it becomes 0 the NIC will
++  *				exit promiscuous mode
++  *	@allmulti:		Counter, enables or disables allmulticast mode
++  *
++  *	@vlan_info:	VLAN info
++  *	@dsa_ptr:	dsa specific data
++  *	@tipc_ptr:	TIPC specific data
++  *	@atalk_ptr:	AppleTalk link
++  *	@ip_ptr:	IPv4 specific data
++  *	@dn_ptr:	DECnet specific data
++  *	@ip6_ptr:	IPv6 specific data
++  *	@ax25_ptr:	AX.25 specific data
++  *	@ieee80211_ptr:	IEEE 802.11 specific data, assign before registering
++  *
++  *	@dev_addr:	Hw address (before bcast,
++  *			because most packets are unicast)
++  *
++  *	@_rx:			Array of RX queues
++  *	@num_rx_queues:		Number of RX queues
++  *				allocated at register_netdev() time
++  *	@real_num_rx_queues: 	Number of RX queues currently active in device
++  *
++  *	@rx_handler:		handler for received packets
++  *	@rx_handler_data: 	XXX: need comments on this one
++  *	@ingress_queue:		XXX: need comments on this one
++  *	@broadcast:		hw bcast address
++  *
++  *	@rx_cpu_rmap:	CPU reverse-mapping for RX completion interrupts,
++  *			indexed by RX queue number. Assigned by driver.
++  *			This must only be set if the ndo_rx_flow_steer
++  *			operation is defined
++  *	@index_hlist:		Device index hash chain
++  *
++  *	@_tx:			Array of TX queues
++  *	@num_tx_queues:		Number of TX queues allocated at alloc_netdev_mq() time
++  *	@real_num_tx_queues: 	Number of TX queues currently active in device
++  *	@qdisc:			Root qdisc from userspace point of view
++  *	@tx_queue_len:		Max frames per queue allowed
++  *	@tx_global_lock: 	XXX: need comments on this one
++  *
++  *	@xps_maps:	XXX: need comments on this one
++  *
++  *	@watchdog_timeo:	Represents the timeout that is used by
++  *				the watchdog (see dev_watchdog())
++  *	@watchdog_timer:	List of timers
++  *
++  *	@pcpu_refcnt:		Number of references to this device
++  *	@todo_list:		Delayed register/unregister
++  *	@link_watch_list:	XXX: need comments on this one
++  *
++  *	@reg_state:		Register/unregister state machine
++  *	@dismantle:		Device is going to be freed
++  *	@rtnl_link_state:	This enum represents the phases of creating
++  *				a new link
++  *
++  *	@needs_free_netdev:	Should unregister perform free_netdev?
++  *	@priv_destructor:	Called from unregister
++  *	@npinfo:		XXX: need comments on this one
++  * 	@nd_net:		Network namespace this network device is inside
++  *
++  * 	@ml_priv:	Mid-layer private
++  * 	@lstats:	Loopback statistics
++  * 	@tstats:	Tunnel statistics
++  * 	@dstats:	Dummy statistics
++  * 	@vstats:	Virtual ethernet statistics
++  *
++  *	@garp_port:	GARP
++  *	@mrp_port:	MRP
++  *
++  *	@dev:		Class/net/name entry
++  *	@sysfs_groups:	Space for optional device, statistics and wireless
++  *			sysfs groups
++  *
++  *	@sysfs_rx_queue_group:	Space for optional per-rx queue attributes
++  *	@rtnl_link_ops:	Rtnl_link_ops
++  *
++  *	@gso_max_size:	Maximum size of generic segmentation offload
++  *	@gso_max_segs:	Maximum number of segments that can be passed to the
++  *			NIC for GSO
++  *
++  *	@dcbnl_ops:	Data Center Bridging netlink ops
++  *	@num_tc:	Number of traffic classes in the net device
++  *	@tc_to_txq:	XXX: need comments on this one
++  *	@prio_tc_map:	XXX: need comments on this one
++  *
++  *	@fcoe_ddp_xid:	Max exchange id for FCoE LRO by ddp
++  *
++  *	@priomap:	XXX: need comments on this one
++  *	@phydev:	Physical device may attach itself
++  *			for hardware timestamping
++  *
++  *	@qdisc_tx_busylock: lockdep class annotating Qdisc->busylock spinlock
++  *	@qdisc_running_key: lockdep class annotating Qdisc->running seqcount
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+   *
+   *	@proto_down:	protocol port state information can be sent to the
+   *			switch driver and used to set the phys state of the
+@@@ -1777,8 -1858,8 +1983,13 @@@ struct net_device 
+  		RTNL_LINK_INITIALIZING,
+  	} rtnl_link_state:16;
+  
+++<<<<<<< HEAD
+ +	/* Called from unregister, can be used to call free_netdev */
+ +	void (*destructor)(struct net_device *dev);
+++=======
++ 	bool needs_free_netdev;
++ 	void (*priv_destructor)(struct net_device *dev);
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  #ifdef CONFIG_NETPOLL
+  	struct netpoll_info __rcu	*npinfo;
+diff --cc net/8021q/vlan_dev.c
+index 314c2f99b67e,abc5f400fc71..000000000000
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@@ -817,6 -806,15 +817,17 @@@ static const struct net_device_ops vlan
+  	.ndo_get_iflink		= vlan_dev_get_iflink,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void vlan_dev_free(struct net_device *dev)
++ {
++ 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
++ 
++ 	free_percpu(vlan->vlan_pcpu_stats);
++ 	vlan->vlan_pcpu_stats = NULL;
++ }
++ 
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  void vlan_setup(struct net_device *dev)
+  {
+  	ether_setup(dev);
+@@@ -826,8 -825,12 +837,13 @@@
+  	netif_keep_dst(dev);
+  
+  	dev->netdev_ops		= &vlan_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor		= free_netdev;
+++=======
++ 	dev->needs_free_netdev	= true;
++ 	dev->priv_destructor	= vlan_dev_free;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  	dev->ethtool_ops	= &vlan_ethtool_ops;
+  
+ -	dev->min_mtu		= 0;
+ -	dev->max_mtu		= ETH_MAX_MTU;
+ -
+ -	eth_zero_addr(dev->broadcast);
+ +	memset(dev->broadcast, 0, ETH_ALEN);
+  }
+diff --cc net/batman-adv/soft-interface.c
+index 819dfb006cdf,10f7edfb176e..000000000000
+--- a/net/batman-adv/soft-interface.c
++++ b/net/batman-adv/soft-interface.c
+@@@ -604,8 -1045,10 +602,15 @@@ static void batadv_softif_init_early(st
+  	ether_setup(dev);
+  
+  	dev->netdev_ops = &batadv_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor = batadv_softif_free;
+ +	dev->tx_queue_len = 0;
+++=======
++ 	dev->needs_free_netdev = true;
++ 	dev->priv_destructor = batadv_softif_free;
++ 	dev->features |= NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_NETNS_LOCAL;
++ 	dev->priv_flags |= IFF_NO_QUEUE;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	/* can't call min_mtu, because the needed variables
+  	 * have not been initialized yet
+diff --cc net/ipv4/ipmr.c
+index 0e96a714fc02,b4f9622ee9f5..000000000000
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@@ -492,8 -500,8 +492,13 @@@ static void reg_vif_setup(struct net_de
+  	dev->type		= ARPHRD_PIMREG;
+  	dev->mtu		= ETH_DATA_LEN - sizeof(struct iphdr) - 8;
+  	dev->flags		= IFF_NOARP;
+++<<<<<<< HEAD
+ +	dev->netdev_ops		= &reg_vif_netdev_ops,
+ +	dev->destructor		= free_netdev;
+++=======
++ 	dev->netdev_ops		= &reg_vif_netdev_ops;
++ 	dev->needs_free_netdev	= true;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  	dev->features		|= NETIF_F_NETNS_LOCAL;
+  }
+  
+diff --cc net/ipv6/sit.c
+index bbc39f175181,2378503577b0..000000000000
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@@ -1275,7 -1350,8 +1274,12 @@@ static void ipip6_tunnel_setup(struct n
+  	int t_hlen = tunnel->hlen + sizeof(struct iphdr);
+  
+  	dev->netdev_ops		= &ipip6_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor 	= ipip6_dev_free;
+++=======
++ 	dev->needs_free_netdev	= true;
++ 	dev->priv_destructor	= ipip6_dev_free;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	dev->type		= ARPHRD_SIT;
+  	dev->hard_header_len	= LL_MAX_HEADER + t_hlen;
+diff --cc net/irda/irlan/irlan_eth.c
+index ae3ab09130ed,3be852808a9d..000000000000
+--- a/net/irda/irlan/irlan_eth.c
++++ b/net/irda/irlan/irlan_eth.c
+@@@ -66,8 -65,9 +66,14 @@@ static void irlan_eth_setup(struct net_
+  	ether_setup(dev);
+  
+  	dev->netdev_ops		= &irlan_eth_netdev_ops;
+++<<<<<<< HEAD
+ +	dev->destructor		= free_netdev;
+ +
+++=======
++ 	dev->needs_free_netdev	= true;
++ 	dev->min_mtu		= 0;
++ 	dev->max_mtu		= ETH_MAX_MTU;
+++>>>>>>> cf124db566e6 (net: Fix inconsistent teardown and release of private netdev state.)
+  
+  	/*
+  	 * Lets do all queueing in IrTTP instead of this device driver.
+* Unmerged path drivers/net/can/vxcan.c
+* Unmerged path drivers/net/gtp.c
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+* Unmerged path drivers/net/vrf.c
+* Unmerged path drivers/net/vsockmon.c
+* Unmerged path drivers/staging/rtl8188eu/os_dep/mon.c
+* Unmerged path net/hsr/hsr_device.c
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index c4b097d4719d..f6d433ba0bd1 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -4209,7 +4209,6 @@ static void bond_destructor(struct net_device *bond_dev)
+ 	struct bonding *bond = netdev_priv(bond_dev);
+ 	if (bond->wq)
+ 		destroy_workqueue(bond->wq);
+-	free_netdev(bond_dev);
+ }
+ 
+ void bond_setup(struct net_device *bond_dev)
+@@ -4229,7 +4228,8 @@ void bond_setup(struct net_device *bond_dev)
+ 	bond_dev->netdev_ops = &bond_netdev_ops;
+ 	bond_dev->ethtool_ops = &bond_ethtool_ops;
+ 
+-	bond_dev->destructor = bond_destructor;
++	bond_dev->needs_free_netdev = true;
++	bond_dev->priv_destructor = bond_destructor;
+ 
+ 	SET_NETDEV_DEVTYPE(bond_dev, &bond_type);
+ 
+@@ -4748,7 +4748,7 @@ int bond_create(struct net *net, const char *name)
+ 
+ 	rtnl_unlock();
+ 	if (res < 0)
+-		bond_destructor(bond_dev);
++		free_netdev(bond_dev);
+ 	return res;
+ }
+ 
+* Unmerged path drivers/net/caif/caif_hsi.c
+* Unmerged path drivers/net/caif/caif_serial.c
+diff --git a/drivers/net/caif/caif_spi.c b/drivers/net/caif/caif_spi.c
+index 155db68e13ba..49761a9295aa 100644
+--- a/drivers/net/caif/caif_spi.c
++++ b/drivers/net/caif/caif_spi.c
+@@ -713,7 +713,7 @@ static void cfspi_setup(struct net_device *dev)
+ 	dev->flags = IFF_NOARP | IFF_POINTOPOINT;
+ 	dev->tx_queue_len = 0;
+ 	dev->mtu = SPI_MAX_PAYLOAD_SIZE;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	skb_queue_head_init(&cfspi->qhead);
+ 	skb_queue_head_init(&cfspi->chead);
+ 	cfspi->cfdev.link_select = CAIF_LINK_HIGH_BANDW;
+diff --git a/drivers/net/caif/caif_virtio.c b/drivers/net/caif/caif_virtio.c
+index 7d899f19da0b..a1d147b4c253 100644
+--- a/drivers/net/caif/caif_virtio.c
++++ b/drivers/net/caif/caif_virtio.c
+@@ -617,7 +617,7 @@ static void cfv_netdev_setup(struct net_device *netdev)
+ 	netdev->tx_queue_len = 100;
+ 	netdev->flags = IFF_POINTOPOINT | IFF_NOARP;
+ 	netdev->mtu = CFV_DEF_MTU_SIZE;
+-	netdev->destructor = free_netdev;
++	netdev->needs_free_netdev = true;
+ }
+ 
+ /* Create debugfs counters for the device */
+diff --git a/drivers/net/can/slcan.c b/drivers/net/can/slcan.c
+index f356a3661549..a95e60f3bc86 100644
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@ -372,7 +372,7 @@ static int slc_open(struct net_device *dev)
+ static void slc_free_netdev(struct net_device *dev)
+ {
+ 	int i = dev->base_addr;
+-	free_netdev(dev);
++
+ 	slcan_devs[i] = NULL;
+ }
+ 
+@@ -385,7 +385,8 @@ static const struct net_device_ops slc_netdev_ops = {
+ static void slc_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops		= &slc_netdev_ops;
+-	dev->destructor		= slc_free_netdev;
++	dev->needs_free_netdev	= true;
++	dev->priv_destructor	= slc_free_netdev;
+ 
+ 	dev->hard_header_len	= 0;
+ 	dev->addr_len		= 0;
+@@ -705,8 +706,6 @@ static void __exit slcan_exit(void)
+ 		if (sl->tty) {
+ 			printk(KERN_ERR "%s: tty discipline still running\n",
+ 			       dev->name);
+-			/* Intentionally leak the control block. */
+-			dev->destructor = NULL;
+ 		}
+ 
+ 		unregister_netdev(dev);
+diff --git a/drivers/net/can/vcan.c b/drivers/net/can/vcan.c
+index 0a2a5ee79a17..b4d734731a9d 100644
+--- a/drivers/net/can/vcan.c
++++ b/drivers/net/can/vcan.c
+@@ -164,7 +164,7 @@ static void vcan_setup(struct net_device *dev)
+ 		dev->flags |= IFF_ECHO;
+ 
+ 	dev->netdev_ops		= &vcan_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ }
+ 
+ static struct rtnl_link_ops vcan_link_ops __read_mostly = {
+* Unmerged path drivers/net/can/vxcan.c
+* Unmerged path drivers/net/dummy.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 7eb2bfa69942..fe6814b53e5a 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -4540,7 +4540,7 @@ static void dummy_setup(struct net_device *dev)
+ 	/* Initialize the device structure. */
+ 	dev->netdev_ops = &cxgb4_mgmt_netdev_ops;
+ 	dev->ethtool_ops = &cxgb4_mgmt_ethtool_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ }
+ 
+ static int config_mgmt_dev(struct pci_dev *pdev)
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index c4c93ccffa85..2cfe92334810 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -1168,7 +1168,7 @@ static void geneve_setup(struct net_device *dev)
+ 
+ 	dev->netdev_ops = &geneve_netdev_ops;
+ 	dev->ethtool_ops = &geneve_ethtool_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 
+ 	SET_NETDEV_DEVTYPE(dev, &geneve_type);
+ 
+* Unmerged path drivers/net/gtp.c
+diff --git a/drivers/net/hamradio/6pack.c b/drivers/net/hamradio/6pack.c
+index 1450e33fc250..f22f81c0e819 100644
+--- a/drivers/net/hamradio/6pack.c
++++ b/drivers/net/hamradio/6pack.c
+@@ -334,7 +334,7 @@ static void sp_setup(struct net_device *dev)
+ {
+ 	/* Finish setting up the DEVICE info. */
+ 	dev->netdev_ops		= &sp_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ 	dev->mtu		= SIXP_MTU;
+ 	dev->hard_header_len	= AX25_MAX_HEADER_LEN;
+ 	dev->header_ops 	= &sp_header_ops;
+diff --git a/drivers/net/hamradio/bpqether.c b/drivers/net/hamradio/bpqether.c
+index c7f3e388a469..481fc896d7f1 100644
+--- a/drivers/net/hamradio/bpqether.c
++++ b/drivers/net/hamradio/bpqether.c
+@@ -474,7 +474,7 @@ static const struct net_device_ops bpq_netdev_ops = {
+ static void bpq_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops	     = &bpq_netdev_ops;
+-	dev->destructor	     = free_netdev;
++	dev->needs_free_netdev = true;
+ 
+ 	memcpy(dev->broadcast, &ax25_bcast, AX25_ADDR_LEN);
+ 	memcpy(dev->dev_addr,  &ax25_defaddr, AX25_ADDR_LEN);
+* Unmerged path drivers/net/ifb.c
+* Unmerged path drivers/net/ipvlan/ipvlan_main.c
+diff --git a/drivers/net/loopback.c b/drivers/net/loopback.c
+index 15521570f5cc..1b1a81284c20 100644
+--- a/drivers/net/loopback.c
++++ b/drivers/net/loopback.c
+@@ -147,7 +147,6 @@ static int loopback_dev_init(struct net_device *dev)
+ static void loopback_dev_free(struct net_device *dev)
+ {
+ 	free_percpu(dev->lstats);
+-	free_netdev(dev);
+ }
+ 
+ static const struct net_device_ops loopback_ops = {
+@@ -184,7 +183,8 @@ static void loopback_setup(struct net_device *dev)
+ 	dev->ethtool_ops	= &loopback_ethtool_ops;
+ 	dev->header_ops		= &eth_header_ops;
+ 	dev->netdev_ops		= &loopback_ops;
+-	dev->destructor		= loopback_dev_free;
++	dev->needs_free_netdev	= true;
++	dev->priv_destructor	= loopback_dev_free;
+ }
+ 
+ /* Setup and register the loopback device. */
+* Unmerged path drivers/net/macsec.c
+* Unmerged path drivers/net/macvlan.c
+diff --git a/drivers/net/nlmon.c b/drivers/net/nlmon.c
+index 038246c26d78..02491e28c5a9 100644
+--- a/drivers/net/nlmon.c
++++ b/drivers/net/nlmon.c
+@@ -135,7 +135,7 @@ static void nlmon_setup(struct net_device *dev)
+ 
+ 	dev->netdev_ops	= &nlmon_ops;
+ 	dev->ethtool_ops = &nlmon_ethtool_ops;
+-	dev->destructor	= free_netdev;
++	dev->needs_free_netdev = true;
+ 
+ 	dev->features = NETIF_F_FRAGLIST | NETIF_F_HIGHDMA;
+ 	dev->flags = IFF_NOARP;
+diff --git a/drivers/net/slip/slip.c b/drivers/net/slip/slip.c
+index 7919288ba54c..6e7eacc90f00 100644
+--- a/drivers/net/slip/slip.c
++++ b/drivers/net/slip/slip.c
+@@ -635,7 +635,7 @@ static void sl_uninit(struct net_device *dev)
+ static void sl_free_netdev(struct net_device *dev)
+ {
+ 	int i = dev->base_addr;
+-	free_netdev(dev);
++
+ 	slip_devs[i] = NULL;
+ }
+ 
+@@ -657,7 +657,8 @@ static const struct net_device_ops sl_netdev_ops = {
+ static void sl_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops		= &sl_netdev_ops;
+-	dev->destructor		= sl_free_netdev;
++	dev->needs_free_netdev	= true;
++	dev->priv_destructor	= sl_free_netdev;
+ 
+ 	dev->hard_header_len	= 0;
+ 	dev->addr_len		= 0;
+@@ -1371,8 +1372,6 @@ static void __exit slip_exit(void)
+ 		if (sl->tty) {
+ 			printk(KERN_ERR "%s: tty discipline still running\n",
+ 			       dev->name);
+-			/* Intentionally leak the control block. */
+-			dev->destructor = NULL;
+ 		}
+ 
+ 		unregister_netdev(dev);
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 93f6926b4b66..ed3ead622b2a 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -1642,7 +1642,6 @@ static void team_destructor(struct net_device *dev)
+ 	struct team *team = netdev_priv(dev);
+ 
+ 	free_percpu(team->pcpu_stats);
+-	free_netdev(dev);
+ }
+ 
+ static int team_open(struct net_device *dev)
+@@ -2081,7 +2080,8 @@ static void team_setup(struct net_device *dev)
+ 
+ 	dev->netdev_ops = &team_netdev_ops;
+ 	dev->ethtool_ops = &team_ethtool_ops;
+-	dev->destructor	= team_destructor;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = team_destructor;
+ 	dev->priv_flags &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
+ 	dev->priv_flags |= IFF_NO_QUEUE;
+ 	dev->priv_flags |= IFF_TEAM;
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index d9aef016340e..f2fefbab6c03 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -1702,7 +1702,6 @@ static void tun_free_netdev(struct net_device *dev)
+ 	free_percpu(tun->pcpu_stats);
+ 	tun_flow_uninit(tun);
+ 	security_tun_dev_free_security(tun->security);
+-	free_netdev(dev);
+ }
+ 
+ static void tun_setup(struct net_device *dev)
+@@ -1713,7 +1712,8 @@ static void tun_setup(struct net_device *dev)
+ 	tun->group = INVALID_GID;
+ 
+ 	dev->ethtool_ops = &tun_ethtool_ops;
+-	dev->destructor = tun_free_netdev;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = tun_free_netdev;
+ 	/* We prefer our own queue length */
+ 	dev->tx_queue_len = TUN_READQ_SIZE;
+ }
+diff --git a/drivers/net/usb/cdc-phonet.c b/drivers/net/usb/cdc-phonet.c
+index 1f7a005beb3c..5b761bdbc0e2 100644
+--- a/drivers/net/usb/cdc-phonet.c
++++ b/drivers/net/usb/cdc-phonet.c
+@@ -306,7 +306,7 @@ static void usbpn_setup(struct net_device *dev)
+ 	dev->addr_len		= 1;
+ 	dev->tx_queue_len	= 3;
+ 
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ }
+ 
+ /*
+* Unmerged path drivers/net/usb/qmi_wwan.c
+* Unmerged path drivers/net/veth.c
+* Unmerged path drivers/net/vrf.c
+* Unmerged path drivers/net/vsockmon.c
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index fcdb95049162..58ae7541ab1a 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2516,7 +2516,7 @@ static void vxlan_setup(struct net_device *dev)
+ 	eth_hw_addr_random(dev);
+ 	ether_setup(dev);
+ 
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	SET_NETDEV_DEVTYPE(dev, &vxlan_type);
+ 
+ 	dev->features	|= NETIF_F_LLTX;
+diff --git a/drivers/net/wan/dlci.c b/drivers/net/wan/dlci.c
+index 4b30ca6b3943..99a8f023906b 100644
+--- a/drivers/net/wan/dlci.c
++++ b/drivers/net/wan/dlci.c
+@@ -481,7 +481,7 @@ static void dlci_setup(struct net_device *dev)
+ 	dev->flags		= 0;
+ 	dev->header_ops		= &dlci_header_ops;
+ 	dev->netdev_ops		= &dlci_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ 
+ 	dlp->receive		= dlci_receive;
+ 
+diff --git a/drivers/net/wan/hdlc_fr.c b/drivers/net/wan/hdlc_fr.c
+index c7aeb9eaaf73..5e31da62bfe6 100644
+--- a/drivers/net/wan/hdlc_fr.c
++++ b/drivers/net/wan/hdlc_fr.c
+@@ -1103,7 +1103,7 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
+ 		return -EIO;
+ 	}
+ 
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	*get_dev_p(pvc, type) = dev;
+ 	if (!used) {
+ 		state(hdlc)->dce_changed = 1;
+diff --git a/drivers/net/wan/lapbether.c b/drivers/net/wan/lapbether.c
+index a1183a7690b7..eabffded7141 100644
+--- a/drivers/net/wan/lapbether.c
++++ b/drivers/net/wan/lapbether.c
+@@ -307,7 +307,7 @@ static const struct net_device_ops lapbeth_netdev_ops = {
+ static void lapbeth_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops	     = &lapbeth_netdev_ops;
+-	dev->destructor	     = free_netdev;
++	dev->needs_free_netdev = true;
+ 	dev->type            = ARPHRD_X25;
+ 	dev->hard_header_len = 3;
+ 	dev->mtu             = 1000;
+diff --git a/drivers/net/wireless/ath/ath6kl/main.c b/drivers/net/wireless/ath/ath6kl/main.c
+index d56554674da4..974638fa9670 100644
+--- a/drivers/net/wireless/ath/ath6kl/main.c
++++ b/drivers/net/wireless/ath/ath6kl/main.c
+@@ -1291,7 +1291,7 @@ static const struct net_device_ops ath6kl_netdev_ops = {
+ void init_netdev(struct net_device *dev)
+ {
+ 	dev->netdev_ops = &ath6kl_netdev_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	dev->watchdog_timeo = ATH6KL_TX_TIMEOUT;
+ 
+ 	dev->needed_headroom = ETH_HLEN;
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+index 210079ee5756..c9faaec32251 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -5140,7 +5140,6 @@ void brcmf_cfg80211_free_netdev(struct net_device *ndev)
+ 
+ 	if (vif)
+ 		brcmf_free_vif(vif);
+-	free_netdev(ndev);
+ }
+ 
+ static bool brcmf_is_linkup(const struct brcmf_event_msg *e)
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index 4882084a35af..a91801c92211 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -671,7 +671,8 @@ struct brcmf_if *brcmf_add_if(struct brcmf_pub *drvr, s32 bsscfgidx, s32 ifidx,
+ 		if (!ndev)
+ 			return ERR_PTR(-ENOMEM);
+ 
+-		ndev->destructor = brcmf_cfg80211_free_netdev;
++		ndev->needs_free_netdev = true;
++		ndev->priv_destructor = brcmf_cfg80211_free_netdev;
+ 		ifp = netdev_priv(ndev);
+ 		ifp->ndev = ndev;
+ 		/* store mapping ifidx to bsscfgidx */
+diff --git a/drivers/net/wireless/hostap/hostap_main.c b/drivers/net/wireless/hostap/hostap_main.c
+index 15f0fad39add..65924450a500 100644
+--- a/drivers/net/wireless/hostap/hostap_main.c
++++ b/drivers/net/wireless/hostap/hostap_main.c
+@@ -73,7 +73,7 @@ struct net_device * hostap_add_interface(struct local_info *local,
+ 	dev->mem_end = mdev->mem_end;
+ 
+ 	hostap_setup_dev(dev, local, type);
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 
+ 	sprintf(dev->name, "%s%s", prefix, name);
+ 	if (!rtnl_locked)
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index cb34c7895f2a..4d6736c3f1f8 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -1740,7 +1740,7 @@ static const struct net_device_ops hwsim_netdev_ops = {
+ static void hwsim_mon_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops = &hwsim_netdev_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	ether_setup(dev);
+ 	dev->tx_queue_len = 0;
+ 	dev->type = ARPHRD_IEEE80211_RADIOTAP;
+diff --git a/drivers/net/wireless/marvell/mwifiex/main.c b/drivers/net/wireless/marvell/mwifiex/main.c
+index 782ed74dd00a..f7fd6a9e8c15 100644
+--- a/drivers/net/wireless/marvell/mwifiex/main.c
++++ b/drivers/net/wireless/marvell/mwifiex/main.c
+@@ -1254,7 +1254,7 @@ void mwifiex_init_priv_params(struct mwifiex_private *priv,
+ 			      struct net_device *dev)
+ {
+ 	dev->netdev_ops = &mwifiex_netdev_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	/* Initialize private structure */
+ 	priv->current_key_index = 0;
+ 	priv->media_connected = false;
+* Unmerged path drivers/staging/rtl8188eu/os_dep/mon.c
+diff --git a/drivers/usb/gadget/f_phonet.c b/drivers/usb/gadget/f_phonet.c
+index b21ab558b6c0..a3ed489381d2 100644
+--- a/drivers/usb/gadget/f_phonet.c
++++ b/drivers/usb/gadget/f_phonet.c
+@@ -286,7 +286,7 @@ static void pn_net_setup(struct net_device *dev)
+ 	dev->tx_queue_len	= 1;
+ 
+ 	dev->netdev_ops		= &pn_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ 	dev->header_ops		= &phonet_header_ops;
+ }
+ 
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/8021q/vlan_dev.c
+* Unmerged path net/batman-adv/soft-interface.c
+diff --git a/net/bluetooth/6lowpan.c b/net/bluetooth/6lowpan.c
+index 7437e9825acd..a268031f157a 100644
+--- a/net/bluetooth/6lowpan.c
++++ b/net/bluetooth/6lowpan.c
+@@ -653,7 +653,7 @@ static void netdev_setup(struct net_device *dev)
+ 
+ 	dev->netdev_ops		= &netdev_ops;
+ 	dev->header_ops		= &header_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ }
+ 
+ static struct device_type bt_type = {
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index f29f37ba5a74..2d3e7d5d1e10 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -385,7 +385,7 @@ void br_dev_setup(struct net_device *dev)
+ 	ether_setup(dev);
+ 
+ 	dev->netdev_ops = &br_netdev_ops;
+-	dev->destructor = free_netdev;
++	dev->needs_free_netdev = true;
+ 	dev->ethtool_ops = &br_ethtool_ops;
+ 	SET_NETDEV_DEVTYPE(dev, &br_type);
+ 	dev->priv_flags = IFF_EBRIDGE | IFF_NO_QUEUE;
+diff --git a/net/caif/chnl_net.c b/net/caif/chnl_net.c
+index 7344a8fa1bb0..40349b339205 100644
+--- a/net/caif/chnl_net.c
++++ b/net/caif/chnl_net.c
+@@ -395,14 +395,14 @@ static void chnl_net_destructor(struct net_device *dev)
+ {
+ 	struct chnl_net *priv = netdev_priv(dev);
+ 	caif_free_client(&priv->chnl);
+-	free_netdev(dev);
+ }
+ 
+ static void ipcaif_net_setup(struct net_device *dev)
+ {
+ 	struct chnl_net *priv;
+ 	dev->netdev_ops = &netdev_ops;
+-	dev->destructor = chnl_net_destructor;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = chnl_net_destructor;
+ 	dev->flags |= IFF_NOARP;
+ 	dev->flags |= IFF_POINTOPOINT;
+ 	dev->mtu = GPRS_PDP_MTU;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index a40c9678b9f6..148b742402ee 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -7299,6 +7299,8 @@ out:
+ err_uninit:
+ 	if (dev->netdev_ops->ndo_uninit)
+ 		dev->netdev_ops->ndo_uninit(dev);
++	if (dev->priv_destructor)
++		dev->priv_destructor(dev);
+ 	goto out;
+ }
+ EXPORT_SYMBOL(register_netdevice);
+@@ -7504,8 +7506,10 @@ void netdev_run_todo(void)
+ 		WARN_ON(rcu_access_pointer(dev->ip6_ptr));
+ 		WARN_ON(dev->dn_ptr);
+ 
+-		if (dev->destructor)
+-			dev->destructor(dev);
++		if (dev->priv_destructor)
++			dev->priv_destructor(dev);
++		if (dev->needs_free_netdev)
++			free_netdev(dev);
+ 
+ 		/* Report a network device has been unregistered */
+ 		rtnl_lock();
+* Unmerged path net/hsr/hsr_device.c
+diff --git a/net/ieee802154/6lowpan/core.c b/net/ieee802154/6lowpan/core.c
+index 61c83075fcd0..dfd291809624 100644
+--- a/net/ieee802154/6lowpan/core.c
++++ b/net/ieee802154/6lowpan/core.c
+@@ -108,7 +108,7 @@ static void lowpan_setup(struct net_device *ldev)
+ 
+ 	ldev->netdev_ops	= &lowpan_netdev_ops;
+ 	ldev->header_ops	= &lowpan_header_ops;
+-	ldev->destructor	= free_netdev;
++	ldev->needs_free_netdev	= true;
+ 	ldev->features		|= NETIF_F_NETNS_LOCAL;
+ }
+ 
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 021a3618b56c..748bb87f8605 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -926,7 +926,6 @@ static void ip_tunnel_dev_free(struct net_device *dev)
+ 	gro_cells_destroy(&tunnel->gro_cells);
+ 	dst_cache_destroy(&tunnel->dst_cache);
+ 	free_percpu(dev->tstats);
+-	free_netdev(dev);
+ }
+ 
+ void ip_tunnel_dellink(struct net_device *dev, struct list_head *head)
+@@ -1116,7 +1115,8 @@ int ip_tunnel_init(struct net_device *dev)
+ 	struct iphdr *iph = &tunnel->parms.iph;
+ 	int err;
+ 
+-	dev->destructor	= ip_tunnel_dev_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = ip_tunnel_dev_free;
+ 	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+ 	if (!dev->tstats)
+ 		return -ENOMEM;
+* Unmerged path net/ipv4/ipmr.c
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index 98dccbd41025..d9b56cd61a86 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -983,13 +983,13 @@ static void ip6gre_dev_free(struct net_device *dev)
+ 
+ 	dst_cache_destroy(&t->dst_cache);
+ 	free_percpu(dev->tstats);
+-	free_netdev(dev);
+ }
+ 
+ static void ip6gre_tunnel_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops = &ip6gre_netdev_ops;
+-	dev->destructor = ip6gre_dev_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = ip6gre_dev_free;
+ 
+ 	dev->type = ARPHRD_IP6GRE;
+ 
+@@ -1138,7 +1138,7 @@ static int __net_init ip6gre_init_net(struct net *net)
+ 	return 0;
+ 
+ err_reg_dev:
+-	ip6gre_dev_free(ign->fb_tunnel_dev);
++	free_netdev(ign->fb_tunnel_dev);
+ err_alloc_dev:
+ 	return err;
+ }
+@@ -1287,7 +1287,8 @@ static void ip6gre_tap_setup(struct net_device *dev)
+ 	ether_setup(dev);
+ 
+ 	dev->netdev_ops = &ip6gre_tap_netdev_ops;
+-	dev->destructor = ip6gre_dev_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = ip6gre_dev_free;
+ 
+ 	dev->features |= NETIF_F_NETNS_LOCAL;
+ 	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index ff03cc24166d..9144f2602a31 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -243,7 +243,6 @@ static void ip6_dev_free(struct net_device *dev)
+ 	gro_cells_destroy(&t->gro_cells);
+ 	dst_cache_destroy(&t->dst_cache);
+ 	free_percpu(dev->tstats);
+-	free_netdev(dev);
+ }
+ 
+ static int ip6_tnl_create2(struct net_device *dev)
+@@ -310,7 +309,7 @@ static struct ip6_tnl *ip6_tnl_create(struct net *net, struct __ip6_tnl_parm *p)
+ 	return t;
+ 
+ failed_free:
+-	ip6_dev_free(dev);
++	free_netdev(dev);
+ failed:
+ 	return ERR_PTR(err);
+ }
+@@ -1602,7 +1601,8 @@ static void ip6_tnl_dev_setup(struct net_device *dev)
+ 	struct ip6_tnl *t;
+ 
+ 	dev->netdev_ops = &ip6_tnl_netdev_ops;
+-	dev->destructor = ip6_dev_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = ip6_dev_free;
+ 
+ 	dev->type = ARPHRD_TUNNEL6;
+ 	dev->hard_header_len = LL_MAX_HEADER + sizeof (struct ipv6hdr);
+@@ -1942,7 +1942,7 @@ static int __net_init ip6_tnl_init_net(struct net *net)
+ 	return 0;
+ 
+ err_register:
+-	ip6_dev_free(ip6n->fb_tnl_dev);
++	free_netdev(ip6n->fb_tnl_dev);
+ err_alloc_dev:
+ 	return err;
+ }
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index 64a80c2177b7..522e6015dd3d 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -179,7 +179,6 @@ vti6_tnl_unlink(struct vti6_net *ip6n, struct ip6_tnl *t)
+ static void vti6_dev_free(struct net_device *dev)
+ {
+ 	free_percpu(dev->tstats);
+-	free_netdev(dev);
+ }
+ 
+ static int vti6_tnl_create2(struct net_device *dev)
+@@ -234,7 +233,7 @@ static struct ip6_tnl *vti6_tnl_create(struct net *net, struct __ip6_tnl_parm *p
+ 	return t;
+ 
+ failed_free:
+-	vti6_dev_free(dev);
++	free_netdev(dev);
+ failed:
+ 	return NULL;
+ }
+@@ -837,7 +836,8 @@ static const struct net_device_ops vti6_netdev_ops = {
+ static void vti6_dev_setup(struct net_device *dev)
+ {
+ 	dev->netdev_ops = &vti6_netdev_ops;
+-	dev->destructor = vti6_dev_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = vti6_dev_free;
+ 
+ 	dev->type = ARPHRD_TUNNEL6;
+ 	dev->hard_header_len = LL_MAX_HEADER + sizeof(struct ipv6hdr);
+@@ -1083,7 +1083,7 @@ static int __net_init vti6_init_net(struct net *net)
+ 	return 0;
+ 
+ err_register:
+-	vti6_dev_free(ip6n->fb_tnl_dev);
++	free_netdev(ip6n->fb_tnl_dev);
+ err_alloc_dev:
+ 	return err;
+ }
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+index c99bd79e4c53..a8a113910385 100644
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -733,7 +733,7 @@ static void reg_vif_setup(struct net_device *dev)
+ 	dev->mtu		= 1500 - sizeof(struct ipv6hdr) - 8;
+ 	dev->flags		= IFF_NOARP;
+ 	dev->netdev_ops		= &reg_vif_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ 	dev->features		|= NETIF_F_NETNS_LOCAL;
+ }
+ 
+* Unmerged path net/ipv6/sit.c
+* Unmerged path net/irda/irlan/irlan_eth.c
+diff --git a/net/l2tp/l2tp_eth.c b/net/l2tp/l2tp_eth.c
+index f1d1ef112330..6f3a6b2fcf9e 100644
+--- a/net/l2tp/l2tp_eth.c
++++ b/net/l2tp/l2tp_eth.c
+@@ -134,7 +134,7 @@ static void l2tp_eth_dev_setup(struct net_device *dev)
+ 	dev->priv_flags		&= ~IFF_TX_SKB_SHARING;
+ 	dev->features		|= NETIF_F_LLTX;
+ 	dev->netdev_ops		= &l2tp_eth_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ }
+ 
+ static void l2tp_eth_dev_recv(struct l2tp_session *session, struct sk_buff *skb, int data_len)
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 359b381e789e..51bacea2e7ba 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -1211,7 +1211,6 @@ static const struct net_device_ops ieee80211_monitorif_ops = {
+ static void ieee80211_if_free(struct net_device *dev)
+ {
+ 	free_percpu(dev->tstats);
+-	free_netdev(dev);
+ }
+ 
+ static void ieee80211_if_setup(struct net_device *dev)
+@@ -1219,7 +1218,8 @@ static void ieee80211_if_setup(struct net_device *dev)
+ 	ether_setup(dev);
+ 	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+ 	dev->netdev_ops = &ieee80211_dataif_ops;
+-	dev->destructor = ieee80211_if_free;
++	dev->needs_free_netdev = true;
++	dev->priv_destructor = ieee80211_if_free;
+ }
+ 
+ static void ieee80211_if_setup_no_queue(struct net_device *dev)
+@@ -1912,7 +1912,7 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
+ 
+ 		ret = register_netdevice(ndev);
+ 		if (ret) {
+-			ieee80211_if_free(ndev);
++			free_netdev(ndev);
+ 			return ret;
+ 		}
+ 	}
+diff --git a/net/mac802154/iface.c b/net/mac802154/iface.c
+index 170bd4fbaa05..162355cdc655 100644
+--- a/net/mac802154/iface.c
++++ b/net/mac802154/iface.c
+@@ -526,8 +526,6 @@ static void mac802154_wpan_free(struct net_device *dev)
+ 	struct ieee802154_sub_if_data *sdata = IEEE802154_DEV_TO_SUB_IF(dev);
+ 
+ 	mac802154_llsec_destroy(&sdata->sec);
+-
+-	free_netdev(dev);
+ }
+ 
+ static void ieee802154_if_setup(struct net_device *dev)
+@@ -593,7 +591,8 @@ ieee802154_setup_sdata(struct ieee802154_sub_if_data *sdata,
+ 					sdata->dev->dev_addr);
+ 
+ 		sdata->dev->header_ops = &mac802154_header_ops;
+-		sdata->dev->destructor = mac802154_wpan_free;
++		sdata->dev->needs_free_netdev = true;
++		sdata->dev->priv_destructor = mac802154_wpan_free;
+ 		sdata->dev->netdev_ops = &mac802154_wpan_ops;
+ 		sdata->dev->ml_priv = &mac802154_mlme_wpan;
+ 		wpan_dev->promiscuous_mode = false;
+@@ -608,7 +607,7 @@ ieee802154_setup_sdata(struct ieee802154_sub_if_data *sdata,
+ 
+ 		break;
+ 	case NL802154_IFTYPE_MONITOR:
+-		sdata->dev->destructor = free_netdev;
++		sdata->dev->needs_free_netdev = true;
+ 		sdata->dev->netdev_ops = &mac802154_monitor_ops;
+ 		wpan_dev->promiscuous_mode = true;
+ 		break;
+diff --git a/net/openvswitch/vport-internal_dev.c b/net/openvswitch/vport-internal_dev.c
+index d9a90c874130..9c33bd2608a2 100644
+--- a/net/openvswitch/vport-internal_dev.c
++++ b/net/openvswitch/vport-internal_dev.c
+@@ -103,7 +103,6 @@ static void internal_dev_destructor(struct net_device *dev)
+ 	struct vport *vport = ovs_internal_dev_get_vport(dev);
+ 
+ 	ovs_vport_free(vport);
+-	free_netdev(dev);
+ }
+ 
+ static struct rtnl_link_stats64 *
+@@ -167,7 +166,8 @@ static void do_setup(struct net_device *netdev)
+ 	netdev->priv_flags &= ~IFF_TX_SKB_SHARING;
+ 	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE | IFF_OPENVSWITCH |
+ 			      IFF_PHONY_HEADROOM | IFF_NO_QUEUE;
+-	netdev->destructor = internal_dev_destructor;
++	netdev->needs_free_netdev = true;
++	netdev->priv_destructor = internal_dev_destructor;
+ 	netdev->ethtool_ops = &internal_dev_ethtool_ops;
+ 	netdev->rtnl_link_ops = &internal_dev_link_ops;
+ 
+diff --git a/net/phonet/pep-gprs.c b/net/phonet/pep-gprs.c
+index a2fba7edfd1f..dd34b56ca037 100644
+--- a/net/phonet/pep-gprs.c
++++ b/net/phonet/pep-gprs.c
+@@ -245,7 +245,7 @@ static void gprs_setup(struct net_device *dev)
+ 	dev->tx_queue_len	= 10;
+ 
+ 	dev->netdev_ops		= &gprs_netdev_ops;
+-	dev->destructor		= free_netdev;
++	dev->needs_free_netdev	= true;
+ }
+ 
+ /*
