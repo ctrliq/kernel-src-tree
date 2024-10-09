@@ -1,0 +1,164 @@
+vfs: Generalize filesystem nodev handling.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] vfs: Generalize filesystem nodev handling ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 98.80%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit a2982cc922c3068783eb9a1f77a5626a1ec36a1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a2982cc9.failed
+
+Introduce a function may_open_dev that tests MNT_NODEV and a new
+superblock flab SB_I_NODEV.  Use this new function in all of the
+places where MNT_NODEV was previously tested.
+
+Add the new SB_I_NODEV s_iflag to proc, sysfs, and mqueuefs as those
+filesystems should never support device nodes, and a simple superblock
+flags makes that very hard to get wrong.  With SB_I_NODEV set if any
+device nodes somehow manage to show up on on a filesystem those
+device nodes will be unopenable.
+
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit a2982cc922c3068783eb9a1f77a5626a1ec36a1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/mount.c
+#	fs/proc/inode.c
+#	include/linux/fs.h
+#	ipc/mqueue.c
+diff --cc fs/kernfs/mount.c
+index 642fe1db4ffa,b3d73ad52b22..000000000000
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@@ -68,8 -151,11 +68,16 @@@ static int kernfs_fill_super(struct sup
+  	struct inode *inode;
+  	struct dentry *root;
+  
+++<<<<<<< HEAD
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+++=======
++ 	info->sb = sb;
++ 	/* Userspace would break if executables or devices appear on sysfs */
++ 	sb->s_iflags |= SB_I_NOEXEC | SB_I_NODEV;
++ 	sb->s_blocksize = PAGE_SIZE;
++ 	sb->s_blocksize_bits = PAGE_SHIFT;
+++>>>>>>> a2982cc922c3 (vfs: Generalize filesystem nodev handling.)
+  	sb->s_magic = magic;
+  	sb->s_op = &kernfs_sops;
+  	sb->s_time_gran = 1;
+diff --cc fs/proc/inode.c
+index 8d35dac92daf,a5b2c33745b7..000000000000
+--- a/fs/proc/inode.c
++++ b/fs/proc/inode.c
+@@@ -411,10 -457,17 +411,18 @@@ struct inode *proc_get_inode(struct sup
+  	return inode;
+  }
+  
+ -int proc_fill_super(struct super_block *s, void *data, int silent)
+ +int proc_fill_super(struct super_block *s)
+  {
+ -	struct pid_namespace *ns = get_pid_ns(s->s_fs_info);
+  	struct inode *root_inode;
+ -	int ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!proc_parse_options(data, ns))
++ 		return -EINVAL;
++ 
++ 	/* User space would break if executables or devices appear on proc */
++ 	s->s_iflags |= SB_I_USERNS_VISIBLE | SB_I_NOEXEC | SB_I_NODEV;
+++>>>>>>> a2982cc922c3 (vfs: Generalize filesystem nodev handling.)
+  	s->s_flags |= MS_NODIRATIME | MS_NOSUID | MS_NOEXEC;
+  	s->s_blocksize = 1024;
+  	s->s_blocksize_bits = 10;
+diff --cc include/linux/fs.h
+index 24213ce025a6,e05983170d23..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1396,8 -1324,13 +1396,18 @@@ struct mm_struct
+  #define UMOUNT_NOFOLLOW	0x00000008	/* Don't follow symlink on umount */
+  #define UMOUNT_UNUSED	0x80000000	/* Flag guaranteed to be unused */
+  
+++<<<<<<< HEAD
+ +extern struct list_head super_blocks;
+ +extern spinlock_t sb_lock;
+++=======
++ /* sb->s_iflags */
++ #define SB_I_CGROUPWB	0x00000001	/* cgroup-aware writeback enabled */
++ #define SB_I_NOEXEC	0x00000002	/* Ignore executables on this fs */
++ #define SB_I_NODEV	0x00000004	/* Ignore devices on this fs */
++ 
++ /* sb->s_iflags to limit user namespace mounts */
++ #define SB_I_USERNS_VISIBLE		0x00000010 /* fstype already mounted */
+++>>>>>>> a2982cc922c3 (vfs: Generalize filesystem nodev handling.)
+  
+  /* Possible states of 'frozen' field */
+  enum {
+diff --cc ipc/mqueue.c
+index 653f05809d9a,0b13ace266f2..000000000000
+--- a/ipc/mqueue.c
++++ b/ipc/mqueue.c
+@@@ -311,8 -307,9 +311,14 @@@ static int mqueue_fill_super(struct sup
+  	struct inode *inode;
+  	struct ipc_namespace *ns = sb->s_fs_info;
+  
+++<<<<<<< HEAD
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+++=======
++ 	sb->s_iflags |= SB_I_NOEXEC | SB_I_NODEV;
++ 	sb->s_blocksize = PAGE_SIZE;
++ 	sb->s_blocksize_bits = PAGE_SHIFT;
+++>>>>>>> a2982cc922c3 (vfs: Generalize filesystem nodev handling.)
+  	sb->s_magic = MQUEUE_MAGIC;
+  	sb->s_op = &mqueue_super_ops;
+  
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index a9db5f6ddc3f..10b623f6be0e 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -1861,7 +1861,7 @@ struct block_device *lookup_bdev(const char *pathname)
+ 	if (!S_ISBLK(inode->i_mode))
+ 		goto fail;
+ 	error = -EACCES;
+-	if (path.mnt->mnt_flags & MNT_NODEV)
++	if (!may_open_dev(&path))
+ 		goto fail;
+ 	error = -ENOMEM;
+ 	bdev = bd_acquire(inode);
+* Unmerged path fs/kernfs/mount.c
+diff --git a/fs/namei.c b/fs/namei.c
+index 999526d427c6..39114c323874 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2639,6 +2639,12 @@ int vfs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
+ 	return error;
+ }
+ 
++bool may_open_dev(const struct path *path)
++{
++	return !(path->mnt->mnt_flags & MNT_NODEV) &&
++		!(path->mnt->mnt_sb->s_iflags & SB_I_NODEV);
++}
++
+ static int may_open(struct path *path, int acc_mode, int flag)
+ {
+ 	struct dentry *dentry = path->dentry;
+@@ -2661,7 +2667,7 @@ static int may_open(struct path *path, int acc_mode, int flag)
+ 		break;
+ 	case S_IFBLK:
+ 	case S_IFCHR:
+-		if (path->mnt->mnt_flags & MNT_NODEV)
++		if (!may_open_dev(path))
+ 			return -EACCES;
+ 		/*FALLTHRU*/
+ 	case S_IFIFO:
+* Unmerged path fs/proc/inode.c
+* Unmerged path include/linux/fs.h
+* Unmerged path ipc/mqueue.c
