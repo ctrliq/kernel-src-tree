@@ -1,0 +1,124 @@
+net/mlx5: E-Switch, Vport ingress/egress ACLs rules for spoofchk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Vport ingress/egress ACLs rules for spoofchk (Don Dutile) [1383290 1417284]
+Rebuild_FUZZ: 96.77%
+commit-author Mohamad Haj Yahia <mohamad@mellanox.com>
+commit f942380c12394002efe0ca0be023e0f6fafbf29b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f942380c.failed
+
+Configure ingress and egress vport ACL rules according to spoofchk
+admin parameters.
+
+Ingress ACL flow table rules:
+if (!spoofchk && !vst) allow all traffic.
+else :
+1) one of the following rules :
+* if (spoofchk && vst) allow only untagged traffic with smac=original
+mac sent from the VF.
+* if (spoofchk && !vst) allow only traffic with smac=original mac sent
+from the VF.
+* if (!spoofchk && vst) allow only untagged traffic.
+2) drop all traffic that didn't hit #1.
+
+Add support for set vf spoofchk ndo.
+
+Add non zero mac validation in case of spoofchk to set mac ndo:
+when setting new mac we need to validate that the new mac is
+not zero while the spoofchk is on because it is illegal
+combination.
+
+	Signed-off-by: Mohamad Haj Yahia <mohamad@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f942380c12394002efe0ca0be023e0f6fafbf29b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 59fdb2081852,17d093cd6fc8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1378,8 -1422,8 +1434,9 @@@ static void node_guid_gen_from_mac(u64 
+  int mlx5_eswitch_set_vport_mac(struct mlx5_eswitch *esw,
+  			       int vport, u8 mac[ETH_ALEN])
+  {
+ +	u64 node_guid;
+  	int err = 0;
++ 	struct mlx5_vport *evport;
+  
+  	if (!ESW_ALLOWED(esw))
+  		return -EPERM;
+@@@ -1394,12 -1447,10 +1460,19 @@@
+  		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	node_guid_gen_from_mac(&node_guid, mac);
+ +	err = mlx5_modify_nic_vport_node_guid(esw->dev, vport, node_guid);
+ +	if (err)
+ +		mlx5_core_warn(esw->dev,
+ +			       "Failed to set vport %d node guid, err = %d. RDMA_CM will not function properly for this VF.\n",
+ +			       vport, err);
+++=======
++ 	mutex_lock(&esw->state_lock);
++ 	if (evport->enabled)
++ 		err = esw_vport_ingress_config(esw, evport);
++ 	mutex_unlock(&esw->state_lock);
+++>>>>>>> f942380c1239 (net/mlx5: E-Switch, Vport ingress/egress ACLs rules for spoofchk)
+  
+  	return err;
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d634db07bf6d..2d85f41da1b7 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2386,6 +2386,14 @@ static int mlx5e_set_vf_vlan(struct net_device *dev, int vf, u16 vlan, u8 qos)
+ 					   vlan, qos);
+ }
+ 
++static int mlx5e_set_vf_spoofchk(struct net_device *dev, int vf, bool setting)
++{
++	struct mlx5e_priv *priv = netdev_priv(dev);
++	struct mlx5_core_dev *mdev = priv->mdev;
++
++	return mlx5_eswitch_set_vport_spoofchk(mdev->priv.eswitch, vf + 1, setting);
++}
++
+ static int mlx5_vport_link2ifla(u8 esw_link)
+ {
+ 	switch (esw_link) {
+@@ -2553,6 +2561,7 @@ static const struct net_device_ops mlx5e_netdev_ops_sriov = {
+ #endif
+ 	.ndo_set_vf_mac          = mlx5e_set_vf_mac,
+ 	.ndo_set_vf_vlan         = mlx5e_set_vf_vlan,
++	.ndo_set_vf_spoofchk     = mlx5e_set_vf_spoofchk,
+ 	.ndo_get_vf_config       = mlx5e_get_vf_config,
+ 	.ndo_set_vf_link_state   = mlx5e_set_vf_link_state,
+ 	.ndo_get_vf_stats        = mlx5e_get_vf_stats,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 30d55ace4786..2f979c9bcb93 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -118,6 +118,7 @@ struct mlx5_vport {
+ 
+ 	u16                     vlan;
+ 	u8                      qos;
++	bool                    spoofchk;
+ 	bool                    enabled;
+ 	u16                     enabled_events;
+ };
+@@ -160,6 +161,8 @@ int mlx5_eswitch_set_vport_state(struct mlx5_eswitch *esw,
+ 				 int vport, int link_state);
+ int mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
+ 				int vport, u16 vlan, u8 qos);
++int mlx5_eswitch_set_vport_spoofchk(struct mlx5_eswitch *esw,
++				    int vport, bool spoofchk);
+ int mlx5_eswitch_get_vport_config(struct mlx5_eswitch *esw,
+ 				  int vport, struct ifla_vf_info *ivi);
+ int mlx5_eswitch_get_vport_stats(struct mlx5_eswitch *esw,
