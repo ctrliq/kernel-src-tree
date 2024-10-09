@@ -1,0 +1,198 @@
+nvme-pci: simplify __nvme_submit_cmd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 90ea5ca45c1fa09bec83ea106b9947170a00edb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/90ea5ca4.failed
+
+With recent CQ handling improvements we can now move the locking into
+__nvme_submit_cmd.  Also remove the local tail variable to make the code
+more obvious, remove the __ prefix in the name, and fix the comments
+describing the function.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jens Axboe <axboe@kernel.dk>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+(cherry picked from commit 90ea5ca45c1fa09bec83ea106b9947170a00edb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 332216cbb84e,4d0bb0e45401..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -418,46 -421,68 +418,43 @@@ static int nvme_pci_map_queues(struct b
+  }
+  
+  /**
+-  * __nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
++  * nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+   * @nvmeq: The queue to use
+   * @cmd: The command to send
+-  *
+-  * Safe to use from interrupt context
+   */
+- static void __nvme_submit_cmd(struct nvme_queue *nvmeq,
+- 						struct nvme_command *cmd)
++ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd)
+  {
+- 	u16 tail = nvmeq->sq_tail;
+- 
++ 	spin_lock(&nvmeq->sq_lock);
+  	if (nvmeq->sq_cmds_io)
+- 		memcpy_toio(&nvmeq->sq_cmds_io[tail], cmd, sizeof(*cmd));
++ 		memcpy_toio(&nvmeq->sq_cmds_io[nvmeq->sq_tail], cmd,
++ 				sizeof(*cmd));
+  	else
+- 		memcpy(&nvmeq->sq_cmds[tail], cmd, sizeof(*cmd));
++ 		memcpy(&nvmeq->sq_cmds[nvmeq->sq_tail], cmd, sizeof(*cmd));
+  
+- 	if (++tail == nvmeq->q_depth)
+- 		tail = 0;
+- 	if (nvme_dbbuf_update_and_check_event(tail, nvmeq->dbbuf_sq_db,
+- 					      nvmeq->dbbuf_sq_ei))
+- 		writel(tail, nvmeq->q_db);
+- 	nvmeq->sq_tail = tail;
++ 	if (++nvmeq->sq_tail == nvmeq->q_depth)
++ 		nvmeq->sq_tail = 0;
++ 	if (nvme_dbbuf_update_and_check_event(nvmeq->sq_tail,
++ 			nvmeq->dbbuf_sq_db, nvmeq->dbbuf_sq_ei))
++ 		writel(nvmeq->sq_tail, nvmeq->q_db);
++ 	spin_unlock(&nvmeq->sq_lock);
+  }
+  
+ -static void **nvme_pci_iod_list(struct request *req)
+ -{
+ -	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ -	return (void **)(iod->sg + blk_rq_nr_phys_segments(req));
+ -}
+ -
+ -static inline bool nvme_pci_use_sgls(struct nvme_dev *dev, struct request *req)
+ +static __le64 **iod_list(struct request *req)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ -	int nseg = blk_rq_nr_phys_segments(req);
+ -	unsigned int avg_seg_size;
+ -
+ -	if (nseg == 0)
+ -		return false;
+ -
+ -	avg_seg_size = DIV_ROUND_UP(blk_rq_payload_bytes(req), nseg);
+ -
+ -	if (!(dev->ctrl.sgls & ((1 << 0) | (1 << 1))))
+ -		return false;
+ -	if (!iod->nvmeq->qid)
+ -		return false;
+ -	if (!sgl_threshold || avg_seg_size < sgl_threshold)
+ -		return false;
+ -	return true;
+ +	return (__le64 **)(iod->sg + req->nr_phys_segments);
+  }
+  
+ -static blk_status_t nvme_init_iod(struct request *rq, struct nvme_dev *dev)
+ +static int nvme_init_iod(struct request *rq, unsigned size,
+ +		struct nvme_dev *dev)
+  {
+  	struct nvme_iod *iod = blk_mq_rq_to_pdu(rq);
+ -	int nseg = blk_rq_nr_phys_segments(rq);
+ -	unsigned int size = blk_rq_payload_bytes(rq);
+ -
+ -	iod->use_sgl = nvme_pci_use_sgls(dev, rq);
+ +	int nseg = rq->nr_phys_segments;
+  
+  	if (nseg > NVME_INT_PAGES || size > NVME_INT_BYTES(dev)) {
+ -		size_t alloc_size = nvme_pci_iod_alloc_size(dev, size, nseg,
+ -				iod->use_sgl);
+ -
+ -		iod->sg = kmalloc(alloc_size, GFP_ATOMIC);
+ +		iod->sg = kmalloc(nvme_iod_alloc_size(dev, size, nseg), GFP_ATOMIC);
+  		if (!iod->sg)
+ -			return BLK_STS_RESOURCE;
+ +			return BLK_MQ_RQ_QUEUE_BUSY;
+  	} else {
+  		iod->sg = iod->inline_sg;
+  	}
+@@@ -665,38 -868,36 +662,44 @@@ static int nvme_queue_rq(struct blk_mq_
+  	struct nvme_dev *dev = nvmeq->dev;
+  	struct request *req = bd->rq;
+  	struct nvme_command cmnd;
+ -	blk_status_t ret;
+ +	unsigned map_len;
+ +	int ret = BLK_MQ_RQ_QUEUE_OK;
+  
+ -	/*
+ -	 * We should not need to do this, but we're still using this to
+ -	 * ensure we can drain requests on a dying queue.
+ -	 */
+ -	if (unlikely(nvmeq->cq_vector < 0))
+ -		return BLK_STS_IOERR;
+ +	map_len = nvme_map_len(req);
+ +	ret = nvme_init_iod(req, map_len, dev);
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+ +		return ret;
+  
+  	ret = nvme_setup_cmd(ns, req, &cmnd);
+ -	if (ret)
+ -		return ret;
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+ +		goto out;
+  
+ -	ret = nvme_init_iod(req, dev);
+ -	if (ret)
+ -		goto out_free_cmd;
+ +	if (req->nr_phys_segments)
+ +		ret = nvme_map_data(dev, req, map_len, &cmnd);
+  
+ -	if (blk_rq_nr_phys_segments(req)) {
+ -		ret = nvme_map_data(dev, req, &cmnd);
+ -		if (ret)
+ -			goto out_cleanup_iod;
+ -	}
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+ +		goto out;
+  
+  	blk_mq_start_request(req);
+++<<<<<<< HEAD
+ +
+ +	spin_lock_irq(&nvmeq->q_lock);
+ +	if (unlikely(nvmeq->cq_vector < 0)) {
+ +		ret = BLK_MQ_RQ_QUEUE_ERROR;
+ +		spin_unlock_irq(&nvmeq->q_lock);
+ +		goto out;
+ +	}
+ +	__nvme_submit_cmd(nvmeq, &cmnd);
+ +	nvme_process_cq(nvmeq);
+ +	spin_unlock_irq(&nvmeq->q_lock);
+ +	return BLK_MQ_RQ_QUEUE_OK;
+ +out:
+++=======
++ 	nvme_submit_cmd(nvmeq, &cmnd);
++ 	return BLK_STS_OK;
++ out_cleanup_iod:
+++>>>>>>> 90ea5ca45c1f (nvme-pci: simplify __nvme_submit_cmd)
+  	nvme_free_iod(dev, req);
+ -out_free_cmd:
+ -	nvme_cleanup_cmd(req);
+  	return ret;
+  }
+  
+@@@ -817,10 -1052,7 +820,14 @@@ static void nvme_pci_submit_async_event
+  	memset(&c, 0, sizeof(c));
+  	c.common.opcode = nvme_admin_async_event;
+  	c.common.command_id = NVME_AQ_BLK_MQ_DEPTH;
+++<<<<<<< HEAD
+ +
+ +	spin_lock_irq(&nvmeq->q_lock);
+ +	__nvme_submit_cmd(nvmeq, &c);
+ +	spin_unlock_irq(&nvmeq->q_lock);
+++=======
++ 	nvme_submit_cmd(nvmeq, &c);
+++>>>>>>> 90ea5ca45c1f (nvme-pci: simplify __nvme_submit_cmd)
+  }
+  
+  static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
+* Unmerged path drivers/nvme/host/pci.c
