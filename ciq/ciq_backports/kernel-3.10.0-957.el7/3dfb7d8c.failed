@@ -1,0 +1,174 @@
+security: let security modules use PTRACE_MODE_* with bitmasks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [security] let security modules use PTRACE_MODE_* with bitmasks (Joe Lawrence) [1574784]
+Rebuild_FUZZ: 91.23%
+commit-author Jann Horn <jann@thejh.net>
+commit 3dfb7d8cdbc7ea0c2970450e60818bb3eefbad69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3dfb7d8c.failed
+
+It looks like smack and yama weren't aware that the ptrace mode
+can have flags ORed into it - PTRACE_MODE_NOAUDIT until now, but
+only for /proc/$pid/stat, and with the PTRACE_MODE_*CREDS patch,
+all modes have flags ORed into them.
+
+	Signed-off-by: Jann Horn <jann@thejh.net>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Casey Schaufler <casey@schaufler-ca.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: James Morris <james.l.morris@oracle.com>
+	Cc: "Serge E. Hallyn" <serge.hallyn@ubuntu.com>
+	Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Willy Tarreau <w@1wt.eu>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3dfb7d8cdbc7ea0c2970450e60818bb3eefbad69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/smack/smack_lsm.c
+diff --cc security/smack/smack_lsm.c
+index 42fad0f7949a,2d6e9bdea398..000000000000
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@@ -146,6 -361,107 +146,110 @@@ static int smk_copy_rules(struct list_h
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * smk_copy_relabel - copy smk_relabel labels list
++  * @nhead: new rules header pointer
++  * @ohead: old rules header pointer
++  * @gfp: type of the memory for the allocation
++  *
++  * Returns 0 on success, -ENOMEM on error
++  */
++ static int smk_copy_relabel(struct list_head *nhead, struct list_head *ohead,
++ 				gfp_t gfp)
++ {
++ 	struct smack_known_list_elem *nklep;
++ 	struct smack_known_list_elem *oklep;
++ 
++ 	INIT_LIST_HEAD(nhead);
++ 
++ 	list_for_each_entry(oklep, ohead, list) {
++ 		nklep = kzalloc(sizeof(struct smack_known_list_elem), gfp);
++ 		if (nklep == NULL) {
++ 			smk_destroy_label_list(nhead);
++ 			return -ENOMEM;
++ 		}
++ 		nklep->smk_label = oklep->smk_label;
++ 		list_add(&nklep->list, nhead);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * smk_ptrace_mode - helper function for converting PTRACE_MODE_* into MAY_*
++  * @mode - input mode in form of PTRACE_MODE_*
++  *
++  * Returns a converted MAY_* mode usable by smack rules
++  */
++ static inline unsigned int smk_ptrace_mode(unsigned int mode)
++ {
++ 	if (mode & PTRACE_MODE_ATTACH)
++ 		return MAY_READWRITE;
++ 	if (mode & PTRACE_MODE_READ)
++ 		return MAY_READ;
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * smk_ptrace_rule_check - helper for ptrace access
++  * @tracer: tracer process
++  * @tracee_known: label entry of the process that's about to be traced
++  * @mode: ptrace attachment mode (PTRACE_MODE_*)
++  * @func: name of the function that called us, used for audit
++  *
++  * Returns 0 on access granted, -error on error
++  */
++ static int smk_ptrace_rule_check(struct task_struct *tracer,
++ 				 struct smack_known *tracee_known,
++ 				 unsigned int mode, const char *func)
++ {
++ 	int rc;
++ 	struct smk_audit_info ad, *saip = NULL;
++ 	struct task_smack *tsp;
++ 	struct smack_known *tracer_known;
++ 
++ 	if ((mode & PTRACE_MODE_NOAUDIT) == 0) {
++ 		smk_ad_init(&ad, func, LSM_AUDIT_DATA_TASK);
++ 		smk_ad_setfield_u_tsk(&ad, tracer);
++ 		saip = &ad;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	tsp = __task_cred(tracer)->security;
++ 	tracer_known = smk_of_task(tsp);
++ 
++ 	if ((mode & PTRACE_MODE_ATTACH) &&
++ 	    (smack_ptrace_rule == SMACK_PTRACE_EXACT ||
++ 	     smack_ptrace_rule == SMACK_PTRACE_DRACONIAN)) {
++ 		if (tracer_known->smk_known == tracee_known->smk_known)
++ 			rc = 0;
++ 		else if (smack_ptrace_rule == SMACK_PTRACE_DRACONIAN)
++ 			rc = -EACCES;
++ 		else if (capable(CAP_SYS_PTRACE))
++ 			rc = 0;
++ 		else
++ 			rc = -EACCES;
++ 
++ 		if (saip)
++ 			smack_log(tracer_known->smk_known,
++ 				  tracee_known->smk_known,
++ 				  0, rc, saip);
++ 
++ 		rcu_read_unlock();
++ 		return rc;
++ 	}
++ 
++ 	/* In case of rule==SMACK_PTRACE_DEFAULT or mode==PTRACE_MODE_READ */
++ 	rc = smk_tskacc(tsp, tracee_known, smk_ptrace_mode(mode), saip);
++ 
++ 	rcu_read_unlock();
++ 	return rc;
++ }
++ 
+++>>>>>>> 3dfb7d8cdbc7 (security: let security modules use PTRACE_MODE_* with bitmasks)
+  /*
+   * LSM hooks.
+   * We he, that is fun!
+* Unmerged path security/smack/smack_lsm.c
+diff --git a/security/yama/yama_lsm.c b/security/yama/yama_lsm.c
+index 13c88fbcf037..0038834b558e 100644
+--- a/security/yama/yama_lsm.c
++++ b/security/yama/yama_lsm.c
+@@ -292,7 +292,7 @@ int yama_ptrace_access_check(struct task_struct *child,
+ 		return rc;
+ 
+ 	/* require ptrace target be a child of ptracer on attach */
+-	if (mode == PTRACE_MODE_ATTACH) {
++	if (mode & PTRACE_MODE_ATTACH) {
+ 		switch (ptrace_scope) {
+ 		case YAMA_SCOPE_DISABLED:
+ 			/* No additional restrictions. */
+@@ -318,7 +318,7 @@ int yama_ptrace_access_check(struct task_struct *child,
+ 		}
+ 	}
+ 
+-	if (rc) {
++	if (rc && (mode & PTRACE_MODE_NOAUDIT) == 0) {
+ 		printk_ratelimited(KERN_NOTICE
+ 			"ptrace of pid %d was attempted by: %s (pid %d)\n",
+ 			child->pid, current->comm, current->pid);
