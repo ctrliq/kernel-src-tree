@@ -1,0 +1,130 @@
+scsi: qla2xxx: Do not call abort handler function during chip reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Do not call abort handler function during chip reset (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 95.31%
+commit-author Sawan Chandak <sawan.chandak@cavium.com>
+commit d61cca60aa79aa5afde29e37e26aff819e5b2f16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d61cca60.failed
+
+If there are IO's running and host reset or chip reset is triggered,
+IO's can fail due to rport time out. During chip reset recovery process,
+driver notifies the transport layer that remote port no longer exist, by
+calling fc_remote_port_delete(). When this function is called, it
+actually delays deletion by "blocking" it. It sets the remote port state
+to "FC_PORTSTATE_BLOCKED" and sets FC_RPORT_DEVLOSS_PENDING.  When
+driver tries to abort the command by calling its abort handler function,
+abort handler will wait until remote port state is blocked state or wait
+for dev_loss_tmo time. Due to this blocking, rport times out and results
+in an IO failure. This patch adds a check for any active reset process
+before calling abort handler function.
+
+[mkp: typo]
+
+	Signed-off-by: Sawan Chandak <sawan.chandak@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d61cca60aa79aa5afde29e37e26aff819e5b2f16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c724f888aca6,56bd086b79ea..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -1590,27 -1720,67 +1590,90 @@@ qla2x00_abort_all_cmds(scsi_qla_host_t 
+  		for (cnt = 1; cnt < req->num_outstanding_cmds; cnt++) {
+  			sp = req->outstanding_cmds[cnt];
+  			if (sp) {
+++<<<<<<< HEAD
+ +				/* Don't abort commands in adapter during EEH
+ +				 * recovery as it's not accessible/responding.
+ +				 */
+ +				if (GET_CMD_SP(sp) && !ha->flags.eeh_busy &&
+ +				    (sp->type == SRB_SCSI_CMD)) {
+ +					/* Get a reference to the sp and drop the lock.
+ +					 * The reference ensures this sp->done() call
+ +					 * - and not the call in qla2xxx_eh_abort() -
+ +					 * ends the SCSI command (with result 'res').
+ +					 */
+ +					sp_get(sp);
+ +					spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +					status = qla2xxx_eh_abort(GET_CMD_SP(sp));
+ +					spin_lock_irqsave(&ha->hardware_lock, flags);
+ +					/* Get rid of extra reference if immediate exit
+ +					 * from ql2xxx_eh_abort */
+ +					if (status == FAILED && (qla2x00_isp_reg_stat(ha)))
+ +						atomic_dec(&sp->ref_count);
+++=======
++ 				req->outstanding_cmds[cnt] = NULL;
++ 				if (sp->cmd_type == TYPE_SRB) {
++ 					if (sp->type == SRB_NVME_CMD ||
++ 					    sp->type == SRB_NVME_LS) {
++ 						sp_get(sp);
++ 						spin_unlock_irqrestore(
++ 						    &ha->hardware_lock, flags);
++ 						qla_nvme_abort(ha, sp);
++ 						spin_lock_irqsave(
++ 						    &ha->hardware_lock, flags);
++ 					} else if (GET_CMD_SP(sp) &&
++ 					    !ha->flags.eeh_busy &&
++ 					    (!test_bit(ABORT_ISP_ACTIVE,
++ 						&vha->dpc_flags)) &&
++ 					    (sp->type == SRB_SCSI_CMD)) {
++ 						/*
++ 						 * Don't abort commands in
++ 						 * adapter during EEH
++ 						 * recovery as it's not
++ 						 * accessible/responding.
++ 						 *
++ 						 * Get a reference to the sp
++ 						 * and drop the lock. The
++ 						 * reference ensures this
++ 						 * sp->done() call and not the
++ 						 * call in qla2xxx_eh_abort()
++ 						 * ends the SCSI command (with
++ 						 * result 'res').
++ 						 */
++ 						sp_get(sp);
++ 						spin_unlock_irqrestore(
++ 						    &ha->hardware_lock, flags);
++ 						status = qla2xxx_eh_abort(
++ 						    GET_CMD_SP(sp));
++ 						spin_lock_irqsave(
++ 						    &ha->hardware_lock, flags);
++ 						/*
++ 						 * Get rid of extra reference
++ 						 * if immediate exit from
++ 						 * ql2xxx_eh_abort
++ 						 */
++ 						if (status == FAILED &&
++ 						    (qla2x00_isp_reg_stat(ha)))
++ 							atomic_dec(
++ 							    &sp->ref_count);
++ 					}
++ 					sp->done(sp, res);
++ 				} else {
++ 					if (!vha->hw->tgt.tgt_ops || !tgt ||
++ 					    qla_ini_mode_enabled(vha)) {
++ 						if (!trace)
++ 							ql_dbg(ql_dbg_tgt_mgt,
++ 							    vha, 0xf003,
++ 							    "HOST-ABORT-HNDLR: dpc_flags=%lx. Target mode disabled\n",
++ 							    vha->dpc_flags);
++ 						continue;
++ 					}
++ 					cmd = (struct qla_tgt_cmd *)sp;
++ 					qlt_abort_cmd_on_host_reset(cmd->vha,
++ 					    cmd);
+++>>>>>>> d61cca60aa79 (scsi: qla2xxx: Do not call abort handler function during chip reset)
+  				}
+ +				req->outstanding_cmds[cnt] = NULL;
+ +				sp->done(vha, sp, res);
+  			}
+  		}
+  	}
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
