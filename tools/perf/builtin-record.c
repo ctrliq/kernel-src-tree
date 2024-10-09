@@ -48,7 +48,6 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
-#include <asm/bug.h>
 #include <linux/time64.h>
 
 struct switch_output {
