@@ -1,0 +1,325 @@
+mlxsw: spectrum: Set port's mode according to FID mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 4aafc368daac7781576ca6144622254adf469a15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4aafc368.failed
+
+We currently transition the port to "Virtual mode" upon the creation of
+its first VLAN upper, as we need to classify incoming packets to a FID
+using {Port, VID} and not only the VID.
+
+However, it's more appropriate to transition the port to this mode when
+the {Port, VID} are actually mapped to a FID. Either during the
+enslavement of the VLAN upper to a VLAN-unaware bridge or the
+configuration of a router port.
+
+Do this change now in preparation for the introduction of the FID core,
+where this operation will be encapsulated.
+
+To prevent regressions, this patch also explicitly configures an OVS
+slave to "Virtual mode". Otherwise, a packet that didn't hit an ACL rule
+could be classified to an existing FID based on a global VID-to-FID
+mapping, thus not incurring a FID mis-classification, which would
+otherwise trap the packet to the CPU to be processed by the OVS daemon.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4aafc368daac7781576ca6144622254adf469a15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 280114e1ebf6,277a432af319..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@@ -302,6 -252,8 +302,11 @@@ struct mlxsw_sp_port 
+  		struct rtnl_link_stats64 *cache;
+  		struct delayed_work update_dw;
+  	} hw_stats;
+++<<<<<<< HEAD
+++=======
++ 	struct mlxsw_sp_port_sample *sample;
++ 	unsigned int nr_port_vid_map;  /* {Port, VID} => FID mappings */
+++>>>>>>> 4aafc368daac (mlxsw: spectrum: Set port's mode according to FID mappings)
+  };
+  
+  bool mlxsw_sp_port_dev_check(const struct net_device *dev);
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index f8e7036e3f4a,cb5e86ad0f66..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -2857,32 -3110,72 +2857,90 @@@ static int mlxsw_sp_vport_rif_sp_join(s
+  				      struct net_device *l3_dev)
+  {
+  	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_vport->mlxsw_sp;
+++<<<<<<< HEAD
+ +	struct mlxsw_sp_rif *r;
+++=======
++ 	u16 vid = mlxsw_sp_vport_vid_get(mlxsw_sp_vport);
++ 	struct mlxsw_sp_port *mlxsw_sp_port;
++ 	struct mlxsw_sp_rif *rif;
++ 	int err;
+++>>>>>>> 4aafc368daac (mlxsw: spectrum: Set port's mode according to FID mappings)
+  
+ -	rif = mlxsw_sp_rif_find_by_dev(mlxsw_sp, l3_dev);
+ -	if (!rif) {
+ -		rif = mlxsw_sp_vport_rif_sp_create(mlxsw_sp_vport, l3_dev);
+ -		if (IS_ERR(rif))
+ -			return PTR_ERR(rif);
+ +	r = mlxsw_sp_rif_find_by_dev(mlxsw_sp, l3_dev);
+ +	if (!r) {
+ +		r = mlxsw_sp_vport_rif_sp_create(mlxsw_sp_vport, l3_dev);
+ +		if (IS_ERR(r))
+ +			return PTR_ERR(r);
+  	}
+  
+ -	err = mlxsw_sp_port_vid_learning_set(mlxsw_sp_vport, vid, false);
+ -	if (err)
+ -		goto err_port_vid_learning_set;
+ +	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, r->f);
+ +	r->f->ref_count++;
+  
+++<<<<<<< HEAD
+ +	netdev_dbg(mlxsw_sp_vport->dev, "Joined FID=%d\n", r->f->fid);
+ +
+ +	return 0;
+++=======
++ 	err = mlxsw_sp_port_vid_stp_set(mlxsw_sp_vport, vid,
++ 					BR_STATE_FORWARDING);
++ 	if (err)
++ 		goto err_port_vid_stp_set;
++ 
++ 	mlxsw_sp_port = mlxsw_sp_vport_port(mlxsw_sp_vport);
++ 	if (mlxsw_sp_port->nr_port_vid_map++ == 0) {
++ 		err = mlxsw_sp_port_vp_mode_trans(mlxsw_sp_port);
++ 		if (err)
++ 			goto err_port_vp_mode_trans;
++ 	}
++ 
++ 	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, rif->f);
++ 	rif->f->ref_count++;
++ 
++ 	netdev_dbg(mlxsw_sp_vport->dev, "Joined FID=%d\n", rif->f->fid);
++ 
++ 	return 0;
++ 
++ err_port_vp_mode_trans:
++ 	mlxsw_sp_port->nr_port_vid_map--;
++ 	mlxsw_sp_port_vid_stp_set(mlxsw_sp_vport, vid, BR_STATE_BLOCKING);
++ err_port_vid_stp_set:
++ 	mlxsw_sp_port_vid_learning_set(mlxsw_sp_vport, vid, true);
++ err_port_vid_learning_set:
++ 	if (rif->f->ref_count == 0)
++ 		mlxsw_sp_vport_rif_sp_destroy(mlxsw_sp_vport, rif);
++ 	return err;
+++>>>>>>> 4aafc368daac (mlxsw: spectrum: Set port's mode according to FID mappings)
+  }
+  
+  static void mlxsw_sp_vport_rif_sp_leave(struct mlxsw_sp_port *mlxsw_sp_vport)
+  {
+  	struct mlxsw_sp_fid *f = mlxsw_sp_vport_fid_get(mlxsw_sp_vport);
+++<<<<<<< HEAD
+ +
+ +	netdev_dbg(mlxsw_sp_vport->dev, "Left FID=%d\n", f->fid);
+ +
+ +	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, NULL);
+ +	if (--f->ref_count == 0)
+ +		mlxsw_sp_vport_rif_sp_destroy(mlxsw_sp_vport, f->r);
+++=======
++ 	u16 vid = mlxsw_sp_vport_vid_get(mlxsw_sp_vport);
++ 	struct mlxsw_sp_port *mlxsw_sp_port;
++ 
++ 	netdev_dbg(mlxsw_sp_vport->dev, "Left FID=%d\n", f->fid);
++ 
++ 	f->ref_count--;
++ 	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, NULL);
++ 
++ 	mlxsw_sp_port = mlxsw_sp_vport_port(mlxsw_sp_vport);
++ 	if (mlxsw_sp_port->nr_port_vid_map == 1)
++ 		mlxsw_sp_port_vlan_mode_trans(mlxsw_sp_port);
++ 	mlxsw_sp_port->nr_port_vid_map--;
++ 	mlxsw_sp_port_vid_stp_set(mlxsw_sp_vport, vid, BR_STATE_BLOCKING);
++ 	mlxsw_sp_port_vid_learning_set(mlxsw_sp_vport, vid, true);
++ 
++ 	if (f->ref_count == 0)
++ 		mlxsw_sp_vport_rif_sp_destroy(mlxsw_sp_vport, f->rif);
+++>>>>>>> 4aafc368daac (mlxsw: spectrum: Set port's mode according to FID mappings)
+  }
+  
+  static int mlxsw_sp_inetaddr_vport_event(struct net_device *l3_dev,
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 4a2dd98ae919..93a643f42e19 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -1389,7 +1389,7 @@ int mlxsw_sp_port_vlan_set(struct mlxsw_sp_port *mlxsw_sp_port, u16 vid_begin,
+ 	return 0;
+ }
+ 
+-static int mlxsw_sp_port_vp_mode_trans(struct mlxsw_sp_port *mlxsw_sp_port)
++int mlxsw_sp_port_vp_mode_trans(struct mlxsw_sp_port *mlxsw_sp_port)
+ {
+ 	enum mlxsw_reg_svfa_mt mt = MLXSW_REG_SVFA_MT_PORT_VID_TO_FID;
+ 	u16 vid, last_visited_vid;
+@@ -1419,7 +1419,7 @@ err_port_vid_to_fid_set:
+ 	return err;
+ }
+ 
+-static int mlxsw_sp_port_vlan_mode_trans(struct mlxsw_sp_port *mlxsw_sp_port)
++int mlxsw_sp_port_vlan_mode_trans(struct mlxsw_sp_port *mlxsw_sp_port)
+ {
+ 	enum mlxsw_reg_svfa_mt mt = MLXSW_REG_SVFA_MT_PORT_VID_TO_FID;
+ 	u16 vid;
+@@ -1492,16 +1492,6 @@ static int mlxsw_sp_port_add_vid(struct net_device *dev,
+ 	if (!mlxsw_sp_vport)
+ 		return -ENOMEM;
+ 
+-	/* When adding the first VLAN interface on a bridged port we need to
+-	 * transition all the active 802.1Q bridge VLANs to use explicit
+-	 * {Port, VID} to FID mappings and set the port's mode to Virtual mode.
+-	 */
+-	if (list_is_singular(&mlxsw_sp_port->vports_list)) {
+-		err = mlxsw_sp_port_vp_mode_trans(mlxsw_sp_port);
+-		if (err)
+-			goto err_port_vp_mode_trans;
+-	}
+-
+ 	err = mlxsw_sp_port_vlan_set(mlxsw_sp_vport, vid, vid, true, untagged);
+ 	if (err)
+ 		goto err_port_add_vid;
+@@ -1509,9 +1499,6 @@ static int mlxsw_sp_port_add_vid(struct net_device *dev,
+ 	return 0;
+ 
+ err_port_add_vid:
+-	if (list_is_singular(&mlxsw_sp_port->vports_list))
+-		mlxsw_sp_port_vlan_mode_trans(mlxsw_sp_port);
+-err_port_vp_mode_trans:
+ 	mlxsw_sp_port_vport_destroy(mlxsw_sp_vport);
+ 	return err;
+ }
+@@ -1542,13 +1529,6 @@ static int mlxsw_sp_port_kill_vid(struct net_device *dev,
+ 	if (f && !WARN_ON(!f->leave))
+ 		f->leave(mlxsw_sp_vport);
+ 
+-	/* When removing the last VLAN interface on a bridged port we need to
+-	 * transition all active 802.1Q bridge VLANs to use VID to FID
+-	 * mappings and set port's mode to VLAN mode.
+-	 */
+-	if (list_is_singular(&mlxsw_sp_port->vports_list))
+-		mlxsw_sp_port_vlan_mode_trans(mlxsw_sp_port);
+-
+ 	mlxsw_sp_port_vport_destroy(mlxsw_sp_vport);
+ 
+ 	return 0;
+@@ -4261,9 +4241,12 @@ static int mlxsw_sp_port_ovs_join(struct mlxsw_sp_port *mlxsw_sp_port)
+ {
+ 	int err;
+ 
+-	err = mlxsw_sp_port_stp_set(mlxsw_sp_port, true);
++	err = mlxsw_sp_port_vp_mode_set(mlxsw_sp_port, true);
+ 	if (err)
+ 		return err;
++	err = mlxsw_sp_port_stp_set(mlxsw_sp_port, true);
++	if (err)
++		goto err_port_stp_set;
+ 	err = mlxsw_sp_port_vlan_set(mlxsw_sp_port, 2, VLAN_N_VID - 1,
+ 				     true, false);
+ 	if (err)
+@@ -4272,6 +4255,8 @@ static int mlxsw_sp_port_ovs_join(struct mlxsw_sp_port *mlxsw_sp_port)
+ 
+ err_port_vlan_set:
+ 	mlxsw_sp_port_stp_set(mlxsw_sp_port, false);
++err_port_stp_set:
++	mlxsw_sp_port_vp_mode_set(mlxsw_sp_port, false);
+ 	return err;
+ }
+ 
+@@ -4280,6 +4265,7 @@ static void mlxsw_sp_port_ovs_leave(struct mlxsw_sp_port *mlxsw_sp_port)
+ 	mlxsw_sp_port_vlan_set(mlxsw_sp_port, 2, VLAN_N_VID - 1,
+ 			       false, false);
+ 	mlxsw_sp_port_stp_set(mlxsw_sp_port, false);
++	mlxsw_sp_port_vp_mode_set(mlxsw_sp_port, false);
+ }
+ 
+ static int mlxsw_sp_netdevice_port_upper_event(struct net_device *dev,
+@@ -4586,6 +4572,7 @@ static int mlxsw_sp_vport_fid_map(struct mlxsw_sp_port *mlxsw_sp_vport, u16 fid,
+ static int mlxsw_sp_vport_vfid_join(struct mlxsw_sp_port *mlxsw_sp_vport,
+ 				    struct net_device *br_dev)
+ {
++	struct mlxsw_sp_port *mlxsw_sp_port;
+ 	struct mlxsw_sp_fid *f;
+ 	int err;
+ 
+@@ -4604,6 +4591,13 @@ static int mlxsw_sp_vport_vfid_join(struct mlxsw_sp_port *mlxsw_sp_vport,
+ 	if (err)
+ 		goto err_vport_fid_map;
+ 
++	mlxsw_sp_port = mlxsw_sp_vport_port(mlxsw_sp_vport);
++	if (mlxsw_sp_port->nr_port_vid_map++ == 0) {
++		err = mlxsw_sp_port_vp_mode_trans(mlxsw_sp_port);
++		if (err)
++			goto err_port_vp_mode_trans;
++	}
++
+ 	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, f);
+ 	f->ref_count++;
+ 
+@@ -4611,6 +4605,9 @@ static int mlxsw_sp_vport_vfid_join(struct mlxsw_sp_port *mlxsw_sp_vport,
+ 
+ 	return 0;
+ 
++err_port_vp_mode_trans:
++	mlxsw_sp_port->nr_port_vid_map--;
++	mlxsw_sp_vport_fid_map(mlxsw_sp_vport, f->fid, false);
+ err_vport_fid_map:
+ 	mlxsw_sp_vport_flood_set(mlxsw_sp_vport, f->fid, false);
+ err_vport_flood_set:
+@@ -4622,17 +4619,25 @@ err_vport_flood_set:
+ static void mlxsw_sp_vport_vfid_leave(struct mlxsw_sp_port *mlxsw_sp_vport)
+ {
+ 	struct mlxsw_sp_fid *f = mlxsw_sp_vport_fid_get(mlxsw_sp_vport);
++	struct mlxsw_sp_port *mlxsw_sp_port;
+ 
+ 	netdev_dbg(mlxsw_sp_vport->dev, "Left FID=%d\n", f->fid);
+ 
++	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, NULL);
++	f->ref_count--;
++
++	mlxsw_sp_port = mlxsw_sp_vport_port(mlxsw_sp_vport);
++	if (mlxsw_sp_port->nr_port_vid_map == 1)
++		mlxsw_sp_port_vlan_mode_trans(mlxsw_sp_port);
++	mlxsw_sp_port->nr_port_vid_map--;
++
+ 	mlxsw_sp_vport_fid_map(mlxsw_sp_vport, f->fid, false);
+ 
+ 	mlxsw_sp_vport_flood_set(mlxsw_sp_vport, f->fid, false);
+ 
+ 	mlxsw_sp_port_fdb_flush(mlxsw_sp_vport, f->fid);
+ 
+-	mlxsw_sp_vport_fid_set(mlxsw_sp_vport, NULL);
+-	if (--f->ref_count == 0)
++	if (f->ref_count == 0)
+ 		mlxsw_sp_vfid_destroy(mlxsw_sp_vport->mlxsw_sp, f);
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 44693bdf62ad..3e4ba6592b81 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -595,7 +595,7 @@ static int mlxsw_sp_port_fid_map(struct mlxsw_sp_port *mlxsw_sp_port, u16 fid,
+ 	/* If port doesn't have vPorts, then it can use the global
+ 	 * VID-to-FID mapping.
+ 	 */
+-	if (list_empty(&mlxsw_sp_port->vports_list))
++	if (mlxsw_sp_port->nr_port_vid_map == 0)
+ 		return 0;
+ 
+ 	return mlxsw_sp_port_vid_to_fid_set(mlxsw_sp_port, mt, valid, fid, fid);
