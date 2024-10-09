@@ -1,0 +1,133 @@
+target: Fix race between iscsi-target connection shutdown + ABORT_TASK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Fix race between iscsi-target connection shutdown + ABORT_TASK (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.94%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 064cdd2d91c2805d788876082f31cc63506f22c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/064cdd2d.failed
+
+This patch fixes a race in iscsit_release_commands_from_conn() ->
+iscsit_free_cmd() -> transport_generic_free_cmd() + wait_for_tasks=1,
+where CMD_T_FABRIC_STOP could end up being set after the final
+kref_put() is called from core_tmr_abort_task() context.
+
+This results in transport_generic_free_cmd() blocking indefinately
+on se_cmd->cmd_wait_comp, because the target_release_cmd_kref()
+check for CMD_T_FABRIC_STOP returns false.
+
+To address this bug, make iscsit_release_commands_from_conn()
+do list_splice and set CMD_T_FABRIC_STOP early while holding
+iscsi_conn->cmd_lock.  Also make iscsit_aborted_task() only
+remove iscsi_cmd_t if CMD_T_FABRIC_STOP has not already been
+set.
+
+Finally in target_release_cmd_kref(), only honor fabric_stop
+if CMD_T_ABORTED has been set.
+
+	Cc: Mike Christie <mchristi@redhat.com>
+	Cc: Quinn Tran <quinn.tran@qlogic.com>
+	Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: stable@vger.kernel.org # 3.14+
+	Tested-by: Nicholas Bellinger <nab@linux-iscsi.org>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 064cdd2d91c2805d788876082f31cc63506f22c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_transport.c
+index 68bc47c2e404,38bf2dcf926a..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -2546,14 -2553,20 +2546,28 @@@ static void target_release_cmd_kref(str
+  {
+  	struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
+  	struct se_session *se_sess = se_cmd->se_sess;
+ -	unsigned long flags;
+ -	bool fabric_stop;
+  
+++<<<<<<< HEAD
+ +	if (list_empty(&se_cmd->se_cmd_list)) {
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+ +		se_cmd->se_tfo->release_cmd(se_cmd);
+ +		return;
+ +	}
+ +	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
+ +		spin_unlock(&se_sess->sess_cmd_lock);
+++=======
++ 	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
++ 
++ 	spin_lock(&se_cmd->t_state_lock);
++ 	fabric_stop = (se_cmd->transport_state & CMD_T_FABRIC_STOP) &&
++ 		      (se_cmd->transport_state & CMD_T_ABORTED);
++ 	spin_unlock(&se_cmd->t_state_lock);
++ 
++ 	if (se_cmd->cmd_wait_set || fabric_stop) {
++ 		list_del_init(&se_cmd->se_cmd_list);
++ 		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 		target_free_cmd_mem(se_cmd);
+++>>>>>>> 064cdd2d91c2 (target: Fix race between iscsi-target connection shutdown + ABORT_TASK)
+  		complete(&se_cmd->cmd_wait_comp);
+  		return;
+  	}
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index eaa0803bafc9..24cad6b354eb 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -492,7 +492,8 @@ void iscsit_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+ 	bool scsi_cmd = (cmd->iscsi_opcode == ISCSI_OP_SCSI_CMD);
+ 
+ 	spin_lock_bh(&conn->cmd_lock);
+-	if (!list_empty(&cmd->i_conn_node))
++	if (!list_empty(&cmd->i_conn_node) &&
++	    !(cmd->se_cmd.transport_state & CMD_T_FABRIC_STOP))
+ 		list_del_init(&cmd->i_conn_node);
+ 	spin_unlock_bh(&conn->cmd_lock);
+ 
+@@ -4046,6 +4047,7 @@ int iscsi_target_rx_thread(void *arg)
+ 
+ static void iscsit_release_commands_from_conn(struct iscsi_conn *conn)
+ {
++	LIST_HEAD(tmp_list);
+ 	struct iscsi_cmd *cmd = NULL, *cmd_tmp = NULL;
+ 	struct iscsi_session *sess = conn->sess;
+ 	/*
+@@ -4054,18 +4056,26 @@ static void iscsit_release_commands_from_conn(struct iscsi_conn *conn)
+ 	 * has been reset -> returned sleeping pre-handler state.
+ 	 */
+ 	spin_lock_bh(&conn->cmd_lock);
+-	list_for_each_entry_safe(cmd, cmd_tmp, &conn->conn_cmd_list, i_conn_node) {
++	list_splice_init(&conn->conn_cmd_list, &tmp_list);
+ 
++	list_for_each_entry(cmd, &tmp_list, i_conn_node) {
++		struct se_cmd *se_cmd = &cmd->se_cmd;
++
++		if (se_cmd->se_tfo != NULL) {
++			spin_lock(&se_cmd->t_state_lock);
++			se_cmd->transport_state |= CMD_T_FABRIC_STOP;
++			spin_unlock(&se_cmd->t_state_lock);
++		}
++	}
++	spin_unlock_bh(&conn->cmd_lock);
++
++	list_for_each_entry_safe(cmd, cmd_tmp, &tmp_list, i_conn_node) {
+ 		list_del_init(&cmd->i_conn_node);
+-		spin_unlock_bh(&conn->cmd_lock);
+ 
+ 		iscsit_increment_maxcmdsn(cmd, sess);
+-
+ 		iscsit_free_cmd(cmd, true);
+ 
+-		spin_lock_bh(&conn->cmd_lock);
+ 	}
+-	spin_unlock_bh(&conn->cmd_lock);
+ }
+ 
+ static void iscsit_stop_timers_for_cmds(
+* Unmerged path drivers/target/target_core_transport.c
