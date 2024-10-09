@@ -30,14 +30,13 @@
 #define PCI_DEVICE_ID_BAYTRAIL		0x0F00
 #define PCI_DEVICE_ID_QUARK_X1000	0x0958
 
+static struct pci_dev *mbi_pdev;
 static DEFINE_SPINLOCK(iosf_mbi_lock);
 
 static inline u32 iosf_mbi_form_mcr(u8 op, u8 port, u8 offset)
 {
 	return (op << 24) | (port << 16) | (offset << 8) | MBI_ENABLE;
 }
-
-static struct pci_dev *mbi_pdev;	/* one mbi device */
 
 static int iosf_mbi_pci_read_mdr(u32 mcrx, u32 mcr, u32 *mdr)
 {
@@ -103,7 +102,7 @@ int iosf_mbi_read(u8 port, u8 opcode, u32 offset, u32 *mdr)
 	unsigned long flags;
 	int ret;
 
-	/*Access to the GFX unit is handled by GPU code */
+	/* Access to the GFX unit is handled by GPU code */
 	if (port == BT_MBI_UNIT_GFX) {
 		WARN_ON(1);
 		return -EPERM;
@@ -126,7 +125,7 @@ int iosf_mbi_write(u8 port, u8 opcode, u32 offset, u32 mdr)
 	unsigned long flags;
 	int ret;
 
-	/*Access to the GFX unit is handled by GPU code */
+	/* Access to the GFX unit is handled by GPU code */
 	if (port == BT_MBI_UNIT_GFX) {
 		WARN_ON(1);
 		return -EPERM;
@@ -150,7 +149,7 @@ int iosf_mbi_modify(u8 port, u8 opcode, u32 offset, u32 mdr, u32 mask)
 	unsigned long flags;
 	int ret;
 
-	/*Access to the GFX unit is handled by GPU code */
+	/* Access to the GFX unit is handled by GPU code */
 	if (port == BT_MBI_UNIT_GFX) {
 		WARN_ON(1);
 		return -EPERM;
