@@ -1,0 +1,134 @@
+NTB: Reset transport QP link stats on down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] Reset transport QP link stats on down (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 93.67%
+commit-author Allen Hubbe <Allen.Hubbe@emc.com>
+commit 2849b5d70641db76f9b674d00c6d204892c51515
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2849b5d7.failed
+
+Reset the link stats when the link goes down.  In particular, the TX and
+RX index and count must be reset, or else the TX side will be sending
+packets to the RX side where the RX side is not expecting them.  Reset
+all the stats, to be consistent.
+
+	Signed-off-by: Allen Hubbe <Allen.Hubbe@emc.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit 2849b5d70641db76f9b674d00c6d204892c51515)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index bf77f3a0b404,2efd1eae9a7c..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -595,21 -648,40 +595,50 @@@ static int ntb_set_mw(struct ntb_transp
+  	return 0;
+  }
+  
++ static void ntb_qp_link_down_reset(struct ntb_transport_qp *qp)
++ {
++ 	qp->link_is_up = false;
++ 
++ 	qp->tx_index = 0;
++ 	qp->rx_index = 0;
++ 	qp->rx_bytes = 0;
++ 	qp->rx_pkts = 0;
++ 	qp->rx_ring_empty = 0;
++ 	qp->rx_err_no_buf = 0;
++ 	qp->rx_err_oflow = 0;
++ 	qp->rx_err_ver = 0;
++ 	qp->rx_memcpy = 0;
++ 	qp->rx_async = 0;
++ 	qp->tx_bytes = 0;
++ 	qp->tx_pkts = 0;
++ 	qp->tx_ring_full = 0;
++ 	qp->tx_err_no_buf = 0;
++ 	qp->tx_memcpy = 0;
++ 	qp->tx_async = 0;
++ }
++ 
+  static void ntb_qp_link_cleanup(struct ntb_transport_qp *qp)
+  {
+ -	struct ntb_transport_ctx *nt = qp->transport;
+ -	struct pci_dev *pdev = nt->ndev->pdev;
+ +	struct ntb_transport *nt = qp->transport;
+ +	struct pci_dev *pdev = ntb_query_pdev(nt->ndev);
+  
+++<<<<<<< HEAD
+ +	if (qp->qp_link == NTB_LINK_DOWN) {
+ +		cancel_delayed_work_sync(&qp->link_work);
+ +		return;
+ +	}
+++=======
++ 	dev_info(&pdev->dev, "qp %d: Link Cleanup\n", qp->qp_num);
++ 
++ 	cancel_delayed_work_sync(&qp->link_work);
++ 	ntb_qp_link_down_reset(qp);
+++>>>>>>> 2849b5d70641 (NTB: Reset transport QP link stats on down)
+  
+  	if (qp->event_handler)
+ -		qp->event_handler(qp->cb_data, qp->link_is_up);
+ +		qp->event_handler(qp->cb_data, NTB_LINK_DOWN);
+ +
+ +	dev_info(&pdev->dev, "qp %d: Link Down\n", qp->qp_num);
+ +	qp->qp_link = NTB_LINK_DOWN;
+  }
+  
+  static void ntb_qp_link_cleanup_work(struct work_struct *work)
+@@@ -865,18 -885,22 +894,23 @@@ static int ntb_transport_init_queue(str
+  	qp->qp_num = qp_num;
+  	qp->transport = nt;
+  	qp->ndev = nt->ndev;
+++<<<<<<< HEAD
+ +	qp->qp_link = NTB_LINK_DOWN;
+ +	qp->client_ready = NTB_LINK_DOWN;
+++=======
++ 	qp->client_ready = false;
+++>>>>>>> 2849b5d70641 (NTB: Reset transport QP link stats on down)
+  	qp->event_handler = NULL;
++ 	ntb_qp_link_down_reset(qp);
+  
+ -	if (qp_count % mw_count && mw_num + 1 < qp_count / mw_count)
+ -		num_qps_mw = qp_count / mw_count + 1;
+ +	if (nt->max_qps % mw_max && mw_num + 1 < nt->max_qps / mw_max)
+ +		num_qps_mw = nt->max_qps / mw_max + 1;
+  	else
+ -		num_qps_mw = qp_count / mw_count;
+ +		num_qps_mw = nt->max_qps / mw_max;
+  
+ -	mw_base = nt->mw_vec[mw_num].phys_addr;
+ -	mw_size = nt->mw_vec[mw_num].phys_size;
+ -
+ -	tx_size = (unsigned int)mw_size / num_qps_mw;
+ -	qp_offset = tx_size * qp_num / mw_count;
+ -
+ -	qp->tx_mw = nt->mw_vec[mw_num].vbase + qp_offset;
+ +	tx_size = (unsigned int) ntb_get_mw_size(qp->ndev, mw_num) / num_qps_mw;
+ +	qp_offset = qp_num / mw_max * tx_size;
+ +	qp->tx_mw = ntb_get_mw_vbase(nt->ndev, mw_num) + qp_offset;
+  	if (!qp->tx_mw)
+  		return -EINVAL;
+  
+@@@ -1389,11 -1484,10 +1423,15 @@@ static void ntb_send_link_down(struct n
+  	struct ntb_queue_entry *entry;
+  	int i, rc;
+  
+ -	if (!qp->link_is_up)
+ +	if (qp->qp_link == NTB_LINK_DOWN)
+  		return;
+  
+++<<<<<<< HEAD
+ +	qp->qp_link = NTB_LINK_DOWN;
+ +	dev_info(&pdev->dev, "qp %d: Link Down\n", qp->qp_num);
+++=======
++ 	dev_info(&pdev->dev, "qp %d: Send Link Down\n", qp->qp_num);
+++>>>>>>> 2849b5d70641 (NTB: Reset transport QP link stats on down)
+  
+  	for (i = 0; i < NTB_LINK_DOWN_TIMEOUT; i++) {
+  		entry = ntb_list_rm(&qp->ntb_tx_free_q_lock, &qp->tx_free_q);
+* Unmerged path drivers/ntb/ntb_transport.c
