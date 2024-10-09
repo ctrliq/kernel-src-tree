@@ -5408,7 +5408,6 @@ static void __md_stop_writes(struct mddev *mddev)
 	del_timer_sync(&mddev->safemode_timer);
 
 	bitmap_flush(mddev);
-	md_super_wait(mddev);
 
 	if (mddev->ro == 0 &&
 	    (!mddev->in_sync || (mddev->flags & MD_UPDATE_SB_FLAGS))) {
