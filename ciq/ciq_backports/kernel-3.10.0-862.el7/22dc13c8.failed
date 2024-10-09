@@ -1,0 +1,1145 @@
+net_sched: convert tcf_exts from list to pointer array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 22dc13c837c33207548c8ee5116b64e2930a6e23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/22dc13c8.failed
+
+As pointed out by Jamal, an action could be shared by
+multiple filters, so we can't use list to chain them
+any more after we get rid of the original tc_action.
+Instead, we could just save pointers to these actions
+in tcf_exts, since they are refcount'ed, so convert
+the list to an array of pointers.
+
+The "ugly" part is the action API still accepts list
+as a parameter, I just introduce a helper function to
+convert the array of pointers to a list, instead of
+relying on the C99 feature to iterate the array.
+
+Fixes: a85a970af265 ("net_sched: move tc_action into tcf_common")
+	Reported-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22dc13c837c33207548c8ee5116b64e2930a6e23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+#	net/sched/cls_api.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index c0b8df7cf72a,b4f03748adc0..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -8564,6 -8264,414 +8564,417 @@@ int ixgbe_setup_tc(struct net_device *d
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ixgbe_delete_clsu32(struct ixgbe_adapter *adapter,
++ 			       struct tc_cls_u32_offload *cls)
++ {
++ 	u32 hdl = cls->knode.handle;
++ 	u32 uhtid = TC_U32_USERHTID(cls->knode.handle);
++ 	u32 loc = cls->knode.handle & 0xfffff;
++ 	int err = 0, i, j;
++ 	struct ixgbe_jump_table *jump = NULL;
++ 
++ 	if (loc > IXGBE_MAX_HW_ENTRIES)
++ 		return -EINVAL;
++ 
++ 	if ((uhtid != 0x800) && (uhtid >= IXGBE_MAX_LINK_HANDLE))
++ 		return -EINVAL;
++ 
++ 	/* Clear this filter in the link data it is associated with */
++ 	if (uhtid != 0x800) {
++ 		jump = adapter->jump_tables[uhtid];
++ 		if (!jump)
++ 			return -EINVAL;
++ 		if (!test_bit(loc - 1, jump->child_loc_map))
++ 			return -EINVAL;
++ 		clear_bit(loc - 1, jump->child_loc_map);
++ 	}
++ 
++ 	/* Check if the filter being deleted is a link */
++ 	for (i = 1; i < IXGBE_MAX_LINK_HANDLE; i++) {
++ 		jump = adapter->jump_tables[i];
++ 		if (jump && jump->link_hdl == hdl) {
++ 			/* Delete filters in the hardware in the child hash
++ 			 * table associated with this link
++ 			 */
++ 			for (j = 0; j < IXGBE_MAX_HW_ENTRIES; j++) {
++ 				if (!test_bit(j, jump->child_loc_map))
++ 					continue;
++ 				spin_lock(&adapter->fdir_perfect_lock);
++ 				err = ixgbe_update_ethtool_fdir_entry(adapter,
++ 								      NULL,
++ 								      j + 1);
++ 				spin_unlock(&adapter->fdir_perfect_lock);
++ 				clear_bit(j, jump->child_loc_map);
++ 			}
++ 			/* Remove resources for this link */
++ 			kfree(jump->input);
++ 			kfree(jump->mask);
++ 			kfree(jump);
++ 			adapter->jump_tables[i] = NULL;
++ 			return err;
++ 		}
++ 	}
++ 
++ 	spin_lock(&adapter->fdir_perfect_lock);
++ 	err = ixgbe_update_ethtool_fdir_entry(adapter, NULL, loc);
++ 	spin_unlock(&adapter->fdir_perfect_lock);
++ 	return err;
++ }
++ 
++ static int ixgbe_configure_clsu32_add_hnode(struct ixgbe_adapter *adapter,
++ 					    __be16 protocol,
++ 					    struct tc_cls_u32_offload *cls)
++ {
++ 	u32 uhtid = TC_U32_USERHTID(cls->hnode.handle);
++ 
++ 	if (uhtid >= IXGBE_MAX_LINK_HANDLE)
++ 		return -EINVAL;
++ 
++ 	/* This ixgbe devices do not support hash tables at the moment
++ 	 * so abort when given hash tables.
++ 	 */
++ 	if (cls->hnode.divisor > 0)
++ 		return -EINVAL;
++ 
++ 	set_bit(uhtid - 1, &adapter->tables);
++ 	return 0;
++ }
++ 
++ static int ixgbe_configure_clsu32_del_hnode(struct ixgbe_adapter *adapter,
++ 					    struct tc_cls_u32_offload *cls)
++ {
++ 	u32 uhtid = TC_U32_USERHTID(cls->hnode.handle);
++ 
++ 	if (uhtid >= IXGBE_MAX_LINK_HANDLE)
++ 		return -EINVAL;
++ 
++ 	clear_bit(uhtid - 1, &adapter->tables);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_NET_CLS_ACT
++ static int handle_redirect_action(struct ixgbe_adapter *adapter, int ifindex,
++ 				  u8 *queue, u64 *action)
++ {
++ 	unsigned int num_vfs = adapter->num_vfs, vf;
++ 	struct net_device *upper;
++ 	struct list_head *iter;
++ 
++ 	/* redirect to a SRIOV VF */
++ 	for (vf = 0; vf < num_vfs; ++vf) {
++ 		upper = pci_get_drvdata(adapter->vfinfo[vf].vfdev);
++ 		if (upper->ifindex == ifindex) {
++ 			if (adapter->num_rx_pools > 1)
++ 				*queue = vf * 2;
++ 			else
++ 				*queue = vf * adapter->num_rx_queues_per_pool;
++ 
++ 			*action = vf + 1;
++ 			*action <<= ETHTOOL_RX_FLOW_SPEC_RING_VF_OFF;
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* redirect to a offloaded macvlan netdev */
++ 	netdev_for_each_all_upper_dev_rcu(adapter->netdev, upper, iter) {
++ 		if (netif_is_macvlan(upper)) {
++ 			struct macvlan_dev *dfwd = netdev_priv(upper);
++ 			struct ixgbe_fwd_adapter *vadapter = dfwd->fwd_priv;
++ 
++ 			if (vadapter && vadapter->netdev->ifindex == ifindex) {
++ 				*queue = adapter->rx_ring[vadapter->rx_base_queue]->reg_idx;
++ 				*action = *queue;
++ 				return 0;
++ 			}
++ 		}
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int parse_tc_actions(struct ixgbe_adapter *adapter,
++ 			    struct tcf_exts *exts, u64 *action, u8 *queue)
++ {
++ 	const struct tc_action *a;
++ 	LIST_HEAD(actions);
++ 	int err;
++ 
++ 	if (tc_no_actions(exts))
++ 		return -EINVAL;
++ 
++ 	tcf_exts_to_list(exts, &actions);
++ 	list_for_each_entry(a, &actions, list) {
++ 
++ 		/* Drop action */
++ 		if (is_tcf_gact_shot(a)) {
++ 			*action = IXGBE_FDIR_DROP_QUEUE;
++ 			*queue = IXGBE_FDIR_DROP_QUEUE;
++ 			return 0;
++ 		}
++ 
++ 		/* Redirect to a VF or a offloaded macvlan */
++ 		if (is_tcf_mirred_redirect(a)) {
++ 			int ifindex = tcf_mirred_ifindex(a);
++ 
++ 			err = handle_redirect_action(adapter, ifindex, queue,
++ 						     action);
++ 			if (err == 0)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ #else
++ static int parse_tc_actions(struct ixgbe_adapter *adapter,
++ 			    struct tcf_exts *exts, u64 *action, u8 *queue)
++ {
++ 	return -EINVAL;
++ }
++ #endif /* CONFIG_NET_CLS_ACT */
++ 
++ static int ixgbe_clsu32_build_input(struct ixgbe_fdir_filter *input,
++ 				    union ixgbe_atr_input *mask,
++ 				    struct tc_cls_u32_offload *cls,
++ 				    struct ixgbe_mat_field *field_ptr,
++ 				    struct ixgbe_nexthdr *nexthdr)
++ {
++ 	int i, j, off;
++ 	__be32 val, m;
++ 	bool found_entry = false, found_jump_field = false;
++ 
++ 	for (i = 0; i < cls->knode.sel->nkeys; i++) {
++ 		off = cls->knode.sel->keys[i].off;
++ 		val = cls->knode.sel->keys[i].val;
++ 		m = cls->knode.sel->keys[i].mask;
++ 
++ 		for (j = 0; field_ptr[j].val; j++) {
++ 			if (field_ptr[j].off == off) {
++ 				field_ptr[j].val(input, mask, val, m);
++ 				input->filter.formatted.flow_type |=
++ 					field_ptr[j].type;
++ 				found_entry = true;
++ 				break;
++ 			}
++ 		}
++ 		if (nexthdr) {
++ 			if (nexthdr->off == cls->knode.sel->keys[i].off &&
++ 			    nexthdr->val == cls->knode.sel->keys[i].val &&
++ 			    nexthdr->mask == cls->knode.sel->keys[i].mask)
++ 				found_jump_field = true;
++ 			else
++ 				continue;
++ 		}
++ 	}
++ 
++ 	if (nexthdr && !found_jump_field)
++ 		return -EINVAL;
++ 
++ 	if (!found_entry)
++ 		return 0;
++ 
++ 	mask->formatted.flow_type = IXGBE_ATR_L4TYPE_IPV6_MASK |
++ 				    IXGBE_ATR_L4TYPE_MASK;
++ 
++ 	if (input->filter.formatted.flow_type == IXGBE_ATR_FLOW_TYPE_IPV4)
++ 		mask->formatted.flow_type &= IXGBE_ATR_L4TYPE_IPV6_MASK;
++ 
++ 	return 0;
++ }
++ 
++ static int ixgbe_configure_clsu32(struct ixgbe_adapter *adapter,
++ 				  __be16 protocol,
++ 				  struct tc_cls_u32_offload *cls)
++ {
++ 	u32 loc = cls->knode.handle & 0xfffff;
++ 	struct ixgbe_hw *hw = &adapter->hw;
++ 	struct ixgbe_mat_field *field_ptr;
++ 	struct ixgbe_fdir_filter *input = NULL;
++ 	union ixgbe_atr_input *mask = NULL;
++ 	struct ixgbe_jump_table *jump = NULL;
++ 	int i, err = -EINVAL;
++ 	u8 queue;
++ 	u32 uhtid, link_uhtid;
++ 
++ 	uhtid = TC_U32_USERHTID(cls->knode.handle);
++ 	link_uhtid = TC_U32_USERHTID(cls->knode.link_handle);
++ 
++ 	/* At the moment cls_u32 jumps to network layer and skips past
++ 	 * L2 headers. The canonical method to match L2 frames is to use
++ 	 * negative values. However this is error prone at best but really
++ 	 * just broken because there is no way to "know" what sort of hdr
++ 	 * is in front of the network layer. Fix cls_u32 to support L2
++ 	 * headers when needed.
++ 	 */
++ 	if (protocol != htons(ETH_P_IP))
++ 		return err;
++ 
++ 	if (loc >= ((1024 << adapter->fdir_pballoc) - 2)) {
++ 		e_err(drv, "Location out of range\n");
++ 		return err;
++ 	}
++ 
++ 	/* cls u32 is a graph starting at root node 0x800. The driver tracks
++ 	 * links and also the fields used to advance the parser across each
++ 	 * link (e.g. nexthdr/eat parameters from 'tc'). This way we can map
++ 	 * the u32 graph onto the hardware parse graph denoted in ixgbe_model.h
++ 	 * To add support for new nodes update ixgbe_model.h parse structures
++ 	 * this function _should_ be generic try not to hardcode values here.
++ 	 */
++ 	if (uhtid == 0x800) {
++ 		field_ptr = (adapter->jump_tables[0])->mat;
++ 	} else {
++ 		if (uhtid >= IXGBE_MAX_LINK_HANDLE)
++ 			return err;
++ 		if (!adapter->jump_tables[uhtid])
++ 			return err;
++ 		field_ptr = (adapter->jump_tables[uhtid])->mat;
++ 	}
++ 
++ 	if (!field_ptr)
++ 		return err;
++ 
++ 	/* At this point we know the field_ptr is valid and need to either
++ 	 * build cls_u32 link or attach filter. Because adding a link to
++ 	 * a handle that does not exist is invalid and the same for adding
++ 	 * rules to handles that don't exist.
++ 	 */
++ 
++ 	if (link_uhtid) {
++ 		struct ixgbe_nexthdr *nexthdr = ixgbe_ipv4_jumps;
++ 
++ 		if (link_uhtid >= IXGBE_MAX_LINK_HANDLE)
++ 			return err;
++ 
++ 		if (!test_bit(link_uhtid - 1, &adapter->tables))
++ 			return err;
++ 
++ 		/* Multiple filters as links to the same hash table are not
++ 		 * supported. To add a new filter with the same next header
++ 		 * but different match/jump conditions, create a new hash table
++ 		 * and link to it.
++ 		 */
++ 		if (adapter->jump_tables[link_uhtid] &&
++ 		    (adapter->jump_tables[link_uhtid])->link_hdl) {
++ 			e_err(drv, "Link filter exists for link: %x\n",
++ 			      link_uhtid);
++ 			return err;
++ 		}
++ 
++ 		for (i = 0; nexthdr[i].jump; i++) {
++ 			if (nexthdr[i].o != cls->knode.sel->offoff ||
++ 			    nexthdr[i].s != cls->knode.sel->offshift ||
++ 			    nexthdr[i].m != cls->knode.sel->offmask)
++ 				return err;
++ 
++ 			jump = kzalloc(sizeof(*jump), GFP_KERNEL);
++ 			if (!jump)
++ 				return -ENOMEM;
++ 			input = kzalloc(sizeof(*input), GFP_KERNEL);
++ 			if (!input) {
++ 				err = -ENOMEM;
++ 				goto free_jump;
++ 			}
++ 			mask = kzalloc(sizeof(*mask), GFP_KERNEL);
++ 			if (!mask) {
++ 				err = -ENOMEM;
++ 				goto free_input;
++ 			}
++ 			jump->input = input;
++ 			jump->mask = mask;
++ 			jump->link_hdl = cls->knode.handle;
++ 
++ 			err = ixgbe_clsu32_build_input(input, mask, cls,
++ 						       field_ptr, &nexthdr[i]);
++ 			if (!err) {
++ 				jump->mat = nexthdr[i].jump;
++ 				adapter->jump_tables[link_uhtid] = jump;
++ 				break;
++ 			}
++ 		}
++ 		return 0;
++ 	}
++ 
++ 	input = kzalloc(sizeof(*input), GFP_KERNEL);
++ 	if (!input)
++ 		return -ENOMEM;
++ 	mask = kzalloc(sizeof(*mask), GFP_KERNEL);
++ 	if (!mask) {
++ 		err = -ENOMEM;
++ 		goto free_input;
++ 	}
++ 
++ 	if ((uhtid != 0x800) && (adapter->jump_tables[uhtid])) {
++ 		if ((adapter->jump_tables[uhtid])->input)
++ 			memcpy(input, (adapter->jump_tables[uhtid])->input,
++ 			       sizeof(*input));
++ 		if ((adapter->jump_tables[uhtid])->mask)
++ 			memcpy(mask, (adapter->jump_tables[uhtid])->mask,
++ 			       sizeof(*mask));
++ 
++ 		/* Lookup in all child hash tables if this location is already
++ 		 * filled with a filter
++ 		 */
++ 		for (i = 1; i < IXGBE_MAX_LINK_HANDLE; i++) {
++ 			struct ixgbe_jump_table *link = adapter->jump_tables[i];
++ 
++ 			if (link && (test_bit(loc - 1, link->child_loc_map))) {
++ 				e_err(drv, "Filter exists in location: %x\n",
++ 				      loc);
++ 				err = -EINVAL;
++ 				goto err_out;
++ 			}
++ 		}
++ 	}
++ 	err = ixgbe_clsu32_build_input(input, mask, cls, field_ptr, NULL);
++ 	if (err)
++ 		goto err_out;
++ 
++ 	err = parse_tc_actions(adapter, cls->knode.exts, &input->action,
++ 			       &queue);
++ 	if (err < 0)
++ 		goto err_out;
++ 
++ 	input->sw_idx = loc;
++ 
++ 	spin_lock(&adapter->fdir_perfect_lock);
++ 
++ 	if (hlist_empty(&adapter->fdir_filter_list)) {
++ 		memcpy(&adapter->fdir_mask, mask, sizeof(*mask));
++ 		err = ixgbe_fdir_set_input_mask_82599(hw, mask);
++ 		if (err)
++ 			goto err_out_w_lock;
++ 	} else if (memcmp(&adapter->fdir_mask, mask, sizeof(*mask))) {
++ 		err = -EINVAL;
++ 		goto err_out_w_lock;
++ 	}
++ 
++ 	ixgbe_atr_compute_perfect_hash_82599(&input->filter, mask);
++ 	err = ixgbe_fdir_write_perfect_filter_82599(hw, &input->filter,
++ 						    input->sw_idx, queue);
++ 	if (!err)
++ 		ixgbe_update_ethtool_fdir_entry(adapter, input, input->sw_idx);
++ 	spin_unlock(&adapter->fdir_perfect_lock);
++ 
++ 	if ((uhtid != 0x800) && (adapter->jump_tables[uhtid]))
++ 		set_bit(loc - 1, (adapter->jump_tables[uhtid])->child_loc_map);
++ 
++ 	kfree(mask);
++ 	return err;
++ err_out_w_lock:
++ 	spin_unlock(&adapter->fdir_perfect_lock);
++ err_out:
++ 	kfree(mask);
++ free_input:
++ 	kfree(input);
++ free_jump:
++ 	kfree(jump);
++ 	return err;
++ }
++ 
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  static int __ixgbe_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
+  			    struct tc_to_netdev *tc)
+  {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 7ecb54e0e3be,dc8b1cb0fdc8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -692,407 -360,26 +694,420 @@@ static int parse_tc_nic_actions(struct 
+  	return 0;
+  }
+  
+ +static inline int cmp_encap_info(struct ip_tunnel_key *a,
+ +				 struct ip_tunnel_key *b)
+ +{
+ +	return memcmp(a, b, sizeof(*a));
+ +}
+ +
+ +static inline int hash_encap_info(struct ip_tunnel_key *key)
+ +{
+ +	return jhash(key, sizeof(*key), 0);
+ +}
+ +
+ +static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
+ +				   struct net_device *mirred_dev,
+ +				   struct net_device **out_dev,
+ +				   struct flowi4 *fl4,
+ +				   struct neighbour **out_n,
+ +				   __be32 *saddr,
+ +				   int *out_ttl)
+ +{
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ +	struct rtable *rt;
+ +	struct neighbour *n = NULL;
+ +	int ttl;
+ +
+ +#if IS_ENABLED(CONFIG_INET)
+ +	int ret;
+ +
+ +	rt = ip_route_output_key(dev_net(mirred_dev), fl4);
+ +	ret = PTR_ERR_OR_ZERO(rt);
+ +	if (ret)
+ +		return ret;
+ +#else
+ +	return -EOPNOTSUPP;
+ +#endif
+ +	/* if the egress device isn't on the same HW e-switch, we use the uplink */
+ +	if (!switchdev_port_same_parent_id(priv->netdev, rt->dst.dev))
+ +		*out_dev = mlx5_eswitch_get_uplink_netdev(esw);
+ +	else
+ +		*out_dev = rt->dst.dev;
+ +
+ +	ttl = ip4_dst_hoplimit(&rt->dst);
+ +	n = dst_neigh_lookup(&rt->dst, &fl4->daddr);
+ +	ip_rt_put(rt);
+ +	if (!n)
+ +		return -ENOMEM;
+ +
+ +	*out_n = n;
+ +	*saddr = fl4->saddr;
+ +	*out_ttl = ttl;
+ +
+ +	return 0;
+ +}
+ +
+ +static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
+ +				   struct net_device *mirred_dev,
+ +				   struct net_device **out_dev,
+ +				   struct flowi6 *fl6,
+ +				   struct neighbour **out_n,
+ +				   int *out_ttl)
+ +{
+ +	struct neighbour *n = NULL;
+ +	struct dst_entry *dst;
+ +
+ +#if IS_ENABLED(CONFIG_INET) && IS_ENABLED(CONFIG_IPV6)
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ +	int ret;
+ +
+ +	dst = ip6_route_output(dev_net(mirred_dev), NULL, fl6);
+ +	ret = dst->error;
+ +	if (ret) {
+ +		dst_release(dst);
+ +		return ret;
+ +	}
+ +
+ +	*out_ttl = ip6_dst_hoplimit(dst);
+ +
+ +	/* if the egress device isn't on the same HW e-switch, we use the uplink */
+ +	if (!switchdev_port_same_parent_id(priv->netdev, dst->dev))
+ +		*out_dev = mlx5_eswitch_get_uplink_netdev(esw);
+ +	else
+ +		*out_dev = dst->dev;
+ +#else
+ +	return -EOPNOTSUPP;
+ +#endif
+ +
+ +	n = dst_neigh_lookup(dst, &fl6->daddr);
+ +	dst_release(dst);
+ +	if (!n)
+ +		return -ENOMEM;
+ +
+ +	*out_n = n;
+ +	return 0;
+ +}
+ +
+ +static int gen_vxlan_header_ipv4(struct net_device *out_dev,
+ +				 char buf[],
+ +				 unsigned char h_dest[ETH_ALEN],
+ +				 int ttl,
+ +				 __be32 daddr,
+ +				 __be32 saddr,
+ +				 __be16 udp_dst_port,
+ +				 __be32 vx_vni)
+ +{
+ +	int encap_size = VXLAN_HLEN + sizeof(struct iphdr) + ETH_HLEN;
+ +	struct ethhdr *eth = (struct ethhdr *)buf;
+ +	struct iphdr  *ip = (struct iphdr *)((char *)eth + sizeof(struct ethhdr));
+ +	struct udphdr *udp = (struct udphdr *)((char *)ip + sizeof(struct iphdr));
+ +	struct vxlanhdr *vxh = (struct vxlanhdr *)((char *)udp + sizeof(struct udphdr));
+ +
+ +	memset(buf, 0, encap_size);
+ +
+ +	ether_addr_copy(eth->h_dest, h_dest);
+ +	ether_addr_copy(eth->h_source, out_dev->dev_addr);
+ +	eth->h_proto = htons(ETH_P_IP);
+ +
+ +	ip->daddr = daddr;
+ +	ip->saddr = saddr;
+ +
+ +	ip->ttl = ttl;
+ +	ip->protocol = IPPROTO_UDP;
+ +	ip->version = 0x4;
+ +	ip->ihl = 0x5;
+ +
+ +	udp->dest = udp_dst_port;
+ +	vxh->vx_flags = VXLAN_HF_VNI;
+ +	vxh->vx_vni = vxlan_vni_field(vx_vni);
+ +
+ +	return encap_size;
+ +}
+ +
+ +static void gen_vxlan_header_ipv6(struct net_device *out_dev,
+ +				  char buf[], int encap_size,
+ +				  unsigned char h_dest[ETH_ALEN],
+ +				  int ttl,
+ +				  struct in6_addr *daddr,
+ +				  struct in6_addr *saddr,
+ +				  __be16 udp_dst_port,
+ +				  __be32 vx_vni)
+ +{
+ +	struct ethhdr *eth = (struct ethhdr *)buf;
+ +	struct ipv6hdr *ip6h = (struct ipv6hdr *)((char *)eth + sizeof(struct ethhdr));
+ +	struct udphdr *udp = (struct udphdr *)((char *)ip6h + sizeof(struct ipv6hdr));
+ +	struct vxlanhdr *vxh = (struct vxlanhdr *)((char *)udp + sizeof(struct udphdr));
+ +
+ +	memset(buf, 0, encap_size);
+ +
+ +	ether_addr_copy(eth->h_dest, h_dest);
+ +	ether_addr_copy(eth->h_source, out_dev->dev_addr);
+ +	eth->h_proto = htons(ETH_P_IPV6);
+ +
+ +	ip6_flow_hdr(ip6h, 0, 0);
+ +	/* the HW fills up ipv6 payload len */
+ +	ip6h->nexthdr     = IPPROTO_UDP;
+ +	ip6h->hop_limit   = ttl;
+ +	ip6h->daddr	  = *daddr;
+ +	ip6h->saddr	  = *saddr;
+ +
+ +	udp->dest = udp_dst_port;
+ +	vxh->vx_flags = VXLAN_HF_VNI;
+ +	vxh->vx_vni = vxlan_vni_field(vx_vni);
+ +}
+ +
+ +static int mlx5e_create_encap_header_ipv4(struct mlx5e_priv *priv,
+ +					  struct net_device *mirred_dev,
+ +					  struct mlx5_encap_entry *e,
+ +					  struct net_device **out_dev)
+ +{
+ +	int max_encap_size = MLX5_CAP_ESW(priv->mdev, max_encap_header_size);
+ +	struct ip_tunnel_key *tun_key = &e->tun_info.key;
+ +	struct neighbour *n = NULL;
+ +	struct flowi4 fl4 = {};
+ +	char *encap_header;
+ +	int encap_size;
+ +	__be32 saddr;
+ +	int ttl;
+ +	int err;
+ +
+ +	encap_header = kzalloc(max_encap_size, GFP_KERNEL);
+ +	if (!encap_header)
+ +		return -ENOMEM;
+ +
+ +	switch (e->tunnel_type) {
+ +	case MLX5_HEADER_TYPE_VXLAN:
+ +		fl4.flowi4_proto = IPPROTO_UDP;
+ +		fl4.fl4_dport = tun_key->tp_dst;
+ +		break;
+ +	default:
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +	fl4.daddr = tun_key->u.ipv4.dst;
+ +
+ +	err = mlx5e_route_lookup_ipv4(priv, mirred_dev, out_dev,
+ +				      &fl4, &n, &saddr, &ttl);
+ +	if (err)
+ +		goto out;
+ +
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+ +
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI4 invalid\n", __func__, &fl4.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+ +
+ +	switch (e->tunnel_type) {
+ +	case MLX5_HEADER_TYPE_VXLAN:
+ +		encap_size = gen_vxlan_header_ipv4(*out_dev, encap_header,
+ +						   e->h_dest, ttl,
+ +						   tun_key->u.ipv4.dst,
+ +						   saddr, tun_key->tp_dst,
+ +						   tunnel_id_to_key32(tun_key->tun_id));
+ +		break;
+ +	default:
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
+ +			       encap_size, encap_header, &e->encap_id);
+ +out:
+ +	if (err && n)
+ +		neigh_release(n);
+ +	kfree(encap_header);
+ +	return err;
+ +}
+ +
+ +static int mlx5e_create_encap_header_ipv6(struct mlx5e_priv *priv,
+ +					  struct net_device *mirred_dev,
+ +					  struct mlx5_encap_entry *e,
+ +					  struct net_device **out_dev)
+ +
+ +{
+ +	int max_encap_size = MLX5_CAP_ESW(priv->mdev, max_encap_header_size);
+ +	int ipv6_encap_size = ETH_HLEN + sizeof(struct ipv6hdr) + VXLAN_HLEN;
+ +	struct ip_tunnel_key *tun_key = &e->tun_info.key;
+ +	struct neighbour *n = NULL;
+ +	struct flowi6 fl6 = {};
+ +	char *encap_header;
+ +	int err, ttl = 0;
+ +
+ +	if (max_encap_size < ipv6_encap_size) {
+ +		mlx5_core_warn(priv->mdev, "encap size %d too big, max supported is %d\n",
+ +			       ipv6_encap_size, max_encap_size);
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	encap_header = kzalloc(ipv6_encap_size, GFP_KERNEL);
+ +	if (!encap_header)
+ +		return -ENOMEM;
+ +
+ +	switch (e->tunnel_type) {
+ +	case MLX5_HEADER_TYPE_VXLAN:
+ +		fl6.flowi6_proto = IPPROTO_UDP;
+ +		fl6.fl6_dport = tun_key->tp_dst;
+ +		break;
+ +	default:
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tun_key->tos), tun_key->label);
+ +	fl6.daddr = tun_key->u.ipv6.dst;
+ +	fl6.saddr = tun_key->u.ipv6.src;
+ +
+ +	err = mlx5e_route_lookup_ipv6(priv, mirred_dev, out_dev,
+ +				      &fl6, &n, &ttl);
+ +	if (err)
+ +		goto out;
+ +
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI6 invalid\n", __func__, &fl6.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+ +
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+ +
+ +	switch (e->tunnel_type) {
+ +	case MLX5_HEADER_TYPE_VXLAN:
+ +		gen_vxlan_header_ipv6(*out_dev, encap_header,
+ +				      ipv6_encap_size, e->h_dest, ttl,
+ +				      &fl6.daddr,
+ +				      &fl6.saddr, tun_key->tp_dst,
+ +				      tunnel_id_to_key32(tun_key->tun_id));
+ +		break;
+ +	default:
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
+ +			       ipv6_encap_size, encap_header, &e->encap_id);
+ +out:
+ +	if (err && n)
+ +		neigh_release(n);
+ +	kfree(encap_header);
+ +	return err;
+ +}
+ +
+ +static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ +			      struct ip_tunnel_info *tun_info,
+ +			      struct net_device *mirred_dev,
+ +			      struct mlx5_esw_flow_attr *attr)
+ +{
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ +	unsigned short family = ip_tunnel_info_af(tun_info);
+ +	struct ip_tunnel_key *key = &tun_info->key;
+ +	struct mlx5_encap_entry *e;
+ +	struct net_device *out_dev;
+ +	int tunnel_type, err = -EOPNOTSUPP;
+ +	uintptr_t hash_key;
+ +	bool found = false;
+ +
+ +	/* udp dst port must be set */
+ +	if (!memchr_inv(&key->tp_dst, 0, sizeof(key->tp_dst)))
+ +		goto vxlan_encap_offload_err;
+ +
+ +	/* setting udp src port isn't supported */
+ +	if (memchr_inv(&key->tp_src, 0, sizeof(key->tp_src))) {
+ +vxlan_encap_offload_err:
+ +		netdev_warn(priv->netdev,
+ +			    "must set udp dst port and not set udp src port\n");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (mlx5e_vxlan_lookup_port(priv, be16_to_cpu(key->tp_dst)) &&
+ +	    MLX5_CAP_ESW(priv->mdev, vxlan_encap_decap)) {
+ +		tunnel_type = MLX5_HEADER_TYPE_VXLAN;
+ +	} else {
+ +		netdev_warn(priv->netdev,
+ +			    "%d isn't an offloaded vxlan udp dport\n", be16_to_cpu(key->tp_dst));
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	hash_key = hash_encap_info(key);
+ +
+ +	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
+ +				   encap_hlist, hash_key) {
+ +		if (!cmp_encap_info(&e->tun_info.key, key)) {
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (found) {
+ +		attr->encap = e;
+ +		return 0;
+ +	}
+ +
+ +	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ +	if (!e)
+ +		return -ENOMEM;
+ +
+ +	e->tun_info = *tun_info;
+ +	e->tunnel_type = tunnel_type;
+ +	INIT_LIST_HEAD(&e->flows);
+ +
+ +	if (family == AF_INET)
+ +		err = mlx5e_create_encap_header_ipv4(priv, mirred_dev, e, &out_dev);
+ +	else if (family == AF_INET6)
+ +		err = mlx5e_create_encap_header_ipv6(priv, mirred_dev, e, &out_dev);
+ +
+ +	if (err)
+ +		goto out_err;
+ +
+ +	attr->encap = e;
+ +	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+ +
+ +	return err;
+ +
+ +out_err:
+ +	kfree(e);
+ +	return err;
+ +}
+ +
+  static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
+ -				u32 *action, u32 *dest_vport)
+ +				struct mlx5e_tc_flow *flow)
+  {
+ +	struct mlx5_esw_flow_attr *attr = flow->attr;
+ +	struct ip_tunnel_info *info = NULL;
+  	const struct tc_action *a;
+++<<<<<<< HEAD
+ +	bool encap = false;
+ +	int err;
+++=======
++ 	LIST_HEAD(actions);
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  
+  	if (tc_no_actions(exts))
+  		return -EINVAL;
+  
+ -	*action = 0;
+ +	memset(attr, 0, sizeof(*attr));
+ +	attr->in_rep = priv->ppriv;
+  
+++<<<<<<< HEAD
+ +	tc_for_each_action(a, exts) {
+++=======
++ 	tcf_exts_to_list(exts, &actions);
++ 	list_for_each_entry(a, &actions, list) {
++ 		/* Only support a single action per rule */
++ 		if (*action)
++ 			return -EINVAL;
++ 
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  		if (is_tcf_gact_shot(a)) {
+ -			*action = MLX5_FLOW_CONTEXT_ACTION_DROP |
+ -				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +			attr->action |= MLX5_FLOW_CONTEXT_ACTION_DROP |
+ +					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  			continue;
+  		}
+  
+@@@ -1270,13 -523,10 +1286,18 @@@ int mlx5e_stats_flower(struct mlx5e_pri
+  
+  	mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
+  
+++<<<<<<< HEAD
+ +	preempt_disable();
+ +
+ +	tc_for_each_action(a, f->exts)
+++=======
++ 	tcf_exts_to_list(f->exts, &actions);
++ 	list_for_each_entry(a, &actions, list)
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  		tcf_action_stats_update(a, bytes, packets, lastuse);
+  
+ +	preempt_enable();
+ +
+  	return 0;
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index c628b7aede0f,1f8168906811..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -1223,42 -1120,27 +1223,50 @@@ static int mlxsw_sp_port_add_cls_matcha
+  					  struct tc_cls_matchall_offload *cls,
+  					  bool ingress)
+  {
+ +	struct mlxsw_sp_port_mall_tc_entry *mall_tc_entry;
+  	const struct tc_action *a;
++ 	LIST_HEAD(actions);
+  	int err;
+  
+  	if (!tc_single_action(cls->exts)) {
+  		netdev_err(mlxsw_sp_port->dev, "only singular actions are supported\n");
+ -		return -ENOTSUPP;
+ +		return -EOPNOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+ +	mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
+ +	if (!mall_tc_entry)
+ +		return -ENOMEM;
+ +	mall_tc_entry->cookie = cls->cookie;
+++=======
++ 	tcf_exts_to_list(cls->exts, &actions);
++ 	list_for_each_entry(a, &actions, list) {
++ 		if (!is_tcf_mirred_mirror(a) || protocol != htons(ETH_P_ALL))
++ 			return -ENOTSUPP;
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  
+ -		err = mlxsw_sp_port_add_cls_matchall_mirror(mlxsw_sp_port, cls,
+ -							    a, ingress);
+ -		if (err)
+ -			return err;
+ +	a = list_first_entry(&cls->exts->actions, struct tc_action, list);
+ +
+ +	if (is_tcf_mirred_egress_mirror(a) && protocol == htons(ETH_P_ALL)) {
+ +		struct mlxsw_sp_port_mall_mirror_tc_entry *mirror;
+ +
+ +		mall_tc_entry->type = MLXSW_SP_PORT_MALL_MIRROR;
+ +		mirror = &mall_tc_entry->mirror;
+ +		err = mlxsw_sp_port_add_cls_matchall_mirror(mlxsw_sp_port,
+ +							    mirror, a, ingress);
+ +	} else {
+ +		err = -EOPNOTSUPP;
+  	}
+  
+ +	if (err)
+ +		goto err_add_action;
+ +
+ +	list_add_tail(&mall_tc_entry->list, &mlxsw_sp_port->mall_tc_list);
+  	return 0;
+ +
+ +err_add_action:
+ +	kfree(mall_tc_entry);
+ +	return err;
+  }
+  
+  static void mlxsw_sp_port_del_cls_matchall(struct mlxsw_sp_port *mlxsw_sp_port,
+diff --cc net/sched/cls_api.c
+index 0d89965696fc,a7c5645373af..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -556,22 -558,28 +560,32 @@@ int tcf_exts_validate(struct net *net, 
+  	{
+  		struct tc_action *act;
+  
+- 		INIT_LIST_HEAD(&exts->actions);
+  		if (exts->police && tb[exts->police]) {
+  			act = tcf_action_init_1(net, tb[exts->police], rate_tlv,
+ -						"police", ovr,
+ -						TCA_ACT_BIND);
+ +						"police", ovr, TCA_ACT_BIND);
+  			if (IS_ERR(act))
+  				return PTR_ERR(act);
+  
+  			act->type = exts->type = TCA_OLD_COMPAT;
+- 			list_add(&act->list, &exts->actions);
++ 			exts->actions[0] = act;
++ 			exts->nr_actions = 1;
+  		} else if (exts->action && tb[exts->action]) {
+- 			int err;
++ 			LIST_HEAD(actions);
++ 			int err, i = 0;
++ 
+  			err = tcf_action_init(net, tb[exts->action], rate_tlv,
+++<<<<<<< HEAD
+ +					      NULL, ovr, TCA_ACT_BIND,
+ +					      &exts->actions);
+++=======
++ 					      NULL, ovr,
++ 					      TCA_ACT_BIND, &actions);
+++>>>>>>> 22dc13c837c3 (net_sched: convert tcf_exts from list to pointer array)
+  			if (err)
+  				return err;
++ 			list_for_each_entry(act, &actions, list)
++ 				exts->actions[i++] = act;
++ 			exts->nr_actions = i;
+  		}
+  	}
+  #else
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index 7eba1aba336b..d520d4cc7980 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -138,8 +138,8 @@ static inline int tcf_hash_release(struct tc_action *a, bool bind)
+ int tcf_register_action(struct tc_action_ops *a, unsigned int mask);
+ int tcf_unregister_action(struct tc_action_ops *a);
+ int tcf_action_destroy(struct list_head *actions, int bind);
+-int tcf_action_exec(struct sk_buff *skb, const struct list_head *actions,
+-		    struct tcf_result *res);
++int tcf_action_exec(struct sk_buff *skb, struct tc_action **actions,
++		    int nr_actions, struct tcf_result *res);
+ int tcf_action_init(struct net *net, struct nlattr *nla,
+ 				  struct nlattr *est, char *n, int ovr,
+ 				  int bind, struct list_head *);
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index ddbf01b80b4c..913d6d06ea27 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -59,7 +59,8 @@ tcf_unbind_filter(struct tcf_proto *tp, struct tcf_result *r)
+ struct tcf_exts {
+ #ifdef CONFIG_NET_CLS_ACT
+ 	__u32	type; /* for backward compat(TCA_OLD_COMPAT) */
+-	struct list_head actions;
++	int nr_actions;
++	struct tc_action **actions;
+ #endif
+ 	/* Map to export classifier specific extension TLV types to the
+ 	 * generic extensions API. Unsupported extensions must be set to 0.
+@@ -72,7 +73,10 @@ static inline void tcf_exts_init(struct tcf_exts *exts, int action, int police)
+ {
+ #ifdef CONFIG_NET_CLS_ACT
+ 	exts->type = 0;
+-	INIT_LIST_HEAD(&exts->actions);
++	exts->nr_actions = 0;
++	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
++				GFP_KERNEL);
++	WARN_ON(!exts->actions); /* TODO: propagate the error to callers */
+ #endif
+ 	exts->action = action;
+ 	exts->police = police;
+@@ -89,7 +93,7 @@ static inline int
+ tcf_exts_is_predicative(struct tcf_exts *exts)
+ {
+ #ifdef CONFIG_NET_CLS_ACT
+-	return !list_empty(&exts->actions);
++	return exts->nr_actions;
+ #else
+ 	return 0;
+ #endif
+@@ -108,6 +112,20 @@ tcf_exts_is_available(struct tcf_exts *exts)
+ 	return tcf_exts_is_predicative(exts);
+ }
+ 
++static inline void tcf_exts_to_list(const struct tcf_exts *exts,
++				    struct list_head *actions)
++{
++#ifdef CONFIG_NET_CLS_ACT
++	int i;
++
++	for (i = 0; i < exts->nr_actions; i++) {
++		struct tc_action *a = exts->actions[i];
++
++		list_add(&a->list, actions);
++	}
++#endif
++}
++
+ /**
+  * tcf_exts_exec - execute tc filter extensions
+  * @skb: socket buffer
+@@ -124,27 +142,21 @@ tcf_exts_exec(struct sk_buff *skb, struct tcf_exts *exts,
+ 	       struct tcf_result *res)
+ {
+ #ifdef CONFIG_NET_CLS_ACT
+-	if (!list_empty(&exts->actions))
+-		return tcf_action_exec(skb, &exts->actions, res);
++	if (exts->nr_actions)
++		return tcf_action_exec(skb, exts->actions, exts->nr_actions,
++				       res);
+ #endif
+ 	return 0;
+ }
+ 
+ #ifdef CONFIG_NET_CLS_ACT
+ 
+-#define tc_no_actions(_exts) \
+-	(list_empty(&(_exts)->actions))
+-
+-#define tc_for_each_action(_a, _exts) \
+-	list_for_each_entry(_a, &(_exts)->actions, list)
+-
+-#define tc_single_action(_exts) \
+-	(list_is_singular(&(_exts)->actions))
++#define tc_no_actions(_exts)  ((_exts)->nr_actions == 0)
++#define tc_single_action(_exts) ((_exts)->nr_actions == 1)
+ 
+ #else /* CONFIG_NET_CLS_ACT */
+ 
+ #define tc_no_actions(_exts) true
+-#define tc_for_each_action(_a, _exts) while ((void)(_a), 0)
+ #define tc_single_action(_exts) false
+ 
+ #endif /* CONFIG_NET_CLS_ACT */
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 9d43de892233..9fc69ec03cc0 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -436,18 +436,19 @@ static struct tc_action_ops *tc_lookup_action(struct nlattr *kind)
+ 	return res;
+ }
+ 
+-int tcf_action_exec(struct sk_buff *skb, const struct list_head *actions,
+-		    struct tcf_result *res)
++int tcf_action_exec(struct sk_buff *skb, struct tc_action **actions,
++		    int nr_actions, struct tcf_result *res)
+ {
+-	const struct tc_action *a;
+-	int ret = -1;
++	int ret = -1, i;
+ 
+ 	if (skb->tc_verd & TC_NCLS) {
+ 		skb->tc_verd = CLR_TC_NCLS(skb->tc_verd);
+ 		ret = TC_ACT_OK;
+ 		goto exec_done;
+ 	}
+-	list_for_each_entry(a, actions, list) {
++	for (i = 0; i < nr_actions; i++) {
++		const struct tc_action *a = actions[i];
++
+ repeat:
+ 		ret = a->ops->act(skb, a, res);
+ 		if (ret == TC_ACT_REPEAT)
+* Unmerged path net/sched/cls_api.c
