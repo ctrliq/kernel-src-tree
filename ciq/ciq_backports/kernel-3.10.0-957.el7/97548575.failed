@@ -1,0 +1,405 @@
+mmc: block: Convert RPMB to a character device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Convert RPMB to a character device (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.25%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 97548575bef38abd06690a5a6f6816200c7e77f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/97548575.failed
+
+The RPMB partition on the eMMC devices is a special area used
+for storing cryptographically safe information signed by a
+special secret key. To write and read records from this special
+area, authentication is needed.
+
+The RPMB area is *only* and *exclusively* accessed using
+ioctl():s from userspace. It is not really a block device,
+as blocks cannot be read or written from the device, also
+the signed chunks that can be stored on the RPMB are actually
+256 bytes, not 512 making a block device a real bad fit.
+
+Currently the RPMB partition spawns a separate block device
+named /dev/mmcblkNrpmb for each device with an RPMB partition,
+including the creation of a block queue with its own kernel
+thread and all overhead associated with this. On the Ux500
+HREFv60 platform, for example, the two eMMCs means that two
+block queues with separate threads are created for no use
+whatsoever.
+
+I have concluded that this block device design for RPMB is
+actually pretty wrong. The RPMB area should have been designed
+to be accessed from /dev/mmcblkN directly, using ioctl()s on
+the main block device. It is however way too late to change
+that, since userspace expects to open an RPMB device in
+/dev/mmcblkNrpmb and we cannot break userspace.
+
+This patch tries to amend the situation using the following
+strategy:
+
+- Stop creating a block device for the RPMB partition/area
+
+- Instead create a custom, dynamic character device with
+  the same name.
+
+- Make this new character device support exactly the same
+  set of ioctl()s as the old block device.
+
+- Wrap the requests back to the same ioctl() handlers, but
+  issue them on the block queue of the main partition/area,
+  i.e. /dev/mmcblkN
+
+We need to create a special "rpmb" bus type in order to get
+udev and/or busybox hot/coldplug to instantiate the device
+node properly.
+
+Before the patch, this appears in 'ps aux':
+
+101 root       0:00 [mmcqd/2rpmb]
+123 root       0:00 [mmcqd/3rpmb]
+
+After applying the patch these surplus block queue threads
+are gone, but RPMB is as usable as ever using the userspace
+MMC tools, such as 'mmc rpmb read-counter'.
+
+We get instead those dynamice devices in /dev:
+
+brw-rw----    1 root     root      179,   0 Jan  1  2000 mmcblk0
+brw-rw----    1 root     root      179,   1 Jan  1  2000 mmcblk0p1
+brw-rw----    1 root     root      179,   2 Jan  1  2000 mmcblk0p2
+brw-rw----    1 root     root      179,   5 Jan  1  2000 mmcblk0p5
+brw-rw----    1 root     root      179,   8 Jan  1  2000 mmcblk2
+brw-rw----    1 root     root      179,  16 Jan  1  2000 mmcblk2boot0
+brw-rw----    1 root     root      179,  24 Jan  1  2000 mmcblk2boot1
+crw-rw----    1 root     root      248,   0 Jan  1  2000 mmcblk2rpmb
+brw-rw----    1 root     root      179,  32 Jan  1  2000 mmcblk3
+brw-rw----    1 root     root      179,  40 Jan  1  2000 mmcblk3boot0
+brw-rw----    1 root     root      179,  48 Jan  1  2000 mmcblk3boot1
+brw-rw----    1 root     root      179,  33 Jan  1  2000 mmcblk3p1
+crw-rw----    1 root     root      248,   1 Jan  1  2000 mmcblk3rpmb
+
+Notice the (248,0) and (248,1) character devices for RPMB.
+
+	Cc: Tomas Winkler <tomas.winkler@intel.com>
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 97548575bef38abd06690a5a6f6816200c7e77f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index bf17147e2808,f75932776968..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -485,7 -529,7 +526,11 @@@ static int __mmc_blk_ioctl_cmd(struct m
+  
+  	mrq.cmd = &cmd;
+  
+++<<<<<<< HEAD
+ +	err = mmc_blk_part_switch(card, md);
+++=======
++ 	err = mmc_blk_part_switch(card, target_part);
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  	if (err)
+  		return err;
+  
+@@@ -550,52 -594,55 +595,83 @@@
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_ioctl_cmd(struct block_device *bdev,
+ +			     struct mmc_ioc_cmd __user *ic_ptr)
+++=======
++ static int mmc_blk_ioctl_cmd(struct mmc_blk_data *md,
++ 			     struct mmc_ioc_cmd __user *ic_ptr,
++ 			     struct mmc_rpmb_data *rpmb)
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  {
+  	struct mmc_blk_ioc_data *idata;
+ -	struct mmc_blk_ioc_data *idatas[1];
+ -	struct mmc_queue *mq;
+ +	struct mmc_blk_data *md;
+  	struct mmc_card *card;
+  	int err = 0, ioc_err = 0;
+ -	struct request *req;
+  
+  	idata = mmc_blk_ioctl_copy_from_user(ic_ptr);
+  	if (IS_ERR(idata))
+  		return PTR_ERR(idata);
++ 	/* This will be NULL on non-RPMB ioctl():s */
++ 	idata->rpmb = rpmb;
+  
+ +	md = mmc_blk_get(bdev->bd_disk);
+ +	if (!md) {
+ +		err = -EINVAL;
+ +		goto cmd_err;
+ +	}
+ +
+  	card = md->queue.card;
+  	if (IS_ERR(card)) {
+  		err = PTR_ERR(card);
+  		goto cmd_done;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	ioc_err = __mmc_blk_ioctl_cmd(card, md, idata);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+ +
+++=======
++ 	/*
++ 	 * Dispatch the ioctl() into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	idatas[0] = idata;
++ 	req_to_mmc_queue_req(req)->drv_op =
++ 		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idatas;
++ 	req_to_mmc_queue_req(req)->ioc_count = 1;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  	err = mmc_blk_ioctl_copy_to_user(ic_ptr, idata);
+ -	blk_put_request(req);
+  
+  cmd_done:
+ +	mmc_blk_put(md);
+ +cmd_err:
+  	kfree(idata->buf);
+  	kfree(idata);
+  	return ioc_err ? ioc_err : err;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_ioctl_multi_cmd(struct block_device *bdev,
+ +				   struct mmc_ioc_multi_cmd __user *user)
+++=======
++ static int mmc_blk_ioctl_multi_cmd(struct mmc_blk_data *md,
++ 				   struct mmc_ioc_multi_cmd __user *user,
++ 				   struct mmc_rpmb_data *rpmb)
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  {
+  	struct mmc_blk_ioc_data **idata = NULL;
+  	struct mmc_ioc_cmd __user *cmds = user->cmds;
+@@@ -625,30 -673,30 +701,48 @@@
+  			num_of_cmds = i;
+  			goto cmd_err;
+  		}
++ 		/* This will be NULL on non-RPMB ioctl():s */
++ 		idata[i]->rpmb = rpmb;
+  	}
+  
+ +	md = mmc_blk_get(bdev->bd_disk);
+ +	if (!md) {
+ +		err = -EINVAL;
+ +		goto cmd_err;
+ +	}
+ +
+  	card = md->queue.card;
+  	if (IS_ERR(card)) {
+  		err = PTR_ERR(card);
+ -		goto cmd_err;
+ +		goto cmd_done;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	for (i = 0; i < num_of_cmds && !ioc_err; i++)
+ +		ioc_err = __mmc_blk_ioctl_cmd(card, md, idata[i]);
+  
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+++=======
++ 	/*
++ 	 * Dispatch the ioctl()s into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata[0]->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	req_to_mmc_queue_req(req)->drv_op =
++ 		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idata;
++ 	req_to_mmc_queue_req(req)->ioc_count = num_of_cmds;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  
+  	/* copy to user if data and response */
+  	for (i = 0; i < num_of_cmds && !err; i++)
+@@@ -687,14 -736,26 +781,36 @@@ static int mmc_blk_ioctl(struct block_d
+  		ret = mmc_blk_check_blkdev(bdev);
+  		if (ret)
+  			return ret;
+++<<<<<<< HEAD
+ +		return mmc_blk_ioctl_cmd(bdev,
+ +				(struct mmc_ioc_cmd __user *)arg);
+++=======
++ 		md = mmc_blk_get(bdev->bd_disk);
++ 		if (!md)
++ 			return -EINVAL;
++ 		ret = mmc_blk_ioctl_cmd(md,
++ 					(struct mmc_ioc_cmd __user *)arg,
++ 					NULL);
++ 		mmc_blk_put(md);
++ 		return ret;
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  	case MMC_IOC_MULTI_CMD:
+  		ret = mmc_blk_check_blkdev(bdev);
+  		if (ret)
+  			return ret;
+++<<<<<<< HEAD
+ +		return mmc_blk_ioctl_multi_cmd(bdev,
+ +				(struct mmc_ioc_multi_cmd __user *)arg);
+++=======
++ 		md = mmc_blk_get(bdev->bd_disk);
++ 		if (!md)
++ 			return -EINVAL;
++ 		ret = mmc_blk_ioctl_multi_cmd(md,
++ 					(struct mmc_ioc_multi_cmd __user *)arg,
++ 					NULL);
++ 		mmc_blk_put(md);
++ 		return ret;
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  	default:
+  		return -EINVAL;
+  	}
+@@@ -1154,7 -1215,71 +1270,75 @@@ int mmc_access_rpmb(struct mmc_queue *m
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++=======
++ /*
++  * The non-block commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	struct mmc_blk_ioc_data **idata;
++ 	bool rpmb_ioctl;
++ 	u8 **ext_csd;
++ 	u32 status;
++ 	int ret;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 	rpmb_ioctl = (mq_rq->drv_op == MMC_DRV_OP_IOCTL_RPMB);
++ 
++ 	switch (mq_rq->drv_op) {
++ 	case MMC_DRV_OP_IOCTL:
++ 	case MMC_DRV_OP_IOCTL_RPMB:
++ 		idata = mq_rq->drv_op_data;
++ 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
++ 			ret = __mmc_blk_ioctl_cmd(card, md, idata[i]);
++ 			if (ret)
++ 				break;
++ 		}
++ 		/* Always switch back to main area after RPMB access */
++ 		if (rpmb_ioctl)
++ 			mmc_blk_part_switch(card, 0);
++ 		break;
++ 	case MMC_DRV_OP_BOOT_WP:
++ 		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
++ 				 card->ext_csd.boot_ro_lock |
++ 				 EXT_CSD_BOOT_WP_B_PWR_WP_EN,
++ 				 card->ext_csd.part_time);
++ 		if (ret)
++ 			pr_err("%s: Locking boot partition ro until next power on failed: %d\n",
++ 			       md->disk->disk_name, ret);
++ 		else
++ 			card->ext_csd.boot_ro_lock |=
++ 				EXT_CSD_BOOT_WP_B_PWR_WP_EN;
++ 		break;
++ 	case MMC_DRV_OP_GET_CARD_STATUS:
++ 		ret = mmc_send_status(card, &status);
++ 		if (!ret)
++ 			ret = status;
++ 		break;
++ 	case MMC_DRV_OP_GET_EXT_CSD:
++ 		ext_csd = mq_rq->drv_op_data;
++ 		ret = mmc_get_ext_csd(card, ext_csd);
++ 		break;
++ 	default:
++ 		pr_err("%s: unknown driver specific operation\n",
++ 		       md->disk->disk_name);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mq_rq->drv_op_result = ret;
++ 	blk_end_request_all(req, ret ? BLK_STS_IOERR : BLK_STS_OK);
++ }
++ 
++ static void mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,5807c03dddcf..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -16,14 -32,30 +16,33 @@@ struct mmc_blk_request 
+  	int			retune_retry_done;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * enum mmc_drv_op - enumerates the operations in the mmc_queue_req
++  * @MMC_DRV_OP_IOCTL: ioctl operation
++  * @MMC_DRV_OP_IOCTL_RPMB: RPMB-oriented ioctl operation
++  * @MMC_DRV_OP_BOOT_WP: write protect boot partitions
++  * @MMC_DRV_OP_GET_CARD_STATUS: get card status
++  * @MMC_DRV_OP_GET_EXT_CSD: get the EXT CSD from an eMMC card
++  */
++ enum mmc_drv_op {
++ 	MMC_DRV_OP_IOCTL,
++ 	MMC_DRV_OP_IOCTL_RPMB,
++ 	MMC_DRV_OP_BOOT_WP,
++ 	MMC_DRV_OP_GET_CARD_STATUS,
++ 	MMC_DRV_OP_GET_EXT_CSD,
++ };
++ 
+++>>>>>>> 97548575bef3 (mmc: block: Convert RPMB to a character device)
+  struct mmc_queue_req {
+ +	struct request		*req;
+  	struct mmc_blk_request	brq;
+  	struct scatterlist	*sg;
+ -	struct mmc_async_req	areq;
+ -	enum mmc_drv_op		drv_op;
+ -	int			drv_op_result;
+ -	void			*drv_op_data;
+ -	unsigned int		ioc_count;
+ +	char			*bounce_buf;
+ +	struct scatterlist	*bounce_sg;
+ +	unsigned int		bounce_sg_len;
+ +	struct mmc_async_req	mmc_active;
+  };
+  
+  struct mmc_queue {
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.h
