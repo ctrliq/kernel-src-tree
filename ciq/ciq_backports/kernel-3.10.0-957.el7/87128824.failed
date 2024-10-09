@@ -1,0 +1,94 @@
+i40e: setup xdp_rxq_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit 871288248de23d5c87433dcd94910ff813495588
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/87128824.failed
+
+The i40e driver has a special "FDIR" RX-ring (I40E_VSI_FDIR) which is
+a sideband channel for configuring/updating the flow director tables.
+This (i40e_vsi_)type does not invoke XDP-ebpf code.
+
+As suggested by Björn (V2): Instead of marking this I40E_VSI_FDIR RX-ring
+a special case, reverse the logic and only select RX-rings of type
+I40E_VSI_MAIN to register xdp_rxq_info's for.
+
+Driver hook points for xdp_rxq_info:
+ * reg  : i40e_setup_rx_descriptors (via i40e_vsi_setup_rx_resources)
+ * unreg: i40e_free_rx_resources    (via i40e_vsi_free_rx_resources)
+
+Tested on actual hardware with samples/bpf program.
+
+V2: Fixed bug in i40e_set_ringparam (memset zero) + match on I40E_VSI_MAIN.
+V4: Update patch desc that got out-of-sync with code.
+
+	Cc: intel-wired-lan@lists.osuosl.org
+	Cc: Björn Töpel <bjorn.topel@intel.com>
+	Cc: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+	Cc: Paul Menzel <pmenzel@molgen.mpg.de>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 871288248de23d5c87433dcd94910ff813495588)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index d6a622ef9c0e,2a8a85e3ae8f..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -2040,7 -2079,10 +2052,14 @@@ static int i40e_clean_rx_irq(struct i40
+  	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+  	struct sk_buff *skb = rx_ring->skb;
+  	u16 cleaned_count = I40E_DESC_UNUSED(rx_ring);
+++<<<<<<< HEAD
+ +	bool failure = false;
+++=======
++ 	bool failure = false, xdp_xmit = false;
++ 	struct xdp_buff xdp;
++ 
++ 	xdp.rxq = &rx_ring->xdp_rxq;
+++>>>>>>> 871288248de2 (i40e: setup xdp_rxq_info)
+  
+  	while (likely(total_rx_packets < (unsigned int)budget)) {
+  		struct i40e_rx_buffer *rx_buffer;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index fe085a5b0fbf..99fccf4cbf83 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@ -1500,6 +1500,8 @@ static int i40e_set_ringparam(struct net_device *netdev,
+ 			 */
+ 			rx_rings[i].desc = NULL;
+ 			rx_rings[i].rx_bi = NULL;
++			/* Clear cloned XDP RX-queue info before setup call */
++			memset(&rx_rings[i].xdp_rxq, 0, sizeof(rx_rings[i].xdp_rxq));
+ 			/* this is to allow wr32 to have something to write to
+ 			 * during early allocation of Rx buffers
+ 			 */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.h b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index 3eaaa3113384..806002f211f3 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@ -27,6 +27,8 @@
+ #ifndef _I40E_TXRX_H_
+ #define _I40E_TXRX_H_
+ 
++#include <net/xdp.h>
++
+ /* Interrupt Throttling and Rate Limiting Goodies */
+ 
+ #define I40E_MAX_ITR               0x0FF0  /* reg uses 2 usec resolution */
+@@ -429,6 +431,7 @@ struct i40e_ring {
+ 					 */
+ 
+ 	struct i40e_channel *ch;
++	struct xdp_rxq_info xdp_rxq;
+ } ____cacheline_internodealigned_in_smp;
+ 
+ static inline bool ring_uses_build_skb(struct i40e_ring *ring)
