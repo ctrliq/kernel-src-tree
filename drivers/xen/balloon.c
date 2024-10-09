@@ -611,6 +611,9 @@ static int __init balloon_init(void)
 			balloon_add_region(PFN_UP(xen_extra_mem[i].start),
 					   PFN_DOWN(xen_extra_mem[i].size));
 
+	/* Init the xen-balloon driver. */
+	xen_balloon_init();
+
 	return 0;
 }
 
