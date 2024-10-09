@@ -1,0 +1,255 @@
+net: switchdev: remove dev from switchdev_obj cb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] switchdev: remove dev from switchdev_obj cb (Ivan Vecera) [1275772 1297841 1331748]
+Rebuild_FUZZ: 94.51%
+commit-author Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+commit 03d5fb18626aff95426a380aef0d1c6904cac7c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/03d5fb18.failed
+
+The net_device associated to a dump operation does not have to be passed
+to the callback. switchdev stores it in a superset struct, if needed.
+
+Also some drivers (such as DSA drivers) may not have easy access to it.
+
+This will simplify pushing the callback function down to the drivers.
+
+	Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 03d5fb18626aff95426a380aef0d1c6904cac7c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/net/switchdev.h
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/dsa/slave.c
+index 6ebd8fbd9285,0b47647961e8..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -161,6 -200,211 +161,214 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dsa_bridge_check_vlan_range(struct dsa_switch *ds,
++ 				       const struct net_device *bridge,
++ 				       u16 vid_begin, u16 vid_end)
++ {
++ 	struct dsa_slave_priv *p;
++ 	struct net_device *dev, *vlan_br;
++ 	DECLARE_BITMAP(members, DSA_MAX_PORTS);
++ 	DECLARE_BITMAP(untagged, DSA_MAX_PORTS);
++ 	u16 vid;
++ 	int member, err;
++ 
++ 	if (!ds->drv->vlan_getnext || !vid_begin)
++ 		return -EOPNOTSUPP;
++ 
++ 	vid = vid_begin - 1;
++ 
++ 	do {
++ 		err = ds->drv->vlan_getnext(ds, &vid, members, untagged);
++ 		if (err)
++ 			break;
++ 
++ 		if (vid > vid_end)
++ 			break;
++ 
++ 		member = find_first_bit(members, DSA_MAX_PORTS);
++ 		if (member == DSA_MAX_PORTS)
++ 			continue;
++ 
++ 		dev = ds->ports[member];
++ 		p = netdev_priv(dev);
++ 		vlan_br = p->bridge_dev;
++ 		if (vlan_br == bridge)
++ 			continue;
++ 
++ 		netdev_dbg(vlan_br, "hardware VLAN %d already in use\n", vid);
++ 		return -EOPNOTSUPP;
++ 	} while (vid < vid_end);
++ 
++ 	return err == -ENOENT ? 0 : err;
++ }
++ 
++ static int dsa_slave_port_vlan_add(struct net_device *dev,
++ 				   struct switchdev_obj *obj,
++ 				   struct switchdev_trans *trans)
++ {
++ 	struct switchdev_obj_vlan *vlan = &obj->u.vlan;
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	u16 vid;
++ 	int err;
++ 
++ 	if (switchdev_trans_ph_prepare(trans)) {
++ 		if (!ds->drv->port_vlan_add || !ds->drv->port_pvid_set)
++ 			return -EOPNOTSUPP;
++ 
++ 		/* If the requested port doesn't belong to the same bridge as
++ 		 * the VLAN members, fallback to software VLAN (hopefully).
++ 		 */
++ 		err = dsa_bridge_check_vlan_range(ds, p->bridge_dev,
++ 						  vlan->vid_begin,
++ 						  vlan->vid_end);
++ 		if (err)
++ 			return err;
++ 	} else {
++ 		for (vid = vlan->vid_begin; vid <= vlan->vid_end; ++vid) {
++ 			err = ds->drv->port_vlan_add(ds, p->port, vid,
++ 						     vlan->flags &
++ 						     BRIDGE_VLAN_INFO_UNTAGGED);
++ 			if (!err && vlan->flags & BRIDGE_VLAN_INFO_PVID)
++ 				err = ds->drv->port_pvid_set(ds, p->port, vid);
++ 			if (err)
++ 				return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_port_vlan_del(struct net_device *dev,
++ 				   struct switchdev_obj *obj)
++ {
++ 	struct switchdev_obj_vlan *vlan = &obj->u.vlan;
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	u16 vid;
++ 	int err;
++ 
++ 	if (!ds->drv->port_vlan_del)
++ 		return -EOPNOTSUPP;
++ 
++ 	for (vid = vlan->vid_begin; vid <= vlan->vid_end; ++vid) {
++ 		err = ds->drv->port_vlan_del(ds, p->port, vid);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dsa_slave_port_vlan_dump(struct net_device *dev,
++ 				    struct switchdev_obj *obj)
++ {
++ 	struct switchdev_obj_vlan *vlan = &obj->u.vlan;
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	DECLARE_BITMAP(members, DSA_MAX_PORTS);
++ 	DECLARE_BITMAP(untagged, DSA_MAX_PORTS);
++ 	u16 pvid, vid = 0;
++ 	int err;
++ 
++ 	if (!ds->drv->vlan_getnext || !ds->drv->port_pvid_get)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = ds->drv->port_pvid_get(ds, p->port, &pvid);
++ 	if (err)
++ 		return err;
++ 
++ 	for (;;) {
++ 		err = ds->drv->vlan_getnext(ds, &vid, members, untagged);
++ 		if (err)
++ 			break;
++ 
++ 		if (!test_bit(p->port, members))
++ 			continue;
++ 
++ 		memset(vlan, 0, sizeof(*vlan));
++ 		vlan->vid_begin = vlan->vid_end = vid;
++ 
++ 		if (vid == pvid)
++ 			vlan->flags |= BRIDGE_VLAN_INFO_PVID;
++ 
++ 		if (test_bit(p->port, untagged))
++ 			vlan->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
++ 
++ 		err = obj->cb(obj);
++ 		if (err)
++ 			break;
++ 	}
++ 
++ 	return err == -ENOENT ? 0 : err;
++ }
++ 
++ static int dsa_slave_port_fdb_add(struct net_device *dev,
++ 				  struct switchdev_obj *obj,
++ 				  struct switchdev_trans *trans)
++ {
++ 	struct switchdev_obj_fdb *fdb = &obj->u.fdb;
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (switchdev_trans_ph_prepare(trans))
++ 		ret = ds->drv->port_fdb_add ? 0 : -EOPNOTSUPP;
++ 	else
++ 		ret = ds->drv->port_fdb_add(ds, p->port, fdb->addr, fdb->vid);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_fdb_del(struct net_device *dev,
++ 				  struct switchdev_obj *obj)
++ {
++ 	struct switchdev_obj_fdb *fdb = &obj->u.fdb;
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->drv->port_fdb_del)
++ 		ret = ds->drv->port_fdb_del(ds, p->port, fdb->addr, fdb->vid);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_fdb_dump(struct net_device *dev,
++ 				   struct switchdev_obj *obj)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	unsigned char addr[ETH_ALEN] = { 0 };
++ 	u16 vid = 0;
++ 	int ret;
++ 
++ 	if (!ds->drv->port_fdb_getnext)
++ 		return -EOPNOTSUPP;
++ 
++ 	for (;;) {
++ 		bool is_static;
++ 
++ 		ret = ds->drv->port_fdb_getnext(ds, p->port, addr, &vid,
++ 						&is_static);
++ 		if (ret < 0)
++ 			break;
++ 
++ 		obj->u.fdb.addr = addr;
++ 		obj->u.fdb.vid = vid;
++ 		obj->u.fdb.ndm_state = is_static ? NUD_NOARP : NUD_REACHABLE;
++ 
++ 		ret = obj->cb(obj);
++ 		if (ret < 0)
++ 			break;
++ 	}
++ 
++ 	return ret == -ENOENT ? 0 : ret;
++ }
++ 
+++>>>>>>> 03d5fb18626a (net: switchdev: remove dev from switchdev_obj cb)
+  static int dsa_slave_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+  {
+  	struct dsa_slave_priv *p = netdev_priv(dev);
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
