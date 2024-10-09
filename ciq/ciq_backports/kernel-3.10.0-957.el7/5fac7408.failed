@@ -1,0 +1,342 @@
+mm, fs, dax: handle layout changes to pinned dax mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [fs] mm, dax: handle layout changes to pinned dax mappings (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 96.36%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 5fac7408d828719db6d3fdba63e3c3726a6d1ee5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5fac7408.failed
+
+Background:
+
+get_user_pages() in the filesystem pins file backed memory pages for
+access by devices performing dma. However, it only pins the memory pages
+not the page-to-file offset association. If a file is truncated the
+pages are mapped out of the file and dma may continue indefinitely into
+a page that is owned by a device driver. This breaks coherency of the
+file vs dma, but the assumption is that if userspace wants the
+file-space truncated it does not matter what data is inbound from the
+device, it is not relevant anymore. The only expectation is that dma can
+safely continue while the filesystem reallocates the block(s).
+
+Problem:
+
+This expectation that dma can safely continue while the filesystem
+changes the block map is broken by dax. With dax the target dma page
+*is* the filesystem block. The model of leaving the page pinned for dma,
+but truncating the file block out of the file, means that the filesytem
+is free to reallocate a block under active dma to another file and now
+the expected data-incoherency situation has turned into active
+data-corruption.
+
+Solution:
+
+Defer all filesystem operations (fallocate(), truncate()) on a dax mode
+file while any page/block in the file is under active dma. This solution
+assumes that dma is transient. Cases where dma operations are known to
+not be transient, like RDMA, have been explicitly disabled via
+commits like 5f1d43de5416 "IB/core: disable memory registration of
+filesystem-dax vmas".
+
+The dax_layout_busy_page() routine is called by filesystems with a lock
+held against mm faults (i_mmap_lock) to find pinned / busy dax pages.
+The process of looking up a busy page invalidates all mappings
+to trigger any subsequent get_user_pages() to block on i_mmap_lock.
+The filesystem continues to call dax_layout_busy_page() until it finally
+returns no more active pages. This approach assumes that the page
+pinning is transient, if that assumption is violated the system would
+have likely hung from the uncompleted I/O.
+
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 5fac7408d828719db6d3fdba63e3c3726a6d1ee5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+#	include/linux/dax.h
+diff --cc fs/dax.c
+index 879d2cfa39b7,e8f61ea690f7..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -263,11 -294,81 +263,71 @@@ static void put_unlocked_mapping_entry(
+  	dax_wake_mapping_entry_waiter(mapping, index, entry, false);
+  }
+  
+ -static unsigned long dax_entry_size(void *entry)
+ -{
+ -	if (dax_is_zero_entry(entry))
+ -		return 0;
+ -	else if (dax_is_empty_entry(entry))
+ -		return 0;
+ -	else if (dax_is_pmd_entry(entry))
+ -		return PMD_SIZE;
+ -	else
+ -		return PAGE_SIZE;
+ -}
+ -
+ -static unsigned long dax_radix_end_pfn(void *entry)
+ -{
+ -	return dax_radix_pfn(entry) + dax_entry_size(entry) / PAGE_SIZE;
+ -}
+ -
+  /*
+++<<<<<<< HEAD
+ + * Find radix tree entry at given index. If it points to a page, return with
+ + * the page locked. If it points to the exceptional entry, return with the
+ + * radix tree entry locked. If the radix tree doesn't contain given index,
+ + * create empty exceptional entry for the index and return with it locked.
+++=======
++  * Iterate through all mapped pfns represented by an entry, i.e. skip
++  * 'empty' and 'zero' entries.
++  */
++ #define for_each_mapped_pfn(entry, pfn) \
++ 	for (pfn = dax_radix_pfn(entry); \
++ 			pfn < dax_radix_end_pfn(entry); pfn++)
++ 
++ static void dax_associate_entry(void *entry, struct address_space *mapping)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (IS_ENABLED(CONFIG_FS_DAX_LIMITED))
++ 		return;
++ 
++ 	for_each_mapped_pfn(entry, pfn) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		WARN_ON_ONCE(page->mapping);
++ 		page->mapping = mapping;
++ 	}
++ }
++ 
++ static void dax_disassociate_entry(void *entry, struct address_space *mapping,
++ 		bool trunc)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (IS_ENABLED(CONFIG_FS_DAX_LIMITED))
++ 		return;
++ 
++ 	for_each_mapped_pfn(entry, pfn) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		WARN_ON_ONCE(trunc && page_ref_count(page) > 1);
++ 		WARN_ON_ONCE(page->mapping && page->mapping != mapping);
++ 		page->mapping = NULL;
++ 	}
++ }
++ 
++ static struct page *dax_busy_page(void *entry)
++ {
++ 	unsigned long pfn;
++ 
++ 	for_each_mapped_pfn(entry, pfn) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		if (page_ref_count(page) > 1)
++ 			return page;
++ 	}
++ 	return NULL;
++ }
++ 
++ /*
++  * Find radix tree entry at given index. If it points to an exceptional entry,
++  * return it with the radix tree entry locked. If the radix tree doesn't
++  * contain given index, create an empty exceptional entry for the index and
++  * return with it locked.
+++>>>>>>> 5fac7408d828 (mm, fs, dax: handle layout changes to pinned dax mappings)
+   *
+   * When requesting an entry with size RADIX_DAX_PMD, grab_mapping_entry() will
+   * either return that locked entry or will return an error.  This error will
+@@@ -415,30 -505,89 +475,116 @@@ restart
+  	return entry;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * We do not necessarily hold the mapping->tree_lock when we call this
+ + * function so it is possible that 'entry' is no longer a valid item in the
+ + * radix tree.  This is okay because all we really need to do is to find the
+ + * correct waitqueue where tasks might be waiting for that old 'entry' and
+ + * wake them.
+ + */
+ +void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+ +		pgoff_t index, void *entry, bool wake_all)
+ +{
+ +	struct exceptional_entry_key key;
+ +	wait_queue_head_t *wq;
+ +
+ +	wq = dax_entry_waitqueue(mapping, index, entry, &key);
+ +
+ +	/*
+ +	 * Checking for locked entry and prepare_to_wait_exclusive() happens
+ +	 * under mapping->tree_lock, ditto for entry handling in our callers.
+ +	 * So at this point all tasks that could have seen our entry locked
+ +	 * must be in the waitqueue and the following check will see them.
+ +	 */
+ +	if (waitqueue_active(wq))
+ +		__wake_up(wq, TASK_NORMAL, wake_all ? 0 : 1, &key);
+ +}
+++=======
++ /**
++  * dax_layout_busy_page - find first pinned page in @mapping
++  * @mapping: address space to scan for a page with ref count > 1
++  *
++  * DAX requires ZONE_DEVICE mapped pages. These pages are never
++  * 'onlined' to the page allocator so they are considered idle when
++  * page->count == 1. A filesystem uses this interface to determine if
++  * any page in the mapping is busy, i.e. for DMA, or other
++  * get_user_pages() usages.
++  *
++  * It is expected that the filesystem is holding locks to block the
++  * establishment of new mappings in this address_space. I.e. it expects
++  * to be able to run unmap_mapping_range() and subsequently not race
++  * mapping_mapped() becoming true.
++  */
++ struct page *dax_layout_busy_page(struct address_space *mapping)
++ {
++ 	pgoff_t	indices[PAGEVEC_SIZE];
++ 	struct page *page = NULL;
++ 	struct pagevec pvec;
++ 	pgoff_t	index, end;
++ 	unsigned i;
++ 
++ 	/*
++ 	 * In the 'limited' case get_user_pages() for dax is disabled.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_FS_DAX_LIMITED))
++ 		return NULL;
++ 
++ 	if (!dax_mapping(mapping) || !mapping_mapped(mapping))
++ 		return NULL;
++ 
++ 	pagevec_init(&pvec);
++ 	index = 0;
++ 	end = -1;
++ 
++ 	/*
++ 	 * If we race get_user_pages_fast() here either we'll see the
++ 	 * elevated page count in the pagevec_lookup and wait, or
++ 	 * get_user_pages_fast() will see that the page it took a reference
++ 	 * against is no longer mapped in the page tables and bail to the
++ 	 * get_user_pages() slow path.  The slow path is protected by
++ 	 * pte_lock() and pmd_lock(). New references are not taken without
++ 	 * holding those locks, and unmap_mapping_range() will not zero the
++ 	 * pte or pmd without holding the respective lock, so we are
++ 	 * guaranteed to either see new references or prevent new
++ 	 * references from being established.
++ 	 */
++ 	unmap_mapping_range(mapping, 0, 0, 1);
++ 
++ 	while (index < end && pagevec_lookup_entries(&pvec, mapping, index,
++ 				min(end - index, (pgoff_t)PAGEVEC_SIZE),
++ 				indices)) {
++ 		for (i = 0; i < pagevec_count(&pvec); i++) {
++ 			struct page *pvec_ent = pvec.pages[i];
++ 			void *entry;
++ 
++ 			index = indices[i];
++ 			if (index >= end)
++ 				break;
++ 
++ 			if (!radix_tree_exceptional_entry(pvec_ent))
++ 				continue;
++ 
++ 			xa_lock_irq(&mapping->i_pages);
++ 			entry = get_unlocked_mapping_entry(mapping, index, NULL);
++ 			if (entry)
++ 				page = dax_busy_page(entry);
++ 			put_unlocked_mapping_entry(mapping, index, entry);
++ 			xa_unlock_irq(&mapping->i_pages);
++ 			if (page)
++ 				break;
++ 		}
++ 		pagevec_remove_exceptionals(&pvec);
++ 		pagevec_release(&pvec);
++ 		index++;
++ 
++ 		if (page)
++ 			break;
++ 	}
++ 	return page;
++ }
++ EXPORT_SYMBOL_GPL(dax_layout_busy_page);
+++>>>>>>> 5fac7408d828 (mm, fs, dax: handle layout changes to pinned dax mappings)
+  
+  static int __dax_invalidate_mapping_entry(struct address_space *mapping,
+  					  pgoff_t index, bool trunc)
+diff --cc include/linux/dax.h
+index b7b81d6cc271,25bab6abb695..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -55,6 -69,22 +55,25 @@@ static inline int bdev_dax_supported(st
+  {
+  	return __bdev_dax_supported(sb, blocksize);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline struct dax_device *fs_dax_get_by_host(const char *host)
++ {
++ 	return dax_get_by_host(host);
++ }
++ 
++ static inline void fs_put_dax(struct dax_device *dax_dev)
++ {
++ 	put_dax(dax_dev);
++ }
++ 
++ struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev);
++ int dax_writeback_mapping_range(struct address_space *mapping,
++ 		struct block_device *bdev, struct writeback_control *wbc);
++ 
++ struct page *dax_layout_busy_page(struct address_space *mapping);
+++>>>>>>> 5fac7408d828 (mm, fs, dax: handle layout changes to pinned dax mappings)
+  #else
+  static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+  {
+@@@ -71,9 -96,25 +90,28 @@@ static inline struct dax_device *dax_ge
+  	return NULL;
+  }
+  
+ -static inline void fs_put_dax(struct dax_device *dax_dev)
+ +static inline void put_dax(struct dax_device *dax_dev)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev)
++ {
++ 	return NULL;
++ }
++ 
++ static inline struct page *dax_layout_busy_page(struct address_space *mapping)
++ {
++ 	return NULL;
++ }
++ 
++ static inline int dax_writeback_mapping_range(struct address_space *mapping,
++ 		struct block_device *bdev, struct writeback_control *wbc)
++ {
++ 	return -EOPNOTSUPP;
++ }
+++>>>>>>> 5fac7408d828 (mm, fs, dax: handle layout changes to pinned dax mappings)
+  #endif
+  
+  int dax_read_lock(void);
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
