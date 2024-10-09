@@ -3968,6 +3968,11 @@ static inline bool netif_is_rxfh_configured(const struct net_device *dev)
 	return dev->priv_flags & IFF_RXFH_CONFIGURED;
 }
 
+static inline bool netif_is_team_port(struct net_device *dev)
+{
+	return dev->priv_flags & IFF_TEAM_PORT;
+}
+
 /* This device needs to keep skb dst for qdisc enqueue or ndo_start_xmit() */
 static inline void netif_keep_dst(struct net_device *dev)
 {
