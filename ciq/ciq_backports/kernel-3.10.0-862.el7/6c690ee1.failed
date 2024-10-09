@@ -1,0 +1,819 @@
+x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Split read_cr3() into read_cr3_pa() and __read_cr3() (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 96.55%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 6c690ee1039b251e583fc65b28da30e97d6a7385
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6c690ee1.failed
+
+The kernel has several code paths that read CR3.  Most of them assume that
+CR3 contains the PGD's physical address, whereas some of them awkwardly
+use PHYSICAL_PAGE_MASK to mask off low bits.
+
+Add explicit mask macros for CR3 and convert all of the CR3 readers.
+This will keep them from breaking when PCID is enabled.
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Cc: xen-devel <xen-devel@lists.xen.org>
+Link: http://lkml.kernel.org/r/883f8fb121f4616c1c1427ad87350bb2f5ffeca1.1497288170.git.luto@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6c690ee1039b251e583fc65b28da30e97d6a7385)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/include/asm/mmu_context.h
+#	arch/x86/include/asm/processor.h
+#	arch/x86/include/asm/tlbflush.h
+#	arch/x86/kernel/head64.c
+#	arch/x86/kernel/process_32.c
+#	arch/x86/kernel/process_64.c
+#	arch/x86/kvm/vmx.c
+#	arch/x86/mm/fault.c
+#	arch/x86/platform/efi/efi_64.c
+#	arch/x86/power/cpu.c
+#	arch/x86/power/hibernate_64.c
+#	arch/x86/xen/mmu_pv.c
+diff --cc arch/x86/include/asm/efi.h
+index d1a2aa8edaf2,d2ff779f347e..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -48,25 -56,58 +48,48 @@@ extern u64 asmlinkage efi_call(void *fp
+  
+  #define efi_call_phys(f, args...)		efi_call((f), args)
+  
+ -/*
+ - * Scratch space used for switching the pagetable in the EFI stub
+ - */
+ -struct efi_scratch {
+ -	u64	r15;
+ -	u64	prev_cr3;
+ -	pgd_t	*efi_pgt;
+ -	bool	use_pgd;
+ -	u64	phys_stack;
+ -} __packed;
+ -
+ -#define arch_efi_call_virt_setup()					\
+ +#define efi_call_virt(f, ...)						\
+  ({									\
+ +	efi_status_t __s;						\
+ +									\
+  	efi_sync_low_kernel_mappings();					\
+  	preempt_disable();						\
+++<<<<<<< HEAD
+ +	__s = efi_call((void *)efi.systab->runtime->f, __VA_ARGS__);	\
+++=======
++ 	__kernel_fpu_begin();						\
++ 									\
++ 	if (efi_scratch.use_pgd) {					\
++ 		efi_scratch.prev_cr3 = __read_cr3();			\
++ 		write_cr3((unsigned long)efi_scratch.efi_pgt);		\
++ 		__flush_tlb_all();					\
++ 	}								\
++ })
++ 
++ #define arch_efi_call_virt(p, f, args...)				\
++ 	efi_call((void *)p->f, args)					\
++ 
++ #define arch_efi_call_virt_teardown()					\
++ ({									\
++ 	if (efi_scratch.use_pgd) {					\
++ 		write_cr3(efi_scratch.prev_cr3);			\
++ 		__flush_tlb_all();					\
++ 	}								\
++ 									\
++ 	__kernel_fpu_end();						\
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  	preempt_enable();						\
+ +	__s;								\
+  })
+  
+ -extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
+ -					u32 type, u64 attribute);
+ -
+ -#ifdef CONFIG_KASAN
+  /*
+ - * CONFIG_KASAN may redefine memset to __memset.  __memset function is present
+ - * only in kernel binary.  Since the EFI stub linked into a separate binary it
+ - * doesn't have __memset().  So we should use standard memset from
+ - * arch/x86/boot/compressed/string.c.  The same applies to memcpy and memmove.
+ + * All X86_64 virt calls return non-void values. Thus, use non-void call for
+ + * virt calls that would be void on X86_32.
+   */
+ -#undef memcpy
+ -#undef memset
+ -#undef memmove
+ -#endif
+ +#define __efi_call_virt(f, args...) efi_call_virt(f, args)
+ +
+ +extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
+ +					u32 type, u64 attribute);
+  
+  #endif /* CONFIG_X86_32 */
+  
+diff --cc arch/x86/include/asm/mmu_context.h
+index a34c7d411865,cfe6034ebfc6..000000000000
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@@ -150,7 -182,107 +150,111 @@@ static inline void arch_bprm_mm_init(st
+  static inline void arch_unmap(struct mm_struct *mm, struct vm_area_struct *vma,
+  			      unsigned long start, unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	mpx_notify_unmap(mm, vma, start, end);
+++=======
++ 	/*
++ 	 * mpx_notify_unmap() goes and reads a rarely-hot
++ 	 * cacheline in the mm_struct.  That can be expensive
++ 	 * enough to be seen in profiles.
++ 	 *
++ 	 * The mpx_notify_unmap() call and its contents have been
++ 	 * observed to affect munmap() performance on hardware
++ 	 * where MPX is not present.
++ 	 *
++ 	 * The unlikely() optimizes for the fast case: no MPX
++ 	 * in the CPU, or no MPX use in the process.  Even if
++ 	 * we get this wrong (in the unlikely event that MPX
++ 	 * is widely enabled on some system) the overhead of
++ 	 * MPX itself (reading bounds tables) is expected to
++ 	 * overwhelm the overhead of getting this unlikely()
++ 	 * consistently wrong.
++ 	 */
++ 	if (unlikely(cpu_feature_enabled(X86_FEATURE_MPX)))
++ 		mpx_notify_unmap(mm, vma, start, end);
++ }
++ 
++ #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++ static inline int vma_pkey(struct vm_area_struct *vma)
++ {
++ 	unsigned long vma_pkey_mask = VM_PKEY_BIT0 | VM_PKEY_BIT1 |
++ 				      VM_PKEY_BIT2 | VM_PKEY_BIT3;
++ 
++ 	return (vma->vm_flags & vma_pkey_mask) >> VM_PKEY_SHIFT;
++ }
++ #else
++ static inline int vma_pkey(struct vm_area_struct *vma)
++ {
++ 	return 0;
++ }
++ #endif
++ 
++ static inline bool __pkru_allows_pkey(u16 pkey, bool write)
++ {
++ 	u32 pkru = read_pkru();
++ 
++ 	if (!__pkru_allows_read(pkru, pkey))
++ 		return false;
++ 	if (write && !__pkru_allows_write(pkru, pkey))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /*
++  * We only want to enforce protection keys on the current process
++  * because we effectively have no access to PKRU for other
++  * processes or any way to tell *which * PKRU in a threaded
++  * process we could use.
++  *
++  * So do not enforce things if the VMA is not from the current
++  * mm, or if we are in a kernel thread.
++  */
++ static inline bool vma_is_foreign(struct vm_area_struct *vma)
++ {
++ 	if (!current->mm)
++ 		return true;
++ 	/*
++ 	 * Should PKRU be enforced on the access to this VMA?  If
++ 	 * the VMA is from another process, then PKRU has no
++ 	 * relevance and should not be enforced.
++ 	 */
++ 	if (current->mm != vma->vm_mm)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static inline bool arch_vma_access_permitted(struct vm_area_struct *vma,
++ 		bool write, bool execute, bool foreign)
++ {
++ 	/* pkeys never affect instruction fetches */
++ 	if (execute)
++ 		return true;
++ 	/* allow access if the VMA is not one from this process */
++ 	if (foreign || vma_is_foreign(vma))
++ 		return true;
++ 	return __pkru_allows_pkey(vma_pkey(vma), write);
++ }
++ 
++ 
++ /*
++  * This can be used from process context to figure out what the value of
++  * CR3 is without needing to do a (slow) __read_cr3().
++  *
++  * It's intended to be used for code like KVM that sneakily changes CR3
++  * and needs to restore it.  It needs to be used very carefully.
++  */
++ static inline unsigned long __get_current_cr3_fast(void)
++ {
++ 	unsigned long cr3 = __pa(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd);
++ 
++ 	/* For now, be very restrictive about when this can be called. */
++ 	VM_WARN_ON(in_nmi() || !in_atomic());
++ 
++ 	VM_BUG_ON(cr3 != __read_cr3());
++ 	return cr3;
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  }
+  
+  #endif /* _ASM_X86_MMU_CONTEXT_H */
+diff --cc arch/x86/include/asm/processor.h
+index 5023ca6231a6,9de02c985aa4..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -224,6 -213,32 +224,35 @@@ static inline void native_cpuid(unsigne
+  	    : "memory");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define native_cpuid_reg(reg)					\
++ static inline unsigned int native_cpuid_##reg(unsigned int op)	\
++ {								\
++ 	unsigned int eax = op, ebx, ecx = 0, edx;		\
++ 								\
++ 	native_cpuid(&eax, &ebx, &ecx, &edx);			\
++ 								\
++ 	return reg;						\
++ }
++ 
++ /*
++  * Native CPUID functions returning a single datum.
++  */
++ native_cpuid_reg(eax)
++ native_cpuid_reg(ebx)
++ native_cpuid_reg(ecx)
++ native_cpuid_reg(edx)
++ 
++ /*
++  * Friendlier CR3 helpers.
++  */
++ static inline unsigned long read_cr3_pa(void)
++ {
++ 	return __read_cr3() & CR3_ADDR_MASK;
++ }
++ 
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  static inline void load_cr3(pgd_t *pgdir)
+  {
+  	write_cr3(__pa(pgdir));
+diff --cc arch/x86/include/asm/tlbflush.h
+index 3e41fd3dc902,5f78c6a77578..000000000000
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@@ -15,9 -65,99 +15,20 @@@
+  #define __flush_tlb_single(addr) __native_flush_tlb_single(addr)
+  #endif
+  
+ -struct tlb_state {
+ -	/*
+ -	 * cpu_tlbstate.loaded_mm should match CR3 whenever interrupts
+ -	 * are on.  This means that it may not match current->active_mm,
+ -	 * which will contain the previous user mm when we're in lazy TLB
+ -	 * mode even if we've already switched back to swapper_pg_dir.
+ -	 */
+ -	struct mm_struct *loaded_mm;
+ -	int state;
+ -
+ -	/*
+ -	 * Access to this CR4 shadow and to H/W CR4 is protected by
+ -	 * disabling interrupts when modifying either one.
+ -	 */
+ -	unsigned long cr4;
+ -};
+ -DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
+ -
+ -/* Initialize cr4 shadow for this CPU. */
+ -static inline void cr4_init_shadow(void)
+ -{
+ -	this_cpu_write(cpu_tlbstate.cr4, __read_cr4());
+ -}
+ -
+ -/* Set in this cpu's CR4. */
+ -static inline void cr4_set_bits(unsigned long mask)
+ -{
+ -	unsigned long cr4;
+ -
+ -	cr4 = this_cpu_read(cpu_tlbstate.cr4);
+ -	if ((cr4 | mask) != cr4) {
+ -		cr4 |= mask;
+ -		this_cpu_write(cpu_tlbstate.cr4, cr4);
+ -		__write_cr4(cr4);
+ -	}
+ -}
+ -
+ -/* Clear in this cpu's CR4. */
+ -static inline void cr4_clear_bits(unsigned long mask)
+ -{
+ -	unsigned long cr4;
+ -
+ -	cr4 = this_cpu_read(cpu_tlbstate.cr4);
+ -	if ((cr4 & ~mask) != cr4) {
+ -		cr4 &= ~mask;
+ -		this_cpu_write(cpu_tlbstate.cr4, cr4);
+ -		__write_cr4(cr4);
+ -	}
+ -}
+ -
+ -static inline void cr4_toggle_bits(unsigned long mask)
+ -{
+ -	unsigned long cr4;
+ -
+ -	cr4 = this_cpu_read(cpu_tlbstate.cr4);
+ -	cr4 ^= mask;
+ -	this_cpu_write(cpu_tlbstate.cr4, cr4);
+ -	__write_cr4(cr4);
+ -}
+ -
+ -/* Read the CR4 shadow. */
+ -static inline unsigned long cr4_read_shadow(void)
+ -{
+ -	return this_cpu_read(cpu_tlbstate.cr4);
+ -}
+ -
+ -/*
+ - * Save some of cr4 feature set we're using (e.g.  Pentium 4MB
+ - * enable and PPro Global page enable), so that any CPU's that boot
+ - * up after us can get the correct flags.  This should only be used
+ - * during boot on the boot cpu.
+ - */
+ -extern unsigned long mmu_cr4_features;
+ -extern u32 *trampoline_cr4_features;
+ -
+ -static inline void cr4_set_bits_and_update_boot(unsigned long mask)
+ -{
+ -	mmu_cr4_features |= mask;
+ -	if (trampoline_cr4_features)
+ -		*trampoline_cr4_features = mmu_cr4_features;
+ -	cr4_set_bits(mask);
+ -}
+ -
+  static inline void __native_flush_tlb(void)
+  {
+++<<<<<<< HEAD
+ +	native_write_cr3(native_read_cr3());
+++=======
++ 	/*
++ 	 * If current->mm == NULL then we borrow a mm which may change during a
++ 	 * task switch and therefore we must not be preempted while we write CR3
++ 	 * back:
++ 	 */
++ 	preempt_disable();
++ 	native_write_cr3(__native_read_cr3());
++ 	preempt_enable();
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  }
+  
+  static inline void __native_flush_tlb_global_irq_disabled(void)
+@@@ -168,20 -262,22 +179,26 @@@ DECLARE_PER_CPU_SHARED_ALIGNED(struct t
+  static inline void reset_lazy_tlbstate(void)
+  {
+  	this_cpu_write(cpu_tlbstate.state, 0);
+++<<<<<<< HEAD
+ +	this_cpu_write(cpu_tlbstate.active_mm, &init_mm);
+++=======
++ 	this_cpu_write(cpu_tlbstate.loaded_mm, &init_mm);
++ 
++ 	WARN_ON(read_cr3_pa() != __pa_symbol(swapper_pg_dir));
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  }
+  
+ -static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
+ -					struct mm_struct *mm)
+ -{
+ -	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+ -}
+ +#endif	/* SMP */
+  
+ -extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
+ +/* Not inlined due to inc_irq_stat not being defined yet */
+ +#define flush_tlb_local() {		\
+ +	inc_irq_stat(irq_tlb_count);	\
+ +	local_flush_tlb();		\
+ +}
+  
+  #ifndef CONFIG_PARAVIRT
+ -#define flush_tlb_others(mask, info)	\
+ -	native_flush_tlb_others(mask, info)
+ +#define flush_tlb_others(mask, mm, start, end)	\
+ +	native_flush_tlb_others(mask, mm, start, end)
+  #endif
+  
+  #endif /* _ASM_X86_TLBFLUSH_H */
+diff --cc arch/x86/kernel/head64.c
+index 39ad3cdc4c78,794e8f517a81..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -59,7 -55,8 +59,12 @@@ int __init early_make_pgtable(unsigned 
+  	pmdval_t pmd, *pmd_p;
+  
+  	/* Invalid address or early pgt is done ?  */
+++<<<<<<< HEAD
+ +	if (physaddr >= MAXMEM || read_cr3() != __pa(early_level4_pgt))
+++=======
++ 	if (physaddr >= MAXMEM ||
++ 	    read_cr3_pa() != __pa_nodebug(early_level4_pgt))
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  		return -1;
+  
+  again:
+diff --cc arch/x86/kernel/process_32.c
+index fbb10db72948,c6d6dc5f8bb2..000000000000
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@@ -101,8 -92,8 +101,13 @@@ void __show_regs(struct pt_regs *regs, 
+  
+  	cr0 = read_cr0();
+  	cr2 = read_cr2();
+++<<<<<<< HEAD
+ +	cr3 = read_cr3();
+ +	cr4 = read_cr4_safe();
+++=======
++ 	cr3 = __read_cr3();
++ 	cr4 = __read_cr4();
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  	printk(KERN_DEFAULT "CR0: %08lx CR2: %08lx CR3: %08lx CR4: %08lx\n",
+  			cr0, cr2, cr3, cr4);
+  
+diff --cc arch/x86/kernel/process_64.c
+index 3a53d050bda4,c3169be4c596..000000000000
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@@ -93,8 -104,8 +93,13 @@@ void __show_regs(struct pt_regs *regs, 
+  
+  	cr0 = read_cr0();
+  	cr2 = read_cr2();
+++<<<<<<< HEAD
+ +	cr3 = read_cr3();
+ +	cr4 = read_cr4();
+++=======
++ 	cr3 = __read_cr3();
++ 	cr4 = __read_cr4();
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  
+  	printk(KERN_DEFAULT "FS:  %016lx(%04x) GS:%016lx(%04x) knlGS:%016lx\n",
+  	       fs, fsindex, gs, gsindex, shadowgs);
+diff --cc arch/x86/kvm/vmx.c
+index 9e322d5ffbcf,d143dd397dc9..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -4703,13 -5014,22 +4703,27 @@@ static void vmx_set_constant_host_state
+  	u32 low32, high32;
+  	unsigned long tmpl;
+  	struct desc_ptr dt;
+ -	unsigned long cr0, cr3, cr4;
+ +	unsigned long cr4;
+  
+++<<<<<<< HEAD
+ +	vmcs_writel(HOST_CR0, read_cr0() & ~X86_CR0_TS);  /* 22.2.3 */
+ +	vmcs_writel(HOST_CR3, read_cr3());  /* 22.2.3  FIXME: shadow tables */
+++=======
++ 	cr0 = read_cr0();
++ 	WARN_ON(cr0 & X86_CR0_TS);
++ 	vmcs_writel(HOST_CR0, cr0);  /* 22.2.3 */
++ 
++ 	/*
++ 	 * Save the most likely value for this task's CR3 in the VMCS.
++ 	 * We can't use __get_current_cr3_fast() because we're not atomic.
++ 	 */
++ 	cr3 = __read_cr3();
++ 	vmcs_writel(HOST_CR3, cr3);		/* 22.2.3  FIXME: shadow tables */
++ 	vmx->host_state.vmcs_host_cr3 = cr3;
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  
+  	/* Save the most likely value for this task's CR4 in the VMCS. */
+ -	cr4 = cr4_read_shadow();
+ +	cr4 = read_cr4();
+  	vmcs_writel(HOST_CR4, cr4);			/* 22.2.3, 22.2.5 */
+  	vmx->host_state.vmcs_host_cr4 = cr4;
+  
+diff --cc arch/x86/mm/fault.c
+index 7d19407891fe,2a1fa10c6a98..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -321,8 -388,10 +321,8 @@@ static bool low_pfn(unsigned long pfn
+  
+  static void dump_pagetable(unsigned long address)
+  {
+- 	pgd_t *base = __va(read_cr3());
++ 	pgd_t *base = __va(read_cr3_pa());
+  	pgd_t *pgd = &base[pgd_index(address)];
+ -	p4d_t *p4d;
+ -	pud_t *pud;
+  	pmd_t *pmd;
+  	pte_t *pte;
+  
+@@@ -379,7 -451,7 +379,11 @@@ static noinline __kprobes int vmalloc_f
+  	 * happen within a race in page table update. In the later
+  	 * case just flush:
+  	 */
+++<<<<<<< HEAD
+ +	pgd = pgd_offset(current->active_mm, address);
+++=======
++ 	pgd = (pgd_t *)__va(read_cr3_pa()) + pgd_index(address);
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  	pgd_ref = pgd_offset_k(address);
+  	if (pgd_none(*pgd_ref))
+  		return -1;
+@@@ -462,8 -555,9 +466,8 @@@ static int bad_address(void *p
+  
+  static void dump_pagetable(unsigned long address)
+  {
+- 	pgd_t *base = __va(read_cr3() & PHYSICAL_PAGE_MASK);
++ 	pgd_t *base = __va(read_cr3_pa());
+  	pgd_t *pgd = base + pgd_index(address);
+ -	p4d_t *p4d;
+  	pud_t *pud;
+  	pmd_t *pmd;
+  	pte_t *pte;
+@@@ -593,8 -697,13 +597,15 @@@ show_fault_oops(struct pt_regs *regs, u
+  
+  	if (error_code & PF_INSTR) {
+  		unsigned int level;
+ -		pgd_t *pgd;
+ -		pte_t *pte;
+  
+++<<<<<<< HEAD
+ +		pte_t *pte = lookup_address(address, &level);
+++=======
++ 		pgd = __va(read_cr3_pa());
++ 		pgd += pgd_index(address);
++ 
++ 		pte = lookup_address_in_pgd(pgd, address, &level);
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  
+  		if (pte && pte_present(*pte) && !pte_exec(*pte))
+  			printk(nx_warning, from_kuid(&init_user_ns, current_uid()));
+diff --cc arch/x86/platform/efi/efi_64.c
+index 1a2483c88c8c,f40bf6230480..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -85,10 -77,13 +85,18 @@@ void __init efi_call_phys_prolog(void
+  	pud_t *pud;
+  
+  	int pgd;
+ -	int n_pgds, i, j;
+ +	int n_pgds, j;
+  
+++<<<<<<< HEAD
+ +	if (!efi_enabled(EFI_OLD_MEMMAP))
+ +		return;
+++=======
++ 	if (!efi_enabled(EFI_OLD_MEMMAP)) {
++ 		save_pgd = (pgd_t *)__read_cr3();
++ 		write_cr3((unsigned long)efi_scratch.efi_pgt);
++ 		goto out;
++ 	}
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  
+  	early_code_mapping_set_exec(1);
+  
+diff --cc arch/x86/power/cpu.c
+index 48463426dafa,78459a6d455a..000000000000
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@@ -105,12 -129,9 +105,18 @@@ static void __save_processor_state(stru
+  	 */
+  	ctxt->cr0 = read_cr0();
+  	ctxt->cr2 = read_cr2();
+++<<<<<<< HEAD
+ +	ctxt->cr3 = read_cr3();
+ +#ifdef CONFIG_X86_32
+ +	ctxt->cr4 = read_cr4_safe();
+ +#else
+ +/* CONFIG_X86_64 */
+ +	ctxt->cr4 = read_cr4();
+++=======
++ 	ctxt->cr3 = __read_cr3();
++ 	ctxt->cr4 = __read_cr4();
++ #ifdef CONFIG_X86_64
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  	ctxt->cr8 = read_cr8();
+  #endif
+  	ctxt->misc_enable_saved = !rdmsrl_safe(MSR_IA32_MISC_ENABLE,
+diff --cc arch/x86/power/hibernate_64.c
+index 2118214a9db7,e3e62c8a8e70..000000000000
+--- a/arch/x86/power/hibernate_64.c
++++ b/arch/x86/power/hibernate_64.c
+@@@ -131,23 -150,27 +131,34 @@@ static int relocate_restore_code(void
+  	memcpy((void *)relocated_restore_code, &core_restore_code, PAGE_SIZE);
+  
+  	/* Make the page containing the relocated code executable */
+++<<<<<<< HEAD
+ +	pgd = (pgd_t *)__va(read_cr3()) + pgd_index(relocated_restore_code);
+ +	pud = pud_offset(pgd, relocated_restore_code);
+++=======
++ 	pgd = (pgd_t *)__va(read_cr3_pa()) +
++ 		pgd_index(relocated_restore_code);
++ 	p4d = p4d_offset(pgd, relocated_restore_code);
++ 	if (p4d_large(*p4d)) {
++ 		set_p4d(p4d, __p4d(p4d_val(*p4d) & ~_PAGE_NX));
++ 		goto out;
++ 	}
++ 	pud = pud_offset(p4d, relocated_restore_code);
+++>>>>>>> 6c690ee1039b (x86/mm: Split read_cr3() into read_cr3_pa() and __read_cr3())
+  	if (pud_large(*pud)) {
+  		set_pud(pud, __pud(pud_val(*pud) & ~_PAGE_NX));
+ -		goto out;
+ -	}
+ -	pmd = pmd_offset(pud, relocated_restore_code);
+ -	if (pmd_large(*pmd)) {
+ -		set_pmd(pmd, __pmd(pmd_val(*pmd) & ~_PAGE_NX));
+ -		goto out;
+ +	} else {
+ +		pmd_t *pmd = pmd_offset(pud, relocated_restore_code);
+ +
+ +		if (pmd_large(*pmd)) {
+ +			set_pmd(pmd, __pmd(pmd_val(*pmd) & ~_PAGE_NX));
+ +		} else {
+ +			pte_t *pte = pte_offset_kernel(pmd, relocated_restore_code);
+ +
+ +			set_pte(pte, __pte(pte_val(*pte) & ~_PAGE_NX));
+ +		}
+  	}
+ -	pte = pte_offset_kernel(pmd, relocated_restore_code);
+ -	set_pte(pte, __pte(pte_val(*pte) & ~_PAGE_NX));
+ -out:
+  	__flush_tlb_all();
+ +
+  	return 0;
+  }
+  
+* Unmerged path arch/x86/xen/mmu_pv.c
+diff --git a/arch/x86/boot/compressed/pagetable.c b/arch/x86/boot/compressed/pagetable.c
+index 7a916659f660..bc0eabcd8560 100644
+--- a/arch/x86/boot/compressed/pagetable.c
++++ b/arch/x86/boot/compressed/pagetable.c
+@@ -102,7 +102,7 @@ void initialize_identity_maps(void)
+ 	 * and we must append to the existing area instead of entirely
+ 	 * overwriting it.
+ 	 */
+-	level4p = read_cr3();
++	level4p = read_cr3_pa();
+ 	if (level4p == (unsigned long)_pgtable) {
+ 		debug_putstr("booted via startup_32()\n");
+ 		pgt_data.pgt_buf = _pgtable + BOOT_INIT_PGT_SIZE;
+* Unmerged path arch/x86/include/asm/efi.h
+* Unmerged path arch/x86/include/asm/mmu_context.h
+diff --git a/arch/x86/include/asm/paravirt.h b/arch/x86/include/asm/paravirt.h
+index ddc1e7942cf2..5b48a1e31352 100644
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@ -71,7 +71,7 @@ static inline void write_cr2(unsigned long x)
+ 	PVOP_VCALL1(pv_mmu_ops.write_cr2, x);
+ }
+ 
+-static inline unsigned long read_cr3(void)
++static inline unsigned long __read_cr3(void)
+ {
+ 	return PVOP_CALL0(unsigned long, pv_mmu_ops.read_cr3);
+ }
+diff --git a/arch/x86/include/asm/processor-flags.h b/arch/x86/include/asm/processor-flags.h
+index 39fb618e2211..79aa2f98398d 100644
+--- a/arch/x86/include/asm/processor-flags.h
++++ b/arch/x86/include/asm/processor-flags.h
+@@ -8,4 +8,40 @@
+ #else
+ #define X86_VM_MASK	0 /* No VM86 support */
+ #endif
++
++/*
++ * CR3's layout varies depending on several things.
++ *
++ * If CR4.PCIDE is set (64-bit only), then CR3[11:0] is the address space ID.
++ * If PAE is enabled, then CR3[11:5] is part of the PDPT address
++ * (i.e. it's 32-byte aligned, not page-aligned) and CR3[4:0] is ignored.
++ * Otherwise (non-PAE, non-PCID), CR3[3] is PWT, CR3[4] is PCD, and
++ * CR3[2:0] and CR3[11:5] are ignored.
++ *
++ * In all cases, Linux puts zeros in the low ignored bits and in PWT and PCD.
++ *
++ * CR3[63] is always read as zero.  If CR4.PCIDE is set, then CR3[63] may be
++ * written as 1 to prevent the write to CR3 from flushing the TLB.
++ *
++ * On systems with SME, one bit (in a variable position!) is stolen to indicate
++ * that the top-level paging structure is encrypted.
++ *
++ * All of the remaining bits indicate the physical address of the top-level
++ * paging structure.
++ *
++ * CR3_ADDR_MASK is the mask used by read_cr3_pa().
++ */
++#ifdef CONFIG_X86_64
++/* Mask off the address space ID bits. */
++#define CR3_ADDR_MASK 0x7FFFFFFFFFFFF000ull
++#define CR3_PCID_MASK 0xFFFull
++#else
++/*
++ * CR3_ADDR_MASK needs at least bits 31:5 set on PAE systems, and we save
++ * a tiny bit of code size by setting all the bits.
++ */
++#define CR3_ADDR_MASK 0xFFFFFFFFull
++#define CR3_PCID_MASK 0ull
++#endif
++
+ #endif /* _ASM_X86_PROCESSOR_FLAGS_H */
+* Unmerged path arch/x86/include/asm/processor.h
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 52e6a657b889..99f7acf9c2d7 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -44,7 +44,7 @@ static inline void native_write_cr2(unsigned long val)
+ 	asm volatile("mov %0,%%cr2": : "r" (val), "m" (__force_order));
+ }
+ 
+-static inline unsigned long native_read_cr3(void)
++static inline unsigned long __native_read_cr3(void)
+ {
+ 	unsigned long val;
+ 	asm volatile("mov %%cr3,%0\n\t" : "=r" (val), "=m" (__force_order));
+@@ -167,9 +167,13 @@ static inline void write_cr2(unsigned long x)
+ 	native_write_cr2(x);
+ }
+ 
+-static inline unsigned long read_cr3(void)
++/*
++ * Careful!  CR3 contains more than just an address.  You probably want
++ * read_cr3_pa() instead.
++ */
++static inline unsigned long __read_cr3(void)
+ {
+-	return native_read_cr3();
++	return __native_read_cr3();
+ }
+ 
+ static inline void write_cr3(unsigned long x)
+* Unmerged path arch/x86/include/asm/tlbflush.h
+* Unmerged path arch/x86/kernel/head64.c
+diff --git a/arch/x86/kernel/paravirt.c b/arch/x86/kernel/paravirt.c
+index 0e8d1e742550..5f3dcdb2a100 100644
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@ -419,7 +419,7 @@ struct pv_mmu_ops pv_mmu_ops = {
+ 
+ 	.read_cr2 = native_read_cr2,
+ 	.write_cr2 = native_write_cr2,
+-	.read_cr3 = native_read_cr3,
++	.read_cr3 = __native_read_cr3,
+ 	.write_cr3 = native_write_cr3,
+ 
+ 	.flush_tlb_user = native_flush_tlb,
+* Unmerged path arch/x86/kernel/process_32.c
+* Unmerged path arch/x86/kernel/process_64.c
+* Unmerged path arch/x86/kvm/vmx.c
+* Unmerged path arch/x86/mm/fault.c
+diff --git a/arch/x86/mm/ioremap.c b/arch/x86/mm/ioremap.c
+index 497d382ddb05..45658d869ebc 100644
+--- a/arch/x86/mm/ioremap.c
++++ b/arch/x86/mm/ioremap.c
+@@ -374,7 +374,7 @@ static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
+ static inline pmd_t * __init early_ioremap_pmd(unsigned long addr)
+ {
+ 	/* Don't assume we're using swapper_pg_dir at this point */
+-	pgd_t *base = __va(read_cr3());
++	pgd_t *base = __va(read_cr3_pa());
+ 	pgd_t *pgd = &base[pgd_index(addr)];
+ 	pud_t *pud = pud_offset(pgd, addr);
+ 	pmd_t *pmd = pmd_offset(pud, addr);
+* Unmerged path arch/x86/platform/efi/efi_64.c
+diff --git a/arch/x86/platform/olpc/olpc-xo1-pm.c b/arch/x86/platform/olpc/olpc-xo1-pm.c
+index ff0174dda810..5812e9556768 100644
+--- a/arch/x86/platform/olpc/olpc-xo1-pm.c
++++ b/arch/x86/platform/olpc/olpc-xo1-pm.c
+@@ -77,7 +77,7 @@ static int xo1_power_state_enter(suspend_state_t pm_state)
+ 
+ asmlinkage int xo1_do_sleep(u8 sleep_state)
+ {
+-	void *pgd_addr = __va(read_cr3());
++	void *pgd_addr = __va(read_cr3_pa());
+ 
+ 	/* Program wakeup mask (using dword access to CS5536_PM1_EN) */
+ 	outl(wakeup_mask << 16, acpi_base + CS5536_PM1_STS);
+* Unmerged path arch/x86/power/cpu.c
+* Unmerged path arch/x86/power/hibernate_64.c
+* Unmerged path arch/x86/xen/mmu_pv.c
