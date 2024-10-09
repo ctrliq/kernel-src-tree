@@ -1,0 +1,170 @@
+sysfs, kernfs: introduce kernfs_create_link()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 5d0e26bb59a680a5d97db5b6629941603e8de229
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5d0e26bb.failed
+
+Separate out kernfs symlink interface - kernfs_create_link() - which
+takes and returns sysfs_dirents, from sysfs_do_create_link_sd().
+sysfs_do_create_link_sd() now just determines the parent and target
+sysfs_dirents and invokes the new interface and handles dup warning.
+
+This patch doesn't introduce behavior changes.
+
+v2: Dummy implementation for !CONFIG_SYSFS updated to return -ENOSYS.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5d0e26bb59a680a5d97db5b6629941603e8de229)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/symlink.c
+#	include/linux/kernfs.h
+diff --cc fs/sysfs/symlink.c
+index 8c940df97a52,41138e91947a..000000000000
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@@ -25,65 -62,32 +62,77 @@@ static int sysfs_do_create_link_sd(stru
+  				   struct kobject *target,
+  				   const char *name, int warn)
+  {
+++<<<<<<< HEAD
+ +	struct sysfs_dirent *target_sd = NULL;
+ +	struct sysfs_dirent *sd = NULL;
+ +	struct sysfs_addrm_cxt acxt;
+ +	enum kobj_ns_type ns_type;
+ +	int error;
+++=======
++ 	struct sysfs_dirent *sd, *target_sd = NULL;
+++>>>>>>> 5d0e26bb59a6 (sysfs, kernfs: introduce kernfs_create_link())
+  
+  	BUG_ON(!name || !parent_sd);
+  
+ -	/*
+ -	 * We don't own @target and it may be removed at any time.
+ -	 * Synchronize using sysfs_symlink_target_lock.  See
+ -	 * sysfs_remove_dir() for details.
+ +	/* target->sd can go away beneath us but is protected with
+ +	 * sysfs_assoc_lock.  Fetch target_sd from it.
+  	 */
+ -	spin_lock(&sysfs_symlink_target_lock);
+ +	spin_lock(&sysfs_assoc_lock);
+  	if (target->sd)
+  		target_sd = sysfs_get(target->sd);
+ -	spin_unlock(&sysfs_symlink_target_lock);
+ +	spin_unlock(&sysfs_assoc_lock);
+  
+- 	error = -ENOENT;
+  	if (!target_sd)
+- 		goto out_put;
++ 		return -ENOENT;
+  
+++<<<<<<< HEAD
+ +	error = -ENOMEM;
+ +	sd = sysfs_new_dirent(name, S_IFLNK|S_IRWXUGO, SYSFS_KOBJ_LINK);
+ +	if (!sd)
+ +		goto out_put;
+ +
+ +	ns_type = sysfs_ns_type(parent_sd);
+ +	if (ns_type)
+ +		sd->s_ns = target->ktype->namespace(target);
+ +	sd->s_symlink.target_sd = target_sd;
+ +	target_sd = NULL;	/* reference is now owned by the symlink */
+ +
+ +	sysfs_addrm_start(&acxt, parent_sd);
+ +	/* Symlinks must be between directories with the same ns_type */
+ +	if (!ns_type ||
+ +	    (ns_type == sysfs_ns_type(sd->s_symlink.target_sd->s_parent))) {
+ +		if (warn)
+ +			error = sysfs_add_one(&acxt, sd);
+ +		else
+ +			error = __sysfs_add_one(&acxt, sd);
+ +	} else {
+ +		error = -EINVAL;
+ +		WARN(1, KERN_WARNING
+ +			"sysfs: symlink across ns_types %s/%s -> %s/%s\n",
+ +			parent_sd->s_name,
+ +			sd->s_name,
+ +			sd->s_symlink.target_sd->s_parent->s_name,
+ +			sd->s_symlink.target_sd->s_name);
+ +	}
+ +	sysfs_addrm_finish(&acxt);
+ +
+ +	if (error)
+ +		goto out_put;
+ +
+ +	return 0;
+ +
+ + out_put:
+++=======
++ 	sd = kernfs_create_link(parent_sd, name, target_sd);
+++>>>>>>> 5d0e26bb59a6 (sysfs, kernfs: introduce kernfs_create_link())
+  	sysfs_put(target_sd);
+- 	sysfs_put(sd);
+- 	return error;
++ 
++ 	if (!IS_ERR(sd))
++ 		return 0;
++ 
++ 	if (warn && PTR_ERR(sd) == -EEXIST)
++ 		sysfs_warn_dup(parent_sd, name);
++ 	return PTR_ERR(sd);
+  }
+  
+  /**
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,fe6290d41776..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,39 +7,44 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+++<<<<<<< HEAD
+ +struct sysfs_dirent;
+ +
+++=======
++ #include <linux/kernel.h>
++ #include <linux/err.h>
++ 
++ struct sysfs_dirent;
++ 
++ #ifdef CONFIG_SYSFS
++ 
++ struct sysfs_dirent *kernfs_create_link(struct sysfs_dirent *parent,
++ 					const char *name,
++ 					struct sysfs_dirent *target);
++ void kernfs_remove(struct sysfs_dirent *sd);
++ int kernfs_remove_by_name_ns(struct sysfs_dirent *parent, const char *name,
++ 			     const void *ns);
++ 
++ #else	/* CONFIG_SYSFS */
++ 
++ static inline struct sysfs_dirent *
++ kernfs_create_link(struct sysfs_dirent *parent, const char *name,
++ 		   struct sysfs_dirent *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_remove(struct sysfs_dirent *sd) { }
++ 
++ static inline int kernfs_remove_by_name_ns(struct sysfs_dirent *parent,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ #endif	/* CONFIG_SYSFS */
++ 
++ static inline int kernfs_remove_by_name(struct sysfs_dirent *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
+++>>>>>>> 5d0e26bb59a6 (sysfs, kernfs: introduce kernfs_create_link())
+  #endif	/* __LINUX_KERNFS_H */
+* Unmerged path fs/sysfs/symlink.c
+* Unmerged path include/linux/kernfs.h
