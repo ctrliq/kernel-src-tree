@@ -1,0 +1,116 @@
+flow_dissector: fix vlan tag handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit bc72f3dd89e087e33afe8c490fbe132e3dcd9afe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bc72f3dd.failed
+
+gcc warns about an uninitialized pointer dereference in the vlan
+priority handling:
+
+net/core/flow_dissector.c: In function '__skb_flow_dissect':
+net/core/flow_dissector.c:281:61: error: 'vlan' may be used uninitialized in this function [-Werror=maybe-uninitialized]
+
+As pointed out by Jiri Pirko, the variable is never actually used
+without being initialized first as the only way it end up uninitialized
+is with skb_vlan_tag_present(skb)==true, and that means it does not
+get accessed.
+
+However, the warning hints at some related issues that I'm addressing
+here:
+
+- the second check for the vlan tag is different from the first one
+  that tests the skb for being NULL first, causing both the warning
+  and a possible NULL pointer dereference that was not entirely fixed.
+- The same patch that introduced the NULL pointer check dropped an
+  earlier optimization that skipped the repeated check of the
+  protocol type
+- The local '_vlan' variable is referenced through the 'vlan' pointer
+  but the variable has gone out of scope by the time that it is
+  accessed, causing undefined behavior
+
+Caching the result of the 'skb && skb_vlan_tag_present(skb)' check
+in a local variable allows the compiler to further optimize the
+later check. With those changes, the warning also disappears.
+
+Fixes: 3805a938a6c2 ("flow_dissector: Check skb for VLAN only if skb specified.")
+Fixes: d5709f7ab776 ("flow_dissector: For stripped vlan, get vlan info from skb->vlan_tci")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Eric Garver <e@erig.me>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bc72f3dd89e087e33afe8c490fbe132e3dcd9afe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,ab193e5def07..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -173,20 -243,49 +173,58 @@@ ipv6
+  
+  		break;
+  	}
+ -	case htons(ETH_P_8021AD):
+ -	case htons(ETH_P_8021Q): {
+ +	case __constant_htons(ETH_P_8021AD):
+ +	case __constant_htons(ETH_P_8021Q): {
+  		const struct vlan_hdr *vlan;
+  		struct vlan_hdr _vlan;
+++<<<<<<< HEAD
+ +
+ +		vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan), data, hlen, &_vlan);
+ +		if (!vlan)
+ +			return false;
+++=======
++ 		bool vlan_tag_present = skb && skb_vlan_tag_present(skb);
++ 
++ 		if (vlan_tag_present)
++ 			proto = skb->protocol;
++ 
++ 		if (!vlan_tag_present || eth_type_vlan(skb->protocol)) {
++ 			vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan),
++ 						    data, hlen, &_vlan);
++ 			if (!vlan)
++ 				goto out_bad;
++ 			proto = vlan->h_vlan_encapsulated_proto;
++ 			nhoff += sizeof(*vlan);
++ 			if (skip_vlan)
++ 				goto again;
++ 		}
++ 
++ 		skip_vlan = true;
++ 		if (dissector_uses_key(flow_dissector,
++ 				       FLOW_DISSECTOR_KEY_VLAN)) {
++ 			key_vlan = skb_flow_dissector_target(flow_dissector,
++ 							     FLOW_DISSECTOR_KEY_VLAN,
++ 							     target_container);
++ 
++ 			if (vlan_tag_present) {
++ 				key_vlan->vlan_id = skb_vlan_tag_get_id(skb);
++ 				key_vlan->vlan_priority =
++ 					(skb_vlan_tag_get_prio(skb) >> VLAN_PRIO_SHIFT);
++ 			} else {
++ 				key_vlan->vlan_id = ntohs(vlan->h_vlan_TCI) &
++ 					VLAN_VID_MASK;
++ 				key_vlan->vlan_priority =
++ 					(ntohs(vlan->h_vlan_TCI) &
++ 					 VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++ 			}
++ 		}
+++>>>>>>> bc72f3dd89e0 (flow_dissector: fix vlan tag handling)
+  
+ +		proto = vlan->h_vlan_encapsulated_proto;
+ +		nhoff += sizeof(*vlan);
+  		goto again;
+  	}
+ -	case htons(ETH_P_PPP_SES): {
+ +	case __constant_htons(ETH_P_PPP_SES): {
+  		struct {
+  			struct pppoe_hdr hdr;
+  			__be16 proto;
+* Unmerged path net/core/flow_dissector.c
