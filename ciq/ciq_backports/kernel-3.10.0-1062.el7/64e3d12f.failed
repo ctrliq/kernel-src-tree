@@ -1,0 +1,236 @@
+mm, drm/i915: mark pinned shmemfs pages as unevictable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Kuo-Hsin Yang <vovoy@chromium.org>
+commit 64e3d12f769d60eaee6d2e53a9b7f0b3814f32ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/64e3d12f.failed
+
+The i915 driver uses shmemfs to allocate backing storage for gem
+objects. These shmemfs pages can be pinned (increased ref count) by
+shmem_read_mapping_page_gfp(). When a lot of pages are pinned, vmscan
+wastes a lot of time scanning these pinned pages. In some extreme case,
+all pages in the inactive anon lru are pinned, and only the inactive
+anon lru is scanned due to inactive_ratio, the system cannot swap and
+invokes the oom-killer. Mark these pinned pages as unevictable to speed
+up vmscan.
+
+Export pagevec API check_move_unevictable_pages().
+
+This patch was inspired by Chris Wilson's change [1].
+
+[1]: https://patchwork.kernel.org/patch/9768741/
+
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Signed-off-by: Kuo-Hsin Yang <vovoy@chromium.org>
+	Acked-by: Michal Hocko <mhocko@suse.com> # mm part
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Acked-by: Dave Hansen <dave.hansen@intel.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+Link: https://patchwork.freedesktop.org/patch/msgid/20181106132324.17390-1-chris@chris-wilson.co.uk
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 64e3d12f769d60eaee6d2e53a9b7f0b3814f32ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+#	mm/vmscan.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index 873a84ec3008,5b80b0c14aed..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -2284,8 -2418,11 +2299,15 @@@ i915_gem_object_put_pages_gtt(struct dr
+  		if (obj->mm.madv == I915_MADV_WILLNEED)
+  			mark_page_accessed(page);
+  
+++<<<<<<< HEAD
+ +		put_page(page);
+++=======
++ 		if (!pagevec_add(&pvec, page))
++ 			check_release_pagevec(&pvec);
+++>>>>>>> 64e3d12f769d (mm, drm/i915: mark pinned shmemfs pages as unevictable)
+  	}
++ 	if (pagevec_count(&pvec))
++ 		check_release_pagevec(&pvec);
+  	obj->mm.dirty = false;
+  
+  	sg_free_table(pages);
+@@@ -2419,9 -2579,9 +2442,15 @@@ rebuild_st
+  	 * Fail silently without starting the shrinker
+  	 */
+  	mapping = obj->base.filp->f_mapping;
+++<<<<<<< HEAD
+ +	noreclaim = mapping_gfp_mask(mapping);
+ +	noreclaim |= __GFP_NORETRY | __GFP_NOWARN | __GFP_NO_KSWAPD;
+ +	noreclaim &= ~(__GFP_IO | __GFP_WAIT);
+++=======
++ 	mapping_set_unevictable(mapping);
++ 	noreclaim = mapping_gfp_constraint(mapping, ~__GFP_RECLAIM);
++ 	noreclaim |= __GFP_NORETRY | __GFP_NOWARN;
+++>>>>>>> 64e3d12f769d (mm, drm/i915: mark pinned shmemfs pages as unevictable)
+  
+  	sg = st->sgl;
+  	st->nents = 0;
+diff --cc mm/vmscan.c
+index 8fd2a568a694,0dbc493026a2..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -42,7 -46,9 +42,8 @@@
+  #include <linux/delayacct.h>
+  #include <linux/sysctl.h>
+  #include <linux/oom.h>
++ #include <linux/pagevec.h>
+  #include <linux/prefetch.h>
+ -#include <linux/printk.h>
+  #include <linux/dax.h>
+  
+  #include <asm/tlbflush.h>
+@@@ -3769,40 -4154,44 +3770,45 @@@ int zone_reclaim(struct zone *zone, gfp
+   */
+  int page_evictable(struct page *page)
+  {
+ -	int ret;
+ -
+ -	/* Prevent address_space of inode and swap cache from being freed */
+ -	rcu_read_lock();
+ -	ret = !mapping_unevictable(page_mapping(page)) && !PageMlocked(page);
+ -	rcu_read_unlock();
+ -	return ret;
+ +	return !mapping_unevictable(page_mapping(page)) && !PageMlocked(page);
+  }
+  
+- #ifdef CONFIG_SHMEM
+  /**
+-  * check_move_unevictable_pages - check pages for evictability and move to appropriate zone lru list
+-  * @pages:	array of pages to check
+-  * @nr_pages:	number of pages to check
++  * check_move_unevictable_pages - check pages for evictability and move to
++  * appropriate zone lru list
++  * @pvec: pagevec with lru pages to check
+   *
+-  * Checks pages for evictability and moves them to the appropriate lru list.
+-  *
+-  * This function is only used for SysV IPC SHM_UNLOCK.
++  * Checks pages for evictability, if an evictable page is in the unevictable
++  * lru list, moves it to the appropriate evictable lru list. This function
++  * should be only used for lru pages.
+   */
+- void check_move_unevictable_pages(struct page **pages, int nr_pages)
++ void check_move_unevictable_pages(struct pagevec *pvec)
+  {
+  	struct lruvec *lruvec;
+ -	struct pglist_data *pgdat = NULL;
+ +	struct zone *zone = NULL;
+  	int pgscanned = 0;
+  	int pgrescued = 0;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < nr_pages; i++) {
+ +		struct page *page = pages[i];
+ +		struct zone *pagezone;
+++=======
++ 	for (i = 0; i < pvec->nr; i++) {
++ 		struct page *page = pvec->pages[i];
++ 		struct pglist_data *pagepgdat = page_pgdat(page);
+++>>>>>>> 64e3d12f769d (mm, drm/i915: mark pinned shmemfs pages as unevictable)
+  
+  		pgscanned++;
+ -		if (pagepgdat != pgdat) {
+ -			if (pgdat)
+ -				spin_unlock_irq(&pgdat->lru_lock);
+ -			pgdat = pagepgdat;
+ -			spin_lock_irq(&pgdat->lru_lock);
+ +		pagezone = page_zone(page);
+ +		if (pagezone != zone) {
+ +			if (zone)
+ +				spin_unlock_irq(&zone->lru_lock);
+ +			zone = pagezone;
+ +			spin_lock_irq(&zone->lru_lock);
+  		}
+ -		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ +		lruvec = mem_cgroup_page_lruvec(page, zone);
+  
+  		if (!PageLRU(page) || !PageUnevictable(page))
+  			continue;
+@@@ -3818,10 -4207,10 +3824,10 @@@
+  		}
+  	}
+  
+ -	if (pgdat) {
+ +	if (zone) {
+  		__count_vm_events(UNEVICTABLE_PGRESCUED, pgrescued);
+  		__count_vm_events(UNEVICTABLE_PGSCANNED, pgscanned);
+ -		spin_unlock_irq(&pgdat->lru_lock);
+ +		spin_unlock_irq(&zone->lru_lock);
+  	}
+  }
+- #endif /* CONFIG_SHMEM */
++ EXPORT_SYMBOL_GPL(check_move_unevictable_pages);
+diff --git a/Documentation/vm/unevictable-lru.txt b/Documentation/vm/unevictable-lru.txt
+index 719e291d3732..6f6d58a252ed 100644
+--- a/Documentation/vm/unevictable-lru.txt
++++ b/Documentation/vm/unevictable-lru.txt
+@@ -164,7 +164,7 @@ using a number of wrapper functions:
+ 	Query the address space, and return true if it is completely
+ 	unevictable.
+ 
+-These are currently used in two places in the kernel:
++These are currently used in three places in the kernel:
+ 
+  (1) By ramfs to mark the address spaces of its inodes when they are created,
+      and this mark remains for the life of the inode.
+@@ -175,6 +175,10 @@ These are currently used in two places in the kernel:
+      swapped out; the application must touch the pages manually if it wants to
+      ensure they're in memory.
+ 
++ (3) By the i915 driver to mark pinned address space until it's unpinned. The
++     amount of unevictable memory marked by i915 driver is roughly the bounded
++     object size in debugfs/dri/0/i915_gem_objects.
++
+ 
+ DETECTING UNEVICTABLE PAGES
+ ---------------------------
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index a8d3662b5bce..b0a1d1379a38 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -19,6 +19,8 @@ struct notifier_block;
+ 
+ struct bio;
+ 
++struct pagevec;
++
+ #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
+ #define SWAP_FLAG_PRIO_MASK	0x7fff
+ #define SWAP_FLAG_PRIO_SHIFT	0
+@@ -396,7 +398,7 @@ static inline int zone_reclaim(struct zone *z, gfp_t mask, unsigned int order)
+ #endif
+ 
+ extern int page_evictable(struct page *page);
+-extern void check_move_unevictable_pages(struct page **, int nr_pages);
++extern void check_move_unevictable_pages(struct pagevec *pvec);
+ 
+ extern int kswapd_run(int nid);
+ extern void kswapd_stop(int nid);
+diff --git a/mm/shmem.c b/mm/shmem.c
+index fce4fdb37b9d..0a198ab3b687 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -491,7 +491,7 @@ void shmem_unlock_mapping(struct address_space *mapping)
+ 			break;
+ 		index = indices[pvec.nr - 1] + 1;
+ 		pagevec_remove_exceptionals(&pvec);
+-		check_move_unevictable_pages(pvec.pages, pvec.nr);
++		check_move_unevictable_pages(&pvec);
+ 		pagevec_release(&pvec);
+ 		cond_resched();
+ 	}
+* Unmerged path mm/vmscan.c
