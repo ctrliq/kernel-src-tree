@@ -1,0 +1,219 @@
+x86/perf/cqm: Wipe out perf based cqm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] perf/cqm: Wipe out perf based cqm (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 94.29%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit c39a0e2c8850f08249383f2425dbd8dbe4baad69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c39a0e2c.failed
+
+'perf cqm' never worked due to the incompatibility between perf
+infrastructure and cqm hardware support.  The hardware uses RMIDs to
+track the llc occupancy of tasks and these RMIDs are per package. This
+makes monitoring a hierarchy like cgroup along with monitoring of tasks
+separately difficult and several patches sent to lkml to fix them were
+NACKed. Further more, the following issues in the current perf cqm make
+it almost unusable:
+
+    1. No support to monitor the same group of tasks for which we do
+    allocation using resctrl.
+
+    2. It gives random and inaccurate data (mostly 0s) once we run out
+    of RMIDs due to issues in Recycling.
+
+    3. Recycling results in inaccuracy of data because we cannot
+    guarantee that the RMID was stolen from a task when it was not
+    pulling data into cache or even when it pulled the least data. Also
+    for monitoring llc_occupancy, if we stop using an RMID_x and then
+    start using an RMID_y after we reclaim an RMID from an other event,
+    we miss accounting all the occupancy that was tagged to RMID_x at a
+    later perf_count.
+
+    2. Recycling code makes the monitoring code complex including
+    scheduling because the event can lose RMID any time. Since MBM
+    counters count bandwidth for a period of time by taking snap shot of
+    total bytes at two different times, recycling complicates the way we
+    count MBM in a hierarchy. Also we need a spin lock while we do the
+    processing to account for MBM counter overflow. We also currently
+    use a spin lock in scheduling to prevent the RMID from being taken
+    away.
+
+    4. Lack of support when we run different kind of event like task,
+    system-wide and cgroup events together. Data mostly prints 0s. This
+    is also because we can have only one RMID tied to a cpu as defined
+    by the cqm hardware but a perf can at the same time tie multiple
+    events during one sched_in.
+
+    5. No support of monitoring a group of tasks. There is partial support
+    for cgroup but it does not work once there is a hierarchy of cgroups
+    or if we want to monitor a task in a cgroup and the cgroup itself.
+
+    6. No support for monitoring tasks for the lifetime without perf
+    overhead.
+
+    7. It reported the aggregate cache occupancy or memory bandwidth over
+    all sockets. But most cloud and VMM based use cases want to know the
+    individual per-socket usage.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-2-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit c39a0e2c8850f08249383f2425dbd8dbe4baad69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/cqm.c
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index c194e6aa7dd7,4572dbabd4e8..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -125,15 -139,6 +125,18 @@@ struct hw_perf_event 
+  			/* for tp_event->class */
+  			struct list_head	tp_list;
+  		};
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +		struct { /* intel_cqm */
+ +			int			cqm_state;
+ +			u32			cqm_rmid;
+ +			int			is_group_event;
+ +			struct list_head	cqm_events_entry;
+ +			struct list_head	cqm_groups_entry;
+ +			struct list_head	cqm_group_entry;
+ +		};
+++=======
+++>>>>>>> c39a0e2c8850 (x86/perf/cqm: Wipe out perf based cqm)
+  		struct { /* itrace */
+  			int			itrace_started;
+  		};
+@@@ -315,18 -405,14 +318,21 @@@ struct pmu 
+  	/*
+  	 * PMU specific data size
+  	 */
+ -	size_t				task_ctx_size;
+ +	RH_KABI_EXTEND(size_t task_ctx_size)
+  
+ +	/*
+++<<<<<<< HEAD
+ +	 * Return the count value for a counter.
+ +	 */
+ +	RH_KABI_EXTEND(u64 (*count)			(struct perf_event *event)) /*optional*/
+  
+  	/*
+++=======
+++>>>>>>> c39a0e2c8850 (x86/perf/cqm: Wipe out perf based cqm)
+  	 * Set up pmu-private data structures for an AUX area
+  	 */
+ -	void *(*setup_aux)		(int cpu, void **pages,
+ -					 int nr_pages, bool overwrite);
+ +	RH_KABI_EXTEND(void *(*setup_aux)		(int cpu, void **pages,
+ +					 int nr_pages, bool overwrite))
+  					/* optional */
+  
+  	/*
+diff --cc kernel/events/core.c
+index c7982922c47d,6e171540c0af..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -3615,13 -3651,24 +3612,29 @@@ u64 perf_event_read_local(struct perf_e
+  	 * It must not be an event with inherit set, we cannot read
+  	 * all child counters from atomic context.
+  	 */
+ -	if (event->attr.inherit) {
+ -		ret = -EOPNOTSUPP;
+ -		goto out;
+ -	}
+ +	WARN_ON_ONCE(event->attr.inherit);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * It must not have a pmu::count method, those are not
+ +	 * NMI safe.
+ +	 */
+ +	WARN_ON_ONCE(event->pmu->count);
+++=======
++ 	/* If this is a per-task event, it must be for current */
++ 	if ((event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->hw.target != current) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	/* If this is a per-CPU event, it must be for this CPU */
++ 	if (!(event->attach_state & PERF_ATTACH_TASK) &&
++ 	    event->cpu != smp_processor_id()) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
+++>>>>>>> c39a0e2c8850 (x86/perf/cqm: Wipe out perf based cqm)
+  
+  	/*
+  	 * If the event is currently on this CPU, its either a per-task event,
+* Unmerged path arch/x86/events/intel/cqm.c
+diff --git a/arch/x86/events/intel/Makefile b/arch/x86/events/intel/Makefile
+index f3de4494c761..fedb59988fb6 100644
+--- a/arch/x86/events/intel/Makefile
++++ b/arch/x86/events/intel/Makefile
+@@ -1,4 +1,4 @@
+-obj-$(CONFIG_CPU_SUP_INTEL)		+= core.o bts.o cqm.o
++obj-$(CONFIG_CPU_SUP_INTEL)		+= core.o bts.o
+ obj-$(CONFIG_CPU_SUP_INTEL)		+= ds.o knc.o
+ obj-$(CONFIG_CPU_SUP_INTEL)		+= lbr.o p4.o p6.o pt.o
+ obj-$(CONFIG_PERF_EVENTS_INTEL_RAPL)	+= intel-rapl-perf.o
+* Unmerged path arch/x86/events/intel/cqm.c
+diff --git a/arch/x86/include/asm/intel_rdt_common.h b/arch/x86/include/asm/intel_rdt_common.h
+index b31081b89407..c95321870842 100644
+--- a/arch/x86/include/asm/intel_rdt_common.h
++++ b/arch/x86/include/asm/intel_rdt_common.h
+@@ -7,7 +7,6 @@
+  * struct intel_pqr_state - State cache for the PQR MSR
+  * @rmid:		The cached Resource Monitoring ID
+  * @closid:		The cached Class Of Service ID
+- * @rmid_usecnt:	The usage counter for rmid
+  *
+  * The upper 32 bits of MSR_IA32_PQR_ASSOC contain closid and the
+  * lower 10 bits rmid. The update to MSR_IA32_PQR_ASSOC always
+@@ -19,7 +18,6 @@
+ struct intel_pqr_state {
+ 	u32			rmid;
+ 	u32			closid;
+-	int			rmid_usecnt;
+ };
+ 
+ DECLARE_PER_CPU(struct intel_pqr_state, pqr_state);
+diff --git a/arch/x86/kernel/cpu/intel_rdt.c b/arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e..967342a7f5df 100644
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@ -39,6 +39,14 @@ DEFINE_PER_CPU_READ_MOSTLY(int, cpu_closid);
+ 
+ #define domain_init(id) LIST_HEAD_INIT(rdt_resources_all[id].domains)
+ 
++/*
++ * The cached intel_pqr_state is strictly per CPU and can never be
++ * updated from a remote CPU. Functions which modify the state
++ * are called with interrupts disabled and no preemption, which
++ * is sufficient for the protection.
++ */
++DEFINE_PER_CPU(struct intel_pqr_state, pqr_state);
++
+ /*
+  * Used to store the max resource name width and max resource data width
+  * to display the schemata in a tabular format
+* Unmerged path include/linux/perf_event.h
+* Unmerged path kernel/events/core.c
