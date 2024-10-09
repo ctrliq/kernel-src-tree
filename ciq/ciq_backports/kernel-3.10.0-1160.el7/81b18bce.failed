@@ -1,0 +1,308 @@
+Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+Rebuild_CHGLOG: - [hv] Send one page worth of kmsg dump over Hyper-V during panic (Mohammed Gamal) [1828450]
+Rebuild_FUZZ: 89.92%
+commit-author Sunil Muthuswamy <sunilmut@microsoft.com>
+commit 81b18bce48af3e222ca9eebb3b931f59141b7b49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/81b18bce.failed
+
+In the VM mode on Hyper-V, currently, when the kernel panics, an error
+code and few register values are populated in an MSR and the Hypervisor
+notified. This information is collected on the host. The amount of
+information currently collected is found to be limited and not very
+actionable. To gather more actionable data, such as stack trace, the
+proposal is to write one page worth of kmsg data on an allocated page
+and the Hypervisor notified of the page address through the MSR.
+
+- Sysctl option to control the behavior, with ON by default.
+
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: Sunil Muthuswamy <sunilmut@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 81b18bce48af3e222ca9eebb3b931f59141b7b49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/kernel.txt
+#	drivers/hv/vmbus_drv.c
+diff --cc Documentation/sysctl/kernel.txt
+index 6379309be03c,59585030cbaf..000000000000
+--- a/Documentation/sysctl/kernel.txt
++++ b/Documentation/sysctl/kernel.txt
+@@@ -40,6 -39,8 +40,11 @@@ show up in /proc/sys/kernel
+  - hung_task_check_count
+  - hung_task_timeout_secs
+  - hung_task_warnings
+++<<<<<<< HEAD
+++=======
++ - hyperv_record_panic_msg
++ - kexec_load_disabled
+++>>>>>>> 81b18bce48af (Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic)
+  - kptr_restrict
+  - l2cr                        [ PPC only ]
+  - modprobe                    ==> Documentation/debugging-modules.txt
+@@@ -382,6 -375,28 +387,31 @@@ This file shows up if CONFIG_DETECT_HUN
+  
+  ==============================================================
+  
+++<<<<<<< HEAD
+++=======
++ hyperv_record_panic_msg:
++ 
++ Controls whether the panic kmsg data should be reported to Hyper-V.
++ 
++ 0: do not report panic kmsg data.
++ 
++ 1: report the panic kmsg data. This is the default behavior.
++ 
++ ==============================================================
++ 
++ kexec_load_disabled:
++ 
++ A toggle indicating if the kexec_load syscall has been disabled. This
++ value defaults to 0 (false: kexec_load enabled), but can be set to 1
++ (true: kexec_load disabled). Once true, kexec can no longer be used, and
++ the toggle cannot be set back to false. This allows a kexec image to be
++ loaded before disabling the syscall, allowing a system to set up (and
++ later use) an image without it being altered. Generally used together
++ with the "modules_disabled" sysctl.
++ 
++ ==============================================================
++ 
+++>>>>>>> 81b18bce48af (Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic)
+  kptr_restrict:
+  
+  This toggle indicates whether restrictions are placed on
+diff --cc drivers/hv/vmbus_drv.c
+index 52302e715e84,05e37283d7c3..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -54,7 -54,10 +54,9 @@@ static struct acpi_device  *hv_acpi_dev
+  
+  static struct completion probe_event;
+  
+ -static int hyperv_cpuhp_online;
+  
++ static void *hv_panic_page;
++ 
+  static int hyperv_panic_event(struct notifier_block *nb, unsigned long val,
+  			      void *args)
+  {
+@@@ -1149,48 -1020,74 +1151,119 @@@ static void vmbus_isr(void
+  	add_interrupt_randomness(HYPERVISOR_CALLBACK_VECTOR, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static void hv_synic_init_oncpu(void *arg)
+ +{
+ +	int cpu = get_cpu();
+ +	hv_synic_init(cpu);
+ +	put_cpu();
+ +}
+ +
+ +static void hv_synic_cleanup_oncpu(void *arg)
+ +{
+ +	int cpu = get_cpu();
+ +	hv_synic_cleanup(cpu);
+ +	put_cpu();
+ +}
+ +
+ +static int hv_cpuhp_callback(struct notifier_block *nfb,
+ +			     unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (unsigned long) hcpu;
+ +
+ +	switch (action & ~CPU_TASKS_FROZEN) {
+ +	case CPU_STARTING:
+ +		hv_synic_init(cpu);
+ +		break;
+ +	case CPU_DYING:
+ +		hv_synic_cleanup(cpu);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		if (hv_synic_cpu_used(cpu))
+ +			return NOTIFY_BAD;
+ +		hv_clockevents_unbind(cpu);
+ +		break;
+ +	case CPU_DOWN_FAILED:
+ +		hv_clockevents_bind(cpu);
+ +		break;
+ +	}
+ +
+ +	return NOTIFY_OK;
+ +}
+ +
+ +static struct notifier_block hv_cpuhp_notifier __refdata = {
+ +       .notifier_call = hv_cpuhp_callback,
+ +       .priority = INT_MAX - 1, /* Run after hv_cpu_init() */
+++=======
++ /*
++  * Boolean to control whether to report panic messages over Hyper-V.
++  *
++  * It can be set via /proc/sys/kernel/hyperv/record_panic_msg
++  */
++ static int sysctl_record_panic_msg = 1;
++ 
++ /*
++  * Callback from kmsg_dump. Grab as much as possible from the end of the kmsg
++  * buffer and call into Hyper-V to transfer the data.
++  */
++ static void hv_kmsg_dump(struct kmsg_dumper *dumper,
++ 			 enum kmsg_dump_reason reason)
++ {
++ 	size_t bytes_written;
++ 	phys_addr_t panic_pa;
++ 
++ 	/* We are only interested in panics. */
++ 	if ((reason != KMSG_DUMP_PANIC) || (!sysctl_record_panic_msg))
++ 		return;
++ 
++ 	panic_pa = virt_to_phys(hv_panic_page);
++ 
++ 	/*
++ 	 * Write dump contents to the page. No need to synchronize; panic should
++ 	 * be single-threaded.
++ 	 */
++ 	if (!kmsg_dump_get_buffer(dumper, true, hv_panic_page,
++ 				  PAGE_SIZE, &bytes_written)) {
++ 		pr_err("Hyper-V: Unable to get kmsg data for panic\n");
++ 		return;
++ 	}
++ 
++ 	hyperv_report_panic_msg(panic_pa, bytes_written);
++ }
++ 
++ static struct kmsg_dumper hv_kmsg_dumper = {
++ 	.dump = hv_kmsg_dump,
++ };
++ 
++ static struct ctl_table_header *hv_ctl_table_hdr;
++ static int zero;
++ static int one = 1;
++ 
++ /*
++  * sysctl option to allow the user to control whether kmsg data should be
++  * reported to Hyper-V on panic.
++  */
++ static struct ctl_table hv_ctl_table[] = {
++ 	{
++ 		.procname       = "hyperv_record_panic_msg",
++ 		.data           = &sysctl_record_panic_msg,
++ 		.maxlen         = sizeof(int),
++ 		.mode           = 0644,
++ 		.proc_handler   = proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one
++ 	},
++ 	{}
++ };
++ 
++ static struct ctl_table hv_root_table[] = {
++ 	{
++ 		.procname	= "kernel",
++ 		.mode		= 0555,
++ 		.child		= hv_ctl_table
++ 	},
++ 	{}
+++>>>>>>> 81b18bce48af (Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic)
+  };
+  
+  /*
+@@@ -1977,14 -1892,16 +2082,21 @@@ static void __exit vmbus_exit(void
+  		atomic_notifier_chain_unregister(&panic_notifier_list,
+  						 &hyperv_panic_block);
+  	}
++ 
++ 	free_page((unsigned long)hv_panic_page);
++ 	if (!hv_ctl_table_hdr) {
++ 		unregister_sysctl_table(hv_ctl_table_hdr);
++ 		hv_ctl_table_hdr = NULL;
++ 	}
++ 
+  	bus_unregister(&hv_bus);
+ +	cpu_notifier_register_begin();
+ +	__unregister_hotcpu_notifier(&hv_cpuhp_notifier);
+ +
+ +	for_each_online_cpu(cpu)
+ +		smp_call_function_single(cpu, hv_synic_cleanup_oncpu, NULL, 1);
+  
+ -	cpuhp_remove_state(hyperv_cpuhp_online);
+ +	cpu_notifier_register_done();
+  	hv_synic_free();
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+  }
+* Unmerged path Documentation/sysctl/kernel.txt
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+index 2c8a003f032c..8a9e150c70ac 100644
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -291,6 +291,33 @@ void hyperv_report_panic(struct pt_regs *regs, long err)
+ }
+ EXPORT_SYMBOL_GPL(hyperv_report_panic);
+ 
++/**
++ * hyperv_report_panic_msg - report panic message to Hyper-V
++ * @pa: physical address of the panic page containing the message
++ * @size: size of the message in the page
++ */
++void hyperv_report_panic_msg(phys_addr_t pa, size_t size)
++{
++	/*
++	 * P3 to contain the physical address of the panic page & P4 to
++	 * contain the size of the panic data in that page. Rest of the
++	 * registers are no-op when the NOTIFY_MSG flag is set.
++	 */
++	wrmsrl(HV_X64_MSR_CRASH_P0, 0);
++	wrmsrl(HV_X64_MSR_CRASH_P1, 0);
++	wrmsrl(HV_X64_MSR_CRASH_P2, 0);
++	wrmsrl(HV_X64_MSR_CRASH_P3, pa);
++	wrmsrl(HV_X64_MSR_CRASH_P4, size);
++
++	/*
++	 * Let Hyper-V know there is crash data available along with
++	 * the panic message.
++	 */
++	wrmsrl(HV_X64_MSR_CRASH_CTL,
++	       (HV_CRASH_CTL_CRASH_NOTIFY | HV_CRASH_CTL_CRASH_NOTIFY_MSG));
++}
++EXPORT_SYMBOL_GPL(hyperv_report_panic_msg);
++
+ bool hv_is_hyperv_initialized(void)
+ {
+ 	union hv_x64_msr_hypercall_contents hypercall_msr;
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index 36e412c356da..5db5f4a6538a 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -364,6 +364,7 @@ void hyperv_init(void);
+ void hyperv_setup_mmu_ops(void);
+ void hyper_alloc_mmu(void);
+ void hyperv_report_panic(struct pt_regs *regs, long err);
++void hyperv_report_panic_msg(phys_addr_t pa, size_t size);
+ bool hv_is_hyperv_initialized(void);
+ void hyperv_cleanup(void);
+ #else /* CONFIG_HYPERV */
+diff --git a/arch/x86/include/uapi/asm/hyperv.h b/arch/x86/include/uapi/asm/hyperv.h
+index 44f024cc954a..8fdc037bd834 100644
+--- a/arch/x86/include/uapi/asm/hyperv.h
++++ b/arch/x86/include/uapi/asm/hyperv.h
+@@ -158,9 +158,10 @@
+ #define HV_X64_EX_PROCESSOR_MASKS_RECOMMENDED	(1 << 11)
+ 
+ /*
+- * Crash notification flag.
++ * Crash notification flags.
+  */
+-#define HV_CRASH_CTL_CRASH_NOTIFY (1ULL << 63)
++#define HV_CRASH_CTL_CRASH_NOTIFY_MSG	BIT_ULL(62)
++#define HV_CRASH_CTL_CRASH_NOTIFY	BIT_ULL(63)
+ 
+ /* MSR used to identify the guest OS. */
+ #define HV_X64_MSR_GUEST_OS_ID			0x40000000
+* Unmerged path drivers/hv/vmbus_drv.c
