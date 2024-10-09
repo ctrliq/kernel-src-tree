@@ -1,0 +1,258 @@
+gfs2: Fix iomap write page reclaim deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit d0a22a4b03b8475b7aa3fa41243c26c291407844
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/d0a22a4b.failed
+
+Since commit 64bc06bb32ee ("gfs2: iomap buffered write support"), gfs2 is doing
+buffered writes by starting a transaction in iomap_begin, writing a range of
+pages, and ending that transaction in iomap_end.  This approach suffers from
+two problems:
+
+  (1) Any allocations necessary for the write are done in iomap_begin, so when
+  the data aren't journaled, there is no need for keeping the transaction open
+  until iomap_end.
+
+  (2) Transactions keep the gfs2 log flush lock held.  When
+  iomap_file_buffered_write calls balance_dirty_pages, this can end up calling
+  gfs2_write_inode, which will try to flush the log.  This requires taking the
+  log flush lock which is already held, resulting in a deadlock.
+
+Fix both of these issues by not keeping transactions open from iomap_begin to
+iomap_end.  Instead, start a small transaction in page_prepare and end it in
+page_done when necessary.
+
+	Reported-by: Edwin Török <edvin.torok@citrix.com>
+Fixes: 64bc06bb32ee ("gfs2: iomap buffered write support")
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit d0a22a4b03b8475b7aa3fa41243c26c291407844)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index cbb60a8063dc,f42718dd292f..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -958,17 -991,34 +958,48 @@@ static void gfs2_write_unlock(struct in
+  	gfs2_glock_dq_uninit(&ip->i_gh);
+  }
+  
+++<<<<<<< HEAD
+ +static void gfs2_iomap_journaled_page_done(struct inode *inode, loff_t pos,
+ +					   unsigned copied, struct page *page,
+ +					   struct iomap *iomap)
+++=======
++ static int gfs2_iomap_page_prepare(struct inode *inode, loff_t pos,
++ 				   unsigned len, struct iomap *iomap)
++ {
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
++ 
++ 	return gfs2_trans_begin(sdp, RES_DINODE + (len >> inode->i_blkbits), 0);
++ }
++ 
++ static void gfs2_iomap_page_done(struct inode *inode, loff_t pos,
++ 				 unsigned copied, struct page *page,
++ 				 struct iomap *iomap)
+++>>>>>>> d0a22a4b03b8 (gfs2: Fix iomap write page reclaim deadlock)
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+  
+++<<<<<<< HEAD
+ +	gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
+ +}
+ +
+ +static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos, loff_t length,
+ +				  unsigned flags, struct iomap *iomap,
+++=======
++ 	if (page && !gfs2_is_stuffed(ip))
++ 		gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
++ 	gfs2_trans_end(sdp);
++ }
++ 
++ static const struct iomap_page_ops gfs2_iomap_page_ops = {
++ 	.page_prepare = gfs2_iomap_page_prepare,
++ 	.page_done = gfs2_iomap_page_done,
++ };
++ 
++ static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos,
++ 				  loff_t length, unsigned flags,
++ 				  struct iomap *iomap,
+++>>>>>>> d0a22a4b03b8 (gfs2: Fix iomap write page reclaim deadlock)
+  				  struct metapath *mp)
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
+@@@ -1018,32 -1068,46 +1049,51 @@@
+  	if (alloc_required)
+  		rblocks += gfs2_rg_blocks(ip, data_blocks + ind_blocks);
+  
+- 	ret = gfs2_trans_begin(sdp, rblocks, iomap->length >> inode->i_blkbits);
+- 	if (ret)
+- 		goto out_trans_fail;
++ 	if (unstuff || iomap->type == IOMAP_HOLE) {
++ 		struct gfs2_trans *tr;
+  
+- 	if (unstuff) {
+- 		ret = gfs2_unstuff_dinode(ip, NULL);
+- 		if (ret)
+- 			goto out_trans_end;
+- 		release_metapath(mp);
+- 		ret = gfs2_iomap_get(inode, iomap->offset, iomap->length,
+- 				     flags, iomap, mp);
++ 		ret = gfs2_trans_begin(sdp, rblocks,
++ 				       iomap->length >> inode->i_blkbits);
+  		if (ret)
+- 			goto out_trans_end;
+- 	}
++ 			goto out_trans_fail;
++ 
++ 		if (unstuff) {
++ 			ret = gfs2_unstuff_dinode(ip, NULL);
++ 			if (ret)
++ 				goto out_trans_end;
++ 			release_metapath(mp);
++ 			ret = gfs2_iomap_get(inode, iomap->offset,
++ 					     iomap->length, flags, iomap, mp);
++ 			if (ret)
++ 				goto out_trans_end;
++ 		}
+  
+- 	if (iomap->type == IOMAP_HOLE) {
+- 		ret = gfs2_iomap_alloc(inode, iomap, flags, mp);
+- 		if (ret) {
+- 			gfs2_trans_end(sdp);
+- 			gfs2_inplace_release(ip);
+- 			punch_hole(ip, iomap->offset, iomap->length);
+- 			goto out_qunlock;
++ 		if (iomap->type == IOMAP_HOLE) {
++ 			ret = gfs2_iomap_alloc(inode, iomap, flags, mp);
++ 			if (ret) {
++ 				gfs2_trans_end(sdp);
++ 				gfs2_inplace_release(ip);
++ 				punch_hole(ip, iomap->offset, iomap->length);
++ 				goto out_qunlock;
++ 			}
+  		}
++ 
++ 		tr = current->journal_info;
++ 		if (tr->tr_num_buf_new)
++ 			__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
++ 		else
++ 			gfs2_trans_add_meta(ip->i_gl, mp->mp_bh[0]);
++ 
++ 		gfs2_trans_end(sdp);
+  	}
+++<<<<<<< HEAD
+ +	if (!gfs2_is_stuffed(ip) && gfs2_is_jdata(ip))
+ +		iomap->page_done = gfs2_iomap_journaled_page_done;
+++=======
++ 
++ 	if (gfs2_is_stuffed(ip) || gfs2_is_jdata(ip))
++ 		iomap->page_ops = &gfs2_iomap_page_ops;
+++>>>>>>> d0a22a4b03b8 (gfs2: Fix iomap write page reclaim deadlock)
+  	return 0;
+  
+  out_trans_end:
+@@@ -1071,11 -1137,15 +1121,7 @@@ static int gfs2_iomap_begin(struct inod
+  		ret = gfs2_iomap_begin_write(inode, pos, length, flags, iomap, &mp);
+  	} else {
+  		ret = gfs2_iomap_get(inode, pos, length, flags, iomap, &mp);
+ -
+ -		/*
+ -		 * Silently fall back to buffered I/O for stuffed files or if
+ -		 * we've hot a hole (see gfs2_file_direct_write).
+ -		 */
+ -		if ((flags & IOMAP_WRITE) && (flags & IOMAP_DIRECT) &&
+ -		    iomap->type != IOMAP_MAPPED)
+ -			ret = -ENOTBLK;
+  	}
+- 	if (!ret) {
+- 		get_bh(mp.mp_bh[0]);
+- 		iomap->private = mp.mp_bh[0];
+- 	}
+  	release_metapath(&mp);
+  	trace_gfs2_iomap_end(ip, iomap, ret);
+  	return ret;
+@@@ -1086,27 -1156,16 +1132,16 @@@ static int gfs2_iomap_end(struct inode 
+  {
+  	struct gfs2_inode *ip = GFS2_I(inode);
+  	struct gfs2_sbd *sdp = GFS2_SB(inode);
+- 	struct gfs2_trans *tr = current->journal_info;
+- 	struct buffer_head *dibh = iomap->private;
+  
+ -	if ((flags & (IOMAP_WRITE | IOMAP_DIRECT)) != IOMAP_WRITE)
+ +	if (!(flags & IOMAP_WRITE))
+  		goto out;
+  
+- 	if (iomap->type != IOMAP_INLINE) {
++ 	if (!gfs2_is_stuffed(ip))
+  		gfs2_ordered_add_inode(ip);
+  
+- 		if (tr->tr_num_buf_new)
+- 			__mark_inode_dirty(inode, I_DIRTY_DATASYNC);
+- 		else
+- 			gfs2_trans_add_meta(ip->i_gl, dibh);
+- 	}
+- 
+- 	if (inode == sdp->sd_rindex) {
++ 	if (inode == sdp->sd_rindex)
+  		adjust_fs_space(inode);
+- 		sdp->sd_rindex_uptodate = 0;
+- 	}
+  
+- 	gfs2_trans_end(sdp);
+  	gfs2_inplace_release(ip);
+  
+  	if (length != written && (iomap->flags & IOMAP_F_NEW)) {
+diff --git a/fs/gfs2/aops.c b/fs/gfs2/aops.c
+index e3baedba6d55..0b7cbf658c05 100644
+--- a/fs/gfs2/aops.c
++++ b/fs/gfs2/aops.c
+@@ -790,7 +790,7 @@ out_uninit:
+  */
+ void adjust_fs_space(struct inode *inode)
+ {
+-	struct gfs2_sbd *sdp = inode->i_sb->s_fs_info;
++	struct gfs2_sbd *sdp = GFS2_SB(inode);
+ 	struct gfs2_inode *m_ip = GFS2_I(sdp->sd_statfs_inode);
+ 	struct gfs2_inode *l_ip = GFS2_I(sdp->sd_sc_inode);
+ 	struct gfs2_statfs_change_host *m_sc = &sdp->sd_statfs_master;
+@@ -798,10 +798,13 @@ void adjust_fs_space(struct inode *inode)
+ 	struct buffer_head *m_bh, *l_bh;
+ 	u64 fs_total, new_free;
+ 
++	if (gfs2_trans_begin(sdp, 2 * RES_STATFS, 0) != 0)
++		return;
++
+ 	/* Total up the file system space, according to the latest rindex. */
+ 	fs_total = gfs2_ri_total(sdp);
+ 	if (gfs2_meta_inode_buffer(m_ip, &m_bh) != 0)
+-		return;
++		goto out;
+ 
+ 	spin_lock(&sdp->sd_statfs_spin);
+ 	gfs2_statfs_change_in(m_sc, m_bh->b_data +
+@@ -816,11 +819,14 @@ void adjust_fs_space(struct inode *inode)
+ 	gfs2_statfs_change(sdp, new_free, new_free, 0);
+ 
+ 	if (gfs2_meta_inode_buffer(l_ip, &l_bh) != 0)
+-		goto out;
++		goto out2;
+ 	update_statfs(sdp, m_bh, l_bh);
+ 	brelse(l_bh);
+-out:
++out2:
+ 	brelse(m_bh);
++out:
++	sdp->sd_rindex_uptodate = 0;
++	gfs2_trans_end(sdp);
+ }
+ 
+ /**
+* Unmerged path fs/gfs2/bmap.c
