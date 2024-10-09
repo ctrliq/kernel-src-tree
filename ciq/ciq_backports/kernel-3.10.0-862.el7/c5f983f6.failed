@@ -1,0 +1,240 @@
+nVMX: Implement emulated Page Modification Logging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bandan Das <bsd@redhat.com>
+commit c5f983f6e8455bbff8b6b39f3ad470317fcd808e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c5f983f6.failed
+
+With EPT A/D enabled, processor access to L2 guest
+paging structures will result in a write violation.
+When this happens, write the GUEST_PHYSICAL_ADDRESS
+to the pml buffer provided by L1 if the access is
+write and the dirty bit is being set.
+
+This patch also adds necessary checks during VMEntry if L1
+has enabled PML. If the PML index overflows, we change the
+exit reason and run L1 to simulate a PML full event.
+
+	Signed-off-by: Bandan Das <bsd@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c5f983f6e8455bbff8b6b39f3ad470317fcd808e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 8426c9cb3bfe,7d056f5385e7..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -235,8 -245,10 +235,9 @@@ struct __packed vmcs12 
+  	u64 eoi_exit_bitmap1;
+  	u64 eoi_exit_bitmap2;
+  	u64 eoi_exit_bitmap3;
+ -	u64 xss_exit_bitmap;
+  	u64 guest_physical_address;
+  	u64 vmcs_link_pointer;
++ 	u64 pml_address;
+  	u64 guest_ia32_debugctl;
+  	u64 guest_ia32_pat;
+  	u64 guest_ia32_efer;
+@@@ -738,8 -768,10 +742,9 @@@ static const unsigned short vmcs_field_
+  	FIELD64(EOI_EXIT_BITMAP1, eoi_exit_bitmap1),
+  	FIELD64(EOI_EXIT_BITMAP2, eoi_exit_bitmap2),
+  	FIELD64(EOI_EXIT_BITMAP3, eoi_exit_bitmap3),
+ -	FIELD64(XSS_EXIT_BITMAP, xss_exit_bitmap),
+  	FIELD64(GUEST_PHYSICAL_ADDRESS, guest_physical_address),
+  	FIELD64(VMCS_LINK_POINTER, vmcs_link_pointer),
++ 	FIELD64(PML_ADDRESS, pml_address),
+  	FIELD64(GUEST_IA32_DEBUGCTL, guest_ia32_debugctl),
+  	FIELD64(GUEST_IA32_PAT, guest_ia32_pat),
+  	FIELD64(GUEST_IA32_EFER, guest_ia32_efer),
+@@@ -1246,6 -1352,17 +1251,20 @@@ static inline int nested_cpu_has_ept(st
+  	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool nested_cpu_has_xsaves(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_XSAVES) &&
++ 		vmx_xsaves_supported();
++ }
++ 
++ static inline bool nested_cpu_has_pml(struct vmcs12 *vmcs12)
++ {
++ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_PML);
++ }
++ 
+++>>>>>>> c5f983f6e845 (nVMX: Implement emulated Page Modification Logging)
+  static inline bool nested_cpu_has_virt_x2apic_mode(struct vmcs12 *vmcs12)
+  {
+  	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE);
+@@@ -9955,6 -10269,161 +9997,164 @@@ static int prepare_vmcs02(struct kvm_vc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_vmentry_prereqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (vmcs12->guest_activity_state != GUEST_ACTIVITY_ACTIVE &&
++ 	    vmcs12->guest_activity_state != GUEST_ACTIVITY_HLT)
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_msr_bitmap_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_apicv_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_msr_switch_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_pml_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (!vmx_control_verify(vmcs12->cpu_based_vm_exec_control,
++ 				vmx->nested.nested_vmx_procbased_ctls_low,
++ 				vmx->nested.nested_vmx_procbased_ctls_high) ||
++ 	    (nested_cpu_has(vmcs12, CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) &&
++ 	     !vmx_control_verify(vmcs12->secondary_vm_exec_control,
++ 				 vmx->nested.nested_vmx_secondary_ctls_low,
++ 				 vmx->nested.nested_vmx_secondary_ctls_high)) ||
++ 	    !vmx_control_verify(vmcs12->pin_based_vm_exec_control,
++ 				vmx->nested.nested_vmx_pinbased_ctls_low,
++ 				vmx->nested.nested_vmx_pinbased_ctls_high) ||
++ 	    !vmx_control_verify(vmcs12->vm_exit_controls,
++ 				vmx->nested.nested_vmx_exit_ctls_low,
++ 				vmx->nested.nested_vmx_exit_ctls_high) ||
++ 	    !vmx_control_verify(vmcs12->vm_entry_controls,
++ 				vmx->nested.nested_vmx_entry_ctls_low,
++ 				vmx->nested.nested_vmx_entry_ctls_high))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (vmcs12->cr3_target_count > nested_cpu_vmx_misc_cr3_count(vcpu))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (!nested_host_cr0_valid(vcpu, vmcs12->host_cr0) ||
++ 	    !nested_host_cr4_valid(vcpu, vmcs12->host_cr4) ||
++ 	    !nested_cr3_valid(vcpu, vmcs12->host_cr3))
++ 		return VMXERR_ENTRY_INVALID_HOST_STATE_FIELD;
++ 
++ 	return 0;
++ }
++ 
++ static int check_vmentry_postreqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
++ 				  u32 *exit_qual)
++ {
++ 	bool ia32e;
++ 
++ 	*exit_qual = ENTRY_FAIL_DEFAULT;
++ 
++ 	if (!nested_guest_cr0_valid(vcpu, vmcs12->guest_cr0) ||
++ 	    !nested_guest_cr4_valid(vcpu, vmcs12->guest_cr4))
++ 		return 1;
++ 
++ 	if (!nested_cpu_has2(vmcs12, SECONDARY_EXEC_SHADOW_VMCS) &&
++ 	    vmcs12->vmcs_link_pointer != -1ull) {
++ 		*exit_qual = ENTRY_FAIL_VMCS_LINK_PTR;
++ 		return 1;
++ 	}
++ 
++ 	/*
++ 	 * If the load IA32_EFER VM-entry control is 1, the following checks
++ 	 * are performed on the field for the IA32_EFER MSR:
++ 	 * - Bits reserved in the IA32_EFER MSR must be 0.
++ 	 * - Bit 10 (corresponding to IA32_EFER.LMA) must equal the value of
++ 	 *   the IA-32e mode guest VM-exit control. It must also be identical
++ 	 *   to bit 8 (LME) if bit 31 in the CR0 field (corresponding to
++ 	 *   CR0.PG) is 1.
++ 	 */
++ 	if (to_vmx(vcpu)->nested.nested_run_pending &&
++ 	    (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)) {
++ 		ia32e = (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE) != 0;
++ 		if (!kvm_valid_efer(vcpu, vmcs12->guest_ia32_efer) ||
++ 		    ia32e != !!(vmcs12->guest_ia32_efer & EFER_LMA) ||
++ 		    ((vmcs12->guest_cr0 & X86_CR0_PG) &&
++ 		     ia32e != !!(vmcs12->guest_ia32_efer & EFER_LME)))
++ 			return 1;
++ 	}
++ 
++ 	/*
++ 	 * If the load IA32_EFER VM-exit control is 1, bits reserved in the
++ 	 * IA32_EFER MSR must be 0 in the field for that register. In addition,
++ 	 * the values of the LMA and LME bits in the field must each be that of
++ 	 * the host address-space size VM-exit control.
++ 	 */
++ 	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_IA32_EFER) {
++ 		ia32e = (vmcs12->vm_exit_controls &
++ 			 VM_EXIT_HOST_ADDR_SPACE_SIZE) != 0;
++ 		if (!kvm_valid_efer(vcpu, vmcs12->host_ia32_efer) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LMA) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LME))
++ 			return 1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, bool from_vmentry)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 	struct loaded_vmcs *vmcs02;
++ 	u32 msr_entry_idx;
++ 	u32 exit_qual;
++ 
++ 	vmcs02 = nested_get_current_vmcs02(vmx);
++ 	if (!vmcs02)
++ 		return -ENOMEM;
++ 
++ 	enter_guest_mode(vcpu);
++ 
++ 	if (!(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS))
++ 		vmx->nested.vmcs01_debugctl = vmcs_read64(GUEST_IA32_DEBUGCTL);
++ 
++ 	vmx_switch_vmcs(vcpu, vmcs02);
++ 	vmx_segment_cache_clear(vmx);
++ 
++ 	if (prepare_vmcs02(vcpu, vmcs12, from_vmentry, &exit_qual)) {
++ 		leave_guest_mode(vcpu);
++ 		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
++ 		nested_vmx_entry_failure(vcpu, vmcs12,
++ 					 EXIT_REASON_INVALID_STATE, exit_qual);
++ 		return 1;
++ 	}
++ 
++ 	nested_get_vmcs12_pages(vcpu, vmcs12);
++ 
++ 	msr_entry_idx = nested_vmx_load_msr(vcpu,
++ 					    vmcs12->vm_entry_msr_load_addr,
++ 					    vmcs12->vm_entry_msr_load_count);
++ 	if (msr_entry_idx) {
++ 		leave_guest_mode(vcpu);
++ 		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
++ 		nested_vmx_entry_failure(vcpu, vmcs12,
++ 				EXIT_REASON_MSR_LOAD_FAIL, msr_entry_idx);
++ 		return 1;
++ 	}
++ 
++ 	vmcs12->launch_state = 1;
++ 
++ 	/*
++ 	 * Note no nested_vmx_succeed or nested_vmx_fail here. At this point
++ 	 * we are no longer running L1, and VMLAUNCH/VMRESUME has not yet
++ 	 * returned as far as L1 is concerned. It will only return (and set
++ 	 * the success flag) when L2 exits (see nested_vmx_vmexit()).
++ 	 */
++ 	return 0;
++ }
++ 
+++>>>>>>> c5f983f6e845 (nVMX: Implement emulated Page Modification Logging)
+  /*
+   * nested_vmx_run() handles a nested entry, i.e., a VMLAUNCH or VMRESUME on L1
+   * for running an L2 nested guest.
+* Unmerged path arch/x86/kvm/vmx.c
