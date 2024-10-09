@@ -1,0 +1,491 @@
+i40e/i40evf: Split container ITR into current_itr and target_itr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexander Duyck <alexander.h.duyck@intel.com>
+commit 556fdfd6e6ffcab9d03c942df06a5591c84ca637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/556fdfd6.failed
+
+This patch is mostly prep-work for replacing the current approach to
+programming the dynamic aka adaptive ITR. Specifically here what we are
+doing is splitting the Tx and Rx ITR each into two separate values.
+
+The first value current_itr represents the current value of the register.
+
+The second value target_itr represents the desired value of the register.
+
+The general plan by doing this is to allow for deferring the update of the
+ITR value under certain circumstances. For now we will work with what we
+have, but in the future I hope to change the behavior so that we always
+only update one ITR at a time using some simple logic to determine which
+ITR requires an update.
+
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 556fdfd6e6ffcab9d03c942df06a5591c84ca637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+#	drivers/net/ethernet/intel/i40evf/i40evf_ethtool.c
+#	drivers/net/ethernet/intel/i40evf/i40evf_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index 07d59f1fbd43,29a7412b2fa6..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@@ -2229,30 -2315,31 +2229,42 @@@ static void i40e_set_itr_per_queue(stru
+  
+  	intrl = i40e_intrl_usec_to_reg(vsi->int_rate_limit);
+  
+ -	rx_ring->itr_setting = ITR_REG_ALIGN(ec->rx_coalesce_usecs);
+ -	tx_ring->itr_setting = ITR_REG_ALIGN(ec->tx_coalesce_usecs);
+ +	rx_ring->rx_itr_setting = ec->rx_coalesce_usecs;
+ +	tx_ring->tx_itr_setting = ec->tx_coalesce_usecs;
+  
+  	if (ec->use_adaptive_rx_coalesce)
+ -		rx_ring->itr_setting |= I40E_ITR_DYNAMIC;
+ +		rx_ring->rx_itr_setting |= I40E_ITR_DYNAMIC;
+  	else
+ -		rx_ring->itr_setting &= ~I40E_ITR_DYNAMIC;
+ +		rx_ring->rx_itr_setting &= ~I40E_ITR_DYNAMIC;
+  
+  	if (ec->use_adaptive_tx_coalesce)
+ -		tx_ring->itr_setting |= I40E_ITR_DYNAMIC;
+ +		tx_ring->tx_itr_setting |= I40E_ITR_DYNAMIC;
+  	else
+ -		tx_ring->itr_setting &= ~I40E_ITR_DYNAMIC;
+ +		tx_ring->tx_itr_setting &= ~I40E_ITR_DYNAMIC;
+  
+  	q_vector = rx_ring->q_vector;
+++<<<<<<< HEAD
+ +	q_vector->rx.itr = ITR_TO_REG(rx_ring->rx_itr_setting);
+ +	vector = vsi->base_vector + q_vector->v_idx;
+ +	wr32(hw, I40E_PFINT_ITRN(I40E_RX_ITR, vector - 1), q_vector->rx.itr);
+ +
+ +	q_vector = tx_ring->q_vector;
+ +	q_vector->tx.itr = ITR_TO_REG(tx_ring->tx_itr_setting);
+ +	vector = vsi->base_vector + q_vector->v_idx;
+ +	wr32(hw, I40E_PFINT_ITRN(I40E_TX_ITR, vector - 1), q_vector->tx.itr);
+++=======
++ 	q_vector->rx.target_itr = ITR_TO_REG(rx_ring->itr_setting);
++ 
++ 	q_vector = tx_ring->q_vector;
++ 	q_vector->tx.target_itr = ITR_TO_REG(tx_ring->itr_setting);
++ 
++ 	/* The interrupt handler itself will take care of programming
++ 	 * the Tx and Rx ITR values based on the values we have entered
++ 	 * into the q_vector, no need to write the values now.
++ 	 */
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  
+ -	wr32(hw, I40E_PFINT_RATEN(q_vector->reg_idx), intrl);
+ +	wr32(hw, I40E_PFINT_RATEN(vector - 1), intrl);
+  	i40e_flush(hw);
+  }
+  
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 6c3f00818e15,39552b3875ee..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -3389,14 -3450,18 +3389,26 @@@ static void i40e_vsi_configure_msix(str
+  		struct i40e_q_vector *q_vector = vsi->q_vectors[i];
+  
+  		q_vector->itr_countdown = ITR_COUNTDOWN_START;
+++<<<<<<< HEAD
+ +		q_vector->rx.itr = ITR_TO_REG(vsi->rx_rings[i]->rx_itr_setting);
+ +		q_vector->rx.latency_range = I40E_LOW_LATENCY;
+ +		wr32(hw, I40E_PFINT_ITRN(I40E_RX_ITR, vector - 1),
+ +		     q_vector->rx.itr);
+ +		q_vector->tx.itr = ITR_TO_REG(vsi->tx_rings[i]->tx_itr_setting);
+++=======
++ 		q_vector->rx.target_itr =
++ 			ITR_TO_REG(vsi->rx_rings[i]->itr_setting);
++ 		q_vector->rx.latency_range = I40E_LOW_LATENCY;
++ 		wr32(hw, I40E_PFINT_ITRN(I40E_RX_ITR, vector - 1),
++ 		     q_vector->rx.target_itr);
++ 		q_vector->rx.current_itr = q_vector->rx.target_itr;
++ 		q_vector->tx.target_itr =
++ 			ITR_TO_REG(vsi->tx_rings[i]->itr_setting);
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  		q_vector->tx.latency_range = I40E_LOW_LATENCY;
+  		wr32(hw, I40E_PFINT_ITRN(I40E_TX_ITR, vector - 1),
+- 		     q_vector->tx.itr);
++ 		     q_vector->tx.target_itr);
++ 		q_vector->tx.current_itr = q_vector->tx.target_itr;
+  		wr32(hw, I40E_PFINT_RATEN(vector - 1),
+  		     i40e_intrl_usec_to_reg(vsi->int_rate_limit));
+  
+@@@ -3485,12 -3563,14 +3497,21 @@@ static void i40e_configure_msi_and_lega
+  
+  	/* set the ITR configuration */
+  	q_vector->itr_countdown = ITR_COUNTDOWN_START;
+++<<<<<<< HEAD
+ +	q_vector->rx.itr = ITR_TO_REG(vsi->rx_rings[0]->rx_itr_setting);
+ +	q_vector->rx.latency_range = I40E_LOW_LATENCY;
+ +	wr32(hw, I40E_PFINT_ITR0(I40E_RX_ITR), q_vector->rx.itr);
+ +	q_vector->tx.itr = ITR_TO_REG(vsi->tx_rings[0]->tx_itr_setting);
+++=======
++ 	q_vector->rx.target_itr = ITR_TO_REG(vsi->rx_rings[0]->itr_setting);
++ 	q_vector->rx.latency_range = I40E_LOW_LATENCY;
++ 	wr32(hw, I40E_PFINT_ITR0(I40E_RX_ITR), q_vector->rx.target_itr);
++ 	q_vector->rx.current_itr = q_vector->rx.target_itr;
++ 	q_vector->tx.target_itr = ITR_TO_REG(vsi->tx_rings[0]->itr_setting);
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  	q_vector->tx.latency_range = I40E_LOW_LATENCY;
+- 	wr32(hw, I40E_PFINT_ITR0(I40E_TX_ITR), q_vector->tx.itr);
++ 	wr32(hw, I40E_PFINT_ITR0(I40E_TX_ITR), q_vector->tx.target_itr);
++ 	q_vector->tx.current_itr = q_vector->tx.target_itr;
+  
+  	i40e_enable_misc_int_causes(pf);
+  
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 29471f5698b7,f4257b9e6dae..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -1006,11 -1015,13 +1006,17 @@@ static bool i40e_set_new_dynamic_itr(st
+  	int bytes_per_usec;
+  	unsigned int usecs, estimated_usecs;
+  
+++<<<<<<< HEAD
+ +	if (rc->total_packets == 0 || !rc->itr)
+++=======
++ 	if (!rc->ring || !ITR_IS_DYNAMIC(rc->ring->itr_setting))
+  		return false;
+  
+- 	usecs = (rc->itr << 1) * ITR_COUNTDOWN_START;
++ 	if (!rc->total_packets || !rc->current_itr)
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
++ 		return false;
++ 
++ 	usecs = (rc->current_itr << 1) * ITR_COUNTDOWN_START;
+  	bytes_per_usec = rc->total_bytes / usecs;
+  
+  	/* The calculations in this algorithm depend on interrupts actually
+@@@ -2257,9 -2314,7 +2259,13 @@@ static inline void i40e_update_enable_i
+  {
+  	struct i40e_hw *hw = &vsi->back->hw;
+  	bool rx = false, tx = false;
+++<<<<<<< HEAD
+ +	u32 rxval, txval;
+ +	int idx = q_vector->v_idx;
+ +	int rx_itr_setting, tx_itr_setting;
+++=======
++ 	u32 intval;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  
+  	/* If we don't have MSIX, then we only need to re-enable icr0 */
+  	if (!(vsi->back->flags & I40E_FLAG_MSIX_ENABLED)) {
+@@@ -2267,55 -2322,24 +2273,68 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* avoid dynamic calculation if in countdown mode OR if
+ +	 * all dynamic is disabled
+ +	 */
+ +	rxval = txval = i40e_buildreg_itr(I40E_ITR_NONE, 0);
+ +
+ +	rx_itr_setting = get_rx_itr(vsi, idx);
+ +	tx_itr_setting = get_tx_itr(vsi, idx);
+ +
+ +	if (q_vector->itr_countdown > 0 ||
+ +	    (!ITR_IS_DYNAMIC(rx_itr_setting) &&
+ +	     !ITR_IS_DYNAMIC(tx_itr_setting))) {
+++=======
++ 	/* avoid dynamic calculation if in countdown mode */
++ 	if (q_vector->itr_countdown > 0)
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  		goto enable_int;
+ +	}
+  
+ -	/* these will return false if dynamic mode is disabled */
+ -	rx = i40e_set_new_dynamic_itr(&q_vector->rx);
+ -	tx = i40e_set_new_dynamic_itr(&q_vector->tx);
+ +	if (ITR_IS_DYNAMIC(rx_itr_setting)) {
+ +		rx = i40e_set_new_dynamic_itr(&q_vector->rx);
+ +		rxval = i40e_buildreg_itr(I40E_RX_ITR, q_vector->rx.itr);
+ +	}
+ +
+ +	if (ITR_IS_DYNAMIC(tx_itr_setting)) {
+ +		tx = i40e_set_new_dynamic_itr(&q_vector->tx);
+ +		txval = i40e_buildreg_itr(I40E_TX_ITR, q_vector->tx.itr);
+ +	}
+  
+  	if (rx || tx) {
+  		/* get the higher of the two ITR adjustments and
+  		 * use the same value for both ITR registers
+  		 * when in adaptive mode (Rx and/or Tx)
+  		 */
+++<<<<<<< HEAD
+ +		u16 itr = max(q_vector->tx.itr, q_vector->rx.itr);
+ +
+ +		q_vector->tx.itr = q_vector->rx.itr = itr;
+ +		txval = i40e_buildreg_itr(I40E_TX_ITR, itr);
+ +		tx = true;
+ +		rxval = i40e_buildreg_itr(I40E_RX_ITR, itr);
+ +		rx = true;
+ +	}
+ +
+ +	/* only need to enable the interrupt once, but need
+ +	 * to possibly update both ITR values
+ +	 */
+ +	if (rx) {
+ +		/* set the INTENA_MSK_MASK so that this first write
+ +		 * won't actually enable the interrupt, instead just
+ +		 * updating the ITR (it's bit 31 PF and VF)
+ +		 */
+ +		rxval |= BIT(31);
+ +		/* don't check _DOWN because interrupt isn't being enabled */
+ +		wr32(hw, INTREG(q_vector->reg_idx), rxval);
+++=======
++ 		u16 itr = max(q_vector->tx.target_itr,
++ 			      q_vector->rx.target_itr);
++ 
++ 		q_vector->tx.target_itr = itr;
++ 		q_vector->rx.target_itr = itr;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  	}
+  
+  enable_int:
+diff --cc drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+index 7b9ead8b878f,1f130e931077..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+@@@ -412,11 -412,13 +412,17 @@@ static bool i40e_set_new_dynamic_itr(st
+  	int bytes_per_usec;
+  	unsigned int usecs, estimated_usecs;
+  
+++<<<<<<< HEAD
+ +	if (rc->total_packets == 0 || !rc->itr)
+++=======
++ 	if (!rc->ring || !ITR_IS_DYNAMIC(rc->ring->itr_setting))
+  		return false;
+  
+- 	usecs = (rc->itr << 1) * ITR_COUNTDOWN_START;
++ 	if (!rc->total_packets || !rc->current_itr)
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
++ 		return false;
++ 
++ 	usecs = (rc->current_itr << 1) * ITR_COUNTDOWN_START;
+  	bytes_per_usec = rc->total_bytes / usecs;
+  
+  	/* The calculations in this algorithm depend on interrupts actually
+@@@ -1515,59 -1497,26 +1517,71 @@@ static inline void i40e_update_enable_i
+  {
+  	struct i40e_hw *hw = &vsi->back->hw;
+  	bool rx = false, tx = false;
+++<<<<<<< HEAD
+ +	u32 rxval, txval;
+ +	int idx = q_vector->v_idx;
+ +	int rx_itr_setting, tx_itr_setting;
+ +
+ +	/* avoid dynamic calculation if in countdown mode OR if
+ +	 * all dynamic is disabled
+ +	 */
+ +	rxval = txval = i40e_buildreg_itr(I40E_ITR_NONE, 0);
+++=======
++ 	u32 intval;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+ +
+ +	rx_itr_setting = get_rx_itr(vsi, idx);
+ +	tx_itr_setting = get_tx_itr(vsi, idx);
+  
+ -	/* avoid dynamic calculation if in countdown mode */
+ -	if (q_vector->itr_countdown > 0)
+ +	if (q_vector->itr_countdown > 0 ||
+ +	    (!ITR_IS_DYNAMIC(rx_itr_setting) &&
+ +	     !ITR_IS_DYNAMIC(tx_itr_setting))) {
+  		goto enable_int;
+ +	}
+ +
+ +	if (ITR_IS_DYNAMIC(rx_itr_setting)) {
+ +		rx = i40e_set_new_dynamic_itr(&q_vector->rx);
+ +		rxval = i40e_buildreg_itr(I40E_RX_ITR, q_vector->rx.itr);
+ +	}
+  
+ -	/* these will return false if dynamic mode is disabled */
+ -	rx = i40e_set_new_dynamic_itr(&q_vector->rx);
+ -	tx = i40e_set_new_dynamic_itr(&q_vector->tx);
+ +	if (ITR_IS_DYNAMIC(tx_itr_setting)) {
+ +		tx = i40e_set_new_dynamic_itr(&q_vector->tx);
+ +		txval = i40e_buildreg_itr(I40E_TX_ITR, q_vector->tx.itr);
+ +	}
+  
+  	if (rx || tx) {
+  		/* get the higher of the two ITR adjustments and
+  		 * use the same value for both ITR registers
+  		 * when in adaptive mode (Rx and/or Tx)
+  		 */
+++<<<<<<< HEAD
+ +		u16 itr = max(q_vector->tx.itr, q_vector->rx.itr);
+ +
+ +		q_vector->tx.itr = q_vector->rx.itr = itr;
+ +		txval = i40e_buildreg_itr(I40E_TX_ITR, itr);
+ +		tx = true;
+ +		rxval = i40e_buildreg_itr(I40E_RX_ITR, itr);
+ +		rx = true;
+ +	}
+ +
+ +	/* only need to enable the interrupt once, but need
+ +	 * to possibly update both ITR values
+ +	 */
+ +	if (rx) {
+ +		/* set the INTENA_MSK_MASK so that this first write
+ +		 * won't actually enable the interrupt, instead just
+ +		 * updating the ITR (it's bit 31 PF and VF)
+ +		 */
+ +		rxval |= BIT(31);
+ +		/* don't check _DOWN because interrupt isn't being enabled */
+ +		wr32(hw, INTREG(q_vector->reg_idx), rxval);
+++=======
++ 		u16 itr = max(q_vector->tx.target_itr,
++ 			      q_vector->rx.target_itr);
++ 
++ 		q_vector->tx.target_itr = itr;
++ 		q_vector->rx.target_itr = itr;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  	}
+  
+  enable_int:
+diff --cc drivers/net/ethernet/intel/i40evf/i40evf_ethtool.c
+index e2d8aa19d205,aded3ad7763e..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40evf_ethtool.c
++++ b/drivers/net/ethernet/intel/i40evf/i40evf_ethtool.c
+@@@ -514,33 -514,29 +514,46 @@@ static void i40evf_set_itr_per_queue(st
+  {
+  	struct i40e_ring *rx_ring = &adapter->rx_rings[queue];
+  	struct i40e_ring *tx_ring = &adapter->tx_rings[queue];
+++<<<<<<< HEAD
+ +	struct i40e_vsi *vsi = &adapter->vsi;
+ +	struct i40e_hw *hw = &adapter->hw;
+++=======
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  	struct i40e_q_vector *q_vector;
+ +	u16 vector;
+  
+ -	rx_ring->itr_setting = ITR_REG_ALIGN(ec->rx_coalesce_usecs);
+ -	tx_ring->itr_setting = ITR_REG_ALIGN(ec->tx_coalesce_usecs);
+ +	rx_ring->rx_itr_setting = ec->rx_coalesce_usecs;
+ +	tx_ring->tx_itr_setting = ec->tx_coalesce_usecs;
+  
+ -	rx_ring->itr_setting |= I40E_ITR_DYNAMIC;
+ +	rx_ring->rx_itr_setting |= I40E_ITR_DYNAMIC;
+  	if (!ec->use_adaptive_rx_coalesce)
+ -		rx_ring->itr_setting ^= I40E_ITR_DYNAMIC;
+ +		rx_ring->rx_itr_setting ^= I40E_ITR_DYNAMIC;
+  
+ -	tx_ring->itr_setting |= I40E_ITR_DYNAMIC;
+ +	tx_ring->tx_itr_setting |= I40E_ITR_DYNAMIC;
+  	if (!ec->use_adaptive_tx_coalesce)
+ -		tx_ring->itr_setting ^= I40E_ITR_DYNAMIC;
+ +		tx_ring->tx_itr_setting ^= I40E_ITR_DYNAMIC;
+  
+  	q_vector = rx_ring->q_vector;
+++<<<<<<< HEAD
+ +	q_vector->rx.itr = ITR_TO_REG(rx_ring->rx_itr_setting);
+ +	vector = vsi->base_vector + q_vector->v_idx;
+ +	wr32(hw, I40E_VFINT_ITRN1(I40E_RX_ITR, vector - 1), q_vector->rx.itr);
+ +
+ +	q_vector = tx_ring->q_vector;
+ +	q_vector->tx.itr = ITR_TO_REG(tx_ring->tx_itr_setting);
+ +	vector = vsi->base_vector + q_vector->v_idx;
+ +	wr32(hw, I40E_VFINT_ITRN1(I40E_TX_ITR, vector - 1), q_vector->tx.itr);
+++=======
++ 	q_vector->rx.target_itr = ITR_TO_REG(rx_ring->itr_setting);
+  
+- 	i40e_flush(hw);
++ 	q_vector = tx_ring->q_vector;
++ 	q_vector->tx.target_itr = ITR_TO_REG(tx_ring->itr_setting);
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
++ 
++ 	/* The interrupt handler itself will take care of programming
++ 	 * the Tx and Rx ITR values based on the values we have entered
++ 	 * into the q_vector, no need to write the values now.
++ 	 */
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/i40evf/i40evf_main.c
+index b473966a345a,3bf6a126be72..000000000000
+--- a/drivers/net/ethernet/intel/i40evf/i40evf_main.c
++++ b/drivers/net/ethernet/intel/i40evf/i40evf_main.c
+@@@ -354,10 -354,12 +354,19 @@@ i40evf_map_vector_to_rxq(struct i40evf_
+  	q_vector->rx.ring = rx_ring;
+  	q_vector->rx.count++;
+  	q_vector->rx.latency_range = I40E_LOW_LATENCY;
+++<<<<<<< HEAD
+ +	q_vector->rx.itr = ITR_TO_REG(rx_ring->rx_itr_setting);
+ +	q_vector->ring_mask |= BIT(r_idx);
+ +	q_vector->itr_countdown = ITR_COUNTDOWN_START;
+ +	wr32(hw, I40E_VFINT_ITRN1(I40E_RX_ITR, v_idx - 1), q_vector->rx.itr);
+++=======
++ 	q_vector->rx.target_itr = ITR_TO_REG(rx_ring->itr_setting);
++ 	q_vector->ring_mask |= BIT(r_idx);
++ 	q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	wr32(hw, I40E_VFINT_ITRN1(I40E_RX_ITR, q_vector->reg_idx),
++ 	     q_vector->rx.current_itr);
++ 	q_vector->rx.current_itr = q_vector->rx.target_itr;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  }
+  
+  /**
+@@@ -379,10 -381,12 +388,19 @@@ i40evf_map_vector_to_txq(struct i40evf_
+  	q_vector->tx.ring = tx_ring;
+  	q_vector->tx.count++;
+  	q_vector->tx.latency_range = I40E_LOW_LATENCY;
+++<<<<<<< HEAD
+ +	q_vector->tx.itr = ITR_TO_REG(tx_ring->tx_itr_setting);
+ +	q_vector->itr_countdown = ITR_COUNTDOWN_START;
+ +	q_vector->num_ringpairs++;
+ +	wr32(hw, I40E_VFINT_ITRN1(I40E_TX_ITR, v_idx - 1), q_vector->tx.itr);
+++=======
++ 	q_vector->tx.target_itr = ITR_TO_REG(tx_ring->itr_setting);
++ 	q_vector->itr_countdown = ITR_COUNTDOWN_START;
++ 	q_vector->num_ringpairs++;
++ 	wr32(hw, I40E_VFINT_ITRN1(I40E_TX_ITR, q_vector->reg_idx),
++ 	     q_vector->tx.target_itr);
++ 	q_vector->tx.current_itr = q_vector->tx.target_itr;
+++>>>>>>> 556fdfd6e6ff (i40e/i40evf: Split container ITR into current_itr and target_itr)
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.h b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+index b39e067a394b..44d88b3f5f27 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.h
+@@ -461,7 +461,8 @@ struct i40e_ring_container {
+ 	unsigned long last_itr_update;	/* jiffies of last ITR update */
+ 	u16 count;
+ 	enum i40e_latency_range latency_range;
+-	u16 itr;
++	u16 target_itr;			/* target ITR setting for ring(s) */
++	u16 current_itr;		/* current ITR setting for ring(s) */
+ };
+ 
+ /* iterator for handling rings in ring container */
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40e_txrx.c
+diff --git a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+index 6278d2a2abeb..b222a0eb8d47 100644
+--- a/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
++++ b/drivers/net/ethernet/intel/i40evf/i40e_txrx.h
+@@ -441,7 +441,8 @@ struct i40e_ring_container {
+ 	unsigned long last_itr_update;	/* jiffies of last ITR update */
+ 	u16 count;
+ 	enum i40e_latency_range latency_range;
+-	u16 itr;
++	u16 target_itr;			/* target ITR setting for ring(s) */
++	u16 current_itr;		/* current ITR setting for ring(s) */
+ };
+ 
+ /* iterator for handling rings in ring container */
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40evf_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/i40evf/i40evf_main.c
