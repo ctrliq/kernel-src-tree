@@ -6489,7 +6489,7 @@ static void process_smi(struct kvm_vcpu *vcpu)
 
 static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
 {
-	if (!kvm_apic_hw_enabled(vcpu->arch.apic))
+	if (!kvm_apic_present(vcpu))
 		return;
 
 	memset(vcpu->arch.eoi_exit_bitmap, 0, 256 / 8);
