@@ -1,0 +1,1872 @@
+crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [crypto] chelsio: Move DMA un/mapping to chcr from lld cxgb4 driver (Arjun Vynipadath) [1548047]
+Rebuild_FUZZ: 91.20%
+commit-author Harsh Jain <harsh@chelsio.com>
+commit 2f47d58043110b0aeac1952494db668fc0fc7c0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2f47d580.failed
+
+Allow chcr to do DMA mapping/Unmapping instead of lld cxgb4.
+It moves "Copy AAD to dst buffer" requirement from driver to
+firmware.
+
+	Signed-off-by: Harsh Jain <harsh@chelsio.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 2f47d58043110b0aeac1952494db668fc0fc7c0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+#	drivers/crypto/chelsio/chcr_algo.h
+#	drivers/crypto/chelsio/chcr_crypto.h
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index dde319f5f616,9d298c681abe..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -116,6 -120,92 +118,95 @@@ static inline unsigned int sgl_len(unsi
+  	return (3 * n) / 2 + (n & 1) + 2;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sg_nents_xlen(struct scatterlist *sg, unsigned int reqlen,
++ 			 unsigned int entlen,
++ 			 unsigned int skip)
++ {
++ 	int nents = 0;
++ 	unsigned int less;
++ 	unsigned int skip_len = 0;
++ 
++ 	while (sg && skip) {
++ 		if (sg_dma_len(sg) <= skip) {
++ 			skip -= sg_dma_len(sg);
++ 			skip_len = 0;
++ 			sg = sg_next(sg);
++ 		} else {
++ 			skip_len = skip;
++ 			skip = 0;
++ 		}
++ 	}
++ 
++ 	while (sg && reqlen) {
++ 		less = min(reqlen, sg_dma_len(sg) - skip_len);
++ 		nents += DIV_ROUND_UP(less, entlen);
++ 		reqlen -= less;
++ 		skip_len = 0;
++ 		sg = sg_next(sg);
++ 	}
++ 	return nents;
++ }
++ 
++ static inline void chcr_handle_ahash_resp(struct ahash_request *req,
++ 					  unsigned char *input,
++ 					  int err)
++ {
++ 	struct chcr_ahash_req_ctx *reqctx = ahash_request_ctx(req);
++ 	int digestsize, updated_digestsize;
++ 	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
++ 	struct uld_ctx *u_ctx = ULD_CTX(h_ctx(tfm));
++ 
++ 	if (input == NULL)
++ 		goto out;
++ 	reqctx = ahash_request_ctx(req);
++ 	digestsize = crypto_ahash_digestsize(crypto_ahash_reqtfm(req));
++ 	if (reqctx->is_sg_map)
++ 		chcr_hash_dma_unmap(&u_ctx->lldi.pdev->dev, req);
++ 	if (reqctx->dma_addr)
++ 		dma_unmap_single(&u_ctx->lldi.pdev->dev, reqctx->dma_addr,
++ 				 reqctx->dma_len, DMA_TO_DEVICE);
++ 	reqctx->dma_addr = 0;
++ 	updated_digestsize = digestsize;
++ 	if (digestsize == SHA224_DIGEST_SIZE)
++ 		updated_digestsize = SHA256_DIGEST_SIZE;
++ 	else if (digestsize == SHA384_DIGEST_SIZE)
++ 		updated_digestsize = SHA512_DIGEST_SIZE;
++ 	if (reqctx->result == 1) {
++ 		reqctx->result = 0;
++ 		memcpy(req->result, input + sizeof(struct cpl_fw6_pld),
++ 		       digestsize);
++ 	} else {
++ 		memcpy(reqctx->partial_hash, input + sizeof(struct cpl_fw6_pld),
++ 		       updated_digestsize);
++ 	}
++ out:
++ 	req->base.complete(&req->base, err);
++ 
++ 	}
++ 
++ static inline void chcr_handle_aead_resp(struct aead_request *req,
++ 					 unsigned char *input,
++ 					 int err)
++ {
++ 	struct chcr_aead_reqctx *reqctx = aead_request_ctx(req);
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	struct uld_ctx *u_ctx = ULD_CTX(a_ctx(tfm));
++ 
++ 
++ 	chcr_aead_dma_unmap(&u_ctx->lldi.pdev->dev, req, reqctx->op);
++ 	if (reqctx->b0_dma)
++ 		dma_unmap_single(&u_ctx->lldi.pdev->dev, reqctx->b0_dma,
++ 				 reqctx->b0_len, DMA_BIDIRECTIONAL);
++ 	if (reqctx->verify == VERIFY_SW) {
++ 		chcr_verify_tag(req, input, &err);
++ 		reqctx->verify = VERIFY_HW;
++ }
++ 	req->base.complete(&req->base, err);
++ 
++ }
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  static void chcr_verify_tag(struct aead_request *req, u8 *input, int *err)
+  {
+  	u8 temp[SHA512_DIGEST_SIZE];
+@@@ -156,22 -244,7 +244,26 @@@ int chcr_handle_resp(struct crypto_asyn
+  
+  	switch (tfm->__crt_alg->cra_flags & CRYPTO_ALG_TYPE_MASK) {
+  	case CRYPTO_ALG_TYPE_AEAD:
+++<<<<<<< HEAD
+ +		ctx_req.req.aead_req = aead_request_cast(req);
+ +		ctx_req.ctx.reqctx = aead_request_ctx(ctx_req.req.aead_req);
+ +		dma_unmap_sg(&u_ctx->lldi.pdev->dev, ctx_req.ctx.reqctx->dst,
+ +			     ctx_req.ctx.reqctx->dst_nents, DMA_FROM_DEVICE);
+ +		if (ctx_req.ctx.reqctx->skb) {
+ +			kfree_skb(ctx_req.ctx.reqctx->skb);
+ +			ctx_req.ctx.reqctx->skb = NULL;
+ +		}
+ +		free_new_sg(ctx_req.ctx.reqctx->newdstsg);
+ +		ctx_req.ctx.reqctx->newdstsg = NULL;
+ +		if (ctx_req.ctx.reqctx->verify == VERIFY_SW) {
+ +			chcr_verify_tag(ctx_req.req.aead_req, input,
+ +					&err);
+ +			ctx_req.ctx.reqctx->verify = VERIFY_HW;
+ +		}
+ +		ctx_req.req.aead_req->base.complete(req, err);
+++=======
++ 		chcr_handle_aead_resp(aead_request_cast(req), input, err);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  		break;
+  
+  	case CRYPTO_ALG_TYPE_ABLKCIPHER:
+@@@ -380,13 -406,19 +425,25 @@@ static inline int is_hmac(struct crypto
+  	return 0;
+  }
+  
+- static void write_phys_cpl(struct cpl_rx_phys_dsgl *phys_cpl,
+- 			   struct scatterlist *sg,
+- 			   struct phys_sge_parm *sg_param)
++ static inline void dsgl_walk_init(struct dsgl_walk *walk,
++ 				   struct cpl_rx_phys_dsgl *dsgl)
+  {
+++<<<<<<< HEAD
+ +	struct phys_sge_pairs *to;
+ +	unsigned int len = 0, left_size = sg_param->obsize;
+ +	unsigned int nents = sg_param->nents, i, j = 0;
+++=======
++ 	walk->dsgl = dsgl;
++ 	walk->nents = 0;
++ 	walk->to = (struct phys_sge_pairs *)(dsgl + 1);
++ }
++ 
++ static inline void dsgl_walk_end(struct dsgl_walk *walk, unsigned short qid)
++ {
++ 	struct cpl_rx_phys_dsgl *phys_cpl;
++ 
++ 	phys_cpl = walk->dsgl;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	phys_cpl->op_to_tid = htonl(CPL_RX_PHYS_DSGL_OPCODE_V(CPL_RX_PHYS_DSGL)
+  				    | CPL_RX_PHYS_DSGL_ISRDMA_V(0));
+@@@ -396,38 -428,171 +453,189 @@@
+  		      CPL_RX_PHYS_DSGL_PCITPHNTENB_V(0) |
+  		      CPL_RX_PHYS_DSGL_PCITPHNT_V(0) |
+  		      CPL_RX_PHYS_DSGL_DCAID_V(0) |
+++<<<<<<< HEAD
+ +		      CPL_RX_PHYS_DSGL_NOOFSGENTR_V(nents));
+++=======
++ 		      CPL_RX_PHYS_DSGL_NOOFSGENTR_V(walk->nents));
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	phys_cpl->rss_hdr_int.opcode = CPL_RX_PHYS_ADDR;
+- 	phys_cpl->rss_hdr_int.qid = htons(sg_param->qid);
++ 	phys_cpl->rss_hdr_int.qid = htons(qid);
+  	phys_cpl->rss_hdr_int.hash_val = 0;
+++<<<<<<< HEAD
+ +	to = (struct phys_sge_pairs *)((unsigned char *)phys_cpl +
+ +				       sizeof(struct cpl_rx_phys_dsgl));
+ +	for (i = 0; nents && left_size; to++) {
+ +		for (j = 0; j < 8 && nents && left_size; j++, nents--) {
+ +			len = min(left_size, sg_dma_len(sg));
+ +			to->len[j] = htons(len);
+ +			to->addr[j] = cpu_to_be64(sg_dma_address(sg));
+ +			left_size -= len;
+ +			sg = sg_next(sg);
+ +		}
+ +	}
+++=======
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  }
+  
+- static inline int map_writesg_phys_cpl(struct device *dev,
+- 					struct cpl_rx_phys_dsgl *phys_cpl,
++ static inline void dsgl_walk_add_page(struct dsgl_walk *walk,
++ 					size_t size,
++ 					dma_addr_t *addr)
++ {
++ 	int j;
++ 
++ 	if (!size)
++ 		return;
++ 	j = walk->nents;
++ 	walk->to->len[j % 8] = htons(size);
++ 	walk->to->addr[j % 8] = cpu_to_be64(*addr);
++ 	j++;
++ 	if ((j % 8) == 0)
++ 		walk->to++;
++ 	walk->nents = j;
++ }
++ 
++ static void  dsgl_walk_add_sg(struct dsgl_walk *walk,
++ 			   struct scatterlist *sg,
++ 			      unsigned int slen,
++ 			      unsigned int skip)
++ {
++ 	int skip_len = 0;
++ 	unsigned int left_size = slen, len = 0;
++ 	unsigned int j = walk->nents;
++ 	int offset, ent_len;
++ 
++ 	if (!slen)
++ 		return;
++ 	while (sg && skip) {
++ 		if (sg_dma_len(sg) <= skip) {
++ 			skip -= sg_dma_len(sg);
++ 			skip_len = 0;
++ 			sg = sg_next(sg);
++ 		} else {
++ 			skip_len = skip;
++ 			skip = 0;
++ 		}
++ 	}
++ 
++ 	while (left_size && sg) {
++ 		len = min_t(u32, left_size, sg_dma_len(sg) - skip_len);
++ 		offset = 0;
++ 		while (len) {
++ 			ent_len =  min_t(u32, len, CHCR_DST_SG_SIZE);
++ 			walk->to->len[j % 8] = htons(ent_len);
++ 			walk->to->addr[j % 8] = cpu_to_be64(sg_dma_address(sg) +
++ 						      offset + skip_len);
++ 			offset += ent_len;
++ 			len -= ent_len;
++ 			j++;
++ 			if ((j % 8) == 0)
++ 				walk->to++;
++ 		}
++ 		walk->last_sg = sg;
++ 		walk->last_sg_len = min_t(u32, left_size, sg_dma_len(sg) -
++ 					  skip_len) + skip_len;
++ 		left_size -= min_t(u32, left_size, sg_dma_len(sg) - skip_len);
++ 		skip_len = 0;
++ 		sg = sg_next(sg);
++ 	}
++ 	walk->nents = j;
++ }
++ 
++ static inline void ulptx_walk_init(struct ulptx_walk *walk,
++ 				   struct ulptx_sgl *ulp)
++ {
++ 	walk->sgl = ulp;
++ 	walk->nents = 0;
++ 	walk->pair_idx = 0;
++ 	walk->pair = ulp->sge;
++ 	walk->last_sg = NULL;
++ 	walk->last_sg_len = 0;
++ }
++ 
++ static inline void ulptx_walk_end(struct ulptx_walk *walk)
++ {
++ 	walk->sgl->cmd_nsge = htonl(ULPTX_CMD_V(ULP_TX_SC_DSGL) |
++ 			      ULPTX_NSGE_V(walk->nents));
++ }
++ 
++ 
++ static inline void ulptx_walk_add_page(struct ulptx_walk *walk,
++ 					size_t size,
++ 					dma_addr_t *addr)
++ {
++ 	if (!size)
++ 		return;
++ 
++ 	if (walk->nents == 0) {
++ 		walk->sgl->len0 = cpu_to_be32(size);
++ 		walk->sgl->addr0 = cpu_to_be64(*addr);
++ 	} else {
++ 		walk->pair->addr[walk->pair_idx] = cpu_to_be64(*addr);
++ 		walk->pair->len[walk->pair_idx] = cpu_to_be32(size);
++ 		walk->pair_idx = !walk->pair_idx;
++ 		if (!walk->pair_idx)
++ 			walk->pair++;
++ 	}
++ 	walk->nents++;
++ }
++ 
++ static void  ulptx_walk_add_sg(struct ulptx_walk *walk,
+  					struct scatterlist *sg,
+- 					struct phys_sge_parm *sg_param)
++ 			       unsigned int len,
++ 			       unsigned int skip)
+  {
+- 	if (!sg || !sg_param->nents)
+- 		return -EINVAL;
++ 	int small;
++ 	int skip_len = 0;
++ 	unsigned int sgmin;
+  
+- 	sg_param->nents = dma_map_sg(dev, sg, sg_param->nents, DMA_FROM_DEVICE);
+- 	if (sg_param->nents == 0) {
+- 		pr_err("CHCR : DMA mapping failed\n");
+- 		return -EINVAL;
++ 	if (!len)
++ 		return;
++ 
++ 	while (sg && skip) {
++ 		if (sg_dma_len(sg) <= skip) {
++ 			skip -= sg_dma_len(sg);
++ 			skip_len = 0;
++ 			sg = sg_next(sg);
++ 		} else {
++ 			skip_len = skip;
++ 			skip = 0;
++ 		}
++ 	}
++ 	if (walk->nents == 0) {
++ 		small = min_t(unsigned int, sg_dma_len(sg) - skip_len, len);
++ 		sgmin = min_t(unsigned int, small, CHCR_SRC_SG_SIZE);
++ 		walk->sgl->len0 = cpu_to_be32(sgmin);
++ 		walk->sgl->addr0 = cpu_to_be64(sg_dma_address(sg) + skip_len);
++ 		walk->nents++;
++ 		len -= sgmin;
++ 		walk->last_sg = sg;
++ 		walk->last_sg_len = sgmin + skip_len;
++ 		skip_len += sgmin;
++ 		if (sg_dma_len(sg) == skip_len) {
++ 			sg = sg_next(sg);
++ 			skip_len = 0;
++ 		}
++ 	}
++ 
++ 	while (sg && len) {
++ 		small = min(sg_dma_len(sg) - skip_len, len);
++ 		sgmin = min_t(unsigned int, small, CHCR_SRC_SG_SIZE);
++ 		walk->pair->len[walk->pair_idx] = cpu_to_be32(sgmin);
++ 		walk->pair->addr[walk->pair_idx] =
++ 			cpu_to_be64(sg_dma_address(sg) + skip_len);
++ 		walk->pair_idx = !walk->pair_idx;
++ 		walk->nents++;
++ 		if (!walk->pair_idx)
++ 			walk->pair++;
++ 		len -= sgmin;
++ 		skip_len += sgmin;
++ 		walk->last_sg = sg;
++ 		walk->last_sg_len = skip_len;
++ 		if (sg_dma_len(sg) == skip_len) {
++ 			sg = sg_next(sg);
++ 			skip_len = 0;
++ 		}
+  	}
+- 	write_phys_cpl(phys_cpl, sg, sg_param);
+- 	return 0;
+  }
+  
+  static inline int get_aead_subtype(struct crypto_aead *aead)
+@@@ -523,30 -648,46 +692,64 @@@ static int chcr_sg_ent_in_wr(struct sca
+  			     struct scatterlist *dst,
+  			     unsigned int minsg,
+  			     unsigned int space,
+++<<<<<<< HEAD
+ +			     short int *sent,
+ +			     short int *dent)
+ +{
+ +	int srclen = 0, dstlen = 0;
+ +	int srcsg = minsg, dstsg = 0;
+ +
+ +	*sent = 0;
+ +	*dent = 0;
+ +	while (src && dst && ((srcsg + 1) <= MAX_SKB_FRAGS) &&
+++=======
++ 			     unsigned int srcskip,
++ 			     unsigned int dstskip)
++ {
++ 	int srclen = 0, dstlen = 0;
++ 	int srcsg = minsg, dstsg = minsg;
++ 	int offset = 0, less;
++ 
++ 	if (sg_dma_len(src) == srcskip) {
++ 		src = sg_next(src);
++ 		srcskip = 0;
++ 	}
++ 
++ 	if (sg_dma_len(dst) == dstskip) {
++ 		dst = sg_next(dst);
++ 		dstskip = 0;
++ 	}
++ 
++ 	while (src && dst &&
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	       space > (sgl_ent_len[srcsg + 1] + dsgl_ent_len[dstsg])) {
+- 		srclen += src->length;
++ 		srclen += (sg_dma_len(src) - srcskip);
+  		srcsg++;
+ -		offset = 0;
+  		while (dst && ((dstsg + 1) <= MAX_DSGL_ENT) &&
+  		       space > (sgl_ent_len[srcsg] + dsgl_ent_len[dstsg + 1])) {
+  			if (srclen <= dstlen)
+  				break;
+++<<<<<<< HEAD
+ +			dstlen += dst->length;
+ +			dst = sg_next(dst);
+++=======
++ 			less = min_t(unsigned int, sg_dma_len(dst) - offset -
++ 				dstskip, CHCR_DST_SG_SIZE);
++ 			dstlen += less;
++ 			offset += less;
++ 			if (offset == sg_dma_len(dst)) {
++ 				dst = sg_next(dst);
++ 				offset = 0;
++ 			}
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  			dstsg++;
++ 			dstskip = 0;
+  		}
+  		src = sg_next(src);
++ 		 srcskip = 0;
+  	}
+ +	*sent = srcsg - minsg;
+ +	*dent = dstsg;
+  	return min(srclen, dstlen);
+  }
+  
+@@@ -575,46 -716,35 +778,60 @@@ static int chcr_cipher_fallback(struct 
+  }
+  static inline void create_wreq(struct chcr_context *ctx,
+  			       struct chcr_wr *chcr_req,
+++<<<<<<< HEAD
+ +			       void *req, struct sk_buff *skb,
+ +			       int kctx_len, int hash_sz,
+ +			       int is_iv,
+++=======
++ 			       struct crypto_async_request *req,
++ 			       unsigned int imm,
++ 			       int hash_sz,
++ 			       unsigned int len16,
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  			       unsigned int sc_len,
+  			       unsigned int lcb)
+  {
+  	struct uld_ctx *u_ctx = ULD_CTX(ctx);
+ +	int iv_loc = IV_DSGL;
+  	int qid = u_ctx->lldi.rxq_ids[ctx->rx_qidx];
+++<<<<<<< HEAD
+ +	unsigned int immdatalen = 0, nr_frags = 0;
+ +
+ +	if (is_ofld_imm(skb)) {
+ +		immdatalen = skb->data_len;
+ +		iv_loc = IV_IMMEDIATE;
+ +	} else {
+ +		nr_frags = skb_shinfo(skb)->nr_frags;
+ +	}
+++=======
++ 
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+ -	chcr_req->wreq.op_to_cctx_size = FILL_WR_OP_CCTX_SIZE;
+ +	chcr_req->wreq.op_to_cctx_size = FILL_WR_OP_CCTX_SIZE(immdatalen,
+ +				((sizeof(chcr_req->key_ctx) + kctx_len) >> 4));
+  	chcr_req->wreq.pld_size_hash_size =
+ -		htonl(FW_CRYPTO_LOOKASIDE_WR_HASH_SIZE_V(hash_sz));
+ +		htonl(FW_CRYPTO_LOOKASIDE_WR_PLD_SIZE_V(sgl_lengths[nr_frags]) |
+ +		      FW_CRYPTO_LOOKASIDE_WR_HASH_SIZE_V(hash_sz));
+  	chcr_req->wreq.len16_pkd =
+- 		htonl(FW_CRYPTO_LOOKASIDE_WR_LEN16_V(DIV_ROUND_UP(
+- 				    (calc_tx_flits_ofld(skb) * 8), 16)));
++ 		htonl(FW_CRYPTO_LOOKASIDE_WR_LEN16_V(DIV_ROUND_UP(len16, 16)));
+  	chcr_req->wreq.cookie = cpu_to_be64((uintptr_t)req);
+  	chcr_req->wreq.rx_chid_to_rx_q_id =
+  		FILL_WR_RX_Q_ID(ctx->dev->rx_channel_id, qid,
+ -				!!lcb, ctx->tx_qidx);
+ -
+ +				is_iv ? iv_loc : IV_NOP, !!lcb,
+ +				ctx->tx_qidx);
+  	chcr_req->ulptx.cmd_dest = FILL_ULPTX_CMD_DEST(ctx->dev->tx_channel_id,
+  						       qid);
+- 	chcr_req->ulptx.len = htonl((DIV_ROUND_UP((calc_tx_flits_ofld(skb) * 8),
+- 					16) - ((sizeof(chcr_req->wreq)) >> 4)));
++ 	chcr_req->ulptx.len = htonl((DIV_ROUND_UP(len16, 16) -
++ 				     ((sizeof(chcr_req->wreq)) >> 4)));
+  
+- 	chcr_req->sc_imm.cmd_more = FILL_CMD_MORE(immdatalen);
++ 	chcr_req->sc_imm.cmd_more = FILL_CMD_MORE(!imm);
+  	chcr_req->sc_imm.len = cpu_to_be32(sizeof(struct cpl_tx_sec_pdu) +
+++<<<<<<< HEAD
+ +				   sizeof(chcr_req->key_ctx) +
+ +				   kctx_len + sc_len + immdatalen);
+++=======
++ 					   sizeof(chcr_req->key_ctx) + sc_len);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  }
+  
+  /**
+@@@ -633,34 -761,40 +848,55 @@@ static struct sk_buff *create_cipher_wr
+  	struct sk_buff *skb = NULL;
+  	struct chcr_wr *chcr_req;
+  	struct cpl_rx_phys_dsgl *phys_cpl;
++ 	struct ulptx_sgl *ulptx;
+  	struct chcr_blkcipher_req_ctx *reqctx =
+  		ablkcipher_request_ctx(wrparam->req);
+- 	struct phys_sge_parm sg_param;
+- 	unsigned int frags = 0, transhdr_len, phys_dsgl;
++ 	unsigned int temp = 0, transhdr_len, dst_size;
+  	int error;
+++<<<<<<< HEAD
+ +	unsigned int ivsize = AES_BLOCK_SIZE, kctx_len;
+++=======
++ 	int nents;
++ 	unsigned int kctx_len;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	gfp_t flags = wrparam->req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ?
+  			GFP_KERNEL : GFP_ATOMIC;
+- 	struct adapter *adap = padap(ctx->dev);
++ 	struct adapter *adap = padap(c_ctx(tfm)->dev);
+  
+++<<<<<<< HEAD
+ +	phys_dsgl = get_space_for_phys_dsgl(reqctx->dst_nents);
+ +
+++=======
++ 	nents = sg_nents_xlen(reqctx->dstsg,  wrparam->bytes, CHCR_DST_SG_SIZE,
++ 			      reqctx->dst_ofst);
++ 	dst_size = get_space_for_phys_dsgl(nents + 1);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	kctx_len = (DIV_ROUND_UP(ablkctx->enckey_len, 16) * 16);
+- 	transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, phys_dsgl);
+- 	skb = alloc_skb((transhdr_len + sizeof(struct sge_opaque_hdr)), flags);
++ 	transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, dst_size);
++ 	nents = sg_nents_xlen(reqctx->srcsg, wrparam->bytes,
++ 				  CHCR_SRC_SG_SIZE, reqctx->src_ofst);
++ 	temp = reqctx->imm ? (DIV_ROUND_UP((IV + wrparam->req->nbytes), 16)
++ 			      * 16) : (sgl_len(nents + MIN_CIPHER_SG) * 8);
++ 	transhdr_len += temp;
++ 	transhdr_len = DIV_ROUND_UP(transhdr_len, 16) * 16;
++ 	skb = alloc_skb(SGE_MAX_WR_LEN, flags);
+  	if (!skb) {
+  		error = -ENOMEM;
+  		goto err;
+  	}
+++<<<<<<< HEAD
+ +	skb_reserve(skb, sizeof(struct sge_opaque_hdr));
+ +	chcr_req = (struct chcr_wr *)__skb_put(skb, transhdr_len);
+ +	memset(chcr_req, 0, transhdr_len);
+++=======
++ 	chcr_req = __skb_put_zero(skb, transhdr_len);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	chcr_req->sec_cpl.op_ivinsrtofst =
+- 		FILL_SEC_CPL_OP_IVINSR(ctx->dev->rx_channel_id, 2, 1);
++ 		FILL_SEC_CPL_OP_IVINSR(c_ctx(tfm)->dev->rx_channel_id, 2, 1);
+  
+- 	chcr_req->sec_cpl.pldlen = htonl(ivsize + wrparam->bytes);
++ 	chcr_req->sec_cpl.pldlen = htonl(IV + wrparam->bytes);
+  	chcr_req->sec_cpl.aadstart_cipherstop_hi =
+- 			FILL_SEC_CPL_CIPHERSTOP_HI(0, 0, ivsize + 1, 0);
++ 			FILL_SEC_CPL_CIPHERSTOP_HI(0, 0, IV + 1, 0);
+  
+  	chcr_req->sec_cpl.cipherstop_lo_authinsert =
+  			FILL_SEC_CPL_AUTHINSERT(0, 0, 0, 0);
+@@@ -693,26 -827,18 +929,23 @@@
+  		}
+  	}
+  	phys_cpl = (struct cpl_rx_phys_dsgl *)((u8 *)(chcr_req + 1) + kctx_len);
+- 	sg_param.nents = reqctx->dst_nents;
+- 	sg_param.obsize =  wrparam->bytes;
+- 	sg_param.qid = wrparam->qid;
+- 	error = map_writesg_phys_cpl(&u_ctx->lldi.pdev->dev, phys_cpl,
+- 				       reqctx->dst, &sg_param);
+- 	if (error)
+- 		goto map_fail1;
++ 	ulptx = (struct ulptx_sgl *)((u8 *)(phys_cpl + 1) + dst_size);
++ 	chcr_add_cipher_src_ent(wrparam->req, ulptx, wrparam);
++ 	chcr_add_cipher_dst_ent(wrparam->req, phys_cpl, wrparam, wrparam->qid);
+  
+- 	skb_set_transport_header(skb, transhdr_len);
+- 	write_buffer_to_skb(skb, &frags, reqctx->iv, ivsize);
+- 	write_sg_to_skb(skb, &frags, wrparam->srcsg, wrparam->bytes);
+  	atomic_inc(&adap->chcr_stats.cipher_rqst);
+++<<<<<<< HEAD
+ +	create_wreq(ctx, chcr_req, &(wrparam->req->base), skb, kctx_len, 0, 1,
+ +			sizeof(struct cpl_rx_phys_dsgl) + phys_dsgl,
+++=======
++ 	temp = sizeof(struct cpl_rx_phys_dsgl) + dst_size + kctx_len
++ 		+(reqctx->imm ? (IV + wrparam->bytes) : 0);
++ 	create_wreq(c_ctx(tfm), chcr_req, &(wrparam->req->base), reqctx->imm, 0,
++ 		    transhdr_len, temp,
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  			ablkctx->ciph_mode == CHCR_SCMD_CIPHER_MODE_AES_CBC);
+  	reqctx->skb = skb;
+- 	skb_get(skb);
+  	return skb;
+- map_fail1:
+- 	kfree_skb(skb);
+  err:
+  	return ERR_PTR(error);
+  }
+@@@ -1018,18 -1131,10 +1238,25 @@@ static int chcr_handle_cipher_resp(stru
+  		}
+  
+  	}
+++<<<<<<< HEAD
+ +	wrparam.srcsg = scatterwalk_ffwd(reqctx->srcffwd, req->src,
+ +				       reqctx->processed);
+ +	reqctx->dst = scatterwalk_ffwd(reqctx->dstffwd, reqctx->dstsg,
+ +					 reqctx->processed);
+ +	if (!wrparam.srcsg || !reqctx->dst) {
+ +		pr_err("Input sg list length less that nbytes\n");
+ +		err = -EINVAL;
+ +		goto complete;
+ +	}
+ +	bytes = chcr_sg_ent_in_wr(wrparam.srcsg, reqctx->dst, 1,
+ +				 SPACE_LEFT(ablkctx->enckey_len),
+ +				 &wrparam.snent, &reqctx->dst_nents);
+++=======
++ 	if (!reqctx->imm) {
++ 		bytes = chcr_sg_ent_in_wr(reqctx->srcsg, reqctx->dstsg, 1,
++ 					  SPACE_LEFT(ablkctx->enckey_len),
++ 					  reqctx->src_ofst, reqctx->dst_ofst);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	if ((bytes + reqctx->processed) >= req->nbytes)
+  		bytes  = req->nbytes - reqctx->processed;
+  	else
+@@@ -1061,15 -1174,17 +1296,19 @@@
+  	if (IS_ERR(skb)) {
+  		pr_err("chcr : %s : Failed to form WR. No memory\n", __func__);
+  		err = PTR_ERR(skb);
+- 		goto complete;
++ 		goto unmap;
+  	}
+  	skb->dev = u_ctx->lldi.ports[0];
+- 	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
++ 	set_wr_txq(skb, CPL_PRIORITY_DATA, c_ctx(tfm)->tx_qidx);
+  	chcr_send_wr(skb);
++ 	reqctx->last_req_len = bytes;
++ 	reqctx->processed += bytes;
+  	return 0;
++ unmap:
++ 	chcr_cipher_dma_unmap(&ULD_CTX(c_ctx(tfm))->lldi.pdev->dev, req);
+  complete:
+ +	free_new_sg(reqctx->newdstsg);
+ +	reqctx->newdstsg = NULL;
+  	req->base.complete(&req->base, err);
+  	return err;
+  }
+@@@ -1082,12 -1197,10 +1321,11 @@@ static int process_cipher(struct ablkci
+  	struct crypto_ablkcipher *tfm = crypto_ablkcipher_reqtfm(req);
+  	unsigned int ivsize = crypto_ablkcipher_ivsize(tfm);
+  	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
+- 	struct chcr_context *ctx = crypto_ablkcipher_ctx(tfm);
+- 	struct ablk_ctx *ablkctx = ABLK_CTX(ctx);
++ 	struct ablk_ctx *ablkctx = ABLK_CTX(c_ctx(tfm));
+  	struct	cipher_wr_param wrparam;
+ -	int bytes, err = -EINVAL;
+ +	int bytes, nents, err = -EINVAL;
+  
+ +	reqctx->newdstsg = NULL;
+  	reqctx->processed = 0;
+  	if (!req->info)
+  		goto error;
+@@@ -1098,19 -1211,34 +1336,50 @@@
+  		       ablkctx->enckey_len, req->nbytes, ivsize);
+  		goto error;
+  	}
+++<<<<<<< HEAD
+ +	wrparam.srcsg = req->src;
+ +	if (is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return PTR_ERR(reqctx->newdstsg);
+ +		reqctx->dstsg = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dstsg = req->dst;
+ +	}
+ +	bytes = chcr_sg_ent_in_wr(wrparam.srcsg, reqctx->dstsg, MIN_CIPHER_SG,
+ +				 SPACE_LEFT(ablkctx->enckey_len),
+ +				 &wrparam.snent,
+ +				 &reqctx->dst_nents);
+++=======
++ 	chcr_cipher_dma_map(&ULD_CTX(c_ctx(tfm))->lldi.pdev->dev, req);
++ 	if (req->nbytes < (SGE_MAX_WR_LEN - (sizeof(struct chcr_wr) +
++ 					    AES_MIN_KEY_SIZE +
++ 					    sizeof(struct cpl_rx_phys_dsgl) +
++ 					/*Min dsgl size*/
++ 					    32))) {
++ 		/* Can be sent as Imm*/
++ 		unsigned int dnents = 0, transhdr_len, phys_dsgl, kctx_len;
++ 
++ 		dnents = sg_nents_xlen(req->dst, req->nbytes,
++ 				       CHCR_DST_SG_SIZE, 0);
++ 		dnents += 1; // IV
++ 		phys_dsgl = get_space_for_phys_dsgl(dnents);
++ 		kctx_len = (DIV_ROUND_UP(ablkctx->enckey_len, 16) * 16);
++ 		transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, phys_dsgl);
++ 		reqctx->imm = (transhdr_len + IV + req->nbytes) <=
++ 			SGE_MAX_WR_LEN;
++ 		bytes = IV + req->nbytes;
++ 
++ 	} else {
++ 		reqctx->imm = 0;
++ 	}
++ 
++ 	if (!reqctx->imm) {
++ 		bytes = chcr_sg_ent_in_wr(req->src, req->dst,
++ 					  MIN_CIPHER_SG,
++ 					  SPACE_LEFT(ablkctx->enckey_len),
++ 					  0, 0);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	if ((bytes + reqctx->processed) >= req->nbytes)
+  		bytes  = req->nbytes - reqctx->processed;
+  	else
+@@@ -1155,13 -1287,15 +1428,17 @@@
+  	*skb = create_cipher_wr(&wrparam);
+  	if (IS_ERR(*skb)) {
+  		err = PTR_ERR(*skb);
+- 		goto error;
++ 		goto unmap;
+  	}
++ 	reqctx->processed = bytes;
++ 	reqctx->last_req_len = bytes;
+  
+  	return 0;
++ unmap:
++ 	chcr_cipher_dma_unmap(&ULD_CTX(c_ctx(tfm))->lldi.pdev->dev, req);
+  error:
+ +	free_new_sg(reqctx->newdstsg);
+ +	reqctx->newdstsg = NULL;
+  	return err;
+  }
+  
+@@@ -1378,16 -1512,22 +1655,28 @@@ static struct sk_buff *create_hash_wr(s
+  	else
+  		hash_size_in_response = param->alg_prm.result_size;
+  	transhdr_len = HASH_TRANSHDR_SIZE(kctx_len);
+- 	skb = alloc_skb((transhdr_len + sizeof(struct sge_opaque_hdr)), flags);
+- 	if (!skb)
+- 		return skb;
+- 
++ 	req_ctx->imm = (transhdr_len + param->bfr_len + param->sg_len) <=
++ 		SGE_MAX_WR_LEN;
++ 	nents = sg_nents_xlen(req->src, param->sg_len, CHCR_SRC_SG_SIZE, 0);
++ 	nents += param->bfr_len ? 1 : 0;
++ 	transhdr_len += req_ctx->imm ? (DIV_ROUND_UP((param->bfr_len +
++ 			param->sg_len), 16) * 16) :
++ 			(sgl_len(nents) * 8);
++ 	transhdr_len = DIV_ROUND_UP(transhdr_len, 16) * 16;
++ 
+++<<<<<<< HEAD
+ +	skb_reserve(skb, sizeof(struct sge_opaque_hdr));
+ +	chcr_req = (struct chcr_wr *)__skb_put(skb, transhdr_len);
+ +	memset(chcr_req, 0, transhdr_len);
+++=======
++ 	skb = alloc_skb(SGE_MAX_WR_LEN, flags);
++ 	if (!skb)
++ 		return ERR_PTR(-ENOMEM);
++ 	chcr_req = __skb_put_zero(skb, transhdr_len);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	chcr_req->sec_cpl.op_ivinsrtofst =
+- 		FILL_SEC_CPL_OP_IVINSR(ctx->dev->rx_channel_id, 2, 0);
++ 		FILL_SEC_CPL_OP_IVINSR(h_ctx(tfm)->dev->rx_channel_id, 2, 0);
+  	chcr_req->sec_cpl.pldlen = htonl(param->bfr_len + param->sg_len);
+  
+  	chcr_req->sec_cpl.aadstart_cipherstop_hi =
+@@@ -1416,19 -1556,34 +1705,39 @@@
+  					    ((kctx_len +
+  					     sizeof(chcr_req->key_ctx)) >> 4));
+  	chcr_req->sec_cpl.scmd1 = cpu_to_be64((u64)param->scmd1);
+- 
+- 	skb_set_transport_header(skb, transhdr_len);
+- 	if (param->bfr_len != 0)
+- 		write_buffer_to_skb(skb, &frags, req_ctx->reqbfr,
+- 				    param->bfr_len);
+- 	if (param->sg_len != 0)
+- 		write_sg_to_skb(skb, &frags, req->src, param->sg_len);
++ 	ulptx = (struct ulptx_sgl *)((u8 *)(chcr_req + 1) + kctx_len +
++ 				     DUMMY_BYTES);
++ 	if (param->bfr_len != 0) {
++ 		req_ctx->dma_addr = dma_map_single(&u_ctx->lldi.pdev->dev,
++ 					  req_ctx->reqbfr, param->bfr_len,
++ 					  DMA_TO_DEVICE);
++ 		if (dma_mapping_error(&u_ctx->lldi.pdev->dev,
++ 				       req_ctx->dma_addr)) {
++ 			error = -ENOMEM;
++ 			goto err;
++ 		}
++ 		req_ctx->dma_len = param->bfr_len;
++ 	} else {
++ 		req_ctx->dma_addr = 0;
++ 	}
++ 	chcr_add_hash_src_ent(req, ulptx, param);
++ 	/* Request upto max wr size */
++ 	temp = kctx_len + DUMMY_BYTES + (req_ctx->imm ? (param->sg_len
++ 					+ param->bfr_len) : 0);
+  	atomic_inc(&adap->chcr_stats.digest_rqst);
+++<<<<<<< HEAD
+ +	create_wreq(ctx, chcr_req, &req->base, skb, kctx_len,
+ +		    hash_size_in_response, 0, DUMMY_BYTES, 0);
+++=======
++ 	create_wreq(h_ctx(tfm), chcr_req, &req->base, req_ctx->imm,
++ 		    hash_size_in_response, transhdr_len,
++ 		    temp,  0);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	req_ctx->skb = skb;
+- 	skb_get(skb);
+  	return skb;
++ err:
++ 	kfree_skb(skb);
++ 	return  ERR_PTR(error);
+  }
+  
+  static int chcr_ahash_update(struct ahash_request *req)
+@@@ -1833,64 -2010,39 +2164,100 @@@ static void chcr_hmac_cra_exit(struct c
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int is_newsg(struct scatterlist *sgl, unsigned int *newents)
+ +{
+ +	int nents = 0;
+ +	int ret = 0;
+ +
+ +	while (sgl) {
+ +		if (sgl->length > CHCR_SG_SIZE)
+ +			ret = 1;
+ +		nents += DIV_ROUND_UP(sgl->length, CHCR_SG_SIZE);
+ +		sgl = sg_next(sgl);
+ +	}
+ +	*newents = nents;
+ +	return ret;
+ +}
+ +
+ +static inline void free_new_sg(struct scatterlist *sgl)
+ +{
+ +	kfree(sgl);
+ +}
+ +
+ +static struct scatterlist *alloc_new_sg(struct scatterlist *sgl,
+ +				       unsigned int nents)
+ +{
+ +	struct scatterlist *newsg, *sg;
+ +	int i, len, processed = 0;
+ +	struct page *spage;
+ +	int offset;
+ +
+ +	newsg = kmalloc_array(nents, sizeof(struct scatterlist), GFP_KERNEL);
+ +	if (!newsg)
+ +		return ERR_PTR(-ENOMEM);
+ +	sg = newsg;
+ +	sg_init_table(sg, nents);
+ +	offset = sgl->offset;
+ +	spage = sg_page(sgl);
+ +	for (i = 0; i < nents; i++) {
+ +		len = min_t(u32, sgl->length - processed, CHCR_SG_SIZE);
+ +		sg_set_page(sg, spage, len, offset);
+ +		processed += len;
+ +		offset += len;
+ +		if (offset >= PAGE_SIZE) {
+ +			offset = offset % PAGE_SIZE;
+ +			spage++;
+ +		}
+ +		if (processed == sgl->length) {
+ +			processed = 0;
+ +			sgl = sg_next(sgl);
+ +			if (!sgl)
+ +				break;
+ +			spage = sg_page(sgl);
+ +			offset = sgl->offset;
+ +		}
+ +		sg = sg_next(sg);
+ +	}
+ +	return newsg;
+ +}
+ +
+ +static int chcr_aead_need_fallback(struct aead_request *req, int src_nent,
+++=======
++ static int chcr_aead_common_init(struct aead_request *req,
++ 				 unsigned short op_type)
++ {
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 	int error = -EINVAL;
++ 	unsigned int dst_size;
++ 	unsigned int authsize = crypto_aead_authsize(tfm);
++ 
++ 	dst_size = req->assoclen + req->cryptlen + (op_type ?
++ 					-authsize : authsize);
++ 	/* validate key size */
++ 	if (aeadctx->enckey_len == 0)
++ 		goto err;
++ 	if (op_type && req->cryptlen < authsize)
++ 		goto err;
++ 	error = chcr_aead_dma_map(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 				  op_type);
++ 	if (error) {
++ 		error = -ENOMEM;
++ 		goto err;
++ 	}
++ 	reqctx->aad_nents = sg_nents_xlen(req->src, req->assoclen,
++ 					  CHCR_SRC_SG_SIZE, 0);
++ 	reqctx->src_nents = sg_nents_xlen(req->src, req->cryptlen,
++ 					  CHCR_SRC_SG_SIZE, req->assoclen);
++ 	return 0;
++ err:
++ 	return error;
++ }
++ 
++ static int chcr_aead_need_fallback(struct aead_request *req, int dst_nents,
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  				   int aadmax, int wrlen,
+  				   unsigned short op_type)
+  {
+@@@ -1935,77 -2084,69 +2299,118 @@@ static struct sk_buff *create_authenc_w
+  	struct sk_buff *skb = NULL;
+  	struct chcr_wr *chcr_req;
+  	struct cpl_rx_phys_dsgl *phys_cpl;
+++<<<<<<< HEAD
+ +	struct phys_sge_parm sg_param;
+ +	unsigned int frags = 0, transhdr_len;
+ +	unsigned int ivsize = crypto_aead_ivsize(tfm), dst_size = 0;
+ +	unsigned int   kctx_len = 0, nents;
+ +	unsigned short stop_offset = 0;
+++=======
++ 	struct ulptx_sgl *ulptx;
++ 	unsigned int transhdr_len;
++ 	unsigned int dst_size = 0, temp;
++ 	unsigned int   kctx_len = 0, dnents;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	unsigned int  assoclen = req->assoclen;
+  	unsigned int  authsize = crypto_aead_authsize(tfm);
+- 	int error = -EINVAL, src_nent;
++ 	int error = -EINVAL;
+  	int null = 0;
+  	gfp_t flags = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+  		GFP_ATOMIC;
+- 	struct adapter *adap = padap(ctx->dev);
++ 	struct adapter *adap = padap(a_ctx(tfm)->dev);
+  
+++<<<<<<< HEAD
+ +	reqctx->newdstsg = NULL;
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+ +	if (aeadctx->enckey_len == 0 || (req->cryptlen <= 0))
+ +		goto err;
+ +
+ +	if (op_type && req->cryptlen < crypto_aead_authsize(tfm))
+ +		goto err;
+ +	src_nent = sg_nents_for_len(req->src, req->cryptlen);
+ +	if (src_nent < 0)
+ +		goto err;
+ +
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+ +	}
+++=======
++ 	if (req->cryptlen == 0)
++ 		return NULL;
++ 
++ 	reqctx->b0_dma = 0;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	if (get_aead_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_AEAD_NULL) {
+  		null = 1;
+  		assoclen = 0;
+  	}
+- 	reqctx->dst_nents = sg_nents_for_len(reqctx->dst, req->cryptlen +
+- 					     (op_type ? -authsize : authsize));
+- 	if (reqctx->dst_nents < 0) {
+- 		pr_err("AUTHENC:Invalid Destination sg entries\n");
+- 		error = -EINVAL;
+- 		goto err;
++ 	dst_size = assoclen + req->cryptlen + (op_type ? -authsize :
++ 						    authsize);
++ 	error = chcr_aead_common_init(req, op_type);
++ 	if (error)
++ 		return ERR_PTR(error);
++ 	if (dst_size) {
++ 		dnents = sg_nents_xlen(req->dst, assoclen, CHCR_DST_SG_SIZE, 0);
++ 		dnents += sg_nents_xlen(req->dst, req->cryptlen +
++ 			(op_type ? -authsize : authsize), CHCR_DST_SG_SIZE,
++ 			req->assoclen);
++ 		dnents += MIN_AUTH_SG; // For IV
++ 	} else {
++ 		dnents = 0;
+  	}
+++<<<<<<< HEAD
+ +	dst_size = get_space_for_phys_dsgl(reqctx->dst_nents);
+++=======
++ 
++ 	dst_size = get_space_for_phys_dsgl(dnents);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	kctx_len = (ntohl(KEY_CONTEXT_CTX_LEN_V(aeadctx->key_ctx_hdr)) << 4)
+  		- sizeof(chcr_req->key_ctx);
+  	transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, dst_size);
+- 	if (chcr_aead_need_fallback(req, src_nent + MIN_AUTH_SG,
+- 			T6_MAX_AAD_SIZE,
+- 			transhdr_len + (sgl_len(src_nent + MIN_AUTH_SG) * 8),
+- 				op_type)) {
++ 	reqctx->imm = (transhdr_len + assoclen + IV + req->cryptlen) <
++ 			SGE_MAX_WR_LEN;
++ 	temp = reqctx->imm ? (DIV_ROUND_UP((assoclen + IV + req->cryptlen), 16)
++ 			* 16) : (sgl_len(reqctx->src_nents + reqctx->aad_nents
++ 			+ MIN_GCM_SG) * 8);
++ 	transhdr_len += temp;
++ 	transhdr_len = DIV_ROUND_UP(transhdr_len, 16) * 16;
++ 
++ 	if (chcr_aead_need_fallback(req, dnents, T6_MAX_AAD_SIZE,
++ 				    transhdr_len, op_type)) {
+  		atomic_inc(&adap->chcr_stats.fallback);
+++<<<<<<< HEAD
+ +		free_new_sg(reqctx->newdstsg);
+ +		reqctx->newdstsg = NULL;
+++=======
++ 		chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 				    op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  		return ERR_PTR(chcr_aead_fallback(req, op_type));
+  	}
+- 	skb = alloc_skb((transhdr_len + sizeof(struct sge_opaque_hdr)), flags);
++ 	skb = alloc_skb(SGE_MAX_WR_LEN, flags);
+  	if (!skb) {
+  		error = -ENOMEM;
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* LLD is going to write the sge hdr. */
+ +	skb_reserve(skb, sizeof(struct sge_opaque_hdr));
+ +
+ +	/* Write WR */
+ +	chcr_req = (struct chcr_wr *) __skb_put(skb, transhdr_len);
+ +	memset(chcr_req, 0, transhdr_len);
+++=======
++ 	chcr_req = __skb_put_zero(skb, transhdr_len);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+- 	stop_offset = (op_type == CHCR_ENCRYPT_OP) ? 0 : authsize;
++ 	temp  = (op_type == CHCR_ENCRYPT_OP) ? 0 : authsize;
+  
+  	/*
+  	 * Input order	is AAD,IV and Payload. where IV should be included as
+@@@ -2013,17 -2154,17 +2418,23 @@@
+  	 * to the hardware spec
+  	 */
+  	chcr_req->sec_cpl.op_ivinsrtofst =
+- 		FILL_SEC_CPL_OP_IVINSR(ctx->dev->rx_channel_id, 2,
+- 				       (ivsize ? (assoclen + 1) : 0));
+- 	chcr_req->sec_cpl.pldlen = htonl(assoclen + ivsize + req->cryptlen);
++ 		FILL_SEC_CPL_OP_IVINSR(a_ctx(tfm)->dev->rx_channel_id, 2,
++ 				       assoclen + 1);
++ 	chcr_req->sec_cpl.pldlen = htonl(assoclen + IV + req->cryptlen);
+  	chcr_req->sec_cpl.aadstart_cipherstop_hi = FILL_SEC_CPL_CIPHERSTOP_HI(
+  					assoclen ? 1 : 0, assoclen,
+- 					assoclen + ivsize + 1,
+- 					(stop_offset & 0x1F0) >> 4);
++ 					assoclen + IV + 1,
++ 					(temp & 0x1F0) >> 4);
+  	chcr_req->sec_cpl.cipherstop_lo_authinsert = FILL_SEC_CPL_AUTHINSERT(
+++<<<<<<< HEAD
+ +					stop_offset & 0xF,
+ +					null ? 0 : assoclen + 1,
+ +					stop_offset, stop_offset);
+++=======
++ 					temp & 0xF,
++ 					null ? 0 : assoclen + IV + 1,
++ 					temp, temp);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	chcr_req->sec_cpl.seqno_numivs = FILL_SEC_CPL_SCMD0_SEQNO(op_type,
+  					(op_type == CHCR_ENCRYPT_OP) ? 1 : 0,
+  					CHCR_SCMD_CIPHER_MODE_AES_CBC,
+@@@ -2043,39 -2184,24 +2454,53 @@@
+  	memcpy(chcr_req->key_ctx.key + (DIV_ROUND_UP(aeadctx->enckey_len, 16) <<
+  					4), actx->h_iopad, kctx_len -
+  				(DIV_ROUND_UP(aeadctx->enckey_len, 16) << 4));
+- 
++ 	memcpy(reqctx->iv, req->iv, IV);
+  	phys_cpl = (struct cpl_rx_phys_dsgl *)((u8 *)(chcr_req + 1) + kctx_len);
+++<<<<<<< HEAD
+ +	sg_param.nents = reqctx->dst_nents;
+ +	sg_param.obsize = req->cryptlen + (op_type ? -authsize : authsize);
+ +	sg_param.qid = qid;
+ +	error = map_writesg_phys_cpl(&u_ctx->lldi.pdev->dev, phys_cpl,
+ +					reqctx->dst, &sg_param);
+ +	if (error)
+ +		goto dstmap_fail;
+ +
+ +	skb_set_transport_header(skb, transhdr_len);
+ +
+ +	if (assoclen) {
+ +		/* AAD buffer in */
+ +		write_sg_to_skb(skb, &frags, req->assoc, assoclen);
+ +
+ +	}
+ +	memcpy(reqctx->iv, req->iv, ivsize);
+ +	write_buffer_to_skb(skb, &frags, reqctx->iv, ivsize);
+ +	write_sg_to_skb(skb, &frags, req->src, req->cryptlen);
+ +	atomic_inc(&adap->chcr_stats.cipher_rqst);
+ +	create_wreq(ctx, chcr_req, &req->base, skb, kctx_len, size, 1,
+ +		   sizeof(struct cpl_rx_phys_dsgl) + dst_size, 0);
+++=======
++ 	ulptx = (struct ulptx_sgl *)((u8 *)(phys_cpl + 1) + dst_size);
++ 	chcr_add_aead_dst_ent(req, phys_cpl, assoclen, op_type, qid);
++ 	chcr_add_aead_src_ent(req, ulptx, assoclen, op_type);
++ 	atomic_inc(&adap->chcr_stats.cipher_rqst);
++ 	temp = sizeof(struct cpl_rx_phys_dsgl) + dst_size +
++ 		kctx_len + (reqctx->imm ? (assoclen + IV + req->cryptlen) : 0);
++ 	create_wreq(a_ctx(tfm), chcr_req, &req->base, reqctx->imm, size,
++ 		   transhdr_len, temp, 0);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	reqctx->skb = skb;
+- 	skb_get(skb);
++ 	reqctx->op = op_type;
+  
+  	return skb;
+- dstmap_fail:
+- 	/* ivmap_fail: */
+- 	kfree_skb(skb);
+  err:
+++<<<<<<< HEAD
+ +	free_new_sg(reqctx->newdstsg);
+ +	reqctx->newdstsg = NULL;
+++=======
++ 	chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 			    op_type);
++ 
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	return ERR_PTR(error);
+  }
+  
+@@@ -2162,23 -2574,26 +2872,25 @@@ static int ccm_format_packet(struct aea
+  static void fill_sec_cpl_for_aead(struct cpl_tx_sec_pdu *sec_cpl,
+  				  unsigned int dst_size,
+  				  struct aead_request *req,
+- 				  unsigned short op_type,
+- 					  struct chcr_context *chcrctx)
++ 				  unsigned short op_type)
+  {
+  	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+- 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(crypto_aead_ctx(tfm));
+- 	unsigned int ivsize = AES_BLOCK_SIZE;
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
+  	unsigned int cipher_mode = CHCR_SCMD_CIPHER_MODE_AES_CCM;
+  	unsigned int mac_mode = CHCR_SCMD_AUTH_MODE_CBCMAC;
+- 	unsigned int c_id = chcrctx->dev->rx_channel_id;
++ 	unsigned int c_id = a_ctx(tfm)->dev->rx_channel_id;
+  	unsigned int ccm_xtra;
+  	unsigned char tag_offset = 0, auth_offset = 0;
+ -	unsigned int assoclen;
+  
+ -	if (get_aead_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_AEAD_RFC4309)
+ -		assoclen = req->assoclen - 8;
+ -	else
+ -		assoclen = req->assoclen;
+  	ccm_xtra = CCM_B0_SIZE +
+ -		((assoclen) ? CCM_AAD_FIELD_SIZE : 0);
+ +		((req->assoclen) ? CCM_AAD_FIELD_SIZE : 0);
+  
+  	auth_offset = req->cryptlen ?
+++<<<<<<< HEAD
+ +		(req->assoclen + ivsize + 1 + ccm_xtra) : 0;
+++=======
++ 		(assoclen + IV + 1 + ccm_xtra) : 0;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	if (op_type == CHCR_DECRYPT_OP) {
+  		if (crypto_aead_authsize(tfm) != req->cryptlen)
+  			tag_offset = crypto_aead_authsize(tfm);
+@@@ -2187,15 -2602,14 +2899,26 @@@
+  	}
+  
+  
+++<<<<<<< HEAD
+ +	sec_cpl->op_ivinsrtofst = FILL_SEC_CPL_OP_IVINSR(c_id, 2,
+ +					(ivsize ?  (req->assoclen + 1) :  0) +
+ +					ccm_xtra);
+ +	sec_cpl->pldlen =
+ +		htonl(req->assoclen + ivsize + req->cryptlen + ccm_xtra);
+ +	/* For CCM there wil be b0 always. So AAD start will be 1 always */
+ +	sec_cpl->aadstart_cipherstop_hi = FILL_SEC_CPL_CIPHERSTOP_HI(
+ +					1, req->assoclen + ccm_xtra, req->assoclen
+ +					+ ivsize + 1 + ccm_xtra, 0);
+++=======
++ 	sec_cpl->op_ivinsrtofst = FILL_SEC_CPL_OP_IVINSR(c_id,
++ 					 2, assoclen + 1 + ccm_xtra);
++ 	sec_cpl->pldlen =
++ 		htonl(assoclen + IV + req->cryptlen + ccm_xtra);
++ 	/* For CCM there wil be b0 always. So AAD start will be 1 always */
++ 	sec_cpl->aadstart_cipherstop_hi = FILL_SEC_CPL_CIPHERSTOP_HI(
++ 					1, assoclen + ccm_xtra, assoclen
++ 					+ IV + 1 + ccm_xtra, 0);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	sec_cpl->cipherstop_lo_authinsert = FILL_SEC_CPL_AUTHINSERT(0,
+  					auth_offset, tag_offset,
+@@@ -2220,35 -2634,16 +2943,34 @@@ int aead_ccm_validate_input(unsigned sh
+  			pr_err("CCM: IV check fails\n");
+  			return -EINVAL;
+  		}
+ -	} else {
+ -		if (req->assoclen != 16 && req->assoclen != 20) {
+ -			pr_err("RFC4309: Invalid AAD length %d\n",
+ -			       req->assoclen);
+ -			return -EINVAL;
+ -		}
+  	}
+- 	if (aeadctx->enckey_len == 0) {
+- 		pr_err("CCM: Encryption key not set\n");
+- 		return -EINVAL;
+- 	}
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +unsigned int fill_aead_req_fields(struct sk_buff *skb,
+ +				  struct aead_request *req,
+ +				  struct scatterlist *src,
+ +				  unsigned int ivsize,
+ +				  struct chcr_aead_ctx *aeadctx)
+ +{
+ +	unsigned int frags = 0;
+ +	struct chcr_aead_reqctx *reqctx = aead_request_ctx(req);
+ +	/* b0 and aad length(if available) */
+ +
+ +	write_buffer_to_skb(skb, &frags, reqctx->scratch_pad, CCM_B0_SIZE +
+ +				(req->assoclen ?  CCM_AAD_FIELD_SIZE : 0));
+ +	if (req->assoclen)
+ +		write_sg_to_skb(skb, &frags, req->assoc, req->assoclen);
+ +	write_buffer_to_skb(skb, &frags, reqctx->iv, ivsize);
+ +	if (req->cryptlen)
+ +		write_sg_to_skb(skb, &frags, src, req->cryptlen);
+ +
+ +	return frags;
+ +}
+ +
+++=======
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  static struct sk_buff *create_aead_ccm_wr(struct aead_request *req,
+  					  unsigned short qid,
+  					  int size,
+@@@ -2262,71 -2655,69 +2982,124 @@@
+  	struct sk_buff *skb = NULL;
+  	struct chcr_wr *chcr_req;
+  	struct cpl_rx_phys_dsgl *phys_cpl;
+++<<<<<<< HEAD
+ +	struct phys_sge_parm sg_param;
+ +	unsigned int frags = 0, transhdr_len, ivsize = AES_BLOCK_SIZE;
+ +	unsigned int dst_size = 0, kctx_len, nents;
+ +	unsigned int sub_type;
+++=======
++ 	struct ulptx_sgl *ulptx;
++ 	unsigned int transhdr_len;
++ 	unsigned int dst_size = 0, kctx_len, dnents, temp;
++ 	unsigned int sub_type, assoclen = req->assoclen;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	unsigned int authsize = crypto_aead_authsize(tfm);
+- 	int error = -EINVAL, src_nent;
++ 	int error = -EINVAL;
+  	gfp_t flags = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+  		GFP_ATOMIC;
+++<<<<<<< HEAD
+ +	struct adapter *adap = padap(ctx->dev);
+ +
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+ +	reqctx->newdstsg = NULL;
+ +	if (op_type && req->cryptlen < crypto_aead_authsize(tfm))
+ +		goto err;
+ +	src_nent = sg_nents_for_len(req->src, req->cryptlen);
+ +	if (src_nent < 0)
+ +		goto err;
+++=======
++ 	struct adapter *adap = padap(a_ctx(tfm)->dev);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
++ 	reqctx->b0_dma = 0;
+  	sub_type = get_aead_subtype(tfm);
+++<<<<<<< HEAD
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+ +	}
+ +	reqctx->dst_nents = sg_nents_for_len(reqctx->dst, req->cryptlen +
+ +					     (op_type ? -authsize : authsize));
+ +	if (reqctx->dst_nents < 0) {
+ +		pr_err("CCM:Invalid Destination sg entries\n");
+ +		error = -EINVAL;
+ +		goto err;
+ +	}
+ +	error = aead_ccm_validate_input(op_type, req, aeadctx, sub_type);
+ +	if (error)
+ +		goto err;
+ +
+ +	dst_size = get_space_for_phys_dsgl(reqctx->dst_nents);
+++=======
++ 	if (sub_type == CRYPTO_ALG_SUB_TYPE_AEAD_RFC4309)
++ 		assoclen -= 8;
++ 	dst_size = assoclen + req->cryptlen + (op_type ? -authsize :
++ 						   authsize);
++ 	error = chcr_aead_common_init(req, op_type);
++ 	if (error)
++ 		return ERR_PTR(error);
++ 
++ 
++ 	reqctx->b0_len = CCM_B0_SIZE + (assoclen ? CCM_AAD_FIELD_SIZE : 0);
++ 	error = aead_ccm_validate_input(op_type, req, aeadctx, sub_type);
++ 	if (error)
++ 		goto err;
++ 	if (dst_size) {
++ 		dnents = sg_nents_xlen(req->dst, assoclen, CHCR_DST_SG_SIZE, 0);
++ 		dnents += sg_nents_xlen(req->dst, req->cryptlen
++ 				+ (op_type ? -authsize : authsize),
++ 				CHCR_DST_SG_SIZE, req->assoclen);
++ 		dnents += MIN_CCM_SG; // For IV and B0
++ 	} else {
++ 		dnents = 0;
++ 	}
++ 	dst_size = get_space_for_phys_dsgl(dnents);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	kctx_len = ((DIV_ROUND_UP(aeadctx->enckey_len, 16)) << 4) * 2;
+  	transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, dst_size);
+- 	if (chcr_aead_need_fallback(req, src_nent + MIN_CCM_SG,
+- 			    T6_MAX_AAD_SIZE - 18,
+- 			    transhdr_len + (sgl_len(src_nent + MIN_CCM_SG) * 8),
+- 			    op_type)) {
++ 	reqctx->imm = (transhdr_len + assoclen + IV + req->cryptlen +
++ 		       reqctx->b0_len) <= SGE_MAX_WR_LEN;
++ 	temp = reqctx->imm ? (DIV_ROUND_UP((assoclen + IV + req->cryptlen +
++ 				reqctx->b0_len), 16) * 16) :
++ 		(sgl_len(reqctx->src_nents + reqctx->aad_nents +
++ 				    MIN_CCM_SG) *  8);
++ 	transhdr_len += temp;
++ 	transhdr_len = DIV_ROUND_UP(transhdr_len, 16) * 16;
++ 
++ 	if (chcr_aead_need_fallback(req, dnents, T6_MAX_AAD_SIZE -
++ 				    reqctx->b0_len, transhdr_len, op_type)) {
+  		atomic_inc(&adap->chcr_stats.fallback);
+++<<<<<<< HEAD
+ +		free_new_sg(reqctx->newdstsg);
+ +		reqctx->newdstsg = NULL;
+++=======
++ 		chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 				    op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  		return ERR_PTR(chcr_aead_fallback(req, op_type));
+  	}
+- 
+- 	skb = alloc_skb((transhdr_len + sizeof(struct sge_opaque_hdr)),  flags);
++ 	skb = alloc_skb(SGE_MAX_WR_LEN,  flags);
+  
+  	if (!skb) {
+  		error = -ENOMEM;
+  		goto err;
+  	}
+  
+- 	skb_reserve(skb, sizeof(struct sge_opaque_hdr));
++ 	chcr_req = (struct chcr_wr *) __skb_put_zero(skb, transhdr_len);
+  
+++<<<<<<< HEAD
+ +	chcr_req = (struct chcr_wr *) __skb_put(skb, transhdr_len);
+ +	memset(chcr_req, 0, transhdr_len);
+ +
+ +	fill_sec_cpl_for_aead(&chcr_req->sec_cpl, dst_size, req, op_type, ctx);
+++=======
++ 	fill_sec_cpl_for_aead(&chcr_req->sec_cpl, dst_size, req, op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	chcr_req->key_ctx.ctx_hdr = aeadctx->key_ctx_hdr;
+  	memcpy(chcr_req->key_ctx.key, aeadctx->key, aeadctx->enckey_len);
+@@@ -2338,27 -2730,32 +3112,45 @@@
+  	if (error)
+  		goto dstmap_fail;
+  
+- 	sg_param.nents = reqctx->dst_nents;
+- 	sg_param.obsize = req->cryptlen + (op_type ? -authsize : authsize);
+- 	sg_param.qid = qid;
+- 	error = map_writesg_phys_cpl(&u_ctx->lldi.pdev->dev, phys_cpl,
+- 				 reqctx->dst, &sg_param);
+- 	if (error)
++ 	reqctx->b0_dma = dma_map_single(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev,
++ 					&reqctx->scratch_pad, reqctx->b0_len,
++ 					DMA_BIDIRECTIONAL);
++ 	if (dma_mapping_error(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev,
++ 			      reqctx->b0_dma)) {
++ 		error = -ENOMEM;
+  		goto dstmap_fail;
++ 	}
+  
++ 	chcr_add_aead_dst_ent(req, phys_cpl, assoclen, op_type, qid);
++ 	chcr_add_aead_src_ent(req, ulptx, assoclen, op_type);
++ 
+++<<<<<<< HEAD
+ +	skb_set_transport_header(skb, transhdr_len);
+ +	frags = fill_aead_req_fields(skb, req, req->src, ivsize, aeadctx);
+ +	atomic_inc(&adap->chcr_stats.aead_rqst);
+ +	create_wreq(ctx, chcr_req, &req->base, skb, kctx_len, 0, 1,
+ +		    sizeof(struct cpl_rx_phys_dsgl) + dst_size, 0);
+++=======
++ 	atomic_inc(&adap->chcr_stats.aead_rqst);
++ 	temp = sizeof(struct cpl_rx_phys_dsgl) + dst_size +
++ 		kctx_len + (reqctx->imm ? (assoclen + IV + req->cryptlen +
++ 		reqctx->b0_len) : 0);
++ 	create_wreq(a_ctx(tfm), chcr_req, &req->base, reqctx->imm, 0,
++ 		    transhdr_len, temp, 0);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	reqctx->skb = skb;
+- 	skb_get(skb);
++ 	reqctx->op = op_type;
++ 
+  	return skb;
+  dstmap_fail:
+  	kfree_skb(skb);
+  err:
+++<<<<<<< HEAD
+ +	free_new_sg(reqctx->newdstsg);
+ +	reqctx->newdstsg = NULL;
+++=======
++ 	chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req, op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	return ERR_PTR(error);
+  }
+  
+@@@ -2375,85 -2770,71 +3165,129 @@@ static struct sk_buff *create_gcm_wr(st
+  	struct sk_buff *skb = NULL;
+  	struct chcr_wr *chcr_req;
+  	struct cpl_rx_phys_dsgl *phys_cpl;
+++<<<<<<< HEAD
+ +	struct phys_sge_parm sg_param;
+ +	unsigned int frags = 0, transhdr_len;
+ +	unsigned int ivsize = AES_BLOCK_SIZE;
+ +	unsigned int dst_size = 0, kctx_len, nents, assoclen = req->assoclen;
+ +	unsigned char tag_offset = 0;
+++=======
++ 	struct ulptx_sgl *ulptx;
++ 	unsigned int transhdr_len, dnents = 0;
++ 	unsigned int dst_size = 0, temp = 0, kctx_len, assoclen = req->assoclen;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	unsigned int authsize = crypto_aead_authsize(tfm);
+- 	int error = -EINVAL, src_nent;
++ 	int error = -EINVAL;
+  	gfp_t flags = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL :
+  		GFP_ATOMIC;
+- 	struct adapter *adap = padap(ctx->dev);
++ 	struct adapter *adap = padap(a_ctx(tfm)->dev);
+  
+++<<<<<<< HEAD
+ +	reqctx->newdstsg = NULL;
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+ +	/* validate key size */
+ +	if (aeadctx->enckey_len == 0)
+ +		goto err;
+ +
+ +	if (op_type && req->cryptlen < crypto_aead_authsize(tfm))
+ +		goto err;
+ +	src_nent = sg_nents_for_len(req->src, req->cryptlen);
+ +	if (src_nent < 0)
+ +		goto err;
+ +
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+ +	}
+ +
+ +	reqctx->dst_nents = sg_nents_for_len(reqctx->dst, req->cryptlen +
+ +					     (op_type ? -authsize : authsize));
+ +	if (reqctx->dst_nents < 0) {
+ +		pr_err("GCM:Invalid Destination sg entries\n");
+ +		error = -EINVAL;
+ +		goto err;
+ +	}
+ +
+ +
+ +	dst_size = get_space_for_phys_dsgl(reqctx->dst_nents);
+++=======
++ 	if (get_aead_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_AEAD_RFC4106)
++ 		assoclen = req->assoclen - 8;
++ 
++ 	reqctx->b0_dma = 0;
++ 	dst_size = assoclen + req->cryptlen + (op_type ? -authsize :  authsize);
++ 	error = chcr_aead_common_init(req, op_type);
++ 		if (error)
++ 			return	ERR_PTR(error);
++ 	if (dst_size) {
++ 		dnents = sg_nents_xlen(req->dst, assoclen, CHCR_DST_SG_SIZE, 0);
++ 		dnents += sg_nents_xlen(req->dst,
++ 			req->cryptlen + (op_type ? -authsize : authsize),
++ 				CHCR_DST_SG_SIZE, req->assoclen);
++ 		dnents += MIN_GCM_SG; // For IV
++ 	} else {
++ 		dnents = 0;
++ 	}
++ 	dst_size = get_space_for_phys_dsgl(dnents);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	kctx_len = ((DIV_ROUND_UP(aeadctx->enckey_len, 16)) << 4) +
+  		AEAD_H_SIZE;
+  	transhdr_len = CIPHER_TRANSHDR_SIZE(kctx_len, dst_size);
+- 	if (chcr_aead_need_fallback(req, src_nent + MIN_GCM_SG,
+- 			    T6_MAX_AAD_SIZE,
+- 			    transhdr_len + (sgl_len(src_nent + MIN_GCM_SG) * 8),
+- 			    op_type)) {
++ 	reqctx->imm = (transhdr_len + assoclen + IV + req->cryptlen) <=
++ 			SGE_MAX_WR_LEN;
++ 	temp = reqctx->imm ? (DIV_ROUND_UP((assoclen + IV +
++ 	req->cryptlen), 16) * 16) : (sgl_len(reqctx->src_nents +
++ 				reqctx->aad_nents + MIN_GCM_SG) * 8);
++ 	transhdr_len += temp;
++ 	transhdr_len = DIV_ROUND_UP(transhdr_len, 16) * 16;
++ 	if (chcr_aead_need_fallback(req, dnents, T6_MAX_AAD_SIZE,
++ 			    transhdr_len, op_type)) {
+  		atomic_inc(&adap->chcr_stats.fallback);
+++<<<<<<< HEAD
+ +		free_new_sg(reqctx->newdstsg);
+ +		reqctx->newdstsg = NULL;
+++=======
++ 		chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req,
++ 				    op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  		return ERR_PTR(chcr_aead_fallback(req, op_type));
+  	}
+- 	skb = alloc_skb((transhdr_len + sizeof(struct sge_opaque_hdr)), flags);
++ 	skb = alloc_skb(SGE_MAX_WR_LEN, flags);
+  	if (!skb) {
+  		error = -ENOMEM;
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* NIC driver is going to write the sge hdr. */
+ +	skb_reserve(skb, sizeof(struct sge_opaque_hdr));
+ +
+ +	chcr_req = (struct chcr_wr *)__skb_put(skb, transhdr_len);
+ +	memset(chcr_req, 0, transhdr_len);
+ +
+ +	tag_offset = (op_type == CHCR_ENCRYPT_OP) ? 0 : authsize;
+++=======
++ 	chcr_req = __skb_put_zero(skb, transhdr_len);
++ 
++ 	//Offset of tag from end
++ 	temp = (op_type == CHCR_ENCRYPT_OP) ? 0 : authsize;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	chcr_req->sec_cpl.op_ivinsrtofst = FILL_SEC_CPL_OP_IVINSR(
+- 					ctx->dev->rx_channel_id, 2, (ivsize ?
+- 					(assoclen + 1) : 0));
++ 					a_ctx(tfm)->dev->rx_channel_id, 2,
++ 					(assoclen + 1));
+  	chcr_req->sec_cpl.pldlen =
+- 		htonl(assoclen + ivsize + req->cryptlen);
++ 		htonl(assoclen + IV + req->cryptlen);
+  	chcr_req->sec_cpl.aadstart_cipherstop_hi = FILL_SEC_CPL_CIPHERSTOP_HI(
+  					assoclen ? 1 : 0, assoclen,
+- 					assoclen + ivsize + 1, 0);
++ 					assoclen + IV + 1, 0);
+  		chcr_req->sec_cpl.cipherstop_lo_authinsert =
+- 			FILL_SEC_CPL_AUTHINSERT(0, assoclen + ivsize + 1,
+- 						tag_offset, tag_offset);
++ 			FILL_SEC_CPL_AUTHINSERT(0, assoclen + IV + 1,
++ 						temp, temp);
+  		chcr_req->sec_cpl.seqno_numivs =
+  			FILL_SEC_CPL_SCMD0_SEQNO(op_type, (op_type ==
+  					CHCR_ENCRYPT_OP) ? 1 : 0,
+@@@ -2479,56 -2860,45 +3313,75 @@@
+  	*((unsigned int *)(reqctx->iv + 12)) = htonl(0x01);
+  
+  	phys_cpl = (struct cpl_rx_phys_dsgl *)((u8 *)(chcr_req + 1) + kctx_len);
+- 	sg_param.nents = reqctx->dst_nents;
+- 	sg_param.obsize = req->cryptlen + (op_type ? -authsize : authsize);
+- 	sg_param.qid = qid;
+- 	error = map_writesg_phys_cpl(&u_ctx->lldi.pdev->dev, phys_cpl,
+- 					  reqctx->dst, &sg_param);
+- 	if (error)
+- 		goto dstmap_fail;
++ 	ulptx = (struct ulptx_sgl *)((u8 *)(phys_cpl + 1) + dst_size);
+  
+++<<<<<<< HEAD
+ +	skb_set_transport_header(skb, transhdr_len);
+ +	write_sg_to_skb(skb, &frags, req->assoc, assoclen);
+ +	write_buffer_to_skb(skb, &frags, reqctx->iv, ivsize);
+ +	write_sg_to_skb(skb, &frags, req->src, req->cryptlen);
+ +	atomic_inc(&adap->chcr_stats.aead_rqst);
+ +	create_wreq(ctx, chcr_req, &req->base, skb, kctx_len, size, 1,
+ +			sizeof(struct cpl_rx_phys_dsgl) + dst_size,
+ +			reqctx->verify);
+++=======
++ 	chcr_add_aead_dst_ent(req, phys_cpl, assoclen, op_type, qid);
++ 	chcr_add_aead_src_ent(req, ulptx, assoclen, op_type);
++ 	atomic_inc(&adap->chcr_stats.aead_rqst);
++ 	temp = sizeof(struct cpl_rx_phys_dsgl) + dst_size +
++ 		kctx_len + (reqctx->imm ? (assoclen + IV + req->cryptlen) : 0);
++ 	create_wreq(a_ctx(tfm), chcr_req, &req->base, reqctx->imm, size,
++ 		    transhdr_len, temp, reqctx->verify);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	reqctx->skb = skb;
+- 	skb_get(skb);
++ 	reqctx->op = op_type;
+  	return skb;
+  
+- dstmap_fail:
+- 	/* ivmap_fail: */
+- 	kfree_skb(skb);
+  err:
+++<<<<<<< HEAD
+ +	free_new_sg(reqctx->newdstsg);
+ +	reqctx->newdstsg = NULL;
+++=======
++ 	chcr_aead_dma_unmap(&ULD_CTX(a_ctx(tfm))->lldi.pdev->dev, req, op_type);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	return ERR_PTR(error);
+  }
+  
+ -
+ -
+ -static int chcr_aead_cra_init(struct crypto_aead *tfm)
+ +static int chcr_aead_cra_init(struct crypto_tfm *tfm)
+  {
+++<<<<<<< HEAD
+ +	struct chcr_context *ctx = crypto_tfm_ctx(tfm);
+ +	struct chcr_aead_ctx *aeadctx = AEAD_CTX(ctx);
+ +	struct crypto_alg *alg = tfm->__crt_alg;
+++=======
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
++ 	struct aead_alg *alg = crypto_aead_alg(tfm);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+ -	aeadctx->sw_cipher = crypto_alloc_aead(alg->base.cra_name, 0,
+ +	aeadctx->sw_cipher = crypto_alloc_aead(alg->cra_name, 0,
+  					       CRYPTO_ALG_NEED_FALLBACK |
+  					       CRYPTO_ALG_ASYNC);
+  	if  (IS_ERR(aeadctx->sw_cipher))
+  		return PTR_ERR(aeadctx->sw_cipher);
+ -	crypto_aead_set_reqsize(tfm, max(sizeof(struct chcr_aead_reqctx),
+ +	tfm->crt_aead.reqsize =	max(sizeof(struct chcr_aead_reqctx),
+  				 sizeof(struct aead_request) +
+++<<<<<<< HEAD
+ +				 crypto_aead_reqsize(aeadctx->sw_cipher));
+ +	return chcr_device_init(ctx);
+++=======
++ 				 crypto_aead_reqsize(aeadctx->sw_cipher)));
++ 	return chcr_device_init(a_ctx(tfm));
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  }
+  
+ -static void chcr_aead_cra_exit(struct crypto_aead *tfm)
+ +static void chcr_aead_cra_exit(struct crypto_tfm *tfm)
+  {
+++<<<<<<< HEAD
+ +	struct chcr_context *ctx = crypto_tfm_ctx(tfm);
+ +	struct chcr_aead_ctx *aeadctx = AEAD_CTX(ctx);
+++=======
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	crypto_free_aead(aeadctx->sw_cipher);
+  }
+@@@ -2545,8 -2915,8 +3398,13 @@@ static int chcr_authenc_null_setauthsiz
+  static int chcr_authenc_setauthsize(struct crypto_aead *tfm,
+  				    unsigned int authsize)
+  {
+++<<<<<<< HEAD
+ +	struct chcr_aead_ctx *aeadctx = AEAD_CTX(crypto_aead_ctx(tfm));
+ +	u32 maxauth = crypto_aead_alg(tfm)->maxauthsize;
+++=======
++ 	struct chcr_aead_ctx *aeadctx = AEAD_CTX(a_ctx(tfm));
++ 	u32 maxauth = crypto_aead_maxauthsize(tfm);
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  
+  	/*SHA1 authsize in ipsec is 12 instead of 10 i.e maxauthsize / 2 is not
+  	 * true for sha1. authsize == 12 condition should be before
+diff --cc drivers/crypto/chelsio/chcr_algo.h
+index 583008de51a3,96c9335ee728..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.h
++++ b/drivers/crypto/chelsio/chcr_algo.h
+@@@ -214,27 -214,22 +214,26 @@@
+  					   calc_tx_flits_ofld(skb) * 8), 16)))
+  
+  #define FILL_CMD_MORE(immdatalen) htonl(ULPTX_CMD_V(ULP_TX_SC_IMM) |\
+- 					ULP_TX_SC_MORE_V((immdatalen) ? 0 : 1))
+- 
++ 					ULP_TX_SC_MORE_V((immdatalen)))
+  #define MAX_NK 8
+- #define CRYPTO_MAX_IMM_TX_PKT_LEN 256
+- #define MAX_WR_SIZE			512
+  #define ROUND_16(bytes)		((bytes) & 0xFFFFFFF0)
+  #define MAX_DSGL_ENT			32
+++<<<<<<< HEAD
+ +#define MAX_DIGEST_SKB_SGE	(MAX_SKB_FRAGS - 2)
+++=======
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  #define MIN_CIPHER_SG			1 /* IV */
+- #define MIN_AUTH_SG			2 /*IV + AAD*/
+- #define MIN_GCM_SG			2 /* IV + AAD*/
++ #define MIN_AUTH_SG			1 /* IV */
++ #define MIN_GCM_SG			1 /* IV */
+  #define MIN_DIGEST_SG			1 /*Partial Buffer*/
+- #define MIN_CCM_SG			3 /*IV+AAD+B0*/
++ #define MIN_CCM_SG			2 /*IV+B0*/
+  #define SPACE_LEFT(len) \
+- 	((MAX_WR_SIZE - WR_MIN_LEN - (len)))
++ 	((SGE_MAX_WR_LEN - WR_MIN_LEN - (len)))
+  
+- unsigned int sgl_ent_len[] = {0, 0, 16, 24, 40,
+- 				48, 64, 72, 88,
+- 				96, 112, 120, 136,
+- 				144, 160, 168, 184,
+- 				192};
++ unsigned int sgl_ent_len[] = {0, 0, 16, 24, 40, 48, 64, 72, 88,
++ 				96, 112, 120, 136, 144, 160, 168, 184,
++ 				192, 208, 216, 232, 240, 256, 264, 280,
++ 				288, 304, 312, 328, 336, 352, 360, 376};
+  unsigned int dsgl_ent_len[] = {0, 32, 32, 48, 48, 64, 64, 80, 80,
+  				112, 112, 128, 128, 144, 144, 160, 160,
+  				192, 192, 208, 208, 224, 224, 240, 240,
+@@@ -258,10 -253,8 +257,9 @@@ struct hash_wr_param 
+  
+  struct cipher_wr_param {
+  	struct ablkcipher_request *req;
+- 	struct scatterlist *srcsg;
+  	char *iv;
+  	int bytes;
+ +	short int snent;
+  	unsigned short qid;
+  };
+  enum {
+diff --cc drivers/crypto/chelsio/chcr_crypto.h
+index ee637a7f2f30,94a87e3ad9bc..000000000000
+--- a/drivers/crypto/chelsio/chcr_crypto.h
++++ b/drivers/crypto/chelsio/chcr_crypto.h
+@@@ -165,9 -179,14 +179,19 @@@ struct ablk_ctx 
+  };
+  struct chcr_aead_reqctx {
+  	struct	sk_buff	*skb;
+++<<<<<<< HEAD
+ +	struct scatterlist *dst;
+ +	struct scatterlist *newdstsg;
+++=======
++ 	dma_addr_t iv_dma;
++ 	dma_addr_t b0_dma;
++ 	unsigned int b0_len;
++ 	unsigned int op;
++ 	short int aad_nents;
++ 	short int src_nents;
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	short int dst_nents;
++ 	u16 imm;
+  	u16 verify;
+  	u8 iv[CHCR_MAX_CRYPTO_IV_LEN];
+  	unsigned char scratch_pad[MAX_SCRATCH_PAD_SIZE];
+@@@ -238,15 -280,15 +285,20 @@@ struct chcr_ahash_req_ctx 
+  
+  struct chcr_blkcipher_req_ctx {
+  	struct sk_buff *skb;
+- 	struct scatterlist srcffwd[2];
+- 	struct scatterlist dstffwd[2];
+  	struct scatterlist *dstsg;
+++<<<<<<< HEAD
+ +	struct scatterlist *dst;
+ +	struct scatterlist *newdstsg;
+++=======
+++>>>>>>> 2f47d5804311 (crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver)
+  	unsigned int processed;
+  	unsigned int last_req_len;
++ 	struct scatterlist *srcsg;
++ 	unsigned int src_ofst;
++ 	unsigned int dst_ofst;
+  	unsigned int op;
+- 	short int dst_nents;
++ 	dma_addr_t iv_dma;
++ 	u16 imm;
+  	u8 iv[CHCR_MAX_CRYPTO_IV_LEN];
+  };
+  
+@@@ -288,10 -312,39 +322,43 @@@ static int chcr_aead_op(struct aead_req
+  			  int size,
+  			  create_wr_t create_wr_fn);
+  static inline int get_aead_subtype(struct crypto_aead *aead);
+ +static int is_newsg(struct scatterlist *sgl, unsigned int *newents);
+ +static struct scatterlist *alloc_new_sg(struct scatterlist *sgl,
+ +					unsigned int nents);
+ +static inline void free_new_sg(struct scatterlist *sgl);
+  static int chcr_handle_cipher_resp(struct ablkcipher_request *req,
+  				   unsigned char *input, int err);
++ static void chcr_verify_tag(struct aead_request *req, u8 *input, int *err);
++ static int chcr_aead_dma_map(struct device *dev, struct aead_request *req,
++ 			     unsigned short op_type);
++ static void chcr_aead_dma_unmap(struct device *dev, struct aead_request
++ 				*req, unsigned short op_type);
++ static inline void chcr_add_aead_dst_ent(struct aead_request *req,
++ 				    struct cpl_rx_phys_dsgl *phys_cpl,
++ 				    unsigned int assoclen,
++ 				    unsigned short op_type,
++ 				    unsigned short qid);
++ static inline void chcr_add_aead_src_ent(struct aead_request *req,
++ 				    struct ulptx_sgl *ulptx,
++ 				    unsigned int assoclen,
++ 				    unsigned short op_type);
++ static inline void chcr_add_cipher_src_ent(struct ablkcipher_request *req,
++ 					   struct ulptx_sgl *ulptx,
++ 					   struct  cipher_wr_param *wrparam);
++ static int chcr_cipher_dma_map(struct device *dev,
++ 			       struct ablkcipher_request *req);
++ static void chcr_cipher_dma_unmap(struct device *dev,
++ 				  struct ablkcipher_request *req);
++ static inline void chcr_add_cipher_dst_ent(struct ablkcipher_request *req,
++ 					   struct cpl_rx_phys_dsgl *phys_cpl,
++ 					   struct  cipher_wr_param *wrparam,
++ 					   unsigned short qid);
++ int sg_nents_len_skip(struct scatterlist *sg, u64 len, u64 skip);
++ static inline void chcr_add_hash_src_ent(struct ahash_request *req,
++ 					 struct ulptx_sgl *ulptx,
++ 					 struct hash_wr_param *param);
++ static inline int chcr_hash_dma_map(struct device *dev,
++ 				    struct ahash_request *req);
++ static inline void chcr_hash_dma_unmap(struct device *dev,
++ 				       struct ahash_request *req);
+  #endif /* __CHCR_CRYPTO_H__ */
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
+* Unmerged path drivers/crypto/chelsio/chcr_algo.h
+* Unmerged path drivers/crypto/chelsio/chcr_crypto.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+index a64f3863f5c9..84153607a3a6 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@ -1485,7 +1485,13 @@ int t4_mgmt_tx(struct adapter *adap, struct sk_buff *skb)
+  */
+ static inline int is_ofld_imm(const struct sk_buff *skb)
+ {
+-	return skb->len <= MAX_IMM_TX_PKT_LEN;
++	struct work_request_hdr *req = (struct work_request_hdr *)skb->data;
++	unsigned long opcode = FW_WR_OP_G(ntohl(req->wr_hi));
++
++	if (opcode == FW_CRYPTO_LOOKASIDE_WR)
++		return skb->len <= SGE_MAX_WR_LEN;
++	else
++		return skb->len <= MAX_IMM_TX_PKT_LEN;
+ }
+ 
+ /**
