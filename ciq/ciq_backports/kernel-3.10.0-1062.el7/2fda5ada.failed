@@ -1,0 +1,242 @@
+perf evsel: Introduce per event max_events property
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 2fda5ada07f36f6cde39a52e7f05d86ea8ffdc33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/2fda5ada.failed
+
+This simply adds the field to 'struct perf_evsel' and allows setting
+it via the event parser, to test it lets trace trace:
+
+First look at where in a function that receives an evsel we can put a probe
+to read how evsel->max_events was setup:
+
+  # perf probe -x ~/bin/perf -L trace__event_handler
+  <trace__event_handler@/home/acme/git/perf/tools/perf/builtin-trace.c:0>
+        0  static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
+                                          union perf_event *event __maybe_unused,
+                                          struct perf_sample *sample)
+        3  {
+        4         struct thread *thread = machine__findnew_thread(trace->host, sample->pid, sample->tid);
+        5         int callchain_ret = 0;
+
+        7         if (sample->callchain) {
+        8                 callchain_ret = trace__resolve_callchain(trace, evsel, sample, &callchain_cursor);
+        9                 if (callchain_ret == 0) {
+       10                         if (callchain_cursor.nr < trace->min_stack)
+       11                                 goto out;
+       12                         callchain_ret = 1;
+                          }
+                  }
+
+See what variables we can probe at line 7:
+
+  # perf probe -x ~/bin/perf -V trace__event_handler:7
+  Available variables at trace__event_handler:7
+          @<trace__event_handler+89>
+                  int     callchain_ret
+                  struct perf_evsel*      evsel
+                  struct perf_sample*     sample
+                  struct thread*  thread
+                  struct trace*   trace
+                  union perf_event*       event
+
+Add a probe at that line asking for evsel->max_events to be collected and named
+as "max_events":
+
+  # perf probe -x ~/bin/perf trace__event_handler:7 'max_events=evsel->max_events'
+  Added new event:
+    probe_perf:trace__event_handler (on trace__event_handler:7 in /home/acme/bin/perf with max_events=evsel->max_events)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:trace__event_handler -aR sleep 1
+
+Now use 'perf trace', here aliased to just 'trace' and trace trace, i.e.
+the first 'trace' is tracing just that 'probe_perf:trace__event_handler' event,
+while the traced trace is tracing all scheduler tracepoints, will stop at two
+events (--max-events 2) and will just set evsel->max_events for all the sched
+tracepoints to 9, we will see the output of both traces intermixed:
+
+  # trace -e *perf:*event_handler trace --max-events 2 -e sched:*/nr=9/
+       0.000 :0/0 sched:sched_waking:comm=rcu_sched pid=10 prio=120 target_cpu=000
+       0.009 :0/0 sched:sched_wakeup:comm=rcu_sched pid=10 prio=120 target_cpu=000
+       0.000 trace/23949 probe_perf:trace__event_handler:(48c34a) max_events=0x9
+       0.046 trace/23949 probe_perf:trace__event_handler:(48c34a) max_events=0x9
+  #
+
+Now, if the traced trace sends its output to /dev/null, we'll see just
+what the first level trace outputs: that evsel->max_events is indeed
+being set to 9:
+
+  # trace -e *perf:*event_handler trace -o /dev/null --max-events 2 -e sched:*/nr=9/
+       0.000 trace/23961 probe_perf:trace__event_handler:(48c34a) max_events=0x9
+       0.030 trace/23961 probe_perf:trace__event_handler:(48c34a) max_events=0x9
+  #
+
+Now that we can set evsel->max_events, we can go to the next step, honour that
+per-event property in 'perf trace'.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Milian Wolff <milian.wolff@kdab.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: https://lkml.kernel.org/n/tip-og00yasj276joem6e14l1eas@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 2fda5ada07f36f6cde39a52e7f05d86ea8ffdc33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+#	tools/perf/util/parse-events.c
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.l
+diff --cc tools/perf/util/evsel.c
+index b915d99b2d2e,7e95ec1c19a8..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -232,7 -232,9 +232,8 @@@ void perf_evsel__init(struct perf_evse
+  	evsel->leader	   = evsel;
+  	evsel->unit	   = "";
+  	evsel->scale	   = 1.0;
++ 	evsel->max_events  = ULONG_MAX;
+  	evsel->evlist	   = NULL;
+ -	evsel->bpf_fd	   = -1;
+  	INIT_LIST_HEAD(&evsel->node);
+  	INIT_LIST_HEAD(&evsel->config_terms);
+  	perf_evsel__object.init(evsel);
+@@@ -769,6 -791,12 +770,15 @@@ static void apply_config_terms(struct p
+  		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
+  			dump_size = term->val.stack_user;
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case PERF_EVSEL__CONFIG_TERM_MAX_STACK:
++ 			max_stack = term->val.max_stack;
++ 			break;
++ 		case PERF_EVSEL__CONFIG_TERM_MAX_EVENTS:
++ 			evsel->max_events = term->val.max_events;
++ 			break;
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  		case PERF_EVSEL__CONFIG_TERM_INHERIT:
+  			/*
+  			 * attr->inherit should has already been set by
+diff --cc tools/perf/util/evsel.h
+index 11507b972b56,ad5d615c6db6..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -44,6 -45,8 +44,11 @@@ enum term_type 
+  	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
+  	PERF_EVSEL__CONFIG_TERM_STACK_USER,
+  	PERF_EVSEL__CONFIG_TERM_INHERIT,
+++<<<<<<< HEAD
+++=======
++ 	PERF_EVSEL__CONFIG_TERM_MAX_STACK,
++ 	PERF_EVSEL__CONFIG_TERM_MAX_EVENTS,
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  	PERF_EVSEL__CONFIG_TERM_OVERWRITE,
+  	PERF_EVSEL__CONFIG_TERM_DRV_CFG,
+  	PERF_EVSEL__CONFIG_TERM_BRANCH,
+diff --cc tools/perf/util/parse-events.c
+index 3a084b47700c,59be3466d64d..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -699,6 -925,8 +699,11 @@@ static const char *config_term_names[__
+  	[PARSE_EVENTS__TERM_TYPE_STACKSIZE]		= "stack-size",
+  	[PARSE_EVENTS__TERM_TYPE_NOINHERIT]		= "no-inherit",
+  	[PARSE_EVENTS__TERM_TYPE_INHERIT]		= "inherit",
+++<<<<<<< HEAD
+++=======
++ 	[PARSE_EVENTS__TERM_TYPE_MAX_STACK]		= "max-stack",
++ 	[PARSE_EVENTS__TERM_TYPE_MAX_EVENTS]		= "nr",
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  	[PARSE_EVENTS__TERM_TYPE_OVERWRITE]		= "overwrite",
+  	[PARSE_EVENTS__TERM_TYPE_NOOVERWRITE]		= "no-overwrite",
+  	[PARSE_EVENTS__TERM_TYPE_DRV_CFG]		= "driver-config",
+@@@ -807,6 -1035,12 +812,15 @@@ do {									   
+  	case PARSE_EVENTS__TERM_TYPE_NAME:
+  		CHECK_TYPE_VAL(STR);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case PARSE_EVENTS__TERM_TYPE_MAX_STACK:
++ 		CHECK_TYPE_VAL(NUM);
++ 		break;
++ 	case PARSE_EVENTS__TERM_TYPE_MAX_EVENTS:
++ 		CHECK_TYPE_VAL(NUM);
++ 		break;
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  	default:
+  		err->str = strdup("unknown term");
+  		err->idx = term->err_term;
+@@@ -853,6 -1087,8 +867,11 @@@ static int config_term_tracepoint(struc
+  	case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
+  	case PARSE_EVENTS__TERM_TYPE_INHERIT:
+  	case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
+++<<<<<<< HEAD
+++=======
++ 	case PARSE_EVENTS__TERM_TYPE_MAX_STACK:
++ 	case PARSE_EVENTS__TERM_TYPE_MAX_EVENTS:
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  	case PARSE_EVENTS__TERM_TYPE_OVERWRITE:
+  	case PARSE_EVENTS__TERM_TYPE_NOOVERWRITE:
+  		return config_term_common(attr, term, err);
+@@@ -928,6 -1164,12 +947,15 @@@ do {								
+  		case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
+  			ADD_CONFIG_TERM(INHERIT, inherit, term->val.num ? 0 : 1);
+  			break;
+++<<<<<<< HEAD
+++=======
++ 		case PARSE_EVENTS__TERM_TYPE_MAX_STACK:
++ 			ADD_CONFIG_TERM(MAX_STACK, max_stack, term->val.num);
++ 			break;
++ 		case PARSE_EVENTS__TERM_TYPE_MAX_EVENTS:
++ 			ADD_CONFIG_TERM(MAX_EVENTS, max_events, term->val.num);
++ 			break;
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  		case PARSE_EVENTS__TERM_TYPE_OVERWRITE:
+  			ADD_CONFIG_TERM(OVERWRITE, overwrite, term->val.num ? 1 : 0);
+  			break;
+diff --cc tools/perf/util/parse-events.h
+index 411808bd5db5,5ed035cbcbb7..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -69,6 -70,8 +69,11 @@@ enum 
+  	PARSE_EVENTS__TERM_TYPE_STACKSIZE,
+  	PARSE_EVENTS__TERM_TYPE_NOINHERIT,
+  	PARSE_EVENTS__TERM_TYPE_INHERIT,
+++<<<<<<< HEAD
+++=======
++ 	PARSE_EVENTS__TERM_TYPE_MAX_STACK,
++ 	PARSE_EVENTS__TERM_TYPE_MAX_EVENTS,
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  	PARSE_EVENTS__TERM_TYPE_NOOVERWRITE,
+  	PARSE_EVENTS__TERM_TYPE_OVERWRITE,
+  	PARSE_EVENTS__TERM_TYPE_DRV_CFG,
+diff --cc tools/perf/util/parse-events.l
+index 32c8c241ab5c,7805c71aaae2..000000000000
+--- a/tools/perf/util/parse-events.l
++++ b/tools/perf/util/parse-events.l
+@@@ -207,6 -268,8 +207,11 @@@ branch_type		{ return term(yyscanner, P
+  time			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_TIME); }
+  call-graph		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CALLGRAPH); }
+  stack-size		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_STACKSIZE); }
+++<<<<<<< HEAD
+++=======
++ max-stack		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_MAX_STACK); }
++ nr			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_MAX_EVENTS); }
+++>>>>>>> 2fda5ada07f3 (perf evsel: Introduce per event max_events property)
+  inherit			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_INHERIT); }
+  no-inherit		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOINHERIT); }
+  overwrite		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_OVERWRITE); }
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/parse-events.c
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.l
