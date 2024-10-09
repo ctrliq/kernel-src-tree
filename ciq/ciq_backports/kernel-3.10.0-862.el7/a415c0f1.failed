@@ -1,0 +1,131 @@
+md: initialise ->writes_pending in personality modules.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] initialise ->writes_pending in personality modules (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 95.24%
+commit-author NeilBrown <neilb@suse.com>
+commit a415c0f10627913793709ddb75add09d2ea334dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a415c0f1.failed
+
+The new per-cpu counter for writes_pending is initialised in
+md_alloc(), which is not called by dm-raid.
+So dm-raid fails when md_write_start() is called.
+
+Move the initialization to the personality modules
+that need it.  This way it is always initialised when needed,
+but isn't unnecessarily initialized (requiring memory allocation)
+when the personality doesn't use writes_pending.
+
+	Reported-by: Heinz Mauelshagen <heinzm@redhat.com>
+Fixes: 4ad23a976413 ("MD: use per-cpu counter for writes_pending")
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit a415c0f10627913793709ddb75add09d2ea334dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/md.h
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,87edc342ccb3..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -5091,8 -5172,31 +5091,25 @@@ static void mddev_delayed_delete(struc
+  	kobject_put(&mddev->kobj);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void no_op(struct percpu_ref *r) {}
++ 
++ int mddev_init_writes_pending(struct mddev *mddev)
++ {
++ 	if (mddev->writes_pending.percpu_count_ptr)
++ 		return 0;
++ 	if (percpu_ref_init(&mddev->writes_pending, no_op, 0, GFP_KERNEL) < 0)
++ 		return -ENOMEM;
++ 	/* We want to start with the refcount at zero */
++ 	percpu_ref_put(&mddev->writes_pending);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(mddev_init_writes_pending);
++ 
+++>>>>>>> a415c0f10627 (md: initialise ->writes_pending in personality modules.)
+  static int md_alloc(dev_t dev, char *name)
+  {
+ -	/*
+ -	 * If dev is zero, name is the name of a device to allocate with
+ -	 * an arbitrary minor number.  It will be "md_???"
+ -	 * If dev is non-zero it must be a device number with a MAJOR of
+ -	 * MD_MAJOR or mdp_major.  In this case, if "name" is NULL, then
+ -	 * the device is being created by opening a node in /dev.
+ -	 * If "name" is not NULL, the device is being created by
+ -	 * writing to /sys/module/md_mod/parameters/new_array.
+ -	 */
+  	static DEFINE_MUTEX(disks_mutex);
+  	struct mddev *mddev = mddev_find(dev);
+  	struct gendisk *disk;
+diff --cc drivers/md/md.h
+index 0d13bf88f41f,0fa1de42c42b..000000000000
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@@ -649,7 -648,9 +649,13 @@@ extern void md_unregister_thread(struc
+  extern void md_wakeup_thread(struct md_thread *thread);
+  extern void md_check_recovery(struct mddev *mddev);
+  extern void md_reap_sync_thread(struct mddev *mddev);
+++<<<<<<< HEAD
+ +extern bool md_write_start(struct mddev *mddev, struct bio *bi);
+++=======
++ extern int mddev_init_writes_pending(struct mddev *mddev);
++ extern void md_write_start(struct mddev *mddev, struct bio *bi);
++ extern void md_write_inc(struct mddev *mddev, struct bio *bi);
+++>>>>>>> a415c0f10627 (md: initialise ->writes_pending in personality modules.)
+  extern void md_write_end(struct mddev *mddev);
+  extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
+  extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/md.h
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index 481b2b2701df..a9f5a19aec46 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -3083,6 +3083,8 @@ static int raid1_run(struct mddev *mddev)
+ 			mdname(mddev));
+ 		return -EIO;
+ 	}
++	if (mddev_init_writes_pending(mddev) < 0)
++		return -ENOMEM;
+ 	/*
+ 	 * copy the already verified devices into our private RAID1
+ 	 * bookkeeping area. [whatever we allocate in run(),
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 9928c2ec9859..444426d6ad83 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3763,6 +3763,9 @@ static int raid10_run(struct mddev *mddev)
+ 	int first = 1;
+ 	bool discard_supported = false;
+ 
++	if (mddev_init_writes_pending(mddev) < 0)
++		return -ENOMEM;
++
+ 	if (mddev->private == NULL) {
+ 		conf = setup_conf(mddev);
+ 		if (IS_ERR(conf))
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index aa86463a5e50..b6744905cb99 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6952,6 +6952,9 @@ static int raid5_run(struct mddev *mddev)
+ 	long long min_offset_diff = 0;
+ 	int first = 1;
+ 
++	if (mddev_init_writes_pending(mddev) < 0)
++		return -ENOMEM;
++
+ 	if (mddev->recovery_cp != MaxSector)
+ 		pr_notice("md/raid:%s: not clean -- starting background reconstruction\n",
+ 			  mdname(mddev));
