@@ -1,0 +1,188 @@
+qed*: Fix link indication race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 65ed2ffd640578166e4ec149573bcf1d10f81b81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/65ed2ffd.failed
+
+Driver changes the link properties via communication with
+the management firmware, and re-reads the resulting link status
+when it receives an indication that the link has changed.
+However, there are certain scenarios where such indications
+might be missing, and so driver also re-reads the current link
+results without attention in several places. Specifically, it
+does so during load and when resetting the link.
+
+This creates a race where driver might reflect incorrect
+link status - e.g., when explicit reading of the link status is
+switched by attention with the changed configuration.
+
+Correct this flow by a lock syncronizing the handling of the
+link indications [both explicit requests and attention].
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 65ed2ffd640578166e4ec149573bcf1d10f81b81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.h
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.h
+index 1738d5bd2e8e,fc08cc2da6a7..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.h
+@@@ -245,6 -253,8 +245,11 @@@ enum qed_iov_wq_flag 
+  	QED_IOV_WQ_BULLETIN_UPDATE_FLAG,
+  	QED_IOV_WQ_STOP_WQ_FLAG,
+  	QED_IOV_WQ_FLR_FLAG,
+++<<<<<<< HEAD
+++=======
++ 	QED_IOV_WQ_TRUST_FLAG,
++ 	QED_IOV_WQ_VF_FORCE_LINK_QUERY_FLAG,
+++>>>>>>> 65ed2ffd6405 (qed*: Fix link indication race)
+  };
+  
+  #ifdef CONFIG_QED_SRIOV
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_main.c b/drivers/net/ethernet/qlogic/qed/qed_main.c
+index bc7d22e77730..10a31d0e7055 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -1133,12 +1133,18 @@ static int qed_set_link(struct qed_dev *cdev, struct qed_link_params *params)
+ 	if (!cdev)
+ 		return -ENODEV;
+ 
+-	if (IS_VF(cdev))
+-		return 0;
+-
+ 	/* The link should be set only once per PF */
+ 	hwfn = &cdev->hwfns[0];
+ 
++	/* When VF wants to set link, force it to read the bulletin instead.
++	 * This mimics the PF behavior, where a noitification [both immediate
++	 * and possible later] would be generated when changing properties.
++	 */
++	if (IS_VF(cdev)) {
++		qed_schedule_iov(hwfn, QED_IOV_WQ_VF_FORCE_LINK_QUERY_FLAG);
++		return 0;
++	}
++
+ 	ptt = qed_ptt_acquire(hwfn);
+ 	if (!ptt)
+ 		return -EBUSY;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.c b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index 8f3f22c23d15..c5c237b4e5d3 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -192,6 +192,7 @@ int qed_mcp_cmd_init(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ 
+ 	/* Initialize the MFW spinlock */
+ 	spin_lock_init(&p_info->lock);
++	spin_lock_init(&p_info->link_lock);
+ 
+ 	return 0;
+ 
+@@ -610,6 +611,9 @@ static void qed_mcp_handle_link_change(struct qed_hwfn *p_hwfn,
+ 	u8 max_bw, min_bw;
+ 	u32 status = 0;
+ 
++	/* Prevent SW/attentions from doing this at the same time */
++	spin_lock_bh(&p_hwfn->mcp_info->link_lock);
++
+ 	p_link = &p_hwfn->mcp_info->link_output;
+ 	memset(p_link, 0, sizeof(*p_link));
+ 	if (!b_reset) {
+@@ -624,7 +628,7 @@ static void qed_mcp_handle_link_change(struct qed_hwfn *p_hwfn,
+ 	} else {
+ 		DP_VERBOSE(p_hwfn, NETIF_MSG_LINK,
+ 			   "Resetting link indications\n");
+-		return;
++		goto out;
+ 	}
+ 
+ 	if (p_hwfn->b_drv_link_init)
+@@ -731,6 +735,8 @@ static void qed_mcp_handle_link_change(struct qed_hwfn *p_hwfn,
+ 	p_link->sfp_tx_fault = !!(status & LINK_STATUS_SFP_TX_FAULT);
+ 
+ 	qed_link_update(p_hwfn);
++out:
++	spin_unlock_bh(&p_hwfn->mcp_info->link_lock);
+ }
+ 
+ int qed_mcp_set_link(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt, bool b_up)
+@@ -780,9 +786,13 @@ int qed_mcp_set_link(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt, bool b_up)
+ 		return rc;
+ 	}
+ 
+-	/* Reset the link status if needed */
+-	if (!b_up)
+-		qed_mcp_handle_link_change(p_hwfn, p_ptt, true);
++	/* Mimic link-change attention, done for several reasons:
++	 *  - On reset, there's no guarantee MFW would trigger
++	 *    an attention.
++	 *  - On initialization, older MFWs might not indicate link change
++	 *    during LFA, so we'll never get an UP indication.
++	 */
++	qed_mcp_handle_link_change(p_hwfn, p_ptt, !b_up);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.h b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+index f2623df65ec2..bdbfd6d4485e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -484,7 +484,13 @@ int qed_mcp_bist_nvm_test_get_image_att(struct qed_hwfn *p_hwfn,
+ 				  qed_device_num_engines((_p_hwfn)->cdev)))
+ 
+ struct qed_mcp_info {
++	/* Spinlock used for protecting the access to the MFW mailbox */
+ 	spinlock_t				lock;
++
++	/* Spinlock used for syncing SW link-changes and link-changes
++	 * originating from attention context.
++	 */
++	spinlock_t				link_lock;
+ 	bool					block_mb_sending;
+ 	u32					public_base;
+ 	u32					drv_mb_addr;
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.h
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.c b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+index 9667059b15bd..15d2855ec563 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@ -1285,6 +1285,9 @@ void qed_iov_vf_task(struct work_struct *work)
+ 
+ 	/* Handle bulletin board changes */
+ 	qed_vf_read_bulletin(hwfn, &change);
++	if (test_and_clear_bit(QED_IOV_WQ_VF_FORCE_LINK_QUERY_FLAG,
++			       &hwfn->iov_task_flags))
++		change = 1;
+ 	if (change)
+ 		qed_handle_bulletin_change(hwfn);
+ 
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index ca645148d03f..9432523de8cf 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -1804,7 +1804,6 @@ static int qede_load(struct qede_dev *edev, enum qede_load_mode mode,
+ 		     bool is_locked)
+ {
+ 	struct qed_link_params link_params;
+-	struct qed_link_output link_output;
+ 	int rc;
+ 
+ 	DP_INFO(edev, "Starting qede load\n");
+@@ -1856,11 +1855,7 @@ static int qede_load(struct qede_dev *edev, enum qede_load_mode mode,
+ 	link_params.link_up = true;
+ 	edev->ops->common->set_link(edev->cdev, &link_params);
+ 
+-	/* Query whether link is already-up */
+-	memset(&link_output, 0, sizeof(link_output));
+-	edev->ops->common->get_link(edev->cdev, &link_output);
+ 	qede_roce_dev_event_open(edev);
+-	qede_link_update(edev, &link_output);
+ 
+ 	qede_ptp_start(edev, (mode == QEDE_LOAD_NORMAL));
+ 
