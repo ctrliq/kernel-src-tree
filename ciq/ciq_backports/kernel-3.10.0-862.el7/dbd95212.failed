@@ -1,0 +1,206 @@
+seccomp: introduce writer locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kees Cook <keescook@chromium.org>
+commit dbd952127d11bb44a4ea30b08cc60531b6a23d71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dbd95212.failed
+
+Normally, task_struct.seccomp.filter is only ever read or modified by
+the task that owns it (current). This property aids in fast access
+during system call filtering as read access is lockless.
+
+Updating the pointer from another task, however, opens up race
+conditions. To allow cross-thread filter pointer updates, writes to the
+seccomp fields are now protected by the sighand spinlock (which is shared
+by all threads in the thread group). Read access remains lockless because
+pointer updates themselves are atomic.  However, writes (or cloning)
+often entail additional checking (like maximum instruction counts)
+which require locking to perform safely.
+
+In the case of cloning threads, the child is invisible to the system
+until it enters the task list. To make sure a child can't be cloned from
+a thread and left in a prior state, seccomp duplication is additionally
+moved under the sighand lock. Then parent and child are certain have
+the same seccomp state when they exit the lock.
+
+Based on patches by Will Drewry and David Drysdale.
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Andy Lutomirski <luto@amacapital.net>
+(cherry picked from commit dbd952127d11bb44a4ea30b08cc60531b6a23d71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+#	kernel/seccomp.c
+diff --cc kernel/fork.c
+index d1ed92efc038,ed4bc339c9dc..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1183,13 -1090,37 +1192,47 @@@ static int copy_signal(unsigned long cl
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void copy_flags(unsigned long clone_flags, struct task_struct *p)
+ +{
+ +	unsigned long new_flags = p->flags;
+ +
+ +	new_flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER);
+ +	new_flags |= PF_FORKNOEXEC;
+ +	p->flags = new_flags;
+++=======
++ static void copy_seccomp(struct task_struct *p)
++ {
++ #ifdef CONFIG_SECCOMP
++ 	/*
++ 	 * Must be called with sighand->lock held, which is common to
++ 	 * all threads in the group. Holding cred_guard_mutex is not
++ 	 * needed because this new task is not yet running and cannot
++ 	 * be racing exec.
++ 	 */
++ 	BUG_ON(!spin_is_locked(&current->sighand->siglock));
++ 
++ 	/* Ref-count the new filter user, and assign it. */
++ 	get_seccomp_filter(current);
++ 	p->seccomp = current->seccomp;
++ 
++ 	/*
++ 	 * Explicitly enable no_new_privs here in case it got set
++ 	 * between the task_struct being duplicated and holding the
++ 	 * sighand lock. The seccomp state and nnp must be in sync.
++ 	 */
++ 	if (task_no_new_privs(current))
++ 		task_set_no_new_privs(p);
++ 
++ 	/*
++ 	 * If the parent gained a seccomp mode after copying thread
++ 	 * flags and between before we held the sighand lock, we have
++ 	 * to manually enable the seccomp thread flag here.
++ 	 */
++ 	if (p->seccomp.mode != SECCOMP_MODE_DISABLED)
++ 		set_tsk_thread_flag(p, TIF_SECCOMP);
++ #endif
+++>>>>>>> dbd952127d11 (seccomp: introduce writer locking)
+  }
+  
+  SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr)
+diff --cc kernel/seccomp.c
+index dab81904040f,d5543e787e4e..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -325,9 -326,43 +329,47 @@@ long seccomp_attach_user_filter(char __
+  #endif
+  	if (copy_from_user(&fprog, user_filter, sizeof(fprog)))
+  		goto out;
+ -	filter = seccomp_prepare_filter(&fprog);
+ +	ret = seccomp_attach_filter(&fprog);
+  out:
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	return filter;
++ }
++ 
++ /**
++  * seccomp_attach_filter: validate and attach filter
++  * @flags:  flags to change filter behavior
++  * @filter: seccomp filter to add to the current process
++  *
++  * Caller must be holding current->sighand->siglock lock.
++  *
++  * Returns 0 on success, -ve on error.
++  */
++ static long seccomp_attach_filter(unsigned int flags,
++ 				  struct seccomp_filter *filter)
++ {
++ 	unsigned long total_insns;
++ 	struct seccomp_filter *walker;
++ 
++ 	BUG_ON(!spin_is_locked(&current->sighand->siglock));
++ 
++ 	/* Validate resulting filter length. */
++ 	total_insns = filter->prog->len;
++ 	for (walker = current->seccomp.filter; walker; walker = walker->prev)
++ 		total_insns += walker->prog->len + 4;  /* 4 instr penalty */
++ 	if (total_insns > MAX_INSNS_PER_PATH)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * If there is an existing filter, make it the prev and don't drop its
++ 	 * task reference.
++ 	 */
++ 	filter->prev = current->seccomp.filter;
++ 	current->seccomp.filter = filter;
++ 
++ 	return 0;
+++>>>>>>> dbd952127d11 (seccomp: introduce writer locking)
+  }
+  
+  /* get_seccomp_filter - increments the reference count of the filter on @tsk */
+@@@ -521,11 -568,24 +566,25 @@@ out
+   *
+   * Returns 0 on success or -EINVAL on failure.
+   */
+ -static long seccomp_set_mode_filter(unsigned int flags,
+ -				    const char __user *filter)
+ +static long seccomp_set_mode_filter(char __user *filter)
+  {
+  	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
+ -	struct seccomp_filter *prepared = NULL;
+  	long ret = -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Validate flags. */
++ 	if (flags != 0)
++ 		return -EINVAL;
++ 
++ 	/* Prepare the new filter before holding any locks. */
++ 	prepared = seccomp_prepare_user_filter(filter);
++ 	if (IS_ERR(prepared))
++ 		return PTR_ERR(prepared);
++ 
++ 	spin_lock_irq(&current->sighand->siglock);
++ 
+++>>>>>>> dbd952127d11 (seccomp: introduce writer locking)
+  	if (!seccomp_may_assign_mode(seccomp_mode))
+  		goto out;
+  
+@@@ -535,6 -595,10 +594,11 @@@
+  
+  	seccomp_assign_mode(seccomp_mode);
+  out:
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 	seccomp_filter_free(prepared);
+++>>>>>>> dbd952127d11 (seccomp: introduce writer locking)
+  	return ret;
+  }
+  #else
+diff --git a/include/linux/seccomp.h b/include/linux/seccomp.h
+index 6f19cfd1840e..9ab63a574d40 100644
+--- a/include/linux/seccomp.h
++++ b/include/linux/seccomp.h
+@@ -14,11 +14,11 @@ struct seccomp_filter;
+  *
+  * @mode:  indicates one of the valid values above for controlled
+  *         system calls available to a process.
+- * @filter: The metadata and ruleset for determining what system calls
+- *          are allowed for a task.
++ * @filter: must always point to a valid seccomp-filter or NULL as it is
++ *          accessed without locking during system call entry.
+  *
+  *          @filter must only be accessed from the context of current as there
+- *          is no locking.
++ *          is no read locking.
+  */
+ struct seccomp {
+ 	int mode;
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/seccomp.c
