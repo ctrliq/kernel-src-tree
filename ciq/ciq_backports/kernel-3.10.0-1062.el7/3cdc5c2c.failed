@@ -1,0 +1,168 @@
+perf parse-events: Handle uncore event aliases in small groups properly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 3cdc5c2cb924acb43a93241e75c61570eab71614
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3cdc5c2c.failed
+
+Perf stat doesn't count the uncore event aliases from the same uncore
+block in a group, for example:
+
+  perf stat -e '{unc_m_cas_count.all,unc_m_clockticks}' -a -I 1000
+  #           time             counts unit events
+       1.000447342      <not counted>      unc_m_cas_count.all
+       1.000447342      <not counted>      unc_m_clockticks
+       2.000740654      <not counted>      unc_m_cas_count.all
+       2.000740654      <not counted>      unc_m_clockticks
+
+The output is very misleading. It gives a wrong impression that the
+uncore event doesn't work.
+
+An uncore block could be composed by several PMUs. An uncore event alias
+is a joint name which means the same event runs on all PMUs of a block.
+Perf doesn't support mixed events from different PMUs in the same group.
+It is wrong to put uncore event aliases in a big group.
+
+The right way is to split the big group into multiple small groups which
+only include the events from the same PMU.
+
+Only uncore event aliases from the same uncore block should be specially
+handled here. It doesn't make sense to mix the uncore events with other
+uncore events from different blocks or even core events in a group.
+
+With the patch:
+  #           time             counts unit events
+     1.001557653            140,833      unc_m_cas_count.all
+     1.001557653      1,330,231,332      unc_m_clockticks
+     2.002709483             85,007      unc_m_cas_count.all
+     2.002709483      1,429,494,563      unc_m_clockticks
+
+	Reported-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Agustin Vega-Frias <agustinv@codeaurora.org>
+	Cc: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+	Cc: Jin Yao <yao.jin@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Shaokun Zhang <zhangshaokun@hisilicon.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+Link: http://lkml.kernel.org/r/1525727623-19768-1-git-send-email-kan.liang@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 3cdc5c2cb924acb43a93241e75c61570eab71614)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/parse-events.c
+#	tools/perf/util/parse-events.h
+#	tools/perf/util/parse-events.y
+diff --cc tools/perf/util/parse-events.c
+index abd6a0780f61,2fc4ee8b86c1..000000000000
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@@ -983,9 -1217,11 +983,11 @@@ int parse_events_add_numeric(struct par
+  			 get_config_name(head_config), &config_terms);
+  }
+  
+ -int parse_events_add_pmu(struct parse_events_state *parse_state,
+ +static int __parse_events_add_pmu(struct parse_events_state *parse_state,
+  			 struct list_head *list, char *name,
+- 			 struct list_head *head_config, bool auto_merge_stats)
++ 			 struct list_head *head_config,
++ 			 bool auto_merge_stats,
++ 			 bool use_alias)
+  {
+  	struct perf_event_attr attr;
+  	struct perf_pmu_info info;
+@@@ -1089,8 -1323,9 +1096,14 @@@ int parse_events_multi_pmu_add(struct p
+  					return -1;
+  				list_add_tail(&term->list, head);
+  
+++<<<<<<< HEAD
+ +				if (!__parse_events_add_pmu(parse_state, list,
+ +							    pmu->name, head, true)) {
+++=======
++ 				if (!parse_events_add_pmu(parse_state, list,
++ 							  pmu->name, head,
++ 							  true, true)) {
+++>>>>>>> 3cdc5c2cb924 (perf parse-events: Handle uncore event aliases in small groups properly)
+  					pr_debug("%s -> %s/%s/\n", str,
+  						 pmu->name, alias->str);
+  					ok++;
+diff --cc tools/perf/util/parse-events.h
+index 411808bd5db5,4473dac27aee..000000000000
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@@ -143,7 -167,9 +143,13 @@@ int parse_events_add_breakpoint(struct 
+  				void *ptr, char *type, u64 len);
+  int parse_events_add_pmu(struct parse_events_state *parse_state,
+  			 struct list_head *list, char *name,
+++<<<<<<< HEAD
+ +			 struct list_head *head_config);
+++=======
++ 			 struct list_head *head_config,
++ 			 bool auto_merge_stats,
++ 			 bool use_alias);
+++>>>>>>> 3cdc5c2cb924 (perf parse-events: Handle uncore event aliases in small groups properly)
+  
+  int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
+  			       char *str,
+diff --cc tools/perf/util/parse-events.y
+index b7975dc972b1,e37608a87dba..000000000000
+--- a/tools/perf/util/parse-events.y
++++ b/tools/perf/util/parse-events.y
+@@@ -221,9 -232,13 +221,13 @@@ PE_NAME opt_event_confi
+  		YYABORT;
+  
+  	ALLOC_LIST(list);
+++<<<<<<< HEAD
+ +	if (parse_events_add_pmu(_parse_state, list, $1, $2)) {
+++=======
++ 	if (parse_events_add_pmu(_parse_state, list, $1, $2, false, false)) {
+++>>>>>>> 3cdc5c2cb924 (perf parse-events: Handle uncore event aliases in small groups properly)
+  		struct perf_pmu *pmu = NULL;
+  		int ok = 0;
+ -		char *pattern;
+ -
+ -		if (asprintf(&pattern, "%s*", $1) < 0)
+ -			YYABORT;
+  
+  		while ((pmu = perf_pmu__scan(pmu)) != NULL) {
+  			char *name = pmu->name;
+@@@ -231,10 -246,12 +235,15 @@@
+  			if (!strncmp(name, "uncore_", 7) &&
+  			    strncmp($1, "uncore_", 7))
+  				name += 7;
+ -			if (!fnmatch(pattern, name, 0)) {
+ -				if (parse_events_copy_term_list(orig_terms, &terms)) {
+ -					free(pattern);
+ +			if (!strncmp($1, name, strlen($1))) {
+ +				if (parse_events_copy_term_list(orig_terms, &terms))
+  					YYABORT;
+++<<<<<<< HEAD
+ +				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms))
+++=======
++ 				}
++ 				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms, true, false))
+++>>>>>>> 3cdc5c2cb924 (perf parse-events: Handle uncore event aliases in small groups properly)
+  					ok++;
+  				parse_events_terms__delete(terms);
+  			}
+diff --git a/tools/perf/util/evsel.h b/tools/perf/util/evsel.h
+index 90c15ad9578f..86b52e19a19a 100644
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@ -124,6 +124,7 @@ struct perf_evsel {
+ 	bool			precise_max;
+ 	bool			ignore_missing_thread;
+ 	bool			forced_leader;
++	bool			use_uncore_alias;
+ 	/* parse modifier helper */
+ 	int			exclude_GH;
+ 	int			nr_members;
+* Unmerged path tools/perf/util/parse-events.c
+* Unmerged path tools/perf/util/parse-events.h
+* Unmerged path tools/perf/util/parse-events.y
