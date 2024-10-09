@@ -52,7 +52,7 @@ static i40e_status i40e_alloc_adminq_asq_ring(struct i40e_hw *hw)
 					 i40e_mem_atq_ring,
 					 (hw->aq.num_asq_entries *
 					 sizeof(struct i40e_aq_desc)),
-					 I40E_ADMINQ_DESC_ALIGNMENT);
+					 IAVF_ADMINQ_DESC_ALIGNMENT);
 	if (ret_code)
 		return ret_code;
 
@@ -79,7 +79,7 @@ static i40e_status i40e_alloc_adminq_arq_ring(struct i40e_hw *hw)
 					 i40e_mem_arq_ring,
 					 (hw->aq.num_arq_entries *
 					 sizeof(struct i40e_aq_desc)),
-					 I40E_ADMINQ_DESC_ALIGNMENT);
+					 IAVF_ADMINQ_DESC_ALIGNMENT);
 
 	return ret_code;
 }
@@ -136,12 +136,12 @@ static i40e_status i40e_alloc_arq_bufs(struct i40e_hw *hw)
 		ret_code = i40e_allocate_dma_mem(hw, bi,
 						 i40e_mem_arq_buf,
 						 hw->aq.arq_buf_size,
-						 I40E_ADMINQ_DESC_ALIGNMENT);
+						 IAVF_ADMINQ_DESC_ALIGNMENT);
 		if (ret_code)
 			goto unwind_alloc_arq_bufs;
 
 		/* now configure the descriptors for use */
-		desc = I40E_ADMINQ_DESC(hw->aq.arq, i);
+		desc = IAVF_ADMINQ_DESC(hw->aq.arq, i);
 
 		desc->flags = cpu_to_le16(I40E_AQ_FLAG_BUF);
 		if (hw->aq.arq_buf_size > I40E_AQ_LARGE_BUF)
@@ -198,7 +198,7 @@ static i40e_status i40e_alloc_asq_bufs(struct i40e_hw *hw)
 		ret_code = i40e_allocate_dma_mem(hw, bi,
 						 i40e_mem_asq_buf,
 						 hw->aq.asq_buf_size,
-						 I40E_ADMINQ_DESC_ALIGNMENT);
+						 IAVF_ADMINQ_DESC_ALIGNMENT);
 		if (ret_code)
 			goto unwind_alloc_asq_bufs;
 	}
@@ -589,7 +589,7 @@ static u16 i40e_clean_asq(struct i40e_hw *hw)
 	struct i40e_aq_desc desc_cb;
 	struct i40e_aq_desc *desc;
 
-	desc = I40E_ADMINQ_DESC(*asq, ntc);
+	desc = IAVF_ADMINQ_DESC(*asq, ntc);
 	details = I40E_ADMINQ_DETAILS(*asq, ntc);
 	while (rd32(hw, hw->aq.asq.head) != ntc) {
 		i40e_debug(hw, I40E_DEBUG_AQ_MESSAGE,
@@ -607,7 +607,7 @@ static u16 i40e_clean_asq(struct i40e_hw *hw)
 		ntc++;
 		if (ntc == asq->count)
 			ntc = 0;
-		desc = I40E_ADMINQ_DESC(*asq, ntc);
+		desc = IAVF_ADMINQ_DESC(*asq, ntc);
 		details = I40E_ADMINQ_DETAILS(*asq, ntc);
 	}
 
@@ -731,7 +731,7 @@ i40e_status i40evf_asq_send_command(struct i40e_hw *hw,
 	}
 
 	/* initialize the temp desc pointer with the right desc */
-	desc_on_ring = I40E_ADMINQ_DESC(hw->aq.asq, hw->aq.asq.next_to_use);
+	desc_on_ring = IAVF_ADMINQ_DESC(hw->aq.asq, hw->aq.asq.next_to_use);
 
 	/* if the desc is available copy the temp desc to the right place */
 	*desc_on_ring = *desc;
@@ -893,7 +893,7 @@ i40e_status i40evf_clean_arq_element(struct i40e_hw *hw,
 	}
 
 	/* now clean the next descriptor */
-	desc = I40E_ADMINQ_DESC(hw->aq.arq, ntc);
+	desc = IAVF_ADMINQ_DESC(hw->aq.arq, ntc);
 	desc_idx = ntc;
 
 	hw->aq.arq_last_status =
