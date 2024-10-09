@@ -1,0 +1,154 @@
+cpufreq: intel_pstate: Skip unnecessary PID resets on init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Skip unnecessary PID resets on init (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 91.59%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 694cb173475a048a05daebf27cc8fdb7865c158b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/694cb173.failed
+
+PID controller parameters only need to be initialized if the
+get_target_pstate_use_performance() P-state selection routine
+is going to be used.  It is not necessary to initialize them
+otherwise, so don't do that.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 694cb173475a048a05daebf27cc8fdb7865c158b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b6f8db18a31a,ee61db93163c..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1398,35 -1917,101 +1400,39 @@@ static int intel_pstate_init_cpu(unsign
+  
+  	intel_pstate_get_cpu_pstates(cpu);
+  
+ -	pr_debug("controlling: cpu %d\n", cpunum);
+ -
+ -	return 0;
+ -}
+ -
+ -static unsigned int intel_pstate_get(unsigned int cpu_num)
+ -{
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+ -
+ -	return cpu ? get_avg_frequency(cpu) : 0;
+ -}
+ -
+ -static void intel_pstate_set_update_util_hook(unsigned int cpu_num)
+ -{
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+++<<<<<<< HEAD
+ +	init_timer_deferrable(&cpu->timer);
+ +	cpu->timer.data = (unsigned long)cpu;
+ +	cpu->timer.expires = jiffies + HZ/100;
+  
+ -	if (cpu->update_util_set)
+ -		return;
+ -
+ -	/* Prevent intel_pstate_update_util() from using stale data. */
+ -	cpu->sample.time = 0;
+ -	cpufreq_add_update_util_hook(cpu_num, &cpu->update_util,
+ -				     intel_pstate_update_util);
+ -	cpu->update_util_set = true;
+ -}
+ +	if (!hwp_active)
+ +		cpu->timer.function = intel_pstate_timer_func;
+ +	else
+ +		cpu->timer.function = intel_hwp_timer_func;
+  
+ -static void intel_pstate_clear_update_util_hook(unsigned int cpu)
+ -{
+ -	struct cpudata *cpu_data = all_cpu_data[cpu];
+ +	intel_pstate_busy_pid_reset(cpu);
+ +	intel_pstate_sample(cpu);
+  
+ -	if (!cpu_data->update_util_set)
+ -		return;
+ +	add_timer_on(&cpu->timer, cpunum);
+  
+ -	cpufreq_remove_update_util_hook(cpu);
+ -	cpu_data->update_util_set = false;
+ -	synchronize_sched();
+ -}
+ +	pr_debug("Intel pstate controlling: cpu %d\n", cpunum);
+++=======
+++	pr_debug("controlling: cpu %d\n", cpunum);
+++>>>>>>> 694cb173475a (cpufreq: intel_pstate: Skip unnecessary PID resets on init)
+  
+ -static int intel_pstate_get_max_freq(struct cpudata *cpu)
+ -{
+ -	return global.turbo_disabled || global.no_turbo ?
+ -			cpu->pstate.max_freq : cpu->pstate.turbo_freq;
+ +	return 0;
+  }
+  
+ -static void intel_pstate_update_perf_limits(struct cpufreq_policy *policy,
+ -					    struct cpudata *cpu)
+ +static unsigned int intel_pstate_get(unsigned int cpu_num)
+  {
+ -	int max_freq = intel_pstate_get_max_freq(cpu);
+ -	int32_t max_policy_perf, min_policy_perf;
+ -
+ -	max_policy_perf = div_ext_fp(policy->max, max_freq);
+ -	max_policy_perf = clamp_t(int32_t, max_policy_perf, 0, int_ext_tofp(1));
+ -	if (policy->max == policy->min) {
+ -		min_policy_perf = max_policy_perf;
+ -	} else {
+ -		min_policy_perf = div_ext_fp(policy->min, max_freq);
+ -		min_policy_perf = clamp_t(int32_t, min_policy_perf,
+ -					  0, max_policy_perf);
+ -	}
+ -
+ -	/* Normalize user input to [min_perf, max_perf] */
+ -	if (per_cpu_limits) {
+ -		cpu->min_perf = min_policy_perf;
+ -		cpu->max_perf = max_policy_perf;
+ -	} else {
+ -		int32_t global_min, global_max;
+ -
+ -		/* Global limits are in percent of the maximum turbo P-state. */
+ -		global_max = percent_ext_fp(global.max_perf_pct);
+ -		global_min = percent_ext_fp(global.min_perf_pct);
+ -		if (max_freq != cpu->pstate.turbo_freq) {
+ -			int32_t turbo_factor;
+ -
+ -			turbo_factor = div_ext_fp(cpu->pstate.turbo_pstate,
+ -						  cpu->pstate.max_pstate);
+ -			global_min = mul_ext_fp(global_min, turbo_factor);
+ -			global_max = mul_ext_fp(global_max, turbo_factor);
+ -		}
+ -		global_min = clamp_t(int32_t, global_min, 0, global_max);
+ -
+ -		cpu->min_perf = max(min_policy_perf, global_min);
+ -		cpu->min_perf = min(cpu->min_perf, max_policy_perf);
+ -		cpu->max_perf = min(max_policy_perf, global_max);
+ -		cpu->max_perf = max(min_policy_perf, cpu->max_perf);
+ -
+ -		/* Make sure min_perf <= max_perf */
+ -		cpu->min_perf = min(cpu->min_perf, cpu->max_perf);
+ -	}
+ -
+ -	cpu->max_perf = round_up(cpu->max_perf, EXT_FRAC_BITS);
+ -	cpu->min_perf = round_up(cpu->min_perf, EXT_FRAC_BITS);
+ +	struct sample *sample;
+ +	struct cpudata *cpu;
+  
+ -	pr_debug("cpu:%d max_perf_pct:%d min_perf_pct:%d\n", policy->cpu,
+ -		 fp_ext_toint(cpu->max_perf * 100),
+ -		 fp_ext_toint(cpu->min_perf * 100));
+ +	cpu = all_cpu_data[cpu_num];
+ +	if (!cpu)
+ +		return 0;
+ +	sample = &cpu->sample;
+ +	return sample->freq;
+  }
+  
+  static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+* Unmerged path drivers/cpufreq/intel_pstate.c
