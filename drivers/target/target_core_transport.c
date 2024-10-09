@@ -689,9 +689,9 @@ void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
 		dev->transport->transport_complete(cmd,
 				cmd->t_data_sg,
 				transport_get_sense_buffer(cmd));
-		if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
-			success = 1;
 	}
+	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
+		success = 1;
 
 	/*
 	 * See if we are waiting to complete for an exception condition.
