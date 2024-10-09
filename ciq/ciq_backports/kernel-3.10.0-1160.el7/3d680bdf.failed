@@ -1,0 +1,183 @@
+mm/page_isolation: fix potential warning from user
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+Rebuild_CHGLOG: - [mm] mm: page_isolation: fix potential warning from user (Rafael Aquini) [1845620]
+Rebuild_FUZZ: 97.03%
+commit-author Qian Cai <cai@lca.pw>
+commit 3d680bdf60a5bade3e8cbd049927e7f8b1d3fe97
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/3d680bdf.failed
+
+It makes sense to call the WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE)
+from start_isolate_page_range(), but should avoid triggering it from
+userspace, i.e, from is_mem_section_removable() because it could crash
+the system by a non-root user if warn_on_panic is set.
+
+While at it, simplify the code a bit by removing an unnecessary jump
+label.
+
+Link: http://lkml.kernel.org/r/20200120163915.1469-1-cai@lca.pw
+	Signed-off-by: Qian Cai <cai@lca.pw>
+	Suggested-by: Michal Hocko <mhocko@kernel.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3d680bdf60a5bade3e8cbd049927e7f8b1d3fe97)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+#	mm/page_isolation.c
+diff --cc mm/page_alloc.c
+index 789e5ec3768f,15e908ad933b..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -7083,26 -8205,26 +7083,31 @@@ bool has_unmovable_pages(struct zone *z
+  	 * can still lead to having bootmem allocations in zone_movable.
+  	 */
+  
+ -	if (is_migrate_cma_page(page)) {
+ -		/*
+ -		 * CMA allocations (alloc_contig_range) really need to mark
+ -		 * isolate CMA pageblocks even when they are not movable in fact
+ -		 * so consider them movable here.
+ -		 */
+ -		if (is_migrate_cma(migratetype))
+ -			return NULL;
+ +	/*
+ +	 * CMA allocations (alloc_contig_range) really need to mark isolate
+ +	 * CMA pageblocks even when they are not movable in fact so consider
+ +	 * them movable here.
+ +	 */
+ +	if (is_migrate_cma(migratetype) &&
+ +			is_migrate_cma(get_pageblock_migratetype(page)))
+ +		return false;
+  
+++<<<<<<< HEAD
+ +	pfn = page_to_pfn(page);
+ +	for (found = 0, iter = 0; iter < pageblock_nr_pages; iter++) {
+ +		unsigned long check = pfn + iter;
+++=======
++ 		return page;
++ 	}
+++>>>>>>> 3d680bdf60a5 (mm/page_isolation: fix potential warning from user)
+  
+ -	for (; iter < pageblock_nr_pages; iter++) {
+ -		if (!pfn_valid_within(pfn + iter))
+ +		if (!pfn_valid_within(check))
+  			continue;
+  
+ -		page = pfn_to_page(pfn + iter);
+ +		page = pfn_to_page(check);
+  
+  		if (PageReserved(page))
+- 			goto unmovable;
++ 			return page;
+  
+  		/*
+  		 * If the zone is movable and we have ruled out all reserved
+@@@ -7122,9 -8244,9 +7127,9 @@@
+  			unsigned int skip_pages;
+  
+  			if (!hugepage_migration_supported(page_hstate(head)))
+- 				goto unmovable;
++ 				return page;
+  
+ -			skip_pages = compound_nr(head) - (page - head);
+ +			skip_pages = (1 << compound_order(head)) - (page - head);
+  			iter += skip_pages - 1;
+  			continue;
+  		}
+@@@ -7163,40 -8286,12 +7168,46 @@@
+  		 * is set to both of a memory hole page and a _used_ kernel
+  		 * page at boot.
+  		 */
+++<<<<<<< HEAD
+ +		if (found > count)
+ +			goto unmovable;
+ +	}
+ +	return false;
+ +unmovable:
+ +	WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE);
+ +	return true;
+++=======
++ 		return page;
++ 	}
++ 	return NULL;
+++>>>>>>> 3d680bdf60a5 (mm/page_isolation: fix potential warning from user)
+ +}
+ +
+ +bool is_pageblock_removable_nolock(struct page *page)
+ +{
+ +	struct zone *zone;
+ +	unsigned long pfn;
+ +
+ +	/*
+ +	 * We have to be careful here because we are iterating over memory
+ +	 * sections which are not zone aware so we might end up outside of
+ +	 * the zone but still within the section.
+ +	 * We have to take care about the node as well. If the node is offline
+ +	 * its NODE_DATA will be NULL - see page_zone.
+ +	 */
+ +	if (!node_online(page_to_nid(page)))
+ +		return false;
+ +
+ +	zone = page_zone(page);
+ +	pfn = page_to_pfn(page);
+ +	if (!zone_spans_pfn(zone, pfn))
+ +		return false;
+ +
+ +	return !has_unmovable_pages(zone, page, 0, MIGRATE_MOVABLE, true);
+  }
+  
+ -#ifdef CONFIG_CONTIG_ALLOC
+ +#if (defined(CONFIG_MEMORY_ISOLATION) && defined(CONFIG_COMPACTION)) || defined(CONFIG_CMA)
+ +
+  static unsigned long pfn_max_align_down(unsigned long pfn)
+  {
+  	return pfn & ~(max_t(unsigned long, MAX_ORDER_NR_PAGES,
+diff --cc mm/page_isolation.c
+index b52fae45343f,a9fd7c740c23..000000000000
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@@ -61,14 -44,29 +61,30 @@@ out
+  		int mt = get_pageblock_migratetype(page);
+  
+  		set_pageblock_migratetype(page, MIGRATE_ISOLATE);
+ -		zone->nr_isolate_pageblock++;
+ -		nr_pages = move_freepages_block(zone, page, MIGRATE_ISOLATE,
+ -									NULL);
+ +		nr_pages = move_freepages_block(zone, page, MIGRATE_ISOLATE);
+  
+  		__mod_zone_freepage_state(zone, -nr_pages, mt);
+ -		ret = 0;
+  	}
+  
+ -out:
+  	spin_unlock_irqrestore(&zone->lock, flags);
+++<<<<<<< HEAD
+ +	if (!ret)
+ +		drain_all_pages();
+++=======
++ 	if (!ret) {
++ 		drain_all_pages(zone);
++ 	} else {
++ 		WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE);
++ 
++ 		if ((isol_flags & REPORT_FAILURE) && unmovable)
++ 			/*
++ 			 * printk() with zone->lock held will likely trigger a
++ 			 * lockdep splat, so defer it here.
++ 			 */
++ 			dump_page(unmovable, "unmovable page");
++ 	}
++ 
+++>>>>>>> 3d680bdf60a5 (mm/page_isolation: fix potential warning from user)
+  	return ret;
+  }
+  
+* Unmerged path mm/page_alloc.c
+* Unmerged path mm/page_isolation.c
