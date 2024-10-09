@@ -1,0 +1,285 @@
+ovl: verify directory index entries on mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit e8f9e5b780b0406ab81add72f1a05583ae5d40ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e8f9e5b7.failed
+
+Directory index entries should have 'upper' xattr pointing to the real
+upper dir. Verifying that the upper dir file handle is not stale is
+expensive, so only verify stale directory index entries on mount if
+NFS export feature is enabled.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit e8f9e5b780b0406ab81add72f1a05583ae5d40ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/namei.c
+diff --cc fs/overlayfs/namei.c
+index 0afb8ae29e9b,881caa385a36..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -84,15 -84,54 +84,27 @@@ invalid
+  
+  static int ovl_acceptable(void *ctx, struct dentry *dentry)
+  {
+- 	return 1;
++ 	/*
++ 	 * A non-dir origin may be disconnected, which is fine, because
++ 	 * we only need it for its unique inode number.
++ 	 */
++ 	if (!d_is_dir(dentry))
++ 		return 1;
++ 
++ 	/* Don't decode a deleted empty directory */
++ 	if (d_unhashed(dentry))
++ 		return 0;
++ 
++ 	/* Check if directory belongs to the layer we are decoding from */
++ 	return is_subdir(dentry, ((struct vfsmount *)ctx)->mnt_root);
+  }
+  
+ -/*
+ - * Check validity of an overlay file handle buffer.
+ - *
+ - * Return 0 for a valid file handle.
+ - * Return -ENODATA for "origin unknown".
+ - * Return <0 for an invalid file handle.
+ - */
+ -static int ovl_check_fh_len(struct ovl_fh *fh, int fh_len)
+ +static struct ovl_fh *ovl_get_origin_fh(struct dentry *dentry)
+  {
+ -	if (fh_len < sizeof(struct ovl_fh) || fh_len < fh->len)
+ -		return -EINVAL;
+ -
+ -	if (fh->magic != OVL_FH_MAGIC)
+ -		return -EINVAL;
+ -
+ -	/* Treat larger version and unknown flags as "origin unknown" */
+ -	if (fh->version > OVL_FH_VERSION || fh->flags & ~OVL_FH_FLAG_ALL)
+ -		return -ENODATA;
+ -
+ -	/* Treat endianness mismatch as "origin unknown" */
+ -	if (!(fh->flags & OVL_FH_FLAG_ANY_ENDIAN) &&
+ -	    (fh->flags & OVL_FH_FLAG_BIG_ENDIAN) != OVL_FH_FLAG_CPU_ENDIAN)
+ -		return -ENODATA;
+ -
+ -	return 0;
+ -}
+ -
+ -static struct ovl_fh *ovl_get_fh(struct dentry *dentry, const char *name)
+ -{
+ -	int res, err;
+ +	int res;
+  	struct ovl_fh *fh = NULL;
+  
+ -	res = vfs_getxattr(dentry, name, NULL, 0);
+ +	res = vfs_getxattr(dentry, OVL_XATTR_ORIGIN, NULL, 0);
+  	if (res < 0) {
+  		if (res == -ENODATA || res == -EOPNOTSUPP)
+  			return NULL;
+@@@ -139,47 -170,41 +151,76 @@@ invalid
+  	goto out;
+  }
+  
+ -static struct dentry *ovl_decode_fh(struct ovl_fh *fh, struct vfsmount *mnt)
+ +static struct dentry *ovl_get_origin(struct dentry *dentry,
+ +				     struct vfsmount *mnt)
+  {
+++<<<<<<< HEAD
+ +	struct dentry *origin = NULL;
+ +	struct ovl_fh *fh = ovl_get_origin_fh(dentry);
+++=======
++ 	struct dentry *real;
+++>>>>>>> e8f9e5b780b0 (ovl: verify directory index entries on mount)
+  	int bytes;
+  
+ +	if (IS_ERR_OR_NULL(fh))
+ +		return (struct dentry *)fh;
+ +
+  	/*
+  	 * Make sure that the stored uuid matches the uuid of the lower
+  	 * layer where file handle will be decoded.
+  	 */
+ -	if (!uuid_equal(&fh->uuid, &mnt->mnt_sb->s_uuid))
+ -		return NULL;
+ +	if (uuid_be_cmp(fh->uuid, *(uuid_be *) &mnt->mnt_sb->s_uuid))
+ +		goto out;
+  
+  	bytes = (fh->len - offsetof(struct ovl_fh, fid));
+++<<<<<<< HEAD
+ +	origin = exportfs_decode_fh(mnt, (struct fid *)fh->fid,
+ +				    bytes >> 2, (int)fh->type,
+ +				    ovl_acceptable, NULL);
+ +	if (IS_ERR(origin)) {
+ +		/* Treat stale file handle as "origin unknown" */
+ +		if (origin == ERR_PTR(-ESTALE))
+ +			origin = NULL;
+ +		goto out;
+ +	}
+ +
+ +	if (ovl_dentry_weird(origin) ||
+ +	    ((d_inode(origin)->i_mode ^ d_inode(dentry)->i_mode) & S_IFMT))
+ +		goto invalid;
+ +
+ +out:
+ +	kfree(fh);
+ +	return origin;
+ +
+ +invalid:
+ +	pr_warn_ratelimited("overlayfs: invalid origin (%pd2)\n", origin);
+ +	dput(origin);
+ +	origin = NULL;
+ +	goto out;
+++=======
++ 	real = exportfs_decode_fh(mnt, (struct fid *)fh->fid,
++ 				  bytes >> 2, (int)fh->type,
++ 				  ovl_acceptable, mnt);
++ 	if (IS_ERR(real)) {
++ 		/*
++ 		 * Treat stale file handle to lower file as "origin unknown".
++ 		 * upper file handle could become stale when upper file is
++ 		 * unlinked and this information is needed to handle stale
++ 		 * index entries correctly.
++ 		 */
++ 		if (real == ERR_PTR(-ESTALE) &&
++ 		    !(fh->flags & OVL_FH_FLAG_PATH_UPPER))
++ 			real = NULL;
++ 		return real;
++ 	}
++ 
++ 	if (ovl_dentry_weird(real)) {
++ 		dput(real);
++ 		return NULL;
++ 	}
++ 
++ 	return real;
+++>>>>>>> e8f9e5b780b0 (ovl: verify directory index entries on mount)
+  }
+  
+  static bool ovl_is_opaquedir(struct dentry *dentry)
+@@@ -388,29 -476,15 +458,39 @@@ int ovl_verify_index(struct dentry *ind
+  {
+  	struct ovl_fh *fh = NULL;
+  	size_t len;
+++<<<<<<< HEAD
+ +	struct path origin = { };
+ +	struct path *stack = &origin;
+ +	unsigned int ctr = 0;
+++=======
++ 	struct ovl_path origin = { };
++ 	struct ovl_path *stack = &origin;
++ 	struct dentry *upper = NULL;
+++>>>>>>> e8f9e5b780b0 (ovl: verify directory index entries on mount)
+  	int err;
+  
+  	if (!d_inode(index))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Directory index entries are going to be used for looking up
+ +	 * redirected upper dirs by lower dir fh when decoding an overlay
+ +	 * file handle of a merge dir. Whiteout index entries are going to be
+ +	 * used as an indication that an exported overlay file handle should
+ +	 * be treated as stale (i.e. after unlink of the overlay inode).
+ +	 * We don't know the verification rules for directory and whiteout
+ +	 * index entries, because they have not been implemented yet, so return
+ +	 * EINVAL if those entries are found to abort the mount to avoid
+ +	 * corrupting an index that was created by a newer kernel.
+ +	 */
+ +	err = -EINVAL;
+ +	if (d_is_dir(index) || ovl_is_whiteout(index))
+ +		goto fail;
+ +
+++=======
++ 	err = -EINVAL;
+++>>>>>>> e8f9e5b780b0 (ovl: verify directory index entries on mount)
+  	if (index->d_name.len < sizeof(struct ovl_fh)*2)
+  		goto fail;
+  
+@@@ -428,19 -502,53 +508,61 @@@
+  	if (err)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	err = ovl_check_origin(index, lowerstack, numlower, &stack, &ctr);
+ +	if (!err && !ctr)
+ +		err = -ESTALE;
+ +	if (err)
+ +		goto fail;
+++=======
++ 	/*
++ 	 * Whiteout index entries are used as an indication that an exported
++ 	 * overlay file handle should be treated as stale (i.e. after unlink
++ 	 * of the overlay inode). These entries contain no origin xattr.
++ 	 */
++ 	if (ovl_is_whiteout(index))
++ 		goto out;
+  
+- 	/* Check if index is orphan and don't warn before cleaning it */
+- 	if (d_inode(index)->i_nlink == 1 &&
+- 	    ovl_get_nlink(origin.dentry, index, 0) == 0)
+- 		err = -ENOENT;
++ 	/*
++ 	 * Verifying directory index entries are not stale is expensive, so
++ 	 * only verify stale dir index if NFS export is enabled.
++ 	 */
++ 	if (d_is_dir(index) && !ofs->config.nfs_export)
++ 		goto out;
++ 
++ 	/*
++ 	 * Directory index entries should have 'upper' xattr pointing to the
++ 	 * real upper dir. Non-dir index entries are hardlinks to the upper
++ 	 * real inode. For non-dir index, we can read the copy up origin xattr
++ 	 * directly from the index dentry, but for dir index we first need to
++ 	 * decode the upper directory.
++ 	 */
++ 	upper = ovl_index_upper(ofs, index);
++ 	if (IS_ERR_OR_NULL(upper)) {
++ 		err = PTR_ERR(upper);
++ 		if (!err)
++ 			err = -ESTALE;
++ 		goto fail;
++ 	}
++ 
++ 	err = ovl_verify_fh(upper, OVL_XATTR_ORIGIN, fh);
++ 	dput(upper);
++ 	if (err)
++ 		goto fail;
++ 
++ 	/* Check if non-dir index is orphan and don't warn before cleaning it */
++ 	if (!d_is_dir(index) && d_inode(index)->i_nlink == 1) {
++ 		err = ovl_check_origin_fh(ofs, fh, index, &stack);
++ 		if (err)
++ 			goto fail;
+++>>>>>>> e8f9e5b780b0 (ovl: verify directory index entries on mount)
++ 
++ 		if (ovl_get_nlink(origin.dentry, index, 0) == 0)
++ 			err = -ENOENT;
++ 	}
+  
+- 	dput(origin.dentry);
+  out:
++ 	dput(origin.dentry);
+  	kfree(fh);
+  	return err;
+  
+diff --git a/fs/dcache.c b/fs/dcache.c
+index f8f0822c6dd1..e506fdf97f65 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -3327,6 +3327,7 @@ int is_subdir(struct dentry *new_dentry, struct dentry *old_dentry)
+ 
+ 	return result;
+ }
++EXPORT_SYMBOL(is_subdir);
+ 
+ static enum d_walk_ret d_genocide_kill(void *data, struct dentry *dentry)
+ {
+* Unmerged path fs/overlayfs/namei.c
