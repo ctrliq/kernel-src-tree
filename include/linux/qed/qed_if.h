@@ -644,6 +644,7 @@ struct qed_dev_info {
 	u16		mtu;
 
 	bool wol_support;
+	bool smart_an;
 
 	/* MBI version */
 	u32 mbi_version;
