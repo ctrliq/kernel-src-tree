@@ -1,0 +1,367 @@
+mm/core, x86/mm/pkeys: Add execute-only protection keys support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] core, x86/mm/pkeys: Add execute-only protection keys support (Rui Wang) [1272615]
+Rebuild_FUZZ: 97.56%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 62b5f7d013fc455b8db26cf01e421f4c0d264b92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/62b5f7d0.failed
+
+Protection keys provide new page-based protection in hardware.
+But, they have an interesting attribute: they only affect data
+accesses and never affect instruction fetches.  That means that
+if we set up some memory which is set as "access-disabled" via
+protection keys, we can still execute from it.
+
+This patch uses protection keys to set up mappings to do just that.
+If a user calls:
+
+	mmap(..., PROT_EXEC);
+or
+	mprotect(ptr, sz, PROT_EXEC);
+
+(note PROT_EXEC-only without PROT_READ/WRITE), the kernel will
+notice this, and set a special protection key on the memory.  It
+also sets the appropriate bits in the Protection Keys User Rights
+(PKRU) register so that the memory becomes unreadable and
+unwritable.
+
+I haven't found any userspace that does this today.  With this
+facility in place, we expect userspace to move to use it
+eventually.  Userspace _could_ start doing this today.  Any
+PROT_EXEC calls get converted to PROT_READ inside the kernel, and
+would transparently be upgraded to "true" PROT_EXEC with this
+code.  IOW, userspace never has to do any PROT_EXEC runtime
+detection.
+
+This feature provides enhanced protection against leaking
+executable memory contents.  This helps thwart attacks which are
+attempting to find ROP gadgets on the fly.
+
+But, the security provided by this approach is not comprehensive.
+The PKRU register which controls access permissions is a normal
+user register writable from unprivileged userspace.  An attacker
+who can execute the 'wrpkru' instruction can easily disable the
+protection provided by this feature.
+
+The protection key that is used for execute-only support is
+permanently dedicated at compile time.  This is fine for now
+because there is currently no API to set a protection key other
+than this one.
+
+Despite there being a constant PKRU value across the entire
+system, we do not set it unless this feature is in use in a
+process.  That is to preserve the PKRU XSAVE 'init state',
+which can lead to faster context switches.
+
+PKRU *is* a user register and the kernel is modifying it.  That
+means that code doing:
+
+	pkru = rdpkru()
+	pkru |= 0x100;
+	mmap(..., PROT_EXEC);
+	wrpkru(pkru);
+
+could lose the bits in PKRU that enforce execute-only
+permissions.  To avoid this, we suggest avoiding ever calling
+mmap() or mprotect() when the PKRU value is expected to be
+unstable.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Chen Gang <gang.chen.5i5j@gmail.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: David Hildenbrand <dahi@linux.vnet.ibm.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Piotr Kwapulinski <kwapulinski.piotr@gmail.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Stephen Smalley <sds@tycho.nsa.gov>
+	Cc: Vladimir Murzin <vladimir.murzin@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: keescook@google.com
+	Cc: linux-kernel@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/20160212210240.CB4BB5CA@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 62b5f7d013fc455b8db26cf01e421f4c0d264b92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pkeys.h
+#	arch/x86/kernel/fpu/xstate.c
+#	arch/x86/mm/Makefile
+#	arch/x86/mm/fault.c
+#	include/linux/pkeys.h
+#	mm/mmap.c
+#	mm/mprotect.c
+diff --cc arch/x86/mm/Makefile
+index cd47e2b6065c,67cf2e1e557b..000000000000
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@@ -29,9 -33,6 +29,14 @@@ obj-$(CONFIG_AMD_NUMA)		+= amdtopology.
+  obj-$(CONFIG_ACPI_NUMA)		+= srat.o
+  obj-$(CONFIG_NUMA_EMU)		+= numa_emulation.o
+  
+ +obj-$(CONFIG_MEMTEST)		+= memtest.o
+ +
+  obj-$(CONFIG_X86_INTEL_MPX)	+= mpx.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_RANDOMIZE_MEMORY)	+= kaslr.o
+ +
+ +obj-$(CONFIG_TRACK_DIRTY_PAGES)	+= track.o
+++=======
++ obj-$(CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS) += pkeys.o
++ 
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+diff --cc arch/x86/mm/fault.c
+index 1977abf5754c,5877b92ab6f1..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -966,6 -1098,35 +966,38 @@@ int show_unhandled_signals = 1
+  static inline int
+  access_error(unsigned long error_code, struct vm_area_struct *vma)
+  {
+++<<<<<<< HEAD
+++=======
++ 	/* This is only called for the current mm, so: */
++ 	bool foreign = false;
++ 	/*
++ 	 * Access or read was blocked by protection keys. We do
++ 	 * this check before any others because we do not want
++ 	 * to, for instance, confuse a protection-key-denied
++ 	 * write with one for which we should do a COW.
++ 	 */
++ 	if (error_code & PF_PK)
++ 		return 1;
++ 
++ 	if (!(error_code & PF_INSTR)) {
++ 		/*
++ 		 * Assume all accesses require either read or execute
++ 		 * permissions.  This is not an instruction access, so
++ 		 * it requires read permissions.
++ 		 */
++ 		if (!(vma->vm_flags & VM_READ))
++ 			return 1;
++ 	}
++ 	/*
++ 	 * Make sure to check the VMA so that we do not perform
++ 	 * faults just to hit a PF_PK as soon as we fill in a
++ 	 * page.
++ 	 */
++ 	if (!arch_vma_access_permitted(vma, (error_code & PF_WRITE),
++ 				(error_code & PF_INSTR), foreign))
++ 		return 1;
++ 
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+  	if (error_code & PF_WRITE) {
+  		/* write, present and write, not present: */
+  		if (unlikely(!(vma->vm_flags & VM_WRITE)))
+diff --cc mm/mmap.c
+index e69a736f3cf3,0175b7d055f0..000000000000
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@@ -36,7 -40,10 +36,12 @@@
+  #include <linux/sched/sysctl.h>
+  #include <linux/notifier.h>
+  #include <linux/memory.h>
+ -#include <linux/printk.h>
+  #include <linux/userfaultfd_k.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/moduleparam.h>
++ #include <linux/pkeys.h>
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+  
+  #include <asm/uaccess.h>
+  #include <asm/cacheflush.h>
+@@@ -1396,15 -1247,31 +1401,20 @@@ static inline unsigned long round_hint_
+  /*
+   * The caller must hold down_write(&current->mm->mmap_sem).
+   */
+ -unsigned long do_mmap(struct file *file, unsigned long addr,
+ +
+ +unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+  			unsigned long len, unsigned long prot,
+ -			unsigned long flags, vm_flags_t vm_flags,
+ -			unsigned long pgoff, unsigned long *populate)
+ -{
+ +			unsigned long flags, unsigned long pgoff,
+ +			unsigned long *populate,
+ +			struct list_head *uf)
+ +{
+++<<<<<<< HEAD
+ +	struct mm_struct * mm = current->mm;
+ +	vm_flags_t vm_flags;
+++=======
++ 	struct mm_struct *mm = current->mm;
++ 	int pkey = 0;
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+  
+  	*populate = 0;
+  
+@@@ -1448,7 -1321,7 +1464,11 @@@
+  	 * to. we assume access permissions have been handled by the open
+  	 * of the memory object, so we don't do any here.
+  	 */
+++<<<<<<< HEAD
+ +	vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags) |
+++=======
++ 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+  			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+  
+  	if (flags & MAP_LOCKED)
+diff --cc mm/mprotect.c
+index 12cbcc768180,fa37c4cd973a..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -361,8 -381,6 +362,11 @@@ SYSCALL_DEFINE3(mprotect, unsigned long
+  	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+  		prot |= PROT_EXEC;
+  
+++<<<<<<< HEAD
+ +	vm_flags = calc_vm_prot_bits(prot);
+ +
+++=======
+++>>>>>>> 62b5f7d013fc (mm/core, x86/mm/pkeys: Add execute-only protection keys support)
+  	down_write(&current->mm->mmap_sem);
+  
+  	vma = find_vma(current->mm, start);
+* Unmerged path arch/x86/include/asm/pkeys.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path include/linux/pkeys.h
+* Unmerged path arch/x86/include/asm/pkeys.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/mm/Makefile
+* Unmerged path arch/x86/mm/fault.c
+diff --git a/arch/x86/mm/pkeys.c b/arch/x86/mm/pkeys.c
+new file mode 100644
+index 000000000000..e8c474451928
+--- /dev/null
++++ b/arch/x86/mm/pkeys.c
+@@ -0,0 +1,101 @@
++/*
++ * Intel Memory Protection Keys management
++ * Copyright (c) 2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++#include <linux/mm_types.h>             /* mm_struct, vma, etc...       */
++#include <linux/pkeys.h>                /* PKEY_*                       */
++#include <uapi/asm-generic/mman-common.h>
++
++#include <asm/cpufeature.h>             /* boot_cpu_has, ...            */
++#include <asm/mmu_context.h>            /* vma_pkey()                   */
++#include <asm/fpu/internal.h>           /* fpregs_active()              */
++
++int __execute_only_pkey(struct mm_struct *mm)
++{
++	int ret;
++
++	/*
++	 * We do not want to go through the relatively costly
++	 * dance to set PKRU if we do not need to.  Check it
++	 * first and assume that if the execute-only pkey is
++	 * write-disabled that we do not have to set it
++	 * ourselves.  We need preempt off so that nobody
++	 * can make fpregs inactive.
++	 */
++	preempt_disable();
++	if (fpregs_active() &&
++	    !__pkru_allows_read(read_pkru(), PKEY_DEDICATED_EXECUTE_ONLY)) {
++		preempt_enable();
++		return PKEY_DEDICATED_EXECUTE_ONLY;
++	}
++	preempt_enable();
++	ret = arch_set_user_pkey_access(current, PKEY_DEDICATED_EXECUTE_ONLY,
++			PKEY_DISABLE_ACCESS);
++	/*
++	 * If the PKRU-set operation failed somehow, just return
++	 * 0 and effectively disable execute-only support.
++	 */
++	if (ret)
++		return 0;
++
++	return PKEY_DEDICATED_EXECUTE_ONLY;
++}
++
++static inline bool vma_is_pkey_exec_only(struct vm_area_struct *vma)
++{
++	/* Do this check first since the vm_flags should be hot */
++	if ((vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC)) != VM_EXEC)
++		return false;
++	if (vma_pkey(vma) != PKEY_DEDICATED_EXECUTE_ONLY)
++		return false;
++
++	return true;
++}
++
++/*
++ * This is only called for *plain* mprotect calls.
++ */
++int __arch_override_mprotect_pkey(struct vm_area_struct *vma, int prot, int pkey)
++{
++	/*
++	 * Is this an mprotect_pkey() call?  If so, never
++	 * override the value that came from the user.
++	 */
++	if (pkey != -1)
++		return pkey;
++	/*
++	 * Look for a protection-key-drive execute-only mapping
++	 * which is now being given permissions that are not
++	 * execute-only.  Move it back to the default pkey.
++	 */
++	if (vma_is_pkey_exec_only(vma) &&
++	    (prot & (PROT_READ|PROT_WRITE))) {
++		return 0;
++	}
++	/*
++	 * The mapping is execute-only.  Go try to get the
++	 * execute-only protection key.  If we fail to do that,
++	 * fall through as if we do not have execute-only
++	 * support.
++	 */
++	if (prot == PROT_EXEC) {
++		pkey = execute_only_pkey(vma->vm_mm);
++		if (pkey > 0)
++			return pkey;
++	}
++	/*
++	 * This is a vanilla, non-pkey mprotect (or we failed to
++	 * setup execute-only), inherit the pkey from the VMA we
++	 * are working on.
++	 */
++	return vma_pkey(vma);
++}
+* Unmerged path include/linux/pkeys.h
+* Unmerged path mm/mmap.c
+* Unmerged path mm/mprotect.c
