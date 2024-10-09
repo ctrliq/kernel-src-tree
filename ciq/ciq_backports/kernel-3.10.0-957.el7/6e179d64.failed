@@ -1,0 +1,273 @@
+s390: add automatic detection of the spectre defense
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] add automatic detection of the spectre defense (Hendrik Brueckner) [1558325]
+Rebuild_FUZZ: 93.88%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 6e179d64126b909f0b288fa63cdbf07c531e9b1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6e179d64.failed
+
+Automatically decide between nobp vs. expolines if the spectre_v2=auto
+kernel parameter is specified or CONFIG_EXPOLINE_AUTO=y is set.
+
+The decision made at boot time due to CONFIG_EXPOLINE_AUTO=y being set
+can be overruled with the nobp, nospec and spectre_v2 kernel parameters.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 6e179d64126b909f0b288fa63cdbf07c531e9b1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/Kconfig
+#	arch/s390/Makefile
+#	arch/s390/include/asm/nospec-branch.h
+#	arch/s390/kernel/module.c
+#	arch/s390/kernel/nospec-branch.c
+diff --cc arch/s390/Kconfig
+index 6d4676098bd9,90cc6d488492..000000000000
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@@ -445,6 -539,51 +445,54 @@@ config ARCH_RANDO
+  
+  	  If unsure, say Y.
+  
+++<<<<<<< HEAD
+++=======
++ config KERNEL_NOBP
++ 	def_bool n
++ 	prompt "Enable modified branch prediction for the kernel by default"
++ 	help
++ 	  If this option is selected the kernel will switch to a modified
++ 	  branch prediction mode if the firmware interface is available.
++ 	  The modified branch prediction mode improves the behaviour in
++ 	  regard to speculative execution.
++ 
++ 	  With the option enabled the kernel parameter "nobp=0" or "nospec"
++ 	  can be used to run the kernel in the normal branch prediction mode.
++ 
++ 	  With the option disabled the modified branch prediction mode is
++ 	  enabled with the "nobp=1" kernel parameter.
++ 
++ 	  If unsure, say N.
++ 
++ config EXPOLINE
++ 	def_bool n
++ 	prompt "Avoid speculative indirect branches in the kernel"
++ 	help
++ 	  Compile the kernel with the expoline compiler options to guard
++ 	  against kernel-to-user data leaks by avoiding speculative indirect
++ 	  branches.
++ 	  Requires a compiler with -mindirect-branch=thunk support for full
++ 	  protection. The kernel may run slower.
++ 
++ 	  If unsure, say N.
++ 
++ choice
++ 	prompt "Expoline default"
++ 	depends on EXPOLINE
++ 	default EXPOLINE_FULL
++ 
++ config EXPOLINE_OFF
++ 	bool "spectre_v2=off"
++ 
++ config EXPOLINE_AUTO
++ 	bool "spectre_v2=auto"
++ 
++ config EXPOLINE_FULL
++ 	bool "spectre_v2=on"
++ 
++ endchoice
++ 
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  endmenu
+  
+  menu "Memory setup"
+diff --cc arch/s390/Makefile
+index f9751c3fc245,c79936d02f7b..000000000000
+--- a/arch/s390/Makefile
++++ b/arch/s390/Makefile
+@@@ -87,9 -75,33 +87,35 @@@ ifeq ($(call cc-option-yn,-mwarn-dynami
+  cflags-$(CONFIG_WARN_DYNAMIC_STACK) += -mwarn-dynamicstack
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ ifdef CONFIG_EXPOLINE
++   ifeq ($(call cc-option-yn,$(CC_FLAGS_MARCH) -mindirect-branch=thunk),y)
++     CC_FLAGS_EXPOLINE := -mindirect-branch=thunk
++     CC_FLAGS_EXPOLINE += -mfunction-return=thunk
++     CC_FLAGS_EXPOLINE += -mindirect-branch-table
++     export CC_FLAGS_EXPOLINE
++     cflags-y += $(CC_FLAGS_EXPOLINE) -DCC_USING_EXPOLINE
++   endif
++ endif
++ 
++ ifdef CONFIG_FUNCTION_TRACER
++ # make use of hotpatch feature if the compiler supports it
++ cc_hotpatch	:= -mhotpatch=0,3
++ ifeq ($(call cc-option-yn,$(cc_hotpatch)),y)
++ CC_FLAGS_FTRACE := $(cc_hotpatch)
++ KBUILD_AFLAGS	+= -DCC_USING_HOTPATCH
++ KBUILD_CFLAGS	+= -DCC_USING_HOTPATCH
++ endif
++ endif
++ 
++ # Test CFI features of binutils
++ cfi := $(call as-instr,.cfi_startproc\n.cfi_val_offset 15$(comma)-160\n.cfi_endproc,-DCONFIG_AS_CFI_VAL_OFFSET=1)
++ 
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  KBUILD_CFLAGS	+= -mbackchain -msoft-float $(cflags-y)
+  KBUILD_CFLAGS	+= -pipe -fno-strength-reduce -Wno-sign-compare
+ -KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables $(cfi)
+ -KBUILD_AFLAGS	+= $(aflags-y) $(cfi)
+ +KBUILD_AFLAGS	+= $(aflags-y)
+  
+  OBJCOPYFLAGS	:= -O binary
+  
+diff --cc arch/s390/kernel/module.c
+index 5fb5da4560c2,5a83be955c70..000000000000
+--- a/arch/s390/kernel/module.c
++++ b/arch/s390/kernel/module.c
+@@@ -170,11 -154,15 +170,23 @@@ int module_frob_arch_sections(Elf_Ehdr 
+  
+  	/* Increase core size by size of got & plt and set start
+  	   offsets for got and plt. */
+++<<<<<<< HEAD
+ +	me->core_size = ALIGN(me->core_size, 4);
+ +	me->arch.got_offset = me->core_size;
+ +	me->core_size += me->arch.got_size;
+ +	me->arch.plt_offset = me->core_size;
+ +	me->core_size += me->arch.plt_size;
+++=======
++ 	me->core_layout.size = ALIGN(me->core_layout.size, 4);
++ 	me->arch.got_offset = me->core_layout.size;
++ 	me->core_layout.size += me->arch.got_size;
++ 	me->arch.plt_offset = me->core_layout.size;
++ 	if (me->arch.plt_size) {
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) && !nospec_disable)
++ 			me->arch.plt_size += PLT_ENTRY_SIZE;
++ 		me->core_layout.size += me->arch.plt_size;
++ 	}
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  	return 0;
+  }
+  
+@@@ -326,19 -314,24 +338,36 @@@ static int apply_rela(Elf_Rela *rela, E
+  	case R_390_PLTOFF64:	/* 16 bit offset from GOT to PLT. */
+  		if (info->plt_initialized == 0) {
+  			unsigned int *ip;
+ -			ip = me->core_layout.base + me->arch.plt_offset +
+ +			ip = me->module_core + me->arch.plt_offset +
+  				info->plt_offset;
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +			ip[0] = 0x0d105810; /* basr 1,0; l 1,6(1); br 1 */
+ +			ip[1] = 0x100607f1;
+ +			ip[2] = val;
+ +#else /* CONFIG_64BIT */
+ +			ip[0] = 0x0d10e310; /* basr 1,0; lg 1,10(1); br 1 */
+ +			ip[1] = 0x100a0004;
+ +			ip[2] = 0x07f10000;
+++=======
++ 			ip[0] = 0x0d10e310;	/* basr 1,0  */
++ 			ip[1] = 0x100a0004;	/* lg	1,10(1) */
++ 			if (IS_ENABLED(CONFIG_EXPOLINE) && !nospec_disable) {
++ 				unsigned int *ij;
++ 				ij = me->core_layout.base +
++ 					me->arch.plt_offset +
++ 					me->arch.plt_size - PLT_ENTRY_SIZE;
++ 				ip[2] = 0xa7f40000 +	/* j __jump_r1 */
++ 					(unsigned int)(u16)
++ 					(((unsigned long) ij - 8 -
++ 					  (unsigned long) ip) / 2);
++ 			} else {
++ 				ip[2] = 0x07f10000;	/* br %r1 */
++ 			}
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  			ip[3] = (unsigned int) (val >> 32);
+  			ip[4] = (unsigned int) val;
+ +#endif /* CONFIG_64BIT */
+  			info->plt_initialized = 1;
+  		}
+  		if (r_type == R_390_PLTOFF16 ||
+@@@ -442,18 -435,44 +471,46 @@@ int module_finalize(const Elf_Ehdr *hdr
+  		    struct module *me)
+  {
+  	const Elf_Shdr *s;
+ -	char *secstrings, *secname;
+ -	void *aseg;
+ +	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+  
+++<<<<<<< HEAD
+ +	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
+ +		if (!strcmp(".altinstructions", secstrings + s->sh_name)) {
+ +			/* patch .altinstructions */
+ +			void *aseg = (void *)s->sh_addr;
+++=======
++ 	if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 	    !nospec_disable && me->arch.plt_size) {
++ 		unsigned int *ij;
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  
+ -		ij = me->core_layout.base + me->arch.plt_offset +
+ -			me->arch.plt_size - PLT_ENTRY_SIZE;
+ -		if (test_facility(35)) {
+ -			ij[0] = 0xc6000000;	/* exrl	%r0,.+10	*/
+ -			ij[1] = 0x0005a7f4;	/* j	.		*/
+ -			ij[2] = 0x000007f1;	/* br	%r1		*/
+ -		} else {
+ -			ij[0] = 0x44000000 | (unsigned int)
+ -				offsetof(struct lowcore, br_r1_trampoline);
+ -			ij[1] = 0xa7f40000;	/* j	.		*/
+ +			apply_alternatives(aseg, aseg + s->sh_size);
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	vfree(me->arch.syminfo);
+ +	me->arch.syminfo = NULL;
+++=======
++ 	secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
++ 	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
++ 		aseg = (void *) s->sh_addr;
++ 		secname = secstrings + s->sh_name;
++ 
++ 		if (!strcmp(".altinstructions", secname))
++ 			/* patch .altinstructions */
++ 			apply_alternatives(aseg, aseg + s->sh_size);
++ 
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 		    (!strcmp(".nospec_call_table", secname)))
++ 			nospec_revert(aseg, aseg + s->sh_size);
++ 
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 		    (!strcmp(".nospec_return_table", secname)))
++ 			nospec_revert(aseg, aseg + s->sh_size);
++ 	}
++ 
++ 	jump_label_apply_nops(me);
+++>>>>>>> 6e179d64126b (s390: add automatic detection of the spectre defense)
+  	return 0;
+  }
+* Unmerged path arch/s390/include/asm/nospec-branch.h
+* Unmerged path arch/s390/kernel/nospec-branch.c
+* Unmerged path arch/s390/Kconfig
+* Unmerged path arch/s390/Makefile
+* Unmerged path arch/s390/include/asm/nospec-branch.h
+diff --git a/arch/s390/kernel/alternative.c b/arch/s390/kernel/alternative.c
+index 934990fa1fd9..793ac45e0a18 100644
+--- a/arch/s390/kernel/alternative.c
++++ b/arch/s390/kernel/alternative.c
+@@ -1,6 +1,7 @@
+ #include <linux/module.h>
+ #include <asm/alternative.h>
+ #include <asm/facility.h>
++#include <asm/nospec-branch.h>
+ 
+ #define MAX_PATCH_LEN (255 - 1)
+ 
+* Unmerged path arch/s390/kernel/module.c
+* Unmerged path arch/s390/kernel/nospec-branch.c
