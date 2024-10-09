@@ -1,0 +1,240 @@
+perf script: Add 'brstackinsn' for branch stacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 48d02a1d5c137d362defd11a5d57d0af4a75a983
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/48d02a1d.failed
+
+Implement printing instruction sequences as hex dump for branch stacks.
+
+This relies on the x86 instruction decoder used by the PT decoder to
+find the lengths of instructions to dump them individually.
+
+This is good enough for pattern matching.
+
+This allows to study hot paths for individual samples, together with
+branch misprediction and cycle count / IPC information if available (on
+Skylake systems).
+
+  % perf record -b ...
+  % perf script -F brstackinsn
+  ...
+    read_hpet+67:
+          ffffffff9905b843        insn: 74 ea                     # PRED
+          ffffffff9905b82f        insn: 85 c9
+          ffffffff9905b831        insn: 74 12
+          ffffffff9905b833        insn: f3 90
+          ffffffff9905b835        insn: 48 8b 0f
+          ffffffff9905b838        insn: 48 89 ca
+          ffffffff9905b83b        insn: 48 c1 ea 20
+          ffffffff9905b83f        insn: 39 f2
+          ffffffff9905b841        insn: 89 d0
+          ffffffff9905b843        insn: 74 ea                     # PRED
+
+Only works when no special branch filters are specified.
+
+Occasionally the path does not reach up to the sample IP, as the LBRs
+may be frozen before executing a final jump. In this case we print a
+special message.
+
+The instruction dumper piggy backs on the existing infrastructure from
+the IP PT decoder.
+
+An earlier iteration of this patch relied on a disassembler, but this
+version only uses the existing instruction decoder.
+
+Committer note:
+
+Added hint about how to get suitable perf.data files for use with
+'-F brstackinsm':
+
+  $ perf record usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.018 MB perf.data (8 samples) ]
+  $
+  $ perf script -F brstackinsn
+  Display of branch stack assembler requested, but non all-branch filter set
+  Hint: run 'perf record -b ...'
+  $
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+Link: http://lkml.kernel.org/r/20170223234634.583-1-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 48d02a1d5c137d362defd11a5d57d0af4a75a983)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-script.txt
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/Documentation/perf-script.txt
+index 3a666e5005f1,cb0eda3925e6..000000000000
+--- a/tools/perf/Documentation/perf-script.txt
++++ b/tools/perf/Documentation/perf-script.txt
+@@@ -116,8 -116,8 +116,13 @@@ OPTION
+  --fields::
+          Comma separated list of fields to print. Options are:
+          comm, tid, pid, time, cpu, event, trace, ip, sym, dso, addr, symoff,
+++<<<<<<< HEAD
+ +	srcline, period, iregs, brstack, brstacksym, flags, insn, insnlen.
+ +        Field list can be prepended with the type, trace, sw or hw,
+++=======
++         srcline, period, iregs, brstack, brstacksym, flags, bpf-output, brstackinsn,
++         callindent, insn, insnlen. Field list can be prepended with the type, trace, sw or hw,
+++>>>>>>> 48d02a1d5c13 (perf script: Add 'brstackinsn' for branch stacks)
+          to indicate to which event type the field list applies.
+          e.g., -F sw:comm,tid,time,ip,sym  and -F trace:time,cpu,trace
+  
+diff --cc tools/perf/builtin-script.c
+index 86b38dd7fdc5,c98e16689b57..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -853,7 -1177,10 +1096,14 @@@ static void process_event(struct perf_s
+  		print_sample_brstack(sample);
+  	else if (PRINT_FIELD(BRSTACKSYM))
+  		print_sample_brstacksym(sample, thread);
+++<<<<<<< HEAD
+ +	print_insn(sample, attr);
+++=======
++ 
++ 	if (perf_evsel__is_bpf_output(evsel) && PRINT_FIELD(BPF_OUTPUT))
++ 		print_sample_bpf_output(sample);
++ 	print_insn(sample, attr, thread, machine);
+++>>>>>>> 48d02a1d5c13 (perf script: Add 'brstackinsn' for branch stacks)
+  	printf("\n");
+  }
+  
+@@@ -2069,7 -2434,8 +2319,12 @@@ int cmd_script(int argc, const char **a
+  		     "Valid types: hw,sw,trace,raw. "
+  		     "Fields: comm,tid,pid,time,cpu,event,trace,ip,sym,dso,"
+  		     "addr,symoff,period,iregs,brstack,brstacksym,flags,"
+++<<<<<<< HEAD
+ +		     "callindent,insn,insnlen", parse_output_fields),
+++=======
++ 		     "bpf-output,callindent,insn,insnlen,brstackinsn",
++ 		     parse_output_fields),
+++>>>>>>> 48d02a1d5c13 (perf script: Add 'brstackinsn' for branch stacks)
+  	OPT_BOOLEAN('a', "all-cpus", &system_wide,
+  		    "system-wide collection from all CPUs"),
+  	OPT_STRING('S', "symbols", &symbol_conf.sym_list_str, "symbol[,symbol...]",
+@@@ -2097,7 -2463,11 +2352,9 @@@
+  		    "Show the mmap events"),
+  	OPT_BOOLEAN('\0', "show-switch-events", &script.show_switch_events,
+  		    "Show context switch events (if recorded)"),
+ -	OPT_BOOLEAN('\0', "show-namespace-events", &script.show_namespace_events,
+ -		    "Show namespace events (if recorded)"),
+  	OPT_BOOLEAN('f', "force", &symbol_conf.force, "don't complain, do it"),
++ 	OPT_INTEGER(0, "max-blocks", &max_blocks,
++ 		    "Maximum number of code blocks to dump with brstackinsn"),
+  	OPT_BOOLEAN(0, "ns", &nanosecs,
+  		    "Use 9 decimal places when displaying time"),
+  	OPT_CALLBACK_OPTARG(0, "itrace", &itrace_synth_opts, NULL, "opts",
+* Unmerged path tools/perf/Documentation/perf-script.txt
+* Unmerged path tools/perf/builtin-script.c
+diff --git a/tools/perf/util/Build b/tools/perf/util/Build
+index 8fb33efcf54b..e2ae2366c437 100644
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@ -81,6 +81,7 @@ libperf-$(CONFIG_AUXTRACE) += intel-pt-decoder/
+ libperf-$(CONFIG_AUXTRACE) += intel-pt.o
+ libperf-$(CONFIG_AUXTRACE) += intel-bts.o
+ libperf-y += parse-branch-options.o
++libperf-y += dump-insn.o
+ libperf-y += parse-regs-options.o
+ libperf-y += term.o
+ libperf-y += help-unknown-cmd.o
+diff --git a/tools/perf/util/dump-insn.c b/tools/perf/util/dump-insn.c
+new file mode 100644
+index 000000000000..ffbdb19f05d0
+--- /dev/null
++++ b/tools/perf/util/dump-insn.c
+@@ -0,0 +1,14 @@
++#include <linux/compiler.h>
++#include "dump-insn.h"
++
++/* Fallback code */
++
++__weak
++const char *dump_insn(struct perf_insn *x __maybe_unused,
++		      u64 ip __maybe_unused, u8 *inbuf __maybe_unused,
++		      int inlen __maybe_unused, int *lenp)
++{
++	if (lenp)
++		*lenp = 0;
++	return "?";
++}
+diff --git a/tools/perf/util/dump-insn.h b/tools/perf/util/dump-insn.h
+new file mode 100644
+index 000000000000..90fb115981cf
+--- /dev/null
++++ b/tools/perf/util/dump-insn.h
+@@ -0,0 +1,22 @@
++#ifndef __PERF_DUMP_INSN_H
++#define __PERF_DUMP_INSN_H 1
++
++#define MAXINSN 15
++
++#include <linux/types.h>
++
++struct thread;
++
++struct perf_insn {
++	/* Initialized by callers: */
++	struct thread *thread;
++	u8	      cpumode;
++	bool	      is64bit;
++	int	      cpu;
++	/* Temporary */
++	char	      out[256];
++};
++
++const char *dump_insn(struct perf_insn *x, u64 ip,
++		      u8 *inbuf, int inlen, int *lenp);
++#endif
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-insn-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-insn-decoder.c
+index 55b6250350d7..a5f35b21172f 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-insn-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-insn-decoder.c
+@@ -26,6 +26,7 @@
+ #include "insn.c"
+ 
+ #include "intel-pt-insn-decoder.h"
++#include "dump-insn.h"
+ 
+ #if INTEL_PT_INSN_BUF_SZ < MAX_INSN_SIZE || INTEL_PT_INSN_BUF_SZ > MAX_INSN
+ #error Instruction buffer size too small
+@@ -179,6 +180,29 @@ int intel_pt_get_insn(const unsigned char *buf, size_t len, int x86_64,
+ 	return 0;
+ }
+ 
++const char *dump_insn(struct perf_insn *x, uint64_t ip __maybe_unused,
++		      u8 *inbuf, int inlen, int *lenp)
++{
++	struct insn insn;
++	int n, i;
++	int left;
++
++	insn_init(&insn, inbuf, inlen, x->is64bit);
++	insn_get_length(&insn);
++	if (!insn_complete(&insn) || insn.length > inlen)
++		return "<bad>";
++	if (lenp)
++		*lenp = insn.length;
++	left = sizeof(x->out);
++	n = snprintf(x->out, left, "insn: ");
++	left -= n;
++	for (i = 0; i < insn.length; i++) {
++		n += snprintf(x->out + n, left, "%02x ", inbuf[i]);
++		left -= n;
++	}
++	return x->out;
++}
++
+ const char *branch_name[] = {
+ 	[INTEL_PT_OP_OTHER]	= "Other",
+ 	[INTEL_PT_OP_CALL]	= "Call",
