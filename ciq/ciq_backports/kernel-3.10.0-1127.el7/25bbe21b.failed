@@ -1,0 +1,145 @@
+dax: Avoid losing wakeup in dax_lock_mapping_entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 25bbe21bf427a81b8e3ccd480ea0e1d940256156
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/25bbe21b.failed
+
+After calling get_unlocked_entry(), you have to call
+put_unlocked_entry() to avoid subsequent waiters losing wakeups.
+
+Fixes: c2a7d2a11552 ("filesystem-dax: Introduce dax_lock_mapping_entry()")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit 25bbe21bf427a81b8e3ccd480ea0e1d940256156)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 97c3ab5e2b69,9bcce89ea18e..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -397,26 -347,98 +397,102 @@@ static struct page *dax_busy_page(void 
+  }
+  
+  /*
+ - * dax_lock_mapping_entry - Lock the DAX entry corresponding to a page
+ - * @page: The page whose entry we want to lock
+ + * Find radix tree entry at given index. If it points to an exceptional entry,
+ + * return it with the radix tree entry locked. If the radix tree doesn't
+ + * contain given index, create an empty exceptional entry for the index and
+ + * return with it locked.
+   *
+++<<<<<<< HEAD
+ + * When requesting an entry with size RADIX_DAX_PMD, grab_mapping_entry() will
+ + * either return that locked entry or will return an error.  This error will
+ + * happen if there are any 4k entries within the 2MiB range that we are
+ + * requesting.
+++=======
++  * Context: Process context.
++  * Return: %true if the entry was locked or does not need to be locked.
++  */
++ bool dax_lock_mapping_entry(struct page *page)
++ {
++ 	XA_STATE(xas, NULL, 0);
++ 	void *entry;
++ 	bool locked;
++ 
++ 	/* Ensure page->mapping isn't freed while we look at it */
++ 	rcu_read_lock();
++ 	for (;;) {
++ 		struct address_space *mapping = READ_ONCE(page->mapping);
++ 
++ 		locked = false;
++ 		if (!dax_mapping(mapping))
++ 			break;
++ 
++ 		/*
++ 		 * In the device-dax case there's no need to lock, a
++ 		 * struct dev_pagemap pin is sufficient to keep the
++ 		 * inode alive, and we assume we have dev_pagemap pin
++ 		 * otherwise we would not have a valid pfn_to_page()
++ 		 * translation.
++ 		 */
++ 		locked = true;
++ 		if (S_ISCHR(mapping->host->i_mode))
++ 			break;
++ 
++ 		xas.xa = &mapping->i_pages;
++ 		xas_lock_irq(&xas);
++ 		if (mapping != page->mapping) {
++ 			xas_unlock_irq(&xas);
++ 			continue;
++ 		}
++ 		xas_set(&xas, page->index);
++ 		entry = xas_load(&xas);
++ 		if (dax_is_locked(entry)) {
++ 			rcu_read_unlock();
++ 			entry = get_unlocked_entry(&xas);
++ 			xas_unlock_irq(&xas);
++ 			put_unlocked_entry(&xas, entry);
++ 			rcu_read_lock();
++ 			continue;
++ 		}
++ 		dax_lock_entry(&xas, entry);
++ 		xas_unlock_irq(&xas);
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 	return locked;
++ }
++ 
++ void dax_unlock_mapping_entry(struct page *page)
++ {
++ 	struct address_space *mapping = page->mapping;
++ 	XA_STATE(xas, &mapping->i_pages, page->index);
++ 	void *entry;
++ 
++ 	if (S_ISCHR(mapping->host->i_mode))
++ 		return;
++ 
++ 	rcu_read_lock();
++ 	entry = xas_load(&xas);
++ 	rcu_read_unlock();
++ 	entry = dax_make_entry(page_to_pfn_t(page), dax_is_pmd_entry(entry));
++ 	dax_unlock_entry(&xas, entry);
++ }
++ 
++ /*
++  * Find page cache entry at given index. If it is a DAX entry, return it
++  * with the entry locked. If the page cache doesn't contain an entry at
++  * that index, add a locked empty entry.
+++>>>>>>> 25bbe21bf427 (dax: Avoid losing wakeup in dax_lock_mapping_entry)
+   *
+ - * When requesting an entry with size DAX_PMD, grab_mapping_entry() will
+ - * either return that locked entry or will return VM_FAULT_FALLBACK.
+ - * This will happen if there are any PTE entries within the PMD range
+ - * that we are requesting.
+ - *
+ - * We always favor PTE entries over PMD entries. There isn't a flow where we
+ - * evict PTE entries in order to 'upgrade' them to a PMD entry.  A PMD
+ - * insertion will fail if it finds any PTE entries already in the tree, and a
+ - * PTE insertion will cause an existing PMD entry to be unmapped and
+ - * downgraded to PTE entries.  This happens for both PMD zero pages as
+ - * well as PMD empty entries.
+ + * We always favor 4k entries over 2MiB entries. There isn't a flow where we
+ + * evict 4k entries in order to 'upgrade' them to a 2MiB entry.  A 2MiB
+ + * insertion will fail if it finds any 4k entries already in the tree, and a
+ + * 4k insertion will cause an existing 2MiB entry to be unmapped and
+ + * downgraded to 4k entries.  This happens for both 2MiB huge zero pages as
+ + * well as 2MiB empty entries.
+   *
+ - * The exception to this downgrade path is for PMD entries that have
+ - * real storage backing them.  We will leave these real PMD entries in
+ - * the tree, and PTE writes will simply dirty the entire PMD entry.
+ + * The exception to this downgrade path is for 2MiB DAX PMD entries that have
+ + * real storage backing them.  We will leave these real 2MiB DAX entries in
+ + * the tree, and PTE writes will simply dirty the entire 2MiB DAX entry.
+   *
+   * Note: Unlike filemap_fault() we don't honor FAULT_FLAG_RETRY flags. For
+   * persistent memory the benefit is doubtful. We can add that later if we can
+* Unmerged path fs/dax.c
