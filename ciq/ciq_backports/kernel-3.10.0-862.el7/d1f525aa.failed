@@ -1,0 +1,962 @@
+Fix driver unload/reload operation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Fix driver unload/reload operation (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 90.67%
+commit-author James Smart <jsmart2021@gmail.com>
+commit d1f525aaa4d7e575a655365b6ae01a2a1c5fb321
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d1f525aa.failed
+
+There are couple of different load/unload issues fixed with this patch.
+One of the issues was reported by Junichi Nomura, a patch was submitted
+by Johannes Thumsrhirn which did fix one of the problems but the fix in
+this patch separates the pring free from the queue free and does not set
+the parameter passed in to NULL.
+
+issues:
+(1) driver could not be unloaded and reloaded without some Oops or
+ Panic occurring.
+(2) The driver was panicking because of a corruption in the Memory
+Manager when the iocb list was getting allocated.
+
+Root cause for the memory corruption was a double free of the Work Queue
+ring pointer memory - Freed once in the lpfc_sli4_queue_free when the CQ
+was destroyed and again in lpfc_sli4_queue_free when the WQ was destroyed.
+
+The pring free and the queue free were separated, the pring free was moved
+to the wq destroy routine because it a better fit logically to delete the
+ring with the wq.
+
+The checkpatch flagged several alignmenet issues that were also corrected
+with this patch.
+
+The mboxq was never initialed correctly before it was used by the driver
+this patch corrects that issue.
+
+	Reported-by: Junichi Nomura <j-nomura@ce.jp.nec.com>
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Tested-by: Junichi Nomura <j-nomura@ce.jp.nec.com>
+(cherry picked from commit d1f525aaa4d7e575a655365b6ae01a2a1c5fb321)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 9316d7914982,cca7f81357c3..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -5491,6 -5873,54 +5497,57 @@@ lpfc_sli4_driver_resource_setup(struct 
+  		goto out_free_bsmbx;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Check for NVMET being configured */
++ 	phba->nvmet_support = 0;
++ 	if (lpfc_enable_nvmet_cnt) {
++ 
++ 		/* First get WWN of HBA instance */
++ 		lpfc_read_nv(phba, mboxq);
++ 		rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
++ 		if (rc != MBX_SUCCESS) {
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 					"6016 Mailbox failed , mbxCmd x%x "
++ 					"READ_NV, mbxStatus x%x\n",
++ 					bf_get(lpfc_mqe_command, &mboxq->u.mqe),
++ 					bf_get(lpfc_mqe_status, &mboxq->u.mqe));
++ 			mempool_free(mboxq, phba->mbox_mem_pool);
++ 			rc = -EIO;
++ 			goto out_free_bsmbx;
++ 		}
++ 		mb = &mboxq->u.mb;
++ 		memcpy(&wwn, (char *)mb->un.varRDnvp.nodename,
++ 		       sizeof(uint64_t));
++ 		wwn = cpu_to_be64(wwn);
++ 		phba->sli4_hba.wwnn.u.name = wwn;
++ 		memcpy(&wwn, (char *)mb->un.varRDnvp.portname,
++ 		       sizeof(uint64_t));
++ 		/* wwn is WWPN of HBA instance */
++ 		wwn = cpu_to_be64(wwn);
++ 		phba->sli4_hba.wwpn.u.name = wwn;
++ 
++ 		/* Check to see if it matches any module parameter */
++ 		for (i = 0; i < lpfc_enable_nvmet_cnt; i++) {
++ 			if (wwn == lpfc_enable_nvmet[i]) {
++ #if (IS_ENABLED(CONFIG_NVME_TARGET_FC))
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 						"6017 NVME Target %016llx\n",
++ 						wwn);
++ 				phba->nvmet_support = 1; /* a match */
++ #else
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 						"6021 Can't enable NVME Target."
++ 						" NVME_TARGET_FC infrastructure"
++ 						" is not in kernel\n");
++ #endif
++ 			}
++ 		}
++ 	}
++ 
++ 	lpfc_nvme_mod_param_dep(phba);
++ 
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  	/* Get the Supported Pages if PORT_CAPABILITIES is supported by port. */
+  	lpfc_supported_pages(mboxq);
+  	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
+@@@ -7374,10 -7762,67 +7431,73 @@@ lpfc_sli4_queue_verify(struct lpfc_hba 
+  	/* Get CQ depth from module parameter, fake the default for now */
+  	phba->sli4_hba.cq_esize = LPFC_CQE_SIZE;
+  	phba->sli4_hba.cq_ecount = LPFC_CQE_DEF_COUNT;
+ +
+  	return 0;
+++<<<<<<< HEAD
+ +out_error:
+ +	return -ENOMEM;
+++=======
++ }
++ 
++ static int
++ lpfc_alloc_nvme_wq_cq(struct lpfc_hba *phba, int wqidx)
++ {
++ 	struct lpfc_queue *qdesc;
++ 	int cnt;
++ 
++ 	qdesc = lpfc_sli4_queue_alloc(phba, phba->sli4_hba.cq_esize,
++ 					    phba->sli4_hba.cq_ecount);
++ 	if (!qdesc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 				"0508 Failed allocate fast-path NVME CQ (%d)\n",
++ 				wqidx);
++ 		return 1;
++ 	}
++ 	phba->sli4_hba.nvme_cq[wqidx] = qdesc;
++ 
++ 	cnt = LPFC_NVME_WQSIZE;
++ 	qdesc = lpfc_sli4_queue_alloc(phba, LPFC_WQE128_SIZE, cnt);
++ 	if (!qdesc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 				"0509 Failed allocate fast-path NVME WQ (%d)\n",
++ 				wqidx);
++ 		return 1;
++ 	}
++ 	phba->sli4_hba.nvme_wq[wqidx] = qdesc;
++ 	list_add_tail(&qdesc->wq_list, &phba->sli4_hba.lpfc_wq_list);
++ 	return 0;
++ }
++ 
++ static int
++ lpfc_alloc_fcp_wq_cq(struct lpfc_hba *phba, int wqidx)
++ {
++ 	struct lpfc_queue *qdesc;
++ 	uint32_t wqesize;
++ 
++ 	/* Create Fast Path FCP CQs */
++ 	qdesc = lpfc_sli4_queue_alloc(phba, phba->sli4_hba.cq_esize,
++ 					phba->sli4_hba.cq_ecount);
++ 	if (!qdesc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 			"0499 Failed allocate fast-path FCP CQ (%d)\n", wqidx);
++ 		return 1;
++ 	}
++ 	phba->sli4_hba.fcp_cq[wqidx] = qdesc;
++ 
++ 	/* Create Fast Path FCP WQs */
++ 	wqesize = (phba->fcp_embed_io) ?
++ 		LPFC_WQE128_SIZE : phba->sli4_hba.wq_esize;
++ 	qdesc = lpfc_sli4_queue_alloc(phba, wqesize, phba->sli4_hba.wq_ecount);
++ 	if (!qdesc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 				"0503 Failed allocate fast-path FCP WQ (%d)\n",
++ 				wqidx);
++ 		return 1;
++ 	}
++ 	phba->sli4_hba.fcp_wq[wqidx] = qdesc;
++ 	list_add_tail(&qdesc->wq_list, &phba->sli4_hba.lpfc_wq_list);
++ 	return 0;
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  }
+  
+  /**
+@@@ -7398,8 -7843,7 +7518,12 @@@ in
+  lpfc_sli4_queue_create(struct lpfc_hba *phba)
+  {
+  	struct lpfc_queue *qdesc;
+++<<<<<<< HEAD
+ +	uint32_t wqesize;
+ +	int idx;
+++=======
++ 	int idx, io_channel;
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  
+  	/*
+  	 * Create HBA Record arrays.
+@@@ -7470,33 -7992,33 +7594,53 @@@
+  			goto out_error;
+  		}
+  		phba->sli4_hba.hba_eq[idx] = qdesc;
+ -	}
+ -
+ -	/* FCP and NVME io channels are not required to be balanced */
+  
+ -	for (idx = 0; idx < phba->cfg_fcp_io_channel; idx++)
+ -		if (lpfc_alloc_fcp_wq_cq(phba, idx))
+ +		/* Create Fast Path FCP CQs */
+ +		qdesc = lpfc_sli4_queue_alloc(phba, phba->sli4_hba.cq_esize,
+ +					      phba->sli4_hba.cq_ecount);
+ +		if (!qdesc) {
+ +			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +					"0499 Failed allocate fast-path FCP "
+ +					"CQ (%d)\n", idx);
+  			goto out_error;
+++<<<<<<< HEAD
+++=======
++ 
++ 	for (idx = 0; idx < phba->cfg_nvme_io_channel; idx++)
++ 		if (lpfc_alloc_nvme_wq_cq(phba, idx))
++ 			goto out_error;
++ 
++ 	if (phba->nvmet_support) {
++ 		for (idx = 0; idx < phba->cfg_nvmet_mrq; idx++) {
++ 			qdesc = lpfc_sli4_queue_alloc(phba,
++ 					phba->sli4_hba.cq_esize,
++ 					phba->sli4_hba.cq_ecount);
++ 			if (!qdesc) {
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 					"3142 Failed allocate NVME "
++ 					"CQ Set (%d)\n", idx);
++ 				goto out_error;
++ 			}
++ 			phba->sli4_hba.nvmet_cqset[idx] = qdesc;
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  		}
+ +		phba->sli4_hba.fcp_cq[idx] = qdesc;
+ +
+ +		/* Create Fast Path FCP WQs */
+ +		wqesize = (phba->fcp_embed_io) ?
+ +				LPFC_WQE128_SIZE : phba->sli4_hba.wq_esize;
+ +		qdesc = lpfc_sli4_queue_alloc(phba, wqesize,
+ +						phba->sli4_hba.wq_ecount);
+ +		if (!qdesc) {
+ +			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +					"0503 Failed allocate fast-path FCP "
+ +					"WQ (%d)\n", idx);
+ +			goto out_error;
+ +		}
+ +		phba->sli4_hba.fcp_wq[idx] = qdesc;
+  	}
+  
+ +
+  	/*
+  	 * Create Slow Path Completion Queues (CQs)
+  	 */
+@@@ -7605,86 -8220,193 +7749,96 @@@ lpfc_sli4_queue_destroy(struct lpfc_hb
+  	if (phba->cfg_fof)
+  		lpfc_fof_queue_destroy(phba);
+  
+ -	/* Release HBA eqs */
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.hba_eq, phba->io_channel_irqs);
+ +	if (phba->sli4_hba.hba_eq != NULL) {
+ +		/* Release HBA event queue */
+ +		for (idx = 0; idx < phba->cfg_fcp_io_channel; idx++) {
+ +			if (phba->sli4_hba.hba_eq[idx] != NULL) {
+ +				lpfc_sli4_queue_free(
+ +					phba->sli4_hba.hba_eq[idx]);
+ +				phba->sli4_hba.hba_eq[idx] = NULL;
+ +			}
+ +		}
+ +		kfree(phba->sli4_hba.hba_eq);
+ +		phba->sli4_hba.hba_eq = NULL;
+ +	}
+  
+++<<<<<<< HEAD
+ +	if (phba->sli4_hba.fcp_cq != NULL) {
+ +		/* Release FCP completion queue */
+ +		for (idx = 0; idx < phba->cfg_fcp_io_channel; idx++) {
+ +			if (phba->sli4_hba.fcp_cq[idx] != NULL) {
+ +				lpfc_sli4_queue_free(
+ +					phba->sli4_hba.fcp_cq[idx]);
+ +				phba->sli4_hba.fcp_cq[idx] = NULL;
+ +			}
+ +		}
+ +		kfree(phba->sli4_hba.fcp_cq);
+ +		phba->sli4_hba.fcp_cq = NULL;
+ +	}
+ +
+ +	if (phba->sli4_hba.fcp_wq != NULL) {
+ +		/* Release FCP work queue */
+ +		for (idx = 0; idx < phba->cfg_fcp_io_channel; idx++) {
+ +			if (phba->sli4_hba.fcp_wq[idx] != NULL) {
+ +				lpfc_sli4_queue_free(
+ +					phba->sli4_hba.fcp_wq[idx]);
+ +				phba->sli4_hba.fcp_wq[idx] = NULL;
+ +			}
+ +		}
+ +		kfree(phba->sli4_hba.fcp_wq);
+ +		phba->sli4_hba.fcp_wq = NULL;
+ +	}
+++=======
++ 	/* Release FCP cqs */
++ 	lpfc_sli4_release_queues(&phba->sli4_hba.fcp_cq,
++ 				 phba->cfg_fcp_io_channel);
++ 
++ 	/* Release FCP wqs */
++ 	lpfc_sli4_release_queues(&phba->sli4_hba.fcp_wq,
++ 				 phba->cfg_fcp_io_channel);
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  
+  	/* Release FCP CQ mapping array */
+ -	lpfc_sli4_release_queue_map(&phba->sli4_hba.fcp_cq_map);
+ -
+ -	/* Release NVME cqs */
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.nvme_cq,
+ -					phba->cfg_nvme_io_channel);
+ -
+ -	/* Release NVME wqs */
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.nvme_wq,
+ -					phba->cfg_nvme_io_channel);
+ -
+ -	/* Release NVME CQ mapping array */
+ -	lpfc_sli4_release_queue_map(&phba->sli4_hba.nvme_cq_map);
+ -
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.nvmet_cqset,
+ -					phba->cfg_nvmet_mrq);
+ -
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.nvmet_mrq_hdr,
+ -					phba->cfg_nvmet_mrq);
+ -	lpfc_sli4_release_queues(&phba->sli4_hba.nvmet_mrq_data,
+ -					phba->cfg_nvmet_mrq);
+ +	if (phba->sli4_hba.fcp_cq_map != NULL) {
+ +		kfree(phba->sli4_hba.fcp_cq_map);
+ +		phba->sli4_hba.fcp_cq_map = NULL;
+ +	}
+  
+  	/* Release mailbox command work queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.mbx_wq);
+ -
+ -	/* Release ELS work queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.els_wq);
+ +	if (phba->sli4_hba.mbx_wq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.mbx_wq);
+ +		phba->sli4_hba.mbx_wq = NULL;
+ +	}
+  
+  	/* Release ELS work queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.nvmels_wq);
+ -
+ -	/* Release unsolicited receive queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.hdr_rq);
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.dat_rq);
+ -
+ -	/* Release ELS complete queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.els_cq);
+ -
+ -	/* Release NVME LS complete queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.nvmels_cq);
+ -
+ -	/* Release mailbox command complete queue */
+ -	__lpfc_sli4_release_queue(&phba->sli4_hba.mbx_cq);
+ -
+ -	/* Everything on this list has been freed */
+ -	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_wq_list);
+ -}
+ -
+ -int
+ -lpfc_post_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hrq,
+ -		    struct lpfc_queue *drq, int count)
+ -{
+ -	int rc, i;
+ -	struct lpfc_rqe hrqe;
+ -	struct lpfc_rqe drqe;
+ -	struct lpfc_rqb *rqbp;
+ -	struct rqb_dmabuf *rqb_buffer;
+ -	LIST_HEAD(rqb_buf_list);
+ -
+ -	rqbp = hrq->rqbp;
+ -	for (i = 0; i < count; i++) {
+ -		rqb_buffer = (rqbp->rqb_alloc_buffer)(phba);
+ -		if (!rqb_buffer)
+ -			break;
+ -		rqb_buffer->hrq = hrq;
+ -		rqb_buffer->drq = drq;
+ -		list_add_tail(&rqb_buffer->hbuf.list, &rqb_buf_list);
+ -	}
+ -	while (!list_empty(&rqb_buf_list)) {
+ -		list_remove_head(&rqb_buf_list, rqb_buffer, struct rqb_dmabuf,
+ -				 hbuf.list);
+ -
+ -		hrqe.address_lo = putPaddrLow(rqb_buffer->hbuf.phys);
+ -		hrqe.address_hi = putPaddrHigh(rqb_buffer->hbuf.phys);
+ -		drqe.address_lo = putPaddrLow(rqb_buffer->dbuf.phys);
+ -		drqe.address_hi = putPaddrHigh(rqb_buffer->dbuf.phys);
+ -		rc = lpfc_sli4_rq_put(hrq, drq, &hrqe, &drqe);
+ -		if (rc < 0) {
+ -			(rqbp->rqb_free_buffer)(phba, rqb_buffer);
+ -		} else {
+ -			list_add_tail(&rqb_buffer->hbuf.list,
+ -				      &rqbp->rqb_buffer_list);
+ -			rqbp->buffer_count++;
+ -		}
+ +	if (phba->sli4_hba.els_wq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.els_wq);
+ +		phba->sli4_hba.els_wq = NULL;
+  	}
+ -	return 1;
+ -}
+ -
+ -int
+ -lpfc_free_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *rq)
+ -{
+ -	struct lpfc_rqb *rqbp;
+ -	struct lpfc_dmabuf *h_buf;
+ -	struct rqb_dmabuf *rqb_buffer;
+  
+ -	rqbp = rq->rqbp;
+ -	while (!list_empty(&rqbp->rqb_buffer_list)) {
+ -		list_remove_head(&rqbp->rqb_buffer_list, h_buf,
+ -				 struct lpfc_dmabuf, list);
+ -
+ -		rqb_buffer = container_of(h_buf, struct rqb_dmabuf, hbuf);
+ -		(rqbp->rqb_free_buffer)(phba, rqb_buffer);
+ -		rqbp->buffer_count--;
+ +	/* Release unsolicited receive queue */
+ +	if (phba->sli4_hba.hdr_rq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.hdr_rq);
+ +		phba->sli4_hba.hdr_rq = NULL;
+  	}
+ -	return 1;
+ -}
+ -
+ -static int
+ -lpfc_create_wq_cq(struct lpfc_hba *phba, struct lpfc_queue *eq,
+ -	struct lpfc_queue *cq, struct lpfc_queue *wq, uint16_t *cq_map,
+ -	int qidx, uint32_t qtype)
+ -{
+ -	struct lpfc_sli_ring *pring;
+ -	int rc;
+ -
+ -	if (!eq || !cq || !wq) {
+ -		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -			"6085 Fast-path %s (%d) not allocated\n",
+ -			((eq) ? ((cq) ? "WQ" : "CQ") : "EQ"), qidx);
+ -		return -ENOMEM;
+ +	if (phba->sli4_hba.dat_rq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.dat_rq);
+ +		phba->sli4_hba.dat_rq = NULL;
+  	}
+  
+ -	/* create the Cq first */
+ -	rc = lpfc_cq_create(phba, cq, eq,
+ -			(qtype == LPFC_MBOX) ? LPFC_MCQ : LPFC_WCQ, qtype);
+ -	if (rc) {
+ -		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -			"6086 Failed setup of CQ (%d), rc = 0x%x\n",
+ -			qidx, (uint32_t)rc);
+ -		return rc;
+ +	/* Release ELS complete queue */
+ +	if (phba->sli4_hba.els_cq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.els_cq);
+ +		phba->sli4_hba.els_cq = NULL;
+  	}
+  
+ -	if (qtype != LPFC_MBOX) {
+ -		/* Setup nvme_cq_map for fast lookup */
+ -		if (cq_map)
+ -			*cq_map = cq->queue_id;
+ -
+ -		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -			"6087 CQ setup: cq[%d]-id=%d, parent eq[%d]-id=%d\n",
+ -			qidx, cq->queue_id, qidx, eq->queue_id);
+ -
+ -		/* create the wq */
+ -		rc = lpfc_wq_create(phba, wq, cq, qtype);
+ -		if (rc) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"6123 Fail setup fastpath WQ (%d), rc = 0x%x\n",
+ -				qidx, (uint32_t)rc);
+ -			/* no need to tear down cq - caller will do so */
+ -			return rc;
+ -		}
+ -
+ -		/* Bind this CQ/WQ to the NVME ring */
+ -		pring = wq->pring;
+ -		pring->sli.sli4.wqp = (void *)wq;
+ -		cq->pring = pring;
+ -
+ -		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -			"2593 WQ setup: wq[%d]-id=%d assoc=%d, cq[%d]-id=%d\n",
+ -			qidx, wq->queue_id, wq->assoc_qid, qidx, cq->queue_id);
+ -	} else {
+ -		rc = lpfc_mq_create(phba, wq, cq, LPFC_MBOX);
+ -		if (rc) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"0539 Failed setup of slow-path MQ: "
+ -				"rc = 0x%x\n", rc);
+ -			/* no need to tear down cq - caller will do so */
+ -			return rc;
+ -		}
+ -
+ -		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -			"2589 MBX MQ setup: wq-id=%d, parent cq-id=%d\n",
+ -			phba->sli4_hba.mbx_wq->queue_id,
+ -			phba->sli4_hba.mbx_cq->queue_id);
+ +	/* Release mailbox command complete queue */
+ +	if (phba->sli4_hba.mbx_cq != NULL) {
+ +		lpfc_sli4_queue_free(phba->sli4_hba.mbx_cq);
+ +		phba->sli4_hba.mbx_cq = NULL;
+  	}
+  
+ -	return 0;
+ +	return;
+  }
+  
+  /**
+@@@ -7781,194 -8501,236 +7935,208 @@@ lpfc_sli4_queue_setup(struct lpfc_hba *
+  		if (rc) {
+  			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+  					"0523 Failed setup of fast-path EQ "
+ -					"(%d), rc = 0x%x\n", qidx,
+ +					"(%d), rc = 0x%x\n", fcp_eqidx,
+  					(uint32_t)rc);
+ -			goto out_destroy;
+ +			goto out_destroy_hba_eq;
+  		}
+  		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -				"2584 HBA EQ setup: queue[%d]-id=%d\n",
+ -				qidx, phba->sli4_hba.hba_eq[qidx]->queue_id);
+ +				"2584 HBA EQ setup: "
+ +				"queue[%d]-id=%d\n", fcp_eqidx,
+ +				phba->sli4_hba.hba_eq[fcp_eqidx]->queue_id);
+  	}
+  
+ -	if (phba->cfg_nvme_io_channel) {
+ -		if (!phba->sli4_hba.nvme_cq || !phba->sli4_hba.nvme_wq) {
+ +	/* Set up fast-path FCP Response Complete Queue */
+ +	if (!phba->sli4_hba.fcp_cq) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"3148 Fast-path FCP CQ array not "
+ +				"allocated\n");
+ +		rc = -ENOMEM;
+ +		goto out_destroy_hba_eq;
+ +	}
+ +
+ +	for (fcp_cqidx = 0; fcp_cqidx < phba->cfg_fcp_io_channel; fcp_cqidx++) {
+ +		if (!phba->sli4_hba.fcp_cq[fcp_cqidx]) {
+  			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"6084 Fast-path NVME %s array not allocated\n",
+ -				(phba->sli4_hba.nvme_cq) ? "CQ" : "WQ");
+ +					"0526 Fast-path FCP CQ (%d) not "
+ +					"allocated\n", fcp_cqidx);
+  			rc = -ENOMEM;
+ -			goto out_destroy;
+ +			goto out_destroy_fcp_cq;
+  		}
+ -
+ -		for (qidx = 0; qidx < phba->cfg_nvme_io_channel; qidx++) {
+ -			rc = lpfc_create_wq_cq(phba,
+ -					phba->sli4_hba.hba_eq[
+ -						qidx % io_channel],
+ -					phba->sli4_hba.nvme_cq[qidx],
+ -					phba->sli4_hba.nvme_wq[qidx],
+ -					&phba->sli4_hba.nvme_cq_map[qidx],
+ -					qidx, LPFC_NVME);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -					"6123 Failed to setup fastpath "
+ -					"NVME WQ/CQ (%d), rc = 0x%x\n",
+ -					qidx, (uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+ +		rc = lpfc_cq_create(phba, phba->sli4_hba.fcp_cq[fcp_cqidx],
+ +			phba->sli4_hba.hba_eq[fcp_cqidx], LPFC_WCQ, LPFC_FCP);
+ +		if (rc) {
+ +			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +					"0527 Failed setup of fast-path FCP "
+ +					"CQ (%d), rc = 0x%x\n", fcp_cqidx,
+ +					(uint32_t)rc);
+ +			goto out_destroy_fcp_cq;
+  		}
+ +
+ +		/* Setup fcp_cq_map for fast lookup */
+ +		phba->sli4_hba.fcp_cq_map[fcp_cqidx] =
+ +				phba->sli4_hba.fcp_cq[fcp_cqidx]->queue_id;
+ +
+ +		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +				"2588 FCP CQ setup: cq[%d]-id=%d, "
+ +				"parent seq[%d]-id=%d\n",
+ +				fcp_cqidx,
+ +				phba->sli4_hba.fcp_cq[fcp_cqidx]->queue_id,
+ +				fcp_cqidx,
+ +				phba->sli4_hba.hba_eq[fcp_cqidx]->queue_id);
+ +	}
+ +
+ +	/* Set up fast-path FCP Work Queue */
+ +	if (!phba->sli4_hba.fcp_wq) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"3149 Fast-path FCP WQ array not "
+ +				"allocated\n");
+ +		rc = -ENOMEM;
+ +		goto out_destroy_fcp_cq;
+  	}
+  
+ -	if (phba->cfg_fcp_io_channel) {
+ -		/* Set up fast-path FCP Response Complete Queue */
+ -		if (!phba->sli4_hba.fcp_cq || !phba->sli4_hba.fcp_wq) {
+ +	for (fcp_wqidx = 0; fcp_wqidx < phba->cfg_fcp_io_channel; fcp_wqidx++) {
+ +		if (!phba->sli4_hba.fcp_wq[fcp_wqidx]) {
+  			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"3148 Fast-path FCP %s array not allocated\n",
+ -				phba->sli4_hba.fcp_cq ? "WQ" : "CQ");
+ +					"0534 Fast-path FCP WQ (%d) not "
+ +					"allocated\n", fcp_wqidx);
+  			rc = -ENOMEM;
+ -			goto out_destroy;
+ +			goto out_destroy_fcp_wq;
+  		}
+ -
+ -		for (qidx = 0; qidx < phba->cfg_fcp_io_channel; qidx++) {
+ -			rc = lpfc_create_wq_cq(phba,
+ -					phba->sli4_hba.hba_eq[
+ -						qidx % io_channel],
+ -					phba->sli4_hba.fcp_cq[qidx],
+ -					phba->sli4_hba.fcp_wq[qidx],
+ -					&phba->sli4_hba.fcp_cq_map[qidx],
+ -					qidx, LPFC_FCP);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -					"0535 Failed to setup fastpath "
+ -					"FCP WQ/CQ (%d), rc = 0x%x\n",
+ -					qidx, (uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+ +		rc = lpfc_wq_create(phba, phba->sli4_hba.fcp_wq[fcp_wqidx],
+ +				    phba->sli4_hba.fcp_cq[fcp_wqidx],
+ +				    LPFC_FCP);
+ +		if (rc) {
+ +			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +					"0535 Failed setup of fast-path FCP "
+ +					"WQ (%d), rc = 0x%x\n", fcp_wqidx,
+ +					(uint32_t)rc);
+ +			goto out_destroy_fcp_wq;
+  		}
+ -	}
+  
+ +		/* Bind this WQ to the next FCP ring */
+ +		pring = &psli->ring[MAX_SLI3_CONFIGURED_RINGS + fcp_wqidx];
+ +		pring->sli.sli4.wqp = (void *)phba->sli4_hba.fcp_wq[fcp_wqidx];
+ +		phba->sli4_hba.fcp_cq[fcp_wqidx]->pring = pring;
+ +
+ +		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +				"2591 FCP WQ setup: wq[%d]-id=%d, "
+ +				"parent cq[%d]-id=%d\n",
+ +				fcp_wqidx,
+ +				phba->sli4_hba.fcp_wq[fcp_wqidx]->queue_id,
+ +				fcp_cq_index,
+ +				phba->sli4_hba.fcp_cq[fcp_wqidx]->queue_id);
+ +	}
+  	/*
+ -	 * Set up Slow Path Complete Queues (CQs)
+ +	 * Set up Complete Queues (CQs)
+  	 */
+  
+ -	/* Set up slow-path MBOX CQ/MQ */
+ -
+ -	if (!phba->sli4_hba.mbx_cq || !phba->sli4_hba.mbx_wq) {
+ +	/* Set up slow-path MBOX Complete Queue as the first CQ */
+ +	if (!phba->sli4_hba.mbx_cq) {
+  		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+++<<<<<<< HEAD
+ +				"0528 Mailbox CQ not allocated\n");
+++=======
++ 				"0528 %s not allocated\n",
++ 				phba->sli4_hba.mbx_cq ?
++ 				"Mailbox WQ" : "Mailbox CQ");
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  		rc = -ENOMEM;
+ -		goto out_destroy;
+ +		goto out_destroy_fcp_wq;
+  	}
+++<<<<<<< HEAD
+ +	rc = lpfc_cq_create(phba, phba->sli4_hba.mbx_cq,
+ +			phba->sli4_hba.hba_eq[0], LPFC_MCQ, LPFC_MBOX);
+++=======
++ 
++ 	rc = lpfc_create_wq_cq(phba, phba->sli4_hba.hba_eq[0],
++ 			       phba->sli4_hba.mbx_cq,
++ 			       phba->sli4_hba.mbx_wq,
++ 			       NULL, 0, LPFC_MBOX);
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  	if (rc) {
+  		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -			"0529 Failed setup of mailbox WQ/CQ: rc = 0x%x\n",
+ -			(uint32_t)rc);
+ -		goto out_destroy;
+ -	}
+ -	if (phba->nvmet_support) {
+ -		if (!phba->sli4_hba.nvmet_cqset) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -					"3165 Fast-path NVME CQ Set "
+ -					"array not allocated\n");
+ -			rc = -ENOMEM;
+ -			goto out_destroy;
+ -		}
+ -		if (phba->cfg_nvmet_mrq > 1) {
+ -			rc = lpfc_cq_create_set(phba,
+ -					phba->sli4_hba.nvmet_cqset,
+ -					phba->sli4_hba.hba_eq,
+ -					LPFC_WCQ, LPFC_NVMET);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -						"3164 Failed setup of NVME CQ "
+ -						"Set, rc = 0x%x\n",
+ -						(uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+ -		} else {
+ -			/* Set up NVMET Receive Complete Queue */
+ -			rc = lpfc_cq_create(phba, phba->sli4_hba.nvmet_cqset[0],
+ -					    phba->sli4_hba.hba_eq[0],
+ -					    LPFC_WCQ, LPFC_NVMET);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -						"6089 Failed setup NVMET CQ: "
+ -						"rc = 0x%x\n", (uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+ -			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -					"6090 NVMET CQ setup: cq-id=%d, "
+ -					"parent eq-id=%d\n",
+ -					phba->sli4_hba.nvmet_cqset[0]->queue_id,
+ -					phba->sli4_hba.hba_eq[0]->queue_id);
+ -		}
+ +				"0529 Failed setup of slow-path mailbox CQ: "
+ +				"rc = 0x%x\n", (uint32_t)rc);
+ +		goto out_destroy_fcp_wq;
+  	}
+ +	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +			"2585 MBX CQ setup: cq-id=%d, parent eq-id=%d\n",
+ +			phba->sli4_hba.mbx_cq->queue_id,
+ +			phba->sli4_hba.hba_eq[0]->queue_id);
+  
+ -	/* Set up slow-path ELS WQ/CQ */
+ -	if (!phba->sli4_hba.els_cq || !phba->sli4_hba.els_wq) {
+ +	/* Set up slow-path ELS Complete Queue */
+ +	if (!phba->sli4_hba.els_cq) {
+  		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"0530 ELS %s not allocated\n",
+ -				phba->sli4_hba.els_cq ? "WQ" : "CQ");
+ +				"0530 ELS CQ not allocated\n");
+  		rc = -ENOMEM;
+ -		goto out_destroy;
+ +		goto out_destroy_mbx_cq;
+  	}
+ -	rc = lpfc_create_wq_cq(phba, phba->sli4_hba.hba_eq[0],
+ -					phba->sli4_hba.els_cq,
+ -					phba->sli4_hba.els_wq,
+ -					NULL, 0, LPFC_ELS);
+ +	rc = lpfc_cq_create(phba, phba->sli4_hba.els_cq,
+ +			phba->sli4_hba.hba_eq[0], LPFC_WCQ, LPFC_ELS);
+  	if (rc) {
+  		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -			"0529 Failed setup of ELS WQ/CQ: rc = 0x%x\n",
+ -			(uint32_t)rc);
+ -		goto out_destroy;
+ -	}
+ -	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -			"2590 ELS WQ setup: wq-id=%d, parent cq-id=%d\n",
+ -			phba->sli4_hba.els_wq->queue_id,
+ -			phba->sli4_hba.els_cq->queue_id);
+ -
+ -	if (phba->cfg_nvme_io_channel) {
+ -		/* Set up NVME LS Complete Queue */
+ -		if (!phba->sli4_hba.nvmels_cq || !phba->sli4_hba.nvmels_wq) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -					"6091 LS %s not allocated\n",
+ -					phba->sli4_hba.nvmels_cq ? "WQ" : "CQ");
+ -			rc = -ENOMEM;
+ -			goto out_destroy;
+ -		}
+ -		rc = lpfc_create_wq_cq(phba, phba->sli4_hba.hba_eq[0],
+ -					phba->sli4_hba.nvmels_cq,
+ -					phba->sli4_hba.nvmels_wq,
+ -					NULL, 0, LPFC_NVME_LS);
+ -		if (rc) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -				"0529 Failed setup of NVVME LS WQ/CQ: "
+ +				"0531 Failed setup of slow-path ELS CQ: "
+  				"rc = 0x%x\n", (uint32_t)rc);
+ -			goto out_destroy;
+ -		}
+ -
+ -		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ -				"6096 ELS WQ setup: wq-id=%d, "
+ -				"parent cq-id=%d\n",
+ -				phba->sli4_hba.nvmels_wq->queue_id,
+ -				phba->sli4_hba.nvmels_cq->queue_id);
+ +		goto out_destroy_mbx_cq;
+  	}
+ +	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +			"2586 ELS CQ setup: cq-id=%d, parent eq-id=%d\n",
+ +			phba->sli4_hba.els_cq->queue_id,
+ +			phba->sli4_hba.hba_eq[0]->queue_id);
+  
+  	/*
+ -	 * Create NVMET Receive Queue (RQ)
+ +	 * Set up all the Work Queues (WQs)
+  	 */
+ -	if (phba->nvmet_support) {
+ -		if ((!phba->sli4_hba.nvmet_cqset) ||
+ -		    (!phba->sli4_hba.nvmet_mrq_hdr) ||
+ -		    (!phba->sli4_hba.nvmet_mrq_data)) {
+ -			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -					"6130 MRQ CQ Queues not "
+ -					"allocated\n");
+ -			rc = -ENOMEM;
+ -			goto out_destroy;
+ -		}
+ -		if (phba->cfg_nvmet_mrq > 1) {
+ -			rc = lpfc_mrq_create(phba,
+ -					     phba->sli4_hba.nvmet_mrq_hdr,
+ -					     phba->sli4_hba.nvmet_mrq_data,
+ -					     phba->sli4_hba.nvmet_cqset,
+ -					     LPFC_NVMET);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -						"6098 Failed setup of NVMET "
+ -						"MRQ: rc = 0x%x\n",
+ -						(uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+ -
+ -		} else {
+ -			rc = lpfc_rq_create(phba,
+ -					    phba->sli4_hba.nvmet_mrq_hdr[0],
+ -					    phba->sli4_hba.nvmet_mrq_data[0],
+ -					    phba->sli4_hba.nvmet_cqset[0],
+ -					    LPFC_NVMET);
+ -			if (rc) {
+ -				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ -						"6057 Failed setup of NVMET "
+ -						"Receive Queue: rc = 0x%x\n",
+ -						(uint32_t)rc);
+ -				goto out_destroy;
+ -			}
+  
+ -			lpfc_printf_log(
+ -				phba, KERN_INFO, LOG_INIT,
+ -				"6099 NVMET RQ setup: hdr-rq-id=%d, "
+ -				"dat-rq-id=%d parent cq-id=%d\n",
+ -				phba->sli4_hba.nvmet_mrq_hdr[0]->queue_id,
+ -				phba->sli4_hba.nvmet_mrq_data[0]->queue_id,
+ -				phba->sli4_hba.nvmet_cqset[0]->queue_id);
+ +	/* Set up Mailbox Command Queue */
+ +	if (!phba->sli4_hba.mbx_wq) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"0538 Slow-path MQ not allocated\n");
+ +		rc = -ENOMEM;
+ +		goto out_destroy_els_cq;
+ +	}
+ +	rc = lpfc_mq_create(phba, phba->sli4_hba.mbx_wq,
+ +			    phba->sli4_hba.mbx_cq, LPFC_MBOX);
+ +	if (rc) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"0539 Failed setup of slow-path MQ: "
+ +				"rc = 0x%x\n", rc);
+ +		goto out_destroy_els_cq;
+ +	}
+ +	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +			"2589 MBX MQ setup: wq-id=%d, parent cq-id=%d\n",
+ +			phba->sli4_hba.mbx_wq->queue_id,
+ +			phba->sli4_hba.mbx_cq->queue_id);
+  
+ -		}
+ +	/* Set up slow-path ELS Work Queue */
+ +	if (!phba->sli4_hba.els_wq) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"0536 Slow-path ELS WQ not allocated\n");
+ +		rc = -ENOMEM;
+ +		goto out_destroy_mbx_wq;
+ +	}
+ +	rc = lpfc_wq_create(phba, phba->sli4_hba.els_wq,
+ +			    phba->sli4_hba.els_cq, LPFC_ELS);
+ +	if (rc) {
+ +		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ +				"0537 Failed setup of slow-path ELS WQ: "
+ +				"rc = 0x%x\n", (uint32_t)rc);
+ +		goto out_destroy_mbx_wq;
+  	}
+  
+ +	/* Bind this WQ to the ELS ring */
+ +	pring = &psli->ring[LPFC_ELS_RING];
+ +	pring->sli.sli4.wqp = (void *)phba->sli4_hba.els_wq;
+ +	phba->sli4_hba.els_cq->pring = pring;
+ +
+ +	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+ +			"2590 ELS WQ setup: wq-id=%d, parent cq-id=%d\n",
+ +			phba->sli4_hba.els_wq->queue_id,
+ +			phba->sli4_hba.els_cq->queue_id);
+ +
+ +	/*
+ +	 * Create Receive Queue (RQ)
+ +	 */
+  	if (!phba->sli4_hba.hdr_rq || !phba->sli4_hba.dat_rq) {
+  		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+  				"0540 Receive Queue not allocated\n");
+@@@ -10670,6 -11180,25 +10843,28 @@@ lpfc_pci_probe_one_s4(struct pci_dev *p
+  	/* Perform post initialization setup */
+  	lpfc_post_init_setup(phba);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* NVME support in FW earlier in the driver load corrects the
++ 	 * FC4 type making a check for nvme_support unnecessary.
++ 	 */
++ 	if ((phba->nvmet_support == 0) &&
++ 	    (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)) {
++ 		/* Create NVME binding with nvme_fc_transport. This
++ 		 * ensures the vport is initialized.  If the localport
++ 		 * create fails, it should not unload the driver to
++ 		 * support field issues.
++ 		 */
++ 		error = lpfc_nvme_create_localport(vport);
++ 		if (error) {
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 					"6004 NVME registration failed, "
++ 					"error x%x\n",
++ 					error);
++ 		}
++ 	}
++ 
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  	/* check for firmware upgrade or downgrade */
+  	if (phba->cfg_request_firmware_upgrade)
+  		lpfc_sli4_request_firmware_update(phba, INT_FW_UPGRADE);
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index ef148b0632d3,d60694469f45..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -12946,6 -13754,14 +12946,17 @@@ lpfc_sli4_queue_free(struct lpfc_queue 
+  				  dmabuf->virt, dmabuf->phys);
+  		kfree(dmabuf);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (queue->rqbp) {
++ 		lpfc_free_rq_buffer(queue->phba, queue);
++ 		kfree(queue->rqbp);
++ 	}
++ 
++ 	if (!list_empty(&queue->wq_list))
++ 		list_del(&queue->wq_list);
++ 
+++>>>>>>> d1f525aaa4d7 (Fix driver unload/reload operation.)
+  	kfree(queue);
+  	return;
+  }
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
