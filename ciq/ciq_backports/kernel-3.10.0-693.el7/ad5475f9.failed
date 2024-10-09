@@ -1,0 +1,305 @@
+x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op (Vitaly Kuznetsov) [1396554]
+Rebuild_FUZZ: 96.23%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit ad5475f9faf5186b7f59de2c6481ee3e211f1ed7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ad5475f9.failed
+
+HYPERVISOR_vcpu_op() passes Linux's idea of vCPU id as a parameter
+while Xen's idea is expected. In some cases these ideas diverge so we
+need to do remapping.
+
+Convert all callers of HYPERVISOR_vcpu_op() to use xen_vcpu_nr().
+
+Leave xen_fill_possible_map() and xen_filter_cpu_maps() intact as
+they're only being called by PV guests before perpu areas are
+initialized. While the issue could be solved by switching to
+early_percpu for xen_vcpu_id I think it's not worth it: PV guests will
+probably never get to the point where their idea of vCPU id diverges
+from Xen's.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+(cherry picked from commit ad5475f9faf5186b7f59de2c6481ee3e211f1ed7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/xen/smp.c
+#	arch/x86/xen/time.c
+#	drivers/xen/events.c
+#	drivers/xen/time.c
+diff --cc arch/x86/xen/smp.c
+index 44c0515b4138,a3118f250416..000000000000
+--- a/arch/x86/xen/smp.c
++++ b/arch/x86/xen/smp.c
+@@@ -394,14 -437,24 +394,19 @@@ cpu_initialize_context(unsigned int cpu
+  					(unsigned long)xen_hypervisor_callback;
+  		ctxt->failsafe_callback_eip =
+  					(unsigned long)xen_failsafe_callback;
+ -		ctxt->user_regs.cs = __KERNEL_CS;
+ -		per_cpu(xen_cr3, cpu) = __pa(swapper_pg_dir);
+  	}
+ -#ifdef CONFIG_XEN_PVH
+ -	else {
+ -		/*
+ -		 * The vcpu comes on kernel page tables which have the NX pte
+ -		 * bit set. This means before DS/SS is touched, NX in
+ -		 * EFER must be set. Hence the following assembly glue code.
+ -		 */
+ -		ctxt->user_regs.eip = (unsigned long)xen_pvh_early_cpu_init;
+ -		ctxt->user_regs.rdi = cpu;
+ -		ctxt->user_regs.rsi = true;  /* entry == true */
+ -	}
+ -#endif
+ +	ctxt->user_regs.cs = __KERNEL_CS;
+  	ctxt->user_regs.esp = idle->thread.sp0 - sizeof(struct pt_regs);
+++<<<<<<< HEAD
+ +
+ +	per_cpu(xen_cr3, cpu) = __pa(swapper_pg_dir);
+ +	ctxt->ctrlreg[3] = xen_pfn_to_cr3(virt_to_mfn(swapper_pg_dir));
+ +
+ +	if (HYPERVISOR_vcpu_op(VCPUOP_initialise, cpu, ctxt))
+++=======
++ 	ctxt->ctrlreg[3] = xen_pfn_to_cr3(virt_to_gfn(swapper_pg_dir));
++ 	if (HYPERVISOR_vcpu_op(VCPUOP_initialise, xen_vcpu_nr(cpu), ctxt))
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op)
+  		BUG();
+  
+  	kfree(ctxt);
+@@@ -445,13 -492,11 +450,13 @@@ static int xen_cpu_up(unsigned int cpu
+  	if (rc)
+  		return rc;
+  
+- 	rc = HYPERVISOR_vcpu_op(VCPUOP_up, cpu, NULL);
++ 	rc = HYPERVISOR_vcpu_op(VCPUOP_up, xen_vcpu_nr(cpu), NULL);
+  	BUG_ON(rc);
+  
+ -	while (cpu_report_state(cpu) != CPU_ONLINE)
+ +	while(per_cpu(cpu_state, cpu) != CPU_ONLINE) {
+  		HYPERVISOR_sched_op(SCHEDOP_yield, NULL);
+ +		barrier();
+ +	}
+  
+  	return 0;
+  }
+@@@ -475,13 -520,18 +480,19 @@@ static int xen_cpu_disable(void
+  
+  static void xen_cpu_die(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	while (xen_pv_domain() && HYPERVISOR_vcpu_op(VCPUOP_is_up, cpu, NULL)) {
+ +		current->state = TASK_UNINTERRUPTIBLE;
+++=======
++ 	while (xen_pv_domain() && HYPERVISOR_vcpu_op(VCPUOP_is_up,
++ 						     xen_vcpu_nr(cpu), NULL)) {
++ 		__set_current_state(TASK_UNINTERRUPTIBLE);
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op)
+  		schedule_timeout(HZ/10);
+  	}
+ -
+ -	if (common_cpu_die(cpu) == 0) {
+ -		xen_smp_intr_free(cpu);
+ -		xen_uninit_lock_cpu(cpu);
+ -		xen_teardown_timer(cpu);
+ -		xen_pmu_finish(cpu);
+ -	}
+ +	xen_smp_intr_free(cpu);
+ +	xen_uninit_lock_cpu(cpu);
+ +	xen_teardown_timer(cpu);
+  }
+  
+  static void xen_play_dead(void) /* used only with HOTPLUG_CPU */
+diff --cc arch/x86/xen/time.c
+index f31406757f89,fd7cd6f29b68..000000000000
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@@ -331,25 -223,24 +331,45 @@@ static void xen_vcpuop_set_mode(enum cl
+  {
+  	int cpu = smp_processor_id();
+  
+++<<<<<<< HEAD
+ +	switch (mode) {
+ +	case CLOCK_EVT_MODE_PERIODIC:
+ +		WARN_ON(1);	/* unsupported */
+ +		break;
+++=======
++ 	if (HYPERVISOR_vcpu_op(VCPUOP_stop_singleshot_timer, xen_vcpu_nr(cpu),
++ 			       NULL) ||
++ 	    HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, xen_vcpu_nr(cpu),
++ 			       NULL))
++ 		BUG();
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op)
+  
+ -	return 0;
+ -}
+ +	case CLOCK_EVT_MODE_ONESHOT:
+ +		if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, cpu, NULL))
+ +			BUG();
+ +		break;
+  
+++<<<<<<< HEAD
+ +	case CLOCK_EVT_MODE_UNUSED:
+ +	case CLOCK_EVT_MODE_SHUTDOWN:
+ +		if (HYPERVISOR_vcpu_op(VCPUOP_stop_singleshot_timer, cpu, NULL) ||
+ +		    HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, cpu, NULL))
+ +			BUG();
+ +		break;
+ +	case CLOCK_EVT_MODE_RESUME:
+ +		break;
+ +	}
+++=======
++ static int xen_vcpuop_set_oneshot(struct clock_event_device *evt)
++ {
++ 	int cpu = smp_processor_id();
++ 
++ 	if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, xen_vcpu_nr(cpu),
++ 			       NULL))
++ 		BUG();
++ 
++ 	return 0;
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op)
+  }
+  
+  static int xen_vcpuop_set_next_event(unsigned long delta,
+@@@ -359,14 -250,15 +379,20 @@@
+  	struct vcpu_set_singleshot_timer single;
+  	int ret;
+  
+ -	WARN_ON(!clockevent_state_oneshot(evt));
+ +	WARN_ON(evt->mode != CLOCK_EVT_MODE_ONESHOT);
+  
+  	single.timeout_abs_ns = get_abs_timeout(delta);
+ -	/* Get an event anyway, even if the timeout is already expired */
+ -	single.flags = 0;
+ +	single.flags = VCPU_SSHOTTMR_future;
+  
+++<<<<<<< HEAD
+ +	ret = HYPERVISOR_vcpu_op(VCPUOP_set_singleshot_timer, cpu, &single);
+ +
+ +	BUG_ON(ret != 0 && ret != -ETIME);
+++=======
++ 	ret = HYPERVISOR_vcpu_op(VCPUOP_set_singleshot_timer, xen_vcpu_nr(cpu),
++ 				 &single);
++ 	BUG_ON(ret != 0);
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op)
+  
+  	return ret;
+  }
+@@@ -486,9 -371,14 +513,10 @@@ static void __init xen_time_init(void
+  	int cpu = smp_processor_id();
+  	struct timespec tp;
+  
+ -	/* As Dom0 is never moved, no penalty on using TSC there */
+ -	if (xen_initial_domain())
+ -		xen_clocksource.rating = 275;
+ -
+  	clocksource_register_hz(&xen_clocksource, NSEC_PER_SEC);
+  
+- 	if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, cpu, NULL) == 0) {
++ 	if (HYPERVISOR_vcpu_op(VCPUOP_stop_periodic_timer, xen_vcpu_nr(cpu),
++ 			       NULL) == 0) {
+  		/* Successfully turned off 100Hz tick, so we have the
+  		   vcpuop-based timer interface */
+  		printk(KERN_DEBUG "Xen: using vcpuop timer interface\n");
+diff --cc drivers/xen/events.c
+index ff38c3180b36,8fb7cbf33fc9..000000000000
+--- a/drivers/xen/events.c
++++ b/drivers/xen/events.c
+@@@ -1212,7 -1207,18 +1212,22 @@@ EXPORT_SYMBOL_GPL(evtchn_put)
+  
+  void xen_send_IPI_one(unsigned int cpu, enum ipi_vector vector)
+  {
+++<<<<<<< HEAD:drivers/xen/events.c
+ +	int irq = per_cpu(ipi_to_irq, cpu)[vector];
+++=======
++ 	int irq;
++ 
++ #ifdef CONFIG_X86
++ 	if (unlikely(vector == XEN_NMI_VECTOR)) {
++ 		int rc =  HYPERVISOR_vcpu_op(VCPUOP_send_nmi, xen_vcpu_nr(cpu),
++ 					     NULL);
++ 		if (rc < 0)
++ 			printk(KERN_WARNING "Sending nmi to CPU%d failed (rc:%d)\n", cpu, rc);
++ 		return;
++ 	}
++ #endif
++ 	irq = per_cpu(ipi_to_irq, cpu)[vector];
+++>>>>>>> ad5475f9faf5 (x86/xen: use xen_vcpu_id mapping for HYPERVISOR_vcpu_op):drivers/xen/events/events_base.c
+  	BUG_ON(irq < 0);
+  	notify_remote_via_irq(irq);
+  }
+* Unmerged path drivers/xen/time.c
+diff --git a/arch/arm/xen/enlighten.c b/arch/arm/xen/enlighten.c
+index 81edd31bb4ac..84e6f06d7049 100644
+--- a/arch/arm/xen/enlighten.c
++++ b/arch/arm/xen/enlighten.c
+@@ -165,7 +165,8 @@ static void __init xen_percpu_init(void *unused)
+ 	info.mfn = __pa(vcpup) >> PAGE_SHIFT;
+ 	info.offset = offset_in_page(vcpup);
+ 
+-	err = HYPERVISOR_vcpu_op(VCPUOP_register_vcpu_info, cpu, &info);
++	err = HYPERVISOR_vcpu_op(VCPUOP_register_vcpu_info, xen_vcpu_nr(cpu),
++				 &info);
+ 	BUG_ON(err);
+ 	per_cpu(xen_vcpu, cpu) = vcpup;
+ 
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index e845b370d8e6..8548c13dd6cc 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -221,7 +221,8 @@ static void xen_vcpu_setup(int cpu)
+ 	   hypervisor has no unregister variant and this hypercall does not
+ 	   allow to over-write info.mfn and info.offset.
+ 	 */
+-	err = HYPERVISOR_vcpu_op(VCPUOP_register_vcpu_info, cpu, &info);
++	err = HYPERVISOR_vcpu_op(VCPUOP_register_vcpu_info, xen_vcpu_nr(cpu),
++				 &info);
+ 
+ 	if (err) {
+ 		printk(KERN_DEBUG "register_vcpu_info failed: err=%d\n", err);
+@@ -245,10 +246,11 @@ void xen_vcpu_restore(void)
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		bool other_cpu = (cpu != smp_processor_id());
+-		bool is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up, cpu, NULL);
++		bool is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up, xen_vcpu_nr(cpu),
++						NULL);
+ 
+ 		if (other_cpu && is_up &&
+-		    HYPERVISOR_vcpu_op(VCPUOP_down, cpu, NULL))
++		    HYPERVISOR_vcpu_op(VCPUOP_down, xen_vcpu_nr(cpu), NULL))
+ 			BUG();
+ 
+ 		xen_setup_runstate_info(cpu);
+@@ -257,7 +259,7 @@ void xen_vcpu_restore(void)
+ 			xen_vcpu_setup(cpu);
+ 
+ 		if (other_cpu && is_up &&
+-		    HYPERVISOR_vcpu_op(VCPUOP_up, cpu, NULL))
++		    HYPERVISOR_vcpu_op(VCPUOP_up, xen_vcpu_nr(cpu), NULL))
+ 			BUG();
+ 	}
+ }
+diff --git a/arch/x86/xen/irq.c b/arch/x86/xen/irq.c
+index 0d4b54283628..77bc5e7f336d 100644
+--- a/arch/x86/xen/irq.c
++++ b/arch/x86/xen/irq.c
+@@ -109,7 +109,8 @@ static void xen_safe_halt(void)
+ static void xen_halt(void)
+ {
+ 	if (irqs_disabled())
+-		HYPERVISOR_vcpu_op(VCPUOP_down, smp_processor_id(), NULL);
++		HYPERVISOR_vcpu_op(VCPUOP_down,
++				   xen_vcpu_nr(smp_processor_id()), NULL);
+ 	else
+ 		xen_safe_halt();
+ }
+* Unmerged path arch/x86/xen/smp.c
+* Unmerged path arch/x86/xen/time.c
+* Unmerged path drivers/xen/events.c
+* Unmerged path drivers/xen/time.c
