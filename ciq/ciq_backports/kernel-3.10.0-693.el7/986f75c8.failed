@@ -1,0 +1,99 @@
+nvme: avoid to use blk_mq_abort_requeue_list()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] avoid to use blk_mq_abort_requeue_list() (Ming Lei) [1445595]
+Rebuild_FUZZ: 93.02%
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 986f75c876dbafed98eba7cb516c5118f155db23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/986f75c8.failed
+
+NVMe may add request into requeue list simply and not kick off the
+requeue if hw queues are stopped. Then blk_mq_abort_requeue_list()
+is called in both nvme_kill_queues() and nvme_ns_remove() for
+dealing with this issue.
+
+Unfortunately blk_mq_abort_requeue_list() is absolutely a
+race maker, for example, one request may be requeued during
+the aborting. So this patch just calls blk_mq_kick_requeue_list() in
+nvme_kill_queues() to handle this issue like what nvme_start_queues()
+does. Now all requests in requeue list when queues are stopped will be
+handled by blk_mq_kick_requeue_list() when queues are restarted, either
+in nvme_start_queues() or in nvme_kill_queues().
+
+	Cc: stable@vger.kernel.org
+	Reported-by: Zhang Yi <yizhan@redhat.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 986f75c876dbafed98eba7cb516c5118f155db23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 0588703d149f,04e115834702..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1285,12 -2095,16 +1285,11 @@@ static void nvme_ns_remove(struct nvme_
+  			blk_integrity_unregister(ns->disk);
+  		sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
+  					&nvme_ns_attr_group);
+ -		if (ns->ndev)
+ -			nvme_nvm_unregister_sysfs(ns);
+  		del_gendisk(ns->disk);
+- 		blk_mq_abort_requeue_list(ns->queue);
+  		blk_cleanup_queue(ns->queue);
+  	}
+ -
+ -	mutex_lock(&ns->ctrl->namespaces_mutex);
+  	list_del_init(&ns->list);
+ -	mutex_unlock(&ns->ctrl->namespaces_mutex);
+ -
+ +	synchronize_rcu();
+  	nvme_put_ns(ns);
+  }
+  
+@@@ -1517,19 -2431,26 +1516,32 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  		 * Revalidating a dead namespace sets capacity to 0. This will
+  		 * end buffered writers dirtying pages that can't be synced.
+  		 */
+ -		if (!ns->disk || test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ -			continue;
+ -		revalidate_disk(ns->disk);
+ +		if (!test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ +			revalidate_disk(ns->disk);
+ +
+  		blk_set_queue_dying(ns->queue);
+++<<<<<<< HEAD
+ +		blk_mq_abort_requeue_list(ns->queue);
+ +		blk_mq_start_stopped_hw_queues(ns->queue, true);
+ +
+ +		nvme_put_ns(ns);
+++=======
++ 
++ 		/*
++ 		 * Forcibly start all queues to avoid having stuck requests.
++ 		 * Note that we must ensure the queues are not stopped
++ 		 * when the final removal happens.
++ 		 */
++ 		blk_mq_start_hw_queues(ns->queue);
++ 
++ 		/* draining requests in requeue list */
++ 		blk_mq_kick_requeue_list(ns->queue);
+++>>>>>>> 986f75c876db (nvme: avoid to use blk_mq_abort_requeue_list())
+  	}
+ -	mutex_unlock(&ctrl->namespaces_mutex);
+ +	rcu_read_unlock();
+  }
+ -EXPORT_SYMBOL_GPL(nvme_kill_queues);
+  
+ -void nvme_unfreeze(struct nvme_ctrl *ctrl)
+ +void nvme_stop_queues(struct nvme_ctrl *ctrl)
+  {
+  	struct nvme_ns *ns;
+  
+* Unmerged path drivers/nvme/host/core.c
