@@ -1,0 +1,939 @@
+mm: no need to check return value of debugfs_create functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [usb] mon: no need to check return value of debugfs_create functions (Torez Smith) [1657401]
+Rebuild_FUZZ: 97.56%
+commit-author Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+commit d9f7979c92f7b34469c1ca5d1f3add6681fd567c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d9f7979c.failed
+
+When calling debugfs functions, there is no need to ever check the
+return value.  The function can work or not, but the code logic should
+never do something different based on this.
+
+Link: http://lkml.kernel.org/r/20190122152151.16139-14-gregkh@linuxfoundation.org
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Laura Abbott <labbott@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d9f7979c92f7b34469c1ca5d1f3add6681fd567c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/cma_debug.c
+#	mm/failslab.c
+#	mm/gup_benchmark.c
+#	mm/huge_memory.c
+#	mm/memblock.c
+#	mm/memory.c
+#	mm/page_alloc.c
+#	mm/page_owner.c
+diff --cc mm/failslab.c
+index fefaabaab76d,ec5aad211c5b..000000000000
+--- a/mm/failslab.c
++++ b/mm/failslab.c
+@@@ -41,18 -48,12 +41,21 @@@ static int __init failslab_debugfs_init
+  	if (IS_ERR(dir))
+  		return PTR_ERR(dir);
+  
+++<<<<<<< HEAD
+ +	if (!debugfs_create_bool("ignore-gfp-wait", mode, dir,
+ +				&failslab.ignore_gfp_wait))
+ +		goto fail;
+ +	if (!debugfs_create_bool("cache-filter", mode, dir,
+ +				&failslab.cache_filter))
+ +		goto fail;
+++=======
++ 	debugfs_create_bool("ignore-gfp-wait", mode, dir,
++ 			    &failslab.ignore_gfp_reclaim);
++ 	debugfs_create_bool("cache-filter", mode, dir,
++ 			    &failslab.cache_filter);
+++>>>>>>> d9f7979c92f7 (mm: no need to check return value of debugfs_create functions)
+  
+  	return 0;
+- fail:
+- 	debugfs_remove_recursive(dir);
+- 
+- 	return -ENOMEM;
+  }
+  
+  late_initcall(failslab_debugfs_init);
+diff --cc mm/huge_memory.c
+index 5f95a9b1998d,af07527cd971..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -3480,6 -2342,614 +3480,617 @@@ void vma_adjust_trans_huge(struct vm_ar
+  		if (nstart & ~HPAGE_PMD_MASK &&
+  		    (nstart & HPAGE_PMD_MASK) >= next->vm_start &&
+  		    (nstart & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE <= next->vm_end)
+ -			split_huge_pmd_address(next, nstart, false, NULL);
+ +			split_huge_page_address(next->vm_mm, nstart);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void unmap_page(struct page *page)
++ {
++ 	enum ttu_flags ttu_flags = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS |
++ 		TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD;
++ 	bool unmap_success;
++ 
++ 	VM_BUG_ON_PAGE(!PageHead(page), page);
++ 
++ 	if (PageAnon(page))
++ 		ttu_flags |= TTU_SPLIT_FREEZE;
++ 
++ 	unmap_success = try_to_unmap(page, ttu_flags);
++ 	VM_BUG_ON_PAGE(!unmap_success, page);
++ }
++ 
++ static void remap_page(struct page *page)
++ {
++ 	int i;
++ 	if (PageTransHuge(page)) {
++ 		remove_migration_ptes(page, page, true);
++ 	} else {
++ 		for (i = 0; i < HPAGE_PMD_NR; i++)
++ 			remove_migration_ptes(page + i, page + i, true);
++ 	}
++ }
++ 
++ static void __split_huge_page_tail(struct page *head, int tail,
++ 		struct lruvec *lruvec, struct list_head *list)
++ {
++ 	struct page *page_tail = head + tail;
++ 
++ 	VM_BUG_ON_PAGE(atomic_read(&page_tail->_mapcount) != -1, page_tail);
++ 
++ 	/*
++ 	 * Clone page flags before unfreezing refcount.
++ 	 *
++ 	 * After successful get_page_unless_zero() might follow flags change,
++ 	 * for exmaple lock_page() which set PG_waiters.
++ 	 */
++ 	page_tail->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
++ 	page_tail->flags |= (head->flags &
++ 			((1L << PG_referenced) |
++ 			 (1L << PG_swapbacked) |
++ 			 (1L << PG_swapcache) |
++ 			 (1L << PG_mlocked) |
++ 			 (1L << PG_uptodate) |
++ 			 (1L << PG_active) |
++ 			 (1L << PG_workingset) |
++ 			 (1L << PG_locked) |
++ 			 (1L << PG_unevictable) |
++ 			 (1L << PG_dirty)));
++ 
++ 	/* ->mapping in first tail page is compound_mapcount */
++ 	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
++ 			page_tail);
++ 	page_tail->mapping = head->mapping;
++ 	page_tail->index = head->index + tail;
++ 
++ 	/* Page flags must be visible before we make the page non-compound. */
++ 	smp_wmb();
++ 
++ 	/*
++ 	 * Clear PageTail before unfreezing page refcount.
++ 	 *
++ 	 * After successful get_page_unless_zero() might follow put_page()
++ 	 * which needs correct compound_head().
++ 	 */
++ 	clear_compound_head(page_tail);
++ 
++ 	/* Finally unfreeze refcount. Additional reference from page cache. */
++ 	page_ref_unfreeze(page_tail, 1 + (!PageAnon(head) ||
++ 					  PageSwapCache(head)));
++ 
++ 	if (page_is_young(head))
++ 		set_page_young(page_tail);
++ 	if (page_is_idle(head))
++ 		set_page_idle(page_tail);
++ 
++ 	page_cpupid_xchg_last(page_tail, page_cpupid_last(head));
++ 
++ 	/*
++ 	 * always add to the tail because some iterators expect new
++ 	 * pages to show after the currently processed elements - e.g.
++ 	 * migrate_pages
++ 	 */
++ 	lru_add_page_tail(head, page_tail, lruvec, list);
++ }
++ 
++ static void __split_huge_page(struct page *page, struct list_head *list,
++ 		pgoff_t end, unsigned long flags)
++ {
++ 	struct page *head = compound_head(page);
++ 	struct zone *zone = page_zone(head);
++ 	struct lruvec *lruvec;
++ 	int i;
++ 
++ 	lruvec = mem_cgroup_page_lruvec(head, zone->zone_pgdat);
++ 
++ 	/* complete memcg works before add pages to LRU */
++ 	mem_cgroup_split_huge_fixup(head);
++ 
++ 	for (i = HPAGE_PMD_NR - 1; i >= 1; i--) {
++ 		__split_huge_page_tail(head, i, lruvec, list);
++ 		/* Some pages can be beyond i_size: drop them from page cache */
++ 		if (head[i].index >= end) {
++ 			ClearPageDirty(head + i);
++ 			__delete_from_page_cache(head + i, NULL);
++ 			if (IS_ENABLED(CONFIG_SHMEM) && PageSwapBacked(head))
++ 				shmem_uncharge(head->mapping->host, 1);
++ 			put_page(head + i);
++ 		}
++ 	}
++ 
++ 	ClearPageCompound(head);
++ 	/* See comment in __split_huge_page_tail() */
++ 	if (PageAnon(head)) {
++ 		/* Additional pin to swap cache */
++ 		if (PageSwapCache(head))
++ 			page_ref_add(head, 2);
++ 		else
++ 			page_ref_inc(head);
++ 	} else {
++ 		/* Additional pin to page cache */
++ 		page_ref_add(head, 2);
++ 		xa_unlock(&head->mapping->i_pages);
++ 	}
++ 
++ 	spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
++ 
++ 	remap_page(head);
++ 
++ 	for (i = 0; i < HPAGE_PMD_NR; i++) {
++ 		struct page *subpage = head + i;
++ 		if (subpage == page)
++ 			continue;
++ 		unlock_page(subpage);
++ 
++ 		/*
++ 		 * Subpages may be freed if there wasn't any mapping
++ 		 * like if add_to_swap() is running on a lru page that
++ 		 * had its mapping zapped. And freeing these pages
++ 		 * requires taking the lru_lock so we do the put_page
++ 		 * of the tail pages after the split is complete.
++ 		 */
++ 		put_page(subpage);
++ 	}
++ }
++ 
++ int total_mapcount(struct page *page)
++ {
++ 	int i, compound, ret;
++ 
++ 	VM_BUG_ON_PAGE(PageTail(page), page);
++ 
++ 	if (likely(!PageCompound(page)))
++ 		return atomic_read(&page->_mapcount) + 1;
++ 
++ 	compound = compound_mapcount(page);
++ 	if (PageHuge(page))
++ 		return compound;
++ 	ret = compound;
++ 	for (i = 0; i < HPAGE_PMD_NR; i++)
++ 		ret += atomic_read(&page[i]._mapcount) + 1;
++ 	/* File pages has compound_mapcount included in _mapcount */
++ 	if (!PageAnon(page))
++ 		return ret - compound * HPAGE_PMD_NR;
++ 	if (PageDoubleMap(page))
++ 		ret -= HPAGE_PMD_NR;
++ 	return ret;
++ }
++ 
++ /*
++  * This calculates accurately how many mappings a transparent hugepage
++  * has (unlike page_mapcount() which isn't fully accurate). This full
++  * accuracy is primarily needed to know if copy-on-write faults can
++  * reuse the page and change the mapping to read-write instead of
++  * copying them. At the same time this returns the total_mapcount too.
++  *
++  * The function returns the highest mapcount any one of the subpages
++  * has. If the return value is one, even if different processes are
++  * mapping different subpages of the transparent hugepage, they can
++  * all reuse it, because each process is reusing a different subpage.
++  *
++  * The total_mapcount is instead counting all virtual mappings of the
++  * subpages. If the total_mapcount is equal to "one", it tells the
++  * caller all mappings belong to the same "mm" and in turn the
++  * anon_vma of the transparent hugepage can become the vma->anon_vma
++  * local one as no other process may be mapping any of the subpages.
++  *
++  * It would be more accurate to replace page_mapcount() with
++  * page_trans_huge_mapcount(), however we only use
++  * page_trans_huge_mapcount() in the copy-on-write faults where we
++  * need full accuracy to avoid breaking page pinning, because
++  * page_trans_huge_mapcount() is slower than page_mapcount().
++  */
++ int page_trans_huge_mapcount(struct page *page, int *total_mapcount)
++ {
++ 	int i, ret, _total_mapcount, mapcount;
++ 
++ 	/* hugetlbfs shouldn't call it */
++ 	VM_BUG_ON_PAGE(PageHuge(page), page);
++ 
++ 	if (likely(!PageTransCompound(page))) {
++ 		mapcount = atomic_read(&page->_mapcount) + 1;
++ 		if (total_mapcount)
++ 			*total_mapcount = mapcount;
++ 		return mapcount;
++ 	}
++ 
++ 	page = compound_head(page);
++ 
++ 	_total_mapcount = ret = 0;
++ 	for (i = 0; i < HPAGE_PMD_NR; i++) {
++ 		mapcount = atomic_read(&page[i]._mapcount) + 1;
++ 		ret = max(ret, mapcount);
++ 		_total_mapcount += mapcount;
++ 	}
++ 	if (PageDoubleMap(page)) {
++ 		ret -= 1;
++ 		_total_mapcount -= HPAGE_PMD_NR;
++ 	}
++ 	mapcount = compound_mapcount(page);
++ 	ret += mapcount;
++ 	_total_mapcount += mapcount;
++ 	if (total_mapcount)
++ 		*total_mapcount = _total_mapcount;
++ 	return ret;
++ }
++ 
++ /* Racy check whether the huge page can be split */
++ bool can_split_huge_page(struct page *page, int *pextra_pins)
++ {
++ 	int extra_pins;
++ 
++ 	/* Additional pins from page cache */
++ 	if (PageAnon(page))
++ 		extra_pins = PageSwapCache(page) ? HPAGE_PMD_NR : 0;
++ 	else
++ 		extra_pins = HPAGE_PMD_NR;
++ 	if (pextra_pins)
++ 		*pextra_pins = extra_pins;
++ 	return total_mapcount(page) == page_count(page) - extra_pins - 1;
++ }
++ 
++ /*
++  * This function splits huge page into normal pages. @page can point to any
++  * subpage of huge page to split. Split doesn't change the position of @page.
++  *
++  * Only caller must hold pin on the @page, otherwise split fails with -EBUSY.
++  * The huge page must be locked.
++  *
++  * If @list is null, tail pages will be added to LRU list, otherwise, to @list.
++  *
++  * Both head page and tail pages will inherit mapping, flags, and so on from
++  * the hugepage.
++  *
++  * GUP pin and PG_locked transferred to @page. Rest subpages can be freed if
++  * they are not mapped.
++  *
++  * Returns 0 if the hugepage is split successfully.
++  * Returns -EBUSY if the page is pinned or if anon_vma disappeared from under
++  * us.
++  */
++ int split_huge_page_to_list(struct page *page, struct list_head *list)
++ {
++ 	struct page *head = compound_head(page);
++ 	struct pglist_data *pgdata = NODE_DATA(page_to_nid(head));
++ 	struct anon_vma *anon_vma = NULL;
++ 	struct address_space *mapping = NULL;
++ 	int count, mapcount, extra_pins, ret;
++ 	bool mlocked;
++ 	unsigned long flags;
++ 	pgoff_t end;
++ 
++ 	VM_BUG_ON_PAGE(is_huge_zero_page(page), page);
++ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
++ 	VM_BUG_ON_PAGE(!PageCompound(page), page);
++ 
++ 	if (PageWriteback(page))
++ 		return -EBUSY;
++ 
++ 	if (PageAnon(head)) {
++ 		/*
++ 		 * The caller does not necessarily hold an mmap_sem that would
++ 		 * prevent the anon_vma disappearing so we first we take a
++ 		 * reference to it and then lock the anon_vma for write. This
++ 		 * is similar to page_lock_anon_vma_read except the write lock
++ 		 * is taken to serialise against parallel split or collapse
++ 		 * operations.
++ 		 */
++ 		anon_vma = page_get_anon_vma(head);
++ 		if (!anon_vma) {
++ 			ret = -EBUSY;
++ 			goto out;
++ 		}
++ 		end = -1;
++ 		mapping = NULL;
++ 		anon_vma_lock_write(anon_vma);
++ 	} else {
++ 		mapping = head->mapping;
++ 
++ 		/* Truncated ? */
++ 		if (!mapping) {
++ 			ret = -EBUSY;
++ 			goto out;
++ 		}
++ 
++ 		anon_vma = NULL;
++ 		i_mmap_lock_read(mapping);
++ 
++ 		/*
++ 		 *__split_huge_page() may need to trim off pages beyond EOF:
++ 		 * but on 32-bit, i_size_read() takes an irq-unsafe seqlock,
++ 		 * which cannot be nested inside the page tree lock. So note
++ 		 * end now: i_size itself may be changed at any moment, but
++ 		 * head page lock is good enough to serialize the trimming.
++ 		 */
++ 		end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
++ 	}
++ 
++ 	/*
++ 	 * Racy check if we can split the page, before unmap_page() will
++ 	 * split PMDs
++ 	 */
++ 	if (!can_split_huge_page(head, &extra_pins)) {
++ 		ret = -EBUSY;
++ 		goto out_unlock;
++ 	}
++ 
++ 	mlocked = PageMlocked(page);
++ 	unmap_page(head);
++ 	VM_BUG_ON_PAGE(compound_mapcount(head), head);
++ 
++ 	/* Make sure the page is not on per-CPU pagevec as it takes pin */
++ 	if (mlocked)
++ 		lru_add_drain();
++ 
++ 	/* prevent PageLRU to go away from under us, and freeze lru stats */
++ 	spin_lock_irqsave(zone_lru_lock(page_zone(head)), flags);
++ 
++ 	if (mapping) {
++ 		XA_STATE(xas, &mapping->i_pages, page_index(head));
++ 
++ 		/*
++ 		 * Check if the head page is present in page cache.
++ 		 * We assume all tail are present too, if head is there.
++ 		 */
++ 		xa_lock(&mapping->i_pages);
++ 		if (xas_load(&xas) != head)
++ 			goto fail;
++ 	}
++ 
++ 	/* Prevent deferred_split_scan() touching ->_refcount */
++ 	spin_lock(&pgdata->split_queue_lock);
++ 	count = page_count(head);
++ 	mapcount = total_mapcount(head);
++ 	if (!mapcount && page_ref_freeze(head, 1 + extra_pins)) {
++ 		if (!list_empty(page_deferred_list(head))) {
++ 			pgdata->split_queue_len--;
++ 			list_del(page_deferred_list(head));
++ 		}
++ 		if (mapping)
++ 			__dec_node_page_state(page, NR_SHMEM_THPS);
++ 		spin_unlock(&pgdata->split_queue_lock);
++ 		__split_huge_page(page, list, end, flags);
++ 		if (PageSwapCache(head)) {
++ 			swp_entry_t entry = { .val = page_private(head) };
++ 
++ 			ret = split_swap_cluster(entry);
++ 		} else
++ 			ret = 0;
++ 	} else {
++ 		if (IS_ENABLED(CONFIG_DEBUG_VM) && mapcount) {
++ 			pr_alert("total_mapcount: %u, page_count(): %u\n",
++ 					mapcount, count);
++ 			if (PageTail(page))
++ 				dump_page(head, NULL);
++ 			dump_page(page, "total_mapcount(head) > 0");
++ 			BUG();
++ 		}
++ 		spin_unlock(&pgdata->split_queue_lock);
++ fail:		if (mapping)
++ 			xa_unlock(&mapping->i_pages);
++ 		spin_unlock_irqrestore(zone_lru_lock(page_zone(head)), flags);
++ 		remap_page(head);
++ 		ret = -EBUSY;
++ 	}
++ 
++ out_unlock:
++ 	if (anon_vma) {
++ 		anon_vma_unlock_write(anon_vma);
++ 		put_anon_vma(anon_vma);
++ 	}
++ 	if (mapping)
++ 		i_mmap_unlock_read(mapping);
++ out:
++ 	count_vm_event(!ret ? THP_SPLIT_PAGE : THP_SPLIT_PAGE_FAILED);
++ 	return ret;
++ }
++ 
++ void free_transhuge_page(struct page *page)
++ {
++ 	struct pglist_data *pgdata = NODE_DATA(page_to_nid(page));
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&pgdata->split_queue_lock, flags);
++ 	if (!list_empty(page_deferred_list(page))) {
++ 		pgdata->split_queue_len--;
++ 		list_del(page_deferred_list(page));
++ 	}
++ 	spin_unlock_irqrestore(&pgdata->split_queue_lock, flags);
++ 	free_compound_page(page);
++ }
++ 
++ void deferred_split_huge_page(struct page *page)
++ {
++ 	struct pglist_data *pgdata = NODE_DATA(page_to_nid(page));
++ 	unsigned long flags;
++ 
++ 	VM_BUG_ON_PAGE(!PageTransHuge(page), page);
++ 
++ 	spin_lock_irqsave(&pgdata->split_queue_lock, flags);
++ 	if (list_empty(page_deferred_list(page))) {
++ 		count_vm_event(THP_DEFERRED_SPLIT_PAGE);
++ 		list_add_tail(page_deferred_list(page), &pgdata->split_queue);
++ 		pgdata->split_queue_len++;
++ 	}
++ 	spin_unlock_irqrestore(&pgdata->split_queue_lock, flags);
++ }
++ 
++ static unsigned long deferred_split_count(struct shrinker *shrink,
++ 		struct shrink_control *sc)
++ {
++ 	struct pglist_data *pgdata = NODE_DATA(sc->nid);
++ 	return READ_ONCE(pgdata->split_queue_len);
++ }
++ 
++ static unsigned long deferred_split_scan(struct shrinker *shrink,
++ 		struct shrink_control *sc)
++ {
++ 	struct pglist_data *pgdata = NODE_DATA(sc->nid);
++ 	unsigned long flags;
++ 	LIST_HEAD(list), *pos, *next;
++ 	struct page *page;
++ 	int split = 0;
++ 
++ 	spin_lock_irqsave(&pgdata->split_queue_lock, flags);
++ 	/* Take pin on all head pages to avoid freeing them under us */
++ 	list_for_each_safe(pos, next, &pgdata->split_queue) {
++ 		page = list_entry((void *)pos, struct page, mapping);
++ 		page = compound_head(page);
++ 		if (get_page_unless_zero(page)) {
++ 			list_move(page_deferred_list(page), &list);
++ 		} else {
++ 			/* We lost race with put_compound_page() */
++ 			list_del_init(page_deferred_list(page));
++ 			pgdata->split_queue_len--;
++ 		}
++ 		if (!--sc->nr_to_scan)
++ 			break;
++ 	}
++ 	spin_unlock_irqrestore(&pgdata->split_queue_lock, flags);
++ 
++ 	list_for_each_safe(pos, next, &list) {
++ 		page = list_entry((void *)pos, struct page, mapping);
++ 		if (!trylock_page(page))
++ 			goto next;
++ 		/* split_huge_page() removes page from list on success */
++ 		if (!split_huge_page(page))
++ 			split++;
++ 		unlock_page(page);
++ next:
++ 		put_page(page);
++ 	}
++ 
++ 	spin_lock_irqsave(&pgdata->split_queue_lock, flags);
++ 	list_splice_tail(&list, &pgdata->split_queue);
++ 	spin_unlock_irqrestore(&pgdata->split_queue_lock, flags);
++ 
++ 	/*
++ 	 * Stop shrinker if we didn't split any page, but the queue is empty.
++ 	 * This can happen if pages were freed under us.
++ 	 */
++ 	if (!split && list_empty(&pgdata->split_queue))
++ 		return SHRINK_STOP;
++ 	return split;
++ }
++ 
++ static struct shrinker deferred_split_shrinker = {
++ 	.count_objects = deferred_split_count,
++ 	.scan_objects = deferred_split_scan,
++ 	.seeks = DEFAULT_SEEKS,
++ 	.flags = SHRINKER_NUMA_AWARE,
++ };
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static int split_huge_pages_set(void *data, u64 val)
++ {
++ 	struct zone *zone;
++ 	struct page *page;
++ 	unsigned long pfn, max_zone_pfn;
++ 	unsigned long total = 0, split = 0;
++ 
++ 	if (val != 1)
++ 		return -EINVAL;
++ 
++ 	for_each_populated_zone(zone) {
++ 		max_zone_pfn = zone_end_pfn(zone);
++ 		for (pfn = zone->zone_start_pfn; pfn < max_zone_pfn; pfn++) {
++ 			if (!pfn_valid(pfn))
++ 				continue;
++ 
++ 			page = pfn_to_page(pfn);
++ 			if (!get_page_unless_zero(page))
++ 				continue;
++ 
++ 			if (zone != page_zone(page))
++ 				goto next;
++ 
++ 			if (!PageHead(page) || PageHuge(page) || !PageLRU(page))
++ 				goto next;
++ 
++ 			total++;
++ 			lock_page(page);
++ 			if (!split_huge_page(page))
++ 				split++;
++ 			unlock_page(page);
++ next:
++ 			put_page(page);
++ 		}
++ 	}
++ 
++ 	pr_info("%lu of %lu THP split\n", split, total);
++ 
++ 	return 0;
++ }
++ DEFINE_SIMPLE_ATTRIBUTE(split_huge_pages_fops, NULL, split_huge_pages_set,
++ 		"%llu\n");
++ 
++ static int __init split_huge_pages_debugfs(void)
++ {
++ 	debugfs_create_file("split_huge_pages", 0200, NULL, NULL,
++ 			    &split_huge_pages_fops);
++ 	return 0;
++ }
++ late_initcall(split_huge_pages_debugfs);
++ #endif
++ 
++ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
++ void set_pmd_migration_entry(struct page_vma_mapped_walk *pvmw,
++ 		struct page *page)
++ {
++ 	struct vm_area_struct *vma = pvmw->vma;
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	unsigned long address = pvmw->address;
++ 	pmd_t pmdval;
++ 	swp_entry_t entry;
++ 	pmd_t pmdswp;
++ 
++ 	if (!(pvmw->pmd && !pvmw->pte))
++ 		return;
++ 
++ 	flush_cache_range(vma, address, address + HPAGE_PMD_SIZE);
++ 	pmdval = *pvmw->pmd;
++ 	pmdp_invalidate(vma, address, pvmw->pmd);
++ 	if (pmd_dirty(pmdval))
++ 		set_page_dirty(page);
++ 	entry = make_migration_entry(page, pmd_write(pmdval));
++ 	pmdswp = swp_entry_to_pmd(entry);
++ 	if (pmd_soft_dirty(pmdval))
++ 		pmdswp = pmd_swp_mksoft_dirty(pmdswp);
++ 	set_pmd_at(mm, address, pvmw->pmd, pmdswp);
++ 	page_remove_rmap(page, true);
++ 	put_page(page);
++ }
++ 
++ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
++ {
++ 	struct vm_area_struct *vma = pvmw->vma;
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	unsigned long address = pvmw->address;
++ 	unsigned long mmun_start = address & HPAGE_PMD_MASK;
++ 	pmd_t pmde;
++ 	swp_entry_t entry;
++ 
++ 	if (!(pvmw->pmd && !pvmw->pte))
++ 		return;
++ 
++ 	entry = pmd_to_swp_entry(*pvmw->pmd);
++ 	get_page(new);
++ 	pmde = pmd_mkold(mk_huge_pmd(new, vma->vm_page_prot));
++ 	if (pmd_swp_soft_dirty(*pvmw->pmd))
++ 		pmde = pmd_mksoft_dirty(pmde);
++ 	if (is_write_migration_entry(entry))
++ 		pmde = maybe_pmd_mkwrite(pmde, vma);
++ 
++ 	flush_cache_range(vma, mmun_start, mmun_start + HPAGE_PMD_SIZE);
++ 	if (PageAnon(new))
++ 		page_add_anon_rmap(new, vma, mmun_start, true);
++ 	else
++ 		page_add_file_rmap(new, true);
++ 	set_pmd_at(mm, mmun_start, pvmw->pmd, pmde);
++ 	if ((vma->vm_flags & VM_LOCKED) && !PageDoubleMap(new))
++ 		mlock_vma_page(new);
++ 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
++ }
++ #endif
+++>>>>>>> d9f7979c92f7 (mm: no need to check return value of debugfs_create functions)
+diff --cc mm/memblock.c
+index 52a3803db1d5,470601115892..000000000000
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@@ -1662,10 -2005,15 +1662,22 @@@ static const struct file_operations mem
+  static int __init memblock_init_debugfs(void)
+  {
+  	struct dentry *root = debugfs_create_dir("memblock", NULL);
+++<<<<<<< HEAD
+ +	if (!root)
+ +		return -ENXIO;
+ +	debugfs_create_file("memory", S_IRUGO, root, &memblock.memory, &memblock_debug_fops);
+ +	debugfs_create_file("reserved", S_IRUGO, root, &memblock.reserved, &memblock_debug_fops);
+++=======
++ 
++ 	debugfs_create_file("memory", 0444, root,
++ 			    &memblock.memory, &memblock_debug_fops);
++ 	debugfs_create_file("reserved", 0444, root,
++ 			    &memblock.reserved, &memblock_debug_fops);
++ #ifdef CONFIG_HAVE_MEMBLOCK_PHYS_MAP
++ 	debugfs_create_file("physmem", 0444, root,
++ 			    &memblock.physmem, &memblock_debug_fops);
++ #endif
+++>>>>>>> d9f7979c92f7 (mm: no need to check return value of debugfs_create functions)
+  
+  	return 0;
+  }
+diff --cc mm/memory.c
+index 992044080678,6aff43171a7b..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3082,17 -3315,128 +3082,125 @@@ int finish_fault(struct vm_fault *vmf
+  	return 0;
+  }
+  
+ -/*
+ - * fault_around_bytes must be rounded down to the nearest page order as it's
+ - * what do_fault_around() expects to see.
+ - */
+ -static int fault_around_bytes_set(void *data, u64 val)
+ +static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ +		unsigned long address, pmd_t *pmd,
+ +		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
+  {
+ -	if (val / PAGE_SIZE > PTRS_PER_PTE)
+ -		return -EINVAL;
+ -	if (val > PAGE_SIZE)
+ -		fault_around_bytes = rounddown_pow_of_two(val);
+ -	else
+ -		fault_around_bytes = PAGE_SIZE; /* rounddown_pow_of_two(0) is undefined */
+ -	return 0;
+ -}
+ -DEFINE_DEBUGFS_ATTRIBUTE(fault_around_bytes_fops,
+ -		fault_around_bytes_get, fault_around_bytes_set, "%llu\n");
+ +	struct page *fault_page;
+ +	spinlock_t *ptl;
+ +	pte_t *pte;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = __do_fault(vma, address, pgoff, flags, NULL, &fault_page, NULL,
+ +			pmd, orig_pte);
+++=======
++ static int __init fault_around_debugfs(void)
++ {
++ 	debugfs_create_file_unsafe("fault_around_bytes", 0644, NULL, NULL,
++ 				   &fault_around_bytes_fops);
++ 	return 0;
++ }
++ late_initcall(fault_around_debugfs);
++ #endif
++ 
++ /*
++  * do_fault_around() tries to map few pages around the fault address. The hope
++  * is that the pages will be needed soon and this will lower the number of
++  * faults to handle.
++  *
++  * It uses vm_ops->map_pages() to map the pages, which skips the page if it's
++  * not ready to be mapped: not up-to-date, locked, etc.
++  *
++  * This function is called with the page table lock taken. In the split ptlock
++  * case the page table lock only protects only those entries which belong to
++  * the page table corresponding to the fault address.
++  *
++  * This function doesn't cross the VMA boundaries, in order to call map_pages()
++  * only once.
++  *
++  * fault_around_bytes defines how many bytes we'll try to map.
++  * do_fault_around() expects it to be set to a power of two less than or equal
++  * to PTRS_PER_PTE.
++  *
++  * The virtual address of the area that we map is naturally aligned to
++  * fault_around_bytes rounded down to the machine page size
++  * (and therefore to page order).  This way it's easier to guarantee
++  * that we don't cross page table boundaries.
++  */
++ static vm_fault_t do_fault_around(struct vm_fault *vmf)
++ {
++ 	unsigned long address = vmf->address, nr_pages, mask;
++ 	pgoff_t start_pgoff = vmf->pgoff;
++ 	pgoff_t end_pgoff;
++ 	int off;
++ 	vm_fault_t ret = 0;
++ 
++ 	nr_pages = READ_ONCE(fault_around_bytes) >> PAGE_SHIFT;
++ 	mask = ~(nr_pages * PAGE_SIZE - 1) & PAGE_MASK;
++ 
++ 	vmf->address = max(address & mask, vmf->vma->vm_start);
++ 	off = ((address - vmf->address) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++ 	start_pgoff -= off;
++ 
++ 	/*
++ 	 *  end_pgoff is either the end of the page table, the end of
++ 	 *  the vma or nr_pages from start_pgoff, depending what is nearest.
++ 	 */
++ 	end_pgoff = start_pgoff -
++ 		((vmf->address >> PAGE_SHIFT) & (PTRS_PER_PTE - 1)) +
++ 		PTRS_PER_PTE - 1;
++ 	end_pgoff = min3(end_pgoff, vma_pages(vmf->vma) + vmf->vma->vm_pgoff - 1,
++ 			start_pgoff + nr_pages - 1);
++ 
++ 	if (pmd_none(*vmf->pmd)) {
++ 		vmf->prealloc_pte = pte_alloc_one(vmf->vma->vm_mm);
++ 		if (!vmf->prealloc_pte)
++ 			goto out;
++ 		smp_wmb(); /* See comment in __pte_alloc() */
++ 	}
++ 
++ 	vmf->vma->vm_ops->map_pages(vmf, start_pgoff, end_pgoff);
++ 
++ 	/* Huge page is mapped? Page fault is solved */
++ 	if (pmd_trans_huge(*vmf->pmd)) {
++ 		ret = VM_FAULT_NOPAGE;
++ 		goto out;
++ 	}
++ 
++ 	/* ->map_pages() haven't done anything useful. Cold page cache? */
++ 	if (!vmf->pte)
++ 		goto out;
++ 
++ 	/* check if the page fault is solved */
++ 	vmf->pte -= (vmf->address >> PAGE_SHIFT) - (address >> PAGE_SHIFT);
++ 	if (!pte_none(*vmf->pte))
++ 		ret = VM_FAULT_NOPAGE;
++ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
++ out:
++ 	vmf->address = address;
++ 	vmf->pte = NULL;
++ 	return ret;
++ }
++ 
++ static vm_fault_t do_read_fault(struct vm_fault *vmf)
++ {
++ 	struct vm_area_struct *vma = vmf->vma;
++ 	vm_fault_t ret = 0;
++ 
++ 	/*
++ 	 * Let's call ->map_pages() first and use ->fault() as fallback
++ 	 * if page by the offset is not ready to be mapped (cold cache or
++ 	 * something).
++ 	 */
++ 	if (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1) {
++ 		ret = do_fault_around(vmf);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ret = __do_fault(vmf);
+++>>>>>>> d9f7979c92f7 (mm: no need to check return value of debugfs_create functions)
+  	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+  		return ret;
+  
+diff --cc mm/page_alloc.c
+index b9791a67f6c1,9be9a22ebe35..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -2309,24 -3230,14 +2309,26 @@@ static int __init fail_page_alloc_debug
+  
+  	dir = fault_create_debugfs_attr("fail_page_alloc", NULL,
+  					&fail_page_alloc.attr);
+- 	if (IS_ERR(dir))
+- 		return PTR_ERR(dir);
+  
+++<<<<<<< HEAD
+ +	if (!debugfs_create_bool("ignore-gfp-wait", mode, dir,
+ +				&fail_page_alloc.ignore_gfp_wait))
+ +		goto fail;
+ +	if (!debugfs_create_bool("ignore-gfp-highmem", mode, dir,
+ +				&fail_page_alloc.ignore_gfp_highmem))
+ +		goto fail;
+ +	if (!debugfs_create_u32("min-order", mode, dir,
+ +				&fail_page_alloc.min_order))
+ +		goto fail;
+++=======
++ 	debugfs_create_bool("ignore-gfp-wait", mode, dir,
++ 			    &fail_page_alloc.ignore_gfp_reclaim);
++ 	debugfs_create_bool("ignore-gfp-highmem", mode, dir,
++ 			    &fail_page_alloc.ignore_gfp_highmem);
++ 	debugfs_create_u32("min-order", mode, dir, &fail_page_alloc.min_order);
+++>>>>>>> d9f7979c92f7 (mm: no need to check return value of debugfs_create functions)
+  
+  	return 0;
+- fail:
+- 	debugfs_remove_recursive(dir);
+- 
+- 	return -ENOMEM;
+  }
+  
+  late_initcall(fail_page_alloc_debugfs);
+* Unmerged path mm/cma_debug.c
+* Unmerged path mm/gup_benchmark.c
+* Unmerged path mm/page_owner.c
+* Unmerged path mm/cma_debug.c
+* Unmerged path mm/failslab.c
+* Unmerged path mm/gup_benchmark.c
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/memblock.c
+* Unmerged path mm/memory.c
+* Unmerged path mm/page_alloc.c
+* Unmerged path mm/page_owner.c
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index bf0311ec1984..2422fbaa4183 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1578,21 +1578,14 @@ static int __init extfrag_debug_init(void)
+ 	struct dentry *extfrag_debug_root;
+ 
+ 	extfrag_debug_root = debugfs_create_dir("extfrag", NULL);
+-	if (!extfrag_debug_root)
+-		return -ENOMEM;
+ 
+-	if (!debugfs_create_file("unusable_index", 0444,
+-			extfrag_debug_root, NULL, &unusable_file_ops))
+-		goto fail;
++	debugfs_create_file("unusable_index", 0444, extfrag_debug_root, NULL,
++			    &unusable_file_ops);
+ 
+-	if (!debugfs_create_file("extfrag_index", 0444,
+-			extfrag_debug_root, NULL, &extfrag_file_ops))
+-		goto fail;
++	debugfs_create_file("extfrag_index", 0444, extfrag_debug_root, NULL,
++			    &extfrag_file_ops);
+ 
+ 	return 0;
+-fail:
+-	debugfs_remove_recursive(extfrag_debug_root);
+-	return -ENOMEM;
+ }
+ 
+ module_init(extfrag_debug_init);
