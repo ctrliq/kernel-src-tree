@@ -1,0 +1,161 @@
+scsi: qla2xxx: Fix NVME cmd and LS cmd timeout race condition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Quinn Tran <qutran@marvell.com>
+commit 4c2a2d0178d5d8006a6bc50c8dc0ed122e4e946e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/4c2a2d01.failed
+
+This patch uses kref to protect access between fcp_abort path and nvme
+command and LS command completion path.  Stack trace below shows the abort
+path is accessing stale memory (nvme_private->sp).
+
+When command kref reaches 0, nvme_private & srb resource will be
+disconnected from each other.  Any subsequence nvme abort request will not
+be able to reference the original srb.
+
+[ 5631.003998] BUG: unable to handle kernel paging request at 00000010000005d8
+[ 5631.004016] IP: [<ffffffffc087df92>] qla_nvme_abort_work+0x22/0x100 [qla2xxx]
+[ 5631.004086] Workqueue: events qla_nvme_abort_work [qla2xxx]
+[ 5631.004097] RIP: 0010:[<ffffffffc087df92>]  [<ffffffffc087df92>] qla_nvme_abort_work+0x22/0x100 [qla2xxx]
+[ 5631.004109] Call Trace:
+[ 5631.004115]  [<ffffffffaa4b8174>] ? pwq_dec_nr_in_flight+0x64/0xb0
+[ 5631.004117]  [<ffffffffaa4b9d4f>] process_one_work+0x17f/0x440
+[ 5631.004120]  [<ffffffffaa4bade6>] worker_thread+0x126/0x3c0
+
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4c2a2d0178d5d8006a6bc50c8dc0ed122e4e946e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_nvme.c
+diff --cc drivers/scsi/qla2xxx/qla_nvme.c
+index 209fc872a2c6,316aea085e6e..000000000000
+--- a/drivers/scsi/qla2xxx/qla_nvme.c
++++ b/drivers/scsi/qla2xxx/qla_nvme.c
+@@@ -123,47 -123,24 +123,64 @@@ static int qla_nvme_alloc_queue(struct 
+  	return 0;
+  }
+  
+- static void qla_nvme_sp_ls_done(void *ptr, int res)
++ static void qla_nvme_release_fcp_cmd_kref(struct kref *kref)
+  {
+++<<<<<<< HEAD
+ +	srb_t *sp = ptr;
+ +	struct srb_iocb *nvme;
+ +	struct nvmefc_ls_req   *fd;
+ +	struct nvme_private *priv;
+ +
+ +	if (atomic_read(&sp->ref_count) == 0) {
+ +		ql_log(ql_log_warn, sp->fcport->vha, 0x2123,
+ +		    "SP reference-count to ZERO on LS_done -- sp=%p.\n", sp);
+ +		return;
+ +	}
+ +
+ +	if (!atomic_dec_and_test(&sp->ref_count))
+ +		return;
+ +
+ +	if (res)
+ +		res = -EINVAL;
+ +
+ +	nvme = &sp->u.iocb_cmd;
+ +	fd = nvme->u.nvme.desc;
+ +	priv = fd->private;
+ +	priv->comp_status = res;
+ +	schedule_work(&priv->ls_work);
+ +	/* work schedule doesn't need the sp */
+ +	qla2x00_rel_sp(sp);
+ +}
+ +
+ +static void qla_nvme_sp_done(void *ptr, int res)
+ +{
+ +	srb_t *sp = ptr;
+ +	struct srb_iocb *nvme;
+++=======
++ 	struct srb *sp = container_of(kref, struct srb, cmd_kref);
++ 	struct nvme_private *priv = (struct nvme_private *)sp->priv;
+++>>>>>>> 4c2a2d0178d5 (scsi: qla2xxx: Fix NVME cmd and LS cmd timeout race condition)
+  	struct nvmefc_fcp_req *fd;
++ 	struct srb_iocb *nvme;
++ 	unsigned long flags;
++ 
++ 	if (!priv)
++ 		goto out;
+  
+  	nvme = &sp->u.iocb_cmd;
+  	fd = nvme->u.nvme.desc;
+  
+++<<<<<<< HEAD
+ +	if (!atomic_dec_and_test(&sp->ref_count))
+ +		return;
+ +
+ +	if (res == QLA_SUCCESS) {
+++=======
++ 	spin_lock_irqsave(&priv->cmd_lock, flags);
++ 	priv->sp = NULL;
++ 	sp->priv = NULL;
++ 	if (priv->comp_status == QLA_SUCCESS) {
+++>>>>>>> 4c2a2d0178d5 (scsi: qla2xxx: Fix NVME cmd and LS cmd timeout race condition)
+  		fd->rcv_rsplen = nvme->u.nvme.rsp_pyld_len;
+  	} else {
+  		fd->rcv_rsplen = 0;
+@@@ -197,17 -233,9 +273,20 @@@ static void qla_nvme_abort_work(struct 
+  		    "%s Calling done on sp: %p, type: 0x%x, sp->ref_count: 0x%x\n",
+  		    __func__, sp, sp->type, atomic_read(&sp->ref_count));
+  		sp->done(sp, 0);
+- 		return;
++ 		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (atomic_read(&sp->ref_count) == 0) {
+ +		WARN_ON(1);
+ +		ql_log(ql_log_info, fcport->vha, 0xffff,
+ +			"%s: command already aborted on sp: %p\n",
+ +			__func__, sp);
+ +		return;
+ +	}
+ +
+++=======
+++>>>>>>> 4c2a2d0178d5 (scsi: qla2xxx: Fix NVME cmd and LS cmd timeout race condition)
+  	rval = ha->isp_ops->abort_command(sp);
+  
+  	ql_dbg(ql_dbg_io, fcport->vha, 0x212b,
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index e658b52fa060..1556d6cf1c5f 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -541,6 +541,8 @@ typedef struct srb {
+ 	uint8_t cmd_type;
+ 	uint8_t pad[3];
+ 	atomic_t ref_count;
++	struct kref cmd_kref;	/* need to migrate ref_count over to this */
++	void *priv;
+ 	wait_queue_head_t nvme_ls_waitq;
+ 	struct fc_port *fcport;
+ 	struct scsi_qla_host *vha;
+@@ -563,6 +565,7 @@ typedef struct srb {
+ 	} u;
+ 	void (*done)(void *, int);
+ 	void (*free)(void *);
++	void (*put_fn)(struct kref *kref);
+ } srb_t;
+ 
+ #define GET_CMD_SP(sp) (sp->u.scmd.cmd)
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
+diff --git a/drivers/scsi/qla2xxx/qla_nvme.h b/drivers/scsi/qla2xxx/qla_nvme.h
+index 1bef2a79542e..29647bc4307f 100644
+--- a/drivers/scsi/qla2xxx/qla_nvme.h
++++ b/drivers/scsi/qla2xxx/qla_nvme.h
+@@ -33,6 +33,7 @@ struct nvme_private {
+ 	struct work_struct ls_work;
+ 	struct work_struct abort_work;
+ 	int comp_status;
++	spinlock_t cmd_lock;
+ };
+ 
+ struct qla_nvme_rport {
