@@ -201,7 +201,6 @@ struct vcpu_svm {
 
 	unsigned int3_injected;
 	unsigned long int3_rip;
-	u32 apf_reason;
 
 	/* cached guest cpuid flags for faster access */
 	bool nrips_enabled	: 1;
@@ -719,7 +718,7 @@ static void svm_queue_exception(struct kvm_vcpu *vcpu)
 	struct vcpu_svm *svm = to_svm(vcpu);
 	unsigned nr = vcpu->arch.exception.nr;
 	bool has_error_code = vcpu->arch.exception.has_error_code;
-	bool reinject = vcpu->arch.exception.reinject;
+	bool reinject = vcpu->arch.exception.injected;
 	u32 error_code = vcpu->arch.exception.error_code;
 
 	/*
@@ -1278,12 +1277,23 @@ static void init_sys_seg(struct vmcb_seg *seg, uint32_t type)
 	seg->base = 0;
 }
 
-static void svm_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+static u64 svm_read_l1_tsc_offset(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+
+	if (is_guest_mode(vcpu))
+		return svm->nested.hsave->control.tsc_offset;
+
+	return vcpu->arch.tsc_offset;
+}
+
+static u64 svm_write_l1_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	u64 g_tsc_offset = 0;
 
 	if (is_guest_mode(vcpu)) {
+		/* Write L1's TSC offset.  */
 		g_tsc_offset = svm->vmcb->control.tsc_offset -
 			       svm->nested.hsave->control.tsc_offset;
 		svm->nested.hsave->control.tsc_offset = offset;
@@ -1295,6 +1305,7 @@ static void svm_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
 	svm->vmcb->control.tsc_offset = offset + g_tsc_offset;
 
 	mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
+	return svm->vmcb->control.tsc_offset;
 }
 
 static void avic_init_vmcb(struct vcpu_svm *svm)
@@ -2288,34 +2299,11 @@ static void svm_set_dr7(struct kvm_vcpu *vcpu, unsigned long value)
 static int pf_interception(struct vcpu_svm *svm)
 {
 	u64 fault_address = svm->vmcb->control.exit_info_2;
-	u64 error_code;
-	int r = 1;
+	u64 error_code = svm->vmcb->control.exit_info_1;
 
-	switch (svm->apf_reason) {
-	default:
-		error_code = svm->vmcb->control.exit_info_1;
-
-		trace_kvm_page_fault(fault_address, error_code);
-		if (!npt_enabled && kvm_event_needs_reinjection(&svm->vcpu))
-			kvm_mmu_unprotect_page_virt(&svm->vcpu, fault_address);
-		r = kvm_mmu_page_fault(&svm->vcpu, fault_address, error_code,
+	return kvm_handle_page_fault(&svm->vcpu, error_code, fault_address,
 			svm->vmcb->control.insn_bytes,
-			svm->vmcb->control.insn_len);
-		break;
-	case KVM_PV_REASON_PAGE_NOT_PRESENT:
-		svm->apf_reason = 0;
-		local_irq_disable();
-		kvm_async_pf_task_wait(fault_address, true);
-		local_irq_enable();
-		break;
-	case KVM_PV_REASON_PAGE_READY:
-		svm->apf_reason = 0;
-		local_irq_disable();
-		kvm_async_pf_task_wake(fault_address);
-		local_irq_enable();
-		break;
-	}
-	return r;
+			svm->vmcb->control.insn_len, !npt_enabled);
 }
 
 static int db_interception(struct vcpu_svm *svm)
@@ -2549,7 +2537,6 @@ static void nested_svm_set_tdp_cr3(struct kvm_vcpu *vcpu,
 
 	svm->vmcb->control.nested_cr3 = __sme_set(root);
 	mark_dirty(svm->vmcb, VMCB_NPT);
-	svm_flush_tlb(vcpu);
 }
 
 static void nested_svm_inject_npf_exit(struct kvm_vcpu *vcpu,
@@ -2584,19 +2571,22 @@ static void nested_svm_inject_npf_exit(struct kvm_vcpu *vcpu,
 static void nested_svm_init_mmu_context(struct kvm_vcpu *vcpu)
 {
 	WARN_ON(mmu_is_nested(vcpu));
+
+	vcpu->arch.mmu = &vcpu->arch.guest_mmu;
 	kvm_init_shadow_mmu(vcpu);
-	vcpu->arch.mmu.set_cr3           = nested_svm_set_tdp_cr3;
-	vcpu->arch.mmu.get_cr3           = nested_svm_get_tdp_cr3;
-	vcpu->arch.mmu.get_pdptr         = nested_svm_get_tdp_pdptr;
-	vcpu->arch.mmu.inject_page_fault = nested_svm_inject_npf_exit;
-	vcpu->arch.mmu.shadow_root_level = get_npt_level();
-	reset_shadow_zero_bits_mask(vcpu, &vcpu->arch.mmu);
+	vcpu->arch.mmu->set_cr3           = nested_svm_set_tdp_cr3;
+	vcpu->arch.mmu->get_cr3           = nested_svm_get_tdp_cr3;
+	vcpu->arch.mmu->get_pdptr         = nested_svm_get_tdp_pdptr;
+	vcpu->arch.mmu->inject_page_fault = nested_svm_inject_npf_exit;
+	vcpu->arch.mmu->shadow_root_level = get_npt_level();
+	reset_shadow_zero_bits_mask(vcpu, vcpu->arch.mmu);
 	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
 }
 
 static void nested_svm_uninit_mmu_context(struct kvm_vcpu *vcpu)
 {
-	vcpu->arch.walk_mmu = &vcpu->arch.mmu;
+	vcpu->arch.mmu = &vcpu->arch.root_mmu;
+	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
 }
 
 static int nested_svm_check_permissions(struct vcpu_svm *svm)
@@ -2623,15 +2613,29 @@ static int nested_svm_check_exception(struct vcpu_svm *svm, unsigned nr,
 	if (!is_guest_mode(&svm->vcpu))
 		return 0;
 
+	vmexit = nested_svm_intercept(svm);
+	if (vmexit != NESTED_EXIT_DONE)
+		return 0;
+
 	svm->vmcb->control.exit_code = SVM_EXIT_EXCP_BASE + nr;
 	svm->vmcb->control.exit_code_hi = 0;
 	svm->vmcb->control.exit_info_1 = error_code;
-	svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
 
-	vmexit = nested_svm_intercept(svm);
-	if (vmexit == NESTED_EXIT_DONE)
-		svm->nested.exit_required = true;
+	/*
+	 * FIXME: we should not write CR2 when L1 intercepts an L2 #PF exception.
+	 * The fix is to add the ancillary datum (CR2 or DR6) to structs
+	 * kvm_queued_exception and kvm_vcpu_events, so that CR2 and DR6 can be
+	 * written only when inject_pending_event runs (DR6 would written here
+	 * too).  This should be conditional on a new capability---if the
+	 * capability is disabled, kvm_multiple_exception would write the
+	 * ancillary information to CR2 or DR6, for backwards ABI-compatibility.
+	 */
+	if (svm->vcpu.arch.exception.nested_apf)
+		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.apf.nested_apf_token;
+	else
+		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
 
+	svm->nested.exit_required = true;
 	return vmexit;
 }
 
@@ -2806,7 +2810,7 @@ static int nested_svm_exit_special(struct vcpu_svm *svm)
 		break;
 	case SVM_EXIT_EXCP_BASE + PF_VECTOR:
 		/* When we're shadowing, trap PFs, but not async PF */
-		if (!npt_enabled && svm->apf_reason == 0)
+		if (!npt_enabled && svm->vcpu.arch.apf.host_apf_reason == 0)
 			return NESTED_EXIT_HOST;
 		break;
 	case SVM_EXIT_EXCP_BASE + NM_VECTOR:
@@ -2856,7 +2860,7 @@ static int nested_svm_intercept(struct vcpu_svm *svm)
 		}
 		/* async page fault always cause vmexit */
 		else if ((exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR) &&
-			 svm->apf_reason != 0)
+			 svm->vcpu.arch.exception.nested_apf != 0)
 			vmexit = NESTED_EXIT_DONE;
 		break;
 	}
@@ -3004,6 +3008,7 @@ static int nested_svm_vmexit(struct vcpu_svm *svm)
 	/* Restore the original control entries */
 	copy_vmcb_control_area(vmcb, hsave);
 
+	svm->vcpu.arch.tsc_offset = svm->vmcb->control.tsc_offset;
 	kvm_clear_exception_queue(&svm->vcpu);
 	kvm_clear_interrupt_queue(&svm->vcpu);
 
@@ -3106,7 +3111,6 @@ static void enter_svm_guest_mode(struct vcpu_svm *svm, u64 vmcb_gpa,
 		svm->vcpu.arch.hflags &= ~HF_HIF_MASK;
 
 	if (nested_vmcb->control.nested_ctl & SVM_NESTED_CTL_NP_ENABLE) {
-		kvm_mmu_unload(&svm->vcpu);
 		svm->nested.nested_cr3 = nested_vmcb->control.nested_cr3;
 		nested_svm_init_mmu_context(&svm->vcpu);
 	}
@@ -3169,10 +3173,12 @@ static void enter_svm_guest_mode(struct vcpu_svm *svm, u64 vmcb_gpa,
 	/* We don't want to see VMMCALLs from a nested guest */
 	clr_intercept(svm, INTERCEPT_VMMCALL);
 
+	svm->vcpu.arch.tsc_offset += nested_vmcb->control.tsc_offset;
+	svm->vmcb->control.tsc_offset = svm->vcpu.arch.tsc_offset;
+
 	svm->vmcb->control.virt_ext = nested_vmcb->control.virt_ext;
 	svm->vmcb->control.int_vector = nested_vmcb->control.int_vector;
 	svm->vmcb->control.int_state = nested_vmcb->control.int_state;
-	svm->vmcb->control.tsc_offset += nested_vmcb->control.tsc_offset;
 	svm->vmcb->control.event_inj = nested_vmcb->control.event_inj;
 	svm->vmcb->control.event_inj_err = nested_vmcb->control.event_inj_err;
 
@@ -3695,12 +3701,6 @@ static int svm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	struct vcpu_svm *svm = to_svm(vcpu);
 
 	switch (msr_info->index) {
-	case MSR_IA32_TSC: {
-		msr_info->data = svm->vmcb->control.tsc_offset +
-			kvm_scale_tsc(vcpu, rdtsc());
-
-		break;
-	}
 	case MSR_STAR:
 		msr_info->data = svm->vmcb->save.star;
 		break;
@@ -3838,9 +3838,6 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 		vcpu->arch.pat = data;
 		svm->vmcb->save.g_pat = data;
 		mark_dirty(svm->vmcb, VMCB_NPT);
-		break;
-	case MSR_IA32_TSC:
-		kvm_write_tsc(vcpu, msr);
 		break;
 	case MSR_IA32_PRED_CMD:
 		if (!msr->host_initiated &&
@@ -4618,7 +4615,7 @@ static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
 		set_cr_intercept(svm, INTERCEPT_CR8_WRITE);
 }
 
-static void svm_set_virtual_x2apic_mode(struct kvm_vcpu *vcpu, bool set)
+static void svm_set_virtual_apic_mode(struct kvm_vcpu *vcpu)
 {
 	return;
 }
@@ -4649,7 +4646,7 @@ static void svm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
 	mark_dirty(vmcb, VMCB_INTR);
 }
 
-static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
 {
 	return;
 }
@@ -5266,7 +5263,7 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
 
 	/* if exit due to PF check for async PF */
 	if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
-		svm->apf_reason = kvm_read_and_reset_pf_reason();
+		svm->vcpu.arch.apf.host_apf_reason = kvm_read_and_reset_pf_reason();
 
 	if (npt_enabled) {
 		vcpu->arch.regs_avail &= ~(1 << VCPU_EXREG_PDPTR);
@@ -5290,7 +5287,6 @@ static void svm_set_cr3(struct kvm_vcpu *vcpu, unsigned long root)
 
 	svm->vmcb->save.cr3 = __sme_set(root);
 	mark_dirty(svm->vmcb, VMCB_CR);
-	svm_flush_tlb(vcpu);
 }
 
 static void set_tdp_cr3(struct kvm_vcpu *vcpu, unsigned long root)
@@ -5303,8 +5299,6 @@ static void set_tdp_cr3(struct kvm_vcpu *vcpu, unsigned long root)
 	/* Also sync guest cr3 here in case we live migrate */
 	svm->vmcb->save.cr3 = kvm_read_cr3(vcpu);
 	mark_dirty(svm->vmcb, VMCB_CR);
-
-	svm_flush_tlb(vcpu);
 }
 
 static int is_disabled(void)
@@ -5784,7 +5778,7 @@ static struct kvm_x86_ops svm_x86_ops = {
 	.enable_nmi_window = enable_nmi_window,
 	.enable_irq_window = enable_irq_window,
 	.update_cr8_intercept = update_cr8_intercept,
-	.set_virtual_x2apic_mode = svm_set_virtual_x2apic_mode,
+	.set_virtual_apic_mode = svm_set_virtual_apic_mode,
 	.get_enable_apicv = svm_get_enable_apicv,
 	.refresh_apicv_exec_ctrl = svm_refresh_apicv_exec_ctrl,
 	.load_eoi_exitmap = svm_load_eoi_exitmap,
@@ -5810,7 +5804,8 @@ static struct kvm_x86_ops svm_x86_ops = {
 
 	.has_wbinvd_exit = svm_has_wbinvd_exit,
 
-	.write_tsc_offset = svm_write_tsc_offset,
+	.read_l1_tsc_offset = svm_read_l1_tsc_offset,
+	.write_l1_tsc_offset = svm_write_l1_tsc_offset,
 
 	.set_tdp_cr3 = set_tdp_cr3,
 

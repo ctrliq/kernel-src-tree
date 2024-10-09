@@ -646,6 +646,11 @@ void __idr_remove_all(struct idr *idp)
 			--paa;
 		}
 	}
+
+	/* Free the top layer in case of a maximum idr tree height */
+	if (id < 0 && *paa)
+		free_layer(idp, *paa);
+
 	idp->layers = 0;
 }
 EXPORT_SYMBOL(__idr_remove_all);

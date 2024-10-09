@@ -962,7 +962,7 @@ static void decode_mc6_mce(struct mce *m)
 static void decode_smca_errors(struct mce *m)
 {
 	struct smca_hwid *hwid;
-	unsigned int bank_type;
+	enum smca_bank_types bank_type;
 	const char *ip_name;
 	u8 xec = XEC(m->status, xec_mask);
 
@@ -974,7 +974,12 @@ static void decode_smca_errors(struct mce *m)
 		return;
 
 	bank_type = hwid->bank_type;
-	ip_name = smca_names[bank_type].long_name;
+	if (bank_type == SMCA_RESERVED) {
+		pr_emerg(HW_ERR "Bank %d is reserved.\n", m->bank);
+		return;
+	}
+
+	ip_name = smca_get_long_name(bank_type);
 
 	pr_emerg(HW_ERR "%s Extended Error Code: %d\n", ip_name, xec);
 

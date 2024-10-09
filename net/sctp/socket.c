@@ -105,8 +105,9 @@ static int sctp_send_asconf(struct sctp_association *asoc,
 			    struct sctp_chunk *chunk);
 static int sctp_do_bind(struct sock *, union sctp_addr *, int);
 static int sctp_autobind(struct sock *sk);
-static void sctp_sock_migrate(struct sock *, struct sock *,
-			      struct sctp_association *, sctp_socket_type_t);
+static int sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
+			     struct sctp_association *assoc,
+			     sctp_socket_type_t type);
 
 extern struct kmem_cache *sctp_bucket_cachep;
 extern long sysctl_sctp_mem[3];
@@ -2486,14 +2487,16 @@ static int sctp_apply_peer_addr_params(struct sctp_paddrparams *params,
 	 * effect).
 	 */
 	if ((params->spp_flags & SPP_PMTUD_DISABLE) && params->spp_pathmtu) {
+		__u32 pmtu = min_t(__u32, params->spp_pathmtu, INT_MAX);
+
 		if (trans) {
-			trans->pathmtu = params->spp_pathmtu;
+			trans->pathmtu = pmtu;
 			sctp_assoc_sync_pmtu(asoc);
 		} else if (asoc) {
-			asoc->pathmtu = params->spp_pathmtu;
-			sctp_frag_point(asoc, params->spp_pathmtu);
+			asoc->pathmtu = pmtu;
+			sctp_frag_point(asoc, pmtu);
 		} else {
-			sp->pathmtu = params->spp_pathmtu;
+			sp->pathmtu = pmtu;
 		}
 	}
 
@@ -4084,7 +4087,11 @@ static struct sock *sctp_accept(struct sock *sk, int flags, int *err)
 	/* Populate the fields of the newsk from the oldsk and migrate the
 	 * asoc to the newsk.
 	 */
-	sctp_sock_migrate(sk, newsk, asoc, SCTP_SOCKET_TCP);
+	error = sctp_sock_migrate(sk, newsk, asoc, SCTP_SOCKET_TCP);
+	if (error) {
+		sk_common_release(newsk);
+		newsk = NULL;
+	}
 
 out:
 	release_sock(sk);
@@ -4830,7 +4837,12 @@ int sctp_do_peeloff(struct sock *sk, sctp_assoc_t id, struct socket **sockp)
 	/* Populate the fields of the newsk from the oldsk and migrate the
 	 * asoc to the newsk.
 	 */
-	sctp_sock_migrate(sk, sock->sk, asoc, SCTP_SOCKET_UDP_HIGH_BANDWIDTH);
+	err = sctp_sock_migrate(sk, sock->sk, asoc,
+				SCTP_SOCKET_UDP_HIGH_BANDWIDTH);
+	if (err) {
+		sock_release(sock);
+		sock = NULL;
+	}
 
 	*sockp = sock;
 
@@ -6496,14 +6508,15 @@ static int sctp_getsockopt_pr_assocstatus(struct sock *sk, int len,
 	}
 
 	policy = params.sprstat_policy;
-	if (policy & ~SCTP_PR_SCTP_MASK)
+	if (!policy || (policy & ~(SCTP_PR_SCTP_MASK | SCTP_PR_SCTP_ALL)) ||
+	    ((policy & SCTP_PR_SCTP_ALL) && (policy & SCTP_PR_SCTP_MASK)))
 		goto out;
 
 	asoc = sctp_id2assoc(sk, params.sprstat_assoc_id);
 	if (!asoc)
 		goto out;
 
-	if (policy == SCTP_PR_SCTP_NONE) {
+	if (policy == SCTP_PR_SCTP_ALL) {
 		params.sprstat_abandoned_unsent = 0;
 		params.sprstat_abandoned_sent = 0;
 		for (policy = 0; policy <= SCTP_PR_INDEX(MAX); policy++) {
@@ -7837,9 +7850,9 @@ static inline void sctp_copy_descendant(struct sock *sk_to,
 /* Populate the fields of the newsk from the oldsk and migrate the assoc
  * and its messages to the newsk.
  */
-static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
-			      struct sctp_association *assoc,
-			      sctp_socket_type_t type)
+static int sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
+			     struct sctp_association *assoc,
+			     sctp_socket_type_t type)
 {
 	struct sctp_sock *oldsp = sctp_sk(oldsk);
 	struct sctp_sock *newsp = sctp_sk(newsk);
@@ -7848,6 +7861,7 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
 	struct sk_buff *skb, *tmp;
 	struct sctp_ulpevent *event;
 	struct sctp_bind_hashbucket *head;
+	int err;
 
 	/* Migrate socket buffer sizes and all the socket level options to the
 	 * new socket.
@@ -7876,8 +7890,10 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
 	/* Copy the bind_addr list from the original endpoint to the new
 	 * endpoint so that we can handle restarts properly
 	 */
-	sctp_bind_addr_dup(&newsp->ep->base.bind_addr,
-				&oldsp->ep->base.bind_addr, GFP_KERNEL);
+	err = sctp_bind_addr_dup(&newsp->ep->base.bind_addr,
+				 &oldsp->ep->base.bind_addr, GFP_KERNEL);
+	if (err)
+		return err;
 
 	/* New ep's auth_hmacs should be set if old ep's is set, in case
 	 * that net->sctp.auth_enable has been changed to 0 by users and
@@ -7976,6 +7992,8 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
 	}
 
 	release_sock(newsk);
+
+	return 0;
 }
 
 

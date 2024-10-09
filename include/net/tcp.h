@@ -54,6 +54,8 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
 
 #define MAX_TCP_HEADER	(128 + MAX_HEADER)
 #define MAX_TCP_OPTION_SPACE 40
+#define TCP_MIN_SND_MSS		48
+#define TCP_MIN_GSO_SIZE	(TCP_MIN_SND_MSS - MAX_TCP_OPTION_SPACE)
 
 /* 
  * Never offer a window over 32767 without using window scaling. Some
@@ -530,7 +532,13 @@ void tcp_retransmit_timer(struct sock *sk);
 void tcp_xmit_retransmit_queue(struct sock *);
 void tcp_simple_retransmit(struct sock *);
 int tcp_trim_head(struct sock *, struct sk_buff *, u32);
-int tcp_fragment(struct sock *, struct sk_buff *, u32, unsigned int);
+enum tcp_queue {
+	TCP_FRAG_IN_WRITE_QUEUE,
+	TCP_FRAG_IN_RTX_QUEUE,
+};
+int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
+		 struct sk_buff *skb, u32 len,
+		 unsigned int mss_now);
 
 void tcp_send_probe0(struct sock *);
 void tcp_send_partial(struct sock *);
@@ -1543,12 +1551,12 @@ static inline void tcp_highest_sack_reset(struct sock *sk)
 	tcp_sk(sk)->highest_sack = tcp_write_queue_head(sk);
 }
 
-/* Called when old skb is about to be deleted (to be combined with new skb) */
-static inline void tcp_highest_sack_combine(struct sock *sk,
+/* Called when old skb is about to be deleted and replaced by new skb */
+static inline void tcp_highest_sack_replace(struct sock *sk,
 					    struct sk_buff *old,
 					    struct sk_buff *new)
 {
-	if (tcp_sk(sk)->sacked_out && (old == tcp_sk(sk)->highest_sack))
+	if (old == tcp_highest_sack(sk))
 		tcp_sk(sk)->highest_sack = new;
 }
 

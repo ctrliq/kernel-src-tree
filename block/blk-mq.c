@@ -76,6 +76,9 @@ static void blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
 {
 	struct mq_inflight *mi = priv;
 
+	if (!blk_mq_request_started(rq))
+		return;
+
 	/*
 	 * index[0] counts the specific partition that was asked
 	 * for. index[1] counts the ones that are active on the
@@ -102,6 +105,9 @@ static void blk_mq_check_inflight_rw(struct blk_mq_hw_ctx *hctx,
 				     bool reserved)
 {
 	struct mq_inflight *mi = priv;
+
+	if (!blk_mq_request_started(rq))
+		return;
 
 	if (rq->part == mi->part)
 		mi->inflight[rq_data_dir(rq)]++;
@@ -501,6 +507,20 @@ static void blk_mq_ipi_complete_request(struct request *rq)
 	bool shared = false;
 	int cpu;
 
+	/*
+	 * Most of single queue controllers, there is only one irq vector
+	 * for handling IO completion, and the only irq's affinity is set
+	 * as all possible CPUs. On most of ARCHs, this affinity means the
+	 * irq is handled on one specific CPU.
+	 *
+	 * So complete IO reqeust in softirq context in case of single queue
+	 * for not degrading IO performance by irqsoff latency.
+	 */
+	if (rq->q->nr_hw_queues == 1) {
+		__blk_complete_request(rq);
+		return;
+	}
+
 	if (!test_bit(QUEUE_FLAG_SAME_COMP, &rq->q->queue_flags)) {
 		rq->q->softirq_done_fn(rq);
 		return;
@@ -529,7 +549,7 @@ static void blk_mq_stat_add(struct request *rq)
 	}
 }
 
-static void __blk_mq_complete_request(struct request *rq)
+static void __blk_mq_complete_request(struct request *rq, bool sync)
 {
 	struct request_queue *q = rq->q;
 
@@ -540,6 +560,8 @@ static void __blk_mq_complete_request(struct request *rq)
 
 	if (!q->softirq_done_fn)
 		blk_mq_end_request(rq, rq->errors);
+	else if (sync)
+		rq->q->softirq_done_fn(rq);
 	else
 		blk_mq_ipi_complete_request(rq);
 }
@@ -580,10 +602,19 @@ void blk_mq_complete_request(struct request *rq, int error)
 		return;
 	if (!blk_mark_rq_complete(rq)) {
 		rq->errors = error;
-		__blk_mq_complete_request(rq);
+		__blk_mq_complete_request(rq, false);
 	}
 }
 EXPORT_SYMBOL(blk_mq_complete_request);
+
+void blk_mq_complete_request_sync(struct request *rq, int error)
+{
+	if (!blk_mark_rq_complete(rq)) {
+		rq->errors = error;
+		__blk_mq_complete_request(rq, true);
+	}
+}
+EXPORT_SYMBOL_GPL(blk_mq_complete_request_sync);
 
 int blk_mq_request_started(struct request *rq)
 {
@@ -779,7 +810,7 @@ void blk_mq_rq_timed_out(struct request *req, bool reserved)
 
 	switch (ret) {
 	case BLK_EH_HANDLED:
-		__blk_mq_complete_request(req);
+		__blk_mq_complete_request(req, false);
 		break;
 	case BLK_EH_RESET_TIMER:
 		blk_add_timer(req);
@@ -1742,7 +1773,7 @@ insert:
 	if (bypass_insert)
 		return BLK_MQ_RQ_QUEUE_BUSY;
 
-	blk_mq_sched_insert_request(rq, false, run_queue, false);
+	blk_mq_request_bypass_insert(rq, run_queue);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
@@ -1756,7 +1787,7 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
 	hctx_lock(hctx, &srcu_idx);
 	ret = __blk_mq_try_issue_directly(hctx, rq, false);
 	if (ret == BLK_MQ_RQ_QUEUE_BUSY || ret == BLK_MQ_RQ_QUEUE_DEV_BUSY)
-		blk_mq_sched_insert_request(rq, false, true, false);
+		blk_mq_request_bypass_insert(rq, true);
 	else if (ret != BLK_MQ_RQ_QUEUE_OK)
 		blk_mq_end_request(rq, ret);
 
@@ -1790,7 +1821,8 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
 		if (ret != BLK_MQ_RQ_QUEUE_OK) {
 			if (ret == BLK_MQ_RQ_QUEUE_BUSY ||
 					ret == BLK_MQ_RQ_QUEUE_DEV_BUSY) {
-				list_add(&rq->queuelist, list);
+				blk_mq_request_bypass_insert(rq,
+							list_empty(list));
 				break;
 			}
 			blk_mq_end_request(rq, ret);
@@ -2785,11 +2817,26 @@ static int blk_mq_queue_reinit_notify(struct notifier_block *nb,
 
 	__blk_mq_freeze_all_queue_list();
 
-	list_for_each_entry(q, &all_q_list, all_q_node)
+	/*
+	 * Multiple queues can share the same tag set, so we keep track of
+	 * which tag_sets we have already locked by setting
+	 * BLK_MQ_F_TAG_LOCKED
+	 */
+	list_for_each_entry(q, &all_q_list, all_q_node) {
+		if (!(q->tag_set->flags & BLK_MQ_F_TAG_LOCKED)) {
+			mutex_lock(&q->tag_set->tag_list_lock);
+			q->tag_set->flags |= BLK_MQ_F_TAG_LOCKED;
+		}
 		blk_mq_queue_reinit(q, &online_new);
+	}
 
-	list_for_each_entry(q, &all_q_list, all_q_node)
+	list_for_each_entry(q, &all_q_list, all_q_node) {
+		if (q->tag_set->flags & BLK_MQ_F_TAG_LOCKED) {
+			q->tag_set->flags &= ~BLK_MQ_F_TAG_LOCKED;
+			mutex_unlock(&q->tag_set->tag_list_lock);
+		}
 		blk_mq_unfreeze_queue(q);
+	}
 
 	mutex_unlock(&all_q_mutex);
 	return NOTIFY_OK;
@@ -2914,6 +2961,9 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
 	 */
 	if (set->nr_hw_queues > nr_cpu_ids)
 		set->nr_hw_queues = nr_cpu_ids;
+
+	/* make rq_aux() natual aligned */
+	set->cmd_size = round_up(set->cmd_size, sizeof(unsigned long));
 
 	set->tags = kzalloc_node(nr_cpu_ids * sizeof(struct blk_mq_tags *),
 				 GFP_KERNEL, set->numa_node);

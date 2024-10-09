@@ -50,9 +50,9 @@ static int rxe_qp_chk_cap(struct rxe_dev *rxe, struct ib_qp_cap *cap,
 		goto err1;
 	}
 
-	if (cap->max_send_sge > rxe->attr.max_sge) {
+	if (cap->max_send_sge > rxe->attr.max_send_sge) {
 		pr_warn("invalid send sge = %d > %d\n",
-			cap->max_send_sge, rxe->attr.max_sge);
+			cap->max_send_sge, rxe->attr.max_send_sge);
 		goto err1;
 	}
 
@@ -63,9 +63,9 @@ static int rxe_qp_chk_cap(struct rxe_dev *rxe, struct ib_qp_cap *cap,
 			goto err1;
 		}
 
-		if (cap->max_recv_sge > rxe->attr.max_sge) {
+		if (cap->max_recv_sge > rxe->attr.max_recv_sge) {
 			pr_warn("invalid recv sge = %d > %d\n",
-				cap->max_recv_sge, rxe->attr.max_sge);
+				cap->max_recv_sge, rxe->attr.max_recv_sge);
 			goto err1;
 		}
 	}
@@ -236,7 +236,7 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 	 * (0xc000 - 0xffff).
 	 */
 	qp->src_port = RXE_ROCE_V2_SPORT +
-		(hash_32_generic(qp_num(qp), 14) & 0x3fff);
+		(hash_32(qp_num(qp), 14) & 0x3fff);
 
 	qp->sq.max_wr		= init->cap.max_send_wr;
 	qp->sq.max_sge		= init->cap.max_send_sge;
@@ -419,8 +419,7 @@ int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
 	enum ib_qp_state new_state = (mask & IB_QP_STATE) ?
 					attr->qp_state : cur_state;
 
-	if (!ib_modify_qp_is_ok(cur_state, new_state, qp_type(qp), mask,
-				IB_LINK_LAYER_ETHERNET)) {
+	if (!ib_modify_qp_is_ok(cur_state, new_state, qp_type(qp), mask)) {
 		pr_warn("invalid mask or state for qp\n");
 		goto err1;
 	}
@@ -591,9 +590,6 @@ int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask,
 		     struct ib_udata *udata)
 {
 	int err;
-	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
-	union ib_gid sgid;
-	struct ib_gid_attr sgid_attr;
 
 	if (mask & IB_QP_MAX_QP_RD_ATOMIC) {
 		int max_rd_atomic = __roundup_pow_of_two(attr->max_rd_atomic);
@@ -634,30 +630,14 @@ int rxe_qp_from_attr(struct rxe_qp *qp, struct ib_qp_attr *attr, int mask,
 		qp->attr.qkey = attr->qkey;
 
 	if (mask & IB_QP_AV) {
-		ib_get_cached_gid(&rxe->ib_dev, 1,
-				  rdma_ah_read_grh(&attr->ah_attr)->sgid_index,
-				  &sgid, &sgid_attr);
 		rxe_av_from_attr(attr->port_num, &qp->pri_av, &attr->ah_attr);
-		rxe_av_fill_ip_info(&qp->pri_av, &attr->ah_attr,
-				    &sgid_attr, &sgid);
-		if (sgid_attr.ndev)
-			dev_put(sgid_attr.ndev);
+		rxe_av_fill_ip_info(&qp->pri_av, &attr->ah_attr);
 	}
 
 	if (mask & IB_QP_ALT_PATH) {
-		u8 sgid_index =
-			rdma_ah_read_grh(&attr->alt_ah_attr)->sgid_index;
-
-		ib_get_cached_gid(&rxe->ib_dev, 1, sgid_index,
-				  &sgid, &sgid_attr);
-
 		rxe_av_from_attr(attr->alt_port_num, &qp->alt_av,
 				 &attr->alt_ah_attr);
-		rxe_av_fill_ip_info(&qp->alt_av, &attr->alt_ah_attr,
-				    &sgid_attr, &sgid);
-		if (sgid_attr.ndev)
-			dev_put(sgid_attr.ndev);
-
+		rxe_av_fill_ip_info(&qp->alt_av, &attr->alt_ah_attr);
 		qp->attr.alt_port_num = attr->alt_port_num;
 		qp->attr.alt_pkey_index = attr->alt_pkey_index;
 		qp->attr.alt_timeout = attr->alt_timeout;

@@ -27,6 +27,7 @@
 
 #define MBM_CNTR_WIDTH			24
 #define MBM_OVERFLOW_INTERVAL		1000
+#define MAX_MBA_BW			100u
 
 #define RMID_VAL_ERROR			BIT_ULL(63)
 #define RMID_VAL_UNAVAIL		BIT_ULL(62)
@@ -211,6 +212,7 @@ struct mbm_state {
  * @cqm_work_cpu:
  *		worker cpu for CQM h/w counters
  * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
+ * @mbps_val:	When mba_sc is enabled, this holds the bandwidth in MBps
  * @new_ctrl:	new ctrl value to be loaded
  * @have_new_ctrl: did user provide new_ctrl for this domain
  */
@@ -226,6 +228,7 @@ struct rdt_domain {
 	int			mbm_work_cpu;
 	int			cqm_work_cpu;
 	u32			*ctrl_val;
+	u32			*mbps_val;
 	u32			new_ctrl;
 	bool			have_new_ctrl;
 };
@@ -457,6 +460,8 @@ void mbm_setup_overflow_handler(struct rdt_domain *dom,
 				unsigned long delay_ms);
 void mbm_handle_overflow(struct work_struct *work);
 bool is_mba_sc(struct rdt_resource *r);
+void setup_default_ctrlval(struct rdt_resource *r, u32 *dc, u32 *dm);
+u32 delay_bw_map(unsigned long bw, struct rdt_resource *r);
 void cqm_setup_limbo_handler(struct rdt_domain *dom, unsigned long delay_ms);
 void cqm_handle_limbo(struct work_struct *work);
 bool has_busy_rmid(struct rdt_resource *r, struct rdt_domain *d);

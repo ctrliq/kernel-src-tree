@@ -561,7 +561,7 @@ _GLOBAL(kexec_sequence)
 	stw	r6,kexec_flag-1b(5)
 
 	/* clear out hardware hash page table and tlb */
-#if !defined(_CALL_ELF) || _CALL_ELF != 2
+#ifdef PPC64_ELF_ABI_v1
 	ld	r12,0(r27)		/* deref function descriptor */
 #else
 	mr	r12,r27

@@ -53,6 +53,12 @@
 #define TCM_VHOST_NAMELEN 256
 #define TCM_VHOST_MAX_CDB_SIZE 32
 
+/* Max number of requests before requeueing the job.
+ * Using this limit prevents one virtqueue from starving others with
+ * request.
+ */
+#define VHOST_SCSI_WEIGHT 256
+
 struct vhost_scsi_inflight {
 	/* Wait for the flush operation to finish */
 	struct completion comp;
@@ -1240,8 +1246,8 @@ static int vhost_scsi_open(struct inode *inode, struct file *f)
 		vqs[i] = &s->vqs[i].vq;
 		s->vqs[i].vq.handle_kick = vhost_scsi_handle_kick;
 	}
-	r = vhost_dev_init(&s->dev, vqs, VHOST_SCSI_MAX_VQ);
-
+	r = vhost_dev_init(&s->dev, vqs, VHOST_SCSI_MAX_VQ, UIO_MAXIOV,
+			   VHOST_SCSI_WEIGHT, 0););
 	tcm_vhost_init_inflight(s, NULL);
 
 	if (r < 0) {
@@ -1558,7 +1564,7 @@ static int tcm_vhost_drop_nexus(struct tcm_vhost_tpg *tpg)
 	/*
 	 * Release the SCSI I_T Nexus to the emulated vhost Target Port
 	 */
-	transport_deregister_session(tv_nexus->tvn_se_sess);
+	target_remove_session(se_sess);
 	tpg->tpg_nexus = NULL;
 	mutex_unlock(&tpg->tv_tpg_mutex);
 

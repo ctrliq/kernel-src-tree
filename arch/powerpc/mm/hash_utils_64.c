@@ -625,12 +625,12 @@ static unsigned long __init htab_get_table_size(void)
 }
 
 #ifdef CONFIG_MEMORY_HOTPLUG
-void resize_hpt_for_hotplug(unsigned long new_mem_size)
+int resize_hpt_for_hotplug(unsigned long new_mem_size)
 {
 	unsigned target_hpt_shift;
 
 	if (!ppc_md.resize_hpt)
-		return;
+		return 0;
 
 	target_hpt_shift = htab_shift_for_mem_size(new_mem_size);
 
@@ -642,16 +642,11 @@ void resize_hpt_for_hotplug(unsigned long new_mem_size)
 	 * reduce unless the target shift is at least 2 below the
 	 * current shift
 	 */
-	if ((target_hpt_shift > ppc64_pft_size)
-	    || (target_hpt_shift < (ppc64_pft_size - 1))) {
-		int rc;
+	if (target_hpt_shift > ppc64_pft_size ||
+	    target_hpt_shift < ppc64_pft_size - 1)
+		return ppc_md.resize_hpt(target_hpt_shift);
 
-		rc = ppc_md.resize_hpt(target_hpt_shift);
-		if (rc)
-			printk(KERN_WARNING
-			       "Unable to resize hash page table to target order %d: %d\n",
-			       target_hpt_shift, rc);
-	}
+	return 0;
 }
 
 int create_section_mapping(unsigned long start, unsigned long end)

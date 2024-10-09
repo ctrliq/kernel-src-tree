@@ -157,7 +157,7 @@ static int unsolicited_report_interval(struct in_device *in_dev)
 	interval_jiffies = msecs_to_jiffies(interval_ms);
 
 	/* _timer functions can't handle a delay of 0 jiffies so ensure
-	 *  we always return a positive value.
+	 * we always return a positive value.
 	 */
 	if (interval_jiffies <= 0)
 		interval_jiffies = 1;
@@ -1244,6 +1244,8 @@ static void igmp_group_added(struct ip_mc_list *im)
 
 	if (in_dev->dead)
 		return;
+
+	im->unsolicit_count = sysctl_igmp_qrv;
 	if (IGMP_V1_SEEN(in_dev) || IGMP_V2_SEEN(in_dev)) {
 		spin_lock_bh(&im->lock);
 		igmp_start_timer(im, IGMP_Initial_Report_Delay);
@@ -1302,7 +1304,6 @@ static void __ip_mc_inc_group(struct in_device *in_dev, __be32 addr,
 	spin_lock_init(&im->lock);
 #ifdef CONFIG_IP_MULTICAST
 	setup_timer(&im->timer, &igmp_timer_expire, (unsigned long)im);
-	im->unsolicit_count = sysctl_igmp_qrv;
 #endif
 
 	im->next_rcu = in_dev->mc_list;

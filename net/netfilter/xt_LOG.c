@@ -33,14 +33,14 @@ log_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct xt_log_info *loginfo = par->targinfo;
 	struct nf_loginfo li;
-	struct net *net = dev_net(par->in ? par->in : par->out);
+	struct net *net = xt_net(par);
 
 	li.type = NF_LOG_TYPE_LOG;
 	li.u.log.level = loginfo->level;
 	li.u.log.logflags = loginfo->logflags;
 
-	nf_log_packet(net, par->family, par->hooknum, skb, par->in, par->out,
-		      &li, "%s", loginfo->prefix);
+	nf_log_packet(net, xt_family(par), xt_hooknum(par), skb, xt_in(par),
+		      xt_out(par), &li, "%s", loginfo->prefix);
 	return XT_CONTINUE;
 }
 

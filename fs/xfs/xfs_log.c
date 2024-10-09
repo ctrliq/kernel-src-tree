@@ -22,6 +22,7 @@
 #include "xfs_log_format.h"
 #include "xfs_trans_resv.h"
 #include "xfs_mount.h"
+#include "xfs_errortag.h"
 #include "xfs_error.h"
 #include "xfs_trans.h"
 #include "xfs_trans_priv.h"
@@ -2522,7 +2523,7 @@ next_lv:
 				if (lv)
 					vecp = lv->lv_iovecp;
 			}
-			if (record_cnt == 0 && ordered == false) {
+			if (record_cnt == 0 && !ordered) {
 				if (!lv)
 					return 0;
 				break;

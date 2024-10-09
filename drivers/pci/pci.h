@@ -269,6 +269,7 @@ enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev);
 enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev);
 u32 pcie_bandwidth_capable(struct pci_dev *dev, enum pci_bus_speed *speed,
 			   enum pcie_link_width *width);
+void __pcie_print_link_status(struct pci_dev *dev, bool verbose);
 
 /* Single Root I/O Virtualization */
 struct pci_sriov {
@@ -286,7 +287,7 @@ struct pci_sriov {
 	u16 driver_max_VFs;	/* max num VFs driver supports */
 	struct pci_dev *dev;	/* lowest numbered PF */
 	struct pci_dev *self;	/* this PF */
-	struct mutex lock;	/* lock for VF bus */
+	struct mutex lock;	/* lock for setting sriov_numvfs in sysfs */
 	struct work_struct mtask; /* Obsolete as of RHEL7.1 */
 	u8 __iomem *mstate;	/* Obsolete as of RHEL7.1 */
 	RH_KABI_EXTEND(resource_size_t barsz[PCI_SRIOV_NUM_BARS])	/* VF BAR size */

@@ -209,11 +209,11 @@ csio_pci_init(struct pci_dev *pdev, int *bars)
 	pci_set_master(pdev);
 	pci_try_set_mwi(pdev);
 
-	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
-		pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
-	} else if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
-		pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
-	} else {
+	rv = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (rv)
+		rv = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+	if (rv) {
+		rv = -ENODEV;
 		dev_err(&pdev->dev, "No suitable DMA available.\n");
 		goto err_release_regions;
 	}

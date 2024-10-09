@@ -269,13 +269,9 @@ struct dst_entry *inet_csk_route_req(struct sock *sk, struct flowi4 *fl4,
 struct dst_entry *inet_csk_route_child_sock(struct sock *sk, struct sock *newsk,
 					    const struct request_sock *req);
 
-static inline void inet_csk_reqsk_queue_add(struct sock *sk,
-					    struct request_sock *req,
-					    struct sock *child)
-{
-	reqsk_queue_add(&inet_csk(sk)->icsk_accept_queue, req, sk, child);
-}
-
+struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
+				      struct request_sock *req,
+				      struct sock *child);
 void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
 				   unsigned long timeout);
 

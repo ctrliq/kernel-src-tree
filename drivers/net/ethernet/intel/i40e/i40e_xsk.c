@@ -10,69 +10,6 @@
 #include "i40e_xsk.h"
 
 /**
- * i40e_alloc_xsk_umems - Allocate an array to store per ring UMEMs
- * @vsi: Current VSI
- *
- * Returns 0 on success, <0 on failure
- **/
-static int i40e_alloc_xsk_umems(struct i40e_vsi *vsi)
-{
-	if (vsi->xsk_umems)
-		return 0;
-
-	vsi->num_xsk_umems_used = 0;
-	vsi->num_xsk_umems = vsi->alloc_queue_pairs;
-	vsi->xsk_umems = kcalloc(vsi->num_xsk_umems, sizeof(*vsi->xsk_umems),
-				 GFP_KERNEL);
-	if (!vsi->xsk_umems) {
-		vsi->num_xsk_umems = 0;
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-
-/**
- * i40e_add_xsk_umem - Store a UMEM for a certain ring/qid
- * @vsi: Current VSI
- * @umem: UMEM to store
- * @qid: Ring/qid to associate with the UMEM
- *
- * Returns 0 on success, <0 on failure
- **/
-static int i40e_add_xsk_umem(struct i40e_vsi *vsi, struct xdp_umem *umem,
-			     u16 qid)
-{
-	int err;
-
-	err = i40e_alloc_xsk_umems(vsi);
-	if (err)
-		return err;
-
-	vsi->xsk_umems[qid] = umem;
-	vsi->num_xsk_umems_used++;
-
-	return 0;
-}
-
-/**
- * i40e_remove_xsk_umem - Remove a UMEM for a certain ring/qid
- * @vsi: Current VSI
- * @qid: Ring/qid associated with the UMEM
- **/
-static void i40e_remove_xsk_umem(struct i40e_vsi *vsi, u16 qid)
-{
-	vsi->xsk_umems[qid] = NULL;
-	vsi->num_xsk_umems_used--;
-
-	if (vsi->num_xsk_umems == 0) {
-		kfree(vsi->xsk_umems);
-		vsi->xsk_umems = NULL;
-		vsi->num_xsk_umems = 0;
-	}
-}
-
-/**
  * i40e_xsk_umem_dma_map - DMA maps all UMEM memory for the netdev
  * @vsi: Current VSI
  * @umem: UMEM to DMA map
@@ -140,6 +77,8 @@ static void i40e_xsk_umem_dma_unmap(struct i40e_vsi *vsi, struct xdp_umem *umem)
 static int i40e_xsk_umem_enable(struct i40e_vsi *vsi, struct xdp_umem *umem,
 				u16 qid)
 {
+	struct net_device *netdev = vsi->netdev;
+	struct xdp_umem_fq_reuse *reuseq;
 	bool if_running;
 	int err;
 
@@ -149,12 +88,15 @@ static int i40e_xsk_umem_enable(struct i40e_vsi *vsi, struct xdp_umem *umem,
 	if (qid >= vsi->num_queue_pairs)
 		return -EINVAL;
 
-	if (vsi->xsk_umems) {
-		if (qid >= vsi->num_xsk_umems)
-			return -EINVAL;
-		if (vsi->xsk_umems[qid])
-			return -EBUSY;
-	}
+	if (qid >= netdev->real_num_rx_queues ||
+	    qid >= netdev->real_num_tx_queues)
+		return -EINVAL;
+
+	reuseq = xsk_reuseq_prepare(vsi->rx_rings[0]->count);
+	if (!reuseq)
+		return -ENOMEM;
+
+	xsk_reuseq_free(xsk_reuseq_swap(umem, reuseq));
 
 	err = i40e_xsk_umem_dma_map(vsi, umem);
 	if (err)
@@ -166,13 +108,7 @@ static int i40e_xsk_umem_enable(struct i40e_vsi *vsi, struct xdp_umem *umem,
 		err = i40e_queue_pair_disable(vsi, qid);
 		if (err)
 			return err;
-	}
 
-	err = i40e_add_xsk_umem(vsi, umem, qid);
-	if (err)
-		return err;
-
-	if (if_running) {
 		err = i40e_queue_pair_enable(vsi, qid);
 		if (err)
 			return err;
@@ -190,11 +126,13 @@ static int i40e_xsk_umem_enable(struct i40e_vsi *vsi, struct xdp_umem *umem,
  **/
 static int i40e_xsk_umem_disable(struct i40e_vsi *vsi, u16 qid)
 {
+	struct net_device *netdev = vsi->netdev;
+	struct xdp_umem *umem;
 	bool if_running;
 	int err;
 
-	if (!vsi->xsk_umems || qid >= vsi->num_xsk_umems ||
-	    !vsi->xsk_umems[qid])
+	umem = xdp_get_umem_from_qid(netdev, qid);
+	if (!umem)
 		return -EINVAL;
 
 	if_running = netif_running(vsi->netdev) && i40e_enabled_xdp_vsi(vsi);
@@ -205,8 +143,7 @@ static int i40e_xsk_umem_disable(struct i40e_vsi *vsi, u16 qid)
 			return err;
 	}
 
-	i40e_xsk_umem_dma_unmap(vsi, vsi->xsk_umems[qid]);
-	i40e_remove_xsk_umem(vsi, qid);
+	i40e_xsk_umem_dma_unmap(vsi, umem);
 
 	if (if_running) {
 		err = i40e_queue_pair_enable(vsi, qid);
@@ -230,20 +167,18 @@ static int i40e_xsk_umem_disable(struct i40e_vsi *vsi, u16 qid)
 int i40e_xsk_umem_query(struct i40e_vsi *vsi, struct xdp_umem **umem,
 			u16 qid)
 {
+	struct net_device *netdev = vsi->netdev;
+	struct xdp_umem *queried_umem;
+
 	if (vsi->type != I40E_VSI_MAIN)
 		return -EINVAL;
 
-	if (qid >= vsi->num_queue_pairs)
+	queried_umem = xdp_get_umem_from_qid(netdev, qid);
+
+	if (!queried_umem)
 		return -EINVAL;
 
-	if (vsi->xsk_umems) {
-		if (qid >= vsi->num_xsk_umems)
-			return -EINVAL;
-		*umem = vsi->xsk_umems[qid];
-		return 0;
-	}
-
-	*umem = NULL;
+	*umem = queried_umem;
 	return 0;
 }
 
@@ -353,16 +288,46 @@ static bool i40e_alloc_buffer_zc(struct i40e_ring *rx_ring,
 }
 
 /**
- * i40e_alloc_rx_buffers_zc - Allocates a number of Rx buffers
+ * i40e_alloc_buffer_slow_zc - Allocates an i40e_rx_buffer
  * @rx_ring: Rx ring
- * @count: The number of buffers to allocate
+ * @bi: Rx buffer to populate
  *
- * This function allocates a number of Rx buffers and places them on
- * the Rx ring.
+ * This function allocates an Rx buffer. The buffer can come from fill
+ * queue, or via the reuse queue.
  *
  * Returns true for a successful allocation, false otherwise
  **/
-bool i40e_alloc_rx_buffers_zc(struct i40e_ring *rx_ring, u16 count)
+static bool i40e_alloc_buffer_slow_zc(struct i40e_ring *rx_ring,
+				      struct i40e_rx_buffer *bi)
+{
+	struct xdp_umem *umem = rx_ring->xsk_umem;
+	u64 handle, hr;
+
+	if (!xsk_umem_peek_addr_rq(umem, &handle)) {
+		rx_ring->rx_stats.alloc_page_failed++;
+		return false;
+	}
+
+	handle &= rx_ring->xsk_umem->chunk_mask;
+
+	hr = umem->headroom + XDP_PACKET_HEADROOM;
+
+	bi->dma = xdp_umem_get_dma(umem, handle);
+	bi->dma += hr;
+
+	bi->addr = xdp_umem_get_data(umem, handle);
+	bi->addr += hr;
+
+	bi->handle = handle + umem->headroom;
+
+	xsk_umem_discard_addr_rq(umem);
+	return true;
+}
+
+static __always_inline bool
+__i40e_alloc_rx_buffers_zc(struct i40e_ring *rx_ring, u16 count,
+			   bool alloc(struct i40e_ring *rx_ring,
+				      struct i40e_rx_buffer *bi))
 {
 	u16 ntu = rx_ring->next_to_use;
 	union i40e_rx_desc *rx_desc;
@@ -372,7 +337,7 @@ bool i40e_alloc_rx_buffers_zc(struct i40e_ring *rx_ring, u16 count)
 	rx_desc = I40E_RX_DESC(rx_ring, ntu);
 	bi = &rx_ring->rx_bi[ntu];
 	do {
-		if (!i40e_alloc_buffer_zc(rx_ring, bi)) {
+		if (!alloc(rx_ring, bi)) {
 			ok = false;
 			goto no_buffers;
 		}
@@ -402,6 +367,38 @@ no_buffers:
 		i40e_release_rx_desc(rx_ring, ntu);
 
 	return ok;
+}
+
+/**
+ * i40e_alloc_rx_buffers_zc - Allocates a number of Rx buffers
+ * @rx_ring: Rx ring
+ * @count: The number of buffers to allocate
+ *
+ * This function allocates a number of Rx buffers from the reuse queue
+ * or fill ring and places them on the Rx ring.
+ *
+ * Returns true for a successful allocation, false otherwise
+ **/
+bool i40e_alloc_rx_buffers_zc(struct i40e_ring *rx_ring, u16 count)
+{
+	return __i40e_alloc_rx_buffers_zc(rx_ring, count,
+					  i40e_alloc_buffer_slow_zc);
+}
+
+/**
+ * i40e_alloc_rx_buffers_fast_zc - Allocates a number of Rx buffers
+ * @rx_ring: Rx ring
+ * @count: The number of buffers to allocate
+ *
+ * This function allocates a number of Rx buffers from the fill ring
+ * or the internal recycle mechanism and places them on the Rx ring.
+ *
+ * Returns true for a successful allocation, false otherwise
+ **/
+static bool i40e_alloc_rx_buffers_fast_zc(struct i40e_ring *rx_ring, u16 count)
+{
+	return __i40e_alloc_rx_buffers_zc(rx_ring, count,
+					  i40e_alloc_buffer_zc);
 }
 
 /**
@@ -442,7 +439,7 @@ static void i40e_reuse_rx_buffer_zc(struct i40e_ring *rx_ring,
 				    struct i40e_rx_buffer *old_bi)
 {
 	struct i40e_rx_buffer *new_bi = &rx_ring->rx_bi[rx_ring->next_to_alloc];
-	unsigned long mask = (unsigned long)rx_ring->xsk_umem->props.chunk_mask;
+	unsigned long mask = (unsigned long)rx_ring->xsk_umem->chunk_mask;
 	u64 hr = rx_ring->xsk_umem->headroom + XDP_PACKET_HEADROOM;
 	u16 nta = rx_ring->next_to_alloc;
 
@@ -477,7 +474,7 @@ void i40e_zca_free(struct zero_copy_allocator *alloc, unsigned long handle)
 
 	rx_ring = container_of(alloc, struct i40e_ring, zca);
 	hr = rx_ring->xsk_umem->headroom + XDP_PACKET_HEADROOM;
-	mask = rx_ring->xsk_umem->props.chunk_mask;
+	mask = rx_ring->xsk_umem->chunk_mask;
 
 	nta = rx_ring->next_to_alloc;
 	bi = &rx_ring->rx_bi[nta];
@@ -569,8 +566,8 @@ int i40e_clean_rx_irq_zc(struct i40e_ring *rx_ring, int budget)
 
 		if (cleaned_count >= I40E_RX_BUFFER_WRITE) {
 			failure = failure ||
-				  !i40e_alloc_rx_buffers_zc(rx_ring,
-							    cleaned_count);
+				  !i40e_alloc_rx_buffers_fast_zc(rx_ring,
+								 cleaned_count);
 			cleaned_count = 0;
 		}
 
@@ -651,3 +648,238 @@ int i40e_clean_rx_irq_zc(struct i40e_ring *rx_ring, int budget)
 	return failure ? budget : (int)total_rx_packets;
 }
 
+/**
+ * i40e_xmit_zc - Performs zero-copy Tx AF_XDP
+ * @xdp_ring: XDP Tx ring
+ * @budget: NAPI budget
+ *
+ * Returns true if the work is finished.
+ **/
+static bool i40e_xmit_zc(struct i40e_ring *xdp_ring, unsigned int budget)
+{
+	struct i40e_tx_desc *tx_desc = NULL;
+	struct i40e_tx_buffer *tx_bi;
+	bool work_done = true;
+	dma_addr_t dma;
+	u32 len;
+
+	while (budget-- > 0) {
+		if (!unlikely(I40E_DESC_UNUSED(xdp_ring))) {
+			xdp_ring->tx_stats.tx_busy++;
+			work_done = false;
+			break;
+		}
+
+		if (!xsk_umem_consume_tx(xdp_ring->xsk_umem, &dma, &len))
+			break;
+
+		dma_sync_single_for_device(xdp_ring->dev, dma, len,
+					   DMA_BIDIRECTIONAL);
+
+		tx_bi = &xdp_ring->tx_bi[xdp_ring->next_to_use];
+		tx_bi->bytecount = len;
+
+		tx_desc = I40E_TX_DESC(xdp_ring, xdp_ring->next_to_use);
+		tx_desc->buffer_addr = cpu_to_le64(dma);
+		tx_desc->cmd_type_offset_bsz =
+			build_ctob(I40E_TX_DESC_CMD_ICRC
+				   | I40E_TX_DESC_CMD_EOP,
+				   0, len, 0);
+
+		xdp_ring->next_to_use++;
+		if (xdp_ring->next_to_use == xdp_ring->count)
+			xdp_ring->next_to_use = 0;
+	}
+
+	if (tx_desc) {
+		/* Request an interrupt for the last frame and bump tail ptr. */
+		tx_desc->cmd_type_offset_bsz |= (I40E_TX_DESC_CMD_RS <<
+						 I40E_TXD_QW1_CMD_SHIFT);
+		i40e_xdp_ring_update_tail(xdp_ring);
+
+		xsk_umem_consume_tx_done(xdp_ring->xsk_umem);
+	}
+
+	return !!budget && work_done;
+}
+
+/**
+ * i40e_clean_xdp_tx_buffer - Frees and unmaps an XDP Tx entry
+ * @tx_ring: XDP Tx ring
+ * @tx_bi: Tx buffer info to clean
+ **/
+static void i40e_clean_xdp_tx_buffer(struct i40e_ring *tx_ring,
+				     struct i40e_tx_buffer *tx_bi)
+{
+	xdp_return_frame(tx_bi->xdpf);
+	dma_unmap_single(tx_ring->dev,
+			 dma_unmap_addr(tx_bi, dma),
+			 dma_unmap_len(tx_bi, len), DMA_TO_DEVICE);
+	dma_unmap_len_set(tx_bi, len, 0);
+}
+
+/**
+ * i40e_clean_xdp_tx_irq - Completes AF_XDP entries, and cleans XDP entries
+ * @tx_ring: XDP Tx ring
+ * @tx_bi: Tx buffer info to clean
+ *
+ * Returns true if cleanup/tranmission is done.
+ **/
+bool i40e_clean_xdp_tx_irq(struct i40e_vsi *vsi,
+			   struct i40e_ring *tx_ring, int napi_budget)
+{
+	unsigned int ntc, total_bytes = 0, budget = vsi->work_limit;
+	u32 i, completed_frames, frames_ready, xsk_frames = 0;
+	struct xdp_umem *umem = tx_ring->xsk_umem;
+	u32 head_idx = i40e_get_head(tx_ring);
+	bool work_done = true, xmit_done;
+	struct i40e_tx_buffer *tx_bi;
+
+	if (head_idx < tx_ring->next_to_clean)
+		head_idx += tx_ring->count;
+	frames_ready = head_idx - tx_ring->next_to_clean;
+
+	if (frames_ready == 0) {
+		goto out_xmit;
+	} else if (frames_ready > budget) {
+		completed_frames = budget;
+		work_done = false;
+	} else {
+		completed_frames = frames_ready;
+	}
+
+	ntc = tx_ring->next_to_clean;
+
+	for (i = 0; i < completed_frames; i++) {
+		tx_bi = &tx_ring->tx_bi[ntc];
+
+		if (tx_bi->xdpf)
+			i40e_clean_xdp_tx_buffer(tx_ring, tx_bi);
+		else
+			xsk_frames++;
+
+		tx_bi->xdpf = NULL;
+		total_bytes += tx_bi->bytecount;
+
+		if (++ntc >= tx_ring->count)
+			ntc = 0;
+	}
+
+	tx_ring->next_to_clean += completed_frames;
+	if (unlikely(tx_ring->next_to_clean >= tx_ring->count))
+		tx_ring->next_to_clean -= tx_ring->count;
+
+	if (xsk_frames)
+		xsk_umem_complete_tx(umem, xsk_frames);
+
+	i40e_arm_wb(tx_ring, vsi, budget);
+	i40e_update_tx_stats(tx_ring, completed_frames, total_bytes);
+
+out_xmit:
+	xmit_done = i40e_xmit_zc(tx_ring, budget);
+
+	return work_done && xmit_done;
+}
+
+/**
+ * i40e_xsk_async_xmit - Implements the ndo_xsk_async_xmit
+ * @dev: the netdevice
+ * @queue_id: queue id to wake up
+ *
+ * Returns <0 for errors, 0 otherwise.
+ **/
+int i40e_xsk_async_xmit(struct net_device *dev, u32 queue_id)
+{
+	struct i40e_netdev_priv *np = netdev_priv(dev);
+	struct i40e_vsi *vsi = np->vsi;
+	struct i40e_ring *ring;
+
+	if (test_bit(__I40E_VSI_DOWN, vsi->state))
+		return -ENETDOWN;
+
+	if (!i40e_enabled_xdp_vsi(vsi))
+		return -ENXIO;
+
+	if (queue_id >= vsi->num_queue_pairs)
+		return -ENXIO;
+
+	if (!vsi->xdp_rings[queue_id]->xsk_umem)
+		return -ENXIO;
+
+	ring = vsi->xdp_rings[queue_id];
+
+	/* The idea here is that if NAPI is running, mark a miss, so
+	 * it will run again. If not, trigger an interrupt and
+	 * schedule the NAPI from interrupt context. If NAPI would be
+	 * scheduled here, the interrupt affinity would not be
+	 * honored.
+	 */
+	if (!napi_if_scheduled_mark_missed(&ring->q_vector->napi))
+		i40e_force_wb(vsi, ring->q_vector);
+
+	return 0;
+}
+
+void i40e_xsk_clean_rx_ring(struct i40e_ring *rx_ring)
+{
+	u16 i;
+
+	for (i = 0; i < rx_ring->count; i++) {
+		struct i40e_rx_buffer *rx_bi = &rx_ring->rx_bi[i];
+
+		if (!rx_bi->addr)
+			continue;
+
+		xsk_umem_fq_reuse(rx_ring->xsk_umem, rx_bi->handle);
+		rx_bi->addr = NULL;
+	}
+}
+
+/**
+ * i40e_xsk_clean_xdp_ring - Clean the XDP Tx ring on shutdown
+ * @xdp_ring: XDP Tx ring
+ **/
+void i40e_xsk_clean_tx_ring(struct i40e_ring *tx_ring)
+{
+	u16 ntc = tx_ring->next_to_clean, ntu = tx_ring->next_to_use;
+	struct xdp_umem *umem = tx_ring->xsk_umem;
+	struct i40e_tx_buffer *tx_bi;
+	u32 xsk_frames = 0;
+
+	while (ntc != ntu) {
+		tx_bi = &tx_ring->tx_bi[ntc];
+
+		if (tx_bi->xdpf)
+			i40e_clean_xdp_tx_buffer(tx_ring, tx_bi);
+		else
+			xsk_frames++;
+
+		tx_bi->xdpf = NULL;
+
+		ntc++;
+		if (ntc >= tx_ring->count)
+			ntc = 0;
+	}
+
+	if (xsk_frames)
+		xsk_umem_complete_tx(umem, xsk_frames);
+}
+
+/**
+ * i40e_xsk_any_rx_ring_enabled - Checks if Rx rings have AF_XDP UMEM attached
+ * @vsi: vsi
+ *
+ * Returns true if any of the Rx rings has an AF_XDP UMEM attached
+ **/
+bool i40e_xsk_any_rx_ring_enabled(struct i40e_vsi *vsi)
+{
+	struct net_device *netdev = vsi->netdev;
+	int i;
+
+	for (i = 0; i < vsi->num_queue_pairs; i++) {
+		if (xdp_get_umem_from_qid(netdev, i))
+			return true;
+	}
+
+	return false;
+}

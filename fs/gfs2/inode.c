@@ -1997,10 +1997,6 @@ static int gfs2_removexattr(struct dentry *dentry, const char *name)
 	return ret;
 }
 
-const struct iomap_ops gfs2_iomap_ops = {
-	.iomap_begin = gfs2_iomap_begin,
-};
-
 static int gfs2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		       u64 start, u64 len)
 {

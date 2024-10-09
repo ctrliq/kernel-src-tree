@@ -53,7 +53,10 @@ FILES=                                          \
          test-jvmti.bin				\
          test-jvmti-cmlr.bin			\
          test-sched_getcpu.bin			\
-         test-setns.bin
+         test-setns.bin				\
+         test-clang.bin				\
+         test-llvm.bin				\
+         test-llvm-version.bin
 
 FILES := $(addprefix $(OUTPUT),$(FILES))
 

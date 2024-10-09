@@ -1414,7 +1414,7 @@ static void gfs2_kill_sb(struct super_block *sb)
 
 struct file_system_type gfs2_fs_type = {
 	.name = "gfs2",
-	.fs_flags = FS_REQUIRES_DEV,
+	.fs_flags = FS_REQUIRES_DEV | FS_HAS_INVALIDATE_RANGE,
 	.mount = gfs2_mount,
 	.kill_sb = gfs2_kill_sb,
 	.owner = THIS_MODULE,
@@ -1423,7 +1423,7 @@ MODULE_ALIAS_FS("gfs2");
 
 struct file_system_type gfs2meta_fs_type = {
 	.name = "gfs2meta",
-	.fs_flags = FS_REQUIRES_DEV,
+	.fs_flags = FS_REQUIRES_DEV | FS_HAS_INVALIDATE_RANGE,
 	.mount = gfs2_mount_meta,
 	.owner = THIS_MODULE,
 };

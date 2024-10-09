@@ -176,6 +176,7 @@ static const struct intel_gvt_ops intel_gvt_ops = {
 	.emulate_mmio_write = intel_vgpu_emulate_mmio_write,
 	.vgpu_create = intel_gvt_create_vgpu,
 	.vgpu_destroy = intel_gvt_destroy_vgpu,
+	.vgpu_release = intel_gvt_release_vgpu,
 	.vgpu_reset = intel_gvt_reset_vgpu,
 	.vgpu_activate = intel_gvt_activate_vgpu,
 	.vgpu_deactivate = intel_gvt_deactivate_vgpu,
@@ -188,7 +189,6 @@ static const struct intel_gvt_ops intel_gvt_ops = {
 
 /**
  * intel_gvt_init_host - Load MPT modules and detect if we're running in host
- * @gvt: intel gvt device
  *
  * This function is called at the driver loading stage. If failed to find a
  * loadable MPT module or detect currently we're running in a VM, then GVT-g
@@ -238,18 +238,15 @@ static void init_device_info(struct intel_gvt *gvt)
 	struct intel_gvt_device_info *info = &gvt->device_info;
 	struct pci_dev *pdev = gvt->dev_priv->drm.pdev;
 
-	if (IS_BROADWELL(gvt->dev_priv) || IS_SKYLAKE(gvt->dev_priv)
-		|| IS_KABYLAKE(gvt->dev_priv)) {
-		info->max_support_vgpus = 8;
-		info->cfg_space_size = PCI_CFG_SPACE_EXP_SIZE;
-		info->mmio_size = 2 * 1024 * 1024;
-		info->mmio_bar = 0;
-		info->gtt_start_offset = 8 * 1024 * 1024;
-		info->gtt_entry_size = 8;
-		info->gtt_entry_size_shift = 3;
-		info->gmadr_bytes_in_cmd = 8;
-		info->max_surface_size = 36 * 1024 * 1024;
-	}
+	info->max_support_vgpus = 8;
+	info->cfg_space_size = PCI_CFG_SPACE_EXP_SIZE;
+	info->mmio_size = 2 * 1024 * 1024;
+	info->mmio_bar = 0;
+	info->gtt_start_offset = 8 * 1024 * 1024;
+	info->gtt_entry_size = 8;
+	info->gtt_entry_size_shift = 3;
+	info->gmadr_bytes_in_cmd = 8;
+	info->max_surface_size = 36 * 1024 * 1024;
 	info->msi_cap_offset = pdev->msi_cap;
 }
 
@@ -271,11 +268,8 @@ static int gvt_service_thread(void *data)
 			continue;
 
 		if (test_and_clear_bit(INTEL_GVT_REQUEST_EMULATE_VBLANK,
-					(void *)&gvt->service_request)) {
-			mutex_lock(&gvt->lock);
+					(void *)&gvt->service_request))
 			intel_gvt_emulate_vblank(gvt);
-			mutex_unlock(&gvt->lock);
-		}
 
 		if (test_bit(INTEL_GVT_REQUEST_SCHED,
 				(void *)&gvt->service_request) ||
@@ -308,7 +302,7 @@ static int init_service_thread(struct intel_gvt *gvt)
 
 /**
  * intel_gvt_clean_device - clean a GVT device
- * @gvt: intel gvt device
+ * @dev_priv: i915 private
  *
  * This function is called at the driver unloading stage, to free the
  * resources owned by a GVT device.
@@ -377,6 +371,7 @@ int intel_gvt_init_device(struct drm_i915_private *dev_priv)
 	idr_init(&gvt->vgpu_idr);
 	spin_lock_init(&gvt->scheduler.mmio_context_lock);
 	mutex_init(&gvt->lock);
+	mutex_init(&gvt->sched_lock);
 	gvt->dev_priv = dev_priv;
 
 	init_device_info(gvt);
@@ -442,7 +437,7 @@ int intel_gvt_init_device(struct drm_i915_private *dev_priv)
 
 	ret = intel_gvt_debugfs_init(gvt);
 	if (ret)
-		gvt_err("debugfs registeration failed, go on.\n");
+		gvt_err("debugfs registration failed, go on.\n");
 
 	gvt_dbg_core("gvt device initialization is done\n");
 	dev_priv->gvt = gvt;
@@ -471,3 +466,7 @@ out_clean_idr:
 	kfree(gvt);
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_DRM_I915_GVT_KVMGT)
+MODULE_SOFTDEP("pre: kvmgt");
+#endif

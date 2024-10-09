@@ -122,7 +122,8 @@ struct symbol_conf {
 	const char	*vmlinux_name,
 			*kallsyms_name,
 			*source_prefix,
-			*field_sep;
+			*field_sep,
+			*graph_function;
 	const char	*default_guest_vmlinux_name,
 			*default_guest_kallsyms,
 			*default_guest_modules;
@@ -256,16 +257,11 @@ int __dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map,
 			 bool no_kcore);
 int dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map);
 
-void dso__insert_symbol(struct dso *dso, enum map_type type,
+void dso__insert_symbol(struct dso *dso,
 			struct symbol *sym);
 
-struct symbol *__dso__find_symbol(struct dso *dso, enum map_type type, u64 addr);
-struct symbol *__dso__find_symbol_by_name(struct dso *dso, enum map_type type, const char *name);
-
-static inline struct symbol *dso__find_symbol(struct dso *dso, u64 addr)
-{
-	return __dso__find_symbol(dso, MAP__FUNCTION, addr);
-}
+struct symbol *dso__find_symbol(struct dso *dso, u64 addr);
+struct symbol *dso__find_symbol_by_name(struct dso *dso, const char *name);
 
 struct symbol *symbol__next_by_name(struct symbol *sym);
 
@@ -308,8 +304,7 @@ int symbol__config_symfs(const struct option *opt __maybe_unused,
 
 int dso__load_sym(struct dso *dso, struct map *map, struct symsrc *syms_ss,
 		  struct symsrc *runtime_ss, int kmodule);
-int dso__synthesize_plt_symbols(struct dso *dso, struct symsrc *ss,
-				struct map *map);
+int dso__synthesize_plt_symbols(struct dso *dso, struct symsrc *ss);
 
 char *dso__demangle_sym(struct dso *dso, int kmodule, const char *elf_name);
 
@@ -317,7 +312,7 @@ void __symbols__insert(struct rb_root *symbols, struct symbol *sym, bool kernel)
 void symbols__insert(struct rb_root *symbols, struct symbol *sym);
 void symbols__fixup_duplicate(struct rb_root *symbols);
 void symbols__fixup_end(struct rb_root *symbols);
-void __map_groups__fixup_end(struct map_groups *mg, enum map_type type);
+void map_groups__fixup_end(struct map_groups *mg);
 
 typedef int (*mapfn_t)(u64 start, u64 len, u64 pgoff, void *data);
 int file__read_maps(int fd, bool exe, mapfn_t mapfn, void *data,

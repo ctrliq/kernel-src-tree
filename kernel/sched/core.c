@@ -539,6 +539,18 @@ static bool set_nr_if_polling(struct task_struct *p)
 #endif
 #endif
 
+/**
+ * wake_q_add() - queue a wakeup for 'later' waking.
+ * @head: the wake_q_head to add @task to
+ * @task: the task to queue for 'later' wakeup
+ *
+ * Queue a task for later wakeup, most likely by the wake_up_q() call in the
+ * same context, _HOWEVER_ this is not guaranteed, the wakeup can come
+ * instantly.
+ *
+ * This function must be used as-if it were wake_up_process(); IOW the task
+ * must be ready to be woken at this location.
+ */
 void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 {
 	struct wake_q_node *node = &task->wake_q;
@@ -548,10 +560,11 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	 * its already queued (either by us or someone else) and will get the
 	 * wakeup due to that.
 	 *
-	 * This cmpxchg() implies a full barrier, which pairs with the write
-	 * barrier implied by the wakeup in wake_up_list().
+	 * In order to ensure that a pending wakeup will observe our pending
+	 * state, even in the failed case, an explicit smp_mb() must be used.
 	 */
-	if (cmpxchg(&node->next, NULL, WAKE_Q_TAIL))
+	smp_mb__before_atomic();
+	if (cmpxchg_relaxed(&node->next, NULL, WAKE_Q_TAIL))
 		return;
 
 	get_task_struct(task);
@@ -3743,6 +3756,16 @@ int default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags,
 }
 EXPORT_SYMBOL(default_wake_function);
 
+int bookmark_wake_function(wait_queue_t *wait, unsigned mode, int sync, void *key)
+{
+	/* should not ever be called */
+        WARN_ON(true);
+        return 0;
+}
+EXPORT_SYMBOL(bookmark_wake_function);
+
+#define BREAK_CNT 64
+
 /*
  * The core wakeup function. Non-exclusive wakeups (nr_exclusive == 0) just
  * wake everything up. If it's an exclusive wakeup (nr_exclusive == small +ve
@@ -3752,17 +3775,63 @@ EXPORT_SYMBOL(default_wake_function);
  * started to run but is not in state TASK_RUNNING. try_to_wake_up() returns
  * zero in this (rare) case, and we handle it by continuing to scan the queue.
  */
-static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
-			int nr_exclusive, int wake_flags, void *key)
+static int __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+			int nr_exclusive, int wake_flags, void *key,
+			wait_queue_t *bookmark)
 {
 	wait_queue_t *curr, *next;
+	int cnt = 0;
 
-	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+	if (bookmark && (bookmark->flags & WQ_FLAG_BOOKMARK)) {
+		curr = list_next_entry(bookmark, task_list);
+
+		list_del(&bookmark->task_list);
+		bookmark->flags = 0;
+	} else
+		curr = list_first_entry(&q->task_list, wait_queue_t, task_list);
+
+	if (&curr->task_list == &q->task_list)
+		return nr_exclusive;
+
+	list_for_each_entry_safe_from(curr, next, &q->task_list, task_list) {
 		unsigned flags = curr->flags;
+
+		if (curr->func == bookmark_wake_function)
+			continue;
 
 		if (curr->func(curr, mode, wake_flags, key) &&
 				(flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
 			break;
+
+		if (bookmark && (++cnt > BREAK_CNT) &&
+				(&next->task_list != &q->task_list)) {
+			bookmark->flags = WQ_FLAG_BOOKMARK;
+			list_add_tail(&bookmark->task_list, &next->task_list);
+			break;
+		}
+	}
+	return nr_exclusive;
+}
+
+static void __wake_up_common_lock(wait_queue_head_t *q, unsigned int mode,
+			int nr_exclusive, int wake_flags, void *key)
+{
+	unsigned long flags;
+	wait_queue_t bookmark;
+
+	bookmark.flags = 0;
+	bookmark.private = NULL;
+	bookmark.func = bookmark_wake_function;
+	INIT_LIST_HEAD(&bookmark.task_list);
+
+	spin_lock_irqsave(&q->lock, flags);
+	nr_exclusive = __wake_up_common(q, mode, nr_exclusive, wake_flags, key, &bookmark);
+	spin_unlock_irqrestore(&q->lock, flags);
+
+	while (bookmark.flags & WQ_FLAG_BOOKMARK) {
+		spin_lock_irqsave(&q->lock, flags);
+		nr_exclusive = __wake_up_common(q, mode, nr_exclusive, wake_flags, key, &bookmark);
+		spin_unlock_irqrestore(&q->lock, flags);
 	}
 }
 
@@ -3779,11 +3848,7 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
 void __wake_up(wait_queue_head_t *q, unsigned int mode,
 			int nr_exclusive, void *key)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&q->lock, flags);
-	__wake_up_common(q, mode, nr_exclusive, 0, key);
-	spin_unlock_irqrestore(&q->lock, flags);
+	__wake_up_common_lock(q, mode, nr_exclusive, 0, key);
 }
 EXPORT_SYMBOL(__wake_up);
 
@@ -3792,13 +3857,13 @@ EXPORT_SYMBOL(__wake_up);
  */
 void __wake_up_locked(wait_queue_head_t *q, unsigned int mode, int nr)
 {
-	__wake_up_common(q, mode, nr, 0, NULL);
+	__wake_up_common(q, mode, nr, 0, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(__wake_up_locked);
 
 void __wake_up_locked_key(wait_queue_head_t *q, unsigned int mode, void *key)
 {
-	__wake_up_common(q, mode, 1, 0, key);
+	__wake_up_common(q, mode, 1, 0, key, NULL);
 }
 EXPORT_SYMBOL_GPL(__wake_up_locked_key);
 
@@ -3822,7 +3887,6 @@ EXPORT_SYMBOL_GPL(__wake_up_locked_key);
 void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode,
 			int nr_exclusive, void *key)
 {
-	unsigned long flags;
 	int wake_flags = WF_SYNC;
 
 	if (unlikely(!q))
@@ -3831,9 +3895,7 @@ void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode,
 	if (unlikely(!nr_exclusive))
 		wake_flags = 0;
 
-	spin_lock_irqsave(&q->lock, flags);
-	__wake_up_common(q, mode, nr_exclusive, wake_flags, key);
-	spin_unlock_irqrestore(&q->lock, flags);
+	__wake_up_common_lock(q, mode, nr_exclusive, wake_flags, key);
 }
 EXPORT_SYMBOL_GPL(__wake_up_sync_key);
 
@@ -3864,7 +3926,7 @@ void complete(struct completion *x)
 
 	spin_lock_irqsave(&x->wait.lock, flags);
 	x->done++;
-	__wake_up_common(&x->wait, TASK_NORMAL, 1, 0, NULL);
+	__wake_up_common(&x->wait, TASK_NORMAL, 1, 0, NULL, NULL);
 	spin_unlock_irqrestore(&x->wait.lock, flags);
 }
 EXPORT_SYMBOL(complete);
@@ -3884,7 +3946,7 @@ void complete_all(struct completion *x)
 
 	spin_lock_irqsave(&x->wait.lock, flags);
 	x->done += UINT_MAX/2;
-	__wake_up_common(&x->wait, TASK_NORMAL, 0, 0, NULL);
+	__wake_up_common(&x->wait, TASK_NORMAL, 0, 0, NULL, NULL);
 	spin_unlock_irqrestore(&x->wait.lock, flags);
 }
 EXPORT_SYMBOL(complete_all);
@@ -7691,6 +7753,10 @@ static void sched_init_numa(void)
 	if (!sched_domains_numa_distance)
 		return;
 
+	/* Includes NUMA identity node at level 0. */
+	sched_domains_numa_distance[level++] = curr_distance;
+	sched_domains_numa_levels = level;
+
 	/*
 	 * O(nr_nodes^2) deduplicating selection sort -- in order to find the
 	 * unique distances in the node_distance() table.
@@ -7734,8 +7800,7 @@ static void sched_init_numa(void)
 			break;
 	}
 	/*
-	 * 'level' contains the number of unique distances, excluding the
-	 * identity distance node_distance(i,i).
+	 * 'level' contains the number of unique distances
 	 *
 	 * The sched_domains_numa_distance[] array includes the actual distance
 	 * numbers.
@@ -7797,9 +7862,18 @@ static void sched_init_numa(void)
 		tl[i] = sched_domain_topology[i];
 
 	/*
+	 * Add the NUMA identity distance, aka single NODE.
+	 */
+	tl[i++] = (struct sched_domain_topology_level){
+		.mask = sd_numa_mask,
+		.numa_level = 0,
+		SD_INIT_NAME(NODE)
+	};
+
+	/*
 	 * .. and append 'j' levels of NUMA goodness.
 	 */
-	for (j = 0; j < level; i++, j++) {
+	for (j = 1; j < level; i++, j++) {
 		tl[i] = (struct sched_domain_topology_level){
 			.mask = sd_numa_mask,
 			.sd_flags = cpu_numa_flags,
@@ -8345,6 +8419,31 @@ static int cpuset_cpu_inactive(struct notifier_block *nfb, unsigned long action,
 		return NOTIFY_DONE;
 	}
 	return NOTIFY_OK;
+}
+
+struct static_key sched_smt_present = STATIC_KEY_INIT_FALSE;
+EXPORT_SYMBOL_GPL(sched_smt_present);
+
+void sched_cpu_activate(unsigned int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	/*
+	 * When going up, increment the number of cores with SMT present.
+	 */
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_key_slow_inc(&sched_smt_present);
+#endif
+}
+
+void sched_cpu_deactivate(unsigned int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	/*
+	 * When going down, decrement the number of cores with SMT present.
+	 */
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_key_slow_dec(&sched_smt_present);
+#endif
 }
 
 void __init sched_init_smp(void)

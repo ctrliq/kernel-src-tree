@@ -90,7 +90,7 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 	mm->context.pte_frag = NULL;
 #endif
 #ifdef CONFIG_SPAPR_TCE_IOMMU
-	mm_iommu_init(&mm->context);
+	mm_iommu_init(mm);
 #endif
 	return 0;
 }
@@ -131,13 +131,11 @@ static inline void destroy_pagetable_page(struct mm_struct *mm)
 }
 #endif
 
-
 void destroy_context(struct mm_struct *mm)
 {
 #ifdef CONFIG_SPAPR_TCE_IOMMU
-	mm_iommu_cleanup(&mm->context);
+	WARN_ON_ONCE(!list_empty(&mm->iommu_group_mem_list));
 #endif
-
 #ifdef CONFIG_PPC_ICSWX
 	drop_cop(mm->context.acop, mm);
 	kfree(mm->context.cop_lockp);

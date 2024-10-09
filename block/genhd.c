@@ -556,7 +556,8 @@ static int exact_lock(dev_t devt, void *data)
 	return 0;
 }
 
-static void register_disk(struct gendisk *disk)
+static void register_disk(struct gendisk *disk,
+			  const struct attribute_group **groups)
 {
 	struct device *ddev = disk_to_dev(disk);
 	struct block_device *bdev;
@@ -571,6 +572,10 @@ static void register_disk(struct gendisk *disk)
 	/* delay uevents, until we scanned partition table */
 	dev_set_uevent_suppress(ddev, 1);
 
+	if (groups) {
+		WARN_ON(ddev->groups);
+		ddev->groups = groups;
+	}
 	if (device_add(ddev))
 		return;
 	if (!sysfs_deprecated) {
@@ -625,6 +630,7 @@ exit:
 /**
  * __add_disk - add partitioning information to kernel list
  * @disk: per-device partitioning information
+ * @groups: Additional per-device sysfs groups
  * @register_queue: register the queue if set to true
  *
  * This function registers the partitioning information in @disk
@@ -632,7 +638,9 @@ exit:
  *
  * FIXME: error handling
  */
-static void __add_disk(struct gendisk *disk, bool register_queue)
+static void __add_disk(struct gendisk *disk,
+		const struct attribute_group **groups,
+		bool register_queue)
 {
 	struct backing_dev_info *bdi;
 	dev_t devt;
@@ -668,7 +676,7 @@ static void __add_disk(struct gendisk *disk, bool register_queue)
 
 	blk_register_region(disk_devt(disk), disk->minors, NULL,
 			    exact_match, exact_lock, disk);
-	register_disk(disk);
+	register_disk(disk, groups);
 	if (register_queue)
 		blk_register_queue(disk);
 
@@ -687,15 +695,22 @@ static void __add_disk(struct gendisk *disk, bool register_queue)
 
 void add_disk(struct gendisk *disk)
 {
-	__add_disk(disk, true);
+	__add_disk(disk, NULL, true);
 }
 EXPORT_SYMBOL(add_disk);
 
 void add_disk_no_queue_reg(struct gendisk *disk)
 {
-	__add_disk(disk, false);
+	__add_disk(disk, NULL, false);
 }
 EXPORT_SYMBOL(add_disk_no_queue_reg);
+
+void add_disk_with_attributes(struct gendisk *disk,
+		const struct attribute_group **groups)
+{
+	__add_disk(disk, groups, true);
+}
+EXPORT_SYMBOL(add_disk_with_attributes);
 
 void del_gendisk(struct gendisk *disk)
 {

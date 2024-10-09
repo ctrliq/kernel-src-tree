@@ -528,6 +528,7 @@ sysret_check:
 	/*CFI_REGISTER	rflags,r11*/
 	movq	PER_CPU_VAR(old_rsp), %rsp
 	SWITCH_TO_USER_CR3
+	MDS_USER_CLEAR_CPU_BUFFERS
 	USERGS_SYSRET64
 
 	CFI_RESTORE_STATE
@@ -918,6 +919,7 @@ retint_userspace_restore_args:
 	movq (%rax), %rax
 	SWITCH_TO_USER_CR3
 	SWAPGS
+	MDS_USER_CLEAR_CPU_BUFFERS
 	jmp irq_return
 
 paranoid_userspace_restore_all:
@@ -1451,6 +1453,12 @@ paranoid_swapgs_restore:
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
 	RESTORE_ALL 8
 	SWAPGS
+	/*
+	 * If swapgs needs to be called, there is a pretty good chance that
+	 * NMI/exception happen right before returning to userspace.
+	 * So clear the CPU buffers just in case.
+	 */
+	MDS_USER_CLEAR_CPU_BUFFERS
 	jmp irq_return
 paranoid_noswapgs_restore:
 	/* return to kernel */

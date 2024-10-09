@@ -6170,7 +6170,7 @@ check_for_locks(struct nfs4_file *fp, struct nfs4_lockowner *lowner)
 		return status;
 	}
 
-	inode = file_inode(filp);
+	inode = locks_inode(filp);
 
 	spin_lock(&inode->i_lock);
 	for (flpp = &inode->i_flock; *flpp != NULL; flpp = &(*flpp)->fl_next) {

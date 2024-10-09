@@ -5331,12 +5331,15 @@ lpfc_sli4_read_rev(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq,
 	 * mailbox command.
 	 */
 	dma_size = *vpd_size;
-	dmabuf->virt = dma_zalloc_coherent(&phba->pcidev->dev, dma_size,
-					   &dmabuf->phys, GFP_KERNEL);
+	dmabuf->virt = dma_alloc_coherent(&phba->pcidev->dev,
+					  dma_size,
+					  &dmabuf->phys,
+					  GFP_KERNEL);
 	if (!dmabuf->virt) {
 		kfree(dmabuf);
 		return -ENOMEM;
 	}
+	memset(dmabuf->virt, 0, dma_size);
 
 	/*
 	 * The SLI4 implementation of READ_REV conflicts at word1,
@@ -6169,6 +6172,291 @@ lpfc_set_features(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox,
 	}
 
 	return;
+}
+
+/**
+ * lpfc_ras_stop_fwlog: Disable FW logging by the adapter
+ * @phba: Pointer to HBA context object.
+ *
+ * Disable FW logging into host memory on the adapter. To
+ * be done before reading logs from the host memory.
+ **/
+void
+lpfc_ras_stop_fwlog(struct lpfc_hba *phba)
+{
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+
+	ras_fwlog->ras_active = false;
+
+	/* Disable FW logging to host memory */
+	writel(LPFC_CTL_PDEV_CTL_DDL_RAS,
+	       phba->sli4_hba.conf_regs_memmap_p + LPFC_CTL_PDEV_CTL_OFFSET);
+}
+
+/**
+ * lpfc_sli4_ras_dma_free - Free memory allocated for FW logging.
+ * @phba: Pointer to HBA context object.
+ *
+ * This function is called to free memory allocated for RAS FW logging
+ * support in the driver.
+ **/
+void
+lpfc_sli4_ras_dma_free(struct lpfc_hba *phba)
+{
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	struct lpfc_dmabuf *dmabuf, *next;
+
+	if (!list_empty(&ras_fwlog->fwlog_buff_list)) {
+		list_for_each_entry_safe(dmabuf, next,
+				    &ras_fwlog->fwlog_buff_list,
+				    list) {
+			list_del(&dmabuf->list);
+			dma_free_coherent(&phba->pcidev->dev,
+					  LPFC_RAS_MAX_ENTRY_SIZE,
+					  dmabuf->virt, dmabuf->phys);
+			kfree(dmabuf);
+		}
+	}
+
+	if (ras_fwlog->lwpd.virt) {
+		dma_free_coherent(&phba->pcidev->dev,
+				  sizeof(uint32_t) * 2,
+				  ras_fwlog->lwpd.virt,
+				  ras_fwlog->lwpd.phys);
+		ras_fwlog->lwpd.virt = NULL;
+	}
+
+	ras_fwlog->ras_active = false;
+}
+
+/**
+ * lpfc_sli4_ras_dma_alloc: Allocate memory for FW support
+ * @phba: Pointer to HBA context object.
+ * @fwlog_buff_count: Count of buffers to be created.
+ *
+ * This routine DMA memory for Log Write Position Data[LPWD] and buffer
+ * to update FW log is posted to the adapter.
+ * Buffer count is calculated based on module param ras_fwlog_buffsize
+ * Size of each buffer posted to FW is 64K.
+ **/
+
+static int
+lpfc_sli4_ras_dma_alloc(struct lpfc_hba *phba,
+			uint32_t fwlog_buff_count)
+{
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	struct lpfc_dmabuf *dmabuf;
+	int rc = 0, i = 0;
+
+	/* Initialize List */
+	INIT_LIST_HEAD(&ras_fwlog->fwlog_buff_list);
+
+	/* Allocate memory for the LWPD */
+	ras_fwlog->lwpd.virt = dma_alloc_coherent(&phba->pcidev->dev,
+					    sizeof(uint32_t) * 2,
+					    &ras_fwlog->lwpd.phys,
+					    GFP_KERNEL);
+	if (!ras_fwlog->lwpd.virt) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+				"6185 LWPD Memory Alloc Failed\n");
+
+		return -ENOMEM;
+	}
+
+	ras_fwlog->fw_buffcount = fwlog_buff_count;
+	for (i = 0; i < ras_fwlog->fw_buffcount; i++) {
+		dmabuf = kzalloc(sizeof(struct lpfc_dmabuf),
+				 GFP_KERNEL);
+		if (!dmabuf) {
+			rc = -ENOMEM;
+			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+					"6186 Memory Alloc failed FW logging");
+			goto free_mem;
+		}
+
+		dmabuf->virt = dma_zalloc_coherent(&phba->pcidev->dev,
+						  LPFC_RAS_MAX_ENTRY_SIZE,
+						  &dmabuf->phys,
+						  GFP_KERNEL);
+		if (!dmabuf->virt) {
+			kfree(dmabuf);
+			rc = -ENOMEM;
+			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+					"6187 DMA Alloc Failed FW logging");
+			goto free_mem;
+		}
+		dmabuf->buffer_tag = i;
+		list_add_tail(&dmabuf->list, &ras_fwlog->fwlog_buff_list);
+	}
+
+free_mem:
+	if (rc)
+		lpfc_sli4_ras_dma_free(phba);
+
+	return rc;
+}
+
+/**
+ * lpfc_sli4_ras_mbox_cmpl: Completion handler for RAS MBX command
+ * @phba: pointer to lpfc hba data structure.
+ * @pmboxq: pointer to the driver internal queue element for mailbox command.
+ *
+ * Completion handler for driver's RAS MBX command to the device.
+ **/
+static void
+lpfc_sli4_ras_mbox_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+{
+	MAILBOX_t *mb;
+	union lpfc_sli4_cfg_shdr *shdr;
+	uint32_t shdr_status, shdr_add_status;
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+
+	mb = &pmb->u.mb;
+
+	shdr = (union lpfc_sli4_cfg_shdr *)
+		&pmb->u.mqe.un.ras_fwlog.header.cfg_shdr;
+	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
+	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
+
+	if (mb->mbxStatus != MBX_SUCCESS || shdr_status) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
+				"6188 FW LOG mailbox "
+				"completed with status x%x add_status x%x,"
+				" mbx status x%x\n",
+				shdr_status, shdr_add_status, mb->mbxStatus);
+
+		ras_fwlog->ras_hwsupport = false;
+		goto disable_ras;
+	}
+
+	ras_fwlog->ras_active = true;
+	mempool_free(pmb, phba->mbox_mem_pool);
+
+	return;
+
+disable_ras:
+	/* Free RAS DMA memory */
+	lpfc_sli4_ras_dma_free(phba);
+	mempool_free(pmb, phba->mbox_mem_pool);
+}
+
+/**
+ * lpfc_sli4_ras_fwlog_init: Initialize memory and post RAS MBX command
+ * @phba: pointer to lpfc hba data structure.
+ * @fwlog_level: Logging verbosity level.
+ * @fwlog_enable: Enable/Disable logging.
+ *
+ * Initialize memory and post mailbox command to enable FW logging in host
+ * memory.
+ **/
+int
+lpfc_sli4_ras_fwlog_init(struct lpfc_hba *phba,
+			 uint32_t fwlog_level,
+			 uint32_t fwlog_enable)
+{
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	struct lpfc_mbx_set_ras_fwlog *mbx_fwlog = NULL;
+	struct lpfc_dmabuf *dmabuf;
+	LPFC_MBOXQ_t *mbox;
+	uint32_t len = 0, fwlog_buffsize, fwlog_entry_count;
+	int rc = 0;
+
+	fwlog_buffsize = (LPFC_RAS_MIN_BUFF_POST_SIZE *
+			  phba->cfg_ras_fwlog_buffsize);
+	fwlog_entry_count = (fwlog_buffsize/LPFC_RAS_MAX_ENTRY_SIZE);
+
+	/*
+	 * If re-enabling FW logging support use earlier allocated
+	 * DMA buffers while posting MBX command.
+	 **/
+	if (!ras_fwlog->lwpd.virt) {
+		rc = lpfc_sli4_ras_dma_alloc(phba, fwlog_entry_count);
+		if (rc) {
+			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
+					"6189 FW Log Memory Allocation Failed");
+			return rc;
+		}
+	}
+
+	/* Setup Mailbox command */
+	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
+	if (!mbox) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+				"6190 RAS MBX Alloc Failed");
+		rc = -ENOMEM;
+		goto mem_free;
+	}
+
+	ras_fwlog->fw_loglevel = fwlog_level;
+	len = (sizeof(struct lpfc_mbx_set_ras_fwlog) -
+		sizeof(struct lpfc_sli4_cfg_mhdr));
+
+	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_LOWLEVEL,
+			 LPFC_MBOX_OPCODE_SET_DIAG_LOG_OPTION,
+			 len, LPFC_SLI4_MBX_EMBED);
+
+	mbx_fwlog = (struct lpfc_mbx_set_ras_fwlog *)&mbox->u.mqe.un.ras_fwlog;
+	bf_set(lpfc_fwlog_enable, &mbx_fwlog->u.request,
+	       fwlog_enable);
+	bf_set(lpfc_fwlog_loglvl, &mbx_fwlog->u.request,
+	       ras_fwlog->fw_loglevel);
+	bf_set(lpfc_fwlog_buffcnt, &mbx_fwlog->u.request,
+	       ras_fwlog->fw_buffcount);
+	bf_set(lpfc_fwlog_buffsz, &mbx_fwlog->u.request,
+	       LPFC_RAS_MAX_ENTRY_SIZE/SLI4_PAGE_SIZE);
+
+	/* Update DMA buffer address */
+	list_for_each_entry(dmabuf, &ras_fwlog->fwlog_buff_list, list) {
+		memset(dmabuf->virt, 0, LPFC_RAS_MAX_ENTRY_SIZE);
+
+		mbx_fwlog->u.request.buff_fwlog[dmabuf->buffer_tag].addr_lo =
+			putPaddrLow(dmabuf->phys);
+
+		mbx_fwlog->u.request.buff_fwlog[dmabuf->buffer_tag].addr_hi =
+			putPaddrHigh(dmabuf->phys);
+	}
+
+	/* Update LPWD address */
+	mbx_fwlog->u.request.lwpd.addr_lo = putPaddrLow(ras_fwlog->lwpd.phys);
+	mbx_fwlog->u.request.lwpd.addr_hi = putPaddrHigh(ras_fwlog->lwpd.phys);
+
+	mbox->vport = phba->pport;
+	mbox->mbox_cmpl = lpfc_sli4_ras_mbox_cmpl;
+
+	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT);
+
+	if (rc == MBX_NOT_FINISHED) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+				"6191 FW-Log Mailbox failed. "
+				"status %d mbxStatus : x%x", rc,
+				bf_get(lpfc_mqe_status, &mbox->u.mqe));
+		mempool_free(mbox, phba->mbox_mem_pool);
+		rc = -EIO;
+		goto mem_free;
+	} else
+		rc = 0;
+mem_free:
+	if (rc)
+		lpfc_sli4_ras_dma_free(phba);
+
+	return rc;
+}
+
+/**
+ * lpfc_sli4_ras_setup - Check if RAS supported on the adapter
+ * @phba: Pointer to HBA context object.
+ *
+ * Check if RAS is supported on the adapter and initialize it.
+ **/
+void
+lpfc_sli4_ras_setup(struct lpfc_hba *phba)
+{
+	/* Check RAS FW Log needs to be enabled or not */
+	if (lpfc_check_fwlog_support(phba))
+		return;
+
+	lpfc_sli4_ras_fwlog_init(phba, phba->cfg_ras_fwlog_level,
+				 LPFC_RAS_ENABLE_LOGGING);
 }
 
 /**
@@ -7392,7 +7680,18 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 	 */
 	spin_lock_irq(&phba->hbalock);
 	phba->link_state = LPFC_LINK_DOWN;
+
+	/* Check if physical ports are trunked */
+	if (bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba))
+		phba->trunk_link.link0.state = LPFC_LINK_DOWN;
+	if (bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba))
+		phba->trunk_link.link1.state = LPFC_LINK_DOWN;
+	if (bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba))
+		phba->trunk_link.link2.state = LPFC_LINK_DOWN;
+	if (bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba))
+		phba->trunk_link.link3.state = LPFC_LINK_DOWN;
 	spin_unlock_irq(&phba->hbalock);
+
 	if (!(phba->hba_flag & HBA_FCOE_MODE) &&
 	    (phba->hba_flag & LINK_DISABLED)) {
 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT | LOG_SLI,
@@ -14269,13 +14568,14 @@ lpfc_sli4_queue_alloc(struct lpfc_hba *phba, uint32_t page_size,
 		dmabuf = kzalloc(sizeof(struct lpfc_dmabuf), GFP_KERNEL);
 		if (!dmabuf)
 			goto out_fail;
-		dmabuf->virt = dma_zalloc_coherent(&phba->pcidev->dev,
-						   hw_page_size, &dmabuf->phys,
-						   GFP_KERNEL);
+		dmabuf->virt = dma_alloc_coherent(&phba->pcidev->dev,
+						  hw_page_size, &dmabuf->phys,
+						  GFP_KERNEL);
 		if (!dmabuf->virt) {
 			kfree(dmabuf);
 			goto out_fail;
 		}
+		memset(dmabuf->virt, 0, hw_page_size);
 		dmabuf->buffer_tag = x;
 		list_add_tail(&dmabuf->list, &queue->page_list);
 		/* initialize queue's entry array */
@@ -18919,11 +19219,11 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
 	struct lpfc_mbx_wr_object *wr_object;
 	LPFC_MBOXQ_t *mbox;
 	int rc = 0, i = 0;
-	uint32_t shdr_status, shdr_add_status;
+	uint32_t shdr_status, shdr_add_status, shdr_change_status;
 	uint32_t mbox_tmo;
-	union lpfc_sli4_cfg_shdr *shdr;
 	struct lpfc_dmabuf *dmabuf;
 	uint32_t written = 0;
+	bool check_change_status = false;
 
 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
 	if (!mbox)
@@ -18951,6 +19251,8 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
 				(size - written);
 			written += (size - written);
 			bf_set(lpfc_wr_object_eof, &wr_object->u.request, 1);
+			bf_set(lpfc_wr_object_eas, &wr_object->u.request, 1);
+			check_change_status = true;
 		} else {
 			wr_object->u.request.bde[i].tus.f.bdeSize =
 				SLI4_PAGE_SIZE;
@@ -18967,9 +19269,39 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
 		rc = lpfc_sli_issue_mbox_wait(phba, mbox, mbox_tmo);
 	}
 	/* The IOCTL status is embedded in the mailbox subheader. */
-	shdr = (union lpfc_sli4_cfg_shdr *) &wr_object->header.cfg_shdr;
-	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
-	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
+	shdr_status = bf_get(lpfc_mbox_hdr_status,
+			     &wr_object->header.cfg_shdr.response);
+	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status,
+				 &wr_object->header.cfg_shdr.response);
+	if (check_change_status) {
+		shdr_change_status = bf_get(lpfc_wr_object_change_status,
+					    &wr_object->u.response);
+		switch (shdr_change_status) {
+		case (LPFC_CHANGE_STATUS_PHYS_DEV_RESET):
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"3198 Firmware write complete: System "
+					"reboot required to instantiate\n");
+			break;
+		case (LPFC_CHANGE_STATUS_FW_RESET):
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"3199 Firmware write complete: Firmware"
+					" reset required to instantiate\n");
+			break;
+		case (LPFC_CHANGE_STATUS_PORT_MIGRATION):
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"3200 Firmware write complete: Port "
+					"Migration or PCI Reset required to "
+					"instantiate\n");
+			break;
+		case (LPFC_CHANGE_STATUS_PCI_RESET):
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
+					"3201 Firmware write complete: PCI "
+					"Reset required to instantiate\n");
+			break;
+		default:
+			break;
+		}
+	}
 	if (rc != MBX_TIMEOUT)
 		mempool_free(mbox, phba->mbox_mem_pool);
 	if (shdr_status || shdr_add_status || rc) {

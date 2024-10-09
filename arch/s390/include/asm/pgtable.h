@@ -568,12 +568,6 @@ static inline void crdte(unsigned long old, unsigned long new,
 				   _REGION_ENTRY_PROTECT | \
 				   _REGION_ENTRY_NOEXEC)
 
-static inline int mm_exclusive(struct mm_struct *mm)
-{
-	return likely(mm == current->active_mm &&
-		      atomic_read(&mm->context.attach_count) <= 1);
-}
-
 static inline int mm_has_pgste(struct mm_struct *mm)
 {
 #ifdef CONFIG_PGSTE
@@ -1171,6 +1165,17 @@ static inline void __ptep_ipte(unsigned long address, pte_t *ptep)
 	}
 }
 
+static inline void ptep_flush_lazy(struct mm_struct *mm,
+				   unsigned long address, pte_t *ptep)
+{
+	int active = (mm == current->active_mm) ? 1 : 0;
+
+	if (atomic_read(&mm->context.attach_count) > active)
+		__ptep_ipte(address, ptep);
+	else
+		mm->context.flush_mm = 1;
+}
+
 static inline void __ptep_ipte_range(unsigned long address, int nr, pte_t *ptep)
 {
 	unsigned long pto = (unsigned long) ptep;
@@ -1241,15 +1246,13 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 	pgste_t pgste;
 	pte_t pte;
 
-	mm->context.flush_mm = 1;
 	if (mm_has_pgste(mm)) {
 		pgste = pgste_get_lock(ptep);
 		pgste = pgste_ipte_notify(mm, address, ptep, pgste);
 	}
 
 	pte = *ptep;
-	if (!mm_exclusive(mm))
-		__ptep_ipte(address, ptep);
+	ptep_flush_lazy(mm, address, ptep);
 	pte_val(*ptep) = _PAGE_INVALID;
 
 	if (mm_has_pgste(mm)) {
@@ -1267,15 +1270,13 @@ static inline pte_t ptep_modify_prot_start(struct mm_struct *mm,
 	pgste_t pgste;
 	pte_t pte;
 
-	mm->context.flush_mm = 1;
 	if (mm_has_pgste(mm)) {
 		pgste = pgste_get_lock(ptep);
 		pgste_ipte_notify(mm, address, ptep, pgste);
 	}
 
 	pte = *ptep;
-	if (!mm_exclusive(mm))
-		__ptep_ipte(address, ptep);
+	ptep_flush_lazy(mm, address, ptep);
 
 	if (mm_has_pgste(mm)) {
 		pgste = pgste_update_all(&pte, pgste);
@@ -1347,7 +1348,7 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 
 	pte = *ptep;
 	if (!full)
-		__ptep_ipte(address, ptep);
+		ptep_flush_lazy(mm, address, ptep);
 	pte_val(*ptep) = _PAGE_INVALID;
 
 	if (mm_has_pgste(mm)) {
@@ -1365,14 +1366,12 @@ static inline pte_t ptep_set_wrprotect(struct mm_struct *mm,
 	pte_t pte = *ptep;
 
 	if (pte_write(pte)) {
-		mm->context.flush_mm = 1;
 		if (mm_has_pgste(mm)) {
 			pgste = pgste_get_lock(ptep);
 			pgste = pgste_ipte_notify(mm, address, ptep, pgste);
 		}
 
-		if (!mm_exclusive(mm))
-			__ptep_ipte(address, ptep);
+		ptep_flush_lazy(mm, address, ptep);
 		pte = pte_wrprotect(pte);
 
 		if (mm_has_pgste(mm)) {

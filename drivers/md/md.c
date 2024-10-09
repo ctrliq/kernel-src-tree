@@ -176,10 +176,6 @@ static int start_readonly;
  */
 static bool create_on_open = true;
 
-/* bio_clone_mddev
- * like bio_clone, but with a local bio set
- */
-
 struct bio *bio_alloc_mddev(gfp_t gfp_mask, int nr_iovecs,
 			    struct mddev *mddev)
 {
@@ -496,10 +492,10 @@ static void md_submit_flush_data(struct work_struct *ws)
 	mddev->flush_bio = NULL;
 	wake_up(&mddev->sb_wait);
 
-	if (bio->bi_size == 0)
+	if (bio->bi_size == 0) {
 		/* an empty barrier - all done */
 		bio_endio(bio, 0);
-	else {
+	} else {
 		bio->bi_rw &= ~REQ_FLUSH;
 		md_handle_request(mddev, bio);
 	}
@@ -525,11 +521,11 @@ void md_flush_request(struct mddev *mddev, struct bio *bio)
 		queue_work(md_wq, &mddev->flush_work);
 	} else {
 		/* flush was performed for some other bio while we waited. */
-		if (bio->bi_iter.bi_size == 0)
+		if (bio->bi_size == 0)
 			/* an empty barrier - all done */
-			bio_endio(bio);
+			bio_endio(bio, 0);
 		else {
-			bio->bi_opf &= ~REQ_PREFLUSH;
+			bio->bi_rw &= ~REQ_FLUSH;
 			mddev->pers->make_request(mddev, bio);
 		}
 	}
@@ -5617,7 +5613,6 @@ abort:
 		bioset_free(mddev->sync_set);
 		mddev->sync_set = NULL;
 	}
-
 	return err;
 }
 EXPORT_SYMBOL_GPL(md_run);
@@ -8292,9 +8287,11 @@ void md_do_sync(struct md_thread *thread)
 			/((jiffies-mddev->resync_mark)/HZ +1) +1;
 
 		if (currspeed > speed_min(mddev)) {
-			if (currspeed > speed_max(mddev) ||
-			    mddev->queue ? (!is_mddev_idle(mddev, 0) &&
-			    !blk_queue_nonrot(mddev->queue)) : false) {
+			bool check = false;
+			if (mddev->queue && !is_mddev_idle(mddev, 0) &&
+				!blk_queue_nonrot(mddev->queue))
+				check = true;
+			if (currspeed > speed_max(mddev) || check) {
 				msleep(500);
 				goto repeat;
 			}

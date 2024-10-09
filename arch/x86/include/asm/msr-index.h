@@ -1,6 +1,10 @@
 #ifndef _ASM_X86_MSR_INDEX_H
 #define _ASM_X86_MSR_INDEX_H
 
+#ifndef BIT
+#define BIT(nr)		(1UL << (nr))
+#endif
+
 /* CPU model specific register (MSR) numbers */
 
 /* x86-64 specific MSRs */
@@ -34,13 +38,14 @@
 /* Intel MSRs. Some also available on other CPUs */
 
 #define MSR_IA32_SPEC_CTRL		0x00000048 /* Speculation Control */
-#define SPEC_CTRL_IBRS			(1 << 0)   /* Indirect Branch Restricted Speculation */
-#define SPEC_CTRL_STIBP 		(1 << 1)   /* Single Thread Indirect Branch Predictors */
+#define SPEC_CTRL_IBRS			BIT(0)	   /* Indirect Branch Restricted Speculation */
+#define SPEC_CTRL_STIBP_SHIFT		1	   /* Single Thread Indirect Branch Predictor (STIBP) bit */
+#define SPEC_CTRL_STIBP			BIT(SPEC_CTRL_STIBP_SHIFT)	/* STIBP mask */
 #define SPEC_CTRL_SSBD_SHIFT		2	   /* Speculative Store Bypass Disable bit */
-#define SPEC_CTRL_SSBD			(1 << SPEC_CTRL_SSBD_SHIFT)   /* Speculative Store Bypass Disable */
+#define SPEC_CTRL_SSBD			BIT(SPEC_CTRL_SSBD_SHIFT)	/* Speculative Store Bypass Disable */
 
 #define MSR_IA32_PRED_CMD		0x00000049 /* Prediction Command */
-#define PRED_CMD_IBPB			(1 << 0)   /* Indirect Branch Prediction Barrier */
+#define PRED_CMD_IBPB			BIT(0)	   /* Indirect Branch Prediction Barrier */
 
 #define MSR_PPIN_CTL			0x0000004e
 #define MSR_PPIN			0x0000004f
@@ -62,20 +67,25 @@
 #define MSR_MTRRcap			0x000000fe
 
 #define MSR_IA32_ARCH_CAPABILITIES	0x0000010a
-#define ARCH_CAP_RDCL_NO		(1 << 0)   /* Not susceptible to Meltdown */
-#define ARCH_CAP_IBRS_ALL		(1 << 1)   /* Enhanced IBRS support */
-#define ARCH_CAP_SKIP_VMENTRY_L1DFLUSH	(1 << 3)   /* Skip L1D flush on vmentry */
-#define ARCH_CAP_SSB_NO 		(1 << 4)   /*
-						    * Not susceptible to Speculative Store Bypass
-						    * attack, so no Reduced Data Speculation control
-						    * required.
-						    */
+#define ARCH_CAP_RDCL_NO		BIT(0)	/* Not susceptible to Meltdown */
+#define ARCH_CAP_IBRS_ALL		BIT(1)	/* Enhanced IBRS support */
+#define ARCH_CAP_SKIP_VMENTRY_L1DFLUSH	BIT(3)	/* Skip L1D flush on vmentry */
+#define ARCH_CAP_SSB_NO			BIT(4)	/*
+						 * Not susceptible to Speculative Store Bypass
+						 * attack, so no Speculative Store Bypass
+						 * control required.
+						 */
+#define ARCH_CAP_MDS_NO			BIT(5)   /*
+						  * Not susceptible to
+						  * Microarchitectural Data
+						  * Sampling (MDS) vulnerabilities.
+						  */
 
 #define MSR_IA32_FLUSH_CMD		0x0000010b
-#define L1D_FLUSH			(1 << 0)   /*
-						    * Writeback and invalidate the
-						    * L1 data cache.
-						    */
+#define L1D_FLUSH			BIT(0)	/*
+						 * Writeback and invalidate the
+						 * L1 data cache.
+						 */
 
 #define MSR_IA32_BBL_CR_CTL		0x00000119
 #define MSR_IA32_BBL_CR_CTL3		0x0000011e
@@ -160,6 +170,7 @@
 #define DEBUGCTLMSR_BTS_OFF_OS		(1UL <<  9)
 #define DEBUGCTLMSR_BTS_OFF_USR		(1UL << 10)
 #define DEBUGCTLMSR_FREEZE_LBRS_ON_PMI	(1UL << 11)
+#define DEBUGCTLMSR_FREEZE_PERFMON_ON_PMI	(1UL << 12)
 #define DEBUGCTLMSR_FREEZE_IN_SMM_BIT	14
 #define DEBUGCTLMSR_FREEZE_IN_SMM	(1UL << DEBUGCTLMSR_FREEZE_IN_SMM_BIT)
 
@@ -363,6 +374,7 @@
 #define MSR_F15H_PTSC			0xc0010280
 #define MSR_F15H_IC_CFG			0xc0011021
 #define MSR_F15H_IC_CFG_DIS_IND		BIT_ULL(14)
+#define MSR_F15H_EX_CFG			0xc001102c
 
 /* Fam 10h MSRs */
 #define MSR_FAM10H_MMIO_CONF_BASE	0xc0010058
@@ -568,6 +580,12 @@
 #define MSR_MISC_FEATURE_ENABLES_RING3MWAIT_BIT		1
 
 #define MSR_IA32_TSC_DEADLINE		0x000006E0
+
+
+#define MSR_TSX_FORCE_ABORT		0x0000010F
+
+#define MSR_TFA_RTM_FORCE_ABORT_BIT	0
+#define MSR_TFA_RTM_FORCE_ABORT		BIT_ULL(MSR_TFA_RTM_FORCE_ABORT_BIT)
 
 /* P4/Xeon+ specific */
 #define MSR_IA32_MCG_EAX		0x00000180

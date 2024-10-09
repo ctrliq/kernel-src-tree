@@ -346,8 +346,7 @@ struct devlink_param {
 	int (*set)(struct devlink *devlink, u32 id,
 		   struct devlink_param_gset_ctx *ctx);
 	int (*validate)(struct devlink *devlink, u32 id,
-			union devlink_param_value val,
-			struct netlink_ext_ack *extack);
+			union devlink_param_value val);
 };
 
 struct devlink_param_item {

@@ -15,12 +15,6 @@
 #include <asm-generic/dma-coherent.h>
 
 /*
- * DMA_ATTR_NO_WARN: This tells the DMA-mapping subsystem to suppress
- * allocation failure reports (similarly to __GFP_NOWARN).
- */
-#define DMA_ATTR_NO_WARN	(1UL << 8)
-
-/*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.
  * It can be given to a device to use as a DMA source or target.  A CPU cannot
  * reference a dma_addr_t directly because there may be translation between

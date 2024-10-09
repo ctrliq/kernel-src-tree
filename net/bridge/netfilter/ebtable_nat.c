@@ -61,8 +61,7 @@ ebt_nat_in(const struct nf_hook_ops *ops, struct sk_buff *skb,
 	   const struct net_device *in, const struct net_device *out,
 	   const struct nf_hook_state *state)
 {
-	return ebt_do_table(ops->hooknum, skb, state->in, state->out,
-			    dev_net(state->in)->xt.frame_nat);
+	return ebt_do_table(skb, state, state->net->xt.frame_nat);
 }
 
 static unsigned int
@@ -70,8 +69,7 @@ ebt_nat_out(const struct nf_hook_ops *ops, struct sk_buff *skb,
 	    const struct net_device *in, const struct net_device *out,
 	    const struct nf_hook_state *state)
 {
-	return ebt_do_table(ops->hooknum, skb, state->in, state->out,
-			    dev_net(state->out)->xt.frame_nat);
+	return ebt_do_table(skb, state, state->net->xt.frame_nat);
 }
 
 static struct nf_hook_ops ebt_ops_nat[] __read_mostly = {

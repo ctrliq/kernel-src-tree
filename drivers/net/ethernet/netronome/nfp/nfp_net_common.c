@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2015-2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2015-2018 Netronome Systems, Inc. */
 
 /*
  * nfp_net_common.c
@@ -55,6 +25,7 @@
 #include <linux/interrupt.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/overflow.h>
 #include <linux/page_ref.h>
 #include <linux/pci.h>
 #include <linux/pci_regs.h>
@@ -1159,7 +1130,7 @@ nfp_net_tx_ring_reset(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
 		tx_ring->rd_p++;
 	}
 
-	memset(tx_ring->txds, 0, sizeof(*tx_ring->txds) * tx_ring->cnt);
+	memset(tx_ring->txds, 0, tx_ring->size);
 	tx_ring->wr_p = 0;
 	tx_ring->rd_p = 0;
 	tx_ring->qcp_rd_p = 0;
@@ -1341,7 +1312,7 @@ static void nfp_net_rx_ring_reset(struct nfp_net_rx_ring *rx_ring)
 	rx_ring->rxbufs[last_idx].dma_addr = 0;
 	rx_ring->rxbufs[last_idx].frag = NULL;
 
-	memset(rx_ring->rxds, 0, sizeof(*rx_ring->rxds) * rx_ring->cnt);
+	memset(rx_ring->rxds, 0, rx_ring->size);
 	rx_ring->wr_p = 0;
 	rx_ring->rd_p = 0;
 }
@@ -1665,11 +1636,13 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 	unsigned int true_bufsz;
 	struct sk_buff *skb;
 	int pkts_polled = 0;
+	struct xdp_buff xdp;
 	int idx;
 
 	rcu_read_lock();
 	xdp_prog = READ_ONCE(dp->xdp_prog);
 	true_bufsz = xdp_prog ? PAGE_SIZE : dp->fl_bufsz;
+	xdp.rxq = &rx_ring->xdp_rxq;
 	tx_ring = r_vec->xdp_ring;
 
 	while (pkts_polled < budget) {
@@ -1764,7 +1737,6 @@ static int nfp_net_rx(struct nfp_net_rx_ring *rx_ring, int budget)
 				  dp->bpf_offload_xdp) && !meta.portid) {
 			void *orig_data = rxbuf->frag + pkt_off;
 			unsigned int dma_off;
-			struct xdp_buff xdp;
 			int act;
 
 			xdp.data_hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
@@ -2229,7 +2201,7 @@ nfp_net_tx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
 
 	tx_ring->cnt = dp->txd_cnt;
 
-	tx_ring->size = sizeof(*tx_ring->txds) * tx_ring->cnt;
+	tx_ring->size = array_size(tx_ring->cnt, sizeof(*tx_ring->txds));
 	tx_ring->txds = dma_zalloc_coherent(dp->dev, tx_ring->size,
 					    &tx_ring->dma,
 					    GFP_KERNEL | __GFP_NOWARN);
@@ -2352,6 +2324,8 @@ static void nfp_net_rx_ring_free(struct nfp_net_rx_ring *rx_ring)
 	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
 	struct nfp_net_dp *dp = &r_vec->nfp_net->dp;
 
+	if (dp->netdev)
+		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
 	kfree(rx_ring->rxbufs);
 
 	if (rx_ring->rxds)
@@ -2375,10 +2349,17 @@ static void nfp_net_rx_ring_free(struct nfp_net_rx_ring *rx_ring)
 static int
 nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring)
 {
-	int sz;
+	int sz, err;
+
+	if (dp->netdev) {
+		err = xdp_rxq_info_reg(&rx_ring->xdp_rxq, dp->netdev,
+				       rx_ring->idx);
+		if (err < 0)
+			return err;
+	}
 
 	rx_ring->cnt = dp->rxd_cnt;
-	rx_ring->size = sizeof(*rx_ring->rxds) * rx_ring->cnt;
+	rx_ring->size = array_size(rx_ring->cnt, sizeof(*rx_ring->rxds));
 	rx_ring->rxds = dma_zalloc_coherent(dp->dev, rx_ring->size,
 					    &rx_ring->dma,
 					    GFP_KERNEL | __GFP_NOWARN);
@@ -3367,6 +3348,25 @@ nfp_net_features_check(struct sk_buff *skb, struct net_device *dev,
 	return features;
 }
 
+static int
+nfp_net_get_phys_port_name(struct net_device *netdev, char *name, size_t len)
+{
+	struct nfp_net *nn = netdev_priv(netdev);
+	int n;
+
+	if (nn->port)
+		return nfp_port_get_phys_port_name(netdev, name, len);
+
+	if (nn->dp.is_vf || nn->vnic_no_name)
+		return -EOPNOTSUPP;
+
+	n = snprintf(name, len, "n%d", nn->id);
+	if (n >= len)
+		return -EINVAL;
+
+	return 0;
+}
+
 /**
  * nfp_net_set_vxlan_port() - set vxlan port in SW and reconfigure HW
  * @nn:   NFP Net device to reconfigure
@@ -3517,9 +3517,6 @@ static int nfp_net_xdp(struct net_device *netdev, struct netdev_xdp *xdp)
 		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
 					 xdp->extack);
 	case XDP_QUERY_PROG:
-		xdp->prog_attached = !!nn->xdp_prog;
-		if (nn->dp.bpf_offload_xdp)
-			xdp->prog_attached = XDP_ATTACHED_HW;
 		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
 		xdp->prog_flags = nn->xdp_prog ? nn->xdp_flags : 0;
 		return 0;
@@ -3554,6 +3551,8 @@ static int nfp_net_set_mac_address(struct net_device *netdev, void *addr)
 
 const struct net_device_ops nfp_net_netdev_ops = {
 	.ndo_size		= sizeof(struct net_device_ops),
+	.ndo_init		= nfp_app_ndo_init,
+	.ndo_uninit		= nfp_app_ndo_uninit,
 	.ndo_open		= nfp_net_netdev_open,
 	.ndo_stop		= nfp_net_netdev_close,
 	.ndo_start_xmit		= nfp_net_tx,
@@ -3572,7 +3571,7 @@ const struct net_device_ops nfp_net_netdev_ops = {
 	.ndo_set_mac_address	= nfp_net_set_mac_address,
 	.ndo_set_features	= nfp_net_set_features,
 	.ndo_features_check	= nfp_net_features_check,
-	.extended.ndo_get_phys_port_name	= nfp_port_get_phys_port_name,
+	.extended.ndo_get_phys_port_name	= nfp_net_get_phys_port_name,
 	.extended.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
 	.extended.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
 	.extended.ndo_xdp		= nfp_net_xdp,

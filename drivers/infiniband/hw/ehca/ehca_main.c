@@ -457,7 +457,6 @@ static int ehca_init_device(struct ehca_shca *shca)
 	if (ret)
 		return ret;
 
-	strlcpy(shca->ib_device.name, "ehca%d", IB_DEVICE_NAME_MAX);
 	shca->ib_device.owner               = THIS_MODULE;
 
 	shca->ib_device.uverbs_abi_ver	    = 8;
@@ -819,7 +818,7 @@ static int ehca_probe(struct platform_device *dev,
 		goto probe5;
 	}
 
-	ret = ib_register_device(&shca->ib_device, NULL);
+	ret = ib_register_device(&shca->ib_device, "ehca%d", NULL);
 	if (ret) {
 		ehca_err(&shca->ib_device,
 			 "ib_register_device() failed ret=%i", ret);

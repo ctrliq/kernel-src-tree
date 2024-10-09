@@ -136,7 +136,7 @@ isert_create_qp(struct isert_conn *isert_conn,
 	attr.cap.max_send_wr = ISERT_QP_MAX_REQ_DTOS + 1;
 	attr.cap.max_recv_wr = ISERT_QP_MAX_RECV_DTOS + 1;
 	attr.cap.max_rdma_ctxs = ISCSI_DEF_XMIT_CMDS_MAX;
-	attr.cap.max_send_sge = device->ib_device->attrs.max_sge;
+	attr.cap.max_send_sge = device->ib_device->attrs.max_send_sge;
 	attr.cap.max_recv_sge = 1;
 	attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	attr.qp_type = IB_QPT_RC;
@@ -181,8 +181,9 @@ isert_alloc_rx_descriptors(struct isert_conn *isert_conn)
 	u64 dma_addr;
 	int i, j;
 
-	isert_conn->rx_descs = kzalloc(ISERT_QP_MAX_RECV_DTOS *
-				sizeof(struct iser_rx_desc), GFP_KERNEL);
+	isert_conn->rx_descs = kcalloc(ISERT_QP_MAX_RECV_DTOS,
+				       sizeof(struct iser_rx_desc),
+				       GFP_KERNEL);
 	if (!isert_conn->rx_descs)
 		return -ENOMEM;
 
@@ -298,7 +299,8 @@ isert_create_device_ib_res(struct isert_device *device)
 	struct ib_device *ib_dev = device->ib_device;
 	int ret;
 
-	isert_dbg("devattr->max_sge: %d\n", ib_dev->attrs.max_sge);
+	isert_dbg("devattr->max_send_sge: %d devattr->max_recv_sge %d\n",
+		  ib_dev->attrs.max_send_sge, ib_dev->attrs.max_recv_sge);
 	isert_dbg("devattr->max_sge_rd: %d\n", ib_dev->attrs.max_sge_rd);
 
 	ret = isert_alloc_comps(device);

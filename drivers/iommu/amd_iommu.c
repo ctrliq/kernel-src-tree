@@ -1691,10 +1691,11 @@ static unsigned long dma_ops_alloc_iova(struct device *dev,
 
 	if (dma_mask > DMA_BIT_MASK(32))
 		pfn = alloc_iova_fast(&dma_dom->iovad, pages,
-				      IOVA_PFN(DMA_BIT_MASK(32)));
+				      IOVA_PFN(DMA_BIT_MASK(32)), false);
 
 	if (!pfn)
-		pfn = alloc_iova_fast(&dma_dom->iovad, pages, IOVA_PFN(dma_mask));
+		pfn = alloc_iova_fast(&dma_dom->iovad, pages,
+				      IOVA_PFN(dma_mask), true);
 
 	return (pfn << PAGE_SHIFT);
 }
@@ -2036,7 +2037,7 @@ static struct dma_ops_domain *dma_ops_domain_alloc(void)
 		goto free_dma_dom;
 
 	init_iova_domain(&dma_dom->iovad, PAGE_SIZE,
-			 IOVA_START_PFN, DMA_32BIT_PFN);
+			 IOVA_START_PFN);
 
 	/* Initialize reserved ranges */
 	copy_reserved_iova(&reserved_iova_ranges, &dma_dom->iovad);
@@ -2948,7 +2949,7 @@ static int init_reserved_iova_ranges(void)
 	struct iova *val;
 
 	init_iova_domain(&reserved_iova_ranges, PAGE_SIZE,
-			 IOVA_START_PFN, DMA_32BIT_PFN);
+			 IOVA_START_PFN);
 
 	lockdep_set_class(&reserved_iova_ranges.iova_rbtree_lock,
 			  &reserved_rbtree_key);
@@ -3363,11 +3364,14 @@ static void amd_iommu_get_dm_regions(struct device *dev,
 		}
 
 		region->start = entry->address_start;
+		region->type = IOMMU_RESV_DIRECT;
 		region->length = entry->address_end - entry->address_start;
 		if (entry->prot & IOMMU_PROT_IR)
 			region->prot |= IOMMU_READ;
 		if (entry->prot & IOMMU_PROT_IW)
 			region->prot |= IOMMU_WRITE;
+		if (entry->prot & IOMMU_UNITY_MAP_FLAG_EXCL_RANGE)
+			region->type = IOMMU_RESV_RESERVED;
 
 		list_add_tail(&region->list, head);
 	}

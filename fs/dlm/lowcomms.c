@@ -523,12 +523,10 @@ static void save_listen_callbacks(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 
-	write_lock_bh(&sk->sk_callback_lock);
 	listen_sock.sk_data_ready = sk->sk_data_ready;
 	listen_sock.sk_state_change = sk->sk_state_change;
 	listen_sock.sk_write_space = sk->sk_write_space;
 	listen_sock.sk_error_report = sk->sk_error_report;
-	write_unlock_bh(&sk->sk_callback_lock);
 }
 
 static void restore_callbacks(struct socket *sock)

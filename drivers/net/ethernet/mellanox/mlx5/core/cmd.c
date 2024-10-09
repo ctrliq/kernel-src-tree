@@ -279,6 +279,7 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_DESTROY_PSV:
 	case MLX5_CMD_OP_DESTROY_SRQ:
 	case MLX5_CMD_OP_DESTROY_XRC_SRQ:
+	case MLX5_CMD_OP_DESTROY_XRQ:
 	case MLX5_CMD_OP_DESTROY_DCT:
 	case MLX5_CMD_OP_DEALLOC_Q_COUNTER:
 	case MLX5_CMD_OP_DESTROY_SCHEDULING_ELEMENT:
@@ -308,9 +309,12 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_MODIFY_FLOW_TABLE:
 	case MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY:
 	case MLX5_CMD_OP_SET_FLOW_TABLE_ROOT:
-	case MLX5_CMD_OP_DEALLOC_ENCAP_HEADER:
+	case MLX5_CMD_OP_DEALLOC_PACKET_REFORMAT_CONTEXT:
 	case MLX5_CMD_OP_DEALLOC_MODIFY_HEADER_CONTEXT:
 	case MLX5_CMD_OP_FPGA_DESTROY_QP:
+	case MLX5_CMD_OP_DESTROY_GENERAL_OBJECT:
+	case MLX5_CMD_OP_DEALLOC_MEMIC:
+	case MLX5_CMD_OP_PAGE_FAULT_RESUME:
 		return MLX5_CMD_STAT_OK;
 
 	case MLX5_CMD_OP_QUERY_HCA_CAP:
@@ -324,7 +328,6 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_CREATE_MKEY:
 	case MLX5_CMD_OP_QUERY_MKEY:
 	case MLX5_CMD_OP_QUERY_SPECIAL_CONTEXTS:
-	case MLX5_CMD_OP_PAGE_FAULT_RESUME:
 	case MLX5_CMD_OP_CREATE_EQ:
 	case MLX5_CMD_OP_QUERY_EQ:
 	case MLX5_CMD_OP_GEN_EQE:
@@ -347,6 +350,9 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_CREATE_XRC_SRQ:
 	case MLX5_CMD_OP_QUERY_XRC_SRQ:
 	case MLX5_CMD_OP_ARM_XRC_SRQ:
+	case MLX5_CMD_OP_CREATE_XRQ:
+	case MLX5_CMD_OP_QUERY_XRQ:
+	case MLX5_CMD_OP_ARM_XRQ:
 	case MLX5_CMD_OP_CREATE_DCT:
 	case MLX5_CMD_OP_DRAIN_DCT:
 	case MLX5_CMD_OP_QUERY_DCT:
@@ -422,12 +428,16 @@ static int mlx5_internal_err_ret_value(struct mlx5_core_dev *dev, u16 op,
 	case MLX5_CMD_OP_QUERY_FLOW_TABLE_ENTRY:
 	case MLX5_CMD_OP_ALLOC_FLOW_COUNTER:
 	case MLX5_CMD_OP_QUERY_FLOW_COUNTER:
-	case MLX5_CMD_OP_ALLOC_ENCAP_HEADER:
+	case MLX5_CMD_OP_ALLOC_PACKET_REFORMAT_CONTEXT:
 	case MLX5_CMD_OP_ALLOC_MODIFY_HEADER_CONTEXT:
 	case MLX5_CMD_OP_FPGA_CREATE_QP:
 	case MLX5_CMD_OP_FPGA_MODIFY_QP:
 	case MLX5_CMD_OP_FPGA_QUERY_QP:
 	case MLX5_CMD_OP_FPGA_QUERY_QP_COUNTERS:
+	case MLX5_CMD_OP_CREATE_GENERAL_OBJECT:
+	case MLX5_CMD_OP_MODIFY_GENERAL_OBJECT:
+	case MLX5_CMD_OP_QUERY_GENERAL_OBJECT:
+	case MLX5_CMD_OP_ALLOC_MEMIC:
 		*status = MLX5_DRIVER_STATUS_ABORTED;
 		*synd = MLX5_DRIVER_SYND;
 		return -EIO;
@@ -592,8 +602,8 @@ const char *mlx5_command_str(int command)
 	MLX5_COMMAND_STR_CASE(DEALLOC_FLOW_COUNTER);
 	MLX5_COMMAND_STR_CASE(QUERY_FLOW_COUNTER);
 	MLX5_COMMAND_STR_CASE(MODIFY_FLOW_TABLE);
-	MLX5_COMMAND_STR_CASE(ALLOC_ENCAP_HEADER);
-	MLX5_COMMAND_STR_CASE(DEALLOC_ENCAP_HEADER);
+	MLX5_COMMAND_STR_CASE(ALLOC_PACKET_REFORMAT_CONTEXT);
+	MLX5_COMMAND_STR_CASE(DEALLOC_PACKET_REFORMAT_CONTEXT);
 	MLX5_COMMAND_STR_CASE(ALLOC_MODIFY_HEADER_CONTEXT);
 	MLX5_COMMAND_STR_CASE(DEALLOC_MODIFY_HEADER_CONTEXT);
 	MLX5_COMMAND_STR_CASE(FPGA_CREATE_QP);
@@ -601,6 +611,17 @@ const char *mlx5_command_str(int command)
 	MLX5_COMMAND_STR_CASE(FPGA_QUERY_QP);
 	MLX5_COMMAND_STR_CASE(FPGA_QUERY_QP_COUNTERS);
 	MLX5_COMMAND_STR_CASE(FPGA_DESTROY_QP);
+	MLX5_COMMAND_STR_CASE(CREATE_XRQ);
+	MLX5_COMMAND_STR_CASE(DESTROY_XRQ);
+	MLX5_COMMAND_STR_CASE(QUERY_XRQ);
+	MLX5_COMMAND_STR_CASE(ARM_XRQ);
+	MLX5_COMMAND_STR_CASE(CREATE_GENERAL_OBJECT);
+	MLX5_COMMAND_STR_CASE(DESTROY_GENERAL_OBJECT);
+	MLX5_COMMAND_STR_CASE(MODIFY_GENERAL_OBJECT);
+	MLX5_COMMAND_STR_CASE(QUERY_GENERAL_OBJECT);
+	MLX5_COMMAND_STR_CASE(QUERY_MODIFY_HEADER_CONTEXT);
+	MLX5_COMMAND_STR_CASE(ALLOC_MEMIC);
+	MLX5_COMMAND_STR_CASE(DEALLOC_MEMIC);
 	default: return "unknown command opcode";
 	}
 }
@@ -816,6 +837,7 @@ static void cmd_work_handler(struct work_struct *work)
 	struct semaphore *sem;
 	unsigned long flags;
 	int alloc_ret;
+	int cmd_mode;
 
 	sem = ent->page_queue ? &cmd->pages_sem : &cmd->sem;
 	down(sem);
@@ -862,6 +884,7 @@ static void cmd_work_handler(struct work_struct *work)
 	set_signature(ent, !cmd->checksum_disabled);
 	dump_command(dev, ent, 1);
 	ent->ts1 = ktime_get_ns();
+	cmd_mode = cmd->mode;
 
 	if (ent->callback)
 		schedule_delayed_work(&ent->cb_timeout_work, cb_timeout);
@@ -886,7 +909,7 @@ static void cmd_work_handler(struct work_struct *work)
 	iowrite32be(1 << ent->idx, &dev->iseg->cmd_dbell);
 	mmiowb();
 	/* if not in polling don't use ent after this point */
-	if (cmd->mode == CMD_MODE_POLLING) {
+	if (cmd_mode == CMD_MODE_POLLING) {
 		poll_timeout(ent);
 		/* make sure we read the descriptor after ownership is SW */
 		rmb();
@@ -1028,7 +1051,10 @@ static ssize_t dbg_write(struct file *filp, const char __user *buf,
 	if (!dbg->in_msg || !dbg->out_msg)
 		return -ENOMEM;
 
-	if (copy_from_user(lbuf, buf, sizeof(lbuf)))
+	if (count < sizeof(lbuf) - 1)
+		return -EINVAL;
+
+	if (copy_from_user(lbuf, buf, sizeof(lbuf) - 1))
 		return -EFAULT;
 
 	lbuf[sizeof(lbuf) - 1] = 0;
@@ -1232,21 +1258,12 @@ static ssize_t data_read(struct file *filp, char __user *buf, size_t count,
 {
 	struct mlx5_core_dev *dev = filp->private_data;
 	struct mlx5_cmd_debug *dbg = &dev->cmd.dbg;
-	int copy;
-
-	if (*pos)
-		return 0;
 
 	if (!dbg->out_msg)
 		return -ENOMEM;
 
-	copy = min_t(int, count, dbg->outlen);
-	if (copy_to_user(buf, dbg->out_msg, copy))
-		return -EFAULT;
-
-	*pos += copy;
-
-	return copy;
+	return simple_read_from_buffer(buf, count, pos, dbg->out_msg,
+				       dbg->outlen);
 }
 
 static const struct file_operations dfops = {
@@ -1264,19 +1281,11 @@ static ssize_t outlen_read(struct file *filp, char __user *buf, size_t count,
 	char outlen[8];
 	int err;
 
-	if (*pos)
-		return 0;
-
 	err = snprintf(outlen, sizeof(outlen), "%d", dbg->outlen);
 	if (err < 0)
 		return err;
 
-	if (copy_to_user(buf, &outlen, err))
-		return -EFAULT;
-
-	*pos += err;
-
-	return err;
+	return simple_read_from_buffer(buf, count, pos, outlen, err);
 }
 
 static ssize_t outlen_write(struct file *filp, const char __user *buf,

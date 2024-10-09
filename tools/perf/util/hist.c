@@ -1035,7 +1035,7 @@ int hist_entry_iter__add(struct hist_entry_iter *iter, struct addr_location *al,
 	int err, err2;
 	struct map *alm = NULL;
 
-	if (al && al->map)
+	if (al)
 		alm = map__get(al->map);
 
 	err = sample__resolve_callchain(iter->sample, &callchain_cursor, &iter->parent,
@@ -1754,7 +1754,7 @@ void perf_evsel__output_resort(struct perf_evsel *evsel, struct ui_progress *pro
 	bool use_callchain;
 
 	if (evsel && symbol_conf.use_callchain && !symbol_conf.show_ref_callgraph)
-		use_callchain = evsel->attr.sample_type & PERF_SAMPLE_CALLCHAIN;
+		use_callchain = evsel__has_callchain(evsel);
 	else
 		use_callchain = symbol_conf.use_callchain;
 

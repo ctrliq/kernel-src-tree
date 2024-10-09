@@ -69,7 +69,7 @@ static u16 get_app_wr_id(u64 wr_id)
 
 static inline int ehca_write_rwqe(struct ipz_queue *ipz_rqueue,
 				  struct ehca_wqe *wqe_p,
-				  struct ib_recv_wr *recv_wr,
+				  const struct ib_recv_wr *recv_wr,
 				  u32 rq_map_idx)
 {
 	u8 cnt_ds;
@@ -153,7 +153,7 @@ static void trace_ud_wr(const struct ib_ud_wr *ud_wr)
 
 static inline int ehca_write_swqe(struct ehca_qp *qp,
 				  struct ehca_wqe *wqe_p,
-				  struct ib_send_wr *send_wr,
+				  const struct ib_send_wr *send_wr,
 				  u32 sq_map_idx,
 				  int hidden)
 {
@@ -399,7 +399,7 @@ static inline void map_ib_wc_status(u32 cqe_status,
 }
 
 static inline int post_one_send(struct ehca_qp *my_qp,
-			 struct ib_send_wr *cur_send_wr,
+			 const struct ib_send_wr *cur_send_wr,
 			 int hidden)
 {
 	struct ehca_wqe *wqe_p;
@@ -439,8 +439,8 @@ static inline int post_one_send(struct ehca_qp *my_qp,
 }
 
 int ehca_post_send(struct ib_qp *qp,
-		   struct ib_send_wr *send_wr,
-		   struct ib_send_wr **bad_send_wr)
+		   const struct ib_send_wr *send_wr,
+		   const struct ib_send_wr **bad_send_wr)
 {
 	struct ehca_qp *my_qp = container_of(qp, struct ehca_qp, ib_qp);
 	int wqe_cnt = 0;
@@ -504,8 +504,8 @@ out:
 
 static int internal_post_recv(struct ehca_qp *my_qp,
 			      struct ib_device *dev,
-			      struct ib_recv_wr *recv_wr,
-			      struct ib_recv_wr **bad_recv_wr)
+			      const struct ib_recv_wr *recv_wr,
+			      const struct ib_recv_wr **bad_recv_wr)
 {
 	struct ehca_wqe *wqe_p;
 	int wqe_cnt = 0;
@@ -582,8 +582,8 @@ out:
 }
 
 int ehca_post_recv(struct ib_qp *qp,
-		   struct ib_recv_wr *recv_wr,
-		   struct ib_recv_wr **bad_recv_wr)
+		   const struct ib_recv_wr *recv_wr,
+		   const struct ib_recv_wr **bad_recv_wr)
 {
 	struct ehca_qp *my_qp = container_of(qp, struct ehca_qp, ib_qp);
 
@@ -599,8 +599,8 @@ int ehca_post_recv(struct ib_qp *qp,
 }
 
 int ehca_post_srq_recv(struct ib_srq *srq,
-		       struct ib_recv_wr *recv_wr,
-		       struct ib_recv_wr **bad_recv_wr)
+		       const struct ib_recv_wr *recv_wr,
+		       const struct ib_recv_wr **bad_recv_wr)
 {
 	return internal_post_recv(container_of(srq, struct ehca_qp, ib_srq),
 				  srq->device, recv_wr, bad_recv_wr);

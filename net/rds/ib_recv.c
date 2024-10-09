@@ -377,7 +377,6 @@ void rds_ib_recv_refill(struct rds_connection *conn, int prefill, gfp_t gfp)
 {
 	struct rds_ib_connection *ic = conn->c_transport_data;
 	struct rds_ib_recv_work *recv;
-	struct ib_recv_wr *failed_wr;
 	unsigned int posted = 0;
 	int ret = 0;
 	bool can_wait = !!(gfp & __GFP_WAIT);
@@ -405,7 +404,7 @@ void rds_ib_recv_refill(struct rds_connection *conn, int prefill, gfp_t gfp)
 		}
 
 		/* XXX when can this fail? */
-		ret = ib_post_recv(ic->i_cm_id->qp, &recv->r_wr, &failed_wr);
+		ret = ib_post_recv(ic->i_cm_id->qp, &recv->r_wr, NULL);
 		rdsdebug("recv %p ibinc %p page %p addr %lu ret %d\n", recv,
 			 recv->r_ibinc, sg_page(&recv->r_frag->f_sg),
 			 (long) ib_sg_dma_address(
@@ -660,7 +659,6 @@ static u64 rds_ib_get_ack(struct rds_ib_connection *ic)
 static void rds_ib_send_ack(struct rds_ib_connection *ic, unsigned int adv_credits)
 {
 	struct rds_header *hdr = ic->i_ack;
-	struct ib_send_wr *failed_wr;
 	u64 seq;
 	int ret;
 
@@ -673,7 +671,7 @@ static void rds_ib_send_ack(struct rds_ib_connection *ic, unsigned int adv_credi
 	rds_message_make_checksum(hdr);
 	ic->i_ack_queued = jiffies;
 
-	ret = ib_post_send(ic->i_cm_id->qp, &ic->i_ack_wr, &failed_wr);
+	ret = ib_post_send(ic->i_cm_id->qp, &ic->i_ack_wr, NULL);
 	if (unlikely(ret)) {
 		/* Failed to send. Release the WR, and
 		 * force another ACK.

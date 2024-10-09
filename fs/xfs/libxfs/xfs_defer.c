@@ -28,6 +28,9 @@
 #include "xfs_mount.h"
 #include "xfs_defer.h"
 #include "xfs_trans.h"
+#include "xfs_buf_item.h"
+#include "xfs_inode.h"
+#include "xfs_inode_item.h"
 #include "xfs_trace.h"
 
 /*
@@ -242,28 +245,75 @@ xfs_defer_trans_roll(
 	struct xfs_trans		**tp,
 	struct xfs_defer_ops		*dop)
 {
+	struct xfs_buf_log_item		*bli;
+	struct xfs_inode_log_item	*ili;
+	struct xfs_log_item		*lip;
+	struct xfs_log_item_desc	*lidp;
+	struct xfs_buf			*bplist[XFS_DEFER_OPS_NR_BUFS];
+	struct xfs_inode		*iplist[XFS_DEFER_OPS_NR_INODES];
+	int				bpcount = 0, ipcount = 0;
 	int				i;
 	int				error;
 
-	/* Log all the joined inodes. */
-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
-		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+	list_for_each_entry(lidp, &(*tp)->t_items, lid_trans) {
+		lip = lidp->lid_item;
+		switch (lip->li_type) {
+		case XFS_LI_BUF:
+			bli = container_of(lip, struct xfs_buf_log_item,
+					   bli_item);
+			if (bli->bli_flags & XFS_BLI_HOLD) {
+				if (bpcount >= XFS_DEFER_OPS_NR_BUFS) {
+					ASSERT(0);
+					return -EFSCORRUPTED;
+				}
+				xfs_trans_dirty_buf(*tp, bli->bli_buf);
+				bplist[bpcount++] = bli->bli_buf;
+			}
+			break;
+		case XFS_LI_INODE:
+			ili = container_of(lip, struct xfs_inode_log_item,
+					   ili_item);
+			if (ili->ili_lock_flags == 0) {
+				if (ipcount >= XFS_DEFER_OPS_NR_INODES) {
+					ASSERT(0);
+					return -EFSCORRUPTED;
+				}
+				xfs_trans_log_inode(*tp, ili->ili_inode,
+						    XFS_ILOG_CORE);
+				iplist[ipcount++] = ili->ili_inode;
+			}
+			break;
+		default:
+			break;
+		}
+	}
 
 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
 
-	/* Roll the transaction. */
+	/*
+	 * Roll the transaction.  Rolling always given a new transaction (even
+	 * if committing the old one fails!) to hand back to the caller, so we
+	 * join the held resources to the new transaction so that we always
+	 * return with the held resources joined to @tpp, no matter what
+	 * happened.
+	 */
 	error = xfs_trans_roll(tp);
-	if (error) {
-		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
-		xfs_defer_trans_abort(*tp, dop, error);
-		return error;
-	}
 	dop->dop_committed = true;
 
 	/* Rejoin the joined inodes. */
-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
-		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+	for (i = 0; i < ipcount; i++)
+		xfs_trans_ijoin(*tp, iplist[i], 0);
 
+	/* Rejoin the buffers and dirty them so the log moves forward. */
+	for (i = 0; i < bpcount; i++) {
+		xfs_trans_bjoin(*tp, bplist[i]);
+		xfs_trans_bhold(*tp, bplist[i]);
+	}
+
+	if (error) {
+		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
+		xfs_defer_trans_abort(*tp, dop, error);
+	}
 	return error;
 }
 
@@ -276,27 +326,14 @@ xfs_defer_has_unfinished_work(
 }
 
 /*
- * Add this inode to the deferred op.  Each joined inode is relogged
- * each time we roll the transaction, in addition to any inode passed
- * to xfs_defer_finish().
+ * Reset an already used dfops after finish.
  */
-int
-xfs_defer_join(
-	struct xfs_defer_ops		*dop,
-	struct xfs_inode		*ip)
+static void
+xfs_defer_reset(
+	struct xfs_defer_ops	*dop)
 {
-	int				i;
-
-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES; i++) {
-		if (dop->dop_inodes[i] == ip)
-			return 0;
-		else if (dop->dop_inodes[i] == NULL) {
-			dop->dop_inodes[i] = ip;
-			return 0;
-		}
-	}
-
-	return -EFSCORRUPTED;
+	ASSERT(!xfs_defer_has_unfinished_work(dop));
+	dop->dop_low = false;
 }
 
 /*
@@ -310,8 +347,7 @@ xfs_defer_join(
 int
 xfs_defer_finish(
 	struct xfs_trans		**tp,
-	struct xfs_defer_ops		*dop,
-	struct xfs_inode		*ip)
+	struct xfs_defer_ops		*dop)
 {
 	struct xfs_defer_pending	*dfp;
 	struct list_head		*li;
@@ -323,8 +359,6 @@ xfs_defer_finish(
 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
 
 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
-
-	xfs_defer_join(dop, ip);
 
 	/* Until we run out of pending work to finish... */
 	while (xfs_defer_has_unfinished_work(dop)) {
@@ -403,10 +437,13 @@ xfs_defer_finish(
 	if ((*tp)->t_flags & XFS_TRANS_DIRTY)
 		error = xfs_defer_trans_roll(tp, dop);
 out:
-	if (error)
+	if (error) {
 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
-	else
+	} else {
 		trace_xfs_defer_finish_done((*tp)->t_mountp, dop);
+		xfs_defer_reset(dop);
+	}
+
 	return error;
 }
 
@@ -503,9 +540,7 @@ xfs_defer_init(
 	struct xfs_defer_ops		*dop,
 	xfs_fsblock_t			*fbp)
 {
-	dop->dop_committed = false;
-	dop->dop_low = false;
-	memset(&dop->dop_inodes, 0, sizeof(dop->dop_inodes));
+	memset(dop, 0, sizeof(struct xfs_defer_ops));
 	*fbp = NULLFSBLOCK;
 	INIT_LIST_HEAD(&dop->dop_intake);
 	INIT_LIST_HEAD(&dop->dop_pending);

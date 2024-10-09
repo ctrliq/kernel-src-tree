@@ -53,11 +53,24 @@ enum uverbs_default_objects {
 	UVERBS_OBJECT_XRCD,
 	UVERBS_OBJECT_RWQ_IND_TBL,
 	UVERBS_OBJECT_WQ,
+	UVERBS_OBJECT_FLOW_ACTION,
+	UVERBS_OBJECT_DM,
+	UVERBS_OBJECT_COUNTERS,
 };
 
 enum {
 	UVERBS_ATTR_UHW_IN = UVERBS_UDATA_DRIVER_DATA_FLAG,
 	UVERBS_ATTR_UHW_OUT,
+};
+
+enum uverbs_methods_device {
+	UVERBS_METHOD_INVOKE_WRITE,
+};
+
+enum uverbs_attrs_invoke_write_cmd_attr_ids {
+	UVERBS_ATTR_CORE_IN,
+	UVERBS_ATTR_CORE_OUT,
+	UVERBS_ATTR_WRITE_CMD,
 };
 
 enum uverbs_attrs_create_cq_cmd_attr_ids {
@@ -75,9 +88,83 @@ enum uverbs_attrs_destroy_cq_cmd_attr_ids {
 	UVERBS_ATTR_DESTROY_CQ_RESP,
 };
 
+enum uverbs_attrs_create_flow_action_esp {
+	UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE,
+	UVERBS_ATTR_FLOW_ACTION_ESP_ATTRS,
+	UVERBS_ATTR_FLOW_ACTION_ESP_ESN,
+	UVERBS_ATTR_FLOW_ACTION_ESP_KEYMAT,
+	UVERBS_ATTR_FLOW_ACTION_ESP_REPLAY,
+	UVERBS_ATTR_FLOW_ACTION_ESP_ENCAP,
+};
+
+enum uverbs_attrs_modify_flow_action_esp {
+	UVERBS_ATTR_MODIFY_FLOW_ACTION_ESP_HANDLE =
+		UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE,
+};
+
+enum uverbs_attrs_destroy_flow_action_esp {
+	UVERBS_ATTR_DESTROY_FLOW_ACTION_HANDLE,
+};
+
 enum uverbs_methods_cq {
 	UVERBS_METHOD_CQ_CREATE,
 	UVERBS_METHOD_CQ_DESTROY,
+};
+
+enum uverbs_methods_actions_flow_action_ops {
+	UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
+	UVERBS_METHOD_FLOW_ACTION_DESTROY,
+	UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY,
+};
+
+enum uverbs_attrs_alloc_dm_cmd_attr_ids {
+	UVERBS_ATTR_ALLOC_DM_HANDLE,
+	UVERBS_ATTR_ALLOC_DM_LENGTH,
+	UVERBS_ATTR_ALLOC_DM_ALIGNMENT,
+};
+
+enum uverbs_attrs_free_dm_cmd_attr_ids {
+	UVERBS_ATTR_FREE_DM_HANDLE,
+};
+
+enum uverbs_methods_dm {
+	UVERBS_METHOD_DM_ALLOC,
+	UVERBS_METHOD_DM_FREE,
+};
+
+enum uverbs_attrs_reg_dm_mr_cmd_attr_ids {
+	UVERBS_ATTR_REG_DM_MR_HANDLE,
+	UVERBS_ATTR_REG_DM_MR_OFFSET,
+	UVERBS_ATTR_REG_DM_MR_LENGTH,
+	UVERBS_ATTR_REG_DM_MR_PD_HANDLE,
+	UVERBS_ATTR_REG_DM_MR_ACCESS_FLAGS,
+	UVERBS_ATTR_REG_DM_MR_DM_HANDLE,
+	UVERBS_ATTR_REG_DM_MR_RESP_LKEY,
+	UVERBS_ATTR_REG_DM_MR_RESP_RKEY,
+};
+
+enum uverbs_methods_mr {
+	UVERBS_METHOD_DM_MR_REG,
+};
+
+enum uverbs_attrs_create_counters_cmd_attr_ids {
+	UVERBS_ATTR_CREATE_COUNTERS_HANDLE,
+};
+
+enum uverbs_attrs_destroy_counters_cmd_attr_ids {
+	UVERBS_ATTR_DESTROY_COUNTERS_HANDLE,
+};
+
+enum uverbs_attrs_read_counters_cmd_attr_ids {
+	UVERBS_ATTR_READ_COUNTERS_HANDLE,
+	UVERBS_ATTR_READ_COUNTERS_BUFF,
+	UVERBS_ATTR_READ_COUNTERS_FLAGS,
+};
+
+enum uverbs_methods_actions_counters_ops {
+	UVERBS_METHOD_COUNTERS_CREATE,
+	UVERBS_METHOD_COUNTERS_DESTROY,
+	UVERBS_METHOD_COUNTERS_READ,
 };
 
 #endif

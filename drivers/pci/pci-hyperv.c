@@ -394,14 +394,6 @@ struct hv_interrupt_entry {
 	u32	data;
 };
 
-#define HV_VP_SET_BANK_COUNT_MAX	5 /* current implementation limit */
-
-struct hv_vp_set {
-	u64	format;			/* 0 (HvGenericSetSparse4k) */
-	u64	valid_banks;
-	u64	masks[HV_VP_SET_BANK_COUNT_MAX];
-};
-
 /*
  * flags for hv_device_interrupt_target.flags
  */
@@ -413,7 +405,7 @@ struct hv_device_interrupt_target {
 	u32	flags;
 	union {
 		u64		 vp_mask;
-		struct hv_vp_set vp_set;
+		struct hv_vpset vp_set;
 	};
 };
 
@@ -460,10 +452,14 @@ struct hv_pcibus_device {
 	struct list_head children;
 	struct list_head dr_list;
 
+	spinlock_t retarget_msi_interrupt_lock;
+
 	/* hypercall arg, must not cross page boundary */
 	struct retarget_msi_interrupt retarget_msi_interrupt_params;
 
-	spinlock_t retarget_msi_interrupt_lock;
+	/*
+	 * Don't put anything here: retarget_msi_interrupt_params must be last
+	 */
 };
 
 /*
@@ -524,6 +520,8 @@ struct hv_pci_compl {
 };
 
 struct x86_msi_ops hv_msi;
+
+static void hv_pci_onchannelcallback(void *context);
 
 /**
  * hv_pci_generic_compl() - Invoked for a completion packet
@@ -689,6 +687,31 @@ static void _hv_pcifront_read_config(struct hv_pci_dev *hpdev, int where,
 	}
 }
 
+static u16 hv_pcifront_get_vendor_id(struct hv_pci_dev *hpdev)
+{
+	u16 ret;
+	unsigned long flags;
+	void __iomem *addr = hpdev->hbus->cfg_addr + CFG_PAGE_OFFSET +
+			     PCI_VENDOR_ID;
+
+	spin_lock_irqsave(&hpdev->hbus->config_lock, flags);
+
+	/* Choose the function to be read. (See comment above) */
+	writel(hpdev->desc.win_slot.slot, hpdev->hbus->cfg_addr);
+	/* Make sure the function was chosen before we start reading. */
+	mb();
+	/* Read from that function's config space. */
+	ret = readw(addr);
+	/*
+	 * mb() is not required here, because the spin_unlock_irqrestore()
+	 * is a barrier.
+	 */
+
+	spin_unlock_irqrestore(&hpdev->hbus->config_lock, flags);
+
+	return ret;
+}
+
 /**
  * _hv_pcifront_write_config() - Internal PCI config write
  * @hpdev:	The PCI driver's representation of the device
@@ -814,13 +837,13 @@ static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
 	struct irq_cfg *cfg = irqd_cfg(data);
 	struct retarget_msi_interrupt *params;
 	struct hv_pcibus_device *hbus;
+	cpumask_var_t tmp;
 	struct pci_bus *pbus;
 	struct pci_dev *pdev;
-	int cpu, ret;
+	int cpu, ret, nr_bank;
 	unsigned int dest_id;
 	unsigned long flags;
 	u32 var_size = 0;
-	int cpu_vmbus;
 	u64 res;
 
 	ret = __ioapic_set_affinity(data, dest, &dest_id);
@@ -863,27 +886,27 @@ static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
 		 */
 		params->int_target.flags |=
 			HV_DEVICE_INTERRUPT_TARGET_PROCESSOR_SET;
-		params->int_target.vp_set.valid_banks =
-			(1ull << HV_VP_SET_BANK_COUNT_MAX) - 1;
+
+		if (!alloc_cpumask_var(&tmp, GFP_ATOMIC)) {
+			res = 1;
+			goto exit_unlock;
+		}
+
+		cpumask_and(tmp, cfg->domain, cpu_online_mask);
+		nr_bank = cpumask_to_vpset(&params->int_target.vp_set, tmp);
+		free_cpumask_var(tmp);
+
+		if (nr_bank <= 0) {
+			res = 1;
+			goto exit_unlock;
+		}
 
 		/*
 		 * var-sized hypercall, var-size starts after vp_mask (thus
-		 * vp_set.format does not count, but vp_set.valid_banks does).
+		 * vp_set.format does not count, but vp_set.valid_bank_mask
+		 * does).
 		 */
-		var_size = 1 + HV_VP_SET_BANK_COUNT_MAX;
-
-		for_each_cpu_and(cpu, cfg->domain, cpu_online_mask) {
-			cpu_vmbus = hv_cpu_number_to_vp_number(cpu);
-
-			if (cpu_vmbus >= HV_VP_SET_BANK_COUNT_MAX * 64) {
-				dev_err(&hbus->hdev->device,
-					"too high CPU %d", cpu_vmbus);
-				res = 1;
-				goto exit_unlock;
-			}
-			params->int_target.vp_set.masks[cpu_vmbus / 64] |=
-				(1ULL << (cpu_vmbus & 63));
-		}
+		var_size = 1 + nr_bank;
 	} else {
 		for_each_cpu_and(cpu, cfg->domain, cpu_online_mask) {
 			params->int_target.vp_mask |=
@@ -1016,6 +1039,7 @@ static void hv_compose_msi_msg(struct pci_dev *pdev, unsigned int irq,
 	struct hv_pcibus_device *hbus;
 	struct hv_pci_dev *hpdev;
 	struct pci_bus *pbus;
+	unsigned long flags;
 	struct compose_comp_ctxt comp;
 	struct tran_int_desc *int_desc;
 	struct {
@@ -1083,8 +1107,38 @@ static void hv_compose_msi_msg(struct pci_dev *pdev, unsigned int irq,
 	 * Since this function is called with IRQ locks held, can't
 	 * do normal wait for completion; instead poll.
 	 */
-	while (!try_wait_for_completion(&comp.comp_pkt.host_event))
+	while (!try_wait_for_completion(&comp.comp_pkt.host_event)) {
+		/* 0xFFFF means an invalid PCI VENDOR ID. */
+		if (hv_pcifront_get_vendor_id(hpdev) == 0xFFFF) {
+			dev_err_once(&hbus->hdev->device,
+				     "the device has gone\n");
+			goto free_int_desc;
+		}
+
+		/*
+		 * When the higher level interrupt code calls us with
+		 * interrupt disabled, we must poll the channel by calling
+		 * the channel callback directly when channel->target_cpu is
+		 * the current CPU. When the higher level interrupt code
+		 * calls us with interrupt enabled, let's add the
+		 * local_irq_save()/restore() to avoid race:
+		 * hv_pci_onchannelcallback() can also run in tasklet.
+		 */
+		local_irq_save(flags);
+
+		if (hbus->hdev->channel->target_cpu == smp_processor_id())
+			hv_pci_onchannelcallback(hbus);
+
+		local_irq_restore(flags);
+
+		if (hpdev->state == hv_pcichild_ejecting) {
+			dev_err_once(&hbus->hdev->device,
+				     "the device is being ejected\n");
+			goto free_int_desc;
+		}
+
 		udelay(100);
+	}
 
 	if (comp.comp_pkt.completion_status < 0) {
 		pr_err("Request for interrupt failed: 0x%x",

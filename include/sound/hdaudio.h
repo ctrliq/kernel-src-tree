@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * HD-audio core stuff
  */
@@ -344,9 +345,9 @@ struct hdac_bus {
 	spinlock_t reg_lock;
 	struct mutex cmd_mutex;
 
-	/* i915 component interface */
-	struct i915_audio_component *audio_component;
-	int i915_power_refcount;
+	/* DRM component interface */
+	struct drm_audio_component *audio_component;
+	int drm_power_refcount;
 };
 
 int snd_hdac_bus_init(struct hdac_bus *bus, struct device *dev,

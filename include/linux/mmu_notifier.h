@@ -415,6 +415,9 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 	set_pte_at(___mm, ___address, __ptep, ___pte);			\
 })
 
+#define ptep_clear_young_notify ptep_test_and_clear_young
+#define pmdp_clear_young_notify pmdp_test_and_clear_young
+
 extern void mmu_notifier_call_srcu(struct rcu_head *rcu,
 				   void (*func)(struct rcu_head *rcu));
 extern void mmu_notifier_synchronize(void);
@@ -472,6 +475,8 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 
 #define ptep_clear_flush_young_notify ptep_clear_flush_young
 #define pmdp_clear_flush_young_notify pmdp_clear_flush_young
+#define ptep_clear_young_notify ptep_test_and_clear_young
+#define pmdp_clear_young_notify pmdp_test_and_clear_young
 #define	ptep_clear_flush_notify ptep_clear_flush
 #define pmdp_clear_flush_notify pmdp_clear_flush
 #define pmdp_get_and_clear_notify pmdp_get_and_clear

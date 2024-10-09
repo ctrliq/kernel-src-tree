@@ -27,10 +27,12 @@
 #include <linux/dlm_plock.h>
 #include <linux/aio.h>
 #include <linux/delay.h>
+#include <linux/backing-dev.h>
 
 #include "gfs2.h"
 #include "incore.h"
 #include "bmap.h"
+#include "aops.h"
 #include "dir.h"
 #include "glock.h"
 #include "glops.h"
@@ -695,9 +697,7 @@ static int gfs2_fsync(struct file *file, loff_t start, loff_t end,
 /**
  * gfs2_file_aio_write - Perform a write to a file
  * @iocb: The io context
- * @iov: The data to write
- * @nr_segs: Number of @iov segments
- * @pos: The file position
+ * @from: The data to write
  *
  * We have to do a lock/unlock here to refresh the inode size for
  * O_APPEND writes, otherwise we can land up writing at the wrong
@@ -710,15 +710,17 @@ static ssize_t gfs2_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 				   unsigned long nr_segs, loff_t pos)
 {
 	struct file *file = iocb->ki_filp;
-	size_t writesize = iov_length(iov, nr_segs);
-	struct gfs2_inode *ip = GFS2_I(file_inode(file));
-	int ret;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
+	struct gfs2_inode *ip = GFS2_I(inode);
+	size_t ocount, count;
+	ssize_t ret;
 
 	ret = gfs2_rsqa_alloc(ip);
 	if (ret)
 		return ret;
 
-	gfs2_size_hint(file, pos, writesize);
+	gfs2_size_hint(file, pos, iov_length(iov, nr_segs));
 
 	if (file->f_flags & O_APPEND) {
 		struct gfs2_holder gh;
@@ -729,7 +731,53 @@ static ssize_t gfs2_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 		gfs2_glock_dq_uninit(&gh);
 	}
 
-	return generic_file_aio_write(iocb, iov, nr_segs, pos);
+	if (io_is_direct(file))
+		return generic_file_aio_write(iocb, iov, nr_segs, pos);
+
+	ocount = 0;
+	ret = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
+	if (ret)
+		return ret;
+
+	count = ocount;
+
+	BUG_ON(iocb->ki_pos != pos);
+
+	inode_lock(inode);
+	ret = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+	if (ret)
+		goto out;
+
+	if (count == 0)
+		goto out;
+
+	/* We can write back this queue in page reclaim */
+	current->backing_dev_info = mapping->backing_dev_info;
+
+	ret = file_remove_privs(file);
+	if (ret)
+		goto out2;
+
+	ret = file_update_time(file);
+	if (ret)
+		goto out2;
+
+	ret = iomap_file_buffered_write(iocb, iov, nr_segs, pos, &iocb->ki_pos,
+					count, &gfs2_iomap_ops);
+
+out2:
+	current->backing_dev_info = NULL;
+out:
+	inode_unlock(inode);
+	if (likely(ret > 0)) {
+		ssize_t err;
+
+		/* Handle various SYNC-type writes */
+		err = generic_write_sync(file, pos, ret);
+		if (err < 0 && ret > 0)
+			ret = err;
+	}
+	return ret;
 }
 
 static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len,
@@ -739,7 +787,7 @@ static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len,
 	struct gfs2_inode *ip = GFS2_I(inode);
 	loff_t end = offset + len;
 	struct buffer_head *dibh;
-	struct iomap iomap;
+	struct iomap iomap = { };
 	int error;
 
 	error = gfs2_meta_inode_buffer(ip, &dibh);
@@ -755,12 +803,12 @@ static int fallocate_chunk(struct inode *inode, loff_t offset, loff_t len,
 	}
 
 	while (offset < end) {
-		error = gfs2_iomap_begin(inode, offset, end - offset,
-					 IOMAP_WRITE, &iomap);
+		error = gfs2_iomap_get_alloc(inode, offset, end - offset,
+					     &iomap);
 		if (error)
 			goto out;
 		offset = iomap.offset + iomap.length;
-		if (iomap.type != IOMAP_HOLE)
+		if (!(iomap.flags & IOMAP_F_NEW))
 			continue;
 		error = sb_issue_zeroout(sb, iomap.addr >> inode->i_blkbits,
 					 iomap.length >> inode->i_blkbits,
@@ -929,8 +977,7 @@ static long gfs2_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 	struct gfs2_holder gh;
 	int ret;
 
-	/* We only support the FALLOC_FL_KEEP_SIZE mode */
-	if (mode & ~FALLOC_FL_KEEP_SIZE)
+	if (mode & ~(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE))
 		return -EOPNOTSUPP;
 	/* fallocate is needed by gfs2_grow to reserve space in the rindex */
 	if (gfs2_is_jdata(ip) && inode != sdp->sd_rindex)
@@ -954,13 +1001,18 @@ static long gfs2_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 	if (ret)
 		goto out_unlock;
 
-	ret = gfs2_rsqa_alloc(ip);
-	if (ret)
-		goto out_putw;
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		ret = __gfs2_punch_hole(file, offset, len);
+	} else {
+		ret = gfs2_rsqa_alloc(ip);
+		if (ret)
+			goto out_putw;
 
-	ret = __gfs2_fallocate(file, mode, offset, len);
-	if (ret)
-		gfs2_rs_deltree(&ip->i_res);
+		ret = __gfs2_fallocate(file, mode, offset, len);
+
+		if (ret)
+			gfs2_rs_deltree(&ip->i_res);
+	}
 
 out_putw:
 	put_write_access(inode);

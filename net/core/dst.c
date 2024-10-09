@@ -381,7 +381,7 @@ struct metadata_dst *metadata_dst_alloc(u8 optslen, enum metadata_type type,
 
 	md_dst = kmalloc(sizeof(*md_dst) + optslen, flags);
 	if (!md_dst)
-		return ERR_PTR(-ENOMEM);
+		return NULL;
 
 	dst = &md_dst->dst;
 	dst_init(dst, &md_dst_ops, NULL, 1, DST_OBSOLETE_NONE,

@@ -1,36 +1,5 @@
-/* SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause) */
-/*
- * Copyright (C) 2018 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright (C) 2018 Netronome Systems, Inc. */
 
 #ifndef __NFP_ABM_H__
 #define __NFP_ABM_H__ 1
@@ -49,19 +18,55 @@ struct nfp_net;
  * @pf_id:	ID of our PF link
  * @eswitch_mode:	devlink eswitch mode, advanced functions only visible
  *			in switchdev mode
+ * @q_lvls:	queue level control area
+ * @qm_stats:	queue statistics symbol
  */
 struct nfp_abm {
 	struct nfp_app *app;
 	unsigned int pf_id;
 	enum devlink_eswitch_mode eswitch_mode;
+	const struct nfp_rtsym *q_lvls;
+	const struct nfp_rtsym *qm_stats;
+};
+
+/**
+ * struct nfp_alink_stats - ABM NIC statistics
+ * @tx_pkts:		number of TXed packets
+ * @tx_bytes:		number of TXed bytes
+ * @backlog_pkts:	momentary backlog length (packets)
+ * @backlog_bytes:	momentary backlog length (bytes)
+ * @overlimits:		number of ECN marked TXed packets (accumulative)
+ * @drops:		number of tail-dropped packets (accumulative)
+ */
+struct nfp_alink_stats {
+	u64 tx_pkts;
+	u64 tx_bytes;
+	u64 backlog_pkts;
+	u64 backlog_bytes;
+	u64 overlimits;
+	u64 drops;
+};
+
+/**
+ * struct nfp_alink_xstats - extended ABM NIC statistics
+ * @ecn_marked:		number of ECN marked TXed packets
+ * @pdrop:		number of hard drops due to queue limit
+ */
+struct nfp_alink_xstats {
+	u64 ecn_marked;
+	u64 pdrop;
 };
 
 /**
  * struct nfp_red_qdisc - representation of single RED Qdisc
  * @handle:	handle of currently offloaded RED Qdisc
+ * @stats:	statistics from last refresh
+ * @xstats:	base of extended statistics
  */
 struct nfp_red_qdisc {
 	u32 handle;
+	struct nfp_alink_stats stats;
+	struct nfp_alink_xstats xstats;
 };
 
 /**
@@ -82,4 +87,11 @@ struct nfp_abm_link {
 
 void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink);
 int nfp_abm_ctrl_find_addrs(struct nfp_abm *abm);
+int nfp_abm_ctrl_set_all_q_lvls(struct nfp_abm_link *alink, u32 val);
+int nfp_abm_ctrl_read_stats(struct nfp_abm_link *alink,
+			    struct nfp_alink_stats *stats);
+int nfp_abm_ctrl_read_xstats(struct nfp_abm_link *alink,
+			     struct nfp_alink_xstats *xstats);
+int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm);
+int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm);
 #endif

@@ -93,7 +93,7 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 		/* Associate the OF node with the device structure so it
 		 * can be looked up later */
 		of_node_get(child);
-		phy->dev.of_node = child;
+		phy->mdio_dev.of_node = child;
 
 		/* All data is now stored in the phy struct; register it */
 		rc = phy_device_register(phy);
@@ -122,7 +122,7 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 
 		for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
 			/* skip already registered PHYs */
-			if (mdio->phy_map[addr])
+			if (mdiobus_is_registered_device(mdio, addr))
 				continue;
 
 			/* be noisy to encourage people to set reg property */
@@ -143,7 +143,7 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 			/* Associate the OF node with the device structure so it
 			 * can be looked up later */
 			of_node_get(child);
-			phy->dev.of_node = child;
+			phy->mdio_dev.of_node = child;
 
 			/* All data is now stored in the phy struct;
 			 * register it */
@@ -213,7 +213,7 @@ struct phy_device *of_phy_connect(struct net_device *dev,
 	ret = phy_connect_direct(dev, phy, hndlr, iface);
 
 	/* refcount is held by phy_connect_direct() on success */
-	put_device(&phy->dev);
+	put_device(&phy->mdio_dev);
 
 	return ret ? NULL : phy;
 }

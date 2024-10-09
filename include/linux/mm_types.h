@@ -108,6 +108,12 @@ struct page {
 					 * get_page_unless_zero() will
 					 * never succeed on tail
 					 * pages.
+					 *
+					 * Extra information about page type may
+					 * be stored here for pages that are
+					 * never mapped, in which case the value
+					 * MUST BE <= -2. See page-flags.h for
+					 * more details.
 					 */
 					atomic_t _mapcount;
 
@@ -342,7 +348,7 @@ struct vm_area_struct {
 	/* reserved for Red Hat */
 	RH_KABI_USE(1, struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 	RH_KABI_USE(2, unsigned long vm_flags2) /* Flags, see mm.h. */
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(3, atomic_long_t swap_readahead_info)
 	RH_KABI_RESERVE(4)
 };
 
@@ -497,18 +503,12 @@ struct mm_struct {
 	/* numa_scan_seq prevents two threads setting pte_numa */
 	int numa_scan_seq;
 #endif
-#if defined(CONFIG_NUMA_BALANCING) || defined(CONFIG_COMPACTION)
 	/*
 	 * An operation with batched TLB flushing is going on. Anything that
 	 * can move process memory needs to flush the TLB when moving a
 	 * PROT_NONE or PROT_NUMA mapped page.
 	 */
-	bool tlb_flush_pending;
-#endif
-#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
-	/* See flush_tlb_batched_pending() */
-	bool tlb_flush_batched;
-#endif
+	RH_KABI_REPLACE_UNSAFE(bool tlb_flush_pending, atomic_t tlb_flush_pending)
 	struct uprobes_state uprobes_state;
 
 	/* reserved for Red Hat */
@@ -552,7 +552,12 @@ struct mm_struct {
 #else
 	RH_KABI_RESERVE(7)
 #endif
+#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+	/* See flush_tlb_batched_pending() */
+	RH_KABI_USE(8, bool tlb_flush_batched)
+#else
 	RH_KABI_RESERVE(8)
+#endif
 };
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
@@ -568,45 +573,59 @@ static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
 	return mm->cpu_vm_mask_var;
 }
 
-#if defined(CONFIG_NUMA_BALANCING) || defined(CONFIG_COMPACTION)
+struct mmu_gather;
+extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+				unsigned long start, unsigned long end);
+extern void tlb_finish_mmu(struct mmu_gather *tlb,
+				unsigned long start, unsigned long end);
+
 /*
  * Memory barriers to keep this state in sync are graciously provided by
  * the page table locks, outside of which no page table modifications happen.
- * The barriers below prevent the compiler from re-ordering the instructions
- * around the memory barriers that are already present in the code.
+ * The barriers are used to ensure the order between tlb_flush_pending updates,
+ * which happen while the lock is not taken, and the PTE updates, which happen
+ * while the lock is taken, are serialized.
  */
 static inline bool tlb_flush_pending(struct mm_struct *mm)
 {
-	barrier();
-	return mm->tlb_flush_pending;
+	return atomic_read(&mm->tlb_flush_pending) > 0;
 }
-static inline void set_tlb_flush_pending(struct mm_struct *mm)
+
+/*
+ * Returns true if there are two above TLB batching threads in parallel.
+ */
+static inline bool mm_tlb_flush_nested(struct mm_struct *mm)
 {
-	mm->tlb_flush_pending = true;
+	return atomic_read(&mm->tlb_flush_pending) > 1;
+}
+
+static inline void init_tlb_flush_pending(struct mm_struct *mm)
+{
+	atomic_set(&mm->tlb_flush_pending, 0);
+}
+
+static inline void inc_tlb_flush_pending(struct mm_struct *mm)
+{
+	atomic_inc(&mm->tlb_flush_pending);
 
 	/*
-	 * Guarantee that the tlb_flush_pending store does not leak into the
+	 * Guarantee that the tlb_flush_pending increase does not leak into the
 	 * critical section updating the page tables
 	 */
 	smp_mb__before_spinlock();
 }
+
 /* Clearing is done after a TLB flush, which also provides a barrier. */
-static inline void clear_tlb_flush_pending(struct mm_struct *mm)
+static inline void dec_tlb_flush_pending(struct mm_struct *mm)
 {
-	barrier();
-	mm->tlb_flush_pending = false;
+	/*
+	 * Guarantee that the tlb_flush_pending does not not leak into the
+	 * critical section, since we must order the PTE change and changes to
+	 * the pending TLB flush indication. We could have relied on TLB flush
+	 * as a memory barrier, but this behavior is not clearly documented.
+	 */
+	smp_mb__before_atomic();
+	atomic_dec(&mm->tlb_flush_pending);
 }
-#else
-static inline bool tlb_flush_pending(struct mm_struct *mm)
-{
-	return false;
-}
-static inline void set_tlb_flush_pending(struct mm_struct *mm)
-{
-}
-static inline void clear_tlb_flush_pending(struct mm_struct *mm)
-{
-}
-#endif
 
 #endif /* _LINUX_MM_TYPES_H */

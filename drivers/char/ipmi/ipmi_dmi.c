@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * A hack to create a platform device from a DMI entry.  This will
  * allow autoloading of the IPMI drive based on SMBIOS entries.
  */
+
+#define pr_fmt(fmt) "%s" fmt, "ipmi:dmi: "
+#define dev_fmt pr_fmt
 
 #include <linux/slab.h>
 #include <linux/ipmi.h>
@@ -48,9 +52,10 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
 
 	memset(p, 0, sizeof(p));
 
-	name = "ipmi_si";
+	name = "dmi-ipmi-si";
 	switch (type) {
 	case IPMI_DMI_TYPE_SSIF:
+		name = "dmi-ipmi-ssif";
 		offset = 1;
 		size = 1;
 		si_type = SI_TYPE_INVALID;
@@ -68,7 +73,7 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
 		si_type = SI_SMIC;
 		break;
 	default:
-		pr_err("ipmi:dmi: Invalid IPMI type: %d\n", type);
+		pr_err("Invalid IPMI type: %d\n", type);
 		return;
 	}
 
@@ -80,7 +85,7 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
 
 	info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
-		pr_warn("ipmi:dmi: Could not allocate dmi info\n");
+		pr_warn("Could not allocate dmi info\n");
 	} else {
 		info->si_type = si_type;
 		info->flags = flags;
@@ -92,7 +97,7 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
 
 	pdev = platform_device_alloc(name, ipmi_dmi_nr);
 	if (!pdev) {
-		pr_err("ipmi:dmi: Error allocation IPMI platform device\n");
+		pr_err("Error allocation IPMI platform device\n");
 		return;
 	}
 
@@ -134,22 +139,20 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
 
 	rv = platform_device_add_resources(pdev, r, num_r);
 	if (rv) {
-		dev_err(&pdev->dev,
-			"ipmi:dmi: Unable to add resources: %d\n", rv);
+		dev_err(&pdev->dev, "Unable to add resources: %d\n", rv);
 		goto err;
 	}
 
 add_properties:
 	rv = platform_device_add_properties(pdev, p);
 	if (rv) {
-		dev_err(&pdev->dev,
-			"ipmi:dmi: Unable to add properties: %d\n", rv);
+		dev_err(&pdev->dev, "Unable to add properties: %d\n", rv);
 		goto err;
 	}
 
 	rv = platform_device_add(pdev);
 	if (rv) {
-		dev_err(&pdev->dev, "ipmi:dmi: Unable to add device: %d\n", rv);
+		dev_err(&pdev->dev, "Unable to add device: %d\n", rv);
 		goto err;
 	}
 
@@ -260,7 +263,7 @@ static void __init dmi_decode_ipmi(const struct dmi_header *dm)
 				offset = 16;
 				break;
 			default:
-				pr_err("ipmi:dmi: Invalid offset: 0\n");
+				pr_err("Invalid offset: 0\n");
 				return;
 			}
 		}

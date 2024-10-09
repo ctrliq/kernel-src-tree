@@ -1467,6 +1467,12 @@ ENTRY(sys_memfd_create_wrapper)
 	llgfr	%r3,%r3		# unsigned int
 	jg	sys_memfd_create
 
+ENTRY(sys_bpf_wrapper)
+	lgfr	%r2,%r2		# int
+	llgtr	%r3,%r3		# union bpf_attr *
+	llgfr	%r4,%r4		# unsigned int
+	jg	sys_bpf
+
 ENTRY(sys_bind_wrapper)
 	lgfr	%r2,%r2		# int
 	llgtr	%r3,%r3		# struct sockaddr *

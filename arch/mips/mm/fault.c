@@ -19,10 +19,10 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/perf_event.h>
+#include <linux/uaccess.h>
 
 #include <asm/branch.h>
 #include <asm/mmu_context.h>
-#include <asm/uaccess.h>
 #include <asm/ptrace.h>
 #include <asm/highmem.h>		/* For VMALLOC_END */
 #include <linux/kdebug.h>
@@ -89,7 +89,7 @@ asmlinkage void __kprobes do_page_fault(struct pt_regs *regs, unsigned long writ
 	 * If we're in an interrupt or have no user
 	 * context, we must not take the fault..
 	 */
-	if (in_atomic() || !mm)
+	if (faulthandler_disabled() || !mm)
 		goto bad_area_nosemaphore;
 
 retry:

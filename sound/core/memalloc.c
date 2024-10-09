@@ -26,7 +26,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/genalloc.h>
 #ifdef CONFIG_X86
-#include <asm/set_memory.h>
+#include <asm/cacheflush.h>
 #endif
 #include <sound/memalloc.h>
 

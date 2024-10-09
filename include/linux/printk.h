@@ -259,14 +259,14 @@ extern void dump_stack(void) __cold;
  */
 
 #ifdef CONFIG_PRINTK
-#define printk_once(fmt, ...)					\
-({								\
-	static bool __print_once __read_mostly;			\
-								\
-	if (!__print_once) {					\
-		__print_once = true;				\
-		printk(fmt, ##__VA_ARGS__);			\
-	}							\
+#define printk_once(fmt, ...)			\
+({						\
+	static bool __print_once;		\
+						\
+	if (!__print_once) {			\
+		__print_once = true;		\
+		printk(fmt, ##__VA_ARGS__);	\
+	}					\
 })
 #define printk_deferred_once(fmt, ...)				\
 ({								\
@@ -278,7 +278,7 @@ extern void dump_stack(void) __cold;
 	}							\
 })
 #else
-#define printk_once(fmt, ...)					\
+#define printk_once(fmt, ...)			\
 	no_printk(fmt, ##__VA_ARGS__)
 #define printk_deferred_once(fmt, ...)				\
 	no_printk(fmt, ##__VA_ARGS__)

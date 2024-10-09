@@ -803,9 +803,6 @@ int blk_mq_debugfs_register_hctx(struct request_queue *q,
 	if (!q->debugfs_dir)
 		return -ENOENT;
 
-	if (hctx->debugfs_dir)
-		return 0;
-
 	snprintf(name, sizeof(name), "hctx%u", hctx->queue_num);
 	hctx->debugfs_dir = debugfs_create_dir(name, q->debugfs_dir);
 	if (!hctx->debugfs_dir)
@@ -839,14 +836,10 @@ int blk_mq_debugfs_register_hctxs(struct request_queue *q)
 	struct blk_mq_hw_ctx *hctx;
 	int i;
 
-	mutex_lock(&q->sysfs_lock);
 	queue_for_each_hw_ctx(q, hctx, i) {
-		if (blk_mq_debugfs_register_hctx(q, hctx)) {
-			mutex_unlock(&q->sysfs_lock);
+		if (blk_mq_debugfs_register_hctx(q, hctx))
 			return -ENOMEM;
-		}
 	}
-	mutex_unlock(&q->sysfs_lock);
 
 	return 0;
 }
@@ -856,10 +849,8 @@ void blk_mq_debugfs_unregister_hctxs(struct request_queue *q)
 	struct blk_mq_hw_ctx *hctx;
 	int i;
 
-	mutex_lock(&q->sysfs_lock);
 	queue_for_each_hw_ctx(q, hctx, i)
 		blk_mq_debugfs_unregister_hctx(hctx);
-	mutex_unlock(&q->sysfs_lock);
 }
 
 int blk_mq_debugfs_register_sched(struct request_queue *q)

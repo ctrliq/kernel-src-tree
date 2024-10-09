@@ -1829,7 +1829,7 @@ static void intel_pstate_update_util(struct update_util_data *data, u64 time,
 static const struct x86_cpu_id intel_pstate_cpu_ids[] = {
 	ICPU(INTEL_FAM6_SANDYBRIDGE, 		core_funcs),
 	ICPU(INTEL_FAM6_SANDYBRIDGE_X,		core_funcs),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT1,	atom_funcs),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT,	atom_funcs),
 	ICPU(INTEL_FAM6_IVYBRIDGE,		core_funcs),
 	ICPU(INTEL_FAM6_HASWELL_CORE,		core_funcs),
 	ICPU(INTEL_FAM6_BROADWELL_CORE,		core_funcs),
@@ -1845,7 +1845,8 @@ static const struct x86_cpu_id intel_pstate_cpu_ids[] = {
 	ICPU(INTEL_FAM6_XEON_PHI_KNL,		knl_funcs),
 	ICPU(INTEL_FAM6_XEON_PHI_KNM,		knl_funcs),
 	ICPU(INTEL_FAM6_ATOM_GOLDMONT,		bxt_funcs),
-	ICPU(INTEL_FAM6_ATOM_GEMINI_LAKE,       bxt_funcs),
+	ICPU(INTEL_FAM6_ATOM_GOLDMONT_PLUS,       bxt_funcs),
+	ICPU(INTEL_FAM6_SKYLAKE_X,		core_funcs),
 	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, intel_pstate_cpu_ids);
@@ -2411,6 +2412,18 @@ static bool intel_pstate_no_acpi_pss(void)
 	return true;
 }
 
+static bool __init intel_pstate_no_acpi_pcch(void)
+{
+	acpi_status status;
+	acpi_handle handle;
+
+	status = acpi_get_handle(NULL, "\\_SB", &handle);
+	if (ACPI_FAILURE(status))
+		return true;
+
+	return !acpi_has_method(handle, "PCCH");
+}
+
 static bool intel_pstate_has_acpi_ppc(void)
 {
 	int i;
@@ -2482,7 +2495,13 @@ static bool intel_pstate_platform_pwr_mgmt_exists(void)
 						ACPI_OEM_TABLE_ID_SIZE))
 			switch (v_info->oem_pwr_table) {
 			case PSS:
-				return intel_pstate_no_acpi_pss();
+				if (!force_load)
+					return intel_pstate_no_acpi_pss();
+
+				if (!intel_pstate_no_acpi_pss())
+					return false;
+
+				return intel_pstate_no_acpi_pcch();
 			case PPC:
 				return intel_pstate_has_acpi_ppc() &&
 					(!force_load);

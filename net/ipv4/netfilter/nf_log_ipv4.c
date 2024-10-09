@@ -33,7 +33,7 @@ static struct nf_loginfo default_loginfo = {
 };
 
 /* One level of recursion won't kill us */
-static void dump_ipv4_packet(struct nf_log_buf *m,
+static void dump_ipv4_packet(struct net *net, struct nf_log_buf *m,
 			     const struct nf_loginfo *info,
 			     const struct sk_buff *skb, unsigned int iphoff)
 {
@@ -181,7 +181,7 @@ static void dump_ipv4_packet(struct nf_log_buf *m,
 			/* Max length: 3+maxlen */
 			if (!iphoff) { /* Only recurse once. */
 				nf_log_buf_add(m, "[");
-				dump_ipv4_packet(m, info, skb,
+				dump_ipv4_packet(net, m, info, skb,
 					    iphoff + ih->ihl*4+sizeof(_icmph));
 				nf_log_buf_add(m, "] ");
 			}
@@ -249,7 +249,7 @@ static void dump_ipv4_packet(struct nf_log_buf *m,
 
 	/* Max length: 15 "UID=4294967295 " */
 	if ((logflags & XT_LOG_UID) && !iphoff)
-		nf_log_dump_sk_uid_gid(m, skb->sk);
+		nf_log_dump_sk_uid_gid(net, m, skb->sk);
 
 	/* Max length: 16 "MARK=0xFFFFFFFF " */
 	if (!iphoff && skb->mark)
@@ -331,7 +331,7 @@ static void nf_log_ip_packet(struct net *net, u_int8_t pf,
 	if (in != NULL)
 		dump_ipv4_mac_header(m, loginfo, skb);
 
-	dump_ipv4_packet(m, loginfo, skb, 0);
+	dump_ipv4_packet(net, m, loginfo, skb, 0);
 
 	nf_log_buf_close(m);
 }

@@ -333,7 +333,7 @@ static void ipath_copy_from_sge(void *data, struct ipath_sge_state *ss,
  * @qp: the QP to post on
  * @wr: the work request to send
  */
-static int ipath_post_one_send(struct ipath_qp *qp, struct ib_send_wr *wr)
+static int ipath_post_one_send(struct ipath_qp *qp, const struct ib_send_wr *wr)
 {
 	struct ipath_swqe *wqe;
 	u32 next;
@@ -455,8 +455,8 @@ bail:
  *
  * This may be called from interrupt context.
  */
-static int ipath_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
-			   struct ib_send_wr **bad_wr)
+static int ipath_post_send(struct ib_qp *ibqp, const struct ib_send_wr *wr,
+			   const struct ib_send_wr **bad_wr)
 {
 	struct ipath_qp *qp = to_iqp(ibqp);
 	int err = 0;
@@ -484,8 +484,8 @@ bail:
  *
  * This may be called from interrupt context.
  */
-static int ipath_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
-			      struct ib_recv_wr **bad_wr)
+static int ipath_post_receive(struct ib_qp *ibqp, const struct ib_recv_wr *wr,
+			      const struct ib_recv_wr **bad_wr)
 {
 	struct ipath_qp *qp = to_iqp(ibqp);
 	struct ipath_rwq *wq = qp->r_rq.wq;
@@ -1533,7 +1533,8 @@ static int ipath_query_device(struct ib_device *ibdev, struct ib_device_attr *pr
 	props->max_mr_size = ~0ull;
 	props->max_qp = ib_ipath_max_qps;
 	props->max_qp_wr = ib_ipath_max_qp_wrs;
-	props->max_sge = ib_ipath_max_sges;
+	props->max_send_sge = ib_ipath_max_sges;
+	props->max_recv_sge = ib_ipath_max_sges;
 	props->max_sge_rd = ib_ipath_max_sges;
 	props->max_cq = ib_ipath_max_cqs;
 	props->max_ah = ib_ipath_max_ahs;
@@ -2138,7 +2139,6 @@ int ipath_register_ib_device(struct ipath_devdata *dd)
 	idev->ib_unit = dd->ipath_unit;
 	idev->dd = dd;
 
-	strlcpy(dev->name, "ipath%d", IB_DEVICE_NAME_MAX);
 	dev->owner = THIS_MODULE;
 	dev->node_guid = dd->ipath_guid;
 	dev->uverbs_abi_ver = IPATH_UVERBS_ABI_VERSION;
@@ -2222,7 +2222,7 @@ int ipath_register_ib_device(struct ipath_devdata *dd)
 	snprintf(dev->node_desc, sizeof(dev->node_desc),
 		 IPATH_IDSTR " %s", init_utsname()->nodename);
 
-	ret = ib_register_device(dev, NULL);
+	ret = ib_register_device(dev, "ipath%d", NULL);
 	if (ret)
 		goto err_reg;
 

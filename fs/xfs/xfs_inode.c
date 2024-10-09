@@ -39,6 +39,7 @@
 #include "xfs_ialloc.h"
 #include "xfs_bmap.h"
 #include "xfs_bmap_util.h"
+#include "xfs_errortag.h"
 #include "xfs_error.h"
 #include "xfs_quota.h"
 #include "xfs_filestream.h"
@@ -722,9 +723,8 @@ xfs_ialloc(
 	xfs_inode_t	*pip,
 	umode_t		mode,
 	xfs_nlink_t	nlink,
-	xfs_dev_t	rdev,
+	dev_t		rdev,
 	prid_t		prid,
-	int		okalloc,
 	xfs_buf_t	**ialloc_context,
 	xfs_inode_t	**ipp)
 {
@@ -740,7 +740,7 @@ xfs_ialloc(
 	 * Call the space management code to pick
 	 * the on-disk inode to be allocated.
 	 */
-	error = xfs_dialloc(tp, pip ? pip->i_ino : 0, mode, okalloc,
+	error = xfs_dialloc(tp, pip ? pip->i_ino : 0, mode,
 			    ialloc_context, &ino);
 	if (error)
 		return error;
@@ -774,6 +774,7 @@ xfs_ialloc(
 	set_nlink(inode, nlink);
 	ip->i_d.di_uid = xfs_kuid_to_uid(current_fsuid());
 	ip->i_d.di_gid = xfs_kgid_to_gid(current_fsgid());
+	inode->i_rdev = rdev;
 	xfs_set_projid(ip, prid);
 
 	if (pip && XFS_INHERIT_GID(pip)) {
@@ -821,7 +822,6 @@ xfs_ialloc(
 	case S_IFBLK:
 	case S_IFSOCK:
 		ip->i_d.di_format = XFS_DINODE_FMT_DEV;
-		ip->i_df.if_u2.if_rdev = rdev;
 		ip->i_df.if_flags = 0;
 		flags |= XFS_ILOG_DEV;
 		break;
@@ -871,7 +871,7 @@ xfs_ialloc(
 		ip->i_d.di_format = XFS_DINODE_FMT_EXTENTS;
 		ip->i_df.if_flags = XFS_IFEXTENTS;
 		ip->i_df.if_bytes = ip->i_df.if_real_bytes = 0;
-		ip->i_df.if_u1.if_extents = NULL;
+		ip->i_df.if_u1.if_root = NULL;
 		break;
 	default:
 		ASSERT(0);
@@ -913,9 +913,8 @@ xfs_dir_ialloc(
 					   the inode. */
 	umode_t		mode,
 	xfs_nlink_t	nlink,
-	xfs_dev_t	rdev,
+	dev_t		rdev,
 	prid_t		prid,		/* project id */
-	int		okalloc,	/* ok to allocate new space */
 	xfs_inode_t	**ipp,		/* pointer to inode; it will be
 					   locked. */
 	int		*committed)
@@ -946,8 +945,8 @@ xfs_dir_ialloc(
 	 * transaction commit so that no other process can steal
 	 * the inode(s) that we've just allocated.
 	 */
-	code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid, okalloc,
-			  &ialloc_context, &ip);
+	code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid, &ialloc_context,
+			&ip);
 
 	/*
 	 * Return an error if we were unable to allocate a new inode.
@@ -1019,7 +1018,7 @@ xfs_dir_ialloc(
 		 * this call should always succeed.
 		 */
 		code = xfs_ialloc(tp, dp, mode, nlink, rdev, prid,
-				  okalloc, &ialloc_context, &ip);
+				  &ialloc_context, &ip);
 
 		/*
 		 * If we get an error at this point, return to the caller
@@ -1085,7 +1084,7 @@ xfs_create(
 	xfs_inode_t		*dp,
 	struct xfs_name		*name,
 	umode_t			mode,
-	xfs_dev_t		rdev,
+	dev_t			rdev,
 	xfs_inode_t		**ipp)
 {
 	int			is_dir = S_ISDIR(mode);
@@ -1122,7 +1121,6 @@ xfs_create(
 		return error;
 
 	if (is_dir) {
-		rdev = 0;
 		resblks = XFS_MKDIR_SPACE_RES(mp, name->len);
 		tres = &M_RES(mp)->tr_mkdir;
 	} else {
@@ -1142,11 +1140,6 @@ xfs_create(
 		xfs_flush_inodes(mp);
 		error = xfs_trans_alloc(mp, tres, resblks, 0, 0, &tp);
 	}
-	if (error == -ENOSPC) {
-		/* No space at all so try a "no-allocation" reservation */
-		resblks = 0;
-		error = xfs_trans_alloc(mp, tres, 0, 0, 0, &tp);
-	}
 	if (error)
 		goto out_release_inode;
 
@@ -1164,19 +1157,13 @@ xfs_create(
 	if (error)
 		goto out_trans_cancel;
 
-	if (!resblks) {
-		error = xfs_dir_canenter(tp, dp, name);
-		if (error)
-			goto out_trans_cancel;
-	}
-
 	/*
 	 * A newly created regular or special file just has one directory
 	 * entry pointing to them, but a directory also the "." entry
 	 * pointing to itself.
 	 */
-	error = xfs_dir_ialloc(&tp, dp, mode, is_dir ? 2 : 1, rdev,
-			       prid, resblks > 0, &ip, NULL);
+	error = xfs_dir_ialloc(&tp, dp, mode, is_dir ? 2 : 1, rdev, prid, &ip,
+			NULL);
 	if (error)
 		goto out_trans_cancel;
 
@@ -1225,7 +1212,7 @@ xfs_create(
 	 */
 	xfs_qm_vop_create_dqattach(tp, ip, udqp, gdqp, pdqp);
 
-	error = xfs_defer_finish(&tp, &dfops, NULL);
+	error = xfs_defer_finish(&tp, &dfops);
 	if (error)
 		goto out_bmap_cancel;
 
@@ -1301,11 +1288,6 @@ xfs_create_tmpfile(
 	tres = &M_RES(mp)->tr_create_tmpfile;
 
 	error = xfs_trans_alloc(mp, tres, resblks, 0, 0, &tp);
-	if (error == -ENOSPC) {
-		/* No space at all so try a "no-allocation" reservation */
-		resblks = 0;
-		error = xfs_trans_alloc(mp, tres, 0, 0, 0, &tp);
-	}
 	if (error)
 		goto out_release_inode;
 
@@ -1314,8 +1296,7 @@ xfs_create_tmpfile(
 	if (error)
 		goto out_trans_cancel;
 
-	error = xfs_dir_ialloc(&tp, dp, mode, 1, 0,
-				prid, resblks > 0, &ip, NULL);
+	error = xfs_dir_ialloc(&tp, dp, mode, 1, 0, prid, &ip, NULL);
 	if (error)
 		goto out_trans_cancel;
 
@@ -1454,7 +1435,7 @@ xfs_link(
 	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
 		xfs_trans_set_sync(tp);
 
-	error = xfs_defer_finish(&tp, &dfops, NULL);
+	error = xfs_defer_finish(&tp, &dfops);
 	if (error) {
 		xfs_defer_cancel(&dfops);
 		goto error_return;
@@ -1548,7 +1529,7 @@ xfs_itruncate_extents(
 		 * Duplicate the transaction that has the permanent
 		 * reservation and commit the old transaction.
 		 */
-		error = xfs_defer_finish(&tp, &dfops, ip);
+		error = xfs_defer_finish(&tp, &dfops);
 		if (error)
 			goto out_bmap_cancel;
 
@@ -1781,7 +1762,7 @@ xfs_inactive_ifree(
 	 * Just ignore errors at this point.  There is nothing we can do except
 	 * to try to keep going. Make sure it's not a silent error.
 	 */
-	error = xfs_defer_finish(&tp, &dfops, NULL);
+	error = xfs_defer_finish(&tp, &dfops);
 	if (error) {
 		xfs_notice(mp, "%s: xfs_defer_finish returned error %d",
 			__func__, error);
@@ -2598,7 +2579,7 @@ xfs_remove(
 	if (mp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
 		xfs_trans_set_sync(tp);
 
-	error = xfs_defer_finish(&tp, &dfops, NULL);
+	error = xfs_defer_finish(&tp, &dfops);
 	if (error)
 		goto out_bmap_cancel;
 
@@ -2684,7 +2665,7 @@ xfs_finish_rename(
 	if (tp->t_mountp->m_flags & (XFS_MOUNT_WSYNC|XFS_MOUNT_DIRSYNC))
 		xfs_trans_set_sync(tp);
 
-	error = xfs_defer_finish(&tp, dfops, NULL);
+	error = xfs_defer_finish(&tp, dfops);
 	if (error) {
 		xfs_defer_cancel(dfops);
 		xfs_trans_cancel(tp);

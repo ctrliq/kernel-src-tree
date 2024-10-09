@@ -187,6 +187,7 @@ encode_fattr(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp,
 	*p++ = htonl((u32) stat->ino);
 	*p++ = htonl((u32) stat->atime.tv_sec);
 	*p++ = htonl(stat->atime.tv_nsec ? stat->atime.tv_nsec / 1000 : 0);
+	time = stat->mtime;
 	lease_get_mtime(dentry->d_inode, &time); 
 	*p++ = htonl((u32) time.tv_sec);
 	*p++ = htonl(time.tv_nsec ? time.tv_nsec / 1000 : 0); 
@@ -281,7 +282,6 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 {
 	unsigned int len, hdr, dlen;
 	struct kvec *head = rqstp->rq_arg.head;
-	int v;
 
 	p = decode_fh(p, &args->fh);
 	if (!p)
@@ -317,17 +317,8 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 	if (dlen < XDR_QUADLEN(len)*4)
 		return 0;
 
-	rqstp->rq_vec[0].iov_base = (void*)p;
-	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
-	v = 0;
-	while (len > rqstp->rq_vec[v].iov_len) {
-		len -= rqstp->rq_vec[v].iov_len;
-		v++;
-		rqstp->rq_vec[v].iov_base = page_address(rqstp->rq_pages[v]);
-		rqstp->rq_vec[v].iov_len = PAGE_SIZE;
-	}
-	rqstp->rq_vec[v].iov_len = len;
-	args->vlen = v + 1;
+	args->first.iov_base = (void *)p;
+	args->first.iov_len = head->iov_len - hdr;
 	return 1;
 }
 

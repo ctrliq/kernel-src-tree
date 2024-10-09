@@ -190,7 +190,12 @@ struct bio_integrity_payload {
 	unsigned short		bip_slab;	/* slab the bip came from */
 	unsigned short		bip_vcnt;	/* # of integrity bio_vecs */
 	unsigned short		bip_idx;	/* current bip_vec index */
+#ifdef __GENKSYMS__
 	unsigned		bip_owns_buf:1;	/* should free bip_buf */
+#else
+	unsigned		bip_owns_buf:1;	/* should free bip_buf */
+	unsigned		saved_bi_idx:16;/* for rewind bio */
+#endif
 
 	struct work_struct	bip_work;	/* I/O completion */
 

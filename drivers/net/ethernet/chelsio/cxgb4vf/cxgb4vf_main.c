@@ -239,6 +239,73 @@ void t4vf_os_portmod_changed(struct adapter *adapter, int pidx)
 			 "inserted\n", dev->name, pi->mod_type);
 }
 
+static int cxgb4vf_set_addr_hash(struct port_info *pi)
+{
+	struct adapter *adapter = pi->adapter;
+	u64 vec = 0;
+	bool ucast = false;
+	struct hash_mac_addr *entry;
+
+	/* Calculate the hash vector for the updated list and program it */
+	list_for_each_entry(entry, &adapter->mac_hlist, list) {
+		ucast |= is_unicast_ether_addr(entry->addr);
+		vec |= (1ULL << hash_mac_addr(entry->addr));
+	}
+	return t4vf_set_addr_hash(adapter, pi->viid, ucast, vec, false);
+}
+
+/**
+ *	cxgb4vf_change_mac - Update match filter for a MAC address.
+ *	@pi: the port_info
+ *	@viid: the VI id
+ *	@tcam_idx: TCAM index of existing filter for old value of MAC address,
+ *		   or -1
+ *	@addr: the new MAC address value
+ *	@persist: whether a new MAC allocation should be persistent
+ *	@add_smt: if true also add the address to the HW SMT
+ *
+ *	Modifies an MPS filter and sets it to the new MAC address if
+ *	@tcam_idx >= 0, or adds the MAC address to a new filter if
+ *	@tcam_idx < 0. In the latter case the address is added persistently
+ *	if @persist is %true.
+ *	Addresses are programmed to hash region, if tcam runs out of entries.
+ *
+ */
+static int cxgb4vf_change_mac(struct port_info *pi, unsigned int viid,
+			      int *tcam_idx, const u8 *addr, bool persistent)
+{
+	struct hash_mac_addr *new_entry, *entry;
+	struct adapter *adapter = pi->adapter;
+	int ret;
+
+	ret = t4vf_change_mac(adapter, viid, *tcam_idx, addr, persistent);
+	/* We ran out of TCAM entries. try programming hash region. */
+	if (ret == -ENOMEM) {
+		/* If the MAC address to be updated is in the hash addr
+		 * list, update it from the list
+		 */
+		list_for_each_entry(entry, &adapter->mac_hlist, list) {
+			if (entry->iface_mac) {
+				ether_addr_copy(entry->addr, addr);
+				goto set_hash;
+			}
+		}
+		new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+		if (!new_entry)
+			return -ENOMEM;
+		ether_addr_copy(new_entry->addr, addr);
+		new_entry->iface_mac = true;
+		list_add_tail(&new_entry->list, &adapter->mac_hlist);
+set_hash:
+		ret = cxgb4vf_set_addr_hash(pi);
+	} else if (ret >= 0) {
+		*tcam_idx = ret;
+		ret = 0;
+	}
+
+	return ret;
+}
+
 /*
  * Net device operations.
  * ======================
@@ -262,14 +329,10 @@ static int link_start(struct net_device *dev)
 	 */
 	ret = t4vf_set_rxmode(pi->adapter, pi->viid, dev->mtu, -1, -1, -1, 1,
 			      true);
-	if (ret == 0) {
-		ret = t4vf_change_mac(pi->adapter, pi->viid,
-				      pi->xact_addr_filt, dev->dev_addr, true);
-		if (ret >= 0) {
-			pi->xact_addr_filt = ret;
-			ret = 0;
-		}
-	}
+	if (ret == 0)
+		ret = cxgb4vf_change_mac(pi, pi->viid,
+					 &pi->xact_addr_filt,
+					 dev->dev_addr, true);
 
 	/*
 	 * We don't need to actually "start the link" itself since the
@@ -870,21 +933,6 @@ static struct net_device_stats *cxgb4vf_get_stats(struct net_device *dev)
 	return ns;
 }
 
-static inline int cxgb4vf_set_addr_hash(struct port_info *pi)
-{
-	struct adapter *adapter = pi->adapter;
-	u64 vec = 0;
-	bool ucast = false;
-	struct hash_mac_addr *entry;
-
-	/* Calculate the hash vector for the updated list and program it */
-	list_for_each_entry(entry, &adapter->mac_hlist, list) {
-		ucast |= is_unicast_ether_addr(entry->addr);
-		vec |= (1ULL << hash_mac_addr(entry->addr));
-	}
-	return t4vf_set_addr_hash(adapter, pi->viid, ucast, vec, false);
-}
-
 static int cxgb4vf_mac_sync(struct net_device *netdev, const u8 *mac_addr)
 {
 	struct port_info *pi = netdev_priv(netdev);
@@ -1119,10 +1167,6 @@ static int cxgb4vf_change_mtu(struct net_device *dev, int new_mtu)
 	int ret;
 	struct port_info *pi = netdev_priv(dev);
 
-	/* accommodate SACK */
-	if (new_mtu < 81)
-		return -EINVAL;
-
 	ret = t4vf_set_rxmode(pi->adapter, pi->viid, new_mtu,
 			      -1, -1, -1, -1, true);
 	if (!ret)
@@ -1170,13 +1214,12 @@ static int cxgb4vf_set_mac_addr(struct net_device *dev, void *_addr)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	ret = t4vf_change_mac(pi->adapter, pi->viid, pi->xact_addr_filt,
-			      addr->sa_data, true);
+	ret = cxgb4vf_change_mac(pi, pi->viid, &pi->xact_addr_filt,
+				 addr->sa_data, true);
 	if (ret < 0)
 		return ret;
 
 	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
-	pi->xact_addr_filt = ret;
 	return 0;
 }
 
@@ -2343,19 +2386,7 @@ static int resources_show(struct seq_file *seq, void *v)
 
 	return 0;
 }
-
-static int resources_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, resources_show, inode->i_private);
-}
-
-static const struct file_operations resources_proc_fops = {
-	.owner   = THIS_MODULE,
-	.open    = resources_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-};
+DEFINE_SHOW_ATTRIBUTE(resources);
 
 /*
  * Show Virtual Interfaces.
@@ -2436,11 +2467,11 @@ struct cxgb4vf_debugfs_entry {
 };
 
 static struct cxgb4vf_debugfs_entry debugfs_files[] = {
-	{ "mboxlog",    S_IRUGO, &mboxlog_fops },
-	{ "sge_qinfo",  S_IRUGO, &sge_qinfo_debugfs_fops },
-	{ "sge_qstats", S_IRUGO, &sge_qstats_proc_fops },
-	{ "resources",  S_IRUGO, &resources_proc_fops },
-	{ "interfaces", S_IRUGO, &interfaces_proc_fops },
+	{ "mboxlog",    0444, &mboxlog_fops },
+	{ "sge_qinfo",  0444, &sge_qinfo_debugfs_fops },
+	{ "sge_qstats", 0444, &sge_qstats_proc_fops },
+	{ "resources",  0444, &resources_fops },
+	{ "interfaces", 0444, &interfaces_proc_fops },
 };
 
 /*
@@ -2893,12 +2924,12 @@ static const struct net_device_ops cxgb4vf_netdev_ops	= {
 	.ndo_set_mac_address	= cxgb4vf_set_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_do_ioctl		= cxgb4vf_do_ioctl,
-	.ndo_change_mtu_rh74	= cxgb4vf_change_mtu,
 	.ndo_fix_features	= cxgb4vf_fix_features,
 	.ndo_set_features	= cxgb4vf_set_features,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= cxgb4vf_poll_controller,
 #endif
+	.extended.ndo_change_mtu	= cxgb4vf_change_mtu,
 };
 
 /*
@@ -3114,6 +3145,8 @@ static int cxgb4vf_pci_probe(struct pci_dev *pdev,
 		netdev->vlan_features = netdev->features & VLAN_FEAT;
 
 		netdev->priv_flags |= IFF_UNICAST_FLT;
+		netdev->extended->min_mtu = 81;
+		netdev->extended->max_mtu = ETH_MAX_MTU;
 
 		netdev->netdev_ops = &cxgb4vf_netdev_ops;
 		SET_ETHTOOL_OPS(netdev, &cxgb4vf_ethtool_ops);

@@ -53,30 +53,25 @@ enum hrtimer_restart {
  *
  * 0x00		inactive
  * 0x01		enqueued into rbtree
- * 0x02		callback function running
- * 0x04		timer is migrated to another cpu
  *
- * Special cases:
- * 0x03		callback function running and enqueued
- *		(was requeued on another CPU)
- * 0x05		timer was migrated on CPU hotunplug
+ * The callback state is not part of the timer->state because clearing it would
+ * mean touching the timer after the callback, this makes it impossible to free
+ * the timer from the callback function.
  *
- * The "callback function running and enqueued" status is only possible on
- * SMP. It happens for example when a posix timer expired and the callback
+ * Therefore we track the callback state in:
+ *
+ *	timer->base->cpu_base->running == timer
+ *
+ * On SMP it is possible to have a "callback function running and enqueued"
+ * status. It happens for example when a posix timer expired and the callback
  * queued a signal. Between dropping the lock which protects the posix timer
  * and reacquiring the base lock of the hrtimer, another CPU can deliver the
- * signal and rearm the timer. We have to preserve the callback running state,
- * as otherwise the timer could be removed before the softirq code finishes the
- * the handling of the timer.
- *
- * The HRTIMER_STATE_ENQUEUED bit is always or'ed to the current state
- * to preserve the HRTIMER_STATE_CALLBACK in the above scenario.
+ * signal and rearm the timer.
  *
  * All state transitions are protected by cpu_base->lock.
  */
 #define HRTIMER_STATE_INACTIVE	0x00
 #define HRTIMER_STATE_ENQUEUED	0x01
-#define HRTIMER_STATE_CALLBACK	0x02
 
 /**
  * struct hrtimer - the basic hrtimer structure
@@ -177,6 +172,13 @@ enum  hrtimer_base_type {
  * @in_hrtirq:		hrtimer_interrupt() is currently executing
  * @migration_enabled: The migration of hrtimers to other cpus is enabled
  * @nohz_active:	The nohz functionality is enabled
+ * @next_timer:		Pointer to the first expiring timer
+ * @seq:		seqcount around __run_hrtimer
+ * @running:		pointer to the currently running hrtimer
+ *
+ * Note: next_timer is just an optimization for __remove_hrtimer().
+ *      Do not dereference the pointer because it is not reliable on
+ *      cross cpu removals.
  */
 struct hrtimer_cpu_base {
 	raw_spinlock_t			lock;
@@ -196,6 +198,9 @@ struct hrtimer_cpu_base {
 	RH_KABI_EXTEND(int in_hrtirq)
 	RH_KABI_EXTEND(bool migration_enabled)
 	RH_KABI_EXTEND(bool nohz_active)
+	RH_KABI_EXTEND(struct hrtimer *next_timer)
+	RH_KABI_EXTEND(seqcount_t seq)
+	RH_KABI_EXTEND(struct hrtimer *running)
 };
 
 static inline void hrtimer_set_expires(struct hrtimer *timer, ktime_t time)
@@ -371,15 +376,7 @@ extern int hrtimer_get_res(const clockid_t which_clock, struct timespec *tp);
 
 extern u64 hrtimer_get_next_event(void);
 
-/*
- * A timer is active, when it is enqueued into the rbtree or the
- * callback function is running or it's in the state of being migrated
- * to another cpu.
- */
-static inline int hrtimer_active(const struct hrtimer *timer)
-{
-	return timer->state != HRTIMER_STATE_INACTIVE;
-}
+extern bool hrtimer_active(const struct hrtimer *timer);
 
 /*
  * Helper function to check, whether the timer is on one of the queues
@@ -395,7 +392,7 @@ static inline int hrtimer_is_queued(struct hrtimer *timer)
  */
 static inline int hrtimer_callback_running(struct hrtimer *timer)
 {
-	return timer->state & HRTIMER_STATE_CALLBACK;
+	return timer->base->cpu_base->running == timer;
 }
 
 /* Forward a hrtimer so it expires after now: */

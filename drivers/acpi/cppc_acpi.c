@@ -978,8 +978,8 @@ int cppc_get_perf_caps(int cpunum, struct cppc_perf_caps *perf_caps)
 {
 	struct cpc_desc *cpc_desc = per_cpu(cpc_desc_ptr, cpunum);
 	struct cpc_register_resource *highest_reg, *lowest_reg,
-		*lowest_non_linear_reg, *nominal_reg;
-	u64 high, low, nom, min_nonlinear;
+		*lowest_non_linear_reg, *nominal_reg, *guaranteed_reg;
+	u64 high, low, guaranteed, nom, min_nonlinear;
 	int ret = 0, regs_in_pcc = 0;
 
 	if (!cpc_desc) {
@@ -991,6 +991,7 @@ int cppc_get_perf_caps(int cpunum, struct cppc_perf_caps *perf_caps)
 	lowest_reg = &cpc_desc->cpc_regs[LOWEST_PERF];
 	lowest_non_linear_reg = &cpc_desc->cpc_regs[LOW_NON_LINEAR_PERF];
 	nominal_reg = &cpc_desc->cpc_regs[NOMINAL_PERF];
+	guaranteed_reg = &cpc_desc->cpc_regs[GUARANTEED_PERF];
 
 	/* Are any of the regs PCC ?*/
 	if (CPC_IN_PCC(highest_reg) || CPC_IN_PCC(lowest_reg) ||
@@ -1012,6 +1013,14 @@ int cppc_get_perf_caps(int cpunum, struct cppc_perf_caps *perf_caps)
 
 	cpc_read(cpunum, nominal_reg, &nom);
 	perf_caps->nominal_perf = nom;
+
+	if (guaranteed_reg->type != ACPI_TYPE_BUFFER  ||
+	    IS_NULL_REG(&guaranteed_reg->cpc_entry.reg)) {
+		perf_caps->guaranteed_perf = 0;
+	} else {
+		cpc_read(cpunum, guaranteed_reg, &guaranteed);
+		perf_caps->guaranteed_perf = guaranteed;
+	}
 
 	cpc_read(cpunum, lowest_non_linear_reg, &min_nonlinear);
 	perf_caps->lowest_nonlinear_perf = min_nonlinear;

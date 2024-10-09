@@ -25,6 +25,7 @@
 #include "parse-events.h"
 #include <subcmd/parse-options.h>
 
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -1777,6 +1778,22 @@ bool perf_evlist__exclude_kernel(struct perf_evlist *evlist)
 	}
 
 	return true;
+}
+
+struct perf_evsel *
+perf_evlist__find_evsel_by_str(struct perf_evlist *evlist,
+			       const char *str)
+{
+	struct perf_evsel *evsel;
+
+	evlist__for_each_entry(evlist, evsel) {
+		if (!evsel->name)
+			continue;
+		if (strcmp(str, evsel->name) == 0)
+			return evsel;
+	}
+
+	return NULL;
 }
 
 /*

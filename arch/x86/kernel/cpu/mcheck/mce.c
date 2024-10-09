@@ -537,7 +537,7 @@ static void mce_report_event(struct pt_regs *regs)
  * be somewhat complicated (e.g. segment offset would require an instruction
  * parser). So only support physical addresses up to page granuality for now.
  */
-static int mce_usable_address(struct mce *m)
+int mce_usable_address(struct mce *m)
 {
 	if (!(m->status & MCI_STATUS_MISCV) || !(m->status & MCI_STATUS_ADDRV))
 		return 0;
@@ -552,6 +552,7 @@ static int mce_usable_address(struct mce *m)
 		return 0;
 	return 1;
 }
+EXPORT_SYMBOL_GPL(mce_usable_address);
 
 static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
 				void *data)
@@ -668,6 +669,18 @@ bool mce_is_memory_error(struct mce *m)
 	return false;
 }
 EXPORT_SYMBOL_GPL(mce_is_memory_error);
+
+bool mce_is_correctable(struct mce *m)
+{
+	if (m->cpuvendor == X86_VENDOR_AMD && m->status & MCI_STATUS_DEFERRED)
+		return false;
+
+	if (m->status & MCI_STATUS_UC)
+		return false;
+
+	return true;
+}
+EXPORT_SYMBOL_GPL(mce_is_correctable);
 
 DEFINE_PER_CPU(unsigned, mce_poll_count);
 
@@ -1447,13 +1460,12 @@ EXPORT_SYMBOL_GPL(mce_notify_irq);
 static int __mcheck_cpu_mce_banks_init(void)
 {
 	int i;
-	u8 num_banks = mca_cfg.banks;
 
-	mce_banks = kzalloc(num_banks * sizeof(struct mce_bank), GFP_KERNEL);
+	mce_banks = kzalloc(MAX_NR_BANKS * sizeof(struct mce_bank), GFP_KERNEL);
 	if (!mce_banks)
 		return -ENOMEM;
 
-	for (i = 0; i < num_banks; i++) {
+	for (i = 0; i < MAX_NR_BANKS; i++) {
 		struct mce_bank *b = &mce_banks[i];
 
 		b->ctl = -1ULL;
@@ -1467,28 +1479,19 @@ static int __mcheck_cpu_mce_banks_init(void)
  */
 static int __mcheck_cpu_cap_init(void)
 {
-	unsigned b;
 	u64 cap;
+	u8 b;
 
 	rdmsrl(MSR_IA32_MCG_CAP, cap);
 
 	b = cap & MCG_BANKCNT_MASK;
-	if (!mca_cfg.banks)
-		pr_info("CPU supports %d MCE banks\n", b);
-
-	if (b > MAX_NR_BANKS) {
-		pr_warn("Using only %u machine check banks out of %u\n",
-			MAX_NR_BANKS, b);
+	if (WARN_ON_ONCE(b > MAX_NR_BANKS))
 		b = MAX_NR_BANKS;
-	}
 
-	/* Don't support asymmetric configurations today */
-	WARN_ON(mca_cfg.banks != 0 && b != mca_cfg.banks);
-	mca_cfg.banks = b;
+	mca_cfg.banks = max(mca_cfg.banks, b);
 
 	if (!mce_banks) {
 		int err = __mcheck_cpu_mce_banks_init();
-
 		if (err)
 			return err;
 	}
@@ -2715,6 +2718,8 @@ EXPORT_SYMBOL_GPL(mcsafe_key);
 
 static int __init mcheck_late_init(void)
 {
+	pr_info("Using %d MCE banks\n", mca_cfg.banks);
+
 	if (mca_cfg.recovery)
 		static_key_slow_inc(&mcsafe_key);
 

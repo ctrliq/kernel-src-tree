@@ -150,6 +150,10 @@ static inline bool is_error_page(struct page *page)
 #define KVM_REQ_HV_CRASH          27
 #define KVM_REQ_IOAPIC_EOI_EXIT   28
 #define KVM_REQ_HV_RESET          29
+#define KVM_REQ_HV_EXIT           30
+#define KVM_REQ_HV_STIMER         31
+#define KVM_REQ_LOAD_EOI_EXITMAP  32
+#define KVM_REQ_LOAD_CR3          33
 
 #define KVM_USERSPACE_IRQ_SOURCE_ID		0
 #define KVM_IRQFD_RESAMPLE_IRQ_SOURCE_ID	1
@@ -318,6 +322,11 @@ static inline unsigned long kvm_dirty_bitmap_bytes(struct kvm_memory_slot *memsl
 	return ALIGN(memslot->npages, BITS_PER_LONG) / 8;
 }
 
+struct kvm_hv_sint {
+	u32 vcpu;
+	u32 sint;
+};
+
 struct kvm_kernel_irq_routing_entry {
 	u32 gsi;
 	u32 type;
@@ -330,6 +339,7 @@ struct kvm_kernel_irq_routing_entry {
 			unsigned pin;
 		} irqchip;
 		struct msi_msg msi;
+		struct kvm_hv_sint hv_sint;
 	};
 	struct hlist_node link;
 };
@@ -451,6 +461,8 @@ struct kvm {
 #define vcpu_debug_ratelimited(vcpu, fmt, ...)				\
 	kvm_debug_ratelimited("vcpu%i " fmt, (vcpu)->vcpu_id,           \
 			      ## __VA_ARGS__)
+#define vcpu_err(vcpu, fmt, ...)					\
+	kvm_err("vcpu%i " fmt, (vcpu)->vcpu_id, ## __VA_ARGS__)
 
 static inline struct kvm_vcpu *kvm_get_vcpu(struct kvm *kvm, int i)
 {

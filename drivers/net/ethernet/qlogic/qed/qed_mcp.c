@@ -1070,6 +1070,27 @@ int qed_mcp_load_req(struct qed_hwfn *p_hwfn,
 	return 0;
 }
 
+int qed_mcp_load_done(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+{
+	u32 resp = 0, param = 0;
+	int rc;
+
+	rc = qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_LOAD_DONE, 0, &resp,
+			 &param);
+	if (rc) {
+		DP_NOTICE(p_hwfn,
+			  "Failed to send a LOAD_DONE command, rc = %d\n", rc);
+		return rc;
+	}
+
+	/* Check if there is a DID mismatch between nvm-cfg/efuse */
+	if (param & FW_MB_PARAM_LOAD_DONE_DID_EFUSE_ERROR)
+		DP_NOTICE(p_hwfn,
+			  "warning: device configuration is not supported on this board type. The device may not function as expected.\n");
+
+	return 0;
+}
+
 int qed_mcp_unload_req(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 {
 	struct qed_mcp_mb_params mb_params;
@@ -1653,12 +1674,28 @@ static void qed_mcp_update_stag(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	p_hwfn->mcp_info->func_info.ovlan = (u16)shmem_info.ovlan_stag &
 						 FUNC_MF_CFG_OV_STAG_MASK;
 	p_hwfn->hw_info.ovlan = p_hwfn->mcp_info->func_info.ovlan;
-	if ((p_hwfn->hw_info.hw_mode & BIT(MODE_MF_SD)) &&
-	    (p_hwfn->hw_info.ovlan != QED_MCP_VLAN_UNSET)) {
-		qed_wr(p_hwfn, p_ptt,
-		       NIG_REG_LLH_FUNC_TAG_VALUE, p_hwfn->hw_info.ovlan);
+	if (test_bit(QED_MF_OVLAN_CLSS, &p_hwfn->cdev->mf_bits)) {
+		if (p_hwfn->hw_info.ovlan != QED_MCP_VLAN_UNSET) {
+			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_VALUE,
+			       p_hwfn->hw_info.ovlan);
+			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_EN, 1);
+
+			/* Configure DB to add external vlan to EDPM packets */
+			qed_wr(p_hwfn, p_ptt, DORQ_REG_TAG1_OVRD_MODE, 1);
+			qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_EXT_VID_BB_K2,
+			       p_hwfn->hw_info.ovlan);
+		} else {
+			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_EN, 0);
+			qed_wr(p_hwfn, p_ptt, NIG_REG_LLH_FUNC_TAG_VALUE, 0);
+			qed_wr(p_hwfn, p_ptt, DORQ_REG_TAG1_OVRD_MODE, 0);
+			qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_EXT_VID_BB_K2, 0);
+		}
+
 		qed_sp_pf_update_stag(p_hwfn);
 	}
+
+	DP_VERBOSE(p_hwfn, QED_MSG_SP, "ovlan = %d hw_mode = 0x%x\n",
+		   p_hwfn->mcp_info->func_info.ovlan, p_hwfn->hw_info.hw_mode);
 
 	/* Acknowledge the MFW */
 	qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_S_TAG_UPDATE_ACK, 0,
@@ -1679,7 +1716,9 @@ void qed_mcp_read_ufp_config(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	val = (port_cfg & OEM_CFG_CHANNEL_TYPE_MASK) >>
 		OEM_CFG_CHANNEL_TYPE_OFFSET;
 	if (val != OEM_CFG_CHANNEL_TYPE_STAGGED)
-		DP_NOTICE(p_hwfn, "Incorrect UFP Channel type  %d\n", val);
+		DP_NOTICE(p_hwfn,
+			  "Incorrect UFP Channel type  %d port_id 0x%02x\n",
+			  val, MFW_PORT(p_hwfn));
 
 	val = (port_cfg & OEM_CFG_SCHED_TYPE_MASK) >> OEM_CFG_SCHED_TYPE_OFFSET;
 	if (val == OEM_CFG_SCHED_TYPE_ETS) {
@@ -1688,7 +1727,9 @@ void qed_mcp_read_ufp_config(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 		p_hwfn->ufp_info.mode = QED_UFP_MODE_VNIC_BW;
 	} else {
 		p_hwfn->ufp_info.mode = QED_UFP_MODE_UNKNOWN;
-		DP_NOTICE(p_hwfn, "Unknown UFP scheduling mode %d\n", val);
+		DP_NOTICE(p_hwfn,
+			  "Unknown UFP scheduling mode %d port_id 0x%02x\n",
+			  val, MFW_PORT(p_hwfn));
 	}
 
 	qed_mcp_get_shmem_func(p_hwfn, p_ptt, &shmem_info, MCP_PF_ID(p_hwfn));
@@ -1703,13 +1744,15 @@ void qed_mcp_read_ufp_config(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 		p_hwfn->ufp_info.pri_type = QED_UFP_PRI_OS;
 	} else {
 		p_hwfn->ufp_info.pri_type = QED_UFP_PRI_UNKNOWN;
-		DP_NOTICE(p_hwfn, "Unknown Host priority control %d\n", val);
+		DP_NOTICE(p_hwfn,
+			  "Unknown Host priority control %d port_id 0x%02x\n",
+			  val, MFW_PORT(p_hwfn));
 	}
 
 	DP_NOTICE(p_hwfn,
-		  "UFP shmem config: mode = %d tc = %d pri_type = %d\n",
-		  p_hwfn->ufp_info.mode,
-		  p_hwfn->ufp_info.tc, p_hwfn->ufp_info.pri_type);
+		  "UFP shmem config: mode = %d tc = %d pri_type = %d port_id 0x%02x\n",
+		  p_hwfn->ufp_info.mode, p_hwfn->ufp_info.tc,
+		  p_hwfn->ufp_info.pri_type, MFW_PORT(p_hwfn));
 }
 
 static int
@@ -1941,6 +1984,9 @@ int qed_mcp_get_transceiver_data(struct qed_hwfn *p_hwfn,
 {
 	u32 transceiver_info;
 
+	*p_transceiver_type = ETH_TRANSCEIVER_TYPE_NONE;
+	*p_transceiver_state = ETH_TRANSCEIVER_STATE_UPDATING;
+
 	if (IS_VF(p_hwfn->cdev))
 		return -EINVAL;
 
@@ -1948,9 +1994,6 @@ int qed_mcp_get_transceiver_data(struct qed_hwfn *p_hwfn,
 		DP_NOTICE(p_hwfn, "MFW is not initialized!\n");
 		return -EBUSY;
 	}
-
-	*p_transceiver_type = ETH_TRANSCEIVER_TYPE_NONE;
-	*p_transceiver_state = ETH_TRANSCEIVER_STATE_UPDATING;
 
 	transceiver_info = qed_rd(p_hwfn, p_ptt,
 				  p_hwfn->mcp_info->port_addr +

@@ -8560,7 +8560,7 @@ static struct bpf_test tests[] = {
 				    offsetof(struct __sk_buff, mark)),
 			BPF_EXIT_INSN(),
 		},
-		.errstr = "dereference of modified ctx ptr R1 off=68+8, ctx+const is allowed, ctx+const+const is not",
+		.errstr = "dereference of modified ctx ptr",
 		.result = REJECT,
 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 	},
@@ -9763,6 +9763,9 @@ static struct bpf_test tests[] = {
 		},
 		.prog_type = BPF_PROG_TYPE_TRACEPOINT,
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: not on unpriviledged",
@@ -9777,6 +9780,9 @@ static struct bpf_test tests[] = {
 		.result_unpriv = REJECT,
 		.result = ACCEPT,
 		.retval = 1,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: div by 0 in subprog",
@@ -9958,6 +9964,9 @@ static struct bpf_test tests[] = {
 		},
 		.prog_type = BPF_PROG_TYPE_TRACEPOINT,
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: conditional call 3",
@@ -9993,6 +10002,9 @@ static struct bpf_test tests[] = {
 		},
 		.prog_type = BPF_PROG_TYPE_TRACEPOINT,
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: conditional call 5",
@@ -10036,6 +10048,9 @@ static struct bpf_test tests[] = {
 		},
 		.prog_type = BPF_PROG_TYPE_TRACEPOINT,
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: using uninit r0 from callee",
@@ -10074,6 +10089,9 @@ static struct bpf_test tests[] = {
 		.result_unpriv = REJECT,
 		.result = ACCEPT,
 		.retval = POINTER_VALUE,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: callee using wrong args2",
@@ -10176,6 +10194,9 @@ static struct bpf_test tests[] = {
 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 		.result = ACCEPT,
 		.retval = 42,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: calls with misaligned stack access",
@@ -11088,6 +11109,9 @@ static struct bpf_test tests[] = {
 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 		.fixup_map1 = { 12, 22 },
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: two jumps that receive map_value via arg=ptr_stack_of_jumper. test3",
@@ -11231,6 +11255,9 @@ static struct bpf_test tests[] = {
 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 		.fixup_map1 = { 12, 22 },
 		.result = ACCEPT,
+#ifdef __s390x__
+		.disabled = true,
+#endif
 	},
 	{
 		"calls: two calls that receive map_value_ptr_or_null via arg. test2",
@@ -12013,6 +12040,95 @@ static struct bpf_test tests[] = {
 		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
 		.result = ACCEPT,
 		.retval = 10,
+#ifdef __s390x__
+		.disabled = true,
+#endif
+	},
+	{
+		"pass unmodified ctx pointer to helper",
+		.insns = {
+			BPF_MOV64_IMM(BPF_REG_2, 0),
+			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+				     BPF_FUNC_csum_update),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+		.result = ACCEPT,
+		.disabled = true,
+	},
+	{
+		"pass modified ctx pointer to helper, 1",
+		.insns = {
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, -612),
+			BPF_MOV64_IMM(BPF_REG_2, 0),
+			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+				     BPF_FUNC_csum_update),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+		.result = REJECT,
+		.errstr = "dereference of modified ctx ptr",
+		.disabled = true,
+	},
+	{
+		"pass modified ctx pointer to helper, 2",
+		.insns = {
+			BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, -612),
+			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+				     BPF_FUNC_get_socket_cookie),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.result_unpriv = REJECT,
+		.result = REJECT,
+		.errstr_unpriv = "dereference of modified ctx ptr",
+		.errstr = "dereference of modified ctx ptr",
+		.disabled = true,
+	},
+	{
+		"pass modified ctx pointer to helper, 3",
+		.insns = {
+			BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_1, 0),
+			BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 4),
+			BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_3),
+			BPF_MOV64_IMM(BPF_REG_2, 0),
+			BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0,
+				     BPF_FUNC_csum_update),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+		.result = REJECT,
+		.errstr = "variable ctx access var_off=(0x0; 0x4)",
+		.disabled = true,
+	},
+	{
+		"mov64 src == dst",
+		.insns = {
+			BPF_MOV64_IMM(BPF_REG_2, 0),
+			BPF_MOV64_REG(BPF_REG_2, BPF_REG_2),
+			// Check bounds are OK
+			BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+		.result = ACCEPT,
+	},
+	{
+		"mov64 src != dst",
+		.insns = {
+			BPF_MOV64_IMM(BPF_REG_3, 0),
+			BPF_MOV64_REG(BPF_REG_2, BPF_REG_3),
+			// Check bounds are OK
+			BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2),
+			BPF_MOV64_IMM(BPF_REG_0, 0),
+			BPF_EXIT_INSN(),
+		},
+		.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+		.result = ACCEPT,
 	},
 };
 

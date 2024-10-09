@@ -53,6 +53,10 @@ enum qeth_card_types {
 	QETH_CARD_TYPE_OSX     = 2,
 };
 
+#define IS_OSD(card)	((card)->info.type == QETH_CARD_TYPE_OSD)
+#define IS_OSN(card)	((card)->info.type == QETH_CARD_TYPE_OSN)
+#define IS_VM_NIC(card)	((card)->info.guestlan)
+
 #define QETH_MPC_DIFINFO_LEN_INDICATES_LINK_TYPE 0x18
 /* only the first two bytes are looked at in qeth_get_cardname_short */
 enum qeth_link_types {
@@ -61,6 +65,7 @@ enum qeth_link_types {
 	QETH_LINK_TYPE_GBIT_ETH     = 0x03,
 	QETH_LINK_TYPE_OSN          = 0x04,
 	QETH_LINK_TYPE_10GBIT_ETH   = 0x10,
+	QETH_LINK_TYPE_25GBIT_ETH   = 0x12,
 	QETH_LINK_TYPE_LANE_ETH100  = 0x81,
 	QETH_LINK_TYPE_LANE_TR      = 0x82,
 	QETH_LINK_TYPE_LANE_ETH1000 = 0x83,
@@ -295,6 +300,7 @@ enum qeth_card_info_port_speed {
 	CARD_INFO_PORTS_100M		= 0x00000006,
 	CARD_INFO_PORTS_1G		= 0x00000007,
 	CARD_INFO_PORTS_10G		= 0x00000008,
+	CARD_INFO_PORTS_25G		= 0x0000000A,
 };
 
 /* (SET)DELIP(M) IPA stuff ***************************************************/
@@ -448,17 +454,20 @@ struct qeth_query_switch_attributes {
 	__u8  reserved3[8];
 };
 
+#define QETH_SETADP_FLAGS_VIRTUAL_MAC	0x80	/* for CHANGE_ADDR_READ_MAC */
+
 struct qeth_ipacmd_setadpparms_hdr {
-	__u32 supp_hw_cmds;
-	__u32 reserved1;
-	__u16 cmdlength;
-	__u16 reserved2;
-	__u32 command_code;
-	__u16 return_code;
-	__u8  used_total;
-	__u8  seq_no;
-	__u32 reserved3;
-} __attribute__ ((packed));
+	u32 supp_hw_cmds;
+	u32 reserved1;
+	u16 cmdlength;
+	u16 reserved2;
+	u32 command_code;
+	u16 return_code;
+	u8 used_total;
+	u8 seq_no;
+	u8 flags;
+	u8 reserved3[3];
+};
 
 struct qeth_ipacmd_setadpparms {
 	struct qeth_ipacmd_setadpparms_hdr hdr;

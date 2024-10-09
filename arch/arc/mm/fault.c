@@ -85,7 +85,7 @@ void do_page_fault(struct pt_regs *regs, int write, unsigned long address,
 	 * If we're in an interrupt or have no user
 	 * context, we must not take the fault..
 	 */
-	if (in_atomic() || !mm)
+	if (faulthandler_disabled() || !mm)
 		goto no_context;
 
 retry:

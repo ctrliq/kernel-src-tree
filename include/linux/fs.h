@@ -631,6 +631,10 @@ struct inode {
 	spinlock_t		i_lock;	/* i_blocks, i_bytes, maybe i_size */
 	unsigned short          i_bytes;
 	unsigned int		i_blkbits;
+#if defined(CONFIG_IMA) && (defined(CONFIG_PPC64) || defined(CONFIG_S390))
+	/* 4 bytes hole available on both required architectures */
+	RH_KABI_FILL_HOLE(atomic_t		i_readcount)
+#endif
 	blkcnt_t		i_blocks;
 
 #ifdef __NEED_I_SIZE_ORDERED
@@ -677,7 +681,7 @@ struct inode {
 			struct fsnotify_mark_connector __rcu *i_fsnotify_marks)
 #endif
 
-#ifdef CONFIG_IMA
+#if defined(CONFIG_IMA) && defined(CONFIG_X86_64)
 	atomic_t		i_readcount; /* struct files open RO */
 #endif
 	void			*i_private; /* fs or device private pointer */
@@ -1484,12 +1488,16 @@ struct super_block {
 	struct list_head	s_mounts;	/* list of mounts; _not_ for fs use */
 	/* s_dentry_lru, s_nr_dentry_unused protected by dcache.c lru locks */
 	struct list_head	s_dentry_lru;	/* unused dentry lru */
-	long			s_nr_dentry_unused;	/* # of dentry on lru */
+	RH_KABI_REPLACE_UNSAFE(
+			int	s_nr_dentry_unused,
+			long	s_nr_dentry_unused)	/* # of dentry on lru */
 
 	/* s_inode_lru_lock protects s_inode_lru and s_nr_inodes_unused */
 	spinlock_t		s_inode_lru_lock ____cacheline_aligned_in_smp;
 	struct list_head	s_inode_lru;		/* unused inode lru */
-	long			s_nr_inodes_unused;	/* # of inodes on lru */
+	RH_KABI_REPLACE_UNSAFE(
+			int	s_nr_inodes_unused,
+			long	s_nr_inodes_unused)	/* # of inodes on lru */
 
 	struct block_device	*s_bdev;
 	struct backing_dev_info *s_bdi;
@@ -1557,6 +1565,9 @@ struct super_block {
 
 	RH_KABI_EXTEND(unsigned long	s_iflags)
 	RH_KABI_EXTEND(struct user_namespace *s_user_ns)
+
+	/* Pending fsnotify inode refs */
+	RH_KABI_EXTEND(atomic_long_t s_fsnotify_inode_refs)
 };
 
 extern const unsigned super_block_wrapper_version;
@@ -1729,6 +1740,9 @@ extern int vfs_rmdir(struct inode *, struct dentry *);
 extern int vfs_unlink(struct inode *, struct dentry *, struct inode **);
 extern int vfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *, struct inode **, unsigned int);
 extern int vfs_whiteout(struct inode *, struct dentry *);
+
+extern struct dentry *vfs_tmpfile(struct dentry *dentry, umode_t mode,
+				  int open_flag);
 
 /*
  * VFS dentry helper functions.
@@ -2059,6 +2073,8 @@ struct super_operations {
  * I_OVL_INUSE		Used by overlayfs to get exclusive ownership on upper
  *			and work dirs among overlayfs mounts.
  *
+ * I_CREATING		New object's inode in the middle of setting up.
+ *
  * Q: What is the difference between I_WILL_FREE and I_FREEING?
  */
 #define I_DIRTY_SYNC		(1 << 0)
@@ -2075,7 +2091,8 @@ struct super_operations {
 #define __I_DIO_WAKEUP		9
 #define I_DIO_WAKEUP		(1 << I_DIO_WAKEUP)
 #define I_LINKABLE		(1 << 10)
-#define I_OVL_INUSE		(1 << 11)
+#define I_OVL_INUSE		(1 << 14)
+#define I_CREATING		(1 << 15)
 
 #define I_DIRTY (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES)
 
@@ -2203,7 +2220,8 @@ static inline dop_real_t get_real_dop(struct dentry *dentry)
  * d_real - Return the real dentry
  * @dentry: the dentry to query
  * @inode: inode to select the dentry from multiple layers (can be NULL)
- * @flags: open flags to control copy-up behavior
+ * @open_flags: open flags to control copy-up behavior
+ * @flags: flags to control what is returned by this function
  *
  * If dentry is on an union/overlay, then return the underlying, real dentry.
  * Otherwise return the dentry itself.
@@ -2212,12 +2230,12 @@ static inline dop_real_t get_real_dop(struct dentry *dentry)
  */
 static inline struct dentry *d_real(struct dentry *dentry,
 				    const struct inode *inode,
-				    unsigned int flags)
+				    unsigned int open_flags, unsigned int flags)
 {
 	if (unlikely(dentry->d_flags & DCACHE_OP_REAL)) {
 		dop_real_t d_real_op = get_real_dop(dentry);
 
-		return d_real_op(dentry, inode, flags);
+		return d_real_op(dentry, inode, open_flags, flags);
 	} else {
 		return dentry;
 	}
@@ -2233,12 +2251,12 @@ static inline struct dentry *d_real(struct dentry *dentry,
 static inline struct inode *d_real_inode(const struct dentry *dentry)
 {
 	/* This usage of d_real() results in const dentry */
-	return d_real((struct dentry *) dentry, NULL, 0)->d_inode;
+	return d_real((struct dentry *) dentry, NULL, 0, 0)->d_inode;
 }
 
 static inline struct dentry *file_dentry(const struct file *file)
 {
-	return d_real(file->f_path.dentry, file_inode(file), 0);
+	return d_real(file->f_path.dentry, file_inode(file), 0, 0);
 }
 
 /*
@@ -2906,6 +2924,7 @@ extern void lockdep_annotate_inode_mutex_key(struct inode *inode);
 static inline void lockdep_annotate_inode_mutex_key(struct inode *inode) { };
 #endif
 extern void unlock_new_inode(struct inode *);
+extern void discard_new_inode(struct inode *);
 extern unsigned int get_next_ino(void);
 
 extern void __iget(struct inode * inode);

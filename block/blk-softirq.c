@@ -104,8 +104,8 @@ static struct notifier_block blk_cpu_notifier = {
 
 void __blk_complete_request(struct request *req)
 {
-	int ccpu, cpu;
 	struct request_queue *q = req->q;
+	int cpu, ccpu = q->mq_ops ? req->mq_ctx->cpu : req->cpu;
 	unsigned long flags;
 	bool shared = false;
 
@@ -117,8 +117,7 @@ void __blk_complete_request(struct request *req)
 	/*
 	 * Select completion CPU
 	 */
-	if (req->cpu != -1) {
-		ccpu = req->cpu;
+	if (test_bit(QUEUE_FLAG_SAME_COMP, &q->queue_flags) && ccpu != -1) {
 		if (!test_bit(QUEUE_FLAG_SAME_FORCE, &q->queue_flags))
 			shared = cpus_share_cache(cpu, ccpu);
 	} else

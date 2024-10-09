@@ -2344,10 +2344,12 @@ static struct scsi_cmnd *scsi_reset_alloc_cmd(struct scsi_device *dev)
 		cmd->device = dev;
 		INIT_LIST_HEAD(&cmd->list);
 		INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
-		spin_lock_irqsave(&dev->list_lock, flags);
-		list_add_tail(&cmd->list, &dev->cmd_list);
-		spin_unlock_irqrestore(&dev->list_lock, flags);
 		cmd->jiffies_at_alloc = jiffies;
+		if (shost->use_cmd_list) {
+			spin_lock_irqsave(&dev->list_lock, flags);
+			list_add_tail(&cmd->list, &dev->cmd_list);
+			spin_unlock_irqrestore(&dev->list_lock, flags);
+		}
 	}
 	cmd->request = rq;
 	cmd->cmnd = rq->cmd;
@@ -2358,10 +2360,21 @@ static struct scsi_cmnd *scsi_reset_alloc_cmd(struct scsi_device *dev)
 static void scsi_reset_free_cmd(struct scsi_cmnd *cmd)
 {
 	struct Scsi_Host *shost = cmd->device->host;
+	void *request = cmd->request;
 
-	kfree(cmd->request);
 	if (!shost_use_blk_mq(shost))
 		scsi_next_command(cmd);
+	else {
+		struct scsi_device *dev = cmd->device;
+		unsigned long flags;
+
+		if (shost->use_cmd_list) {
+			spin_lock_irqsave(&dev->list_lock, flags);
+			list_del_init(&cmd->list);
+			spin_unlock_irqrestore(&dev->list_lock, flags);
+		}
+	}
+	kfree(request);
 }
 
 static void

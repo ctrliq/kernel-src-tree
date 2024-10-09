@@ -796,8 +796,8 @@ int ipath_lkey_ok(struct ipath_qp *qp, struct ipath_sge *isge,
 int ipath_rkey_ok(struct ipath_qp *qp, struct ipath_sge_state *ss,
 		  u32 len, u64 vaddr, u32 rkey, int acc);
 
-int ipath_post_srq_receive(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
-			   struct ib_recv_wr **bad_wr);
+int ipath_post_srq_receive(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
+			   const struct ib_recv_wr **bad_wr);
 
 struct ib_srq *ipath_create_srq(struct ib_pd *ibpd,
 				struct ib_srq_init_attr *srq_init_attr,

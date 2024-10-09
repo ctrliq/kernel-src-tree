@@ -34,7 +34,9 @@
 
 #include <linux/spinlock.h>
 #include <linux/preempt.h>
+#include <linux/lockdep.h>
 #include <asm/processor.h>
+#include <linux/compiler.h>
 
 /*
  * Version using sequence counter only.
@@ -44,17 +46,49 @@
  */
 typedef struct seqcount {
 	unsigned sequence;
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map dep_map;
+#endif
 } seqcount_t;
-
-#define SEQCNT_ZERO { 0 }
-#define seqcount_init(x)	do { *(x) = (seqcount_t) SEQCNT_ZERO; } while (0)
-
 
 static inline void __seqcount_init(seqcount_t *s, const char *name,
 					  struct lock_class_key *key)
 {
+	/*
+	 * Make sure we are not reinitializing a held lock:
+	 */
+	lockdep_init_map(&s->dep_map, name, key, 0);
 	s->sequence = 0;
 }
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+# define SEQCOUNT_DEP_MAP_INIT(lockname) \
+		.dep_map = { .name = #lockname } \
+
+# define seqcount_init(s)				\
+	do {						\
+		static struct lock_class_key __key;	\
+		__seqcount_init((s), #s, &__key);	\
+	} while (0)
+
+static inline void seqcount_lockdep_reader_access(const seqcount_t *s)
+{
+	seqcount_t *l = (seqcount_t *)s;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	seqcount_acquire_read(&l->dep_map, 0, 0, _RET_IP_);
+	seqcount_release(&l->dep_map, 1, _RET_IP_);
+	local_irq_restore(flags);
+}
+
+#else
+# define SEQCOUNT_DEP_MAP_INIT(lockname)
+# define seqcount_init(s) __seqcount_init(s, NULL, NULL)
+# define seqcount_lockdep_reader_access(x)
+#endif
+
+#define SEQCNT_ZERO(lockname) { .sequence = 0, SEQCOUNT_DEP_MAP_INIT(lockname)}
 
 /**
  * __read_seqcount_begin - begin a seq-read critical section (without barrier)
@@ -99,6 +133,22 @@ static inline unsigned raw_read_seqcount(const seqcount_t *s)
 }
 
 /**
+ * raw_read_seqcount_begin - start seq-read critical section w/o lockdep
+ * @s: pointer to seqcount_t
+ * Returns: count to be passed to read_seqcount_retry
+ *
+ * raw_read_seqcount_begin opens a read critical section of the given
+ * seqcount, but without any lockdep checking. Validity of the critical
+ * section is tested by checking read_seqcount_retry function.
+ */
+static inline unsigned raw_read_seqcount_begin(const seqcount_t *s)
+{
+	unsigned ret = __read_seqcount_begin(s);
+	smp_rmb();
+	return ret;
+}
+
+/**
  * read_seqcount_begin - begin a seq-read critical section
  * @s: pointer to seqcount_t
  * Returns: count to be passed to read_seqcount_retry
@@ -109,9 +159,8 @@ static inline unsigned raw_read_seqcount(const seqcount_t *s)
  */
 static inline unsigned read_seqcount_begin(const seqcount_t *s)
 {
-	unsigned ret = __read_seqcount_begin(s);
-	smp_rmb();
-	return ret;
+	seqcount_lockdep_reader_access(s);
+	return raw_read_seqcount_begin(s);
 }
 
 /**
@@ -131,6 +180,7 @@ static inline unsigned read_seqcount_begin(const seqcount_t *s)
 static inline unsigned raw_seqcount_begin(const seqcount_t *s)
 {
 	unsigned ret = READ_ONCE(s->sequence);
+
 	smp_rmb();
 	return ret & ~1;
 }
@@ -171,9 +221,88 @@ static inline int read_seqcount_retry(const seqcount_t *s, unsigned start)
 }
 
 
-/*
+static inline int raw_read_seqcount_latch(seqcount_t *s)
+{
+       return lockless_dereference(s->sequence);
+}
+
+/**
  * raw_write_seqcount_latch - redirect readers to even/odd copy
  * @s: pointer to seqcount_t
+ *
+ * The latch technique is a multiversion concurrency control method that allows
+ * queries during non-atomic modifications. If you can guarantee queries never
+ * interrupt the modification -- e.g. the concurrency is strictly between CPUs
+ * -- you most likely do not need this.
+ *
+ * Where the traditional RCU/lockless data structures rely on atomic
+ * modifications to ensure queries observe either the old or the new state the
+ * latch allows the same for non-atomic updates. The trade-off is doubling the
+ * cost of storage; we have to maintain two copies of the entire data
+ * structure.
+ *
+ * Very simply put: we first modify one copy and then the other. This ensures
+ * there is always one copy in a stable state, ready to give us an answer.
+ *
+ * The basic form is a data structure like:
+ *
+ * struct latch_struct {
+ *	seqcount_t		seq;
+ *	struct data_struct	data[2];
+ * };
+ *
+ * Where a modification, which is assumed to be externally serialized, does the
+ * following:
+ *
+ * void latch_modify(struct latch_struct *latch, ...)
+ * {
+ *	smp_wmb();	<- Ensure that the last data[1] update is visible
+ *	latch->seq++;
+ *	smp_wmb();	<- Ensure that the seqcount update is visible
+ *
+ *	modify(latch->data[0], ...);
+ *
+ *	smp_wmb();	<- Ensure that the data[0] update is visible
+ *	latch->seq++;
+ *	smp_wmb();	<- Ensure that the seqcount update is visible
+ *
+ *	modify(latch->data[1], ...);
+ * }
+ *
+ * The query will have a form like:
+ *
+ * struct entry *latch_query(struct latch_struct *latch, ...)
+ * {
+ *	struct entry *entry;
+ *	unsigned seq, idx;
+ *
+ *	do {
+ *		seq = latch->seq;
+ *		smp_rmb();
+ *
+ *		idx = seq & 0x01;
+ *		entry = data_query(latch->data[idx], ...);
+ *
+ *		smp_rmb();
+ *	} while (seq != latch->seq);
+ *
+ *	return entry;
+ * }
+ *
+ * So during the modification, queries are first redirected to data[1]. Then we
+ * modify data[0]. When that is complete, we redirect queries back to data[0]
+ * and we can modify data[1].
+ *
+ * NOTE: The non-requirement for atomic modifications does _NOT_ include
+ *       the publishing of new entries in the case where data is a dynamic
+ *       data structure.
+ *
+ *       An iteration might start in data[0] and get suspended long enough
+ *       to miss an entire modification sequence, once it resumes it might
+ *       observe the new entry.
+ *
+ * NOTE: When data is a dynamic data structure; one should use regular RCU
+ *       patterns to manage the lifetimes of the objects within.
  */
 static inline void raw_write_seqcount_latch(seqcount_t *s)
 {
@@ -182,30 +311,89 @@ static inline void raw_write_seqcount_latch(seqcount_t *s)
        smp_wmb();      /* increment "sequence" before following stores */
 }
 
-/*
- * Sequence counter only version assumes that callers are using their
- * own mutexing.
- */
-static inline void write_seqcount_begin(seqcount_t *s)
+
+static inline void raw_write_seqcount_begin(seqcount_t *s)
 {
 	s->sequence++;
 	smp_wmb();
 }
 
-static inline void write_seqcount_end(seqcount_t *s)
+static inline void raw_write_seqcount_end(seqcount_t *s)
 {
 	smp_wmb();
 	s->sequence++;
 }
 
 /**
- * write_seqcount_barrier - invalidate in-progress read-side seq operations
+ * raw_write_seqcount_barrier - do a seq write barrier
  * @s: pointer to seqcount_t
  *
- * After write_seqcount_barrier, no read-side seq operations will complete
+ * This can be used to provide an ordering guarantee instead of the
+ * usual consistency guarantee. It is one wmb cheaper, because we can
+ * collapse the two back-to-back wmb()s.
+ *
+ *      seqcount_t seq;
+ *      bool X = true, Y = false;
+ *
+ *      void read(void)
+ *      {
+ *              bool x, y;
+ *
+ *              do {
+ *                      int s = read_seqcount_begin(&seq);
+ *
+ *                      x = X; y = Y;
+ *
+ *              } while (read_seqcount_retry(&seq, s));
+ *
+ *              BUG_ON(!x && !y);
+ *      }
+ *
+ *      void write(void)
+ *      {
+ *              Y = true;
+ *
+ *              raw_write_seqcount_barrier(seq);
+ *
+ *              X = false;
+ *      }
+ */
+static inline void raw_write_seqcount_barrier(seqcount_t *s)
+{
+	s->sequence++;
+	smp_wmb();
+	s->sequence++;
+}
+
+/*
+ * Sequence counter only version assumes that callers are using their
+ * own mutexing.
+ */
+static inline void write_seqcount_begin_nested(seqcount_t *s, int subclass)
+{
+	raw_write_seqcount_begin(s);
+	seqcount_acquire(&s->dep_map, subclass, 0, _RET_IP_);
+}
+
+static inline void write_seqcount_begin(seqcount_t *s)
+{
+	write_seqcount_begin_nested(s, 0);
+}
+
+static inline void write_seqcount_end(seqcount_t *s)
+{
+	seqcount_release(&s->dep_map, 1, _RET_IP_);
+	raw_write_seqcount_end(s);
+}
+
+/**
+ * write_seqcount_invalidate - invalidate in-progress read-side seq operations
+ * @s: pointer to seqcount_t
+ *
+ * After write_seqcount_invalidate, no read-side seq operations will complete
  * successfully and see data older than this.
  */
-static inline void write_seqcount_barrier(seqcount_t *s)
+static inline void write_seqcount_invalidate(seqcount_t *s)
 {
 	smp_wmb();
 	s->sequence+=2;
@@ -222,7 +410,7 @@ typedef struct {
  */
 #define __SEQLOCK_UNLOCKED(lockname)			\
 	{						\
-		.seqcount = SEQCNT_ZERO,		\
+		.seqcount = SEQCNT_ZERO(lockname),	\
 		.lock =	__SPIN_LOCK_UNLOCKED(lockname)	\
 	}
 

@@ -793,6 +793,13 @@ static void xs_sock_reset_connection_flags(struct rpc_xprt *xprt)
 	smp_mb__after_atomic();
 }
 
+static void xs_sock_mark_closed(struct rpc_xprt *xprt)
+{
+	xs_sock_reset_connection_flags(xprt);
+	/* Mark transport as closed and wake up all pending tasks */
+	xprt_disconnect_done(xprt);
+}
+
 /**
  * xs_error_report - callback to handle TCP socket state errors
  * @sk: socket
@@ -812,6 +819,9 @@ static void xs_error_report(struct sock *sk)
 	err = -sk->sk_err;
 	if (err == 0)
 		goto out;
+	/* Is this a reset event? */
+	if (sk->sk_state == TCP_CLOSE)
+		xs_sock_mark_closed(xprt);
 	dprintk("RPC:       xs_error_report client %p, error=%d...\n",
 			xprt, -err);
 	trace_rpc_socket_error(xprt, sk->sk_socket, err);
@@ -1623,11 +1633,9 @@ static void xs_tcp_state_change(struct sock *sk)
 		if (test_and_clear_bit(XPRT_SOCK_CONNECTING,
 					&transport->sock_state))
 			xprt_clear_connecting(xprt);
-		clear_bit(XPRT_CLOSING, &xprt->state);
 		if (sk->sk_err)
 			xprt_wake_pending_tasks(xprt, -sk->sk_err);
-		/* Trigger the socket release */
-		xs_tcp_force_close(xprt);
+		xs_sock_mark_closed(xprt);
 	}
  out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -2239,19 +2247,14 @@ static void xs_tcp_shutdown(struct rpc_xprt *xprt)
 {
 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
 	struct socket *sock = transport->sock;
-	int skst = transport->inet ? transport->inet->sk_state : TCP_CLOSE;
 
 	if (sock == NULL)
 		return;
-	switch (skst) {
-	default:
+	if (xprt_connected(xprt)) {
 		kernel_sock_shutdown(sock, SHUT_RDWR);
 		trace_rpc_socket_shutdown(xprt, sock);
-		break;
-	case TCP_CLOSE:
-	case TCP_TIME_WAIT:
+	} else
 		xs_reset_transport(transport);
-	}
 }
 
 static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)

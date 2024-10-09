@@ -14,6 +14,8 @@
 #include <linux/hugetlb.h>		/* hstate_index_to_shift	*/
 #include <linux/prefetch.h>		/* prefetchw			*/
 #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+#include <linux/uaccess.h>		/* faulthandler_disabled()	*/
+#include <linux/efi.h>			/* efi_recover_from_page_fault()*/
 
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
@@ -21,6 +23,7 @@
 #include <asm/kmemcheck.h>		/* kmemcheck_*(), ...		*/
 #include <asm/fixmap.h>			/* VSYSCALL_START		*/
 #include <asm/mmu_context.h>		/* vma_pkey()			*/
+#include <asm/efi.h>			/* efi_recover_from_page_fault()*/
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
@@ -735,6 +738,13 @@ no_context(struct pt_regs *regs, unsigned long error_code,
 		return;
 
 	/*
+	 * Buggy firmware could access regions which might page fault, try to
+	 * recover from such faults.
+	 */
+	if (IS_ENABLED(CONFIG_EFI))
+		efi_recover_from_page_fault(address);
+
+	/*
 	 * Oops. The kernel tried to access some bad page. We'll have to
 	 * terminate things with extreme prejudice:
 	 */
@@ -1207,9 +1217,9 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 
 	/*
 	 * If we're in an interrupt, have no user context or are running
-	 * in an atomic region then we must not take the fault:
+	 * in a region with pagefaults disabled then we must not take the fault
 	 */
-	if (unlikely(in_atomic() || !mm)) {
+	if (unlikely(faulthandler_disabled() || !mm)) {
 		bad_area_nosemaphore(regs, error_code, address, NULL);
 		return;
 	}
@@ -1280,18 +1290,6 @@ retry:
 	if (unlikely(!(vma->vm_flags & VM_GROWSDOWN))) {
 		bad_area(regs, error_code, address);
 		return;
-	}
-	if (error_code & X86_PF_USER) {
-		/*
-		 * Accessing the stack below %sp is always a bug.
-		 * The large cushion allows instructions like enter
-		 * and pusha to work. ("enter $65535, $31" pushes
-		 * 32 pointers and then decrements %sp by 65535.)
-		 */
-		if (unlikely(address + 65536 + 32 * sizeof(unsigned long) < regs->sp)) {
-			bad_area(regs, error_code, address);
-			return;
-		}
 	}
 	if (unlikely(expand_stack(vma, address))) {
 		bad_area(regs, error_code, address);

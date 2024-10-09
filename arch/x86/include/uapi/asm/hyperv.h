@@ -268,8 +268,14 @@
 #define HV_FLUSH_USE_EXTENDED_RANGE_FORMAT	BIT(3)
 
 enum HV_GENERIC_SET_FORMAT {
-	HV_GENERIC_SET_SPARCE_4K,
+	HV_GENERIC_SET_SPARSE_4K,
 	HV_GENERIC_SET_ALL,
+};
+
+struct hv_vpset {
+       __u64 format;
+       __u64 valid_bank_mask;
+       __u64 bank_contents[];
 };
 
 /* hypercall status code */
@@ -292,6 +298,8 @@ typedef struct _HV_REFERENCE_TSC_PAGE {
 #define HV_SYNIC_SINT_COUNT		(16)
 /* Define the expected SynIC version. */
 #define HV_SYNIC_VERSION_1		(0x1)
+/* Valid SynIC vectors are 16-255. */
+#define HV_SYNIC_FIRST_VALID_VECTOR	(16)
 
 #define HV_SYNIC_CONTROL_ENABLE		(1ULL << 0)
 #define HV_SYNIC_SIMP_ENABLE		(1ULL << 0)
@@ -385,5 +393,11 @@ struct hv_timer_message_payload {
 	__u64 expiration_time;	/* When the timer expired */
 	__u64 delivery_time;	/* When the message was delivered */
 };
+
+#define HV_STIMER_ENABLE		(1ULL << 0)
+#define HV_STIMER_PERIODIC		(1ULL << 1)
+#define HV_STIMER_LAZY			(1ULL << 2)
+#define HV_STIMER_AUTOENABLE		(1ULL << 3)
+#define HV_STIMER_SINT(config)		(__u8)(((config) >> 16) & 0x0F)
 
 #endif

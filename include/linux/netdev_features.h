@@ -160,6 +160,10 @@ enum {
 #define NETIF_F_HW_TC		__NETIF_F(HW_TC)
 #define	NETIF_F_RX_UDP_TUNNEL_PORT  __NETIF_F(RX_UDP_TUNNEL_PORT)
 
+/* RHEL-7: stubs for UDP GSO */
+#define NETIF_F_GSO_UDP_L4	0
+#define SKB_GSO_UDP_L4		0
+
 #define for_each_netdev_feature(mask_addr, bit)	\
 	for_each_set_bit(bit, (unsigned long *)mask_addr, NETDEV_FEATURE_COUNT)
 

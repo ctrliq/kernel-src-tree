@@ -40,6 +40,7 @@
 #include <linux/memremap.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/ptrace.h>
+#include <linux/page_idle.h>
 
 #include <asm/tlbflush.h>
 
@@ -553,6 +554,11 @@ void migrate_page_states(struct page *newpage, struct page *page)
 			__set_page_dirty_nobuffers(newpage);
  	}
 
+	if (page_is_young(page))
+		set_page_young(newpage);
+	if (page_is_idle(page))
+		set_page_idle(newpage);
+
 	/*
 	 * Copy NUMA information to the new page, to prevent over-eager
 	 * future migrations of this same page.
@@ -978,6 +984,7 @@ static int unmap_and_move(new_page_t get_new_page, unsigned long private,
 	int rc = 0;
 	int *result = NULL;
 	struct page *newpage = get_new_page(page, private, &result);
+	bool is_lru = !isolated_balloon_page(page);
 
 	if (!newpage)
 		return -ENOMEM;
@@ -1009,9 +1016,12 @@ out:
 	}
 	/*
 	 * Move the new page to the LRU. If migration was not successful
-	 * then this will free the page.
+	 * then this will free the page. Use the old state of the isolated
+	 * source page to determine if we migrated a LRU page. newpage was
+	 * already unlocked and possibly modified by its owner - don't rely
+	 * on the page state.
 	 */
-	if (unlikely(__is_movable_balloon_page(newpage))) {
+	if (rc == MIGRATEPAGE_SUCCESS && unlikely(!is_lru)) {
 		/* drop our reference, page already in the balloon */
 		put_page(newpage);
 	} else {
@@ -1586,7 +1596,7 @@ static bool migrate_balanced_pgdat(struct pglist_data *pgdat,
 		if (!populated_zone(zone))
 			continue;
 
-		if (zone->all_unreclaimable)
+		if (!zone_reclaimable(zone))
 			continue;
 
 		/* Avoid waking kswapd by allocating pages_to_migrate pages. */
@@ -1789,9 +1799,7 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	struct page *new_page = NULL;
 	struct mem_cgroup *memcg = NULL;
 	int page_lru = page_is_file_cache(page);
-	unsigned long mmun_start = address & HPAGE_PMD_MASK;
-	unsigned long mmun_end = mmun_start + HPAGE_PMD_SIZE;
-	pmd_t orig_entry;
+	unsigned long start = address & HPAGE_PMD_MASK;
 
 	/*
 	 * Rate-limit the amount of data that is being migrated to a node.
@@ -1813,9 +1821,6 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 		goto out_fail;
 	}
 
-	if (tlb_flush_pending(mm))
-		flush_tlb_range(vma, mmun_start, mmun_end);
-
 	/* Prepare a page as a migration target */
 	__set_page_locked(new_page);
 	SetPageSwapBacked(new_page);
@@ -1823,16 +1828,15 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
 	/* anon mapping, we can simply copy page->mapping to the new page: */
 	new_page->mapping = page->mapping;
 	new_page->index = page->index;
+	/* flush the cache before copying using the kernel virtual address */
+	flush_cache_range(vma, start, start + HPAGE_PMD_SIZE);
 	migrate_page_copy(new_page, page);
 	WARN_ON(PageLRU(new_page));
 
 	/* Recheck the target PMD */
-	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
 	ptl = pmd_lock(mm, pmd);
-	if (unlikely(!pmd_same(*pmd, entry) || page_count(page) != 2)) {
-fail_putback:
+	if (unlikely(!pmd_same(*pmd, entry) || !page_ref_freeze(page, 2))) {
 		spin_unlock(ptl);
-		mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 
 		/* Reverse changes made by migrate_page_copy() */
 		if (TestClearPageActive(new_page))
@@ -1863,34 +1867,34 @@ fail_putback:
 
 	init_trans_huge_mmu_gather_count(new_page);
 
-	orig_entry = *pmd;
 	entry = mk_pmd(new_page, vma->vm_page_prot);
 	entry = pmd_mkhuge(entry);
 	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
 
 	/*
-	 * Clear the old entry under pagetable lock and establish the new PTE.
-	 * Any parallel GUP will either observe the old page blocking on the
-	 * page lock, block on the page table lock or observe the new page.
-	 * The SetPageUptodate on the new page and page_add_new_anon_rmap
-	 * guarantee the copy is visible before the pagetable update.
+	 * Overwrite the old entry under pagetable lock and establish
+	 * the new PTE. Any parallel GUP will either observe the old
+	 * page blocking on the page lock, block on the page table
+	 * lock or observe the new page. The SetPageUptodate on the
+	 * new page and page_add_new_anon_rmap guarantee the copy is
+	 * visible before the pagetable update.
 	 */
-	flush_cache_range(vma, mmun_start, mmun_end);
-	page_add_new_anon_rmap(new_page, vma, mmun_start);
-	pmdp_clear_flush_notify(vma, mmun_start, pmd);
-	set_pmd_at(mm, mmun_start, pmd, entry);
-	flush_tlb_range(vma, mmun_start, mmun_end);
+	page_add_anon_rmap(new_page, vma, start);
+	/*
+	 * At this point the pmd is numa/protnone (i.e. non present) and the TLB
+	 * has already been flushed globally.  So no TLB can be currently
+	 * caching this non present pmd mapping.  There's no need to clear the
+	 * pmd before doing set_pmd_at(), nor to flush the TLB after
+	 * set_pmd_at().  Clearing the pmd here would introduce a race
+	 * condition against MADV_DONTNEED, because MADV_DONTNEED only holds the
+	 * mmap_sem for reading.  If the pmd is set to NULL at any given time,
+	 * MADV_DONTNEED won't wait on the pmd lock and it'll skip clearing this
+	 * pmd.
+	 */
+	set_pmd_at(mm, start, pmd, entry);
 	update_mmu_cache_pmd(vma, address, &entry);
 
-	if (page_count(page) != 2) {
-		set_pmd_at(mm, mmun_start, pmd, orig_entry);
-		flush_tlb_range(vma, mmun_start, mmun_end);
-		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
-		update_mmu_cache_pmd(vma, address, &entry);
-		page_remove_rmap(new_page);
-		goto fail_putback;
-	}
-
+	page_ref_unfreeze(page, 2);
 	mlock_migrate_page(new_page, page);
 	page_remove_rmap(page);
 
@@ -1901,7 +1905,10 @@ fail_putback:
 	 */
 	mem_cgroup_end_migration(memcg, page, new_page, true);
 	spin_unlock(ptl);
-	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+
+	/* Take an "isolate" reference and put new page on the LRU. */
+	get_page(new_page);
+	putback_lru_page(new_page);
 
 	unlock_page(new_page);
 	unlock_page(page);
@@ -1922,7 +1929,7 @@ out_dropref:
 	ptl = pmd_lock(mm, pmd);
 	if (pmd_same(*pmd, entry)) {
 		entry = pmd_mknonnuma(entry);
-		set_pmd_at(mm, mmun_start, pmd, entry);
+		set_pmd_at(mm, start, pmd, entry);
 		update_mmu_cache_pmd(vma, address, &entry);
 	}
 	spin_unlock(ptl);
@@ -2660,7 +2667,8 @@ int migrate_vma(const struct migrate_vma_ops *ops,
 	/* Sanity check the arguments */
 	start &= PAGE_MASK;
 	end &= PAGE_MASK;
-	if (!vma || is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_SPECIAL))
+	if (!vma || is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_SPECIAL) ||
+			vma_is_dax(vma))
 		return -EINVAL;
 	if (start < vma->vm_start || start >= vma->vm_end)
 		return -EINVAL;

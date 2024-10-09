@@ -2912,7 +2912,6 @@ static int mlx4_xdp(struct net_device *dev, struct netdev_xdp *xdp)
 		return mlx4_xdp_set(dev, xdp->prog);
 	case XDP_QUERY_PROG:
 		xdp->prog_id = mlx4_xdp_query(dev);
-		xdp->prog_attached = !!xdp->prog_id;
 		return 0;
 	default:
 		return -EINVAL;
@@ -3062,6 +3061,10 @@ void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
 
 	if (!mlx4_is_slave(dev))
 		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PKT_STATS);
+
+	if (!mlx4_is_slave(dev))
+		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PHY_STATS);
+	last_i += NUM_PHY_STATS;
 }
 
 struct mlx4_en_bond {
@@ -3488,8 +3491,8 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
 		dev->gso_partial_features = NETIF_F_GSO_UDP_TUNNEL_CSUM;
 	}
 
-	/* MTU range: 46 - hw-specific max */
-	dev->extended->min_mtu = MLX4_EN_MIN_MTU;
+	/* MTU range: 68 - hw-specific max */
+	dev->extended->min_mtu = ETH_MIN_MTU;
 	dev->extended->max_mtu = priv->max_mtu;
 
 	mdev->pndev[port] = dev;

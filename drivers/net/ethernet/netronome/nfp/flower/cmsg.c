@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2015-2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2015-2018 Netronome Systems, Inc. */
 
 #include <linux/bitfield.h>
 #include <linux/netdevice.h>
@@ -237,6 +207,50 @@ nfp_flower_cmsg_portreify_rx(struct nfp_app *app, struct sk_buff *skb)
 }
 
 static void
+nfp_flower_cmsg_merge_hint_rx(struct nfp_app *app, struct sk_buff *skb)
+{
+	unsigned int msg_len = nfp_flower_cmsg_get_data_len(skb);
+	struct nfp_flower_cmsg_merge_hint *msg;
+	struct nfp_fl_payload *sub_flows[2];
+	int err, i, flow_cnt;
+
+	msg = nfp_flower_cmsg_get_data(skb);
+	/* msg->count starts at 0 and always assumes at least 1 entry. */
+	flow_cnt = msg->count + 1;
+
+	if (msg_len < struct_size(msg, flow, flow_cnt)) {
+		nfp_flower_cmsg_warn(app, "Merge hint ctrl msg too short - %d bytes but expect %ld\n",
+				     msg_len, struct_size(msg, flow, flow_cnt));
+		return;
+	}
+
+	if (flow_cnt != 2) {
+		nfp_flower_cmsg_warn(app, "Merge hint contains %d flows - two are expected\n",
+				     flow_cnt);
+		return;
+	}
+
+	rtnl_lock();
+	for (i = 0; i < flow_cnt; i++) {
+		u32 ctx = be32_to_cpu(msg->flow[i].host_ctx);
+
+		sub_flows[i] = nfp_flower_get_fl_payload_from_ctx(app, ctx);
+		if (!sub_flows[i]) {
+			nfp_flower_cmsg_warn(app, "Invalid flow in merge hint\n");
+			goto err_rtnl_unlock;
+		}
+	}
+
+	err = nfp_flower_merge_offloaded_flows(app, sub_flows[0], sub_flows[1]);
+	/* Only warn on memory fail. Hint veto will not break functionality. */
+	if (err == -ENOMEM)
+		nfp_flower_cmsg_warn(app, "Flow merge memory fail.\n");
+
+err_rtnl_unlock:
+	rtnl_unlock();
+}
+
+static void
 nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
 {
 	struct nfp_flower_priv *app_priv = app->priv;
@@ -254,6 +268,12 @@ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
 	case NFP_FLOWER_CMSG_TYPE_PORT_MOD:
 		nfp_flower_cmsg_portmod_rx(app, skb);
 		break;
+	case NFP_FLOWER_CMSG_TYPE_MERGE_HINT:
+		if (app_priv->flower_ext_feats & NFP_FL_FEATS_FLOW_MERGE) {
+			nfp_flower_cmsg_merge_hint_rx(app, skb);
+			break;
+		}
+		goto err_default;
 	case NFP_FLOWER_CMSG_TYPE_NO_NEIGH:
 		nfp_tunnel_request_route(app, skb);
 		break;
@@ -267,6 +287,7 @@ nfp_flower_cmsg_process_one_rx(struct nfp_app *app, struct sk_buff *skb)
 		}
 		/* fall through */
 	default:
+err_default:
 		nfp_flower_cmsg_warn(app, "Cannot handle invalid repr control type %u\n",
 				     type);
 		goto out;

@@ -335,6 +335,7 @@ static void igc_clean_rx_ring(struct igc_ring *rx_ring)
 	/* Free all the Rx ring sk_buffs */
 	while (i != rx_ring->next_to_alloc) {
 		struct igc_rx_buffer *buffer_info = &rx_ring->rx_buffer_info[i];
+		DEFINE_DMA_ATTRS(attrs);
 
 		/* Invalidate cache lines that may have been written to by
 		 * device so that we avoid corrupting memory.
@@ -346,11 +347,13 @@ static void igc_clean_rx_ring(struct igc_ring *rx_ring)
 					      DMA_FROM_DEVICE);
 
 		/* free resources associated with mapping */
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev,
 				     buffer_info->dma,
 				     igc_rx_pg_size(rx_ring),
 				     DMA_FROM_DEVICE,
-				     IGC_RX_DMA_ATTR);
+				     &attrs);
 		__page_frag_cache_drain(buffer_info->page,
 					buffer_info->pagecnt_bias);
 
@@ -1362,9 +1365,12 @@ static void igc_put_rx_buffer(struct igc_ring *rx_ring,
 		/* We are not reusing the buffer so unmap it and free
 		 * any references we are holding to it
 		 */
+		DEFINE_DMA_ATTRS(attrs);
+		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+		dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
 				     igc_rx_pg_size(rx_ring), DMA_FROM_DEVICE,
-				     IGC_RX_DMA_ATTR);
+				     &attrs);
 		__page_frag_cache_drain(rx_buffer->page,
 					rx_buffer->pagecnt_bias);
 	}
@@ -1543,6 +1549,7 @@ static bool igc_alloc_mapped_page(struct igc_ring *rx_ring,
 {
 	struct page *page = bi->page;
 	dma_addr_t dma;
+	DEFINE_DMA_ATTRS(attrs);
 
 	/* since we are recycling buffers we should seldom need to alloc */
 	if (likely(page))
@@ -1556,10 +1563,12 @@ static bool igc_alloc_mapped_page(struct igc_ring *rx_ring,
 	}
 
 	/* map page for use */
+	dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, &attrs);
+	dma_set_attr(DMA_ATTR_WEAK_ORDERING, &attrs);
 	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
 				 igc_rx_pg_size(rx_ring),
 				 DMA_FROM_DEVICE,
-				 IGC_RX_DMA_ATTR);
+				 &attrs);
 
 	/* if mapping failed free memory back to system since
 	 * there isn't much point in holding memory we can't use
@@ -3293,11 +3302,13 @@ static int igc_poll(struct napi_struct *napi, int budget)
 	if (!clean_complete)
 		return budget;
 
-	/* If not enough Rx work done, exit the polling mode */
-	napi_complete_done(napi, work_done);
-	igc_ring_irq_enable(q_vector);
+	/* Exit the polling mode, but don't re-enable interrupts if stack might
+	 * poll us due to busy-polling
+	 */
+	if (likely(napi_complete_done(napi, work_done)))
+		igc_ring_irq_enable(q_vector);
 
-	return 0;
+	return min(work_done, budget - 1);
 }
 
 /**
@@ -3865,11 +3876,12 @@ static int igc_close(struct net_device *netdev)
 }
 
 static const struct net_device_ops igc_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= igc_open,
 	.ndo_stop		= igc_close,
 	.ndo_start_xmit		= igc_xmit_frame,
 	.ndo_set_mac_address	= igc_set_mac,
-	.ndo_change_mtu		= igc_change_mtu,
+	.extended.ndo_change_mtu = igc_change_mtu,
 	.ndo_get_stats		= igc_get_stats,
 	.ndo_fix_features	= igc_fix_features,
 	.ndo_set_features	= igc_set_features,
@@ -4013,6 +4025,8 @@ static int igc_probe(struct pci_dev *pdev,
 	const struct igc_info *ei = igc_info_tbl[ent->driver_data];
 	int err;
 
+	mark_tech_preview(DRV_SUMMARY, THIS_MODULE);
+
 	err = pci_enable_device_mem(pdev);
 	if (err)
 		return err;
@@ -4107,8 +4121,8 @@ static int igc_probe(struct pci_dev *pdev,
 	netdev->hw_features |= NETIF_F_NTUPLE;
 
 	/* MTU range: 68 - 9216 */
-	netdev->min_mtu = ETH_MIN_MTU;
-	netdev->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
+	netdev->extended->min_mtu = ETH_MIN_MTU;
+	netdev->extended->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
 
 	/* before reading the NVM, reset the controller to put the device in a
 	 * known good starting state

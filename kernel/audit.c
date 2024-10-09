@@ -1603,6 +1603,10 @@ void audit_log_cap(struct audit_buffer *ab, char *prefix, kernel_cap_t *cap)
 
 void audit_log_fcaps(struct audit_buffer *ab, struct audit_names *name)
 {
+	if (name->fcap_ver == -1) {
+		audit_log_format(ab, " cap_fe=? cap_fver=? cap_fp=? cap_fi=?");
+		return;
+	}
 	audit_log_cap(ab, "cap_fp", &name->fcap.permitted);
 	audit_log_cap(ab, "cap_fi", &name->fcap.inheritable);
 	audit_log_format(ab, " cap_fe=%d cap_fver=%x",
@@ -1633,7 +1637,7 @@ static inline int audit_copy_fcaps(struct audit_names *name,
 
 /* Copy inode data into an audit_names. */
 void audit_copy_inode(struct audit_names *name, const struct dentry *dentry,
-		      struct inode *inode)
+		      struct inode *inode, unsigned int flags)
 {
 	name->ino   = inode->i_ino;
 	name->dev   = inode->i_sb->s_dev;
@@ -1642,6 +1646,10 @@ void audit_copy_inode(struct audit_names *name, const struct dentry *dentry,
 	name->gid   = inode->i_gid;
 	name->rdev  = inode->i_rdev;
 	security_inode_getsecid(inode, &name->osid);
+	if (flags & AUDIT_INODE_NOEVAL) {
+		name->fcap_ver = -1;
+		return;
+	}
 	audit_copy_fcaps(name, dentry);
 }
 
@@ -1852,7 +1860,7 @@ void audit_log_link_denied(const char *operation, struct path *link)
 
 	/* Generate AUDIT_PATH record with object. */
 	name->type = AUDIT_TYPE_NORMAL;
-	audit_copy_inode(name, link->dentry, link->dentry->d_inode);
+	audit_copy_inode(name, link->dentry, link->dentry->d_inode, 0);
 	audit_log_name(current->audit_context, name, link, 0, NULL);
 out:
 	kfree(name);

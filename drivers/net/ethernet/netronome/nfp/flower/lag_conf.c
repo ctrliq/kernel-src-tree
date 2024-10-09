@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2018 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2018 Netronome Systems, Inc. */
 
 #include "main.h"
 
@@ -182,6 +152,48 @@ nfp_fl_lag_find_group_for_master_with_lag(struct nfp_fl_lag *lag,
 			return entry;
 
 	return NULL;
+}
+
+int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
+				       struct net_device *master,
+				       struct nfp_fl_pre_lag *pre_act)
+{
+	struct nfp_flower_priv *priv = app->priv;
+	struct nfp_fl_lag_group *group = NULL;
+	__be32 temp_vers;
+
+	mutex_lock(&priv->nfp_lag.lock);
+	group = nfp_fl_lag_find_group_for_master_with_lag(&priv->nfp_lag,
+							  master);
+	if (!group) {
+		mutex_unlock(&priv->nfp_lag.lock);
+		return -ENOENT;
+	}
+
+	pre_act->group_id = cpu_to_be16(group->group_id);
+	temp_vers = cpu_to_be32(priv->nfp_lag.batch_ver <<
+				NFP_FL_PRE_LAG_VER_OFF);
+	memcpy(pre_act->lag_version, &temp_vers, 3);
+	pre_act->instance = group->group_inst;
+	mutex_unlock(&priv->nfp_lag.lock);
+
+	return 0;
+}
+
+int nfp_flower_lag_get_output_id(struct nfp_app *app, struct net_device *master)
+{
+	struct nfp_flower_priv *priv = app->priv;
+	struct nfp_fl_lag_group *group = NULL;
+	int group_id = -ENOENT;
+
+	mutex_lock(&priv->nfp_lag.lock);
+	group = nfp_fl_lag_find_group_for_master_with_lag(&priv->nfp_lag,
+							  master);
+	if (group)
+		group_id = group->group_id;
+	mutex_unlock(&priv->nfp_lag.lock);
+
+	return group_id;
 }
 
 static int
@@ -614,16 +626,12 @@ nfp_fl_lag_changels_event(struct nfp_fl_lag *lag, struct net_device *netdev,
 	schedule_delayed_work(&lag->work, NFP_FL_LAG_DELAY);
 }
 
-static int
-nfp_fl_lag_netdev_event(struct notifier_block *nb, unsigned long event,
-			void *ptr)
+int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
+				struct net_device *netdev,
+				unsigned long event, void *ptr)
 {
-	struct net_device *netdev;
-	struct nfp_fl_lag *lag;
+	struct nfp_fl_lag *lag = &priv->nfp_lag;
 	int err;
-
-	netdev = netdev_notifier_info_to_dev(ptr);
-	lag = container_of(nb, struct nfp_fl_lag, lag_nb);
 
 	switch (event) {
 	case NETDEV_CHANGEUPPER:
@@ -661,8 +669,6 @@ void nfp_flower_lag_init(struct nfp_fl_lag *lag)
 
 	/* 0 is a reserved batch version so increment to first valid value. */
 	nfp_fl_increment_version(lag);
-
-	lag->lag_nb.notifier_call = nfp_fl_lag_netdev_event;
 }
 
 void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag)

@@ -232,7 +232,9 @@ void perf_evsel__init(struct perf_evsel *evsel,
 	evsel->leader	   = evsel;
 	evsel->unit	   = "";
 	evsel->scale	   = 1.0;
+	evsel->max_events  = ULONG_MAX;
 	evsel->evlist	   = NULL;
+	evsel->bpf_fd	   = -1;
 	INIT_LIST_HEAD(&evsel->node);
 	INIT_LIST_HEAD(&evsel->config_terms);
 	perf_evsel__object.init(evsel);
@@ -253,6 +255,22 @@ struct perf_evsel *perf_evsel__new_idx(struct perf_event_attr *attr, int idx)
 	if (!evsel)
 		return NULL;
 	perf_evsel__init(evsel, attr, idx);
+
+	if (perf_evsel__is_bpf_output(evsel)) {
+		evsel->attr.sample_type |= PERF_SAMPLE_RAW;
+		evsel->attr.sample_period = 1;
+	}
+
+	if (perf_evsel__is_clock(evsel)) {
+		/*
+		 * The evsel->unit points to static alias->unit
+		 * so it's ok to use static string in here.
+		 */
+		static const char *unit = "msec";
+
+		evsel->unit = unit;
+		evsel->scale = 1e-6;
+	}
 
 	return evsel;
 }
@@ -721,7 +739,7 @@ perf_evsel__reset_callgraph(struct perf_evsel *evsel,
 }
 
 static void apply_config_terms(struct perf_evsel *evsel,
-			       struct record_opts *opts)
+			       struct record_opts *opts, bool track)
 {
 	struct perf_evsel_config_term *term;
 	struct list_head *config_terms = &evsel->config_terms;
@@ -769,6 +787,9 @@ static void apply_config_terms(struct perf_evsel *evsel,
 		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
 			dump_size = term->val.stack_user;
 			break;
+		case PERF_EVSEL__CONFIG_TERM_MAX_EVENTS:
+			evsel->max_events = term->val.max_events;
+			break;
 		case PERF_EVSEL__CONFIG_TERM_INHERIT:
 			/*
 			 * attr->inherit should has already been set by
@@ -790,6 +811,8 @@ static void apply_config_terms(struct perf_evsel *evsel,
 
 	/* User explicitly set per-event callgraph, clear the old setting and reset. */
 	if ((callgraph_buf != NULL) || (dump_size > 0)) {
+		bool sample_address = false;
+
 
 		/* parse callgraph parameters */
 		if (callgraph_buf != NULL) {
@@ -804,6 +827,8 @@ static void apply_config_terms(struct perf_evsel *evsel,
 					       evsel->name);
 					return;
 				}
+				if (param.record_mode == CALLCHAIN_DWARF)
+					sample_address = true;
 			}
 		}
 		if (dump_size > 0) {
@@ -816,8 +841,14 @@ static void apply_config_terms(struct perf_evsel *evsel,
 			perf_evsel__reset_callgraph(evsel, &callchain_param);
 
 		/* set perf-event callgraph */
-		if (param.enabled)
+		if (param.enabled) {
+			if (sample_address) {
+				perf_evsel__set_sample_bit(evsel, ADDR);
+				perf_evsel__set_sample_bit(evsel, DATA_SRC);
+				evsel->attr.mmap_data = track;
+			}
 			perf_evsel__config_callchain(evsel, opts, &param);
+		}
 	}
 }
 
@@ -1053,7 +1084,7 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts,
 	 * Apply event specific term settings,
 	 * it overloads any global configuration.
 	 */
-	apply_config_terms(evsel, opts);
+	apply_config_terms(evsel, opts, track);
 
 	evsel->ignore_missing_thread = opts->ignore_missing_thread;
 
@@ -1817,6 +1848,20 @@ retry_open:
 			}
 
 			pr_debug2(" = %d\n", fd);
+			if (evsel->bpf_fd >= 0) {
+				int evt_fd = FD(evsel, cpu, thread);
+				int bpf_fd = evsel->bpf_fd;
+
+				err = ioctl(evt_fd,
+					    PERF_EVENT_IOC_SET_BPF,
+					    bpf_fd);
+				if (err && errno != EEXIST) {
+					pr_err("failed to attach bpf fd %d: %s\n",
+					       bpf_fd, strerror(errno));
+					err = -EINVAL;
+					goto out_close;
+				}
+			}
 
 			set_rlimit = NO_CHANGE;
 
@@ -2057,6 +2102,7 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 	data->stream_id = data->id = data->time = -1ULL;
 	data->period = evsel->attr.sample_period;
 	data->cpumode = event->header.misc & PERF_RECORD_MISC_CPUMODE_MASK;
+	data->misc    = event->header.misc;
 	data->id = -1ULL;
 	data->data_src = PERF_MEM_DATA_SRC_NONE;
 
@@ -2176,7 +2222,7 @@ int perf_evsel__parse_sample(struct perf_evsel *evsel, union perf_event *event,
 		}
 	}
 
-	if (type & PERF_SAMPLE_CALLCHAIN) {
+	if (evsel__has_callchain(evsel)) {
 		const u64 max_callchain_nr = UINT64_MAX / sizeof(u64);
 
 		OVERFLOW_CHECK_u64(array);
@@ -2836,7 +2882,7 @@ int perf_evsel__open_strerror(struct perf_evsel *evsel, struct target *target,
 			 "Hint: Try again after reducing the number of events.\n"
 			 "Hint: Try increasing the limit with 'ulimit -n <limit>'");
 	case ENOMEM:
-		if ((evsel->attr.sample_type & PERF_SAMPLE_CALLCHAIN) != 0 &&
+		if (evsel__has_callchain(evsel) &&
 		    access("/proc/sys/kernel/perf_event_max_stack", F_OK) == 0)
 			return scnprintf(msg, size,
 					 "Not enough memory to setup event with callchain.\n"

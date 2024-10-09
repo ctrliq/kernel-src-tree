@@ -585,6 +585,14 @@ void bpf_jit_compile(struct sk_filter *fp)
 	int pass;
 	int flen = fp->len;
 
+	/*
+	 * RHEL7: Disable cBPF jit for Power. It's not supported in
+	 * upstream and nobody cares to maintain it, while it causes
+	 * problems:
+	 * https://bugzilla.redhat.com/show_bug.cgi?id=1700744
+	 */
+	return;
+
 	if (!bpf_jit_enable)
 		return;
 
@@ -688,9 +696,11 @@ void bpf_jit_compile(struct sk_filter *fp)
 
 	if (image) {
 		bpf_flush_icache(code_base, code_base + (proglen/4));
+#ifdef PPC64_ELF_ABI_v1
 		/* Function descriptor nastiness: Address + TOC */
 		((u64 *)image)[0] = (u64)code_base;
 		((u64 *)image)[1] = local_paca->kernel_toc;
+#endif
 		fp->bpf_func = (void *)image;
 	}
 out:

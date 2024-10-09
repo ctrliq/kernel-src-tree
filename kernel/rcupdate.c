@@ -228,15 +228,17 @@ EXPORT_SYMBOL_GPL(rcu_my_thread_group_empty);
 #endif /* #ifdef CONFIG_PROVE_RCU */
 
 #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
-static inline void debug_init_rcu_head(struct rcu_head *head)
+void init_rcu_head(struct rcu_head *head)
 {
 	debug_object_init(head, &rcuhead_debug_descr);
 }
+EXPORT_SYMBOL_GPL(init_rcu_head);
 
-static inline void debug_rcu_head_free(struct rcu_head *head)
+void destroy_rcu_head(struct rcu_head *head)
 {
 	debug_object_free(head, &rcuhead_debug_descr);
 }
+EXPORT_SYMBOL_GPL(destroy_rcu_head);
 
 /*
  * fixup_init is called when:

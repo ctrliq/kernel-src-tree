@@ -177,7 +177,7 @@ void end_buffer_write_sync(struct buffer_head *bh, int uptodate)
 		set_buffer_uptodate(bh);
 	} else {
 		buffer_io_error(bh, ", lost sync page write");
-		set_buffer_write_io_error(bh);
+		mark_buffer_write_io_error(bh);
 		clear_buffer_uptodate(bh);
 	}
 	unlock_buffer(bh);
@@ -353,8 +353,7 @@ void end_buffer_async_write(struct buffer_head *bh, int uptodate)
 		set_buffer_uptodate(bh);
 	} else {
 		buffer_io_error(bh, ", lost async page write");
-		set_bit(AS_EIO, &page->mapping->flags);
-		set_buffer_write_io_error(bh);
+		mark_buffer_write_io_error(bh);
 		clear_buffer_uptodate(bh);
 		SetPageError(page);
 	}
@@ -482,8 +481,6 @@ static void __remove_assoc_queue(struct buffer_head *bh)
 {
 	list_del_init(&bh->b_assoc_buffers);
 	WARN_ON(!bh->b_assoc_map);
-	if (buffer_write_io_error(bh))
-		set_bit(AS_EIO, &bh->b_assoc_map->flags);
 	bh->b_assoc_map = NULL;
 }
 
@@ -1141,6 +1138,17 @@ void mark_buffer_dirty(struct buffer_head *bh)
 	}
 }
 EXPORT_SYMBOL(mark_buffer_dirty);
+
+void mark_buffer_write_io_error(struct buffer_head *bh)
+{
+	set_buffer_write_io_error(bh);
+	/* FIXME: do we need to set this in both places? */
+	if (bh->b_page && bh->b_page->mapping)
+		mapping_set_error(bh->b_page->mapping, -EIO);
+	if (bh->b_assoc_map)
+		mapping_set_error(bh->b_assoc_map, -EIO);
+}
+EXPORT_SYMBOL(mark_buffer_write_io_error);
 
 /*
  * Decrement a buffer_head's reference count.  If all buffers against a page
@@ -2058,6 +2066,43 @@ int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
 }
 EXPORT_SYMBOL(block_write_begin);
 
+int __generic_write_end(struct file *file, struct address_space *mapping,
+			loff_t pos, unsigned len, unsigned copied,
+			struct page *page, void *fsdata)
+{
+	struct inode *inode = mapping->host;
+	loff_t old_size = inode->i_size;
+	int i_size_changed = 0;
+
+	/*
+	 * No need to use i_size_read() here, the i_size
+	 * cannot change under us because we hold i_mutex.
+	 *
+	 * But it's important to update i_size while still holding page lock:
+	 * page writeout could otherwise come in and zero beyond i_size.
+	 */
+	if (pos+copied > inode->i_size) {
+		i_size_write(inode, pos+copied);
+		i_size_changed = 1;
+	}
+
+	unlock_page(page);
+	page_cache_release(page);
+
+	if (old_size < pos)
+		pagecache_isize_extended(inode, old_size, pos);
+	/*
+	 * Don't mark the inode dirty under page lock. First, it unnecessarily
+	 * makes the holding time of page lock longer. Second, it forces lock
+	 * ordering of page lock and transaction start for journaling
+	 * filesystems.
+	 */
+	if (i_size_changed)
+		mark_inode_dirty(inode);
+
+	return copied;
+}
+
 int block_write_end(struct file *file, struct address_space *mapping,
 			loff_t pos, unsigned len, unsigned copied,
 			struct page *page, void *fsdata)
@@ -2098,39 +2143,10 @@ int generic_write_end(struct file *file, struct address_space *mapping,
 			loff_t pos, unsigned len, unsigned copied,
 			struct page *page, void *fsdata)
 {
-	struct inode *inode = mapping->host;
-	loff_t old_size = inode->i_size;
-	int i_size_changed = 0;
-
 	copied = block_write_end(file, mapping, pos, len, copied, page, fsdata);
 
-	/*
-	 * No need to use i_size_read() here, the i_size
-	 * cannot change under us because we hold i_mutex.
-	 *
-	 * But it's important to update i_size while still holding page lock:
-	 * page writeout could otherwise come in and zero beyond i_size.
-	 */
-	if (pos+copied > inode->i_size) {
-		i_size_write(inode, pos+copied);
-		i_size_changed = 1;
-	}
-
-	unlock_page(page);
-	page_cache_release(page);
-
-	if (old_size < pos)
-		pagecache_isize_extended(inode, old_size, pos);
-	/*
-	 * Don't mark the inode dirty under page lock. First, it unnecessarily
-	 * makes the holding time of page lock longer. Second, it forces lock
-	 * ordering of page lock and transaction start for journaling
-	 * filesystems.
-	 */
-	if (i_size_changed)
-		mark_inode_dirty(inode);
-
-	return copied;
+	return __generic_write_end(file, mapping, pos, len, copied, page,
+				   fsdata);
 }
 EXPORT_SYMBOL(generic_write_end);
 
@@ -3222,8 +3238,6 @@ drop_buffers(struct page *page, struct buffer_head **buffers_to_free)
 
 	bh = head;
 	do {
-		if (buffer_write_io_error(bh) && page->mapping)
-			set_bit(AS_EIO, &page->mapping->flags);
 		if (buffer_busy(bh))
 			goto failed;
 		bh = bh->b_this_page;

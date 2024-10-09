@@ -1113,7 +1113,8 @@ static void tcp_adjust_pcount(struct sock *sk, const struct sk_buff *skb, int de
  * packet to the list.  This won't be called frequently, I hope.
  * Remember, these are still headerless SKBs at this point.
  */
-int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+int tcp_fragment(struct sock *sk, enum tcp_queue tcp_queue,
+		 struct sk_buff *skb, u32 len,
 		 unsigned int mss_now)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -1128,6 +1129,13 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
 	nsize = skb_headlen(skb) - len;
 	if (nsize < 0)
 		nsize = 0;
+
+	if (unlikely(((sk->sk_wmem_queued >> 1) > sk->sk_sndbuf &&
+	    tcp_queue != TCP_FRAG_IN_WRITE_QUEUE) ||
+	    skb_queue_len(&sk->sk_write_queue) > 2048)) {
+		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPWQUEUETOOBIG);
+		return -ENOMEM;
+	}
 
 	if (skb_unclone(skb, GFP_ATOMIC))
 		return -ENOMEM;
@@ -1294,8 +1302,7 @@ static inline int __tcp_mtu_to_mss(struct sock *sk, int pmtu)
 	mss_now -= icsk->icsk_ext_hdr_len;
 
 	/* Then reserve room for full set of TCP options and 8 bytes of data */
-	if (mss_now < 48)
-		mss_now = 48;
+	mss_now = max(mss_now, sock_net(sk)->ipv4_sysctl_tcp_min_snd_mss);
 	return mss_now;
 }
 
@@ -1691,7 +1698,8 @@ static int tso_fragment(struct sock *sk, struct sk_buff *skb, unsigned int len,
 
 	/* All of a TSO frame must be composed of paged data.  */
 	if (skb->len != skb->data_len)
-		return tcp_fragment(sk, skb, len, mss_now);
+		return tcp_fragment(sk, TCP_FRAG_IN_WRITE_QUEUE,
+				    skb, len, mss_now);
 
 	buff = sk_stream_alloc_skb(sk, 0, gfp);
 	if (unlikely(buff == NULL))
@@ -1882,6 +1890,7 @@ static int tcp_mtu_probe(struct sock *sk)
 	nskb->ip_summed = skb->ip_summed;
 
 	tcp_insert_write_queue_before(nskb, skb, sk);
+	tcp_highest_sack_replace(sk, skb, nskb);
 
 	len = 0;
 	tcp_for_write_queue_from_safe(skb, next, sk) {
@@ -2189,7 +2198,8 @@ void tcp_send_loss_probe(struct sock *sk)
 		goto rearm_timer;
 
 	if ((pcount > 1) && (skb->len > (pcount - 1) * mss)) {
-		if (unlikely(tcp_fragment(sk, skb, (pcount - 1) * mss, mss)))
+		if (unlikely(tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, skb,
+					  (pcount - 1) * mss, mss)))
 			goto rearm_timer;
 		skb = tcp_write_queue_tail(sk);
 	}
@@ -2389,7 +2399,7 @@ static void tcp_collapse_retrans(struct sock *sk, struct sk_buff *skb)
 
 	BUG_ON(tcp_skb_pcount(skb) != 1 || tcp_skb_pcount(next_skb) != 1);
 
-	tcp_highest_sack_combine(sk, next_skb, skb);
+	tcp_highest_sack_replace(sk, next_skb, skb);
 
 	tcp_unlink_write_queue(next_skb, sk);
 
@@ -2533,7 +2543,8 @@ int __tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
 		return -EAGAIN;
 
 	if (skb->len > cur_mss) {
-		if (tcp_fragment(sk, skb, cur_mss, cur_mss))
+		if (tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, skb,
+				 cur_mss, cur_mss))
 			return -ENOMEM; /* We'll try again later. */
 	} else {
 		int oldpcount = tcp_skb_pcount(skb);
@@ -3142,11 +3153,12 @@ static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPORIGDATASENT);
 		goto done;
 	}
-	syn_data = NULL;
 
 	/* data was not sent, this is our new send_head */
-	sk->sk_send_head = syn_data;
-	tp->packets_out -= tcp_skb_pcount(syn_data);
+	sk->sk_send_head = data;
+	tp->packets_out -= tcp_skb_pcount(data);
+
+	syn_data = NULL;
 
 fallback:
 	/* Send a regular SYN with Fast Open cookie request option */
@@ -3379,7 +3391,8 @@ int tcp_write_wakeup(struct sock *sk)
 		    skb->len > mss) {
 			seg_size = min(seg_size, mss);
 			TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_PSH;
-			if (tcp_fragment(sk, skb, seg_size, mss))
+			if (tcp_fragment(sk, TCP_FRAG_IN_WRITE_QUEUE,
+					 skb, seg_size, mss))
 				return -1;
 		} else if (!tcp_skb_pcount(skb))
 			tcp_set_skb_tso_segs(sk, skb, mss);

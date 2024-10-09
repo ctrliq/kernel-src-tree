@@ -284,6 +284,47 @@ static int aq_ethtool_set_coalesce(struct net_device *ndev,
 	return aq_nic_update_interrupt_moderation_settings(aq_nic);
 }
 
+static void aq_ethtool_get_pauseparam(struct net_device *ndev,
+				      struct ethtool_pauseparam *pause)
+{
+	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+	u32 fc = aq_nic->aq_nic_cfg.flow_control;
+
+	pause->autoneg = 0;
+
+	pause->rx_pause = !!(fc & AQ_NIC_FC_RX);
+	pause->tx_pause = !!(fc & AQ_NIC_FC_TX);
+
+}
+
+static int aq_ethtool_set_pauseparam(struct net_device *ndev,
+				     struct ethtool_pauseparam *pause)
+{
+	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+	int err = 0;
+
+	if (!aq_nic->aq_fw_ops->set_flow_control)
+		return -EOPNOTSUPP;
+
+	if (pause->autoneg == AUTONEG_ENABLE)
+		return -EOPNOTSUPP;
+
+	if (pause->rx_pause)
+		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_RX;
+	else
+		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_RX;
+
+	if (pause->tx_pause)
+		aq_nic->aq_hw->aq_nic_cfg->flow_control |= AQ_NIC_FC_TX;
+	else
+		aq_nic->aq_hw->aq_nic_cfg->flow_control &= ~AQ_NIC_FC_TX;
+
+	err = aq_nic->aq_fw_ops->set_flow_control(aq_nic->aq_hw);
+
+	return err;
+}
+
+
 const struct ethtool_ops aq_ethtool_ops = {
 	.get_link            = aq_ethtool_get_link,
 	.get_regs_len        = aq_ethtool_get_regs_len,
@@ -291,6 +332,8 @@ const struct ethtool_ops aq_ethtool_ops = {
 	.get_drvinfo         = aq_ethtool_get_drvinfo,
 	.get_strings         = aq_ethtool_get_strings,
 	.get_rxfh_indir_size = aq_ethtool_get_rss_indir_size,
+	.get_pauseparam      = aq_ethtool_get_pauseparam,
+	.set_pauseparam      = aq_ethtool_set_pauseparam,
 	.get_rxfh_key_size   = aq_ethtool_get_rss_key_size,
 	.get_rxfh            = aq_ethtool_get_rss,
 	.get_rxnfc           = aq_ethtool_get_rxnfc,

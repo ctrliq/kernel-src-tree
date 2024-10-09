@@ -484,11 +484,12 @@ void __memcg_kmem_commit_charge(struct page *page,
 void __memcg_kmem_uncharge_pages(struct page *page, int order);
 
 int memcg_cache_id(struct mem_cgroup *memcg);
+
+char *memcg_create_cache_name(struct mem_cgroup *memcg,
+			      struct kmem_cache *root_cache);
 int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
 			     struct kmem_cache *root_cache);
 void memcg_free_cache_params(struct kmem_cache *s);
-void memcg_register_cache(struct kmem_cache *s);
-void memcg_unregister_cache(struct kmem_cache *s);
 
 int memcg_update_cache_size(struct kmem_cache *s, int num_groups);
 void memcg_update_array_size(int num_groups);
@@ -634,14 +635,6 @@ static inline int memcg_alloc_cache_params(struct mem_cgroup *memcg,
 }
 
 static inline void memcg_free_cache_params(struct kmem_cache *s)
-{
-}
-
-static inline void memcg_register_cache(struct kmem_cache *s)
-{
-}
-
-static inline void memcg_unregister_cache(struct kmem_cache *s)
 {
 }
 

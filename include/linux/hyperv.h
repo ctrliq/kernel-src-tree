@@ -705,8 +705,9 @@ struct vmbus_channel {
 	u32 ringbuffer_gpadlhandle;
 
 	/* Allocated memory for ring buffer */
-	void *ringbuffer_pages;
+	struct page *ringbuffer_page;
 	u32 ringbuffer_pagecount;
+	u32 ringbuffer_send_offset;
 	struct hv_ring_buffer_info outbound;	/* send to parent */
 	struct hv_ring_buffer_info inbound;	/* receive from parent */
 
@@ -987,6 +988,14 @@ struct vmbus_packet_mpb_array {
 	struct hv_mpb_array range;
 } __packed;
 
+int vmbus_alloc_ring(struct vmbus_channel *channel,
+		     u32 send_size, u32 recv_size);
+void vmbus_free_ring(struct vmbus_channel *channel);
+
+int vmbus_connect_ring(struct vmbus_channel *channel,
+		       void (*onchannel_callback)(void *context),
+		       void *context);
+int vmbus_disconnect_ring(struct vmbus_channel *channel);
 
 extern int vmbus_open(struct vmbus_channel *channel,
 			    u32 send_ringbuffersize,
@@ -1126,8 +1135,9 @@ struct hv_ring_buffer_debug_info {
 	u32 bytes_avail_towrite;
 };
 
-void hv_ringbuffer_get_debuginfo(const struct hv_ring_buffer_info *ring_info,
-			    struct hv_ring_buffer_debug_info *debug_info);
+
+int hv_ringbuffer_get_debuginfo(const struct hv_ring_buffer_info *ring_info,
+				struct hv_ring_buffer_debug_info *debug_info);
 
 /* Vmbus interface */
 #define vmbus_driver_register(driver)	\

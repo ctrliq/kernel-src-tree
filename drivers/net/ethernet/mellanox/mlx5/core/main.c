@@ -53,14 +53,18 @@
 #endif
 #include <net/devlink.h>
 #include "mlx5_core.h"
+#include "lib/eq.h"
 #include "fs_core.h"
 #include "lib/mpfs.h"
 #include "eswitch.h"
 #include "lib/mlx5.h"
 #include "fpga/core.h"
+#include "fpga/ipsec.h"
 #include "accel/ipsec.h"
 #include "accel/tls.h"
 #include "lib/clock.h"
+#include "lib/vxlan.h"
+#include "lib/devcom.h"
 #include "diag/fw_tracer.h"
 
 MODULE_AUTHOR("Eli Cohen <eli@mellanox.com>");
@@ -295,49 +299,6 @@ static int request_bar(struct pci_dev *pdev)
 static void release_bar(struct pci_dev *pdev)
 {
 	pci_release_regions(pdev);
-}
-
-static int mlx5_alloc_irq_vectors(struct mlx5_core_dev *dev)
-{
-	struct mlx5_priv *priv = &dev->priv;
-	struct mlx5_eq_table *table = &priv->eq_table;
-	int num_eqs = 1 << MLX5_CAP_GEN(dev, log_max_eq);
-	int nvec;
-	int err;
-
-	nvec = MLX5_CAP_GEN(dev, num_ports) * num_online_cpus() +
-	       MLX5_EQ_VEC_COMP_BASE;
-	nvec = min_t(int, nvec, num_eqs);
-	if (nvec <= MLX5_EQ_VEC_COMP_BASE)
-		return -ENOMEM;
-
-	priv->irq_info = kcalloc(nvec, sizeof(*priv->irq_info), GFP_KERNEL);
-	if (!priv->irq_info)
-		return -ENOMEM;
-
-	nvec = pci_alloc_irq_vectors(dev->pdev,
-			MLX5_EQ_VEC_COMP_BASE + 1, nvec,
-			PCI_IRQ_MSIX);
-	if (nvec < 0) {
-		err = nvec;
-		goto err_free_irq_info;
-	}
-
-	table->num_comp_vectors = nvec - MLX5_EQ_VEC_COMP_BASE;
-
-	return 0;
-
-err_free_irq_info:
-	kfree(priv->irq_info);
-	return err;
-}
-
-static void mlx5_free_irq_vectors(struct mlx5_core_dev *dev)
-{
-	struct mlx5_priv *priv = &dev->priv;
-
-	pci_free_irq_vectors(dev->pdev);
-	kfree(priv->irq_info);
 }
 
 struct mlx5_reg_host_endianness {
@@ -620,166 +581,6 @@ u64 mlx5_read_internal_timer(struct mlx5_core_dev *dev,
 	return (u64)timer_l | (u64)timer_h1 << 32;
 }
 
-static int mlx5_irq_set_affinity_hint(struct mlx5_core_dev *mdev, int i)
-{
-	struct mlx5_priv *priv  = &mdev->priv;
-	int irq = pci_irq_vector(mdev->pdev, MLX5_EQ_VEC_COMP_BASE + i);
-
-	if (!zalloc_cpumask_var(&priv->irq_info[i].mask, GFP_KERNEL)) {
-		mlx5_core_warn(mdev, "zalloc_cpumask_var failed");
-		return -ENOMEM;
-	}
-
-	cpumask_set_cpu(cpumask_local_spread(i, priv->numa_node),
-			priv->irq_info[i].mask);
-
-	if (IS_ENABLED(CONFIG_SMP) &&
-	    irq_set_affinity_hint(irq, priv->irq_info[i].mask))
-		mlx5_core_warn(mdev, "irq_set_affinity_hint failed, irq 0x%.4x", irq);
-
-	return 0;
-}
-
-static void mlx5_irq_clear_affinity_hint(struct mlx5_core_dev *mdev, int i)
-{
-	struct mlx5_priv *priv  = &mdev->priv;
-	int irq = pci_irq_vector(mdev->pdev, MLX5_EQ_VEC_COMP_BASE + i);
-
-	irq_set_affinity_hint(irq, NULL);
-	free_cpumask_var(priv->irq_info[i].mask);
-}
-
-static int mlx5_irq_set_affinity_hints(struct mlx5_core_dev *mdev)
-{
-	int err;
-	int i;
-
-	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++) {
-		err = mlx5_irq_set_affinity_hint(mdev, i);
-		if (err)
-			goto err_out;
-	}
-
-	return 0;
-
-err_out:
-	for (i--; i >= 0; i--)
-		mlx5_irq_clear_affinity_hint(mdev, i);
-
-	return err;
-}
-
-static void mlx5_irq_clear_affinity_hints(struct mlx5_core_dev *mdev)
-{
-	int i;
-
-	for (i = 0; i < mdev->priv.eq_table.num_comp_vectors; i++)
-		mlx5_irq_clear_affinity_hint(mdev, i);
-}
-
-int mlx5_vector2eqn(struct mlx5_core_dev *dev, int vector, int *eqn,
-		    unsigned int *irqn)
-{
-	struct mlx5_eq_table *table = &dev->priv.eq_table;
-	struct mlx5_eq *eq, *n;
-	int err = -ENOENT;
-	int i = 0;
-
-	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
-		if (i++ == vector) {
-			*eqn = eq->eqn;
-			*irqn = eq->irqn;
-			err = 0;
-			break;
-		}
-	}
-
-	return err;
-}
-EXPORT_SYMBOL(mlx5_vector2eqn);
-
-struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn)
-{
-	struct mlx5_eq_table *table = &dev->priv.eq_table;
-	struct mlx5_eq *eq;
-
-	list_for_each_entry(eq, &table->comp_eqs_list, list) {
-		if (eq->eqn == eqn)
-			return eq;
-	}
-
-
-	return ERR_PTR(-ENOENT);
-}
-
-static void free_comp_eqs(struct mlx5_core_dev *dev)
-{
-	struct mlx5_eq_table *table = &dev->priv.eq_table;
-	struct mlx5_eq *eq, *n;
-
-#ifdef CONFIG_RFS_ACCEL
-	if (dev->rmap) {
-		free_irq_cpu_rmap(dev->rmap);
-		dev->rmap = NULL;
-	}
-#endif
-	list_for_each_entry_safe(eq, n, &table->comp_eqs_list, list) {
-		list_del(&eq->list);
-		if (mlx5_destroy_unmap_eq(dev, eq))
-			mlx5_core_warn(dev, "failed to destroy EQ 0x%x\n",
-				       eq->eqn);
-		kfree(eq);
-	}
-}
-
-static int alloc_comp_eqs(struct mlx5_core_dev *dev)
-{
-	struct mlx5_eq_table *table = &dev->priv.eq_table;
-	char name[MLX5_MAX_IRQ_NAME];
-	struct mlx5_eq *eq;
-	int ncomp_vec;
-	int nent;
-	int err;
-	int i;
-
-	INIT_LIST_HEAD(&table->comp_eqs_list);
-	ncomp_vec = table->num_comp_vectors;
-	nent = MLX5_COMP_EQ_SIZE;
-#ifdef CONFIG_RFS_ACCEL
-	dev->rmap = alloc_irq_cpu_rmap(ncomp_vec);
-	if (!dev->rmap)
-		return -ENOMEM;
-#endif
-	for (i = 0; i < ncomp_vec; i++) {
-		eq = kzalloc(sizeof(*eq), GFP_KERNEL);
-		if (!eq) {
-			err = -ENOMEM;
-			goto clean;
-		}
-
-#ifdef CONFIG_RFS_ACCEL
-		irq_cpu_rmap_add(dev->rmap, pci_irq_vector(dev->pdev,
-				 MLX5_EQ_VEC_COMP_BASE + i));
-#endif
-		snprintf(name, MLX5_MAX_IRQ_NAME, "mlx5_comp%d", i);
-		err = mlx5_create_map_eq(dev, eq,
-					 i + MLX5_EQ_VEC_COMP_BASE, nent, 0,
-					 name, MLX5_EQ_TYPE_COMP);
-		if (err) {
-			kfree(eq);
-			goto clean;
-		}
-		mlx5_core_dbg(dev, "allocated completion EQN %d\n", eq->eqn);
-		list_add_tail(&eq->list, &table->comp_eqs_list);
-	}
-
-	return 0;
-
-clean:
-	free_comp_eqs(dev);
-	return err;
-}
-
 static int mlx5_core_set_issi(struct mlx5_core_dev *dev)
 {
 	u32 query_in[MLX5_ST_SZ_DW(query_issi_in)]   = {0};
@@ -834,10 +635,8 @@ static int mlx5_core_set_issi(struct mlx5_core_dev *dev)
 
 /* PCI table of mlx5 devices that are tech preview in RHEL */
 static const struct pci_device_id mlx5_core_hw_unsupp_pci_table[] = {
-	{ PCI_VDEVICE(MELLANOX, 0x101b) },			/* ConnectX-6 */
-	{ PCI_VDEVICE(MELLANOX, 0x101c), MLX5_PCI_DEV_IS_VF},	/* ConnectX-6 VF */
-	{ PCI_VDEVICE(MELLANOX, 0xa2d2) },			/* BlueField integrated ConnectX-5 network controller */
-	{ PCI_VDEVICE(MELLANOX, 0xa2d3), MLX5_PCI_DEV_IS_VF},	/* BlueField integrated ConnectX-5 network controller VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101d) },			/* ConnectX-6 Dx */
+	{ PCI_VDEVICE(MELLANOX, 0x101e), MLX5_PCI_DEV_IS_VF},	/* ConnectX Family mlx5Gen Virtual Function */
 	{ 0, }
 };
 
@@ -941,16 +740,21 @@ static int mlx5_init_once(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	struct pci_dev *pdev = dev->pdev;
 	int err;
 
+	priv->devcom = mlx5_devcom_register_device(dev);
+	if (IS_ERR(priv->devcom))
+		dev_err(&pdev->dev, "failed to register with devcom (0x%p)\n",
+			priv->devcom);
+
 	err = mlx5_query_board_id(dev);
 	if (err) {
 		dev_err(&pdev->dev, "query board id failed\n");
-		goto out;
+		goto err_devcom;
 	}
 
-	err = mlx5_eq_init(dev);
+	err = mlx5_eq_table_init(dev);
 	if (err) {
 		dev_err(&pdev->dev, "failed to initialize eq\n");
-		goto out;
+		goto err_devcom;
 	}
 
 	err = mlx5_cq_debugfs_init(dev);
@@ -968,6 +772,8 @@ static int mlx5_init_once(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	mlx5_init_reserved_gids(dev);
 
 	mlx5_init_clock(dev);
+
+	dev->vxlan = mlx5_vxlan_create(dev);
 
 	err = mlx5_init_rl_table(dev);
 	if (err) {
@@ -1012,15 +818,17 @@ err_mpfs_cleanup:
 err_rl_cleanup:
 	mlx5_cleanup_rl_table(dev);
 err_tables_cleanup:
+	mlx5_vxlan_destroy(dev->vxlan);
 	mlx5_cleanup_mkey_table(dev);
 	mlx5_cleanup_srq_table(dev);
 	mlx5_cleanup_qp_table(dev);
 	mlx5_cq_debugfs_cleanup(dev);
 
 err_eq_cleanup:
-	mlx5_eq_cleanup(dev);
+	mlx5_eq_table_cleanup(dev);
+err_devcom:
+	mlx5_devcom_unregister_device(dev->priv.devcom);
 
-out:
 	return err;
 }
 
@@ -1032,13 +840,15 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_eswitch_cleanup(dev->priv.eswitch);
 	mlx5_mpfs_cleanup(dev);
 	mlx5_cleanup_rl_table(dev);
+	mlx5_vxlan_destroy(dev->vxlan);
 	mlx5_cleanup_clock(dev);
 	mlx5_cleanup_reserved_gids(dev);
 	mlx5_cleanup_mkey_table(dev);
 	mlx5_cleanup_srq_table(dev);
 	mlx5_cleanup_qp_table(dev);
 	mlx5_cq_debugfs_cleanup(dev);
-	mlx5_eq_cleanup(dev);
+	mlx5_eq_table_cleanup(dev);
+	mlx5_devcom_unregister_device(dev->priv.devcom);
 }
 
 static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
@@ -1160,41 +970,23 @@ static int mlx5_load_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 		}
 	}
 
-	err = mlx5_alloc_irq_vectors(dev);
-	if (err) {
-		dev_err(&pdev->dev, "alloc irq vectors failed\n");
-		goto err_cleanup_once;
-	}
-
 	dev->priv.uar = mlx5_get_uars_page(dev);
 	if (IS_ERR(dev->priv.uar)) {
 		dev_err(&pdev->dev, "Failed allocating uar, aborting\n");
 		err = PTR_ERR(dev->priv.uar);
-		goto err_disable_msix;
+		goto err_get_uars;
 	}
 
-	err = mlx5_start_eqs(dev);
+	err = mlx5_eq_table_create(dev);
 	if (err) {
-		dev_err(&pdev->dev, "Failed to start pages and async EQs\n");
-		goto err_put_uars;
+		dev_err(&pdev->dev, "Failed to create EQs\n");
+		goto err_eq_table;
 	}
 
 	err = mlx5_fw_tracer_init(dev->tracer);
 	if (err) {
 		dev_err(&pdev->dev, "Failed to init FW tracer\n");
 		goto err_fw_tracer;
-	}
-
-	err = alloc_comp_eqs(dev);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to alloc completion EQs\n");
-		goto err_comp_eqs;
-	}
-
-	err = mlx5_irq_set_affinity_hints(dev);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to alloc affinity hint cpumask\n");
-		goto err_affinity_hints;
 	}
 
 	err = mlx5_fpga_device_start(dev);
@@ -1265,29 +1057,20 @@ err_ipsec_start:
 	mlx5_fpga_device_stop(dev);
 
 err_fpga_start:
-	mlx5_irq_clear_affinity_hints(dev);
-
-err_affinity_hints:
-	free_comp_eqs(dev);
-
-err_comp_eqs:
 	mlx5_fw_tracer_cleanup(dev->tracer);
 
 err_fw_tracer:
-	mlx5_stop_eqs(dev);
+	mlx5_eq_table_destroy(dev);
 
-err_put_uars:
+err_eq_table:
 	mlx5_put_uars_page(dev, priv->uar);
 
-err_disable_msix:
-	mlx5_free_irq_vectors(dev);
-
-err_cleanup_once:
+err_get_uars:
 	if (boot)
 		mlx5_cleanup_once(dev);
 
 err_stop_poll:
-	mlx5_stop_health_poll(dev);
+	mlx5_stop_health_poll(dev, boot);
 	if (mlx5_cmd_teardown_hca(dev)) {
 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
 		goto out_err;
@@ -1339,15 +1122,12 @@ static int mlx5_unload_one(struct mlx5_core_dev *dev, struct mlx5_priv *priv,
 	mlx5_accel_ipsec_cleanup(dev);
 	mlx5_accel_tls_cleanup(dev);
 	mlx5_fpga_device_stop(dev);
-	mlx5_irq_clear_affinity_hints(dev);
-	free_comp_eqs(dev);
 	mlx5_fw_tracer_cleanup(dev->tracer);
-	mlx5_stop_eqs(dev);
+	mlx5_eq_table_destroy(dev);
 	mlx5_put_uars_page(dev, priv->uar);
-	mlx5_free_irq_vectors(dev);
 	if (cleanup)
 		mlx5_cleanup_once(dev);
-	mlx5_stop_health_poll(dev);
+	mlx5_stop_health_poll(dev, cleanup);
 	err = mlx5_cmd_teardown_hca(dev);
 	if (err) {
 		dev_err(&dev->pdev->dev, "tear_down_hca failed, skip cleanup\n");
@@ -1413,14 +1193,6 @@ static int init_one(struct pci_dev *pdev,
 	INIT_LIST_HEAD(&priv->waiting_events_list);
 	priv->is_accum_events = false;
 
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	err = init_srcu_struct(&priv->pfault_srcu);
-	if (err) {
-		dev_err(&pdev->dev, "init_srcu_struct failed with error code %d\n",
-			err);
-		goto clean_dev;
-	}
-#endif
 	mutex_init(&priv->bfregs.reg_head.lock);
 	mutex_init(&priv->bfregs.wc_head.lock);
 	INIT_LIST_HEAD(&priv->bfregs.reg_head.list);
@@ -1429,7 +1201,7 @@ static int init_one(struct pci_dev *pdev,
 	err = mlx5_pci_init(dev, priv);
 	if (err) {
 		dev_err(&pdev->dev, "mlx5_pci_init failed with error code %d\n", err);
-		goto clean_srcu;
+		goto clean_dev;
 	}
 
 	err = mlx5_health_init(dev);
@@ -1462,11 +1234,7 @@ clean_health:
 	mlx5_health_cleanup(dev);
 close_pci:
 	mlx5_pci_close(dev, priv);
-clean_srcu:
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	cleanup_srcu_struct(&priv->pfault_srcu);
 clean_dev:
-#endif
 	devlink_free(devlink);
 
 	return err;
@@ -1490,9 +1258,6 @@ static void remove_one(struct pci_dev *pdev)
 	mlx5_pagealloc_cleanup(dev);
 	mlx5_health_cleanup(dev);
 	mlx5_pci_close(dev, priv);
-#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
-	cleanup_srcu_struct(&priv->pfault_srcu);
-#endif
 	devlink_free(devlink);
 }
 
@@ -1614,6 +1379,8 @@ static const struct pci_device_id mlx5_core_pci_table[] = {
 	{ PCI_VDEVICE(MELLANOX, 0x101a), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 Ex VF */
 	{ PCI_VDEVICE(MELLANOX, 0x101b) },			/* ConnectX-6 */
 	{ PCI_VDEVICE(MELLANOX, 0x101c), MLX5_PCI_DEV_IS_VF},	/* ConnectX-6 VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101d) },			/* ConnectX-6 Dx */
+	{ PCI_VDEVICE(MELLANOX, 0x101e), MLX5_PCI_DEV_IS_VF},	/* ConnectX Family mlx5Gen Virtual Function */
 	{ PCI_VDEVICE(MELLANOX, 0xa2d2) },			/* BlueField integrated ConnectX-5 network controller */
 	{ PCI_VDEVICE(MELLANOX, 0xa2d3), MLX5_PCI_DEV_IS_VF},	/* BlueField integrated ConnectX-5 network controller VF */
 	{ 0, }
@@ -1661,6 +1428,7 @@ static int __init init(void)
 	get_random_bytes(&sw_owner_id, sizeof(sw_owner_id));
 
 	mlx5_core_verify_params();
+	mlx5_fpga_ipsec_build_fs_cmds();
 	mlx5_register_debugfs();
 
 	err = pci_register_driver(&mlx5_core_driver);

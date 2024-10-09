@@ -50,7 +50,7 @@
 #include <linux/semaphore.h>
 #include <linux/slab.h>
 
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 
 #include <rdma/ib_mad.h>
 #include <rdma/ib_user_mad.h>
@@ -266,6 +266,7 @@ static void recv_handler(struct ib_mad_agent *agent,
 		packet->mad.hdr.traffic_class = grh->traffic_class;
 		memcpy(packet->mad.hdr.gid, &grh->dgid, 16);
 		packet->mad.hdr.flow_label = cpu_to_be32(grh->flow_label);
+		rdma_destroy_ah_attr(&ah_attr);
 	}
 
 	if (queue_packet(file, agent, packet))
@@ -1129,7 +1130,7 @@ static ssize_t show_ibdev(struct device *dev, struct device_attribute *attr,
 	if (!port)
 		return -ENODEV;
 
-	return sprintf(buf, "%s\n", port->ib_dev->name);
+	return sprintf(buf, "%s\n", dev_name(&port->ib_dev->dev));
 }
 static DEVICE_ATTR(ibdev, S_IRUGO, show_ibdev, NULL);
 
@@ -1244,17 +1245,11 @@ static void ib_umad_kill_port(struct ib_umad_port *port)
 	struct ib_umad_file *file;
 	int id;
 
-	dev_set_drvdata(port->dev,    NULL);
-	dev_set_drvdata(port->sm_dev, NULL);
-
-	device_destroy(&umad_class, port->cdev.dev);
-	device_destroy(&umad_class, port->sm_cdev.dev);
-
-	cdev_del(&port->cdev);
-	cdev_del(&port->sm_cdev);
-
 	mutex_lock(&port->file_mutex);
 
+	/* Mark ib_dev NULL and block ioctl or other file ops to progress
+	 * further.
+	 */
 	port->ib_dev = NULL;
 
 	list_for_each_entry(file, &port->file_list, port_list) {
@@ -1268,6 +1263,16 @@ static void ib_umad_kill_port(struct ib_umad_port *port)
 	}
 
 	mutex_unlock(&port->file_mutex);
+
+	dev_set_drvdata(port->dev,    NULL);
+	dev_set_drvdata(port->sm_dev, NULL);
+
+	device_destroy(&umad_class, port->cdev.dev);
+	device_destroy(&umad_class, port->sm_cdev.dev);
+
+	cdev_del(&port->cdev);
+	cdev_del(&port->sm_cdev);
+
 	clear_bit(port->dev_num, dev_map);
 }
 

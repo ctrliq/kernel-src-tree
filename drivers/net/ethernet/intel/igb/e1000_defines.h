@@ -1050,7 +1050,12 @@
 #define E1000_TQAVCTRL_DATAFETCHARB	BIT(4)
 #define E1000_TQAVCTRL_DATATRANARB	BIT(8)
 #define E1000_TQAVCTRL_DATATRANTIM	BIT(9)
+/* RHEL7: don't define bit if ETF qdisc isn't available */
+#ifdef TC_SETUP_QDISC_ETF
 #define E1000_TQAVCTRL_SP_WAIT_SR	BIT(10)
+#else
+#define E1000_TQAVCTRL_SP_WAIT_SR	0
+#endif
 /* Fetch Time Delta - bits 31:16
  *
  * This field holds the value to be reduced from the launch time for

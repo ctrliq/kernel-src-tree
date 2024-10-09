@@ -205,7 +205,7 @@ nouveau_user_framebuffer_destroy(struct drm_framebuffer *drm_fb)
 	struct nouveau_framebuffer *fb = nouveau_framebuffer(drm_fb);
 
 	if (fb->nvbo)
-		drm_gem_object_unreference_unlocked(&fb->nvbo->gem);
+		drm_gem_object_put_unlocked(&fb->nvbo->gem);
 
 	drm_framebuffer_cleanup(drm_fb);
 	kfree(fb);
@@ -287,7 +287,7 @@ nouveau_user_framebuffer_create(struct drm_device *dev,
 	if (ret == 0)
 		return &fb->base;
 
-	drm_gem_object_unreference_unlocked(gem);
+	drm_gem_object_put_unlocked(gem);
 	return ERR_PTR(ret);
 }
 
@@ -338,11 +338,9 @@ static struct nouveau_drm_prop_enum_list dither_depth[] = {
 	if (c) {                                                               \
 		p = drm_property_create(dev, DRM_MODE_PROP_ENUM, n, c);        \
 		l = (list);                                                    \
-		c = 0;                                                         \
 		while (p && l->gen_mask) {                                     \
 			if (l->gen_mask & (1 << (gen))) {                      \
-				drm_property_add_enum(p, c, l->type, l->name); \
-				c++;                                           \
+				drm_property_add_enum(p, l->type, l->name);    \
 			}                                                      \
 			l++;                                                   \
 		}                                                              \
@@ -584,7 +582,6 @@ nouveau_display_create(struct drm_device *dev)
 			goto vblank_err;
 	}
 
-	nouveau_backlight_init(dev);
 	INIT_WORK(&drm->hpd_work, nouveau_display_hpd_work);
 #ifdef CONFIG_ACPI
 	drm->acpi_nb.notifier_call = nouveau_display_acpi_ntfy;
@@ -609,7 +606,6 @@ nouveau_display_destroy(struct drm_device *dev)
 #ifdef CONFIG_ACPI
 	unregister_acpi_notifier(&nouveau_drm(dev)->acpi_nb);
 #endif
-	nouveau_backlight_exit(dev);
 	nouveau_display_vblank_fini(dev);
 
 	drm_kms_helper_poll_fini(dev);
@@ -967,7 +963,7 @@ nouveau_display_dumb_create(struct drm_file *file_priv, struct drm_device *dev,
 		return ret;
 
 	ret = drm_gem_handle_create(file_priv, &bo->gem, &args->handle);
-	drm_gem_object_unreference_unlocked(&bo->gem);
+	drm_gem_object_put_unlocked(&bo->gem);
 	return ret;
 }
 
@@ -982,7 +978,7 @@ nouveau_display_dumb_map_offset(struct drm_file *file_priv,
 	if (gem) {
 		struct nouveau_bo *bo = nouveau_gem_object(gem);
 		*poffset = drm_vma_node_offset_addr(&bo->bo.vma_node);
-		drm_gem_object_unreference_unlocked(gem);
+		drm_gem_object_put_unlocked(gem);
 		return 0;
 	}
 

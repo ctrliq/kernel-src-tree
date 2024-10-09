@@ -169,7 +169,7 @@ void nft_trace_notify(struct nft_traceinfo *info)
 	unsigned int size;
 	int event = (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_TRACE;
 
-	if (!nfnetlink_has_listeners(pkt_net(pkt), NFNLGRP_NFTRACE))
+	if (!nfnetlink_has_listeners(nft_net(pkt), NFNLGRP_NFTRACE))
 		return;
 
 	size = nlmsg_total_size(sizeof(struct nfgenmsg)) +
@@ -205,7 +205,7 @@ void nft_trace_notify(struct nft_traceinfo *info)
 	nfmsg->version		= NFNETLINK_V0;
 	nfmsg->res_id		= 0;
 
-	if (nla_put_be32(skb, NFTA_TRACE_NFPROTO, htonl(pkt->pf)))
+	if (nla_put_be32(skb, NFTA_TRACE_NFPROTO, htonl(nft_pf(pkt))))
 		goto nla_put_failure;
 
 	if (nla_put_be32(skb, NFTA_TRACE_TYPE, htonl(info->type)))
@@ -247,7 +247,7 @@ void nft_trace_notify(struct nft_traceinfo *info)
 		goto nla_put_failure;
 
 	if (!info->packet_dumped) {
-		if (nf_trace_fill_dev_info(skb, pkt->in, pkt->out))
+		if (nf_trace_fill_dev_info(skb, nft_in(pkt), nft_out(pkt)))
 			goto nla_put_failure;
 
 		if (nf_trace_fill_pkt_info(skb, pkt))
@@ -256,7 +256,7 @@ void nft_trace_notify(struct nft_traceinfo *info)
 	}
 
 	nlmsg_end(skb, nlh);
-	nfnetlink_send(skb, pkt_net(pkt), 0, NFNLGRP_NFTRACE, 0, GFP_ATOMIC);
+	nfnetlink_send(skb, nft_net(pkt), 0, NFNLGRP_NFTRACE, 0, GFP_ATOMIC);
 	return;
 
  nla_put_failure:

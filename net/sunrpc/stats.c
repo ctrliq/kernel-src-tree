@@ -213,7 +213,7 @@ static void _add_rpc_iostats(struct rpc_iostats *a, struct rpc_iostats *b)
 }
 
 static void _print_rpc_iostats(struct seq_file *seq, struct rpc_iostats *stats,
-			       int op, const struct rpc_procinfo *procs)
+			       int op, struct rpc_procinfo *procs)
 {
 	_print_name(seq, op, procs);
 	seq_printf(seq, "%lu %lu %lu %Lu %Lu %Lu %Lu %Lu\n",

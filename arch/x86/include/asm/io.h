@@ -179,6 +179,7 @@ extern void __iomem *ioremap_nocache(resource_size_t offset, unsigned long size)
 extern void __iomem *ioremap_cache(resource_size_t offset, unsigned long size);
 extern void __iomem *ioremap_prot(resource_size_t offset, unsigned long size,
 				unsigned long prot_val);
+extern void __iomem *ioremap_encrypted(resource_size_t phys_addr, unsigned long size);
 
 /*
  * The default ioremap() behavior is non-cached:
@@ -349,8 +350,8 @@ BUILDIO(b, b, char)
 BUILDIO(w, w, short)
 BUILDIO(l, , int)
 
-extern void *xlate_dev_mem_ptr(unsigned long phys);
-extern void unxlate_dev_mem_ptr(unsigned long phys, void *addr);
+extern void *xlate_dev_mem_ptr(phys_addr_t phys);
+extern void unxlate_dev_mem_ptr(phys_addr_t phys, void *addr);
 
 extern int ioremap_change_attr(unsigned long vaddr, unsigned long size,
 				enum page_cache_mode pcm);

@@ -8,11 +8,17 @@
 
 #include "../mount.h"
 
-struct fsnotify_iter_info {
-	struct fsnotify_mark *inode_mark;
-	struct fsnotify_mark *vfsmount_mark;
-	int srcu_idx;
-};
+static inline struct inode *fsnotify_conn_inode(
+				struct fsnotify_mark_connector *conn)
+{
+	return container_of(conn->obj, struct inode, i_fsnotify_marks);
+}
+
+static inline struct mount *fsnotify_conn_mount(
+				struct fsnotify_mark_connector *conn)
+{
+	return container_of(conn->obj, struct mount, mnt_fsnotify_marks);
+}
 
 /* destroy all events sitting in this groups notification queue */
 extern void fsnotify_flush_notify(struct fsnotify_group *group);

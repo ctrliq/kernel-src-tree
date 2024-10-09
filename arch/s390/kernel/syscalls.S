@@ -359,7 +359,7 @@ NI_SYSCALL					/* 347 sys_renameat2 */
 SYSCALL(sys_seccomp,sys_seccomp,sys_seccomp_wrapper)
 SYSCALL(sys_getrandom,sys_getrandom,sys_getrandom_wrapper)
 SYSCALL(sys_memfd_create,sys_memfd_create,sys_memfd_create_wrapper) /* 350 */
-NI_SYSCALL					/* 351 sys_bpf */
+SYSCALL(sys_bpf,sys_bpf,sys_bpf_wrapper) /* 351 */
 SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_write,sys_s390_pci_mmio_write_wrapper)
 SYSCALL(sys_ni_syscall,sys_s390_pci_mmio_read,sys_s390_pci_mmio_read_wrapper)
 NI_SYSCALL					/* 354 sys_execveat */

@@ -162,7 +162,6 @@ xfs_inode_item_format_data_fork(
 		    ip->i_df.if_bytes > 0) {
 			struct xfs_bmbt_rec *p;
 
-			ASSERT(ip->i_df.if_u1.if_extents != NULL);
 			ASSERT(xfs_iext_count(&ip->i_df) > 0);
 
 			p = xlog_prepare_iovec(lv, vecp, XLOG_REG_TYPE_IEXT);
@@ -222,7 +221,7 @@ xfs_inode_item_format_data_fork(
 		iip->ili_fields &=
 			~(XFS_ILOG_DDATA | XFS_ILOG_DBROOT | XFS_ILOG_DEXT);
 		if (iip->ili_fields & XFS_ILOG_DEV)
-			ilf->ilf_u.ilfu_rdev = ip->i_df.if_u2.if_rdev;
+			ilf->ilf_u.ilfu_rdev = sysv_encode_dev(VFS_I(ip)->i_rdev);
 		break;
 	default:
 		ASSERT(0);
@@ -252,7 +251,6 @@ xfs_inode_item_format_attr_fork(
 
 			ASSERT(xfs_iext_count(ip->i_afp) ==
 				ip->i_d.di_anextents);
-			ASSERT(ip->i_afp->if_u1.if_extents != NULL);
 
 			p = xlog_prepare_iovec(lv, vecp, XLOG_REG_TYPE_IATTR_EXT);
 			data_bytes = xfs_iextents_copy(ip, p, XFS_ATTR_FORK);

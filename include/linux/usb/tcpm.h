@@ -86,6 +86,7 @@ struct tcpc_config {
 	unsigned int operating_snk_mw;
 
 	enum typec_port_type type;
+	enum typec_port_data data;
 	enum typec_role default_role;
 	bool try_role_hw;	/* try.{src,snk} implemented in hardware */
 
@@ -97,18 +98,10 @@ struct tcpc_config {
 #define TCPC_MUX_DP_ENABLED		BIT(1)	/* DP enabled */
 #define TCPC_MUX_POLARITY_INVERTED	BIT(2)	/* Polarity inverted */
 
-/* Mux modes, decoded to attributes */
-enum tcpc_mux_mode {
-	TYPEC_MUX_NONE	= 0,				/* Open switch */
-	TYPEC_MUX_USB	= TCPC_MUX_USB_ENABLED,		/* USB only */
-	TYPEC_MUX_DP	= TCPC_MUX_DP_ENABLED,		/* DP only */
-	TYPEC_MUX_DOCK	= TCPC_MUX_USB_ENABLED |	/* Both USB and DP */
-			  TCPC_MUX_DP_ENABLED,
-};
-
 /**
  * struct tcpc_dev - Port configuration and callback functions
  * @config:	Pointer to port configuration
+ * @fwnode:	Pointer to port fwnode
  * @get_vbus:	Called to read current VBUS state
  * @get_current_limit:
  *		Optional; called by the tcpm core when configured as a snk
@@ -137,6 +130,7 @@ enum tcpc_mux_mode {
  */
 struct tcpc_dev {
 	const struct tcpc_config *config;
+	struct fwnode_handle *fwnode;
 
 	int (*init)(struct tcpc_dev *dev);
 	int (*get_vbus)(struct tcpc_dev *dev);

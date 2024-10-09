@@ -253,6 +253,7 @@ sysc_tif:
 	BPON
 sysc_restore:
 	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r11)
+sysc_exit_timer:
 	stpt	__LC_EXIT_TIMER
 	lm	%r0,%r15,__PT_R0(%r11)
 	lpsw	__LC_RETURN_PSW
@@ -497,6 +498,7 @@ io_restore:
 	tm	__PT_PSW+1(%r11),0x01	# returning to user ?
 	jno	io_exit_kernel
 	BPON
+io_exit_timer:
 	stpt	__LC_EXIT_TIMER
 io_exit_kernel:
 	lm	%r0,%r15,__PT_R0(%r11)
@@ -887,15 +889,23 @@ cleanup_sysc_tif:
 	br	%r14
 
 cleanup_sysc_restore:
+	# check if stpt has been executed
 	cl	%r9,BASED(cleanup_sysc_restore_insn)
-	jhe	0f
+	jh	0f
+	mvc	__LC_EXIT_TIMER(8),__LC_ASYNC_ENTER_TIMER
+	chi	%r11,__LC_SAVE_AREA_ASYNC
+	je	0f
+	mvc	__LC_EXIT_TIMER(8),__LC_MCCK_ENTER_TIMER
+0:	cl	%r9,BASED(cleanup_sysc_restore_insn+4)
+	je	1f
 	l	%r9,12(%r11)		# get saved pointer to pt_regs
 	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r9)
 	mvc	0(32,%r11),__PT_R8(%r9)
 	lm	%r0,%r7,__PT_R0(%r9)
-0:	lm	%r8,%r9,__LC_RETURN_PSW
+1:	lm	%r8,%r9,__LC_RETURN_PSW
 	br	%r14
 cleanup_sysc_restore_insn:
+	.long	sysc_exit_timer + 0x80000000
 	.long	sysc_done - 4 + 0x80000000
 
 cleanup_io_tif:
@@ -903,15 +913,20 @@ cleanup_io_tif:
 	br	%r14
 
 cleanup_io_restore:
+	# check if stpt has been executed
 	cl	%r9,BASED(cleanup_io_restore_insn)
-	jhe	0f
+	jh	0f
+	mvc	__LC_EXIT_TIMER(8),__LC_MCCK_ENTER_TIMER
+0:	cl	%r9,BASED(cleanup_io_restore_insn+4)
+	je	1f
 	l	%r9,12(%r11)		# get saved r11 pointer to pt_regs
 	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r9)
 	mvc	0(32,%r11),__PT_R8(%r9)
 	lm	%r0,%r7,__PT_R0(%r9)
-0:	lm	%r8,%r9,__LC_RETURN_PSW
+1:	lm	%r8,%r9,__LC_RETURN_PSW
 	br	%r14
 cleanup_io_restore_insn:
+	.long	io_exit_timer + 0x80000000
 	.long	io_done - 4 + 0x80000000
 
 cleanup_idle:

@@ -701,6 +701,28 @@ struct device_dma_parameters {
 	unsigned long segment_boundary_mask;
 };
 
+/**
+ * struct device_connection - Device Connection Descriptor
+ * @endpoint: The names of the two devices connected together
+ * @id: Unique identifier for the connection
+ * @list: List head, private, for internal use only
+ */
+struct device_connection {
+	const char		*endpoint[2];
+	const char		*id;
+	struct list_head	list;
+};
+
+void *device_connection_find_match(struct device *dev, const char *con_id,
+				void *data,
+				void *(*match)(struct device_connection *con,
+					       int ep, void *data));
+
+struct device *device_connection_find(struct device *dev, const char *con_id);
+
+void device_connection_add(struct device_connection *con);
+void device_connection_remove(struct device_connection *con);
+
 /* RHEL7: Do not use this struct.  It is only here for KABI purposes. */
 struct acpi_dev_node {
 #ifdef CONFIG_ACPI

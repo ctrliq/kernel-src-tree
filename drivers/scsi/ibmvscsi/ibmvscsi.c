@@ -2302,7 +2302,7 @@ static int ibmvscsi_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 	host->max_cmd_len = 16;
 
 	dev_info(dev,
-		 "Maximum ID: %d Maximum LUN: %llu Maximum Channel: %d\n",
+		 "Maximum ID: %d Maximum LUN: %u Maximum Channel: %d\n",
 		 host->max_id, host->max_lun, host->max_channel);
 
 	if (scsi_add_host(hostdata->host, hostdata->dev))

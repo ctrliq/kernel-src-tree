@@ -336,6 +336,30 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);		/* keep VO_INIT_SIZE page aligned */
 	_end = .;
 
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+	/*
+	 * SME workarea section: Lives outside of the kernel proper (_text -
+	 * _end) for performing in-place encryption of the kernel during boot.
+	 *
+	 * Resides after _end because even though the .brk section is after
+	 * __end_of_kernel_reserve, the .brk section is later reserved as a
+	 * part of the kernel. It is used in very early boot code and not
+	 * needed after that, so it is located after __end_of_kernel_reserve
+	 * so that it will be discarded and become part of the available
+	 * memory.
+	 *
+	 * Resides on a 2MB boundary to simplify the pagetable setup used for
+	 * the encryption.
+	 */
+	. = ALIGN(HPAGE_SIZE);
+	.sme : AT(ADDR(.sme) - LOAD_OFFSET) {
+		__sme_begin = .;
+		*(.sme)
+		. = ALIGN(HPAGE_SIZE);
+		__sme_end = .;
+	}
+#endif
+
         STABS_DEBUG
         DWARF_DEBUG
 

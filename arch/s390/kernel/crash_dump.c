@@ -304,6 +304,20 @@ static void *nt_init(void *buf, Elf64_Word type, void *desc, int d_len,
 }
 
 /*
+ * Calculate the size of ELF note
+ */
+static size_t nt_size(int d_len, const char *name)
+{
+	size_t size;
+
+	size = sizeof(Elf64_Nhdr);
+	size += roundup(strlen(name) + 1, 4);
+	size += roundup(d_len, 4);
+
+	return size;
+}
+
+/*
  * Initialize prstatus note
  */
 static void *nt_prstatus(void *ptr, struct save_area *sa)
@@ -438,6 +452,29 @@ void *fill_cpu_elf_notes(void *ptr, struct save_area *sa, __vector128 *vx_regs)
 }
 
 /*
+ * Calculate size of ELF notes per cpu
+ */
+static size_t get_cpu_elf_notes_size(void)
+{
+	struct save_area *sa = NULL;
+	size_t size;
+
+	size =	nt_size(sizeof(struct elf_prstatus), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(elf_fpregset_t), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(sa->timer), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(sa->clk_cmp), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(sa->tod_reg), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(sa->ctrl_regs), KEXEC_CORE_NOTE_NAME);
+	size +=  nt_size(sizeof(sa->pref_reg), KEXEC_CORE_NOTE_NAME);
+	if (MACHINE_HAS_VX) {
+		size += nt_size(16 * sizeof(__vector128), KEXEC_CORE_NOTE_NAME);
+		size += nt_size(16 * 8, KEXEC_CORE_NOTE_NAME);
+	}
+
+	return size;
+}
+
+/*
  * Initialize prpsinfo note (new kernel)
  */
 static void *nt_prpsinfo(void *ptr)
@@ -490,6 +527,24 @@ static void *nt_vmcoreinfo(void *ptr)
 	if (!vmcoreinfo)
 		return ptr;
 	return nt_init(ptr, 0, vmcoreinfo, size, "VMCOREINFO");
+}
+
+static size_t nt_vmcoreinfo_size(void)
+{
+	const char *name = VMCOREINFO_NOTE_NAME;
+	unsigned long size;
+	void *vmcoreinfo;
+
+	vmcoreinfo = os_info_old_entry(OS_INFO_VMCOREINFO, &size);
+	if (vmcoreinfo)
+		return nt_size(size, name);
+
+	vmcoreinfo = get_vmcoreinfo_old(&size);
+	if (!vmcoreinfo)
+		return 0;
+
+	kfree(vmcoreinfo);
+	return nt_size(size, name);
 }
 
 /*
@@ -607,6 +662,25 @@ static void *notes_init(Elf64_Phdr *phdr, void *ptr, u64 notes_offset)
 	return ptr;
 }
 
+static size_t get_elfcorehdr_size(int mem_chunk_cnt)
+{
+	size_t size;
+
+	size = sizeof(Elf64_Ehdr);
+	/* PT_NOTES */
+	size += sizeof(Elf64_Phdr);
+	/* nt_prpsinfo */
+	size += nt_size(sizeof(struct elf_prpsinfo), KEXEC_CORE_NOTE_NAME);
+	/* regsets */
+	size += get_cpu_cnt() * get_cpu_elf_notes_size();
+	/* nt_vmcoreinfo */
+	size += nt_vmcoreinfo_size();
+	/* PT_LOADS */
+	size += mem_chunk_cnt * sizeof(Elf64_Phdr);
+
+	return size;
+}
+
 /*
  * Create ELF core header (new kernel)
  */
@@ -629,8 +703,8 @@ int elfcorehdr_alloc(unsigned long long *addr, unsigned long long *size)
 		return -ENODEV;
 	mem_chunk_cnt = get_mem_chunk_cnt();
 
-	alloc_size = 0x1000 + get_cpu_cnt() * 0x4a0 +
-		mem_chunk_cnt * sizeof(Elf64_Phdr);
+	alloc_size = get_elfcorehdr_size(mem_chunk_cnt);
+
 	hdr = kzalloc_panic(alloc_size);
 	/* Init elf header */
 	ptr = ehdr_init(hdr, mem_chunk_cnt);

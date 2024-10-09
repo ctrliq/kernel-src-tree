@@ -58,7 +58,6 @@ MODULE_PARM_DESC(tjmax, "TjMax value in degrees Celsius");
 #define TOTAL_ATTRS		(MAX_CORE_ATTRS + 1)
 #define MAX_CORE_DATA		(NUM_REAL_CORES + BASE_SYSFS_ATTR_NO)
 
-#define TO_PHYS_ID(cpu)		(cpu_data(cpu).phys_proc_id)
 #define TO_CORE_ID(cpu)		(cpu_data(cpu).cpu_core_id)
 #define TO_ATTR_NO(cpu)		(TO_CORE_ID(cpu) + BASE_SYSFS_ATTR_NO)
 
@@ -103,7 +102,7 @@ struct temp_data {
 /* Platform Data per Physical CPU */
 struct platform_data {
 	struct device *hwmon_dev;
-	u16 phys_proc_id;
+	u16 pkg_id;
 	struct temp_data *core_data[MAX_CORE_DATA];
 	struct device_attribute name_attr;
 };
@@ -111,7 +110,7 @@ struct platform_data {
 struct pdev_entry {
 	struct list_head list;
 	struct platform_device *pdev;
-	u16 phys_proc_id;
+	u16 pkg_id;
 };
 
 static LIST_HEAD(pdev_list);
@@ -125,7 +124,7 @@ static ssize_t show_label(struct device *dev,
 	struct temp_data *tdata = pdata->core_data[attr->index];
 
 	if (tdata->is_pkg_data)
-		return sprintf(buf, "Physical id %u\n", pdata->phys_proc_id);
+		return sprintf(buf, "Package id %u\n", pdata->pkg_id);
 
 	return sprintf(buf, "Core %u\n", tdata->cpu_core_id);
 }
@@ -435,13 +434,13 @@ static int chk_ucode_version(unsigned int cpu)
 
 static struct platform_device *coretemp_get_pdev(unsigned int cpu)
 {
-	u16 phys_proc_id = TO_PHYS_ID(cpu);
+	int pkgid = topology_logical_package_id(cpu);
 	struct pdev_entry *p;
 
 	mutex_lock(&pdev_list_mutex);
 
 	list_for_each_entry(p, &pdev_list, list)
-		if (p->phys_proc_id == phys_proc_id) {
+		if (p->pkg_id == pkgid) {
 			mutex_unlock(&pdev_list_mutex);
 			return p->pdev;
 		}
@@ -574,7 +573,7 @@ static int coretemp_probe(struct platform_device *pdev)
 	if (!pdata)
 		return -ENOMEM;
 
-	pdata->phys_proc_id = pdev->id;
+	pdata->pkg_id = pdev->id;
 	platform_set_drvdata(pdev, pdata);
 
 	pdata->hwmon_dev = devm_hwmon_device_register_with_groups(dev, DRVNAME,
@@ -605,13 +604,16 @@ static struct platform_driver coretemp_driver = {
 
 static int coretemp_device_add(unsigned int cpu)
 {
-	int err;
+	int err, pkgid = topology_logical_package_id(cpu);
 	struct platform_device *pdev;
 	struct pdev_entry *pdev_entry;
 
+	if (pkgid < 0)
+		return -ENOMEM;
+
 	mutex_lock(&pdev_list_mutex);
 
-	pdev = platform_device_alloc(DRVNAME, TO_PHYS_ID(cpu));
+	pdev = platform_device_alloc(DRVNAME, pkgid);
 	if (!pdev) {
 		err = -ENOMEM;
 		pr_err("Device allocation failed\n");
@@ -631,7 +633,7 @@ static int coretemp_device_add(unsigned int cpu)
 	}
 
 	pdev_entry->pdev = pdev;
-	pdev_entry->phys_proc_id = pdev->id;
+	pdev_entry->pkg_id = pkgid;
 
 	list_add_tail(&pdev_entry->list, &pdev_list);
 	mutex_unlock(&pdev_list_mutex);
@@ -650,11 +652,11 @@ exit:
 static void coretemp_device_remove(unsigned int cpu)
 {
 	struct pdev_entry *p, *n;
-	u16 phys_proc_id = TO_PHYS_ID(cpu);
+	int pkg_id = topology_logical_package_id(cpu);
 
 	mutex_lock(&pdev_list_mutex);
 	list_for_each_entry_safe(p, n, &pdev_list, list) {
-		if (p->phys_proc_id != phys_proc_id)
+		if (p->pkg_id != pkg_id)
 			continue;
 		platform_device_unregister(p->pdev);
 		list_del(&p->list);

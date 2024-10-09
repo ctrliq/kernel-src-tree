@@ -96,7 +96,7 @@ long vfs_truncate(struct path *path, loff_t length)
 	 * write access on the upper inode, not on the overlay inode.  For
 	 * non-overlay filesystems d_real() is an identity function.
 	 */
-	upperdentry = d_real(path->dentry, NULL, O_WRONLY);
+	upperdentry = d_real(path->dentry, NULL, O_WRONLY, 0);
 	error = PTR_ERR(upperdentry);
 	if (IS_ERR(upperdentry))
 		goto mnt_drop_write_and_out;
@@ -656,12 +656,12 @@ SYSCALL_DEFINE3(fchown, unsigned int, fd, uid_t, user, gid_t, group)
 	if (!f.file)
 		goto out;
 
-	error = mnt_want_write_file(f.file);
+	error = mnt_want_write_file_path(f.file);
 	if (error)
 		goto out_fput;
 	audit_inode(NULL, f.file->f_path.dentry, 0);
 	error = chown_common(&f.file->f_path, user, group);
-	mnt_drop_write_file(f.file);
+	mnt_drop_write_file_path(f.file);
 out_fput:
 	fdput(f);
 out:
@@ -896,7 +896,7 @@ int vfs_open(const struct path *path, struct file *filp,
 	if (dentry_open)
 		return dentry_open(path->dentry, filp, cred);
 	else {
-		struct dentry *dentry = d_real(path->dentry, NULL, filp->f_flags);
+		struct dentry *dentry = d_real(path->dentry, NULL, filp->f_flags, 0);
 
 		if (IS_ERR(dentry))
 			return PTR_ERR(dentry);
@@ -910,7 +910,7 @@ EXPORT_SYMBOL(vfs_open);
 static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
 {
 	int lookup_flags = 0;
-	int acc_mode;
+	int acc_mode = ACC_MODE(flags);
 
 	if (flags & (O_CREAT | __O_TMPFILE))
 		op->mode = (mode & S_IALLUGO) | S_IFREG;
@@ -932,7 +932,6 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 	if (flags & __O_TMPFILE) {
 		if ((flags & O_TMPFILE_MASK) != O_TMPFILE)
 			return -EINVAL;
-		acc_mode = MAY_OPEN | ACC_MODE(flags);
 		if (!(acc_mode & MAY_WRITE))
 			return -EINVAL;
 	} else if (flags & O_PATH) {
@@ -942,8 +941,6 @@ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *o
 		 */
 		flags &= O_DIRECTORY | O_NOFOLLOW | O_PATH;
 		acc_mode = 0;
-	} else {
-		acc_mode = MAY_OPEN | ACC_MODE(flags);
 	}
 
 	op->open_flag = flags;

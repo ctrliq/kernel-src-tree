@@ -69,6 +69,12 @@ struct xdp_buff;
 /* unused opcode to mark call to interpreter with arguments */
 #define BPF_CALL_ARGS	0xe0
 
+/* As per nm, we expose JITed images as text (code) section for
+ * kallsyms. That way, tools like perf can find it to match
+ * addresses.
+ */
+#define BPF_SYM_ELF_TYPE	't'
+
 /* BPF program can access up to 512 bytes of stack space. */
 #define MAX_BPF_STACK	512
 
@@ -425,7 +431,9 @@ struct bpf_prog {
 				cb_access:1,	/* Is control block accessed? */
 				dst_needed:1,	/* Do we need dst entry? */
 				blinded:1,	/* Was blinded */
-				is_func:1;	/* program is a bpf function */
+				is_func:1,	/* program is a bpf function */
+				kprobe_override:1, /* Do we override a kprobe? */
+				has_callchain_buf:1; /* callchain buffer allocated? */
 	kmemcheck_bitfield_end(meta);
 	enum bpf_prog_type	type;		/* Type of BPF program */
 	enum bpf_attach_type	expected_attach_type; /* For some prog types */
@@ -477,16 +485,34 @@ static inline unsigned int bpf_prog_size(unsigned int proglen)
 		   offsetof(struct bpf_prog, insns[proglen]));
 }
 
-static inline bool
-bpf_ctx_narrow_access_ok(u32 off, u32 size, const u32 size_default)
+static inline u32 bpf_ctx_off_adjust_machine(u32 size)
 {
-	bool off_ok;
+	const u32 size_machine = sizeof(unsigned long);
+
+	if (size > size_machine && size % size_machine == 0)
+		size = size_machine;
+
+	return size;
+}
+
+static inline bool bpf_ctx_narrow_align_ok(u32 off, u32 size_access,
+					   u32 size_default)
+{
+	size_default = bpf_ctx_off_adjust_machine(size_default);
+	size_access  = bpf_ctx_off_adjust_machine(size_access);
+
 #ifdef __LITTLE_ENDIAN
-	off_ok = (off & (size_default - 1)) == 0;
+	return (off & (size_default - 1)) == 0;
 #else
-	off_ok = (off & (size_default - 1)) + size == size_default;
+	return (off & (size_default - 1)) + size_access == size_default;
 #endif
-	return off_ok && size <= size_default && (size & (size - 1)) == 0;
+}
+
+static inline bool
+bpf_ctx_narrow_access_ok(u32 off, u32 size, u32 size_default)
+{
+	return bpf_ctx_narrow_align_ok(off, size, size_default) &&
+	       size <= size_default && (size & (size - 1)) == 0;
 }
 
 static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
@@ -501,7 +527,7 @@ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
 
 #define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
 
-#ifdef CONFIG_DEBUG_SET_MODULE_RONX
+#ifdef CONFIG_ARCH_HAS_SET_MEMORY
 static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
 {
 	set_memory_ro((unsigned long)fp, fp->pages);
@@ -511,6 +537,16 @@ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
 {
 	set_memory_rw((unsigned long)fp, fp->pages);
 }
+
+static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
+{
+	set_memory_ro((unsigned long)hdr, hdr->pages);
+}
+
+static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
+{
+	set_memory_rw((unsigned long)hdr, hdr->pages);
+}
 #else
 static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
 {
@@ -519,7 +555,15 @@ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
 static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
 {
 }
-#endif /* CONFIG_DEBUG_SET_MODULE_RONX */
+
+static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
+{
+}
+
+static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
+{
+}
+#endif /* CONFIG_ARCH_HAS_SET_MEMORY */
 
 /* compute the linear packet data range [data, data_end) which
  * will be accessed by cls_bpf and act_bpf programs
@@ -532,6 +576,15 @@ static inline unsigned int sk_filter_len(const struct sk_filter *fp)
 static inline void bpf_compute_data_end(struct sk_buff *skb)
 {
 	return;
+}
+
+static inline struct bpf_binary_header *
+bpf_jit_binary_hdr(const struct bpf_prog *fp)
+{
+	unsigned long real_start = (unsigned long)fp->bpf_func;
+	unsigned long addr = real_start & PAGE_MASK;
+
+	return (void *)addr;
 }
 
 int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
@@ -614,6 +667,7 @@ void bpf_jit_binary_free(struct bpf_binary_header *hdr);
 #include <linux/printk.h>
 
 extern int bpf_jit_harden;
+extern int bpf_jit_kallsyms;
 
 void bpf_jit_compile(struct sk_filter *fp);
 void bpf_jit_free(struct sk_filter *fp);
@@ -650,6 +704,11 @@ static inline bool ebpf_jit_enabled(void)
 	return bpf_jit_enable && bpf_jit_is_ebpf();
 }
 
+static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
+{
+	return fp->jited && bpf_jit_is_ebpf();
+}
+
 static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
 {
 	/* These are the prerequisites, should someone ever have the
@@ -667,10 +726,90 @@ static inline bool bpf_jit_blinding_enabled(struct bpf_prog *prog)
 
 	return true;
 }
-#else
+
+static inline bool bpf_jit_kallsyms_enabled(void)
+{
+	/* There are a couple of corner cases where kallsyms should
+	 * not be enabled f.e. on hardening.
+	 */
+	if (bpf_jit_harden)
+		return false;
+	if (!bpf_jit_kallsyms)
+		return false;
+	if (bpf_jit_kallsyms == 1)
+		return true;
+
+	return false;
+}
+
+const char *__bpf_address_lookup(unsigned long addr, unsigned long *size,
+				 unsigned long *off, char *sym);
+bool is_bpf_text_address(unsigned long addr);
+int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
+		    char *sym);
+
+static inline const char *
+bpf_address_lookup(unsigned long addr, unsigned long *size,
+		   unsigned long *off, char **modname, char *sym)
+{
+	const char *ret = __bpf_address_lookup(addr, size, off, sym);
+
+	if (ret && modname)
+		*modname = NULL;
+	return ret;
+}
+
+void bpf_prog_kallsyms_add(struct bpf_prog *fp);
+void bpf_prog_kallsyms_del(struct bpf_prog *fp);
+
+#else /* CONFIG_BPF_JIT */
+
+static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
+{
+	return false;
+}
+
 static inline bool ebpf_jit_enabled(void)
 {
 	return false;
+}
+
+static inline bool bpf_jit_kallsyms_enabled(void)
+{
+	return false;
+}
+
+static inline const char *
+__bpf_address_lookup(unsigned long addr, unsigned long *size,
+		     unsigned long *off, char *sym)
+{
+	return NULL;
+}
+
+static inline bool is_bpf_text_address(unsigned long addr)
+{
+	return false;
+}
+
+static inline int bpf_get_kallsym(unsigned int symnum, unsigned long *value,
+				  char *type, char *sym)
+{
+	return -ERANGE;
+}
+
+static inline const char *
+bpf_address_lookup(unsigned long addr, unsigned long *size,
+		   unsigned long *off, char **modname, char *sym)
+{
+	return NULL;
+}
+
+static inline void bpf_prog_kallsyms_add(struct bpf_prog *fp)
+{
+}
+
+static inline void bpf_prog_kallsyms_del(struct bpf_prog *fp)
+{
 }
 
 static inline void bpf_jit_compile(struct sk_filter *fp)
@@ -681,6 +820,9 @@ static inline void bpf_jit_free(struct sk_filter *fp)
 }
 #define SK_RUN_FILTER(FILTER, SKB) sk_run_filter(SKB, FILTER->insns)
 #endif
+
+void bpf_prog_kallsyms_del_subprogs(struct bpf_prog *fp);
+void bpf_prog_kallsyms_del_all(struct bpf_prog *fp);
 
 void *trace_bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb,
 						 int k, unsigned int size);

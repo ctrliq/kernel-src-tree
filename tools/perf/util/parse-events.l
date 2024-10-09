@@ -9,8 +9,8 @@
 %{
 #include <errno.h>
 #include "../perf.h"
-#include "parse-events-bison.h"
 #include "parse-events.h"
+#include "parse-events-bison.h"
 
 char *parse_events_get_text(yyscan_t yyscanner);
 YYSTYPE *parse_events_get_lval(yyscan_t yyscanner);
@@ -49,7 +49,21 @@ static int str(yyscan_t scanner, int token)
 	YYSTYPE *yylval = parse_events_get_lval(scanner);
 	char *text = parse_events_get_text(scanner);
 
-	yylval->str = strdup(text);
+	if (text[0] != '\'') {
+		yylval->str = strdup(text);
+	} else {
+		/*
+		 * If a text tag specified on the command line
+		 * contains opening single quite ' then it is
+		 * expected that the tag ends with single quote
+		 * as well, like this:
+		 *     name=\'CPU_CLK_UNHALTED.THREAD:cmask=1\'
+		 * quotes need to be escaped to bypass shell
+		 * processing.
+		 */
+		yylval->str = strndup(&text[1], strlen(text) - 2);
+	}
+
 	return token;
 }
 
@@ -131,16 +145,20 @@ do {							\
 %x mem
 %s config
 %x event
+%x array
 
 group		[^,{}/]*[{][^}]*[}][^,{}/]*
 event_pmu	[^,{}/]+[/][^/]*[/][^,{}/]*
 event		[^,{}/]+
+bpf_object	.*\.(o|bpf)
+bpf_source	.*\.c
 
 num_dec		[0-9]+
 num_hex		0x[a-fA-F0-9]+
 num_raw_hex	[a-fA-F0-9]+
-name		[a-zA-Z_*?][a-zA-Z0-9_*?.]*
-name_minus	[a-zA-Z_*?][a-zA-Z0-9\-_*?.]*
+name		[a-zA-Z_*?\[\]][a-zA-Z0-9_*?.\[\]]*
+name_tag	[\'][a-zA-Z_*?\[\]][a-zA-Z0-9_*?\-,\.\[\]:=]*[\']
+name_minus	[a-zA-Z_*?][a-zA-Z0-9\-_*?.:]*
 drv_cfg_term	[a-zA-Z0-9_\.]+(=[a-zA-Z0-9_*?\.:]+)?
 /* If you add a modifier you need to update check_modifier() */
 modifier_event	[ukhpPGHSDIW]+
@@ -180,6 +198,8 @@ modifier_bp	[rwx]{1,3}
 		}
 
 {event_pmu}	|
+{bpf_object}	|
+{bpf_source}	|
 {event}		{
 			BEGIN(INITIAL);
 			REWIND(1);
@@ -191,6 +211,14 @@ modifier_bp	[rwx]{1,3}
 			REWIND(0);
 		}
 
+}
+
+<array>{
+"]"			{ BEGIN(config); return ']'; }
+{num_dec}		{ return value(yyscanner, 10); }
+{num_hex}		{ return value(yyscanner, 16); }
+,			{ return ','; }
+"\.\.\."		{ return PE_ARRAY_RANGE; }
 }
 
 <config>{
@@ -207,6 +235,7 @@ branch_type		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE
 time			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_TIME); }
 call-graph		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CALLGRAPH); }
 stack-size		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_STACKSIZE); }
+nr			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_MAX_EVENTS); }
 inherit			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_INHERIT); }
 no-inherit		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOINHERIT); }
 overwrite		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_OVERWRITE); }
@@ -214,6 +243,8 @@ no-overwrite		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOOVERWRITE); }
 ,			{ return ','; }
 "/"			{ BEGIN(INITIAL); return '/'; }
 {name_minus}		{ return str(yyscanner, PE_NAME); }
+\[all\]			{ return PE_ARRAY_ALL; }
+"["			{ BEGIN(array); return '['; }
 @{drv_cfg_term}		{ return drv_str(yyscanner, PE_DRV_CFG_TERM); }
 }
 
@@ -257,6 +288,7 @@ cpu-migrations|migrations			{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COU
 alignment-faults				{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_ALIGNMENT_FAULTS); }
 emulation-faults				{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_EMULATION_FAULTS); }
 dummy						{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_DUMMY); }
+bpf-output					{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_BPF_OUTPUT); }
 duration_time					{ return sym(yyscanner, PERF_TYPE_SOFTWARE, PERF_COUNT_SW_DUMMY); }
 
 	/*
@@ -291,7 +323,10 @@ r{num_raw_hex}		{ return raw(yyscanner); }
 {num_hex}		{ return value(yyscanner, 16); }
 
 {modifier_event}	{ return str(yyscanner, PE_MODIFIER_EVENT); }
+{bpf_object}		{ return str(yyscanner, PE_BPF_OBJECT); }
+{bpf_source}		{ return str(yyscanner, PE_BPF_SOURCE); }
 {name}			{ return pmu_str_check(yyscanner); }
+{name_tag}		{ return str(yyscanner, PE_NAME); }
 "/"			{ BEGIN(config); return '/'; }
 -			{ return '-'; }
 ,			{ BEGIN(event); return ','; }

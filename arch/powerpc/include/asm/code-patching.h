@@ -29,6 +29,9 @@ unsigned int create_cond_branch(const unsigned int *addr,
 				unsigned long target, int flags);
 int patch_branch(unsigned int *addr, unsigned long target, int flags);
 int patch_instruction(unsigned int *addr, unsigned int instr);
+int raw_patch_instruction(unsigned int *addr, unsigned int instr);
+int patch_instruction_site(s32 *addr, unsigned int instr);
+int patch_branch_site(s32 *site, unsigned long target, int flags);
 
 int instr_is_relative_branch(unsigned int instr);
 int instr_is_relative_link_branch(unsigned int instr);
@@ -44,8 +47,7 @@ unsigned int translate_branch(const unsigned int *dest,
 
 static inline unsigned long ppc_function_entry(void *func)
 {
-#if defined(CONFIG_PPC64)
-#if defined(_CALL_ELF) && _CALL_ELF == 2
+#ifdef PPC64_ELF_ABI_v2
 	u32 *insn = func;
 
 	/*
@@ -70,14 +72,13 @@ static inline unsigned long ppc_function_entry(void *func)
 		return (unsigned long)(insn + 2);
 	else
 		return (unsigned long)func;
-#else
+#elif defined(PPC64_ELF_ABI_v1)
 	/*
 	 * On PPC64 ABIv1 the function pointer actually points to the
 	 * function's descriptor. The first entry in the descriptor is the
 	 * address of the function text.
 	 */
 	return ((func_descr_t *)func)->entry;
-#endif
 #else
 	return (unsigned long)func;
 #endif
@@ -85,7 +86,7 @@ static inline unsigned long ppc_function_entry(void *func)
 
 static inline unsigned long ppc_global_function_entry(void *func)
 {
-#if defined(CONFIG_PPC64) && defined(_CALL_ELF) && _CALL_ELF == 2
+#ifdef PPC64_ELF_ABI_v2
 	/* PPC64 ABIv2 the global entry point is at the address */
 	return (unsigned long)func;
 #else
@@ -101,7 +102,7 @@ static inline unsigned long ppc_global_function_entry(void *func)
  */
 
 /* This must match the definition of STK_GOT in <asm/ppc_asm.h> */
-#if defined(_CALL_ELF) && _CALL_ELF == 2
+#ifdef PPC64_ELF_ABI_v2
 #define R2_STACK_OFFSET         24
 #else
 #define R2_STACK_OFFSET         40

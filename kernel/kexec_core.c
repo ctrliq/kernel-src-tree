@@ -452,12 +452,12 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 			break;
 		}
 	}
-	if (pages)
+	if (pages) {
 		image->control_page = hole_end;
 
-	/* Ensure that these pages are decrypted if SME is enabled. */
-	if (pages)
+		/* Ensure that these pages are decrypted if SME is enabled. */
 		arch_kexec_post_alloc_pages(page_address(pages), 1 << order, 0);
+	}
 
 	return pages;
 }

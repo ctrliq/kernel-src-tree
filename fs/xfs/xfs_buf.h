@@ -151,7 +151,7 @@ typedef struct xfs_buf {
 	 * which is the only bit that is touched if we hit the semaphore
 	 * fast-path on locking.
 	 */
-	struct rhash_head	b_rhash_head;	/* pag buffer hash node */
+	struct rb_node		b_rbnode;	/* rbtree node */
 	xfs_daddr_t		b_bn;		/* block number of buffer */
 	int			b_length;	/* size of buffer in BBs */
 	atomic_t		b_hold;		/* reference count */
@@ -353,10 +353,7 @@ extern void xfs_buf_terminate(void);
 #define XFS_BUF_ADDR(bp)		((bp)->b_maps[0].bm_bn)
 #define XFS_BUF_SET_ADDR(bp, bno)	((bp)->b_maps[0].bm_bn = (xfs_daddr_t)(bno))
 
-static inline void xfs_buf_set_ref(struct xfs_buf *bp, int lru_ref)
-{
-	atomic_set(&bp->b_lru_ref, lru_ref);
-}
+void xfs_buf_set_ref(struct xfs_buf *bp, int lru_ref);
 
 /*
  * If the buffer is already on the LRU, do nothing. Otherwise set the buffer

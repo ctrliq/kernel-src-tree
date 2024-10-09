@@ -233,6 +233,7 @@ static struct platform_driver pruss_driver = {
 	.remove = pruss_remove,
 	.driver = {
 		   .name = DRV_NAME,
+		   .owner = THIS_MODULE,
 		   },
 };
 

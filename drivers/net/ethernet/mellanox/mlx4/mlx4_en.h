@@ -167,7 +167,6 @@
 #define MLX4_SELFTEST_LB_MIN_MTU (MLX4_LOOPBACK_TEST_PAYLOAD + NET_IP_ALIGN + \
 				  ETH_HLEN + PREAMBLE_LEN)
 
-#define MLX4_EN_MIN_MTU		46
 #define ETH_BCAST		0xffffffffffffULL
 
 #define MLX4_EN_LOOPBACK_RETRIES	5
@@ -616,6 +615,7 @@ struct mlx4_en_priv {
 	struct mlx4_en_flow_stats_tx tx_flowstats;
 	struct mlx4_en_port_stats port_stats;
 	struct mlx4_en_xdp_stats xdp_stats;
+	struct mlx4_en_phy_stats phy_stats;
 	struct mlx4_en_stats_bitmap stats_bitmap;
 	struct list_head mc_list;
 	struct list_head curr_list;

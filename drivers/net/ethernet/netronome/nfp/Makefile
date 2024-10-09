@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 obj-$(CONFIG_NFP)	+= nfp.o
 
 nfp-objs := \
@@ -18,6 +19,7 @@ nfp-objs := \
 	    nfp_app.o \
 	    nfp_app_nic.o \
 	    nfp_devlink.o \
+	    nfp_hwmon.o \
 	    nfp_main.o \
 	    nfp_net_common.o \
 	    nfp_net_ctrl.o \
@@ -28,6 +30,7 @@ nfp-objs := \
 	    nfp_net_sriov.o \
 	    nfp_netvf_main.o \
 	    nfp_port.o \
+	    nfp_shared_buf.o \
 	    nic/main.o
 
 ifeq ($(CONFIG_NFP_APP_FLOWER),y)

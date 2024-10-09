@@ -825,16 +825,21 @@ static ssize_t show(struct kobject *kobj, struct attribute *attr, char *buf)
 	struct cpufreq_policy *policy = to_policy(kobj);
 	struct freq_attr *fattr = to_attr(attr);
 	ssize_t ret;
+	int retry = 5;
 
 	if (!down_read_trylock(&cpufreq_rwsem))
 		return -EINVAL;
 
 	/*
 	 * Use trylok to avoid lockdep circular dependency warning.
+	 * Retries 5 more times before giving up.
 	 */
-	if (!down_read_trylock(&policy->rwsem)) {
-		ret = -EBUSY;
-		goto err_out;
+	while (!down_read_trylock(&policy->rwsem)) {
+		if (retry-- <= 0) {
+			ret = -EBUSY;
+			goto err_out;
+		}
+		msleep(5);	/* Sleep 5ms before a retry */
 	}
 
 	if (fattr->show)

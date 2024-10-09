@@ -40,6 +40,7 @@
 
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <rdma/ib_cache.h>
 
 #include "ipoib.h"
 
@@ -57,7 +58,7 @@ struct ipoib_ah *ipoib_create_ah(struct net_device *dev,
 	struct ipoib_ah *ah;
 	struct ib_ah *vah;
 
-	ah = kmalloc(sizeof *ah, GFP_KERNEL);
+	ah = kmalloc(sizeof(*ah), GFP_KERNEL);
 	if (!ah)
 		return ERR_PTR(-ENOMEM);
 
@@ -201,7 +202,7 @@ static void ipoib_ib_handle_rx_wc(struct net_device *dev, struct ib_wc *wc)
 	}
 
 	memcpy(mapping, priv->rx_ring[wr_id].mapping,
-	       IPOIB_UD_RX_SG * sizeof *mapping);
+	       IPOIB_UD_RX_SG * sizeof(*mapping));
 
 	/*
 	 * If we can't allocate a new RX buffer, dump
@@ -1066,7 +1067,7 @@ static bool ipoib_dev_addr_changed_valid(struct ipoib_dev_priv *priv)
 	bool ret = false;
 
 	netdev_gid = (union ib_gid *)(priv->dev->dev_addr + 4);
-	if (ib_query_gid(priv->ca, priv->port, 0, &gid0, NULL))
+	if (rdma_query_gid(priv->ca, priv->port, 0, &gid0))
 		return false;
 
 	netif_addr_lock_bh(priv->dev);

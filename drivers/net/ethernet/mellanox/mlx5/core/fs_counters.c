@@ -33,6 +33,7 @@
 #include <linux/mlx5/driver.h>
 #include <linux/mlx5/fs.h>
 #include <linux/rbtree.h>
+#include <linux/idr_ext.h>
 #include "mlx5_core.h"
 #include "fs_core.h"
 #include "fs_cmd.h"
@@ -82,8 +83,8 @@ static struct list_head *mlx5_fc_counters_lookup_next(struct mlx5_core_dev *dev,
 
 	rcu_read_lock();
 	/* skip counters that are in idr, but not yet in counters list */
-	while ((counter = idr_get_next_ul(&fc_stats->counters_idr,
-					  &next_id)) != NULL &&
+	while ((counter = idr_get_next_ext(&fc_stats->counters_idr,
+					   &next_id)) != NULL &&
 	       list_empty(&counter->list))
 		next_id++;
 	rcu_read_unlock();
@@ -107,7 +108,7 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 	list_del(&counter->list);
 
 	spin_lock(&fc_stats->counters_idr_lock);
-	WARN_ON(!idr_remove(&fc_stats->counters_idr, counter->id));
+	idr_remove_ext(&fc_stats->counters_idr, counter->id);
 	spin_unlock(&fc_stats->counters_idr_lock);
 }
 
@@ -249,8 +250,8 @@ struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
 		idr_preload(GFP_KERNEL);
 		spin_lock(&fc_stats->counters_idr_lock);
 
-		err = idr_alloc_u32(&fc_stats->counters_idr, counter, &id, id,
-				    GFP_NOWAIT);
+		err = idr_alloc_ext(&fc_stats->counters_idr, counter, NULL, id,
+				    id + 1, GFP_NOWAIT);
 
 		spin_unlock(&fc_stats->counters_idr_lock);
 		idr_preload_end();
@@ -272,6 +273,12 @@ err_out:
 	return ERR_PTR(err);
 }
 EXPORT_SYMBOL(mlx5_fc_create);
+
+u32 mlx5_fc_id(struct mlx5_fc *counter)
+{
+	return counter->id;
+}
+EXPORT_SYMBOL(mlx5_fc_id);
 
 void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter)
 {
@@ -295,7 +302,7 @@ int mlx5_init_fc_stats(struct mlx5_core_dev *dev)
 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
 
 	spin_lock_init(&fc_stats->counters_idr_lock);
-	idr_init(&fc_stats->counters_idr);
+	idr_init_ext(&fc_stats->counters_idr);
 	INIT_LIST_HEAD(&fc_stats->counters);
 	init_llist_head(&fc_stats->addlist);
 	init_llist_head(&fc_stats->dellist);
@@ -321,7 +328,7 @@ void mlx5_cleanup_fc_stats(struct mlx5_core_dev *dev)
 	destroy_workqueue(dev->priv.fc_stats.wq);
 	dev->priv.fc_stats.wq = NULL;
 
-	idr_destroy(&fc_stats->counters_idr);
+	idr_destroy_ext(&fc_stats->counters_idr);
 
 	tmplist = llist_del_all(&fc_stats->addlist);
 	llist_for_each_entry_safe(counter, tmp, tmplist, addlist)

@@ -222,7 +222,7 @@ struct ib_fmr_pool *ib_create_fmr_pool(struct ib_pd             *pd,
 	device = pd->device;
 	if (!device->alloc_fmr    || !device->dealloc_fmr  ||
 	    !device->map_phys_fmr || !device->unmap_fmr) {
-		pr_info(PFX "Device %s does not support FMRs\n", device->name);
+		dev_info(&device->dev, "Device does not support FMRs\n");
 		return ERR_PTR(-ENOSYS);
 	}
 
@@ -244,8 +244,9 @@ struct ib_fmr_pool *ib_create_fmr_pool(struct ib_pd             *pd,
 
 	if (params->cache) {
 		pool->cache_bucket =
-			kmalloc(IB_FMR_HASH_SIZE * sizeof *pool->cache_bucket,
-				GFP_KERNEL);
+			kmalloc_array(IB_FMR_HASH_SIZE,
+				      sizeof(*pool->cache_bucket),
+				      GFP_KERNEL);
 		if (!pool->cache_bucket) {
 			ret = -ENOMEM;
 			goto out_free_pool;
@@ -268,7 +269,7 @@ struct ib_fmr_pool *ib_create_fmr_pool(struct ib_pd             *pd,
 	pool->thread = kthread_run(ib_fmr_cleanup_thread,
 				   pool,
 				   "ib_fmr(%s)",
-				   device->name);
+				   dev_name(&device->dev));
 	if (IS_ERR(pool->thread)) {
 		pr_warn(PFX "couldn't start cleanup thread\n");
 		ret = PTR_ERR(pool->thread);

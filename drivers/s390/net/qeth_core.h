@@ -18,6 +18,7 @@
 #include <linux/bitops.h>
 #include <linux/seq_file.h>
 #include <linux/ethtool.h>
+#include <linux/workqueue.h>
 
 #include <net/ipv6.h>
 #include <net/if_inet6.h>
@@ -82,6 +83,18 @@ struct qeth_dbf_info {
 #define SENSE_RESETTING_EVENT_BYTE 1
 #define SENSE_RESETTING_EVENT_FLAG 0x80
 
+static inline u32 qeth_get_device_id(struct ccw_device *cdev)
+{
+	struct ccw_dev_id dev_id;
+	u32 id;
+
+	ccw_device_get_id(cdev, &dev_id);
+	id = dev_id.devno;
+	id |= (u32) (dev_id.ssid << 16);
+
+	return id;
+}
+
 /*
  * Common IO related definitions
  */
@@ -92,7 +105,8 @@ struct qeth_dbf_info {
 #define CARD_RDEV_ID(card) dev_name(&card->read.ccwdev->dev)
 #define CARD_WDEV_ID(card) dev_name(&card->write.ccwdev->dev)
 #define CARD_DDEV_ID(card) dev_name(&card->data.ccwdev->dev)
-#define CHANNEL_ID(channel) dev_name(&channel->ccwdev->dev)
+#define CCW_DEVID(cdev)		(qeth_get_device_id(cdev))
+#define CARD_DEVID(card)	(CCW_DEVID(CARD_RDEV(card)))
 
 /**
  * card stuff
@@ -664,7 +678,6 @@ struct qeth_card_blkt {
 
 #define QETH_BROADCAST_WITH_ECHO    0x01
 #define QETH_BROADCAST_WITHOUT_ECHO 0x02
-#define QETH_LAYER2_MAC_READ	    0x01
 #define QETH_LAYER2_MAC_REGISTERED  0x02
 struct qeth_card_info {
 	unsigned short unit_addr2;
@@ -710,6 +723,8 @@ struct qeth_card_options {
 	enum qeth_cq cq;
 	char hsuid[9];
 };
+
+#define	IS_LAYER2(card)	((card)->options.layer2 == 1)
 
 /*
  * thread bits for qeth_card thread masks
@@ -799,6 +814,7 @@ struct qeth_card {
 	struct qeth_seqno seqno;
 	struct qeth_card_options options;
 
+	struct workqueue_struct *event_wq;
 	wait_queue_head_t wait_q;
 	spinlock_t vlanlock;
 	spinlock_t mclock;
@@ -909,7 +925,6 @@ extern const struct attribute_group *qeth_osn_attr_groups[];
 extern const struct attribute_group qeth_device_attr_group;
 extern const struct attribute_group qeth_device_blkt_group;
 extern const struct device_type qeth_generic_devtype;
-extern struct workqueue_struct *qeth_wq;
 
 const char *qeth_get_cardname_short(struct qeth_card *);
 int qeth_realloc_buffer_pool(struct qeth_card *, int);
@@ -998,7 +1013,8 @@ void qeth_core_get_ethtool_stats(struct net_device *,
 void qeth_core_get_strings(struct net_device *, u32, u8 *);
 void qeth_core_get_drvinfo(struct net_device *, struct ethtool_drvinfo *);
 void qeth_dbf_longtext(debug_info_t *id, int level, char *text, ...);
-int qeth_core_ethtool_get_settings(struct net_device *, struct ethtool_cmd *);
+int qeth_core_ethtool_get_link_ksettings(struct net_device *netdev,
+					 struct ethtool_link_ksettings *cmd);
 int qeth_set_access_ctrl_online(struct qeth_card *card, int fallback);
 int qeth_hdr_chk_and_bounce(struct sk_buff *, struct qeth_hdr **, int);
 int qeth_configure_cq(struct qeth_card *, enum qeth_cq);

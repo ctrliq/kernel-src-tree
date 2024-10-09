@@ -102,11 +102,11 @@ xfs_find_daxdev_for_inode(
  * associated buffer_heads, paying attention to the start and end offsets that
  * we need to process on the page.
  *
- * Landmine Warning: bh->b_end_io() will call end_page_writeback() on the last
- * buffer in the IO. Once it does this, it is unsafe to access the bufferhead or
- * the page at all, as we may be racing with memory reclaim and it can free both
- * the bufferhead chain and the page as it will see the page as clean and
- * unused.
+ * Note that we open code the action in end_buffer_async_write here so that we
+ * only have to iterate over the buffers attached to the page once.  This is not
+ * only more efficient, but also ensures that we only calls end_page_writeback
+ * at the end of the iteration, and thus avoids the pitfall of having the page
+ * and buffers potentially freed after every call to end_buffer_async_write.
  */
 static void
 xfs_finish_page_writeback(
@@ -114,29 +114,44 @@ xfs_finish_page_writeback(
 	struct bio_vec		*bvec,
 	int			error)
 {
-	unsigned int		end = bvec->bv_offset + bvec->bv_len - 1;
-	struct buffer_head	*head, *bh, *next;
+	struct buffer_head	*head = page_buffers(bvec->bv_page), *bh = head;
+	bool			busy = false;
 	unsigned int		off = 0;
-	unsigned int		bsize;
+	unsigned long		flags;
 
 	ASSERT(bvec->bv_offset < PAGE_SIZE);
 	ASSERT((bvec->bv_offset & ((1 << inode->i_blkbits) - 1)) == 0);
-	ASSERT(end < PAGE_SIZE);
+	ASSERT(bvec->bv_offset + bvec->bv_len <= PAGE_SIZE);
 	ASSERT((bvec->bv_len & ((1 << inode->i_blkbits) - 1)) == 0);
 
-	bh = head = page_buffers(bvec->bv_page);
-
-	bsize = bh->b_size;
+	local_irq_save(flags);
+	bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
 	do {
-		if (off > end)
-			break;
-		next = bh->b_this_page;
-		if (off < bvec->bv_offset)
-			goto next_bh;
-		bh->b_end_io(bh, !error);
-next_bh:
-		off += bsize;
-	} while ((bh = next) != head);
+		if (off >= bvec->bv_offset &&
+		    off < bvec->bv_offset + bvec->bv_len) {
+			ASSERT(buffer_async_write(bh));
+			ASSERT(bh->b_end_io == NULL);
+
+			if (error) {
+				mark_buffer_write_io_error(bh);
+				clear_buffer_uptodate(bh);
+				SetPageError(bvec->bv_page);
+			} else {
+				set_buffer_uptodate(bh);
+			}
+			clear_buffer_async_write(bh);
+			unlock_buffer(bh);
+		} else if (buffer_async_write(bh)) {
+			ASSERT(buffer_locked(bh));
+			busy = true;
+		}
+		off += bh->b_size;
+	} while ((bh = bh->b_this_page) != head);
+	bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
+	local_irq_restore(flags);
+
+	if (!busy)
+		end_page_writeback(bvec->bv_page);
 }
 
 /*
@@ -150,8 +165,10 @@ xfs_destroy_ioend(
 	int			error)
 {
 	struct inode		*inode = ioend->io_inode;
-	struct bio		*last = ioend->io_bio;
-	struct bio		*bio, *next;
+	struct bio		*bio = &ioend->io_inline_bio;
+	struct bio		*last = ioend->io_bio, *next;
+	u64			start = bio->bi_sector;
+	bool			quiet = bio_flagged(bio, BIO_QUIET);
 
 	for (bio = &ioend->io_inline_bio; bio; bio = next) {
 		struct bio_vec	*bvec;
@@ -171,6 +188,11 @@ xfs_destroy_ioend(
 			xfs_finish_page_writeback(inode, bvec, error);
 
 		bio_put(bio);
+	}
+
+	if (unlikely(error && !quiet)) {
+		xfs_err_ratelimited(XFS_I(inode)->i_mount,
+			"writeback error on sector %llu", start);
 	}
 }
 
@@ -314,7 +336,8 @@ xfs_end_io(
 	 */
 	switch (ioend->io_type) {
 	case XFS_IO_UNWRITTEN:
-		error = xfs_iomap_write_unwritten(ip, offset, size);
+		/* writeback should never update isize */
+		error = xfs_iomap_write_unwritten(ip, offset, size, false);
 		break;
 	default:
 		ASSERT(!xfs_ioend_is_append(ioend) || ioend->io_append_trans);
@@ -437,7 +460,8 @@ xfs_start_buffer_writeback(
 	ASSERT(!buffer_delay(bh));
 	ASSERT(!buffer_unwritten(bh));
 
-	mark_buffer_async_write(bh);
+	bh->b_end_io = NULL;
+	set_buffer_async_write(bh);
 	set_buffer_uptodate(bh);
 	clear_buffer_dirty(bh);
 }
@@ -705,6 +729,14 @@ xfs_vm_invalidatepage(
 {
 	trace_xfs_invalidatepage(page->mapping->host, page, offset,
 				 length);
+
+	/*
+	 * If we are invalidating the entire page, clear the dirty state from it
+	 * so that we can check for attempts to release dirty cached pages in
+	 * xfs_vm_releasepage().
+	 */
+	if (offset == 0 && length >= PAGE_SIZE)
+		cancel_dirty_page(page, PAGE_CACHE_SIZE);
 	block_invalidatepage_range(page, offset, length);
 }
 
@@ -795,13 +827,13 @@ xfs_writepage_map(
 	struct writeback_control *wbc,
 	struct inode		*inode,
 	struct page		*page,
-	loff_t			offset,
-	uint64_t              end_offset)
+	uint64_t		end_offset)
 {
 	LIST_HEAD(submit_list);
 	struct xfs_ioend	*ioend, *next;
 	struct buffer_head	*bh, *head;
 	ssize_t			len = 1 << inode->i_blkbits;
+	uint64_t		offset;
 	int			error = 0;
 	int			count = 0;
 	int			uptodate = 1;
@@ -1042,7 +1074,7 @@ xfs_do_writepage(
 		end_offset = offset;
 	}
 
-	return xfs_writepage_map(wpc, wbc, inode, page, offset, end_offset);
+	return xfs_writepage_map(wpc, wbc, inode, page, end_offset);
 
 redirty:
 	redirty_page_for_writepage(wbc, page);
@@ -1114,12 +1146,17 @@ xfs_vm_releasepage(
 	 * mm accommodates an old ext3 case where clean pages might not have had
 	 * the dirty bit cleared. Thus, it can send actual dirty pages to
 	 * ->releasepage() via shrink_active_list(). Conversely,
-	 * block_invalidatepage() can send pages that are still marked dirty
-	 * but otherwise have invalidated buffers.
+	 * block_invalidatepage() can send pages that are still marked dirty but
+	 * otherwise have invalidated buffers.
 	 *
-	 * We've historically freed buffers on the latter. Instead, quietly
-	 * filter out all dirty pages to avoid spurious buffer state warnings.
-	 * This can likely be removed once shrink_active_list() is fixed.
+	 * We want to release the latter to avoid unnecessary buildup of the
+	 * LRU, so xfs_vm_invalidatepage() clears the page dirty flag on pages
+	 * that are entirely invalidated and need to be released.  Hence the
+	 * only time we should get dirty pages here is through
+	 * shrink_active_list() and so we can simply skip those now.
+	 *
+	 * warn if we've left any lingering delalloc/unwritten buffers on clean
+	 * or invalidated pages we are about to release.
 	 *
 	 * RHEL7: Actually, XFS and the buffered write mechanism in RHEL can
 	 * also result in dirty pages with clean buffers in the event of a write
@@ -1474,6 +1511,19 @@ xfs_end_io_direct_write(
 	}
 
 	/*
+	 * Unwritten conversion updates the in-core isize after extent
+	 * conversion but before updating the on-disk size. Updating isize any
+	 * earlier allows a racing dio read to find unwritten extents before
+	 * they are converted.
+	 */
+	if (flags & XFS_DIO_FLAG_UNWRITTEN) {
+		trace_xfs_end_io_direct_write_unwritten(ip, offset, size);
+
+		error = xfs_iomap_write_unwritten(ip, offset, size, true);
+		return;
+	}
+
+	/*
 	 * We need to update the in-core inode size here so that we don't end up
 	 * with the on-disk inode size being outside the in-core inode size. We
 	 * have no other method of updating EOF for AIO, so always do it here
@@ -1489,11 +1539,7 @@ xfs_end_io_direct_write(
 		i_size_write(inode, offset + size);
 	spin_unlock_irqrestore(&ip->i_size_lock, irqflags);
 
-	if (flags & XFS_DIO_FLAG_UNWRITTEN) {
-		trace_xfs_end_io_direct_write_unwritten(ip, offset, size);
-
-		error = xfs_iomap_write_unwritten(ip, offset, size);
-	} else if (flags & XFS_DIO_FLAG_APPEND) {
+	if (flags & XFS_DIO_FLAG_APPEND) {
 		trace_xfs_end_io_direct_write_append(ip, offset, size);
 
 		error = xfs_setfilesize(ip, offset, size);

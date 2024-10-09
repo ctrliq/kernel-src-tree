@@ -31,10 +31,10 @@ static void nft_log_eval(const struct nft_expr *expr,
 			 const struct nft_pktinfo *pkt)
 {
 	const struct nft_log *priv = nft_expr_priv(expr);
-	struct net *net = dev_net(pkt->in ? pkt->in : pkt->out);
 
-	nf_log_packet(net, pkt->pf, pkt->hook, pkt->skb, pkt->in,
-		      pkt->out, &priv->loginfo, "%s", priv->prefix);
+	nf_log_packet(nft_net(pkt), nft_pf(pkt), nft_hook(pkt), pkt->skb,
+		      nft_in(pkt), nft_out(pkt), &priv->loginfo, "%s",
+		      priv->prefix);
 }
 
 static const struct nla_policy nft_log_policy[NFTA_LOG_MAX + 1] = {

@@ -53,7 +53,7 @@ static struct hpet_scope ir_hpet[MAX_HPET_TBS];
  * in single-threaded environment with interrupt disabled, so no need to tabke
  * the dmar_global_lock.
  */
-static DEFINE_RAW_SPINLOCK(irq_2_ir_lock);
+DEFINE_RAW_SPINLOCK(irq_2_ir_lock);
 
 static void iommu_disable_irq_remapping(struct intel_iommu *iommu);
 static int __init parse_ioapics_under_ir(void);

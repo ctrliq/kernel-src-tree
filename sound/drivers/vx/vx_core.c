@@ -643,10 +643,7 @@ static void vx_proc_read(struct snd_info_entry *entry, struct snd_info_buffer *b
 
 static void vx_proc_init(struct vx_core *chip)
 {
-	struct snd_info_entry *entry;
-
-	if (! snd_card_proc_new(chip->card, "vx-status", &entry))
-		snd_info_set_text_ops(entry, chip, vx_proc_read);
+	snd_card_ro_proc_new(chip->card, "vx-status", chip, vx_proc_read);
 }
 
 
@@ -815,18 +812,3 @@ struct vx_core *snd_vx_create(struct snd_card *card, struct snd_vx_hardware *hw,
 }
 
 EXPORT_SYMBOL(snd_vx_create);
-
-/*
- * module entries
- */
-static int __init alsa_vx_core_init(void)
-{
-	return 0;
-}
-
-static void __exit alsa_vx_core_exit(void)
-{
-}
-
-module_init(alsa_vx_core_init)
-module_exit(alsa_vx_core_exit)

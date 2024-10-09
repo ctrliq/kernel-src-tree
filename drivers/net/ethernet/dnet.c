@@ -280,11 +280,11 @@ static int dnet_mii_probe(struct net_device *dev)
 
 	/* attach the mac to the phy */
 	if (bp->capabilities & DNET_HAS_RMII) {
-		phydev = phy_connect(dev, dev_name(&phydev->dev),
+		phydev = phy_connect(dev, phydev_name(phydev),
 				     &dnet_handle_link_change,
 				     PHY_INTERFACE_MODE_RMII);
 	} else {
-		phydev = phy_connect(dev, dev_name(&phydev->dev),
+		phydev = phy_connect(dev, phydev_name(phydev),
 				     &dnet_handle_link_change,
 				     PHY_INTERFACE_MODE_MII);
 	}
@@ -922,9 +922,7 @@ static int dnet_probe(struct platform_device *pdev)
 	       (bp->capabilities & DNET_HAS_GIGABIT) ? "" : "no ",
 	       (bp->capabilities & DNET_HAS_DMA) ? "" : "no ");
 	phydev = bp->phy_dev;
-	dev_info(&pdev->dev, "attached PHY driver [%s] "
-	       "(mii_bus:phy_addr=%s, irq=%d)\n",
-	       phydev->drv->name, dev_name(&phydev->dev), phydev->irq);
+	phy_attached_info(phydev);
 
 	return 0;
 

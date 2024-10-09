@@ -582,7 +582,7 @@ static __init int bts_init(void)
 	if (!boot_cpu_has(X86_FEATURE_DTES64) || !x86_pmu.bts)
 		return -ENODEV;
 
-	if (boot_cpu_has(X86_FEATURE_PTI)) {
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
 		/*
 		 * BTS hardware writes through a virtual memory map we must
 		 * either use the kernel physical map, or the user mapping of
@@ -598,7 +598,7 @@ static __init int bts_init(void)
 		 * For now, disable this driver when using PTI.
 		 */
 		return -ENODEV;
-	}
+#endif
 
 	bts_pmu.capabilities	= PERF_PMU_CAP_AUX_NO_SG | PERF_PMU_CAP_ITRACE |
 				  PERF_PMU_CAP_EXCLUSIVE;

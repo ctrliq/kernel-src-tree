@@ -48,6 +48,10 @@
 
 static const struct vm_operations_struct xfs_file_vm_ops;
 
+STATIC ssize_t
+xfs_file_aio_write_checks(struct file *file, loff_t *pos, size_t *count,
+			  int *iolock);
+
 /*
  * Locking primitives for read and write IO paths to ensure we consistently use
  * and order the inode->i_mutex, ip->i_lock and ip->i_iolock.
@@ -461,6 +465,7 @@ xfs_file_splice_write(
 	struct inode		*inode = outfilp->f_mapping->host;
 	struct xfs_inode	*ip = XFS_I(inode);
 	ssize_t			ret;
+	int			iolock = XFS_IOLOCK_EXCL;
 
 	/*
 	 * For dax, we need to avoid the page cache.  Locking and stats will
@@ -475,16 +480,21 @@ xfs_file_splice_write(
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount))
 		return -EIO;
 
-	xfs_rw_ilock(ip, XFS_IOLOCK_EXCL);
+	xfs_rw_ilock(ip, iolock);
 
 	trace_xfs_file_splice_write(ip, count, *ppos);
+
+	ret = xfs_file_aio_write_checks(outfilp, ppos, &count, &iolock);
+	if (ret)
+		goto out;
 
 	ret = splice_write_to_file(pipe, outfilp, ppos, count, flags,
 					xfs_file_splice_write_actor);
 	if (ret > 0)
 		XFS_STATS_ADD(ip->i_mount, xs_write_bytes, ret);
 
-	xfs_rw_iunlock(ip, XFS_IOLOCK_EXCL);
+out:
+	xfs_rw_iunlock(ip, iolock);
 	return ret;
 }
 
@@ -566,8 +576,6 @@ restart:
 	 */
 	spin_lock_irqsave(&ip->i_size_lock, flags);
 	if (*pos > i_size_read(inode)) {
-		bool	zero = false;
-
 		spin_unlock_irqrestore(&ip->i_size_lock, flags);
 		if (!drained_dio) {
 			if (*iolock == XFS_IOLOCK_SHARED) {
@@ -587,7 +595,7 @@ restart:
 			drained_dio = true;
 			goto restart;
 		}
-		error = xfs_zero_eof(ip, *pos, i_size_read(inode), &zero);
+		error = xfs_zero_eof(ip, *pos, i_size_read(inode), NULL);
 		if (error)
 			return error;
 	} else
@@ -704,9 +712,11 @@ xfs_file_dio_aio_write(
 	}
 
 	/*
-	 * If we are doing unaligned IO, wait for all other IO to drain,
-	 * otherwise demote the lock if we had to take the exclusive lock
-	 * for other reasons in xfs_file_aio_write_checks.
+	 * If we are doing unaligned IO, we can't allow any other overlapping IO
+	 * in-flight at the same time or we risk data corruption. Wait for all
+	 * other IO to drain before we submit. If the IO is aligned, demote the
+	 * iolock if we had to take the exclusive lock in
+	 * xfs_file_aio_write_checks() for other reasons.
 	 */
 	if (unaligned_io)
 		inode_dio_wait(inode);
@@ -736,6 +746,13 @@ xfs_file_dio_aio_write(
 		iocb->ki_pos = pos;
 	}
 
+	/*
+	 * If unaligned, this is the only IO in-flight. If it has not yet
+	 * completed, wait on it before we release the iolock to prevent
+	 * subsequent overlapping IO.
+	 */
+	if (ret == -EIOCBQUEUED && unaligned_io)
+		inode_dio_wait(inode);
 out:
 	xfs_rw_iunlock(ip, iolock);
 
@@ -967,6 +984,11 @@ xfs_break_layouts(
 	return error;
 }
 
+#define	XFS_FALLOC_FL_SUPPORTED						\
+		(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |		\
+		 FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE |	\
+		 FALLOC_FL_INSERT_RANGE)
+
 STATIC long
 xfs_file_fallocate(
 	struct file		*file,
@@ -980,11 +1002,11 @@ xfs_file_fallocate(
 	enum xfs_prealloc_flags	flags = 0;
 	uint			iolock = XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL;
 	loff_t			new_size = 0;
+	bool			do_file_insert = false;
 
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
-	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
-		     FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE))
+	if (mode & ~XFS_FALLOC_FL_SUPPORTED)
 		return -EOPNOTSUPP;
 
 	xfs_ilock(ip, iolock);
@@ -1018,6 +1040,31 @@ xfs_file_fallocate(
 		error = xfs_collapse_file_space(ip, offset, len);
 		if (error)
 			goto out_unlock;
+	} else if (mode & FALLOC_FL_INSERT_RANGE) {
+		unsigned int	blksize_mask = (1 << inode->i_blkbits) - 1;
+		loff_t		isize = i_size_read(inode);
+
+		if (offset & blksize_mask || len & blksize_mask) {
+			error = -EINVAL;
+			goto out_unlock;
+		}
+
+		/*
+		 * New inode size must not exceed ->s_maxbytes, accounting for
+		 * possible signed overflow.
+		 */
+		if (inode->i_sb->s_maxbytes - isize < len) {
+			error = -EFBIG;
+			goto out_unlock;
+		}
+		new_size = isize + len;
+
+		/* Offset should be less than i_size */
+		if (offset >= isize) {
+			error = -EINVAL;
+			goto out_unlock;
+		}
+		do_file_insert = true;
 	} else {
 		flags |= XFS_PREALLOC_SET;
 
@@ -1052,7 +1099,18 @@ xfs_file_fallocate(
 		iattr.ia_valid = ATTR_SIZE;
 		iattr.ia_size = new_size;
 		error = xfs_vn_setattr_size(file_dentry(file), &iattr);
+		if (error)
+			goto out_unlock;
 	}
+
+	/*
+	 * Perform hole insertion now that the file size has been
+	 * updated so that if we crash during the operation we don't
+	 * leave shifted extents past EOF and hence losing access to
+	 * the data that is contained within them.
+	 */
+	if (do_file_insert)
+		error = xfs_insert_file_space(ip, offset, len);
 
 out_unlock:
 	xfs_iunlock(ip, iolock);
@@ -1276,7 +1334,7 @@ xfs_file_mmap(
 	file_accessed(filp);
 	vma->vm_ops = &xfs_file_vm_ops;
 	if (IS_DAX(file_inode(filp)))
-		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+		vma->vm_flags |= VM_HUGEPAGE;
 	vma->vm_flags2 |= VM_PFN_MKWRITE | VM_HUGE_FAULT;
 	return 0;
 }

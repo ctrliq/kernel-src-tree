@@ -85,20 +85,11 @@ save_stack_trace_tsk_reliable(struct task_struct *tsk,
 				struct stack_trace *trace)
 {
 	unsigned long sp;
+	unsigned long newsp;
 	unsigned long stack_page = (unsigned long)task_stack_page(tsk);
 	unsigned long stack_end;
 	int graph_idx = 0;
-
-	/*
-	 * The last frame (unwinding first) may not yet have saved
-	 * its LR onto the stack.
-	 */
-	int firstframe = 1;
-
-	if (tsk == current)
-		sp = __get_SP();
-	else
-		sp = tsk->thread.ksp;
+	bool firstframe;
 
 	stack_end = stack_page + THREAD_SIZE;
 	if (!is_idle_task(tsk)) {
@@ -125,14 +116,20 @@ save_stack_trace_tsk_reliable(struct task_struct *tsk,
 		stack_end -= STACK_FRAME_OVERHEAD;
 	}
 
+	if (tsk == current)
+		sp = __get_SP();
+	else
+		sp = tsk->thread.ksp;
+
 	if (sp < stack_page + sizeof(struct thread_struct) ||
 	    sp > stack_end - STACK_FRAME_MIN_SIZE) {
 		return -EINVAL;
 	}
 
-	for (;;) {
+	for (firstframe = true; sp != stack_end;
+	     firstframe = false, sp = newsp) {
 		unsigned long *stack = (unsigned long *) sp;
-		unsigned long newsp, ip;
+		unsigned long ip;
 
 		/* sanity check: ABI requires SP to be aligned 16 bytes. */
 		if (sp & 0xF)
@@ -153,10 +150,8 @@ save_stack_trace_tsk_reliable(struct task_struct *tsk,
 		 * rest of the frame may be uninitialized, continue to
 		 * the next.
 		 */
-		if (firstframe) {
-			firstframe = 0;
-			goto next;
-		}
+		if (firstframe)
+			continue;
 
 		/* Mark stacktraces with exception frames as unreliable. */
 		if (sp <= stack_end - STACK_INT_FRAME_SIZE &&
@@ -183,19 +178,12 @@ save_stack_trace_tsk_reliable(struct task_struct *tsk,
 			return -EINVAL;
 #endif
 
+		if (trace->nr_entries >= trace->max_entries)
+			return -E2BIG;
 		if (!trace->skip)
 			trace->entries[trace->nr_entries++] = ip;
 		else
 			trace->skip--;
-
-next:
-		if (newsp == stack_end)
-			break;
-
-		if (trace->nr_entries >= trace->max_entries)
-			return -E2BIG;
-
-		sp = newsp;
 	}
 	return 0;
 }

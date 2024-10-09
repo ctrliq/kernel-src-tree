@@ -342,8 +342,7 @@ static int intel_bts_get_next_insn(struct intel_bts_queue *btsq, u64 ip)
 	if (!thread)
 		return -1;
 
-	thread__find_addr_map(thread, cpumode, MAP__FUNCTION, ip, &al);
-	if (!al.map || !al.map->dso)
+	if (!thread__find_map(thread, cpumode, ip, &al) || !al.map->dso)
 		goto out_put;
 
 	len = dso__data_read_addr(al.map->dso, al.map, machine, ip, buf,
@@ -918,7 +917,8 @@ int intel_bts_process_auxtrace_info(union perf_event *event,
 	if (session->itrace_synth_opts && session->itrace_synth_opts->set) {
 		bts->synth_opts = *session->itrace_synth_opts;
 	} else {
-		itrace_synth_opts__set_default(&bts->synth_opts);
+		itrace_synth_opts__set_default(&bts->synth_opts,
+				session->itrace_synth_opts->default_no_sample);
 		if (session->itrace_synth_opts)
 			bts->synth_opts.thread_stack =
 				session->itrace_synth_opts->thread_stack;

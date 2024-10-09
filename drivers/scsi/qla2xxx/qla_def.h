@@ -262,8 +262,8 @@ struct name_list_extended {
 	struct get_name_list_extended *l;
 	dma_addr_t		ldma;
 	struct list_head	fcports;
-	spinlock_t		fcports_lock;
 	u32			size;
+	u8			sent;
 };
 /*
  * Timeout timer counts in seconds
@@ -390,6 +390,7 @@ struct srb_iocb {
 #define SRB_LOGIN_COND_PLOGI	BIT_1
 #define SRB_LOGIN_SKIP_PRLI	BIT_2
 #define SRB_LOGIN_NVME_PRLI	BIT_3
+#define SRB_LOGIN_PRLI_ONLY	BIT_4
 			uint16_t data[2];
 			u32 iop[2];
 		} logio;
@@ -409,6 +410,8 @@ struct srb_iocb {
 			struct completion comp;
 			struct els_plogi_payload *els_plogi_pyld;
 			struct els_plogi_payload *els_resp_pyld;
+			u32 tx_size;
+			u32 rx_size;
 			dma_addr_t els_plogi_pyld_dma;
 			dma_addr_t els_resp_pyld_dma;
 			uint32_t	fw_status[3];
@@ -526,6 +529,7 @@ struct srb_iocb {
 enum {
 	TYPE_SRB,
 	TYPE_TGT_CMD,
+	TYPE_TGT_TMCMD,		/* task management */
 };
 
 typedef struct srb {
@@ -2287,7 +2291,6 @@ struct ct_sns_desc {
 enum discovery_state {
 	DSC_DELETED,
 	DSC_GNN_ID,
-	DSC_GID_PN,
 	DSC_GNL,
 	DSC_LOGIN_PEND,
 	DSC_LOGIN_FAILED,
@@ -2312,7 +2315,6 @@ enum login_state {	/* FW control Target side */
 enum fcport_mgt_event {
 	FCME_RELOGIN = 1,
 	FCME_RSCN,
-	FCME_GIDPN_DONE,
 	FCME_PLOGI_DONE,	/* Initiator side sent LLIOCB */
 	FCME_PRLI_DONE,
 	FCME_GNL_DONE,
@@ -2323,6 +2325,7 @@ enum fcport_mgt_event {
 	FCME_ADISC_DONE,
 	FCME_GNNID_DONE,
 	FCME_GFPNID_DONE,
+	FCME_ELS_PLOGI_DONE,
 };
 
 enum rscn_addr_format {
@@ -2357,7 +2360,7 @@ typedef struct fc_port {
 	unsigned int login_succ:1;
 	unsigned int query:1;
 	unsigned int id_changed:1;
-	unsigned int rscn_rcvd:1;
+	unsigned int scan_needed:1;
 
 	struct work_struct nvme_del_work;
 	struct completion nvme_del_done;
@@ -2381,11 +2384,13 @@ typedef struct fc_port {
 	unsigned long expires;
 	struct list_head del_list_entry;
 	struct work_struct free_work;
-
+	struct work_struct reg_work;
+	uint64_t jiffies_at_registration;
 	struct qlt_plogi_ack_t *plogi_link[QLT_PLOGI_LINK_MAX];
 
 	uint16_t tgt_id;
 	uint16_t old_tgt_id;
+	uint16_t sec_since_registration;
 
 	uint8_t fcp_prio;
 
@@ -2418,7 +2423,9 @@ typedef struct fc_port {
 	struct qla_tgt_sess *tgt_session;
 	struct ct_sns_desc ct_desc;
 	enum discovery_state disc_state;
+	enum discovery_state next_disc_state;
 	enum login_state fw_login_state;
+	unsigned long dm_login_expire;
 	unsigned long plogi_nack_done_deadline;
 
 	u32 login_gen, last_login_gen;
@@ -2429,7 +2436,8 @@ typedef struct fc_port {
 	u8 iocb[IOCB_SIZE];
 	u8 current_login_state;
 	u8 last_login_state;
-	struct completion n2n_done;
+	u16 n2n_link_reset_cnt;
+	u16 n2n_chip_reset;
 } fc_port_t;
 
 #define QLA_FCPORT_SCAN		1
@@ -3217,14 +3225,12 @@ enum qla_work_type {
 	QLA_EVT_ASYNC_ADISC,
 	QLA_EVT_UEVENT,
 	QLA_EVT_AENFX,
-	QLA_EVT_GIDPN,
 	QLA_EVT_GPNID,
 	QLA_EVT_UNMAP,
 	QLA_EVT_NEW_SESS,
 	QLA_EVT_GPDB,
 	QLA_EVT_PRLI,
 	QLA_EVT_GPSC,
-	QLA_EVT_UPD_FCPORT,
 	QLA_EVT_GNL,
 	QLA_EVT_NACK,
 	QLA_EVT_RELOGIN,
@@ -3237,6 +3243,7 @@ enum qla_work_type {
 	QLA_EVT_GFPNID,
 	QLA_EVT_SP_RETRY,
 	QLA_EVT_IIDMA,
+	QLA_EVT_ELS_PLOGI,
 };
 
 
@@ -3610,6 +3617,7 @@ struct qla_hw_data {
 		uint32_t	using_lr_setting:1;
 		uint32_t	rida_fmt2:1;
 		uint32_t	purge_mbox:1;
+		uint32_t        n2n_bigger:1;
 	} flags;
 
 	uint16_t max_exchg;
@@ -3918,6 +3926,9 @@ struct qla_hw_data {
 	int		exchoffld_size;
 	int 		exchoffld_count;
 
+	/* n2n */
+	struct els_plogi_payload plogi_els_payld;
+
 	void            *swl;
 
 	/* These are used by mailbox operations. */
@@ -4185,6 +4196,10 @@ struct qla_hw_data {
 
 	atomic_t        nvme_active_aen_cnt;
 	uint16_t        nvme_last_rptd_aen;             /* Last recorded aen count */
+
+	atomic_t zio_threshold;
+	uint16_t last_zio_threshold;
+#define DEFAULT_ZIO_THRESHOLD 64
 };
 
 #define FW_ABILITY_MAX_SPEED_MASK	0xFUL
@@ -4257,17 +4272,18 @@ typedef struct scsi_qla_host {
 #define FCOE_CTX_RESET_NEEDED	18	/* Initiate FCoE context reset */
 #define MPI_RESET_NEEDED	19	/* Initiate MPI FW reset */
 #define ISP_QUIESCE_NEEDED	20	/* Driver need some quiescence */
-#define FREE_BIT 21
+#define N2N_LINK_RESET		21
 #define PORT_UPDATE_NEEDED	22
 #define FX00_RESET_RECOVERY	23
 #define FX00_TARGET_SCAN	24
 #define FX00_CRITEMP_RECOVERY	25
 #define FX00_HOST_INFO_RESEND	26
 #define QPAIR_ONLINE_CHECK_NEEDED	27
-#define SET_ZIO_THRESHOLD_NEEDED	28
+#define SET_NVME_ZIO_THRESHOLD_NEEDED	28
 #define DETECT_SFP_CHANGE	29
 #define N2N_LOGIN_NEEDED	30
 #define IOCB_WORK_ACTIVE	31
+#define SET_ZIO_THRESHOLD_NEEDED 32
 
 	unsigned long	pci_flags;
 #define PFLG_DISCONNECTED	0	/* PCI device removed */
@@ -4370,6 +4386,13 @@ typedef struct scsi_qla_host {
 	atomic_t	vref_count;
 	struct qla8044_reset_template reset_tmplt;
 	uint16_t	bbcr;
+
+	uint16_t u_ql2xexchoffld;
+	uint16_t u_ql2xiniexchg;
+	uint16_t qlini_mode;
+	uint16_t ql2xexchoffld;
+	uint16_t ql2xiniexchg;
+
 	struct name_list_extended gnl;
 	/* Count of active session/fcport */
 	int fcport_count;

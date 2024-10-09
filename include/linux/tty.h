@@ -10,6 +10,7 @@
 #include <linux/mutex.h>
 #include <linux/tty_flags.h>
 #include <uapi/linux/tty.h>
+#include <linux/rwsem.h>
 
 
 
@@ -204,7 +205,7 @@ struct tty_port {
 #define TTYP_FLUSHING			1  /* Flushing to ldisc in progress */
 #define TTYP_FLUSHPENDING		2  /* Queued buffer flush pending */
 	unsigned char		console:1,	/* port is a console */
-				low_latency:1;	/* direct buffer flush */
+				low_latency:1;	/* optional: tune for latency */
 	struct mutex		mutex;		/* Locking */
 	struct mutex		buf_mutex;	/* Buffer alloc lock */
 	unsigned char		*xmit_buf;	/* Optional buffer */
@@ -244,9 +245,9 @@ struct tty_struct {
 
 	struct mutex atomic_write_lock;
 	struct mutex legacy_mutex;
-	struct mutex termios_mutex;
+	RH_KABI_DEPRECATE(struct mutex, termios_mutex)
 	spinlock_t ctrl_lock;
-	/* Termios values are protected by the termios mutex */
+	/* Termios values are protected by the termios rwsem */
 	struct ktermios termios, termios_locked;
 	struct termiox *termiox;	/* May be NULL for unsupported */
 	char name[64];
@@ -254,7 +255,7 @@ struct tty_struct {
 	struct pid *session;
 	unsigned long flags;
 	int count;
-	struct winsize winsize;		/* termios mutex */
+	struct winsize winsize;		/* winsize_mutex */
 	unsigned char stopped:1, hw_stopped:1, flow_stopped:1, packet:1;
 	unsigned char ctrl_status;	/* ctrl_lock */
 	unsigned int receive_room;	/* Bytes free for queue */
@@ -281,6 +282,8 @@ struct tty_struct {
 	struct tty_port *port;
 
 	RH_KABI_EXTEND(struct ld_semaphore ldisc_sem)
+	RH_KABI_EXTEND(struct rw_semaphore termios_rwsem)
+	RH_KABI_EXTEND(struct mutex winsize_mutex)
 };
 
 /* Each of a tty's open files has private_data pointing to tty_file_private */
@@ -562,6 +565,19 @@ extern void tty_ldisc_init(struct tty_struct *tty);
 extern void tty_ldisc_deinit(struct tty_struct *tty);
 extern void tty_ldisc_begin(void);
 
+static inline int tty_ldisc_receive_buf(struct tty_ldisc *ld, unsigned char *p,
+					char *f, int count)
+{
+	if (ld->ops->receive_buf2)
+		count = ld->ops->receive_buf2(ld->tty, p, f, count);
+	else {
+		count = min_t(int, count, ld->tty->receive_room);
+		if (count)
+			ld->ops->receive_buf(ld->tty, p, f, count);
+	}
+	return count;
+}
+
 
 /* n_tty.c */
 extern struct tty_ldisc_ops tty_ldisc_N_TTY;
@@ -569,7 +585,7 @@ extern void n_tty_inherit_ops(struct tty_ldisc_ops *ops);
 
 /* tty_audit.c */
 #ifdef CONFIG_AUDIT
-extern void tty_audit_add_data(struct tty_struct *tty, unsigned char *data,
+extern void tty_audit_add_data(struct tty_struct *tty, const void *data,
 			       size_t size, unsigned icanon);
 extern void tty_audit_exit(void);
 extern void tty_audit_fork(struct signal_struct *sig);
@@ -578,7 +594,7 @@ extern void tty_audit_push(struct tty_struct *tty);
 extern int tty_audit_push_current(void);
 #else
 static inline void tty_audit_add_data(struct tty_struct *tty,
-		unsigned char *data, size_t size, unsigned icanon)
+		const void *data, size_t size, unsigned icanon)
 {
 }
 static inline void tty_audit_tiocsti(struct tty_struct *tty, char ch)

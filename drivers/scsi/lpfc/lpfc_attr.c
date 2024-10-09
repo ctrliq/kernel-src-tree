@@ -883,6 +883,42 @@ lpfc_link_state_show(struct device *dev, struct device_attribute *attr,
 		}
 	}
 
+	if ((phba->sli_rev == LPFC_SLI_REV4) &&
+	    ((bf_get(lpfc_sli_intf_if_type,
+	     &phba->sli4_hba.sli_intf) ==
+	     LPFC_SLI_INTF_IF_TYPE_6))) {
+		struct lpfc_trunk_link link = phba->trunk_link;
+
+		if (bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba))
+			len += snprintf(buf + len, PAGE_SIZE - len,
+				"Trunk port 0: Link %s %s\n",
+				(link.link0.state == LPFC_LINK_UP) ?
+				 "Up" : "Down. ",
+				trunk_errmsg[link.link0.fault]);
+
+		if (bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba))
+			len += snprintf(buf + len, PAGE_SIZE - len,
+				"Trunk port 1: Link %s %s\n",
+				(link.link1.state == LPFC_LINK_UP) ?
+				 "Up" : "Down. ",
+				trunk_errmsg[link.link1.fault]);
+
+		if (bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba))
+			len += snprintf(buf + len, PAGE_SIZE - len,
+				"Trunk port 2: Link %s %s\n",
+				(link.link2.state == LPFC_LINK_UP) ?
+				 "Up" : "Down. ",
+				trunk_errmsg[link.link2.fault]);
+
+		if (bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba))
+			len += snprintf(buf + len, PAGE_SIZE - len,
+				"Trunk port 3: Link %s %s\n",
+				(link.link3.state == LPFC_LINK_UP) ?
+				 "Up" : "Down. ",
+				trunk_errmsg[link.link3.fault]);
+
+	}
+
 	return len;
 }
 
@@ -1153,6 +1189,82 @@ out:
 		return -EIO;
 
 	return 0;
+}
+
+/**
+ * lpfc_reset_pci_bus - resets PCI bridge controller's secondary bus of an HBA
+ * @phba: lpfc_hba pointer.
+ *
+ * Description:
+ * Issues a PCI secondary bus reset for the phba->pcidev.
+ *
+ * Notes:
+ * First walks the bus_list to ensure only PCI devices with Emulex
+ * vendor id, device ids that support hot reset, only one occurrence
+ * of function 0, and all ports on the bus are in offline mode to ensure the
+ * hot reset only affects one valid HBA.
+ *
+ * Returns:
+ * -ENOTSUPP, cfg_enable_hba_reset must be of value 2
+ * -ENODEV,   NULL ptr to pcidev
+ * -EBADSLT,  detected invalid device
+ * -EBUSY,    port is not in offline state
+ *      0,    successful
+ */
+int
+lpfc_reset_pci_bus(struct lpfc_hba *phba)
+{
+	struct pci_dev *pdev = phba->pcidev;
+	struct Scsi_Host *shost = NULL;
+	struct lpfc_hba *phba_other = NULL;
+	struct pci_dev *ptr = NULL;
+	int res;
+
+	if (phba->cfg_enable_hba_reset != 2)
+		return -ENOTSUPP;
+
+	if (!pdev) {
+		lpfc_printf_log(phba, KERN_INFO, LOG_INIT, "8345 pdev NULL!\n");
+		return -ENODEV;
+	}
+
+	res = lpfc_check_pci_resettable(phba);
+	if (res)
+		return res;
+
+	/* Walk the list of devices on the pci_dev's bus */
+	list_for_each_entry(ptr, &pdev->bus->devices, bus_list) {
+		/* Check port is offline */
+		shost = pci_get_drvdata(ptr);
+		if (shost) {
+			phba_other =
+				((struct lpfc_vport *)shost->hostdata)->phba;
+			if (!(phba_other->pport->fc_flag & FC_OFFLINE_MODE)) {
+				lpfc_printf_log(phba_other, KERN_INFO, LOG_INIT,
+						"8349 WWPN = 0x%02x%02x%02x%02x"
+						"%02x%02x%02x%02x is not "
+						"offline!\n",
+						phba_other->wwpn[0],
+						phba_other->wwpn[1],
+						phba_other->wwpn[2],
+						phba_other->wwpn[3],
+						phba_other->wwpn[4],
+						phba_other->wwpn[5],
+						phba_other->wwpn[6],
+						phba_other->wwpn[7]);
+				return -EBUSY;
+			}
+		}
+	}
+
+	/* Issue PCI bus reset */
+	res = pci_reset_bus(pdev->bus);
+	if (res) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+				"8350 PCI reset bus failed: %d\n", res);
+	}
+
+	return res;
 }
 
 /**
@@ -1430,6 +1542,66 @@ lpfc_nport_evt_cnt_show(struct device *dev, struct device_attribute *attr,
 	return snprintf(buf, PAGE_SIZE, "%d\n", phba->nport_event_cnt);
 }
 
+int
+lpfc_set_trunking(struct lpfc_hba *phba, char *buff_out)
+{
+	LPFC_MBOXQ_t *mbox = NULL;
+	unsigned long val = 0;
+	char *pval = 0;
+	int rc = 0;
+
+	if (!strncmp("enable", buff_out,
+				 strlen("enable"))) {
+		pval = buff_out + strlen("enable") + 1;
+		rc = kstrtoul(pval, 0, &val);
+		if (rc)
+			return rc; /* Invalid  number */
+	} else if (!strncmp("disable", buff_out,
+				 strlen("disable"))) {
+		val = 0;
+	} else {
+		return -EINVAL;  /* Invalid command */
+	}
+
+	switch (val) {
+	case 0:
+		val = 0x0; /* Disable */
+		break;
+	case 2:
+		val = 0x1; /* Enable two port trunk */
+		break;
+	case 4:
+		val = 0x2; /* Enable four port trunk */
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
+			"0070 Set trunk mode with val %ld ", val);
+
+	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
+	if (!mbox)
+		return -ENOMEM;
+
+	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_FCOE,
+			 LPFC_MBOX_OPCODE_FCOE_FC_SET_TRUNK_MODE,
+			 12, LPFC_SLI4_MBX_EMBED);
+
+	bf_set(lpfc_mbx_set_trunk_mode,
+	       &mbox->u.mqe.un.set_trunk_mode,
+	       val);
+	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_POLL);
+	if (rc)
+		lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
+				"0071 Set trunk mode failed with status: %d",
+				rc);
+	if (rc != MBX_TIMEOUT)
+		mempool_free(mbox, phba->mbox_mem_pool);
+
+	return 0;
+}
+
 /**
  * lpfc_board_mode_show - Return the state of the board
  * @dev: class device that is converted into a Scsi_host.
@@ -1522,6 +1694,11 @@ lpfc_board_mode_store(struct device *dev, struct device_attribute *attr,
 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_FW_RESET);
 	else if (strncmp(buf, "dv_reset", sizeof("dv_reset") - 1) == 0)
 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_DV_RESET);
+	else if (strncmp(buf, "pci_bus_reset", sizeof("pci_bus_reset") - 1)
+		 == 0)
+		status = lpfc_reset_pci_bus(phba);
+	else if (strncmp(buf, "trunk", sizeof("trunk") - 1) == 0)
+		status = lpfc_set_trunking(phba, (char *)buf + sizeof("trunk"));
 	else
 		status = -EINVAL;
 
@@ -5292,9 +5469,10 @@ LPFC_ATTR_R(nvme_io_channel,
 # lpfc_enable_hba_reset: Allow or prevent HBA resets to the hardware.
 #       0  = HBA resets disabled
 #       1  = HBA resets enabled (default)
-# Value range is [0,1]. Default value is 1.
+#       2  = HBA reset via PCI bus reset enabled
+# Value range is [0,2]. Default value is 1.
 */
-LPFC_ATTR_R(enable_hba_reset, 1, 0, 1, "Enable HBA resets from the driver.");
+LPFC_ATTR_RW(enable_hba_reset, 1, 0, 2, "Enable HBA resets from the driver.");
 
 /*
 # lpfc_enable_hba_heartbeat: Disable HBA heartbeat timer..
@@ -5468,6 +5646,31 @@ lpfc_sg_seg_cnt_init(struct lpfc_hba *phba, int val)
 LPFC_ATTR_R(enable_mds_diags, 0, 0, 1, "Enable MDS Diagnostics");
 
 /*
+ * lpfc_ras_fwlog_buffsize: Firmware logging host buffer size
+ *	0 = Disable firmware logging (default)
+ *	[1-4] = Multiple of 1/4th Mb of host memory for FW logging
+ * Value range [0..4]. Default value is 0
+ */
+LPFC_ATTR_RW(ras_fwlog_buffsize, 0, 0, 4, "Host memory for FW logging");
+
+/*
+ * lpfc_ras_fwlog_level: Firmware logging verbosity level
+ * Valid only if firmware logging is enabled
+ * 0(Least Verbosity) 4 (most verbosity)
+ * Value range is [0..4]. Default value is 0
+ */
+LPFC_ATTR_RW(ras_fwlog_level, 0, 0, 4, "Firmware Logging Level");
+
+/*
+ * lpfc_ras_fwlog_func: Firmware logging enabled on function number
+ * Default function which has RAS support : 0
+ * Value Range is [0..7].
+ * FW logging is a global action and enablement is via a specific
+ * port.
+ */
+LPFC_ATTR_RW(ras_fwlog_func, 0, 0, 7, "Firmware Logging Enabled on Function");
+
+/*
  * lpfc_enable_bbcr: Enable BB Credit Recovery
  *       0  = BB Credit Recovery disabled
  *       1  = BB Credit Recovery enabled (default)
@@ -5594,6 +5797,9 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_protocol,
 	&dev_attr_lpfc_xlane_supported,
 	&dev_attr_lpfc_enable_mds_diags,
+	&dev_attr_lpfc_ras_fwlog_buffsize,
+	&dev_attr_lpfc_ras_fwlog_level,
+	&dev_attr_lpfc_ras_fwlog_func,
 	&dev_attr_lpfc_enable_bbcr,
 	&dev_attr_lpfc_enable_dpp,
 	NULL,
@@ -6011,6 +6217,9 @@ lpfc_get_host_speed(struct Scsi_Host *shost)
 			break;
 		case LPFC_LINK_SPEED_64GHZ:
 			fc_host_speed(shost) = FC_PORTSPEED_64GBIT;
+			break;
+		case LPFC_LINK_SPEED_128GHZ:
+			fc_host_speed(shost) = FC_PORTSPEED_128GBIT;
 			break;
 		default:
 			fc_host_speed(shost) = FC_PORTSPEED_UNKNOWN;
@@ -6686,6 +6895,10 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	lpfc_sli_mode_init(phba, lpfc_sli_mode);
 	phba->cfg_enable_dss = 1;
 	lpfc_enable_mds_diags_init(phba, lpfc_enable_mds_diags);
+	lpfc_ras_fwlog_buffsize_init(phba, lpfc_ras_fwlog_buffsize);
+	lpfc_ras_fwlog_level_init(phba, lpfc_ras_fwlog_level);
+	lpfc_ras_fwlog_func_init(phba, lpfc_ras_fwlog_func);
+
 
 	/* If the NVME FC4 type is enabled, scale the sg_seg_cnt to
 	 * accommodate 512K and 1M IOs in a single nvme buf and supply

@@ -134,6 +134,7 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
 	struct sock *child;
+	u32 end_seq;
 
 	req->num_retrans = 0;
 	req->num_timeout = 0;
@@ -175,7 +176,16 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 				  TCP_TIMEOUT_INIT, TCP_RTO_MAX);
 
 	/* Add the child socket directly into the accept queue */
-	inet_csk_reqsk_queue_add(sk, req, child);
+	if (!inet_csk_reqsk_queue_add(sk, req, child)) {
+		tcp_rsk(req)->listener = NULL;
+		spin_lock(&queue->fastopenq->lock);
+		queue->fastopenq->qlen--;
+		spin_unlock(&queue->fastopenq->lock);
+
+		bh_unlock_sock(child);
+		sock_put(child);
+		return false;
+	}
 
 	/* Now finish processing the fastopen child socket. */
 	inet_csk(child)->icsk_af_ops->rebuild_header(child);
@@ -186,26 +196,42 @@ static bool tcp_fastopen_create_child(struct sock *sk,
 
 	/* Queue the data carried in the SYN packet. We need to first
 	 * bump skb's refcnt because the caller will attempt to free it.
+	 * Note that IPv6 might also have used skb_get() trick
+	 * in tcp_v6_conn_request() to keep this SYN around (treq->pktopts)
+	 * So we need to eventually get a clone of the packet,
+	 * before inserting it in sk_receive_queue.
 	 *
 	 * XXX (TFO) - we honor a zero-payload TFO request for now,
 	 * (any reason not to?) but no need to queue the skb since
 	 * there is no data. How about SYN+FIN?
 	 */
-	if (TCP_SKB_CB(skb)->end_seq != TCP_SKB_CB(skb)->seq + 1) {
-		skb = skb_get(skb);
-		skb_dst_drop(skb);
-		__skb_pull(skb, tcp_hdr(skb)->doff * 4);
-		skb_set_owner_r(skb, child);
-		__skb_queue_tail(&child->sk_receive_queue, skb);
-		tp->syn_data_acked = 1;
+	end_seq = TCP_SKB_CB(skb)->end_seq;
+	if (end_seq != TCP_SKB_CB(skb)->seq + 1) {
+		struct sk_buff *skb2;
 
-		/* u64_stats_update_begin(&tp->syncp) not needed here,
-		 * as we certainly are not changing upper 32bit value (0)
-		 */
-		tp->bytes_received = TCP_SKB_CB(skb)->end_seq -
-				     TCP_SKB_CB(skb)->seq - 1;
+		if (unlikely(skb_shared(skb)))
+			skb2 = skb_clone(skb, GFP_ATOMIC);
+		else
+			skb2 = skb_get(skb);
+
+		if (likely(skb2)) {
+			skb_dst_drop(skb2);
+			__skb_pull(skb2, tcp_hdrlen(skb));
+			sk_forced_mem_schedule(sk, skb->truesize);
+			skb_set_owner_r(skb2, child);
+			__skb_queue_tail(&child->sk_receive_queue, skb2);
+			tp->syn_data_acked = 1;
+
+			/* u64_stats_update_begin(&tp->syncp) not needed here,
+			 * as we certainly are not changing upper 32bit value (0)
+			 */
+			tp->bytes_received = end_seq - TCP_SKB_CB(skb)->seq - 1;
+		} else {
+			end_seq = TCP_SKB_CB(skb)->seq + 1;
+		}
 	}
-	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = TCP_SKB_CB(skb)->end_seq;
+	tcp_rsk(req)->rcv_nxt = tp->rcv_nxt = end_seq;
+	tp->rcv_wup = tp->rcv_nxt;
 	sk->sk_data_ready(sk, 0);
 	bh_unlock_sock(child);
 	sock_put(child);

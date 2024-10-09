@@ -73,10 +73,16 @@ static inline unsigned int kstat_irqs_cpu(unsigned int irq, int cpu)
 #include <linux/irq.h>
 extern unsigned int kstat_irqs_cpu(unsigned int irq, int cpu);
 
-#define kstat_incr_irqs_this_cpu(irqno, DESC)		\
+#define __kstat_incr_irqs_this_cpu(irqno, DESC)		\
 do {							\
 	__this_cpu_inc(*(DESC)->kstat_irqs);		\
 	__this_cpu_inc(kstat.irqs_sum);			\
+} while (0)
+
+#define kstat_incr_irqs_this_cpu(irqno, DESC)		\
+do {							\
+	__kstat_incr_irqs_this_cpu(irqno, DESC);	\
+	(DESC)->tot_count++;				\
 } while (0)
 
 #endif

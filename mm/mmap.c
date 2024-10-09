@@ -37,6 +37,7 @@
 #include <linux/memory.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/pkeys.h>
+#include <linux/sched/mm.h>
 
 #include <asm/uaccess.h>
 #include <asm/cacheflush.h>
@@ -1838,11 +1839,12 @@ out:
 
 	vm_stat_account(mm, vm_flags, file, len >> PAGE_SHIFT);
 	if (vm_flags & VM_LOCKED) {
-		if (!((vm_flags & VM_SPECIAL) || is_vm_hugetlb_page(vma) ||
-					vma == get_gate_vma(current->mm)))
-			mm->locked_vm += (len >> PAGE_SHIFT);
-		else
+		if ((vm_flags & VM_SPECIAL) || vma_is_dax(vma) ||
+					is_vm_hugetlb_page(vma) ||
+					vma == get_gate_vma(current->mm))
 			vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
+		else
+			mm->locked_vm += (len >> PAGE_SHIFT);
 	}
 
 	if (file)
@@ -2555,7 +2557,8 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	vma = find_vma_prev(mm, addr, &prev);
 	if (vma && (vma->vm_start <= addr))
 		return vma;
-	if (!prev || expand_stack(prev, addr))
+	/* don't alter vm_end if the coredump is running */
+	if (!prev || !mmget_still_valid(mm) || expand_stack(prev, addr))
 		return NULL;
 	if (prev->vm_flags & VM_LOCKED)
 		populate_vma_page_range(prev, addr, prev->vm_end, NULL);
@@ -2580,6 +2583,9 @@ find_extend_vma(struct mm_struct * mm, unsigned long addr)
 	if (vma->vm_start <= addr)
 		return vma;
 	if (!(vma->vm_flags & VM_GROWSDOWN))
+		return NULL;
+	/* don't alter vm_start if the coredump is running */
+	if (!mmget_still_valid(mm))
 		return NULL;
 	start = vma->vm_start;
 	if (expand_stack(vma, addr))

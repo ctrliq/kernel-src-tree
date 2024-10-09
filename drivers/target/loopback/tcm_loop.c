@@ -511,11 +511,6 @@ static void tcm_loop_release_core_bus(void)
 	pr_debug("Releasing TCM Loop Core BUS\n");
 }
 
-static char *tcm_loop_get_fabric_name(void)
-{
-	return "loopback";
-}
-
 static inline struct tcm_loop_tpg *tl_tpg(struct se_portal_group *se_tpg)
 {
 	return container_of(se_tpg, struct tcm_loop_tpg, tl_se_tpg);
@@ -818,7 +813,7 @@ static int tcm_loop_make_nexus(
 		return -ENOMEM;
 	}
 
-	tl_nexus->se_sess = target_alloc_session(&tl_tpg->tl_se_tpg, 0, 0,
+	tl_nexus->se_sess = target_setup_session(&tl_tpg->tl_se_tpg, 0, 0,
 					TARGET_PROT_DIN_PASS | TARGET_PROT_DOUT_PASS,
 					name, tl_nexus, tcm_loop_alloc_sess_cb);
 	if (IS_ERR(tl_nexus->se_sess)) {
@@ -860,7 +855,7 @@ static int tcm_loop_drop_nexus(
 	/*
 	 * Release the SCSI I_T Nexus to the emulated Target Port
 	 */
-	transport_deregister_session(tl_nexus->se_sess);
+	target_remove_session(se_sess);
 	tpg->tl_nexus = NULL;
 	kfree(tl_nexus);
 	return 0;
@@ -1216,8 +1211,7 @@ static struct configfs_attribute *tcm_loop_wwn_attrs[] = {
 
 static const struct target_core_fabric_ops loop_ops = {
 	.module				= THIS_MODULE,
-	.name				= "loopback",
-	.get_fabric_name		= tcm_loop_get_fabric_name,
+	.fabric_name			= "loopback",
 	.tpg_get_wwn			= tcm_loop_get_endpoint_wwn,
 	.tpg_get_tag			= tcm_loop_get_tag,
 	.tpg_check_demo_mode		= tcm_loop_check_demo_mode,

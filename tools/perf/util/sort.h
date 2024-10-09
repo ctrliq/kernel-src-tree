@@ -220,6 +220,7 @@ enum sort_type {
 	SORT_TRANSACTION,
 	SORT_TRACE,
 	SORT_SYM_SIZE,
+	SORT_DSO_SIZE,
 
 	/* branch stack specific sort keys */
 	__SORT_BRANCH_STACK,

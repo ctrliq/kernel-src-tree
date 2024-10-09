@@ -625,7 +625,7 @@ void __init setup_arch(char **cmdline_p)
 	init_mm.context.pte_frag = NULL;
 #endif
 #ifdef CONFIG_SPAPR_TCE_IOMMU
-	mm_iommu_init(&init_mm.context);
+	mm_iommu_init(&init_mm);
 #endif
 	irqstack_early_init();
 	exc_lvl_early_init();
@@ -644,6 +644,8 @@ void __init setup_arch(char **cmdline_p)
 
 	if (ppc_md.setup_arch)
 		ppc_md.setup_arch();
+
+	setup_barrier_nospec();
 
 	paging_init();
 
@@ -855,7 +857,7 @@ void setup_rfi_flush(enum l1d_flush_type types, bool enable)
 
 	enabled_flush_types = types;
 
-	if (!no_rfi_flush)
+	if (!no_rfi_flush && !cpu_mitigations_off())
 		rfi_flush_enable(enable);
 }
 

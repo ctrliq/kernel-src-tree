@@ -265,13 +265,13 @@ int ovl_set_attr(struct dentry *upperdentry, struct kstat *stat)
 	return err;
 }
 
-struct ovl_fh *ovl_encode_fh(struct dentry *lower, bool is_upper)
+struct ovl_fh *ovl_encode_real_fh(struct dentry *real, bool is_upper)
 {
 	struct ovl_fh *fh;
 	int fh_type, fh_len, dwords;
 	void *buf;
 	int buflen = MAX_HANDLE_SZ;
-	uuid_be *uuid = (uuid_be *) &lower->d_sb->s_uuid;
+	uuid_t *uuid = (uuid_t *) &real->d_sb->s_uuid;
 
 	buf = kmalloc(buflen, GFP_TEMPORARY);
 	if (!buf)
@@ -283,7 +283,7 @@ struct ovl_fh *ovl_encode_fh(struct dentry *lower, bool is_upper)
 	 * the price or reconnecting the dentry.
 	 */
 	dwords = buflen >> 2;
-	fh_type = exportfs_encode_fh(lower, buf, &dwords, 0);
+	fh_type = exportfs_encode_fh(real, buf, &dwords, 0);
 	buflen = (dwords << 2);
 
 	fh = ERR_PTR(-EIO);
@@ -321,8 +321,8 @@ out:
 	return fh;
 }
 
-static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
-			  struct dentry *upper)
+int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
+		   struct dentry *upper)
 {
 	const struct ovl_fh *fh = NULL;
 	int err;
@@ -333,7 +333,7 @@ static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
 	 * up and a pure upper inode.
 	 */
 	if (ovl_can_decode_fh(lower->d_sb)) {
-		fh = ovl_encode_fh(lower, false);
+		fh = ovl_encode_real_fh(lower, false);
 		if (IS_ERR(fh))
 			return PTR_ERR(fh);
 	}
@@ -354,7 +354,7 @@ static int ovl_set_upper_fh(struct dentry *upper, struct dentry *index)
 	const struct ovl_fh *fh;
 	int err;
 
-	fh = ovl_encode_fh(upper, true);
+	fh = ovl_encode_real_fh(upper, true);
 	if (IS_ERR(fh))
 		return PTR_ERR(fh);
 
@@ -398,17 +398,14 @@ static int ovl_create_index(struct dentry *dentry, struct dentry *origin,
 	if (err)
 		return err;
 
-	temp = ovl_lookup_temp(indexdir);
+	temp = ovl_create_temp(indexdir, OVL_CATTR(S_IFDIR | 0));
+	err = PTR_ERR(temp);
 	if (IS_ERR(temp))
-		goto temp_err;
-
-	err = ovl_do_mkdir(dir, temp, S_IFDIR, true);
-	if (err)
-		goto out;
+		goto free_name;
 
 	err = ovl_set_upper_fh(upper, temp);
 	if (err)
-		goto out_cleanup;
+		goto out;
 
 	index = lookup_one_len(name.name, indexdir, name.len);
 	if (IS_ERR(index)) {
@@ -417,23 +414,13 @@ static int ovl_create_index(struct dentry *dentry, struct dentry *origin,
 		err = ovl_do_rename(dir, temp, dir, index, 0);
 		dput(index);
 	}
-
-	if (err)
-		goto out_cleanup;
-
 out:
+	if (err)
+		ovl_cleanup(dir, temp);
 	dput(temp);
+free_name:
 	kfree(name.name);
 	return err;
-
-temp_err:
-	err = PTR_ERR(temp);
-	temp = NULL;
-	goto out;
-
-out_cleanup:
-	ovl_cleanup(dir, temp);
-	goto out;
 }
 
 struct ovl_copy_up_ctx {
@@ -472,8 +459,7 @@ static int ovl_link_up(struct ovl_copy_up_ctx *c)
 			       c->dentry->d_name.len);
 	err = PTR_ERR(upper);
 	if (!IS_ERR(upper)) {
-		err = ovl_do_link(ovl_dentry_upper(c->dentry), udir, upper,
-				  true);
+		err = ovl_do_link(ovl_dentry_upper(c->dentry), udir, upper);
 		dput(upper);
 
 		if (!err) {
@@ -483,7 +469,10 @@ static int ovl_link_up(struct ovl_copy_up_ctx *c)
 		}
 	}
 	inode_unlock(udir);
-	ovl_set_nlink_upper(c->dentry);
+	if (err)
+		return err;
+
+	err = ovl_set_nlink_upper(c->dentry);
 
 	return err;
 }
@@ -500,7 +489,7 @@ static int ovl_install_temp(struct ovl_copy_up_ctx *c, struct dentry *temp,
 		return PTR_ERR(upper);
 
 	if (c->tmpfile)
-		err = ovl_do_link(temp, udir, upper, true);
+		err = ovl_do_link(temp, udir, upper);
 	else
 		err = ovl_do_rename(d_inode(c->workdir), temp, udir, upper, 0);
 
@@ -511,13 +500,13 @@ static int ovl_install_temp(struct ovl_copy_up_ctx *c, struct dentry *temp,
 	return err;
 }
 
-static int ovl_get_tmpfile(struct ovl_copy_up_ctx *c, struct dentry **tempp)
+static struct dentry *ovl_get_tmpfile(struct ovl_copy_up_ctx *c)
 {
 	int err;
 	struct dentry *temp;
 	const struct cred *old_creds = NULL;
 	struct cred *new_creds = NULL;
-	struct cattr cattr = {
+	struct ovl_cattr cattr = {
 		/* Can't properly set mode on creation because of the umask */
 		.mode = c->stat.mode & S_IFMT,
 		.rdev = c->stat.rdev,
@@ -525,41 +514,24 @@ static int ovl_get_tmpfile(struct ovl_copy_up_ctx *c, struct dentry **tempp)
 	};
 
 	err = security_inode_copy_up(c->dentry, &new_creds);
+	temp = ERR_PTR(err);
 	if (err < 0)
 		goto out;
 
 	if (new_creds)
 		old_creds = override_creds(new_creds);
 
-	if (c->tmpfile) {
+	if (c->tmpfile)
 		temp = ovl_do_tmpfile(c->workdir, c->stat.mode);
-		if (IS_ERR(temp))
-			goto temp_err;
-	} else {
-		temp = ovl_lookup_temp(c->workdir);
-		if (IS_ERR(temp))
-			goto temp_err;
-
-		err = ovl_create_real(d_inode(c->workdir), temp, &cattr,
-				      NULL, true);
-		if (err) {
-			dput(temp);
-			goto out;
-		}
-	}
-	err = 0;
-	*tempp = temp;
+	else
+		temp = ovl_create_temp(c->workdir, &cattr);
 out:
 	if (new_creds) {
 		revert_creds(old_creds);
 		put_cred(new_creds);
 	}
 
-	return err;
-
-temp_err:
-	err = PTR_ERR(temp);
-	goto out;
+	return temp;
 }
 
 static int ovl_copy_up_inode(struct ovl_copy_up_ctx *c, struct dentry *temp)
@@ -609,21 +581,21 @@ static int ovl_copy_up_locked(struct ovl_copy_up_ctx *c)
 	struct inode *udir = c->destdir->d_inode;
 	struct inode *inode;
 	struct dentry *newdentry = NULL;
-	struct dentry *temp = NULL;
+	struct dentry *temp;
 	int err;
 
-	err = ovl_get_tmpfile(c, &temp);
-	if (err)
-		goto out;
+	temp = ovl_get_tmpfile(c);
+	if (IS_ERR(temp))
+		return PTR_ERR(temp);
 
 	err = ovl_copy_up_inode(c, temp);
 	if (err)
-		goto out_cleanup;
+		goto out;
 
 	if (S_ISDIR(c->stat.mode) && c->indexed) {
 		err = ovl_create_index(c->dentry, c->lowerpath.dentry, temp);
 		if (err)
-			goto out_cleanup;
+			goto out;
 	}
 
 	if (c->tmpfile) {
@@ -634,7 +606,7 @@ static int ovl_copy_up_locked(struct ovl_copy_up_ctx *c)
 		err = ovl_install_temp(c, temp, &newdentry);
 	}
 	if (err)
-		goto out_cleanup;
+		goto out;
 
 	inode = d_inode(c->dentry);
 	ovl_inode_update(inode, newdentry);
@@ -642,13 +614,11 @@ static int ovl_copy_up_locked(struct ovl_copy_up_ctx *c)
 		ovl_set_flag(OVL_WHITEOUTS, inode);
 
 out:
+	if (err && !c->tmpfile)
+		ovl_cleanup(d_inode(c->workdir), temp);
 	dput(temp);
 	return err;
 
-out_cleanup:
-	if (!c->tmpfile)
-		ovl_cleanup(d_inode(c->workdir), temp);
-	goto out;
 }
 
 /*
@@ -688,6 +658,9 @@ static int ovl_do_copy_up(struct ovl_copy_up_ctx *c)
 		err = ovl_get_index_name(c->lowerpath.dentry, &c->destname);
 		if (err)
 			return err;
+	} else if (WARN_ON(!c->parent)) {
+		/* Disconnected dentry must be copied up to index dir */
+		return -EIO;
 	} else {
 		/*
 		 * Mark parent "impure" because it may now contain non-pure
@@ -710,12 +683,17 @@ static int ovl_do_copy_up(struct ovl_copy_up_ctx *c)
 		}
 	}
 
-	if (!err && c->indexed)
+
+	if (err)
+		goto out;
+
+	if (c->indexed)
 		ovl_set_flag(OVL_INDEX, d_inode(c->dentry));
 
 	if (to_index) {
-		kfree(c->destname.name);
-	} else if (!err) {
+		/* Initialize nlink for copy up of disconnected dentry */
+		err = ovl_set_nlink_upper(c->dentry);
+	} else {
 		struct inode *udir = d_inode(c->destdir);
 
 		/* Restore timestamps on parent (best effort) */
@@ -726,6 +704,9 @@ static int ovl_do_copy_up(struct ovl_copy_up_ctx *c)
 		ovl_dentry_set_upper_alias(c->dentry);
 	}
 
+out:
+	if (to_index)
+		kfree(c->destname.name);
 	return err;
 }
 
@@ -748,13 +729,15 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 	if (err)
 		return err;
 
-	ovl_path_upper(parent, &parentpath);
-	ctx.destdir = parentpath.dentry;
-	ctx.destname = dentry->d_name;
+	if (parent) {
+		ovl_path_upper(parent, &parentpath);
+		ctx.destdir = parentpath.dentry;
+		ctx.destname = dentry->d_name;
 
-	err = vfs_getattr(&parentpath, &ctx.pstat);
-	if (err)
-		return err;
+		err = vfs_getattr(&parentpath, &ctx.pstat);
+		if (err)
+			return err;
+	}
 
 	/* maybe truncate regular file. this has no effect on dirs */
 	if (flags & O_TRUNC)
@@ -775,7 +758,7 @@ static int ovl_copy_up_one(struct dentry *parent, struct dentry *dentry,
 	} else {
 		if (!ovl_dentry_upper(dentry))
 			err = ovl_do_copy_up(&ctx);
-		if (!err && !ovl_dentry_has_upper_alias(dentry))
+		if (!err && parent && !ovl_dentry_has_upper_alias(dentry))
 			err = ovl_link_up(&ctx);
 		ovl_copy_up_end(dentry);
 	}
@@ -789,10 +772,19 @@ int ovl_copy_up_flags(struct dentry *dentry, int flags)
 {
 	int err = 0;
 	const struct cred *old_cred = ovl_override_creds(dentry->d_sb);
+	bool disconnected = (dentry->d_flags & DCACHE_DISCONNECTED);
+
+	/*
+	 * With NFS export, copy up can get called for a disconnected non-dir.
+	 * In this case, we will copy up lower inode to index dir without
+	 * linking it to upper dir.
+	 */
+	if (WARN_ON(disconnected && d_is_dir(dentry)))
+		return -EIO;
 
 	while (!err) {
 		struct dentry *next;
-		struct dentry *parent;
+		struct dentry *parent = NULL;
 
 		/*
 		 * Check if copy-up has happened as well as for upper alias (in
@@ -808,12 +800,12 @@ int ovl_copy_up_flags(struct dentry *dentry, int flags)
 		 *      with rename.
 		 */
 		if (ovl_dentry_upper(dentry) &&
-		    ovl_dentry_has_upper_alias(dentry))
+		    (ovl_dentry_has_upper_alias(dentry) || disconnected))
 			break;
 
 		next = dget(dentry);
 		/* find the topmost dentry not yet copied up */
-		for (;;) {
+		for (; !disconnected;) {
 			parent = dget_parent(next);
 
 			if (ovl_dentry_upper(parent))

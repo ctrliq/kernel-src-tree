@@ -575,8 +575,7 @@ static int srpt_refresh_port(struct srpt_port *sport)
 	sport->sm_lid = port_attr.sm_lid;
 	sport->lid = port_attr.lid;
 
-	ret = ib_query_gid(sport->sdev->device, sport->port, 0, &sport->gid,
-			   NULL);
+	ret = rdma_query_gid(sport->sdev->device, sport->port, 0, &sport->gid);
 	if (ret)
 		goto err_query_port;
 
@@ -720,7 +719,7 @@ static struct srpt_ioctx **srpt_alloc_ioctx_ring(struct srpt_device *sdev,
 	WARN_ON(ioctx_size != sizeof(struct srpt_recv_ioctx)
 		&& ioctx_size != sizeof(struct srpt_send_ioctx));
 
-	ring = kmalloc(ring_size * sizeof(ring[0]), GFP_KERNEL);
+	ring = kvmalloc_array(ring_size, sizeof(ring[0]), GFP_KERNEL);
 	if (!ring)
 		goto out;
 	for (i = 0; i < ring_size; ++i) {
@@ -734,7 +733,7 @@ static struct srpt_ioctx **srpt_alloc_ioctx_ring(struct srpt_device *sdev,
 err:
 	while (--i >= 0)
 		srpt_free_ioctx(sdev, ring[i], dma_size, dir);
-	kfree(ring);
+	kvfree(ring);
 	ring = NULL;
 out:
 	return ring;
@@ -759,7 +758,7 @@ static void srpt_free_ioctx_ring(struct srpt_ioctx **ioctx_ring,
 
 	for (i = 0; i < ring_size; ++i)
 		srpt_free_ioctx(sdev, ioctx_ring[i], dma_size, dir);
-	kfree(ioctx_ring);
+	kvfree(ioctx_ring);
 }
 
 /**
@@ -1751,13 +1750,15 @@ retry:
 	 */
 	qp_init->cap.max_send_wr = min(sq_size / 2, attrs->max_qp_wr);
 	qp_init->cap.max_rdma_ctxs = sq_size / 2;
-	qp_init->cap.max_send_sge = min(attrs->max_sge, SRPT_MAX_SG_PER_WQE);
+	qp_init->cap.max_send_sge = min(attrs->max_send_sge,
+					SRPT_MAX_SG_PER_WQE);
 	qp_init->port_num = ch->sport->port;
 	if (sdev->use_srq) {
 		qp_init->srq = sdev->srq;
 	} else {
 		qp_init->cap.max_recv_wr = ch->rq_size;
-		qp_init->cap.max_recv_sge = qp_init->cap.max_send_sge;
+		qp_init->cap.max_recv_sge = min(attrs->max_recv_sge,
+						SRPT_MAX_SG_PER_WQE);
 	}
 
 	if (ch->using_rdma_cm) {
@@ -2034,8 +2035,7 @@ static void srpt_release_channel_work(struct work_struct *w)
 	target_sess_cmd_list_set_waiting(se_sess);
 	target_wait_for_sess_cmds(se_sess);
 
-	transport_deregister_session_configfs(se_sess);
-	transport_deregister_session(se_sess);
+	target_remove_session(se_sess);
 	ch->sess = NULL;
 
 	if (ch->using_rdma_cm)
@@ -2226,16 +2226,16 @@ static int srpt_cm_req_recv(struct srpt_device *const sdev,
 	pr_debug("registering session %s\n", ch->sess_name);
 
 	if (sport->port_guid_tpg.se_tpg_wwn)
-		ch->sess = target_alloc_session(&sport->port_guid_tpg, 0, 0,
+		ch->sess = target_setup_session(&sport->port_guid_tpg, 0, 0,
 						TARGET_PROT_NORMAL,
 						ch->sess_name, ch, NULL);
 	if (sport->port_gid_tpg.se_tpg_wwn && IS_ERR_OR_NULL(ch->sess))
-		ch->sess = target_alloc_session(&sport->port_gid_tpg, 0, 0,
+		ch->sess = target_setup_session(&sport->port_gid_tpg, 0, 0,
 					TARGET_PROT_NORMAL, i_port_id, ch,
 					NULL);
 	/* Retry without leading "0x" */
 	if (sport->port_gid_tpg.se_tpg_wwn && IS_ERR_OR_NULL(ch->sess))
-		ch->sess = target_alloc_session(&sport->port_gid_tpg, 0, 0,
+		ch->sess = target_setup_session(&sport->port_gid_tpg, 0, 0,
 						TARGET_PROT_NORMAL,
 						i_port_id + 2, ch, NULL);
 	if (IS_ERR_OR_NULL(ch->sess)) {
@@ -2407,7 +2407,7 @@ out:
 }
 
 static int srpt_ib_cm_req_recv(struct ib_cm_id *cm_id,
-			       struct ib_cm_req_event_param *param,
+			       const struct ib_cm_req_event_param *param,
 			       void *private_data)
 {
 	char sguid[40];
@@ -2519,7 +2519,8 @@ static void srpt_cm_rtu_recv(struct srpt_rdma_ch *ch)
  * a non-zero value in any other case will trigger a race with the
  * ib_destroy_cm_id() call in srpt_release_channel().
  */
-static int srpt_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event)
+static int srpt_cm_handler(struct ib_cm_id *cm_id,
+			   const struct ib_cm_event *event)
 {
 	struct srpt_rdma_ch *ch = cm_id->context;
 	int ret;
@@ -3164,11 +3165,6 @@ static int srpt_check_false(struct se_portal_group *se_tpg)
 	return 0;
 }
 
-static char *srpt_get_fabric_name(void)
-{
-	return "srpt";
-}
-
 static struct srpt_port *srpt_tpg_to_sport(struct se_portal_group *tpg)
 {
 	return tpg->se_tpg_wwn->priv;
@@ -3697,9 +3693,8 @@ static struct configfs_attribute *srpt_wwn_attrs[] = {
 
 static const struct target_core_fabric_ops srpt_template = {
 	.module				= THIS_MODULE,
-	.name				= "srpt",
 	.node_acl_size			= sizeof(struct srpt_node_acl),
-	.get_fabric_name		= srpt_get_fabric_name,
+	.fabric_name			= "srpt",
 	.tpg_get_wwn			= srpt_get_fabric_wwn,
 	.tpg_get_tag			= srpt_get_tag,
 	.tpg_check_demo_mode		= srpt_check_false,

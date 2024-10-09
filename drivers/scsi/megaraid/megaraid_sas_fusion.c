@@ -234,7 +234,7 @@ megasas_fire_cmd_fusion(struct megasas_instance *instance,
 {
 #if defined(writeq) && defined(CONFIG_64BIT)
 	u64 req_data = (((u64)le32_to_cpu(req_desc->u.high) << 32) |
-			le32_to_cpu(req_desc->u.low));
+		le32_to_cpu(req_desc->u.low));
 
 	writeq(req_data, &instance->reg_set->inbound_low_queue_port);
 #else
@@ -495,7 +495,7 @@ megasas_alloc_cmdlist_fusion(struct megasas_instance *instance)
 	 * commands.
 	 */
 	fusion->cmd_list =
-		kzalloc(sizeof(struct megasas_cmd_fusion *) * max_mpt_cmd,
+		kcalloc(max_mpt_cmd, sizeof(struct megasas_cmd_fusion *),
 			GFP_KERNEL);
 	if (!fusion->cmd_list) {
 		dev_err(&instance->pdev->dev,
@@ -815,10 +815,8 @@ megasas_free_rdpq_fusion(struct megasas_instance *instance) {
 
 	}
 
-	if (fusion->reply_frames_desc_pool)
-		dma_pool_destroy(fusion->reply_frames_desc_pool);
-	if (fusion->reply_frames_desc_pool_align)
-		dma_pool_destroy(fusion->reply_frames_desc_pool_align);
+	dma_pool_destroy(fusion->reply_frames_desc_pool);
+	dma_pool_destroy(fusion->reply_frames_desc_pool_align);
 
 	if (fusion->rdpq_virt)
 		dma_free_coherent(&instance->pdev->dev,
@@ -838,8 +836,7 @@ megasas_free_reply_fusion(struct megasas_instance *instance) {
 			fusion->reply_frames_desc[0],
 			fusion->reply_frames_desc_phys[0]);
 
-	if (fusion->reply_frames_desc_pool)
-		dma_pool_destroy(fusion->reply_frames_desc_pool);
+	dma_pool_destroy(fusion->reply_frames_desc_pool);
 
 }
 
@@ -1631,8 +1628,7 @@ static inline void megasas_free_ioc_init_cmd(struct megasas_instance *instance)
 				  fusion->ioc_init_cmd->frame,
 				  fusion->ioc_init_cmd->frame_phys_addr);
 
-	if (fusion->ioc_init_cmd)
-		kfree(fusion->ioc_init_cmd);
+	kfree(fusion->ioc_init_cmd);
 }
 
 /**

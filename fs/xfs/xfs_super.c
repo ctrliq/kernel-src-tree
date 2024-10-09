@@ -1032,7 +1032,6 @@ xfs_fs_destroy_inode(
 
 	if (!XFS_FORCED_SHUTDOWN(ip->i_mount) && ip->i_delayed_blks) {
 		xfs_check_delalloc(ip, XFS_DATA_FORK);
-		xfs_check_delalloc(ip, XFS_COW_FORK);
 		ASSERT(0);
 	}
 
@@ -1685,6 +1684,16 @@ xfs_fs_fill_super(
 		if (!printed) {
 			mark_tech_preview("xfs direct access (dax)", NULL);
 			printed = true;
+		}
+	}
+
+	if (mp->m_flags & XFS_MOUNT_DISCARD) {
+		struct request_queue *q = bdev_get_queue(sb->s_bdev);
+
+		if (!blk_queue_discard(q)) {
+			xfs_warn(mp, "mounting with \"discard\" option, but "
+					"the device does not support discard");
+			mp->m_flags &= ~XFS_MOUNT_DISCARD;
 		}
 	}
 

@@ -236,6 +236,7 @@ static struct ap_driver zcrypt_pcixcc_card_driver = {
 	.probe = zcrypt_pcixcc_card_probe,
 	.remove = zcrypt_pcixcc_card_remove,
 	.ids = zcrypt_pcixcc_card_ids,
+	.flags = AP_DRIVER_FLAG_DEFAULT,
 };
 
 /**
@@ -299,6 +300,7 @@ static struct ap_driver zcrypt_pcixcc_queue_driver = {
 	.suspend = ap_queue_suspend,
 	.resume = ap_queue_resume,
 	.ids = zcrypt_pcixcc_queue_ids,
+	.flags = AP_DRIVER_FLAG_DEFAULT,
 };
 
 int __init zcrypt_pcixcc_init(void)

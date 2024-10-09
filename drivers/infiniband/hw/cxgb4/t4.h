@@ -35,6 +35,7 @@
 #include "t4_regs.h"
 #include "t4_values.h"
 #include "t4_msg.h"
+#include "t4_tcb.h"
 #include "t4fw_ri_api.h"
 
 #define T4_MAX_NUM_PD 65536
@@ -91,6 +92,9 @@ static inline int t4_max_fr_depth(int use_dsgl)
 #define T4_RQ_NUM_BYTES (T4_EQ_ENTRY_SIZE * T4_RQ_NUM_SLOTS)
 #define T4_MAX_RECV_SGE 4
 
+#define T4_WRITE_CMPL_MAX_SGL 4
+#define T4_WRITE_CMPL_MAX_CQE 16
+
 union t4_wr {
 	struct fw_ri_res_wr res;
 	struct fw_ri_wr ri;
@@ -101,6 +105,7 @@ union t4_wr {
 	struct fw_ri_fr_nsmr_wr fr;
 	struct fw_ri_fr_nsmr_tpte_wr fr_tpte;
 	struct fw_ri_inv_lstag_wr inv;
+	struct fw_ri_rdma_write_cmpl_wr write_cmpl;
 	struct t4_status_page status;
 	__be64 flits[T4_EQ_ENTRY_SIZE / sizeof(__be64) * T4_SQ_NUM_SLOTS];
 };
@@ -190,7 +195,19 @@ struct t4_cqe {
 			__be32 abs_rqe_idx;
 		} srcqe;
 		struct {
-			__be64 imm_data;
+			__be32 mo;
+			__be32 msn;
+			/*
+			 * Use union for immediate data to be consistent with
+			 * stack's 32 bit data and iWARP spec's 64 bit data.
+			 */
+			union {
+				struct {
+					__be32 imm_data32;
+					u32 reserved;
+				} ib_imm_data;
+				__be64 imm_data64;
+			} iw_imm_data;
 		} imm_data_rcqe;
 
 		u64 drain_cookie;
@@ -253,6 +270,8 @@ struct t4_cqe {
 #define CQE_WRID_STAG(x)  (be32_to_cpu((x)->u.rcqe.stag))
 #define CQE_WRID_MSN(x)   (be32_to_cpu((x)->u.rcqe.msn))
 #define CQE_ABS_RQE_IDX(x) (be32_to_cpu((x)->u.srcqe.abs_rqe_idx))
+#define CQE_IMM_DATA(x)( \
+	(x)->u.imm_data_rcqe.iw_imm_data.ib_imm_data.imm_data32)
 
 /* used for SQ completion processing */
 #define CQE_WRID_SQ_IDX(x)	((x)->u.scqe.cidx)
@@ -379,7 +398,7 @@ struct t4_srq_pending_wr {
 struct t4_srq {
 	union t4_recv_wr *queue;
 	dma_addr_t dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(mapping);
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 	struct t4_swrqe *sw_rq;
 	void __iomem *bar2_va;
 	u64 bar2_pa;
@@ -491,7 +510,6 @@ static inline void t4_rq_produce(struct t4_wq *wq, u8 len16)
 static inline void t4_rq_consume(struct t4_wq *wq)
 {
 	wq->rq.in_use--;
-	wq->rq.msn++;
 	if (++wq->rq.cidx == wq->rq.size)
 		wq->rq.cidx = 0;
 }
@@ -641,12 +659,14 @@ static inline void t4_ring_rq_db(struct t4_wq *wq, u16 inc,
 
 static inline int t4_wq_in_error(struct t4_wq *wq)
 {
-	return wq->rq.queue[wq->rq.size].status.qp_err;
+	return *wq->qp_errp;
 }
 
-static inline void t4_set_wq_in_error(struct t4_wq *wq)
+static inline void t4_set_wq_in_error(struct t4_wq *wq, u32 srqidx)
 {
-	wq->rq.queue[wq->rq.size].status.qp_err = 1;
+	if (srqidx)
+		*wq->srqidxp = srqidx;
+	*wq->qp_errp = 1;
 }
 
 static inline void t4_disable_wq_db(struct t4_wq *wq)
@@ -836,7 +856,7 @@ static inline void t4_set_cq_in_error(struct t4_cq *cq)
 
 struct t4_dev_status_page {
 	u8 db_off;
-	u8 pad1;
+	u8 write_cmpl_supported;
 	u16 pad2;
 	u32 pad3;
 	u64 qp_start;

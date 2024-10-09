@@ -287,7 +287,7 @@ static int ovl_check_whiteouts(struct dentry *dir, struct ovl_readdir_data *rdd)
 				dput(dentry);
 			}
 		}
-		mutex_unlock(&dir->d_inode->i_mutex);
+		inode_unlock(dir->d_inode);
 	}
 	revert_creds(old_cred);
 
@@ -503,7 +503,7 @@ get:
 		struct path statpath = *path;
 
 		statpath.dentry = this;
-		err = vfs_getattr(&statpath, &stat, STATX_INO, 0);
+		err = vfs_getattr(&statpath, &stat);
 		if (err)
 			goto fail;
 
@@ -526,10 +526,11 @@ fail:
 	goto out;
 }
 
-static int ovl_fill_plain(struct dir_context *ctx, const char *name,
+static int ovl_fill_plain(void *buf, const char *name,
 			  int namelen, loff_t offset, u64 ino,
 			  unsigned int d_type)
 {
+	struct dir_context *ctx = buf;
 	struct ovl_cache_entry *p;
 	struct ovl_readdir_data *rdd =
 		container_of(ctx, struct ovl_readdir_data, ctx);
@@ -644,10 +645,11 @@ struct ovl_readdir_translate {
 	int xinobits;
 };
 
-static int ovl_fill_real(struct dir_context *ctx, const char *name,
+static int ovl_fill_real(void *buf, const char *name,
 			   int namelen, loff_t offset, u64 ino,
 			   unsigned int d_type)
 {
+	struct dir_context *ctx = buf;
 	struct ovl_readdir_translate *rdt =
 		container_of(ctx, struct ovl_readdir_translate, ctx);
 	struct dir_context *orig_ctx = rdt->orig_ctx;
@@ -703,7 +705,7 @@ static int ovl_iterate_real(struct file *file, struct dir_context *ctx)
 		struct path statpath = file->f_path;
 
 		statpath.dentry = dir->d_parent;
-		err = vfs_getattr(&statpath, &stat, STATX_INO, 0);
+		err = vfs_getattr(&statpath, &stat);
 		if (err)
 			return err;
 
@@ -782,7 +784,7 @@ static loff_t ovl_dir_llseek(struct file *file, loff_t offset, int origin)
 	loff_t res;
 	struct ovl_dir_file *od = file->private_data;
 
-	mutex_lock(&file_inode(file)->i_mutex);
+	inode_lock(file_inode(file));
 	if (!file->f_pos)
 		ovl_dir_reset(file);
 
@@ -812,7 +814,7 @@ static loff_t ovl_dir_llseek(struct file *file, loff_t offset, int origin)
 		res = offset;
 	}
 out_unlock:
-	mutex_unlock(&file_inode(file)->i_mutex);
+	inode_unlock(file_inode(file));
 
 	return res;
 }
@@ -840,21 +842,21 @@ static int ovl_dir_fsync(struct file *file, loff_t start, loff_t end,
 
 			ovl_path_upper(dentry, &upperpath);
 			realfile = ovl_path_open(&upperpath, O_RDONLY);
-			smp_mb__before_spinlock();
-			mutex_lock(&inode->i_mutex);
+
+			inode_lock(inode);
 			if (!od->upperfile) {
 				if (IS_ERR(realfile)) {
-					mutex_unlock(&inode->i_mutex);
+					inode_unlock(inode);
 					return PTR_ERR(realfile);
 				}
-				od->upperfile = realfile;
+				smp_store_release(&od->upperfile, realfile);
 			} else {
 				/* somebody has beaten us to it */
 				if (!IS_ERR(realfile))
 					fput(realfile);
 				realfile = od->upperfile;
 			}
-			mutex_unlock(&inode->i_mutex);
+			inode_unlock(inode);
 		}
 	}
 
@@ -866,9 +868,9 @@ static int ovl_dir_release(struct inode *inode, struct file *file)
 	struct ovl_dir_file *od = file->private_data;
 
 	if (od->cache) {
-		mutex_lock(&inode->i_mutex);
+		inode_lock(inode);
 		ovl_cache_put(od, file->f_path.dentry);
-		mutex_unlock(&inode->i_mutex);
+		inode_unlock(inode);
 	}
 	fput(od->realfile);
 	if (od->upperfile)
@@ -960,7 +962,7 @@ void ovl_cleanup_whiteouts(struct dentry *upper, struct list_head *list)
 {
 	struct ovl_cache_entry *p;
 
-	mutex_lock_nested(&upper->d_inode->i_mutex, I_MUTEX_CHILD);
+	inode_lock_nested(upper->d_inode, I_MUTEX_CHILD);
 	list_for_each_entry(p, list, l_node) {
 		struct dentry *dentry;
 
@@ -978,7 +980,7 @@ void ovl_cleanup_whiteouts(struct dentry *upper, struct list_head *list)
 			ovl_cleanup(upper->d_inode, dentry);
 		dput(dentry);
 	}
-	mutex_unlock(&upper->d_inode->i_mutex);
+	inode_unlock(upper->d_inode);
 }
 
 static int ovl_check_d_type(void *buf, const char *name,
@@ -1080,13 +1082,13 @@ void ovl_workdir_cleanup(struct inode *dir, struct vfsmount *mnt,
 	}
 }
 
-int ovl_indexdir_cleanup(struct dentry *dentry, struct vfsmount *mnt,
-			 struct path *lowerstack, unsigned int numlower)
+int ovl_indexdir_cleanup(struct ovl_fs *ofs)
 {
 	int err;
+	struct dentry *indexdir = ofs->indexdir;
 	struct dentry *index = NULL;
-	struct inode *dir = dentry->d_inode;
-	struct path path = { .mnt = mnt, .dentry = dentry };
+	struct inode *dir = indexdir->d_inode;
+	struct path path = { .mnt = ofs->upper_mnt, .dentry = indexdir };
 	LIST_HEAD(list);
 	struct rb_root root = RB_ROOT;
 	struct ovl_cache_entry *p;
@@ -1110,19 +1112,40 @@ int ovl_indexdir_cleanup(struct dentry *dentry, struct vfsmount *mnt,
 			if (p->len == 2 && p->name[1] == '.')
 				continue;
 		}
-		index = lookup_one_len(p->name, dentry, p->len);
+		index = lookup_one_len(p->name, indexdir, p->len);
 		if (IS_ERR(index)) {
 			err = PTR_ERR(index);
 			index = NULL;
 			break;
 		}
-		err = ovl_verify_index(index, lowerstack, numlower);
-		/* Cleanup stale and orphan index entries */
-		if (err && (err == -ESTALE || err == -ENOENT))
+		err = ovl_verify_index(ofs, index);
+		if (!err) {
+			goto next;
+		} else if (err == -ESTALE) {
+			/* Cleanup stale index entries */
 			err = ovl_cleanup(dir, index);
+		} else if (err != -ENOENT) {
+			/*
+			 * Abort mount to avoid corrupting the index if
+			 * an incompatible index entry was found or on out
+			 * of memory.
+			 */
+			break;
+		} else if (ofs->config.nfs_export) {
+			/*
+			 * Whiteout orphan index to block future open by
+			 * handle after overlay nlink dropped to zero.
+			 */
+			err = ovl_cleanup_and_whiteout(indexdir, dir, index);
+		} else {
+			/* Cleanup orphan index entries */
+			err = ovl_cleanup(dir, index);
+		}
+
 		if (err)
 			break;
 
+next:
 		dput(index);
 		index = NULL;
 	}

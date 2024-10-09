@@ -342,6 +342,9 @@ static int iommu_group_create_direct_mappings(struct iommu_group *group,
 		start = ALIGN(entry->start, pg_size);
 		end   = ALIGN(entry->start + entry->length, pg_size);
 
+		if (entry->type != IOMMU_RESV_DIRECT)
+			continue;
+
 		for (addr = start; addr < end; addr += pg_size) {
 			phys_addr_t phys_addr;
 
@@ -1500,6 +1503,8 @@ static int __init iommu_init(void)
 	iommu_group_kset = kset_create_and_add("iommu_groups",
 					       NULL, kernel_kobj);
 	BUG_ON(!iommu_group_kset);
+
+	iommu_debugfs_setup();
 
 	return 0;
 }

@@ -47,11 +47,11 @@ void phy_print_status(struct phy_device *phydev)
 {
 	if (phydev->link) {
 		pr_info("%s - Link is Up - %d/%s\n",
-			dev_name(&phydev->dev),
+			dev_name(&phydev->mdio_dev),
 			phydev->speed,
 			DUPLEX_FULL == phydev->duplex ? "Full" : "Half");
 	} else	{
-		pr_info("%s - Link is Down\n", dev_name(&phydev->dev));
+		pr_info("%s - Link is Down\n", dev_name(&phydev->mdio_dev));
 	}
 }
 EXPORT_SYMBOL(phy_print_status);
@@ -89,6 +89,25 @@ static int phy_config_interrupt(struct phy_device *phydev, u32 interrupts)
 	return 0;
 }
 
+/**
+ * phy_restart_aneg - restart auto-negotiation
+ * @phydev: target phy_device struct
+ *
+ * Restart the autonegotiation on @phydev.  Returns >= 0 on success or
+ * negative errno on error.
+ */
+int phy_restart_aneg(struct phy_device *phydev)
+{
+	int ret;
+
+	if (phydev->is_c45 && !(phydev->c45_ids.devices_in_package & BIT(0)))
+		ret = genphy_c45_restart_aneg(phydev);
+	else
+		ret = genphy_restart_aneg(phydev);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(phy_restart_aneg);
 
 /**
  * phy_aneg_done - return auto-negotiation status
@@ -242,7 +261,7 @@ int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd)
 {
 	u32 speed = ethtool_cmd_speed(cmd);
 
-	if (cmd->phy_address != phydev->addr)
+	if (cmd->phy_address != phydev->mdio_addr)
 		return -EINVAL;
 
 	/* We make sure that we don't pass unsupported values in to the PHY */
@@ -293,7 +312,7 @@ int phy_ethtool_ksettings_set(struct phy_device *phydev,
 	u32 speed = cmd->base.speed;
 	u32 advertising;
 
-	if (cmd->base.phy_address != phydev->mdio.addr)
+	if (cmd->base.phy_address != phydev->mdio_addr)
 		return -EINVAL;
 
 	ethtool_convert_link_mode_to_legacy_u32(&advertising,
@@ -352,7 +371,7 @@ int phy_ethtool_gset(struct phy_device *phydev, struct ethtool_cmd *cmd)
 		cmd->port = PORT_BNC;
 	else
 		cmd->port = PORT_MII;
-	cmd->phy_address = phydev->addr;
+	cmd->phy_address = phydev->mdio_addr;
 	cmd->transceiver = phy_is_internal(phydev) ?
 		XCVR_INTERNAL : XCVR_EXTERNAL;
 	cmd->autoneg = phydev->autoneg;
@@ -382,7 +401,7 @@ int phy_ethtool_ksettings_get(struct phy_device *phydev,
 		cmd->base.port = PORT_MII;
 	cmd->base.transceiver = phy_is_internal(phydev) ?
 				XCVR_INTERNAL : XCVR_EXTERNAL;
-	cmd->base.phy_address = phydev->mdio.addr;
+	cmd->base.phy_address = phydev->mdio_addr;
 	cmd->base.autoneg = phydev->autoneg;
 	cmd->base.eth_tp_mdix_ctrl = phydev->mdix;
 
@@ -407,16 +426,17 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 
 	switch (cmd) {
 	case SIOCGMIIPHY:
-		mii_data->phy_id = phydev->addr;
+		mii_data->phy_id = phydev->mdio_addr;
 		/* fall through */
 
 	case SIOCGMIIREG:
-		mii_data->val_out = mdiobus_read(phydev->bus, mii_data->phy_id,
+		mii_data->val_out = mdiobus_read(phydev->mdio_bus,
+						 mii_data->phy_id,
 						 mii_data->reg_num);
 		return 0;
 
 	case SIOCSMIIREG:
-		if (mii_data->phy_id == phydev->addr) {
+		if (mii_data->phy_id == phydev->mdio_addr) {
 			switch (mii_data->reg_num) {
 			case MII_BMCR:
 				if ((val & (BMCR_RESET | BMCR_ANENABLE)) == 0)
@@ -442,7 +462,7 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 			}
 		}
 
-		mdiobus_write(phydev->bus, mii_data->phy_id,
+		mdiobus_write(phydev->mdio_bus, mii_data->phy_id,
 			      mii_data->reg_num, val);
 
 		if (mii_data->reg_num == MII_BMCR &&
@@ -451,7 +471,7 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 		return 0;
 
 	case SIOCSHWTSTAMP:
-		if (phydev->drv->hwtstamp)
+		if (phydev->drv && phydev->drv->hwtstamp)
 			return phydev->drv->hwtstamp(phydev, ifr);
 		/* fall through */
 
@@ -460,6 +480,14 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
 	}
 }
 EXPORT_SYMBOL(phy_mii_ioctl);
+
+static int phy_config_aneg(struct phy_device *phydev)
+{
+	if (phydev->drv->config_aneg)
+		return phydev->drv->config_aneg(phydev);
+	else
+		return genphy_config_aneg(phydev);
+}
 
 /**
  * phy_start_aneg - start auto-negotiation for this PHY device
@@ -474,6 +502,9 @@ int phy_start_aneg(struct phy_device *phydev)
 {
 	int err;
 
+	if (!phydev->drv)
+		return -EIO;
+
 	mutex_lock(&phydev->lock);
 
 	if (AUTONEG_DISABLE == phydev->autoneg)
@@ -482,7 +513,7 @@ int phy_start_aneg(struct phy_device *phydev)
 	/* Invalidate LP advertising flags */
 	phydev->lp_advertising = 0;
 
-	err = phydev->drv->config_aneg(phydev);
+	err = phy_config_aneg(phydev);
 	if (err < 0)
 		goto out_unlock;
 
@@ -736,7 +767,7 @@ int phy_start_interrupts(struct phy_device *phydev)
 				"phy_interrupt",
 				phydev) < 0) {
 		pr_warn("%s: Can't get IRQ %d (PHY)\n",
-			phydev->bus->name, phydev->irq);
+			phydev->mdio_bus->name, phydev->irq);
 		phydev->irq = PHY_POLL;
 		return 0;
 	}
@@ -867,7 +898,6 @@ EXPORT_SYMBOL(phy_stop);
  */
 void phy_start(struct phy_device *phydev)
 {
-	bool do_resume = false;
 	int err = 0;
 
 	mutex_lock(&phydev->lock);
@@ -880,22 +910,20 @@ void phy_start(struct phy_device *phydev)
 		phydev->state = PHY_UP;
 		break;
 	case PHY_HALTED:
+		/* if phy was suspended, bring the physical link up again */
+		__phy_resume(phydev);
+
 		/* make sure interrupts are re-enabled for the PHY */
 		err = phy_enable_interrupts(phydev);
 		if (err < 0)
 			break;
 
 		phydev->state = PHY_RESUMING;
-		do_resume = true;
 		break;
 	default:
 		break;
 	}
 	mutex_unlock(&phydev->lock);
-
-	/* if phy was suspended, bring the physical link up again */
-	if (do_resume)
-		phy_resume(phydev);
 
 	phy_trigger_machine(phydev, true);
 }
@@ -1093,76 +1121,19 @@ void phy_state_machine(struct work_struct *work)
 				   PHY_STATE_TIME * HZ);
 }
 
-void phy_mac_interrupt(struct phy_device *phydev, int new_link)
+/**
+ * phy_mac_interrupt - MAC says the link has changed
+ * @phydev: phy_device struct with changed link
+ *
+ * The MAC layer is able to indicate there has been a change in the PHY link
+ * status. Trigger the state machine and work a work queue.
+ */
+void phy_mac_interrupt(struct phy_device *phydev)
 {
-	phydev->link = new_link;
-
 	/* Trigger a state machine change */
 	queue_work(system_power_efficient_wq, &phydev->phy_queue);
 }
 EXPORT_SYMBOL(phy_mac_interrupt);
-
-static inline void mmd_phy_indirect(struct mii_bus *bus, int prtad, int devad,
-				    int addr)
-{
-	/* Write the desired MMD Devad */
-	bus->write(bus, addr, MII_MMD_CTRL, devad);
-
-	/* Write the desired MMD register address */
-	bus->write(bus, addr, MII_MMD_DATA, prtad);
-
-	/* Select the Function : DATA with no post increment */
-	bus->write(bus, addr, MII_MMD_CTRL, (devad | MII_MMD_CTRL_NOINCR));
-}
-
-/**
- * phy_read_mmd_indirect - reads data from the MMD registers
- * @bus: the target MII bus
- * @prtad: MMD Address
- * @devad: MMD DEVAD
- * @addr: PHY address on the MII bus
- *
- * Description: it reads data from the MMD registers (clause 22 to access to
- * clause 45) of the specified phy address.
- * To read these register we have:
- * 1) Write reg 13 // DEVAD
- * 2) Write reg 14 // MMD Address
- * 3) Write reg 13 // MMD Data Command for MMD DEVAD
- * 3) Read  reg 14 // Read MMD data
- */
-static int phy_read_mmd_indirect(struct mii_bus *bus, int prtad, int devad,
-				 int addr)
-{
-	mmd_phy_indirect(bus, prtad, devad, addr);
-
-	/* Read the content of the MMD's selected register */
-	return bus->read(bus, addr, MII_MMD_DATA);
-}
-
-/**
- * phy_write_mmd_indirect - writes data to the MMD registers
- * @bus: the target MII bus
- * @prtad: MMD Address
- * @devad: MMD DEVAD
- * @addr: PHY address on the MII bus
- * @data: data to write in the MMD register
- *
- * Description: Write data from the MMD registers of the specified
- * phy address.
- * To write these register we have:
- * 1) Write reg 13 // DEVAD
- * 2) Write reg 14 // MMD Address
- * 3) Write reg 13 // MMD Data Command for MMD DEVAD
- * 3) Write reg 14 // Write MMD data
- */
-static void phy_write_mmd_indirect(struct mii_bus *bus, int prtad, int devad,
-				   int addr, u32 data)
-{
-	mmd_phy_indirect(bus, prtad, devad, addr);
-
-	/* Write the data into MMD's selected register */
-	bus->write(bus, addr, MII_MMD_DATA, data);
-}
 
 /**
  * phy_init_eee - init and check the EEE feature
@@ -1176,6 +1147,9 @@ static void phy_write_mmd_indirect(struct mii_bus *bus, int prtad, int devad,
  */
 int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 {
+	if (!phydev->drv)
+		return -EIO;
+
 	/* According to 802.3az,the EEE is supported only in full duplex-mode.
 	 * Also EEE feature is active when core is operating with MII, GMII
 	 * or RGMII. Internal PHYs are also allowed to proceed and should
@@ -1196,8 +1170,7 @@ int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 			return status;
 
 		/* First check if the EEE ability is supported */
-		eee_cap = phy_read_mmd_indirect(phydev->bus, MDIO_PCS_EEE_ABLE,
-						MDIO_MMD_PCS, phydev->addr);
+		eee_cap = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
 		if (eee_cap <= 0)
 			goto eee_exit_err;
 
@@ -1208,13 +1181,11 @@ int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 		/* Check which link settings negotiated and verify it in
 		 * the EEE advertising registers.
 		 */
-		eee_lp = phy_read_mmd_indirect(phydev->bus, MDIO_AN_EEE_LPABLE,
-					       MDIO_MMD_AN, phydev->addr);
+		eee_lp = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
 		if (eee_lp <= 0)
 			goto eee_exit_err;
 
-		eee_adv = phy_read_mmd_indirect(phydev->bus, MDIO_AN_EEE_ADV,
-						MDIO_MMD_AN, phydev->addr);
+		eee_adv = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
 		if (eee_adv <= 0)
 			goto eee_exit_err;
 
@@ -1224,20 +1195,12 @@ int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable)
 		if (!(lp & adv & settings[idx].setting))
 			goto eee_exit_err;
 
-		if (clk_stop_enable) {
+		if (clk_stop_enable)
 			/* Configure the PHY to stop receiving xMII
 			 * clock while it is signaling LPI.
 			 */
-			int val = phy_read_mmd_indirect(phydev->bus, MDIO_CTRL1,
-							MDIO_MMD_PCS,
-							phydev->addr);
-			if (val < 0)
-				return val;
-
-			val |= MDIO_PCS_CTRL1_CLKSTOP_EN;
-			phy_write_mmd_indirect(phydev->bus, MDIO_CTRL1,
-					       MDIO_MMD_PCS, phydev->addr, val);
-		}
+			phy_set_bits_mmd(phydev, MDIO_MMD_PCS, MDIO_CTRL1,
+					 MDIO_PCS_CTRL1_CLKSTOP_EN);
 
 		return 0; /* EEE supported */
 	}
@@ -1255,8 +1218,10 @@ EXPORT_SYMBOL(phy_init_eee);
  */
 int phy_get_eee_err(struct phy_device *phydev)
 {
-	return phy_read_mmd_indirect(phydev->bus, MDIO_PCS_EEE_WK_ERR,
-				     MDIO_MMD_PCS, phydev->addr);
+	if (!phydev->drv)
+		return -EIO;
+
+	return phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_WK_ERR);
 }
 EXPORT_SYMBOL(phy_get_eee_err);
 
@@ -1272,23 +1237,23 @@ int phy_ethtool_get_eee(struct phy_device *phydev, struct ethtool_eee *data)
 {
 	int val;
 
+	if (!phydev->drv)
+		return -EIO;
+
 	/* Get Supported EEE */
-	val = phy_read_mmd_indirect(phydev->bus, MDIO_PCS_EEE_ABLE,
-				    MDIO_MMD_PCS, phydev->addr);
+	val = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
 	if (val < 0)
 		return val;
 	data->supported = mmd_eee_cap_to_ethtool_sup_t(val);
 
 	/* Get advertisement EEE */
-	val = phy_read_mmd_indirect(phydev->bus, MDIO_AN_EEE_ADV,
-				    MDIO_MMD_AN, phydev->addr);
+	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
 	if (val < 0)
 		return val;
 	data->advertised = mmd_eee_adv_to_ethtool_adv_t(val);
 
 	/* Get LP advertisement EEE */
-	val = phy_read_mmd_indirect(phydev->bus, MDIO_AN_EEE_LPABLE,
-				    MDIO_MMD_AN, phydev->addr);
+	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
 	if (val < 0)
 		return val;
 	data->lp_advertised = mmd_eee_adv_to_ethtool_adv_t(val);
@@ -1306,10 +1271,37 @@ EXPORT_SYMBOL(phy_ethtool_get_eee);
  */
 int phy_ethtool_set_eee(struct phy_device *phydev, struct ethtool_eee *data)
 {
-	int val = ethtool_adv_to_mmd_eee_adv_t(data->advertised);
+	int cap, old_adv, adv, ret;
 
-	phy_write_mmd_indirect(phydev->bus, MDIO_AN_EEE_ADV, MDIO_MMD_AN,
-			       phydev->addr, val);
+	if (!phydev->drv)
+		return -EIO;
+
+	/* Get Supported EEE */
+	cap = phy_read_mmd(phydev, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
+	if (cap < 0)
+		return cap;
+
+	old_adv = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
+	if (old_adv < 0)
+		return old_adv;
+
+	adv = ethtool_adv_to_mmd_eee_adv_t(data->advertised) & cap;
+
+	/* Mask prohibited EEE modes */
+	adv &= ~phydev->eee_broken_modes;
+
+	if (old_adv != adv) {
+		ret = phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, adv);
+		if (ret < 0)
+			return ret;
+
+		/* Restart autonegotiation so the new modes get sent to the
+		 * link partner.
+		 */
+		ret = phy_restart_aneg(phydev);
+		if (ret < 0)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1317,7 +1309,7 @@ EXPORT_SYMBOL(phy_ethtool_set_eee);
 
 int phy_ethtool_set_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
 {
-	if (phydev->drv->set_wol)
+	if (phydev->drv && phydev->drv->set_wol)
 		return phydev->drv->set_wol(phydev, wol);
 
 	return -EOPNOTSUPP;
@@ -1326,7 +1318,7 @@ EXPORT_SYMBOL(phy_ethtool_set_wol);
 
 void phy_ethtool_get_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol)
 {
-	if (phydev->drv->get_wol)
+	if (phydev->drv && phydev->drv->get_wol)
 		phydev->drv->get_wol(phydev, wol);
 }
 EXPORT_SYMBOL(phy_ethtool_get_wol);
@@ -1362,6 +1354,9 @@ int phy_ethtool_nway_reset(struct net_device *ndev)
 	if (!phydev)
 		return -ENODEV;
 
-	return genphy_restart_aneg(phydev);
+	if (!phydev->drv)
+		return -EIO;
+
+	return phy_restart_aneg(phydev);
 }
 EXPORT_SYMBOL(phy_ethtool_nway_reset);

@@ -85,7 +85,7 @@ static ssize_t report_error_write(struct file *filp, struct kobject *kobj,
 	struct zpci_report_error_header *report = (void *) buf;
 	struct device *dev = kobj_to_dev(kobj);
 	struct pci_dev *pdev = to_pci_dev(dev);
-	struct zpci_dev *zdev = to_zpci(pdev);
+	struct zpci_dev *zdev = get_zdev(pdev);
 	int ret;
 
 	if (off || (count < sizeof(*report)))

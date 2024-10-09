@@ -69,6 +69,14 @@ enum {
 	RDMA_USER_CM_CMD_JOIN_MCAST
 };
 
+/* See IBTA Annex A11, servies ID bytes 4 & 5 */
+enum rdma_ucm_port_space {
+	RDMA_PS_IPOIB = 0x0002,
+	RDMA_PS_IB    = 0x013F,
+	RDMA_PS_TCP   = 0x0106,
+	RDMA_PS_UDP   = 0x0111,
+};
+
 /*
  * command ABI structures.
  */
@@ -81,7 +89,7 @@ struct rdma_ucm_cmd_hdr {
 struct rdma_ucm_create_id {
 	__aligned_u64 uid;
 	__aligned_u64 response;
-	__u16 ps;
+	__u16 ps;                  /* use enum rdma_ucm_port_space */
 	__u8  qp_type;
 	__u8  reserved[5];
 };

@@ -364,9 +364,14 @@ static void dm_done(struct request *clone, int error, bool mapped)
 			r = rq_end_io(tio->ti, clone, error, &tio->info);
 	}
 
-	if (unlikely(r == -EREMOTEIO && (clone->cmd_flags & REQ_WRITE_SAME) &&
-		     !clone->q->limits.max_write_same_sectors))
-		disable_write_same(tio->md);
+	if (unlikely(r == -EREMOTEIO)) {
+		if ((clone->cmd_flags & REQ_DISCARD) &&
+		    !clone->q->limits.max_discard_sectors)
+			disable_discard(tio->md);
+		else if ((clone->cmd_flags & REQ_WRITE_SAME) &&
+			 !clone->q->limits.max_write_same_sectors)
+			disable_write_same(tio->md);
+	}
 
 	if (r <= 0)
 		/* The target wants to complete the I/O */

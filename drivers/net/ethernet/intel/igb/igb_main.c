@@ -239,7 +239,7 @@ static struct pci_driver igb_driver = {
 
 MODULE_AUTHOR("Intel Corporation, <e1000-devel@lists.sourceforge.net>");
 MODULE_DESCRIPTION("Intel(R) Gigabit Ethernet Network Driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRV_VERSION);
 
 #define DEFAULT_MSG_ENABLE (NETIF_MSG_DRV|NETIF_MSG_PROBE|NETIF_MSG_LINK)
@@ -1858,6 +1858,8 @@ static void igb_config_tx_modes(struct igb_adapter *adapter, int queue)
 		   ring->hicredit, ring->locredit);
 }
 
+/* RHEL7: igb_save_txtime_params may be unused if ETF qdisc isn't available */
+__attribute__ ((__unused__))
 static int igb_save_txtime_params(struct igb_adapter *adapter, int queue,
 				  bool enable)
 {
@@ -2578,12 +2580,7 @@ static int igb_offload_cbs(struct igb_adapter *adapter,
 /* RHEL 7: We don't have a struct netlink_ext_ack and so we don't have the
    tc_cls_common_offload::extack member (yet?) Fortunately this member is
    only used to store an error message here.  Override the usage for now. */
-#ifdef NL_SET_ERR_MSG_MOD
-#error "Remove NL_SET_ERR_MSG_MOD override"
-#else
 #define __rhel7_no_netlink_ext_ack
-#define NL_SET_ERR_MSG_MOD(_e,_m) netdev_err(adapter->netdev, (_m))
-#endif
 
 static int igb_parse_cls_flower(struct igb_adapter *adapter,
 				struct tc_cls_flower_offload *f,
@@ -2830,6 +2827,9 @@ static int igb_setup_tc_block(struct igb_adapter *adapter,
 	}
 }
 
+/* RHEL7: don't define igb_offload_txtime if ETF qdisc isn't available */
+#ifdef TC_SETUP_QDISC_ETF
+
 static int igb_offload_txtime(struct igb_adapter *adapter,
 			      struct tc_etf_qopt_offload *qopt)
 {
@@ -2853,6 +2853,8 @@ static int igb_offload_txtime(struct igb_adapter *adapter,
 	return 0;
 }
 
+#endif /* TC_SETUP_QDISC_ETF */
+
 static int igb_setup_tc(struct net_device *dev, enum tc_setup_type type,
 			void *type_data)
 {
@@ -2863,8 +2865,10 @@ static int igb_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		return igb_offload_cbs(adapter, type_data);
 	case TC_SETUP_BLOCK:
 		return igb_setup_tc_block(adapter, type_data);
+#ifdef TC_SETUP_QDISC_ETF
 	case TC_SETUP_QDISC_ETF:
 		return igb_offload_txtime(adapter, type_data);
+#endif /* TC_SETUP_QDISC_ETF */
 
 	default:
 		return -EOPNOTSUPP;
@@ -3878,8 +3882,9 @@ static int igb_sw_init(struct igb_adapter *adapter)
 	/* Assume MSI-X interrupts, will be checked during IRQ allocation */
 	adapter->flags |= IGB_FLAG_HAS_MSIX;
 
-	adapter->mac_table = kzalloc(sizeof(struct igb_mac_addr) *
-				     hw->mac.rar_entry_count, GFP_ATOMIC);
+	adapter->mac_table = kcalloc(hw->mac.rar_entry_count,
+				     sizeof(struct igb_mac_addr),
+				     GFP_KERNEL);
 	if (!adapter->mac_table)
 		return -ENOMEM;
 
@@ -3889,7 +3894,7 @@ static int igb_sw_init(struct igb_adapter *adapter)
 
 	/* Setup and initialize a copy of the hw vlan table array */
 	adapter->shadow_vfta = kcalloc(E1000_VLAN_FILTER_TBL_SIZE, sizeof(u32),
-				       GFP_ATOMIC);
+				       GFP_KERNEL);
 	if (!adapter->shadow_vfta)
 		return -ENOMEM;
 
@@ -4870,7 +4875,7 @@ static int igb_write_mc_addr_list(struct net_device *netdev)
 		return 0;
 	}
 
-	mta_list = kzalloc(netdev_mc_count(netdev) * 6, GFP_ATOMIC);
+	mta_list = kcalloc(netdev_mc_count(netdev), 6, GFP_ATOMIC);
 	if (!mta_list)
 		return -ENOMEM;
 
@@ -5715,7 +5720,7 @@ static void igb_tx_ctxtdesc(struct igb_ring *tx_ring,
 	 * should have been handled by the upper layers.
 	 */
 	if (tx_ring->launchtime_enable) {
-		ts = ns_to_timespec64(first->skb->tstamp);
+		ts = ktime_to_timespec64(first->skb->tstamp);
 		context_desc->seqnum_seed = cpu_to_le32(ts.tv_nsec / 32);
 	} else {
 		context_desc->seqnum_seed = 0;
@@ -7769,11 +7774,13 @@ static int igb_poll(struct napi_struct *napi, int budget)
 	if (!clean_complete)
 		return budget;
 
-	/* If not enough Rx work done, exit the polling mode */
-	napi_complete_done(napi, work_done);
-	igb_ring_irq_enable(q_vector);
+	/* Exit the polling mode, but don't re-enable interrupts if stack might
+	 * poll us due to busy-polling
+	 */
+	if (likely(napi_complete_done(napi, work_done)))
+		igb_ring_irq_enable(q_vector);
 
-	return 0;
+	return min(work_done, budget - 1);
 }
 
 /**

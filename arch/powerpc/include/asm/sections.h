@@ -51,7 +51,7 @@ static inline int overlaps_kernel_text(unsigned long start, unsigned long end)
 		(unsigned long)_stext < end;
 }
 
-#if !defined(_CALL_ELF) || _CALL_ELF != 2
+#ifdef PPC64_ELF_ABI_v1
 #undef dereference_function_descriptor
 static inline void *dereference_function_descriptor(void *ptr)
 {
@@ -62,7 +62,7 @@ static inline void *dereference_function_descriptor(void *ptr)
 		ptr = p;
 	return ptr;
 }
-#endif
+#endif /* PPC64_ELF_ABI_v1 */
 
 #endif
 

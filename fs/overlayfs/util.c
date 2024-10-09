@@ -48,15 +48,29 @@ struct super_block *ovl_same_sb(struct super_block *sb)
 {
 	struct ovl_fs *ofs = sb->s_fs_info;
 
-	return ofs->same_sb;
+	if (!ofs->numlowerfs)
+		return ofs->upper_mnt->mnt_sb;
+	else if (ofs->numlowerfs == 1 && !ofs->upper_mnt)
+		return ofs->lower_fs[0].sb;
+	else
+		return NULL;
 }
 
-bool ovl_can_decode_fh(struct super_block *sb)
+/*
+ * Check if underlying fs supports file handles and try to determine encoding
+ * type, in order to deduce maximum inode number used by fs.
+ *
+ * Return 0 if file handles are not supported.
+ * Return 1 (FILEID_INO32_GEN) if fs uses the default 32bit inode encoding.
+ * Return -1 if fs uses a non default encoding with unknown inode size.
+ */
+int ovl_can_decode_fh(struct super_block *sb)
 {
-	uuid_be *uuid = (uuid_be *) &sb->s_uuid;
+	if (!sb->s_export_op || !sb->s_export_op->fh_to_dentry ||
+	    uuid_is_null((uuid_t *) &sb->s_uuid))
+		return 0;
 
-	return (sb->s_export_op && sb->s_export_op->fh_to_dentry &&
-		uuid_be_cmp(*uuid, NULL_UUID_BE));
+	return sb->s_export_op->encode_fh ? -1 : FILEID_INO32_GEN;
 }
 
 struct dentry *ovl_indexdir(struct super_block *sb)
@@ -64,6 +78,22 @@ struct dentry *ovl_indexdir(struct super_block *sb)
 	struct ovl_fs *ofs = sb->s_fs_info;
 
 	return ofs->indexdir;
+}
+
+/* Index all files on copy up. For now only enabled for NFS export */
+bool ovl_index_all(struct super_block *sb)
+{
+	struct ovl_fs *ofs = sb->s_fs_info;
+
+	return ofs->config.nfs_export && ofs->config.index;
+}
+
+/* Verify lower origin on lookup. For now only enabled for NFS export */
+bool ovl_verify_lower(struct super_block *sb)
+{
+	struct ovl_fs *ofs = sb->s_fs_info;
+
+	return ofs->config.nfs_export && ofs->config.index;
 }
 
 struct ovl_entry *ovl_alloc_entry(unsigned int numlower)
@@ -127,7 +157,12 @@ void ovl_path_lower(struct dentry *dentry, struct path *path)
 {
 	struct ovl_entry *oe = dentry->d_fsdata;
 
-	*path = oe->numlower ? oe->lowerstack[0] : (struct path) { };
+	if (oe->numlower) {
+		path->mnt = oe->lowerstack[0].layer->mnt;
+		path->dentry = oe->lowerstack[0].dentry;
+	} else {
+		*path = (struct path) { };
+	}
 }
 
 enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path)
@@ -152,6 +187,13 @@ struct dentry *ovl_dentry_lower(struct dentry *dentry)
 	struct ovl_entry *oe = dentry->d_fsdata;
 
 	return oe->numlower ? oe->lowerstack[0].dentry : NULL;
+}
+
+struct ovl_layer *ovl_layer_lower(struct dentry *dentry)
+{
+	struct ovl_entry *oe = dentry->d_fsdata;
+
+	return oe->numlower ? oe->lowerstack[0].layer : NULL;
 }
 
 struct dentry *ovl_dentry_real(struct dentry *dentry)
@@ -192,10 +234,24 @@ void ovl_set_dir_cache(struct inode *inode, struct ovl_dir_cache *cache)
 	OVL_I(inode)->cache = cache;
 }
 
+void ovl_dentry_set_flag(unsigned long flag, struct dentry *dentry)
+{
+	set_bit(flag, &OVL_E(dentry)->flags);
+}
+
+void ovl_dentry_clear_flag(unsigned long flag, struct dentry *dentry)
+{
+	clear_bit(flag, &OVL_E(dentry)->flags);
+}
+
+bool ovl_dentry_test_flag(unsigned long flag, struct dentry *dentry)
+{
+	return test_bit(flag, &OVL_E(dentry)->flags);
+}
+
 bool ovl_dentry_is_opaque(struct dentry *dentry)
 {
-	struct ovl_entry *oe = dentry->d_fsdata;
-	return oe->opaque;
+	return ovl_dentry_test_flag(OVL_E_OPAQUE, dentry);
 }
 
 bool ovl_dentry_is_whiteout(struct dentry *dentry)
@@ -205,28 +261,23 @@ bool ovl_dentry_is_whiteout(struct dentry *dentry)
 
 void ovl_dentry_set_opaque(struct dentry *dentry)
 {
-	struct ovl_entry *oe = dentry->d_fsdata;
-
-	oe->opaque = true;
+	ovl_dentry_set_flag(OVL_E_OPAQUE, dentry);
 }
 
 /*
- * For hard links it's possible for ovl_dentry_upper() to return positive, while
- * there's no actual upper alias for the inode.  Copy up code needs to know
- * about the existence of the upper alias, so it can't use ovl_dentry_upper().
+ * For hard links and decoded file handles, it's possible for ovl_dentry_upper()
+ * to return positive, while there's no actual upper alias for the inode.
+ * Copy up code needs to know about the existence of the upper alias, so it
+ * can't use ovl_dentry_upper().
  */
 bool ovl_dentry_has_upper_alias(struct dentry *dentry)
 {
-	struct ovl_entry *oe = dentry->d_fsdata;
-
-	return oe->has_upper;
+	return ovl_dentry_test_flag(OVL_E_UPPER_ALIAS, dentry);
 }
 
 void ovl_dentry_set_upper_alias(struct dentry *dentry)
 {
-	struct ovl_entry *oe = dentry->d_fsdata;
-
-	oe->has_upper = true;
+	ovl_dentry_set_flag(OVL_E_UPPER_ALIAS, dentry);
 }
 
 bool ovl_redirect_dir(struct super_block *sb)

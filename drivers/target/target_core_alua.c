@@ -449,7 +449,7 @@ static inline void set_ascq(struct se_cmd *cmd, u8 alua_ascq)
 	pr_debug("[%s]: ALUA TG Port not available, "
 		"SenseKey: NOT_READY, ASC/ASCQ: "
 		"0x04/0x%02x\n",
-		cmd->se_tfo->get_fabric_name(), alua_ascq);
+		cmd->se_tfo->fabric_name, alua_ascq);
 
 	cmd->scsi_asc = 0x04;
 	cmd->scsi_ascq = alua_ascq;
@@ -1230,7 +1230,7 @@ static int core_alua_update_tpg_secondary_metadata(struct se_lun *lun)
 			lun->lun_tg_pt_secondary_stat);
 
 	snprintf(path, ALUA_METADATA_PATH_LEN, "/var/target/alua/%s/%s/lun_%llu",
-			se_tpg->se_tpg_tfo->get_fabric_name(), wwn,
+			se_tpg->se_tpg_tfo->fabric_name, wwn,
 			lun->unpacked_lun);
 
 	rc = core_alua_write_tpg_metadata(path, md_buf, len);

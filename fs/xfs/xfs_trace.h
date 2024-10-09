@@ -212,53 +212,15 @@ TRACE_EVENT(xfs_attr_list_node_descend,
 		   __entry->bt_before)
 );
 
-TRACE_EVENT(xfs_iext_insert,
-	TP_PROTO(struct xfs_inode *ip, xfs_extnum_t idx,
-		 struct xfs_bmbt_irec *r, int state, unsigned long caller_ip),
-	TP_ARGS(ip, idx, r, state, caller_ip),
-	TP_STRUCT__entry(
-		__field(dev_t, dev)
-		__field(xfs_ino_t, ino)
-		__field(xfs_extnum_t, idx)
-		__field(xfs_fileoff_t, startoff)
-		__field(xfs_fsblock_t, startblock)
-		__field(xfs_filblks_t, blockcount)
-		__field(xfs_exntst_t, state)
-		__field(int, bmap_state)
-		__field(unsigned long, caller_ip)
-	),
-	TP_fast_assign(
-		__entry->dev = VFS_I(ip)->i_sb->s_dev;
-		__entry->ino = ip->i_ino;
-		__entry->idx = idx;
-		__entry->startoff = r->br_startoff;
-		__entry->startblock = r->br_startblock;
-		__entry->blockcount = r->br_blockcount;
-		__entry->state = r->br_state;
-		__entry->bmap_state = state;
-		__entry->caller_ip = caller_ip;
-	),
-	TP_printk("dev %d:%d ino 0x%llx state %s idx %ld "
-		  "offset %lld block %lld count %lld flag %d caller %ps",
-		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __entry->ino,
-		  __print_flags(__entry->bmap_state, "|", XFS_BMAP_EXT_FLAGS),
-		  (long)__entry->idx,
-		  __entry->startoff,
-		  (int64_t)__entry->startblock,
-		  __entry->blockcount,
-		  __entry->state,
-		  (char *)__entry->caller_ip)
-);
-
 DECLARE_EVENT_CLASS(xfs_bmap_class,
-	TP_PROTO(struct xfs_inode *ip, xfs_extnum_t idx, int state,
+	TP_PROTO(struct xfs_inode *ip, struct xfs_iext_cursor *cur, int state,
 		 unsigned long caller_ip),
-	TP_ARGS(ip, idx, state, caller_ip),
+	TP_ARGS(ip, cur, state, caller_ip),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(xfs_ino_t, ino)
-		__field(xfs_extnum_t, idx)
+		__field(void *, leaf);
+		__field(int, pos);
 		__field(xfs_fileoff_t, startoff)
 		__field(xfs_fsblock_t, startblock)
 		__field(xfs_filblks_t, blockcount)
@@ -271,10 +233,11 @@ DECLARE_EVENT_CLASS(xfs_bmap_class,
 						ip->i_afp : &ip->i_df;
 		struct xfs_bmbt_irec	r;
 
-		xfs_bmbt_get_all(xfs_iext_get_ext(ifp, idx), &r);
+		xfs_iext_get_extent(ifp, cur, &r);
 		__entry->dev = VFS_I(ip)->i_sb->s_dev;
 		__entry->ino = ip->i_ino;
-		__entry->idx = idx;
+		__entry->leaf = cur->leaf;
+		__entry->pos = cur->pos;
 		__entry->startoff = r.br_startoff;
 		__entry->startblock = r.br_startblock;
 		__entry->blockcount = r.br_blockcount;
@@ -282,12 +245,13 @@ DECLARE_EVENT_CLASS(xfs_bmap_class,
 		__entry->bmap_state = state;
 		__entry->caller_ip = caller_ip;
 	),
-	TP_printk("dev %d:%d ino 0x%llx state %s idx %ld "
+	TP_printk("dev %d:%d ino 0x%llx state %s cur 0x%p/%d "
 		  "offset %lld block %lld count %lld flag %d caller %ps",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->ino,
 		  __print_flags(__entry->bmap_state, "|", XFS_BMAP_EXT_FLAGS),
-		  (long)__entry->idx,
+		  __entry->leaf,
+		  __entry->pos,
 		  __entry->startoff,
 		  (int64_t)__entry->startblock,
 		  __entry->blockcount,
@@ -297,13 +261,15 @@ DECLARE_EVENT_CLASS(xfs_bmap_class,
 
 #define DEFINE_BMAP_EVENT(name) \
 DEFINE_EVENT(xfs_bmap_class, name, \
-	TP_PROTO(struct xfs_inode *ip, xfs_extnum_t idx, int state, \
+	TP_PROTO(struct xfs_inode *ip, struct xfs_iext_cursor *cur, int state, \
 		 unsigned long caller_ip), \
-	TP_ARGS(ip, idx, state, caller_ip))
+	TP_ARGS(ip, cur, state, caller_ip))
+DEFINE_BMAP_EVENT(xfs_iext_insert);
 DEFINE_BMAP_EVENT(xfs_iext_remove);
 DEFINE_BMAP_EVENT(xfs_bmap_pre_update);
 DEFINE_BMAP_EVENT(xfs_bmap_post_update);
-DEFINE_BMAP_EVENT(xfs_extlist);
+DEFINE_BMAP_EVENT(xfs_read_extent);
+DEFINE_BMAP_EVENT(xfs_write_extent);
 
 DECLARE_EVENT_CLASS(xfs_buf_class,
 	TP_PROTO(struct xfs_buf *bp, unsigned long caller_ip),
@@ -658,6 +624,7 @@ DEFINE_INODE_EVENT(xfs_alloc_file_space);
 DEFINE_INODE_EVENT(xfs_free_file_space);
 DEFINE_INODE_EVENT(xfs_zero_file_space);
 DEFINE_INODE_EVENT(xfs_collapse_file_space);
+DEFINE_INODE_EVENT(xfs_insert_file_space);
 DEFINE_INODE_EVENT(xfs_readdir);
 #ifdef CONFIG_XFS_POSIX_ACL
 DEFINE_INODE_EVENT(xfs_get_acl);

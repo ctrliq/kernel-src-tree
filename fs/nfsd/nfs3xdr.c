@@ -250,6 +250,34 @@ encode_wcc_data(struct svc_rqst *rqstp, __be32 *p, struct svc_fh *fhp)
 }
 
 /*
+ * Fill in the pre_op attr for the wcc data
+ */
+void fill_pre_wcc(struct svc_fh *fhp)
+{
+	struct inode    *inode;
+	struct kstat	stat;
+	__be32 err;
+
+	if (fhp->fh_pre_saved)
+		return;
+
+	inode = d_inode(fhp->fh_dentry);
+	err = fh_getattr(fhp, &stat);
+	if (err) {
+		/* Grab the times from inode anyway */
+		stat.mtime = inode->i_mtime;
+		stat.ctime = inode->i_ctime;
+		stat.size  = inode->i_size;
+	}
+
+	fhp->fh_pre_mtime = stat.mtime;
+	fhp->fh_pre_ctime = stat.ctime;
+	fhp->fh_pre_size  = stat.size;
+	fhp->fh_pre_change = inode->i_version;
+	fhp->fh_pre_saved = true;
+}
+
+/*
  * Fill in the post_op attr for the wcc data
  */
 void fill_post_wcc(struct svc_fh *fhp)
@@ -356,7 +384,7 @@ int
 nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 					struct nfsd3_writeargs *args)
 {
-	unsigned int len, v, hdr, dlen;
+	unsigned int len, hdr, dlen;
 	u32 max_blocksize = svc_max_payload(rqstp);
 	struct kvec *head = rqstp->rq_arg.head;
 	struct kvec *tail = rqstp->rq_arg.tail;
@@ -398,17 +426,9 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 		args->count = max_blocksize;
 		len = args->len = max_blocksize;
 	}
-	rqstp->rq_vec[0].iov_base = (void*)p;
-	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
-	v = 0;
-	while (len > rqstp->rq_vec[v].iov_len) {
-		len -= rqstp->rq_vec[v].iov_len;
-		v++;
-		rqstp->rq_vec[v].iov_base = page_address(rqstp->rq_pages[v]);
-		rqstp->rq_vec[v].iov_len = PAGE_SIZE;
-	}
-	rqstp->rq_vec[v].iov_len = len;
-	args->vlen = v + 1;
+
+	args->first.iov_base = (void *)p;
+	args->first.iov_len = head->iov_len - hdr;
 	return 1;
 }
 

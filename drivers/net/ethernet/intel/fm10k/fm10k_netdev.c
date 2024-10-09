@@ -1,22 +1,5 @@
-/* Intel(R) Ethernet Switch Host Interface Driver
- * Copyright(c) 2013 - 2017 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- */
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 2013 - 2018 Intel Corporation. */
 
 #include "fm10k.h"
 #include <linux/vmalloc.h>
@@ -432,7 +415,7 @@ static void fm10k_restore_vxlan_port(struct fm10k_intfc *interface)
 
 /**
  * fm10k_add_vxlan_port
- * @netdev: network interface device structure
+ * @dev: network interface device structure
  * @sa_family: Address family of new port
  * @port: port number used for VXLAN
  * @type: Enumerated value specifying udp encapsulation type
@@ -480,7 +463,7 @@ insert_tail:
 
 /**
  * fm10k_del_vxlan_port
- * @netdev: network interface device structure
+ * @dev: network interface device structure
  * @sa_family: Address family of freed port
  * @port: port number used for VXLAN
  * @type: Enumerated value specifying udp encapsulation type
@@ -777,7 +760,7 @@ int fm10k_queue_vlan_request(struct fm10k_intfc *interface,
  * @glort: the target glort for this update
  * @addr: the address to update
  * @vid: the vid to update
- * @sync: whether to add or remove
+ * @set: whether to add or remove
  *
  * This function queues up a MAC request for sending to the switch manager.
  * A separate thread monitors the queue and sends updates to the switch
@@ -1261,7 +1244,7 @@ void fm10k_restore_rx_state(struct fm10k_intfc *interface)
 			glort = l2_accel->dglort + 1 + i;
 
 			hw->mac.ops.update_xcast_mode(hw, glort,
-						      FM10K_XCAST_MODE_MULTI);
+						      FM10K_XCAST_MODE_NONE);
 			fm10k_queue_mac_request(interface, glort,
 						sdev->dev_addr,
 						hw->mac.default_vid, true);
@@ -1528,12 +1511,12 @@ static void *fm10k_dfwd_add_station(struct net_device *dev,
 
 	glort = l2_accel->dglort + 1 + i;
 
-	if (fm10k_host_mbx_ready(interface)) {
+	if (fm10k_host_mbx_ready(interface))
 		hw->mac.ops.update_xcast_mode(hw, glort,
-					      FM10K_XCAST_MODE_MULTI);
-		fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
-					hw->mac.default_vid, true);
-	}
+					      FM10K_XCAST_MODE_NONE);
+
+	fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
+				hw->mac.default_vid, true);
 
 	for (vid = fm10k_find_next_vlan(interface, 0);
 	     vid < VLAN_N_VID;
@@ -1574,12 +1557,12 @@ static void fm10k_dfwd_del_station(struct net_device *dev, void *priv)
 
 	glort = l2_accel->dglort + 1 + i;
 
-	if (fm10k_host_mbx_ready(interface)) {
+	if (fm10k_host_mbx_ready(interface))
 		hw->mac.ops.update_xcast_mode(hw, glort,
 					      FM10K_XCAST_MODE_NONE);
-		fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
-					hw->mac.default_vid, false);
-	}
+
+	fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
+				hw->mac.default_vid, false);
 
 	for (vid = fm10k_find_next_vlan(interface, 0);
 	     vid < VLAN_N_VID;
@@ -1633,9 +1616,6 @@ static const struct net_device_ops fm10k_netdev_ops = {
 #if 0
 	.extended.ndo_dfwd_add_station	= fm10k_dfwd_add_station,
 	.extended.ndo_dfwd_del_station	= fm10k_dfwd_del_station,
-#endif
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= fm10k_netpoll,
 #endif
 };
 

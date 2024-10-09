@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2017-2018 Netronome Systems, Inc. */
 
 #include <linux/rtnetlink.h>
 #include <net/devlink.h>
@@ -160,6 +130,26 @@ out:
 	return ret;
 }
 
+static int
+nfp_devlink_sb_pool_get(struct devlink *devlink, unsigned int sb_index,
+			u16 pool_index, struct devlink_sb_pool_info *pool_info)
+{
+	struct nfp_pf *pf = devlink_priv(devlink);
+
+	return nfp_shared_buf_pool_get(pf, sb_index, pool_index, pool_info);
+}
+
+static int
+nfp_devlink_sb_pool_set(struct devlink *devlink, unsigned int sb_index,
+			u16 pool_index,
+			u32 size, enum devlink_sb_threshold_type threshold_type)
+{
+	struct nfp_pf *pf = devlink_priv(devlink);
+
+	return nfp_shared_buf_pool_set(pf, sb_index, pool_index,
+				       size, threshold_type);
+}
+
 static int nfp_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode)
 {
 	struct nfp_pf *pf = devlink_priv(devlink);
@@ -182,6 +172,8 @@ static int nfp_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode)
 const struct devlink_ops nfp_devlink_ops = {
 	.port_split		= nfp_devlink_port_split,
 	.port_unsplit		= nfp_devlink_port_unsplit,
+	.sb_pool_get		= nfp_devlink_sb_pool_get,
+	.sb_pool_set		= nfp_devlink_sb_pool_set,
 	.eswitch_mode_get	= nfp_devlink_eswitch_mode_get,
 	.eswitch_mode_set	= nfp_devlink_eswitch_mode_set,
 };

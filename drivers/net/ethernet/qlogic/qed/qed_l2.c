@@ -2203,21 +2203,22 @@ out:
 static int qed_fill_eth_dev_info(struct qed_dev *cdev,
 				 struct qed_dev_eth_info *info)
 {
+	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
 	int i;
 
 	memset(info, 0, sizeof(*info));
-
-	info->num_tc = 1;
 
 	if (IS_PF(cdev)) {
 		int max_vf_vlan_filters = 0;
 		int max_vf_mac_filters = 0;
 
+		info->num_tc = p_hwfn->hw_info.num_hw_tc;
+
 		if (cdev->int_params.out.int_mode == QED_INT_MODE_MSIX) {
 			u16 num_queues = 0;
 
 			/* Since the feature controls only queue-zones,
-			 * make sure we have the contexts [rx, tx] to
+			 * make sure we have the contexts [rx, xdp, tcs] to
 			 * match.
 			 */
 			for_each_hwfn(cdev, i) {
@@ -2227,7 +2228,8 @@ static int qed_fill_eth_dev_info(struct qed_dev *cdev,
 				u16 cids;
 
 				cids = hwfn->pf_params.eth_pf_params.num_cons;
-				num_queues += min_t(u16, l2_queues, cids / 2);
+				cids /= (2 + info->num_tc);
+				num_queues += min_t(u16, l2_queues, cids);
 			}
 
 			/* queues might theoretically be >256, but interrupts'
@@ -2262,6 +2264,8 @@ static int qed_fill_eth_dev_info(struct qed_dev *cdev,
 		info->xdp_supported = true;
 	} else {
 		u16 total_cids = 0;
+
+		info->num_tc = 1;
 
 		/* Determine queues &  XDP support */
 		for_each_hwfn(cdev, i) {
@@ -2569,7 +2573,7 @@ static int qed_start_txq(struct qed_dev *cdev,
 
 	rc = qed_eth_tx_queue_start(p_hwfn,
 				    p_hwfn->hw_info.opaque_fid,
-				    p_params, 0,
+				    p_params, p_params->tc,
 				    pbl_addr, pbl_size, ret_params);
 
 	if (rc) {

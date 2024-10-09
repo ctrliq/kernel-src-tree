@@ -78,6 +78,7 @@ struct amd_nb {
 
 /* The maximal number of PEBS events: */
 #define MAX_PEBS_EVENTS		8
+#define MAX_FIXED_PEBS_EVENTS	3
 #define PEBS_COUNTER_MASK	((1ULL << MAX_PEBS_EVENTS) - 1)
 
 /*
@@ -109,7 +110,7 @@ struct debug_store {
 	u64	pebs_index;
 	u64	pebs_absolute_maximum;
 	u64	pebs_interrupt_threshold;
-	u64	pebs_event_reset[MAX_PEBS_EVENTS];
+	u64	pebs_event_reset[MAX_PEBS_EVENTS + MAX_FIXED_PEBS_EVENTS];
 };
 
 #define PEBS_REGS \
@@ -252,6 +253,11 @@ struct cpu_hw_events {
 	struct event_constraint *constraint_list; /* in enable order */
 	struct intel_excl_cntrs		*excl_cntrs;
 	int excl_thread_id; /* 0 or 1 */
+
+	/*
+	 * SKL TSX_FORCE_ABORT shadow
+	 */
+	u64				tfa_shadow;
 
 	/*
 	 * AMD specific bits
@@ -571,9 +577,11 @@ struct x86_pmu {
 	struct event_constraint *event_constraints;
 	struct x86_pmu_quirk *quirks;
 	int		perfctr_second_write;
-	bool		late_ack;
 	u64		(*limit_period)(struct perf_event *event, u64 l);
 
+	/* PMI handler bits */
+	unsigned int	late_ack		:1,
+			counter_freezing	:1;
 	/*
 	 * sysfs attrs
 	 */
@@ -682,6 +690,7 @@ do {									\
 #define PMU_FL_EXCL_CNTRS	0x4 /* has exclusive counter requirements  */
 #define PMU_FL_EXCL_ENABLED	0x8 /* exclusive counter active */
 #define PMU_FL_PEBS_ALL		0x10 /* all events are valid PEBS events */
+#define PMU_FL_TFA		0x20 /* deal with TSX force abort */
 
 #define EVENT_VAR(_id)  event_attr_##_id
 #define EVENT_PTR(_id) &event_attr_##_id.attr.attr
@@ -870,7 +879,8 @@ struct event_constraint *
 x86_get_event_constraints(struct cpu_hw_events *cpuc, int idx,
 			  struct perf_event *event);
 
-struct intel_shared_regs *allocate_shared_regs(int cpu);
+extern int intel_cpuc_prepare(struct cpu_hw_events *cpuc, int cpu);
+extern void intel_cpuc_finish(struct cpu_hw_events *cpuc);
 
 int intel_pmu_init(void);
 
@@ -1007,9 +1017,13 @@ static inline int intel_pmu_init(void)
 	return 0;
 }
 
-static inline struct intel_shared_regs *allocate_shared_regs(int cpu)
+static inline int intel_cpuc_prepare(struct cpu_hw_events *cpuc, int cpu)
 {
-	return NULL;
+	return 0;
+}
+
+static inline void intel_cpuc_finish(struct cpu_hw_events *cpuc)
+{
 }
 
 static inline int is_ht_workaround_enabled(void)

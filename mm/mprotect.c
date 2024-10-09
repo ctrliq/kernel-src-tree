@@ -32,6 +32,8 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
+#include "internal.h"
+
 static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 		unsigned long addr, unsigned long end, pgprot_t newprot,
 		int dirty_accountable, int prot_numa)
@@ -223,7 +225,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
 	BUG_ON(addr >= end);
 	pgd = pgd_offset(mm, addr);
 	flush_cache_range(vma, addr, end);
-	set_tlb_flush_pending(mm);
+	inc_tlb_flush_pending(mm);
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(pgd))
@@ -235,7 +237,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
 	/* Only flush the TLB if we actually modified any entries: */
 	if (pages)
 		flush_tlb_range(vma, start, end);
-	clear_tlb_flush_pending(mm);
+	dec_tlb_flush_pending(mm);
 
 	return pages;
 }
@@ -370,6 +372,15 @@ success:
 
 	change_protection(vma, start, end, vma->vm_page_prot,
 			  dirty_accountable, 0);
+
+	/*
+	 * Private VM_LOCKED VMA becoming writable: trigger COW to avoid major
+	 * fault on access.
+	 */
+	if ((oldflags & (VM_WRITE | VM_SHARED | VM_LOCKED)) == VM_LOCKED &&
+			(newflags & VM_WRITE)) {
+		populate_vma_page_range(vma, start, end, NULL);
+	}
 
 	vm_stat_account(mm, oldflags, vma->vm_file, -nrpages);
 	vm_stat_account(mm, newflags, vma->vm_file, nrpages);

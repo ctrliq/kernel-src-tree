@@ -34,7 +34,7 @@ static unsigned int
 reject_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct ipt_reject_info *reject = par->targinfo;
-	int hook = par->hooknum;
+	int hook = xt_hooknum(par);
 
 	switch (reject->with) {
 	case IPT_ICMP_NET_UNREACHABLE:

@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <sys/utsname.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,7 +202,7 @@ out:
 	return err;
 }
 
-static int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size)
+int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size)
 {
 	void *ptr;
 	loff_t pgoff;
@@ -383,4 +384,33 @@ out:
 	strlist__delete(tips);
 
 	return tip;
+}
+
+int
+fetch_kernel_version(unsigned int *puint, char *str,
+		     size_t str_size)
+{
+	struct utsname utsname;
+	int version, patchlevel, sublevel, err;
+
+	if (uname(&utsname))
+		return -1;
+
+	if (str && str_size) {
+		strncpy(str, utsname.release, str_size);
+		str[str_size - 1] = '\0';
+	}
+
+	err = sscanf(utsname.release, "%d.%d.%d",
+		     &version, &patchlevel, &sublevel);
+
+	if (err != 3) {
+		pr_debug("Unablt to get kernel version from uname '%s'\n",
+			 utsname.release);
+		return -1;
+	}
+
+	if (puint)
+		*puint = (version << 16) + (patchlevel << 8) + sublevel;
+	return 0;
 }

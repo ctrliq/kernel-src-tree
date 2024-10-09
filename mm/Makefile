@@ -69,3 +69,4 @@ obj-$(CONFIG_USERFAULTFD) += userfaultfd.o
 obj-$(CONFIG_MEMORY_BALLOON) += balloon_compaction.o
 obj-$(CONFIG_PAGE_EXTENSION) += page_ext.o
 obj-$(CONFIG_HARDENED_USERCOPY) += usercopy.o
+obj-$(CONFIG_IDLE_PAGE_TRACKING) += page_idle.o

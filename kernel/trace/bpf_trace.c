@@ -13,9 +13,14 @@
 #include <linux/filter.h>
 #include <linux/uaccess.h>
 #include <linux/ctype.h>
+#include <linux/kprobes.h>
+#include <asm/kprobes.h>
+
+#include "trace_probe.h"
 #include "trace.h"
 
 u64 bpf_get_stackid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+u64 bpf_get_stack(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
 
 /**
  * trace_call_bpf - invoke BPF program
@@ -75,6 +80,29 @@ unsigned int trace_call_bpf(struct ftrace_event_call *call, void *ctx)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(trace_call_bpf);
+
+#ifdef CONFIG_BPF_KPROBE_OVERRIDE
+BPF_CALL_2(bpf_override_return, struct pt_regs *, regs, unsigned long, rc)
+{
+	__this_cpu_write(bpf_kprobe_override, 1);
+	regs_set_return_value(regs, rc);
+	arch_ftrace_kprobe_override_function(regs);
+	return 0;
+}
+#else
+BPF_CALL_2(bpf_override_return, struct pt_regs *, regs, unsigned long, rc)
+{
+	return -EINVAL;
+}
+#endif
+
+static const struct bpf_func_proto bpf_override_return_proto = {
+	.func		= bpf_override_return,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_ANYTHING,
+};
 
 BPF_CALL_3(bpf_probe_read, void *, dst, u32, size, const void *, unsafe_ptr)
 {
@@ -494,8 +522,14 @@ kprobe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_perf_event_output_proto;
 	case BPF_FUNC_get_stackid:
 		return &bpf_get_stackid_proto;
+	case BPF_FUNC_get_stack:
+		return &bpf_get_stack_proto;
 	case BPF_FUNC_perf_event_read_value:
 		return &bpf_perf_event_read_value_proto;
+	case BPF_FUNC_override_return:
+		pr_warn_ratelimited("%s[%d] is installing a program with bpf_override_return helper that may cause unexpected behavior!",
+				    current->comm, task_pid_nr(current));
+		return &bpf_override_return_proto;
 	default:
 		return tracing_func_proto(func_id, prog);
 	}
@@ -577,6 +611,25 @@ static const struct bpf_func_proto bpf_get_stackid_proto_tp = {
 	.arg3_type	= ARG_ANYTHING,
 };
 
+BPF_CALL_4(bpf_get_stack_tp, void *, tp_buff, void *, buf, u32, size,
+	   u64, flags)
+{
+	struct pt_regs *regs = *(struct pt_regs **)tp_buff;
+
+	return bpf_get_stack((unsigned long) regs, (unsigned long) buf,
+			     (unsigned long) size, flags, 0);
+}
+
+static const struct bpf_func_proto bpf_get_stack_proto_tp = {
+	.func		= bpf_get_stack_tp,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
+	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+	.arg4_type	= ARG_ANYTHING,
+};
+
 static const struct bpf_func_proto *
 tp_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -585,6 +638,8 @@ tp_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_perf_event_output_proto_tp;
 	case BPF_FUNC_get_stackid:
 		return &bpf_get_stackid_proto_tp;
+	case BPF_FUNC_get_stack:
+		return &bpf_get_stack_proto_tp;
 	default:
 		return tracing_func_proto(func_id, prog);
 	}
@@ -647,6 +702,8 @@ pe_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return &bpf_perf_event_output_proto_tp;
 	case BPF_FUNC_get_stackid:
 		return &bpf_get_stackid_proto_tp;
+	case BPF_FUNC_get_stack:
+		return &bpf_get_stack_proto_tp;
 	case BPF_FUNC_perf_prog_read_value:
 		return &bpf_perf_prog_read_value_proto;
 	default:
@@ -665,8 +722,14 @@ static bool pe_prog_is_valid_access(int off, int size, enum bpf_access_type type
 		return false;
 	if (type != BPF_READ)
 		return false;
-	if (off % size != 0)
-		return false;
+	if (off % size != 0) {
+		if (sizeof(unsigned long) != 4)
+			return false;
+		if (size != 8)
+			return false;
+		if (off % size != 4)
+			return false;
+	}
 
 	switch (off) {
 	case bpf_ctx_range(struct bpf_perf_event_data, sample_period):
@@ -729,6 +792,10 @@ int perf_event_attach_bpf_prog(struct perf_event *event,
 	struct bpf_prog_array __rcu *old_array;
 	struct bpf_prog_array *new_array;
 	int ret = -EEXIST;
+
+	/* Kprobe override only works for ftrace based kprobes. */
+	if (prog->kprobe_override && !trace_kprobe_ftrace(event->tp_event))
+		return -EINVAL;
 
 	mutex_lock(&bpf_event_mutex);
 

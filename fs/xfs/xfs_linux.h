@@ -72,7 +72,6 @@ typedef uuid_be			uuid_t;
 #include <linux/freezer.h>
 #include <linux/list_sort.h>
 #include <linux/ratelimit.h>
-#include <linux/rhashtable.h>
 
 #include <asm/page.h>
 #include <asm/div64.h>
@@ -143,6 +142,13 @@ typedef uuid_be			uuid_t;
 #define SYNCHRONIZE()	barrier()
 #define __return_address __builtin_return_address(0)
 
+/*
+ * Return the address of a label.  Use barrier() so that the optimizer
+ * won't reorder code to refactor the error jumpouts into a single
+ * return, which throws off the reported address.
+ */
+#define __this_address	({ __label__ __here; __here: barrier(); &&__here; })
+
 #define XFS_PROJID_DEFAULT	0
 
 #define MIN(a,b)	(min(a,b))
@@ -196,6 +202,16 @@ static inline uint32_t xfs_kgid_to_gid(kgid_t gid)
 static inline kgid_t xfs_gid_to_kgid(uint32_t gid)
 {
 	return make_kgid(&init_user_ns, gid);
+}
+
+static inline dev_t xfs_to_linux_dev_t(xfs_dev_t dev)
+{
+	return MKDEV(sysv_major(dev) & 0x1ff, sysv_minor(dev));
+}
+
+static inline xfs_dev_t linux_to_xfs_dev_t(dev_t dev)
+{
+	return sysv_encode_dev(dev);
 }
 
 /*

@@ -92,6 +92,8 @@ static int autofs4_show_options(struct seq_file *m, struct dentry *root)
 		seq_printf(m, ",direct");
 	else
 		seq_printf(m, ",indirect");
+	if (sbi->flags & AUTOFS_SBI_STRICTEXPIRE)
+		seq_printf(m, ",strictexpire");
 #ifdef CONFIG_CHECKPOINT_RESTORE
 	if (sbi->pipe)
 		seq_printf(m, ",pipe_ino=%ld", sbi->pipe->f_inode->i_ino);
@@ -114,7 +116,7 @@ static const struct super_operations autofs4_sops = {
 };
 
 enum {Opt_err, Opt_fd, Opt_uid, Opt_gid, Opt_pgrp, Opt_minproto, Opt_maxproto,
-	Opt_indirect, Opt_direct, Opt_offset};
+	Opt_indirect, Opt_direct, Opt_offset, Opt_strictexpire};
 
 static const match_table_t tokens = {
 	{Opt_fd, "fd=%u"},
@@ -126,6 +128,7 @@ static const match_table_t tokens = {
 	{Opt_indirect, "indirect"},
 	{Opt_direct, "direct"},
 	{Opt_offset, "offset"},
+	{Opt_strictexpire, "strictexpire"},
 	{Opt_err, NULL}
 };
 
@@ -205,6 +208,9 @@ static int parse_options(char *options,
 		case Opt_offset:
 			set_autofs_type_offset(&sbi->type);
 			break;
+		case Opt_strictexpire:
+			sbi->flags |= AUTOFS_SBI_STRICTEXPIRE;
+			break;
 		default:
 			return 1;
 		}
@@ -232,12 +238,12 @@ int autofs4_fill_super(struct super_block *s, void *data, int silent)
 	sbi->magic = AUTOFS_SBI_MAGIC;
 	sbi->pipefd = -1;
 	sbi->pipe = NULL;
-	sbi->catatonic = 1;
 	sbi->exp_timeout = 0;
 	sbi->oz_pgrp = NULL;
 	sbi->sb = s;
 	sbi->version = 0;
 	sbi->sub_version = 0;
+	sbi->flags = AUTOFS_SBI_CATATONIC;
 	set_autofs_type_indirect(&sbi->type);
 	sbi->min_proto = 0;
 	sbi->max_proto = 0;
@@ -323,7 +329,7 @@ int autofs4_fill_super(struct super_block *s, void *data, int silent)
 	if (ret < 0)
 		goto fail_fput;
 	sbi->pipe = pipe;
-	sbi->catatonic = 0;
+	sbi->flags &= ~AUTOFS_SBI_CATATONIC;
 
 	/*
 	 * Success! Install the root dentry now to indicate completion.

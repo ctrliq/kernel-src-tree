@@ -495,6 +495,9 @@ struct scsi_host_template {
 	/* flag to enable the use of host-wide tags */
 	RH_KABI_EXTEND(unsigned use_host_wide_tags:1)
 
+	/* True if the low-level driver supports blk-mq only */
+	RH_KABI_EXTEND(unsigned force_blk_mq:1)
+
 	/*
 	 * Countdown for host blocking with no commands outstanding.
 	 */

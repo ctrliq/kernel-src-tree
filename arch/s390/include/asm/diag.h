@@ -223,6 +223,17 @@ struct diag204_x_phys_block {
 	struct diag204_x_phys_cpu cpus[];
 } __packed;
 
+#define CPNC_LINUX		0x4
+union diag318_info {
+	unsigned long val;
+	struct {
+		unsigned int cpnc : 8;
+		unsigned int cpvc_linux : 24;
+		unsigned char cpvc_distro[3];
+		unsigned char zero;
+	};
+};
+
 int diag204(unsigned long subcode, unsigned long size, void *addr);
 int diag224(void *ptr);
 #endif /* _ASM_S390_DIAG_H */

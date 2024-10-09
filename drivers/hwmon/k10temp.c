@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/pci_ids.h>
 #include <asm/amd_nb.h>
 #include <asm/processor.h>
 
@@ -36,14 +37,6 @@ MODULE_PARM_DESC(force, "force loading on processors with erratum 319");
 
 /* Provide lock for writing to NB_SMU_IND_ADDR */
 static DEFINE_MUTEX(nb_smu_ind_mutex);
-
-#ifndef PCI_DEVICE_ID_AMD_17H_DF_F3
-#define PCI_DEVICE_ID_AMD_17H_DF_F3	0x1463
-#endif
-
-#ifndef PCI_DEVICE_ID_AMD_17H_M10H_DF_F3
-#define PCI_DEVICE_ID_AMD_17H_M10H_DF_F3	0x15eb
-#endif
 
 /* CPUID function 0x80000001, ebx */
 #define CPUID_PKGTYPE_MASK	0xf0000000
@@ -123,7 +116,7 @@ static void read_tempreg_nb_f15(struct pci_dev *pdev, u32 *regval)
 
 static void read_tempreg_nb_f17(struct pci_dev *pdev, u32 *regval)
 {
-	amd_smn_read(amd_pci_dev_to_node_id(pdev),
+	amd_smn_read(amd_get_node_id(pdev),
 		     F17H_M01H_REPORTED_TEMP_CTRL_OFFSET, regval);
 }
 

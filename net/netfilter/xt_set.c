@@ -59,7 +59,7 @@ set_match_v0(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_set_info_match_v0 *info = par->matchinfo;
 
-	ADT_OPT(opt, par->family, info->match_set.u.compat.dim,
+	ADT_OPT(opt, xt_family(par), info->match_set.u.compat.dim,
 		info->match_set.u.compat.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 
@@ -123,7 +123,7 @@ set_match_v1(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_set_info_match_v1 *info = par->matchinfo;
 
-	ADT_OPT(opt, par->family, info->match_set.dim,
+	ADT_OPT(opt, xt_family(par), info->match_set.dim,
 		info->match_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 
@@ -171,7 +171,7 @@ set_match_v3(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_set_info_match_v3 *info = par->matchinfo;
 
-	ADT_OPT(opt, par->family, info->match_set.dim,
+	ADT_OPT(opt, xt_family(par), info->match_set.dim,
 		info->match_set.flags, info->flags, UINT_MAX,
 		info->packets.value, info->bytes.value,
 		info->packets.op, info->bytes.op);
@@ -194,7 +194,7 @@ set_match_v4(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_set_info_match_v4 *info = par->matchinfo;
 
-	ADT_OPT(opt, par->family, info->match_set.dim,
+	ADT_OPT(opt, xt_family(par), info->match_set.dim,
 		info->match_set.flags, info->flags, UINT_MAX,
 		info->packets.value, info->bytes.value,
 		info->packets.op, info->bytes.op);
@@ -217,10 +217,10 @@ set_target_v0(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct xt_set_info_target_v0 *info = par->targinfo;
 
-	ADT_OPT(add_opt, par->family, info->add_set.u.compat.dim,
+	ADT_OPT(add_opt, xt_family(par), info->add_set.u.compat.dim,
 		info->add_set.u.compat.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
-	ADT_OPT(del_opt, par->family, info->del_set.u.compat.dim,
+	ADT_OPT(del_opt, xt_family(par), info->del_set.u.compat.dim,
 		info->del_set.u.compat.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 
@@ -292,10 +292,10 @@ set_target_v1(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct xt_set_info_target_v1 *info = par->targinfo;
 
-	ADT_OPT(add_opt, par->family, info->add_set.dim,
+	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
 		info->add_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
-	ADT_OPT(del_opt, par->family, info->del_set.dim,
+	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
 		info->del_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 
@@ -363,10 +363,10 @@ set_target_v2(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct xt_set_info_target_v2 *info = par->targinfo;
 
-	ADT_OPT(add_opt, par->family, info->add_set.dim,
+	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
 		info->add_set.flags, info->flags, info->timeout,
 		0, 0, 0, 0);
-	ADT_OPT(del_opt, par->family, info->del_set.dim,
+	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
 		info->del_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 
@@ -395,13 +395,13 @@ set_target_v3(struct sk_buff *skb, const struct xt_action_param *par)
 	const struct xt_set_info_target_v3 *info = par->targinfo;
 	int ret;
 
-	ADT_OPT(add_opt, par->family, info->add_set.dim,
+	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
 		info->add_set.flags, info->flags, info->timeout,
 		0, 0, 0, 0);
-	ADT_OPT(del_opt, par->family, info->del_set.dim,
+	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
 		info->del_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
-	ADT_OPT(map_opt, par->family, info->map_set.dim,
+	ADT_OPT(map_opt, xt_family(par), info->map_set.dim,
 		info->map_set.flags, 0, UINT_MAX,
 		0, 0, 0, 0);
 

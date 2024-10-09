@@ -1453,9 +1453,9 @@ out:
 EXPORT_SYMBOL(__break_lease);
 
 /**
- *	lease_get_mtime - get the last modified time of an inode
+ *	lease_get_mtime - update modified time of an inode with exclusive lease
  *	@inode: the inode
- *      @time:  pointer to a timespec which will contain the last modified time
+ *      @time:  pointer to a timespec which contains the last modified time
  *
  * This is to force NFS clients to flush their caches for files with
  * exclusive leases.  The justification is that if someone has an
@@ -1466,8 +1466,6 @@ void lease_get_mtime(struct inode *inode, struct timespec *time)
 	struct file_lock *flock = inode->i_flock;
 	if (flock && IS_LEASE(flock) && (flock->fl_type == F_WRLCK))
 		*time = current_fs_time(inode->i_sb);
-	else
-		*time = inode->i_mtime;
 }
 
 EXPORT_SYMBOL(lease_get_mtime);

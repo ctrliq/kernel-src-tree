@@ -286,7 +286,7 @@
 #define __NR_seccomp		348
 #define __NR_getrandom		349
 #define __NR_memfd_create	350
-/* Number 351 is reserved for sys_bpf */
+#define __NR_bpf		351
 #define __NR_s390_pci_mmio_write	352
 #define __NR_s390_pci_mmio_read		353
 #define __NR_membarrier		356

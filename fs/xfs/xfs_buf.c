@@ -41,6 +41,8 @@
 #include "xfs_mount.h"
 #include "xfs_trace.h"
 #include "xfs_log.h"
+#include "xfs_errortag.h"
+#include "xfs_error.h"
 
 static kmem_zone_t *xfs_buf_zone;
 
@@ -289,6 +291,7 @@ _xfs_buf_alloc(
 	init_completion(&bp->b_iowait);
 	INIT_LIST_HEAD(&bp->b_lru);
 	INIT_LIST_HEAD(&bp->b_list);
+	RB_CLEAR_NODE(&bp->b_rbnode);
 	sema_init(&bp->b_sema, 0); /* held, no waiters */
 	spin_lock_init(&bp->b_lock);
 	XB_SET_OWNER(bp);
@@ -543,62 +546,6 @@ _xfs_buf_map_pages(
 /*
  *	Finding and Reading Buffers
  */
-static int
-_xfs_buf_obj_cmp(
-	struct rhashtable_compare_arg	*arg,
-	const void			*obj)
-{
-	const struct xfs_buf_map	*map = arg->key;
-	const struct xfs_buf		*bp = obj;
-
-	/*
-	 * The key hashing in the lookup path depends on the key being the
-	 * first element of the compare_arg, make sure to assert this.
-	 */
-	BUILD_BUG_ON(offsetof(struct xfs_buf_map, bm_bn) != 0);
-
-	if (bp->b_bn != map->bm_bn)
-		return 1;
-
-	if (unlikely(bp->b_length != map->bm_len)) {
-		/*
-		 * found a block number match. If the range doesn't
-		 * match, the only way this is allowed is if the buffer
-		 * in the cache is stale and the transaction that made
-		 * it stale has not yet committed. i.e. we are
-		 * reallocating a busy extent. Skip this buffer and
-		 * continue searching for an exact match.
-		 */
-		ASSERT(bp->b_flags & XBF_STALE);
-		return 1;
-	}
-	return 0;
-}
-
-static const struct rhashtable_params xfs_buf_hash_params = {
-	.min_size		= 32,	/* empty AGs have minimal footprint */
-	.nelem_hint		= 16,
-	.key_len		= sizeof(xfs_daddr_t),
-	.key_offset		= offsetof(struct xfs_buf, b_bn),
-	.head_offset		= offsetof(struct xfs_buf, b_rhash_head),
-	.automatic_shrinking	= true,
-	.obj_cmpfn		= _xfs_buf_obj_cmp,
-};
-
-int
-xfs_buf_hash_init(
-	struct xfs_perag	*pag)
-{
-	spin_lock_init(&pag->pag_buf_lock);
-	return rhashtable_init(&pag->pag_buf_hash, &xfs_buf_hash_params);
-}
-
-void
-xfs_buf_hash_destroy(
-	struct xfs_perag	*pag)
-{
-	rhashtable_destroy(&pag->pag_buf_hash);
-}
 
 /*
  *	Look up, and creates if absent, a lockable buffer for
@@ -614,24 +561,27 @@ _xfs_buf_find(
 	xfs_buf_t		*new_bp)
 {
 	struct xfs_perag	*pag;
+	struct rb_node		**rbp;
+	struct rb_node		*parent;
 	xfs_buf_t		*bp;
-	struct xfs_buf_map	cmap = { .bm_bn = map[0].bm_bn };
+	xfs_daddr_t		blkno = map[0].bm_bn;
 	xfs_daddr_t		eofs;
+	int			numblks = 0;
 	int			i;
 
 	for (i = 0; i < nmaps; i++)
-		cmap.bm_len += map[i].bm_len;
+		numblks += map[i].bm_len;
 
 	/* Check for IOs smaller than the sector size / not sector aligned */
-	ASSERT(!(BBTOB(cmap.bm_len) < btp->bt_meta_sectorsize));
-	ASSERT(!(BBTOB(cmap.bm_bn) & (xfs_off_t)btp->bt_meta_sectormask));
+	ASSERT(!(BBTOB(numblks) < btp->bt_meta_sectorsize));
+	ASSERT(!(BBTOB(blkno) & (xfs_off_t)btp->bt_meta_sectormask));
 
 	/*
 	 * Corrupted block numbers can get through to here, unfortunately, so we
 	 * have to check that the buffer falls within the filesystem bounds.
 	 */
 	eofs = XFS_FSB_TO_BB(btp->bt_mount, btp->bt_mount->m_sb.sb_dblocks);
-	if (cmap.bm_bn < 0 || cmap.bm_bn >= eofs) {
+	if (blkno < 0 || blkno >= eofs) {
 		/*
 		 * XXX (dgc): we should really be returning -EFSCORRUPTED here,
 		 * but none of the higher level infrastructure supports
@@ -639,29 +589,53 @@ _xfs_buf_find(
 		 */
 		xfs_alert(btp->bt_mount,
 			  "%s: Block out of range: block 0x%llx, EOFS 0x%llx ",
-			  __func__, cmap.bm_bn, eofs);
+			  __func__, blkno, eofs);
 		WARN_ON(1);
 		return NULL;
 	}
 
+	/* get tree root */
 	pag = xfs_perag_get(btp->bt_mount,
-			    xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
+				xfs_daddr_to_agno(btp->bt_mount, blkno));
 
+	/* walk tree */
 	spin_lock(&pag->pag_buf_lock);
-	bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
-				    xfs_buf_hash_params);
-	if (bp) {
-		atomic_inc(&bp->b_hold);
-		goto found;
+	rbp = &pag->pag_buf_tree.rb_node;
+	parent = NULL;
+	bp = NULL;
+	while (*rbp) {
+		parent = *rbp;
+		bp = rb_entry(parent, struct xfs_buf, b_rbnode);
+
+		if (blkno < bp->b_bn)
+			rbp = &(*rbp)->rb_left;
+		else if (blkno > bp->b_bn)
+			rbp = &(*rbp)->rb_right;
+		else {
+			/*
+			 * found a block number match. If the range doesn't
+			 * match, the only way this is allowed is if the buffer
+			 * in the cache is stale and the transaction that made
+			 * it stale has not yet committed. i.e. we are
+			 * reallocating a busy extent. Skip this buffer and
+			 * continue searching to the right for an exact match.
+			 */
+			if (bp->b_length != numblks) {
+				ASSERT(bp->b_flags & XBF_STALE);
+				rbp = &(*rbp)->rb_right;
+				continue;
+			}
+			atomic_inc(&bp->b_hold);
+			goto found;
+		}
 	}
 
 	/* No match found */
 	if (new_bp) {
+		rb_link_node(&new_bp->b_rbnode, parent, rbp);
+		rb_insert_color(&new_bp->b_rbnode, &pag->pag_buf_tree);
 		/* the buffer keeps the perag reference until it is freed */
 		new_bp->b_pag = pag;
-		rhashtable_insert_fast(&pag->pag_buf_hash,
-				       &new_bp->b_rhash_head,
-				       xfs_buf_hash_params);
 		spin_unlock(&pag->pag_buf_lock);
 	} else {
 		XFS_STATS_INC(btp->bt_mount, xb_miss_locked);
@@ -1029,12 +1003,15 @@ xfs_buf_rele(
 
 	if (!pag) {
 		ASSERT(list_empty(&bp->b_lru));
+		ASSERT(RB_EMPTY_NODE(&bp->b_rbnode));
 		if (atomic_dec_and_test(&bp->b_hold)) {
 			xfs_buf_ioacct_dec(bp);
 			xfs_buf_free(bp);
 		}
 		return;
 	}
+
+	ASSERT(!RB_EMPTY_NODE(&bp->b_rbnode));
 
 	ASSERT(atomic_read(&bp->b_hold) > 0);
 	release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
@@ -1075,8 +1052,7 @@ xfs_buf_rele(
 		}
 
 		ASSERT(!(bp->b_flags & _XBF_DELWRI_Q));
-		rhashtable_remove_fast(&pag->pag_buf_hash, &bp->b_rhash_head,
-				       xfs_buf_hash_params);
+		rb_erase(&bp->b_rbnode, &pag->pag_buf_tree);
 		spin_unlock(&pag->pag_buf_lock);
 		xfs_perag_put(pag);
 		freebuf = true;
@@ -1540,6 +1516,20 @@ xfs_buf_submit(
 }
 
 /*
+ * Wait for I/O completion of a sync buffer and return the I/O error code.
+ */
+static int
+xfs_buf_iowait(
+	struct xfs_buf	*bp)
+{
+	trace_xfs_buf_iowait(bp, _RET_IP_);
+	wait_for_completion(&bp->b_iowait);
+	trace_xfs_buf_iowait_done(bp, _RET_IP_);
+
+	return bp->b_error;
+}
+
+/*
  * Synchronous buffer IO submission path, read or write.
  */
 int
@@ -1561,12 +1551,7 @@ xfs_buf_submit_wait(
 	error = __xfs_buf_submit(bp);
 	if (error)
 		goto out;
-
-	/* wait for completion before gathering the error from the buffer */
-	trace_xfs_buf_iowait(bp, _RET_IP_);
-	wait_for_completion(&bp->b_iowait);
-	trace_xfs_buf_iowait_done(bp, _RET_IP_);
-	error = bp->b_error;
+	error = xfs_buf_iowait(bp);
 
 out:
 	/*
@@ -1950,16 +1935,11 @@ xfs_buf_cmp(
 }
 
 /*
- * submit buffers for write.
- *
- * When we have a large buffer list, we do not want to hold all the buffers
- * locked while we block on the request queue waiting for IO dispatch. To avoid
- * this problem, we lock and submit buffers in groups of 50, thereby minimising
- * the lock hold times for lists which may contain thousands of objects.
- *
- * To do this, we sort the buffer list before we walk the list to lock and
- * submit buffers, and we plug and unplug around each group of buffers we
- * submit.
+ * Submit buffers for write. If wait_list is specified, the buffers are
+ * submitted using sync I/O and placed on the wait list such that the caller can
+ * iowait each buffer. Otherwise async I/O is used and the buffers are released
+ * at I/O completion time. In either case, buffers remain locked until I/O
+ * completes and the buffer is released from the queue.
  */
 static int
 xfs_buf_delwri_submit_buffers(
@@ -2001,21 +1981,22 @@ xfs_buf_delwri_submit_buffers(
 		trace_xfs_buf_delwri_split(bp, _RET_IP_);
 
 		/*
-		 * We do all IO submission async. This means if we need
-		 * to wait for IO completion we need to take an extra
-		 * reference so the buffer is still valid on the other
-		 * side. We need to move the buffer onto the io_list
-		 * at this point so the caller can still access it.
+		 * If we have a wait list, each buffer (and associated delwri
+		 * queue reference) transfers to it and is submitted
+		 * synchronously. Otherwise, drop the buffer from the delwri
+		 * queue and submit async.
 		 */
 		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC | XBF_WRITE_FAIL);
-		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
+		bp->b_flags |= XBF_WRITE;
 		if (wait_list) {
-			xfs_buf_hold(bp);
+			bp->b_flags &= ~XBF_ASYNC;
 			list_move_tail(&bp->b_list, wait_list);
-		} else
+			__xfs_buf_submit(bp);
+		} else {
+			bp->b_flags |= XBF_ASYNC;
 			list_del_init(&bp->b_list);
-
-		xfs_buf_submit(bp);
+			xfs_buf_submit(bp);
+		}
 	}
 	blk_finish_plug(&plug);
 
@@ -2062,9 +2043,11 @@ xfs_buf_delwri_submit(
 
 		list_del_init(&bp->b_list);
 
-		/* locking the buffer will wait for async IO completion. */
-		xfs_buf_lock(bp);
-		error2 = bp->b_error;
+		/*
+		 * Wait on the locked buffer, check for errors and unlock and
+		 * release the delwri queue reference.
+		 */
+		error2 = xfs_buf_iowait(bp);
 		xfs_buf_relse(bp);
 		if (!error)
 			error = error2;
@@ -2110,23 +2093,18 @@ xfs_buf_delwri_pushbuf(
 
 	/*
 	 * Delwri submission clears the DELWRI_Q buffer flag and returns with
-	 * the buffer on the wait list with an associated reference. Rather than
+	 * the buffer on the wait list with the original reference. Rather than
 	 * bounce the buffer from a local wait list back to the original list
 	 * after I/O completion, reuse the original list as the wait list.
 	 */
 	xfs_buf_delwri_submit_buffers(&submit_list, buffer_list);
 
 	/*
-	 * The buffer is now under I/O and wait listed as during typical delwri
-	 * submission. Lock the buffer to wait for I/O completion. Rather than
-	 * remove the buffer from the wait list and release the reference, we
-	 * want to return with the buffer queued to the original list. The
-	 * buffer already sits on the original list with a wait list reference,
-	 * however. If we let the queue inherit that wait list reference, all we
-	 * need to do is reset the DELWRI_Q flag.
+	 * The buffer is now locked, under I/O and wait listed on the original
+	 * delwri queue. Wait for I/O completion, restore the DELWRI_Q flag and
+	 * return with the buffer unlocked and on the original queue.
 	 */
-	xfs_buf_lock(bp);
-	error = bp->b_error;
+	error = xfs_buf_iowait(bp);
 	bp->b_flags |= _XBF_DELWRI_Q;
 	xfs_buf_unlock(bp);
 
@@ -2151,4 +2129,18 @@ void
 xfs_buf_terminate(void)
 {
 	kmem_zone_destroy(xfs_buf_zone);
+}
+
+void xfs_buf_set_ref(struct xfs_buf *bp, int lru_ref)
+{
+	/*
+	 * Set the lru reference count to 0 based on the error injection tag.
+	 * This allows userspace to disrupt buffer caching for debug/testing
+	 * purposes.
+	 */
+	if (XFS_TEST_ERROR(false, bp->b_target->bt_mount,
+			   XFS_ERRTAG_BUF_LRU_REF))
+		lru_ref = 0;
+
+	atomic_set(&bp->b_lru_ref, lru_ref);
 }

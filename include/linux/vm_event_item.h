@@ -80,6 +80,10 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
 		BALLOON_MIGRATE,
 #endif
 #endif
+#ifdef CONFIG_SWAP
+		SWAP_RA,
+		SWAP_RA_HIT,
+#endif
 		NR_VM_EVENT_ITEMS
 };
 

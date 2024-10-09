@@ -182,3 +182,5 @@ static inline bool irqd_has_set(struct irq_data *d, unsigned int mask)
 {
 	return d->state_use_accessors & mask;
 }
+
+extern bool irqaffinity_drivers;

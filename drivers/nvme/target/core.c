@@ -142,6 +142,51 @@ static void nvmet_add_async_event(struct nvmet_ctrl *ctrl, u8 event_type,
 	schedule_work(&ctrl->async_event_work);
 }
 
+static bool nvmet_aen_disabled(struct nvmet_ctrl *ctrl, u32 aen)
+{
+	if (!(READ_ONCE(ctrl->aen_enabled) & aen))
+		return true;
+	return test_and_set_bit(aen, &ctrl->aen_masked);
+}
+
+static void nvmet_add_to_changed_ns_log(struct nvmet_ctrl *ctrl, __le32 nsid)
+{
+	u32 i;
+
+	mutex_lock(&ctrl->lock);
+	if (ctrl->nr_changed_ns > NVME_MAX_CHANGED_NAMESPACES)
+		goto out_unlock;
+
+	for (i = 0; i < ctrl->nr_changed_ns; i++) {
+		if (ctrl->changed_ns_list[i] == nsid)
+			goto out_unlock;
+	}
+
+	if (ctrl->nr_changed_ns == NVME_MAX_CHANGED_NAMESPACES) {
+		ctrl->changed_ns_list[0] = cpu_to_le32(0xffffffff);
+		ctrl->nr_changed_ns = U32_MAX;
+		goto out_unlock;
+	}
+
+	ctrl->changed_ns_list[ctrl->nr_changed_ns++] = nsid;
+out_unlock:
+	mutex_unlock(&ctrl->lock);
+}
+
+static void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid)
+{
+	struct nvmet_ctrl *ctrl;
+
+	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
+		nvmet_add_to_changed_ns_log(ctrl, cpu_to_le32(nsid));
+		if (nvmet_aen_disabled(ctrl, NVME_AEN_CFG_NS_ATTR))
+			continue;
+		nvmet_add_async_event(ctrl, NVME_AER_TYPE_NOTICE,
+				NVME_AER_NOTICE_NS_CHANGED,
+				NVME_LOG_CHANGED_NS);
+	}
+}
+
 int nvmet_register_transport(const struct nvmet_fabrics_ops *ops)
 {
 	int ret = 0;
@@ -193,6 +238,10 @@ int nvmet_enable_port(struct nvmet_port *port)
 		module_put(ops->owner);
 		return ret;
 	}
+
+	/* If the transport didn't set inline_data_size, then disable it. */
+	if (port->inline_data_size < 0)
+		port->inline_data_size = 0;
 
 	port->enabled = true;
 	return 0;
@@ -279,7 +328,6 @@ void nvmet_put_namespace(struct nvmet_ns *ns)
 int nvmet_ns_enable(struct nvmet_ns *ns)
 {
 	struct nvmet_subsys *subsys = ns->subsys;
-	struct nvmet_ctrl *ctrl;
 	int ret = 0;
 
 	mutex_lock(&subsys->lock);
@@ -325,9 +373,7 @@ int nvmet_ns_enable(struct nvmet_ns *ns)
 		list_add_tail_rcu(&ns->dev_link, &old->dev_link);
 	}
 
-	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry)
-		nvmet_add_async_event(ctrl, NVME_AER_TYPE_NOTICE, 0, 0);
-
+	nvmet_ns_changed(subsys, ns->nsid);
 	ns->enabled = true;
 	ret = 0;
 out_unlock:
@@ -342,7 +388,6 @@ out_blkdev_put:
 void nvmet_ns_disable(struct nvmet_ns *ns)
 {
 	struct nvmet_subsys *subsys = ns->subsys;
-	struct nvmet_ctrl *ctrl;
 
 	mutex_lock(&subsys->lock);
 	if (!ns->enabled)
@@ -368,9 +413,7 @@ void nvmet_ns_disable(struct nvmet_ns *ns)
 	percpu_ref_exit(&ns->ref);
 
 	mutex_lock(&subsys->lock);
-	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry)
-		nvmet_add_async_event(ctrl, NVME_AER_TYPE_NOTICE, 0, 0);
-
+	nvmet_ns_changed(subsys, ns->nsid);
 	if (ns->bdev)
 		blkdev_put(ns->bdev, FMODE_WRITE|FMODE_READ);
 out_unlock:
@@ -810,6 +853,8 @@ u16 nvmet_alloc_ctrl(const char *subsysnqn, const char *hostnqn,
 
 	nvmet_init_cap(ctrl);
 
+	ctrl->port = req->port;
+
 	INIT_WORK(&ctrl->async_event_work, nvmet_async_event_work);
 	INIT_LIST_HEAD(&ctrl->async_events);
 
@@ -818,12 +863,18 @@ u16 nvmet_alloc_ctrl(const char *subsysnqn, const char *hostnqn,
 
 	kref_init(&ctrl->ref);
 	ctrl->subsys = subsys;
+	WRITE_ONCE(ctrl->aen_enabled, NVMET_AEN_CFG_OPTIONAL);
+
+	ctrl->changed_ns_list = kmalloc_array(NVME_MAX_CHANGED_NAMESPACES,
+			sizeof(__le32), GFP_KERNEL);
+	if (!ctrl->changed_ns_list)
+		goto out_free_ctrl;
 
 	ctrl->cqs = kcalloc(subsys->max_qid + 1,
 			sizeof(struct nvmet_cq *),
 			GFP_KERNEL);
 	if (!ctrl->cqs)
-		goto out_free_ctrl;
+		goto out_free_changed_ns_list;
 
 	ctrl->sqs = kcalloc(subsys->max_qid + 1,
 			sizeof(struct nvmet_sq *),
@@ -881,6 +932,8 @@ out_free_sqs:
 	kfree(ctrl->sqs);
 out_free_cqs:
 	kfree(ctrl->cqs);
+out_free_changed_ns_list:
+	kfree(ctrl->changed_ns_list);
 out_free_ctrl:
 	kfree(ctrl);
 out_put_subsystem:
@@ -907,6 +960,7 @@ static void nvmet_ctrl_free(struct kref *ref)
 
 	kfree(ctrl->sqs);
 	kfree(ctrl->cqs);
+	kfree(ctrl->changed_ns_list);
 	kfree(ctrl);
 
 	nvmet_subsys_put(subsys);

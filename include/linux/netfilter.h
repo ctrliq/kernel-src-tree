@@ -9,7 +9,10 @@
 #include <linux/in6.h>
 #include <linux/wait.h>
 #include <linux/list.h>
-#include <uapi/linux/netfilter.h>
+#include <linux/netfilter_defs.h>
+#include <linux/netdevice.h>
+#include <net/net_namespace.h>
+
 #ifdef CONFIG_NETFILTER
 static inline int NF_DROP_GETERR(int verdict)
 {
@@ -37,9 +40,6 @@ static inline void nf_inet_addr_mask(const union nf_inet_addr *a1,
 
 int netfilter_init(void);
 
-/* Largest hook number + 1 */
-#define NF_MAX_HOOKS 8
-
 struct sk_buff;
 
 struct nf_hook_ops;
@@ -58,6 +58,7 @@ struct nf_hook_state {
 	/* RHEL: this structure can be extended by adding new fields below
 	 * this point. Any user of such new field has to check the 'size'
 	 * field first to determine whether the field is present. */
+	struct net *net;
 };
 
 static inline void nf_hook_state_init(struct nf_hook_state *p,
@@ -66,6 +67,7 @@ static inline void nf_hook_state_init(struct nf_hook_state *p,
 				      struct net_device *indev,
 				      struct net_device *outdev,
 				      struct sock *sk,
+				      struct net *net,
 				      int (*okfn)(struct sock *, struct sk_buff *))
 {
 	p->size = sizeof(*p);
@@ -75,6 +77,7 @@ static inline void nf_hook_state_init(struct nf_hook_state *p,
 	p->in = indev;
 	p->out = outdev;
 	p->sk = sk;
+	p->net = net;
 	p->okfn = okfn;
 }
 
@@ -181,11 +184,13 @@ static inline int nf_hook_thresh(u_int8_t pf, unsigned int hook,
 				 int (*okfn)(struct sock *, struct sk_buff *),
 				 int thresh)
 {
+	struct net *net = dev_net(indev ? indev : outdev);
+
 	if (nf_hooks_active(pf, hook)) {
 		struct nf_hook_state state;
 
 		nf_hook_state_init(&state, hook, thresh, pf,
-				   indev, outdev, sk, okfn);
+				   indev, outdev, sk, net, okfn);
 		return nf_hook_slow(skb, &state);
 	}
 	return 1;

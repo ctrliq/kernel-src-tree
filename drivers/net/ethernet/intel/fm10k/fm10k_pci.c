@@ -1,22 +1,5 @@
-/* Intel(R) Ethernet Switch Host Interface Driver
- * Copyright(c) 2013 - 2017 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- */
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 2013 - 2018 Intel Corporation. */
 
 #include <linux/module.h>
 #include <linux/interrupt.h>
@@ -213,7 +196,7 @@ static void fm10k_start_service_event(struct fm10k_intfc *interface)
 
 /**
  * fm10k_service_timer - Timer Call-back
- * @data: pointer to interface cast into an unsigned long
+ * @t: pointer to timer data
  **/
 static void fm10k_service_timer(struct timer_list *t)
 {
@@ -651,7 +634,7 @@ void fm10k_update_stats(struct fm10k_intfc *interface)
 
 /**
  * fm10k_watchdog_flush_tx - flush queues on host not ready
- * @interface - pointer to the device interface structure
+ * @interface: pointer to the device interface structure
  **/
 static void fm10k_watchdog_flush_tx(struct fm10k_intfc *interface)
 {
@@ -681,7 +664,7 @@ static void fm10k_watchdog_flush_tx(struct fm10k_intfc *interface)
 
 /**
  * fm10k_watchdog_subtask - check and bring link up
- * @interface - pointer to the device interface structure
+ * @interface: pointer to the device interface structure
  **/
 static void fm10k_watchdog_subtask(struct fm10k_intfc *interface)
 {
@@ -705,7 +688,7 @@ static void fm10k_watchdog_subtask(struct fm10k_intfc *interface)
 
 /**
  * fm10k_check_hang_subtask - check for hung queues and dropped interrupts
- * @interface - pointer to the device interface structure
+ * @interface: pointer to the device interface structure
  *
  * This function serves two purposes.  First it strobes the interrupt lines
  * in order to make certain interrupts are occurring.  Secondly it sets the
@@ -1229,28 +1212,6 @@ static irqreturn_t fm10k_msix_mbx_vf(int __always_unused irq, void *data)
 	return IRQ_HANDLED;
 }
 
-#ifdef CONFIG_NET_POLL_CONTROLLER
-/**
- *  fm10k_netpoll - A Polling 'interrupt' handler
- *  @netdev: network interface device structure
- *
- *  This is used by netconsole to send skbs without having to re-enable
- *  interrupts. It's not called while the normal interrupt routine is executing.
- **/
-void fm10k_netpoll(struct net_device *netdev)
-{
-	struct fm10k_intfc *interface = netdev_priv(netdev);
-	int i;
-
-	/* if interface is down do nothing */
-	if (test_bit(__FM10K_DOWN, interface->state))
-		return;
-
-	for (i = 0; i < interface->num_q_vectors; i++)
-		fm10k_msix_clean_rings(0, interface->q_vector[i]);
-}
-
-#endif
 #define FM10K_ERR_MSG(type) case (type): error = #type; break
 static void fm10k_handle_fault(struct fm10k_intfc *interface, int type,
 			       struct fm10k_fault *fault)
@@ -1997,6 +1958,7 @@ skip_tx_dma_drain:
 /**
  * fm10k_sw_init - Initialize general software structures
  * @interface: host interface private structure to initialize
+ * @ent: PCI device ID entry
  *
  * fm10k_sw_init initializes the interface private data structure.
  * Fields are initialized based on PCI device information and
@@ -2568,8 +2530,6 @@ static pci_ers_result_t fm10k_io_slot_reset(struct pci_dev *pdev)
 
 		result = PCI_ERS_RESULT_RECOVERED;
 	}
-
-	pci_cleanup_aer_uncorrect_error_status(pdev);
 
 	return result;
 }

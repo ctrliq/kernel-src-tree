@@ -5,6 +5,7 @@
 #include <asm/spec_ctrl.h>
 
 #include <asm/cpufeature.h>
+#include <asm/nospec-branch.h>
 
 #define MWAIT_SUBSTATE_MASK		0xf
 #define MWAIT_CSTATE_MASK		0xf
@@ -28,6 +29,8 @@ static __always_inline void __monitor(const void *eax, unsigned long ecx,
 
 static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
 {
+	mds_idle_clear_cpu_buffers();
+
 	/* "mwait %eax, %ecx;" */
 	asm volatile(".byte 0x0f, 0x01, 0xc9;"
 		     :: "a" (eax), "c" (ecx));
@@ -45,7 +48,7 @@ static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
  */
 static inline void mwait_idle_with_hints(unsigned long eax, unsigned long ecx)
 {
-	if (!current_set_polling_and_test()) {
+	if (static_cpu_has_bug(X86_BUG_MONITOR) || !current_set_polling_and_test()) {
 		if (this_cpu_has(X86_FEATURE_CLFLUSH_MONITOR))
 			clflush((void *)&current_thread_info()->flags);
 

@@ -41,6 +41,7 @@
 #include "trace.h"
 #include "x86.h"
 #include "cpuid.h"
+#include "hyperv.h"
 
 #ifndef CONFIG_X86_64
 #define mod_64(x, y) ((x) - (y) * div64_u64(x, y))
@@ -1065,7 +1066,7 @@ int kvm_apic_compare_prio(struct kvm_vcpu *vcpu1, struct kvm_vcpu *vcpu2)
 
 static bool kvm_ioapic_handles_vector(struct kvm_lapic *apic, int vector)
 {
-	return test_bit(vector, (ulong *)apic->vcpu->arch.eoi_exit_bitmap);
+	return test_bit(vector, apic->vcpu->arch.ioapic_handled_vectors);
 }
 
 static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
@@ -1106,6 +1107,9 @@ static int apic_set_eoi(struct kvm_lapic *apic)
 
 	apic_clear_isr(vector, apic);
 	apic_update_ppr(apic);
+
+	if (test_bit(vector, vcpu_to_synic(apic->vcpu)->vec_bitmap))
+		kvm_hv_synic_send_eoi(apic->vcpu, vector);
 
 	kvm_ioapic_send_eoi(apic, vector);
 	kvm_make_request(KVM_REQ_EVENT, apic->vcpu);
@@ -1292,7 +1296,7 @@ static int apic_mmio_read(struct kvm_io_device *this,
 		return -EOPNOTSUPP;
 
 	if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
-		if (!kvm_check_has_quirk(vcpu->kvm,
+		if (!kvm_check_has_quirk(apic->vcpu->kvm,
 					 KVM_X86_QUIRK_LAPIC_MMIO_HOLE))
 			return -EOPNOTSUPP;
 
@@ -1812,7 +1816,7 @@ static int apic_mmio_write(struct kvm_io_device *this,
 		return -EOPNOTSUPP;
 
 	if (!kvm_apic_hw_enabled(apic) || apic_x2apic_mode(apic)) {
-		if (!kvm_check_has_quirk(vcpu->kvm,
+		if (!kvm_check_has_quirk(apic->vcpu->kvm,
 					 KVM_X86_QUIRK_LAPIC_MMIO_HOLE))
 			return -EOPNOTSUPP;
 
@@ -1956,13 +1960,11 @@ void kvm_lapic_set_base(struct kvm_vcpu *vcpu, u64 value)
 		recalculate_apic_map(vcpu->kvm);
 	}
 
-	if ((old_value ^ value) & X2APIC_ENABLE) {
-		if (value & X2APIC_ENABLE) {
-			kvm_apic_set_x2apic_id(apic, vcpu->vcpu_id);
-			kvm_x86_ops->set_virtual_x2apic_mode(vcpu, true);
-		} else
-			kvm_x86_ops->set_virtual_x2apic_mode(vcpu, false);
-	}
+	if (((old_value ^ value) & X2APIC_ENABLE) && (value & X2APIC_ENABLE))
+		kvm_apic_set_x2apic_id(apic, vcpu->vcpu_id);
+
+	if ((old_value ^ value) & (MSR_IA32_APICBASE_ENABLE | X2APIC_ENABLE))
+		kvm_x86_ops->set_virtual_apic_mode(vcpu);
 
 	apic->base_address = apic->vcpu->arch.apic_base &
 			     MSR_IA32_APICBASE_BASE;
@@ -2207,7 +2209,7 @@ int kvm_get_apic_interrupt(struct kvm_vcpu *vcpu)
 	 */
 
 	apic_clear_irr(vector, apic);
-	if (0 /* test_bit(vector, vcpu_to_synic(vcpu)->auto_eoi_bitmap) */) {
+	if (test_bit(vector, vcpu_to_synic(vcpu)->auto_eoi_bitmap)) {
 		/*
 		 * For auto-EOI interrupts, there might be another pending
 		 * interrupt above PPR, so check whether to raise another

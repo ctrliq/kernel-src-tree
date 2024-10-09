@@ -573,6 +573,7 @@ int main(void)
 	DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
 	DEFINE(VCORE_KVM, offsetof(struct kvmppc_vcore, kvm));
 	DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+	OFFSET(VCORE_TB_OFFSET_APPL, kvmppc_vcore, tb_offset_applied);
 	DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
 	DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
 	DEFINE(VCORE_DPDES, offsetof(struct kvmppc_vcore, dpdes));

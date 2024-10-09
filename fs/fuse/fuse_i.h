@@ -82,6 +82,9 @@ struct fuse_inode {
 	/** Time in jiffies until the file attributes are valid */
 	u64 i_time;
 
+	/* Is atime invalid? */
+	int inval_atime;
+
 	/** The sticky bit in inode->i_mode may have been removed, so
 	    preserve the original mode */
 	umode_t orig_i_mode;
@@ -375,9 +378,6 @@ struct fuse_req {
 struct fuse_conn {
 	/** Lock protecting accessess to  members of this structure */
 	spinlock_t lock;
-
-	/** Mutex protecting against directory alias creation */
-	struct mutex inst_mutex;
 
 	/** Refcount */
 	atomic_t count;
@@ -682,7 +682,7 @@ void fuse_sync_release(struct fuse_file *ff, int flags);
 /**
  * Send RELEASE or RELEASEDIR request
  */
-void fuse_release_common(struct file *file, int opcode);
+void fuse_release_common(struct file *file, bool isdir);
 
 /**
  * Send FSYNC or FSYNCDIR request
@@ -900,7 +900,10 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
 unsigned fuse_file_poll(struct file *file, poll_table *wait);
 int fuse_dev_release(struct inode *inode, struct file *file);
 
-void fuse_write_update_size(struct inode *inode, loff_t pos);
+bool fuse_write_update_size(struct inode *inode, loff_t pos);
+
+int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
+int fuse_write_inode(struct inode *inode, struct writeback_control *wbc);
 
 int fuse_do_setattr(struct inode *inode, struct iattr *attr,
 		    struct file *file);

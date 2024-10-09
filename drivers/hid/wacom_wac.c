@@ -1829,12 +1829,14 @@ static void wacom_wac_pad_usage_mapping(struct hid_device *hdev,
 		wacom_map_usage(input, usage, field, EV_ABS, ABS_Z, 0);
 		features->device_type |= WACOM_DEVICETYPE_PAD;
 		break;
+	case WACOM_HID_WD_BUTTONCENTER:
+		wacom->generic_has_leds = true;
+		/* fall through */
 	case WACOM_HID_WD_BUTTONHOME:
 	case WACOM_HID_WD_BUTTONUP:
 	case WACOM_HID_WD_BUTTONDOWN:
 	case WACOM_HID_WD_BUTTONLEFT:
 	case WACOM_HID_WD_BUTTONRIGHT:
-	case WACOM_HID_WD_BUTTONCENTER:
 		wacom_map_usage(input, usage, field, EV_KEY,
 				wacom_numbered_button_to_key(features->numbered_buttons),
 				0);

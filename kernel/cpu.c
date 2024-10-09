@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/notifier.h>
 #include <linux/sched.h>
+#include <linux/sched/smt.h>
 #include <linux/unistd.h>
 #include <linux/cpu.h>
 #include <linux/oom.h>
@@ -23,6 +24,7 @@
 #include <linux/tick.h>
 
 #include "smpboot.h"
+#include "sched/sched.h"
 
 #ifdef CONFIG_SMP
 /* Serializes the updates to cpu_online_mask, cpu_present_mask */
@@ -227,9 +229,14 @@ static void cpu_hotplug_begin(void) {}
 static void cpu_hotplug_done(void) {}
 #endif	/* #else #if CONFIG_HOTPLUG_CPU */
 
+/*
+ * Architectures that need SMT-specific errata handling during SMT hotplug
+ * should override this.
+ */
+void __weak arch_smt_update(void) { }
+
 #ifdef CONFIG_HOTPLUG_SMT
 enum cpuhp_smt_control cpu_smt_control __read_mostly = CPU_SMT_ENABLED;
-EXPORT_SYMBOL_GPL(cpu_smt_control);
 
 void __init cpu_smt_disable(bool force)
 {
@@ -432,6 +439,13 @@ static int __ref _cpu_down(unsigned int cpu, int tasks_frozen)
 	if (!cpu_online(cpu))
 		return -EINVAL;
 
+	/*
+	 * The sibling_mask will be cleared in take_cpu_down when the
+	 * operation succeeds. So we can't test the sibling mask after
+	 * that. We needs to call sched_cpu_activate() if it fails.
+	 */
+	sched_cpu_deactivate(cpu);
+
 	cpu_hotplug_begin();
 
 	err = __cpu_notify(CPU_DOWN_PREPARE | mod, hcpu, -1, &nr_calls);
@@ -496,6 +510,9 @@ out_release:
 	cpu_hotplug_done();
 	if (!err)
 		cpu_notify_nofail(CPU_POST_DEAD | mod, hcpu);
+	else
+		sched_cpu_activate(cpu); /* Revert sched_cpu_deactivate() */
+	arch_smt_update();
 	return err;
 }
 
@@ -568,6 +585,9 @@ out_notify:
 		__cpu_notify(CPU_UP_CANCELED | mod, hcpu, nr_calls, NULL);
 out:
 	cpu_hotplug_done();
+	if (!ret)
+		sched_cpu_activate(cpu);
+	arch_smt_update();
 
 	return ret;
 }
@@ -770,19 +790,6 @@ void notify_cpu_starting(unsigned int cpu)
 
 #ifdef CONFIG_HOTPLUG_SMT
 
-static const char *smt_states[] = {
-	[CPU_SMT_ENABLED]		= "on",
-	[CPU_SMT_DISABLED]		= "off",
-	[CPU_SMT_FORCE_DISABLED]	= "forceoff",
-	[CPU_SMT_NOT_SUPPORTED]		= "notsupported",
-};
-
-static ssize_t
-show_smt_control(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE - 2, "%s\n", smt_states[cpu_smt_control]);
-}
-
 static void cpuhp_offline_cpu_device(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
@@ -853,9 +860,10 @@ static int cpuhp_smt_enable(void)
 	return ret;
 }
 
+
 static ssize_t
-store_smt_control(struct device *dev, struct device_attribute *attr,
-		  const char *buf, size_t count)
+__store_smt_control(struct device *dev, struct device_attribute *attr,
+		    const char *buf, size_t count)
 {
 	int ctrlval, ret;
 
@@ -893,14 +901,44 @@ store_smt_control(struct device *dev, struct device_attribute *attr,
 	unlock_device_hotplug();
 	return ret ? ret : count;
 }
+
+#else /* !CONFIG_HOTPLUG_SMT */
+static ssize_t
+__store_smt_control(struct device *dev, struct device_attribute *attr,
+		    const char *buf, size_t count)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_HOTPLUG_SMT */
+
+static const char *smt_states[] = {
+	[CPU_SMT_ENABLED]		= "on",
+	[CPU_SMT_DISABLED]		= "off",
+	[CPU_SMT_FORCE_DISABLED]	= "forceoff",
+	[CPU_SMT_NOT_SUPPORTED]		= "notsupported",
+	[CPU_SMT_NOT_IMPLEMENTED]	= "notimplemented",
+};
+
+static ssize_t
+show_smt_control(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	const char *state = smt_states[cpu_smt_control];
+
+	return snprintf(buf, PAGE_SIZE - 2, "%s\n", state);
+}
+
+static ssize_t
+store_smt_control(struct device *dev, struct device_attribute *attr,
+		  const char *buf, size_t count)
+{
+	return __store_smt_control(dev, attr, buf, count);
+}
 static DEVICE_ATTR(control, 0644, show_smt_control, store_smt_control);
 
 static ssize_t
 show_smt_active(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	bool active = topology_max_smt_threads() > 1;
-
-	return snprintf(buf, PAGE_SIZE - 2, "%d\n", active);
+	return snprintf(buf, PAGE_SIZE - 2, "%d\n", sched_smt_active());
 }
 static DEVICE_ATTR(active, 0444, show_smt_active, NULL);
 
@@ -916,31 +954,18 @@ static const struct attribute_group cpuhp_smt_attr_group = {
 	NULL
 };
 
-static int __init cpu_smt_state_init(void)
+static int __init cpu_smt_sysfs_init(void)
 {
-	/*
-	 * If SMT was disabled by BIOS, detect it here, after the CPUs have
-	 * been brought online.  This ensures the smt/l1tf sysfs entries are
-	 * consistent with reality.  Note this may overwrite cpu_smt_control's
-	 * previous setting.
-	 */
-	if (topology_max_smt_threads() == 1)
-		cpu_smt_control = CPU_SMT_NOT_SUPPORTED;
-
 	return sysfs_create_group(&cpu_subsys.dev_root->kobj,
 				  &cpuhp_smt_attr_group);
 }
 
-#else
-static inline int cpu_smt_state_init(void) { return 0; }
-#endif
-
 static int __init cpuhp_sysfs_init(void)
 {
-	return cpu_smt_state_init();
+	return cpu_smt_sysfs_init();
 }
 device_initcall(cpuhp_sysfs_init);
-#endif
+#endif /* CONFIG_SYSFS && CONFIG_HOTPLUG_CPU */
 
 /*
  * cpu_bit_bitmap[] is a special, "compressed" data structure that
@@ -1047,3 +1072,18 @@ void __init boot_cpu_state_init(void)
 {
 	this_cpu_write(booted_once, true);
 }
+
+enum cpu_mitigations cpu_mitigations = CPU_MITIGATIONS_AUTO;
+
+static int __init mitigations_parse_cmdline(char *arg)
+{
+	if (!strcmp(arg, "off"))
+		cpu_mitigations = CPU_MITIGATIONS_OFF;
+	else if (!strcmp(arg, "auto"))
+		cpu_mitigations = CPU_MITIGATIONS_AUTO;
+	else if (!strcmp(arg, "auto,nosmt"))
+		cpu_mitigations = CPU_MITIGATIONS_AUTO_NOSMT;
+
+	return 0;
+}
+early_param("mitigations", mitigations_parse_cmdline);

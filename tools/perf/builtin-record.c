@@ -44,6 +44,8 @@
 #include <inttypes.h>
 #include <locale.h>
 #include <poll.h>
+#include "util/bpf-loader.h"
+
 #include <unistd.h>
 #include <sched.h>
 #include <signal.h>
@@ -913,8 +915,27 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		}
 	}
 
+	/*
+	 * If we have just single event and are sending data
+	 * through pipe, we need to force the ids allocation,
+	 * because we synthesize event name through the pipe
+	 * and need the id for that.
+	 */
+	if (data->is_pipe && rec->evlist->nr_entries == 1)
+		rec->opts.sample_id = true;
+
 	if (record__open(rec) != 0) {
 		err = -1;
+		goto out_child;
+	}
+
+	err = bpf__apply_obj_config();
+	if (err) {
+		char errbuf[BUFSIZ];
+
+		bpf__strerror_apply_obj_config(err, errbuf, sizeof(errbuf));
+		pr_err("ERROR: Apply config to BPF failed: %s\n",
+			 errbuf);
 		goto out_child;
 	}
 
@@ -1715,6 +1736,14 @@ int cmd_record(int argc, const char **argv)
 	 * filters. Refer to auxtrace_parse_filters().
 	 */
 	symbol_conf.allow_aliases = true;
+
+	err = bpf__setup_stdout(rec->evlist);
+	if (err) {
+		bpf__strerror_setup_stdout(rec->evlist, err, errbuf, sizeof(errbuf));
+		pr_err("ERROR: Setup BPF stdout failed: %s\n",
+			 errbuf);
+		return err;
+	}
 
 	symbol__init(NULL);
 

@@ -1,36 +1,5 @@
-// SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
-/*
- * Copyright (C) 2018 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2018 Netronome Systems, Inc. */
 
 #include <linux/bitfield.h>
 #include <linux/etherdevice.h>
@@ -40,6 +9,7 @@
 #include <linux/slab.h>
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
+#include <net/red.h>
 
 #include "../nfpcore/nfp.h"
 #include "../nfpcore/nfp_cpp.h"
@@ -55,6 +25,23 @@ static u32 nfp_abm_portid(enum nfp_repr_type rtype, unsigned int id)
 {
 	return FIELD_PREP(NFP_ABM_PORTID_TYPE, rtype) |
 	       FIELD_PREP(NFP_ABM_PORTID_ID, id);
+}
+
+static int nfp_abm_reset_stats(struct nfp_abm_link *alink)
+{
+	int err;
+
+	err = nfp_abm_ctrl_read_stats(alink, &alink->qdiscs[0].stats);
+	if (err)
+		return err;
+	alink->qdiscs[0].stats.backlog_pkts = 0;
+	alink->qdiscs[0].stats.backlog_bytes = 0;
+
+	err = nfp_abm_ctrl_read_xstats(alink, &alink->qdiscs[0].xstats);
+	if (err)
+		return err;
+
+	return 0;
 }
 
 static void
@@ -88,14 +75,84 @@ nfp_abm_red_replace(struct net_device *netdev, struct nfp_abm_link *alink,
 	if (err)
 		goto err_destroy;
 
+	/* Reset stats only on new qdisc */
+	if (alink->qdiscs[0].handle != opt->handle) {
+		err = nfp_abm_reset_stats(alink);
+		if (err)
+			goto err_destroy;
+	}
+
 	alink->qdiscs[0].handle = opt->handle;
 	port->tc_offload_cnt = 1;
 
 	return 0;
 err_destroy:
+	/* If the qdisc keeps on living, but we can't offload undo changes */
+	if (alink->qdiscs[0].handle == opt->handle) {
+		opt->set.qstats->qlen -= alink->qdiscs[0].stats.backlog_pkts;
+		opt->set.qstats->backlog -=
+			alink->qdiscs[0].stats.backlog_bytes;
+	}
 	if (alink->qdiscs[0].handle != TC_H_UNSPEC)
 		nfp_abm_red_destroy(netdev, alink, alink->qdiscs[0].handle);
 	return err;
+}
+
+static void
+nfp_abm_update_stats(struct nfp_alink_stats *new, struct nfp_alink_stats *old,
+		     struct tc_qopt_offload_stats *stats)
+{
+	_bstats_update(stats->bstats, new->tx_bytes - old->tx_bytes,
+		       new->tx_pkts - old->tx_pkts);
+	stats->qstats->qlen += new->backlog_pkts - old->backlog_pkts;
+	stats->qstats->backlog += new->backlog_bytes - old->backlog_bytes;
+	stats->qstats->overlimits += new->overlimits - old->overlimits;
+	stats->qstats->drops += new->drops - old->drops;
+}
+
+static int
+nfp_abm_red_stats(struct nfp_abm_link *alink, struct tc_red_qopt_offload *opt)
+{
+	struct nfp_alink_stats *prev_stats;
+	struct nfp_alink_stats stats;
+	int err;
+
+	if (alink->qdiscs[0].handle != opt->handle)
+		return -EOPNOTSUPP;
+	prev_stats = &alink->qdiscs[0].stats;
+
+	err = nfp_abm_ctrl_read_stats(alink, &stats);
+	if (err)
+		return err;
+
+	nfp_abm_update_stats(&stats, prev_stats, &opt->stats);
+
+	*prev_stats = stats;
+
+	return 0;
+}
+
+static int
+nfp_abm_red_xstats(struct nfp_abm_link *alink, struct tc_red_qopt_offload *opt)
+{
+	struct nfp_alink_xstats *prev_xstats;
+	struct nfp_alink_xstats xstats;
+	int err;
+
+	if (alink->qdiscs[0].handle != opt->handle)
+		return -EOPNOTSUPP;
+	prev_xstats = &alink->qdiscs[0].xstats;
+
+	err = nfp_abm_ctrl_read_xstats(alink, &xstats);
+	if (err)
+		return err;
+
+	opt->xstats->forced_mark += xstats.ecn_marked - prev_xstats->ecn_marked;
+	opt->xstats->pdrop += xstats.pdrop - prev_xstats->pdrop;
+
+	*prev_xstats = xstats;
+
+	return 0;
 }
 
 static int
@@ -111,6 +168,10 @@ nfp_abm_setup_tc_red(struct net_device *netdev, struct nfp_abm_link *alink,
 	case TC_RED_DESTROY:
 		nfp_abm_red_destroy(netdev, alink, opt->handle);
 		return 0;
+	case TC_RED_STATS:
+		return nfp_abm_red_stats(alink, opt);
+	case TC_RED_XSTATS:
+		return nfp_abm_red_xstats(alink, opt);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -190,8 +251,6 @@ nfp_abm_spawn_repr(struct nfp_app *app, struct nfp_abm_link *alink,
 			goto err_free_port;
 	} else {
 		port->pf_id = alink->abm->pf_id;
-		port->pf_split = app->pf->max_data_vnics > 1;
-		port->pf_split_id = alink->id;
 		port->vnic = alink->vnic->dp.ctrl_bar;
 	}
 
@@ -267,6 +326,7 @@ static enum devlink_eswitch_mode nfp_abm_eswitch_mode_get(struct nfp_app *app)
 static int nfp_abm_eswitch_set_legacy(struct nfp_abm *abm)
 {
 	nfp_abm_kill_reprs_all(abm);
+	nfp_abm_ctrl_qm_disable(abm);
 
 	abm->eswitch_mode = DEVLINK_ESWITCH_MODE_LEGACY;
 	return 0;
@@ -285,6 +345,10 @@ static int nfp_abm_eswitch_set_switchdev(struct nfp_abm *abm)
 	struct nfp_net *nn;
 	int err;
 
+	err = nfp_abm_ctrl_qm_enable(abm);
+	if (err)
+		return err;
+
 	list_for_each_entry(nn, &pf->vnics, vnic_list) {
 		struct nfp_abm_link *alink = nn->app_priv;
 
@@ -302,6 +366,7 @@ static int nfp_abm_eswitch_set_switchdev(struct nfp_abm *abm)
 
 err_kill_all_reprs:
 	nfp_abm_kill_reprs_all(abm);
+	nfp_abm_ctrl_qm_disable(abm);
 	return err;
 }
 
@@ -432,6 +497,11 @@ static int nfp_abm_init(struct nfp_app *app)
 	abm->app = app;
 
 	err = nfp_abm_ctrl_find_addrs(abm);
+	if (err)
+		goto err_free_abm;
+
+	/* We start in legacy mode, make sure advanced queuing is disabled */
+	err = nfp_abm_ctrl_qm_disable(abm);
 	if (err)
 		goto err_free_abm;
 

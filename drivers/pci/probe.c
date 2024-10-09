@@ -1436,7 +1436,7 @@ int pci_setup_device(struct pci_dev *dev)
 static void pci_configure_mps(struct pci_dev *dev)
 {
 	struct pci_dev *bridge = pci_upstream_bridge(dev);
-	int mps, p_mps, rc;
+	int mps, mpss, p_mps, rc;
 
 	if (!pci_is_pcie(dev) || !bridge || !pci_is_pcie(bridge))
 		return;
@@ -1464,6 +1464,14 @@ static void pci_configure_mps(struct pci_dev *dev)
 	if (pcie_bus_config != PCIE_BUS_DEFAULT)
 		return;
 
+	mpss = 128 << dev->pcie_mpss;
+	if (mpss < p_mps && pci_pcie_type(bridge) == PCI_EXP_TYPE_ROOT_PORT) {
+		pcie_set_mps(bridge, mpss);
+		pci_info(dev, "Upstream bridge's Max Payload Size set to %d (was %d, max %d)\n",
+			 mpss, p_mps, 128 << bridge->pcie_mpss);
+		p_mps = pcie_get_mps(bridge);
+	}
+
 	rc = pcie_set_mps(dev, p_mps);
 	if (rc) {
 		dev_warn(&dev->dev, "can't set Max Payload Size to %d; if necessary, use \"pci=pcie_bus_safe\" and report a bug\n",
@@ -1472,7 +1480,7 @@ static void pci_configure_mps(struct pci_dev *dev)
 	}
 
 	dev_info(&dev->dev, "Max Payload Size set to %d (was %d, max %d)\n",
-		 p_mps, mps, 128 << dev->pcie_mpss);
+		 p_mps, mps, mpss);
 }
 
 static struct hpp_type0 pci_default_type0 = {
@@ -1800,6 +1808,25 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	return dev;
 }
 
+static void pcie_report_downtraining(struct pci_dev *dev)
+{
+	if (!pci_is_pcie(dev))
+		return;
+
+	/* Look from the device up to avoid downstream ports with no devices */
+	if ((pci_pcie_type(dev) != PCI_EXP_TYPE_ENDPOINT) &&
+	    (pci_pcie_type(dev) != PCI_EXP_TYPE_LEG_END) &&
+	    (pci_pcie_type(dev) != PCI_EXP_TYPE_UPSTREAM))
+		return;
+
+	/* Multi-function PCIe devices share the same link/status */
+	if (PCI_FUNC(dev->devfn) != 0 || dev->is_virtfn)
+		return;
+
+	/* Print link status only if the device is constrained by the fabric */
+	__pcie_print_link_status(dev, false);
+}
+
 static void pci_init_capabilities(struct pci_dev *dev)
 {
 	/* Enhanced Allocation */
@@ -1833,6 +1860,11 @@ static void pci_init_capabilities(struct pci_dev *dev)
 	pci_enable_acs(dev);
 
 	pci_cleanup_aer_error_status_regs(dev);
+
+	if (pci_probe_reset_function(dev) == 0)
+		dev->reset_fn = 1;
+
+	pcie_report_downtraining(dev);
 }
 
 void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)

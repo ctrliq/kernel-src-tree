@@ -174,7 +174,7 @@ static int xgpu_ai_send_access_requests(struct amdgpu_device *adev,
 			return r;
 		}
 		/* Retrieve checksum from mailbox2 */
-		if (req == IDH_REQ_GPU_INIT_ACCESS) {
+		if (req == IDH_REQ_GPU_INIT_ACCESS || req == IDH_REQ_GPU_RESET_ACCESS) {
 			adev->virt.fw_reserve.checksum_key =
 				RREG32_NO_KIQ(SOC15_REG_OFFSET(NBIO, 0,
 					mmBIF_BX_PF0_MAILBOX_MSGBUF_RCV_DW2));
@@ -260,12 +260,14 @@ static void xgpu_ai_mailbox_flr_work(struct work_struct *work)
 	} while (timeout > 1);
 
 flr_done:
-	if (locked)
+	if (locked) {
+		adev->in_gpu_reset = 0;
 		mutex_unlock(&adev->lock_reset);
+	}
 
 	/* Trigger recovery for world switch failure if no TDR */
-	if (amdgpu_lockup_timeout == 0)
-		amdgpu_device_gpu_recover(adev, NULL, true);
+	if (amdgpu_device_should_recover_gpu(adev))
+		amdgpu_device_gpu_recover(adev, NULL);
 }
 
 static int xgpu_ai_set_mailbox_rcv_irq(struct amdgpu_device *adev,

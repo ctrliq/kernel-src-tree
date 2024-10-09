@@ -1005,7 +1005,7 @@ static void __print_slab_result(struct rb_root *root,
 		if (is_caller) {
 			addr = data->call_site;
 			if (!raw_ip)
-				sym = machine__find_kernel_function(machine, addr, &map);
+				sym = machine__find_kernel_symbol(machine, addr, &map);
 		} else
 			addr = data->ptr;
 
@@ -1069,7 +1069,7 @@ static void __print_page_alloc_result(struct perf_session *session, int n_lines)
 		char *caller = buf;
 
 		data = rb_entry(next, struct page_stat, node);
-		sym = machine__find_kernel_function(machine, data->callsite, &map);
+		sym = machine__find_kernel_symbol(machine, data->callsite, &map);
 		if (sym)
 			caller = sym->name;
 		else
@@ -1111,7 +1111,7 @@ static void __print_page_caller_result(struct perf_session *session, int n_lines
 		char *caller = buf;
 
 		data = rb_entry(next, struct page_stat, node);
-		sym = machine__find_kernel_function(machine, data->callsite, &map);
+		sym = machine__find_kernel_symbol(machine, data->callsite, &map);
 		if (sym)
 			caller = sym->name;
 		else

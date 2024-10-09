@@ -125,19 +125,21 @@ int ptp_open(struct posix_clock *pc, fmode_t fmode)
 
 long ptp_ioctl(struct posix_clock *pc, unsigned int cmd, unsigned long arg)
 {
-	struct ptp_clock_caps caps;
-	struct ptp_clock_request req;
-	struct ptp_sys_offset *sysoff = NULL;
-	struct ptp_sys_offset_precise precise_offset;
-	struct ptp_pin_desc pd;
 	struct ptp_clock *ptp = container_of(pc, struct ptp_clock, clock);
-	struct ptp_clock_info *ops = ptp->info;
-	struct ptp_clock_time *pct;
-	struct timespec64 ts;
+	struct ptp_sys_offset_extended *extoff = NULL;
+	struct ptp_sys_offset_precise precise_offset;
 	struct system_device_crosststamp xtstamp;
+	struct ptp_clock_info *ops = ptp->info;
+	struct ptp_sys_offset *sysoff = NULL;
+	struct ptp_system_timestamp sts;
+	struct ptp_clock_request req;
+	struct ptp_clock_caps caps;
+	struct ptp_clock_time *pct;
+	unsigned int i, pin_index;
+	struct ptp_pin_desc pd;
+	struct timespec64 ts;
 	struct timespec t2;
 	int enable, err = 0;
-	unsigned int i, pin_index;
 
 	switch (cmd) {
 
@@ -215,6 +217,37 @@ long ptp_ioctl(struct posix_clock *pc, unsigned int cmd, unsigned long arg)
 			err = -EFAULT;
 		break;
 
+	case PTP_SYS_OFFSET_EXTENDED:
+		if (!ptp->info->gettimex64) {
+			err = -EOPNOTSUPP;
+			break;
+		}
+		extoff = memdup_user((void __user *)arg, sizeof(*extoff));
+		if (IS_ERR(extoff)) {
+			err = PTR_ERR(extoff);
+			extoff = NULL;
+			break;
+		}
+		if (extoff->n_samples > PTP_MAX_SAMPLES
+		    || extoff->rsv[0] || extoff->rsv[1] || extoff->rsv[2]) {
+			err = -EINVAL;
+			break;
+		}
+		for (i = 0; i < extoff->n_samples; i++) {
+			err = ptp->info->gettimex64(ptp->info, &ts, &sts);
+			if (err)
+				goto out;
+			extoff->ts[i][0].sec = sts.pre_ts.tv_sec;
+			extoff->ts[i][0].nsec = sts.pre_ts.tv_nsec;
+			extoff->ts[i][1].sec = ts.tv_sec;
+			extoff->ts[i][1].nsec = ts.tv_nsec;
+			extoff->ts[i][2].sec = sts.post_ts.tv_sec;
+			extoff->ts[i][2].nsec = sts.post_ts.tv_nsec;
+		}
+		if (copy_to_user((void __user *)arg, extoff, sizeof(*extoff)))
+			err = -EFAULT;
+		break;
+
 	case PTP_SYS_OFFSET:
 		sysoff = kmalloc(sizeof(*sysoff), GFP_KERNEL);
 		if (!sysoff) {
@@ -236,12 +269,16 @@ long ptp_ioctl(struct posix_clock *pc, unsigned int cmd, unsigned long arg)
 			pct->sec = ts.tv_sec;
 			pct->nsec = ts.tv_nsec;
 			pct++;
-			if (ptp->info->gettime64) {
-				ptp->info->gettime64(ptp->info, &ts);
+			if (ops->gettimex64) {
+				err = ops->gettimex64(ops, &ts, NULL);
+			} else if (ops->gettime64) {
+				err = ops->gettime64(ops, &ts);
 			} else {
-				ptp->info->gettime(ptp->info, &t2);
+				err = ptp->info->gettime(ptp->info, &t2);
 				ts = timespec_to_timespec64(t2);
 			}
+			if (err)
+				goto out;
 			pct->sec = ts.tv_sec;
 			pct->nsec = ts.tv_nsec;
 			pct++;
@@ -294,6 +331,8 @@ long ptp_ioctl(struct posix_clock *pc, unsigned int cmd, unsigned long arg)
 		break;
 	}
 
+out:
+	kfree(extoff);
 	kfree(sysoff);
 	return err;
 }

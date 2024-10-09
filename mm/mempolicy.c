@@ -907,11 +907,14 @@ static int lookup_node(struct mm_struct *mm, unsigned long addr)
 	struct page *p;
 	int err;
 
-	err = get_user_pages(current, mm, addr & PAGE_MASK, 1, 0, 0, &p, NULL);
+	int locked = 1;
+	err = get_user_pages_locked(current, mm, addr & PAGE_MASK, 1, 0, 0, &p, &locked);
 	if (err >= 0) {
 		err = page_to_nid(p);
 		put_page(p);
 	}
+	if (locked)
+		up_read(&mm->mmap_sem);
 	return err;
 }
 
@@ -922,7 +925,7 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
 	int err;
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma = NULL;
-	struct mempolicy *pol = current->mempolicy;
+	struct mempolicy *pol = current->mempolicy, *pol_refcount = NULL;
 
 	if (flags &
 		~(unsigned long)(MPOL_F_NODE|MPOL_F_ADDR|MPOL_F_MEMS_ALLOWED))
@@ -962,6 +965,15 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
 
 	if (flags & MPOL_F_NODE) {
 		if (flags & MPOL_F_ADDR) {
+			/*
+			 * Take a refcount on the mpol, lookup_node()
+			 * wil drop the mmap_sem, so after calling
+			 * lookup_node() only "pol" remains valid, "vma"
+			 * is stale.
+			 */
+			pol_refcount = pol;
+			vma = NULL;
+			mpol_get(pol);
 			err = lookup_node(mm, addr);
 			if (err < 0)
 				goto out;
@@ -997,7 +1009,9 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
  out:
 	mpol_cond_put(pol);
 	if (vma)
-		up_read(&current->mm->mmap_sem);
+		up_read(&mm->mmap_sem);
+	if (pol_refcount)
+		mpol_put(pol_refcount);
 	return err;
 }
 

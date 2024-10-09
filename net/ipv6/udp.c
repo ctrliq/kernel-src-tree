@@ -505,6 +505,62 @@ csum_copy_err:
 	goto try_again;
 }
 
+static struct static_key udpv6_encap_needed __read_mostly;
+void udpv6_encap_enable(void)
+{
+	if (!static_key_enabled(&udpv6_encap_needed))
+		static_key_slow_inc(&udpv6_encap_needed);
+}
+EXPORT_SYMBOL(udpv6_encap_enable);
+
+/* Try to match ICMP errors to UDP tunnels by looking up a socket without
+ * reversing source and destination port: this will match tunnels that force the
+ * same destination port on both endpoints (e.g. VXLAN, GENEVE). Note that
+ * lwtunnels might actually break this assumption by being configured with
+ * different destination ports on endpoints, in this case we won't be able to
+ * trace ICMP messages back to them.
+ *
+ * Then ask the tunnel implementation to match the error against a valid
+ * association.
+ *
+ * Return the socket if we have a match.
+ */
+static struct sock *__udp6_lib_err_encap(struct net *net,
+					 const struct ipv6hdr *hdr, int offset,
+					 struct udphdr *uh,
+					 struct udp_table *udptable,
+					 struct sk_buff *skb)
+{
+	int (*lookup)(struct sock *sk, struct sk_buff *skb);
+	int network_offset, transport_offset;
+	struct udp_sock *up;
+	struct sock *sk;
+
+	sk = __udp6_lib_lookup(net, &hdr->daddr, uh->source,
+			       &hdr->saddr, uh->dest,
+			       inet6_iif(skb), udptable);
+	if (!sk)
+		return NULL;
+
+	network_offset = skb_network_offset(skb);
+	transport_offset = skb_transport_offset(skb);
+
+	/* Network header needs to point to the outer IPv6 header inside ICMP */
+	skb_reset_network_header(skb);
+
+	/* Transport header needs to point to the UDP header */
+	skb_set_transport_header(skb, offset);
+
+	up = udp_sk(sk);
+	lookup = READ_ONCE(up->encap_err_lookup);
+	if (!lookup || lookup(sk, skb))
+		sk = NULL;
+
+	skb_set_transport_header(skb, transport_offset);
+	skb_set_network_header(skb, network_offset);
+	return sk;
+}
+
 void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 		    u8 type, u8 code, int offset, __be32 info,
 		    struct udp_table *udptable)
@@ -514,6 +570,7 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	const struct in6_addr *saddr = &hdr->saddr;
 	const struct in6_addr *daddr = &hdr->daddr;
 	struct udphdr *uh = (struct udphdr*)(skb->data+offset);
+	bool tunnel = false;
 	struct sock *sk;
 	int err;
 	struct net *net = dev_net(skb->dev);
@@ -521,9 +578,18 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	sk = __udp6_lib_lookup(net, daddr, uh->dest, saddr, uh->source,
 			       inet6_iif(skb), udptable);
 	if (sk == NULL) {
-		ICMP6_INC_STATS_BH(net, __in6_dev_get(skb->dev),
-				   ICMP6_MIB_INERRORS);
-		return;
+		/* No socket for error: try tunnels before discarding */
+		if (static_key_false(&udpv6_encap_needed)) {
+			sk = __udp6_lib_err_encap(net, hdr, offset, uh,
+						  udptable, skb);
+		}
+
+		if (!sk) {
+			ICMP6_INC_STATS_BH(net, __in6_dev_get(skb->dev),
+					   ICMP6_MIB_INERRORS);
+			return;
+		}
+		tunnel = true;
 	}
 
 	if (type == ICMPV6_PKT_TOOBIG) {
@@ -532,9 +598,18 @@ void __udp6_lib_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 		ip6_sk_update_pmtu(skb, sk, info);
 	}
 	if (type == NDISC_REDIRECT) {
-		ip6_sk_redirect(skb, sk);
+		if (tunnel) {
+			ip6_redirect(skb, sock_net(sk), inet6_iif(skb),
+				     sk->sk_mark);
+		} else {
+			ip6_sk_redirect(skb, sk);
+		}
 		goto out;
 	}
+
+	/* Tunnels don't have an application socket: don't pass errors back */
+	if (tunnel)
+		goto out;
 
 	np = inet6_sk(sk);
 
@@ -584,14 +659,6 @@ static __inline__ void udpv6_err(struct sk_buff *skb,
 {
 	__udp6_lib_err(skb, opt, type, code, offset, info, &udp_table);
 }
-
-static struct static_key udpv6_encap_needed __read_mostly;
-void udpv6_encap_enable(void)
-{
-	if (!static_key_enabled(&udpv6_encap_needed))
-		static_key_slow_inc(&udpv6_encap_needed);
-}
-EXPORT_SYMBOL(udpv6_encap_enable);
 
 int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {

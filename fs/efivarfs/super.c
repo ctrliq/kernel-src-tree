@@ -129,6 +129,7 @@ static int efivarfs_callback(efi_char16_t *name16, efi_guid_t vendor,
 	char *name;
 	int len, i;
 	int err = -ENOMEM;
+	bool is_removable = false;
 
 	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
@@ -149,11 +150,15 @@ static int efivarfs_callback(efi_char16_t *name16, efi_guid_t vendor,
 
 	name[len] = '-';
 
+	if (efivar_variable_is_removable(entry->var.VendorGuid, name, len))
+		is_removable = true;
+
 	efi_guid_to_str(&entry->var.VendorGuid, name + len + 1);
 
 	name[len + EFI_VARIABLE_GUID_LEN+1] = '\0';
 
-	inode = efivarfs_get_inode(sb, root->d_inode, S_IFREG | 0644, 0);
+	inode = efivarfs_get_inode(sb, d_inode(root), S_IFREG | 0644, 0,
+				   is_removable);
 	if (!inode)
 		goto fail_name;
 
@@ -167,7 +172,9 @@ static int efivarfs_callback(efi_char16_t *name16, efi_guid_t vendor,
 	kfree(name);
 
 	efivar_entry_size(entry, &size);
-	efivar_entry_add(entry, &efivarfs_list);
+	err = efivar_entry_add(entry, &efivarfs_list);
+	if (err)
+		goto fail_inode;
 
 	mutex_lock(&inode->i_mutex);
 	inode->i_private = entry;
@@ -188,7 +195,10 @@ fail:
 
 static int efivarfs_destroy(struct efivar_entry *entry, void *data)
 {
-	efivar_entry_remove(entry);
+	int err = efivar_entry_remove(entry);
+
+	if (err)
+		return err;
 	kfree(entry);
 	return 0;
 }
@@ -209,7 +219,7 @@ static int efivarfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_d_op		= &efivarfs_d_ops;
 	sb->s_time_gran         = 1;
 
-	inode = efivarfs_get_inode(sb, NULL, S_IFDIR | 0755, 0);
+	inode = efivarfs_get_inode(sb, NULL, S_IFDIR | 0755, 0, true);
 	if (!inode)
 		return -ENOMEM;
 	inode->i_op = &efivarfs_dir_inode_operations;

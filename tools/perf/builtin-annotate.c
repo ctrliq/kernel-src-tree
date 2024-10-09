@@ -39,9 +39,8 @@
 struct perf_annotate {
 	struct perf_tool tool;
 	struct perf_session *session;
+	struct annotation_options opts;
 	bool	   use_tui, use_stdio, use_stdio2, use_gtk;
-	bool	   full_paths;
-	bool	   print_line;
 	bool	   skip_missing;
 	bool	   has_br_stack;
 	bool	   group_set;
@@ -228,7 +227,7 @@ static int perf_evsel__add_sample(struct perf_evsel *evsel,
 		 */
 		if (al->sym != NULL) {
 			rb_erase(&al->sym->rb_node,
-				 &al->map->dso->symbols[al->map->type]);
+				 &al->map->dso->symbols);
 			symbol__delete(al->sym);
 			dso__reset_find_symbol_cache(al->map->dso);
 		}
@@ -296,10 +295,9 @@ static int hist_entry__tty_annotate(struct hist_entry *he,
 				    struct perf_annotate *ann)
 {
 	if (!ann->use_stdio2)
-		return symbol__tty_annotate(he->ms.sym, he->ms.map, evsel,
-					    ann->print_line, ann->full_paths, 0, 0);
-	return symbol__tty_annotate2(he->ms.sym, he->ms.map, evsel,
-				     ann->print_line, ann->full_paths);
+		return symbol__tty_annotate(he->ms.sym, he->ms.map, evsel, &ann->opts);
+
+	return symbol__tty_annotate2(he->ms.sym, he->ms.map, evsel, &ann->opts);
 }
 
 static void hists__find_annotations(struct hists *hists,
@@ -397,8 +395,9 @@ static int __cmd_annotate(struct perf_annotate *ann)
 			goto out;
 	}
 
-	if (!objdump_path) {
-		ret = perf_env__lookup_objdump(&session->header.env);
+	if (!ann->opts.objdump_path) {
+		ret = perf_env__lookup_objdump(&session->header.env,
+					       &ann->opts.objdump_path);
 		if (ret)
 			goto out;
 	}
@@ -482,6 +481,7 @@ int cmd_annotate(int argc, const char **argv)
 			.ordered_events = true,
 			.ordering_requires_timestamps = true,
 		},
+		.opts = annotation__default_options,
 	};
 	struct perf_data data = {
 		.mode  = PERF_DATA_MODE_READ,
@@ -509,9 +509,9 @@ int cmd_annotate(int argc, const char **argv)
 		   "file", "vmlinux pathname"),
 	OPT_BOOLEAN('m', "modules", &symbol_conf.use_modules,
 		    "load module symbols - WARNING: use only with -k and LIVE kernel"),
-	OPT_BOOLEAN('l', "print-line", &annotate.print_line,
+	OPT_BOOLEAN('l', "print-line", &annotate.opts.print_lines,
 		    "print matching source lines (may be slow)"),
-	OPT_BOOLEAN('P', "full-paths", &annotate.full_paths,
+	OPT_BOOLEAN('P', "full-paths", &annotate.opts.full_path,
 		    "Don't shorten the displayed pathnames"),
 	OPT_BOOLEAN(0, "skip-missing", &annotate.skip_missing,
 		    "Skip symbols that cannot be annotated"),
@@ -526,9 +526,9 @@ int cmd_annotate(int argc, const char **argv)
 		    "Interleave source code with assembly code (default)"),
 	OPT_BOOLEAN(0, "asm-raw", &annotate.opts.show_asm_raw,
 		    "Display raw encoding of assembly instructions (default)"),
-	OPT_STRING('M', "disassembler-style", &disassembler_style, "disassembler style",
+	OPT_STRING('M', "disassembler-style", &annotate.opts.disassembler_style, "disassembler style",
 		   "Specify disassembler style (e.g. -M intel for intel syntax)"),
-	OPT_STRING(0, "objdump", &objdump_path, "path",
+	OPT_STRING(0, "objdump", &annotate.opts.objdump_path, "path",
 		   "objdump binary to use for disassembly and annotations"),
 	OPT_BOOLEAN(0, "group", &symbol_conf.event_group,
 		    "Show event group information together"),

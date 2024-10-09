@@ -3,15 +3,25 @@
  * Copyright (c) 2017-2018 Mellanox Technologies. All rights reserved.
  */
 
+#include <rdma/rdma_cm.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/restrack.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
 #include <linux/pid_namespace.h>
 
+#include "cma_priv.h"
+
+static int fill_res_noop(struct sk_buff *msg,
+			 struct rdma_restrack_entry *entry)
+{
+	return 0;
+}
+
 void rdma_restrack_init(struct rdma_restrack_root *res)
 {
 	init_rwsem(&res->rwsem);
+	res->fill_res_entry = fill_res_noop;
 }
 
 static const char *type2str(enum rdma_restrack_type type)
@@ -40,8 +50,7 @@ void rdma_restrack_clean(struct rdma_restrack_root *res)
 
 	dev = container_of(res, struct ib_device, res);
 	pr_err("restrack: %s", CUT_HERE);
-	pr_err("restrack: BUG: RESTRACK detected leak of resources on %s\n",
-	       dev->name);
+	dev_err(&dev->dev, "BUG: RESTRACK detected leak of resources\n");
 	hash_for_each(res->hash, bkt, e, node) {
 		if (rdma_is_kernel_res(e)) {
 			owner = e->kern_name;
@@ -83,22 +92,28 @@ EXPORT_SYMBOL(rdma_restrack_count);
 
 static void set_kern_name(struct rdma_restrack_entry *res)
 {
-	enum rdma_restrack_type type = res->type;
-	struct ib_qp *qp;
+	struct ib_pd *pd;
 
-	if (type != RDMA_RESTRACK_QP)
-		/* PD and CQ types already have this name embedded in */
-		return;
-
-	qp = container_of(res, struct ib_qp, res);
-	if (!qp->pd) {
-		WARN_ONCE(true, "XRC QPs are not supported\n");
-		/* Survive, despite the programmer's error */
-		res->kern_name = " ";
-		return;
+	switch (res->type) {
+	case RDMA_RESTRACK_QP:
+		pd = container_of(res, struct ib_qp, res)->pd;
+		if (!pd) {
+			WARN_ONCE(true, "XRC QPs are not supported\n");
+			/* Survive, despite the programmer's error */
+			res->kern_name = " ";
+		}
+		break;
+	case RDMA_RESTRACK_MR:
+		pd = container_of(res, struct ib_mr, res)->pd;
+		break;
+	default:
+		/* Other types set kern_name directly */
+		pd = NULL;
+		break;
 	}
 
-	res->kern_name = qp->pd->res.kern_name;
+	if (pd)
+		res->kern_name = pd->res.kern_name;
 }
 
 static struct ib_device *res_to_dev(struct rdma_restrack_entry *res)
@@ -110,6 +125,11 @@ static struct ib_device *res_to_dev(struct rdma_restrack_entry *res)
 		return container_of(res, struct ib_cq, res)->device;
 	case RDMA_RESTRACK_QP:
 		return container_of(res, struct ib_qp, res)->device;
+	case RDMA_RESTRACK_CM_ID:
+		return container_of(res, struct rdma_id_private,
+				    res)->id.device;
+	case RDMA_RESTRACK_MR:
+		return container_of(res, struct ib_mr, res)->device;
 	default:
 		WARN_ONCE(true, "Wrong resource tracking type %u\n", res->type);
 		return NULL;
@@ -125,11 +145,30 @@ static bool res_is_user(struct rdma_restrack_entry *res)
 		return container_of(res, struct ib_cq, res)->uobject;
 	case RDMA_RESTRACK_QP:
 		return container_of(res, struct ib_qp, res)->uobject;
+	case RDMA_RESTRACK_CM_ID:
+		return !res->kern_name;
+	case RDMA_RESTRACK_MR:
+		return container_of(res, struct ib_mr, res)->pd->uobject;
 	default:
 		WARN_ONCE(true, "Wrong resource tracking type %u\n", res->type);
 		return false;
 	}
 }
+
+void rdma_restrack_set_task(struct rdma_restrack_entry *res,
+			    const char *caller)
+{
+	if (caller) {
+		res->kern_name = caller;
+		return;
+	}
+
+	if (res->task)
+		put_task_struct(res->task);
+	get_task_struct(current);
+	res->task = current;
+}
+EXPORT_SYMBOL(rdma_restrack_set_task);
 
 void rdma_restrack_add(struct rdma_restrack_entry *res)
 {
@@ -142,8 +181,8 @@ void rdma_restrack_add(struct rdma_restrack_entry *res)
 		res->task = NULL;
 
 	if (res_is_user(res)) {
-		get_task_struct(current);
-		res->task = current;
+		if (!res->task)
+			rdma_restrack_set_task(res, NULL);
 		res->kern_name = NULL;
 	} else {
 		set_kern_name(res);
@@ -184,7 +223,7 @@ void rdma_restrack_del(struct rdma_restrack_entry *res)
 	struct ib_device *dev;
 
 	if (!res->valid)
-		return;
+		goto out;
 
 	dev = res_to_dev(res);
 	if (!dev)
@@ -197,8 +236,12 @@ void rdma_restrack_del(struct rdma_restrack_entry *res)
 	down_write(&dev->res.rwsem);
 	hash_del(&res->node);
 	res->valid = false;
-	if (res->task)
-		put_task_struct(res->task);
 	up_write(&dev->res.rwsem);
+
+out:
+	if (res->task) {
+		put_task_struct(res->task);
+		res->task = NULL;
+	}
 }
 EXPORT_SYMBOL(rdma_restrack_del);

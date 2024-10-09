@@ -1106,6 +1106,8 @@ struct boot_params *make_boot_params(struct efi_config *c)
 	u16 *s2;
 	u8 *s1;
 	int i;
+	unsigned long ramdisk_addr;
+	unsigned long ramdisk_size;
 
 	efi_early = c;
 	sys_table = (efi_system_table_t *)(unsigned long)efi_early->table;
@@ -1169,9 +1171,26 @@ struct boot_params *make_boot_params(struct efi_config *c)
 
 	memset(sdt, 0, sizeof(*sdt));
 
-	status = handle_ramdisks(sys_table, image, hdr);
+	status = handle_cmdline_files(sys_table, image,
+				      (char *)(unsigned long)hdr->cmd_line_ptr,
+				      "initrd=", hdr->initrd_addr_max,
+				      &ramdisk_addr, &ramdisk_size);
+
+	if (status != EFI_SUCCESS &&
+	    hdr->xloadflags & XLF_CAN_BE_LOADED_ABOVE_4G) {
+		efi_printk(sys_table, "Trying to load files to higher address\n");
+		status = handle_cmdline_files(sys_table, image,
+				      (char *)(unsigned long)hdr->cmd_line_ptr,
+				      "initrd=", -1UL,
+				      &ramdisk_addr, &ramdisk_size);
+	}
+
 	if (status != EFI_SUCCESS)
 		goto fail2;
+	hdr->ramdisk_image = ramdisk_addr & 0xffffffff;
+	hdr->ramdisk_size  = ramdisk_size & 0xffffffff;
+	boot_params->ext_ramdisk_image = (u64)ramdisk_addr >> 32;
+	boot_params->ext_ramdisk_size  = (u64)ramdisk_size >> 32;
 
 	return boot_params;
 fail2:

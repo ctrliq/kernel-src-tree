@@ -179,6 +179,15 @@ static struct test generic_tests[] = {
 		.func = test__thread_map,
 	},
 	{
+		.desc = "LLVM search and compile",
+		.func = test__llvm,
+		.subtest = {
+			.skip_if_fail	= true,
+			.get_nr		= test__llvm_subtest_get_nr,
+			.get_desc	= test__llvm_subtest_get_desc,
+		},
+	},
+	{
 		.desc = "Session topology",
 		.func = test__session_topology,
 	},
@@ -223,7 +232,7 @@ static struct test generic_tests[] = {
 		.func = test__cpu_map_print,
 	},
 	{
-		.desc = "Test SDT event probing",
+		.desc = "Probe SDT events",
 		.func = test__sdt_event,
 	},
 	{
@@ -241,6 +250,24 @@ static struct test generic_tests[] = {
 	{
 		.desc = "unit_number__scnprintf",
 		.func = test__unit_number__scnprint,
+	},
+	{
+		.desc = "BPF filter",
+		.func = test__bpf,
+		.subtest = {
+			.skip_if_fail	= true,
+			.get_nr		= test__bpf_subtest_get_nr,
+			.get_desc	= test__bpf_subtest_get_desc,
+		},
+	},
+	{
+		.desc = "builtin clang support",
+		.func = test__clang,
+		.subtest = {
+			.skip_if_fail	= true,
+			.get_nr		= test__clang_subtest_get_nr,
+			.get_desc	= test__clang_subtest_get_desc,
+		}
 	},
 	{
 		.desc = "mem2node",

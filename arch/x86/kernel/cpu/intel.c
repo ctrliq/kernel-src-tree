@@ -485,6 +485,10 @@ static void init_intel(struct cpuinfo_x86 *c)
 	    (c->x86_model == 29 || c->x86_model == 46 || c->x86_model == 47))
 		set_cpu_cap(c, X86_FEATURE_CLFLUSH_MONITOR);
 
+	if (c->x86 == 6 && boot_cpu_has(X86_FEATURE_MWAIT) &&
+		((c->x86_model == INTEL_FAM6_ATOM_GOLDMONT)))
+		set_cpu_bug(c, X86_BUG_MONITOR);
+
 #ifdef CONFIG_X86_64
 	if (c->x86 == 15)
 		c->x86_cache_alignment = c->x86_clflush_size * 2;

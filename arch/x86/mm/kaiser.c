@@ -36,6 +36,7 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/stop_machine.h>
+#include <linux/cpu.h>
 
 #include <asm/kaiser.h>
 #include <asm/pgtable.h>
@@ -469,9 +470,9 @@ void __init kaiser_init(void)
 	if (is_xen_pv_domain()) {
 		pr_info("x86/pti: Xen PV detected, disabling "
 			"PTI protection\n");
-	} else if ((kpti_force_enabled > 0) ||
+	} else if (!cpu_mitigations_off() && ((kpti_force_enabled > 0) ||
 		   (boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN) &&
-		   !kpti_force_enabled)) {
+		   !kpti_force_enabled))) {
 		pr_info("x86/pti: Unmapping kernel while in userspace\n");
 		kaiser_enable_pcp(true);
 		kaiser_enabled = 1;
@@ -620,7 +621,7 @@ static const struct file_operations fops_kaiser_enabled = {
 
 static int __init create_kpti_enabled(void)
 {
-	if (!xen_pv_domain())
+	if (!xen_pv_domain() && !sme_active())
 		debugfs_create_file("pti_enabled", S_IRUSR | S_IWUSR,
 				    arch_debugfs_dir, NULL, &fops_kaiser_enabled);
 	return 0;

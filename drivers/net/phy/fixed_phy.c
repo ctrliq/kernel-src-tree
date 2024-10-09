@@ -176,11 +176,11 @@ int fixed_phy_set_link_update(struct phy_device *phydev,
 	struct fixed_mdio_bus *fmb = &platform_fmb;
 	struct fixed_phy *fp;
 
-	if (!link_update || !phydev || !phydev->bus)
+	if (!link_update || !phydev || !phydev->mdio_bus)
 		return -EINVAL;
 
 	list_for_each_entry(fp, &fmb->phys, node) {
-		if (fp->addr == phydev->addr) {
+		if (fp->addr == phydev->mdio_addr) {
 			fp->link_update = link_update;
 			fp->phydev = phydev;
 			return 0;
@@ -198,11 +198,11 @@ int fixed_phy_update_state(struct phy_device *phydev,
 	struct fixed_mdio_bus *fmb = &platform_fmb;
 	struct fixed_phy *fp;
 
-	if (!phydev || phydev->bus != fmb->mii_bus)
+	if (!phydev || phydev->mdio_bus != fmb->mii_bus)
 		return -EINVAL;
 
 	list_for_each_entry(fp, &fmb->phys, node) {
-		if (fp->addr == phydev->addr) {
+		if (fp->addr == phydev->mdio_addr) {
 #define _UPD(x) if (changed->x) \
 	fp->status.x = status->x
 			_UPD(link);
@@ -311,7 +311,7 @@ struct phy_device *fixed_phy_register(unsigned int irq,
 	}
 
 	of_node_get(np);
-	phy->dev.of_node = np;
+	phy->mdio_dev.of_node = np;
 
 	ret = phy_device_register(phy);
 	if (ret) {
@@ -328,8 +328,8 @@ EXPORT_SYMBOL_GPL(fixed_phy_register);
 void fixed_phy_unregister(struct phy_device *phy)
 {
 	phy_device_remove(phy);
-	of_node_put(phy->dev.of_node);
-	fixed_phy_del(phy->addr);
+	of_node_put(phy->mdio_dev.of_node);
+	fixed_phy_del(phy->mdio_addr);
 }
 EXPORT_SYMBOL_GPL(fixed_phy_unregister);
 

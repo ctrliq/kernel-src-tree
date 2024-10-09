@@ -188,6 +188,43 @@ struct inet_sock {
 #define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */
 #define IPCORK_ALLFRAG	2	/* always fragment (for ipv6 for now) */
 
+/**
+ * sk_to_full_sk - Access to a full socket
+ * @sk: pointer to a socket
+ *
+ * SYNACK messages might be attached to request sockets.
+ * Some places want to reach the listener in this case.
+ */
+static inline struct sock *sk_to_full_sk(struct sock *sk)
+{
+#ifdef CONFIG_INET
+	/* RHEL7 note: it doesn't attach SYNACK messages to request
+	 * sockets instead of listener.
+	 * if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	 *	sk = inet_reqsk(sk)->rsk_listener;
+	 */
+#endif
+	return sk;
+}
+
+/* sk_to_full_sk() variant with a const argument */
+static inline const struct sock *sk_const_to_full_sk(const struct sock *sk)
+{
+#ifdef CONFIG_INET
+	/* RHEL7 note: it doesn't attach SYNACK messages to request
+	 * sockets instead of listener.
+	 * if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	 * 	sk = ((const struct request_sock *)sk)->rsk_listener;
+	 */
+#endif
+	return sk;
+}
+
+static inline struct sock *skb_to_full_sk(const struct sk_buff *skb)
+{
+	return sk_to_full_sk(skb->sk);
+}
+
 static inline struct inet_sock *inet_sk(const struct sock *sk)
 {
 	return (struct inet_sock *)sk;

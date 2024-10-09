@@ -145,6 +145,7 @@ struct r1bio {
 	atomic_t		behind_remaining; /* number of write-behind ios remaining
 						 * in this BehindIO request
 						 */
+	atomic_t		split_bios;
 	sector_t		sector;
 	int			sectors;
 	unsigned long		state;
@@ -153,6 +154,7 @@ struct r1bio {
 	 * original bio going to /dev/mdx
 	 */
 	struct bio		*master_bio;
+	struct r1bio		*master_r1bio;
 	/*
 	 * if the IO is in READ direction, then this is where we read
 	 */

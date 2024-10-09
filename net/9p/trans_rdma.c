@@ -386,7 +386,7 @@ static int
 post_recv(struct p9_client *client, struct p9_rdma_context *c)
 {
 	struct p9_trans_rdma *rdma = client->trans;
-	struct ib_recv_wr wr, *bad_wr;
+	struct ib_recv_wr wr;
 	struct ib_sge sge;
 
 	c->busa = ib_dma_map_single(rdma->cm_id->device,
@@ -404,7 +404,7 @@ post_recv(struct p9_client *client, struct p9_rdma_context *c)
 	wr.wr_id = (unsigned long) c;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
-	return ib_post_recv(rdma->qp, &wr, &bad_wr);
+	return ib_post_recv(rdma->qp, &wr, NULL);
 
  error:
 	p9_debug(P9_DEBUG_ERROR, "EIO\n");
@@ -414,7 +414,7 @@ post_recv(struct p9_client *client, struct p9_rdma_context *c)
 static int rdma_request(struct p9_client *client, struct p9_req_t *req)
 {
 	struct p9_trans_rdma *rdma = client->trans;
-	struct ib_send_wr wr, *bad_wr;
+	struct ib_send_wr wr;
 	struct ib_sge sge;
 	int err = 0;
 	unsigned long flags;
@@ -494,7 +494,7 @@ static int rdma_request(struct p9_client *client, struct p9_req_t *req)
 	if (down_interruptible(&rdma->sq_sem))
 		goto error;
 
-	return ib_post_send(rdma->qp, &wr, &bad_wr);
+	return ib_post_send(rdma->qp, &wr, NULL);
 
  error:
 	kfree(c);

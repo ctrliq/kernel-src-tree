@@ -27,8 +27,7 @@ static int query_topology_info(struct drm_i915_private *dev_priv,
 
 	slice_length = sizeof(sseu->slice_mask);
 	subslice_length = sseu->max_slices *
-		DIV_ROUND_UP(sseu->max_subslices,
-			     sizeof(sseu->subslice_mask[0]) * BITS_PER_BYTE);
+		DIV_ROUND_UP(sseu->max_subslices, BITS_PER_BYTE);
 	eu_length = sseu->max_slices * sseu->max_subslices *
 		DIV_ROUND_UP(sseu->max_eus_per_subslice, BITS_PER_BYTE);
 
@@ -102,13 +101,16 @@ int i915_query_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 
 	for (i = 0; i < args->num_items; i++, user_item_ptr++) {
 		struct drm_i915_query_item item;
-		u64 func_idx;
+		unsigned long func_idx;
 		int ret;
 
 		if (copy_from_user(&item, user_item_ptr, sizeof(item)))
 			return -EFAULT;
 
 		if (item.query_id == 0)
+			return -EINVAL;
+
+		if (overflows_type(item.query_id - 1, unsigned long))
 			return -EINVAL;
 
 		func_idx = item.query_id - 1;

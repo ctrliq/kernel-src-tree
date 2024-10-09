@@ -1027,7 +1027,7 @@ static void fc_rport_prli_resp(struct fc_seq *sp, struct fc_frame *fp,
 	if (op == ELS_LS_ACC) {
 		pp = fc_frame_payload_get(fp, sizeof(*pp));
 		if (!pp) {
-			fc_rport_error_retry(rdata, -FC_EX_SEQ_ERR);
+			fc_rport_error_retry(rdata, NULL);
 			goto out;
 		}
 
@@ -1043,7 +1043,7 @@ static void fc_rport_prli_resp(struct fc_seq *sp, struct fc_frame *fp,
 			goto out;
 		}
 		if (pp->prli.prli_spp_len < sizeof(pp->spp)) {
-			fc_rport_error_retry(rdata, -FC_EX_SEQ_ERR);
+			fc_rport_error_retry(rdata, NULL);
 			goto out;
 		}
 

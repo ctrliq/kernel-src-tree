@@ -40,6 +40,25 @@ struct backing_dev_info swap_backing_dev_info = {
 
 struct address_space *swapper_spaces[MAX_SWAPFILES];
 static unsigned int nr_swapper_spaces[MAX_SWAPFILES];
+bool swap_vma_readahead = true;
+
+#define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
+#define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
+#define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
+#define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
+
+#define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
+#define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
+#define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
+
+#define SWAP_RA_VAL(addr, win, hits)				\
+	(((addr) & PAGE_MASK) |					\
+	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
+	 ((hits) & SWAP_RA_HITS_MASK))
+
+/* Initial readahead hits is 4 to start up with a small window */
+#define GET_SWAP_RA_VAL(vma)					\
+	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
 
 #define INC_CACHE_INFO(x)	do { swap_cache_info.x++; } while (0)
 
@@ -74,6 +93,8 @@ unsigned long total_swapcache_pages(void)
 	rcu_read_unlock();
 	return ret;
 }
+
+static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
 
 void show_swap_cache_info(void)
 {
@@ -303,16 +324,35 @@ void free_pages_and_swap_cache(struct page **pages, int nr)
  * lock getting page table operations atomic even if we drop the page
  * lock before returning.
  */
-struct page * lookup_swap_cache(swp_entry_t entry)
+struct page * lookup_swap_cache(swp_entry_t entry, struct vm_area_struct *vma,
+				unsigned long addr)
 {
 	struct page *page;
+	unsigned long ra_info;
+	int win, hits, readahead;
 
 	page = find_get_page(swap_address_space(entry), entry.val);
 
-	if (page)
-		INC_CACHE_INFO(find_success);
-
 	INC_CACHE_INFO(find_total);
+	if (page) {
+		INC_CACHE_INFO(find_success);
+		readahead = TestClearPageReadahead(page);
+		if (vma) {
+			ra_info = GET_SWAP_RA_VAL(vma);
+			win = SWAP_RA_WIN(ra_info);
+			hits = SWAP_RA_HITS(ra_info);
+			if (readahead)
+				hits = min_t(int, hits + 1, SWAP_RA_HITS_MAX);
+			atomic_long_set(&vma->swap_readahead_info,
+					SWAP_RA_VAL(addr, win, hits));
+		}
+		if (readahead) {
+			count_vm_event(SWAP_RA_HIT);
+			if (!vma)
+				atomic_inc(&swapin_readahead_hits);
+		}
+	}
+
 	return page;
 }
 
@@ -438,6 +478,66 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 	return retpage;
 }
 
+static unsigned long __swapin_nr_pages(unsigned long prev_offset,
+				       unsigned long offset,
+				       int hits,
+				       int max_pages,
+				       int prev_win)
+{
+	unsigned int pages, last_ra;
+
+	/*
+	 * This heuristic has been found to work well on both sequential and
+	 * random loads, swapping to hard disk or to SSD: please don't ask
+	 * what the "+ 2" means, it just happens to work well, that's all.
+	 */
+	pages = hits + 2;
+	if (pages == 2) {
+		/*
+		 * We can have no readahead hits to judge by: but must not get
+		 * stuck here forever, so check for an adjacent offset instead
+		 * (and don't even bother to check whether swap type is same).
+		 */
+		if (offset != prev_offset + 1 && offset != prev_offset - 1)
+			pages = 1;
+	} else {
+		unsigned int roundup = 4;
+		while (roundup < pages)
+			roundup <<= 1;
+		pages = roundup;
+	}
+
+	if (pages > max_pages)
+		pages = max_pages;
+
+	/* Don't shrink readahead too fast */
+	last_ra = prev_win / 2;
+	if (pages < last_ra)
+		pages = last_ra;
+
+	return pages;
+}
+
+static unsigned long swapin_nr_pages(unsigned long offset)
+{
+	static unsigned long prev_offset;
+	unsigned int hits, pages, max_pages;
+	static atomic_t last_readahead_pages;
+
+	max_pages = 1 << READ_ONCE(page_cluster);
+	if (max_pages <= 1)
+		return 1;
+
+	hits = atomic_xchg(&swapin_readahead_hits, 0);
+	pages = __swapin_nr_pages(prev_offset, offset, hits, max_pages,
+				  atomic_read(&last_readahead_pages));
+	if (!hits)
+		prev_offset = offset;
+	atomic_set(&last_readahead_pages, pages);
+
+	return pages;
+}
+
 /**
  * swapin_readahead - swap in pages in hope we need them soon
  * @entry: swap entry of this memory
@@ -461,11 +561,17 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 			struct vm_area_struct *vma, unsigned long addr)
 {
 	struct page *page;
-	unsigned long offset = swp_offset(entry);
+	unsigned long entry_offset = swp_offset(entry);
+	unsigned long offset = entry_offset;
 	unsigned long start_offset, end_offset;
-	unsigned long mask = (1UL << page_cluster) - 1;
+	unsigned long mask;
 	struct swap_info_struct *si = swp_swap_info(entry);
 	struct blk_plug plug;
+	bool page_allocated;
+
+	mask = swapin_nr_pages(offset) - 1;
+	if (!mask)
+		goto skip;
 
 	/* Read a page_cluster sized and aligned cluster around offset. */
 	start_offset = offset & ~mask;
@@ -478,15 +584,24 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	blk_start_plug(&plug);
 	for (offset = start_offset; offset <= end_offset ; offset++) {
 		/* Ok, do the async read-ahead now */
-		page = read_swap_cache_async(swp_entry(swp_type(entry), offset),
-						gfp_mask, vma, addr);
+		page = __read_swap_cache_async(
+			swp_entry(swp_type(entry), offset),
+			gfp_mask, vma, addr, &page_allocated);
 		if (!page)
 			continue;
+		if (page_allocated) {
+			swap_readpage(page);
+			if (offset != entry_offset) {
+				SetPageReadahead(page);
+				count_vm_event(SWAP_RA);
+			}
+		}
 		page_cache_release(page);
 	}
 	blk_finish_plug(&plug);
 
 	lru_add_drain();	/* Push any new pages onto the LRU now */
+skip:
 	return read_swap_cache_async(entry, gfp_mask, vma, addr);
 }
 
@@ -527,3 +642,186 @@ void exit_swap_address_space(unsigned int type)
 	synchronize_rcu();
 	kvfree(spaces);
 }
+
+static inline void swap_ra_clamp_pfn(struct vm_area_struct *vma,
+				     unsigned long faddr,
+				     unsigned long lpfn,
+				     unsigned long rpfn,
+				     unsigned long *start,
+				     unsigned long *end)
+{
+	*start = max3(lpfn, PFN_DOWN(vma->vm_start),
+		      PFN_DOWN(faddr & PMD_MASK));
+	*end = min3(rpfn, PFN_DOWN(vma->vm_end),
+		    PFN_DOWN((faddr & PMD_MASK) + PMD_SIZE));
+}
+
+struct page *swap_readahead_detect(struct vm_area_struct *vma,
+				   struct vma_swap_readahead *swap_ra,
+				   pte_t *page_table, pte_t orig_pte,
+				   unsigned long address)
+{
+	unsigned long swap_ra_info;
+	struct page *page;
+	swp_entry_t entry;
+	unsigned long faddr, pfn, fpfn;
+	unsigned long start, end;
+	pte_t *pte;
+	unsigned int max_win, hits, prev_win, win, left;
+#ifndef CONFIG_64BIT
+	pte_t *tpte;
+#endif
+
+	max_win = 1 << min_t(unsigned int, READ_ONCE(page_cluster),
+			     SWAP_RA_ORDER_CEILING);
+	if (max_win == 1) {
+		swap_ra->win = 1;
+		return NULL;
+	}
+
+	faddr = address;
+	entry = pte_to_swp_entry(orig_pte);
+	if ((unlikely(non_swap_entry(entry))))
+		return NULL;
+	page = lookup_swap_cache(entry, vma, faddr);
+	if (page)
+		return page;
+
+	fpfn = PFN_DOWN(faddr);
+	swap_ra_info = GET_SWAP_RA_VAL(vma);
+	pfn = PFN_DOWN(SWAP_RA_ADDR(swap_ra_info));
+	prev_win = SWAP_RA_WIN(swap_ra_info);
+	hits = SWAP_RA_HITS(swap_ra_info);
+	swap_ra->win = win = __swapin_nr_pages(pfn, fpfn, hits,
+					       max_win, prev_win);
+	atomic_long_set(&vma->swap_readahead_info,
+			SWAP_RA_VAL(faddr, win, 0));
+
+	if (win == 1)
+		return NULL;
+
+	/* Copy the PTEs because the page table may be unmapped */
+	if (fpfn == pfn + 1)
+		swap_ra_clamp_pfn(vma, faddr, fpfn, fpfn + win, &start, &end);
+	else if (pfn == fpfn + 1)
+		swap_ra_clamp_pfn(vma, faddr, fpfn - win + 1, fpfn + 1,
+				  &start, &end);
+	else {
+		left = (win - 1) / 2;
+		swap_ra_clamp_pfn(vma, faddr, fpfn - left, fpfn + win - left,
+				  &start, &end);
+	}
+	swap_ra->nr_pte = end - start;
+	swap_ra->offset = fpfn - start;
+	pte = page_table - swap_ra->offset;
+#ifdef CONFIG_64BIT
+	swap_ra->ptes = pte;
+#else
+	tpte = swap_ra->ptes;
+	for (pfn = start; pfn != end; pfn++)
+		*tpte++ = *pte++;
+#endif
+
+	return NULL;
+}
+
+struct page *do_swap_page_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+				    struct vm_area_struct *vma,
+				    unsigned long address,
+				    struct vma_swap_readahead *swap_ra)
+{
+	struct blk_plug plug;
+	struct page *page;
+	pte_t *pte, pentry;
+	swp_entry_t entry;
+	unsigned int i;
+	bool page_allocated;
+
+	if (swap_ra->win == 1)
+		goto skip;
+
+	blk_start_plug(&plug);
+	for (i = 0, pte = swap_ra->ptes; i < swap_ra->nr_pte;
+	     i++, pte++) {
+		pentry = *pte;
+		if (pte_none(pentry))
+			continue;
+		if (pte_present(pentry))
+			continue;
+		entry = pte_to_swp_entry(pentry);
+		if (unlikely(non_swap_entry(entry)))
+			continue;
+		page = __read_swap_cache_async(entry, gfp_mask, vma,
+					       address, &page_allocated);
+		if (!page)
+			continue;
+		if (page_allocated) {
+			swap_readpage(page);
+			if (i != swap_ra->offset) {
+				SetPageReadahead(page);
+				count_vm_event(SWAP_RA);
+			}
+		}
+		put_page(page);
+	}
+	blk_finish_plug(&plug);
+	lru_add_drain();
+skip:
+	return read_swap_cache_async(fentry, gfp_mask, vma, address);
+}
+
+#ifdef CONFIG_SYSFS
+static ssize_t vma_ra_enabled_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%s\n", swap_vma_readahead ? "true" : "false");
+}
+static ssize_t vma_ra_enabled_store(struct kobject *kobj,
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
+{
+	if (!strncmp(buf, "true", 4) || !strncmp(buf, "1", 1))
+		swap_vma_readahead = true;
+	else if (!strncmp(buf, "false", 5) || !strncmp(buf, "0", 1))
+		swap_vma_readahead = false;
+	else
+		return -EINVAL;
+
+	return count;
+}
+static struct kobj_attribute vma_ra_enabled_attr =
+	__ATTR(vma_ra_enabled, 0644, vma_ra_enabled_show,
+	       vma_ra_enabled_store);
+
+static struct attribute *swap_attrs[] = {
+	&vma_ra_enabled_attr.attr,
+	NULL,
+};
+
+static struct attribute_group swap_attr_group = {
+	.attrs = swap_attrs,
+};
+
+static int __init swap_init_sysfs(void)
+{
+	int err;
+	struct kobject *swap_kobj;
+
+	swap_kobj = kobject_create_and_add("swap", mm_kobj);
+	if (!swap_kobj) {
+		pr_err("failed to create swap kobject\n");
+		return -ENOMEM;
+	}
+	err = sysfs_create_group(swap_kobj, &swap_attr_group);
+	if (err) {
+		pr_err("failed to register swap group\n");
+		goto delete_obj;
+	}
+	return 0;
+
+delete_obj:
+	kobject_put(swap_kobj);
+	return err;
+}
+subsys_initcall(swap_init_sysfs);
+#endif

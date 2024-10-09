@@ -244,9 +244,12 @@ static void efi_free(efi_system_table_t *sys_table_arg, unsigned long size,
  * We only support loading an initrd from the same filesystem as the
  * kernel image.
  */
-static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
-				    efi_loaded_image_t *image,
-				    struct setup_header *hdr)
+static efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
+					 efi_loaded_image_t *image,
+					 char *cmd_line, char *option_string,
+					 unsigned long max_addr,
+					 unsigned long *load_addr,
+					 unsigned long *load_size)
 {
 	struct initrd *initrds;
 	unsigned long initrd_addr;
@@ -260,19 +263,25 @@ static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
 	initrd_addr = 0;
 	initrd_total = 0;
 
-	str = (char *)(unsigned long)hdr->cmd_line_ptr;
+	str = cmd_line;
 
 	j = 0;			/* See close_handles */
+
+	if (!load_addr || !load_size)
+		return EFI_INVALID_PARAMETER;
+
+	*load_addr = 0;
+	*load_size = 0;
 
 	if (!str || !*str)
 		return EFI_SUCCESS;
 
 	for (nr_initrds = 0; *str; nr_initrds++) {
-		str = strstr(str, "initrd=");
+		str = strstr(str, option_string);
 		if (!str)
 			break;
 
-		str += 7;
+		str += strlen(option_string);
 
 		/* Skip any leading slashes */
 		while (*str == '/' || *str == '\\')
@@ -289,21 +298,21 @@ static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
 				nr_initrds * sizeof(*initrds),
 				(void **)&initrds);
 	if (status != EFI_SUCCESS) {
-		pr_efi_err(sys_table_arg, "Failed to alloc mem for initrds\n");
+		pr_efi_err(sys_table_arg, "Failed to alloc mem for file load\n");
 		goto fail;
 	}
 
-	str = (char *)(unsigned long)hdr->cmd_line_ptr;
+	str = cmd_line;
 	for (i = 0; i < nr_initrds; i++) {
 		struct initrd *initrd;
 		efi_char16_t filename_16[256];
 		efi_char16_t *p;
 
-		str = strstr(str, "initrd=");
+		str = strstr(str, option_string);
 		if (!str)
 			break;
 
-		str += 7;
+		str += strlen(option_string);
 
 		initrd = &initrds[i];
 		p = filename_16;
@@ -351,14 +360,14 @@ static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
 		 * all the initrd's.
 		 */
 		status = efi_high_alloc(sys_table_arg, initrd_total, 0x1000,
-				    &initrd_addr, hdr->initrd_addr_max);
+				    &initrd_addr, max_addr);
 		if (status != EFI_SUCCESS) {
 			pr_efi_err(sys_table_arg, "Failed to alloc highmem for initrds\n");
 			goto close_handles;
 		}
 
 		/* We've run out of free low memory. */
-		if (initrd_addr > hdr->initrd_addr_max) {
+		if (initrd_addr > max_addr) {
 			pr_efi_err(sys_table_arg, "We've run out of free low memory\n");
 			status = EFI_INVALID_PARAMETER;
 			goto free_initrd_total;
@@ -380,7 +389,7 @@ static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
 						       &chunksize,
 						       (void *)addr);
 				if (status != EFI_SUCCESS) {
-					pr_efi_err(sys_table_arg, "Failed to read initrd\n");
+					pr_efi_err(sys_table_arg, "Failed to read file\n");
 					goto free_initrd_total;
 				}
 				addr += chunksize;
@@ -394,8 +403,8 @@ static efi_status_t handle_ramdisks(efi_system_table_t *sys_table_arg,
 
 	efi_call_early(free_pool, initrds);
 
-	hdr->ramdisk_image = initrd_addr;
-	hdr->ramdisk_size = initrd_total;
+	*load_addr = initrd_addr;
+	*load_size = initrd_total;
 
 	return status;
 
@@ -408,8 +417,8 @@ close_handles:
 free_initrds:
 	efi_call_early(free_pool, initrds);
 fail:
-	hdr->ramdisk_image = 0;
-	hdr->ramdisk_size = 0;
+	*load_addr = 0;
+	*load_size = 0;
 
 	return status;
 }

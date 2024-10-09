@@ -1063,6 +1063,17 @@ static __printf(2,3) void svc_printk(struct svc_rqst *rqstp, const char *fmt, ..
 #endif
 
 /*
+ * Setup response header for TCP, it has a 4B record length field.
+ */
+static void svc_tcp_prep_reply_hdr(struct svc_rqst *rqstp)
+{
+	struct kvec *resv = &rqstp->rq_res.head[0];
+
+	/* tcp needs a space for the record length... */
+	svc_putnl(resv, 0);
+}
+
+/*
  * Common routine for processing the RPC request.
  */
 static int
@@ -1091,7 +1102,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	clear_bit(RQ_DROPME, &rqstp->rq_flags);
 
 	/* Setup reply header */
-	rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr(rqstp);
+	if (rqstp->rq_prot == IPPROTO_TCP)
+		svc_tcp_prep_reply_hdr(rqstp);
 
 	svc_putu32(resv, rqstp->rq_xid);
 
@@ -1236,7 +1248,7 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	return 0;
 
  close:
-	if (test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
+	if (rqstp->rq_xprt && test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
 		svc_close_xprt(rqstp->rq_xprt);
 	dprintk("svc: svc_process close\n");
 	return 0;
@@ -1363,10 +1375,10 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
 	dprintk("svc: %s(%p)\n", __func__, req);
 
 	/* Build the svc_rqst used by the common processing routine */
-	rqstp->rq_xprt = serv->sv_bc_xprt;
 	rqstp->rq_xid = req->rq_xid;
 	rqstp->rq_prot = req->rq_xprt->prot;
 	rqstp->rq_server = serv;
+	rqstp->rq_bc_net = req->rq_xprt->xprt_net;
 
 	rqstp->rq_addrlen = sizeof(req->rq_xprt->addr);
 	memcpy(&rqstp->rq_addr, &req->rq_xprt->addr, rqstp->rq_addrlen);
@@ -1442,3 +1454,45 @@ u32 svc_max_payload(const struct svc_rqst *rqstp)
 	return max;
 }
 EXPORT_SYMBOL_GPL(svc_max_payload);
+
+/**
+ * svc_fill_write_vector - Construct data argument for VFS write call
+ * @rqstp: svc_rqst to operate on
+ * @first: buffer containing first section of write payload
+ * @total: total number of bytes of write payload
+ *
+ * Returns the number of elements populated in the data argument array.
+ */
+unsigned int svc_fill_write_vector(struct svc_rqst *rqstp, struct kvec *first,
+				   size_t total)
+{
+	struct kvec *vec = rqstp->rq_vec;
+	struct page **pages;
+	unsigned int i;
+
+	/* Some types of transport can present the write payload
+	 * entirely in rq_arg.pages. In this case, @first is empty.
+	 */
+	i = 0;
+	if (first->iov_len) {
+		vec[i].iov_base = first->iov_base;
+		vec[i].iov_len = min_t(size_t, total, first->iov_len);
+		total -= vec[i].iov_len;
+		++i;
+	}
+
+	WARN_ON_ONCE(rqstp->rq_arg.page_base != 0);
+	pages = rqstp->rq_arg.pages;
+	while (total) {
+		vec[i].iov_base = page_address(*pages);
+		vec[i].iov_len = min_t(size_t, total, PAGE_SIZE);
+		total -= vec[i].iov_len;
+		++i;
+
+		++pages;
+	}
+
+	WARN_ON_ONCE(i > ARRAY_SIZE(rqstp->rq_vec));
+	return i;
+}
+EXPORT_SYMBOL_GPL(svc_fill_write_vector);

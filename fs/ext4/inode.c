@@ -3084,11 +3084,16 @@ static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 {
 	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
 	unsigned int blkbits = inode->i_blkbits;
-	unsigned long first_block = offset >> blkbits;
-	unsigned long last_block = (offset + length - 1) >> blkbits;
+	unsigned long first_block, last_block;
 	struct ext4_map_blocks map;
 	bool delalloc = false;
 	int ret;
+
+	if ((offset >> blkbits) > EXT4_MAX_LOGICAL_BLOCK)
+		return -EINVAL;
+	first_block = offset >> blkbits;
+	last_block = min_t(loff_t, (offset + length - 1) >> blkbits,
+			   EXT4_MAX_LOGICAL_BLOCK);
 
 	if (WARN_ON_ONCE(ext4_has_inline_data(inode)))
 		return -ERANGE;
@@ -3535,6 +3540,7 @@ static const struct address_space_operations ext4_dax_aops = {
 	.writepages		= ext4_dax_writepages,
 	.direct_IO		= noop_direct_IO,
 	.set_page_dirty		= noop_set_page_dirty,
+	.bmap			= ext4_bmap,
 	.invalidatepage_range	= noop_invalidatepage_range,
 };
 
@@ -3943,6 +3949,8 @@ int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length)
 
 	inode->i_mtime = inode->i_ctime = ext4_current_time(inode);
 	ext4_mark_inode_dirty(handle, inode);
+	if (ret >= 0)
+		ext4_update_inode_fsync_trans(handle, inode, 1);
 out_stop:
 	ext4_journal_stop(handle);
 out_dio:
@@ -4448,6 +4456,7 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
 		 * not initialized on a new filesystem. */
 	}
 	ei->i_flags = le32_to_cpu(raw_inode->i_flags);
+	ext4_set_inode_flags(inode);
 	inode->i_blocks = ext4_inode_blocks(raw_inode, ei);
 	ei->i_file_acl = le32_to_cpu(raw_inode->i_file_acl_lo);
 	if (EXT4_HAS_INCOMPAT_FEATURE(sb, EXT4_FEATURE_INCOMPAT_64BIT))
@@ -4581,7 +4590,6 @@ struct inode *ext4_iget(struct super_block *sb, unsigned long ino)
 		goto bad_inode;
 	}
 	brelse(iloc.bh);
-	ext4_set_inode_flags(inode);
 	unlock_new_inode(inode);
 	return inode;
 

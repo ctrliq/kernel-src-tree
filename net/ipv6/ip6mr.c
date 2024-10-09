@@ -54,6 +54,8 @@
 #include <net/ip6_checksum.h>
 #include <linux/netconf.h>
 
+#include <linux/nospec.h>
+
 struct mr6_table {
 	struct list_head	list;
 	possible_net_t		net;
@@ -1873,6 +1875,7 @@ int ip6mr_ioctl(struct sock *sk, int cmd, void __user *arg)
 			return -EFAULT;
 		if (vr.mifi >= mrt->maxvif)
 			return -EINVAL;
+		vr.mifi = array_index_nospec(vr.mifi, mrt->maxvif);
 		read_lock(&mrt_lock);
 		vif = &mrt->vif6_table[vr.mifi];
 		if (MIF_EXISTS(mrt, vr.mifi)) {
@@ -1947,6 +1950,7 @@ int ip6mr_compat_ioctl(struct sock *sk, unsigned int cmd, void __user *arg)
 			return -EFAULT;
 		if (vr.mifi >= mrt->maxvif)
 			return -EINVAL;
+		vr.mifi = array_index_nospec(vr.mifi, mrt->maxvif);
 		read_lock(&mrt_lock);
 		vif = &mrt->vif6_table[vr.mifi];
 		if (MIF_EXISTS(mrt, vr.mifi)) {

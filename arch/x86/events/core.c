@@ -1590,9 +1590,9 @@ __init struct attribute **merge_attr(struct attribute **a, struct attribute **b)
 	struct attribute **new;
 	int j, i;
 
-	for (j = 0; a[j]; j++)
+	for (j = 0; a && a[j]; j++)
 		;
-	for (i = 0; b[i]; i++)
+	for (i = 0; b && b[i]; i++)
 		j++;
 	j++;
 
@@ -1601,9 +1601,9 @@ __init struct attribute **merge_attr(struct attribute **a, struct attribute **b)
 		return NULL;
 
 	j = 0;
-	for (i = 0; a[i]; i++)
+	for (i = 0; a && a[i]; i++)
 		new[j++] = a[i];
-	for (i = 0; b[i]; i++)
+	for (i = 0; b && b[i]; i++)
 		new[j++] = b[i];
 	new[j] = NULL;
 
@@ -1897,7 +1897,7 @@ static int x86_pmu_commit_txn(struct pmu *pmu)
  */
 static void free_fake_cpuc(struct cpu_hw_events *cpuc)
 {
-	kfree(cpuc->shared_regs);
+	intel_cpuc_finish(cpuc);
 	kfree(cpuc);
 }
 
@@ -1909,14 +1909,11 @@ static struct cpu_hw_events *allocate_fake_cpuc(void)
 	cpuc = kzalloc(sizeof(*cpuc), GFP_KERNEL);
 	if (!cpuc)
 		return ERR_PTR(-ENOMEM);
-
-	/* only needed, if we have extra_regs */
-	if (x86_pmu.extra_regs) {
-		cpuc->shared_regs = allocate_shared_regs(cpu);
-		if (!cpuc->shared_regs)
-			goto error;
-	}
 	cpuc->is_fake = 1;
+
+	if (intel_cpuc_prepare(cpuc, cpu) != NOTIFY_OK)
+		goto error;
+
 	return cpuc;
 error:
 	free_fake_cpuc(cpuc);

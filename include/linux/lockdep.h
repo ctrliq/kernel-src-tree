@@ -96,13 +96,8 @@ struct lock_class {
 	 */
 	unsigned int			version;
 
-	/*
-	 * Statistics counter:
-	 */
-	unsigned long			ops;
-
-	const char			*name;
 	int				name_version;
+	const char			*name;
 
 #ifdef CONFIG_LOCK_STAT
 	unsigned long			contention_point[LOCKSTAT_POINTS];
@@ -337,9 +332,18 @@ extern void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 extern void lock_release(struct lockdep_map *lock, int nested,
 			 unsigned long ip);
 
-#define lockdep_is_held(lock)	lock_is_held(&(lock)->dep_map)
+/*
+ * Same "read" as for lock_acquire(), except -1 means any.
+ */
+extern int lock_is_held_type(struct lockdep_map *lock, int read);
 
-extern int lock_is_held(struct lockdep_map *lock);
+static inline int lock_is_held(struct lockdep_map *lock)
+{
+	return lock_is_held_type(lock, -1);
+}
+
+#define lockdep_is_held(lock)		lock_is_held(&(lock)->dep_map)
+#define lockdep_is_held_type(lock, r)	lock_is_held_type(&(lock)->dep_map, (r))
 
 extern void lock_set_class(struct lockdep_map *lock, const char *name,
 			   struct lock_class_key *key, unsigned int subclass,
@@ -361,6 +365,14 @@ extern void lockdep_trace_alloc(gfp_t mask);
 
 #define lockdep_assert_held(l)	do {				\
 		WARN_ON(debug_locks && !lockdep_is_held(l));	\
+	} while (0)
+
+#define lockdep_assert_held_exclusive(l)	do {			\
+		WARN_ON(debug_locks && !lockdep_is_held_type(l, 0));	\
+	} while (0)
+
+#define lockdep_assert_held_read(l)	do {				\
+		WARN_ON(debug_locks && !lockdep_is_held_type(l, 1));	\
 	} while (0)
 
 #define lockdep_assert_held_once(l)	do {				\
@@ -416,7 +428,11 @@ struct lock_class_key { };
 
 #define lockdep_depth(tsk)	(0)
 
+#define lockdep_is_held_type(l, r)		(1)
+
 #define lockdep_assert_held(l)			do { (void)(l); } while (0)
+#define lockdep_assert_held_exclusive(l)	do { (void)(l); } while (0)
+#define lockdep_assert_held_read(l)		do { (void)(l); } while (0)
 #define lockdep_assert_held_once(l)		do { (void)(l); } while (0)
 
 #define lockdep_recursing(tsk)			(0)
@@ -502,6 +518,10 @@ static inline void print_irqtrace_events(struct task_struct *curr)
 #define rwlock_acquire_read(l, s, t, i)		lock_acquire_shared_recursive(l, s, t, NULL, i)
 #define rwlock_release(l, n, i)			lock_release(l, n, i)
 
+#define seqcount_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define seqcount_acquire_read(l, s, t, i)	lock_acquire_shared_recursive(l, s, t, NULL, i)
+#define seqcount_release(l, n, i)		lock_release(l, n, i)
+
 #define mutex_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
 #define mutex_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
 #define mutex_release(l, n, i)			lock_release(l, n, i)
@@ -509,12 +529,12 @@ static inline void print_irqtrace_events(struct task_struct *curr)
 #define rwsem_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
 #define rwsem_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
 #define rwsem_acquire_read(l, s, t, i)		lock_acquire_shared(l, s, t, NULL, i)
-# define rwsem_release(l, n, i)			lock_release(l, n, i)
+#define rwsem_release(l, n, i)			lock_release(l, n, i)
 
 #define lock_map_acquire(l)			lock_acquire_exclusive(l, 0, 0, NULL, _THIS_IP_)
 #define lock_map_acquire_read(l)		lock_acquire_shared_recursive(l, 0, 0, NULL, _THIS_IP_)
 #define lock_map_acquire_tryread(l)		lock_acquire_shared_recursive(l, 0, 1, NULL, _THIS_IP_)
-# define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
+#define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
 
 #ifdef CONFIG_PROVE_LOCKING
 # define might_lock(lock) 						\

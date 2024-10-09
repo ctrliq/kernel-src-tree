@@ -11,8 +11,6 @@
 #include "dc_link_dp.h"
 #include "dc_link_ddc.h"
 #include "dm_helpers.h"
-#include "dce/dce_link_encoder.h"
-#include "dce/dce_stream_encoder.h"
 #include "dpcd_defs.h"
 
 enum dc_status core_link_read_dpcd(
@@ -98,6 +96,7 @@ void dp_enable_link_phy(
 						link_settings,
 						clock_source);
 	}
+	link->cur_link_settings = *link_settings;
 
 	dp_receiver_power_ctrl(link, true);
 }
@@ -309,6 +308,7 @@ void dp_retrain_link_dp_test(struct dc_link *link,
 						link->link_enc,
 						link_setting,
 						pipes[i].clock_source->id);
+			link->cur_link_settings = *link_setting;
 
 			dp_receiver_power_ctrl(link, true);
 
@@ -318,7 +318,6 @@ void dp_retrain_link_dp_test(struct dc_link *link,
 					skip_video_pattern,
 					LINK_TRAINING_ATTEMPTS);
 
-			link->cur_link_settings = *link_setting;
 
 			link->dc->hwss.enable_stream(&pipes[i]);
 

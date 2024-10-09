@@ -38,8 +38,9 @@ static bool
 cgroup_mt(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_cgroup_info *info = par->matchinfo;
+	struct sock *sk = skb->sk;
 
-	if (skb->sk == NULL || !sk_fullsock(skb->sk))
+	if (!sk || !sk_fullsock(sk) || !net_eq(xt_net(par), sock_net(sk)))
 		return false;
 
 	return (info->id == skb->sk->sk_classid) ^ info->invert;

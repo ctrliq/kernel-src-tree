@@ -1616,6 +1616,10 @@ static void ip_del_fnhe(struct fib_nh *nh, __be32 daddr)
 		if (fnhe->fnhe_daddr == daddr) {
 			rcu_assign_pointer(*fnhe_p, rcu_dereference_protected(
 				fnhe->fnhe_next, lockdep_is_held(&fnhe_lock)));
+			/* set fnhe_daddr to 0 to ensure it won't bind with
+			 * new dsts in rt_bind_exception().
+			 */
+			fnhe->fnhe_daddr = 0;
 			fnhe_flush_routes(fnhe);
 			kfree_rcu(fnhe, rcu);
 			break;
@@ -2454,7 +2458,7 @@ struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_or
 }
 
 struct rtable *ip_route_output_flow(struct net *net, struct flowi4 *flp4,
-				    struct sock *sk)
+				    const struct sock *sk)
 {
 	struct rtable *rt = __ip_route_output_key(net, flp4);
 

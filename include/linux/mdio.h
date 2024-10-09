@@ -12,6 +12,9 @@
 #include <uapi/linux/mdio.h>
 
 struct mii_bus;
+struct phy_device;
+
+#define MDIO_DEVICE_FLAG_PHY		1
 
 static inline bool mdio_phy_id_is_c45(int phy_id)
 {
@@ -198,9 +201,17 @@ static inline u16 ethtool_adv_to_mmd_eee_adv_t(u32 adv)
 	return reg;
 }
 
+int __mdiobus_read(struct mii_bus *bus, int addr, u32 regnum);
+int __mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val);
+
 int mdiobus_read(struct mii_bus *bus, int addr, u32 regnum);
 int mdiobus_read_nested(struct mii_bus *bus, int addr, u32 regnum);
 int mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val);
 int mdiobus_write_nested(struct mii_bus *bus, int addr, u32 regnum, u16 val);
+
+int mdiobus_register_device(struct phy_device *phydev);
+int mdiobus_unregister_device(struct phy_device *phydev);
+bool mdiobus_is_registered_device(struct mii_bus *bus, int addr);
+struct phy_device *mdiobus_get_phy(struct mii_bus *bus, int addr);
 
 #endif /* __LINUX_MDIO_H__ */

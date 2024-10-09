@@ -760,9 +760,8 @@ static void ib_nl_set_path_rec_attrs(struct sk_buff *skb,
 	query->mad_buf->context[1] = NULL;
 
 	/* Construct the family header first */
-	header = (struct rdma_ls_resolve_header *)
-		skb_put(skb, NLMSG_ALIGN(sizeof(*header)));
-	memcpy(header->device_name, query->port->agent->device->name,
+	header = skb_put(skb, NLMSG_ALIGN(sizeof(*header)));
+	memcpy(header->device_name, dev_name(&query->port->agent->device->dev),
 	       LS_DEVICE_NAME_MAX);
 	header->port_num = query->port->port_num;
 
@@ -1359,7 +1358,8 @@ static void init_mad(struct ib_sa_query *query, struct ib_mad_agent *agent)
 	spin_unlock_irqrestore(&tid_lock, flags);
 }
 
-static int send_mad(struct ib_sa_query *query, int timeout_ms, gfp_t gfp_mask)
+static int send_mad(struct ib_sa_query *query, unsigned long timeout_ms,
+		    gfp_t gfp_mask)
 {
 	bool preload = !!(gfp_mask & __GFP_WAIT);
 	unsigned long flags;
@@ -1549,7 +1549,7 @@ int ib_sa_path_rec_get(struct ib_sa_client *client,
 		       struct ib_device *device, u8 port_num,
 		       struct sa_path_rec *rec,
 		       ib_sa_comp_mask comp_mask,
-		       int timeout_ms, gfp_t gfp_mask,
+		       unsigned long timeout_ms, gfp_t gfp_mask,
 		       void (*callback)(int status,
 					struct sa_path_rec *resp,
 					void *context),
@@ -1703,7 +1703,7 @@ int ib_sa_service_rec_query(struct ib_sa_client *client,
 			    struct ib_device *device, u8 port_num, u8 method,
 			    struct ib_sa_service_rec *rec,
 			    ib_sa_comp_mask comp_mask,
-			    int timeout_ms, gfp_t gfp_mask,
+			    unsigned long timeout_ms, gfp_t gfp_mask,
 			    void (*callback)(int status,
 					     struct ib_sa_service_rec *resp,
 					     void *context),
@@ -1800,7 +1800,7 @@ int ib_sa_mcmember_rec_query(struct ib_sa_client *client,
 			     u8 method,
 			     struct ib_sa_mcmember_rec *rec,
 			     ib_sa_comp_mask comp_mask,
-			     int timeout_ms, gfp_t gfp_mask,
+			     unsigned long timeout_ms, gfp_t gfp_mask,
 			     void (*callback)(int status,
 					      struct ib_sa_mcmember_rec *resp,
 					      void *context),
@@ -1891,7 +1891,7 @@ int ib_sa_guid_info_rec_query(struct ib_sa_client *client,
 			      struct ib_device *device, u8 port_num,
 			      struct ib_sa_guidinfo_rec *rec,
 			      ib_sa_comp_mask comp_mask, u8 method,
-			      int timeout_ms, gfp_t gfp_mask,
+			      unsigned long timeout_ms, gfp_t gfp_mask,
 			      void (*callback)(int status,
 					       struct ib_sa_guidinfo_rec *resp,
 					       void *context),
@@ -2058,7 +2058,7 @@ static void ib_sa_classport_info_rec_release(struct ib_sa_query *sa_query)
 }
 
 static int ib_sa_classport_info_rec_query(struct ib_sa_port *port,
-					  int timeout_ms,
+					  unsigned long timeout_ms,
 					  void (*callback)(void *context),
 					  void *context,
 					  struct ib_sa_query **sa_query)
@@ -2226,6 +2226,7 @@ static void update_sm_ah(struct work_struct *work)
 	struct ib_sa_sm_ah *new_ah;
 	struct ib_port_attr port_attr;
 	struct rdma_ah_attr   ah_attr;
+	bool grh_required;
 
 	if (ib_query_port(port->agent->device, port->port_num, &port_attr)) {
 		pr_warn("Couldn't query port\n");
@@ -2251,6 +2252,9 @@ static void update_sm_ah(struct work_struct *work)
 	rdma_ah_set_sl(&ah_attr, port_attr.sm_sl);
 	rdma_ah_set_port_num(&ah_attr, port->port_num);
 
+	grh_required = rdma_is_grh_required(port->agent->device,
+					    port->port_num);
+
 	/*
 	 * The OPA sm_lid of 0xFFFF needs special handling so that it can be
 	 * differentiated from a permissive LID of 0xFFFF.  We set the
@@ -2258,11 +2262,11 @@ static void update_sm_ah(struct work_struct *work)
 	 * address handle appropriately
 	 */
 	if (ah_attr.type == RDMA_AH_ATTR_TYPE_OPA &&
-	    (port_attr.grh_required ||
+	    (grh_required ||
 	     port_attr.sm_lid == be16_to_cpu(IB_LID_PERMISSIVE)))
 		rdma_ah_set_make_grd(&ah_attr, true);
 
-	if (ah_attr.type == RDMA_AH_ATTR_TYPE_IB && port_attr.grh_required) {
+	if (ah_attr.type == RDMA_AH_ATTR_TYPE_IB && grh_required) {
 		rdma_ah_set_ah_flags(&ah_attr, IB_AH_GRH);
 		rdma_ah_set_subnet_prefix(&ah_attr,
 					  cpu_to_be64(port_attr.subnet_prefix));

@@ -37,41 +37,21 @@
 #define RTL8201F_ISR				0x1e
 #define RTL8201F_IER				0x13
 
+#define RTL8366RB_POWER_SAVE			0x15
+#define RTL8366RB_POWER_SAVE_ON			BIT(12)
+
 MODULE_DESCRIPTION("Realtek PHY driver");
 MODULE_AUTHOR("Johnson Leung");
 MODULE_LICENSE("GPL");
 
-static int rtl8211x_page_read(struct phy_device *phydev, u16 page, u16 address)
+static int rtl821x_read_page(struct phy_device *phydev)
 {
-	int ret;
-
-	ret = phy_write(phydev, RTL821x_PAGE_SELECT, page);
-	if (ret)
-		return ret;
-
-	ret = phy_read(phydev, address);
-
-	/* restore to default page 0 */
-	phy_write(phydev, RTL821x_PAGE_SELECT, 0x0);
-
-	return ret;
+	return __phy_read(phydev, RTL821x_PAGE_SELECT);
 }
 
-static int rtl8211x_page_write(struct phy_device *phydev, u16 page,
-			       u16 address, u16 val)
+static int rtl821x_write_page(struct phy_device *phydev, int page)
 {
-	int ret;
-
-	ret = phy_write(phydev, RTL821x_PAGE_SELECT, page);
-	if (ret)
-		return ret;
-
-	ret = phy_write(phydev, address, val);
-
-	/* restore to default page 0 */
-	phy_write(phydev, RTL821x_PAGE_SELECT, 0x0);
-
-	return ret;
+	return __phy_write(phydev, RTL821x_PAGE_SELECT, page);
 }
 
 static int rtl8201_ack_interrupt(struct phy_device *phydev)
@@ -96,7 +76,7 @@ static int rtl8211f_ack_interrupt(struct phy_device *phydev)
 {
 	int err;
 
-	err = rtl8211x_page_read(phydev, 0xa43, RTL8211F_INSR);
+	err = phy_read_paged(phydev, 0xa43, RTL8211F_INSR);
 
 	return (err < 0) ? err : 0;
 }
@@ -110,7 +90,7 @@ static int rtl8201_config_intr(struct phy_device *phydev)
 	else
 		val = 0;
 
-	return rtl8211x_page_write(phydev, 0x7, RTL8201F_IER, val);
+	return phy_write_paged(phydev, 0x7, RTL8201F_IER, val);
 }
 
 static int rtl8211b_config_intr(struct phy_device *phydev)
@@ -148,7 +128,7 @@ static int rtl8211f_config_intr(struct phy_device *phydev)
 	else
 		val = 0;
 
-	return rtl8211x_page_write(phydev, 0xa42, RTL821x_INER, val);
+	return phy_write_paged(phydev, 0xa42, RTL821x_INER, val);
 }
 
 static int rtl8211_config_aneg(struct phy_device *phydev)
@@ -185,30 +165,64 @@ static int rtl8211c_config_init(struct phy_device *phydev)
 static int rtl8211f_config_init(struct phy_device *phydev)
 {
 	int ret;
-	u16 val;
+	u16 val = 0;
 
 	ret = genphy_config_init(phydev);
 	if (ret < 0)
 		return ret;
 
-	ret = rtl8211x_page_read(phydev, 0xd08, 0x11);
-	if (ret < 0)
-		return ret;
-
-	val = ret & 0xffff;
-
 	/* enable TX-delay for rgmii-id and rgmii-txid, otherwise disable it */
 	if (phydev->interface == PHY_INTERFACE_MODE_RGMII_ID ||
 	    phydev->interface == PHY_INTERFACE_MODE_RGMII_TXID)
-		val |= RTL8211F_TX_DELAY;
-	else
-		val &= ~RTL8211F_TX_DELAY;
+		val = RTL8211F_TX_DELAY;
 
-	ret = rtl8211x_page_write(phydev, 0xd08, 0x11, val);
-	if (ret)
+	return phy_modify_paged(phydev, 0xd08, 0x11, RTL8211F_TX_DELAY, val);
+}
+
+/* RHEL7 only START */
+static int genphy_read_mmd_unsupported(struct phy_device *phdev, int devad,
+				       u16 regnum)
+{
+	return -EOPNOTSUPP;
+}
+
+static int genphy_write_mmd_unsupported(struct phy_device *phdev, int devnum,
+					u16 regnum, u16 val)
+{
+	return -EOPNOTSUPP;
+}
+/* RHEL7 only END */
+
+static int rtl8211b_suspend(struct phy_device *phydev)
+{
+	phy_write(phydev, MII_MMD_DATA, BIT(9));
+
+	return genphy_suspend(phydev);
+}
+
+static int rtl8211b_resume(struct phy_device *phydev)
+{
+	phy_write(phydev, MII_MMD_DATA, 0);
+
+	return genphy_resume(phydev);
+}
+
+static int rtl8366rb_config_init(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = genphy_config_init(phydev);
+	if (ret < 0)
 		return ret;
 
-	return 0;
+	ret = phy_set_bits(phydev, RTL8366RB_POWER_SAVE,
+			   RTL8366RB_POWER_SAVE_ON);
+	if (ret) {
+		dev_err(&phydev->mdio_dev,
+			"error enabling power management\n");
+	}
+
+	return ret;
 }
 
 static struct phy_driver realtek_drvs[] = {
@@ -233,12 +247,17 @@ static struct phy_driver realtek_drvs[] = {
 		.config_intr	= &rtl8201_config_intr,
 		.suspend	= genphy_suspend,
 		.resume		= genphy_resume,
+		.driver         = { .owner = THIS_MODULE,},
+		.read_page	= rtl821x_read_page,
+		.write_page	= rtl821x_write_page,
 	}, {
 		.phy_id		= 0x001cc910,
 		.name		= "RTL8211 Gigabit Ethernet",
 		.phy_id_mask	= 0x001fffff,
 		.features	= PHY_GBIT_FEATURES,
 		.config_aneg	= rtl8211_config_aneg,
+		.read_status	= &genphy_read_status,
+		.driver		= { .owner = THIS_MODULE,},
 		.read_mmd	= &genphy_read_mmd_unsupported,
 		.write_mmd	= &genphy_write_mmd_unsupported,
 	}, {
@@ -252,12 +271,19 @@ static struct phy_driver realtek_drvs[] = {
 		.ack_interrupt	= &rtl821x_ack_interrupt,
 		.config_intr	= &rtl8211b_config_intr,
 		.driver		= { .owner = THIS_MODULE,},
+		.read_mmd	= &genphy_read_mmd_unsupported,
+		.write_mmd	= &genphy_write_mmd_unsupported,
+		.suspend	= rtl8211b_suspend,
+		.resume		= rtl8211b_resume,
 	}, {
 		.phy_id		= 0x001cc913,
 		.name		= "RTL8211C Gigabit Ethernet",
 		.phy_id_mask	= 0x001fffff,
 		.features	= PHY_GBIT_FEATURES,
+		.config_aneg	= &genphy_config_aneg,
 		.config_init	= rtl8211c_config_init,
+		.read_status	= &genphy_read_status,
+		.driver		= { .owner = THIS_MODULE,},
 		.read_mmd	= &genphy_read_mmd_unsupported,
 		.write_mmd	= &genphy_write_mmd_unsupported,
 	}, {
@@ -300,6 +326,32 @@ static struct phy_driver realtek_drvs[] = {
 		.suspend	= genphy_suspend,
 		.resume		= genphy_resume,
 		.driver		= { .owner = THIS_MODULE },
+		.read_page	= rtl821x_read_page,
+		.write_page	= rtl821x_write_page,
+	}, {
+		.phy_id		= 0x001cc800,
+		.name		= "Generic Realtek PHY",
+		.features	= PHY_GBIT_FEATURES,
+		.config_aneg	= genphy_config_aneg,
+		.config_init	= genphy_config_init,
+		.read_status	= genphy_read_status,
+		.suspend	= genphy_suspend,
+		.resume		= genphy_resume,
+		.driver		= { .owner = THIS_MODULE },
+		.read_page	= rtl821x_read_page,
+		.write_page	= rtl821x_write_page,
+	}, {
+		.phy_id		= 0x001cc961,
+		.name		= "RTL8366RB Gigabit Ethernet",
+		.phy_id_mask	= 0x001fffff,
+		.features	= PHY_GBIT_FEATURES,
+		.flags		= PHY_HAS_INTERRUPT,
+		.config_aneg	= &genphy_config_aneg,
+		.config_init	= &rtl8366rb_config_init,
+		.read_status	= &genphy_read_status,
+		.suspend	= genphy_suspend,
+		.resume		= genphy_resume,
+		.driver		= { .owner = THIS_MODULE },
 	},
 };
 
@@ -316,14 +368,8 @@ static void __exit realtek_exit(void)
 module_init(realtek_init);
 module_exit(realtek_exit);
 
-static struct mdio_device_id __maybe_unused realtek_tbl[] = {
-	{ 0x001cc816, 0x001fffff },
-	{ 0x001cc910, 0x001fffff },
-	{ 0x001cc912, 0x001fffff },
-	{ 0x001cc913, 0x001fffff },
-	{ 0x001cc914, 0x001fffff },
-	{ 0x001cc915, 0x001fffff },
-	{ 0x001cc916, 0x001fffff },
+static const struct mdio_device_id __maybe_unused realtek_tbl[] = {
+	{ 0x001cc800, GENMASK(31, 10) },
 	{ }
 };
 

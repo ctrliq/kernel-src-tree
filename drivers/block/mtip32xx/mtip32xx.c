@@ -198,9 +198,6 @@ static struct mtip_cmd *mtip_get_int_command(struct driver_data *dd)
 	if (IS_ERR(rq))
 		return NULL;
 
-	/* Internal cmd isn't submitted via .queue_rq */
-	mtip_init_cmd_header(rq);
-
 	return blk_mq_rq_to_pdu(rq);
 }
 

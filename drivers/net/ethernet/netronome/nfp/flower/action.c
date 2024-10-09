@@ -1,46 +1,15 @@
-/*
- * Copyright (C) 2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2017-2018 Netronome Systems, Inc. */
 
 #include <linux/bitfield.h>
-#include <net/geneve.h>
 #include <net/pkt_cls.h>
 #include <net/switchdev.h>
+#include <net/tc_act/tc_csum.h>
 #include <net/tc_act/tc_gact.h>
 #include <net/tc_act/tc_mirred.h>
 #include <net/tc_act/tc_pedit.h>
 #include <net/tc_act/tc_vlan.h>
 #include <net/tc_act/tc_tunnel_key.h>
-#include <net/vxlan.h>
 
 #include "cmsg.h"
 #include "main.h"
@@ -85,25 +54,50 @@ nfp_fl_push_vlan(struct nfp_fl_push_vlan *push_vlan,
 	push_vlan->vlan_tci = cpu_to_be16(tmp_push_vlan_tci);
 }
 
-static bool nfp_fl_netdev_is_tunnel_type(struct net_device *out_dev,
-					 enum nfp_flower_tun_type tun_type)
+static int
+nfp_fl_pre_lag(struct nfp_app *app, const struct tc_action *action,
+	       struct nfp_fl_payload *nfp_flow, int act_len)
 {
-	if (netif_is_vxlan(out_dev))
-		return tun_type == NFP_FL_TUNNEL_VXLAN;
+	size_t act_size = sizeof(struct nfp_fl_pre_lag);
+	struct nfp_fl_pre_lag *pre_lag;
+	struct net_device *out_dev;
+	int err;
 
-	if (netif_is_geneve(out_dev))
-		return tun_type == NFP_FL_TUNNEL_GENEVE;
+	out_dev = tcf_mirred_dev(action);
+	if (!out_dev || !netif_is_lag_master(out_dev))
+		return 0;
 
-	return false;
+	if (act_len + act_size > NFP_FL_MAX_A_SIZ)
+		return -EOPNOTSUPP;
+
+	/* Pre_lag action must be first on action list.
+	 * If other actions already exist they need pushed forward.
+	 */
+	if (act_len)
+		memmove(nfp_flow->action_data + act_size,
+			nfp_flow->action_data, act_len);
+
+	pre_lag = (struct nfp_fl_pre_lag *)nfp_flow->action_data;
+	err = nfp_flower_lag_populate_pre_action(app, out_dev, pre_lag);
+	if (err)
+		return err;
+
+	pre_lag->head.jump_id = NFP_FL_ACTION_OPCODE_PRE_LAG;
+	pre_lag->head.len_lw = act_size >> NFP_FL_LW_SIZ;
+
+	nfp_flow->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_NULL);
+
+	return act_size;
 }
 
 static int
-nfp_fl_output(struct nfp_fl_output *output, const struct tc_action *action,
-	      struct nfp_fl_payload *nfp_flow, bool last,
-	      struct net_device *in_dev, enum nfp_flower_tun_type tun_type,
-	      int *tun_out_cnt)
+nfp_fl_output(struct nfp_app *app, struct nfp_fl_output *output,
+	      const struct tc_action *action, struct nfp_fl_payload *nfp_flow,
+	      bool last, struct net_device *in_dev,
+	      enum nfp_flower_tun_type tun_type, int *tun_out_cnt)
 {
 	size_t act_size = sizeof(struct nfp_fl_output);
+	struct nfp_flower_priv *priv = app->priv;
 	struct net_device *out_dev;
 	u16 tmp_flags;
 
@@ -128,15 +122,25 @@ nfp_fl_output(struct nfp_fl_output *output, const struct tc_action *action,
 		output->flags = cpu_to_be16(tmp_flags |
 					    NFP_FL_OUT_FLAGS_USE_TUN);
 		output->port = cpu_to_be32(NFP_FL_PORT_TYPE_TUN | tun_type);
+	} else if (netif_is_lag_master(out_dev) &&
+		   priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
+		int gid;
+
+		output->flags = cpu_to_be16(tmp_flags);
+		gid = nfp_flower_lag_get_output_id(app, out_dev);
+		if (gid < 0)
+			return gid;
+		output->port = cpu_to_be32(NFP_FL_LAG_OUT | gid);
 	} else {
 		/* Set action output parameters. */
 		output->flags = cpu_to_be16(tmp_flags);
 
-		/* Only offload if egress ports are on the same device as the
-		 * ingress port.
-		 */
-		if (!switchdev_port_same_parent_id(in_dev, out_dev))
-			return -EOPNOTSUPP;
+		if (nfp_netdev_is_nfp_repr(in_dev)) {
+			/* Confirm ingress and egress are on same device. */
+			if (!switchdev_port_same_parent_id(in_dev, out_dev))
+				return -EOPNOTSUPP;
+		}
+
 		if (!nfp_netdev_is_nfp_repr(out_dev))
 			return -EOPNOTSUPP;
 
@@ -174,7 +178,7 @@ static struct nfp_fl_pre_tunnel *nfp_fl_pre_tunnel(char *act_data, int act_len)
 	struct nfp_fl_pre_tunnel *pre_tun_act;
 
 	/* Pre_tunnel action must be first on action list.
-	 * If other actions already exist they need pushed forward.
+	 * If other actions already exist they need to be pushed forward.
 	 */
 	if (act_len)
 		memmove(act_data + act_size, act_data, act_len);
@@ -266,7 +270,6 @@ nfp_fl_set_ipv4_udp_tun(struct nfp_app *app,
 	u32 tmp_set_ip_tun_type_index = 0;
 	/* Currently support one pre-tunnel so index is always 0. */
 	int pretun_idx = 0;
-	struct net *net;
 
 	BUILD_BUG_ON(NFP_FL_TUNNEL_CSUM != TUNNEL_CSUM ||
 		     NFP_FL_TUNNEL_KEY	!= TUNNEL_KEY ||
@@ -275,8 +278,6 @@ nfp_fl_set_ipv4_udp_tun(struct nfp_app *app,
 	    (tun_type != NFP_FL_TUNNEL_GENEVE ||
 	    !(priv->flower_ext_feats & NFP_FL_FEATS_GENEVE_OPT)))
 		return -EOPNOTSUPP;
-
-	net = dev_net(netdev);
 
 	set_tun->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV4_TUNNEL;
 	set_tun->head.len_lw = act_size >> NFP_FL_LW_SIZ;
@@ -288,7 +289,30 @@ nfp_fl_set_ipv4_udp_tun(struct nfp_app *app,
 
 	set_tun->tun_type_index = cpu_to_be32(tmp_set_ip_tun_type_index);
 	set_tun->tun_id = ip_tun->key.tun_id;
-	set_tun->ttl = net->ipv4_sysctl_ip_default_ttl;
+
+	if (ip_tun->key.ttl) {
+		set_tun->ttl = ip_tun->key.ttl;
+	} else {
+		struct net *net = dev_net(netdev);
+		struct flowi4 flow = {};
+		struct rtable *rt;
+		int err;
+
+		/* Do a route lookup to determine ttl - if fails then use
+		 * default. Note that CONFIG_INET is a requirement of
+		 * CONFIG_NET_SWITCHDEV so must be defined here.
+		 */
+		flow.daddr = ip_tun->key.u.ipv4.dst;
+		flow.flowi4_proto = IPPROTO_UDP;
+		rt = ip_route_output_key(net, &flow);
+		err = PTR_ERR_OR_ZERO(rt);
+		if (!err) {
+			set_tun->ttl = ip4_dst_hoplimit(&rt->dst);
+			ip_rt_put(rt);
+		} else {
+			set_tun->ttl = net->ipv4_sysctl_ip_default_ttl;
+		}
+	}
 
 	set_tun->tos = ip_tun->key.tos;
 
@@ -345,10 +369,21 @@ nfp_fl_set_eth(const struct tc_action *action, int idx, u32 off,
 	return 0;
 }
 
+struct ipv4_ttl_word {
+	__u8	ttl;
+	__u8	protocol;
+	__sum16	check;
+};
+
 static int
 nfp_fl_set_ip4(const struct tc_action *action, int idx, u32 off,
-	       struct nfp_fl_set_ip4_addrs *set_ip_addr)
+	       struct nfp_fl_set_ip4_addrs *set_ip_addr,
+	       struct nfp_fl_set_ip4_ttl_tos *set_ip_ttl_tos)
 {
+	struct ipv4_ttl_word *ttl_word_mask;
+	struct ipv4_ttl_word *ttl_word;
+	struct iphdr *tos_word_mask;
+	struct iphdr *tos_word;
 	__be32 exact, mask;
 
 	/* We are expecting tcf_pedit to return a big endian value */
@@ -363,19 +398,52 @@ nfp_fl_set_ip4(const struct tc_action *action, int idx, u32 off,
 		set_ip_addr->ipv4_dst_mask |= mask;
 		set_ip_addr->ipv4_dst &= ~mask;
 		set_ip_addr->ipv4_dst |= exact & mask;
+		set_ip_addr->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS;
+		set_ip_addr->head.len_lw = sizeof(*set_ip_addr) >>
+					   NFP_FL_LW_SIZ;
 		break;
 	case offsetof(struct iphdr, saddr):
 		set_ip_addr->ipv4_src_mask |= mask;
 		set_ip_addr->ipv4_src &= ~mask;
 		set_ip_addr->ipv4_src |= exact & mask;
+		set_ip_addr->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS;
+		set_ip_addr->head.len_lw = sizeof(*set_ip_addr) >>
+					   NFP_FL_LW_SIZ;
+		break;
+	case offsetof(struct iphdr, ttl):
+		ttl_word_mask = (struct ipv4_ttl_word *)&mask;
+		ttl_word = (struct ipv4_ttl_word *)&exact;
+
+		if (ttl_word_mask->protocol || ttl_word_mask->check)
+			return -EOPNOTSUPP;
+
+		set_ip_ttl_tos->ipv4_ttl_mask |= ttl_word_mask->ttl;
+		set_ip_ttl_tos->ipv4_ttl &= ~ttl_word_mask->ttl;
+		set_ip_ttl_tos->ipv4_ttl |= ttl_word->ttl & ttl_word_mask->ttl;
+		set_ip_ttl_tos->head.jump_id =
+			NFP_FL_ACTION_OPCODE_SET_IPV4_TTL_TOS;
+		set_ip_ttl_tos->head.len_lw = sizeof(*set_ip_ttl_tos) >>
+					      NFP_FL_LW_SIZ;
+		break;
+	case round_down(offsetof(struct iphdr, tos), 4):
+		tos_word_mask = (struct iphdr *)&mask;
+		tos_word = (struct iphdr *)&exact;
+
+		if (tos_word_mask->version || tos_word_mask->ihl ||
+		    tos_word_mask->tot_len)
+			return -EOPNOTSUPP;
+
+		set_ip_ttl_tos->ipv4_tos_mask |= tos_word_mask->tos;
+		set_ip_ttl_tos->ipv4_tos &= ~tos_word_mask->tos;
+		set_ip_ttl_tos->ipv4_tos |= tos_word->tos & tos_word_mask->tos;
+		set_ip_ttl_tos->head.jump_id =
+			NFP_FL_ACTION_OPCODE_SET_IPV4_TTL_TOS;
+		set_ip_ttl_tos->head.len_lw = sizeof(*set_ip_ttl_tos) >>
+					      NFP_FL_LW_SIZ;
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
-
-	set_ip_addr->reserved = cpu_to_be16(0);
-	set_ip_addr->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV4_ADDRS;
-	set_ip_addr->head.len_lw = sizeof(*set_ip_addr) >> NFP_FL_LW_SIZ;
 
 	return 0;
 }
@@ -393,12 +461,57 @@ nfp_fl_set_ip6_helper(int opcode_tag, u8 word, __be32 exact, __be32 mask,
 	ip6->head.len_lw = sizeof(*ip6) >> NFP_FL_LW_SIZ;
 }
 
+struct ipv6_hop_limit_word {
+	__be16 payload_len;
+	u8 nexthdr;
+	u8 hop_limit;
+};
+
+static int
+nfp_fl_set_ip6_hop_limit_flow_label(u32 off, __be32 exact, __be32 mask,
+				    struct nfp_fl_set_ipv6_tc_hl_fl *ip_hl_fl)
+{
+	struct ipv6_hop_limit_word *fl_hl_mask;
+	struct ipv6_hop_limit_word *fl_hl;
+
+	switch (off) {
+	case offsetof(struct ipv6hdr, payload_len):
+		fl_hl_mask = (struct ipv6_hop_limit_word *)&mask;
+		fl_hl = (struct ipv6_hop_limit_word *)&exact;
+
+		if (fl_hl_mask->nexthdr || fl_hl_mask->payload_len)
+			return -EOPNOTSUPP;
+
+		ip_hl_fl->ipv6_hop_limit_mask |= fl_hl_mask->hop_limit;
+		ip_hl_fl->ipv6_hop_limit &= ~fl_hl_mask->hop_limit;
+		ip_hl_fl->ipv6_hop_limit |= fl_hl->hop_limit &
+					    fl_hl_mask->hop_limit;
+		break;
+	case round_down(offsetof(struct ipv6hdr, flow_lbl), 4):
+		if (mask & ~IPV6_FLOW_LABEL_MASK ||
+		    exact & ~IPV6_FLOW_LABEL_MASK)
+			return -EOPNOTSUPP;
+
+		ip_hl_fl->ipv6_label_mask |= mask;
+		ip_hl_fl->ipv6_label &= ~mask;
+		ip_hl_fl->ipv6_label |= exact & mask;
+		break;
+	}
+
+	ip_hl_fl->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV6_TC_HL_FL;
+	ip_hl_fl->head.len_lw = sizeof(*ip_hl_fl) >> NFP_FL_LW_SIZ;
+
+	return 0;
+}
+
 static int
 nfp_fl_set_ip6(const struct tc_action *action, int idx, u32 off,
 	       struct nfp_fl_set_ipv6_addr *ip_dst,
-	       struct nfp_fl_set_ipv6_addr *ip_src)
+	       struct nfp_fl_set_ipv6_addr *ip_src,
+	       struct nfp_fl_set_ipv6_tc_hl_fl *ip_hl_fl)
 {
 	__be32 exact, mask;
+	int err = 0;
 	u8 word;
 
 	/* We are expecting tcf_pedit to return a big endian value */
@@ -409,7 +522,8 @@ nfp_fl_set_ip6(const struct tc_action *action, int idx, u32 off,
 		return -EOPNOTSUPP;
 
 	if (off < offsetof(struct ipv6hdr, saddr)) {
-		return -EOPNOTSUPP;
+		err = nfp_fl_set_ip6_hop_limit_flow_label(off, exact, mask,
+							  ip_hl_fl);
 	} else if (off < offsetof(struct ipv6hdr, daddr)) {
 		word = (off - offsetof(struct ipv6hdr, saddr)) / sizeof(exact);
 		nfp_fl_set_ip6_helper(NFP_FL_ACTION_OPCODE_SET_IPV6_SRC, word,
@@ -423,7 +537,7 @@ nfp_fl_set_ip6(const struct tc_action *action, int idx, u32 off,
 		return -EOPNOTSUPP;
 	}
 
-	return 0;
+	return err;
 }
 
 static int
@@ -451,18 +565,42 @@ nfp_fl_set_tport(const struct tc_action *action, int idx, u32 off,
 	return 0;
 }
 
+static u32 nfp_fl_csum_l4_to_flag(u8 ip_proto)
+{
+	switch (ip_proto) {
+	case 0:
+		/* Filter doesn't force proto match,
+		 * both TCP and UDP will be updated if encountered
+		 */
+		return TCA_CSUM_UPDATE_FLAG_TCP | TCA_CSUM_UPDATE_FLAG_UDP;
+	case IPPROTO_TCP:
+		return TCA_CSUM_UPDATE_FLAG_TCP;
+	case IPPROTO_UDP:
+		return TCA_CSUM_UPDATE_FLAG_UDP;
+	default:
+		/* All other protocols will be ignored by FW */
+		return 0;
+	}
+}
+
 static int
-nfp_fl_pedit(const struct tc_action *action, char *nfp_action, int *a_len)
+nfp_fl_pedit(const struct tc_action *action, struct tc_cls_flower_offload *flow,
+	     char *nfp_action, int *a_len, u32 *csum_updated)
 {
 	struct nfp_fl_set_ipv6_addr set_ip6_dst, set_ip6_src;
+	struct nfp_fl_set_ipv6_tc_hl_fl set_ip6_tc_hl_fl;
+	struct nfp_fl_set_ip4_ttl_tos set_ip_ttl_tos;
 	struct nfp_fl_set_ip4_addrs set_ip_addr;
 	struct nfp_fl_set_tport set_tport;
 	struct nfp_fl_set_eth set_eth;
 	enum pedit_header_type htype;
 	int idx, nkeys, err;
-	size_t act_size;
+	size_t act_size = 0;
 	u32 offset, cmd;
+	u8 ip_proto = 0;
 
+	memset(&set_ip6_tc_hl_fl, 0, sizeof(set_ip6_tc_hl_fl));
+	memset(&set_ip_ttl_tos, 0, sizeof(set_ip_ttl_tos));
 	memset(&set_ip6_dst, 0, sizeof(set_ip6_dst));
 	memset(&set_ip6_src, 0, sizeof(set_ip6_src));
 	memset(&set_ip_addr, 0, sizeof(set_ip_addr));
@@ -483,11 +621,12 @@ nfp_fl_pedit(const struct tc_action *action, char *nfp_action, int *a_len)
 			err = nfp_fl_set_eth(action, idx, offset, &set_eth);
 			break;
 		case TCA_PEDIT_KEY_EX_HDR_TYPE_IP4:
-			err = nfp_fl_set_ip4(action, idx, offset, &set_ip_addr);
+			err = nfp_fl_set_ip4(action, idx, offset, &set_ip_addr,
+					     &set_ip_ttl_tos);
 			break;
 		case TCA_PEDIT_KEY_EX_HDR_TYPE_IP6:
 			err = nfp_fl_set_ip6(action, idx, offset, &set_ip6_dst,
-					     &set_ip6_src);
+					     &set_ip6_src, &set_ip6_tc_hl_fl);
 			break;
 		case TCA_PEDIT_KEY_EX_HDR_TYPE_TCP:
 			err = nfp_fl_set_tport(action, idx, offset, &set_tport,
@@ -504,18 +643,54 @@ nfp_fl_pedit(const struct tc_action *action, char *nfp_action, int *a_len)
 			return err;
 	}
 
+	if (dissector_uses_key(flow->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
+		struct flow_dissector_key_basic *basic;
+
+		basic = skb_flow_dissector_target(flow->dissector,
+						  FLOW_DISSECTOR_KEY_BASIC,
+						  flow->key);
+		ip_proto = basic->ip_proto;
+	}
+
 	if (set_eth.head.len_lw) {
 		act_size = sizeof(set_eth);
 		memcpy(nfp_action, &set_eth, act_size);
 		*a_len += act_size;
-	} else if (set_ip_addr.head.len_lw) {
+	}
+	if (set_ip_ttl_tos.head.len_lw) {
+		nfp_action += act_size;
+		act_size = sizeof(set_ip_ttl_tos);
+		memcpy(nfp_action, &set_ip_ttl_tos, act_size);
+		*a_len += act_size;
+
+		/* Hardware will automatically fix IPv4 and TCP/UDP checksum. */
+		*csum_updated |= TCA_CSUM_UPDATE_FLAG_IPV4HDR |
+				nfp_fl_csum_l4_to_flag(ip_proto);
+	}
+	if (set_ip_addr.head.len_lw) {
+		nfp_action += act_size;
 		act_size = sizeof(set_ip_addr);
 		memcpy(nfp_action, &set_ip_addr, act_size);
 		*a_len += act_size;
-	} else if (set_ip6_dst.head.len_lw && set_ip6_src.head.len_lw) {
+
+		/* Hardware will automatically fix IPv4 and TCP/UDP checksum. */
+		*csum_updated |= TCA_CSUM_UPDATE_FLAG_IPV4HDR |
+				nfp_fl_csum_l4_to_flag(ip_proto);
+	}
+	if (set_ip6_tc_hl_fl.head.len_lw) {
+		nfp_action += act_size;
+		act_size = sizeof(set_ip6_tc_hl_fl);
+		memcpy(nfp_action, &set_ip6_tc_hl_fl, act_size);
+		*a_len += act_size;
+
+		/* Hardware will automatically fix TCP/UDP checksum. */
+		*csum_updated |= nfp_fl_csum_l4_to_flag(ip_proto);
+	}
+	if (set_ip6_dst.head.len_lw && set_ip6_src.head.len_lw) {
 		/* TC compiles set src and dst IPv6 address as a single action,
 		 * the hardware requires this to be 2 separate actions.
 		 */
+		nfp_action += act_size;
 		act_size = sizeof(set_ip6_src);
 		memcpy(nfp_action, &set_ip6_src, act_size);
 		*a_len += act_size;
@@ -524,60 +699,114 @@ nfp_fl_pedit(const struct tc_action *action, char *nfp_action, int *a_len)
 		memcpy(&nfp_action[sizeof(set_ip6_src)], &set_ip6_dst,
 		       act_size);
 		*a_len += act_size;
+
+		/* Hardware will automatically fix TCP/UDP checksum. */
+		*csum_updated |= nfp_fl_csum_l4_to_flag(ip_proto);
 	} else if (set_ip6_dst.head.len_lw) {
+		nfp_action += act_size;
 		act_size = sizeof(set_ip6_dst);
 		memcpy(nfp_action, &set_ip6_dst, act_size);
 		*a_len += act_size;
+
+		/* Hardware will automatically fix TCP/UDP checksum. */
+		*csum_updated |= nfp_fl_csum_l4_to_flag(ip_proto);
 	} else if (set_ip6_src.head.len_lw) {
+		nfp_action += act_size;
 		act_size = sizeof(set_ip6_src);
 		memcpy(nfp_action, &set_ip6_src, act_size);
 		*a_len += act_size;
-	} else if (set_tport.head.len_lw) {
+
+		/* Hardware will automatically fix TCP/UDP checksum. */
+		*csum_updated |= nfp_fl_csum_l4_to_flag(ip_proto);
+	}
+	if (set_tport.head.len_lw) {
+		nfp_action += act_size;
 		act_size = sizeof(set_tport);
 		memcpy(nfp_action, &set_tport, act_size);
 		*a_len += act_size;
+
+		/* Hardware will automatically fix TCP/UDP checksum. */
+		*csum_updated |= nfp_fl_csum_l4_to_flag(ip_proto);
 	}
 
 	return 0;
 }
 
 static int
-nfp_flower_loop_action(const struct tc_action *a,
+nfp_flower_output_action(struct nfp_app *app, const struct tc_action *a,
+			 struct nfp_fl_payload *nfp_fl, int *a_len,
+			 struct net_device *netdev, bool last,
+			 enum nfp_flower_tun_type *tun_type, int *tun_out_cnt,
+			 int *out_cnt, u32 *csum_updated)
+{
+	struct nfp_flower_priv *priv = app->priv;
+	struct nfp_fl_output *output;
+	int err, prelag_size;
+
+	/* If csum_updated has not been reset by now, it means HW will
+	 * incorrectly update csums when they are not requested.
+	 */
+	if (*csum_updated)
+		return -EOPNOTSUPP;
+
+	if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
+		return -EOPNOTSUPP;
+
+	output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
+	err = nfp_fl_output(app, output, a, nfp_fl, last, netdev, *tun_type,
+			    tun_out_cnt);
+	if (err)
+		return err;
+
+	*a_len += sizeof(struct nfp_fl_output);
+
+	if (priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
+		/* nfp_fl_pre_lag returns -err or size of prelag action added.
+		 * This will be 0 if it is not egressing to a lag dev.
+		 */
+		prelag_size = nfp_fl_pre_lag(app, a, nfp_fl, *a_len);
+		if (prelag_size < 0)
+			return prelag_size;
+		else if (prelag_size > 0 && (!last || *out_cnt))
+			return -EOPNOTSUPP;
+
+		*a_len += prelag_size;
+	}
+	(*out_cnt)++;
+
+	return 0;
+}
+
+static int
+nfp_flower_loop_action(struct nfp_app *app, const struct tc_action *a,
+		       struct tc_cls_flower_offload *flow,
 		       struct nfp_fl_payload *nfp_fl, int *a_len,
 		       struct net_device *netdev,
-		       enum nfp_flower_tun_type *tun_type, int *tun_out_cnt)
+		       enum nfp_flower_tun_type *tun_type, int *tun_out_cnt,
+		       int *out_cnt, u32 *csum_updated)
 {
 	struct nfp_fl_set_ipv4_udp_tun *set_tun;
 	struct nfp_fl_pre_tunnel *pre_tun;
 	struct nfp_fl_push_vlan *psh_v;
 	struct nfp_fl_pop_vlan *pop_v;
-	struct nfp_fl_output *output;
 	int err;
 
 	if (is_tcf_gact_shot(a)) {
 		nfp_fl->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_DROP);
 	} else if (is_tcf_mirred_egress_redirect(a)) {
-		if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
-			return -EOPNOTSUPP;
-
-		output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
-		err = nfp_fl_output(output, a, nfp_fl, true, netdev, *tun_type,
-				    tun_out_cnt);
+		err = nfp_flower_output_action(app, a, nfp_fl, a_len, netdev,
+					       true, tun_type, tun_out_cnt,
+					       out_cnt, csum_updated);
 		if (err)
 			return err;
 
-		*a_len += sizeof(struct nfp_fl_output);
 	} else if (is_tcf_mirred_egress_mirror(a)) {
-		if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
-			return -EOPNOTSUPP;
-
-		output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
-		err = nfp_fl_output(output, a, nfp_fl, false, netdev, *tun_type,
-				    tun_out_cnt);
+		err = nfp_flower_output_action(app, a, nfp_fl, a_len, netdev,
+					       false, tun_type, tun_out_cnt,
+					       out_cnt, csum_updated);
 		if (err)
 			return err;
 
-		*a_len += sizeof(struct nfp_fl_output);
 	} else if (is_tcf_vlan(a) && tcf_vlan_action(a) == TCA_VLAN_ACT_POP) {
 		if (*a_len + sizeof(struct nfp_fl_pop_vlan) > NFP_FL_MAX_A_SIZ)
 			return -EOPNOTSUPP;
@@ -598,9 +827,8 @@ nfp_flower_loop_action(const struct tc_action *a,
 		*a_len += sizeof(struct nfp_fl_push_vlan);
 	} else if (is_tcf_tunnel_set(a)) {
 		struct ip_tunnel_info *ip_tun = tcf_tunnel_info(a);
-		struct nfp_repr *repr = netdev_priv(netdev);
 
-		*tun_type = nfp_fl_get_tun_from_act_l4_port(repr->app, a);
+		*tun_type = nfp_fl_get_tun_from_act_l4_port(app, a);
 		if (*tun_type == NFP_FL_TUNNEL_NONE)
 			return -EOPNOTSUPP;
 
@@ -633,8 +861,17 @@ nfp_flower_loop_action(const struct tc_action *a,
 		/* Tunnel decap is handled by default so accept action. */
 		return 0;
 	} else if (is_tcf_pedit(a)) {
-		if (nfp_fl_pedit(a, &nfp_fl->action_data[*a_len], a_len))
+		if (nfp_fl_pedit(a, flow, &nfp_fl->action_data[*a_len],
+				 a_len, csum_updated))
 			return -EOPNOTSUPP;
+	} else if (is_tcf_csum(a)) {
+		/* csum action requests recalc of something we have not fixed */
+		if (tcf_csum_update_flags(a) & ~*csum_updated)
+			return -EOPNOTSUPP;
+		/* If we will correctly fix the csum we can remove it from the
+		 * csum update list. Which will later be used to check support.
+		 */
+		*csum_updated &= ~tcf_csum_update_flags(a);
 	} else {
 		/* Currently we do not handle any other actions. */
 		return -EOPNOTSUPP;
@@ -643,13 +880,15 @@ nfp_flower_loop_action(const struct tc_action *a,
 	return 0;
 }
 
-int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
+int nfp_flower_compile_action(struct nfp_app *app,
+			      struct tc_cls_flower_offload *flow,
 			      struct net_device *netdev,
 			      struct nfp_fl_payload *nfp_flow)
 {
-	int act_len, act_cnt, err, tun_out_cnt;
+	int act_len, act_cnt, err, tun_out_cnt, out_cnt;
 	enum nfp_flower_tun_type tun_type;
 	const struct tc_action *a;
+	u32 csum_updated = 0;
 	LIST_HEAD(actions);
 
 	memset(nfp_flow->action_data, 0, NFP_FL_MAX_A_SIZ);
@@ -658,11 +897,13 @@ int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
 	act_len = 0;
 	act_cnt = 0;
 	tun_out_cnt = 0;
+	out_cnt = 0;
 
 	tcf_exts_to_list(flow->exts, &actions);
 	list_for_each_entry(a, &actions, list) {
-		err = nfp_flower_loop_action(a, nfp_flow, &act_len, netdev,
-					     &tun_type, &tun_out_cnt);
+		err = nfp_flower_loop_action(app, a, flow, nfp_flow, &act_len,
+					     netdev, &tun_type, &tun_out_cnt,
+					     &out_cnt, &csum_updated);
 		if (err)
 			return err;
 		act_cnt++;

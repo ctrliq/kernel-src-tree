@@ -48,6 +48,7 @@ static inline unsigned int __shrink_ple_window(unsigned int val,
 static inline void kvm_clear_exception_queue(struct kvm_vcpu *vcpu)
 {
 	vcpu->arch.exception.pending = false;
+	vcpu->arch.exception.injected = false;
 }
 
 static inline void kvm_queue_interrupt(struct kvm_vcpu *vcpu, u8 vector,
@@ -65,7 +66,7 @@ static inline void kvm_clear_interrupt_queue(struct kvm_vcpu *vcpu)
 
 static inline bool kvm_event_needs_reinjection(struct kvm_vcpu *vcpu)
 {
-	return vcpu->arch.exception.pending || vcpu->arch.interrupt.pending ||
+	return vcpu->arch.exception.injected || vcpu->arch.interrupt.pending ||
 		vcpu->arch.nmi_injected;
 }
 
@@ -98,6 +99,15 @@ static inline bool is_64_bit_mode(struct kvm_vcpu *vcpu)
 	return cs_l;
 }
 
+static inline bool x86_exception_has_error_code(unsigned int vector)
+{
+	static u32 exception_has_error_code = BIT(DF_VECTOR) | BIT(TS_VECTOR) |
+			BIT(NP_VECTOR) | BIT(SS_VECTOR) | BIT(GP_VECTOR) |
+			BIT(PF_VECTOR) | BIT(AC_VECTOR);
+
+	return (1U << vector) & exception_has_error_code;
+}
+
 static inline bool mmu_is_nested(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.walk_mmu == &vcpu->arch.nested_mmu;
@@ -126,7 +136,11 @@ static inline u32 bit(int bitno)
 static inline void vcpu_cache_mmio_info(struct kvm_vcpu *vcpu,
 					gva_t gva, gfn_t gfn, unsigned access)
 {
-	vcpu->arch.mmio_gva = gva & PAGE_MASK;
+	/*
+	 * If this is a shadow nested page table, the "GVA" is
+	 * actually a nGPA.
+	 */
+	vcpu->arch.mmio_gva = mmu_is_nested(vcpu) ? 0 : gva & PAGE_MASK;
 	vcpu->arch.access = access;
 	vcpu->arch.mmio_gfn = gfn;
 	vcpu->arch.mmio_gen = kvm_memslots(vcpu->kvm)->generation;
@@ -198,11 +212,11 @@ int kvm_inject_realmode_interrupt(struct kvm_vcpu *vcpu, int irq, int inc_eip);
 void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr);
 u64 get_kvmclock_ns(struct kvm *kvm);
 
-int kvm_read_guest_virt(struct x86_emulate_ctxt *ctxt,
+int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
 	gva_t addr, void *val, unsigned int bytes,
 	struct x86_exception *exception);
 
-int kvm_write_guest_virt_system(struct x86_emulate_ctxt *ctxt,
+int kvm_write_guest_virt_system(struct kvm_vcpu *vcpu,
 	gva_t addr, void *val, unsigned int bytes,
 	struct x86_exception *exception);
 

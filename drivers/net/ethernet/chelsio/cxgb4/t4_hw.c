@@ -2883,6 +2883,57 @@ int t4_get_vpd_params(struct adapter *adapter, struct vpd_params *p)
 	return 0;
 }
 
+/**
+ *	t4_get_pfres - retrieve VF resource limits
+ *	@adapter: the adapter
+ *
+ *	Retrieves configured resource limits and capabilities for a physical
+ *	function.  The results are stored in @adapter->pfres.
+ */
+int t4_get_pfres(struct adapter *adapter)
+{
+	struct pf_resources *pfres = &adapter->params.pfres;
+	struct fw_pfvf_cmd cmd, rpl;
+	int v;
+	u32 word;
+
+	/* Execute PFVF Read command to get VF resource limits; bail out early
+	 * with error on command failure.
+	 */
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.op_to_vfn = cpu_to_be32(FW_CMD_OP_V(FW_PFVF_CMD) |
+				    FW_CMD_REQUEST_F |
+				    FW_CMD_READ_F |
+				    FW_PFVF_CMD_PFN_V(adapter->pf) |
+				    FW_PFVF_CMD_VFN_V(0));
+	cmd.retval_len16 = cpu_to_be32(FW_LEN16(cmd));
+	v = t4_wr_mbox(adapter, adapter->mbox, &cmd, sizeof(cmd), &rpl);
+	if (v != FW_SUCCESS)
+		return v;
+
+	/* Extract PF resource limits and return success.
+	 */
+	word = be32_to_cpu(rpl.niqflint_niq);
+	pfres->niqflint = FW_PFVF_CMD_NIQFLINT_G(word);
+	pfres->niq = FW_PFVF_CMD_NIQ_G(word);
+
+	word = be32_to_cpu(rpl.type_to_neq);
+	pfres->neq = FW_PFVF_CMD_NEQ_G(word);
+	pfres->pmask = FW_PFVF_CMD_PMASK_G(word);
+
+	word = be32_to_cpu(rpl.tc_to_nexactf);
+	pfres->tc = FW_PFVF_CMD_TC_G(word);
+	pfres->nvi = FW_PFVF_CMD_NVI_G(word);
+	pfres->nexactf = FW_PFVF_CMD_NEXACTF_G(word);
+
+	word = be32_to_cpu(rpl.r_caps_to_nethctrl);
+	pfres->r_caps = FW_PFVF_CMD_R_CAPS_G(word);
+	pfres->wx_caps = FW_PFVF_CMD_WX_CAPS_G(word);
+	pfres->nethctrl = FW_PFVF_CMD_NETHCTRL_G(word);
+
+	return 0;
+}
+
 /* serial flash and firmware constants */
 enum {
 	SF_ATTEMPTS = 10,             /* max retries for SF operations */
@@ -3744,7 +3795,7 @@ int t4_load_phy_fw(struct adapter *adap,
 	/* If we have version number support, then check to see if the adapter
 	 * already has up-to-date PHY firmware loaded.
 	 */
-	 if (phy_fw_version) {
+	if (phy_fw_version) {
 		new_phy_fw_vers = phy_fw_version(phy_fw_data, phy_fw_size);
 		ret = t4_phy_fw_ver(adap, &cur_phy_fw_ver);
 		if (ret < 0)
@@ -7451,7 +7502,7 @@ int t4_cfg_pfvf(struct adapter *adap, unsigned int mbox, unsigned int pf,
  */
 int t4_alloc_vi(struct adapter *adap, unsigned int mbox, unsigned int port,
 		unsigned int pf, unsigned int vf, unsigned int nmac, u8 *mac,
-		unsigned int *rss_size)
+		unsigned int *rss_size, u8 *vivld, u8 *vin)
 {
 	int ret;
 	struct fw_vi_cmd c;
@@ -7486,6 +7537,13 @@ int t4_alloc_vi(struct adapter *adap, unsigned int mbox, unsigned int port,
 	}
 	if (rss_size)
 		*rss_size = FW_VI_CMD_RSSSIZE_G(be16_to_cpu(c.rsssize_pkd));
+
+	if (vivld)
+		*vivld = FW_VI_CMD_VFVLD_G(be32_to_cpu(c.alloc_to_len16));
+
+	if (vin)
+		*vin = FW_VI_CMD_VIN_G(be32_to_cpu(c.alloc_to_len16));
+
 	return FW_VI_CMD_VIID_G(be16_to_cpu(c.type_viid));
 }
 
@@ -7943,7 +8001,7 @@ int t4_free_mac_filt(struct adapter *adap, unsigned int mbox,
  *	MAC value.
  */
 int t4_change_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
-		  int idx, const u8 *addr, bool persist, bool add_smt)
+		  int idx, const u8 *addr, bool persist, u8 *smt_idx)
 {
 	int ret, mode;
 	struct fw_vi_mac_cmd c;
@@ -7952,7 +8010,7 @@ int t4_change_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
 
 	if (idx < 0)                             /* new allocation */
 		idx = persist ? FW_VI_MAC_ADD_PERSIST_MAC : FW_VI_MAC_ADD_MAC;
-	mode = add_smt ? FW_VI_MAC_SMT_AND_MPSTCAM : FW_VI_MAC_MPS_TCAM_ENTRY;
+	mode = smt_idx ? FW_VI_MAC_SMT_AND_MPSTCAM : FW_VI_MAC_MPS_TCAM_ENTRY;
 
 	memset(&c, 0, sizeof(c));
 	c.op_to_viid = cpu_to_be32(FW_CMD_OP_V(FW_VI_MAC_CMD) |
@@ -7969,6 +8027,23 @@ int t4_change_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
 		ret = FW_VI_MAC_CMD_IDX_G(be16_to_cpu(p->valid_to_idx));
 		if (ret >= max_mac_addr)
 			ret = -ENOMEM;
+		if (smt_idx) {
+			if (adap->params.viid_smt_extn_support) {
+				*smt_idx = FW_VI_MAC_CMD_SMTID_G
+						    (be32_to_cpu(c.op_to_viid));
+			} else {
+				/* In T4/T5, SMT contains 256 SMAC entries
+				 * organized in 128 rows of 2 entries each.
+				 * In T6, SMT contains 256 SMAC entries in
+				 * 256 rows.
+				 */
+				if (CHELSIO_CHIP_VERSION(adap->params.chip) <=
+								     CHELSIO_T5)
+					*smt_idx = (viid & FW_VIID_VIN_M) << 1;
+				else
+					*smt_idx = (viid & FW_VIID_VIN_M);
+			}
+		}
 	}
 	return ret;
 }
@@ -9357,6 +9432,7 @@ int t4_init_portinfo(struct port_info *pi, int mbox,
 	enum fw_port_type port_type;
 	int mdio_addr;
 	fw_port_cap32_t pcaps, acaps;
+	u8 vivld = 0, vin = 0;
 	int ret;
 
 	/* If we haven't yet determined whether we're talking to Firmware
@@ -9411,7 +9487,8 @@ int t4_init_portinfo(struct port_info *pi, int mbox,
 		acaps = be32_to_cpu(cmd.u.info32.acaps32);
 	}
 
-	ret = t4_alloc_vi(pi->adapter, mbox, port, pf, vf, 1, mac, &rss_size);
+	ret = t4_alloc_vi(pi->adapter, mbox, port, pf, vf, 1, mac, &rss_size,
+			  &vivld, &vin);
 	if (ret < 0)
 		return ret;
 
@@ -9419,6 +9496,18 @@ int t4_init_portinfo(struct port_info *pi, int mbox,
 	pi->tx_chan = port;
 	pi->lport = port;
 	pi->rss_size = rss_size;
+
+	/* If fw supports returning the VIN as part of FW_VI_CMD,
+	 * save the returned values.
+	 */
+	if (adapter->params.viid_smt_extn_support) {
+		pi->vivld = vivld;
+		pi->vin = vin;
+	} else {
+		/* Retrieve the values from VIID */
+		pi->vivld = FW_VIID_VIVLD_G(pi->viid);
+		pi->vin =  FW_VIID_VIN_G(pi->viid);
+	}
 
 	pi->port_type = port_type;
 	pi->mdio_addr = mdio_addr;

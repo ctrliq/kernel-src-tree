@@ -780,6 +780,23 @@ static void dump_orphan_list(struct super_block *sb, struct ext4_sb_info *sbi)
 	}
 }
 
+#ifdef CONFIG_QUOTA
+static int ext4_quota_off(struct super_block *sb, int type);
+
+static inline void ext4_quota_off_umount(struct super_block *sb)
+{
+	int type;
+
+	/* Use our quota_off function to clear inode flags etc. */
+	for (type = 0; type < MAXQUOTAS; type++)
+		ext4_quota_off(sb, type);
+}
+#else
+static inline void ext4_quota_off_umount(struct super_block *sb)
+{
+}
+#endif
+
 static void ext4_put_super(struct super_block *sb)
 {
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
@@ -788,7 +805,7 @@ static void ext4_put_super(struct super_block *sb)
 	int i, err;
 
 	ext4_unregister_li_request(sb);
-	dquot_disable(sb, -1, DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED);
+	ext4_quota_off_umount(sb);
 
 	flush_workqueue(sbi->rsv_conversion_wq);
 	destroy_workqueue(sbi->rsv_conversion_wq);
@@ -1067,7 +1084,6 @@ static int ext4_quota_on(struct super_block *sb, int type, int format_id,
 			 struct path *path);
 static int ext4_quota_on_sysfile(struct super_block *sb, int type,
 				 int format_id);
-static int ext4_quota_off(struct super_block *sb, int type);
 static int ext4_quota_off_sysfile(struct super_block *sb, int type);
 static int ext4_quota_on_mount(struct super_block *sb, int type);
 static ssize_t ext4_quota_read(struct super_block *sb, int type, char *data,
@@ -2244,6 +2260,7 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 	unsigned int s_flags = sb->s_flags;
 	int nr_orphans = 0, nr_truncates = 0;
 #ifdef CONFIG_QUOTA
+	int quota_update = 0;
 	int i;
 #endif
 	if (!es->s_last_orphan) {
@@ -2282,14 +2299,34 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 #ifdef CONFIG_QUOTA
 	/* Needed for iput() to work correctly and not trash data */
 	sb->s_flags |= MS_ACTIVE;
-	/* Turn on quotas so that they are updated correctly */
+
+	/*
+	 * Turn on quotas which were not enabled for read-only mounts if
+	 * filesystem has quota feature, so that they are updated correctly.
+	 */
+	if (EXT4_HAS_RO_COMPAT_FEATURE(sb, EXT4_FEATURE_RO_COMPAT_QUOTA) &&
+	    (s_flags & MS_RDONLY))
+	{
+		int ret = ext4_enable_quotas(sb);
+
+		if (!ret)
+			quota_update = 1;
+		else
+			ext4_msg(sb, KERN_ERR,
+				"Cannot turn on quotas: error %d", ret);
+	}
+
+	/* Turn on journaled quotas used for old sytle */
 	for (i = 0; i < MAXQUOTAS; i++) {
 		if (EXT4_SB(sb)->s_qf_names[i]) {
 			int ret = ext4_quota_on_mount(sb, i);
-			if (ret < 0)
+
+			if (!ret)
+				quota_update = 1;
+			else
 				ext4_msg(sb, KERN_ERR,
 					"Cannot turn on journaled "
-					"quota: error %d", ret);
+					"quota: type %d: error %d", i, ret);
 		}
 	}
 #endif
@@ -2348,10 +2385,12 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 		ext4_msg(sb, KERN_INFO, "%d truncate%s cleaned up",
 		       PLURAL(nr_truncates));
 #ifdef CONFIG_QUOTA
-	/* Turn quotas off */
-	for (i = 0; i < MAXQUOTAS; i++) {
-		if (sb_dqopt(sb)->files[i])
-			dquot_quota_off(sb, i);
+	/* Turn off quotas if they were enabled for orphan cleanup */
+	if (quota_update) {
+		for (i = 0; i < MAXQUOTAS; i++) {
+			if (sb_dqopt(sb)->files[i])
+				dquot_quota_off(sb, i);
+		}
 	}
 #endif
 	sb->s_flags = s_flags; /* Restore MS_RDONLY status */
@@ -4785,8 +4824,9 @@ static int ext4_commit_super(struct super_block *sb, int sync)
 				&EXT4_SB(sb)->s_freeinodes_counter));
 	BUFFER_TRACE(sbh, "marking dirty");
 	ext4_superblock_csum_set(sb);
-	lock_buffer(sbh);
-	if (buffer_write_io_error(sbh)) {
+	if (sync)
+		lock_buffer(sbh);
+	if (buffer_write_io_error(sbh) || !buffer_uptodate(sbh)) {
 		/*
 		 * Oh, dear.  A previous attempt to write the
 		 * superblock failed.  This could happen because the
@@ -4801,8 +4841,8 @@ static int ext4_commit_super(struct super_block *sb, int sync)
 		set_buffer_uptodate(sbh);
 	}
 	mark_buffer_dirty(sbh);
-	unlock_buffer(sbh);
 	if (sync) {
+		unlock_buffer(sbh);
 		error = sync_dirty_buffer(sbh);
 		if (error)
 			return error;
@@ -5457,11 +5497,28 @@ static int ext4_quota_on(struct super_block *sb, int type, int format_id,
 		if (err)
 			return err;
 	}
+
 	lockdep_set_quota_inode(path->dentry->d_inode, I_DATA_SEM_QUOTA);
 	err = dquot_quota_on(sb, type, format_id, path);
-	if (err)
+	if (err) {
 		lockdep_set_quota_inode(path->dentry->d_inode,
 					     I_DATA_SEM_NORMAL);
+	} else {
+		struct inode *inode = d_inode(path->dentry);
+		handle_t *handle;
+
+		inode_lock(inode);
+		handle = ext4_journal_start(inode, EXT4_HT_QUOTA, 1);
+		if (IS_ERR(handle))
+			goto unlock_inode;
+		EXT4_I(inode)->i_flags |= EXT4_NOATIME_FL | EXT4_IMMUTABLE_FL;
+		inode_set_flags(inode, S_NOATIME | S_IMMUTABLE,
+				S_NOATIME | S_IMMUTABLE);
+		ext4_mark_inode_dirty(handle, inode);
+		ext4_journal_stop(handle);
+	unlock_inode:
+		inode_unlock(inode);
+	}
 	return err;
 }
 
@@ -5512,6 +5569,9 @@ static int ext4_enable_quotas(struct super_block *sb)
 			err = ext4_quota_enable(sb, type, QFMT_VFS_V1,
 						DQUOT_USAGE_ENABLED);
 			if (err) {
+				for (type--; type >= 0; type--)
+					dquot_quota_off(sb, type);
+
 				ext4_warning(sb,
 					"Failed to enable quota tracking "
 					"(type=%d, err=%d). Please run "
@@ -5542,24 +5602,37 @@ static int ext4_quota_off(struct super_block *sb, int type)
 {
 	struct inode *inode = sb_dqopt(sb)->files[type];
 	handle_t *handle;
+	int err;
 
 	/* Force all delayed allocation blocks to be allocated.
 	 * Caller already holds s_umount sem */
 	if (test_opt(sb, DELALLOC))
 		sync_filesystem(sb);
 
-	if (!inode)
+	if (!inode || !igrab(inode))
 		goto out;
 
+	err = dquot_quota_off(sb, type);
+	if (err || EXT4_HAS_RO_COMPAT_FEATURE(sb, EXT4_FEATURE_RO_COMPAT_QUOTA))
+		goto out_put;
+
+	inode_lock(inode);
 	/* Update modification times of quota files when userspace can
 	 * start looking at them */
 	handle = ext4_journal_start(inode, EXT4_HT_QUOTA, 1);
 	if (IS_ERR(handle))
-		goto out;
+		goto out_unlock;
+	EXT4_I(inode)->i_flags &= ~(EXT4_NOATIME_FL | EXT4_IMMUTABLE_FL);
+	inode_set_flags(inode, 0, S_NOATIME | S_IMMUTABLE);
 	inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 	ext4_mark_inode_dirty(handle, inode);
 	ext4_journal_stop(handle);
-
+out_unlock:
+	inode_unlock(inode);
+out_put:
+	lockdep_set_quota_inode(inode, I_DATA_SEM_NORMAL);
+	iput(inode);
+	return err;
 out:
 	return dquot_quota_off(sb, type);
 }

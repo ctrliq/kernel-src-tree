@@ -926,6 +926,9 @@ int get_cpu_cache_id(int cpu, int level)
 {
 	int i;
 
+	if (!per_cpu(ici_cpuid4_info, cpu))
+		return -1;
+
 	for (i = 0; i < num_cache_leaves; i++) {
 		struct _cpuid4_info *this_leaf = CPUID4_INFO_IDX(cpu, i);
 

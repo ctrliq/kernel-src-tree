@@ -28,6 +28,7 @@
 #include <linux/ioctl.h>
 #include <linux/security.h>
 #include <linux/hugetlb.h>
+#include <linux/sched/mm.h>
 
 static struct kmem_cache *userfaultfd_ctx_cachep __read_mostly;
 
@@ -223,24 +224,26 @@ static inline bool userfaultfd_huge_must_wait(struct userfaultfd_ctx *ctx,
 					 unsigned long reason)
 {
 	struct mm_struct *mm = ctx->mm;
-	pte_t *pte;
+	pte_t *ptep, pte;
 	bool ret = true;
 
 	VM_BUG_ON(!rwsem_is_locked(&mm->mmap_sem));
 
-	pte = huge_pte_offset(mm, address);
-	if (!pte)
+	ptep = huge_pte_offset(mm, address);
+
+	if (!ptep)
 		goto out;
 
 	ret = false;
+	pte = huge_ptep_get(ptep);
 
 	/*
 	 * Lockless access: we're in a wait_event so it's ok if it
 	 * changes under us.
 	 */
-	if (huge_pte_none(*pte))
+	if (huge_pte_none(pte))
 		ret = true;
-	if (!huge_pte_write(*pte) && (reason & VM_UFFD_WP))
+	if (!huge_pte_write(pte) && (reason & VM_UFFD_WP))
 		ret = true;
 out:
 	return ret;
@@ -627,6 +630,8 @@ static void userfaultfd_event_wait_completion(struct userfaultfd_ctx *ctx,
 
 		/* the various vma->vm_userfaultfd_ctx still points to it */
 		down_write(&mm->mmap_sem);
+		/* no task can run (and in turn coredump) yet */
+		VM_WARN_ON(!mmget_still_valid(mm));
 		for (vma = mm->mmap; vma; vma = vma->vm_next)
 			if (vma->vm_userfaultfd_ctx.ctx == release_new_ctx) {
 				vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
@@ -881,6 +886,8 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
 	 * taking the mmap_sem for writing.
 	 */
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto skip_mm;
 	prev = NULL;
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		cond_resched();
@@ -903,6 +910,7 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
 		vma->vm_flags = new_flags;
 		vma->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
 	}
+skip_mm:
 	up_write(&mm->mmap_sem);
 	mmput(mm);
 wakeup:
@@ -1031,7 +1039,7 @@ static ssize_t userfaultfd_ctx_read(struct userfaultfd_ctx *ctx, int no_wait,
 	struct userfaultfd_ctx *fork_nctx = NULL;
 
 	/* always take the fd_wqh lock before the fault_pending_wqh lock */
-	spin_lock(&ctx->fd_wqh.lock);
+	spin_lock_irq(&ctx->fd_wqh.lock);
 	__add_wait_queue_exclusive(&ctx->fd_wqh, &wait);
 	for (;;) {
 		set_current_state(TASK_INTERRUPTIBLE);
@@ -1117,13 +1125,13 @@ static ssize_t userfaultfd_ctx_read(struct userfaultfd_ctx *ctx, int no_wait,
 			ret = -EAGAIN;
 			break;
 		}
-		spin_unlock(&ctx->fd_wqh.lock);
+		spin_unlock_irq(&ctx->fd_wqh.lock);
 		schedule();
-		spin_lock(&ctx->fd_wqh.lock);
+		spin_lock_irq(&ctx->fd_wqh.lock);
 	}
 	__remove_wait_queue(&ctx->fd_wqh, &wait);
 	__set_current_state(TASK_RUNNING);
-	spin_unlock(&ctx->fd_wqh.lock);
+	spin_unlock_irq(&ctx->fd_wqh.lock);
 
 	if (!ret && msg->event == UFFD_EVENT_FORK) {
 		ret = resolve_userfault_fork(ctx, fork_nctx, msg);
@@ -1331,6 +1339,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		goto out;
 
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto out_unlock;
 	vma = find_vma_prev(mm, start, &prev);
 	if (!vma)
 		goto out_unlock;
@@ -1518,6 +1528,8 @@ static int userfaultfd_unregister(struct userfaultfd_ctx *ctx,
 		goto out;
 
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto out_unlock;
 	vma = find_vma_prev(mm, start, &prev);
 	if (!vma)
 		goto out_unlock;
@@ -1868,17 +1880,14 @@ static int userfaultfd_show_fdinfo(struct seq_file *m, struct file *f)
 {
 	struct userfaultfd_ctx *ctx = f->private_data;
 	wait_queue_t *wq;
-	struct userfaultfd_wait_queue *uwq;
 	unsigned long pending = 0, total = 0;
 
 	spin_lock(&ctx->fault_pending_wqh.lock);
 	list_for_each_entry(wq, &ctx->fault_pending_wqh.task_list, task_list) {
-		uwq = container_of(wq, struct userfaultfd_wait_queue, wq);
 		pending++;
 		total++;
 	}
 	list_for_each_entry(wq, &ctx->fault_wqh.task_list, task_list) {
-		uwq = container_of(wq, struct userfaultfd_wait_queue, wq);
 		total++;
 	}
 	spin_unlock(&ctx->fault_pending_wqh.lock);

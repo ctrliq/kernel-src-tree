@@ -983,6 +983,21 @@ static void tun_set_headroom(struct net_device *dev, int new_hr)
 	tun->align = new_hr;
 }
 
+static int tun_net_change_carrier(struct net_device *dev, bool new_carrier)
+{
+	if (new_carrier) {
+		struct tun_struct *tun = netdev_priv(dev);
+
+		if (!tun->numqueues)
+			return -EPERM;
+
+		netif_carrier_on(dev);
+	} else {
+		netif_carrier_off(dev);
+	}
+	return 0;
+}
+
 static const struct net_device_ops tun_netdev_ops = {
 	.ndo_uninit		= tun_net_uninit,
 	.ndo_open		= tun_net_open,
@@ -997,6 +1012,7 @@ static const struct net_device_ops tun_netdev_ops = {
 	.ndo_size		= sizeof(struct net_device_ops),
 	.extended.ndo_set_rx_headroom	= tun_set_headroom,
 	.ndo_get_stats64	= tun_net_get_stats64,
+	.ndo_change_carrier	= tun_net_change_carrier,
 };
 
 static const struct net_device_ops tap_netdev_ops = {
@@ -1016,6 +1032,7 @@ static const struct net_device_ops tap_netdev_ops = {
 	.ndo_size		= sizeof(struct net_device_ops),
 	.extended.ndo_set_rx_headroom	= tun_set_headroom,
 	.ndo_get_stats64	= tun_net_get_stats64,
+	.ndo_change_carrier	= tun_net_change_carrier,
 };
 
 static void tun_flow_init(struct tun_struct *tun)
@@ -1241,6 +1258,7 @@ static void tun_rx_batched(struct tun_struct *tun, struct tun_file *tfile,
 
 	if (!rx_batched || (!more && skb_queue_empty(queue))) {
 		local_bh_disable();
+		skb_record_rx_queue(skb, tfile->queue_index);
 		netif_receive_skb(skb);
 		local_bh_enable();
 		return;
@@ -1260,8 +1278,11 @@ static void tun_rx_batched(struct tun_struct *tun, struct tun_file *tfile,
 		struct sk_buff *nskb;
 
 		local_bh_disable();
-		while ((nskb = __skb_dequeue(&process_queue)))
+		while ((nskb = __skb_dequeue(&process_queue))) {
+			skb_record_rx_queue(nskb, tfile->queue_index);
 			netif_receive_skb(nskb);
+		}
+		skb_record_rx_queue(skb, tfile->queue_index);
 		netif_receive_skb(skb);
 		local_bh_enable();
 	}
@@ -1651,21 +1672,25 @@ out:
 
 static ssize_t tun_do_read(struct tun_struct *tun, struct tun_file *tfile,
 			   struct kiocb *iocb, const struct iovec *iv,
-			   ssize_t len, int noblock)
+			   ssize_t len, int noblock, struct sk_buff *skb)
 {
-	struct sk_buff *skb;
 	ssize_t ret;
 	int err;
 
 	tun_debug(KERN_INFO, tun, "tun_do_read\n");
 
-	if (!len)
+	if (!len) {
+		if (skb)
+			kfree_skb(skb);
 		return 0;
+	}
 
-	/* Read frames from ring */
-	skb = tun_ring_recv(tun, tfile, noblock, &err);
-	if (!skb)
-		return err;
+	if (!skb) {
+		/* Read frames from ring */
+		skb = tun_ring_recv(tun, tfile, noblock, &err);
+		if (!skb)
+			return err;
+	}
 
 	ret = tun_put_user(tun, tfile, skb, iv, len);
 	if (unlikely(ret < 0))
@@ -1693,7 +1718,7 @@ static ssize_t tun_chr_aio_read(struct kiocb *iocb, const struct iovec *iv,
 	}
 
 	ret = tun_do_read(tun, tfile, iocb, iv, len,
-			  file->f_flags & O_NONBLOCK);
+			  file->f_flags & O_NONBLOCK, NULL);
 	ret = min_t(ssize_t, ret, len);
 out:
 	tun_put(tun);
@@ -1838,23 +1863,33 @@ static int tun_recvmsg(struct kiocb *iocb, struct socket *sock,
 {
 	struct tun_file *tfile = container_of(sock, struct tun_file, socket);
 	struct tun_struct *tun = __tun_get(tfile);
+	struct sk_buff *skb = m->msg_control;
 	int ret;
 
-	if (!tun)
-		return -EBADFD;
+	if (!tun) {
+		ret = -EBADFD;
+		goto out_free_skb;
+	}
 
 	if (flags & ~(MSG_DONTWAIT|MSG_TRUNC)) {
 		ret = -EINVAL;
-		goto out;
+		goto out_put_tun;
 	}
 	ret = tun_do_read(tun, tfile, iocb, m->msg_iov, total_len,
-			  flags & MSG_DONTWAIT);
+			  flags & MSG_DONTWAIT, skb);
 	if (ret > total_len) {
 		m->msg_flags |= MSG_TRUNC;
 		ret = flags & MSG_TRUNC ? ret : total_len;
 	}
-out:
+
 	tun_put(tun);
+	return ret;
+
+out_put_tun:
+	tun_put(tun);
+out_free_skb:
+	if (skb)
+		kfree_skb(skb);
 	return ret;
 }
 
@@ -2229,12 +2264,12 @@ static long __tun_chr_ioctl(struct file *file, unsigned int cmd,
 	struct tun_file *tfile = file->private_data;
 	struct tun_struct *tun;
 	void __user* argp = (void __user*)arg;
+	unsigned int ifindex, carrier;
 	struct ifreq ifr;
 	kuid_t owner;
 	kgid_t group;
 	int sndbuf;
 	int vnet_hdr_sz;
-	unsigned int ifindex;
 	int le;
 	int ret;
 	bool do_notify = false;
@@ -2494,6 +2529,14 @@ static long __tun_chr_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user(argp, &tun->fprog, sizeof(tun->fprog)))
 			break;
 		ret = 0;
+		break;
+
+	case TUNSETCARRIER:
+		ret = -EFAULT;
+		if (copy_from_user(&carrier, argp, sizeof(carrier)))
+			goto unlock;
+
+		ret = tun_net_change_carrier(tun->dev, (bool)carrier);
 		break;
 
 	default:

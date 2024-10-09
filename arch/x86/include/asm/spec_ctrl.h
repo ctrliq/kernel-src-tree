@@ -190,6 +190,7 @@ extern void spec_ctrl_init(void);
 extern void spec_ctrl_cpu_init(void);
 extern void ssb_select_mitigation(void);
 extern void ssb_print_mitigation(void);
+extern void mds_print_mitigation(void);
 
 bool spec_ctrl_force_enable_ibrs(void);
 bool spec_ctrl_cond_enable_ibrs(bool full_retpoline);
@@ -256,12 +257,8 @@ extern void speculative_store_bypass_ht_init(void);
 static inline void speculative_store_bypass_ht_init(void) { }
 #endif
 
-extern void speculative_store_bypass_update(unsigned long tif);
-
-static inline void speculative_store_bypass_update_current(void)
-{
-	speculative_store_bypass_update(current_thread_info()->flags);
-}
+extern void speculation_ctrl_update(unsigned long tif);
+extern void speculation_ctrl_update_current(void);
 
 enum {
 	IBRS_DISABLED,
@@ -309,8 +306,7 @@ static inline bool retp_enabled_full(void)
 
 static inline bool ibpb_enabled(void)
 {
-	return (boot_cpu_has(X86_FEATURE_IBPB) &&
-		(ibrs_enabled_kernel() || retp_enabled()));
+	return static_cpu_has(X86_FEATURE_USE_IBPB);
 }
 
 /*
@@ -386,7 +382,7 @@ x86_virt_spec_ctrl(u64 guest_spec_ctrl, u64 guest_virt_spec_ctrl, bool setguest)
 		tif = setguest ? ssbd_spec_ctrl_to_tif(guestval) :
 				 ssbd_spec_ctrl_to_tif(hostval);
 
-		speculative_store_bypass_update(tif);
+		speculation_ctrl_update(tif);
 	}
 
 ret:

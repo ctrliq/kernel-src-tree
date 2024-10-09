@@ -533,7 +533,7 @@ static int start_power_clamp(void)
 		thread = kthread_create_on_node(clamp_thread,
 						(void *) cpu,
 						cpu_to_node(cpu),
-						"kidle_inject/%ld", cpu);
+						"kidle_inj/%ld", cpu);
 		/* bind to cpu here */
 		if (likely(!IS_ERR(thread))) {
 			kthread_bind(thread, cpu);
@@ -584,7 +584,7 @@ static int powerclamp_cpu_callback(struct notifier_block *nfb,
 		thread = kthread_create_on_node(clamp_thread,
 						(void *) cpu,
 						cpu_to_node(cpu),
-						"kidle_inject/%lu", cpu);
+						"kidle_inj/%lu", cpu);
 		if (likely(!IS_ERR(thread))) {
 			kthread_bind(thread, cpu);
 			wake_up_process(thread);

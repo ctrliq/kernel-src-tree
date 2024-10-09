@@ -143,14 +143,18 @@ int call_lsm_notifier(enum lsm_event event, void *data)
 }
 EXPORT_SYMBOL(call_lsm_notifier);
 
+extern int selinux_enabled;
+
 int register_lsm_notifier(struct notifier_block *nb)
 {
+	if (!selinux_enabled) return 0;
 	return atomic_notifier_chain_register(&lsm_notifier_chain, nb);
 }
 EXPORT_SYMBOL(register_lsm_notifier);
 
 int unregister_lsm_notifier(struct notifier_block *nb)
 {
+	if (!selinux_enabled) return 0;
 	return atomic_notifier_chain_unregister(&lsm_notifier_chain, nb);
 }
 EXPORT_SYMBOL(unregister_lsm_notifier);

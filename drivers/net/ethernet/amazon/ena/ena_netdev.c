@@ -137,7 +137,7 @@ static int ena_init_rx_cpu_rmap(struct ena_adapter *adapter)
 		int irq_idx = ENA_IO_IRQ_IDX(i);
 
 		rc = irq_cpu_rmap_add(adapter->netdev->rx_cpu_rmap,
-				      adapter->msix_entries[irq_idx].vector);
+				      pci_irq_vector(adapter->pdev, irq_idx));
 		if (rc) {
 			free_irq_cpu_rmap(adapter->netdev->rx_cpu_rmap);
 			adapter->netdev->rx_cpu_rmap = NULL;
@@ -996,8 +996,19 @@ static inline void ena_rx_checksum(struct ena_ring *rx_ring,
 			return;
 		}
 
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
+		if (likely(ena_rx_ctx->l4_csum_checked)) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		} else {
+			u64_stats_update_begin(&rx_ring->syncp);
+			rx_ring->rx_stats.csum_unchecked++;
+			u64_stats_update_end(&rx_ring->syncp);
+			skb->ip_summed = CHECKSUM_NONE;
+		}
+	} else {
+		skb->ip_summed = CHECKSUM_NONE;
+		return;
 	}
+
 }
 
 static void ena_set_rx_hash(struct ena_ring *rx_ring,
@@ -1283,9 +1294,14 @@ static irqreturn_t ena_intr_msix_io(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Reserve a single MSI-X vector for management (admin + aenq).
+ * plus reserve one vector for each potential io queue.
+ * the number of potential io queues is the minimum of what the device
+ * supports and the number of vCPUs.
+ */
 static int ena_enable_msix(struct ena_adapter *adapter, int num_queues)
 {
-	int i, msix_vecs, rc;
+	int msix_vecs, irq_cnt;
 
 	if (test_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags)) {
 		netif_err(adapter, probe, adapter->netdev,
@@ -1298,32 +1314,27 @@ static int ena_enable_msix(struct ena_adapter *adapter, int num_queues)
 	netif_dbg(adapter, probe, adapter->netdev,
 		  "trying to enable MSI-X, vectors %d\n", msix_vecs);
 
-	adapter->msix_entries = vzalloc(msix_vecs * sizeof(struct msix_entry));
+	irq_cnt = pci_alloc_irq_vectors(adapter->pdev, ENA_MIN_MSIX_VEC,
+					msix_vecs, PCI_IRQ_MSIX);
 
-	if (!adapter->msix_entries)
-		return -ENOMEM;
-
-	for (i = 0; i < msix_vecs; i++)
-		adapter->msix_entries[i].entry = i;
-
-	rc = pci_enable_msix(adapter->pdev, adapter->msix_entries, msix_vecs);
-	if (rc != 0) {
+	if (irq_cnt < 0) {
 		netif_err(adapter, probe, adapter->netdev,
-			  "Failed to enable MSI-X, vectors %d rc %d\n",
-			  msix_vecs, rc);
+			  "Failed to enable MSI-X. irq_cnt %d\n", irq_cnt);
 		return -ENOSPC;
 	}
 
-	netif_dbg(adapter, probe, adapter->netdev, "enable MSI-X, vectors %d\n",
-		  msix_vecs);
-
-	if (msix_vecs >= 1) {
-		if (ena_init_rx_cpu_rmap(adapter))
-			netif_warn(adapter, probe, adapter->netdev,
-				   "Failed to map IRQs to CPUs\n");
+	if (irq_cnt != msix_vecs) {
+		netif_notice(adapter, probe, adapter->netdev,
+			     "enable only %d MSI-X (out of %d), reduce the number of queues\n",
+			     irq_cnt, msix_vecs);
+		adapter->num_queues = irq_cnt - ENA_ADMIN_MSIX_VEC;
 	}
 
-	adapter->msix_vecs = msix_vecs;
+	if (ena_init_rx_cpu_rmap(adapter))
+		netif_warn(adapter, probe, adapter->netdev,
+			   "Failed to map IRQs to CPUs\n");
+
+	adapter->msix_vecs = irq_cnt;
 	set_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags);
 
 	return 0;
@@ -1340,7 +1351,7 @@ static void ena_setup_mgmnt_intr(struct ena_adapter *adapter)
 		ena_intr_msix_mgmnt;
 	adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].data = adapter;
 	adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].vector =
-		adapter->msix_entries[ENA_MGMNT_IRQ_IDX].vector;
+		pci_irq_vector(adapter->pdev, ENA_MGMNT_IRQ_IDX);
 	cpu = cpumask_first(cpu_online_mask);
 	adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].cpu = cpu;
 	cpumask_set_cpu(cpu,
@@ -1363,7 +1374,7 @@ static void ena_setup_io_intr(struct ena_adapter *adapter)
 		adapter->irq_tbl[irq_idx].handler = ena_intr_msix_io;
 		adapter->irq_tbl[irq_idx].data = &adapter->ena_napi[i];
 		adapter->irq_tbl[irq_idx].vector =
-			adapter->msix_entries[irq_idx].vector;
+			pci_irq_vector(adapter->pdev, irq_idx);
 		adapter->irq_tbl[irq_idx].cpu = cpu;
 
 		cpumask_set_cpu(cpu,
@@ -1468,11 +1479,7 @@ static void ena_free_io_irq(struct ena_adapter *adapter)
 static void ena_disable_msix(struct ena_adapter *adapter)
 {
 	if (test_and_clear_bit(ENA_FLAG_MSIX_ENABLED, &adapter->flags))
-		pci_disable_msix(adapter->pdev);
-
-	if (adapter->msix_entries)
-		vfree(adapter->msix_entries);
-	adapter->msix_entries = NULL;
+		pci_free_irq_vectors(adapter->pdev);
 }
 
 static void ena_disable_io_intr_sync(struct ena_adapter *adapter)
@@ -1831,6 +1838,8 @@ static void ena_down(struct ena_adapter *adapter)
 		rc = ena_com_dev_reset(adapter->ena_dev, adapter->reset_reason);
 		if (rc)
 			dev_err(&adapter->pdev->dev, "Device reset failed\n");
+		/* stop submitting admin commands on a device that was reset */
+		ena_com_set_admin_running_state(adapter->ena_dev, false);
 	}
 
 	ena_destroy_all_io_queues(adapter);
@@ -1896,6 +1905,9 @@ static int ena_close(struct net_device *netdev)
 	struct ena_adapter *adapter = netdev_priv(netdev);
 
 	netif_dbg(adapter, ifdown, netdev, "%s\n", __func__);
+
+	if (!test_bit(ENA_FLAG_DEVICE_RUNNING, &adapter->flags))
+		return 0;
 
 	if (test_bit(ENA_FLAG_DEV_UP, &adapter->flags))
 		ena_down(adapter);
@@ -2235,25 +2247,6 @@ error_drop_packet:
 	return NETDEV_TX_OK;
 }
 
-#ifdef CONFIG_NET_POLL_CONTROLLER
-static void ena_netpoll(struct net_device *netdev)
-{
-	struct ena_adapter *adapter = netdev_priv(netdev);
-	int i;
-
-	/* Dont schedule NAPI if the driver is in the middle of reset
-	 * or netdev is down.
-	 */
-
-	if (!test_bit(ENA_FLAG_DEV_UP, &adapter->flags) ||
-	    test_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags))
-		return;
-
-	for (i = 0; i < adapter->num_queues; i++)
-		napi_schedule(&adapter->ena_napi[i].napi);
-}
-#endif /* CONFIG_NET_POLL_CONTROLLER */
-
 static u16 ena_select_queue(struct net_device *dev, struct sk_buff *skb,
 			    void *accel_priv, select_queue_fallback_t fallback)
 {
@@ -2423,9 +2416,6 @@ static const struct net_device_ops ena_netdev_ops = {
 	.extended.ndo_change_mtu		= ena_change_mtu,
 	.ndo_set_mac_address	= NULL,
 	.ndo_validate_addr	= eth_validate_addr,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= ena_netpoll,
-#endif /* CONFIG_NET_POLL_CONTROLLER */
 };
 
 static int ena_device_validate_params(struct ena_adapter *adapter,
@@ -2611,17 +2601,14 @@ static void ena_destroy_device(struct ena_adapter *adapter, bool graceful)
 
 	dev_up = test_bit(ENA_FLAG_DEV_UP, &adapter->flags);
 	adapter->dev_up_before_reset = dev_up;
-
 	if (!graceful)
 		ena_com_set_admin_running_state(ena_dev, false);
 
 	if (test_bit(ENA_FLAG_DEV_UP, &adapter->flags))
 		ena_down(adapter);
 
-	/* Before releasing the ENA resources, a device reset is required.
-	 * (to prevent the device from accessing them).
-	 * In case the reset flag is set and the device is up, ena_down()
-	 * already perform the reset, so it can be skipped.
+	/* Stop the device from sending AENQ events (in case reset flag is set
+	 *  and device is up, ena_down() already reset the device.
 	 */
 	if (!(test_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags) && dev_up))
 		ena_com_dev_reset(adapter->ena_dev, adapter->reset_reason);
@@ -3459,6 +3446,8 @@ err_rss:
 	ena_com_rss_destroy(ena_dev);
 err_free_msix:
 	ena_com_dev_reset(ena_dev, ENA_REGS_RESET_INIT_ERR);
+	/* stop submitting admin commands on a device that was reset */
+	ena_com_set_admin_running_state(ena_dev, false);
 	ena_free_mgmnt_irq(adapter);
 	ena_disable_msix(adapter);
 err_worker_destroy:
@@ -3531,17 +3520,11 @@ static void ena_remove(struct pci_dev *pdev)
 
 	cancel_work_sync(&adapter->reset_task);
 
-	unregister_netdev(netdev);
-
-	/* If the device is running then we want to make sure the device will be
-	 * reset to make sure no more events will be issued by the device.
-	 */
-	if (test_bit(ENA_FLAG_DEVICE_RUNNING, &adapter->flags))
-		set_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags);
-
 	rtnl_lock();
 	ena_destroy_device(adapter, true);
 	rtnl_unlock();
+
+	unregister_netdev(netdev);
 
 	free_netdev(netdev);
 

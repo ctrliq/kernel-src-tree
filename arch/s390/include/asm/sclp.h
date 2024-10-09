@@ -48,6 +48,19 @@ struct sclp_cpu_info {
 	struct sclp_cpu_entry cpu[MAX_CPU_ADDRESS + 1];
 };
 
+struct zpci_report_error_header {
+	u8 version;	/* Interface version byte */
+	u8 action;	/* Action qualifier byte
+			 * 0: Adapter Reset Request
+			 * 1: Deconfigure and repair action requested
+			 *	(OpenCrypto Problem Call Home)
+			 * 2: Informational Report
+			 *	(OpenCrypto Successful Diagnostics Execution)
+			 */
+	u16 length;	/* Length of Subsequent Data (up to 4K – SCLP header */
+	u8 data[0];	/* Subsequent Data passed verbatim to SCLP ET 24 */
+} __packed;
+
 int sclp_get_cpu_info(struct sclp_cpu_info *info);
 int sclp_cpu_configure(u8 cpu);
 int sclp_cpu_deconfigure(u8 cpu);
@@ -67,11 +80,13 @@ bool __init sclp_has_linemode(void);
 bool __init sclp_has_vt220(void);
 int sclp_pci_configure(u32 fid);
 int sclp_pci_deconfigure(u32 fid);
+int sclp_pci_report(struct zpci_report_error_header *report, u32 fh, u32 fid);
 int memcpy_hsa(void *dest, unsigned long src, size_t count, int mode);
 unsigned long sclp_get_hsa_size(void);
 void sclp_early_detect(void);
 int sclp_has_siif(void);
 int sclp_has_sief2(void);
+int sclp_has_diag318(void);
 void sclp_ocf_cpc_name_copy(char *dst);
 
 #endif /* _ASM_S390_SCLP_H */

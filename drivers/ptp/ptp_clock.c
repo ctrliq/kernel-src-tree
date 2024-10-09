@@ -120,7 +120,11 @@ static int ptp_clock_gettime(struct posix_clock *pc, struct timespec *tp)
 	struct timespec64 ts;
 	int err;
 
-	if (ptp->info->gettime64) {
+	if (ptp->info->gettimex64) {
+		err = ptp->info->gettimex64(ptp->info, &ts, NULL);
+		if (!err)
+			*tp = timespec64_to_timespec(ts);
+	} else if (ptp->info->gettime64) {
 		err = ptp->info->gettime64(ptp->info, &ts);
 		if (!err)
 			*tp = timespec64_to_timespec(ts);

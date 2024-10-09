@@ -175,6 +175,7 @@
 #define NearBranch  ((u64)1 << 52)  /* Near branches */
 #define No16	    ((u64)1 << 53)  /* No 16 bit operand */
 #define IncSP       ((u64)1 << 54)  /* SP is incremented before ModRM calc */
+#define TwoMemOp    ((u64)1 << 55)  /* Instruction has two memory operand */
 
 #define DstXacc     (DstAccLo | SrcAccHi | SrcWrite)
 
@@ -829,14 +830,14 @@ static inline int jmp_rel(struct x86_emulate_ctxt *ctxt, int rel)
 static int linear_read_system(struct x86_emulate_ctxt *ctxt, ulong linear,
 			      void *data, unsigned size)
 {
-	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception);
+	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception, true);
 }
 
 static int linear_write_system(struct x86_emulate_ctxt *ctxt,
 			       ulong linear, void *data,
 			       unsigned int size)
 {
-	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception);
+	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception, true);
 }
 
 static int segmented_read_std(struct x86_emulate_ctxt *ctxt,
@@ -850,7 +851,7 @@ static int segmented_read_std(struct x86_emulate_ctxt *ctxt,
 	rc = linearize(ctxt, addr, size, false, &linear);
 	if (rc != X86EMUL_CONTINUE)
 		return rc;
-	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception);
+	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception, false);
 }
 
 static int segmented_write_std(struct x86_emulate_ctxt *ctxt,
@@ -864,7 +865,7 @@ static int segmented_write_std(struct x86_emulate_ctxt *ctxt,
 	rc = linearize(ctxt, addr, size, true, &linear);
 	if (rc != X86EMUL_CONTINUE)
 		return rc;
-	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception);
+	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception, false);
 }
 
 /*
@@ -2945,12 +2946,12 @@ static bool emulator_io_port_access_allowed(struct x86_emulate_ctxt *ctxt,
 #ifdef CONFIG_X86_64
 	base |= ((u64)base3) << 32;
 #endif
-	r = ops->read_std(ctxt, base + 102, &io_bitmap_ptr, 2, NULL);
+	r = ops->read_std(ctxt, base + 102, &io_bitmap_ptr, 2, NULL, true);
 	if (r != X86EMUL_CONTINUE)
 		return false;
 	if (io_bitmap_ptr + port/8 > desc_limit_scaled(&tr_seg))
 		return false;
-	r = ops->read_std(ctxt, base + io_bitmap_ptr + port/8, &perm, 2, NULL);
+	r = ops->read_std(ctxt, base + io_bitmap_ptr + port/8, &perm, 2, NULL, true);
 	if (r != X86EMUL_CONTINUE)
 		return false;
 	if ((perm >> bit_idx) & mask)
@@ -4357,7 +4358,7 @@ static const struct opcode group1[] = {
 };
 
 static const struct opcode group1A[] = {
-	I(DstMem | SrcNone | Mov | Stack | IncSP, em_pop), N, N, N, N, N, N, N,
+	I(DstMem | SrcNone | Mov | Stack | IncSP | TwoMemOp, em_pop), N, N, N, N, N, N, N,
 };
 
 static const struct opcode group2[] = {
@@ -4395,7 +4396,7 @@ static const struct opcode group5[] = {
 	I(SrcMemFAddr | ImplicitOps,		em_call_far),
 	I(SrcMem | NearBranch,			em_jmp_abs),
 	I(SrcMemFAddr | ImplicitOps,		em_jmp_far),
-	I(SrcMem | Stack,			em_push), D(Undefined),
+	I(SrcMem | Stack | TwoMemOp,		em_push), D(Undefined),
 };
 
 static const struct opcode group6[] = {
@@ -4615,8 +4616,8 @@ static const struct opcode opcode_table[256] = {
 	/* 0xA0 - 0xA7 */
 	I2bv(DstAcc | SrcMem | Mov | MemAbs, em_mov),
 	I2bv(DstMem | SrcAcc | Mov | MemAbs | PageTable, em_mov),
-	I2bv(SrcSI | DstDI | Mov | String, em_mov),
-	F2bv(SrcSI | DstDI | String | NoWrite, em_cmp_r),
+	I2bv(SrcSI | DstDI | Mov | String | TwoMemOp, em_mov),
+	F2bv(SrcSI | DstDI | String | NoWrite | TwoMemOp, em_cmp_r),
 	/* 0xA8 - 0xAF */
 	F2bv(DstAcc | SrcImm | NoWrite, em_test),
 	I2bv(SrcAcc | DstDI | Mov | String, em_mov),
@@ -5731,4 +5732,15 @@ void emulator_invalidate_register_cache(struct x86_emulate_ctxt *ctxt)
 void emulator_writeback_register_cache(struct x86_emulate_ctxt *ctxt)
 {
 	writeback_registers(ctxt);
+}
+
+bool emulator_can_use_gpa(struct x86_emulate_ctxt *ctxt)
+{
+	if (ctxt->rep_prefix && (ctxt->d & String))
+		return false;
+
+	if (ctxt->d & TwoMemOp)
+		return false;
+
+	return true;
 }

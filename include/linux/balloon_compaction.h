@@ -169,13 +169,13 @@ static inline gfp_t balloon_mapping_gfp_mask(void)
 static inline void balloon_page_insert(struct balloon_dev_info *balloon,
 				       struct page *page)
 {
-	__SetPageBalloon(page);
+	__SetPageOffline(page);
 	list_add(&page->lru, &balloon->pages);
 }
 
 static inline void balloon_page_delete(struct page *page)
 {
-	__ClearPageBalloon(page);
+	__ClearPageOffline(page);
 	list_del(&page->lru);
 }
 

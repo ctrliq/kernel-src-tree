@@ -30,6 +30,21 @@
 #define NVMET_ASYNC_EVENTS		4
 #define NVMET_ERROR_LOG_SLOTS		128
 
+
+/*
+ * Supported optional AENs:
+ */
+#define NVMET_AEN_CFG_OPTIONAL \
+	NVME_AEN_CFG_NS_ATTR
+
+/*
+ * Plus mandatory SMART AENs (we'll never send them, but allow enabling them):
+ */
+#define NVMET_AEN_CFG_ALL \
+	(NVME_SMART_CRIT_SPARE | NVME_SMART_CRIT_TEMPERATURE | \
+	 NVME_SMART_CRIT_RELIABILITY | NVME_SMART_CRIT_MEDIA | \
+	 NVME_SMART_CRIT_VOLATILE_MEMORY | NVMET_AEN_CFG_OPTIONAL)
+
 /* Helper Macros when NVMe error is NVME_SC_CONNECT_INVALID_PARAM
  * The 16 bit shift is to set IATTR bit to 1, which means offending
  * offset starts in the data section of connect()
@@ -98,6 +113,7 @@ struct nvmet_port {
 	struct list_head		referrals;
 	void				*priv;
 	bool				enabled;
+	int				inline_data_size;
 };
 
 static inline struct nvmet_port *to_nvmet_port(struct config_item *item)
@@ -120,6 +136,10 @@ struct nvmet_ctrl {
 	u16			cntlid;
 	u32			kato;
 
+	struct nvmet_port	*port;
+
+	u32			aen_enabled;
+	unsigned long		aen_masked;
 	struct nvmet_req	*async_event_cmds[NVMET_ASYNC_EVENTS];
 	unsigned int		nr_async_event_cmds;
 	struct list_head	async_events;
@@ -131,6 +151,9 @@ struct nvmet_ctrl {
 	struct work_struct	fatal_err_work;
 
 	const struct nvmet_fabrics_ops *ops;
+
+	__le32			*changed_ns_list;
+	u32			nr_changed_ns;
 
 	char			subsysnqn[NVMF_NQN_FIELD_LEN];
 	char			hostnqn[NVMF_NQN_FIELD_LEN];
@@ -202,7 +225,6 @@ struct nvmet_req;
 struct nvmet_fabrics_ops {
 	struct module *owner;
 	unsigned int type;
-	unsigned int sqe_inline_size;
 	unsigned int msdbd;
 	bool has_keyed_sgls : 1;
 	void (*queue_response)(struct nvmet_req *req);

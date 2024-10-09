@@ -244,10 +244,9 @@ static void perf_top__show_details(struct perf_top *top)
 		goto out_unlock;
 
 	printf("Showing %s for %s\n", perf_evsel__name(top->sym_evsel), symbol->name);
-	printf("  Events  Pcnt (>=%d%%)\n", top->sym_pcnt_filter);
+	printf("  Events  Pcnt (>=%d%%)\n", top->annotation_opts.min_pcnt);
 
-	more = symbol__annotate_printf(symbol, he->ms.map, top->sym_evsel,
-				       0, top->sym_pcnt_filter, top->print_entries, 4);
+	more = symbol__annotate_printf(symbol, he->ms.map, top->sym_evsel, &top->annotation_opts);
 
 	if (top->evlist->enabled) {
 		if (top->zero)
@@ -405,7 +404,7 @@ static void perf_top__print_mapped_keys(struct perf_top *top)
 
 	fprintf(stdout, "\t[f]     profile display filter (count).    \t(%d)\n", top->count_filter);
 
-	fprintf(stdout, "\t[F]     annotate display filter (percent). \t(%d%%)\n", top->sym_pcnt_filter);
+	fprintf(stdout, "\t[F]     annotate display filter (percent). \t(%d%%)\n", top->annotation_opts.min_pcnt);
 	fprintf(stdout, "\t[s]     annotate symbol.                   \t(%s)\n", name?: "NULL");
 	fprintf(stdout, "\t[S]     stop annotation.\n");
 
@@ -508,7 +507,7 @@ static bool perf_top__handle_keypress(struct perf_top *top, int c)
 			prompt_integer(&top->count_filter, "Enter display event count filter");
 			break;
 		case 'F':
-			prompt_percent(&top->sym_pcnt_filter,
+			prompt_percent(&top->annotation_opts.min_pcnt,
 				       "Enter details display event filter (percent)");
 			break;
 		case 'K':
@@ -1202,8 +1201,9 @@ static int __cmd_top(struct perf_top *top)
 	if (top->session == NULL)
 		return -1;
 
-	if (!objdump_path) {
-		ret = perf_env__lookup_objdump(&top->session->header.env);
+	if (!top->annotation_opts.objdump_path) {
+		ret = perf_env__lookup_objdump(&top->session->header.env,
+					       &top->annotation_opts.objdump_path);
 		if (ret)
 			goto out_delete;
 	}
@@ -1402,7 +1402,7 @@ int cmd_top(int argc, const char **argv)
 			.sample_time	= true,
 		},
 		.max_stack	     = sysctl_perf_event_max_stack,
-		.sym_pcnt_filter     = 5,
+		.annotation_opts     = annotation__default_options,
 		.nr_threads_synthesize = UINT_MAX,
 	};
 	struct record_opts *opts = &top.record_opts;
@@ -1490,9 +1490,9 @@ int cmd_top(int argc, const char **argv)
 		    "Display raw encoding of assembly instructions (default)"),
 	OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
 		    "Enable kernel symbol demangling"),
-	OPT_STRING(0, "objdump", &objdump_path, "path",
+	OPT_STRING(0, "objdump", &top.annotation_opts.objdump_path, "path",
 		    "objdump binary to use for disassembly and annotations"),
-	OPT_STRING('M', "disassembler-style", &disassembler_style, "disassembler style",
+	OPT_STRING('M', "disassembler-style", &top.annotation_opts.disassembler_style, "disassembler style",
 		   "Specify disassembler style (e.g. -M intel for intel syntax)"),
 	OPT_STRING('u', "uid", &target->uid_str, "user", "user to profile"),
 	OPT_CALLBACK(0, "percent-limit", &top, "percent",
@@ -1529,6 +1529,9 @@ int cmd_top(int argc, const char **argv)
 
 	if (status < 0)
 		return status;
+
+	top.annotation_opts.min_pcnt = 5;
+	top.annotation_opts.context  = 4;
 
 	top.evlist = perf_evlist__new();
 	if (top.evlist == NULL)

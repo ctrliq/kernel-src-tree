@@ -73,7 +73,7 @@ __kmem_cache_alias(const char *name, size_t size, size_t align,
 #define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER)
 #elif defined(CONFIG_SLUB_DEBUG)
 #define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER | \
-			  SLAB_TRACE | SLAB_DEBUG_FREE)
+			  SLAB_TRACE | SLAB_CONSISTENCY_CHECKS)
 #else
 #define SLAB_DEBUG_FLAGS (0)
 #endif
@@ -136,11 +136,8 @@ static inline void memcg_bind_pages(struct kmem_cache *s, int order)
 
 static inline void memcg_release_pages(struct kmem_cache *s, int order)
 {
-	if (is_root_cache(s))
-		return;
-
-	if (atomic_sub_and_test((1 << order), &s->memcg_params->nr_pages))
-		mem_cgroup_destroy_cache(s);
+	if (!is_root_cache(s))
+		atomic_sub(1 << order, &s->memcg_params->nr_pages);
 }
 
 static inline bool slab_equal_or_root(struct kmem_cache *s,
@@ -162,12 +159,36 @@ static inline const char *cache_name(struct kmem_cache *s)
 	return s->name;
 }
 
+/*
+ * Note, we protect with RCU only the memcg_caches array, not per-memcg caches.
+ * That said the caller must assure the memcg's cache won't go away. Since once
+ * created a memcg's cache is destroyed only along with the root cache, it is
+ * true if we are going to allocate from the cache or hold a reference to the
+ * root cache by other means. Otherwise, we should hold either the slab_mutex
+ * or the memcg's slab_caches_mutex while calling this function and accessing
+ * the returned value.
+ */
 static inline struct kmem_cache *
 cache_from_memcg_idx(struct kmem_cache *s, int idx)
 {
+	struct kmem_cache *cachep;
+	struct memcg_cache_params *params;
+
 	if (!s->memcg_params)
 		return NULL;
-	return s->memcg_params->memcg_caches[idx];
+
+	rcu_read_lock();
+	params = rcu_dereference(s->memcg_params);
+	cachep = params->memcg_caches[idx];
+	rcu_read_unlock();
+
+	/*
+	 * Make sure we will access the up-to-date value. The code updating
+	 * memcg_caches issues a write barrier to match this (see
+	 * memcg_register_cache()).
+	 */
+	smp_read_barrier_depends();
+	return cachep;
 }
 
 static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
@@ -225,7 +246,8 @@ static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
 	 * to not do even the assignment. In that case, slab_equal_or_root
 	 * will also be a constant.
 	 */
-	if (!memcg_kmem_enabled() && !unlikely(s->flags & SLAB_DEBUG_FREE))
+	if (!memcg_kmem_enabled() &&
+	    !unlikely(s->flags & SLAB_CONSISTENCY_CHECKS))
 		return s;
 
 	page = virt_to_head_page(x);

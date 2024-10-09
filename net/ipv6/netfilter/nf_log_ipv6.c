@@ -34,7 +34,7 @@ static struct nf_loginfo default_loginfo = {
 };
 
 /* One level of recursion won't kill us */
-static void dump_ipv6_packet(struct nf_log_buf *m,
+static void dump_ipv6_packet(struct net *net, struct nf_log_buf *m,
 			     const struct nf_loginfo *info,
 			     const struct sk_buff *skb, unsigned int ip6hoff,
 			     int recurse)
@@ -256,7 +256,7 @@ static void dump_ipv6_packet(struct nf_log_buf *m,
 			/* Max length: 3+maxlen */
 			if (recurse) {
 				nf_log_buf_add(m, "[");
-				dump_ipv6_packet(m, info, skb,
+				dump_ipv6_packet(net, m, info, skb,
 						 ptr + sizeof(_icmp6h), 0);
 				nf_log_buf_add(m, "] ");
 			}
@@ -276,7 +276,7 @@ static void dump_ipv6_packet(struct nf_log_buf *m,
 
 	/* Max length: 15 "UID=4294967295 " */
 	if ((logflags & XT_LOG_UID) && recurse)
-		nf_log_dump_sk_uid_gid(m, skb->sk);
+		nf_log_dump_sk_uid_gid(net, m, skb->sk);
 
 	/* Max length: 16 "MARK=0xFFFFFFFF " */
 	if (recurse && skb->mark)
@@ -363,7 +363,7 @@ static void nf_log_ip6_packet(struct net *net, u_int8_t pf,
 	if (in != NULL)
 		dump_ipv6_mac_header(m, loginfo, skb);
 
-	dump_ipv6_packet(m, loginfo, skb, skb_network_offset(skb), 1);
+	dump_ipv6_packet(net, m, loginfo, skb, skb_network_offset(skb), 1);
 
 	nf_log_buf_close(m);
 }

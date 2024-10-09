@@ -176,6 +176,7 @@ nf_ct_get_tuple(const struct sk_buff *skb,
 		unsigned int dataoff,
 		u_int16_t l3num,
 		u_int8_t protonum,
+		struct net *net,
 		struct nf_conntrack_tuple *tuple,
 		const struct nf_conntrack_l3proto *l3proto,
 		const struct nf_conntrack_l4proto *l4proto)
@@ -189,12 +190,13 @@ nf_ct_get_tuple(const struct sk_buff *skb,
 	tuple->dst.protonum = protonum;
 	tuple->dst.dir = IP_CT_DIR_ORIGINAL;
 
-	return l4proto->pkt_to_tuple(skb, dataoff, tuple);
+	return l4proto->pkt_to_tuple(skb, dataoff, net, tuple);
 }
 EXPORT_SYMBOL_GPL(nf_ct_get_tuple);
 
 bool nf_ct_get_tuplepr(const struct sk_buff *skb, unsigned int nhoff,
-		       u_int16_t l3num, struct nf_conntrack_tuple *tuple)
+		       u_int16_t l3num,
+		       struct net *net, struct nf_conntrack_tuple *tuple)
 {
 	struct nf_conntrack_l3proto *l3proto;
 	struct nf_conntrack_l4proto *l4proto;
@@ -213,7 +215,7 @@ bool nf_ct_get_tuplepr(const struct sk_buff *skb, unsigned int nhoff,
 
 	l4proto = __nf_ct_l4proto_find(l3num, protonum);
 
-	ret = nf_ct_get_tuple(skb, nhoff, protoff, l3num, protonum, tuple,
+	ret = nf_ct_get_tuple(skb, nhoff, protoff, l3num, protonum, net, tuple,
 			      l3proto, l4proto);
 
 	rcu_read_unlock();
@@ -474,6 +476,17 @@ nf_ct_key_equal(struct nf_conntrack_tuple_hash *h,
 	       nf_ct_is_confirmed(ct);
 }
 
+static inline bool
+nf_ct_match(const struct nf_conn *ct1, const struct nf_conn *ct2)
+{
+	return nf_ct_tuple_equal(&ct1->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+				 &ct2->tuplehash[IP_CT_DIR_ORIGINAL].tuple) &&
+	       nf_ct_tuple_equal(&ct1->tuplehash[IP_CT_DIR_REPLY].tuple,
+				 &ct2->tuplehash[IP_CT_DIR_REPLY].tuple) &&
+	       nf_ct_zone_equal(ct1, nf_ct_zone(ct2), IP_CT_DIR_ORIGINAL) &&
+	       nf_ct_zone_equal(ct1, nf_ct_zone(ct2), IP_CT_DIR_REPLY);
+}
+
 /* must be called with rcu read lock held */
 void nf_conntrack_get_ht(struct net *net, struct hlist_nulls_head **hash, unsigned int *hsize)
 {
@@ -640,6 +653,62 @@ out:
 }
 EXPORT_SYMBOL_GPL(nf_conntrack_hash_check_insert);
 
+static inline void nf_ct_acct_update(struct nf_conn *ct,
+				     enum ip_conntrack_info ctinfo,
+				     unsigned int len)
+{
+	struct nf_conn_counter *counter;
+
+	counter = nf_conn_acct_find(ct);
+	if (counter) {
+		atomic64_inc(&counter[CTINFO2DIR(ctinfo)].packets);
+		atomic64_add(len, &counter[CTINFO2DIR(ctinfo)].bytes);
+	}
+}
+
+static void nf_ct_acct_merge(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
+			     const struct nf_conn *loser_ct)
+{
+	struct nf_conn_counter *counter;
+
+	counter = nf_conn_acct_find(loser_ct);
+	if (counter) {
+		unsigned int bytes;
+
+		/* u32 should be fine since we must have seen one packet. */
+		bytes = atomic64_read(&counter[CTINFO2DIR(ctinfo)].bytes);
+		nf_ct_acct_update(ct, ctinfo, bytes);
+	}
+}
+
+/* Resolve race on insertion if this protocol allows this. */
+static int nf_ct_resolve_clash(struct net *net, struct sk_buff *skb,
+			       enum ip_conntrack_info ctinfo,
+			       struct nf_conntrack_tuple_hash *h)
+{
+	/* This is the conntrack entry already in hashes that won race. */
+	struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
+	const struct nf_conntrack_l4proto *l4proto;
+	enum ip_conntrack_info oldinfo;
+	struct nf_conn *loser_ct = nf_ct_get(skb, &oldinfo);
+
+	l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), nf_ct_protonum(ct));
+	if (l4proto->allow_clash &&
+	    !nf_ct_is_dying(ct) &&
+	    atomic_inc_not_zero(&ct->ct_general.use)) {
+		if (((ct->status & IPS_NAT_DONE_MASK) == 0) ||
+		    nf_ct_match(ct, loser_ct)) {
+			nf_ct_acct_merge(ct, ctinfo, loser_ct);
+			nf_conntrack_put(&loser_ct->ct_general);
+			nf_ct_set(skb, ct, oldinfo);
+			return NF_ACCEPT;
+		}
+		nf_ct_put(ct);
+	}
+	NF_CT_STAT_INC(net, drop);
+	return NF_DROP;
+}
+
 /* Confirm a connection given skb; places it in hash table */
 int
 __nf_conntrack_confirm(struct sk_buff *skb)
@@ -654,6 +723,7 @@ __nf_conntrack_confirm(struct sk_buff *skb)
 	enum ip_conntrack_info ctinfo;
 	struct net *net;
 	unsigned int sequence;
+	int ret = NF_DROP;
 
 	ct = nf_ct_get(skb, &ctinfo);
 	net = nf_ct_net(ct);
@@ -696,8 +766,10 @@ __nf_conntrack_confirm(struct sk_buff *skb)
 	 */
 	nf_ct_del_from_dying_or_unconfirmed_list(ct);
 
-	if (unlikely(nf_ct_is_dying(ct)))
-		goto out;
+	if (unlikely(nf_ct_is_dying(ct))) {
+		nf_ct_add_to_dying_list(ct);
+		goto dying;
+	}
 
 	/* See if there's one in the list already, including reverse:
 	   NAT could have grabbed it without realizing, since we're
@@ -751,10 +823,12 @@ __nf_conntrack_confirm(struct sk_buff *skb)
 
 out:
 	nf_ct_add_to_dying_list(ct);
+	ret = nf_ct_resolve_clash(net, skb, ctinfo, h);
+dying:
 	nf_conntrack_double_unlock(hash, reply_hash);
 	NF_CT_STAT_INC(net, insert_failed);
 	local_bh_enable();
-	return NF_DROP;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(__nf_conntrack_confirm);
 
@@ -789,6 +863,22 @@ nf_conntrack_tuple_taken(const struct nf_conntrack_tuple *tuple,
 		if (ct != ignored_conntrack &&
 		    nf_ct_tuple_equal(tuple, &h->tuple) &&
 		    nf_ct_zone_equal(ct, zone, NF_CT_DIRECTION(h))) {
+			/* Tuple is taken already, so caller will need to find
+			 * a new source port to use.
+			 *
+			 * Only exception:
+			 * If the *original tuples* are identical, then both
+			 * conntracks refer to the same flow.
+			 * This is a rare situation, it can occur e.g. when
+			 * more than one UDP packet is sent from same socket
+			 * in different threads.
+			 *
+			 * Let nf_ct_resolve_clash() deal with this later.
+			 */
+			if (nf_ct_tuple_equal(&ignored_conntrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
+					      &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple))
+				continue;
+
 			NF_CT_STAT_INC(net, found);
 			rcu_read_unlock_bh();
 			return 1;
@@ -1103,7 +1193,7 @@ resolve_normal_ct(struct net *net, struct nf_conn *tmpl,
 	u32 hash;
 
 	if (!nf_ct_get_tuple(skb, skb_network_offset(skb),
-			     dataoff, l3num, protonum, &tuple, l3proto,
+			     dataoff, l3num, protonum, net, &tuple, l3proto,
 			     l4proto)) {
 		pr_debug("resolve_normal_ct: Can't get tuple\n");
 		return NULL;
@@ -1320,15 +1410,8 @@ void __nf_ct_refresh_acct(struct nf_conn *ct,
 	}
 
 acct:
-	if (do_acct) {
-		struct nf_conn_counter *acct;
-
-		acct = nf_conn_acct_find(ct);
-		if (acct) {
-			atomic64_inc(&acct[CTINFO2DIR(ctinfo)].packets);
-			atomic64_add(skb->len, &acct[CTINFO2DIR(ctinfo)].bytes);
-		}
-	}
+	if (do_acct)
+		nf_ct_acct_update(ct, ctinfo, skb->len);
 }
 EXPORT_SYMBOL_GPL(__nf_ct_refresh_acct);
 
@@ -1337,16 +1420,8 @@ bool __nf_ct_kill_acct(struct nf_conn *ct,
 		       const struct sk_buff *skb,
 		       int do_acct)
 {
-	if (do_acct) {
-		struct nf_conn_counter *acct;
-
-		acct = nf_conn_acct_find(ct);
-		if (acct) {
-			atomic64_inc(&acct[CTINFO2DIR(ctinfo)].packets);
-			atomic64_add(skb->len - skb_network_offset(skb),
-				     &acct[CTINFO2DIR(ctinfo)].bytes);
-		}
-	}
+	if (do_acct)
+		nf_ct_acct_update(ct, ctinfo, skb->len);
 
 	if (del_timer(&ct->timeout)) {
 		ct->timeout.function((unsigned long)ct);

@@ -80,7 +80,7 @@ audit_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
 	audit_log_format(ab, "mark=%#x", skb->mark);
 
-	switch (par->family) {
+	switch (xt_family(par)) {
 	case NFPROTO_BRIDGE:
 		switch (eth_hdr(skb)->h_proto) {
 		case htons(ETH_P_IP):

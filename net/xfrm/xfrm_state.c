@@ -37,9 +37,6 @@
 
 static unsigned int xfrm_state_hashmax __read_mostly = 1 * 1024 * 1024;
 
-static struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family);
-static void xfrm_state_put_afinfo(struct xfrm_state_afinfo *afinfo);
-
 static inline unsigned int xfrm_dst_hash(struct net *net,
 					 const xfrm_address_t *daddr,
 					 const xfrm_address_t *saddr,
@@ -453,7 +450,7 @@ static enum hrtimer_restart xfrm_timer_handler(struct hrtimer *me)
 	if (warn)
 		km_state_expired(x, 0, 0);
 resched:
-	if (next != LONG_MAX){
+	if (next != LONG_MAX) {
 		tasklet_hrtimer_start(&x->mtimer, ktime_set(next, 0), HRTIMER_MODE_REL);
 	}
 
@@ -938,7 +935,7 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
 	struct xfrm_state *x;
 	struct xfrm_state_walk *w;
 
-	spin_lock_bh(&net->xfrm.xfrm_state_lock);
+	spin_lock_bh(&net->xfrm_state_lock);
 	list_for_each_entry(w, &net->xfrm.state_all, all) {
 		x = container_of(w, struct xfrm_state, km);
 		if (x->props.family != family ||
@@ -946,10 +943,10 @@ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
 			continue;
 
 		xfrm_state_hold(x);
-		spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+		spin_unlock_bh(&net->xfrm_state_lock);
 		return x;
 	}
-	spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+	spin_unlock_bh(&net->xfrm_state_lock);
 	return NULL;
 }
 EXPORT_SYMBOL(xfrm_state_lookup_byspi);
@@ -1402,7 +1399,7 @@ int xfrm_state_check_expire(struct xfrm_state *x)
 	if (x->curlft.bytes >= x->lft.hard_byte_limit ||
 	    x->curlft.packets >= x->lft.hard_packet_limit) {
 		x->km.state = XFRM_STATE_EXPIRED;
-		tasklet_hrtimer_start(&x->mtimer, ktime_set(0,0), HRTIMER_MODE_REL);
+		tasklet_hrtimer_start(&x->mtimer, ktime_set(0, 0), HRTIMER_MODE_REL);
 		return -EINVAL;
 	}
 
@@ -1604,7 +1601,7 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high)
 		x->id.spi = minspi;
 	} else {
 		u32 spi = 0;
-		for (h=0; h<high-low+1; h++) {
+		for (h = 0; h < high-low+1; h++) {
 			spi = low + prandom_u32()%(high-low+1);
 			x0 = xfrm_state_lookup(net, mark, &x->id.daddr, htonl(spi), x->id.proto, x->props.family);
 			if (x0 == NULL) {
@@ -1952,7 +1949,7 @@ int xfrm_state_unregister_afinfo(struct xfrm_state_afinfo *afinfo)
 }
 EXPORT_SYMBOL(xfrm_state_unregister_afinfo);
 
-static struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family)
+struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family)
 {
 	struct xfrm_state_afinfo *afinfo;
 	if (unlikely(family >= NPROTO))
@@ -1964,7 +1961,7 @@ static struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family)
 	return afinfo;
 }
 
-static void xfrm_state_put_afinfo(struct xfrm_state_afinfo *afinfo)
+void xfrm_state_put_afinfo(struct xfrm_state_afinfo *afinfo)
 {
 	rcu_read_unlock();
 }
@@ -2162,7 +2159,7 @@ static void xfrm_audit_helper_sainfo(struct xfrm_state *x,
 		audit_log_format(audit_buf, " sec_alg=%u sec_doi=%u sec_obj=%s",
 				 ctx->ctx_alg, ctx->ctx_doi, ctx->ctx_str);
 
-	switch(x->props.family) {
+	switch (x->props.family) {
 	case AF_INET:
 		audit_log_format(audit_buf, " src=%pI4 dst=%pI4",
 				 &x->props.saddr.a4, &x->id.daddr.a4);
@@ -2192,7 +2189,7 @@ static void xfrm_audit_helper_pktinfo(struct sk_buff *skb, u16 family,
 		iph6 = ipv6_hdr(skb);
 		audit_log_format(audit_buf,
 				 " src=%pI6 dst=%pI6 flowlbl=0x%x%02x%02x",
-				 &iph6->saddr,&iph6->daddr,
+				 &iph6->saddr, &iph6->daddr,
 				 iph6->flow_lbl[0] & 0x0f,
 				 iph6->flow_lbl[1],
 				 iph6->flow_lbl[2]);

@@ -512,6 +512,7 @@ static ssize_t reload_store(struct device *dev,
 	int cpu;
 	unsigned long val;
 	ssize_t ret = 0;
+	struct cpuinfo_x86 *c = &boot_cpu_data;
 
 	ret = kstrtoul(buf, 0, &val);
 	if (ret)
@@ -528,8 +529,19 @@ static ssize_t reload_store(struct device *dev,
 
 	mutex_lock(&microcode_mutex);
 
-	for_each_online_cpu(cpu) {
-		tmp_ret = microcode_ops->request_microcode_fw(cpu, &microcode_pdev->dev, true);
+	if (c->x86_vendor == X86_VENDOR_INTEL) {
+		for_each_online_cpu(cpu) {
+			tmp_ret = microcode_ops->request_microcode_fw(cpu,
+						    &microcode_pdev->dev, true);
+			if (tmp_ret != UCODE_NEW) {
+				ret = size;
+				goto out;
+			}
+		}
+	} else {
+		/* AMD implements microcode load only on bsp */
+		tmp_ret = microcode_ops->request_microcode_fw(c->cpu_index,
+						    &microcode_pdev->dev, true);
 		if (tmp_ret != UCODE_NEW) {
 			ret = size;
 			goto out;

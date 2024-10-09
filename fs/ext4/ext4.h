@@ -626,6 +626,9 @@ enum {
 /* Max physical block we can address w/o extents */
 #define EXT4_MAX_BLOCK_FILE_PHYS	0xFFFFFFFF
 
+/* Max logical block we can support */
+#define EXT4_MAX_LOGICAL_BLOCK		0xFFFFFFFF
+
 /*
  * Structure of an inode on the disk
  */
@@ -1774,7 +1777,9 @@ static inline __le16 ext4_rec_len_to_disk(unsigned len, unsigned blocksize)
 #define is_dx(dir) (EXT4_HAS_COMPAT_FEATURE(dir->i_sb, \
 				      EXT4_FEATURE_COMPAT_DIR_INDEX) && \
 		    ext4_test_inode_flag((dir), EXT4_INODE_INDEX))
-#define EXT4_DIR_LINK_MAX(dir) (!is_dx(dir) && (dir)->i_nlink >= EXT4_LINK_MAX)
+#define EXT4_DIR_LINK_MAX(dir) unlikely((dir)->i_nlink >= EXT4_LINK_MAX && \
+		!(EXT4_HAS_RO_COMPAT_FEATURE((dir)->i_sb, EXT4_FEATURE_RO_COMPAT_DIR_NLINK) && \
+		  is_dx(dir)))
 #define EXT4_DIR_LINK_EMPTY(dir) ((dir)->i_nlink == 2 || (dir)->i_nlink == 1)
 
 /* Legal values for the dx_root hash_version field: */

@@ -27,6 +27,10 @@ extern u32 pnv_get_supported_cpuidle_states(void);
 
 extern void pnv_lpc_init(void);
 
+extern void opal_handle_events(void);
+extern bool opal_have_pending_events(void);
+extern void opal_event_shutdown(void);
+
 bool cpu_core_split_required(void);
 
 #endif /* _POWERNV_H */

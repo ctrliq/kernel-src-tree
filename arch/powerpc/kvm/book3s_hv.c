@@ -2086,6 +2086,7 @@ static void init_master_vcore(struct kvmppc_vcore *vc)
 	vc->in_guest = 0;
 	vc->napping_threads = 0;
 	vc->conferring_threads = 0;
+	vc->tb_offset_applied = 0;
 }
 
 static bool can_dynamic_split(struct kvmppc_vcore *vc, struct core_info *cip)

@@ -141,7 +141,8 @@ static void srp_remove_one(struct ib_device *device, void *client_data);
 static void srp_recv_done(struct ib_cq *cq, struct ib_wc *wc);
 static void srp_handle_qp_err(struct ib_cq *cq, struct ib_wc *wc,
 		const char *opname);
-static int srp_ib_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event);
+static int srp_ib_cm_handler(struct ib_cm_id *cm_id,
+			     const struct ib_cm_event *event);
 static int srp_rdma_cm_handler(struct rdma_cm_id *cm_id,
 			       struct rdma_cm_event *event);
 
@@ -1031,16 +1032,17 @@ static int srp_alloc_req_data(struct srp_rdma_ch *ch)
 
 	for (i = 0; i < target->req_ring_size; ++i) {
 		req = &ch->req_ring[i];
-		mr_list = kmalloc(target->mr_per_cmd * sizeof(void *),
-				  GFP_KERNEL);
+		mr_list = kmalloc_array(target->mr_per_cmd, sizeof(void *),
+					GFP_KERNEL);
 		if (!mr_list)
 			goto out;
 		if (srp_dev->use_fast_reg) {
 			req->fr_list = mr_list;
 		} else {
 			req->fmr_list = mr_list;
-			req->map_page = kmalloc(srp_dev->max_pages_per_mr *
-						sizeof(void *), GFP_KERNEL);
+			req->map_page = kmalloc_array(srp_dev->max_pages_per_mr,
+						      sizeof(void *),
+						      GFP_KERNEL);
 			if (!req->map_page)
 				goto out;
 		}
@@ -2547,7 +2549,7 @@ error:
 }
 
 static void srp_ib_cm_rej_handler(struct ib_cm_id *cm_id,
-				  struct ib_cm_event *event,
+				  const struct ib_cm_event *event,
 				  struct srp_rdma_ch *ch)
 {
 	struct srp_target_port *target = ch->target;
@@ -2632,7 +2634,8 @@ static void srp_ib_cm_rej_handler(struct ib_cm_id *cm_id,
 	}
 }
 
-static int srp_ib_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event)
+static int srp_ib_cm_handler(struct ib_cm_id *cm_id,
+			     const struct ib_cm_event *event)
 {
 	struct srp_rdma_ch *ch = cm_id->context;
 	struct srp_target_port *target = ch->target;
@@ -3861,7 +3864,7 @@ static ssize_t srp_create_target(struct device *dev,
 	INIT_WORK(&target->tl_err_work, srp_tl_err_work);
 	INIT_WORK(&target->remove_work, srp_remove_work);
 	spin_lock_init(&target->lock);
-	ret = ib_query_gid(ibdev, host->port, 0, &target->sgid, NULL);
+	ret = rdma_query_gid(ibdev, host->port, 0, &target->sgid);
 	if (ret)
 		goto out;
 

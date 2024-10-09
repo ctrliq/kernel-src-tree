@@ -527,51 +527,43 @@ static int snd_pcm_stream_proc_init(struct snd_pcm_str *pstr)
 					   pcm->card->proc_root);
 	if (!entry)
 		return -ENOMEM;
-	entry->mode = S_IFDIR | S_IRUGO | S_IXUGO;
-	if (snd_info_register(entry) < 0) {
-		snd_info_free_entry(entry);
-		return -ENOMEM;
-	}
+	entry->mode = S_IFDIR | 0555;
 	pstr->proc_root = entry;
 	entry = snd_info_create_card_entry(pcm->card, "info", pstr->proc_root);
-	if (entry) {
+	if (entry)
 		snd_info_set_text_ops(entry, pstr, snd_pcm_stream_proc_info_read);
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	pstr->proc_info_entry = entry;
-
 #ifdef CONFIG_SND_PCM_XRUN_DEBUG
 	entry = snd_info_create_card_entry(pcm->card, "xrun_debug",
 					   pstr->proc_root);
 	if (entry) {
-		entry->c.text.read = snd_pcm_xrun_debug_read;
+		snd_info_set_text_ops(entry, pstr, snd_pcm_xrun_debug_read);
 		entry->c.text.write = snd_pcm_xrun_debug_write;
-		entry->mode |= S_IWUSR;
-		entry->private_data = pstr;
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
+		entry->mode |= 0200;
 	}
-	pstr->proc_xrun_debug_entry = entry;
 #endif
 	return 0;
 }
 
 static int snd_pcm_stream_proc_done(struct snd_pcm_str *pstr)
 {
-#ifdef CONFIG_SND_PCM_XRUN_DEBUG
-	snd_info_free_entry(pstr->proc_xrun_debug_entry);
-	pstr->proc_xrun_debug_entry = NULL;
-#endif
-	snd_info_free_entry(pstr->proc_info_entry);
-	pstr->proc_info_entry = NULL;
 	snd_info_free_entry(pstr->proc_root);
 	pstr->proc_root = NULL;
 	return 0;
+}
+
+static struct snd_info_entry *
+create_substream_info_entry(struct snd_pcm_substream *substream,
+			    const char *name,
+			    void (*read)(struct snd_info_entry *,
+					 struct snd_info_buffer *))
+{
+	struct snd_info_entry *entry;
+
+	entry = snd_info_create_card_entry(substream->pcm->card, name,
+					   substream->proc_root);
+	if (entry)
+		snd_info_set_text_ops(entry, substream, read);
+	return entry;
 }
 
 static int snd_pcm_substream_proc_init(struct snd_pcm_substream *substream)
@@ -587,98 +579,33 @@ static int snd_pcm_substream_proc_init(struct snd_pcm_substream *substream)
 					   substream->pstr->proc_root);
 	if (!entry)
 		return -ENOMEM;
-	entry->mode = S_IFDIR | S_IRUGO | S_IXUGO;
-	if (snd_info_register(entry) < 0) {
-		snd_info_free_entry(entry);
-		return -ENOMEM;
-	}
+	entry->mode = S_IFDIR | 0555;
 	substream->proc_root = entry;
-	entry = snd_info_create_card_entry(card, "info", substream->proc_root);
-	if (entry) {
-		snd_info_set_text_ops(entry, substream,
-				      snd_pcm_substream_proc_info_read);
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	substream->proc_info_entry = entry;
-	entry = snd_info_create_card_entry(card, "hw_params",
-					   substream->proc_root);
-	if (entry) {
-		snd_info_set_text_ops(entry, substream,
-				      snd_pcm_substream_proc_hw_params_read);
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	substream->proc_hw_params_entry = entry;
-	entry = snd_info_create_card_entry(card, "sw_params",
-					   substream->proc_root);
-	if (entry) {
-		snd_info_set_text_ops(entry, substream,
-				      snd_pcm_substream_proc_sw_params_read);
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	substream->proc_sw_params_entry = entry;
-	entry = snd_info_create_card_entry(card, "status",
-					   substream->proc_root);
-	if (entry) {
-		snd_info_set_text_ops(entry, substream,
-				      snd_pcm_substream_proc_status_read);
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	substream->proc_status_entry = entry;
+
+	create_substream_info_entry(substream, "info",
+				    snd_pcm_substream_proc_info_read);
+	create_substream_info_entry(substream, "hw_params",
+				    snd_pcm_substream_proc_hw_params_read);
+	create_substream_info_entry(substream, "sw_params",
+				    snd_pcm_substream_proc_sw_params_read);
+	create_substream_info_entry(substream, "status",
+				    snd_pcm_substream_proc_status_read);
 
 #ifdef CONFIG_SND_PCM_XRUN_DEBUG
-	entry = snd_info_create_card_entry(card, "xrun_injection",
-					   substream->proc_root);
+	entry = create_substream_info_entry(substream, "xrun_injection", NULL);
 	if (entry) {
-		entry->private_data = substream;
-		entry->c.text.read = NULL;
 		entry->c.text.write = snd_pcm_xrun_injection_write;
-		entry->mode = S_IFREG | S_IWUSR;
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
+		entry->mode = S_IFREG | 0200;
 	}
-	substream->proc_xrun_injection_entry = entry;
 #endif /* CONFIG_SND_PCM_XRUN_DEBUG */
 
 	return 0;
 }
 
-static int snd_pcm_substream_proc_done(struct snd_pcm_substream *substream)
-{
-	snd_info_free_entry(substream->proc_info_entry);
-	substream->proc_info_entry = NULL;
-	snd_info_free_entry(substream->proc_hw_params_entry);
-	substream->proc_hw_params_entry = NULL;
-	snd_info_free_entry(substream->proc_sw_params_entry);
-	substream->proc_sw_params_entry = NULL;
-	snd_info_free_entry(substream->proc_status_entry);
-	substream->proc_status_entry = NULL;
-#ifdef CONFIG_SND_PCM_XRUN_DEBUG
-	snd_info_free_entry(substream->proc_xrun_injection_entry);
-	substream->proc_xrun_injection_entry = NULL;
-#endif
-	snd_info_free_entry(substream->proc_root);
-	substream->proc_root = NULL;
-	return 0;
-}
 #else /* !CONFIG_SND_VERBOSE_PROCFS */
 static inline int snd_pcm_stream_proc_init(struct snd_pcm_str *pstr) { return 0; }
 static inline int snd_pcm_stream_proc_done(struct snd_pcm_str *pstr) { return 0; }
 static inline int snd_pcm_substream_proc_init(struct snd_pcm_substream *substream) { return 0; }
-static inline int snd_pcm_substream_proc_done(struct snd_pcm_substream *substream) { return 0; }
 #endif /* CONFIG_SND_VERBOSE_PROCFS */
 
 static const struct attribute_group *pcm_dev_attr_groups[];
@@ -753,9 +680,7 @@ int snd_pcm_new_stream(struct snd_pcm *pcm, int stream, int substream_count)
 			}
 		}
 		substream->group = &substream->self_group;
-		spin_lock_init(&substream->self_group.lock);
-		mutex_init(&substream->self_group.mutex);
-		INIT_LIST_HEAD(&substream->self_group.substreams);
+		snd_pcm_group_init(&substream->self_group);
 		list_add_tail(&substream->link_list, &substream->self_group.substreams);
 		atomic_set(&substream->mmap_count, 0);
 		prev = substream;
@@ -885,15 +810,17 @@ static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
 #if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	struct snd_pcm_oss_setup *setup, *setupn;
 #endif
+
+	/* free all proc files under the stream */
+	snd_pcm_stream_proc_done(pstr);
+
 	substream = pstr->substream;
 	while (substream) {
 		substream_next = substream->next;
 		snd_pcm_timer_done(substream);
-		snd_pcm_substream_proc_done(substream);
 		kfree(substream);
 		substream = substream_next;
 	}
-	snd_pcm_stream_proc_done(pstr);
 #if IS_ENABLED(CONFIG_SND_PCM_OSS)
 	for (setup = pstr->oss.setup_list; setup; setup = setupn) {
 		setupn = setup->next;
@@ -1084,7 +1011,7 @@ static ssize_t show_pcm_class(struct device *dev,
         return snprintf(buf, PAGE_SIZE, "%s\n", str);
 }
 
-static DEVICE_ATTR(pcm_class, S_IRUGO, show_pcm_class, NULL);
+static DEVICE_ATTR(pcm_class, 0444, show_pcm_class, NULL);
 static struct attribute *pcm_dev_attrs[] = {
 	&dev_attr_pcm_class.attr,
 	NULL

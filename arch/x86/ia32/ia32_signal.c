@@ -65,6 +65,21 @@ int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
 					  &to->_sifields._pad[0]);
 			switch (from->si_code >> 16) {
 			case __SI_FAULT >> 16:
+				if (from->si_signo == SIGBUS &&
+				    (from->si_code == BUS_MCEERR_AR ||
+				     from->si_code == BUS_MCEERR_AO))
+					put_user_ex(from->si_addr_lsb, &to->si_addr_lsb);
+
+				if (from->si_signo == SIGSEGV) {
+					if (from->si_code == SEGV_BNDERR) {
+						compat_uptr_t lower = (unsigned long)&from->si_lower;
+						compat_uptr_t upper = (unsigned long)&from->si_upper;
+						put_user_ex(lower, &to->si_lower);
+						put_user_ex(upper, &to->si_upper);
+					}
+					if (from->si_code == SEGV_PKUERR)
+						put_user_ex(from->si_pkey, &to->si_pkey);
+				}
 				break;
 			case __SI_SYS >> 16:
 				put_user_ex(from->si_syscall, &to->si_syscall);

@@ -151,7 +151,7 @@ static int read_and_add_raw_conns(struct hda_codec *codec, hda_nid_t nid)
 	len = snd_hda_get_raw_connections(codec, nid, list, ARRAY_SIZE(list));
 	if (len == -ENOSPC) {
 		len = snd_hda_get_num_raw_conns(codec, nid);
-		result = kmalloc(sizeof(hda_nid_t) * len, GFP_KERNEL);
+		result = kmalloc_array(len, sizeof(hda_nid_t), GFP_KERNEL);
 		if (!result)
 			return -ENOMEM;
 		len = snd_hda_get_raw_connections(codec, nid, result, len);
@@ -431,7 +431,7 @@ static int read_widget_caps(struct hda_codec *codec, hda_nid_t fg_node)
 	int i;
 	hda_nid_t nid;
 
-	codec->wcaps = kmalloc(codec->core.num_nodes * 4, GFP_KERNEL);
+	codec->wcaps = kmalloc_array(codec->core.num_nodes, 4, GFP_KERNEL);
 	if (!codec->wcaps)
 		return -ENOMEM;
 	nid = codec->core.start_nid;
@@ -805,7 +805,6 @@ void snd_hda_codec_register(struct hda_codec *codec)
 	if (codec->registered)
 		return;
 	if (device_is_registered(hda_codec_dev(codec))) {
-		snd_hda_register_beep_device(codec);
 		snd_hdac_link_power(&codec->core, true);
 		pm_runtime_enable(hda_codec_dev(codec));
 		/* it was powered up in snd_hda_codec_new(), now all done */
@@ -817,14 +816,6 @@ void snd_hda_codec_register(struct hda_codec *codec)
 static int snd_hda_codec_dev_register(struct snd_device *device)
 {
 	snd_hda_codec_register(device->device_data);
-	return 0;
-}
-
-static int snd_hda_codec_dev_disconnect(struct snd_device *device)
-{
-	struct hda_codec *codec = device->device_data;
-
-	snd_hda_detach_beep_device(codec);
 	return 0;
 }
 
@@ -913,7 +904,6 @@ int snd_hda_codec_device_new(struct hda_bus *bus, struct snd_card *card,
 	int err;
 	static struct snd_device_ops dev_ops = {
 		.dev_register = snd_hda_codec_dev_register,
-		.dev_disconnect = snd_hda_codec_dev_disconnect,
 		.dev_free = snd_hda_codec_dev_free,
 	};
 

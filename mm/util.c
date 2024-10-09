@@ -126,7 +126,8 @@ EXPORT_SYMBOL(kmemdup);
  * @src: source address in user space
  * @len: number of bytes to copy
  *
- * Returns an ERR_PTR() on failure.
+ * Returns an ERR_PTR() on failure.  Result is physically
+ * contiguous, to be freed by kfree().
  */
 void *memdup_user(const void __user *src, size_t len)
 {
@@ -240,6 +241,32 @@ void kzfree(const void *p)
 	kfree(mem);
 }
 EXPORT_SYMBOL(kzfree);
+
+/**
+ * vmemdup_user - duplicate memory region from user space
+ *
+ * @src: source address in user space
+ * @len: number of bytes to copy
+ *
+ * Returns an ERR_PTR() on failure.  Result may be not
+ * physically contiguous.  Use kvfree() to free.
+ */
+void *vmemdup_user(const void __user *src, size_t len)
+{
+	void *p;
+
+	p = kvmalloc(len, GFP_USER);
+	if (!p)
+		return ERR_PTR(-ENOMEM);
+
+	if (copy_from_user(p, src, len)) {
+		kvfree(p);
+		return ERR_PTR(-EFAULT);
+	}
+
+	return p;
+}
+EXPORT_SYMBOL(vmemdup_user);
 
 /*
  * strndup_user - duplicate an existing string from user space

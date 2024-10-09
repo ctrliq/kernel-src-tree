@@ -1985,11 +1985,7 @@ static void snd_ymfpci_proc_read(struct snd_info_entry *entry,
 
 static int snd_ymfpci_proc_init(struct snd_card *card, struct snd_ymfpci *chip)
 {
-	struct snd_info_entry *entry;
-	
-	if (! snd_card_proc_new(card, "ymfpci", &entry))
-		snd_info_set_text_ops(entry, chip, snd_ymfpci_proc_read);
-	return 0;
+	return snd_card_ro_proc_new(card, "ymfpci", chip, snd_ymfpci_proc_read);
 }
 
 /*
@@ -2435,8 +2431,8 @@ int snd_ymfpci_create(struct snd_card *card,
 		goto free_chip;
 
 #ifdef CONFIG_PM_SLEEP
-	chip->saved_regs = kmalloc(YDSXGR_NUM_SAVED_REGS * sizeof(u32),
-				   GFP_KERNEL);
+	chip->saved_regs = kmalloc_array(YDSXGR_NUM_SAVED_REGS, sizeof(u32),
+					 GFP_KERNEL);
 	if (chip->saved_regs == NULL) {
 		err = -ENOMEM;
 		goto free_chip;

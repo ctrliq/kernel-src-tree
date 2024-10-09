@@ -1365,6 +1365,54 @@ static u32 rtnl_get_event(unsigned long event)
 	return rtnl_event_type;
 }
 
+static int put_master_ifindex(struct sk_buff *skb, struct net_device *dev)
+{
+	const struct net_device *upper_dev;
+	int ret = 0;
+
+	rcu_read_lock();
+
+	upper_dev = netdev_master_upper_dev_get_rcu(dev);
+	if (upper_dev)
+		ret = nla_put_u32(skb, IFLA_MASTER, upper_dev->ifindex);
+
+	rcu_read_unlock();
+	return ret;
+}
+
+static int nla_put_iflink(struct sk_buff *skb, const struct net_device *dev,
+			  bool force)
+{
+	int ifindex = dev_get_iflink(dev);
+
+	if (force || dev->ifindex != ifindex)
+		return nla_put_u32(skb, IFLA_LINK, ifindex);
+
+	return 0;
+}
+
+static int rtnl_fill_link_netnsid(struct sk_buff *skb,
+				  const struct net_device *dev,
+				  struct net *src_net)
+{
+	bool put_iflink = false;
+
+	if (dev->rtnl_link_ops && dev->rtnl_link_ops->get_link_net) {
+		struct net *link_net = dev->rtnl_link_ops->get_link_net(dev);
+
+		if (!net_eq(dev_net(dev), link_net)) {
+			int id = peernet2id_alloc(src_net, link_net);
+
+			if (nla_put_s32(skb, IFLA_LINK_NETNSID, id))
+				return -EMSGSIZE;
+
+			put_iflink = true;
+		}
+	}
+
+	return nla_put_iflink(skb, dev, put_iflink);
+}
+
 static int rtnl_fill_ifinfo(struct sk_buff *skb,
 			    struct net_device *dev, struct net *src_net,
 			    int type, u32 pid, u32 seq, u32 change,
@@ -1376,7 +1424,6 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 	struct nlmsghdr *nlh;
 	struct nlattr *af_spec;
 	struct rtnl_af_ops *af_ops;
-	struct net_device *upper_dev = netdev_master_upper_dev_get(dev);
 
 	ASSERT_RTNL();
 	nlh = nlmsg_put(skb, pid, seq, type, sizeof(*ifm), flags);
@@ -1408,10 +1455,7 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 #ifdef CONFIG_RPS
 	    nla_put_u32(skb, IFLA_NUM_RX_QUEUES, dev->num_rx_queues) ||
 #endif
-	    (dev->ifindex != dev_get_iflink(dev) &&
-	     nla_put_u32(skb, IFLA_LINK, dev_get_iflink(dev))) ||
-	    (upper_dev &&
-	     nla_put_u32(skb, IFLA_MASTER, upper_dev->ifindex)) ||
+	    put_master_ifindex(skb, dev) ||
 	    nla_put_u8(skb, IFLA_CARRIER, netif_carrier_ok(dev)) ||
 	    (dev->qdisc &&
 	     nla_put_string(skb, IFLA_QDISC, dev->qdisc->ops->id)) ||
@@ -1477,17 +1521,8 @@ static int rtnl_fill_ifinfo(struct sk_buff *skb,
 			goto nla_put_failure;
 	}
 
-	if (dev->rtnl_link_ops &&
-	    dev->rtnl_link_ops->get_link_net) {
-		struct net *link_net = dev->rtnl_link_ops->get_link_net(dev);
-
-		if (!net_eq(dev_net(dev), link_net)) {
-			int id = peernet2id_alloc(src_net, link_net);
-
-			if (nla_put_s32(skb, IFLA_LINK_NETNSID, id))
-				goto nla_put_failure;
-		}
-	}
+	if (rtnl_fill_link_netnsid(skb, dev, src_net))
+		goto nla_put_failure;
 
 	if (new_nsid &&
 	    nla_put_s32(skb, IFLA_NEW_NETNSID, *new_nsid) < 0)
@@ -1614,18 +1649,18 @@ static const struct nla_policy ifla_port_policy[IFLA_PORT_MAX+1] = {
 	[IFLA_PORT_RESPONSE]	= { .type = NLA_U16, },
 };
 
-static struct net *get_target_net(struct sk_buff *skb, int netnsid)
+static struct net *get_target_net(struct sock *sk, int netnsid)
 {
 	struct net *net;
 
-	net = get_net_ns_by_id(sock_net(skb->sk), netnsid);
+	net = get_net_ns_by_id(sock_net(sk), netnsid);
 	if (!net)
 		return ERR_PTR(-EINVAL);
 
 	/* For now, the caller is required to have CAP_NET_ADMIN in
 	 * the user namespace owning the target net ns.
 	 */
-	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)) {
+	if (!sk_ns_capable(sk, net->user_ns, CAP_NET_ADMIN)) {
 		put_net(net);
 		return ERR_PTR(-EACCES);
 	}
@@ -1663,7 +1698,7 @@ static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
 
 		if (tb[IFLA_IF_NETNSID]) {
 			netnsid = nla_get_s32(tb[IFLA_IF_NETNSID]);
-			tgt_net = get_target_net(skb, netnsid);
+			tgt_net = get_target_net(skb->sk, netnsid);
 			if (IS_ERR(tgt_net)) {
 				tgt_net = net;
 				netnsid = -1;
@@ -2713,7 +2748,7 @@ static int rtnl_getlink(struct sk_buff *skb, struct nlmsghdr* nlh)
 
 	if (tb[IFLA_IF_NETNSID]) {
 		netnsid = nla_get_s32(tb[IFLA_IF_NETNSID]);
-		tgt_net = get_target_net(skb, netnsid);
+		tgt_net = get_target_net(NETLINK_CB(skb).sk, netnsid);
 		if (IS_ERR(tgt_net))
 			return PTR_ERR(tgt_net);
 	}

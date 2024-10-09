@@ -182,7 +182,7 @@ struct mlx4_icm *mlx4_alloc_icm(struct mlx4_dev *dev, int npages,
 
 		mask = gfp_mask;
 		if (cur_order)
-			mask &= ~__GFP_DIRECT_RECLAIM;
+			mask &= ~__GFP_WAIT;
 
 		if (coherent)
 			ret = mlx4_alloc_icm_coherent(&dev->persist->pdev->dev,

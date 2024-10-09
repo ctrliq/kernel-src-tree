@@ -48,6 +48,12 @@ typedef int64_t		xfs_srtblock_t;	/* signed version of xfs_rtblock_t */
 typedef int64_t		xfs_sfiloff_t;	/* signed block number in a file */
 
 /*
+ * New verifiers will return the instruction address of the failing check.
+ * NULL means everything is ok.
+ */
+typedef void *		xfs_failaddr_t;
+
+/*
  * Null values for the types.
  */
 #define	NULLFSBLOCK	((xfs_fsblock_t)-1)
@@ -135,6 +141,10 @@ typedef uint32_t	xfs_dqid_t;
 #define	XFS_NBWORD	(1 << XFS_NBWORDLOG)
 #define	XFS_WORDMASK	((1 << XFS_WORDLOG) - 1)
 
+struct xfs_iext_cursor {
+	struct xfs_iext_leaf	*leaf;
+	int			pos;
+};
 
 typedef enum {
 	XFS_EXT_NORM, XFS_EXT_UNWRITTEN,

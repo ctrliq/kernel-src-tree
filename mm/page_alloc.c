@@ -57,6 +57,7 @@
 #include <linux/ftrace_event.h>
 #include <linux/memcontrol.h>
 #include <linux/prefetch.h>
+#include <linux/mm_inline.h>
 #include <linux/migrate.h>
 #include <linux/page_ext.h>
 #include <linux/hugetlb.h>
@@ -827,7 +828,6 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	int to_free = count;
 
 	spin_lock(&zone->lock);
-	zone->all_unreclaimable = 0;
 	zone->pages_scanned = 0;
 
 	while (to_free) {
@@ -876,7 +876,6 @@ static void free_one_page(struct zone *zone, struct page *page, int order,
 				int migratetype)
 {
 	spin_lock(&zone->lock);
-	zone->all_unreclaimable = 0;
 	zone->pages_scanned = 0;
 
 	__free_one_page(page, zone, order, migratetype);
@@ -4074,7 +4073,7 @@ void show_free_areas(unsigned int filter)
 			K(zone_page_state(zone, NR_FREE_CMA_PAGES)),
 			K(zone_page_state(zone, NR_WRITEBACK_TEMP)),
 			zone->pages_scanned,
-			(zone->all_unreclaimable ? "yes" : "no")
+			(!zone_reclaimable(zone) ? "yes" : "no")
 			);
 		printk("lowmem_reserve[]:");
 		for (i = 0; i < MAX_NR_ZONES; i++)
@@ -7108,6 +7107,7 @@ void set_pageblock_flags_group(struct page *page, unsigned long flags,
  * expect this function should be exact.
  */
 bool has_unmovable_pages(struct zone *zone, struct page *page, int count,
+			 int migratetype,
 			 bool skip_hwpoisoned_pages)
 {
 	unsigned long pfn, iter, found;
@@ -7119,6 +7119,15 @@ bool has_unmovable_pages(struct zone *zone, struct page *page, int count,
 	 * the later is not the case right now unfortunatelly. E.g. movablecore
 	 * can still lead to having bootmem allocations in zone_movable.
 	 */
+
+	/*
+	 * CMA allocations (alloc_contig_range) really need to mark isolate
+	 * CMA pageblocks even when they are not movable in fact so consider
+	 * them movable here.
+	 */
+	if (is_migrate_cma(migratetype) &&
+			is_migrate_cma(get_pageblock_migratetype(page)))
+		return false;
 
 	pfn = page_to_pfn(page);
 	for (found = 0, iter = 0; iter < pageblock_nr_pages; iter++) {
@@ -7220,7 +7229,7 @@ bool is_pageblock_removable_nolock(struct page *page)
 	if (!zone_spans_pfn(zone, pfn))
 		return false;
 
-	return !has_unmovable_pages(zone, page, 0, true);
+	return !has_unmovable_pages(zone, page, 0, MIGRATE_MOVABLE, true);
 }
 
 #if (defined(CONFIG_MEMORY_ISOLATION) && defined(CONFIG_COMPACTION)) || defined(CONFIG_CMA)
@@ -7572,6 +7581,10 @@ static const struct trace_print_flags pageflag_names[] = {
 #endif
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	{1UL << PG_compound_lock,	"compound_lock"	},
+#endif
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+	{1UL << PG_young,               "young"         },
+	{1UL << PG_idle,                "idle"          },
 #endif
 };
 

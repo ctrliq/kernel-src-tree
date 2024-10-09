@@ -1443,21 +1443,28 @@ static int test_pages_in_a_zone(unsigned long start_pfn, unsigned long end_pfn)
 static unsigned long scan_movable_pages(unsigned long start, unsigned long end)
 {
 	unsigned long pfn;
-	struct page *page;
+
 	for (pfn = start; pfn < end; pfn++) {
-		if (pfn_valid(pfn)) {
-			page = pfn_to_page(pfn);
-			if (PageLRU(page))
-				return pfn;
-			if (PageHuge(page)) {
-				if (hugepage_migration_supported(page_hstate(page)) &&
-				    page_huge_active(page))
-					return pfn;
-				else
-					pfn = round_up(pfn + 1,
-						1 << compound_order(page)) - 1;
-			}
-		}
+		struct page *page, *head;
+		unsigned long skip;
+
+		if (!pfn_valid(pfn))
+			continue;
+
+		page = pfn_to_page(pfn);
+		if (PageLRU(page))
+			return pfn;
+
+		if (!PageHuge(page))
+			continue;
+
+		head = compound_head(page);
+		if (hugepage_migration_supported(page_hstate(head)) &&
+		    page_huge_active(head))
+			return pfn;
+
+		skip = (1 << compound_order(head)) - (page - head);
+		pfn += skip - 1;
 	}
 	return 0;
 }
@@ -1744,11 +1751,11 @@ static void node_states_clear_node(int node, struct memory_notify *arg)
 }
 
 static int __ref __offline_pages(unsigned long start_pfn,
-		  unsigned long end_pfn, unsigned long timeout)
+		  unsigned long end_pfn)
 {
-	unsigned long pfn, nr_pages, expire;
+	unsigned long pfn, nr_pages;
 	long offlined_pages;
-	int ret, drain, retry_max, node;
+	int ret, node;
 	struct zone *zone;
 	struct memory_notify arg;
 
@@ -1786,44 +1793,22 @@ static int __ref __offline_pages(unsigned long start_pfn,
 		goto failed_removal;
 
 	pfn = start_pfn;
-	expire = jiffies + timeout;
-	drain = 0;
-	retry_max = 5;
 repeat:
 	/* start memory hot removal */
-	ret = -EAGAIN;
-	if (time_after(jiffies, expire))
-		goto failed_removal;
 	ret = -EINTR;
 	if (signal_pending(current))
 		goto failed_removal;
-	ret = 0;
-	if (drain) {
-		lru_add_drain_all();
-		cond_resched();
-		drain_all_pages();
-	}
+
+	cond_resched();
+	lru_add_drain_all();
+	drain_all_pages();
 
 	pfn = scan_movable_pages(start_pfn, end_pfn);
 	if (pfn) { /* We have movable pages */
 		ret = do_migrate_range(pfn, end_pfn);
-		if (!ret) {
-			drain = 1;
-			goto repeat;
-		} else {
-			if (ret < 0)
-				if (--retry_max == 0)
-					goto failed_removal;
-			yield();
-			drain = 1;
-			goto repeat;
-		}
+		goto repeat;
 	}
-	/* drain all zone's lru pagevec, this is asynchronous... */
-	lru_add_drain_all();
-	yield();
-	/* drain pcp pages, this is synchronous. */
-	drain_all_pages();
+
 	/*
 	 * dissolve free hugepages in the memory block before doing offlining
 	 * actually in order to make hugetlbfs's object counting consistent.
@@ -1833,10 +1818,8 @@ repeat:
 		goto failed_removal;
 	/* check again */
 	offlined_pages = check_pages_isolated(start_pfn, end_pfn);
-	if (offlined_pages < 0) {
-		ret = -EBUSY;
-		goto failed_removal;
-	}
+	if (offlined_pages < 0)
+		goto repeat;
 	printk(KERN_INFO "Offlined Pages %ld\n", offlined_pages);
 	/* Ok, all of our target is isolated.
 	   We cannot do rollback at this point. */
@@ -1881,7 +1864,7 @@ failed_removal:
 /* Must be protected by mem_hotplug_begin() */
 int offline_pages(unsigned long start_pfn, unsigned long nr_pages)
 {
-	return __offline_pages(start_pfn, start_pfn + nr_pages, 120 * HZ);
+	return __offline_pages(start_pfn, start_pfn + nr_pages);
 }
 #endif /* CONFIG_MEMORY_HOTREMOVE */
 

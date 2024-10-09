@@ -44,6 +44,7 @@ enum term_type {
 	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
 	PERF_EVSEL__CONFIG_TERM_STACK_USER,
 	PERF_EVSEL__CONFIG_TERM_INHERIT,
+	PERF_EVSEL__CONFIG_TERM_MAX_EVENTS,
 	PERF_EVSEL__CONFIG_TERM_OVERWRITE,
 	PERF_EVSEL__CONFIG_TERM_DRV_CFG,
 	PERF_EVSEL__CONFIG_TERM_BRANCH,
@@ -62,6 +63,7 @@ struct perf_evsel_config_term {
 		bool	inherit;
 		bool	overwrite;
 		char	*branch;
+		unsigned long max_events;
 	} val;
 	bool weak;
 };
@@ -96,6 +98,7 @@ struct perf_evsel {
 	struct perf_counts	*prev_raw_counts;
 	int			idx;
 	u32			ids;
+	unsigned long		max_events;
 	char			*name;
 	double			scale;
 	const char		*unit;
@@ -125,6 +128,7 @@ struct perf_evsel {
 	bool			precise_max;
 	bool			ignore_missing_thread;
 	bool			forced_leader;
+	bool			use_uncore_alias;
 	/* parse modifier helper */
 	int			exclude_GH;
 	int			nr_members;
@@ -134,6 +138,7 @@ struct perf_evsel {
 	char			*group_name;
 	bool			cmdline_group_boundary;
 	struct list_head	config_terms;
+	int			bpf_fd;
 	bool			auto_merge_stats;
 	bool			merged_stat;
 	const char *		metric_expr;
@@ -396,6 +401,17 @@ static inline bool perf_evsel__is_group_event(struct perf_evsel *evsel)
 
 bool perf_evsel__is_function_event(struct perf_evsel *evsel);
 
+static inline bool perf_evsel__is_bpf_output(struct perf_evsel *evsel)
+{
+	return perf_evsel__match(evsel, SOFTWARE, SW_BPF_OUTPUT);
+}
+
+static inline bool perf_evsel__is_clock(struct perf_evsel *evsel)
+{
+	return perf_evsel__match(evsel, SOFTWARE, SW_CPU_CLOCK) ||
+	       perf_evsel__match(evsel, SOFTWARE, SW_TASK_CLOCK);
+}
+
 struct perf_attr_details {
 	bool freq;
 	bool verbose;
@@ -452,6 +468,11 @@ for ((_evsel) = _leader; 							\
 static inline bool perf_evsel__has_branch_callstack(const struct perf_evsel *evsel)
 {
 	return evsel->attr.branch_sample_type & PERF_SAMPLE_BRANCH_CALL_STACK;
+}
+
+static inline bool evsel__has_callchain(const struct perf_evsel *evsel)
+{
+	return (evsel->attr.sample_type & PERF_SAMPLE_CALLCHAIN) != 0;
 }
 
 typedef int (*attr__fprintf_f)(FILE *, const char *, const char *, void *);

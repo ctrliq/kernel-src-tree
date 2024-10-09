@@ -221,21 +221,14 @@ static int tlb_next_batch(struct mmu_gather *tlb)
 	return 1;
 }
 
-/* tlb_gather_mmu
- *	Called to initialize an (on-stack) mmu_gather structure for page-table
- *	tear-down from @mm. The @fullmm argument is used when @mm is without
- *	users and we're going to destroy the full address space (exit/execve).
- */
-void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
+void arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+		unsigned long start, unsigned long end)
 {
 	tlb->mm = mm;
 
 	/* Is it from 0 to ~0? */
 	tlb->fullmm     = !(start | (end+1));
 	tlb->need_flush_all = 0;
-	tlb->start	= start;
-	tlb->end	= end;
-	tlb->need_flush = 0;
 	tlb->local.next = NULL;
 	tlb->local.nr   = 0;
 	tlb->local.max  = ARRAY_SIZE(tlb->__pages);
@@ -245,21 +238,26 @@ void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long 
 #ifdef CONFIG_HAVE_RCU_TABLE_FREE
 	tlb->batch = NULL;
 #endif
+
+	__tlb_reset_range(tlb);
 }
 
-void tlb_flush_mmu(struct mmu_gather *tlb)
+static void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+{
+	if (!tlb->end)
+		return;
+	tlb_flush(tlb);
+	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
+	__tlb_reset_range(tlb);
+}
+
+static void tlb_flush_mmu_free(struct mmu_gather *tlb)
 {
 	struct mmu_gather_batch *batch;
 
-	if (!tlb->need_flush)
-		return;
-	tlb->need_flush = 0;
-	tlb_flush(tlb);
-	mmu_notifier_invalidate_range(tlb->mm, tlb->start, tlb->end);
 #ifdef CONFIG_HAVE_RCU_TABLE_FREE
 	tlb_table_flush(tlb);
 #endif
-
 	for (batch = &tlb->local; batch; batch = batch->next) {
 		free_pages_and_swap_cache(batch->pages, batch->nr);
 		batch->nr = 0;
@@ -267,13 +265,23 @@ void tlb_flush_mmu(struct mmu_gather *tlb)
 	tlb->active = &tlb->local;
 }
 
+void tlb_flush_mmu(struct mmu_gather *tlb)
+{
+	tlb_flush_mmu_tlbonly(tlb);
+	tlb_flush_mmu_free(tlb);
+}
+
 /* tlb_finish_mmu
  *	Called at the end of the shootdown operation to free up any resources
  *	that were required.
  */
-void tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
+void arch_tlb_finish_mmu(struct mmu_gather *tlb,
+		unsigned long start, unsigned long end, bool force)
 {
 	struct mmu_gather_batch *batch, *next;
+
+	if (force)
+		__tlb_adjust_range(tlb, start, end - start);
 
 	tlb_flush_mmu(tlb);
 
@@ -297,7 +305,7 @@ int __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
 {
 	struct mmu_gather_batch *batch;
 
-	VM_BUG_ON(!tlb->need_flush);
+	VM_BUG_ON(!tlb->end);
 
 	batch = tlb->active;
 	batch->pages[batch->nr++] = page;
@@ -318,6 +326,21 @@ int __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
 /*
  * See the comment near struct mmu_table_batch.
  */
+
+/*
+ * If we want tlb_remove_table() to imply TLB invalidates.
+ */
+static inline void tlb_table_invalidate(struct mmu_gather *tlb)
+{
+#ifdef CONFIG_HAVE_RCU_TABLE_INVALIDATE
+	/*
+	 * Invalidate page-table caches used by hardware walkers. Then we still
+	 * need to RCU-sched wait while freeing the pages because software
+	 * walkers can still be in-flight.
+	 */
+	tlb_flush_mmu_tlbonly(tlb);
+#endif
+}
 
 static void tlb_remove_table_smp_sync(void *arg)
 {
@@ -355,6 +378,7 @@ void tlb_table_flush(struct mmu_gather *tlb)
 	struct mmu_table_batch **batch = &tlb->batch;
 
 	if (*batch) {
+		tlb_table_invalidate(tlb);
 		call_rcu_sched(&(*batch)->rcu, tlb_remove_table_rcu);
 		*batch = NULL;
 	}
@@ -364,31 +388,50 @@ void tlb_remove_table(struct mmu_gather *tlb, void *table)
 {
 	struct mmu_table_batch **batch = &tlb->batch;
 
-	tlb->need_flush = 1;
-
-	/*
-	 * When there's less then two users of this mm there cannot be a
-	 * concurrent page-table walk.
-	 */
-	if (atomic_read(&tlb->mm->mm_users) < 2) {
-		__tlb_remove_table(table);
-		return;
-	}
-
 	if (*batch == NULL) {
 		*batch = (struct mmu_table_batch *)__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
 		if (*batch == NULL) {
+			tlb_table_invalidate(tlb);
 			tlb_remove_table_one(table);
 			return;
 		}
 		(*batch)->nr = 0;
 	}
+
 	(*batch)->tables[(*batch)->nr++] = table;
 	if ((*batch)->nr == MAX_TABLE_BATCH)
 		tlb_table_flush(tlb);
 }
 
 #endif /* CONFIG_HAVE_RCU_TABLE_FREE */
+
+/* tlb_gather_mmu
+ *	Called to initialize an (on-stack) mmu_gather structure for page-table
+ *	tear-down from @mm. The @fullmm argument is used when @mm is without
+ *	users and we're going to destroy the full address space (exit/execve).
+ */
+void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+			unsigned long start, unsigned long end)
+{
+	arch_tlb_gather_mmu(tlb, mm, start, end);
+	inc_tlb_flush_pending(tlb->mm);
+}
+
+void tlb_finish_mmu(struct mmu_gather *tlb,
+		unsigned long start, unsigned long end)
+{
+	/*
+	 * If there are parallel threads are doing PTE changes on same range
+	 * under non-exclusive lock(e.g., mmap_sem read-side) but defer TLB
+	 * flush by batching, a thread has stable TLB entry can fail to flush
+	 * the TLB by observing pte_none|!pte_dirty, for example so flush TLB
+	 * forcefully if we detect parallel PTE batching threads.
+	 */
+	bool force = mm_tlb_flush_nested(tlb->mm);
+
+	arch_tlb_finish_mmu(tlb, start, end, force);
+	dec_tlb_flush_pending(tlb->mm);
+}
 
 /*
  * If a p?d_bad entry is found while walking page tables, report
@@ -788,8 +831,12 @@ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
 			goto check_pfn;
 		if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
 			return NULL;
-		if (!is_zero_pfn(pfn))
-			print_bad_pte(vma, addr, pte, NULL);
+		if (is_zero_pfn(pfn))
+			return NULL;
+		if (pte_devmap(pte))
+			return NULL;
+
+		print_bad_pte(vma, addr, pte, NULL);
 		return NULL;
 	}
 
@@ -1190,8 +1237,10 @@ again:
 				set_pte_at(mm, addr, pte, ptfile);
 			}
 			if (!PageAnon(page)) {
-				if (pte_dirty(ptent))
+				if (pte_dirty(ptent)) {
+					force_flush = 1;
 					set_page_dirty(page);
+				}
 				if (pte_young(ptent) &&
 				    likely(!VM_SequentialReadHint(vma)))
 					mark_page_accessed(page);
@@ -1200,9 +1249,10 @@ again:
 			page_remove_rmap(page);
 			if (unlikely(page_mapcount(page) < 0))
 				print_bad_pte(vma, addr, ptent, page);
-			force_flush = !__tlb_remove_page(tlb, page);
-			if (force_flush)
+			if (unlikely(!__tlb_remove_page(tlb, page))) {
+				force_flush = 1;
 				break;
+			}
 			continue;
 		}
 
@@ -1249,30 +1299,21 @@ again:
 
 	add_mm_rss_vec(mm, rss);
 	arch_leave_lazy_mmu_mode();
+
+	/* Do the actual TLB flush before dropping ptl */
+	if (force_flush)
+		tlb_flush_mmu_tlbonly(tlb);
 	pte_unmap_unlock(start_pte, ptl);
 
 	/*
-	 * mmu_gather ran out of room to batch pages, we break out of
-	 * the PTE lock to avoid doing the potential expensive TLB invalidate
-	 * and page-free while holding it.
+	 * If we forced a TLB flush (either due to running out of
+	 * batch buffers or because we needed to flush dirty TLB
+	 * entries before releasing the ptl), free the batched
+	 * memory too. Restart if we didn't do everything.
 	 */
 	if (force_flush) {
-		unsigned long old_end;
-
 		force_flush = 0;
-
-		/*
-		 * Flush the TLB just for the previous segment,
-		 * then update the range to be the remaining
-		 * TLB range.
-		 */
-		old_end = tlb->end;
-		tlb->end = addr;
-
-		tlb_flush_mmu(tlb);
-
-		tlb->start = addr;
-		tlb->end = old_end;
+		tlb_flush_mmu_free(tlb);
 
 		if (addr != end)
 			goto again;
@@ -2709,16 +2750,26 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		unsigned int flags, pte_t orig_pte)
 {
 	spinlock_t *ptl;
-	struct page *page, *swapcache;
+	struct page *page = NULL, *swapcache;
 	swp_entry_t entry;
 	pte_t pte;
 	int locked;
 	struct mem_cgroup *ptr;
+	struct vma_swap_readahead swap_ra;
 	int exclusive = 0;
 	int ret = 0;
+	bool vma_readahead = swap_use_vma_readahead();
 
-	if (!pte_unmap_same(mm, pmd, page_table, orig_pte))
+	if (vma_readahead)
+		page = swap_readahead_detect(vma, &swap_ra,
+					     page_table, orig_pte, address);
+
+	if (!pte_unmap_same(mm, pmd, page_table, orig_pte)) {
+		if (page)
+			put_page(page);
+			// page_cache_release(page);
 		goto out;
+	}
 
 	entry = pte_to_swp_entry(orig_pte);
 	if (unlikely(non_swap_entry(entry))) {
@@ -2741,10 +2792,16 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 		goto out;
 	}
 	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
-	page = lookup_swap_cache(entry);
+	if (!page)
+		page = lookup_swap_cache(entry, vma_readahead ? vma : NULL,
+					 address);
 	if (!page) {
-		page = swapin_readahead(entry,
-					GFP_HIGHUSER_MOVABLE, vma, address);
+		if (vma_readahead)
+			page = do_swap_page_readahead(entry,
+				GFP_HIGHUSER_MOVABLE, vma, address, &swap_ra);
+		else
+			page = swapin_readahead(entry,
+				GFP_HIGHUSER_MOVABLE, vma, address);
 		if (!page) {
 			/*
 			 * Back out if somebody else faulted in this pte
@@ -4035,7 +4092,7 @@ void print_vma_addr(char *prefix, unsigned long ip)
 }
 
 #if defined(CONFIG_PROVE_LOCKING) || defined(CONFIG_DEBUG_ATOMIC_SLEEP)
-void might_fault(void)
+void __might_fault(const char *file, int line)
 {
 	/*
 	 * Some code (nfs/sunrpc) uses socket ops on kernel memory while
@@ -4045,21 +4102,15 @@ void might_fault(void)
 	 */
 	if (segment_eq(get_fs(), KERNEL_DS))
 		return;
-
-	/*
-	 * it would be nicer only to annotate paths which are not under
-	 * pagefault_disable, however that requires a larger audit and
-	 * providing helpers like get_user_atomic.
-	 */
-	if (in_atomic())
+	if (pagefault_disabled())
 		return;
-
-	__might_sleep(__FILE__, __LINE__, 0);
-
+	__might_sleep(file, line, 0);
+#if defined(CONFIG_DEBUG_ATOMIC_SLEEP)
 	if (current->mm)
 		might_lock_read(&current->mm->mmap_sem);
+#endif
 }
-EXPORT_SYMBOL(might_fault);
+EXPORT_SYMBOL(__might_fault);
 #endif
 
 #if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_HUGETLBFS)

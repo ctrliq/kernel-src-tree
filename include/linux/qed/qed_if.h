@@ -47,7 +47,6 @@
 #include <linux/slab.h>
 #include <linux/qed/common_hsi.h>
 #include <linux/qed/qed_chain.h>
-#include <linux/io-64-nonatomic-lo-hi.h>
 
 enum dcbx_protocol_type {
 	DCBX_PROTOCOL_ISCSI,

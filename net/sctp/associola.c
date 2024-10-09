@@ -1025,9 +1025,10 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 	struct sctp_endpoint *ep;
 	struct sctp_chunk *chunk;
 	struct sctp_inq *inqueue;
-	int state;
 	sctp_subtype_t subtype;
+	int first_time = 1;	/* is this the first time through the loop */
 	int error = 0;
+	int state;
 
 	/* The association should be held so we should be safe. */
 	ep = asoc->ep;
@@ -1038,6 +1039,30 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 		state = asoc->state;
 		subtype = SCTP_ST_CHUNK(chunk->chunk_hdr->type);
 
+		/* If the first chunk in the packet is AUTH, do special
+		 * processing specified in Section 6.3 of SCTP-AUTH spec
+		 */
+		if (first_time && subtype.chunk == SCTP_CID_AUTH) {
+			struct sctp_chunkhdr *next_hdr;
+
+			next_hdr = sctp_inq_peek(inqueue);
+			if (!next_hdr)
+				goto normal;
+
+			/* If the next chunk is COOKIE-ECHO, skip the AUTH
+			 * chunk while saving a pointer to it so we can do
+			 * Authentication later (during cookie-echo
+			 * processing).
+			 */
+			if (next_hdr->type == SCTP_CID_COOKIE_ECHO) {
+				chunk->auth_chunk = skb_clone(chunk->skb,
+							      GFP_ATOMIC);
+				chunk->auth = 1;
+				continue;
+			}
+		}
+
+normal:
 		/* SCTP-AUTH, Section 6.3:
 		 *    The receiver has a list of chunk types which it expects
 		 *    to be received only after an AUTH-chunk.  This list has
@@ -1076,6 +1101,9 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
 		/* If there is an error on chunk, discard this packet. */
 		if (error && chunk)
 			chunk->pdiscard = 1;
+
+		if (first_time)
+			first_time = 0;
 	}
 	sctp_association_put(asoc);
 }
@@ -1426,8 +1454,8 @@ void sctp_assoc_sync_pmtu(struct sctp_association *asoc)
 	list_for_each_entry(t, &asoc->peer.transport_addr_list,
 				transports) {
 		if (t->pmtu_pending && t->dst) {
-			sctp_transport_update_pmtu(
-					t, SCTP_TRUNC4(dst_mtu(t->dst)));
+			sctp_transport_update_pmtu(t,
+						   atomic_read(&t->mtu_info));
 			t->pmtu_pending = 0;
 		}
 		if (!pmtu || (t->pathmtu < pmtu))

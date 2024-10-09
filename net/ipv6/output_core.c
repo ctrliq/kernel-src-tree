@@ -7,6 +7,7 @@
 #include <net/ipv6.h>
 #include <net/ip6_fib.h>
 #include <net/addrconf.h>
+#include <linux/netfilter.h>
 
 static u32 __ipv6_select_ident(struct net *net, u32 hashrnd,
 			       const struct in6_addr *dst,

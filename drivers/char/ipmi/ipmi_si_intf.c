@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * ipmi_si.c
  *
@@ -10,27 +11,6 @@
  *
  * Copyright 2002 MontaVista Software Inc.
  * Copyright 2006 IBM Corp., Christian Krafft <krafft@de.ibm.com>
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the
- *  Free Software Foundation; either version 2 of the License, or (at your
- *  option) any later version.
- *
- *
- *  THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
- *  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- *  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- *  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- *  OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- *  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
- *  TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
- *  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 /*
@@ -38,6 +18,8 @@
  * machine.  It does the configuration, handles timers and interrupts,
  * and drives the real SMI state machine.
  */
+
+#define pr_fmt(fmt) "ipmi_si: " fmt
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -60,8 +42,6 @@
 #include "ipmi_si.h"
 #include <linux/string.h>
 #include <linux/ctype.h>
-
-#define PFX "ipmi_si: "
 
 /* Measure times between events in the driver. */
 #undef DEBUG_TIMING
@@ -142,7 +122,7 @@ enum si_stat_indexes {
 };
 
 struct smi_info {
-	int                    intf_num;
+	int                    si_num;
 	ipmi_smi_t             intf;
 	struct si_sm_data      *si_sm;
 	const struct si_sm_handlers *handlers;
@@ -983,8 +963,8 @@ static inline int ipmi_thread_busy_wait(enum si_sm_result smi_result,
 {
 	unsigned int max_busy_us = 0;
 
-	if (smi_info->intf_num < num_max_busy_us)
-		max_busy_us = kipmid_max_busy_us[smi_info->intf_num];
+	if (smi_info->si_num < num_max_busy_us)
+		max_busy_us = kipmid_max_busy_us[smi_info->si_num];
 	if (max_busy_us == 0 || smi_result != SI_SM_CALL_WITH_DELAY)
 		ipmi_si_set_not_busy(busy_until);
 	else if (!ipmi_si_is_busy(busy_until)) {
@@ -1098,9 +1078,9 @@ static void set_need_watch(void *send_info, int enable)
 	spin_unlock_irqrestore(&smi_info->si_lock, flags);
 }
 
-static void smi_timeout(unsigned long data)
+static void smi_timeout(struct timer_list *t)
 {
-	struct smi_info   *smi_info = (struct smi_info *) data;
+	struct smi_info   *smi_info = from_timer(smi_info, t, si_timer);
 	enum si_sm_result smi_result;
 	unsigned long     flags;
 	unsigned long     jiffies_now;
@@ -1173,7 +1153,7 @@ static int smi_start_processing(void       *send_info,
 	new_smi->intf = intf;
 
 	/* Set up the timer that drives the interface. */
-	setup_timer(&new_smi->si_timer, smi_timeout, (long)new_smi);
+	timer_setup(&new_smi->si_timer, smi_timeout, 0);
 	new_smi->timer_can_start = true;
 	smi_mod_timer(new_smi, jiffies + SI_TIMEOUT_JIFFIES);
 
@@ -1186,8 +1166,8 @@ static int smi_start_processing(void       *send_info,
 	/*
 	 * Check if the user forcefully enabled the daemon.
 	 */
-	if (new_smi->intf_num < num_force_kipmid)
-		enable = force_kipmid[new_smi->intf_num];
+	if (new_smi->si_num < num_force_kipmid)
+		enable = force_kipmid[new_smi->si_num];
 	/*
 	 * The BT interface is efficient enough to not need a thread,
 	 * and there is no need for a thread if we have interrupts.
@@ -1197,7 +1177,7 @@ static int smi_start_processing(void       *send_info,
 
 	if (enable) {
 		new_smi->thread = kthread_run(ipmi_thread, new_smi,
-					      "kipmi%d", new_smi->intf_num);
+					      "kipmi%d", new_smi->si_num);
 		if (IS_ERR(new_smi->thread)) {
 			dev_notice(new_smi->io.dev, "Could not start"
 				   " kernel thread due to error %ld, only using"
@@ -1553,7 +1533,7 @@ static int try_enable_event_buffer(struct smi_info *smi_info)
 
 	rv = wait_for_msg_done(smi_info);
 	if (rv) {
-		pr_warn(PFX "Error getting response from get global enables command, the event buffer is not enabled.\n");
+		pr_warn("Error getting response from get global enables command, the event buffer is not enabled\n");
 		goto out;
 	}
 
@@ -1564,7 +1544,7 @@ static int try_enable_event_buffer(struct smi_info *smi_info)
 			resp[0] != (IPMI_NETFN_APP_REQUEST | 1) << 2 ||
 			resp[1] != IPMI_GET_BMC_GLOBAL_ENABLES_CMD   ||
 			resp[2] != 0) {
-		pr_warn(PFX "Invalid return from get global enables command, cannot enable the event buffer.\n");
+		pr_warn("Invalid return from get global enables command, cannot enable the event buffer\n");
 		rv = -EINVAL;
 		goto out;
 	}
@@ -1582,7 +1562,7 @@ static int try_enable_event_buffer(struct smi_info *smi_info)
 
 	rv = wait_for_msg_done(smi_info);
 	if (rv) {
-		pr_warn(PFX "Error getting response from set global, enables command, the event buffer is not enabled.\n");
+		pr_warn("Error getting response from set global, enables command, the event buffer is not enabled\n");
 		goto out;
 	}
 
@@ -1592,7 +1572,7 @@ static int try_enable_event_buffer(struct smi_info *smi_info)
 	if (resp_len < 3 ||
 			resp[0] != (IPMI_NETFN_APP_REQUEST | 1) << 2 ||
 			resp[1] != IPMI_SET_BMC_GLOBAL_ENABLES_CMD) {
-		pr_warn(PFX "Invalid return from get global, enables command, not enable the event buffer.\n");
+		pr_warn("Invalid return from get global, enables command, not enable the event buffer\n");
 		rv = -EINVAL;
 		goto out;
 	}
@@ -1981,6 +1961,18 @@ int ipmi_si_add_smi(struct si_sm_io *io)
 	int rv = 0;
 	struct smi_info *new_smi, *dup;
 
+	/*
+	 * If the user gave us a hard-coded device at the same
+	 * address, they presumably want us to use it and not what is
+	 * in the firmware.
+	 */
+	if (io->addr_source != SI_HARDCODED &&
+	    ipmi_si_hardcode_match(io->addr_type, io->addr_data)) {
+		dev_info(io->dev,
+			 "Hard-coded device at this address already exists");
+		return -ENODEV;
+	}
+
 	if (!io->io_setup) {
 		if (io->addr_type == IPMI_IO_ADDR_SPACE) {
 			io->io_setup = ipmi_si_port_setup;
@@ -2019,7 +2011,7 @@ int ipmi_si_add_smi(struct si_sm_io *io)
 		}
 	}
 
-	pr_info(PFX "Adding %s-specified %s state machine\n",
+	pr_info("Adding %s-specified %s state machine\n",
 		ipmi_addr_src_to_str(new_smi->io.addr_source),
 		si_to_str[new_smi->io.si_type]);
 
@@ -2050,7 +2042,7 @@ static int try_smi_init(struct smi_info *new_smi)
 	struct ipmi_shadow_smi_handlers *shadow_handlers;
 	char *init_name = NULL;
 
-	pr_info(PFX "Trying %s-specified %s state machine at %s address 0x%lx, slave address 0x%x, irq %d\n",
+	pr_info("Trying %s-specified %s state machine at %s address 0x%lx, slave address 0x%x, irq %d\n",
 		ipmi_addr_src_to_str(new_smi->io.addr_source),
 		si_to_str[new_smi->io.si_type],
 		addr_space_to_str[new_smi->io.addr_type],
@@ -2076,21 +2068,21 @@ static int try_smi_init(struct smi_info *new_smi)
 		goto out_err;
 	}
 
-	new_smi->intf_num = smi_num;
+	new_smi->si_num = smi_num;
 
 	/* Do this early so it's available for logs. */
 	if (!new_smi->io.dev) {
 		init_name = kasprintf(GFP_KERNEL, "ipmi_si.%d",
-				      new_smi->intf_num);
+				      new_smi->si_num);
 
 		/*
 		 * If we don't already have a device from something
 		 * else (like PCI), then register a new one.
 		 */
 		new_smi->pdev = platform_device_alloc("ipmi_si",
-						      new_smi->intf_num);
+						      new_smi->si_num);
 		if (!new_smi->pdev) {
-			pr_err(PFX "Unable to allocate platform device\n");
+			pr_err("Unable to allocate platform device\n");
 			rv = -ENOMEM;
 			goto out_err;
 		}
@@ -2258,7 +2250,7 @@ out_err:
 	return rv;
 }
 
-static int init_ipmi_si(void)
+static int __init init_ipmi_si(void)
 {
 	struct smi_info *e;
 	enum ipmi_addr_src type = SI_INVALID;
@@ -2277,11 +2269,9 @@ static int init_ipmi_si(void)
 	shadow_handlers->handlers = &handlers;
 	shadow_handlers->set_need_watch = set_need_watch;
 
-	pr_info("IPMI System Interface driver.\n");
+	ipmi_hardcode_init();
 
-	/* If the user gave us a device, they presumably want us to use it */
-	if (!ipmi_si_hardcode_find_bmc())
-		goto do_scan;
+	pr_info("IPMI System Interface driver\n");
 
 	ipmi_si_platform_init();
 
@@ -2293,7 +2283,6 @@ static int init_ipmi_si(void)
 	   with multiple BMCs we assume that there will be several instances
 	   of a given type so if we succeed in registering a type then also
 	   try to register everything else of the same type */
-do_scan:
 	mutex_lock(&smi_infos_lock);
 	list_for_each_entry(e, &smi_infos, link) {
 		/* Try to register a device if it has an IRQ and we either
@@ -2331,7 +2320,7 @@ skip_fallback_noirq:
 	if (unload_when_empty && list_empty(&smi_infos)) {
 		mutex_unlock(&smi_infos_lock);
 		cleanup_ipmi_si();
-		pr_warn(PFX "Unable to find any System Interface(s)\n");
+		pr_warn("Unable to find any System Interface(s)\n");
 		return -ENODEV;
 	} else {
 		mutex_unlock(&smi_infos_lock);
@@ -2350,8 +2339,7 @@ static void shutdown_one_si(struct smi_info *smi_info)
 		smi_info->intf = NULL;
 		rv = ipmi_unregister_smi(intf);
 		if (rv) {
-			pr_err(PFX "Unable to unregister device: errno=%d\n",
-			       rv);
+			pr_err("Unable to unregister device: errno=%d\n", rv);
 		}
 	}
 
@@ -2378,7 +2366,7 @@ static void shutdown_one_si(struct smi_info *smi_info)
 	 * handlers might have been running before we freed the
 	 * interrupt.
 	 */
-	synchronize_sched();
+	synchronize_rcu();
 
 	/*
 	 * Timeouts are stopped, now make sure the interrupts are off
@@ -2483,6 +2471,8 @@ static void cleanup_ipmi_si(void)
 	list_for_each_entry_safe(e, tmp_e, &smi_infos, link)
 		cleanup_one_si(e);
 	mutex_unlock(&smi_infos_lock);
+
+	ipmi_si_hardcode_exit();
 }
 module_exit(cleanup_ipmi_si);
 

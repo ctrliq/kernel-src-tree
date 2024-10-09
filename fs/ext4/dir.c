@@ -345,7 +345,7 @@ static loff_t ext4_dir_llseek(struct file *file, loff_t offset, int whence)
 						    htree_max, htree_max);
 	else
 		ret = ext4_llseek(file, offset, whence);
-	file->f_version = inode_peek_iversion(inode) - 1;
+	file->f_version = inode->i_version - 1;
 	return ret;
 }
 

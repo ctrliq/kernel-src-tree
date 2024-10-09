@@ -31,8 +31,7 @@ static int xfrm4_tunnel_check_size(struct sk_buff *skb)
 	mtu = dst_mtu(skb_dst(skb));
 	if (skb->len > mtu) {
 		if (skb->sk)
-			ip_local_error(skb->sk, EMSGSIZE, ip_hdr(skb)->daddr,
-				       inet_sk(skb->sk)->inet_dport, mtu);
+			xfrm_local_error(skb, mtu);
 		else
 			icmp_send(skb, ICMP_DEST_UNREACH,
 				  ICMP_FRAG_NEEDED, htonl(mtu));
@@ -100,4 +99,13 @@ int xfrm4_output(struct sock *sk, struct sk_buff *skb)
 	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING, sk, skb,
 			    NULL, skb_dst(skb)->dev, __xfrm4_output,
 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
+}
+
+void xfrm4_local_error(struct sk_buff *skb, u32 mtu)
+{
+	struct iphdr *hdr;
+
+	hdr = skb->encapsulation ? inner_ip_hdr(skb) : ip_hdr(skb);
+	ip_local_error(skb->sk, EMSGSIZE, hdr->daddr,
+		       inet_sk(skb->sk)->inet_dport, mtu);
 }

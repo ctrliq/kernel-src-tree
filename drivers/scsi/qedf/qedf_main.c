@@ -2939,8 +2939,7 @@ static void qedf_free_fcoe_pf_param(struct qedf_ctx *qedf)
 
 	qedf_free_global_queues(qedf);
 
-	if (qedf->global_queues)
-		kfree(qedf->global_queues);
+	kfree(qedf->global_queues);
 }
 
 /*

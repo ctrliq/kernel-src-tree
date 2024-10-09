@@ -140,6 +140,14 @@ static void nft_rbtree_activate(const struct nft_set *set,
 	nft_set_elem_change_active(set, &rbe->ext);
 }
 
+static bool nft_rbtree_deactivate_one(const struct nft_set *set, void *priv)
+{
+	struct nft_rbtree_elem *rbe = priv;
+
+	nft_set_elem_change_active(set, &rbe->ext);
+	return true;
+}
+
 static void *nft_rbtree_deactivate(const struct nft_set *set,
 				   const struct nft_set_elem *elem)
 {
@@ -163,7 +171,7 @@ static void *nft_rbtree_deactivate(const struct nft_set *set,
 				parent = parent->rb_left;
 				continue;
 			}
-			nft_set_elem_change_active(set, &rbe->ext);
+			nft_rbtree_deactivate_one(set, rbe);
 			return rbe;
 		}
 	}
@@ -171,7 +179,7 @@ static void *nft_rbtree_deactivate(const struct nft_set *set,
 }
 
 static void nft_rbtree_walk(const struct nft_ctx *ctx,
-			    const struct nft_set *set,
+			    struct nft_set *set,
 			    struct nft_set_iter *iter)
 {
 	const struct nft_rbtree *priv = nft_set_priv(set);
@@ -255,6 +263,7 @@ static struct nft_set_ops nft_rbtree_ops __read_mostly = {
 	.insert		= nft_rbtree_insert,
 	.remove		= nft_rbtree_remove,
 	.deactivate	= nft_rbtree_deactivate,
+	.deactivate_one	= nft_rbtree_deactivate_one,
 	.activate	= nft_rbtree_activate,
 	.lookup		= nft_rbtree_lookup,
 	.walk		= nft_rbtree_walk,

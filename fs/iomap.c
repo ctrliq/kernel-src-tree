@@ -162,7 +162,7 @@ iomap_write_begin(struct inode *inode, loff_t pos, unsigned len, unsigned flags,
 
 static int
 iomap_write_end_inline(struct inode *inode, struct page *page,
-		struct iomap *iomap, loff_t pos, unsigned copied)
+		struct iomap *iomap, loff_t pos, unsigned len, unsigned copied)
 {
 	void *addr;
 
@@ -174,7 +174,8 @@ iomap_write_end_inline(struct inode *inode, struct page *page,
 	kunmap_atomic(addr);
 
 	mark_inode_dirty(inode);
-	__generic_write_end(inode, pos, copied, page);
+	__generic_write_end(NULL, inode->i_mapping, pos, len, copied, page,
+			NULL);
 	return copied;
 }
 
@@ -185,7 +186,8 @@ iomap_write_end(struct inode *inode, loff_t pos, unsigned len,
 	int ret;
 
 	if (iomap->type == IOMAP_INLINE) {
-		ret = iomap_write_end_inline(inode, page, iomap, pos, copied);
+		ret = iomap_write_end_inline(inode, page, iomap, pos, len,
+				copied);
 	} else {
 		ret = generic_write_end(NULL, inode->i_mapping, pos, len,
 				copied, page, NULL);
@@ -567,10 +569,13 @@ static int iomap_to_fiemap(struct fiemap_extent_info *fi,
 	case IOMAP_DELALLOC:
 		flags |= FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNKNOWN;
 		break;
+	case IOMAP_MAPPED:
+		break;
 	case IOMAP_UNWRITTEN:
 		flags |= FIEMAP_EXTENT_UNWRITTEN;
 		break;
-	case IOMAP_MAPPED:
+	case IOMAP_INLINE:
+		flags |= FIEMAP_EXTENT_DATA_INLINE;
 		break;
 	}
 
@@ -578,8 +583,6 @@ static int iomap_to_fiemap(struct fiemap_extent_info *fi,
 		flags |= FIEMAP_EXTENT_MERGED;
 	if (iomap->flags & IOMAP_F_SHARED)
 		flags |= FIEMAP_EXTENT_SHARED;
-	if (iomap->flags & IOMAP_F_DATA_INLINE)
-		flags |= FIEMAP_EXTENT_DATA_INLINE;
 
 	return fiemap_fill_next_extent(fi, iomap->offset,
 			iomap->addr != IOMAP_NULL_ADDR ? iomap->addr : 0,

@@ -1,6 +1,6 @@
 # Makefile for Linux PHY drivers
 
-libphy-objs			:= phy.o phy_device.o mdio_bus.o
+libphy-objs			:= phy.o phy-c45.o phy_device.o mdio_bus.o phy-core.o
 
 obj-$(CONFIG_PHYLIB)		+= libphy.o
 obj-$(CONFIG_MARVELL_PHY)	+= marvell.o

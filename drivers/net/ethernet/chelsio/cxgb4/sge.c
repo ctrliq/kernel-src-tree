@@ -392,7 +392,7 @@ void free_tx_desc(struct adapter *adap, struct sge_txq *q,
  */
 static inline int reclaimable(const struct sge_txq *q)
 {
-	int hw_cidx = ntohs(ACCESS_ONCE(q->stat->cidx));
+	int hw_cidx = ntohs(READ_ONCE(q->stat->cidx));
 	hw_cidx -= q->cidx;
 	return hw_cidx < 0 ? hw_cidx + q->size : hw_cidx;
 }
@@ -696,7 +696,7 @@ static void *alloc_ring(struct device *dev, size_t nelem, size_t elem_size,
 	if (!p)
 		return NULL;
 	if (sw_size) {
-		s = kzalloc_node(nelem * sw_size, GFP_KERNEL, node);
+		s = kcalloc_node(sw_size, nelem, GFP_KERNEL, node);
 
 		if (!s) {
 			dma_free_coherent(dev, len, p, *phys);
@@ -1874,7 +1874,7 @@ netdev_tx_t t4_start_xmit(struct sk_buff *skb, struct net_device *dev)
  */
 static inline void reclaim_completed_tx_imm(struct sge_txq *q)
 {
-	int hw_cidx = ntohs(ACCESS_ONCE(q->stat->cidx));
+	int hw_cidx = ntohs(READ_ONCE(q->stat->cidx));
 	int reclaim = hw_cidx - q->cidx;
 
 	if (reclaim < 0)

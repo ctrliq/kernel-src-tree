@@ -266,7 +266,7 @@ int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m)
 	desc->affinity_hint = m;
 	irq_put_desc_unlock(desc, flags);
 	/* set the initial affinity to prevent every interrupt being on CPU0 */
-	if (m)
+	if (m && irqaffinity_drivers)
 		__irq_set_affinity(irq, m, false);
 	return 0;
 }

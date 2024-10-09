@@ -794,8 +794,10 @@ static struct mlxsw_sp_vr *mlxsw_sp_vr_create(struct mlxsw_sp *mlxsw_sp,
 	int err;
 
 	vr = mlxsw_sp_vr_find_unused(mlxsw_sp);
-	if (!vr)
+	if (!vr) {
+		NL_SET_ERR_MSG(extack, "spectrum: Exceeded number of supported virtual routers");
 		return ERR_PTR(-EBUSY);
+	}
 	fib4 = mlxsw_sp_fib_create(mlxsw_sp, vr, MLXSW_SP_L3_PROTO_IPV4);
 	if (IS_ERR(fib4))
 		return ERR_CAST(fib4);
@@ -6079,8 +6081,10 @@ mlxsw_sp_rif_create(struct mlxsw_sp *mlxsw_sp,
 	vr->rif_count++;
 
 	err = mlxsw_sp_rif_index_alloc(mlxsw_sp, &rif_index);
-	if (err)
+	if (err) {
+		NL_SET_ERR_MSG(extack, "spectrum: Exceeded number of supported router interfaces");
 		goto err_rif_index_alloc;
+	}
 
 	rif = mlxsw_sp_rif_alloc(ops->rif_size, rif_index, vr->id, params->dev);
 	if (!rif) {

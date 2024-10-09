@@ -19,6 +19,8 @@ struct notifier_block;
 
 struct bio;
 
+struct pagevec;
+
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
 #define SWAP_FLAG_PRIO_SHIFT	0
@@ -283,6 +285,25 @@ struct swap_info_struct {
 	RH_KABI_EXTEND(struct percpu_cluster __percpu *percpu_cluster) /* per cpu's swap location */
 };
 
+#ifdef CONFIG_64BIT
+#define SWAP_RA_ORDER_CEILING	5
+#else
+/* Avoid stack overflow, because we need to save part of page table */
+#define SWAP_RA_ORDER_CEILING	3
+#define SWAP_RA_PTE_CACHE_SIZE	(1 << SWAP_RA_ORDER_CEILING)
+#endif
+
+struct vma_swap_readahead {
+	unsigned short win;
+	unsigned short offset;
+	unsigned short nr_pte;
+#ifdef CONFIG_64BIT
+	pte_t *ptes;
+#else
+	pte_t ptes[SWAP_RA_PTE_CACHE_SIZE];
+#endif
+};
+
 /* linux/mm/workingset.c */
 void *workingset_eviction(struct address_space *mapping, struct page *page);
 bool workingset_refault(void *shadow);
@@ -396,7 +417,7 @@ static inline int zone_reclaim(struct zone *z, gfp_t mask, unsigned int order)
 #endif
 
 extern int page_evictable(struct page *page);
-extern void check_move_unevictable_pages(struct page **, int nr_pages);
+extern void check_move_unevictable_pages(struct pagevec *pvec);
 
 extern int kswapd_run(int nid);
 extern void kswapd_stop(int nid);
@@ -436,6 +457,7 @@ extern struct backing_dev_info swap_backing_dev_info;
 #define SWAP_ADDRESS_SPACE_SHIFT	14
 #define SWAP_ADDRESS_SPACE_PAGES	(1 << SWAP_ADDRESS_SPACE_SHIFT)
 extern struct address_space *swapper_spaces[];
+extern bool swap_vma_readahead;
 #define swap_address_space(entry)			    \
 	(&swapper_spaces[swp_type(entry)][swp_offset(entry) \
 		>> SWAP_ADDRESS_SPACE_SHIFT])
@@ -448,7 +470,9 @@ extern void __delete_from_swap_cache(struct page *);
 extern void delete_from_swap_cache(struct page *);
 extern void free_page_and_swap_cache(struct page *);
 extern void free_pages_and_swap_cache(struct page **, int);
-extern struct page *lookup_swap_cache(swp_entry_t);
+extern struct page *lookup_swap_cache(swp_entry_t entry,
+				      struct vm_area_struct *vma,
+				      unsigned long addr);
 extern struct page *read_swap_cache_async(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
 extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
@@ -457,10 +481,25 @@ extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
 extern struct page *swapin_readahead(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
 
+extern struct page *swap_readahead_detect(struct vm_area_struct *vma,
+					  struct vma_swap_readahead *swap_ra,
+					  pte_t *page_table, pte_t orig_pte,
+					  unsigned long address);
+extern struct page *do_swap_page_readahead(swp_entry_t fentry, gfp_t gfp_mask,
+					   struct vm_area_struct *vma,
+					   unsigned long address,
+					   struct vma_swap_readahead *swap_ra);
+
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
+extern atomic_t nr_rotate_swap;
 extern bool has_usable_swap(void);
+
+static inline bool swap_use_vma_readahead(void)
+{
+	return READ_ONCE(swap_vma_readahead) && !atomic_read(&nr_rotate_swap);
+}
 
 /* Swap 50% full? Release swapcache more aggressively.. */
 static inline bool vm_swap_full(void)
@@ -563,12 +602,34 @@ static inline struct page *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
 	return NULL;
 }
 
+static inline bool swap_use_vma_readahead(void)
+{
+	return false;
+}
+
+static inline struct page *swap_readahead_detect(
+	struct vm_area_struct *vma, struct vma_swap_readahead *swap_ra,
+	pte_t *page_table, pte_t orig_pte, unsigned long address)
+{
+	return NULL;
+}
+
+static inline struct page *do_swap_page_readahead(
+	swp_entry_t fentry, gfp_t gfp_mask,
+	struct vm_area_struct *vma, unsigned long address,
+	struct vma_swap_readahead *swap_ra)
+{
+	return NULL;
+}
+
 static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
 {
 	return 0;
 }
 
-static inline struct page *lookup_swap_cache(swp_entry_t swp)
+static inline struct page *lookup_swap_cache(swp_entry_t swp,
+					     struct vm_area_struct *vma,
+					     unsigned long addr)
 {
 	return NULL;
 }

@@ -4817,6 +4817,64 @@ int pcie_get_minimum_link(struct pci_dev *dev, enum pci_bus_speed *speed,
 EXPORT_SYMBOL(pcie_get_minimum_link);
 
 /**
+ * pcie_bandwidth_available - determine minimum link settings of a PCIe
+ *			      device and its bandwidth limitation
+ * @dev: PCI device to query
+ * @limiting_dev: storage for device causing the bandwidth limitation
+ * @speed: storage for speed of limiting device
+ * @width: storage for width of limiting device
+ *
+ * Walk up the PCI device chain and find the point where the minimum
+ * bandwidth is available.  Return the bandwidth available there and (if
+ * limiting_dev, speed, and width pointers are supplied) information about
+ * that point.  The bandwidth returned is in Mb/s, i.e., megabits/second of
+ * raw bandwidth.
+ */
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
+			     enum pci_bus_speed *speed,
+			     enum pcie_link_width *width)
+{
+	u16 lnksta;
+	enum pci_bus_speed next_speed;
+	enum pcie_link_width next_width;
+	u32 bw, next_bw;
+
+	if (speed)
+		*speed = PCI_SPEED_UNKNOWN;
+	if (width)
+		*width = PCIE_LNK_WIDTH_UNKNOWN;
+
+	bw = 0;
+
+	while (dev) {
+		pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
+
+		next_speed = pcie_link_speed[lnksta & PCI_EXP_LNKSTA_CLS];
+		next_width = (lnksta & PCI_EXP_LNKSTA_NLW) >>
+			PCI_EXP_LNKSTA_NLW_SHIFT;
+
+		next_bw = next_width * PCIE_SPEED2MBS_ENC(next_speed);
+
+		/* Check if current device limits the total bandwidth */
+		if (!bw || next_bw <= bw) {
+			bw = next_bw;
+
+			if (limiting_dev)
+				*limiting_dev = dev;
+			if (speed)
+				*speed = next_speed;
+			if (width)
+				*width = next_width;
+		}
+
+		dev = pci_upstream_bridge(dev);
+	}
+
+	return bw;
+}
+EXPORT_SYMBOL(pcie_bandwidth_available);
+
+/**
  * pcie_get_speed_cap - query for the PCI device's link speed capability
  * @dev: PCI device to query
  *
@@ -4901,6 +4959,51 @@ u32 pcie_bandwidth_capable(struct pci_dev *dev, enum pci_bus_speed *speed,
 
 	return *width * PCIE_SPEED2MBS_ENC(*speed);
 }
+
+/**
+ * __pcie_print_link_status - Report the PCI device's link speed and width
+ * @dev: PCI device to query
+ * @verbose: Print info even when enough bandwidth is available
+ *
+ * If the available bandwidth at the device is less than the device is
+ * capable of, report the device's maximum possible bandwidth and the
+ * upstream link that limits its performance.  If @verbose, always print
+ * the available bandwidth, even if the device isn't constrained.
+ */
+void __pcie_print_link_status(struct pci_dev *dev, bool verbose)
+{
+	enum pcie_link_width width, width_cap;
+	enum pci_bus_speed speed, speed_cap;
+	struct pci_dev *limiting_dev = NULL;
+	u32 bw_avail, bw_cap;
+
+	bw_cap = pcie_bandwidth_capable(dev, &speed_cap, &width_cap);
+	bw_avail = pcie_bandwidth_available(dev, &limiting_dev, &speed, &width);
+
+	if (bw_avail >= bw_cap && verbose)
+		pci_info(dev, "%u.%03u Gb/s available PCIe bandwidth (%s x%d link)\n",
+			 bw_cap / 1000, bw_cap % 1000,
+			 PCIE_SPEED2STR(speed_cap), width_cap);
+	else if (bw_avail < bw_cap)
+		pci_info(dev, "%u.%03u Gb/s available PCIe bandwidth, limited by %s x%d link at %s (capable of %u.%03u Gb/s with %s x%d link)\n",
+			 bw_avail / 1000, bw_avail % 1000,
+			 PCIE_SPEED2STR(speed), width,
+			 limiting_dev ? pci_name(limiting_dev) : "<unknown>",
+			 bw_cap / 1000, bw_cap % 1000,
+			 PCIE_SPEED2STR(speed_cap), width_cap);
+}
+
+/**
+ * pcie_print_link_status - Report the PCI device's link speed and width
+ * @dev: PCI device to query
+ *
+ * Report the available bandwidth at the device.
+ */
+void pcie_print_link_status(struct pci_dev *dev)
+{
+	__pcie_print_link_status(dev, true);
+}
+EXPORT_SYMBOL(pcie_print_link_status);
 
 /**
  * pci_select_bars - Make BAR mask from the type of resource

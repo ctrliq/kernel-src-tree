@@ -1100,11 +1100,11 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
 			return -EMSGSIZE;
 	}
 
-	if (ops->dcbnl_getbuffer) {
+	if (eops && eops->dcbnl_getbuffer) {
 		struct dcbnl_buffer buffer;
 
 		memset(&buffer, 0, sizeof(buffer));
-		err = ops->dcbnl_getbuffer(netdev, &buffer);
+		err = eops->dcbnl_getbuffer(netdev, &buffer);
 		if (!err &&
 		    nla_put(skb, DCB_ATTR_DCB_BUFFER, sizeof(buffer), &buffer))
 			return -EMSGSIZE;
@@ -1469,11 +1469,11 @@ static int dcbnl_ieee_set(struct net_device *netdev, struct nlmsghdr *nlh,
 			goto err;
 	}
 
-	if (ieee[DCB_ATTR_DCB_BUFFER] && ops->dcbnl_setbuffer) {
+	if (ieee[DCB_ATTR_DCB_BUFFER] && eops && eops->dcbnl_setbuffer) {
 		struct dcbnl_buffer *buffer =
 			nla_data(ieee[DCB_ATTR_DCB_BUFFER]);
 
-		err = ops->dcbnl_setbuffer(netdev, buffer);
+		err = eops->dcbnl_setbuffer(netdev, buffer);
 		if (err)
 			goto err;
 	}

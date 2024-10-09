@@ -69,10 +69,10 @@ const char *perf_event__name(unsigned int id)
 	return perf_event__names[id];
 }
 
-static int perf_tool__process_synth_event(struct perf_tool *tool,
-					  union perf_event *event,
-					  struct machine *machine,
-					  perf_event__handler_t process)
+int perf_tool__process_synth_event(struct perf_tool *tool,
+				   union perf_event *event,
+				   struct machine *machine,
+				   perf_event__handler_t process)
 {
 	struct perf_sample synth_sample = {
 	.pid	   = -1,
@@ -237,6 +237,7 @@ static int perf_event__synthesize_fork(struct perf_tool *tool,
 	event->fork.pid  = tgid;
 	event->fork.tid  = pid;
 	event->fork.header.type = PERF_RECORD_FORK;
+	event->fork.header.misc = PERF_RECORD_MISC_FORK_EXEC;
 
 	event->fork.header.size = (sizeof(event->fork) + machine->id_hdr_size);
 
@@ -788,9 +789,16 @@ int kallsyms__get_function_start(const char *kallsyms_filename,
 	return 0;
 }
 
-int perf_event__synthesize_kernel_mmap(struct perf_tool *tool,
-				       perf_event__handler_t process,
-				       struct machine *machine)
+int __weak perf_event__synthesize_extra_kmaps(struct perf_tool *tool __maybe_unused,
+					      perf_event__handler_t process __maybe_unused,
+					      struct machine *machine __maybe_unused)
+{
+	return 0;
+}
+
+static int __perf_event__synthesize_kernel_mmap(struct perf_tool *tool,
+						perf_event__handler_t process,
+						struct machine *machine)
 {
 	size_t size;
 	struct map *map = machine__kernel_map(machine);
@@ -841,6 +849,19 @@ int perf_event__synthesize_kernel_mmap(struct perf_tool *tool,
 	free(event);
 
 	return err;
+}
+
+int perf_event__synthesize_kernel_mmap(struct perf_tool *tool,
+				       perf_event__handler_t process,
+				       struct machine *machine)
+{
+	int err;
+
+	err = __perf_event__synthesize_kernel_mmap(tool, process, machine);
+	if (err < 0)
+		return err;
+
+	return perf_event__synthesize_extra_kmaps(tool, process, machine);
 }
 
 int perf_event__synthesize_thread_map2(struct perf_tool *tool,
@@ -1299,6 +1320,11 @@ size_t perf_event__fprintf_switch(union perf_event *event, FILE *fp)
 		       event->context_switch.next_prev_tid);
 }
 
+static size_t perf_event__fprintf_lost(union perf_event *event, FILE *fp)
+{
+	return fprintf(fp, " lost %" PRIu64 "\n", event->lost.lost);
+}
+
 size_t perf_event__fprintf(union perf_event *event, FILE *fp)
 {
 	size_t ret = fprintf(fp, "PERF_RECORD_%s",
@@ -1328,6 +1354,9 @@ size_t perf_event__fprintf(union perf_event *event, FILE *fp)
 	case PERF_RECORD_SWITCH_CPU_WIDE:
 		ret += perf_event__fprintf_switch(event, fp);
 		break;
+	case PERF_RECORD_LOST:
+		ret += perf_event__fprintf_lost(event, fp);
+		break;
 	default:
 		ret += fprintf(fp, "\n");
 	}
@@ -1343,9 +1372,8 @@ int perf_event__process(struct perf_tool *tool __maybe_unused,
 	return machine__process_event(machine, event, sample);
 }
 
-void thread__find_addr_map(struct thread *thread, u8 cpumode,
-			   enum map_type type, u64 addr,
-			   struct addr_location *al)
+struct map *thread__find_map(struct thread *thread, u8 cpumode, u64 addr,
+			     struct addr_location *al)
 {
 	struct map_groups *mg = thread->mg;
 	struct machine *machine = mg->machine;
@@ -1359,7 +1387,7 @@ void thread__find_addr_map(struct thread *thread, u8 cpumode,
 
 	if (machine == NULL) {
 		al->map = NULL;
-		return;
+		return NULL;
 	}
 
 	if (cpumode == PERF_RECORD_MISC_KERNEL && perf_host) {
@@ -1387,28 +1415,11 @@ void thread__find_addr_map(struct thread *thread, u8 cpumode,
 			!perf_host)
 			al->filtered |= (1 << HIST_FILTER__HOST);
 
-		return;
+		return NULL;
 	}
-try_again:
-	al->map = __map_groups__find(mg, type, al->addr);
-	if (al->map == NULL) {
-		/*
-		 * If this is outside of all known maps, and is a negative
-		 * address, try to look it up in the kernel dso, as it might be
-		 * a vsyscall or vdso (which executes in user-mode).
-		 *
-		 * XXX This is nasty, we should have a symbol list in the
-		 * "[vdso]" dso, but for now lets use the old trick of looking
-		 * in the whole kernel symbol list.
-		 */
-		if (cpumode == PERF_RECORD_MISC_USER && machine &&
-		    mg != &machine->kmaps &&
-		    machine__kernel_ip(machine, al->addr)) {
-			mg = &machine->kmaps;
-			load_map = true;
-			goto try_again;
-		}
-	} else {
+
+	al->map = map_groups__find(mg, al->addr);
+	if (al->map != NULL) {
 		/*
 		 * Kernel maps might be changed when loading symbols so loading
 		 * must be done prior to using kernel maps.
@@ -1417,17 +1428,17 @@ try_again:
 			map__load(al->map);
 		al->addr = al->map->map_ip(al->map, al->addr);
 	}
+
+	return al->map;
 }
 
-void __thread__find_symbol(struct thread *thread, u8 cpumode,
-			   enum map_type type, u64 addr,
-			   struct addr_location *al)
+struct symbol *thread__find_symbol(struct thread *thread, u8 cpumode,
+				   u64 addr, struct addr_location *al)
 {
-	thread__find_addr_map(thread, cpumode, type, addr, al);
-	if (al->map != NULL)
+	al->sym = NULL;
+	if (thread__find_map(thread, cpumode, addr, al))
 		al->sym = map__find_symbol(al->map, al->addr);
-	else
-		al->sym = NULL;
+	return al->sym;
 }
 
 /*
@@ -1444,7 +1455,7 @@ int machine__resolve(struct machine *machine, struct addr_location *al,
 		return -1;
 
 	dump_printf(" ... thread: %s:%d\n", thread__comm_str(thread), thread->tid);
-	thread__find_addr_map(thread, sample->cpumode, MAP__FUNCTION, sample->ip, al);
+	thread__find_map(thread, sample->cpumode, sample->ip, al);
 	dump_printf(" ...... dso: %s\n",
 		    al->map ? al->map->dso->long_name :
 			al->level == 'H' ? "[hypervisor]" : "<not found>");
@@ -1523,10 +1534,7 @@ bool sample_addr_correlates_sym(struct perf_event_attr *attr)
 void thread__resolve(struct thread *thread, struct addr_location *al,
 		     struct perf_sample *sample)
 {
-	thread__find_addr_map(thread, sample->cpumode, MAP__FUNCTION, sample->addr, al);
-	if (!al->map)
-		thread__find_addr_map(thread, sample->cpumode, MAP__VARIABLE,
-				      sample->addr, al);
+	thread__find_map(thread, sample->cpumode, sample->addr, al);
 
 	al->cpu = sample->cpu;
 	al->sym = NULL;

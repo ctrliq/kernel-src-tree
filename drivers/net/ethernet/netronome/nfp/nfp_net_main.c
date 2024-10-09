@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2015-2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2015-2018 Netronome Systems, Inc. */
 
 /*
  * nfp_net_main.c
@@ -67,23 +37,26 @@
 /**
  * nfp_net_get_mac_addr() - Get the MAC address.
  * @pf:       NFP PF handle
+ * @netdev:   net_device to set MAC address on
  * @port:     NFP port structure
  *
  * First try to get the MAC address from NSP ETH table. If that
  * fails generate a random address.
  */
-void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port)
+void
+nfp_net_get_mac_addr(struct nfp_pf *pf, struct net_device *netdev,
+		     struct nfp_port *port)
 {
 	struct nfp_eth_table_port *eth_port;
 
 	eth_port = __nfp_port_get_eth_port(port);
 	if (!eth_port) {
-		eth_hw_addr_random(port->netdev);
+		eth_hw_addr_random(netdev);
 		return;
 	}
 
-	ether_addr_copy(port->netdev->dev_addr, eth_port->mac_addr);
-	ether_addr_copy(port->netdev->perm_addr, eth_port->mac_addr);
+	ether_addr_copy(netdev->dev_addr, eth_port->mac_addr);
+	ether_addr_copy(netdev->perm_addr, eth_port->mac_addr);
 }
 
 static struct nfp_eth_table_port *
@@ -175,11 +148,13 @@ nfp_net_pf_init_vnic(struct nfp_pf *pf, struct nfp_net *nn, unsigned int id)
 {
 	int err;
 
+	nn->id = id;
+
 	err = nfp_net_init(nn);
 	if (err)
 		return err;
 
-	nfp_net_debugfs_vnic_add(nn, pf->ddir, id);
+	nfp_net_debugfs_vnic_add(nn, pf->ddir);
 
 	if (nn->port) {
 		err = nfp_devlink_port_register(pf->app, nn->port);
@@ -477,16 +452,18 @@ static int nfp_net_pci_map_mem(struct nfp_pf *pf)
 		return PTR_ERR(mem);
 	}
 
-	min_size =  NFP_MAC_STATS_SIZE * (pf->eth_tbl->max_index + 1);
-	pf->mac_stats_mem = nfp_rtsym_map(pf->rtbl, "_mac_stats",
-					  "net.macstats", min_size,
-					  &pf->mac_stats_bar);
-	if (IS_ERR(pf->mac_stats_mem)) {
-		if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
-			err = PTR_ERR(pf->mac_stats_mem);
-			goto err_unmap_ctrl;
+	if (pf->eth_tbl) {
+		min_size =  NFP_MAC_STATS_SIZE * (pf->eth_tbl->max_index + 1);
+		pf->mac_stats_mem = nfp_rtsym_map(pf->rtbl, "_mac_stats",
+						  "net.macstats", min_size,
+						  &pf->mac_stats_bar);
+		if (IS_ERR(pf->mac_stats_mem)) {
+			if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
+				err = PTR_ERR(pf->mac_stats_mem);
+				goto err_unmap_ctrl;
+			}
+			pf->mac_stats_mem = NULL;
 		}
-		pf->mac_stats_mem = NULL;
 	}
 
 	pf->vf_cfg_mem = nfp_pf_map_rtsym(pf, "net.vfcfg", "_pf%d_net_vf_bar",
@@ -723,6 +700,10 @@ int nfp_net_pci_probe(struct nfp_pf *pf)
 	if (err)
 		goto err_app_clean;
 
+	err = nfp_shared_buf_register(pf);
+	if (err)
+		goto err_devlink_unreg;
+
 	mutex_lock(&pf->lock);
 	pf->ddir = nfp_net_debugfs_device_add(pf->pdev);
 
@@ -756,6 +737,8 @@ err_free_vnics:
 err_clean_ddir:
 	nfp_net_debugfs_dir_clean(&pf->ddir);
 	mutex_unlock(&pf->lock);
+	nfp_shared_buf_unregister(pf);
+err_devlink_unreg:
 	cancel_work_sync(&pf->port_refresh_work);
 	devlink_unregister(devlink);
 err_app_clean:
@@ -783,6 +766,7 @@ void nfp_net_pci_remove(struct nfp_pf *pf)
 
 	mutex_unlock(&pf->lock);
 
+	nfp_shared_buf_unregister(pf);
 	devlink_unregister(priv_to_devlink(pf));
 
 	nfp_net_pf_free_irqs(pf);

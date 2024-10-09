@@ -14,18 +14,34 @@
 
 struct nft_pktinfo {
 	struct sk_buff			*skb;
-	const struct net_device		*in;
-	const struct net_device		*out;
-	u8				pf;
-	u8				hook;
 	u8				tprot;
 	/* for x_tables compatibility */
 	struct xt_action_param		xt;
 };
 
-static inline struct net *pkt_net(const struct nft_pktinfo *pkt)
+static inline struct net *nft_net(const struct nft_pktinfo *pkt)
 {
-	return dev_net(pkt->in ? pkt->in : pkt->out);
+	return pkt->xt.net;
+}
+
+static inline unsigned int nft_hook(const struct nft_pktinfo *pkt)
+{
+	return pkt->xt.hooknum;
+}
+
+static inline u8 nft_pf(const struct nft_pktinfo *pkt)
+{
+	return pkt->xt.family;
+}
+
+static inline const struct net_device *nft_in(const struct nft_pktinfo *pkt)
+{
+	return pkt->xt.in;
+}
+
+static inline const struct net_device *nft_out(const struct nft_pktinfo *pkt)
+{
+	return pkt->xt.out;
 }
 
 static inline void nft_set_pktinfo(struct nft_pktinfo *pkt,
@@ -33,10 +49,11 @@ static inline void nft_set_pktinfo(struct nft_pktinfo *pkt,
 				   const struct nf_hook_state *state)
 {
 	pkt->skb = skb;
-	pkt->in = pkt->xt.in = state->in;
-	pkt->out = pkt->xt.out = state->out;
-	pkt->hook = pkt->xt.hooknum = state->hook;
-	pkt->pf = pkt->xt.family = state->pf;
+	pkt->xt.net = state->net;
+	pkt->xt.in = state->in;
+	pkt->xt.out = state->out;
+	pkt->xt.hooknum = state->hook;
+	pkt->xt.family = state->pf;
 }
 
 /**
@@ -204,9 +221,9 @@ struct nft_set_iter {
 	unsigned int	skip;
 	int		err;
 	int		(*fn)(const struct nft_ctx *ctx,
-			      const struct nft_set *set,
+			      struct nft_set *set,
 			      const struct nft_set_iter *iter,
-			      const struct nft_set_elem *elem);
+			      struct nft_set_elem *elem);
 };
 
 /**
@@ -256,7 +273,8 @@ struct nft_expr;
  *	@lookup: look up an element within the set
  *	@insert: insert new element into set
  *	@activate: activate new element in the next generation
- *	@deactivate: deactivate element in the next generation
+ *	@deactivate: lookup for element and deactivate it in the next generation
+ *	@deactivate_one: deactivate element in the next generation
  *	@remove: remove element from set
  *	@walk: iterate over all set elemeennts
  *	@privsize: function to return size of set private data
@@ -286,10 +304,12 @@ struct nft_set_ops {
 						    const struct nft_set_elem *elem);
 	void *				(*deactivate)(const struct nft_set *set,
 						      const struct nft_set_elem *elem);
+	bool				(*deactivate_one)(const struct nft_set *set,
+							  void *priv);
 	void				(*remove)(const struct nft_set *set,
 						  const struct nft_set_elem *elem);
 	void				(*walk)(const struct nft_ctx *ctx,
-						const struct nft_set *set,
+						struct nft_set *set,
 						struct nft_set_iter *iter);
 
 	unsigned int			(*privsize)(const struct nlattr * const nla[]);

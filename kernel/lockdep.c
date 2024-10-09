@@ -135,7 +135,7 @@ static struct lock_list list_entries[MAX_LOCKDEP_ENTRIES];
  * get freed - this significantly simplifies the debugging code.
  */
 unsigned long nr_lock_classes;
-static struct lock_class lock_classes[MAX_LOCKDEP_KEYS];
+struct lock_class lock_classes[MAX_LOCKDEP_KEYS];
 
 static inline struct lock_class *hlock_class(struct held_lock *hlock)
 {
@@ -1365,7 +1365,9 @@ static void print_lock_class_header(struct lock_class *class, int depth)
 
 	printk("%*s->", depth, "");
 	print_lock_name(class);
-	printk(" ops: %lu", class->ops);
+#ifdef CONFIG_DEBUG_LOCKDEP
+	printk(" ops: %lu", debug_class_ops_read(class));
+#endif
 	printk(" {\n");
 
 	for (bit = 0; bit < LOCK_USAGE_STATES; bit++) {
@@ -3041,7 +3043,7 @@ print_lock_nested_lock_not_held(struct task_struct *curr,
 	return 0;
 }
 
-static int __lock_is_held(struct lockdep_map *lock);
+static int __lock_is_held(struct lockdep_map *lock, int read);
 
 /*
  * This gets called for every mutex_lock*()/spin_lock*() operation.
@@ -3087,7 +3089,9 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 		if (!class)
 			return 0;
 	}
-	atomic_inc((atomic_t *)&class->ops);
+
+	debug_class_ops_inc(class);
+
 	if (very_verbose(class)) {
 		printk("\nacquire class [%p] %s", class->key, class->name);
 		if (class->name_version > 1)
@@ -3184,7 +3188,7 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 	}
 	chain_key = iterate_chain_key(chain_key, id);
 
-	if (nest_lock && !__lock_is_held(nest_lock))
+	if (nest_lock && !__lock_is_held(nest_lock, -1))
 		return print_lock_nested_lock_not_held(curr, hlock, ip);
 
 	if (!validate_chain(curr, lock, hlock, chain_head, chain_key))
@@ -3425,6 +3429,13 @@ found_it:
 	curr->lockdep_depth = i;
 	curr->curr_chain_key = hlock->prev_chain_key;
 
+	/*
+	 * The most likely case is when the unlock is on the innermost
+	 * lock. In this case, we are done!
+	 */
+	if (i == depth - 1)
+		return 1;
+
 	for (i++; i < depth; i++) {
 		hlock = curr->held_locks + i;
 		if (!__lock_acquire(hlock->instance,
@@ -3439,9 +3450,13 @@ found_it:
 	 * We had N bottles of beer on the wall, we drank one, but now
 	 * there's not N-1 bottles of beer left on the wall...
 	 */
-	if (DEBUG_LOCKS_WARN_ON(curr->lockdep_depth != depth - 1))
-		return 0;
-	return 1;
+	DEBUG_LOCKS_WARN_ON(curr->lockdep_depth != depth - 1);
+
+	/*
+	 * Since __lock_acquire() would have called check_chain_key(),
+	 * we don't need to do it again on return.
+	 */
+	return 0;
 }
 
 /*
@@ -3513,7 +3528,7 @@ __lock_release(struct lockdep_map *lock, int nested, unsigned long ip)
 	check_chain_key(curr);
 }
 
-static int __lock_is_held(struct lockdep_map *lock)
+static int __lock_is_held(struct lockdep_map *lock, int read)
 {
 	struct task_struct *curr = current;
 	int i;
@@ -3521,8 +3536,12 @@ static int __lock_is_held(struct lockdep_map *lock)
 	for (i = 0; i < curr->lockdep_depth; i++) {
 		struct held_lock *hlock = curr->held_locks + i;
 
-		if (match_held_lock(hlock, lock))
-			return 1;
+		if (match_held_lock(hlock, lock)) {
+			if (read == -1 || hlock->read == read)
+				return 1;
+
+			return 0;
+		}
 	}
 
 	return 0;
@@ -3630,7 +3649,7 @@ void lock_release(struct lockdep_map *lock, int nested,
 }
 EXPORT_SYMBOL_GPL(lock_release);
 
-int lock_is_held(struct lockdep_map *lock)
+int lock_is_held_type(struct lockdep_map *lock, int read)
 {
 	unsigned long flags;
 	int ret = 0;
@@ -3642,13 +3661,13 @@ int lock_is_held(struct lockdep_map *lock)
 	check_flags(flags);
 
 	current->lockdep_recursion = 1;
-	ret = __lock_is_held(lock);
+	ret = __lock_is_held(lock, read);
 	current->lockdep_recursion = 0;
 	raw_local_irq_restore(flags);
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(lock_is_held);
+EXPORT_SYMBOL_GPL(lock_is_held_type);
 
 void lockdep_set_current_reclaim_state(gfp_t gfp_mask)
 {

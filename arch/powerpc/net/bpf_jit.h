@@ -57,7 +57,11 @@ DECLARE_LOAD_FUNC(sk_load_half);
 DECLARE_LOAD_FUNC(sk_load_byte);
 DECLARE_LOAD_FUNC(sk_load_byte_msh);
 
+#ifdef PPC64_ELF_ABI_v1
 #define FUNCTION_DESCR_SIZE	24
+#else
+#define FUNCTION_DESCR_SIZE	0
+#endif
 
 /*
  * 16-bit immediate helper macros: HA() is for use with sign-extending instrs

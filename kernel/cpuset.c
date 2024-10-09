@@ -940,7 +940,7 @@ static void update_cpumasks_hier(struct cpuset *cs, struct cpumask *new_cpus,
 	 * If it becomes empty, inherit the effective mask of the
 	 * parent, which is guaranteed to have some CPUs.
 	 */
-	if (cpumask_empty(new_cpus))
+	if (is_in_v2_mode() && cpumask_empty(new_cpus))
 		cpumask_copy(new_cpus, parent->effective_cpus);
 
 	/* skip the whole subtree if the cpumask remains the same. */
@@ -973,7 +973,7 @@ static void update_cpumasks_hier(struct cpuset *cs, struct cpumask *new_cpus,
 		 * If it becomes empty, inherit the effective mask of the
 		 * parent, which is guaranteed to have some CPUs.
 		 */
-		if (cpumask_empty(new_cpus))
+		if (is_in_v2_mode() && cpumask_empty(new_cpus))
 			cpumask_copy(new_cpus, parent->effective_cpus);
 
 		/* skip the whole subtree if the cpumask remains the same. */
@@ -1250,7 +1250,7 @@ static void update_nodemasks_hier(struct cpuset *cs, nodemask_t *new_mems,
 	 * If it becomes empty, inherit the effective mask of the
 	 * parent, which is guaranteed to have some MEMs.
 	 */
-	if (nodes_empty(*new_mems))
+	if (is_in_v2_mode() && nodes_empty(*new_mems))
 		*new_mems = parent->effective_mems;
 
 	/* Skip the whole subtree if the nodemask remains the same. */
@@ -1275,11 +1275,11 @@ static void update_nodemasks_hier(struct cpuset *cs, nodemask_t *new_mems,
 		 * If it becomes empty, inherit the effective mask of the
 		 * parent, which is guaranteed to have some MEMs.
 		 */
-		if (nodes_empty(*new_mems))
+		if (is_in_v2_mode() && nodes_empty(*new_mems))
 			*new_mems = parent->effective_mems;
 
-		/* skip the whole subtree if @cp have some CPU */
-		if (!nodes_empty(cp->mems_allowed)) {
+		/* Skip the whole subtree if the nodemask remains the same. */
+		if (nodes_equal(*new_mems, cp->effective_mems)) {
 			pos_cgrp = cgroup_rightmost_descendant(pos_cgrp);
 			continue;
 		}
@@ -1368,7 +1368,7 @@ static int update_nodemask(struct cpuset *cs, struct cpuset *trialcs,
 	mutex_unlock(&callback_mutex);
 
 	/* use trialcs->mems_allowed as a temp variable */
-	update_nodemasks_hier(cs, &cs->mems_allowed, &heap);
+	update_nodemasks_hier(cs, &trialcs->mems_allowed, &heap);
 
 	heap_free(&heap);
 done:
@@ -2175,7 +2175,9 @@ static int cpuset_css_online(struct cgroup *cgrp)
 
 	mutex_lock(&callback_mutex);
 	cs->mems_allowed = parent->mems_allowed;
+	cs->effective_mems = parent->mems_allowed;
 	cpumask_copy(cs->cpus_allowed, parent->cpus_allowed);
+	cpumask_copy(cs->effective_cpus, parent->cpus_allowed);
 	mutex_unlock(&callback_mutex);
 out_unlock:
 	mutex_unlock(&cpuset_mutex);

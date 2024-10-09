@@ -69,14 +69,24 @@ enum {
 	PARSE_EVENTS__TERM_TYPE_STACKSIZE,
 	PARSE_EVENTS__TERM_TYPE_NOINHERIT,
 	PARSE_EVENTS__TERM_TYPE_INHERIT,
+	PARSE_EVENTS__TERM_TYPE_MAX_EVENTS,
 	PARSE_EVENTS__TERM_TYPE_NOOVERWRITE,
 	PARSE_EVENTS__TERM_TYPE_OVERWRITE,
 	PARSE_EVENTS__TERM_TYPE_DRV_CFG,
 	__PARSE_EVENTS__TERM_TYPE_NR,
 };
 
+struct parse_events_array {
+	size_t nr_ranges;
+	struct {
+		unsigned int start;
+		size_t length;
+	} *ranges;
+};
+
 struct parse_events_term {
 	char *config;
+	struct parse_events_array array;
 	union {
 		char *str;
 		u64  num;
@@ -107,6 +117,7 @@ struct parse_events_state {
 	int			   nr_groups;
 	struct parse_events_error *error;
 	struct list_head	  *terms;
+	struct perf_evlist	  *evlist;
 };
 
 void parse_events__shrink_config_terms(void);
@@ -124,6 +135,7 @@ int parse_events_term__clone(struct parse_events_term **new,
 			     struct parse_events_term *term);
 void parse_events_terms__delete(struct list_head *terms);
 void parse_events_terms__purge(struct list_head *terms);
+void parse_events__clear_array(struct parse_events_array *a);
 int parse_events__modifier_event(struct list_head *list, char *str, bool add);
 int parse_events__modifier_group(struct list_head *list, char *event_mod);
 int parse_events_name(struct list_head *list, char *name);
@@ -131,6 +143,17 @@ int parse_events_add_tracepoint(struct list_head *list, int *idx,
 				const char *sys, const char *event,
 				struct parse_events_error *error,
 				struct list_head *head_config);
+int parse_events_load_bpf(struct parse_events_state *data,
+			  struct list_head *list,
+			  char *bpf_file_name,
+			  bool source,
+			  struct list_head *head_config);
+/* Provide this function for perf test */
+struct bpf_object;
+int parse_events_load_bpf_obj(struct parse_events_state *data,
+			      struct list_head *list,
+			      struct bpf_object *obj,
+			      struct list_head *head_config);
 int parse_events_add_numeric(struct parse_events_state *parse_state,
 			     struct list_head *list,
 			     u32 type, u64 config,
@@ -143,7 +166,9 @@ int parse_events_add_breakpoint(struct list_head *list, int *idx,
 				void *ptr, char *type, u64 len);
 int parse_events_add_pmu(struct parse_events_state *parse_state,
 			 struct list_head *list, char *name,
-			 struct list_head *head_config);
+			 struct list_head *head_config,
+			 bool auto_merge_stats,
+			 bool use_alias);
 
 int parse_events_multi_pmu_add(struct parse_events_state *parse_state,
 			       char *str,
@@ -154,7 +179,8 @@ int parse_events_copy_term_list(struct list_head *old,
 
 enum perf_pmu_event_symbol_type
 perf_pmu__parse_check(const char *name);
-void parse_events__set_leader(char *name, struct list_head *list);
+void parse_events__set_leader(char *name, struct list_head *list,
+			      struct parse_events_state *parse_state);
 void parse_events_update_lists(struct list_head *list_event,
 			       struct list_head *list_all);
 void parse_events_evlist_error(struct parse_events_state *parse_state,

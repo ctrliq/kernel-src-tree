@@ -82,8 +82,6 @@
 #define IOVA_START_PFN		(1)
 
 #define IOVA_PFN(addr)		((addr) >> PAGE_SHIFT)
-#define DMA_32BIT_PFN		IOVA_PFN(DMA_BIT_MASK(32))
-#define DMA_64BIT_PFN		IOVA_PFN(DMA_BIT_MASK(64))
 
 /* page table handling */
 #define LEVEL_STRIDE		(9)
@@ -184,16 +182,6 @@ static int rwbf_quirk;
  */
 static int force_on = 0;
 
-/*
- * 0: Present
- * 1-11: Reserved
- * 12-63: Context Ptr (12 - (haw-1))
- * 64-127: Reserved
- */
-struct root_entry {
-	u64	lo;
-	u64	hi;
-};
 #define ROOT_ENTRY_NR (VTD_PAGE_SIZE/sizeof(struct root_entry))
 
 /*
@@ -219,21 +207,6 @@ static phys_addr_t root_entry_uctp(struct root_entry *re)
 
 	return re->hi & VTD_PAGE_MASK;
 }
-/*
- * low 64 bits:
- * 0: present
- * 1: fault processing disable
- * 2-3: translation type
- * 12-63: address space root
- * high 64 bits:
- * 0-2: address width
- * 3-6: aval
- * 8-23: domain id
- */
-struct context_entry {
-	u64 lo;
-	u64 hi;
-};
 
 static inline void context_clear_pasid_enable(struct context_entry *context)
 {
@@ -260,7 +233,7 @@ static inline bool __context_present(struct context_entry *context)
 	return (context->lo & 1);
 }
 
-static inline bool context_present(struct context_entry *context)
+bool context_present(struct context_entry *context)
 {
 	return context_pasid_enabled(context) ?
 	     __context_present(context) :
@@ -783,8 +756,8 @@ static void domain_update_iommu_cap(struct dmar_domain *domain)
 	domain->iommu_superpage = domain_update_iommu_superpage(NULL);
 }
 
-static inline struct context_entry *iommu_context_addr(struct intel_iommu *iommu,
-						       u8 bus, u8 devfn, int alloc)
+struct context_entry *iommu_context_addr(struct intel_iommu *iommu, u8 bus,
+					 u8 devfn, int alloc)
 {
 	struct root_entry *root = &iommu->root_entry[bus];
 	struct context_entry *context;
@@ -1834,8 +1807,7 @@ static int dmar_init_reserved_ranges(void)
 	struct iova *iova;
 	int i;
 
-	init_iova_domain(&reserved_iova_list, VTD_PAGE_SIZE, IOVA_START_PFN,
-			DMA_32BIT_PFN);
+	init_iova_domain(&reserved_iova_list, VTD_PAGE_SIZE, IOVA_START_PFN);
 
 	lockdep_set_class(&reserved_iova_list.iova_rbtree_lock,
 		&reserved_rbtree_key);
@@ -1894,8 +1866,7 @@ static int domain_init(struct dmar_domain *domain, struct intel_iommu *iommu,
 	unsigned long sagaw;
 	int err;
 
-	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN,
-			DMA_32BIT_PFN);
+	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN);
 
 	err = init_iova_flush_queue(&domain->iovad,
 				    iommu_flush_iova, iova_entry_free);
@@ -3407,11 +3378,12 @@ static unsigned long intel_alloc_iova(struct device *dev,
 		 * from higher range
 		 */
 		iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
-					   IOVA_PFN(DMA_BIT_MASK(32)));
+					   IOVA_PFN(DMA_BIT_MASK(32)), false);
 		if (iova_pfn)
 			return iova_pfn;
 	}
-	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages, IOVA_PFN(dma_mask));
+	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
+				   IOVA_PFN(dma_mask), true);
 	if (unlikely(!iova_pfn)) {
 		pr_err("Allocating %ld-page iova for %s failed",
 		       nrpages, dev_name(dev));
@@ -4720,6 +4692,7 @@ int __init intel_iommu_init(void)
 	register_hotcpu_notifier(&intel_iommu_cpu_nb);
 
 	intel_iommu_enabled = 1;
+	intel_iommu_debugfs_init();
 
 	return 0;
 
@@ -4796,8 +4769,7 @@ static int md_domain_init(struct dmar_domain *domain, int guest_width)
 {
 	int adjust_width;
 
-	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN,
-			DMA_32BIT_PFN);
+	init_iova_domain(&domain->iovad, VTD_PAGE_SIZE, IOVA_START_PFN);
 	domain_reserve_special_ranges(domain);
 
 	/* calculate AGAW */

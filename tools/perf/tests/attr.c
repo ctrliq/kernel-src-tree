@@ -127,7 +127,6 @@ static int store_event(struct perf_event_attr *attr, pid_t pid, int cpu,
 	WRITE_ASS(comm_exec,	  "d");
 	WRITE_ASS(context_switch, "d");
 	WRITE_ASS(write_backward, "d");
-	WRITE_ASS(namespaces,	  "d");
 	WRITE_ASS(use_clockid,    "d");
 	WRITE_ASS(wakeup_events, PRIu32);
 	WRITE_ASS(bp_type, PRIu32);

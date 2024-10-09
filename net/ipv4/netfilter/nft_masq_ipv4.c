@@ -31,8 +31,8 @@ static void nft_masq_ipv4_eval(const struct nft_expr *expr,
 		range.max_proto.all = (__force __be16)nft_reg_load16(
 			&regs->data[priv->sreg_proto_max]);
 	}
-	regs->verdict.code = nf_nat_masquerade_ipv4(pkt->skb, pkt->hook,
-						    &range, pkt->out);
+	regs->verdict.code = nf_nat_masquerade_ipv4(pkt->skb, nft_hook(pkt),
+						    &range, nft_out(pkt));
 }
 
 static struct nft_expr_type nft_masq_ipv4_type;
@@ -62,7 +62,9 @@ static int __init nft_masq_ipv4_module_init(void)
 	if (ret < 0)
 		return ret;
 
-	nf_nat_masquerade_ipv4_register_notifier();
+	ret = nf_nat_masquerade_ipv4_register_notifier();
+	if (ret)
+		nft_unregister_expr(&nft_masq_ipv4_type);
 
 	return ret;
 }

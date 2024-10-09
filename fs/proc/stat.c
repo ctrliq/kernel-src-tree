@@ -77,6 +77,33 @@ static u64 get_iowait_time(int cpu)
 
 #endif
 
+#ifdef CONFIG_GENERIC_HARDIRQS
+static void show_irq_gap(struct seq_file *p, unsigned int gap)
+{
+	static const char zeros[] = " 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+
+	while (gap > 0) {
+		unsigned int inc;
+
+		inc = min_t(unsigned int, gap, ARRAY_SIZE(zeros) / 2);
+		seq_write(p, zeros, 2 * inc);
+		gap -= inc;
+	}
+}
+
+static void show_all_irqs(struct seq_file *p)
+{
+	unsigned int i, next = 0;
+
+	for_each_active_irq(i) {
+		show_irq_gap(p, i - next);
+		seq_put_decimal_ull(p, ' ', kstat_irqs(i));
+		next = i + 1;
+	}
+	show_irq_gap(p, nr_irqs - next);
+}
+#endif /* CONFIG_GENERIC_HARDIRQS */
+
 static int show_stat(struct seq_file *p, void *v)
 {
 	int i, j;
@@ -157,9 +184,12 @@ static int show_stat(struct seq_file *p, void *v)
 	}
 	seq_printf(p, "intr %llu", (unsigned long long)sum);
 
-	/* sum again ? it could be updated? */
+#ifdef CONFIG_GENERIC_HARDIRQS
+	show_all_irqs(p);
+#else
 	for_each_irq_nr(j)
 		seq_put_decimal_ull(p, ' ', kstat_irqs(j));
+#endif
 
 	seq_printf(p,
 		"\nctxt %llu\n"

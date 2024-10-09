@@ -8,6 +8,7 @@
 
 #define YYDEBUG 1
 
+#include <fnmatch.h>
 #include <linux/compiler.h>
 #include <linux/list.h>
 #include <linux/types.h>
@@ -46,18 +47,22 @@ static void inc_group_count(struct list_head *list,
 %token PE_VALUE PE_VALUE_SYM_HW PE_VALUE_SYM_SW PE_RAW PE_TERM
 %token PE_EVENT_NAME
 %token PE_NAME
+%token PE_BPF_OBJECT PE_BPF_SOURCE
 %token PE_MODIFIER_EVENT PE_MODIFIER_BP
 %token PE_NAME_CACHE_TYPE PE_NAME_CACHE_OP_RESULT
 %token PE_PREFIX_MEM PE_PREFIX_RAW PE_PREFIX_GROUP
 %token PE_ERROR
 %token PE_PMU_EVENT_PRE PE_PMU_EVENT_SUF PE_KERNEL_PMU_EVENT
 %token PE_DRV_CFG_TERM
+%token PE_ARRAY_ALL PE_ARRAY_RANGE
 %type <num> PE_VALUE
 %type <num> PE_VALUE_SYM_HW
 %type <num> PE_VALUE_SYM_SW
 %type <num> PE_RAW
 %type <num> PE_TERM
 %type <str> PE_NAME
+%type <str> PE_BPF_OBJECT
+%type <str> PE_BPF_SOURCE
 %type <str> PE_NAME_CACHE_TYPE
 %type <str> PE_NAME_CACHE_OP_RESULT
 %type <str> PE_MODIFIER_EVENT
@@ -78,6 +83,7 @@ static void inc_group_count(struct list_head *list,
 %type <tracepoint_name> tracepoint_name
 %type <head> event_legacy_numeric
 %type <head> event_legacy_raw
+%type <head> event_bpf_file
 %type <head> event_def
 %type <head> event_mod
 %type <head> event_name
@@ -86,6 +92,9 @@ static void inc_group_count(struct list_head *list,
 %type <head> group_def
 %type <head> group
 %type <head> groups
+%type <array> array
+%type <array> array_term
+%type <array> array_terms
 
 %union
 {
@@ -97,6 +106,7 @@ static void inc_group_count(struct list_head *list,
 		char *sys;
 		char *event;
 	} tracepoint_name;
+	struct parse_events_array array;
 }
 %%
 
@@ -152,7 +162,7 @@ PE_NAME '{' events '}'
 	struct list_head *list = $3;
 
 	inc_group_count(list, _parse_state);
-	parse_events__set_leader($1, list);
+	parse_events__set_leader($1, list, _parse_state);
 	$$ = list;
 }
 |
@@ -161,7 +171,7 @@ PE_NAME '{' events '}'
 	struct list_head *list = $2;
 
 	inc_group_count(list, _parse_state);
-	parse_events__set_leader(NULL, list);
+	parse_events__set_leader(NULL, list, _parse_state);
 	$$ = list;
 }
 
@@ -211,7 +221,8 @@ event_def: event_pmu |
 	   event_legacy_mem |
 	   event_legacy_tracepoint sep_dc |
 	   event_legacy_numeric sep_dc |
-	   event_legacy_raw sep_dc
+	   event_legacy_raw sep_dc |
+	   event_bpf_file
 
 event_pmu:
 PE_NAME opt_pmu_config
@@ -227,9 +238,13 @@ PE_NAME opt_pmu_config
 		error->idx = @1.first_column;
 
 	ALLOC_LIST(list);
-	if (parse_events_add_pmu(_parse_state, list, $1, $2)) {
+	if (parse_events_add_pmu(_parse_state, list, $1, $2, false, false)) {
 		struct perf_pmu *pmu = NULL;
 		int ok = 0;
+		char *pattern;
+
+		if (asprintf(&pattern, "%s*", $1) < 0)
+			YYABORT;
 
 		while ((pmu = perf_pmu__scan(pmu)) != NULL) {
 			char *name = pmu->name;
@@ -237,14 +252,19 @@ PE_NAME opt_pmu_config
 			if (!strncmp(name, "uncore_", 7) &&
 			    strncmp($1, "uncore_", 7))
 				name += 7;
-			if (!strncmp($1, name, strlen($1))) {
-				if (parse_events_copy_term_list(orig_terms, &terms))
+			if (!fnmatch(pattern, name, 0)) {
+				if (parse_events_copy_term_list(orig_terms, &terms)) {
+					free(pattern);
 					YYABORT;
-				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms))
+				}
+				if (!parse_events_add_pmu(_parse_state, list, pmu->name, terms, true, false))
 					ok++;
 				parse_events_terms__delete(terms);
 			}
 		}
+
+		free(pattern);
+
 		if (!ok)
 			YYABORT;
 	}
@@ -459,6 +479,30 @@ opt_event_config:
 	$$ = NULL;
 }
 
+event_bpf_file:
+PE_BPF_OBJECT opt_event_config
+{
+	struct parse_events_state *data = _parse_state;
+	struct parse_events_error *error = data->error;
+	struct list_head *list;
+
+	ALLOC_LIST(list);
+	ABORT_ON(parse_events_load_bpf(data, list, $1, false, $2));
+	parse_events_terms__delete($2);
+	$$ = list;
+}
+|
+PE_BPF_SOURCE opt_event_config
+{
+	struct parse_events_state *data = _parse_state;
+	struct list_head *list;
+
+	ALLOC_LIST(list);
+	ABORT_ON(parse_events_load_bpf(data, list, $1, true, $2));
+	parse_events_terms__delete($2);
+	$$ = list;
+}
+
 opt_pmu_config:
 '/' event_config '/'
 {
@@ -575,6 +619,86 @@ PE_DRV_CFG_TERM
 	ABORT_ON(parse_events_term__str(&term, PARSE_EVENTS__TERM_TYPE_DRV_CFG,
 					$1, $1, &@1, NULL));
 	$$ = term;
+}
+|
+PE_NAME array '=' PE_NAME
+{
+	struct parse_events_term *term;
+	int i;
+
+	ABORT_ON(parse_events_term__str(&term, PARSE_EVENTS__TERM_TYPE_USER,
+					$1, $4, &@1, &@4));
+
+	term->array = $2;
+	$$ = term;
+}
+|
+PE_NAME array '=' PE_VALUE
+{
+	struct parse_events_term *term;
+
+	ABORT_ON(parse_events_term__num(&term, PARSE_EVENTS__TERM_TYPE_USER,
+					$1, $4, false, &@1, &@4));
+	term->array = $2;
+	$$ = term;
+}
+
+array:
+'[' array_terms ']'
+{
+	$$ = $2;
+}
+|
+PE_ARRAY_ALL
+{
+	$$.nr_ranges = 0;
+	$$.ranges = NULL;
+}
+
+array_terms:
+array_terms ',' array_term
+{
+	struct parse_events_array new_array;
+
+	new_array.nr_ranges = $1.nr_ranges + $3.nr_ranges;
+	new_array.ranges = malloc(sizeof(new_array.ranges[0]) *
+				  new_array.nr_ranges);
+	ABORT_ON(!new_array.ranges);
+	memcpy(&new_array.ranges[0], $1.ranges,
+	       $1.nr_ranges * sizeof(new_array.ranges[0]));
+	memcpy(&new_array.ranges[$1.nr_ranges], $3.ranges,
+	       $3.nr_ranges * sizeof(new_array.ranges[0]));
+	free($1.ranges);
+	free($3.ranges);
+	$$ = new_array;
+}
+|
+array_term
+
+array_term:
+PE_VALUE
+{
+	struct parse_events_array array;
+
+	array.nr_ranges = 1;
+	array.ranges = malloc(sizeof(array.ranges[0]));
+	ABORT_ON(!array.ranges);
+	array.ranges[0].start = $1;
+	array.ranges[0].length = 1;
+	$$ = array;
+}
+|
+PE_VALUE PE_ARRAY_RANGE PE_VALUE
+{
+	struct parse_events_array array;
+
+	ABORT_ON($3 < $1);
+	array.nr_ranges = 1;
+	array.ranges = malloc(sizeof(array.ranges[0]));
+	ABORT_ON(!array.ranges);
+	array.ranges[0].start = $1;
+	array.ranges[0].length = $3 - $1 + 1;
+	$$ = array;
 }
 
 sep_dc: ':' |

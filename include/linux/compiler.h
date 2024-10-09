@@ -280,7 +280,7 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
 #define READ_ONCE_NOCHECK(x) __READ_ONCE(x, 0)
 
 #define WRITE_ONCE(x, val) \
-	({ typeof(x) __val = (val); __write_once_size(&(x), &__val, sizeof(__val)); __val; })
+	({ union { typeof(x) __val; char __c[1]; } __u = { .__val = (val) }; __write_once_size(&(x), __u.__c, sizeof(x)); __u.__val; })
 
 #endif /* __KERNEL__ */
 
@@ -470,6 +470,21 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
  * handlers, all running on the same CPU.
  */
 #define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
+
+/**
+ * lockless_dereference() - safely load a pointer for later dereference
+ * @p: The pointer to load
+ *
+ * Similar to rcu_dereference(), but for situations where the pointed-to
+ * object's lifetime is managed by something other than RCU.  That
+ * "something other" might be reference counting or simple immortality.
+ */
+#define lockless_dereference(p) \
+({ \
+	typeof(p) _________p1 = ACCESS_ONCE(p); \
+	smp_read_barrier_depends(); /* Dependency order vs. p above. */ \
+	(_________p1); \
+})
 
 /* Ignore/forbid kprobes attach on very low level functions marked by this attribute: */
 #ifdef CONFIG_KPROBES

@@ -26,6 +26,7 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/list.h>
+#include <linux/vmalloc.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_host.h>
@@ -2696,13 +2697,14 @@ lpfc_bsg_dma_page_alloc(struct lpfc_hba *phba)
 	INIT_LIST_HEAD(&dmabuf->list);
 
 	/* now, allocate dma buffer */
-	dmabuf->virt = dma_zalloc_coherent(&pcidev->dev, BSG_MBOX_SIZE,
-					   &(dmabuf->phys), GFP_KERNEL);
+	dmabuf->virt = dma_alloc_coherent(&pcidev->dev, BSG_MBOX_SIZE,
+					  &(dmabuf->phys), GFP_KERNEL);
 
 	if (!dmabuf->virt) {
 		kfree(dmabuf);
 		return NULL;
 	}
+	memset((uint8_t *)dmabuf->virt, 0, BSG_MBOX_SIZE);
 
 	return dmabuf;
 }
@@ -5239,6 +5241,369 @@ job_error:
 }
 
 /**
+ * lpfc_check_fwlog_support: Check FW log support on the adapter
+ * @phba: Pointer to HBA context object.
+ *
+ * Check if FW Logging support by the adapter
+ **/
+int
+lpfc_check_fwlog_support(struct lpfc_hba *phba)
+{
+	struct lpfc_ras_fwlog *ras_fwlog = NULL;
+
+	ras_fwlog = &phba->ras_fwlog;
+
+	if (ras_fwlog->ras_hwsupport == false)
+		return -EACCES;
+	else if (ras_fwlog->ras_enabled == false)
+		return -EPERM;
+	else
+		return 0;
+}
+
+/**
+ * lpfc_bsg_get_ras_config: Get RAS configuration settings
+ * @job: fc_bsg_job to handle
+ *
+ * Get RAS configuration values set.
+ **/
+static int
+lpfc_bsg_get_ras_config(struct fc_bsg_job *job)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)job->shost->hostdata;
+	struct fc_bsg_reply *bsg_reply = job->reply;
+	struct lpfc_hba *phba = vport->phba;
+	struct lpfc_bsg_get_ras_config_reply *ras_reply;
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	int rc = 0;
+
+	if (job->request_len <
+	    sizeof(struct fc_bsg_request) +
+	    sizeof(struct lpfc_bsg_ras_req)) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"6192 FW_LOG request received "
+				"below minimum size\n");
+		rc = -EINVAL;
+		goto ras_job_error;
+	}
+
+	/* Check FW log status */
+	rc = lpfc_check_fwlog_support(phba);
+	if (rc)
+		goto ras_job_error;
+
+	ras_reply = (struct lpfc_bsg_get_ras_config_reply *)
+		bsg_reply->reply_data.vendor_reply.vendor_rsp;
+
+	/* Current logging state */
+	if (ras_fwlog->ras_active == true)
+		ras_reply->state = LPFC_RASLOG_STATE_RUNNING;
+	else
+		ras_reply->state = LPFC_RASLOG_STATE_STOPPED;
+
+	ras_reply->log_level = phba->ras_fwlog.fw_loglevel;
+	ras_reply->log_buff_sz = phba->cfg_ras_fwlog_buffsize;
+
+ras_job_error:
+	/* make error code available to userspace */
+	bsg_reply->result = rc;
+
+	/* complete the job back to userspace */
+	job->job_done(job);
+	return rc;
+}
+
+/**
+ * lpfc_bsg_set_ras_config: Set FW logging parameters
+ * @job: fc_bsg_job to handle
+ *
+ * Set log-level parameters for FW-logging in host memory
+ **/
+static int
+lpfc_bsg_set_ras_config(struct fc_bsg_job *job)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)job->shost->hostdata;
+	struct lpfc_hba *phba = vport->phba;
+	struct lpfc_bsg_set_ras_config_req *ras_req;
+	struct fc_bsg_request *bsg_request = job->request;
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	struct fc_bsg_reply *bsg_reply = job->reply;
+	uint8_t action = 0, log_level = 0;
+	int rc = 0, action_status = 0;
+
+	if (job->request_len <
+	    sizeof(struct fc_bsg_request) +
+	    sizeof(struct lpfc_bsg_set_ras_config_req)) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"6182 Received RAS_LOG request "
+				"below minimum size\n");
+		rc = -EINVAL;
+		goto ras_job_error;
+	}
+
+	/* Check FW log status */
+	rc = lpfc_check_fwlog_support(phba);
+	if (rc)
+		goto ras_job_error;
+
+	ras_req = (struct lpfc_bsg_set_ras_config_req *)
+		bsg_request->rqst_data.h_vendor.vendor_cmd;
+	action = ras_req->action;
+	log_level = ras_req->log_level;
+
+	if (action == LPFC_RASACTION_STOP_LOGGING) {
+		/* Check if already disabled */
+		if (ras_fwlog->ras_active == false) {
+			rc = -ESRCH;
+			goto ras_job_error;
+		}
+
+		/* Disable logging */
+		lpfc_ras_stop_fwlog(phba);
+	} else {
+		/*action = LPFC_RASACTION_START_LOGGING*/
+
+		/* Even though FW-logging is active re-initialize
+		 * FW-logging with new log-level. Return status
+		 * "Logging already Running" to caller.
+		 **/
+		if (ras_fwlog->ras_active)
+			action_status = -EINPROGRESS;
+
+		/* Enable logging */
+		rc = lpfc_sli4_ras_fwlog_init(phba, log_level,
+					      LPFC_RAS_ENABLE_LOGGING);
+		if (rc) {
+			rc = -EINVAL;
+			goto ras_job_error;
+		}
+
+		/* Check if FW-logging is re-initialized */
+		if (action_status == -EINPROGRESS)
+			rc = action_status;
+	}
+ras_job_error:
+	/* make error code available to userspace */
+	bsg_reply->result = rc;
+
+	/* complete the job back to userspace */
+	job->job_done(job);
+
+	return rc;
+}
+
+/**
+ * lpfc_bsg_get_ras_lwpd: Get log write position data
+ * @job: fc_bsg_job to handle
+ *
+ * Get Offset/Wrap count of the log message written
+ * in host memory
+ **/
+static int
+lpfc_bsg_get_ras_lwpd(struct fc_bsg_job *job)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)job->shost->hostdata;
+	struct lpfc_bsg_get_ras_lwpd *ras_reply;
+	struct lpfc_hba *phba = vport->phba;
+	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
+	struct fc_bsg_reply *bsg_reply = job->reply;
+	u32 *lwpd_ptr = NULL;
+	int rc = 0;
+
+	rc = lpfc_check_fwlog_support(phba);
+	if (rc)
+		goto ras_job_error;
+
+	if (job->request_len <
+	    sizeof(struct fc_bsg_request) +
+	    sizeof(struct lpfc_bsg_ras_req)) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"6183 Received RAS_LOG request "
+				"below minimum size\n");
+		rc = -EINVAL;
+		goto ras_job_error;
+	}
+
+	ras_reply = (struct lpfc_bsg_get_ras_lwpd *)
+		bsg_reply->reply_data.vendor_reply.vendor_rsp;
+
+	if (!ras_fwlog->lwpd.virt) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"6193 Restart FW Logging\n");
+		rc = -EINVAL;
+		goto ras_job_error;
+	}
+
+	/* Get lwpd offset */
+	lwpd_ptr = (uint32_t *)(ras_fwlog->lwpd.virt);
+	ras_reply->offset = be32_to_cpu(*lwpd_ptr & 0xffffffff);
+
+	/* Get wrap count */
+	ras_reply->wrap_count = be32_to_cpu(*(++lwpd_ptr) & 0xffffffff);
+
+ras_job_error:
+	/* make error code available to userspace */
+	bsg_reply->result = rc;
+
+	/* complete the job back to userspace */
+	job->job_done(job);
+
+	return rc;
+}
+
+/**
+ * lpfc_bsg_get_ras_fwlog: Read FW log
+ * @job: fc_bsg_job to handle
+ *
+ * Copy the FW log into the passed buffer.
+ **/
+static int
+lpfc_bsg_get_ras_fwlog(struct fc_bsg_job *job)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)job->shost->hostdata;
+	struct lpfc_hba *phba = vport->phba;
+	struct fc_bsg_request *bsg_request = job->request;
+	struct fc_bsg_reply *bsg_reply = job->reply;
+	struct lpfc_bsg_get_fwlog_req *ras_req;
+	u32 rd_offset, rd_index, offset;
+	void *src, *fwlog_buff;
+	struct lpfc_ras_fwlog *ras_fwlog = NULL;
+	struct lpfc_dmabuf *dmabuf, *next;
+	int rc = 0;
+
+	ras_fwlog = &phba->ras_fwlog;
+
+	rc = lpfc_check_fwlog_support(phba);
+	if (rc)
+		goto ras_job_error;
+
+	/* Logging to be stopped before reading */
+	if (ras_fwlog->ras_active == true) {
+		rc = -EINPROGRESS;
+		goto ras_job_error;
+	}
+
+	if (job->request_len <
+	    sizeof(struct fc_bsg_request) +
+	    sizeof(struct lpfc_bsg_get_fwlog_req)) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"6184 Received RAS_LOG request "
+				"below minimum size\n");
+		rc = -EINVAL;
+		goto ras_job_error;
+	}
+
+	ras_req = (struct lpfc_bsg_get_fwlog_req *)
+		bsg_request->rqst_data.h_vendor.vendor_cmd;
+	rd_offset = ras_req->read_offset;
+
+	/* Allocate memory to read fw log*/
+	fwlog_buff = vmalloc(ras_req->read_size);
+	if (!fwlog_buff) {
+		rc = -ENOMEM;
+		goto ras_job_error;
+	}
+
+	rd_index = (rd_offset / LPFC_RAS_MAX_ENTRY_SIZE);
+	offset = (rd_offset % LPFC_RAS_MAX_ENTRY_SIZE);
+
+	list_for_each_entry_safe(dmabuf, next,
+			      &ras_fwlog->fwlog_buff_list, list) {
+
+		if (dmabuf->buffer_tag < rd_index)
+			continue;
+
+		src = dmabuf->virt + offset;
+		memcpy(fwlog_buff, src, ras_req->read_size);
+		break;
+	}
+
+	bsg_reply->reply_payload_rcv_len =
+		sg_copy_from_buffer(job->reply_payload.sg_list,
+				    job->reply_payload.sg_cnt,
+				    fwlog_buff, ras_req->read_size);
+
+	vfree(fwlog_buff);
+
+ras_job_error:
+	bsg_reply->result = rc;
+	job->job_done(job);
+
+	return rc;
+}
+
+static int
+lpfc_get_trunk_info(struct fc_bsg_job *job)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)job->shost->hostdata;
+	struct lpfc_hba *phba = vport->phba;
+	struct fc_bsg_reply *bsg_reply = job->reply;
+	struct lpfc_trunk_info *event_reply;
+	int rc = 0;
+
+	if (job->request_len <
+	    sizeof(struct fc_bsg_request) + sizeof(struct get_trunk_info_req)) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
+				"2744 Received GET TRUNK _INFO request below "
+				"minimum size\n");
+		rc = -EINVAL;
+		goto job_error;
+	}
+
+	event_reply = (struct lpfc_trunk_info *)
+		bsg_reply->reply_data.vendor_reply.vendor_rsp;
+
+	if (job->reply_len <
+	    sizeof(struct fc_bsg_request) + sizeof(struct lpfc_trunk_info)) {
+		lpfc_printf_log(phba, KERN_WARNING, LOG_LIBDFC,
+				"2728 Received GET TRUNK _INFO reply below "
+				"minimum size\n");
+		rc = -EINVAL;
+		goto job_error;
+	}
+	if (event_reply == NULL) {
+		rc = -EINVAL;
+		goto job_error;
+	}
+
+	bsg_bf_set(lpfc_trunk_info_link_status, event_reply,
+		   (phba->link_state >= LPFC_LINK_UP) ? 1 : 0);
+
+	bsg_bf_set(lpfc_trunk_info_trunk_active0, event_reply,
+		   (phba->trunk_link.link0.state == LPFC_LINK_UP) ? 1 : 0);
+
+	bsg_bf_set(lpfc_trunk_info_trunk_active1, event_reply,
+		   (phba->trunk_link.link1.state == LPFC_LINK_UP) ? 1 : 0);
+
+	bsg_bf_set(lpfc_trunk_info_trunk_active2, event_reply,
+		   (phba->trunk_link.link2.state == LPFC_LINK_UP) ? 1 : 0);
+
+	bsg_bf_set(lpfc_trunk_info_trunk_active3, event_reply,
+		   (phba->trunk_link.link3.state == LPFC_LINK_UP) ? 1 : 0);
+
+	bsg_bf_set(lpfc_trunk_info_trunk_config0, event_reply,
+		   bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba));
+
+	bsg_bf_set(lpfc_trunk_info_trunk_config1, event_reply,
+		   bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba));
+
+	bsg_bf_set(lpfc_trunk_info_trunk_config2, event_reply,
+		   bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba));
+
+	bsg_bf_set(lpfc_trunk_info_trunk_config3, event_reply,
+		   bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba));
+
+	event_reply->port_speed = phba->sli4_hba.link_state.speed / 1000;
+	event_reply->logical_speed =
+				phba->sli4_hba.link_state.logical_speed / 100;
+job_error:
+	bsg_reply->result = rc;
+	job->job_done(job);
+	return rc;
+
+}
+
+/**
  * lpfc_bsg_hst_vendor - process a vendor-specific fc_bsg_job
  * @job: fc_bsg_job to handle
  **/
@@ -5283,6 +5648,21 @@ lpfc_bsg_hst_vendor(struct fc_bsg_job *job)
 	case LPFC_BSG_VENDOR_FORCED_LINK_SPEED:
 		rc = lpfc_forced_link_speed(job);
 		break;
+	case LPFC_BSG_VENDOR_RAS_GET_LWPD:
+		rc = lpfc_bsg_get_ras_lwpd(job);
+		break;
+	case LPFC_BSG_VENDOR_RAS_GET_FWLOG:
+		rc = lpfc_bsg_get_ras_fwlog(job);
+		break;
+	case LPFC_BSG_VENDOR_RAS_GET_CONFIG:
+		rc = lpfc_bsg_get_ras_config(job);
+		break;
+	case LPFC_BSG_VENDOR_RAS_SET_CONFIG:
+		rc = lpfc_bsg_set_ras_config(job);
+		break;
+	case LPFC_BSG_VENDOR_GET_TRUNK_INFO:
+		rc = lpfc_get_trunk_info(job);
+		break;
 	default:
 		rc = -EINVAL;
 		job->reply->reply_payload_rcv_len = 0;
@@ -5296,7 +5676,7 @@ lpfc_bsg_hst_vendor(struct fc_bsg_job *job)
 
 /**
  * lpfc_bsg_request - handle a bsg request from the FC transport
- * @job: fc_bsg_job to handle
+ * @job: bsg_job to handle
  **/
 int
 lpfc_bsg_request(struct fc_bsg_job *job)
@@ -5328,7 +5708,7 @@ lpfc_bsg_request(struct fc_bsg_job *job)
 
 /**
  * lpfc_bsg_timeout - handle timeout of a bsg request from the FC transport
- * @job: fc_bsg_job that has timed out
+ * @job: bsg_job that has timed out
  *
  * This function just aborts the job's IOCB.  The aborted IOCB will return to
  * the waiting function which will handle passing the error back to userspace

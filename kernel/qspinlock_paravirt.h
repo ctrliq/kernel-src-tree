@@ -341,7 +341,7 @@ static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
 		 *
 		 * Matches the cmpxchg() from pv_kick_node().
 		 */
-		set_mb(pn->state, vcpu_halted);
+		smp_store_mb(pn->state, vcpu_halted);
 
 		if (!READ_ONCE(node->locked)) {
 			qstat_inc(qstat_pv_wait_node, true);

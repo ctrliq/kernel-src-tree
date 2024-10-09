@@ -36,11 +36,6 @@
 #include "en.h"
 #include "clock.h"
 
-/* RHEL only: make sure we have smp_store_mb */
-#ifndef smp_store_mb
-#define smp_store_mb(var, value)	set_mb(var, value)
-#endif
-
 enum {
 	MLX5_CYCLES_SHIFT	= 23
 };

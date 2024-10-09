@@ -204,6 +204,8 @@ For 32-bit we have the following conventions - kernel is built with
 	.macro ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg
 		sbb \clobber_reg, \clobber_reg
 		and \clobber_reg, %rax
+		/* prevent a data "leak" */
+		xorq \clobber_reg, \clobber_reg
 	.endm
 
 .macro UNWIND_END_OF_STACK

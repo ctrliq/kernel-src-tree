@@ -596,6 +596,18 @@ static inline u32 irq_get_trigger_type(unsigned int irq)
 	return d ? irqd_get_trigger_type(d) : 0;
 }
 
+static inline struct cpumask *irq_get_affinity_mask(int irq)
+{
+	struct irq_data *d = irq_get_irq_data(irq);
+
+	return d ? d->affinity : NULL;
+}
+
+static inline struct cpumask *irq_data_get_affinity_mask(struct irq_data *d)
+{
+	return d->affinity;
+}
+
 unsigned int arch_dynirq_lower_bound(unsigned int from);
 
 int __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,

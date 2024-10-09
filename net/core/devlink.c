@@ -115,6 +115,8 @@ static struct devlink *devlink_get_from_attrs(struct net *net,
 	busname = nla_data(attrs[DEVLINK_ATTR_BUS_NAME]);
 	devname = nla_data(attrs[DEVLINK_ATTR_DEV_NAME]);
 
+	lockdep_assert_held(&devlink_mutex);
+
 	list_for_each_entry(devlink, &devlink_list, list) {
 		if (strcmp(devlink->dev->bus->name, busname) == 0 &&
 		    strcmp(dev_name(devlink->dev), devname) == 0 &&
@@ -1876,7 +1878,6 @@ send_done:
 nla_put_failure:
 	err = -EMSGSIZE;
 err_table_put:
-	genlmsg_cancel(skb, hdr);
 	nlmsg_free(skb);
 	return err;
 }
@@ -2082,7 +2083,6 @@ int devlink_dpipe_entry_ctx_prepare(struct devlink_dpipe_dump_ctx *dump_ctx)
 	return 0;
 
 nla_put_failure:
-	genlmsg_cancel(dump_ctx->skb, dump_ctx->hdr);
 	nlmsg_free(dump_ctx->skb);
 	return -EMSGSIZE;
 }
@@ -2299,7 +2299,6 @@ send_done:
 nla_put_failure:
 	err = -EMSGSIZE;
 err_table_put:
-	genlmsg_cancel(skb, hdr);
 	nlmsg_free(skb);
 	return err;
 }
@@ -2588,7 +2587,7 @@ send_done:
 	if (!nlh) {
 		err = devlink_dpipe_send_and_alloc_skb(&skb, info);
 		if (err)
-			goto err_skb_send_alloc;
+			return err;
 		goto send_done;
 	}
 	return genlmsg_reply(skb, info);
@@ -2596,8 +2595,6 @@ send_done:
 nla_put_failure:
 	err = -EMSGSIZE;
 err_resource_put:
-err_skb_send_alloc:
-	genlmsg_cancel(skb, hdr);
 	nlmsg_free(skb);
 	return err;
 }
@@ -3105,7 +3102,7 @@ static int devlink_nl_cmd_param_set_doit(struct sk_buff *skb,
 	if (err)
 		return err;
 	if (param->validate) {
-		err = param->validate(devlink, param->id, value, info->extack);
+		err = param->validate(devlink, param->id, value);
 		if (err)
 			return err;
 	}
@@ -3507,13 +3504,14 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
 	start_offset = *((u64 *)&cb->args[0]);
 
 	err = nlmsg_parse(cb->nlh, GENL_HDRLEN + devlink_nl_family.hdrsize,
-			  attrs, DEVLINK_ATTR_MAX, ops->policy, NULL);
+			  attrs, DEVLINK_ATTR_MAX, ops->policy);
 	if (err)
 		goto out;
 
+	mutex_lock(&devlink_mutex);
 	devlink = devlink_get_from_attrs(sock_net(cb->skb->sk), attrs);
 	if (IS_ERR(devlink))
-		goto out;
+		goto out_dev;
 
 	mutex_lock(&devlink_mutex);
 	mutex_lock(&devlink->lock);
@@ -3582,6 +3580,7 @@ nla_put_failure:
 	genlmsg_cancel(skb, hdr);
 out_unlock:
 	mutex_unlock(&devlink->lock);
+out_dev:
 	mutex_unlock(&devlink_mutex);
 out:
 	return 0;
@@ -3645,20 +3644,6 @@ static const struct genl_ops devlink_nl_ops[] = {
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
 				  DEVLINK_NL_FLAG_NO_LOCK,
-	},
-	{
-		.cmd = DEVLINK_CMD_ESWITCH_GET,
-		.doit = devlink_nl_cmd_eswitch_get_doit,
-		.policy = devlink_nl_policy,
-		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
-	},
-	{
-		.cmd = DEVLINK_CMD_ESWITCH_SET,
-		.doit = devlink_nl_cmd_eswitch_set_doit,
-		.policy = devlink_nl_policy,
-		.flags = GENL_ADMIN_PERM,
-		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
 	},
 	{
 		.cmd = DEVLINK_CMD_PORT_UNSPLIT,
@@ -3743,6 +3728,21 @@ static const struct genl_ops devlink_nl_ops[] = {
 		.flags = GENL_ADMIN_PERM,
 		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
 				  DEVLINK_NL_FLAG_NEED_SB,
+	},
+	{
+		.cmd = DEVLINK_CMD_ESWITCH_GET,
+		.doit = devlink_nl_cmd_eswitch_get_doit,
+		.policy = devlink_nl_policy,
+		.flags = GENL_ADMIN_PERM,
+		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK,
+	},
+	{
+		.cmd = DEVLINK_CMD_ESWITCH_SET,
+		.doit = devlink_nl_cmd_eswitch_set_doit,
+		.policy = devlink_nl_policy,
+		.flags = GENL_ADMIN_PERM,
+		.internal_flags = DEVLINK_NL_FLAG_NEED_DEVLINK |
+				  DEVLINK_NL_FLAG_NO_LOCK,
 	},
 	{
 		.cmd = DEVLINK_CMD_DPIPE_TABLE_GET,

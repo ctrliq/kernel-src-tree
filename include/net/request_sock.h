@@ -194,23 +194,6 @@ static inline void reqsk_queue_unlink(struct request_sock_queue *queue,
 	write_unlock(&queue->syn_wait_lock);
 }
 
-static inline void reqsk_queue_add(struct request_sock_queue *queue,
-				   struct request_sock *req,
-				   struct sock *parent,
-				   struct sock *child)
-{
-	req->sk = child;
-	sk_acceptq_added(parent);
-
-	if (queue->rskq_accept_head == NULL)
-		queue->rskq_accept_head = req;
-	else
-		queue->rskq_accept_tail->dl_next = req;
-
-	queue->rskq_accept_tail = req;
-	req->dl_next = NULL;
-}
-
 static inline struct request_sock *reqsk_queue_remove(struct request_sock_queue *queue)
 {
 	struct request_sock *req = queue->rskq_accept_head;

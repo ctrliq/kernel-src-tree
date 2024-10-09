@@ -73,8 +73,10 @@ static struct ipv4_devconf ipv4_devconf = {
 		[IPV4_DEVCONF_SEND_REDIRECTS - 1] = 1,
 		[IPV4_DEVCONF_SECURE_REDIRECTS - 1] = 1,
 		[IPV4_DEVCONF_SHARED_MEDIA - 1] = 1,
-		[IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL - 1] = 10000 /*ms*/,
-		[IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL - 1] =  1000 /*ms*/,
+	},
+	.extra_data = {
+		[IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL - __IPV4_DEVCONF_MAX] = 10000 /*ms*/,
+		[IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL - __IPV4_DEVCONF_MAX] =  1000 /*ms*/,
 	},
 };
 
@@ -85,8 +87,10 @@ static struct ipv4_devconf ipv4_devconf_dflt = {
 		[IPV4_DEVCONF_SECURE_REDIRECTS - 1] = 1,
 		[IPV4_DEVCONF_SHARED_MEDIA - 1] = 1,
 		[IPV4_DEVCONF_ACCEPT_SOURCE_ROUTE - 1] = 1,
-		[IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL - 1] = 10000 /*ms*/,
-		[IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL - 1] =  1000 /*ms*/,
+	},
+	.extra_data = {
+		[IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL - __IPV4_DEVCONF_MAX] = 10000 /*ms*/,
+		[IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL - __IPV4_DEVCONF_MAX] =  1000 /*ms*/,
 	},
 };
 
@@ -180,6 +184,7 @@ EXPORT_SYMBOL(__ip_dev_find);
 static void rtmsg_ifa(int event, struct in_ifaddr *, struct nlmsghdr *, u32);
 
 static BLOCKING_NOTIFIER_HEAD(inetaddr_chain);
+static BLOCKING_NOTIFIER_HEAD(inetaddr_validator_chain);
 static void inet_del_ifa(struct in_device *in_dev, struct in_ifaddr **ifap,
 			 int destroy);
 #ifdef CONFIG_SYSCTL
@@ -444,6 +449,8 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
 {
 	struct in_device *in_dev = ifa->ifa_dev;
 	struct in_ifaddr *ifa1, **ifap, **last_primary;
+	struct in_validator_info ivi;
+	int ret;
 
 	ASSERT_RTNL();
 
@@ -472,6 +479,23 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
 			}
 			ifa->ifa_flags |= IFA_F_SECONDARY;
 		}
+	}
+
+	/* Allow any devices that wish to register ifaddr validtors to weigh
+	 * in now, before changes are committed.  The rntl lock is serializing
+	 * access here, so the state should not change between a validator call
+	 * and a final notify on commit.  This isn't invoked on promotion under
+	 * the assumption that validators are checking the address itself, and
+	 * not the flags.
+	 */
+	ivi.ivi_addr = ifa->ifa_address;
+	ivi.ivi_dev = ifa->ifa_dev;
+	ret = blocking_notifier_call_chain(&inetaddr_validator_chain,
+					   NETDEV_UP, &ivi);
+	ret = notifier_to_errno(ret);
+	if (ret) {
+		inet_free_ifa(ifa);
+		return ret;
 	}
 
 	if (!(ifa->ifa_flags & IFA_F_SECONDARY)) {
@@ -1331,6 +1355,19 @@ int unregister_inetaddr_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL(unregister_inetaddr_notifier);
 
+int register_inetaddr_validator_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&inetaddr_validator_chain, nb);
+}
+EXPORT_SYMBOL(register_inetaddr_validator_notifier);
+
+int unregister_inetaddr_validator_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&inetaddr_validator_chain,
+	    nb);
+}
+EXPORT_SYMBOL(unregister_inetaddr_validator_notifier);
+
 /* Rename ifa_labels for a device name change. Make some effort to preserve
  * existing alias numbering and to create unique labels if possible.
 */
@@ -1659,7 +1696,7 @@ static size_t inet_get_link_af_size(const struct net_device *dev,
 	if (!in_dev)
 		return 0;
 
-	return nla_total_size(IPV4_DEVCONF_MAX * 4); /* IFLA_INET_CONF */
+	return nla_total_size(IPV4_DEVCONF_EXTRA_LAST * 4); /* IFLA_INET_CONF */
 }
 
 static int inet_fill_link_af(struct sk_buff *skb, const struct net_device *dev)
@@ -1671,12 +1708,16 @@ static int inet_fill_link_af(struct sk_buff *skb, const struct net_device *dev)
 	if (!in_dev)
 		return -ENODATA;
 
-	nla = nla_reserve(skb, IFLA_INET_CONF, IPV4_DEVCONF_MAX * 4);
+	nla = nla_reserve(skb, IFLA_INET_CONF, IPV4_DEVCONF_EXTRA_LAST * 4);
 	if (nla == NULL)
 		return -EMSGSIZE;
 
-	for (i = 0; i < IPV4_DEVCONF_MAX; i++)
-		((u32 *) nla_data(nla))[i] = in_dev->cnf.data[i];
+	for (i = 0; i < IPV4_DEVCONF_EXTRA_LAST; i++) {
+		if (i < IPV4_DEVCONF_MAX)
+			((u32 *) nla_data(nla))[i] = in_dev->cnf.data[i];
+		else
+			((u32 *) nla_data(nla))[i] = in_dev->cnf.extra_data[i - IPV4_DEVCONF_MAX];
+	}
 
 	return 0;
 }
@@ -1705,7 +1746,7 @@ static int inet_validate_link_af(const struct net_device *dev,
 			if (nla_len(a) < 4)
 				return -EINVAL;
 
-			if (cfgid <= 0 || cfgid > IPV4_DEVCONF_MAX)
+			if (cfgid <= 0 || cfgid > IPV4_DEVCONF_EXTRA_LAST)
 				return -EINVAL;
 		}
 	}
@@ -1958,14 +1999,20 @@ done:
 static void devinet_copy_dflt_conf(struct net *net, int i)
 {
 	struct net_device *dev;
+	int ext_idx = i - IPV4_DEVCONF_MAX;
 
 	rcu_read_lock();
 	for_each_netdev_rcu(net, dev) {
 		struct in_device *in_dev;
 
 		in_dev = __in_dev_get_rcu(dev);
-		if (in_dev && !test_bit(i, in_dev->cnf.state))
-			in_dev->cnf.data[i] = net->ipv4.devconf_dflt->data[i];
+		if (in_dev) {
+			if (i < IPV4_DEVCONF_MAX && !test_bit(i, in_dev->cnf.state))
+				in_dev->cnf.data[i] = net->ipv4.devconf_dflt->data[i];
+			else if (i >= IPV4_DEVCONF_MAX &&
+				 !test_bit(ext_idx, in_dev->cnf.extra_state))
+				in_dev->cnf.extra_data[ext_idx] = net->ipv4.devconf_dflt->extra_data[ext_idx];
+		}
 	}
 	rcu_read_unlock();
 }
@@ -2013,7 +2060,13 @@ static int devinet_conf_proc(struct ctl_table *ctl, int write,
 		struct net *net = ctl->extra2;
 		int i = (int *)ctl->data - cnf->data;
 
-		set_bit(i, cnf->state);
+		if (i < IPV4_DEVCONF_MAX) {
+			set_bit(i, cnf->state);
+		} else {
+			i = (int *)ctl->data - cnf->extra_data;
+			set_bit(i, cnf->extra_state);
+			i += IPV4_DEVCONF_MAX;
+		}
 
 		if (cnf == net->ipv4.devconf_dflt)
 			devinet_copy_dflt_conf(net, i);
@@ -2115,6 +2168,20 @@ static int ipv4_doint_and_flush(struct ctl_table *ctl, int write,
 #define DEVINET_SYSCTL_RW_ENTRY(attr, name) \
 	DEVINET_SYSCTL_ENTRY(attr, name, 0644, devinet_conf_proc)
 
+#define DEVINET_SYSCTL_EXTRA_ENTRY(attr, name, mval, proc) \
+	{ \
+		.procname	= name, \
+		.data		= ipv4_devconf.extra_data + \
+				  IPV4_DEVCONF_ ## attr - __IPV4_DEVCONF_MAX, \
+		.maxlen		= sizeof(int), \
+		.mode		= mval, \
+		.proc_handler	= proc, \
+		.extra1		= &ipv4_devconf, \
+	}
+
+#define DEVINET_SYSCTL_RW_EXTRA_ENTRY(attr, name) \
+	DEVINET_SYSCTL_EXTRA_ENTRY(attr, name, 0644, devinet_conf_proc)
+
 #define DEVINET_SYSCTL_RO_ENTRY(attr, name) \
 	DEVINET_SYSCTL_ENTRY(attr, name, 0444, devinet_conf_proc)
 
@@ -2126,7 +2193,7 @@ static int ipv4_doint_and_flush(struct ctl_table *ctl, int write,
 
 static struct devinet_sysctl_table {
 	struct ctl_table_header *sysctl_header;
-	struct ctl_table devinet_vars[__IPV4_DEVCONF_MAX];
+	struct ctl_table devinet_vars[__IPV4_DEVCONF_EXTRA_LAST];
 } devinet_sysctl = {
 	.devinet_vars = {
 		DEVINET_SYSCTL_COMPLEX_ENTRY(FORWARDING, "forwarding",
@@ -2155,9 +2222,9 @@ static struct devinet_sysctl_table {
 		DEVINET_SYSCTL_RW_ENTRY(PROXY_ARP_PVLAN, "proxy_arp_pvlan"),
 		DEVINET_SYSCTL_RW_ENTRY(FORCE_IGMP_VERSION,
 					"force_igmp_version"),
-		DEVINET_SYSCTL_RW_ENTRY(IGMPV2_UNSOLICITED_REPORT_INTERVAL,
+		DEVINET_SYSCTL_RW_EXTRA_ENTRY(IGMPV2_UNSOLICITED_REPORT_INTERVAL,
 					"igmpv2_unsolicited_report_interval"),
-		DEVINET_SYSCTL_RW_ENTRY(IGMPV3_UNSOLICITED_REPORT_INTERVAL,
+		DEVINET_SYSCTL_RW_EXTRA_ENTRY(IGMPV3_UNSOLICITED_REPORT_INTERVAL,
 					"igmpv3_unsolicited_report_interval"),
 
 		DEVINET_SYSCTL_FLUSHING_ENTRY(NOXFRM, "disable_xfrm"),
@@ -2354,6 +2421,8 @@ static struct rtnl_af_ops inet_af_ops __read_mostly = {
 void __init devinet_init(void)
 {
 	int i;
+
+	BUILD_BUG_ON(__IPV4_DEVCONF_EXTRA_LAST > __IPV4_DEVCONF_EXTRA_MAX);
 
 	for (i = 0; i < IN4_ADDR_HSIZE; i++)
 		INIT_HLIST_HEAD(&inet_addr_lst[i]);

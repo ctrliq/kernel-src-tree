@@ -111,11 +111,6 @@ static ssize_t tcm_qla2xxx_format_wwn(char *buf, size_t len, u64 wwn)
 		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
 }
 
-static char *tcm_qla2xxx_get_fabric_name(void)
-{
-	return "qla2xxx";
-}
-
 /*
  * From drivers/scsi/scsi_transport_fc.c:fc_parse_wwn
  */
@@ -179,11 +174,6 @@ static int tcm_qla2xxx_npiv_parse_wwn(
 		return rc;
 
 	return 0;
-}
-
-static char *tcm_qla2xxx_npiv_get_fabric_name(void)
-{
-	return "qla2xxx_npiv";
 }
 
 static char *tcm_qla2xxx_get_fabric_wwn(struct se_portal_group *se_tpg)
@@ -641,11 +631,13 @@ static int tcm_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
 	struct fc_port *sess = mcmd->sess;
 	struct se_cmd *se_cmd = &mcmd->se_cmd;
 	int transl_tmr_func = 0;
+	int flags = TARGET_SCF_ACK_KREF;
 
 	switch (tmr_func) {
 	case QLA_TGT_ABTS:
 		pr_debug("%ld: ABTS received\n", sess->vha->host_no);
 		transl_tmr_func = TMR_ABORT_TASK;
+		flags |= TARGET_SCF_LOOKUP_LUN_FROM_TAG;
 		break;
 	case QLA_TGT_2G_ABORT_TASK:
 		pr_debug("%ld: 2G Abort Task received\n", sess->vha->host_no);
@@ -678,7 +670,33 @@ static int tcm_qla2xxx_handle_tmr(struct qla_tgt_mgmt_cmd *mcmd, u64 lun,
 	}
 
 	return target_submit_tmr(se_cmd, sess->se_sess, NULL, lun, mcmd,
-	    transl_tmr_func, GFP_ATOMIC, tag, TARGET_SCF_ACK_KREF);
+	    transl_tmr_func, GFP_ATOMIC, tag, flags);
+}
+
+static struct qla_tgt_cmd *tcm_qla2xxx_find_cmd_by_tag(struct fc_port *sess,
+    uint64_t tag)
+{
+	struct qla_tgt_cmd *cmd = NULL;
+	struct se_cmd *secmd;
+	unsigned long flags;
+
+	if (!sess->se_sess)
+		return NULL;
+
+	spin_lock_irqsave(&sess->se_sess->sess_cmd_lock, flags);
+	list_for_each_entry(secmd, &sess->se_sess->sess_cmd_list, se_cmd_list) {
+		/* skip task management functions, including tmr->task_cmd */
+		if (secmd->se_cmd_flags & SCF_SCSI_TMR_CDB)
+			continue;
+
+		if (secmd->tag == tag) {
+			cmd = container_of(secmd, struct qla_tgt_cmd, se_cmd);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&sess->se_sess->sess_cmd_lock, flags);
+
+	return cmd;
 }
 
 static int tcm_qla2xxx_queue_data_in(struct se_cmd *se_cmd)
@@ -743,10 +761,6 @@ static int tcm_qla2xxx_queue_status(struct se_cmd *se_cmd)
 	cmd->sg_cnt = 0;
 	cmd->offset = 0;
 	cmd->dma_data_direction = tcm_qla2xxx_mapping_dir(se_cmd);
-	if (cmd->trc_flags & TRC_XMIT_STATUS) {
-		pr_crit("Multiple calls for status = %p.\n", cmd);
-		dump_stack();
-	}
 	cmd->trc_flags |= TRC_XMIT_STATUS;
 
 	if (se_cmd->data_direction == DMA_FROM_DEVICE) {
@@ -1461,8 +1475,7 @@ static void tcm_qla2xxx_free_session(struct fc_port *sess)
 	}
 	target_wait_for_sess_cmds(se_sess);
 
-	transport_deregister_session_configfs(sess->se_sess);
-	transport_deregister_session(sess->se_sess);
+	target_remove_session(se_sess);
 }
 
 /*
@@ -1623,15 +1636,13 @@ static void tcm_qla2xxx_update_sess(struct fc_port *sess, port_id_t s_id,
 
 	sess->conf_compl_supported = conf_compl_supported;
 
-	/* Reset logout parameters to default */
-	sess->logout_on_delete = 1;
-	sess->keep_nport_handle = 0;
 }
 
 /*
  * Calls into tcm_qla2xxx used by qla2xxx LLD I/O path.
  */
 static struct qla_tgt_func_tmpl tcm_qla2xxx_template = {
+	.find_cmd_by_tag	= tcm_qla2xxx_find_cmd_by_tag,
 	.handle_cmd		= tcm_qla2xxx_handle_cmd,
 	.handle_data		= tcm_qla2xxx_handle_data,
 	.handle_tmr		= tcm_qla2xxx_handle_tmr,
@@ -1891,14 +1902,13 @@ static struct configfs_attribute *tcm_qla2xxx_wwn_attrs[] = {
 
 static const struct target_core_fabric_ops tcm_qla2xxx_ops = {
 	.module				= THIS_MODULE,
-	.name				= "qla2xxx",
+	.fabric_name			= "qla2xxx",
 	.node_acl_size			= sizeof(struct tcm_qla2xxx_nacl),
 	/*
 	 * XXX: Limit assumes single page per scatter-gather-list entry.
 	 * Current maximum is ~4.9 MB per se_cmd->t_data_sg with PAGE_SIZE=4096
 	 */
 	.max_data_sg_nents		= 1200,
-	.get_fabric_name		= tcm_qla2xxx_get_fabric_name,
 	.tpg_get_wwn			= tcm_qla2xxx_get_fabric_wwn,
 	.tpg_get_tag			= tcm_qla2xxx_get_tag,
 	.tpg_check_demo_mode		= tcm_qla2xxx_check_demo_mode,
@@ -1940,9 +1950,8 @@ static const struct target_core_fabric_ops tcm_qla2xxx_ops = {
 
 static const struct target_core_fabric_ops tcm_qla2xxx_npiv_ops = {
 	.module				= THIS_MODULE,
-	.name				= "qla2xxx_npiv",
+	.fabric_name			= "qla2xxx_npiv",
 	.node_acl_size			= sizeof(struct tcm_qla2xxx_nacl),
-	.get_fabric_name		= tcm_qla2xxx_npiv_get_fabric_name,
 	.tpg_get_wwn			= tcm_qla2xxx_get_fabric_wwn,
 	.tpg_get_tag			= tcm_qla2xxx_get_tag,
 	.tpg_check_demo_mode		= tcm_qla2xxx_check_demo_mode,

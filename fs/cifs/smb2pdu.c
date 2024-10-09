@@ -679,7 +679,14 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 		(char *)&vneg_inbuf, sizeof(struct validate_negotiate_info_req),
 		(char **)&pneg_rsp, &rsplen);
 
-	if (rc != 0) {
+	if (rc == -EOPNOTSUPP) {
+		/*
+		 * Old Windows versions or Netapp SMB server can return
+		 * not supported error. Client should accept it.
+		 */
+		cifs_dbg(VFS, "Server does not support validate negotiate\n");
+		return 0;
+	} else if (rc != 0) {
 		cifs_dbg(VFS, "validate protocol negotiate failed: %d\n", rc);
 		return -EIO;
 	}

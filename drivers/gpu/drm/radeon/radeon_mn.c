@@ -75,8 +75,8 @@ static void radeon_mn_destroy(struct work_struct *work)
 	mutex_lock(&rdev->mn_lock);
 	mutex_lock(&rmn->lock);
 	hash_del(&rmn->node);
-	rbtree_postorder_for_each_entry_safe(node, next_node, &rmn->objects,
-					     it.rb) {
+	rbtree_postorder_for_each_entry_safe(node, next_node,
+					     &rmn->objects, it.rb) {
 
 		interval_tree_remove(&node->it, &rmn->objects);
 		list_for_each_entry_safe(bo, next_bo, &node->bos, mn_list) {

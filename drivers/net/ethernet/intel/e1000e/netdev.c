@@ -1,23 +1,5 @@
-/* Intel PRO/1000 Linux driver
- * Copyright(c) 1999 - 2015 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * Linux NICS <linux.nics@intel.com>
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- */
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 1999 - 2018 Intel Corporation. */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -2326,8 +2308,8 @@ static int e1000_alloc_ring_dma(struct e1000_adapter *adapter,
 {
 	struct pci_dev *pdev = adapter->pdev;
 
-	ring->desc = dma_zalloc_coherent(&pdev->dev, ring->size, &ring->dma,
-					 GFP_KERNEL);
+	ring->desc = dma_alloc_coherent(&pdev->dev, ring->size, &ring->dma,
+					GFP_KERNEL);
 	if (!ring->desc)
 		return -ENOMEM;
 
@@ -2672,9 +2654,9 @@ err:
 /**
  * e1000e_poll - NAPI Rx polling callback
  * @napi: struct associated with this polling callback
- * @weight: number of packets driver is allowed to process this poll
+ * @budget: number of packets driver is allowed to process this poll
  **/
-static int e1000e_poll(struct napi_struct *napi, int weight)
+static int e1000e_poll(struct napi_struct *napi, int budget)
 {
 	struct e1000_adapter *adapter = container_of(napi, struct e1000_adapter,
 						     napi);
@@ -2688,16 +2670,17 @@ static int e1000e_poll(struct napi_struct *napi, int weight)
 	    (adapter->rx_ring->ims_val & adapter->tx_ring->ims_val))
 		tx_cleaned = e1000_clean_tx_irq(adapter->tx_ring);
 
-	adapter->clean_rx(adapter->rx_ring, &work_done, weight);
+	adapter->clean_rx(adapter->rx_ring, &work_done, budget);
 
-	if (!tx_cleaned)
-		work_done = weight;
+	if (!tx_cleaned || work_done == budget)
+		return budget;
 
-	/* If weight not fully consumed, exit the polling mode */
-	if (work_done < weight) {
+	/* Exit the polling mode, but don't re-enable interrupts if stack might
+	 * poll us due to busy-polling
+	 */
+	if (likely(napi_complete_done(napi, work_done))) {
 		if (adapter->itr_setting & 3)
 			e1000_set_itr(adapter);
-		napi_complete_done(napi, work_done);
 		if (!test_bit(__E1000_DOWN, &adapter->state)) {
 			if (adapter->msix_entries)
 				ew32(IMS, adapter->rx_ring->ims_val);
@@ -3333,7 +3316,7 @@ static int e1000e_write_mc_addr_list(struct net_device *netdev)
 		return 0;
 	}
 
-	mta_list = kzalloc(netdev_mc_count(netdev) * ETH_ALEN, GFP_ATOMIC);
+	mta_list = kcalloc(netdev_mc_count(netdev), ETH_ALEN, GFP_ATOMIC);
 	if (!mta_list)
 		return -ENOMEM;
 
@@ -7617,7 +7600,7 @@ module_exit(e1000_exit_module);
 
 MODULE_AUTHOR("Intel Corporation, <linux.nics@intel.com>");
 MODULE_DESCRIPTION("Intel(R) PRO/1000 Network Driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRV_VERSION);
 
 /* netdev.c */

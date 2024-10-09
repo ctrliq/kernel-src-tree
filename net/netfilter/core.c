@@ -168,6 +168,7 @@ repeat:
 
 /* Returns 1 if okfn() needs to be executed by the caller,
  * -EPERM for NF_DROP, 0 otherwise. */
+RH_KABI_FORCE_CHANGE(1)
 int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state)
 {
 	struct nf_hook_ops *elem;

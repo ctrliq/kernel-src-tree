@@ -1055,11 +1055,19 @@ done:
 
 static ssize_t macvtap_do_read(struct macvtap_queue *q, struct kiocb *iocb,
 			       const struct iovec *iv, unsigned long len,
-			       int noblock)
+			       int noblock, struct sk_buff *skb)
 {
 	DEFINE_WAIT(wait);
-	struct sk_buff *skb;
 	ssize_t ret = 0;
+
+	if (!len) {
+		if (skb)
+			kfree_skb(skb);
+		return 0;
+	}
+
+	if (skb)
+		goto put;
 
 	while (len) {
 		if (!noblock)
@@ -1081,16 +1089,19 @@ static ssize_t macvtap_do_read(struct macvtap_queue *q, struct kiocb *iocb,
 			schedule();
 			continue;
 		}
-		ret = macvtap_put_user(q, skb, iv, len);
-		if (unlikely(ret < 0))
-			kfree_skb(skb);
-		else
-			consume_skb(skb);
 		break;
 	}
 
 	if (!noblock)
 		finish_wait(sk_sleep(&q->sk), &wait);
+put:
+	if (skb) {
+		ret = macvtap_put_user(q, skb, iv, len);
+		if (unlikely(ret < 0))
+			kfree_skb(skb);
+		else
+			consume_skb(skb);
+	}
 	return ret;
 }
 
@@ -1107,7 +1118,8 @@ static ssize_t macvtap_aio_read(struct kiocb *iocb, const struct iovec *iv,
 		goto out;
 	}
 
-	ret = macvtap_do_read(q, iocb, iv, len, file->f_flags & O_NONBLOCK);
+	ret = macvtap_do_read(q, iocb, iv, len,
+		file->f_flags & O_NONBLOCK, NULL);
 	ret = min_t(ssize_t, ret, len); /* XXX copied from tun.c. Why? */
 out:
 	return ret;
@@ -1355,11 +1367,15 @@ static int macvtap_recvmsg(struct kiocb *iocb, struct socket *sock,
 			   int flags)
 {
 	struct macvtap_queue *q = container_of(sock, struct macvtap_queue, sock);
+	struct sk_buff *skb = m->msg_control;
 	int ret;
-	if (flags & ~(MSG_DONTWAIT|MSG_TRUNC))
+	if (flags & ~(MSG_DONTWAIT|MSG_TRUNC)) {
+		if (skb)
+			kfree_skb(skb);
 		return -EINVAL;
+	}
 	ret = macvtap_do_read(q, iocb, m->msg_iov, total_len,
-			  flags & MSG_DONTWAIT);
+			flags & MSG_DONTWAIT, skb);
 	if (ret > total_len) {
 		m->msg_flags |= MSG_TRUNC;
 		ret = flags & MSG_TRUNC ? ret : total_len;
@@ -1396,6 +1412,19 @@ struct socket *macvtap_get_socket(struct file *file)
 	return &q->sock;
 }
 EXPORT_SYMBOL_GPL(macvtap_get_socket);
+
+struct skb_array *macvtap_get_skb_array(struct file *file)
+{
+	struct macvtap_queue *q;
+
+	if (file->f_op != &macvtap_fops)
+		return ERR_PTR(-EINVAL);
+	q = file->private_data;
+	if (!q)
+		return ERR_PTR(-EBADFD);
+	return &q->skb_array;
+}
+EXPORT_SYMBOL_GPL(macvtap_get_skb_array);
 
 static int macvtap_queue_resize(struct macvlan_dev *vlan)
 {

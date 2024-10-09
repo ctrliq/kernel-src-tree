@@ -398,7 +398,7 @@ struct perf_addr_filters_head {
 };
 
 /**
- * enum perf_event_active_state - the states of a event
+ * enum perf_event_active_state - the states of an event
  */
 enum perf_event_active_state {
 #ifndef __GENKSYMS__
@@ -609,6 +609,8 @@ struct perf_event {
 	RH_KABI_EXTEND(perf_overflow_handler_t		orig_overflow_handler)
 	RH_KABI_EXTEND(struct bpf_prog			*prog)
 #endif
+	RH_KABI_EXTEND(unsigned long			rcu_batches)
+	RH_KABI_EXTEND(int				rcu_pending)
 #endif /* CONFIG_PERF_EVENTS */
 };
 

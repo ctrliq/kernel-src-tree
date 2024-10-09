@@ -19,6 +19,9 @@ static struct msr __percpu *msrs;
 static struct mem_ctl_info **mcis;
 static struct ecc_settings **ecc_stngs;
 
+/* Number of Unified Memory Controllers */
+static u8 num_umcs;
+
 /*
  * Valid scrub rates for the K8 hardware memory scrubber. We map the scrubbing
  * bandwidth to a valid bit pattern. The 'set' operation finds the 'matching-
@@ -450,7 +453,7 @@ static void get_cs_base_and_mask(struct amd64_pvt *pvt, int csrow, u8 dct,
 	for (i = 0; i < pvt->csels[dct].m_cnt; i++)
 
 #define for_each_umc(i) \
-	for (i = 0; i < NUM_UMCS; i++)
+	for (i = 0; i < num_umcs; i++)
 
 /*
  * @input_addr is an InputAddr associated with the node given by mci. Return the
@@ -2208,6 +2211,24 @@ static struct amd64_family_type family_types[] = {
 			.dbam_to_cs		= f17_base_addr_to_cs_size,
 		}
 	},
+	[F17_M10H_CPUS] = {
+		.ctl_name = "F17h_M10h",
+		.f0_id = PCI_DEVICE_ID_AMD_17H_M10H_DF_F0,
+		.f6_id = PCI_DEVICE_ID_AMD_17H_M10H_DF_F6,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_base_addr_to_cs_size,
+		}
+	},
+	[F17_M30H_CPUS] = {
+		.ctl_name = "F17h_M30h",
+		.f0_id = PCI_DEVICE_ID_AMD_17H_M30H_DF_F0,
+		.f6_id = PCI_DEVICE_ID_AMD_17H_M30H_DF_F6,
+		.ops = {
+			.early_channel_count	= f17_early_channel_count,
+			.dbam_to_cs		= f17_base_addr_to_cs_size,
+		}
+	},
 };
 
 /*
@@ -2455,18 +2476,14 @@ static inline void decode_bus_error(int node_id, struct mce *m)
  * To find the UMC channel represented by this bank we need to match on its
  * instance_id. The instance_id of a bank is held in the lower 32 bits of its
  * IPID.
+ *
+ * Currently, we can derive the channel number by looking at the 6th nibble in
+ * the instance_id. For example, instance_id=0xYXXXXX where Y is the channel
+ * number.
  */
-static int find_umc_channel(struct amd64_pvt *pvt, struct mce *m)
+static int find_umc_channel(struct mce *m)
 {
-	u32 umc_instance_id[] = {0x50f00, 0x150f00};
-	u32 instance_id = m->ipid & GENMASK(31, 0);
-	int i, channel = -1;
-
-	for (i = 0; i < ARRAY_SIZE(umc_instance_id); i++)
-		if (umc_instance_id[i] == instance_id)
-			channel = i;
-
-	return channel;
+	return (m->ipid & GENMASK(31, 0)) >> 20;
 }
 
 static void decode_umc_error(int node_id, struct mce *m)
@@ -2488,11 +2505,7 @@ static void decode_umc_error(int node_id, struct mce *m)
 	if (m->status & MCI_STATUS_DEFERRED)
 		ecc_type = 3;
 
-	err.channel = find_umc_channel(pvt, m);
-	if (err.channel < 0) {
-		err.err_code = ERR_CHANNEL;
-		goto log_error;
-	}
+	err.channel = find_umc_channel(m);
 
 	if (umc_normaddr_to_sysaddr(m->addr, pvt->mc_node_id, err.channel, &sys_addr)) {
 		err.err_code = ERR_NORM_ADDR;
@@ -3215,6 +3228,15 @@ static struct amd64_family_type *per_family_init(struct amd64_pvt *pvt)
 		break;
 
 	case 0x17:
+		if (pvt->model >= 0x10 && pvt->model <= 0x2f) {
+			fam_type = &family_types[F17_M10H_CPUS];
+			pvt->ops = &family_types[F17_M10H_CPUS].ops;
+			break;
+		} else if (pvt->model >= 0x30 && pvt->model <= 0x3f) {
+			fam_type = &family_types[F17_M30H_CPUS];
+			pvt->ops = &family_types[F17_M30H_CPUS].ops;
+			break;
+		}
 		fam_type	= &family_types[F17_CPUS];
 		pvt->ops	= &family_types[F17_CPUS].ops;
 		break;
@@ -3230,6 +3252,22 @@ static struct amd64_family_type *per_family_init(struct amd64_pvt *pvt)
 							     : "revE or earlier ")
 				 : ""), pvt->mc_node_id);
 	return fam_type;
+}
+
+/* Set the number of Unified Memory Controllers in the system. */
+static void compute_num_umcs(void)
+{
+	u8 model = boot_cpu_data.x86_model;
+
+	if (boot_cpu_data.x86 < 0x17)
+		return;
+
+	if (model >= 0x30 && model <= 0x3f)
+		num_umcs = 8;
+	else
+		num_umcs = 2;
+
+	edac_dbg(1, "Number of UMCs: %x", num_umcs);
 }
 
 static int init_one_instance(unsigned int nid)
@@ -3256,7 +3294,7 @@ static int init_one_instance(unsigned int nid)
 		goto err_free;
 
 	if (pvt->fam >= 0x17) {
-		pvt->umc = kcalloc(NUM_UMCS, sizeof(struct amd64_umc), GFP_KERNEL);
+		pvt->umc = kcalloc(num_umcs, sizeof(struct amd64_umc), GFP_KERNEL);
 		if (!pvt->umc) {
 			ret = -ENOMEM;
 			goto err_free;
@@ -3501,6 +3539,8 @@ static int __init amd64_edac_init(void)
 	msrs = msrs_alloc();
 	if (!msrs)
 		goto err_free;
+
+	compute_num_umcs();
 
 	for (i = 0; i < amd_nb_num(); i++)
 		if (probe_one_instance(i)) {

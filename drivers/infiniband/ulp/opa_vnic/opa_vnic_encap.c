@@ -498,7 +498,7 @@ void opa_vnic_encap_skb(struct opa_vnic_adapter *adapter, struct sk_buff *skb)
 	rc = opa_vnic_get_rc(info, skb);
 	l4_hdr = info->vesw.vesw_id;
 
-	mdata = (struct opa_vnic_skb_mdata *)skb_push(skb, sizeof(*mdata));
+	mdata = skb_push(skb, sizeof(*mdata));
 	mdata->vl = opa_vnic_get_vl(adapter, skb);
 	mdata->entropy = entropy;
 	mdata->flags = 0;

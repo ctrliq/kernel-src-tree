@@ -99,18 +99,25 @@ enum iommu_attr {
 	DOMAIN_ATTR_MAX,
 };
 
+#define IOMMU_RESV_DIRECT	(1 << 0)
+#define IOMMU_RESV_RESERVED	(1 << 1)
+
 /**
  * struct iommu_dm_region - descriptor for a direct mapped memory region
  * @list: Linked list pointers
  * @start: System physical start address of the region
  * @length: Length of the region in bytes
  * @prot: IOMMU Protection flags (READ/WRITE/...)
+ * RHEL7 Note: Adding the type field to iommu_dm_region to
+ * avoid backporting all of the new reserved region helper code
+ * @type: Type of region
  */
 struct iommu_dm_region {
 	struct list_head	list;
 	phys_addr_t		start;
 	size_t			length;
 	int			prot;
+	int			type;
 };
 
 #ifdef CONFIG_IOMMU_API
@@ -526,5 +533,12 @@ static inline void iommu_device_unlink(struct device *dev, struct device *link)
 }
 
 #endif /* CONFIG_IOMMU_API */
+
+#ifdef CONFIG_IOMMU_DEBUGFS
+extern	struct dentry *iommu_debugfs_dir;
+void iommu_debugfs_setup(void);
+#else
+static inline void iommu_debugfs_setup(void) {}
+#endif
 
 #endif /* __LINUX_IOMMU_H */

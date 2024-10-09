@@ -50,6 +50,8 @@ int fib_default_rule_add(struct fib_rules_ops *ops,
 	r->flags = flags;
 	r->fr_net = ops->fro_net;
 
+	r->suppress_prefixlen = -1;
+
 	/* The lock is not required here, the list in unreacheable
 	 * at the moment this function is called */
 	list_add_tail(&r->list, &ops->rules_list);
@@ -413,8 +415,10 @@ static int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr* nlh)
 	rule->action = frh->action;
 	rule->flags = frh->flags;
 	rule->table = frh_get_table(frh, tb);
-	if (tb[FRA_TABLE_PREFIXLEN_MIN])
-		rule->table_prefixlen_min = nla_get_u8(tb[FRA_TABLE_PREFIXLEN_MIN]);
+	if (tb[FRA_SUPPRESS_PREFIXLEN])
+		rule->suppress_prefixlen = nla_get_u32(tb[FRA_SUPPRESS_PREFIXLEN]);
+	else
+		rule->suppress_prefixlen = -1;
 
 	err = -EINVAL;
 	if (tb[FRA_GOTO]) {
@@ -614,7 +618,7 @@ static inline size_t fib_rule_nlmsg_size(struct fib_rules_ops *ops,
 			 + nla_total_size(IFNAMSIZ) /* FRA_OIFNAME */
 			 + nla_total_size(4) /* FRA_PRIORITY */
 			 + nla_total_size(4) /* FRA_TABLE */
-			 + nla_total_size(1) /* FRA_TABLE_PREFIXLEN_MIN */
+			 + nla_total_size(4) /* FRA_SUPPRESS_PREFIXLEN */
 			 + nla_total_size(4) /* FRA_FWMARK */
 			 + nla_total_size(4) /* FRA_FWMASK */
 			 + nla_total_size_64bit(8); /* FRA_TUN_ID */
@@ -641,7 +645,7 @@ static int fib_nl_fill_rule(struct sk_buff *skb, struct fib_rule *rule,
 	frh->table = rule->table;
 	if (nla_put_u32(skb, FRA_TABLE, rule->table))
 		goto nla_put_failure;
-	if (nla_put_u8(skb, FRA_TABLE_PREFIXLEN_MIN, rule->table_prefixlen_min))
+	if (nla_put_u32(skb, FRA_SUPPRESS_PREFIXLEN, rule->suppress_prefixlen))
 		goto nla_put_failure;
 	frh->res1 = 0;
 	frh->res2 = 0;

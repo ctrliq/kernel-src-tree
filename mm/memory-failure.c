@@ -1667,14 +1667,6 @@ int soft_offline_page(struct page *page, int flags)
 
 	get_online_mems();
 
-	/*
-	 * Isolate the page, so that it doesn't get reallocated if it
-	 * was free. This flag should be kept set until the source page
-	 * is freed and PG_hwpoison on it is set.
-	 */
-	if (get_pageblock_migratetype(page) != MIGRATE_ISOLATE)
-		set_migratetype_isolate(page, true);
-
 	ret = get_any_page(page, pfn, flags);
 	put_online_mems();
 	if (ret > 0) { /* for in-use pages */
@@ -1693,7 +1685,6 @@ int soft_offline_page(struct page *page, int flags)
 				atomic_long_inc(&num_poisoned_pages);
 		}
 	}
-	unset_migratetype_isolate(page, MIGRATE_MOVABLE);
 	return ret;
 }
 

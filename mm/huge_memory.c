@@ -25,6 +25,7 @@
 #include <linux/migrate.h>
 #include <linux/hashtable.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/page_idle.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -688,8 +689,8 @@ static inline pmd_t mk_huge_pmd(struct page *page, struct vm_area_struct *vma)
 {
 	pmd_t entry;
 	entry = mk_pmd(page, vma->vm_page_prot);
-	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
 	entry = pmd_mkhuge(entry);
+	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
 	return entry;
 }
 
@@ -937,11 +938,11 @@ int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
 	 * but we need to be consistent with PTEs and architectures that
 	 * can't support a 'special' bit.
 	 */
-	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)));
+	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
+			!pfn_t_devmap(pfn));
 	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
 						(VM_PFNMAP|VM_MIXEDMAP));
 	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
-	BUG_ON(!pfn_t_devmap(pfn));
 
 	if (addr < vma->vm_start || addr >= vma->vm_end)
 		return VM_FAULT_SIGBUS;
@@ -1265,17 +1266,15 @@ void huge_pmd_set_accessed(struct vm_fault *vmf, pmd_t orig_pmd)
 	spinlock_t *ptl;
 	pmd_t entry;
 	unsigned long haddr;
-	bool write = vmf->flags & FAULT_FLAG_WRITE;
 
 	ptl = pmd_lock(vma->vm_mm, vmf->pmd);
 	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd)))
 		goto unlock;
 
 	entry = pmd_mkyoung(orig_pmd);
-	if (write)
-		entry = pmd_mkdirty(entry);
 	haddr = address & HPAGE_PMD_MASK;
-	if (pmdp_set_access_flags(vmf->vma, haddr, vmf->pmd, entry, write))
+	if (pmdp_set_access_flags(vmf->vma, haddr, vmf->pmd, entry,
+				vmf->flags & FAULT_FLAG_WRITE))
 		update_mmu_cache_pmd(vma, address, vmf->pmd);
 
 unlock:
@@ -1720,6 +1719,25 @@ int do_huge_pmd_numa_page(struct vm_fault *vmf, pmd_t orig_pmd)
 	}
 
 	/*
+	 * The page_table_lock above provides a memory barrier
+	 * with change_protection_range.
+	 */
+	if (tlb_flush_pending(vma->vm_mm)) {
+		flush_tlb_range(vma, haddr, haddr + HPAGE_PMD_SIZE);
+		/*
+		 * change_huge_pmd() released the pmd lock before
+		 * invalidating the secondary MMUs sharing the primary
+		 * MMU pagetables (with ->invalidate_range()). The
+		 * mmu_notifier_invalidate_range_end() (which
+		 * internally calls ->invalidate_range()) in
+		 * change_pmd_range() will run after us, so we can't
+		 * rely on it here and we need an explicit invalidate.
+		 */
+		mmu_notifier_invalidate_range(vma->vm_mm, haddr,
+					      haddr + HPAGE_PMD_SIZE);
+	}
+
+	/*
 	 * Migrate the THP to the requested node, returns with page unlocked
 	 * and pmd_numa cleared.
 	 */
@@ -1750,76 +1768,6 @@ out:
 		task_numa_fault(last_cpupid, page_nid, HPAGE_PMD_NR, flags);
 
 	return 0;
-}
-
-int madvise_free_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
-		pmd_t *pmd, unsigned long addr, unsigned long next)
-
-{
-	spinlock_t *ptl;
-	pmd_t orig_pmd;
-	struct page *page;
-	struct mm_struct *mm = tlb->mm;
-	int ret = 0;
-
-	if (!pmd_trans_huge_lock(pmd, vma, &ptl))
-		goto out_unlocked;
-
-	orig_pmd = *pmd;
-	if (is_huge_zero_pmd(orig_pmd)) {
-		ret = 1;
-		goto out;
-	}
-
-	page = pmd_page(orig_pmd);
-	/*
-	 * If other processes are mapping this page, we couldn't discard
-	 * the page unless they all do MADV_FREE so let's skip the page.
-	 */
-	if (page_mapcount(page) != 1)
-		goto out;
-
-	if (!trylock_page(page))
-		goto out;
-
-	/*
-	 * If user want to discard part-pages of THP, split it so MADV_FREE
-	 * will deactivate only them.
-	 */
-	if (next - addr != HPAGE_PMD_SIZE) {
-		get_page(page);
-		spin_unlock(ptl);
-		if (split_huge_page(page)) {
-			put_page(page);
-			unlock_page(page);
-			goto out_unlocked;
-		}
-		unlock_page(page);
-		put_page(page);
-		ret = 1;
-		goto out_unlocked;
-	}
-
-	if (PageDirty(page))
-		ClearPageDirty(page);
-	unlock_page(page);
-
-	if (PageActive(page))
-		deactivate_page(page);
-
-	if (pmd_young(orig_pmd) || pmd_dirty(orig_pmd)) {
-		orig_pmd = pmdp_get_and_clear(tlb->mm, addr, pmd);
-		orig_pmd = pmd_mkold(orig_pmd);
-		orig_pmd = pmd_mkclean(orig_pmd);
-
-		set_pmd_at(mm, addr, pmd, orig_pmd);
-		tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
-	}
-	ret = 1;
-out:
-	spin_unlock(ptl);
-out_unlocked:
-	return ret;
 }
 
 int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
@@ -1896,7 +1844,7 @@ int mincore_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
 		  unsigned long old_addr,
 		  unsigned long new_addr, unsigned long old_end,
-		  pmd_t *old_pmd, pmd_t *new_pmd, bool *need_flush)
+		  pmd_t *old_pmd, pmd_t *new_pmd)
 {
 	spinlock_t *old_ptl, *new_ptl;
 	int ret = 0;
@@ -1930,7 +1878,7 @@ int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
 		if (new_ptl != old_ptl)
 			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
 		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
-		if (pmd_present(pmd) && pmd_dirty(pmd))
+		if (pmd_present(pmd))
 			force_flush = true;
 		VM_BUG_ON(!pmd_none(*new_pmd));
 		if (pmd_move_must_withdraw(new_ptl, old_ptl)) {
@@ -1939,12 +1887,10 @@ int move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
 			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
 		}
 		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
-		if (new_ptl != old_ptl)
-			spin_unlock(new_ptl);
 		if (force_flush)
 			flush_tlb_range(vma, old_addr, old_addr + PMD_SIZE);
-		else
-			*need_flush = true;
+		if (new_ptl != old_ptl)
+			spin_unlock(new_ptl);
 		spin_unlock(old_ptl);
 	}
 out:
@@ -2248,6 +2194,11 @@ static void __split_huge_page_refcount(struct page *page,
 		/* clear PageTail before overwriting first_page */
 		smp_wmb();
 
+		if (page_is_young(page))
+			set_page_young(page_tail);
+		if (page_is_idle(page))
+			set_page_idle(page_tail);
+
 		/*
 		 * __split_huge_page_splitting() already set the
 		 * splitting bit in all pmd that could map this
@@ -2321,7 +2272,6 @@ static int __split_huge_page_map(struct page *page,
 	pmd = page_check_address_pmd(page, mm, address,
 			PAGE_CHECK_ADDRESS_PMD_SPLITTING_FLAG, &ptl);
 	if (pmd) {
-		bool dirty = pmd_dirty(*pmd);
 		pgtable = pgtable_trans_huge_withdraw(mm, pmd);
 		pmd_populate(mm, &_pmd, pgtable);
 
@@ -2330,7 +2280,7 @@ static int __split_huge_page_map(struct page *page,
 			pte_t *pte, entry;
 			BUG_ON(PageCompound(page+i));
 			entry = mk_pte(page + i, vma->vm_page_prot);
-			entry = maybe_mkwrite(entry, vma);
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 			if (!pmd_write(*pmd))
 				entry = pte_wrprotect(entry);
 			else
@@ -2339,8 +2289,6 @@ static int __split_huge_page_map(struct page *page,
 				entry = pte_mkold(entry);
 			if (pmd_numa(*pmd))
 				entry = pte_mknuma(entry);
-			if (dirty)
-				SetPageDirty(page + i);
 			pte = pte_offset_map(&_pmd, haddr);
 			BUG_ON(!pte_none(*pte));
 			set_pte_at(mm, haddr, pte, entry);
@@ -2725,7 +2673,8 @@ static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 		VM_BUG_ON_PAGE(PageLRU(page), page);
 
 		/* If there is no mapped pte young don't collapse the page */
-		if (pte_young(pteval) || PageReferenced(page) ||
+		if (pte_young(pteval) ||
+		    page_is_young(page) || PageReferenced(page) ||
 		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced = 1;
 	}
@@ -3097,7 +3046,8 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 		/* cannot use mapcount: can't collapse if there's a gup pin */
 		if (page_count(page) != 1)
 			goto out_unmap;
-		if (pte_young(pteval) || PageReferenced(page) ||
+		if (pte_young(pteval) ||
+		    page_is_young(page) || PageReferenced(page) ||
 		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced = 1;
 	}

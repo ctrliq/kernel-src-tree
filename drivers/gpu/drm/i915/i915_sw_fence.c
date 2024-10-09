@@ -1,10 +1,7 @@
 /*
- * (C) Copyright 2016 Intel Corporation
+ * SPDX-License-Identifier: MIT
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; version 2
- * of the License.
+ * (C) Copyright 2016 Intel Corporation
  */
 
 #include <linux/slab.h>
@@ -24,12 +21,12 @@ enum {
 	DEBUG_FENCE_NOTIFY,
 };
 
-#ifdef CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS
-
 static void *i915_sw_fence_debug_hint(void *addr)
 {
 	return (void *)(((struct i915_sw_fence *)addr)->flags & I915_SW_FENCE_MASK);
 }
+
+#ifdef CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS
 
 static struct debug_obj_descr i915_sw_fence_debug_descr = {
 	.name = "i915_sw_fence",
@@ -135,7 +132,7 @@ static void __i915_sw_fence_wake_up_all(struct i915_sw_fence *fence,
 					struct list_head *continuation)
 {
 	wait_queue_head_t *x = &fence->wait;
-	wait_queue_t *pos, *next;
+	wait_queue_entry_t *pos, *next;
 	unsigned long flags;
 
 	debug_fence_deactivate(fence);
@@ -245,7 +242,7 @@ static int i915_sw_fence_wake(wait_queue_entry_t *wq, unsigned mode, int flags, 
 static bool __i915_sw_fence_check_if_after(struct i915_sw_fence *fence,
 				    const struct i915_sw_fence * const signaler)
 {
-	wait_queue_t *wq;
+	wait_queue_entry_t *wq;
 
 	if (__test_and_set_bit(I915_SW_FENCE_CHECKED_BIT, &fence->flags))
 		return false;
@@ -394,10 +391,11 @@ static void timer_i915_sw_fence_wake(struct timer_list *t)
 	if (!fence)
 		return;
 
-	pr_warn("asynchronous wait on fence %s:%s:%x timed out\n",
-		cb->dma->ops->get_driver_name(cb->dma),
-		cb->dma->ops->get_timeline_name(cb->dma),
-		cb->dma->seqno);
+	pr_notice("Asynchronous wait on fence %s:%s:%x timed out (hint:%pS)\n",
+		  cb->dma->ops->get_driver_name(cb->dma),
+		  cb->dma->ops->get_timeline_name(cb->dma),
+		  cb->dma->seqno,
+		  i915_sw_fence_debug_hint(fence));
 
 	i915_sw_fence_complete(fence);
 }

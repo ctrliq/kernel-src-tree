@@ -42,7 +42,9 @@ struct read_info_sccb {
 	u64	rnmax2;			/* 104-111 */
 	u8	_pad_112[120 - 112];	/* 112-119 */
 	u16	hcpua;			/* 120-121 */
-	u8	_pad_122[4096 - 122];	/* 122-4095 */
+	u8	_pad_122[134 - 122];	/* 122-133 */
+	u8	fac134;			/* 134 */
+	u8	_pad_135[4096 - 135];	/* 135-4095 */
 } __packed __aligned(PAGE_SIZE);
 
 static char sccb_early[PAGE_SIZE] __aligned(PAGE_SIZE) __initdata;
@@ -57,6 +59,7 @@ static unsigned int sclp_mtid_cp;
 static unsigned int sclp_mtid_max;
 static unsigned int sclp_mtid_prev;
 static unsigned char sclp_sief2;
+static unsigned char sclp_diag318;
 
 u64 sclp_facilities;
 u8 sclp_fac84;
@@ -151,6 +154,8 @@ static void __init sclp_facilities_detect(struct read_info_sccb *sccb)
 	sclp_mtid_cp = (sccb->fac42 & 0x80) ? (sccb->fac43 & 31) : 0;
 	sclp_mtid_max = max(sclp_mtid, sclp_mtid_cp);
 	sclp_mtid_prev = (sccb->fac42 & 0x80) ? (sccb->fac66 & 31) : 0;
+	if (sccb->cpuoff > 134)
+		sclp_diag318 = !!(sccb->fac134 & 0x80);
 }
 
 unsigned int sclp_get_mtid(u8 cpu_type)
@@ -204,6 +209,12 @@ int sclp_has_sief2(void)
 	return sclp_sief2;
 }
 EXPORT_SYMBOL(sclp_has_sief2);
+
+int sclp_has_diag318(void)
+{
+	return sclp_diag318;
+}
+EXPORT_SYMBOL(sclp_has_diag318);
 
 /*
  * This function will be called after sclp_facilities_detect(), which gets

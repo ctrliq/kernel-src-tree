@@ -352,7 +352,6 @@ static int fwspk_create_pcm(struct fwspk *fwspk)
 		.trigger   = fwspk_trigger,
 		.pointer   = fwspk_pointer,
 		.page      = snd_pcm_lib_get_vmalloc_page,
-		.mmap      = snd_pcm_lib_mmap_vmalloc,
 	};
 	struct snd_pcm *pcm;
 	int err;

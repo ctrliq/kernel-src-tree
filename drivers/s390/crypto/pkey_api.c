@@ -64,6 +64,24 @@ static void __exit pkey_debug_exit(void)
 	debug_unregister(debug_info);
 }
 
+/* Key token types */
+#define TOKTYPE_NON_CCA		0x00 /* Non-CCA key token */
+#define TOKTYPE_CCA_INTERNAL	0x01 /* CCA internal key token */
+
+/* For TOKTYPE_NON_CCA: */
+#define TOKVER_PROTECTED_KEY	0x01 /* Protected key token */
+
+/* For TOKTYPE_CCA_INTERNAL: */
+#define TOKVER_CCA_AES		0x04 /* CCA AES key token */
+
+/* header part of a key token */
+struct keytoken_header {
+	u8  type;     /* one of the TOKTYPE values */
+	u8  res0[3];
+	u8  version;  /* one of the TOKVER values */
+	u8  res1[3];
+} __packed;
+
 /* inside view of a secure key token (only type 0x01 version 0x04) */
 struct secaeskeytoken {
 	u8  type;     /* 0x01 for internal key token */
@@ -80,6 +98,17 @@ struct secaeskeytoken {
 	u8  tvv[4];   /* token validation value */
 } __packed;
 
+/* inside view of a protected key token (only type 0x00 version 0x01) */
+struct protaeskeytoken {
+	u8  type;     /* 0x00 for PAES specific key tokens */
+	u8  res0[3];
+	u8  version;  /* should be 0x01 for protected AES key token */
+	u8  res1[3];
+	u32 keytype;  /* key type, one of the PKEY_KEYTYPE values */
+	u32 len;      /* bytes actually stored in protkey[] */
+	u8  protkey[MAXPROTKEYSIZE]; /* the protected key blob */
+} __packed;
+
 /*
  * Simple check if the token is a valid CCA secure AES key
  * token. If keybitsize is given, the bitsize of the key is
@@ -89,16 +118,16 @@ static int check_secaeskeytoken(const u8 *token, int keybitsize)
 {
 	struct secaeskeytoken *t = (struct secaeskeytoken *) token;
 
-	if (t->type != 0x01) {
+	if (t->type != TOKTYPE_CCA_INTERNAL) {
 		DEBUG_ERR(
-			"check_secaeskeytoken secure token check failed, type mismatch 0x%02x != 0x01\n",
-			(int) t->type);
+			"%s secure token check failed, type mismatch 0x%02x != 0x%02x\n",
+			__func__, (int) t->type, TOKTYPE_CCA_INTERNAL);
 		return -EINVAL;
 	}
-	if (t->version != 0x04) {
+	if (t->version != TOKVER_CCA_AES) {
 		DEBUG_ERR(
-			"check_secaeskeytoken secure token check failed, version mismatch 0x%02x != 0x04\n",
-			(int) t->version);
+			"%s secure token check failed, version mismatch 0x%02x != 0x%02x\n",
+			__func__, (int) t->version, TOKVER_CCA_AES);
 		return -EINVAL;
 	}
 	if (keybitsize > 0 && t->bitsize != keybitsize) {
@@ -1049,7 +1078,7 @@ int pkey_verifykey(const struct pkey_seckey *seckey,
 	rc = mkvp_cache_fetch(cardnr, domain, mkvp);
 	if (rc)
 		goto out;
-	if (t->mkvp == mkvp[1]) {
+	if (t->mkvp == mkvp[1] && t->mkvp != mkvp[0]) {
 		DEBUG_DBG("pkey_verifykey secure key has old mkvp\n");
 		if (pattributes)
 			*pattributes |= PKEY_VERIFY_ATTR_OLD_MKVP;
@@ -1151,6 +1180,80 @@ int pkey_verifyprotkey(const struct pkey_protkey *protkey)
 	return 0;
 }
 EXPORT_SYMBOL(pkey_verifyprotkey);
+
+/*
+ * Transform a non-CCA key token into a protected key
+ */
+static int pkey_nonccatok2pkey(const __u8 *key, __u32 keylen,
+			       struct pkey_protkey *protkey)
+{
+	struct keytoken_header *hdr = (struct keytoken_header *)key;
+	struct protaeskeytoken *t;
+
+	switch (hdr->version) {
+	case TOKVER_PROTECTED_KEY:
+		if (keylen != sizeof(struct protaeskeytoken))
+			return -EINVAL;
+
+		t = (struct protaeskeytoken *)key;
+		protkey->len = t->len;
+		protkey->type = t->keytype;
+		memcpy(protkey->protkey, t->protkey,
+		       sizeof(protkey->protkey));
+
+		return pkey_verifyprotkey(protkey);
+	default:
+		DEBUG_ERR("%s unknown/unsupported non-CCA token version %d\n",
+			  __func__, hdr->version);
+		return -EINVAL;
+	}
+}
+
+/*
+ * Transform a CCA internal key token into a protected key
+ */
+static int pkey_ccainttok2pkey(const __u8 *key, __u32 keylen,
+			       struct pkey_protkey *protkey)
+{
+	struct keytoken_header *hdr = (struct keytoken_header *)key;
+
+	switch (hdr->version) {
+	case TOKVER_CCA_AES:
+		if (keylen != sizeof(struct secaeskeytoken))
+			return -EINVAL;
+
+		return pkey_skey2pkey((struct pkey_seckey *)key,
+				      protkey);
+	default:
+		DEBUG_ERR("%s unknown/unsupported CCA internal token version %d\n",
+			  __func__, hdr->version);
+		return -EINVAL;
+	}
+}
+
+/*
+ * Transform a key blob (of any type) into a protected key
+ */
+int pkey_keyblob2pkey(const __u8 *key, __u32 keylen,
+		      struct pkey_protkey *protkey)
+{
+	struct keytoken_header *hdr = (struct keytoken_header *)key;
+
+	if (keylen < sizeof(struct keytoken_header))
+		return -EINVAL;
+
+	switch (hdr->type) {
+	case TOKTYPE_NON_CCA:
+		return pkey_nonccatok2pkey(key, keylen, protkey);
+	case TOKTYPE_CCA_INTERNAL:
+		return pkey_ccainttok2pkey(key, keylen, protkey);
+	default:
+		DEBUG_ERR("%s unknown/unsupported blob type %d\n", __func__,
+			  hdr->type);
+		return -EINVAL;
+	}
+}
+EXPORT_SYMBOL(pkey_keyblob2pkey);
 
 /*
  * File io functions
@@ -1290,6 +1393,34 @@ static long pkey_unlocked_ioctl(struct file *filp, unsigned int cmd,
 			return -EFAULT;
 		rc = pkey_verifyprotkey(&kvp.protkey);
 		DEBUG_DBG("%s pkey_verifyprotkey()=%d\n", __func__, rc);
+		break;
+	}
+	case PKEY_KBLOB2PROTK: {
+		struct pkey_kblob2pkey __user *utp = (void __user *) arg;
+		struct pkey_kblob2pkey ktp;
+		__u8 __user *ukey;
+		__u8 *kkey;
+
+		if (copy_from_user(&ktp, utp, sizeof(ktp)))
+			return -EFAULT;
+		if (ktp.keylen < MINKEYBLOBSIZE ||
+		    ktp.keylen > MAXKEYBLOBSIZE)
+			return -EINVAL;
+		ukey = ktp.key;
+		kkey = kmalloc(ktp.keylen, GFP_KERNEL);
+		if (kkey == NULL)
+			return -ENOMEM;
+		if (copy_from_user(kkey, ukey, ktp.keylen)) {
+			kfree(kkey);
+			return -EFAULT;
+		}
+		rc = pkey_keyblob2pkey(kkey, ktp.keylen, &ktp.protkey);
+		DEBUG_DBG("%s pkey_keyblob2pkey()=%d\n", __func__, rc);
+		kfree(kkey);
+		if (rc)
+			break;
+		if (copy_to_user(utp, &ktp, sizeof(ktp)))
+			return -EFAULT;
 		break;
 	}
 	default:
@@ -1527,12 +1658,6 @@ static struct attribute_group ccadata_attr_group = {
 	.bin_attrs = ccadata_attrs,
 };
 
-static const struct attribute_group *pkey_attr_groups[] = {
-	&protkey_attr_group,
-	&ccadata_attr_group,
-	NULL,
-};
-
 static const struct file_operations pkey_fops = {
 	.owner		= THIS_MODULE,
 	.open		= nonseekable_open,
@@ -1545,7 +1670,6 @@ static struct miscdevice pkey_dev = {
 	.minor	= MISC_DYNAMIC_MINOR,
 	.mode	= 0666,
 	.fops	= &pkey_fops,
-	.groups = pkey_attr_groups,
 };
 
 /*
@@ -1554,6 +1678,7 @@ static struct miscdevice pkey_dev = {
 int __init pkey_init(void)
 {
 	cpacf_mask_t kmc_functions;
+	int ret;
 
 	/*
 	 * The pckmo instruction should be available - even if we don't
@@ -1574,7 +1699,26 @@ int __init pkey_init(void)
 
 	pkey_debug_init();
 
-	return misc_register(&pkey_dev);
+	ret = misc_register(&pkey_dev);
+	if (ret)
+		return ret;
+
+	ret = sysfs_create_group(&pkey_dev.this_device->kobj, &protkey_attr_group);
+	if (ret)
+		goto out_err;
+
+	ret = sysfs_create_group(&pkey_dev.this_device->kobj, &ccadata_attr_group);
+	if (ret)
+		goto out_err2;
+
+	return 0;
+
+out_err2:
+	sysfs_remove_group(&pkey_dev.this_device->kobj, &protkey_attr_group);
+out_err:
+	misc_deregister(&pkey_dev);
+	pkey_debug_exit();
+	return ret;
 }
 
 /*
@@ -1582,6 +1726,8 @@ int __init pkey_init(void)
  */
 static void __exit pkey_exit(void)
 {
+	sysfs_remove_group(&pkey_dev.this_device->kobj, &protkey_attr_group);
+	sysfs_remove_group(&pkey_dev.this_device->kobj, &ccadata_attr_group);
 	misc_deregister(&pkey_dev);
 	mkvp_cache_free();
 	pkey_debug_exit();

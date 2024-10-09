@@ -276,7 +276,7 @@ struct ib_pd *__ib_alloc_pd(struct ib_device *device, unsigned int flags,
 	}
 
 	pd->res.type = RDMA_RESTRACK_PD;
-	pd->res.kern_name = caller;
+	rdma_restrack_set_task(&pd->res, caller);
 	rdma_restrack_add(&pd->res);
 
 	if (mr_access_flags) {
@@ -402,7 +402,8 @@ static int rdma_check_ah_attr(struct ib_device *device,
 	if (!rdma_is_port_valid(device, ah_attr->port_num))
 		return -EINVAL;
 
-	if (ah_attr->type == RDMA_AH_ATTR_TYPE_ROCE &&
+	if ((rdma_is_grh_required(device, ah_attr->port_num) ||
+	     ah_attr->type == RDMA_AH_ATTR_TYPE_ROCE) &&
 	    !(ah_attr->ah_flags & IB_AH_GRH))
 		return -EINVAL;
 
@@ -651,16 +652,16 @@ static bool find_gid_index(const union ib_gid *gid,
 	return true;
 }
 
-static int get_sgid_index_from_eth(struct ib_device *device, u8 port_num,
-				   u16 vlan_id, const union ib_gid *sgid,
-				   enum ib_gid_type gid_type,
-				   u16 *gid_index)
+static const struct ib_gid_attr *
+get_sgid_attr_from_eth(struct ib_device *device, u8 port_num,
+		       u16 vlan_id, const union ib_gid *sgid,
+		       enum ib_gid_type gid_type)
 {
 	struct find_gid_index_context context = {.vlan_id = vlan_id,
 						 .gid_type = gid_type};
 
-	return ib_find_gid_by_filter(device, sgid, port_num, find_gid_index,
-				     &context, gid_index);
+	return rdma_find_gid_by_filter(device, sgid, port_num, find_gid_index,
+				       &context);
 }
 
 int ib_get_gids_from_rdma_hdr(const union rdma_network_hdr *hdr,
@@ -704,39 +705,24 @@ EXPORT_SYMBOL(ib_get_gids_from_rdma_hdr);
 static int ib_resolve_unicast_gid_dmac(struct ib_device *device,
 				       struct rdma_ah_attr *ah_attr)
 {
-	struct ib_gid_attr sgid_attr;
-	struct ib_global_route *grh;
+	struct ib_global_route *grh = rdma_ah_retrieve_grh(ah_attr);
+	const struct ib_gid_attr *sgid_attr = grh->sgid_attr;
 	int hop_limit = 0xff;
-	union ib_gid sgid;
-	int ret;
-
-	grh = rdma_ah_retrieve_grh(ah_attr);
-
-	ret = ib_query_gid(device,
-			   rdma_ah_get_port_num(ah_attr),
-			   grh->sgid_index,
-			   &sgid, &sgid_attr);
-	if (ret || !sgid_attr.ndev) {
-		if (!ret)
-			ret = -ENXIO;
-		return ret;
-	}
+	int ret = 0;
 
 	/* If destination is link local and source GID is RoCEv1,
 	 * IP stack is not used.
 	 */
 	if (rdma_link_local_addr((struct in6_addr *)grh->dgid.raw) &&
-	    sgid_attr.gid_type == IB_GID_TYPE_ROCE) {
+	    sgid_attr->gid_type == IB_GID_TYPE_ROCE) {
 		rdma_get_ll_mac((struct in6_addr *)grh->dgid.raw,
 				ah_attr->roce.dmac);
-		goto done;
+		return ret;
 	}
 
-	ret = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
+	ret = rdma_addr_find_l2_eth_by_grh(&sgid_attr->gid, &grh->dgid,
 					   ah_attr->roce.dmac,
-					   sgid_attr.ndev, &hop_limit);
-done:
-	dev_put(sgid_attr.ndev);
+					   sgid_attr, &hop_limit);
 
 	grh->hop_limit = hop_limit;
 	return ret;
@@ -751,16 +737,18 @@ done:
  * as sgid and, sgid is used as dgid because sgid contains destinations
  * GID whom to respond to.
  *
+ * On success the caller is responsible to call rdma_destroy_ah_attr on the
+ * attr.
  */
 int ib_init_ah_attr_from_wc(struct ib_device *device, u8 port_num,
 			    const struct ib_wc *wc, const struct ib_grh *grh,
 			    struct rdma_ah_attr *ah_attr)
 {
 	u32 flow_class;
-	u16 gid_index;
 	int ret;
 	enum rdma_network_type net_type = RDMA_NETWORK_IB;
 	enum ib_gid_type gid_type = IB_GID_TYPE_IB;
+	const struct ib_gid_attr *sgid_attr;
 	int hoplimit = 0xff;
 	union ib_gid dgid;
 	union ib_gid sgid;
@@ -791,40 +779,49 @@ int ib_init_ah_attr_from_wc(struct ib_device *device, u8 port_num,
 		if (!(wc->wc_flags & IB_WC_GRH))
 			return -EPROTOTYPE;
 
-		ret = get_sgid_index_from_eth(device, port_num,
-					      vlan_id, &dgid,
-					      gid_type, &gid_index);
-		if (ret)
-			return ret;
+		sgid_attr = get_sgid_attr_from_eth(device, port_num,
+						   vlan_id, &dgid,
+						   gid_type);
+		if (IS_ERR(sgid_attr))
+			return PTR_ERR(sgid_attr);
 
 		flow_class = be32_to_cpu(grh->version_tclass_flow);
-		rdma_ah_set_grh(ah_attr, &sgid,
-				flow_class & 0xFFFFF,
-				(u8)gid_index, hoplimit,
-				(flow_class >> 20) & 0xFF);
-		return ib_resolve_unicast_gid_dmac(device, ah_attr);
+		rdma_move_grh_sgid_attr(ah_attr,
+					&sgid,
+					flow_class & 0xFFFFF,
+					hoplimit,
+					(flow_class >> 20) & 0xFF,
+					sgid_attr);
+
+		ret = ib_resolve_unicast_gid_dmac(device, ah_attr);
+		if (ret)
+			rdma_destroy_ah_attr(ah_attr);
+
+		return ret;
 	} else {
 		rdma_ah_set_dlid(ah_attr, wc->slid);
 		rdma_ah_set_path_bits(ah_attr, wc->dlid_path_bits);
 
-		if (wc->wc_flags & IB_WC_GRH) {
-			if (dgid.global.interface_id != cpu_to_be64(IB_SA_WELL_KNOWN_GUID)) {
-				ret = ib_find_cached_gid_by_port(device, &dgid,
-								 IB_GID_TYPE_IB,
-								 port_num, NULL,
-								 &gid_index);
-				if (ret)
-					return ret;
-			} else {
-				gid_index = 0;
-			}
+		if ((wc->wc_flags & IB_WC_GRH) == 0)
+			return 0;
 
-			flow_class = be32_to_cpu(grh->version_tclass_flow);
-			rdma_ah_set_grh(ah_attr, &sgid,
+		if (dgid.global.interface_id !=
+					cpu_to_be64(IB_SA_WELL_KNOWN_GUID)) {
+			sgid_attr = rdma_find_gid_by_port(
+				device, &dgid, IB_GID_TYPE_IB, port_num, NULL);
+		} else
+			sgid_attr = rdma_get_gid_attr(device, port_num, 0);
+
+		if (IS_ERR(sgid_attr))
+			return PTR_ERR(sgid_attr);
+		flow_class = be32_to_cpu(grh->version_tclass_flow);
+		rdma_move_grh_sgid_attr(ah_attr,
+					&sgid,
 					flow_class & 0xFFFFF,
-					(u8)gid_index, hoplimit,
-					(flow_class >> 20) & 0xFF);
-		}
+					hoplimit,
+					(flow_class >> 20) & 0xFF,
+					sgid_attr);
+
 		return 0;
 	}
 }
@@ -877,13 +874,17 @@ struct ib_ah *ib_create_ah_from_wc(struct ib_pd *pd, const struct ib_wc *wc,
 				   const struct ib_grh *grh, u8 port_num)
 {
 	struct rdma_ah_attr ah_attr;
+	struct ib_ah *ah;
 	int ret;
 
 	ret = ib_init_ah_attr_from_wc(pd->device, port_num, wc, grh, &ah_attr);
 	if (ret)
 		return ERR_PTR(ret);
 
-	return rdma_create_ah(pd, &ah_attr);
+	ah = rdma_create_ah(pd, &ah_attr);
+
+	rdma_destroy_ah_attr(&ah_attr);
+	return ah;
 }
 EXPORT_SYMBOL(ib_create_ah_from_wc);
 
@@ -1098,8 +1099,8 @@ struct ib_qp *ib_open_qp(struct ib_xrcd *xrcd,
 }
 EXPORT_SYMBOL(ib_open_qp);
 
-static struct ib_qp *ib_create_xrc_qp(struct ib_qp *qp,
-		struct ib_qp_init_attr *qp_init_attr)
+static struct ib_qp *create_xrc_qp(struct ib_qp *qp,
+				   struct ib_qp_init_attr *qp_init_attr)
 {
 	struct ib_qp *real_qp = qp;
 
@@ -1114,10 +1115,10 @@ static struct ib_qp *ib_create_xrc_qp(struct ib_qp *qp,
 
 	qp = __ib_open_qp(real_qp, qp_init_attr->event_handler,
 			  qp_init_attr->qp_context);
-	if (!IS_ERR(qp))
-		__ib_insert_xrcd_qp(qp_init_attr->xrcd, real_qp);
-	else
-		real_qp->device->destroy_qp(real_qp);
+	if (IS_ERR(qp))
+		return qp;
+
+	__ib_insert_xrcd_qp(qp_init_attr->xrcd, real_qp);
 	return qp;
 }
 
@@ -1148,10 +1149,8 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 		return qp;
 
 	ret = ib_create_qp_security(qp, device);
-	if (ret) {
-		ib_destroy_qp(qp);
-		return ERR_PTR(ret);
-	}
+	if (ret)
+		goto err;
 
 	qp->real_qp    = qp;
 	qp->qp_type    = qp_init_attr->qp_type;
@@ -1164,8 +1163,15 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 	INIT_LIST_HEAD(&qp->sig_mrs);
 	qp->port = 0;
 
-	if (qp_init_attr->qp_type == IB_QPT_XRC_TGT)
-		return ib_create_xrc_qp(qp, qp_init_attr);
+	if (qp_init_attr->qp_type == IB_QPT_XRC_TGT) {
+		struct ib_qp *xrc_qp = create_xrc_qp(qp, qp_init_attr);
+
+		if (IS_ERR(xrc_qp)) {
+			ret = PTR_ERR(xrc_qp);
+			goto err;
+		}
+		return xrc_qp;
+	}
 
 	qp->event_handler = qp_init_attr->event_handler;
 	qp->qp_context = qp_init_attr->qp_context;
@@ -1192,11 +1198,8 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 
 	if (qp_init_attr->cap.max_rdma_ctxs) {
 		ret = rdma_rw_init_mrs(qp, qp_init_attr);
-		if (ret) {
-			pr_err("failed to init MR pool ret= %d\n", ret);
-			ib_destroy_qp(qp);
-			return ERR_PTR(ret);
-		}
+		if (ret)
+			goto err;
 	}
 
 	/*
@@ -1209,6 +1212,11 @@ struct ib_qp *ib_create_qp(struct ib_pd *pd,
 				 device->attrs.max_sge_rd);
 
 	return qp;
+
+err:
+	ib_destroy_qp(qp);
+	return ERR_PTR(ret);
+
 }
 EXPORT_SYMBOL(ib_create_qp);
 
@@ -1521,8 +1529,7 @@ static const struct {
 };
 
 bool ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
-			enum ib_qp_type type, enum ib_qp_attr_mask mask,
-			enum rdma_link_layer ll)
+			enum ib_qp_type type, enum ib_qp_attr_mask mask)
 {
 	enum ib_qp_attr_mask req_param, opt_param;
 
@@ -1641,14 +1648,16 @@ static int _ib_modify_qp(struct ib_qp *qp, struct ib_qp_attr *attr,
 
 	if (rdma_ib_or_roce(qp->device, port)) {
 		if (attr_mask & IB_QP_RQ_PSN && attr->rq_psn & ~0xffffff) {
-			pr_warn("%s: %s rq_psn overflow, masking to 24 bits\n",
-				__func__, qp->device->name);
+			dev_warn(&qp->device->dev,
+				 "%s rq_psn overflow, masking to 24 bits\n",
+				 __func__);
 			attr->rq_psn &= 0xffffff;
 		}
 
 		if (attr_mask & IB_QP_SQ_PSN && attr->sq_psn & ~0xffffff) {
-			pr_warn("%s: %s sq_psn overflow, masking to 24 bits\n",
-				__func__, qp->device->name);
+			dev_warn(&qp->device->dev,
+				 " %s sq_psn overflow, masking to 24 bits\n",
+				 __func__);
 			attr->sq_psn &= 0xffffff;
 		}
 	}
@@ -1900,7 +1909,7 @@ struct ib_cq *__ib_create_cq(struct ib_device *device,
 		cq->cq_context    = cq_context;
 		atomic_set(&cq->usecnt, 0);
 		cq->res.type = RDMA_RESTRACK_CQ;
-		cq->res.kern_name = caller;
+		rdma_restrack_set_task(&cq->res, caller);
 		rdma_restrack_add(&cq->res);
 	}
 
@@ -1937,11 +1946,16 @@ EXPORT_SYMBOL(ib_resize_cq);
 int ib_dereg_mr(struct ib_mr *mr)
 {
 	struct ib_pd *pd = mr->pd;
+	struct ib_dm *dm = mr->dm;
 	int ret;
 
+	rdma_restrack_del(&mr->res);
 	ret = mr->device->dereg_mr(mr);
-	if (!ret)
+	if (!ret) {
 		atomic_dec(&pd->usecnt);
+		if (dm)
+			atomic_dec(&dm->usecnt);
+	}
 
 	return ret;
 }
@@ -1976,6 +1990,8 @@ struct ib_mr *ib_alloc_mr(struct ib_pd *pd,
 		mr->uobject = NULL;
 		atomic_inc(&pd->usecnt);
 		mr->need_inval = false;
+		mr->res.type = RDMA_RESTRACK_MR;
+		rdma_restrack_add(&mr->res);
 	}
 
 	return mr;
@@ -2626,3 +2642,49 @@ void ib_drain_qp(struct ib_qp *qp)
 		ib_drain_rq(qp);
 }
 EXPORT_SYMBOL(ib_drain_qp);
+
+struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
+				     enum rdma_netdev_t type, const char *name,
+				     unsigned char name_assign_type,
+				     void (*setup)(struct net_device *))
+{
+	struct rdma_netdev_alloc_params params;
+	struct net_device *netdev;
+	int rc;
+
+	if (!device->rdma_netdev_get_params)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	rc = device->rdma_netdev_get_params(device, port_num, type, &params);
+	if (rc)
+		return ERR_PTR(rc);
+
+	netdev = alloc_netdev_mqs(params.sizeof_priv, name,
+				  setup, params.txqs, params.rxqs);
+	if (!netdev)
+		return ERR_PTR(-ENOMEM);
+
+	return netdev;
+}
+EXPORT_SYMBOL(rdma_alloc_netdev);
+
+int rdma_init_netdev(struct ib_device *device, u8 port_num,
+		     enum rdma_netdev_t type, const char *name,
+		     unsigned char name_assign_type,
+		     void (*setup)(struct net_device *),
+		     struct net_device *netdev)
+{
+	struct rdma_netdev_alloc_params params;
+	int rc;
+
+	if (!device->rdma_netdev_get_params)
+		return -EOPNOTSUPP;
+
+	rc = device->rdma_netdev_get_params(device, port_num, type, &params);
+	if (rc)
+		return rc;
+
+	return params.initialize_rdma_netdev(device, port_num,
+					     netdev, params.param);
+}
+EXPORT_SYMBOL(rdma_init_netdev);

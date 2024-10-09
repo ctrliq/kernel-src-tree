@@ -1120,8 +1120,6 @@ struct pqi_ctrl_info {
 	int		max_msix_vectors;
 	int		num_msix_vectors_enabled;
 	int		num_msix_vectors_initialized;
-	u32		msix_vectors[PQI_MAX_MSIX_VECTORS];
-	void		*intr_data[PQI_MAX_MSIX_VECTORS];
 	int		event_irq;
 	struct Scsi_Host *scsi_host;
 
@@ -1414,8 +1412,8 @@ static inline bool pqi_ctrl_blocked(struct pqi_ctrl_info *ctrl_info)
 	return ctrl_info->block_requests;
 }
 
-void pqi_sas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
-	struct sas_rphy *rphy);
+int pqi_sas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+        struct request *rq);
 
 int pqi_add_sas_host(struct Scsi_Host *shost, struct pqi_ctrl_info *ctrl_info);
 void pqi_delete_sas_host(struct pqi_ctrl_info *ctrl_info);

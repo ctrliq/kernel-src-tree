@@ -62,8 +62,7 @@
 #include <net/netevent.h>
 #include <net/addrconf.h>
 #include <net/bonding.h>
-#include <net/addrconf.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 #include <linux/crash_dump.h>
 #include <linux/ip.h>
 #include <net/udp_tunnel.h>
@@ -268,7 +267,7 @@ static void dcb_tx_queue_prio_enable(struct net_device *dev, int enable)
 	}
 }
 
-static int cxgb4_dcb_enabled(const struct net_device *dev)
+int cxgb4_dcb_enabled(const struct net_device *dev)
 {
 	struct port_info *pi = netdev_priv(dev);
 
@@ -435,6 +434,60 @@ static int set_rxmode(struct net_device *dev, int mtu, bool sleep_ok)
 }
 
 /**
+ *	cxgb4_change_mac - Update match filter for a MAC address.
+ *	@pi: the port_info
+ *	@viid: the VI id
+ *	@tcam_idx: TCAM index of existing filter for old value of MAC address,
+ *		   or -1
+ *	@addr: the new MAC address value
+ *	@persist: whether a new MAC allocation should be persistent
+ *	@add_smt: if true also add the address to the HW SMT
+ *
+ *	Modifies an MPS filter and sets it to the new MAC address if
+ *	@tcam_idx >= 0, or adds the MAC address to a new filter if
+ *	@tcam_idx < 0. In the latter case the address is added persistently
+ *	if @persist is %true.
+ *	Addresses are programmed to hash region, if tcam runs out of entries.
+ *
+ */
+static int cxgb4_change_mac(struct port_info *pi, unsigned int viid,
+			    int *tcam_idx, const u8 *addr, bool persist,
+			    u8 *smt_idx)
+{
+	struct adapter *adapter = pi->adapter;
+	struct hash_mac_addr *entry, *new_entry;
+	int ret;
+
+	ret = t4_change_mac(adapter, adapter->mbox, viid,
+			    *tcam_idx, addr, persist, smt_idx);
+	/* We ran out of TCAM entries. try programming hash region. */
+	if (ret == -ENOMEM) {
+		/* If the MAC address to be updated is in the hash addr
+		 * list, update it from the list
+		 */
+		list_for_each_entry(entry, &adapter->mac_hlist, list) {
+			if (entry->iface_mac) {
+				ether_addr_copy(entry->addr, addr);
+				goto set_hash;
+			}
+		}
+		new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
+		if (!new_entry)
+			return -ENOMEM;
+		ether_addr_copy(new_entry->addr, addr);
+		new_entry->iface_mac = true;
+		list_add_tail(&new_entry->list, &adapter->mac_hlist);
+set_hash:
+		ret = cxgb4_set_addr_hash(pi);
+	} else if (ret >= 0) {
+		*tcam_idx = ret;
+		ret = 0;
+	}
+
+	return ret;
+}
+
+/*
  *	link_start - enable a port
  *	@dev: the port to enable
  *
@@ -452,15 +505,9 @@ static int link_start(struct net_device *dev)
 	 */
 	ret = t4_set_rxmode(pi->adapter, mb, pi->viid, dev->mtu, -1, -1, -1,
 			    !!(dev->features & NETIF_F_HW_VLAN_CTAG_RX), true);
-	if (ret == 0) {
-		ret = t4_change_mac(pi->adapter, mb, pi->viid,
-				    pi->xact_addr_filt, dev->dev_addr, true,
-				    true);
-		if (ret >= 0) {
-			pi->xact_addr_filt = ret;
-			ret = 0;
-		}
-	}
+	if (ret == 0)
+		ret = cxgb4_change_mac(pi, pi->viid, &pi->xact_addr_filt,
+				       dev->dev_addr, true, &pi->smt_idx);
 	if (ret == 0)
 		ret = t4_link_l1cfg(pi->adapter, mb, pi->tx_chan,
 				    &pi->link_cfg);
@@ -713,7 +760,7 @@ int cxgb4_write_rss(const struct port_info *pi, const u16 *queues)
 	const struct sge_eth_rxq *rxq;
 
 	rxq = &adapter->sge.ethrxq[pi->first_qset];
-	rss = kmalloc(pi->rss_size * sizeof(u16), GFP_KERNEL);
+	rss = kmalloc_array(pi->rss_size, sizeof(u16), GFP_KERNEL);
 	if (!rss)
 		return -ENOMEM;
 
@@ -924,6 +971,7 @@ static int setup_sge_queues(struct adapter *adap)
 		     QUEUENUMBER_V(s->ethrxq[0].rspq.abs_id));
 	return 0;
 freeout:
+	dev_err(adap->pdev_dev, "Can't allocate queues, err=%d\n", -err);
 	t4_free_sge_resources(adap);
 	return err;
 }
@@ -1579,28 +1627,6 @@ unsigned int cxgb4_best_aligned_mtu(const unsigned short *mtus,
 	return mtus[mtu_idx];
 }
 EXPORT_SYMBOL(cxgb4_best_aligned_mtu);
-
-/**
- *	cxgb4_tp_smt_idx - Get the Source Mac Table index for this VI
- *	@chip: chip type
- *	@viid: VI id of the given port
- *
- *	Return the SMT index for this VI.
- */
-unsigned int cxgb4_tp_smt_idx(enum chip_type chip, unsigned int viid)
-{
-	/* In T4/T5, SMT contains 256 SMAC entries organized in
-	 * 128 rows of 2 entries each.
-	 * In T6, SMT contains 256 SMAC entries in 256 rows.
-	 * TODO: The below code needs to be updated when we add support
-	 * for 256 VFs.
-	 */
-	if (CHELSIO_CHIP_VERSION(chip) <= CHELSIO_T5)
-		return ((viid & 0x7f) << 1);
-	else
-		return (viid & 0x7f);
-}
-EXPORT_SYMBOL(cxgb4_tp_smt_idx);
 
 /**
  *	cxgb4_port_chan - get the HW channel of a port
@@ -2614,8 +2640,6 @@ static int cxgb_change_mtu(struct net_device *dev, int new_mtu)
 	int ret;
 	struct port_info *pi = netdev_priv(dev);
 
-	if (new_mtu < 81 || new_mtu > MAX_MTU)         /* accommodate SACK */
-		return -EINVAL;
 	ret = t4_set_rxmode(pi->adapter, pi->adapter->pf, pi->viid, new_mtu, -1,
 			    -1, -1, -1, true);
 	if (!ret)
@@ -2721,6 +2745,7 @@ static int cxgb4_mgmt_get_vf_config(struct net_device *dev,
 	ivi->min_tx_rate = 0;
 	ether_addr_copy(ivi->mac, vfinfo->vf_mac_addr);
 	ivi->vlan = vfinfo->vlan;
+	ivi->linkstate = vfinfo->link_state;
 	return 0;
 }
 
@@ -2848,6 +2873,49 @@ static int cxgb4_mgmt_set_vf_vlan(struct net_device *dev, int vf,
 		ret, (vlan ? "setting" : "clearing"), adap->pf, vf);
 	return ret;
 }
+
+static int cxgb4_mgmt_set_vf_link_state(struct net_device *dev, int vf,
+					int link)
+{
+	struct port_info *pi = netdev_priv(dev);
+	struct adapter *adap = pi->adapter;
+	u32 param, val;
+	int ret = 0;
+
+	if (vf >= adap->num_vfs)
+		return -EINVAL;
+
+	switch (link) {
+	case IFLA_VF_LINK_STATE_AUTO:
+		val = FW_VF_LINK_STATE_AUTO;
+		break;
+
+	case IFLA_VF_LINK_STATE_ENABLE:
+		val = FW_VF_LINK_STATE_ENABLE;
+		break;
+
+	case IFLA_VF_LINK_STATE_DISABLE:
+		val = FW_VF_LINK_STATE_DISABLE;
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	param = (FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_PFVF) |
+		 FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_PFVF_LINK_STATE));
+	ret = t4_set_params(adap, adap->mbox, adap->pf, vf + 1, 1,
+			    &param, &val);
+	if (ret) {
+		dev_err(adap->pdev_dev,
+			"Error %d in setting PF %d VF %d link state\n",
+			ret, adap->pf, vf);
+		return -EINVAL;
+	}
+
+	adap->vfinfo[vf].link_state = link;
+	return ret;
+}
 #endif /* CONFIG_PCI_IOV */
 
 static int cxgb_set_mac_addr(struct net_device *dev, void *p)
@@ -2859,8 +2927,8 @@ static int cxgb_set_mac_addr(struct net_device *dev, void *p)
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
 
-	ret = t4_change_mac(pi->adapter, pi->adapter->pf, pi->viid,
-			    pi->xact_addr_filt, addr->sa_data, true, true);
+	ret = cxgb4_change_mac(pi, pi->viid, &pi->xact_addr_filt,
+			       addr->sa_data, true, &pi->smt_idx);
 	if (ret < 0)
 		return ret;
 
@@ -3246,7 +3314,7 @@ static const struct net_device_ops cxgb4_netdev_ops = {
 	.ndo_set_features     = cxgb_set_features,
 	.ndo_validate_addr    = eth_validate_addr,
 	.ndo_do_ioctl         = cxgb_ioctl,
-	.ndo_change_mtu_rh74  = cxgb_change_mtu,
+	.extended.ndo_change_mtu       = cxgb_change_mtu,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller  = cxgb_netpoll,
 #endif
@@ -3260,13 +3328,14 @@ static const struct net_device_ops cxgb4_netdev_ops = {
 
 #ifdef CONFIG_PCI_IOV
 static const struct net_device_ops cxgb4_mgmt_netdev_ops = {
-	.ndo_size             = sizeof(struct net_device_ops),
-	.ndo_open             = cxgb4_mgmt_open,
-	.ndo_set_vf_mac       = cxgb4_mgmt_set_vf_mac,
-	.ndo_get_vf_config    = cxgb4_mgmt_get_vf_config,
-	.ndo_set_vf_rate      = cxgb4_mgmt_set_vf_rate,
-	.ndo_get_phys_port_id = cxgb4_mgmt_get_phys_port_id,
-	.extended.ndo_set_vf_vlan      = cxgb4_mgmt_set_vf_vlan,
+	.ndo_size                 = sizeof(struct net_device_ops),
+	.ndo_open                 = cxgb4_mgmt_open,
+	.ndo_set_vf_mac           = cxgb4_mgmt_set_vf_mac,
+	.ndo_get_vf_config        = cxgb4_mgmt_get_vf_config,
+	.ndo_set_vf_rate          = cxgb4_mgmt_set_vf_rate,
+	.ndo_get_phys_port_id     = cxgb4_mgmt_get_phys_port_id,
+	.extended.ndo_set_vf_vlan = cxgb4_mgmt_set_vf_vlan,
+	.ndo_set_vf_link_state	  = cxgb4_mgmt_set_vf_link_state,
 };
 #endif
 
@@ -3553,6 +3622,16 @@ static int adap_init1(struct adapter *adap, struct fw_caps_config_cmd *c)
 {
 	u32 v;
 	int ret;
+
+	/* Now that we've successfully configured and initialized the adapter
+	 * can ask the Firmware what resources it has provisioned for us.
+	 */
+	ret = t4_get_pfres(adap);
+	if (ret) {
+		dev_err(adap->pdev_dev,
+			"Unable to retrieve resource provisioning information\n");
+		return ret;
+	}
 
 	/* get device capabilities */
 	memset(c, 0, sizeof(*c));
@@ -4188,32 +4267,6 @@ static int adap_init0(struct adapter *adap)
 			goto bye;
 	}
 
-	/*
-	 * Grab VPD parameters.  This should be done after we establish a
-	 * connection to the firmware since some of the VPD parameters
-	 * (notably the Core Clock frequency) are retrieved via requests to
-	 * the firmware.  On the other hand, we need these fairly early on
-	 * so we do this right after getting ahold of the firmware.
-	 */
-	ret = t4_get_vpd_params(adap, &adap->params.vpd);
-	if (ret < 0)
-		goto bye;
-
-	/*
-	 * Find out what ports are available to us.  Note that we need to do
-	 * this before calling adap_init0_no_config() since it needs nports
-	 * and portvec ...
-	 */
-	v =
-	    FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
-	    FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_PORTVEC);
-	ret = t4_query_params(adap, adap->mbox, adap->pf, 0, 1, &v, &port_vec);
-	if (ret < 0)
-		goto bye;
-
-	adap->params.nports = hweight32(port_vec);
-	adap->params.portvec = port_vec;
-
 	/* If the firmware is initialized already, emit a simply note to that
 	 * effect. Otherwise, it's time to try initializing the adapter.
 	 */
@@ -4263,6 +4316,45 @@ static int adap_init0(struct adapter *adap)
 			goto bye;
 		}
 	}
+
+	/* Now that we've successfully configured and initialized the adapter
+	 * (or found it already initialized), we can ask the Firmware what
+	 * resources it has provisioned for us.
+	 */
+	ret = t4_get_pfres(adap);
+	if (ret) {
+		dev_err(adap->pdev_dev,
+			"Unable to retrieve resource provisioning information\n");
+		goto bye;
+	}
+
+	/* Grab VPD parameters.  This should be done after we establish a
+	 * connection to the firmware since some of the VPD parameters
+	 * (notably the Core Clock frequency) are retrieved via requests to
+	 * the firmware.  On the other hand, we need these fairly early on
+	 * so we do this right after getting ahold of the firmware.
+	 *
+	 * We need to do this after initializing the adapter because someone
+	 * could have FLASHed a new VPD which won't be read by the firmware
+	 * until we do the RESET ...
+	 */
+	ret = t4_get_vpd_params(adap, &adap->params.vpd);
+	if (ret < 0)
+		goto bye;
+
+	/* Find out what ports are available to us.  Note that we need to do
+	 * this before calling adap_init0_no_config() since it needs nports
+	 * and portvec ...
+	 */
+	v =
+	    FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DEV) |
+	    FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_DEV_PORTVEC);
+	ret = t4_query_params(adap, adap->mbox, adap->pf, 0, 1, &v, &port_vec);
+	if (ret < 0)
+		goto bye;
+
+	adap->params.nports = hweight32(port_vec);
+	adap->params.portvec = port_vec;
 
 	/* Give the SGE code a chance to pull in anything that it needs ...
 	 * Note that this must be called after we retrieve our VPD parameters
@@ -4438,6 +4530,15 @@ static int adap_init0(struct adapter *adap)
 				      1, params, val);
 		adap->params.filter2_wr_support = (ret == 0 && val[0] != 0);
 	}
+
+	/* Check if FW supports returning vin and smt index.
+	 * If this is not supported, driver will interpret
+	 * these values from viid.
+	 */
+	params[0] = FW_PARAM_DEV(OPAQUE_VIID_SMT_EXTN);
+	ret = t4_query_params(adap, adap->mbox, adap->pf, 0,
+			      1, params, val);
+	adap->params.viid_smt_extn_support = (ret == 0 && val[0] != 0);
 
 	/*
 	 * Get device capabilities so we can determine what resources we need
@@ -4750,14 +4851,26 @@ static pci_ers_result_t eeh_slot_reset(struct pci_dev *pdev)
 		return PCI_ERS_RESULT_DISCONNECT;
 
 	for_each_port(adap, i) {
-		struct port_info *p = adap2pinfo(adap, i);
+		struct port_info *pi = adap2pinfo(adap, i);
+		u8 vivld = 0, vin = 0;
 
-		ret = t4_alloc_vi(adap, adap->mbox, p->tx_chan, adap->pf, 0, 1,
-				  NULL, NULL);
+		ret = t4_alloc_vi(adap, adap->mbox, pi->tx_chan, adap->pf, 0, 1,
+				  NULL, NULL, &vivld, &vin);
 		if (ret < 0)
 			return PCI_ERS_RESULT_DISCONNECT;
-		p->viid = ret;
-		p->xact_addr_filt = -1;
+		pi->viid = ret;
+		pi->xact_addr_filt = -1;
+		/* If fw supports returning the VIN as part of FW_VI_CMD,
+		 * save the returned values.
+		 */
+		if (adap->params.viid_smt_extn_support) {
+			pi->vivld = vivld;
+			pi->vin = vin;
+		} else {
+			/* Retrieve the values from VIID */
+			pi->vivld = FW_VIID_VIVLD_G(pi->viid);
+			pi->vin = FW_VIID_VIN_G(pi->viid);
+		}
 	}
 
 	t4_load_mtus(adap, adap->params.mtus, adap->params.a_wnd,
@@ -4815,10 +4928,12 @@ static inline bool is_x_10g_port(const struct link_config *lc)
  * of ports we found and the number of available CPUs.  Most settings can be
  * modified by the admin prior to actual use.
  */
-static void cfg_queues(struct adapter *adap)
+static int cfg_queues(struct adapter *adap)
 {
 	struct sge *s = &adap->sge;
-	int i = 0, n10g = 0, qidx = 0;
+	int i, n10g = 0, qidx = 0;
+	int niqflint, neq, avail_eth_qsets;
+	int max_eth_qsets = 32;
 #ifndef CONFIG_CHELSIO_T4_DCB
 	int q10g = 0;
 #endif
@@ -4830,16 +4945,46 @@ static void cfg_queues(struct adapter *adap)
 		adap->params.crypto = 0;
 	}
 
-	n10g += is_x_10g_port(&adap2pinfo(adap, i)->link_cfg);
+	/* Calculate the number of Ethernet Queue Sets available based on
+	 * resources provisioned for us.  We always have an Asynchronous
+	 * Firmware Event Ingress Queue.  If we're operating in MSI or Legacy
+	 * IRQ Pin Interrupt mode, then we'll also have a Forwarded Interrupt
+	 * Ingress Queue.  Meanwhile, we need two Egress Queues for each
+	 * Queue Set: one for the Free List and one for the Ethernet TX Queue.
+	 *
+	 * Note that we should also take into account all of the various
+	 * Offload Queues.  But, in any situation where we're operating in
+	 * a Resource Constrained Provisioning environment, doing any Offload
+	 * at all is problematic ...
+	 */
+	niqflint = adap->params.pfres.niqflint - 1;
+	if (!(adap->flags & USING_MSIX))
+		niqflint--;
+	neq = adap->params.pfres.neq / 2;
+	avail_eth_qsets = min(niqflint, neq);
+
+	if (avail_eth_qsets > max_eth_qsets)
+		avail_eth_qsets = max_eth_qsets;
+
+	if (avail_eth_qsets < adap->params.nports) {
+		dev_err(adap->pdev_dev, "avail_eth_qsets=%d < nports=%d\n",
+			avail_eth_qsets, adap->params.nports);
+		return -ENOMEM;
+	}
+
+	/* Count the number of 10Gb/s or better ports */
+	for_each_port(adap, i)
+		n10g += is_x_10g_port(&adap2pinfo(adap, i)->link_cfg);
+
 #ifdef CONFIG_CHELSIO_T4_DCB
 	/* For Data Center Bridging support we need to be able to support up
 	 * to 8 Traffic Priorities; each of which will be assigned to its
 	 * own TX Queue in order to prevent Head-Of-Line Blocking.
 	 */
-	if (adap->params.nports * 8 > MAX_ETH_QSETS) {
-		dev_err(adap->pdev_dev, "MAX_ETH_QSETS=%d < %d!\n",
-			MAX_ETH_QSETS, adap->params.nports * 8);
-		BUG_ON(1);
+	if (adap->params.nports * 8 > avail_eth_qsets) {
+		dev_err(adap->pdev_dev, "DCB avail_eth_qsets=%d < %d!\n",
+			avail_eth_qsets, adap->params.nports * 8);
+		return -ENOMEM;
 	}
 
 	for_each_port(adap, i) {
@@ -4855,7 +5000,7 @@ static void cfg_queues(struct adapter *adap)
 	 * per 10G port.
 	 */
 	if (n10g)
-		q10g = (MAX_ETH_QSETS - (adap->params.nports - n10g)) / n10g;
+		q10g = (avail_eth_qsets - (adap->params.nports - n10g)) / n10g;
 	if (q10g > netif_get_num_default_rss_queues())
 		q10g = netif_get_num_default_rss_queues();
 
@@ -4906,6 +5051,8 @@ static void cfg_queues(struct adapter *adap)
 
 	init_rspq(adap, &s->fw_evtq, 0, 1, 1024, 64);
 	init_rspq(adap, &s->intrq, 0, 1, 512, 64);
+
+	return 0;
 }
 
 /*
@@ -4990,8 +5137,8 @@ static int enable_msix(struct adapter *adap)
 		max_ingq += (MAX_OFLD_QSETS * adap->num_uld);
 	if (is_offload(adap))
 		max_ingq += (MAX_OFLD_QSETS * adap->num_ofld_uld);
-	entries = kmalloc(sizeof(*entries) * (max_ingq + 1),
-			  GFP_KERNEL);
+	entries = kmalloc_array(max_ingq + 1, sizeof(*entries),
+				GFP_KERNEL);
 	if (!entries)
 		return -ENOMEM;
 
@@ -5592,9 +5739,11 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 						   NETIF_F_IPV6_CSUM |
 						   NETIF_F_RXCSUM |
 						   NETIF_F_GSO_UDP_TUNNEL |
+						   NETIF_F_GSO_UDP_TUNNEL_CSUM |
 						   NETIF_F_TSO | NETIF_F_TSO6;
 
-			netdev->hw_features |= NETIF_F_GSO_UDP_TUNNEL;
+			netdev->hw_features |= NETIF_F_GSO_UDP_TUNNEL |
+					       NETIF_F_GSO_UDP_TUNNEL_CSUM;
 		}
 
 		if (highdma)
@@ -5604,10 +5753,15 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 		netdev->priv_flags |= IFF_UNICAST_FLT;
 
+		/* MTU range: 81 - 9600 */
+		netdev->extended->min_mtu = 81;           /* accommodate SACK */
+		netdev->extended->max_mtu = MAX_MTU;
+
 		netdev->netdev_ops = &cxgb4_netdev_ops;
 #ifdef CONFIG_CHELSIO_T4_DCB
 		netdev->dcbnl_ops = &cxgb4_dcb_ops;
 		cxgb4_dcb_state_init(netdev);
+		cxgb4_dcb_version_init(netdev);
 #endif
 		cxgb4_set_ethtool_ops(netdev);
 	}
@@ -5638,10 +5792,15 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		}
 	}
 
+	if (!(adapter->flags & FW_OK))
+		goto fw_attach_fail;
+
 	/* Configure queues and allocate tables now, they can be needed as
 	 * soon as the first register_netdev completes.
 	 */
-	cfg_queues(adapter);
+	err = cfg_queues(adapter);
+	if (err)
+		goto out_free_dev;
 
 	adapter->smt = t4_init_smt();
 	if (!adapter->smt) {
@@ -5748,6 +5907,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto out_free_dev;
 	}
 
+fw_attach_fail:
 	/*
 	 * The card is now ready to go.  If any errors occur during device
 	 * registration we do not fail the whole card but rather proceed only
@@ -5794,6 +5954,10 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	if (!is_t4(adapter->params.chip))
 		cxgb4_ptp_init(adapter);
+
+	if (IS_REACHABLE(CONFIG_THERMAL) &&
+	    !is_t4(adapter->params.chip) && (adapter->flags & FW_OK))
+		cxgb4_thermal_init(adapter);
 
 	print_adapter_info(adapter);
 	return 0;
@@ -5861,6 +6025,8 @@ static void remove_one(struct pci_dev *pdev)
 
 		if (!is_t4(adapter->params.chip))
 			cxgb4_ptp_stop(adapter);
+		if (IS_REACHABLE(CONFIG_THERMAL))
+			cxgb4_thermal_remove(adapter);
 
 		/* If we allocated filters, free up state associated with any
 		 * valid filters ...

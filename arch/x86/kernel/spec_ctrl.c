@@ -9,6 +9,7 @@
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
 #include <linux/module.h>
+#include <linux/sched/smt.h>
 #include <asm/spec_ctrl.h>
 #include <asm/cpufeature.h>
 #include <asm/nospec-branch.h>
@@ -386,10 +387,17 @@ bool spec_ctrl_cond_enable_ibrs(bool full_retp)
 {
 	if (cpu_has_spec_ctrl() && (is_skylake_era() || !full_retp) &&
 	    !noibrs_cmdline) {
-		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED))
+		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
 			spec_ctrl_enable_ibrs_enhanced();
-		else
+		} else {
 			set_spec_ctrl_pcp_ibrs();
+			/*
+			 * Print a warning message about performance
+			 * impact of enabling IBRS vs. retpoline.
+			 */
+			pr_warn_once("Using IBRS as the default Spectre v2 mitigation for a Skylake-\n");
+			pr_warn_once("generation CPU.  This may have a negative performance impact.\n");
+		}
 		return true;
 	}
 
@@ -482,8 +490,6 @@ enum spectre_v2_mitigation spec_ctrl_get_mitigation(void)
 			mode = SPECTRE_V2_RETPOLINE_MINIMAL;
 		else if (!boot_cpu_has(X86_FEATURE_IBPB))
 			mode = SPECTRE_V2_RETPOLINE_NO_IBPB;
-		else if (is_skylake_era())
-			mode = SPECTRE_V2_RETPOLINE_SKYLAKE;
 		else if (unsafe_module)
 			mode = SPECTRE_V2_RETPOLINE_UNSAFE_MODULE;
 		else if (ibrs_mode == IBRS_ENABLED_USER)
@@ -492,7 +498,8 @@ enum spectre_v2_mitigation spec_ctrl_get_mitigation(void)
 			mode = SPECTRE_V2_RETPOLINE;
 	}
 
-	return mode;
+	spectre_v2_enabled = mode;	/* Update spectre_v2_enabled */
+	return spectre_v2_enabled;
 }
 
 static void spec_ctrl_print_features(void)
@@ -556,7 +563,7 @@ void spec_ctrl_init(void)
 void spec_ctrl_rescan_cpuid(void)
 {
 	enum spectre_v2_mitigation old_mode;
-	bool old_ibrs, old_ibpb, old_ssbd;
+	bool old_ibrs, old_ibpb, old_ssbd, old_mds;
 	bool ssbd_changed;
 	int cpu;
 
@@ -569,19 +576,25 @@ void spec_ctrl_rescan_cpuid(void)
 		old_ibrs = boot_cpu_has(X86_FEATURE_IBRS);
 		old_ibpb = boot_cpu_has(X86_FEATURE_IBPB);
 		old_ssbd = boot_cpu_has(X86_FEATURE_SSBD);
+		old_mds  = boot_cpu_has(X86_FEATURE_MD_CLEAR);
 		old_mode = spec_ctrl_get_mitigation();
 
 		/* detect spec ctrl related cpuid additions */
 		get_cpu_cap(&boot_cpu_data);
 
-		/* if there were no spec ctrl related changes, we're done */
+		/*
+		 * If there were no spec ctrl or MDS related changes,
+		 * we're done
+		 */
 		ssbd_changed = (old_ssbd != boot_cpu_has(X86_FEATURE_SSBD));
 		if (old_ibrs == boot_cpu_has(X86_FEATURE_IBRS) &&
-		    old_ibpb == boot_cpu_has(X86_FEATURE_IBPB) && !ssbd_changed)
+		    old_ibpb == boot_cpu_has(X86_FEATURE_IBPB) &&
+		    old_mds  == boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
+		    !ssbd_changed)
 			goto done;
 
 		/*
-		 * The IBRS, IBPB & SSBD cpuid bits may have
+		 * The IBRS, IBPB, SSBD & MDS cpuid bits may have
 		 * just been set in the boot_cpu_data, transfer them
 		 * to the per-cpu data too.
 		 */
@@ -594,6 +607,10 @@ void spec_ctrl_rescan_cpuid(void)
 		if (boot_cpu_has(X86_FEATURE_SSBD))
 			for_each_online_cpu(cpu)
 				set_cpu_cap(&cpu_data(cpu), X86_FEATURE_SSBD);
+		if (boot_cpu_has(X86_FEATURE_MD_CLEAR))
+			for_each_online_cpu(cpu)
+				set_cpu_cap(&cpu_data(cpu),
+					    X86_FEATURE_MD_CLEAR);
 
 		/* update static key, print the changed IBRS/IBPB features */
 		spec_ctrl_init();
@@ -633,6 +650,23 @@ void spec_ctrl_rescan_cpuid(void)
 		/* print any mitigation changes */
 		if (old_mode != spec_ctrl_get_mitigation())
 			spectre_v2_print_mitigation();
+
+		/*
+		 * Look for X86_FEATURE_MD_CLEAR change for CPUs that are
+		 * vulnerable to MDS & reflect that in the mds vulnerabilities
+		 * file.
+		 */
+		if (boot_cpu_has_bug(X86_BUG_MDS) &&
+		   (mds_mitigation != MDS_MITIGATION_OFF)) {
+			enum mds_mitigations new;
+
+			new = boot_cpu_has(X86_FEATURE_MD_CLEAR)
+			    ? MDS_MITIGATION_FULL : MDS_MITIGATION_VMWERV;
+			if (new != mds_mitigation) {
+				mds_mitigation = new;
+				mds_print_mitigation();
+			}
+		}
 	}
 done:
 	mutex_unlock(&spec_ctrl_mutex);
@@ -656,8 +690,8 @@ void spec_ctrl_set_ssbd(bool ssbd_on)
 		this_cpu_or(spec_ctrl_pcp.entry, SPEC_CTRL_SSBD);
 		this_cpu_or(spec_ctrl_pcp.exit,  SPEC_CTRL_SSBD);
 	} else {
-		this_cpu_and(spec_ctrl_pcp.entry, ~SPEC_CTRL_SSBD);
-		this_cpu_and(spec_ctrl_pcp.exit,  ~SPEC_CTRL_SSBD);
+		this_cpu_and(spec_ctrl_pcp.entry, ~(int)SPEC_CTRL_SSBD);
+		this_cpu_and(spec_ctrl_pcp.exit,  ~(int)SPEC_CTRL_SSBD);
 	}
 }
 
@@ -763,6 +797,7 @@ static ssize_t ibrs_enabled_write(struct file *file,
 		set_spec_ctrl_pcp_ibrs_user();
 		set_spec_ctrl_retp(true);
 	}
+	spec_ctrl_get_mitigation();
 
 out_unlock:
 	mutex_unlock(&spec_ctrl_mutex);
@@ -837,6 +872,7 @@ static ssize_t retp_enabled_write(struct file *file,
 			set_spec_ctrl_pcp_ibrs_user();
 		}
 	}
+	spec_ctrl_get_mitigation();
 
 out_unlock:
 	mutex_unlock(&spec_ctrl_mutex);
@@ -874,7 +910,7 @@ static void ssbd_spec_ctrl_write(unsigned int mode)
 	 * the existing SSBD bit in the spec_ctrl_pcp won't carry over.
 	 */
 	if (!ssb_is_user_settable(mode))
-		set_mb(ssb_mode, mode);
+		smp_store_mb(ssb_mode, mode);
 
 	switch (ibrs_mode) {
 		case IBRS_DISABLED:
@@ -917,7 +953,7 @@ static void ssbd_amd_write(unsigned int mode)
 	 * ssb_mode first.
 	 */
 	if (!ssb_is_user_settable(mode))
-		set_mb(ssb_mode, mode);
+		smp_store_mb(ssb_mode, mode);
 
 	/*
 	 * If the old mode isn't user settable, it is assumed that no
@@ -1011,6 +1047,19 @@ static const struct file_operations fops_ssbd_enabled = {
 	.llseek = default_llseek,
 };
 
+static ssize_t smt_present_read(struct file *file, char __user *user_buf,
+				 size_t count, loff_t *ppos)
+{
+	unsigned int present = atomic_read(&sched_smt_present.enabled);
+
+	return __enabled_read(file, user_buf, count, ppos, &present);
+}
+
+static const struct file_operations fops_smt_present = {
+	.read = smt_present_read,
+	.llseek = default_llseek,
+};
+
 static int __init debugfs_spec_ctrl(void)
 {
 	debugfs_create_file("ibrs_enabled", S_IRUSR | S_IWUSR,
@@ -1021,6 +1070,8 @@ static int __init debugfs_spec_ctrl(void)
 			    arch_debugfs_dir, NULL, &fops_retp_enabled);
 	debugfs_create_file("ssbd_enabled", S_IRUSR,
 			    arch_debugfs_dir, NULL, &fops_ssbd_enabled);
+	debugfs_create_file("smt_present", S_IRUSR,
+			    arch_debugfs_dir, NULL, &fops_smt_present);
 	return 0;
 }
 late_initcall(debugfs_spec_ctrl);

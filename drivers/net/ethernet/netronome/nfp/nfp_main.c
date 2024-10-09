@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2015-2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2015-2018 Netronome Systems, Inc. */
 
 /*
  * nfp_main.c
@@ -111,23 +81,18 @@ nfp_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
 int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
 		 void *out_data, u64 out_length)
 {
-	unsigned long long addr;
 	unsigned long err_at;
 	u64 max_data_sz;
 	u32 val = 0;
-	u32 cpp_id;
 	int n, err;
 
 	if (!pf->mbox)
 		return -EOPNOTSUPP;
 
-	cpp_id = NFP_CPP_ISLAND_ID(pf->mbox->target, NFP_CPP_ACTION_RW, 0,
-				   pf->mbox->domain);
-	addr = pf->mbox->addr;
-	max_data_sz = pf->mbox->size - NFP_MBOX_SYM_MIN_SIZE;
+	max_data_sz = nfp_rtsym_size(pf->mbox) - NFP_MBOX_SYM_MIN_SIZE;
 
 	/* Check if cmd field is clear */
-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, &val);
+	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_CMD, &val);
 	if (err || val) {
 		nfp_warn(pf->cpp, "failed to issue command (%u): %u, err: %d\n",
 			 cmd, val, err);
@@ -135,30 +100,29 @@ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
 	}
 
 	in_length = min(in_length, max_data_sz);
-	n = nfp_cpp_write(pf->cpp, cpp_id, addr + NFP_MBOX_DATA,
-			  in_data, in_length);
+	n = nfp_rtsym_write(pf->cpp, pf->mbox, NFP_MBOX_DATA, in_data,
+			    in_length);
 	if (n != in_length)
 		return -EIO;
 	/* Write data_len and wipe reserved */
-	err = nfp_cpp_writeq(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN,
-			     in_length);
+	err = nfp_rtsym_writeq(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, in_length);
 	if (err)
 		return err;
 
 	/* Read back for ordering */
-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN, &val);
+	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, &val);
 	if (err)
 		return err;
 
 	/* Write cmd and wipe return value */
-	err = nfp_cpp_writeq(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, cmd);
+	err = nfp_rtsym_writeq(pf->cpp, pf->mbox, NFP_MBOX_CMD, cmd);
 	if (err)
 		return err;
 
 	err_at = jiffies + 5 * HZ;
 	while (true) {
 		/* Wait for command to go to 0 (NFP_MBOX_NO_CMD) */
-		err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_CMD, &val);
+		err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_CMD, &val);
 		if (err)
 			return err;
 		if (!val)
@@ -171,18 +135,18 @@ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
 	}
 
 	/* Copy output if any (could be error info, do it before reading ret) */
-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_DATA_LEN, &val);
+	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_DATA_LEN, &val);
 	if (err)
 		return err;
 
 	out_length = min_t(u32, val, min(out_length, max_data_sz));
-	n = nfp_cpp_read(pf->cpp, cpp_id, addr + NFP_MBOX_DATA,
-			 out_data, out_length);
+	n = nfp_rtsym_read(pf->cpp, pf->mbox, NFP_MBOX_DATA,
+			   out_data, out_length);
 	if (n != out_length)
 		return -EIO;
 
 	/* Check if there is an error */
-	err = nfp_cpp_readl(pf->cpp, cpp_id, addr + NFP_MBOX_RET, &val);
+	err = nfp_rtsym_readl(pf->cpp, pf->mbox, NFP_MBOX_RET, &val);
 	if (err)
 		return err;
 	if (val)
@@ -235,17 +199,20 @@ static int nfp_pcie_sriov_read_nfd_limit(struct nfp_pf *pf)
 	int err;
 
 	pf->limit_vfs = nfp_rtsym_read_le(pf->rtbl, "nfd_vf_cfg_max_vfs", &err);
-	if (!err)
-		return pci_sriov_set_totalvfs(pf->pdev, pf->limit_vfs);
+	if (err) {
+		/* For backwards compatibility if symbol not found allow all */
+		pf->limit_vfs = ~0;
+		if (err == -ENOENT)
+			return 0;
 
-	pf->limit_vfs = ~0;
-	pci_sriov_set_totalvfs(pf->pdev, 0); /* 0 is unset */
-	/* Allow any setting for backwards compatibility if symbol not found */
-	if (err == -ENOENT)
-		return 0;
+		nfp_warn(pf->cpp, "Warning: VF limit read failed: %d\n", err);
+		return err;
+	}
 
-	nfp_warn(pf->cpp, "Warning: VF limit read failed: %d\n", err);
-	return err;
+	err = pci_sriov_set_totalvfs(pf->pdev, pf->limit_vfs);
+	if (err)
+		nfp_warn(pf->cpp, "Failed to set VF count in sysfs: %d\n", err);
+	return 0;
 }
 
 static int nfp_pcie_sriov_enable(struct pci_dev *pdev, int num_vfs)
@@ -493,7 +460,6 @@ nfp_nsp_init_ports(struct pci_dev *pdev, struct nfp_pf *pf,
 
 static int nfp_nsp_init(struct pci_dev *pdev, struct nfp_pf *pf)
 {
-	struct nfp_nsp_identify *nspi;
 	struct nfp_nsp *nsp;
 	int err;
 
@@ -514,11 +480,9 @@ static int nfp_nsp_init(struct pci_dev *pdev, struct nfp_pf *pf)
 
 	nfp_nsp_init_ports(pdev, pf, nsp);
 
-	nspi = __nfp_nsp_identify(nsp);
-	if (nspi) {
-		dev_info(&pdev->dev, "BSP: %s\n", nspi->version);
-		kfree(nspi);
-	}
+	pf->nspi = __nfp_nsp_identify(nsp);
+	if (pf->nspi)
+		dev_info(&pdev->dev, "BSP: %s\n", pf->nspi->version);
 
 	err = nfp_fw_load(pdev, pf, nsp);
 	if (err < 0) {
@@ -567,9 +531,9 @@ static int nfp_pf_find_rtsyms(struct nfp_pf *pf)
 	/* Optional per-PCI PF mailbox */
 	snprintf(pf_symbol, sizeof(pf_symbol), NFP_MBOX_SYM_NAME, pf_id);
 	pf->mbox = nfp_rtsym_lookup(pf->rtbl, pf_symbol);
-	if (pf->mbox && pf->mbox->size < NFP_MBOX_SYM_MIN_SIZE) {
+	if (pf->mbox && nfp_rtsym_size(pf->mbox) < NFP_MBOX_SYM_MIN_SIZE) {
 		nfp_err(pf->cpp, "PF mailbox symbol too small: %llu < %d\n",
-			pf->mbox->size, NFP_MBOX_SYM_MIN_SIZE);
+			nfp_rtsym_size(pf->mbox), NFP_MBOX_SYM_MIN_SIZE);
 		return -EINVAL;
 	}
 
@@ -672,18 +636,25 @@ static int nfp_pci_probe(struct pci_dev *pdev,
 
 	err = nfp_net_pci_probe(pf);
 	if (err)
-		goto err_sriov_unlimit;
+		goto err_fw_unload;
+
+	err = nfp_hwmon_register(pf);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to register hwmon info\n");
+		goto err_net_remove;
+	}
 
 	return 0;
 
-err_sriov_unlimit:
-	pci_sriov_set_totalvfs(pf->pdev, 0);
+err_net_remove:
+	nfp_net_pci_remove(pf);
 err_fw_unload:
 	kfree(pf->rtbl);
 	nfp_mip_close(pf->mip);
 	if (pf->fw_loaded)
 		nfp_fw_unload(pf);
 	kfree(pf->eth_tbl);
+	kfree(pf->nspi);
 	vfree(pf->dumpspec);
 err_hwinfo_free:
 	kfree(pf->hwinfo);
@@ -707,8 +678,9 @@ static void nfp_pci_remove(struct pci_dev *pdev)
 {
 	struct nfp_pf *pf = pci_get_drvdata(pdev);
 
+	nfp_hwmon_unregister(pf);
+
 	nfp_pcie_sriov_disable(pdev);
-	pci_sriov_set_totalvfs(pf->pdev, 0);
 
 	nfp_net_pci_remove(pf);
 
@@ -724,6 +696,7 @@ static void nfp_pci_remove(struct pci_dev *pdev)
 	nfp_cpp_free(pf->cpp);
 
 	kfree(pf->eth_tbl);
+	kfree(pf->nspi);
 	mutex_destroy(&pf->lock);
 	devlink_free(priv_to_devlink(pf));
 	pci_release_regions(pdev);

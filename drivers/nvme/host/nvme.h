@@ -72,6 +72,11 @@ enum nvme_quirks {
 	 * The deepest sleep state should not be used.
 	 */
 	NVME_QUIRK_NO_DEEPEST_PS		= (1 << 5),
+
+	/*
+	 * Set MEDIUM priority on SQ creation
+	 */
+	NVME_QUIRK_MEDIUM_PRIO_SQ		= (1 << 7),
 };
 
 /*
@@ -135,11 +140,13 @@ struct nvme_ctrl {
 	struct work_struct reset_work;
 	struct work_struct delete_work;
 
+	struct nvme_subsystem *subsys;
+	struct list_head subsys_entry;
+
 	char name[12];
 	char serial[20];
 	char model[40];
 	char firmware_rev[8];
-	char subnqn[NVMF_NQN_SIZE];
 	u16 cntlid;
 
 	u32 ctrl_config;
@@ -149,8 +156,8 @@ struct nvme_ctrl {
 	u64 cap;
 	u32 page_size;
 	u32 max_hw_sectors;
+	u32 max_segments;
 	u16 oncs;
-	u16 vid;
 	u16 oacs;
 	atomic_t abort_limit;
 	u8 vwc;
@@ -192,6 +199,25 @@ struct nvme_ctrl {
 	u16 maxcmd;
 	int nr_reconnects;
 	struct nvmf_ctrl_options *opts;
+};
+
+struct nvme_subsystem {
+	int			instance;
+	struct device		dev;
+	/*
+	 * Because we unregister the device on the last put we need
+	 * a separate refcount.
+	 */
+	struct kref		ref;
+	struct list_head	entry;
+	struct mutex		lock;
+	struct list_head	ctrls;
+	char			subnqn[NVMF_NQN_SIZE];
+	char			serial[20];
+	char			model[40];
+	char			firmware_rev[8];
+	u8			cmic;
+	u16			vendor_id;
 };
 
 struct nvme_ns {
@@ -352,8 +378,8 @@ int nvme_reset_ctrl_sync(struct nvme_ctrl *ctrl);
 int nvme_delete_ctrl(struct nvme_ctrl *ctrl);
 int nvme_delete_ctrl_sync(struct nvme_ctrl *ctrl);
 
-int nvme_get_log_ext(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
-		u8 log_page, void *log, size_t size, u64 offset);
+int nvme_get_log(struct nvme_ctrl *ctrl, u32 nsid, u8 log_page, u8 lsp,
+		void *log, size_t size, u64 offset);
 
 struct sg_io_hdr;
 

@@ -204,7 +204,13 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
 
 	inet_csk_reqsk_queue_unlink(sk, req, prev);
 	inet_csk_reqsk_queue_removed(sk, req);
-	inet_csk_reqsk_queue_add(sk, req, child);
+
+	if (!inet_csk_reqsk_queue_add(sk, req, child)) {
+		bh_unlock_sock(child);
+		sock_put(child);
+		reqsk_free(req);
+		return NULL;
+	}
 out:
 	return child;
 listen_overflow:

@@ -164,7 +164,7 @@ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 			int offset, int len)
 {
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}
@@ -192,7 +192,7 @@ int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
 	int orig_len = len;
 
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}
@@ -226,7 +226,7 @@ int memcpy_fromiovecend_partial_nocache(unsigned char *kdata,
 	int orig_len = len;
 
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}
@@ -262,7 +262,7 @@ int csum_partial_copy_fromiovecend(unsigned char *kdata, struct iovec *iov,
 	int partial_cnt = 0, err = 0;
 
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}

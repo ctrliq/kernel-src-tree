@@ -5608,9 +5608,9 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	/* stream detection initialization */
 	if (instance->adapter_type >= VENTURA_SERIES) {
 		fusion->stream_detect_by_ld =
-			kzalloc(sizeof(struct LD_STREAM_DETECT *)
-			* MAX_LOGICAL_DRIVES_EXT,
-			GFP_KERNEL);
+			kcalloc(MAX_LOGICAL_DRIVES_EXT,
+				sizeof(struct LD_STREAM_DETECT *),
+				GFP_KERNEL);
 		if (!fusion->stream_detect_by_ld) {
 			dev_err(&instance->pdev->dev,
 				"unable to allocate stream detection for pool of LDs\n");
@@ -5752,8 +5752,10 @@ static int megasas_init_fw(struct megasas_instance *instance)
 					    &instance->sriov_heartbeat_timer,
 					    megasas_sriov_heartbeat_handler,
 					    MEGASAS_SRIOV_HEARTBEAT_INTERVAL_VF);
-		else
+		else {
 			instance->skip_heartbeat_timer_del = 1;
+			goto fail_get_ld_pd_list;
+		}
 	}
 
 	/*
@@ -6305,6 +6307,7 @@ static inline void megasas_set_adapter_type(struct megasas_instance *instance)
 		case PCI_DEVICE_ID_LSI_AERO_10E5:
 		case PCI_DEVICE_ID_LSI_AERO_10E6:
 			instance->adapter_type = AERO_SERIES;
+			mark_tech_preview("Avago MegaRAID SAS Driver", THIS_MODULE);
 			break;
 		case PCI_DEVICE_ID_LSI_VENTURA:
 		case PCI_DEVICE_ID_LSI_CRUSADER:
@@ -6363,7 +6366,7 @@ static inline int megasas_alloc_mfi_ctrl_mem(struct megasas_instance *instance)
  */
 static int megasas_alloc_ctrl_mem(struct megasas_instance *instance)
 {
-	instance->reply_map = kzalloc(sizeof(unsigned int) * nr_cpu_ids,
+	instance->reply_map = kcalloc(nr_cpu_ids, sizeof(unsigned int),
 				      GFP_KERNEL);
 	if (!instance->reply_map)
 		return -ENOMEM;

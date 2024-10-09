@@ -29,6 +29,7 @@
 #include <asm/debugreg.h>
 #include <asm/nmi.h>
 #include <asm/mce.h>
+#include <asm/prctl.h>
 #include <asm/spec_ctrl.h>
 
 /*
@@ -315,79 +316,140 @@ static __always_inline void amd_set_ssb_virt_state(unsigned long tifn)
 	wrmsrl(MSR_AMD64_VIRT_SPEC_CTRL, ssbd_tif_to_spec_ctrl(tifn));
 }
 
-static __always_inline void intel_set_ssb_state(unsigned long tifn)
+static __always_inline void __speculation_ctrl_update(unsigned long tifp,
+						      unsigned long tifn)
 {
-	spec_ctrl_set_ssbd(ssbd_tif_to_spec_ctrl(tifn));
-	wrmsrl(MSR_IA32_SPEC_CTRL, this_cpu_read(spec_ctrl_pcp.entry64));
-}
+	bool updmsr = false;
 
-static __always_inline void __speculative_store_bypass_update(unsigned long tifn)
-{
 	if (!static_key_false(&ssbd_userset_key))
 		return;	/* Don't do anything if not user settable */
 
-	if (static_cpu_has(X86_FEATURE_VIRT_SSBD))
-		amd_set_ssb_virt_state(tifn);
-	else if (static_cpu_has(X86_FEATURE_LS_CFG_SSBD))
-		amd_set_core_ssb_state(tifn);
-	else
-		intel_set_ssb_state(tifn);
+	/* If TIF_SSBD is different, select the proper mitigation method */
+	if ((tifp ^ tifn) & _TIF_SSBD) {
+		if (static_cpu_has(X86_FEATURE_VIRT_SSBD)) {
+			amd_set_ssb_virt_state(tifn);
+		} else if (static_cpu_has(X86_FEATURE_LS_CFG_SSBD)) {
+			amd_set_core_ssb_state(tifn);
+		} else if (static_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD) ||
+			   static_cpu_has(X86_FEATURE_AMD_SSBD)) {
+			spec_ctrl_set_ssbd(ssbd_tif_to_spec_ctrl(tifn));
+			updmsr = true;
+		}
+	}
+
+	if (updmsr)
+		wrmsrl(MSR_IA32_SPEC_CTRL,
+		       this_cpu_read(spec_ctrl_pcp.entry64));
 }
 
-void speculative_store_bypass_update(unsigned long tif)
+static unsigned long speculation_ctrl_update_tif(struct task_struct *tsk)
 {
+	if (test_and_clear_tsk_thread_flag(tsk, TIF_SPEC_FORCE_UPDATE)) {
+		if (task_spec_ssb_disable(tsk))
+			set_tsk_thread_flag(tsk, TIF_SSBD);
+		else
+			clear_tsk_thread_flag(tsk, TIF_SSBD);
+	}
+	/* Return the updated threadinfo flags*/
+	return task_thread_info(tsk)->flags;
+}
+
+void speculation_ctrl_update(unsigned long tif)
+{
+	/* Forced update. Make sure all relevant TIF flags are different */
 	preempt_disable();
-	__speculative_store_bypass_update(tif);
+	__speculation_ctrl_update(~tif, tif);
 	preempt_enable();
 }
-EXPORT_SYMBOL_GPL(speculative_store_bypass_update);
+EXPORT_SYMBOL_GPL(speculation_ctrl_update);
 
-void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
-		      struct tss_struct *tss)
+static inline void switch_to_bitmap(struct tss_struct *tss,
+				    struct thread_struct *prev,
+				    struct thread_struct *next,
+				    unsigned long tifp, unsigned long tifn)
 {
-	struct thread_struct *prev, *next;
-
-	prev = &prev_p->thread;
-	next = &next_p->thread;
-
-	if (test_tsk_thread_flag(prev_p, TIF_BLOCKSTEP) ^
-	    test_tsk_thread_flag(next_p, TIF_BLOCKSTEP)) {
-		unsigned long debugctl = get_debugctlmsr();
-
-		debugctl &= ~DEBUGCTLMSR_BTF;
-		if (test_tsk_thread_flag(next_p, TIF_BLOCKSTEP))
-			debugctl |= DEBUGCTLMSR_BTF;
-
-		update_debugctlmsr(debugctl);
-	}
-
-	if (test_tsk_thread_flag(prev_p, TIF_NOTSC) ^
-	    test_tsk_thread_flag(next_p, TIF_NOTSC)) {
-		/* prev and next are different */
-		if (test_tsk_thread_flag(next_p, TIF_NOTSC))
-			hard_disable_TSC();
-		else
-			hard_enable_TSC();
-	}
-
-	if (test_tsk_thread_flag(next_p, TIF_IO_BITMAP)) {
+	if (tifn & _TIF_IO_BITMAP) {
 		/*
 		 * Copy the relevant range of the IO bitmap.
 		 * Normally this is 128 bytes or less:
 		 */
 		memcpy(tss->io_bitmap, next->io_bitmap_ptr,
 		       max(prev->io_bitmap_max, next->io_bitmap_max));
-	} else if (test_tsk_thread_flag(prev_p, TIF_IO_BITMAP)) {
+	} else if (tifp & _TIF_IO_BITMAP) {
 		/*
 		 * Clear any possible leftover bits:
 		 */
 		memset(tss->io_bitmap, 0xff, prev->io_bitmap_max);
 	}
+}
+
+/* Called from seccomp/prctl update */
+void speculation_ctrl_update_current(void)
+{
+	preempt_disable();
+	speculation_ctrl_update(speculation_ctrl_update_tif(current));
+	preempt_enable();
+}
+
+/*
+ * Called immediately after a successful exec.
+ */
+void arch_setup_new_exec(void)
+{
+	/*
+	 * Don't inherit TIF_SSBD across exec boundary when
+	 * PR_SPEC_DISABLE_NOEXEC is used.
+	 */
+	if (test_thread_flag(TIF_SSBD) &&
+	    task_spec_ssb_noexec(current)) {
+		clear_thread_flag(TIF_SSBD);
+		task_clear_spec_ssb_disable(current);
+		task_clear_spec_ssb_noexec(current);
+		speculation_ctrl_update(task_thread_info(current)->flags);
+	}
+}
+
+void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
+		      struct tss_struct *tss)
+{
+	struct thread_struct *prev, *next;
+	unsigned long tifp, tifn;
+
+	prev = &prev_p->thread;
+	next = &next_p->thread;
+
+	tifn = READ_ONCE(task_thread_info(next_p)->flags);
+	tifp = READ_ONCE(task_thread_info(prev_p)->flags);
+	switch_to_bitmap(tss, prev, next, tifp, tifn);
+
 	propagate_user_return_notify(prev_p, next_p);
 
-	if (test_tsk_thread_flag(prev_p, TIF_SSBD) ^
-	    test_tsk_thread_flag(next_p, TIF_SSBD))
-		__speculative_store_bypass_update(task_thread_info(next_p)->flags);
+	if ((tifp ^ tifn) & _TIF_BLOCKSTEP) {
+		unsigned long debugctl = get_debugctlmsr();
+
+		debugctl &= ~DEBUGCTLMSR_BTF;
+		if (tifn & _TIF_BLOCKSTEP)
+			debugctl |= DEBUGCTLMSR_BTF;
+
+		update_debugctlmsr(debugctl);
+	}
+
+	if ((tifp ^ tifn) & _TIF_NOTSC) {
+		if (tifn & _TIF_NOTSC)
+			hard_disable_TSC();
+		else
+			hard_enable_TSC();
+	}
+
+	if (likely(!((tifp | tifn) & _TIF_SPEC_FORCE_UPDATE))) {
+		__speculation_ctrl_update(tifp, tifn);
+	} else {
+		speculation_ctrl_update_tif(prev_p);
+		tifn = speculation_ctrl_update_tif(next_p);
+
+		/* Enforce MSR update to ensure consistent state */
+		__speculation_ctrl_update(~tifn, tifn);
+	}
 }
 
 /*

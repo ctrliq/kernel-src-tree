@@ -25,6 +25,7 @@
 #include <linux/types.h>
 #include <linux/iova.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/dma_remapping.h>
 #include <asm/cacheflush.h>
 #include <asm/iommu.h>
@@ -57,6 +58,50 @@
 #define DMAR_IQA_REG	0x90	/* Invalidation queue addr register */
 #define DMAR_ICS_REG	0x9c	/* Invalidation complete status register */
 #define DMAR_IRTA_REG	0xb8    /* Interrupt remapping table addr register */
+#define DMAR_PQH_REG   0xc0    /* Page request queue head register */
+#define DMAR_PQT_REG   0xc8    /* Page request queue tail register */
+#define DMAR_PQA_REG   0xd0    /* Page request queue address register */
+#define DMAR_PRS_REG   0xdc    /* Page request status register */
+#define DMAR_PECTL_REG 0xe0    /* Page request event control register */
+#define        DMAR_PEDATA_REG 0xe4    /* Page request event interrupt data register */
+#define        DMAR_PEADDR_REG 0xe8    /* Page request event interrupt addr register */
+#define        DMAR_PEUADDR_REG 0xec   /* Page request event Upper address register */
+#define DMAR_MTRRCAP_REG 0x100	/* MTRR capability register */
+#define DMAR_MTRRDEF_REG 0x108	/* MTRR default type register */
+#define DMAR_MTRR_FIX64K_00000_REG 0x120 /* MTRR Fixed range registers */
+#define DMAR_MTRR_FIX16K_80000_REG 0x128
+#define DMAR_MTRR_FIX16K_A0000_REG 0x130
+#define DMAR_MTRR_FIX4K_C0000_REG 0x138
+#define DMAR_MTRR_FIX4K_C8000_REG 0x140
+#define DMAR_MTRR_FIX4K_D0000_REG 0x148
+#define DMAR_MTRR_FIX4K_D8000_REG 0x150
+#define DMAR_MTRR_FIX4K_E0000_REG 0x158
+#define DMAR_MTRR_FIX4K_E8000_REG 0x160
+#define DMAR_MTRR_FIX4K_F0000_REG 0x168
+#define DMAR_MTRR_FIX4K_F8000_REG 0x170
+#define DMAR_MTRR_PHYSBASE0_REG 0x180 /* MTRR Variable range registers */
+#define DMAR_MTRR_PHYSMASK0_REG 0x188
+#define DMAR_MTRR_PHYSBASE1_REG 0x190
+#define DMAR_MTRR_PHYSMASK1_REG 0x198
+#define DMAR_MTRR_PHYSBASE2_REG 0x1a0
+#define DMAR_MTRR_PHYSMASK2_REG 0x1a8
+#define DMAR_MTRR_PHYSBASE3_REG 0x1b0
+#define DMAR_MTRR_PHYSMASK3_REG 0x1b8
+#define DMAR_MTRR_PHYSBASE4_REG 0x1c0
+#define DMAR_MTRR_PHYSMASK4_REG 0x1c8
+#define DMAR_MTRR_PHYSBASE5_REG 0x1d0
+#define DMAR_MTRR_PHYSMASK5_REG 0x1d8
+#define DMAR_MTRR_PHYSBASE6_REG 0x1e0
+#define DMAR_MTRR_PHYSMASK6_REG 0x1e8
+#define DMAR_MTRR_PHYSBASE7_REG 0x1f0
+#define DMAR_MTRR_PHYSMASK7_REG 0x1f8
+#define DMAR_MTRR_PHYSBASE8_REG 0x200
+#define DMAR_MTRR_PHYSMASK8_REG 0x208
+#define DMAR_MTRR_PHYSBASE9_REG 0x210
+#define DMAR_MTRR_PHYSMASK9_REG 0x218
+#define DMAR_VCCAP_REG		0xe00 /* Virtual command capability register */
+#define DMAR_VCMD_REG		0xe10 /* Virtual command register */
+#define DMAR_VCRSP_REG		0xe20 /* Virtual command response register */
 
 #define OFFSET_STRIDE		(9)
 /*
@@ -326,6 +371,33 @@ enum {
 #define VTD_FLAG_TRANS_PRE_ENABLED	(1 << 0)
 #define VTD_FLAG_IRQ_REMAP_PRE_ENABLED	(1 << 1)
 
+/*
+ * 0: Present
+ * 1-11: Reserved
+ * 12-63: Context Ptr (12 - (haw-1))
+ * 64-127: Reserved
+ */
+struct root_entry {
+	u64     lo;
+	u64     hi;
+};
+
+/*
+ * low 64 bits:
+ * 0: present
+ * 1: fault processing disable
+ * 2-3: translation type
+ * 12-63: address space root
+ * high 64 bits:
+ * 0-2: address width
+ * 3-6: aval
+ * 8-23: domain id
+ */
+struct context_entry {
+	u64 lo;
+	u64 hi;
+};
+
 struct intel_iommu {
 	void __iomem	*reg; /* Pointer to hardware regs, virtual addr */
 	u64 		reg_phys; /* physical address of hw register set */
@@ -386,6 +458,15 @@ extern int qi_submit_sync(struct qi_desc *desc, struct intel_iommu *iommu);
 
 extern int dmar_ir_support(void);
 
+#ifdef CONFIG_INTEL_IOMMU_DEBUGFS
+void intel_iommu_debugfs_init(void);
+#else
+static inline void intel_iommu_debugfs_init(void) {}
+#endif /* CONFIG_INTEL_IOMMU_DEBUGFS */
+
 extern const struct attribute_group *intel_iommu_groups[];
+bool context_present(struct context_entry *context);
+struct context_entry *iommu_context_addr(struct intel_iommu *iommu, u8 bus,
+					 u8 devfn, int alloc);
 
 #endif

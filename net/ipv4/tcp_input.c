@@ -1201,7 +1201,7 @@ static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb,
 		if (pkt_len >= skb->len && !in_sack)
 			return 0;
 
-		err = tcp_fragment(sk, skb, pkt_len, mss);
+		err = tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, skb, pkt_len, mss);
 		if (err < 0)
 			return err;
 	}
@@ -1329,7 +1329,7 @@ static bool tcp_shifted_skb(struct sock *sk, struct sk_buff *prev,
 	TCP_SKB_CB(skb)->seq += shifted;
 
 	skb_shinfo(prev)->gso_segs += pcount;
-	BUG_ON(skb_shinfo(skb)->gso_segs < pcount);
+	WARN_ON_ONCE(tcp_skb_pcount(skb) < pcount);
 	skb_shinfo(skb)->gso_segs -= pcount;
 
 	/* When we're adding to gso_segs == 1, gso_size will be zero,
@@ -1393,6 +1393,21 @@ static int tcp_skb_seglen(const struct sk_buff *skb)
 static int skb_can_shift(const struct sk_buff *skb)
 {
 	return !skb_headlen(skb) && skb_is_nonlinear(skb);
+}
+
+int tcp_skb_shift(struct sk_buff *to, struct sk_buff *from,
+		  int pcount, int shiftlen)
+{
+	/* TCP min gso_size is 8 bytes (TCP_MIN_GSO_SIZE)
+	 * Since TCP_SKB_CB(skb)->tcp_gso_segs is 16 bits, we need
+	 * to make sure not storing more than 65535 * 8 bytes per skb,
+	 * even if current MSS is bigger.
+	 */
+	if (unlikely(to->len + shiftlen >= 65535 * TCP_MIN_GSO_SIZE))
+		return 0;
+	if (unlikely(tcp_skb_pcount(to) + pcount > 65535))
+		return 0;
+	return skb_shift(to, from, shiftlen);
 }
 
 /* Try collapsing SACK blocks spanning across multiple skbs to a single
@@ -1500,7 +1515,7 @@ static struct sk_buff *tcp_shift_skb_data(struct sock *sk, struct sk_buff *skb,
 	if (!after(TCP_SKB_CB(skb)->seq + len, tp->snd_una))
 		goto fallback;
 
-	if (!skb_shift(prev, skb, len))
+	if (!tcp_skb_shift(prev, skb, pcount, len))
 		goto fallback;
 	if (!tcp_shifted_skb(sk, prev, skb, state, pcount, len, mss, dup_sack))
 		goto out;
@@ -1519,12 +1534,11 @@ static struct sk_buff *tcp_shift_skb_data(struct sock *sk, struct sk_buff *skb,
 		goto out;
 
 	len = skb->len;
-	if (skb_shift(prev, skb, len)) {
+	if (tcp_skb_shift(prev, skb, tcp_skb_pcount(skb), len)) {
 		pcount += tcp_skb_pcount(skb);
 		tcp_shifted_skb(sk, prev, skb, state, tcp_skb_pcount(skb),
 				len, mss, 0);
 	}
-
 out:
 	state->fack_count += pcount;
 	return prev;
@@ -2281,7 +2295,7 @@ static void tcp_mark_head_lost(struct sock *sk, int packets, int mark_head)
 			/* If needed, chop off the prefix to mark as lost. */
 			lost = (packets - oldcnt) * mss;
 			if (lost < skb->len &&
-			    tcp_fragment(sk, skb, lost, mss) < 0)
+			    tcp_fragment(sk, TCP_FRAG_IN_RTX_QUEUE, skb, lost, mss) < 0)
 				break;
 			cnt = packets;
 		}
@@ -2929,9 +2943,6 @@ static inline bool tcp_ack_update_rtt(struct sock *sk, const int flag,
 	 * Karn's algorithm forbids taking RTT if some retransmitted data
 	 * is acked (RFC6298).
 	 */
-	if (flag & FLAG_RETRANS_DATA_ACKED)
-		seq_rtt_us = -1L;
-
 	if (seq_rtt_us < 0)
 		seq_rtt_us = sack_rtt_us;
 
@@ -3008,8 +3019,7 @@ void tcp_rearm_rto(struct sock *sk)
 			/* delta may not be positive if the socket is locked
 			 * when the retrans timer fires and is rescheduled.
 			 */
-			if (delta > 0)
-				rto = delta;
+			rto = max_t(int, delta, 1);
 		}
 		inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, rto,
 					  TCP_RTO_MAX);
@@ -3154,7 +3164,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
 		flag |= FLAG_SACK_RENEGING;
 
 	skb_mstamp_get(&now);
-	if (first_ackt.v64) {
+	if (first_ackt.v64 && !(flag & FLAG_RETRANS_DATA_ACKED)) {
 		seq_rtt_us = skb_mstamp_us_delta(&now, &first_ackt);
 		ca_seq_rtt_us = skb_mstamp_us_delta(&now, &last_ackt);
 	}

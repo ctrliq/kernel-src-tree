@@ -532,7 +532,6 @@ struct smb_vol {
 	bool persistent:1;
 	bool nopersistent:1;
 	bool resilient:1; /* noresilient not required since not fored for CA */
-	bool domainauto:1;
 	unsigned int rsize;
 	unsigned int wsize;
 	bool sockopt_tcp_nodelay:1;
@@ -848,7 +847,6 @@ struct cifs_ses {
 	enum securityEnum sectype; /* what security flavor was specified? */
 	bool sign;		/* is signing required? */
 	bool need_reconnect:1; /* connection reset, uid now invalid */
-	bool domainAuto:1;
 	__u16 session_flags;
 	__u8 smb3signingkey[SMB3_SIGN_KEY_SIZE];
 	__u8 smb3encryptionkey[SMB3_SIGN_KEY_SIZE];
@@ -1616,6 +1614,7 @@ GLOBAL_EXTERN struct list_head		cifs_tcp_ses_list;
  * structure order is cifs_socket-->cifs_ses-->cifs_tcon-->cifs_file
  */
 GLOBAL_EXTERN spinlock_t		cifs_tcp_ses_lock;
+GLOBAL_EXTERN spinlock_t		cifs_list_lock;
 
 #ifdef CONFIG_CIFS_DNOTIFY_EXPERIMENTAL /* unused temporarily */
 /* Outstanding dir notify requests */

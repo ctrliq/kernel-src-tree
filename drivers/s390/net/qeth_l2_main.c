@@ -143,13 +143,13 @@ static int qeth_l2_send_setgroupmac_cb(struct qeth_card *card,
 	mac = &cmd->data.setdelmac.mac[0];
 	/* MAC already registered, needed in couple/uncouple case */
 	if (cmd->hdr.return_code ==  IPA_RC_L2_DUP_MAC) {
-		QETH_DBF_MESSAGE(2, "Group MAC %pM already existing on %s \n",
-			  mac, QETH_CARD_IFNAME(card));
+		QETH_DBF_MESSAGE(2, "Group MAC already existing on device %x\n",
+				 CARD_DEVID(card));
 		cmd->hdr.return_code = 0;
 	}
 	if (cmd->hdr.return_code)
-		QETH_DBF_MESSAGE(2, "Could not set group MAC %pM on %s: %x\n",
-			  mac, QETH_CARD_IFNAME(card), cmd->hdr.return_code);
+		QETH_DBF_MESSAGE(2, "Could not set group MAC on device %x: %x\n",
+				 CARD_DEVID(card), cmd->hdr.return_code);
 	return 0;
 }
 
@@ -171,8 +171,8 @@ static int qeth_l2_send_delgroupmac_cb(struct qeth_card *card,
 	cmd = (struct qeth_ipa_cmd *) data;
 	mac = &cmd->data.setdelmac.mac[0];
 	if (cmd->hdr.return_code)
-		QETH_DBF_MESSAGE(2, "Could not delete group MAC %pM on %s: %x\n",
-			  mac, QETH_CARD_IFNAME(card), cmd->hdr.return_code);
+		QETH_DBF_MESSAGE(2, "Could not delete group MAC on device %x: %x\n",
+				 CARD_DEVID(card), cmd->hdr.return_code);
 	return 0;
 }
 
@@ -292,9 +292,9 @@ static int qeth_l2_send_setdelvlan_cb(struct qeth_card *card,
 	QETH_CARD_TEXT(card, 2, "L2sdvcb");
 	cmd = (struct qeth_ipa_cmd *) data;
 	if (cmd->hdr.return_code) {
-		QETH_DBF_MESSAGE(2, "Error in processing VLAN %i on %s: 0x%x. "
-			  "Continuing\n", cmd->data.setdelvlan.vlan_id,
-			  QETH_CARD_IFNAME(card), cmd->hdr.return_code);
+		QETH_DBF_MESSAGE(2, "Error in processing VLAN %u on device %x: %#x\n",
+				 cmd->data.setdelvlan.vlan_id,
+				 CARD_DEVID(card), cmd->hdr.return_code);
 		QETH_CARD_TEXT_(card, 2, "L2VL%4x", cmd->hdr.command);
 		QETH_CARD_TEXT_(card, 2, "err%d", cmd->hdr.return_code);
 	}
@@ -457,6 +457,8 @@ static int qeth_l2_stop_card(struct qeth_card *card, int recovery_mode)
 		qeth_clear_cmd_buffers(&card->read);
 		qeth_clear_cmd_buffers(&card->write);
 	}
+
+	flush_workqueue(card->event_wq);
 	return rc;
 }
 
@@ -696,8 +698,8 @@ static int qeth_l2_request_initial_mac(struct qeth_card *card)
 		rc = qeth_vm_request_mac(card);
 		if (!rc)
 			goto out;
-		QETH_DBF_MESSAGE(2, "z/VM MAC Service failed on device %s: x%x\n",
-				 CARD_BUS_ID(card), rc);
+		QETH_DBF_MESSAGE(2, "z/VM MAC Service failed on device %x: %#x\n",
+				 CARD_DEVID(card), rc);
 		QETH_DBF_TEXT_(SETUP, 2, "err%04x", rc);
 		/* fall back to alternative mechanism: */
 	}
@@ -705,27 +707,28 @@ static int qeth_l2_request_initial_mac(struct qeth_card *card)
 	if (qeth_is_supported(card, IPA_SETADAPTERPARMS)) {
 		rc = qeth_query_setadapterparms(card);
 		if (rc) {
-			QETH_DBF_MESSAGE(2, "could not query adapter "
-				"parameters on device %s: x%x\n",
-				CARD_BUS_ID(card), rc);
+			QETH_DBF_MESSAGE(2, "could not query adapter parameters on device %x: %#x\n",
+					 CARD_DEVID(card), rc);
 		}
 	}
 
-	if (card->info.type == QETH_CARD_TYPE_IQD ||
-	    card->info.type == QETH_CARD_TYPE_OSM ||
-	    card->info.type == QETH_CARD_TYPE_OSX ||
-	    card->info.guestlan) {
+	if (!IS_OSN(card)) {
 		rc = qeth_setadpparms_change_macaddr(card);
-		if (rc) {
-			QETH_DBF_MESSAGE(2, "couldn't get MAC address on "
-				"device %s: x%x\n", CARD_BUS_ID(card), rc);
-			QETH_DBF_TEXT_(SETUP, 2, "1err%d", rc);
-			return rc;
-		}
-	} else {
-		eth_random_addr(card->dev->dev_addr);
-		memcpy(card->dev->dev_addr, vendor_pre, 3);
+		if (!rc && is_valid_ether_addr(card->dev->dev_addr))
+			goto out;
+		QETH_DBF_MESSAGE(2, "READ_MAC Assist failed on device %x: %#x\n",
+				 CARD_DEVID(card), rc);
+		QETH_DBF_TEXT_(SETUP, 2, "1err%04x", rc);
+		/* fall back once more: */
 	}
+
+	/* some devices don't support a custom MAC address: */
+	if (card->info.type == QETH_CARD_TYPE_OSM ||
+	    card->info.type == QETH_CARD_TYPE_OSX)
+		return (rc) ? rc : -EADDRNOTAVAIL;
+
+	eth_random_addr(card->dev->dev_addr);
+	memcpy(card->dev->dev_addr, vendor_pre, 3);
 out:
 	QETH_DBF_HEX(SETUP, 2, card->dev->dev_addr, card->dev->addr_len);
 	return 0;
@@ -1027,6 +1030,7 @@ static void qeth_l2_remove_device(struct ccwgroup_device *cgdev)
 	if (cgdev->state == CCWGROUP_ONLINE)
 		qeth_l2_set_offline(cgdev);
 
+	cancel_work_sync(&card->close_dev_work);
 	if (card->dev) {
 		unregister_netdev(card->dev);
 		free_netdev(card->dev);
@@ -1041,7 +1045,7 @@ static const struct ethtool_ops qeth_l2_ethtool_ops = {
 	.get_ethtool_stats = qeth_core_get_ethtool_stats,
 	.get_sset_count = qeth_core_get_sset_count,
 	.get_drvinfo = qeth_core_get_drvinfo,
-	.get_settings = qeth_core_ethtool_get_settings,
+	.get_link_ksettings = qeth_core_ethtool_get_link_ksettings,
 };
 
 static const struct ethtool_ops qeth_l2_osn_ops = {
@@ -1665,7 +1669,7 @@ static void qeth_bridge_state_change(struct qeth_card *card,
 	data->card = card;
 	memcpy(&data->qports, qports,
 			sizeof(struct qeth_sbp_state_change) + extrasize);
-	queue_work(qeth_wq, &data->worker);
+	queue_work(card->event_wq, &data->worker);
 }
 
 struct qeth_bridge_host_data {
@@ -1737,7 +1741,7 @@ static void qeth_bridge_host_event(struct qeth_card *card,
 	data->card = card;
 	memcpy(&data->hostevs, hostevs,
 			sizeof(struct qeth_ipacmd_addr_change) + extrasize);
-	queue_work(qeth_wq, &data->worker);
+	queue_work(card->event_wq, &data->worker);
 }
 
 /* SETBRIDGEPORT support; sending commands */

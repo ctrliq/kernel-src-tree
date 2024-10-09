@@ -8,11 +8,14 @@
 #define _LINUX_BPF_H 1
 
 #include <uapi/linux/bpf.h>
+
 #include <linux/workqueue.h>
 #include <linux/file.h>
 #include <linux/err.h>
 #include <linux/percpu.h>
 #include <linux/err.h>
+#include <linux/numa.h>
+#include <linux/rbtree_latch.h>
 
 struct perf_event;
 struct bpf_map;
@@ -205,6 +208,8 @@ struct bpf_prog_aux {
 	void *jit_data; /* JIT specific data. arch dependent */
 	u32 max_ctx_offset;
 	u32 stack_depth;
+	struct latch_tree_node ksym_tnode;
+	struct list_head ksym_lnode;
 	const struct bpf_prog_ops *ops;
 	struct bpf_map **used_maps;
 	struct bpf_prog *prog;
@@ -476,6 +481,7 @@ extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
 extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;
 extern const struct bpf_func_proto bpf_get_current_comm_proto;
 extern const struct bpf_func_proto bpf_get_stackid_proto;
+extern const struct bpf_func_proto bpf_get_stack_proto;
 
 /* Shared helpers among cBPF and eBPF. */
 void bpf_user_rnd_init_once(void);

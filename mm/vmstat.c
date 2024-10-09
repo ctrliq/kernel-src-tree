@@ -22,6 +22,19 @@
 #include <linux/writeback.h>
 #include <linux/compaction.h>
 
+/*
+ * RHEL7 note:
+ * we need to __GENKSYSM__ wrap the following includes
+ * to avoid changing KABI'ed symbols modversions due
+ * to opaque structs reclaim_state, swap_info_struct,
+ * exception_table_entry and xattr_handler that are now
+ * becoming defined
+ */
+#ifndef __GENKSYMS__
+#include <linux/mm_inline.h>
+#include "internal.h"
+#endif
+
 #ifdef CONFIG_VM_EVENT_COUNTERS
 DEFINE_PER_CPU(struct vm_event_state, vm_event_states) = {{0}};
 EXPORT_PER_CPU_SYMBOL(vm_event_states);
@@ -883,6 +896,10 @@ const char * const vmstat_text[] = {
 	"balloon_migrate",
 #endif
 #endif /* CONFIG_MEMORY_BALLOON */
+#ifdef CONFIG_SWAP
+	"swap_ra",
+	"swap_ra_hit",
+#endif
 #endif /* CONFIG_VM_EVENTS_COUNTERS */
 };
 #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA */
@@ -1117,7 +1134,7 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 		   "\n  all_unreclaimable: %u"
 		   "\n  start_pfn:         %lu"
 		   "\n  inactive_ratio:    %u",
-		   zone->all_unreclaimable,
+		   !zone_reclaimable(zone),
 		   zone->zone_start_pfn,
 		   zone->inactive_ratio);
 	seq_putc(m, '\n');

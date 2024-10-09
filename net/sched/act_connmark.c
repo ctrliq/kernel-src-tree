@@ -69,7 +69,7 @@ static int tcf_connmark(struct sk_buff *skb, const struct tc_action *a,
 	}
 
 	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
-			       proto, &tuple))
+			       proto, ca->net, &tuple))
 		goto out;
 
 	zone.id = ca->zone;
@@ -133,9 +133,10 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
 		ci = to_connmark(*a);
 		if (bind)
 			return 0;
-		tcf_idr_release(*a, bind);
-		if (!ovr)
+		if (!ovr) {
+			tcf_idr_release(*a, bind);
 			return -EEXIST;
+		}
 		/* replacing action and zone */
 		ci->tcf_action = parm->action;
 		ci->zone = parm->zone;

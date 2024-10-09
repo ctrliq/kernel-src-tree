@@ -57,6 +57,7 @@ static const struct {
 	QEDE_RQSTAT(rx_hw_errors),
 	QEDE_RQSTAT(rx_alloc_errors),
 	QEDE_RQSTAT(rx_ip_frags),
+	QEDE_RQSTAT(xdp_no_pass),
 };
 
 #define QEDE_NUM_RQSTATS ARRAY_SIZE(qede_rqstats_arr)
@@ -219,8 +220,14 @@ static void qede_get_strings_stats_txq(struct qede_dev *edev,
 	int i;
 
 	for (i = 0; i < QEDE_NUM_TQSTATS; i++) {
-		sprintf(*buf, "%d: %s", txq->index,
-			qede_tqstats_arr[i].string);
+		if (txq->is_xdp)
+			sprintf(*buf, "%d [XDP]: %s",
+				QEDE_TXQ_XDP_TO_IDX(edev, txq),
+				qede_tqstats_arr[i].string);
+		else
+			sprintf(*buf, "%d_%d: %s", txq->index, txq->cos,
+				qede_tqstats_arr[i].string);
+
 		*buf += ETH_GSTRING_LEN;
 	}
 }
@@ -256,8 +263,16 @@ static void qede_get_strings_stats(struct qede_dev *edev, u8 *buf)
 		if (fp->type & QEDE_FASTPATH_RX)
 			qede_get_strings_stats_rxq(edev, fp->rxq, &buf);
 
-		if (fp->type & QEDE_FASTPATH_TX)
-			qede_get_strings_stats_txq(edev, fp->txq, &buf);
+		if (fp->type & QEDE_FASTPATH_XDP)
+			qede_get_strings_stats_txq(edev, fp->xdp_tx, &buf);
+
+		if (fp->type & QEDE_FASTPATH_TX) {
+			int cos;
+
+			for_each_cos_in_txq(edev, cos)
+				qede_get_strings_stats_txq(edev,
+							   &fp->txq[cos], &buf);
+		}
 	}
 
 	/* Account for non-queue statistics */
@@ -329,8 +344,15 @@ static void qede_get_ethtool_stats(struct net_device *dev,
 		if (fp->type & QEDE_FASTPATH_RX)
 			qede_get_ethtool_stats_rxq(fp->rxq, &buf);
 
-		if (fp->type & QEDE_FASTPATH_TX)
-			qede_get_ethtool_stats_txq(fp->txq, &buf);
+		if (fp->type & QEDE_FASTPATH_XDP)
+			qede_get_ethtool_stats_txq(fp->xdp_tx, &buf);
+
+		if (fp->type & QEDE_FASTPATH_TX) {
+			int cos;
+
+			for_each_cos_in_txq(edev, cos)
+				qede_get_ethtool_stats_txq(&fp->txq[cos], &buf);
+		}
 	}
 
 	for (i = 0; i < QEDE_NUM_STATS; i++) {
@@ -357,11 +379,15 @@ static int qede_get_sset_count(struct net_device *dev, int stringset)
 				num_stats--;
 
 		/* Account for the Regular Tx statistics */
-		num_stats += QEDE_TSS_COUNT(edev) * QEDE_NUM_TQSTATS;
+		num_stats += QEDE_TSS_COUNT(edev) * QEDE_NUM_TQSTATS *
+				edev->dev_info.num_tc;
 
 		/* Account for the Regular Rx statistics */
 		num_stats += QEDE_RSS_COUNT(edev) * QEDE_NUM_RQSTATS;
 
+		/* Account for XDP statistics [if needed] */
+		if (edev->xdp_prog)
+			num_stats += QEDE_RSS_COUNT(edev) * QEDE_NUM_TQSTATS;
 		return num_stats;
 
 	case ETH_SS_PRIV_FLAGS:
@@ -794,9 +820,17 @@ static int qede_get_coalesce(struct net_device *dev,
 		}
 
 		for_each_queue(i) {
+			struct qede_tx_queue *txq;
+
 			fp = &edev->fp_array[i];
+
+			/* All TX queues of given fastpath uses same
+			 * coalescing value, so no need to iterate over
+			 * all TCs, TC0 txq should suffice.
+			 */
 			if (fp->type & QEDE_FASTPATH_TX) {
-				tx_handle = fp->txq->handle;
+				txq = QEDE_FP_TC0_TXQ(fp);
+				tx_handle = txq->handle;
 				break;
 			}
 		}
@@ -854,9 +888,17 @@ static int qede_set_coalesce(struct net_device *dev,
 		}
 
 		if (edev->fp_array[i].type & QEDE_FASTPATH_TX) {
+			struct qede_tx_queue *txq;
+
+			/* All TX queues of given fastpath uses same
+			 * coalescing value, so no need to iterate over
+			 * all TCs, TC0 txq should suffice.
+			 */
+			txq = QEDE_FP_TC0_TXQ(fp);
+
 			rc = edev->ops->common->set_coalesce(edev->cdev,
 							     0, txc,
-							     fp->txq->handle);
+							     txq->handle);
 			if (rc) {
 				DP_INFO(edev,
 					"Set TX coalesce error, rc = %d\n", rc);
@@ -1312,7 +1354,7 @@ static int qede_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info)
 		rc = qede_add_cls_rule(edev, info);
 		break;
 	case ETHTOOL_SRXCLSRLDEL:
-		rc = qede_del_cls_rule(edev, info);
+		rc = qede_delete_flow_filter(edev, info->fs.location);
 		break;
 	default:
 		DP_INFO(edev, "Command parameters not supported\n");
@@ -1438,8 +1480,10 @@ static int qede_selftest_transmit_traffic(struct qede_dev *edev,
 	u16 val;
 
 	for_each_queue(i) {
-		if (edev->fp_array[i].type & QEDE_FASTPATH_TX) {
-			txq = edev->fp_array[i].txq;
+		struct qede_fastpath *fp = &edev->fp_array[i];
+
+		if (fp->type & QEDE_FASTPATH_TX) {
+			txq = QEDE_FP_TC0_TXQ(fp);
 			break;
 		}
 	}
@@ -1451,7 +1495,7 @@ static int qede_selftest_transmit_traffic(struct qede_dev *edev,
 
 	/* Fill the entry in the SW ring and the BDs in the FW ring */
 	idx = txq->sw_tx_prod;
-	txq->sw_tx_ring[idx].skb = skb;
+	txq->sw_tx_ring.skbs[idx].skb = skb;
 	first_bd = qed_chain_produce(&txq->tx_pbl);
 	memset(first_bd, 0, sizeof(*first_bd));
 	val = 1 << ETH_TX_1ST_BD_FLAGS_START_BD_SHIFT;
@@ -1506,7 +1550,7 @@ static int qede_selftest_transmit_traffic(struct qede_dev *edev,
 	dma_unmap_single(&edev->pdev->dev, BD_UNMAP_ADDR(first_bd),
 			 BD_UNMAP_LEN(first_bd), DMA_TO_DEVICE);
 	txq->sw_tx_cons = (txq->sw_tx_cons + 1) % txq->num_tx_buffers;
-	txq->sw_tx_ring[idx].skb = NULL;
+	txq->sw_tx_ring.skbs[idx].skb = NULL;
 
 	return 0;
 }
@@ -1564,7 +1608,8 @@ static int qede_selftest_receive_traffic(struct qede_dev *edev)
 		len =  le16_to_cpu(fp_cqe->len_on_first_bd);
 		data_ptr = (u8 *)(page_address(sw_rx_data->data) +
 				  fp_cqe->placement_offset +
-				  sw_rx_data->page_offset);
+				  sw_rx_data->page_offset +
+				  rxq->rx_headroom);
 		if (ether_addr_equal(data_ptr,  edev->ndev->dev_addr) &&
 		    ether_addr_equal(data_ptr + ETH_ALEN,
 				     edev->ndev->dev_addr)) {

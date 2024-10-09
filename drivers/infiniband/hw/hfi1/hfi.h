@@ -80,6 +80,7 @@
 #include "qsfp.h"
 #include "platform.h"
 #include "affinity.h"
+#include "msix.h"
 
 /* bumped 1 from s/w major version of TrueScale */
 #define HFI1_CHIP_VERS_MAJ 3U
@@ -672,6 +673,14 @@ struct hfi1_msix_entry {
 	struct irq_affinity_notify notify;
 };
 
+struct hfi1_msix_info {
+	/* lock to synchronize in_use_msix access */
+	spinlock_t msix_lock;
+	DECLARE_BITMAP(in_use_msix, CCE_NUM_MSIX_VECTORS);
+	struct hfi1_msix_entry *msix_entries;
+	u16 max_requested;
+};
+
 /* per-SL CCA information */
 struct cca_timer {
 	struct hrtimer hrtimer;
@@ -997,7 +1006,6 @@ struct hfi1_vnic_data {
 	struct idr vesw_idr;
 	u8 rmt_start;
 	u8 num_ctxt;
-	u32 msix_idx;
 };
 
 struct hfi1_vnic_vport_info;
@@ -1063,8 +1071,6 @@ struct hfi1_devdata {
 	dma_addr_t                          sdma_pad_phys;
 	/* for deallocation */
 	size_t                              sdma_heads_size;
-	/* number from the chip */
-	u32                                 chip_sdma_engines;
 	/* num used */
 	u32                                 num_sdma;
 	/* array of engines sized by num_sdma */
@@ -1145,19 +1151,6 @@ struct hfi1_devdata {
 	/* Base GUID for device (network order) */
 	u64 base_guid;
 
-	/* these are the "32 bit" regs */
-
-	/* number of receive contexts the chip supports */
-	u32 chip_rcv_contexts;
-	/* number of receive array entries */
-	u32 chip_rcv_array_count;
-	/* number of PIO send contexts the chip supports */
-	u32 chip_send_contexts;
-	/* number of bytes in the PIO memory buffer */
-	u32 chip_pio_mem_size;
-	/* number of bytes in the SDMA memory buffer */
-	u32 chip_sdma_mem_size;
-
 	/* both sides of the PCIe link are gen3 capable */
 	u8 link_gen3_capable;
 	u8 dc_shutdown;
@@ -1225,15 +1218,6 @@ struct hfi1_devdata {
 
 	struct diag_client *diag_client;
 
-	/* MSI-X information */
-	struct hfi1_msix_entry *msix_entries;
-	u32 num_msix_entries;
-	u32 first_dyn_msix_idx;
-
-	/* INTx information */
-	u32 requested_intx_irq;		/* did we request one? */
-	char intx_name[MAX_NAME_SIZE];	/* INTx name */
-
 	/* general interrupt: mask of handled interrupts */
 	u64 gi_mask[CCE_NUM_INT_CSRS];
 
@@ -1246,6 +1230,9 @@ struct hfi1_devdata {
 	 * 64 bit synthetic counters
 	 */
 	struct timer_list synth_stats_timer;
+
+	/* MSI-X information */
+	struct hfi1_msix_info msix_info;
 
 	/*
 	 * device counters
@@ -1302,6 +1289,9 @@ struct hfi1_devdata {
 
 	/* Save the enabled LCB error bits */
 	u64 lcb_err_en;
+	struct cpu_mask_set *comp_vect;
+	int *comp_vect_mappings;
+	u32 comp_vect_possible_cpus;
 
 	/*
 	 * Capability to have different send engines simply by changing a
@@ -1370,6 +1360,8 @@ struct hfi1_devdata {
 
 	/* vnic data */
 	struct hfi1_vnic_data vnic;
+	/* Lock to protect IRQ SRC register access */
+	spinlock_t irq_src_lock;
 };
 
 static inline bool hfi1_vnic_is_rsm_full(struct hfi1_devdata *dd, int spare)
@@ -1452,9 +1444,6 @@ int handle_receive_interrupt(struct hfi1_ctxtdata *rcd, int thread);
 int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *rcd, int thread);
 int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *rcd, int thread);
 void set_all_slowpath(struct hfi1_devdata *dd);
-void hfi1_vnic_synchronize_irq(struct hfi1_devdata *dd);
-void hfi1_set_vnic_msix_info(struct hfi1_ctxtdata *rcd);
-void hfi1_reset_vnic_msix_info(struct hfi1_ctxtdata *rcd);
 
 extern const struct pci_device_id hfi1_pci_tbl[];
 void hfi1_make_ud_req_9B(struct rvt_qp *qp,
@@ -1923,10 +1912,8 @@ struct cc_state *get_cc_state_protected(struct hfi1_pportdata *ppd)
 #define HFI1_CTXT_WAITING_URG 4
 
 /* free up any allocated data at closes */
-struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
-				  const struct pci_device_id *ent);
+int hfi1_init_dd(struct hfi1_devdata *dd);
 void hfi1_free_devdata(struct hfi1_devdata *dd);
-struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra);
 
 /* LED beaconing functions */
 void hfi1_start_led_override(struct hfi1_pportdata *ppd, unsigned int timeon,
@@ -1999,6 +1986,7 @@ static inline u32 get_rcvhdrtail(const struct hfi1_ctxtdata *rcd)
  */
 
 extern const char ib_hfi1_version[];
+extern const struct attribute_group ib_hfi1_attr_group;
 
 int hfi1_device_create(struct hfi1_devdata *dd);
 void hfi1_device_remove(struct hfi1_devdata *dd);
@@ -2010,16 +1998,15 @@ void hfi1_verbs_unregister_sysfs(struct hfi1_devdata *dd);
 /* Hook for sysfs read of QSFP */
 int qsfp_dump(struct hfi1_pportdata *ppd, char *buf, int len);
 
-int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent);
-void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
+int hfi1_pcie_init(struct hfi1_devdata *dd);
 void hfi1_pcie_cleanup(struct pci_dev *pdev);
 int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev);
 void hfi1_pcie_ddcleanup(struct hfi1_devdata *);
 int pcie_speeds(struct hfi1_devdata *dd);
-int request_msix(struct hfi1_devdata *dd, u32 msireq);
 int restore_pci_variables(struct hfi1_devdata *dd);
 int save_pci_variables(struct hfi1_devdata *dd);
 int do_pcie_gen3_transition(struct hfi1_devdata *dd);
+void tune_pcie_caps(struct hfi1_devdata *dd);
 int parse_platform_config(struct hfi1_devdata *dd);
 int get_platform_config_field(struct hfi1_devdata *dd,
 			      enum platform_config_table_type_encoding
@@ -2153,19 +2140,6 @@ static inline u64 hfi1_pkt_base_sdma_integrity(struct hfi1_devdata *dd)
 
 	return base_sdma_integrity;
 }
-
-/*
- * hfi1_early_err is used (only!) to print early errors before devdata is
- * allocated, or when dd->pcidev may not be valid, and at the tail end of
- * cleanup when devdata may have been freed, etc.  hfi1_dev_porterr is
- * the same as dd_dev_err, but is used when the message really needs
- * the IB port# to be definitive as to what's happening..
- */
-#define hfi1_early_err(dev, fmt, ...) \
-	dev_err(dev, fmt, ##__VA_ARGS__)
-
-#define hfi1_early_info(dev, fmt, ...) \
-	dev_info(dev, fmt, ##__VA_ARGS__)
 
 #define dd_dev_emerg(dd, fmt, ...) \
 	dev_emerg(&(dd)->pcidev->dev, "%s: " fmt, \

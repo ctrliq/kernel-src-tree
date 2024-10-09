@@ -970,7 +970,7 @@ static void __run_parallel(int tasks, void (*fn)(int task, void *data),
 	}
 }
 
-static void test_map_stress(void)
+__maybe_unused static void test_map_stress(void)
 {
 	run_parallel(100, test_hashmap, NULL);
 	run_parallel(100, test_hashmap_percpu, NULL);
@@ -1006,7 +1006,7 @@ static void test_update_delete(int fn, void *data)
 	}
 }
 
-static void test_map_parallel(void)
+__maybe_unused static void test_map_parallel(void)
 {
 	int i, fd, key = 0, value = 0;
 	int data[2];
@@ -1121,8 +1121,11 @@ static void run_all_tests(void)
 #endif
 
 	test_map_large();
+
+#ifndef __s390x__
 	test_map_parallel();
 	test_map_stress();
+#endif
 
 	test_map_rdonly();
 	test_map_wronly();

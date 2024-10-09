@@ -17,7 +17,7 @@
 
 #include "internal.h"
 
-#ifdef CONFIG_RTC_MC146818_LIB
+#ifdef CONFIG_RTC_LIB
 #include <linux/mc146818rtc.h>
 
 /*

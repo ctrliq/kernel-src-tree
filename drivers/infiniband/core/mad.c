@@ -390,10 +390,10 @@ struct ib_mad_agent *ib_register_mad_agent(struct ib_device *device,
 	}
 
 	idr_preload(GFP_KERNEL);
-	idr_lock(&ib_mad_clients);
+	spin_lock(&ib_mad_clients.lock);
 	ret2 = idr_alloc_cyclic(&ib_mad_clients, mad_agent_priv, 0,
 			AGENT_ID_LIMIT, GFP_ATOMIC);
-	idr_unlock(&ib_mad_clients);
+	spin_unlock(&ib_mad_clients.lock);
 	idr_preload_end();
 
 	if (ret2 < 0) {
@@ -448,9 +448,9 @@ struct ib_mad_agent *ib_register_mad_agent(struct ib_device *device,
 	return &mad_agent_priv->agent;
 error6:
 	spin_unlock_irq(&port_priv->reg_lock);
-	idr_lock(&ib_mad_clients);
+	spin_lock(&ib_mad_clients.lock);
 	idr_remove(&ib_mad_clients, mad_agent_priv->agent.hi_tid);
-	idr_unlock(&ib_mad_clients);
+	spin_unlock(&ib_mad_clients.lock);
 error5:
 	ib_mad_agent_security_cleanup(&mad_agent_priv->agent);
 error4:
@@ -614,9 +614,9 @@ static void unregister_mad_agent(struct ib_mad_agent_private *mad_agent_priv)
 	spin_lock_irq(&port_priv->reg_lock);
 	remove_mad_reg_req(mad_agent_priv);
 	spin_unlock_irq(&port_priv->reg_lock);
-	idr_lock(&ib_mad_clients);
+	spin_lock(&ib_mad_clients.lock);
 	idr_remove(&ib_mad_clients, mad_agent_priv->agent.hi_tid);
-	idr_unlock(&ib_mad_clients);
+	spin_unlock(&ib_mad_clients.lock);
 
 	flush_workqueue(port_priv->wq);
 	ib_cancel_rmpp_recvs(mad_agent_priv);
@@ -1920,8 +1920,8 @@ static inline int rcv_has_same_gid(const struct ib_mad_agent_private *mad_agent_
 			const struct ib_global_route *grh =
 					rdma_ah_read_grh(&attr);
 
-			if (ib_get_cached_gid(device, port_num,
-					      grh->sgid_index, &sgid, NULL))
+			if (rdma_query_gid(device, port_num,
+					   grh->sgid_index, &sgid))
 				return 0;
 			return !memcmp(sgid.raw, rwc->recv_buf.grh->dgid.raw,
 				       16);
@@ -2414,7 +2414,7 @@ static void wait_for_response(struct ib_mad_send_wr_private *mad_send_wr)
 }
 
 void ib_reset_mad_timeout(struct ib_mad_send_wr_private *mad_send_wr,
-			  int timeout_ms)
+			  unsigned long timeout_ms)
 {
 	mad_send_wr->timeout = msecs_to_jiffies(timeout_ms);
 	wait_for_response(mad_send_wr);

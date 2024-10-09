@@ -52,9 +52,6 @@ struct hugepage_subpool *hugepage_new_subpool(struct hstate *h, long max_hpages,
 						long min_hpages);
 void hugepage_put_subpool(struct hugepage_subpool *spool);
 
-int PageHuge(struct page *page);
-bool page_huge_active(struct page *page);
-
 void reset_vma_resv_huge_pages(struct vm_area_struct *vma);
 int hugetlb_sysctl_handler(struct ctl_table *, int, void __user *, size_t *, loff_t *);
 int hugetlb_overcommit_handler(struct ctl_table *, int, void __user *, size_t *, loff_t *);
@@ -134,16 +131,6 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
 		unsigned long address, unsigned long end, pgprot_t newprot);
 
 #else /* !CONFIG_HUGETLB_PAGE */
-
-static inline int PageHuge(struct page *page)
-{
-	return 0;
-}
-
-static inline bool page_huge_active(struct page *page)
-{
-	return 0;
-}
 
 static inline void reset_vma_resv_huge_pages(struct vm_area_struct *vma)
 {

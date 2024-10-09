@@ -137,6 +137,8 @@ struct cpuinfo_x86 {
 	u16			cpu_core_id;
 	/* Compute unit id */
 	RH_KABI_REPLACE(u8 compute_unit_id, __u8 cu_id)
+	/* Address space bits used by the cache internally */
+	RH_KABI_FILL_HOLE(u8	x86_cache_bits)
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 	u32			microcode;
@@ -193,7 +195,7 @@ extern void cpu_detect(struct cpuinfo_x86 *c);
 
 static inline unsigned long l1tf_pfn_limit(void)
 {
-	return BIT(boot_cpu_data.x86_phys_bits - 1 - PAGE_SHIFT) - 1;
+	return BIT(boot_cpu_data.x86_cache_bits - 1 - PAGE_SHIFT) - 1;
 }
 
 extern void early_cpu_init(void);
@@ -1100,5 +1102,13 @@ enum l1tf_mitigations {
 };
 
 extern enum l1tf_mitigations l1tf_mitigation;
+
+enum mds_mitigations {
+	MDS_MITIGATION_OFF,
+	MDS_MITIGATION_FULL,
+	MDS_MITIGATION_VMWERV,
+};
+
+extern enum mds_mitigations mds_mitigation;
 
 #endif /* _ASM_X86_PROCESSOR_H */

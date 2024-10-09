@@ -192,22 +192,43 @@ ext4_xattr_check_names(struct ext4_xattr_entry *entry, void *end,
 {
 	struct ext4_xattr_entry *e = entry;
 
+	/* Find the end of the names list */
 	while (!IS_LAST_ENTRY(e)) {
 		struct ext4_xattr_entry *next = EXT4_XATTR_NEXT(e);
 		if ((void *)next >= end)
-			return -EIO;
+			return -EFSCORRUPTED;
+		if (strnlen(e->e_name, e->e_name_len) != e->e_name_len)
+			return -EFSCORRUPTED;
 		e = next;
 	}
 
+	/* Check the values */
 	while (!IS_LAST_ENTRY(entry)) {
+		u32 size = le32_to_cpu(entry->e_value_size);
 		if (entry->e_value_block != 0)
 			return -EFSCORRUPTED;
-		if (entry->e_value_size != 0 &&
-		    (value_start + le16_to_cpu(entry->e_value_offs) <
-		     (void *)e + sizeof(__u32) ||
-		     value_start + le16_to_cpu(entry->e_value_offs) +
-		    le32_to_cpu(entry->e_value_size) > end))
-			return -EIO;
+
+		if (size > INT_MAX)
+			return -EFSCORRUPTED;
+
+		if (size != 0) {
+			u16 offs = le16_to_cpu(entry->e_value_offs);
+			void *value;
+
+			/*
+			 * The value cannot overlap the names, and the value
+			 * with padding cannot extend beyond 'end'.  Check both
+			 * the padded and unpadded sizes, since the size may
+			 * overflow to 0 when adding padding.
+			 */
+			if (offs > end - value_start)
+				return -EFSCORRUPTED;
+			value = value_start + offs;
+			if (value < (void *)e + sizeof(u32) ||
+			    size > end - value ||
+			    EXT4_XATTR_SIZE(size) > end - value)
+				return -EFSCORRUPTED;
+		}
 		entry = EXT4_XATTR_NEXT(entry);
 	}
 

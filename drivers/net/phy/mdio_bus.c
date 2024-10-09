@@ -41,6 +41,51 @@
 #include <asm/irq.h>
 #include <asm/uaccess.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/mdio.h>
+
+int mdiobus_register_device(struct phy_device *phydev)
+{
+	if (phydev->mdio_bus->phy_map[phydev->mdio_addr])
+		return -EBUSY;
+
+	phydev->mdio_bus->phy_map[phydev->mdio_addr] = phydev;
+
+	return 0;
+}
+EXPORT_SYMBOL(mdiobus_register_device);
+
+int mdiobus_unregister_device(struct phy_device *phydev)
+{
+	if (phydev->mdio_bus->phy_map[phydev->mdio_addr] != phydev)
+		return -EINVAL;
+
+	phydev->mdio_bus->phy_map[phydev->mdio_addr] = NULL;
+
+	return 0;
+}
+EXPORT_SYMBOL(mdiobus_unregister_device);
+
+struct phy_device *mdiobus_get_phy(struct mii_bus *bus, int addr)
+{
+	struct phy_device *phydev = bus->phy_map[addr];
+
+	if (!phydev)
+		return NULL;
+
+	if (!(phydev->mdio_flags & MDIO_DEVICE_FLAG_PHY))
+		return NULL;
+
+	return phydev;
+}
+EXPORT_SYMBOL(mdiobus_get_phy);
+
+bool mdiobus_is_registered_device(struct mii_bus *bus, int addr)
+{
+	return bus->phy_map[addr];
+}
+EXPORT_SYMBOL(mdiobus_is_registered_device);
+
 /**
  * mdiobus_alloc_size - allocate a mii_bus structure
  * @size: extra amount of memory to allocate for private storage.
@@ -250,7 +295,7 @@ int __mdiobus_register(struct mii_bus *bus, struct module *owner)
 
 error:
 	while (--i >= 0) {
-		struct phy_device *phydev = bus->phy_map[i];
+		struct phy_device *phydev = mdiobus_get_phy(bus, i);
 		if (phydev) {
 			phy_device_remove(phydev);
 			phy_device_free(phydev);
@@ -270,7 +315,7 @@ void mdiobus_unregister(struct mii_bus *bus)
 
 	device_del(&bus->dev);
 	for (i = 0; i < PHY_MAX_ADDR; i++) {
-		struct phy_device *phydev = bus->phy_map[i];
+		struct phy_device *phydev = mdiobus_get_phy(bus, i);
 		if (phydev) {
 			phy_device_remove(phydev);
 			phy_device_free(phydev);
@@ -324,6 +369,55 @@ struct phy_device *mdiobus_scan(struct mii_bus *bus, int addr)
 EXPORT_SYMBOL(mdiobus_scan);
 
 /**
+ * __mdiobus_read - Unlocked version of the mdiobus_read function
+ * @bus: the mii_bus struct
+ * @addr: the phy address
+ * @regnum: register number to read
+ *
+ * Read a MDIO bus register. Caller must hold the mdio bus lock.
+ *
+ * NOTE: MUST NOT be called from interrupt context.
+ */
+int __mdiobus_read(struct mii_bus *bus, int addr, u32 regnum)
+{
+	int retval;
+
+	WARN_ON_ONCE(!mutex_is_locked(&bus->mdio_lock));
+
+	retval = bus->read(bus, addr, regnum);
+
+	trace_mdio_access(bus, 1, addr, regnum, retval, retval);
+
+	return retval;
+}
+EXPORT_SYMBOL(__mdiobus_read);
+
+/**
+ * __mdiobus_write - Unlocked version of the mdiobus_write function
+ * @bus: the mii_bus struct
+ * @addr: the phy address
+ * @regnum: register number to write
+ * @val: value to write to @regnum
+ *
+ * Write a MDIO bus register. Caller must hold the mdio bus lock.
+ *
+ * NOTE: MUST NOT be called from interrupt context.
+ */
+int __mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val)
+{
+	int err;
+
+	WARN_ON_ONCE(!mutex_is_locked(&bus->mdio_lock));
+
+	err = bus->write(bus, addr, regnum, val);
+
+	trace_mdio_access(bus, 0, addr, regnum, val, err);
+
+	return err;
+}
+EXPORT_SYMBOL(__mdiobus_write);
+
+/**
  * mdiobus_read_nested - Nested version of the mdiobus_read function
  * @bus: the mii_bus struct
  * @addr: the phy address
@@ -343,7 +437,7 @@ int mdiobus_read_nested(struct mii_bus *bus, int addr, u32 regnum)
 	BUG_ON(in_interrupt());
 
 	mutex_lock_nested(&bus->mdio_lock, SINGLE_DEPTH_NESTING);
-	retval = bus->read(bus, addr, regnum);
+	retval = __mdiobus_read(bus, addr, regnum);
 	mutex_unlock(&bus->mdio_lock);
 
 	return retval;
@@ -367,7 +461,7 @@ int mdiobus_read(struct mii_bus *bus, int addr, u32 regnum)
 	BUG_ON(in_interrupt());
 
 	mutex_lock(&bus->mdio_lock);
-	retval = bus->read(bus, addr, regnum);
+	retval = __mdiobus_read(bus, addr, regnum);
 	mutex_unlock(&bus->mdio_lock);
 
 	return retval;
@@ -395,7 +489,7 @@ int mdiobus_write_nested(struct mii_bus *bus, int addr, u32 regnum, u16 val)
 	BUG_ON(in_interrupt());
 
 	mutex_lock_nested(&bus->mdio_lock, SINGLE_DEPTH_NESTING);
-	err = bus->write(bus, addr, regnum, val);
+	err = __mdiobus_write(bus, addr, regnum, val);
 	mutex_unlock(&bus->mdio_lock);
 
 	return err;
@@ -420,7 +514,7 @@ int mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val)
 	BUG_ON(in_interrupt());
 
 	mutex_lock(&bus->mdio_lock);
-	err = bus->write(bus, addr, regnum, val);
+	err = __mdiobus_write(bus, addr, regnum, val);
 	mutex_unlock(&bus->mdio_lock);
 
 	return err;
@@ -451,98 +545,32 @@ static int mdio_bus_match(struct device *dev, struct device_driver *drv)
 }
 
 #ifdef CONFIG_PM
-
-static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
-{
-	struct device_driver *drv = phydev->dev.driver;
-	struct phy_driver *phydrv = to_phy_driver(drv);
-	struct net_device *netdev = phydev->attached_dev;
-
-	if (!drv || !phydrv->suspend)
-		return false;
-
-	/* PHY not attached? May suspend if the PHY has not already been
-	 * suspended as part of a prior call to phy_disconnect() ->
-	 * phy_detach() -> phy_suspend() because the parent netdev might be the
-	 * MDIO bus driver and clock gated at this point.
-	 */
-	if (!netdev)
-		return !phydev->suspended;
-
-	/*
-	 * Don't suspend PHY if the attched netdev parent may wakeup.
-	 * The parent may point to a PCI device, as in tg3 driver.
-	 */
-	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
-		return false;
-
-	/*
-	 * Also don't suspend PHY if the netdev itself may wakeup. This
-	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
-	 * e.g. SoC devices.
-	 */
-	if (device_may_wakeup(&netdev->dev))
-		return false;
-
-	return true;
-}
-
 static int mdio_bus_suspend(struct device *dev)
 {
-	struct phy_device *phydev = to_phy_device(dev);
+	struct phy_device *phy = to_phy_device(dev);
 
-	/*
-	 * We must stop the state machine manually, otherwise it stops out of
-	 * control, possibly with the phydev->lock held. Upon resume, netdev
-	 * may call phy routines that try to grab the same lock, and that may
-	 * lead to a deadlock.
-	 */
-	if (phydev->attached_dev && phydev->adjust_link)
-		phy_stop_machine(phydev);
+	if (phy->mdio_pm_ops && phy->mdio_pm_ops->suspend)
+		return phy->mdio_pm_ops->suspend(dev);
 
-	if (!mdio_bus_phy_may_suspend(phydev))
-		return 0;
-
-	return phy_suspend(phydev);
+	return 0;
 }
 
 static int mdio_bus_resume(struct device *dev)
 {
-	struct phy_device *phydev = to_phy_device(dev);
-	int ret;
+	struct phy_device *phy = to_phy_device(dev);
 
-	if (!mdio_bus_phy_may_suspend(phydev))
-		goto no_resume;
-
-	ret = phy_resume(phydev);
-	if (ret < 0)
-		return ret;
-
-no_resume:
-	if (phydev->attached_dev && phydev->adjust_link)
-		phy_start_machine(phydev);
+	if (phy->mdio_pm_ops && phy->mdio_pm_ops->resume)
+		return phy->mdio_pm_ops->resume(dev);
 
 	return 0;
 }
 
 static int mdio_bus_restore(struct device *dev)
 {
-	struct phy_device *phydev = to_phy_device(dev);
-	struct net_device *netdev = phydev->attached_dev;
-	int ret;
+	struct phy_device *phy = to_phy_device(dev);
 
-	if (!netdev)
-		return 0;
-
-	ret = phy_init_hw(phydev);
-	if (ret < 0)
-		return ret;
-
-	/* The PHY needs to renegotiate. */
-	phydev->link = 0;
-	phydev->state = PHY_UP;
-
-	phy_start_machine(phydev);
+	if (phy->mdio_pm_ops && phy->mdio_pm_ops->restore)
+		return phy->mdio_pm_ops->restore(dev);
 
 	return 0;
 }

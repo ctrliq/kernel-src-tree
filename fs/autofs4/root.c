@@ -281,8 +281,11 @@ static int autofs4_mount_wait(const struct path *path, bool rcu_walk)
 		pr_debug("waiting for mount name=%pd\n", path->dentry);
 		status = autofs4_wait(sbi, path, NFY_MOUNT);
 		pr_debug("mount wait done status=%d\n", status);
+		ino->last_used = jiffies;
+		return status;
 	}
-	ino->last_used = jiffies;
+	if (!(sbi->flags & AUTOFS_SBI_STRICTEXPIRE))
+		ino->last_used = jiffies;
 	return status;
 }
 
@@ -516,7 +519,8 @@ static struct dentry *autofs4_lookup(struct inode *dir,
 	sbi = autofs4_sbi(dir->i_sb);
 
 	pr_debug("pid = %u, pgrp = %u, catatonic = %d, oz_mode = %d\n",
-		 current->pid, task_pgrp_nr(current), sbi->catatonic,
+		 current->pid, task_pgrp_nr(current),
+		 sbi->flags & AUTOFS_SBI_CATATONIC,
 		 autofs4_oz_mode(sbi));
 
 	active = autofs4_lookup_active(dentry);
@@ -563,6 +567,13 @@ static int autofs4_dir_symlink(struct inode *dir,
 	pr_debug("%s <- %pd\n", symname, dentry);
 
 	if (!autofs4_oz_mode(sbi))
+		return -EACCES;
+
+	/* autofs4_oz_mode() needs to allow path walks when the
+	 * autofs mount is catatonic but the state of an autofs
+	 * file system needs to be preserved over restarts.
+	 */
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
 		return -EACCES;
 
 	BUG_ON(!ino);
@@ -618,9 +629,15 @@ static int autofs4_dir_unlink(struct inode *dir, struct dentry *dentry)
 	struct autofs_info *ino = autofs4_dentry_ino(dentry);
 	struct autofs_info *p_ino;
 
-	/* This allows root to remove symlinks */
-	if (!autofs4_oz_mode(sbi) && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
+	if (!autofs4_oz_mode(sbi))
+		return -EACCES;
+
+	/* autofs4_oz_mode() needs to allow path walks when the
+	 * autofs mount is catatonic but the state of an autofs
+	 * file system needs to be preserved over restarts.
+	 */
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
+		return -EACCES;
 
 	if (atomic_dec_and_test(&ino->count)) {
 		p_ino = autofs4_dentry_ino(dentry->d_parent);
@@ -703,6 +720,13 @@ static int autofs4_dir_rmdir(struct inode *dir, struct dentry *dentry)
 	if (!autofs4_oz_mode(sbi))
 		return -EACCES;
 
+	/* autofs4_oz_mode() needs to allow path walks when the
+	 * autofs mount is catatonic but the state of an autofs
+	 * file system needs to be preserved over restarts.
+	 */
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
+		return -EACCES;
+
 	spin_lock(&sbi->lookup_lock);
 	if (!simple_empty(dentry)) {
 		spin_unlock(&sbi->lookup_lock);
@@ -739,6 +763,13 @@ static int autofs4_dir_mkdir(struct inode *dir,
 	struct inode *inode;
 
 	if (!autofs4_oz_mode(sbi))
+		return -EACCES;
+
+	/* autofs4_oz_mode() needs to allow path walks when the
+	 * autofs mount is catatonic but the state of an autofs
+	 * file system needs to be preserved over restarts.
+	 */
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
 		return -EACCES;
 
 	pr_debug("dentry %p, creating %pd\n", dentry, dentry);

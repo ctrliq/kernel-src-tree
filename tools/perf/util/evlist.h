@@ -6,7 +6,6 @@
 #include <linux/refcount.h>
 #include <linux/list.h>
 #include <api/fd/array.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include "../perf.h"
 #include "event.h"
@@ -301,6 +300,9 @@ void perf_evlist__set_tracking_event(struct perf_evlist *evlist,
 				     struct perf_evsel *tracking_evsel);
 
 void perf_event_attr__set_max_precise_ip(struct perf_event_attr *attr);
+
+struct perf_evsel *
+perf_evlist__find_evsel_by_str(struct perf_evlist *evlist, const char *str);
 
 struct perf_evsel *perf_evlist__event2evsel(struct perf_evlist *evlist,
 					    union perf_event *event);

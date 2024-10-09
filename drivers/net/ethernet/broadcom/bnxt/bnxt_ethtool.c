@@ -433,8 +433,10 @@ static void bnxt_get_ethtool_stats(struct net_device *dev,
 	struct bnxt *bp = netdev_priv(dev);
 	u32 stat_fields = sizeof(struct ctx_hw_stats) / 8;
 
-	if (!bp->bnapi)
-		return;
+	if (!bp->bnapi) {
+		j += BNXT_NUM_STATS * bp->cp_nr_rings + BNXT_NUM_SW_FUNC_STATS;
+		goto skip_ring_stats;
+	}
 
 	for (i = 0; i < BNXT_NUM_SW_FUNC_STATS; i++)
 		bnxt_sw_func_stats[i].counter = 0;
@@ -459,6 +461,7 @@ static void bnxt_get_ethtool_stats(struct net_device *dev,
 	for (i = 0; i < BNXT_NUM_SW_FUNC_STATS; i++, j++)
 		buf[j] = bnxt_sw_func_stats[i].counter;
 
+skip_ring_stats:
 	if (bp->flags & BNXT_FLAG_PORT_STATS) {
 		__le64 *port_stats = (__le64 *)bp->hw_rx_port_stats;
 
@@ -2653,11 +2656,11 @@ static int bnxt_hwrm_phy_loopback(struct bnxt *bp, bool enable, bool ext)
 	return hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
 }
 
-static int bnxt_rx_loopback(struct bnxt *bp, struct bnxt_napi *bnapi,
+static int bnxt_rx_loopback(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
 			    u32 raw_cons, int pkt_size)
 {
-	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
-	struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
+	struct bnxt_napi *bnapi = cpr->bnapi;
+	struct bnxt_rx_ring_info *rxr;
 	struct bnxt_sw_rx_bd *rx_buf;
 	struct rx_cmp *rxcmp;
 	u16 cp_cons, cons;
@@ -2665,6 +2668,7 @@ static int bnxt_rx_loopback(struct bnxt *bp, struct bnxt_napi *bnapi,
 	u32 len;
 	int i;
 
+	rxr = bnapi->rx_ring;
 	cp_cons = RING_CMP(raw_cons);
 	rxcmp = (struct rx_cmp *)
 		&cpr->cp_desc_ring[CP_RING(cp_cons)][CP_IDX(cp_cons)];
@@ -2685,17 +2689,15 @@ static int bnxt_rx_loopback(struct bnxt *bp, struct bnxt_napi *bnapi,
 	return 0;
 }
 
-static int bnxt_poll_loopback(struct bnxt *bp, int pkt_size)
+static int bnxt_poll_loopback(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+			      int pkt_size)
 {
-	struct bnxt_napi *bnapi = bp->bnapi[0];
-	struct bnxt_cp_ring_info *cpr;
 	struct tx_cmp *txcmp;
 	int rc = -EIO;
 	u32 raw_cons;
 	u32 cons;
 	int i;
 
-	cpr = &bnapi->cp_ring;
 	raw_cons = cpr->cp_raw_cons;
 	for (i = 0; i < 200; i++) {
 		cons = RING_CMP(raw_cons);
@@ -2711,7 +2713,7 @@ static int bnxt_poll_loopback(struct bnxt *bp, int pkt_size)
 		 */
 		dma_rmb();
 		if (TX_CMP_TYPE(txcmp) == CMP_TYPE_RX_L2_CMP) {
-			rc = bnxt_rx_loopback(bp, bnapi, raw_cons, pkt_size);
+			rc = bnxt_rx_loopback(bp, cpr, raw_cons, pkt_size);
 			raw_cons = NEXT_RAW_CMP(raw_cons);
 			raw_cons = NEXT_RAW_CMP(raw_cons);
 			break;
@@ -2725,12 +2727,17 @@ static int bnxt_poll_loopback(struct bnxt *bp, int pkt_size)
 static int bnxt_run_loopback(struct bnxt *bp)
 {
 	struct bnxt_tx_ring_info *txr = &bp->tx_ring[0];
+	struct bnxt_rx_ring_info *rxr = &bp->rx_ring[0];
+	struct bnxt_cp_ring_info *cpr;
 	int pkt_size, i = 0;
 	struct sk_buff *skb;
 	dma_addr_t map;
 	u8 *data;
 	int rc;
 
+	cpr = &rxr->bnapi->cp_ring;
+	if (bp->flags & BNXT_FLAG_CHIP_P5)
+		cpr = cpr->cp_ring_arr[BNXT_RX_HDL];
 	pkt_size = min(bp->dev->mtu + ETH_HLEN, bp->rx_copy_thresh);
 	skb = netdev_alloc_skb(bp->dev, pkt_size);
 	if (!skb)
@@ -2754,8 +2761,8 @@ static int bnxt_run_loopback(struct bnxt *bp)
 	/* Sync BD data before updating doorbell */
 	wmb();
 
-	bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | txr->tx_prod);
-	rc = bnxt_poll_loopback(bp, pkt_size);
+	bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
+	rc = bnxt_poll_loopback(bp, cpr, pkt_size);
 
 	dma_unmap_single(&bp->pdev->dev, map, pkt_size, PCI_DMA_TODEVICE);
 	dev_kfree_skb(skb);
@@ -3083,11 +3090,11 @@ bnxt_fill_coredump_record(struct bnxt *bp, struct bnxt_coredump_record *record,
 			  time64_t start, s16 start_utc, u16 total_segs,
 			  int status)
 {
-	time64_t end = ktime_get_real_seconds();
+	time64_t end = get_seconds();
 	u32 os_ver_major = 0, os_ver_minor = 0;
 	struct tm tm;
 
-	time64_to_tm(start, 0, &tm);
+	time_to_tm(start, 0, &tm);
 	memset(record, 0, sizeof(*record));
 	memcpy(record->signature, "cOrE", 4);
 	record->flags = 0;
@@ -3111,7 +3118,7 @@ bnxt_fill_coredump_record(struct bnxt *bp, struct bnxt_coredump_record *record,
 	record->os_ver_minor = cpu_to_le32(os_ver_minor);
 
 	strlcpy(record->os_name, utsname()->sysname, 32);
-	time64_to_tm(end, 0, &tm);
+	time_to_tm(end, 0, &tm);
 	record->end_year = cpu_to_le16(tm.tm_year + 1900);
 	record->end_month = cpu_to_le16(tm.tm_mon + 1);
 	record->end_day = cpu_to_le16(tm.tm_mday);
@@ -3139,7 +3146,7 @@ static int bnxt_get_coredump(struct bnxt *bp, void *buf, u32 *dump_len)
 	u16 start_utc;
 	int rc = 0, i;
 
-	start_time = ktime_get_real_seconds();
+	start_time = get_seconds();
 	start_utc = sys_tz.tz_minuteswest * 60;
 	seg_hdr_len = sizeof(seg_hdr);
 

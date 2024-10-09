@@ -143,11 +143,12 @@ struct rt6_info {
 	RH_KABI_EXTEND(struct list_head			rt6i_uncached)
 	RH_KABI_EXTEND(struct uncached_list		*rt6i_uncached_list)
 	RH_KABI_EXTEND(struct rt6_info * __percpu	*rt6i_pcpu)
+	RH_KABI_EXTEND(unsigned long last_probe)
 
 	/* kABI: use these reserved fields to add new items; the structure
 	 * can't be further extended after we whitelist fib_rules_register.
 	 */
-	RH_KABI_EXTEND(u64        rh_reserved[4])
+	RH_KABI_EXTEND(u64        rh_reserved[3])
 };
 
 static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)

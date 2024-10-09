@@ -10,6 +10,7 @@
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
 #include <linux/preempt.h>
+#include <linux/preempt_mask.h>
 
 struct worker_pool;
 

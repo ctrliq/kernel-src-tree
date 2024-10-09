@@ -44,6 +44,7 @@ struct event_file_link {
 	(offsetof(struct trace_kprobe, tp.args) +	\
 	(sizeof(struct probe_arg) * (n)))
 
+DEFINE_PER_CPU(int, bpf_kprobe_override);
 
 static __kprobes bool trace_kprobe_is_return(struct trace_kprobe *tk)
 {
@@ -76,6 +77,12 @@ static __kprobes bool trace_kprobe_within_module(struct trace_kprobe *tk,
 static __kprobes bool trace_kprobe_is_on_module(struct trace_kprobe *tk)
 {
 	return !!strchr(trace_kprobe_symbol(tk), ':');
+}
+
+int trace_kprobe_ftrace(struct ftrace_event_call *call)
+{
+	struct trace_kprobe *tk = (struct trace_kprobe *)call->rh_data->data;
+	return kprobe_ftrace(&tk->rp.kp);
 }
 
 static int register_kprobe_event(struct trace_kprobe *tk);
@@ -1146,7 +1153,7 @@ static int kretprobe_event_define_fields(struct ftrace_event_call *event_call)
 #ifdef CONFIG_PERF_EVENTS
 
 /* Kprobe profile handler */
-static __kprobes void
+static __kprobes int
 kprobe_perf_func(struct trace_kprobe *tk, struct pt_regs *regs)
 {
 	struct ftrace_event_call *call = &tk->tp.call;
@@ -1155,8 +1162,29 @@ kprobe_perf_func(struct trace_kprobe *tk, struct pt_regs *regs)
 	int size, __size, dsize;
 	int rctx;
 
-	if (bpf_prog_array_valid(call) && !trace_call_bpf(call, regs))
-		return;
+	if (bpf_prog_array_valid(call)) {
+		int ret;
+
+		ret = trace_call_bpf(call, regs);
+
+		/*
+		 * We need to check and see if we modified the pc of the
+		 * pt_regs, and if so clear the kprobe and return 1 so that we
+		 * don't do the instruction skipping.  Also reset our state so
+		 * we are clean the next pass through.
+		 */
+		if (__this_cpu_read(bpf_kprobe_override)) {
+			__this_cpu_write(bpf_kprobe_override, 0);
+			reset_current_kprobe();
+			return 1;
+		}
+		if (!ret)
+			return 0;
+	}
+
+	head = this_cpu_ptr(call->perf_events);
+	if (hlist_empty(head))
+		return 0;
 
 	dsize = __get_data_size(&tk->tp, regs);
 	__size = sizeof(*entry) + tk->tp.size + dsize;
@@ -1164,19 +1192,18 @@ kprobe_perf_func(struct trace_kprobe *tk, struct pt_regs *regs)
 	size -= sizeof(u32);
 	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE,
 		     "profile buffer not large enough"))
-		return;
+		return 0;
 
 	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
 	if (!entry)
-		return;
+		return 0;
 
 	entry->ip = (unsigned long)tk->rp.kp.addr;
 	memset(&entry[1], 0, dsize);
 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
-
-	head = this_cpu_ptr(call->perf_events);
 	perf_trace_buf_submit(entry, size, rctx,
 					entry->ip, 1, regs, head, NULL);
+	return 0;
 }
 
 /* Kretprobe profile handler */
@@ -1191,6 +1218,10 @@ kretprobe_perf_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
 	int rctx;
 
 	if (bpf_prog_array_valid(call) && !trace_call_bpf(call, regs))
+		return;
+
+	head = this_cpu_ptr(call->perf_events);
+	if (hlist_empty(head))
 		return;
 
 	dsize = __get_data_size(&tk->tp, regs);
@@ -1208,8 +1239,6 @@ kretprobe_perf_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
 	entry->func = (unsigned long)tk->rp.kp.addr;
 	entry->ret_ip = (unsigned long)ri->ret_addr;
 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
-
-	head = this_cpu_ptr(call->perf_events);
 	perf_trace_buf_submit(entry, size, rctx,
 					entry->ret_ip, 1, regs, head, NULL);
 }
@@ -1253,6 +1282,7 @@ static __kprobes
 int kprobe_dispatcher(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct trace_kprobe *tk = container_of(kp, struct trace_kprobe, rp.kp);
+	int ret = 0;
 
 	tk->nhit++;
 
@@ -1260,9 +1290,9 @@ int kprobe_dispatcher(struct kprobe *kp, struct pt_regs *regs)
 		kprobe_trace_func(tk, regs);
 #ifdef CONFIG_PERF_EVENTS
 	if (tk->tp.flags & TP_FLAG_PROFILE)
-		kprobe_perf_func(tk, regs);
+		ret = kprobe_perf_func(tk, regs);
 #endif
-	return 0;	/* We don't tweek kernel, so just return 0 */
+	return ret;
 }
 
 static __kprobes

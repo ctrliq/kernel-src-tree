@@ -642,7 +642,11 @@ handle_percpu_irq(unsigned int irq, struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
 
-	kstat_incr_irqs_this_cpu(irq, desc);
+	/*
+	 * PER CPU interrupts are not serialized. Do not touch
+	 * desc->tot_count.
+	 */
+	__kstat_incr_irqs_this_cpu(irq, desc);
 
 	if (chip->irq_ack)
 		chip->irq_ack(&desc->irq_data);
@@ -672,7 +676,11 @@ void handle_percpu_devid_irq(unsigned int irq, struct irq_desc *desc)
 	void *dev_id = __this_cpu_ptr(action->percpu_dev_id);
 	irqreturn_t res;
 
-	kstat_incr_irqs_this_cpu(irq, desc);
+	/*
+	 * PER CPU interrupts are not serialized. Do not touch
+	 * desc->tot_count.
+	 */
+	__kstat_incr_irqs_this_cpu(irq, desc);
 
 	if (chip->irq_ack)
 		chip->irq_ack(&desc->irq_data);

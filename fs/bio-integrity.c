@@ -437,6 +437,8 @@ int bio_integrity_prep(struct bio *bio)
 	/* Auto-generate integrity metadata if this is a write */
 	if (bio_data_dir(bio) == WRITE)
 		bio_integrity_generate(bio);
+	else
+		bip->saved_bi_idx = bio->bi_idx;
 
 	return 0;
 }
@@ -504,6 +506,8 @@ static void bio_integrity_verify_fn(struct work_struct *work)
 	struct bio *bio = bip->bip_bio;
 	int error;
 
+	/* rewind the bio */
+	bio->bi_idx = bip->saved_bi_idx;
 	error = bio_integrity_verify(bio);
 
 	/* Restore original bio completion handler */

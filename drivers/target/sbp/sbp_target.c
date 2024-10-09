@@ -210,7 +210,7 @@ static struct sbp_session *sbp_session_create(
 	INIT_DELAYED_WORK(&sess->maint_work, session_maintenance_work);
 	sess->guid = guid;
 
-	sess->se_sess = target_alloc_session(&tpg->se_tpg, 128,
+	sess->se_sess = target_setup_session(&tpg->se_tpg, 128,
 					     sizeof(struct sbp_target_request),
 					     TARGET_PROT_NORMAL, guid_str,
 					     sess, NULL);
@@ -236,8 +236,7 @@ static void sbp_session_release(struct sbp_session *sess, bool cancel_work)
 	if (cancel_work)
 		cancel_delayed_work_sync(&sess->maint_work);
 
-	transport_deregister_session_configfs(sess->se_sess);
-	transport_deregister_session(sess->se_sess);
+	target_remove_session(sess->se_sess);
 
 	if (sess->card)
 		fw_card_put(sess->card);
@@ -1695,11 +1694,6 @@ static int sbp_check_false(struct se_portal_group *se_tpg)
 	return 0;
 }
 
-static char *sbp_get_fabric_name(void)
-{
-	return "sbp";
-}
-
 static char *sbp_get_fabric_wwn(struct se_portal_group *se_tpg)
 {
 	struct sbp_tpg *tpg = container_of(se_tpg, struct sbp_tpg, se_tpg);
@@ -2330,8 +2324,7 @@ static struct configfs_attribute *sbp_tpg_attrib_attrs[] = {
 
 static const struct target_core_fabric_ops sbp_ops = {
 	.module				= THIS_MODULE,
-	.name				= "sbp",
-	.get_fabric_name		= sbp_get_fabric_name,
+	.fabric_name			= "sbp",
 	.tpg_get_wwn			= sbp_get_fabric_wwn,
 	.tpg_get_tag			= sbp_get_tag,
 	.tpg_check_demo_mode		= sbp_check_true,

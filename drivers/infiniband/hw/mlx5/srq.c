@@ -144,7 +144,7 @@ static int create_srq_user(struct ib_pd *pd, struct mlx5_ib_srq *srq,
 
 	in->log_page_size = page_shift - MLX5_ADAPTER_PAGE_SHIFT;
 	in->page_offset = offset;
-	in->uid = to_mpd(pd)->uid;
+	in->uid = (in->type != IB_SRQT_XRC) ?  to_mpd(pd)->uid : 0;
 	if (MLX5_CAP_GEN(dev->mdev, cqe_version) == MLX5_CQE_VERSION_V1 &&
 	    in->type != IB_SRQT_BASIC)
 		in->user_index = uidx;
@@ -447,8 +447,8 @@ void mlx5_ib_free_srq_wqe(struct mlx5_ib_srq *srq, int wqe_index)
 	spin_unlock(&srq->lock);
 }
 
-int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, struct ib_recv_wr *wr,
-			  struct ib_recv_wr **bad_wr)
+int mlx5_ib_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
+			  const struct ib_recv_wr **bad_wr)
 {
 	struct mlx5_ib_srq *srq = to_msrq(ibsrq);
 	struct mlx5_wqe_srq_next_seg *next;

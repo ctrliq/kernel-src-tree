@@ -584,6 +584,7 @@ const struct nla_policy rtm_ipv4_policy[RTA_MAX + 1] = {
 	[RTA_FLOW]		= { .type = NLA_U32 },
 	[RTA_ENCAP_TYPE]	= { .type = NLA_U16 },
 	[RTA_ENCAP]		= { .type = NLA_NESTED },
+	[RTA_MARK]		= { .type = NLA_U32 },
 };
 
 static int rtm_to_fib_config(struct net *net, struct sk_buff *skb,
@@ -1123,6 +1124,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, 
 static int fib_netdev_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct netdev_notifier_info_ext *info_ext = ptr;
 	struct in_device *in_dev;
 	struct net *net = dev_net(dev);
 
@@ -1150,8 +1152,11 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 	case NETDEV_DOWN:
 		fib_disable_ip(dev, 0);
 		break;
-	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGE:
+		rt_cache_flush(net);
+		break;
+	case NETDEV_CHANGEMTU:
+		fib_sync_mtu(dev, info_ext->ext.mtu);
 		rt_cache_flush(net);
 		break;
 	}
@@ -1198,16 +1203,19 @@ err_table_hash_alloc:
 
 static void ip_fib_net_exit(struct net *net)
 {
-	unsigned int i;
+	int i;
 
 	rtnl_lock();
-
 #ifdef CONFIG_IP_MULTIPLE_TABLES
 	RCU_INIT_POINTER(net->ipv4.fib_main, NULL);
 	RCU_INIT_POINTER(net->ipv4.fib_default, NULL);
 #endif
-
-	for (i = 0; i < FIB_TABLE_HASHSZ; i++) {
+	/* Destroy the tables in reverse order to guarantee that the
+	 * local table, ID 255, is destroyed before the main table, ID
+	 * 254. This is necessary as the local table may contain
+	 * references to data contained in the main table.
+	 */
+	for (i = FIB_TABLE_HASHSZ - 1; i >= 0; i--) {
 		struct hlist_head *head = &net->ipv4.fib_table_hash[i];
 		struct hlist_node *tmp;
 		struct fib_table *tb;

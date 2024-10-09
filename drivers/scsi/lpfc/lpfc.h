@@ -335,6 +335,18 @@ enum hba_state {
 	LPFC_HBA_ERROR       =  -1
 };
 
+struct lpfc_trunk_link_state {
+	enum hba_state state;
+	uint8_t fault;
+};
+
+struct lpfc_trunk_link  {
+	struct lpfc_trunk_link_state link0,
+				     link1,
+				     link2,
+				     link3;
+};
+
 struct lpfc_vport {
 	struct lpfc_hba *phba;
 	struct list_head listentry;
@@ -584,6 +596,25 @@ struct lpfc_mbox_ext_buf_ctx {
 	struct list_head ext_dmabuf_list;
 };
 
+struct lpfc_ras_fwlog {
+	uint8_t *fwlog_buff;
+	uint32_t fw_buffcount; /* Buffer size posted to FW */
+#define LPFC_RAS_BUFF_ENTERIES  16      /* Each entry can hold max of 64k */
+#define LPFC_RAS_MAX_ENTRY_SIZE (64 * 1024)
+#define LPFC_RAS_MIN_BUFF_POST_SIZE (256 * 1024)
+#define LPFC_RAS_MAX_BUFF_POST_SIZE (1024 * 1024)
+	uint32_t fw_loglevel; /* Log level set */
+	struct lpfc_dmabuf lwpd;
+	struct list_head fwlog_buff_list;
+
+	/* RAS support status on adapter */
+	bool ras_hwsupport; /* RAS Support available on HW or not */
+	bool ras_enabled;   /* Ras Enabled for the function */
+#define LPFC_RAS_DISABLE_LOGGING 0x00
+#define LPFC_RAS_ENABLE_LOGGING 0x01
+	bool ras_active;    /* RAS logging running state */
+};
+
 struct lpfc_hba {
 	/* SCSI interface function jump table entries */
 	int (*lpfc_new_scsi_buf)
@@ -665,6 +696,7 @@ struct lpfc_hba {
 	uint32_t iocb_cmd_size;
 	uint32_t iocb_rsp_size;
 
+	struct lpfc_trunk_link  trunk_link;
 	enum hba_state link_state;
 	uint32_t link_flag;	/* link state flags */
 #define LS_LOOPBACK_MODE      0x1	/* NPort is in Loopback mode */
@@ -836,6 +868,9 @@ struct lpfc_hba {
 #define LPFC_FDMI_SUPPORT	1	/* FDMI supported? */
 	uint32_t cfg_enable_SmartSAN;
 	uint32_t cfg_enable_mds_diags;
+	uint32_t cfg_ras_fwlog_level;
+	uint32_t cfg_ras_fwlog_buffsize;
+	uint32_t cfg_ras_fwlog_func;
 	uint32_t cfg_enable_fc4_type;
 	uint32_t cfg_enable_bbcr;	/* Enable BB Credit Recovery */
 	uint32_t cfg_enable_dpp;	/* Enable Direct Packet Push */
@@ -1102,6 +1137,9 @@ struct lpfc_hba {
 	struct list_head ct_ev_waiters;
 	struct unsol_rcv_ct_ctx ct_ctx[LPFC_CT_CTX_MAX];
 	uint32_t ctx_idx;
+
+	/* RAS Support */
+	struct lpfc_ras_fwlog ras_fwlog;
 
 	uint8_t menlo_flag;	/* menlo generic flags */
 #define HBA_MENLO_SUPPORT	0x1 /* HBA supports menlo commands */

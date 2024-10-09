@@ -410,6 +410,8 @@ extern void part_round_stats(struct request_queue *q, int cpu, struct hd_struct 
 /* block/genhd.c */
 extern void add_disk(struct gendisk *disk);
 extern void add_disk_no_queue_reg(struct gendisk *disk);
+extern void add_disk_with_attributes(struct gendisk *disk,
+                const struct attribute_group **groups);
 extern void del_gendisk(struct gendisk *gp);
 extern struct gendisk *get_gendisk(dev_t dev, int *partno);
 extern struct block_device *bdget_disk(struct gendisk *disk, int partno);

@@ -14,6 +14,7 @@
  * @target:	the target extension
  * @matchinfo:	per-match data
  * @targetinfo:	per-target data
+ * @net		network namespace through which the action was invoked
  * @in:		input netdevice
  * @out:	output netdevice
  * @fragoff:	packet is a fragment, this is the data offset
@@ -25,7 +26,6 @@
  * Fields written to by extensions:
  *
  * @hotdrop:	drop packet if we had inspection problems
- * Network namespace obtainable using dev_net(in/out)
  */
 struct xt_action_param {
 	union {
@@ -41,7 +41,43 @@ struct xt_action_param {
 	unsigned int hooknum;
 	u_int8_t family;
 	bool hotdrop;
+	RH_KABI_EXTEND(struct net *net)
 };
+
+static inline struct net *xt_net(const struct xt_action_param *par)
+{
+	return par->net;
+}
+
+static inline const struct net_device *xt_in(const struct xt_action_param *par)
+{
+	return par->in;
+}
+
+static inline const char *xt_inname(const struct xt_action_param *par)
+{
+	return par->in->name;
+}
+
+static inline const struct net_device *xt_out(const struct xt_action_param *par)
+{
+	return par->out;
+}
+
+static inline const char *xt_outname(const struct xt_action_param *par)
+{
+	return par->out->name;
+}
+
+static inline unsigned int xt_hooknum(const struct xt_action_param *par)
+{
+	return par->hooknum;
+}
+
+static inline u_int8_t xt_family(const struct xt_action_param *par)
+{
+	return par->family;
+}
 
 /**
  * struct xt_mtchk_param - parameters for match extensions'
@@ -252,6 +288,8 @@ int xt_check_entry_offsets(const void *base, const char *elems,
 unsigned int *xt_alloc_entry_offsets(unsigned int size);
 bool xt_find_jump_offset(const unsigned int *offsets,
 			 unsigned int target, unsigned int size);
+
+int xt_check_proc_name(const char *name, unsigned int size);
 
 int xt_check_match(struct xt_mtchk_param *, unsigned int size, u_int8_t proto,
 		   bool inv_proto);

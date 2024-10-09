@@ -314,9 +314,19 @@ void wait_rcu_gp(call_rcu_func_t crf);
  * initialization.
  */
 #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
-extern void init_rcu_head_on_stack(struct rcu_head *head);
-extern void destroy_rcu_head_on_stack(struct rcu_head *head);
+void init_rcu_head(struct rcu_head *head);
+void destroy_rcu_head(struct rcu_head *head);
+void init_rcu_head_on_stack(struct rcu_head *head);
+void destroy_rcu_head_on_stack(struct rcu_head *head);
 #else /* !CONFIG_DEBUG_OBJECTS_RCU_HEAD */
+static inline void init_rcu_head(struct rcu_head *head)
+{
+}
+
+static inline void destroy_rcu_head(struct rcu_head *head)
+{
+}
+
 static inline void init_rcu_head_on_stack(struct rcu_head *head)
 {
 }
@@ -578,21 +588,6 @@ static inline void rcu_preempt_sleep_check(void)
 		smp_wmb(); \
 		(p) = (typeof(*v) __force space *)(v); \
 	} while (0)
-
-/**
- * lockless_dereference() - safely load a pointer for later dereference
- * @p: The pointer to load
- *
- * Similar to rcu_dereference(), but for situations where the pointed-to
- * object's lifetime is managed by something other than RCU.  That
- * "something other" might be reference counting or simple immortality.
- */
-#define lockless_dereference(p) \
-({ \
-	typeof(p) _________p1 = ACCESS_ONCE(p); \
-	smp_read_barrier_depends(); /* Dependency order vs. p above. */ \
-	(_________p1); \
-})
 
 /**
  * rcu_access_pointer() - fetch RCU pointer with no dereferencing

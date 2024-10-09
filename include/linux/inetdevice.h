@@ -27,11 +27,9 @@ enum
 	IPV4_DEVCONF_TAG,
 	IPV4_DEVCONF_ARPFILTER,
 	IPV4_DEVCONF_MEDIUM_ID,
-	IPV4_DEVCONF_FORCE_IGMP_VERSION,
-	IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL,
-	IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL,
 	IPV4_DEVCONF_NOXFRM,
 	IPV4_DEVCONF_NOPOLICY,
+	IPV4_DEVCONF_FORCE_IGMP_VERSION,
 	IPV4_DEVCONF_ARP_ANNOUNCE,
 	IPV4_DEVCONF_ARP_IGNORE,
 	IPV4_DEVCONF_PROMOTE_SECONDARIES,
@@ -46,10 +44,27 @@ enum
 
 #define IPV4_DEVCONF_MAX (__IPV4_DEVCONF_MAX - 1)
 
+/* Extra index values for ipv4_devconf, as the previous values are protected
+ * by KABI. Reserved some spaces for future usage. Please minus the reserved
+ * spaces when add new values.
+ */
+enum
+{
+	IPV4_DEVCONF_IGMPV2_UNSOLICITED_REPORT_INTERVAL = __IPV4_DEVCONF_MAX,
+	IPV4_DEVCONF_IGMPV3_UNSOLICITED_REPORT_INTERVAL,
+	__IPV4_DEVCONF_EXTRA_LAST,
+	__IPV4_DEVCONF_EXTRA_MAX = __IPV4_DEVCONF_MAX + 16,
+};
+
+#define IPV4_DEVCONF_EXTRA_LAST (__IPV4_DEVCONF_EXTRA_LAST - 1)
+#define IPV4_DEVCONF_EXTRA_MAX (__IPV4_DEVCONF_EXTRA_MAX - 1)
+
 struct ipv4_devconf {
 	void	*sysctl;
 	int	data[IPV4_DEVCONF_MAX];
 	DECLARE_BITMAP(state, IPV4_DEVCONF_MAX);
+	RH_KABI_EXTEND(int extra_data[IPV4_DEVCONF_EXTRA_MAX - IPV4_DEVCONF_MAX])
+	RH_KABI_EXTEND(DECLARE_BITMAP(extra_state, IPV4_DEVCONF_EXTRA_MAX - IPV4_DEVCONF_MAX))
 };
 
 struct in_device {
@@ -82,20 +97,30 @@ struct in_device {
 static inline int ipv4_devconf_get(struct in_device *in_dev, int index)
 {
 	index--;
-	return in_dev->cnf.data[index];
+	if (index < IPV4_DEVCONF_MAX)
+		return in_dev->cnf.data[index];
+	else
+		return in_dev->cnf.extra_data[index - IPV4_DEVCONF_MAX];
 }
 
 static inline void ipv4_devconf_set(struct in_device *in_dev, int index,
 				    int val)
 {
 	index--;
-	set_bit(index, in_dev->cnf.state);
-	in_dev->cnf.data[index] = val;
+	if (index < IPV4_DEVCONF_MAX) {
+		set_bit(index, in_dev->cnf.state);
+		in_dev->cnf.data[index] = val;
+	} else {
+		set_bit(index - IPV4_DEVCONF_MAX, in_dev->cnf.extra_state);
+		in_dev->cnf.extra_data[index - IPV4_DEVCONF_MAX] = val;
+	}
 }
 
 static inline void ipv4_devconf_setall(struct in_device *in_dev)
 {
 	bitmap_fill(in_dev->cnf.state, IPV4_DEVCONF_MAX);
+	bitmap_fill(in_dev->cnf.extra_state,
+		    IPV4_DEVCONF_EXTRA_MAX - IPV4_DEVCONF_MAX);
 }
 
 #define IN_DEV_CONF_GET(in_dev, attr) \
@@ -176,8 +201,15 @@ struct in_ifaddr {
 	unsigned long		ifa_tstamp; /* updated timestamp */
 };
 
+struct in_validator_info {
+	__be32			ivi_addr;
+	struct in_device	*ivi_dev;
+};
+
 int register_inetaddr_notifier(struct notifier_block *nb);
 int unregister_inetaddr_notifier(struct notifier_block *nb);
+int register_inetaddr_validator_notifier(struct notifier_block *nb);
+int unregister_inetaddr_validator_notifier(struct notifier_block *nb);
 
 void inet_netconf_notify_devconf(struct net *net, int type, int ifindex,
 				 struct ipv4_devconf *devconf);

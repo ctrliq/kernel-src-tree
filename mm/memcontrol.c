@@ -70,6 +70,9 @@ EXPORT_SYMBOL(mem_cgroup_subsys);
 #define MEM_CGROUP_RECLAIM_RETRIES	5
 static struct mem_cgroup *root_mem_cgroup __read_mostly;
 
+/* Kernel memory accounting disabled? */
+static bool cgroup_memory_nokmem;
+
 #ifdef CONFIG_MEMCG_SWAP
 /* Turned on only when memory cgroup is enabled && really_do_swap_account = 1 */
 int do_swap_account __read_mostly;
@@ -362,10 +365,10 @@ struct mem_cgroup {
 	struct tcp_memcontrol tcp_mem;
 #endif
 #if defined(CONFIG_MEMCG_KMEM)
-	/* analogous to slab_common's slab_caches list. per-memcg */
+	/* analogous to slab_common's slab_caches list, but per-memcg;
+	 * protected by memcg_slab_mutex */
 	struct list_head memcg_slab_caches;
-	/* Not a spinlock, we can take a lot of time walking the list */
-	struct mutex slab_caches_mutex;
+	RH_KABI_DEPRECATE(struct mutex, slab_caches_mutex)
         /* Index in the kmem_cache->memcg_params->memcg_caches array */
 	int kmemcg_id;
 #endif
@@ -653,7 +656,8 @@ static void disarm_kmem_keys(struct mem_cgroup *memcg)
 {
 	if (memcg_kmem_is_active(memcg)) {
 		static_key_slow_dec(&memcg_kmem_enabled_key);
-		ida_simple_remove(&kmem_limited_groups, memcg->kmemcg_id);
+		if (memcg->kmemcg_id >= 0)
+			ida_simple_remove(&kmem_limited_groups, memcg->kmemcg_id);
 	}
 	/*
 	 * This check can't live in kmem destruction function,
@@ -1155,6 +1159,69 @@ skip_node:
 	return NULL;
 }
 
+static void mem_cgroup_iter_invalidate(struct mem_cgroup *root)
+{
+	/*
+	 * When a group in the hierarchy below root is destroyed, the
+	 * hierarchy iterator can no longer be trusted since it might
+	 * have pointed to the destroyed group.  Invalidate it.
+	 */
+	atomic_inc(&root->dead_count);
+}
+
+static struct mem_cgroup *
+mem_cgroup_iter_load(struct mem_cgroup_reclaim_iter *iter,
+		     struct mem_cgroup *root,
+		     int *sequence)
+{
+	struct mem_cgroup *position = NULL;
+	/*
+	 * A cgroup destruction happens in two stages: offlining and
+	 * release.  They are separated by a RCU grace period.
+	 *
+	 * If the iterator is valid, we may still race with an
+	 * offlining.  The RCU lock ensures the object won't be
+	 * released, tryget will fail if we lost the race.
+	 */
+	*sequence = atomic_read(&root->dead_count);
+	if (iter->last_dead_count == *sequence) {
+		smp_rmb();
+		position = iter->last_visited;
+
+		/*
+		 * We cannot take a reference to root because we might race
+		 * with root removal and returning NULL would end up in
+		 * an endless loop on the iterator user level when root
+		 * would be returned all the time.
+		*/
+		if (position && position != root &&
+				!css_tryget(&position->css))
+
+			position = NULL;
+	}
+	return position;
+}
+
+static void mem_cgroup_iter_update(struct mem_cgroup_reclaim_iter *iter,
+				   struct mem_cgroup *last_visited,
+				   struct mem_cgroup *new_position,
+				   struct mem_cgroup *root,
+				   int sequence)
+{
+	/* root reference counting symmetric to mem_cgroup_iter_load */
+	if (last_visited && last_visited != root)
+		css_put(&last_visited->css);
+	/*
+	 * We store the sequence count from the time @last_visited was
+	 * loaded successfully instead of rereading it here so that we
+	 * don't lose destruction events in between.  We could have
+	 * raced with the destruction of @new_position after all.
+	 */
+	iter->last_visited = new_position;
+	smp_wmb();
+	iter->last_dead_count = sequence;
+}
+
 /**
  * mem_cgroup_iter - iterate over memory cgroup hierarchy
  * @root: hierarchy root
@@ -1178,7 +1245,6 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 {
 	struct mem_cgroup *memcg = NULL;
 	struct mem_cgroup *last_visited = NULL;
-	unsigned long uninitialized_var(dead_count);
 
 	if (mem_cgroup_disabled())
 		return NULL;
@@ -1198,6 +1264,7 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 	rcu_read_lock();
 	while (!memcg) {
 		struct mem_cgroup_reclaim_iter *uninitialized_var(iter);
+		int uninitialized_var(seq);
 
 		if (reclaim) {
 			int nid = zone_to_nid(reclaim->zone);
@@ -1211,37 +1278,14 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
 				goto out_unlock;
 			}
 
-			/*
-			 * If the dead_count mismatches, a destruction
-			 * has happened or is happening concurrently.
-			 * If the dead_count matches, a destruction
-			 * might still happen concurrently, but since
-			 * we checked under RCU, that destruction
-			 * won't free the object until we release the
-			 * RCU reader lock.  Thus, the dead_count
-			 * check verifies the pointer is still valid,
-			 * css_tryget() verifies the cgroup pointed to
-			 * is alive.
-			 */
-			dead_count = atomic_read(&root->dead_count);
-			if (dead_count == iter->last_dead_count) {
-				smp_rmb();
-				last_visited = iter->last_visited;
-				if (last_visited && last_visited != root &&
-				    !css_tryget(&last_visited->css))
-					last_visited = NULL;
-			}
+			last_visited = mem_cgroup_iter_load(iter, root, &seq);
 		}
 
 		memcg = __mem_cgroup_iter_next(root, last_visited);
 
 		if (reclaim) {
-			if (last_visited && last_visited != root)
-				css_put(&last_visited->css);
-
-			iter->last_visited = memcg;
-			smp_wmb();
-			iter->last_dead_count = dead_count;
+			mem_cgroup_iter_update(iter, last_visited, memcg, root,
+					seq);
 
 			if (!memcg)
 				iter->generation++;
@@ -2603,15 +2647,14 @@ static int mem_cgroup_do_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
 	struct mem_cgroup *mem_over_limit;
 	struct page_counter *counter;
 	unsigned long flags = 0;
-	int ret;
+	int ret = -ENOMEM;
 
-	ret = page_counter_try_charge(&memcg->memory, nr_pages, &counter);
-
-	if (likely(!ret)) {
+	if (likely(page_counter_try_charge(&memcg->memory, nr_pages,
+					   &counter))) {
 		if (!do_swap_account)
 			return CHARGE_OK;
-		ret = page_counter_try_charge(&memcg->memsw, nr_pages, &counter);
-		if (likely(!ret))
+		if (likely(page_counter_try_charge(&memcg->memsw, nr_pages,
+						   &counter)))
 			return CHARGE_OK;
 
 		page_counter_uncharge(&memcg->memory, nr_pages);
@@ -2953,9 +2996,16 @@ static void __mem_cgroup_commit_charge(struct mem_cgroup *memcg,
 }
 
 #ifdef CONFIG_MEMCG_KMEM
+/*
+ * The memcg_slab_mutex is held whenever a per memcg kmem cache is created or
+ * destroyed. It protects memcg_caches arrays and memcg_slab_caches lists.
+ */
+static DEFINE_MUTEX(memcg_slab_mutex);
+
 static inline bool memcg_can_account_kmem(struct mem_cgroup *memcg)
 {
-	return !mem_cgroup_disabled() && !mem_cgroup_is_root(memcg) &&
+	return !cgroup_memory_nokmem && !mem_cgroup_disabled() &&
+		!mem_cgroup_is_root(memcg) &&
 		memcg_kmem_is_active(memcg);
 }
 
@@ -2969,7 +3019,7 @@ static struct kmem_cache *memcg_params_to_cache(struct memcg_cache_params *p)
 
 	VM_BUG_ON(p->is_root_cache);
 	cachep = p->root_cache;
-	return cachep->memcg_params->memcg_caches[memcg_cache_id(p->memcg)];
+	return cache_from_memcg_idx(cachep, memcg_cache_id(p->memcg));
 }
 
 #ifdef CONFIG_SLABINFO
@@ -2984,10 +3034,10 @@ static int mem_cgroup_slabinfo_read(struct cgroup *cont, struct cftype *cft,
 
 	print_slabinfo_header(m);
 
-	mutex_lock(&memcg->slab_caches_mutex);
+	mutex_lock(&memcg_slab_mutex);
 	list_for_each_entry(params, &memcg->memcg_slab_caches, list)
 		cache_show(memcg_params_to_cache(params), m);
-	mutex_unlock(&memcg->slab_caches_mutex);
+	mutex_unlock(&memcg_slab_mutex);
 
 	return 0;
 }
@@ -3001,9 +3051,8 @@ static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
 	int ret = 0;
 	bool may_oom;
 
-	ret = page_counter_try_charge(&memcg->kmem, nr_pages, &counter);
-	if (ret < 0)
-		return ret;
+	if (!page_counter_try_charge(&memcg->kmem, nr_pages, &counter))
+		return -ENOMEM;
 
 	/*
 	 * Conditions under which we can wait for the oom_killer. Those are
@@ -3081,7 +3130,9 @@ static int memcg_update_cache_sizes(struct mem_cgroup *memcg)
 	if (num < 0)
 		return num;
 
+	mutex_lock(&memcg_slab_mutex);
 	ret = memcg_update_all_caches(num+1);
+	mutex_unlock(&memcg_slab_mutex);
 	if (ret) {
 		ida_simple_remove(&kmem_limited_groups, num);
 		return ret;
@@ -3089,7 +3140,6 @@ static int memcg_update_cache_sizes(struct mem_cgroup *memcg)
 
 	memcg->kmemcg_id = num;
 	INIT_LIST_HEAD(&memcg->memcg_slab_caches);
-	mutex_init(&memcg->slab_caches_mutex);
 	return 0;
 }
 
@@ -3119,8 +3169,6 @@ void memcg_update_array_size(int num)
 		memcg_limited_groups_array_size = memcg_caches_array_size(num);
 }
 
-static void kmem_cache_destroy_work_func(struct work_struct *w);
-
 int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 {
 	struct memcg_cache_params *cur_params = s->memcg_params;
@@ -3133,22 +3181,21 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 	 */
 	if (num_groups > memcg_limited_groups_array_size || !cur_params) {
 		int i;
+		struct memcg_cache_params *new_params;
 		ssize_t size = memcg_caches_array_size(num_groups);
 
 		size *= sizeof(void *);
 		size += sizeof(struct memcg_cache_params);
 
-		s->memcg_params = kzalloc(size, GFP_KERNEL);
-		if (!s->memcg_params) {
-			s->memcg_params = cur_params;
+		new_params = kzalloc(size, GFP_KERNEL);
+		if (!new_params)
 			return -ENOMEM;
-		}
 
-		s->memcg_params->is_root_cache = true;
+		new_params->is_root_cache = true;
 
 		/* if there was no kmem_cache->memcg_params, first time so we are done */
 		if (!cur_params)
-			return 0;
+			goto out;
 
 		/*
 		 * There is the chance it will be bigger than
@@ -3162,7 +3209,7 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 		for (i = 0; i < memcg_limited_groups_array_size; i++) {
 			if (!cur_params->memcg_caches[i])
 				continue;
-			s->memcg_params->memcg_caches[i] =
+			new_params->memcg_caches[i] =
 						cur_params->memcg_caches[i];
 		}
 
@@ -3175,9 +3222,31 @@ int memcg_update_cache_size(struct kmem_cache *s, int num_groups)
 		 * bigger than the others. And all updates will reset this
 		 * anyway.
 		 */
-		kfree(cur_params);
+out:
+		rcu_assign_pointer(s->memcg_params, new_params);
+		if (cur_params)
+			kfree_rcu(cur_params, rcu_head);
 	}
 	return 0;
+}
+
+char *memcg_create_cache_name(struct mem_cgroup *memcg,
+			      struct kmem_cache *root_cache)
+{
+	const char *name;
+
+	/*
+	 * We need a mutex here to protect the shared buffer. Since this is
+	 * expected to be called only on cache creation, we can employ the
+	 * slab_mutex for that purpose.
+	 */
+	lockdep_assert_held(&slab_mutex);
+
+	rcu_read_lock();
+	name = cgroup_name(memcg->css.cgroup);
+	rcu_read_unlock();
+	return kasprintf(GFP_KERNEL, "%s(%d:%s)", root_cache->name,
+			 memcg_cache_id(memcg), name);
 }
 
 int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
@@ -3198,8 +3267,6 @@ int memcg_alloc_cache_params(struct mem_cgroup *memcg, struct kmem_cache *s,
 	if (memcg) {
 		s->memcg_params->memcg = memcg;
 		s->memcg_params->root_cache = root_cache;
-		INIT_WORK(&s->memcg_params->destroy,
-				kmem_cache_destroy_work_func);
 	} else
 		s->memcg_params->is_root_cache = true;
 
@@ -3211,70 +3278,68 @@ void memcg_free_cache_params(struct kmem_cache *s)
 	kfree(s->memcg_params);
 }
 
-void memcg_register_cache(struct kmem_cache *s)
+static void memcg_kmem_create_cache(struct mem_cgroup *memcg,
+                                   struct kmem_cache *root_cache)
 {
-	struct kmem_cache *root;
-	struct mem_cgroup *memcg;
+	struct kmem_cache *cachep;
 	int id;
 
-	if (is_root_cache(s))
-		return;
+	lockdep_assert_held(&memcg_slab_mutex);
 
-	/*
-	 * Holding the slab_mutex assures nobody will touch the memcg_caches
-	 * array while we are modifying it.
-	 */
-	lockdep_assert_held(&slab_mutex);
-
-	root = s->memcg_params->root_cache;
-	memcg = s->memcg_params->memcg;
 	id = memcg_cache_id(memcg);
 
-	mutex_lock(&memcg->slab_caches_mutex);
-	list_add(&s->memcg_params->list, &memcg->memcg_slab_caches);
-	mutex_unlock(&memcg->slab_caches_mutex);
-
-	VM_BUG_ON(root->memcg_params->memcg_caches[id]);
-	root->memcg_params->memcg_caches[id] = s;
 	/*
-	 * the readers won't lock, make sure everybody sees the updated value,
-	 * so they won't put stuff in the queue again for no reason
+	 * Since per-memcg caches are created asynchronously on first
+	 * allocation (see memcg_kmem_get_cache()), several threads can try to
+	 * create the same cache, but only one of them may succeed.
 	 */
-	wmb();
+	if (cache_from_memcg_idx(root_cache, id))
+		return;
+
+	cachep = kmem_cache_create_memcg(memcg, root_cache);
+	/*
+	 * If we could not create a memcg cache, do not complain, because
+	 * that's not critical at all as we can always proceed with the root
+	 * cache.
+	 */
+	if (!cachep)
+		return;
+
+	list_add(&cachep->memcg_params->list, &memcg->memcg_slab_caches);
+
+	/*
+	 * Since readers won't lock (see cache_from_memcg_idx()), we need a
+	 * barrier here to ensure nobody will see the kmem_cache partially
+	 * initialized.
+	 */
+	smp_wmb();
+
+	BUG_ON(root_cache->memcg_params->memcg_caches[id]);
+	root_cache->memcg_params->memcg_caches[id] = cachep;
+
+	mem_cgroup_get(memcg);
 }
 
-void memcg_unregister_cache(struct kmem_cache *s)
+static void memcg_kmem_destroy_cache(struct kmem_cache *cachep)
 {
-	struct kmem_cache *root;
+	struct kmem_cache *root_cache;
 	struct mem_cgroup *memcg;
 	int id;
 
-	/*
-	 * This happens, for instance, when a root cache goes away before we
-	 * add any memcg.
-	 */
-	if (!s->memcg_params)
-		return;
+	lockdep_assert_held(&memcg_slab_mutex);
 
-	if (s->memcg_params->is_root_cache)
-		return;
+	BUG_ON(is_root_cache(cachep));
 
-	/*
-	 * Holding the slab_mutex assures nobody will touch the memcg_caches
-	 * array while we are modifying it.
-	 */
-	lockdep_assert_held(&slab_mutex);
-
-	memcg = s->memcg_params->memcg;
+	root_cache = cachep->memcg_params->root_cache;
+	memcg = cachep->memcg_params->memcg;
 	id  = memcg_cache_id(memcg);
 
-	root = s->memcg_params->root_cache;
-	VM_BUG_ON(!root->memcg_params->memcg_caches[id]);
-	root->memcg_params->memcg_caches[id] = NULL;
+	BUG_ON(root_cache->memcg_params->memcg_caches[id] != cachep);
+	root_cache->memcg_params->memcg_caches[id] = NULL;
 
-	mutex_lock(&memcg->slab_caches_mutex);
-	list_del(&s->memcg_params->list);
-	mutex_unlock(&memcg->slab_caches_mutex);
+	list_del(&cachep->memcg_params->list);
+
+	kmem_cache_destroy(cachep);
 
 	mem_cgroup_put(memcg);
 }
@@ -3310,139 +3375,6 @@ static inline void memcg_resume_kmem_account(void)
 	current->memcg_kmem_skip_account--;
 }
 
-static void kmem_cache_destroy_work_func(struct work_struct *w)
-{
-	struct kmem_cache *cachep;
-	struct memcg_cache_params *p;
-
-	p = container_of(w, struct memcg_cache_params, destroy);
-
-	cachep = memcg_params_to_cache(p);
-
-	/*
-	 * If we get down to 0 after shrink, we could delete right away.
-	 * However, memcg_release_pages() already puts us back in the workqueue
-	 * in that case. If we proceed deleting, we'll get a dangling
-	 * reference, and removing the object from the workqueue in that case
-	 * is unnecessary complication. We are not a fast path.
-	 *
-	 * Note that this case is fundamentally different from racing with
-	 * shrink_slab(): if memcg_cgroup_destroy_cache() is called in
-	 * kmem_cache_shrink, not only we would be reinserting a dead cache
-	 * into the queue, but doing so from inside the worker racing to
-	 * destroy it.
-	 *
-	 * So if we aren't down to zero, we'll just schedule a worker and try
-	 * again
-	 */
-	if (atomic_read(&cachep->memcg_params->nr_pages) != 0) {
-		kmem_cache_shrink(cachep);
-		if (atomic_read(&cachep->memcg_params->nr_pages) == 0)
-			return;
-	} else
-		kmem_cache_destroy(cachep);
-}
-
-void mem_cgroup_destroy_cache(struct kmem_cache *cachep)
-{
-	if (!cachep->memcg_params->dead)
-		return;
-
-	/*
-	 * There are many ways in which we can get here.
-	 *
-	 * We can get to a memory-pressure situation while the delayed work is
-	 * still pending to run. The vmscan shrinkers can then release all
-	 * cache memory and get us to destruction. If this is the case, we'll
-	 * be executed twice, which is a bug (the second time will execute over
-	 * bogus data). In this case, cancelling the work should be fine.
-	 *
-	 * But we can also get here from the worker itself, if
-	 * kmem_cache_shrink is enough to shake all the remaining objects and
-	 * get the page count to 0. In this case, we'll deadlock if we try to
-	 * cancel the work (the worker runs with an internal lock held, which
-	 * is the same lock we would hold for cancel_work_sync().)
-	 *
-	 * Since we can't possibly know who got us here, just refrain from
-	 * running if there is already work pending
-	 */
-	if (work_pending(&cachep->memcg_params->destroy))
-		return;
-	/*
-	 * We have to defer the actual destroying to a workqueue, because
-	 * we might currently be in a context that cannot sleep.
-	 */
-	schedule_work(&cachep->memcg_params->destroy);
-}
-
-/*
- * This lock protects updaters, not readers. We want readers to be as fast as
- * they can, and they will either see NULL or a valid cache value. Our model
- * allow them to see NULL, in which case the root memcg will be selected.
- *
- * We need this lock because multiple allocations to the same cache from a non
- * will span more than one worker. Only one of them can create the cache.
- */
-static DEFINE_MUTEX(memcg_cache_mutex);
-
-/*
- * Called with memcg_cache_mutex held
- */
-static struct kmem_cache *kmem_cache_dup(struct mem_cgroup *memcg,
-					 struct kmem_cache *s)
-{
-	struct kmem_cache *new;
-	static char *tmp_name = NULL;
-
-	lockdep_assert_held(&memcg_cache_mutex);
-
-	/*
-	 * kmem_cache_create_memcg duplicates the given name and
-	 * cgroup_name for this name requires RCU context.
-	 * This static temporary buffer is used to prevent from
-	 * pointless shortliving allocation.
-	 */
-	if (!tmp_name) {
-		tmp_name = kmalloc(PATH_MAX, GFP_KERNEL);
-		if (!tmp_name)
-			return NULL;
-	}
-
-	rcu_read_lock();
-	snprintf(tmp_name, PATH_MAX, "%s(%d:%s)", s->name,
-			 memcg_cache_id(memcg), cgroup_name(memcg->css.cgroup));
-	rcu_read_unlock();
-
-	new = kmem_cache_create_memcg(memcg, tmp_name, s->object_size, s->align,
-				      (s->flags & ~SLAB_PANIC), s->ctor, s);
-
-	if (new)
-		new->allocflags |= __GFP_KMEMCG;
-
-	return new;
-}
-
-static struct kmem_cache *memcg_create_kmem_cache(struct mem_cgroup *memcg,
-						  struct kmem_cache *cachep)
-{
-	struct kmem_cache *new_cachep;
-
-	BUG_ON(!memcg_can_account_kmem(memcg));
-
-	mutex_lock(&memcg_cache_mutex);
-
-	new_cachep = kmem_cache_dup(memcg, cachep);
-	if (new_cachep == NULL) {
-		new_cachep = cachep;
-		goto out;
-	}
-
-	mem_cgroup_get(memcg);
-out:
-	mutex_unlock(&memcg_cache_mutex);
-	return new_cachep;
-}
-
 static DEFINE_MUTEX(memcg_limit_mutex);
 
 int __kmem_cache_destroy_memcg_children(struct kmem_cache *s)
@@ -3450,43 +3382,37 @@ int __kmem_cache_destroy_memcg_children(struct kmem_cache *s)
 	struct kmem_cache *c;
 	int i, failed = 0;
 
-	/*
-	 * If the cache is being destroyed, we trust that there is no one else
-	 * requesting objects from it. Even if there are, the sanity checks in
-	 * kmem_cache_destroy should caught this ill-case.
-	 *
-	 * Still, we don't want anyone else freeing memcg_caches under our
-	 * noses, which can happen if a new memcg comes to life. As usual,
-	 * we'll take the memcg_limit_mutex to protect ourselves against this.
-	 */
-	mutex_lock(&memcg_limit_mutex);
-	for (i = 0; i < memcg_limited_groups_array_size; i++) {
-		c = s->memcg_params->memcg_caches[i];
+	mutex_lock(&memcg_slab_mutex);
+	for_each_memcg_cache_index(i) {
+		c = cache_from_memcg_idx(s, i);
 		if (!c)
 			continue;
 
-		/*
-		 * We will now manually delete the caches, so to avoid races
-		 * we need to cancel all pending destruction workers and
-		 * proceed with destruction ourselves.
-		 *
-		 * kmem_cache_destroy() will call kmem_cache_shrink internally,
-		 * and that could spawn the workers again: it is likely that
-		 * the cache still have active pages until this very moment.
-		 * This would lead us back to mem_cgroup_destroy_cache.
-		 *
-		 * But that will not execute at all if the "dead" flag is not
-		 * set, so flip it down to guarantee we are in control.
-		 */
-		c->memcg_params->dead = false;
-		cancel_work_sync(&c->memcg_params->destroy);
-		kmem_cache_destroy(c);
+		memcg_kmem_destroy_cache(c);
 
-		if (cache_from_memcg(s, i))
+		if (cache_from_memcg_idx(s, i))
 			failed++;
 	}
-	mutex_unlock(&memcg_limit_mutex);
+	mutex_unlock(&memcg_slab_mutex);
 	return failed;
+}
+
+static void mem_cgroup_destroy_all_caches(struct mem_cgroup *memcg)
+{
+	struct kmem_cache *cachep;
+	struct memcg_cache_params *params, *tmp;
+
+	if (!memcg_kmem_is_active(memcg))
+		return;
+
+	mutex_lock(&memcg_slab_mutex);
+	list_for_each_entry_safe(params, tmp, &memcg->memcg_slab_caches, list) {
+		cachep = memcg_params_to_cache(params);
+		kmem_cache_shrink(cachep);
+		if (atomic_read(&cachep->memcg_params->nr_pages) == 0)
+			memcg_kmem_destroy_cache(cachep);
+	}
+	mutex_unlock(&memcg_slab_mutex);
 }
 
 struct create_work {
@@ -3495,31 +3421,17 @@ struct create_work {
 	struct work_struct work;
 };
 
-static void mem_cgroup_destroy_all_caches(struct mem_cgroup *memcg)
-{
-	struct kmem_cache *cachep;
-	struct memcg_cache_params *params;
-
-	if (!memcg_kmem_is_active(memcg))
-		return;
-
-	mutex_lock(&memcg->slab_caches_mutex);
-	list_for_each_entry(params, &memcg->memcg_slab_caches, list) {
-		cachep = memcg_params_to_cache(params);
-		cachep->memcg_params->dead = true;
-		schedule_work(&cachep->memcg_params->destroy);
-	}
-	mutex_unlock(&memcg->slab_caches_mutex);
-}
-
 static void memcg_create_cache_work_func(struct work_struct *w)
 {
-	struct create_work *cw;
+	struct create_work *cw = container_of(w, struct create_work, work);
+	struct mem_cgroup *memcg = cw->memcg;
+	struct kmem_cache *cachep = cw->cachep;
 
-	cw = container_of(w, struct create_work, work);
-	memcg_create_kmem_cache(cw->memcg, cw->cachep);
-	/* Drop the reference gotten when we enqueued. */
-	css_put(&cw->memcg->css);
+	mutex_lock(&memcg_slab_mutex);
+	memcg_kmem_create_cache(memcg, cachep);
+	mutex_unlock(&memcg_slab_mutex);
+
+	css_put(&memcg->css);
 	kfree(cw);
 }
 
@@ -3579,7 +3491,7 @@ struct kmem_cache *__memcg_kmem_get_cache(struct kmem_cache *cachep,
 					  gfp_t gfp)
 {
 	struct mem_cgroup *memcg;
-	int idx;
+	struct kmem_cache *memcg_cachep;
 
 	VM_BUG_ON(!cachep->memcg_params);
 	VM_BUG_ON(!cachep->memcg_params->is_root_cache);
@@ -3593,15 +3505,9 @@ struct kmem_cache *__memcg_kmem_get_cache(struct kmem_cache *cachep,
 	if (!memcg_can_account_kmem(memcg))
 		goto out;
 
-	idx = memcg_cache_id(memcg);
-
-	/*
-	 * barrier to mare sure we're always seeing the up to date value.  The
-	 * code updating memcg_caches will issue a write barrier to match this.
-	 */
-	read_barrier_depends();
-	if (likely(cachep->memcg_params->memcg_caches[idx])) {
-		cachep = cachep->memcg_params->memcg_caches[idx];
+	memcg_cachep = cache_from_memcg_idx(cachep, memcg_cache_id(memcg));
+	if (likely(memcg_cachep)) {
+		cachep = memcg_cachep;
 		goto out;
 	}
 
@@ -4859,6 +4765,7 @@ static void mem_cgroup_force_empty_list(struct mem_cgroup *memcg,
 		struct page_cgroup *pc;
 		struct page *page;
 
+		cond_resched();
 		spin_lock_irqsave(&zone->lru_lock, flags);
 		if (list_empty(list)) {
 			spin_unlock_irqrestore(&zone->lru_lock, flags);
@@ -4878,7 +4785,6 @@ static void mem_cgroup_force_empty_list(struct mem_cgroup *memcg,
 		if (mem_cgroup_move_parent(page, pc, memcg)) {
 			/* found lock contention or "pc" is obsolete. */
 			busy = page;
-			cond_resched();
 		} else
 			busy = NULL;
 	} while (!list_empty(list));
@@ -5154,6 +5060,15 @@ static int memcg_update_kmem_limit(struct cgroup *cont, unsigned long limit)
 	int ret = -EINVAL;
 #ifdef CONFIG_MEMCG_KMEM
 	struct mem_cgroup *memcg = mem_cgroup_from_cont(cont);
+
+	/*
+	 * When cgroup_memory_nokmem is set, kmem limit update is silently
+	 * ignored to not break existing applications that write to
+	 * kmem.limit_in_bytes.
+	 */
+	if (cgroup_memory_nokmem)
+		return 0;
+
 	/*
 	 * For simplicity, we won't allow this to be disabled.  It also can't
 	 * be changed if the cgroup has children already, or if tasks had
@@ -5209,7 +5124,8 @@ static int memcg_propagate_kmem(struct mem_cgroup *memcg)
 {
 	int ret = 0;
 	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
-	if (!parent)
+
+	if (!parent || cgroup_memory_nokmem)
 		goto out;
 
 	memcg->kmem_account_flags = parent->kmem_account_flags;
@@ -6377,14 +6293,14 @@ static void mem_cgroup_invalidate_reclaim_iterators(struct mem_cgroup *memcg)
 	struct mem_cgroup *parent = memcg;
 
 	while ((parent = parent_mem_cgroup(parent)))
-		atomic_inc(&parent->dead_count);
+		mem_cgroup_iter_invalidate(parent);
 
 	/*
 	 * if the root memcg is not hierarchical we have to check it
 	 * explicitely.
 	 */
 	if (!root_mem_cgroup->use_hierarchy)
-		atomic_inc(&root_mem_cgroup->dead_count);
+		mem_cgroup_iter_invalidate(root_mem_cgroup);
 }
 
 static void mem_cgroup_css_offline(struct cgroup *cont)
@@ -6443,10 +6359,10 @@ static int mem_cgroup_do_precharge(unsigned long count)
 		 * are still under the same cgroup_mutex. So we can postpone
 		 * css_get().
 		 */
-		if (page_counter_try_charge(&memcg->memory, count, &dummy))
+		if (!page_counter_try_charge(&memcg->memory, count, &dummy))
 			goto one_by_one;
 		if (do_swap_account &&
-		    page_counter_try_charge(&memcg->memsw, count, &dummy)) {
+		    !page_counter_try_charge(&memcg->memsw, count, &dummy)) {
 			page_counter_uncharge(&memcg->memory, count);
 			goto one_by_one;
 		}
@@ -7069,6 +6985,20 @@ static void __init enable_swap_cgroup(void)
 {
 }
 #endif
+
+static int __init cgroup_memory(char *s)
+{
+	char *token;
+
+	while ((token = strsep(&s, ",")) != NULL) {
+		if (!*token)
+			continue;
+		if (!strcmp(token, "nokmem"))
+			cgroup_memory_nokmem = true;
+	}
+	return 0;
+}
+__setup("cgroup.memory=", cgroup_memory);
 
 /*
  * subsys_initcall() for memory controller.

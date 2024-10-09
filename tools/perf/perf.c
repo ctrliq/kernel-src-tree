@@ -11,10 +11,10 @@
 #include "util/env.h"
 #include <subcmd/exec-cmd.h>
 #include "util/config.h"
-#include "util/quote.h"
 #include <subcmd/run-command.h>
 #include "util/parse-events.h"
 #include <subcmd/parse-options.h>
+#include "util/bpf-loader.h"
 #include "util/debug.h"
 #include "util/event.h"
 #include <api/fs/fs.h>
@@ -302,6 +302,7 @@ static int run_builtin(struct cmd_struct *p, int argc, const char **argv)
 	perf_config__exit();
 	exit_browser(status);
 	perf_env__exit(&perf_env);
+	bpf__clear();
 
 	if (status)
 		return status & 0xff;

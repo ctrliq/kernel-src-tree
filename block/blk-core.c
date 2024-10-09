@@ -295,6 +295,7 @@ void blk_clear_preempt_only(struct request_queue *q)
 
 	spin_lock_irqsave(q->queue_lock, flags);
 	queue_flag_clear(QUEUE_FLAG_PREEMPT_ONLY, q);
+	wake_up_all(&q->mq_freeze_wq);
 	spin_unlock_irqrestore(q->queue_lock, flags);
 }
 EXPORT_SYMBOL_GPL(blk_clear_preempt_only);
@@ -546,6 +547,9 @@ void blk_set_queue_dying(struct request_queue *q)
 			}
 		}
 	}
+
+	/* Make blk_queue_enter() reexamine the DYING flag. */
+	wake_up_all(&q->mq_freeze_wq);
 }
 EXPORT_SYMBOL_GPL(blk_set_queue_dying);
 
@@ -782,9 +786,6 @@ int blk_queue_enter(struct request_queue *q, unsigned int flags)
 		if (blk_queue_dying(q))
 			return -ENODEV;
 	}
-
-	/* Make blk_queue_enter() reexamine the DYING flag. */
-	wake_up_all(&q->mq_freeze_wq);
 }
 
 void blk_queue_exit(struct request_queue *q)

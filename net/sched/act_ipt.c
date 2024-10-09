@@ -145,10 +145,11 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
 	} else {
 		if (bind)/* dont override defaults */
 			return 0;
-		tcf_idr_release(*a, bind);
 
-		if (!ovr)
+		if (!ovr) {
+			tcf_idr_release(*a, bind);
 			return -EEXIST;
+		}
 	}
 	hook = nla_get_u32(tb[TCA_IPT_HOOK]);
 
@@ -228,6 +229,7 @@ static int tcf_ipt(struct sk_buff *skb, const struct tc_action *a,
 	 * worry later - danger - this API seems to have changed
 	 * from earlier kernels
 	 */
+	par.net	     = dev_net(skb->dev);
 	par.in       = skb->dev;
 	par.out      = NULL;
 	par.hooknum  = ipt->tcfi_hook;

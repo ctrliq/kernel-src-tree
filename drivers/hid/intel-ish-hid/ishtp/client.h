@@ -84,7 +84,6 @@ struct ishtp_cl {
 	/* Client Tx buffers list */
 	unsigned int	tx_ring_size;
 	struct ishtp_cl_tx_ring	tx_list, tx_free_list;
-	int		tx_ring_free_size;
 	spinlock_t	tx_list_spinlock;
 	spinlock_t	tx_free_list_spinlock;
 	size_t	tx_offs;	/* Offset in buffer at head of 'tx_list' */
@@ -123,6 +122,9 @@ struct ishtp_cl {
 	struct timespec ts_out_fc;
 	struct timespec ts_max_fc_delay;
 	void *client_data;
+
+	/* New Client Tx buffer added to end of struct */
+	RH_KABI_EXTEND(int tx_ring_free_size;)
 };
 
 /* Client connection managenment internal functions */

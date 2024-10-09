@@ -35,6 +35,8 @@ struct opal_sg_list {
 /* We calculate number of sg entries based on PAGE_SIZE */
 #define SG_ENTRIES_PER_NODE ((PAGE_SIZE - 16) / sizeof(struct opal_sg_entry))
 
+void opal_wake_poller(void);
+
 #endif /* __ASSEMBLY__ */
 
 /****** OPAL APIs ******/
@@ -1244,6 +1246,10 @@ extern int opal_elog_init(void);
 extern void opal_platform_dump_init(void);
 extern void opal_sys_param_init(void);
 extern void opal_msglog_init(void);
+extern int opal_event_init(void);
+extern int opal_async_comp_init(void);
+extern int opal_sensor_init(void);
+extern int opal_hmi_handler_init(void);
 
 extern int opal_machine_check(struct pt_regs *regs);
 extern bool opal_mce_check_early_recovery(struct pt_regs *regs);
@@ -1256,6 +1262,8 @@ extern int opal_resync_timebase(void);
 extern void opal_lpc_init(void);
 
 extern void opal_kmsg_init(void);
+
+extern int opal_event_request(unsigned int opal_event_nr);
 
 struct opal_sg_list *opal_vmalloc_to_sg_list(void *vmalloc_addr,
 					     unsigned long vmalloc_size);

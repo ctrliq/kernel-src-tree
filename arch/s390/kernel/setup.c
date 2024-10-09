@@ -950,7 +950,15 @@ static void __init setup_hwcaps(void)
 			elf_hwcap |= HWCAP_S390_VXRS_EXT;
 		if (test_facility(135))
 			elf_hwcap |= HWCAP_S390_VXRS_BCD;
+		if (test_facility(148))
+			elf_hwcap |= HWCAP_S390_VXRS_EXT2;
+		if (test_facility(152))
+			elf_hwcap |= HWCAP_S390_VXRS_PDE;
 	}
+	if (test_facility(150))
+		elf_hwcap |= HWCAP_S390_SORT;
+	if (test_facility(151))
+		elf_hwcap |= HWCAP_S390_DFLT;
 #endif
 
 	/*
@@ -1012,6 +1020,24 @@ static void __init setup_hwcaps(void)
 }
 
 /*
+ * Issue diagnose 318 to set the control program name and
+ * version codes.
+ */
+static void __init setup_control_program_code(void)
+{
+	union diag318_info diag318_info = {
+		.cpnc = CPNC_LINUX,
+		.cpvc_linux = 0,
+		.cpvc_distro = {0},
+	};
+
+	if (!sclp_has_diag318())
+		return;
+
+	asm volatile("diag %0,0,0x318\n" : : "d" (diag318_info.val));
+}
+
+/*
  * Setup function called from init/main.c just after the banner
  * was printed.
  */
@@ -1068,6 +1094,7 @@ void __init setup_arch(char **cmdline_p)
 	setup_resources();
 	setup_vmcoreinfo();
 	setup_lowcore();
+	setup_control_program_code();
 
 	smp_fill_possible_mask();
         cpu_init();

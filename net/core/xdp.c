@@ -45,3 +45,9 @@ int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
+
+void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
+{
+	return;
+}
+EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg_mem_model);

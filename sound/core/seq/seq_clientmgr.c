@@ -1100,7 +1100,7 @@ static unsigned int snd_seq_poll(struct file *file, poll_table * wait)
 
 	/* check client structures are in place */
 	if (snd_BUG_ON(!client))
-		return EPOLLERR;
+		return POLLERR;
 
 	if ((snd_seq_file_flags(file) & SNDRV_SEQ_LFLG_INPUT) &&
 	    client->data.user.fifo) {

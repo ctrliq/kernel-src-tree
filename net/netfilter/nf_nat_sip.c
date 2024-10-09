@@ -23,11 +23,15 @@
 #include <net/netfilter/nf_conntrack_seqadj.h>
 #include <linux/netfilter/nf_conntrack_sip.h>
 
+#define NAT_HELPER_NAME "sip"
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Christian Hentschel <chentschel@arnet.com.ar>");
 MODULE_DESCRIPTION("SIP NAT helper");
-MODULE_ALIAS_NF_NAT_HELPER("sip");
+MODULE_ALIAS_NF_NAT_HELPER(NAT_HELPER_NAME);
 
+static struct nf_conntrack_nat_helper nat_helper_sip =
+	NF_CT_NAT_HELPER_INIT(NAT_HELPER_NAME);
 
 static unsigned int mangle_packet(struct sk_buff *skb, unsigned int protoff,
 				  unsigned int dataoff,
@@ -625,6 +629,7 @@ static struct nf_ct_helper_expectfn sip_nat = {
 
 static void __exit nf_nat_sip_fini(void)
 {
+	nf_nat_helper_unregister(&nat_helper_sip);
 	RCU_INIT_POINTER(nf_nat_sip_hook, NULL);
 	RCU_INIT_POINTER(nf_nat_sip_seq_adjust_hook, NULL);
 	RCU_INIT_POINTER(nf_nat_sip_expect_hook, NULL);
@@ -645,6 +650,7 @@ static int __init nf_nat_sip_init(void)
 	BUG_ON(nf_nat_sdp_port_hook != NULL);
 	BUG_ON(nf_nat_sdp_session_hook != NULL);
 	BUG_ON(nf_nat_sdp_media_hook != NULL);
+	nf_nat_helper_register(&nat_helper_sip);
 	RCU_INIT_POINTER(nf_nat_sip_hook, nf_nat_sip);
 	RCU_INIT_POINTER(nf_nat_sip_seq_adjust_hook, nf_nat_sip_seq_adjust);
 	RCU_INIT_POINTER(nf_nat_sip_expect_hook, nf_nat_sip_expect);

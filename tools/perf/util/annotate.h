@@ -68,6 +68,8 @@ struct annotation_options {
 	bool hide_src_code,
 	     use_offset,
 	     jump_arrows,
+	     print_lines,
+	     full_path,
 	     show_linenr,
 	     show_nr_jumps,
 	     show_nr_samples,
@@ -76,6 +78,12 @@ struct annotation_options {
 	     show_asm_raw,
 	     annotate_src;
 	u8   offset_level;
+	int  min_pcnt;
+	int  max_lines;
+	int  context;
+	const char *objdump_path;
+	const char *disassembler_style;
+	unsigned int percent_type;
 };
 
 enum {
@@ -193,19 +201,13 @@ struct annotation_write_ops {
 };
 
 void annotation_line__write(struct annotation_line *al, struct annotation *notes,
-			    struct annotation_write_ops *ops);
+			    struct annotation_write_ops *ops,
+			    struct annotation_options *opts);
 
 int __annotation__scnprintf_samples_period(struct annotation *notes,
 					   char *bf, size_t size,
 					   struct perf_evsel *evsel,
 					   bool show_freq);
-
-static inline int annotation__scnprintf_samples_period(struct annotation *notes,
-						       char *bf, size_t size,
-						       struct perf_evsel *evsel)
-{
-	return __annotation__scnprintf_samples_period(notes, bf, size, evsel, true);
-}
 
 int disasm_line__scnprintf(struct disasm_line *dl, char *bf, size_t size, bool raw);
 size_t disasm__fprintf(struct list_head *head, FILE *fp);
@@ -360,24 +362,22 @@ int symbol__strerror_disassemble(struct symbol *sym, struct map *map,
 				 int errnum, char *buf, size_t buflen);
 
 int symbol__annotate_printf(struct symbol *sym, struct map *map,
-			    struct perf_evsel *evsel, bool full_paths,
-			    int min_pcnt, int max_lines, int context);
-int symbol__annotate_fprintf2(struct symbol *sym, FILE *fp);
+			    struct perf_evsel *evsel,
+			    struct annotation_options *options);
 void symbol__annotate_zero_histogram(struct symbol *sym, int evidx);
 void symbol__annotate_decay_histogram(struct symbol *sym, int evidx);
 void annotated_source__purge(struct annotated_source *as);
 
-int map_symbol__annotation_dump(struct map_symbol *ms, struct perf_evsel *evsel);
+int map_symbol__annotation_dump(struct map_symbol *ms, struct perf_evsel *evsel,
+				struct annotation_options *opts);
 
 bool ui__has_annotation(void);
 
 int symbol__tty_annotate(struct symbol *sym, struct map *map,
-			 struct perf_evsel *evsel, bool print_lines,
-			 bool full_paths, int min_pcnt, int max_lines);
+			 struct perf_evsel *evsel, struct annotation_options *opts);
 
 int symbol__tty_annotate2(struct symbol *sym, struct map *map,
-			  struct perf_evsel *evsel, bool print_lines,
-			  bool full_paths);
+			  struct perf_evsel *evsel, struct annotation_options *opts);
 
 #ifdef HAVE_SLANG_SUPPORT
 int symbol__tui_annotate(struct symbol *sym, struct map *map,
@@ -394,8 +394,6 @@ static inline int symbol__tui_annotate(struct symbol *sym __maybe_unused,
 	return 0;
 }
 #endif
-
-extern const char	*disassembler_style;
 
 void annotation_config__init(void);
 

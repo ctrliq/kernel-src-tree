@@ -494,7 +494,6 @@ int irq_domain_associate_many(struct irq_domain *domain, unsigned int irq_base,
 
 	return 0;
 
- err_unmap:
 	irq_domain_disassociate_many(domain, irq_base, i);
 	return -EINVAL;
 }

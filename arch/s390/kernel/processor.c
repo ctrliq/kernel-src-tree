@@ -51,7 +51,7 @@ static void show_facilities(struct seq_file *m)
 
 	facilities = (long *)&S390_lowcore.stfle_fac_list;
 	seq_puts(m, "facilities      :");
-	for_each_set_bit_left(bit, facilities, MAX_FACILITY_BIT)
+	for_each_set_bit_inv(bit, facilities, MAX_FACILITY_BIT)
 		seq_printf(m, " %d", bit);
 	seq_putc(m, '\n');
 }
@@ -63,7 +63,8 @@ static int show_cpuinfo(struct seq_file *m, void *v)
 {
 	static const char *hwcap_str[] = {
 		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
-		"edat", "etf3eh", "highgprs", "te", "vx", "vxd", "vxe", "gs"
+		"edat", "etf3eh", "highgprs", "te", "vx", "vxd", "vxe", "gs",
+		"vxe2", "vxp", "sort", "dflt"
 	};
 	static const char * const int_hwcap_str[] = {
 		"sie"

@@ -123,11 +123,13 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 
 		/* Similar to the PMD case, NUMA hinting must take slow path */
 		if (pte_numa(pte)) {
+			put_dev_pagemap(pgmap);
 			pte_unmap(ptep);
 			return 0;
 		}
 
 		if (!pte_allows_gup(pte_val(pte), write)) {
+			put_dev_pagemap(pgmap);
 			pte_unmap(ptep);
 			return 0;
 		}
@@ -140,6 +142,7 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 				return 0;
 			}
 		} else if (pte_special(pte)) {
+			put_dev_pagemap(pgmap);
 			pte_unmap(ptep);
 			return 0;
 		}
@@ -152,10 +155,13 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 		 * when IPIs are not send on TLB shootdown.
 		 */
 		if (rh_flush_tlb_others_IPI_less()) {
-			if (!page_cache_get_speculative(page))
+			if (!page_cache_get_speculative(page)) {
+				put_dev_pagemap(pgmap);
 				return 0;
+			}
 			if (unlikely(pte_val(pte) != pte_val(*ptep))) {
 				put_page(page);
+				put_dev_pagemap(pgmap);
 				return 0;
 			}
 		} else {

@@ -33,8 +33,8 @@
 #include <asm/intel_rdt_sched.h>
 #include "intel_rdt.h"
 
-#define MAX_MBA_BW	100u
 #define MBA_IS_LINEAR	0x4
+#define MBA_MAX_MBPS	U32_MAX
 
 /* Mutex to protect rdtgroup access. */
 DEFINE_MUTEX(rdtgroup_mutex);
@@ -341,7 +341,7 @@ static int get_cache_id(int cpu, int level)
  * that can be written to QOS_MSRs.
  * There are currently no SKUs which support non linear delay values.
  */
-static u32 delay_bw_map(unsigned long bw, struct rdt_resource *r)
+u32 delay_bw_map(unsigned long bw, struct rdt_resource *r)
 {
 	if (r->membw.delay_linear)
 		return MAX_MBA_BW - bw;
@@ -431,26 +431,41 @@ struct rdt_domain *rdt_find_domain(struct rdt_resource *r, int id,
 	return NULL;
 }
 
+void setup_default_ctrlval(struct rdt_resource *r, u32 *dc, u32 *dm)
+{
+	int i;
+
+	/*
+	 * Initialize the Control MSRs to having no control.
+	 * For Cache Allocation: Set all bits in cbm
+	 * For Memory Allocation: Set b/w requested to 100%
+	 * and the bandwidth in MBps to U32_MAX
+	 */
+	for (i = 0; i < r->num_closid; i++, dc++, dm++) {
+		*dc = r->default_ctrl;
+		*dm = MBA_MAX_MBPS;
+	}
+}
+
 static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d,
 				bool notifier)
 {
 	struct msr_param m;
-	u32 *dc;
-	int i;
+	u32 *dc, *dm;
 
 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
 	if (!dc)
 		return -ENOMEM;
 
-	d->ctrl_val = dc;
+	dm = kmalloc_array(r->num_closid, sizeof(*d->mbps_val), GFP_KERNEL);
+	if (!dm) {
+		kfree(dc);
+		return -ENOMEM;
+	}
 
-	/*
-	 * Initialize the Control MSRs to having no control.
-	 * For Cache Allocation: Set all bits in cbm
-	 * For Memory Allocation: Set b/w requested to 100
-	 */
-	for (i = 0; i < r->num_closid; i++, dc++)
-		*dc = r->default_ctrl;
+	d->ctrl_val = dc;
+	d->mbps_val = dm;
+	setup_default_ctrlval(r, dc, dm);
 
 	if (notifier) {
 		m.low = 0;
@@ -591,6 +606,7 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
 		}
 
 		kfree(d->ctrl_val);
+		kfree(d->mbps_val);
 		kfree(d->rmid_busy_llc);
 		kfree(d->mbm_total);
 		kfree(d->mbm_local);

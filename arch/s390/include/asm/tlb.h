@@ -47,10 +47,9 @@ struct mmu_table_batch {
 extern void tlb_table_flush(struct mmu_gather *tlb);
 extern void tlb_remove_table(struct mmu_gather *tlb, void *table);
 
-static inline void tlb_gather_mmu(struct mmu_gather *tlb,
-				  struct mm_struct *mm,
-				  unsigned long start,
-				  unsigned long end)
+static inline void
+arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+			unsigned long start, unsigned long end)
 {
 	tlb->mm = mm;
 	tlb->start = start;
@@ -61,15 +60,33 @@ static inline void tlb_gather_mmu(struct mmu_gather *tlb,
 		__tlb_flush_mm(mm);
 }
 
-static inline void tlb_flush_mmu(struct mmu_gather *tlb)
+static inline void tlb_flush_mmu_tlbonly(struct mmu_gather *tlb)
+{
+	__tlb_flush_mm_lazy(tlb->mm);
+}
+
+static inline void tlb_flush_mmu_free(struct mmu_gather *tlb)
 {
 	tlb_table_flush(tlb);
 }
 
-static inline void tlb_finish_mmu(struct mmu_gather *tlb,
-				  unsigned long start, unsigned long end)
+
+static inline void tlb_flush_mmu(struct mmu_gather *tlb)
 {
-	tlb_table_flush(tlb);
+	tlb_flush_mmu_tlbonly(tlb);
+	tlb_flush_mmu_free(tlb);
+}
+
+static inline void
+arch_tlb_finish_mmu(struct mmu_gather *tlb,
+		unsigned long start, unsigned long end, bool force)
+{
+	if (force) {
+		tlb->start = start;
+		tlb->end = end;
+	}
+
+	tlb_flush_mmu(tlb);
 }
 
 /*

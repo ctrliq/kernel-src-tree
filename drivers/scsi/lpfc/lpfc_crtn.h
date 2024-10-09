@@ -383,6 +383,7 @@ void lpfc_rq_buf_free(struct lpfc_hba *phba, struct lpfc_dmabuf *mp);
 int lpfc_link_reset(struct lpfc_vport *vport);
 
 /* Function prototypes. */
+int lpfc_check_pci_resettable(const struct lpfc_hba *phba);
 const char* lpfc_info(struct Scsi_Host *);
 int lpfc_scan_finished(struct Scsi_Host *, unsigned long);
 
@@ -548,6 +549,14 @@ bool lpfc_find_next_oas_lun(struct lpfc_hba *, struct lpfc_name *,
 			    uint32_t *, uint32_t *);
 int lpfc_sli4_dump_page_a0(struct lpfc_hba *phba, struct lpfcMboxq *mbox);
 void lpfc_mbx_cmpl_rdp_page_a0(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb);
+
+/* RAS Interface */
+void lpfc_sli4_ras_init(struct lpfc_hba *phba);
+void lpfc_sli4_ras_setup(struct lpfc_hba *phba);
+int  lpfc_sli4_ras_fwlog_init(struct lpfc_hba *phba, uint32_t fwlog_level,
+			 uint32_t fwlog_enable);
+void lpfc_ras_stop_fwlog(struct lpfc_hba *phba);
+int lpfc_check_fwlog_support(struct lpfc_hba *phba);
 
 /* NVME interfaces. */
 void lpfc_nvme_unregister_port(struct lpfc_vport *vport,

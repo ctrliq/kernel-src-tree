@@ -43,7 +43,7 @@ struct xfs_bmalloca {
 	xfs_fsblock_t		blkno;	/* starting block of new extent */
 
 	struct xfs_btree_cur	*cur;	/* btree cursor */
-	xfs_extnum_t		idx;	/* current extent index */
+	struct xfs_iext_cursor	icur;	/* incore extent cursor */
 	int			nallocs;/* number of extents alloc'd */
 	int			logflags;/* flags for transaction logging */
 
@@ -143,24 +143,6 @@ static inline int xfs_bmapi_aflag(int w)
 	{ BMAP_ATTRFORK,	"ATTR" }
 
 
-/*
- * This macro is used to determine how many extents will be shifted
- * in one write transaction. We could require two splits,
- * an extent move on the first and an extent merge on the second,
- * So it is proper that one extent is shifted inside write transaction
- * at a time.
- */
-#define XFS_BMAP_MAX_SHIFT_EXTENTS	1
-
-#ifdef DEBUG
-void	xfs_bmap_trace_exlist(struct xfs_inode *ip, xfs_extnum_t cnt,
-		int whichfork, unsigned long caller_ip);
-#define	XFS_BMAP_TRACE_EXLIST(ip,c,w)	\
-	xfs_bmap_trace_exlist(ip,c,w, _THIS_IP_)
-#else
-#define	XFS_BMAP_TRACE_EXLIST(ip,c,w)
-#endif
-
 void	xfs_trim_extent(struct xfs_bmbt_irec *irec, xfs_fileoff_t bno,
 		xfs_filblks_t len);
 void	xfs_trim_extent_eof(struct xfs_bmbt_irec *, struct xfs_inode *);
@@ -176,8 +158,6 @@ int	xfs_bmap_last_before(struct xfs_trans *tp, struct xfs_inode *ip,
 int	xfs_bmap_last_offset(struct xfs_inode *ip, xfs_fileoff_t *unused,
 		int whichfork);
 int	xfs_bmap_one_block(struct xfs_inode *ip, int whichfork);
-int	xfs_bmap_read_extents(struct xfs_trans *tp, struct xfs_inode *ip,
-		int whichfork);
 int	xfs_bmapi_read(struct xfs_inode *ip, xfs_fileoff_t bno,
 		xfs_filblks_t len, struct xfs_bmbt_irec *mval,
 		int *nmap, int flags);
@@ -194,13 +174,35 @@ int	xfs_bunmapi(struct xfs_trans *tp, struct xfs_inode *ip,
 		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
 		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
 		struct xfs_defer_ops *dfops, int *done);
+int	xfs_bmap_del_extent_delay(struct xfs_inode *ip, int whichfork,
+		struct xfs_iext_cursor *cur, struct xfs_bmbt_irec *got,
+		struct xfs_bmbt_irec *del);
 uint	xfs_default_attroffset(struct xfs_inode *ip);
-int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
-		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
-		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
-		struct xfs_defer_ops *dfops, int num_exts);
+int	xfs_bmap_collapse_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
+		bool *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
+		struct xfs_defer_ops *dfops);
+int	xfs_bmap_can_insert_extents(struct xfs_inode *ip, xfs_fileoff_t off,
+		xfs_fileoff_t shift);
+int	xfs_bmap_insert_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
+		bool *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
+		struct xfs_defer_ops *dfops);
+int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
+
 int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t off,
 		xfs_filblks_t len, xfs_filblks_t prealloc,
-		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
+		struct xfs_bmbt_irec *got, struct xfs_iext_cursor *cur,
+		int eof);
+
+static inline int xfs_bmap_fork_to_state(int whichfork)
+{
+	switch (whichfork) {
+	case XFS_ATTR_FORK:
+		return BMAP_ATTRFORK;
+	default:
+		return 0;
+	}
+}
 
 #endif	/* __XFS_BMAP_H__ */

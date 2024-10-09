@@ -23,6 +23,7 @@
 #include <linux/posix_acl_xattr.h>
 
 #include <asm/uaccess.h>
+#include "internal.h"
 
 /*
  * Check permissions for extended attribute access.  This is a bit complicated
@@ -422,10 +423,10 @@ SYSCALL_DEFINE5(fsetxattr, int, fd, const char __user *, name,
 		return error;
 	dentry = f.file->f_path.dentry;
 	audit_inode(NULL, dentry, 0);
-	error = mnt_want_write_file(f.file);
+	error = mnt_want_write_file_path(f.file);
 	if (!error) {
 		error = setxattr(dentry, name, value, size, flags);
-		mnt_drop_write_file(f.file);
+		mnt_drop_write_file_path(f.file);
 	}
 	fdput(f);
 	return error;
@@ -683,10 +684,10 @@ SYSCALL_DEFINE2(fremovexattr, int, fd, const char __user *, name)
 		return error;
 	dentry = f.file->f_path.dentry;
 	audit_inode(NULL, dentry, 0);
-	error = mnt_want_write_file(f.file);
+	error = mnt_want_write_file_path(f.file);
 	if (!error) {
 		error = removexattr(dentry, name);
-		mnt_drop_write_file(f.file);
+		mnt_drop_write_file_path(f.file);
 	}
 	fdput(f);
 	return error;

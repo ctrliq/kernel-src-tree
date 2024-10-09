@@ -403,7 +403,7 @@ static int __init at91ether_probe(struct platform_device *pdev)
 
 	phydev = lp->phy_dev;
 	netdev_info(dev, "attached PHY driver [%s] (mii_bus:phy_addr=%s, irq=%d)\n",
-				phydev->drv->name, dev_name(&phydev->dev),
+				phydev->drv->name, dev_name(&phydev->mdio_dev),
 				phydev->irq);
 
 	/* Display ethernet banner */

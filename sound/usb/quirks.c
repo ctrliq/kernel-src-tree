@@ -19,7 +19,6 @@
 #include <linux/usb.h>
 #include <linux/usb/audio.h>
 #include <linux/usb/midi.h>
-#include <linux/bits.h>
 
 #include <sound/control.h>
 #include <sound/core.h>

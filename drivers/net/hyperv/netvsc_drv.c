@@ -112,7 +112,7 @@ static void netvsc_tx_enable(struct netvsc_device *nvscdev,
 			     struct net_device *ndev)
 {
 	nvscdev->tx_disable = false;
-	virt_wmb(); /* ensure queue wake up mechanism is on */
+	wmb(); /* ensure queue wake up mechanism is on */
 
 	netif_tx_wake_all_queues(ndev);
 }
@@ -197,7 +197,7 @@ static void netvsc_tx_disable(struct netvsc_device *nvscdev,
 {
 	if (nvscdev) {
 		nvscdev->tx_disable = true;
-		virt_wmb(); /* ensure txq will not wake up after stop */
+		wmb(); /* ensure txq will not wake up after stop */
 	}
 
 	netif_tx_disable(ndev);

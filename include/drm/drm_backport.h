@@ -122,7 +122,6 @@ extern struct workqueue_struct *system_power_efficient_wq;
 #include <linux/rculist.h>
 
 #define cpu_relax_lowlatency() cpu_relax()
-#define pagefault_disabled()   in_atomic()
 
 static inline int arch_phys_wc_index(int handle)
 {
@@ -265,9 +264,6 @@ static inline long __drm_get_user_pages(struct task_struct *tsk, struct mm_struc
 #define get_user_pages(start, nr_pages, write, pages, vmas) \
 	__drm_get_user_pages(current, current->mm, start, nr_pages, write, 0, pages, vmas)
 
-
-#define smp_store_mb(var, value)	set_mb(var, value)
-
 #ifndef atomic_set_release
 #define  atomic_set_release(v, i)	smp_store_release(&(v)->counter, (i))
 #endif
@@ -305,6 +301,11 @@ static inline void drm_panel_remove(struct drm_panel *panel) {}
 typedef wait_queue_t wait_queue_entry_t;
 #define __add_wait_queue_entry_tail __add_wait_queue_tail
 
+static inline void init_wait_entry(wait_queue_entry_t *entry, int flags)
+{
+	init_wait(entry);
+}
+
 unsigned int swiotlb_max_size(void);
 #define swiotlb_max_segment swiotlb_max_size
 
@@ -315,11 +316,6 @@ unsigned int swiotlb_max_size(void);
 static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	return file->f_op->mmap(file, vma);
-}
-
-static inline void mmgrab(struct mm_struct *mm)
-{
-	atomic_inc(&mm->mm_count);
 }
 
 /*
@@ -365,6 +361,56 @@ enum {
 /* until 8eb8284b412906181357c2b0110d879d5af95e52 is backported: */
 #define kmem_cache_create_usercopy(n, s, a, f, uo, us, c) \
 	kmem_cache_create(n, s, a, f, c)
+
+/*
+ * Avoid backporting 6ce711f2750031d12cec91384ac5cfa0a485b60a which
+ * depends on 0a835c4f090af2c76fc2932c539c3b32fd21fbbb
+ */
+#include <linux/idr.h>
+static inline void idr_init_base(struct idr *idr, int base)
+{
+	/* TODO we might need to remap things to idr_get_new_above().. */
+	idr_init(idr);
+}
+
+/*
+ * Avoid backporting 5ade60dda43c8906d4554374226c2eb11cc2ffba
+ */
+
+static inline void ida_free(struct ida *ida, unsigned int id)
+{
+	ida_simple_remove(ida, id);
+}
+
+static inline int ida_alloc_range(struct ida *ida, unsigned int min, unsigned int _max, gfp_t gfp)
+{
+	unsigned int end = max(_max, _max + 1);
+	return ida_simple_get(ida, min, end, gfp);
+}
+
+static inline int ida_alloc(struct ida *ida, gfp_t gfp)
+{
+	return ida_alloc_range(ida, 0, ~0, gfp);
+}
+
+static inline int ida_alloc_min(struct ida *ida, unsigned int min, gfp_t gfp)
+{
+	return ida_alloc_range(ida, min, ~0, gfp);
+}
+
+static inline int ida_alloc_max(struct ida *ida, unsigned int max, gfp_t gfp)
+{
+	return ida_alloc_range(ida, 0, max, gfp);
+}
+
+/*
+ * Avoid poll API changes
+ */
+typedef unsigned int __poll_t;
+#define EPOLLIN POLLIN
+#define EPOLLOUT POLLOUT
+#define EPOLLRDNORM POLLRDNORM
+
 
 int __init drm_backport_init(void);
 void __exit drm_backport_exit(void);

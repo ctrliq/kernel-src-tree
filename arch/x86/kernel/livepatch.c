@@ -18,7 +18,6 @@
 #include <linux/module.h>
 #include <linux/kallsyms.h>
 #include <linux/livepatch.h>
-#include <asm/text-patching.h>
 
 /* Apply per-object alternatives. Based on x86 module_finalize() */
 void arch_klp_init_object_loaded(struct klp_patch *patch,
@@ -31,8 +30,13 @@ void arch_klp_init_object_loaded(struct klp_patch *patch,
 	const char *objname;
 	char sec_objname[MODULE_NAME_LEN];
 	char secname[KSYM_NAME_LEN];
+	struct module_ext *mod_ext;
 
-	info = patch->mod->klp_info;
+	mutex_lock(&module_ext_mutex);
+	mod_ext = find_module_ext(patch->mod);
+	mutex_unlock(&module_ext_mutex);
+
+	info = mod_ext->klp_info;
 	objname = obj->name ? obj->name : "vmlinux";
 
 	/* See livepatch core code for BUILD_BUG_ON() explanation */

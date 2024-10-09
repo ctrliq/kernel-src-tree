@@ -530,7 +530,7 @@ ovs_ct_expect_find(struct net *net, const struct nf_conntrack_zone *zone,
 	struct nf_conntrack_tuple tuple;
 	struct nf_conntrack_expect *exp;
 
-	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb), proto, &tuple))
+	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb), proto, net, &tuple))
 		return NULL;
 
 	exp = __nf_ct_expect_find(net, zone, &tuple);
@@ -608,7 +608,7 @@ ovs_ct_find_existing(struct net *net, const struct nf_conntrack_zone *zone,
 	}
 	l4proto = __nf_ct_l4proto_find(l3num, protonum);
 	if (!nf_ct_get_tuple(skb, skb_network_offset(skb), dataoff, l3num,
-			     protonum, &tuple, l3proto, l4proto)) {
+			     protonum, net, &tuple, l3proto, l4proto)) {
 		pr_debug("ovs_ct_find_existing: Can't get tuple\n");
 		return NULL;
 	}
@@ -1208,6 +1208,7 @@ static int ovs_ct_add_helper(struct ovs_conntrack_info *info, const char *name,
 {
 	struct nf_conntrack_helper *helper;
 	struct nf_conn_help *help;
+	int ret = 0;
 
 	helper = nf_conntrack_helper_try_module_get(name, info->family,
 						    key->ip.proto);
@@ -1218,17 +1219,25 @@ static int ovs_ct_add_helper(struct ovs_conntrack_info *info, const char *name,
 
 	help = nf_ct_helper_ext_add(info->ct, helper, GFP_KERNEL);
 	if (!help) {
-		module_put(helper->me);
+		nf_conntrack_helper_put(helper);
 		return -ENOMEM;
 	}
 
+#ifdef CONFIG_NF_NAT_NEEDED
+	if (info->nat) {
+		ret = nf_nat_helper_try_module_get(name, info->family,
+						   key->ip.proto);
+		if (ret) {
+			nf_conntrack_helper_put(helper);
+			OVS_NLERR(log, "Failed to load \"%s\" NAT helper, error: %d",
+				  name, ret);
+			return ret;
+		}
+	}
+#endif
 	rcu_assign_pointer(help->helper, helper);
 	info->helper = helper;
-
-	if (info->nat)
-		request_module("ip_nat_%s", name);
-
-	return 0;
+	return ret;
 }
 
 #ifdef CONFIG_NF_NAT_NEEDED
@@ -1681,8 +1690,13 @@ void ovs_ct_free_action(const struct nlattr *a)
 
 static void __ovs_ct_free_action(struct ovs_conntrack_info *ct_info)
 {
-	if (ct_info->helper)
-		module_put(ct_info->helper->me);
+	if (ct_info->helper) {
+#ifdef CONFIG_NF_NAT_NEEDED
+		if (ct_info->nat)
+			nf_nat_helper_put(ct_info->helper);
+#endif
+		nf_conntrack_helper_put(ct_info->helper);
+	}
 	if (ct_info->ct)
 		nf_ct_tmpl_free(ct_info->ct);
 }

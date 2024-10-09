@@ -1,35 +1,5 @@
-/*
- * Copyright (C) 2017 Netronome Systems, Inc.
- *
- * This software is dual licensed under the GNU General License Version 2,
- * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree or the BSD 2-Clause License provided below.  You have the
- * option to license this software under the complete terms of either license.
- *
- * The BSD 2-Clause License:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      1. Redistributions of source code must retain the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer.
- *
- *      2. Redistributions in binary form must reproduce the above
- *         copyright notice, this list of conditions and the following
- *         disclaimer in the documentation and/or other materials
- *         provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright (C) 2017-2018 Netronome Systems, Inc. */
 
 #undef CONFIG_BPF_SYSCALL
 
@@ -62,6 +32,11 @@ static const struct nfp_app_type *apps[] = {
 #endif
 };
 
+void nfp_check_rhashtable_empty(void *ptr, void *arg)
+{
+	WARN_ON_ONCE(1);
+}
+
 struct nfp_app *nfp_app_from_netdev(struct net_device *netdev)
 {
 	if (nfp_netdev_is_nfp_net(netdev)) {
@@ -86,6 +61,23 @@ const char *nfp_app_mip_name(struct nfp_app *app)
 	if (!app || !app->pf->mip)
 		return "";
 	return nfp_mip_name(app->pf->mip);
+}
+
+int nfp_app_ndo_init(struct net_device *netdev)
+{
+	struct nfp_app *app = nfp_app_from_netdev(netdev);
+
+	if (!app || !app->type->ndo_init)
+		return 0;
+	return app->type->ndo_init(app, netdev);
+}
+
+void nfp_app_ndo_uninit(struct net_device *netdev)
+{
+	struct nfp_app *app = nfp_app_from_netdev(netdev);
+
+	if (app && app->type->ndo_uninit)
+		app->type->ndo_uninit(app, netdev);
 }
 
 u64 *nfp_app_port_get_stats(struct nfp_port *port, u64 *data)
@@ -215,7 +207,7 @@ int nfp_app_start(struct nfp_app *app, struct nfp_net *ctrl)
 	}
 
 	app->netdev_nb.notifier_call = nfp_app_netdev_event;
-	err = register_netdevice_notifier(&app->netdev_nb);
+	err = register_netdevice_notifier_rh(&app->netdev_nb);
 	if (err)
 		goto err_app_stop;
 
@@ -229,7 +221,7 @@ err_app_stop:
 
 void nfp_app_stop(struct nfp_app *app)
 {
-	unregister_netdevice_notifier(&app->netdev_nb);
+	unregister_netdevice_notifier_rh(&app->netdev_nb);
 
 	if (app->type->stop)
 		app->type->stop(app);

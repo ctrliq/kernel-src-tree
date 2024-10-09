@@ -26,14 +26,14 @@ void autofs4_catatonic_mode(struct autofs_sb_info *sbi)
 	struct autofs_wait_queue *wq, *nwq;
 
 	mutex_lock(&sbi->wq_mutex);
-	if (sbi->catatonic) {
+	if (sbi->flags & AUTOFS_SBI_CATATONIC) {
 		mutex_unlock(&sbi->wq_mutex);
 		return;
 	}
 
 	pr_debug("entering catatonic mode\n");
 
-	sbi->catatonic = 1;
+	sbi->flags |= AUTOFS_SBI_CATATONIC;
 	wq = sbi->queues;
 	sbi->queues = NULL;	/* Erase all wait queues */
 	while (wq) {
@@ -256,7 +256,7 @@ static int validate_request(struct autofs_wait_queue **wait,
 	struct autofs_wait_queue *wq;
 	struct autofs_info *ino;
 
-	if (sbi->catatonic)
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
 		return -ENOENT;
 
 	/* Wait in progress, continue; */
@@ -291,7 +291,7 @@ static int validate_request(struct autofs_wait_queue **wait,
 			if (mutex_lock_interruptible(&sbi->wq_mutex))
 				return -EINTR;
 
-			if (sbi->catatonic)
+			if (sbi->flags & AUTOFS_SBI_CATATONIC)
 				return -ENOENT;
 
 			wq = autofs4_find_wait(sbi, qstr);
@@ -360,7 +360,7 @@ int autofs4_wait(struct autofs_sb_info *sbi,
 	pid_t tgid;
 
 	/* In catatonic mode, we don't wait for nobody */
-	if (sbi->catatonic)
+	if (sbi->flags & AUTOFS_SBI_CATATONIC)
 		return -ENOENT;
 
 	/*

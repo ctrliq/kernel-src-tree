@@ -45,7 +45,7 @@ enum {
 	FRA_FLOW,	/* flow/class id */
 	FRA_TUN_ID,
 	FRA_UNUSED7,
-	FRA_TABLE_PREFIXLEN_MIN,
+	FRA_SUPPRESS_PREFIXLEN,
 	FRA_TABLE,	/* Extended table id */
 	FRA_FWMASK,	/* mask for netfilter mark */
 	FRA_OIFNAME,

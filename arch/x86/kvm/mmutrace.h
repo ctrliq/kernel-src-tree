@@ -30,11 +30,11 @@
 								        \
 	role.word = __entry->role;					\
 									\
-	trace_seq_printf(p, "sp gen %lx gfn %llx l%u%s q%u%s %s%s"	\
+	trace_seq_printf(p, "sp gen %lx gfn %llx l%u %u-byte q%u%s %s%s"	\
 			 " %snxe %sad root %u %s%c",			\
 			 __entry->mmu_valid_gen,			\
 			 __entry->gfn, role.level,			\
-			 role.cr4_pae ? " pae" : "",			\
+			 role.gpte_is_8_bytes ? 8 : 4,			\
 			 role.quadrant,					\
 			 role.direct ? " direct" : "",			\
 			 access_str[role.access],			\

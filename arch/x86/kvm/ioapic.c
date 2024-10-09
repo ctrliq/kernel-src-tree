@@ -236,7 +236,7 @@ static void kvm_ioapic_inject_all(struct kvm_ioapic *ioapic, unsigned long irr)
 }
 
 
-void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, ulong *ioapic_handled_vectors)
 {
 	struct kvm_ioapic *ioapic = vcpu->kvm->arch.vioapic;
 	struct dest_map *dest_map = &ioapic->rtc_status.dest_map;
@@ -248,7 +248,7 @@ void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
 	/* Make sure we see any missing RTC EOI */
 	if (test_bit(vcpu->vcpu_id, dest_map->map))
 		__set_bit(dest_map->vectors[vcpu->vcpu_id],
-			  (unsigned long *)eoi_exit_bitmap);
+			  ioapic_handled_vectors);
 
 	for (index = 0; index < IOAPIC_NUM_PINS; index++) {
 		e = &ioapic->redirtbl[index];
@@ -260,7 +260,7 @@ void kvm_ioapic_scan_entry(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
 			    (e->fields.trig_mode == IOAPIC_EDGE_TRIG &&
 			     kvm_apic_pending_eoi(vcpu, e->fields.vector)))
 				__set_bit(e->fields.vector,
-					(unsigned long *)eoi_exit_bitmap);
+					  ioapic_handled_vectors);
 		}
 	}
 	spin_unlock(&ioapic->lock);

@@ -795,9 +795,4 @@ struct mem_ctl_info {
 #endif
 };
 
-/*
- * Maximum number of memory controllers in the coherent fabric.
- */
-#define EDAC_MAX_MCS	2 * MAX_NUMNODES
-
 #endif

@@ -16,6 +16,7 @@
 #ifndef __PHY_H
 #define __PHY_H
 
+#include <linux/compiler.h>
 #include <linux/spinlock.h>
 #include <linux/ethtool.h>
 #include <linux/mdio.h>
@@ -74,11 +75,12 @@ typedef enum {
 	PHY_INTERFACE_MODE_RGMII_TXID,
 	PHY_INTERFACE_MODE_RTBI,
 	PHY_INTERFACE_MODE_SMII,
+#ifndef __GENKSYMS__
+	PHY_INTERFACE_MODE_XGMII,
+	PHY_INTERFACE_MODE_MOCA,
+	PHY_INTERFACE_MODE_MAX,
+#endif
 } phy_interface_t;
-
-#define PHY_INTERFACE_MODE_XGMII	(PHY_INTERFACE_MODE_SMII+1)
-#define PHY_INTERFACE_MODE_MAX \
-	(PHY_INTERFACE_MODE_XGMII - PHY_INTERFACE_MODE_NA + 1)
 
 /**
  * It maps 'enum phy_interface_t' found in include/linux/phy.h
@@ -112,6 +114,10 @@ static inline const char *phy_modes(phy_interface_t interface)
 		return "rtbi";
 	case PHY_INTERFACE_MODE_SMII:
 		return "smii";
+	case PHY_INTERFACE_MODE_XGMII:
+		return "xgmii";
+	case PHY_INTERFACE_MODE_MOCA:
+		return "moca";
 	default:
 		return "unknown";
 	}
@@ -319,6 +325,7 @@ struct phy_c45_device_ids {
  * c45_ids: 802.3-c45 Device Identifers if is_c45.
  * is_c45:  Set to true if this phy uses clause 45 addressing.
  * is_internal: Set to true if this phy is internal to a MAC.
+ * suspended: Set to true if this phy has been suspended successfully.
  * state: state of the PHY for management purposes
  * dev_flags: Device-specific flags used by the PHY driver.
  * addr: Bus address of PHY
@@ -346,16 +353,17 @@ struct phy_device {
 	/* And management functions */
 	struct phy_driver *drv;
 
-	struct mii_bus *bus;
+	struct mii_bus RH_KABI_RENAME(*bus, *mdio_bus);
 
-	struct device dev;
+	struct device RH_KABI_RENAME(dev, mdio_dev);
 
 	u32 phy_id;
 
 	struct phy_c45_device_ids c45_ids;
 	bool is_c45;
 	RH_KABI_FILL_HOLE(bool is_internal)
-	/* there is 2-bytes hole on all platforms */
+	RH_KABI_FILL_HOLE(bool suspended)
+	/* there is 1-byte hole on all platforms */
 
 	enum phy_state state;
 
@@ -364,7 +372,7 @@ struct phy_device {
 	phy_interface_t interface;
 
 	/* Bus address of the PHY (0-31) */
-	int addr;
+	int RH_KABI_RENAME(addr, mdio_addr);
 
 	/*
 	 * forced speed & duplex (no autoneg)
@@ -385,7 +393,6 @@ struct phy_device {
 	/* See mii.h for more info */
 	u32 supported;
 	u32 advertising;
-	u32 lp_advertising;
 
 	int autoneg;
 
@@ -410,12 +417,17 @@ struct phy_device {
 
 	struct net_device *attached_dev;
 
-	u8 mdix;
-
 	void (*adjust_link)(struct net_device *dev);
 	RH_KABI_DEPRECATE_FN(void, adjust_state, struct net_device *dev)
+	RH_KABI_EXTEND(u32 lp_advertising)
+	RH_KABI_EXTEND(u8 mdix)
+	RH_KABI_EXTEND(int mdio_flags)
+	RH_KABI_EXTEND(const struct dev_pm_ops *mdio_pm_ops)
+
+	/* Energy efficient ethernet modes which should be prohibited */
+	RH_KABI_EXTEND(u32 eee_broken_modes)
 };
-#define to_phy_device(d) container_of(d, struct phy_device, dev)
+#define to_phy_device(d) container_of(d, struct phy_device, mdio_dev)
 
 /* struct phy_driver: Driver structure for a particular PHY type
  *
@@ -429,13 +441,13 @@ struct phy_device {
  * flags: A bitfield defining certain other features this PHY
  *   supports (like interrupts)
  *
- * The drivers must implement config_aneg and read_status.  All
- * other functions are optional. Note that none of these
- * functions should be called from interrupt time.  The goal is
- * for the bus read/write functions to be able to block when the
- * bus transaction is happening, and be freed up by an interrupt
- * (The MPC85xx has this ability, though it is not currently
- * supported in the driver).
+ * All functions are optional. If config_aneg or read_status
+ * are not implemented, the phy core uses the genphy versions.
+ * Note that none of these functions should be called from
+ * interrupt time. The goal is for the bus read/write functions
+ * to be able to block when the bus transaction is happening,
+ * and be freed up by an interrupt (The MPC85xx has this ability,
+ * though it is not currently supported in the driver).
  */
 struct phy_driver {
 	u32 phy_id;
@@ -528,6 +540,34 @@ struct phy_driver {
 	/* Determines the auto negotiation result */
 	RH_KABI_EXTEND(int (*aneg_done)(struct phy_device *phydev))
 
+	/*
+	 * Phy specific driver override for reading a MMD register.
+	 * This function is optional for PHY specific drivers.  When
+	 * not provided, the default MMD read function will be used
+	 * by phy_read_mmd(), which will use either a direct read for
+	 * Clause 45 PHYs or an indirect read for Clause 22 PHYs.
+	 *  devnum is the MMD device number within the PHY device,
+	 *  regnum is the register within the selected MMD device.
+	 */
+	RH_KABI_EXTEND(int (*read_mmd)(struct phy_device *dev, int devnum,
+				       u16 regnum))
+
+	/*
+	 * Phy specific driver override for writing a MMD register.
+	 * This function is optional for PHY specific drivers.  When
+	 * not provided, the default MMD write function will be used
+	 * by phy_write_mmd(), which will use either a direct write for
+	 * Clause 45 PHYs, or an indirect write for Clause 22 PHYs.
+	 *  devnum is the MMD device number within the PHY device,
+	 *  regnum is the register within the selected MMD device.
+	 *  val is the value to be written.
+	 */
+	RH_KABI_EXTEND(int (*write_mmd)(struct phy_device *dev, int devnum,
+					u16 regnum, u16 val))
+
+	RH_KABI_EXTEND(int (*read_page)(struct phy_device *dev))
+	RH_KABI_EXTEND(int (*write_page)(struct phy_device *dev, int page))
+
 	/* PHY API is not on symbol whitelist now so we can extend
 	 * this structure directly via simple RH_KABI_EXTEND.
 	 */
@@ -547,24 +587,6 @@ struct phy_fixup {
 };
 
 /**
- * phy_read_mmd - Convenience function for reading a register
- * from an MMD on a given PHY.
- * @phydev: The phy_device struct
- * @devad: The MMD to read from
- * @regnum: The register on the MMD to read
- *
- * Same rules as for phy_read();
- */
-static inline int phy_read_mmd(struct phy_device *phydev, int devad, u32 regnum)
-{
-	if (!phydev->is_c45)
-		return -EOPNOTSUPP;
-
-	return mdiobus_read(phydev->bus, phydev->addr,
-			    MII_ADDR_C45 | (devad << 16) | (regnum & 0xffff));
-}
-
-/**
  * phy_read - Convenience function for reading a given PHY register
  * @phydev: the phy_device struct
  * @regnum: register number to read
@@ -575,7 +597,19 @@ static inline int phy_read_mmd(struct phy_device *phydev, int devad, u32 regnum)
  */
 static inline int phy_read(struct phy_device *phydev, u32 regnum)
 {
-	return mdiobus_read(phydev->bus, phydev->addr, regnum);
+	return mdiobus_read(phydev->mdio_bus, phydev->mdio_addr, regnum);
+}
+
+/**
+ * __phy_read - convenience function for reading a given PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to read
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_read(struct phy_device *phydev, u32 regnum)
+{
+	return __mdiobus_read(phydev->mdio_bus, phydev->mdio_addr, regnum);
 }
 
 /**
@@ -590,7 +624,192 @@ static inline int phy_read(struct phy_device *phydev, u32 regnum)
  */
 static inline int phy_write(struct phy_device *phydev, u32 regnum, u16 val)
 {
-	return mdiobus_write(phydev->bus, phydev->addr, regnum, val);
+	return mdiobus_write(phydev->mdio_bus, phydev->mdio_addr, regnum, val);
+}
+
+/**
+ * __phy_write - Convenience function for writing a given PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @val: value to write to @regnum
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_write(struct phy_device *phydev, u32 regnum, u16 val)
+{
+	return __mdiobus_write(phydev->mdio_bus, phydev->mdio_addr, regnum,
+			       val);
+}
+
+/**
+ * phy_read_mmd - Convenience function for reading a register
+ * from an MMD on a given PHY.
+ * @phydev: The phy_device struct
+ * @devad: The MMD to read from
+ * @regnum: The register on the MMD to read
+ *
+ * Same rules as for phy_read();
+ */
+int phy_read_mmd(struct phy_device *phydev, int devad, u32 regnum);
+
+/**
+ * __phy_read_mmd - Convenience function for reading a register
+ * from an MMD on a given PHY.
+ * @phydev: The phy_device struct
+ * @devad: The MMD to read from
+ * @regnum: The register on the MMD to read
+ *
+ * Same rules as for __phy_read();
+ */
+int __phy_read_mmd(struct phy_device *phydev, int devad, u32 regnum);
+
+/**
+ * phy_write_mmd - Convenience function for writing a register
+ * on an MMD on a given PHY.
+ * @phydev: The phy_device struct
+ * @devad: The MMD to write to
+ * @regnum: The register on the MMD to read
+ * @val: value to write to @regnum
+ *
+ * Same rules as for phy_write();
+ */
+int phy_write_mmd(struct phy_device *phydev, int devad, u32 regnum, u16 val);
+
+/**
+ * __phy_write_mmd - Convenience function for writing a register
+ * on an MMD on a given PHY.
+ * @phydev: The phy_device struct
+ * @devad: The MMD to write to
+ * @regnum: The register on the MMD to read
+ * @val: value to write to @regnum
+ *
+ * Same rules as for __phy_write();
+ */
+int __phy_write_mmd(struct phy_device *phydev, int devad, u32 regnum, u16 val);
+
+int __phy_modify_changed(struct phy_device *phydev, u32 regnum, u16 mask,
+			 u16 set);
+int phy_modify_changed(struct phy_device *phydev, u32 regnum, u16 mask,
+		       u16 set);
+int __phy_modify(struct phy_device *phydev, u32 regnum, u16 mask, u16 set);
+int phy_modify(struct phy_device *phydev, u32 regnum, u16 mask, u16 set);
+
+int __phy_modify_mmd_changed(struct phy_device *phydev, int devad, u32 regnum,
+			     u16 mask, u16 set);
+int phy_modify_mmd_changed(struct phy_device *phydev, int devad, u32 regnum,
+			   u16 mask, u16 set);
+int __phy_modify_mmd(struct phy_device *phydev, int devad, u32 regnum,
+		     u16 mask, u16 set);
+int phy_modify_mmd(struct phy_device *phydev, int devad, u32 regnum,
+		   u16 mask, u16 set);
+
+/**
+ * __phy_set_bits - Convenience function for setting bits in a PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @val: bits to set
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_set_bits(struct phy_device *phydev, u32 regnum, u16 val)
+{
+	return __phy_modify(phydev, regnum, 0, val);
+}
+
+/**
+ * __phy_clear_bits - Convenience function for clearing bits in a PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @val: bits to clear
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_clear_bits(struct phy_device *phydev, u32 regnum,
+				   u16 val)
+{
+	return __phy_modify(phydev, regnum, val, 0);
+}
+
+/**
+ * phy_set_bits - Convenience function for setting bits in a PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @val: bits to set
+ */
+static inline int phy_set_bits(struct phy_device *phydev, u32 regnum, u16 val)
+{
+	return phy_modify(phydev, regnum, 0, val);
+}
+
+/**
+ * phy_clear_bits - Convenience function for clearing bits in a PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @val: bits to clear
+ */
+static inline int phy_clear_bits(struct phy_device *phydev, u32 regnum, u16 val)
+{
+	return phy_modify(phydev, regnum, val, 0);
+}
+
+/**
+ * __phy_set_bits_mmd - Convenience function for setting bits in a register
+ * on MMD
+ * @phydev: the phy_device struct
+ * @devad: the MMD containing register to modify
+ * @regnum: register number to modify
+ * @val: bits to set
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_set_bits_mmd(struct phy_device *phydev, int devad,
+		u32 regnum, u16 val)
+{
+	return __phy_modify_mmd(phydev, devad, regnum, 0, val);
+}
+
+/**
+ * __phy_clear_bits_mmd - Convenience function for clearing bits in a register
+ * on MMD
+ * @phydev: the phy_device struct
+ * @devad: the MMD containing register to modify
+ * @regnum: register number to modify
+ * @val: bits to clear
+ *
+ * The caller must have taken the MDIO bus lock.
+ */
+static inline int __phy_clear_bits_mmd(struct phy_device *phydev, int devad,
+		u32 regnum, u16 val)
+{
+	return __phy_modify_mmd(phydev, devad, regnum, val, 0);
+}
+
+/**
+ * phy_set_bits_mmd - Convenience function for setting bits in a register
+ * on MMD
+ * @phydev: the phy_device struct
+ * @devad: the MMD containing register to modify
+ * @regnum: register number to modify
+ * @val: bits to set
+ */
+static inline int phy_set_bits_mmd(struct phy_device *phydev, int devad,
+		u32 regnum, u16 val)
+{
+	return phy_modify_mmd(phydev, devad, regnum, 0, val);
+}
+
+/**
+ * phy_clear_bits_mmd - Convenience function for clearing bits in a register
+ * on MMD
+ * @phydev: the phy_device struct
+ * @devad: the MMD containing register to modify
+ * @regnum: register number to modify
+ * @val: bits to clear
+ */
+static inline int phy_clear_bits_mmd(struct phy_device *phydev, int devad,
+		u32 regnum, u16 val)
+{
+	return phy_modify_mmd(phydev, devad, regnum, val, 0);
 }
 
 /**
@@ -614,26 +833,13 @@ static inline bool phy_is_internal(struct phy_device *phydev)
 	return phydev->is_internal;
 }
 
-/**
- * phy_write_mmd - Convenience function for writing a register
- * on an MMD on a given PHY.
- * @phydev: The phy_device struct
- * @devad: The MMD to read from
- * @regnum: The register on the MMD to read
- * @val: value to write to @regnum
- *
- * Same rules as for phy_write();
- */
-static inline int phy_write_mmd(struct phy_device *phydev, int devad,
-				u32 regnum, u16 val)
-{
-	if (!phydev->is_c45)
-		return -EOPNOTSUPP;
-
-	regnum = MII_ADDR_C45 | ((devad & 0x1f) << 16) | (regnum & 0xffff);
-
-	return mdiobus_write(phydev->bus, phydev->addr, regnum, val);
-}
+int phy_save_page(struct phy_device *phydev);
+int phy_select_page(struct phy_device *phydev, int page);
+int phy_restore_page(struct phy_device *phydev, int oldpage, int ret);
+int phy_read_paged(struct phy_device *phydev, int page, u32 regnum);
+int phy_write_paged(struct phy_device *phydev, int page, u32 regnum, u16 val);
+int phy_modify_paged(struct phy_device *phydev, int page, u32 regnum,
+		     u16 mask, u16 set);
 
 struct phy_device *phy_device_create(struct mii_bus *bus, int addr, int phy_id,
 				     bool is_c45,
@@ -644,6 +850,7 @@ void phy_device_remove(struct phy_device *phydev);
 int phy_init_hw(struct phy_device *phydev);
 int phy_suspend(struct phy_device *phydev);
 int phy_resume(struct phy_device *phydev);
+int __phy_resume(struct phy_device *phydev);
 struct phy_device *phy_attach(struct net_device *dev, const char *bus_id,
 			      phy_interface_t interface);
 struct phy_device *phy_find_first(struct mii_bus *bus);
@@ -665,12 +872,25 @@ int phy_speed_down(struct phy_device *phydev, bool sync);
 int phy_speed_up(struct phy_device *phydev);
 
 int phy_stop_interrupts(struct phy_device *phydev);
+int phy_restart_aneg(struct phy_device *phydev);
 
-static inline int phy_read_status(struct phy_device *phydev)
+#define phydev_err(_phydev, format, args...)	\
+	dev_err(&_phydev->mdio_dev, format, ##args)
+
+#define phydev_dbg(_phydev, format, args...)	\
+	dev_dbg(&_phydev->mdio_dev, format, ##args)
+
+static inline const char *phydev_name(const struct phy_device *phydev)
 {
-	return phydev->drv->read_status(phydev);
+	return dev_name(&phydev->mdio_dev);
 }
 
+void phy_attached_print(struct phy_device *phydev, const char *fmt, ...)
+	__printf(2, 3);
+void phy_attached_info(struct phy_device *phydev);
+
+/* Clause 22 PHY */
+int genphy_config_init(struct phy_device *phydev);
 int genphy_restart_aneg(struct phy_device *phydev);
 int genphy_config_aneg(struct phy_device *phydev);
 int genphy_aneg_done(struct phy_device *phydev);
@@ -679,13 +899,34 @@ int genphy_read_status(struct phy_device *phydev);
 int genphy_suspend(struct phy_device *phydev);
 int genphy_resume(struct phy_device *phydev);
 int genphy_soft_reset(struct phy_device *phydev);
+
+/* Clause 45 PHY */
+int genphy_c45_restart_aneg(struct phy_device *phydev);
+int genphy_c45_aneg_done(struct phy_device *phydev);
+int genphy_c45_read_link(struct phy_device *phydev, u32 mmd_mask);
+int genphy_c45_read_lpa(struct phy_device *phydev);
+int genphy_c45_read_pma(struct phy_device *phydev);
+int genphy_c45_pma_setup_forced(struct phy_device *phydev);
+int genphy_c45_an_disable_aneg(struct phy_device *phydev);
+
+static inline int phy_read_status(struct phy_device *phydev)
+{
+	if (!phydev->drv)
+		return -EIO;
+
+	if (phydev->drv->read_status)
+		return phydev->drv->read_status(phydev);
+	else
+		return genphy_read_status(phydev);
+}
+
 void phy_driver_unregister(struct phy_driver *drv);
 void phy_drivers_unregister(struct phy_driver *drv, int n);
 int phy_driver_register(struct phy_driver *new_driver);
 int phy_drivers_register(struct phy_driver *new_driver, int n);
 void phy_state_machine(struct work_struct *work);
 void phy_change(struct work_struct *work);
-void phy_mac_interrupt(struct phy_device *phydev, int new_link);
+void phy_mac_interrupt(struct phy_device *phydev);
 void phy_start_machine(struct phy_device *phydev);
 void phy_stop_machine(struct phy_device *phydev);
 int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd);
@@ -698,6 +939,7 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd);
 int phy_start_interrupts(struct phy_device *phydev);
 void phy_print_status(struct phy_device *phydev);
 void phy_device_free(struct phy_device *phydev);
+int phy_set_max_speed(struct phy_device *phydev, u32 max_speed);
 
 int phy_register_fixup(const char *bus_id, u32 phy_uid, u32 phy_uid_mask,
 		       int (*run)(struct phy_device *));

@@ -804,6 +804,9 @@ static inline u64 get_cqe_ts(struct mlx5_cqe64 *cqe)
 	return (u64)lo | ((u64)hi << 32);
 }
 
+#define MLX5_MPWQE_LOG_NUM_STRIDES_BASE	(9)
+#define MLX5_MPWQE_LOG_STRIDE_SZ_BASE	(6)
+
 struct mpwrq_cqe_bc {
 	__be16	filler_consumed_strides;
 	__be16	byte_cnt;
@@ -1048,6 +1051,8 @@ enum mlx5_cap_type {
 	MLX5_CAP_VECTOR_CALC,
 	MLX5_CAP_QOS,
 	MLX5_CAP_DEBUG,
+	MLX5_CAP_RESERVED_14,
+	MLX5_CAP_DEV_MEM,
 	/* NUM OF CAP Types */
 	MLX5_CAP_NUM
 };
@@ -1079,6 +1084,9 @@ enum mlx5_qcam_feature_groups {
 /* GET Dev Caps macros */
 #define MLX5_CAP_GEN(mdev, cap) \
 	MLX5_GET(cmd_hca_cap, mdev->caps.hca_cur[MLX5_CAP_GENERAL], cap)
+
+#define MLX5_CAP_GEN_64(mdev, cap) \
+	MLX5_GET64(cmd_hca_cap, mdev->caps.hca_cur[MLX5_CAP_GENERAL], cap)
 
 #define MLX5_CAP_GEN_MAX(mdev, cap) \
 	MLX5_GET(cmd_hca_cap, mdev->caps.hca_max[MLX5_CAP_GENERAL], cap)
@@ -1118,6 +1126,12 @@ enum mlx5_qcam_feature_groups {
 
 #define MLX5_CAP_FLOWTABLE_NIC_RX_MAX(mdev, cap) \
 	MLX5_CAP_FLOWTABLE_MAX(mdev, flow_table_properties_nic_receive.cap)
+
+#define MLX5_CAP_FLOWTABLE_NIC_TX(mdev, cap) \
+		MLX5_CAP_FLOWTABLE(mdev, flow_table_properties_nic_transmit.cap)
+
+#define MLX5_CAP_FLOWTABLE_NIC_TX_MAX(mdev, cap) \
+	MLX5_CAP_FLOWTABLE_MAX(mdev, flow_table_properties_nic_transmit.cap)
 
 #define MLX5_CAP_FLOWTABLE_SNIFFER_RX(mdev, cap) \
 	MLX5_CAP_FLOWTABLE(mdev, flow_table_properties_nic_receive_sniffer.cap)
@@ -1201,6 +1215,12 @@ enum mlx5_qcam_feature_groups {
 
 #define MLX5_CAP64_FPGA(mdev, cap) \
 	MLX5_GET64(fpga_cap, (mdev)->caps.fpga, cap)
+
+#define MLX5_CAP_DEV_MEM(mdev, cap)\
+	MLX5_GET(device_mem_cap, mdev->caps.hca_cur[MLX5_CAP_DEV_MEM], cap)
+
+#define MLX5_CAP64_DEV_MEM(mdev, cap)\
+	MLX5_GET64(device_mem_cap, mdev->caps.hca_cur[MLX5_CAP_DEV_MEM], cap)
 
 enum {
 	MLX5_CMD_STAT_OK			= 0x0,

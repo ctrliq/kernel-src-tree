@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
 snd-soc-da7213-objs := da7213.o
 snd-soc-da7219-objs := da7219.o da7219-aad.o
 snd-soc-dmic-objs := dmic.o

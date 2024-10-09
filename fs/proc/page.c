@@ -8,12 +8,14 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/hugetlb.h>
+#include <linux/page_idle.h>
 #include <linux/kernel-page-flags.h>
 #include <asm/uaccess.h>
 #include "internal.h"
 
 #define KPMSIZE sizeof(u64)
 #define KPMMASK (KPMSIZE - 1)
+#define KPMBITS (KPMSIZE * BITS_PER_BYTE)
 
 /* /proc/kpagecount - an array exposing page counts
  *
@@ -53,6 +55,8 @@ static ssize_t kpagecount_read(struct file *file, char __user *buf,
 		pfn++;
 		out++;
 		count -= KPMSIZE;
+
+		cond_resched();
 	}
 
 	*ppos += (char __user *)out - buf;
@@ -133,8 +137,11 @@ u64 stable_page_flags(struct page *page)
 	if (PageBuddy(page))
 		u |= 1 << KPF_BUDDY;
 
-	if (PageBalloon(page))
-		u |= 1 << KPF_BALLOON;
+	if (PageOffline(page))
+		u |= 1 << KPF_OFFLINE;
+
+	if (page_is_idle(page))
+		u |= 1 << KPF_IDLE;
 
 	u |= kpf_copy_bit(k, KPF_LOCKED,	PG_locked);
 
@@ -202,6 +209,8 @@ static ssize_t kpageflags_read(struct file *file, char __user *buf,
 		pfn++;
 		out++;
 		count -= KPMSIZE;
+
+		cond_resched();
 	}
 
 	*ppos += (char __user *)out - buf;

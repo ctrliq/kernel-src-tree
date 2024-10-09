@@ -62,6 +62,19 @@ netlink_kernel_create(struct net *net, int unit, struct netlink_kernel_cfg *cfg)
 	return __netlink_kernel_create(net, unit, THIS_MODULE, cfg);
 }
 
+/* RHEL: Specific implementation of NL_SET_ERR_MSG* macros. Due to absence of
+ * ext-ack support in RHEL7 the macros don't pass the error message to caller
+ * and instead of this they simply put the message to the system log.
+ * To avoid flooding of the log macro pr_debug() is used and the error messages
+ * can be enabled or disabled via dynamic_debug in sysfs.
+ */
+#define NL_SET_ERR_MSG(unused, msg) do {		\
+	static const char __msg[] = msg;		\
+	pr_debug("%s", __msg);				\
+} while(0)
+
+#define NL_SET_ERR_MSG_MOD(unused, msg)	NL_SET_ERR_MSG(unused, msg)
+
 extern void netlink_kernel_release(struct sock *sk);
 extern int __netlink_change_ngroups(struct sock *sk, unsigned int groups);
 extern int netlink_change_ngroups(struct sock *sk, unsigned int groups);

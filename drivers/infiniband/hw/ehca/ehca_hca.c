@@ -96,7 +96,8 @@ int ehca_query_device(struct ib_device *ibdev, struct ib_device_attr *props,
 	props->hw_ver          = rblock->hw_ver;
 	props->max_qp          = limit_uint(rblock->max_qp);
 	props->max_qp_wr       = limit_uint(rblock->max_wqes_wq);
-	props->max_sge         = limit_uint(rblock->max_sge);
+	props->max_send_sge    = limit_uint(rblock->max_sge);
+	props->max_recv_sge    = limit_uint(rblock->max_sge);
 	props->max_sge_rd      = limit_uint(rblock->max_sge_rd);
 	props->max_cq          = limit_uint(rblock->max_cq);
 	props->max_cqe         = limit_uint(rblock->max_cqe);

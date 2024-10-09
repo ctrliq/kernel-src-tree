@@ -159,7 +159,6 @@ xfs_free_perag(
 		spin_unlock(&mp->m_perag_lock);
 		ASSERT(pag);
 		ASSERT(atomic_read(&pag->pag_ref) == 0);
-		xfs_buf_hash_destroy(pag);
 		call_rcu(&pag->rcu_head, __xfs_free_perag);
 	}
 }
@@ -213,12 +212,13 @@ xfs_initialize_perag(
 		spin_lock_init(&pag->pag_ici_lock);
 		mutex_init(&pag->pag_ici_reclaim_lock);
 		INIT_RADIX_TREE(&pag->pag_ici_root, GFP_ATOMIC);
-		if (xfs_buf_hash_init(pag))
-			goto out_free_pag;
+
 		init_waitqueue_head(&pag->pagb_wait);
+		spin_lock_init(&pag->pag_buf_lock);
+		pag->pag_buf_tree = RB_ROOT;
 
 		if (radix_tree_preload(GFP_NOFS))
-			goto out_hash_destroy;
+			goto out_free_pag;
 
 		spin_lock(&mp->m_perag_lock);
 		if (radix_tree_insert(&mp->m_perag_tree, index, pag)) {
@@ -226,7 +226,7 @@ xfs_initialize_perag(
 			spin_unlock(&mp->m_perag_lock);
 			radix_tree_preload_end();
 			error = -EEXIST;
-			goto out_hash_destroy;
+			goto out_free_pag;
 		}
 		spin_unlock(&mp->m_perag_lock);
 		radix_tree_preload_end();
@@ -241,8 +241,6 @@ xfs_initialize_perag(
 		*maxagi = index;
 	return 0;
 
-out_hash_destroy:
-	xfs_buf_hash_destroy(pag);
 out_free_pag:
 	kmem_free(pag);
 out_unwind_new_pags:
@@ -251,7 +249,6 @@ out_unwind_new_pags:
 		pag = radix_tree_delete(&mp->m_perag_tree, index);
 		if (!pag)
 			break;
-		xfs_buf_hash_destroy(pag);
 		kmem_free(pag);
 	}
 	return error;
@@ -698,7 +695,7 @@ xfs_mountfs(
 	xfs_set_maxicount(mp);
 
 	/* enable fail_at_unmount as default */
-	mp->m_fail_unmount = 1;
+	mp->m_fail_unmount = true;
 
 	error = xfs_sysfs_init(&mp->m_kobj, &xfs_mp_ktype, NULL, mp->m_fsname);
 	if (error)

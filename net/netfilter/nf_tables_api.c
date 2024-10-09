@@ -110,12 +110,12 @@ static void nft_ctx_init(struct nft_ctx *ctx,
 	ctx->seq	= nlh->nlmsg_seq;
 }
 
-static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
-					 int msg_type, u32 size)
+static struct nft_trans *nft_trans_alloc_gfp(const struct nft_ctx *ctx,
+					     int msg_type, u32 size, gfp_t gfp)
 {
 	struct nft_trans *trans;
 
-	trans = kzalloc(sizeof(struct nft_trans) + size, GFP_KERNEL);
+	trans = kzalloc(sizeof(struct nft_trans) + size, gfp);
 	if (trans == NULL)
 		return NULL;
 
@@ -123,6 +123,12 @@ static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
 	trans->ctx	= *ctx;
 
 	return trans;
+}
+
+static struct nft_trans *nft_trans_alloc(const struct nft_ctx *ctx,
+					 int msg_type, u32 size)
+{
+	return nft_trans_alloc_gfp(ctx, msg_type, size, GFP_KERNEL);
 }
 
 static void nft_trans_destroy(struct nft_trans *trans)
@@ -2933,9 +2939,9 @@ static int nf_tables_delset(struct net *net, struct sock *nlsk,
 }
 
 static int nf_tables_bind_check_setelem(const struct nft_ctx *ctx,
-					const struct nft_set *set,
+					struct nft_set *set,
 					const struct nft_set_iter *iter,
-					const struct nft_set_elem *elem)
+					struct nft_set_elem *elem)
 {
 	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem->priv);
 	enum nft_registers dreg;
@@ -3143,9 +3149,9 @@ struct nft_set_dump_args {
 };
 
 static int nf_tables_dump_setelem(const struct nft_ctx *ctx,
-				  const struct nft_set *set,
+				  struct nft_set *set,
 				  const struct nft_set_iter *iter,
-				  const struct nft_set_elem *elem)
+				  struct nft_set_elem *elem)
 {
 	struct nft_set_dump_args *args;
 
@@ -3156,7 +3162,7 @@ static int nf_tables_dump_setelem(const struct nft_ctx *ctx,
 static int nf_tables_dump_set(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct net *net = sock_net(skb->sk);
-	const struct nft_set *set;
+	struct nft_set *set;
 	struct nft_set_dump_args args;
 	struct nft_ctx ctx;
 	struct nlattr *nla[NFTA_SET_ELEM_LIST_MAX + 1];
@@ -3649,6 +3655,35 @@ err1:
 	return err;
 }
 
+static int nft_flush_set(const struct nft_ctx *ctx,
+			 struct nft_set *set,
+			 const struct nft_set_iter *iter,
+			 struct nft_set_elem *elem)
+{
+	struct nft_trans *trans;
+	int err;
+
+	trans = nft_trans_alloc_gfp(ctx, NFT_MSG_DELSETELEM,
+				    sizeof(struct nft_trans_elem), GFP_ATOMIC);
+	if (!trans)
+		return -ENOMEM;
+
+	if (!set->ops->deactivate_one(set, elem->priv)) {
+		err = -ENOENT;
+		goto err1;
+	}
+	set->ndeact++;
+
+	nft_trans_elem_set(trans) = set;
+	nft_trans_elem(trans) = *elem;
+	list_add_tail(&trans->list, &ctx->net->nft.commit_list);
+
+	return 0;
+err1:
+	kfree(trans);
+	return err;
+}
+
 static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
 				struct sk_buff *skb, const struct nlmsghdr *nlh,
 				const struct nlattr * const nla[])
@@ -3657,9 +3692,6 @@ static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
 	struct nft_set *set;
 	struct nft_ctx ctx;
 	int rem, err = 0;
-
-	if (nla[NFTA_SET_ELEM_LIST_ELEMENTS] == NULL)
-		return -EINVAL;
 
 	err = nft_ctx_init_from_elemattr(&ctx, net, skb, nlh, nla);
 	if (err < 0)
@@ -3670,6 +3702,17 @@ static int nf_tables_delsetelem(struct net *net, struct sock *nlsk,
 		return PTR_ERR(set);
 	if (!list_empty(&set->bindings) && set->flags & NFT_SET_CONSTANT)
 		return -EBUSY;
+
+	if (nla[NFTA_SET_ELEM_LIST_ELEMENTS] == NULL) {
+		struct nft_set_dump_args args = {
+			.iter	= {
+				.fn		= nft_flush_set,
+			},
+		};
+		set->ops->walk(&ctx, set, &args.iter);
+
+		return args.iter.err;
+	}
 
 	nla_for_each_nested(attr, nla[NFTA_SET_ELEM_LIST_ELEMENTS], rem) {
 		err = nft_del_setelem(&ctx, set, attr);
@@ -4196,9 +4239,9 @@ static int nf_tables_check_loops(const struct nft_ctx *ctx,
 				 const struct nft_chain *chain);
 
 static int nf_tables_loop_check_setelem(const struct nft_ctx *ctx,
-					const struct nft_set *set,
+					struct nft_set *set,
 					const struct nft_set_iter *iter,
-					const struct nft_set_elem *elem)
+					struct nft_set_elem *elem)
 {
 	const struct nft_set_ext *ext = nft_set_elem_ext(set, elem->priv);
 	const struct nft_data *data;
@@ -4222,7 +4265,7 @@ static int nf_tables_check_loops(const struct nft_ctx *ctx,
 {
 	const struct nft_rule *rule;
 	const struct nft_expr *expr, *last;
-	const struct nft_set *set;
+	struct nft_set *set;
 	struct nft_set_binding *binding;
 	struct nft_set_iter iter;
 

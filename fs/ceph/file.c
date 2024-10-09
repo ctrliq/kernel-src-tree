@@ -1487,6 +1487,7 @@ retry_snap:
 	    (ci->i_ceph_flags & CEPH_I_ERROR_WRITE)) {
 		struct ceph_snap_context *snapc;
 		struct iov_iter i;
+		loff_t orig_ki_pos;
 		mutex_unlock(&inode->i_mutex);
 
 		spin_lock(&ci->i_ceph_lock);
@@ -1504,11 +1505,15 @@ retry_snap:
 
 		iov_iter_init(&i, iov, nr_segs, count, 0);
 
+		orig_ki_pos = iocb->ki_pos;
+		iocb->ki_pos = pos;
 		if (file->f_flags & O_DIRECT)
 			written = ceph_direct_read_write(iocb, &i, snapc,
 							 &prealloc_cf);
 		else
 			written = ceph_sync_write(iocb, &i, snapc);
+		if (iocb->ki_pos == pos)
+			iocb->ki_pos = orig_ki_pos;
 
 		ceph_put_snap_context(snapc);
 	} else {

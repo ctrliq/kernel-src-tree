@@ -319,11 +319,13 @@ static struct ip6_tnl *ip6gre_tunnel_locate(struct net *net,
 	if (t || !create)
 		return t;
 
-	if (parms->name[0])
+	if (parms->name[0]) {
+		if (!dev_valid_name(parms->name))
+			return NULL;
 		strlcpy(name, parms->name, IFNAMSIZ);
-	else
+	} else {
 		strcpy(name, "ip6gre%d");
-
+	}
 	dev = alloc_netdev(sizeof(*t), name, ip6gre_tunnel_setup);
 	if (!dev)
 		return NULL;
@@ -515,6 +517,9 @@ static netdev_tx_t __gre6_xmit(struct sk_buff *skb,
 		fl6->daddr = ((struct ipv6hdr *)skb->data)->daddr;
 	else
 		fl6->daddr = tunnel->parms.raddr;
+
+	if (skb_cow_head(skb, dev->needed_headroom ?: tunnel->hlen))
+		return -ENOMEM;
 
 	if (tunnel->parms.o_flags & TUNNEL_SEQ)
 		tunnel->o_seqno++;
@@ -1286,7 +1291,7 @@ static void ip6gre_tap_setup(struct net_device *dev)
 
 	ether_setup(dev);
 
-	dev->max_mtu = 0;
+	dev->extended->max_mtu = 0;
 	dev->netdev_ops = &ip6gre_tap_netdev_ops;
 	dev->extended->needs_free_netdev = true;
 	dev->extended->priv_destructor = ip6gre_dev_free;
@@ -1296,12 +1301,6 @@ static void ip6gre_tap_setup(struct net_device *dev)
 	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 	netif_keep_dst(dev);
 }
-
-bool is_ip6gretap_dev(const struct net_device *dev)
-{
-	return dev->netdev_ops == &ip6gre_tap_netdev_ops;
-}
-EXPORT_SYMBOL_GPL(is_ip6gretap_dev);
 
 static int ip6gre_newlink(struct net *src_net, struct net_device *dev,
 	struct nlattr *tb[], struct nlattr *data[])

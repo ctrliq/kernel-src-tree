@@ -901,10 +901,10 @@ static int act_open_rpl_status_to_errno(int status)
 	}
 }
 
-static void csk_act_open_retry_timer(unsigned long data)
+static void csk_act_open_retry_timer(struct timer_list *t)
 {
 	struct sk_buff *skb = NULL;
-	struct cxgbi_sock *csk = (struct cxgbi_sock *)data;
+	struct cxgbi_sock *csk = from_timer(csk, t, retry_timer);
 	struct cxgb4_lld_info *lldi = cxgbi_cdev_priv(csk->cdev);
 	void (*send_act_open_func)(struct cxgbi_sock *, struct sk_buff *,
 				   struct l2t_entry *);
@@ -992,8 +992,8 @@ static void do_act_open_rpl(struct cxgbi_device *cdev, struct sk_buff *skb)
 	spin_lock_bh(&csk->lock);
 
 	if (status == CPL_ERR_CONN_EXIST &&
-	    csk->retry_timer.function != csk_act_open_retry_timer) {
-		csk->retry_timer.function = csk_act_open_retry_timer;
+	    csk->retry_timer.function != (TIMER_FUNC_TYPE)csk_act_open_retry_timer) {
+		csk->retry_timer.function = (TIMER_FUNC_TYPE)csk_act_open_retry_timer;
 		mod_timer(&csk->retry_timer, jiffies + HZ / 2);
 	} else
 		cxgbi_sock_fail_act_open(csk,
@@ -1547,16 +1547,22 @@ static void do_set_tcb_rpl(struct cxgbi_device *cdev, struct sk_buff *skb)
 	struct cxgbi_sock *csk;
 
 	csk = lookup_tid(t, tid);
-	if (!csk)
+	if (!csk) {
 		pr_err("can't find conn. for tid %u.\n", tid);
+		return;
+	}
 
 	log_debug(1 << CXGBI_DBG_TOE | 1 << CXGBI_DBG_SOCK,
 		"csk 0x%p,%u,%lx,%u, status 0x%x.\n",
 		csk, csk->state, csk->flags, csk->tid, rpl->status);
 
-	if (rpl->status != CPL_ERR_NONE)
+	if (rpl->status != CPL_ERR_NONE) {
 		pr_err("csk 0x%p,%u, SET_TCB_RPL status %u.\n",
 			csk, tid, rpl->status);
+		csk->err = -EINVAL;
+	}
+
+	complete(&csk->cmpl);
 
 	__kfree_skb(skb);
 }
@@ -1766,8 +1772,7 @@ static int init_act_open(struct cxgbi_sock *csk)
 		csk->mtu = dst_mtu(csk->dst);
 	cxgb4_best_mtu(lldi->mtus, csk->mtu, &csk->mss_idx);
 	csk->tx_chan = cxgb4_port_chan(ndev);
-	csk->smac_idx = cxgb4_tp_smt_idx(lldi->adapter_type,
-					 cxgb4_port_viid(ndev));
+	csk->smac_idx = ((struct port_info *)netdev_priv(ndev))->smt_idx;
 	step = lldi->ntxq / lldi->nchan;
 	csk->txq_idx = cxgb4_port_idx(ndev) * step;
 	step = lldi->nrxq / lldi->nchan;
@@ -1983,7 +1988,7 @@ static int ddp_set_map(struct cxgbi_ppm *ppm, struct cxgbi_sock *csk,
 }
 
 static int ddp_setup_conn_pgidx(struct cxgbi_sock *csk, unsigned int tid,
-				int pg_idx, bool reply)
+				int pg_idx)
 {
 	struct sk_buff *skb;
 	struct cpl_set_tcb_field *req;
@@ -1999,7 +2004,7 @@ static int ddp_setup_conn_pgidx(struct cxgbi_sock *csk, unsigned int tid,
 	req = (struct cpl_set_tcb_field *)skb->head;
 	INIT_TP_WR(req, csk->tid);
 	OPCODE_TID(req) = htonl(MK_OPCODE_TID(CPL_SET_TCB_FIELD, csk->tid));
-	req->reply_ctrl = htons(NO_REPLY_V(reply) | QUEUENO_V(csk->rss_qid));
+	req->reply_ctrl = htons(NO_REPLY_V(0) | QUEUENO_V(csk->rss_qid));
 	req->word_cookie = htons(0);
 	req->mask = cpu_to_be64(0x3 << 8);
 	req->val = cpu_to_be64(pg_idx << 8);
@@ -2008,12 +2013,15 @@ static int ddp_setup_conn_pgidx(struct cxgbi_sock *csk, unsigned int tid,
 	log_debug(1 << CXGBI_DBG_TOE | 1 << CXGBI_DBG_SOCK,
 		"csk 0x%p, tid 0x%x, pg_idx %u.\n", csk, csk->tid, pg_idx);
 
+	reinit_completion(&csk->cmpl);
 	cxgb4_ofld_send(csk->cdev->ports[csk->port_id], skb);
-	return 0;
+	wait_for_completion(&csk->cmpl);
+
+	return csk->err;
 }
 
 static int ddp_setup_conn_digest(struct cxgbi_sock *csk, unsigned int tid,
-				 int hcrc, int dcrc, int reply)
+				 int hcrc, int dcrc)
 {
 	struct sk_buff *skb;
 	struct cpl_set_tcb_field *req;
@@ -2031,7 +2039,7 @@ static int ddp_setup_conn_digest(struct cxgbi_sock *csk, unsigned int tid,
 	req = (struct cpl_set_tcb_field *)skb->head;
 	INIT_TP_WR(req, tid);
 	OPCODE_TID(req) = htonl(MK_OPCODE_TID(CPL_SET_TCB_FIELD, tid));
-	req->reply_ctrl = htons(NO_REPLY_V(reply) | QUEUENO_V(csk->rss_qid));
+	req->reply_ctrl = htons(NO_REPLY_V(0) | QUEUENO_V(csk->rss_qid));
 	req->word_cookie = htons(0);
 	req->mask = cpu_to_be64(0x3 << 4);
 	req->val = cpu_to_be64(((hcrc ? ULP_CRC_HEADER : 0) |
@@ -2041,8 +2049,11 @@ static int ddp_setup_conn_digest(struct cxgbi_sock *csk, unsigned int tid,
 	log_debug(1 << CXGBI_DBG_TOE | 1 << CXGBI_DBG_SOCK,
 		"csk 0x%p, tid 0x%x, crc %d,%d.\n", csk, csk->tid, hcrc, dcrc);
 
+	reinit_completion(&csk->cmpl);
 	cxgb4_ofld_send(csk->cdev->ports[csk->port_id], skb);
-	return 0;
+	wait_for_completion(&csk->cmpl);
+
+	return csk->err;
 }
 
 static struct cxgbi_ppm *cdev2ppm(struct cxgbi_device *cdev)

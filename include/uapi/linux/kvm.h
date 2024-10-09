@@ -147,6 +147,25 @@ struct kvm_pit_config {
 
 #define KVM_PIT_SPEAKER_DUMMY     1
 
+struct kvm_hyperv_exit {
+#define KVM_EXIT_HYPERV_SYNIC          1
+#define KVM_EXIT_HYPERV_HCALL          2
+	__u32 type;
+	union {
+		struct {
+			__u32 msr;
+			__u64 control;
+			__u64 evt_page;
+			__u64 msg_page;
+		} synic;
+		struct {
+			__u64 input;
+			__u64 result;
+			__u64 params[2];
+		} hcall;
+	} u;
+};
+
 #define KVM_EXIT_UNKNOWN          0
 #define KVM_EXIT_EXCEPTION        1
 #define KVM_EXIT_IO               2
@@ -173,6 +192,7 @@ struct kvm_pit_config {
 #define KVM_EXIT_EPR              23
 #define KVM_EXIT_SYSTEM_EVENT     24
 #define KVM_EXIT_IOAPIC_EOI       26
+#define KVM_EXIT_HYPERV           27
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -316,7 +336,8 @@ struct kvm_run {
 			__u32 type;
 			__u64 flags;
 		} system_event;
-
+		/* KVM_EXIT_HYPERV */
+		struct kvm_hyperv_exit hyperv;
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -713,6 +734,9 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_X2APIC_API 129
 #define KVM_CAP_SPAPR_RESIZE_HPT 133
 #define KVM_CAP_PPC_GET_CPU_CHAR 151
+#define KVM_CAP_HYPERV_SYNIC 123
+#define KVM_CAP_HYPERV_SYNIC2 148
+#define KVM_CAP_HYPERV_VP_INDEX 149
 
 #ifdef KVM_CAP_IRQ_ROUTING
 
@@ -732,6 +756,16 @@ struct kvm_irq_routing_msi {
 #define KVM_IRQ_ROUTING_IRQCHIP 1
 #define KVM_IRQ_ROUTING_MSI 2
 
+struct kvm_irq_routing_hv_sint {
+	__u32 vcpu;
+	__u32 sint;
+};
+
+/* gsi routing entry types */
+#define KVM_IRQ_ROUTING_IRQCHIP 1
+#define KVM_IRQ_ROUTING_MSI 2
+#define KVM_IRQ_ROUTING_HV_SINT 4
+
 struct kvm_irq_routing_entry {
 	__u32 gsi;
 	__u32 type;
@@ -740,6 +774,7 @@ struct kvm_irq_routing_entry {
 	union {
 		struct kvm_irq_routing_irqchip irqchip;
 		struct kvm_irq_routing_msi msi;
+		struct kvm_irq_routing_hv_sint hv_sint;
 		__u32 pad[8];
 	} u;
 };

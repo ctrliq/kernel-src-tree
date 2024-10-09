@@ -325,6 +325,7 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int  ignore_hotplug:1)
 	RH_KABI_FILL_HOLE(unsigned int  hotplug_user_indicators:1)
 	RH_KABI_FILL_HOLE(unsigned int  bridge_d3:1)  /* Allow D3 for bridge*/
+	RH_KABI_FILL_HOLE(unsigned int  clear_retrain_link:1) /* Need to clear Retrain Link bit manually */
 	unsigned int	d3_delay;	/* D3->D0 transition time in ms */
 	unsigned int	d3cold_delay;	/* D3cold->D0 transition time in ms */
 
@@ -374,6 +375,7 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int has_secondary_link:1)
 	RH_KABI_FILL_HOLE(unsigned int non_compliant_bars:1) /* broken BARs; ignore them */
 	RH_KABI_FILL_HOLE(unsigned int is_thunderbolt:1) /* Thunderbolt controller */
+	RH_KABI_FILL_HOLE(unsigned int shpc_managed:1) /* SHPC owned by shpchp */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
@@ -1072,6 +1074,10 @@ int pcie_get_mps(struct pci_dev *dev);
 int pcie_set_mps(struct pci_dev *dev, int mps);
 int pcie_get_minimum_link(struct pci_dev *dev, enum pci_bus_speed *speed,
 			  enum pcie_link_width *width);
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
+			     enum pci_bus_speed *speed,
+			     enum pcie_link_width *width);
+void pcie_print_link_status(struct pci_dev *dev);
 bool pcie_has_flr(struct pci_dev *dev);
 void pcie_flr(struct pci_dev *dev);
 int __pci_reset_function(struct pci_dev *dev);
@@ -1289,7 +1295,6 @@ int pci_set_vga_state(struct pci_dev *pdev, bool decode,
 
 /* kmem_cache style wrapper around pci_alloc_consistent() */
 
-#include <linux/pci-dma.h>
 #include <linux/dmapool.h>
 
 #define	pci_pool dma_pool

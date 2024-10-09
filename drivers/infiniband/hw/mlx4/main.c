@@ -243,14 +243,9 @@ static int mlx4_ib_update_gids(struct gid_entry *gids,
 	return mlx4_ib_update_gids_v1(gids, ibdev, port_num);
 }
 
-static int mlx4_ib_add_gid(struct ib_device *device,
-			   u8 port_num,
-			   unsigned int index,
-			   const union ib_gid *gid,
-			   const struct ib_gid_attr *attr,
-			   void **context)
+static int mlx4_ib_add_gid(const struct ib_gid_attr *attr, void **context)
 {
-	struct mlx4_ib_dev *ibdev = to_mdev(device);
+	struct mlx4_ib_dev *ibdev = to_mdev(attr->device);
 	struct mlx4_ib_iboe *iboe = &ibdev->iboe;
 	struct mlx4_port_gid_table   *port_gid_table;
 	int free = -1, found = -1;
@@ -259,24 +254,25 @@ static int mlx4_ib_add_gid(struct ib_device *device,
 	int i;
 	struct gid_entry *gids = NULL;
 
-	if (!rdma_cap_roce_gid_table(device, port_num))
+	if (!rdma_cap_roce_gid_table(attr->device, attr->port_num))
 		return -EINVAL;
 
-	if (port_num > MLX4_MAX_PORTS)
+	if (attr->port_num > MLX4_MAX_PORTS)
 		return -EINVAL;
 
 	if (!context)
 		return -EINVAL;
 
-	port_gid_table = &iboe->gids[port_num - 1];
+	port_gid_table = &iboe->gids[attr->port_num - 1];
 	spin_lock_bh(&iboe->lock);
 	for (i = 0; i < MLX4_MAX_PORT_GIDS; ++i) {
-		if (!memcmp(&port_gid_table->gids[i].gid, gid, sizeof(*gid)) &&
-		    (port_gid_table->gids[i].gid_type == attr->gid_type))  {
+		if (!memcmp(&port_gid_table->gids[i].gid,
+			    &attr->gid, sizeof(attr->gid)) &&
+		    port_gid_table->gids[i].gid_type == attr->gid_type)  {
 			found = i;
 			break;
 		}
-		if (free < 0 && !memcmp(&port_gid_table->gids[i].gid, &zgid, sizeof(*gid)))
+		if (free < 0 && rdma_is_zero_gid(&port_gid_table->gids[i].gid))
 			free = i; /* HW has space */
 	}
 
@@ -289,7 +285,8 @@ static int mlx4_ib_add_gid(struct ib_device *device,
 				ret = -ENOMEM;
 			} else {
 				*context = port_gid_table->gids[free].ctx;
-				memcpy(&port_gid_table->gids[free].gid, gid, sizeof(*gid));
+				memcpy(&port_gid_table->gids[free].gid,
+				       &attr->gid, sizeof(attr->gid));
 				port_gid_table->gids[free].gid_type = attr->gid_type;
 				port_gid_table->gids[free].ctx->real_index = free;
 				port_gid_table->gids[free].ctx->refcount = 1;
@@ -302,7 +299,8 @@ static int mlx4_ib_add_gid(struct ib_device *device,
 		ctx->refcount++;
 	}
 	if (!ret && hw_update) {
-		gids = kmalloc(sizeof(*gids) * MLX4_MAX_PORT_GIDS, GFP_ATOMIC);
+		gids = kmalloc_array(MLX4_MAX_PORT_GIDS, sizeof(*gids),
+				     GFP_ATOMIC);
 		if (!gids) {
 			ret = -ENOMEM;
 		} else {
@@ -315,40 +313,38 @@ static int mlx4_ib_add_gid(struct ib_device *device,
 	spin_unlock_bh(&iboe->lock);
 
 	if (!ret && hw_update) {
-		ret = mlx4_ib_update_gids(gids, ibdev, port_num);
+		ret = mlx4_ib_update_gids(gids, ibdev, attr->port_num);
 		kfree(gids);
 	}
 
 	return ret;
 }
 
-static int mlx4_ib_del_gid(struct ib_device *device,
-			   u8 port_num,
-			   unsigned int index,
-			   void **context)
+static int mlx4_ib_del_gid(const struct ib_gid_attr *attr, void **context)
 {
 	struct gid_cache_context *ctx = *context;
-	struct mlx4_ib_dev *ibdev = to_mdev(device);
+	struct mlx4_ib_dev *ibdev = to_mdev(attr->device);
 	struct mlx4_ib_iboe *iboe = &ibdev->iboe;
 	struct mlx4_port_gid_table   *port_gid_table;
 	int ret = 0;
 	int hw_update = 0;
 	struct gid_entry *gids = NULL;
 
-	if (!rdma_cap_roce_gid_table(device, port_num))
+	if (!rdma_cap_roce_gid_table(attr->device, attr->port_num))
 		return -EINVAL;
 
-	if (port_num > MLX4_MAX_PORTS)
+	if (attr->port_num > MLX4_MAX_PORTS)
 		return -EINVAL;
 
-	port_gid_table = &iboe->gids[port_num - 1];
+	port_gid_table = &iboe->gids[attr->port_num - 1];
 	spin_lock_bh(&iboe->lock);
 	if (ctx) {
 		ctx->refcount--;
 		if (!ctx->refcount) {
 			unsigned int real_index = ctx->real_index;
 
-			memcpy(&port_gid_table->gids[real_index].gid, &zgid, sizeof(zgid));
+			memset(&port_gid_table->gids[real_index].gid, 0,
+			       sizeof(port_gid_table->gids[real_index].gid));
 			kfree(port_gid_table->gids[real_index].ctx);
 			port_gid_table->gids[real_index].ctx = NULL;
 			hw_update = 1;
@@ -357,7 +353,8 @@ static int mlx4_ib_del_gid(struct ib_device *device,
 	if (!ret && hw_update) {
 		int i;
 
-		gids = kmalloc(sizeof(*gids) * MLX4_MAX_PORT_GIDS, GFP_ATOMIC);
+		gids = kmalloc_array(MLX4_MAX_PORT_GIDS, sizeof(*gids),
+				     GFP_ATOMIC);
 		if (!gids) {
 			ret = -ENOMEM;
 		} else {
@@ -373,7 +370,7 @@ static int mlx4_ib_del_gid(struct ib_device *device,
 	spin_unlock_bh(&iboe->lock);
 
 	if (!ret && hw_update) {
-		ret = mlx4_ib_update_gids(gids, ibdev, port_num);
+		ret = mlx4_ib_update_gids(gids, ibdev, attr->port_num);
 		kfree(gids);
 	}
 	return ret;
@@ -517,9 +514,11 @@ static int mlx4_ib_query_device(struct ib_device *ibdev,
 	props->page_size_cap	   = dev->dev->caps.page_size_cap;
 	props->max_qp		   = dev->dev->quotas.qp;
 	props->max_qp_wr	   = dev->dev->caps.max_wqes - MLX4_IB_SQ_MAX_SPARE;
-	props->max_sge		   = min(dev->dev->caps.max_sq_sg,
-					 dev->dev->caps.max_rq_sg);
-	props->max_sge_rd	   = MLX4_MAX_SGE_RD;
+	props->max_send_sge =
+		min(dev->dev->caps.max_sq_sg, dev->dev->caps.max_rq_sg);
+	props->max_recv_sge =
+		min(dev->dev->caps.max_sq_sg, dev->dev->caps.max_rq_sg);
+	props->max_sge_rd = MLX4_MAX_SGE_RD;
 	props->max_cq		   = dev->dev->quotas.cq;
 	props->max_cqe		   = dev->dev->caps.max_cqes;
 	props->max_mr		   = dev->dev->quotas.mpt;
@@ -762,7 +761,8 @@ static int eth_link_query_port(struct ib_device *ibdev, u8 port,
 					   IB_WIDTH_4X : IB_WIDTH_1X;
 	props->active_speed	=  (((u8 *)mailbox->buf)[5] == 0x20 /*56Gb*/) ?
 					   IB_SPEED_FDR : IB_SPEED_QDR;
-	props->port_cap_flags	= IB_PORT_CM_SUP | IB_PORT_IP_BASED_GIDS;
+	props->port_cap_flags	= IB_PORT_CM_SUP;
+	props->ip_gids = true;
 	props->gid_tbl_len	= mdev->dev->caps.gid_table_len[port];
 	props->max_msg_sz	= mdev->dev->caps.max_msg_sz;
 	props->pkey_tbl_len	= 1;
@@ -874,24 +874,9 @@ out:
 static int mlx4_ib_query_gid(struct ib_device *ibdev, u8 port, int index,
 			     union ib_gid *gid)
 {
-	int ret;
-
 	if (rdma_protocol_ib(ibdev, port))
 		return __mlx4_ib_query_gid(ibdev, port, index, gid, 0);
-
-	if (!rdma_protocol_roce(ibdev, port))
-		return -ENODEV;
-
-	if (!rdma_cap_roce_gid_table(ibdev, port))
-		return -ENODEV;
-
-	ret = ib_get_cached_gid(ibdev, port, index, gid, NULL);
-	if (ret == -EAGAIN) {
-		memcpy(gid, &zgid, sizeof(*gid));
-		return 0;
-	}
-
-	return ret;
+	return 0;
 }
 
 static int mlx4_ib_query_sl2vl(struct ib_device *ibdev, u8 port, u64 *sl2vl_tbl)
@@ -2052,39 +2037,43 @@ out:
 	return err;
 }
 
-static ssize_t show_hca(struct device *device, struct device_attribute *attr,
-			char *buf)
+static ssize_t hca_type_show(struct device *device,
+			     struct device_attribute *attr, char *buf)
 {
 	struct mlx4_ib_dev *dev =
 		container_of(device, struct mlx4_ib_dev, ib_dev.dev);
 	return sprintf(buf, "MT%d\n", dev->dev->persist->pdev->device);
 }
+static DEVICE_ATTR_RO(hca_type);
 
-static ssize_t show_rev(struct device *device, struct device_attribute *attr,
-			char *buf)
+static ssize_t hw_rev_show(struct device *device,
+			   struct device_attribute *attr, char *buf)
 {
 	struct mlx4_ib_dev *dev =
 		container_of(device, struct mlx4_ib_dev, ib_dev.dev);
 	return sprintf(buf, "%x\n", dev->dev->rev_id);
 }
+static DEVICE_ATTR_RO(hw_rev);
 
-static ssize_t show_board(struct device *device, struct device_attribute *attr,
-			  char *buf)
+static ssize_t board_id_show(struct device *device,
+			     struct device_attribute *attr, char *buf)
 {
 	struct mlx4_ib_dev *dev =
 		container_of(device, struct mlx4_ib_dev, ib_dev.dev);
 	return sprintf(buf, "%.*s\n", MLX4_BOARD_ID_LEN,
 		       dev->dev->board_id);
 }
+static DEVICE_ATTR_RO(board_id);
 
-static DEVICE_ATTR(hw_rev,   S_IRUGO, show_rev,    NULL);
-static DEVICE_ATTR(hca_type, S_IRUGO, show_hca,    NULL);
-static DEVICE_ATTR(board_id, S_IRUGO, show_board,  NULL);
+static struct attribute *mlx4_class_attributes[] = {
+	&dev_attr_hw_rev.attr,
+	&dev_attr_hca_type.attr,
+	&dev_attr_board_id.attr,
+	NULL
+};
 
-static struct device_attribute *mlx4_class_attributes[] = {
-	&dev_attr_hw_rev,
-	&dev_attr_hca_type,
-	&dev_attr_board_id
+static const struct attribute_group mlx4_attr_group = {
+	.attrs = mlx4_class_attributes,
 };
 
 struct diag_counter {
@@ -2555,7 +2544,6 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 	ibdev->dev = dev;
 	ibdev->bond_next_port	= 0;
 
-	strlcpy(ibdev->ib_dev.name, "mlx4_%d", IB_DEVICE_NAME_MAX);
 	ibdev->ib_dev.owner		= THIS_MODULE;
 	ibdev->ib_dev.node_type		= RDMA_NODE_IB_CA;
 	ibdev->ib_dev.local_dma_lkey	= dev->caps.reserved_lkey;
@@ -2790,9 +2778,9 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 			goto err_counter;
 
 		ibdev->ib_uc_qpns_bitmap =
-			kmalloc(BITS_TO_LONGS(ibdev->steer_qpn_count) *
-				sizeof(long),
-				GFP_KERNEL);
+			kmalloc_array(BITS_TO_LONGS(ibdev->steer_qpn_count),
+				      sizeof(long),
+				      GFP_KERNEL);
 		if (!ibdev->ib_uc_qpns_bitmap)
 			goto err_steer_qp_release;
 
@@ -2817,7 +2805,9 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 	if (mlx4_ib_alloc_diag_counters(ibdev))
 		goto err_steer_free_bitmap;
 
-	if (ib_register_device(&ibdev->ib_dev, NULL))
+	rdma_set_device_sysfs_group(&ibdev->ib_dev, &mlx4_attr_group);
+	ibdev->ib_dev.driver_id = RDMA_DRIVER_MLX4;
+	if (ib_register_device(&ibdev->ib_dev, "mlx4_%d", NULL))
 		goto err_diag_counters;
 
 	if (mlx4_ib_mad_init(ibdev))
@@ -2837,12 +2827,6 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
 	if (dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ROCE_V1_V2) {
 		err = mlx4_config_roce_v2_port(dev, ROCE_V2_UDP_DPORT);
 		if (err)
-			goto err_notif;
-	}
-
-	for (j = 0; j < ARRAY_SIZE(mlx4_class_attributes); ++j) {
-		if (device_create_file(&ibdev->ib_dev.dev,
-				       mlx4_class_attributes[j]))
 			goto err_notif;
 	}
 

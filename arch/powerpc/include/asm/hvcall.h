@@ -276,6 +276,7 @@
 #define H_COP			0x304
 #define H_GET_MPP_X		0x314
 #define H_SET_MODE		0x31C
+#define H_BLOCK_REMOVE		0x328
 #define H_CLEAR_HPT		0x358
 #define H_RESIZE_HPT_PREPARE	0x36C
 #define H_RESIZE_HPT_COMMIT	0x370

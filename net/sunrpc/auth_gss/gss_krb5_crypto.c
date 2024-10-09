@@ -339,7 +339,6 @@ make_checksum_v2(struct krb5_ctx *kctx, char *header, int hdrlen,
 	struct scatterlist sg[1];
 	int err = -1;
 	u8 *checksumdata;
-	unsigned int checksumlen;
 
 	if (kctx->gk5e->keyed_cksum == 0) {
 		dprintk("%s: expected keyed hash for %s\n",
@@ -360,7 +359,6 @@ make_checksum_v2(struct krb5_ctx *kctx, char *header, int hdrlen,
 							CRYPTO_ALG_ASYNC);
 	if (IS_ERR(desc.tfm))
 		goto out_free_cksum;
-	checksumlen = crypto_hash_digestsize(desc.tfm);
 	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	err = crypto_hash_setkey(desc.tfm, cksumkey, kctx->gk5e->keylength);

@@ -35,6 +35,7 @@
 
 #include <linux/types.h>
 #include <linux/if_ether.h>	/* For ETH_ALEN. */
+#include <rdma/ib_user_ioctl_verbs.h>
 
 enum {
 	MLX5_QP_FLAG_SIGNATURE		= 1 << 0,
@@ -77,6 +78,9 @@ enum mlx5_lib_caps {
 	MLX5_LIB_CAP_4K_UAR	= (__u64)1 << 0,
 };
 
+enum mlx5_ib_alloc_uctx_v2_flags {
+	MLX5_IB_ALLOC_UCTX_DEVX	= 1 << 0,
+};
 struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u32	total_num_bfregs;
 	__u32	num_low_latency_bfregs;
@@ -448,6 +452,7 @@ enum mlx5_ib_mmap_cmd {
 	MLX5_IB_MMAP_CORE_CLOCK                 = 5,
 	MLX5_IB_MMAP_ALLOC_WC                   = 6,
 	MLX5_IB_MMAP_CLOCK_INFO                 = 7,
+	MLX5_IB_MMAP_DEVICE_MEM                 = 8,
 };
 
 enum {
@@ -458,4 +463,27 @@ enum {
 enum {
 	MLX5_IB_CLOCK_INFO_V1              = 0,
 };
+
+struct mlx5_ib_flow_counters_desc {
+	__u32	description;
+	__u32	index;
+};
+
+struct mlx5_ib_flow_counters_data {
+	RDMA_UAPI_PTR(struct mlx5_ib_flow_counters_desc *, counters_data);
+	__u32   ncounters;
+	__u32   reserved;
+};
+
+struct mlx5_ib_create_flow {
+	__u32   ncounters_data;
+	__u32   reserved;
+	/*
+	 * Following are counters data based on ncounters_data, each
+	 * entry in the data[] should match a corresponding counter object
+	 * that was pointed by a counters spec upon the flow creation
+	 */
+	struct mlx5_ib_flow_counters_data data[];
+};
+
 #endif /* MLX5_ABI_USER_H */

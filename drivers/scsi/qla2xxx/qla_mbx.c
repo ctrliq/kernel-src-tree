@@ -59,6 +59,8 @@ struct rom_cmd {
 	{ MBC_IOCB_COMMAND_A64 },
 	{ MBC_GET_ADAPTER_LOOP_ID },
 	{ MBC_READ_SFP },
+	{ MBC_GET_RNID_PARAMS },
+	{ MBC_GET_SET_ZIO_THRESHOLD },
 };
 
 static int is_rom_cmd(uint16_t cmd)
@@ -188,7 +190,7 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		goto premature_exit;
 	}
 
-	ha->flags.mbox_busy = 1;
+
 	/* Save mailbox command for debug */
 	ha->mcp = mcp;
 
@@ -197,12 +199,13 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 
 	spin_lock_irqsave(&ha->hardware_lock, flags);
 
-	if (ha->flags.purge_mbox || chip_reset != ha->chip_reset) {
+	if (ha->flags.purge_mbox || chip_reset != ha->chip_reset ||
+	    ha->flags.mbox_busy) {
 		rval = QLA_ABORTED;
-		ha->flags.mbox_busy = 0;
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
 		goto premature_exit;
 	}
+	ha->flags.mbox_busy = 1;
 
 	/* Load mailbox registers. */
 	if (IS_P3P_TYPE(ha))
@@ -253,9 +256,10 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		if (IS_P3P_TYPE(ha)) {
 			if (RD_REG_DWORD(&reg->isp82.hint) &
 				HINT_MBX_INT_PENDING) {
+				ha->flags.mbox_busy = 0;
 				spin_unlock_irqrestore(&ha->hardware_lock,
 					flags);
-				ha->flags.mbox_busy = 0;
+
 				atomic_dec(&ha->num_pend_mbx_stage2);
 				ql_dbg(ql_dbg_mbx, vha, 0x1010,
 				    "Pending mailbox timeout, exiting.\n");
@@ -273,6 +277,16 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		atomic_inc(&ha->num_pend_mbx_stage3);
 		if (!wait_for_completion_timeout(&ha->mbx_intr_comp,
 		    mcp->tov * HZ)) {
+			if (chip_reset != ha->chip_reset) {
+				spin_lock_irqsave(&ha->hardware_lock, flags);
+				ha->flags.mbox_busy = 0;
+				spin_unlock_irqrestore(&ha->hardware_lock,
+				    flags);
+				atomic_dec(&ha->num_pend_mbx_stage2);
+				atomic_dec(&ha->num_pend_mbx_stage3);
+				rval = QLA_ABORTED;
+				goto premature_exit;
+			}
 			ql_dbg(ql_dbg_mbx, vha, 0x117a,
 			    "cmd=%x Timeout.\n", command);
 			spin_lock_irqsave(&ha->hardware_lock, flags);
@@ -281,7 +295,9 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 
 		} else if (ha->flags.purge_mbox ||
 		    chip_reset != ha->chip_reset) {
+			spin_lock_irqsave(&ha->hardware_lock, flags);
 			ha->flags.mbox_busy = 0;
+			spin_unlock_irqrestore(&ha->hardware_lock, flags);
 			atomic_dec(&ha->num_pend_mbx_stage2);
 			atomic_dec(&ha->num_pend_mbx_stage3);
 			rval = QLA_ABORTED;
@@ -299,9 +315,9 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		if (IS_P3P_TYPE(ha)) {
 			if (RD_REG_DWORD(&reg->isp82.hint) &
 				HINT_MBX_INT_PENDING) {
+				ha->flags.mbox_busy = 0;
 				spin_unlock_irqrestore(&ha->hardware_lock,
 					flags);
-				ha->flags.mbox_busy = 0;
 				atomic_dec(&ha->num_pend_mbx_stage2);
 				ql_dbg(ql_dbg_mbx, vha, 0x1012,
 				    "Pending mailbox timeout, exiting.\n");
@@ -319,7 +335,10 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		while (!ha->flags.mbox_int) {
 			if (ha->flags.purge_mbox ||
 			    chip_reset != ha->chip_reset) {
+				spin_lock_irqsave(&ha->hardware_lock, flags);
 				ha->flags.mbox_busy = 0;
+				spin_unlock_irqrestore(&ha->hardware_lock,
+				    flags);
 				atomic_dec(&ha->num_pend_mbx_stage2);
 				rval = QLA_ABORTED;
 				goto premature_exit;
@@ -362,7 +381,10 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 		clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
 
 		if (IS_P3P_TYPE(ha) && ha->flags.isp82xx_fw_hung) {
+			spin_lock_irqsave(&ha->hardware_lock, flags);
 			ha->flags.mbox_busy = 0;
+			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+
 			/* Setting Link-Down error */
 			mcp->mb[0] = MBS_LINK_DOWN_ERROR;
 			ha->mcp = NULL;
@@ -435,7 +457,10 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 				 * then only PCI ERR flag would be set.
 				 * we will do premature exit for above case.
 				 */
+				spin_lock_irqsave(&ha->hardware_lock, flags);
 				ha->flags.mbox_busy = 0;
+				spin_unlock_irqrestore(&ha->hardware_lock,
+				    flags);
 				rval = QLA_FUNCTION_TIMEOUT;
 				goto premature_exit;
 			}
@@ -450,8 +475,9 @@ qla2x00_mailbox_command(scsi_qla_host_t *vha, mbx_cmd_t *mcp)
 			rval = QLA_FUNCTION_TIMEOUT;
 		 }
 	}
-
+	spin_lock_irqsave(&ha->hardware_lock, flags);
 	ha->flags.mbox_busy = 0;
+	spin_unlock_irqrestore(&ha->hardware_lock, flags);
 
 	/* Clean up */
 	ha->mcp = NULL;
@@ -2222,7 +2248,10 @@ qla2x00_lip_reset(scsi_qla_host_t *vha)
 		mcp->out_mb = MBX_2|MBX_1|MBX_0;
 	} else if (IS_FWI2_CAPABLE(vha->hw)) {
 		mcp->mb[0] = MBC_LIP_FULL_LOGIN;
-		mcp->mb[1] = BIT_6;
+		if (N2N_TOPO(vha->hw))
+			mcp->mb[1] = BIT_4; /* re-init */
+		else
+			mcp->mb[1] = BIT_6; /* LIP */
 		mcp->mb[2] = 0;
 		mcp->mb[3] = vha->hw->loop_reset_delay;
 		mcp->out_mb = MBX_3|MBX_2|MBX_1|MBX_0;
@@ -3071,22 +3100,25 @@ qla24xx_abort_command(srb_t *sp)
 	struct scsi_qla_host *vha = fcport->vha;
 	struct qla_hw_data *ha = vha->hw;
 	struct req_que *req = vha->req;
+	struct qla_qpair *qpair = sp->qpair;
 
 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x108c,
 	    "Entered %s.\n", __func__);
 
 	if (vha->flags.qpairs_available && sp->qpair)
 		req = sp->qpair->req;
+	else
+		return QLA_FUNCTION_FAILED;
 
 	if (ql2xasynctmfenable)
 		return qla24xx_async_abort_command(sp);
 
-	spin_lock_irqsave(&ha->hardware_lock, flags);
+	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
 	for (handle = 1; handle < req->num_outstanding_cmds; handle++) {
 		if (req->outstanding_cmds[handle] == sp)
 			break;
 	}
-	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
 	if (handle == req->num_outstanding_cmds) {
 		/* Command not found. */
 		return QLA_FUNCTION_FAILED;
@@ -3839,30 +3871,68 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		   "Format 1: WWPN %8phC.\n",
 		   vha->port_name);
 
-		/* N2N.  direct connect */
-		if (IS_QLA27XX(ha) &&
-		    ((rptid_entry->u.f1.flags>>1) & 0x7) == 2) {
-			/* if our portname is higher then initiate N2N login */
-			if (wwn_to_u64(vha->port_name) >
-			    wwn_to_u64(rptid_entry->u.f1.port_name)) {
-				// ??? qlt_update_host_map(vha, id);
-				vha->n2n_id = 0x1;
-				ql_dbg(ql_dbg_async, vha, 0x5075,
-				    "Format 1: Setting n2n_update_needed for id %d\n",
-				    vha->n2n_id);
+		switch (rptid_entry->u.f1.flags & TOPO_MASK) {
+		case TOPO_N2N:
+			ha->current_topology = ISP_CFG_N;
+			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+			fcport = qla2x00_find_fcport_by_wwpn(vha,
+			    rptid_entry->u.f1.port_name, 1);
+			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+
+			if (fcport) {
+				fcport->plogi_nack_done_deadline = jiffies + HZ;
+				fcport->dm_login_expire = jiffies + 3*HZ;
+				fcport->scan_state = QLA_FCPORT_FOUND;
+				switch (fcport->disc_state) {
+				case DSC_DELETED:
+					set_bit(RELOGIN_NEEDED,
+					    &vha->dpc_flags);
+					break;
+				case DSC_DELETE_PEND:
+					break;
+				default:
+					qlt_schedule_sess_for_deletion(fcport);
+					break;
+				}
 			} else {
-				ql_dbg(ql_dbg_async, vha, 0x5075,
-				    "Format 1: Remote login - Waiting for WWPN %8phC.\n",
-				    rptid_entry->u.f1.port_name);
+				id.b24 = 0;
+				if (wwn_to_u64(vha->port_name) >
+				    wwn_to_u64(rptid_entry->u.f1.port_name)) {
+					vha->d_id.b24 = 0;
+					vha->d_id.b.al_pa = 1;
+					ha->flags.n2n_bigger = 1;
+
+					id.b.al_pa = 2;
+					ql_dbg(ql_dbg_async, vha, 0x5075,
+					    "Format 1: assign local id %x remote id %x\n",
+					    vha->d_id.b24, id.b24);
+				} else {
+					ql_dbg(ql_dbg_async, vha, 0x5075,
+					    "Format 1: Remote login - Waiting for WWPN %8phC.\n",
+					    rptid_entry->u.f1.port_name);
+					ha->flags.n2n_bigger = 0;
+				}
+				qla24xx_post_newsess_work(vha, &id,
+				    rptid_entry->u.f1.port_name,
+				    rptid_entry->u.f1.node_name,
+				    NULL,
+				    FC4_TYPE_UNKNOWN);
 			}
 
-			memcpy(vha->n2n_port_name, rptid_entry->u.f1.port_name,
-			    WWN_SIZE);
+			/* if our portname is higher then initiate N2N login */
+
 			set_bit(N2N_LOGIN_NEEDED, &vha->dpc_flags);
-			set_bit(REGISTER_FC4_NEEDED, &vha->dpc_flags);
-			set_bit(REGISTER_FDMI_NEEDED, &vha->dpc_flags);
 			ha->flags.n2n_ae = 1;
 			return;
+			break;
+		case TOPO_FL:
+			ha->current_topology = ISP_CFG_FL;
+			break;
+		case TOPO_F:
+			ha->current_topology = ISP_CFG_F;
+			break;
+		default:
+			break;
 		}
 
 		ha->flags.gpsc_supported = 1;
@@ -3951,30 +4021,9 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
 		    rptid_entry->u.f2.port_name, 1);
 
 		if (fcport) {
+			fcport->login_retry = vha->hw->login_retry_count;
 			fcport->plogi_nack_done_deadline = jiffies + HZ;
 			fcport->scan_state = QLA_FCPORT_FOUND;
-			switch (fcport->disc_state) {
-			case DSC_DELETED:
-				ql_dbg(ql_dbg_disc, vha, 0x210d,
-				    "%s %d %8phC login\n",
-				    __func__, __LINE__, fcport->port_name);
-				qla24xx_fcport_handle_login(vha, fcport);
-				break;
-			case DSC_DELETE_PEND:
-				break;
-			default:
-				qlt_schedule_sess_for_deletion(fcport);
-				break;
-			}
-		} else {
-			id.b.al_pa  = rptid_entry->u.f2.remote_nport_id[0];
-			id.b.area   = rptid_entry->u.f2.remote_nport_id[1];
-			id.b.domain = rptid_entry->u.f2.remote_nport_id[2];
-			qla24xx_post_newsess_work(vha, &id,
-			    rptid_entry->u.f2.port_name,
-			    rptid_entry->u.f2.node_name,
-			    NULL,
-			    FC4_TYPE_UNKNOWN);
 		}
 	}
 }
@@ -4705,7 +4754,7 @@ qla24xx_get_port_login_templ(scsi_qla_host_t *vha, dma_addr_t buf_dma,
 		    "Done %s.\n", __func__);
 		bp = (uint32_t *) buf;
 		for (i = 0; i < (bufsiz-4)/4; i++, bp++)
-			*bp = cpu_to_be32(*bp);
+			*bp = le32_to_cpu(*bp);
 	}
 
 	return rval;

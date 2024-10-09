@@ -42,7 +42,10 @@ MODULE_FIRMWARE("amdgpu/vega10_asd.bin");
 MODULE_FIRMWARE("amdgpu/vega12_sos.bin");
 MODULE_FIRMWARE("amdgpu/vega12_asd.bin");
 
+
 #define smnMP1_FIRMWARE_FLAGS 0x3010028
+
+static uint32_t sos_old_versions[] = {1517616, 1510592, 1448594, 1446554};
 
 static int
 psp_v3_1_get_fw_type(struct amdgpu_firmware_info *ucode, enum psp_gfx_fw_type *type)
@@ -191,7 +194,7 @@ static int psp_v3_1_bootloader_load_sysdrv(struct psp_context *psp)
 	/* Copy PSP System Driver binary to memory */
 	memcpy(psp->fw_pri_buf, psp->sys_start_addr, psp->sys_bin_size);
 
-	/* Provide the sys driver to bootrom */
+	/* Provide the sys driver to bootloader */
 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
 	       (uint32_t)(psp->fw_pri_mc_addr >> 20));
 	psp_gfxdrv_command_reg = 1 << 16;
@@ -207,19 +210,41 @@ static int psp_v3_1_bootloader_load_sysdrv(struct psp_context *psp)
 	return ret;
 }
 
+static bool psp_v3_1_match_version(struct amdgpu_device *adev, uint32_t ver)
+{
+	int i;
+
+	if (ver == adev->psp.sos_fw_version)
+		return true;
+
+	/*
+	 * Double check if the latest four legacy versions.
+	 * If yes, it is still the right version.
+	 */
+	for (i = 0; i < sizeof(sos_old_versions) / sizeof(uint32_t); i++) {
+		if (sos_old_versions[i] == adev->psp.sos_fw_version)
+			return true;
+	}
+
+	return false;
+}
+
 static int psp_v3_1_bootloader_load_sos(struct psp_context *psp)
 {
 	int ret;
 	unsigned int psp_gfxdrv_command_reg = 0;
 	struct amdgpu_device *adev = psp->adev;
-	uint32_t sol_reg;
+	uint32_t sol_reg, ver;
 
 	/* Check sOS sign of life register to confirm sys driver and sOS
 	 * are already been loaded.
 	 */
 	sol_reg = RREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_81);
-	if (sol_reg)
+	if (sol_reg) {
+		psp->sos_fw_version = RREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_58);
+		printk("sos fw version = 0x%x.\n", psp->sos_fw_version);
 		return 0;
+	}
 
 	/* Wait for bootloader to signify that is ready having bit 31 of C2PMSG_35 set to 1 */
 	ret = psp_wait_for(psp, SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_35),
@@ -232,7 +257,7 @@ static int psp_v3_1_bootloader_load_sos(struct psp_context *psp)
 	/* Copy Secure OS binary to PSP memory */
 	memcpy(psp->fw_pri_buf, psp->sos_start_addr, psp->sos_bin_size);
 
-	/* Provide the PSP secure OS to bootrom */
+	/* Provide the PSP secure OS to bootloader */
 	WREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_36,
 	       (uint32_t)(psp->fw_pri_mc_addr >> 20));
 	psp_gfxdrv_command_reg = 2 << 16;
@@ -244,6 +269,10 @@ static int psp_v3_1_bootloader_load_sos(struct psp_context *psp)
 	ret = psp_wait_for(psp, SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_81),
 			   RREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_81),
 			   0, true);
+
+	ver = RREG32_SOC15(MP0, 0, mmMP0_SMN_C2PMSG_58);
+	if (!psp_v3_1_match_version(adev, ver))
+		DRM_WARN("SOS version doesn't match\n");
 
 	return ret;
 }
@@ -330,11 +359,8 @@ static int psp_v3_1_ring_stop(struct psp_context *psp,
 			      enum psp_ring_type ring_type)
 {
 	int ret = 0;
-	struct psp_ring *ring;
 	unsigned int psp_ring_reg = 0;
 	struct amdgpu_device *adev = psp->adev;
-
-	ring = &psp->km_ring;
 
 	/* Write the ring destroy command to C2PMSG_64 */
 	psp_ring_reg = 3 << 16;
@@ -567,9 +593,9 @@ static int psp_v3_1_mode1_reset(struct psp_context *psp)
 	}
 
 	/*send the mode 1 reset command*/
-	WREG32(offset, 0x70000);
+	WREG32(offset, GFX_CTRL_CMD_ID_MODE1_RST);
 
-	mdelay(1000);
+	msleep(500);
 
 	offset = SOC15_REG_OFFSET(MP0, 0, mmMP0_SMN_C2PMSG_33);
 

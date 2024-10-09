@@ -54,14 +54,9 @@ static int mc_recoverable_range_len;
 struct device_node *opal_node;
 static DEFINE_SPINLOCK(opal_write_lock);
 extern u64 opal_mc_secondary_handler[];
-static unsigned int *opal_irqs;
-static unsigned int opal_irq_count;
-static ATOMIC_NOTIFIER_HEAD(opal_notifier_head);
 static struct atomic_notifier_head opal_msg_notifier_head[OPAL_MSG_TYPE_MAX];
-static DEFINE_SPINLOCK(opal_notifier_lock);
-static uint64_t last_notified_mask = 0x0ul;
-static atomic_t opal_notifier_hold = ATOMIC_INIT(0);
 static uint32_t opal_heartbeat;
+static struct task_struct *kopald_tsk;
 
 static void opal_reinit_cores(void)
 {
@@ -226,83 +221,6 @@ static int __init opal_register_exception_handlers(void)
 }
 machine_early_initcall(powernv, opal_register_exception_handlers);
 
-int opal_notifier_register(struct notifier_block *nb)
-{
-	if (!nb) {
-		pr_warning("%s: Invalid argument (%p)\n",
-			   __func__, nb);
-		return -EINVAL;
-	}
-
-	atomic_notifier_chain_register(&opal_notifier_head, nb);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(opal_notifier_register);
-
-int opal_notifier_unregister(struct notifier_block *nb)
-{
-	if (!nb) {
-		pr_warning("%s: Invalid argument (%p)\n",
-			   __func__, nb);
-		return -EINVAL;
-	}
-
-	atomic_notifier_chain_unregister(&opal_notifier_head, nb);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(opal_notifier_unregister);
-
-static void opal_do_notifier(uint64_t events)
-{
-	unsigned long flags;
-	uint64_t changed_mask;
-
-	if (atomic_read(&opal_notifier_hold))
-		return;
-
-	spin_lock_irqsave(&opal_notifier_lock, flags);
-	changed_mask = last_notified_mask ^ events;
-	last_notified_mask = events;
-	spin_unlock_irqrestore(&opal_notifier_lock, flags);
-
-	/*
-	 * We feed with the event bits and changed bits for
-	 * enough information to the callback.
-	 */
-	atomic_notifier_call_chain(&opal_notifier_head,
-				   events, (void *)changed_mask);
-}
-EXPORT_SYMBOL_GPL(opal_message_notifier_register);
-
-void opal_notifier_update_evt(uint64_t evt_mask,
-			      uint64_t evt_val)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&opal_notifier_lock, flags);
-	last_notified_mask &= ~evt_mask;
-	last_notified_mask |= evt_val;
-	spin_unlock_irqrestore(&opal_notifier_lock, flags);
-}
-
-void opal_notifier_enable(void)
-{
-	int64_t rc;
-	__be64 evt = 0;
-
-	atomic_set(&opal_notifier_hold, 0);
-
-	/* Process pending events */
-	rc = opal_poll_events(&evt);
-	if (rc == OPAL_SUCCESS && evt)
-		opal_do_notifier(be64_to_cpu(evt));
-}
-
-void opal_notifier_disable(void)
-{
-	atomic_set(&opal_notifier_hold, 1);
-}
-
 /*
  * Opal message notifier based on message type. Allow subscribers to get
  * notified for specific messgae type.
@@ -319,6 +237,7 @@ int opal_message_notifier_register(enum OpalMessageType msg_type,
 	return atomic_notifier_chain_register(
 				&opal_msg_notifier_head[msg_type], nb);
 }
+EXPORT_SYMBOL_GPL(opal_message_notifier_register);
 
 int opal_message_notifier_unregister(enum OpalMessageType msg_type,
 				     struct notifier_block *nb)
@@ -367,36 +286,36 @@ static void opal_handle_message(void)
 	opal_message_do_notify(type, (void *)&msg);
 }
 
-static int opal_message_notify(struct notifier_block *nb,
-			  unsigned long events, void *change)
+static irqreturn_t opal_message_notify(int irq, void *data)
 {
-	if (events & OPAL_EVENT_MSG_PENDING)
-		opal_handle_message();
-	return 0;
+	opal_handle_message();
+	return IRQ_HANDLED;
 }
-
-static struct notifier_block opal_message_nb = {
-	.notifier_call	= opal_message_notify,
-	.next		= NULL,
-	.priority	= 0,
-};
 
 static int __init opal_message_init(void)
 {
-	int ret, i;
+	int ret, i, irq;
 
 	for (i = 0; i < OPAL_MSG_TYPE_MAX; i++)
 		ATOMIC_INIT_NOTIFIER_HEAD(&opal_msg_notifier_head[i]);
 
-	ret = opal_notifier_register(&opal_message_nb);
+	irq = opal_event_request(ilog2(OPAL_EVENT_MSG_PENDING));
+	if (!irq) {
+		pr_err("%s: Can't register OPAL event irq (%d)\n",
+		       __func__, irq);
+		return irq;
+	}
+
+	ret = request_irq(irq, opal_message_notify,
+			IRQ_TYPE_LEVEL_HIGH, "opal-msg", NULL);
 	if (ret) {
-		pr_err("%s: Can't register OPAL event notifier (%d)\n",
+		pr_err("%s: Can't request OPAL event irq (%d)\n",
 		       __func__, ret);
 		return ret;
 	}
+
 	return 0;
 }
-machine_early_initcall(powernv, opal_message_init);
 
 int opal_get_chars(uint32_t vtermno, char *buf, int count)
 {
@@ -597,21 +516,15 @@ int opal_hmi_exception_early(struct pt_regs *regs)
 /* HMI exception handler called in virtual mode during check_irq_replay. */
 int opal_handle_hmi_exception(struct pt_regs *regs)
 {
-	s64 rc;
-	__be64 evt = 0;
-
 	/*
 	 * Check if HMI event is available.
-	 * if Yes, then call opal_poll_events to pull opal messages and
-	 * process them.
+	 * if Yes, then wake kopald to process them.
 	 */
 	if (!local_paca->hmi_event_available)
 		return 0;
 
 	local_paca->hmi_event_available = 0;
-	rc = opal_poll_events(&evt);
-	if (rc == OPAL_SUCCESS && evt)
-		opal_do_notifier(be64_to_cpu(evt));
+	opal_wake_poller();
 
 	return 1;
 }
@@ -646,17 +559,6 @@ bool opal_mce_check_early_recovery(struct pt_regs *regs)
 
 out:
 	return !!recover_addr;
-}
-
-static irqreturn_t opal_interrupt(int irq, void *data)
-{
-	__be64 events;
-
-	opal_handle_interrupt(virq_to_hw(irq), &events);
-
-	opal_do_notifier(be64_to_cpu(events));
-
-	return IRQ_HANDLED;
 }
 
 static int opal_sysfs_init(void)
@@ -737,14 +639,29 @@ static void opal_pdev_init(struct device_node *opal_node,
 
 static int kopald(void *unused)
 {
+	unsigned long timeout = msecs_to_jiffies(opal_heartbeat) + 1;
+
 	set_freezable();
 	do {
 		try_to_freeze();
-		opal_poll_events(NULL);
-		msleep_interruptible(opal_heartbeat);
+
+		opal_handle_events();
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (opal_have_pending_events())
+			__set_current_state(TASK_RUNNING);
+		else
+			schedule_timeout(timeout);
+
 	} while (!kthread_should_stop());
 
 	return 0;
+}
+
+void opal_wake_poller(void)
+{
+	if (kopald_tsk)
+		wake_up_process(kopald_tsk);
 }
 
 static void opal_init_heartbeat(void)
@@ -755,7 +672,7 @@ static void opal_init_heartbeat(void)
 		opal_heartbeat = 0;
 
 	if (opal_heartbeat)
-		kthread_run(kopald, NULL, "kopald");
+		kopald_tsk = kthread_run(kopald, NULL, "kopald");
 }
 
 static void opal_i2c_create_devs(void)
@@ -766,44 +683,6 @@ static void opal_i2c_create_devs(void)
 		of_platform_device_create(np, NULL, NULL);
 }
 
-static void __init opal_irq_init(struct device_node *dn)
-{
-	const __be32 *irqs;
-	int i, irqlen;
-
-	/* Get interrupt property */
-	irqs = of_get_property(opal_node, "opal-interrupts", &irqlen);
-	pr_debug("Found %d interrupts reserved for OPAL\n",
-		 irqs ? (irqlen / 4) : 0);
-
-	/* Install interrupt handlers */
-	opal_irq_count = irqlen / 4;
-	opal_irqs = kzalloc(opal_irq_count * sizeof(unsigned int), GFP_KERNEL);
-	for (i = 0; irqs && i < opal_irq_count; i++, irqs++) {
-		unsigned int irq, virq;
-		int rc;
-
-		/* Get hardware and virtual IRQ */
-		irq = be32_to_cpup(irqs);
-		virq = irq_create_mapping(NULL, irq);
-		if (virq == NO_IRQ) {
-			pr_warn("Failed to map irq 0x%x\n", irq);
-			continue;
-		}
-
-		/* Install interrupt handler */
-		rc = request_irq(virq, opal_interrupt, 0, "opal", NULL);
-		if (rc) {
-			irq_dispose_mapping(virq);
-			pr_warn("Error %d requesting irq %d (0x%x)\n",
-				 rc, virq, irq);
-			continue;
-		}
-
-		/* Cache IRQ */
-		opal_irqs[i] = virq;
-	}
-}
 
 static int __init opal_init(void)
 {
@@ -833,11 +712,20 @@ static int __init opal_init(void)
 	/* Setup a heatbeat thread if requested by OPAL */
 	opal_init_heartbeat();
 
+	/* Initialise OPAL messaging system */
+	opal_message_init();
+
+	/* Initialise OPAL asynchronous completion interface */
+	opal_async_comp_init();
+
+	/* Initialise OPAL sensor interface */
+	opal_sensor_init();
+
+	/* Initialise OPAL hypervisor maintainence interrupt handling */
+	opal_hmi_handler_init();
+
 	/* Create i2c platform devices */
 	opal_i2c_create_devs();
-
-	/* Find all OPAL interrupts and request them */
-	opal_irq_init(opal_node);
 
 	/* Create leds platform devices */
 	leds = of_find_node_by_path("/ibm,opal/leds");
@@ -879,15 +767,9 @@ machine_subsys_initcall(powernv, opal_init);
 
 void opal_shutdown(void)
 {
-	unsigned int i;
 	long rc = OPAL_BUSY;
 
-	/* First free interrupts, which will also mask them */
-	for (i = 0; i < opal_irq_count; i++) {
-		if (opal_irqs[i])
-			free_irq(opal_irqs[i], NULL);
-		opal_irqs[i] = 0;
-	}
+	opal_event_shutdown();
 
 	/*
 	 * Then sync with OPAL which ensure anything that can

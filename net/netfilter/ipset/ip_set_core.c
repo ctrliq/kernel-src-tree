@@ -558,8 +558,7 @@ int
 ip_set_test(ip_set_id_t index, const struct sk_buff *skb,
 	    const struct xt_action_param *par, struct ip_set_adt_opt *opt)
 {
-	struct ip_set *set = ip_set_rcu_get(
-			dev_net(par->in ? par->in : par->out), index);
+	struct ip_set *set = ip_set_rcu_get(xt_net(par), index);
 	int ret = 0;
 
 	BUG_ON(!set);
@@ -597,8 +596,7 @@ int
 ip_set_add(ip_set_id_t index, const struct sk_buff *skb,
 	   const struct xt_action_param *par, struct ip_set_adt_opt *opt)
 {
-	struct ip_set *set = ip_set_rcu_get(
-			dev_net(par->in ? par->in : par->out), index);
+	struct ip_set *set = ip_set_rcu_get(xt_net(par), index);
 	int ret;
 
 	BUG_ON(!set);
@@ -620,8 +618,7 @@ int
 ip_set_del(ip_set_id_t index, const struct sk_buff *skb,
 	   const struct xt_action_param *par, struct ip_set_adt_opt *opt)
 {
-	struct ip_set *set = ip_set_rcu_get(
-			dev_net(par->in ? par->in : par->out), index);
+	struct ip_set *set = ip_set_rcu_get(xt_net(par), index);
 	int ret = 0;
 
 	BUG_ON(!set);
@@ -1864,12 +1861,11 @@ nlmsg_failure:
 
 /* Get set by name or index, from userspace */
 
-static int ip_set_byname(struct net *net, struct sock *ctnl,
+static int ip_set_byname(struct sock *ctnl,
 			 struct sk_buff *skb, const struct nlmsghdr *nlh,
-			 const struct nlattr * const attr[],
-			 struct netlink_ext_ack *extack)
+			 const struct nlattr * const attr[])
 {
-	struct ip_set_net *inst = ip_set_pernet(net);
+	struct ip_set_net *inst = ip_set_pernet(sock_net(ctnl));
 	struct sk_buff *skb2;
 	struct nlmsghdr *nlh2;
 	ip_set_id_t id = IPSET_INVALID_ID;
@@ -1916,12 +1912,11 @@ static const struct nla_policy ip_set_index_policy[IPSET_ATTR_CMD_MAX + 1] = {
 	[IPSET_ATTR_INDEX]	= { .type = NLA_U16 },
 };
 
-static int ip_set_byindex(struct net *net, struct sock *ctnl,
+static int ip_set_byindex(struct sock *ctnl,
 			  struct sk_buff *skb, const struct nlmsghdr *nlh,
-			  const struct nlattr * const attr[],
-			  struct netlink_ext_ack *extack)
+			  const struct nlattr * const attr[])
 {
-	struct ip_set_net *inst = ip_set_pernet(net);
+	struct ip_set_net *inst = ip_set_pernet(sock_net(ctnl));
 	struct sk_buff *skb2;
 	struct nlmsghdr *nlh2;
 	ip_set_id_t id = IPSET_INVALID_ID;

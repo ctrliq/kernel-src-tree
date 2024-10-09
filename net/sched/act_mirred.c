@@ -128,10 +128,9 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
 		if (ret)
 			return ret;
 		ret = ACT_P_CREATED;
-	} else {
+	} else if (!ovr) {
 		tcf_idr_release(*a, bind);
-		if (!ovr)
-			return -EEXIST;
+		return -EEXIST;
 	}
 	m = to_mirred(*a);
 
@@ -231,13 +230,16 @@ out:
 }
 
 static void tcf_stats_update(struct tc_action *a, u64 bytes, u32 packets,
-			     u64 lastuse)
+			     u64 lastuse, bool hw)
 {
 	struct tcf_mirred *m = to_mirred(a);
 	struct tcf_t *tm = &m->tcf_tm;
 
 	_bstats_cpu_update(this_cpu_ptr(m->common.cpu_bstats), bytes, packets);
-	tm->lastuse = lastuse;
+	if (hw)
+		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
+				   bytes, packets);
+	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
 }
 
 static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind,

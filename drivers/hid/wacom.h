@@ -91,7 +91,6 @@
 #include <linux/mod_devicetable.h>
 #include <linux/hid.h>
 #include <linux/kfifo.h>
-#include <linux/leds.h>
 #include <linux/usb/input.h>
 #include <linux/power_supply.h>
 #include <asm/unaligned.h>
@@ -116,8 +115,6 @@ enum wacom_worker {
 struct wacom;
 
 struct wacom_led {
-	struct led_classdev cdev;
-	struct led_trigger trigger;
 	struct wacom *wacom;
 	unsigned int group;
 	unsigned int id;
@@ -169,6 +166,7 @@ struct wacom {
 	struct delayed_work init_work;
 	struct wacom_remote *remote;
 	struct work_struct mode_change_work;
+	bool generic_has_leds;
 	struct wacom_leds {
 		struct wacom_group_leds *groups;
 		unsigned int count;
@@ -220,4 +218,5 @@ void wacom_wac_event(struct hid_device *hdev, struct hid_field *field,
 void wacom_wac_report(struct hid_device *hdev, struct hid_report *report);
 void wacom_battery_work(struct work_struct *work);
 int wacom_equivalent_usage(int usage);
+int wacom_initialize_leds(struct wacom *wacom);
 #endif

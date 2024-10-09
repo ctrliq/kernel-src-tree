@@ -31,6 +31,7 @@
 #include "xfs_ialloc_btree.h"
 #include "xfs_alloc.h"
 #include "xfs_rtalloc.h"
+#include "xfs_errortag.h"
 #include "xfs_error.h"
 #include "xfs_bmap.h"
 #include "xfs_cksum.h"
@@ -917,8 +918,7 @@ STATIC xfs_agnumber_t
 xfs_ialloc_ag_select(
 	xfs_trans_t	*tp,		/* transaction pointer */
 	xfs_ino_t	parent,		/* parent directory inode number */
-	umode_t		mode,		/* bits set to indicate file type */
-	int		okalloc)	/* ok to allocate more space */
+	umode_t		mode)		/* bits set to indicate file type */
 {
 	xfs_agnumber_t	agcount;	/* number of ag's in the filesystem */
 	xfs_agnumber_t	agno;		/* current ag number */
@@ -974,9 +974,6 @@ xfs_ialloc_ag_select(
 			xfs_perag_put(pag);
 			return agno;
 		}
-
-		if (!okalloc)
-			goto nextag;
 
 		if (!pag->pagf_init) {
 			error = xfs_alloc_pagf_init(mp, tp, agno, flags);
@@ -1677,7 +1674,6 @@ xfs_dialloc(
 	struct xfs_trans	*tp,
 	xfs_ino_t		parent,
 	umode_t			mode,
-	int			okalloc,
 	struct xfs_buf		**IO_agbp,
 	xfs_ino_t		*inop)
 {
@@ -1689,6 +1685,7 @@ xfs_dialloc(
 	int			noroom = 0;
 	xfs_agnumber_t		start_agno;
 	struct xfs_perag	*pag;
+	int			okalloc = 1;
 
 	if (*IO_agbp) {
 		/*
@@ -1704,7 +1701,7 @@ xfs_dialloc(
 	 * We do not have an agbp, so select an initial allocation
 	 * group for inode allocation.
 	 */
-	start_agno = xfs_ialloc_ag_select(tp, parent, mode, okalloc);
+	start_agno = xfs_ialloc_ag_select(tp, parent, mode);
 	if (start_agno == NULLAGNUMBER) {
 		*inop = NULLFSINO;
 		return 0;
@@ -1958,7 +1955,7 @@ xfs_difree_inobt(
 	if (!(mp->m_flags & XFS_MOUNT_IKEEP) &&
 	    rec.ir_free == XFS_INOBT_ALL_FREE &&
 	    mp->m_sb.sb_inopblock <= XFS_INODES_PER_CHUNK) {
-		xic->deleted = 1;
+		xic->deleted = true;
 		xic->first_ino = XFS_AGINO_TO_INO(mp, agno, rec.ir_startino);
 		xic->alloc = xfs_inobt_irec_to_allocmask(&rec);
 
@@ -1985,7 +1982,7 @@ xfs_difree_inobt(
 
 		xfs_difree_inode_chunk(mp, agno, &rec, dfops);
 	} else {
-		xic->deleted = 0;
+		xic->deleted = false;
 
 		error = xfs_inobt_update(cur, &rec);
 		if (error) {

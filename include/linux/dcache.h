@@ -57,9 +57,10 @@ struct qstr {
 struct dentry_stat_t {
 	long nr_dentry;
 	long nr_unused;
-	long age_limit;          /* age in seconds */
-	long want_pages;         /* pages requested by system */
-	long dummy[2];
+	long age_limit;		/* age in seconds */
+	long want_pages;	/* pages requested by system */
+	long nr_negative;	/* # of unused negative dentries */
+	long dummy;		/* Reserved for future use */
 };
 extern struct dentry_stat_t dentry_stat;
 
@@ -161,14 +162,14 @@ struct dentry_operations {
 			int (*d_manage)(const struct path *, bool))
 } ____cacheline_aligned;
 
-typedef struct dentry* (*dop_real_t) (struct dentry *, const struct inode *, unsigned int);
+typedef struct dentry* (*dop_real_t) (struct dentry *, const struct inode *, unsigned int, unsigned int);
 
 struct dentry_operations_wrapper {
 	struct dentry_operations ops;
 	size_t size;
 
 	struct dentry *(*d_real)(struct dentry *, const struct inode *,
-				 unsigned int);
+				 unsigned int, unsigned int);
 } ____cacheline_aligned;
 
 /*
@@ -241,8 +242,11 @@ static inline int dname_external(struct dentry *dentry)
  * These are the low-level FS interfaces to the dcache..
  */
 extern void d_instantiate(struct dentry *, struct inode *);
+extern void d_instantiate_new(struct dentry *, struct inode *);
 extern struct dentry * d_instantiate_unique(struct dentry *, struct inode *);
 extern struct dentry * d_materialise_unique(struct dentry *, struct inode *);
+extern struct dentry * d_instantiate_anon(struct dentry *, struct inode *);
+extern int d_instantiate_no_diralias(struct dentry *, struct inode *);
 extern void __d_drop(struct dentry *dentry);
 extern void d_drop(struct dentry *dentry);
 extern void d_delete(struct dentry *);
@@ -250,6 +254,7 @@ extern void d_set_d_op(struct dentry *dentry, const struct dentry_operations *op
 
 /* allocate/de-allocate */
 extern struct dentry * d_alloc(struct dentry *, const struct qstr *);
+extern struct dentry * d_alloc_anon(struct super_block *);
 extern struct dentry * d_alloc_pseudo(struct super_block *, const struct qstr *);
 extern struct dentry * d_splice_alias(struct inode *, struct dentry *);
 extern struct dentry * d_add_ci(struct dentry *, struct inode *, struct qstr *);
@@ -569,6 +574,9 @@ static inline struct dentry *d_backing_dentry(struct dentry *upper)
 {
 	return upper;
 }
+
+/* d_real() flags */
+#define D_REAL_UPPER	0x2	/* return upper dentry or NULL if non-upper */
 
 struct name_snapshot {
 	const char *name;

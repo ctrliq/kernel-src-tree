@@ -615,7 +615,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p)
 	mm->cached_hole_size = ~0UL;
 	mm_init_aio(mm);
 	mm_init_owner(mm, p);
-	clear_tlb_flush_pending(mm);
+	init_tlb_flush_pending(mm);
 
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
@@ -1406,9 +1406,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 	prev_cputime_init(&p->prev_cputime);
 
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
-	seqlock_init(&p->vtime_seqlock);
-	p->vtime_snap = 0;
-	p->vtime_snap_whence = VTIME_SLEEPING;
+	seqlock_init(&p->vtime.seqlock);
+	p->vtime.starttime = 0;
+	p->vtime.state = VTIME_SLEEPING;
 #endif
 
 #if defined(SPLIT_RSS_COUNTING)
@@ -1460,6 +1460,9 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 	p->hardirq_context = 0;
 	p->softirq_context = 0;
 #endif
+
+	p->pagefault_disabled = 0;
+
 #ifdef CONFIG_LOCKDEP
 	p->lockdep_depth = 0; /* no locks held yet */
 	p->curr_chain_key = 0;

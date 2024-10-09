@@ -456,8 +456,7 @@ static int intel_pt_walk_next_insn(struct intel_pt_insn *intel_pt_insn,
 	}
 
 	while (1) {
-		thread__find_addr_map(thread, cpumode, MAP__FUNCTION, *ip, &al);
-		if (!al.map || !al.map->dso)
+		if (!thread__find_map(thread, cpumode, *ip, &al) || !al.map->dso)
 			return -EINVAL;
 
 		if (al.map->dso->data.status == DSO_DATA_STATUS_ERROR &&
@@ -610,8 +609,7 @@ static int __intel_pt_pgd_ip(uint64_t ip, void *data)
 	if (!thread)
 		return -EINVAL;
 
-	thread__find_addr_map(thread, cpumode, MAP__FUNCTION, ip, &al);
-	if (!al.map || !al.map->dso)
+	if (!thread__find_map(thread, cpumode, ip, &al) || !al.map->dso)
 		return -EINVAL;
 
 	offset = al.map->map_ip(al.map, ip);
@@ -2577,7 +2575,8 @@ int intel_pt_process_auxtrace_info(union perf_event *event,
 	if (session->itrace_synth_opts && session->itrace_synth_opts->set) {
 		pt->synth_opts = *session->itrace_synth_opts;
 	} else {
-		itrace_synth_opts__set_default(&pt->synth_opts);
+		itrace_synth_opts__set_default(&pt->synth_opts,
+				session->itrace_synth_opts->default_no_sample);
 		if (use_browser != -1) {
 			pt->synth_opts.branches = false;
 			pt->synth_opts.callchain = true;

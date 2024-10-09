@@ -5,12 +5,13 @@
 /* glibc 2.20 deprecates _BSD_SOURCE in favour of _DEFAULT_SOURCE */
 #define _DEFAULT_SOURCE 1
 
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <linux/compiler.h>
-#include <linux/types.h>
+#include <sys/types.h>
 
 /* General helper functions */
 void usage(const char *err) __noreturn;
@@ -24,6 +25,7 @@ static inline void *zalloc(size_t size)
 #define zfree(ptr) ({ free(*ptr); *ptr = NULL; })
 
 struct dirent;
+struct nsinfo;
 struct strlist;
 
 int mkdir_p(char *path, mode_t mode);
@@ -32,6 +34,7 @@ struct strlist *lsdir(const char *name, bool (*filter)(const char *, struct dire
 bool lsdir_no_dot_filter(const char *name, struct dirent *d);
 int copyfile(const char *from, const char *to);
 int copyfile_mode(const char *from, const char *to, mode_t mode);
+int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size);
 
 ssize_t readn(int fd, void *buf, size_t n);
 ssize_t writen(int fd, const void *buf, size_t n);
@@ -60,6 +63,15 @@ extern bool perf_singlethreaded;
 
 void perf_set_singlethreaded(void);
 void perf_set_multithreaded(void);
+
+#define KVER_VERSION(x)		(((x) >> 16) & 0xff)
+#define KVER_PATCHLEVEL(x)	(((x) >> 8) & 0xff)
+#define KVER_SUBLEVEL(x)	((x) & 0xff)
+#define KVER_FMT	"%d.%d.%d"
+#define KVER_PARAM(x)	KVER_VERSION(x), KVER_PATCHLEVEL(x), KVER_SUBLEVEL(x)
+
+int fetch_kernel_version(unsigned int *puint,
+			 char *str, size_t str_sz);
 
 #ifndef O_CLOEXEC
 #ifdef __sparc__

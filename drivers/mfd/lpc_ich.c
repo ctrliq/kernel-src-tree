@@ -55,6 +55,7 @@
  *	document number TBD : Coleto Creek
  *	document number TBD : Wildcat Point-LP
  *	document number TBD : Lewisburg
+ *	document number TBD : Apollo Lake SoC
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -82,6 +83,8 @@
 
 #define ACPIBASE_GCS_OFF	0x3410
 #define ACPIBASE_GCS_END	0x3414
+
+#define SPIBASE_APL_SZ		4096
 
 #define GPIOBASE_ICH0		0x58
 #define GPIOCTRL_ICH0		0x5C
@@ -220,6 +223,7 @@ enum lpc_chipsets {
 	LPC_COLETO,	/* Coleto Creek */
 	LPC_WPT_LP,	/* Wildcat Point-LP */
 	LPC_LEWISBURG,	/* Lewisburg */
+	LPC_APL,	/* Apollo Lake SoC */
 };
 
 struct lpc_ich_info lpc_chipset_info[] = {
@@ -525,6 +529,10 @@ struct lpc_ich_info lpc_chipset_info[] = {
 		.name = "Lewisburg",
 		.iTCO_version = 2,
 	},
+	[LPC_APL] = {
+		.name = "Apollo Lake SoC",
+		.iTCO_version = 5,
+	},
 };
 
 /*
@@ -666,6 +674,7 @@ static const struct pci_device_id lpc_ich_ids[] = {
 	{ PCI_VDEVICE(INTEL, 0x1e5d), LPC_PPT},
 	{ PCI_VDEVICE(INTEL, 0x1e5e), LPC_PPT},
 	{ PCI_VDEVICE(INTEL, 0x1e5f), LPC_PPT},
+	{ PCI_VDEVICE(INTEL, 0x5ae8), LPC_APL},
 	{ PCI_VDEVICE(INTEL, 0x8c40), LPC_LPT},
 	{ PCI_VDEVICE(INTEL, 0x8c41), LPC_LPT},
 	{ PCI_VDEVICE(INTEL, 0x8c42), LPC_LPT},
