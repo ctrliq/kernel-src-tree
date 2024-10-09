@@ -1,0 +1,202 @@
+nvme: add fabrics sysfs attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] add fabrics sysfs attributes (David Milburn) [1384526 1389755 1366753 1374291 1383834]
+Rebuild_FUZZ: 90.32%
+commit-author Ming Lin <ming.l@ssi.samsung.com>
+commit 1a353d85b02d010e9daa7bd189d203ba1f2614a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1a353d85.failed
+
+- delete_controller: This attribute allows to delete a controller.
+  A driver is not obligated to support it (pci doesn't) so it is
+  created only if the driver supports it. The new fabrics drivers
+  will support it (essentialy a disconnect operation).
+
+  Usage:
+  echo > /sys/class/nvme/nvme0/delete_controller
+
+- subsysnqn: This attribute shows the subsystem nqn of the configured
+  device. If a driver does not implement the get_subsysnqn method, the
+  file will not appear in sysfs.
+
+- transport: This attribute shows the transport name. Added a "name"
+  field to struct nvme_ctrl_ops.
+
+  For loop,
+  cat /sys/class/nvme/nvme0/transport
+  loop
+
+  For RDMA,
+  cat /sys/class/nvme/nvme0/transport
+  rdma
+
+  For PCIe,
+  cat /sys/class/nvme/nvme0/transport
+  pcie
+
+- address: This attributes shows the controller address. The fabrics
+  drivers that will implement get_address can show the address of the
+  connected controller.
+
+  example:
+  cat /sys/class/nvme/nvme0/address
+  traddr=192.168.2.2,trsvcid=1023
+
+	Signed-off-by: Ming Lin <ming.l@ssi.samsung.com>
+	Reviewed-by: Jay Freyensee <james.p.freyensee@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 1a353d85b02d010e9daa7bd189d203ba1f2614a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,c99acb082855..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -145,6 -151,11 +146,14 @@@ struct nvme_ctrl_ops 
+  	int (*reg_read64)(struct nvme_ctrl *ctrl, u32 off, u64 *val);
+  	int (*reset_ctrl)(struct nvme_ctrl *ctrl);
+  	void (*free_ctrl)(struct nvme_ctrl *ctrl);
+++<<<<<<< HEAD
+++=======
++ 	void (*post_scan)(struct nvme_ctrl *ctrl);
++ 	void (*submit_async_event)(struct nvme_ctrl *ctrl, int aer_idx);
++ 	int (*delete_ctrl)(struct nvme_ctrl *ctrl);
++ 	const char *(*get_subsysnqn)(struct nvme_ctrl *ctrl);
++ 	int (*get_address)(struct nvme_ctrl *ctrl, char *buf, int size);
+++>>>>>>> 1a353d85b02d (nvme: add fabrics sysfs attributes)
+  };
+  
+  static inline bool nvme_ctrl_ready(struct nvme_ctrl *ctrl)
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 63f6b5f40b5c..11b39b952835 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1117,7 +1117,7 @@ static struct attribute *nvme_ns_attrs[] = {
+ 	NULL,
+ };
+ 
+-static umode_t nvme_attrs_are_visible(struct kobject *kobj,
++static umode_t nvme_ns_attrs_are_visible(struct kobject *kobj,
+ 		struct attribute *a, int n)
+ {
+ 	struct device *dev = container_of(kobj, struct device, kobj);
+@@ -1136,7 +1136,7 @@ static umode_t nvme_attrs_are_visible(struct kobject *kobj,
+ 
+ static const struct attribute_group nvme_ns_attr_group = {
+ 	.attrs		= nvme_ns_attrs,
+-	.is_visible	= nvme_attrs_are_visible,
++	.is_visible	= nvme_ns_attrs_are_visible,
+ };
+ 
+ #define nvme_show_str_function(field)						\
+@@ -1162,6 +1162,49 @@ nvme_show_str_function(serial);
+ nvme_show_str_function(firmware_rev);
+ nvme_show_int_function(cntlid);
+ 
++static ssize_t nvme_sysfs_delete(struct device *dev,
++				struct device_attribute *attr, const char *buf,
++				size_t count)
++{
++	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++
++	if (device_remove_file_self(dev, attr))
++		ctrl->ops->delete_ctrl(ctrl);
++	return count;
++}
++static DEVICE_ATTR(delete_controller, S_IWUSR, NULL, nvme_sysfs_delete);
++
++static ssize_t nvme_sysfs_show_transport(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++
++	return snprintf(buf, PAGE_SIZE, "%s\n", ctrl->ops->name);
++}
++static DEVICE_ATTR(transport, S_IRUGO, nvme_sysfs_show_transport, NULL);
++
++static ssize_t nvme_sysfs_show_subsysnqn(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++
++	return snprintf(buf, PAGE_SIZE, "%s\n",
++			ctrl->ops->get_subsysnqn(ctrl));
++}
++static DEVICE_ATTR(subsysnqn, S_IRUGO, nvme_sysfs_show_subsysnqn, NULL);
++
++static ssize_t nvme_sysfs_show_address(struct device *dev,
++					 struct device_attribute *attr,
++					 char *buf)
++{
++	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++
++	return ctrl->ops->get_address(ctrl, buf, PAGE_SIZE);
++}
++static DEVICE_ATTR(address, S_IRUGO, nvme_sysfs_show_address, NULL);
++
+ static struct attribute *nvme_dev_attrs[] = {
+ 	&dev_attr_reset_controller.attr,
+ 	&dev_attr_rescan_controller.attr,
+@@ -1169,11 +1212,38 @@ static struct attribute *nvme_dev_attrs[] = {
+ 	&dev_attr_serial.attr,
+ 	&dev_attr_firmware_rev.attr,
+ 	&dev_attr_cntlid.attr,
++	&dev_attr_delete_controller.attr,
++	&dev_attr_transport.attr,
++	&dev_attr_subsysnqn.attr,
++	&dev_attr_address.attr,
+ 	NULL
+ };
+ 
++#define CHECK_ATTR(ctrl, a, name)		\
++	if ((a) == &dev_attr_##name.attr &&	\
++	    !(ctrl)->ops->get_##name)		\
++		return 0
++
++static umode_t nvme_dev_attrs_are_visible(struct kobject *kobj,
++		struct attribute *a, int n)
++{
++	struct device *dev = container_of(kobj, struct device, kobj);
++	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++
++	if (a == &dev_attr_delete_controller.attr) {
++		if (!ctrl->ops->delete_ctrl)
++			return 0;
++	}
++
++	CHECK_ATTR(ctrl, a, subsysnqn);
++	CHECK_ATTR(ctrl, a, address);
++
++	return a->mode;
++}
++
+ static struct attribute_group nvme_dev_attrs_group = {
+-	.attrs = nvme_dev_attrs,
++	.attrs		= nvme_dev_attrs,
++	.is_visible	= nvme_dev_attrs_are_visible,
+ };
+ 
+ static const struct attribute_group *nvme_dev_attr_groups[] = {
+* Unmerged path drivers/nvme/host/nvme.h
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 6cf19a97b3a4..c11621e63aa6 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1905,6 +1905,7 @@ static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
+ }
+ 
+ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
++	.name			= "pcie",
+ 	.module			= THIS_MODULE,
+ 	.reg_read32		= nvme_pci_reg_read32,
+ 	.reg_write32		= nvme_pci_reg_write32,
