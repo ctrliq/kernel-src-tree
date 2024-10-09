@@ -1,0 +1,318 @@
+perf mmap: Discard legacy interfaces for mmap read forward
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 6afad54d2f0ddebacfcf3b829147d7fed8dab298
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6afad54d.failed
+
+Discards legacy interfaces perf_evlist__mmap_read_forward(),
+perf_evlist__mmap_read() and perf_evlist__mmap_consume().
+
+No tools use them.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1519945751-37786-14-git-send-email-kan.liang@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 6afad54d2f0ddebacfcf3b829147d7fed8dab298)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evlist.c
+#	tools/perf/util/evlist.h
+#	tools/perf/util/mmap.c
+diff --cc tools/perf/util/evlist.c
+index 0abcf97f8546,41a4666f1519..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -704,249 -702,6 +704,252 @@@ static int perf_evlist__resume(struct p
+  	return perf_evlist__set_paused(evlist, false);
+  }
+  
+++<<<<<<< HEAD
+ +/* When check_messup is true, 'end' must points to a good entry */
+ +static union perf_event *
+ +perf_mmap__read(struct perf_mmap *md, bool check_messup, u64 start,
+ +		u64 end, u64 *prev)
+ +{
+ +	unsigned char *data = md->base + page_size;
+ +	union perf_event *event = NULL;
+ +	int diff = end - start;
+ +
+ +	if (check_messup) {
+ +		/*
+ +		 * If we're further behind than half the buffer, there's a chance
+ +		 * the writer will bite our tail and mess up the samples under us.
+ +		 *
+ +		 * If we somehow ended up ahead of the 'end', we got messed up.
+ +		 *
+ +		 * In either case, truncate and restart at 'end'.
+ +		 */
+ +		if (diff > md->mask / 2 || diff < 0) {
+ +			fprintf(stderr, "WARNING: failed to keep up with mmap data.\n");
+ +
+ +			/*
+ +			 * 'end' points to a known good entry, start there.
+ +			 */
+ +			start = end;
+ +			diff = 0;
+ +		}
+ +	}
+ +
+ +	if (diff >= (int)sizeof(event->header)) {
+ +		size_t size;
+ +
+ +		event = (union perf_event *)&data[start & md->mask];
+ +		size = event->header.size;
+ +
+ +		if (size < sizeof(event->header) || diff < (int)size) {
+ +			event = NULL;
+ +			goto broken_event;
+ +		}
+ +
+ +		/*
+ +		 * Event straddles the mmap boundary -- header should always
+ +		 * be inside due to u64 alignment of output.
+ +		 */
+ +		if ((start & md->mask) + size != ((start + size) & md->mask)) {
+ +			unsigned int offset = start;
+ +			unsigned int len = min(sizeof(*event), size), cpy;
+ +			void *dst = md->event_copy;
+ +
+ +			do {
+ +				cpy = min(md->mask + 1 - (offset & md->mask), len);
+ +				memcpy(dst, &data[offset & md->mask], cpy);
+ +				offset += cpy;
+ +				dst += cpy;
+ +				len -= cpy;
+ +			} while (len);
+ +
+ +			event = (union perf_event *) md->event_copy;
+ +		}
+ +
+ +		start += size;
+ +	}
+ +
+ +broken_event:
+ +	if (prev)
+ +		*prev = start;
+ +
+ +	return event;
+ +}
+ +
+ +union perf_event *perf_mmap__read_forward(struct perf_mmap *md, bool check_messup)
+ +{
+ +	u64 head;
+ +	u64 old = md->prev;
+ +
+ +	/*
+ +	 * Check if event was unmapped due to a POLLHUP/POLLERR.
+ +	 */
+ +	if (!refcount_read(&md->refcnt))
+ +		return NULL;
+ +
+ +	head = perf_mmap__read_head(md);
+ +
+ +	return perf_mmap__read(md, check_messup, old, head, &md->prev);
+ +}
+ +
+ +union perf_event *
+ +perf_mmap__read_backward(struct perf_mmap *md)
+ +{
+ +	u64 head, end;
+ +	u64 start = md->prev;
+ +
+ +	/*
+ +	 * Check if event was unmapped due to a POLLHUP/POLLERR.
+ +	 */
+ +	if (!refcount_read(&md->refcnt))
+ +		return NULL;
+ +
+ +	head = perf_mmap__read_head(md);
+ +	if (!head)
+ +		return NULL;
+ +
+ +	/*
+ +	 * 'head' pointer starts from 0. Kernel minus sizeof(record) form
+ +	 * it each time when kernel writes to it, so in fact 'head' is
+ +	 * negative. 'end' pointer is made manually by adding the size of
+ +	 * the ring buffer to 'head' pointer, means the validate data can
+ +	 * read is the whole ring buffer. If 'end' is positive, the ring
+ +	 * buffer has not fully filled, so we must adjust 'end' to 0.
+ +	 *
+ +	 * However, since both 'head' and 'end' is unsigned, we can't
+ +	 * simply compare 'end' against 0. Here we compare '-head' and
+ +	 * the size of the ring buffer, where -head is the number of bytes
+ +	 * kernel write to the ring buffer.
+ +	 */
+ +	if (-head < (u64)(md->mask + 1))
+ +		end = 0;
+ +	else
+ +		end = head + md->mask + 1;
+ +
+ +	return perf_mmap__read(md, false, start, end, &md->prev);
+ +}
+ +
+ +union perf_event *perf_evlist__mmap_read_forward(struct perf_evlist *evlist, int idx)
+ +{
+ +	struct perf_mmap *md = &evlist->mmap[idx];
+ +
+ +	/*
+ +	 * Check messup is required for forward overwritable ring buffer:
+ +	 * memory pointed by md->prev can be overwritten in this case.
+ +	 * No need for read-write ring buffer: kernel stop outputting when
+ +	 * it hit md->prev (perf_mmap__consume()).
+ +	 */
+ +	return perf_mmap__read_forward(md, evlist->overwrite);
+ +}
+ +
+ +union perf_event *perf_evlist__mmap_read_backward(struct perf_evlist *evlist, int idx)
+ +{
+ +	struct perf_mmap *md = &evlist->mmap[idx];
+ +
+ +	/*
+ +	 * No need to check messup for backward ring buffer:
+ +	 * We can always read arbitrary long data from a backward
+ +	 * ring buffer unless we forget to pause it before reading.
+ +	 */
+ +	return perf_mmap__read_backward(md);
+ +}
+ +
+ +union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx)
+ +{
+ +	return perf_evlist__mmap_read_forward(evlist, idx);
+ +}
+ +
+ +void perf_mmap__read_catchup(struct perf_mmap *md)
+ +{
+ +	u64 head;
+ +
+ +	if (!refcount_read(&md->refcnt))
+ +		return;
+ +
+ +	head = perf_mmap__read_head(md);
+ +	md->prev = head;
+ +}
+ +
+ +void perf_evlist__mmap_read_catchup(struct perf_evlist *evlist, int idx)
+ +{
+ +	perf_mmap__read_catchup(&evlist->mmap[idx]);
+ +}
+ +
+ +static bool perf_mmap__empty(struct perf_mmap *md)
+ +{
+ +	return perf_mmap__read_head(md) == md->prev && !md->auxtrace_mmap.base;
+ +}
+ +
+ +static void perf_mmap__get(struct perf_mmap *map)
+ +{
+ +	refcount_inc(&map->refcnt);
+ +}
+ +
+ +static void perf_mmap__put(struct perf_mmap *md)
+ +{
+ +	BUG_ON(md->base && refcount_read(&md->refcnt) == 0);
+ +
+ +	if (refcount_dec_and_test(&md->refcnt))
+ +		perf_mmap__munmap(md);
+ +}
+ +
+ +void perf_mmap__consume(struct perf_mmap *md, bool overwrite)
+ +{
+ +	if (!overwrite) {
+ +		u64 old = md->prev;
+ +
+ +		perf_mmap__write_tail(md, old);
+ +	}
+ +
+ +	if (refcount_read(&md->refcnt) == 1 && perf_mmap__empty(md))
+ +		perf_mmap__put(md);
+ +}
+ +
+ +void perf_evlist__mmap_consume(struct perf_evlist *evlist, int idx)
+ +{
+ +	perf_mmap__consume(&evlist->mmap[idx], evlist->overwrite);
+ +}
+ +
+ +int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm __maybe_unused,
+ +			       struct auxtrace_mmap_params *mp __maybe_unused,
+ +			       void *userpg __maybe_unused,
+ +			       int fd __maybe_unused)
+ +{
+ +	return 0;
+ +}
+ +
+ +void __weak auxtrace_mmap__munmap(struct auxtrace_mmap *mm __maybe_unused)
+ +{
+ +}
+ +
+ +void __weak auxtrace_mmap_params__init(
+ +			struct auxtrace_mmap_params *mp __maybe_unused,
+ +			off_t auxtrace_offset __maybe_unused,
+ +			unsigned int auxtrace_pages __maybe_unused,
+ +			bool auxtrace_overwrite __maybe_unused)
+ +{
+ +}
+ +
+ +void __weak auxtrace_mmap_params__set_idx(
+ +			struct auxtrace_mmap_params *mp __maybe_unused,
+ +			struct perf_evlist *evlist __maybe_unused,
+ +			int idx __maybe_unused,
+ +			bool per_cpu __maybe_unused)
+ +{
+ +}
+ +
+ +static void perf_mmap__munmap(struct perf_mmap *map)
+ +{
+ +	if (map->base != NULL) {
+ +		munmap(map->base, perf_mmap__mmap_len(map));
+ +		map->base = NULL;
+ +		map->fd = -1;
+ +		refcount_set(&map->refcnt, 0);
+ +	}
+ +	auxtrace_mmap__munmap(&map->auxtrace_mmap);
+ +}
+ +
+++=======
+++>>>>>>> 6afad54d2f0d (perf mmap: Discard legacy interfaces for mmap read forward)
+  static void perf_evlist__munmap_nofree(struct perf_evlist *evlist)
+  {
+  	int i;
+diff --cc tools/perf/util/evlist.h
+index 8cb6e907ffcd,6c41b2f78713..000000000000
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@@ -175,20 -129,6 +175,23 @@@ struct perf_sample_id *perf_evlist__id2
+  
+  void perf_evlist__toggle_bkw_mmap(struct perf_evlist *evlist, enum bkw_mmap_state state);
+  
+++<<<<<<< HEAD
+ +union perf_event *perf_mmap__read_forward(struct perf_mmap *map, bool check_messup);
+ +union perf_event *perf_mmap__read_backward(struct perf_mmap *map);
+ +
+ +void perf_mmap__read_catchup(struct perf_mmap *md);
+ +void perf_mmap__consume(struct perf_mmap *md, bool overwrite);
+ +
+ +union perf_event *perf_evlist__mmap_read(struct perf_evlist *evlist, int idx);
+ +
+ +union perf_event *perf_evlist__mmap_read_forward(struct perf_evlist *evlist,
+ +						 int idx);
+ +union perf_event *perf_evlist__mmap_read_backward(struct perf_evlist *evlist,
+ +						  int idx);
+ +void perf_evlist__mmap_read_catchup(struct perf_evlist *evlist, int idx);
+ +
+++=======
+++>>>>>>> 6afad54d2f0d (perf mmap: Discard legacy interfaces for mmap read forward)
+  void perf_evlist__mmap_consume(struct perf_evlist *evlist, int idx);
+  
+  int perf_evlist__open(struct perf_evlist *evlist);
+* Unmerged path tools/perf/util/mmap.c
+* Unmerged path tools/perf/util/evlist.c
+* Unmerged path tools/perf/util/evlist.h
+* Unmerged path tools/perf/util/mmap.c
