@@ -1,0 +1,618 @@
+vmbus: put related per-cpu variable together
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit 37cdd991fac810a727cd285629d1640fcf53cd19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/37cdd991.failed
+
+The hv_context structure had several arrays which were per-cpu
+and was allocating small structures (tasklet_struct). Instead use
+a single per-cpu array.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 37cdd991fac810a727cd285629d1640fcf53cd19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/connection.c
+#	drivers/hv/hv.c
+#	drivers/hv/hyperv_vmbus.h
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/connection.c
+index 9b72ebcd37bc,158f12823baf..000000000000
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@@ -382,17 -377,12 +380,23 @@@ static void process_chn_event(u32 relid
+   */
+  void vmbus_on_event(unsigned long data)
+  {
+++<<<<<<< HEAD
+ +	u32 dword;
+ +	u32 maxdword;
+ +	int bit;
+ +	u32 relid;
+ +	u32 *recv_int_page = NULL;
+ +	void *page_addr;
+ +	int cpu = smp_processor_id();
+ +	union hv_synic_event_flags *event;
+++=======
++ 	struct hv_per_cpu_context *hv_cpu = (void *)data;
++ 	unsigned long *recv_int_page;
++ 	u32 maxbits, relid;
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  
+  	if (vmbus_proto_version < VERSION_WIN8) {
+ -		maxbits = MAX_NUM_CHANNELS_SUPPORTED;
+ +		maxdword = MAX_NUM_CHANNELS_SUPPORTED >> 5;
+  		recv_int_page = vmbus_connection.recv_int_page;
+  	} else {
+  		/*
+@@@ -400,35 -390,23 +404,41 @@@
+  		 * can be directly checked to get the id of the channel
+  		 * that has the interrupt pending.
+  		 */
+++<<<<<<< HEAD
+ +		maxdword = HV_EVENT_FLAGS_DWORD_COUNT;
+ +		page_addr = hv_context.synic_event_page[cpu];
+ +		event = (union hv_synic_event_flags *)page_addr +
+++=======
++ 		void *page_addr = hv_cpu->synic_event_page;
++ 		union hv_synic_event_flags *event
++ 			= (union hv_synic_event_flags *)page_addr +
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  						 VMBUS_MESSAGE_SINT;
+ -
+ -		maxbits = HV_EVENT_FLAGS_COUNT;
+ -		recv_int_page = event->flags;
+ +		recv_int_page = event->flags32;
+  	}
+  
+ -	if (unlikely(!recv_int_page))
+ +
+ +
+ +	/* Check events */
+ +	if (!recv_int_page)
+  		return;
+ +	for (dword = 0; dword < maxdword; dword++) {
+ +		if (!recv_int_page[dword])
+ +			continue;
+ +		for (bit = 0; bit < 32; bit++) {
+ +			if (sync_test_and_clear_bit(bit,
+ +				(unsigned long *)&recv_int_page[dword])) {
+ +				relid = (dword << 5) + bit;
+ +
+ +				if (relid == 0)
+ +					/*
+ +					 * Special case - vmbus
+ +					 * channel protocol msg
+ +					 */
+ +					continue;
+  
+ -	for_each_set_bit(relid, recv_int_page, maxbits) {
+ -		if (sync_test_and_clear_bit(relid, recv_int_page)) {
+ -			/* Special case - vmbus channel protocol msg */
+ -			if (relid != 0)
+  				process_chn_event(relid);
+ +			}
+  		}
+  	}
+  }
+diff --cc drivers/hv/hv.c
+index f6a591c69dfd,9fc2355a60ea..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -146,92 -49,14 +146,102 @@@ static struct clocksource *hyperv_cs_ol
+   */
+  int hv_init(void)
+  {
+++<<<<<<< HEAD
+ +	int max_leaf;
+ +	union hv_x64_msr_hypercall_contents hypercall_msr;
+ +
+ +	memset(hv_context.synic_event_page, 0, sizeof(void *) * NR_CPUS);
+ +	memset(hv_context.synic_message_page, 0,
+ +	       sizeof(void *) * NR_CPUS);
+ +	memset(hv_context.post_msg_page, 0,
+ +	       sizeof(void *) * NR_CPUS);
+ +	memset(hv_context.vp_index, 0,
+ +	       sizeof(int) * NR_CPUS);
+ +	memset(hv_context.event_dpc, 0,
+ +	       sizeof(void *) * NR_CPUS);
+ +	memset(hv_context.msg_dpc, 0,
+ +	       sizeof(void *) * NR_CPUS);
+ +	memset(hv_context.clk_evt, 0,
+ +	       sizeof(void *) * NR_CPUS);
+ +
+ +	max_leaf = query_hypervisor_info();
+ +
+ +
+ +	/* See if the hypercall page is already set */
+ +	hypercall_msr.as_uint64 = 0;
+ +	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+ +
+ +	if (!hypercall_msr.enable)
+ +		return -ENOTSUPP;
+ +
+ +#ifdef CONFIG_X86_64
+ +	if (ms_hyperv.features & HV_X64_MSR_REFERENCE_TSC_AVAILABLE) {
+ +		union hv_x64_msr_hypercall_contents tsc_msr;
+ +		void *va_tsc;
+ +
+ +		va_tsc = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL);
+ +		if (!va_tsc)
+ +			goto cleanup;
+ +		hv_context.tsc_page = va_tsc;
+ +
+ +		rdmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
+ +
+ +		tsc_msr.enable = 1;
+ +		tsc_msr.guest_physical_address = vmalloc_to_pfn(va_tsc);
+ +
+ +		wrmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
+ +		clocksource_register_hz(&hyperv_cs_tsc, NSEC_PER_SEC/100);
+ +		hyperv_cs_old = hyperv_cs;
+ +		hyperv_cs = &hyperv_cs_tsc;
+ +	}
+ +#endif
+++=======
++ 	if (!hv_is_hypercall_page_setup())
++ 		return -ENOTSUPP;
++ 
++ 	hv_context.cpu_context = alloc_percpu(struct hv_per_cpu_context);
++ 	if (!hv_context.cpu_context)
++ 		return -ENOMEM;
++ 
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  	return 0;
+ +
+ +cleanup:
+ +	return -ENOTSUPP;
+ +}
+ +
+ +/*
+ + * hv_cleanup - Cleanup routine.
+ + *
+ + * This routine is called normally during driver unloading or exiting.
+ + */
+ +void hv_cleanup(bool crash)
+ +{
+ +
+ +#ifdef CONFIG_X86_64
+ +	union hv_x64_msr_hypercall_contents hypercall_msr;
+ +	/*
+ +	 * Cleanup the TSC page based CS.
+ +	 */
+ +	if (ms_hyperv.features & HV_X64_MSR_REFERENCE_TSC_AVAILABLE) {
+ +		/*
+ +		 * Crash can happen in an interrupt context and unregistering
+ +		 * a clocksource is impossible and redundant in this case.
+ +		 */
+ +		if (!oops_in_progress) {
+ +			hyperv_cs = hyperv_cs_old;
+ +			clocksource_change_rating(&hyperv_cs_tsc, 10);
+ +			clocksource_unregister(&hyperv_cs_tsc);
+ +		}
+ +
+ +		hypercall_msr.as_uint64 = 0;
+ +		wrmsrl(HV_X64_MSR_REFERENCE_TSC, hypercall_msr.as_uint64);
+ +		if (!crash) {
+ +			vfree(hv_context.tsc_page);
+ +			hv_context.tsc_page = NULL;
+ +		}
+ +	}
+ +#endif
+  }
+  
+  /*
+@@@ -390,37 -196,26 +387,50 @@@ err
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +void hv_synic_free_cpu(int cpu)
+ +{
+ +	kfree(hv_context.event_dpc[cpu]);
+ +	kfree(hv_context.msg_dpc[cpu]);
+ +	kfree(hv_context.clk_evt[cpu]);
+ +	if (hv_context.synic_event_page[cpu])
+ +		free_page((unsigned long)hv_context.synic_event_page[cpu]);
+ +	if (hv_context.synic_message_page[cpu])
+ +		free_page((unsigned long)hv_context.synic_message_page[cpu]);
+ +	if (hv_context.post_msg_page[cpu])
+ +		free_page((unsigned long)hv_context.post_msg_page[cpu]);
+ +}
+++=======
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  
+  void hv_synic_free(void)
+  {
+  	int cpu;
+  
++ 	for_each_present_cpu(cpu) {
++ 		struct hv_per_cpu_context *hv_cpu
++ 			= per_cpu_ptr(hv_context.cpu_context, cpu);
++ 
++ 		if (hv_cpu->synic_event_page)
++ 			free_page((unsigned long)hv_cpu->synic_event_page);
++ 		if (hv_cpu->synic_message_page)
++ 			free_page((unsigned long)hv_cpu->synic_message_page);
++ 		if (hv_cpu->post_msg_page)
++ 			free_page((unsigned long)hv_cpu->post_msg_page);
++ 	}
++ 
+  	kfree(hv_context.hv_numa_map);
+- 	for_each_present_cpu(cpu)
+- 		hv_synic_free_cpu(cpu);
+  }
+  
+ +void hv_clockevents_bind(int cpu)
+ +{
+ +	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
+ +		clockevents_config_and_register(hv_context.clk_evt[cpu],
+ +						HV_TIMER_FREQUENCY,
+ +						HV_MIN_DELTA_TICKS,
+ +						HV_MAX_MAX_DELTA_TICKS);
+ +}
+ +
+  /*
+   * hv_synic_init - Initialize the Synthethic Interrupt Controller.
+   *
+@@@ -430,34 -225,33 +440,39 @@@
+   */
+  int hv_synic_init(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	u64 version;
+++=======
++ 	struct hv_per_cpu_context *hv_cpu
++ 		= per_cpu_ptr(hv_context.cpu_context, cpu);
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  	union hv_synic_simp simp;
+  	union hv_synic_siefp siefp;
+  	union hv_synic_sint shared_sint;
+  	union hv_synic_scontrol sctrl;
+  	u64 vp_index;
+  
+ +	/* Check the version */
+ +	rdmsrl(HV_X64_MSR_SVERSION, version);
+ +
+  	/* Setup the Synic's message page */
+ -	hv_get_simp(simp.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SIMP, simp.as_uint64);
+  	simp.simp_enabled = 1;
+- 	simp.base_simp_gpa = virt_to_phys(hv_context.synic_message_page[cpu])
++ 	simp.base_simp_gpa = virt_to_phys(hv_cpu->synic_message_page)
+  		>> PAGE_SHIFT;
+  
+ -	hv_set_simp(simp.as_uint64);
+ +	wrmsrl(HV_X64_MSR_SIMP, simp.as_uint64);
+  
+  	/* Setup the Synic's event page */
+ -	hv_get_siefp(siefp.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SIEFP, siefp.as_uint64);
+  	siefp.siefp_enabled = 1;
+- 	siefp.base_siefp_gpa = virt_to_phys(hv_context.synic_event_page[cpu])
++ 	siefp.base_siefp_gpa = virt_to_phys(hv_cpu->synic_event_page)
+  		>> PAGE_SHIFT;
+  
+ -	hv_set_siefp(siefp.as_uint64);
+ +	wrmsrl(HV_X64_MSR_SIEFP, siefp.as_uint64);
+  
+  	/* Setup the shared SINT. */
+ -	hv_get_synint_state(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT,
+ -			    shared_sint.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT, shared_sint.as_uint64);
+  
+  	shared_sint.as_uint64 = 0;
+  	shared_sint.vector = HYPERVISOR_CALLBACK_VECTOR;
+@@@ -485,8 -280,11 +500,16 @@@
+  	/*
+  	 * Register the per-cpu clockevent source.
+  	 */
+++<<<<<<< HEAD
+ +	hv_clockevents_bind(cpu);
+ +
+++=======
++ 	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
++ 		clockevents_config_and_register(hv_cpu->clk_evt,
++ 						HV_TIMER_FREQUENCY,
++ 						HV_MIN_DELTA_TICKS,
++ 						HV_MAX_MAX_DELTA_TICKS);
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  	return 0;
+  }
+  
+@@@ -500,18 -298,23 +523,22 @@@ void hv_synic_clockevents_cleanup(void
+  	if (!(ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE))
+  		return;
+  
+- 	for_each_present_cpu(cpu)
+- 		clockevents_unbind_device(hv_context.clk_evt[cpu], cpu);
++ 	for_each_present_cpu(cpu) {
++ 		struct hv_per_cpu_context *hv_cpu
++ 			= per_cpu_ptr(hv_context.cpu_context, cpu);
++ 
++ 		clockevents_unbind_device(hv_cpu->clk_evt, cpu);
++ 	}
+  }
+  
+ -/*
+ - * hv_synic_cleanup - Cleanup routine for hv_synic_init().
+ - */
+ -int hv_synic_cleanup(unsigned int cpu)
+ +void hv_clockevents_unbind(int cpu)
+ +{
+ +	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
+ +		clockevents_unbind_device(hv_context.clk_evt[cpu], cpu);
+ +}
+ +
+ +int hv_synic_cpu_used(unsigned int cpu)
+  {
+ -	union hv_synic_sint shared_sint;
+ -	union hv_synic_simp simp;
+ -	union hv_synic_siefp siefp;
+ -	union hv_synic_scontrol sctrl;
+  	struct vmbus_channel *channel, *sc;
+  	bool channel_found = false;
+  	unsigned long flags;
+@@@ -542,30 -348,20 +569,41 @@@
+  	mutex_unlock(&vmbus_connection.channel_mutex);
+  
+  	if (channel_found && vmbus_connection.conn_state == CONNECTED)
+ -		return -EBUSY;
+ +		return 1;
+ +
+ +	return 0;
+ +}
+ +
+ +/*
+ + * hv_synic_cleanup - Cleanup routine for hv_synic_init().
+ + */
+ +int hv_synic_cleanup(unsigned int cpu)
+ +{
+ +	union hv_synic_sint shared_sint;
+ +	union hv_synic_simp simp;
+ +	union hv_synic_siefp siefp;
+ +	union hv_synic_scontrol sctrl;
+ +
+ +	if (!hv_context.synic_initialized)
+ +		return -EFAULT;
+  
+  	/* Turn off clockevent device */
+++<<<<<<< HEAD
+ +	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
+ +		hv_ce_setmode(CLOCK_EVT_MODE_SHUTDOWN,
+ +			      hv_context.clk_evt[cpu]);
+++=======
++ 	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE) {
++ 		struct hv_per_cpu_context *hv_cpu
++ 			= this_cpu_ptr(hv_context.cpu_context);
++ 
++ 		clockevents_unbind_device(hv_cpu->clk_evt, cpu);
++ 		hv_ce_shutdown(hv_cpu->clk_evt);
++ 		put_cpu_ptr(hv_cpu);
++ 	}
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  
+ -	hv_get_synint_state(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT,
+ -			    shared_sint.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT, shared_sint.as_uint64);
+  
+  	shared_sint.masked = 1;
+  
+diff --cc drivers/hv/hyperv_vmbus.h
+index c92ad5535c23,c8ce9ab2e16a..000000000000
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@@ -322,55 -190,33 +323,85 @@@ enum 
+  	VMBUS_MESSAGE_SINT		= 2,
+  };
+  
+++<<<<<<< HEAD
+ +/* #defines */
+ +
+ +#define HV_PRESENT_BIT			0x80000000
+ +
+ +
+ +#define HV_CPU_POWER_MANAGEMENT		(1 << 0)
+ +#define HV_RECOMMENDATIONS_MAX		4
+ +
+ +#define HV_X64_MAX			5
+ +#define HV_CAPS_MAX			8
+ +
+ +
+ +#define HV_HYPERCALL_PARAM_ALIGN	sizeof(u64)
+ +
+ +
+ +/* Service definitions */
+ +
+ +#define HV_SERVICE_PARENT_PORT				(0)
+ +#define HV_SERVICE_PARENT_CONNECTION			(0)
+ +
+ +#define HV_SERVICE_CONNECT_RESPONSE_SUCCESS		(0)
+ +#define HV_SERVICE_CONNECT_RESPONSE_INVALID_PARAMETER	(1)
+ +#define HV_SERVICE_CONNECT_RESPONSE_UNKNOWN_SERVICE	(2)
+ +#define HV_SERVICE_CONNECT_RESPONSE_CONNECTION_REJECTED	(3)
+ +
+ +#define HV_SERVICE_CONNECT_REQUEST_MESSAGE_ID		(1)
+ +#define HV_SERVICE_CONNECT_RESPONSE_MESSAGE_ID		(2)
+ +#define HV_SERVICE_DISCONNECT_REQUEST_MESSAGE_ID	(3)
+ +#define HV_SERVICE_DISCONNECT_RESPONSE_MESSAGE_ID	(4)
+ +#define HV_SERVICE_MAX_MESSAGE_ID				(4)
+ +
+ +#define HV_SERVICE_PROTOCOL_VERSION (0x0010)
+ +#define HV_CONNECT_PAYLOAD_BYTE_COUNT 64
+ +
+ +/* #define VMBUS_REVISION_NUMBER	6 */
+ +
+ +/* Our local vmbus's port and connection id. Anything >0 is fine */
+ +/* #define VMBUS_PORT_ID		11 */
+ +
+ +/* 628180B8-308D-4c5e-B7DB-1BEB62E62EF4 */
+ +static const uuid_le VMBUS_SERVICE_ID = {
+ +	.b = {
+ +		0xb8, 0x80, 0x81, 0x62, 0x8d, 0x30, 0x5e, 0x4c,
+ +		0xb7, 0xdb, 0x1b, 0xeb, 0x62, 0xe6, 0x2e, 0xf4
+ +	},
+ +};
+ +
+ +
+ +
+++=======
++ /*
++  * Per cpu state for channel handling
++  */
++ struct hv_per_cpu_context {
++ 	void *synic_message_page;
++ 	void *synic_event_page;
++ 	/*
++ 	 * buffer to post messages to the host.
++ 	 */
++ 	void *post_msg_page;
++ 
++ 	/*
++ 	 * Starting with win8, we can take channel interrupts on any CPU;
++ 	 * we will manage the tasklet that handles events messages on a per CPU
++ 	 * basis.
++ 	 */
++ 	struct tasklet_struct event_dpc;
++ 	struct tasklet_struct msg_dpc;
++ 
++ 	/*
++ 	 * To optimize the mapping of relid to channel, maintain
++ 	 * per-cpu list of the channels based on their CPU affinity.
++ 	 */
++ 	struct list_head chan_list;
++ 	struct clock_event_device *clk_evt;
++ };
++ 
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  struct hv_context {
+  	/* We only support running on top of Hyper-V
+  	* So at this point this really can only contain the Hyper-V ID
+diff --cc drivers/hv/vmbus_drv.c
+index 4aa498db4703,cf8540c1df4a..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -866,9 -835,10 +866,14 @@@ static void vmbus_onmessage_work(struc
+  	kfree(ctx);
+  }
+  
+++<<<<<<< HEAD
+ +void hv_process_timer_expiration(struct hv_message *msg, int cpu)
+++=======
++ static void hv_process_timer_expiration(struct hv_message *msg,
++ 					struct hv_per_cpu_context *hv_cpu)
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  {
+- 	struct clock_event_device *dev = hv_context.clk_evt[cpu];
++ 	struct clock_event_device *dev = hv_cpu->clk_evt;
+  
+  	if (dev->event_handler)
+  		dev->event_handler(dev);
+@@@ -1629,14 -1536,13 +1639,21 @@@ static void __exit vmbus_exit(void
+  						 &hyperv_panic_block);
+  	}
+  	bus_unregister(&hv_bus);
+ +	hv_cleanup(false);
+ +	cpu_notifier_register_begin();
+ +	__unregister_hotcpu_notifier(&hv_cpuhp_notifier);
+  	for_each_online_cpu(cpu) {
+++<<<<<<< HEAD
+ +		tasklet_kill(hv_context.event_dpc[cpu]);
+ +		smp_call_function_single(cpu, hv_synic_cleanup_oncpu, NULL, 1);
+++=======
++ 		struct hv_per_cpu_context *hv_cpu
++ 			= per_cpu_ptr(hv_context.cpu_context, cpu);
++ 
++ 		tasklet_kill(&hv_cpu->event_dpc);
+++>>>>>>> 37cdd991fac8 (vmbus: put related per-cpu variable together)
+  	}
+ -	cpuhp_remove_state(hyperv_cpuhp_online);
+ +	cpu_notifier_register_done();
+  	hv_synic_free();
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+  }
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 8a209b718a7d..9b758b078077 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -329,9 +329,10 @@ static void free_channel(struct vmbus_channel *channel)
+ static void percpu_channel_enq(void *arg)
+ {
+ 	struct vmbus_channel *channel = arg;
+-	int cpu = smp_processor_id();
++	struct hv_per_cpu_context *hv_cpu
++		= this_cpu_ptr(hv_context.cpu_context);
+ 
+-	list_add_tail(&channel->percpu_list, &hv_context.percpu_list[cpu]);
++	list_add_tail(&channel->percpu_list, &hv_cpu->chan_list);
+ }
+ 
+ static void percpu_channel_deq(void *arg)
+@@ -355,19 +356,21 @@ static void vmbus_release_relid(u32 relid)
+ 
+ void hv_event_tasklet_disable(struct vmbus_channel *channel)
+ {
+-	struct tasklet_struct *tasklet;
+-	tasklet = hv_context.event_dpc[channel->target_cpu];
+-	tasklet_disable(tasklet);
++	struct hv_per_cpu_context *hv_cpu;
++
++	hv_cpu = per_cpu_ptr(hv_context.cpu_context, channel->target_cpu);
++	tasklet_disable(&hv_cpu->event_dpc);
+ }
+ 
+ void hv_event_tasklet_enable(struct vmbus_channel *channel)
+ {
+-	struct tasklet_struct *tasklet;
+-	tasklet = hv_context.event_dpc[channel->target_cpu];
+-	tasklet_enable(tasklet);
++	struct hv_per_cpu_context *hv_cpu;
++
++	hv_cpu = per_cpu_ptr(hv_context.cpu_context, channel->target_cpu);
++	tasklet_enable(&hv_cpu->event_dpc);
+ 
+ 	/* In case there is any pending event */
+-	tasklet_schedule(tasklet);
++	tasklet_schedule(&hv_cpu->event_dpc);
+ }
+ 
+ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
+@@ -702,9 +705,12 @@ static void vmbus_wait_for_unload(void)
+ 			break;
+ 
+ 		for_each_online_cpu(cpu) {
+-			page_addr = hv_context.synic_message_page[cpu];
+-			msg = (struct hv_message *)page_addr +
+-				VMBUS_MESSAGE_SINT;
++			struct hv_per_cpu_context *hv_cpu
++				= per_cpu_ptr(hv_context.cpu_context, cpu);
++
++			page_addr = hv_cpu->synic_message_page;
++			msg = (struct hv_message *)page_addr
++				+ VMBUS_MESSAGE_SINT;
+ 
+ 			message_type = READ_ONCE(msg->header.message_type);
+ 			if (message_type == HVMSG_NONE)
+@@ -728,7 +734,10 @@ static void vmbus_wait_for_unload(void)
+ 	 * messages after we reconnect.
+ 	 */
+ 	for_each_online_cpu(cpu) {
+-		page_addr = hv_context.synic_message_page[cpu];
++		struct hv_per_cpu_context *hv_cpu
++			= per_cpu_ptr(hv_context.cpu_context, cpu);
++
++		page_addr = hv_cpu->synic_message_page;
+ 		msg = (struct hv_message *)page_addr + VMBUS_MESSAGE_SINT;
+ 		msg->header.message_type = HVMSG_NONE;
+ 	}
+* Unmerged path drivers/hv/connection.c
+* Unmerged path drivers/hv/hv.c
+* Unmerged path drivers/hv/hyperv_vmbus.h
+* Unmerged path drivers/hv/vmbus_drv.c
