@@ -1,0 +1,285 @@
+locking/pvqspinlock, x86: Implement the paravirt qspinlock call patching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra (Intel) <peterz@infradead.org>
+commit f233f7f1581e78fd9b4023f2e7d8c1ed89020cc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f233f7f1.failed
+
+We use the regular paravirt call patching to switch between:
+
+  native_queued_spin_lock_slowpath()	__pv_queued_spin_lock_slowpath()
+  native_queued_spin_unlock()		__pv_queued_spin_unlock()
+
+We use a callee saved call for the unlock function which reduces the
+i-cache footprint and allows 'inlining' of SPIN_UNLOCK functions
+again.
+
+We further optimize the unlock path by patching the direct call with a
+"movb $0,%arg1" if we are indeed using the native unlock code. This
+makes the unlock code almost as fast as the !PARAVIRT case.
+
+This significantly lowers the overhead of having
+CONFIG_PARAVIRT_SPINLOCKS enabled, even for native code.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Daniel J Blueman <daniel@numascale.com>
+	Cc: David Vrabel <david.vrabel@citrix.com>
+	Cc: Douglas Hatch <doug.hatch@hp.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paolo Bonzini <paolo.bonzini@gmail.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Scott J Norton <scott.norton@hp.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: virtualization@lists.linux-foundation.org
+	Cc: xen-devel@lists.xenproject.org
+Link: http://lkml.kernel.org/r/1429901803-29771-10-git-send-email-Waiman.Long@hp.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit f233f7f1581e78fd9b4023f2e7d8c1ed89020cc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/qspinlock.h
+#	arch/x86/kernel/paravirt_patch_32.c
+diff --cc arch/x86/kernel/paravirt_patch_32.c
+index 78ffa1b0606a,e1b013696dde..000000000000
+--- a/arch/x86/kernel/paravirt_patch_32.c
++++ b/arch/x86/kernel/paravirt_patch_32.c
+@@@ -10,7 -10,12 +10,11 @@@ DEF_NATIVE(pv_mmu_ops, read_cr2, "mov %
+  DEF_NATIVE(pv_mmu_ops, write_cr3, "mov %eax, %cr3");
+  DEF_NATIVE(pv_mmu_ops, read_cr3, "mov %cr3, %eax");
+  DEF_NATIVE(pv_cpu_ops, clts, "clts");
+ -DEF_NATIVE(pv_cpu_ops, read_tsc, "rdtsc");
+  
++ #if defined(CONFIG_PARAVIRT_SPINLOCKS) && defined(CONFIG_QUEUED_SPINLOCKS)
++ DEF_NATIVE(pv_lock_ops, queued_spin_unlock, "movb $0, (%eax)");
++ #endif
++ 
+  unsigned paravirt_patch_ident_32(void *insnbuf, unsigned len)
+  {
+  	/* arg in %eax, return in %eax */
+@@@ -45,10 -52,15 +51,22 @@@ unsigned native_patch(u8 type, u16 clob
+  		PATCH_SITE(pv_mmu_ops, read_cr3);
+  		PATCH_SITE(pv_mmu_ops, write_cr3);
+  		PATCH_SITE(pv_cpu_ops, clts);
+++<<<<<<< HEAD
+ +
+ +	patch_site:
+ +		ret = paravirt_patch_insns(ibuf, len, start, end);
+ +		break;
+++=======
++ 		PATCH_SITE(pv_cpu_ops, read_tsc);
++ #if defined(CONFIG_PARAVIRT_SPINLOCKS) && defined(CONFIG_QUEUED_SPINLOCKS)
++ 		case PARAVIRT_PATCH(pv_lock_ops.queued_spin_unlock):
++ 			if (pv_is_native_spin_unlock()) {
++ 				start = start_pv_lock_ops_queued_spin_unlock;
++ 				end   = end_pv_lock_ops_queued_spin_unlock;
++ 				goto patch_site;
++ 			}
++ #endif
+++>>>>>>> f233f7f1581e (locking/pvqspinlock, x86: Implement the paravirt qspinlock call patching)
+  
+  	default:
+  		ret = paravirt_patch_default(type, clobbers, ibuf, addr, len);
+* Unmerged path arch/x86/include/asm/qspinlock.h
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index d30a5322b64f..0cdcff747cee 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -630,7 +630,7 @@ config PARAVIRT_DEBUG
+ config PARAVIRT_SPINLOCKS
+ 	bool "Paravirtualization layer for spinlocks"
+ 	depends on PARAVIRT && SMP
+-	select UNINLINE_SPIN_UNLOCK
++	select UNINLINE_SPIN_UNLOCK if !QUEUED_SPINLOCK
+ 	---help---
+ 	  Paravirtualized spinlocks allow a pvops backend to replace the
+ 	  spinlock implementation with something virtualization-friendly
+diff --git a/arch/x86/include/asm/paravirt.h b/arch/x86/include/asm/paravirt.h
+index 9a12f4a8dad4..1e64ffbc379a 100644
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@ -679,6 +679,31 @@ static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
+ 
+ #if defined(CONFIG_SMP) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+ 
++#ifdef CONFIG_QUEUED_SPINLOCK
++
++static __always_inline void pv_queued_spin_lock_slowpath(struct qspinlock *lock,
++							u32 val)
++{
++	PVOP_VCALL2(pv_lock_ops.queued_spin_lock_slowpath, lock, val);
++}
++
++static __always_inline void pv_queued_spin_unlock(struct qspinlock *lock)
++{
++	PVOP_VCALLEE1(pv_lock_ops.queued_spin_unlock, lock);
++}
++
++static __always_inline void pv_wait(u8 *ptr, u8 val)
++{
++	PVOP_VCALL2(pv_lock_ops.wait, ptr, val);
++}
++
++static __always_inline void pv_kick(int cpu)
++{
++	PVOP_VCALL1(pv_lock_ops.kick, cpu);
++}
++
++#else /* !CONFIG_QUEUED_SPINLOCK */
++
+ static __always_inline void __ticket_lock_spinning(struct arch_spinlock *lock,
+ 							__ticket_t ticket)
+ {
+@@ -691,7 +716,9 @@ static __always_inline void __ticket_unlock_kick(struct arch_spinlock *lock,
+ 	PVOP_VCALL2(pv_lock_ops.unlock_kick, lock, ticket);
+ }
+ 
+-#endif
++#endif /* CONFIG_QUEUED_SPINLOCK */
++
++#endif /* SMP && PARAVIRT_SPINLOCKS */
+ 
+ #ifdef CONFIG_X86_32
+ #define PV_SAVE_REGS "pushl %ecx; pushl %edx;"
+diff --git a/arch/x86/include/asm/paravirt_types.h b/arch/x86/include/asm/paravirt_types.h
+index 7e0527fa618b..a4460d429656 100644
+--- a/arch/x86/include/asm/paravirt_types.h
++++ b/arch/x86/include/asm/paravirt_types.h
+@@ -339,9 +339,19 @@ struct arch_spinlock;
+ typedef u16 __ticket_t;
+ #endif
+ 
++struct qspinlock;
++
+ struct pv_lock_ops {
++#ifdef CONFIG_QUEUED_SPINLOCK
++	void (*queued_spin_lock_slowpath)(struct qspinlock *lock, u32 val);
++	struct paravirt_callee_save queued_spin_unlock;
++
++	void (*wait)(u8 *ptr, u8 val);
++	void (*kick)(int cpu);
++#else /* !CONFIG_QUEUED_SPINLOCK */
+ 	struct paravirt_callee_save lock_spinning;
+ 	void (*unlock_kick)(struct arch_spinlock *lock, __ticket_t ticket);
++#endif /* !CONFIG_QUEUED_SPINLOCK */
+ };
+ 
+ /* This contains all the paravirt structures: we get a convenient
+* Unmerged path arch/x86/include/asm/qspinlock.h
+diff --git a/arch/x86/include/asm/qspinlock_paravirt.h b/arch/x86/include/asm/qspinlock_paravirt.h
+new file mode 100644
+index 000000000000..b002e711ba88
+--- /dev/null
++++ b/arch/x86/include/asm/qspinlock_paravirt.h
+@@ -0,0 +1,6 @@
++#ifndef __ASM_QSPINLOCK_PARAVIRT_H
++#define __ASM_QSPINLOCK_PARAVIRT_H
++
++PV_CALLEE_SAVE_REGS_THUNK(__pv_queued_spin_unlock);
++
++#endif
+diff --git a/arch/x86/kernel/paravirt-spinlocks.c b/arch/x86/kernel/paravirt-spinlocks.c
+index bbb6c7316341..a33f1eb15003 100644
+--- a/arch/x86/kernel/paravirt-spinlocks.c
++++ b/arch/x86/kernel/paravirt-spinlocks.c
+@@ -8,11 +8,33 @@
+ 
+ #include <asm/paravirt.h>
+ 
++#ifdef CONFIG_QUEUED_SPINLOCK
++__visible void __native_queued_spin_unlock(struct qspinlock *lock)
++{
++	native_queued_spin_unlock(lock);
++}
++
++PV_CALLEE_SAVE_REGS_THUNK(__native_queued_spin_unlock);
++
++bool pv_is_native_spin_unlock(void)
++{
++	return pv_lock_ops.queued_spin_unlock.func ==
++		__raw_callee_save___native_queued_spin_unlock;
++}
++#endif
++
+ struct pv_lock_ops pv_lock_ops = {
+ #ifdef CONFIG_SMP
++#ifdef CONFIG_QUEUED_SPINLOCK
++	.queued_spin_lock_slowpath = native_queued_spin_lock_slowpath,
++	.queued_spin_unlock = PV_CALLEE_SAVE(__native_queued_spin_unlock),
++	.wait = paravirt_nop,
++	.kick = paravirt_nop,
++#else /* !CONFIG_QUEUED_SPINLOCK */
+ 	.lock_spinning = __PV_IS_CALLEE_SAVE(paravirt_nop),
+ 	.unlock_kick = paravirt_nop,
+-#endif
++#endif /* !CONFIG_QUEUED_SPINLOCK */
++#endif /* SMP */
+ };
+ EXPORT_SYMBOL(pv_lock_ops);
+ 
+* Unmerged path arch/x86/kernel/paravirt_patch_32.c
+diff --git a/arch/x86/kernel/paravirt_patch_64.c b/arch/x86/kernel/paravirt_patch_64.c
+index 3f08f34f93eb..0383e6a3d042 100644
+--- a/arch/x86/kernel/paravirt_patch_64.c
++++ b/arch/x86/kernel/paravirt_patch_64.c
+@@ -22,6 +22,10 @@ DEF_NATIVE(pv_cpu_ops, swapgs, "swapgs");
+ DEF_NATIVE(, mov32, "mov %edi, %eax");
+ DEF_NATIVE(, mov64, "mov %rdi, %rax");
+ 
++#if defined(CONFIG_PARAVIRT_SPINLOCKS) && defined(CONFIG_QUEUED_SPINLOCK)
++DEF_NATIVE(pv_lock_ops, queued_spin_unlock, "movb $0, (%rdi)");
++#endif
++
+ unsigned paravirt_patch_ident_32(void *insnbuf, unsigned len)
+ {
+ 	return paravirt_patch_insns(insnbuf, len,
+@@ -34,6 +38,8 @@ unsigned paravirt_patch_ident_64(void *insnbuf, unsigned len)
+ 				    start__mov64, end__mov64);
+ }
+ 
++extern bool pv_is_native_spin_unlock(void);
++
+ unsigned native_patch(u8 type, u16 clobbers, void *ibuf,
+ 		      unsigned long addr, unsigned len)
+ {
+@@ -61,14 +67,22 @@ unsigned native_patch(u8 type, u16 clobbers, void *ibuf,
+ 		PATCH_SITE(pv_cpu_ops, clts);
+ 		PATCH_SITE(pv_mmu_ops, flush_tlb_single);
+ 		PATCH_SITE(pv_cpu_ops, wbinvd);
+-
+-	patch_site:
+-		ret = paravirt_patch_insns(ibuf, len, start, end);
+-		break;
++#if defined(CONFIG_PARAVIRT_SPINLOCKS) && defined(CONFIG_QUEUED_SPINLOCK)
++		case PARAVIRT_PATCH(pv_lock_ops.queued_spin_unlock):
++			if (pv_is_native_spin_unlock()) {
++				start = start_pv_lock_ops_queued_spin_unlock;
++				end   = end_pv_lock_ops_queued_spin_unlock;
++				goto patch_site;
++			}
++#endif
+ 
+ 	default:
+ 		ret = paravirt_patch_default(type, clobbers, ibuf, addr, len);
+ 		break;
++
++patch_site:
++		ret = paravirt_patch_insns(ibuf, len, start, end);
++		break;
+ 	}
+ #undef PATCH_SITE
+ 	return ret;
