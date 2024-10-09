@@ -1,0 +1,195 @@
+x86/boot/KASLR: Work around firmware bugs by excluding EFI_BOOT_SERVICES_* and EFI_LOADER_* from KASLR's choice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] boot/kaslr: Work around firmware bugs by excluding EFI_BOOT_SERVICES_* and EFI_LOADER_* from KASLR's choice (Kazuhito Hagio) [1458129]
+Rebuild_FUZZ: 98.17%
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit 0982adc746736a313dac9cb8cc936ca51ca3741a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0982adc7.failed
+
+There's a potential bug in how we select the KASLR kernel address n
+the early boot code.
+
+The KASLR boot code currently chooses the kernel image's physical memory
+location from E820_TYPE_RAM regions by walking over all e820 entries.
+
+E820_TYPE_RAM includes EFI_BOOT_SERVICES_CODE and EFI_BOOT_SERVICES_DATA
+as well, so those regions can end up hosting the kernel image. According to
+the UEFI spec, all memory regions marked as EfiBootServicesCode and
+EfiBootServicesData are available as free memory after the first call
+to ExitBootServices(). I.e. so such regions should be usable for the
+kernel, per spec.
+
+In real life however, we have workarounds for broken x86 firmware,
+where we keep such regions reserved until SetVirtualAddressMap() is done.
+
+See the following code in should_map_region():
+
+	static bool should_map_region(efi_memory_desc_t *md)
+	{
+		...
+		/*
+		 * Map boot services regions as a workaround for buggy
+		 * firmware that accesses them even when they shouldn't.
+		 *
+		 * See efi_{reserve,free}_boot_services().
+		 */
+		if (md->type =3D=3D EFI_BOOT_SERVICES_CODE ||
+			md->type =3D=3D EFI_BOOT_SERVICES_DATA)
+				return false;
+
+This workaround suppressed a boot crash, but potential issues still
+remain because no one prevents the regions from overlapping with kernel
+image by KASLR.
+
+So let's make sure that EFI_BOOT_SERVICES_{CODE|DATA} regions are never
+chosen as kernel memory for the workaround to work fine.
+
+Furthermore, EFI_LOADER_{CODE|DATA} regions are also excluded because
+they can be used after ExitBootServices() as defined in EFI spec.
+
+As a result, we choose kernel address only from EFI_CONVENTIONAL_MEMORY
+which is the only memory type we know to be safely free.
+
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Baoquan He <bhe@redhat.com>
+	Cc: Junichi Nomura <j-nomura@ce.jp.nec.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Garnier <thgarnie@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: fanc.fnst@cn.fujitsu.com
+	Cc: izumi.taku@jp.fujitsu.com
+Link: http://lkml.kernel.org/r/20170828074444.GC23181@hori1.linux.bs1.fc.nec.co.jp
+[ Rewrote/fixed/clarified the changelog and the in code comments. ]
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0982adc746736a313dac9cb8cc936ca51ca3741a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr.c
+diff --cc arch/x86/boot/compressed/kaslr.c
+index b93f968ac8d4,17818ba6906f..000000000000
+--- a/arch/x86/boot/compressed/kaslr.c
++++ b/arch/x86/boot/compressed/kaslr.c
+@@@ -562,6 -560,110 +562,113 @@@ static void process_e820_entry(struct e
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_EFI
++ /*
++  * Returns true if mirror region found (and must have been processed
++  * for slots adding)
++  */
++ static bool
++ process_efi_entries(unsigned long minimum, unsigned long image_size)
++ {
++ 	struct efi_info *e = &boot_params->efi_info;
++ 	bool efi_mirror_found = false;
++ 	struct mem_vector region;
++ 	efi_memory_desc_t *md;
++ 	unsigned long pmap;
++ 	char *signature;
++ 	u32 nr_desc;
++ 	int i;
++ 
++ 	signature = (char *)&e->efi_loader_signature;
++ 	if (strncmp(signature, EFI32_LOADER_SIGNATURE, 4) &&
++ 	    strncmp(signature, EFI64_LOADER_SIGNATURE, 4))
++ 		return false;
++ 
++ #ifdef CONFIG_X86_32
++ 	/* Can't handle data above 4GB at this time */
++ 	if (e->efi_memmap_hi) {
++ 		warn("EFI memmap is above 4GB, can't be handled now on x86_32. EFI should be disabled.\n");
++ 		return false;
++ 	}
++ 	pmap =  e->efi_memmap;
++ #else
++ 	pmap = (e->efi_memmap | ((__u64)e->efi_memmap_hi << 32));
++ #endif
++ 
++ 	nr_desc = e->efi_memmap_size / e->efi_memdesc_size;
++ 	for (i = 0; i < nr_desc; i++) {
++ 		md = efi_early_memdesc_ptr(pmap, e->efi_memdesc_size, i);
++ 		if (md->attribute & EFI_MEMORY_MORE_RELIABLE) {
++ 			efi_mirror_found = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	for (i = 0; i < nr_desc; i++) {
++ 		md = efi_early_memdesc_ptr(pmap, e->efi_memdesc_size, i);
++ 
++ 		/*
++ 		 * Here we are more conservative in picking free memory than
++ 		 * the EFI spec allows:
++ 		 *
++ 		 * According to the spec, EFI_BOOT_SERVICES_{CODE|DATA} are also
++ 		 * free memory and thus available to place the kernel image into,
++ 		 * but in practice there's firmware where using that memory leads
++ 		 * to crashes.
++ 		 *
++ 		 * Only EFI_CONVENTIONAL_MEMORY is guaranteed to be free.
++ 		 */
++ 		if (md->type != EFI_CONVENTIONAL_MEMORY)
++ 			continue;
++ 
++ 		if (efi_mirror_found &&
++ 		    !(md->attribute & EFI_MEMORY_MORE_RELIABLE))
++ 			continue;
++ 
++ 		region.start = md->phys_addr;
++ 		region.size = md->num_pages << EFI_PAGE_SHIFT;
++ 		process_mem_region(&region, minimum, image_size);
++ 		if (slot_area_index == MAX_SLOT_AREA) {
++ 			debug_putstr("Aborted EFI scan (slot_areas full)!\n");
++ 			break;
++ 		}
++ 	}
++ 	return true;
++ }
++ #else
++ static inline bool
++ process_efi_entries(unsigned long minimum, unsigned long image_size)
++ {
++ 	return false;
++ }
++ #endif
++ 
++ static void process_e820_entries(unsigned long minimum,
++ 				 unsigned long image_size)
++ {
++ 	int i;
++ 	struct mem_vector region;
++ 	struct boot_e820_entry *entry;
++ 
++ 	/* Verify potential e820 positions, appending to slots list. */
++ 	for (i = 0; i < boot_params->e820_entries; i++) {
++ 		entry = &boot_params->e820_table[i];
++ 		/* Skip non-RAM entries. */
++ 		if (entry->type != E820_TYPE_RAM)
++ 			continue;
++ 		region.start = entry->addr;
++ 		region.size = entry->size;
++ 		process_mem_region(&region, minimum, image_size);
++ 		if (slot_area_index == MAX_SLOT_AREA) {
++ 			debug_putstr("Aborted e820 scan (slot_areas full)!\n");
++ 			break;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 0982adc74673 (x86/boot/KASLR: Work around firmware bugs by excluding EFI_BOOT_SERVICES_* and EFI_LOADER_* from KASLR's choice)
+  static unsigned long find_random_phys_addr(unsigned long minimum,
+  					   unsigned long image_size)
+  {
+* Unmerged path arch/x86/boot/compressed/kaslr.c
