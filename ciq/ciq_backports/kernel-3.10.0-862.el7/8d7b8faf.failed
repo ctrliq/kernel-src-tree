@@ -1,0 +1,165 @@
+nvme: kick requeue list when requeueing a request instead of when starting the queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] kick requeue list when requeueing a request instead of when starting the queues (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 96.34%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 8d7b8fafad87c3404f72ce2d36c79c48be1129a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8d7b8faf.failed
+
+When we requeue a request, we can always insert the request
+back to the scheduler instead of doing it when restarting
+the queues and kicking the requeue work, so get rid of
+the requeue kick in nvme (core and drivers).
+
+Also, now there is no need start hw queues in nvme_kill_queues
+We don't stop the hw queues anymore, so no need to
+start them.
+
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 8d7b8fafad87c3404f72ce2d36c79c48be1129a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index eb6945931263,48cafaa6fbc5..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -61,6 -76,69 +61,72 @@@ static DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ int nvme_reset_ctrl(struct nvme_ctrl *ctrl)
++ {
++ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_RESETTING))
++ 		return -EBUSY;
++ 	if (!queue_work(nvme_wq, &ctrl->reset_work))
++ 		return -EBUSY;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvme_reset_ctrl);
++ 
++ static int nvme_reset_ctrl_sync(struct nvme_ctrl *ctrl)
++ {
++ 	int ret;
++ 
++ 	ret = nvme_reset_ctrl(ctrl);
++ 	if (!ret)
++ 		flush_work(&ctrl->reset_work);
++ 	return ret;
++ }
++ 
++ static blk_status_t nvme_error_status(struct request *req)
++ {
++ 	switch (nvme_req(req)->status & 0x7ff) {
++ 	case NVME_SC_SUCCESS:
++ 		return BLK_STS_OK;
++ 	case NVME_SC_CAP_EXCEEDED:
++ 		return BLK_STS_NOSPC;
++ 	case NVME_SC_ONCS_NOT_SUPPORTED:
++ 		return BLK_STS_NOTSUPP;
++ 	case NVME_SC_WRITE_FAULT:
++ 	case NVME_SC_READ_ERROR:
++ 	case NVME_SC_UNWRITTEN_BLOCK:
++ 		return BLK_STS_MEDIUM;
++ 	default:
++ 		return BLK_STS_IOERR;
++ 	}
++ }
++ 
++ static inline bool nvme_req_needs_retry(struct request *req)
++ {
++ 	if (blk_noretry_request(req))
++ 		return false;
++ 	if (nvme_req(req)->status & NVME_SC_DNR)
++ 		return false;
++ 	if (jiffies - req->start_time >= req->timeout)
++ 		return false;
++ 	if (nvme_req(req)->retries >= nvme_max_retries)
++ 		return false;
++ 	return true;
++ }
++ 
++ void nvme_complete_rq(struct request *req)
++ {
++ 	if (unlikely(nvme_req(req)->status && nvme_req_needs_retry(req))) {
++ 		nvme_req(req)->retries++;
++ 		blk_mq_requeue_request(req, true);
++ 		return;
++ 	}
++ 
++ 	blk_mq_end_request(req, nvme_error_status(req));
++ }
++ EXPORT_SYMBOL_GPL(nvme_complete_rq);
++ 
+++>>>>>>> 8d7b8fafad87 (nvme: kick requeue list when requeueing a request instead of when starting the queues)
+  void nvme_cancel_request(struct request *req, void *data, bool reserved)
+  {
+  	int status;
+@@@ -2018,28 -2691,21 +2084,38 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  
+  	mutex_lock(&ctrl->namespaces_mutex);
+  
+++<<<<<<< HEAD
+ +	/* Forcibly start all queues to avoid having stuck requests */
+ +	blk_mq_start_hw_queues(ctrl->admin_q);
+++=======
++ 	/* Forcibly unquiesce queues to avoid blocking dispatch */
++ 	blk_mq_unquiesce_queue(ctrl->admin_q);
+++>>>>>>> 8d7b8fafad87 (nvme: kick requeue list when requeueing a request instead of when starting the queues)
+  
+  	list_for_each_entry(ns, &ctrl->namespaces, list) {
+  		/*
+  		 * Revalidating a dead namespace sets capacity to 0. This will
+  		 * end buffered writers dirtying pages that can't be synced.
+  		 */
+ -		if (!ns->disk || test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ -			continue;
+ -		revalidate_disk(ns->disk);
+ +		if (!test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ +			revalidate_disk(ns->disk);
+ +
+++<<<<<<< HEAD
+  		blk_set_queue_dying(ns->queue);
+  
+ +		/*
+ +		 * Forcibly start all queues to avoid having stuck requests.
+ +		 * Note that we must ensure the queues are not stopped
+ +		 * when the final removal happens.
+ +		 */
+ +		blk_mq_start_hw_queues(ns->queue);
+ +
+ +		/* draining requests in requeue list */
+ +		blk_mq_kick_requeue_list(ns->queue);
+++=======
++ 		/* Forcibly unquiesce queues to avoid blocking dispatch */
++ 		blk_mq_unquiesce_queue(ns->queue);
+++>>>>>>> 8d7b8fafad87 (nvme: kick requeue list when requeueing a request instead of when starting the queues)
+  	}
+  	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+@@@ -2113,11 -2774,8 +2189,16 @@@ void nvme_start_queues(struct nvme_ctr
+  	struct nvme_ns *ns;
+  
+  	mutex_lock(&ctrl->namespaces_mutex);
+++<<<<<<< HEAD
+ +	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ +		queue_flag_clear_unlocked(QUEUE_FLAG_STOPPED, ns->queue);
+ +		blk_mq_start_stopped_hw_queues(ns->queue, true);
+ +		blk_mq_kick_requeue_list(ns->queue);
+ +	}
+++=======
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_mq_unquiesce_queue(ns->queue);
+++>>>>>>> 8d7b8fafad87 (nvme: kick requeue list when requeueing a request instead of when starting the queues)
+  	mutex_unlock(&ctrl->namespaces_mutex);
+  }
+  EXPORT_SYMBOL_GPL(nvme_start_queues);
+* Unmerged path drivers/nvme/host/core.c
