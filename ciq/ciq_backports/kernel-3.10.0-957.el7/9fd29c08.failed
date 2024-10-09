@@ -1,0 +1,93 @@
+bpf: improve verifier ARG_CONST_SIZE_OR_ZERO semantics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yonghong Song <yhs@fb.com>
+commit 9fd29c08e52023252f0480ab8f6906a1ecc9a8d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9fd29c08.failed
+
+For helpers, the argument type ARG_CONST_SIZE_OR_ZERO permits the
+access size to be 0 when accessing the previous argument (arg).
+Right now, it requires the arg needs to be NULL when size passed
+is 0 or could be 0. It also requires a non-NULL arg when the size
+is proved to be non-0.
+
+This patch changes verifier ARG_CONST_SIZE_OR_ZERO behavior
+such that for size-0 or possible size-0, it is not required
+the arg equal to NULL.
+
+There are a couple of reasons for this semantics change, and
+all of them intends to simplify user bpf programs which
+may improve user experience and/or increase chances of
+verifier acceptance. Together with the next patch which
+changes bpf_probe_read arg2 type from ARG_CONST_SIZE to
+ARG_CONST_SIZE_OR_ZERO, the following two examples, which
+fail the verifier currently, are able to get verifier acceptance.
+
+Example 1:
+   unsigned long len = pend - pstart;
+   len = len > MAX_PAYLOAD_LEN ? MAX_PAYLOAD_LEN : len;
+   len &= MAX_PAYLOAD_LEN;
+   bpf_probe_read(data->payload, len, pstart);
+
+It does not have test for "len > 0" and it failed the verifier.
+Users may not be aware that they have to add this test.
+Converting the bpf_probe_read helper to have
+ARG_CONST_SIZE_OR_ZERO helps the above code get
+verifier acceptance.
+
+Example 2:
+  Here is one example where llvm "messed up" the code and
+  the verifier fails.
+
+......
+   unsigned long len = pend - pstart;
+   if (len > 0 && len <= MAX_PAYLOAD_LEN)
+     bpf_probe_read(data->payload, len, pstart);
+......
+
+The compiler generates the following code and verifier fails:
+......
+39: (79) r2 = *(u64 *)(r10 -16)
+40: (1f) r2 -= r8
+41: (bf) r1 = r2
+42: (07) r1 += -1
+43: (25) if r1 > 0xffe goto pc+3
+  R0=inv(id=0) R1=inv(id=0,umax_value=4094,var_off=(0x0; 0xfff))
+  R2=inv(id=0) R6=map_value(id=0,off=0,ks=4,vs=4095,imm=0) R7=inv(id=0)
+  R8=inv(id=0) R9=inv0 R10=fp0
+44: (bf) r1 = r6
+45: (bf) r3 = r8
+46: (85) call bpf_probe_read#45
+R2 min value is negative, either use unsigned or 'var &= const'
+......
+
+The compiler optimization is correct. If r1 = 0,
+r1 - 1 = 0xffffffffffffffff > 0xffe.  If r1 != 0, r1 - 1 will not wrap.
+r1 > 0xffe at insn #43 can actually capture
+both "r1 > 0" and "len <= MAX_PAYLOAD_LEN".
+This however causes an issue in verifier as the value range of arg2
+"r2" does not properly get refined and lead to verification failure.
+
+Relaxing bpf_prog_read arg2 from ARG_CONST_SIZE to ARG_CONST_SIZE_OR_ZERO
+allows the following simplied code:
+   unsigned long len = pend - pstart;
+   if (len <= MAX_PAYLOAD_LEN)
+     bpf_probe_read(data->payload, len, pstart);
+
+The llvm compiler will generate less complex code and the
+verifier is able to verify that the program is okay.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9fd29c08e52023252f0480ab8f6906a1ecc9a8d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
