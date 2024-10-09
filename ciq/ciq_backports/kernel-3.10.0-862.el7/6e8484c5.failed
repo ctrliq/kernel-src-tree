@@ -1,0 +1,124 @@
+RDMA/mlx5: set UMR wqe fence according to HCA cap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 6e8484c5cf07c7ee632587e98c1a12d319dacb7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6e8484c5.failed
+
+Cache the needed umr_fence and set the wqe ctrl segmennt
+accordingly.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Acked-by: Leon Romanovsky <leon@kernel.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6e8484c5cf07c7ee632587e98c1a12d319dacb7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 17ce965b9a6d,bdcf25410c99..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -653,6 -652,9 +653,12 @@@ struct mlx5_ib_dev 
+  	struct list_head	qp_list;
+  	/* Array with num_ports elements */
+  	struct mlx5_ib_port	*port;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_sq_bfreg     bfreg;
++ 	struct mlx5_sq_bfreg     fp_bfreg;
++ 	u8				umr_fence;
+++>>>>>>> 6e8484c5cf07 (RDMA/mlx5: set UMR wqe fence according to HCA cap)
+  };
+  
+  static inline struct mlx5_ib_cq *to_mibcq(struct mlx5_core_cq *mcq)
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 5d46e93692b2,ebb6768684de..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -3778,42 -3738,6 +3778,45 @@@ static void dump_wqe(struct mlx5_ib_qp 
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5_bf_copy(u64 __iomem *dst, u64 *src,
+ +			 unsigned bytecnt, struct mlx5_ib_qp *qp)
+ +{
+ +	while (bytecnt > 0) {
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		__iowrite64_copy(dst++, src++, 8);
+ +		bytecnt -= 64;
+ +		if (unlikely(src == qp->sq.qend))
+ +			src = mlx5_get_send_wqe(qp, 0);
+ +	}
+ +}
+ +
+ +static u8 get_fence(u8 fence, struct ib_send_wr *wr)
+ +{
+ +	if (unlikely(wr->opcode == IB_WR_LOCAL_INV &&
+ +		     wr->send_flags & IB_SEND_FENCE))
+ +		return MLX5_FENCE_MODE_STRONG_ORDERING;
+ +
+ +	if (unlikely(fence)) {
+ +		if (wr->send_flags & IB_SEND_FENCE)
+ +			return MLX5_FENCE_MODE_SMALL_AND_FENCE;
+ +		else
+ +			return fence;
+ +	} else if (unlikely(wr->send_flags & IB_SEND_FENCE)) {
+ +		return MLX5_FENCE_MODE_FENCE;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 6e8484c5cf07 (RDMA/mlx5: set UMR wqe fence according to HCA cap)
+  static int begin_wqe(struct mlx5_ib_qp *qp, void **seg,
+  		     struct mlx5_wqe_ctrl_seg **ctrl,
+  		     struct ib_send_wr *wr, unsigned *idx,
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 9a7070605698..bfaebbed0acc 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -2834,6 +2834,18 @@ error_0:
+ 	return ret;
+ }
+ 
++static u8 mlx5_get_umr_fence(u8 umr_fence_cap)
++{
++	switch (umr_fence_cap) {
++	case MLX5_CAP_UMR_FENCE_NONE:
++		return MLX5_FENCE_MODE_NONE;
++	case MLX5_CAP_UMR_FENCE_SMALL:
++		return MLX5_FENCE_MODE_INITIATOR_SMALL;
++	default:
++		return MLX5_FENCE_MODE_STRONG_ORDERING;
++	}
++}
++
+ static int create_dev_resources(struct mlx5_ib_resources *devr)
+ {
+ 	struct ib_srq_init_attr attr;
+@@ -3380,6 +3392,8 @@ static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+ 
+ 	mlx5_ib_internal_fill_odp_caps(dev);
+ 
++	dev->umr_fence = mlx5_get_umr_fence(MLX5_CAP_GEN(mdev, umr_fence));
++
+ 	if (MLX5_CAP_GEN(mdev, imaicl)) {
+ 		dev->ib_dev.alloc_mw		= mlx5_ib_alloc_mw;
+ 		dev->ib_dev.dealloc_mw		= mlx5_ib_dealloc_mw;
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
