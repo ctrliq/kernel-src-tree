@@ -651,6 +651,7 @@ struct net_device *bond_option_active_slave_get_rcu(struct bonding *bond);
 const char *bond_slave_link_status(s8 link);
 int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave);
 void bond_slave_arr_work_rearm(struct bonding *bond, unsigned long delay);
+void bond_work_init_all(struct bonding *bond);
 
 #ifdef CONFIG_PROC_FS
 void bond_create_proc_entry(struct bonding *bond);
