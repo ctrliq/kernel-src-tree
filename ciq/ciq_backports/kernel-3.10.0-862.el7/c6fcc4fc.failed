@@ -1,0 +1,143 @@
+vxlan: avoid using stale vxlan socket.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] vxlan: avoid using stale vxlan socket (Jiri Benc) [1467280]
+Rebuild_FUZZ: 98.67%
+commit-author pravin shelar <pshelar@ovn.org>
+commit c6fcc4fc5f8b592600c7409e769ab68da0fb1eca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c6fcc4fc.failed
+
+When vxlan device is closed vxlan socket is freed. This
+operation can race with vxlan-xmit function which
+dereferences vxlan socket. Following patch uses RCU
+mechanism to avoid this situation.
+
+	Signed-off-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6fcc4fc5f8b592600c7409e769ab68da0fb1eca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 68ca252705e5,f3c2fa3ab0d5..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1021,18 -1010,19 +1026,27 @@@ static bool __vxlan_sock_release_prep(s
+  
+  static void vxlan_sock_release(struct vxlan_dev *vxlan)
+  {
+- 	bool ipv4 = __vxlan_sock_release_prep(vxlan->vn4_sock);
++ 	struct vxlan_sock *sock4 = rtnl_dereference(vxlan->vn4_sock);
+  #if IS_ENABLED(CONFIG_IPV6)
+- 	bool ipv6 = __vxlan_sock_release_prep(vxlan->vn6_sock);
++ 	struct vxlan_sock *sock6 = rtnl_dereference(vxlan->vn6_sock);
++ 
++ 	rcu_assign_pointer(vxlan->vn6_sock, NULL);
+  #endif
+  
++ 	rcu_assign_pointer(vxlan->vn4_sock, NULL);
+  	synchronize_net();
+  
+++<<<<<<< HEAD
+ +	vxlan_vs_del_dev(vxlan);
+ +
+ +	if (ipv4) {
+ +		udp_tunnel_sock_release(vxlan->vn4_sock->sock);
+ +		kfree(vxlan->vn4_sock);
+++=======
++ 	if (__vxlan_sock_release_prep(sock4)) {
++ 		udp_tunnel_sock_release(sock4->sock);
++ 		kfree(sock4);
+++>>>>>>> c6fcc4fc5f8b (vxlan: avoid using stale vxlan socket.)
+  	}
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+@@@ -2439,12 -2451,9 +2467,10 @@@ static int vxlan_fill_metadata_dst(stru
+  #if IS_ENABLED(CONFIG_IPV6)
+  		struct dst_entry *ndst;
+  
+- 		if (!vxlan->vn6_sock)
+- 			return -EINVAL;
+  		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
+  					info->key.label, &info->key.u.ipv6.dst,
+ -					&info->key.u.ipv6.src, NULL, info);
+ +					&info->key.u.ipv6.src,
+ +					&info->dst_cache, info);
+  		if (IS_ERR(ndst))
+  			return PTR_ERR(ndst);
+  		dst_release(ndst);
+@@@ -2750,36 -2759,28 +2776,50 @@@ static int __vxlan_sock_add(struct vxla
+  	if (IS_ERR(vs))
+  		return PTR_ERR(vs);
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +	if (ipv6) {
+ +		vxlan->vn6_sock = vs;
+ +		node = &vxlan->hlist6;
+ +	} else
+ +#endif
+ +	{
+ +		vxlan->vn4_sock = vs;
+ +		node = &vxlan->hlist4;
+ +	}
+ +	vxlan_vs_add_dev(vs, vxlan, node);
+++=======
++ 	if (ipv6)
++ 		rcu_assign_pointer(vxlan->vn6_sock, vs);
++ 	else
++ #endif
++ 		rcu_assign_pointer(vxlan->vn4_sock, vs);
++ 	vxlan_vs_add_dev(vs, vxlan);
+++>>>>>>> c6fcc4fc5f8b (vxlan: avoid using stale vxlan socket.)
+  	return 0;
+  }
+  
+  static int vxlan_sock_add(struct vxlan_dev *vxlan)
+  {
+ -	bool ipv6 = vxlan->flags & VXLAN_F_IPV6;
+  	bool metadata = vxlan->flags & VXLAN_F_COLLECT_METADATA;
+ +	bool ipv6 = vxlan->flags & VXLAN_F_IPV6 || metadata;
+ +	bool ipv4 = !ipv6 || metadata;
+  	int ret = 0;
+  
+- 	vxlan->vn4_sock = NULL;
++ 	RCU_INIT_POINTER(vxlan->vn4_sock, NULL);
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +	vxlan->vn6_sock = NULL;
+ +	if (ipv6) {
+++=======
++ 	RCU_INIT_POINTER(vxlan->vn6_sock, NULL);
++ 	if (ipv6 || metadata)
+++>>>>>>> c6fcc4fc5f8b (vxlan: avoid using stale vxlan socket.)
+  		ret = __vxlan_sock_add(vxlan, true);
+ +		if (ret < 0 && ret != -EAFNOSUPPORT)
+ +			ipv4 = false;
+ +	}
+  #endif
+ -	if (!ret && (!ipv6 || metadata))
+ +	if (ipv4)
+  		ret = __vxlan_sock_add(vxlan, false);
+  	if (ret < 0)
+  		vxlan_sock_release(vxlan);
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index 4ba23515efc8..77fd0dde105c 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -233,9 +233,9 @@ struct vxlan_dev {
+ 	struct vxlan_dev_node hlist6;	/* vni hash table for IPv6 socket */
+ #endif
+ 	struct list_head  next;		/* vxlan's per namespace list */
+-	struct vxlan_sock *vn4_sock;	/* listening socket for IPv4 */
++	struct vxlan_sock __rcu *vn4_sock;	/* listening socket for IPv4 */
+ #if IS_ENABLED(CONFIG_IPV6)
+-	struct vxlan_sock *vn6_sock;	/* listening socket for IPv6 */
++	struct vxlan_sock __rcu *vn6_sock;	/* listening socket for IPv6 */
+ #endif
+ 	struct net_device *dev;
+ 	struct net	  *net;		/* netns for packet i/o */
