@@ -1,0 +1,172 @@
+scsi: qla2xxx: Cleanup code to improve FC-NVMe error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Cleanup code to improve FC-NVMe error handling (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.83%
+commit-author Darren Trapp <darren.trapp@cavium.com>
+commit 60dd6e8e42077a4c25f221cf124e8ba038b86e2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/60dd6e8e.failed
+
+This patch cleans up ABTS handling for FC-NVMe by
+
+- Removing allocation of sp, instead pass the sp pointer for abort IOCB
+- Fix error handling from Trasport failure
+- set outstanding_cmds array to NULL for nvme completion
+
+	Signed-off-by: Darren Trapp <darren.trapp@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 60dd6e8e42077a4c25f221cf124e8ba038b86e2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_nvme.c
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 55510f69f284,5fbb8f4b4dc7..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -1805,6 -1837,115 +1805,118 @@@ qla24xx_tm_iocb_entry(scsi_qla_host_t *
+  	sp->done(sp, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qla24xx_nvme_iocb_entry(scsi_qla_host_t *vha, struct req_que *req,
++     void *tsk, srb_t *sp)
++ {
++ 	fc_port_t *fcport;
++ 	struct srb_iocb *iocb;
++ 	struct sts_entry_24xx *sts = (struct sts_entry_24xx *)tsk;
++ 	uint16_t        state_flags;
++ 	struct nvmefc_fcp_req *fd;
++ 	uint16_t        ret = 0;
++ 
++ 	iocb = &sp->u.iocb_cmd;
++ 	fcport = sp->fcport;
++ 	iocb->u.nvme.comp_status = le16_to_cpu(sts->comp_status);
++ 	state_flags  = le16_to_cpu(sts->state_flags);
++ 	fd = iocb->u.nvme.desc;
++ 
++ 	if (unlikely(iocb->u.nvme.aen_op))
++ 		atomic_dec(&sp->vha->hw->nvme_active_aen_cnt);
++ 
++ 	/*
++ 	 * State flags: Bit 6 and 0.
++ 	 * If 0 is set, we don't care about 6.
++ 	 * both cases resp was dma'd to host buffer
++ 	 * if both are 0, that is good path case.
++ 	 * if six is set and 0 is clear, we need to
++ 	 * copy resp data from status iocb to resp buffer.
++ 	 */
++ 	if (!(state_flags & (SF_FCP_RSP_DMA | SF_NVME_ERSP))) {
++ 		iocb->u.nvme.rsp_pyld_len = 0;
++ 	} else if ((state_flags & SF_FCP_RSP_DMA)) {
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 	} else if (state_flags & SF_NVME_ERSP) {
++ 		uint32_t *inbuf, *outbuf;
++ 		uint16_t iter;
++ 
++ 		inbuf = (uint32_t *)&sts->nvme_ersp_data;
++ 		outbuf = (uint32_t *)fd->rspaddr;
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 		iter = iocb->u.nvme.rsp_pyld_len >> 2;
++ 		for (; iter; iter--)
++ 			*outbuf++ = swab32(*inbuf++);
++ 	} else { /* unhandled case */
++ 	    ql_log(ql_log_warn, fcport->vha, 0x503a,
++ 		"NVME-%s error. Unhandled state_flags of %x\n",
++ 		sp->name, state_flags);
++ 	}
++ 
++ 	fd->transferred_length = fd->payload_length -
++ 	    le32_to_cpu(sts->residual_len);
++ 
++ 	switch (le16_to_cpu(sts->comp_status)) {
++ 	case CS_COMPLETE:
++ 		ret = QLA_SUCCESS;
++ 		break;
++ 	case CS_ABORTED:
++ 	case CS_RESET:
++ 	case CS_PORT_UNAVAILABLE:
++ 	case CS_PORT_LOGGED_OUT:
++ 	case CS_PORT_BUSY:
++ 		ql_log(ql_log_warn, fcport->vha, 0x5060,
++ 		    "NVME-%s ERR Handling - hdl=%x completion status(%x) resid=%x  ox_id=%x\n",
++ 		    sp->name, sp->handle, sts->comp_status,
++ 		    le32_to_cpu(sts->residual_len), sts->ox_id);
++ 		fd->transferred_length = 0;
++ 		iocb->u.nvme.rsp_pyld_len = 0;
++ 		ret = QLA_ABORTED;
++ 		break;
++ 	default:
++ 		ql_log(ql_log_warn, fcport->vha, 0x5060,
++ 		    "NVME-%s error - hdl=%x completion status(%x) resid=%x  ox_id=%x\n",
++ 		    sp->name, sp->handle, sts->comp_status,
++ 		    le32_to_cpu(sts->residual_len), sts->ox_id);
++ 		ret = QLA_FUNCTION_FAILED;
++ 		break;
++ 	}
++ 	sp->done(sp, ret);
++ }
++ 
++ static void qla_ctrlvp_completed(scsi_qla_host_t *vha, struct req_que *req,
++     struct vp_ctrl_entry_24xx *vce)
++ {
++ 	const char func[] = "CTRLVP-IOCB";
++ 	srb_t *sp;
++ 	int rval = QLA_SUCCESS;
++ 
++ 	sp = qla2x00_get_sp_from_handle(vha, func, req, vce);
++ 	if (!sp)
++ 		return;
++ 
++ 	if (vce->entry_status != 0) {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c4,
++ 		    "%s: Failed to complete IOCB -- error status (%x)\n",
++ 		    sp->name, vce->entry_status);
++ 		rval = QLA_FUNCTION_FAILED;
++ 	} else if (vce->comp_status != cpu_to_le16(CS_COMPLETE)) {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c5,
++ 		    "%s: Failed to complete IOCB -- completion status (%x) vpidx %x\n",
++ 		    sp->name, le16_to_cpu(vce->comp_status),
++ 		    le16_to_cpu(vce->vp_idx_failed));
++ 		rval = QLA_FUNCTION_FAILED;
++ 	} else {
++ 		ql_dbg(ql_dbg_vport, vha, 0x10c6,
++ 		    "Done %s.\n", __func__);
++ 	}
++ 
++ 	sp->rc = rval;
++ 	sp->done(sp, rval);
++ }
++ 
+++>>>>>>> 60dd6e8e4207 (scsi: qla2xxx: Cleanup code to improve FC-NVMe error handling)
+  /**
+   * qla2x00_process_response_queue() - Process response queue entries.
+   * @rsp: response queue
+@@@ -2294,6 -2436,13 +2406,16 @@@ qla2x00_status_entry(scsi_qla_host_t *v
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* NVME completion. */
++ 	if (sp->type == SRB_NVME_CMD) {
++ 		req->outstanding_cmds[handle] = NULL;
++ 		qla24xx_nvme_iocb_entry(vha, req, pkt, sp);
++ 		return;
++ 	}
++ 
+++>>>>>>> 60dd6e8e4207 (scsi: qla2xxx: Cleanup code to improve FC-NVMe error handling)
+  	if (unlikely((state_flags & BIT_1) && (sp->type == SRB_BIDI_CMD))) {
+  		qla25xx_process_bidir_status_iocb(vha, pkt, req, handle);
+  		return;
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
