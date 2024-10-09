@@ -1,0 +1,277 @@
+net: sched: store Qdisc pointer in struct block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: store Qdisc pointer in struct block (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 94.38%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 69d78ef25c7b0058674145500efb12255738ba8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/69d78ef2.failed
+
+Prepare for removal of tp->q and store Qdisc pointer in the block
+structure.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 69d78ef25c7b0058674145500efb12255738ba8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_ingress.c
+diff --cc net/sched/sch_ingress.c
+index 790eb0f81e70,9ccc1b89b0d9..000000000000
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@@ -157,7 -157,7 +157,11 @@@ static int clsact_init(struct Qdisc *sc
+  	if (err)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	err = tcf_block_get(&q->egress_block, &dev->extended->egress_cl_list);
+++=======
++ 	err = tcf_block_get(&q->egress_block, &dev->egress_cl_list, sch);
+++>>>>>>> 69d78ef25c7b (net: sched: store Qdisc pointer in struct block)
+  	if (err)
+  		return err;
+  
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 065c00671d15..442b69bae236 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -25,7 +25,7 @@ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+ 				bool create);
+ void tcf_chain_put(struct tcf_chain *chain);
+ int tcf_block_get(struct tcf_block **p_block,
+-		  struct tcf_proto __rcu **p_filter_chain);
++		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q);
+ void tcf_block_put(struct tcf_block *block);
+ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 		 struct tcf_result *res, bool compat_mode);
+@@ -33,7 +33,7 @@ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ #else
+ static inline
+ int tcf_block_get(struct tcf_block **p_block,
+-		  struct tcf_proto __rcu **p_filter_chain)
++		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q)
+ {
+ 	return 0;
+ }
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 00754093559f..9b92bfba29e1 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -286,6 +286,7 @@ struct tcf_chain {
+ 
+ struct tcf_block {
+ 	struct list_head chain_list;
++	struct Qdisc *q;
+ };
+ 
+ static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 3b8cc4dc4e82..b975e76e1d23 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -255,7 +255,7 @@ tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
+ }
+ 
+ int tcf_block_get(struct tcf_block **p_block,
+-		  struct tcf_proto __rcu **p_filter_chain)
++		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q)
+ {
+ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
+ 	struct tcf_chain *chain;
+@@ -271,6 +271,7 @@ int tcf_block_get(struct tcf_block **p_block,
+ 		goto err_chain_create;
+ 	}
+ 	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
++	block->q = q;
+ 	*p_block = block;
+ 	return 0;
+ 
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index 8b5eefb68b69..7c8966a42794 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -281,7 +281,7 @@ static int atm_tc_change(struct Qdisc *sch, u32 classid, u32 parent,
+ 		goto err_out;
+ 	}
+ 
+-	error = tcf_block_get(&flow->block, &flow->filter_list);
++	error = tcf_block_get(&flow->block, &flow->filter_list, sch);
+ 	if (error) {
+ 		kfree(flow);
+ 		goto err_out;
+@@ -546,7 +546,7 @@ static int atm_tc_init(struct Qdisc *sch, struct nlattr *opt)
+ 		p->link.q = &noop_qdisc;
+ 	pr_debug("atm_tc_init: link (%p) qdisc %p\n", &p->link, p->link.q);
+ 
+-	err = tcf_block_get(&p->link.block, &p->link.filter_list);
++	err = tcf_block_get(&p->link.block, &p->link.filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index b4532a9f8389..3553d901f7bf 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -1573,7 +1573,7 @@ cbq_change_class(struct Qdisc *sch, u32 classid, u32 parentid, struct nlattr **t
+ 	if (cl == NULL)
+ 		goto failure;
+ 
+-	err = tcf_block_get(&cl->block, &cl->filter_list);
++	err = tcf_block_get(&cl->block, &cl->filter_list, sch);
+ 	if (err) {
+ 		kfree(cl);
+ 		return err;
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index b6c34866c9c4..9bfe7b50115f 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -412,7 +412,7 @@ static int drr_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
+ 	struct drr_sched *q = qdisc_priv(sch);
+ 	int err;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 	err = qdisc_class_hash_init(&q->clhash);
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 6b9060177c54..df08e15e6f19 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -344,7 +344,7 @@ static int dsmark_init(struct Qdisc *sch, struct nlattr *opt)
+ 	if (!opt)
+ 		goto errout;
+ 
+-	err = tcf_block_get(&p->block, &p->filter_list);
++	err = tcf_block_get(&p->block, &p->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 2ca6552d43ba..7b1f9fad0285 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -480,7 +480,7 @@ static int fq_codel_init(struct Qdisc *sch, struct nlattr *opt)
+ 			return err;
+ 	}
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index f18139163019..d443d947f57f 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1033,7 +1033,7 @@ hfsc_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 	if (cl == NULL)
+ 		return -ENOBUFS;
+ 
+-	err = tcf_block_get(&cl->block, &cl->filter_list);
++	err = tcf_block_get(&cl->block, &cl->filter_list, sch);
+ 	if (err) {
+ 		kfree(cl);
+ 		return err;
+@@ -1405,7 +1405,7 @@ hfsc_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
+ 		return err;
+ 	q->eligible = RB_ROOT;
+ 
+-	err = tcf_block_get(&q->root.block, &q->root.filter_list);
++	err = tcf_block_get(&q->root.block, &q->root.filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2c506f483c52..645b078c196b 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -1026,7 +1026,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+@@ -1388,7 +1388,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
+ 		if (!cl)
+ 			goto failure;
+ 
+-		err = tcf_block_get(&cl->block, &cl->filter_list);
++		err = tcf_block_get(&cl->block, &cl->filter_list, sch);
+ 		if (err) {
+ 			kfree(cl);
+ 			goto failure;
+* Unmerged path net/sched/sch_ingress.c
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index ff4fc3e0facd..31e0a284eeff 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -245,7 +245,7 @@ static int multiq_init(struct Qdisc *sch, struct nlattr *opt)
+ 	if (opt == NULL)
+ 		return -EINVAL;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index 2dd6c68ae91e..95fad348c8d7 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -212,7 +212,7 @@ static int prio_init(struct Qdisc *sch, struct nlattr *opt)
+ 	if (!opt)
+ 		return -EINVAL;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index cc61b847624f..a36b3ec3271a 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -1418,7 +1418,7 @@ static int qfq_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
+ 	int i, j, err;
+ 	u32 max_cl_shift, maxbudg_shift, max_classes;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index a26633eab531..aeb509bde740 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -553,7 +553,7 @@ static int sfb_init(struct Qdisc *sch, struct nlattr *opt)
+ 	struct sfb_sched_data *q = qdisc_priv(sch);
+ 	int err;
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index 74ea863b8240..123a53af2506 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -725,7 +725,7 @@ static int sfq_init(struct Qdisc *sch, struct nlattr *opt)
+ 	setup_deferrable_timer(&q->perturb_timer, sfq_perturbation,
+ 			       (unsigned long)sch);
+ 
+-	err = tcf_block_get(&q->block, &q->filter_list);
++	err = tcf_block_get(&q->block, &q->filter_list, sch);
+ 	if (err)
+ 		return err;
+ 
