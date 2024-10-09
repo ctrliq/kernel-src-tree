@@ -1,0 +1,140 @@
+scsi: qla2xxx: Allow relogin and session creation after reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Allow relogin and session creation after reset (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.83%
+commit-author himanshu.madhani@cavium.com <himanshu.madhani@cavium.com>
+commit bf12b4162d0014a4aeb873a8196eacd5a7faef09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bf12b416.failed
+
+When any kind of reset is issued, current code was setting
+state of LOGIN pending too early. This resulted into driver
+not retrying relogin until pervious reloin completes.
+
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit bf12b4162d0014a4aeb873a8196eacd5a7faef09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index bc98a1a62b13,e9513ec344b1..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -822,23 -1050,99 +822,61 @@@ void qla24xx_handle_gpdb_event(scsi_qla
+  		/*
+  		 * We have an existing session. A late RSCN delivery
+  		 * must have triggered the session to be re-validate.
+ -		 * Session is still valid.
+ +		 * session is still valid.
+  		 */
+ -		ql_dbg(ql_dbg_disc, vha, 0x20d6,
+ -		    "%s %d %8phC session revalidate success\n",
+ -		    __func__, __LINE__, ea->fcport->port_name);
+ -		 ea->fcport->disc_state = DSC_LOGIN_COMPLETE;
+ +		fcport->disc_state = DSC_LOGIN_COMPLETE;
+  	}
+  	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+ -}
+ -
+ -static
+ -void qla24xx_handle_gpdb_event(scsi_qla_host_t *vha, struct event_arg *ea)
+ -{
+ -	fc_port_t *fcport = ea->fcport;
+ -	struct port_database_24xx *pd;
+ -	struct srb *sp = ea->sp;
+ -
+ -	pd = (struct port_database_24xx *)sp->u.iocb_cmd.u.mbx.in;
+ -
+ -	fcport->flags &= ~FCF_ASYNC_SENT;
+ -
+ -	ql_dbg(ql_dbg_disc, vha, 0x20d2,
+ -	    "%s %8phC DS %d LS %d rc %d\n", __func__, fcport->port_name,
+ -	    fcport->disc_state, pd->current_login_state, ea->rc);
+ -
+ -	if (fcport->disc_state == DSC_DELETE_PEND)
+ -		return;
+ -
+ -	switch (pd->current_login_state) {
+ -	case PDS_PRLI_COMPLETE:
+ -		__qla24xx_parse_gpdb(vha, fcport, pd);
+ -		break;
+ -	case PDS_PLOGI_PENDING:
+ -	case PDS_PLOGI_COMPLETE:
+ -	case PDS_PRLI_PENDING:
+ -	case PDS_PRLI2_PENDING:
+ -		ql_dbg(ql_dbg_disc, vha, 0x20d5, "%s %d %8phC relogin needed\n",
+ -		    __func__, __LINE__, fcport->port_name);
+ -		set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+ -		return;
+ -	case PDS_LOGO_PENDING:
+ -	case PDS_PORT_UNAVAILABLE:
+ -	default:
+ -		ql_dbg(ql_dbg_disc, vha, 0x20d5, "%s %d %8phC post del sess\n",
+ -		    __func__, __LINE__, fcport->port_name);
+ -		qlt_schedule_sess_for_deletion_lock(fcport);
+ -		return;
+ -	}
+ -	__qla24xx_handle_gpdb_event(vha, ea);
+  } /* gpdb event */
+  
+++<<<<<<< HEAD
+++=======
++ static void qla_chk_n2n_b4_login(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	u8 login = 0;
++ 
++ 	if (qla_tgt_mode_enabled(vha))
++ 		return;
++ 
++ 	if (qla_dual_mode_enabled(vha)) {
++ 		if (N2N_TOPO(vha->hw)) {
++ 			u64 mywwn, wwn;
++ 
++ 			mywwn = wwn_to_u64(vha->port_name);
++ 			wwn = wwn_to_u64(fcport->port_name);
++ 			if (mywwn > wwn)
++ 				login = 1;
++ 			else if ((fcport->fw_login_state == DSC_LS_PLOGI_COMP)
++ 			    && time_after_eq(jiffies,
++ 				    fcport->plogi_nack_done_deadline))
++ 				login = 1;
++ 		} else {
++ 			login = 1;
++ 		}
++ 	} else {
++ 		/* initiator mode */
++ 		login = 1;
++ 	}
++ 
++ 	if (login) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x20bf,
++ 		    "%s %d %8phC post login\n",
++ 		    __func__, __LINE__, fcport->port_name);
++ 		qla2x00_post_async_login_work(vha, fcport, NULL);
++ 	}
++ }
++ 
+++>>>>>>> bf12b4162d00 (scsi: qla2xxx: Allow relogin and session creation after reset)
+  int qla24xx_fcport_handle_login(struct scsi_qla_host *vha, fc_port_t *fcport)
+  {
+ -	u16 data[2];
+ -	u64 wwn;
+ +	if (fcport->login_retry == 0)
+ +		return 0;
+ +
+ +	if (fcport->scan_state != QLA_FCPORT_FOUND)
+ +		return 0;
+  
+  	ql_dbg(ql_dbg_disc, vha, 0x20d8,
+ -	    "%s %8phC DS %d LS %d P %d fl %x confl %p rscn %d|%d login %d retry %d lid %d scan %d\n",
+ +	    "%s %8phC DS %d LS %d P %d fl %x confl %p rscn %d|%d login %d|%d retry %d lid %d\n",
+  	    __func__, fcport->port_name, fcport->disc_state,
+  	    fcport->fw_login_state, fcport->login_pause, fcport->flags,
+  	    fcport->conflict, fcport->last_rscn_gen, fcport->rscn_gen,
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
