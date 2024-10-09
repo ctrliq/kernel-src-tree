@@ -1,0 +1,317 @@
+nfp: add ethtool statistics for representors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 899a37ade8c6dd1619d510c1e3b4b99d508272a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/899a37ad.failed
+
+Representors may be associated with both VFs or more importantly
+with physical ports.  Allow vNIC and MAC statistics to be read
+with ethtool -S on representors.  In case of vNICs we reuse
+the vNIC statistic helper, we just need to swap RX and TX to
+give statistics the "switch perspective."
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 899a37ade8c6dd1619d510c1e3b4b99d508272a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 69f458e0de89,07969f06df10..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -115,13 -180,10 +115,17 @@@ static const struct _nfp_net_et_stats n
+  };
+  
+  #define NN_ET_GLOBAL_STATS_LEN ARRAY_SIZE(nfp_net_et_stats)
+++<<<<<<< HEAD
+ +#define NN_ET_RVEC_STATS_LEN (nn->num_r_vecs * 3)
+++=======
++ #define NN_ET_SWITCH_STATS_LEN 9
+++>>>>>>> 899a37ade8c6 (nfp: add ethtool statistics for representors)
+  #define NN_ET_RVEC_GATHER_STATS 7
+ +#define NN_ET_QUEUE_STATS_LEN ((nn->num_tx_rings + nn->num_rx_rings) * 2)
+ +#define NN_ET_STATS_LEN (NN_ET_GLOBAL_STATS_LEN + NN_ET_RVEC_GATHER_STATS + \
+ +			 NN_ET_RVEC_STATS_LEN + NN_ET_QUEUE_STATS_LEN)
+  
+ -static void nfp_net_get_nspinfo(struct nfp_app *app, char *version)
+ +static void nfp_net_get_nspinfo(struct nfp_net *nn, char *version)
+  {
+  	struct nfp_nsp *nsp;
+  
+@@@ -323,6 -412,188 +327,191 @@@ static int nfp_net_set_ringparam(struc
+  	return nfp_net_set_ring_size(nn, rxd_cnt, txd_cnt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __printf(2, 3) u8 *nfp_pr_et(u8 *data, const char *fmt, ...)
++ {
++ 	va_list args;
++ 
++ 	va_start(args, fmt);
++ 	vsnprintf(data, ETH_GSTRING_LEN, fmt, args);
++ 	va_end(args);
++ 
++ 	return data + ETH_GSTRING_LEN;
++ }
++ 
++ static unsigned int nfp_vnic_get_sw_stats_count(struct net_device *netdev)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	return NN_ET_RVEC_GATHER_STATS + nn->dp.num_r_vecs * 3;
++ }
++ 
++ static u8 *nfp_vnic_get_sw_stats_strings(struct net_device *netdev, u8 *data)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	int i;
++ 
++ 	for (i = 0; i < nn->dp.num_r_vecs; i++) {
++ 		data = nfp_pr_et(data, "rvec_%u_rx_pkts", i);
++ 		data = nfp_pr_et(data, "rvec_%u_tx_pkts", i);
++ 		data = nfp_pr_et(data, "rvec_%u_tx_busy", i);
++ 	}
++ 
++ 	data = nfp_pr_et(data, "hw_rx_csum_ok");
++ 	data = nfp_pr_et(data, "hw_rx_csum_inner_ok");
++ 	data = nfp_pr_et(data, "hw_rx_csum_err");
++ 	data = nfp_pr_et(data, "hw_tx_csum");
++ 	data = nfp_pr_et(data, "hw_tx_inner_csum");
++ 	data = nfp_pr_et(data, "tx_gather");
++ 	data = nfp_pr_et(data, "tx_lso");
++ 
++ 	return data;
++ }
++ 
++ static u64 *nfp_vnic_get_sw_stats(struct net_device *netdev, u64 *data)
++ {
++ 	u64 gathered_stats[NN_ET_RVEC_GATHER_STATS] = {};
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	u64 tmp[NN_ET_RVEC_GATHER_STATS];
++ 	unsigned int i, j;
++ 
++ 	for (i = 0; i < nn->dp.num_r_vecs; i++) {
++ 		unsigned int start;
++ 
++ 		do {
++ 			start = u64_stats_fetch_begin(&nn->r_vecs[i].rx_sync);
++ 			*data++ = nn->r_vecs[i].rx_pkts;
++ 			tmp[0] = nn->r_vecs[i].hw_csum_rx_ok;
++ 			tmp[1] = nn->r_vecs[i].hw_csum_rx_inner_ok;
++ 			tmp[2] = nn->r_vecs[i].hw_csum_rx_error;
++ 		} while (u64_stats_fetch_retry(&nn->r_vecs[i].rx_sync, start));
++ 
++ 		do {
++ 			start = u64_stats_fetch_begin(&nn->r_vecs[i].tx_sync);
++ 			*data++ = nn->r_vecs[i].tx_pkts;
++ 			*data++ = nn->r_vecs[i].tx_busy;
++ 			tmp[3] = nn->r_vecs[i].hw_csum_tx;
++ 			tmp[4] = nn->r_vecs[i].hw_csum_tx_inner;
++ 			tmp[5] = nn->r_vecs[i].tx_gather;
++ 			tmp[6] = nn->r_vecs[i].tx_lso;
++ 		} while (u64_stats_fetch_retry(&nn->r_vecs[i].tx_sync, start));
++ 
++ 		for (j = 0; j < NN_ET_RVEC_GATHER_STATS; j++)
++ 			gathered_stats[j] += tmp[j];
++ 	}
++ 
++ 	for (j = 0; j < NN_ET_RVEC_GATHER_STATS; j++)
++ 		*data++ = gathered_stats[j];
++ 
++ 	return data;
++ }
++ 
++ static unsigned int
++ nfp_vnic_get_hw_stats_count(unsigned int rx_rings, unsigned int tx_rings)
++ {
++ 	return NN_ET_GLOBAL_STATS_LEN + (rx_rings + tx_rings) * 2;
++ }
++ 
++ static u8 *
++ nfp_vnic_get_hw_stats_strings(u8 *data, unsigned int rx_rings,
++ 			      unsigned int tx_rings, bool repr)
++ {
++ 	int swap_off, i;
++ 
++ 	BUILD_BUG_ON(NN_ET_GLOBAL_STATS_LEN < NN_ET_SWITCH_STATS_LEN * 2);
++ 	/* If repr is true first add SWITCH_STATS_LEN and then subtract it
++ 	 * effectively swapping the RX and TX statistics (giving us the RX
++ 	 * and TX from perspective of the switch).
++ 	 */
++ 	swap_off = repr * NN_ET_SWITCH_STATS_LEN;
++ 
++ 	for (i = 0; i < NN_ET_SWITCH_STATS_LEN; i++)
++ 		data = nfp_pr_et(data, nfp_net_et_stats[i + swap_off].name);
++ 
++ 	for (i = NN_ET_SWITCH_STATS_LEN; i < NN_ET_SWITCH_STATS_LEN * 2; i++)
++ 		data = nfp_pr_et(data, nfp_net_et_stats[i - swap_off].name);
++ 
++ 	for (i = NN_ET_SWITCH_STATS_LEN * 2; i < NN_ET_GLOBAL_STATS_LEN; i++)
++ 		data = nfp_pr_et(data, nfp_net_et_stats[i].name);
++ 
++ 	for (i = 0; i < tx_rings; i++) {
++ 		data = nfp_pr_et(data, "txq_%u_pkts", i);
++ 		data = nfp_pr_et(data, "txq_%u_bytes", i);
++ 	}
++ 
++ 	for (i = 0; i < rx_rings; i++) {
++ 		data = nfp_pr_et(data, "rxq_%u_pkts", i);
++ 		data = nfp_pr_et(data, "rxq_%u_bytes", i);
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static u64 *
++ nfp_vnic_get_hw_stats(u64 *data, u8 __iomem *mem,
++ 		      unsigned int rx_rings, unsigned int tx_rings)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < NN_ET_GLOBAL_STATS_LEN; i++)
++ 		*data++ = readq(mem + nfp_net_et_stats[i].off);
++ 
++ 	for (i = 0; i < tx_rings; i++) {
++ 		*data++ = readq(mem + NFP_NET_CFG_TXR_STATS(i));
++ 		*data++ = readq(mem + NFP_NET_CFG_TXR_STATS(i) + 8);
++ 	}
++ 
++ 	for (i = 0; i < rx_rings; i++) {
++ 		*data++ = readq(mem + NFP_NET_CFG_RXR_STATS(i));
++ 		*data++ = readq(mem + NFP_NET_CFG_RXR_STATS(i) + 8);
++ 	}
++ 
++ 	return data;
++ }
++ 
++ static unsigned int nfp_mac_get_stats_count(struct net_device *netdev)
++ {
++ 	struct nfp_port *port;
++ 
++ 	port = nfp_port_from_netdev(netdev);
++ 	if (!__nfp_port_get_eth_port(port) || !port->eth_stats)
++ 		return 0;
++ 
++ 	return ARRAY_SIZE(nfp_mac_et_stats);
++ }
++ 
++ static u8 *nfp_mac_get_stats_strings(struct net_device *netdev, u8 *data)
++ {
++ 	struct nfp_port *port;
++ 	unsigned int i;
++ 
++ 	port = nfp_port_from_netdev(netdev);
++ 	if (!__nfp_port_get_eth_port(port) || !port->eth_stats)
++ 		return data;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(nfp_mac_et_stats); i++)
++ 		data = nfp_pr_et(data, "mac.%s", nfp_mac_et_stats[i].name);
++ 
++ 	return data;
++ }
++ 
++ static u64 *nfp_mac_get_stats(struct net_device *netdev, u64 *data)
++ {
++ 	struct nfp_port *port;
++ 	unsigned int i;
++ 
++ 	port = nfp_port_from_netdev(netdev);
++ 	if (!__nfp_port_get_eth_port(port) || !port->eth_stats)
++ 		return data;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(nfp_mac_et_stats); i++)
++ 		*data++ = readq(port->eth_stats + nfp_mac_et_stats[i].off);
++ 
++ 	return data;
++ }
++ 
+++>>>>>>> 899a37ade8c6 (nfp: add ethtool statistics for representors)
+  static void nfp_net_get_strings(struct net_device *netdev,
+  				u32 stringset, u8 *data)
+  {
+@@@ -332,44 -601,11 +521,52 @@@
+  
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+++<<<<<<< HEAD
+ +		for (i = 0; i < NN_ET_GLOBAL_STATS_LEN; i++) {
+ +			memcpy(p, nfp_net_et_stats[i].name, ETH_GSTRING_LEN);
+ +			p += ETH_GSTRING_LEN;
+ +		}
+ +		for (i = 0; i < nn->num_r_vecs; i++) {
+ +			sprintf(p, "rvec_%u_rx_pkts", i);
+ +			p += ETH_GSTRING_LEN;
+ +			sprintf(p, "rvec_%u_tx_pkts", i);
+ +			p += ETH_GSTRING_LEN;
+ +			sprintf(p, "rvec_%u_tx_busy", i);
+ +			p += ETH_GSTRING_LEN;
+ +		}
+ +		strncpy(p, "hw_rx_csum_ok", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "hw_rx_csum_inner_ok", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "hw_rx_csum_err", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "hw_tx_csum", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "hw_tx_inner_csum", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "tx_gather", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		strncpy(p, "tx_lso", ETH_GSTRING_LEN);
+ +		p += ETH_GSTRING_LEN;
+ +		for (i = 0; i < nn->num_tx_rings; i++) {
+ +			sprintf(p, "txq_%u_pkts", i);
+ +			p += ETH_GSTRING_LEN;
+ +			sprintf(p, "txq_%u_bytes", i);
+ +			p += ETH_GSTRING_LEN;
+ +		}
+ +		for (i = 0; i < nn->num_rx_rings; i++) {
+ +			sprintf(p, "rxq_%u_pkts", i);
+ +			p += ETH_GSTRING_LEN;
+ +			sprintf(p, "rxq_%u_bytes", i);
+ +			p += ETH_GSTRING_LEN;
+ +		}
+++=======
++ 		data = nfp_vnic_get_sw_stats_strings(netdev, data);
++ 		data = nfp_vnic_get_hw_stats_strings(data, nn->dp.num_rx_rings,
++ 						     nn->dp.num_tx_rings,
++ 						     false);
++ 		data = nfp_mac_get_stats_strings(netdev, data);
+++>>>>>>> 899a37ade8c6 (nfp: add ethtool statistics for representors)
+  		break;
+  	}
+  }
+@@@ -907,6 -1141,17 +1148,20 @@@ static const struct ethtool_ops nfp_net
+  	.set_link_ksettings	= nfp_net_set_link_ksettings,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ const struct ethtool_ops nfp_port_ethtool_ops = {
++ 	.get_drvinfo		= nfp_app_get_drvinfo,
++ 	.get_link		= ethtool_op_get_link,
++ 	.get_strings		= nfp_port_get_strings,
++ 	.get_ethtool_stats	= nfp_port_get_stats,
++ 	.get_sset_count		= nfp_port_get_sset_count,
++ 	.set_dump		= nfp_app_set_dump,
++ 	.get_dump_flag		= nfp_app_get_dump_flag,
++ 	.get_dump_data		= nfp_app_get_dump_data,
++ };
++ 
+++>>>>>>> 899a37ade8c6 (nfp: add ethtool statistics for representors)
+  void nfp_net_set_ethtool_ops(struct net_device *netdev)
+  {
+  	netdev->ethtool_ops = &nfp_net_ethtool_ops;
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
