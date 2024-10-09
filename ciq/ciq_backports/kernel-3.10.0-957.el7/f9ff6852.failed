@@ -1,0 +1,159 @@
+drm/amdgpu: Dynamically probe for ATIF handle (v2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Lyude Paul <lyude@redhat.com>
+commit f9ff68521a5541e1fdaeb0ef11871c035b30e409
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f9ff6852.failed
+
+The other day I was testing one of the HP laptops at my office with an
+i915/amdgpu hybrid setup and noticed that hotplugging was non-functional
+on almost all of the display outputs. I eventually discovered that all
+of the external outputs were connected to the amdgpu device instead of
+i915, and that the hotplugs weren't being detected so long as the GPU
+was in runtime suspend. After some talking with folks at AMD, I learned
+that amdgpu is actually supposed to support hotplug detection in runtime
+suspend so long as the OEM has implemented it properly in the firmware.
+
+On this HP ZBook 15 G4 (the machine in question), amdgpu wasn't managing
+to find the ATIF handle at all despite the fact that I could see acpi
+events being sent in response to any hotplugging. After going through
+dumps of the firmware, I discovered that this machine did in fact
+support ATIF, but that it's ATIF method lived in an entirely different
+namespace than this device's handle (the device handle was
+\_SB_.PCI0.PEG0.PEGP, but ATIF lives in ATPX's handle at
+\_SB_.PCI0.GFX0).
+
+So, fix this by probing ATPX's ACPI parent's namespace if we can't find
+ATIF elsewhere, along with storing a pointer to the proper handle to use
+for ATIF and using that instead of the device's handle.
+
+This fixes HPD detection while in runtime suspend for this ZBook!
+
+v2: Update the comment to reflect how the namespaces are arranged
+based on the system configuration. (Alex)
+
+	Signed-off-by: Lyude Paul <lyude@redhat.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit f9ff68521a5541e1fdaeb0ef11871c035b30e409)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+index 57afad79f55d,0d8c3fc6eace..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+@@@ -34,6 -34,45 +34,48 @@@
+  #include "amd_acpi.h"
+  #include "atom.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct amdgpu_atif_notification_cfg {
++ 	bool enabled;
++ 	int command_code;
++ };
++ 
++ struct amdgpu_atif_notifications {
++ 	bool display_switch;
++ 	bool expansion_mode_change;
++ 	bool thermal_state;
++ 	bool forced_power_state;
++ 	bool system_power_state;
++ 	bool display_conf_change;
++ 	bool px_gfx_switch;
++ 	bool brightness_change;
++ 	bool dgpu_display_event;
++ };
++ 
++ struct amdgpu_atif_functions {
++ 	bool system_params;
++ 	bool sbios_requests;
++ 	bool select_active_disp;
++ 	bool lid_state;
++ 	bool get_tv_standard;
++ 	bool set_tv_standard;
++ 	bool get_panel_expansion_mode;
++ 	bool set_panel_expansion_mode;
++ 	bool temperature_change;
++ 	bool graphics_device_types;
++ };
++ 
++ struct amdgpu_atif {
++ 	acpi_handle handle;
++ 
++ 	struct amdgpu_atif_notifications notifications;
++ 	struct amdgpu_atif_functions functions;
++ 	struct amdgpu_atif_notification_cfg notification_cfg;
++ 	struct amdgpu_encoder *encoder_for_bl;
++ };
++ 
+++>>>>>>> f9ff68521a55 (drm/amdgpu: Dynamically probe for ATIF handle (v2))
+  /* Call the ATIF method
+   */
+  /**
+@@@ -290,11 -361,10 +364,10 @@@ out
+   * Returns NOTIFY code
+   */
+  static int amdgpu_atif_handler(struct amdgpu_device *adev,
+- 			struct acpi_bus_event *event)
++ 			       struct acpi_bus_event *event)
+  {
+ -	struct amdgpu_atif *atif = adev->atif;
+ +	struct amdgpu_atif *atif = &adev->atif;
+  	struct atif_sbios_requests req;
+- 	acpi_handle handle;
+  	int count;
+  
+  	DRM_DEBUG_DRIVER("event, device_class = %s, type = %#x\n",
+@@@ -638,8 -711,8 +710,13 @@@ static int amdgpu_acpi_event(struct not
+   */
+  int amdgpu_acpi_init(struct amdgpu_device *adev)
+  {
+++<<<<<<< HEAD
+ +	acpi_handle handle;
+ +	struct amdgpu_atif *atif = &adev->atif;
+++=======
++ 	acpi_handle handle, atif_handle;
++ 	struct amdgpu_atif *atif;
+++>>>>>>> f9ff68521a55 (drm/amdgpu: Dynamically probe for ATIF handle (v2))
+  	struct amdgpu_atcs *atcs = &adev->atcs;
+  	int ret;
+  
+@@@ -655,12 -728,26 +732,29 @@@
+  		DRM_DEBUG_DRIVER("Call to ATCS verify_interface failed: %d\n", ret);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Call the ATIF method */
+ +	ret = amdgpu_atif_verify_interface(handle, atif);
+++=======
++ 	/* Probe for ATIF, and initialize it if found */
++ 	atif_handle = amdgpu_atif_probe_handle(handle);
++ 	if (!atif_handle)
++ 		goto out;
++ 
++ 	atif = kzalloc(sizeof(*atif), GFP_KERNEL);
++ 	if (!atif) {
++ 		DRM_WARN("Not enough memory to initialize ATIF\n");
++ 		goto out;
++ 	}
++ 	atif->handle = atif_handle;
++ 
++ 	/* Call the ATIF method */
++ 	ret = amdgpu_atif_verify_interface(atif);
+++>>>>>>> f9ff68521a55 (drm/amdgpu: Dynamically probe for ATIF handle (v2))
+  	if (ret) {
+  		DRM_DEBUG_DRIVER("Call to ATIF verify_interface failed: %d\n", ret);
+ -		kfree(atif);
+  		goto out;
+  	}
+ -	adev->atif = atif;
+  
+  	if (atif->notifications.brightness_change) {
+  		struct drm_encoder *tmp;
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
