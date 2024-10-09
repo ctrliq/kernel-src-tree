@@ -1,0 +1,216 @@
+iwlwifi: stop dbgc recording before stopping DMA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Golan Ben Ami <golan.ben.ami@intel.com>
+commit 1efc3843a4ee1331bc20df685a79b47fa0f547d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1efc3843.failed
+
+Today we stop the device and the DMA without stopping the dbgc
+recording before. This causes host crashes when the DMA
+rate is high.
+
+Stop dbgc recording when clearing the fw debug configuration
+to fix this.
+
+	Signed-off-by: Golan Ben Ami <golan.ben.ami@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit 1efc3843a4ee1331bc20df685a79b47fa0f547d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+#	drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
+diff --cc drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+index 5533f8638ecd,f5dd7d83cd0a..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+@@@ -1010,3 -1073,52 +1010,55 @@@ int iwl_mvm_start_fw_dbg_conf(struct iw
+  
+  	return 0;
+  }
+++<<<<<<< HEAD:drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+++=======
++ IWL_EXPORT_SYMBOL(iwl_fw_start_dbg_conf);
++ 
++ void iwl_fw_error_dump_wk(struct work_struct *work)
++ {
++ 	struct iwl_fw_runtime *fwrt =
++ 		container_of(work, struct iwl_fw_runtime, dump.wk.work);
++ 
++ 	if (fwrt->ops && fwrt->ops->dump_start &&
++ 	    fwrt->ops->dump_start(fwrt->ops_ctx))
++ 		return;
++ 
++ 	if (fwrt->trans->cfg->device_family == IWL_DEVICE_FAMILY_7000) {
++ 		/* stop recording */
++ 		iwl_fw_dbg_stop_recording(fwrt);
++ 
++ 		iwl_fw_error_dump(fwrt);
++ 
++ 		/* start recording again if the firmware is not crashed */
++ 		if (!test_bit(STATUS_FW_ERROR, &fwrt->trans->status) &&
++ 		    fwrt->fw->dbg_dest_tlv) {
++ 			iwl_clear_bits_prph(fwrt->trans,
++ 					    MON_BUFF_SAMPLE_CTL, 0x100);
++ 			iwl_clear_bits_prph(fwrt->trans,
++ 					    MON_BUFF_SAMPLE_CTL, 0x1);
++ 			iwl_set_bits_prph(fwrt->trans,
++ 					  MON_BUFF_SAMPLE_CTL, 0x1);
++ 		}
++ 	} else {
++ 		u32 in_sample = iwl_read_prph(fwrt->trans, DBGC_IN_SAMPLE);
++ 		u32 out_ctrl = iwl_read_prph(fwrt->trans, DBGC_OUT_CTRL);
++ 
++ 		iwl_fw_dbg_stop_recording(fwrt);
++ 		/* wait before we collect the data till the DBGC stop */
++ 		udelay(500);
++ 
++ 		iwl_fw_error_dump(fwrt);
++ 
++ 		/* start recording again if the firmware is not crashed */
++ 		if (!test_bit(STATUS_FW_ERROR, &fwrt->trans->status) &&
++ 		    fwrt->fw->dbg_dest_tlv) {
++ 			iwl_write_prph(fwrt->trans, DBGC_IN_SAMPLE, in_sample);
++ 			iwl_write_prph(fwrt->trans, DBGC_OUT_CTRL, out_ctrl);
++ 		}
++ 	}
++ 
++ 	if (fwrt->ops && fwrt->ops->dump_end)
++ 		fwrt->ops->dump_end(fwrt->ops_ctx);
++ }
++ 
+++>>>>>>> 1efc3843a4ee (iwlwifi: stop dbgc recording before stopping DMA):drivers/net/wireless/intel/iwlwifi/fw/dbg.c
+diff --cc drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
+index e9f1be9da7d4,9c889a32fe24..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
+@@@ -63,24 -63,48 +63,36 @@@
+   *
+   *****************************************************************************/
+  
+++<<<<<<< HEAD:drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
+ +#ifndef __mvm_fw_dbg_h__
+ +#define __mvm_fw_dbg_h__
+ +#include "iwl-fw-file.h"
+ +#include "iwl-fw-error-dump.h"
+ +#include "mvm.h"
+++=======
++ #ifndef __iwl_fw_dbg_h__
++ #define __iwl_fw_dbg_h__
++ #include <linux/workqueue.h>
++ #include <net/cfg80211.h>
++ #include "runtime.h"
++ #include "iwl-prph.h"
++ #include "iwl-io.h"
++ #include "file.h"
++ #include "error-dump.h"
+ -
+ -/**
+ - * struct iwl_fw_dump_desc - describes the dump
+ - * @len: length of trig_desc->data
+ - * @trig_desc: the description of the dump
+ - */
+ -struct iwl_fw_dump_desc {
+ -	size_t len;
+ -	/* must be last */
+ -	struct iwl_fw_error_dump_trigger_desc trig_desc;
+ -};
+ -
+ -extern const struct iwl_fw_dump_desc iwl_dump_desc_assert;
+ -
+ -static inline void iwl_fw_free_dump_desc(struct iwl_fw_runtime *fwrt)
+ -{
+ -	if (fwrt->dump.desc != &iwl_dump_desc_assert)
+ -		kfree(fwrt->dump.desc);
+ -	fwrt->dump.desc = NULL;
+ -}
+ -
+ -void iwl_fw_error_dump(struct iwl_fw_runtime *fwrt);
+ -int iwl_fw_dbg_collect_desc(struct iwl_fw_runtime *fwrt,
+ -			    const struct iwl_fw_dump_desc *desc,
+ -			    const struct iwl_fw_dbg_trigger_tlv *trigger);
+ -int iwl_fw_dbg_collect(struct iwl_fw_runtime *fwrt,
+ -		       enum iwl_fw_dbg_trigger trig,
+ -		       const char *str, size_t len,
+ -		       const struct iwl_fw_dbg_trigger_tlv *trigger);
+ -int iwl_fw_dbg_collect_trig(struct iwl_fw_runtime *fwrt,
+ -			    struct iwl_fw_dbg_trigger_tlv *trigger,
+ -			    const char *fmt, ...) __printf(3, 4);
+ -int iwl_fw_start_dbg_conf(struct iwl_fw_runtime *fwrt, u8 id);
+++>>>>>>> 1efc3843a4ee (iwlwifi: stop dbgc recording before stopping DMA):drivers/net/wireless/intel/iwlwifi/fw/dbg.h
+ +
+ +void iwl_mvm_fw_error_dump(struct iwl_mvm *mvm);
+ +void iwl_mvm_free_fw_dump_desc(struct iwl_mvm *mvm);
+ +int iwl_mvm_fw_dbg_collect_desc(struct iwl_mvm *mvm,
+ +				const struct iwl_mvm_dump_desc *desc,
+ +				const struct iwl_fw_dbg_trigger_tlv *trigger);
+ +int iwl_mvm_fw_dbg_collect(struct iwl_mvm *mvm, enum iwl_fw_dbg_trigger trig,
+ +			   const char *str, size_t len,
+ +			   const struct iwl_fw_dbg_trigger_tlv *trigger);
+ +int iwl_mvm_fw_dbg_collect_trig(struct iwl_mvm *mvm,
+ +				struct iwl_fw_dbg_trigger_tlv *trigger,
+ +				const char *fmt, ...) __printf(3, 4);
+ +int iwl_mvm_start_fw_dbg_conf(struct iwl_mvm *mvm, u8 id);
+  
+  #define iwl_fw_dbg_trigger_enabled(fw, id) ({			\
+  	void *__dbg_trigger = (fw)->dbg_trigger_tlv[(id)];	\
+@@@ -161,15 -185,45 +173,49 @@@ _iwl_fw_dbg_trigger_simple_stop(struct 
+  	if (!trigger)
+  		return;
+  
+ -	if (!iwl_fw_dbg_trigger_check_stop(fwrt, wdev, trigger))
+ +	if (!iwl_fw_dbg_trigger_check_stop(mvm, vif, trigger))
+  		return;
+  
+ -	iwl_fw_dbg_collect_trig(fwrt, trigger, NULL);
+ +	iwl_mvm_fw_dbg_collect_trig(mvm, trigger, NULL);
+  }
+  
+ -#define iwl_fw_dbg_trigger_simple_stop(fwrt, wdev, trig)	\
+ -	_iwl_fw_dbg_trigger_simple_stop((fwrt), (wdev),		\
+ -					iwl_fw_dbg_get_trigger((fwrt)->fw,\
+ +#define iwl_fw_dbg_trigger_simple_stop(mvm, vif, trig)	\
+ +	_iwl_fw_dbg_trigger_simple_stop((mvm), (vif),	\
+ +					iwl_fw_dbg_get_trigger((mvm)->fw,\
+  							       (trig)))
+  
+++<<<<<<< HEAD:drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
+ +#endif  /* __mvm_fw_dbg_h__ */
+++=======
++ static inline void iwl_fw_dbg_stop_recording(struct iwl_fw_runtime *fwrt)
++ {
++ 	if (fwrt->trans->cfg->device_family == IWL_DEVICE_FAMILY_7000) {
++ 		iwl_set_bits_prph(fwrt->trans, MON_BUFF_SAMPLE_CTL, 0x100);
++ 	} else {
++ 		iwl_write_prph(fwrt->trans, DBGC_IN_SAMPLE, 0);
++ 		udelay(100);
++ 		iwl_write_prph(fwrt->trans, DBGC_OUT_CTRL, 0);
++ 	}
++ }
++ 
++ static inline void iwl_fw_dump_conf_clear(struct iwl_fw_runtime *fwrt)
++ {
++ 	iwl_fw_dbg_stop_recording(fwrt);
++ 
++ 	fwrt->dump.conf = FW_DBG_INVALID;
++ }
++ 
++ void iwl_fw_error_dump_wk(struct work_struct *work);
++ 
++ static inline void iwl_fw_flush_dump(struct iwl_fw_runtime *fwrt)
++ {
++ 	flush_delayed_work(&fwrt->dump.wk);
++ }
++ 
++ static inline void iwl_fw_cancel_dump(struct iwl_fw_runtime *fwrt)
++ {
++ 	cancel_delayed_work_sync(&fwrt->dump.wk);
++ }
++ 
++ #endif  /* __iwl_fw_dbg_h__ */
+++>>>>>>> 1efc3843a4ee (iwlwifi: stop dbgc recording before stopping DMA):drivers/net/wireless/intel/iwlwifi/fw/dbg.h
+* Unmerged path drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+* Unmerged path drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.h
