@@ -1,0 +1,112 @@
+IB/core: Add lock to multicast handlers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matan Barak <matanb@mellanox.com>
+commit f48b726920d96dcd1860df06143bdea7d6d7dcc3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f48b7269.failed
+
+When two handlers used the same object in the old schema, we blocked
+the process in the kernel. The new schema just returns -EBUSY. This
+could lead to different behaviour in applications between the old
+schema and the new schema. In most cases, using such handlers
+concurrently could lead to crashing the process. For example, if
+thread A destroys a QP and thread B modifies it, we could have the
+destruction happens before the modification. In this case, we are
+accessing freed memory which could lead to crashing the process.
+This is true for most cases. However, attaching and detaching
+a multicast address from QP concurrently is safe. Therefore, we
+preserve the original behaviour by adding a lock there.
+
+	Signed-off-by: Matan Barak <matanb@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f48b726920d96dcd1860df06143bdea7d6d7dcc3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 9f5575bf9d2c,119c10da7751..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -1781,13 -1346,14 +1781,23 @@@ static int create_qp(struct ib_uverbs_f
+  	if (cmd->qp_type == IB_QPT_RAW_PACKET && !capable(CAP_NET_RAW))
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	obj = kzalloc(sizeof *obj, GFP_KERNEL);
+ +	if (!obj)
+ +		return -ENOMEM;
+++=======
++ 	obj  = (struct ib_uqp_object *)uobj_alloc(uobj_get_type(qp),
++ 						  file->ucontext);
++ 	if (IS_ERR(obj))
++ 		return PTR_ERR(obj);
++ 	obj->uxrcd = NULL;
++ 	obj->uevent.uobject.user_handle = cmd->user_handle;
++ 	mutex_init(&obj->mcast_lock);
+++>>>>>>> f48b726920d9 (IB/core: Add lock to multicast handlers)
+  
+ +	init_uobj(&obj->uevent.uobject, cmd->user_handle, file->ucontext,
+ +		  &qp_lock_class);
+ +	down_write(&obj->uevent.uobject.mutex);
+  	if (cmd_sz >= offsetof(typeof(*cmd), rwq_ind_tbl_handle) +
+  		      sizeof(cmd->rwq_ind_tbl_handle) &&
+  		      (cmd->comp_mask & IB_UVERBS_CREATE_QP_MASK_IND_TABLE)) {
+@@@ -3101,7 -2614,8 +3112,12 @@@ ssize_t ib_uverbs_attach_mcast(struct i
+  		kfree(mcast);
+  
+  out_put:
+++<<<<<<< HEAD
+ +	put_qp_write(qp);
+++=======
++ 	mutex_unlock(&obj->mcast_lock);
++ 	uobj_put_obj_read(qp);
+++>>>>>>> f48b726920d9 (IB/core: Add lock to multicast handlers)
+  
+  	return ret ? ret : in_len;
+  }
+@@@ -3124,6 -2638,9 +3140,12 @@@ ssize_t ib_uverbs_detach_mcast(struct i
+  	if (!qp)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	obj = container_of(qp->uobject, struct ib_uqp_object, uevent.uobject);
++ 	mutex_lock(&obj->mcast_lock);
++ 
+++>>>>>>> f48b726920d9 (IB/core: Add lock to multicast handlers)
+  	ret = ib_detach_mcast(qp, (union ib_gid *) cmd.gid, cmd.mlid);
+  	if (ret)
+  		goto out_put;
+@@@ -3139,8 -2654,8 +3161,13 @@@
+  		}
+  
+  out_put:
+++<<<<<<< HEAD
+ +	put_qp_write(qp);
+ +
+++=======
++ 	mutex_unlock(&obj->mcast_lock);
++ 	uobj_put_obj_read(qp);
+++>>>>>>> f48b726920d9 (IB/core: Add lock to multicast handlers)
+  	return ret ? ret : in_len;
+  }
+  
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index e1bedf0bac04..da042f0f5b8b 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -159,6 +159,8 @@ struct ib_usrq_object {
+ 
+ struct ib_uqp_object {
+ 	struct ib_uevent_object	uevent;
++	/* lock for mcast list */
++	struct mutex		mcast_lock;
+ 	struct list_head 	mcast_list;
+ 	struct ib_uxrcd_object *uxrcd;
+ };
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
