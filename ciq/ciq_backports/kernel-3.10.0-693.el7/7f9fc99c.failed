@@ -1,0 +1,351 @@
+ACPICA: Tables: Clean up split INSTALLED/VALIDATED table state logics.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [acpi] acpica: tables: Clean up split INSTALLED/VALIDATED table state logics (Prarit Bhargava) [1425180]
+Rebuild_FUZZ: 99.28%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit 7f9fc99cde939187c1ee6dac115bdb76655cc798
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7f9fc99c.failed
+
+This patch is mainly a naming cleanup to clarify hidden logics, no
+functional changes.
+
+acpi_initialize_tables() is used by Linux to install table addresses for
+early boot steps.  During this stage, table addresses are mapped by
+early_ioremap() mechanism which is different from the runtime IO mappings.
+Thus it is not safe for ACPICA to keep mapped pointers in struct acpi_table_desc
+structure during this stage.
+
+In order to support this in ACPICA, table states are divided into
+1. "INSTALLED" (where struct acpi_table_desc.Pointer is always NULL) and
+2. "VALIDATED" (where struct acpi_table_desc.Pointer is always not NULL).
+During acpi_initialize_tables(), table state are ensured to be "INSTALLED"
+but not "VALIDATED".  This logic is ensured by the original code in very
+ambigious way.  For example, currently acpi_tb_delete_table() is invoked in
+some place to perform an uninstallation while it is invoked in other place
+to perform an invalidation.  They happen to work just because no one enters
+the penalty where the 2 behaviours are not equivalent.
+
+The naming cleanups are made in this patch:
+A. For installation and validation:
+   There is code setting struct acpi_table_desc.Pointer first and delete it
+   immediately to keep the descriptor's state as "INSTALLED" during the
+   installation.  This patch implements this in more direct way.  After
+   applying it, struct acpi_table_desc.Pointer will never be set in
+   acpi_tb_install_table() and acpi_tb_override_table() as they are the only
+   functions invoked during acpi_initialize_tables(). This is achieved by:
+1. Rename acpi_tb_verify_table() to acpi_tb_validate_table() to clarify this
+   change.
+2. Rename acpi_tb_table_override() to acpi_tb_override_table() to keep nameing
+   consistencies as other APIs (verb. Table).
+3. Stops setting struct acpi_table_desc.Pointer in acpi_tb_install_table() and
+   acpi_tb_table_override().
+4. Introduce acpi_tb_acquire_table() to acquire the table pointer that is not
+   maintained in the struct acpi_table_desc of the global root table list and
+   rewrite acpi_tb_validate_table() using this new function to reduce
+   redundancies.
+5. Replace the table pointer using the overridden table pointer in
+   acpi_tb_add_table(). As acpi_tb_add_table() is not invoked during early boot
+   stage, tables returned from this functions should be "VALIDATED".  As
+   acpi_tb_override_table() is modified by this patch to return a "INSTALLED"
+   but not "VALIDATED" descriptor, to keep acpi_tb_add_table() unchanged,
+   struct acpi_table_desc.Pointer is filled in acpi_tb_add_table().
+B. For invalidation and uninstallation:
+   The original code invalidate table by invoking acpi_tb_delete_table() here
+   and there, but actually this function should only be used to uninstall
+   tables.  This can work just because its invocations are equivalent to
+   invalidation in some cases.
+   This patch splits acpi_tb_delete_table() into acpi_tb_invalidate_table() and
+   acpi_tb_uninstall_table() and cleans up the hidden logic using the new
+   APIs.  This is achieved by:
+1. Rename acpi_tb_delete_table() to acpi_tb_uninstall_table() as it is mainly
+   called before resetting struct acpi_table_desc.Address.  Thus the table
+   descriptor is in "not INSTALLED" state.  This patch enforces this by
+   setting struct acpi_table_desc.Address to NULL in this function.
+2. Introduce acpi_tb_invalidate_table() to be the reversal of
+   acpi_tb_validate_table() and invoke it in acpi_tb_uninstall_table().
+3. Introduce acpi_tb_release_table() to release the table pointer that is not
+   maintained in acpi_gbl_root_table_list and rewrite acpi_tb_invalidate_table()
+   using this new function to reduce redundancies.
+
+After cleaning up, the maintainability of the internal APIs are also
+improved:
+1. acpi_tb_acquire_table: Acquire struct acpi_table_header according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+2. acpi_tb_release_table: Release struct acpi_table_header according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+3. acpi_tb_install_table: Make struct acpi_table_desc.Address not NULL according to
+                       ACPI_TABLE_ORIGIN_xxx flags.
+4. acpi_tb_uninstall_table: Make struct acpi_table_desc.Address NULL according to
+                         ACPI_TABLE_ORIGIN_xxx flags.
+5. acpi_tb_validate_table: Make struct acpi_table_desc.Pointer not NULL according to
+                        ACPI_TABLE_ORIGIN_xxx flags.
+6. acpi_tb_invalidate_table: Make struct acpi_table_desc.Pointer NULL according to
+                          ACPI_TABLE_ORIGIN_xxx flags.
+7. acpi_tb_override_table: Replace struct acpi_table_desc.Address and
+                        struct acpi_table_desc.Flags.  It only happens in
+                        "INSTALLED" state.
+
+The patch has been unit tested in acpi_exec by:
+1. Initializing;
+2. Executing exc_tbl ASLTS tests;
+3. Executing "Load" command.
+So that all original acpi_tb_install_table() and acpi_tb_override_table()
+invocations are covered.
+
+Known Issues:
+1. Cleanup acpi_tb_add_table() to Kill Code Redundancies
+   Current implementation in acpi_tb_add_table() is not very clean, further
+   patch can rewrite acpi_tb_add_table() with ordered acpi_tb_install_table(),
+   acpi_tb_override_table() and acpi_tb_validate_table(). It is not done in this
+   patch so that it is easy for the reviewers to understand the changes in
+   this patch.
+
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Bob Moore <robert.moore@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 7f9fc99cde939187c1ee6dac115bdb76655cc798)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/tbinstal.c
+diff --cc drivers/acpi/acpica/tbinstal.c
+index 731220a5f187,93a99ef03425..000000000000
+--- a/drivers/acpi/acpica/tbinstal.c
++++ b/drivers/acpi/acpica/tbinstal.c
+@@@ -300,47 -412,49 +418,76 @@@ struct acpi_table_header *acpi_tb_overr
+  	/* (2) Attempt physical override (returns a physical address) */
+  
+  	status = acpi_os_physical_table_override(table_header,
+++<<<<<<< HEAD
+ +						 &new_address,
+ +						 &new_table_length);
+ +	if (ACPI_SUCCESS(status) && new_address && new_table_length) {
+ +
+ +		/* Map the entire new table */
+ +
+ +		new_table = acpi_os_map_memory(new_address, new_table_length);
+ +		if (!new_table) {
+ +			ACPI_EXCEPTION((AE_INFO, AE_NO_MEMORY,
+ +					"%4.4s %p Attempted physical table override failed",
+ +					table_header->signature,
+ +					ACPI_CAST_PTR(void,
+ +						      table_desc->address)));
+ +			return (NULL);
+ +		}
+ +
+++=======
++ 						 &new_table_desc.address,
++ 						 &new_table_desc.length);
++ 	if (ACPI_SUCCESS(status) && new_table_desc.address
++ 	    && new_table_desc.length) {
+++>>>>>>> 7f9fc99cde93 (ACPICA: Tables: Clean up split INSTALLED/VALIDATED table state logics.)
+  		override_type = "Physical";
+- 		new_flags = ACPI_TABLE_ORIGIN_MAPPED;
++ 		new_table_desc.flags = ACPI_TABLE_ORIGIN_MAPPED;
+  		goto finish_override;
+  	}
+  
+  	return (NULL);		/* There was no override */
+  
+ -finish_override:
+ +      finish_override:
+  
+++<<<<<<< HEAD
+ +	ACPI_INFO((AE_INFO,
+ +		   "%4.4s %p %s table override, new table: %p",
+ +		   table_header->signature,
+ +		   ACPI_CAST_PTR(void, table_desc->address),
+ +		   override_type, new_table));
+++=======
++ 	/*
++ 	 * Acquire the entire new table to indicate overridden.
++ 	 * Note that this is required by the callers of this function.
++ 	 */
++ 	status = acpi_tb_acquire_table(&new_table_desc, &new_table,
++ 				       &new_table_length, &new_flags);
++ 	if (ACPI_FAILURE(status)) {
++ 		ACPI_EXCEPTION((AE_INFO, AE_NO_MEMORY,
++ 				"%4.4s " ACPI_PRINTF_UINT
++ 				" Attempted table override failed",
++ 				table_header->signature,
++ 				ACPI_FORMAT_TO_UINT(table_desc->address)));
++ 		return (NULL);
++ 	}
++ 
++ 	ACPI_INFO((AE_INFO, "%4.4s " ACPI_PRINTF_UINT
++ 		   " %s table override, new table: " ACPI_PRINTF_UINT,
++ 		   table_header->signature,
++ 		   ACPI_FORMAT_TO_UINT(table_desc->address),
++ 		   override_type, ACPI_FORMAT_TO_UINT(new_table_desc.address)));
+++>>>>>>> 7f9fc99cde93 (ACPICA: Tables: Clean up split INSTALLED/VALIDATED table state logics.)
+  
+- 	/* We can now unmap/delete the original table (if fully mapped) */
++ 	/* We can now uninstall the original table (if fully mapped) */
+  
+- 	acpi_tb_delete_table(table_desc);
++ 	acpi_tb_uninstall_table(table_desc);
+  
+- 	/* Setup descriptor for the new table */
++ 	/* Install the new table */
+  
+- 	table_desc->address = new_address;
+- 	table_desc->pointer = new_table;
+- 	table_desc->length = new_table_length;
+- 	table_desc->flags = new_flags;
++ 	table_desc->address = new_table_desc.address;
++ 	table_desc->length = new_table_desc.length;
++ 	table_desc->flags = new_table_desc.flags;
+  
+  	return (new_table);
+  }
+diff --git a/drivers/acpi/acpica/actables.h b/drivers/acpi/acpica/actables.h
+index 917315ec21dd..67f009f1c1fd 100644
+--- a/drivers/acpi/acpica/actables.h
++++ b/drivers/acpi/acpica/actables.h
+@@ -70,13 +70,24 @@ acpi_tb_find_table(char *signature,
+  */
+ acpi_status acpi_tb_resize_root_table_list(void);
+ 
+-acpi_status acpi_tb_verify_table(struct acpi_table_desc *table_desc);
++acpi_status acpi_tb_validate_table(struct acpi_table_desc *table_desc);
+ 
+-struct acpi_table_header *acpi_tb_table_override(struct acpi_table_header
++void acpi_tb_invalidate_table(struct acpi_table_desc *table_desc);
++
++struct acpi_table_header *acpi_tb_override_table(struct acpi_table_header
+ 						 *table_header,
+ 						 struct acpi_table_desc
+ 						 *table_desc);
+ 
++acpi_status
++acpi_tb_acquire_table(struct acpi_table_desc *table_desc,
++		      struct acpi_table_header **table_ptr,
++		      u32 *table_length, u8 *table_flags);
++
++void
++acpi_tb_release_table(struct acpi_table_header *table,
++		      u32 table_length, u8 table_flags);
++
+ acpi_status
+ acpi_tb_add_table(struct acpi_table_desc *table_desc, u32 *table_index);
+ 
+@@ -85,7 +96,7 @@ acpi_tb_store_table(acpi_physical_address address,
+ 		    struct acpi_table_header *table,
+ 		    u32 length, u8 flags, u32 *table_index);
+ 
+-void acpi_tb_delete_table(struct acpi_table_desc *table_desc);
++void acpi_tb_uninstall_table(struct acpi_table_desc *table_desc);
+ 
+ void acpi_tb_terminate(void);
+ 
+diff --git a/drivers/acpi/acpica/tbfind.c b/drivers/acpi/acpica/tbfind.c
+index e4f4f02d49e7..0785cd874ac4 100644
+--- a/drivers/acpi/acpica/tbfind.c
++++ b/drivers/acpi/acpica/tbfind.c
+@@ -99,8 +99,8 @@ acpi_tb_find_table(char *signature,
+ 			/* Table is not currently mapped, map it */
+ 
+ 			status =
+-			    acpi_tb_verify_table(&acpi_gbl_root_table_list.
+-						 tables[i]);
++			    acpi_tb_validate_table(&acpi_gbl_root_table_list.
++						   tables[i]);
+ 			if (ACPI_FAILURE(status)) {
+ 				return_ACPI_STATUS(status);
+ 			}
+* Unmerged path drivers/acpi/acpica/tbinstal.c
+diff --git a/drivers/acpi/acpica/tbutils.c b/drivers/acpi/acpica/tbutils.c
+index 61ffb069ecd5..298f2d197dd9 100644
+--- a/drivers/acpi/acpica/tbutils.c
++++ b/drivers/acpi/acpica/tbutils.c
+@@ -236,7 +236,7 @@ struct acpi_table_header *acpi_tb_copy_dsdt(u32 table_index)
+ 	}
+ 
+ 	ACPI_MEMCPY(new_table, table_desc->pointer, table_desc->length);
+-	acpi_tb_delete_table(table_desc);
++	acpi_tb_uninstall_table(table_desc);
+ 	table_desc->address = ACPI_PTR_TO_PHYSADDR(new_table);
+ 	table_desc->pointer = new_table;
+ 	table_desc->flags = ACPI_TABLE_ORIGIN_ALLOCATED;
+@@ -326,7 +326,7 @@ acpi_tb_install_table(acpi_physical_address address,
+ 	 * fully mapped later (in verify table). In any case, we must
+ 	 * unmap the header that was mapped above.
+ 	 */
+-	final_table = acpi_tb_table_override(table, table_desc);
++	final_table = acpi_tb_override_table(table, table_desc);
+ 	if (!final_table) {
+ 		final_table = table;	/* There was no override */
+ 	}
+@@ -348,7 +348,12 @@ acpi_tb_install_table(acpi_physical_address address,
+ 	 * flag set and will not be deleted below.
+ 	 */
+ 	if (final_table != table) {
+-		acpi_tb_delete_table(table_desc);
++		/*
++		 * Table is in "INSTALLED" state, the final_table pointer is not
++		 * maintained in the root table list.
++		 */
++		acpi_tb_release_table(final_table, table_desc->length,
++				      table_desc->flags);
+ 	}
+ 
+       unmap_and_exit:
+diff --git a/drivers/acpi/acpica/tbxface.c b/drivers/acpi/acpica/tbxface.c
+index ba6e31d96bc1..d7e3f763e226 100644
+--- a/drivers/acpi/acpica/tbxface.c
++++ b/drivers/acpi/acpica/tbxface.c
+@@ -342,7 +342,7 @@ acpi_get_table_with_size(char *signature,
+ 		}
+ 
+ 		status =
+-		    acpi_tb_verify_table(&acpi_gbl_root_table_list.tables[i]);
++		    acpi_tb_validate_table(&acpi_gbl_root_table_list.tables[i]);
+ 		if (ACPI_SUCCESS(status)) {
+ 			*out_table = acpi_gbl_root_table_list.tables[i].pointer;
+ 			*tbl_size = acpi_gbl_root_table_list.tables[i].length;
+@@ -410,8 +410,8 @@ acpi_get_table_by_index(u32 table_index, struct acpi_table_header ** table)
+ 		/* Table is not mapped, map it */
+ 
+ 		status =
+-		    acpi_tb_verify_table(&acpi_gbl_root_table_list.
+-					 tables[table_index]);
++		    acpi_tb_validate_table(&acpi_gbl_root_table_list.
++					   tables[table_index]);
+ 		if (ACPI_FAILURE(status)) {
+ 			(void)acpi_ut_release_mutex(ACPI_MTX_TABLES);
+ 			return_ACPI_STATUS(status);
+diff --git a/drivers/acpi/acpica/tbxfload.c b/drivers/acpi/acpica/tbxfload.c
+index 2620dbe96cfa..4fa3202ef85e 100644
+--- a/drivers/acpi/acpica/tbxfload.c
++++ b/drivers/acpi/acpica/tbxfload.c
+@@ -117,7 +117,7 @@ static acpi_status acpi_tb_load_namespace(void)
+ 				tables[ACPI_TABLE_INDEX_DSDT].signature),
+ 			       ACPI_SIG_DSDT)
+ 	    ||
+-	    ACPI_FAILURE(acpi_tb_verify_table
++	    ACPI_FAILURE(acpi_tb_validate_table
+ 			 (&acpi_gbl_root_table_list.
+ 			  tables[ACPI_TABLE_INDEX_DSDT]))) {
+ 		status = AE_NO_ACPI_TABLES;
+@@ -128,7 +128,7 @@ static acpi_status acpi_tb_load_namespace(void)
+ 	 * Save the DSDT pointer for simple access. This is the mapped memory
+ 	 * address. We must take care here because the address of the .Tables
+ 	 * array can change dynamically as tables are loaded at run-time. Note:
+-	 * .Pointer field is not validated until after call to acpi_tb_verify_table.
++	 * .Pointer field is not validated until after call to acpi_tb_validate_table.
+ 	 */
+ 	acpi_gbl_DSDT =
+ 	    acpi_gbl_root_table_list.tables[ACPI_TABLE_INDEX_DSDT].pointer;
+@@ -174,7 +174,7 @@ static acpi_status acpi_tb_load_namespace(void)
+ 					(acpi_gbl_root_table_list.tables[i].
+ 					 signature), ACPI_SIG_PSDT))
+ 		    ||
+-		    ACPI_FAILURE(acpi_tb_verify_table
++		    ACPI_FAILURE(acpi_tb_validate_table
+ 				 (&acpi_gbl_root_table_list.tables[i]))) {
+ 			continue;
+ 		}
