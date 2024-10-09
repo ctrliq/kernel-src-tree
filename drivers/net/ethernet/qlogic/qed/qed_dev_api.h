@@ -84,7 +84,7 @@ void qed_resc_setup(struct qed_dev *cdev);
 
 struct qed_hw_init_params {
 	/* Tunneling parameters */
-	struct qed_tunn_start_params *p_tunn;
+	struct qed_tunnel_info *p_tunn;
 
 	bool b_hw_start;
 
