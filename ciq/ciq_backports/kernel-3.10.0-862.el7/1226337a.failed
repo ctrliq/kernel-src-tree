@@ -1,0 +1,386 @@
+qed: Correct HW stop flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tomer Tayar <Tomer.Tayar@cavium.com>
+commit 1226337ad98ffc7982244a67a47faab1eacaca33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1226337a.failed
+
+Management firmware is used as arbiter between different PFs
+which are loading/unloading, but in order to use the synchronization
+it offers the contending configurations need to be applied either
+between their LOAD_REQ <-> LOAD_DONE or UNLOAD_REQ <-> UNLOAD_DONE
+management firmware commands.
+
+Existing HW stop flow utilizes 2 different functions: qed_hw_stop() and
+qed_hw_reset() which don't abide this requirement; Most of the closure
+is doing outside the scope of the unload request.
+
+This patch removes qed_hw_reset() and places the relevant stop
+functionality underneath the management firmware protection.
+
+	Signed-off-by: Tomer Tayar <Tomer.Tayar@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1226337ad98ffc7982244a67a47faab1eacaca33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_mcp.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index 98ee024dec53,f2e5ab90f574..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@@ -400,7 -550,6 +400,10 @@@ int qed_mcp_cmd(struct qed_hwfn *p_hwfn
+  		u32 *o_mcp_param)
+  {
+  	struct qed_mcp_mb_params mb_params;
+++<<<<<<< HEAD
+ +	union drv_union_data data_src;
+++=======
+++>>>>>>> 1226337ad98f (qed: Correct HW stop flow)
+  	int rc;
+  
+  	memset(&mb_params, 0, sizeof(mb_params));
+@@@ -408,24 -556,6 +411,27 @@@
+  	mb_params.cmd = cmd;
+  	mb_params.param = param;
+  
+++<<<<<<< HEAD
+ +	/* In case of UNLOAD_DONE, set the primary MAC */
+ +	if ((cmd == DRV_MSG_CODE_UNLOAD_DONE) &&
+ +	    (p_hwfn->cdev->wol_config == QED_OV_WOL_ENABLED)) {
+ +		u8 *p_mac = p_hwfn->cdev->wol_mac;
+ +
+ +		data_src.wol_mac.mac_upper = p_mac[0] << 8 | p_mac[1];
+ +		data_src.wol_mac.mac_lower = p_mac[2] << 24 | p_mac[3] << 16 |
+ +					     p_mac[4] << 8 | p_mac[5];
+ +
+ +		DP_VERBOSE(p_hwfn,
+ +			   (QED_MSG_SP | NETIF_MSG_IFDOWN),
+ +			   "Setting WoL MAC: %pM --> [%08x,%08x]\n",
+ +			   p_mac, data_src.wol_mac.mac_upper,
+ +			   data_src.wol_mac.mac_lower);
+ +
+ +		mb_params.p_data_src = &data_src;
+ +	}
+ +
+++=======
+++>>>>>>> 1226337ad98f (qed: Correct HW stop flow)
+  	rc = qed_mcp_cmd_and_union(p_hwfn, p_ptt, &mb_params);
+  	if (rc)
+  		return rc;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed.h b/drivers/net/ethernet/qlogic/qed/qed.h
+index 079b98ee34fc..8bdc6ee9497c 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -730,5 +730,6 @@ void qed_get_protocol_stats(struct qed_dev *cdev,
+ 			    enum qed_mcp_protocol_type type,
+ 			    union qed_mcp_protocol_stats *stats);
+ int qed_slowpath_irq_req(struct qed_hwfn *hwfn);
++void qed_slowpath_irq_sync(struct qed_hwfn *p_hwfn);
+ 
+ #endif /* _QED_H */
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev.c b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+index 11e45f0f7779..cf95da5679c3 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -1303,27 +1303,53 @@ void qed_hw_timers_stop_all(struct qed_dev *cdev)
+ 
+ int qed_hw_stop(struct qed_dev *cdev)
+ {
+-	int rc = 0, t_rc;
++	struct qed_hwfn *p_hwfn;
++	struct qed_ptt *p_ptt;
++	int rc, rc2 = 0;
+ 	int j;
+ 
+ 	for_each_hwfn(cdev, j) {
+-		struct qed_hwfn *p_hwfn = &cdev->hwfns[j];
+-		struct qed_ptt *p_ptt = p_hwfn->p_main_ptt;
++		p_hwfn = &cdev->hwfns[j];
++		p_ptt = p_hwfn->p_main_ptt;
+ 
+ 		DP_VERBOSE(p_hwfn, NETIF_MSG_IFDOWN, "Stopping hw/fw\n");
+ 
+ 		if (IS_VF(cdev)) {
+ 			qed_vf_pf_int_cleanup(p_hwfn);
++			rc = qed_vf_pf_reset(p_hwfn);
++			if (rc) {
++				DP_NOTICE(p_hwfn,
++					  "qed_vf_pf_reset failed. rc = %d.\n",
++					  rc);
++				rc2 = -EINVAL;
++			}
+ 			continue;
+ 		}
+ 
+ 		/* mark the hw as uninitialized... */
+ 		p_hwfn->hw_init_done = false;
+ 
++		/* Send unload command to MCP */
++		rc = qed_mcp_unload_req(p_hwfn, p_ptt);
++		if (rc) {
++			DP_NOTICE(p_hwfn,
++				  "Failed sending a UNLOAD_REQ command. rc = %d.\n",
++				  rc);
++			rc2 = -EINVAL;
++		}
++
++		qed_slowpath_irq_sync(p_hwfn);
++
++		/* After this point no MFW attentions are expected, e.g. prevent
++		 * race between pf stop and dcbx pf update.
++		 */
+ 		rc = qed_sp_pf_stop(p_hwfn);
+-		if (rc)
++		if (rc) {
+ 			DP_NOTICE(p_hwfn,
+-				  "Failed to close PF against FW. Continue to stop HW to prevent illegal host access by the device\n");
++				  "Failed to close PF against FW [rc = %d]. Continue to stop HW to prevent illegal host access by the device.\n",
++				  rc);
++			rc2 = -EINVAL;
++		}
+ 
+ 		qed_wr(p_hwfn, p_ptt,
+ 		       NIG_REG_RX_LLH_BRB_GATE_DNTFWD_PERPF, 0x1);
+@@ -1346,20 +1372,37 @@ int qed_hw_stop(struct qed_dev *cdev)
+ 
+ 		/* Need to wait 1ms to guarantee SBs are cleared */
+ 		usleep_range(1000, 2000);
++
++		/* Disable PF in HW blocks */
++		qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_DB_ENABLE, 0);
++		qed_wr(p_hwfn, p_ptt, QM_REG_PF_EN, 0);
++
++		qed_mcp_unload_done(p_hwfn, p_ptt);
++		if (rc) {
++			DP_NOTICE(p_hwfn,
++				  "Failed sending a UNLOAD_DONE command. rc = %d.\n",
++				  rc);
++			rc2 = -EINVAL;
++		}
+ 	}
+ 
+ 	if (IS_PF(cdev)) {
++		p_hwfn = QED_LEADING_HWFN(cdev);
++		p_ptt = QED_LEADING_HWFN(cdev)->p_main_ptt;
++
+ 		/* Disable DMAE in PXP - in CMT, this should only be done for
+ 		 * first hw-function, and only after all transactions have
+ 		 * stopped for all active hw-functions.
+ 		 */
+-		t_rc = qed_change_pci_hwfn(&cdev->hwfns[0],
+-					   cdev->hwfns[0].p_main_ptt, false);
+-		if (t_rc != 0)
+-			rc = t_rc;
++		rc = qed_change_pci_hwfn(p_hwfn, p_ptt, false);
++		if (rc) {
++			DP_NOTICE(p_hwfn,
++				  "qed_change_pci_hwfn failed. rc = %d.\n", rc);
++			rc2 = -EINVAL;
++		}
+ 	}
+ 
+-	return rc;
++	return rc2;
+ }
+ 
+ void qed_hw_stop_fastpath(struct qed_dev *cdev)
+@@ -1404,89 +1447,6 @@ void qed_hw_start_fastpath(struct qed_hwfn *p_hwfn)
+ 	       NIG_REG_RX_LLH_BRB_GATE_DNTFWD_PERPF, 0x0);
+ }
+ 
+-static int qed_reg_assert(struct qed_hwfn *p_hwfn,
+-			  struct qed_ptt *p_ptt, u32 reg, bool expected)
+-{
+-	u32 assert_val = qed_rd(p_hwfn, p_ptt, reg);
+-
+-	if (assert_val != expected) {
+-		DP_NOTICE(p_hwfn, "Value at address 0x%08x != 0x%08x\n",
+-			  reg, expected);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-int qed_hw_reset(struct qed_dev *cdev)
+-{
+-	int rc = 0;
+-	u32 unload_resp, unload_param;
+-	u32 wol_param;
+-	int i;
+-
+-	switch (cdev->wol_config) {
+-	case QED_OV_WOL_DISABLED:
+-		wol_param = DRV_MB_PARAM_UNLOAD_WOL_DISABLED;
+-		break;
+-	case QED_OV_WOL_ENABLED:
+-		wol_param = DRV_MB_PARAM_UNLOAD_WOL_ENABLED;
+-		break;
+-	default:
+-		DP_NOTICE(cdev,
+-			  "Unknown WoL configuration %02x\n", cdev->wol_config);
+-		/* Fallthrough */
+-	case QED_OV_WOL_DEFAULT:
+-		wol_param = DRV_MB_PARAM_UNLOAD_WOL_MCP;
+-	}
+-
+-	for_each_hwfn(cdev, i) {
+-		struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
+-
+-		if (IS_VF(cdev)) {
+-			rc = qed_vf_pf_reset(p_hwfn);
+-			if (rc)
+-				return rc;
+-			continue;
+-		}
+-
+-		DP_VERBOSE(p_hwfn, NETIF_MSG_IFDOWN, "Resetting hw/fw\n");
+-
+-		/* Check for incorrect states */
+-		qed_reg_assert(p_hwfn, p_hwfn->p_main_ptt,
+-			       QM_REG_USG_CNT_PF_TX, 0);
+-		qed_reg_assert(p_hwfn, p_hwfn->p_main_ptt,
+-			       QM_REG_USG_CNT_PF_OTHER, 0);
+-
+-		/* Disable PF in HW blocks */
+-		qed_wr(p_hwfn, p_hwfn->p_main_ptt, DORQ_REG_PF_DB_ENABLE, 0);
+-		qed_wr(p_hwfn, p_hwfn->p_main_ptt, QM_REG_PF_EN, 0);
+-		qed_wr(p_hwfn, p_hwfn->p_main_ptt,
+-		       TCFC_REG_STRONG_ENABLE_PF, 0);
+-		qed_wr(p_hwfn, p_hwfn->p_main_ptt,
+-		       CCFC_REG_STRONG_ENABLE_PF, 0);
+-
+-		/* Send unload command to MCP */
+-		rc = qed_mcp_cmd(p_hwfn, p_hwfn->p_main_ptt,
+-				 DRV_MSG_CODE_UNLOAD_REQ, wol_param,
+-				 &unload_resp, &unload_param);
+-		if (rc) {
+-			DP_NOTICE(p_hwfn, "qed_hw_reset: UNLOAD_REQ failed\n");
+-			unload_resp = FW_MSG_CODE_DRV_UNLOAD_ENGINE;
+-		}
+-
+-		rc = qed_mcp_cmd(p_hwfn, p_hwfn->p_main_ptt,
+-				 DRV_MSG_CODE_UNLOAD_DONE,
+-				 0, &unload_resp, &unload_param);
+-		if (rc) {
+-			DP_NOTICE(p_hwfn, "qed_hw_reset: UNLOAD_DONE failed\n");
+-			return rc;
+-		}
+-	}
+-
+-	return rc;
+-}
+-
+ /* Free hwfn memory and resources acquired in hw_hwfn_prepare */
+ static void qed_hw_hwfn_free(struct qed_hwfn *p_hwfn)
+ {
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+index 6812003411cd..e96eccff3a41 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+@@ -140,14 +140,6 @@ void qed_hw_stop_fastpath(struct qed_dev *cdev);
+  */
+ void qed_hw_start_fastpath(struct qed_hwfn *p_hwfn);
+ 
+-/**
+- * @brief qed_hw_reset -
+- *
+- * @param cdev
+- *
+- * @return int
+- */
+-int qed_hw_reset(struct qed_dev *cdev);
+ 
+ /**
+  * @brief qed_hw_prepare -
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_main.c b/drivers/net/ethernet/qlogic/qed/qed_main.c
+index bc7d22e77730..70f3dccdbcd8 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -589,6 +589,19 @@ int qed_slowpath_irq_req(struct qed_hwfn *hwfn)
+ 	return rc;
+ }
+ 
++void qed_slowpath_irq_sync(struct qed_hwfn *p_hwfn)
++{
++	struct qed_dev *cdev = p_hwfn->cdev;
++	u8 id = p_hwfn->my_id;
++	u32 int_mode;
++
++	int_mode = cdev->int_params.out.int_mode;
++	if (int_mode == QED_INT_MODE_MSIX)
++		synchronize_irq(cdev->int_params.msix_table[id].vector);
++	else
++		synchronize_irq(cdev->pdev->irq);
++}
++
+ static void qed_slowpath_irq_free(struct qed_dev *cdev)
+ {
+ 	int i;
+@@ -631,19 +644,6 @@ static int qed_nic_stop(struct qed_dev *cdev)
+ 	return rc;
+ }
+ 
+-static int qed_nic_reset(struct qed_dev *cdev)
+-{
+-	int rc;
+-
+-	rc = qed_hw_reset(cdev);
+-	if (rc)
+-		return rc;
+-
+-	qed_resc_free(cdev);
+-
+-	return 0;
+-}
+-
+ static int qed_nic_setup(struct qed_dev *cdev)
+ {
+ 	int rc, i;
+@@ -1029,7 +1029,8 @@ static int qed_slowpath_stop(struct qed_dev *cdev)
+ 	}
+ 
+ 	qed_disable_msix(cdev);
+-	qed_nic_reset(cdev);
++
++	qed_resc_free(cdev);
+ 
+ 	qed_iov_wq_stop(cdev, true);
+ 
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_mcp.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_mcp.h b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+index f2623df65ec2..ed5702475d6c 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -579,6 +579,26 @@ int qed_mcp_load_req(struct qed_hwfn *p_hwfn,
+ 		     struct qed_ptt *p_ptt,
+ 		     u32 *p_load_code);
+ 
++/**
++ * @brief Sends a UNLOAD_REQ message to the MFW
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ *
++ * @return int - 0 - Operation was successful.
++ */
++int qed_mcp_unload_req(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
++/**
++ * @brief Sends a UNLOAD_DONE message to the MFW
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ *
++ * @return int - 0 - Operation was successful.
++ */
++int qed_mcp_unload_done(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
+ /**
+  * @brief Read the MFW mailbox into Current buffer.
+  *
