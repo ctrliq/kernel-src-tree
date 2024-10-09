@@ -1,0 +1,644 @@
+scsi: be2iscsi: Fix to add timer for UE detection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fix to add timer for UE detection (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 93.48%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 10bcd47dff496206de68223aeb1a581bccad03d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/10bcd47d.failed
+
+UE detection in health check is done in a work scheduled in global wq.
+UE caused due to transient parity errors are recoverable and reported
+within 1s. If this check for TPE gets delayed, PF0 might initiate
+soft-reset and then status of UE recoverable is lost.
+
+Handle UE detection in timer routine. Move out EQ delay update work
+from health check. Make the IOCTL for EQ delay update non-blocking
+as the completion status is ignored.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 10bcd47dff496206de68223aeb1a581bccad03d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be.h
+#	drivers/scsi/be2iscsi/be_cmds.c
+#	drivers/scsi/be2iscsi/be_main.c
+#	drivers/scsi/be2iscsi/be_main.h
+diff --cc drivers/scsi/be2iscsi/be.h
+index b4770d3f9056,bb4042c9acfb..000000000000
+--- a/drivers/scsi/be2iscsi/be.h
++++ b/drivers/scsi/be2iscsi/be.h
+@@@ -111,8 -111,11 +111,16 @@@ struct be_mcc_obj 
+  
+  struct beiscsi_mcc_tag_state {
+  	unsigned long tag_state;
+++<<<<<<< HEAD
+ +#define MCC_TAG_STATE_RUNNING	1
+ +#define MCC_TAG_STATE_TIMEOUT	2
+++=======
++ #define MCC_TAG_STATE_RUNNING	0
++ #define MCC_TAG_STATE_TIMEOUT	1
++ #define MCC_TAG_STATE_ASYNC	2
++ #define MCC_TAG_STATE_IGNORE	3
++ 	void (*cbfn)(struct beiscsi_hba *, unsigned int);
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  	struct be_dma_mem tag_mem_state;
+  };
+  
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index 403296239ae9,7cb009e0030e..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -474,8 -503,25 +474,30 @@@ int beiscsi_process_mcc_compl(struct be
+  				     CQE_STATUS_ADDL_MASK;
+  	ctrl->mcc_tag_status[tag] |= (compl_status & CQE_STATUS_MASK);
+  
+++<<<<<<< HEAD
+ +	/* write ordering forced in wake_up_interruptible */
+ +	clear_bit(MCC_TAG_STATE_RUNNING, &ctrl->ptag_state[tag].tag_state);
+++=======
++ 	if (test_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state)) {
++ 		if (ctrl->ptag_state[tag].cbfn)
++ 			ctrl->ptag_state[tag].cbfn(phba, tag);
++ 		else
++ 			beiscsi_log(phba, KERN_ERR,
++ 				    BEISCSI_LOG_MBOX | BEISCSI_LOG_INIT |
++ 				    BEISCSI_LOG_CONFIG,
++ 				    "BC_%d : MBX ASYNC command with no callback\n");
++ 		free_mcc_wrb(ctrl, tag);
++ 		return 0;
++ 	}
++ 
++ 	if (test_bit(MCC_TAG_STATE_IGNORE, &ctrl->ptag_state[tag].tag_state)) {
++ 		/* just check completion status and free wrb */
++ 		__beiscsi_mcc_compl_status(phba, tag, NULL, NULL);
++ 		free_mcc_wrb(ctrl, tag);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  	wake_up_interruptible(&ctrl->mcc_wait[tag]);
+  	return 0;
+  }
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 8e3a0f9d2ac4,3dd4f9d126ae..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -5273,7 -4999,9 +5273,13 @@@ static void beiscsi_quiesce(struct beis
+  		if (phba->pcidev->irq)
+  			free_irq(phba->pcidev->irq, phba);
+  	pci_disable_msix(phba->pcidev);
+++<<<<<<< HEAD
+ +	cancel_delayed_work_sync(&phba->beiscsi_hw_check_task);
+++=======
++ 	cancel_delayed_work_sync(&phba->eqd_update);
++ 	cancel_work_sync(&phba->boot_work);
++ 	del_timer_sync(&phba->hw_check);
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  
+  	for (i = 0; i < phba->num_cpus; i++) {
+  		pbe_eq = &phwi_context->be_eq[i];
+@@@ -5334,18 -5065,310 +5340,317 @@@ static void beiscsi_msix_enable(struct 
+  	return;
+  }
+  
+++<<<<<<< HEAD
+ +static void be_eqd_update(struct beiscsi_hba *phba)
+++=======
++ void beiscsi_start_boot_work(struct beiscsi_hba *phba, unsigned int s_handle)
+  {
++ 	if (phba->boot_struct.boot_kset)
++ 		return;
++ 
++ 	/* skip if boot work is already in progress */
++ 	if (test_and_set_bit(BEISCSI_HBA_BOOT_WORK, &phba->state))
++ 		return;
++ 
++ 	phba->boot_struct.retry = 3;
++ 	phba->boot_struct.tag = 0;
++ 	phba->boot_struct.s_handle = s_handle;
++ 	phba->boot_struct.action = BEISCSI_BOOT_GET_SHANDLE;
++ 	schedule_work(&phba->boot_work);
++ }
++ 
++ static ssize_t beiscsi_show_boot_tgt_info(void *data, int type, char *buf)
++ {
++ 	struct beiscsi_hba *phba = data;
++ 	struct mgmt_session_info *boot_sess = &phba->boot_struct.boot_sess;
++ 	struct mgmt_conn_info *boot_conn = &boot_sess->conn_list[0];
++ 	char *str = buf;
++ 	int rc = -EPERM;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_TGT_NAME:
++ 		rc = sprintf(buf, "%.*s\n",
++ 			    (int)strlen(boot_sess->target_name),
++ 			    (char *)&boot_sess->target_name);
++ 		break;
++ 	case ISCSI_BOOT_TGT_IP_ADDR:
++ 		if (boot_conn->dest_ipaddr.ip_type == BEISCSI_IP_TYPE_V4)
++ 			rc = sprintf(buf, "%pI4\n",
++ 				(char *)&boot_conn->dest_ipaddr.addr);
++ 		else
++ 			rc = sprintf(str, "%pI6\n",
++ 				(char *)&boot_conn->dest_ipaddr.addr);
++ 		break;
++ 	case ISCSI_BOOT_TGT_PORT:
++ 		rc = sprintf(str, "%d\n", boot_conn->dest_port);
++ 		break;
++ 
++ 	case ISCSI_BOOT_TGT_CHAP_NAME:
++ 		rc = sprintf(str,  "%.*s\n",
++ 			     boot_conn->negotiated_login_options.auth_data.chap.
++ 			     target_chap_name_length,
++ 			     (char *)&boot_conn->negotiated_login_options.
++ 			     auth_data.chap.target_chap_name);
++ 		break;
++ 	case ISCSI_BOOT_TGT_CHAP_SECRET:
++ 		rc = sprintf(str,  "%.*s\n",
++ 			     boot_conn->negotiated_login_options.auth_data.chap.
++ 			     target_secret_length,
++ 			     (char *)&boot_conn->negotiated_login_options.
++ 			     auth_data.chap.target_secret);
++ 		break;
++ 	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
++ 		rc = sprintf(str,  "%.*s\n",
++ 			     boot_conn->negotiated_login_options.auth_data.chap.
++ 			     intr_chap_name_length,
++ 			     (char *)&boot_conn->negotiated_login_options.
++ 			     auth_data.chap.intr_chap_name);
++ 		break;
++ 	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
++ 		rc = sprintf(str,  "%.*s\n",
++ 			     boot_conn->negotiated_login_options.auth_data.chap.
++ 			     intr_secret_length,
++ 			     (char *)&boot_conn->negotiated_login_options.
++ 			     auth_data.chap.intr_secret);
++ 		break;
++ 	case ISCSI_BOOT_TGT_FLAGS:
++ 		rc = sprintf(str, "2\n");
++ 		break;
++ 	case ISCSI_BOOT_TGT_NIC_ASSOC:
++ 		rc = sprintf(str, "0\n");
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ static ssize_t beiscsi_show_boot_ini_info(void *data, int type, char *buf)
++ {
++ 	struct beiscsi_hba *phba = data;
++ 	char *str = buf;
++ 	int rc = -EPERM;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_INI_INITIATOR_NAME:
++ 		rc = sprintf(str, "%s\n",
++ 			     phba->boot_struct.boot_sess.initiator_iscsiname);
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ static ssize_t beiscsi_show_boot_eth_info(void *data, int type, char *buf)
++ {
++ 	struct beiscsi_hba *phba = data;
++ 	char *str = buf;
++ 	int rc = -EPERM;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_ETH_FLAGS:
++ 		rc = sprintf(str, "2\n");
++ 		break;
++ 	case ISCSI_BOOT_ETH_INDEX:
++ 		rc = sprintf(str, "0\n");
++ 		break;
++ 	case ISCSI_BOOT_ETH_MAC:
++ 		rc  = beiscsi_get_macaddr(str, phba);
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ 
++ static umode_t beiscsi_tgt_get_attr_visibility(void *data, int type)
++ {
++ 	umode_t rc = 0;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_TGT_NAME:
++ 	case ISCSI_BOOT_TGT_IP_ADDR:
++ 	case ISCSI_BOOT_TGT_PORT:
++ 	case ISCSI_BOOT_TGT_CHAP_NAME:
++ 	case ISCSI_BOOT_TGT_CHAP_SECRET:
++ 	case ISCSI_BOOT_TGT_REV_CHAP_NAME:
++ 	case ISCSI_BOOT_TGT_REV_CHAP_SECRET:
++ 	case ISCSI_BOOT_TGT_NIC_ASSOC:
++ 	case ISCSI_BOOT_TGT_FLAGS:
++ 		rc = S_IRUGO;
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ static umode_t beiscsi_ini_get_attr_visibility(void *data, int type)
++ {
++ 	umode_t rc = 0;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_INI_INITIATOR_NAME:
++ 		rc = S_IRUGO;
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ 
++ static umode_t beiscsi_eth_get_attr_visibility(void *data, int type)
++ {
++ 	umode_t rc = 0;
++ 
++ 	switch (type) {
++ 	case ISCSI_BOOT_ETH_FLAGS:
++ 	case ISCSI_BOOT_ETH_MAC:
++ 	case ISCSI_BOOT_ETH_INDEX:
++ 		rc = S_IRUGO;
++ 		break;
++ 	}
++ 	return rc;
++ }
++ 
++ static void beiscsi_boot_kobj_release(void *data)
++ {
++ 	struct beiscsi_hba *phba = data;
++ 
++ 	scsi_host_put(phba->shost);
++ }
++ 
++ static int beiscsi_boot_create_kset(struct beiscsi_hba *phba)
++ {
++ 	struct boot_struct *bs = &phba->boot_struct;
++ 	struct iscsi_boot_kobj *boot_kobj;
++ 
++ 	if (bs->boot_kset) {
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			      "BM_%d: boot_kset already created\n");
++ 		return 0;
++ 	}
++ 
++ 	bs->boot_kset = iscsi_boot_create_host_kset(phba->shost->host_no);
++ 	if (!bs->boot_kset) {
++ 		__beiscsi_log(phba, KERN_ERR,
++ 			      "BM_%d: boot_kset alloc failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* get shost ref because the show function will refer phba */
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 
++ 	boot_kobj = iscsi_boot_create_target(bs->boot_kset, 0, phba,
++ 					     beiscsi_show_boot_tgt_info,
++ 					     beiscsi_tgt_get_attr_visibility,
++ 					     beiscsi_boot_kobj_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 
++ 	boot_kobj = iscsi_boot_create_initiator(bs->boot_kset, 0, phba,
++ 						beiscsi_show_boot_ini_info,
++ 						beiscsi_ini_get_attr_visibility,
++ 						beiscsi_boot_kobj_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 
++ 	if (!scsi_host_get(phba->shost))
++ 		goto free_kset;
++ 
++ 	boot_kobj = iscsi_boot_create_ethernet(bs->boot_kset, 0, phba,
++ 					       beiscsi_show_boot_eth_info,
++ 					       beiscsi_eth_get_attr_visibility,
++ 					       beiscsi_boot_kobj_release);
++ 	if (!boot_kobj)
++ 		goto put_shost;
++ 
++ 	return 0;
++ 
++ put_shost:
++ 	scsi_host_put(phba->shost);
++ free_kset:
++ 	iscsi_boot_destroy_kset(bs->boot_kset);
++ 	bs->boot_kset = NULL;
++ 	return -ENOMEM;
++ }
++ 
++ static void beiscsi_boot_work(struct work_struct *work)
++ {
++ 	struct beiscsi_hba *phba =
++ 		container_of(work, struct beiscsi_hba, boot_work);
++ 	struct boot_struct *bs = &phba->boot_struct;
++ 	unsigned int tag = 0;
++ 
++ 	if (beiscsi_hba_in_error(phba))
++ 		return;
++ 
++ 	beiscsi_log(phba, KERN_INFO,
++ 		    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
++ 		    "BM_%d : %s action %d\n",
++ 		    __func__, phba->boot_struct.action);
++ 
++ 	switch (phba->boot_struct.action) {
++ 	case BEISCSI_BOOT_REOPEN_SESS:
++ 		tag = beiscsi_boot_reopen_sess(phba);
++ 		break;
++ 	case BEISCSI_BOOT_GET_SHANDLE:
++ 		tag = __beiscsi_boot_get_shandle(phba, 1);
++ 		break;
++ 	case BEISCSI_BOOT_GET_SINFO:
++ 		tag = beiscsi_boot_get_sinfo(phba);
++ 		break;
++ 	case BEISCSI_BOOT_LOGOUT_SESS:
++ 		tag = beiscsi_boot_logout_sess(phba);
++ 		break;
++ 	case BEISCSI_BOOT_CREATE_KSET:
++ 		beiscsi_boot_create_kset(phba);
++ 		/**
++ 		 * updated boot_kset is made visible to all before
++ 		 * ending the boot work.
++ 		 */
++ 		mb();
++ 		clear_bit(BEISCSI_HBA_BOOT_WORK, &phba->state);
++ 		return;
++ 	}
++ 	if (!tag) {
++ 		if (bs->retry--)
++ 			schedule_work(&phba->boot_work);
++ 		else
++ 			clear_bit(BEISCSI_HBA_BOOT_WORK, &phba->state);
++ 	}
++ }
++ 
++ static void beiscsi_hw_health_check(unsigned long ptr)
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
++ {
++ 	struct beiscsi_hba *phba;
++ 
+++<<<<<<< HEAD
+++=======
++ 	phba = (struct beiscsi_hba *)ptr;
++ 	beiscsi_ue_detect(phba);
++ 	if (test_bit(BEISCSI_HBA_IN_UE, &phba->state))
++ 		return;
++ 
++ 	mod_timer(&phba->hw_check,
++ 		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
++ }
++ 
++ static void beiscsi_eqd_update_work(struct work_struct *work)
++ {
++ 	struct hwi_context_memory *phwi_context;
+  	struct be_set_eqd set_eqd[MAX_CPUS];
+- 	struct be_aic_obj *aic;
+- 	struct be_eq_obj *pbe_eq;
+  	struct hwi_controller *phwi_ctrlr;
+- 	struct hwi_context_memory *phwi_context;
++ 	struct be_eq_obj *pbe_eq;
++ 	struct beiscsi_hba *phba;
++ 	unsigned int pps, delta;
++ 	struct be_aic_obj *aic;
+  	int eqd, i, num = 0;
+- 	ulong now;
+- 	u32 pps, delta;
+- 	unsigned int tag;
++ 	unsigned long now;
+  
++ 	phba = container_of(work, struct beiscsi_hba, eqd_update.work);
++ 	if (beiscsi_hba_in_error(phba))
++ 		return;
++ 
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  	phwi_ctrlr = phba->phwi_ctrlr;
+  	phwi_context = phwi_ctrlr->phwi_ctxt;
+  
+@@@ -5378,51 -5401,12 +5683,53 @@@
+  			num++;
+  		}
+  	}
+- 	if (num) {
+- 		tag = be_cmd_modify_eq_delay(phba, set_eqd, num);
+- 		if (tag)
+- 			beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+- 	}
+- }
++ 	if (num)
++ 		/* completion of this is ignored */
++ 		beiscsi_modify_eq_delay(phba, set_eqd, num);
+  
+++<<<<<<< HEAD
+ +static void be_check_boot_session(struct beiscsi_hba *phba)
+ +{
+ +	if (beiscsi_setup_boot_info(phba))
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+ +			    "BM_%d : Could not set up "
+ +			    "iSCSI boot info on async event.\n");
+ +}
+ +
+ +/*
+ + * beiscsi_hw_health_check()- Check adapter health
+ + * @work: work item to check HW health
+ + *
+ + * Check if adapter in an unrecoverable state or not.
+ + **/
+ +static void
+ +beiscsi_hw_health_check(struct work_struct *work)
+ +{
+ +	struct beiscsi_hba *phba =
+ +		container_of(work, struct beiscsi_hba,
+ +			     beiscsi_hw_check_task.work);
+ +
+ +	be_eqd_update(phba);
+ +
+ +	if (phba->state & BE_ADAPTER_CHECK_BOOT) {
+ +		if ((phba->get_boot > 0) && (!phba->boot_kset)) {
+ +			phba->get_boot--;
+ +			if (!(phba->get_boot % BE_GET_BOOT_TO))
+ +				be_check_boot_session(phba);
+ +		} else {
+ +			phba->state &= ~BE_ADAPTER_CHECK_BOOT;
+ +			phba->get_boot = 0;
+ +		}
+ +	}
+ +
+ +	beiscsi_ue_detect(phba);
+ +
+ +	schedule_delayed_work(&phba->beiscsi_hw_check_task,
+ +			      msecs_to_jiffies(1000));
+++=======
++ 	schedule_delayed_work(&phba->eqd_update,
++ 			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  }
+  
+  
+@@@ -5569,8 -5553,13 +5876,13 @@@ static void beiscsi_eeh_resume(struct p
+  	}
+  
+  	hwi_enable_intr(phba);
+ -	clear_bit(BEISCSI_HBA_PCI_ERR, &phba->state);
+ +	phba->state &= ~BE_ADAPTER_PCI_ERR;
+  
++ 	/* start hw_check timer and eqd_update work */
++ 	schedule_delayed_work(&phba->eqd_update,
++ 			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
++ 	mod_timer(&phba->hw_check,
++ 		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
+  	return;
+  ret_err:
+  	beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+@@@ -5748,18 -5735,30 +6059,27 @@@ static int beiscsi_dev_probe(struct pci
+  	if (iscsi_host_add(phba->shost, &phba->pcidev->dev))
+  		goto free_blkenbld;
+  
+ -	INIT_WORK(&phba->boot_work, beiscsi_boot_work);
+ -	ret = beiscsi_boot_get_shandle(phba, &s_handle);
+ -	if (ret > 0) {
+ -		beiscsi_start_boot_work(phba, s_handle);
+ -		/**
+ -		 * Set this bit after starting the work to let
+ -		 * probe handle it first.
+ -		 * ASYNC event can too schedule this work.
+ +	if (beiscsi_setup_boot_info(phba))
+ +		/*
+ +		 * log error but continue, because we may not be using
+ +		 * iscsi boot.
+  		 */
+ -		set_bit(BEISCSI_HBA_BOOT_FOUND, &phba->state);
+ -	}
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_INIT,
+ +			    "BM_%d : Could not set up "
+ +			    "iSCSI boot info.\n");
+  
+  	beiscsi_iface_create_default(phba);
+- 	schedule_delayed_work(&phba->beiscsi_hw_check_task,
+- 			      msecs_to_jiffies(1000));
++ 	schedule_delayed_work(&phba->eqd_update,
++ 			      msecs_to_jiffies(BEISCSI_EQD_UPDATE_INTERVAL));
++ 	/**
++ 	 * Start UE detection here. UE before this will cause stall in probe
++ 	 * and eventually fail the probe.
++ 	 */
++ 	init_timer(&phba->hw_check);
++ 	phba->hw_check.function = beiscsi_hw_health_check;
++ 	phba->hw_check.data = (unsigned long)phba;
++ 	mod_timer(&phba->hw_check,
++ 		  jiffies + msecs_to_jiffies(BEISCSI_UE_DETECT_INTERVAL));
+  
+  	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_INIT,
+  		    "\n\n\n BM_%d : SUCCESS - DRIVER LOADED\n\n\n");
+diff --cc drivers/scsi/be2iscsi/be_main.h
+index 90cdc10c01fb,0d34ac611d2f..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@@ -417,12 -400,26 +417,21 @@@ struct beiscsi_hba 
+  		unsigned long ulp_supported;
+  	} fw_config;
+  
+ -	unsigned long state;
+ -#define BEISCSI_HBA_RUNNING	0
+ -#define BEISCSI_HBA_LINK_UP	1
+ -#define BEISCSI_HBA_BOOT_FOUND	2
+ -#define BEISCSI_HBA_BOOT_WORK	3
+ -#define BEISCSI_HBA_PCI_ERR	4
+ -#define BEISCSI_HBA_FW_TIMEOUT	5
+ -#define BEISCSI_HBA_IN_UE	6
+ -/* error bits */
+ -#define BEISCSI_HBA_IN_ERR	((1 << BEISCSI_HBA_PCI_ERR) | \
+ -				 (1 << BEISCSI_HBA_FW_TIMEOUT) | \
+ -				 (1 << BEISCSI_HBA_IN_UE))
+ -
+ +	unsigned int state;
+  	u8 optic_state;
+++<<<<<<< HEAD
+ +	int get_boot;
+ +	bool fw_timeout;
+ +	bool ue_detected;
+ +	struct delayed_work beiscsi_hw_check_task;
+++=======
++ 	struct delayed_work eqd_update;
++ 	/* update EQ delay timer every 1000ms */
++ #define BEISCSI_EQD_UPDATE_INTERVAL	1000
++ 	struct timer_list hw_check;
++ 	/* check for UE every 1000ms */
++ #define BEISCSI_UE_DETECT_INTERVAL	1000
+++>>>>>>> 10bcd47dff49 (scsi: be2iscsi: Fix to add timer for UE detection)
+  
+  	bool mac_addr_set;
+  	u8 mac_address[ETH_ALEN];
+* Unmerged path drivers/scsi/be2iscsi/be.h
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index c50b74afd00a..f7ebd1d1cf31 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -738,7 +738,7 @@ unsigned int be_cmd_get_initname(struct beiscsi_hba *phba);
+ 
+ void free_mcc_wrb(struct be_ctrl_info *ctrl, unsigned int tag);
+ 
+-int be_cmd_modify_eq_delay(struct beiscsi_hba *phba, struct be_set_eqd *,
++int beiscsi_modify_eq_delay(struct beiscsi_hba *phba, struct be_set_eqd *,
+ 			    int num);
+ int beiscsi_mccq_compl_wait(struct beiscsi_hba *phba,
+ 			    uint32_t tag, struct be_mcc_wrb **wrb,
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+* Unmerged path drivers/scsi/be2iscsi/be_main.h
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index fa17b8e5a47c..6f2df0291eac 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -97,7 +97,7 @@ static const char * const desc_ue_status_hi[] = {
+ };
+ 
+ /*
+- * beiscsi_ue_detec()- Detect Unrecoverable Error on adapter
++ * beiscsi_ue_detect()- Detect Unrecoverable Error on adapter
+  * @phba: Driver priv structure
+  *
+  * Read registers linked to UE and check for the UE status
+@@ -155,8 +155,9 @@ void beiscsi_ue_detect(struct beiscsi_hba *phba)
+ 	}
+ }
+ 
+-int be_cmd_modify_eq_delay(struct beiscsi_hba *phba,
+-		 struct be_set_eqd *set_eqd, int num)
++int beiscsi_modify_eq_delay(struct beiscsi_hba *phba,
++			    struct be_set_eqd *set_eqd,
++			    int num)
+ {
+ 	struct be_ctrl_info *ctrl = &phba->ctrl;
+ 	struct be_mcc_wrb *wrb;
+@@ -174,7 +175,7 @@ int be_cmd_modify_eq_delay(struct beiscsi_hba *phba,
+ 	req = embedded_payload(wrb);
+ 	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0);
+ 	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
+-		OPCODE_COMMON_MODIFY_EQ_DELAY, sizeof(*req));
++			   OPCODE_COMMON_MODIFY_EQ_DELAY, sizeof(*req));
+ 
+ 	req->num_eq = cpu_to_le32(num);
+ 	for (i = 0; i < num; i++) {
+@@ -184,6 +185,8 @@ int be_cmd_modify_eq_delay(struct beiscsi_hba *phba,
+ 				cpu_to_le32(set_eqd[i].delay_multiplier);
+ 	}
+ 
++	/* ignore the completion of this mbox command */
++	set_bit(MCC_TAG_STATE_IGNORE, &ctrl->ptag_state[tag].tag_state);
+ 	be_mcc_notify(phba, tag);
+ 	mutex_unlock(&ctrl->mbox_lock);
+ 	return tag;
