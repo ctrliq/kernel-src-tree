@@ -1,0 +1,163 @@
+Support to encoding decoding skb prio on IFE action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jamal Hadi Salim <jhs@mojatatu.com>
+commit 200e10f46936d95a553414f249cefb765194b235
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/200e10f4.failed
+
+    Example usage:
+    Set the skb priority using skbedit then allow it to be encoded
+
+    sudo tc qdisc add dev $ETH root handle 1: prio
+    sudo tc filter add dev $ETH parent 1: protocol ip prio 10 \
+    u32 match ip protocol 1 0xff flowid 1:2 \
+    action skbedit prio 17 \
+    action ife encode \
+    allow prio \
+    dst 02:15:15:15:15:15
+
+    Note: You dont need the skbedit action if you are already encoding the
+    skb priority earlier. A zero skb priority will not be sent
+
+    Alternative hard code static priority of decimal 33 (unlike skbedit)
+    then mark of 0x12 every time the filter matches
+
+    sudo $TC filter add dev $ETH parent 1: protocol ip prio 10 \
+    u32 match ip protocol 1 0xff flowid 1:2 \
+    action ife encode \
+    type 0xDEAD \
+    use prio 33 \
+    use mark 0x12 \
+    dst 02:15:15:15:15:15
+
+    Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 200e10f46936d95a553414f249cefb765194b235)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/Makefile
+diff --cc net/sched/Makefile
+index bde3e9082f42,84bddb373517..000000000000
+--- a/net/sched/Makefile
++++ b/net/sched/Makefile
+@@@ -17,7 -17,11 +17,15 @@@ obj-$(CONFIG_NET_ACT_SIMP)	+= act_simpl
+  obj-$(CONFIG_NET_ACT_SKBEDIT)	+= act_skbedit.o
+  obj-$(CONFIG_NET_ACT_CSUM)	+= act_csum.o
+  obj-$(CONFIG_NET_ACT_VLAN)	+= act_vlan.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_NET_ACT_TUNNEL_KEY)+= act_tunnel_key.o
+++=======
++ obj-$(CONFIG_NET_ACT_BPF)	+= act_bpf.o
++ obj-$(CONFIG_NET_ACT_CONNMARK)	+= act_connmark.o
++ obj-$(CONFIG_NET_ACT_IFE)	+= act_ife.o
++ obj-$(CONFIG_NET_IFE_SKBMARK)	+= act_meta_mark.o
++ obj-$(CONFIG_NET_IFE_SKBPRIO)	+= act_meta_skbprio.o
+++>>>>>>> 200e10f46936 (Support to encoding decoding skb prio on IFE action)
+  obj-$(CONFIG_NET_SCH_FIFO)	+= sch_fifo.o
+  obj-$(CONFIG_NET_SCH_CBQ)	+= sch_cbq.o
+  obj-$(CONFIG_NET_SCH_HTB)	+= sch_htb.o
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index 18f24078aae0..cb98c654a3d6 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -729,6 +729,11 @@ config NET_ACT_TUNNEL_KEY
+ 	  To compile this code as a module, choose M here: the
+ 	  module will be called act_tunnel_key.
+ 
++config NET_IFE_SKBPRIO
++        tristate "Support to encoding decoding skb prio on IFE action"
++        depends on NET_ACT_IFE
++        ---help---
++
+ config NET_CLS_IND
+ 	bool "Incoming device classification"
+ 	depends on NET_CLS_U32 || NET_CLS_FW
+* Unmerged path net/sched/Makefile
+diff --git a/net/sched/act_meta_skbprio.c b/net/sched/act_meta_skbprio.c
+new file mode 100644
+index 000000000000..26bf4d86030b
+--- /dev/null
++++ b/net/sched/act_meta_skbprio.c
+@@ -0,0 +1,76 @@
++/*
++ * net/sched/act_meta_prio.c IFE skb->priority metadata module
++ *
++ *		This program is free software; you can redistribute it and/or
++ *		modify it under the terms of the GNU General Public License
++ *		as published by the Free Software Foundation; either version
++ *		2 of the License, or (at your option) any later version.
++ *
++ * copyright Jamal Hadi Salim (2015)
++ *
++*/
++
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/skbuff.h>
++#include <linux/rtnetlink.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <net/netlink.h>
++#include <net/pkt_sched.h>
++#include <uapi/linux/tc_act/tc_ife.h>
++#include <net/tc_act/tc_ife.h>
++
++static int skbprio_check(struct sk_buff *skb, struct tcf_meta_info *e)
++{
++	return ife_check_meta_u32(skb->priority, e);
++}
++
++static int skbprio_encode(struct sk_buff *skb, void *skbdata,
++			  struct tcf_meta_info *e)
++{
++	u32 ifeprio = skb->priority; /* avoid having to cast skb->priority*/
++
++	return ife_encode_meta_u32(ifeprio, skbdata, e);
++}
++
++static int skbprio_decode(struct sk_buff *skb, void *data, u16 len)
++{
++	u32 ifeprio = *(u32 *)data;
++
++	skb->priority = ntohl(ifeprio);
++	return 0;
++}
++
++static struct tcf_meta_ops ife_prio_ops = {
++	.metaid = IFE_META_PRIO,
++	.metatype = NLA_U32,
++	.name = "skbprio",
++	.synopsis = "skb prio metadata",
++	.check_presence = skbprio_check,
++	.encode = skbprio_encode,
++	.decode = skbprio_decode,
++	.get = ife_get_meta_u32,
++	.alloc = ife_alloc_meta_u32,
++	.owner = THIS_MODULE,
++};
++
++static int __init ifeprio_init_module(void)
++{
++	return register_ife_op(&ife_prio_ops);
++}
++
++static void __exit ifeprio_cleanup_module(void)
++{
++	unregister_ife_op(&ife_prio_ops);
++}
++
++module_init(ifeprio_init_module);
++module_exit(ifeprio_cleanup_module);
++
++MODULE_AUTHOR("Jamal Hadi Salim(2015)");
++MODULE_DESCRIPTION("Inter-FE skb prio metadata action");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_IFE_META(IFE_META_PRIO);
