@@ -1,0 +1,246 @@
+powerpc/lib/feature-fixups: use raw_patch_instruction()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] lib/feature-fixups: use raw_patch_instruction() (Desnes Augusto Nunes do Rosario) [1637841]
+Rebuild_FUZZ: 92.16%
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit 8183d99f4a22c2abbc543847a588df3666ef0c0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8183d99f.failed
+
+feature fixups need to use patch_instruction() early in the boot,
+even before the code is relocated to its final address, requiring
+patch_instruction() to use PTRRELOC() in order to address data.
+
+But feature fixups applies on code before it is set to read only,
+even for modules. Therefore, feature fixups can use
+raw_patch_instruction() instead.
+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8183d99f4a22c2abbc543847a588df3666ef0c0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/lib/code-patching.c
+diff --cc arch/powerpc/lib/code-patching.c
+index 74b351ac15dc,e0d881ab304e..000000000000
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@@ -27,6 -38,158 +27,161 @@@ int patch_instruction(unsigned int *add
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int raw_patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	return __patch_instruction(addr, instr, addr);
++ }
++ 
++ #ifdef CONFIG_STRICT_KERNEL_RWX
++ static DEFINE_PER_CPU(struct vm_struct *, text_poke_area);
++ 
++ static int text_area_cpu_up(unsigned int cpu)
++ {
++ 	struct vm_struct *area;
++ 
++ 	area = get_vm_area(PAGE_SIZE, VM_ALLOC);
++ 	if (!area) {
++ 		WARN_ONCE(1, "Failed to create text area for cpu %d\n",
++ 			cpu);
++ 		return -1;
++ 	}
++ 	this_cpu_write(text_poke_area, area);
++ 
++ 	return 0;
++ }
++ 
++ static int text_area_cpu_down(unsigned int cpu)
++ {
++ 	free_vm_area(this_cpu_read(text_poke_area));
++ 	return 0;
++ }
++ 
++ /*
++  * Run as a late init call. This allows all the boot time patching to be done
++  * simply by patching the code, and then we're called here prior to
++  * mark_rodata_ro(), which happens after all init calls are run. Although
++  * BUG_ON() is rude, in this case it should only happen if ENOMEM, and we judge
++  * it as being preferable to a kernel that will crash later when someone tries
++  * to use patch_instruction().
++  */
++ static int __init setup_text_poke_area(void)
++ {
++ 	BUG_ON(!cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
++ 		"powerpc/text_poke:online", text_area_cpu_up,
++ 		text_area_cpu_down));
++ 
++ 	return 0;
++ }
++ late_initcall(setup_text_poke_area);
++ 
++ /*
++  * This can be called for kernel text or a module.
++  */
++ static int map_patch_area(void *addr, unsigned long text_poke_addr)
++ {
++ 	unsigned long pfn;
++ 	int err;
++ 
++ 	if (is_vmalloc_addr(addr))
++ 		pfn = vmalloc_to_pfn(addr);
++ 	else
++ 		pfn = __pa_symbol(addr) >> PAGE_SHIFT;
++ 
++ 	err = map_kernel_page(text_poke_addr, (pfn << PAGE_SHIFT),
++ 				pgprot_val(PAGE_KERNEL));
++ 
++ 	pr_devel("Mapped addr %lx with pfn %lx:%d\n", text_poke_addr, pfn, err);
++ 	if (err)
++ 		return -1;
++ 
++ 	return 0;
++ }
++ 
++ static inline int unmap_patch_area(unsigned long addr)
++ {
++ 	pte_t *ptep;
++ 	pmd_t *pmdp;
++ 	pud_t *pudp;
++ 	pgd_t *pgdp;
++ 
++ 	pgdp = pgd_offset_k(addr);
++ 	if (unlikely(!pgdp))
++ 		return -EINVAL;
++ 
++ 	pudp = pud_offset(pgdp, addr);
++ 	if (unlikely(!pudp))
++ 		return -EINVAL;
++ 
++ 	pmdp = pmd_offset(pudp, addr);
++ 	if (unlikely(!pmdp))
++ 		return -EINVAL;
++ 
++ 	ptep = pte_offset_kernel(pmdp, addr);
++ 	if (unlikely(!ptep))
++ 		return -EINVAL;
++ 
++ 	pr_devel("clearing mm %p, pte %p, addr %lx\n", &init_mm, ptep, addr);
++ 
++ 	/*
++ 	 * In hash, pte_clear flushes the tlb, in radix, we have to
++ 	 */
++ 	pte_clear(&init_mm, addr, ptep);
++ 	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++ 
++ 	return 0;
++ }
++ 
++ int patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	int err;
++ 	unsigned int *patch_addr = NULL;
++ 	unsigned long flags;
++ 	unsigned long text_poke_addr;
++ 	unsigned long kaddr = (unsigned long)addr;
++ 
++ 	/*
++ 	 * During early early boot patch_instruction is called
++ 	 * when text_poke_area is not ready, but we still need
++ 	 * to allow patching. We just do the plain old patching
++ 	 */
++ 	if (!this_cpu_read(text_poke_area))
++ 		return raw_patch_instruction(addr, instr);
++ 
++ 	local_irq_save(flags);
++ 
++ 	text_poke_addr = (unsigned long)__this_cpu_read(text_poke_area)->addr;
++ 	if (map_patch_area(addr, text_poke_addr)) {
++ 		err = -1;
++ 		goto out;
++ 	}
++ 
++ 	patch_addr = (unsigned int *)(text_poke_addr) +
++ 			((kaddr & ~PAGE_MASK) / sizeof(unsigned int));
++ 
++ 	__patch_instruction(addr, instr, patch_addr);
++ 
++ 	err = unmap_patch_area(text_poke_addr);
++ 	if (err)
++ 		pr_warn("failed to unmap %lx\n", text_poke_addr);
++ 
++ out:
++ 	local_irq_restore(flags);
++ 
++ 	return err;
++ }
++ #else /* !CONFIG_STRICT_KERNEL_RWX */
++ 
++ int patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	return raw_patch_instruction(addr, instr);
++ }
++ 
++ #endif /* CONFIG_STRICT_KERNEL_RWX */
++ NOKPROBE_SYMBOL(patch_instruction);
++ 
+++>>>>>>> 8183d99f4a22 (powerpc/lib/feature-fixups: use raw_patch_instruction())
+  int patch_branch(unsigned int *addr, unsigned long target, int flags)
+  {
+  	return patch_instruction(addr, create_branch(addr, target, flags));
+diff --git a/arch/powerpc/include/asm/code-patching.h b/arch/powerpc/include/asm/code-patching.h
+index e41ded25995b..1c4dd9100ff8 100644
+--- a/arch/powerpc/include/asm/code-patching.h
++++ b/arch/powerpc/include/asm/code-patching.h
+@@ -28,6 +28,7 @@ unsigned int create_cond_branch(const unsigned int *addr,
+ 				unsigned long target, int flags);
+ int patch_branch(unsigned int *addr, unsigned long target, int flags);
+ int patch_instruction(unsigned int *addr, unsigned int instr);
++int raw_patch_instruction(unsigned int *addr, unsigned int instr);
+ 
+ int instr_is_relative_branch(unsigned int instr);
+ int instr_is_relative_link_branch(unsigned int instr);
+* Unmerged path arch/powerpc/lib/code-patching.c
+diff --git a/arch/powerpc/lib/feature-fixups.c b/arch/powerpc/lib/feature-fixups.c
+index bf84e37263b5..bd8e7d92a127 100644
+--- a/arch/powerpc/lib/feature-fixups.c
++++ b/arch/powerpc/lib/feature-fixups.c
+@@ -61,7 +61,7 @@ static int patch_alt_instruction(unsigned int *src, unsigned int *dest,
+ 		}
+ 	}
+ 
+-	patch_instruction(dest, instr);
++	raw_patch_instruction(dest, instr);
+ 
+ 	return 0;
+ }
+@@ -90,7 +90,7 @@ static int patch_feature_section(unsigned long value, struct fixup_entry *fcur)
+ 	}
+ 
+ 	for (; dest < end; dest++)
+-		patch_instruction(dest, PPC_INST_NOP);
++		raw_patch_instruction(dest, PPC_INST_NOP);
+ 
+ 	return 0;
+ }
+@@ -290,7 +290,7 @@ void do_lwsync_fixups(unsigned long value, void *fixup_start, void *fixup_end)
+ 
+ 	for (; start < end; start++) {
+ 		dest = (void *)start + *start;
+-		patch_instruction(dest, PPC_INST_LWSYNC);
++		raw_patch_instruction(dest, PPC_INST_LWSYNC);
+ 	}
+ }
+ 
+@@ -308,7 +308,7 @@ void do_final_fixups(void)
+ 	length = (__end_interrupts - _stext) / sizeof(int);
+ 
+ 	while (length--) {
+-		patch_instruction(dest, *src);
++		raw_patch_instruction(dest, *src);
+ 		src++;
+ 		dest++;
+ 	}
