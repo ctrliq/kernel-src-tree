@@ -1,0 +1,186 @@
+ipv6: generation of stable privacy addresses for link-local and autoconf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 622c81d57b392cc9be836670eb464a4dfaa9adfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/622c81d5.failed
+
+This patch implements the stable privacy address generation for
+link-local and autoconf addresses as specified in RFC7217.
+
+  RID = F(Prefix, Net_Iface, Network_ID, DAD_Counter, secret_key)
+
+is the RID (random identifier). As the hash function F we chose one
+round of sha1. Prefix will be either the link-local prefix or the
+router advertised one. As Net_Iface we use the MAC address of the
+device. DAD_Counter and secret_key are implemented as specified.
+
+We don't use Network_ID, as it couples the code too closely to other
+subsystems. It is specified as optional in the RFC.
+
+As Net_Iface we only use the MAC address: we simply have no stable
+identifier in the kernel we could possibly use: because this code might
+run very early, we cannot depend on names, as they might be changed by
+user space early on during the boot process.
+
+A new address generation mode is introduced,
+IN6_ADDR_GEN_MODE_STABLE_PRIVACY. With iproute2 one can switch back to
+none or eui64 address configuration mode although the stable_secret is
+already set.
+
+We refuse writes to ipv6/conf/all/stable_secret but only allow
+ipv6/conf/default/stable_secret and the interface specific file to be
+written to. The default stable_secret is used as the parameter for the
+namespace, the interface specific can overwrite the secret, e.g. when
+switching a network configuration from one system to another while
+inheriting the secret.
+
+	Cc: Erik Kline <ek@google.com>
+	Cc: Fernando Gont <fgont@si6networks.com>
+	Cc: Lorenzo Colitti <lorenzo@google.com>
+	Cc: YOSHIFUJI Hideaki/吉藤英明 <hideaki.yoshifuji@miraclelinux.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 622c81d57b392cc9be836670eb464a4dfaa9adfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index cc12901dc798,6813268ce8b8..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -4954,6 -5147,114 +5055,117 @@@ int addrconf_sysctl_disable(struct ctl_
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static
++ int addrconf_sysctl_proxy_ndp(struct ctl_table *ctl, int write,
++ 			      void __user *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int *valp = ctl->data;
++ 	int ret;
++ 	int old, new;
++ 
++ 	old = *valp;
++ 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
++ 	new = *valp;
++ 
++ 	if (write && old != new) {
++ 		struct net *net = ctl->extra2;
++ 
++ 		if (!rtnl_trylock())
++ 			return restart_syscall();
++ 
++ 		if (valp == &net->ipv6.devconf_dflt->proxy_ndp)
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     NETCONFA_IFINDEX_DEFAULT,
++ 						     net->ipv6.devconf_dflt);
++ 		else if (valp == &net->ipv6.devconf_all->proxy_ndp)
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     NETCONFA_IFINDEX_ALL,
++ 						     net->ipv6.devconf_all);
++ 		else {
++ 			struct inet6_dev *idev = ctl->extra1;
++ 
++ 			inet6_netconf_notify_devconf(net, NETCONFA_PROXY_NEIGH,
++ 						     idev->dev->ifindex,
++ 						     &idev->cnf);
++ 		}
++ 		rtnl_unlock();
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int addrconf_sysctl_stable_secret(struct ctl_table *ctl, int write,
++ 					 void __user *buffer, size_t *lenp,
++ 					 loff_t *ppos)
++ {
++ 	int err;
++ 	struct in6_addr addr;
++ 	char str[IPV6_MAX_STRLEN];
++ 	struct ctl_table lctl = *ctl;
++ 	struct net *net = ctl->extra2;
++ 	struct ipv6_stable_secret *secret = ctl->data;
++ 
++ 	if (&net->ipv6.devconf_all->stable_secret == ctl->data)
++ 		return -EIO;
++ 
++ 	lctl.maxlen = IPV6_MAX_STRLEN;
++ 	lctl.data = str;
++ 
++ 	if (!rtnl_trylock())
++ 		return restart_syscall();
++ 
++ 	if (!write && !secret->initialized) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	if (!write) {
++ 		err = snprintf(str, sizeof(str), "%pI6",
++ 			       &secret->secret);
++ 		if (err >= sizeof(str)) {
++ 			err = -EIO;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	err = proc_dostring(&lctl, write, buffer, lenp, ppos);
++ 	if (err || !write)
++ 		goto out;
++ 
++ 	if (in6_pton(str, -1, addr.in6_u.u6_addr8, -1, NULL) != 1) {
++ 		err = -EIO;
++ 		goto out;
++ 	}
++ 
++ 	secret->initialized = true;
++ 	secret->secret = addr;
++ 
++ 	if (&net->ipv6.devconf_dflt->stable_secret == ctl->data) {
++ 		struct net_device *dev;
++ 
++ 		for_each_netdev(net, dev) {
++ 			struct inet6_dev *idev = __in6_dev_get(dev);
++ 
++ 			if (idev) {
++ 				idev->addr_gen_mode =
++ 					IN6_ADDR_GEN_MODE_STABLE_PRIVACY;
++ 			}
++ 		}
++ 	} else {
++ 		struct inet6_dev *idev = ctl->extra1;
++ 
++ 		idev->addr_gen_mode = IN6_ADDR_GEN_MODE_STABLE_PRIVACY;
++ 	}
++ 
++ out:
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 622c81d57b39 (ipv6: generation of stable privacy addresses for link-local and autoconf)
+  static struct addrconf_sysctl_table
+  {
+  	struct ctl_table_header *sysctl_header;
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 1b43f8aab560..73a880e66dfb 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -223,6 +223,7 @@ enum {
+ enum in6_addr_gen_mode {
+ 	IN6_ADDR_GEN_MODE_EUI64,
+ 	IN6_ADDR_GEN_MODE_NONE,
++	IN6_ADDR_GEN_MODE_STABLE_PRIVACY,
+ };
+ 
+ /* Bridge section */
+* Unmerged path net/ipv6/addrconf.c
