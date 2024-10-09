@@ -1,0 +1,114 @@
+fsnotify: add a way to stop queueing events on group shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 12703dbfeb15402260e7554d32a34ac40c233990
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/12703dbf.failed
+
+Implement a function that can be called when a group is being shutdown
+to stop queueing new events to the group.  Fanotify will use this.
+
+Fixes: 5838d4442bd5 ("fanotify: fix double free of pending permission events")
+Link: http://lkml.kernel.org/r/1473797711-14111-2-git-send-email-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 12703dbfeb15402260e7554d32a34ac40c233990)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/group.c
+diff --cc fs/notify/group.c
+index ad1995980456,b47f7cfdcaa4..000000000000
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@@ -47,12 -58,29 +58,25 @@@ void fsnotify_group_stop_queueing(struc
+   */
+  void fsnotify_destroy_group(struct fsnotify_group *group)
+  {
+++<<<<<<< HEAD
+ +	/* clear all inode marks for this group */
+ +	fsnotify_clear_marks_by_group(group);
+++=======
++ 	/*
++ 	 * Stop queueing new events. The code below is careful enough to not
++ 	 * require this but fanotify needs to stop queuing events even before
++ 	 * fsnotify_destroy_group() is called and this makes the other callers
++ 	 * of fsnotify_destroy_group() to see the same behavior.
++ 	 */
++ 	fsnotify_group_stop_queueing(group);
++ 
++ 	/* clear all inode marks for this group, attach them to destroy_list */
++ 	fsnotify_detach_group_marks(group);
+++>>>>>>> 12703dbfeb15 (fsnotify: add a way to stop queueing events on group shutdown)
+  
+ -	/*
+ -	 * Wait for fsnotify_mark_srcu period to end and free all marks in
+ -	 * destroy_list
+ -	 */
+ -	fsnotify_mark_destroy_list();
+ +	synchronize_srcu(&fsnotify_mark_srcu);
+  
+ -	/*
+ -	 * Since we have waited for fsnotify_mark_srcu in
+ -	 * fsnotify_mark_destroy_list() there can be no outstanding event
+ -	 * notification against this group. So clearing the notification queue
+ -	 * of all events is reliable now.
+ -	 */
+ +	/* clear the notification queue of all events */
+  	fsnotify_flush_notify(group);
+  
+  	/*
+* Unmerged path fs/notify/group.c
+diff --git a/fs/notify/notification.c b/fs/notify/notification.c
+index a95d8e037aeb..3d76e65ff84f 100644
+--- a/fs/notify/notification.c
++++ b/fs/notify/notification.c
+@@ -82,7 +82,8 @@ void fsnotify_destroy_event(struct fsnotify_group *group,
+  * Add an event to the group notification queue.  The group can later pull this
+  * event off the queue to deal with.  The function returns 0 if the event was
+  * added to the queue, 1 if the event was merged with some other queued event,
+- * 2 if the queue of events has overflown.
++ * 2 if the event was not queued - either the queue of events has overflown
++ * or the group is shutting down.
+  */
+ int fsnotify_add_event(struct fsnotify_group *group,
+ 		       struct fsnotify_event *event,
+@@ -96,6 +97,11 @@ int fsnotify_add_event(struct fsnotify_group *group,
+ 
+ 	mutex_lock(&group->notification_mutex);
+ 
++	if (group->shutdown) {
++		mutex_unlock(&group->notification_mutex);
++		return 2;
++	}
++
+ 	if (group->q_len >= group->max_events) {
+ 		ret = 2;
+ 		/* Queue overflow event only if it isn't already queued */
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index ca060d7c4fa6..689e66b2fb18 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -150,6 +150,7 @@ struct fsnotify_group {
+ 	#define FS_PRIO_1	1 /* fanotify content based access control */
+ 	#define FS_PRIO_2	2 /* fanotify pre-content access */
+ 	unsigned int priority;
++	bool shutdown;		/* group is being shut down, don't queue more events */
+ 
+ 	/* stores all fastpath marks assoc with this group so they can be cleaned on unregister */
+ 	struct mutex mark_mutex;	/* protect marks_list */
+@@ -314,6 +315,8 @@ extern struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *op
+ extern void fsnotify_get_group(struct fsnotify_group *group);
+ /* drop reference on a group from fsnotify_alloc_group */
+ extern void fsnotify_put_group(struct fsnotify_group *group);
++/* group destruction begins, stop queuing new events */
++extern void fsnotify_group_stop_queueing(struct fsnotify_group *group);
+ /* destroy group */
+ extern void fsnotify_destroy_group(struct fsnotify_group *group);
+ /* fasync handler function */
