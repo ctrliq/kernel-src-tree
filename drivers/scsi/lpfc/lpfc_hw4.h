@@ -4621,6 +4621,9 @@ union lpfc_wqe128 {
 	struct gen_req64_wqe gen_req;
 };
 
+#define MAGIC_NUMER_G6 0xFEAA0003
+#define MAGIC_NUMER_G7 0xFEAA0005
+
 struct lpfc_grp_hdr {
 	uint32_t size;
 	uint32_t magic_number;
