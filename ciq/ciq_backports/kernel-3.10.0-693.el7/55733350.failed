@@ -1,0 +1,196 @@
+flow disector: ARP support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] flow_disector: ARP support (Jonathan Toppins) [1393375]
+Rebuild_FUZZ: 96.15%
+commit-author Simon Horman <simon.horman@netronome.com>
+commit 55733350e5e8b70c5e54a30dbf98148c695f21f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/55733350.failed
+
+Allow dissection of (R)ARP operation hardware and protocol addresses
+for Ethernet hardware and IPv4 protocol addresses.
+
+There are currently no users of FLOW_DISSECTOR_KEY_ARP.
+A follow-up patch will allow FLOW_DISSECTOR_KEY_ARP to be used by the
+flower classifier.
+
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 55733350e5e8b70c5e54a30dbf98148c695f21f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_dissector.h
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,5b3800fe20f3..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -116,13 -123,30 +116,28 @@@ EXPORT_SYMBOL(__skb_flow_get_ports)
+   * @nhoff: network header offset, if @data is NULL use skb_network_offset(skb)
+   * @hlen: packet header length, if @data is NULL use skb_headlen(skb)
+   *
+ - * The function will try to retrieve individual keys into target specified
+ - * by flow_dissector from either the skbuff or a raw buffer specified by the
+ - * rest parameters.
+ - *
+ - * Caller must take care of zeroing target container memory.
+ + * The function will try to retrieve the struct flow_keys from either the skbuff
+ + * or a raw buffer specified by the rest parameters
+   */
+ -bool __skb_flow_dissect(const struct sk_buff *skb,
+ -			struct flow_dissector *flow_dissector,
+ -			void *target_container,
+ -			void *data, __be16 proto, int nhoff, int hlen,
+ -			unsigned int flags)
+ +bool __skb_flow_dissect(const struct sk_buff *skb, struct flow_keys *flow,
+ +			void *data, __be16 proto, int nhoff, int hlen)
+  {
+++<<<<<<< HEAD
+ +	u8 ip_proto;
+++=======
++ 	struct flow_dissector_key_control *key_control;
++ 	struct flow_dissector_key_basic *key_basic;
++ 	struct flow_dissector_key_addrs *key_addrs;
++ 	struct flow_dissector_key_arp *key_arp;
++ 	struct flow_dissector_key_ports *key_ports;
++ 	struct flow_dissector_key_icmp *key_icmp;
++ 	struct flow_dissector_key_tags *key_tags;
++ 	struct flow_dissector_key_vlan *key_vlan;
++ 	struct flow_dissector_key_keyid *key_keyid;
++ 	bool skip_vlan = false;
++ 	u8 ip_proto = 0;
++ 	bool ret;
+++>>>>>>> 55733350e5e8 (flow disector: ARP support)
+  
+  	if (!data) {
+  		data = skb->data;
+@@@ -212,18 -335,109 +227,82 @@@ ipv6
+  		} *hdr, _hdr;
+  		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data, hlen, &_hdr);
+  		if (!hdr)
+ -			goto out_bad;
+ -
+ -		if (dissector_uses_key(flow_dissector,
+ -				       FLOW_DISSECTOR_KEY_TIPC_ADDRS)) {
+ -			key_addrs = skb_flow_dissector_target(flow_dissector,
+ -							      FLOW_DISSECTOR_KEY_TIPC_ADDRS,
+ -							      target_container);
+ -			key_addrs->tipcaddrs.srcnode = hdr->srcnode;
+ -			key_control->addr_type = FLOW_DISSECTOR_KEY_TIPC_ADDRS;
+ -		}
+ -		goto out_good;
+ -	}
+ -
+ -	case htons(ETH_P_MPLS_UC):
+ -	case htons(ETH_P_MPLS_MC): {
+ -		struct mpls_label *hdr, _hdr[2];
+ -mpls:
+ -		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data,
+ -					   hlen, &_hdr);
+ -		if (!hdr)
+ -			goto out_bad;
+ -
+ -		if ((ntohl(hdr[0].entry) & MPLS_LS_LABEL_MASK) >>
+ -		     MPLS_LS_LABEL_SHIFT == MPLS_LABEL_ENTROPY) {
+ -			if (dissector_uses_key(flow_dissector,
+ -					       FLOW_DISSECTOR_KEY_MPLS_ENTROPY)) {
+ -				key_keyid = skb_flow_dissector_target(flow_dissector,
+ -								      FLOW_DISSECTOR_KEY_MPLS_ENTROPY,
+ -								      target_container);
+ -				key_keyid->keyid = hdr[1].entry &
+ -					htonl(MPLS_LS_LABEL_MASK);
+ -			}
+ -
+ -			goto out_good;
+ -		}
+ -
+ -		goto out_good;
+ +			return false;
+ +		flow->src = hdr->srcnode;
+ +		flow->dst = 0;
+ +		flow->n_proto = proto;
+ +		flow->thoff = (u16)nhoff;
+ +		return true;
+  	}
+ -
+  	case htons(ETH_P_FCOE):
+++<<<<<<< HEAD
+ +		flow->thoff = (u16)(nhoff + FCOE_HEADER_LEN);
+ +		/* fall through */
+++=======
++ 		if ((hlen - nhoff) < FCOE_HEADER_LEN)
++ 			goto out_bad;
++ 
++ 		nhoff += FCOE_HEADER_LEN;
++ 		goto out_good;
++ 
++ 	case htons(ETH_P_ARP):
++ 	case htons(ETH_P_RARP): {
++ 		struct {
++ 			unsigned char ar_sha[ETH_ALEN];
++ 			unsigned char ar_sip[4];
++ 			unsigned char ar_tha[ETH_ALEN];
++ 			unsigned char ar_tip[4];
++ 		} *arp_eth, _arp_eth;
++ 		const struct arphdr *arp;
++ 		struct arphdr *_arp;
++ 
++ 		arp = __skb_header_pointer(skb, nhoff, sizeof(_arp), data,
++ 					   hlen, &_arp);
++ 		if (!arp)
++ 			goto out_bad;
++ 
++ 		if (arp->ar_hrd != htons(ARPHRD_ETHER) ||
++ 		    arp->ar_pro != htons(ETH_P_IP) ||
++ 		    arp->ar_hln != ETH_ALEN ||
++ 		    arp->ar_pln != 4 ||
++ 		    (arp->ar_op != htons(ARPOP_REPLY) &&
++ 		     arp->ar_op != htons(ARPOP_REQUEST)))
++ 			goto out_bad;
++ 
++ 		arp_eth = __skb_header_pointer(skb, nhoff + sizeof(_arp),
++ 					       sizeof(_arp_eth), data,
++ 					       hlen - sizeof(_arp),
++ 					       &_arp_eth);
++ 		if (!arp)
++ 			goto out_bad;
++ 
++ 		if (dissector_uses_key(flow_dissector,
++ 				       FLOW_DISSECTOR_KEY_ARP)) {
++ 
++ 			key_arp = skb_flow_dissector_target(flow_dissector,
++ 							    FLOW_DISSECTOR_KEY_ARP,
++ 							    target_container);
++ 
++ 			memcpy(&key_arp->sip, arp_eth->ar_sip,
++ 			       sizeof(key_arp->sip));
++ 			memcpy(&key_arp->tip, arp_eth->ar_tip,
++ 			       sizeof(key_arp->tip));
++ 
++ 			/* Only store the lower byte of the opcode;
++ 			 * this covers ARPOP_REPLY and ARPOP_REQUEST.
++ 			 */
++ 			key_arp->op = ntohs(arp->ar_op) & 0xff;
++ 
++ 			ether_addr_copy(key_arp->sha, arp_eth->ar_sha);
++ 			ether_addr_copy(key_arp->tha, arp_eth->ar_tha);
++ 		}
++ 
++ 		goto out_good;
++ 	}
++ 
+++>>>>>>> 55733350e5e8 (flow disector: ARP support)
+  	default:
+ -		goto out_bad;
+ +		return false;
+  	}
+  
+  ip_proto_again:
+* Unmerged path include/net/flow_dissector.h
+* Unmerged path include/net/flow_dissector.h
+* Unmerged path net/core/flow_dissector.c
