@@ -1129,7 +1129,7 @@ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 		return;
 
 	if (rcd->rcvhdrq) {
-		dma_free_coherent(&dd->pcidev->dev, rcd->rcvhdrq_size,
+		dma_free_coherent(&dd->pcidev->dev, rcvhdrq_size(rcd),
 				  rcd->rcvhdrq, rcd->rcvhdrq_dma);
 		rcd->rcvhdrq = NULL;
 		if (rcd->rcvhdrtail_kvaddr) {
@@ -1829,12 +1829,7 @@ int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 	if (!rcd->rcvhdrq) {
 		gfp_t gfp_flags;
 
-		/*
-		 * rcvhdrqentsize is in DWs, so we have to convert to bytes
-		 * (* sizeof(u32)).
-		 */
-		amt = PAGE_ALIGN(rcd->rcvhdrq_cnt * rcd->rcvhdrqentsize *
-				 sizeof(u32));
+		amt = rcvhdrq_size(rcd);
 
 		if (rcd->ctxt < dd->first_dyn_alloc_ctxt || rcd->is_vnic)
 			gfp_flags = GFP_KERNEL;
@@ -1859,8 +1854,6 @@ int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
 			if (!rcd->rcvhdrtail_kvaddr)
 				goto bail_free;
 		}
-
-		rcd->rcvhdrq_size = amt;
 	}
 	/*
 	 * These values are per-context:
