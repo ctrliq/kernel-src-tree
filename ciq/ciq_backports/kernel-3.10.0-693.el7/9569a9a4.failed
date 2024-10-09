@@ -1,0 +1,143 @@
+i40e: when adding or removing MAC filters, correctly handle VLANs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 9569a9a4547d5636827c3f6b09be73ed924b1d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9569a9a4.failed
+
+Instead of using i40e_add_filter or i40e_del_filter directly, when
+adding a MAC address, we should normally be using i40e_add_mac_filter or
+i40e_del_mac_filter. These functions correctly handle the various cases
+of VLAN mode or PVID settings. This ensures consistency and avoids the
+issues that can occur with the recent addition of a WARN_ON() in
+i40e_sync_vsi_filters.
+
+Change-ID: I7fe62db063391fdd1180b2d6a6a3c5ab4307eeee
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 9569a9a4547d5636827c3f6b09be73ed924b1d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 2f00e31ef630,2d689e0e12a5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -9246,20 -9334,44 +9246,58 @@@ static int i40e_config_netdev(struct i4
+  	if (vsi->type == I40E_VSI_MAIN) {
+  		SET_NETDEV_DEV(netdev, &pf->pdev->dev);
+  		ether_addr_copy(mac_addr, hw->mac.perm_addr);
+++<<<<<<< HEAD
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+ +		i40e_add_filter(vsi, mac_addr, I40E_VLAN_ANY, false, true);
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+++=======
++ 		/* The following steps are necessary to prevent reception
++ 		 * of tagged packets - some older NVM configurations load a
++ 		 * default a MAC-VLAN filter that accepts any tagged packet
++ 		 * which must be replaced by a normal filter.
++ 		 */
++ 		i40e_rm_default_mac_filter(vsi, mac_addr);
++ 		spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 		i40e_add_mac_filter(vsi, mac_addr);
++ 		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+++>>>>>>> 9569a9a4547d (i40e: when adding or removing MAC filters, correctly handle VLANs)
+  	} else {
+  		/* relate the VSI_VMDQ name to the VSI_MAIN name */
+  		snprintf(netdev->name, IFNAMSIZ, "%sv%%d",
+  			 pf->vsi[pf->lan_vsi]->netdev->name);
+  		random_ether_addr(mac_addr);
+  
+++<<<<<<< HEAD
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+ +		i40e_add_filter(vsi, mac_addr, I40E_VLAN_ANY, false, false);
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+ +	}
+ +
+++=======
++ 		spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 		i40e_add_mac_filter(vsi, mac_addr);
++ 		spin_unlock_bh(&vsi->mac_filter_hash_lock);
++ 	}
++ 
++ 	/* Add the broadcast filter so that we initially will receive
++ 	 * broadcast packets. Note that when a new VLAN is first added the
++ 	 * driver will convert all filters marked I40E_VLAN_ANY into VLAN
++ 	 * specific filters as part of transitioning into "vlan" operation.
++ 	 * When more VLANs are added, the driver will copy each existing MAC
++ 	 * filter and add it for the new VLAN.
++ 	 *
++ 	 * Broadcast filters are handled specially by
++ 	 * i40e_sync_filters_subtask, as the driver must to set the broadcast
++ 	 * promiscuous bit instead of adding this directly as a MAC/VLAN
++ 	 * filter. The subtask will update the correct broadcast promiscuous
++ 	 * bits as VLANs become active or inactive.
++ 	 */
++ 	eth_broadcast_addr(broadcast);
++ 	spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 	i40e_add_mac_filter(vsi, broadcast);
++ 	spin_unlock_bh(&vsi->mac_filter_hash_lock);
++ 
+++>>>>>>> 9569a9a4547d (i40e: when adding or removing MAC filters, correctly handle VLANs)
+  	ether_addr_copy(netdev->dev_addr, mac_addr);
+  	ether_addr_copy(netdev->perm_addr, mac_addr);
+  
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index 4fb0bfac177f,cbbf8648307a..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -686,17 -687,21 +686,31 @@@ static int i40e_alloc_vsi_res(struct i4
+  		if (vf->port_vlan_id)
+  			i40e_vsi_add_pvid(vsi, vf->port_vlan_id);
+  
+ -		spin_lock_bh(&vsi->mac_filter_hash_lock);
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+  		if (is_valid_ether_addr(vf->default_lan_addr.addr)) {
+++<<<<<<< HEAD
+ +			f = i40e_add_filter(vsi, vf->default_lan_addr.addr,
+ +				       vf->port_vlan_id ? vf->port_vlan_id : -1,
+ +				       true, false);
+++=======
++ 			f = i40e_add_mac_filter(vsi,
++ 						vf->default_lan_addr.addr);
+++>>>>>>> 9569a9a4547d (i40e: when adding or removing MAC filters, correctly handle VLANs)
+  			if (!f)
+  				dev_info(&pf->pdev->dev,
+  					 "Could not add MAC filter %pM for VF %d\n",
+  					vf->default_lan_addr.addr, vf->vf_id);
+  		}
+++<<<<<<< HEAD
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+++=======
++ 		eth_broadcast_addr(broadcast);
++ 		f = i40e_add_mac_filter(vsi, broadcast);
++ 		if (!f)
++ 			dev_info(&pf->pdev->dev,
++ 				 "Could not allocate VF broadcast filter\n");
++ 		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+++>>>>>>> 9569a9a4547d (i40e: when adding or removing MAC filters, correctly handle VLANs)
+  		i40e_write_rx_ctl(&pf->hw, I40E_VFQF_HENA1(0, vf->vf_id),
+  				  (u32)hena);
+  		i40e_write_rx_ctl(&pf->hw, I40E_VFQF_HENA1(1, vf->vf_id),
+@@@ -2726,9 -2716,7 +2740,13 @@@ int i40e_ndo_set_vf_mac(struct net_devi
+  
+  	/* delete the temporary mac address */
+  	if (!is_zero_ether_addr(vf->default_lan_addr.addr))
+++<<<<<<< HEAD
+ +		i40e_del_filter(vsi, vf->default_lan_addr.addr,
+ +				vf->port_vlan_id ? vf->port_vlan_id : -1,
+ +				true, false);
+++=======
++ 		i40e_del_mac_filter(vsi, vf->default_lan_addr.addr);
+++>>>>>>> 9569a9a4547d (i40e: when adding or removing MAC filters, correctly handle VLANs)
+  
+  	/* Delete all the filters for this VSI - we're going to kill it
+  	 * anyway.
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
