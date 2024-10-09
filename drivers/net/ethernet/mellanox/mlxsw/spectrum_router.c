@@ -95,6 +95,7 @@ struct mlxsw_sp_router {
 	struct list_head ipip_list;
 	bool aborted;
 	struct notifier_block fib_nb;
+	struct notifier_block netevent_nb;
 	const struct mlxsw_sp_rif_ops **rif_ops_arr;
 	const struct mlxsw_sp_ipip_ops **ipip_ops_arr;
 };
@@ -2070,8 +2071,8 @@ out:
 	kfree(neigh_work);
 }
 
-int mlxsw_sp_router_netevent_event(struct notifier_block *unused,
-				   unsigned long event, void *ptr)
+static int mlxsw_sp_router_netevent_event(struct notifier_block *unused,
+					  unsigned long event, void *ptr)
 {
 	struct mlxsw_sp_neigh_event_work *neigh_work;
 	struct mlxsw_sp_port *mlxsw_sp_port;
@@ -6621,6 +6622,12 @@ int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp)
 	if (err)
 		goto err_neigh_init;
 
+	mlxsw_sp->router->netevent_nb.notifier_call =
+		mlxsw_sp_router_netevent_event;
+	err = register_netevent_notifier(&mlxsw_sp->router->netevent_nb);
+	if (err)
+		goto err_register_netevent_notifier;
+
 	mlxsw_sp->router->fib_nb.notifier_call = mlxsw_sp_router_fib_event;
 	err = register_fib_notifier(&mlxsw_sp->router->fib_nb,
 				    mlxsw_sp_router_fib_dump_flush);
@@ -6630,6 +6637,8 @@ int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp)
 	return 0;
 
 err_register_fib_notifier:
+	unregister_netevent_notifier(&mlxsw_sp->router->netevent_nb);
+err_register_netevent_notifier:
 	mlxsw_sp_neigh_fini(mlxsw_sp);
 err_neigh_init:
 	mlxsw_sp_vrs_fini(mlxsw_sp);
@@ -6655,6 +6664,7 @@ err_router_init:
 void mlxsw_sp_router_fini(struct mlxsw_sp *mlxsw_sp)
 {
 	unregister_fib_notifier(&mlxsw_sp->router->fib_nb);
+	unregister_netevent_notifier(&mlxsw_sp->router->netevent_nb);
 	mlxsw_sp_neigh_fini(mlxsw_sp);
 	mlxsw_sp_vrs_fini(mlxsw_sp);
 	mlxsw_sp_mr_fini(mlxsw_sp);
