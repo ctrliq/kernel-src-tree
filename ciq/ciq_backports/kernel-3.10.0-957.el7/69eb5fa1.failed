@@ -1,0 +1,317 @@
+xfs: prepare xfs_break_layouts() for another layout type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 69eb5fa10eb283e9fcae3ce6f8aaf103b8f0c28d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/69eb5fa1.failed
+
+When xfs is operating as the back-end of a pNFS block server, it
+prevents collisions between local and remote operations by requiring a
+lease to be held for remotely accessed blocks. Local filesystem
+operations break those leases before writing or mutating the extent map
+of the file.
+
+A similar mechanism is needed to prevent operations on pinned dax
+mappings, like device-DMA, from colliding with extent unmap operations.
+
+BREAK_WRITE and BREAK_UNMAP are introduced as two distinct levels of
+layout breaking.
+
+Layouts are broken in the BREAK_WRITE case to ensure that layout-holders
+do not collide with local writes. Additionally, layouts are broken in
+the BREAK_UNMAP case to make sure the layout-holder has a consistent
+view of the file's extent map. While BREAK_WRITE breaks can be satisfied
+be recalling FL_LAYOUT leases, BREAK_UNMAP breaks additionally require
+waiting for busy dax-pages to go idle while holding XFS_MMAPLOCK_EXCL.
+
+After this refactoring xfs_break_layouts() becomes the entry point for
+coordinating both types of breaks. Finally, xfs_break_leased_layouts()
+becomes just the BREAK_WRITE handler.
+
+Note that the unlock tracking is needed in a follow on change. That will
+coordinate retrying either break handler until both successfully test
+for a lease break while maintaining the lock state.
+
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Reported-by: Dave Chinner <david@fromorbit.com>
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 69eb5fa10eb283e9fcae3ce6f8aaf103b8f0c28d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_inode.h
+#	fs/xfs/xfs_ioctl.c
+#	fs/xfs/xfs_iops.c
+#	fs/xfs/xfs_pnfs.c
+#	fs/xfs/xfs_pnfs.h
+diff --cc fs/xfs/xfs_file.c
+index cea567087acc,4774c7172ef4..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -521,19 -295,24 +521,27 @@@ xfs_zero_eof
+   */
+  STATIC ssize_t
+  xfs_file_aio_write_checks(
+ -	struct kiocb		*iocb,
+ -	struct iov_iter		*from,
+ +	struct file		*file,
+ +	loff_t			*pos,
+ +	size_t			*count,
+  	int			*iolock)
+  {
+ -	struct file		*file = iocb->ki_filp;
+  	struct inode		*inode = file->f_mapping->host;
+  	struct xfs_inode	*ip = XFS_I(inode);
+ -	ssize_t			error = 0;
+ -	size_t			count = iov_iter_count(from);
+ +	int			error = 0;
+ +	unsigned long		flags;
+  	bool			drained_dio = false;
+ -	loff_t			isize;
+  
+  restart:
+++<<<<<<< HEAD
+ +	error = generic_write_checks(file, pos, count, S_ISBLK(inode->i_mode));
+++=======
++ 	error = generic_write_checks(iocb, from);
++ 	if (error <= 0)
++ 		return error;
++ 
++ 	error = xfs_break_layouts(inode, iolock, BREAK_WRITE);
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  	if (error)
+  		return error;
+  
+@@@ -902,6 -718,33 +910,36 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int
++ xfs_break_layouts(
++ 	struct inode		*inode,
++ 	uint			*iolock,
++ 	enum layout_break_reason reason)
++ {
++ 	bool			retry;
++ 
++ 	ASSERT(xfs_isilocked(XFS_I(inode), XFS_IOLOCK_SHARED|XFS_IOLOCK_EXCL));
++ 
++ 	switch (reason) {
++ 	case BREAK_UNMAP:
++ 		ASSERT(xfs_isilocked(XFS_I(inode), XFS_MMAPLOCK_EXCL));
++ 		/* fall through */
++ 	case BREAK_WRITE:
++ 		return xfs_break_leased_layouts(inode, iolock, &retry);
++ 	default:
++ 		WARN_ON_ONCE(1);
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ #define	XFS_FALLOC_FL_SUPPORTED						\
++ 		(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |		\
++ 		 FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE |	\
++ 		 FALLOC_FL_INSERT_RANGE | FALLOC_FL_UNSHARE_RANGE)
++ 
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  STATIC long
+  xfs_file_fallocate(
+  	struct file		*file,
+@@@ -923,7 -766,7 +961,11 @@@
+  		return -EOPNOTSUPP;
+  
+  	xfs_ilock(ip, iolock);
+++<<<<<<< HEAD
+ +	error = xfs_break_layouts(inode, &iolock, false);
+++=======
++ 	error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  	if (error)
+  		goto out_unlock;
+  
+diff --cc fs/xfs/xfs_inode.h
+index c5d5738477f2,e5b849815ce1..000000000000
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@@ -431,10 -457,8 +445,15 @@@ enum xfs_prealloc_flags 
+  
+  int	xfs_update_prealloc_flags(struct xfs_inode *ip,
+  				  enum xfs_prealloc_flags flags);
+++<<<<<<< HEAD
+ +int	xfs_zero_eof(struct xfs_inode *ip, xfs_off_t offset,
+ +		     xfs_fsize_t isize, bool *did_zeroing);
+ +int	xfs_zero_range(struct xfs_inode *ip, xfs_off_t pos, xfs_off_t count,
+ +		bool *did_zero);
+++=======
++ int	xfs_break_layouts(struct inode *inode, uint *iolock,
++ 		enum layout_break_reason reason);
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  
+  /* from xfs_iops.c */
+  extern void xfs_setup_inode(struct xfs_inode *ip);
+diff --cc fs/xfs/xfs_ioctl.c
+index 16aae82f734b,91e73d663099..000000000000
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@@ -39,10 -39,15 +39,9 @@@
+  #include "xfs_icache.h"
+  #include "xfs_symlink.h"
+  #include "xfs_trans.h"
+- #include "xfs_pnfs.h"
+  #include "xfs_acl.h"
+ -#include "xfs_btree.h"
+ -#include <linux/fsmap.h>
+ -#include "xfs_fsmap.h"
+ -#include "scrub/xfs_scrub.h"
+ -#include "xfs_sb.h"
+  
+  #include <linux/capability.h>
+ -#include <linux/cred.h>
+  #include <linux/dcache.h>
+  #include <linux/mount.h>
+  #include <linux/namei.h>
+@@@ -678,7 -643,7 +677,11 @@@ xfs_ioc_space
+  		return error;
+  
+  	xfs_ilock(ip, iolock);
+++<<<<<<< HEAD
+ +	error = xfs_break_layouts(inode, &iolock, false);
+++=======
++ 	error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  	if (error)
+  		goto out_unlock;
+  
+diff --cc fs/xfs/xfs_iops.c
+index 8c9150043298,ce0c1f9466a8..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -36,9 -36,8 +36,13 @@@
+  #include "xfs_symlink.h"
+  #include "xfs_da_btree.h"
+  #include "xfs_dir2.h"
+++<<<<<<< HEAD
+ +#include "xfs_pnfs.h"
+++=======
++ #include "xfs_trans_space.h"
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  #include "xfs_iomap.h"
+ +#include "xfs_trans_space.h"
+  
+  #include <linux/capability.h>
+  #include <linux/xattr.h>
+@@@ -1021,18 -1029,21 +1025,31 @@@ xfs_vn_setattr
+  	int			error;
+  
+  	if (iattr->ia_valid & ATTR_SIZE) {
+++<<<<<<< HEAD
+ +		struct xfs_inode	*ip = XFS_I(d_inode(dentry));
+ +		uint			iolock = XFS_IOLOCK_EXCL;
+++=======
++ 		struct inode		*inode = d_inode(dentry);
++ 		struct xfs_inode	*ip = XFS_I(inode);
++ 		uint			iolock;
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  
+ -		xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+ -		iolock = XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL;
+ +		xfs_ilock(ip, iolock);
+ +		error = xfs_break_layouts(dentry->d_inode, &iolock, true);
+ +		if (!error) {
+ +			xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+ +			iolock |= XFS_MMAPLOCK_EXCL;
+  
+++<<<<<<< HEAD
+ +			error = xfs_vn_setattr_size(dentry, iattr);
+++=======
++ 		error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
++ 		if (error) {
++ 			xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
++ 			return error;
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  		}
+ -
+ -		error = xfs_vn_setattr_size(dentry, iattr);
+ -		xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
+ +		xfs_iunlock(ip, iolock);
+  	} else {
+  		error = xfs_vn_setattr_nonsize(dentry, iattr);
+  	}
+diff --cc fs/xfs/xfs_pnfs.c
+index 28b343e7dd14,f44c3599527d..000000000000
+--- a/fs/xfs/xfs_pnfs.c
++++ b/fs/xfs/xfs_pnfs.c
+@@@ -30,24 -31,20 +30,30 @@@
+   * rules in the page fault path we don't bother.
+   */
+  int
+- xfs_break_layouts(
++ xfs_break_leased_layouts(
+  	struct inode		*inode,
+  	uint			*iolock,
+++<<<<<<< HEAD
+ +	bool			with_imutex)
+++=======
++ 	bool			*did_unlock)
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  {
+  	struct xfs_inode	*ip = XFS_I(inode);
+  	int			error;
+  
+- 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_SHARED|XFS_IOLOCK_EXCL));
+- 
+  	while ((error = break_layout(inode, false) == -EWOULDBLOCK)) {
+  		xfs_iunlock(ip, *iolock);
+++<<<<<<< HEAD
+ +		if (with_imutex && (*iolock & XFS_IOLOCK_EXCL))
+ +			mutex_unlock(&inode->i_mutex);
+++=======
++ 		*did_unlock = true;
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  		error = break_layout(inode, true);
+ -		*iolock &= ~XFS_IOLOCK_SHARED;
+ -		*iolock |= XFS_IOLOCK_EXCL;
+ +		*iolock = XFS_IOLOCK_EXCL;
+ +		if (with_imutex)
+ +			mutex_lock(&inode->i_mutex);
+  		xfs_ilock(ip, *iolock);
+  	}
+  
+diff --cc fs/xfs/xfs_pnfs.h
+index 93f74853961b,940c6c2ad88c..000000000000
+--- a/fs/xfs/xfs_pnfs.h
++++ b/fs/xfs/xfs_pnfs.h
+@@@ -8,10 -9,11 +8,18 @@@ int xfs_fs_map_blocks(struct inode *ino
+  int xfs_fs_commit_blocks(struct inode *inode, struct iomap *maps, int nr_maps,
+  		struct iattr *iattr);
+  
+++<<<<<<< HEAD
+ +int xfs_break_layouts(struct inode *inode, uint *iolock, bool with_imutex);
+ +#else
+ +static inline int
+ +xfs_break_layouts(struct inode *inode, uint *iolock, bool with_imutex)
+++=======
++ int xfs_break_leased_layouts(struct inode *inode, uint *iolock,
++ 		bool *did_unlock);
++ #else
++ static inline int
++ xfs_break_leased_layouts(struct inode *inode, uint *iolock, bool *did_unlock)
+++>>>>>>> 69eb5fa10eb2 (xfs: prepare xfs_break_layouts() for another layout type)
+  {
+  	return 0;
+  }
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_inode.h
+* Unmerged path fs/xfs/xfs_ioctl.c
+* Unmerged path fs/xfs/xfs_iops.c
+* Unmerged path fs/xfs/xfs_pnfs.c
+* Unmerged path fs/xfs/xfs_pnfs.h
