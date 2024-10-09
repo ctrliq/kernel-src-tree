@@ -1,0 +1,204 @@
+scsi: be2iscsi: Add IOCTL to check UER supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Add IOCTL to check UER supported (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 93.33%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 6694095b5a28c54d9fd114997e483cdc47a2e792
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6694095b.failed
+
+BE3 and SH cards can recover from transient parity errors treated
+earlier as unrecoverable errors.
+
+Add IOCTL to query FW support for this feature.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 6694095b5a28c54d9fd114997e483cdc47a2e792)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_cmds.c
+#	drivers/scsi/be2iscsi/be_main.h
+diff --cc drivers/scsi/be2iscsi/be_cmds.c
+index 403296239ae9,a246abebb1de..000000000000
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@@ -474,8 -495,23 +466,28 @@@ int beiscsi_process_mcc_compl(struct be
+  				     CQE_STATUS_ADDL_MASK;
+  	ctrl->mcc_tag_status[tag] |= (compl_status & CQE_STATUS_MASK);
+  
+++<<<<<<< HEAD
+ +	/* write ordering forced in wake_up_interruptible */
+ +	clear_bit(MCC_TAG_STATE_RUNNING, &ctrl->ptag_state[tag].tag_state);
+++=======
++ 	if (test_bit(MCC_TAG_STATE_ASYNC, &ctrl->ptag_state[tag].tag_state)) {
++ 		if (ctrl->ptag_state[tag].cbfn)
++ 			ctrl->ptag_state[tag].cbfn(phba, tag);
++ 		else
++ 			__beiscsi_log(phba, KERN_ERR,
++ 				      "BC_%d : MBX ASYNC command with no callback\n");
++ 		free_mcc_wrb(ctrl, tag);
++ 		return 0;
++ 	}
++ 
++ 	if (test_bit(MCC_TAG_STATE_IGNORE, &ctrl->ptag_state[tag].tag_state)) {
++ 		/* just check completion status and free wrb */
++ 		__beiscsi_mcc_compl_status(phba, tag, NULL, NULL);
++ 		free_mcc_wrb(ctrl, tag);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 6694095b5a28 (scsi: be2iscsi: Add IOCTL to check UER supported)
+  	wake_up_interruptible(&ctrl->mcc_wait[tag]);
+  	return 0;
+  }
+diff --cc drivers/scsi/be2iscsi/be_main.h
+index 90cdc10c01fb,0a5de01c3883..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@@ -417,12 -400,31 +417,40 @@@ struct beiscsi_hba 
+  		unsigned long ulp_supported;
+  	} fw_config;
+  
+++<<<<<<< HEAD
+ +	unsigned int state;
+ +	u8 optic_state;
+ +	int get_boot;
+ +	bool fw_timeout;
+ +	bool ue_detected;
+ +	struct delayed_work beiscsi_hw_check_task;
+++=======
++ 	unsigned long state;
++ #define BEISCSI_HBA_RUNNING	0
++ #define BEISCSI_HBA_LINK_UP	1
++ #define BEISCSI_HBA_BOOT_FOUND	2
++ #define BEISCSI_HBA_BOOT_WORK	3
++ #define BEISCSI_HBA_UER_SUPP	4
++ #define BEISCSI_HBA_PCI_ERR	5
++ #define BEISCSI_HBA_FW_TIMEOUT	6
++ #define BEISCSI_HBA_IN_UE	7
++ #define BEISCSI_HBA_IN_TPE	8
++ 
++ /* error bits */
++ #define BEISCSI_HBA_IN_ERR	((1 << BEISCSI_HBA_PCI_ERR) | \
++ 				 (1 << BEISCSI_HBA_FW_TIMEOUT) | \
++ 				 (1 << BEISCSI_HBA_IN_UE) | \
++ 				 (1 << BEISCSI_HBA_IN_TPE))
++ 
++ 	u8 optic_state;
++ 	struct delayed_work eqd_update;
++ 	/* update EQ delay timer every 1000ms */
++ #define BEISCSI_EQD_UPDATE_INTERVAL	1000
++ 	struct timer_list hw_check;
++ 	/* check for UE every 1000ms */
++ #define BEISCSI_UE_DETECT_INTERVAL	1000
++ 	u32 ue2rp;
+++>>>>>>> 6694095b5a28 (scsi: be2iscsi: Add IOCTL to check UER supported)
+  
+  	bool mac_addr_set;
+  	u8 mac_address[ETH_ALEN];
+* Unmerged path drivers/scsi/be2iscsi/be_cmds.c
+diff --git a/drivers/scsi/be2iscsi/be_cmds.h b/drivers/scsi/be2iscsi/be_cmds.h
+index c50b74afd00a..4c52600b7e59 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.h
++++ b/drivers/scsi/be2iscsi/be_cmds.h
+@@ -57,6 +57,7 @@ struct be_mcc_wrb {
+ #define MCC_STATUS_ILLEGAL_REQUEST 0x2
+ #define MCC_STATUS_ILLEGAL_FIELD 0x3
+ #define MCC_STATUS_INSUFFICIENT_BUFFER 0x4
++#define MCC_STATUS_INVALID_LENGTH 0x74
+ 
+ #define CQE_STATUS_COMPL_MASK	0xFFFF
+ #define CQE_STATUS_COMPL_SHIFT	0		/* bits 0 - 15 */
+@@ -217,6 +218,7 @@ struct be_mcc_mailbox {
+ #define OPCODE_COMMON_QUERY_FIRMWARE_CONFIG		58
+ #define OPCODE_COMMON_FUNCTION_RESET			61
+ #define OPCODE_COMMON_GET_PORT_NAME			77
++#define OPCODE_COMMON_SET_FEATURES			191
+ 
+ /**
+  * LIST of opcodes that are common between Initiator and Target
+@@ -707,6 +709,8 @@ struct be_cmd_get_nic_conf_resp {
+ 	u8 mac_address[ETH_ALEN];
+ } __packed;
+ 
++/******************** Get HBA NAME *******************/
++
+ #define BEISCSI_ALIAS_LEN 32
+ 
+ struct be_cmd_hba_name {
+@@ -717,6 +721,34 @@ struct be_cmd_hba_name {
+ 	u8 initiator_alias[BEISCSI_ALIAS_LEN];
+ } __packed;
+ 
++/******************** COMMON SET Features *******************/
++#define BE_CMD_SET_FEATURE_UER	0x10
++#define BE_CMD_UER_SUPP_BIT	0x1
++struct be_uer_req {
++	u32 uer;
++	u32 rsvd;
++};
++
++struct be_uer_resp {
++	u32 uer;
++	u16 ue2rp;
++	u16 ue2sr;
++};
++
++struct be_cmd_set_features {
++	union {
++		struct be_cmd_req_hdr req_hdr;
++		struct be_cmd_resp_hdr resp_hdr;
++	} h;
++	u32 feature;
++	u32 param_len;
++	union {
++		struct be_uer_req req;
++		struct be_uer_resp resp;
++		u32 rsvd[2];
++	} param;
++} __packed;
++
+ int beiscsi_cmd_eq_create(struct be_ctrl_info *ctrl,
+ 			  struct be_queue_info *eq, int eq_delay);
+ 
+@@ -785,6 +817,8 @@ int be_cmd_wrbq_create(struct be_ctrl_info *ctrl, struct be_dma_mem *q_mem,
+ /* Configuration Functions */
+ int be_cmd_set_vlan(struct beiscsi_hba *phba, uint16_t vlan_tag);
+ 
++int beiscsi_set_uer_feature(struct beiscsi_hba *phba);
++
+ struct be_default_pdu_context {
+ 	u32 dw[4];
+ } __packed;
+diff --git a/drivers/scsi/be2iscsi/be_main.c b/drivers/scsi/be2iscsi/be_main.c
+index 8e3a0f9d2ac4..ee30559c45ac 100644
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@ -5672,6 +5672,7 @@ static int beiscsi_dev_probe(struct pci_dev *pcidev,
+ 	}
+ 	mgmt_get_port_name(&phba->ctrl, phba);
+ 	beiscsi_get_params(phba);
++	beiscsi_set_uer_feature(phba);
+ 
+ 	if (enable_msix)
+ 		find_num_cpus(phba);
+* Unmerged path drivers/scsi/be2iscsi/be_main.h
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index fa17b8e5a47c..0cf03f9951a9 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -131,7 +131,7 @@ void beiscsi_ue_detect(struct beiscsi_hba *phba)
+ 		phba->ue_detected = true;
+ 		beiscsi_log(phba, KERN_ERR,
+ 			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+-			    "BG_%d : Error detected on the adapter\n");
++			    "BG_%d : HBA error detected\n");
+ 	}
+ 
+ 	if (ue_lo) {
