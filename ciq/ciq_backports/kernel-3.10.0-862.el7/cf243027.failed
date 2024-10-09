@@ -1,0 +1,371 @@
+scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Separate AFU internal command handling from AFU sync specifics (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 96.00%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit cf2430279006e4afa67dfa4cf952ded38c7ed5b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cf243027.failed
+
+To date the only supported internal AFU command is AFU sync. The logic
+to send an internal AFU command is embedded in the specific AFU sync
+handler and would need to be duplicated for new internal AFU commands.
+
+In order to support new internal AFU commands, separate code that is
+common for AFU internal commands into a generic transmission routine
+and support passing back command status through an IOASA structure.
+The first user of this new routine is the existing AFU sync command.
+As a cleanup, use a descriptive name for the AFU sync command instead
+of a magic number.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cf2430279006e4afa67dfa4cf952ded38c7ed5b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+#	drivers/scsi/cxlflash/sislite.h
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,7732dfc099c4..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -1776,29 -2127,107 +1776,112 @@@ err1
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * cxlflash_afu_sync() - builds and sends an AFU sync command
+++=======
++  * afu_reset() - resets the AFU
++  * @cfg:	Internal structure associated with the host.
++  *
++  * Return: 0 on success, -errno on failure
++  */
++ static int afu_reset(struct cxlflash_cfg *cfg)
++ {
++ 	struct device *dev = &cfg->dev->dev;
++ 	int rc = 0;
++ 
++ 	/* Stop the context before the reset. Since the context is
++ 	 * no longer available restart it after the reset is complete
++ 	 */
++ 	term_afu(cfg);
++ 
++ 	rc = init_afu(cfg);
++ 
++ 	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
++ 	return rc;
++ }
++ 
++ /**
++  * drain_ioctls() - wait until all currently executing ioctls have completed
++  * @cfg:	Internal structure associated with the host.
++  *
++  * Obtain write access to read/write semaphore that wraps ioctl
++  * handling to 'drain' ioctls currently executing.
++  */
++ static void drain_ioctls(struct cxlflash_cfg *cfg)
++ {
++ 	down_write(&cfg->ioctl_rwsem);
++ 	up_write(&cfg->ioctl_rwsem);
++ }
++ 
++ /**
++  * cxlflash_async_reset_host() - asynchronous host reset handler
++  * @data:	Private data provided while scheduling reset.
++  * @cookie:	Cookie that can be used for checkpointing.
++  */
++ static void cxlflash_async_reset_host(void *data, async_cookie_t cookie)
++ {
++ 	struct cxlflash_cfg *cfg = data;
++ 	struct device *dev = &cfg->dev->dev;
++ 	int rc = 0;
++ 
++ 	if (cfg->state != STATE_RESET) {
++ 		dev_dbg(dev, "%s: Not performing a reset, state=%d\n",
++ 			__func__, cfg->state);
++ 		goto out;
++ 	}
++ 
++ 	drain_ioctls(cfg);
++ 	cxlflash_mark_contexts_error(cfg);
++ 	rc = afu_reset(cfg);
++ 	if (rc)
++ 		cfg->state = STATE_FAILTERM;
++ 	else
++ 		cfg->state = STATE_NORMAL;
++ 	wake_up_all(&cfg->reset_waitq);
++ 
++ out:
++ 	scsi_unblock_requests(cfg->host);
++ }
++ 
++ /**
++  * cxlflash_schedule_async_reset() - schedule an asynchronous host reset
++  * @cfg:	Internal structure associated with the host.
++  */
++ static void cxlflash_schedule_async_reset(struct cxlflash_cfg *cfg)
++ {
++ 	struct device *dev = &cfg->dev->dev;
++ 
++ 	if (cfg->state != STATE_NORMAL) {
++ 		dev_dbg(dev, "%s: Not performing reset state=%d\n",
++ 			__func__, cfg->state);
++ 		return;
++ 	}
++ 
++ 	cfg->state = STATE_RESET;
++ 	scsi_block_requests(cfg->host);
++ 	cfg->async_reset_cookie = async_schedule(cxlflash_async_reset_host,
++ 						 cfg);
++ }
++ 
++ /**
++  * send_afu_cmd() - builds and sends an internal AFU command
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+   * @afu:	AFU associated with the host.
+-  * @ctx_hndl_u:	Identifies context requesting sync.
+-  * @res_hndl_u:	Identifies resource requesting sync.
+-  * @mode:	Type of sync to issue (lightweight, heavyweight, global).
++  * @rcb:	Pre-populated IOARCB describing command to send.
+   *
+-  * The AFU can only take 1 sync command at a time. This routine enforces this
+-  * limitation by using a mutex to provide exclusive access to the AFU during
+-  * the sync. This design point requires calling threads to not be on interrupt
+-  * context due to the possibility of sleeping during concurrent sync operations.
++  * The AFU can only take one internal AFU command at a time. This limitation is
++  * enforced by using a mutex to provide exclusive access to the AFU during the
++  * operation. This design point requires calling threads to not be on interrupt
++  * context due to the possibility of sleeping during concurrent AFU operations.
+   *
+-  * AFU sync operations are only necessary and allowed when the device is
+-  * operating normally. When not operating normally, sync requests can occur as
+-  * part of cleaning up resources associated with an adapter prior to removal.
+-  * In this scenario, these requests are simply ignored (safe due to the AFU
+-  * going away).
++  * The command status is optionally passed back to the caller when the caller
++  * populates the IOASA field of the IOARCB with a pointer to an IOASA structure.
+   *
+   * Return:
+ - *	0 on success, -errno on failure
+ + *	0 on success
+ + *	-1 on failure
+   */
+- int cxlflash_afu_sync(struct afu *afu, ctx_hndl_t ctx_hndl_u,
+- 		      res_hndl_t res_hndl_u, u8 mode)
++ static int send_afu_cmd(struct afu *afu, struct sisl_ioarcb *rcb)
+  {
+  	struct cxlflash_cfg *cfg = afu->parent;
+  	struct device *dev = &cfg->dev->dev;
+@@@ -1821,63 -2254,134 +1904,119 @@@
+  	}
+  
+  	cmd = (struct afu_cmd *)PTR_ALIGN(buf, __alignof__(*cmd));
+++<<<<<<< HEAD
+++=======
++ 
++ retry:
++ 	memset(cmd, 0, sizeof(*cmd));
++ 	memcpy(&cmd->rcb, rcb, sizeof(*rcb));
++ 	INIT_LIST_HEAD(&cmd->queue);
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+  	init_completion(&cmd->cevent);
+ +	spin_lock_init(&cmd->slock);
+  	cmd->parent = afu;
+++<<<<<<< HEAD
+ +
+ +	pr_debug("%s: afu=%p cmd=%p %d\n", __func__, afu, cmd, ctx_hndl_u);
+ +
+ +	cmd->rcb.req_flags = SISL_REQ_FLAGS_AFU_CMD;
+ +	cmd->rcb.ctx_id = afu->ctx_hndl;
+ +	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
+ +	cmd->rcb.port_sel = 0x0;	/* NA */
+ +	cmd->rcb.lun_id = 0x0;	/* NA */
+ +	cmd->rcb.data_len = 0x0;
+ +	cmd->rcb.data_ea = 0x0;
+ +	cmd->rcb.timeout = MC_AFU_SYNC_TIMEOUT;
+++=======
++ 	cmd->hwq_index = hwq->index;
++ 	cmd->rcb.ctx_id = hwq->ctx_hndl;
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+  
+- 	cmd->rcb.cdb[0] = 0xC0;	/* AFU Sync */
+- 	cmd->rcb.cdb[1] = mode;
+- 
+- 	/* The cdb is aligned, no unaligned accessors required */
+- 	*((__be16 *)&cmd->rcb.cdb[2]) = cpu_to_be16(ctx_hndl_u);
+- 	*((__be32 *)&cmd->rcb.cdb[4]) = cpu_to_be32(res_hndl_u);
++ 	dev_dbg(dev, "%s: afu=%p cmd=%p type=%02x nretry=%d\n",
++ 		__func__, afu, cmd, cmd->rcb.cdb[0], nretry);
+  
+ -	rc = afu->send_cmd(afu, cmd);
+ -	if (unlikely(rc)) {
+ -		rc = -ENOBUFS;
+ +	rc = send_cmd(afu, cmd);
+ +	if (unlikely(rc))
+  		goto out;
+ -	}
+  
+ -	rc = wait_resp(afu, cmd);
+ -	switch (rc) {
+ -	case -ETIMEDOUT:
+ -		rc = afu->context_reset(hwq);
+ -		if (rc) {
+ -			cxlflash_schedule_async_reset(cfg);
+ -			break;
+ -		}
+ -		/* fall through to retry */
+ -	case -EAGAIN:
+ -		if (++nretry < 2)
+ -			goto retry;
+ -		/* fall through to exit */
+ -	default:
+ -		break;
+ -	}
+ +	wait_resp(afu, cmd);
+  
+++<<<<<<< HEAD
+ +	/* Set on timeout */
+ +	if (unlikely((cmd->sa.ioasc != 0) ||
+ +		     (cmd->sa.host_use_b[0] & B_ERROR)))
+ +		rc = -1;
+++=======
++ 	if (rcb->ioasa)
++ 		*rcb->ioasa = cmd->sa;
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+  out:
+ -	atomic_dec(&afu->cmds_active);
+  	mutex_unlock(&sync_active);
+  	kfree(buf);
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * afu_reset() - resets the AFU
+ + * @cfg:	Internal structure associated with the host.
+++=======
++  * cxlflash_afu_sync() - builds and sends an AFU sync command
++  * @afu:	AFU associated with the host.
++  * @ctx:	Identifies context requesting sync.
++  * @res:	Identifies resource requesting sync.
++  * @mode:	Type of sync to issue (lightweight, heavyweight, global).
++  *
++  * AFU sync operations are only necessary and allowed when the device is
++  * operating normally. When not operating normally, sync requests can occur as
++  * part of cleaning up resources associated with an adapter prior to removal.
++  * In this scenario, these requests are simply ignored (safe due to the AFU
++  * going away).
++  *
++  * Return:
++  *	0 on success, -errno on failure
++  */
++ int cxlflash_afu_sync(struct afu *afu, ctx_hndl_t ctx, res_hndl_t res, u8 mode)
++ {
++ 	struct cxlflash_cfg *cfg = afu->parent;
++ 	struct device *dev = &cfg->dev->dev;
++ 	struct sisl_ioarcb rcb = { 0 };
++ 
++ 	dev_dbg(dev, "%s: afu=%p ctx=%u res=%u mode=%u\n",
++ 		__func__, afu, ctx, res, mode);
++ 
++ 	rcb.req_flags = SISL_REQ_FLAGS_AFU_CMD;
++ 	rcb.msi = SISL_MSI_RRQ_UPDATED;
++ 	rcb.timeout = MC_AFU_SYNC_TIMEOUT;
++ 
++ 	rcb.cdb[0] = SISL_AFU_CMD_SYNC;
++ 	rcb.cdb[1] = mode;
++ 	put_unaligned_be16(ctx, &rcb.cdb[2]);
++ 	put_unaligned_be32(res, &rcb.cdb[4]);
++ 
++ 	return send_afu_cmd(afu, &rcb);
++ }
++ 
++ /**
++  * cxlflash_eh_abort_handler() - abort a SCSI command
++  * @scp:	SCSI command to abort.
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+   *
+ - * CXL Flash devices do not support a single command abort. Reset the context
+ - * as per SISLite specification. Flush any pending commands in the hardware
+ - * queue before the reset.
+ - *
+ - * Return: SUCCESS/FAILED as defined in scsi/scsi.h
+ + * Return: 0 on success, -errno on failure
+   */
+ -static int cxlflash_eh_abort_handler(struct scsi_cmnd *scp)
+ +static int afu_reset(struct cxlflash_cfg *cfg)
+  {
+ -	int rc = FAILED;
+ -	struct Scsi_Host *host = scp->device->host;
+ -	struct cxlflash_cfg *cfg = shost_priv(host);
+ -	struct afu_cmd *cmd = sc_to_afuc(scp);
+ -	struct device *dev = &cfg->dev->dev;
+ -	struct afu *afu = cfg->afu;
+ -	struct hwq *hwq = get_hwq(afu, cmd->hwq_index);
+ -
+ -	dev_dbg(dev, "%s: (scp=%p) %d/%d/%d/%llu "
+ -		"cdb=(%08x-%08x-%08x-%08x)\n", __func__, scp, host->host_no,
+ -		scp->device->channel, scp->device->id, scp->device->lun,
+ -		get_unaligned_be32(&((u32 *)scp->cmnd)[0]),
+ -		get_unaligned_be32(&((u32 *)scp->cmnd)[1]),
+ -		get_unaligned_be32(&((u32 *)scp->cmnd)[2]),
+ -		get_unaligned_be32(&((u32 *)scp->cmnd)[3]));
+ -
+ -	/* When the state is not normal, another reset/reload is in progress.
+ -	 * Return failed and the mid-layer will invoke host reset handler.
+ +	int rc = 0;
+ +	/* Stop the context before the reset. Since the context is
+ +	 * no longer available restart it after the reset is complete
+  	 */
+ -	if (cfg->state != STATE_NORMAL) {
+ -		dev_dbg(dev, "%s: Invalid state for abort, state=%d\n",
+ -			__func__, cfg->state);
+ -		goto out;
+ -	}
+  
+ -	rc = afu->context_reset(hwq);
+ -	if (unlikely(rc))
+ -		goto out;
+ +	term_afu(cfg);
+  
+ -	rc = SUCCESS;
+ +	rc = init_afu(cfg);
+  
+ -out:
+ -	dev_dbg(dev, "%s: returning rc=%d\n", __func__, rc);
+ +	pr_debug("%s: returning rc=%d\n", __func__, rc);
+  	return rc;
+  }
+  
+diff --cc drivers/scsi/cxlflash/sislite.h
+index 347fc1671975,483710a89781..000000000000
+mode 100755,100644..100755
+--- a/drivers/scsi/cxlflash/sislite.h
++++ b/drivers/scsi/cxlflash/sislite.h
+@@@ -72,7 -72,12 +72,16 @@@ struct sisl_ioarcb 
+  	u16 timeout;		/* in units specified by req_flags */
+  	u32 rsvd1;
+  	u8 cdb[16];		/* must be in big endian */
+++<<<<<<< HEAD
+ +	struct scsi_cmnd *scp;
+++=======
++ #define SISL_AFU_CMD_SYNC		0xC0	/* AFU sync command */
++ 
++ 	union {
++ 		u64 reserved;			/* Reserved for IOARRIN mode */
++ 		struct sisl_ioasa *ioasa;	/* IOASA EA for SQ Mode */
++ 	};
+++>>>>>>> cf2430279006 (scsi: cxlflash: Separate AFU internal command handling from AFU sync specifics)
+  } __packed;
+  
+  struct sisl_rc {
+* Unmerged path drivers/scsi/cxlflash/main.c
+* Unmerged path drivers/scsi/cxlflash/sislite.h
