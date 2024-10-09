@@ -1,0 +1,192 @@
+kprobes: Propagate error from arm_kprobe_ftrace()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jessica Yu <jeyu@kernel.org>
+commit 12310e3437554328bcd75186cf331bc712cb30b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/12310e34.failed
+
+Improve error handling when arming ftrace-based kprobes. Specifically, if
+we fail to arm a ftrace-based kprobe, register_kprobe()/enable_kprobe()
+should report an error instead of success. Previously, this has lead to
+confusing situations where register_kprobe() would return 0 indicating
+success, but the kprobe would not be functional if ftrace registration
+during the kprobe arming process had failed. We should therefore take any
+errors returned by ftrace into account and propagate this error so that we
+do not register/enable kprobes that cannot be armed. This can happen if,
+for example, register_ftrace_function() finds an IPMODIFY conflict (since
+kprobe_ftrace_ops has this flag set) and returns an error. Such a conflict
+is possible since livepatches also set the IPMODIFY flag for their ftrace_ops.
+
+arm_all_kprobes() keeps its current behavior and attempts to arm all
+kprobes. It returns the last encountered error and gives a warning if
+not all probes could be armed.
+
+This patch is based on Petr Mladek's original patchset (patches 2 and 3)
+back in 2015, which improved kprobes error handling, found here:
+
+   https://lkml.org/lkml/2015/2/26/452
+
+However, further work on this had been paused since then and the patches
+were not upstreamed.
+
+Based-on-patches-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Jessica Yu <jeyu@kernel.org>
+	Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Ananth N Mavinakayanahalli <ananth@linux.vnet.ibm.com>
+	Cc: Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
+	Cc: David S . Miller <davem@davemloft.net>
+	Cc: Jiri Kosina <jikos@kernel.org>
+	Cc: Joe Lawrence <joe.lawrence@redhat.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Miroslav Benes <mbenes@suse.cz>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Petr Mladek <pmladek@suse.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: live-patching@vger.kernel.org
+Link: http://lkml.kernel.org/r/20180109235124.30886-2-jeyu@kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 12310e3437554328bcd75186cf331bc712cb30b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kprobes.c
+diff --cc kernel/kprobes.c
+index a0d8f0f341d9,2d988141ab85..000000000000
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@@ -941,9 -978,9 +941,13 @@@ static int __kprobes prepare_kprobe(str
+  }
+  
+  /* Caller must lock kprobe_mutex */
+++<<<<<<< HEAD
+ +static void __kprobes arm_kprobe_ftrace(struct kprobe *p)
+++=======
++ static int arm_kprobe_ftrace(struct kprobe *p)
+++>>>>>>> 12310e343755 (kprobes: Propagate error from arm_kprobe_ftrace())
+  {
+- 	int ret;
++ 	int ret = 0;
+  
+  	ret = ftrace_set_filter_ip(&kprobe_ftrace_ops,
+  				   (unsigned long)p->addr, 0, 0);
+@@@ -976,20 -1031,18 +998,35 @@@ static void __kprobes disarm_kprobe_ftr
+  #endif
+  
+  /* Arm a kprobe with text_mutex */
+++<<<<<<< HEAD
+ +static void __kprobes arm_kprobe(struct kprobe *kp)
+ +{
+ +	if (unlikely(kprobe_ftrace(kp))) {
+ +		arm_kprobe_ftrace(kp);
+ +		return;
+ +	}
+ +	/*
+ +	 * Here, since __arm_kprobe() doesn't use stop_machine(),
+ +	 * this doesn't cause deadlock on text_mutex. So, we don't
+ +	 * need get_online_cpus().
+ +	 */
+ +	mutex_lock(&text_mutex);
+ +	__arm_kprobe(kp);
+ +	mutex_unlock(&text_mutex);
+++=======
++ static int arm_kprobe(struct kprobe *kp)
++ {
++ 	if (unlikely(kprobe_ftrace(kp)))
++ 		return arm_kprobe_ftrace(kp);
++ 
++ 	cpus_read_lock();
++ 	mutex_lock(&text_mutex);
++ 	__arm_kprobe(kp);
++ 	mutex_unlock(&text_mutex);
++ 	cpus_read_unlock();
++ 
++ 	return 0;
+++>>>>>>> 12310e343755 (kprobes: Propagate error from arm_kprobe_ftrace())
+  }
+  
+  /* Disarm a kprobe with text_mutex */
+@@@ -2235,7 -2400,47 +2286,51 @@@ static const struct file_operations deb
+  	.release        = seq_release,
+  };
+  
+++<<<<<<< HEAD
+ +static void __kprobes arm_all_kprobes(void)
+++=======
++ /* kprobes/blacklist -- shows which functions can not be probed */
++ static void *kprobe_blacklist_seq_start(struct seq_file *m, loff_t *pos)
++ {
++ 	return seq_list_start(&kprobe_blacklist, *pos);
++ }
++ 
++ static void *kprobe_blacklist_seq_next(struct seq_file *m, void *v, loff_t *pos)
++ {
++ 	return seq_list_next(v, &kprobe_blacklist, pos);
++ }
++ 
++ static int kprobe_blacklist_seq_show(struct seq_file *m, void *v)
++ {
++ 	struct kprobe_blacklist_entry *ent =
++ 		list_entry(v, struct kprobe_blacklist_entry, list);
++ 
++ 	seq_printf(m, "0x%p-0x%p\t%ps\n", (void *)ent->start_addr,
++ 		   (void *)ent->end_addr, (void *)ent->start_addr);
++ 	return 0;
++ }
++ 
++ static const struct seq_operations kprobe_blacklist_seq_ops = {
++ 	.start = kprobe_blacklist_seq_start,
++ 	.next  = kprobe_blacklist_seq_next,
++ 	.stop  = kprobe_seq_stop,	/* Reuse void function */
++ 	.show  = kprobe_blacklist_seq_show,
++ };
++ 
++ static int kprobe_blacklist_open(struct inode *inode, struct file *filp)
++ {
++ 	return seq_open(filp, &kprobe_blacklist_seq_ops);
++ }
++ 
++ static const struct file_operations debugfs_kprobe_blacklist_ops = {
++ 	.open           = kprobe_blacklist_open,
++ 	.read           = seq_read,
++ 	.llseek         = seq_lseek,
++ 	.release        = seq_release,
++ };
++ 
++ static int arm_all_kprobes(void)
+++>>>>>>> 12310e343755 (kprobes: Propagate error from arm_kprobe_ftrace())
+  {
+  	struct hlist_head *head;
+  	struct kprobe *p;
+@@@ -2265,10 -2483,10 +2373,10 @@@
+  
+  already_enabled:
+  	mutex_unlock(&kprobe_mutex);
+- 	return;
++ 	return ret;
+  }
+  
+ -static void disarm_all_kprobes(void)
+ +static void __kprobes disarm_all_kprobes(void)
+  {
+  	struct hlist_head *head;
+  	struct kprobe *p;
+@@@ -2338,8 -2558,13 +2447,11 @@@ static ssize_t write_enabled_file_bool(
+  	case '0':
+  		disarm_all_kprobes();
+  		break;
+ -	default:
+ -		return -EINVAL;
+  	}
+  
++ 	if (ret)
++ 		return ret;
++ 
+  	return count;
+  }
+  
+* Unmerged path kernel/kprobes.c
