@@ -1,0 +1,377 @@
+amd-xgbe: Rework the Rx path SKB allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 7d9ca345b50881097eeac9d88a2899dd5e150927
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7d9ca345.failed
+
+Rework the SKB allocation so that all of the buffers of the first
+descriptor are handled in the SKB allocation routine. After copying the
+data in the header buffer (which can be just the header if split header
+processing succeeded for header plus data if split header processing did
+not succeed) into the SKB, check for remaining data in the receive
+buffer. If there is data remaining in the receive buffer, add that as a
+frag to the SKB. Once an SKB has been allocated, all other descriptors
+are added as frags to the SKB.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7d9ca345b50881097eeac9d88a2899dd5e150927)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index 28954354521f,dd03ad865caf..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -355,9 -454,37 +355,19 @@@ static void xgbe_unmap_skb(struct xgbe_
+  		rdata->skb = NULL;
+  	}
+  
+ -	if (rdata->rx.hdr.pa.pages)
+ -		put_page(rdata->rx.hdr.pa.pages);
+ -
+ -	if (rdata->rx.hdr.pa_unmap.pages) {
+ -		dma_unmap_page(pdata->dev, rdata->rx.hdr.pa_unmap.pages_dma,
+ -			       rdata->rx.hdr.pa_unmap.pages_len,
+ -			       DMA_FROM_DEVICE);
+ -		put_page(rdata->rx.hdr.pa_unmap.pages);
+ -	}
+ -
+ -	if (rdata->rx.buf.pa.pages)
+ -		put_page(rdata->rx.buf.pa.pages);
+ -
+ -	if (rdata->rx.buf.pa_unmap.pages) {
+ -		dma_unmap_page(pdata->dev, rdata->rx.buf.pa_unmap.pages_dma,
+ -			       rdata->rx.buf.pa_unmap.pages_len,
+ -			       DMA_FROM_DEVICE);
+ -		put_page(rdata->rx.buf.pa_unmap.pages);
+ -	}
+ -
+ -	memset(&rdata->tx, 0, sizeof(rdata->tx));
+ -	memset(&rdata->rx, 0, sizeof(rdata->rx));
+ -
+ +	rdata->tso_header = 0;
+ +	rdata->len = 0;
+  	rdata->mapped_as_page = 0;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (rdata->state_saved) {
++ 		rdata->state_saved = 0;
++ 		rdata->state.skb = NULL;
++ 		rdata->state.len = 0;
++ 		rdata->state.error = 0;
++ 	}
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  }
+  
+  static int xgbe_map_tx_skb(struct xgbe_channel *channel, struct sk_buff *skb)
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,f0fbe3386951..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1098,6 -1822,48 +1098,51 @@@ static void xgbe_rx_refresh(struct xgbe
+  			  lower_32_bits(rdata->rdesc_dma));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
++ 				       struct napi_struct *napi,
++ 				       struct xgbe_ring_data *rdata,
++ 				       unsigned int len)
++ {
++ 	struct sk_buff *skb;
++ 	u8 *packet;
++ 	unsigned int copy_len;
++ 
++ 	skb = napi_alloc_skb(napi, rdata->rx.hdr.dma_len);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	/* Start with the header buffer which may contain just the header
++ 	 * or the header plus data
++ 	 */
++ 	dma_sync_single_for_cpu(pdata->dev, rdata->rx.hdr.dma,
++ 				rdata->rx.hdr.dma_len, DMA_FROM_DEVICE);
++ 
++ 	packet = page_address(rdata->rx.hdr.pa.pages) +
++ 		 rdata->rx.hdr.pa.pages_offset;
++ 	copy_len = (rdata->rx.hdr_len) ? rdata->rx.hdr_len : len;
++ 	copy_len = min(rdata->rx.hdr.dma_len, copy_len);
++ 	skb_copy_to_linear_data(skb, packet, copy_len);
++ 	skb_put(skb, copy_len);
++ 
++ 	len -= copy_len;
++ 	if (len) {
++ 		/* Add the remaining data as a frag */
++ 		dma_sync_single_for_cpu(pdata->dev, rdata->rx.buf.dma,
++ 					rdata->rx.buf.dma_len, DMA_FROM_DEVICE);
++ 
++ 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 				rdata->rx.buf.pa.pages,
++ 				rdata->rx.buf.pa.pages_offset,
++ 				len, rdata->rx.buf.dma_len);
++ 		rdata->rx.buf.pa.pages = NULL;
++ 	}
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  static int xgbe_tx_poll(struct xgbe_channel *channel)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+@@@ -1163,10 -1937,13 +1208,18 @@@ static int xgbe_rx_poll(struct xgbe_cha
+  	struct xgbe_ring_data *rdata;
+  	struct xgbe_packet_data *packet;
+  	struct net_device *netdev = pdata->netdev;
+ -	struct napi_struct *napi;
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+ +	unsigned int incomplete, error;
+ +	unsigned int cur_len, put_len, max_len;
+ +	int received = 0;
+++=======
++ 	struct skb_shared_hwtstamps *hwtstamps;
++ 	unsigned int incomplete, error, context_next, context;
++ 	unsigned int len, rdesc_len, max_len;
++ 	unsigned int received = 0;
++ 	int packet_count = 0;
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  
+  	DBGPR("-->xgbe_rx_poll: budget=%d\n", budget);
+  
+@@@ -1174,22 -1951,34 +1227,45 @@@
+  	if (!ring)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	incomplete = 0;
++ 	context_next = 0;
++ 
++ 	napi = (pdata->per_channel_irq) ? &channel->napi : &pdata->napi;
++ 
++ 	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  	packet = &ring->packet_data;
+ -	while (packet_count < budget) {
+ +	while (received < budget) {
+  		DBGPR("  cur = %d\n", ring->cur);
+  
+++<<<<<<< HEAD
+ +		/* Clear the packet data information */
+ +		memset(packet, 0, sizeof(*packet));
+ +		skb = NULL;
+ +		error = 0;
+ +		cur_len = 0;
+++=======
++ 		/* First time in loop see if we need to restore state */
++ 		if (!received && rdata->state_saved) {
++ 			skb = rdata->state.skb;
++ 			error = rdata->state.error;
++ 			len = rdata->state.len;
++ 		} else {
++ 			memset(packet, 0, sizeof(*packet));
++ 			skb = NULL;
++ 			error = 0;
++ 			len = 0;
++ 		}
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  
+  read_again:
+ -		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ -
+ -		if (xgbe_rx_dirty_desc(ring) > (XGBE_RX_DESC_CNT >> 3))
+ +		if (ring->dirty > (XGBE_RX_DESC_CNT >> 3))
+  			xgbe_rx_refresh(channel);
+  
+ +		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ +
+  		if (hw_if->dev_read(channel))
+  			break;
+  
+@@@ -1211,35 -2001,43 +1287,64 @@@
+  
+  		if (error || packet->errors) {
+  			if (packet->errors)
+ -				netif_err(pdata, rx_err, netdev,
+ -					  "error in received packet\n");
+ +				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+ +					error = 1;
+ +					goto read_again;
+ +				}
+ +
+ +				dev_kfree_skb(skb);
+ +				continue;
+++=======
++ 		if (!context) {
++ 			/* Length is cumulative, get this descriptor's length */
++ 			rdesc_len = rdata->rx.len - len;
++ 			len += rdesc_len;
++ 
++ 			if (rdesc_len && !skb) {
++ 				skb = xgbe_create_skb(pdata, napi, rdata,
++ 						      rdesc_len);
++ 				if (!skb)
++ 					error = 1;
++ 			} else if (rdesc_len) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx.buf.dma,
++ 							rdata->rx.buf.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 						rdata->rx.buf.pa.pages,
++ 						rdata->rx.buf.pa.pages_offset,
++ 						rdesc_len,
++ 						rdata->rx.buf.dma_len);
++ 				rdata->rx.buf.pa.pages = NULL;
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+++<<<<<<< HEAD
+ +		if (incomplete)
+++=======
++ 		if (incomplete || context_next)
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  			goto read_again;
+  
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+@@@ -1269,18 -2067,72 +1374,29 @@@
+  		skb->dev = netdev;
+  		skb->protocol = eth_type_trans(skb, netdev);
+  		skb_record_rx_queue(skb, channel->queue_index);
+ -		skb_mark_napi_id(skb, napi);
+ -
+ -		napi_gro_receive(napi, skb);
+ +		skb_mark_napi_id(skb, &pdata->napi);
+  
+ -next_packet:
+ -		packet_count++;
+ +		netdev->last_rx = jiffies;
+ +		napi_gro_receive(&pdata->napi, skb);
+  	}
+  
+++<<<<<<< HEAD
+ +	DBGPR("<--xgbe_rx_poll: received = %d\n", received);
+++=======
++ 	/* Check if we need to save state before leaving */
++ 	if (received && (incomplete || context_next)) {
++ 		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 		rdata->state_saved = 1;
++ 		rdata->state.skb = skb;
++ 		rdata->state.len = len;
++ 		rdata->state.error = error;
++ 	}
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  
+ -	DBGPR("<--xgbe_rx_poll: packet_count = %d\n", packet_count);
+ -
+ -	return packet_count;
+ -}
+ -
+ -static int xgbe_one_poll(struct napi_struct *napi, int budget)
+ -{
+ -	struct xgbe_channel *channel = container_of(napi, struct xgbe_channel,
+ -						    napi);
+ -	int processed = 0;
+ -
+ -	DBGPR("-->xgbe_one_poll: budget=%d\n", budget);
+ -
+ -	/* Cleanup Tx ring first */
+ -	xgbe_tx_poll(channel);
+ -
+ -	/* Process Rx ring next */
+ -	processed = xgbe_rx_poll(channel, budget);
+ -
+ -	/* If we processed everything, we are done */
+ -	if (processed < budget) {
+ -		/* Turn off polling */
+ -		napi_complete(napi);
+ -
+ -		/* Enable Tx and Rx interrupts */
+ -		enable_irq(channel->dma_irq);
+ -	}
+ -
+ -	DBGPR("<--xgbe_one_poll: received = %d\n", processed);
+ -
+ -	return processed;
+ +	return received;
+  }
+  
+ -static int xgbe_all_poll(struct napi_struct *napi, int budget)
+ +static int xgbe_poll(struct napi_struct *napi, int budget)
+  {
+  	struct xgbe_prv_data *pdata = container_of(napi, struct xgbe_prv_data,
+  						   napi);
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a,e182b2569bde..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -232,13 -321,23 +232,28 @@@ struct xgbe_ring_data 
+  	struct sk_buff *skb;		/* Virtual address of SKB */
+  	dma_addr_t skb_dma;		/* DMA address of SKB data */
+  	unsigned int skb_dma_len;	/* Length of SKB DMA area */
+ +	unsigned int tso_header;        /* TSO header indicator */
+  
+ -	struct xgbe_tx_ring_data tx;	/* Tx-related data */
+ -	struct xgbe_rx_ring_data rx;	/* Rx-related data */
+ +	unsigned short len;		/* Length of received Rx packet */
+ +
+ +	unsigned int interrupt;		/* Interrupt indicator */
+  
+  	unsigned int mapped_as_page;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Incomplete receive save location.  If the budget is exhausted
++ 	 * or the last descriptor (last normal descriptor or a following
++ 	 * context descriptor) has not been DMA'd yet the current state
++ 	 * of the receive processing needs to be saved.
++ 	 */
++ 	unsigned int state_saved;
++ 	struct {
++ 		struct sk_buff *skb;
++ 		unsigned int len;
++ 		unsigned int error;
++ 	} state;
+++>>>>>>> 7d9ca345b508 (amd-xgbe: Rework the Rx path SKB allocation)
+  };
+  
+  struct xgbe_ring {
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
