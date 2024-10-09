@@ -1,0 +1,130 @@
+md/r5cache: after recovery, increase journal seq by 10000
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] r5cache: after recovery, increase journal seq by 10000 (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 97.30%
+commit-author Song Liu <songliubraving@fb.com>
+commit 3c6edc66085e1d895a698c572bbfaf4d57fdb771
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3c6edc66.failed
+
+Currently, we increase journal entry seq by 10 after recovery.
+However, this is not sufficient in the following case.
+
+After crash the journal looks like
+
+| seq+0 | +1 | +2 | +3 | +4 | +5 | +6 | +7 | ... | +11 | +12 |
+
+If +1 is not valid, we dropped all entries from +1 to +12; and
+write seq+10:
+
+| seq+0 | +10 | +2 | +3 | +4 | +5 | +6 | +7 | ... | +11 | +12 |
+
+However, if we write a big journal entry with seq+11, it will
+connect with some stale journal entry:
+
+| seq+0 | +10 |                     +11                 | +12 |
+
+To reduce the risk of this issue, we increase seq by 10000 instead.
+
+Shaohua: use 10000 instead of 1000. The risk should be very unlikely. The total
+stripe cache size is less than 2k typically, and several stripes can fit into
+one meta data block. So the total inflight meta data blocks would be quite
+small, which means the the total sequence number used should be quite small.
+The 10000 sequence number increase should be far more than safe.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 3c6edc66085e1d895a698c572bbfaf4d57fdb771)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index c6ed6dc6889f,de8a4ede0bc9..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -1670,47 -2151,44 +1670,54 @@@ static int r5l_recovery_log(struct r5l_
+  	if (!ctx.meta_page)
+  		return -ENOMEM;
+  
+ -	ret = r5c_recovery_flush_log(log, &ctx);
+ +	r5l_recovery_flush_log(log, &ctx);
+  	__free_page(ctx.meta_page);
+  
+ -	if (ret)
+ -		return ret;
+ -
+ +	/*
+ +	 * we did a recovery. Now ctx.pos points to an invalid meta block. New
+ +	 * log will start here. but we can't let superblock point to last valid
+ +	 * meta block. The log might looks like:
+ +	 * | meta 1| meta 2| meta 3|
+ +	 * meta 1 is valid, meta 2 is invalid. meta 3 could be valid. If
+ +	 * superblock points to meta 1, we write a new valid meta 2n.  if crash
+ +	 * happens again, new recovery will start from meta 1. Since meta 2n is
+ +	 * valid now, recovery will think meta 3 is valid, which is wrong.
+ +	 * The solution is we create a new meta in meta2 with its seq == meta
+ +	 * 1's seq + 10 and let superblock points to meta2. The same recovery will
+ +	 * not think meta 3 is a valid meta, because its seq doesn't match
+ +	 */
+ +	if (ctx.seq > log->last_cp_seq) {
+ +		int ret;
+ +
+++<<<<<<< HEAD
+ +		ret = r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq + 10);
+ +		if (ret)
+ +			return ret;
+ +		log->seq = ctx.seq + 11;
+ +		log->log_start = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
+ +		r5l_write_super(log, ctx.pos);
+ +		log->last_checkpoint = ctx.pos;
+++=======
++ 	pos = ctx.pos;
++ 	ctx.seq += 10000;
++ 
++ 	if (ctx.data_only_stripes == 0) {
+++>>>>>>> 3c6edc66085e (md/r5cache: after recovery, increase journal seq by 10000)
+  		log->next_checkpoint = ctx.pos;
+ -		r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq++);
+ -		ctx.pos = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
+  	} else {
+ -		sh = list_last_entry(&ctx.cached_list, struct stripe_head, lru);
+ -		log->next_checkpoint = sh->log_start;
+ +		log->log_start = ctx.pos;
+ +		log->seq = ctx.seq;
+  	}
+  
+ -	if ((ctx.data_only_stripes == 0) && (ctx.data_parity_stripes == 0))
+ -		pr_debug("md/raid:%s: starting from clean shutdown\n",
+ -			 mdname(mddev));
+ -	else {
+ -		pr_debug("md/raid:%s: recoverying %d data-only stripes and %d data-parity stripes\n",
+ -			 mdname(mddev), ctx.data_only_stripes,
+ -			 ctx.data_parity_stripes);
+ -
+ -		if (ctx.data_only_stripes > 0)
+ -			if (r5c_recovery_rewrite_data_only_stripes(log, &ctx)) {
+ -				pr_err("md/raid:%s: failed to rewrite stripes to journal\n",
+ -				       mdname(mddev));
+ -				return -EIO;
+ -			}
+ +	/*
+ +	 * This is to suppress "function defined but not used" warning.
+ +	 * It will be removed when the two functions are used (next patch).
+ +	 */
+ +	if (!log) {
+ +		r5c_recovery_flush_log(log, &ctx);
+ +		r5c_recovery_rewrite_data_only_stripes(log, &ctx);
+  	}
+  
+ -	log->log_start = ctx.pos;
+ -	log->seq = ctx.seq;
+ -	log->last_checkpoint = pos;
+ -	r5l_write_super(log, pos);
+  	return 0;
+  }
+  
+* Unmerged path drivers/md/raid5-cache.c
