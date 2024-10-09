@@ -1,0 +1,281 @@
+qed: Add a missing error code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit c800460086d1db3579b747d9297cecd2bbf70119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c8004600.failed
+
+We should be returning -ENOMEM if qed_mcp_cmd_add_elem() fails.  The
+current code returns success.
+
+Fixes: 4ed1eea82a21 ("qed: Revise MFW command locking")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Acked-by: Tomer Tayar <Tomer.Tayar@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c800460086d1db3579b747d9297cecd2bbf70119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_mcp.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_mcp.c
+index ab5be3bfbe79,ff6080df2246..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@@ -285,67 -318,202 +285,78 @@@ int qed_mcp_reset(struct qed_hwfn *p_hw
+  	return rc;
+  }
+  
+ -/* Must be called while cmd_lock is acquired */
+ -static bool qed_mcp_has_pending_cmd(struct qed_hwfn *p_hwfn)
+ -{
+ -	struct qed_mcp_cmd_elem *p_cmd_elem;
+ -
+ -	/* There is at most one pending command at a certain time, and if it
+ -	 * exists - it is placed at the HEAD of the list.
+ -	 */
+ -	if (!list_empty(&p_hwfn->mcp_info->cmd_list)) {
+ -		p_cmd_elem = list_first_entry(&p_hwfn->mcp_info->cmd_list,
+ -					      struct qed_mcp_cmd_elem, list);
+ -		return !p_cmd_elem->b_is_completed;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -/* Must be called while cmd_lock is acquired */
+ -static int
+ -qed_mcp_update_pending_cmd(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ +static int qed_do_mcp_cmd(struct qed_hwfn *p_hwfn,
+ +			  struct qed_ptt *p_ptt,
+ +			  u32 cmd,
+ +			  u32 param,
+ +			  u32 *o_mcp_resp,
+ +			  u32 *o_mcp_param)
+  {
+ -	struct qed_mcp_mb_params *p_mb_params;
+ -	struct qed_mcp_cmd_elem *p_cmd_elem;
+ -	u32 mcp_resp;
+ -	u16 seq_num;
+ -
+ -	mcp_resp = DRV_MB_RD(p_hwfn, p_ptt, fw_mb_header);
+ -	seq_num = (u16)(mcp_resp & FW_MSG_SEQ_NUMBER_MASK);
+ -
+ -	/* Return if no new non-handled response has been received */
+ -	if (seq_num != p_hwfn->mcp_info->drv_mb_seq)
+ -		return -EAGAIN;
+ -
+ -	p_cmd_elem = qed_mcp_cmd_get_elem(p_hwfn, seq_num);
+ -	if (!p_cmd_elem) {
+ -		DP_ERR(p_hwfn,
+ -		       "Failed to find a pending mailbox cmd that expects sequence number %d\n",
+ -		       seq_num);
+ -		return -EINVAL;
+ -	}
+ -
+ -	p_mb_params = p_cmd_elem->p_mb_params;
+ -
+ -	/* Get the MFW response along with the sequence number */
+ -	p_mb_params->mcp_resp = mcp_resp;
+ -
+ -	/* Get the MFW param */
+ -	p_mb_params->mcp_param = DRV_MB_RD(p_hwfn, p_ptt, fw_mb_param);
+ -
+ -	/* Get the union data */
+ -	if (p_mb_params->p_data_dst != NULL && p_mb_params->data_dst_size) {
+ -		u32 union_data_addr = p_hwfn->mcp_info->drv_mb_addr +
+ -				      offsetof(struct public_drv_mb,
+ -					       union_data);
+ -		qed_memcpy_from(p_hwfn, p_ptt, p_mb_params->p_data_dst,
+ -				union_data_addr, p_mb_params->data_dst_size);
+ -	}
+ -
+ -	p_cmd_elem->b_is_completed = true;
+ -
+ -	return 0;
+ -}
+ -
+ -/* Must be called while cmd_lock is acquired */
+ -static void __qed_mcp_cmd_and_union(struct qed_hwfn *p_hwfn,
+ -				    struct qed_ptt *p_ptt,
+ -				    struct qed_mcp_mb_params *p_mb_params,
+ -				    u16 seq_num)
+ -{
+ -	union drv_union_data union_data;
+ -	u32 union_data_addr;
+ -
+ -	/* Set the union data */
+ -	union_data_addr = p_hwfn->mcp_info->drv_mb_addr +
+ -			  offsetof(struct public_drv_mb, union_data);
+ -	memset(&union_data, 0, sizeof(union_data));
+ -	if (p_mb_params->p_data_src != NULL && p_mb_params->data_src_size)
+ -		memcpy(&union_data, p_mb_params->p_data_src,
+ -		       p_mb_params->data_src_size);
+ -	qed_memcpy_to(p_hwfn, p_ptt, union_data_addr, &union_data,
+ -		      sizeof(union_data));
+ -
+ -	/* Set the drv param */
+ -	DRV_MB_WR(p_hwfn, p_ptt, drv_mb_param, p_mb_params->param);
+ -
+ -	/* Set the drv command along with the sequence number */
+ -	DRV_MB_WR(p_hwfn, p_ptt, drv_mb_header, (p_mb_params->cmd | seq_num));
+ -
+ -	DP_VERBOSE(p_hwfn, QED_MSG_SP,
+ -		   "MFW mailbox: command 0x%08x param 0x%08x\n",
+ -		   (p_mb_params->cmd | seq_num), p_mb_params->param);
+ -}
+ -
+ -static int
+ -_qed_mcp_cmd_and_union(struct qed_hwfn *p_hwfn,
+ -		       struct qed_ptt *p_ptt,
+ -		       struct qed_mcp_mb_params *p_mb_params,
+ -		       u32 max_retries, u32 delay)
+ -{
+ -	struct qed_mcp_cmd_elem *p_cmd_elem;
+ -	u32 cnt = 0;
+ -	u16 seq_num;
+ +	u8 delay = CHIP_MCP_RESP_ITER_US;
+ +	u32 seq, cnt = 1, actual_mb_seq;
+  	int rc = 0;
+  
+ -	/* Wait until the mailbox is non-occupied */
+ -	do {
+ -		/* Exit the loop if there is no pending command, or if the
+ -		 * pending command is completed during this iteration.
+ -		 * The spinlock stays locked until the command is sent.
+ -		 */
+ -
+ -		spin_lock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -
+ -		if (!qed_mcp_has_pending_cmd(p_hwfn))
+ -			break;
+ -
+ -		rc = qed_mcp_update_pending_cmd(p_hwfn, p_ptt);
+ -		if (!rc)
+ -			break;
+ -		else if (rc != -EAGAIN)
+ -			goto err;
+ -
+ -		spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -		udelay(delay);
+ -	} while (++cnt < max_retries);
+ +	/* Get actual driver mailbox sequence */
+ +	actual_mb_seq = DRV_MB_RD(p_hwfn, p_ptt, drv_mb_header) &
+ +			DRV_MSG_SEQ_NUMBER_MASK;
+  
+ -	if (cnt >= max_retries) {
+ -		DP_NOTICE(p_hwfn,
+ -			  "The MFW mailbox is occupied by an uncompleted command. Failed to send command 0x%08x [param 0x%08x].\n",
+ -			  p_mb_params->cmd, p_mb_params->param);
+ -		return -EAGAIN;
+ +	/* Use MCP history register to check if MCP reset occurred between
+ +	 * init time and now.
+ +	 */
+ +	if (p_hwfn->mcp_info->mcp_hist !=
+ +	    qed_rd(p_hwfn, p_ptt, MISCS_REG_GENERIC_POR_0)) {
+ +		DP_VERBOSE(p_hwfn, QED_MSG_SP, "Rereading MCP offsets\n");
+ +		qed_load_mcp_offsets(p_hwfn, p_ptt);
+ +		qed_mcp_cmd_port_init(p_hwfn, p_ptt);
+  	}
+ +	seq = ++p_hwfn->mcp_info->drv_mb_seq;
+  
+++<<<<<<< HEAD
+ +	/* Set drv param */
+ +	DRV_MB_WR(p_hwfn, p_ptt, drv_mb_param, param);
+++=======
++ 	/* Send the mailbox command */
++ 	qed_mcp_reread_offsets(p_hwfn, p_ptt);
++ 	seq_num = ++p_hwfn->mcp_info->drv_mb_seq;
++ 	p_cmd_elem = qed_mcp_cmd_add_elem(p_hwfn, p_mb_params, seq_num);
++ 	if (!p_cmd_elem) {
++ 		rc = -ENOMEM;
++ 		goto err;
++ 	}
+++>>>>>>> c800460086d1 (qed: Add a missing error code)
+  
+ -	__qed_mcp_cmd_and_union(p_hwfn, p_ptt, p_mb_params, seq_num);
+ -	spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+ +	/* Set drv command along with the updated sequence */
+ +	DRV_MB_WR(p_hwfn, p_ptt, drv_mb_header, (cmd | seq));
+  
+ -	/* Wait for the MFW response */
+ -	do {
+ -		/* Exit the loop if the command is already completed, or if the
+ -		 * command is completed during this iteration.
+ -		 * The spinlock stays locked until the list element is removed.
+ -		 */
+ +	DP_VERBOSE(p_hwfn, QED_MSG_SP,
+ +		   "wrote command (%x) to MFW MB param 0x%08x\n",
+ +		   (cmd | seq), param);
+  
+ +	do {
+ +		/* Wait for MFW response */
+  		udelay(delay);
+ -		spin_lock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -
+ -		if (p_cmd_elem->b_is_completed)
+ -			break;
+ -
+ -		rc = qed_mcp_update_pending_cmd(p_hwfn, p_ptt);
+ -		if (!rc)
+ -			break;
+ -		else if (rc != -EAGAIN)
+ -			goto err;
+ -
+ -		spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -	} while (++cnt < max_retries);
+ -
+ -	if (cnt >= max_retries) {
+ -		DP_NOTICE(p_hwfn,
+ -			  "The MFW failed to respond to command 0x%08x [param 0x%08x].\n",
+ -			  p_mb_params->cmd, p_mb_params->param);
+ +		*o_mcp_resp = DRV_MB_RD(p_hwfn, p_ptt, fw_mb_header);
+  
+ -		spin_lock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -		qed_mcp_cmd_del_elem(p_hwfn, p_cmd_elem);
+ -		spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+ +		/* Give the FW up to 5 second (500*10ms) */
+ +	} while ((seq != (*o_mcp_resp & FW_MSG_SEQ_NUMBER_MASK)) &&
+ +		 (cnt++ < QED_DRV_MB_MAX_RETRIES));
+  
+ -		return -EAGAIN;
+ +	DP_VERBOSE(p_hwfn, QED_MSG_SP,
+ +		   "[after %d ms] read (%x) seq is (%x) from FW MB\n",
+ +		   cnt * delay, *o_mcp_resp, seq);
+ +
+ +	/* Is this a reply to our command? */
+ +	if (seq == (*o_mcp_resp & FW_MSG_SEQ_NUMBER_MASK)) {
+ +		*o_mcp_resp &= FW_MSG_CODE_MASK;
+ +		/* Get the MCP param */
+ +		*o_mcp_param = DRV_MB_RD(p_hwfn, p_ptt, fw_mb_param);
+ +	} else {
+ +		/* FW BUG! */
+ +		DP_ERR(p_hwfn, "MFW failed to respond [cmd 0x%x param 0x%x]\n",
+ +		       cmd, param);
+ +		*o_mcp_resp = 0;
+ +		rc = -EAGAIN;
+  	}
+ -
+ -	qed_mcp_cmd_del_elem(p_hwfn, p_cmd_elem);
+ -	spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+ -
+ -	DP_VERBOSE(p_hwfn,
+ -		   QED_MSG_SP,
+ -		   "MFW mailbox: response 0x%08x param 0x%08x [after %d.%03d ms]\n",
+ -		   p_mb_params->mcp_resp,
+ -		   p_mb_params->mcp_param,
+ -		   (cnt * delay) / 1000, (cnt * delay) % 1000);
+ -
+ -	/* Clear the sequence number from the MFW response */
+ -	p_mb_params->mcp_resp &= FW_MSG_CODE_MASK;
+ -
+ -	return 0;
+ -
+ -err:
+ -	spin_unlock_bh(&p_hwfn->mcp_info->cmd_lock);
+  	return rc;
+  }
+  
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_mcp.c
