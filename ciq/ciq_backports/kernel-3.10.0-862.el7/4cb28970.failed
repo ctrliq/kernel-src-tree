@@ -1,0 +1,487 @@
+net: use the new API kvfree()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] use the new API kvfree() (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 90.57%
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 4cb28970a23ff209199b0a4358d68efe82c8f493
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4cb28970.failed
+
+It is available since v3.15-rc5.
+
+	Cc: Pablo Neira Ayuso <pablo@netfilter.org>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4cb28970a23ff209199b0a4358d68efe82c8f493)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nft_hash.c
+diff --cc net/netfilter/nft_hash.c
+index 6fa016564f90,4080ed6a072b..000000000000
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@@ -21,108 -20,195 +21,178 @@@
+  #include <linux/netfilter/nf_tables.h>
+  #include <net/netfilter/nf_tables.h>
+  
+ -#define NFT_HASH_MIN_SIZE	4UL
+ +/* We target a hash table size of 4, element hint is 75% of final size */
+ +#define NFT_HASH_ELEMENT_HINT 3
+  
+  struct nft_hash {
+ -	struct nft_hash_table __rcu	*tbl;
+ +	struct rhashtable		ht;
+ +	struct delayed_work		gc_work;
+  };
+  
+ -struct nft_hash_table {
+ -	unsigned int			size;
+ -	struct nft_hash_elem __rcu	*buckets[];
+ +struct nft_hash_elem {
+ +	struct rhash_head		node;
+ +	struct nft_set_ext		ext;
+  };
+  
+ -struct nft_hash_elem {
+ -	struct nft_hash_elem __rcu	*next;
+ -	struct nft_data			key;
+ -	struct nft_data			data[];
+ +struct nft_hash_cmp_arg {
+ +	const struct nft_set		*set;
+ +	const u32			*key;
+ +	u8				genmask;
+  };
+  
+ -#define nft_hash_for_each_entry(i, head) \
+ -	for (i = nft_dereference(head); i != NULL; i = nft_dereference(i->next))
+ -#define nft_hash_for_each_entry_rcu(i, head) \
+ -	for (i = rcu_dereference(head); i != NULL; i = rcu_dereference(i->next))
+ +static const struct rhashtable_params nft_hash_params;
+ +
+ +static inline u32 nft_hash_key(const void *data, u32 len, u32 seed)
+ +{
+ +	const struct nft_hash_cmp_arg *arg = data;
+  
+ -static u32 nft_hash_rnd __read_mostly;
+ -static bool nft_hash_rnd_initted __read_mostly;
+ +	return jhash(arg->key, len, seed);
+ +}
+  
+ -static unsigned int nft_hash_data(const struct nft_data *data,
+ -				  unsigned int hsize, unsigned int len)
+ +static inline u32 nft_hash_obj(const void *data, u32 len, u32 seed)
+  {
+ -	unsigned int h;
+ +	const struct nft_hash_elem *he = data;
+  
+ -	h = jhash(data->data, len, nft_hash_rnd);
+ -	return h & (hsize - 1);
+ +	return jhash(nft_set_ext_key(&he->ext), len, seed);
+  }
+  
+ -static bool nft_hash_lookup(const struct nft_set *set,
+ -			    const struct nft_data *key,
+ -			    struct nft_data *data)
+ +static inline int nft_hash_cmp(struct rhashtable_compare_arg *arg,
+ +			       const void *ptr)
+  {
+ -	const struct nft_hash *priv = nft_set_priv(set);
+ -	const struct nft_hash_table *tbl = rcu_dereference(priv->tbl);
+ +	const struct nft_hash_cmp_arg *x = arg->key;
+ +	const struct nft_hash_elem *he = ptr;
+ +
+ +	if (memcmp(nft_set_ext_key(&he->ext), x->key, x->set->klen))
+ +		return 1;
+ +	if (nft_set_elem_expired(&he->ext))
+ +		return 1;
+ +	if (!nft_set_elem_active(&he->ext, x->genmask))
+ +		return 1;
+ +	return 0;
+ +}
+ +
+ +static bool nft_hash_lookup(const struct nft_set *set, const u32 *key,
+ +			    const struct nft_set_ext **ext)
+ +{
+ +	struct nft_hash *priv = nft_set_priv(set);
+  	const struct nft_hash_elem *he;
+ -	unsigned int h;
+ +	struct nft_hash_cmp_arg arg = {
+ +		.genmask = nft_genmask_cur(read_pnet(&set->pnet)),
+ +		.set	 = set,
+ +		.key	 = key,
+ +	};
+  
+ -	h = nft_hash_data(key, tbl->size, set->klen);
+ -	nft_hash_for_each_entry_rcu(he, tbl->buckets[h]) {
+ -		if (nft_data_cmp(&he->key, key, set->klen))
+ -			continue;
+ -		if (set->flags & NFT_SET_MAP)
+ -			nft_data_copy(data, he->data);
+ -		return true;
+ -	}
+ -	return false;
+ +	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ +	if (he != NULL)
+ +		*ext = &he->ext;
+ +
+ +	return !!he;
+  }
+  
+ -static void nft_hash_tbl_free(const struct nft_hash_table *tbl)
+ +static bool nft_hash_update(struct nft_set *set, const u32 *key,
+ +			    void *(*new)(struct nft_set *,
+ +					 const struct nft_expr *,
+ +					 struct nft_regs *regs),
+ +			    const struct nft_expr *expr,
+ +			    struct nft_regs *regs,
+ +			    const struct nft_set_ext **ext)
+  {
+++<<<<<<< HEAD
+ +	struct nft_hash *priv = nft_set_priv(set);
+++=======
++ 	kvfree(tbl);
++ }
++ 
++ static unsigned int nft_hash_tbl_size(unsigned int nelem)
++ {
++ 	return max(roundup_pow_of_two(nelem * 4 / 3), NFT_HASH_MIN_SIZE);
++ }
++ 
++ static struct nft_hash_table *nft_hash_tbl_alloc(unsigned int nbuckets)
++ {
++ 	struct nft_hash_table *tbl;
++ 	size_t size;
++ 
++ 	size = sizeof(*tbl) + nbuckets * sizeof(tbl->buckets[0]);
++ 	tbl = kzalloc(size, GFP_KERNEL | __GFP_REPEAT | __GFP_NOWARN);
++ 	if (tbl == NULL)
++ 		tbl = vzalloc(size);
++ 	if (tbl == NULL)
++ 		return NULL;
++ 	tbl->size = nbuckets;
++ 
++ 	return tbl;
++ }
++ 
++ static void nft_hash_chain_unzip(const struct nft_set *set,
++ 				 const struct nft_hash_table *ntbl,
++ 				 struct nft_hash_table *tbl, unsigned int n)
++ {
++ 	struct nft_hash_elem *he, *last, *next;
++ 	unsigned int h;
++ 
++ 	he = nft_dereference(tbl->buckets[n]);
++ 	if (he == NULL)
++ 		return;
++ 	h = nft_hash_data(&he->key, ntbl->size, set->klen);
++ 
++ 	/* Find last element of first chain hashing to bucket h */
++ 	last = he;
++ 	nft_hash_for_each_entry(he, he->next) {
++ 		if (nft_hash_data(&he->key, ntbl->size, set->klen) != h)
++ 			break;
++ 		last = he;
++ 	}
++ 
++ 	/* Unlink first chain from the old table */
++ 	RCU_INIT_POINTER(tbl->buckets[n], last->next);
++ 
++ 	/* If end of chain reached, done */
++ 	if (he == NULL)
++ 		return;
++ 
++ 	/* Find first element of second chain hashing to bucket h */
++ 	next = NULL;
++ 	nft_hash_for_each_entry(he, he->next) {
++ 		if (nft_hash_data(&he->key, ntbl->size, set->klen) != h)
++ 			continue;
++ 		next = he;
++ 		break;
++ 	}
++ 
++ 	/* Link the two chains */
++ 	RCU_INIT_POINTER(last->next, next);
++ }
++ 
++ static int nft_hash_tbl_expand(const struct nft_set *set, struct nft_hash *priv)
++ {
++ 	struct nft_hash_table *tbl = nft_dereference(priv->tbl), *ntbl;
+++>>>>>>> 4cb28970a23f (net: use the new API kvfree())
+  	struct nft_hash_elem *he;
+ -	unsigned int i, h;
+ -	bool complete;
+ -
+ -	ntbl = nft_hash_tbl_alloc(tbl->size * 2);
+ -	if (ntbl == NULL)
+ -		return -ENOMEM;
+ -
+ -	/* Link new table's buckets to first element in the old table
+ -	 * hashing to the new bucket.
+ -	 */
+ -	for (i = 0; i < ntbl->size; i++) {
+ -		h = i < tbl->size ? i : i - tbl->size;
+ -		nft_hash_for_each_entry(he, tbl->buckets[h]) {
+ -			if (nft_hash_data(&he->key, ntbl->size, set->klen) != i)
+ -				continue;
+ -			RCU_INIT_POINTER(ntbl->buckets[i], he);
+ -			break;
+ -		}
+ -	}
+ -
+ -	/* Publish new table */
+ -	rcu_assign_pointer(priv->tbl, ntbl);
+ +	struct nft_hash_cmp_arg arg = {
+ +		.genmask = NFT_GENMASK_ANY,
+ +		.set	 = set,
+ +		.key	 = key,
+ +	};
+  
+ -	/* Unzip interleaved hash chains */
+ -	do {
+ -		/* Wait for readers to use new table/unzipped chains */
+ -		synchronize_rcu();
+ +	he = rhashtable_lookup_fast(&priv->ht, &arg, nft_hash_params);
+ +	if (he != NULL)
+ +		goto out;
+  
+ -		complete = true;
+ -		for (i = 0; i < tbl->size; i++) {
+ -			nft_hash_chain_unzip(set, ntbl, tbl, i);
+ -			if (tbl->buckets[i] != NULL)
+ -				complete = false;
+ -		}
+ -	} while (!complete);
+ -
+ -	nft_hash_tbl_free(tbl);
+ -	return 0;
+ -}
+ -
+ -static int nft_hash_tbl_shrink(const struct nft_set *set, struct nft_hash *priv)
+ -{
+ -	struct nft_hash_table *tbl = nft_dereference(priv->tbl), *ntbl;
+ -	struct nft_hash_elem __rcu **pprev;
+ -	unsigned int i;
+ -
+ -	ntbl = nft_hash_tbl_alloc(tbl->size / 2);
+ -	if (ntbl == NULL)
+ -		return -ENOMEM;
+ -
+ -	for (i = 0; i < ntbl->size; i++) {
+ -		ntbl->buckets[i] = tbl->buckets[i];
+ -
+ -		for (pprev = &ntbl->buckets[i]; *pprev != NULL;
+ -		     pprev = &nft_dereference(*pprev)->next)
+ -			;
+ -		RCU_INIT_POINTER(*pprev, tbl->buckets[i + ntbl->size]);
+ -	}
+ -
+ -	/* Publish new table */
+ -	rcu_assign_pointer(priv->tbl, ntbl);
+ -	synchronize_rcu();
+ +	he = new(set, expr, regs);
+ +	if (he == NULL)
+ +		goto err1;
+ +	if (rhashtable_lookup_insert_key(&priv->ht, &arg, &he->node,
+ +					 nft_hash_params))
+ +		goto err2;
+ +out:
+ +	*ext = &he->ext;
+ +	return true;
+  
+ -	nft_hash_tbl_free(tbl);
+ -	return 0;
+ +err2:
+ +	nft_set_elem_destroy(set, he);
+ +err1:
+ +	return false;
+  }
+  
+  static int nft_hash_insert(const struct nft_set *set,
+diff --git a/net/core/dev.c b/net/core/dev.c
+index b482205867a8..35184f174bd3 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -7129,10 +7129,7 @@ static void netdev_init_one_queue(struct net_device *dev,
+ 
+ static void netif_free_tx_queues(struct net_device *dev)
+ {
+-	if (is_vmalloc_addr(dev->_tx))
+-		vfree(dev->_tx);
+-	else
+-		kfree(dev->_tx);
++	kvfree(dev->_tx);
+ }
+ 
+ static int netif_alloc_netdev_queues(struct net_device *dev)
+@@ -7640,10 +7637,7 @@ void netdev_freemem(struct net_device *dev)
+ {
+ 	char *addr = (char *)dev - dev->padded;
+ 
+-	if (is_vmalloc_addr(addr))
+-		vfree(addr);
+-	else
+-		kfree(addr);
++	kvfree(addr);
+ }
+ 
+ /**
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index af7c5919cddc..3409696b6f3f 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -1164,10 +1164,7 @@ static void __net_exit tcp_net_metrics_exit(struct net *net)
+ 			tm = next;
+ 		}
+ 	}
+-	if (is_vmalloc_addr(net->ipv4.tcp_metrics_hash))
+-		vfree(net->ipv4.tcp_metrics_hash);
+-	else
+-		kfree(net->ipv4.tcp_metrics_hash);
++	kvfree(net->ipv4.tcp_metrics_hash);
+ }
+ 
+ static __net_initdata struct pernet_operations tcp_net_metrics_ops = {
+diff --git a/net/netfilter/ipset/ip_set_core.c b/net/netfilter/ipset/ip_set_core.c
+index 98b197a78f1a..abbafe328523 100644
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@ -260,10 +260,7 @@ ip_set_free(void *members)
+ {
+ 	pr_debug("%p: free with %s\n", members,
+ 		 is_vmalloc_addr(members) ? "vfree" : "kfree");
+-	if (is_vmalloc_addr(members))
+-		vfree(members);
+-	else
+-		kfree(members);
++	kvfree(members);
+ }
+ EXPORT_SYMBOL_GPL(ip_set_free);
+ 
+* Unmerged path net/netfilter/nft_hash.c
+diff --git a/net/netfilter/xt_recent.c b/net/netfilter/xt_recent.c
+index 1e657cf715c4..a9faae89f955 100644
+--- a/net/netfilter/xt_recent.c
++++ b/net/netfilter/xt_recent.c
+@@ -313,10 +313,7 @@ out:
+ 
+ static void recent_table_free(void *addr)
+ {
+-	if (is_vmalloc_addr(addr))
+-		vfree(addr);
+-	else
+-		kfree(addr);
++	kvfree(addr);
+ }
+ 
+ static int recent_mt_check(const struct xt_mtchk_param *par,
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index 4d19ba107e1e..5ae25eeafe11 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -397,12 +397,7 @@ static const struct nla_policy choke_policy[TCA_CHOKE_MAX + 1] = {
+ 
+ static void choke_free(void *addr)
+ {
+-	if (addr) {
+-		if (is_vmalloc_addr(addr))
+-			vfree(addr);
+-		else
+-			kfree(addr);
+-	}
++	kvfree(addr);
+ }
+ 
+ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index efe361bfdd23..4816778566d3 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -604,10 +604,7 @@ static void *fq_alloc_node(size_t sz, int node)
+ 
+ static void fq_free(void *addr)
+ {
+-	if (addr && is_vmalloc_addr(addr))
+-		vfree(addr);
+-	else
+-		kfree(addr);
++	kvfree(addr);
+ }
+ 
+ static int fq_resize(struct Qdisc *sch, u32 log)
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 5384081a1876..74fe4795d16c 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -464,12 +464,7 @@ static void *fq_codel_zalloc(size_t sz)
+ 
+ static void fq_codel_free(void *addr)
+ {
+-	if (addr) {
+-		if (is_vmalloc_addr(addr))
+-			vfree(addr);
+-		else
+-			kfree(addr);
+-	}
++	kvfree(addr);
+ }
+ 
+ static void fq_codel_destroy(struct Qdisc *sch)
+diff --git a/net/sched/sch_hhf.c b/net/sched/sch_hhf.c
+index cffc9d85c9e5..59a50121214e 100644
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@ -494,12 +494,7 @@ static void *hhf_zalloc(size_t sz)
+ 
+ static void hhf_free(void *addr)
+ {
+-	if (addr) {
+-		if (is_vmalloc_addr(addr))
+-			vfree(addr);
+-		else
+-			kfree(addr);
+-	}
++	kvfree(addr);
+ }
+ 
+ static void hhf_destroy(struct Qdisc *sch)
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index 0f67384afb4d..19d76007cc30 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -706,12 +706,7 @@ static void netem_reset(struct Qdisc *sch)
+ 
+ static void dist_free(struct disttable *d)
+ {
+-	if (d) {
+-		if (is_vmalloc_addr(d))
+-			vfree(d);
+-		else
+-			kfree(d);
+-	}
++	kvfree(d);
+ }
+ 
+ /*
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index 811d4c2ed214..8437587a46fb 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -698,12 +698,7 @@ static void *sfq_alloc(size_t sz)
+ 
+ static void sfq_free(void *addr)
+ {
+-	if (addr) {
+-		if (is_vmalloc_addr(addr))
+-			vfree(addr);
+-		else
+-			kfree(addr);
+-	}
++	kvfree(addr);
+ }
+ 
+ static void sfq_destroy(struct Qdisc *sch)
