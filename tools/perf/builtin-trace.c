@@ -1364,19 +1364,32 @@ out:
  * variable to read it. Most notably this avoids extended load instructions
  * on unaligned addresses
  */
+static unsigned long __syscall_arg__val(unsigned char *args, u8 idx)
+{
+	unsigned long val;
+	unsigned char *p = args + sizeof(unsigned long) * idx;
+
+	memcpy(&val, p, sizeof(val));
+	return val;
+}
+
+unsigned long syscall_arg__val(struct syscall_arg *arg, u8 idx)
+{
+	return __syscall_arg__val(arg->args, idx);
+}
 
 static size_t syscall__scnprintf_args(struct syscall *sc, char *bf, size_t size,
 				      unsigned char *args, struct trace *trace,
 				      struct thread *thread)
 {
 	size_t printed = 0;
-	unsigned char *p;
 	unsigned long val;
 
 	if (sc->args != NULL) {
 		struct format_field *field;
 		u8 bit = 1;
 		struct syscall_arg arg = {
+			.args	= args,
 			.idx	= 0,
 			.mask	= 0,
 			.trace  = trace,
@@ -1388,9 +1401,7 @@ static size_t syscall__scnprintf_args(struct syscall *sc, char *bf, size_t size,
 			if (arg.mask & bit)
 				continue;
 
-			/* special care for unaligned accesses */
-			p = args + sizeof(unsigned long) * arg.idx;
-			memcpy(&val, p, sizeof(val));
+			val = syscall_arg__val(&arg, arg.idx);
 
 			/*
  			 * Suppress this argument if its value is zero and
@@ -1426,9 +1437,7 @@ static size_t syscall__scnprintf_args(struct syscall *sc, char *bf, size_t size,
 		int i = 0;
 
 		while (i < 6) {
-			/* special care for unaligned accesses */
-			p = args + sizeof(unsigned long) * i;
-			memcpy(&val, p, sizeof(val));
+			val = __syscall_arg__val(args, i);
 			printed += scnprintf(bf + printed, size - printed,
 					     "%sarg%d: %ld",
 					     printed ? ", " : "", i, val);
