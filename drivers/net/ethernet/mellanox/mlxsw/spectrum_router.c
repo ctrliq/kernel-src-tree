@@ -2797,7 +2797,8 @@ static int mlxsw_sp_router_fib_event(struct notifier_block *nb,
 	struct mlxsw_sp_fib_event_work *fib_work;
 	struct fib_notifier_info *info = ptr;
 
-	if (!net_eq(info->net, &init_net))
+	if (!net_eq(info->net, &init_net) ||
+	    (info->family != AF_INET && info->family != AF_INET6))
 		return NOTIFY_DONE;
 
 	fib_work = kzalloc(sizeof(*fib_work), GFP_ATOMIC);
