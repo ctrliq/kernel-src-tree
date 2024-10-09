@@ -1,0 +1,186 @@
+kdump, proc/vmcore: Enable kdumping encrypted memory with SME enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Lianbo Jiang <lijiang@redhat.com>
+commit 992b649a3f013465d8128da02e5449def662a4c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/992b649a.failed
+
+In the kdump kernel, the memory of the first kernel needs to be dumped
+into the vmcore file.
+
+If SME is enabled in the first kernel, the old memory has to be remapped
+with the memory encryption mask in order to access it properly.
+
+Split copy_oldmem_page() functionality to handle encrypted memory
+properly.
+
+ [ bp: Heavily massage everything. ]
+
+	Signed-off-by: Lianbo Jiang <lijiang@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: kexec@lists.infradead.org
+	Cc: tglx@linutronix.de
+	Cc: mingo@redhat.com
+	Cc: hpa@zytor.com
+	Cc: akpm@linux-foundation.org
+	Cc: dan.j.williams@intel.com
+	Cc: bhelgaas@google.com
+	Cc: baiyaowei@cmss.chinamobile.com
+	Cc: tiwai@suse.de
+	Cc: brijesh.singh@amd.com
+	Cc: dyoung@redhat.com
+	Cc: bhe@redhat.com
+	Cc: jroedel@suse.de
+Link: https://lkml.kernel.org/r/be7b47f9-6be6-e0d1-2c2a-9125bc74b818@redhat.com
+(cherry picked from commit 992b649a3f013465d8128da02e5449def662a4c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/vmcore.c
+#	include/linux/crash_dump.h
+diff --cc fs/proc/vmcore.c
+index 7ca36a10c49c,42c32d06f7da..000000000000
+--- a/fs/proc/vmcore.c
++++ b/fs/proc/vmcore.c
+@@@ -20,9 -20,12 +20,15 @@@
+  #include <linux/init.h>
+  #include <linux/crash_dump.h>
+  #include <linux/list.h>
+ -#include <linux/mutex.h>
+  #include <linux/vmalloc.h>
+  #include <linux/pagemap.h>
+++<<<<<<< HEAD
+ +#include <asm/uaccess.h>
+++=======
++ #include <linux/uaccess.h>
++ #include <linux/mem_encrypt.h>
++ #include <asm/pgtable.h>
+++>>>>>>> 992b649a3f01 (kdump, proc/vmcore: Enable kdumping encrypted memory with SME enabled)
+  #include <asm/io.h>
+  #include "internal.h"
+  
+@@@ -231,9 -358,12 +246,10 @@@ static ssize_t __read_vmcore(char *buff
+  
+  	list_for_each_entry(m, &vmcore_list, list) {
+  		if (*fpos < m->offset + m->size) {
+ -			tsz = (size_t)min_t(unsigned long long,
+ -					    m->offset + m->size - *fpos,
+ -					    buflen);
+ +			tsz = min_t(size_t, m->offset + m->size - *fpos, buflen);
+  			start = m->paddr + *fpos - m->offset;
+- 			tmp = read_from_oldmem(buffer, tsz, &start, userbuf);
++ 			tmp = read_from_oldmem(buffer, tsz, &start,
++ 					       userbuf, sme_active());
+  			if (tmp < 0)
+  				return tmp;
+  			buflen -= tsz;
+diff --cc include/linux/crash_dump.h
+index fe68a5a98583,f774c5eb9e3c..000000000000
+--- a/include/linux/crash_dump.h
++++ b/include/linux/crash_dump.h
+@@@ -23,6 -26,11 +23,14 @@@ extern int __weak remap_oldmem_pfn_rang
+  
+  extern ssize_t copy_oldmem_page(unsigned long, char *, size_t,
+  						unsigned long, int);
+++<<<<<<< HEAD
+++=======
++ extern ssize_t copy_oldmem_page_encrypted(unsigned long pfn, char *buf,
++ 					  size_t csize, unsigned long offset,
++ 					  int userbuf);
++ 
++ void vmcore_cleanup(void);
+++>>>>>>> 992b649a3f01 (kdump, proc/vmcore: Enable kdumping encrypted memory with SME enabled)
+  
+  /* Architecture code defines this if there are other possible ELF
+   * machine types, e.g. on bi-arch capable hardware. */
+diff --git a/arch/x86/kernel/crash_dump_64.c b/arch/x86/kernel/crash_dump_64.c
+index afa64adb75ee..b46094aa41be 100644
+--- a/arch/x86/kernel/crash_dump_64.c
++++ b/arch/x86/kernel/crash_dump_64.c
+@@ -10,40 +10,62 @@
+ #include <linux/uaccess.h>
+ #include <linux/io.h>
+ 
+-/**
+- * copy_oldmem_page - copy one page from "oldmem"
+- * @pfn: page frame number to be copied
+- * @buf: target memory address for the copy; this can be in kernel address
+- *	space or user address space (see @userbuf)
+- * @csize: number of bytes to copy
+- * @offset: offset in bytes into the page (based on pfn) to begin the copy
+- * @userbuf: if set, @buf is in user address space, use copy_to_user(),
+- *	otherwise @buf is in kernel address space, use memcpy().
+- *
+- * Copy a page from "oldmem". For this page, there is no pte mapped
+- * in the current kernel. We stitch up a pte, similar to kmap_atomic.
+- */
+-ssize_t copy_oldmem_page(unsigned long pfn, char *buf,
+-		size_t csize, unsigned long offset, int userbuf)
++static ssize_t __copy_oldmem_page(unsigned long pfn, char *buf, size_t csize,
++				  unsigned long offset, int userbuf,
++				  bool encrypted)
+ {
+ 	void  *vaddr;
+ 
+ 	if (!csize)
+ 		return 0;
+ 
+-	vaddr = ioremap_cache(pfn << PAGE_SHIFT, PAGE_SIZE);
++	if (encrypted)
++		vaddr = (__force void *)ioremap_encrypted(pfn << PAGE_SHIFT, PAGE_SIZE);
++	else
++		vaddr = (__force void *)ioremap_cache(pfn << PAGE_SHIFT, PAGE_SIZE);
++
+ 	if (!vaddr)
+ 		return -ENOMEM;
+ 
+ 	if (userbuf) {
+-		if (copy_to_user(buf, vaddr + offset, csize)) {
+-			iounmap(vaddr);
++		if (copy_to_user((void __user *)buf, vaddr + offset, csize)) {
++			iounmap((void __iomem *)vaddr);
+ 			return -EFAULT;
+ 		}
+ 	} else
+ 		memcpy(buf, vaddr + offset, csize);
+ 
+ 	set_iounmap_nonlazy();
+-	iounmap(vaddr);
++	iounmap((void __iomem *)vaddr);
+ 	return csize;
+ }
++
++/**
++ * copy_oldmem_page - copy one page of memory
++ * @pfn: page frame number to be copied
++ * @buf: target memory address for the copy; this can be in kernel address
++ *	space or user address space (see @userbuf)
++ * @csize: number of bytes to copy
++ * @offset: offset in bytes into the page (based on pfn) to begin the copy
++ * @userbuf: if set, @buf is in user address space, use copy_to_user(),
++ *	otherwise @buf is in kernel address space, use memcpy().
++ *
++ * Copy a page from the old kernel's memory. For this page, there is no pte
++ * mapped in the current kernel. We stitch up a pte, similar to kmap_atomic.
++ */
++ssize_t copy_oldmem_page(unsigned long pfn, char *buf, size_t csize,
++			 unsigned long offset, int userbuf)
++{
++	return __copy_oldmem_page(pfn, buf, csize, offset, userbuf, false);
++}
++
++/**
++ * copy_oldmem_page_encrypted - same as copy_oldmem_page() above but ioremap the
++ * memory with the encryption mask set to accomodate kdump on SME-enabled
++ * machines.
++ */
++ssize_t copy_oldmem_page_encrypted(unsigned long pfn, char *buf, size_t csize,
++				   unsigned long offset, int userbuf)
++{
++	return __copy_oldmem_page(pfn, buf, csize, offset, userbuf, true);
++}
+* Unmerged path fs/proc/vmcore.c
+* Unmerged path include/linux/crash_dump.h
