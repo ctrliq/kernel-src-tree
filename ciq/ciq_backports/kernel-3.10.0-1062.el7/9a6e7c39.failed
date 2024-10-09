@@ -1,0 +1,91 @@
+KVM: async_pf: Fix #DF due to inject "Page not Present" and "Page Ready" exceptions simultaneously
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 9a6e7c39810e4a8bc7fc95056cefb40583fe07ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9a6e7c39.failed
+
+qemu-system-x86-8600  [004] d..1  7205.687530: kvm_entry: vcpu 2
+qemu-system-x86-8600  [004] ....  7205.687532: kvm_exit: reason EXCEPTION_NMI rip 0xffffffffa921297d info ffffeb2c0e44e018 80000b0e
+qemu-system-x86-8600  [004] ....  7205.687532: kvm_page_fault: address ffffeb2c0e44e018 error_code 0
+qemu-system-x86-8600  [004] ....  7205.687620: kvm_try_async_get_page: gva = 0xffffeb2c0e44e018, gfn = 0x427e4e
+qemu-system-x86-8600  [004] .N..  7205.687628: kvm_async_pf_not_present: token 0x8b002 gva 0xffffeb2c0e44e018
+    kworker/4:2-7814  [004] ....  7205.687655: kvm_async_pf_completed: gva 0xffffeb2c0e44e018 address 0x7fcc30c4e000
+qemu-system-x86-8600  [004] ....  7205.687703: kvm_async_pf_ready: token 0x8b002 gva 0xffffeb2c0e44e018
+qemu-system-x86-8600  [004] d..1  7205.687711: kvm_entry: vcpu 2
+
+After running some memory intensive workload in guest, I catch the kworker
+which completes the GUP too quickly, and queues an "Page Ready" #PF exception
+after the "Page not Present" exception before the next vmentry as the above
+trace which will result in #DF injected to guest.
+
+This patch fixes it by clearing the queue for "Page not Present" if "Page Ready"
+occurs before the next vmentry since the GUP has already got the required page
+and shadow page table has already been fixed by "Page Ready" handler.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Fixes: 7c90705bf2a3 ("KVM: Inject asynchronous page fault into a PV guest if page is swapped out.")
+[Changed indentation and added clearing of injected. - Radim]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 9a6e7c39810e4a8bc7fc95056cefb40583fe07ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index f751a44d4548,cd17b7d9a107..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8452,21 -8665,34 +8459,45 @@@ void kvm_arch_async_page_present(struc
+  				 struct kvm_async_pf *work)
+  {
+  	struct x86_exception fault;
++ 	u32 val;
+  
+ +	trace_kvm_async_pf_ready(work->arch.token, work->gva);
+  	if (work->wakeup_all)
+  		work->arch.token = ~0; /* broadcast wakeup */
+  	else
+  		kvm_del_async_pf_gfn(vcpu, work->arch.gfn);
+ -	trace_kvm_async_pf_ready(work->arch.token, work->gva);
+  
+++<<<<<<< HEAD
+ +	if ((vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED) &&
+ +	    !apf_put_user(vcpu, KVM_PV_REASON_PAGE_READY)) {
+ +		fault.vector = PF_VECTOR;
+ +		fault.error_code_valid = true;
+ +		fault.error_code = 0;
+ +		fault.nested_page_fault = false;
+ +		fault.address = work->arch.token;
+ +		kvm_inject_page_fault(vcpu, &fault);
+++=======
++ 	if (vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED &&
++ 	    !apf_get_user(vcpu, &val)) {
++ 		if (val == KVM_PV_REASON_PAGE_NOT_PRESENT &&
++ 		    vcpu->arch.exception.pending &&
++ 		    vcpu->arch.exception.nr == PF_VECTOR &&
++ 		    !apf_put_user(vcpu, 0)) {
++ 			vcpu->arch.exception.injected = false;
++ 			vcpu->arch.exception.pending = false;
++ 			vcpu->arch.exception.nr = 0;
++ 			vcpu->arch.exception.has_error_code = false;
++ 			vcpu->arch.exception.error_code = 0;
++ 		} else if (!apf_put_user(vcpu, KVM_PV_REASON_PAGE_READY)) {
++ 			fault.vector = PF_VECTOR;
++ 			fault.error_code_valid = true;
++ 			fault.error_code = 0;
++ 			fault.nested_page_fault = false;
++ 			fault.address = work->arch.token;
++ 			fault.async_page_fault = true;
++ 			kvm_inject_page_fault(vcpu, &fault);
++ 		}
+++>>>>>>> 9a6e7c39810e (KVM: async_pf: Fix #DF due to inject "Page not Present" and "Page Ready" exceptions simultaneously)
+  	}
+  	vcpu->arch.apf.halted = false;
+  	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+* Unmerged path arch/x86/kvm/x86.c
