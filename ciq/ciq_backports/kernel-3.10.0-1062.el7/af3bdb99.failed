@@ -1,0 +1,314 @@
+perf/x86/intel: Add a separate Arch Perfmon v4 PMI handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit af3bdb991a5cb57c189d34aadbd3aa88995e0d9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/af3bdb99.failed
+
+Implements counter freezing for Arch Perfmon v4 (Skylake and
+newer). This allows to speed up the PMI handler by avoiding
+unnecessary MSR writes and make it more accurate.
+
+The Arch Perfmon v4 PMI handler is substantially different than
+the older PMI handler.
+
+Differences to the old handler:
+
+- It relies on counter freezing, which eliminates several MSR
+  writes from the PMI handler and lowers the overhead significantly.
+
+  It makes the PMI handler more accurate, as all counters get
+  frozen atomically as soon as any counter overflows. So there is
+  much less counting of the PMI handler itself.
+
+  With the freezing we don't need to disable or enable counters or
+  PEBS. Only BTS which does not support auto-freezing still needs to
+  be explicitly managed.
+
+- The PMU acking is done at the end, not the beginning.
+  This makes it possible to avoid manual enabling/disabling
+  of the PMU, instead we just rely on the freezing/acking.
+
+- The APIC is acked before reenabling the PMU, which avoids
+  problems with LBRs occasionally not getting unfreezed on Skylake.
+
+- Looping is only needed to workaround a corner case which several PMIs
+  are very close to each other. For common cases, the counters are freezed
+  during PMI handler. It doesn't need to do re-check.
+
+This patch:
+
+- Adds code to enable v4 counter freezing
+- Fork <=v3 and >=v4 PMI handlers into separate functions.
+- Add kernel parameter to disable counter freezing. It took some time to
+  debug counter freezing, so in case there are new problems we added an
+  option to turn it off. Would not expect this to be used until there
+  are new bugs.
+- Only for big core. The patch for small core will be posted later
+  separately.
+
+Performance:
+
+When profiling a kernel build on Kabylake with different perf options,
+measuring the length of all NMI handlers using the nmi handler
+trace point:
+
+V3 is without counter freezing.
+V4 is with counter freezing.
+The value is the average cost of the PMI handler.
+(lower is better)
+
+perf options    `           V3(ns) V4(ns)  delta
+-c 100000                   1088   894     -18%
+-g -c 100000                1862   1646    -12%
+--call-graph lbr -c 100000  3649   3367    -8%
+--c.g. dwarf -c 100000      2248   1982    -12%
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: acme@kernel.org
+Link: http://lkml.kernel.org/r/1533712328-2834-2-git-send-email-kan.liang@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit af3bdb991a5cb57c189d34aadbd3aa88995e0d9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	arch/x86/events/intel/core.c
+diff --cc Documentation/kernel-parameters.txt
+index f6852ae416ce,6795dedcbd1e..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -812,7 -856,12 +812,16 @@@ bytes respectively. Such letter suffixe
+  			causing system reset or hang due to sending
+  			INIT from AP to BSP.
+  
+++<<<<<<< HEAD:Documentation/kernel-parameters.txt
+ +	disable_ddw     [PPC/PSERIES]
+++=======
++ 	disable_counter_freezing [HW]
++ 			Disable Intel PMU counter freezing feature.
++ 			The feature only exists starting from
++ 			Arch Perfmon v4 (Skylake and newer).
++ 
++ 	disable_ddw	[PPC/PSERIES]
+++>>>>>>> af3bdb991a5c (perf/x86/intel: Add a separate Arch Perfmon v4 PMI handler):Documentation/admin-guide/kernel-parameters.txt
+  			Disable Dynamic DMA Window support. Use this if
+  			to workaround buggy firmware.
+  
+diff --cc arch/x86/events/intel/core.c
+index 65e18eccc087,bd3b8f3600b2..000000000000
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@@ -2265,6 -2299,146 +2277,149 @@@ again
+  			x86_pmu_stop(event, 0);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return handled;
++ }
++ 
++ static bool disable_counter_freezing;
++ static int __init intel_perf_counter_freezing_setup(char *s)
++ {
++ 	disable_counter_freezing = true;
++ 	pr_info("Intel PMU Counter freezing feature disabled\n");
++ 	return 1;
++ }
++ __setup("disable_counter_freezing", intel_perf_counter_freezing_setup);
++ 
++ /*
++  * Simplified handler for Arch Perfmon v4:
++  * - We rely on counter freezing/unfreezing to enable/disable the PMU.
++  * This is done automatically on PMU ack.
++  * - Ack the PMU only after the APIC.
++  */
++ 
++ static int intel_pmu_handle_irq_v4(struct pt_regs *regs)
++ {
++ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
++ 	int handled = 0;
++ 	bool bts = false;
++ 	u64 status;
++ 	int pmu_enabled = cpuc->enabled;
++ 	int loops = 0;
++ 
++ 	/* PMU has been disabled because of counter freezing */
++ 	cpuc->enabled = 0;
++ 	if (test_bit(INTEL_PMC_IDX_FIXED_BTS, cpuc->active_mask)) {
++ 		bts = true;
++ 		intel_bts_disable_local();
++ 		handled = intel_pmu_drain_bts_buffer();
++ 		handled += intel_bts_interrupt();
++ 	}
++ 	status = intel_pmu_get_status();
++ 	if (!status)
++ 		goto done;
++ again:
++ 	intel_pmu_lbr_read();
++ 	if (++loops > 100) {
++ 		static bool warned;
++ 
++ 		if (!warned) {
++ 			WARN(1, "perfevents: irq loop stuck!\n");
++ 			perf_event_print_debug();
++ 			warned = true;
++ 		}
++ 		intel_pmu_reset();
++ 		goto done;
++ 	}
++ 
++ 
++ 	handled += handle_pmi_common(regs, status);
++ done:
++ 	/* Ack the PMI in the APIC */
++ 	apic_write(APIC_LVTPC, APIC_DM_NMI);
++ 
++ 	/*
++ 	 * The counters start counting immediately while ack the status.
++ 	 * Make it as close as possible to IRET. This avoids bogus
++ 	 * freezing on Skylake CPUs.
++ 	 */
++ 	if (status) {
++ 		intel_pmu_ack_status(status);
++ 	} else {
++ 		/*
++ 		 * CPU may issues two PMIs very close to each other.
++ 		 * When the PMI handler services the first one, the
++ 		 * GLOBAL_STATUS is already updated to reflect both.
++ 		 * When it IRETs, the second PMI is immediately
++ 		 * handled and it sees clear status. At the meantime,
++ 		 * there may be a third PMI, because the freezing bit
++ 		 * isn't set since the ack in first PMI handlers.
++ 		 * Double check if there is more work to be done.
++ 		 */
++ 		status = intel_pmu_get_status();
++ 		if (status)
++ 			goto again;
++ 	}
++ 
++ 	if (bts)
++ 		intel_bts_enable_local();
++ 	cpuc->enabled = pmu_enabled;
++ 	return handled;
++ }
++ 
++ /*
++  * This handler is triggered by the local APIC, so the APIC IRQ handling
++  * rules apply:
++  */
++ static int intel_pmu_handle_irq(struct pt_regs *regs)
++ {
++ 	struct cpu_hw_events *cpuc;
++ 	int loops;
++ 	u64 status;
++ 	int handled;
++ 	int pmu_enabled;
++ 
++ 	cpuc = this_cpu_ptr(&cpu_hw_events);
++ 
++ 	/*
++ 	 * Save the PMU state.
++ 	 * It needs to be restored when leaving the handler.
++ 	 */
++ 	pmu_enabled = cpuc->enabled;
++ 	/*
++ 	 * No known reason to not always do late ACK,
++ 	 * but just in case do it opt-in.
++ 	 */
++ 	if (!x86_pmu.late_ack)
++ 		apic_write(APIC_LVTPC, APIC_DM_NMI);
++ 	intel_bts_disable_local();
++ 	cpuc->enabled = 0;
++ 	__intel_pmu_disable_all();
++ 	handled = intel_pmu_drain_bts_buffer();
++ 	handled += intel_bts_interrupt();
++ 	status = intel_pmu_get_status();
++ 	if (!status)
++ 		goto done;
++ 
++ 	loops = 0;
++ again:
++ 	intel_pmu_lbr_read();
++ 	intel_pmu_ack_status(status);
++ 	if (++loops > 100) {
++ 		static bool warned;
++ 
++ 		if (!warned) {
++ 			WARN(1, "perfevents: irq loop stuck!\n");
++ 			perf_event_print_debug();
++ 			warned = true;
++ 		}
++ 		intel_pmu_reset();
++ 		goto done;
++ 	}
++ 
++ 	handled += handle_pmi_common(regs, status);
++ 
+++>>>>>>> af3bdb991a5c (perf/x86/intel: Add a separate Arch Perfmon v4 PMI handler)
+  	/*
+  	 * Repeat if there is more work to be done:
+  	 */
+@@@ -4346,10 -4549,11 +4510,18 @@@ __init int intel_pmu_init(void
+  	}
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * RHEL7: read the smm bit instead of overwriting it.
+ +	 *        This addresses a missed NMI button issue.
+ +	 */
+ +	x86_pmu.attr_freeze_on_smi = read_smm_bit();
+++=======
++ 	 * For arch perfmon 4 use counter freezing to avoid
++ 	 * several MSR accesses in the PMI.
++ 	 */
++ 	if (x86_pmu.counter_freezing)
++ 		x86_pmu.handle_irq = intel_pmu_handle_irq_v4;
+++>>>>>>> af3bdb991a5c (perf/x86/intel: Add a separate Arch Perfmon v4 PMI handler)
+  
+  	kfree(to_free);
+  	return 0;
+* Unmerged path Documentation/kernel-parameters.txt
+* Unmerged path arch/x86/events/intel/core.c
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 10d2c8149597..5c77bc91a4e6 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -571,9 +571,11 @@ struct x86_pmu {
+ 	struct event_constraint *event_constraints;
+ 	struct x86_pmu_quirk *quirks;
+ 	int		perfctr_second_write;
+-	bool		late_ack;
+ 	u64		(*limit_period)(struct perf_event *event, u64 l);
+ 
++	/* PMI handler bits */
++	unsigned int	late_ack		:1,
++			counter_freezing	:1;
+ 	/*
+ 	 * sysfs attrs
+ 	 */
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 49b8d668bfc1..b1da43be5153 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -160,6 +160,7 @@
+ #define DEBUGCTLMSR_BTS_OFF_OS		(1UL <<  9)
+ #define DEBUGCTLMSR_BTS_OFF_USR		(1UL << 10)
+ #define DEBUGCTLMSR_FREEZE_LBRS_ON_PMI	(1UL << 11)
++#define DEBUGCTLMSR_FREEZE_PERFMON_ON_PMI	(1UL << 12)
+ #define DEBUGCTLMSR_FREEZE_IN_SMM_BIT	14
+ #define DEBUGCTLMSR_FREEZE_IN_SMM	(1UL << DEBUGCTLMSR_FREEZE_IN_SMM_BIT)
+ 
