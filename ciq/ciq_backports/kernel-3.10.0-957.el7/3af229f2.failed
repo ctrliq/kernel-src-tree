@@ -1,0 +1,121 @@
+powerpc/numa: Reset node_possible_map to only node_online_map
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] numa: Reset node_possible_map to only node_online_map (Serhii Popovych) [1507765]
+Rebuild_FUZZ: 92.98%
+commit-author Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+commit 3af229f2071f5b5cb31664be6109561fbe19c861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3af229f2.failed
+
+Raghu noticed an issue with excessive memory allocation on power with a
+simple cgroup test, specifically, in mem_cgroup_css_alloc ->
+for_each_node -> alloc_mem_cgroup_per_zone_info(), which ends up blowing
+up the kmalloc-2048 slab (to the order of 200MB for 400 cgroup
+directories).
+
+The underlying issue is that NODES_SHIFT on power is 8 (256 NUMA nodes
+possible), which defines node_possible_map, which in turn defines the
+value of nr_node_ids in setup_nr_node_ids and the iteration of
+for_each_node.
+
+In practice, we never see a system with 256 NUMA nodes, and in fact, we
+do not support node hotplug on power in the first place, so the nodes
+that are online when we come up are the nodes that will be present for
+the lifetime of this kernel. So let's, at least, drop the NUMA possible
+map down to the online map at runtime. This is similar to what x86 does
+in its initialization routines.
+
+mem_cgroup_css_alloc should also be fixed to only iterate over
+memory-populated nodes and handle hotplug, but that is a separate
+change.
+
+	Signed-off-by: Nishanth Aravamudan <nacc@linux.vnet.ibm.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Anton Blanchard <anton@samba.org>
+	Cc: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 3af229f2071f5b5cb31664be6109561fbe19c861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/numa.c
+diff --cc arch/powerpc/mm/numa.c
+index 2d9f62402d44,5e80621d9324..000000000000
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@@ -1065,55 -956,20 +1065,67 @@@ void __init do_init_bootmem(void
+  	else
+  		dump_numa_memory_topology();
+  
+++<<<<<<< HEAD
+++=======
++ 	memblock_dump_all();
++ 
++ 	/*
++ 	 * Reduce the possible NUMA nodes to the online NUMA nodes,
++ 	 * since we do not support node hotplug. This ensures that  we
++ 	 * lower the maximum NUMA node ID to what is actually present.
++ 	 */
++ 	nodes_and(node_possible_map, node_possible_map, node_online_map);
++ 
+++>>>>>>> 3af229f2071f (powerpc/numa: Reset node_possible_map to only node_online_map)
+  	for_each_online_node(nid) {
+  		unsigned long start_pfn, end_pfn;
+ +		void *bootmem_vaddr;
+ +		unsigned long bootmap_pages;
+  
+  		get_pfn_range_for_nid(nid, &start_pfn, &end_pfn);
+ -		setup_node_data(nid, start_pfn, end_pfn);
+ +
+ +		/*
+ +		 * Allocate the node structure node local if possible
+ +		 *
+ +		 * Be careful moving this around, as it relies on all
+ +		 * previous nodes' bootmem to be initialized and have
+ +		 * all reserved areas marked.
+ +		 */
+ +		NODE_DATA(nid) = careful_zallocation(nid,
+ +					sizeof(struct pglist_data),
+ +					SMP_CACHE_BYTES, end_pfn);
+ +
+ +  		dbg("node %d\n", nid);
+ +		dbg("NODE_DATA() = %p\n", NODE_DATA(nid));
+ +
+ +		NODE_DATA(nid)->bdata = &bootmem_node_data[nid];
+ +		NODE_DATA(nid)->node_start_pfn = start_pfn;
+ +		NODE_DATA(nid)->node_spanned_pages = end_pfn - start_pfn;
+ +
+ +		if (NODE_DATA(nid)->node_spanned_pages == 0)
+ +  			continue;
+ +
+ +  		dbg("start_paddr = %lx\n", start_pfn << PAGE_SHIFT);
+ +  		dbg("end_paddr = %lx\n", end_pfn << PAGE_SHIFT);
+ +
+ +		bootmap_pages = bootmem_bootmap_pages(end_pfn - start_pfn);
+ +		bootmem_vaddr = careful_zallocation(nid,
+ +					bootmap_pages << PAGE_SHIFT,
+ +					PAGE_SIZE, end_pfn);
+ +
+ +		dbg("bootmap_vaddr = %p\n", bootmem_vaddr);
+ +
+ +		init_bootmem_node(NODE_DATA(nid),
+ +				  __pa(bootmem_vaddr) >> PAGE_SHIFT,
+ +				  start_pfn, end_pfn);
+ +
+ +		free_bootmem_with_active_regions(nid, end_pfn);
+ +		/*
+ +		 * Be very careful about moving this around.  Future
+ +		 * calls to careful_zallocation() depend on this getting
+ +		 * done correctly.
+ +		 */
+ +		mark_reserved_regions_for_nid(nid);
+  		sparse_memory_present_with_active_regions(nid);
+  	}
+  
+* Unmerged path arch/powerpc/mm/numa.c
