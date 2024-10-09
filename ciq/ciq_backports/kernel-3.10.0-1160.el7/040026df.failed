@@ -1,0 +1,193 @@
+x86/Hyper-V: Report crash register data when sysctl_record_panic_msg is not set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Tianyu Lan <Tianyu.Lan@microsoft.com>
+commit 040026df7088c56ccbad28f7042308f67bde63df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/040026df.failed
+
+When sysctl_record_panic_msg is not set, the panic will
+not be reported to Hyper-V via hyperv_report_panic_msg().
+So the crash should be reported via hyperv_report_panic().
+
+Fixes: 81b18bce48af ("Drivers: HV: Send one page worth of kmsg dump over Hyper-V during panic")
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Tianyu Lan <Tianyu.Lan@microsoft.com>
+Link: https://lore.kernel.org/r/20200406155331.2105-6-Tianyu.Lan@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 040026df7088c56ccbad28f7042308f67bde63df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 52302e715e84,172ceae69abb..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -54,15 -44,39 +54,40 @@@ static struct acpi_device  *hv_acpi_dev
+  
+  static struct completion probe_event;
+  
+ -static int hyperv_cpuhp_online;
+ -
+ -static void *hv_panic_page;
+  
++ /*
++  * Boolean to control whether to report panic messages over Hyper-V.
++  *
++  * It can be set via /proc/sys/kernel/hyperv/record_panic_msg
++  */
++ static int sysctl_record_panic_msg = 1;
++ 
++ static int hyperv_report_reg(void)
++ {
++ 	return !sysctl_record_panic_msg || !hv_panic_page;
++ }
++ 
+  static int hyperv_panic_event(struct notifier_block *nb, unsigned long val,
+  			      void *args)
+  {
+  	struct pt_regs *regs;
+  
+ -	vmbus_initiate_unload(true);
+ +	regs = current_pt_regs();
+  
+++<<<<<<< HEAD
+ +	hyperv_report_panic(regs, val);
+++=======
++ 	/*
++ 	 * Hyper-V should be notified only once about a panic.  If we will be
++ 	 * doing hyperv_report_panic_msg() later with kmsg data, don't do
++ 	 * the notification here.
++ 	 */
++ 	if (ms_hyperv.misc_features & HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE
++ 	    && hyperv_report_reg()) {
++ 		regs = current_pt_regs();
++ 		hyperv_report_panic(regs, val);
++ 	}
+++>>>>>>> 040026df7088 (x86/Hyper-V: Report crash register data when sysctl_record_panic_msg is not set)
+  	return NOTIFY_DONE;
+  }
+  
+@@@ -72,7 -86,13 +97,17 @@@ static int hyperv_die_event(struct noti
+  	struct die_args *die = (struct die_args *)args;
+  	struct pt_regs *regs = die->regs;
+  
+++<<<<<<< HEAD
+ +	hyperv_report_panic(regs, val);
+++=======
++ 	/*
++ 	 * Hyper-V should be notified only once about a panic.  If we will be
++ 	 * doing hyperv_report_panic_msg() later with kmsg data, don't do
++ 	 * the notification here.
++ 	 */
++ 	if (hyperv_report_reg())
++ 		hyperv_report_panic(regs, val);
+++>>>>>>> 040026df7088 (x86/Hyper-V: Report crash register data when sysctl_record_panic_msg is not set)
+  	return NOTIFY_DONE;
+  }
+  
+@@@ -1149,48 -1279,62 +1184,57 @@@ static void vmbus_isr(void
+  	add_interrupt_randomness(HYPERVISOR_CALLBACK_VECTOR, 0);
+  }
+  
+++<<<<<<< HEAD
+ +static void hv_synic_init_oncpu(void *arg)
+++=======
++ /*
++  * Callback from kmsg_dump. Grab as much as possible from the end of the kmsg
++  * buffer and call into Hyper-V to transfer the data.
++  */
++ static void hv_kmsg_dump(struct kmsg_dumper *dumper,
++ 			 enum kmsg_dump_reason reason)
+++>>>>>>> 040026df7088 (x86/Hyper-V: Report crash register data when sysctl_record_panic_msg is not set)
+  {
+ -	size_t bytes_written;
+ -	phys_addr_t panic_pa;
+ -
+ -	/* We are only interested in panics. */
+ -	if ((reason != KMSG_DUMP_PANIC) || (!sysctl_record_panic_msg))
+ -		return;
+ -
+ -	panic_pa = virt_to_phys(hv_panic_page);
+ +	int cpu = get_cpu();
+ +	hv_synic_init(cpu);
+ +	put_cpu();
+ +}
+  
+ -	/*
+ -	 * Write dump contents to the page. No need to synchronize; panic should
+ -	 * be single-threaded.
+ -	 */
+ -	kmsg_dump_get_buffer(dumper, true, hv_panic_page, HV_HYP_PAGE_SIZE,
+ -			     &bytes_written);
+ -	if (bytes_written)
+ -		hyperv_report_panic_msg(panic_pa, bytes_written);
+ +static void hv_synic_cleanup_oncpu(void *arg)
+ +{
+ +	int cpu = get_cpu();
+ +	hv_synic_cleanup(cpu);
+ +	put_cpu();
+  }
+  
+ -static struct kmsg_dumper hv_kmsg_dumper = {
+ -	.dump = hv_kmsg_dump,
+ -};
+ +static int hv_cpuhp_callback(struct notifier_block *nfb,
+ +			     unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (unsigned long) hcpu;
+  
+ -static struct ctl_table_header *hv_ctl_table_hdr;
+ +	switch (action & ~CPU_TASKS_FROZEN) {
+ +	case CPU_STARTING:
+ +		hv_synic_init(cpu);
+ +		break;
+ +	case CPU_DYING:
+ +		hv_synic_cleanup(cpu);
+ +		break;
+ +	case CPU_DOWN_PREPARE:
+ +		if (hv_synic_cpu_used(cpu))
+ +			return NOTIFY_BAD;
+ +		hv_clockevents_unbind(cpu);
+ +		break;
+ +	case CPU_DOWN_FAILED:
+ +		hv_clockevents_bind(cpu);
+ +		break;
+ +	}
+  
+ -/*
+ - * sysctl option to allow the user to control whether kmsg data should be
+ - * reported to Hyper-V on panic.
+ - */
+ -static struct ctl_table hv_ctl_table[] = {
+ -	{
+ -		.procname       = "hyperv_record_panic_msg",
+ -		.data           = &sysctl_record_panic_msg,
+ -		.maxlen         = sizeof(int),
+ -		.mode           = 0644,
+ -		.proc_handler   = proc_dointvec_minmax,
+ -		.extra1		= SYSCTL_ZERO,
+ -		.extra2		= SYSCTL_ONE
+ -	},
+ -	{}
+ -};
+ +	return NOTIFY_OK;
+ +}
+  
+ -static struct ctl_table hv_root_table[] = {
+ -	{
+ -		.procname	= "kernel",
+ -		.mode		= 0555,
+ -		.child		= hv_ctl_table
+ -	},
+ -	{}
+ +static struct notifier_block hv_cpuhp_notifier __refdata = {
+ +       .notifier_call = hv_cpuhp_callback,
+ +       .priority = INT_MAX - 1, /* Run after hv_cpu_init() */
+  };
+  
+  /*
+* Unmerged path drivers/hv/vmbus_drv.c
