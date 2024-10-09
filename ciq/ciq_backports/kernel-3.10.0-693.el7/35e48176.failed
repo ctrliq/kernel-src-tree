@@ -1,0 +1,300 @@
+fsnotify: avoid spurious EMFILE errors from inotify_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 35e481761cdc688dbee0ef552a13f49af8eba6cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/35e48176.failed
+
+Inotify instance is destroyed when all references to it are dropped.
+That not only means that the corresponding file descriptor needs to be
+closed but also that all corresponding instance marks are freed (as each
+mark holds a reference to the inotify instance).  However marks are
+freed only after SRCU period ends which can take some time and thus if
+user rapidly creates and frees inotify instances, number of existing
+inotify instances can exceed max_user_instances limit although from user
+point of view there is always at most one existing instance.  Thus
+inotify_init() returns EMFILE error which is hard to justify from user
+point of view.  This problem is exposed by LTP inotify06 testcase on
+some machines.
+
+We fix the problem by making sure all group marks are properly freed
+while destroying inotify instance.  We wait for SRCU period to end in
+that path anyway since we have to make sure there is no event being
+added to the instance while we are tearing down the instance.  So it
+takes only some plumbing to allow for marks to be destroyed in that path
+as well and not from a dedicated work item.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reported-by: Xiaoguang Wang <wangxg.fnst@cn.fujitsu.com>
+	Tested-by: Xiaoguang Wang <wangxg.fnst@cn.fujitsu.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 35e481761cdc688dbee0ef552a13f49af8eba6cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.h
+#	fs/notify/mark.c
+diff --cc fs/notify/fsnotify.h
+index 3b68b0ae0a97,0a3bc2cf192c..000000000000
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@@ -31,10 -40,29 +31,36 @@@ extern int fsnotify_add_vfsmount_mark(s
+  extern void fsnotify_destroy_vfsmount_mark(struct fsnotify_mark *mark);
+  /* inode specific destruction of a mark */
+  extern void fsnotify_destroy_inode_mark(struct fsnotify_mark *mark);
+++<<<<<<< HEAD
+ +/* run the list of all marks associated with inode and flag them to be freed */
+ +extern void fsnotify_clear_marks_by_inode(struct inode *inode);
+ +/* run the list of all marks associated with vfsmount and flag them to be freed */
+ +extern void fsnotify_clear_marks_by_mount(struct vfsmount *mnt);
+++=======
++ /* Find mark belonging to given group in the list of marks */
++ extern struct fsnotify_mark *fsnotify_find_mark(struct hlist_head *head,
++ 						struct fsnotify_group *group);
++ /* Destroy all marks in the given list protected by 'lock' */
++ extern void fsnotify_destroy_marks(struct hlist_head *head, spinlock_t *lock);
++ /* run the list of all marks associated with inode and destroy them */
++ static inline void fsnotify_clear_marks_by_inode(struct inode *inode)
++ {
++ 	fsnotify_destroy_marks(&inode->i_fsnotify_marks, &inode->i_lock);
++ }
++ /* run the list of all marks associated with vfsmount and destroy them */
++ static inline void fsnotify_clear_marks_by_mount(struct vfsmount *mnt)
++ {
++ 	fsnotify_destroy_marks(&real_mount(mnt)->mnt_fsnotify_marks,
++ 			       &mnt->mnt_root->d_lock);
++ }
++ /* prepare for freeing all marks associated with given group */
++ extern void fsnotify_detach_group_marks(struct fsnotify_group *group);
++ /*
++  * wait for fsnotify_mark_srcu period to end and free all marks in destroy_list
++  */
++ extern void fsnotify_mark_destroy_list(void);
++ 
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+  /*
+   * update the dentry->d_flags of all of inode's children to indicate if inode cares
+   * about events that happen to its children.
+diff --cc fs/notify/mark.c
+index b46c40e4c8a2,d3fea0bd89e2..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -94,7 -94,11 +94,13 @@@
+  struct srcu_struct fsnotify_mark_srcu;
+  static DEFINE_SPINLOCK(destroy_lock);
+  static LIST_HEAD(destroy_list);
+++<<<<<<< HEAD
+ +static DECLARE_WAIT_QUEUE_HEAD(destroy_waitq);
+++=======
++ 
++ static void fsnotify_mark_destroy_workfn(struct work_struct *work);
++ static DECLARE_DELAYED_WORK(reaper_work, fsnotify_mark_destroy_workfn);
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+  
+  void fsnotify_get_mark(struct fsnotify_mark *mark)
+  {
+@@@ -146,19 -168,32 +152,48 @@@ void fsnotify_destroy_mark_locked(struc
+  
+  	if (inode && (mark->flags & FSNOTIFY_MARK_FLAG_OBJECT_PINNED))
+  		iput(inode);
+++<<<<<<< HEAD
+ +	/* release lock temporarily */
+ +	mutex_unlock(&group->mark_mutex);
+ +
+ +	spin_lock(&destroy_lock);
+ +	list_add(&mark->g_list, &destroy_list);
+ +	spin_unlock(&destroy_lock);
+ +	wake_up(&destroy_waitq);
+ +	/*
+ +	 * We don't necessarily have a ref on mark from caller so the above destroy
+ +	 * may have actually freed it, unless this group provides a 'freeing_mark'
+ +	 * function which must be holding a reference.
+ +	 */
+ +
+++=======
++ 
++ 	atomic_dec(&group->num_marks);
++ }
++ 
++ /*
++  * Prepare mark for freeing and add it to the list of marks prepared for
++  * freeing. The actual freeing must happen after SRCU period ends and the
++  * caller is responsible for this.
++  *
++  * The function returns true if the mark was added to the list of marks for
++  * freeing. The function returns false if someone else has already called
++  * __fsnotify_free_mark() for the mark.
++  */
++ static bool __fsnotify_free_mark(struct fsnotify_mark *mark)
++ {
++ 	struct fsnotify_group *group = mark->group;
++ 
++ 	spin_lock(&mark->lock);
++ 	/* something else already called this function on this mark */
++ 	if (!(mark->flags & FSNOTIFY_MARK_FLAG_ALIVE)) {
++ 		spin_unlock(&mark->lock);
++ 		return false;
++ 	}
++ 	mark->flags &= ~FSNOTIFY_MARK_FLAG_ALIVE;
++ 	spin_unlock(&mark->lock);
++ 
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+  	/*
+  	 * Some groups like to know that marks are being freed.  This is a
+  	 * callback to the group function to let it know that this mark
+@@@ -167,21 -202,24 +202,42 @@@
+  	if (group->ops->freeing_mark)
+  		group->ops->freeing_mark(mark, group);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * __fsnotify_update_child_dentry_flags(inode);
+ +	 *
+ +	 * I really want to call that, but we can't, we have no idea if the inode
+ +	 * still exists the second we drop the mark->lock.
+ +	 *
+ +	 * The next time an event arrive to this inode from one of it's children
+ +	 * __fsnotify_parent will see that the inode doesn't care about it's
+ +	 * children and will update all of these flags then.  So really this
+ +	 * is just a lazy update (and could be a perf win...)
+ +	 */
+ +
+ +	atomic_dec(&group->num_marks);
+ +
+ +	mutex_lock_nested(&group->mark_mutex, SINGLE_DEPTH_NESTING);
+++=======
++ 	spin_lock(&destroy_lock);
++ 	list_add(&mark->g_list, &destroy_list);
++ 	spin_unlock(&destroy_lock);
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Free fsnotify mark. The freeing is actually happening from a workqueue which
++  * first waits for srcu period end. Caller must have a reference to the mark
++  * or be protected by fsnotify_mark_srcu.
++  */
++ void fsnotify_free_mark(struct fsnotify_mark *mark)
++ {
++ 	if (__fsnotify_free_mark(mark)) {
++ 		queue_delayed_work(system_unbound_wq, &reaper_work,
++ 				   FSNOTIFY_REAPER_DELAY);
++ 	}
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+  }
+  
+  void fsnotify_destroy_mark(struct fsnotify_mark *mark,
+@@@ -393,39 -534,29 +467,54 @@@ void fsnotify_init_mark(struct fsnotify
+  	mark->free_mark = free_mark;
+  }
+  
+++<<<<<<< HEAD
+ +static int fsnotify_mark_destroy(void *ignored)
+++=======
++ /*
++  * Destroy all marks in destroy_list, waits for SRCU period to finish before
++  * actually freeing marks.
++  */
++ void fsnotify_mark_destroy_list(void)
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+  {
+  	struct fsnotify_mark *mark, *next;
+  	struct list_head private_destroy_list;
+  
+ -	spin_lock(&destroy_lock);
+ -	/* exchange the list head */
+ -	list_replace_init(&destroy_list, &private_destroy_list);
+ -	spin_unlock(&destroy_lock);
+ +	for (;;) {
+ +		spin_lock(&destroy_lock);
+ +		/* exchange the list head */
+ +		list_replace_init(&destroy_list, &private_destroy_list);
+ +		spin_unlock(&destroy_lock);
+  
+ -	synchronize_srcu(&fsnotify_mark_srcu);
+ +		synchronize_srcu(&fsnotify_mark_srcu);
+  
+ -	list_for_each_entry_safe(mark, next, &private_destroy_list, g_list) {
+ -		list_del_init(&mark->g_list);
+ -		fsnotify_put_mark(mark);
+ +		list_for_each_entry_safe(mark, next, &private_destroy_list, g_list) {
+ +			list_del_init(&mark->g_list);
+ +			fsnotify_put_mark(mark);
+ +		}
+ +
+ +		wait_event_interruptible(destroy_waitq, !list_empty(&destroy_list));
+  	}
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int __init fsnotify_mark_init(void)
+ +{
+ +	struct task_struct *thread;
+ +
+ +	thread = kthread_run(fsnotify_mark_destroy, NULL,
+ +			     "fsnotify_mark");
+ +	if (IS_ERR(thread))
+ +		panic("unable to start fsnotify mark destruction thread.");
+ +
+ +	return 0;
+ +}
+ +device_initcall(fsnotify_mark_init);
+++=======
++ static void fsnotify_mark_destroy_workfn(struct work_struct *work)
++ {
++ 	fsnotify_mark_destroy_list();
++ }
+++>>>>>>> 35e481761cdc (fsnotify: avoid spurious EMFILE errors from inotify_init())
+* Unmerged path fs/notify/fsnotify.h
+diff --git a/fs/notify/group.c b/fs/notify/group.c
+index d16b62cb2854..3e2dd85be5dd 100644
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@ -47,12 +47,21 @@ static void fsnotify_final_destroy_group(struct fsnotify_group *group)
+  */
+ void fsnotify_destroy_group(struct fsnotify_group *group)
+ {
+-	/* clear all inode marks for this group */
+-	fsnotify_clear_marks_by_group(group);
++	/* clear all inode marks for this group, attach them to destroy_list */
++	fsnotify_detach_group_marks(group);
+ 
+-	synchronize_srcu(&fsnotify_mark_srcu);
++	/*
++	 * Wait for fsnotify_mark_srcu period to end and free all marks in
++	 * destroy_list
++	 */
++	fsnotify_mark_destroy_list();
+ 
+-	/* clear the notification queue of all events */
++	/*
++	 * Since we have waited for fsnotify_mark_srcu in
++	 * fsnotify_mark_destroy_list() there can be no outstanding event
++	 * notification against this group. So clearing the notification queue
++	 * of all events is reliable now.
++	 */
+ 	fsnotify_flush_notify(group);
+ 
+ 	/*
+* Unmerged path fs/notify/mark.c
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index 6b41e8a76df9..1497f3a99339 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -366,8 +366,6 @@ extern void fsnotify_clear_vfsmount_marks_by_group(struct fsnotify_group *group)
+ extern void fsnotify_clear_inode_marks_by_group(struct fsnotify_group *group);
+ /* run all the marks in a group, and clear all of the marks where mark->flags & flags is true*/
+ extern void fsnotify_clear_marks_by_group_flags(struct fsnotify_group *group, unsigned int flags);
+-/* run all the marks in a group, and flag them to be freed */
+-extern void fsnotify_clear_marks_by_group(struct fsnotify_group *group);
+ extern void fsnotify_get_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_put_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_unmount_inodes(struct list_head *list);
