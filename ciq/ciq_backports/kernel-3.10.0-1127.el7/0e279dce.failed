@@ -1,0 +1,239 @@
+ALSA: pcm: Fix refcount_inc() on zero usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 0e279dcea0ec897af1c979ebee4ec92b461793f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0e279dce.failed
+
+The recent rewrite of PCM link lock management introduced the refcount
+in snd_pcm_group object, managed by the kernel refcount_t API.  This
+caused unexpected kernel warnings when the kernel is built with
+CONFIG_REFCOUNT_FULL=y.  As the warning line indicates, the problem is
+obviously that we start with refcount=0 and do refcount_inc() for
+adding each PCM link, while refcount_t API doesn't like refcount_inc()
+performed on zero.
+
+For adapting the proper refcount_t usage, this patch changes the logic
+slightly:
+- The initial refcount is 1, assuming the single list entry
+- The refcount is incremented / decremented at each PCM link addition
+  and deletion
+- ... which allows us concentrating only on the refcount as a release
+  condition
+
+Fixes: f57f3df03a8e ("ALSA: pcm: More fine-grained PCM link locking")
+BugLink: https://bugzilla.kernel.org/show_bug.cgi?id=204221
+Reported-and-tested-by: Duncan Overbruck <kernel@duncano.de>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 0e279dcea0ec897af1c979ebee4ec92b461793f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/core/pcm_native.c
+diff --cc sound/core/pcm_native.c
+index e5b262e50308,12dd9b318db1..000000000000
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@@ -104,58 -77,23 +104,62 @@@ void snd_pcm_group_init(struct snd_pcm_
+  	spin_lock_init(&group->lock);
+  	mutex_init(&group->mutex);
+  	INIT_LIST_HEAD(&group->substreams);
+++<<<<<<< HEAD
+++=======
++ 	refcount_set(&group->refs, 1);
+++>>>>>>> 0e279dcea0ec (ALSA: pcm: Fix refcount_inc() on zero usage)
+  }
+  
+ -/* define group lock helpers */
+ -#define DEFINE_PCM_GROUP_LOCK(action, mutex_action) \
+ -static void snd_pcm_group_ ## action(struct snd_pcm_group *group, bool nonatomic) \
+ -{ \
+ -	if (nonatomic) \
+ -		mutex_ ## mutex_action(&group->mutex); \
+ -	else \
+ -		spin_ ## action(&group->lock); \
+ +#define PCM_LOCK_DEFAULT	0
+ +#define PCM_LOCK_IRQ	1
+ +#define PCM_LOCK_IRQSAVE	2
+ +
+ +static unsigned long __snd_pcm_stream_lock_mode(struct snd_pcm_substream *substream,
+ +						unsigned int mode)
+ +{
+ +	unsigned long flags = 0;
+ +	if (substream->pcm->nonatomic) {
+ +		down_read_nested(&snd_pcm_link_rwsem, SINGLE_DEPTH_NESTING);
+ +		mutex_lock(&substream->self_group.mutex);
+ +	} else {
+ +		switch (mode) {
+ +		case PCM_LOCK_DEFAULT:
+ +			read_lock(&snd_pcm_link_rwlock);
+ +			break;
+ +		case PCM_LOCK_IRQ:
+ +			read_lock_irq(&snd_pcm_link_rwlock);
+ +			break;
+ +		case PCM_LOCK_IRQSAVE:
+ +			read_lock_irqsave(&snd_pcm_link_rwlock, flags);
+ +			break;
+ +		}
+ +		spin_lock(&substream->self_group.lock);
+ +	}
+ +	return flags;
+  }
+  
+ -DEFINE_PCM_GROUP_LOCK(lock, lock);
+ -DEFINE_PCM_GROUP_LOCK(unlock, unlock);
+ -DEFINE_PCM_GROUP_LOCK(lock_irq, lock);
+ -DEFINE_PCM_GROUP_LOCK(unlock_irq, unlock);
+ +static void __snd_pcm_stream_unlock_mode(struct snd_pcm_substream *substream,
+ +					 unsigned int mode, unsigned long flags)
+ +{
+ +	if (substream->pcm->nonatomic) {
+ +		mutex_unlock(&substream->self_group.mutex);
+ +		up_read(&snd_pcm_link_rwsem);
+ +	} else {
+ +		spin_unlock(&substream->self_group.lock);
+ +
+ +		switch (mode) {
+ +		case PCM_LOCK_DEFAULT:
+ +			read_unlock(&snd_pcm_link_rwlock);
+ +			break;
+ +		case PCM_LOCK_IRQ:
+ +			read_unlock_irq(&snd_pcm_link_rwlock);
+ +			break;
+ +		case PCM_LOCK_IRQSAVE:
+ +			read_unlock_irqrestore(&snd_pcm_link_rwlock, flags);
+ +			break;
+ +		}
+ +	}
+ +}
+  
+  /**
+   * snd_pcm_stream_lock - Lock the PCM stream
+@@@ -1138,6 -1086,60 +1142,63 @@@ static void snd_pcm_group_assign(struc
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Unref and unlock the group, but keep the stream lock;
++  * when the group becomes empty and no longer referred, destroy itself
++  */
++ static void snd_pcm_group_unref(struct snd_pcm_group *group,
++ 				struct snd_pcm_substream *substream)
++ {
++ 	bool do_free;
++ 
++ 	if (!group)
++ 		return;
++ 	do_free = refcount_dec_and_test(&group->refs);
++ 	snd_pcm_group_unlock(group, substream->pcm->nonatomic);
++ 	if (do_free)
++ 		kfree(group);
++ }
++ 
++ /*
++  * Lock the group inside a stream lock and reference it;
++  * return the locked group object, or NULL if not linked
++  */
++ static struct snd_pcm_group *
++ snd_pcm_stream_group_ref(struct snd_pcm_substream *substream)
++ {
++ 	bool nonatomic = substream->pcm->nonatomic;
++ 	struct snd_pcm_group *group;
++ 	bool trylock;
++ 
++ 	for (;;) {
++ 		if (!snd_pcm_stream_linked(substream))
++ 			return NULL;
++ 		group = substream->group;
++ 		/* block freeing the group object */
++ 		refcount_inc(&group->refs);
++ 
++ 		trylock = nonatomic ? mutex_trylock(&group->mutex) :
++ 			spin_trylock(&group->lock);
++ 		if (trylock)
++ 			break; /* OK */
++ 
++ 		/* re-lock for avoiding ABBA deadlock */
++ 		snd_pcm_stream_unlock(substream);
++ 		snd_pcm_group_lock(group, nonatomic);
++ 		snd_pcm_stream_lock(substream);
++ 
++ 		/* check the group again; the above opens a small race window */
++ 		if (substream->group == group)
++ 			break; /* OK */
++ 		/* group changed, try again */
++ 		snd_pcm_group_unref(group, substream);
++ 	}
++ 	return group;
++ }
++ 
++ /*
+++>>>>>>> 0e279dcea0ec (ALSA: pcm: Fix refcount_inc() on zero usage)
+   *  Note: call with stream lock
+   */
+  static int snd_pcm_action(const struct action_ops *ops,
+@@@ -2013,13 -2007,22 +2074,25 @@@ static int snd_pcm_link(struct snd_pcm_
+  		res = -EALREADY;
+  		goto _end;
+  	}
+ -
+ -	snd_pcm_stream_lock_irq(substream);
+  	if (!snd_pcm_stream_linked(substream)) {
+  		snd_pcm_group_assign(substream, group);
+ -		group = NULL; /* assigned, don't free this one below */
+ +		group = NULL;
+  	}
+++<<<<<<< HEAD
+ +	snd_pcm_group_assign(substream1, substream->group);
+++=======
++ 	target_group = substream->group;
++ 	snd_pcm_stream_unlock_irq(substream);
++ 
++ 	snd_pcm_group_lock_irq(target_group, nonatomic);
++ 	snd_pcm_stream_lock(substream1);
++ 	snd_pcm_group_assign(substream1, target_group);
++ 	refcount_inc(&target_group->refs);
++ 	snd_pcm_stream_unlock(substream1);
++ 	snd_pcm_group_unlock_irq(target_group, nonatomic);
+++>>>>>>> 0e279dcea0ec (ALSA: pcm: Fix refcount_inc() on zero usage)
+   _end:
+ +	write_unlock_irq(&snd_pcm_link_rwlock);
+  	up_write(&snd_pcm_link_rwsem);
+   _nolock:
+  	kfree(group);
+@@@ -2046,19 -2053,24 +2119,24 @@@ static int snd_pcm_unlink(struct snd_pc
+  	}
+  
+  	group = substream->group;
+ -	snd_pcm_group_lock_irq(group, nonatomic);
+  
+  	relink_to_local(substream);
++ 	refcount_dec(&group->refs);
+  
+  	/* detach the last stream, too */
+  	if (list_is_singular(&group->substreams)) {
+  		relink_to_local(list_first_entry(&group->substreams,
+  						 struct snd_pcm_substream,
+  						 link_list));
+++<<<<<<< HEAD
+ +		kfree(group);
+++=======
++ 		do_free = refcount_dec_and_test(&group->refs);
+++>>>>>>> 0e279dcea0ec (ALSA: pcm: Fix refcount_inc() on zero usage)
+  	}
+  
+ -	snd_pcm_group_unlock_irq(group, nonatomic);
+ -	if (do_free)
+ -		kfree(group);
+ -
+         _end:
+ +	write_unlock_irq(&snd_pcm_link_rwlock);
+  	up_write(&snd_pcm_link_rwsem);
+  	return res;
+  }
+* Unmerged path sound/core/pcm_native.c
