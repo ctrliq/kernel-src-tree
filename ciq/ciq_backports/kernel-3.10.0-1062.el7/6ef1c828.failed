@@ -1,0 +1,405 @@
+IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 6ef1c82821b2ae9bfa26fe65e6f0a66dfd79b7d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6ef1c828.failed
+
+The correct handle to refer to the idr/etc is ib_uverbs_file, revise all
+the core APIs to use this instead. The user API are left as wrappers
+that automatically convert a ucontext to a ufile for now.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 6ef1c82821b2ae9bfa26fe65e6f0a66dfd79b7d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_ioctl.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,dcaf3813ee78..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -161,7 -161,8 +161,12 @@@ static struct ib_uobject *alloc_uobj(st
+  	 * user_handle should be filled by the handler,
+  	 * The object is added to the list in the commit stage.
+  	 */
+++<<<<<<< HEAD
+ +	uobj->context = context;
+++=======
++ 	uobj->ufile = ufile;
++ 	uobj->context = ufile->ucontext;
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  	uobj->type = type;
+  	/*
+  	 * Allocated objects start out as write locked to deny any other
+@@@ -312,8 -313,14 +317,16 @@@ static struct ib_uobject *alloc_begin_i
+  	if (ret)
+  		goto uobj_put;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = ib_rdmacg_try_charge(&uobj->cg_obj, ufile->ucontext->device,
++ 				   RDMACG_RESOURCE_HCA_OBJECT);
++ 	if (ret)
++ 		goto idr_remove;
++ 
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  	return uobj;
+  
+ -idr_remove:
+  	uverbs_idr_remove_uobj(uobj);
+  uobj_put:
+  	uverbs_uobject_put(uobj);
+@@@ -656,72 -669,81 +669,145 @@@ void uverbs_close_fd(struct file *f
+  	kref_put(uverbs_file_ref, ib_uverbs_release_file);
+  }
+  
+++<<<<<<< HEAD
+ +void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
+ +{
+ +	enum rdma_remove_reason reason = device_removed ?
+ +		RDMA_REMOVE_DRIVER_REMOVE : RDMA_REMOVE_CLOSE;
+ +	unsigned int cur_order = 0;
+++=======
++ static int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
++ 				  enum rdma_remove_reason reason)
++ {
++ 	struct ib_uobject *obj, *next_obj;
++ 	int ret = -EINVAL;
++ 	int err = 0;
++ 
++ 	/*
++ 	 * This shouldn't run while executing other commands on this
++ 	 * context. Thus, the only thing we should take care of is
++ 	 * releasing a FD while traversing this list. The FD could be
++ 	 * closed and released from the _release fop of this FD.
++ 	 * In order to mitigate this, we add a lock.
++ 	 * We take and release the lock per traversal in order to let
++ 	 * other threads (which might still use the FDs) chance to run.
++ 	 */
++ 	mutex_lock(&ufile->uobjects_lock);
++ 	ufile->cleanup_reason = reason;
++ 	list_for_each_entry_safe(obj, next_obj, &ufile->uobjects, list) {
++ 		/*
++ 		 * if we hit this WARN_ON, that means we are
++ 		 * racing with a lookup_get.
++ 		 */
++ 		WARN_ON(uverbs_try_lock_object(obj, true));
++ 		err = obj->type->type_class->remove_commit(obj, reason);
++ 
++ 		if (ib_is_destroy_retryable(err, reason, obj)) {
++ 			pr_debug("ib_uverbs: failed to remove uobject id %d err %d\n",
++ 				 obj->id, err);
++ 			atomic_set(&obj->usecnt, 0);
++ 			continue;
++ 		}
++ 
++ 		if (err)
++ 			pr_err("ib_uverbs: unable to remove uobject id %d err %d\n",
++ 				obj->id, err);
++ 
++ 		list_del(&obj->list);
++ 		/* put the ref we took when we created the object */
++ 		uverbs_uobject_put(obj);
++ 		ret = 0;
++ 	}
++ 	mutex_unlock(&ufile->uobjects_lock);
++ 	return ret;
++ }
++ 
++ void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed)
++ {
++ 	enum rdma_remove_reason reason = device_removed ?
++ 					RDMA_REMOVE_DRIVER_REMOVE :
++ 					RDMA_REMOVE_CLOSE;
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  
+ +	ucontext->cleanup_reason = reason;
+  	/*
+  	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+  	 * want to hold this forever as the context is going to be destroyed,
+  	 * but we'll release it since it causes a "held lock freed" BUG message.
+  	 */
+++<<<<<<< HEAD
+ +	down_write(&ucontext->cleanup_rwsem);
+ +
+ +	while (!list_empty(&ucontext->uobjects)) {
+ +		struct ib_uobject *obj, *next_obj;
+ +		unsigned int next_order = UINT_MAX;
+ +
+ +		/*
+ +		 * This shouldn't run while executing other commands on this
+ +		 * context. Thus, the only thing we should take care of is
+ +		 * releasing a FD while traversing this list. The FD could be
+ +		 * closed and released from the _release fop of this FD.
+ +		 * In order to mitigate this, we add a lock.
+ +		 * We take and release the lock per order traversal in order
+ +		 * to let other threads (which might still use the FDs) chance
+ +		 * to run.
+ +		 */
+ +		mutex_lock(&ucontext->uobjects_lock);
+ +		list_for_each_entry_safe(obj, next_obj, &ucontext->uobjects,
+ +					 list) {
+ +			if (obj->type->destroy_order == cur_order) {
+ +				int ret;
+ +
+ +				/*
+ +				 * if we hit this WARN_ON, that means we are
+ +				 * racing with a lookup_get.
+ +				 */
+ +				WARN_ON(uverbs_try_lock_object(obj, true));
+ +				ret = obj->type->type_class->remove_commit(obj,
+ +									   reason);
+ +				list_del(&obj->list);
+ +				if (ret)
+ +					pr_warn("ib_uverbs: failed to remove uobject id %d order %u\n",
+ +						obj->id, cur_order);
+ +				/* put the ref we took when we created the object */
+ +				uverbs_uobject_put(obj);
+ +			} else {
+ +				next_order = min(next_order,
+ +						 obj->type->destroy_order);
+ +			}
+ +		}
+ +		mutex_unlock(&ucontext->uobjects_lock);
+ +		cur_order = next_order;
+ +	}
+ +	up_write(&ucontext->cleanup_rwsem);
+++=======
++ 	down_write(&ufile->cleanup_rwsem);
++ 	ufile->ucontext->cleanup_retryable = true;
++ 	while (!list_empty(&ufile->uobjects))
++ 		if (__uverbs_cleanup_ufile(ufile, reason)) {
++ 			/*
++ 			 * No entry was cleaned-up successfully during this
++ 			 * iteration
++ 			 */
++ 			break;
++ 		}
++ 
++ 	ufile->ucontext->cleanup_retryable = false;
++ 	if (!list_empty(&ufile->uobjects))
++ 		__uverbs_cleanup_ufile(ufile, reason);
++ 
++ 	up_write(&ufile->cleanup_rwsem);
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  }
+  
+ +void uverbs_initialize_ucontext(struct ib_ucontext *ucontext)
+ +{
+ +	ucontext->cleanup_reason = 0;
+ +	mutex_init(&ucontext->uobjects_lock);
+ +	INIT_LIST_HEAD(&ucontext->uobjects);
+ +	init_rwsem(&ucontext->cleanup_rwsem);
+ +}
+ + 
+  const struct uverbs_obj_type_class uverbs_fd_class = {
+  	.alloc_begin = alloc_begin_fd_uobject,
+  	.lookup_get = lookup_get_fd_uobject,
+@@@ -731,11 -753,12 +817,20 @@@
+  	.remove_commit = remove_commit_fd_uobject,
+  	.needs_kfree_rcu = false,
+  };
+++<<<<<<< HEAD
+ + 
+ +struct ib_uobject *uverbs_get_uobject_from_context(const struct uverbs_obj_type *type_attrs,
+ +						   struct ib_ucontext *ucontext,
+ +						   enum uverbs_obj_access access,
+ +						   int id)
+++=======
++ EXPORT_SYMBOL(uverbs_fd_class);
++ 
++ struct ib_uobject *
++ uverbs_get_uobject_from_file(const struct uverbs_obj_type *type_attrs,
++ 			     struct ib_uverbs_file *ufile,
++ 			     enum uverbs_obj_access access, int id)
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  {
+  	switch (access) {
+  	case UVERBS_ACCESS_READ:
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,1bba60e960c1..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -48,15 -48,8 +48,20 @@@ const struct uverbs_object_spec *uverbs
+  						   uint16_t object);
+  const struct uverbs_method_spec *uverbs_get_method(const struct uverbs_object_spec *object,
+  						   uint16_t method);
+++<<<<<<< HEAD
+ +/*
+ + * These functions initialize the context and cleanups its uobjects.
+ + * The context has a list of objects which is protected by a mutex
+ + * on the context. initialize_ucontext should be called when we create
+ + * a context.
+ + * cleanup_ucontext removes all uobjects from the context and puts them.
+ + */
+ +void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed);
+ +void uverbs_initialize_ucontext(struct ib_ucontext *ucontext);
+++=======
++ 
++ void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed);
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  
+  /*
+   * uverbs_uobject_get is called in order to increase the reference count on
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,d3bf82cfaa2b..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -135,10 -152,10 +135,15 @@@ static int uverbs_process_attr(struct i
+  		if (!object)
+  			return -EINVAL;
+  
+- 		o_attr->uobject = uverbs_get_uobject_from_context(
++ 		o_attr->uobject = uverbs_get_uobject_from_file(
+  					object->type_attrs,
+++<<<<<<< HEAD
+ +					ucontext,
+ +					spec->obj.access,
+++=======
++ 					ufile,
++ 					spec->u.obj.access,
+++>>>>>>> 6ef1c82821b2 (IB/uverbs: Replace ib_ucontext with ib_uverbs_file in core function calls)
+  					(int)uattr->data);
+  
+  		if (IS_ERR(o_attr->uobject))
+* Unmerged path drivers/infiniband/core/rdma_core.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 9b53f7b4a4a8..c848441a5a45 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -226,12 +226,13 @@ void ib_uverbs_detach_umcast(struct ib_qp *qp,
+ 	}
+ }
+ 
+-static int ib_uverbs_cleanup_ucontext(struct ib_uverbs_file *file,
+-				      struct ib_ucontext *context,
+-				      bool device_removed)
++static int ib_uverbs_cleanup_ufile(struct ib_uverbs_file *file,
++				   bool device_removed)
+ {
++	struct ib_ucontext *context = file->ucontext;
++
+ 	context->closing = 1;
+-	uverbs_cleanup_ucontext(context, device_removed);
++	uverbs_cleanup_ufile(file, device_removed);
+ 	put_pid(context->tgid);
+ 
+ 	return context->device->dealloc_ucontext(context);
+@@ -916,7 +917,7 @@ static int ib_uverbs_close(struct inode *inode, struct file *filp)
+ 
+ 	mutex_lock(&file->cleanup_mutex);
+ 	if (file->ucontext) {
+-		ib_uverbs_cleanup_ucontext(file, file->ucontext, false);
++		ib_uverbs_cleanup_ufile(file, false);
+ 		file->ucontext = NULL;
+ 	}
+ 	mutex_unlock(&file->cleanup_mutex);
+@@ -1169,7 +1170,7 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
+ 		mutex_unlock(&file->cleanup_mutex);
+ 
+ 		/* At this point ib_uverbs_close cannot be running
+-		 * ib_uverbs_cleanup_ucontext
++		 * ib_uverbs_cleanup_ufile
+ 		 */
+ 		if (ucontext) {
+ 			/* We must release the mutex before going ahead and
+@@ -1181,7 +1182,7 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
+ 			ib_uverbs_event_handler(&file->event_handler, &event);
+ 			ib_uverbs_disassociate_ucontext(ucontext);
+ 			mutex_lock(&file->cleanup_mutex);
+-			ib_uverbs_cleanup_ucontext(file, ucontext, true);
++			ib_uverbs_cleanup_ufile(file, true);
+ 			mutex_unlock(&file->cleanup_mutex);
+ 		}
+ 
+diff --git a/include/rdma/uverbs_std_types.h b/include/rdma/uverbs_std_types.h
+index 6e389a6b0382..40cf284ac224 100644
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@ -48,28 +48,28 @@ static inline const struct uverbs_object_tree_def *uverbs_default_get_objects(vo
+ 
+ static inline struct ib_uobject *__uobj_get(const struct uverbs_obj_type *type,
+ 					    bool write,
+-					    struct ib_ucontext *ucontext,
++					    struct ib_uverbs_file *ufile,
+ 					    int id)
+ {
+-	return rdma_lookup_get_uobject(type, ucontext, id, write);
++	return rdma_lookup_get_uobject(type, ufile, id, write);
+ }
+ 
+ #define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
+ 
+-#define uobj_get_read(_type, _id, _ucontext)				\
+-	 __uobj_get(uobj_get_type(_type), false, _ucontext, _id)
++#define uobj_get_read(_type, _id, _ucontext)                                   \
++	__uobj_get(uobj_get_type(_type), false, (_ucontext)->ufile, _id)
+ 
+ #define uobj_get_obj_read(_object, _type, _id, _ucontext)		\
+ ({									\
+ 	struct ib_uobject *__uobj =					\
+ 		__uobj_get(uobj_get_type(_type),			\
+-			   false, _ucontext, _id);			\
++			   false, (_ucontext)->ufile, _id);		\
+ 									\
+ 	(struct ib_##_object *)(IS_ERR(__uobj) ? NULL : __uobj->object);\
+ })
+ 
+-#define uobj_get_write(_type, _id, _ucontext)				\
+-	 __uobj_get(uobj_get_type(_type), true, _ucontext, _id)
++#define uobj_get_write(_type, _id, _ucontext)                                  \
++	__uobj_get(uobj_get_type(_type), true, (_ucontext)->ufile, _id)
+ 
+ int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
+ 			   struct ib_uverbs_file *ufile, int success_res);
+@@ -107,7 +107,7 @@ static inline void uobj_alloc_abort(struct ib_uobject *uobj)
+ static inline struct ib_uobject *__uobj_alloc(const struct uverbs_obj_type *type,
+ 					      struct ib_ucontext *ucontext)
+ {
+-	return rdma_alloc_begin_uobject(type, ucontext);
++	return rdma_alloc_begin_uobject(type, ucontext->ufile);
+ }
+ 
+ #define uobj_alloc(_type, ucontext)	\
+diff --git a/include/rdma/uverbs_types.h b/include/rdma/uverbs_types.h
+index cc04ec65588d..22ed01b78d70 100644
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -72,12 +72,12 @@ struct uverbs_obj_type_class {
+ 	 *		 reset flow).
+ 	 */
+ 	struct ib_uobject *(*alloc_begin)(const struct uverbs_obj_type *type,
+-					  struct ib_ucontext *ucontext);
++					  struct ib_uverbs_file *ufile);
+ 	void (*alloc_commit)(struct ib_uobject *uobj);
+ 	void (*alloc_abort)(struct ib_uobject *uobj);
+ 
+ 	struct ib_uobject *(*lookup_get)(const struct uverbs_obj_type *type,
+-					 struct ib_ucontext *ucontext, int id,
++					 struct ib_uverbs_file *ufile, int id,
+ 					 bool exclusive);
+ 	void (*lookup_put)(struct ib_uobject *uobj, bool exclusive);
+ 	/*
+@@ -121,11 +121,11 @@ struct uverbs_obj_idr_type {
+ };
+ 
+ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+-					   struct ib_ucontext *ucontext,
++					   struct ib_uverbs_file *ufile,
+ 					   int id, bool exclusive);
+ void rdma_lookup_put_uobject(struct ib_uobject *uobj, bool exclusive);
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+-					    struct ib_ucontext *ucontext);
++					    struct ib_uverbs_file *ufile);
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+ int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj);
+ int rdma_alloc_commit_uobject(struct ib_uobject *uobj);
