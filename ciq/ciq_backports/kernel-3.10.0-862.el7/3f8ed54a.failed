@@ -1,0 +1,388 @@
+cpufreq: intel_pstate: Correct frequency setting in the HWP mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Correct frequency setting in the HWP mode (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 92.44%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 3f8ed54aee491bbb83656592c2d0ad7b78d045ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3f8ed54a.failed
+
+In the functions intel_pstate_hwp_set(), min/max range from HWP capability
+MSR along with max_perf_pct and min_perf_pct, is used to set the HWP
+request MSR. In some cases this doesn't result in the correct HWP max/min
+in HWP request.
+
+For example: In the following case:
+
+HWP capabilities from MSR 0x771
+0x70a1220
+
+Here cpufreq min/max frequencies from above MSR dump are 700MHz and 3.2GHz
+respectively.
+
+This will result in
+hwp_min = 0x07
+hwp_max = 0x20
+
+To limit max frequency to 2GHz:
+
+perf_limits->max_perf_pct = 63 (2GHz as a percent of 3.2GHz rounded up)
+
+With the current calculation:
+adj_range = max_perf_pct * range / 100;
+adj_range = 63 * (32 - 7) / 100
+adj_range = 15
+
+max = hw_min + adj_range;
+max = 7 + 15 = 22
+
+This will result in HWP request of 0x160f, which will result in a
+frequency cap of 2.2GHz not 2GHz.
+
+The problem with the above calculation is that hwp_min of 7 is treated
+as 0% in the range. But max_perf_pct is calculated with respect to minimum
+as 0 and max as 3.2GHz or hwp_max, so adding hwp_min to it will result in
+more than the desired.
+
+Since the min_perf_pct and max_perf_pct is already a percent of max
+frequency or hwp_max, this min/max HWP request value can be calculated
+directly applying these percentage to hwp_max.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 3f8ed54aee491bbb83656592c2d0ad7b78d045ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 9b85edc571c0,ee12641ee010..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -551,31 -626,303 +551,48 @@@ static inline void update_turbo_state(v
+  		 cpu->pstate.max_pstate == cpu->pstate.turbo_pstate);
+  }
+  
+ -static s16 intel_pstate_get_epb(struct cpudata *cpu_data)
+ -{
+ -	u64 epb;
+ -	int ret;
+ -
+ -	if (!static_cpu_has(X86_FEATURE_EPB))
+ -		return -ENXIO;
+ -
+ -	ret = rdmsrl_on_cpu(cpu_data->cpu, MSR_IA32_ENERGY_PERF_BIAS, &epb);
+ -	if (ret)
+ -		return (s16)ret;
+ -
+ -	return (s16)(epb & 0x0f);
+ -}
+ -
+ -static s16 intel_pstate_get_epp(struct cpudata *cpu_data, u64 hwp_req_data)
+ -{
+ -	s16 epp;
+ -
+ -	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
+ -		/*
+ -		 * When hwp_req_data is 0, means that caller didn't read
+ -		 * MSR_HWP_REQUEST, so need to read and get EPP.
+ -		 */
+ -		if (!hwp_req_data) {
+ -			epp = rdmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST,
+ -					    &hwp_req_data);
+ -			if (epp)
+ -				return epp;
+ -		}
+ -		epp = (hwp_req_data >> 24) & 0xff;
+ -	} else {
+ -		/* When there is no EPP present, HWP uses EPB settings */
+ -		epp = intel_pstate_get_epb(cpu_data);
+ -	}
+ -
+ -	return epp;
+ -}
+ -
+ -static int intel_pstate_set_epb(int cpu, s16 pref)
+ -{
+ -	u64 epb;
+ -	int ret;
+ -
+ -	if (!static_cpu_has(X86_FEATURE_EPB))
+ -		return -ENXIO;
+ -
+ -	ret = rdmsrl_on_cpu(cpu, MSR_IA32_ENERGY_PERF_BIAS, &epb);
+ -	if (ret)
+ -		return ret;
+ -
+ -	epb = (epb & ~0x0f) | pref;
+ -	wrmsrl_on_cpu(cpu, MSR_IA32_ENERGY_PERF_BIAS, epb);
+ -
+ -	return 0;
+ -}
+ -
+ -/*
+ - * EPP/EPB display strings corresponding to EPP index in the
+ - * energy_perf_strings[]
+ - *	index		String
+ - *-------------------------------------
+ - *	0		default
+ - *	1		performance
+ - *	2		balance_performance
+ - *	3		balance_power
+ - *	4		power
+ - */
+ -static const char * const energy_perf_strings[] = {
+ -	"default",
+ -	"performance",
+ -	"balance_performance",
+ -	"balance_power",
+ -	"power",
+ -	NULL
+ -};
+ -
+ -static int intel_pstate_get_energy_pref_index(struct cpudata *cpu_data)
+ -{
+ -	s16 epp;
+ -	int index = -EINVAL;
+ -
+ -	epp = intel_pstate_get_epp(cpu_data, 0);
+ -	if (epp < 0)
+ -		return epp;
+ -
+ -	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
+ -		/*
+ -		 * Range:
+ -		 *	0x00-0x3F	:	Performance
+ -		 *	0x40-0x7F	:	Balance performance
+ -		 *	0x80-0xBF	:	Balance power
+ -		 *	0xC0-0xFF	:	Power
+ -		 * The EPP is a 8 bit value, but our ranges restrict the
+ -		 * value which can be set. Here only using top two bits
+ -		 * effectively.
+ -		 */
+ -		index = (epp >> 6) + 1;
+ -	} else if (static_cpu_has(X86_FEATURE_EPB)) {
+ -		/*
+ -		 * Range:
+ -		 *	0x00-0x03	:	Performance
+ -		 *	0x04-0x07	:	Balance performance
+ -		 *	0x08-0x0B	:	Balance power
+ -		 *	0x0C-0x0F	:	Power
+ -		 * The EPB is a 4 bit value, but our ranges restrict the
+ -		 * value which can be set. Here only using top two bits
+ -		 * effectively.
+ -		 */
+ -		index = (epp >> 2) + 1;
+ -	}
+ -
+ -	return index;
+ -}
+ -
+ -static int intel_pstate_set_energy_pref_index(struct cpudata *cpu_data,
+ -					      int pref_index)
+ -{
+ -	int epp = -EINVAL;
+ -	int ret;
+ -
+ -	if (!pref_index)
+ -		epp = cpu_data->epp_default;
+ -
+ -	mutex_lock(&intel_pstate_limits_lock);
+ -
+ -	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
+ -		u64 value;
+ -
+ -		ret = rdmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST, &value);
+ -		if (ret)
+ -			goto return_pref;
+ -
+ -		value &= ~GENMASK_ULL(31, 24);
+ -
+ -		/*
+ -		 * If epp is not default, convert from index into
+ -		 * energy_perf_strings to epp value, by shifting 6
+ -		 * bits left to use only top two bits in epp.
+ -		 * The resultant epp need to shifted by 24 bits to
+ -		 * epp position in MSR_HWP_REQUEST.
+ -		 */
+ -		if (epp == -EINVAL)
+ -			epp = (pref_index - 1) << 6;
+ -
+ -		value |= (u64)epp << 24;
+ -		ret = wrmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST, value);
+ -	} else {
+ -		if (epp == -EINVAL)
+ -			epp = (pref_index - 1) << 2;
+ -		ret = intel_pstate_set_epb(cpu_data->cpu, epp);
+ -	}
+ -return_pref:
+ -	mutex_unlock(&intel_pstate_limits_lock);
+ -
+ -	return ret;
+ -}
+ -
+ -static ssize_t show_energy_performance_available_preferences(
+ -				struct cpufreq_policy *policy, char *buf)
+ -{
+ -	int i = 0;
+ -	int ret = 0;
+ -
+ -	while (energy_perf_strings[i] != NULL)
+ -		ret += sprintf(&buf[ret], "%s ", energy_perf_strings[i++]);
+ -
+ -	ret += sprintf(&buf[ret], "\n");
+ -
+ -	return ret;
+ -}
+ -
+ -cpufreq_freq_attr_ro(energy_performance_available_preferences);
+ -
+ -static ssize_t store_energy_performance_preference(
+ -		struct cpufreq_policy *policy, const char *buf, size_t count)
+ -{
+ -	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
+ -	char str_preference[21];
+ -	int ret, i = 0;
+ -
+ -	ret = sscanf(buf, "%20s", str_preference);
+ -	if (ret != 1)
+ -		return -EINVAL;
+ -
+ -	while (energy_perf_strings[i] != NULL) {
+ -		if (!strcmp(str_preference, energy_perf_strings[i])) {
+ -			intel_pstate_set_energy_pref_index(cpu_data, i);
+ -			return count;
+ -		}
+ -		++i;
+ -	}
+ -
+ -	return -EINVAL;
+ -}
+ -
+ -static ssize_t show_energy_performance_preference(
+ -				struct cpufreq_policy *policy, char *buf)
+ -{
+ -	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
+ -	int preference;
+ -
+ -	preference = intel_pstate_get_energy_pref_index(cpu_data);
+ -	if (preference < 0)
+ -		return preference;
+ -
+ -	return  sprintf(buf, "%s\n", energy_perf_strings[preference]);
+ -}
+ -
+ -cpufreq_freq_attr_rw(energy_performance_preference);
+ -
+ -static struct freq_attr *hwp_cpufreq_attrs[] = {
+ -	&energy_performance_preference,
+ -	&energy_performance_available_preferences,
+ -	NULL,
+ -};
+ -
+ -static void intel_pstate_hwp_set(struct cpufreq_policy *policy)
+ +static void intel_pstate_hwp_set(const struct cpumask *cpumask)
+  {
+++<<<<<<< HEAD
+ +	int min, hw_min, max, hw_max, cpu, range, adj_range;
+++=======
++ 	int min, hw_min, max, hw_max, cpu;
++ 	struct perf_limits *perf_limits = limits;
+++>>>>>>> 3f8ed54aee49 (cpufreq: intel_pstate: Correct frequency setting in the HWP mode)
+  	u64 value, cap;
+  
+ -	for_each_cpu(cpu, policy->cpus) {
+ -		int max_perf_pct, min_perf_pct;
+ -		struct cpudata *cpu_data = all_cpu_data[cpu];
+ -		s16 epp;
+ -
+ -		if (per_cpu_limits)
+ -			perf_limits = all_cpu_data[cpu]->perf_limits;
+ -
+ +	for_each_cpu(cpu, cpumask) {
+  		rdmsrl_on_cpu(cpu, MSR_HWP_CAPABILITIES, &cap);
+  		hw_min = HWP_LOWEST_PERF(cap);
+  		if (limits->no_turbo)
+  			hw_max = HWP_GUARANTEED_PERF(cap);
+  		else
+  			hw_max = HWP_HIGHEST_PERF(cap);
+- 		range = hw_max - hw_min;
+  
+++<<<<<<< HEAD
+ +		rdmsrl_on_cpu(cpu, MSR_HWP_REQUEST, &value);
+ +		adj_range = limits->min_perf_pct * range / 100;
+ +		min = hw_min + adj_range;
+ +		value &= ~HWP_MIN_PERF(~0L);
+ +		value |= HWP_MIN_PERF(min);
+ +
+ +		adj_range = limits->max_perf_pct * range / 100;
+ +		max = hw_min + adj_range;
+ +
+++=======
++ 		max_perf_pct = perf_limits->max_perf_pct;
++ 		min_perf_pct = perf_limits->min_perf_pct;
++ 		min = hw_max * min_perf_pct / 100;
++ 
++ 		rdmsrl_on_cpu(cpu, MSR_HWP_REQUEST, &value);
++ 
++ 		value &= ~HWP_MIN_PERF(~0L);
++ 		value |= HWP_MIN_PERF(min);
++ 
++ 		max = hw_max * max_perf_pct / 100;
+++>>>>>>> 3f8ed54aee49 (cpufreq: intel_pstate: Correct frequency setting in the HWP mode)
+  		value &= ~HWP_MAX_PERF(~0L);
+  		value |= HWP_MAX_PERF(max);
+ -
+ -		if (cpu_data->epp_policy == cpu_data->policy)
+ -			goto skip_epp;
+ -
+ -		cpu_data->epp_policy = cpu_data->policy;
+ -
+ -		if (cpu_data->epp_saved >= 0) {
+ -			epp = cpu_data->epp_saved;
+ -			cpu_data->epp_saved = -EINVAL;
+ -			goto update_epp;
+ -		}
+ -
+ -		if (cpu_data->policy == CPUFREQ_POLICY_PERFORMANCE) {
+ -			epp = intel_pstate_get_epp(cpu_data, value);
+ -			cpu_data->epp_powersave = epp;
+ -			/* If EPP read was failed, then don't try to write */
+ -			if (epp < 0)
+ -				goto skip_epp;
+ -
+ -
+ -			epp = 0;
+ -		} else {
+ -			/* skip setting EPP, when saved value is invalid */
+ -			if (cpu_data->epp_powersave < 0)
+ -				goto skip_epp;
+ -
+ -			/*
+ -			 * No need to restore EPP when it is not zero. This
+ -			 * means:
+ -			 *  - Policy is not changed
+ -			 *  - user has manually changed
+ -			 *  - Error reading EPB
+ -			 */
+ -			epp = intel_pstate_get_epp(cpu_data, value);
+ -			if (epp)
+ -				goto skip_epp;
+ -
+ -			epp = cpu_data->epp_powersave;
+ -		}
+ -update_epp:
+ -		if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
+ -			value &= ~GENMASK_ULL(31, 24);
+ -			value |= (u64)epp << 24;
+ -		} else {
+ -			intel_pstate_set_epb(cpu, epp);
+ -		}
+ -skip_epp:
+  		wrmsrl_on_cpu(cpu, MSR_HWP_REQUEST, value);
+  	}
+  }
+* Unmerged path drivers/cpufreq/intel_pstate.c
