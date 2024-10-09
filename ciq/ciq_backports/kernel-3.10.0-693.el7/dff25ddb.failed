@@ -1,0 +1,198 @@
+nfs: add support for the umask attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit dff25ddb48086afcb434770caa3d6849a4489b85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dff25ddb.failed
+
+Clients can set the umask attribute when creating files to cause the
+server to apply it always except when inheriting permissions from the
+parent directory.  That way, the new files will end up with the same
+permissions as files created locally.
+
+See https://tools.ietf.org/html/draft-ietf-nfsv4-umask-02 for more details.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit dff25ddb48086afcb434770caa3d6849a4489b85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index a4c6328ece52,d33242c8d95d..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -1121,6 -1224,8 +1121,11 @@@ static struct nfs4_opendata *nfs4_opend
+  	atomic_inc(&sp->so_count);
+  	p->o_arg.open_flags = flags;
+  	p->o_arg.fmode = fmode & (FMODE_READ|FMODE_WRITE);
+++<<<<<<< HEAD
+++=======
++ 	p->o_arg.umask = current_umask();
++ 	p->o_arg.claim = nfs4_map_atomic_open_claim(server, claim);
+++>>>>>>> dff25ddb4808 (nfs: add support for the umask attribute)
+  	p->o_arg.share_access = nfs4_map_atomic_open_share(server,
+  			fmode, flags);
+  	/* don't put an ACCESS op in OPEN compound if O_EXCL, because ACCESS
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 8cabfa5feb35..bb68caef4635 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1517,8 +1517,13 @@ int nfs_atomic_open(struct inode *dir, struct dentry *dentry,
+ 		return -ENAMETOOLONG;
+ 
+ 	if (open_flags & O_CREAT) {
++		struct nfs_server *server = NFS_SERVER(dir);
++
++		if (!(server->attr_bitmask[2] & FATTR4_WORD2_MODE_UMASK))
++			mode &= ~current_umask();
++
+ 		attr.ia_valid |= ATTR_MODE;
+-		attr.ia_mode = mode & ~current_umask();
++		attr.ia_mode = mode;
+ 	}
+ 	if (open_flags & O_TRUNC) {
+ 		attr.ia_valid |= ATTR_SIZE;
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index 621e5a40cfec..a900bfdd5ca9 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -52,6 +52,7 @@
+ #include <linux/nfs.h>
+ #include <linux/nfs4.h>
+ #include <linux/nfs_fs.h>
++#include <linux/fs_struct.h>
+ 
+ #include "nfs4_fs.h"
+ #include "internal.h"
+@@ -1001,7 +1002,7 @@ static void encode_nfs4_verifier(struct xdr_stream *xdr, const nfs4_verifier *ve
+ static void encode_attrs(struct xdr_stream *xdr, const struct iattr *iap,
+ 				const struct nfs4_label *label,
+ 				const struct nfs_server *server,
+-				bool excl_check)
++				bool excl_check, const umode_t *umask)
+ {
+ 	char owner_name[IDMAP_NAMESZ];
+ 	char owner_group[IDMAP_NAMESZ];
+@@ -1015,18 +1016,21 @@ static void encode_attrs(struct xdr_stream *xdr, const struct iattr *iap,
+ 
+ 	/*
+ 	 * We reserve enough space to write the entire attribute buffer at once.
+-	 * In the worst-case, this would be
+-	 * 16(bitmap) + 4(attrlen) + 8(size) + 4(mode) + 4(atime) + 4(mtime)
+-	 * = 40 bytes, plus any contribution from variable-length fields
+-	 *            such as owner/group.
+ 	 */
+ 	if (iap->ia_valid & ATTR_SIZE) {
+ 		bmval[0] |= FATTR4_WORD0_SIZE;
+ 		len += 8;
+ 	}
++	if (!(server->attr_bitmask[2] & FATTR4_WORD2_MODE_UMASK))
++		umask = NULL;
+ 	if (iap->ia_valid & ATTR_MODE) {
+-		bmval[1] |= FATTR4_WORD1_MODE;
+-		len += 4;
++		if (umask) {
++			bmval[2] |= FATTR4_WORD2_MODE_UMASK;
++			len += 8;
++		} else {
++			bmval[1] |= FATTR4_WORD1_MODE;
++			len += 4;
++		}
+ 	}
+ 	if (iap->ia_valid & ATTR_UID) {
+ 		owner_namelen = nfs_map_uid_to_name(server, iap->ia_uid, owner_name, IDMAP_NAMESZ);
+@@ -1127,6 +1131,10 @@ static void encode_attrs(struct xdr_stream *xdr, const struct iattr *iap,
+ 		*p++ = cpu_to_be32(label->len);
+ 		p = xdr_encode_opaque_fixed(p, label->label, label->len);
+ 	}
++	if (bmval[2] & FATTR4_WORD2_MODE_UMASK) {
++		*p++ = cpu_to_be32(iap->ia_mode & S_IALLUGO);
++		*p++ = cpu_to_be32(*umask);
++	}
+ 
+ /* out: */
+ }
+@@ -1181,7 +1189,8 @@ static void encode_create(struct xdr_stream *xdr, const struct nfs4_create_arg *
+ 	}
+ 
+ 	encode_string(xdr, create->name->len, create->name->name);
+-	encode_attrs(xdr, create->attrs, create->label, create->server, false);
++	encode_attrs(xdr, create->attrs, create->label, create->server, false,
++		     &create->umask);
+ }
+ 
+ static void encode_getattr_one(struct xdr_stream *xdr, uint32_t bitmap, struct compound_hdr *hdr)
+@@ -1401,11 +1410,13 @@ static inline void encode_createmode(struct xdr_stream *xdr, const struct nfs_op
+ 	switch(arg->createmode) {
+ 	case NFS4_CREATE_UNCHECKED:
+ 		*p = cpu_to_be32(NFS4_CREATE_UNCHECKED);
+-		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, false);
++		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, false,
++			     &arg->umask);
+ 		break;
+ 	case NFS4_CREATE_GUARDED:
+ 		*p = cpu_to_be32(NFS4_CREATE_GUARDED);
+-		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, false);
++		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, false,
++			     &arg->umask);
+ 		break;
+ 	case NFS4_CREATE_EXCLUSIVE:
+ 		*p = cpu_to_be32(NFS4_CREATE_EXCLUSIVE);
+@@ -1414,7 +1425,8 @@ static inline void encode_createmode(struct xdr_stream *xdr, const struct nfs_op
+ 	case NFS4_CREATE_EXCLUSIVE4_1:
+ 		*p = cpu_to_be32(NFS4_CREATE_EXCLUSIVE4_1);
+ 		encode_nfs4_verifier(xdr, &arg->u.verifier);
+-		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, true);
++		encode_attrs(xdr, arg->u.attrs, arg->label, arg->server, true,
++			     &arg->umask);
+ 	}
+ }
+ 
+@@ -1670,7 +1682,7 @@ static void encode_setattr(struct xdr_stream *xdr, const struct nfs_setattrargs
+ {
+ 	encode_op_hdr(xdr, OP_SETATTR, decode_setattr_maxsz, hdr);
+ 	encode_nfs4_stateid(xdr, &arg->stateid);
+-	encode_attrs(xdr, arg->iap, arg->label, server, false);
++	encode_attrs(xdr, arg->iap, arg->label, server, false, NULL);
+ }
+ 
+ static void encode_setclientid(struct xdr_stream *xdr, const struct nfs4_setclientid *setclientid, struct compound_hdr *hdr)
+diff --git a/include/linux/nfs4.h b/include/linux/nfs4.h
+index 40f13d5e824c..68b017b962b3 100644
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@ -432,6 +432,7 @@ enum lock_type4 {
+ #define FATTR4_WORD2_MDSTHRESHOLD       (1UL << 4)
+ #define FATTR4_WORD2_CLONE_BLKSIZE	(1UL << 13)
+ #define FATTR4_WORD2_SECURITY_LABEL     (1UL << 16)
++#define FATTR4_WORD2_MODE_UMASK		(1UL << 17)
+ 
+ /* MDS threshold bitmap bits */
+ #define THRESHOLD_RD                    (1UL << 0)
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index 40bea20710a0..191097fecb9f 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -414,6 +414,7 @@ struct nfs_openargs {
+ 	enum open_claim_type4	claim;
+ 	enum createmode4	createmode;
+ 	const struct nfs4_label *label;
++	umode_t			umask;
+ };
+ 
+ struct nfs_openres {
+@@ -933,6 +934,7 @@ struct nfs4_create_arg {
+ 	const struct nfs_fh *		dir_fh;
+ 	const u32 *			bitmask;
+ 	const struct nfs4_label		*label;
++	umode_t				umask;
+ };
+ 
+ struct nfs4_create_res {
