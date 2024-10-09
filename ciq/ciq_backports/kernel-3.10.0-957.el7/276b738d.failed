@@ -1,0 +1,183 @@
+PCI: Add resizable BAR infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christian König <christian.koenig@amd.com>
+commit 276b738deb5bf856b9f6049fcd92a967f52643d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/276b738d.failed
+
+Add resizable BAR infrastructure, including defines and helper functions to
+read the possible sizes of a BAR and update its size.  See PCIe r3.1, sec
+7.22.
+
+Link: https://pcisig.com/sites/default/files/specification_documents/ECN_Resizable-BAR_24Apr2008.pdf
+	Signed-off-by: Christian König <christian.koenig@amd.com>
+[bhelgaas: rename to functions with "rebar" (to match #defines), drop shift
+#defines, drop "_MASK" suffixes, fix typos, fix kerneldoc]
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+(cherry picked from commit 276b738deb5bf856b9f6049fcd92a967f52643d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci.h
+diff --cc drivers/pci/pci.h
+index b527a1ee3584,33469a33738d..000000000000
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@@ -344,4 -361,17 +344,20 @@@ static inline int pci_dev_specific_rese
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_PCI_QUIRKS) && defined(CONFIG_ARM64)
++ int acpi_get_rc_resources(struct device *dev, const char *hid, u16 segment,
++ 			  struct resource *res);
++ #endif
++ 
++ u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar);
++ int pci_rebar_get_current_size(struct pci_dev *pdev, int bar);
++ int pci_rebar_set_size(struct pci_dev *pdev, int bar, int size);
++ static inline u64 pci_rebar_size_to_bytes(int size)
++ {
++ 	return 1ULL << (size + 20);
++ }
++ 
+++>>>>>>> 276b738deb5b (PCI: Add resizable BAR infrastructure)
+  #endif /* DRIVERS_PCI_H */
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 78e7102016b2..8f172ab04ba3 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -2820,6 +2820,107 @@ bool pci_acs_path_enabled(struct pci_dev *start,
+ 	return true;
+ }
+ 
++/**
++ * pci_rebar_find_pos - find position of resize ctrl reg for BAR
++ * @pdev: PCI device
++ * @bar: BAR to find
++ *
++ * Helper to find the position of the ctrl register for a BAR.
++ * Returns -ENOTSUPP if resizable BARs are not supported at all.
++ * Returns -ENOENT if no ctrl register for the BAR could be found.
++ */
++static int pci_rebar_find_pos(struct pci_dev *pdev, int bar)
++{
++	unsigned int pos, nbars, i;
++	u32 ctrl;
++
++	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_REBAR);
++	if (!pos)
++		return -ENOTSUPP;
++
++	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
++	nbars = (ctrl & PCI_REBAR_CTRL_NBAR_MASK) >>
++		    PCI_REBAR_CTRL_NBAR_SHIFT;
++
++	for (i = 0; i < nbars; i++, pos += 8) {
++		int bar_idx;
++
++		pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
++		bar_idx = ctrl & PCI_REBAR_CTRL_BAR_IDX;
++		if (bar_idx == bar)
++			return pos;
++	}
++
++	return -ENOENT;
++}
++
++/**
++ * pci_rebar_get_possible_sizes - get possible sizes for BAR
++ * @pdev: PCI device
++ * @bar: BAR to query
++ *
++ * Get the possible sizes of a resizable BAR as bitmask defined in the spec
++ * (bit 0=1MB, bit 19=512GB). Returns 0 if BAR isn't resizable.
++ */
++u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar)
++{
++	int pos;
++	u32 cap;
++
++	pos = pci_rebar_find_pos(pdev, bar);
++	if (pos < 0)
++		return 0;
++
++	pci_read_config_dword(pdev, pos + PCI_REBAR_CAP, &cap);
++	return (cap & PCI_REBAR_CAP_SIZES) >> 4;
++}
++
++/**
++ * pci_rebar_get_current_size - get the current size of a BAR
++ * @pdev: PCI device
++ * @bar: BAR to set size to
++ *
++ * Read the size of a BAR from the resizable BAR config.
++ * Returns size if found or negative error code.
++ */
++int pci_rebar_get_current_size(struct pci_dev *pdev, int bar)
++{
++	int pos;
++	u32 ctrl;
++
++	pos = pci_rebar_find_pos(pdev, bar);
++	if (pos < 0)
++		return pos;
++
++	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
++	return (ctrl & PCI_REBAR_CTRL_BAR_SIZE) >> 8;
++}
++
++/**
++ * pci_rebar_set_size - set a new size for a BAR
++ * @pdev: PCI device
++ * @bar: BAR to set size to
++ * @size: new size as defined in the spec (0=1MB, 19=512GB)
++ *
++ * Set the new size of a BAR as defined in the spec.
++ * Returns zero if resizing was successful, error code otherwise.
++ */
++int pci_rebar_set_size(struct pci_dev *pdev, int bar, int size)
++{
++	int pos;
++	u32 ctrl;
++
++	pos = pci_rebar_find_pos(pdev, bar);
++	if (pos < 0)
++		return pos;
++
++	pci_read_config_dword(pdev, pos + PCI_REBAR_CTRL, &ctrl);
++	ctrl &= ~PCI_REBAR_CTRL_BAR_SIZE;
++	ctrl |= size << 8;
++	pci_write_config_dword(pdev, pos + PCI_REBAR_CTRL, ctrl);
++	return 0;
++}
++
+ /**
+  * pci_swizzle_interrupt_pin - swizzle INTx for device behind bridge
+  * @dev: the PCI device
+* Unmerged path drivers/pci/pci.h
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index 16d610857697..0c28f72701ed 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -940,9 +940,13 @@
+ #define PCI_SATA_SIZEOF_LONG	16
+ 
+ /* Resizable BARs */
++#define PCI_REBAR_CAP		4	/* capability register */
++#define  PCI_REBAR_CAP_SIZES		0x00FFFFF0  /* supported BAR sizes */
+ #define PCI_REBAR_CTRL		8	/* control register */
+-#define  PCI_REBAR_CTRL_NBAR_MASK	(7 << 5)	/* mask for # bars */
+-#define  PCI_REBAR_CTRL_NBAR_SHIFT	5	/* shift for # bars */
++#define  PCI_REBAR_CTRL_BAR_IDX		0x00000007  /* BAR index */
++#define  PCI_REBAR_CTRL_NBAR_MASK	0x000000E0  /* # of resizable BARs */
++#define  PCI_REBAR_CTRL_NBAR_SHIFT	5  	    /* shift for # of BARs */
++#define  PCI_REBAR_CTRL_BAR_SIZE	0x00001F00  /* BAR size */
+ 
+ /* Dynamic Power Allocation */
+ #define PCI_DPA_CAP		4	/* capability register */
