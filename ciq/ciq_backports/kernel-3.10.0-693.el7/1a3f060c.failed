@@ -1,0 +1,224 @@
+net: Introduce new api for walking upper and lower devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] Introduce new api for walking upper and lower devices (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 95.50%
+commit-author David Ahern <dsa@cumulusnetworks.com>
+commit 1a3f060c1a47dba4e12ac21ce62b57666b9c4e95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1a3f060c.failed
+
+This patch introduces netdev_walk_all_upper_dev_rcu,
+netdev_walk_all_lower_dev and netdev_walk_all_lower_dev_rcu. These
+functions recursively walk the adj_list of devices to determine all upper
+and lower devices.
+
+The functions take a callback function that is invoked for each device
+in the list. If the callback returns non-0, the walk is terminated and
+the functions return that code back to callers.
+
+v3
+- simplified netdev_has_upper_dev_all_rcu and __netdev_has_upper_dev and
+  removed typecast as suggested by Stephen
+
+v2
+- fixed definition of netdev_next_lower_dev_rcu to mirror the upper_dev
+  version.
+
+	Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a3f060c1a47dba4e12ac21ce62b57666b9c4e95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index 381d98dab175,a5902d995907..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -3694,6 -3812,32 +3702,35 @@@ void *netdev_lower_get_next(struct net_
+  	     ldev; \
+  	     ldev = netdev_lower_get_next(dev, &(iter)))
+  
+++<<<<<<< HEAD
+++=======
++ struct net_device *netdev_all_lower_get_next(struct net_device *dev,
++ 					     struct list_head **iter);
++ struct net_device *netdev_all_lower_get_next_rcu(struct net_device *dev,
++ 						 struct list_head **iter);
++ 
++ #define netdev_for_each_all_lower_dev(dev, ldev, iter) \
++ 	for (iter = (dev)->all_adj_list.lower.next, \
++ 	     ldev = netdev_all_lower_get_next(dev, &(iter)); \
++ 	     ldev; \
++ 	     ldev = netdev_all_lower_get_next(dev, &(iter)))
++ 
++ #define netdev_for_each_all_lower_dev_rcu(dev, ldev, iter) \
++ 	for (iter = (dev)->all_adj_list.lower.next, \
++ 	     ldev = netdev_all_lower_get_next_rcu(dev, &(iter)); \
++ 	     ldev; \
++ 	     ldev = netdev_all_lower_get_next_rcu(dev, &(iter)))
++ 
++ int netdev_walk_all_lower_dev(struct net_device *dev,
++ 			      int (*fn)(struct net_device *lower_dev,
++ 					void *data),
++ 			      void *data);
++ int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
++ 				  int (*fn)(struct net_device *lower_dev,
++ 					    void *data),
++ 				  void *data);
++ 
+++>>>>>>> 1a3f060c1a47 (net: Introduce new api for walking upper and lower devices)
+  void *netdev_adjacent_get_private(struct list_head *adj_list);
+  void *netdev_lower_get_first_private_rcu(struct net_device *dev);
+  struct net_device *netdev_master_upper_dev_get(struct net_device *dev);
+diff --cc net/core/dev.c
+index 48cb2232de86,fc48337cfab8..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5162,6 -5407,137 +5232,140 @@@ void *netdev_lower_get_next(struct net_
+  EXPORT_SYMBOL(netdev_lower_get_next);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * netdev_all_lower_get_next - Get the next device from all lower neighbour list
++  * @dev: device
++  * @iter: list_head ** of the current position
++  *
++  * Gets the next netdev_adjacent from the dev's all lower neighbour
++  * list, starting from iter position. The caller must hold RTNL lock or
++  * its own locking that guarantees that the neighbour all lower
++  * list will remain unchanged.
++  */
++ struct net_device *netdev_all_lower_get_next(struct net_device *dev, struct list_head **iter)
++ {
++ 	struct netdev_adjacent *lower;
++ 
++ 	lower = list_entry(*iter, struct netdev_adjacent, list);
++ 
++ 	if (&lower->list == &dev->all_adj_list.lower)
++ 		return NULL;
++ 
++ 	*iter = lower->list.next;
++ 
++ 	return lower->dev;
++ }
++ EXPORT_SYMBOL(netdev_all_lower_get_next);
++ 
++ static struct net_device *netdev_next_lower_dev(struct net_device *dev,
++ 						struct list_head **iter)
++ {
++ 	struct netdev_adjacent *lower;
++ 
++ 	lower = list_entry(*iter, struct netdev_adjacent, list);
++ 
++ 	if (&lower->list == &dev->adj_list.lower)
++ 		return NULL;
++ 
++ 	*iter = lower->list.next;
++ 
++ 	return lower->dev;
++ }
++ 
++ int netdev_walk_all_lower_dev(struct net_device *dev,
++ 			      int (*fn)(struct net_device *dev,
++ 					void *data),
++ 			      void *data)
++ {
++ 	struct net_device *ldev;
++ 	struct list_head *iter;
++ 	int ret;
++ 
++ 	for (iter = &dev->adj_list.lower,
++ 	     ldev = netdev_next_lower_dev(dev, &iter);
++ 	     ldev;
++ 	     ldev = netdev_next_lower_dev(dev, &iter)) {
++ 		/* first is the lower device itself */
++ 		ret = fn(ldev, data);
++ 		if (ret)
++ 			return ret;
++ 
++ 		/* then look at all of its lower devices */
++ 		ret = netdev_walk_all_lower_dev(ldev, fn, data);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(netdev_walk_all_lower_dev);
++ 
++ /**
++  * netdev_all_lower_get_next_rcu - Get the next device from all
++  *				   lower neighbour list, RCU variant
++  * @dev: device
++  * @iter: list_head ** of the current position
++  *
++  * Gets the next netdev_adjacent from the dev's all lower neighbour
++  * list, starting from iter position. The caller must hold RCU read lock.
++  */
++ struct net_device *netdev_all_lower_get_next_rcu(struct net_device *dev,
++ 						 struct list_head **iter)
++ {
++ 	struct netdev_adjacent *lower;
++ 
++ 	lower = list_first_or_null_rcu(&dev->all_adj_list.lower,
++ 				       struct netdev_adjacent, list);
++ 
++ 	return lower ? lower->dev : NULL;
++ }
++ EXPORT_SYMBOL(netdev_all_lower_get_next_rcu);
++ 
++ static struct net_device *netdev_next_lower_dev_rcu(struct net_device *dev,
++ 						    struct list_head **iter)
++ {
++ 	struct netdev_adjacent *lower;
++ 
++ 	lower = list_entry_rcu((*iter)->next, struct netdev_adjacent, list);
++ 	if (&lower->list == &dev->adj_list.lower)
++ 		return NULL;
++ 
++ 	*iter = &lower->list;
++ 
++ 	return lower->dev;
++ }
++ 
++ int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
++ 				  int (*fn)(struct net_device *dev,
++ 					    void *data),
++ 				  void *data)
++ {
++ 	struct net_device *ldev;
++ 	struct list_head *iter;
++ 	int ret;
++ 
++ 	for (iter = &dev->adj_list.lower,
++ 	     ldev = netdev_next_lower_dev_rcu(dev, &iter);
++ 	     ldev;
++ 	     ldev = netdev_next_lower_dev_rcu(dev, &iter)) {
++ 		/* first is the lower device itself */
++ 		ret = fn(ldev, data);
++ 		if (ret)
++ 			return ret;
++ 
++ 		/* then look at all of its lower devices */
++ 		ret = netdev_walk_all_lower_dev_rcu(ldev, fn, data);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(netdev_walk_all_lower_dev_rcu);
++ 
++ /**
+++>>>>>>> 1a3f060c1a47 (net: Introduce new api for walking upper and lower devices)
+   * netdev_lower_get_first_private_rcu - Get the first ->private from the
+   *				       lower neighbour list, RCU
+   *				       variant
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
