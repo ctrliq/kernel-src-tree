@@ -1,0 +1,658 @@
+ovl: introduce the inodes index dir feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 02bcd1577400b0b2eab806ccb9f72d6b5ec7bcca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/02bcd157.failed
+
+Create the index dir on mount. The index dir will contain hardlinks to
+upper inodes, named after the hex representation of their origin lower
+inodes.
+
+The index dir is going to be used to prevent breaking lower hardlinks
+on copy up and to implement overlayfs NFS export.
+
+Because the feature is not fully backward compat, enabling the feature
+is opt-in by config/module/mount option.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 02bcd1577400b0b2eab806ccb9f72d6b5ec7bcca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/Kconfig
+#	fs/overlayfs/copy_up.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/ovl_entry.h
+#	fs/overlayfs/super.c
+#	fs/overlayfs/util.c
+diff --cc fs/overlayfs/Kconfig
+index aeec86b8f671,cbfc196e5dc5..000000000000
+--- a/fs/overlayfs/Kconfig
++++ b/fs/overlayfs/Kconfig
+@@@ -9,3 -9,37 +9,40 @@@ config OVERLAY_F
+  	  merged with the 'upper' object.
+  
+  	  For more information see Documentation/filesystems/overlayfs.txt
+++<<<<<<< HEAD
+++=======
++ 
++ config OVERLAY_FS_REDIRECT_DIR
++ 	bool "Overlayfs: turn on redirect dir feature by default"
++ 	depends on OVERLAY_FS
++ 	help
++ 	  If this config option is enabled then overlay filesystems will use
++ 	  redirects when renaming directories by default.  In this case it is
++ 	  still possible to turn off redirects globally with the
++ 	  "redirect_dir=off" module option or on a filesystem instance basis
++ 	  with the "redirect_dir=off" mount option.
++ 
++ 	  Note, that redirects are not backward compatible.  That is, mounting
++ 	  an overlay which has redirects on a kernel that doesn't support this
++ 	  feature will have unexpected results.
++ 
++ config OVERLAY_FS_INDEX
++ 	bool "Overlayfs: turn on inodes index feature by default"
++ 	depends on OVERLAY_FS
++ 	help
++ 	  If this config option is enabled then overlay filesystems will use
++ 	  the inodes index dir to map lower inodes to upper inodes by default.
++ 	  In this case it is still possible to turn off index globally with the
++ 	  "index=off" module option or on a filesystem instance basis with the
++ 	  "index=off" mount option.
++ 
++ 	  The inodes index feature prevents breaking of lower hardlinks on copy
++ 	  up.
++ 
++ 	  Note, that the inodes index feature is read-only backward compatible.
++ 	  That is, mounting an overlay which has an index dir on a kernel that
++ 	  doesn't support this feature read-only, will not have any negative
++ 	  outcomes.  However, mounting the same overlay with an old kernel
++ 	  read-write and then mounting it again with a new kernel, will have
++ 	  unexpected results.
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,f9f51cce3c18..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -264,9 -233,85 +264,87 @@@ int ovl_set_attr(struct dentry *upperde
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ovl_fh *ovl_encode_fh(struct dentry *lower)
++ {
++ 	struct ovl_fh *fh;
++ 	int fh_type, fh_len, dwords;
++ 	void *buf;
++ 	int buflen = MAX_HANDLE_SZ;
++ 	uuid_t *uuid = &lower->d_sb->s_uuid;
++ 
++ 	buf = kmalloc(buflen, GFP_TEMPORARY);
++ 	if (!buf)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/*
++ 	 * We encode a non-connectable file handle for non-dir, because we
++ 	 * only need to find the lower inode number and we don't want to pay
++ 	 * the price or reconnecting the dentry.
++ 	 */
++ 	dwords = buflen >> 2;
++ 	fh_type = exportfs_encode_fh(lower, buf, &dwords, 0);
++ 	buflen = (dwords << 2);
++ 
++ 	fh = ERR_PTR(-EIO);
++ 	if (WARN_ON(fh_type < 0) ||
++ 	    WARN_ON(buflen > MAX_HANDLE_SZ) ||
++ 	    WARN_ON(fh_type == FILEID_INVALID))
++ 		goto out;
++ 
++ 	BUILD_BUG_ON(MAX_HANDLE_SZ + offsetof(struct ovl_fh, fid) > 255);
++ 	fh_len = offsetof(struct ovl_fh, fid) + buflen;
++ 	fh = kmalloc(fh_len, GFP_KERNEL);
++ 	if (!fh) {
++ 		fh = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 
++ 	fh->version = OVL_FH_VERSION;
++ 	fh->magic = OVL_FH_MAGIC;
++ 	fh->type = fh_type;
++ 	fh->flags = OVL_FH_FLAG_CPU_ENDIAN;
++ 	fh->len = fh_len;
++ 	fh->uuid = *uuid;
++ 	memcpy(fh->fid, buf, buflen);
++ 
++ out:
++ 	kfree(buf);
++ 	return fh;
++ }
++ 
++ static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
++ 			  struct dentry *upper)
++ {
++ 	const struct ovl_fh *fh = NULL;
++ 	int err;
++ 
++ 	/*
++ 	 * When lower layer doesn't support export operations store a 'null' fh,
++ 	 * so we can use the overlay.origin xattr to distignuish between a copy
++ 	 * up and a pure upper inode.
++ 	 */
++ 	if (ovl_can_decode_fh(lower->d_sb)) {
++ 		fh = ovl_encode_fh(lower);
++ 		if (IS_ERR(fh))
++ 			return PTR_ERR(fh);
++ 	}
++ 
++ 	/*
++ 	 * Do not fail when upper doesn't support xattrs.
++ 	 */
++ 	err = ovl_check_setxattr(dentry, upper, OVL_XATTR_ORIGIN, fh,
++ 				 fh ? fh->len : 0, 0);
++ 	kfree(fh);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+  			      struct dentry *dentry, struct path *lowerpath,
+ -			      struct kstat *stat, const char *link,
+ -			      struct kstat *pstat, bool tmpfile)
+ +			      struct kstat *stat, const char *link)
+  {
+  	struct inode *wdir = workdir->d_inode;
+  	struct inode *udir = upperdir->d_inode;
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,4e7a74e99d3c..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -131,19 -168,27 +131,33 @@@ static inline int ovl_do_whiteout(struc
+  	return err;
+  }
+  
+ -static inline struct dentry *ovl_do_tmpfile(struct dentry *dentry, umode_t mode)
+ +static inline struct inode *ovl_inode_real(struct inode *inode, bool *is_upper)
+  {
+ -	struct dentry *ret = vfs_tmpfile(dentry, mode, 0);
+ -	int err = IS_ERR(ret) ? PTR_ERR(ret) : 0;
+ +	unsigned long x = (unsigned long) READ_ONCE(inode->i_private);
+ +
+ +	if (is_upper)
+ +		*is_upper = x & OVL_ISUPPER_MASK;
+  
+ -	pr_debug("tmpfile(%pd2, 0%o) = %i\n", dentry, mode, err);
+ -	return ret;
+ +	return (struct inode *) (x & ~OVL_ISUPPER_MASK);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* util.c */
++ int ovl_want_write(struct dentry *dentry);
++ void ovl_drop_write(struct dentry *dentry);
++ struct dentry *ovl_workdir(struct dentry *dentry);
++ const struct cred *ovl_override_creds(struct super_block *sb);
++ struct super_block *ovl_same_sb(struct super_block *sb);
++ bool ovl_can_decode_fh(struct super_block *sb);
++ struct dentry *ovl_indexdir(struct super_block *sb);
++ struct ovl_entry *ovl_alloc_entry(unsigned int numlower);
++ bool ovl_dentry_remote(struct dentry *dentry);
++ bool ovl_dentry_weird(struct dentry *dentry);
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  enum ovl_path_type ovl_path_type(struct dentry *dentry);
+ +u64 ovl_dentry_version_get(struct dentry *dentry);
+ +void ovl_dentry_version_inc(struct dentry *dentry);
+  void ovl_path_upper(struct dentry *dentry, struct path *path);
+  void ovl_path_lower(struct dentry *dentry, struct path *path);
+  enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path);
+diff --cc fs/overlayfs/super.c
+index aaf06952d88f,fa83b3245124..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -49,245 -27,18 +49,250 @@@ struct ovl_fs 
+  
+  struct ovl_dir_cache;
+  
+ +/* private information held for every overlayfs dentry */
+ +struct ovl_entry {
+ +	struct dentry *__upperdentry;
+ +	struct ovl_dir_cache *cache;
+ +	union {
+ +		struct {
+ +			u64 version;
+ +			bool opaque;
+ +		};
+ +		struct rcu_head rcu;
+ +	};
+ +	unsigned numlower;
+ +	struct path lowerstack[];
+ +};
+ +
+  #define OVL_MAX_STACK 500
+  
+ -static bool ovl_redirect_dir_def = IS_ENABLED(CONFIG_OVERLAY_FS_REDIRECT_DIR);
+ -module_param_named(redirect_dir, ovl_redirect_dir_def, bool, 0644);
+ -MODULE_PARM_DESC(ovl_redirect_dir_def,
+ -		 "Default to on or off for the redirect_dir feature");
+ +static struct dentry *__ovl_dentry_lower(struct ovl_entry *oe)
+ +{
+ +	return oe->numlower ? oe->lowerstack[0].dentry : NULL;
+ +}
+ +
+ +enum ovl_path_type ovl_path_type(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	enum ovl_path_type type = 0;
+ +
+ +	if (oe->__upperdentry) {
+ +		type = __OVL_PATH_UPPER;
+ +
+ +		/*
+ +		 * Non-dir dentry can hold lower dentry from previous
+ +		 * location.
+ +		 */
+ +		if (oe->numlower && d_is_dir(dentry))
+ +			type |= __OVL_PATH_MERGE;
+ +	} else {
+ +		if (oe->numlower > 1)
+ +			type |= __OVL_PATH_MERGE;
+ +	}
+ +	return type;
+ +}
+ +
+ +static struct dentry *ovl_upperdentry_dereference(struct ovl_entry *oe)
+ +{
+ +	return lockless_dereference(oe->__upperdentry);
+ +}
+ +
+ +void ovl_path_upper(struct dentry *dentry, struct path *path)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	path->mnt = ofs->upper_mnt;
+ +	path->dentry = ovl_upperdentry_dereference(oe);
+ +}
+ +
+ +enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path)
+ +{
+ +	enum ovl_path_type type = ovl_path_type(dentry);
+ +
+ +	if (!OVL_TYPE_UPPER(type))
+ +		ovl_path_lower(dentry, path);
+ +	else
+ +		ovl_path_upper(dentry, path);
+ +
+ +	return type;
+ +}
+ +
+ +struct dentry *ovl_dentry_upper(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return ovl_upperdentry_dereference(oe);
+ +}
+ +
+ +struct dentry *ovl_dentry_lower(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return __ovl_dentry_lower(oe);
+ +}
+ +
+ +struct dentry *ovl_dentry_real(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	struct dentry *realdentry;
+ +
+ +	realdentry = ovl_upperdentry_dereference(oe);
+ +	if (!realdentry)
+ +		realdentry = __ovl_dentry_lower(oe);
+ +
+ +	return realdentry;
+ +}
+ +
+ +static void ovl_inode_init(struct inode *inode, struct inode *realinode,
+ +			   bool is_upper)
+ +{
+ +	WRITE_ONCE(inode->i_private, (void *) ((unsigned long) realinode |
+ +		   (is_upper ? OVL_ISUPPER_MASK : 0)));
+ +}
+ +
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper)
+ +{
+ +	if (is_upper) {
+ +		struct ovl_fs *ofs = inode->i_sb->s_fs_info;
+ +
+ +		return ofs->upper_mnt;
+ +	} else {
+ +		return oe->numlower ? oe->lowerstack[0].mnt : NULL;
+ +	}
+ +}
+ +
+ +struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	return oe->cache;
+ +}
+ +
+ +void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	oe->cache = cache;
+ +}
+ +
+ +void ovl_path_lower(struct dentry *dentry, struct path *path)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	*path = oe->numlower ? oe->lowerstack[0] : (struct path) { NULL, NULL };
+ +}
+ +
+ +int ovl_want_write(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	return mnt_want_write(ofs->upper_mnt);
+ +}
+ +
+ +void ovl_drop_write(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	mnt_drop_write(ofs->upper_mnt);
+ +}
+ +
+ +struct dentry *ovl_workdir(struct dentry *dentry)
+ +{
+ +	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+ +	return ofs->workdir;
+ +}
+ +
+ +bool ovl_dentry_is_opaque(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	return oe->opaque;
+ +}
+ +
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry)
+ +{
+ +	return !dentry->d_inode && ovl_dentry_is_opaque(dentry);
+ +}
+ +
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +	oe->opaque = opaque;
+ +}
+ +
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&upperdentry->d_parent->d_inode->i_mutex));
+ +	WARN_ON(oe->__upperdentry);
+ +	/*
+ +	 * Make sure upperdentry is consistent before making it visible to
+ +	 * ovl_upperdentry_dereference().
+ +	 */
+ +	smp_wmb();
+ +	oe->__upperdentry = upperdentry;
+ +}
+ +
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode)
+ +{
+ +	WARN_ON(!upperinode);
+ +	WARN_ON(!inode_unhashed(inode));
+ +	WRITE_ONCE(inode->i_private,
+ +		   (void *) ((unsigned long) upperinode | OVL_ISUPPER_MASK));
+ +	if (!S_ISDIR(upperinode->i_mode))
+ +		__insert_inode_hash(inode, (unsigned long) upperinode);
+ +}
+ +
+ +void ovl_dentry_version_inc(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+ +	oe->version++;
+ +}
+ +
+ +u64 ovl_dentry_version_get(struct dentry *dentry)
+ +{
+ +	struct ovl_entry *oe = dentry->d_fsdata;
+ +
+ +	WARN_ON(!mutex_is_locked(&dentry->d_inode->i_mutex));
+ +	return oe->version;
+ +}
+ +
+ +bool ovl_is_whiteout(struct dentry *dentry)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +
+ +	return inode && IS_WHITEOUT(inode);
+ +}
+ +
+ +const struct cred *ovl_override_creds(struct super_block *sb)
+ +{
+ +	struct ovl_fs *ofs = sb->s_fs_info;
+ +
+ +	return override_creds(ofs->creator_cred);
+ +}
+ +
+ +static bool ovl_is_opaquedir(struct dentry *dentry)
+ +{
+ +	int res;
+ +	char val;
+ +
+ +	if (!d_is_dir(dentry))
+ +		return false;
+ +
+ +	res = vfs_getxattr(dentry, OVL_XATTR_OPAQUE, &val, 1);
+ +	if (res == 1 && val == 'y')
+ +		return true;
+ +
+ +	return false;
+ +}
+  
++ static bool ovl_index_def = IS_ENABLED(CONFIG_OVERLAY_FS_INDEX);
++ module_param_named(index, ovl_index_def, bool, 0644);
++ MODULE_PARM_DESC(ovl_index_def,
++ 		 "Default to on or off for the inodes index feature");
++ 
+  static void ovl_dentry_release(struct dentry *dentry)
+  {
+  	struct ovl_entry *oe = dentry->d_fsdata;
+@@@ -698,7 -208,12 +703,8 @@@ static void ovl_put_super(struct super_
+  	struct ovl_fs *ufs = sb->s_fs_info;
+  	unsigned i;
+  
++ 	dput(ufs->indexdir);
+  	dput(ufs->workdir);
+ -	ovl_inuse_unlock(ufs->workbasedir);
+ -	dput(ufs->workbasedir);
+ -	if (ufs->upper_mnt)
+ -		ovl_inuse_unlock(ufs->upper_mnt->mnt_root);
+  	mntput(ufs->upper_mnt);
+  	for (i = 0; i < ufs->numlower; i++)
+  		mntput(ufs->lower_mnt[i]);
+@@@ -804,6 -330,10 +819,13 @@@ enum 
+  	OPT_UPPERDIR,
+  	OPT_WORKDIR,
+  	OPT_DEFAULT_PERMISSIONS,
+++<<<<<<< HEAD
+++=======
++ 	OPT_REDIRECT_DIR_ON,
++ 	OPT_REDIRECT_DIR_OFF,
++ 	OPT_INDEX_ON,
++ 	OPT_INDEX_OFF,
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  	OPT_ERR,
+  };
+  
+@@@ -812,6 -342,10 +834,13 @@@ static const match_table_t ovl_tokens 
+  	{OPT_UPPERDIR,			"upperdir=%s"},
+  	{OPT_WORKDIR,			"workdir=%s"},
+  	{OPT_DEFAULT_PERMISSIONS,	"default_permissions"},
+++<<<<<<< HEAD
+++=======
++ 	{OPT_REDIRECT_DIR_ON,		"redirect_dir=on"},
++ 	{OPT_REDIRECT_DIR_OFF,		"redirect_dir=off"},
++ 	{OPT_INDEX_ON,			"index=on"},
++ 	{OPT_INDEX_OFF,			"index=off"},
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  	{OPT_ERR,			NULL}
+  };
+  
+@@@ -876,6 -410,22 +905,25 @@@ static int ovl_parse_opt(char *opt, str
+  			config->default_permissions = true;
+  			break;
+  
+++<<<<<<< HEAD
+++=======
++ 		case OPT_REDIRECT_DIR_ON:
++ 			config->redirect_dir = true;
++ 			break;
++ 
++ 		case OPT_REDIRECT_DIR_OFF:
++ 			config->redirect_dir = false;
++ 			break;
++ 
++ 		case OPT_INDEX_ON:
++ 			config->index = true;
++ 			break;
++ 
++ 		case OPT_INDEX_OFF:
++ 			config->index = false;
++ 			break;
++ 
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  		default:
+  			pr_err("overlayfs: unrecognized mount option \"%s\" or missing value\n", p);
+  			return -EINVAL;
+@@@ -894,11 -444,15 +942,12 @@@
+  }
+  
+  #define OVL_WORKDIR_NAME "work"
++ #define OVL_INDEXDIR_NAME "index"
+  
+ -static struct dentry *ovl_workdir_create(struct super_block *sb,
+ -					 struct ovl_fs *ufs,
+ -					 struct dentry *dentry,
+ -					 const char *name, bool persist)
+ +static struct dentry *ovl_workdir_create(struct vfsmount *mnt,
+ +					 struct dentry *dentry)
+  {
+  	struct inode *dir = dentry->d_inode;
+ -	struct vfsmount *mnt = ufs->upper_mnt;
+  	struct dentry *work;
+  	int err;
+  	bool retried = false;
+@@@ -1265,6 -843,8 +1323,11 @@@ static int ovl_fill_super(struct super_
+  	if (!ufs)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	ufs->config.redirect_dir = ovl_redirect_dir_def;
++ 	ufs->config.index = ovl_index_def;
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  	err = ovl_parse_opt((char *) data, &ufs->config);
+  	if (err)
+  		goto out_free_config;
+@@@ -1399,13 -976,40 +1462,45 @@@
+  				goto out_put_workdir;
+  
+  			/*
+ -			 * We allowed this configuration and don't want to
+ -			 * break users over kernel upgrade. So warn instead
+ -			 * of erroring out.
+ +			 * Warn instead of error to avoid breaking previously
+ +			 * working configurations over upgrade. If d_type
+ +			 * is not supported, whiteouts will become visible
+ +			 * to user space.
+  			 */
+  			if (!err)
+++<<<<<<< HEAD
+ +				pr_warn("overlayfs: upper fs needs to support d_type. This is an invalid configuration.\n");
+++=======
++ 				pr_warn("overlayfs: upper fs needs to support d_type.\n");
++ 
++ 			/* Check if upper/work fs supports O_TMPFILE */
++ 			temp = ovl_do_tmpfile(ufs->workdir, S_IFREG | 0);
++ 			ufs->tmpfile = !IS_ERR(temp);
++ 			if (ufs->tmpfile)
++ 				dput(temp);
++ 			else
++ 				pr_warn("overlayfs: upper fs does not support tmpfile.\n");
++ 
++ 			/*
++ 			 * Check if upper/work fs supports trusted.overlay.*
++ 			 * xattr
++ 			 */
++ 			err = ovl_do_setxattr(ufs->workdir, OVL_XATTR_OPAQUE,
++ 					      "0", 1, 0);
++ 			if (err) {
++ 				ufs->noxattr = true;
++ 				pr_warn("overlayfs: upper fs does not support xattr.\n");
++ 			} else {
++ 				vfs_removexattr(ufs->workdir, OVL_XATTR_OPAQUE);
++ 			}
++ 
++ 			/* Check if upper/work fs supports file handles */
++ 			if (ufs->config.index &&
++ 			    !ovl_can_decode_fh(ufs->workdir->d_sb)) {
++ 				ufs->config.index = false;
++ 				pr_warn("overlayfs: upper fs does not support file handles, falling back to index=off.\n");
++ 			}
+++>>>>>>> 02bcd1577400 (ovl: introduce the inodes index dir feature)
+  		}
+  	}
+  
+@@@ -1434,11 -1044,28 +1529,26 @@@
+  	/* If the upper fs is nonexistent, we mark overlayfs r/o too */
+  	if (!ufs->upper_mnt)
+  		sb->s_flags |= MS_RDONLY;
+ -	else if (ufs->upper_mnt->mnt_sb != ufs->same_sb)
+ -		ufs->same_sb = NULL;
+  
++ 	if (!(ovl_force_readonly(ufs)) && ufs->config.index) {
++ 		ufs->indexdir = ovl_workdir_create(sb, ufs, workpath.dentry,
++ 						   OVL_INDEXDIR_NAME, true);
++ 		err = PTR_ERR(ufs->indexdir);
++ 		if (IS_ERR(ufs->indexdir))
++ 			goto out_put_lower_mnt;
++ 
++ 		if (!ufs->indexdir)
++ 			pr_warn("overlayfs: try deleting index dir or mounting with '-o index=off' to disable inodes index.\n");
++ 	}
++ 
++ 	/* Show index=off/on in /proc/mounts for any of the reasons above */
++ 	if (!ufs->indexdir)
++ 		ufs->config.index = false;
++ 
+  	if (remote)
+ -		sb->s_d_op = &ovl_reval_dentry_operations;
+ +		sb->s_d_op = &ovl_reval_dentry_operations.ops;
+  	else
+ -		sb->s_d_op = &ovl_dentry_operations;
+ +		sb->s_d_op = &ovl_dentry_operations.ops;
+  
+  	ufs->creator_cred = cred = prepare_creds();
+  	if (!cred)
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/util.c
+* Unmerged path fs/overlayfs/Kconfig
+* Unmerged path fs/overlayfs/copy_up.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/ovl_entry.h
+* Unmerged path fs/overlayfs/super.c
+* Unmerged path fs/overlayfs/util.c
