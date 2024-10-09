@@ -1,0 +1,164 @@
+nvme-pci: fix NULL pointer reference in nvme_alloc_ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jianchao Wang <jianchao.w.wang@oracle.com>
+commit 2b1b7e784a63f5ded4dda804e05e3f34b3880b25
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2b1b7e78.failed
+
+When the io queues setup or tagset allocation failed, ctrl.tagset is
+NULL.  But the scan work will still be queued and executed, then panic
+comes up due to NULL pointer reference of ctrl.tagset.
+
+To fix this, add a new ctrl state NVME_CTRL_ADMIN_ONLY to inidcate only
+admin queue is live. When non io queues or tagset allocation failed, ctrl
+enters into this state, scan work will not be started.  But async event
+work and nvme dev ioctl will be still available.  This will be helpful to
+do further investigation and recovery.
+
+	Suggested-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jianchao Wang <jianchao.w.wang@oracle.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2b1b7e784a63f5ded4dda804e05e3f34b3880b25)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 27174fd02aa2,609307ca9e4d..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1753,33 -2344,18 +1764,45 @@@ EXPORT_SYMBOL_GPL(nvme_init_identify)
+  
+  static int nvme_dev_open(struct inode *inode, struct file *file)
+  {
+ -	struct nvme_ctrl *ctrl =
+ -		container_of(inode->i_cdev, struct nvme_ctrl, cdev);
+ +	struct nvme_ctrl *ctrl;
+ +	int instance = iminor(inode);
+ +	int ret = -ENODEV;
+ +
+++<<<<<<< HEAD
+ +	spin_lock(&dev_list_lock);
+ +	list_for_each_entry(ctrl, &nvme_ctrl_list, node) {
+ +		if (ctrl->instance != instance)
+ +			continue;
+ +
+ +		if (!ctrl->admin_q) {
+ +			ret = -EWOULDBLOCK;
+ +			break;
+ +		}
+ +		if (!kref_get_unless_zero(&ctrl->kref))
+ +			break;
+ +		file->private_data = ctrl;
+ +		ret = 0;
+ +		break;
+ +	}
+ +	spin_unlock(&dev_list_lock);
+  
+ +	return ret;
+ +}
+ +
+ +static int nvme_dev_release(struct inode *inode, struct file *file)
+ +{
+ +	nvme_put_ctrl(file->private_data);
+++=======
++ 	switch (ctrl->state) {
++ 	case NVME_CTRL_LIVE:
++ 	case NVME_CTRL_ADMIN_ONLY:
++ 		break;
++ 	default:
++ 		return -EWOULDBLOCK;
++ 	}
++ 
++ 	file->private_data = ctrl;
+++>>>>>>> 2b1b7e784a63 (nvme-pci: fix NULL pointer reference in nvme_alloc_ns)
+  	return 0;
+  }
+  
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 68f79634c978..cd64823672e4 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -102,6 +102,7 @@ static inline struct nvme_request *nvme_req(struct request *req)
+ enum nvme_ctrl_state {
+ 	NVME_CTRL_NEW,
+ 	NVME_CTRL_LIVE,
++	NVME_CTRL_ADMIN_ONLY,    /* Only admin queue live */
+ 	NVME_CTRL_RESETTING,
+ 	NVME_CTRL_RECONNECTING,
+ 	NVME_CTRL_DELETING,
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index fa50cb022418..6fadf235c92e 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1797,13 +1797,12 @@ static void nvme_disable_io_queues(struct nvme_dev *dev, int queues)
+ }
+ 
+ /*
+- * Return: error value if an error occurred setting up the queues or calling
+- * Identify Device.  0 if these succeeded, even if adding some of the
+- * namespaces failed.  At the moment, these failures are silent.  TBD which
+- * failures should be reported.
++ * return error value only when tagset allocation failed
+  */
+ static int nvme_dev_add(struct nvme_dev *dev)
+ {
++	int ret;
++
+ 	if (!dev->ctrl.tagset) {
+ 		dev->tagset.ops = &nvme_mq_ops;
+ 		dev->tagset.nr_hw_queues = dev->online_queues - 1;
+@@ -1815,8 +1814,12 @@ static int nvme_dev_add(struct nvme_dev *dev)
+ 		dev->tagset.flags = BLK_MQ_F_SHOULD_MERGE;
+ 		dev->tagset.driver_data = dev;
+ 
+-		if (blk_mq_alloc_tag_set(&dev->tagset))
+-			return 0;
++		ret = blk_mq_alloc_tag_set(&dev->tagset);
++		if (ret) {
++			dev_warn(dev->ctrl.device,
++				"IO queues tagset allocation failed %d\n", ret);
++			return ret;
++		}
+ 		dev->ctrl.tagset = &dev->tagset;
+ 
+ 		nvme_dbbuf_set(dev);
+@@ -2043,6 +2046,7 @@ static void nvme_reset_work(struct work_struct *work)
+ 	struct nvme_dev *dev =
+ 		container_of(work, struct nvme_dev, ctrl.reset_work);
+ 	int result = -ENODEV;
++	enum nvme_ctrl_state new_state = NVME_CTRL_LIVE;
+ 
+ 	if (WARN_ON(dev->ctrl.state != NVME_CTRL_RESETTING))
+ 		goto out;
+@@ -2095,15 +2099,23 @@ static void nvme_reset_work(struct work_struct *work)
+ 		dev_warn(dev->ctrl.device, "IO queues not created\n");
+ 		nvme_kill_queues(&dev->ctrl);
+ 		nvme_remove_namespaces(&dev->ctrl);
++		new_state = NVME_CTRL_ADMIN_ONLY;
+ 	} else {
+ 		nvme_start_queues(&dev->ctrl);
+ 		nvme_wait_freeze(&dev->ctrl);
+-		nvme_dev_add(dev);
++		/* hit this only when allocate tagset fails */
++		if (nvme_dev_add(dev))
++			new_state = NVME_CTRL_ADMIN_ONLY;
+ 		nvme_unfreeze(&dev->ctrl);
+ 	}
+ 
+-	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_LIVE)) {
+-		dev_warn(dev->ctrl.device, "failed to mark controller live\n");
++	/*
++	 * If only admin queue live, keep it to do further investigation or
++	 * recovery.
++	 */
++	if (!nvme_change_ctrl_state(&dev->ctrl, new_state)) {
++		dev_warn(dev->ctrl.device,
++			"failed to mark controller state %d\n", new_state);
+ 		goto out;
+ 	}
+ 
