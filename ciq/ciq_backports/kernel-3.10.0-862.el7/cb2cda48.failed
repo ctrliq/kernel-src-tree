@@ -1,0 +1,178 @@
+nfp: remove legacy MAC address lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit cb2cda484840730f0f7683286fa2a25dc1dbecf0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cb2cda48.failed
+
+The legacy MAC address lookup doesn't work well with breakout
+cables.  We are probably better off picking random addresses
+than the wrong ones in the theoretical scenario where management
+FW didn't tell us what the port config is.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb2cda484840730f0f7683286fa2a25dc1dbecf0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,6922410806db..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -102,4 -144,13 +102,14 @@@ extern struct pci_driver nfp_netvf_pci_
+  int nfp_net_pci_probe(struct nfp_pf *pf);
+  void nfp_net_pci_remove(struct nfp_pf *pf);
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_hwmon_register(struct nfp_pf *pf);
++ void nfp_hwmon_unregister(struct nfp_pf *pf);
++ 
++ void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port);
++ 
++ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
++ 
+++>>>>>>> cb2cda484840 (nfp: remove legacy MAC address lookup)
+  #endif /* NFP_MAIN_H */
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,5797dbf2b507..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -79,99 -81,29 +79,121 @@@ static int nfp_is_ready(struct nfp_cpp 
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * nfp_net_map_area() - Help function to map an area
+ + * @cpp:    NFP CPP handler
+ + * @name:   Name for the area
+ + * @target: CPP target
+ + * @addr:   CPP address
+ + * @size:   Size of the area
+ + * @area:   Area handle (returned).
+ + *
+ + * This function is primarily to simplify the code in the main probe
+ + * function. To undo the effect of this functions call
+ + * @nfp_cpp_area_release_free(*area);
+ + *
+ + * Return: Pointer to memory mapped area or ERR_PTR
+ + */
+ +static u8 __iomem *nfp_net_map_area(struct nfp_cpp *cpp,
+ +				    const char *name, int isl, int target,
+ +				    unsigned long long addr, unsigned long size,
+ +				    struct nfp_cpp_area **area)
+ +{
+ +	u8 __iomem *res;
+ +	u32 dest;
+ +	int err;
+ +
+ +	dest = NFP_CPP_ISLAND_ID(target, NFP_CPP_ACTION_RW, 0, isl);
+ +
+ +	*area = nfp_cpp_area_alloc_with_name(cpp, dest, name, addr, size);
+ +	if (!*area) {
+ +		err = -EIO;
+ +		goto err_area;
+ +	}
+ +
+ +	err = nfp_cpp_area_acquire(*area);
+ +	if (err < 0)
+ +		goto err_acquire;
+ +
+ +	res = nfp_cpp_area_iomem(*area);
+ +	if (!res) {
+ +		err = -EIO;
+ +		goto err_map;
+ +	}
+ +
+ +	return res;
+ +
+ +err_map:
+ +	nfp_cpp_area_release(*area);
+ +err_acquire:
+ +	nfp_cpp_area_free(*area);
+ +err_area:
+ +	return (u8 __iomem *)ERR_PTR(err);
+ +}
+ +
+ +static void
+ +nfp_net_get_mac_addr_hwinfo(struct nfp_net *nn, struct nfp_cpp *cpp,
+ +			    unsigned int id)
+ +{
+ +	u8 mac_addr[ETH_ALEN];
+ +	const char *mac_str;
+ +	char name[32];
+ +
+ +	snprintf(name, sizeof(name), "eth%d.mac", id);
+ +
+ +	mac_str = nfp_hwinfo_lookup(cpp, name);
+ +	if (!mac_str) {
+ +		dev_warn(&nn->pdev->dev,
+ +			 "Can't lookup MAC address. Generate\n");
+ +		eth_hw_addr_random(nn->netdev);
+ +		return;
+ +	}
+ +
+ +	if (sscanf(mac_str, "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
+ +		   &mac_addr[0], &mac_addr[1], &mac_addr[2],
+ +		   &mac_addr[3], &mac_addr[4], &mac_addr[5]) != 6) {
+ +		dev_warn(&nn->pdev->dev,
+ +			 "Can't parse MAC address (%s). Generate.\n", mac_str);
+ +		eth_hw_addr_random(nn->netdev);
+ +		return;
+ +	}
+ +
+ +	ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+++=======
++  * nfp_net_get_mac_addr() - Get the MAC address.
++  * @pf:       NFP PF handle
++  * @port:     NFP port structure
++  *
++  * First try to get the MAC address from NSP ETH table. If that
++  * fails generate a random address.
++  */
++ void nfp_net_get_mac_addr(struct nfp_pf *pf, struct nfp_port *port)
++ {
++ 	struct nfp_eth_table_port *eth_port;
++ 
++ 	eth_port = __nfp_port_get_eth_port(port);
++ 	if (!eth_port) {
++ 		eth_hw_addr_random(port->netdev);
++ 		return;
++ 	}
++ 
++ 	ether_addr_copy(port->netdev->dev_addr, eth_port->mac_addr);
++ 	ether_addr_copy(port->netdev->perm_addr, eth_port->mac_addr);
+++>>>>>>> cb2cda484840 (nfp: remove legacy MAC address lookup)
+  }
+  
+ -static struct nfp_eth_table_port *
+ -nfp_net_find_port(struct nfp_eth_table *eth_tbl, unsigned int index)
+ +/**
+ + * nfp_net_get_mac_addr() - Get the MAC address.
+ + * @nn:       NFP Network structure
+ + * @pf:	      NFP PF device structure
+ + * @id:	      NFP port id
+ + *
+ + * First try to get the MAC address from NSP ETH table. If that
+ + * fails try HWInfo.  As a last resort generate a random address.
+ + */
+ +static void
+ +nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_pf *pf, unsigned int id)
+  {
+  	int i;
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app_nic.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
