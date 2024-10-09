@@ -1084,7 +1084,7 @@ br_multicast_update_query_timer(struct net_bridge *br,
 }
 
 /*
- * Add port to rotuer_list
+ * Add port to router_list
  *  list is maintained ordered by pointer value
  *  and locked by br->multicast_lock and RCU
  */
