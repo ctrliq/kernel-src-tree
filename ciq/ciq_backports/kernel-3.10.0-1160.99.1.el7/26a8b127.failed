@@ -1,0 +1,117 @@
+sched/fair: Fix race between runtime distribution and assignment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.99.1.el7
+commit-author Huaixin Chang <changhuaixin@linux.alibaba.com>
+commit 26a8b12747c975b33b4a82d62e4a307e1c07f31b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.99.1.el7/26a8b127.failed
+
+Currently, there is a potential race between distribute_cfs_runtime()
+and assign_cfs_rq_runtime(). Race happens when cfs_b->runtime is read,
+distributes without holding lock and finds out there is not enough
+runtime to charge against after distribution. Because
+assign_cfs_rq_runtime() might be called during distribution, and use
+cfs_b->runtime at the same time.
+
+Fibtest is the tool to test this race. Assume all gcfs_rq is throttled
+and cfs period timer runs, slow threads might run and sleep, returning
+unused cfs_rq runtime and keeping min_cfs_rq_runtime in their local
+pool. If all this happens sufficiently quickly, cfs_b->runtime will drop
+a lot. If runtime distributed is large too, over-use of runtime happens.
+
+A runtime over-using by about 70 percent of quota is seen when we
+test fibtest on a 96-core machine. We run fibtest with 1 fast thread and
+95 slow threads in test group, configure 10ms quota for this group and
+see the CPU usage of fibtest is 17.0%, which is far more than the
+expected 10%.
+
+On a smaller machine with 32 cores, we also run fibtest with 96
+threads. CPU usage is more than 12%, which is also more than expected
+10%. This shows that on similar workloads, this race do affect CPU
+bandwidth control.
+
+Solve this by holding lock inside distribute_cfs_runtime().
+
+Fixes: c06f04c70489 ("sched: Fix potential near-infinite distribute_cfs_runtime() loop")
+	Reviewed-by: Ben Segall <bsegall@google.com>
+	Signed-off-by: Huaixin Chang <changhuaixin@linux.alibaba.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/lkml/20200325092602.22471-1-changhuaixin@linux.alibaba.com/
+(cherry picked from commit 26a8b12747c975b33b4a82d62e4a307e1c07f31b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index 5869b3fb548c,95cbd9e7958d..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -3568,9 -4883,8 +3568,8 @@@ next
+   * period the timer is deactivated until scheduling resumes; cfs_b->idle is
+   * used to track this state.
+   */
+ -static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
+ +static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun)
+  {
+- 	u64 runtime;
+  	int throttled;
+  
+  	/* no need to continue the timer with no bandwidth constraint */
+@@@ -3599,24 -4913,17 +3598,27 @@@
+  	cfs_b->nr_throttled += overrun;
+  
+  	/*
+- 	 * This check is repeated as we are holding onto the new bandwidth while
+- 	 * we unthrottle. This can potentially race with an unthrottled group
+- 	 * trying to acquire new bandwidth from the global pool. This can result
+- 	 * in us over-using our runtime if it is all used during this loop, but
+- 	 * only by limited amounts in that extreme case.
++ 	 * This check is repeated as we release cfs_b->lock while we unthrottle.
+  	 */
+  	while (throttled && cfs_b->runtime > 0 && !cfs_b->distribute_running) {
+- 		runtime = cfs_b->runtime;
+  		cfs_b->distribute_running = 1;
+ -		raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ +		raw_spin_unlock(&cfs_b->lock);
+  		/* we can't nest cfs_b->lock while distributing bandwidth */
+++<<<<<<< HEAD
+ +		runtime = distribute_cfs_runtime(cfs_b, runtime);
+ +		raw_spin_lock(&cfs_b->lock);
+ +
+ +		cfs_b->distribute_running = 0;
+ +		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+ +
+ +		cfs_b->runtime -= min(runtime, cfs_b->runtime);
+++=======
++ 		distribute_cfs_runtime(cfs_b);
++ 		raw_spin_lock_irqsave(&cfs_b->lock, flags);
++ 
++ 		cfs_b->distribute_running = 0;
++ 		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
+++>>>>>>> 26a8b12747c9 (sched/fair: Fix race between runtime distribution and assignment)
+  	}
+  
+  	/*
+@@@ -3743,12 -5057,11 +3745,16 @@@ static void do_sched_cfs_slack_timer(st
+  	if (!runtime)
+  		return;
+  
+- 	runtime = distribute_cfs_runtime(cfs_b, runtime);
++ 	distribute_cfs_runtime(cfs_b);
+  
+++<<<<<<< HEAD
+ +	raw_spin_lock(&cfs_b->lock);
+ +	cfs_b->runtime -= min(runtime, cfs_b->runtime);
+++=======
++ 	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+++>>>>>>> 26a8b12747c9 (sched/fair: Fix race between runtime distribution and assignment)
+  	cfs_b->distribute_running = 0;
+ -	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+ +	raw_spin_unlock(&cfs_b->lock);
+  }
+  
+  /*
+* Unmerged path kernel/sched/fair.c
