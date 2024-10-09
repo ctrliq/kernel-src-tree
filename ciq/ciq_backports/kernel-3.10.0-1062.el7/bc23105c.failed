@@ -1,0 +1,219 @@
+bpf: fix context access in tracing progs on 32 bit archs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit bc23105ca0abdeed98366af01c700c2c3aff5cd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bc23105c.failed
+
+Wang reported that all the testcases for BPF_PROG_TYPE_PERF_EVENT
+program type in test_verifier report the following errors on x86_32:
+
+  172/p unpriv: spill/fill of different pointers ldx FAIL
+  Unexpected error message!
+  0: (bf) r6 = r10
+  1: (07) r6 += -8
+  2: (15) if r1 == 0x0 goto pc+3
+  R1=ctx(id=0,off=0,imm=0) R6=fp-8,call_-1 R10=fp0,call_-1
+  3: (bf) r2 = r10
+  4: (07) r2 += -76
+  5: (7b) *(u64 *)(r6 +0) = r2
+  6: (55) if r1 != 0x0 goto pc+1
+  R1=ctx(id=0,off=0,imm=0) R2=fp-76,call_-1 R6=fp-8,call_-1 R10=fp0,call_-1 fp-8=fp
+  7: (7b) *(u64 *)(r6 +0) = r1
+  8: (79) r1 = *(u64 *)(r6 +0)
+  9: (79) r1 = *(u64 *)(r1 +68)
+  invalid bpf_context access off=68 size=8
+
+  378/p check bpf_perf_event_data->sample_period byte load permitted FAIL
+  Failed to load prog 'Permission denied'!
+  0: (b7) r0 = 0
+  1: (71) r0 = *(u8 *)(r1 +68)
+  invalid bpf_context access off=68 size=1
+
+  379/p check bpf_perf_event_data->sample_period half load permitted FAIL
+  Failed to load prog 'Permission denied'!
+  0: (b7) r0 = 0
+  1: (69) r0 = *(u16 *)(r1 +68)
+  invalid bpf_context access off=68 size=2
+
+  380/p check bpf_perf_event_data->sample_period word load permitted FAIL
+  Failed to load prog 'Permission denied'!
+  0: (b7) r0 = 0
+  1: (61) r0 = *(u32 *)(r1 +68)
+  invalid bpf_context access off=68 size=4
+
+  381/p check bpf_perf_event_data->sample_period dword load permitted FAIL
+  Failed to load prog 'Permission denied'!
+  0: (b7) r0 = 0
+  1: (79) r0 = *(u64 *)(r1 +68)
+  invalid bpf_context access off=68 size=8
+
+Reason is that struct pt_regs on x86_32 doesn't fully align to 8 byte
+boundary due to its size of 68 bytes. Therefore, bpf_ctx_narrow_access_ok()
+will then bail out saying that off & (size_default - 1) which is 68 & 7
+doesn't cleanly align in the case of sample_period access from struct
+bpf_perf_event_data, hence verifier wrongly thinks we might be doing an
+unaligned access here though underlying arch can handle it just fine.
+Therefore adjust this down to machine size and check and rewrite the
+offset for narrow access on that basis. We also need to fix corresponding
+pe_prog_is_valid_access(), since we hit the check for off % size != 0
+(e.g. 68 % 8 -> 4) in the first and last test. With that in place, progs
+for tracing work on x86_32.
+
+	Reported-by: Wang YanQing <udknight@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Wang YanQing <udknight@gmail.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit bc23105ca0abdeed98366af01c700c2c3aff5cd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+diff --cc include/linux/filter.h
+index e2bb1b37f012,45fc0f5000d8..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -477,39 -629,74 +477,72 @@@ static inline unsigned int bpf_prog_siz
+  		   offsetof(struct bpf_prog, insns[proglen]));
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool
+ +bpf_ctx_narrow_access_ok(u32 off, u32 size, const u32 size_default)
+++=======
++ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
++ {
++ 	/* When classic BPF programs have been loaded and the arch
++ 	 * does not have a classic BPF JIT (anymore), they have been
++ 	 * converted via bpf_migrate_filter() to eBPF and thus always
++ 	 * have an unspec program type.
++ 	 */
++ 	return prog->type == BPF_PROG_TYPE_UNSPEC;
++ }
++ 
++ static inline u32 bpf_ctx_off_adjust_machine(u32 size)
+++>>>>>>> bc23105ca0ab (bpf: fix context access in tracing progs on 32 bit archs)
+  {
+- 	bool off_ok;
++ 	const u32 size_machine = sizeof(unsigned long);
++ 
++ 	if (size > size_machine && size % size_machine == 0)
++ 		size = size_machine;
++ 
++ 	return size;
++ }
++ 
++ static inline bool bpf_ctx_narrow_align_ok(u32 off, u32 size_access,
++ 					   u32 size_default)
++ {
++ 	size_default = bpf_ctx_off_adjust_machine(size_default);
++ 	size_access  = bpf_ctx_off_adjust_machine(size_access);
++ 
+  #ifdef __LITTLE_ENDIAN
+- 	off_ok = (off & (size_default - 1)) == 0;
++ 	return (off & (size_default - 1)) == 0;
+  #else
+- 	off_ok = (off & (size_default - 1)) + size == size_default;
++ 	return (off & (size_default - 1)) + size_access == size_default;
+  #endif
+- 	return off_ok && size <= size_default && (size & (size - 1)) == 0;
++ }
++ 
++ static inline bool
++ bpf_ctx_narrow_access_ok(u32 off, u32 size, u32 size_default)
++ {
++ 	return bpf_ctx_narrow_align_ok(off, size, size_default) &&
++ 	       size <= size_default && (size & (size - 1)) == 0;
+  }
+  
+ -#define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
+ -
+ -#ifdef CONFIG_ARCH_HAS_SET_MEMORY
+ -static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+ +static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
+  {
+ -	fp->locked = 1;
+ -	WARN_ON_ONCE(set_memory_ro((unsigned long)fp, fp->pages));
+ +	/* When classic BPF programs have been loaded and the arch
+ +	 * does not have a classic BPF JIT (anymore), they have been
+ +	 * converted via bpf_migrate_filter() to eBPF and thus always
+ +	 * have an unspec program type.
+ +	 */
+ +	return prog->type == BPF_PROG_TYPE_UNSPEC;
+  }
+  
+ -static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+ -{
+ -	if (fp->locked) {
+ -		WARN_ON_ONCE(set_memory_rw((unsigned long)fp, fp->pages));
+ -		/* In case set_memory_rw() fails, we want to be the first
+ -		 * to crash here instead of some random place later on.
+ -		 */
+ -		fp->locked = 0;
+ -	}
+ -}
+ +#define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
+  
+ -static inline void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
+ +#ifdef CONFIG_DEBUG_SET_MODULE_RONX
+ +static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+  {
+ -	WARN_ON_ONCE(set_memory_ro((unsigned long)hdr, hdr->pages));
+ +	set_memory_ro((unsigned long)fp, fp->pages);
+  }
+  
+ -static inline void bpf_jit_binary_unlock_ro(struct bpf_binary_header *hdr)
+ +static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
+  {
+ -	WARN_ON_ONCE(set_memory_rw((unsigned long)hdr, hdr->pages));
+ +	set_memory_rw((unsigned long)fp, fp->pages);
+  }
+  #else
+  static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
+* Unmerged path include/linux/filter.h
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 0dcbd375ce11..bd6ac1274bd3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5223,6 +5223,7 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
+ 		 */
+ 		is_narrower_load = size < ctx_field_size;
+ 		if (is_narrower_load) {
++			u32 size_default = bpf_ctx_off_adjust_machine(ctx_field_size);
+ 			u32 off = insn->off;
+ 			u8 size_code;
+ 
+@@ -5237,7 +5238,7 @@ static int convert_ctx_accesses(struct bpf_verifier_env *env)
+ 			else if (ctx_field_size == 8)
+ 				size_code = BPF_DW;
+ 
+-			insn->off = off & ~(ctx_field_size - 1);
++			insn->off = off & ~(size_default - 1);
+ 			insn->code = BPF_LDX | BPF_MEM | size_code;
+ 		}
+ 
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index 8fa6522b08ac..4ec81ab13be3 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -665,8 +665,14 @@ static bool pe_prog_is_valid_access(int off, int size, enum bpf_access_type type
+ 		return false;
+ 	if (type != BPF_READ)
+ 		return false;
+-	if (off % size != 0)
+-		return false;
++	if (off % size != 0) {
++		if (sizeof(unsigned long) != 4)
++			return false;
++		if (size != 8)
++			return false;
++		if (off % size != 4)
++			return false;
++	}
+ 
+ 	switch (off) {
+ 	case bpf_ctx_range(struct bpf_perf_event_data, sample_period):
