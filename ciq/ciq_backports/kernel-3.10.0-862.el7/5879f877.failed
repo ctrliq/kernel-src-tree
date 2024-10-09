@@ -1,0 +1,130 @@
+cpufreq: intel_pstate: Reduce impact due to rounding error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Reduce impact due to rounding error (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 91.59%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 5879f877398a2a5e5006c6e16a4288e9d4c308a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5879f877.failed
+
+When policy->max and policy->min are same, in some cases they don't
+result in the same frequency cap. The max_policy_pct is rounded up but
+not min_perf_pct. So even when they are same, results in different
+percentage or maximum and minimum.
+Since minimum is a conservative value for power, a lower value without
+rounding is better in most of the cases, unless user wants
+policy->max = policy->min.
+This change uses use the same policy percentage when policy->max and
+policy->min are same.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 5879f877398a2a5e5006c6e16a4288e9d4c308a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index 2849fe3729b8,8e7390bb2175..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -1406,40 -1495,65 +1406,83 @@@ static int intel_pstate_init_cpu(unsign
+  
+  static unsigned int intel_pstate_get(unsigned int cpu_num)
+  {
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+ +	struct sample *sample;
+ +	struct cpudata *cpu;
+  
+ -	return cpu ? get_avg_frequency(cpu) : 0;
+ +	cpu = all_cpu_data[cpu_num];
+ +	if (!cpu)
+ +		return 0;
+ +	sample = &cpu->sample;
+ +	return sample->freq;
+  }
+  
+ -static void intel_pstate_set_update_util_hook(unsigned int cpu_num)
+ +static int intel_pstate_set_policy(struct cpufreq_policy *policy)
+  {
+ -	struct cpudata *cpu = all_cpu_data[cpu_num];
+ +	if (!policy->cpuinfo.max_freq)
+ +		return -ENODEV;
+  
+ -	if (cpu->update_util_set)
+ -		return;
+ +	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
+ +		 policy->cpuinfo.max_freq, policy->max);
+  
+ -	/* Prevent intel_pstate_update_util() from using stale data. */
+ -	cpu->sample.time = 0;
+ -	cpufreq_add_update_util_hook(cpu_num, &cpu->update_util,
+ -				     intel_pstate_update_util);
+ -	cpu->update_util_set = true;
+ -}
+ +	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
+ +	    policy->max >= policy->cpuinfo.max_freq) {
+ +		pr_debug("intel_pstate: set performance\n");
+ +		limits = &performance_limits;
+ +		if (hwp_active)
+ +			intel_pstate_hwp_set(policy->cpus);
+ +		return 0;
+ +	}
+  
+++<<<<<<< HEAD
+ +	pr_debug("intel_pstate: set powersave\n");
+ +	limits = &powersave_limits;
+ +	limits->min_policy_pct = (policy->min * 100) / policy->cpuinfo.max_freq;
+ +	limits->min_policy_pct = clamp_t(int, limits->min_policy_pct, 0 , 100);
+ +	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
+ +					      policy->cpuinfo.max_freq);
+ +	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0 , 100);
+++=======
++ static void intel_pstate_clear_update_util_hook(unsigned int cpu)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[cpu];
++ 
++ 	if (!cpu_data->update_util_set)
++ 		return;
++ 
++ 	cpufreq_remove_update_util_hook(cpu);
++ 	cpu_data->update_util_set = false;
++ 	synchronize_sched();
++ }
++ 
++ static void intel_pstate_set_performance_limits(struct perf_limits *limits)
++ {
++ 	limits->no_turbo = 0;
++ 	limits->turbo_disabled = 0;
++ 	limits->max_perf_pct = 100;
++ 	limits->max_perf = int_tofp(1);
++ 	limits->min_perf_pct = 100;
++ 	limits->min_perf = int_tofp(1);
++ 	limits->max_policy_pct = 100;
++ 	limits->max_sysfs_pct = 100;
++ 	limits->min_policy_pct = 0;
++ 	limits->min_sysfs_pct = 0;
++ }
++ 
++ static void intel_pstate_update_perf_limits(struct cpufreq_policy *policy,
++ 					    struct perf_limits *limits)
++ {
++ 	limits->max_policy_pct = DIV_ROUND_UP(policy->max * 100,
++ 					      policy->cpuinfo.max_freq);
++ 	limits->max_policy_pct = clamp_t(int, limits->max_policy_pct, 0, 100);
++ 	if (policy->max == policy->min) {
++ 		limits->min_policy_pct = limits->max_policy_pct;
++ 	} else {
++ 		limits->min_policy_pct = (policy->min * 100) /
++ 						policy->cpuinfo.max_freq;
++ 		limits->min_policy_pct = clamp_t(int, limits->min_policy_pct,
++ 						 0, 100);
++ 	}
+++>>>>>>> 5879f877398a (cpufreq: intel_pstate: Reduce impact due to rounding error)
+  
+  	/* Normalize user input to [min_policy_pct, max_policy_pct] */
+  	limits->min_perf_pct = max(limits->min_policy_pct,
+* Unmerged path drivers/cpufreq/intel_pstate.c
