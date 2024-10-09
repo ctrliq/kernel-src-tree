@@ -148,8 +148,8 @@ static void get_smca_bank_info(unsigned int bank)
 	struct smca_hwid *s_hwid;
 	u32 high, instance_id;
 
-	/* Collect bank_info using CPU 0 for now. */
-	if (cpu)
+	/* Return early if this bank was already initialized. */
+	if (smca_banks[bank].hwid)
 		return;
 
 	if (rdmsr_safe_on_cpu(cpu, MSR_AMD64_SMCA_MCx_IPID(bank), &instance_id, &high)) {
