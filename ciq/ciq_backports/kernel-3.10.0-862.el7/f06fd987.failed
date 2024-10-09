@@ -1,0 +1,176 @@
+fsnotify: Move locking into fsnotify_find_mark()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit f06fd98759451876f51607f60abd74c89b141610
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f06fd987.failed
+
+Move locking of a mark list into fsnotify_find_mark(). This reduces code
+churn in the following patch changing lock protecting the list.
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit f06fd98759451876f51607f60abd74c89b141610)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/inode_mark.c
+#	fs/notify/mark.c
+#	fs/notify/vfsmount_mark.c
+diff --cc fs/notify/inode_mark.c
+index 1168d71dbf85,f05fc49b8242..000000000000
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@@ -79,66 -71,7 +79,70 @@@ void fsnotify_clear_inode_marks_by_grou
+  struct fsnotify_mark *fsnotify_find_inode_mark(struct fsnotify_group *group,
+  					       struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	struct fsnotify_mark *mark;
+ +
+ +	spin_lock(&inode->i_lock);
+ +	mark = fsnotify_find_mark(&inode->i_fsnotify_marks, group);
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	return mark;
+++=======
++ 	return fsnotify_find_mark(inode->i_fsnotify_marks, group);
+++>>>>>>> f06fd9875945 (fsnotify: Move locking into fsnotify_find_mark())
+ +}
+ +
+ +/*
+ + * If we are setting a mark mask on an inode mark we should pin the inode
+ + * in memory.
+ + */
+ +void fsnotify_set_inode_mark_mask_locked(struct fsnotify_mark *mark,
+ +					 __u32 mask)
+ +{
+ +	struct inode *inode;
+ +
+ +	assert_spin_locked(&mark->lock);
+ +
+ +	if (mask &&
+ +	    mark->inode &&
+ +	    !(mark->flags & FSNOTIFY_MARK_FLAG_OBJECT_PINNED)) {
+ +		mark->flags |= FSNOTIFY_MARK_FLAG_OBJECT_PINNED;
+ +		inode = igrab(mark->inode);
+ +		/*
+ +		 * we shouldn't be able to get here if the inode wasn't
+ +		 * already safely held in memory.  But bug in case it
+ +		 * ever is wrong.
+ +		 */
+ +		BUG_ON(!inode);
+ +	}
+ +}
+ +
+ +/*
+ + * Attach an initialized mark to a given inode.
+ + * These marks may be used for the fsnotify backend to determine which
+ + * event types should be delivered to which group and for which inodes.  These
+ + * marks are ordered according to priority, highest number first, and then by
+ + * the group's location in memory.
+ + */
+ +int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ +			    struct fsnotify_group *group, struct inode *inode,
+ +			    int allow_dups)
+ +{
+ +	int ret;
+ +
+ +	mark->flags |= FSNOTIFY_MARK_FLAG_INODE;
+ +
+ +	BUG_ON(!mutex_is_locked(&group->mark_mutex));
+ +	assert_spin_locked(&mark->lock);
+ +
+ +	spin_lock(&inode->i_lock);
+ +	mark->inode = inode;
+ +	ret = fsnotify_add_mark_list(&inode->i_fsnotify_marks, mark,
+ +				     allow_dups);
+ +	inode->i_fsnotify_mask = fsnotify_recalc_mask(&inode->i_fsnotify_marks);
+ +	spin_unlock(&inode->i_lock);
+ +
+ +	return ret;
+  }
+  
+  /**
+diff --cc fs/notify/mark.c
+index 44836e539169,0830e0af997a..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -423,10 -485,20 +423,24 @@@ struct fsnotify_mark *fsnotify_find_mar
+  					 struct fsnotify_group *group)
+  {
+  	struct fsnotify_mark *mark;
++ 	spinlock_t *lock;
+  
+++<<<<<<< HEAD
+ +	hlist_for_each_entry(mark, head, obj_list) {
+++=======
++ 	if (!conn)
++ 		return NULL;
++ 
++ 	if (conn->flags & FSNOTIFY_OBJ_TYPE_INODE)
++ 		lock = &conn->inode->i_lock;
++ 	else
++ 		lock = &conn->mnt->mnt_root->d_lock;
++ 	spin_lock(lock);
++ 	hlist_for_each_entry(mark, &conn->list, obj_list) {
+++>>>>>>> f06fd9875945 (fsnotify: Move locking into fsnotify_find_mark())
+  		if (mark->group == group) {
+  			fsnotify_get_mark(mark);
++ 			spin_unlock(lock);
+  			return mark;
+  		}
+  	}
+diff --cc fs/notify/vfsmount_mark.c
+index a8fcab68faef,3476ee44b2c5..000000000000
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@@ -72,37 -65,6 +72,40 @@@ struct fsnotify_mark *fsnotify_find_vfs
+  						  struct vfsmount *mnt)
+  {
+  	struct mount *m = real_mount(mnt);
+- 	struct fsnotify_mark *mark;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&mnt->mnt_root->d_lock);
+ +	mark = fsnotify_find_mark(&m->mnt_fsnotify_marks, group);
+ +	spin_unlock(&mnt->mnt_root->d_lock);
+ +
+ +	return mark;
+++=======
++ 	return fsnotify_find_mark(m->mnt_fsnotify_marks, group);
+++>>>>>>> f06fd9875945 (fsnotify: Move locking into fsnotify_find_mark())
+ +}
+ +
+ +/*
+ + * Attach an initialized mark to a given group and vfsmount.
+ + * These marks may be used for the fsnotify backend to determine which
+ + * event types should be delivered to which groups.
+ + */
+ +int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ +			       struct fsnotify_group *group, struct vfsmount *mnt,
+ +			       int allow_dups)
+ +{
+ +	struct mount *m = real_mount(mnt);
+ +	int ret;
+ +
+ +	mark->flags |= FSNOTIFY_MARK_FLAG_VFSMOUNT;
+ +
+ +	BUG_ON(!mutex_is_locked(&group->mark_mutex));
+ +	assert_spin_locked(&mark->lock);
+ +
+ +	spin_lock(&mnt->mnt_root->d_lock);
+ +	mark->mnt = mnt;
+ +	ret = fsnotify_add_mark_list(&m->mnt_fsnotify_marks, mark, allow_dups);
+ +	m->mnt_fsnotify_mask = fsnotify_recalc_mask(&m->mnt_fsnotify_marks);
+ +	spin_unlock(&mnt->mnt_root->d_lock);
+ +
+ +	return ret;
+  }
+* Unmerged path fs/notify/inode_mark.c
+* Unmerged path fs/notify/mark.c
+* Unmerged path fs/notify/vfsmount_mark.c
