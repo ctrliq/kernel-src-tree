@@ -3800,7 +3800,8 @@ static u32 bond_rr_gen_slave_id(struct bonding *bond)
 	return slave_id;
 }
 
-static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev)
+static netdev_tx_t bond_xmit_roundrobin(struct sk_buff *skb,
+					struct net_device *bond_dev)
 {
 	struct bonding *bond = netdev_priv(bond_dev);
 	struct iphdr *iph = ip_hdr(skb);
@@ -3836,7 +3837,8 @@ static int bond_xmit_roundrobin(struct sk_buff *skb, struct net_device *bond_dev
 /* In active-backup mode, we know that bond->curr_active_slave is always valid if
  * the bond has a usable interface.
  */
-static int bond_xmit_activebackup(struct sk_buff *skb, struct net_device *bond_dev)
+static netdev_tx_t bond_xmit_activebackup(struct sk_buff *skb,
+					  struct net_device *bond_dev)
 {
 	struct bonding *bond = netdev_priv(bond_dev);
 	struct slave *slave;
@@ -3974,7 +3976,8 @@ out:
  * usable slave array is formed in the control path. The xmit function
  * just calculates hash and sends the packet out.
  */
-static int bond_3ad_xor_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t bond_3ad_xor_xmit(struct sk_buff *skb,
+				     struct net_device *dev)
 {
 	struct bonding *bond = netdev_priv(dev);
 	struct slave *slave;
@@ -3994,7 +3997,8 @@ static int bond_3ad_xor_xmit(struct sk_buff *skb, struct net_device *dev)
 }
 
 /* in broadcast mode, we send everything to all usable interfaces. */
-static int bond_xmit_broadcast(struct sk_buff *skb, struct net_device *bond_dev)
+static netdev_tx_t bond_xmit_broadcast(struct sk_buff *skb,
+				       struct net_device *bond_dev)
 {
 	struct bonding *bond = netdev_priv(bond_dev);
 	struct slave *slave = NULL;
