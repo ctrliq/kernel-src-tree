@@ -1,0 +1,186 @@
+blk-mq-sched: improve dispatching from sw queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit b347689ffbca745ac457ee27400ce1affd571c6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b347689f.failed
+
+SCSI devices use host-wide tagset, and the shared driver tag space is
+often quite big. However, there is also a queue depth for each lun(
+.cmd_per_lun), which is often small, for example, on both lpfc and
+qla2xxx, .cmd_per_lun is just 3.
+
+So lots of requests may stay in sw queue, and we always flush all
+belonging to same hw queue and dispatch them all to driver.
+Unfortunately it is easy to cause queue busy because of the small
+.cmd_per_lun.  Once these requests are flushed out, they have to stay in
+hctx->dispatch, and no bio merge can happen on these requests, and
+sequential IO performance is harmed.
+
+This patch introduces blk_mq_dequeue_from_ctx for dequeuing a request
+from a sw queue, so that we can dispatch them in scheduler's way. We can
+then avoid dequeueing too many requests from sw queue, since we don't
+flush ->dispatch completely.
+
+This patch improves dispatching from sw queue by using the .get_budget
+and .put_budget callbacks.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b347689ffbca745ac457ee27400ce1affd571c6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.h
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.h
+index 2d50f02667c4,522b420dedc0..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -33,20 -30,35 +33,30 @@@ void blk_mq_freeze_queue(struct request
+  void blk_mq_free_queue(struct request_queue *q);
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+++<<<<<<< HEAD
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *, struct list_head *);
+++=======
++ bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);
++ void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
++ bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx);
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 				bool wait);
++ struct request *blk_mq_dequeue_from_ctx(struct blk_mq_hw_ctx *hctx,
++ 					struct blk_mq_ctx *start);
+++>>>>>>> b347689ffbca (blk-mq-sched: improve dispatching from sw queue)
+  
+  /*
+ - * Internal helpers for allocating/freeing the request map
+ - */
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx);
+ -void blk_mq_free_rq_map(struct blk_mq_tags *tags);
+ -struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
+ -					unsigned int hctx_idx,
+ -					unsigned int nr_tags,
+ -					unsigned int reserved_tags);
+ -int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx, unsigned int depth);
+ -
+ -/*
+ - * Internal helpers for request insertion into sw queues
+ + * CPU hotplug helpers
+   */
+ -void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ -				bool at_head);
+ -void blk_mq_request_bypass_insert(struct request *rq);
+ -void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+ -				struct list_head *list);
+ +struct blk_mq_cpu_notifier;
+ +void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ +			      int (*fn)(void *, unsigned long, unsigned int),
+ +			      void *data);
+ +void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_cpu_init(void);
+ +void blk_mq_enable_hotplug(void);
+ +void blk_mq_disable_hotplug(void);
+  
+  /*
+   * CPU -> queue mappings
+diff --cc include/linux/blk-mq.h
+index ab31251b7413,e5e6becd57d3..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -38,22 -28,18 +38,30 @@@ struct blk_mq_hw_ctx 
+  
+  	void			*driver_data;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct sbitmap		ctx_map;
++ 
++ 	struct blk_mq_ctx	*dispatch_from;
++ 
++ 	struct blk_mq_ctx	**ctxs;
+++>>>>>>> b347689ffbca (blk-mq-sched: improve dispatching from sw queue)
+  	unsigned int		nr_ctx;
+ +	struct blk_mq_ctx	**ctxs;
+ +
+ +	RH_KABI_REPLACE(unsigned int		nr_ctx_map,
+ +			atomic_t		wait_index)
+ +
+ +	RH_KABI_REPLACE(unsigned long		*ctx_map,
+ +			unsigned long		*padding1)
+  
+ -	wait_queue_entry_t		dispatch_wait;
+ -	atomic_t		wait_index;
+ +	RH_KABI_REPLACE(struct request		**rqs,
+ +			struct request		**padding2)
+ +
+ +	RH_KABI_REPLACE(struct list_head	page_list,
+ +			struct list_head	padding3)
+  
+  	struct blk_mq_tags	*tags;
+ -	struct blk_mq_tags	*sched_tags;
+  
+  	unsigned long		queued;
+  	unsigned long		run;
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index d9bfe0c6bc0e..c0ae947f15a2 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -817,6 +817,45 @@ static void flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+ 	}
+ }
+ 
++struct dispatch_rq_data {
++	struct blk_mq_hw_ctx *hctx;
++	struct request *rq;
++};
++
++static bool dispatch_rq_from_ctx(struct sbitmap *sb, unsigned int bitnr,
++		void *data)
++{
++	struct dispatch_rq_data *dispatch_data = data;
++	struct blk_mq_hw_ctx *hctx = dispatch_data->hctx;
++	struct blk_mq_ctx *ctx = hctx->ctxs[bitnr];
++
++	spin_lock(&ctx->lock);
++	if (unlikely(!list_empty(&ctx->rq_list))) {
++		dispatch_data->rq = list_entry_rq(ctx->rq_list.next);
++		list_del_init(&dispatch_data->rq->queuelist);
++		if (list_empty(&ctx->rq_list))
++			sbitmap_clear_bit(sb, bitnr);
++	}
++	spin_unlock(&ctx->lock);
++
++	return !dispatch_data->rq;
++}
++
++struct request *blk_mq_dequeue_from_ctx(struct blk_mq_hw_ctx *hctx,
++					struct blk_mq_ctx *start)
++{
++	unsigned off = start ? start->index_hw : 0;
++	struct dispatch_rq_data data = {
++		.hctx = hctx,
++		.rq   = NULL,
++	};
++
++	__sbitmap_for_each_set(&hctx->ctx_map, off,
++			       dispatch_rq_from_ctx, &data);
++
++	return data.rq;
++}
++
+ static inline unsigned int queued_to_index(unsigned int queued)
+ {
+ 	if (!queued)
+* Unmerged path block/blk-mq.h
+* Unmerged path include/linux/blk-mq.h
