@@ -1,0 +1,266 @@
+nvme: rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING (David Milburn) [1515584]
+Rebuild_FUZZ: 95.16%
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit ad6a0a52e6de3d1161b7999c7903db906ba4cf79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ad6a0a52.failed
+
+In pci transport, this state is used to mark the initialization
+process. This should be also used in other transports as well.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit ad6a0a52e6de3d1161b7999c7903db906ba4cf79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/fabrics.h
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index 27174fd02aa2,1033de4136e0..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -186,6 -263,15 +186,18 @@@ bool nvme_change_ctrl_state(struct nvme
+  
+  	old_state = ctrl->state;
+  	switch (new_state) {
+++<<<<<<< HEAD
+++=======
++ 	case NVME_CTRL_ADMIN_ONLY:
++ 		switch (old_state) {
++ 		case NVME_CTRL_CONNECTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
+++>>>>>>> ad6a0a52e6de (nvme: rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING)
+  	case NVME_CTRL_LIVE:
+  		switch (old_state) {
+  		case NVME_CTRL_NEW:
+@@@ -220,8 -307,9 +232,8 @@@
+  	case NVME_CTRL_DELETING:
+  		switch (old_state) {
+  		case NVME_CTRL_LIVE:
+ -		case NVME_CTRL_ADMIN_ONLY:
+  		case NVME_CTRL_RESETTING:
+- 		case NVME_CTRL_RECONNECTING:
++ 		case NVME_CTRL_CONNECTING:
+  			changed = true;
+  			/* FALLTHRU */
+  		default:
+@@@ -2043,8 -2685,9 +2055,8 @@@ static ssize_t nvme_sysfs_show_state(st
+  	static const char *const state_name[] = {
+  		[NVME_CTRL_NEW]		= "new",
+  		[NVME_CTRL_LIVE]	= "live",
+ -		[NVME_CTRL_ADMIN_ONLY]	= "only-admin",
+  		[NVME_CTRL_RESETTING]	= "resetting",
+- 		[NVME_CTRL_RECONNECTING]= "reconnecting",
++ 		[NVME_CTRL_CONNECTING]	= "connecting",
+  		[NVME_CTRL_DELETING]	= "deleting",
+  		[NVME_CTRL_DEAD]	= "dead",
+  	};
+diff --cc drivers/nvme/host/fabrics.h
+index 5a20948e5609,a3145d90c1d2..000000000000
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@@ -156,4 -158,35 +156,38 @@@ void nvmf_free_options(struct nvmf_ctrl
+  int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size);
+  bool nvmf_should_reconnect(struct nvme_ctrl *ctrl);
+  
+++<<<<<<< HEAD
+++=======
++ static inline blk_status_t nvmf_check_init_req(struct nvme_ctrl *ctrl,
++ 		struct request *rq)
++ {
++ 	struct nvme_command *cmd = nvme_req(rq)->cmd;
++ 
++ 	/*
++ 	 * We cannot accept any other command until the connect command has
++ 	 * completed, so only allow connect to pass.
++ 	 */
++ 	if (!blk_rq_is_passthrough(rq) ||
++ 	    cmd->common.opcode != nvme_fabrics_command ||
++ 	    cmd->fabrics.fctype != nvme_fabrics_type_connect) {
++ 		/*
++ 		 * Connecting state means transport disruption or initial
++ 		 * establishment, which can take a long time and even might
++ 		 * fail permanently, fail fast to give upper layers a chance
++ 		 * to failover.
++ 		 * Deleting state means that the ctrl will never accept commands
++ 		 * again, fail it permanently.
++ 		 */
++ 		if (ctrl->state == NVME_CTRL_CONNECTING ||
++ 		    ctrl->state == NVME_CTRL_DELETING) {
++ 			nvme_req(rq)->status = NVME_SC_ABORT_REQ;
++ 			return BLK_STS_IOERR;
++ 		}
++ 		return BLK_STS_RESOURCE; /* try again later */
++ 	}
++ 
++ 	return BLK_STS_OK;
++ }
++ 
+++>>>>>>> ad6a0a52e6de (nvme: rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING)
+  #endif /* _NVME_FABRICS_H */
+diff --cc drivers/nvme/host/pci.c
+index e3ee89a3f5ff,ab9c19525fa8..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -905,9 -1138,14 +905,16 @@@ static bool nvme_should_reset(struct nv
+  	 */
+  	bool nssro = dev->subsystem && (csts & NVME_CSTS_NSSRO);
+  
+++<<<<<<< HEAD
+ +	/* If there is a reset ongoing, we shouldn't reset again. */
+ +	if (dev->ctrl.state == NVME_CTRL_RESETTING)
+++=======
++ 	/* If there is a reset/reinit ongoing, we shouldn't reset again. */
++ 	switch (dev->ctrl.state) {
++ 	case NVME_CTRL_RESETTING:
++ 	case NVME_CTRL_CONNECTING:
+++>>>>>>> ad6a0a52e6de (nvme: rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING)
+  		return false;
+ -	default:
+ -		break;
+ -	}
+  
+  	/* We shouldn't reset unless the controller is on fatal error state
+  	 * _or_ if we lost the communication with it.
+@@@ -2055,6 -2287,16 +2062,19 @@@ static void nvme_reset_work(struct work
+  	if (dev->ctrl.ctrl_config & NVME_CC_ENABLE)
+  		nvme_dev_disable(dev, false);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Introduce CONNECTING state from nvme-fc/rdma transports to mark the
++ 	 * initializing procedure here.
++ 	 */
++ 	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_CONNECTING)) {
++ 		dev_warn(dev->ctrl.device,
++ 			"failed to mark controller CONNECTING\n");
++ 		goto out;
++ 	}
++ 
+++>>>>>>> ad6a0a52e6de (nvme: rename NVME_CTRL_RECONNECTING state to NVME_CTRL_CONNECTING)
+  	result = nvme_pci_enable(dev);
+  	if (result)
+  		goto out;
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/fabrics.h
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 6e7bb75ba7ba..a3e74243845d 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -545,7 +545,7 @@ nvme_fc_resume_controller(struct nvme_fc_ctrl *ctrl)
+ {
+ 	switch (ctrl->ctrl.state) {
+ 	case NVME_CTRL_NEW:
+-	case NVME_CTRL_RECONNECTING:
++	case NVME_CTRL_CONNECTING:
+ 		/*
+ 		 * As all reconnects were suppressed, schedule a
+ 		 * connect.
+@@ -790,7 +790,7 @@ nvme_fc_ctrl_connectivity_loss(struct nvme_fc_ctrl *ctrl)
+ 		}
+ 		break;
+ 
+-	case NVME_CTRL_RECONNECTING:
++	case NVME_CTRL_CONNECTING:
+ 		/*
+ 		 * The association has already been terminated and the
+ 		 * controller is attempting reconnects.  No need to do anything
+@@ -1736,7 +1736,7 @@ done:
+ 	if (status &&
+ 	    (blk_queue_dying(rq->q) ||
+ 	     ctrl->ctrl.state == NVME_CTRL_NEW ||
+-	     ctrl->ctrl.state == NVME_CTRL_RECONNECTING))
++	     ctrl->ctrl.state == NVME_CTRL_CONNECTING))
+ 		status |= cpu_to_le16(NVME_SC_DNR << 1);
+ 
+ 	if (__nvme_fc_fcpop_chk_teardowns(ctrl, op))
+@@ -2976,7 +2976,7 @@ nvme_fc_reconnect_or_delete(struct nvme_fc_ctrl *ctrl, int status)
+ 	unsigned long recon_delay = ctrl->ctrl.opts->reconnect_delay * HZ;
+ 	bool recon = true;
+ 
+-	if (ctrl->ctrl.state != NVME_CTRL_RECONNECTING)
++	if (ctrl->ctrl.state != NVME_CTRL_CONNECTING)
+ 		return;
+ 
+ 	if (portptr->port_state == FC_OBJSTATE_ONLINE)
+@@ -3024,10 +3024,10 @@ nvme_fc_reset_ctrl_work(struct work_struct *work)
+ 	/* will block will waiting for io to terminate */
+ 	nvme_fc_delete_association(ctrl);
+ 
+-	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING)) {
+ 		dev_err(ctrl->ctrl.device,
+ 			"NVME-FC{%d}: error_recovery: Couldn't change state "
+-			"to RECONNECTING\n", ctrl->cnum);
++			"to CONNECTING\n", ctrl->cnum);
+ 		return;
+ 	}
+ 
+@@ -3229,7 +3229,7 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	 * transport errors (frame drop, LS failure) inherently must kill
+ 	 * the association. The transport is coded so that any command used
+ 	 * to create the association (prior to a LIVE state transition
+-	 * while NEW or RECONNECTING) will fail if it completes in error or
++	 * while NEW or CONNECTING) will fail if it completes in error or
+ 	 * times out.
+ 	 *
+ 	 * As such: as the connect request was mostly likely due to a
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 68f79634c978..cc404b68e683 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -103,7 +103,7 @@ enum nvme_ctrl_state {
+ 	NVME_CTRL_NEW,
+ 	NVME_CTRL_LIVE,
+ 	NVME_CTRL_RESETTING,
+-	NVME_CTRL_RECONNECTING,
++	NVME_CTRL_CONNECTING,
+ 	NVME_CTRL_DELETING,
+ 	NVME_CTRL_DEAD,
+ };
+* Unmerged path drivers/nvme/host/pci.c
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 2e9ce2cbb1eb..7e4be10d9b1f 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -703,7 +703,7 @@ free_ctrl:
+ static void nvme_rdma_reconnect_or_remove(struct nvme_rdma_ctrl *ctrl)
+ {
+ 	/* If we are resetting/deleting then do nothing */
+-	if (ctrl->ctrl.state != NVME_CTRL_RECONNECTING) {
++	if (ctrl->ctrl.state != NVME_CTRL_CONNECTING) {
+ 		WARN_ON_ONCE(ctrl->ctrl.state == NVME_CTRL_NEW ||
+ 			ctrl->ctrl.state == NVME_CTRL_LIVE);
+ 		return;
+@@ -820,7 +820,7 @@ static void nvme_rdma_error_recovery_work(struct work_struct *work)
+ 	blk_mq_start_stopped_hw_queues(ctrl->ctrl.admin_q, true);
+ 	nvme_start_queues(&ctrl->ctrl);
+ 
+-	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING)) {
+ 		/* state change failure should never happen */
+ 		WARN_ON_ONCE(1);
+ 		return;
+@@ -1755,7 +1755,7 @@ static void nvme_rdma_reset_ctrl_work(struct work_struct *work)
+ 	nvme_stop_ctrl(&ctrl->ctrl);
+ 	nvme_rdma_shutdown_ctrl(ctrl);
+ 
+-	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
++	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING)) {
+ 		/* state change failure should never happen */
+ 		WARN_ON_ONCE(1);
+ 		return;
