@@ -1,0 +1,424 @@
+KVM: PPC: Book 3S: XICS: Implement ICS P/Q states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Li Zhong <zhong@linux.vnet.ibm.com>
+commit 17d48610ae0fa218aa386b16a538c792991a3652
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/17d48610.failed
+
+This patch implements P(Presented)/Q(Queued) states for ICS irqs.
+
+When the interrupt is presented, set P. Present if P was not set.
+If P is already set, don't present again, set Q.
+When the interrupt is EOI'ed, move Q into P (and clear Q). If it is
+set, re-present.
+
+The asserted flag used by LSI is also incorporated into the P bit.
+
+When the irq state is saved, P/Q bits are also saved, they need some
+qemu modifications to be recognized and passed around to be restored.
+KVM_XICS_PENDING bit set and saved should also indicate
+KVM_XICS_PRESENTED bit set and saved. But it is possible some old
+code doesn't have/recognize the P bit, so when we restore, we set P
+for PENDING bit, too.
+
+The idea and much of the code come from Ben.
+
+	Signed-off-by: Li Zhong <zhong@linux.vnet.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 17d48610ae0fa218aa386b16a538c792991a3652)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv_rm_xics.c
+#	arch/powerpc/kvm/book3s_xics.c
+diff --cc arch/powerpc/kvm/book3s_hv_rm_xics.c
+index 37eb41dc50c9,30f82c79de5d..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rm_xics.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_xics.c
+@@@ -578,8 -678,63 +578,68 @@@ static int ics_rm_eoi(struct kvm_vcpu *
+  	struct kvmppc_icp *icp = vcpu->arch.icp;
+  	struct kvmppc_ics *ics;
+  	struct ics_irq_state *state;
+- 	u32 irq = xirr & 0x00ffffff;
+  	u16 src;
++ 	u32 pq_old, pq_new;
++ 
++ 	/*
++ 	 * ICS EOI handling: For LSI, if P bit is still set, we need to
++ 	 * resend it.
++ 	 *
++ 	 * For MSI, we move Q bit into P (and clear Q). If it is set,
++ 	 * resend it.
++ 	 */
++ 
++ 	ics = kvmppc_xics_find_ics(xics, irq, &src);
++ 	if (!ics)
++ 		goto bail;
++ 
++ 	state = &ics->irq_state[src];
++ 
++ 	if (state->lsi)
++ 		pq_new = state->pq_state;
++ 	else
++ 		do {
++ 			pq_old = state->pq_state;
++ 			pq_new = pq_old >> 1;
++ 		} while (cmpxchg(&state->pq_state, pq_old, pq_new) != pq_old);
++ 
++ 	if (pq_new & PQ_PRESENTED)
++ 		icp_rm_deliver_irq(xics, NULL, irq);
++ 
++ 	if (!hlist_empty(&vcpu->kvm->irq_ack_notifier_list)) {
++ 		icp->rm_action |= XICS_RM_NOTIFY_EOI;
++ 		icp->rm_eoied_irq = irq;
++ 	}
+++<<<<<<< HEAD
+++ bail:
+++	return check_too_hard(xics, icp);
+++}
+++=======
++ 
++ 	if (state->host_irq) {
++ 		++vcpu->stat.pthru_all;
++ 		if (state->intr_cpu != -1) {
++ 			int pcpu = raw_smp_processor_id();
++ 
++ 			pcpu = cpu_first_thread_sibling(pcpu);
++ 			++vcpu->stat.pthru_host;
++ 			if (state->intr_cpu != pcpu) {
++ 				++vcpu->stat.pthru_bad_aff;
++ 				xics_opal_rm_set_server(state->host_irq, pcpu);
++ 			}
++ 			state->intr_cpu = -1;
++ 		}
++ 	}
++ 
++  bail:
++ 	return check_too_hard(xics, icp);
++ }
++ 
++ int kvmppc_rm_h_eoi(struct kvm_vcpu *vcpu, unsigned long xirr)
++ {
++ 	struct kvmppc_xics *xics = vcpu->kvm->arch.xics;
++ 	struct kvmppc_icp *icp = vcpu->arch.icp;
++ 	u32 irq = xirr & 0x00ffffff;
+  
+  	if (!xics || !xics->real_mode)
+  		return H_TOO_HARD;
+@@@ -602,26 -757,168 +662,169 @@@
+  
+  	/* IPIs have no EOI */
+  	if (irq == XICS_IPI)
+- 		goto bail;
+- 	/*
+- 	 * EOI handling: If the interrupt is still asserted, we need to
+- 	 * resend it. We can take a lockless "peek" at the ICS state here.
+- 	 *
+- 	 * "Message" interrupts will never have "asserted" set
+- 	 */
++ 		return check_too_hard(xics, icp);
++ 
++ 	return ics_rm_eoi(vcpu, irq);
++ }
++ 
++ unsigned long eoi_rc;
++ 
++ static void icp_eoi(struct irq_chip *c, u32 hwirq, __be32 xirr, bool *again)
++ {
++ 	unsigned long xics_phys;
++ 	int64_t rc;
++ 
++ 	rc = pnv_opal_pci_msi_eoi(c, hwirq);
++ 
++ 	if (rc)
++ 		eoi_rc = rc;
++ 
++ 	iosync();
++ 
++ 	/* EOI it */
++ 	xics_phys = local_paca->kvm_hstate.xics_phys;
++ 	if (xics_phys) {
++ 		_stwcix(xics_phys + XICS_XIRR, xirr);
++ 	} else {
++ 		rc = opal_rm_int_eoi(be32_to_cpu(xirr));
++ 		*again = rc > 0;
++ 	}
++ }
++ 
++ static int xics_opal_rm_set_server(unsigned int hw_irq, int server_cpu)
++ {
++ 	unsigned int mangle_cpu = get_hard_smp_processor_id(server_cpu) << 2;
++ 
++ 	return opal_rm_set_xive(hw_irq, mangle_cpu, DEFAULT_PRIORITY);
++ }
++ 
++ /*
++  * Increment a per-CPU 32-bit unsigned integer variable.
++  * Safe to call in real-mode. Handles vmalloc'ed addresses
++  *
++  * ToDo: Make this work for any integral type
++  */
++ 
++ static inline void this_cpu_inc_rm(unsigned int __percpu *addr)
++ {
++ 	unsigned long l;
++ 	unsigned int *raddr;
++ 	int cpu = smp_processor_id();
++ 
++ 	raddr = per_cpu_ptr(addr, cpu);
++ 	l = (unsigned long)raddr;
++ 
++ 	if (REGION_ID(l) == VMALLOC_REGION_ID) {
++ 		l = vmalloc_to_phys(raddr);
++ 		raddr = (unsigned int *)l;
++ 	}
++ 	++*raddr;
++ }
++ 
++ /*
++  * We don't try to update the flags in the irq_desc 'istate' field in
++  * here as would happen in the normal IRQ handling path for several reasons:
++  *  - state flags represent internal IRQ state and are not expected to be
++  *    updated outside the IRQ subsystem
++  *  - more importantly, these are useful for edge triggered interrupts,
++  *    IRQ probing, etc., but we are only handling MSI/MSIx interrupts here
++  *    and these states shouldn't apply to us.
++  *
++  * However, we do update irq_stats - we somewhat duplicate the code in
++  * kstat_incr_irqs_this_cpu() for this since this function is defined
++  * in irq/internal.h which we don't want to include here.
++  * The only difference is that desc->kstat_irqs is an allocated per CPU
++  * variable and could have been vmalloc'ed, so we can't directly
++  * call __this_cpu_inc() on it. The kstat structure is a static
++  * per CPU variable and it should be accessible by real-mode KVM.
++  *
++  */
++ static void kvmppc_rm_handle_irq_desc(struct irq_desc *desc)
++ {
++ 	this_cpu_inc_rm(desc->kstat_irqs);
++ 	__this_cpu_inc(kstat.irqs_sum);
++ }
++ 
++ long kvmppc_deliver_irq_passthru(struct kvm_vcpu *vcpu,
++ 				 __be32 xirr,
++ 				 struct kvmppc_irq_map *irq_map,
++ 				 struct kvmppc_passthru_irqmap *pimap,
++ 				 bool *again)
++ {
++ 	struct kvmppc_xics *xics;
++ 	struct kvmppc_icp *icp;
++ 	struct kvmppc_ics *ics;
++ 	struct ics_irq_state *state;
++ 	u32 irq;
++ 	u16 src;
++ 	u32 pq_old, pq_new;
++ 
++ 	irq = irq_map->v_hwirq;
++ 	xics = vcpu->kvm->arch.xics;
++ 	icp = vcpu->arch.icp;
++ 
++ 	kvmppc_rm_handle_irq_desc(irq_map->desc);
++ 
+  	ics = kvmppc_xics_find_ics(xics, irq, &src);
+  	if (!ics)
+- 		goto bail;
++ 		return 2;
++ 
+  	state = &ics->irq_state[src];
+  
+- 	/* Still asserted, resend it */
+- 	if (state->asserted)
++ 	/* only MSIs register bypass producers, so it must be MSI here */
++ 	do {
++ 		pq_old = state->pq_state;
++ 		pq_new = ((pq_old << 1) & 3) | PQ_PRESENTED;
++ 	} while (cmpxchg(&state->pq_state, pq_old, pq_new) != pq_old);
++ 
++ 	/* Test P=1, Q=0, this is the only case where we present */
++ 	if (pq_new == PQ_PRESENTED)
+  		icp_rm_deliver_irq(xics, icp, irq);
+  
+- 	if (!hlist_empty(&vcpu->kvm->irq_ack_notifier_list)) {
+- 		icp->rm_action |= XICS_RM_NOTIFY_EOI;
+- 		icp->rm_eoied_irq = irq;
++ 	/* EOI the interrupt */
++ 	icp_eoi(irq_desc_get_chip(irq_map->desc), irq_map->r_hwirq, xirr,
++ 		again);
++ 
++ 	if (check_too_hard(xics, icp) == H_TOO_HARD)
++ 		return 2;
++ 	else
++ 		return -2;
++ }
++ 
++ /*  --- Non-real mode XICS-related built-in routines ---  */
++ 
++ /**
++  * Host Operations poked by RM KVM
++  */
++ static void rm_host_ipi_action(int action, void *data)
++ {
++ 	switch (action) {
++ 	case XICS_RM_KICK_VCPU:
++ 		kvmppc_host_rm_ops_hv->vcpu_kick(data);
++ 		break;
++ 	default:
++ 		WARN(1, "Unexpected rm_action=%d data=%p\n", action, data);
++ 		break;
++ 	}
++ 
++ }
++ 
++ void kvmppc_xics_ipi_action(void)
++ {
++ 	int core;
++ 	unsigned int cpu = smp_processor_id();
++ 	struct kvmppc_host_rm_core *rm_corep;
++ 
++ 	core = cpu >> threads_shift;
++ 	rm_corep = &kvmppc_host_rm_ops_hv->rm_core[core];
++ 
++ 	if (rm_corep->rm_data) {
++ 		rm_host_ipi_action(rm_corep->rm_state.rm_action,
++ 							rm_corep->rm_data);
++ 		/* Order these stores against the real mode KVM */
++ 		rm_corep->rm_data = NULL;
++ 		smp_wmb();
++ 		rm_corep->rm_state.rm_action = 0;
+  	}
+-  bail:
+- 	return check_too_hard(xics, icp);
+  }
+++>>>>>>> 17d48610ae0f (KVM: PPC: Book 3S: XICS: Implement ICS P/Q states)
+diff --cc arch/powerpc/kvm/book3s_xics.c
+index 5543482c55d7,c7620622c846..000000000000
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@@ -87,20 -88,40 +88,45 @@@ static int ics_deliver_irq(struct kvmpp
+  	if (!state->exists)
+  		return -EINVAL;
+  
++ 	if (level == KVM_INTERRUPT_SET_LEVEL || level == KVM_INTERRUPT_SET)
++ 		level = 1;
++ 	else if (level == KVM_INTERRUPT_UNSET)
++ 		level = 0;
+  	/*
+- 	 * We set state->asserted locklessly. This should be fine as
+- 	 * we are the only setter, thus concurrent access is undefined
+- 	 * to begin with.
++ 	 * Take other values the same as 1, consistent with original code.
++ 	 * maybe WARN here?
+  	 */
+- 	if ((level == 1 && state->lsi) || level == KVM_INTERRUPT_SET_LEVEL)
+- 		state->asserted = 1;
+- 	else if (level == 0 || level == KVM_INTERRUPT_UNSET) {
+- 		state->asserted = 0;
++ 
++ 	if (!state->lsi && level == 0) /* noop for MSI */
+  		return 0;
+- 	}
+  
++ 	do {
++ 		pq_old = state->pq_state;
++ 		if (state->lsi) {
++ 			if (level) {
++ 				if (pq_old & PQ_PRESENTED)
++ 					/* Setting already set LSI ... */
++ 					return 0;
++ 
++ 				pq_new = PQ_PRESENTED;
++ 			} else
++ 				pq_new = 0;
++ 		} else
++ 			pq_new = ((pq_old << 1) & 3) | PQ_PRESENTED;
++ 	} while (cmpxchg(&state->pq_state, pq_old, pq_new) != pq_old);
++ 
++ 	/* Test P=1, Q=0, this is the only case where we present */
++ 	if (pq_new == PQ_PRESENTED)
++ 		icp_deliver_irq(xics, NULL, irq);
++ 
+++<<<<<<< HEAD
+ +	/* Attempt delivery */
+ +	icp_deliver_irq(xics, NULL, irq);
+++=======
++ 	/* Record which CPU this arrived on for passed-through interrupts */
++ 	if (state->host_irq)
++ 		state->intr_cpu = raw_smp_processor_id();
+++>>>>>>> 17d48610ae0f (KVM: PPC: Book 3S: XICS: Implement ICS P/Q states)
+  
+  	return 0;
+  }
+@@@ -794,29 -852,11 +857,11 @@@ static noinline int kvmppc_h_eoi(struc
+  	/* IPIs have no EOI */
+  	if (irq == XICS_IPI)
+  		return H_SUCCESS;
+- 	/*
+- 	 * EOI handling: If the interrupt is still asserted, we need to
+- 	 * resend it. We can take a lockless "peek" at the ICS state here.
+- 	 *
+- 	 * "Message" interrupts will never have "asserted" set
+- 	 */
+- 	ics = kvmppc_xics_find_ics(xics, irq, &src);
+- 	if (!ics) {
+- 		XICS_DBG("h_eoi: IRQ 0x%06x not found !\n", irq);
+- 		return H_PARAMETER;
+- 	}
+- 	state = &ics->irq_state[src];
+- 
+- 	/* Still asserted, resend it */
+- 	if (state->asserted)
+- 		icp_deliver_irq(xics, icp, irq);
+- 
+- 	kvm_notify_acked_irq(vcpu->kvm, 0, irq);
+  
+- 	return H_SUCCESS;
++ 	return ics_eoi(vcpu, irq);
+  }
+  
+ -int kvmppc_xics_rm_complete(struct kvm_vcpu *vcpu, u32 hcall)
+ +static noinline int kvmppc_xics_rm_complete(struct kvm_vcpu *vcpu, u32 hcall)
+  {
+  	struct kvmppc_xics *xics = vcpu->kvm->arch.xics;
+  	struct kvmppc_icp *icp = vcpu->arch.icp;
+diff --git a/arch/powerpc/include/uapi/asm/kvm.h b/arch/powerpc/include/uapi/asm/kvm.h
+index 15f2d16d2a7e..a7b23d489043 100644
+--- a/arch/powerpc/include/uapi/asm/kvm.h
++++ b/arch/powerpc/include/uapi/asm/kvm.h
+@@ -591,5 +591,7 @@ struct kvm_get_htab_header {
+ #define  KVM_XICS_LEVEL_SENSITIVE	(1ULL << 40)
+ #define  KVM_XICS_MASKED		(1ULL << 41)
+ #define  KVM_XICS_PENDING		(1ULL << 42)
++#define  KVM_XICS_PRESENTED		(1ULL << 43)
++#define  KVM_XICS_QUEUED		(1ULL << 44)
+ 
+ #endif /* __LINUX_KVM_POWERPC_H */
+* Unmerged path arch/powerpc/kvm/book3s_hv_rm_xics.c
+* Unmerged path arch/powerpc/kvm/book3s_xics.c
+diff --git a/arch/powerpc/kvm/book3s_xics.h b/arch/powerpc/kvm/book3s_xics.h
+index 129f5b2691a5..5ee69ab48d89 100644
+--- a/arch/powerpc/kvm/book3s_xics.h
++++ b/arch/powerpc/kvm/book3s_xics.h
+@@ -31,16 +31,19 @@
+ /* Priority value to use for disabling an interrupt */
+ #define MASKED	0xff
+ 
++#define PQ_PRESENTED	1
++#define PQ_QUEUED	2
++
+ /* State for one irq source */
+ struct ics_irq_state {
+ 	u32 number;
+ 	u32 server;
++	u32 pq_state;
+ 	u8  priority;
+ 	u8  saved_priority;
+ 	u8  resend;
+ 	u8  masked_pending;
+ 	u8  lsi;		/* level-sensitive interrupt */
+-	u8  asserted; /* Only for LSI */
+ 	u8  exists;
+ };
+ 
