@@ -1,0 +1,221 @@
+x86/mce: Detect and use SMCA-specific msr_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mce: Detect and use SMCA-specific msr_ops (David Arcari) [1389383]
+Rebuild_FUZZ: 95.35%
+commit-author Yazen Ghannam <Yazen.Ghannam@amd.com>
+commit d9d73fcc878469d209d7a7030726f20dd10841a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d9d73fcc.failed
+
+Replace all calls to MCx_IA32_{CTL,ADDR,MISC,STATUS} with the
+appropriate msr_ops.
+
+Use SMCA-specific msr_ops when on an SMCA-enabled processor.
+
+Carved out from a patch by Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>.
+
+	Signed-off-by: Yazen Ghannam <Yazen.Ghannam@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Aravind Gopalakrishnan <aravindksg.lkml@gmail.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/1462019637-16474-6-git-send-email-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit d9d73fcc878469d209d7a7030726f20dd10841a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce_amd.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce_amd.c
+index f6a10e3f36cb,c594680c36f2..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce_amd.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+@@@ -272,6 -301,51 +272,54 @@@ static void deferred_error_interrupt_en
+  	wrmsr(MSR_CU_DEF_ERR, low, high);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 get_block_address(u32 current_addr, u32 low, u32 high,
++ 			     unsigned int bank, unsigned int block)
++ {
++ 	u32 addr = 0, offset = 0;
++ 
++ 	if (mce_flags.smca) {
++ 		if (!block) {
++ 			addr = MSR_AMD64_SMCA_MCx_MISC(bank);
++ 		} else {
++ 			/*
++ 			 * For SMCA enabled processors, BLKPTR field of the
++ 			 * first MISC register (MCx_MISC0) indicates presence of
++ 			 * additional MISC register set (MISC1-4).
++ 			 */
++ 			u32 low, high;
++ 
++ 			if (rdmsr_safe(MSR_AMD64_SMCA_MCx_CONFIG(bank), &low, &high))
++ 				return addr;
++ 
++ 			if (!(low & MCI_CONFIG_MCAX))
++ 				return addr;
++ 
++ 			if (!rdmsr_safe(MSR_AMD64_SMCA_MCx_MISC(bank), &low, &high) &&
++ 			    (low & MASK_BLKPTR_LO))
++ 				addr = MSR_AMD64_SMCA_MCx_MISCy(bank, block - 1);
++ 		}
++ 		return addr;
++ 	}
++ 
++ 	/* Fall back to method we used for older processors: */
++ 	switch (block) {
++ 	case 0:
++ 		addr = msr_ops.misc(bank);
++ 		break;
++ 	case 1:
++ 		offset = ((low & MASK_BLKPTR_LO) >> 21);
++ 		if (offset)
++ 			addr = MCG_XBLK_ADDR + offset;
++ 		break;
++ 	default:
++ 		addr = ++current_addr;
++ 	}
++ 	return addr;
++ }
++ 
+++>>>>>>> d9d73fcc8784 (x86/mce: Detect and use SMCA-specific msr_ops)
+  static int
+  prepare_threshold_block(unsigned int bank, unsigned int block, u32 addr,
+  			int offset, u32 misc_high)
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 1bfa973429e1..aea7c70e5c74 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -354,11 +354,11 @@ static int msr_to_offset(u32 msr)
+ 
+ 	if (msr == mca_cfg.rip_msr)
+ 		return offsetof(struct mce, ip);
+-	if (msr == MSR_IA32_MCx_STATUS(bank))
++	if (msr == msr_ops.status(bank))
+ 		return offsetof(struct mce, status);
+-	if (msr == MSR_IA32_MCx_ADDR(bank))
++	if (msr == msr_ops.addr(bank))
+ 		return offsetof(struct mce, addr);
+-	if (msr == MSR_IA32_MCx_MISC(bank))
++	if (msr == msr_ops.misc(bank))
+ 		return offsetof(struct mce, misc);
+ 	if (msr == MSR_IA32_MCG_STATUS)
+ 		return offsetof(struct mce, mcgstatus);
+@@ -521,9 +521,9 @@ static struct notifier_block mce_srao_nb = {
+ static void mce_read_aux(struct mce *m, int i)
+ {
+ 	if (m->status & MCI_STATUS_MISCV)
+-		m->misc = mce_rdmsrl(MSR_IA32_MCx_MISC(i));
++		m->misc = mce_rdmsrl(msr_ops.misc(i));
+ 	if (m->status & MCI_STATUS_ADDRV) {
+-		m->addr = mce_rdmsrl(MSR_IA32_MCx_ADDR(i));
++		m->addr = mce_rdmsrl(msr_ops.addr(i));
+ 
+ 		/*
+ 		 * Mask the reported address by the reported granularity.
+@@ -605,7 +605,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+ 		m.tsc = 0;
+ 
+ 		barrier();
+-		m.status = mce_rdmsrl(MSR_IA32_MCx_STATUS(i));
++		m.status = mce_rdmsrl(msr_ops.status(i));
+ 		if (!(m.status & MCI_STATUS_VAL))
+ 			continue;
+ 
+@@ -652,7 +652,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
+ 		/*
+ 		 * Clear state for this bank.
+ 		 */
+-		mce_wrmsrl(MSR_IA32_MCx_STATUS(i), 0);
++		mce_wrmsrl(msr_ops.status(i), 0);
+ 	}
+ 
+ 	/*
+@@ -677,7 +677,7 @@ static int mce_no_way_out(struct mce *m, char **msg, unsigned long *validp,
+ 	char *tmp;
+ 
+ 	for (i = 0; i < mca_cfg.banks; i++) {
+-		m->status = mce_rdmsrl(MSR_IA32_MCx_STATUS(i));
++		m->status = mce_rdmsrl(msr_ops.status(i));
+ 		if (m->status & MCI_STATUS_VAL) {
+ 			__set_bit(i, validp);
+ 			if (quirk_no_way_out)
+@@ -955,7 +955,7 @@ static void mce_clear_state(unsigned long *toclear)
+ 
+ 	for (i = 0; i < mca_cfg.banks; i++) {
+ 		if (test_bit(i, toclear))
+-			mce_wrmsrl(MSR_IA32_MCx_STATUS(i), 0);
++			mce_wrmsrl(msr_ops.status(i), 0);
+ 	}
+ }
+ 
+@@ -1060,7 +1060,7 @@ void do_machine_check(struct pt_regs *regs, long error_code)
+ 		m.addr = 0;
+ 		m.bank = i;
+ 
+-		m.status = mce_rdmsrl(MSR_IA32_MCx_STATUS(i));
++		m.status = mce_rdmsrl(msr_ops.status(i));
+ 		if ((m.status & MCI_STATUS_VAL) == 0)
+ 			continue;
+ 
+@@ -1432,8 +1432,8 @@ static void __mcheck_cpu_init_generic(void)
+ 
+ 		if (!b->init)
+ 			continue;
+-		wrmsrl(MSR_IA32_MCx_CTL(i), b->ctl);
+-		wrmsrl(MSR_IA32_MCx_STATUS(i), 0);
++		wrmsrl(msr_ops.ctl(i), b->ctl);
++		wrmsrl(msr_ops.status(i), 0);
+ 	}
+ }
+ 
+@@ -1612,6 +1612,16 @@ static void __mcheck_cpu_init_vendor(struct cpuinfo_x86 *c)
+ 		mce_flags.overflow_recov = !!(ebx & BIT(0));
+ 		mce_flags.succor	 = !!(ebx & BIT(1));
+ 		mce_flags.smca		 = !!(ebx & BIT(3));
++
++		/*
++		 * Install proper ops for Scalable MCA enabled processors
++		 */
++		if (mce_flags.smca) {
++			msr_ops.ctl	= smca_ctl_reg;
++			msr_ops.status	= smca_status_reg;
++			msr_ops.addr	= smca_addr_reg;
++			msr_ops.misc	= smca_misc_reg;
++		}
+ 		mce_amd_feature_init(c);
+ 
+ 		break;
+@@ -2059,7 +2069,7 @@ static void mce_disable_error_reporting(void)
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		if (b->init)
+-			wrmsrl(MSR_IA32_MCx_CTL(i), 0);
++			wrmsrl(msr_ops.ctl(i), 0);
+ 	}
+ 	return;
+ }
+@@ -2390,7 +2400,7 @@ static void mce_reenable_cpu(void *h)
+ 		struct mce_bank *b = &mce_banks[i];
+ 
+ 		if (b->init)
+-			wrmsrl(MSR_IA32_MCx_CTL(i), b->ctl);
++			wrmsrl(msr_ops.ctl(i), b->ctl);
+ 	}
+ }
+ 
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce_amd.c
