@@ -1,0 +1,129 @@
+ibmvnic: Correct return code checking for ibmvnic_init during probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 6d659237657c64e9e2a930865da4c777239b678e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6d659237.failed
+
+The update to ibmvnic_init to allow an EAGAIN return code broke
+the calling of ibmvnic_init from ibmvnic_probe. The code now
+will return from this point in the probe routine if anything
+other than EAGAIN is returned. The check should be to see if rc
+is non-zero and not equal to EAGAIN.
+
+Without this fix, the vNIC driver can return 0 (success) from
+its probe routine due to ibmvnic_init returning zero, but before
+completing the probe process and registering with the netdev layer.
+
+Fixes: 6a2fb0e99f9c (ibmvnic: driver initialization for kdump/kexec)
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d659237657c64e9e2a930865da4c777239b678e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 0396d573827d,87db1eb5cc44..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -3879,77 -3713,33 +3879,84 @@@ static int ibmvnic_probe(struct vio_de
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+  
+ -	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
+ -	INIT_LIST_HEAD(&adapter->rwi_list);
+ -	mutex_init(&adapter->reset_lock);
+ -	mutex_init(&adapter->rwi_lock);
+ -	adapter->resetting = false;
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+  
+  	do {
+++<<<<<<< HEAD
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+++=======
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc && rc != EAGAIN) {
++ 			free_netdev(netdev);
++ 			return rc;
+++>>>>>>> 6d659237657c (ibmvnic: Correct return code checking for ibmvnic_init during probe)
+  		}
+ -	} while (rc == EAGAIN);
+ -
+ -	netdev->mtu = adapter->req_mtu - ETH_HLEN;
+ +	} while (adapter->renegotiate);
+  
+ -	rc = device_create_file(&dev->dev, &dev_attr_failover);
+ +	rc = init_sub_crq_irqs(adapter);
+  	if (rc) {
+ -		free_netdev(netdev);
+ -		return rc;
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+  	}
+  
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+ +
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
