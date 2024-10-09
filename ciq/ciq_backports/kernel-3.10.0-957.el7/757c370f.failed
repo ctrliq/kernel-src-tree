@@ -1,0 +1,125 @@
+iommu/iova: Sort out rbtree limit_pfn handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iommu] iova: Sort out rbtree limit_pfn handling (Jerry Snitselaar) [1519117]
+Rebuild_FUZZ: 93.02%
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 757c370f036e1f9f9a816cd481a13cdbcb346eb9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/757c370f.failed
+
+When walking the rbtree, the fact that iovad->start_pfn and limit_pfn
+are both inclusive limits creates an ambiguity once limit_pfn reaches
+the bottom of the address space and they overlap. Commit 5016bdb796b3
+("iommu/iova: Fix underflow bug in __alloc_and_insert_iova_range") fixed
+the worst side-effect of this, that of underflow wraparound leading to
+bogus allocations, but the remaining fallout is that any attempt to
+allocate start_pfn itself erroneously fails.
+
+The cleanest way to resolve the ambiguity is to simply make limit_pfn an
+exclusive limit when inside the guts of the rbtree. Since we're working
+with PFNs, representing one past the top of the address space is always
+possible without fear of overflow, and elsewhere it just makes life a
+little more straightforward.
+
+	Reported-by: Aaron Sierra <asierra@xes-inc.com>
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 757c370f036e1f9f9a816cd481a13cdbcb346eb9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iova.c
+diff --cc drivers/iommu/iova.c
+index f106fd9782bf,3f24c9a831c9..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -62,8 -62,8 +62,13 @@@ __get_cached_rbnode(struct iova_domain 
+  	else {
+  		struct rb_node *prev_node = rb_prev(iovad->cached32_node);
+  		struct iova *curr_iova =
+++<<<<<<< HEAD
+ +			container_of(iovad->cached32_node, struct iova, node);
+ +		*limit_pfn = curr_iova->pfn_lo - 1;
+++=======
++ 			rb_entry(iovad->cached32_node, struct iova, node);
++ 		*limit_pfn = curr_iova->pfn_lo;
+++>>>>>>> 757c370f036e (iommu/iova: Sort out rbtree limit_pfn handling)
+  		return prev_node;
+  	}
+  }
+@@@ -125,20 -153,17 +130,17 @@@ static int __alloc_and_insert_iova_rang
+  	curr = __get_cached_rbnode(iovad, &limit_pfn);
+  	prev = curr;
+  	while (curr) {
+ -		struct iova *curr_iova = rb_entry(curr, struct iova, node);
+ +		struct iova *curr_iova = container_of(curr, struct iova, node);
+  
+- 		if (limit_pfn < curr_iova->pfn_lo)
++ 		if (limit_pfn <= curr_iova->pfn_lo) {
+  			goto move_left;
+- 		else if (limit_pfn < curr_iova->pfn_hi)
+- 			goto adjust_limit_pfn;
+- 		else {
++ 		} else if (limit_pfn > curr_iova->pfn_hi) {
+  			if (size_aligned)
+  				pad_size = iova_get_pad_size(size, limit_pfn);
+- 			if ((curr_iova->pfn_hi + size + pad_size) <= limit_pfn)
++ 			if ((curr_iova->pfn_hi + size + pad_size) < limit_pfn)
+  				break;	/* found a free slot */
+  		}
+- adjust_limit_pfn:
+- 		limit_pfn = curr_iova->pfn_lo ? (curr_iova->pfn_lo - 1) : 0;
++ 		limit_pfn = curr_iova->pfn_lo;
+  move_left:
+  		prev = curr;
+  		curr = rb_prev(curr);
+@@@ -154,39 -179,11 +156,39 @@@
+  	}
+  
+  	/* pfn_lo will point to size aligned address if size_aligned is set */
+- 	new->pfn_lo = limit_pfn - (size + pad_size) + 1;
++ 	new->pfn_lo = limit_pfn - (size + pad_size);
+  	new->pfn_hi = new->pfn_lo + size - 1;
+  
+ -	/* If we have 'prev', it's a valid place to start the insertion. */
+ -	iova_insert_rbtree(&iovad->rbroot, new, prev);
+ +	/* Insert the new_iova into domain rbtree by holding writer lock */
+ +	/* Add new node and rebalance tree. */
+ +	{
+ +		struct rb_node **entry, *parent = NULL;
+ +
+ +		/* If we have 'prev', it's a valid place to start the
+ +		   insertion. Otherwise, start from the root. */
+ +		if (prev)
+ +			entry = &prev;
+ +		else
+ +			entry = &iovad->rbroot.rb_node;
+ +
+ +		/* Figure out where to put new node */
+ +		while (*entry) {
+ +			struct iova *this = container_of(*entry,
+ +							struct iova, node);
+ +			parent = *entry;
+ +
+ +			if (new->pfn_lo < this->pfn_lo)
+ +				entry = &((*entry)->rb_left);
+ +			else if (new->pfn_lo > this->pfn_lo)
+ +				entry = &((*entry)->rb_right);
+ +			else
+ +				BUG(); /* this should not happen */
+ +		}
+ +
+ +		/* Add new node and rebalance tree. */
+ +		rb_link_node(&new->node, parent, entry);
+ +		rb_insert_color(&new->node, &iovad->rbroot);
+ +	}
+  	__cached_rbnode_insert_update(iovad, saved_pfn, new);
+  
+  	spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/iova.c
