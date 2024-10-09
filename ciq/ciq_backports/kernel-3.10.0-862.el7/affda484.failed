@@ -1,0 +1,431 @@
+trim fsnotify hooks a bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit affda48410a5bbfd516def60bbc97f2683cd9f7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/affda484.failed
+
+fsnotify_d_move()/__fsnotify_d_instantiate()/__fsnotify_update_dcache_flags()
+are identical to each other, regardless of the config.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit affda48410a5bbfd516def60bbc97f2683cd9f7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/dcache.c
+index e518a196fb4f,f9c63c108881..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1532,15 -1762,15 +1532,23 @@@ static unsigned d_flags_for_inode(struc
+  static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+  {
+  	unsigned add_flags = d_flags_for_inode(inode);
+ -	WARN_ON(d_in_lookup(dentry));
+  
+  	spin_lock(&dentry->d_lock);
+++<<<<<<< HEAD
+ +	__d_set_type(dentry, add_flags);
+ +	if (inode)
+ +		hlist_add_head(&dentry->d_alias, &inode->i_dentry);
+ +	dentry->d_inode = inode;
+ +	dentry_rcuwalk_barrier(dentry);
+++=======
++ 	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 	raw_write_seqcount_begin(&dentry->d_seq);
++ 	__d_set_inode_and_type(dentry, inode, add_flags);
++ 	raw_write_seqcount_end(&dentry->d_seq);
++ 	fsnotify_update_flags(dentry);
+++>>>>>>> affda48410a5 (trim fsnotify hooks a bit)
+  	spin_unlock(&dentry->d_lock);
+ +	fsnotify_d_instantiate(dentry, inode);
+  }
+  
+  /**
+@@@ -2284,6 -2383,265 +2292,268 @@@ void d_rehash(struct dentry * entry
+  }
+  EXPORT_SYMBOL(d_rehash);
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned start_dir_add(struct inode *dir)
++ {
++ 
++ 	for (;;) {
++ 		unsigned n = dir->i_dir_seq;
++ 		if (!(n & 1) && cmpxchg(&dir->i_dir_seq, n, n + 1) == n)
++ 			return n;
++ 		cpu_relax();
++ 	}
++ }
++ 
++ static inline void end_dir_add(struct inode *dir, unsigned n)
++ {
++ 	smp_store_release(&dir->i_dir_seq, n + 2);
++ }
++ 
++ static void d_wait_lookup(struct dentry *dentry)
++ {
++ 	if (d_in_lookup(dentry)) {
++ 		DECLARE_WAITQUEUE(wait, current);
++ 		add_wait_queue(dentry->d_wait, &wait);
++ 		do {
++ 			set_current_state(TASK_UNINTERRUPTIBLE);
++ 			spin_unlock(&dentry->d_lock);
++ 			schedule();
++ 			spin_lock(&dentry->d_lock);
++ 		} while (d_in_lookup(dentry));
++ 	}
++ }
++ 
++ struct dentry *d_alloc_parallel(struct dentry *parent,
++ 				const struct qstr *name,
++ 				wait_queue_head_t *wq)
++ {
++ 	unsigned int len = name->len;
++ 	unsigned int hash = name->hash;
++ 	const unsigned char *str = name->name;
++ 	struct hlist_bl_head *b = in_lookup_hash(parent, hash);
++ 	struct hlist_bl_node *node;
++ 	struct dentry *new = d_alloc(parent, name);
++ 	struct dentry *dentry;
++ 	unsigned seq, r_seq, d_seq;
++ 
++ 	if (unlikely(!new))
++ 		return ERR_PTR(-ENOMEM);
++ 
++ retry:
++ 	rcu_read_lock();
++ 	seq = smp_load_acquire(&parent->d_inode->i_dir_seq) & ~1;
++ 	r_seq = read_seqbegin(&rename_lock);
++ 	dentry = __d_lookup_rcu(parent, name, &d_seq);
++ 	if (unlikely(dentry)) {
++ 		if (!lockref_get_not_dead(&dentry->d_lockref)) {
++ 			rcu_read_unlock();
++ 			goto retry;
++ 		}
++ 		if (read_seqcount_retry(&dentry->d_seq, d_seq)) {
++ 			rcu_read_unlock();
++ 			dput(dentry);
++ 			goto retry;
++ 		}
++ 		rcu_read_unlock();
++ 		dput(new);
++ 		return dentry;
++ 	}
++ 	if (unlikely(read_seqretry(&rename_lock, r_seq))) {
++ 		rcu_read_unlock();
++ 		goto retry;
++ 	}
++ 	hlist_bl_lock(b);
++ 	if (unlikely(parent->d_inode->i_dir_seq != seq)) {
++ 		hlist_bl_unlock(b);
++ 		rcu_read_unlock();
++ 		goto retry;
++ 	}
++ 	rcu_read_unlock();
++ 	/*
++ 	 * No changes for the parent since the beginning of d_lookup().
++ 	 * Since all removals from the chain happen with hlist_bl_lock(),
++ 	 * any potential in-lookup matches are going to stay here until
++ 	 * we unlock the chain.  All fields are stable in everything
++ 	 * we encounter.
++ 	 */
++ 	hlist_bl_for_each_entry(dentry, node, b, d_u.d_in_lookup_hash) {
++ 		if (dentry->d_name.hash != hash)
++ 			continue;
++ 		if (dentry->d_parent != parent)
++ 			continue;
++ 		if (d_unhashed(dentry))
++ 			continue;
++ 		if (parent->d_flags & DCACHE_OP_COMPARE) {
++ 			int tlen = dentry->d_name.len;
++ 			const char *tname = dentry->d_name.name;
++ 			if (parent->d_op->d_compare(parent, dentry, tlen, tname, name))
++ 				continue;
++ 		} else {
++ 			if (dentry->d_name.len != len)
++ 				continue;
++ 			if (dentry_cmp(dentry, str, len))
++ 				continue;
++ 		}
++ 		dget(dentry);
++ 		hlist_bl_unlock(b);
++ 		/* somebody is doing lookup for it right now; wait for it */
++ 		spin_lock(&dentry->d_lock);
++ 		d_wait_lookup(dentry);
++ 		/*
++ 		 * it's not in-lookup anymore; in principle we should repeat
++ 		 * everything from dcache lookup, but it's likely to be what
++ 		 * d_lookup() would've found anyway.  If it is, just return it;
++ 		 * otherwise we really have to repeat the whole thing.
++ 		 */
++ 		if (unlikely(dentry->d_name.hash != hash))
++ 			goto mismatch;
++ 		if (unlikely(dentry->d_parent != parent))
++ 			goto mismatch;
++ 		if (unlikely(d_unhashed(dentry)))
++ 			goto mismatch;
++ 		if (parent->d_flags & DCACHE_OP_COMPARE) {
++ 			int tlen = dentry->d_name.len;
++ 			const char *tname = dentry->d_name.name;
++ 			if (parent->d_op->d_compare(parent, dentry, tlen, tname, name))
++ 				goto mismatch;
++ 		} else {
++ 			if (unlikely(dentry->d_name.len != len))
++ 				goto mismatch;
++ 			if (unlikely(dentry_cmp(dentry, str, len)))
++ 				goto mismatch;
++ 		}
++ 		/* OK, it *is* a hashed match; return it */
++ 		spin_unlock(&dentry->d_lock);
++ 		dput(new);
++ 		return dentry;
++ 	}
++ 	/* we can't take ->d_lock here; it's OK, though. */
++ 	new->d_flags |= DCACHE_PAR_LOOKUP;
++ 	new->d_wait = wq;
++ 	hlist_bl_add_head_rcu(&new->d_u.d_in_lookup_hash, b);
++ 	hlist_bl_unlock(b);
++ 	return new;
++ mismatch:
++ 	spin_unlock(&dentry->d_lock);
++ 	dput(dentry);
++ 	goto retry;
++ }
++ EXPORT_SYMBOL(d_alloc_parallel);
++ 
++ void __d_lookup_done(struct dentry *dentry)
++ {
++ 	struct hlist_bl_head *b = in_lookup_hash(dentry->d_parent,
++ 						 dentry->d_name.hash);
++ 	hlist_bl_lock(b);
++ 	dentry->d_flags &= ~DCACHE_PAR_LOOKUP;
++ 	__hlist_bl_del(&dentry->d_u.d_in_lookup_hash);
++ 	wake_up_all(dentry->d_wait);
++ 	dentry->d_wait = NULL;
++ 	hlist_bl_unlock(b);
++ 	INIT_HLIST_NODE(&dentry->d_u.d_alias);
++ 	INIT_LIST_HEAD(&dentry->d_lru);
++ }
++ EXPORT_SYMBOL(__d_lookup_done);
++ 
++ /* inode->i_lock held if inode is non-NULL */
++ 
++ static inline void __d_add(struct dentry *dentry, struct inode *inode)
++ {
++ 	struct inode *dir = NULL;
++ 	unsigned n;
++ 	spin_lock(&dentry->d_lock);
++ 	if (unlikely(d_in_lookup(dentry))) {
++ 		dir = dentry->d_parent->d_inode;
++ 		n = start_dir_add(dir);
++ 		__d_lookup_done(dentry);
++ 	}
++ 	if (inode) {
++ 		unsigned add_flags = d_flags_for_inode(inode);
++ 		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 		raw_write_seqcount_begin(&dentry->d_seq);
++ 		__d_set_inode_and_type(dentry, inode, add_flags);
++ 		raw_write_seqcount_end(&dentry->d_seq);
++ 		fsnotify_update_flags(dentry);
++ 	}
++ 	_d_rehash(dentry);
++ 	if (dir)
++ 		end_dir_add(dir, n);
++ 	spin_unlock(&dentry->d_lock);
++ 	if (inode)
++ 		spin_unlock(&inode->i_lock);
++ }
++ 
++ /**
++  * d_add - add dentry to hash queues
++  * @entry: dentry to add
++  * @inode: The inode to attach to this dentry
++  *
++  * This adds the entry to the hash queues and initializes @inode.
++  * The entry was actually filled in earlier during d_alloc().
++  */
++ 
++ void d_add(struct dentry *entry, struct inode *inode)
++ {
++ 	if (inode) {
++ 		security_d_instantiate(entry, inode);
++ 		spin_lock(&inode->i_lock);
++ 	}
++ 	__d_add(entry, inode);
++ }
++ EXPORT_SYMBOL(d_add);
++ 
++ /**
++  * d_exact_alias - find and hash an exact unhashed alias
++  * @entry: dentry to add
++  * @inode: The inode to go with this dentry
++  *
++  * If an unhashed dentry with the same name/parent and desired
++  * inode already exists, hash and return it.  Otherwise, return
++  * NULL.
++  *
++  * Parent directory should be locked.
++  */
++ struct dentry *d_exact_alias(struct dentry *entry, struct inode *inode)
++ {
++ 	struct dentry *alias;
++ 	int len = entry->d_name.len;
++ 	const char *name = entry->d_name.name;
++ 	unsigned int hash = entry->d_name.hash;
++ 
++ 	spin_lock(&inode->i_lock);
++ 	hlist_for_each_entry(alias, &inode->i_dentry, d_u.d_alias) {
++ 		/*
++ 		 * Don't need alias->d_lock here, because aliases with
++ 		 * d_parent == entry->d_parent are not subject to name or
++ 		 * parent changes, because the parent inode i_mutex is held.
++ 		 */
++ 		if (alias->d_name.hash != hash)
++ 			continue;
++ 		if (alias->d_parent != entry->d_parent)
++ 			continue;
++ 		if (alias->d_name.len != len)
++ 			continue;
++ 		if (dentry_cmp(alias, name, len))
++ 			continue;
++ 		spin_lock(&alias->d_lock);
++ 		if (!d_unhashed(alias)) {
++ 			spin_unlock(&alias->d_lock);
++ 			alias = NULL;
++ 		} else {
++ 			__dget_dlock(alias);
++ 			_d_rehash(alias);
++ 			spin_unlock(&alias->d_lock);
++ 		}
++ 		spin_unlock(&inode->i_lock);
++ 		return alias;
++ 	}
++ 	spin_unlock(&inode->i_lock);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(d_exact_alias);
++ 
+++>>>>>>> affda48410a5 (trim fsnotify hooks a bit)
+  /**
+   * dentry_update_name_case - update case insensitive dentry with a new name
+   * @dentry: dentry to be updated
+@@@ -2445,28 -2834,29 +2715,36 @@@ static void __d_move(struct dentry *den
+  			   d_hash(dentry->d_parent, dentry->d_name.hash));
+  	}
+  
+ +	list_del(&dentry->d_u.d_child);
+ +	list_del(&target->d_u.d_child);
+ +
+  	/* Switch the names.. */
+ -	if (exchange)
+ -		swap_names(dentry, target);
+ -	else
+ -		copy_name(dentry, target);
+ +	switch_names(dentry, target);
+ +	swap(dentry->d_name.hash, target->d_name.hash);
+  
+ -	/* ... and switch them in the tree */
+ +	/* ... and switch the parents */
+  	if (IS_ROOT(dentry)) {
+ -		/* splicing a tree */
+ +		dentry->d_flags |= DCACHE_RCUACCESS;
+  		dentry->d_parent = target->d_parent;
+  		target->d_parent = target;
+ -		list_del_init(&target->d_child);
+ -		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
+ +		INIT_LIST_HEAD(&target->d_u.d_child);
+  	} else {
+ -		/* swapping two dentries */
+  		swap(dentry->d_parent, target->d_parent);
+++<<<<<<< HEAD
+ +
+ +		/* And add them back to the (new) parent lists */
+ +		list_add(&target->d_u.d_child, &target->d_parent->d_subdirs);
+++=======
++ 		list_move(&target->d_child, &target->d_parent->d_subdirs);
++ 		list_move(&dentry->d_child, &dentry->d_parent->d_subdirs);
++ 		if (exchange)
++ 			fsnotify_update_flags(target);
++ 		fsnotify_update_flags(dentry);
+++>>>>>>> affda48410a5 (trim fsnotify hooks a bit)
+  	}
+  
+ +	list_add(&dentry->d_u.d_child, &dentry->d_parent->d_subdirs);
+ +
+  	write_seqcount_end(&target->d_seq);
+  	write_seqcount_end(&dentry->d_seq);
+  
+diff --cc include/linux/fsnotify_backend.h
+index 0256909191e5,58205f33af02..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -287,19 -284,6 +284,22 @@@ static inline void fsnotify_update_flag
+  		dentry->d_flags &= ~DCACHE_FSNOTIFY_PARENT_WATCHED;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * fsnotify_d_instantiate - instantiate a dentry for inode
+ + */
+ +static inline void __fsnotify_d_instantiate(struct dentry *dentry, struct inode *inode)
+ +{
+ +	if (!inode)
+ +		return;
+ +
+ +	spin_lock(&dentry->d_lock);
+ +	__fsnotify_update_dcache_flags(dentry);
+ +	spin_unlock(&dentry->d_lock);
+ +}
+ +
+++=======
+++>>>>>>> affda48410a5 (trim fsnotify hooks a bit)
+  /* called from fsnotify listeners, such as fanotify or dnotify */
+  
+  /* create a new group */
+@@@ -389,10 -375,7 +389,14 @@@ static inline void __fsnotify_inode_del
+  static inline void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
+  {}
+  
+++<<<<<<< HEAD
+ +static inline void __fsnotify_update_dcache_flags(struct dentry *dentry)
+ +{}
+ +
+ +static inline void __fsnotify_d_instantiate(struct dentry *dentry, struct inode *inode)
+++=======
++ static inline void fsnotify_update_flags(struct dentry *dentry)
+++>>>>>>> affda48410a5 (trim fsnotify hooks a bit)
+  {}
+  
+  static inline u32 fsnotify_get_cookie(void)
+* Unmerged path fs/dcache.c
+diff --git a/include/linux/fsnotify.h b/include/linux/fsnotify.h
+index fe48e677497c..12c2305e386d 100644
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@ -64,18 +64,6 @@ static inline int fsnotify_perm(struct file *file, int mask)
+ 	return fsnotify(inode, fsnotify_mask, path, FSNOTIFY_EVENT_PATH, NULL, 0);
+ }
+ 
+-/*
+- * fsnotify_d_move - dentry has been moved
+- */
+-static inline void fsnotify_d_move(struct dentry *dentry)
+-{
+-	/*
+-	 * On move we need to update dentry->d_flags to indicate if the new parent
+-	 * cares about events from this dentry.
+-	 */
+-	__fsnotify_update_dcache_flags(dentry);
+-}
+-
+ /*
+  * fsnotify_link_count - inode's link count changed
+  */
+* Unmerged path include/linux/fsnotify_backend.h
