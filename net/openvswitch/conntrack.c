@@ -368,7 +368,6 @@ static int handle_fragments(struct net *net, struct sw_flow_key *key,
 		enum ip6_defrag_users user = IP6_DEFRAG_CONNTRACK_IN + zone;
 		struct sk_buff *reasm;
 
-		skb_orphan(skb);
 		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
 		reasm = nf_ct_frag6_gather(skb, user);
 		if (!reasm)
