@@ -546,7 +546,7 @@ static long zcrypt_rsa_crt(struct ica_rsa_modexpo_crt *crt)
 	return -ENODEV;
 }
 
-static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
+long zcrypt_send_cprb(struct ica_xcRB *xcRB)
 {
 	struct zcrypt_device *zdev;
 	int rc;
@@ -580,6 +580,7 @@ static long zcrypt_send_cprb(struct ica_xcRB *xcRB)
 	spin_unlock_bh(&zcrypt_device_lock);
 	return -ENODEV;
 }
+EXPORT_SYMBOL(zcrypt_send_cprb);
 
 struct ep11_target_dev_list {
 	unsigned short		targets_num;
@@ -696,7 +697,7 @@ static long zcrypt_rng(char *buffer)
 	return -ENODEV;
 }
 
-static void zcrypt_device_status_mask(struct zcrypt_device_matrix *matrix)
+void zcrypt_device_status_mask(struct zcrypt_device_matrix *matrix)
 {
 	struct zcrypt_card *zc;
 	struct zcrypt_queue *zq;
