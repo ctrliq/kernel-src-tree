@@ -1,0 +1,206 @@
+tcmu: clean up the code and with one small fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit daf78c305148c5a52f75a7fd88461ffa7066aec6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/daf78c30.failed
+
+Remove useless blank line and code and at the same time add one error
+path to catch the errors.
+
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit daf78c305148c5a52f75a7fd88461ffa7066aec6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,80ee130f8253..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -292,6 -316,94 +292,97 @@@ static struct genl_family tcmu_genl_fam
+  	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define tcmu_cmd_set_dbi_cur(cmd, index) ((cmd)->dbi_cur = (index))
++ #define tcmu_cmd_reset_dbi_cur(cmd) tcmu_cmd_set_dbi_cur(cmd, 0)
++ #define tcmu_cmd_set_dbi(cmd, index) ((cmd)->dbi[(cmd)->dbi_cur++] = (index))
++ #define tcmu_cmd_get_dbi(cmd) ((cmd)->dbi[(cmd)->dbi_cur++])
++ 
++ static void tcmu_cmd_free_data(struct tcmu_cmd *tcmu_cmd, uint32_t len)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	uint32_t i;
++ 
++ 	for (i = 0; i < len; i++)
++ 		clear_bit(tcmu_cmd->dbi[i], udev->data_bitmap);
++ }
++ 
++ static inline bool tcmu_get_empty_block(struct tcmu_dev *udev,
++ 					struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct page *page;
++ 	int ret, dbi;
++ 
++ 	dbi = find_first_zero_bit(udev->data_bitmap, udev->dbi_thresh);
++ 	if (dbi == udev->dbi_thresh)
++ 		return false;
++ 
++ 	page = radix_tree_lookup(&udev->data_blocks, dbi);
++ 	if (!page) {
++ 		if (atomic_add_return(1, &global_db_count) >
++ 					TCMU_GLOBAL_MAX_BLOCKS) {
++ 			atomic_dec(&global_db_count);
++ 			return false;
++ 		}
++ 
++ 		/* try to get new page from the mm */
++ 		page = alloc_page(GFP_KERNEL);
++ 		if (!page)
++ 			goto err_alloc;
++ 
++ 		ret = radix_tree_insert(&udev->data_blocks, dbi, page);
++ 		if (ret)
++ 			goto err_insert;
++ 	}
++ 
++ 	if (dbi > udev->dbi_max)
++ 		udev->dbi_max = dbi;
++ 
++ 	set_bit(dbi, udev->data_bitmap);
++ 	tcmu_cmd_set_dbi(tcmu_cmd, dbi);
++ 
++ 	return true;
++ err_insert:
++ 	__free_page(page);
++ err_alloc:
++ 	atomic_dec(&global_db_count);
++ 	return false;
++ }
++ 
++ static bool tcmu_get_empty_blocks(struct tcmu_dev *udev,
++ 				  struct tcmu_cmd *tcmu_cmd)
++ {
++ 	int i;
++ 
++ 	udev->waiting_global = false;
++ 
++ 	for (i = tcmu_cmd->dbi_cur; i < tcmu_cmd->dbi_cnt; i++) {
++ 		if (!tcmu_get_empty_block(udev, tcmu_cmd))
++ 			goto err;
++ 	}
++ 	return true;
++ 
++ err:
++ 	udev->waiting_global = true;
++ 	/* Try to wake up the unmap thread */
++ 	wake_up(&unmap_wait);
++ 	return false;
++ }
++ 
++ static inline struct page *
++ tcmu_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
++ {
++ 	return radix_tree_lookup(&udev->data_blocks, dbi);
++ }
++ 
++ static inline void tcmu_free_cmd(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	kfree(tcmu_cmd->dbi);
++ 	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
++ }
++ 
+++>>>>>>> daf78c305148 (tcmu: clean up the code and with one small fix)
+  static inline size_t tcmu_cmd_get_data_length(struct tcmu_cmd *tcmu_cmd)
+  {
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -444,19 -550,24 +535,19 @@@ static void alloc_and_scatter_data_area
+  		from = kmap_atomic(sg_page(sg)) + sg->offset;
+  		while (sg_remaining > 0) {
+  			if (block_remaining == 0) {
+ -				if (to)
+ -					kunmap_atomic(to);
+ -
+ +				block = find_first_zero_bit(udev->data_bitmap,
+ +							    udev->max_blocks);
+  				block_remaining = DATA_BLOCK_SIZE;
+ -				dbi = tcmu_cmd_get_dbi(tcmu_cmd);
+ -				page = tcmu_get_block_page(udev, dbi);
+ -				to = kmap_atomic(page);
+ +				set_bit(block, udev->data_bitmap);
+ +				set_bit(block, cmd_bitmap);
+  			}
+ -
+  			copy_bytes = min_t(size_t, sg_remaining,
+  					block_remaining);
+ -			to_offset = get_block_offset_user(udev, dbi,
+ +			to_offset = get_block_offset(udev, block,
+  					block_remaining);
+ -			offset = DATA_BLOCK_SIZE - block_remaining;
+ -			to += offset;
+ -
+ +			to = (void *)udev->mb_addr + to_offset;
+  			if (*iov_cnt != 0 &&
+- 			    to_offset == iov_tail(udev, *iov)) {
++ 			    to_offset == iov_tail(*iov)) {
+  				(*iov)->iov_len += copy_bytes;
+  			} else {
+  				new_iov(iov, iov_cnt, udev);
+@@@ -556,14 -691,39 +647,47 @@@ static bool is_ring_space_avail(struct 
+  		return false;
+  	}
+  
+ -	/* try to check and get the data blocks as needed */
+ -	space = spc_bitmap_free(udev->data_bitmap, udev->dbi_thresh);
+ +	space = spc_bitmap_free(udev->data_bitmap, udev->max_blocks);
+  	if (space < data_needed) {
+++<<<<<<< HEAD
+ +		pr_debug("no data space: only %zu available, but ask for %zu\n",
+ +				space, data_needed);
+ +		return false;
+ +	}
+ +
+ +	return true;
+++=======
++ 		unsigned long blocks_left = DATA_BLOCK_BITS - udev->dbi_thresh;
++ 		unsigned long grow;
++ 
++ 		if (blocks_left < blocks_needed) {
++ 			pr_debug("no data space: only %lu available, but ask for %zu\n",
++ 					blocks_left * DATA_BLOCK_SIZE,
++ 					data_needed);
++ 			return false;
++ 		}
++ 
++ 		/* Try to expand the thresh */
++ 		if (!udev->dbi_thresh) {
++ 			/* From idle state */
++ 			uint32_t init_thresh = DATA_BLOCK_INIT_BITS;
++ 
++ 			udev->dbi_thresh = max(blocks_needed, init_thresh);
++ 		} else {
++ 			/*
++ 			 * Grow the data area by max(blocks needed,
++ 			 * dbi_thresh / 2), but limited to the max
++ 			 * DATA_BLOCK_BITS size.
++ 			 */
++ 			grow = max(blocks_needed, udev->dbi_thresh / 2);
++ 			udev->dbi_thresh += grow;
++ 			if (udev->dbi_thresh > DATA_BLOCK_BITS)
++ 				udev->dbi_thresh = DATA_BLOCK_BITS;
++ 		}
++ 	}
++ 
++ 	return tcmu_get_empty_blocks(udev, cmd);
+++>>>>>>> daf78c305148 (tcmu: clean up the code and with one small fix)
+  }
+  
+  static inline size_t tcmu_cmd_get_base_cmd_size(size_t iov_cnt)
+* Unmerged path drivers/target/target_core_user.c
