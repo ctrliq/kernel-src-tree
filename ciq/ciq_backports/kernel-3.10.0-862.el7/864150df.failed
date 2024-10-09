@@ -1,0 +1,177 @@
+net: Add module reference to FIB notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] Add module reference to FIB notifiers (Ivan Vecera) [1500886]
+Rebuild_FUZZ: 93.67%
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 864150dfa31dceab6ec5ca4579a2d35ede985cb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/864150df.failed
+
+When a listener registers to the FIB notification chain it receives a
+dump of the FIB entries and rules from existing address families by
+invoking their dump operations.
+
+While we call into these modules we need to make sure they aren't
+removed. Do that by increasing their reference count before invoking
+their dump operations and decrease it afterwards.
+
+Fixes: 04b1d4e50e82 ("net: core: Make the FIB notification chain generic")
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 864150dfa31dceab6ec5ca4579a2d35ede985cb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/fib_notifier.h
+#	net/core/fib_notifier.c
+#	net/ipv4/fib_notifier.c
+#	net/ipv6/fib6_notifier.c
+diff --cc net/ipv4/fib_notifier.c
+index e0714d975947,cfd420b0572c..000000000000
+--- a/net/ipv4/fib_notifier.c
++++ b/net/ipv4/fib_notifier.c
+@@@ -1,86 -1,73 +1,98 @@@
+  #include <linux/rtnetlink.h>
+  #include <linux/notifier.h>
+ -#include <linux/socket.h>
+ +#include <linux/rcupdate.h>
+  #include <linux/kernel.h>
++ #include <linux/export.h>
+  #include <net/net_namespace.h>
+ -#include <net/fib_notifier.h>
+  #include <net/netns/ipv4.h>
+  #include <net/ip_fib.h>
+  
+ -int call_fib4_notifier(struct notifier_block *nb, struct net *net,
+ -		       enum fib_event_type event_type,
+ -		       struct fib_notifier_info *info)
+ +static ATOMIC_NOTIFIER_HEAD(fib_chain);
+ +
+ +int call_fib_notifier(struct notifier_block *nb, struct net *net,
+ +		      enum fib_event_type event_type,
+ +		      struct fib_notifier_info *info)
+  {
+ -	info->family = AF_INET;
+ -	return call_fib_notifier(nb, net, event_type, info);
+ +	info->net = net;
+ +	return nb->notifier_call(nb, event_type, info);
+  }
+  
+ -int call_fib4_notifiers(struct net *net, enum fib_event_type event_type,
+ -			struct fib_notifier_info *info)
+ +int call_fib_notifiers(struct net *net, enum fib_event_type event_type,
+ +		       struct fib_notifier_info *info)
+  {
+ -	ASSERT_RTNL();
+ -
+ -	info->family = AF_INET;
+  	net->ipv4.fib_seq++;
+ -	return call_fib_notifiers(net, event_type, info);
+ +	info->net = net;
+ +	return atomic_notifier_call_chain(&fib_chain, event_type, info);
+  }
+  
+ -static unsigned int fib4_seq_read(struct net *net)
+ +static unsigned int fib_seq_sum(void)
+  {
+ -	ASSERT_RTNL();
+ +	unsigned int fib_seq = 0;
+ +	struct net *net;
+ +
+ +	rtnl_lock();
+ +	for_each_net(net)
+ +		fib_seq += net->ipv4.fib_seq;
+ +	rtnl_unlock();
+  
+ -	return net->ipv4.fib_seq + fib4_rules_seq_read(net);
+ +	return fib_seq;
+  }
+  
+ -static int fib4_dump(struct net *net, struct notifier_block *nb)
+ +static bool fib_dump_is_consistent(struct notifier_block *nb,
+ +				   void (*cb)(struct notifier_block *nb),
+ +				   unsigned int fib_seq)
+  {
+ -	int err;
+ -
+ -	err = fib4_rules_dump(net, nb);
+ -	if (err)
+ -		return err;
+ -
+ -	fib_notify(net, nb);
+ -
+ -	return 0;
+ +	atomic_notifier_chain_register(&fib_chain, nb);
+ +	if (fib_seq == fib_seq_sum())
+ +		return true;
+ +	atomic_notifier_chain_unregister(&fib_chain, nb);
+ +	if (cb)
+ +		cb(nb);
+ +	return false;
+  }
+  
+++<<<<<<< HEAD
+ +#define FIB_DUMP_MAX_RETRIES 5
+ +int register_fib_notifier(struct notifier_block *nb,
+ +			  void (*cb)(struct notifier_block *nb))
+++=======
++ static const struct fib_notifier_ops fib4_notifier_ops_template = {
++ 	.family		= AF_INET,
++ 	.fib_seq_read	= fib4_seq_read,
++ 	.fib_dump	= fib4_dump,
++ 	.owner		= THIS_MODULE,
++ };
++ 
++ int __net_init fib4_notifier_init(struct net *net)
+++>>>>>>> 864150dfa31d (net: Add module reference to FIB notifiers)
+  {
+ -	struct fib_notifier_ops *ops;
+ +	int retries = 0;
+ +
+ +	do {
+ +		unsigned int fib_seq = fib_seq_sum();
+ +		struct net *net;
+  
+ -	net->ipv4.fib_seq = 0;
+ +		/* Mutex semantics guarantee that every change done to
+ +		 * FIB tries before we read the change sequence counter
+ +		 * is now visible to us.
+ +		 */
+ +		rcu_read_lock();
+ +		for_each_net_rcu(net) {
+ +			fib_rules_notify(net, nb);
+ +			fib_notify(net, nb);
+ +		}
+ +		rcu_read_unlock();
+  
+ -	ops = fib_notifier_ops_register(&fib4_notifier_ops_template, net);
+ -	if (IS_ERR(ops))
+ -		return PTR_ERR(ops);
+ -	net->ipv4.notifier_ops = ops;
+ +		if (fib_dump_is_consistent(nb, cb, fib_seq))
+ +			return 0;
+ +	} while (++retries < FIB_DUMP_MAX_RETRIES);
+  
+ -	return 0;
+ +	return -EBUSY;
+  }
+ +EXPORT_SYMBOL(register_fib_notifier);
+  
+ -void __net_exit fib4_notifier_exit(struct net *net)
+ +int unregister_fib_notifier(struct notifier_block *nb)
+  {
+ -	fib_notifier_ops_unregister(net->ipv4.notifier_ops);
+ +	return atomic_notifier_chain_unregister(&fib_chain, nb);
+  }
+ +EXPORT_SYMBOL(unregister_fib_notifier);
+* Unmerged path include/net/fib_notifier.h
+* Unmerged path net/core/fib_notifier.c
+* Unmerged path net/ipv6/fib6_notifier.c
+* Unmerged path include/net/fib_notifier.h
+* Unmerged path net/core/fib_notifier.c
+* Unmerged path net/ipv4/fib_notifier.c
+* Unmerged path net/ipv6/fib6_notifier.c
