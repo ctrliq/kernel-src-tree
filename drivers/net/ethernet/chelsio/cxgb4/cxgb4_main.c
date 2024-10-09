@@ -5078,7 +5078,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	err = t4_wait_dev_ready(regs);
 	if (err < 0)
-		goto out_unmap_bar0;
+		goto out_free_adapter;
 
 	/* We control everything through one PF */
 	whoami = readl(regs + PL_WHOAMI_A);
