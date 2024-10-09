@@ -1,0 +1,898 @@
+cxgb4: Add support for dynamic allocation of resources for ULD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hariprasad Shenai <hariprasad@chelsio.com>
+commit 94cdb8bb993a2303d6172b28cbd2b48245b9b8a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/94cdb8bb.failed
+
+Add a new commmon infrastructure to allocate reosurces dynamically to
+Upper layer driver's(ULD) when they register with cxgb4 driver and free
+them during unregistering. All the queues and the interrupts for
+them will be allocated during ULD probe only and freed during remove.
+
+	Signed-off-by: Atul Gupta <atul.gupta@chelsio.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 94cdb8bb993a2303d6172b28cbd2b48245b9b8a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 85dc923f30a0,85e30f19e97a..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -4347,29 -4360,12 +4362,19 @@@ static const struct pci_error_handlers 
+  	.resume         = eeh_resume,
+  };
+  
+ +/* Return true if the Link Configuration supports "High Speeds" (those greater
+ + * than 1Gb/s).
+ + */
+  static inline bool is_x_10g_port(const struct link_config *lc)
+  {
+ -	return (lc->supported & FW_PORT_CAP_SPEED_10G) != 0 ||
+ -	       (lc->supported & FW_PORT_CAP_SPEED_40G) != 0;
+ +	unsigned int speeds, high_speeds;
+ +
+ +	speeds = FW_PORT_CAP_SPEED_V(FW_PORT_CAP_SPEED_G(lc->supported));
+ +	high_speeds = speeds & ~(FW_PORT_CAP_SPEED_100M | FW_PORT_CAP_SPEED_1G);
+ +
+ +	return high_speeds != 0;
+  }
+  
+- static inline void init_rspq(struct adapter *adap, struct sge_rspq *q,
+- 			     unsigned int us, unsigned int cnt,
+- 			     unsigned int size, unsigned int iqe_size)
+- {
+- 	q->adap = adap;
+- 	cxgb4_set_rspq_intr_params(q, us, cnt);
+- 	q->iqe_len = iqe_size;
+- 	q->size = size;
+- }
+- 
+  /*
+   * Perform default configuration of DMA queues depending on the number and type
+   * of ports we found and the number of available CPUs.  Most settings can be
+@@@ -4386,8 -4382,12 +4391,17 @@@ static void cfg_queues(struct adapter *
+  
+  	/* Reduce memory usage in kdump environment, disable all offload.
+  	 */
+++<<<<<<< HEAD
+ +	if (is_kdump_kernel())
+ +		adap->params.offload = 0;
+++=======
++ 	if (is_kdump_kernel()) {
++ 		adap->params.offload = 0;
++ 		adap->params.crypto = 0;
++ 	} else if (adap->num_uld && uld_mem_alloc(adap)) {
++ 		adap->params.crypto = 0;
++ 	}
+++>>>>>>> 94cdb8bb993a (cxgb4: Add support for dynamic allocation of resources for ULD)
+  
+  	for_each_port(adap, i)
+  		n10g += is_x_10g_port(&adap2pinfo(adap, i)->link_cfg);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/Makefile b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+index 742fd720ee60..8d17e8bbbb66 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/Makefile
++++ b/drivers/net/ethernet/chelsio/cxgb4/Makefile
+@@ -4,7 +4,7 @@
+ 
+ obj-$(CONFIG_CHELSIO_T4) += cxgb4.o
+ 
+-cxgb4-objs := cxgb4_main.o l2t.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o
++cxgb4-objs := cxgb4_main.o l2t.o t4_hw.o sge.o clip_tbl.o cxgb4_ethtool.o cxgb4_uld.o
+ cxgb4-$(CONFIG_CHELSIO_T4_DCB) +=  cxgb4_dcb.o
+ cxgb4-$(CONFIG_CHELSIO_T4_UWIRE) +=  cxgb4_ppm.o
+ cxgb4-$(CONFIG_DEBUG_FS) += cxgb4_debugfs.o
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 70d5542c0f8b..914f78087b14 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -53,6 +53,8 @@
+ #include "cxgb4_uld.h"
+ 
+ #define CH_WARN(adap, fmt, ...) dev_warn(adap->pdev_dev, fmt, ## __VA_ARGS__)
++extern struct list_head adapter_list;
++extern struct mutex uld_mutex;
+ 
+ enum {
+ 	MAX_NPORTS	= 4,     /* max # of ports */
+@@ -338,6 +340,7 @@ struct adapter_params {
+ 	enum chip_type chip;               /* chip code */
+ 	struct arch_specific_params arch;  /* chip specific params */
+ 	unsigned char offload;
++	unsigned char crypto;		/* HW capability for crypto */
+ 
+ 	unsigned char bypass;
+ 
+@@ -403,7 +406,6 @@ struct fw_info {
+ 	struct fw_hdr fw_hdr;
+ };
+ 
+-
+ struct trace_params {
+ 	u32 data[TRACE_LEN / 4];
+ 	u32 mask[TRACE_LEN / 4];
+@@ -503,6 +505,10 @@ enum {                                 /* adapter flags */
+ 	FW_OFLD_CONN       = (1 << 9),
+ };
+ 
++enum {
++	ULP_CRYPTO_LOOKASIDE = 1 << 0,
++};
++
+ struct rx_sw_desc;
+ 
+ struct sge_fl {                     /* SGE free-buffer queue state */
+@@ -673,6 +679,16 @@ struct sge_ctrl_txq {               /* state for an SGE control Tx queue */
+ 	u8 full;                    /* the Tx ring is full */
+ } ____cacheline_aligned_in_smp;
+ 
++struct sge_uld_rxq_info {
++	char name[IFNAMSIZ];	/* name of ULD driver */
++	struct sge_ofld_rxq *uldrxq; /* Rxq's for ULD */
++	u16 *msix_tbl;		/* msix_tbl for uld */
++	u16 *rspq_id;		/* response queue id's of rxq */
++	u16 nrxq;		/* # of ingress uld queues */
++	u16 nciq;		/* # of completion queues */
++	u8 uld;			/* uld type */
++};
++
+ struct sge {
+ 	struct sge_eth_txq ethtxq[MAX_ETH_QSETS];
+ 	struct sge_ofld_txq ofldtxq[MAX_OFLD_QSETS];
+@@ -684,6 +700,7 @@ struct sge {
+ 	struct sge_ofld_rxq rdmarxq[MAX_RDMA_QUEUES];
+ 	struct sge_ofld_rxq rdmaciq[MAX_RDMA_CIQS];
+ 	struct sge_rspq fw_evtq ____cacheline_aligned_in_smp;
++	struct sge_uld_rxq_info **uld_rxq_info;
+ 
+ 	struct sge_rspq intrq ____cacheline_aligned_in_smp;
+ 	spinlock_t intrq_lock;
+@@ -695,6 +712,7 @@ struct sge {
+ 	u16 niscsitq;               /* # of available iSCST Rx queues */
+ 	u16 rdmaqs;                 /* # of available RDMA Rx queues */
+ 	u16 rdmaciqs;               /* # of available RDMA concentrator IQs */
++	u16 nqs_per_uld;	    /* # of Rx queues per ULD */
+ 	u16 iscsi_rxq[MAX_OFLD_QSETS];
+ 	u16 iscsit_rxq[MAX_ISCSIT_QUEUES];
+ 	u16 rdma_rxq[MAX_RDMA_QUEUES];
+@@ -750,6 +768,17 @@ struct hash_mac_addr {
+ 	u8 addr[ETH_ALEN];
+ };
+ 
++struct uld_msix_bmap {
++	unsigned long *msix_bmap;
++	unsigned int mapsize;
++	spinlock_t lock; /* lock for acquiring bitmap */
++};
++
++struct uld_msix_info {
++	unsigned short vec;
++	char desc[IFNAMSIZ + 10];
++};
++
+ struct adapter {
+ 	void __iomem *regs;
+ 	void __iomem *bar2;
+@@ -773,6 +802,9 @@ struct adapter {
+ 		unsigned short vec;
+ 		char desc[IFNAMSIZ + 10];
+ 	} msix_info[MAX_INGQ + 1];
++	struct uld_msix_info *msix_info_ulds; /* msix info for uld's */
++	struct uld_msix_bmap msix_bmap_ulds; /* msix bitmap for all uld */
++	unsigned int msi_idx;
+ 
+ 	struct doorbell_stats db_stats;
+ 	struct sge sge;
+@@ -787,7 +819,9 @@ struct adapter {
+ 	unsigned int clipt_start;
+ 	unsigned int clipt_end;
+ 	struct clip_tbl *clipt;
++	struct cxgb4_pci_uld_info *uld;
+ 	void *uld_handle[CXGB4_ULD_MAX];
++	unsigned int num_uld;
+ 	struct list_head list_node;
+ 	struct list_head rcu_node;
+ 	struct list_head mac_hlist; /* list of MAC addresses in MPS Hash */
+@@ -946,6 +980,11 @@ static inline int is_offload(const struct adapter *adap)
+ 	return adap->params.offload;
+ }
+ 
++static inline int is_pci_uld(const struct adapter *adap)
++{
++	return adap->params.crypto;
++}
++
+ static inline u32 t4_read_reg(struct adapter *adap, u32 reg_addr)
+ {
+ 	return readl(adap->regs + reg_addr);
+@@ -1179,8 +1218,6 @@ int t4_sge_init(struct adapter *adap);
+ void t4_sge_start(struct adapter *adap);
+ void t4_sge_stop(struct adapter *adap);
+ int cxgb_busy_poll(struct napi_struct *napi);
+-int cxgb4_set_rspq_intr_params(struct sge_rspq *q, unsigned int us,
+-			       unsigned int cnt);
+ void cxgb4_set_ethtool_ops(struct net_device *netdev);
+ int cxgb4_write_rss(const struct port_info *pi, const u16 *queues);
+ extern int dbfifo_int_thresh;
+@@ -1283,6 +1320,18 @@ static inline int hash_mac_addr(const u8 *addr)
+ 	return a & 0x3f;
+ }
+ 
++int cxgb4_set_rspq_intr_params(struct sge_rspq *q, unsigned int us,
++			       unsigned int cnt);
++static inline void init_rspq(struct adapter *adap, struct sge_rspq *q,
++			     unsigned int us, unsigned int cnt,
++			     unsigned int size, unsigned int iqe_size)
++{
++	q->adap = adap;
++	cxgb4_set_rspq_intr_params(q, us, cnt);
++	q->iqe_len = iqe_size;
++	q->size = size;
++}
++
+ void t4_write_indirect(struct adapter *adap, unsigned int addr_reg,
+ 		       unsigned int data_reg, const u32 *vals,
+ 		       unsigned int nregs, unsigned int start_idx);
+@@ -1517,5 +1566,7 @@ void t4_idma_monitor(struct adapter *adapter,
+ 		     int hz, int ticks);
+ int t4_set_vf_mac_acl(struct adapter *adapter, unsigned int vf,
+ 		      unsigned int naddr, u8 *addr);
+-
++void uld_mem_free(struct adapter *adap);
++int uld_mem_alloc(struct adapter *adap);
++void free_rspq_fl(struct adapter *adap, struct sge_rspq *rq, struct sge_fl *fl);
+ #endif /* __CXGB4_H__ */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+new file mode 100644
+index 000000000000..aac6e444abf2
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+@@ -0,0 +1,555 @@
++/*
++ * cxgb4_uld.c:Chelsio Upper Layer Driver Interface for T4/T5/T6 SGE management
++ *
++ * Copyright (c) 2016 Chelsio Communications, Inc. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ *  Written by: Atul Gupta (atul.gupta@chelsio.com)
++ *  Written by: Hariprasad Shenai (hariprasad@chelsio.com)
++ */
++
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/debugfs.h>
++#include <linux/export.h>
++#include <linux/list.h>
++#include <linux/skbuff.h>
++#include <linux/pci.h>
++
++#include "cxgb4.h"
++#include "cxgb4_uld.h"
++#include "t4_regs.h"
++#include "t4fw_api.h"
++#include "t4_msg.h"
++
++#define for_each_uldrxq(m, i) for (i = 0; i < ((m)->nrxq + (m)->nciq); i++)
++
++static int get_msix_idx_from_bmap(struct adapter *adap)
++{
++	struct uld_msix_bmap *bmap = &adap->msix_bmap_ulds;
++	unsigned long flags;
++	unsigned int msix_idx;
++
++	spin_lock_irqsave(&bmap->lock, flags);
++	msix_idx = find_first_zero_bit(bmap->msix_bmap, bmap->mapsize);
++	if (msix_idx < bmap->mapsize) {
++		__set_bit(msix_idx, bmap->msix_bmap);
++	} else {
++		spin_unlock_irqrestore(&bmap->lock, flags);
++		return -ENOSPC;
++	}
++
++	spin_unlock_irqrestore(&bmap->lock, flags);
++	return msix_idx;
++}
++
++static void free_msix_idx_in_bmap(struct adapter *adap, unsigned int msix_idx)
++{
++	struct uld_msix_bmap *bmap = &adap->msix_bmap_ulds;
++	unsigned long flags;
++
++	spin_lock_irqsave(&bmap->lock, flags);
++	 __clear_bit(msix_idx, bmap->msix_bmap);
++	spin_unlock_irqrestore(&bmap->lock, flags);
++}
++
++static int uldrx_handler(struct sge_rspq *q, const __be64 *rsp,
++			 const struct pkt_gl *gl)
++{
++	struct adapter *adap = q->adap;
++	struct sge_ofld_rxq *rxq = container_of(q, struct sge_ofld_rxq, rspq);
++	int ret;
++
++	/* FW can send CPLs encapsulated in a CPL_FW4_MSG */
++	if (((const struct rss_header *)rsp)->opcode == CPL_FW4_MSG &&
++	    ((const struct cpl_fw4_msg *)(rsp + 1))->type == FW_TYPE_RSSCPL)
++		rsp += 2;
++
++	if (q->flush_handler)
++		ret = adap->uld[q->uld].lro_rx_handler(adap->uld[q->uld].handle,
++				rsp, gl, &q->lro_mgr,
++				&q->napi);
++	else
++		ret = adap->uld[q->uld].rx_handler(adap->uld[q->uld].handle,
++				rsp, gl);
++
++	if (ret) {
++		rxq->stats.nomem++;
++		return -1;
++	}
++
++	if (!gl)
++		rxq->stats.imm++;
++	else if (gl == CXGB4_MSG_AN)
++		rxq->stats.an++;
++	else
++		rxq->stats.pkts++;
++	return 0;
++}
++
++static int alloc_uld_rxqs(struct adapter *adap,
++			  struct sge_uld_rxq_info *rxq_info,
++			  unsigned int nq, unsigned int offset, bool lro)
++{
++	struct sge *s = &adap->sge;
++	struct sge_ofld_rxq *q = rxq_info->uldrxq + offset;
++	unsigned short *ids = rxq_info->rspq_id + offset;
++	unsigned int per_chan = nq / adap->params.nports;
++	unsigned int msi_idx, bmap_idx;
++	int i, err;
++
++	if (adap->flags & USING_MSIX)
++		msi_idx = 1;
++	else
++		msi_idx = -((int)s->intrq.abs_id + 1);
++
++	for (i = 0; i < nq; i++, q++) {
++		if (msi_idx >= 0) {
++			bmap_idx = get_msix_idx_from_bmap(adap);
++			adap->msi_idx++;
++		}
++		err = t4_sge_alloc_rxq(adap, &q->rspq, false,
++				       adap->port[i / per_chan],
++				       adap->msi_idx,
++				       q->fl.size ? &q->fl : NULL,
++				       uldrx_handler,
++				       NULL,
++				       0);
++		if (err)
++			goto freeout;
++		if (msi_idx >= 0)
++			rxq_info->msix_tbl[i + offset] = bmap_idx;
++		memset(&q->stats, 0, sizeof(q->stats));
++		if (ids)
++			ids[i] = q->rspq.abs_id;
++	}
++	return 0;
++freeout:
++	q = rxq_info->uldrxq + offset;
++	for ( ; i; i--, q++) {
++		if (q->rspq.desc)
++			free_rspq_fl(adap, &q->rspq,
++				     q->fl.size ? &q->fl : NULL);
++		adap->msi_idx--;
++	}
++
++	/* We need to free rxq also in case of ciq allocation failure */
++	if (offset) {
++		q = rxq_info->uldrxq + offset;
++		for ( ; i; i--, q++) {
++			if (q->rspq.desc)
++				free_rspq_fl(adap, &q->rspq,
++					     q->fl.size ? &q->fl : NULL);
++			adap->msi_idx--;
++		}
++	}
++	return err;
++}
++
++int setup_sge_queues_uld(struct adapter *adap, unsigned int uld_type, bool lro)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++
++	if (adap->flags & USING_MSIX) {
++		rxq_info->msix_tbl = kzalloc(rxq_info->nrxq + rxq_info->nciq,
++					     GFP_KERNEL);
++		if (!rxq_info->msix_tbl)
++			return -ENOMEM;
++	}
++
++	return !(!alloc_uld_rxqs(adap, rxq_info, rxq_info->nrxq, 0, lro) &&
++		 !alloc_uld_rxqs(adap, rxq_info, rxq_info->nciq,
++				 rxq_info->nrxq, lro));
++}
++
++static void t4_free_uld_rxqs(struct adapter *adap, int n,
++			     struct sge_ofld_rxq *q)
++{
++	for ( ; n; n--, q++) {
++		if (q->rspq.desc)
++			free_rspq_fl(adap, &q->rspq,
++				     q->fl.size ? &q->fl : NULL);
++		adap->msi_idx--;
++	}
++}
++
++void free_sge_queues_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++
++	if (rxq_info->nciq)
++		t4_free_uld_rxqs(adap, rxq_info->nciq,
++				 rxq_info->uldrxq + rxq_info->nrxq);
++	t4_free_uld_rxqs(adap, rxq_info->nrxq, rxq_info->uldrxq);
++	if (adap->flags & USING_MSIX)
++		kfree(rxq_info->msix_tbl);
++}
++
++int cfg_queues_uld(struct adapter *adap, unsigned int uld_type,
++		   const struct cxgb4_pci_uld_info *uld_info)
++{
++	struct sge *s = &adap->sge;
++	struct sge_uld_rxq_info *rxq_info;
++	int i, nrxq;
++
++	rxq_info = kzalloc(sizeof(*rxq_info), GFP_KERNEL);
++	if (!rxq_info)
++		return -ENOMEM;
++
++	if (uld_info->nrxq > s->nqs_per_uld)
++		rxq_info->nrxq = s->nqs_per_uld;
++	else
++		rxq_info->nrxq = uld_info->nrxq;
++	if (!uld_info->nciq)
++		rxq_info->nciq = 0;
++	else if (uld_info->nciq && uld_info->nciq > s->nqs_per_uld)
++		rxq_info->nciq = s->nqs_per_uld;
++	else
++		rxq_info->nciq = uld_info->nciq;
++
++	nrxq = rxq_info->nrxq + rxq_info->nciq; /* total rxq's */
++	rxq_info->uldrxq = kcalloc(nrxq, sizeof(struct sge_ofld_rxq),
++				   GFP_KERNEL);
++	if (!rxq_info->uldrxq) {
++		kfree(rxq_info);
++		return -ENOMEM;
++	}
++
++	rxq_info->rspq_id = kcalloc(nrxq, sizeof(unsigned short), GFP_KERNEL);
++	if (!rxq_info->uldrxq) {
++		kfree(rxq_info->uldrxq);
++		kfree(rxq_info);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < rxq_info->nrxq; i++) {
++		struct sge_ofld_rxq *r = &rxq_info->uldrxq[i];
++
++		init_rspq(adap, &r->rspq, 5, 1, uld_info->rxq_size, 64);
++		r->rspq.uld = uld_type;
++		r->fl.size = 72;
++	}
++
++	for (i = rxq_info->nrxq; i < nrxq; i++) {
++		struct sge_ofld_rxq *r = &rxq_info->uldrxq[i];
++
++		init_rspq(adap, &r->rspq, 5, 1, uld_info->ciq_size, 64);
++		r->rspq.uld = uld_type;
++		r->fl.size = 72;
++	}
++
++	memcpy(rxq_info->name, uld_info->name, IFNAMSIZ);
++	adap->sge.uld_rxq_info[uld_type] = rxq_info;
++
++	return 0;
++}
++
++void free_queues_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++
++	kfree(rxq_info->rspq_id);
++	kfree(rxq_info->uldrxq);
++	kfree(rxq_info);
++}
++
++int request_msix_queue_irqs_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++	int idx, bmap_idx, err = 0;
++
++	for_each_uldrxq(rxq_info, idx) {
++		bmap_idx = rxq_info->msix_tbl[idx];
++		err = request_irq(adap->msix_info_ulds[bmap_idx].vec,
++				  t4_sge_intr_msix, 0,
++				  adap->msix_info_ulds[bmap_idx].desc,
++				  &rxq_info->uldrxq[idx].rspq);
++		if (err)
++			goto unwind;
++	}
++	return 0;
++unwind:
++	while (--idx >= 0) {
++		bmap_idx = rxq_info->msix_tbl[idx];
++		free_msix_idx_in_bmap(adap, bmap_idx);
++		free_irq(adap->msix_info_ulds[bmap_idx].vec,
++			 &rxq_info->uldrxq[idx].rspq);
++	}
++	return err;
++}
++
++void free_msix_queue_irqs_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++	int idx;
++
++	for_each_uldrxq(rxq_info, idx) {
++		unsigned int bmap_idx = rxq_info->msix_tbl[idx];
++
++		free_msix_idx_in_bmap(adap, bmap_idx);
++		free_irq(adap->msix_info_ulds[bmap_idx].vec,
++			 &rxq_info->uldrxq[idx].rspq);
++	}
++}
++
++void name_msix_vecs_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++	int n = sizeof(adap->msix_info_ulds[0].desc);
++	int idx;
++
++	for_each_uldrxq(rxq_info, idx) {
++		unsigned int bmap_idx = rxq_info->msix_tbl[idx];
++
++		snprintf(adap->msix_info_ulds[bmap_idx].desc, n, "%s-%s%d",
++			 adap->port[0]->name, rxq_info->name, idx);
++	}
++}
++
++static void enable_rx(struct adapter *adap, struct sge_rspq *q)
++{
++	if (!q)
++		return;
++
++	if (q->handler) {
++		cxgb_busy_poll_init_lock(q);
++		napi_enable(&q->napi);
++	}
++	/* 0-increment GTS to start the timer and enable interrupts */
++	t4_write_reg(adap, MYPF_REG(SGE_PF_GTS_A),
++		     SEINTARM_V(q->intr_params) |
++		     INGRESSQID_V(q->cntxt_id));
++}
++
++static void quiesce_rx(struct adapter *adap, struct sge_rspq *q)
++{
++	if (q && q->handler) {
++		napi_disable(&q->napi);
++		local_bh_disable();
++		while (!cxgb_poll_lock_napi(q))
++			mdelay(1);
++		local_bh_enable();
++	}
++}
++
++void enable_rx_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++	int idx;
++
++	for_each_uldrxq(rxq_info, idx)
++		enable_rx(adap, &rxq_info->uldrxq[idx].rspq);
++}
++
++void quiesce_rx_uld(struct adapter *adap, unsigned int uld_type)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++	int idx;
++
++	for_each_uldrxq(rxq_info, idx)
++		quiesce_rx(adap, &rxq_info->uldrxq[idx].rspq);
++}
++
++static void uld_queue_init(struct adapter *adap, unsigned int uld_type,
++			   struct cxgb4_lld_info *lli)
++{
++	struct sge_uld_rxq_info *rxq_info = adap->sge.uld_rxq_info[uld_type];
++
++	lli->rxq_ids = rxq_info->rspq_id;
++	lli->nrxq = rxq_info->nrxq;
++	lli->ciq_ids = rxq_info->rspq_id + rxq_info->nrxq;
++	lli->nciq = rxq_info->nciq;
++}
++
++int uld_mem_alloc(struct adapter *adap)
++{
++	struct sge *s = &adap->sge;
++
++	adap->uld = kcalloc(adap->num_uld, sizeof(*adap->uld), GFP_KERNEL);
++	if (!adap->uld)
++		return -ENOMEM;
++
++	s->uld_rxq_info = kzalloc(adap->num_uld *
++				  sizeof(struct sge_uld_rxq_info *),
++				  GFP_KERNEL);
++	if (!s->uld_rxq_info)
++		goto err_uld;
++
++	return 0;
++err_uld:
++	kfree(adap->uld);
++	return -ENOMEM;
++}
++
++void uld_mem_free(struct adapter *adap)
++{
++	struct sge *s = &adap->sge;
++
++	kfree(s->uld_rxq_info);
++	kfree(adap->uld);
++}
++
++static void uld_init(struct adapter *adap, struct cxgb4_lld_info *lld)
++{
++	int i;
++
++	lld->pdev = adap->pdev;
++	lld->pf = adap->pf;
++	lld->l2t = adap->l2t;
++	lld->tids = &adap->tids;
++	lld->ports = adap->port;
++	lld->vr = &adap->vres;
++	lld->mtus = adap->params.mtus;
++	lld->ntxq = adap->sge.iscsiqsets;
++	lld->nchan = adap->params.nports;
++	lld->nports = adap->params.nports;
++	lld->wr_cred = adap->params.ofldq_wr_cred;
++	lld->adapter_type = adap->params.chip;
++	lld->cclk_ps = 1000000000 / adap->params.vpd.cclk;
++	lld->udb_density = 1 << adap->params.sge.eq_qpp;
++	lld->ucq_density = 1 << adap->params.sge.iq_qpp;
++	lld->filt_mode = adap->params.tp.vlan_pri_map;
++	/* MODQ_REQ_MAP sets queues 0-3 to chan 0-3 */
++	for (i = 0; i < NCHAN; i++)
++		lld->tx_modq[i] = i;
++	lld->gts_reg = adap->regs + MYPF_REG(SGE_PF_GTS_A);
++	lld->db_reg = adap->regs + MYPF_REG(SGE_PF_KDOORBELL_A);
++	lld->fw_vers = adap->params.fw_vers;
++	lld->dbfifo_int_thresh = dbfifo_int_thresh;
++	lld->sge_ingpadboundary = adap->sge.fl_align;
++	lld->sge_egrstatuspagesize = adap->sge.stat_len;
++	lld->sge_pktshift = adap->sge.pktshift;
++	lld->enable_fw_ofld_conn = adap->flags & FW_OFLD_CONN;
++	lld->max_ordird_qp = adap->params.max_ordird_qp;
++	lld->max_ird_adapter = adap->params.max_ird_adapter;
++	lld->ulptx_memwrite_dsgl = adap->params.ulptx_memwrite_dsgl;
++	lld->nodeid = dev_to_node(adap->pdev_dev);
++}
++
++static void uld_attach(struct adapter *adap, unsigned int uld)
++{
++	void *handle;
++	struct cxgb4_lld_info lli;
++
++	uld_init(adap, &lli);
++	uld_queue_init(adap, uld, &lli);
++
++	handle = adap->uld[uld].add(&lli);
++	if (IS_ERR(handle)) {
++		dev_warn(adap->pdev_dev,
++			 "could not attach to the %s driver, error %ld\n",
++			 adap->uld[uld].name, PTR_ERR(handle));
++		return;
++	}
++
++	adap->uld[uld].handle = handle;
++
++	if (adap->flags & FULL_INIT_DONE)
++		adap->uld[uld].state_change(handle, CXGB4_STATE_UP);
++}
++
++int cxgb4_register_pci_uld(enum cxgb4_pci_uld type,
++			   struct cxgb4_pci_uld_info *p)
++{
++	int ret = 0;
++	struct adapter *adap;
++
++	if (type >= CXGB4_PCI_ULD_MAX)
++		return -EINVAL;
++
++	mutex_lock(&uld_mutex);
++	list_for_each_entry(adap, &adapter_list, list_node) {
++		if (!is_pci_uld(adap))
++			continue;
++		ret = cfg_queues_uld(adap, type, p);
++		if (ret)
++			goto out;
++		ret = setup_sge_queues_uld(adap, type, p->lro);
++		if (ret)
++			goto free_queues;
++		if (adap->flags & USING_MSIX) {
++			name_msix_vecs_uld(adap, type);
++			ret = request_msix_queue_irqs_uld(adap, type);
++			if (ret)
++				goto free_rxq;
++		}
++		if (adap->flags & FULL_INIT_DONE)
++			enable_rx_uld(adap, type);
++		if (adap->uld[type].add) {
++			ret = -EBUSY;
++			goto free_irq;
++		}
++		adap->uld[type] = *p;
++		uld_attach(adap, type);
++	}
++	mutex_unlock(&uld_mutex);
++	return 0;
++
++free_irq:
++	if (adap->flags & USING_MSIX)
++		free_msix_queue_irqs_uld(adap, type);
++free_rxq:
++	free_sge_queues_uld(adap, type);
++free_queues:
++	free_queues_uld(adap, type);
++out:
++	mutex_unlock(&uld_mutex);
++	return ret;
++}
++EXPORT_SYMBOL(cxgb4_register_pci_uld);
++
++int cxgb4_unregister_pci_uld(enum cxgb4_pci_uld type)
++{
++	struct adapter *adap;
++
++	if (type >= CXGB4_PCI_ULD_MAX)
++		return -EINVAL;
++
++	mutex_lock(&uld_mutex);
++	list_for_each_entry(adap, &adapter_list, list_node) {
++		if (!is_pci_uld(adap))
++			continue;
++		adap->uld[type].handle = NULL;
++		adap->uld[type].add = NULL;
++		if (adap->flags & FULL_INIT_DONE)
++			quiesce_rx_uld(adap, type);
++		if (adap->flags & USING_MSIX)
++			free_msix_queue_irqs_uld(adap, type);
++		free_sge_queues_uld(adap, type);
++		free_queues_uld(adap, type);
++	}
++	mutex_unlock(&uld_mutex);
++
++	return 0;
++}
++EXPORT_SYMBOL(cxgb4_unregister_pci_uld);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index f3c58aaa932d..ab4037222f8d 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@ -32,8 +32,8 @@
+  * SOFTWARE.
+  */
+ 
+-#ifndef __CXGB4_OFLD_H
+-#define __CXGB4_OFLD_H
++#ifndef __CXGB4_ULD_H
++#define __CXGB4_ULD_H
+ 
+ #include <linux/cache.h>
+ #include <linux/spinlock.h>
+@@ -296,8 +296,36 @@ struct cxgb4_uld_info {
+ 	void (*lro_flush)(struct t4_lro_mgr *);
+ };
+ 
++enum cxgb4_pci_uld {
++	CXGB4_PCI_ULD1,
++	CXGB4_PCI_ULD_MAX
++};
++
++struct cxgb4_pci_uld_info {
++	const char *name;
++	bool lro;
++	void *handle;
++	unsigned int nrxq;
++	unsigned int nciq;
++	unsigned int rxq_size;
++	unsigned int ciq_size;
++	void *(*add)(const struct cxgb4_lld_info *p);
++	int (*rx_handler)(void *handle, const __be64 *rsp,
++			  const struct pkt_gl *gl);
++	int (*state_change)(void *handle, enum cxgb4_state new_state);
++	int (*control)(void *handle, enum cxgb4_control control, ...);
++	int (*lro_rx_handler)(void *handle, const __be64 *rsp,
++			      const struct pkt_gl *gl,
++			      struct t4_lro_mgr *lro_mgr,
++			      struct napi_struct *napi);
++	void (*lro_flush)(struct t4_lro_mgr *);
++};
++
+ int cxgb4_register_uld(enum cxgb4_uld type, const struct cxgb4_uld_info *p);
+ int cxgb4_unregister_uld(enum cxgb4_uld type);
++int cxgb4_register_pci_uld(enum cxgb4_pci_uld type,
++			   struct cxgb4_pci_uld_info *p);
++int cxgb4_unregister_pci_uld(enum cxgb4_pci_uld type);
+ int cxgb4_ofld_send(struct net_device *dev, struct sk_buff *skb);
+ unsigned int cxgb4_dbfifo_count(const struct net_device *dev, int lpfifo);
+ unsigned int cxgb4_port_chan(const struct net_device *dev);
+@@ -330,4 +358,4 @@ int cxgb4_bar2_sge_qregs(struct net_device *dev,
+ 			 u64 *pbar2_qoffset,
+ 			 unsigned int *pbar2_qid);
+ 
+-#endif  /* !__CXGB4_OFLD_H */
++#endif  /* !__CXGB4_ULD_H */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+index fa95604acbec..589090743e6c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@ -2864,8 +2864,8 @@ static void free_txq(struct adapter *adap, struct sge_txq *q)
+ 	q->desc = NULL;
+ }
+ 
+-static void free_rspq_fl(struct adapter *adap, struct sge_rspq *rq,
+-			 struct sge_fl *fl)
++void free_rspq_fl(struct adapter *adap, struct sge_rspq *rq,
++		  struct sge_fl *fl)
+ {
+ 	struct sge *s = &adap->sge;
+ 	unsigned int fl_id = fl ? fl->cntxt_id : 0xffff;
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+index 410a0f812e73..d416831fedf1 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+@@ -1060,7 +1060,7 @@ struct fw_caps_config_cmd {
+ 	__be16 niccaps;
+ 	__be16 ofldcaps;
+ 	__be16 rdmacaps;
+-	__be16 r4;
++	__be16 cryptocaps;
+ 	__be16 iscsicaps;
+ 	__be16 fcoecaps;
+ 	__be32 cfcsum;
