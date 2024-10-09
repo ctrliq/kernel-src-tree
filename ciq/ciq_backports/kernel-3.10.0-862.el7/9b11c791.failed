@@ -1,0 +1,253 @@
+s390/mm: simplify arch_get_unmapped_area[_topdown]
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 9b11c7912d00d0e5fe0d7f8973b77dac4f69d3df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9b11c791.failed
+
+With TASK_SIZE now reflecting the maximum size of the address space for
+a process the code for arch_get_unmapped_area[_topdown] can be simplified.
+Just let the logic pick a suitable address and deal with the page table
+upgrade after the address has been selected.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 9b11c7912d00d0e5fe0d7f8973b77dac4f69d3df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/mm/mmap.c
+diff --cc arch/s390/mm/mmap.c
+index 88bf1e650652,b017daed6887..000000000000
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@@ -92,7 -89,7 +92,11 @@@ arch_get_unmapped_area(struct file *fil
+  	struct mm_struct *mm = current->mm;
+  	struct vm_area_struct *vma;
+  	struct vm_unmapped_area_info info;
+++<<<<<<< HEAD
+ +	int do_color_align;
+++=======
++ 	int rc;
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+  
+  	if (len > TASK_SIZE - mmap_min_addr)
+  		return -ENOMEM;
+@@@ -104,21 -101,31 +108,44 @@@
+  		addr = PAGE_ALIGN(addr);
+  		vma = find_vma(mm, addr);
+  		if (TASK_SIZE - len >= addr && addr >= mmap_min_addr &&
+++<<<<<<< HEAD
+ +		    (!vma || addr + len <= vm_start_gap(vma)))
+ +			return addr;
+++=======
++ 		    (!vma || addr + len <= vma->vm_start))
++ 			goto check_asce_limit;
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+  	}
+  
+ +	do_color_align = 0;
+ +	if (filp || (flags & MAP_SHARED))
+ +		do_color_align = !is_32bit_task();
+ +
+  	info.flags = 0;
+  	info.length = len;
+  	info.low_limit = mm->mmap_base;
+  	info.high_limit = TASK_SIZE;
+++<<<<<<< HEAD
+ +	info.align_mask = do_color_align ? (mmap_align_mask << PAGE_SHIFT) : 0;
+++=======
++ 	if (filp || (flags & MAP_SHARED))
++ 		info.align_mask = MMAP_ALIGN_MASK << PAGE_SHIFT;
++ 	else
++ 		info.align_mask = 0;
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+  	info.align_offset = pgoff << PAGE_SHIFT;
+- 	return vm_unmapped_area(&info);
++ 	addr = vm_unmapped_area(&info);
++ 	if (addr & ~PAGE_MASK)
++ 		return addr;
++ 
++ check_asce_limit:
++ 	if (addr + len > current->mm->context.asce_limit) {
++ 		rc = crst_table_upgrade(mm);
++ 		if (rc)
++ 			return (unsigned long) rc;
++ 	}
++ 
++ 	return addr;
+  }
+  
+  unsigned long
+@@@ -130,7 -137,7 +157,11 @@@ arch_get_unmapped_area_topdown(struct f
+  	struct mm_struct *mm = current->mm;
+  	unsigned long addr = addr0;
+  	struct vm_unmapped_area_info info;
+++<<<<<<< HEAD
+ +	int do_color_align;
+++=======
++ 	int rc;
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+  
+  	/* requested length too big for entire address space */
+  	if (len > TASK_SIZE - mmap_min_addr)
+@@@ -145,13 -152,9 +176,13 @@@
+  		vma = find_vma(mm, addr);
+  		if (TASK_SIZE - len >= addr && addr >= mmap_min_addr &&
+  				(!vma || addr + len <= vma->vm_start))
+- 			return addr;
++ 			goto check_asce_limit;
+  	}
+  
+ +	do_color_align = 0;
+ +	if (filp || (flags & MAP_SHARED))
+ +		do_color_align = !is_32bit_task();
+ +
+  	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+  	info.length = len;
+  	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
+@@@ -177,8 -192,6 +217,9 @@@ check_asce_limit
+  	return addr;
+  }
+  
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +
+  /*
+   * This function, called very early during the creation of a new
+   * process VM image, sets up which VM layout function to use:
+@@@ -201,122 -213,5 +242,131 @@@ void arch_pick_mmap_layout(struct mm_st
+  	} else {
+  		mm->mmap_base = mmap_base(random_factor);
+  		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
+ +		mm->unmap_area = arch_unmap_area_topdown;
+ +	}
+ +}
+ +
+ +#else
+ +
+ +int s390_mmap_check(unsigned long addr, unsigned long len, unsigned long flags)
+ +{
+ +	if (is_compat_task() || (TASK_SIZE >= (1UL << 53)))
+ +		return 0;
+ +	if (!(flags & MAP_FIXED))
+ +		addr = 0;
+ +	if ((addr + len) >= TASK_SIZE)
+ +		return crst_table_upgrade(current->mm);
+ +	return 0;
+ +}
+ +
+ +static unsigned long
+ +s390_get_unmapped_area(struct file *filp, unsigned long addr,
+ +		unsigned long len, unsigned long pgoff, unsigned long flags)
+ +{
+ +	struct mm_struct *mm = current->mm;
+ +	unsigned long area;
+ +	int rc;
+ +
+ +	area = arch_get_unmapped_area(filp, addr, len, pgoff, flags);
+ +	if (!(area & ~PAGE_MASK))
+ +		return area;
+ +	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < (1UL << 53)) {
+ +		/* Upgrade the page table to 4 levels and retry. */
+ +		rc = crst_table_upgrade(mm);
+ +		if (rc)
+ +			return (unsigned long) rc;
+ +		area = arch_get_unmapped_area(filp, addr, len, pgoff, flags);
+  	}
+ +	return area;
+  }
+ +
+ +static unsigned long
+ +s390_get_unmapped_area_topdown(struct file *filp, const unsigned long addr,
+ +			  const unsigned long len, const unsigned long pgoff,
+ +			  const unsigned long flags)
+ +{
+ +	struct mm_struct *mm = current->mm;
+ +	unsigned long area;
+ +	int rc;
+ +
+ +	area = arch_get_unmapped_area_topdown(filp, addr, len, pgoff, flags);
+ +	if (!(area & ~PAGE_MASK))
+ +		return area;
+ +	if (area == -ENOMEM && !is_compat_task() && TASK_SIZE < (1UL << 53)) {
+ +		/* Upgrade the page table to 4 levels and retry. */
+ +		rc = crst_table_upgrade(mm);
+ +		if (rc)
+ +			return (unsigned long) rc;
+ +		area = arch_get_unmapped_area_topdown(filp, addr, len,
+ +						      pgoff, flags);
+ +	}
+ +	return area;
+ +}
+++=======
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+ +/*
+ + * This function, called very early during the creation of a new
+ + * process VM image, sets up which VM layout function to use:
+ + */
+ +void arch_pick_mmap_layout(struct mm_struct *mm)
+ +{
+ +	unsigned long random_factor = 0UL;
+ +
+ +	if (current->flags & PF_RANDOMIZE)
+ +		random_factor = arch_mmap_rnd();
+ +
+ +	/*
+ +	 * Fall back to the standard layout if the personality
+ +	 * bit is set, or if the expected stack growth is unlimited:
+ +	 */
+ +	if (mmap_is_legacy()) {
+ +		mm->mmap_base = mmap_base_legacy(random_factor);
+++<<<<<<< HEAD
+ +		mm->get_unmapped_area = s390_get_unmapped_area;
+ +		mm->unmap_area = arch_unmap_area;
+ +	} else {
+ +		mm->mmap_base = mmap_base(random_factor);
+ +		mm->get_unmapped_area = s390_get_unmapped_area_topdown;
+ +		mm->unmap_area = arch_unmap_area_topdown;
+++=======
+++		mm->get_unmapped_area = arch_get_unmapped_area;
+++	} else {
+++		mm->mmap_base = mmap_base(random_factor);
+++		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
+++>>>>>>> 9b11c7912d00 (s390/mm: simplify arch_get_unmapped_area[_topdown])
+ +	}
+ +}
+ +
+ +static int __init setup_mmap_rnd(void)
+ +{
+ +	struct cpuid cpu_id;
+ +
+ +	get_cpu_id(&cpu_id);
+ +	switch (cpu_id.machine) {
+ +	case 0x9672:
+ +	case 0x2064:
+ +	case 0x2066:
+ +	case 0x2084:
+ +	case 0x2086:
+ +	case 0x2094:
+ +	case 0x2096:
+ +	case 0x2097:
+ +	case 0x2098:
+ +	case 0x2817:
+ +	case 0x2818:
+ +	case 0x2827:
+ +	case 0x2828:
+ +		mmap_rnd_mask = 0x7ffUL;
+ +		mmap_align_mask = 0UL;
+ +		break;
+ +	case 0x2964:	/* z13 */
+ +	default:
+ +		mmap_rnd_mask = 0x3ff80UL;
+ +		mmap_align_mask = 0x7fUL;
+ +		break;
+ +	}
+ +	return 0;
+ +}
+ +early_initcall(setup_mmap_rnd);
+ +
+ +#endif
+* Unmerged path arch/s390/mm/mmap.c
