@@ -1,0 +1,220 @@
+ext4: Support for synchronous DAX faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jan Kara <jack@suse.cz>
+commit b8a6176c214cf9aa2679131ed7e4515cddaadc33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b8a6176c.failed
+
+We return IOMAP_F_DIRTY flag from ext4_iomap_begin() when asked to
+prepare blocks for writing and the inode has some uncommitted metadata
+changes. In the fault handler ext4_dax_fault() we then detect this case
+(through VM_FAULT_NEEDDSYNC return value) and call helper
+dax_finish_sync_fault() to flush metadata changes and insert page table
+entry. Note that this will also dirty corresponding radix tree entry
+which is what we want - fsync(2) will still provide data integrity
+guarantees for applications not using userspace flushing. And
+applications using userspace flushing can avoid calling fsync(2) and
+thus avoid the performance overhead.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit b8a6176c214cf9aa2679131ed7e4515cddaadc33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+diff --cc fs/ext4/file.c
+index feb7f54458b2,08a1d1a33a90..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -25,9 -23,10 +25,14 @@@
+  #include <linux/mount.h>
+  #include <linux/path.h>
+  #include <linux/dax.h>
+ +#include <linux/aio.h>
+  #include <linux/quotaops.h>
+  #include <linux/pagevec.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/uio.h>
++ #include <linux/mman.h>
+++>>>>>>> b8a6176c214c (ext4: Support for synchronous DAX faults)
+  #include "ext4.h"
+  #include "ext4_jbd2.h"
+  #include "xattr.h"
+@@@ -300,13 -307,17 +306,22 @@@ static int ext4_dax_huge_fault(struct v
+  	} else {
+  		down_read(&EXT4_I(inode)->i_mmap_sem);
+  	}
+++<<<<<<< HEAD
+ +	if (!IS_ERR(handle))
+ +		result = dax_iomap_fault(vmf, pe_size, &ext4_iomap_ops);
+ +	else
+ +		result = VM_FAULT_SIGBUS;
+ +	if (write) {
+ +		if (!IS_ERR(handle))
+ +			ext4_journal_stop(handle);
+++=======
++ 	result = dax_iomap_fault(vmf, pe_size, &pfn, &ext4_iomap_ops);
++ 	if (write) {
++ 		ext4_journal_stop(handle);
++ 		/* Handling synchronous page fault? */
++ 		if (result & VM_FAULT_NEEDDSYNC)
++ 			result = dax_finish_sync_fault(vmf, pe_size, pfn);
+++>>>>>>> b8a6176c214c (ext4: Support for synchronous DAX faults)
+  		up_read(&EXT4_I(inode)->i_mmap_sem);
+  		sb_end_pagefault(sb);
+  	} else {
+@@@ -372,6 -350,18 +387,21 @@@ static const struct vm_operations_struc
+  
+  static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct inode *inode = file->f_mapping->host;
++ 
++ 	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb))))
++ 		return -EIO;
++ 
++ 	/*
++ 	 * We don't support synchronous mappings for non-DAX files. At least
++ 	 * until someone comes with a sensible use case.
++ 	 */
++ 	if (!IS_DAX(file_inode(file)) && (vma->vm_flags & VM_SYNC))
++ 		return -EOPNOTSUPP;
++ 
+++>>>>>>> b8a6176c214c (ext4: Support for synchronous DAX faults)
+  	file_accessed(file);
+  	if (IS_DAX(file_inode(file))) {
+  		vma->vm_ops = &ext4_dax_vm_ops;
+diff --cc fs/ext4/inode.c
+index a2d511ecf734,13a198924a0f..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3027,35 -3393,18 +3027,50 @@@ static int ext4_releasepage(struct pag
+  		return try_to_free_buffers(page);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * ext4_get_block used when preparing for a DIO write or buffer write.
+ + * We allocate an uinitialized extent if blocks haven't been allocated.
+ + * The extent will be converted to initialized after the IO is complete.
+ + */
+ +int ext4_get_block_write(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+ +{
+ +	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+ +}
+ +
+ +static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+ +{
+ +	int ret;
+ +
+ +	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	ret = _ext4_get_block(inode, iblock, bh_result, 0);
+ +	/*
+ +	 * Blocks should have been preallocated! ext4_file_write_iter() checks
+ +	 * that.
+ +	 */
+ +	WARN_ON_ONCE(!buffer_mapped(bh_result));
+ +
+ +	return ret;
+++=======
++ #ifdef CONFIG_FS_DAX
++ static bool ext4_inode_datasync_dirty(struct inode *inode)
++ {
++ 	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
++ 
++ 	if (journal)
++ 		return !jbd2_transaction_committed(journal,
++ 					EXT4_I(inode)->i_datasync_tid);
++ 	/* Any metadata buffers to write? */
++ 	if (!list_empty(&inode->i_mapping->private_list))
++ 		return true;
++ 	return inode->i_state & I_DIRTY_DATASYNC;
+++>>>>>>> b8a6176c214c (ext4: Support for synchronous DAX faults)
+  }
+  
+  static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+@@@ -3159,18 -3479,16 +3174,25 @@@ retry
+  	}
+  
+  	iomap->flags = 0;
+++<<<<<<< HEAD
+ +	bdev = inode->i_sb->s_bdev;
+ +	iomap->bdev = bdev;
+ +	if (blk_queue_dax(bdev->bd_queue))
+ +		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
+ +	else
+ +		iomap->dax_dev = NULL;
+++=======
++ 	if ((flags & IOMAP_WRITE) && ext4_inode_datasync_dirty(inode))
++ 		iomap->flags |= IOMAP_F_DIRTY;
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ 	iomap->dax_dev = sbi->s_daxdev;
+++>>>>>>> b8a6176c214c (ext4: Support for synchronous DAX faults)
+  	iomap->offset = first_block << blkbits;
+ +	iomap->length = (u64)map.m_len << blkbits;
+  
+  	if (ret == 0) {
+ -		iomap->type = IOMAP_HOLE;
+ -		iomap->blkno = IOMAP_NULL_BLOCK;
+ -		iomap->length = (u64)map.m_len << blkbits;
+ +		iomap->type = delalloc ? IOMAP_DELALLOC : IOMAP_HOLE;
+ +		iomap->addr = IOMAP_NULL_ADDR;
+  	} else {
+  		if (map.m_flags & EXT4_MAP_MAPPED) {
+  			iomap->type = IOMAP_MAPPED;
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index e44b12833fef..2c92b5c8f669 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -723,6 +723,23 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
+ 	return err;
+ }
+ 
++/* Return 1 when transaction with given tid has already committed. */
++int jbd2_transaction_committed(journal_t *journal, tid_t tid)
++{
++	int ret = 1;
++
++	read_lock(&journal->j_state_lock);
++	if (journal->j_running_transaction &&
++	    journal->j_running_transaction->t_tid == tid)
++		ret = 0;
++	if (journal->j_committing_transaction &&
++	    journal->j_committing_transaction->t_tid == tid)
++		ret = 0;
++	read_unlock(&journal->j_state_lock);
++	return ret;
++}
++EXPORT_SYMBOL(jbd2_transaction_committed);
++
+ /*
+  * When this function returns the transaction corresponding to tid
+  * will be completed.  If the transaction has currently running, start
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index 686643222476..e908348fe348 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1246,6 +1246,7 @@ int jbd2_log_start_commit(journal_t *journal, tid_t tid);
+ int __jbd2_log_start_commit(journal_t *journal, tid_t tid);
+ int jbd2_journal_start_commit(journal_t *journal, tid_t *tid);
+ int jbd2_log_wait_commit(journal_t *journal, tid_t tid);
++int jbd2_transaction_committed(journal_t *journal, tid_t tid);
+ int jbd2_complete_transaction(journal_t *journal, tid_t tid);
+ int jbd2_log_do_checkpoint(journal_t *journal);
+ int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid);
