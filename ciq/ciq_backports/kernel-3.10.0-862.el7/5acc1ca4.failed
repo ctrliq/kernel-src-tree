@@ -1,0 +1,252 @@
+KVM: X86: Fix preempt the preemption timer cancel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 5acc1ca4fb15f00bfa3d4046e35ca381bc25d580
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5acc1ca4.failed
+
+Preemption can occur during cancel preemption timer, and there will be
+inconsistent status in lapic, vmx and vmcs field.
+
+          CPU0                    CPU1
+
+  preemption timer vmexit
+  handle_preemption_timer(vCPU0)
+    kvm_lapic_expired_hv_timer
+      vmx_cancel_hv_timer
+        vmx->hv_deadline_tsc = -1
+        vmcs_clear_bits
+        /* hv_timer_in_use still true */
+  sched_out
+                           sched_in
+                           kvm_arch_vcpu_load
+                             vmx_set_hv_timer
+                               write vmx->hv_deadline_tsc
+                               vmcs_set_bits
+                           /* back in kvm_lapic_expired_hv_timer */
+                           hv_timer_in_use = false
+                           ...
+                           vmx_vcpu_run
+                             vmx_arm_hv_run
+                               write preemption timer deadline
+                             spurious preemption timer vmexit
+                               handle_preemption_timer(vCPU0)
+                                 kvm_lapic_expired_hv_timer
+                                   WARN_ON(!apic->lapic_timer.hv_timer_in_use);
+
+This can be reproduced sporadically during boot of L2 on a
+preemptible L1, causing a splat on L1.
+
+ WARNING: CPU: 3 PID: 1952 at arch/x86/kvm/lapic.c:1529 kvm_lapic_expired_hv_timer+0xb5/0xd0 [kvm]
+ CPU: 3 PID: 1952 Comm: qemu-system-x86 Not tainted 4.12.0-rc1+ #24 RIP: 0010:kvm_lapic_expired_hv_timer+0xb5/0xd0 [kvm]
+  Call Trace:
+  handle_preemption_timer+0xe/0x20 [kvm_intel]
+  vmx_handle_exit+0xc9/0x15f0 [kvm_intel]
+  ? lock_acquire+0xdb/0x250
+  ? lock_acquire+0xdb/0x250
+  ? kvm_arch_vcpu_ioctl_run+0xdf3/0x1ce0 [kvm]
+  kvm_arch_vcpu_ioctl_run+0xe55/0x1ce0 [kvm]
+  kvm_vcpu_ioctl+0x384/0x7b0 [kvm]
+  ? kvm_vcpu_ioctl+0x384/0x7b0 [kvm]
+  ? __fget+0xf3/0x210
+  do_vfs_ioctl+0xa4/0x700
+  ? __fget+0x114/0x210
+  SyS_ioctl+0x79/0x90
+  do_syscall_64+0x8f/0x750
+  ? trace_hardirqs_on_thunk+0x1a/0x1c
+  entry_SYSCALL64_slow_path+0x25/0x25
+
+This patch fixes it by disabling preemption while cancelling
+preemption timer.  This way cancel_hv_timer is atomic with
+respect to kvm_arch_vcpu_load.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5acc1ca4fb15f00bfa3d4046e35ca381bc25d580)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+diff --cc arch/x86/kvm/lapic.c
+index 0e8704ed991e,6e6f345adfe6..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -1373,9 -1411,168 +1373,172 @@@ static void start_sw_tscdeadline(struc
+  	local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void start_sw_period(struct kvm_lapic *apic)
++ {
++ 	if (!apic->lapic_timer.period)
++ 		return;
++ 
++ 	if (apic_lvtt_oneshot(apic) &&
++ 	    ktime_after(ktime_get(),
++ 			apic->lapic_timer.target_expiration)) {
++ 		apic_timer_expired(apic);
++ 		return;
++ 	}
++ 
++ 	hrtimer_start(&apic->lapic_timer.timer,
++ 		apic->lapic_timer.target_expiration,
++ 		HRTIMER_MODE_ABS_PINNED);
++ }
++ 
++ static bool set_target_expiration(struct kvm_lapic *apic)
++ {
++ 	ktime_t now;
++ 	u64 tscl = rdtsc();
++ 
++ 	now = ktime_get();
++ 	apic->lapic_timer.period = (u64)kvm_lapic_get_reg(apic, APIC_TMICT)
++ 		* APIC_BUS_CYCLE_NS * apic->divide_count;
++ 
++ 	if (!apic->lapic_timer.period)
++ 		return false;
++ 
++ 	/*
++ 	 * Do not allow the guest to program periodic timers with small
++ 	 * interval, since the hrtimers are not throttled by the host
++ 	 * scheduler.
++ 	 */
++ 	if (apic_lvtt_period(apic)) {
++ 		s64 min_period = min_timer_period_us * 1000LL;
++ 
++ 		if (apic->lapic_timer.period < min_period) {
++ 			pr_info_ratelimited(
++ 			    "kvm: vcpu %i: requested %lld ns "
++ 			    "lapic timer period limited to %lld ns\n",
++ 			    apic->vcpu->vcpu_id,
++ 			    apic->lapic_timer.period, min_period);
++ 			apic->lapic_timer.period = min_period;
++ 		}
++ 	}
++ 
++ 	apic_debug("%s: bus cycle is %" PRId64 "ns, now 0x%016"
++ 		   PRIx64 ", "
++ 		   "timer initial count 0x%x, period %lldns, "
++ 		   "expire @ 0x%016" PRIx64 ".\n", __func__,
++ 		   APIC_BUS_CYCLE_NS, ktime_to_ns(now),
++ 		   kvm_lapic_get_reg(apic, APIC_TMICT),
++ 		   apic->lapic_timer.period,
++ 		   ktime_to_ns(ktime_add_ns(now,
++ 				apic->lapic_timer.period)));
++ 
++ 	apic->lapic_timer.tscdeadline = kvm_read_l1_tsc(apic->vcpu, tscl) +
++ 		nsec_to_cycles(apic->vcpu, apic->lapic_timer.period);
++ 	apic->lapic_timer.target_expiration = ktime_add_ns(now, apic->lapic_timer.period);
++ 
++ 	return true;
++ }
++ 
++ static void advance_periodic_target_expiration(struct kvm_lapic *apic)
++ {
++ 	apic->lapic_timer.tscdeadline +=
++ 		nsec_to_cycles(apic->vcpu, apic->lapic_timer.period);
++ 	apic->lapic_timer.target_expiration =
++ 		ktime_add_ns(apic->lapic_timer.target_expiration,
++ 				apic->lapic_timer.period);
++ }
++ 
++ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
++ {
++ 	if (!lapic_in_kernel(vcpu))
++ 		return false;
++ 
++ 	return vcpu->arch.apic->lapic_timer.hv_timer_in_use;
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_hv_timer_in_use);
++ 
++ static void cancel_hv_timer(struct kvm_lapic *apic)
++ {
++ 	preempt_disable();
++ 	kvm_x86_ops->cancel_hv_timer(apic->vcpu);
++ 	apic->lapic_timer.hv_timer_in_use = false;
++ 	preempt_enable();
++ }
++ 
++ static bool start_hv_timer(struct kvm_lapic *apic)
++ {
++ 	u64 tscdeadline = apic->lapic_timer.tscdeadline;
++ 
++ 	if ((atomic_read(&apic->lapic_timer.pending) &&
++ 		!apic_lvtt_period(apic)) ||
++ 		kvm_x86_ops->set_hv_timer(apic->vcpu, tscdeadline)) {
++ 		if (apic->lapic_timer.hv_timer_in_use)
++ 			cancel_hv_timer(apic);
++ 	} else {
++ 		apic->lapic_timer.hv_timer_in_use = true;
++ 		hrtimer_cancel(&apic->lapic_timer.timer);
++ 
++ 		/* In case the sw timer triggered in the window */
++ 		if (atomic_read(&apic->lapic_timer.pending) &&
++ 			!apic_lvtt_period(apic))
++ 			cancel_hv_timer(apic);
++ 	}
++ 	trace_kvm_hv_timer_state(apic->vcpu->vcpu_id,
++ 			apic->lapic_timer.hv_timer_in_use);
++ 	return apic->lapic_timer.hv_timer_in_use;
++ }
++ 
++ void kvm_lapic_expired_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(!apic->lapic_timer.hv_timer_in_use);
++ 	WARN_ON(swait_active(&vcpu->wq));
++ 	cancel_hv_timer(apic);
++ 	apic_timer_expired(apic);
++ 
++ 	if (apic_lvtt_period(apic) && apic->lapic_timer.period) {
++ 		advance_periodic_target_expiration(apic);
++ 		if (!start_hv_timer(apic))
++ 			start_sw_period(apic);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_expired_hv_timer);
++ 
++ void kvm_lapic_switch_to_hv_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	WARN_ON(apic->lapic_timer.hv_timer_in_use);
++ 
++ 	start_hv_timer(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_hv_timer);
++ 
++ void kvm_lapic_switch_to_sw_timer(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_lapic *apic = vcpu->arch.apic;
++ 
++ 	/* Possibly the TSC deadline timer is not enabled yet */
++ 	if (!apic->lapic_timer.hv_timer_in_use)
++ 		return;
++ 
++ 	cancel_hv_timer(apic);
++ 
++ 	if (atomic_read(&apic->lapic_timer.pending))
++ 		return;
++ 
++ 	if (apic_lvtt_period(apic) || apic_lvtt_oneshot(apic))
++ 		start_sw_period(apic);
++ 	else if (apic_lvtt_tscdeadline(apic))
++ 		start_sw_tscdeadline(apic);
++ }
++ EXPORT_SYMBOL_GPL(kvm_lapic_switch_to_sw_timer);
++ 
+++>>>>>>> 5acc1ca4fb15 (KVM: X86: Fix preempt the preemption timer cancel)
+  static void start_apic_timer(struct kvm_lapic *apic)
+  {
+ +	ktime_t now;
+  	atomic_set(&apic->lapic_timer.pending, 0);
+  
+  	if (apic_lvtt_period(apic) || apic_lvtt_oneshot(apic)) {
+* Unmerged path arch/x86/kvm/lapic.c
