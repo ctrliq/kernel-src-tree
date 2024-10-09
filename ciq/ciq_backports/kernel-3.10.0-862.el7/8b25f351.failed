@@ -1,0 +1,109 @@
+nvme-fc: address target disconnect race conditions in fcp io submit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] fc: address target disconnect race conditions in fcp io submit (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 96.12%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 8b25f351929b5a5216ccb2c8882965134019679d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b25f351.failed
+
+There are cases where threads are in the process of submitting new
+io when the LLDD calls in to remove the remote port. In some cases,
+the next io actually goes to the LLDD, who knows the remoteport isn't
+present and rejects it. To properly recovery/restart these i/o's we
+don't want to hard fail them, we want to treat them as temporary
+resource errors in which a delayed retry will work.
+
+Add a couple more checks on remoteport connectivity and commonize the
+busy response handling when it's seen.
+
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 8b25f351929b5a5216ccb2c8882965134019679d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index bff7f964238e,5630ca46c3b5..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1739,8 -1883,15 +1739,18 @@@ nvme_fc_start_fcp_op(struct nvme_fc_ctr
+  	u32 csn;
+  	int ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * before attempting to send the io, check to see if we believe
++ 	 * the target device is present
++ 	 */
++ 	if (ctrl->rport->remoteport.port_state != FC_OBJSTATE_ONLINE)
++ 		goto busy;
++ 
+++>>>>>>> 8b25f351929b (nvme-fc: address target disconnect race conditions in fcp io submit)
+  	if (!nvme_fc_ctrl_get(ctrl))
+ -		return BLK_STS_IOERR;
+ +		return BLK_MQ_RQ_QUEUE_ERROR;
+  
+  	/* format the FC-NVME CMD IU and fcp_req */
+  	cmdiu->connection_id = cpu_to_be64(queue->connection_id);
+@@@ -1811,31 -1958,28 +1821,53 @@@
+  					queue->lldd_handle, &op->fcp_req);
+  
+  	if (ret) {
+++<<<<<<< HEAD
+ +		dev_err(ctrl->dev,
+ +			"Send nvme command failed - lldd returned %d.\n", ret);
+ +
+ +		if (op->rq) {			/* normal request */
+ +			nvme_fc_unmap_data(ctrl, op->rq, op);
+ +			nvme_cleanup_cmd(op->rq);
+ +		}
+ +		/* else - aen. no cleanup needed */
+ +
+ +		nvme_fc_ctrl_put(ctrl);
+ +
+ +		if (ret != -EBUSY)
+ +			return BLK_MQ_RQ_QUEUE_ERROR;
+ +
+ +		if (op->rq) {
+ +			blk_mq_stop_hw_queues(op->rq->q);
+ +			blk_mq_delay_queue(queue->hctx, NVMEFC_QUEUE_DELAY);
+ +		}
+ +		return BLK_MQ_RQ_QUEUE_BUSY;
+ +	}
+ +
+ +	return BLK_MQ_RQ_QUEUE_OK;
+++=======
++ 		if (!(op->flags & FCOP_FLAGS_AEN))
++ 			nvme_fc_unmap_data(ctrl, op->rq, op);
++ 
++ 		nvme_fc_ctrl_put(ctrl);
++ 
++ 		if (ctrl->rport->remoteport.port_state == FC_OBJSTATE_ONLINE &&
++ 				ret != -EBUSY)
++ 			return BLK_STS_IOERR;
++ 
++ 		goto busy;
++ 	}
++ 
++ 	return BLK_STS_OK;
++ 
++ busy:
++ 	if (!(op->flags & FCOP_FLAGS_AEN) && queue->hctx)
++ 		blk_mq_delay_run_hw_queue(queue->hctx, NVMEFC_QUEUE_DELAY);
++ 
++ 	return BLK_STS_RESOURCE;
+++>>>>>>> 8b25f351929b (nvme-fc: address target disconnect race conditions in fcp io submit)
+  }
+  
+ -static blk_status_t
+ +static int
+  nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
+  			const struct blk_mq_queue_data *bd)
+  {
+* Unmerged path drivers/nvme/host/fc.c
