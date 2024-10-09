@@ -1,0 +1,122 @@
+blk-mq: Avoid that requeueing starts stopped queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 52d7f1b5c2f33b5d34dc2b6af5175fb6a44999f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/52d7f1b5.failed
+
+Since blk_mq_requeue_work() starts stopped queues and since
+execution of this function can be scheduled after a queue has
+been stopped it is not possible to stop queues without using
+an additional state variable to track whether or not the queue
+has been stopped. Hence modify blk_mq_requeue_work() such that it
+does not start stopped queues. My conclusion after a review of
+the blk_mq_stop_hw_queues() and blk_mq_{delay_,}kick_requeue_list()
+callers is as follows:
+* In the dm driver starting and stopping queues should only happen
+  if __dm_suspend() or __dm_resume() is called and not if the
+  requeue list is processed.
+* In the SCSI core queue stopping and starting should only be
+  performed by the scsi_internal_device_block() and
+  scsi_internal_device_unblock() functions but not by any other
+  function. Although the blk_mq_stop_hw_queue() call in
+  scsi_queue_rq() may help to reduce CPU load if a LLD queue is
+  full, figuring out whether or not a queue should be restarted
+  when requeueing a command would require to introduce additional
+  locking in scsi_mq_requeue_cmd() to avoid a race with
+  scsi_internal_device_block(). Avoid this complexity by removing
+  the blk_mq_stop_hw_queue() call from scsi_queue_rq().
+* In the NVMe core only the functions that call
+  blk_mq_start_stopped_hw_queues() explicitly should start stopped
+  queues.
+* A blk_mq_start_stopped_hwqueues() call must be added in the
+  xen-blkfront driver in its blkif_recover() function.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Roger Pau Monné <roger.pau@citrix.com>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: James Bottomley <jejb@linux.vnet.ibm.com>
+	Cc: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 52d7f1b5c2f33b5d34dc2b6af5175fb6a44999f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/xen-blkfront.c
+diff --cc drivers/block/xen-blkfront.c
+index f6a97f7f4ca5,71ca36eab558..000000000000
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@@ -1545,11 -2043,12 +1545,16 @@@ static int blkif_recover(struct blkfron
+  		/* Requeue pending requests (flush or discard) */
+  		list_del_init(&req->queuelist);
+  		BUG_ON(req->nr_phys_segments > segs);
+ -		blk_mq_requeue_request(req);
+ +		blk_requeue_request(info->rq, req);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock_irq(&info->io_lock);
+++=======
++ 	blk_mq_start_stopped_hw_queues(info->rq, true);
++ 	blk_mq_kick_requeue_list(info->rq);
+++>>>>>>> 52d7f1b5c2f3 (blk-mq: Avoid that requeueing starts stopped queues)
+  
+ -	while ((bio = bio_list_pop(&info->bio_list)) != NULL) {
+ +	while ((bio = bio_list_pop(&bio_list)) != NULL) {
+  		/* Traverse the list of pending bios and re-queue them */
+  		if (bio_segments(bio) > segs) {
+  			/*
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 1fb8b36f35c6..a6ae26b39834 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -482,11 +482,7 @@ static void blk_mq_requeue_work(struct work_struct *work)
+ 		blk_mq_insert_request(rq, false, false, false);
+ 	}
+ 
+-	/*
+-	 * Use the start variant of queue running here, so that running
+-	 * the requeue work will kick stopped queues.
+-	 */
+-	blk_mq_start_hw_queues(q);
++	blk_mq_run_hw_queues(q, false);
+ }
+ 
+ void blk_mq_add_to_requeue_list(struct request *rq, bool at_head)
+* Unmerged path drivers/block/xen-blkfront.c
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 63a5735de609..ecb38d529218 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -330,12 +330,7 @@ static void dm_old_requeue_request(struct request *rq)
+ 
+ static void __dm_mq_kick_requeue_list(struct request_queue *q, unsigned long msecs)
+ {
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(q->queue_lock, flags);
+-	if (!blk_queue_stopped(q))
+-		blk_mq_delay_kick_requeue_list(q, msecs);
+-	spin_unlock_irqrestore(q->queue_lock, flags);
++	blk_mq_delay_kick_requeue_list(q, msecs);
+ }
+ 
+ void dm_mq_kick_requeue_list(struct mapped_device *md)
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index f0252ebf3ca9..1b1be1af9e00 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1956,7 +1956,6 @@ out_put_device:
+ out:
+ 	switch (ret) {
+ 	case BLK_MQ_RQ_QUEUE_BUSY:
+-		blk_mq_stop_hw_queue(hctx);
+ 		if (atomic_read(&sdev->device_busy) == 0 &&
+ 		    !scsi_device_blocked(sdev))
+ 			blk_mq_delay_queue(hctx, SCSI_QUEUE_DELAY);
