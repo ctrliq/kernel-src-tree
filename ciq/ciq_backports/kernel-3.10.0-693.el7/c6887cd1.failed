@@ -1,0 +1,101 @@
+Btrfs: don't do nocow check unless we have to
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Josef Bacik <jbacik@fb.com>
+commit c6887cd11149d7325328749f06719071e6c725c6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c6887cd1.failed
+
+Before we write into prealloc/nocow space we have to make sure that there are no
+references to the extents we are writing into, which means checking the extent
+tree and csum tree in the case of nocow.  So we don't want to do the nocow dance
+unless we can't reserve data space, since it's a serious drag on performance.
+With the following sequence
+
+fallocate -l10737418240 /mnt/btrfs-test/file
+cp --reflink /mnt/btrfs-test/file /mnt/btrfs-test/link
+fio --name=randwrite --rw=randwrite --bs=4k --filename=/mnt/btrfs-test/file \
+	--end_fsync=1
+
+we get the worst case scenario where we have to fall back on to doing the check
+anyway.
+
+Without this patch
+lat (usec): min=5, max=111598, avg=27.65, stdev=124.51
+write: io=10240MB, bw=126876KB/s, iops=31718, runt= 82646msec
+
+With this patch
+lat (usec): min=3, max=91210, avg=14.09, stdev=110.62
+write: io=10240MB, bw=212753KB/s, iops=53188, runt= 49286msec
+
+We get twice the throughput, half of the runtime, and half of the average
+latency.  Thanks,
+
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+[ PAGE_CACHE_ removal related fixups ]
+	Signed-off-by: David Sterba <dsterba@suse.com>
+	Signed-off-by: Chris Mason <clm@fb.com>
+(cherry picked from commit c6887cd11149d7325328749f06719071e6c725c6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/file.c
+diff --cc fs/btrfs/file.c
+index 598edb4eb9be,8a538abb597a..000000000000
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@@ -1538,12 -1534,11 +1538,20 @@@ static noinline ssize_t __btrfs_buffere
+  		reserve_bytes = round_up(write_bytes + sector_offset,
+  				root->sectorsize);
+  
+++<<<<<<< HEAD
+ +		if (BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW |
+ +					     BTRFS_INODE_PREALLOC)) {
+ +			ret = check_can_nocow(inode, pos, &write_bytes);
+ +			if (ret < 0)
+ +				break;
+ +			if (ret > 0) {
+++=======
++ 		ret = btrfs_check_data_free_space(inode, pos, write_bytes);
++ 		if (ret < 0) {
++ 			if ((BTRFS_I(inode)->flags & (BTRFS_INODE_NODATACOW |
++ 						      BTRFS_INODE_PREALLOC)) &&
++ 			    check_can_nocow(inode, pos, &write_bytes) > 0) {
+++>>>>>>> c6887cd11149 (Btrfs: don't do nocow check unless we have to)
+  				/*
+  				 * For nodata cow case, no need to reserve
+  				 * data space.
+@@@ -1554,18 -1549,15 +1562,30 @@@
+  				 * write_bytes, so scale down.
+  				 */
+  				num_pages = DIV_ROUND_UP(write_bytes + offset,
+++<<<<<<< HEAD
+ +							 PAGE_CACHE_SIZE);
+ +				reserve_bytes = round_up(write_bytes
+ +							+ sector_offset,
+ +							root->sectorsize);
+ +				goto reserve_metadata;
+ +			}
+ +		}
+ +		ret = btrfs_check_data_free_space(inode, pos, write_bytes);
+ +		if (ret < 0)
+ +			break;
+ +
+ +reserve_metadata:
+++=======
++ 							 PAGE_SIZE);
++ 				reserve_bytes = round_up(write_bytes +
++ 							 sector_offset,
++ 							 root->sectorsize);
++ 			} else {
++ 				break;
++ 			}
++ 		}
++ 
+++>>>>>>> c6887cd11149 (Btrfs: don't do nocow check unless we have to)
+  		ret = btrfs_delalloc_reserve_metadata(inode, reserve_bytes);
+  		if (ret) {
+  			if (!only_release_metadata)
+* Unmerged path fs/btrfs/file.c
