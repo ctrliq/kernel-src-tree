@@ -823,7 +823,6 @@ struct tc_to_netdev {
 		struct tc_cls_flower_offload *cls_flower;
 		struct tc_cls_matchall_offload *cls_mall;
 	};
-	bool egress_dev;
 };
 
 /* This structure defines the management hooks for network devices.
