@@ -1,0 +1,362 @@
+mlxsw: spectrum_span: Generalize SPAN support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit 169b5d95c15e01e08e1665bd8ceaff9bf8331c33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/169b5d95.failed
+
+To support mirroring to different device types, the functions that
+partake in configuring the port analyzer need to be extended to admit
+non-trivial SPAN types.
+
+Create a structure where all details of SPAN configuration are kept,
+struct mlxsw_sp_span_parms. Also create struct mlxsw_sp_span_entry_ops
+to keep per-SPAN-type operations.
+
+Instantiate the latter once for MLXSW_REG_MPAT_SPAN_TYPE_LOCAL_ETH, and
+once for a suite of NOP callbacks used for invalidated SPAN entry. Put
+the formet as a sole member of a new array mlxsw_sp_span_entry_types,
+where all known SPAN types are kept. Introduce a new function,
+mlxsw_sp_span_entry_ops(), to look up the right ops suite given a
+netdevice.
+
+Change mlxsw_sp_span_mirror_add() to use both parms and ops structures.
+Change mlxsw_sp_span_entry_get() and mlxsw_sp_span_entry_create() to
+take these as arguments. Modify mlxsw_sp_span_entry_configure() and
+mlxsw_sp_span_entry_deconfigure() to dispatch to ops.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 169b5d95c15e01e08e1665bd8ceaff9bf8331c33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_span.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index b68d3beaa490,b070cad8dba7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -1271,17 -1266,10 +1271,20 @@@ mlxsw_sp_port_add_cls_matchall_mirror(s
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!mlxsw_sp_port_dev_check(to_dev)) {
+ +		netdev_err(mlxsw_sp_port->dev, "Cannot mirror to a non-spectrum port");
+ +		return -EOPNOTSUPP;
+ +	}
+ +	to_port = netdev_priv(to_dev);
+ +
+ +	mirror->to_local_port = to_port->local_port;
+++=======
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	mirror->ingress = ingress;
+  	span_type = ingress ? MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
+ -	return mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_dev, span_type,
+ -					true, &mirror->span_id);
+ +	return mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_port, span_type,
+ +					true);
+  }
+  
+  static void
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+index a025a77a589d,c0e0e9af2da7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+@@@ -88,10 -99,12 +99,16 @@@ mlxsw_sp_span_entry_phys_configure(stru
+  }
+  
+  static void
+- mlxsw_sp_span_entry_deconfigure(struct mlxsw_sp *mlxsw_sp,
+- 				struct mlxsw_sp_span_entry *span_entry)
++ mlxsw_sp_span_entry_deconfigure_common(struct mlxsw_sp_span_entry *span_entry,
++ 				       enum mlxsw_reg_mpat_span_type span_type)
+  {
+++<<<<<<< HEAD
+ +	u8 local_port = span_entry->local_port;
+++=======
++ 	struct mlxsw_sp_port *dest_port = span_entry->parms.dest_port;
++ 	struct mlxsw_sp *mlxsw_sp = dest_port->mlxsw_sp;
++ 	u8 local_port = dest_port->local_port;
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	char mpat_pl[MLXSW_REG_MPAT_LEN];
+  	int pa_id = span_entry->id;
+  
+@@@ -100,12 -112,82 +116,90 @@@
+  	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(mpat), mpat_pl);
+  }
+  
++ static void
++ mlxsw_sp_span_entry_phys_deconfigure(struct mlxsw_sp_span_entry *span_entry)
++ {
++ 	mlxsw_sp_span_entry_deconfigure_common(span_entry,
++ 					    MLXSW_REG_MPAT_SPAN_TYPE_LOCAL_ETH);
++ }
++ 
++ static const
++ struct mlxsw_sp_span_entry_ops mlxsw_sp_span_entry_ops_phys = {
++ 	.can_handle = mlxsw_sp_port_dev_check,
++ 	.parms = mlxsw_sp_span_entry_phys_parms,
++ 	.configure = mlxsw_sp_span_entry_phys_configure,
++ 	.deconfigure = mlxsw_sp_span_entry_phys_deconfigure,
++ };
++ 
++ static const
++ struct mlxsw_sp_span_entry_ops *const mlxsw_sp_span_entry_types[] = {
++ 	&mlxsw_sp_span_entry_ops_phys,
++ };
++ 
++ static int
++ mlxsw_sp_span_entry_nop_parms(const struct net_device *to_dev,
++ 			      struct mlxsw_sp_span_parms *sparmsp)
++ {
++ 	sparmsp->dest_port = NULL;
++ 	return 0;
++ }
++ 
++ static int
++ mlxsw_sp_span_entry_nop_configure(struct mlxsw_sp_span_entry *span_entry,
++ 				  struct mlxsw_sp_span_parms sparms)
++ {
++ 	return 0;
++ }
++ 
++ static void
++ mlxsw_sp_span_entry_nop_deconfigure(struct mlxsw_sp_span_entry *span_entry)
++ {
++ }
++ 
++ static const struct mlxsw_sp_span_entry_ops mlxsw_sp_span_entry_ops_nop = {
++ 	.parms = mlxsw_sp_span_entry_nop_parms,
++ 	.configure = mlxsw_sp_span_entry_nop_configure,
++ 	.deconfigure = mlxsw_sp_span_entry_nop_deconfigure,
++ };
++ 
++ static void
++ mlxsw_sp_span_entry_configure(struct mlxsw_sp *mlxsw_sp,
++ 			      struct mlxsw_sp_span_entry *span_entry,
++ 			      struct mlxsw_sp_span_parms sparms)
++ {
++ 	if (sparms.dest_port) {
++ 		if (span_entry->ops->configure(span_entry, sparms)) {
++ 			netdev_err(span_entry->to_dev, "Failed to offload mirror to %s",
++ 				   sparms.dest_port->dev->name);
++ 			sparms.dest_port = NULL;
++ 		}
++ 	}
++ 
++ 	span_entry->parms = sparms;
++ }
++ 
++ static void
++ mlxsw_sp_span_entry_deconfigure(struct mlxsw_sp_span_entry *span_entry)
++ {
++ 	if (span_entry->parms.dest_port)
++ 		span_entry->ops->deconfigure(span_entry);
++ }
++ 
+  static struct mlxsw_sp_span_entry *
+++<<<<<<< HEAD
+ +mlxsw_sp_span_entry_create(struct mlxsw_sp_port *port)
+ +{
+ +	struct mlxsw_sp_span_entry *span_entry = NULL;
+ +	struct mlxsw_sp *mlxsw_sp = port->mlxsw_sp;
+ +	u8 local_port = port->local_port;
+++=======
++ mlxsw_sp_span_entry_create(struct mlxsw_sp *mlxsw_sp,
++ 			   const struct net_device *to_dev,
++ 			   const struct mlxsw_sp_span_entry_ops *ops,
++ 			   struct mlxsw_sp_span_parms sparms)
++ {
++ 	struct mlxsw_sp_span_entry *span_entry = NULL;
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	int i;
+  
+  	/* find a free entry to use */
+@@@ -118,18 -200,17 +212,25 @@@
+  	if (!span_entry)
+  		return NULL;
+  
+- 	if (mlxsw_sp_span_entry_configure(mlxsw_sp, span_entry, local_port))
+- 		return NULL;
+- 
++ 	span_entry->ops = ops;
+  	span_entry->ref_count = 1;
+++<<<<<<< HEAD
+ +	span_entry->local_port = local_port;
+++=======
++ 	span_entry->to_dev = to_dev;
++ 	mlxsw_sp_span_entry_configure(mlxsw_sp, span_entry, sparms);
++ 
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	return span_entry;
+  }
+  
+- static void mlxsw_sp_span_entry_destroy(struct mlxsw_sp *mlxsw_sp,
+- 					struct mlxsw_sp_span_entry *span_entry)
++ static void mlxsw_sp_span_entry_destroy(struct mlxsw_sp_span_entry *span_entry)
+  {
+++<<<<<<< HEAD
+ +	mlxsw_sp_span_entry_deconfigure(mlxsw_sp, span_entry);
+++=======
++ 	mlxsw_sp_span_entry_deconfigure(span_entry);
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  }
+  
+  struct mlxsw_sp_span_entry *
+@@@ -140,14 -222,38 +241,46 @@@ mlxsw_sp_span_entry_find(struct mlxsw_s
+  	for (i = 0; i < mlxsw_sp->span.entries_count; i++) {
+  		struct mlxsw_sp_span_entry *curr = &mlxsw_sp->span.entries[i];
+  
+++<<<<<<< HEAD
+ +		if (curr->ref_count && curr->local_port == local_port)
+++=======
++ 		if (curr->ref_count && curr->to_dev == to_dev)
+  			return curr;
+  	}
+  	return NULL;
+  }
+  
++ void mlxsw_sp_span_entry_invalidate(struct mlxsw_sp *mlxsw_sp,
++ 				    struct mlxsw_sp_span_entry *span_entry)
++ {
++ 	mlxsw_sp_span_entry_deconfigure(span_entry);
++ 	span_entry->ops = &mlxsw_sp_span_entry_ops_nop;
++ }
++ 
+  static struct mlxsw_sp_span_entry *
++ mlxsw_sp_span_entry_find_by_id(struct mlxsw_sp *mlxsw_sp, int span_id)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < mlxsw_sp->span.entries_count; i++) {
++ 		struct mlxsw_sp_span_entry *curr = &mlxsw_sp->span.entries[i];
++ 
++ 		if (curr->ref_count && curr->id == span_id)
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
++ 			return curr;
++ 	}
++ 	return NULL;
++ }
++ 
++ static struct mlxsw_sp_span_entry *
+++<<<<<<< HEAD
+ +mlxsw_sp_span_entry_get(struct mlxsw_sp_port *port)
+++=======
++ mlxsw_sp_span_entry_get(struct mlxsw_sp *mlxsw_sp,
++ 			const struct net_device *to_dev,
++ 			const struct mlxsw_sp_span_entry_ops *ops,
++ 			struct mlxsw_sp_span_parms sparms)
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  {
+  	struct mlxsw_sp_span_entry *span_entry;
+  
+@@@ -159,7 -264,7 +292,11 @@@
+  		return span_entry;
+  	}
+  
+++<<<<<<< HEAD
+ +	return mlxsw_sp_span_entry_create(port);
+++=======
++ 	return mlxsw_sp_span_entry_create(mlxsw_sp, to_dev, ops, sparms);
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  }
+  
+  static int mlxsw_sp_span_entry_put(struct mlxsw_sp *mlxsw_sp,
+@@@ -329,15 -434,41 +466,44 @@@ mlxsw_sp_span_inspected_port_del(struc
+  	kfree(inspected_port);
+  }
+  
++ static const struct mlxsw_sp_span_entry_ops *
++ mlxsw_sp_span_entry_ops(struct mlxsw_sp *mlxsw_sp,
++ 			const struct net_device *to_dev)
++ {
++ 	size_t i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(mlxsw_sp_span_entry_types); ++i)
++ 		if (mlxsw_sp_span_entry_types[i]->can_handle(to_dev))
++ 			return mlxsw_sp_span_entry_types[i];
++ 
++ 	return NULL;
++ }
++ 
+  int mlxsw_sp_span_mirror_add(struct mlxsw_sp_port *from,
+ -			     const struct net_device *to_dev,
+ -			     enum mlxsw_sp_span_type type, bool bind,
+ -			     int *p_span_id)
+ +			     struct mlxsw_sp_port *to,
+ +			     enum mlxsw_sp_span_type type, bool bind)
+  {
+  	struct mlxsw_sp *mlxsw_sp = from->mlxsw_sp;
++ 	const struct mlxsw_sp_span_entry_ops *ops;
++ 	struct mlxsw_sp_span_parms sparms = {0};
+  	struct mlxsw_sp_span_entry *span_entry;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	span_entry = mlxsw_sp_span_entry_get(to);
+++=======
++ 	ops = mlxsw_sp_span_entry_ops(mlxsw_sp, to_dev);
++ 	if (!ops) {
++ 		netdev_err(to_dev, "Cannot mirror to %s", to_dev->name);
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	err = ops->parms(to_dev, &sparms);
++ 	if (err)
++ 		return err;
++ 
++ 	span_entry = mlxsw_sp_span_entry_get(mlxsw_sp, to_dev, ops, sparms);
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	if (!span_entry)
+  		return -ENOENT;
+  
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_span.h
+index 069050e385ff,9390b05a7919..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_span.h
+@@@ -50,8 -50,16 +50,20 @@@ struct mlxsw_sp_span_inspected_port 
+  	u8 local_port;
+  };
+  
++ struct mlxsw_sp_span_parms {
++ 	struct mlxsw_sp_port *dest_port; /* NULL for unoffloaded SPAN. */
++ };
++ 
++ struct mlxsw_sp_span_entry_ops;
++ 
+  struct mlxsw_sp_span_entry {
+++<<<<<<< HEAD
+ +	u8 local_port;
+++=======
++ 	const struct net_device *to_dev;
++ 	const struct mlxsw_sp_span_entry_ops *ops;
++ 	struct mlxsw_sp_span_parms parms;
+++>>>>>>> 169b5d95c15e (mlxsw: spectrum_span: Generalize SPAN support)
+  	struct list_head bound_ports_list;
+  	int ref_count;
+  	int id;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+index 7fab6a96c717..80ea4d1e96cd 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+@@ -414,9 +414,6 @@ int mlxsw_sp_acl_rulei_act_mirror(struct mlxsw_sp *mlxsw_sp,
+ 	binding = list_first_entry(&block->binding_list,
+ 				   struct mlxsw_sp_acl_block_binding, list);
+ 	in_port = binding->mlxsw_sp_port;
+-	if (!mlxsw_sp_port_dev_check(out_dev))
+-		return -EINVAL;
+-
+ 	out_port = netdev_priv(out_dev);
+ 	if (out_port->mlxsw_sp != mlxsw_sp)
+ 		return -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_span.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_span.h
