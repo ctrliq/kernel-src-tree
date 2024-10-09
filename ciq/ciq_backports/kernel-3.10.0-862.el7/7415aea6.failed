@@ -1,0 +1,811 @@
+hyper-v: Globalize vp_index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 7415aea6072bab15969b6c3c5b2a193d88095326
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7415aea6.failed
+
+To support implementing remote TLB flushing on Hyper-V with a hypercall
+we need to make vp_index available outside of vmbus module. Rename and
+globalize.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
+	Reviewed-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Haiyang Zhang <haiyangz@microsoft.com>
+	Cc: Jork Loeser <Jork.Loeser@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Simon Xiao <sixiao@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: devel@linuxdriverproject.org
+Link: http://lkml.kernel.org/r/20170802160921.21791-7-vkuznets@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7415aea6072bab15969b6c3c5b2a193d88095326)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/hyperv/hv_init.c
+#	arch/x86/include/asm/mshyperv.h
+#	drivers/hv/connection.c
+#	drivers/hv/hv.c
+#	drivers/hv/hyperv_vmbus.h
+#	drivers/pci/pci-hyperv.c
+#	include/linux/hyperv.h
+diff --cc arch/x86/hyperv/hv_init.c
+index 18e3d3f26a37,e93b9a0b1b10..000000000000
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@@ -24,8 -24,78 +24,83 @@@
+  #include <linux/version.h>
+  #include <linux/vmalloc.h>
+  #include <linux/mm.h>
+++<<<<<<< HEAD
+ +
+ +static void *hypercall_pg;
+++=======
++ #include <linux/clockchips.h>
++ #include <linux/hyperv.h>
++ #include <linux/slab.h>
++ #include <linux/cpuhotplug.h>
++ 
++ #ifdef CONFIG_HYPERV_TSCPAGE
++ 
++ static struct ms_hyperv_tsc_page *tsc_pg;
++ 
++ struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
++ {
++ 	return tsc_pg;
++ }
++ 
++ static u64 read_hv_clock_tsc(struct clocksource *arg)
++ {
++ 	u64 current_tick = hv_read_tsc_page(tsc_pg);
++ 
++ 	if (current_tick == U64_MAX)
++ 		rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
++ 
++ 	return current_tick;
++ }
++ 
++ static struct clocksource hyperv_cs_tsc = {
++ 		.name		= "hyperv_clocksource_tsc_page",
++ 		.rating		= 400,
++ 		.read		= read_hv_clock_tsc,
++ 		.mask		= CLOCKSOURCE_MASK(64),
++ 		.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++ };
++ #endif
++ 
++ static u64 read_hv_clock_msr(struct clocksource *arg)
++ {
++ 	u64 current_tick;
++ 	/*
++ 	 * Read the partition counter to get the current tick count. This count
++ 	 * is set to 0 when the partition is created and is incremented in
++ 	 * 100 nanosecond units.
++ 	 */
++ 	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
++ 	return current_tick;
++ }
++ 
++ static struct clocksource hyperv_cs_msr = {
++ 	.name		= "hyperv_clocksource_msr",
++ 	.rating		= 400,
++ 	.read		= read_hv_clock_msr,
++ 	.mask		= CLOCKSOURCE_MASK(64),
++ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++ };
++ 
++ void *hv_hypercall_pg;
++ EXPORT_SYMBOL_GPL(hv_hypercall_pg);
++ struct clocksource *hyperv_cs;
++ EXPORT_SYMBOL_GPL(hyperv_cs);
++ 
++ u32 *hv_vp_index;
++ EXPORT_SYMBOL_GPL(hv_vp_index);
++ 
++ static int hv_cpu_init(unsigned int cpu)
++ {
++ 	u64 msr_vp_index;
++ 
++ 	hv_get_vp_index(msr_vp_index);
++ 
++ 	hv_vp_index[smp_processor_id()] = msr_vp_index;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  /*
+   * This function is to be invoked early in the boot sequence after the
+   * hypervisor has been detected.
+@@@ -48,16 -129,58 +133,61 @@@ void hyperv_init(void
+  	guest_id = generate_guest_id(0, LINUX_VERSION_CODE, 0);
+  	wrmsrl(HV_X64_MSR_GUEST_OS_ID, guest_id);
+  
+ -	hv_hypercall_pg  = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL_RX);
+ -	if (hv_hypercall_pg == NULL) {
+ +	hypercall_pg  = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL_RX);
+ +	if (hypercall_pg == NULL) {
+  		wrmsrl(HV_X64_MSR_GUEST_OS_ID, 0);
+- 		return;
++ 		goto free_vp_index;
+  	}
+  
+  	rdmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+  	hypercall_msr.enable = 1;
+ -	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hv_hypercall_pg);
+ +	hypercall_msr.guest_physical_address = vmalloc_to_pfn(hypercall_pg);
+  	wrmsrl(HV_X64_MSR_HYPERCALL, hypercall_msr.as_uint64);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Register Hyper-V specific clocksource.
++ 	 */
++ #ifdef CONFIG_HYPERV_TSCPAGE
++ 	if (ms_hyperv.features & HV_X64_MSR_REFERENCE_TSC_AVAILABLE) {
++ 		union hv_x64_msr_hypercall_contents tsc_msr;
++ 
++ 		tsc_pg = __vmalloc(PAGE_SIZE, GFP_KERNEL, PAGE_KERNEL);
++ 		if (!tsc_pg)
++ 			goto register_msr_cs;
++ 
++ 		hyperv_cs = &hyperv_cs_tsc;
++ 
++ 		rdmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
++ 
++ 		tsc_msr.enable = 1;
++ 		tsc_msr.guest_physical_address = vmalloc_to_pfn(tsc_pg);
++ 
++ 		wrmsrl(HV_X64_MSR_REFERENCE_TSC, tsc_msr.as_uint64);
++ 
++ 		hyperv_cs_tsc.archdata.vclock_mode = VCLOCK_HVCLOCK;
++ 
++ 		clocksource_register_hz(&hyperv_cs_tsc, NSEC_PER_SEC/100);
++ 		return;
++ 	}
++ register_msr_cs:
++ #endif
++ 	/*
++ 	 * For 32 bit guests just use the MSR based mechanism for reading
++ 	 * the partition counter.
++ 	 */
++ 
++ 	hyperv_cs = &hyperv_cs_msr;
++ 	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE)
++ 		clocksource_register_hz(&hyperv_cs_msr, NSEC_PER_SEC/100);
++ 
++ 	return;
++ 
++ free_vp_index:
++ 	kfree(hv_vp_index);
++ 	hv_vp_index = NULL;
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  }
+  
+  /*
+diff --cc arch/x86/include/asm/mshyperv.h
+index c86331fdc4b0,efd2f80d3353..000000000000
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@@ -83,6 -169,205 +83,146 @@@ void hv_setup_crash_handler(void (*hand
+  void hv_remove_crash_handler(void);
+  
+  #if IS_ENABLED(CONFIG_HYPERV)
+++<<<<<<< HEAD
+++=======
++ extern struct clocksource *hyperv_cs;
++ extern void *hv_hypercall_pg;
++ 
++ static inline u64 hv_do_hypercall(u64 control, void *input, void *output)
++ {
++ 	u64 input_address = input ? virt_to_phys(input) : 0;
++ 	u64 output_address = output ? virt_to_phys(output) : 0;
++ 	u64 hv_status;
++ 	register void *__sp asm(_ASM_SP);
++ 
++ #ifdef CONFIG_X86_64
++ 	if (!hv_hypercall_pg)
++ 		return U64_MAX;
++ 
++ 	__asm__ __volatile__("mov %4, %%r8\n"
++ 			     "call *%5"
++ 			     : "=a" (hv_status), "+r" (__sp),
++ 			       "+c" (control), "+d" (input_address)
++ 			     :  "r" (output_address), "m" (hv_hypercall_pg)
++ 			     : "cc", "memory", "r8", "r9", "r10", "r11");
++ #else
++ 	u32 input_address_hi = upper_32_bits(input_address);
++ 	u32 input_address_lo = lower_32_bits(input_address);
++ 	u32 output_address_hi = upper_32_bits(output_address);
++ 	u32 output_address_lo = lower_32_bits(output_address);
++ 
++ 	if (!hv_hypercall_pg)
++ 		return U64_MAX;
++ 
++ 	__asm__ __volatile__("call *%7"
++ 			     : "=A" (hv_status),
++ 			       "+c" (input_address_lo), "+r" (__sp)
++ 			     : "A" (control),
++ 			       "b" (input_address_hi),
++ 			       "D"(output_address_hi), "S"(output_address_lo),
++ 			       "m" (hv_hypercall_pg)
++ 			     : "cc", "memory");
++ #endif /* !x86_64 */
++ 	return hv_status;
++ }
++ 
++ #define HV_HYPERCALL_RESULT_MASK	GENMASK_ULL(15, 0)
++ #define HV_HYPERCALL_FAST_BIT		BIT(16)
++ #define HV_HYPERCALL_VARHEAD_OFFSET	17
++ #define HV_HYPERCALL_REP_COMP_OFFSET	32
++ #define HV_HYPERCALL_REP_COMP_MASK	GENMASK_ULL(43, 32)
++ #define HV_HYPERCALL_REP_START_OFFSET	48
++ #define HV_HYPERCALL_REP_START_MASK	GENMASK_ULL(59, 48)
++ 
++ /* Fast hypercall with 8 bytes of input and no output */
++ static inline u64 hv_do_fast_hypercall8(u16 code, u64 input1)
++ {
++ 	u64 hv_status, control = (u64)code | HV_HYPERCALL_FAST_BIT;
++ 	register void *__sp asm(_ASM_SP);
++ 
++ #ifdef CONFIG_X86_64
++ 	{
++ 		__asm__ __volatile__("call *%4"
++ 				     : "=a" (hv_status), "+r" (__sp),
++ 				       "+c" (control), "+d" (input1)
++ 				     : "m" (hv_hypercall_pg)
++ 				     : "cc", "r8", "r9", "r10", "r11");
++ 	}
++ #else
++ 	{
++ 		u32 input1_hi = upper_32_bits(input1);
++ 		u32 input1_lo = lower_32_bits(input1);
++ 
++ 		__asm__ __volatile__ ("call *%5"
++ 				      : "=A"(hv_status),
++ 					"+c"(input1_lo),
++ 					"+r"(__sp)
++ 				      :	"A" (control),
++ 					"b" (input1_hi),
++ 					"m" (hv_hypercall_pg)
++ 				      : "cc", "edi", "esi");
++ 	}
++ #endif
++ 		return hv_status;
++ }
++ 
++ /*
++  * Rep hypercalls. Callers of this functions are supposed to ensure that
++  * rep_count and varhead_size comply with Hyper-V hypercall definition.
++  */
++ static inline u64 hv_do_rep_hypercall(u16 code, u16 rep_count, u16 varhead_size,
++ 				      void *input, void *output)
++ {
++ 	u64 control = code;
++ 	u64 status;
++ 	u16 rep_comp;
++ 
++ 	control |= (u64)varhead_size << HV_HYPERCALL_VARHEAD_OFFSET;
++ 	control |= (u64)rep_count << HV_HYPERCALL_REP_COMP_OFFSET;
++ 
++ 	do {
++ 		status = hv_do_hypercall(control, input, output);
++ 		if ((status & HV_HYPERCALL_RESULT_MASK) != HV_STATUS_SUCCESS)
++ 			return status;
++ 
++ 		/* Bits 32-43 of status have 'Reps completed' data. */
++ 		rep_comp = (status & HV_HYPERCALL_REP_COMP_MASK) >>
++ 			HV_HYPERCALL_REP_COMP_OFFSET;
++ 
++ 		control &= ~HV_HYPERCALL_REP_START_MASK;
++ 		control |= (u64)rep_comp << HV_HYPERCALL_REP_START_OFFSET;
++ 
++ 		touch_nmi_watchdog();
++ 	} while (rep_comp < rep_count);
++ 
++ 	return status;
++ }
++ 
++ /*
++  * Hypervisor's notion of virtual processor ID is different from
++  * Linux' notion of CPU ID. This information can only be retrieved
++  * in the context of the calling CPU. Setup a map for easy access
++  * to this information.
++  */
++ extern u32 *hv_vp_index;
++ 
++ /**
++  * hv_cpu_number_to_vp_number() - Map CPU to VP.
++  * @cpu_number: CPU number in Linux terms
++  *
++  * This function returns the mapping between the Linux processor
++  * number and the hypervisor's virtual processor number, useful
++  * in making hypercalls and such that talk about specific
++  * processors.
++  *
++  * Return: Virtual processor number in Hyper-V terms
++  */
++ static inline int hv_cpu_number_to_vp_number(int cpu_number)
++ {
++ 	return hv_vp_index[cpu_number];
++ }
++ 
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  void hyperv_init(void);
+ -void hyperv_report_panic(struct pt_regs *regs);
+ -bool hv_is_hypercall_page_setup(void);
+ -void hyperv_cleanup(void);
+ -#else /* CONFIG_HYPERV */
+ -static inline void hyperv_init(void) {}
+ -static inline bool hv_is_hypercall_page_setup(void) { return false; }
+ -static inline void hyperv_cleanup(void) {}
+ -#endif /* CONFIG_HYPERV */
+ -
+ -#ifdef CONFIG_HYPERV_TSCPAGE
+ -struct ms_hyperv_tsc_page *hv_get_tsc_page(void);
+ -static inline u64 hv_read_tsc_page(const struct ms_hyperv_tsc_page *tsc_pg)
+ -{
+ -	u64 scale, offset, cur_tsc;
+ -	u32 sequence;
+ -
+ -	/*
+ -	 * The protocol for reading Hyper-V TSC page is specified in Hypervisor
+ -	 * Top-Level Functional Specification ver. 3.0 and above. To get the
+ -	 * reference time we must do the following:
+ -	 * - READ ReferenceTscSequence
+ -	 *   A special '0' value indicates the time source is unreliable and we
+ -	 *   need to use something else. The currently published specification
+ -	 *   versions (up to 4.0b) contain a mistake and wrongly claim '-1'
+ -	 *   instead of '0' as the special value, see commit c35b82ef0294.
+ -	 * - ReferenceTime =
+ -	 *        ((RDTSC() * ReferenceTscScale) >> 64) + ReferenceTscOffset
+ -	 * - READ ReferenceTscSequence again. In case its value has changed
+ -	 *   since our first reading we need to discard ReferenceTime and repeat
+ -	 *   the whole sequence as the hypervisor was updating the page in
+ -	 *   between.
+ -	 */
+ -	do {
+ -		sequence = READ_ONCE(tsc_pg->tsc_sequence);
+ -		if (!sequence)
+ -			return U64_MAX;
+ -		/*
+ -		 * Make sure we read sequence before we read other values from
+ -		 * TSC page.
+ -		 */
+ -		smp_rmb();
+ -
+ -		scale = READ_ONCE(tsc_pg->tsc_scale);
+ -		offset = READ_ONCE(tsc_pg->tsc_offset);
+ -		cur_tsc = rdtsc_ordered();
+ -
+ -		/*
+ -		 * Make sure we read sequence after we read all other values
+ -		 * from TSC page.
+ -		 */
+ -		smp_rmb();
+ -
+ -	} while (READ_ONCE(tsc_pg->tsc_sequence) != sequence);
+ -
+ -	return mul_u64_u64_shr(cur_tsc, scale, 64) + offset;
+ -}
+ -
+ -#else
+ -static inline struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
+ -{
+ -	return NULL;
+ -}
+  #endif
+  #endif
+diff --cc drivers/hv/connection.c
+index ce0f35db478b,f41901f80b64..000000000000
+--- a/drivers/hv/connection.c
++++ b/drivers/hv/connection.c
+@@@ -94,10 -96,12 +94,16 @@@ static int vmbus_negotiate_version(stru
+  	 * the CPU attempting to connect may not be CPU 0.
+  	 */
+  	if (version >= VERSION_WIN8_1) {
+++<<<<<<< HEAD
+ +		msg->target_vcpu = hv_context.vp_index[get_cpu()];
+ +		put_cpu();
+++=======
++ 		msg->target_vcpu =
++ 			hv_cpu_number_to_vp_number(smp_processor_id());
++ 		vmbus_connection.connect_cpu = smp_processor_id();
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  	} else {
+  		msg->target_vcpu = 0;
+ -		vmbus_connection.connect_cpu = 0;
+  	}
+  
+  	/*
+diff --cc drivers/hv/hv.c
+index f6a591c69dfd,8267439dd1ee..000000000000
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@@ -435,29 -234,26 +435,28 @@@ int hv_synic_init(unsigned int cpu
+  	union hv_synic_siefp siefp;
+  	union hv_synic_sint shared_sint;
+  	union hv_synic_scontrol sctrl;
+- 	u64 vp_index;
+  
+ +	/* Check the version */
+ +	rdmsrl(HV_X64_MSR_SVERSION, version);
+ +
+  	/* Setup the Synic's message page */
+ -	hv_get_simp(simp.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SIMP, simp.as_uint64);
+  	simp.simp_enabled = 1;
+ -	simp.base_simp_gpa = virt_to_phys(hv_cpu->synic_message_page)
+ +	simp.base_simp_gpa = virt_to_phys(hv_context.synic_message_page[cpu])
+  		>> PAGE_SHIFT;
+  
+ -	hv_set_simp(simp.as_uint64);
+ +	wrmsrl(HV_X64_MSR_SIMP, simp.as_uint64);
+  
+  	/* Setup the Synic's event page */
+ -	hv_get_siefp(siefp.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SIEFP, siefp.as_uint64);
+  	siefp.siefp_enabled = 1;
+ -	siefp.base_siefp_gpa = virt_to_phys(hv_cpu->synic_event_page)
+ +	siefp.base_siefp_gpa = virt_to_phys(hv_context.synic_event_page[cpu])
+  		>> PAGE_SHIFT;
+  
+ -	hv_set_siefp(siefp.as_uint64);
+ +	wrmsrl(HV_X64_MSR_SIEFP, siefp.as_uint64);
+  
+  	/* Setup the shared SINT. */
+ -	hv_get_synint_state(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT,
+ -			    shared_sint.as_uint64);
+ +	rdmsrl(HV_X64_MSR_SINT0 + VMBUS_MESSAGE_SINT, shared_sint.as_uint64);
+  
+  	shared_sint.as_uint64 = 0;
+  	shared_sint.vector = HYPERVISOR_CALLBACK_VECTOR;
+@@@ -475,18 -275,13 +474,21 @@@
+  	hv_context.synic_initialized = true;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Setup the mapping between Hyper-V's notion
+ +	 * of cpuid and Linux' notion of cpuid.
+ +	 * This array will be indexed using Linux cpuid.
+ +	 */
+ +	rdmsrl(HV_X64_MSR_VP_INDEX, vp_index);
+ +	hv_context.vp_index[cpu] = (u32)vp_index;
+ +
+ +	/*
+++=======
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  	 * Register the per-cpu clockevent source.
+  	 */
+ -	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
+ -		clockevents_config_and_register(hv_cpu->clk_evt,
+ -						HV_TIMER_FREQUENCY,
+ -						HV_MIN_DELTA_TICKS,
+ -						HV_MAX_MAX_DELTA_TICKS);
+ +	hv_clockevents_bind(cpu);
+ +
+  	return 0;
+  }
+  
+diff --cc drivers/hv/hyperv_vmbus.h
+index fe2016fea9b4,49569f8fe038..000000000000
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@@ -381,39 -226,9 +381,42 @@@ struct hv_context 
+  
+  	bool synic_initialized;
+  
+ -	struct hv_per_cpu_context __percpu *cpu_context;
+ -
+ +	void *synic_message_page[NR_CPUS];
+ +	void *synic_event_page[NR_CPUS];
+ +	/*
+++<<<<<<< HEAD
+ +	 * Hypervisor's notion of virtual processor ID is different from
+ +	 * Linux' notion of CPU ID. This information can only be retrieved
+ +	 * in the context of the calling CPU. Setup a map for easy access
+ +	 * to this information:
+ +	 *
+ +	 * vp_index[a] is the Hyper-V's processor ID corresponding to
+ +	 * Linux cpuid 'a'.
+ +	 */
+ +	u32 vp_index[NR_CPUS];
+ +	/*
+ +	 * Starting with win8, we can take channel interrupts on any CPU;
+ +	 * we will manage the tasklet that handles events messages on a per CPU
+ +	 * basis.
+ +	 */
+ +	struct tasklet_struct *event_dpc[NR_CPUS];
+ +	struct tasklet_struct *msg_dpc[NR_CPUS];
+ +	/*
+ +	 * To optimize the mapping of relid to channel, maintain
+ +	 * per-cpu list of the channels based on their CPU affinity.
+ +	 */
+ +	struct list_head percpu_list[NR_CPUS];
+  	/*
+ +	 * buffer to post messages to the host.
+ +	 */
+ +	void *post_msg_page[NR_CPUS];
+ +	/*
+ +	 * Support PV clockevent device.
+ +	 */
+ +	struct clock_event_device *clk_evt[NR_CPUS];
+ +	/*
+++=======
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  	 * To manage allocations in a NUMA node.
+  	 * Array indexed by numa node ID.
+  	 */
+diff --cc drivers/pci/pci-hyperv.c
+index 61c7f8142d81,aba041438566..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -749,44 -896,67 +749,90 @@@ static int hv_set_affinity(struct irq_d
+  			   (hbus->hdev->dev_instance.b[7] << 8) |
+  			   (hbus->hdev->dev_instance.b[6] & 0xf8) |
+  			   PCI_FUNC(pdev->devfn);
+ -	params->int_target.vector = cfg->vector;
+ +	params->vector = cfg->vector;
+  
+ -	/*
+ -	 * Honoring apic->irq_delivery_mode set to dest_Fixed by
+ -	 * setting the HV_DEVICE_INTERRUPT_TARGET_MULTICAST flag results in a
+ -	 * spurious interrupt storm. Not doing so does not seem to have a
+ -	 * negative effect (yet?).
+ -	 */
+ +	for_each_cpu_and(cpu, dest, cpu_online_mask)
+ +		params->vp_mask |= (1ULL << vmbus_cpu_number_to_vp_number(cpu));
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	hv_do_hypercall(HVCALL_RETARGET_INTERRUPT, params, NULL);
+++=======
++ 	if (pci_protocol_version >= PCI_PROTOCOL_VERSION_1_2) {
++ 		/*
++ 		 * PCI_PROTOCOL_VERSION_1_2 supports the VP_SET version of the
++ 		 * HVCALL_RETARGET_INTERRUPT hypercall, which also coincides
++ 		 * with >64 VP support.
++ 		 * ms_hyperv.hints & HV_X64_EX_PROCESSOR_MASKS_RECOMMENDED
++ 		 * is not sufficient for this hypercall.
++ 		 */
++ 		params->int_target.flags |=
++ 			HV_DEVICE_INTERRUPT_TARGET_PROCESSOR_SET;
++ 		params->int_target.vp_set.valid_banks =
++ 			(1ull << HV_VP_SET_BANK_COUNT_MAX) - 1;
++ 
++ 		/*
++ 		 * var-sized hypercall, var-size starts after vp_mask (thus
++ 		 * vp_set.format does not count, but vp_set.valid_banks does).
++ 		 */
++ 		var_size = 1 + HV_VP_SET_BANK_COUNT_MAX;
++ 
++ 		for_each_cpu_and(cpu, dest, cpu_online_mask) {
++ 			cpu_vmbus = hv_cpu_number_to_vp_number(cpu);
++ 
++ 			if (cpu_vmbus >= HV_VP_SET_BANK_COUNT_MAX * 64) {
++ 				dev_err(&hbus->hdev->device,
++ 					"too high CPU %d", cpu_vmbus);
++ 				res = 1;
++ 				goto exit_unlock;
++ 			}
++ 
++ 			params->int_target.vp_set.masks[cpu_vmbus / 64] |=
++ 				(1ULL << (cpu_vmbus & 63));
++ 		}
++ 	} else {
++ 		for_each_cpu_and(cpu, dest, cpu_online_mask) {
++ 			params->int_target.vp_mask |=
++ 				(1ULL << hv_cpu_number_to_vp_number(cpu));
++ 		}
++ 	}
++ 
++ 	res = hv_do_hypercall(HVCALL_RETARGET_INTERRUPT | (var_size << 17),
++ 			      params, NULL);
++ 
++ exit_unlock:
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index):drivers/pci/host/pci-hyperv.c
+  	spin_unlock_irqrestore(&hbus->retarget_msi_interrupt_lock, flags);
+  
+ -	if (res) {
+ -		dev_err(&hbus->hdev->device,
+ -			"%s() failed: %#llx", __func__, res);
+ -		return;
+ +	return 0;
+ +}
+ +
+ +int hv_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type)
+ +{
+ +	struct msi_desc *msidesc;
+ +	struct irq_chip *chip;
+ +	int ret;
+ +
+ +	/*
+ +	 * Call the base function which will do everything related to setting up
+ +	 * the tracking structures.
+ +	 */
+ +
+ +	ret = hv_msi.setup_msi_irqs(pdev, nvec, type);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_for_each_entry(msidesc, &pdev->msi_list, list) {
+ +		if (msidesc->irq) {
+ +			chip = irq_get_chip(msidesc->irq);
+ +			/*
+ +			 * Replace the affinity callback so that it doesn't
+ +			 * rearrage the message in the hardware.
+ +			 */
+ +			chip->irq_set_affinity = hv_set_affinity;
+ +		}
+  	}
+  
+ -	pci_msi_unmask_irq(data);
+ +	return 0;
+  }
+  
+  struct compose_comp_ctxt {
+@@@ -806,8 -976,57 +852,58 @@@ static void hv_pci_compose_compl(void *
+  	complete(&comp_pkt->comp_pkt.host_event);
+  }
+  
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ static u32 hv_compose_msi_req_v1(
++ 	struct pci_create_interrupt *int_pkt, struct cpumask *affinity,
++ 	u32 slot, u8 vector)
++ {
++ 	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE;
++ 	int_pkt->wslot.slot = slot;
++ 	int_pkt->int_desc.vector = vector;
++ 	int_pkt->int_desc.vector_count = 1;
++ 	int_pkt->int_desc.delivery_mode =
++ 		(apic->irq_delivery_mode == dest_LowestPrio) ?
++ 			dest_LowestPrio : dest_Fixed;
++ 
++ 	/*
++ 	 * Create MSI w/ dummy vCPU set, overwritten by subsequent retarget in
++ 	 * hv_irq_unmask().
++ 	 */
++ 	int_pkt->int_desc.cpu_mask = CPU_AFFINITY_ALL;
++ 
++ 	return sizeof(*int_pkt);
++ }
++ 
++ static u32 hv_compose_msi_req_v2(
++ 	struct pci_create_interrupt2 *int_pkt, struct cpumask *affinity,
++ 	u32 slot, u8 vector)
++ {
++ 	int cpu;
++ 
++ 	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE2;
++ 	int_pkt->wslot.slot = slot;
++ 	int_pkt->int_desc.vector = vector;
++ 	int_pkt->int_desc.vector_count = 1;
++ 	int_pkt->int_desc.delivery_mode =
++ 		(apic->irq_delivery_mode == dest_LowestPrio) ?
++ 			dest_LowestPrio : dest_Fixed;
++ 
++ 	/*
++ 	 * Create MSI w/ dummy vCPU set targeting just one vCPU, overwritten
++ 	 * by subsequent retarget in hv_irq_unmask().
++ 	 */
++ 	cpu = cpumask_first_and(affinity, cpu_online_mask);
++ 	int_pkt->int_desc.processor_array[0] =
++ 		hv_cpu_number_to_vp_number(cpu);
++ 	int_pkt->int_desc.processor_count = 1;
++ 
++ 	return sizeof(*int_pkt);
++ }
++ 
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index):drivers/pci/host/pci-hyperv.c
+  /**
+   * hv_compose_msi_msg() - Supplies a valid MSI address/data
+ - * @data:	Everything about this MSI
+ - * @msg:	Buffer that is filled in by this function
+   *
+   * This function unpacks the IRQ looking for target CPU set, IDT
+   * vector and mode and sends a message to the parent partition
+diff --cc include/linux/hyperv.h
+index aa56be06d88b,e2a4fa57f110..000000000000
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@@ -1153,21 -1173,6 +1153,24 @@@ int vmbus_allocate_mmio(struct resourc
+  			resource_size_t size, resource_size_t align,
+  			bool fb_overlap_ok);
+  void vmbus_free_mmio(resource_size_t start, resource_size_t size);
+++<<<<<<< HEAD
+ +int vmbus_cpu_number_to_vp_number(int cpu_number);
+ +u64 hv_do_hypercall(u64 control, void *input, void *output);
+ +
+ +/**
+ + * VMBUS_DEVICE - macro used to describe a specific hyperv vmbus device
+ + *
+ + * This macro is used to create a struct hv_vmbus_device_id that matches a
+ + * specific device.
+ + */
+ +#define VMBUS_DEVICE(g0, g1, g2, g3, g4, g5, g6, g7,	\
+ +		     g8, g9, ga, gb, gc, gd, ge, gf)	\
+ +	.guid = { g0, g1, g2, g3, g4, g5, g6, g7,	\
+ +		  g8, g9, ga, gb, gc, gd, ge, gf },
+ +
+ +
+++=======
+++>>>>>>> 7415aea6072b (hyper-v: Globalize vp_index)
+  
+  /*
+   * GUID definitions of various offer types - services offered to the guest.
+* Unmerged path arch/x86/hyperv/hv_init.c
+* Unmerged path arch/x86/include/asm/mshyperv.h
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index d086400f9ca0..7a85d0522838 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -593,7 +593,7 @@ static void init_vp_index(struct vmbus_channel *channel, u16 dev_type)
+ 		 */
+ 		channel->numa_node = 0;
+ 		channel->target_cpu = 0;
+-		channel->target_vp = hv_context.vp_index[0];
++		channel->target_vp = hv_cpu_number_to_vp_number(0);
+ 		return;
+ 	}
+ 
+@@ -677,7 +677,7 @@ static void init_vp_index(struct vmbus_channel *channel, u16 dev_type)
+ 	}
+ 
+ 	channel->target_cpu = cur_cpu;
+-	channel->target_vp = hv_context.vp_index[cur_cpu];
++	channel->target_vp = hv_cpu_number_to_vp_number(cur_cpu);
+ }
+ 
+ static void vmbus_wait_for_unload(void)
+@@ -1171,8 +1171,7 @@ struct vmbus_channel *vmbus_get_outgoing_channel(struct vmbus_channel *primary)
+ 		return outgoing_channel;
+ 	}
+ 
+-	cur_cpu = hv_context.vp_index[get_cpu()];
+-	put_cpu();
++	cur_cpu = hv_cpu_number_to_vp_number(smp_processor_id());
+ 	list_for_each_safe(cur, tmp, &primary->sc_list) {
+ 		cur_channel = list_entry(cur, struct vmbus_channel, sc_list);
+ 		if (cur_channel->state != CHANNEL_OPENED_STATE)
+* Unmerged path drivers/hv/connection.c
+* Unmerged path drivers/hv/hv.c
+* Unmerged path drivers/hv/hyperv_vmbus.h
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index c0ae167b5e36..2586977e9d87 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -1434,23 +1434,6 @@ void vmbus_free_mmio(resource_size_t start, resource_size_t size)
+ }
+ EXPORT_SYMBOL_GPL(vmbus_free_mmio);
+ 
+-/**
+- * vmbus_cpu_number_to_vp_number() - Map CPU to VP.
+- * @cpu_number: CPU number in Linux terms
+- *
+- * This function returns the mapping between the Linux processor
+- * number and the hypervisor's virtual processor number, useful
+- * in making hypercalls and such that talk about specific
+- * processors.
+- *
+- * Return: Virtual processor number in Hyper-V terms
+- */
+-int vmbus_cpu_number_to_vp_number(int cpu_number)
+-{
+-	return hv_context.vp_index[cpu_number];
+-}
+-EXPORT_SYMBOL_GPL(vmbus_cpu_number_to_vp_number);
+-
+ static int vmbus_acpi_add(struct acpi_device *device)
+ {
+ 	acpi_status result;
+* Unmerged path drivers/pci/pci-hyperv.c
+* Unmerged path include/linux/hyperv.h
