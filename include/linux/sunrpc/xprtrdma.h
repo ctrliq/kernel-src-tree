@@ -53,8 +53,8 @@
 #define RPCRDMA_MAX_SLOT_TABLE	(256U)
 
 #define RPCRDMA_MIN_INLINE  (1024)	/* min inline thresh */
-#define RPCRDMA_DEF_INLINE  (1024)	/* default inline thresh */
-#define RPCRDMA_MAX_INLINE  (3068)	/* max inline thresh */
+#define RPCRDMA_DEF_INLINE  (4096)	/* default inline thresh */
+#define RPCRDMA_MAX_INLINE  (65536)	/* max inline thresh */
 
 #define RPCRDMA_INLINE_PAD_THRESH  (512)/* payload threshold to pad (bytes) */
 
