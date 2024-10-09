@@ -1,0 +1,93 @@
+netem: fix skb_orphan_partial()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit f6ba8d33cfbb46df569972e64dbb5bb7e929bfd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f6ba8d33.failed
+
+I should have known that lowering skb->truesize was dangerous :/
+
+In case packets are not leaving the host via a standard Ethernet device,
+but looped back to local sockets, bad things can happen, as reported
+by Michael Madsen ( https://bugzilla.kernel.org/show_bug.cgi?id=195713 )
+
+So instead of tweaking skb->truesize, lets change skb->destructor
+and keep a reference on the owner socket via its sk_refcnt.
+
+Fixes: f2f872f9272a ("netem: Introduce skb_orphan_partial() helper")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Michael Madsen <mkm@nabto.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f6ba8d33cfbb46df569972e64dbb5bb7e929bfd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/sock.c
+diff --cc net/core/sock.c
+index b453f6bf7361,e43e71d7856b..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -1602,12 -1766,50 +1602,59 @@@ void sock_wfree(struct sk_buff *skb
+  }
+  EXPORT_SYMBOL(sock_wfree);
+  
+++<<<<<<< HEAD
+ +void skb_orphan_partial(struct sk_buff *skb)
+ +{
+ +	/* TCP stack sets skb->ooo_okay based on sk_wmem_alloc,
+ +	 * so we do not completely orphan skb, but transfert all
+ +	 * accounted bytes but one, to avoid unexpected reorders.
+ +	 */
+++=======
++ /* This variant of sock_wfree() is used by TCP,
++  * since it sets SOCK_USE_WRITE_QUEUE.
++  */
++ void __sock_wfree(struct sk_buff *skb)
++ {
++ 	struct sock *sk = skb->sk;
++ 
++ 	if (atomic_sub_and_test(skb->truesize, &sk->sk_wmem_alloc))
++ 		__sk_free(sk);
++ }
++ 
++ void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)
++ {
++ 	skb_orphan(skb);
++ 	skb->sk = sk;
++ #ifdef CONFIG_INET
++ 	if (unlikely(!sk_fullsock(sk))) {
++ 		skb->destructor = sock_edemux;
++ 		sock_hold(sk);
++ 		return;
++ 	}
++ #endif
++ 	skb->destructor = sock_wfree;
++ 	skb_set_hash_from_sk(skb, sk);
++ 	/*
++ 	 * We used to take a refcount on sk, but following operation
++ 	 * is enough to guarantee sk_free() wont free this sock until
++ 	 * all in-flight packets are completed
++ 	 */
++ 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
++ }
++ EXPORT_SYMBOL(skb_set_owner_w);
++ 
++ /* This helper is used by netem, as it can hold packets in its
++  * delay queue. We want to allow the owner socket to send more
++  * packets, as if they were already TX completed by a typical driver.
++  * But we also want to keep skb->sk set because some packet schedulers
++  * rely on it (sch_fq for example).
++  */
++ void skb_orphan_partial(struct sk_buff *skb)
++ {
++ 	if (skb_is_tcp_pure_ack(skb))
++ 		return;
++ 
+++>>>>>>> f6ba8d33cfbb (netem: fix skb_orphan_partial())
+  	if (skb->destructor == sock_wfree
+  #ifdef CONFIG_INET
+  	    || skb->destructor == tcp_wfree
+* Unmerged path net/core/sock.c
