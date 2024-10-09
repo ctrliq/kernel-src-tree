@@ -1,0 +1,195 @@
+dm mpath: use dm_mq_kick_requeue_list()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 7e48c768f44056a06bca596577c37f7721b53f0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7e48c768.failed
+
+When reinstating a path the blk-mq request_queue's requeue_list should
+get kicked.  It makes sense to kick the requeue_list as part of the
+existing hook (previously only used by bio-based support).
+
+Rename process_queued_bios_list to process_queued_io_list.
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+(cherry picked from commit 7e48c768f44056a06bca596577c37f7721b53f0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index 18be29ec3a10,f69715bf0575..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -540,6 -621,110 +540,113 @@@ static void multipath_release_clone(str
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Map cloned bios (bio-based multipath)
++  */
++ static int __multipath_map_bio(struct multipath *m, struct bio *bio, struct dm_mpath_io *mpio)
++ {
++ 	size_t nr_bytes = bio->bi_iter.bi_size;
++ 	struct pgpath *pgpath;
++ 	unsigned long flags;
++ 	bool queue_io;
++ 
++ 	/* Do we need to select a new pgpath? */
++ 	pgpath = lockless_dereference(m->current_pgpath);
++ 	queue_io = test_bit(MPATHF_QUEUE_IO, &m->flags);
++ 	if (!pgpath || !queue_io)
++ 		pgpath = choose_pgpath(m, nr_bytes);
++ 
++ 	if ((pgpath && queue_io) ||
++ 	    (!pgpath && test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))) {
++ 		/* Queue for the daemon to resubmit */
++ 		spin_lock_irqsave(&m->lock, flags);
++ 		bio_list_add(&m->queued_bios, bio);
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		/* PG_INIT_REQUIRED cannot be set without QUEUE_IO */
++ 		if (queue_io || test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
++ 			pg_init_all_paths(m);
++ 		else if (!queue_io)
++ 			queue_work(kmultipathd, &m->process_queued_bios);
++ 		return DM_MAPIO_SUBMITTED;
++ 	}
++ 
++ 	if (!pgpath) {
++ 		if (!must_push_back_bio(m))
++ 			return -EIO;
++ 		return DM_MAPIO_REQUEUE;
++ 	}
++ 
++ 	mpio->pgpath = pgpath;
++ 	mpio->nr_bytes = nr_bytes;
++ 
++ 	bio->bi_error = 0;
++ 	bio->bi_bdev = pgpath->path.dev->bdev;
++ 	bio->bi_opf |= REQ_FAILFAST_TRANSPORT;
++ 
++ 	if (pgpath->pg->ps.type->start_io)
++ 		pgpath->pg->ps.type->start_io(&pgpath->pg->ps,
++ 					      &pgpath->path,
++ 					      nr_bytes);
++ 	return DM_MAPIO_REMAPPED;
++ }
++ 
++ static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
++ {
++ 	struct multipath *m = ti->private;
++ 	struct dm_mpath_io *mpio = NULL;
++ 
++ 	multipath_init_per_bio_data(bio, &mpio, NULL);
++ 
++ 	return __multipath_map_bio(m, bio, mpio);
++ }
++ 
++ static void process_queued_io_list(struct multipath *m)
++ {
++ 	if (m->queue_mode == DM_TYPE_MQ_REQUEST_BASED)
++ 		dm_mq_kick_requeue_list(dm_table_get_md(m->ti->table));
++ 	else if (m->queue_mode == DM_TYPE_BIO_BASED)
++ 		queue_work(kmultipathd, &m->process_queued_bios);
++ }
++ 
++ static void process_queued_bios(struct work_struct *work)
++ {
++ 	int r;
++ 	unsigned long flags;
++ 	struct bio *bio;
++ 	struct bio_list bios;
++ 	struct blk_plug plug;
++ 	struct multipath *m =
++ 		container_of(work, struct multipath, process_queued_bios);
++ 
++ 	bio_list_init(&bios);
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 
++ 	if (bio_list_empty(&m->queued_bios)) {
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		return;
++ 	}
++ 
++ 	bio_list_merge(&bios, &m->queued_bios);
++ 	bio_list_init(&m->queued_bios);
++ 
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 
++ 	blk_start_plug(&plug);
++ 	while ((bio = bio_list_pop(&bios))) {
++ 		r = __multipath_map_bio(m, bio, get_mpio_from_bio(bio));
++ 		if (r < 0 || r == DM_MAPIO_REQUEUE) {
++ 			bio->bi_error = r;
++ 			bio_endio(bio);
++ 		} else if (r == DM_MAPIO_REMAPPED)
++ 			generic_make_request(bio);
++ 	}
++ 	blk_finish_plug(&plug);
++ }
++ 
++ /*
+++>>>>>>> 7e48c768f440 (dm mpath: use dm_mq_kick_requeue_list())
+   * If we run out of usable paths, should we queue I/O or error it?
+   */
+  static int queue_if_no_path(struct multipath *m, bool queue_if_no_path,
+@@@ -567,8 -752,10 +674,13 @@@
+  
+  	spin_unlock_irqrestore(&m->lock, flags);
+  
+ -	if (!queue_if_no_path) {
+ +	if (!queue_if_no_path)
+  		dm_table_run_md_queue_async(m->ti->table);
+++<<<<<<< HEAD
+++=======
++ 		process_queued_io_list(m);
++ 	}
+++>>>>>>> 7e48c768f440 (dm mpath: use dm_mq_kick_requeue_list())
+  
+  	return 0;
+  }
+@@@ -1101,8 -1304,10 +1213,13 @@@ static int reinstate_path(struct pgpat
+  
+  out:
+  	spin_unlock_irqrestore(&m->lock, flags);
+ -	if (run_queue) {
+ +	if (run_queue)
+  		dm_table_run_md_queue_async(m->ti->table);
+++<<<<<<< HEAD
+++=======
++ 		process_queued_io_list(m);
++ 	}
+++>>>>>>> 7e48c768f440 (dm mpath: use dm_mq_kick_requeue_list())
+  
+  	return r;
+  }
+@@@ -1299,6 -1504,8 +1416,11 @@@ static void pg_init_done(void *data, in
+  	}
+  	clear_bit(MPATHF_QUEUE_IO, &m->flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	process_queued_io_list(m);
++ 
+++>>>>>>> 7e48c768f440 (dm mpath: use dm_mq_kick_requeue_list())
+  	/*
+  	 * Wake up any thread waiting to suspend.
+  	 */
+@@@ -1662,6 -1939,7 +1784,10 @@@ static int multipath_prepare_ioctl(stru
+  		if (test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
+  			pg_init_all_paths(m);
+  		dm_table_run_md_queue_async(m->ti->table);
+++<<<<<<< HEAD
+++=======
++ 		process_queued_io_list(m);
+++>>>>>>> 7e48c768f440 (dm mpath: use dm_mq_kick_requeue_list())
+  	}
+  
+  	/*
+* Unmerged path drivers/md/dm-mpath.c
