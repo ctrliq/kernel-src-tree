@@ -1,0 +1,121 @@
+s390/pci: handle insufficient resources during dma tlb flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] pci: handle insufficient resources during dma tlb flush (Hendrik Brueckner) [1539025]
+Rebuild_FUZZ: 95.65%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit a5f1005517534aeb1fac20180badfbf0896c183c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a5f10055.failed
+
+In a virtualized setup lazy flushing can lead to the hypervisor
+running out of resources when lots of guest pages need to be
+pinned. In this situation simply trigger a global flush to give
+the hypervisor a chance to free some of these resources.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit a5f1005517534aeb1fac20180badfbf0896c183c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_dma.c
+#	arch/s390/pci/pci_insn.c
+diff --cc arch/s390/pci/pci_dma.c
+index 0a25a0fb6217,2d15d84c20ed..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -191,7 -178,62 +191,66 @@@ no_refresh
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static void dma_free_seg_table(unsigned long entry)
+++=======
++ static int __dma_purge_tlb(struct zpci_dev *zdev, dma_addr_t dma_addr,
++ 			   size_t size, int flags)
++ {
++ 	unsigned long irqflags;
++ 	int ret;
++ 
++ 	/*
++ 	 * With zdev->tlb_refresh == 0, rpcit is not required to establish new
++ 	 * translations when previously invalid translation-table entries are
++ 	 * validated. With lazy unmap, rpcit is skipped for previously valid
++ 	 * entries, but a global rpcit is then required before any address can
++ 	 * be re-used, i.e. after each iommu bitmap wrap-around.
++ 	 */
++ 	if ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID) {
++ 		if (!zdev->tlb_refresh)
++ 			return 0;
++ 	} else {
++ 		if (!s390_iommu_strict)
++ 			return 0;
++ 	}
++ 
++ 	ret = zpci_refresh_trans((u64) zdev->fh << 32, dma_addr,
++ 				 PAGE_ALIGN(size));
++ 	if (ret == -ENOMEM && !s390_iommu_strict) {
++ 		/* enable the hypervisor to free some resources */
++ 		if (zpci_refresh_global(zdev))
++ 			goto out;
++ 
++ 		spin_lock_irqsave(&zdev->iommu_bitmap_lock, irqflags);
++ 		bitmap_andnot(zdev->iommu_bitmap, zdev->iommu_bitmap,
++ 			      zdev->lazy_bitmap, zdev->iommu_pages);
++ 		bitmap_zero(zdev->lazy_bitmap, zdev->iommu_pages);
++ 		spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, irqflags);
++ 		ret = 0;
++ 	}
++ out:
++ 	return ret;
++ }
++ 
++ static int dma_update_trans(struct zpci_dev *zdev, unsigned long pa,
++ 			    dma_addr_t dma_addr, size_t size, int flags)
++ {
++ 	int rc;
++ 
++ 	rc = __dma_update_trans(zdev, pa, dma_addr, size, flags);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = __dma_purge_tlb(zdev, dma_addr, size, flags);
++ 	if (rc && ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID))
++ 		__dma_update_trans(zdev, pa, dma_addr, size, ZPCI_PTE_INVALID);
++ 
++ 	return rc;
++ }
++ 
++ void dma_free_seg_table(unsigned long entry)
+++>>>>>>> a5f100551753 (s390/pci: handle insufficient resources during dma tlb flush)
+  {
+  	unsigned long *sto = get_rt_sto(entry);
+  	int sx;
+diff --cc arch/s390/pci/pci_insn.c
+index 44fa91a4e9a9,f069929e8211..000000000000
+--- a/arch/s390/pci/pci_insn.c
++++ b/arch/s390/pci/pci_insn.c
+@@@ -73,8 -87,11 +73,16 @@@ int zpci_refresh_trans(u64 fn, u64 addr
+  	} while (cc == 2);
+  
+  	if (cc)
+++<<<<<<< HEAD
+ +		printk_once(KERN_ERR "%s: error cc: %d  status: %d  dma_addr: %Lx  size: %Lx\n",
+ +			    __func__, cc, status, addr, range);
+++=======
++ 		zpci_err_insn(cc, status, addr, range);
++ 
++ 	if (cc == 1 && (status == 4 || status == 16))
++ 		return -ENOMEM;
++ 
+++>>>>>>> a5f100551753 (s390/pci: handle insufficient resources during dma tlb flush)
+  	return (cc) ? -EIO : 0;
+  }
+  
+* Unmerged path arch/s390/pci/pci_dma.c
+* Unmerged path arch/s390/pci/pci_insn.c
