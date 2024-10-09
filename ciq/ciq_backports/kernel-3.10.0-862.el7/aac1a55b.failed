@@ -1,0 +1,171 @@
+GFS2: Switch fiemap implementation to use iomap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit aac1a55b450c623ec236c0635cdb68408f632e9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/aac1a55b.failed
+
+This patch switches GFS2's implementation of fiemap from the old
+block_map code to the new iomap interface.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit aac1a55b450c623ec236c0635cdb68408f632e9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/inode.c
+diff --cc fs/gfs2/inode.c
+index 29cd4718980e,321da48ca123..000000000000
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@@ -17,9 -18,9 +17,9 @@@
+  #include <linux/posix_acl.h>
+  #include <linux/gfs2_ondisk.h>
+  #include <linux/crc32.h>
+- #include <linux/fiemap.h>
++ #include <linux/iomap.h>
+  #include <linux/security.h>
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  
+  #include "gfs2.h"
+  #include "incore.h"
+@@@ -1945,66 -2003,9 +1945,72 @@@ static int gfs2_getattr(struct vfsmoun
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int gfs2_setxattr(struct dentry *dentry, const char *name,
+ +			 const void *data, size_t size, int flags)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct gfs2_inode *ip = GFS2_I(inode);
+ +	struct gfs2_holder gh;
+ +	int ret;
+ +
+ +	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
+ +	ret = gfs2_glock_nq(&gh);
+ +	if (ret == 0) {
+ +		ret = gfs2_rsqa_alloc(ip);
+ +		if (ret == 0)
+ +			ret = generic_setxattr(dentry, name, data, size, flags);
+ +		gfs2_glock_dq(&gh);
+ +	}
+ +	gfs2_holder_uninit(&gh);
+ +	return ret;
+ +}
+ +
+ +static ssize_t gfs2_getxattr(struct dentry *dentry, const char *name,
+ +			     void *data, size_t size)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct gfs2_inode *ip = GFS2_I(inode);
+ +	struct gfs2_holder gh;
+ +	int ret;
+ +
+ +	/* For selinux during lookup */
+ +	if (gfs2_glock_is_locked_by_me(ip->i_gl))
+ +		return generic_getxattr(dentry, name, data, size);
+ +
+ +	gfs2_holder_init(ip->i_gl, LM_ST_SHARED, LM_FLAG_ANY, &gh);
+ +	ret = gfs2_glock_nq(&gh);
+ +	if (ret == 0) {
+ +		ret = generic_getxattr(dentry, name, data, size);
+ +		gfs2_glock_dq(&gh);
+ +	}
+ +	gfs2_holder_uninit(&gh);
+ +	return ret;
+ +}
+ +
+ +static int gfs2_removexattr(struct dentry *dentry, const char *name)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct gfs2_inode *ip = GFS2_I(inode);
+ +	struct gfs2_holder gh;
+ +	int ret;
+ +
+ +	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &gh);
+ +	ret = gfs2_glock_nq(&gh);
+ +	if (ret == 0) {
+ +		ret = gfs2_rsqa_alloc(ip);
+ +		if (ret == 0)
+ +			ret = generic_removexattr(dentry, name);
+ +		gfs2_glock_dq(&gh);
+ +	}
+ +	gfs2_holder_uninit(&gh);
+ +	return ret;
+ +}
+++=======
++ const struct iomap_ops gfs2_iomap_ops = {
++ 	.iomap_begin = gfs2_iomap_begin,
++ };
+++>>>>>>> aac1a55b450c (GFS2: Switch fiemap implementation to use iomap)
+  
+  static int gfs2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+  		       u64 start, u64 len)
+@@@ -2013,38 -2014,18 +2019,30 @@@
+  	struct gfs2_holder gh;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = fiemap_check_flags(fieinfo, FIEMAP_FLAG_SYNC);
+ +	if (ret)
+ +		return ret;
+ +
+ +	mutex_lock(&inode->i_mutex);
+++=======
++ 	inode_lock_shared(inode);
+++>>>>>>> aac1a55b450c (GFS2: Switch fiemap implementation to use iomap)
+  
+  	ret = gfs2_glock_nq_init(ip->i_gl, LM_ST_SHARED, 0, &gh);
+  	if (ret)
+  		goto out;
+  
+- 	if (gfs2_is_stuffed(ip)) {
+- 		u64 phys = ip->i_no_addr << inode->i_blkbits;
+- 		u64 size = i_size_read(inode);
+- 		u32 flags = FIEMAP_EXTENT_LAST|FIEMAP_EXTENT_NOT_ALIGNED|
+- 			    FIEMAP_EXTENT_DATA_INLINE;
+- 		phys += sizeof(struct gfs2_dinode);
+- 		phys += start;
+- 		if (start + len > size)
+- 			len = size - start;
+- 		if (start < size)
+- 			ret = fiemap_fill_next_extent(fieinfo, start, phys,
+- 						      len, flags);
+- 		if (ret == 1)
+- 			ret = 0;
+- 	} else {
+- 		ret = __generic_block_fiemap(inode, fieinfo, start, len,
+- 					     gfs2_block_map);
+- 	}
++ 	ret = iomap_fiemap(inode, fieinfo, start, len, &gfs2_iomap_ops);
+  
+  	gfs2_glock_dq_uninit(&gh);
++ 
+  out:
+++<<<<<<< HEAD
+ +	mutex_unlock(&inode->i_mutex);
+++=======
++ 	inode_unlock_shared(inode);
+++>>>>>>> aac1a55b450c (GFS2: Switch fiemap implementation to use iomap)
+  	return ret;
+  }
+  
+diff --git a/fs/gfs2/Kconfig b/fs/gfs2/Kconfig
+index 90c6a8faaecb..43c827a7cce5 100644
+--- a/fs/gfs2/Kconfig
++++ b/fs/gfs2/Kconfig
+@@ -4,6 +4,7 @@ config GFS2_FS
+ 	select FS_POSIX_ACL
+ 	select CRC32
+ 	select QUOTACTL
++	select FS_IOMAP
+ 	help
+ 	  A cluster filesystem.
+ 
+* Unmerged path fs/gfs2/inode.c
