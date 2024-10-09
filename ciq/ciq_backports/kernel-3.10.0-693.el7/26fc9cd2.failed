@@ -1,0 +1,1014 @@
+kernfs: move the last knowledge of sysfs out from kernfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jianyu Zhan <nasa4836@gmail.com>
+commit 26fc9cd200ec839e0b3095e05ae018f27314e7aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/26fc9cd2.failed
+
+There is still one residue of sysfs remaining: the sb_magic
+SYSFS_MAGIC. However this should be kernfs user specific,
+so this patch moves it out. Kerrnfs user should specify their
+magic number while mouting.
+
+	Signed-off-by: Jianyu Zhan <nasa4836@gmail.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 26fc9cd200ec839e0b3095e05ae018f27314e7aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/mount.c
+#	fs/sysfs/mount.c
+#	include/linux/kernfs.h
+#	kernel/cgroup.c
+diff --cc fs/kernfs/mount.c
+index 872e262e5166,d171b98a6cdd..000000000000
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@@ -7,3 -7,214 +7,217 @@@
+   *
+   * This file is released under the GPLv2.
+   */
+++<<<<<<< HEAD
+++=======
++ 
++ #include <linux/fs.h>
++ #include <linux/mount.h>
++ #include <linux/init.h>
++ #include <linux/magic.h>
++ #include <linux/slab.h>
++ #include <linux/pagemap.h>
++ 
++ #include "kernfs-internal.h"
++ 
++ struct kmem_cache *kernfs_node_cache;
++ 
++ static int kernfs_sop_remount_fs(struct super_block *sb, int *flags, char *data)
++ {
++ 	struct kernfs_root *root = kernfs_info(sb)->root;
++ 	struct kernfs_syscall_ops *scops = root->syscall_ops;
++ 
++ 	if (scops && scops->remount_fs)
++ 		return scops->remount_fs(root, flags, data);
++ 	return 0;
++ }
++ 
++ static int kernfs_sop_show_options(struct seq_file *sf, struct dentry *dentry)
++ {
++ 	struct kernfs_root *root = kernfs_root(dentry->d_fsdata);
++ 	struct kernfs_syscall_ops *scops = root->syscall_ops;
++ 
++ 	if (scops && scops->show_options)
++ 		return scops->show_options(sf, root);
++ 	return 0;
++ }
++ 
++ const struct super_operations kernfs_sops = {
++ 	.statfs		= simple_statfs,
++ 	.drop_inode	= generic_delete_inode,
++ 	.evict_inode	= kernfs_evict_inode,
++ 
++ 	.remount_fs	= kernfs_sop_remount_fs,
++ 	.show_options	= kernfs_sop_show_options,
++ };
++ 
++ /**
++  * kernfs_root_from_sb - determine kernfs_root associated with a super_block
++  * @sb: the super_block in question
++  *
++  * Return the kernfs_root associated with @sb.  If @sb is not a kernfs one,
++  * %NULL is returned.
++  */
++ struct kernfs_root *kernfs_root_from_sb(struct super_block *sb)
++ {
++ 	if (sb->s_op == &kernfs_sops)
++ 		return kernfs_info(sb)->root;
++ 	return NULL;
++ }
++ 
++ static int kernfs_fill_super(struct super_block *sb, unsigned long magic)
++ {
++ 	struct kernfs_super_info *info = kernfs_info(sb);
++ 	struct inode *inode;
++ 	struct dentry *root;
++ 
++ 	info->sb = sb;
++ 	sb->s_blocksize = PAGE_CACHE_SIZE;
++ 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
++ 	sb->s_magic = magic;
++ 	sb->s_op = &kernfs_sops;
++ 	sb->s_time_gran = 1;
++ 
++ 	/* get root inode, initialize and unlock it */
++ 	mutex_lock(&kernfs_mutex);
++ 	inode = kernfs_get_inode(sb, info->root->kn);
++ 	mutex_unlock(&kernfs_mutex);
++ 	if (!inode) {
++ 		pr_debug("kernfs: could not get root inode\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* instantiate and link root dentry */
++ 	root = d_make_root(inode);
++ 	if (!root) {
++ 		pr_debug("%s: could not get root dentry!\n", __func__);
++ 		return -ENOMEM;
++ 	}
++ 	kernfs_get(info->root->kn);
++ 	root->d_fsdata = info->root->kn;
++ 	sb->s_root = root;
++ 	sb->s_d_op = &kernfs_dops;
++ 	return 0;
++ }
++ 
++ static int kernfs_test_super(struct super_block *sb, void *data)
++ {
++ 	struct kernfs_super_info *sb_info = kernfs_info(sb);
++ 	struct kernfs_super_info *info = data;
++ 
++ 	return sb_info->root == info->root && sb_info->ns == info->ns;
++ }
++ 
++ static int kernfs_set_super(struct super_block *sb, void *data)
++ {
++ 	int error;
++ 	error = set_anon_super(sb, data);
++ 	if (!error)
++ 		sb->s_fs_info = data;
++ 	return error;
++ }
++ 
++ /**
++  * kernfs_super_ns - determine the namespace tag of a kernfs super_block
++  * @sb: super_block of interest
++  *
++  * Return the namespace tag associated with kernfs super_block @sb.
++  */
++ const void *kernfs_super_ns(struct super_block *sb)
++ {
++ 	struct kernfs_super_info *info = kernfs_info(sb);
++ 
++ 	return info->ns;
++ }
++ 
++ /**
++  * kernfs_mount_ns - kernfs mount helper
++  * @fs_type: file_system_type of the fs being mounted
++  * @flags: mount flags specified for the mount
++  * @root: kernfs_root of the hierarchy being mounted
++  * @magic: file system specific magic number
++  * @new_sb_created: tell the caller if we allocated a new superblock
++  * @ns: optional namespace tag of the mount
++  *
++  * This is to be called from each kernfs user's file_system_type->mount()
++  * implementation, which should pass through the specified @fs_type and
++  * @flags, and specify the hierarchy and namespace tag to mount via @root
++  * and @ns, respectively.
++  *
++  * The return value can be passed to the vfs layer verbatim.
++  */
++ struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
++ 				struct kernfs_root *root, unsigned long magic,
++ 				bool *new_sb_created, const void *ns)
++ {
++ 	struct super_block *sb;
++ 	struct kernfs_super_info *info;
++ 	int error;
++ 
++ 	info = kzalloc(sizeof(*info), GFP_KERNEL);
++ 	if (!info)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	info->root = root;
++ 	info->ns = ns;
++ 
++ 	sb = sget(fs_type, kernfs_test_super, kernfs_set_super, flags, info);
++ 	if (IS_ERR(sb) || sb->s_fs_info != info)
++ 		kfree(info);
++ 	if (IS_ERR(sb))
++ 		return ERR_CAST(sb);
++ 
++ 	if (new_sb_created)
++ 		*new_sb_created = !sb->s_root;
++ 
++ 	if (!sb->s_root) {
++ 		struct kernfs_super_info *info = kernfs_info(sb);
++ 
++ 		error = kernfs_fill_super(sb, magic);
++ 		if (error) {
++ 			deactivate_locked_super(sb);
++ 			return ERR_PTR(error);
++ 		}
++ 		sb->s_flags |= MS_ACTIVE;
++ 
++ 		mutex_lock(&kernfs_mutex);
++ 		list_add(&info->node, &root->supers);
++ 		mutex_unlock(&kernfs_mutex);
++ 	}
++ 
++ 	return dget(sb->s_root);
++ }
++ 
++ /**
++  * kernfs_kill_sb - kill_sb for kernfs
++  * @sb: super_block being killed
++  *
++  * This can be used directly for file_system_type->kill_sb().  If a kernfs
++  * user needs extra cleanup, it can implement its own kill_sb() and call
++  * this function at the end.
++  */
++ void kernfs_kill_sb(struct super_block *sb)
++ {
++ 	struct kernfs_super_info *info = kernfs_info(sb);
++ 	struct kernfs_node *root_kn = sb->s_root->d_fsdata;
++ 
++ 	mutex_lock(&kernfs_mutex);
++ 	list_del(&info->node);
++ 	mutex_unlock(&kernfs_mutex);
++ 
++ 	/*
++ 	 * Remove the superblock from fs_supers/s_instances
++ 	 * so we can't find it, before freeing kernfs_super_info.
++ 	 */
++ 	kill_anon_super(sb);
++ 	kfree(info);
++ 	kernfs_put(root_kn);
++ }
++ 
++ void __init kernfs_init(void)
++ {
++ 	kernfs_node_cache = kmem_cache_create("kernfs_node_cache",
++ 					      sizeof(struct kernfs_node),
++ 					      0, SLAB_PANIC, NULL);
++ 	kernfs_inode_init();
++ }
+++>>>>>>> 26fc9cd200ec (kernfs: move the last knowledge of sysfs out from kernfs)
+diff --cc fs/sysfs/mount.c
+index afd83273e6ce,8a49486bf30c..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -13,130 -13,37 +13,140 @@@
+  #define DEBUG
+  
+  #include <linux/fs.h>
++ #include <linux/magic.h>
+  #include <linux/mount.h>
+ +#include <linux/pagemap.h>
+  #include <linux/init.h>
+ +#include <linux/module.h>
+ +#include <linux/magic.h>
+ +#include <linux/slab.h>
+  #include <linux/user_namespace.h>
+  
+  #include "sysfs.h"
+  
+ -static struct kernfs_root *sysfs_root;
+ -struct kernfs_node *sysfs_root_kn;
+  
+ -static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ -	int flags, const char *dev_name, void *data)
+ +static struct vfsmount *sysfs_mnt;
+ +struct kmem_cache *sysfs_dir_cachep;
+ +
+ +static const struct super_operations sysfs_ops = {
+ +	.statfs		= simple_statfs,
+ +	.drop_inode	= generic_delete_inode,
+ +	.evict_inode	= sysfs_evict_inode,
+ +};
+ +
+ +struct sysfs_dirent sysfs_root = {
+ +	.s_name		= "",
+ +	.s_count	= ATOMIC_INIT(1),
+ +	.s_flags	= SYSFS_DIR | (KOBJ_NS_TYPE_NONE << SYSFS_NS_TYPE_SHIFT),
+ +	.s_mode		= S_IFDIR | S_IRUGO | S_IXUGO,
+ +	.s_ino		= 1,
+ +};
+ +
+ +static int sysfs_fill_super(struct super_block *sb, void *data, int silent)
+  {
+ +	struct inode *inode;
+  	struct dentry *root;
+ -	void *ns;
+ -	bool new_sb;
+  
+ -	if (!(flags & MS_KERNMOUNT)) {
+ -		if (!capable(CAP_SYS_ADMIN) && !fs_fully_visible(fs_type))
+ -			return ERR_PTR(-EPERM);
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = SYSFS_MAGIC;
+ +	sb->s_op = &sysfs_ops;
+ +	sb->s_time_gran = 1;
+ +
+ +	/* get root inode, initialize and unlock it */
+ +	mutex_lock(&sysfs_mutex);
+ +	inode = sysfs_get_inode(sb, &sysfs_root);
+ +	mutex_unlock(&sysfs_mutex);
+ +	if (!inode) {
+ +		pr_debug("sysfs: could not get root inode\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* instantiate and link root dentry */
+ +	root = d_make_root(inode);
+ +	if (!root) {
+ +		pr_debug("%s: could not get root dentry!\n",__func__);
+ +		return -ENOMEM;
+ +	}
+ +	root->d_fsdata = &sysfs_root;
+ +	sb->s_root = root;
+ +	sb->s_d_op = &sysfs_dentry_ops;
+ +	return 0;
+ +}
+ +
+ +static int sysfs_test_super(struct super_block *sb, void *data)
+ +{
+ +	struct sysfs_super_info *sb_info = sysfs_info(sb);
+ +	struct sysfs_super_info *info = data;
+ +	enum kobj_ns_type type;
+ +	int found = 1;
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++) {
+ +		if (sb_info->ns[type] != info->ns[type])
+ +			found = 0;
+ +	}
+ +	return found;
+ +}
+ +
+ +static int sysfs_set_super(struct super_block *sb, void *data)
+ +{
+ +	int error;
+ +	error = set_anon_super(sb, data);
+ +	if (!error)
+ +		sb->s_fs_info = data;
+ +	return error;
+ +}
+  
+ -		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
+ -			return ERR_PTR(-EPERM);
+ +static void free_sysfs_super_info(struct sysfs_super_info *info)
+ +{
+ +	int type;
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		kobj_ns_drop(type, info->ns[type]);
+ +	kfree(info);
+ +}
+ +
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+ +{
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb, data, flags & MS_SILENT ? 1 : 0);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+  	}
+  
+++<<<<<<< HEAD
+ +	return dget(sb->s_root);
+++=======
++ 	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
++ 				SYSFS_MAGIC, &new_sb, ns);
++ 	if (IS_ERR(root) || !new_sb)
++ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++ 	return root;
+++>>>>>>> 26fc9cd200ec (kernfs: move the last knowledge of sysfs out from kernfs)
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+diff --cc include/linux/kernfs.h
+index 254b9e872b09,17aa1cce6f8e..000000000000
+--- a/include/linux/kernfs.h
++++ b/include/linux/kernfs.h
+@@@ -7,6 -7,458 +7,462 @@@
+  #ifndef __LINUX_KERNFS_H
+  #define __LINUX_KERNFS_H
+  
+++<<<<<<< HEAD
+ +struct sysfs_dirent;
+++=======
++ #include <linux/kernel.h>
++ #include <linux/err.h>
++ #include <linux/list.h>
++ #include <linux/mutex.h>
++ #include <linux/idr.h>
++ #include <linux/lockdep.h>
++ #include <linux/rbtree.h>
++ #include <linux/atomic.h>
++ #include <linux/wait.h>
++ 
++ struct file;
++ struct dentry;
++ struct iattr;
++ struct seq_file;
++ struct vm_area_struct;
++ struct super_block;
++ struct file_system_type;
++ 
++ struct kernfs_open_node;
++ struct kernfs_iattrs;
++ 
++ enum kernfs_node_type {
++ 	KERNFS_DIR		= 0x0001,
++ 	KERNFS_FILE		= 0x0002,
++ 	KERNFS_LINK		= 0x0004,
++ };
++ 
++ #define KERNFS_TYPE_MASK	0x000f
++ #define KERNFS_FLAG_MASK	~KERNFS_TYPE_MASK
++ 
++ enum kernfs_node_flag {
++ 	KERNFS_ACTIVATED	= 0x0010,
++ 	KERNFS_NS		= 0x0020,
++ 	KERNFS_HAS_SEQ_SHOW	= 0x0040,
++ 	KERNFS_HAS_MMAP		= 0x0080,
++ 	KERNFS_LOCKDEP		= 0x0100,
++ 	KERNFS_STATIC_NAME	= 0x0200,
++ 	KERNFS_SUICIDAL		= 0x0400,
++ 	KERNFS_SUICIDED		= 0x0800,
++ };
++ 
++ /* @flags for kernfs_create_root() */
++ enum kernfs_root_flag {
++ 	/*
++ 	 * kernfs_nodes are created in the deactivated state and invisible.
++ 	 * They require explicit kernfs_activate() to become visible.  This
++ 	 * can be used to make related nodes become visible atomically
++ 	 * after all nodes are created successfully.
++ 	 */
++ 	KERNFS_ROOT_CREATE_DEACTIVATED		= 0x0001,
++ 
++ 	/*
++ 	 * For regular flies, if the opener has CAP_DAC_OVERRIDE, open(2)
++ 	 * succeeds regardless of the RW permissions.  sysfs had an extra
++ 	 * layer of enforcement where open(2) fails with -EACCES regardless
++ 	 * of CAP_DAC_OVERRIDE if the permission doesn't have the
++ 	 * respective read or write access at all (none of S_IRUGO or
++ 	 * S_IWUGO) or the respective operation isn't implemented.  The
++ 	 * following flag enables that behavior.
++ 	 */
++ 	KERNFS_ROOT_EXTRA_OPEN_PERM_CHECK	= 0x0002,
++ };
++ 
++ /* type-specific structures for kernfs_node union members */
++ struct kernfs_elem_dir {
++ 	unsigned long		subdirs;
++ 	/* children rbtree starts here and goes through kn->rb */
++ 	struct rb_root		children;
++ 
++ 	/*
++ 	 * The kernfs hierarchy this directory belongs to.  This fits
++ 	 * better directly in kernfs_node but is here to save space.
++ 	 */
++ 	struct kernfs_root	*root;
++ };
++ 
++ struct kernfs_elem_symlink {
++ 	struct kernfs_node	*target_kn;
++ };
++ 
++ struct kernfs_elem_attr {
++ 	const struct kernfs_ops	*ops;
++ 	struct kernfs_open_node	*open;
++ 	loff_t			size;
++ };
++ 
++ /*
++  * kernfs_node - the building block of kernfs hierarchy.  Each and every
++  * kernfs node is represented by single kernfs_node.  Most fields are
++  * private to kernfs and shouldn't be accessed directly by kernfs users.
++  *
++  * As long as s_count reference is held, the kernfs_node itself is
++  * accessible.  Dereferencing elem or any other outer entity requires
++  * active reference.
++  */
++ struct kernfs_node {
++ 	atomic_t		count;
++ 	atomic_t		active;
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lockdep_map	dep_map;
++ #endif
++ 	/*
++ 	 * Use kernfs_get_parent() and kernfs_name/path() instead of
++ 	 * accessing the following two fields directly.  If the node is
++ 	 * never moved to a different parent, it is safe to access the
++ 	 * parent directly.
++ 	 */
++ 	struct kernfs_node	*parent;
++ 	const char		*name;
++ 
++ 	struct rb_node		rb;
++ 
++ 	const void		*ns;	/* namespace tag */
++ 	unsigned int		hash;	/* ns + name hash */
++ 	union {
++ 		struct kernfs_elem_dir		dir;
++ 		struct kernfs_elem_symlink	symlink;
++ 		struct kernfs_elem_attr		attr;
++ 	};
++ 
++ 	void			*priv;
++ 
++ 	unsigned short		flags;
++ 	umode_t			mode;
++ 	unsigned int		ino;
++ 	struct kernfs_iattrs	*iattr;
++ };
++ 
++ /*
++  * kernfs_syscall_ops may be specified on kernfs_create_root() to support
++  * syscalls.  These optional callbacks are invoked on the matching syscalls
++  * and can perform any kernfs operations which don't necessarily have to be
++  * the exact operation requested.  An active reference is held for each
++  * kernfs_node parameter.
++  */
++ struct kernfs_syscall_ops {
++ 	int (*remount_fs)(struct kernfs_root *root, int *flags, char *data);
++ 	int (*show_options)(struct seq_file *sf, struct kernfs_root *root);
++ 
++ 	int (*mkdir)(struct kernfs_node *parent, const char *name,
++ 		     umode_t mode);
++ 	int (*rmdir)(struct kernfs_node *kn);
++ 	int (*rename)(struct kernfs_node *kn, struct kernfs_node *new_parent,
++ 		      const char *new_name);
++ };
++ 
++ struct kernfs_root {
++ 	/* published fields */
++ 	struct kernfs_node	*kn;
++ 	unsigned int		flags;	/* KERNFS_ROOT_* flags */
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct ida		ino_ida;
++ 	struct kernfs_syscall_ops *syscall_ops;
++ 
++ 	/* list of kernfs_super_info of this root, protected by kernfs_mutex */
++ 	struct list_head	supers;
++ 
++ 	wait_queue_head_t	deactivate_waitq;
++ };
++ 
++ struct kernfs_open_file {
++ 	/* published fields */
++ 	struct kernfs_node	*kn;
++ 	struct file		*file;
++ 	void			*priv;
++ 
++ 	/* private fields, do not use outside kernfs proper */
++ 	struct mutex		mutex;
++ 	int			event;
++ 	struct list_head	list;
++ 
++ 	size_t			atomic_write_len;
++ 	bool			mmapped;
++ 	const struct vm_operations_struct *vm_ops;
++ };
++ 
++ struct kernfs_ops {
++ 	/*
++ 	 * Read is handled by either seq_file or raw_read().
++ 	 *
++ 	 * If seq_show() is present, seq_file path is active.  Other seq
++ 	 * operations are optional and if not implemented, the behavior is
++ 	 * equivalent to single_open().  @sf->private points to the
++ 	 * associated kernfs_open_file.
++ 	 *
++ 	 * read() is bounced through kernel buffer and a read larger than
++ 	 * PAGE_SIZE results in partial operation of PAGE_SIZE.
++ 	 */
++ 	int (*seq_show)(struct seq_file *sf, void *v);
++ 
++ 	void *(*seq_start)(struct seq_file *sf, loff_t *ppos);
++ 	void *(*seq_next)(struct seq_file *sf, void *v, loff_t *ppos);
++ 	void (*seq_stop)(struct seq_file *sf, void *v);
++ 
++ 	ssize_t (*read)(struct kernfs_open_file *of, char *buf, size_t bytes,
++ 			loff_t off);
++ 
++ 	/*
++ 	 * write() is bounced through kernel buffer.  If atomic_write_len
++ 	 * is not set, a write larger than PAGE_SIZE results in partial
++ 	 * operations of PAGE_SIZE chunks.  If atomic_write_len is set,
++ 	 * writes upto the specified size are executed atomically but
++ 	 * larger ones are rejected with -E2BIG.
++ 	 */
++ 	size_t atomic_write_len;
++ 	ssize_t (*write)(struct kernfs_open_file *of, char *buf, size_t bytes,
++ 			 loff_t off);
++ 
++ 	int (*mmap)(struct kernfs_open_file *of, struct vm_area_struct *vma);
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lock_class_key	lockdep_key;
++ #endif
++ };
++ 
++ #ifdef CONFIG_KERNFS
++ 
++ static inline enum kernfs_node_type kernfs_type(struct kernfs_node *kn)
++ {
++ 	return kn->flags & KERNFS_TYPE_MASK;
++ }
++ 
++ /**
++  * kernfs_enable_ns - enable namespace under a directory
++  * @kn: directory of interest, should be empty
++  *
++  * This is to be called right after @kn is created to enable namespace
++  * under it.  All children of @kn must have non-NULL namespace tags and
++  * only the ones which match the super_block's tag will be visible.
++  */
++ static inline void kernfs_enable_ns(struct kernfs_node *kn)
++ {
++ 	WARN_ON_ONCE(kernfs_type(kn) != KERNFS_DIR);
++ 	WARN_ON_ONCE(!RB_EMPTY_ROOT(&kn->dir.children));
++ 	kn->flags |= KERNFS_NS;
++ }
++ 
++ /**
++  * kernfs_ns_enabled - test whether namespace is enabled
++  * @kn: the node to test
++  *
++  * Test whether namespace filtering is enabled for the children of @ns.
++  */
++ static inline bool kernfs_ns_enabled(struct kernfs_node *kn)
++ {
++ 	return kn->flags & KERNFS_NS;
++ }
++ 
++ int kernfs_name(struct kernfs_node *kn, char *buf, size_t buflen);
++ char * __must_check kernfs_path(struct kernfs_node *kn, char *buf,
++ 				size_t buflen);
++ void pr_cont_kernfs_name(struct kernfs_node *kn);
++ void pr_cont_kernfs_path(struct kernfs_node *kn);
++ struct kernfs_node *kernfs_get_parent(struct kernfs_node *kn);
++ struct kernfs_node *kernfs_find_and_get_ns(struct kernfs_node *parent,
++ 					   const char *name, const void *ns);
++ void kernfs_get(struct kernfs_node *kn);
++ void kernfs_put(struct kernfs_node *kn);
++ 
++ struct kernfs_node *kernfs_node_from_dentry(struct dentry *dentry);
++ struct kernfs_root *kernfs_root_from_sb(struct super_block *sb);
++ 
++ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
++ 				       unsigned int flags, void *priv);
++ void kernfs_destroy_root(struct kernfs_root *root);
++ 
++ struct kernfs_node *kernfs_create_dir_ns(struct kernfs_node *parent,
++ 					 const char *name, umode_t mode,
++ 					 void *priv, const void *ns);
++ struct kernfs_node *__kernfs_create_file(struct kernfs_node *parent,
++ 					 const char *name,
++ 					 umode_t mode, loff_t size,
++ 					 const struct kernfs_ops *ops,
++ 					 void *priv, const void *ns,
++ 					 bool name_is_static,
++ 					 struct lock_class_key *key);
++ struct kernfs_node *kernfs_create_link(struct kernfs_node *parent,
++ 				       const char *name,
++ 				       struct kernfs_node *target);
++ void kernfs_activate(struct kernfs_node *kn);
++ void kernfs_remove(struct kernfs_node *kn);
++ void kernfs_break_active_protection(struct kernfs_node *kn);
++ void kernfs_unbreak_active_protection(struct kernfs_node *kn);
++ bool kernfs_remove_self(struct kernfs_node *kn);
++ int kernfs_remove_by_name_ns(struct kernfs_node *parent, const char *name,
++ 			     const void *ns);
++ int kernfs_rename_ns(struct kernfs_node *kn, struct kernfs_node *new_parent,
++ 		     const char *new_name, const void *new_ns);
++ int kernfs_setattr(struct kernfs_node *kn, const struct iattr *iattr);
++ void kernfs_notify(struct kernfs_node *kn);
++ 
++ const void *kernfs_super_ns(struct super_block *sb);
++ struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
++ 			       struct kernfs_root *root, unsigned long magic,
++ 			       bool *new_sb_created, const void *ns);
++ void kernfs_kill_sb(struct super_block *sb);
++ 
++ void kernfs_init(void);
++ 
++ #else	/* CONFIG_KERNFS */
++ 
++ static inline enum kernfs_node_type kernfs_type(struct kernfs_node *kn)
++ { return 0; }	/* whatever */
++ 
++ static inline void kernfs_enable_ns(struct kernfs_node *kn) { }
++ 
++ static inline bool kernfs_ns_enabled(struct kernfs_node *kn)
++ { return false; }
++ 
++ static inline int kernfs_name(struct kernfs_node *kn, char *buf, size_t buflen)
++ { return -ENOSYS; }
++ 
++ static inline char * __must_check kernfs_path(struct kernfs_node *kn, char *buf,
++ 					      size_t buflen)
++ { return NULL; }
++ 
++ static inline void pr_cont_kernfs_name(struct kernfs_node *kn) { }
++ static inline void pr_cont_kernfs_path(struct kernfs_node *kn) { }
++ 
++ static inline struct kernfs_node *kernfs_get_parent(struct kernfs_node *kn)
++ { return NULL; }
++ 
++ static inline struct kernfs_node *
++ kernfs_find_and_get_ns(struct kernfs_node *parent, const char *name,
++ 		       const void *ns)
++ { return NULL; }
++ 
++ static inline void kernfs_get(struct kernfs_node *kn) { }
++ static inline void kernfs_put(struct kernfs_node *kn) { }
++ 
++ static inline struct kernfs_node *kernfs_node_from_dentry(struct dentry *dentry)
++ { return NULL; }
++ 
++ static inline struct kernfs_root *kernfs_root_from_sb(struct super_block *sb)
++ { return NULL; }
++ 
++ static inline struct kernfs_root *
++ kernfs_create_root(struct kernfs_syscall_ops *scops, unsigned int flags,
++ 		   void *priv)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_destroy_root(struct kernfs_root *root) { }
++ 
++ static inline struct kernfs_node *
++ kernfs_create_dir_ns(struct kernfs_node *parent, const char *name,
++ 		     umode_t mode, void *priv, const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct kernfs_node *
++ __kernfs_create_file(struct kernfs_node *parent, const char *name,
++ 		     umode_t mode, loff_t size, const struct kernfs_ops *ops,
++ 		     void *priv, const void *ns, bool name_is_static,
++ 		     struct lock_class_key *key)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline struct kernfs_node *
++ kernfs_create_link(struct kernfs_node *parent, const char *name,
++ 		   struct kernfs_node *target)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_activate(struct kernfs_node *kn) { }
++ 
++ static inline void kernfs_remove(struct kernfs_node *kn) { }
++ 
++ static inline bool kernfs_remove_self(struct kernfs_node *kn)
++ { return false; }
++ 
++ static inline int kernfs_remove_by_name_ns(struct kernfs_node *kn,
++ 					   const char *name, const void *ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_rename_ns(struct kernfs_node *kn,
++ 				   struct kernfs_node *new_parent,
++ 				   const char *new_name, const void *new_ns)
++ { return -ENOSYS; }
++ 
++ static inline int kernfs_setattr(struct kernfs_node *kn,
++ 				 const struct iattr *iattr)
++ { return -ENOSYS; }
++ 
++ static inline void kernfs_notify(struct kernfs_node *kn) { }
++ 
++ static inline const void *kernfs_super_ns(struct super_block *sb)
++ { return NULL; }
++ 
++ static inline struct dentry *
++ kernfs_mount_ns(struct file_system_type *fs_type, int flags,
++ 		struct kernfs_root *root, unsigned long magic,
++ 		bool *new_sb_created, const void *ns)
++ { return ERR_PTR(-ENOSYS); }
++ 
++ static inline void kernfs_kill_sb(struct super_block *sb) { }
++ 
++ static inline void kernfs_init(void) { }
++ 
++ #endif	/* CONFIG_KERNFS */
++ 
++ static inline struct kernfs_node *
++ kernfs_find_and_get(struct kernfs_node *kn, const char *name)
++ {
++ 	return kernfs_find_and_get_ns(kn, name, NULL);
++ }
++ 
++ static inline struct kernfs_node *
++ kernfs_create_dir(struct kernfs_node *parent, const char *name, umode_t mode,
++ 		  void *priv)
++ {
++ 	return kernfs_create_dir_ns(parent, name, mode, priv, NULL);
++ }
++ 
++ static inline struct kernfs_node *
++ kernfs_create_file_ns(struct kernfs_node *parent, const char *name,
++ 		      umode_t mode, loff_t size, const struct kernfs_ops *ops,
++ 		      void *priv, const void *ns)
++ {
++ 	struct lock_class_key *key = NULL;
++ 
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	key = (struct lock_class_key *)&ops->lockdep_key;
++ #endif
++ 	return __kernfs_create_file(parent, name, mode, size, ops, priv, ns,
++ 				    false, key);
++ }
++ 
++ static inline struct kernfs_node *
++ kernfs_create_file(struct kernfs_node *parent, const char *name, umode_t mode,
++ 		   loff_t size, const struct kernfs_ops *ops, void *priv)
++ {
++ 	return kernfs_create_file_ns(parent, name, mode, size, ops, priv, NULL);
++ }
++ 
++ static inline int kernfs_remove_by_name(struct kernfs_node *parent,
++ 					const char *name)
++ {
++ 	return kernfs_remove_by_name_ns(parent, name, NULL);
++ }
++ 
++ static inline int kernfs_rename(struct kernfs_node *kn,
++ 				struct kernfs_node *new_parent,
++ 				const char *new_name)
++ {
++ 	return kernfs_rename_ns(kn, new_parent, new_name, NULL);
++ }
++ 
++ static inline struct dentry *
++ kernfs_mount(struct file_system_type *fs_type, int flags,
++ 		struct kernfs_root *root, unsigned long magic,
++ 		bool *new_sb_created)
++ {
++ 	return kernfs_mount_ns(fs_type, flags, root,
++ 				magic, new_sb_created, NULL);
++ }
+++>>>>>>> 26fc9cd200ec (kernfs: move the last knowledge of sysfs out from kernfs)
+  
+  #endif	/* __LINUX_KERNFS_H */
+diff --cc kernel/cgroup.c
+index 2f8b053194d3,ceee0c54c6a4..000000000000
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@@ -1707,74 -1553,72 +1708,85 @@@ static struct dentry *cgroup_mount(stru
+  			}
+  		}
+  
+ -		/*
+ -		 * A root's lifetime is governed by its root cgroup.  Zero
+ -		 * ref indicate that the root is being destroyed.  Wait for
+ -		 * destruction to complete so that the subsystems are free.
+ -		 * We can use wait_queue for the wait but this path is
+ -		 * super cold.  Let's just sleep for a bit and retry.
+ -		 */
+ -		if (!atomic_inc_not_zero(&root->cgrp.refcnt)) {
+ -			mutex_unlock(&cgroup_mutex);
+ -			mutex_unlock(&cgroup_tree_mutex);
+ -			msleep(10);
+ -			mutex_lock(&cgroup_tree_mutex);
+ -			mutex_lock(&cgroup_mutex);
+ -			goto retry;
+ -		}
+ -
+ -		ret = 0;
+ -		goto out_unlock;
+ -	}
+ -
+ -	/*
+ -	 * No such thing, create a new one.  name= matching without subsys
+ -	 * specification is allowed for already existing hierarchies but we
+ -	 * can't create new one without subsys specification.
+ -	 */
+ -	if (!opts.subsys_mask && !opts.none) {
+ -		ret = -EINVAL;
+ -		goto out_unlock;
+ -	}
+ -
+ -	root = kzalloc(sizeof(*root), GFP_KERNEL);
+ -	if (!root) {
+ -		ret = -ENOMEM;
+ -		goto out_unlock;
+ +		/* no subsys rebinding, so refcounts don't change */
+ +		drop_parsed_module_refcounts(opts.subsys_mask);
+  	}
+  
+ -	init_cgroup_root(root, &opts);
+ -
+ -	ret = cgroup_setup_root(root, opts.subsys_mask);
+ -	if (ret)
+ -		cgroup_free_root(root);
+ +	kfree(opts.release_agent);
+ +	kfree(opts.name);
+ +	return dget(sb->s_root);
+  
+ -out_unlock:
+++<<<<<<< HEAD
+ + unlock_drop:
+ +	mutex_unlock(&cgroup_root_mutex);
+  	mutex_unlock(&cgroup_mutex);
+ -	mutex_unlock(&cgroup_tree_mutex);
+ -
+ +	mutex_unlock(&inode->i_mutex);
+ + drop_new_super:
+ +	deactivate_locked_super(sb);
+ + drop_modules:
+ +	drop_parsed_module_refcounts(opts.subsys_mask);
+ + out_err:
+  	kfree(opts.release_agent);
+  	kfree(opts.name);
+ -
+ +	return ERR_PTR(ret);
+++=======
++ 	if (ret)
++ 		return ERR_PTR(ret);
++ 
++ 	dentry = kernfs_mount(fs_type, flags, root->kf_root,
++ 				CGROUP_SUPER_MAGIC, &new_sb);
++ 	if (IS_ERR(dentry) || !new_sb)
++ 		cgroup_put(&root->cgrp);
++ 	return dentry;
+++>>>>>>> 26fc9cd200ec (kernfs: move the last knowledge of sysfs out from kernfs)
+  }
+  
+ -static void cgroup_kill_sb(struct super_block *sb)
+ -{
+ -	struct kernfs_root *kf_root = kernfs_root_from_sb(sb);
+ -	struct cgroup_root *root = cgroup_root_from_kf(kf_root);
+ +static void cgroup_kill_sb(struct super_block *sb) {
+ +	struct cgroupfs_root *root = sb->s_fs_info;
+ +	struct cgroup *cgrp = &root->top_cgroup;
+ +	int ret;
+ +	struct cg_cgroup_link *link;
+ +	struct cg_cgroup_link *saved_link;
+ +
+ +	BUG_ON(!root);
+ +
+ +	BUG_ON(root->number_of_cgroups != 1);
+ +	BUG_ON(!list_empty(&cgrp->children));
+ +
+ +	mutex_lock(&cgroup_mutex);
+ +	mutex_lock(&cgroup_root_mutex);
+ +
+ +	/* Rebind all subsystems back to the default hierarchy */
+ +	ret = rebind_subsystems(root, 0);
+ +	/* Shouldn't be able to fail ... */
+ +	BUG_ON(ret);
+ +
+ +	/*
+ +	 * Release all the links from css_sets to this hierarchy's
+ +	 * root cgroup
+ +	 */
+ +	write_lock(&css_set_lock);
+ +
+ +	list_for_each_entry_safe(link, saved_link, &cgrp->css_sets,
+ +				 cgrp_link_list) {
+ +		list_del(&link->cg_link_list);
+ +		list_del(&link->cgrp_link_list);
+ +		kfree(link);
+ +	}
+ +	write_unlock(&css_set_lock);
+ +
+ +	if (!list_empty(&root->root_list)) {
+ +		list_del(&root->root_list);
+ +		root_count--;
+ +	}
+  
+ -	cgroup_put(&root->cgrp);
+ -	kernfs_kill_sb(sb);
+ +	mutex_unlock(&cgroup_root_mutex);
+ +	mutex_unlock(&cgroup_mutex);
+ +
+ +	simple_xattrs_free(&cgrp->xattrs);
+ +
+ +	kill_litter_super(sb);
+ +	cgroup_drop_root(root);
+  }
+  
+  static struct file_system_type cgroup_fs_type = {
+* Unmerged path fs/kernfs/mount.c
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path include/linux/kernfs.h
+* Unmerged path kernel/cgroup.c
