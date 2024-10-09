@@ -1,0 +1,386 @@
+scsi: lpfc: Correct return error codes to align with nvme_fc transport
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Correct return error codes to align with nvme_fc transport (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 95.52%
+commit-author Dick Kennedy <dick.kennedy@broadcom.com>
+commit cd22d6057c0cf1d6753a11c19c1cb62ca3f8fb29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cd22d605.failed
+
+Modify driver return error codes to align with host nvme transport.
+
+Driver isn't returning Exxx error codes to properly reflect out of
+resource or connectivity conditions (-EBUSY), yet there were hard error
+conditions returning -EBUSY.
+
+Ensure the following situations return the proper return code:
+
+ - Temporary failures or temporary resource availability: -EBUSY
+
+ - Connectivity issues: -ENODEV
+
+All others are treated as hard errors and return an -Exxx value that
+indicates the type of error.
+
+Also, lpfc_sli4_issue_wqe() was modified to not translate error from
+-Exxx to WQE state.  This allows lpfc_nvme_fcp_io_submit() routine to
+just return whatever -E value was returned from other routines.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cd22d6057c0cf1d6753a11c19c1cb62ca3f8fb29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_nvme.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index afe166ddbf5a,6569fffb8b71..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -10099,6 -10658,108 +10099,111 @@@ abort_iotag_exit
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_sli4_abort_nvme_io - Issue abort for a command iocb
++  * @phba: Pointer to HBA context object.
++  * @pring: Pointer to driver SLI ring object.
++  * @cmdiocb: Pointer to driver command iocb object.
++  *
++  * This function issues an abort iocb for the provided command iocb down to
++  * the port. Other than the case the outstanding command iocb is an abort
++  * request, this function issues abort out unconditionally. This function is
++  * called with hbalock held. The function returns 0 when it fails due to
++  * memory allocation failure or when the command iocb is an abort request.
++  **/
++ static int
++ lpfc_sli4_abort_nvme_io(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
++ 			struct lpfc_iocbq *cmdiocb)
++ {
++ 	struct lpfc_vport *vport = cmdiocb->vport;
++ 	struct lpfc_iocbq *abtsiocbp;
++ 	union lpfc_wqe *abts_wqe;
++ 	int retval;
++ 
++ 	/*
++ 	 * There are certain command types we don't want to abort.  And we
++ 	 * don't want to abort commands that are already in the process of
++ 	 * being aborted.
++ 	 */
++ 	if (cmdiocb->iocb.ulpCommand == CMD_ABORT_XRI_CN ||
++ 	    cmdiocb->iocb.ulpCommand == CMD_CLOSE_XRI_CN ||
++ 	    (cmdiocb->iocb_flag & LPFC_DRIVER_ABORTED) != 0)
++ 		return 0;
++ 
++ 	/* issue ABTS for this io based on iotag */
++ 	abtsiocbp = __lpfc_sli_get_iocbq(phba);
++ 	if (abtsiocbp == NULL)
++ 		return 0;
++ 
++ 	/* This signals the response to set the correct status
++ 	 * before calling the completion handler
++ 	 */
++ 	cmdiocb->iocb_flag |= LPFC_DRIVER_ABORTED;
++ 
++ 	/* Complete prepping the abort wqe and issue to the FW. */
++ 	abts_wqe = &abtsiocbp->wqe;
++ 	bf_set(abort_cmd_ia, &abts_wqe->abort_cmd, 0);
++ 	bf_set(abort_cmd_criteria, &abts_wqe->abort_cmd, T_XRI_TAG);
++ 
++ 	/* Explicitly set reserved fields to zero.*/
++ 	abts_wqe->abort_cmd.rsrvd4 = 0;
++ 	abts_wqe->abort_cmd.rsrvd5 = 0;
++ 
++ 	/* WQE Common - word 6.  Context is XRI tag.  Set 0. */
++ 	bf_set(wqe_xri_tag, &abts_wqe->abort_cmd.wqe_com, 0);
++ 	bf_set(wqe_ctxt_tag, &abts_wqe->abort_cmd.wqe_com, 0);
++ 
++ 	/* word 7 */
++ 	bf_set(wqe_ct, &abts_wqe->abort_cmd.wqe_com, 0);
++ 	bf_set(wqe_cmnd, &abts_wqe->abort_cmd.wqe_com, CMD_ABORT_XRI_CX);
++ 	bf_set(wqe_class, &abts_wqe->abort_cmd.wqe_com,
++ 	       cmdiocb->iocb.ulpClass);
++ 
++ 	/* word 8 - tell the FW to abort the IO associated with this
++ 	 * outstanding exchange ID.
++ 	 */
++ 	abts_wqe->abort_cmd.wqe_com.abort_tag = cmdiocb->sli4_xritag;
++ 
++ 	/* word 9 - this is the iotag for the abts_wqe completion. */
++ 	bf_set(wqe_reqtag, &abts_wqe->abort_cmd.wqe_com,
++ 	       abtsiocbp->iotag);
++ 
++ 	/* word 10 */
++ 	bf_set(wqe_wqid, &abts_wqe->abort_cmd.wqe_com, cmdiocb->hba_wqidx);
++ 	bf_set(wqe_qosd, &abts_wqe->abort_cmd.wqe_com, 1);
++ 	bf_set(wqe_lenloc, &abts_wqe->abort_cmd.wqe_com, LPFC_WQE_LENLOC_NONE);
++ 
++ 	/* word 11 */
++ 	bf_set(wqe_cmd_type, &abts_wqe->abort_cmd.wqe_com, OTHER_COMMAND);
++ 	bf_set(wqe_wqec, &abts_wqe->abort_cmd.wqe_com, 1);
++ 	bf_set(wqe_cqid, &abts_wqe->abort_cmd.wqe_com, LPFC_WQE_CQ_ID_DEFAULT);
++ 
++ 	/* ABTS WQE must go to the same WQ as the WQE to be aborted */
++ 	abtsiocbp->iocb_flag |= LPFC_IO_NVME;
++ 	abtsiocbp->vport = vport;
++ 	abtsiocbp->wqe_cmpl = lpfc_nvme_abort_fcreq_cmpl;
++ 	retval = lpfc_sli4_issue_wqe(phba, LPFC_FCP_RING, abtsiocbp);
++ 	if (retval) {
++ 		lpfc_printf_vlog(vport, KERN_ERR, LOG_NVME,
++ 				 "6147 Failed abts issue_wqe with status x%x "
++ 				 "for oxid x%x\n",
++ 				 retval, cmdiocb->sli4_xritag);
++ 		lpfc_sli_release_iocbq(phba, abtsiocbp);
++ 		return retval;
++ 	}
++ 
++ 	lpfc_printf_vlog(vport, KERN_ERR, LOG_NVME,
++ 			 "6148 Drv Abort NVME Request Issued for "
++ 			 "ox_id x%x on reqtag x%x\n",
++ 			 cmdiocb->sli4_xritag,
++ 			 abtsiocbp->iotag);
++ 
++ 	return retval;
++ }
++ 
++ /**
+++>>>>>>> cd22d6057c0c (scsi: lpfc: Correct return error codes to align with nvme_fc transport)
+   * lpfc_sli_hba_iocb_abort - Abort all iocbs to an hba.
+   * @phba: pointer to lpfc HBA data structure.
+   *
+@@@ -17278,3 -18746,222 +17383,225 @@@ lpfc_drain_txq(struct lpfc_hba *phba
+  
+  	return txq_cnt;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * lpfc_wqe_bpl2sgl - Convert the bpl/bde to a sgl.
++  * @phba: Pointer to HBA context object.
++  * @pwqe: Pointer to command WQE.
++  * @sglq: Pointer to the scatter gather queue object.
++  *
++  * This routine converts the bpl or bde that is in the WQE
++  * to a sgl list for the sli4 hardware. The physical address
++  * of the bpl/bde is converted back to a virtual address.
++  * If the WQE contains a BPL then the list of BDE's is
++  * converted to sli4_sge's. If the WQE contains a single
++  * BDE then it is converted to a single sli_sge.
++  * The WQE is still in cpu endianness so the contents of
++  * the bpl can be used without byte swapping.
++  *
++  * Returns valid XRI = Success, NO_XRI = Failure.
++  */
++ static uint16_t
++ lpfc_wqe_bpl2sgl(struct lpfc_hba *phba, struct lpfc_iocbq *pwqeq,
++ 		 struct lpfc_sglq *sglq)
++ {
++ 	uint16_t xritag = NO_XRI;
++ 	struct ulp_bde64 *bpl = NULL;
++ 	struct ulp_bde64 bde;
++ 	struct sli4_sge *sgl  = NULL;
++ 	struct lpfc_dmabuf *dmabuf;
++ 	union lpfc_wqe *wqe;
++ 	int numBdes = 0;
++ 	int i = 0;
++ 	uint32_t offset = 0; /* accumulated offset in the sg request list */
++ 	int inbound = 0; /* number of sg reply entries inbound from firmware */
++ 	uint32_t cmd;
++ 
++ 	if (!pwqeq || !sglq)
++ 		return xritag;
++ 
++ 	sgl  = (struct sli4_sge *)sglq->sgl;
++ 	wqe = &pwqeq->wqe;
++ 	pwqeq->iocb.ulpIoTag = pwqeq->iotag;
++ 
++ 	cmd = bf_get(wqe_cmnd, &wqe->generic.wqe_com);
++ 	if (cmd == CMD_XMIT_BLS_RSP64_WQE)
++ 		return sglq->sli4_xritag;
++ 	numBdes = pwqeq->rsvd2;
++ 	if (numBdes) {
++ 		/* The addrHigh and addrLow fields within the WQE
++ 		 * have not been byteswapped yet so there is no
++ 		 * need to swap them back.
++ 		 */
++ 		if (pwqeq->context3)
++ 			dmabuf = (struct lpfc_dmabuf *)pwqeq->context3;
++ 		else
++ 			return xritag;
++ 
++ 		bpl  = (struct ulp_bde64 *)dmabuf->virt;
++ 		if (!bpl)
++ 			return xritag;
++ 
++ 		for (i = 0; i < numBdes; i++) {
++ 			/* Should already be byte swapped. */
++ 			sgl->addr_hi = bpl->addrHigh;
++ 			sgl->addr_lo = bpl->addrLow;
++ 
++ 			sgl->word2 = le32_to_cpu(sgl->word2);
++ 			if ((i+1) == numBdes)
++ 				bf_set(lpfc_sli4_sge_last, sgl, 1);
++ 			else
++ 				bf_set(lpfc_sli4_sge_last, sgl, 0);
++ 			/* swap the size field back to the cpu so we
++ 			 * can assign it to the sgl.
++ 			 */
++ 			bde.tus.w = le32_to_cpu(bpl->tus.w);
++ 			sgl->sge_len = cpu_to_le32(bde.tus.f.bdeSize);
++ 			/* The offsets in the sgl need to be accumulated
++ 			 * separately for the request and reply lists.
++ 			 * The request is always first, the reply follows.
++ 			 */
++ 			switch (cmd) {
++ 			case CMD_GEN_REQUEST64_WQE:
++ 				/* add up the reply sg entries */
++ 				if (bpl->tus.f.bdeFlags == BUFF_TYPE_BDE_64I)
++ 					inbound++;
++ 				/* first inbound? reset the offset */
++ 				if (inbound == 1)
++ 					offset = 0;
++ 				bf_set(lpfc_sli4_sge_offset, sgl, offset);
++ 				bf_set(lpfc_sli4_sge_type, sgl,
++ 					LPFC_SGE_TYPE_DATA);
++ 				offset += bde.tus.f.bdeSize;
++ 				break;
++ 			case CMD_FCP_TRSP64_WQE:
++ 				bf_set(lpfc_sli4_sge_offset, sgl, 0);
++ 				bf_set(lpfc_sli4_sge_type, sgl,
++ 					LPFC_SGE_TYPE_DATA);
++ 				break;
++ 			case CMD_FCP_TSEND64_WQE:
++ 			case CMD_FCP_TRECEIVE64_WQE:
++ 				bf_set(lpfc_sli4_sge_type, sgl,
++ 					bpl->tus.f.bdeFlags);
++ 				if (i < 3)
++ 					offset = 0;
++ 				else
++ 					offset += bde.tus.f.bdeSize;
++ 				bf_set(lpfc_sli4_sge_offset, sgl, offset);
++ 				break;
++ 			}
++ 			sgl->word2 = cpu_to_le32(sgl->word2);
++ 			bpl++;
++ 			sgl++;
++ 		}
++ 	} else if (wqe->gen_req.bde.tus.f.bdeFlags == BUFF_TYPE_BDE_64) {
++ 		/* The addrHigh and addrLow fields of the BDE have not
++ 		 * been byteswapped yet so they need to be swapped
++ 		 * before putting them in the sgl.
++ 		 */
++ 		sgl->addr_hi = cpu_to_le32(wqe->gen_req.bde.addrHigh);
++ 		sgl->addr_lo = cpu_to_le32(wqe->gen_req.bde.addrLow);
++ 		sgl->word2 = le32_to_cpu(sgl->word2);
++ 		bf_set(lpfc_sli4_sge_last, sgl, 1);
++ 		sgl->word2 = cpu_to_le32(sgl->word2);
++ 		sgl->sge_len = cpu_to_le32(wqe->gen_req.bde.tus.f.bdeSize);
++ 	}
++ 	return sglq->sli4_xritag;
++ }
++ 
++ /**
++  * lpfc_sli4_issue_wqe - Issue an SLI4 Work Queue Entry (WQE)
++  * @phba: Pointer to HBA context object.
++  * @ring_number: Base sli ring number
++  * @pwqe: Pointer to command WQE.
++  **/
++ int
++ lpfc_sli4_issue_wqe(struct lpfc_hba *phba, uint32_t ring_number,
++ 		    struct lpfc_iocbq *pwqe)
++ {
++ 	union lpfc_wqe *wqe = &pwqe->wqe;
++ 	struct lpfc_nvmet_rcv_ctx *ctxp;
++ 	struct lpfc_queue *wq;
++ 	struct lpfc_sglq *sglq;
++ 	struct lpfc_sli_ring *pring;
++ 	unsigned long iflags;
++ 	uint32_t ret = 0;
++ 
++ 	/* NVME_LS and NVME_LS ABTS requests. */
++ 	if (pwqe->iocb_flag & LPFC_IO_NVME_LS) {
++ 		pring =  phba->sli4_hba.nvmels_wq->pring;
++ 		spin_lock_irqsave(&pring->ring_lock, iflags);
++ 		sglq = __lpfc_sli_get_els_sglq(phba, pwqe);
++ 		if (!sglq) {
++ 			spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 			return WQE_BUSY;
++ 		}
++ 		pwqe->sli4_lxritag = sglq->sli4_lxritag;
++ 		pwqe->sli4_xritag = sglq->sli4_xritag;
++ 		if (lpfc_wqe_bpl2sgl(phba, pwqe, sglq) == NO_XRI) {
++ 			spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 			return WQE_ERROR;
++ 		}
++ 		bf_set(wqe_xri_tag, &pwqe->wqe.xmit_bls_rsp.wqe_com,
++ 		       pwqe->sli4_xritag);
++ 		ret = lpfc_sli4_wq_put(phba->sli4_hba.nvmels_wq, wqe);
++ 		if (ret) {
++ 			spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 			return ret;
++ 		}
++ 
++ 		lpfc_sli_ringtxcmpl_put(phba, pring, pwqe);
++ 		spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 		return 0;
++ 	}
++ 
++ 	/* NVME_FCREQ and NVME_ABTS requests */
++ 	if (pwqe->iocb_flag & LPFC_IO_NVME) {
++ 		/* Get the IO distribution (hba_wqidx) for WQ assignment. */
++ 		pring = phba->sli4_hba.nvme_wq[pwqe->hba_wqidx]->pring;
++ 
++ 		spin_lock_irqsave(&pring->ring_lock, iflags);
++ 		wq = phba->sli4_hba.nvme_wq[pwqe->hba_wqidx];
++ 		bf_set(wqe_cqid, &wqe->generic.wqe_com,
++ 		      phba->sli4_hba.nvme_cq[pwqe->hba_wqidx]->queue_id);
++ 		ret = lpfc_sli4_wq_put(wq, wqe);
++ 		if (ret) {
++ 			spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 			return ret;
++ 		}
++ 		lpfc_sli_ringtxcmpl_put(phba, pring, pwqe);
++ 		spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 		return 0;
++ 	}
++ 
++ 	/* NVMET requests */
++ 	if (pwqe->iocb_flag & LPFC_IO_NVMET) {
++ 		/* Get the IO distribution (hba_wqidx) for WQ assignment. */
++ 		pring = phba->sli4_hba.nvme_wq[pwqe->hba_wqidx]->pring;
++ 
++ 		spin_lock_irqsave(&pring->ring_lock, iflags);
++ 		ctxp = pwqe->context2;
++ 		sglq = ctxp->ctxbuf->sglq;
++ 		if (pwqe->sli4_xritag ==  NO_XRI) {
++ 			pwqe->sli4_lxritag = sglq->sli4_lxritag;
++ 			pwqe->sli4_xritag = sglq->sli4_xritag;
++ 		}
++ 		bf_set(wqe_xri_tag, &pwqe->wqe.xmit_bls_rsp.wqe_com,
++ 		       pwqe->sli4_xritag);
++ 		wq = phba->sli4_hba.nvme_wq[pwqe->hba_wqidx];
++ 		bf_set(wqe_cqid, &wqe->generic.wqe_com,
++ 		      phba->sli4_hba.nvme_cq[pwqe->hba_wqidx]->queue_id);
++ 		ret = lpfc_sli4_wq_put(wq, wqe);
++ 		if (ret) {
++ 			spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 			return ret;
++ 		}
++ 		lpfc_sli_ringtxcmpl_put(phba, pring, pwqe);
++ 		spin_unlock_irqrestore(&pring->ring_lock, iflags);
++ 		return 0;
++ 	}
++ 	return WQE_ERROR;
++ }
+++>>>>>>> cd22d6057c0c (scsi: lpfc: Correct return error codes to align with nvme_fc transport)
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_nvme.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
