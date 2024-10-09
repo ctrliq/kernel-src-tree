@@ -1,0 +1,162 @@
+IB/core: Fix to avoid deleting IPv6 look alike default GIDs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 22c01ee4b8a8c000c490dfc479e175404e64167b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/22c01ee4.failed
+
+When IPv6 link local address is removed, if it matches with the default
+GID, default GID(s)s gets removed which may not be a desired behavior.
+This behavior is introduced by refactor work in Fixes tag.
+
+When IPv6 link address is removed, removing its equivalent RoCEv2 GID
+which exactly matches with default RoCEv2 GID, is right thing to do.
+However achieving it correctly requires lot more changes, likely in
+roce_gid_mgmt.c and core/cache.c. This should be done as independent
+patch.
+
+Therefore, this patch preserves behavior of not deleteing default GIDs.
+This is done by providing explicit hint to consider default GID property
+using mask and default_gid; similar to add_gid().
+
+Fixes: 598ff6bae68 ("IB/core: Refactor GID modify code for RoCE")
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 22c01ee4b8a8c000c490dfc479e175404e64167b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 8ce9acd96a1f,8e6a4f05f3ea..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -364,35 -424,47 +364,48 @@@ out_unlock
+  	return ret;
+  }
+  
+- int ib_cache_gid_del(struct ib_device *ib_dev, u8 port,
+- 		     union ib_gid *gid, struct ib_gid_attr *attr)
++ static int
++ _ib_cache_gid_del(struct ib_device *ib_dev, u8 port,
++ 		  union ib_gid *gid, struct ib_gid_attr *attr,
++ 		  bool default_gid)
+  {
+  	struct ib_gid_table *table;
+ -	int ret = 0;
+  	int ix;
+  
+  	table = ib_dev->cache.ports[port - rdma_start_port(ib_dev)].gid;
+  
+  	mutex_lock(&table->lock);
+ +	write_lock_irq(&table->rwlock);
+  
+- 	ix = find_gid(table, gid, attr, false,
++ 	ix = find_gid(table, gid, attr, default_gid,
+  		      GID_ATTR_FIND_MASK_GID	  |
+  		      GID_ATTR_FIND_MASK_GID_TYPE |
+++<<<<<<< HEAD
+ +		      GID_ATTR_FIND_MASK_NETDEV	  |
+ +		      GID_ATTR_FIND_MASK_DEFAULT,
+++=======
++ 		      GID_ATTR_FIND_MASK_DEFAULT  |
++ 		      GID_ATTR_FIND_MASK_NETDEV,
+++>>>>>>> 22c01ee4b8a8 (IB/core: Fix to avoid deleting IPv6 look alike default GIDs)
+  		      NULL);
+ -	if (ix < 0) {
+ -		ret = -EINVAL;
+ +	if (ix < 0)
+  		goto out_unlock;
+ -	}
+  
+ -	del_gid(ib_dev, port, table, ix);
+ -	dispatch_gid_change_event(ib_dev, port);
+ +	if (!del_gid(ib_dev, port, table, ix, false))
+ +		dispatch_gid_change_event(ib_dev, port);
+  
+  out_unlock:
+ +	write_unlock_irq(&table->rwlock);
+  	mutex_unlock(&table->lock);
+ -	if (ret)
+ -		pr_debug("%s: can't delete gid %pI6 error=%d\n",
+ -			 __func__, gid->raw, ret);
+ -	return ret;
+ +	return 0;
+  }
+  
++ int ib_cache_gid_del(struct ib_device *ib_dev, u8 port,
++ 		     union ib_gid *gid, struct ib_gid_attr *attr)
++ {
++ 	return _ib_cache_gid_del(ib_dev, port, gid, attr, false);
++ }
++ 
+  int ib_cache_gid_del_all_netdev_gids(struct ib_device *ib_dev, u8 port,
+  				     struct net_device *ndev)
+  {
+@@@ -688,51 -759,14 +701,61 @@@ void ib_cache_gid_set_default_gid(struc
+  
+  		gid_attr.gid_type = gid_type;
+  
+++<<<<<<< HEAD
+ +		mutex_lock(&table->lock);
+ +		write_lock_irq(&table->rwlock);
+ +		ix = find_gid(table, NULL, &gid_attr, true,
+ +			      GID_ATTR_FIND_MASK_GID_TYPE |
+ +			      GID_ATTR_FIND_MASK_DEFAULT,
+ +			      NULL);
+ +
+ +		/* Coudn't find default GID location */
+ +		if (WARN_ON(ix < 0))
+ +			goto release;
+ +
+ +		zattr_type.gid_type = gid_type;
+ +
+ +		if (!__ib_cache_gid_get(ib_dev, port, ix,
+ +					&current_gid, &current_gid_attr) &&
+ +		    mode == IB_CACHE_GID_DEFAULT_MODE_SET &&
+ +		    !memcmp(&gid, &current_gid, sizeof(gid)) &&
+ +		    !memcmp(&gid_attr, &current_gid_attr, sizeof(gid_attr)))
+ +			goto release;
+ +
+ +		if (memcmp(&current_gid, &zgid, sizeof(current_gid)) ||
+ +		    memcmp(&current_gid_attr, &zattr_type,
+ +			   sizeof(current_gid_attr))) {
+ +			if (del_gid(ib_dev, port, table, ix, true)) {
+ +				pr_warn("ib_cache_gid: can't delete index %d for default gid %pI6\n",
+ +					ix, gid.raw);
+ +				goto release;
+ +			} else {
+ +				dispatch_gid_change_event(ib_dev, port);
+ +			}
+++=======
++ 		if (mode == IB_CACHE_GID_DEFAULT_MODE_SET) {
++ 			mask = GID_ATTR_FIND_MASK_GID_TYPE |
++ 			       GID_ATTR_FIND_MASK_DEFAULT;
++ 			__ib_cache_gid_add(ib_dev, port, &gid,
++ 					   &gid_attr, mask, true);
++ 		} else if (mode == IB_CACHE_GID_DEFAULT_MODE_DELETE) {
++ 			_ib_cache_gid_del(ib_dev, port, &gid, &gid_attr, true);
+++>>>>>>> 22c01ee4b8a8 (IB/core: Fix to avoid deleting IPv6 look alike default GIDs)
+  		}
+ +
+ +		if (mode == IB_CACHE_GID_DEFAULT_MODE_SET) {
+ +			if (add_gid(ib_dev, port, table, ix, &gid, &gid_attr, true))
+ +				pr_warn("ib_cache_gid: unable to add default gid %pI6\n",
+ +					gid.raw);
+ +			else
+ +				dispatch_gid_change_event(ib_dev, port);
+ +		}
+ +
+ +release:
+ +		if (current_gid_attr.ndev)
+ +			dev_put(current_gid_attr.ndev);
+ +		write_unlock_irq(&table->rwlock);
+ +		mutex_unlock(&table->lock);
+  	}
+  }
+  
+* Unmerged path drivers/infiniband/core/cache.c
