@@ -656,9 +656,7 @@ int vmbus_sendpacket_ctl(struct vmbus_channel *channel, void *buffer,
 	bufferlist[2].iov_base = &aligned_data;
 	bufferlist[2].iov_len = (packetlen_aligned - packetlen);
 
-	return hv_ringbuffer_write(channel, bufferlist, num_vecs,
-				   lock, kick_q);
-
+	return hv_ringbuffer_write(channel, bufferlist, num_vecs, lock);
 }
 EXPORT_SYMBOL(vmbus_sendpacket_ctl);
 
@@ -743,8 +741,7 @@ int vmbus_sendpacket_pagebuffer_ctl(struct vmbus_channel *channel,
 	bufferlist[2].iov_base = &aligned_data;
 	bufferlist[2].iov_len = (packetlen_aligned - packetlen);
 
-	return hv_ringbuffer_write(channel, bufferlist, 3,
-				   lock, kick_q);
+	return hv_ringbuffer_write(channel, bufferlist, 3, lock);
 }
 EXPORT_SYMBOL_GPL(vmbus_sendpacket_pagebuffer_ctl);
 
@@ -799,8 +796,7 @@ int vmbus_sendpacket_mpb_desc(struct vmbus_channel *channel,
 	bufferlist[2].iov_base = &aligned_data;
 	bufferlist[2].iov_len = (packetlen_aligned - packetlen);
 
-	return hv_ringbuffer_write(channel, bufferlist, 3,
-				   lock, true);
+	return hv_ringbuffer_write(channel, bufferlist, 3, lock);
 }
 EXPORT_SYMBOL_GPL(vmbus_sendpacket_mpb_desc);
 
@@ -857,8 +853,7 @@ int vmbus_sendpacket_multipagebuffer(struct vmbus_channel *channel,
 	bufferlist[2].iov_base = &aligned_data;
 	bufferlist[2].iov_len = (packetlen_aligned - packetlen);
 
-	return hv_ringbuffer_write(channel, bufferlist, 3,
-				   lock, true);
+	return hv_ringbuffer_write(channel, bufferlist, 3, lock);
 }
 EXPORT_SYMBOL_GPL(vmbus_sendpacket_multipagebuffer);
 
