@@ -1,0 +1,165 @@
+procfs: expose umask in /proc/<PID>/status
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Richard W.M. Jones <rjones@redhat.com>
+commit 3e42979e65dace1f9268dd5440e5ab096b8dee59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3e42979e.failed
+
+It's not possible to read the process umask without also modifying it,
+which is what umask(2) does.  A library cannot read umask safely,
+especially if the main program might be multithreaded.
+
+Add a new status line ("Umask") in /proc/<PID>/status.  It contains the
+file mode creation mask (umask) in octal.  It is only shown for tasks
+which have task->fs.
+
+This patch is adapted from one originally written by Pierre Carrier.
+
+The use case is that we have endless trouble with people setting weird
+umask() values (usually on the grounds of "security"), and then
+everything breaking.  I'm on the hook to fix these.  We'd like to add
+debugging to our program so we can dump out the umask in debug reports.
+
+Previous versions of the patch used a syscall so you could only read
+your own umask.  That's all I need.  However there was quite a lot of
+push-back from those, so this new version exports it in /proc.
+
+See:
+  https://lkml.org/lkml/2016/4/13/704 [umask2]
+  https://lkml.org/lkml/2016/4/13/487 [getumask]
+
+	Signed-off-by: Richard W.M. Jones <rjones@redhat.com>
+	Acked-by: Konstantin Khlebnikov <koct9i@gmail.com>
+	Acked-by: Jerome Marchand <jmarchan@redhat.com>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Pierre Carrier <pierre@spotify.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3e42979e65dace1f9268dd5440e5ab096b8dee59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/array.c
+diff --cc fs/proc/array.c
+index 1254b3338235,88c7de12197b..000000000000
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@@ -81,7 -81,9 +81,8 @@@
+  #include <linux/pid_namespace.h>
+  #include <linux/ptrace.h>
+  #include <linux/tracehook.h>
+ -#include <linux/string_helpers.h>
+  #include <linux/user_namespace.h>
++ #include <linux/fs_struct.h>
+  
+  #include <asm/pgtable.h>
+  #include <asm/processor.h>
+@@@ -148,38 -125,67 +149,70 @@@ static const char * const task_state_ar
+  
+  static inline const char *get_task_state(struct task_struct *tsk)
+  {
+ -	unsigned int state = (tsk->state | tsk->exit_state) & TASK_REPORT;
+ +	unsigned int state = (tsk->state & TASK_REPORT) | tsk->exit_state;
+ +	const char * const *p = &task_state_array[0];
+  
+ -	/*
+ -	 * Parked tasks do not run; they sit in __kthread_parkme().
+ -	 * Without this check, we would report them as running, which is
+ -	 * clearly wrong, so we report them as sleeping instead.
+ -	 */
+ -	if (tsk->state == TASK_PARKED)
+ -		state = TASK_INTERRUPTIBLE;
+ -
+ -	BUILD_BUG_ON(1 + ilog2(TASK_REPORT) != ARRAY_SIZE(task_state_array)-1);
+ +	BUILD_BUG_ON(1 + ilog2(TASK_STATE_MAX) != ARRAY_SIZE(task_state_array));
+  
+ -	return task_state_array[fls(state)];
+ +	while (state) {
+ +		p++;
+ +		state >>= 1;
+ +	}
+ +	return *p;
+  }
+  
++ static inline int get_task_umask(struct task_struct *tsk)
++ {
++ 	struct fs_struct *fs;
++ 	int umask = -ENOENT;
++ 
++ 	task_lock(tsk);
++ 	fs = tsk->fs;
++ 	if (fs)
++ 		umask = fs->umask;
++ 	task_unlock(tsk);
++ 	return umask;
++ }
++ 
+  static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
+  				struct pid *pid, struct task_struct *p)
+  {
+  	struct user_namespace *user_ns = seq_user_ns(m);
+  	struct group_info *group_info;
+++<<<<<<< HEAD
+ +	int g;
+ +	struct fdtable *fdt = NULL;
+++=======
++ 	int g, umask;
++ 	struct task_struct *tracer;
+++>>>>>>> 3e42979e65da (procfs: expose umask in /proc/<PID>/status)
+  	const struct cred *cred;
+ -	pid_t ppid, tpid = 0, tgid, ngid;
+ -	unsigned int max_fds = 0;
+ +	pid_t ppid, tpid;
+  
+  	rcu_read_lock();
+  	ppid = pid_alive(p) ?
+  		task_tgid_nr_ns(rcu_dereference(p->real_parent), ns) : 0;
+ -
+ -	tracer = ptrace_parent(p);
+ -	if (tracer)
+ -		tpid = task_pid_nr_ns(tracer, ns);
+ -
+ -	tgid = task_tgid_nr_ns(p, ns);
+ -	ngid = task_numa_group_id(p);
+ +	tpid = 0;
+ +	if (pid_alive(p)) {
+ +		struct task_struct *tracer = ptrace_parent(p);
+ +		if (tracer)
+ +			tpid = task_pid_nr_ns(tracer, ns);
+ +	}
+  	cred = get_task_cred(p);
+++<<<<<<< HEAD
+++=======
++ 
++ 	umask = get_task_umask(p);
++ 	if (umask >= 0)
++ 		seq_printf(m, "Umask:\t%#04o\n", umask);
++ 
++ 	task_lock(p);
++ 	if (p->files)
++ 		max_fds = files_fdtable(p->files)->max_fds;
++ 	task_unlock(p);
++ 	rcu_read_unlock();
++ 
+++>>>>>>> 3e42979e65da (procfs: expose umask in /proc/<PID>/status)
+  	seq_printf(m,
+  		"State:\t%s\n"
+  		"Tgid:\t%d\n"
+diff --git a/Documentation/filesystems/proc.txt b/Documentation/filesystems/proc.txt
+index 96455058b68f..9433709281cc 100644
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -220,6 +220,7 @@ Table 1-2: Contents of the status files (as of 2.6.30-rc7)
+  TracerPid                   PID of process tracing this process (0 if not)
+  Uid                         Real, effective, saved set, and  file system UIDs
+  Gid                         Real, effective, saved set, and  file system GIDs
++ Umask                       file mode creation mask
+  FDSize                      number of file descriptor slots currently allocated
+  Groups                      supplementary group list
+  VmPeak                      peak virtual memory size
+* Unmerged path fs/proc/array.c
