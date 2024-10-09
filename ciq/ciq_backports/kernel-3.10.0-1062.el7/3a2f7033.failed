@@ -1,0 +1,776 @@
+net/mlx5: Use order-0 allocations for all WQ types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Use order-0 allocations for all WQ types (Alaa Hleihel) [1641354 1642498]
+Rebuild_FUZZ: 95.83%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 3a2f70331226c140e5aa27ee6bbe2a5c618acb4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3a2f7033.failed
+
+Complete the transition of all WQ types to use fragmented
+order-0 coherent memory instead of high-order allocations.
+
+CQ-WQ already uses order-0.
+Here we do the same for cyclic and linked-list WQs.
+
+This allows the driver to load cleanly on systems with a highly
+fragmented coherent memory.
+
+Performance tests:
+ConnectX-5 100Gbps, CPU: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+Packet rate of 64B packets, single transmit ring, size 8K.
+
+No degradation is sensed.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 3a2f70331226c140e5aa27ee6bbe2a5c618acb4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/wq.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 29331bf7aa1d,ac54380d41e4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -440,18 -378,83 +440,60 @@@ static void mlx5e_post_rx_mpwqe(struct 
+  	mlx5_wq_ll_update_db_record(wq);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+++=======
++ static inline u16 mlx5e_icosq_wrap_cnt(struct mlx5e_icosq *sq)
++ {
++ 	return sq->pc >> MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE;
++ }
++ 
++ static inline void mlx5e_fill_icosq_frag_edge(struct mlx5e_icosq *sq,
++ 					      struct mlx5_wq_cyc *wq,
++ 					      u16 pi, u16 frag_pi)
++ {
++ 	struct mlx5e_sq_wqe_info *edge_wi, *wi = &sq->db.ico_wqe[pi];
++ 	u8 nnops = mlx5_wq_cyc_get_frag_size(wq) - frag_pi;
++ 
++ 	edge_wi = wi + nnops;
++ 
++ 	/* fill sq frag edge with nops to avoid wqe wrapping two pages */
++ 	for (; wi < edge_wi; wi++) {
++ 		wi->opcode = MLX5_OPCODE_NOP;
++ 		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
++ 	}
++ }
++ 
++ static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
++ {
++ 	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
++ 	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
++ 	struct mlx5e_icosq *sq = &rq->channel->icosq;
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_umr_wqe *umr_wqe;
++ 	u16 xlt_offset = ix << (MLX5E_LOG_ALIGNED_MPWQE_PPW - 1);
++ 	u16 pi, frag_pi;
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  	int err;
+ -	int i;
+  
+++<<<<<<< HEAD
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+++=======
++ 	pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
++ 	frag_pi = mlx5_wq_cyc_ctr2fragix(wq, sq->pc);
++ 
++ 	if (unlikely(frag_pi + MLX5E_UMR_WQEBBS > mlx5_wq_cyc_get_frag_size(wq))) {
++ 		mlx5e_fill_icosq_frag_edge(sq, wq, pi, frag_pi);
++ 		pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  	}
+ -
+ -	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ -	if (unlikely(mlx5e_icosq_wrap_cnt(sq) < 2))
+ -		memcpy(umr_wqe, &rq->mpwqe.umr_wqe,
+ -		       offsetof(struct mlx5e_umr_wqe, inline_mtts));
+ -
+ -	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ -		err = mlx5e_page_alloc_mapped(rq, dma_info);
+ -		if (unlikely(err))
+ -			goto err_unmap;
+ -		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
+ -	}
+ -
+ -	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
+ -	wi->consumed_strides = 0;
+ -
+  	rq->mpwqe.umr_in_progress = true;
+ -
+ -	umr_wqe->ctrl.opmod_idx_opcode =
+ -		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ -			    MLX5_OPCODE_UMR);
+ -	umr_wqe->uctrl.xlt_offset = cpu_to_be16(xlt_offset);
+ -
+ -	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
+ -	sq->pc += MLX5E_UMR_WQEBBS;
+ -	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &umr_wqe->ctrl);
+ -
+ +	mlx5e_post_umr_wqe(rq, ix);
+  	return 0;
+ -
+ -err_unmap:
+ -	while (--i >= 0) {
+ -		dma_info--;
+ -		mlx5e_page_release(rq, dma_info, true);
+ -	}
+ -	rq->stats.buff_alloc_err++;
+ -
+ -	return err;
+  }
+  
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 31cc86df395a,d37566be06e1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -286,6 -290,28 +286,31 @@@ mlx5e_txwqe_build_dsegs(struct mlx5e_tx
+  	}
+  
+  	return num_dma;
+++<<<<<<< HEAD
+++=======
++ 
++ dma_unmap_wqe_err:
++ 	mlx5e_dma_unmap_wqe_err(sq, num_dma);
++ 	return -ENOMEM;
++ }
++ 
++ static inline void mlx5e_fill_sq_frag_edge(struct mlx5e_txqsq *sq,
++ 					   struct mlx5_wq_cyc *wq,
++ 					   u16 pi, u16 frag_pi)
++ {
++ 	struct mlx5e_tx_wqe_info *edge_wi, *wi = &sq->db.wqe_info[pi];
++ 	u8 nnops = mlx5_wq_cyc_get_frag_size(wq) - frag_pi;
++ 
++ 	edge_wi = wi + nnops;
++ 
++ 	/* fill sq frag edge with nops to avoid wqe wrapping two pages */
++ 	for (; wi < edge_wi; wi++) {
++ 		wi->skb        = NULL;
++ 		wi->num_wqebbs = 1;
++ 		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
++ 	}
++ 	sq->stats.nop += nnops;
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  }
+  
+  static inline void
+@@@ -317,32 -342,70 +342,84 @@@ mlx5e_txwqe_complete(struct mlx5e_txqs
+  
+  	if (!skb->xmit_more || netif_xmit_stopped(sq->txq))
+  		mlx5e_notify_hw(wq, sq->pc, sq->uar_map, cseg);
+ -}
+  
+ -#define INL_HDR_START_SZ (sizeof(((struct mlx5_wqe_eth_seg *)NULL)->inline_hdr.start))
+ +	/* fill sq edge with nops to avoid wqe wrap around */
+ +	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ +		sq->db.wqe_info[pi].skb = NULL;
+ +		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +		sq->stats->nop++;
+ +	}
+ +}
+  
+ -netdev_tx_t mlx5e_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ -			  struct mlx5e_tx_wqe *wqe, u16 pi)
+ +static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ +				 struct mlx5e_tx_wqe *wqe, u16 pi)
+  {
+ -	struct mlx5_wq_cyc *wq = &sq->wq;
+ -	struct mlx5_wqe_ctrl_seg *cseg;
+ -	struct mlx5_wqe_eth_seg  *eseg;
+ -	struct mlx5_wqe_data_seg *dseg;
+ -	struct mlx5e_tx_wqe_info *wi;
+ +	struct mlx5e_tx_wqe_info *wi   = &sq->db.wqe_info[pi];
+ +
+ +	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
+ +	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
+  
+ +	struct mlx5e_sq_stats *stats = sq->stats;
+  	unsigned char *skb_data = skb->data;
+  	unsigned int skb_len = skb->len;
+++<<<<<<< HEAD
+ +	u8  opcode = MLX5_OPCODE_SEND;
+ +	unsigned int num_bytes;
+ +	int num_dma;
+ +	u16 headlen;
+ +	u16 ds_cnt;
+ +	u16 ihs;
+++=======
++ 	u16 ds_cnt, ds_cnt_inl = 0;
++ 	u16 headlen, ihs, frag_pi;
++ 	u8 num_wqebbs, opcode;
++ 	u32 num_bytes;
++ 	int num_dma;
++ 	__be16 mss;
++ 
++ 	/* Calc ihs and ds cnt, no writes to wqe yet */
++ 	ds_cnt = sizeof(*wqe) / MLX5_SEND_WQE_DS;
++ 	if (skb_is_gso(skb)) {
++ 		opcode    = MLX5_OPCODE_LSO;
++ 		mss       = cpu_to_be16(skb_shinfo(skb)->gso_size);
++ 		ihs       = mlx5e_tx_get_gso_ihs(sq, skb);
++ 		num_bytes = skb->len + (skb_shinfo(skb)->gso_segs - 1) * ihs;
++ 		sq->stats.packets += skb_shinfo(skb)->gso_segs;
++ 	} else {
++ 		opcode    = MLX5_OPCODE_SEND;
++ 		mss       = 0;
++ 		ihs       = mlx5e_calc_min_inline(sq->min_inline_mode, skb);
++ 		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
++ 		sq->stats.packets++;
++ 	}
++ 
++ 	sq->stats.bytes     += num_bytes;
++ 	sq->stats.xmit_more += skb->xmit_more;
++ 
++ 	headlen = skb_len - ihs - skb->data_len;
++ 	ds_cnt += !!headlen;
++ 	ds_cnt += skb_shinfo(skb)->nr_frags;
++ 
++ 	if (ihs) {
++ 		ihs += !!skb_vlan_tag_present(skb) * VLAN_HLEN;
++ 
++ 		ds_cnt_inl = DIV_ROUND_UP(ihs - INL_HDR_START_SZ, MLX5_SEND_WQE_DS);
++ 		ds_cnt += ds_cnt_inl;
++ 	}
++ 
++ 	num_wqebbs = DIV_ROUND_UP(ds_cnt, MLX5_SEND_WQEBB_NUM_DS);
++ 	frag_pi = mlx5_wq_cyc_ctr2fragix(wq, sq->pc);
++ 	if (unlikely(frag_pi + num_wqebbs > mlx5_wq_cyc_get_frag_size(wq))) {
++ 		mlx5e_fill_sq_frag_edge(sq, wq, pi, frag_pi);
++ 		mlx5e_sq_fetch_wqe(sq, &wqe, &pi);
++ 	}
++ 
++ 	/* fill wqe */
++ 	wi   = &sq->db.wqe_info[pi];
++ 	cseg = &wqe->ctrl;
++ 	eseg = &wqe->eth;
++ 	dseg =  wqe->data;
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  
+  	mlx5e_txwqe_build_eseg_csum(sq, skb, eseg);
+  
+@@@ -592,26 -632,67 +669,79 @@@ mlx5i_txwqe_build_datagram(struct mlx5_
+  netdev_tx_t mlx5i_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+  			  struct mlx5_av *av, u32 dqpn, u32 dqkey)
+  {
+ -	struct mlx5_wq_cyc *wq = &sq->wq;
+ -	struct mlx5i_tx_wqe *wqe;
+ +	struct mlx5_wq_cyc       *wq   = &sq->wq;
+ +	u16                       pi   = sq->pc & wq->sz_m1;
+ +	struct mlx5i_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+ +	struct mlx5e_tx_wqe_info *wi   = &sq->db.wqe_info[pi];
+  
+ -	struct mlx5_wqe_datagram_seg *datagram;
+ -	struct mlx5_wqe_ctrl_seg *cseg;
+ -	struct mlx5_wqe_eth_seg  *eseg;
+ -	struct mlx5_wqe_data_seg *dseg;
+ -	struct mlx5e_tx_wqe_info *wi;
+ +	struct mlx5_wqe_ctrl_seg     *cseg = &wqe->ctrl;
+ +	struct mlx5_wqe_datagram_seg *datagram = &wqe->datagram;
+ +	struct mlx5_wqe_eth_seg      *eseg = &wqe->eth;
+  
+ +	struct mlx5e_sq_stats *stats = sq->stats;
+  	unsigned char *skb_data = skb->data;
+  	unsigned int skb_len = skb->len;
+++<<<<<<< HEAD
+ +	u8  opcode = MLX5_OPCODE_SEND;
+ +	unsigned int num_bytes;
+++=======
++ 	u16 headlen, ihs, pi, frag_pi;
++ 	u16 ds_cnt, ds_cnt_inl = 0;
++ 	u8 num_wqebbs, opcode;
++ 	u32 num_bytes;
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  	int num_dma;
+ -	__be16 mss;
+ +	u16 headlen;
+ +	u16 ds_cnt;
+ +	u16 ihs;
+  
+++<<<<<<< HEAD
+ +	memset(wqe, 0, sizeof(*wqe));
+++=======
++ 	mlx5i_sq_fetch_wqe(sq, &wqe, &pi);
++ 
++ 	/* Calc ihs and ds cnt, no writes to wqe yet */
++ 	ds_cnt = sizeof(*wqe) / MLX5_SEND_WQE_DS;
++ 	if (skb_is_gso(skb)) {
++ 		opcode    = MLX5_OPCODE_LSO;
++ 		mss       = cpu_to_be16(skb_shinfo(skb)->gso_size);
++ 		ihs       = mlx5e_tx_get_gso_ihs(sq, skb);
++ 		num_bytes = skb->len + (skb_shinfo(skb)->gso_segs - 1) * ihs;
++ 		sq->stats.packets += skb_shinfo(skb)->gso_segs;
++ 	} else {
++ 		opcode    = MLX5_OPCODE_SEND;
++ 		mss       = 0;
++ 		ihs       = mlx5e_calc_min_inline(sq->min_inline_mode, skb);
++ 		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
++ 		sq->stats.packets++;
++ 	}
++ 
++ 	sq->stats.bytes     += num_bytes;
++ 	sq->stats.xmit_more += skb->xmit_more;
++ 
++ 	headlen = skb_len - ihs - skb->data_len;
++ 	ds_cnt += !!headlen;
++ 	ds_cnt += skb_shinfo(skb)->nr_frags;
++ 
++ 	if (ihs) {
++ 		ds_cnt_inl = DIV_ROUND_UP(ihs - INL_HDR_START_SZ, MLX5_SEND_WQE_DS);
++ 		ds_cnt += ds_cnt_inl;
++ 	}
++ 
++ 	num_wqebbs = DIV_ROUND_UP(ds_cnt, MLX5_SEND_WQEBB_NUM_DS);
++ 	frag_pi = mlx5_wq_cyc_ctr2fragix(wq, sq->pc);
++ 	if (unlikely(frag_pi + num_wqebbs > mlx5_wq_cyc_get_frag_size(wq))) {
++ 		mlx5e_fill_sq_frag_edge(sq, wq, pi, frag_pi);
++ 		mlx5i_sq_fetch_wqe(sq, &wqe, &pi);
++ 	}
++ 
++ 	/* fill wqe */
++ 	wi       = &sq->db.wqe_info[pi];
++ 	cseg     = &wqe->ctrl;
++ 	datagram = &wqe->datagram;
++ 	eseg     = &wqe->eth;
++ 	dseg     =  wqe->data;
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  
+  	mlx5i_txwqe_build_datagram(av, dqpn, dqkey, datagram);
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/wq.h
+index f3dfa0ca3c5d,b9d7c01fc7cb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.h
+@@@ -174,9 -179,14 +169,17 @@@ static inline int mlx5_wq_ll_is_empty(s
+  	return !wq->cur_sz;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u16 mlx5_wq_ll_ctr2ix(struct mlx5_wq_ll *wq, u16 ctr)
++ {
++ 	return ctr & wq->fbc.sz_m1;
++ }
++ 
+++>>>>>>> 3a2f70331226 (net/mlx5: Use order-0 allocations for all WQ types)
+  static inline void *mlx5_wq_ll_get_wqe(struct mlx5_wq_ll *wq, u16 ix)
+  {
+- 	return wq->buf + (ix << wq->log_stride);
++ 	return mlx5_frag_buf_get_wqe(&wq->fbc, ix);
+  }
+  
+  static inline void mlx5_wq_ll_push(struct mlx5_wq_ll *wq, u16 head_next)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883..891cb0786c13 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -311,7 +311,7 @@ struct mlx5e_cq {
+ 
+ 	/* control */
+ 	struct mlx5_core_dev      *mdev;
+-	struct mlx5_frag_wq_ctrl   wq_ctrl;
++	struct mlx5_wq_ctrl        wq_ctrl;
+ } ____cacheline_aligned_in_smp;
+ 
+ struct mlx5e_tx_wqe_info {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a11f70af9727..5e26d993a5cb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -618,8 +618,8 @@ static int mlx5e_create_rq(struct mlx5e_rq *rq,
+ 						MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET64(wq, wq,  dbr_addr,		rq->wq_ctrl.db.dma);
+ 
+-	mlx5_fill_page_array(&rq->wq_ctrl.buf,
+-			     (__be64 *)MLX5_ADDR_OF(wq, wq, pas));
++	mlx5_fill_page_frag_array(&rq->wq_ctrl.buf,
++				  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));
+ 
+ 	err = mlx5_core_create_rq(mdev, in, inlen, &rq->rqn);
+ 
+@@ -1062,7 +1062,8 @@ static int mlx5e_create_sq(struct mlx5_core_dev *mdev,
+ 					  MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET64(wq, wq, dbr_addr,      csp->wq_ctrl->db.dma);
+ 
+-	mlx5_fill_page_array(&csp->wq_ctrl->buf, (__be64 *)MLX5_ADDR_OF(wq, wq, pas));
++	mlx5_fill_page_frag_array(&csp->wq_ctrl->buf,
++				  (__be64 *)MLX5_ADDR_OF(wq, wq, pas));
+ 
+ 	err = mlx5_core_create_sq(mdev, in, inlen, sqn);
+ 
+@@ -1388,7 +1389,7 @@ static int mlx5e_alloc_cq(struct mlx5e_channel *c,
+ 
+ static void mlx5e_free_cq(struct mlx5e_cq *cq)
+ {
+-	mlx5_cqwq_destroy(&cq->wq_ctrl);
++	mlx5_wq_destroy(&cq->wq_ctrl);
+ }
+ 
+ static int mlx5e_create_cq(struct mlx5e_cq *cq, struct mlx5e_cq_param *param)
+@@ -1404,7 +1405,7 @@ static int mlx5e_create_cq(struct mlx5e_cq *cq, struct mlx5e_cq_param *param)
+ 	int err;
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+-		sizeof(u64) * cq->wq_ctrl.frag_buf.npages;
++		sizeof(u64) * cq->wq_ctrl.buf.npages;
+ 	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+@@ -1413,7 +1414,7 @@ static int mlx5e_create_cq(struct mlx5e_cq *cq, struct mlx5e_cq_param *param)
+ 
+ 	memcpy(cqc, param->cqc, sizeof(param->cqc));
+ 
+-	mlx5_fill_page_frag_array(&cq->wq_ctrl.frag_buf,
++	mlx5_fill_page_frag_array(&cq->wq_ctrl.buf,
+ 				  (__be64 *)MLX5_ADDR_OF(create_cq_in, in, pas));
+ 
+ 	mlx5_vector2eqn(mdev, param->eq_ix, &eqn, &irqn_not_used);
+@@ -1421,7 +1422,7 @@ static int mlx5e_create_cq(struct mlx5e_cq *cq, struct mlx5e_cq_param *param)
+ 	MLX5_SET(cqc,   cqc, cq_period_mode, param->cq_period_mode);
+ 	MLX5_SET(cqc,   cqc, c_eqn,         eqn);
+ 	MLX5_SET(cqc,   cqc, uar_page,      mdev->priv.uar->index);
+-	MLX5_SET(cqc,   cqc, log_page_size, cq->wq_ctrl.frag_buf.page_shift -
++	MLX5_SET(cqc,   cqc, log_page_size, cq->wq_ctrl.buf.page_shift -
+ 					    MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET64(cqc, cqc, dbr_addr,      cq->wq_ctrl.db.dma);
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+index e6175f8ac0e4..4e427cafd38c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+@@ -454,7 +454,7 @@ static int mlx5_fpga_conn_create_cq(struct mlx5_fpga_conn *conn, int cq_size)
+ 	}
+ 
+ 	inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+-		sizeof(u64) * conn->cq.wq_ctrl.frag_buf.npages;
++		sizeof(u64) * conn->cq.wq_ctrl.buf.npages;
+ 	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in) {
+ 		err = -ENOMEM;
+@@ -469,12 +469,12 @@ static int mlx5_fpga_conn_create_cq(struct mlx5_fpga_conn *conn, int cq_size)
+ 	MLX5_SET(cqc, cqc, log_cq_size, ilog2(cq_size));
+ 	MLX5_SET(cqc, cqc, c_eqn, eqn);
+ 	MLX5_SET(cqc, cqc, uar_page, fdev->conn_res.uar->index);
+-	MLX5_SET(cqc, cqc, log_page_size, conn->cq.wq_ctrl.frag_buf.page_shift -
++	MLX5_SET(cqc, cqc, log_page_size, conn->cq.wq_ctrl.buf.page_shift -
+ 			   MLX5_ADAPTER_PAGE_SHIFT);
+ 	MLX5_SET64(cqc, cqc, dbr_addr, conn->cq.wq_ctrl.db.dma);
+ 
+ 	pas = (__be64 *)MLX5_ADDR_OF(create_cq_in, in, pas);
+-	mlx5_fill_page_frag_array(&conn->cq.wq_ctrl.frag_buf, pas);
++	mlx5_fill_page_frag_array(&conn->cq.wq_ctrl.buf, pas);
+ 
+ 	err = mlx5_core_create_cq(mdev, &conn->cq.mcq, in, inlen);
+ 	kvfree(in);
+@@ -500,7 +500,7 @@ static int mlx5_fpga_conn_create_cq(struct mlx5_fpga_conn *conn, int cq_size)
+ 	goto out;
+ 
+ err_cqwq:
+-	mlx5_cqwq_destroy(&conn->cq.wq_ctrl);
++	mlx5_wq_destroy(&conn->cq.wq_ctrl);
+ out:
+ 	return err;
+ }
+@@ -510,7 +510,7 @@ static void mlx5_fpga_conn_destroy_cq(struct mlx5_fpga_conn *conn)
+ 	tasklet_disable(&conn->cq.tasklet);
+ 	tasklet_kill(&conn->cq.tasklet);
+ 	mlx5_core_destroy_cq(conn->fdev->mdev, &conn->cq.mcq);
+-	mlx5_cqwq_destroy(&conn->cq.wq_ctrl);
++	mlx5_wq_destroy(&conn->cq.wq_ctrl);
+ }
+ 
+ static int mlx5_fpga_conn_create_wq(struct mlx5_fpga_conn *conn, void *qpc)
+@@ -591,8 +591,8 @@ static int mlx5_fpga_conn_create_qp(struct mlx5_fpga_conn *conn,
+ 	if (MLX5_CAP_GEN(mdev, cqe_version) == 1)
+ 		MLX5_SET(qpc, qpc, user_index, 0xFFFFFF);
+ 
+-	mlx5_fill_page_array(&conn->qp.wq_ctrl.buf,
+-			     (__be64 *)MLX5_ADDR_OF(create_qp_in, in, pas));
++	mlx5_fill_page_frag_array(&conn->qp.wq_ctrl.buf,
++				  (__be64 *)MLX5_ADDR_OF(create_qp_in, in, pas));
+ 
+ 	err = mlx5_core_create_qp(mdev, &conn->qp.mqp, in, inlen);
+ 	if (err)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.h b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.h
+index 44bd9eccc711..634ae10e287b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.h
+@@ -54,7 +54,7 @@ struct mlx5_fpga_conn {
+ 	/* CQ */
+ 	struct {
+ 		struct mlx5_cqwq wq;
+-		struct mlx5_frag_wq_ctrl wq_ctrl;
++		struct mlx5_wq_ctrl wq_ctrl;
+ 		struct mlx5_core_cq mcq;
+ 		struct tasklet_struct tasklet;
+ 	} cq;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/wq.c b/drivers/net/ethernet/mellanox/mlx5/core/wq.c
+index ea66448ba365..5b8b35392025 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.c
+@@ -36,7 +36,12 @@
+ 
+ u32 mlx5_wq_cyc_get_size(struct mlx5_wq_cyc *wq)
+ {
+-	return (u32)wq->sz_m1 + 1;
++	return (u32)wq->fbc.sz_m1 + 1;
++}
++
++u32 mlx5_wq_cyc_get_frag_size(struct mlx5_wq_cyc *wq)
++{
++	return (u32)wq->fbc.frag_sz_m1 + 1;
+ }
+ 
+ u32 mlx5_cqwq_get_size(struct mlx5_cqwq *wq)
+@@ -46,12 +51,12 @@ u32 mlx5_cqwq_get_size(struct mlx5_cqwq *wq)
+ 
+ u32 mlx5_wq_ll_get_size(struct mlx5_wq_ll *wq)
+ {
+-	return (u32)wq->sz_m1 + 1;
++	return (u32)wq->fbc.sz_m1 + 1;
+ }
+ 
+ static u32 mlx5_wq_cyc_get_byte_size(struct mlx5_wq_cyc *wq)
+ {
+-	return mlx5_wq_cyc_get_size(wq) << wq->log_stride;
++	return mlx5_wq_cyc_get_size(wq) << wq->fbc.log_stride;
+ }
+ 
+ static u32 mlx5_wq_qp_get_byte_size(struct mlx5_wq_qp *wq)
+@@ -67,17 +72,19 @@ static u32 mlx5_cqwq_get_byte_size(struct mlx5_cqwq *wq)
+ 
+ static u32 mlx5_wq_ll_get_byte_size(struct mlx5_wq_ll *wq)
+ {
+-	return mlx5_wq_ll_get_size(wq) << wq->log_stride;
++	return mlx5_wq_ll_get_size(wq) << wq->fbc.log_stride;
+ }
+ 
+ int mlx5_wq_cyc_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		       void *wqc, struct mlx5_wq_cyc *wq,
+ 		       struct mlx5_wq_ctrl *wq_ctrl)
+ {
++	struct mlx5_frag_buf_ctrl *fbc = &wq->fbc;
+ 	int err;
+ 
+-	wq->log_stride = MLX5_GET(wq, wqc, log_wq_stride);
+-	wq->sz_m1 = (1 << MLX5_GET(wq, wqc, log_wq_sz)) - 1;
++	mlx5_fill_fbc(MLX5_GET(wq, wqc, log_wq_stride),
++		      MLX5_GET(wq, wqc, log_wq_sz),
++		      fbc);
+ 
+ 	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+ 	if (err) {
+@@ -85,14 +92,14 @@ int mlx5_wq_cyc_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		return err;
+ 	}
+ 
+-	err = mlx5_buf_alloc_node(mdev, mlx5_wq_cyc_get_byte_size(wq),
+-				  &wq_ctrl->buf, param->buf_numa_node);
++	err = mlx5_frag_buf_alloc_node(mdev, mlx5_wq_cyc_get_byte_size(wq),
++				       &wq_ctrl->buf, param->buf_numa_node);
+ 	if (err) {
+-		mlx5_core_warn(mdev, "mlx5_buf_alloc_node() failed, %d\n", err);
++		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->buf = wq_ctrl->buf.frags->buf;
++	fbc->frag_buf = wq_ctrl->buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+ 	wq_ctrl->mdev = mdev;
+@@ -105,17 +112,35 @@ err_db_free:
+ 	return err;
+ }
+ 
++static void mlx5e_qp_set_frag_buf(struct mlx5_frag_buf *buf,
++				  struct mlx5_wq_qp *qp)
++{
++	struct mlx5_frag_buf *rqb, *sqb;
++
++	rqb = &qp->rq.fbc.frag_buf;
++	*rqb = *buf;
++	rqb->size   = mlx5_wq_cyc_get_byte_size(&qp->rq);
++	rqb->npages = 1 << get_order(rqb->size);
++
++	sqb = &qp->sq.fbc.frag_buf;
++	*sqb = *buf;
++	sqb->size   = mlx5_wq_cyc_get_byte_size(&qp->rq);
++	sqb->npages = 1 << get_order(sqb->size);
++	sqb->frags += rqb->npages; /* first part is for the rq */
++}
++
+ int mlx5_wq_qp_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		      void *qpc, struct mlx5_wq_qp *wq,
+ 		      struct mlx5_wq_ctrl *wq_ctrl)
+ {
+ 	int err;
+ 
+-	wq->rq.log_stride = MLX5_GET(qpc, qpc, log_rq_stride) + 4;
+-	wq->rq.sz_m1 = (1 << MLX5_GET(qpc, qpc, log_rq_size)) - 1;
+-
+-	wq->sq.log_stride = ilog2(MLX5_SEND_WQE_BB);
+-	wq->sq.sz_m1 = (1 << MLX5_GET(qpc, qpc, log_sq_size)) - 1;
++	mlx5_fill_fbc(MLX5_GET(qpc, qpc, log_rq_stride) + 4,
++		      MLX5_GET(qpc, qpc, log_rq_size),
++		      &wq->rq.fbc);
++	mlx5_fill_fbc(ilog2(MLX5_SEND_WQE_BB),
++		      MLX5_GET(qpc, qpc, log_sq_size),
++		      &wq->sq.fbc);
+ 
+ 	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+ 	if (err) {
+@@ -123,15 +148,15 @@ int mlx5_wq_qp_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		return err;
+ 	}
+ 
+-	err = mlx5_buf_alloc_node(mdev, mlx5_wq_qp_get_byte_size(wq),
+-				  &wq_ctrl->buf, param->buf_numa_node);
++	err = mlx5_frag_buf_alloc_node(mdev, mlx5_wq_qp_get_byte_size(wq),
++				       &wq_ctrl->buf, param->buf_numa_node);
+ 	if (err) {
+-		mlx5_core_warn(mdev, "mlx5_buf_alloc_node() failed, %d\n", err);
++		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->rq.buf = wq_ctrl->buf.frags->buf;
+-	wq->sq.buf = wq->rq.buf + mlx5_wq_cyc_get_byte_size(&wq->rq);
++	mlx5e_qp_set_frag_buf(&wq_ctrl->buf, wq);
++
+ 	wq->rq.db  = &wq_ctrl->db.db[MLX5_RCV_DBR];
+ 	wq->sq.db  = &wq_ctrl->db.db[MLX5_SND_DBR];
+ 
+@@ -147,7 +172,7 @@ err_db_free:
+ 
+ int mlx5_cqwq_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		     void *cqc, struct mlx5_cqwq *wq,
+-		     struct mlx5_frag_wq_ctrl *wq_ctrl)
++		     struct mlx5_wq_ctrl *wq_ctrl)
+ {
+ 	int err;
+ 
+@@ -160,7 +185,7 @@ int mlx5_cqwq_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 	}
+ 
+ 	err = mlx5_frag_buf_alloc_node(mdev, mlx5_cqwq_get_byte_size(wq),
+-				       &wq_ctrl->frag_buf,
++				       &wq_ctrl->buf,
+ 				       param->buf_numa_node);
+ 	if (err) {
+ 		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n",
+@@ -168,7 +193,7 @@ int mlx5_cqwq_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->fbc.frag_buf = wq_ctrl->frag_buf;
++	wq->fbc.frag_buf = wq_ctrl->buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+ 	wq_ctrl->mdev = mdev;
+@@ -185,12 +210,14 @@ int mlx5_wq_ll_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		      void *wqc, struct mlx5_wq_ll *wq,
+ 		      struct mlx5_wq_ctrl *wq_ctrl)
+ {
++	struct mlx5_frag_buf_ctrl *fbc = &wq->fbc;
+ 	struct mlx5_wqe_srq_next_seg *next_seg;
+ 	int err;
+ 	int i;
+ 
+-	wq->log_stride = MLX5_GET(wq, wqc, log_wq_stride);
+-	wq->sz_m1 = (1 << MLX5_GET(wq, wqc, log_wq_sz)) - 1;
++	mlx5_fill_fbc(MLX5_GET(wq, wqc, log_wq_stride),
++		      MLX5_GET(wq, wqc, log_wq_sz),
++		      fbc);
+ 
+ 	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+ 	if (err) {
+@@ -198,17 +225,17 @@ int mlx5_wq_ll_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
+ 		return err;
+ 	}
+ 
+-	err = mlx5_buf_alloc_node(mdev, mlx5_wq_ll_get_byte_size(wq),
+-				  &wq_ctrl->buf, param->buf_numa_node);
++	err = mlx5_frag_buf_alloc_node(mdev, mlx5_wq_ll_get_byte_size(wq),
++				       &wq_ctrl->buf, param->buf_numa_node);
+ 	if (err) {
+-		mlx5_core_warn(mdev, "mlx5_buf_alloc_node() failed, %d\n", err);
++		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->buf = wq_ctrl->buf.frags->buf;
++	wq->fbc.frag_buf = wq_ctrl->buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+-	for (i = 0; i < wq->sz_m1; i++) {
++	for (i = 0; i < fbc->sz_m1; i++) {
+ 		next_seg = mlx5_wq_ll_get_wqe(wq, i);
+ 		next_seg->next_wqe_index = cpu_to_be16(i + 1);
+ 	}
+@@ -227,12 +254,7 @@ err_db_free:
+ 
+ void mlx5_wq_destroy(struct mlx5_wq_ctrl *wq_ctrl)
+ {
+-	mlx5_buf_free(wq_ctrl->mdev, &wq_ctrl->buf);
++	mlx5_frag_buf_free(wq_ctrl->mdev, &wq_ctrl->buf);
+ 	mlx5_db_free(wq_ctrl->mdev, &wq_ctrl->db);
+ }
+ 
+-void mlx5_cqwq_destroy(struct mlx5_frag_wq_ctrl *wq_ctrl)
+-{
+-	mlx5_frag_buf_free(wq_ctrl->mdev, &wq_ctrl->frag_buf);
+-	mlx5_db_free(wq_ctrl->mdev, &wq_ctrl->db);
+-}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/wq.h
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 4e54981203eb..786eb659629c 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -980,16 +980,24 @@ static inline u32 mlx5_base_mkey(const u32 key)
+ 	return key & 0xffffff00u;
+ }
+ 
+-static inline void mlx5_core_init_cq_frag_buf(struct mlx5_frag_buf_ctrl *fbc,
+-					      void *cqc)
++static inline void mlx5_fill_fbc(u8 log_stride, u8 log_sz,
++				 struct mlx5_frag_buf_ctrl *fbc)
+ {
+-	fbc->log_stride	= 6 + MLX5_GET(cqc, cqc, cqe_sz);
+-	fbc->log_sz	= MLX5_GET(cqc, cqc, log_cq_size);
++	fbc->log_stride = log_stride;
++	fbc->log_sz     = log_sz;
+ 	fbc->sz_m1	= (1 << fbc->log_sz) - 1;
+ 	fbc->log_frag_strides = PAGE_SHIFT - fbc->log_stride;
+ 	fbc->frag_sz_m1	= (1 << fbc->log_frag_strides) - 1;
+ }
+ 
++static inline void mlx5_core_init_cq_frag_buf(struct mlx5_frag_buf_ctrl *fbc,
++					      void *cqc)
++{
++	mlx5_fill_fbc(6 + MLX5_GET(cqc, cqc, cqe_sz),
++		      MLX5_GET(cqc, cqc, log_cq_size),
++		      fbc);
++}
++
+ static inline void *mlx5_frag_buf_get_wqe(struct mlx5_frag_buf_ctrl *fbc,
+ 					  u32 ix)
+ {
