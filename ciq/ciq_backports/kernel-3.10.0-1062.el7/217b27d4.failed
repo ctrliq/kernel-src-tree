@@ -1,0 +1,368 @@
+efi: Use a file local lock for efivars
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sylvain Chouleur <sylvain.chouleur@intel.com>
+commit 217b27d4671a0a3f34147f1b341683d36b7457db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/217b27d4.failed
+
+This patch replaces the spinlock in the efivars struct with a single lock
+for the whole vars.c file.  The goal of this lock is to protect concurrent
+calls to efi variable services, registering and unregistering. This allows
+us to register new efivars operations without having in-progress call.
+
+	Signed-off-by: Sylvain Chouleur <sylvain.chouleur@intel.com>
+	Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Cc: Leif Lindholm <leif.lindholm@linaro.org>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Sylvain Chouleur <sylvain.chouleur@gmail.com>
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+(cherry picked from commit 217b27d4671a0a3f34147f1b341683d36b7457db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/efi.h
+diff --cc include/linux/efi.h
+index ef5037485869,deecb2902715..000000000000
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@@ -1139,16 -1157,6 +1139,19 @@@ struct efivar_operations 
+  };
+  
+  struct efivars {
+++<<<<<<< HEAD
+ +	/*
+ +	 * ->lock protects two things:
+ +	 * 1) ->list - adds, removals, reads, writes
+ +	 * 2) ops.[gs]et_variable() calls.
+ +	 * It must not be held when creating sysfs entries or calling kmalloc.
+ +	 * ops.get_next_variable() is only called from register_efivars()
+ +	 * or efivar_update_sysfs_entries(),
+ +	 * which is protected by the BKL, so that path is safe.
+ +	 */
+ +	spinlock_t lock;
+++=======
+++>>>>>>> 217b27d4671a (efi: Use a file local lock for efivars)
+  	struct kset *kset;
+  	struct kobject *kobject;
+  	const struct efivar_operations *ops;
+diff --git a/drivers/firmware/efi/vars.c b/drivers/firmware/efi/vars.c
+index 3c34751620b1..0b4655122298 100644
+--- a/drivers/firmware/efi/vars.c
++++ b/drivers/firmware/efi/vars.c
+@@ -37,6 +37,14 @@
+ /* Private pointer to registered efivars */
+ static struct efivars *__efivars;
+ 
++/*
++ * efivars_lock protects three things:
++ * 1) efivarfs_list and efivars_sysfs_list
++ * 2) ->ops calls
++ * 3) (un)registration of __efivars
++ */
++static DEFINE_SPINLOCK(efivars_lock);
++
+ static bool efivar_wq_enabled = true;
+ DECLARE_WORK(efivar_work, NULL);
+ EXPORT_SYMBOL_GPL(efivar_work);
+@@ -386,7 +394,7 @@ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+ 		return -ENOMEM;
+ 	}
+ 
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 
+ 	/*
+ 	 * Per EFI spec, the maximum storage allocated for both
+@@ -402,7 +410,7 @@ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+ 		switch (status) {
+ 		case EFI_SUCCESS:
+ 			if (duplicates)
+-				spin_unlock_irq(&__efivars->lock);
++				spin_unlock_irq(&efivars_lock);
+ 
+ 			variable_name_size = var_name_strnsize(variable_name,
+ 							       variable_name_size);
+@@ -429,7 +437,7 @@ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+ 			}
+ 
+ 			if (duplicates)
+-				spin_lock_irq(&__efivars->lock);
++				spin_lock_irq(&efivars_lock);
+ 
+ 			break;
+ 		case EFI_NOT_FOUND:
+@@ -443,7 +451,7 @@ int efivar_init(int (*func)(efi_char16_t *, efi_guid_t, unsigned long, void *),
+ 
+ 	} while (status != EFI_NOT_FOUND);
+ 
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ 
+ 	kfree(variable_name);
+ 
+@@ -458,9 +466,9 @@ EXPORT_SYMBOL_GPL(efivar_init);
+  */
+ void efivar_entry_add(struct efivar_entry *entry, struct list_head *head)
+ {
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	list_add(&entry->list, head);
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ }
+ EXPORT_SYMBOL_GPL(efivar_entry_add);
+ 
+@@ -470,9 +478,9 @@ EXPORT_SYMBOL_GPL(efivar_entry_add);
+  */
+ void efivar_entry_remove(struct efivar_entry *entry)
+ {
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	list_del(&entry->list);
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ }
+ EXPORT_SYMBOL_GPL(efivar_entry_remove);
+ 
+@@ -489,10 +497,10 @@ EXPORT_SYMBOL_GPL(efivar_entry_remove);
+  */
+ static void efivar_entry_list_del_unlock(struct efivar_entry *entry)
+ {
+-	lockdep_assert_held(&__efivars->lock);
++	lockdep_assert_held(&efivars_lock);
+ 
+ 	list_del(&entry->list);
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ }
+ 
+ /**
+@@ -515,7 +523,7 @@ int __efivar_entry_delete(struct efivar_entry *entry)
+ 	const struct efivar_operations *ops = __efivars->ops;
+ 	efi_status_t status;
+ 
+-	lockdep_assert_held(&__efivars->lock);
++	lockdep_assert_held(&efivars_lock);
+ 
+ 	status = ops->set_variable(entry->var.VariableName,
+ 				   &entry->var.VendorGuid,
+@@ -541,12 +549,12 @@ int efivar_entry_delete(struct efivar_entry *entry)
+ 	const struct efivar_operations *ops = __efivars->ops;
+ 	efi_status_t status;
+ 
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	status = ops->set_variable(entry->var.VariableName,
+ 				   &entry->var.VendorGuid,
+ 				   0, 0, NULL);
+ 	if (!(status == EFI_SUCCESS || status == EFI_NOT_FOUND)) {
+-		spin_unlock_irq(&__efivars->lock);
++		spin_unlock_irq(&efivars_lock);
+ 		return efi_status_to_err(status);
+ 	}
+ 
+@@ -584,10 +592,10 @@ int efivar_entry_set(struct efivar_entry *entry, u32 attributes,
+ 	efi_char16_t *name = entry->var.VariableName;
+ 	efi_guid_t vendor = entry->var.VendorGuid;
+ 
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 
+ 	if (head && efivar_entry_find(name, vendor, head, false)) {
+-		spin_unlock_irq(&__efivars->lock);
++		spin_unlock_irq(&efivars_lock);
+ 		return -EEXIST;
+ 	}
+ 
+@@ -596,7 +604,7 @@ int efivar_entry_set(struct efivar_entry *entry, u32 attributes,
+ 		status = ops->set_variable(name, &vendor,
+ 					   attributes, size, data);
+ 
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ 
+ 	return efi_status_to_err(status);
+ 
+@@ -610,7 +618,7 @@ EXPORT_SYMBOL_GPL(efivar_entry_set);
+  * from crash/panic handlers.
+  *
+  * Crucially, this function will not block if it cannot acquire
+- * __efivars->lock. Instead, it returns -EBUSY.
++ * efivars_lock. Instead, it returns -EBUSY.
+  */
+ static int
+ efivar_entry_set_nonblocking(efi_char16_t *name, efi_guid_t vendor,
+@@ -620,20 +628,20 @@ efivar_entry_set_nonblocking(efi_char16_t *name, efi_guid_t vendor,
+ 	unsigned long flags;
+ 	efi_status_t status;
+ 
+-	if (!spin_trylock_irqsave(&__efivars->lock, flags))
++	if (!spin_trylock_irqsave(&efivars_lock, flags))
+ 		return -EBUSY;
+ 
+ 	status = check_var_size_nonblocking(attributes,
+ 					    size + ucs2_strsize(name, 1024));
+ 	if (status != EFI_SUCCESS) {
+-		spin_unlock_irqrestore(&__efivars->lock, flags);
++		spin_unlock_irqrestore(&efivars_lock, flags);
+ 		return -ENOSPC;
+ 	}
+ 
+ 	status = ops->set_variable_nonblocking(name, &vendor, attributes,
+ 					       size, data);
+ 
+-	spin_unlock_irqrestore(&__efivars->lock, flags);
++	spin_unlock_irqrestore(&efivars_lock, flags);
+ 	return efi_status_to_err(status);
+ }
+ 
+@@ -679,21 +687,21 @@ int efivar_entry_set_safe(efi_char16_t *name, efi_guid_t vendor, u32 attributes,
+ 						    size, data);
+ 
+ 	if (!block) {
+-		if (!spin_trylock_irqsave(&__efivars->lock, flags))
++		if (!spin_trylock_irqsave(&efivars_lock, flags))
+ 			return -EBUSY;
+ 	} else {
+-		spin_lock_irqsave(&__efivars->lock, flags);
++		spin_lock_irqsave(&efivars_lock, flags);
+ 	}
+ 
+ 	status = check_var_size(attributes, size + ucs2_strsize(name, 1024));
+ 	if (status != EFI_SUCCESS) {
+-		spin_unlock_irqrestore(&__efivars->lock, flags);
++		spin_unlock_irqrestore(&efivars_lock, flags);
+ 		return -ENOSPC;
+ 	}
+ 
+ 	status = ops->set_variable(name, &vendor, attributes, size, data);
+ 
+-	spin_unlock_irqrestore(&__efivars->lock, flags);
++	spin_unlock_irqrestore(&efivars_lock, flags);
+ 
+ 	return efi_status_to_err(status);
+ }
+@@ -723,7 +731,7 @@ struct efivar_entry *efivar_entry_find(efi_char16_t *name, efi_guid_t guid,
+ 	int strsize1, strsize2;
+ 	bool found = false;
+ 
+-	lockdep_assert_held(&__efivars->lock);
++	lockdep_assert_held(&efivars_lock);
+ 
+ 	list_for_each_entry_safe(entry, n, head, list) {
+ 		strsize1 = ucs2_strsize(name, 1024);
+@@ -766,10 +774,10 @@ int efivar_entry_size(struct efivar_entry *entry, unsigned long *size)
+ 
+ 	*size = 0;
+ 
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	status = ops->get_variable(entry->var.VariableName,
+ 				   &entry->var.VendorGuid, NULL, size, NULL);
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ 
+ 	if (status != EFI_BUFFER_TOO_SMALL)
+ 		return efi_status_to_err(status);
+@@ -795,7 +803,7 @@ int __efivar_entry_get(struct efivar_entry *entry, u32 *attributes,
+ 	const struct efivar_operations *ops = __efivars->ops;
+ 	efi_status_t status;
+ 
+-	lockdep_assert_held(&__efivars->lock);
++	lockdep_assert_held(&efivars_lock);
+ 
+ 	status = ops->get_variable(entry->var.VariableName,
+ 				   &entry->var.VendorGuid,
+@@ -818,11 +826,11 @@ int efivar_entry_get(struct efivar_entry *entry, u32 *attributes,
+ 	const struct efivar_operations *ops = __efivars->ops;
+ 	efi_status_t status;
+ 
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	status = ops->get_variable(entry->var.VariableName,
+ 				   &entry->var.VendorGuid,
+ 				   attributes, size, data);
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ 
+ 	return efi_status_to_err(status);
+ }
+@@ -869,7 +877,7 @@ int efivar_entry_set_get_size(struct efivar_entry *entry, u32 attributes,
+ 	 * set_variable call, and removal of the variable from the efivars
+ 	 * list (in the case of an authenticated delete).
+ 	 */
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 
+ 	/*
+ 	 * Ensure that the available space hasn't shrunk below the safe level
+@@ -909,7 +917,7 @@ int efivar_entry_set_get_size(struct efivar_entry *entry, u32 attributes,
+ 	if (status == EFI_NOT_FOUND)
+ 		efivar_entry_list_del_unlock(entry);
+ 	else
+-		spin_unlock_irq(&__efivars->lock);
++		spin_unlock_irq(&efivars_lock);
+ 
+ 	if (status && status != EFI_BUFFER_TOO_SMALL)
+ 		return efi_status_to_err(status);
+@@ -917,7 +925,7 @@ int efivar_entry_set_get_size(struct efivar_entry *entry, u32 attributes,
+ 	return 0;
+ 
+ out:
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ 	return err;
+ 
+ }
+@@ -932,7 +940,7 @@ EXPORT_SYMBOL_GPL(efivar_entry_set_get_size);
+  */
+ void efivar_entry_iter_begin(void)
+ {
+-	spin_lock_irq(&__efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ }
+ EXPORT_SYMBOL_GPL(efivar_entry_iter_begin);
+ 
+@@ -943,7 +951,7 @@ EXPORT_SYMBOL_GPL(efivar_entry_iter_begin);
+  */
+ void efivar_entry_iter_end(void)
+ {
+-	spin_unlock_irq(&__efivars->lock);
++	spin_unlock_irq(&efivars_lock);
+ }
+ EXPORT_SYMBOL_GPL(efivar_entry_iter_end);
+ 
+@@ -1064,11 +1072,12 @@ int efivars_register(struct efivars *efivars,
+ 		     const struct efivar_operations *ops,
+ 		     struct kobject *kobject)
+ {
+-	spin_lock_init(&efivars->lock);
++	spin_lock_irq(&efivars_lock);
+ 	efivars->ops = ops;
+ 	efivars->kobject = kobject;
+ 
+ 	__efivars = efivars;
++	spin_unlock_irq(&efivars_lock);
+ 
+ 	return 0;
+ }
+@@ -1085,6 +1094,7 @@ int efivars_unregister(struct efivars *efivars)
+ {
+ 	int rv;
+ 
++	spin_lock_irq(&efivars_lock);
+ 	if (!__efivars) {
+ 		printk(KERN_ERR "efivars not registered\n");
+ 		rv = -EINVAL;
+@@ -1100,6 +1110,7 @@ int efivars_unregister(struct efivars *efivars)
+ 
+ 	rv = 0;
+ out:
++	spin_unlock_irq(&efivars_lock);
+ 	return rv;
+ }
+ EXPORT_SYMBOL_GPL(efivars_unregister);
+* Unmerged path include/linux/efi.h
