@@ -1,0 +1,811 @@
+nfp: bpf: relocate jump targets just before the load
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 2314fe9ed0a1760ceab96b81e6b7181963c93254
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2314fe9e.failed
+
+Don't translate the program assuming it will be loaded at a given
+address.  This will be required for sharing programs between ports
+of the same NIC, tail calls and subprograms.  It will also make the
+jump targets easier to understand when dumping the program to user
+space.
+
+Translate the program as if it was going to be loaded at address
+zero.  When load happens add the load offset in and set addresses
+of special branches.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 2314fe9ed0a1760ceab96b81e6b7181963c93254)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/jit.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/bpf/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 0a5af8620ac1,3a5c747fd12b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@@ -101,13 -85,19 +101,26 @@@ static void nfp_prog_push(struct nfp_pr
+  
+  static unsigned int nfp_prog_current_offset(struct nfp_prog *nfp_prog)
+  {
+- 	return nfp_prog->start_off + nfp_prog->prog_len;
++ 	return nfp_prog->prog_len;
+  }
+  
+++<<<<<<< HEAD
+ +static unsigned int
+ +nfp_prog_offset_to_index(struct nfp_prog *nfp_prog, unsigned int offset)
+ +{
+ +	return offset - nfp_prog->start_off;
+++=======
++ static bool
++ nfp_prog_confirm_current_offset(struct nfp_prog *nfp_prog, unsigned int off)
++ {
++ 	/* If there is a recorded error we may have dropped instructions;
++ 	 * that doesn't have to be due to translator bug, and the translation
++ 	 * will fail anyway, so just return OK.
++ 	 */
++ 	if (nfp_prog->error)
++ 		return true;
++ 	return !WARN_ON_ONCE(nfp_prog_current_offset(nfp_prog) != off);
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  }
+  
+  /* --- Emitters --- */
+@@@ -191,51 -210,9 +212,49 @@@ emit_br_relo(struct nfp_prog *nfp_prog
+  static void
+  emit_br(struct nfp_prog *nfp_prog, enum br_mask mask, u16 addr, u8 defer)
+  {
+- 	__emit_br(nfp_prog, mask,
+- 		  mask != BR_UNC ? BR_EV_PIP_COND : BR_EV_PIP_UNCOND,
+- 		  BR_CSS_NONE, addr, defer);
++ 	emit_br_relo(nfp_prog, mask, addr, defer, RELO_BR_REL);
+  }
+  
+ +static void
+ +__emit_br_byte(struct nfp_prog *nfp_prog, u8 areg, u8 breg, bool imm8,
+ +	       u8 byte, bool equal, u16 addr, u8 defer)
+ +{
+ +	u16 addr_lo, addr_hi;
+ +	u64 insn;
+ +
+ +	addr_lo = addr & (OP_BB_ADDR_LO >> __bf_shf(OP_BB_ADDR_LO));
+ +	addr_hi = addr != addr_lo;
+ +
+ +	insn = OP_BBYTE_BASE |
+ +		FIELD_PREP(OP_BB_A_SRC, areg) |
+ +		FIELD_PREP(OP_BB_BYTE, byte) |
+ +		FIELD_PREP(OP_BB_B_SRC, breg) |
+ +		FIELD_PREP(OP_BB_I8, imm8) |
+ +		FIELD_PREP(OP_BB_EQ, equal) |
+ +		FIELD_PREP(OP_BB_DEFBR, defer) |
+ +		FIELD_PREP(OP_BB_ADDR_LO, addr_lo) |
+ +		FIELD_PREP(OP_BB_ADDR_HI, addr_hi);
+ +
+ +	nfp_prog_push(nfp_prog, insn);
+ +}
+ +
+ +static void
+ +emit_br_byte_neq(struct nfp_prog *nfp_prog,
+ +		 swreg dst, u8 imm, u8 byte, u16 addr, u8 defer)
+ +{
+ +	struct nfp_insn_re_regs reg;
+ +	int err;
+ +
+ +	err = swreg_to_restricted(reg_none(), dst, reg_imm(imm), &reg, true);
+ +	if (err) {
+ +		nfp_prog->error = err;
+ +		return;
+ +	}
+ +
+ +	__emit_br_byte(nfp_prog, reg.areg, reg.breg, reg.i8, byte, false, addr,
+ +		       defer);
+ +}
+ +
+  static void
+  __emit_immed(struct nfp_prog *nfp_prog, u16 areg, u16 breg, u16 imm_hi,
+  	     enum immed_width width, bool invert,
+@@@ -963,6 -1199,86 +972,89 @@@ static void wrp_end32(struct nfp_prog *
+  		      SHF_SC_R_ROT, 16);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int adjust_head(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++ {
++ 	swreg tmp = imm_a(nfp_prog), tmp_len = imm_b(nfp_prog);
++ 	struct nfp_bpf_cap_adjust_head *adjust_head;
++ 	u32 ret_einval, end;
++ 
++ 	adjust_head = &nfp_prog->bpf->adjust_head;
++ 
++ 	/* Optimized version - 5 vs 14 cycles */
++ 	if (nfp_prog->adjust_head_location != UINT_MAX) {
++ 		if (WARN_ON_ONCE(nfp_prog->adjust_head_location != meta->n))
++ 			return -EINVAL;
++ 
++ 		emit_alu(nfp_prog, pptr_reg(nfp_prog),
++ 			 reg_a(2 * 2), ALU_OP_ADD, pptr_reg(nfp_prog));
++ 		emit_alu(nfp_prog, plen_reg(nfp_prog),
++ 			 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 		emit_alu(nfp_prog, pv_len(nfp_prog),
++ 			 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 
++ 		wrp_immed(nfp_prog, reg_both(0), 0);
++ 		wrp_immed(nfp_prog, reg_both(1), 0);
++ 
++ 		/* TODO: when adjust head is guaranteed to succeed we can
++ 		 * also eliminate the following if (r0 == 0) branch.
++ 		 */
++ 
++ 		return 0;
++ 	}
++ 
++ 	ret_einval = nfp_prog_current_offset(nfp_prog) + 14;
++ 	end = ret_einval + 2;
++ 
++ 	/* We need to use a temp because offset is just a part of the pkt ptr */
++ 	emit_alu(nfp_prog, tmp,
++ 		 reg_a(2 * 2), ALU_OP_ADD_2B, pptr_reg(nfp_prog));
++ 
++ 	/* Validate result will fit within FW datapath constraints */
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 tmp, ALU_OP_SUB, reg_imm(adjust_head->off_min));
++ 	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 reg_imm(adjust_head->off_max), ALU_OP_SUB, tmp);
++ 	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++ 
++ 	/* Validate the length is at least ETH_HLEN */
++ 	emit_alu(nfp_prog, tmp_len,
++ 		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 tmp_len, ALU_OP_SUB, reg_imm(ETH_HLEN));
++ 	emit_br(nfp_prog, BR_BMI, ret_einval, 0);
++ 
++ 	/* Load the ret code */
++ 	wrp_immed(nfp_prog, reg_both(0), 0);
++ 	wrp_immed(nfp_prog, reg_both(1), 0);
++ 
++ 	/* Modify the packet metadata */
++ 	emit_ld_field(nfp_prog, pptr_reg(nfp_prog), 0x3, tmp, SHF_SC_NONE, 0);
++ 
++ 	/* Skip over the -EINVAL ret code (defer 2) */
++ 	emit_br(nfp_prog, BR_UNC, end, 2);
++ 
++ 	emit_alu(nfp_prog, plen_reg(nfp_prog),
++ 		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 	emit_alu(nfp_prog, pv_len(nfp_prog),
++ 		 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 
++ 	/* return -EINVAL target */
++ 	if (!nfp_prog_confirm_current_offset(nfp_prog, ret_einval))
++ 		return -EINVAL;
++ 
++ 	wrp_immed(nfp_prog, reg_both(0), -22);
++ 	wrp_immed(nfp_prog, reg_both(1), ~0);
++ 
++ 	if (!nfp_prog_confirm_current_offset(nfp_prog, end))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  /* --- Callbacks --- */
+  static int mov_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+  {
+@@@ -1791,15 -2114,10 +1883,22 @@@ static int nfp_fixup_branches(struct nf
+  		if (BPF_CLASS(meta->insn.code) != BPF_JMP)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (list_is_last(&meta->l, &nfp_prog->insns)) {
+ +			next = NULL;
+ +			idx = nfp_prog->last_bpf_off;
+ +		} else {
+ +			next = list_next_entry(meta, l);
+ +			idx = next->off - 1;
+ +		}
+ +
+ +		br_idx = nfp_prog_offset_to_index(nfp_prog, idx);
+++=======
++ 		if (list_is_last(&meta->l, &nfp_prog->insns))
++ 			br_idx = nfp_prog->last_bpf_off;
++ 		else
++ 			br_idx = list_next_entry(meta, l)->off - 1;
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  
+  		if (!nfp_is_br(nfp_prog->prog[br_idx])) {
+  			pr_err("Fixup found block not ending in branch %d %02x %016llx!!\n",
+@@@ -1807,13 -2125,12 +1906,14 @@@
+  			return -ELOOP;
+  		}
+  		/* Leave special branches for later */
+- 		if (FIELD_GET(OP_BR_SPECIAL, nfp_prog->prog[br_idx]))
++ 		if (FIELD_GET(OP_RELO_TYPE, nfp_prog->prog[br_idx]) !=
++ 		    RELO_BR_REL)
+  			continue;
+  
+ -		if (!meta->jmp_dst) {
+ -			pr_err("Non-exit jump doesn't have destination info recorded!!\n");
+ +		/* Find the target offset in assembler realm */
+ +		off = meta->insn.off;
+ +		if (!off) {
+ +			pr_err("Fixup found zero offset!!\n");
+  			return -ELOOP;
+  		}
+  
+@@@ -1851,11 -2141,10 +1951,10 @@@
+  			return -ELOOP;
+  		}
+  
+- 		for (idx = nfp_prog_offset_to_index(nfp_prog, meta->off);
+- 		     idx <= br_idx; idx++) {
++ 		for (idx = meta->off; idx <= br_idx; idx++) {
+  			if (!nfp_is_br(nfp_prog->prog[idx]))
+  				continue;
+ -			br_set_offset(&nfp_prog->prog[idx], jmp_dst->off);
+ +			br_set_offset(&nfp_prog->prog[idx], next->off);
+  		}
+  	}
+  
+@@@ -2514,16 -2688,79 +2588,91 @@@ nfp_bpf_jit(struct bpf_prog *filter, vo
+  	if (ret) {
+  		pr_err("Translation failed with error %d (translated: %u)\n",
+  		       ret, nfp_prog->n_translated);
+ -		return -EINVAL;
+ +		ret = -EINVAL;
+ +		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = nfp_bpf_ustore_calc(nfp_prog, (__force __le64 *)prog_mem);
+ +
+ +	res->n_instr = nfp_prog->prog_len;
+ +	res->dense_mode = false;
+ +out:
+ +	nfp_prog_free(nfp_prog);
+ +
+ +	return ret;
+++=======
++ 	return ret;
++ }
++ 
++ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt)
++ {
++ 	struct nfp_insn_meta *meta;
++ 
++ 	/* Another pass to record jump information. */
++ 	list_for_each_entry(meta, &nfp_prog->insns, l) {
++ 		u64 code = meta->insn.code;
++ 
++ 		if (BPF_CLASS(code) == BPF_JMP && BPF_OP(code) != BPF_EXIT &&
++ 		    BPF_OP(code) != BPF_CALL) {
++ 			struct nfp_insn_meta *dst_meta;
++ 			unsigned short dst_indx;
++ 
++ 			dst_indx = meta->n + 1 + meta->insn.off;
++ 			dst_meta = nfp_bpf_goto_meta(nfp_prog, meta, dst_indx,
++ 						     cnt);
++ 
++ 			meta->jmp_dst = dst_meta;
++ 			dst_meta->flags |= FLAG_INSN_IS_JUMP_DST;
++ 		}
++ 	}
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
++ }
++ 
++ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv)
++ {
++ 	unsigned int i;
++ 	u64 *prog;
++ 	int err;
++ 
++ 	prog = kmemdup(nfp_prog->prog, nfp_prog->prog_len * sizeof(u64),
++ 		       GFP_KERNEL);
++ 	if (!prog)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	for (i = 0; i < nfp_prog->prog_len; i++) {
++ 		enum nfp_relo_type special;
++ 
++ 		special = FIELD_GET(OP_RELO_TYPE, prog[i]);
++ 		switch (special) {
++ 		case RELO_NONE:
++ 			continue;
++ 		case RELO_BR_REL:
++ 			br_add_offset(&prog[i], bv->start_off);
++ 			break;
++ 		case RELO_BR_GO_OUT:
++ 			br_set_offset(&prog[i],
++ 				      nfp_prog->tgt_out + bv->start_off);
++ 			break;
++ 		case RELO_BR_GO_ABORT:
++ 			br_set_offset(&prog[i],
++ 				      nfp_prog->tgt_abort + bv->start_off);
++ 			break;
++ 		case RELO_BR_NEXT_PKT:
++ 			br_set_offset(&prog[i], bv->tgt_done);
++ 			break;
++ 		}
++ 
++ 		prog[i] &= ~OP_RELO_TYPE;
++ 	}
++ 
++ 	err = nfp_bpf_ustore_calc(prog, nfp_prog->prog_len);
++ 	if (err)
++ 		goto err_free_prog;
++ 
++ 	return prog;
++ 
++ err_free_prog:
++ 	kfree(prog);
++ 	return ERR_PTR(err);
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 60a7af297852,9ed76ccdd3c1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -88,23 -87,25 +88,42 @@@ static const char *nfp_bpf_extra_cap(st
+  static int
+  nfp_bpf_vnic_alloc(struct nfp_app *app, struct nfp_net *nn, unsigned int id)
+  {
+++<<<<<<< HEAD
+ +	struct nfp_net_bpf_priv *priv;
+ +	int ret;
+ +
+ +	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+ +	if (!priv)
+++=======
++ 	struct nfp_bpf_vnic *bv;
++ 	int err;
++ 
++ 	bv = kzalloc(sizeof(*bv), GFP_KERNEL);
++ 	if (!bv)
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  		return -ENOMEM;
++ 	nn->app_priv = bv;
+  
+ -	err = nfp_app_nic_vnic_alloc(app, nn, id);
+ -	if (err)
+ -		goto err_free_priv;
+ +	nn->app_priv = priv;
+ +	spin_lock_init(&priv->rx_filter_lock);
+ +	setup_timer(&priv->rx_filter_stats_timer,
+ +		    nfp_net_filter_stats_timer, (unsigned long)nn);
+ +
+++<<<<<<< HEAD
+ +	ret = nfp_app_nic_vnic_alloc(app, nn, id);
+ +	if (ret)
+ +		kfree(priv);
+  
+ +	return ret;
+++=======
++ 	bv->start_off = nn_readw(nn, NFP_NET_CFG_BPF_START);
++ 	bv->tgt_done = nn_readw(nn, NFP_NET_CFG_BPF_DONE);
++ 
++ 	return 0;
++ err_free_priv:
++ 	kfree(nn->app_priv);
++ 	return err;
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  }
+  
+  static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,5deba5099618..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -146,10 -193,9 +151,15 @@@ static inline u8 mbpf_mode(const struc
+   * @prog: machine code
+   * @prog_len: number of valid instructions in @prog array
+   * @__prog_alloc_len: alloc size of @prog array
+++<<<<<<< HEAD
+ + * @act: BPF program/action type (TC DA, TC with action, XDP etc.)
+ + * @num_regs: number of registers used by this program
+ + * @regs_per_thread: number of basic registers allocated per thread
+ + * @start_off: address of the first instruction in the memory
+++=======
++  * @verifier_meta: temporary storage for verifier's insn meta
++  * @type: BPF program type
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+   * @last_bpf_off: address of the last instruction translated from BPF
+   * @tgt_out: jump target for normal exit
+   * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
+@@@ -164,12 -212,10 +173,11 @@@ struct nfp_prog 
+  	unsigned int prog_len;
+  	unsigned int __prog_alloc_len;
+  
+ -	struct nfp_insn_meta *verifier_meta;
+ +	enum nfp_bpf_action_type act;
+  
+ -	enum bpf_prog_type type;
+ +	unsigned int num_regs;
+ +	unsigned int regs_per_thread;
+  
+- 	unsigned int start_off;
+  	unsigned int last_bpf_off;
+  	unsigned int tgt_out;
+  	unsigned int tgt_abort;
+@@@ -183,37 -229,39 +190,64 @@@
+  	struct list_head insns;
+  };
+  
+++<<<<<<< HEAD
+ +struct nfp_bpf_result {
+ +	unsigned int n_instr;
+ +	bool dense_mode;
+++=======
++ /**
++  * struct nfp_bpf_vnic - per-vNIC BPF priv structure
++  * @tc_prog:	currently loaded cls_bpf program
++  * @start_off:	address of the first instruction in the memory
++  * @tgt_done:	jump target to get the next packet
++  */
++ struct nfp_bpf_vnic {
++ 	struct bpf_prog *tc_prog;
++ 	unsigned int start_off;
++ 	unsigned int tgt_done;
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  };
+  
+ -void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ -int nfp_bpf_jit(struct nfp_prog *prog);
+ +int
+ +nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
+ +	    unsigned int prog_start, unsigned int prog_done,
+ +	    unsigned int prog_sz, struct nfp_bpf_result *res);
+  
+ -extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ +int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+  
+ -struct netdev_bpf;
+ -struct nfp_app;
+  struct nfp_net;
+ +struct tc_cls_bpf_offload;
+ +
+ +/**
+ + * struct nfp_net_bpf_priv - per-vNIC BPF private data
+ + * @rx_filter:		Filter offload statistics - dropped packets/bytes
+ + * @rx_filter_prev:	Filter offload statistics - values from previous update
+ + * @rx_filter_change:	Jiffies when statistics last changed
+ + * @rx_filter_stats_timer:  Timer for polling filter offload statistics
+ + * @rx_filter_lock:	Lock protecting timer state changes (teardown)
+ + */
+ +struct nfp_net_bpf_priv {
+ +	struct nfp_stat_pair rx_filter, rx_filter_prev;
+ +	unsigned long rx_filter_change;
+ +	struct timer_list rx_filter_stats_timer;
+ +	spinlock_t rx_filter_lock;
+ +};
+  
+ -int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ -			bool old_prog);
+ +int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+ +void nfp_net_filter_stats_timer(unsigned long data);
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
++ 			  struct netdev_bpf *bpf);
++ int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
++ 		      struct bpf_prog *prog);
++ int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
++ 		    struct bpf_prog *prog);
++ struct nfp_insn_meta *
++ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
++ 		  unsigned int insn_idx, unsigned int n_insns);
++ 
++ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index de79faf0874b,5f165e1d7648..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@@ -51,118 -51,115 +51,128 @@@
+  #include "../nfp_net_ctrl.h"
+  #include "../nfp_net.h"
+  
+ -static int
+ -nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
+ -		 unsigned int cnt)
+ +void nfp_net_filter_stats_timer(unsigned long data)
+  {
+ -	struct nfp_insn_meta *meta;
+ -	unsigned int i;
+ +	struct nfp_net *nn = (void *)data;
+ +	struct nfp_net_bpf_priv *priv;
+ +	struct nfp_stat_pair latest;
+  
+ -	for (i = 0; i < cnt; i++) {
+ -		meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+ -		if (!meta)
+ -			return -ENOMEM;
+ +	priv = nn->app_priv;
+  
+ -		meta->insn = prog[i];
+ -		meta->n = i;
+ +	spin_lock_bh(&priv->rx_filter_lock);
+  
+ -		list_add_tail(&meta->l, &nfp_prog->insns);
+ -	}
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ +		mod_timer(&priv->rx_filter_stats_timer,
+ +			  jiffies + NFP_NET_STAT_POLL_IVL);
+  
+ -	nfp_bpf_jit_prepare(nfp_prog, cnt);
+ +	spin_unlock_bh(&priv->rx_filter_lock);
+  
+ -	return 0;
+ +	latest.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	latest.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +
+ +	if (latest.pkts != priv->rx_filter.pkts)
+ +		priv->rx_filter_change = jiffies;
+ +
+ +	priv->rx_filter = latest;
+  }
+  
+ -static void nfp_prog_free(struct nfp_prog *nfp_prog)
+ +#if 0 /* Not in RHEL7 */
+ +static void nfp_net_bpf_stats_reset(struct nfp_net *nn)
+  {
+ -	struct nfp_insn_meta *meta, *tmp;
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+  
+ -	list_for_each_entry_safe(meta, tmp, &nfp_prog->insns, l) {
+ -		list_del(&meta->l);
+ -		kfree(meta);
+ -	}
+ -	kfree(nfp_prog);
+ +	priv->rx_filter.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	priv->rx_filter.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +	priv->rx_filter_prev = priv->rx_filter;
+ +	priv->rx_filter_change = jiffies;
+  }
+  
+ -int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+ -			  struct netdev_bpf *bpf)
+ +static int
+ +nfp_net_bpf_stats_update(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct bpf_prog *prog = bpf->verifier.prog;
+ -	struct nfp_prog *nfp_prog;
+ -	int ret;
+ +	struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +	u64 bytes, pkts;
+  
+ -	nfp_prog = kzalloc(sizeof(*nfp_prog), GFP_KERNEL);
+ -	if (!nfp_prog)
+ -		return -ENOMEM;
+ -	prog->aux->offload->dev_priv = nfp_prog;
+ +	pkts = priv->rx_filter.pkts - priv->rx_filter_prev.pkts;
+ +	bytes = priv->rx_filter.bytes - priv->rx_filter_prev.bytes;
+ +	bytes -= pkts * ETH_HLEN;
+  
+ -	INIT_LIST_HEAD(&nfp_prog->insns);
+ -	nfp_prog->type = prog->type;
+ -	nfp_prog->bpf = app->priv;
+ +	priv->rx_filter_prev = priv->rx_filter;
+  
+ -	ret = nfp_prog_prepare(nfp_prog, prog->insnsi, prog->len);
+ -	if (ret)
+ -		goto err_free;
+ +	preempt_disable();
+  
+ -	nfp_prog->verifier_meta = nfp_prog_first_meta(nfp_prog);
+ -	bpf->verifier.ops = &nfp_bpf_analyzer_ops;
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list)
+ +		tcf_action_stats_update(a, bytes, pkts, nn->rx_filter_change);
+  
+ -	return 0;
+ -
+ -err_free:
+ -	nfp_prog_free(nfp_prog);
+ +	preempt_enable();
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+ -int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
+ -		      struct bpf_prog *prog)
+ +static int
+ +nfp_net_bpf_get_act(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ -	unsigned int stack_size;
+ -	unsigned int max_instr;
+ +	const struct tc_action *a;
+ +	LIST_HEAD(actions);
+  
+ -	stack_size = nn_readb(nn, NFP_NET_CFG_BPF_STACK_SZ) * 64;
+ -	if (prog->aux->stack_depth > stack_size) {
+ -		nn_info(nn, "stack too large: program %dB > FW stack %dB\n",
+ -			prog->aux->stack_depth, stack_size);
+ -		return -EOPNOTSUPP;
+ -	}
+ -	nfp_prog->stack_depth = round_up(prog->aux->stack_depth, 4);
+ +	if (!cls_bpf->exts)
+ +		return NN_ACT_XDP;
+  
+ -	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+ -	nfp_prog->__prog_alloc_len = max_instr * sizeof(u64);
+ +	/* TC direct action */
+ +	if (cls_bpf->exts_integrated) {
+ +		if (tc_no_actions(cls_bpf->exts))
+ +			return NN_ACT_DIRECT;
+  
+ -	nfp_prog->prog = kmalloc(nfp_prog->__prog_alloc_len, GFP_KERNEL);
+ -	if (!nfp_prog->prog)
+ -		return -ENOMEM;
+ +		return -EOPNOTSUPP;
+ +	}
+++<<<<<<< HEAD
+  
+ -	return nfp_bpf_jit(nfp_prog);
+ -}
+ +	/* TC legacy mode */
+ +	if (!tc_single_action(cls_bpf->exts))
+ +		return -EOPNOTSUPP;
+++=======
+++	nfp_prog->stack_depth = round_up(prog->aux->stack_depth, 4);
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  
+ -int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+ -		    struct bpf_prog *prog)
+ -{
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list) {
+ +		if (is_tcf_gact_shot(a))
+ +			return NN_ACT_TC_DROP;
+  
+ -	kfree(nfp_prog->prog);
+ -	nfp_prog_free(nfp_prog);
+ +		if (is_tcf_mirred_egress_redirect(a) &&
+ +		    tcf_mirred_ifindex(a) == nn->dp.netdev->ifindex)
+ +			return NN_ACT_TC_REDIR;
+ +	}
+  
+ -	return 0;
+ +	return -EOPNOTSUPP;
+  }
+  
+ -static int nfp_net_bpf_load(struct nfp_net *nn, struct bpf_prog *prog)
+ +static int
+ +nfp_net_bpf_offload_prepare(struct nfp_net *nn,
+ +			    struct tc_cls_bpf_offload *cls_bpf,
+ +			    struct nfp_bpf_result *res,
+ +			    void **code, dma_addr_t *dma_addr, u16 max_instr)
+  {
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ +	unsigned int code_sz = max_instr * sizeof(u64);
+ +	enum nfp_bpf_action_type act;
+ +	unsigned int stack_size;
+ +	u16 start_off, done_off;
+  	unsigned int max_mtu;
+++<<<<<<< HEAD
+ +	int ret;
+ +
+ +	ret = nfp_net_bpf_get_act(nn, cls_bpf);
+ +	if (ret < 0)
+ +		return ret;
+ +	act = ret;
+++=======
++ 	dma_addr_t dma_addr;
++ 	void *img;
++ 	int err;
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  
+  	max_mtu = nn_readb(nn, NFP_NET_CFG_BPF_INL_MTU) * 64 - 32;
+  	if (max_mtu < nn->dp.netdev->mtu) {
+@@@ -170,61 -167,37 +180,88 @@@
+  		return -EOPNOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+ +	start_off = nn_readw(nn, NFP_NET_CFG_BPF_START);
+ +	done_off = nn_readw(nn, NFP_NET_CFG_BPF_DONE);
+ +
+ +	if (cls_bpf->prog->aux->stack_depth > 64) {
+ +		nn_info(nn, "large stack not supported: program %dB > 64B\n",
+ +			cls_bpf->prog->aux->stack_depth);
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	stack_size = nn_readb(nn, NFP_NET_CFG_BPF_STACK_SZ) * 64;
+ +	if (cls_bpf->prog->aux->stack_depth > stack_size) {
+ +		nn_info(nn, "stack too large: program %dB > FW stack %dB\n",
+ +			cls_bpf->prog->aux->stack_depth, stack_size);
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	*code = dma_zalloc_coherent(nn->dp.dev, code_sz, dma_addr, GFP_KERNEL);
+ +	if (!*code)
+++=======
++ 	img = nfp_bpf_relo_for_vnic(nfp_prog, nn->app_priv);
++ 	if (IS_ERR(img))
++ 		return PTR_ERR(img);
++ 
++ 	dma_addr = dma_map_single(nn->dp.dev, img,
++ 				  nfp_prog->prog_len * sizeof(u64),
++ 				  DMA_TO_DEVICE);
++ 	if (dma_mapping_error(nn->dp.dev, dma_addr)) {
++ 		kfree(img);
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  		return -ENOMEM;
++ 	}
+  
+ -	nn_writew(nn, NFP_NET_CFG_BPF_SIZE, nfp_prog->prog_len);
+ -	nn_writeq(nn, NFP_NET_CFG_BPF_ADDR, dma_addr);
+ +	ret = nfp_bpf_jit(cls_bpf->prog, *code, act, start_off, done_off,
+ +			  max_instr, res);
+ +	if (ret)
+ +		goto out;
+ +
+ +	return 0;
+ +
+ +out:
+ +	dma_free_coherent(nn->dp.dev, code_sz, *code, *dma_addr);
+ +	return ret;
+ +}
+ +
+ +static void
+ +nfp_net_bpf_load_and_start(struct nfp_net *nn, u32 tc_flags,
+ +			   void *code, dma_addr_t dma_addr,
+ +			   unsigned int code_sz, unsigned int n_instr,
+ +			   bool dense_mode)
+ +{
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +	u64 bpf_addr = dma_addr;
+ +	int err;
+ +
+ +	nn->dp.bpf_offload_skip_sw = !!(tc_flags & TCA_CLS_FLAGS_SKIP_SW);
+ +
+ +	if (dense_mode)
+ +		bpf_addr |= NFP_NET_CFG_BPF_CFG_8CTX;
+ +
+ +	nn_writew(nn, NFP_NET_CFG_BPF_SIZE, n_instr);
+ +	nn_writeq(nn, NFP_NET_CFG_BPF_ADDR, bpf_addr);
+  
+  	/* Load up the JITed code */
+  	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_BPF);
+  	if (err)
+  		nn_err(nn, "FW command error while loading BPF: %d\n", err);
+  
+++<<<<<<< HEAD
+++=======
++ 	dma_unmap_single(nn->dp.dev, dma_addr, nfp_prog->prog_len * sizeof(u64),
++ 			 DMA_TO_DEVICE);
++ 	kfree(img);
++ 
++ 	return err;
++ }
++ 
++ static void nfp_net_bpf_start(struct nfp_net *nn)
++ {
++ 	int err;
++ 
+++>>>>>>> 2314fe9ed0a1 (nfp: bpf: relocate jump targets just before the load)
+  	/* Enable passing packets through BPF function */
+  	nn->dp.ctrl |= NFP_NET_CFG_CTRL_BPF;
+  	nn_writel(nn, NFP_NET_CFG_CTRL, nn->dp.ctrl);
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/jit.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/offload.c
