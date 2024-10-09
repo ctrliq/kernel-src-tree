@@ -784,9 +784,8 @@ static void ovs_fragment(struct vport *vport, struct sk_buff *skb, u16 mru,
 		unsigned long orig_dst;
 		struct rt6_info ovs_rt;
 
-		if (!v6ops) {
+		if (!v6ops)
 			goto err;
-		}
 
 		prepare_frag(vport, skb, orig_network_offset);
 		memset(&ovs_rt, 0, sizeof(ovs_rt));
