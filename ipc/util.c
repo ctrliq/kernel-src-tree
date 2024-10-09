@@ -522,10 +522,7 @@ void ipc_rcu_free(struct rcu_head *head)
 {
 	struct ipc_rcu *p = container_of(head, struct ipc_rcu, rcu);
 
-	if (is_vmalloc_addr(p))
-		vfree(p);
-	else
-		kfree(p);
+	kvfree(p);
 }
 
 /**
