@@ -1,0 +1,102 @@
+debugobjects: Reduce contention on the global pool_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Waiman Long <longman@redhat.com>
+commit 858274b6a13b4db0e6fb451eea7f8817c42426a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/858274b6.failed
+
+On a large SMP system with many CPUs, the global pool_lock may become
+a performance bottleneck as all the CPUs that need to allocate or
+free debug objects have to take the lock. That can sometimes cause
+soft lockups like:
+
+ NMI watchdog: BUG: soft lockup - CPU#35 stuck for 22s! [rcuos/1:21]
+ ...
+ RIP: 0010:[<ffffffff817c216b>]  [<ffffffff817c216b>]
+	_raw_spin_unlock_irqrestore+0x3b/0x60
+ ...
+ Call Trace:
+  [<ffffffff813f40d1>] free_object+0x81/0xb0
+  [<ffffffff813f4f33>] debug_check_no_obj_freed+0x193/0x220
+  [<ffffffff81101a59>] ? trace_hardirqs_on_caller+0xf9/0x1c0
+  [<ffffffff81284996>] ? file_free_rcu+0x36/0x60
+  [<ffffffff81251712>] kmem_cache_free+0xd2/0x380
+  [<ffffffff81284960>] ? fput+0x90/0x90
+  [<ffffffff81284996>] file_free_rcu+0x36/0x60
+  [<ffffffff81124c23>] rcu_nocb_kthread+0x1b3/0x550
+  [<ffffffff81124b71>] ? rcu_nocb_kthread+0x101/0x550
+  [<ffffffff81124a70>] ? sync_exp_work_done.constprop.63+0x50/0x50
+  [<ffffffff810c59d1>] kthread+0x101/0x120
+  [<ffffffff81101a59>] ? trace_hardirqs_on_caller+0xf9/0x1c0
+  [<ffffffff817c2d32>] ret_from_fork+0x22/0x50
+
+To reduce the amount of contention on the pool_lock, the actual
+kmem_cache_free() of the debug objects will be delayed if the pool_lock
+is busy. This will temporarily increase the amount of free objects
+available at the free pool when the system is busy. As a result,
+the number of kmem_cache allocation and freeing is reduced.
+
+To further reduce the lock operations free debug objects in batches of
+four.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Cc: Christian Borntraeger <borntraeger@de.ibm.com>
+	Cc: "Du Changbin" <changbin.du@intel.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Jan Stancek <jstancek@redhat.com>
+Link: http://lkml.kernel.org/r/1483647425-4135-4-git-send-email-longman@redhat.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 858274b6a13b4db0e6fb451eea7f8817c42426a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/debugobjects.c
+diff --cc lib/debugobjects.c
+index 0d4f195d791d,5e1bf2f4a5ec..000000000000
+--- a/lib/debugobjects.c
++++ b/lib/debugobjects.c
+@@@ -166,18 -172,30 +166,39 @@@ alloc_object(void *addr, struct debug_b
+  
+  /*
+   * workqueue function to free objects.
++  *
++  * To reduce contention on the global pool_lock, the actual freeing of
++  * debug objects will be delayed if the pool_lock is busy. We also free
++  * the objects in a batch of 4 for each lock/unlock cycle.
+   */
++ #define ODEBUG_FREE_BATCH	4
++ 
+  static void free_obj_work(struct work_struct *work)
+  {
+- 	struct debug_obj *obj;
++ 	struct debug_obj *objs[ODEBUG_FREE_BATCH];
+  	unsigned long flags;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	raw_spin_lock_irqsave(&pool_lock, flags);
+ +	while (obj_pool_free > ODEBUG_POOL_SIZE) {
+ +		obj = hlist_entry(obj_pool.first, typeof(*obj), node);
+ +		hlist_del(&obj->node);
+ +		obj_pool_free--;
+ +		debug_objects_freed++;
+++=======
++ 	if (!raw_spin_trylock_irqsave(&pool_lock, flags))
++ 		return;
++ 	while (obj_pool_free >= debug_objects_pool_size + ODEBUG_FREE_BATCH) {
++ 		for (i = 0; i < ODEBUG_FREE_BATCH; i++) {
++ 			objs[i] = hlist_entry(obj_pool.first,
++ 					      typeof(*objs[0]), node);
++ 			hlist_del(&objs[i]->node);
++ 		}
++ 
++ 		obj_pool_free -= ODEBUG_FREE_BATCH;
++ 		debug_objects_freed += ODEBUG_FREE_BATCH;
+++>>>>>>> 858274b6a13b (debugobjects: Reduce contention on the global pool_lock)
+  		/*
+  		 * We release pool_lock across kmem_cache_free() to
+  		 * avoid contention on pool_lock.
+* Unmerged path lib/debugobjects.c
