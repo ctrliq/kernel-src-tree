@@ -2426,7 +2426,6 @@ static int snd_pcm_oss_open_file(struct file *file,
 		}
 
 		pcm_oss_file->streams[idx] = substream;
-		substream->file = pcm_oss_file;
 		snd_pcm_oss_init_substream(substream, &setup[idx], minor);
 	}
 	
