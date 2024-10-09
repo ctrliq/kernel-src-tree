@@ -1,0 +1,122 @@
+net: use jump label patching for ingress qdisc in __netif_receive_skb_core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] use jump label patching for ingress qdisc in __netif_receive_skb_core (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 96.50%
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 4577139b2dabf58973d59d157aae4ddd3bde863a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4577139b.failed
+
+Even if we make use of classifier and actions from the egress
+path, we're going into handle_ing() executing additional code
+on a per-packet cost for ingress qdisc, just to realize that
+nothing is attached on ingress.
+
+Instead, this can just be blinded out as a no-op entirely with
+the use of a static key. On input fast-path, we already make
+use of static keys in various places, e.g. skb time stamping,
+in RPS, etc. It makes sense to not waste time when we're assured
+that no ingress qdisc is attached anywhere.
+
+Enabling/disabling of that code path is being done via two
+helpers, namely net_{inc,dec}_ingress_queue(), that are being
+invoked under RTNL mutex when a ingress qdisc is being either
+initialized or destructed.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4577139b2dabf58973d59d157aae4ddd3bde863a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 48cb2232de86,af4a1b0adc10..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3808,12 -3712,15 +3822,21 @@@ another_round
+  
+  skip_taps:
+  #ifdef CONFIG_NET_CLS_ACT
+++<<<<<<< HEAD
+ +	skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+ +	if (!skb)
+ +		goto out;
+++=======
++ 	if (static_key_false(&ingress_needed)) {
++ 		skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
++ 		if (!skb)
++ 			goto unlock;
++ 	}
++ 
++ 	skb->tc_verd = 0;
+++>>>>>>> 4577139b2dab (net: use jump label patching for ingress qdisc in __netif_receive_skb_core)
+  ncls:
+  #endif
+- 
+  	if (pfmemalloc && !skb_pfmemalloc_protocol(skb))
+  		goto drop;
+  
+diff --git a/include/linux/rtnetlink.h b/include/linux/rtnetlink.h
+index b89d99ba6bc1..81bfabd0a755 100644
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -77,7 +77,20 @@ static inline struct netdev_queue *dev_ingress_queue(struct net_device *dev)
+ 	return rtnl_dereference(dev->ingress_queue);
+ }
+ 
+-extern struct netdev_queue *dev_ingress_queue_create(struct net_device *dev);
++struct netdev_queue *dev_ingress_queue_create(struct net_device *dev);
++
++#ifdef CONFIG_NET_CLS_ACT
++void net_inc_ingress_queue(void);
++void net_dec_ingress_queue(void);
++#else
++static inline void net_inc_ingress_queue(void)
++{
++}
++
++static inline void net_dec_ingress_queue(void)
++{
++}
++#endif
+ 
+ extern void rtnetlink_init(void);
+ extern void __rtnl_unlock(void);
+* Unmerged path net/core/dev.c
+diff --git a/net/sched/sch_ingress.c b/net/sched/sch_ingress.c
+index f92df45a3719..3c62e10a1e80 100644
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@ -86,11 +86,19 @@ static int ingress_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 
+ /* ------------------------------------------------------------- */
+ 
++static int ingress_init(struct Qdisc *sch, struct nlattr *opt)
++{
++	net_inc_ingress_queue();
++
++	return 0;
++}
++
+ static void ingress_destroy(struct Qdisc *sch)
+ {
+ 	struct ingress_qdisc_data *p = qdisc_priv(sch);
+ 
+ 	tcf_destroy_chain(&p->filter_list);
++	net_dec_ingress_queue();
+ }
+ 
+ static int ingress_dump(struct Qdisc *sch, struct sk_buff *skb)
+@@ -122,6 +130,7 @@ static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
+ 	.id		=	"ingress",
+ 	.priv_size	=	sizeof(struct ingress_qdisc_data),
+ 	.enqueue	=	ingress_enqueue,
++	.init		=	ingress_init,
+ 	.destroy	=	ingress_destroy,
+ 	.dump		=	ingress_dump,
+ 	.owner		=	THIS_MODULE,
