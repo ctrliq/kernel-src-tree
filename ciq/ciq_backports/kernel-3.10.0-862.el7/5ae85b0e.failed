@@ -1,0 +1,301 @@
+net/mlx5: Fix UAR memory leak
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] lx5: Fix UAR memory leak (Don Dutile) [1385309 1385649 1386645 1409099 1456667 1456687]
+Rebuild_FUZZ: 90.57%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit 5ae85b0edaa597b063ee9d8f48b830519a6e0c0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5ae85b0e.failed
+
+When UAR is released, we deallocate the device resource, but
+don't unmmap the UAR mapping memory.
+Fix the leak by unmapping this memory.
+
+Fixes: a6d51b68611e9 ('net/mlx5: Introduce blue flame register allocator)
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5ae85b0edaa597b063ee9d8f48b830519a6e0c0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/uar.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/uar.c
+index ab0b896621a0,222b25908d01..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/uar.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/uar.c
+@@@ -77,106 -70,190 +77,139 @@@ static int need_uuar_lock(int uuarn
+  	return 1;
+  }
+  
+ -static u64 uar2pfn(struct mlx5_core_dev *mdev, u32 index)
+ +int mlx5_alloc_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari)
+  {
+++<<<<<<< HEAD
+ +	int tot_uuars = NUM_DRIVER_UARS * MLX5_BF_REGS_PER_PAGE;
+ +	struct mlx5_bf *bf;
+ +	phys_addr_t addr;
+ +	int err;
+++=======
++ 	u32 system_page_index;
++ 
++ 	if (MLX5_CAP_GEN(mdev, uar_4k))
++ 		system_page_index = index >> (PAGE_SHIFT - MLX5_ADAPTER_PAGE_SHIFT);
++ 	else
++ 		system_page_index = index;
++ 
++ 	return (pci_resource_start(mdev->pdev, 0) >> PAGE_SHIFT) + system_page_index;
++ }
++ 
++ static void up_rel_func(struct kref *kref)
++ {
++ 	struct mlx5_uars_page *up = container_of(kref, struct mlx5_uars_page, ref_count);
++ 
++ 	list_del(&up->list);
++ 	iounmap(up->map);
++ 	if (mlx5_cmd_free_uar(up->mdev, up->index))
++ 		mlx5_core_warn(up->mdev, "failed to free uar index %d\n", up->index);
++ 	kfree(up->reg_bitmap);
++ 	kfree(up->fp_bitmap);
++ 	kfree(up);
++ }
++ 
++ static struct mlx5_uars_page *alloc_uars_page(struct mlx5_core_dev *mdev,
++ 					      bool map_wc)
++ {
++ 	struct mlx5_uars_page *up;
++ 	int err = -ENOMEM;
++ 	phys_addr_t pfn;
++ 	int bfregs;
+++>>>>>>> 5ae85b0edaa5 (net/mlx5: Fix UAR memory leak)
+  	int i;
+  
+ -	bfregs = uars_per_sys_page(mdev) * MLX5_BFREGS_PER_UAR;
+ -	up = kzalloc(sizeof(*up), GFP_KERNEL);
+ -	if (!up)
+ -		return ERR_PTR(err);
+ -
+ -	up->mdev = mdev;
+ -	up->reg_bitmap = kcalloc(BITS_TO_LONGS(bfregs), sizeof(unsigned long), GFP_KERNEL);
+ -	if (!up->reg_bitmap)
+ -		goto error1;
+ +	uuari->num_uars = NUM_DRIVER_UARS;
+ +	uuari->num_low_latency_uuars = NUM_LOW_LAT_UUARS;
+  
+ -	up->fp_bitmap = kcalloc(BITS_TO_LONGS(bfregs), sizeof(unsigned long), GFP_KERNEL);
+ -	if (!up->fp_bitmap)
+ -		goto error1;
+ +	mutex_init(&uuari->lock);
+ +	uuari->uars = kcalloc(uuari->num_uars, sizeof(*uuari->uars), GFP_KERNEL);
+ +	if (!uuari->uars)
+ +		return -ENOMEM;
+  
+ -	for (i = 0; i < bfregs; i++)
+ -		if ((i % MLX5_BFREGS_PER_UAR) < MLX5_NON_FP_BFREGS_PER_UAR)
+ -			set_bit(i, up->reg_bitmap);
+ -		else
+ -			set_bit(i, up->fp_bitmap);
+ +	uuari->bfs = kcalloc(tot_uuars, sizeof(*uuari->bfs), GFP_KERNEL);
+ +	if (!uuari->bfs) {
+ +		err = -ENOMEM;
+ +		goto out_uars;
+ +	}
+  
+ -	up->bfregs = bfregs;
+ -	up->fp_avail = bfregs * MLX5_FP_BFREGS_PER_UAR / MLX5_BFREGS_PER_UAR;
+ -	up->reg_avail = bfregs * MLX5_NON_FP_BFREGS_PER_UAR / MLX5_BFREGS_PER_UAR;
+ +	uuari->bitmap = kcalloc(BITS_TO_LONGS(tot_uuars), sizeof(*uuari->bitmap),
+ +				GFP_KERNEL);
+ +	if (!uuari->bitmap) {
+ +		err = -ENOMEM;
+ +		goto out_bfs;
+ +	}
+  
+ -	err = mlx5_cmd_alloc_uar(mdev, &up->index);
+ -	if (err) {
+ -		mlx5_core_warn(mdev, "mlx5_cmd_alloc_uar() failed, %d\n", err);
+ -		goto error1;
+ +	uuari->count = kcalloc(tot_uuars, sizeof(*uuari->count), GFP_KERNEL);
+ +	if (!uuari->count) {
+ +		err = -ENOMEM;
+ +		goto out_bitmap;
+  	}
+  
+ -	pfn = uar2pfn(mdev, up->index);
+ -	if (map_wc) {
+ -		up->map = ioremap_wc(pfn << PAGE_SHIFT, PAGE_SIZE);
+ -		if (!up->map) {
+ -			err = -EAGAIN;
+ -			goto error2;
+ -		}
+ -	} else {
+ -		up->map = ioremap(pfn << PAGE_SHIFT, PAGE_SIZE);
+ -		if (!up->map) {
+ +	for (i = 0; i < uuari->num_uars; i++) {
+ +		err = mlx5_cmd_alloc_uar(dev, &uuari->uars[i].index);
+ +		if (err)
+ +			goto out_count;
+ +
+ +		addr = dev->iseg_base + ((phys_addr_t)(uuari->uars[i].index) << PAGE_SHIFT);
+ +		uuari->uars[i].map = ioremap(addr, PAGE_SIZE);
+ +		if (!uuari->uars[i].map) {
+ +			mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+  			err = -ENOMEM;
+ -			goto error2;
+ +			goto out_count;
+  		}
+ +		mlx5_core_dbg(dev, "allocated uar index 0x%x, mmaped at %p\n",
+ +			      uuari->uars[i].index, uuari->uars[i].map);
+  	}
+ -	kref_init(&up->ref_count);
+ -	mlx5_core_dbg(mdev, "allocated UAR page: index %d, total bfregs %d\n",
+ -		      up->index, up->bfregs);
+ -	return up;
+ -
+ -error2:
+ -	if (mlx5_cmd_free_uar(mdev, up->index))
+ -		mlx5_core_warn(mdev, "failed to free uar index %d\n", up->index);
+ -error1:
+ -	kfree(up->fp_bitmap);
+ -	kfree(up->reg_bitmap);
+ -	kfree(up);
+ -	return ERR_PTR(err);
+ -}
+  
+ -struct mlx5_uars_page *mlx5_get_uars_page(struct mlx5_core_dev *mdev)
+ -{
+ -	struct mlx5_uars_page *ret;
+ -
+ -	mutex_lock(&mdev->priv.bfregs.reg_head.lock);
+ -	if (list_empty(&mdev->priv.bfregs.reg_head.list)) {
+ -		ret = alloc_uars_page(mdev, false);
+ -		if (IS_ERR(ret)) {
+ -			ret = NULL;
+ -			goto out;
+ -		}
+ -		list_add(&ret->list, &mdev->priv.bfregs.reg_head.list);
+ -	} else {
+ -		ret = list_first_entry(&mdev->priv.bfregs.reg_head.list,
+ -				       struct mlx5_uars_page, list);
+ -		kref_get(&ret->ref_count);
+ +	for (i = 0; i < tot_uuars; i++) {
+ +		bf = &uuari->bfs[i];
+ +
+ +		bf->buf_size = (1 << MLX5_CAP_GEN(dev, log_bf_reg_size)) / 2;
+ +		bf->uar = &uuari->uars[i / MLX5_BF_REGS_PER_PAGE];
+ +		bf->regreg = uuari->uars[i / MLX5_BF_REGS_PER_PAGE].map;
+ +		bf->reg = NULL; /* Add WC support */
+ +		bf->offset = (i % MLX5_BF_REGS_PER_PAGE) *
+ +			     (1 << MLX5_CAP_GEN(dev, log_bf_reg_size)) +
+ +			     MLX5_BF_OFFSET;
+ +		bf->need_lock = need_uuar_lock(i);
+ +		spin_lock_init(&bf->lock);
+ +		spin_lock_init(&bf->lock32);
+ +		bf->uuarn = i;
+  	}
+ -out:
+ -	mutex_unlock(&mdev->priv.bfregs.reg_head.lock);
+  
+ -	return ret;
+ -}
+ -EXPORT_SYMBOL(mlx5_get_uars_page);
+ +	return 0;
+  
+ -void mlx5_put_uars_page(struct mlx5_core_dev *mdev, struct mlx5_uars_page *up)
+ -{
+ -	mutex_lock(&mdev->priv.bfregs.reg_head.lock);
+ -	kref_put(&up->ref_count, up_rel_func);
+ -	mutex_unlock(&mdev->priv.bfregs.reg_head.lock);
+ -}
+ -EXPORT_SYMBOL(mlx5_put_uars_page);
+ +out_count:
+ +	for (i--; i >= 0; i--) {
+ +		iounmap(uuari->uars[i].map);
+ +		mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+ +	}
+ +	kfree(uuari->count);
+  
+ -static unsigned long map_offset(struct mlx5_core_dev *mdev, int dbi)
+ -{
+ -	/* return the offset in bytes from the start of the page to the
+ -	 * blue flame area of the UAR
+ -	 */
+ -	return dbi / MLX5_BFREGS_PER_UAR * MLX5_ADAPTER_PAGE_SIZE +
+ -	       (dbi % MLX5_BFREGS_PER_UAR) *
+ -	       (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) + MLX5_BF_OFFSET;
+ +out_bitmap:
+ +	kfree(uuari->bitmap);
+ +
+ +out_bfs:
+ +	kfree(uuari->bfs);
+ +
+ +out_uars:
+ +	kfree(uuari->uars);
+ +	return err;
+  }
+  
+ -static int alloc_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg,
+ -		       bool map_wc, bool fast_path)
+ +int mlx5_free_uuars(struct mlx5_core_dev *dev, struct mlx5_uuar_info *uuari)
+  {
+ -	struct mlx5_bfreg_data *bfregs;
+ -	struct mlx5_uars_page *up;
+ -	struct list_head *head;
+ -	unsigned long *bitmap;
+ -	unsigned int *avail;
+ -	struct mutex *lock;  /* pointer to right mutex */
+ -	int dbi;
+ +	int i = uuari->num_uars;
+  
+ -	bfregs = &mdev->priv.bfregs;
+ -	if (map_wc) {
+ -		head = &bfregs->wc_head.list;
+ -		lock = &bfregs->wc_head.lock;
+ -	} else {
+ -		head = &bfregs->reg_head.list;
+ -		lock = &bfregs->reg_head.lock;
+ -	}
+ -	mutex_lock(lock);
+ -	if (list_empty(head)) {
+ -		up = alloc_uars_page(mdev, map_wc);
+ -		if (IS_ERR(up)) {
+ -			mutex_unlock(lock);
+ -			return PTR_ERR(up);
+ -		}
+ -		list_add(&up->list, head);
+ -	} else {
+ -		up = list_entry(head->next, struct mlx5_uars_page, list);
+ -		kref_get(&up->ref_count);
+ -	}
+ -	if (fast_path) {
+ -		bitmap = up->fp_bitmap;
+ -		avail = &up->fp_avail;
+ -	} else {
+ -		bitmap = up->reg_bitmap;
+ -		avail = &up->reg_avail;
+ +	for (i--; i >= 0; i--) {
+ +		iounmap(uuari->uars[i].map);
+ +		mlx5_cmd_free_uar(dev, uuari->uars[i].index);
+  	}
+ -	dbi = find_first_bit(bitmap, up->bfregs);
+ -	clear_bit(dbi, bitmap);
+ -	(*avail)--;
+ -	if (!(*avail))
+ -		list_del(&up->list);
+ -
+ -	bfreg->map = up->map + map_offset(mdev, dbi);
+ -	bfreg->up = up;
+ -	bfreg->wc = map_wc;
+ -	bfreg->index = up->index + dbi / MLX5_BFREGS_PER_UAR;
+ -	mutex_unlock(lock);
+ +
+ +	kfree(uuari->count);
+ +	kfree(uuari->bitmap);
+ +	kfree(uuari->bfs);
+ +	kfree(uuari->uars);
+  
+  	return 0;
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/uar.c
