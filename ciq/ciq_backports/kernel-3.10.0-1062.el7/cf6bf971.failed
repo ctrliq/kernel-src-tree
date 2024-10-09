@@ -1,0 +1,699 @@
+scsi: mpt3sas: Bug fix for big endian systems.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: Bug fix for big endian systems (Tomas Henzl) [1513855]
+Rebuild_FUZZ: 91.76%
+commit-author Chaitra P B <chaitra.basappa@broadcom.com>
+commit cf6bf9710cabba1fe94a4349f4eb8db623c77ebc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cf6bf971.failed
+
+This patch fixes sparse warnings and bugs on big endian systems.
+
+	Signed-off-by: Chaitra P B <chaitra.basappa@broadcom.com>
+	Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit cf6bf9710cabba1fe94a4349f4eb8db623c77ebc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.c
+#	drivers/scsi/mpt3sas/mpt3sas_ctl.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.c
+index f71797505e69,ca17915b2d1b..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@@ -218,6 -283,213 +218,216 @@@ _base_get_buffer_phys_bar0(struct MPT3S
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * _base_get_chain_buffer_dma_to_chain_buffer - Iterates chain
++  *			lookup list and Provides chain_buffer
++  *			address for the matching dma address.
++  *			(Each smid can have 64K starts from 17024)
++  *
++  * @ioc: per adapter object
++  * @chain_buffer_dma: Chain buffer dma address.
++  *
++  * @Returns - Pointer to chain buffer. Or Null on Failure.
++  */
++ static void *
++ _base_get_chain_buffer_dma_to_chain_buffer(struct MPT3SAS_ADAPTER *ioc,
++ 		dma_addr_t chain_buffer_dma)
++ {
++ 	u16 index;
++ 
++ 	for (index = 0; index < ioc->chain_depth; index++) {
++ 		if (ioc->chain_lookup[index].chain_buffer_dma ==
++ 				chain_buffer_dma)
++ 			return ioc->chain_lookup[index].chain_buffer;
++ 	}
++ 	pr_info(MPT3SAS_FMT
++ 	    "Provided chain_buffer_dma address is not in the lookup list\n",
++ 	    ioc->name);
++ 	return NULL;
++ }
++ 
++ /**
++  * _clone_sg_entries -	MPI EP's scsiio and config requests
++  *			are handled here. Base function for
++  *			double buffering, before submitting
++  *			the requests.
++  *
++  * @ioc: per adapter object.
++  * @mpi_request: mf request pointer.
++  * @smid: system request message index.
++  *
++  * @Returns: Nothing.
++  */
++ static void _clone_sg_entries(struct MPT3SAS_ADAPTER *ioc,
++ 		void *mpi_request, u16 smid)
++ {
++ 	Mpi2SGESimple32_t *sgel, *sgel_next;
++ 	u32  sgl_flags, sge_chain_count = 0;
++ 	bool is_write = 0;
++ 	u16 i = 0;
++ 	void __iomem *buffer_iomem;
++ 	phys_addr_t buffer_iomem_phys;
++ 	void __iomem *buff_ptr;
++ 	phys_addr_t buff_ptr_phys;
++ 	void __iomem *dst_chain_addr[MCPU_MAX_CHAINS_PER_IO];
++ 	void *src_chain_addr[MCPU_MAX_CHAINS_PER_IO];
++ 	phys_addr_t dst_addr_phys;
++ 	MPI2RequestHeader_t *request_hdr;
++ 	struct scsi_cmnd *scmd;
++ 	struct scatterlist *sg_scmd = NULL;
++ 	int is_scsiio_req = 0;
++ 
++ 	request_hdr = (MPI2RequestHeader_t *) mpi_request;
++ 
++ 	if (request_hdr->Function == MPI2_FUNCTION_SCSI_IO_REQUEST) {
++ 		Mpi25SCSIIORequest_t *scsiio_request =
++ 			(Mpi25SCSIIORequest_t *)mpi_request;
++ 		sgel = (Mpi2SGESimple32_t *) &scsiio_request->SGL;
++ 		is_scsiio_req = 1;
++ 	} else if (request_hdr->Function == MPI2_FUNCTION_CONFIG) {
++ 		Mpi2ConfigRequest_t  *config_req =
++ 			(Mpi2ConfigRequest_t *)mpi_request;
++ 		sgel = (Mpi2SGESimple32_t *) &config_req->PageBufferSGE;
++ 	} else
++ 		return;
++ 
++ 	/* From smid we can get scsi_cmd, once we have sg_scmd,
++ 	 * we just need to get sg_virt and sg_next to get virual
++ 	 * address associated with sgel->Address.
++ 	 */
++ 
++ 	if (is_scsiio_req) {
++ 		/* Get scsi_cmd using smid */
++ 		scmd = mpt3sas_scsih_scsi_lookup_get(ioc, smid);
++ 		if (scmd == NULL) {
++ 			pr_err(MPT3SAS_FMT "scmd is NULL\n", ioc->name);
++ 			return;
++ 		}
++ 
++ 		/* Get sg_scmd from scmd provided */
++ 		sg_scmd = scsi_sglist(scmd);
++ 	}
++ 
++ 	/*
++ 	 * 0 - 255	System register
++ 	 * 256 - 4352	MPI Frame. (This is based on maxCredit 32)
++ 	 * 4352 - 4864	Reply_free pool (512 byte is reserved
++ 	 *		considering maxCredit 32. Reply need extra
++ 	 *		room, for mCPU case kept four times of
++ 	 *		maxCredit).
++ 	 * 4864 - 17152	SGE chain element. (32cmd * 3 chain of
++ 	 *		128 byte size = 12288)
++ 	 * 17152 - x	Host buffer mapped with smid.
++ 	 *		(Each smid can have 64K Max IO.)
++ 	 * BAR0+Last 1K MSIX Addr and Data
++ 	 * Total size in use 2113664 bytes of 4MB BAR0
++ 	 */
++ 
++ 	buffer_iomem = _base_get_buffer_bar0(ioc, smid);
++ 	buffer_iomem_phys = _base_get_buffer_phys_bar0(ioc, smid);
++ 
++ 	buff_ptr = buffer_iomem;
++ 	buff_ptr_phys = buffer_iomem_phys;
++ 	WARN_ON(buff_ptr_phys > U32_MAX);
++ 
++ 	if (le32_to_cpu(sgel->FlagsLength) &
++ 			(MPI2_SGE_FLAGS_HOST_TO_IOC << MPI2_SGE_FLAGS_SHIFT))
++ 		is_write = 1;
++ 
++ 	for (i = 0; i < MPT_MIN_PHYS_SEGMENTS + ioc->facts.MaxChainDepth; i++) {
++ 
++ 		sgl_flags =
++ 		    (le32_to_cpu(sgel->FlagsLength) >> MPI2_SGE_FLAGS_SHIFT);
++ 
++ 		switch (sgl_flags & MPI2_SGE_FLAGS_ELEMENT_MASK) {
++ 		case MPI2_SGE_FLAGS_CHAIN_ELEMENT:
++ 			/*
++ 			 * Helper function which on passing
++ 			 * chain_buffer_dma returns chain_buffer. Get
++ 			 * the virtual address for sgel->Address
++ 			 */
++ 			sgel_next =
++ 				_base_get_chain_buffer_dma_to_chain_buffer(ioc,
++ 						le32_to_cpu(sgel->Address));
++ 			if (sgel_next == NULL)
++ 				return;
++ 			/*
++ 			 * This is coping 128 byte chain
++ 			 * frame (not a host buffer)
++ 			 */
++ 			dst_chain_addr[sge_chain_count] =
++ 				_base_get_chain(ioc,
++ 					smid, sge_chain_count);
++ 			src_chain_addr[sge_chain_count] =
++ 						(void *) sgel_next;
++ 			dst_addr_phys = _base_get_chain_phys(ioc,
++ 						smid, sge_chain_count);
++ 			WARN_ON(dst_addr_phys > U32_MAX);
++ 			sgel->Address =
++ 				cpu_to_le32(lower_32_bits(dst_addr_phys));
++ 			sgel = sgel_next;
++ 			sge_chain_count++;
++ 			break;
++ 		case MPI2_SGE_FLAGS_SIMPLE_ELEMENT:
++ 			if (is_write) {
++ 				if (is_scsiio_req) {
++ 					_base_clone_to_sys_mem(buff_ptr,
++ 					    sg_virt(sg_scmd),
++ 					    (le32_to_cpu(sgel->FlagsLength) &
++ 					    0x00ffffff));
++ 					/*
++ 					 * FIXME: this relies on a a zero
++ 					 * PCI mem_offset.
++ 					 */
++ 					sgel->Address =
++ 					    cpu_to_le32((u32)buff_ptr_phys);
++ 				} else {
++ 					_base_clone_to_sys_mem(buff_ptr,
++ 					    ioc->config_vaddr,
++ 					    (le32_to_cpu(sgel->FlagsLength) &
++ 					    0x00ffffff));
++ 					sgel->Address =
++ 					    cpu_to_le32((u32)buff_ptr_phys);
++ 				}
++ 			}
++ 			buff_ptr += (le32_to_cpu(sgel->FlagsLength) &
++ 			    0x00ffffff);
++ 			buff_ptr_phys += (le32_to_cpu(sgel->FlagsLength) &
++ 			    0x00ffffff);
++ 			if ((le32_to_cpu(sgel->FlagsLength) &
++ 			    (MPI2_SGE_FLAGS_END_OF_BUFFER
++ 					<< MPI2_SGE_FLAGS_SHIFT)))
++ 				goto eob_clone_chain;
++ 			else {
++ 				/*
++ 				 * Every single element in MPT will have
++ 				 * associated sg_next. Better to sanity that
++ 				 * sg_next is not NULL, but it will be a bug
++ 				 * if it is null.
++ 				 */
++ 				if (is_scsiio_req) {
++ 					sg_scmd = sg_next(sg_scmd);
++ 					if (sg_scmd)
++ 						sgel++;
++ 					else
++ 						goto eob_clone_chain;
++ 				}
++ 			}
++ 			break;
++ 		}
++ 	}
++ 
++ eob_clone_chain:
++ 	for (i = 0; i < sge_chain_count; i++) {
++ 		if (is_scsiio_req)
++ 			_base_clone_to_sys_mem(dst_chain_addr[i],
++ 				src_chain_addr[i], ioc->request_sz);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+   *  mpt3sas_remove_dead_ioc_func - kthread context to remove dead ioc
+   * @arg: input argument, used to derive ioc
+   *
+@@@ -1153,6 -1439,10 +1363,13 @@@ _base_interrupt(int irq, void *bus_id
+  				    0 : ioc->reply_free_host_index + 1;
+  				ioc->reply_free[ioc->reply_free_host_index] =
+  				    cpu_to_le32(reply);
+++<<<<<<< HEAD
+++=======
++ 				if (ioc->is_mcpu_endpoint)
++ 					_base_clone_reply_to_sys_mem(ioc,
++ 						reply,
++ 						ioc->reply_free_host_index);
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  				writel(ioc->reply_free_host_index,
+  				    &ioc->chip->ReplyFreeHostIndex);
+  			}
+@@@ -2573,6 -3333,29 +2790,32 @@@ mpt3sas_base_free_smid(struct MPT3SAS_A
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * _base_mpi_ep_writeq - 32 bit write to MMIO
++  * @b: data payload
++  * @addr: address in MMIO space
++  * @writeq_lock: spin lock
++  *
++  * This special handling for MPI EP to take care of 32 bit
++  * environment where its not quarenteed to send the entire word
++  * in one transfer.
++  */
++ static inline void
++ _base_mpi_ep_writeq(__u64 b, volatile void __iomem *addr,
++ 					spinlock_t *writeq_lock)
++ {
++ 	unsigned long flags;
++ 	__u64 data_out = b;
++ 
++ 	spin_lock_irqsave(writeq_lock, flags);
++ 	writel((u32)(data_out), addr);
++ 	writel((u32)(data_out >> 32), (addr + 4));
++ 	spin_unlock_irqrestore(writeq_lock, flags);
++ }
++ 
++ /**
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+   * _base_writeq - 64 bit write to MMIO
+   * @ioc: per adapter object
+   * @b: data payload
+@@@ -2604,6 -3381,36 +2847,39 @@@ _base_writeq(__u64 b, volatile void __i
+  #endif
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * _base_put_smid_mpi_ep_scsi_io - send SCSI_IO request to firmware
++  * @ioc: per adapter object
++  * @smid: system request message index
++  * @handle: device handle
++  *
++  * Return nothing.
++  */
++ static void
++ _base_put_smid_mpi_ep_scsi_io(struct MPT3SAS_ADAPTER *ioc, u16 smid, u16 handle)
++ {
++ 	Mpi2RequestDescriptorUnion_t descriptor;
++ 	u64 *request = (u64 *)&descriptor;
++ 	void *mpi_req_iomem;
++ 	__le32 *mfp = (__le32 *)mpt3sas_base_get_msg_frame(ioc, smid);
++ 
++ 	_clone_sg_entries(ioc, (void *) mfp, smid);
++ 	mpi_req_iomem = (void __force *)ioc->chip +
++ 			MPI_FRAME_START_OFFSET + (smid * ioc->request_sz);
++ 	_base_clone_mpi_to_sys_mem(mpi_req_iomem, (void *)mfp,
++ 					ioc->request_sz);
++ 	descriptor.SCSIIO.RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO;
++ 	descriptor.SCSIIO.MSIxIndex =  _base_get_msix_index(ioc);
++ 	descriptor.SCSIIO.SMID = cpu_to_le16(smid);
++ 	descriptor.SCSIIO.DevHandle = cpu_to_le16(handle);
++ 	descriptor.SCSIIO.LMID = 0;
++ 	_base_mpi_ep_writeq(*request, &ioc->chip->RequestDescriptorPostLow,
++ 	    &ioc->scsi_lookup_lock);
++ }
++ 
++ /**
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+   * _base_put_smid_scsi_io - send SCSI_IO request to firmware
+   * @ioc: per adapter object
+   * @smid: system request message index
+@@@ -2664,7 -3471,24 +2940,28 @@@ mpt3sas_base_put_smid_hi_priority(struc
+  	u16 msix_task)
+  {
+  	Mpi2RequestDescriptorUnion_t descriptor;
+++<<<<<<< HEAD
+ +	u64 *request = (u64 *)&descriptor;
+++=======
++ 	void *mpi_req_iomem;
++ 	u64 *request;
++ 
++ 	if (ioc->is_mcpu_endpoint) {
++ 		MPI2RequestHeader_t *request_hdr;
++ 
++ 		__le32 *mfp = (__le32 *)mpt3sas_base_get_msg_frame(ioc, smid);
++ 
++ 		request_hdr = (MPI2RequestHeader_t *)mfp;
++ 		/* TBD 256 is offset within sys register. */
++ 		mpi_req_iomem = (void __force *)ioc->chip
++ 					+ MPI_FRAME_START_OFFSET
++ 					+ (smid * ioc->request_sz);
++ 		_base_clone_mpi_to_sys_mem(mpi_req_iomem, (void *)mfp,
++ 							ioc->request_sz);
++ 	}
++ 
++ 	request = (u64 *)&descriptor;
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  
+  	descriptor.HighPriority.RequestFlags =
+  	    MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY;
+@@@ -2687,8 -3540,23 +2984,24 @@@ voi
+  mpt3sas_base_put_smid_default(struct MPT3SAS_ADAPTER *ioc, u16 smid)
+  {
+  	Mpi2RequestDescriptorUnion_t descriptor;
+ -	void *mpi_req_iomem;
+ -	u64 *request;
+ -	MPI2RequestHeader_t *request_hdr;
+ +	u64 *request = (u64 *)&descriptor;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ioc->is_mcpu_endpoint) {
++ 		__le32 *mfp = (__le32 *)mpt3sas_base_get_msg_frame(ioc, smid);
++ 
++ 		request_hdr = (MPI2RequestHeader_t *)mfp;
++ 
++ 		_clone_sg_entries(ioc, (void *) mfp, smid);
++ 		/* TBD 256 is offset within sys register */
++ 		mpi_req_iomem = (void __force *)ioc->chip +
++ 			MPI_FRAME_START_OFFSET + (smid * ioc->request_sz);
++ 		_base_clone_mpi_to_sys_mem(mpi_req_iomem, (void *)mfp,
++ 							ioc->request_sz);
++ 	}
++ 	request = (u64 *)&descriptor;
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  	descriptor.Default.RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
+  	descriptor.Default.MSIxIndex =  _base_get_msix_index(ioc);
+  	descriptor.Default.SMID = cpu_to_le16(smid);
+@@@ -5243,8 -6177,12 +5556,15 @@@ _base_make_ioc_operational(struct MPT3S
+  	/* initialize Reply Free Queue */
+  	for (i = 0, reply_address = (u32)ioc->reply_dma ;
+  	    i < ioc->reply_free_queue_depth ; i++, reply_address +=
+ -	    ioc->reply_sz) {
+ +	    ioc->reply_sz)
+  		ioc->reply_free[i] = cpu_to_le32(reply_address);
+++<<<<<<< HEAD
+++=======
++ 		if (ioc->is_mcpu_endpoint)
++ 			_base_clone_reply_to_sys_mem(ioc,
++ 					reply_address, i);
++ 	}
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  
+  	/* initialize reply queues */
+  	if (ioc->is_driver_loading)
+diff --cc drivers/scsi/mpt3sas/mpt3sas_ctl.c
+index a6a5ecb79a3a,c1b17d64c95f..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_ctl.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_ctl.c
+@@@ -288,7 -289,20 +288,22 @@@ mpt3sas_ctl_done(struct MPT3SAS_ADAPTE
+  				memcpy(ioc->ctl_cmds.sense, sense_data, sz);
+  			}
+  		}
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Get Error Response data for NVMe device. The ctl_cmds.sense
++ 		 * buffer is used to store the Error Response data.
++ 		 */
++ 		if (mpi_reply->Function == MPI2_FUNCTION_NVME_ENCAPSULATED) {
++ 			nvme_error_reply =
++ 			    (Mpi26NVMeEncapsulatedErrorReply_t *)mpi_reply;
++ 			sz = min_t(u32, NVME_ERROR_RESPONSE_SIZE,
++ 			    le16_to_cpu(nvme_error_reply->ErrorResponseCount));
++ 			sense_data = mpt3sas_base_get_sense_buffer(ioc, smid);
++ 			memcpy(ioc->ctl_cmds.sense, sense_data, sz);
++ 		}
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  	}
+ -
+  	_ctl_display_some_debug(ioc, smid, "ctl_done", mpi_reply);
+  	ioc->ctl_cmds.status &= ~MPT3_CMD_PENDING;
+  	complete(&ioc->ctl_cmds.done);
+@@@ -776,6 -791,39 +791,42 @@@ _ctl_do_mpt_command(struct MPT3SAS_ADAP
+  
+  	init_completion(&ioc->ctl_cmds.done);
+  	switch (mpi_request->Function) {
+++<<<<<<< HEAD
+++=======
++ 	case MPI2_FUNCTION_NVME_ENCAPSULATED:
++ 	{
++ 		nvme_encap_request = (Mpi26NVMeEncapsulatedRequest_t *)request;
++ 		/*
++ 		 * Get the Physical Address of the sense buffer.
++ 		 * Use Error Response buffer address field to hold the sense
++ 		 * buffer address.
++ 		 * Clear the internal sense buffer, which will potentially hold
++ 		 * the Completion Queue Entry on return, or 0 if no Entry.
++ 		 * Build the PRPs and set direction bits.
++ 		 * Send the request.
++ 		 */
++ 		nvme_encap_request->ErrorResponseBaseAddress =
++ 		    cpu_to_le64(ioc->sense_dma & 0xFFFFFFFF00000000UL);
++ 		nvme_encap_request->ErrorResponseBaseAddress |=
++ 		   cpu_to_le64(le32_to_cpu(
++ 		   mpt3sas_base_get_sense_buffer_dma(ioc, smid)));
++ 		nvme_encap_request->ErrorResponseAllocationLength =
++ 					cpu_to_le16(NVME_ERROR_RESPONSE_SIZE);
++ 		memset(ioc->ctl_cmds.sense, 0, NVME_ERROR_RESPONSE_SIZE);
++ 		ioc->build_nvme_prp(ioc, smid, nvme_encap_request,
++ 		    data_out_dma, data_out_sz, data_in_dma, data_in_sz);
++ 		if (test_bit(device_handle, ioc->device_remove_in_progress)) {
++ 			dtmprintk(ioc, pr_info(MPT3SAS_FMT "handle(0x%04x) :"
++ 			    "ioctl failed due to device removal in progress\n",
++ 			    ioc->name, device_handle));
++ 			mpt3sas_base_free_smid(ioc, smid);
++ 			ret = -EINVAL;
++ 			goto out;
++ 		}
++ 		mpt3sas_base_put_smid_nvme_encap(ioc, smid);
++ 		break;
++ 	}
+++>>>>>>> cf6bf9710cab (scsi: mpt3sas: Bug fix for big endian systems.)
+  	case MPI2_FUNCTION_SCSI_IO_REQUEST:
+  	case MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH:
+  	{
+diff --git a/drivers/scsi/mpt3sas/mpi/mpi2_init.h b/drivers/scsi/mpt3sas/mpi/mpi2_init.h
+index 7597c24b7ffa..54280b320651 100644
+--- a/drivers/scsi/mpt3sas/mpi/mpi2_init.h
++++ b/drivers/scsi/mpt3sas/mpi/mpi2_init.h
+@@ -74,7 +74,7 @@
+ 
+ typedef struct _MPI2_SCSI_IO_CDB_EEDP32 {
+ 	U8 CDB[20];		/*0x00 */
+-	U32 PrimaryReferenceTag;	/*0x14 */
++	__be32 PrimaryReferenceTag;	/*0x14 */
+ 	U16 PrimaryApplicationTag;	/*0x18 */
+ 	U16 PrimaryApplicationTagMask;	/*0x1A */
+ 	U32 TransferLength;	/*0x1C */
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.c
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index ad008c86cc10..e57b62a5729a 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -806,8 +806,8 @@ struct _sc_list {
+  */
+ struct _event_ack_list {
+ 	struct list_head list;
+-	u16     Event;
+-	u32     EventContext;
++	U16     Event;
++	U32     EventContext;
+ };
+ 
+ /**
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_ctl.c
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 0283789c8e47..8d1e34675937 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -154,8 +154,8 @@ MODULE_PARM_DESC(prot_mask, " host protection capabilities mask, def=7 ");
+ 
+ 
+ /* raid transport support */
+-struct raid_template *mpt3sas_raid_template;
+-struct raid_template *mpt2sas_raid_template;
++static struct raid_template *mpt3sas_raid_template;
++static struct raid_template *mpt2sas_raid_template;
+ 
+ 
+ /**
+@@ -3897,7 +3897,7 @@ _scsih_tm_tr_complete(struct MPT3SAS_ADAPTER *ioc, u16 smid, u8 msix_index,
+ 		if (!delayed_sc)
+ 			return _scsih_check_for_pending_tm(ioc, smid);
+ 		INIT_LIST_HEAD(&delayed_sc->list);
+-		delayed_sc->handle = mpi_request_tm->DevHandle;
++		delayed_sc->handle = le16_to_cpu(mpi_request_tm->DevHandle);
+ 		list_add_tail(&delayed_sc->list, &ioc->delayed_sc_list);
+ 		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+ 		    "DELAYED:sc:handle(0x%04x), (open)\n",
+@@ -4075,8 +4075,8 @@ _scsih_tm_volume_tr_complete(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+  * Context - processed in interrupt context.
+  */
+ static void
+-_scsih_issue_delayed_event_ack(struct MPT3SAS_ADAPTER *ioc, u16 smid, u16 event,
+-				u32 event_context)
++_scsih_issue_delayed_event_ack(struct MPT3SAS_ADAPTER *ioc, u16 smid, U16 event,
++				U32 event_context)
+ {
+ 	Mpi2EventAckRequest_t *ack_request;
+ 	int i = smid - ioc->internal_smid;
+@@ -4151,13 +4151,13 @@ _scsih_issue_delayed_sas_io_unit_ctrl(struct MPT3SAS_ADAPTER *ioc,
+ 
+ 	dewtprintk(ioc, pr_info(MPT3SAS_FMT
+ 	    "sc_send:handle(0x%04x), (open), smid(%d), cb(%d)\n",
+-	    ioc->name, le16_to_cpu(handle), smid,
++	    ioc->name, handle, smid,
+ 	    ioc->tm_sas_control_cb_idx));
+ 	mpi_request = mpt3sas_base_get_msg_frame(ioc, smid);
+ 	memset(mpi_request, 0, sizeof(Mpi2SasIoUnitControlRequest_t));
+ 	mpi_request->Function = MPI2_FUNCTION_SAS_IO_UNIT_CONTROL;
+ 	mpi_request->Operation = MPI2_SAS_OP_REMOVE_DEVICE;
+-	mpi_request->DevHandle = handle;
++	mpi_request->DevHandle = cpu_to_le16(handle);
+ 	mpt3sas_base_put_smid_default(ioc, smid);
+ }
+ 
+@@ -6300,7 +6300,7 @@ _scsih_add_device(struct MPT3SAS_ADAPTER *ioc, u16 handle, u8 phy_num,
+ 	if (sas_device_pg0.EnclosureHandle) {
+ 		encl_pg0_rc = mpt3sas_config_get_enclosure_pg0(ioc, &mpi_reply,
+ 		    &enclosure_pg0, MPI2_SAS_ENCLOS_PGAD_FORM_HANDLE,
+-		    sas_device_pg0.EnclosureHandle);
++		    le16_to_cpu(sas_device_pg0.EnclosureHandle));
+ 		if (encl_pg0_rc)
+ 			pr_info(MPT3SAS_FMT
+ 			    "Enclosure Pg0 read failed for handle(0x%04x)\n",
+@@ -7109,7 +7109,7 @@ _scsih_pcie_add_device(struct MPT3SAS_ADAPTER *ioc, u16 handle)
+ 	if (pcie_device->enclosure_handle != 0)
+ 		pcie_device->slot = le16_to_cpu(pcie_device_pg0.Slot);
+ 
+-	if (le16_to_cpu(pcie_device_pg0.Flags) &
++	if (le32_to_cpu(pcie_device_pg0.Flags) &
+ 	    MPI26_PCIEDEV0_FLAGS_ENCL_LEVEL_VALID) {
+ 		pcie_device->enclosure_level = pcie_device_pg0.EnclosureLevel;
+ 		memcpy(&pcie_device->connector_name[0],
+@@ -8553,8 +8553,9 @@ Mpi2SasDevicePage0_t *sas_device_pg0)
+ 
+ 	spin_lock_irqsave(&ioc->sas_device_lock, flags);
+ 	list_for_each_entry(sas_device, &ioc->sas_device_list, list) {
+-		if ((sas_device->sas_address == sas_device_pg0->SASAddress) &&
+-			(sas_device->slot == sas_device_pg0->Slot)) {
++		if ((sas_device->sas_address == le64_to_cpu(
++		    sas_device_pg0->SASAddress)) && (sas_device->slot ==
++		    le16_to_cpu(sas_device_pg0->Slot))) {
+ 			sas_device->responding = 1;
+ 			starget = sas_device->starget;
+ 			if (starget && starget->hostdata) {
+@@ -8566,7 +8567,7 @@ Mpi2SasDevicePage0_t *sas_device_pg0)
+ 			if (starget) {
+ 				starget_printk(KERN_INFO, starget,
+ 				    "handle(0x%04x), sas_addr(0x%016llx)\n",
+-				    sas_device_pg0->DevHandle,
++				    le16_to_cpu(sas_device_pg0->DevHandle),
+ 				    (unsigned long long)
+ 				    sas_device->sas_address);
+ 
+@@ -8578,7 +8579,7 @@ Mpi2SasDevicePage0_t *sas_device_pg0)
+ 					 sas_device->enclosure_logical_id,
+ 					 sas_device->slot);
+ 			}
+-			if (sas_device_pg0->Flags &
++			if (le16_to_cpu(sas_device_pg0->Flags) &
+ 			      MPI2_SAS_DEVICE0_FLAGS_ENCL_LEVEL_VALID) {
+ 				sas_device->enclosure_level =
+ 				   sas_device_pg0->EnclosureLevel;
+@@ -8592,14 +8593,16 @@ Mpi2SasDevicePage0_t *sas_device_pg0)
+ 			_scsih_get_enclosure_logicalid_chassis_slot(ioc,
+ 			    sas_device_pg0, sas_device);
+ 
+-			if (sas_device->handle == sas_device_pg0->DevHandle)
++			if (sas_device->handle == le16_to_cpu(
++			    sas_device_pg0->DevHandle))
+ 				goto out;
+ 			pr_info("\thandle changed from(0x%04x)!!!\n",
+ 			    sas_device->handle);
+-			sas_device->handle = sas_device_pg0->DevHandle;
++			sas_device->handle = le16_to_cpu(
++			    sas_device_pg0->DevHandle);
+ 			if (sas_target_priv_data)
+ 				sas_target_priv_data->handle =
+-					sas_device_pg0->DevHandle;
++				    le16_to_cpu(sas_device_pg0->DevHandle);
+ 			goto out;
+ 		}
+ 	}
+@@ -8638,15 +8641,10 @@ _scsih_search_responding_sas_devices(struct MPT3SAS_ADAPTER *ioc)
+ 		    MPI2_IOCSTATUS_MASK;
+ 		if (ioc_status != MPI2_IOCSTATUS_SUCCESS)
+ 			break;
+-		handle = sas_device_pg0.DevHandle =
+-				le16_to_cpu(sas_device_pg0.DevHandle);
++		handle = le16_to_cpu(sas_device_pg0.DevHandle);
+ 		device_info = le32_to_cpu(sas_device_pg0.DeviceInfo);
+ 		if (!(_scsih_is_end_device(device_info)))
+ 			continue;
+-		sas_device_pg0.SASAddress =
+-				le64_to_cpu(sas_device_pg0.SASAddress);
+-		sas_device_pg0.Slot = le16_to_cpu(sas_device_pg0.Slot);
+-		sas_device_pg0.Flags = le16_to_cpu(sas_device_pg0.Flags);
+ 		_scsih_mark_responding_sas_device(ioc, &sas_device_pg0);
+ 	}
+ 
+@@ -8676,8 +8674,9 @@ _scsih_mark_responding_pcie_device(struct MPT3SAS_ADAPTER *ioc,
+ 
+ 	spin_lock_irqsave(&ioc->pcie_device_lock, flags);
+ 	list_for_each_entry(pcie_device, &ioc->pcie_device_list, list) {
+-		if ((pcie_device->wwid == pcie_device_pg0->WWID) &&
+-		    (pcie_device->slot == pcie_device_pg0->Slot)) {
++		if ((pcie_device->wwid == le64_to_cpu(pcie_device_pg0->WWID))
++		    && (pcie_device->slot == le16_to_cpu(
++		    pcie_device_pg0->Slot))) {
+ 			pcie_device->responding = 1;
+ 			starget = pcie_device->starget;
+ 			if (starget && starget->hostdata) {
+@@ -8712,14 +8711,16 @@ _scsih_mark_responding_pcie_device(struct MPT3SAS_ADAPTER *ioc,
+ 				pcie_device->connector_name[0] = '\0';
+ 			}
+ 
+-			if (pcie_device->handle == pcie_device_pg0->DevHandle)
++			if (pcie_device->handle == le16_to_cpu(
++			    pcie_device_pg0->DevHandle))
+ 				goto out;
+ 			pr_info("\thandle changed from(0x%04x)!!!\n",
+ 			    pcie_device->handle);
+-			pcie_device->handle = pcie_device_pg0->DevHandle;
++			pcie_device->handle = le16_to_cpu(
++			    pcie_device_pg0->DevHandle);
+ 			if (sas_target_priv_data)
+ 				sas_target_priv_data->handle =
+-				    pcie_device_pg0->DevHandle;
++				    le16_to_cpu(pcie_device_pg0->DevHandle);
+ 			goto out;
+ 		}
+ 	}
+@@ -8768,10 +8769,6 @@ _scsih_search_responding_pcie_devices(struct MPT3SAS_ADAPTER *ioc)
+ 		device_info = le32_to_cpu(pcie_device_pg0.DeviceInfo);
+ 		if (!(_scsih_is_nvme_device(device_info)))
+ 			continue;
+-		pcie_device_pg0.WWID = le64_to_cpu(pcie_device_pg0.WWID),
+-		pcie_device_pg0.Slot = le16_to_cpu(pcie_device_pg0.Slot);
+-		pcie_device_pg0.Flags = le32_to_cpu(pcie_device_pg0.Flags);
+-		pcie_device_pg0.DevHandle = handle;
+ 		_scsih_mark_responding_pcie_device(ioc, &pcie_device_pg0);
+ 	}
+ out:
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_warpdrive.c b/drivers/scsi/mpt3sas/mpt3sas_warpdrive.c
+index 06e3f7d634b2..cbabbc4343b2 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_warpdrive.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_warpdrive.c
+@@ -177,7 +177,8 @@ mpt3sas_init_warpdrive_properties(struct MPT3SAS_ADAPTER *ioc,
+ 		if (mpt3sas_config_get_phys_disk_pg0(ioc, &mpi_reply,
+ 		    &pd_pg0, MPI2_PHYSDISK_PGAD_FORM_PHYSDISKNUM,
+ 		    vol_pg0->PhysDisk[count].PhysDiskNum) ||
+-		    pd_pg0.DevHandle == MPT3SAS_INVALID_DEVICE_HANDLE) {
++		    le16_to_cpu(pd_pg0.DevHandle) ==
++		    MPT3SAS_INVALID_DEVICE_HANDLE) {
+ 			pr_info(MPT3SAS_FMT "WarpDrive : Direct IO is "
+ 			    "disabled for the drive with handle(0x%04x) member"
+ 			    "handle retrieval failed for member number=%d\n",
