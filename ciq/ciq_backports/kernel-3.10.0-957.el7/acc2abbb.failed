@@ -1,0 +1,156 @@
+nfp: bpf: plumb extack into functions related to XDP offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Quentin Monnet <quentin.monnet@netronome.com>
+commit acc2abbbb1b9fb8a018706055794feb4bb9bcdbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/acc2abbb.failed
+
+Pass a pointer to an extack object to nfp_app_xdp_offload() in order to
+prepare for extack usage in the nfp driver. Next step will be to forward
+this extack pointer to nfp_net_bpf_offload(), once this function is able
+to use it for printing error messages.
+
+	Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit acc2abbbb1b9fb8a018706055794feb4bb9bcdbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 60a7af297852,b755c9164ab9..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -52,30 -54,27 +52,36 @@@ static bool nfp_net_ebpf_capable(struc
+  
+  static int
+  nfp_bpf_xdp_offload(struct nfp_app *app, struct nfp_net *nn,
+- 		    struct bpf_prog *prog)
++ 		    struct bpf_prog *prog, struct netlink_ext_ack *extack)
+  {
+ -	bool running, xdp_running;
+ +	struct tc_cls_bpf_offload cmd = {
+ +		.prog = prog,
+ +	};
+  	int ret;
+  
+  	if (!nfp_net_ebpf_capable(nn))
+  		return -EINVAL;
+  
+ -	running = nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+ -	xdp_running = running && nn->dp.bpf_offload_xdp;
+ -
+ -	if (!prog && !xdp_running)
+ -		return 0;
+ -	if (prog && running && !xdp_running)
+ -		return -EBUSY;
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF) {
+ +		if (!nn->dp.bpf_offload_xdp)
+ +			return prog ? -EBUSY : 0;
+ +		cmd.command = prog ? TC_CLSBPF_REPLACE : TC_CLSBPF_DESTROY;
+ +	} else {
+ +		if (!prog)
+ +			return 0;
+ +		cmd.command = TC_CLSBPF_ADD;
+ +	}
+  
+ -	ret = nfp_net_bpf_offload(nn, prog, running);
+ +	ret = nfp_net_bpf_offload(nn, &cmd);
+  	/* Stop offload if replace not possible */
+++<<<<<<< HEAD
+ +	if (ret && cmd.command == TC_CLSBPF_REPLACE)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+++=======
++ 	if (ret && prog)
++ 		nfp_bpf_xdp_offload(app, nn, NULL, extack);
++ 
+++>>>>>>> acc2abbbb1b9 (nfp: bpf: plumb extack into functions related to XDP offload)
+  	nn->dp.bpf_offload_xdp = prog && !ret;
+  	return ret;
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_app.h
+index 96318a0e48d5,437964afa8ee..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@@ -42,9 -42,10 +42,14 @@@
+  
+  struct bpf_prog;
+  struct net_device;
+++<<<<<<< HEAD
+++=======
++ struct netdev_bpf;
++ struct netlink_ext_ack;
+++>>>>>>> acc2abbbb1b9 (nfp: bpf: plumb extack into functions related to XDP offload)
+  struct pci_dev;
+  struct sk_buff;
+ +struct tc_to_netdev;
+  struct sk_buff;
+  struct nfp_app;
+  struct nfp_cpp;
+@@@ -117,8 -136,11 +122,9 @@@ struct nfp_app_type 
+  	int (*setup_tc)(struct nfp_app *app, struct net_device *netdev,
+  			enum tc_setup_type type, void *type_data);
+  	bool (*tc_busy)(struct nfp_app *app, struct nfp_net *nn);
+ -	int (*bpf)(struct nfp_app *app, struct nfp_net *nn,
+ -		   struct netdev_bpf *xdp);
+  	int (*xdp_offload)(struct nfp_app *app, struct nfp_net *nn,
+- 			   struct bpf_prog *prog);
++ 			   struct bpf_prog *prog,
++ 			   struct netlink_ext_ack *extack);
+  
+  	int (*sriov_enable)(struct nfp_app *app, int num_vfs);
+  	void (*sriov_disable)(struct nfp_app *app);
+@@@ -265,14 -317,31 +271,15 @@@ static inline int nfp_app_setup_tc(stru
+  	return app->type->setup_tc(app, netdev, type, type_data);
+  }
+  
+ -static inline int nfp_app_bpf(struct nfp_app *app, struct nfp_net *nn,
+ -			      struct netdev_bpf *bpf)
+ -{
+ -	if (!app || !app->type->bpf)
+ -		return -EINVAL;
+ -	return app->type->bpf(app, nn, bpf);
+ -}
+ -
+  static inline int nfp_app_xdp_offload(struct nfp_app *app, struct nfp_net *nn,
+- 				      struct bpf_prog *prog)
++ 				      struct bpf_prog *prog,
++ 				      struct netlink_ext_ack *extack)
+  {
+  	if (!app || !app->type->xdp_offload)
+  		return -EOPNOTSUPP;
+- 	return app->type->xdp_offload(app, nn, prog);
++ 	return app->type->xdp_offload(app, nn, prog, extack);
+  }
+  
+ -static inline bool __nfp_app_ctrl_tx(struct nfp_app *app, struct sk_buff *skb)
+ -{
+ -	trace_devlink_hwmsg(priv_to_devlink(app->pf), false, 0,
+ -			    skb->data, skb->len);
+ -
+ -	return __nfp_ctrl_tx(app->ctrl, skb);
+ -}
+ -
+  static inline bool nfp_app_ctrl_tx(struct nfp_app *app, struct sk_buff *skb)
+  {
+  	trace_devlink_hwmsg(priv_to_devlink(app->pf), false, 0,
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 93bed1ada247..62ebc402309d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3401,7 +3401,7 @@ nfp_net_xdp_setup(struct nfp_net *nn, struct bpf_prog *prog, u32 flags,
+ 	if (err)
+ 		return err;
+ 
+-	err = nfp_app_xdp_offload(nn->app, nn, offload_prog);
++	err = nfp_app_xdp_offload(nn->app, nn, offload_prog, extack);
+ 	if (err && flags & XDP_FLAGS_HW_MODE)
+ 		return err;
+ 
