@@ -1,0 +1,278 @@
+RDMA/netlink: Add flag to consolidate common handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] netlink: Add flag to consolidate common handling (Don Dutile) [1499364]
+Rebuild_FUZZ: 95.05%
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit e3a2b93dddad315f01a4b67faee738954c084072
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e3a2b93d.failed
+
+Add ability to provide flags to control RDMA netlink callbacks
+and convert addr.c and sa_query.c to be first users of such
+infrastructure. It allows to move their CAP_NET_ADMIN checks
+into netlink core.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+(cherry picked from commit e3a2b93dddad315f01a4b67faee738954c084072)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/core/netlink.c
+#	include/rdma/rdma_netlink.h
+diff --cc drivers/infiniband/core/device.c
+index 32656f7b9a64,7ae29cc49a5e..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -972,29 -1086,21 +972,42 @@@ struct net_device *ib_get_net_dev_by_pa
+  }
+  EXPORT_SYMBOL(ib_get_net_dev_by_params);
+  
+ -static const struct ibnl_client_cbs ibnl_ls_cb_table[] = {
+ +static struct ibnl_client_cbs ibnl_ls_cb_table[] = {
+  	[RDMA_NL_LS_OP_RESOLVE] = {
+  		.dump = ib_nl_handle_resolve_resp,
+++<<<<<<< HEAD
+ +		.module = THIS_MODULE },
+ +	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
+ +		.dump = ib_nl_handle_set_timeout,
+ +		.module = THIS_MODULE },
+ +	[RDMA_NL_LS_OP_IP_RESOLVE] = {
+ +		.dump = ib_nl_handle_ip_res_resp,
+ +		.module = THIS_MODULE },
+++=======
++ 		.flags = RDMA_NL_ADMIN_PERM,
++ 	},
++ 	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
++ 		.dump = ib_nl_handle_set_timeout,
++ 		.flags = RDMA_NL_ADMIN_PERM,
++ 	},
++ 	[RDMA_NL_LS_OP_IP_RESOLVE] = {
++ 		.dump = ib_nl_handle_ip_res_resp,
++ 		.flags = RDMA_NL_ADMIN_PERM,
++ 	},
+++>>>>>>> e3a2b93dddad (RDMA/netlink: Add flag to consolidate common handling)
+  };
+  
+ +static int ib_add_ibnl_clients(void)
+ +{
+ +	return ibnl_add_client(RDMA_NL_LS, ARRAY_SIZE(ibnl_ls_cb_table),
+ +			       ibnl_ls_cb_table);
+ +}
+ +
+ +static void ib_remove_ibnl_clients(void)
+ +{
+ +	ibnl_remove_client(RDMA_NL_LS);
+ +}
+ +
+  static int __init ib_core_init(void)
+  {
+  	int ret;
+diff --cc drivers/infiniband/core/netlink.c
+index e57919353a80,c5ee62a24960..000000000000
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@@ -146,71 -159,85 +146,88 @@@ nla_put_failure
+  }
+  EXPORT_SYMBOL(ibnl_put_attr);
+  
+ -static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ -			   struct netlink_ext_ack *extack)
+ +static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+  {
+ +	struct ibnl_client *client;
+  	int type = nlh->nlmsg_type;
+ -	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ +	int index = RDMA_NL_GET_CLIENT(type);
+  	unsigned int op = RDMA_NL_GET_OP(type);
+ -	struct netlink_callback cb = {};
+ -	struct netlink_dump_control c = {};
+ -
+ -	if (!is_nl_valid(index, op))
+ -		return -EINVAL;
+  
+ +	list_for_each_entry(client, &client_list, list) {
+ +		if (client->index == index) {
+ +			if (op >= client->nops || !client->cb_table[op].dump)
+ +				return -EINVAL;
+ +
+++<<<<<<< HEAD
+ +			/*
+ +			 * For response or local service set_timeout request,
+ +			 * there is no need to use netlink_dump_start.
+ +			 */
+ +			if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+ +			    (index == RDMA_NL_LS &&
+ +			     op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+ +				struct netlink_callback cb = {
+ +					.skb = skb,
+ +					.nlh = nlh,
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +
+ +				return cb.dump(skb, &cb);
+ +			}
+ +
+ +			{
+ +				struct netlink_dump_control c = {
+ +					.dump = client->cb_table[op].dump,
+ +					.module = client->cb_table[op].module,
+ +				};
+ +				return netlink_dump_start(nls, skb, nlh, &c);
+ +			}
+ +		}
+++=======
++ 	if ((rdma_nl_types[index].cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
++ 	    !netlink_capable(skb, CAP_NET_ADMIN))
++ 		return -EPERM;
++ 
++ 	/*
++ 	 * For response or local service set_timeout request,
++ 	 * there is no need to use netlink_dump_start.
++ 	 */
++ 	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
++ 	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
++ 		cb.skb = skb;
++ 		cb.nlh = nlh;
++ 		cb.dump = rdma_nl_types[index].cb_table[op].dump;
++ 		return cb.dump(skb, &cb);
+++>>>>>>> e3a2b93dddad (RDMA/netlink: Add flag to consolidate common handling)
+  	}
+  
+ -	c.dump = rdma_nl_types[index].cb_table[op].dump;
+ -	return netlink_dump_start(nls, skb, nlh, &c);
+ +	pr_info("Index %d wasn't found in client list\n", index);
+ +	return -EINVAL;
+  }
+  
+ -/*
+ - * This function is similar to netlink_rcv_skb with one exception:
+ - * It calls to the callback for the netlink messages without NLM_F_REQUEST
+ - * flag. These messages are intended for RDMA_NL_LS consumer, so it is allowed
+ - * for that consumer only.
+ - */
+ -static int rdma_nl_rcv_skb(struct sk_buff *skb, int (*cb)(struct sk_buff *,
+ -						   struct nlmsghdr *,
+ -						   struct netlink_ext_ack *))
+ +static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+  {
+ -	struct netlink_ext_ack extack = {};
+  	struct nlmsghdr *nlh;
+ -	int err;
+ +	int msglen;
+  
+ +	/*
+ +	 * Process responses until there is no more message or the first
+ +	 * request. Generally speaking, it is not recommended to mix responses
+ +	 * with requests.
+ +	 */
+  	while (skb->len >= nlmsg_total_size(0)) {
+ -		int msglen;
+ -
+  		nlh = nlmsg_hdr(skb);
+ -		err = 0;
+  
+  		if (nlh->nlmsg_len < NLMSG_HDRLEN || skb->len < nlh->nlmsg_len)
+ -			return 0;
+ +			return;
+ +
+ +		/* Handle response only */
+ +		if (nlh->nlmsg_flags & NLM_F_REQUEST)
+ +			return;
+ +
+ +		ibnl_rcv_msg(skb, nlh);
+  
+ -		/*
+ -		 * Generally speaking, the only requests are handled
+ -		 * by the kernel, but RDMA_NL_LS is different, because it
+ -		 * runs backward netlink scheme. Kernel initiates messages
+ -		 * and waits for reply with data to keep pathrecord cache
+ -		 * in sync.
+ -		 */
+ -		if (!(nlh->nlmsg_flags & NLM_F_REQUEST) &&
+ -		    (RDMA_NL_GET_CLIENT(nlh->nlmsg_type) != RDMA_NL_LS))
+ -			goto ack;
+ -
+ -		/* Skip control messages */
+ -		if (nlh->nlmsg_type < NLMSG_MIN_TYPE)
+ -			goto ack;
+ -
+ -		err = cb(skb, nlh, &extack);
+ -		if (err == -EINTR)
+ -			goto skip;
+ -
+ -ack:
+ -		if (nlh->nlmsg_flags & NLM_F_ACK || err)
+ -			netlink_ack(skb, nlh, err, &extack);
+ -
+ -skip:
+  		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
+  		if (msglen > skb->len)
+  			msglen = skb->len;
+diff --cc include/rdma/rdma_netlink.h
+index 5b1466770917,6ea36ec45401..000000000000
+--- a/include/rdma/rdma_netlink.h
++++ b/include/rdma/rdma_netlink.h
+@@@ -7,7 -7,12 +7,16 @@@
+  
+  struct ibnl_client_cbs {
+  	int (*dump)(struct sk_buff *skb, struct netlink_callback *nlcb);
+++<<<<<<< HEAD
+ +	struct module *module;
+++=======
++ 	u8 flags;
++ };
++ 
++ enum rdma_nl_flags {
++ 	/* Require CAP_NET_ADMIN */
++ 	RDMA_NL_ADMIN_PERM	= 1 << 0,
+++>>>>>>> e3a2b93dddad (RDMA/netlink: Add flag to consolidate common handling)
+  };
+  
+  /**
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index ad02d82386ca..83409291e849 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -135,8 +135,7 @@ int ib_nl_handle_ip_res_resp(struct sk_buff *skb,
+ 	const struct nlmsghdr *nlh = (struct nlmsghdr *)cb->nlh;
+ 
+ 	if ((nlh->nlmsg_flags & NLM_F_REQUEST) ||
+-	    !(NETLINK_CB(skb).sk) ||
+-	    !netlink_capable(skb, CAP_NET_ADMIN))
++	    !(NETLINK_CB(skb).sk))
+ 		return -EPERM;
+ 
+ 	if (ib_nl_is_good_ip_resp(nlh))
+* Unmerged path drivers/infiniband/core/device.c
+* Unmerged path drivers/infiniband/core/netlink.c
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index 17b24d8a34e1..e3480bfe185c 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -803,8 +803,7 @@ int ib_nl_handle_set_timeout(struct sk_buff *skb,
+ 	int ret;
+ 
+ 	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+-	    !(NETLINK_CB(skb).sk) ||
+-	    !netlink_capable(skb, CAP_NET_ADMIN))
++	    !(NETLINK_CB(skb).sk))
+ 		return -EPERM;
+ 
+ 	ret = nla_parse(tb, LS_NLA_TYPE_MAX - 1, nlmsg_data(nlh),
+@@ -879,8 +878,7 @@ int ib_nl_handle_resolve_resp(struct sk_buff *skb,
+ 	int ret;
+ 
+ 	if ((nlh->nlmsg_flags & NLM_F_REQUEST) ||
+-	    !(NETLINK_CB(skb).sk) ||
+-	    !netlink_capable(skb, CAP_NET_ADMIN))
++	    !(NETLINK_CB(skb).sk))
+ 		return -EPERM;
+ 
+ 	spin_lock_irqsave(&ib_nl_request_lock, flags);
+* Unmerged path include/rdma/rdma_netlink.h
