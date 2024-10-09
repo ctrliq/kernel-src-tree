@@ -1304,7 +1304,8 @@ void wait_lapic_expire(struct kvm_vcpu *vcpu)
 
 	/* __delay is delay_tsc whenever the hardware has TSC, thus always.  */
 	if (guest_tsc < tsc_deadline)
-		__delay(tsc_deadline - guest_tsc);
+		__delay(min(tsc_deadline - guest_tsc,
+			nsec_to_cycles(vcpu, lapic_timer_advance_ns)));
 }
 
 static void apic_update_lvtt(struct kvm_lapic *apic)
