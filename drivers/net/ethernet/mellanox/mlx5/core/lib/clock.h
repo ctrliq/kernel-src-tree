@@ -39,11 +39,13 @@ void mlx5_cleanup_clock(struct mlx5_core_dev *mdev);
 static inline ktime_t mlx5_timecounter_cyc2time(struct mlx5_clock *clock,
 						u64 timestamp)
 {
+	unsigned int seq;
 	u64 nsec;
 
-	read_lock(&clock->lock);
-	nsec = timecounter_cyc2time(&clock->tc, timestamp);
-	read_unlock(&clock->lock);
+	do {
+		seq = read_seqbegin(&clock->lock);
+		nsec = timecounter_cyc2time(&clock->tc, timestamp);
+	} while (read_seqretry(&clock->lock, seq));
 
 	return ns_to_ktime(nsec);
 }
