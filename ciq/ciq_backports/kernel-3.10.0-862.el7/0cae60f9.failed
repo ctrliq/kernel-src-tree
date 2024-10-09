@@ -1,0 +1,117 @@
+sysfs: rename sysfs_assoc_lock and explain what it's about
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] sysfs: rename sysfs_assoc_lock and explain what it's about ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 99.15%
+commit-author Tejun Heo <tj@kernel.org>
+commit 0cae60f91494e34a0c5391f1455f825d5849b05f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0cae60f9.failed
+
+sysfs_assoc_lock is an odd piece of locking.  In general, whoever owns
+a kobject is responsible for synchronizing sysfs operations and sysfs
+proper assumes that, for example, removal won't race with any other
+operation; however, this doesn't work for symlinking because an entity
+performing symlink doesn't usually own the target kobject and thus has
+no control over its removal.
+
+sysfs_assoc_lock synchronizes symlink operations against kobj->sd
+disassociation so that symlink code doesn't end up dereferencing
+already freed sysfs_dirent by racing with removal of the target
+kobject.
+
+This is quite obscure and the generic name of the lock and lack of
+comments make it difficult to understand its role.  Let's rename it to
+sysfs_symlink_target_lock and add comments explaining what's going on.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 0cae60f91494e34a0c5391f1455f825d5849b05f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/symlink.c
+diff --cc fs/sysfs/symlink.c
+index 9fab2e7f7357,1a23681b8179..000000000000
+--- a/fs/sysfs/symlink.c
++++ b/fs/sysfs/symlink.c
+@@@ -155,11 -142,17 +157,25 @@@ void sysfs_delete_link(struct kobject *
+  			const char *name)
+  {
+  	const void *ns = NULL;
+++<<<<<<< HEAD
+ +	spin_lock(&sysfs_assoc_lock);
+ +	if (targ->sd && sysfs_ns_type(kobj->sd))
+ +		ns = targ->sd->s_ns;
+ +	spin_unlock(&sysfs_assoc_lock);
+ +	sysfs_hash_and_remove(kobj->sd, ns, name);
+++=======
++ 
++ 	/*
++ 	 * We don't own @target and it may be removed at any time.
++ 	 * Synchronize using sysfs_symlink_target_lock.  See
++ 	 * sysfs_remove_dir() for details.
++ 	 */
++ 	spin_lock(&sysfs_symlink_target_lock);
++ 	if (targ->sd)
++ 		ns = targ->sd->s_ns;
++ 	spin_unlock(&sysfs_symlink_target_lock);
++ 	sysfs_hash_and_remove(kobj->sd, name, ns);
+++>>>>>>> 0cae60f91494 (sysfs: rename sysfs_assoc_lock and explain what it's about)
+  }
+  
+  /**
+diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
+index fd502d3fc9fc..95eadabb994d 100644
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -26,7 +26,7 @@
+ #include "sysfs.h"
+ 
+ DEFINE_MUTEX(sysfs_mutex);
+-DEFINE_SPINLOCK(sysfs_assoc_lock);
++DEFINE_SPINLOCK(sysfs_symlink_target_lock);
+ 
+ #define to_sysfs_dirent(X) rb_entry((X), struct sysfs_dirent, s_rb)
+ 
+@@ -854,9 +854,21 @@ void sysfs_remove_dir(struct kobject * kobj)
+ {
+ 	struct sysfs_dirent *sd = kobj->sd;
+ 
+-	spin_lock(&sysfs_assoc_lock);
++	/*
++	 * In general, kboject owner is responsible for ensuring removal
++	 * doesn't race with other operations and sysfs doesn't provide any
++	 * protection; however, when @kobj is used as a symlink target, the
++	 * symlinking entity usually doesn't own @kobj and thus has no
++	 * control over removal.  @kobj->sd may be removed anytime and
++	 * symlink code may end up dereferencing an already freed sd.
++	 *
++	 * sysfs_symlink_target_lock synchronizes @kobj->sd disassociation
++	 * against symlink operations so that symlink code can safely
++	 * dereference @kobj->sd.
++	 */
++	spin_lock(&sysfs_symlink_target_lock);
+ 	kobj->sd = NULL;
+-	spin_unlock(&sysfs_assoc_lock);
++	spin_unlock(&sysfs_symlink_target_lock);
+ 
+ 	__sysfs_remove_dir(sd);
+ }
+* Unmerged path fs/sysfs/symlink.c
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index e18c3f38727c..092a4c14ec23 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -156,7 +156,7 @@ extern struct kmem_cache *sysfs_dir_cachep;
+  * dir.c
+  */
+ extern struct mutex sysfs_mutex;
+-extern spinlock_t sysfs_assoc_lock;
++extern spinlock_t sysfs_symlink_target_lock;
+ extern const struct dentry_operations sysfs_dentry_ops;
+ 
+ extern const struct file_operations sysfs_dir_operations;
