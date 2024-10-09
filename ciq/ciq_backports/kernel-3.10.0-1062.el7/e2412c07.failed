@@ -1,0 +1,344 @@
+vhost_net: fix possible infinite loop
+
+jira LE-1907
+cve CVE-2019-3900
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit e2412c07f8f3040593dfb88207865a3cd58680c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e2412c07.failed
+
+When the rx buffer is too small for a packet, we will discard the vq
+descriptor and retry it for the next packet:
+
+while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk,
+					      &busyloop_intr))) {
+...
+	/* On overrun, truncate and discard */
+	if (unlikely(headcount > UIO_MAXIOV)) {
+		iov_iter_init(&msg.msg_iter, READ, vq->iov, 1, 1);
+		err = sock->ops->recvmsg(sock, &msg,
+					 1, MSG_DONTWAIT | MSG_TRUNC);
+		pr_debug("Discarded rx packet: len %zd\n", sock_len);
+		continue;
+	}
+...
+}
+
+This makes it possible to trigger a infinite while..continue loop
+through the co-opreation of two VMs like:
+
+1) Malicious VM1 allocate 1 byte rx buffer and try to slow down the
+   vhost process as much as possible e.g using indirect descriptors or
+   other.
+2) Malicious VM2 generate packets to VM1 as fast as possible
+
+Fixing this by checking against weight at the end of RX and TX
+loop. This also eliminate other similar cases when:
+
+- userspace is consuming the packets in the meanwhile
+- theoretical TOCTOU attack if guest moving avail index back and forth
+  to hit the continue after vhost find guest just add new buffers
+
+This addresses CVE-2019-3900.
+
+Fixes: d8316f3991d20 ("vhost: fix total length when packets are too short")
+Fixes: 3a4d5c94e9593 ("vhost_net: a kernel-level virtio server")
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Reviewed-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit e2412c07f8f3040593dfb88207865a3cd58680c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/net.c
+diff --cc drivers/vhost/net.c
+index 90b124ca16a4,2d9df786a9d3..000000000000
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@@ -399,39 -770,109 +399,138 @@@ static void handle_tx(struct vhost_net 
+  	};
+  	size_t len, total_len = 0;
+  	int err;
+++<<<<<<< HEAD
+ +	size_t hdr_size;
+ +	struct socket *sock;
+++=======
++ 	int sent_pkts = 0;
++ 	bool sock_can_batch = (sock->sk->sk_sndbuf == INT_MAX);
++ 
++ 	do {
++ 		bool busyloop_intr = false;
++ 
++ 		if (nvq->done_idx == VHOST_NET_BATCH)
++ 			vhost_tx_batch(net, nvq, sock, &msg);
++ 
++ 		head = get_tx_bufs(net, nvq, &msg, &out, &in, &len,
++ 				   &busyloop_intr);
++ 		/* On error, stop handling until the next kick. */
++ 		if (unlikely(head < 0))
++ 			break;
++ 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
++ 		if (head == vq->num) {
++ 			if (unlikely(busyloop_intr)) {
++ 				vhost_poll_queue(&vq->poll);
++ 			} else if (unlikely(vhost_enable_notify(&net->dev,
++ 								vq))) {
++ 				vhost_disable_notify(&net->dev, vq);
++ 				continue;
++ 			}
++ 			break;
++ 		}
++ 
++ 		total_len += len;
++ 
++ 		/* For simplicity, TX batching is only enabled if
++ 		 * sndbuf is unlimited.
++ 		 */
++ 		if (sock_can_batch) {
++ 			err = vhost_net_build_xdp(nvq, &msg.msg_iter);
++ 			if (!err) {
++ 				goto done;
++ 			} else if (unlikely(err != -ENOSPC)) {
++ 				vhost_tx_batch(net, nvq, sock, &msg);
++ 				vhost_discard_vq_desc(vq, 1);
++ 				vhost_net_enable_vq(net, vq);
++ 				break;
++ 			}
++ 
++ 			/* We can't build XDP buff, go for single
++ 			 * packet path but let's flush batched
++ 			 * packets.
++ 			 */
++ 			vhost_tx_batch(net, nvq, sock, &msg);
++ 			msg.msg_control = NULL;
++ 		} else {
++ 			if (tx_can_batch(vq, total_len))
++ 				msg.msg_flags |= MSG_MORE;
++ 			else
++ 				msg.msg_flags &= ~MSG_MORE;
++ 		}
++ 
++ 		/* TODO: Check specific error and bomb out unless ENOBUFS? */
++ 		err = sock->ops->sendmsg(sock, &msg, len);
++ 		if (unlikely(err < 0)) {
++ 			vhost_discard_vq_desc(vq, 1);
++ 			vhost_net_enable_vq(net, vq);
++ 			break;
++ 		}
++ 		if (err != len)
++ 			pr_debug("Truncated TX packet: len %d != %zd\n",
++ 				 err, len);
++ done:
++ 		vq->heads[nvq->done_idx].id = cpu_to_vhost32(vq, head);
++ 		vq->heads[nvq->done_idx].len = 0;
++ 		++nvq->done_idx;
++ 	} while (likely(!vhost_exceeds_weight(vq, ++sent_pkts, total_len)));
++ 
++ 	vhost_tx_batch(net, nvq, sock, &msg);
++ }
++ 
++ static void handle_tx_zerocopy(struct vhost_net *net, struct socket *sock)
++ {
++ 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
++ 	struct vhost_virtqueue *vq = &nvq->vq;
++ 	unsigned out, in;
++ 	int head;
++ 	struct msghdr msg = {
++ 		.msg_name = NULL,
++ 		.msg_namelen = 0,
++ 		.msg_control = NULL,
++ 		.msg_controllen = 0,
++ 		.msg_flags = MSG_DONTWAIT,
++ 	};
++ 	struct tun_msg_ctl ctl;
++ 	size_t len, total_len = 0;
++ 	int err;
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  	struct vhost_net_ubuf_ref *uninitialized_var(ubufs);
+ -	bool zcopy_used;
+ +	bool zcopy, zcopy_used;
+  	int sent_pkts = 0;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&vq->mutex);
+ +	sock = vq->private_data;
+ +	if (!sock)
+ +		goto out;
+ +
+ +	if (!vq_iotlb_prefetch(vq))
+ +		goto out;
+ +
+ +	vhost_disable_notify(&net->dev, vq);
+ +
+ +	hdr_size = nvq->vhost_hlen;
+ +	zcopy = nvq->ubufs;
+ +
+ +	for (;;) {
+++=======
++ 	do {
++ 		bool busyloop_intr;
++ 
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  		/* Release DMAs done buffers first */
+ -		vhost_zerocopy_signal_used(net, vq);
+ +		if (zcopy)
+ +			vhost_zerocopy_signal_used(net, vq);
+  
+ -		busyloop_intr = false;
+ -		head = get_tx_bufs(net, nvq, &msg, &out, &in, &len,
+ -				   &busyloop_intr);
+ +		/* If more outstanding DMAs, queue the work.
+ +		 * Handle upend_idx wrap around
+ +		 */
+ +		if (unlikely(vhost_exceeds_maxpend(net)))
+ +			break;
+ +
+ +		head = vhost_net_tx_get_vq_desc(net, vq, vq->iov,
+ +						ARRAY_SIZE(vq->iov),
+ +						&out, &in);
+  		/* On error, stop handling until the next kick. */
+  		if (unlikely(head < 0))
+  			break;
+@@@ -520,12 -941,33 +619,42 @@@
+  		else
+  			vhost_zerocopy_signal_used(net, vq);
+  		vhost_net_tx_packet(net);
+++<<<<<<< HEAD
+ +		if (unlikely(total_len >= VHOST_NET_WEIGHT) ||
+ +		    unlikely(++sent_pkts >= VHOST_NET_PKT_WEIGHT(vq))) {
+ +			vhost_poll_queue(&vq->poll);
+ +			break;
+ +		}
+ +	}
+++=======
++ 	} while (likely(!vhost_exceeds_weight(vq, ++sent_pkts, total_len)));
++ }
++ 
++ /* Expects to be always run from workqueue - which acts as
++  * read-size critical section for our kind of RCU. */
++ static void handle_tx(struct vhost_net *net)
++ {
++ 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
++ 	struct vhost_virtqueue *vq = &nvq->vq;
++ 	struct socket *sock;
++ 
++ 	mutex_lock_nested(&vq->mutex, VHOST_NET_VQ_TX);
++ 	sock = vq->private_data;
++ 	if (!sock)
++ 		goto out;
++ 
++ 	if (!vq_iotlb_prefetch(vq))
++ 		goto out;
++ 
++ 	vhost_disable_notify(&net->dev, vq);
++ 	vhost_net_disable_vq(net, vq);
++ 
++ 	if (vhost_sock_zcopy(sock))
++ 		handle_tx_zerocopy(net, sock);
++ 	else
++ 		handle_tx_copy(net, sock);
++ 
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  out:
+  	mutex_unlock(&vq->mutex);
+  }
+@@@ -734,7 -1139,11 +863,15 @@@ static void handle_rx(struct vhost_net 
+  		vq->log : NULL;
+  	mergeable = vhost_has_feature(vq, VIRTIO_NET_F_MRG_RXBUF);
+  
+++<<<<<<< HEAD
+ +	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
+++=======
++ 	do {
++ 		sock_len = vhost_net_rx_peek_head_len(net, sock->sk,
++ 						      &busyloop_intr);
++ 		if (!sock_len)
++ 			break;
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  		sock_len += sock_hlen;
+  		vhost_len = sock_len + vhost_hlen;
+  		headcount = get_rx_bufs(vq, vq->heads + nvq->done_idx,
+@@@ -792,28 -1213,29 +929,37 @@@
+  		}
+  		/* TODO: Should check and handle checksum. */
+  
+ -		num_buffers = cpu_to_vhost16(vq, headcount);
+ +		hdr.num_buffers = cpu_to_vhost16(vq, headcount);
+  		if (likely(mergeable) &&
+ -		    copy_to_iter(&num_buffers, sizeof num_buffers,
+ -				 &fixup) != sizeof num_buffers) {
+ +		    memcpy_toiovecend(nvq->hdr, (void *)&hdr.num_buffers,
+ +				      offsetof(typeof(hdr), num_buffers),
+ +				      sizeof hdr.num_buffers)) {
+  			vq_err(vq, "Failed num_buffers write");
+  			vhost_discard_vq_desc(vq, headcount);
+ -			goto out;
+ +			break;
+  		}
+  		nvq->done_idx += headcount;
+ -		if (nvq->done_idx > VHOST_NET_BATCH)
+ -			vhost_net_signal_used(nvq);
+ +		if (nvq->done_idx > VHOST_RX_BATCH)
+ +			vhost_rx_signal_used(nvq);
+  		if (unlikely(vq_log))
+ -			vhost_log_write(vq, vq_log, log, vhost_len,
+ -					vq->iov, in);
+ +			vhost_log_write(vq, vq_log, log, vhost_len);
+  		total_len += vhost_len;
+++<<<<<<< HEAD
+ +		if (unlikely(total_len >= VHOST_NET_WEIGHT)) {
+ +			vhost_poll_queue(&vq->poll);
+ +			break;
+ +		}
+ +	}
+++=======
++ 	} while (likely(!vhost_exceeds_weight(vq, ++recv_pkts, total_len)));
++ 
++ 	if (unlikely(busyloop_intr))
++ 		vhost_poll_queue(&vq->poll);
++ 	else if (!sock_len)
++ 		vhost_net_enable_vq(net, vq);
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  out:
+ -	vhost_net_signal_used(nvq);
+ +	vhost_rx_signal_used(nvq);
+  	mutex_unlock(&vq->mutex);
+  }
+  
+@@@ -883,20 -1317,22 +1029,26 @@@ static int vhost_net_open(struct inode 
+  		n->vqs[i].ubuf_info = NULL;
+  		n->vqs[i].upend_idx = 0;
+  		n->vqs[i].done_idx = 0;
+ -		n->vqs[i].batched_xdp = 0;
+  		n->vqs[i].vhost_hlen = 0;
+  		n->vqs[i].sock_hlen = 0;
+ -		n->vqs[i].rx_ring = NULL;
+ -		vhost_net_buf_init(&n->vqs[i].rxq);
+  	}
+++<<<<<<< HEAD
+ +	r = vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
+ +	if (r < 0) {
+ +		kfree(n);
+ +		kfree(vqs);
+ +		return r;
+ +	}
+++=======
++ 	vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX,
++ 		       UIO_MAXIOV + VHOST_NET_BATCH,
++ 		       VHOST_NET_PKT_WEIGHT, VHOST_NET_WEIGHT);
+++>>>>>>> e2412c07f8f3 (vhost_net: fix possible infinite loop)
+  
+ -	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, EPOLLOUT, dev);
+ -	vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, EPOLLIN, dev);
+ +	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, POLLOUT, dev);
+ +	vhost_poll_init(n->poll + VHOST_NET_VQ_RX, handle_rx_net, POLLIN, dev);
+  
+  	f->private_data = n;
+ -	n->page_frag.page = NULL;
+ -	n->refcnt_bias = 0;
+  
+  	return 0;
+  }
+* Unmerged path drivers/vhost/net.c
