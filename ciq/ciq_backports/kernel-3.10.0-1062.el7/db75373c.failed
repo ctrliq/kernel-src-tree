@@ -1,0 +1,171 @@
+net/mlx5e: Recover Send Queue (SQ) from error state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Recover Send Queue (SQ) from error state (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.92%
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit db75373c91b0cfb6a68ad6ae88721e4e21ae6261
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/db75373c.failed
+
+An error TX completion (CQE) which arrived on a specific SQ indicates
+that this SQ got moved by the hardware to error state, which means all
+pending and incoming TX requests are dropped or will be dropped and no
+further "Good" CQEs will be generated for that SQ.
+
+Before this patch TX completions (CQEs) were not monitored and were
+handled as a regular CQE. This caused the SQ to stay in an error state,
+making it useless for xmiting new packets.
+
+Mitigation plan:
+In case of an error completion, schedule a recovery work which would do
+the following:
+- Mark the TXQ as DRV_XOFF to disable new packets to arrive from the
+  stack
+- NAPI to flush all pending SQ WQEs (via flush_in_error_en bit) to
+  release SW and HW resources(SKB, DMA, etc) and have the SQ and CQ
+  consumer/producer indices synced.
+- Modify the SQ state ERR -> RST -> RDY (restart the SQ).
+- Reactivate the SQ and reset SQ cc and pc
+
+If we identify two consecutive requests for SQ recover in less than
+500 msecs, drop the recover request to avoid CPU overload, as this
+scenario most likely happened due to a severe repeated bug.
+
+In addition, add SQ recover SW counter to monitor successful recoveries.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit db75373c91b0cfb6a68ad6ae88721e4e21ae6261)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 679d757631ad,1b48dec67abf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -977,7 -975,7 +978,11 @@@ static int mlx5e_alloc_txqsq(struct mlx
+  	sq->txq_ix    = txq_ix;
+  	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
+  	sq->min_inline_mode = params->tx_min_inline_mode;
+++<<<<<<< HEAD
+ +	sq->stats     = &c->priv->channel_stats[c->ix].sq[tc];
+++=======
++ 	INIT_WORK(&sq->recover.recover_work, mlx5e_sq_recover);
+++>>>>>>> db75373c91b0 (net/mlx5e: Recover Send Queue (SQ) from error state)
+  	if (MLX5_IPSEC_DEV(c->priv->mdev))
+  		set_bit(MLX5E_SQ_STATE_IPSEC, &sq->state);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 62b38cfe3313..286701a10f42 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -122,6 +122,7 @@
+ #define MLX5E_MAX_NUM_SQS              (MLX5E_MAX_NUM_CHANNELS * MLX5E_MAX_NUM_TC)
+ #define MLX5E_TX_CQ_POLL_BUDGET        128
+ #define MLX5E_UPDATE_STATS_INTERVAL    200 /* msecs */
++#define MLX5E_SQ_RECOVER_MIN_INTERVAL  500 /* msecs */
+ 
+ #define MLX5E_ICOSQ_MAX_WQEBBS \
+ 	(DIV_ROUND_UP(sizeof(struct mlx5e_umr_wqe), MLX5_SEND_WQE_BB))
+@@ -334,6 +335,7 @@ struct mlx5e_sq_dma {
+ 
+ enum {
+ 	MLX5E_SQ_STATE_ENABLED,
++	MLX5E_SQ_STATE_RECOVERING,
+ 	MLX5E_SQ_STATE_IPSEC,
+ };
+ 
+@@ -380,6 +382,10 @@ struct mlx5e_txqsq {
+ 	struct mlx5e_channel      *channel;
+ 	int                        txq_ix;
+ 	u32                        rate_limit;
++	struct mlx5e_txqsq_recover {
++		struct work_struct         recover_work;
++		u64                        last_recover;
++	} recover;
+ } ____cacheline_aligned_in_smp;
+ 
+ struct mlx5e_xdpsq {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 8721ed97ba96..93d16715af37 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -61,6 +61,7 @@ static const struct counter_desc sw_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_queue_dropped) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xmit_more) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_cqe_err) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_recover) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_wqe_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_buff_alloc_err) },
+@@ -153,6 +154,7 @@ static void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
+ 			s->tx_queue_wake	+= sq_stats->wake;
+ 			s->tx_queue_dropped	+= sq_stats->dropped;
+ 			s->tx_cqe_err		+= sq_stats->cqe_err;
++			s->tx_recover		+= sq_stats->recover;
+ 			s->tx_xmit_more		+= sq_stats->xmit_more;
+ 			s->tx_csum_partial_inner += sq_stats->csum_partial_inner;
+ 			s->tx_csum_none		+= sq_stats->csum_none;
+@@ -1104,6 +1106,7 @@ static const struct counter_desc sq_stats_desc[] = {
+ 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, dropped) },
+ 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, xmit_more) },
+ 	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, cqe_err) },
++	{ MLX5E_DECLARE_TX_STAT(struct mlx5e_sq_stats, recover) },
+ };
+ 
+ static const struct counter_desc ch_stats_desc[] = {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 43dc808684c9..53111a2df587 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -79,6 +79,7 @@ struct mlx5e_sw_stats {
+ 	u64 tx_queue_dropped;
+ 	u64 tx_xmit_more;
+ 	u64 tx_cqe_err;
++	u64 tx_recover;
+ 	u64 rx_wqe_err;
+ 	u64 rx_mpwqe_filler;
+ 	u64 rx_buff_alloc_err;
+@@ -199,6 +200,7 @@ struct mlx5e_sq_stats {
+ 	u64 wake;
+ 	u64 dropped;
+ 	u64 cqe_err;
++	u64 recover;
+ };
+ 
+ struct mlx5e_ch_stats {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 31cc86df395a..89f8d46b9c4e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@ -471,9 +471,13 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
+ 
+ 		if (unlikely(cqe->op_own >> 4 == MLX5_CQE_REQ_ERR)) {
+-			if (!sq->stats.cqe_err)
++			if (!test_and_set_bit(MLX5E_SQ_STATE_RECOVERING,
++					      &sq->state)) {
+ 				mlx5e_dump_error_cqe(sq,
+ 						     (struct mlx5_err_cqe *)cqe);
++				queue_work(cq->channel->priv->wq,
++					   &sq->recover.recover_work);
++			}
+ 			sq->stats.cqe_err++;
+ 		}
+ 
+@@ -530,7 +534,9 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+ 	netdev_tx_completed_queue(sq->txq, npkts, nbytes);
+ 
+ 	if (netif_tx_queue_stopped(sq->txq) &&
+-	    mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc, MLX5E_SQ_STOP_ROOM)) {
++	    mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc,
++				   MLX5E_SQ_STOP_ROOM) &&
++	    !test_bit(MLX5E_SQ_STATE_RECOVERING, &sq->state)) {
+ 		netif_tx_wake_queue(sq->txq);
+ 		sq->stats->wake++;
+ 	}
