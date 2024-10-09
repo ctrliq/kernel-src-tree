@@ -773,7 +773,6 @@ static int __init usbip_core_init(void)
 {
 	int ret;
 
-	pr_info(DRIVER_DESC " v" USBIP_VERSION "\n");
 	ret = usbip_init_eh();
 	if (ret)
 		return ret;
@@ -793,4 +792,3 @@ module_exit(usbip_core_exit);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION(USBIP_VERSION);
