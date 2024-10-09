@@ -1,0 +1,239 @@
+x86/mm/64: Initialize CR4.PCIDE early
+
+jira LE-1907
+cve CVE-2017-5754
+cve CVE-2017-5753
+cve CVE-2017-5715
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm/64: Initialize CR4.PCIDE early (Andrea Arcangeli) [1519801 1519798 1519786] {CVE-2017-5715 CVE-2017-5753 CVE-2017-5754}
+Rebuild_FUZZ: 94.29%
+commit-author Andy Lutomirski <luto@kernel.org>
+commit c7ad5ad297e644601747d6dbee978bf85e14f7bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c7ad5ad2.failed
+
+cpu_init() is weird: it's called rather late (after early
+identification and after most MMU state is initialized) on the boot
+CPU but is called extremely early (before identification) on secondary
+CPUs.  It's called just late enough on the boot CPU that its CR4 value
+isn't propagated to mmu_cr4_features.
+
+Even if we put CR4.PCIDE into mmu_cr4_features, we'd hit two
+problems.  First, we'd crash in the trampoline code.  That's
+fixable, and I tried that.  It turns out that mmu_cr4_features is
+totally ignored by secondary_start_64(), though, so even with the
+trampoline code fixed, it wouldn't help.
+
+This means that we don't currently have CR4.PCIDE reliably initialized
+before we start playing with cpu_tlbstate.  This is very fragile and
+tends to cause boot failures if I make even small changes to the TLB
+handling code.
+
+Make it more robust: initialize CR4.PCIDE earlier on the boot CPU
+and propagate it to secondary CPUs in start_secondary().
+
+( Yes, this is ugly.  I think we should have improved mmu_cr4_features
+  to actually control CR4 during secondary bootup, but that would be
+  fairly intrusive at this stage. )
+
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Reported-by: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Tested-by: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Cc: Borislav Petkov <bpetkov@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-kernel@vger.kernel.org
+Fixes: 660da7c9228f ("x86/mm: Enable CR4.PCIDE on supported systems")
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c7ad5ad297e644601747d6dbee978bf85e14f7bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/setup.c
+#	arch/x86/mm/init.c
+diff --cc arch/x86/kernel/cpu/common.c
+index 3eec1147ce1e,775f10100d7f..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -202,6 -168,24 +202,27 @@@ static int __init x86_mpx_setup(char *s
+  }
+  __setup("nompx", x86_mpx_setup);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_64
++ static int __init x86_nopcid_setup(char *s)
++ {
++ 	/* nopcid doesn't accept parameters */
++ 	if (s)
++ 		return -EINVAL;
++ 
++ 	/* do not emit a message if the feature is not present */
++ 	if (!boot_cpu_has(X86_FEATURE_PCID))
++ 		return 0;
++ 
++ 	setup_clear_cpu_cap(X86_FEATURE_PCID);
++ 	pr_info("nopcid: PCID feature disabled\n");
++ 	return 0;
++ }
++ early_param("nopcid", x86_nopcid_setup);
++ #endif
++ 
+++>>>>>>> c7ad5ad297e6 (x86/mm/64: Initialize CR4.PCIDE early)
+  static int __init x86_noinvpcid_setup(char *s)
+  {
+  	/* noinvpcid doesn't accept parameters */
+@@@ -339,16 -315,66 +360,65 @@@ __setup("nosmap", setup_disable_smap)
+  
+  static __always_inline void setup_smap(struct cpuinfo_x86 *c)
+  {
+ -	unsigned long eflags = native_save_fl();
+ +	unsigned long eflags;
+  
+  	/* This should have been cleared long ago */
+ +	raw_local_save_flags(eflags);
+  	BUG_ON(eflags & X86_EFLAGS_AC);
+  
+ -	if (cpu_has(c, X86_FEATURE_SMAP)) {
+ -#ifdef CONFIG_X86_SMAP
+ -		cr4_set_bits(X86_CR4_SMAP);
+ -#else
+ -		cr4_clear_bits(X86_CR4_SMAP);
+ -#endif
+ -	}
+ +	if (cpu_has(c, X86_FEATURE_SMAP))
+ +		set_in_cr4(X86_CR4_SMAP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Protection Keys are not available in 32-bit mode.
++  */
++ static bool pku_disabled;
++ 
++ static __always_inline void setup_pku(struct cpuinfo_x86 *c)
++ {
++ 	/* check the boot processor, plus compile options for PKU: */
++ 	if (!cpu_feature_enabled(X86_FEATURE_PKU))
++ 		return;
++ 	/* checks the actual processor's cpuid bits: */
++ 	if (!cpu_has(c, X86_FEATURE_PKU))
++ 		return;
++ 	if (pku_disabled)
++ 		return;
++ 
++ 	cr4_set_bits(X86_CR4_PKE);
++ 	/*
++ 	 * Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE
++ 	 * cpuid bit to be set.  We need to ensure that we
++ 	 * update that bit in this CPU's "cpu_info".
++ 	 */
++ 	get_cpu_cap(c);
++ }
++ 
++ #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++ static __init int setup_disable_pku(char *arg)
++ {
++ 	/*
++ 	 * Do not clear the X86_FEATURE_PKU bit.  All of the
++ 	 * runtime checks are against OSPKE so clearing the
++ 	 * bit does nothing.
++ 	 *
++ 	 * This way, we will see "pku" in cpuinfo, but not
++ 	 * "ospke", which is exactly what we want.  It shows
++ 	 * that the CPU has PKU, but the OS has not enabled it.
++ 	 * This happens to be exactly how a system would look
++ 	 * if we disabled the config option.
++ 	 */
++ 	pr_info("x86: 'nopku' specified, disabling Memory Protection Keys\n");
++ 	pku_disabled = true;
++ 	return 1;
++ }
++ __setup("nopku", setup_disable_pku);
++ #endif /* CONFIG_X86_64 */
++ 
+++>>>>>>> c7ad5ad297e6 (x86/mm/64: Initialize CR4.PCIDE early)
+  /*
+   * Some CPU features depend on higher CPUID levels, which may not always
+   * be available due to CPUID level capping or broken virtualization
+diff --cc arch/x86/kernel/setup.c
+index dcb7e8a78aab,0957dd73d127..000000000000
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@@ -1247,12 -1171,20 +1247,25 @@@ void __init setup_arch(char **cmdline_p
+  
+  	init_mem_mapping();
+  
+ -	idt_setup_early_pf();
+ +	early_trap_pf_init();
+  
+++<<<<<<< HEAD
+ +	setup_real_mode();
+++=======
++ 	/*
++ 	 * Update mmu_cr4_features (and, indirectly, trampoline_cr4_features)
++ 	 * with the current CR4 value.  This may not be necessary, but
++ 	 * auditing all the early-boot CR4 manipulation would be needed to
++ 	 * rule it out.
++ 	 *
++ 	 * Mask off features that don't work outside long mode (just
++ 	 * PCIDE for now).
++ 	 */
++ 	mmu_cr4_features = __read_cr4() & ~X86_CR4_PCIDE;
+++>>>>>>> c7ad5ad297e6 (x86/mm/64: Initialize CR4.PCIDE early)
+  
+  	memblock_set_current_limit(get_max_mapped());
+ +	dma_contiguous_reserve(0);
+  
+  	/*
+  	 * NOTE: On x86-32, only from this point on, fixmaps are ready for use.
+diff --cc arch/x86/mm/init.c
+index 383740133cb4,af5c1ed21d43..000000000000
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@@ -18,6 -18,15 +18,18 @@@
+  #include <asm/dma.h>		/* for MAX_DMA_PFN */
+  #include <asm/microcode.h>
+  #include <asm/kaslr.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/hypervisor.h>
++ #include <asm/cpufeature.h>
++ 
++ /*
++  * We need to define the tracepoints somewhere, and tlb.c
++  * is only compied when SMP=y.
++  */
++ #define CREATE_TRACE_POINTS
++ #include <trace/events/tlb.h>
+++>>>>>>> c7ad5ad297e6 (x86/mm/64: Initialize CR4.PCIDE early)
+  
+  #include "mm_internal.h"
+  
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/setup.c
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 92e0aea4e8c8..ee88c7757091 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -198,10 +198,12 @@ static int enable_start_cpu0;
+ static void notrace start_secondary(void *unused)
+ {
+ 	/*
+-	 * Don't put *anything* before cpu_init(), SMP booting is too
+-	 * fragile that we want to limit the things done here to the
+-	 * most necessary things.
++	 * Don't put *anything* except direct CPU state initialization
++	 * before cpu_init(), SMP booting is too fragile that we want to
++	 * limit the things done here to the most necessary things.
+ 	 */
++	if (boot_cpu_has(X86_FEATURE_PCID))
++		__write_cr4(__read_cr4() | X86_CR4_PCIDE);
+ 	cpu_init();
+ 	x86_cpuinit.early_percpu_clock_init();
+ 	preempt_disable();
+* Unmerged path arch/x86/mm/init.c
