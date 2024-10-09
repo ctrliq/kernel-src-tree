@@ -1,0 +1,705 @@
+IB/uverbs: Build the specs into a radix tree at runtime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 9ed3e5f447723a41de6bcc29633e9f7e6246d2f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9ed3e5f4.failed
+
+This radix tree datastructure is intended to replace the 'hash' structure
+used today for parsing ioctl methods during system calls. This first
+commit introduces the structure and builds it from the existing .rodata
+descriptions.
+
+The so-called hash arrangement is actually a 5 level open coded radix tree.
+This new version uses a 3 level radix tree built using the radix tree
+library.
+
+Overall this is much less code and much easier to build as the radix tree
+API allows for dynamic modification during the building. There is a small
+memory penalty to pay for this, but since the radix tree is allocated on
+a per device basis, a few kb of RAM seems immaterial considering the
+gained simplicity.
+
+The radix tree is similar to the existing tree, but also has a 'attr_bkey'
+concept, which is a small value'd index for each method attribute. This is
+used to simplify and improve performance of everything in the next
+patches.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+(cherry picked from commit 9ed3e5f447723a41de6bcc29633e9f7e6246d2f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/Makefile
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/Makefile
+index a4e902560c36,d934cf617841..000000000000
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@@ -33,4 -35,7 +33,11 @@@ ib_ucm-y :=			ucm.
+  
+  ib_uverbs-y :=			uverbs_main.o uverbs_cmd.o uverbs_marshall.o \
+  				rdma_core.o uverbs_std_types.o uverbs_ioctl.o \
+++<<<<<<< HEAD
+ +				uverbs_ioctl_merge.o uverbs_std_types_cq.o
+++=======
++ 				uverbs_ioctl_merge.o uverbs_std_types_cq.o \
++ 				uverbs_std_types_flow_action.o uverbs_std_types_dm.o \
++ 				uverbs_std_types_mr.o uverbs_std_types_counters.o \
++ 				uverbs_uapi.o
+++>>>>>>> 9ed3e5f44772 (IB/uverbs: Build the specs into a radix tree at runtime)
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,55a687285b1d..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -43,8 -43,10 +43,10 @@@
+  #include <rdma/ib_verbs.h>
+  #include <linux/mutex.h>
+  
++ struct ib_uverbs_device;
++ 
+  int uverbs_ns_idx(u16 *id, unsigned int ns_count);
+ -const struct uverbs_object_spec *uverbs_get_object(struct ib_uverbs_file *ufile,
+ +const struct uverbs_object_spec *uverbs_get_object(const struct ib_device *ibdev,
+  						   uint16_t object);
+  const struct uverbs_method_spec *uverbs_get_method(const struct uverbs_object_spec *object,
+  						   uint16_t method);
+@@@ -113,4 -112,55 +115,58 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ struct uverbs_api_object {
++ 	const struct uverbs_obj_type *type_attrs;
++ 	const struct uverbs_obj_type_class *type_class;
++ };
++ 
++ struct uverbs_api_ioctl_method {
++ 	int (__rcu *handler)(struct ib_uverbs_file *ufile,
++ 			     struct uverbs_attr_bundle *ctx);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u8 driver_method:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api_object;
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ };
++ 
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	return radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(
++ 	const struct uverbs_object_tree_def *const *driver_specs,
++ 	enum rdma_driver_id driver_id);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ 
+++>>>>>>> 9ed3e5f44772 (IB/uverbs: Build the specs into a radix tree at runtime)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 9b53f7b4a4a8,0fab083cafef..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -160,7 -174,9 +160,8 @@@ static void ib_uverbs_release_dev(struc
+  	struct ib_uverbs_device *dev =
+  		container_of(kobj, struct ib_uverbs_device, kobj);
+  
++ 	uverbs_destroy_api(dev->uapi);
+  	cleanup_srcu_struct(&dev->disassociate_srcu);
+ -	uverbs_free_spec_tree(dev->specs_root);
+  	kfree(dev);
+  }
+  
+@@@ -1009,6 -995,44 +1010,47 @@@ static DEVICE_ATTR(abi_version, S_IRUGO
+  static CLASS_ATTR_STRING(abi_version, S_IRUGO,
+  			 __stringify(IB_USER_VERBS_ABI_VERSION));
+  
+++<<<<<<< HEAD
+++=======
++ static int ib_uverbs_create_uapi(struct ib_device *device,
++ 				 struct ib_uverbs_device *uverbs_dev)
++ {
++ 	const struct uverbs_object_tree_def **specs;
++ 	struct uverbs_root_spec *specs_root;
++ 	unsigned int num_specs = 1;
++ 	struct uverbs_api *uapi;
++ 	unsigned int i;
++ 
++ 	if (device->driver_specs)
++ 		for (i = 0; device->driver_specs[i]; i++)
++ 			num_specs++;
++ 
++ 	specs = kmalloc_array(num_specs, sizeof(*specs), GFP_KERNEL);
++ 	if (!specs)
++ 		return -ENOMEM;
++ 
++ 	specs[0] = uverbs_default_get_objects();
++ 	if (device->driver_specs)
++ 		for (i = 0; device->driver_specs[i]; i++)
++ 			specs[i+1] = device->driver_specs[i];
++ 
++ 	specs_root = uverbs_alloc_spec_tree(num_specs, specs);
++ 	kfree(specs);
++ 	if (IS_ERR(specs_root))
++ 		return PTR_ERR(specs_root);
++ 
++ 	uapi = uverbs_alloc_api(device->driver_specs, device->driver_id);
++ 	if (IS_ERR(uapi)) {
++ 		uverbs_free_spec_tree(specs_root);
++ 		return PTR_ERR(uapi);
++ 	}
++ 
++ 	uverbs_dev->specs_root = specs_root;
++ 	uverbs_dev->uapi = uapi;
++ 	return 0;
++ }
++ 
+++>>>>>>> 9ed3e5f44772 (IB/uverbs: Build the specs into a radix tree at runtime)
+  static void ib_uverbs_add_one(struct ib_device *device)
+  {
+  	int devnum;
+* Unmerged path drivers/infiniband/core/Makefile
+* Unmerged path drivers/infiniband/core/rdma_core.h
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index cbf36c75d546..20b087760884 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -112,6 +112,7 @@ struct ib_uverbs_device {
+ 	struct list_head			uverbs_file_list;
+ 	struct list_head			uverbs_events_file_list;
+ 	struct uverbs_root_spec			*specs_root;
++	struct uverbs_api			*uapi;
+ };
+ 
+ struct ib_uverbs_event_queue {
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+diff --git a/drivers/infiniband/core/uverbs_uapi.c b/drivers/infiniband/core/uverbs_uapi.c
+new file mode 100644
+index 000000000000..21c0de034511
+--- /dev/null
++++ b/drivers/infiniband/core/uverbs_uapi.c
+@@ -0,0 +1,343 @@
++// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
++/*
++ * Copyright (c) 2017, Mellanox Technologies inc.  All rights reserved.
++ */
++#include <rdma/uverbs_ioctl.h>
++#include <rdma/rdma_user_ioctl.h>
++#include <linux/bitops.h>
++#include "rdma_core.h"
++#include "uverbs.h"
++
++static void *uapi_add_elm(struct uverbs_api *uapi, u32 key, size_t alloc_size)
++{
++	void *elm;
++	int rc;
++
++	if (key == UVERBS_API_KEY_ERR)
++		return ERR_PTR(-EOVERFLOW);
++
++	elm = kzalloc(alloc_size, GFP_KERNEL);
++	rc = radix_tree_insert(&uapi->radix, key, elm);
++	if (rc) {
++		kfree(elm);
++		return ERR_PTR(rc);
++	}
++
++	return elm;
++}
++
++static int uapi_merge_method(struct uverbs_api *uapi,
++			     struct uverbs_api_object *obj_elm, u32 obj_key,
++			     const struct uverbs_method_def *method,
++			     bool is_driver)
++{
++	u32 method_key = obj_key | uapi_key_ioctl_method(method->id);
++	struct uverbs_api_ioctl_method *method_elm;
++	unsigned int i;
++
++	if (!method->attrs)
++		return 0;
++
++	method_elm = uapi_add_elm(uapi, method_key, sizeof(*method_elm));
++	if (IS_ERR(method_elm)) {
++		if (method_elm != ERR_PTR(-EEXIST))
++			return PTR_ERR(method_elm);
++
++		/*
++		 * This occurs when a driver uses ADD_UVERBS_ATTRIBUTES_SIMPLE
++		 */
++		if (WARN_ON(method->handler))
++			return -EINVAL;
++		method_elm = radix_tree_lookup(&uapi->radix, method_key);
++		if (WARN_ON(!method_elm))
++			return -EINVAL;
++	} else {
++		WARN_ON(!method->handler);
++		rcu_assign_pointer(method_elm->handler, method->handler);
++		if (method->handler != uverbs_destroy_def_handler)
++			method_elm->driver_method = is_driver;
++	}
++
++	for (i = 0; i != method->num_attrs; i++) {
++		const struct uverbs_attr_def *attr = (*method->attrs)[i];
++		struct uverbs_api_attr *attr_slot;
++
++		if (!attr)
++			continue;
++
++		/*
++		 * ENUM_IN contains the 'ids' pointer to the driver's .rodata,
++		 * so if it is specified by a driver then it always makes this
++		 * into a driver method.
++		 */
++		if (attr->attr.type == UVERBS_ATTR_TYPE_ENUM_IN)
++			method_elm->driver_method |= is_driver;
++
++		attr_slot =
++			uapi_add_elm(uapi, method_key | uapi_key_attr(attr->id),
++				     sizeof(*attr_slot));
++		/* Attributes are not allowed to be modified by drivers */
++		if (IS_ERR(attr_slot))
++			return PTR_ERR(attr_slot);
++
++		attr_slot->spec = attr->attr;
++	}
++
++	return 0;
++}
++
++static int uapi_merge_tree(struct uverbs_api *uapi,
++			   const struct uverbs_object_tree_def *tree,
++			   bool is_driver)
++{
++	unsigned int i, j;
++	int rc;
++
++	if (!tree->objects)
++		return 0;
++
++	for (i = 0; i != tree->num_objects; i++) {
++		const struct uverbs_object_def *obj = (*tree->objects)[i];
++		struct uverbs_api_object *obj_elm;
++		u32 obj_key;
++
++		if (!obj)
++			continue;
++
++		obj_key = uapi_key_obj(obj->id);
++		obj_elm = uapi_add_elm(uapi, obj_key, sizeof(*obj_elm));
++		if (IS_ERR(obj_elm)) {
++			if (obj_elm != ERR_PTR(-EEXIST))
++				return PTR_ERR(obj_elm);
++
++			/* This occurs when a driver uses ADD_UVERBS_METHODS */
++			if (WARN_ON(obj->type_attrs))
++				return -EINVAL;
++			obj_elm = radix_tree_lookup(&uapi->radix, obj_key);
++			if (WARN_ON(!obj_elm))
++				return -EINVAL;
++		} else {
++			obj_elm->type_attrs = obj->type_attrs;
++			if (obj->type_attrs) {
++				obj_elm->type_class =
++					obj->type_attrs->type_class;
++				/*
++				 * Today drivers are only permitted to use
++				 * idr_class types. They cannot use FD types
++				 * because we currently have no way to revoke
++				 * the fops pointer after device
++				 * disassociation.
++				 */
++				if (WARN_ON(is_driver &&
++					    obj->type_attrs->type_class !=
++						    &uverbs_idr_class))
++					return -EINVAL;
++			}
++		}
++
++		if (!obj->methods)
++			continue;
++
++		for (j = 0; j != obj->num_methods; j++) {
++			const struct uverbs_method_def *method =
++				(*obj->methods)[j];
++			if (!method)
++				continue;
++
++			rc = uapi_merge_method(uapi, obj_elm, obj_key, method,
++					       is_driver);
++			if (rc)
++				return rc;
++		}
++	}
++
++	return 0;
++}
++
++static int
++uapi_finalize_ioctl_method(struct uverbs_api *uapi,
++			   struct uverbs_api_ioctl_method *method_elm,
++			   u32 method_key)
++{
++	struct radix_tree_iter iter;
++	unsigned int max_bkey = 0;
++	bool single_uobj = false;
++	void __rcu **slot;
++
++	method_elm->destroy_bkey = UVERBS_API_ATTR_BKEY_LEN;
++	radix_tree_for_each_slot (slot, &uapi->radix, &iter,
++				  uapi_key_attrs_start(method_key)) {
++		struct uverbs_api_attr *elm =
++			rcu_dereference_protected(*slot, true);
++		u32 attr_key = iter.index & UVERBS_API_ATTR_KEY_MASK;
++		u32 attr_bkey = uapi_bkey_attr(attr_key);
++		u8 type = elm->spec.type;
++
++		if (uapi_key_attr_to_method(iter.index) !=
++		    uapi_key_attr_to_method(method_key))
++			break;
++
++		if (elm->spec.mandatory)
++			__set_bit(attr_bkey, method_elm->attr_mandatory);
++
++		if (type == UVERBS_ATTR_TYPE_IDR ||
++		    type == UVERBS_ATTR_TYPE_FD) {
++			u8 access = elm->spec.u.obj.access;
++
++			/*
++			 * Verbs specs may only have one NEW/DESTROY, we don't
++			 * have the infrastructure to abort multiple NEW's or
++			 * cope with multiple DESTROY failure.
++			 */
++			if (access == UVERBS_ACCESS_NEW ||
++			    access == UVERBS_ACCESS_DESTROY) {
++				if (WARN_ON(single_uobj))
++					return -EINVAL;
++
++				single_uobj = true;
++				if (WARN_ON(!elm->spec.mandatory))
++					return -EINVAL;
++			}
++
++			if (access == UVERBS_ACCESS_DESTROY)
++				method_elm->destroy_bkey = attr_bkey;
++		}
++
++		max_bkey = max(max_bkey, attr_bkey);
++	}
++
++	method_elm->key_bitmap_len = max_bkey + 1;
++	WARN_ON(method_elm->key_bitmap_len > UVERBS_API_ATTR_BKEY_LEN);
++
++	return 0;
++}
++
++static int uapi_finalize(struct uverbs_api *uapi)
++{
++	struct radix_tree_iter iter;
++	void __rcu **slot;
++	int rc;
++
++	radix_tree_for_each_slot (slot, &uapi->radix, &iter, 0) {
++		struct uverbs_api_ioctl_method *method_elm =
++			rcu_dereference_protected(*slot, true);
++
++		if (uapi_key_is_ioctl_method(iter.index)) {
++			rc = uapi_finalize_ioctl_method(uapi, method_elm,
++							iter.index);
++			if (rc)
++				return rc;
++		}
++	}
++
++	return 0;
++}
++
++void uverbs_destroy_api(struct uverbs_api *uapi)
++{
++	struct radix_tree_iter iter;
++	void __rcu **slot;
++
++	if (!uapi)
++		return;
++
++	radix_tree_for_each_slot (slot, &uapi->radix, &iter, 0) {
++		kfree(rcu_dereference_protected(*slot, true));
++		radix_tree_iter_delete(&uapi->radix, &iter, slot);
++	}
++}
++
++struct uverbs_api *uverbs_alloc_api(
++	const struct uverbs_object_tree_def *const *driver_specs,
++	enum rdma_driver_id driver_id)
++{
++	struct uverbs_api *uapi;
++	int rc;
++
++	uapi = kzalloc(sizeof(*uapi), GFP_KERNEL);
++	if (!uapi)
++		return ERR_PTR(-ENOMEM);
++
++	INIT_RADIX_TREE(&uapi->radix, GFP_KERNEL);
++	uapi->driver_id = driver_id;
++
++	rc = uapi_merge_tree(uapi, uverbs_default_get_objects(), false);
++	if (rc)
++		goto err;
++
++	for (; driver_specs && *driver_specs; driver_specs++) {
++		rc = uapi_merge_tree(uapi, *driver_specs, true);
++		if (rc)
++			goto err;
++	}
++
++	rc = uapi_finalize(uapi);
++	if (rc)
++		goto err;
++
++	return uapi;
++err:
++	if (rc != -ENOMEM)
++		pr_err("Setup of uverbs_api failed, kernel parsing tree description is not valid (%d)??\n",
++		       rc);
++
++	uverbs_destroy_api(uapi);
++	return ERR_PTR(rc);
++}
++
++/*
++ * The pre version is done before destroying the HW objects, it only blocks
++ * off method access. All methods that require the ib_dev or the module data
++ * must test one of these assignments prior to continuing.
++ */
++void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev)
++{
++	struct uverbs_api *uapi = uverbs_dev->uapi;
++	struct radix_tree_iter iter;
++	void __rcu **slot;
++
++	rcu_assign_pointer(uverbs_dev->ib_dev, NULL);
++
++	radix_tree_for_each_slot (slot, &uapi->radix, &iter, 0) {
++		if (uapi_key_is_ioctl_method(iter.index)) {
++			struct uverbs_api_ioctl_method *method_elm =
++				rcu_dereference_protected(*slot, true);
++
++			if (method_elm->driver_method)
++				rcu_assign_pointer(method_elm->handler, NULL);
++		}
++	}
++
++	synchronize_srcu(&uverbs_dev->disassociate_srcu);
++}
++
++/*
++ * Called when a driver disassociates from the ib_uverbs_device. The
++ * assumption is that the driver module will unload after. Replace everything
++ * related to the driver with NULL as a safety measure.
++ */
++void uverbs_disassociate_api(struct uverbs_api *uapi)
++{
++	struct radix_tree_iter iter;
++	void __rcu **slot;
++
++	radix_tree_for_each_slot (slot, &uapi->radix, &iter, 0) {
++		if (uapi_key_is_object(iter.index)) {
++			struct uverbs_api_object *object_elm =
++				rcu_dereference_protected(*slot, true);
++
++			/*
++			 * Some type_attrs are in the driver module. We don't
++			 * bother to keep track of which since there should be
++			 * no use of this after disassociate.
++			 */
++			object_elm->type_attrs = NULL;
++		} else if (uapi_key_is_attr(iter.index)) {
++			struct uverbs_api_attr *elm =
++				rcu_dereference_protected(*slot, true);
++
++			if (elm->spec.type == UVERBS_ATTR_TYPE_ENUM_IN)
++				elm->spec.u2.enum_def.ids = NULL;
++		}
++	}
++}
+diff --git a/include/rdma/uverbs_ioctl.h b/include/rdma/uverbs_ioctl.h
+index 2cc45699a237..471feab41423 100644
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@ -159,6 +159,143 @@ struct uverbs_root_spec {
+ 	struct uverbs_object_spec_hash		*object_buckets[0];
+ };
+ 
++/*
++ * Information about the API is loaded into a radix tree. For IOCTL we start
++ * with a tuple of:
++ *  object_id, attr_id, method_id
++ *
++ * Which is a 48 bit value, with most of the bits guaranteed to be zero. Based
++ * on the current kernel support this is compressed into 16 bit key for the
++ * radix tree. Since this compression is entirely internal to the kernel the
++ * below limits can be revised if the kernel gains additional data.
++ *
++ * With 64 leafs per node this is a 3 level radix tree.
++ *
++ * The tree encodes multiple types, and uses a scheme where OBJ_ID,0,0 returns
++ * the object slot, and OBJ_ID,METH_ID,0 and returns the method slot.
++ */
++enum uapi_radix_data {
++	UVERBS_API_NS_FLAG = 1U << UVERBS_ID_NS_SHIFT,
++
++	UVERBS_API_ATTR_KEY_BITS = 6,
++	UVERBS_API_ATTR_KEY_MASK = GENMASK(UVERBS_API_ATTR_KEY_BITS - 1, 0),
++	UVERBS_API_ATTR_BKEY_LEN = (1 << UVERBS_API_ATTR_KEY_BITS) - 1,
++
++	UVERBS_API_METHOD_KEY_BITS = 5,
++	UVERBS_API_METHOD_KEY_SHIFT = UVERBS_API_ATTR_KEY_BITS,
++	UVERBS_API_METHOD_KEY_NUM_CORE = 24,
++	UVERBS_API_METHOD_KEY_NUM_DRIVER = (1 << UVERBS_API_METHOD_KEY_BITS) -
++					   UVERBS_API_METHOD_KEY_NUM_CORE,
++	UVERBS_API_METHOD_KEY_MASK = GENMASK(
++		UVERBS_API_METHOD_KEY_BITS + UVERBS_API_METHOD_KEY_SHIFT - 1,
++		UVERBS_API_METHOD_KEY_SHIFT),
++
++	UVERBS_API_OBJ_KEY_BITS = 5,
++	UVERBS_API_OBJ_KEY_SHIFT =
++		UVERBS_API_METHOD_KEY_BITS + UVERBS_API_METHOD_KEY_SHIFT,
++	UVERBS_API_OBJ_KEY_NUM_CORE = 24,
++	UVERBS_API_OBJ_KEY_NUM_DRIVER =
++		(1 << UVERBS_API_OBJ_KEY_BITS) - UVERBS_API_OBJ_KEY_NUM_CORE,
++	UVERBS_API_OBJ_KEY_MASK = GENMASK(31, UVERBS_API_OBJ_KEY_SHIFT),
++
++	/* This id guaranteed to not exist in the radix tree */
++	UVERBS_API_KEY_ERR = 0xFFFFFFFF,
++};
++
++static inline __attribute_const__ u32 uapi_key_obj(u32 id)
++{
++	if (id & UVERBS_API_NS_FLAG) {
++		id &= ~UVERBS_API_NS_FLAG;
++		if (id >= UVERBS_API_OBJ_KEY_NUM_DRIVER)
++			return UVERBS_API_KEY_ERR;
++		id = id + UVERBS_API_OBJ_KEY_NUM_CORE;
++	} else {
++		if (id >= UVERBS_API_OBJ_KEY_NUM_CORE)
++			return UVERBS_API_KEY_ERR;
++	}
++
++	return id << UVERBS_API_OBJ_KEY_SHIFT;
++}
++
++static inline __attribute_const__ bool uapi_key_is_object(u32 key)
++{
++	return (key & ~UVERBS_API_OBJ_KEY_MASK) == 0;
++}
++
++static inline __attribute_const__ u32 uapi_key_ioctl_method(u32 id)
++{
++	if (id & UVERBS_API_NS_FLAG) {
++		id &= ~UVERBS_API_NS_FLAG;
++		if (id >= UVERBS_API_METHOD_KEY_NUM_DRIVER)
++			return UVERBS_API_KEY_ERR;
++		id = id + UVERBS_API_METHOD_KEY_NUM_CORE;
++	} else {
++		id++;
++		if (id >= UVERBS_API_METHOD_KEY_NUM_CORE)
++			return UVERBS_API_KEY_ERR;
++	}
++
++	return id << UVERBS_API_METHOD_KEY_SHIFT;
++}
++
++static inline __attribute_const__ u32 uapi_key_attr_to_method(u32 attr_key)
++{
++	return attr_key &
++	       (UVERBS_API_OBJ_KEY_MASK | UVERBS_API_METHOD_KEY_MASK);
++}
++
++static inline __attribute_const__ bool uapi_key_is_ioctl_method(u32 key)
++{
++	return (key & UVERBS_API_METHOD_KEY_MASK) != 0 &&
++	       (key & UVERBS_API_ATTR_KEY_MASK) == 0;
++}
++
++static inline __attribute_const__ u32 uapi_key_attrs_start(u32 ioctl_method_key)
++{
++	/* 0 is the method slot itself */
++	return ioctl_method_key + 1;
++}
++
++static inline __attribute_const__ u32 uapi_key_attr(u32 id)
++{
++	/*
++	 * The attr is designed to fit in the typical single radix tree node
++	 * of 64 entries. Since allmost all methods have driver attributes we
++	 * organize things so that the driver and core attributes interleave to
++	 * reduce the length of the attributes array in typical cases.
++	 */
++	if (id & UVERBS_API_NS_FLAG) {
++		id &= ~UVERBS_API_NS_FLAG;
++		id++;
++		if (id >= 1 << (UVERBS_API_ATTR_KEY_BITS - 1))
++			return UVERBS_API_KEY_ERR;
++		id = (id << 1) | 0;
++	} else {
++		if (id >= 1 << (UVERBS_API_ATTR_KEY_BITS - 1))
++			return UVERBS_API_KEY_ERR;
++		id = (id << 1) | 1;
++	}
++
++	return id;
++}
++
++static inline __attribute_const__ bool uapi_key_is_attr(u32 key)
++{
++	return (key & UVERBS_API_METHOD_KEY_MASK) != 0 &&
++	       (key & UVERBS_API_ATTR_KEY_MASK) != 0;
++}
++
++/*
++ * This returns a value in the range [0 to UVERBS_API_ATTR_BKEY_LEN),
++ * basically it undoes the reservation of 0 in the ID numbering. attr_key
++ * must already be masked with UVERBS_API_ATTR_KEY_MASK, or be the output of
++ * uapi_key_attr().
++ */
++static inline __attribute_const__ u32 uapi_bkey_attr(u32 attr_key)
++{
++	return attr_key - 1;
++}
++
+ /*
+  * =======================================
+  *	Verbs definitions
