@@ -1,0 +1,223 @@
+efi: Make our variable validation list include the guid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Jones <pjones@redhat.com>
+commit 8282f5d9c17fe15a9e658c06e3f343efae1a2a2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8282f5d9.failed
+
+All the variables in this list so far are defined to be in the global
+namespace in the UEFI spec, so this just further ensures we're
+validating the variables we think we are.
+
+Including the guid for entries will become more important in future
+patches when we decide whether or not to allow deletion of variables
+based on presence in this list.
+
+	Signed-off-by: Peter Jones <pjones@redhat.com>
+	Tested-by: Lee, Chun-Yi <jlee@suse.com>
+	Acked-by: Matthew Garrett <mjg59@coreos.com>
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+(cherry picked from commit 8282f5d9c17fe15a9e658c06e3f343efae1a2a2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/efivars.c
+#	drivers/firmware/efi/vars.c
+#	include/linux/efi.h
+diff --cc drivers/firmware/efi/efivars.c
+index 5cbba0eea363,10e6774ab2a2..000000000000
+--- a/drivers/firmware/efi/efivars.c
++++ b/drivers/firmware/efi/efivars.c
+@@@ -198,21 -193,61 +198,72 @@@ efivar_data_read(struct efivar_entry *e
+  	if (!entry || !buf)
+  		return -EINVAL;
+  
+ +	mutex_lock(&entry->var_data_mutex);
+ +
+  	var->DataSize = 1024;
+ -	if (efivar_entry_get(entry, &var->Attributes, &var->DataSize, var->Data))
+ +	if (efivar_entry_get(entry, &var->Attributes,
+ +			     &var->DataSize, var->Data)) {
+ +		mutex_unlock(&entry->var_data_mutex);
+  		return -EIO;
+ +	}
+  
+  	memcpy(buf, var->Data, var->DataSize);
+ -	return var->DataSize;
+ +	ret = var->DataSize;
+ +
+ +	mutex_unlock(&entry->var_data_mutex);
+ +	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int
++ sanity_check(struct efi_variable *var, efi_char16_t *name, efi_guid_t vendor,
++ 	     unsigned long size, u32 attributes, u8 *data)
++ {
++ 	/*
++ 	 * If only updating the variable data, then the name
++ 	 * and guid should remain the same
++ 	 */
++ 	if (memcmp(name, var->VariableName, sizeof(var->VariableName)) ||
++ 		efi_guidcmp(vendor, var->VendorGuid)) {
++ 		printk(KERN_ERR "efivars: Cannot edit the wrong variable!\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if ((size <= 0) || (attributes == 0)){
++ 		printk(KERN_ERR "efivars: DataSize & Attributes must be valid!\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if ((attributes & ~EFI_VARIABLE_MASK) != 0 ||
++ 	    efivar_validate(vendor, name, data, size) == false) {
++ 		printk(KERN_ERR "efivars: Malformed variable content\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline bool is_compat(void)
++ {
++ 	if (IS_ENABLED(CONFIG_COMPAT) && is_compat_task())
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static void
++ copy_out_compat(struct efi_variable *dst, struct compat_efi_variable *src)
++ {
++ 	memcpy(dst->VariableName, src->VariableName, EFI_VAR_NAME_LEN);
++ 	memcpy(dst->Data, src->Data, sizeof(src->Data));
++ 
++ 	dst->VendorGuid = src->VendorGuid;
++ 	dst->DataSize = src->DataSize;
++ 	dst->Attributes = src->Attributes;
++ }
++ 
+++>>>>>>> 8282f5d9c17f (efi: Make our variable validation list include the guid)
+  /*
+   * We allow each variable to be edited via rewriting the
+   * entire efi variable structure.
+@@@ -364,8 -428,27 +415,32 @@@ static ssize_t efivar_create(struct fil
+  	if (!capable(CAP_SYS_ADMIN))
+  		return -EACCES;
+  
+++<<<<<<< HEAD
+ +	if ((new_var->Attributes & ~EFI_VARIABLE_MASK) != 0 ||
+ +	    efivar_validate(new_var, new_var->Data, new_var->DataSize) == false) {
+++=======
++ 	if (need_compat) {
++ 		if (count != sizeof(*compat))
++ 			return -EINVAL;
++ 
++ 		attributes = compat->Attributes;
++ 		name = compat->VariableName;
++ 		size = compat->DataSize;
++ 		data = compat->Data;
++ 	} else {
++ 		if (count != sizeof(*new_var))
++ 			return -EINVAL;
++ 
++ 		attributes = new_var->Attributes;
++ 		name = new_var->VariableName;
++ 		size = new_var->DataSize;
++ 		data = new_var->Data;
++ 	}
++ 
++ 	if ((attributes & ~EFI_VARIABLE_MASK) != 0 ||
++ 	    efivar_validate(new_var->VendorGuid, name, data,
++ 			    size) == false) {
+++>>>>>>> 8282f5d9c17f (efi: Make our variable validation list include the guid)
+  		printk(KERN_ERR "efivars: Malformed variable content\n");
+  		return -EINVAL;
+  	}
+diff --cc drivers/firmware/efi/vars.c
+index caf5f9efc1c2,9a53da21e7b6..000000000000
+--- a/drivers/firmware/efi/vars.c
++++ b/drivers/firmware/efi/vars.c
+@@@ -165,8 -165,9 +165,9 @@@ validate_ascii_string(struct efi_variab
+  }
+  
+  struct variable_validate {
++ 	efi_guid_t vendor;
+  	char *name;
+ -	bool (*validate)(efi_char16_t *var_name, int match, u8 *data,
+ +	bool (*validate)(struct efi_variable *var, int match, u8 *data,
+  			 unsigned long len);
+  };
+  
+@@@ -189,14 -199,27 +199,22 @@@ static const struct variable_validate v
+  };
+  
+  bool
+++<<<<<<< HEAD
+ +efivar_validate(struct efi_variable *var, u8 *data, unsigned long len)
+++=======
++ efivar_validate(efi_guid_t vendor, efi_char16_t *var_name, u8 *data,
++ 		unsigned long data_size)
+++>>>>>>> 8282f5d9c17f (efi: Make our variable validation list include the guid)
+  {
+  	int i;
+ -	unsigned long utf8_size;
+ -	u8 *utf8_name;
+ -
+ -	utf8_size = ucs2_utf8size(var_name);
+ -	utf8_name = kmalloc(utf8_size + 1, GFP_KERNEL);
+ -	if (!utf8_name)
+ -		return false;
+ -
+ -	ucs2_as_utf8(utf8_name, var_name, utf8_size);
+ -	utf8_name[utf8_size] = '\0';
+ +	u16 *unicode_name = var->VariableName;
+  
+- 	for (i = 0; variable_validate[i].validate != NULL; i++) {
++ 	for (i = 0; variable_validate[i].name[0] != '\0'; i++) {
+  		const char *name = variable_validate[i].name;
+- 		int match;
++ 		int match = 0;
++ 
++ 		if (efi_guidcmp(vendor, variable_validate[i].vendor))
++ 			continue;
+  
+  		for (match = 0; ; match++) {
+  			char c = name[match];
+@@@ -852,7 -876,7 +870,11 @@@ int efivar_entry_set_get_size(struct ef
+  
+  	*set = false;
+  
+++<<<<<<< HEAD
+ +	if (efivar_validate(&entry->var, data, *size) == false)
+++=======
++ 	if (efivar_validate(*vendor, name, data, *size) == false)
+++>>>>>>> 8282f5d9c17f (efi: Make our variable validation list include the guid)
+  		return -EINVAL;
+  
+  	/*
+diff --cc include/linux/efi.h
+index ce99ad24fa74,16ca611aabc8..000000000000
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@@ -1239,7 -1199,8 +1239,12 @@@ int efivar_entry_iter(int (*func)(struc
+  struct efivar_entry *efivar_entry_find(efi_char16_t *name, efi_guid_t guid,
+  				       struct list_head *head, bool remove);
+  
+++<<<<<<< HEAD
+ +bool efivar_validate(struct efi_variable *var, u8 *data, unsigned long len);
+++=======
++ bool efivar_validate(efi_guid_t vendor, efi_char16_t *var_name, u8 *data,
++ 		     unsigned long data_size);
+++>>>>>>> 8282f5d9c17f (efi: Make our variable validation list include the guid)
+  
+  extern struct work_struct efivar_work;
+  void efivar_run_worker(void);
+* Unmerged path drivers/firmware/efi/efivars.c
+* Unmerged path drivers/firmware/efi/vars.c
+* Unmerged path include/linux/efi.h
