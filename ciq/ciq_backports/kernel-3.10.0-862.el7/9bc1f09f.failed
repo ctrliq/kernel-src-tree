@@ -1,0 +1,108 @@
+KVM: async_pf: avoid async pf injection when in guest mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 9bc1f09f6fa76fdf31eb7d6a4a4df43574725f93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9bc1f09f.failed
+
+ INFO: task gnome-terminal-:1734 blocked for more than 120 seconds.
+       Not tainted 4.12.0-rc4+ #8
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ gnome-terminal- D    0  1734   1015 0x00000000
+ Call Trace:
+  __schedule+0x3cd/0xb30
+  schedule+0x40/0x90
+  kvm_async_pf_task_wait+0x1cc/0x270
+  ? __vfs_read+0x37/0x150
+  ? prepare_to_swait+0x22/0x70
+  do_async_page_fault+0x77/0xb0
+  ? do_async_page_fault+0x77/0xb0
+  async_page_fault+0x28/0x30
+
+This is triggered by running both win7 and win2016 on L1 KVM simultaneously,
+and then gives stress to memory on L1, I can observed this hang on L1 when
+at least ~70% swap area is occupied on L0.
+
+This is due to async pf was injected to L2 which should be injected to L1,
+L2 guest starts receiving pagefault w/ bogus %cr2(apf token from the host
+actually), and L1 guest starts accumulating tasks stuck in D state in
+kvm_async_pf_task_wait() since missing PAGE_READY async_pfs.
+
+This patch fixes the hang by doing async pf when executing L1 guest.
+
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9bc1f09f6fa76fdf31eb7d6a4a4df43574725f93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.h
+index 34ee51669a88,330bf3a811fb..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -74,7 -74,9 +74,13 @@@ enum 
+  
+  int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+  void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly);
+++=======
++ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
++ 			     bool accessed_dirty);
++ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu);
+++>>>>>>> 9bc1f09f6fa7 (KVM: async_pf: avoid async pf injection when in guest mode)
+  
+  static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+  {
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 54edab8c50fd..7817505712b2 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3490,12 +3490,15 @@ static int kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu, gva_t gva, gfn_t gfn)
+ 	return kvm_setup_async_pf(vcpu, gva, kvm_vcpu_gfn_to_hva(vcpu, gfn), &arch);
+ }
+ 
+-static bool can_do_async_pf(struct kvm_vcpu *vcpu)
++bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu)
+ {
+ 	if (unlikely(!lapic_in_kernel(vcpu) ||
+ 		     kvm_event_needs_reinjection(vcpu)))
+ 		return false;
+ 
++	if (is_guest_mode(vcpu))
++		return false;
++
+ 	return kvm_x86_ops->interrupt_allowed(vcpu);
+ }
+ 
+@@ -3511,7 +3514,7 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+ 	if (!async)
+ 		return false; /* *pfn has correct page already */
+ 
+-	if (!prefault && can_do_async_pf(vcpu)) {
++	if (!prefault && kvm_can_do_async_pf(vcpu)) {
+ 		trace_kvm_try_async_get_page(gva, gfn);
+ 		if (kvm_find_async_pf_gfn(vcpu, gfn)) {
+ 			trace_kvm_async_pf_doublefault(gva, gfn);
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 15050eb7c19c..c214b5c03e7d 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8421,8 +8421,7 @@ bool kvm_arch_can_inject_async_page_present(struct kvm_vcpu *vcpu)
+ 	if (!(vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED))
+ 		return true;
+ 	else
+-		return !kvm_event_needs_reinjection(vcpu) &&
+-			kvm_x86_ops->interrupt_allowed(vcpu);
++		return kvm_can_do_async_pf(vcpu);
+ }
+ 
+ void kvm_arch_start_assignment(struct kvm *kvm)
