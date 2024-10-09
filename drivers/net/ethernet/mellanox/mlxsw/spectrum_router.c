@@ -1514,6 +1514,9 @@ static int mlxsw_sp_nexthop_init(struct mlxsw_sp *mlxsw_sp,
 	if (err)
 		return err;
 
+	if (!dev)
+		return 0;
+
 	in_dev = __in_dev_get_rtnl(dev);
 #if 0 /* RHEL does not support LINKDOWN yet - the condition is always false */
 	if (in_dev && IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
@@ -1879,17 +1882,29 @@ mlxsw_sp_fib4_entry_type_set(struct mlxsw_sp *mlxsw_sp,
 {
 	struct fib_info *fi = fen_info->fi;
 
-	if (fen_info->type == RTN_LOCAL || fen_info->type == RTN_BROADCAST) {
+	switch (fen_info->type) {
+	case RTN_BROADCAST: /* fall through */
+	case RTN_LOCAL:
 		fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_TRAP;
 		return 0;
-	}
-	if (fen_info->type != RTN_UNICAST)
-		return -EINVAL;
-	if (fi->fib_nh->nh_scope != RT_SCOPE_LINK)
+	case RTN_UNREACHABLE: /* fall through */
+	case RTN_BLACKHOLE: /* fall through */
+	case RTN_PROHIBIT:
+		/* Packets hitting these routes need to be trapped, but
+		 * can do so with a lower priority than packets directed
+		 * at the host, so use action type local instead of trap.
+		 */
 		fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_LOCAL;
-	else
-		fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_REMOTE;
-	return 0;
+		return 0;
+	case RTN_UNICAST:
+		if (fi->fib_nh->nh_scope != RT_SCOPE_LINK)
+			fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_LOCAL;
+		else
+			fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_REMOTE;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static struct mlxsw_sp_fib_entry *
