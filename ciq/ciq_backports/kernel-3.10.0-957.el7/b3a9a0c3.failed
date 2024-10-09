@@ -1,0 +1,738 @@
+dax: Introduce a ->copy_to_iter dax operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit b3a9a0c36e1f7b9e2e6cf965c2bb973624f2b3b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b3a9a0c3.failed
+
+Similar to the ->copy_from_iter() operation, a platform may want to
+deploy an architecture or device specific routine for handling reads
+from a dax_device like /dev/pmemX. On x86 this routine will point to a
+machine check safe version of copy_to_iter(). For now, add the plumbing
+to device-mapper and the dax core.
+
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit b3a9a0c36e1f7b9e2e6cf965c2bb973624f2b3b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/super.c
+#	drivers/md/dm-linear.c
+#	drivers/md/dm-log-writes.c
+#	drivers/md/dm-stripe.c
+#	drivers/md/dm.c
+#	drivers/nvdimm/pmem.c
+#	drivers/s390/block/dcssblk.c
+#	fs/dax.c
+#	include/linux/dax.h
+#	include/linux/device-mapper.h
+diff --cc drivers/dax/super.c
+index 41efc362f7f7,31b839113399..000000000000
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@@ -184,6 -272,57 +184,60 @@@ long dax_direct_access(struct dax_devic
+  }
+  EXPORT_SYMBOL_GPL(dax_direct_access);
+  
+++<<<<<<< HEAD
+++=======
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i)
++ {
++ 	if (!dax_alive(dax_dev))
++ 		return 0;
++ 
++ 	return dax_dev->ops->copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ EXPORT_SYMBOL_GPL(dax_copy_from_iter);
++ 
++ size_t dax_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i)
++ {
++ 	if (!dax_alive(dax_dev))
++ 		return 0;
++ 
++ 	return dax_dev->ops->copy_to_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ EXPORT_SYMBOL_GPL(dax_copy_to_iter);
++ 
++ #ifdef CONFIG_ARCH_HAS_PMEM_API
++ void arch_wb_cache_pmem(void *addr, size_t size);
++ void dax_flush(struct dax_device *dax_dev, void *addr, size_t size)
++ {
++ 	if (unlikely(!test_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags)))
++ 		return;
++ 
++ 	arch_wb_cache_pmem(addr, size);
++ }
++ #else
++ void dax_flush(struct dax_device *dax_dev, void *addr, size_t size)
++ {
++ }
++ #endif
++ EXPORT_SYMBOL_GPL(dax_flush);
++ 
++ void dax_write_cache(struct dax_device *dax_dev, bool wc)
++ {
++ 	if (wc)
++ 		set_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++ 	else
++ 		clear_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++ }
++ EXPORT_SYMBOL_GPL(dax_write_cache);
++ 
++ bool dax_write_cache_enabled(struct dax_device *dax_dev)
++ {
++ 	return test_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++ }
++ EXPORT_SYMBOL_GPL(dax_write_cache_enabled);
++ 
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  bool dax_alive(struct dax_device *dax_dev)
+  {
+  	lockdep_assert_held(&dax_srcu);
+diff --cc drivers/md/dm-linear.c
+index d40e867fe4c7,d10964d41fd7..000000000000
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@@ -172,18 -171,55 +172,60 @@@ static long linear_dax_direct_access(st
+  	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t linear_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	struct linear_c *lc = ti->private;
++ 	struct block_device *bdev = lc->dev->bdev;
++ 	struct dax_device *dax_dev = lc->dev->dax_dev;
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 
++ 	dev_sector = linear_map_sector(ti, sector);
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ static size_t linear_dax_copy_to_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	struct linear_c *lc = ti->private;
++ 	struct block_device *bdev = lc->dev->bdev;
++ 	struct dax_device *dax_dev = lc->dev->dax_dev;
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 
++ 	dev_sector = linear_map_sector(ti, sector);
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_to_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ #else
++ #define linear_dax_direct_access NULL
++ #define linear_dax_copy_from_iter NULL
++ #define linear_dax_copy_to_iter NULL
++ #endif
++ 
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  static struct target_type linear_target = {
+  	.name   = "linear",
+ -	.version = {1, 4, 0},
+ -	.features = DM_TARGET_PASSES_INTEGRITY | DM_TARGET_ZONED_HM,
+ +	.version = {1, 3, 0},
+  	.module = THIS_MODULE,
+  	.ctr    = linear_ctr,
+  	.dtr    = linear_dtr,
+  	.map    = linear_map,
+ -	.end_io = linear_end_io,
+  	.status = linear_status,
+  	.prepare_ioctl = linear_prepare_ioctl,
+ +	.merge  = linear_merge,
+  	.iterate_devices = linear_iterate_devices,
+  	.direct_access = linear_dax_direct_access,
+++<<<<<<< HEAD
+++=======
++ 	.dax_copy_from_iter = linear_dax_copy_from_iter,
++ 	.dax_copy_to_iter = linear_dax_copy_to_iter,
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+  int __init dm_linear_init(void)
+diff --cc drivers/md/dm-log-writes.c
+index 080dee545525,9ea2b0291f20..000000000000
+--- a/drivers/md/dm-log-writes.c
++++ b/drivers/md/dm-log-writes.c
+@@@ -971,6 -962,24 +971,27 @@@ static size_t log_writes_dax_copy_from_
+  dax_copy:
+  	return dax_copy_from_iter(lc->dev->dax_dev, pgoff, addr, bytes, i);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static size_t log_writes_dax_copy_to_iter(struct dm_target *ti,
++ 					  pgoff_t pgoff, void *addr, size_t bytes,
++ 					  struct iov_iter *i)
++ {
++ 	struct log_writes_c *lc = ti->private;
++ 	sector_t sector = pgoff * PAGE_SECTORS;
++ 
++ 	if (bdev_dax_pgoff(lc->dev->bdev, sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_to_iter(lc->dev->dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ #else
++ #define log_writes_dax_direct_access NULL
++ #define log_writes_dax_copy_from_iter NULL
++ #define log_writes_dax_copy_to_iter NULL
++ #endif
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  
+  static struct target_type log_writes_target = {
+  	.name   = "log-writes",
+diff --cc drivers/md/dm-stripe.c
+index db56c81ef539,8547d7594338..000000000000
+--- a/drivers/md/dm-stripe.c
++++ b/drivers/md/dm-stripe.c
+@@@ -327,6 -335,50 +327,53 @@@ static long stripe_dax_direct_access(st
+  	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t stripe_dax_copy_from_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 	struct stripe_c *sc = ti->private;
++ 	struct dax_device *dax_dev;
++ 	struct block_device *bdev;
++ 	uint32_t stripe;
++ 
++ 	stripe_map_sector(sc, sector, &stripe, &dev_sector);
++ 	dev_sector += sc->stripe[stripe].physical_start;
++ 	dax_dev = sc->stripe[stripe].dev->dax_dev;
++ 	bdev = sc->stripe[stripe].dev->bdev;
++ 
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_from_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ static size_t stripe_dax_copy_to_iter(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
++ 	struct stripe_c *sc = ti->private;
++ 	struct dax_device *dax_dev;
++ 	struct block_device *bdev;
++ 	uint32_t stripe;
++ 
++ 	stripe_map_sector(sc, sector, &stripe, &dev_sector);
++ 	dev_sector += sc->stripe[stripe].physical_start;
++ 	dax_dev = sc->stripe[stripe].dev->dax_dev;
++ 	bdev = sc->stripe[stripe].dev->bdev;
++ 
++ 	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(bytes, PAGE_SIZE), &pgoff))
++ 		return 0;
++ 	return dax_copy_to_iter(dax_dev, pgoff, addr, bytes, i);
++ }
++ 
++ #else
++ #define stripe_dax_direct_access NULL
++ #define stripe_dax_copy_from_iter NULL
++ #define stripe_dax_copy_to_iter NULL
++ #endif
++ 
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  /*
+   * Stripe status:
+   *
+@@@ -464,8 -496,9 +511,13 @@@ static struct target_type stripe_targe
+  	.status = stripe_status,
+  	.iterate_devices = stripe_iterate_devices,
+  	.io_hints = stripe_io_hints,
+ +	.merge  = stripe_merge,
+  	.direct_access = stripe_dax_direct_access,
+++<<<<<<< HEAD
+++=======
++ 	.dax_copy_from_iter = stripe_dax_copy_from_iter,
++ 	.dax_copy_to_iter = stripe_dax_copy_to_iter,
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+  int __init dm_stripe_init(void)
+diff --cc drivers/md/dm.c
+index 14d7215727e9,6752f1c25258..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -963,60 -1065,174 +963,111 @@@ static long dm_dax_direct_access(struc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t dm_dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++ 				    void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	struct mapped_device *md = dax_get_private(dax_dev);
++ 	sector_t sector = pgoff * PAGE_SECTORS;
++ 	struct dm_target *ti;
++ 	long ret = 0;
++ 	int srcu_idx;
++ 
++ 	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
++ 
++ 	if (!ti)
++ 		goto out;
++ 	if (!ti->type->dax_copy_from_iter) {
++ 		ret = copy_from_iter(addr, bytes, i);
++ 		goto out;
++ 	}
++ 	ret = ti->type->dax_copy_from_iter(ti, pgoff, addr, bytes, i);
++  out:
++ 	dm_put_live_table(md, srcu_idx);
++ 
++ 	return ret;
++ }
++ 
++ static size_t dm_dax_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	struct mapped_device *md = dax_get_private(dax_dev);
++ 	sector_t sector = pgoff * PAGE_SECTORS;
++ 	struct dm_target *ti;
++ 	long ret = 0;
++ 	int srcu_idx;
++ 
++ 	ti = dm_dax_get_live_target(md, sector, &srcu_idx);
++ 
++ 	if (!ti)
++ 		goto out;
++ 	if (!ti->type->dax_copy_to_iter) {
++ 		ret = copy_to_iter(addr, bytes, i);
++ 		goto out;
++ 	}
++ 	ret = ti->type->dax_copy_to_iter(ti, pgoff, addr, bytes, i);
++  out:
++ 	dm_put_live_table(md, srcu_idx);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  /*
+ - * A target may call dm_accept_partial_bio only from the map routine.  It is
+ - * allowed for all bio types except REQ_PREFLUSH and REQ_OP_ZONE_RESET.
+ - *
+ - * dm_accept_partial_bio informs the dm that the target only wants to process
+ - * additional n_sectors sectors of the bio and the rest of the data should be
+ - * sent in a next bio.
+ - *
+ - * A diagram that explains the arithmetics:
+ - * +--------------------+---------------+-------+
+ - * |         1          |       2       |   3   |
+ - * +--------------------+---------------+-------+
+ - *
+ - * <-------------- *tio->len_ptr --------------->
+ - *                      <------- bi_size ------->
+ - *                      <-- n_sectors -->
+ - *
+ - * Region 1 was already iterated over with bio_advance or similar function.
+ - *	(it may be empty if the target doesn't use bio_advance)
+ - * Region 2 is the remaining bio size that the target wants to process.
+ - *	(it may be empty if region 1 is non-empty, although there is no reason
+ - *	 to make it empty)
+ - * The target requires that region 3 is to be sent in the next bio.
+ - *
+ - * If the target wants to receive multiple copies of the bio (via num_*bios, etc),
+ - * the partially processed part (the sum of regions 1+2) must be the same for all
+ - * copies of the bio.
+ + * Flush current->bio_list when the target map method blocks.
+ + * This fixes deadlocks in snapshot and possibly in other targets.
+   */
+ -void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors)
+ -{
+ -	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ -	unsigned bi_size = bio->bi_iter.bi_size >> SECTOR_SHIFT;
+ -	BUG_ON(bio->bi_opf & REQ_PREFLUSH);
+ -	BUG_ON(bi_size > *tio->len_ptr);
+ -	BUG_ON(n_sectors > bi_size);
+ -	*tio->len_ptr -= bi_size - n_sectors;
+ -	bio->bi_iter.bi_size = n_sectors << SECTOR_SHIFT;
+ -}
+ -EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+ +struct dm_offload {
+ +	struct blk_plug plug;
+ +	struct blk_plug_cb cb;
+ +};
+  
+ -/*
+ - * The zone descriptors obtained with a zone report indicate
+ - * zone positions within the target device. The zone descriptors
+ - * must be remapped to match their position within the dm device.
+ - * A target may call dm_remap_zone_report after completion of a
+ - * REQ_OP_ZONE_REPORT bio to remap the zone descriptors obtained
+ - * from the target device mapping to the dm device.
+ - */
+ -void dm_remap_zone_report(struct dm_target *ti, struct bio *bio, sector_t start)
+ +static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
+  {
+ -#ifdef CONFIG_BLK_DEV_ZONED
+ -	struct dm_target_io *tio = container_of(bio, struct dm_target_io, clone);
+ -	struct bio *report_bio = tio->io->orig_bio;
+ -	struct blk_zone_report_hdr *hdr = NULL;
+ -	struct blk_zone *zone;
+ -	unsigned int nr_rep = 0;
+ -	unsigned int ofst;
+ -	struct bio_vec bvec;
+ -	struct bvec_iter iter;
+ -	void *addr;
+ -
+ -	if (bio->bi_status)
+ -		return;
+ +	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
+ +	struct bio_list list;
+ +	struct bio *bio;
+ +	int i;
+  
+ -	/*
+ -	 * Remap the start sector of the reported zones. For sequential zones,
+ -	 * also remap the write pointer position.
+ -	 */
+ -	bio_for_each_segment(bvec, report_bio, iter) {
+ -		addr = kmap_atomic(bvec.bv_page);
+ -
+ -		/* Remember the report header in the first page */
+ -		if (!hdr) {
+ -			hdr = addr;
+ -			ofst = sizeof(struct blk_zone_report_hdr);
+ -		} else
+ -			ofst = 0;
+ -
+ -		/* Set zones start sector */
+ -		while (hdr->nr_zones && ofst < bvec.bv_len) {
+ -			zone = addr + ofst;
+ -			if (zone->start >= start + ti->len) {
+ -				hdr->nr_zones = 0;
+ -				break;
+ -			}
+ -			zone->start = zone->start + ti->begin - start;
+ -			if (zone->type != BLK_ZONE_TYPE_CONVENTIONAL) {
+ -				if (zone->cond == BLK_ZONE_COND_FULL)
+ -					zone->wp = zone->start + zone->len;
+ -				else if (zone->cond == BLK_ZONE_COND_EMPTY)
+ -					zone->wp = zone->start;
+ -				else
+ -					zone->wp = zone->wp + ti->begin - start;
+ -			}
+ -			ofst += sizeof(struct blk_zone);
+ -			hdr->nr_zones--;
+ -			nr_rep++;
+ -		}
+ +	INIT_LIST_HEAD(&o->cb.list);
+ +
+ +	if (unlikely(!current->bio_list))
+ +		return;
+  
+ -		if (addr != hdr)
+ -			kunmap_atomic(addr);
+ +	for (i = 0; i < 2; i++) {
+ +		list = current->bio_list[i];
+ +		bio_list_init(&current->bio_list[i]);
+  
+ -		if (!hdr->nr_zones)
+ -			break;
+ -	}
+ +		while ((bio = bio_list_pop(&list))) {
+ +			struct bio_set *bs = bio->bi_pool;
+ +			if (unlikely(!bs) || bs == fs_bio_set) {
+ +				bio_list_add(&current->bio_list[i], bio);
+ +				continue;
+ +			}
+  
+ -	if (hdr) {
+ -		hdr->nr_zones = nr_rep;
+ -		kunmap_atomic(hdr);
+ +			spin_lock(&bs->rescue_lock);
+ +			bio_list_add(&bs->rescue_list, bio);
+ +			queue_work(bs->rescue_workqueue, &bs->rescue_work);
+ +			spin_unlock(&bs->rescue_lock);
+ +		}
+  	}
+ +}
+  
+ -	bio_advance(report_bio, report_bio->bi_iter.bi_size);
+ +static void dm_offload_start(struct dm_offload *o)
+ +{
+ +	blk_start_plug(&o->plug);
+ +	o->cb.callback = flush_current_bio_list;
+ +	list_add(&o->cb.list, &current->plug->cb_list);
+ +}
+  
+ -#else /* !CONFIG_BLK_DEV_ZONED */
+ -	bio->bi_status = BLK_STS_NOTSUPP;
+ -#endif
+ +static void dm_offload_end(struct dm_offload *o)
+ +{
+ +	list_del(&o->cb.list);
+ +	blk_finish_plug(&o->plug);
+  }
+ -EXPORT_SYMBOL_GPL(dm_remap_zone_report);
+  
+ -static blk_qc_t __map_bio(struct dm_target_io *tio)
+ +static void __map_bio(struct dm_target_io *tio)
+  {
+  	int r;
+  	sector_t sector;
+@@@ -3093,6 -3157,8 +3144,11 @@@ static const struct block_device_operat
+  
+  static const struct dax_operations dm_dax_ops = {
+  	.direct_access = dm_dax_direct_access,
+++<<<<<<< HEAD
+++=======
++ 	.copy_from_iter = dm_dax_copy_from_iter,
++ 	.copy_to_iter = dm_dax_copy_to_iter,
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+  /*
+diff --cc drivers/nvdimm/pmem.c
+index 3cb343008661,1b8ab48365de..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -230,15 -258,27 +230,31 @@@ static long pmem_dax_direct_access(stru
+  	return __pmem_direct_access(pmem, pgoff, nr_pages, kaddr, pfn);
+  }
+  
+ -static size_t pmem_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff,
+ -		void *addr, size_t bytes, struct iov_iter *i)
+ +static void pmem_dax_flush(struct dax_device *dax_dev, pgoff_t pgoff,
+ +		void *addr, size_t size)
+  {
+ -	return copy_from_iter_flushcache(addr, bytes, i);
+ +	wb_cache_pmem(addr, size);
+  }
+  
++ static size_t pmem_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	return copy_to_iter(addr, bytes, i);
++ }
++ 
+  static const struct dax_operations pmem_dax_ops = {
+  	.direct_access = pmem_dax_direct_access,
+++<<<<<<< HEAD
+ +	.flush = pmem_dax_flush,
+++=======
++ 	.copy_from_iter = pmem_copy_from_iter,
++ 	.copy_to_iter = pmem_copy_to_iter,
++ };
++ 
++ static const struct attribute_group *pmem_attribute_groups[] = {
++ 	&dax_attribute_group,
++ 	NULL,
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+  static void pmem_release_queue(void *q)
+diff --cc drivers/s390/block/dcssblk.c
+index b091572bbbd5,29024492b8ed..000000000000
+--- a/drivers/s390/block/dcssblk.c
++++ b/drivers/s390/block/dcssblk.c
+@@@ -42,8 -45,22 +42,27 @@@ static const struct block_device_operat
+  	.release 	= dcssblk_release,
+  };
+  
+++<<<<<<< HEAD
+ +static const struct dax_operations dcssblk_dax_ops = {
+ +	.direct_access = dcssblk_dax_direct_access,
+++=======
++ static size_t dcssblk_dax_copy_from_iter(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	return copy_from_iter(addr, bytes, i);
++ }
++ 
++ static size_t dcssblk_dax_copy_to_iter(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, void *addr, size_t bytes, struct iov_iter *i)
++ {
++ 	return copy_to_iter(addr, bytes, i);
++ }
++ 
++ static const struct dax_operations dcssblk_dax_ops = {
++ 	.direct_access = dcssblk_dax_direct_access,
++ 	.copy_from_iter = dcssblk_dax_copy_from_iter,
++ 	.copy_to_iter = dcssblk_dax_copy_to_iter,
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+  struct dcssblk_dev_info {
+diff --cc fs/dax.c
+index 879d2cfa39b7,a64afdf7ec0d..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -1093,14 -1048,17 +1093,19 @@@ dax_iomap_actor(int rw, struct inode *i
+  		if (map_len > end - pos)
+  			map_len = end - pos;
+  
+ -		/*
+ -		 * The userspace address for the memory copy has already been
+ -		 * validated via access_ok() in either vfs_read() or
+ -		 * vfs_write(), depending on which operation we are doing.
+ -		 */
+ -		if (iov_iter_rw(iter) == WRITE)
+ -			map_len = dax_copy_from_iter(dax_dev, pgoff, kaddr,
+ -					map_len, iter);
+ +		if (rw & WRITE)
+ +			map_len = memcpy_fromiovecend_partial_flushcache(
+ +					kaddr, iter->iov,
+ +					iter->iov_offset, map_len);
+  		else
+++<<<<<<< HEAD
+ +			map_len = memcpy_toiovecend_partial(iter->iov,
+ +					kaddr, iter->iov_offset, map_len);
+ +
+++=======
++ 			map_len = dax_copy_to_iter(dax_dev, pgoff, kaddr,
++ 					map_len, iter);
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  		if (map_len <= 0) {
+  			ret = map_len ? map_len : -EFAULT;
+  			break;
+diff --cc include/linux/dax.h
+index b7b81d6cc271,a43b396fb336..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -44,10 -17,54 +44,19 @@@ struct dax_operations 
+  	 */
+  	long (*direct_access)(struct dax_device *, pgoff_t, long,
+  			void **, pfn_t *);
+++<<<<<<< HEAD
+ +	/* flush: optional driver-specific cache management after writes */
+ +	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
+++=======
++ 	/* copy_from_iter: required operation for fs-dax direct-i/o */
++ 	size_t (*copy_from_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
++ 	/* copy_to_iter: required operation for fs-dax direct-i/o */
++ 	size_t (*copy_to_iter)(struct dax_device *, pgoff_t, void *, size_t,
++ 			struct iov_iter *);
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  };
+  
+ -extern struct attribute_group dax_attribute_group;
+ -
+ -#if IS_ENABLED(CONFIG_DAX)
+ -struct dax_device *dax_get_by_host(const char *host);
+ -struct dax_device *alloc_dax(void *private, const char *host,
+ -		const struct dax_operations *ops);
+ -void put_dax(struct dax_device *dax_dev);
+ -void kill_dax(struct dax_device *dax_dev);
+ -void dax_write_cache(struct dax_device *dax_dev, bool wc);
+ -bool dax_write_cache_enabled(struct dax_device *dax_dev);
+ -#else
+ -static inline struct dax_device *dax_get_by_host(const char *host)
+ -{
+ -	return NULL;
+ -}
+ -static inline struct dax_device *alloc_dax(void *private, const char *host,
+ -		const struct dax_operations *ops)
+ -{
+ -	/*
+ -	 * Callers should check IS_ENABLED(CONFIG_DAX) to know if this
+ -	 * NULL is an error or expected.
+ -	 */
+ -	return NULL;
+ -}
+ -static inline void put_dax(struct dax_device *dax_dev)
+ -{
+ -}
+ -static inline void kill_dax(struct dax_device *dax_dev)
+ -{
+ -}
+ -static inline void dax_write_cache(struct dax_device *dax_dev, bool wc)
+ -{
+ -}
+ -static inline bool dax_write_cache_enabled(struct dax_device *dax_dev)
+ -{
+ -	return false;
+ -}
+ -#endif
+ -
+ -struct writeback_control;
+  int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+  #if IS_ENABLED(CONFIG_FS_DAX)
+  int __bdev_dax_supported(struct super_block *sb, int blocksize);
+@@@ -85,13 -119,18 +94,21 @@@ void kill_dax(struct dax_device *dax_de
+  void *dax_get_private(struct dax_device *dax_dev);
+  long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+  		void **kaddr, pfn_t *pfn);
+++<<<<<<< HEAD
+++=======
++ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ size_t dax_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
++ 		size_t bytes, struct iov_iter *i);
++ void dax_flush(struct dax_device *dax_dev, void *addr, size_t size);
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ +ssize_t dax_iomap_rw(int rw, struct kiocb *iocb, const struct iovec *iov,
+ +		unsigned long nr_segs, loff_t pos,
+ +		size_t count, const struct iomap_ops *ops);
+  int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    pfn_t *pfnp, int *errp, const struct iomap_ops *ops);
+ -int dax_finish_sync_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -			  pfn_t pfn);
+ +		const struct iomap_ops *ops);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+  int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+  				      pgoff_t index);
+diff --cc include/linux/device-mapper.h
+index eca858277b1d,6fb0808e87c8..000000000000
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@@ -137,6 -133,8 +137,11 @@@ typedef int (*dm_busy_fn) (struct dm_ta
+   */
+  typedef long (*dm_dax_direct_access_fn) (struct dm_target *ti, pgoff_t pgoff,
+  		long nr_pages, void **kaddr, pfn_t *pfn);
+++<<<<<<< HEAD
+++=======
++ typedef size_t (*dm_dax_copy_iter_fn)(struct dm_target *ti, pgoff_t pgoff,
++ 		void *addr, size_t bytes, struct iov_iter *i);
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  #define PAGE_SECTORS (PAGE_SIZE / 512)
+  
+  void dm_error(const char *message);
+@@@ -188,6 -184,8 +193,11 @@@ struct target_type 
+  	dm_iterate_devices_fn iterate_devices;
+  	dm_io_hints_fn io_hints;
+  	dm_dax_direct_access_fn direct_access;
+++<<<<<<< HEAD
+++=======
++ 	dm_dax_copy_iter_fn dax_copy_from_iter;
++ 	dm_dax_copy_iter_fn dax_copy_to_iter;
+++>>>>>>> b3a9a0c36e1f (dax: Introduce a ->copy_to_iter dax operation)
+  
+  	/* For internal device-mapper use. */
+  	struct list_head list;
+* Unmerged path drivers/dax/super.c
+* Unmerged path drivers/md/dm-linear.c
+* Unmerged path drivers/md/dm-log-writes.c
+* Unmerged path drivers/md/dm-stripe.c
+* Unmerged path drivers/md/dm.c
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path drivers/s390/block/dcssblk.c
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/dax.h
+* Unmerged path include/linux/device-mapper.h
