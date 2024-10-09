@@ -1,0 +1,180 @@
+md/raid1: Use a new variable to count flighting sync requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid1: Use a new variable to count flighting sync requests (Xiao Ni) [1379764]
+Rebuild_FUZZ: 97.48%
+commit-author Xiao Ni <xni@redhat.com>
+commit 43ac9b84a399bc10210a2d9f4e0778b7c6059c07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/43ac9b84.failed
+
+In new barrier codes, raise_barrier waits if conf->nr_pending[idx] is not zero.
+After all the conditions are true, the resync request can go on be handled. But
+it adds conf->nr_pending[idx] again. The next resync request hit the same bucket
+idx need to wait the resync request which is submitted before. The performance
+of resync/recovery is degraded.
+So we should use a new variable to count sync requests which are in flight.
+
+I did a simple test:
+1. Without the patch, create a raid1 with two disks. The resync speed:
+Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sdb               0.00     0.00  166.00    0.00    10.38     0.00   128.00     0.03    0.20    0.20    0.00   0.19   3.20
+sdc               0.00     0.00    0.00  166.00     0.00    10.38   128.00     0.96    5.77    0.00    5.77   5.75  95.50
+2. With the patch, the result is:
+sdb            2214.00     0.00  766.00    0.00   185.69     0.00   496.46     2.80    3.66    3.66    0.00   1.03  79.10
+sdc               0.00  2205.00    0.00  769.00     0.00   186.44   496.52     5.25    6.84    0.00    6.84   1.30 100.10
+
+	Suggested-by: Shaohua Li <shli@kernel.org>
+	Signed-off-by: Xiao Ni <xni@redhat.com>
+	Acked-by: Coly Li <colyli@suse.de>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 43ac9b84a399bc10210a2d9f4e0778b7c6059c07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid1.h
+diff --cc drivers/md/raid1.c
+index e588c32492da,5d19c1a7d90a..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -835,24 -881,22 +835,37 @@@ static void raise_barrier(struct r1con
+  	 */
+  	wait_event_lock_irq(conf->wait_barrier,
+  			    !conf->array_frozen &&
+ -			     !atomic_read(&conf->nr_pending[idx]) &&
+ -			     atomic_read(&conf->barrier[idx]) < RESYNC_DEPTH,
+ +			    conf->barrier < RESYNC_DEPTH &&
+ +			    conf->current_window_requests == 0 &&
+ +			    (conf->start_next_window >=
+ +			     conf->next_resync + RESYNC_SECTORS),
+  			    conf->resync_lock);
+  
+++<<<<<<< HEAD
+ +	conf->nr_pending++;
+++=======
++ 	atomic_inc(&conf->nr_sync_pending);
+++>>>>>>> 43ac9b84a399 (md/raid1: Use a new variable to count flighting sync requests)
+  	spin_unlock_irq(&conf->resync_lock);
+  }
+  
+ -static void lower_barrier(struct r1conf *conf, sector_t sector_nr)
+ +static void lower_barrier(struct r1conf *conf)
+  {
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	BUG_ON(conf->barrier <= 0);
+ +	spin_lock_irqsave(&conf->resync_lock, flags);
+ +	conf->barrier--;
+ +	conf->nr_pending--;
+ +	spin_unlock_irqrestore(&conf->resync_lock, flags);
+++=======
++ 	int idx = sector_to_idx(sector_nr);
++ 
++ 	BUG_ON(atomic_read(&conf->barrier[idx]) <= 0);
++ 
++ 	atomic_dec(&conf->barrier[idx]);
++ 	atomic_dec(&conf->nr_sync_pending);
+++>>>>>>> 43ac9b84a399 (md/raid1: Use a new variable to count flighting sync requests)
+  	wake_up(&conf->wait_barrier);
+  }
+  
+@@@ -955,18 -1013,58 +968,49 @@@ static void allow_barrier(struct r1con
+  	wake_up(&conf->wait_barrier);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void allow_barrier(struct r1conf *conf, sector_t sector_nr)
++ {
++ 	int idx = sector_to_idx(sector_nr);
++ 
++ 	_allow_barrier(conf, idx);
++ }
++ 
++ static void allow_all_barriers(struct r1conf *conf)
++ {
++ 	int idx;
++ 
++ 	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
++ 		_allow_barrier(conf, idx);
++ }
++ 
++ /* conf->resync_lock should be held */
++ static int get_unqueued_pending(struct r1conf *conf)
++ {
++ 	int idx, ret;
++ 
++ 	ret = atomic_read(&conf->nr_sync_pending);
++ 	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
++ 		ret += atomic_read(&conf->nr_pending[idx]) -
++ 			atomic_read(&conf->nr_queued[idx]);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 43ac9b84a399 (md/raid1: Use a new variable to count flighting sync requests)
+  static void freeze_array(struct r1conf *conf, int extra)
+  {
+ -	/* Stop sync I/O and normal I/O and wait for everything to
+ -	 * go quiet.
+ -	 * This is called in two situations:
+ -	 * 1) management command handlers (reshape, remove disk, quiesce).
+ -	 * 2) one normal I/O request failed.
+ -
+ -	 * After array_frozen is set to 1, new sync IO will be blocked at
+ -	 * raise_barrier(), and new normal I/O will blocked at _wait_barrier()
+ -	 * or wait_read_barrier(). The flying I/Os will either complete or be
+ -	 * queued. When everything goes quite, there are only queued I/Os left.
+ -
+ -	 * Every flying I/O contributes to a conf->nr_pending[idx], idx is the
+ -	 * barrier bucket index which this I/O request hits. When all sync and
+ -	 * normal I/O are queued, sum of all conf->nr_pending[] will match sum
+ -	 * of all conf->nr_queued[]. But normal I/O failure is an exception,
+ -	 * in handle_read_error(), we may call freeze_array() before trying to
+ -	 * fix the read error. In this case, the error read I/O is not queued,
+ -	 * so get_unqueued_pending() == 1.
+ -	 *
+ -	 * Therefore before this function returns, we need to wait until
+ -	 * get_unqueued_pendings(conf) gets equal to extra. For
+ -	 * normal I/O context, extra is 1, in rested situations extra is 0.
+ +	/* stop syncio and normal IO and wait for everything to
+ +	 * go quite.
+ +	 * We wait until nr_pending match nr_queued+extra
+ +	 * This is called in the context of one normal IO request
+ +	 * that has failed. Thus any sync request that might be pending
+ +	 * will be blocked by nr_pending, and we need to wait for
+ +	 * pending IO requests to complete or be queued for re-try.
+ +	 * Thus the number queued (nr_queued) plus this request (extra)
+ +	 * must match the number of pending IOs (nr_pending) before
+ +	 * we continue.
+  	 */
+  	spin_lock_irq(&conf->resync_lock);
+  	conf->array_frozen = 1;
+diff --cc drivers/md/raid1.h
+index c52d7139c5d7,c8894ef1e9d2..000000000000
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@@ -79,10 -84,11 +79,18 @@@ struct r1conf 
+  	 */
+  	wait_queue_head_t	wait_barrier;
+  	spinlock_t		resync_lock;
+++<<<<<<< HEAD
+ +	int			nr_pending;
+ +	int			nr_waiting;
+ +	int			nr_queued;
+ +	int			barrier;
+++=======
++ 	atomic_t		nr_sync_pending;
++ 	atomic_t		*nr_pending;
++ 	atomic_t		*nr_waiting;
++ 	atomic_t		*nr_queued;
++ 	atomic_t		*barrier;
+++>>>>>>> 43ac9b84a399 (md/raid1: Use a new variable to count flighting sync requests)
+  	int			array_frozen;
+  
+  	/* Set to 1 if a full sync is needed, (fresh device added).
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid1.h
