@@ -1,0 +1,167 @@
+qed: Fix an off by one bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 0331402aeaefe858709b0a4d44ade15f82d3a119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0331402a.failed
+
+The p_l2_info->pp_qid_usage[] array has "p_l2_info->queues" elements so
+the > here should be a >= or we write beyond the end of the array.
+
+Fixes: bbe3f233ec5e ("qed: Assign a unique per-queue index to queue-cid")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Acked-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0331402aeaefe858709b0a4d44ade15f82d3a119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index f852981b5922,e57699bfbdfa..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -65,6 -65,136 +65,139 @@@
+  #define QED_MAX_SGES_NUM 16
+  #define CRC32_POLY 0x1edc6f41
+  
+++<<<<<<< HEAD
+++=======
++ struct qed_l2_info {
++ 	u32 queues;
++ 	unsigned long **pp_qid_usage;
++ 
++ 	/* The lock is meant to synchronize access to the qid usage */
++ 	struct mutex lock;
++ };
++ 
++ int qed_l2_alloc(struct qed_hwfn *p_hwfn)
++ {
++ 	struct qed_l2_info *p_l2_info;
++ 	unsigned long **pp_qids;
++ 	u32 i;
++ 
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return 0;
++ 
++ 	p_l2_info = kzalloc(sizeof(*p_l2_info), GFP_KERNEL);
++ 	if (!p_l2_info)
++ 		return -ENOMEM;
++ 	p_hwfn->p_l2_info = p_l2_info;
++ 
++ 	if (IS_PF(p_hwfn->cdev)) {
++ 		p_l2_info->queues = RESC_NUM(p_hwfn, QED_L2_QUEUE);
++ 	} else {
++ 		u8 rx = 0, tx = 0;
++ 
++ 		qed_vf_get_num_rxqs(p_hwfn, &rx);
++ 		qed_vf_get_num_txqs(p_hwfn, &tx);
++ 
++ 		p_l2_info->queues = max_t(u8, rx, tx);
++ 	}
++ 
++ 	pp_qids = kzalloc(sizeof(unsigned long *) * p_l2_info->queues,
++ 			  GFP_KERNEL);
++ 	if (!pp_qids)
++ 		return -ENOMEM;
++ 	p_l2_info->pp_qid_usage = pp_qids;
++ 
++ 	for (i = 0; i < p_l2_info->queues; i++) {
++ 		pp_qids[i] = kzalloc(MAX_QUEUES_PER_QZONE / 8, GFP_KERNEL);
++ 		if (!pp_qids[i])
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void qed_l2_setup(struct qed_hwfn *p_hwfn)
++ {
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	mutex_init(&p_hwfn->p_l2_info->lock);
++ }
++ 
++ void qed_l2_free(struct qed_hwfn *p_hwfn)
++ {
++ 	u32 i;
++ 
++ 	if (p_hwfn->hw_info.personality != QED_PCI_ETH &&
++ 	    p_hwfn->hw_info.personality != QED_PCI_ETH_ROCE)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info)
++ 		return;
++ 
++ 	if (!p_hwfn->p_l2_info->pp_qid_usage)
++ 		goto out_l2_info;
++ 
++ 	/* Free until hit first uninitialized entry */
++ 	for (i = 0; i < p_hwfn->p_l2_info->queues; i++) {
++ 		if (!p_hwfn->p_l2_info->pp_qid_usage[i])
++ 			break;
++ 		kfree(p_hwfn->p_l2_info->pp_qid_usage[i]);
++ 	}
++ 
++ 	kfree(p_hwfn->p_l2_info->pp_qid_usage);
++ 
++ out_l2_info:
++ 	kfree(p_hwfn->p_l2_info);
++ 	p_hwfn->p_l2_info = NULL;
++ }
++ 
++ static bool qed_eth_queue_qid_usage_add(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	struct qed_l2_info *p_l2_info = p_hwfn->p_l2_info;
++ 	u16 queue_id = p_cid->rel.queue_id;
++ 	bool b_rc = true;
++ 	u8 first;
++ 
++ 	mutex_lock(&p_l2_info->lock);
++ 
++ 	if (queue_id >= p_l2_info->queues) {
++ 		DP_NOTICE(p_hwfn,
++ 			  "Requested to increase usage for qzone %04x out of %08x\n",
++ 			  queue_id, p_l2_info->queues);
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	first = (u8)find_first_zero_bit(p_l2_info->pp_qid_usage[queue_id],
++ 					MAX_QUEUES_PER_QZONE);
++ 	if (first >= MAX_QUEUES_PER_QZONE) {
++ 		b_rc = false;
++ 		goto out;
++ 	}
++ 
++ 	__set_bit(first, p_l2_info->pp_qid_usage[queue_id]);
++ 	p_cid->qid_usage_idx = first;
++ 
++ out:
++ 	mutex_unlock(&p_l2_info->lock);
++ 	return b_rc;
++ }
++ 
++ static void qed_eth_queue_qid_usage_del(struct qed_hwfn *p_hwfn,
++ 					struct qed_queue_cid *p_cid)
++ {
++ 	mutex_lock(&p_hwfn->p_l2_info->lock);
++ 
++ 	clear_bit(p_cid->qid_usage_idx,
++ 		  p_hwfn->p_l2_info->pp_qid_usage[p_cid->rel.queue_id]);
++ 
++ 	mutex_unlock(&p_hwfn->p_l2_info->lock);
++ }
++ 
+++>>>>>>> 0331402aeaef (qed: Fix an off by one bug)
+  void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
+  			       struct qed_queue_cid *p_cid)
+  {
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
