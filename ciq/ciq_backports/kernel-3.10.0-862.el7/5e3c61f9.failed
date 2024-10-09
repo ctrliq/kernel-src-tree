@@ -1,0 +1,122 @@
+netfilter: conntrack: fix lookup race during hash resize
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 5e3c61f981756361e7dc74e2c673121028449e35
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5e3c61f9.failed
+
+When resizing the conntrack hash table at runtime via
+echo 42 > /sys/module/nf_conntrack/parameters/hashsize, we are racing with
+the conntrack lookup path -- reads can happen in parallel and nothing
+prevents readers from observing a the newly allocated hash but the old
+size (or vice versa).
+
+So access to hash[bucket] can trigger OOB read access in case the table got
+expanded and we saw the new size but the old hash pointer (or it got shrunk
+and we got new hash ptr but the size of the old and larger table):
+
+kasan: GPF could be caused by NULL-ptr deref or user memory access general protection fault: 0000 [#1] SMP KASAN
+CPU: 0 PID: 3 Comm: ksoftirqd/0 Not tainted 4.6.0-rc2+ #107
+[..]
+Call Trace:
+[<ffffffff822c3d6a>] ? nf_conntrack_tuple_taken+0x12a/0xe90
+[<ffffffff822c3ac1>] ? nf_ct_invert_tuplepr+0x221/0x3a0
+[<ffffffff8230e703>] get_unique_tuple+0xfb3/0x2760
+
+Use generation counter to obtain the address/length of the same table.
+
+Also add a synchronize_net before freeing the old hash.
+AFAICS, without it we might access ct_hash[bucket] after ct_hash has been
+freed, provided that lockless reader got delayed by another event:
+
+CPU1			CPU2
+seq_begin
+seq_retry
+<delay>			resize occurs
+			free oldhash
+for_each(oldhash[size])
+
+Note that resize is only supported in init_netns, it took over 2 minutes
+of constant resizing+flooding to produce the warning, so this isn't a
+big problem in practice.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 5e3c61f981756361e7dc74e2c673121028449e35)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index 5140736f7cea,29fa08b3ab82..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -482,21 -469,23 +482,28 @@@ ____nf_conntrack_find(struct net *net, 
+  		      const struct nf_conntrack_tuple *tuple, u32 hash)
+  {
+  	struct nf_conntrack_tuple_hash *h;
++ 	struct hlist_nulls_head *ct_hash;
+  	struct hlist_nulls_node *n;
+- 	unsigned int bucket = hash_bucket(hash, net);
++ 	unsigned int bucket, sequence;
+  
+ +	/* Disable BHs the entire time since we normally need to disable them
+ +	 * at least once for the stats anyway.
+ +	 */
+ +	local_bh_disable();
+  begin:
+- 	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[bucket], hnnode) {
++ 	do {
++ 		sequence = read_seqcount_begin(&nf_conntrack_generation);
++ 		bucket = hash_bucket(hash, net);
++ 		ct_hash = net->ct.hash;
++ 	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
++ 
++ 	hlist_nulls_for_each_entry_rcu(h, n, &ct_hash[bucket], hnnode) {
+  		if (nf_ct_key_equal(h, tuple, zone)) {
+ -			NF_CT_STAT_INC_ATOMIC(net, found);
+ +			NF_CT_STAT_INC(net, found);
+ +			local_bh_enable();
+  			return h;
+  		}
+ -		NF_CT_STAT_INC_ATOMIC(net, searched);
+ +		NF_CT_STAT_INC(net, searched);
+  	}
+  	/*
+  	 * if the nulls value we got at the end of this lookup is
+@@@ -743,18 -729,21 +750,29 @@@ nf_conntrack_tuple_taken(const struct n
+  	struct net *net = nf_ct_net(ignored_conntrack);
+  	const struct nf_conntrack_zone *zone;
+  	struct nf_conntrack_tuple_hash *h;
++ 	struct hlist_nulls_head *ct_hash;
++ 	unsigned int hash, sequence;
+  	struct hlist_nulls_node *n;
+  	struct nf_conn *ct;
+- 	unsigned int hash;
+  
+  	zone = nf_ct_zone(ignored_conntrack);
+- 	hash = hash_conntrack(net, tuple);
+  
+++<<<<<<< HEAD
+ +	/* Disable BHs the entire time since we need to disable them at
+ +	 * least once for the stats anyway.
+ +	 */
+ +	rcu_read_lock_bh();
+ +	hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[hash], hnnode) {
+++=======
++ 	rcu_read_lock();
++ 	do {
++ 		sequence = read_seqcount_begin(&nf_conntrack_generation);
++ 		hash = hash_conntrack(net, tuple);
++ 		ct_hash = net->ct.hash;
++ 	} while (read_seqcount_retry(&nf_conntrack_generation, sequence));
++ 
++ 	hlist_nulls_for_each_entry_rcu(h, n, &ct_hash[hash], hnnode) {
+++>>>>>>> 5e3c61f98175 (netfilter: conntrack: fix lookup race during hash resize)
+  		ct = nf_ct_tuplehash_to_ctrack(h);
+  		if (ct != ignored_conntrack &&
+  		    nf_ct_tuple_equal(tuple, &h->tuple) &&
+* Unmerged path net/netfilter/nf_conntrack_core.c
