@@ -1,0 +1,511 @@
+net_sched: fold tcf_block_cb_call() into tc_setup_cb_call()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [net] sched: fold tcf_block_cb_call() into tc_setup_cb_call() (Ivan Vecera) [1660900]
+Rebuild_FUZZ: 96.49%
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit aeb3fecde811d5392ed481d8558f5751ac542e77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/aeb3fecd.failed
+
+After commit 69bd48404f25 ("net/sched: Remove egdev mechanism"),
+tc_setup_cb_call() is nearly identical to tcf_block_cb_call(),
+so we can just fold tcf_block_cb_call() into tc_setup_cb_call()
+and remove its unused parameter 'exts'.
+
+Fixes: 69bd48404f25 ("net/sched: Remove egdev mechanism")
+	Cc: Oz Shlomo <ozsh@mellanox.com>
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Oz Shlomo <ozsh@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit aeb3fecde811d5392ed481d8558f5751ac542e77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+#	net/sched/cls_bpf.c
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_api.c
+index 3e3407968838,8ce2a0507970..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -1744,74 -2492,26 +1721,97 @@@ int tcf_exts_dump_stats(struct sk_buff 
+  }
+  EXPORT_SYMBOL(tcf_exts_dump_stats);
+  
+++<<<<<<< HEAD
+ +static int tc_exts_setup_cb_egdev_call(struct tcf_exts *exts,
+ +				       enum tc_setup_type type,
+ +				       void *type_data, bool err_stop)
+ +{
+ +	int ok_count = 0;
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	const struct tc_action *a;
+ +	struct net_device *dev;
+ +	int i, ret;
+ +
+ +	if (!tcf_exts_has_actions(exts))
+ +		return 0;
+ +
+ +	for (i = 0; i < exts->nr_actions; i++) {
+ +		a = exts->actions[i];
+ +		if (!a->ops->get_dev)
+ +			continue;
+ +		dev = a->ops->get_dev(a);
+ +		if (!dev)
+ +			continue;
+ +		ret = tc_setup_cb_egdev_call(dev, type, type_data, err_stop);
+ +		if (ret < 0)
+ +			return ret;
+ +		ok_count += ret;
+ +	}
+ +#endif
+ +	return ok_count;
+ +}
+ +
+ +int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
+ +		     enum tc_setup_type type, void *type_data, bool err_stop)
+ +{
+ +	int ok_count;
+ +	int ret;
+ +
+ +	/*
+ +	 * RHEL: Older drivers compiled against RHEL 7.4 and older don't
+ +	 * use TC setup callback infrastructure. We need to call their
+ +	 * .ndo_setup_tc() callback for types used by classifiers in RHEL 7.4
+ +	 * TC_SETUP_{MQPRIO,CLS*}.
+ +	 * For newer drivers and such types the __rh_call_ndo_setup_tc()
+ +	 * does nothing and immediately returns 0.
+ +	 *
+ +	 * Note that the compatibility for older external drivers is preserved
+ +	 * only when TC block is not shared. For such drivers we need to
+ +	 * provide qdisc handle but only non-shared blocks have exactly one
+ +	 * qdisc.
+ +	 */
+ +	if (!tcf_block_shared(block)) {
+ +		ret = __rh_call_ndo_setup_tc(tcf_block_dev(block),
+ +					     tcf_block_q(block)->handle, type,
+ +					     type_data);
+ +		if (ret < 0 && err_stop)
+ +			return ret;
+ +	}
+ +
+ +	ret = tcf_block_cb_call(block, type, type_data, err_stop);
+ +	if (ret < 0)
+ +		return ret;
+ +	ok_count = ret;
+ +
+ +	if (!exts || ok_count)
+ +		return ok_count;
+ +	ret = tc_exts_setup_cb_egdev_call(exts, type, type_data, err_stop);
+ +	if (ret < 0)
+ +		return ret;
+ +	ok_count += ret;
+ +
+++=======
++ int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
++ 		     void *type_data, bool err_stop)
++ {
++ 	struct tcf_block_cb *block_cb;
++ 	int ok_count = 0;
++ 	int err;
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop)
++ 		return -EOPNOTSUPP;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list) {
++ 		err = block_cb->cb(type, type_data, block_cb->cb_priv);
++ 		if (err) {
++ 			if (err_stop)
++ 				return err;
++ 		} else {
++ 			ok_count++;
++ 		}
++ 	}
+++>>>>>>> aeb3fecde811 (net_sched: fold tcf_block_cb_call() into tc_setup_cb_call())
+  	return ok_count;
+  }
+  EXPORT_SYMBOL(tc_setup_cb_call);
+diff --cc net/sched/cls_bpf.c
+index 2ac01f52a371,a95cb240a606..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -70,23 -132,109 +70,96 @@@ static int cls_bpf_classify(struct sk_b
+  		if (ret < 0)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		return ret;
+++=======
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static bool cls_bpf_is_ebpf(const struct cls_bpf_prog *prog)
++ {
++ 	return !prog->bpf_ops;
++ }
++ 
++ static int cls_bpf_offload_cmd(struct tcf_proto *tp, struct cls_bpf_prog *prog,
++ 			       struct cls_bpf_prog *oldprog,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct tc_cls_bpf_offload cls_bpf = {};
++ 	struct cls_bpf_prog *obj;
++ 	bool skip_sw;
++ 	int err;
++ 
++ 	skip_sw = prog && tc_skip_sw(prog->gen_flags);
++ 	obj = prog ?: oldprog;
++ 
++ 	tc_cls_common_offload_init(&cls_bpf.common, tp, obj->gen_flags,
++ 				   extack);
++ 	cls_bpf.command = TC_CLSBPF_OFFLOAD;
++ 	cls_bpf.exts = &obj->exts;
++ 	cls_bpf.prog = prog ? prog->filter : NULL;
++ 	cls_bpf.oldprog = oldprog ? oldprog->filter : NULL;
++ 	cls_bpf.name = obj->bpf_name;
++ 	cls_bpf.exts_integrated = obj->exts_integrated;
++ 
++ 	if (oldprog)
++ 		tcf_block_offload_dec(block, &oldprog->gen_flags);
++ 
++ 	err = tc_setup_cb_call(block, TC_SETUP_CLSBPF, &cls_bpf, skip_sw);
++ 	if (prog) {
++ 		if (err < 0) {
++ 			cls_bpf_offload_cmd(tp, oldprog, prog, extack);
++ 			return err;
++ 		} else if (err > 0) {
++ 			prog->in_hw_count = err;
++ 			tcf_block_offload_inc(block, &prog->gen_flags);
++ 		}
+++>>>>>>> aeb3fecde811 (net_sched: fold tcf_block_cb_call() into tc_setup_cb_call())
+  	}
+  
+ -	if (prog && skip_sw && !(prog->gen_flags & TCA_CLS_FLAGS_IN_HW))
+ -		return -EINVAL;
+ -
+ -	return 0;
+ +	return -1;
+  }
+  
+ -static u32 cls_bpf_flags(u32 flags)
+ -{
+ -	return flags & CLS_BPF_SUPPORTED_GEN_FLAGS;
+ -}
+  
+  static int cls_bpf_offload(struct tcf_proto *tp, struct cls_bpf_prog *prog,
+ -			   struct cls_bpf_prog *oldprog,
+ -			   struct netlink_ext_ack *extack)
+ +			   struct cls_bpf_prog *oldprog)
+  {
+ -	if (prog && oldprog &&
+ -	    cls_bpf_flags(prog->gen_flags) !=
+ -	    cls_bpf_flags(oldprog->gen_flags))
+ -		return -EINVAL;
+ -
+ -	if (prog && tc_skip_hw(prog->gen_flags))
+ -		prog = NULL;
+ -	if (oldprog && tc_skip_hw(oldprog->gen_flags))
+ -		oldprog = NULL;
+ -	if (!prog && !oldprog)
+ -		return 0;
+ -
+ -	return cls_bpf_offload_cmd(tp, prog, oldprog, extack);
+ +	return 0;
+  }
+  
+  static void cls_bpf_stop_offload(struct tcf_proto *tp,
+ -				 struct cls_bpf_prog *prog,
+ -				 struct netlink_ext_ack *extack)
+ +				 struct cls_bpf_prog *prog)
+  {
+++<<<<<<< HEAD
+ +	return;
+++=======
++ 	int err;
++ 
++ 	err = cls_bpf_offload_cmd(tp, NULL, prog, extack);
++ 	if (err)
++ 		pr_err("Stopping hardware offload failed: %d\n", err);
++ }
++ 
++ static void cls_bpf_offload_update_stats(struct tcf_proto *tp,
++ 					 struct cls_bpf_prog *prog)
++ {
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct tc_cls_bpf_offload cls_bpf = {};
++ 
++ 	tc_cls_common_offload_init(&cls_bpf.common, tp, prog->gen_flags, NULL);
++ 	cls_bpf.command = TC_CLSBPF_STATS;
++ 	cls_bpf.exts = &prog->exts;
++ 	cls_bpf.prog = prog->filter;
++ 	cls_bpf.name = prog->bpf_name;
++ 	cls_bpf.exts_integrated = prog->exts_integrated;
++ 
++ 	tc_setup_cb_call(block, TC_SETUP_CLSBPF, &cls_bpf, false);
+++>>>>>>> aeb3fecde811 (net_sched: fold tcf_block_cb_call() into tc_setup_cb_call())
+  }
+  
+  static int cls_bpf_init(struct tcf_proto *tp)
+diff --cc net/sched/cls_flower.c
+index c895531406a2,1eb2e2c31dd5..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -284,12 -390,12 +283,11 @@@ static int fl_hw_replace_filter(struct 
+  	cls_flower.exts = &f->exts;
+  	cls_flower.classid = f->res.classid;
+  
+- 	err = tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
+- 			       &cls_flower, skip_sw);
++ 	err = tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, skip_sw);
+  	if (err < 0) {
+ -		fl_hw_destroy_filter(tp, f, NULL);
+ +		fl_hw_destroy_filter(tp, f);
+  		return err;
+  	} else if (err > 0) {
+ -		f->in_hw_count = err;
+  		tcf_block_offload_inc(block, &f->flags);
+  	}
+  
+@@@ -310,11 -416,11 +308,10 @@@ static void fl_hw_update_stats(struct t
+  	cls_flower.exts = &f->exts;
+  	cls_flower.classid = f->res.classid;
+  
+- 	tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
+- 			 &cls_flower, false);
++ 	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, false);
+  }
+  
+ -static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+ -			struct netlink_ext_ack *extack)
+ +static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
+  	bool async = tcf_exts_get_net(&f->exts);
+@@@ -1298,6 -1440,132 +1295,135 @@@ static void fl_walk(struct tcf_proto *t
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int fl_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
++ 			void *cb_priv, struct netlink_ext_ack *extack)
++ {
++ 	struct cls_fl_head *head = rtnl_dereference(tp->root);
++ 	struct tc_cls_flower_offload cls_flower = {};
++ 	struct tcf_block *block = tp->chain->block;
++ 	struct fl_flow_mask *mask;
++ 	struct cls_fl_filter *f;
++ 	int err;
++ 
++ 	list_for_each_entry(mask, &head->masks, list) {
++ 		list_for_each_entry(f, &mask->filters, list) {
++ 			if (tc_skip_hw(f->flags))
++ 				continue;
++ 
++ 			tc_cls_common_offload_init(&cls_flower.common, tp,
++ 						   f->flags, extack);
++ 			cls_flower.command = add ?
++ 				TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
++ 			cls_flower.cookie = (unsigned long)f;
++ 			cls_flower.dissector = &mask->dissector;
++ 			cls_flower.mask = &mask->key;
++ 			cls_flower.key = &f->mkey;
++ 			cls_flower.exts = &f->exts;
++ 			cls_flower.classid = f->res.classid;
++ 
++ 			err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
++ 			if (err) {
++ 				if (add && tc_skip_sw(f->flags))
++ 					return err;
++ 				continue;
++ 			}
++ 
++ 			tc_cls_offload_cnt_update(block, &f->in_hw_count,
++ 						  &f->flags, add);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void fl_hw_create_tmplt(struct tcf_chain *chain,
++ 			       struct fl_flow_tmplt *tmplt)
++ {
++ 	struct tc_cls_flower_offload cls_flower = {};
++ 	struct tcf_block *block = chain->block;
++ 	struct tcf_exts dummy_exts = { 0, };
++ 
++ 	cls_flower.common.chain_index = chain->index;
++ 	cls_flower.command = TC_CLSFLOWER_TMPLT_CREATE;
++ 	cls_flower.cookie = (unsigned long) tmplt;
++ 	cls_flower.dissector = &tmplt->dissector;
++ 	cls_flower.mask = &tmplt->mask;
++ 	cls_flower.key = &tmplt->dummy_key;
++ 	cls_flower.exts = &dummy_exts;
++ 
++ 	/* We don't care if driver (any of them) fails to handle this
++ 	 * call. It serves just as a hint for it.
++ 	 */
++ 	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, false);
++ }
++ 
++ static void fl_hw_destroy_tmplt(struct tcf_chain *chain,
++ 				struct fl_flow_tmplt *tmplt)
++ {
++ 	struct tc_cls_flower_offload cls_flower = {};
++ 	struct tcf_block *block = chain->block;
++ 
++ 	cls_flower.common.chain_index = chain->index;
++ 	cls_flower.command = TC_CLSFLOWER_TMPLT_DESTROY;
++ 	cls_flower.cookie = (unsigned long) tmplt;
++ 
++ 	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, false);
++ }
++ 
++ static void *fl_tmplt_create(struct net *net, struct tcf_chain *chain,
++ 			     struct nlattr **tca,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct fl_flow_tmplt *tmplt;
++ 	struct nlattr **tb;
++ 	int err;
++ 
++ 	if (!tca[TCA_OPTIONS])
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	tb = kcalloc(TCA_FLOWER_MAX + 1, sizeof(struct nlattr *), GFP_KERNEL);
++ 	if (!tb)
++ 		return ERR_PTR(-ENOBUFS);
++ 	err = nla_parse_nested(tb, TCA_FLOWER_MAX, tca[TCA_OPTIONS],
++ 			       fl_policy, NULL);
++ 	if (err)
++ 		goto errout_tb;
++ 
++ 	tmplt = kzalloc(sizeof(*tmplt), GFP_KERNEL);
++ 	if (!tmplt) {
++ 		err = -ENOMEM;
++ 		goto errout_tb;
++ 	}
++ 	tmplt->chain = chain;
++ 	err = fl_set_key(net, tb, &tmplt->dummy_key, &tmplt->mask, extack);
++ 	if (err)
++ 		goto errout_tmplt;
++ 	kfree(tb);
++ 
++ 	fl_init_dissector(&tmplt->dissector, &tmplt->mask);
++ 
++ 	fl_hw_create_tmplt(chain, tmplt);
++ 
++ 	return tmplt;
++ 
++ errout_tmplt:
++ 	kfree(tmplt);
++ errout_tb:
++ 	kfree(tb);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void fl_tmplt_destroy(void *tmplt_priv)
++ {
++ 	struct fl_flow_tmplt *tmplt = tmplt_priv;
++ 
++ 	fl_hw_destroy_tmplt(tmplt->chain, tmplt);
++ 	kfree(tmplt);
++ }
++ 
+++>>>>>>> aeb3fecde811 (net_sched: fold tcf_block_cb_call() into tc_setup_cb_call())
+  static int fl_dump_key_val(struct sk_buff *skb,
+  			   void *val, int val_type,
+  			   void *mask, int mask_type, int len)
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index e628ba118518..1b060cf0e4d4 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -610,8 +610,8 @@ tcf_match_indev(struct sk_buff *skb, int ifindex)
+ }
+ #endif /* CONFIG_NET_CLS_IND */
+ 
+-int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
+-		     enum tc_setup_type type, void *type_data, bool err_stop);
++int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
++		     void *type_data, bool err_stop);
+ 
+ enum tc_block_command {
+ 	TC_BLOCK_BIND,
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/cls_bpf.c
+* Unmerged path net/sched/cls_flower.c
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index 6a3ae9c79130..fe20ea7fab5a 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -69,7 +69,7 @@ static void mall_destroy_hw_filter(struct tcf_proto *tp,
+ 	cls_mall.command = TC_CLSMATCHALL_DESTROY;
+ 	cls_mall.cookie = cookie;
+ 
+-	tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL, &cls_mall, false);
++	tc_setup_cb_call(block, TC_SETUP_CLSMATCHALL, &cls_mall, false);
+ 	tcf_block_offload_dec(block, &head->flags);
+ }
+ 
+@@ -87,8 +87,7 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
+ 	cls_mall.exts = &head->exts;
+ 	cls_mall.cookie = cookie;
+ 
+-	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL,
+-			       &cls_mall, skip_sw);
++	err = tc_setup_cb_call(block, TC_SETUP_CLSMATCHALL, &cls_mall, skip_sw);
+ 	if (err < 0) {
+ 		mall_destroy_hw_filter(tp, head, cookie);
+ 		return err;
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+index 4f44dfd33b52..269dcb08fed5 100644
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -496,7 +496,7 @@ static void u32_clear_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h)
+ 	cls_u32.hnode.handle = h->handle;
+ 	cls_u32.hnode.prio = h->prio;
+ 
+-	tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, false);
++	tc_setup_cb_call(block, TC_SETUP_CLSU32, &cls_u32, false);
+ }
+ 
+ static int u32_replace_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h,
+@@ -514,7 +514,7 @@ static int u32_replace_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h,
+ 	cls_u32.hnode.handle = h->handle;
+ 	cls_u32.hnode.prio = h->prio;
+ 
+-	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, skip_sw);
++	err = tc_setup_cb_call(block, TC_SETUP_CLSU32, &cls_u32, skip_sw);
+ 	if (err < 0) {
+ 		u32_clear_hw_hnode(tp, h);
+ 		return err;
+@@ -537,7 +537,7 @@ static void u32_remove_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n)
+ 	cls_u32.command = TC_CLSU32_DELETE_KNODE;
+ 	cls_u32.knode.handle = n->handle;
+ 
+-	tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, false);
++	tc_setup_cb_call(block, TC_SETUP_CLSU32, &cls_u32, false);
+ 	tcf_block_offload_dec(block, &n->flags);
+ }
+ 
+@@ -565,7 +565,7 @@ static int u32_replace_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
+ 	if (n->ht_down)
+ 		cls_u32.knode.link_handle = n->ht_down->handle;
+ 
+-	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, skip_sw);
++	err = tc_setup_cb_call(block, TC_SETUP_CLSU32, &cls_u32, skip_sw);
+ 	if (err < 0) {
+ 		u32_remove_hw_knode(tp, n);
+ 		return err;
