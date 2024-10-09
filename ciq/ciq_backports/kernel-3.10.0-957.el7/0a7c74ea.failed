@@ -1,0 +1,703 @@
+perf tools: Provide mutex wrappers for pthreads rwlocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 0a7c74eae307894c6c95316c382f118aef8481e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0a7c74ea.failed
+
+Andi reported a performance drop in single threaded perf tools such as
+'perf script' due to the growing number of locks being put in place to
+allow for multithreaded tools, so wrap the POSIX threads rwlock routines
+with the names used for such kinds of locks in the Linux kernel and then
+allow for tools to ask for those locks to be used or not.
+
+I.e. a tool may have a multithreaded phase and then switch to single
+threaded, like the upcoming patches for the synthesizing of
+PERF_RECORD_{FORK,MMAP,etc} for pre-existing processes to then switch to
+single threaded mode in 'perf top'.
+
+The init routines will not be conditional, this way starting as single
+threaded to then move to multi threaded mode should be possible.
+
+	Reported-by: Andi Kleen <ak@linux.intel.com>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Kan Liang <kan.liang@intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/20170404161739.GH12903@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 0a7c74eae307894c6c95316c382f118aef8481e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/builtin-script.c
+index 5d6697e4eb08,9092de0f7238..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -2453,7 -2829,7 +2453,11 @@@ int cmd_script(int argc, const char **a
+  		NULL
+  	};
+  
+++<<<<<<< HEAD
+ +	scripting_max_stack = sysctl_perf_event_max_stack;
+++=======
++ 	perf_set_singlethreaded();
+++>>>>>>> 0a7c74eae307 (perf tools: Provide mutex wrappers for pthreads rwlocks)
+  
+  	setup_scripting();
+  
+diff --git a/tools/perf/builtin-kvm.c b/tools/perf/builtin-kvm.c
+index a4c3ce78bab6..f74b4752f5c7 100644
+--- a/tools/perf/builtin-kvm.c
++++ b/tools/perf/builtin-kvm.c
+@@ -34,7 +34,6 @@
+ #include <termios.h>
+ #include <semaphore.h>
+ #include <signal.h>
+-#include <pthread.h>
+ #include <math.h>
+ 
+ static const char *get_filename_for_perf_kvm(void)
+* Unmerged path tools/perf/builtin-script.c
+diff --git a/tools/perf/util/Build b/tools/perf/util/Build
+index 1108915719e5..82e92c4f802e 100644
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@ -78,6 +78,7 @@ libperf-y += data.o
+ libperf-y += tsc.o
+ libperf-y += cloexec.o
+ libperf-y += call-path.o
++libperf-y += rwsem.o
+ libperf-y += thread-stack.o
+ libperf-$(CONFIG_AUXTRACE) += auxtrace.o
+ libperf-$(CONFIG_AUXTRACE) += intel-pt-decoder/
+diff --git a/tools/perf/util/dso.c b/tools/perf/util/dso.c
+index 4e7ab611377a..a9c10af52620 100644
+--- a/tools/perf/util/dso.c
++++ b/tools/perf/util/dso.c
+@@ -1348,9 +1348,9 @@ void __dsos__add(struct dsos *dsos, struct dso *dso)
+ 
+ void dsos__add(struct dsos *dsos, struct dso *dso)
+ {
+-	pthread_rwlock_wrlock(&dsos->lock);
++	down_write(&dsos->lock);
+ 	__dsos__add(dsos, dso);
+-	pthread_rwlock_unlock(&dsos->lock);
++	up_write(&dsos->lock);
+ }
+ 
+ struct dso *__dsos__find(struct dsos *dsos, const char *name, bool cmp_short)
+@@ -1369,9 +1369,9 @@ struct dso *__dsos__find(struct dsos *dsos, const char *name, bool cmp_short)
+ struct dso *dsos__find(struct dsos *dsos, const char *name, bool cmp_short)
+ {
+ 	struct dso *dso;
+-	pthread_rwlock_rdlock(&dsos->lock);
++	down_read(&dsos->lock);
+ 	dso = __dsos__find(dsos, name, cmp_short);
+-	pthread_rwlock_unlock(&dsos->lock);
++	up_read(&dsos->lock);
+ 	return dso;
+ }
+ 
+@@ -1398,9 +1398,9 @@ struct dso *__dsos__findnew(struct dsos *dsos, const char *name)
+ struct dso *dsos__findnew(struct dsos *dsos, const char *name)
+ {
+ 	struct dso *dso;
+-	pthread_rwlock_wrlock(&dsos->lock);
++	down_write(&dsos->lock);
+ 	dso = dso__get(__dsos__findnew(dsos, name));
+-	pthread_rwlock_unlock(&dsos->lock);
++	up_write(&dsos->lock);
+ 	return dso;
+ }
+ 
+diff --git a/tools/perf/util/dso.h b/tools/perf/util/dso.h
+index bd061ba7b47c..531e59cfad95 100644
+--- a/tools/perf/util/dso.h
++++ b/tools/perf/util/dso.h
+@@ -6,7 +6,7 @@
+ #include <linux/rbtree.h>
+ #include <sys/types.h>
+ #include <stdbool.h>
+-#include <pthread.h>
++#include "rwsem.h"
+ #include <linux/types.h>
+ #include <linux/bitops.h>
+ #include "map.h"
+@@ -127,7 +127,7 @@ struct dso_cache {
+ struct dsos {
+ 	struct list_head head;
+ 	struct rb_root	 root;	/* rbtree root sorted by long name */
+-	pthread_rwlock_t lock;
++	struct rw_semaphore lock;
+ };
+ 
+ struct auxtrace_cache;
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index dd04122c6a82..60fffd201fda 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -29,7 +29,7 @@ static void dsos__init(struct dsos *dsos)
+ {
+ 	INIT_LIST_HEAD(&dsos->head);
+ 	dsos->root = RB_ROOT;
+-	pthread_rwlock_init(&dsos->lock, NULL);
++	init_rwsem(&dsos->lock);
+ }
+ 
+ static void machine__threads_init(struct machine *machine)
+@@ -39,7 +39,7 @@ static void machine__threads_init(struct machine *machine)
+ 	for (i = 0; i < THREADS__TABLE_SIZE; i++) {
+ 		struct threads *threads = &machine->threads[i];
+ 		threads->entries = RB_ROOT;
+-		pthread_rwlock_init(&threads->lock, NULL);
++		init_rwsem(&threads->lock);
+ 		threads->nr = 0;
+ 		INIT_LIST_HEAD(&threads->dead);
+ 		threads->last_match = NULL;
+@@ -129,7 +129,7 @@ static void dsos__purge(struct dsos *dsos)
+ {
+ 	struct dso *pos, *n;
+ 
+-	pthread_rwlock_wrlock(&dsos->lock);
++	down_write(&dsos->lock);
+ 
+ 	list_for_each_entry_safe(pos, n, &dsos->head, node) {
+ 		RB_CLEAR_NODE(&pos->rb_node);
+@@ -138,13 +138,13 @@ static void dsos__purge(struct dsos *dsos)
+ 		dso__put(pos);
+ 	}
+ 
+-	pthread_rwlock_unlock(&dsos->lock);
++	up_write(&dsos->lock);
+ }
+ 
+ static void dsos__exit(struct dsos *dsos)
+ {
+ 	dsos__purge(dsos);
+-	pthread_rwlock_destroy(&dsos->lock);
++	exit_rwsem(&dsos->lock);
+ }
+ 
+ void machine__delete_threads(struct machine *machine)
+@@ -154,7 +154,7 @@ void machine__delete_threads(struct machine *machine)
+ 
+ 	for (i = 0; i < THREADS__TABLE_SIZE; i++) {
+ 		struct threads *threads = &machine->threads[i];
+-		pthread_rwlock_wrlock(&threads->lock);
++		down_write(&threads->lock);
+ 		nd = rb_first(&threads->entries);
+ 		while (nd) {
+ 			struct thread *t = rb_entry(nd, struct thread, rb_node);
+@@ -162,7 +162,7 @@ void machine__delete_threads(struct machine *machine)
+ 			nd = rb_next(nd);
+ 			__machine__remove_thread(machine, t, false);
+ 		}
+-		pthread_rwlock_unlock(&threads->lock);
++		up_write(&threads->lock);
+ 	}
+ }
+ 
+@@ -179,7 +179,7 @@ void machine__exit(struct machine *machine)
+ 
+ 	for (i = 0; i < THREADS__TABLE_SIZE; i++) {
+ 		struct threads *threads = &machine->threads[i];
+-		pthread_rwlock_destroy(&threads->lock);
++		exit_rwsem(&threads->lock);
+ 	}
+ }
+ 
+@@ -481,9 +481,9 @@ struct thread *machine__findnew_thread(struct machine *machine, pid_t pid,
+ 	struct threads *threads = machine__threads(machine, tid);
+ 	struct thread *th;
+ 
+-	pthread_rwlock_wrlock(&threads->lock);
++	down_write(&threads->lock);
+ 	th = __machine__findnew_thread(machine, pid, tid);
+-	pthread_rwlock_unlock(&threads->lock);
++	up_write(&threads->lock);
+ 	return th;
+ }
+ 
+@@ -493,9 +493,9 @@ struct thread *machine__find_thread(struct machine *machine, pid_t pid,
+ 	struct threads *threads = machine__threads(machine, tid);
+ 	struct thread *th;
+ 
+-	pthread_rwlock_rdlock(&threads->lock);
++	down_read(&threads->lock);
+ 	th =  ____machine__findnew_thread(machine, threads, pid, tid, false);
+-	pthread_rwlock_unlock(&threads->lock);
++	up_read(&threads->lock);
+ 	return th;
+ }
+ 
+@@ -556,7 +556,7 @@ static struct dso *machine__findnew_module_dso(struct machine *machine,
+ {
+ 	struct dso *dso;
+ 
+-	pthread_rwlock_wrlock(&machine->dsos.lock);
++	down_write(&machine->dsos.lock);
+ 
+ 	dso = __dsos__find(&machine->dsos, m->name, true);
+ 	if (!dso) {
+@@ -570,7 +570,7 @@ static struct dso *machine__findnew_module_dso(struct machine *machine,
+ 
+ 	dso__get(dso);
+ out_unlock:
+-	pthread_rwlock_unlock(&machine->dsos.lock);
++	up_write(&machine->dsos.lock);
+ 	return dso;
+ }
+ 
+@@ -716,7 +716,8 @@ size_t machine__fprintf(struct machine *machine, FILE *fp)
+ 
+ 	for (i = 0; i < THREADS__TABLE_SIZE; i++) {
+ 		struct threads *threads = &machine->threads[i];
+-		pthread_rwlock_rdlock(&threads->lock);
++
++		down_read(&threads->lock);
+ 
+ 		ret = fprintf(fp, "Threads: %u\n", threads->nr);
+ 
+@@ -726,7 +727,7 @@ size_t machine__fprintf(struct machine *machine, FILE *fp)
+ 			ret += thread__fprintf(pos, fp);
+ 		}
+ 
+-		pthread_rwlock_unlock(&threads->lock);
++		up_read(&threads->lock);
+ 	}
+ 	return ret;
+ }
+@@ -1286,7 +1287,7 @@ static int machine__process_kernel_mmap_event(struct machine *machine,
+ 		struct dso *kernel = NULL;
+ 		struct dso *dso;
+ 
+-		pthread_rwlock_rdlock(&machine->dsos.lock);
++		down_read(&machine->dsos.lock);
+ 
+ 		list_for_each_entry(dso, &machine->dsos.head, node) {
+ 
+@@ -1316,7 +1317,7 @@ static int machine__process_kernel_mmap_event(struct machine *machine,
+ 			break;
+ 		}
+ 
+-		pthread_rwlock_unlock(&machine->dsos.lock);
++		up_read(&machine->dsos.lock);
+ 
+ 		if (kernel == NULL)
+ 			kernel = machine__findnew_dso(machine, kmmap_prefix);
+@@ -1480,7 +1481,7 @@ static void __machine__remove_thread(struct machine *machine, struct thread *th,
+ 
+ 	BUG_ON(refcount_read(&th->refcnt) == 0);
+ 	if (lock)
+-		pthread_rwlock_wrlock(&threads->lock);
++		down_write(&threads->lock);
+ 	rb_erase_init(&th->rb_node, &threads->entries);
+ 	RB_CLEAR_NODE(&th->rb_node);
+ 	--threads->nr;
+@@ -1491,7 +1492,7 @@ static void __machine__remove_thread(struct machine *machine, struct thread *th,
+ 	 */
+ 	list_add_tail(&th->node, &threads->dead);
+ 	if (lock)
+-		pthread_rwlock_unlock(&threads->lock);
++		up_write(&threads->lock);
+ 	thread__put(th);
+ }
+ 
+diff --git a/tools/perf/util/machine.h b/tools/perf/util/machine.h
+index 7de7f73c48bd..08ff679a26dd 100644
+--- a/tools/perf/util/machine.h
++++ b/tools/perf/util/machine.h
+@@ -6,6 +6,7 @@
+ #include "map.h"
+ #include "dso.h"
+ #include "event.h"
++#include "rwsem.h"
+ 
+ struct addr_location;
+ struct branch_stack;
+@@ -28,7 +29,7 @@ struct vdso_info;
+ 
+ struct threads {
+ 	struct rb_root	  entries;
+-	pthread_rwlock_t  lock;
++	struct rw_semaphore lock;
+ 	unsigned int	  nr;
+ 	struct list_head  dead;
+ 	struct thread	  *last_match;
+diff --git a/tools/perf/util/map.c b/tools/perf/util/map.c
+index 2179b2deb730..ecf5ccb2764d 100644
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@ -471,7 +471,7 @@ u64 map__objdump_2mem(struct map *map, u64 ip)
+ static void maps__init(struct maps *maps)
+ {
+ 	maps->entries = RB_ROOT;
+-	pthread_rwlock_init(&maps->lock, NULL);
++	init_rwsem(&maps->lock);
+ }
+ 
+ void map_groups__init(struct map_groups *mg, struct machine *machine)
+@@ -500,9 +500,9 @@ static void __maps__purge(struct maps *maps)
+ 
+ static void maps__exit(struct maps *maps)
+ {
+-	pthread_rwlock_wrlock(&maps->lock);
++	down_write(&maps->lock);
+ 	__maps__purge(maps);
+-	pthread_rwlock_unlock(&maps->lock);
++	up_write(&maps->lock);
+ }
+ 
+ void map_groups__exit(struct map_groups *mg)
+@@ -569,7 +569,7 @@ struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name,
+ 	struct symbol *sym;
+ 	struct rb_node *nd;
+ 
+-	pthread_rwlock_rdlock(&maps->lock);
++	down_read(&maps->lock);
+ 
+ 	for (nd = rb_first(&maps->entries); nd; nd = rb_next(nd)) {
+ 		struct map *pos = rb_entry(nd, struct map, rb_node);
+@@ -585,7 +585,7 @@ struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name,
+ 
+ 	sym = NULL;
+ out:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_read(&maps->lock);
+ 	return sym;
+ }
+ 
+@@ -621,7 +621,7 @@ static size_t maps__fprintf(struct maps *maps, FILE *fp)
+ 	size_t printed = 0;
+ 	struct rb_node *nd;
+ 
+-	pthread_rwlock_rdlock(&maps->lock);
++	down_read(&maps->lock);
+ 
+ 	for (nd = rb_first(&maps->entries); nd; nd = rb_next(nd)) {
+ 		struct map *pos = rb_entry(nd, struct map, rb_node);
+@@ -633,7 +633,7 @@ static size_t maps__fprintf(struct maps *maps, FILE *fp)
+ 		}
+ 	}
+ 
+-	pthread_rwlock_unlock(&maps->lock);
++	up_read(&maps->lock);
+ 
+ 	return printed;
+ }
+@@ -665,7 +665,7 @@ static int maps__fixup_overlappings(struct maps *maps, struct map *map, FILE *fp
+ 	struct rb_node *next;
+ 	int err = 0;
+ 
+-	pthread_rwlock_wrlock(&maps->lock);
++	down_write(&maps->lock);
+ 
+ 	root = &maps->entries;
+ 	next = rb_first(root);
+@@ -733,7 +733,7 @@ put_map:
+ 
+ 	err = 0;
+ out:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_write(&maps->lock);
+ 	return err;
+ }
+ 
+@@ -754,7 +754,7 @@ int map_groups__clone(struct thread *thread,
+ 	struct map *map;
+ 	struct maps *maps = &parent->maps[type];
+ 
+-	pthread_rwlock_rdlock(&maps->lock);
++	down_read(&maps->lock);
+ 
+ 	for (map = maps__first(maps); map; map = map__next(map)) {
+ 		struct map *new = map__clone(map);
+@@ -771,7 +771,7 @@ int map_groups__clone(struct thread *thread,
+ 
+ 	err = 0;
+ out_unlock:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_read(&maps->lock);
+ 	return err;
+ }
+ 
+@@ -798,9 +798,9 @@ static void __maps__insert(struct maps *maps, struct map *map)
+ 
+ void maps__insert(struct maps *maps, struct map *map)
+ {
+-	pthread_rwlock_wrlock(&maps->lock);
++	down_write(&maps->lock);
+ 	__maps__insert(maps, map);
+-	pthread_rwlock_unlock(&maps->lock);
++	up_write(&maps->lock);
+ }
+ 
+ static void __maps__remove(struct maps *maps, struct map *map)
+@@ -811,9 +811,9 @@ static void __maps__remove(struct maps *maps, struct map *map)
+ 
+ void maps__remove(struct maps *maps, struct map *map)
+ {
+-	pthread_rwlock_wrlock(&maps->lock);
++	down_write(&maps->lock);
+ 	__maps__remove(maps, map);
+-	pthread_rwlock_unlock(&maps->lock);
++	up_write(&maps->lock);
+ }
+ 
+ struct map *maps__find(struct maps *maps, u64 ip)
+@@ -821,7 +821,7 @@ struct map *maps__find(struct maps *maps, u64 ip)
+ 	struct rb_node **p, *parent = NULL;
+ 	struct map *m;
+ 
+-	pthread_rwlock_rdlock(&maps->lock);
++	down_read(&maps->lock);
+ 
+ 	p = &maps->entries.rb_node;
+ 	while (*p != NULL) {
+@@ -837,7 +837,7 @@ struct map *maps__find(struct maps *maps, u64 ip)
+ 
+ 	m = NULL;
+ out:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_read(&maps->lock);
+ 	return m;
+ }
+ 
+diff --git a/tools/perf/util/map.h b/tools/perf/util/map.h
+index f9e8ac8a52cd..ef5e520bf92d 100644
+--- a/tools/perf/util/map.h
++++ b/tools/perf/util/map.h
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ #include <stdbool.h>
+ #include <linux/types.h>
++#include "rwsem.h"
+ 
+ enum map_type {
+ 	MAP__FUNCTION = 0,
+@@ -61,7 +62,7 @@ struct kmap {
+ 
+ struct maps {
+ 	struct rb_root	 entries;
+-	pthread_rwlock_t lock;
++	struct rw_semaphore lock;
+ };
+ 
+ struct map_groups {
+diff --git a/tools/perf/util/rwsem.c b/tools/perf/util/rwsem.c
+new file mode 100644
+index 000000000000..5e52e7baa7b6
+--- /dev/null
++++ b/tools/perf/util/rwsem.c
+@@ -0,0 +1,32 @@
++#include "util.h"
++#include "rwsem.h"
++
++int init_rwsem(struct rw_semaphore *sem)
++{
++	return pthread_rwlock_init(&sem->lock, NULL);
++}
++
++int exit_rwsem(struct rw_semaphore *sem)
++{
++	return pthread_rwlock_destroy(&sem->lock);
++}
++
++int down_read(struct rw_semaphore *sem)
++{
++	return perf_singlethreaded ? 0 : pthread_rwlock_rdlock(&sem->lock);
++}
++
++int up_read(struct rw_semaphore *sem)
++{
++	return perf_singlethreaded ? 0 : pthread_rwlock_unlock(&sem->lock);
++}
++
++int down_write(struct rw_semaphore *sem)
++{
++	return perf_singlethreaded ? 0 : pthread_rwlock_wrlock(&sem->lock);
++}
++
++int up_write(struct rw_semaphore *sem)
++{
++	return perf_singlethreaded ? 0 : pthread_rwlock_unlock(&sem->lock);
++}
+diff --git a/tools/perf/util/rwsem.h b/tools/perf/util/rwsem.h
+new file mode 100644
+index 000000000000..94565ad4d494
+--- /dev/null
++++ b/tools/perf/util/rwsem.h
+@@ -0,0 +1,19 @@
++#ifndef _PERF_RWSEM_H
++#define _PERF_RWSEM_H
++
++#include <pthread.h>
++
++struct rw_semaphore {
++	pthread_rwlock_t lock;
++};
++
++int init_rwsem(struct rw_semaphore *sem);
++int exit_rwsem(struct rw_semaphore *sem);
++
++int down_read(struct rw_semaphore *sem);
++int up_read(struct rw_semaphore *sem);
++
++int down_write(struct rw_semaphore *sem);
++int up_write(struct rw_semaphore *sem);
++
++#endif /* _PERF_RWSEM_H */
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index ab4fcf24fc63..fc1aa4353b7a 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -224,7 +224,7 @@ void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
+ 	struct maps *maps = &mg->maps[type];
+ 	struct map *next, *curr;
+ 
+-	pthread_rwlock_wrlock(&maps->lock);
++	down_write(&maps->lock);
+ 
+ 	curr = maps__first(maps);
+ 	if (curr == NULL)
+@@ -244,7 +244,7 @@ void __map_groups__fixup_end(struct map_groups *mg, enum map_type type)
+ 		curr->end = ~0ULL;
+ 
+ out_unlock:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_write(&maps->lock);
+ }
+ 
+ struct symbol *symbol__new(u64 start, u64 len, u8 binding, const char *name)
+@@ -1601,7 +1601,7 @@ struct map *map_groups__find_by_name(struct map_groups *mg,
+ 	struct maps *maps = &mg->maps[type];
+ 	struct map *map;
+ 
+-	pthread_rwlock_rdlock(&maps->lock);
++	down_read(&maps->lock);
+ 
+ 	for (map = maps__first(maps); map; map = map__next(map)) {
+ 		if (map->dso && strcmp(map->dso->short_name, name) == 0)
+@@ -1611,7 +1611,7 @@ struct map *map_groups__find_by_name(struct map_groups *mg,
+ 	map = NULL;
+ 
+ out_unlock:
+-	pthread_rwlock_unlock(&maps->lock);
++	up_read(&maps->lock);
+ 	return map;
+ }
+ 
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index 718e2ab43079..6811a4cec922 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -221,7 +221,7 @@ static int __thread__prepare_access(struct thread *thread)
+ 		struct maps *maps = &thread->mg->maps[i];
+ 		struct map *map;
+ 
+-		pthread_rwlock_rdlock(&maps->lock);
++		down_read(&maps->lock);
+ 
+ 		for (map = maps__first(maps); map; map = map__next(map)) {
+ 			err = unwind__prepare_access(thread, map, &initialized);
+@@ -229,7 +229,7 @@ static int __thread__prepare_access(struct thread *thread)
+ 				break;
+ 		}
+ 
+-		pthread_rwlock_unlock(&maps->lock);
++		up_read(&maps->lock);
+ 	}
+ 
+ 	return err;
+diff --git a/tools/perf/util/trace-event-info.c b/tools/perf/util/trace-event-info.c
+index e7d60d05596d..d7f2113462fb 100644
+--- a/tools/perf/util/trace-event-info.c
++++ b/tools/perf/util/trace-event-info.c
+@@ -28,7 +28,6 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+-#include <pthread.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <errno.h>
+diff --git a/tools/perf/util/trace-event-read.c b/tools/perf/util/trace-event-read.c
+index 8a9a677f7576..40b425949aa3 100644
+--- a/tools/perf/util/trace-event-read.c
++++ b/tools/perf/util/trace-event-read.c
+@@ -27,7 +27,6 @@
+ #include <sys/stat.h>
+ #include <sys/wait.h>
+ #include <sys/mman.h>
+-#include <pthread.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <errno.h>
+diff --git a/tools/perf/util/util.c b/tools/perf/util/util.c
+index 8ad292e61208..ef9b787f017e 100644
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@ -21,6 +21,19 @@
+ /*
+  * XXX We need to find a better place for these things...
+  */
++
++bool perf_singlethreaded = true;
++
++void perf_set_singlethreaded(void)
++{
++	perf_singlethreaded = true;
++}
++
++void perf_set_multithreaded(void)
++{
++	perf_singlethreaded = false;
++}
++
+ unsigned int page_size;
+ int cacheline_size;
+ 
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index cfae35ca23d1..42b79378d0b2 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -66,4 +66,9 @@ int sched_getcpu(void);
+ int setns(int fd, int nstype);
+ #endif
+ 
++extern bool perf_singlethreaded;
++
++void perf_set_singlethreaded(void);
++void perf_set_multithreaded(void);
++
+ #endif /* GIT_COMPAT_UTIL_H */
+diff --git a/tools/perf/util/vdso.c b/tools/perf/util/vdso.c
+index d3c39eec89a8..f5f843d3c22f 100644
+--- a/tools/perf/util/vdso.c
++++ b/tools/perf/util/vdso.c
+@@ -319,7 +319,7 @@ struct dso *machine__findnew_vdso(struct machine *machine,
+ 	struct vdso_info *vdso_info;
+ 	struct dso *dso = NULL;
+ 
+-	pthread_rwlock_wrlock(&machine->dsos.lock);
++	down_write(&machine->dsos.lock);
+ 	if (!machine->vdso_info)
+ 		machine->vdso_info = vdso_info__new();
+ 
+@@ -347,7 +347,7 @@ struct dso *machine__findnew_vdso(struct machine *machine,
+ 
+ out_unlock:
+ 	dso__get(dso);
+-	pthread_rwlock_unlock(&machine->dsos.lock);
++	up_write(&machine->dsos.lock);
+ 	return dso;
+ }
+ 
