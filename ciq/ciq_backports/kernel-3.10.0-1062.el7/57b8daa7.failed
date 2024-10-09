@@ -1,0 +1,597 @@
+KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] kvm: book3s hv: Snapshot timebase offset on guest entry (Laurent Vivier) [1627090]
+Rebuild_FUZZ: 95.65%
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 57b8daa70a179bc23cc4240420ab6fbcdd7faf77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/57b8daa7.failed
+
+Currently, the HV KVM guest entry/exit code adds the timebase offset
+from the vcore struct to the timebase on guest entry, and subtracts
+it on guest exit.  Which is fine, except that it is possible for
+userspace to change the offset using the SET_ONE_REG interface while
+the vcore is running, as there is only one timebase offset per vcore
+but potentially multiple VCPUs in the vcore.  If that were to happen,
+KVM would subtract a different offset on guest exit from that which
+it had added on guest entry, leading to the timebase being out of sync
+between cores in the host, which then leads to bad things happening
+such as hangs and spurious watchdog timeouts.
+
+To fix this, we add a new field 'tb_offset_applied' to the vcore struct
+which stores the offset that is currently applied to the timebase.
+This value is set from the vcore tb_offset field on guest entry, and
+is what is subtracted from the timebase on guest exit.  Since it is
+zero when the timebase offset is not applied, we can simplify the
+logic in kvmhv_start_timing and kvmhv_accumulate_time.
+
+In addition, we had secondary threads reading the timebase while
+running concurrently with code on the primary thread which would
+eventually add or subtract the timebase offset from the timebase.
+This occurred while saving or restoring the DEC register value on
+the secondary threads.  Although no specific incorrect behaviour has
+been observed, this is a race which should be fixed.  To fix it, we
+move the DEC saving code to just before we call kvmhv_commence_exit,
+and the DEC restoring code to after the point where we have waited
+for the primary thread to switch the MMU context and add the timebase
+offset.  That way we are sure that the timebase contains the guest
+timebase value in both cases.
+
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 57b8daa70a179bc23cc4240420ab6fbcdd7faf77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/asm-offsets.c
+#	arch/powerpc/kvm/book3s_hv_rmhandlers.S
+diff --cc arch/powerpc/kernel/asm-offsets.c
+index 715f10a326c8,373dc1d6ef44..000000000000
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@@ -503,98 -487,106 +503,164 @@@ int main(void
+  
+  	/* book3s */
+  #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ -	OFFSET(KVM_TLB_SETS, kvm, arch.tlb_sets);
+ -	OFFSET(KVM_SDR1, kvm, arch.sdr1);
+ -	OFFSET(KVM_HOST_LPID, kvm, arch.host_lpid);
+ -	OFFSET(KVM_HOST_LPCR, kvm, arch.host_lpcr);
+ -	OFFSET(KVM_HOST_SDR1, kvm, arch.host_sdr1);
+ -	OFFSET(KVM_NEED_FLUSH, kvm, arch.need_tlb_flush.bits);
+ -	OFFSET(KVM_ENABLED_HCALLS, kvm, arch.enabled_hcalls);
+ -	OFFSET(KVM_VRMA_SLB_V, kvm, arch.vrma_slb_v);
+ -	OFFSET(KVM_RADIX, kvm, arch.radix);
+ -	OFFSET(KVM_FWNMI, kvm, arch.fwnmi_enabled);
+ -	OFFSET(VCPU_DSISR, kvm_vcpu, arch.shregs.dsisr);
+ -	OFFSET(VCPU_DAR, kvm_vcpu, arch.shregs.dar);
+ -	OFFSET(VCPU_VPA, kvm_vcpu, arch.vpa.pinned_addr);
+ -	OFFSET(VCPU_VPA_DIRTY, kvm_vcpu, arch.vpa.dirty);
+ -	OFFSET(VCPU_HEIR, kvm_vcpu, arch.emul_inst);
+ -	OFFSET(VCPU_CPU, kvm_vcpu, cpu);
+ -	OFFSET(VCPU_THREAD_CPU, kvm_vcpu, arch.thread_cpu);
+ +	DEFINE(KVM_SDR1, offsetof(struct kvm, arch.sdr1));
+ +	DEFINE(KVM_HOST_LPID, offsetof(struct kvm, arch.host_lpid));
+ +	DEFINE(KVM_HOST_LPCR, offsetof(struct kvm, arch.host_lpcr));
+ +	DEFINE(KVM_HOST_SDR1, offsetof(struct kvm, arch.host_sdr1));
+ +	DEFINE(KVM_NEED_FLUSH, offsetof(struct kvm, arch.need_tlb_flush.bits));
+ +	DEFINE(KVM_ENABLED_HCALLS, offsetof(struct kvm, arch.enabled_hcalls));
+ +	DEFINE(KVM_LPCR, offsetof(struct kvm, arch.lpcr));
+ +	DEFINE(KVM_VRMA_SLB_V, offsetof(struct kvm, arch.vrma_slb_v));
+ +	DEFINE(VCPU_DSISR, offsetof(struct kvm_vcpu, arch.shregs.dsisr));
+ +	DEFINE(VCPU_DAR, offsetof(struct kvm_vcpu, arch.shregs.dar));
+ +	DEFINE(VCPU_VPA, offsetof(struct kvm_vcpu, arch.vpa.pinned_addr));
+ +	DEFINE(VCPU_VPA_DIRTY, offsetof(struct kvm_vcpu, arch.vpa.dirty));
+ +	DEFINE(VCPU_HEIR, offsetof(struct kvm_vcpu, arch.emul_inst));
+ +	DEFINE(VCPU_CPU, offsetof(struct kvm_vcpu, cpu));
+ +	DEFINE(VCPU_THREAD_CPU, offsetof(struct kvm_vcpu, arch.thread_cpu));
+  #endif
+  #ifdef CONFIG_PPC_BOOK3S
+++<<<<<<< HEAD
+ +	DEFINE(VCPU_VCPUID, offsetof(struct kvm_vcpu, vcpu_id));
+ +	DEFINE(VCPU_PURR, offsetof(struct kvm_vcpu, arch.purr));
+ +	DEFINE(VCPU_SPURR, offsetof(struct kvm_vcpu, arch.spurr));
+ +	DEFINE(VCPU_IC, offsetof(struct kvm_vcpu, arch.ic));
+ +	DEFINE(VCPU_DSCR, offsetof(struct kvm_vcpu, arch.dscr));
+ +	DEFINE(VCPU_AMR, offsetof(struct kvm_vcpu, arch.amr));
+ +	DEFINE(VCPU_UAMOR, offsetof(struct kvm_vcpu, arch.uamor));
+ +	DEFINE(VCPU_IAMR, offsetof(struct kvm_vcpu, arch.iamr));
+ +	DEFINE(VCPU_CTRL, offsetof(struct kvm_vcpu, arch.ctrl));
+ +	DEFINE(VCPU_DABR, offsetof(struct kvm_vcpu, arch.dabr));
+ +	DEFINE(VCPU_DABRX, offsetof(struct kvm_vcpu, arch.dabrx));
+ +	DEFINE(VCPU_DAWR, offsetof(struct kvm_vcpu, arch.dawr));
+ +	DEFINE(VCPU_DAWRX, offsetof(struct kvm_vcpu, arch.dawrx));
+ +	DEFINE(VCPU_CIABR, offsetof(struct kvm_vcpu, arch.ciabr));
+ +	DEFINE(VCPU_HFLAGS, offsetof(struct kvm_vcpu, arch.hflags));
+ +	DEFINE(VCPU_DEC, offsetof(struct kvm_vcpu, arch.dec));
+ +	DEFINE(VCPU_DEC_EXPIRES, offsetof(struct kvm_vcpu, arch.dec_expires));
+ +	DEFINE(VCPU_PENDING_EXC, offsetof(struct kvm_vcpu, arch.pending_exceptions));
+ +	DEFINE(VCPU_CEDED, offsetof(struct kvm_vcpu, arch.ceded));
+ +	DEFINE(VCPU_PRODDED, offsetof(struct kvm_vcpu, arch.prodded));
+ +	DEFINE(VCPU_MMCR, offsetof(struct kvm_vcpu, arch.mmcr));
+ +	DEFINE(VCPU_PMC, offsetof(struct kvm_vcpu, arch.pmc));
+ +	DEFINE(VCPU_SPMC, offsetof(struct kvm_vcpu, arch.spmc));
+ +	DEFINE(VCPU_SIAR, offsetof(struct kvm_vcpu, arch.siar));
+ +	DEFINE(VCPU_SDAR, offsetof(struct kvm_vcpu, arch.sdar));
+ +	DEFINE(VCPU_SIER, offsetof(struct kvm_vcpu, arch.sier));
+ +	DEFINE(VCPU_SLB, offsetof(struct kvm_vcpu, arch.slb));
+ +	DEFINE(VCPU_SLB_MAX, offsetof(struct kvm_vcpu, arch.slb_max));
+ +	DEFINE(VCPU_SLB_NR, offsetof(struct kvm_vcpu, arch.slb_nr));
+ +	DEFINE(VCPU_FAULT_DSISR, offsetof(struct kvm_vcpu, arch.fault_dsisr));
+ +	DEFINE(VCPU_FAULT_DAR, offsetof(struct kvm_vcpu, arch.fault_dar));
+ +	DEFINE(VCPU_INTR_MSR, offsetof(struct kvm_vcpu, arch.intr_msr));
+ +	DEFINE(VCPU_LAST_INST, offsetof(struct kvm_vcpu, arch.last_inst));
+ +	DEFINE(VCPU_TRAP, offsetof(struct kvm_vcpu, arch.trap));
+ +	DEFINE(VCPU_CFAR, offsetof(struct kvm_vcpu, arch.cfar));
+ +	DEFINE(VCPU_PPR, offsetof(struct kvm_vcpu, arch.ppr));
+ +	DEFINE(VCPU_FSCR, offsetof(struct kvm_vcpu, arch.fscr));
+ +	DEFINE(VCPU_SHADOW_FSCR, offsetof(struct kvm_vcpu, arch.shadow_fscr));
+ +	DEFINE(VCPU_PSPB, offsetof(struct kvm_vcpu, arch.pspb));
+ +	DEFINE(VCPU_EBBHR, offsetof(struct kvm_vcpu, arch.ebbhr));
+ +	DEFINE(VCPU_EBBRR, offsetof(struct kvm_vcpu, arch.ebbrr));
+ +	DEFINE(VCPU_BESCR, offsetof(struct kvm_vcpu, arch.bescr));
+ +	DEFINE(VCPU_CSIGR, offsetof(struct kvm_vcpu, arch.csigr));
+ +	DEFINE(VCPU_TACR, offsetof(struct kvm_vcpu, arch.tacr));
+ +	DEFINE(VCPU_TCSCR, offsetof(struct kvm_vcpu, arch.tcscr));
+ +	DEFINE(VCPU_ACOP, offsetof(struct kvm_vcpu, arch.acop));
+ +	DEFINE(VCPU_WORT, offsetof(struct kvm_vcpu, arch.wort));
+ +	DEFINE(VCPU_SHADOW_SRR1, offsetof(struct kvm_vcpu, arch.shadow_srr1));
+ +	DEFINE(VCORE_ENTRY_EXIT, offsetof(struct kvmppc_vcore, entry_exit_map));
+ +	DEFINE(VCORE_IN_GUEST, offsetof(struct kvmppc_vcore, in_guest));
+ +	DEFINE(VCORE_NAPPING_THREADS, offsetof(struct kvmppc_vcore, napping_threads));
+ +	DEFINE(VCORE_KVM, offsetof(struct kvmppc_vcore, kvm));
+ +	DEFINE(VCORE_TB_OFFSET, offsetof(struct kvmppc_vcore, tb_offset));
+ +	DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+ +	DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
+ +	DEFINE(VCORE_DPDES, offsetof(struct kvmppc_vcore, dpdes));
+ +	DEFINE(VCORE_VTB, offsetof(struct kvmppc_vcore, vtb));
+ +	DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+ +	DEFINE(VCPU_SLB_V, offsetof(struct kvmppc_slb, origv));
+++=======
++ 	OFFSET(VCPU_PURR, kvm_vcpu, arch.purr);
++ 	OFFSET(VCPU_SPURR, kvm_vcpu, arch.spurr);
++ 	OFFSET(VCPU_IC, kvm_vcpu, arch.ic);
++ 	OFFSET(VCPU_DSCR, kvm_vcpu, arch.dscr);
++ 	OFFSET(VCPU_AMR, kvm_vcpu, arch.amr);
++ 	OFFSET(VCPU_UAMOR, kvm_vcpu, arch.uamor);
++ 	OFFSET(VCPU_IAMR, kvm_vcpu, arch.iamr);
++ 	OFFSET(VCPU_CTRL, kvm_vcpu, arch.ctrl);
++ 	OFFSET(VCPU_DABR, kvm_vcpu, arch.dabr);
++ 	OFFSET(VCPU_DABRX, kvm_vcpu, arch.dabrx);
++ 	OFFSET(VCPU_DAWR, kvm_vcpu, arch.dawr);
++ 	OFFSET(VCPU_DAWRX, kvm_vcpu, arch.dawrx);
++ 	OFFSET(VCPU_CIABR, kvm_vcpu, arch.ciabr);
++ 	OFFSET(VCPU_HFLAGS, kvm_vcpu, arch.hflags);
++ 	OFFSET(VCPU_DEC, kvm_vcpu, arch.dec);
++ 	OFFSET(VCPU_DEC_EXPIRES, kvm_vcpu, arch.dec_expires);
++ 	OFFSET(VCPU_PENDING_EXC, kvm_vcpu, arch.pending_exceptions);
++ 	OFFSET(VCPU_CEDED, kvm_vcpu, arch.ceded);
++ 	OFFSET(VCPU_PRODDED, kvm_vcpu, arch.prodded);
++ 	OFFSET(VCPU_IRQ_PENDING, kvm_vcpu, arch.irq_pending);
++ 	OFFSET(VCPU_DBELL_REQ, kvm_vcpu, arch.doorbell_request);
++ 	OFFSET(VCPU_MMCR, kvm_vcpu, arch.mmcr);
++ 	OFFSET(VCPU_PMC, kvm_vcpu, arch.pmc);
++ 	OFFSET(VCPU_SPMC, kvm_vcpu, arch.spmc);
++ 	OFFSET(VCPU_SIAR, kvm_vcpu, arch.siar);
++ 	OFFSET(VCPU_SDAR, kvm_vcpu, arch.sdar);
++ 	OFFSET(VCPU_SIER, kvm_vcpu, arch.sier);
++ 	OFFSET(VCPU_SLB, kvm_vcpu, arch.slb);
++ 	OFFSET(VCPU_SLB_MAX, kvm_vcpu, arch.slb_max);
++ 	OFFSET(VCPU_SLB_NR, kvm_vcpu, arch.slb_nr);
++ 	OFFSET(VCPU_FAULT_DSISR, kvm_vcpu, arch.fault_dsisr);
++ 	OFFSET(VCPU_FAULT_DAR, kvm_vcpu, arch.fault_dar);
++ 	OFFSET(VCPU_FAULT_GPA, kvm_vcpu, arch.fault_gpa);
++ 	OFFSET(VCPU_INTR_MSR, kvm_vcpu, arch.intr_msr);
++ 	OFFSET(VCPU_LAST_INST, kvm_vcpu, arch.last_inst);
++ 	OFFSET(VCPU_TRAP, kvm_vcpu, arch.trap);
++ 	OFFSET(VCPU_CFAR, kvm_vcpu, arch.cfar);
++ 	OFFSET(VCPU_PPR, kvm_vcpu, arch.ppr);
++ 	OFFSET(VCPU_FSCR, kvm_vcpu, arch.fscr);
++ 	OFFSET(VCPU_PSPB, kvm_vcpu, arch.pspb);
++ 	OFFSET(VCPU_EBBHR, kvm_vcpu, arch.ebbhr);
++ 	OFFSET(VCPU_EBBRR, kvm_vcpu, arch.ebbrr);
++ 	OFFSET(VCPU_BESCR, kvm_vcpu, arch.bescr);
++ 	OFFSET(VCPU_CSIGR, kvm_vcpu, arch.csigr);
++ 	OFFSET(VCPU_TACR, kvm_vcpu, arch.tacr);
++ 	OFFSET(VCPU_TCSCR, kvm_vcpu, arch.tcscr);
++ 	OFFSET(VCPU_ACOP, kvm_vcpu, arch.acop);
++ 	OFFSET(VCPU_WORT, kvm_vcpu, arch.wort);
++ 	OFFSET(VCPU_TID, kvm_vcpu, arch.tid);
++ 	OFFSET(VCPU_PSSCR, kvm_vcpu, arch.psscr);
++ 	OFFSET(VCPU_HFSCR, kvm_vcpu, arch.hfscr);
++ 	OFFSET(VCORE_ENTRY_EXIT, kvmppc_vcore, entry_exit_map);
++ 	OFFSET(VCORE_IN_GUEST, kvmppc_vcore, in_guest);
++ 	OFFSET(VCORE_NAPPING_THREADS, kvmppc_vcore, napping_threads);
++ 	OFFSET(VCORE_KVM, kvmppc_vcore, kvm);
++ 	OFFSET(VCORE_TB_OFFSET, kvmppc_vcore, tb_offset);
++ 	OFFSET(VCORE_TB_OFFSET_APPL, kvmppc_vcore, tb_offset_applied);
++ 	OFFSET(VCORE_LPCR, kvmppc_vcore, lpcr);
++ 	OFFSET(VCORE_PCR, kvmppc_vcore, pcr);
++ 	OFFSET(VCORE_DPDES, kvmppc_vcore, dpdes);
++ 	OFFSET(VCORE_VTB, kvmppc_vcore, vtb);
++ 	OFFSET(VCPU_SLB_E, kvmppc_slb, orige);
++ 	OFFSET(VCPU_SLB_V, kvmppc_slb, origv);
+++>>>>>>> 57b8daa70a17 (KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry)
+  	DEFINE(VCPU_SLB_SIZE, sizeof(struct kvmppc_slb));
+  #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+ -	OFFSET(VCPU_TFHAR, kvm_vcpu, arch.tfhar);
+ -	OFFSET(VCPU_TFIAR, kvm_vcpu, arch.tfiar);
+ -	OFFSET(VCPU_TEXASR, kvm_vcpu, arch.texasr);
+ -	OFFSET(VCPU_ORIG_TEXASR, kvm_vcpu, arch.orig_texasr);
+ -	OFFSET(VCPU_GPR_TM, kvm_vcpu, arch.gpr_tm);
+ -	OFFSET(VCPU_FPRS_TM, kvm_vcpu, arch.fp_tm.fpr);
+ -	OFFSET(VCPU_VRS_TM, kvm_vcpu, arch.vr_tm.vr);
+ -	OFFSET(VCPU_VRSAVE_TM, kvm_vcpu, arch.vrsave_tm);
+ -	OFFSET(VCPU_CR_TM, kvm_vcpu, arch.cr_tm);
+ -	OFFSET(VCPU_XER_TM, kvm_vcpu, arch.xer_tm);
+ -	OFFSET(VCPU_LR_TM, kvm_vcpu, arch.lr_tm);
+ -	OFFSET(VCPU_CTR_TM, kvm_vcpu, arch.ctr_tm);
+ -	OFFSET(VCPU_AMR_TM, kvm_vcpu, arch.amr_tm);
+ -	OFFSET(VCPU_PPR_TM, kvm_vcpu, arch.ppr_tm);
+ -	OFFSET(VCPU_DSCR_TM, kvm_vcpu, arch.dscr_tm);
+ -	OFFSET(VCPU_TAR_TM, kvm_vcpu, arch.tar_tm);
+ +	DEFINE(VCPU_TFHAR, offsetof(struct kvm_vcpu, arch.tfhar));
+ +	DEFINE(VCPU_TFIAR, offsetof(struct kvm_vcpu, arch.tfiar));
+ +	DEFINE(VCPU_TEXASR, offsetof(struct kvm_vcpu, arch.texasr));
+ +	DEFINE(VCPU_GPR_TM, offsetof(struct kvm_vcpu, arch.gpr_tm));
+ +	DEFINE(VCPU_FPRS_TM, offsetof(struct kvm_vcpu, arch.fp_tm.fpr));
+ +	DEFINE(VCPU_VRS_TM, offsetof(struct kvm_vcpu, arch.vr_tm.vr));
+ +	DEFINE(VCPU_VRSAVE_TM, offsetof(struct kvm_vcpu, arch.vrsave_tm));
+ +	DEFINE(VCPU_CR_TM, offsetof(struct kvm_vcpu, arch.cr_tm));
+ +	DEFINE(VCPU_LR_TM, offsetof(struct kvm_vcpu, arch.lr_tm));
+ +	DEFINE(VCPU_CTR_TM, offsetof(struct kvm_vcpu, arch.ctr_tm));
+ +	DEFINE(VCPU_AMR_TM, offsetof(struct kvm_vcpu, arch.amr_tm));
+ +	DEFINE(VCPU_PPR_TM, offsetof(struct kvm_vcpu, arch.ppr_tm));
+ +	DEFINE(VCPU_DSCR_TM, offsetof(struct kvm_vcpu, arch.dscr_tm));
+ +	DEFINE(VCPU_TAR_TM, offsetof(struct kvm_vcpu, arch.tar_tm));
+  #endif
+  
+  #ifdef CONFIG_PPC_BOOK3S_64
+diff --cc arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index 81ccea65482d,25c32e421b57..000000000000
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@@ -813,35 -907,40 +814,38 @@@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S
+  	mtspr	SPRN_EBBHR, r8
+  	ld	r5, VCPU_EBBRR(r4)
+  	ld	r6, VCPU_BESCR(r4)
+ -	lwz	r7, VCPU_GUEST_PID(r4)
+ -	ld	r8, VCPU_WORT(r4)
+ +	ld	r7, VCPU_CSIGR(r4)
+ +	ld	r8, VCPU_TACR(r4)
+  	mtspr	SPRN_EBBRR, r5
+  	mtspr	SPRN_BESCR, r6
+ -	mtspr	SPRN_PID, r7
+ -	mtspr	SPRN_WORT, r8
+ -BEGIN_FTR_SECTION
+ -	PPC_INVALIDATE_ERAT
+ -END_FTR_SECTION_IFSET(CPU_FTR_POWER9_DD1)
+ -BEGIN_FTR_SECTION
+ -	/* POWER8-only registers */
+ +	mtspr	SPRN_CSIGR, r7
+ +	mtspr	SPRN_TACR, r8
+  	ld	r5, VCPU_TCSCR(r4)
+  	ld	r6, VCPU_ACOP(r4)
+ -	ld	r7, VCPU_CSIGR(r4)
+ -	ld	r8, VCPU_TACR(r4)
+ +	lwz	r7, VCPU_GUEST_PID(r4)
+ +	ld	r8, VCPU_WORT(r4)
+  	mtspr	SPRN_TCSCR, r5
+  	mtspr	SPRN_ACOP, r6
+ -	mtspr	SPRN_CSIGR, r7
+ -	mtspr	SPRN_TACR, r8
+ -	nop
+ -FTR_SECTION_ELSE
+ -	/* POWER9-only registers */
+ -	ld	r5, VCPU_TID(r4)
+ -	ld	r6, VCPU_PSSCR(r4)
+ -	lbz	r8, HSTATE_FAKE_SUSPEND(r13)
+ -	oris	r6, r6, PSSCR_EC@h	/* This makes stop trap to HV */
+ -	rldimi	r6, r8, PSSCR_FAKE_SUSPEND_LG, 63 - PSSCR_FAKE_SUSPEND_LG
+ -	ld	r7, VCPU_HFSCR(r4)
+ -	mtspr	SPRN_TIDR, r5
+ -	mtspr	SPRN_PSSCR, r6
+ -	mtspr	SPRN_HFSCR, r7
+ -ALT_FTR_SECTION_END_IFCLR(CPU_FTR_ARCH_300)
+ +	mtspr	SPRN_PID, r7
+ +	mtspr	SPRN_WORT, r8
+  8:
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Set the decrementer to the guest decrementer.
+ +	 */
+ +	ld	r8,VCPU_DEC_EXPIRES(r4)
+ +	/* r8 is a host timebase value here, convert to guest TB */
+ +	ld	r5,HSTATE_KVM_VCORE(r13)
+ +	ld	r6,VCORE_TB_OFFSET(r5)
+ +	add	r8,r8,r6
+ +	mftb	r7
+ +	subf	r3,r7,r8
+ +	mtspr	SPRN_DEC,r3
+ +	stw	r3,VCPU_DEC(r4)
+ +
+++=======
+++>>>>>>> 57b8daa70a17 (KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry)
+  	ld	r5, VCPU_SPRG0(r4)
+  	ld	r6, VCPU_SPRG1(r4)
+  	ld	r7, VCPU_SPRG2(r4)
+@@@ -895,11 -994,110 +899,23 @@@
+  	mtspr	SPRN_LPCR,r8
+  	isync
+  
++ 	/*
++ 	 * Set the decrementer to the guest decrementer.
++ 	 */
++ 	ld	r8,VCPU_DEC_EXPIRES(r4)
++ 	/* r8 is a host timebase value here, convert to guest TB */
++ 	ld	r5,HSTATE_KVM_VCORE(r13)
++ 	ld	r6,VCORE_TB_OFFSET_APPL(r5)
++ 	add	r8,r8,r6
++ 	mftb	r7
++ 	subf	r3,r7,r8
++ 	mtspr	SPRN_DEC,r3
++ 
+  	/* Check if HDEC expires soon */
+  	mfspr	r3, SPRN_HDEC
+ -	EXTEND_HDEC(r3)
+ -	cmpdi	r3, 512		/* 1 microsecond */
+ +	cmpwi	r3, 512		/* 1 microsecond */
+  	blt	hdec_soon
+  
+ -	/* For hash guest, clear out and reload the SLB */
+ -	ld	r6, VCPU_KVM(r4)
+ -	lbz	r0, KVM_RADIX(r6)
+ -	cmpwi	r0, 0
+ -	bne	9f
+ -	li	r6, 0
+ -	slbmte	r6, r6
+ -	slbia
+ -	ptesync
+ -
+ -	/* Load up guest SLB entries (N.B. slb_max will be 0 for radix) */
+ -	lwz	r5,VCPU_SLB_MAX(r4)
+ -	cmpwi	r5,0
+ -	beq	9f
+ -	mtctr	r5
+ -	addi	r6,r4,VCPU_SLB
+ -1:	ld	r8,VCPU_SLB_E(r6)
+ -	ld	r9,VCPU_SLB_V(r6)
+ -	slbmte	r9,r8
+ -	addi	r6,r6,VCPU_SLB_SIZE
+ -	bdnz	1b
+ -9:
+ -
+ -#ifdef CONFIG_KVM_XICS
+ -	/* We are entering the guest on that thread, push VCPU to XIVE */
+ -	ld	r10, HSTATE_XIVE_TIMA_PHYS(r13)
+ -	cmpldi	cr0, r10, 0
+ -	beq	no_xive
+ -	ld	r11, VCPU_XIVE_SAVED_STATE(r4)
+ -	li	r9, TM_QW1_OS
+ -	eieio
+ -	stdcix	r11,r9,r10
+ -	lwz	r11, VCPU_XIVE_CAM_WORD(r4)
+ -	li	r9, TM_QW1_OS + TM_WORD2
+ -	stwcix	r11,r9,r10
+ -	li	r9, 1
+ -	stb	r9, VCPU_XIVE_PUSHED(r4)
+ -	eieio
+ -
+ -	/*
+ -	 * We clear the irq_pending flag. There is a small chance of a
+ -	 * race vs. the escalation interrupt happening on another
+ -	 * processor setting it again, but the only consequence is to
+ -	 * cause a spurrious wakeup on the next H_CEDE which is not an
+ -	 * issue.
+ -	 */
+ -	li	r0,0
+ -	stb	r0, VCPU_IRQ_PENDING(r4)
+ -
+ -	/*
+ -	 * In single escalation mode, if the escalation interrupt is
+ -	 * on, we mask it.
+ -	 */
+ -	lbz	r0, VCPU_XIVE_ESC_ON(r4)
+ -	cmpwi	r0,0
+ -	beq	1f
+ -	ld	r10, VCPU_XIVE_ESC_RADDR(r4)
+ -	li	r9, XIVE_ESB_SET_PQ_01
+ -	ldcix	r0, r10, r9
+ -	sync
+ -
+ -	/* We have a possible subtle race here: The escalation interrupt might
+ -	 * have fired and be on its way to the host queue while we mask it,
+ -	 * and if we unmask it early enough (re-cede right away), there is
+ -	 * a theorical possibility that it fires again, thus landing in the
+ -	 * target queue more than once which is a big no-no.
+ -	 *
+ -	 * Fortunately, solving this is rather easy. If the above load setting
+ -	 * PQ to 01 returns a previous value where P is set, then we know the
+ -	 * escalation interrupt is somewhere on its way to the host. In that
+ -	 * case we simply don't clear the xive_esc_on flag below. It will be
+ -	 * eventually cleared by the handler for the escalation interrupt.
+ -	 *
+ -	 * Then, when doing a cede, we check that flag again before re-enabling
+ -	 * the escalation interrupt, and if set, we abort the cede.
+ -	 */
+ -	andi.	r0, r0, XIVE_ESB_VAL_P
+ -	bne-	1f
+ -
+ -	/* Now P is 0, we can clear the flag */
+ -	li	r0, 0
+ -	stb	r0, VCPU_XIVE_ESC_ON(r4)
+ -1:
+ -no_xive:
+ -#endif /* CONFIG_KVM_XICS */
+ -
+  deliver_guest_interrupt:
+  	ld	r6, VCPU_CTR(r4)
+  	ld	r7, VCPU_XER(r4)
+@@@ -1234,9 -1512,113 +1250,80 @@@ mc_cont
+  	mr	r4, r9
+  	bl	kvmhv_accumulate_time
+  #endif
+ -#ifdef CONFIG_KVM_XICS
+ -	/* We are exiting, pull the VP from the XIVE */
+ -	lbz	r0, VCPU_XIVE_PUSHED(r9)
+ -	cmpwi	cr0, r0, 0
+ -	beq	1f
+ -	li	r7, TM_SPC_PULL_OS_CTX
+ -	li	r6, TM_QW1_OS
+ -	mfmsr	r0
+ -	andi.	r0, r0, MSR_DR		/* in real mode? */
+ -	beq	2f
+ -	ld	r10, HSTATE_XIVE_TIMA_VIRT(r13)
+ -	cmpldi	cr0, r10, 0
+ -	beq	1f
+ -	/* First load to pull the context, we ignore the value */
+ -	eieio
+ -	lwzx	r11, r7, r10
+ -	/* Second load to recover the context state (Words 0 and 1) */
+ -	ldx	r11, r6, r10
+ -	b	3f
+ -2:	ld	r10, HSTATE_XIVE_TIMA_PHYS(r13)
+ -	cmpldi	cr0, r10, 0
+ -	beq	1f
+ -	/* First load to pull the context, we ignore the value */
+ -	eieio
+ -	lwzcix	r11, r7, r10
+ -	/* Second load to recover the context state (Words 0 and 1) */
+ -	ldcix	r11, r6, r10
+ -3:	std	r11, VCPU_XIVE_SAVED_STATE(r9)
+ -	/* Fixup some of the state for the next load */
+ -	li	r10, 0
+ -	li	r0, 0xff
+ -	stb	r10, VCPU_XIVE_PUSHED(r9)
+ -	stb	r10, (VCPU_XIVE_SAVED_STATE+3)(r9)
+ -	stb	r0, (VCPU_XIVE_SAVED_STATE+4)(r9)
+ -	eieio
+ -1:
+ -#endif /* CONFIG_KVM_XICS */
+  
+++<<<<<<< HEAD
+ +	mr 	r3, r12
+++=======
++ 	/* For hash guest, read the guest SLB and save it away */
++ 	ld	r5, VCPU_KVM(r9)
++ 	lbz	r0, KVM_RADIX(r5)
++ 	li	r5, 0
++ 	cmpwi	r0, 0
++ 	bne	3f			/* for radix, save 0 entries */
++ 	lwz	r0,VCPU_SLB_NR(r9)	/* number of entries in SLB */
++ 	mtctr	r0
++ 	li	r6,0
++ 	addi	r7,r9,VCPU_SLB
++ 1:	slbmfee	r8,r6
++ 	andis.	r0,r8,SLB_ESID_V@h
++ 	beq	2f
++ 	add	r8,r8,r6		/* put index in */
++ 	slbmfev	r3,r6
++ 	std	r8,VCPU_SLB_E(r7)
++ 	std	r3,VCPU_SLB_V(r7)
++ 	addi	r7,r7,VCPU_SLB_SIZE
++ 	addi	r5,r5,1
++ 2:	addi	r6,r6,1
++ 	bdnz	1b
++ 	/* Finally clear out the SLB */
++ 	li	r0,0
++ 	slbmte	r0,r0
++ 	slbia
++ 	ptesync
++ 3:	stw	r5,VCPU_SLB_MAX(r9)
++ 
++ 	/* load host SLB entries */
++ BEGIN_MMU_FTR_SECTION
++ 	b	0f
++ END_MMU_FTR_SECTION_IFSET(MMU_FTR_TYPE_RADIX)
++ 	ld	r8,PACA_SLBSHADOWPTR(r13)
++ 
++ 	.rept	SLB_NUM_BOLTED
++ 	li	r3, SLBSHADOW_SAVEAREA
++ 	LDX_BE	r5, r8, r3
++ 	addi	r3, r3, 8
++ 	LDX_BE	r6, r8, r3
++ 	andis.	r7,r5,SLB_ESID_V@h
++ 	beq	1f
++ 	slbmte	r6,r5
++ 1:	addi	r8,r8,16
++ 	.endr
++ 0:
++ 
++ guest_bypass:
++ 	stw	r12, STACK_SLOT_TRAP(r1)
++ 
++ 	/* Save DEC */
++ 	/* Do this before kvmhv_commence_exit so we know TB is guest TB */
++ 	ld	r3, HSTATE_KVM_VCORE(r13)
++ 	mfspr	r5,SPRN_DEC
++ 	mftb	r6
++ 	/* On P9, if the guest has large decr enabled, don't sign extend */
++ BEGIN_FTR_SECTION
++ 	ld	r4, VCORE_LPCR(r3)
++ 	andis.	r4, r4, LPCR_LD@h
++ 	bne	16f
++ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
++ 	extsw	r5,r5
++ 16:	add	r5,r5,r6
++ 	/* r5 is a guest timebase value here, convert to host TB */
++ 	ld	r4,VCORE_TB_OFFSET_APPL(r3)
++ 	subf	r5,r4,r5
++ 	std	r5,VCPU_DEC_EXPIRES(r9)
++ 
+++>>>>>>> 57b8daa70a17 (KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry)
+  	/* Increment exit count, poke other threads to exit */
++ 	mr 	r3, r12
+  	bl	kvmhv_commence_exit
+  	nop
+  	ld	r9, HSTATE_KVM_VCPU(r13)
+@@@ -1297,17 -1659,6 +1384,20 @@@
+  	mtspr	SPRN_PURR,r3
+  	mtspr	SPRN_SPURR,r4
+  
+++<<<<<<< HEAD
+ +	/* Save DEC */
+ +	mfspr	r5,SPRN_DEC
+ +	mftb	r6
+ +	extsw	r5,r5
+ +	add	r5,r5,r6
+ +	/* r5 is a guest timebase value here, convert to host TB */
+ +	ld	r3,HSTATE_KVM_VCORE(r13)
+ +	ld	r4,VCORE_TB_OFFSET(r3)
+ +	subf	r5,r4,r5
+ +	std	r5,VCPU_DEC_EXPIRES(r9)
+ +
+++=======
+++>>>>>>> 57b8daa70a17 (KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry)
+  BEGIN_FTR_SECTION
+  	b	8f
+  END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 160f0ac7c109..8bb977eb6570 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -97,6 +97,7 @@ struct kvmppc_vcore {
+ 	struct kvm_vcpu *runner;
+ 	struct kvm *kvm;
+ 	u64 tb_offset;		/* guest timebase - host timebase */
++	u64 tb_offset_applied;	/* timebase offset currently in force */
+ 	ulong lpcr;
+ 	u32 arch_compat;
+ 	ulong pcr;
+* Unmerged path arch/powerpc/kernel/asm-offsets.c
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index f962976f1ab3..442c0ee35f14 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2086,6 +2086,7 @@ static void init_master_vcore(struct kvmppc_vcore *vc)
+ 	vc->in_guest = 0;
+ 	vc->napping_threads = 0;
+ 	vc->conferring_threads = 0;
++	vc->tb_offset_applied = 0;
+ }
+ 
+ static bool can_dynamic_split(struct kvmppc_vcore *vc, struct core_info *cip)
+* Unmerged path arch/powerpc/kvm/book3s_hv_rmhandlers.S
