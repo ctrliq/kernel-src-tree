@@ -1,0 +1,120 @@
+KVM: nVMX: Clear reserved bits of #DB exit qualification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jim Mattson <jmattson@google.com>
+commit cfb634fe3052aefc4e1360fa322018c9a0b49755
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cfb634fe.failed
+
+According to volume 3 of the SDM, bits 63:15 and 12:4 of the exit
+qualification field for debug exceptions are reserved (cleared to
+0). However, the SDM is incorrect about bit 16 (corresponding to
+DR6.RTM). This bit should be set if a debug exception (#DB) or a
+breakpoint exception (#BP) occurred inside an RTM region while
+advanced debugging of RTM transactional regions was enabled. Note that
+this is the opposite of DR6.RTM, which "indicates (when clear) that a
+debug exception (#DB) or breakpoint exception (#BP) occurred inside an
+RTM region while advanced debugging of RTM transactional regions was
+enabled."
+
+There is still an issue with stale DR6 bits potentially being
+misreported for the current debug exception.  DR6 should not have been
+modified before vectoring the #DB exception, and the "new DR6 bits"
+should be available somewhere, but it was and they aren't.
+
+Fixes: b96fb439774e1 ("KVM: nVMX: fixes to nested virt interrupt injection")
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Reviewed-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cfb634fe3052aefc4e1360fa322018c9a0b49755)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,14d446366ca5..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2641,17 -3264,57 +2641,51 @@@ static void skip_emulated_instruction(s
+   * KVM wants to inject page-faults which it got to the guest. This function
+   * checks whether in a nested guest, we need to inject them to L1 or L2.
+   */
+ -static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned long *exit_qual)
+ +static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned nr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -	unsigned int nr = vcpu->arch.exception.nr;
+  
+++<<<<<<< HEAD
+ +	if (!(vmcs12->exception_bitmap & (1u << nr)))
+ +		return 0;
+++=======
++ 	if (nr == PF_VECTOR) {
++ 		if (vcpu->arch.exception.nested_apf) {
++ 			*exit_qual = vcpu->arch.apf.nested_apf_token;
++ 			return 1;
++ 		}
++ 		/*
++ 		 * FIXME: we must not write CR2 when L1 intercepts an L2 #PF exception.
++ 		 * The fix is to add the ancillary datum (CR2 or DR6) to structs
++ 		 * kvm_queued_exception and kvm_vcpu_events, so that CR2 and DR6
++ 		 * can be written only when inject_pending_event runs.  This should be
++ 		 * conditional on a new capability---if the capability is disabled,
++ 		 * kvm_multiple_exception would write the ancillary information to
++ 		 * CR2 or DR6, for backwards ABI-compatibility.
++ 		 */
++ 		if (nested_vmx_is_page_fault_vmexit(vmcs12,
++ 						    vcpu->arch.exception.error_code)) {
++ 			*exit_qual = vcpu->arch.cr2;
++ 			return 1;
++ 		}
++ 	} else {
++ 		if (vmcs12->exception_bitmap & (1u << nr)) {
++ 			if (nr == DB_VECTOR) {
++ 				*exit_qual = vcpu->arch.dr6;
++ 				*exit_qual &= ~(DR6_FIXED_1 | DR6_BT);
++ 				*exit_qual ^= DR6_RTM;
++ 			} else {
++ 				*exit_qual = 0;
++ 			}
++ 			return 1;
++ 		}
++ 	}
+++>>>>>>> cfb634fe3052 (KVM: nVMX: Clear reserved bits of #DB exit qualification)
+  
+ -	return 0;
+ -}
+ -
+ -static void vmx_clear_hlt(struct kvm_vcpu *vcpu)
+ -{
+ -	/*
+ -	 * Ensure that we clear the HLT state in the VMCS.  We don't need to
+ -	 * explicitly skip the instruction because if the HLT state is set,
+ -	 * then the instruction is already executing and RIP has already been
+ -	 * advanced.
+ -	 */
+ -	if (kvm_hlt_in_guest(vcpu->kvm) &&
+ -			vmcs_read32(GUEST_ACTIVITY_STATE) == GUEST_ACTIVITY_HLT)
+ -		vmcs_write32(GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_ACTIVE);
+ +	nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
+ +			  vmcs_read32(VM_EXIT_INTR_INFO),
+ +			  vmcs_readl(EXIT_QUALIFICATION));
+ +	return 1;
+  }
+  
+  static void vmx_queue_exception(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a..9b5cde6a9e99 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -150,6 +150,7 @@ enum {
+ 
+ #define DR6_BD		(1 << 13)
+ #define DR6_BS		(1 << 14)
++#define DR6_BT		(1 << 15)
+ #define DR6_RTM		(1 << 16)
+ #define DR6_FIXED_1	0xfffe0ff0
+ #define DR6_INIT	0xffff0ff0
+* Unmerged path arch/x86/kvm/vmx.c
