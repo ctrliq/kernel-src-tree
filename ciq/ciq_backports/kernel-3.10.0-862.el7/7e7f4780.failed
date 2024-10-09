@@ -1,0 +1,312 @@
+net/mlx5e: IPoIB, Use hash-table to map between QPN to child netdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: IPoIB, Use hash-table to map between QPN to child netdev (Kamal Heib) [1517570 1456694]
+Rebuild_FUZZ: 96.92%
+commit-author Alex Vesker <valex@mellanox.com>
+commit 7e7f4780c3402bd181eea82ca6395013623e4fbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7e7f4780.failed
+
+This change is needed for PKEY support, since the RQs are shared
+between the child interface and the parent. The parent is responsible
+for NAPI and the precessing of RX completions. Using the dqpn in the
+completion descriptor we set the corresponding child IPoIB netdevice
+on the SKB.
+The mapping between the dqpn and the netdevice is done using a HT,
+each mlx5 IPoIB interface registers its mapping on creation.
+
+	Signed-off-by: Alex Vesker <valex@mellanox.com>
+	Reviewed-by: Erez Shitrit <erezsh@mellanox.com>
+(cherry picked from commit 7e7f4780c3402bd181eea82ca6395013623e4fbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib_vlan.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 9e644615f07a,100fe4ecad9b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -12,4 -22,9 +12,13 @@@ mlx5_core-$(CONFIG_MLX5_CORE_EN) += wq.
+  
+  mlx5_core-$(CONFIG_MLX5_CORE_EN_DCB) +=  en_dcbnl.o
+  
+++<<<<<<< HEAD
+ +mlx5_core-$(CONFIG_MLX5_CORE_IPOIB) += ipoib.o
+++=======
++ mlx5_core-$(CONFIG_MLX5_CORE_IPOIB) += ipoib/ipoib.o ipoib/ethtool.o ipoib/ipoib_vlan.o
++ 
++ mlx5_core-$(CONFIG_MLX5_EN_IPSEC) += en_accel/ipsec.o en_accel/ipsec_rxtx.o \
++ 		en_accel/ipsec_stats.o
++ 
++ CFLAGS_tracepoint.o := -I$(src)
+++>>>>>>> 7e7f4780c340 (net/mlx5e: IPoIB, Use hash-table to map between QPN to child netdev)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index d6a4d3219a46,2c3f2e9b6983..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -841,3 -1080,220 +841,223 @@@ int mlx5e_poll_rx_cq(struct mlx5e_cq *c
+  
+  	return work_done;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
++ {
++ 	struct mlx5e_xdpsq *sq;
++ 	struct mlx5_cqe64 *cqe;
++ 	struct mlx5e_rq *rq;
++ 	u16 sqcc;
++ 	int i;
++ 
++ 	sq = container_of(cq, struct mlx5e_xdpsq, cq);
++ 
++ 	if (unlikely(!MLX5E_TEST_BIT(sq->state, MLX5E_SQ_STATE_ENABLED)))
++ 		return false;
++ 
++ 	cqe = mlx5_cqwq_get_cqe(&cq->wq);
++ 	if (!cqe)
++ 		return false;
++ 
++ 	rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 
++ 	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
++ 	 * otherwise a cq overrun may occur
++ 	 */
++ 	sqcc = sq->cc;
++ 
++ 	i = 0;
++ 	do {
++ 		u16 wqe_counter;
++ 		bool last_wqe;
++ 
++ 		mlx5_cqwq_pop(&cq->wq);
++ 
++ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
++ 
++ 		do {
++ 			struct mlx5e_dma_info *di;
++ 			u16 ci;
++ 
++ 			last_wqe = (sqcc == wqe_counter);
++ 
++ 			ci = sqcc & sq->wq.sz_m1;
++ 			di = &sq->db.di[ci];
++ 
++ 			sqcc++;
++ 			/* Recycle RX page */
++ 			mlx5e_page_release(rq, di, true);
++ 		} while (!last_wqe);
++ 	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
++ 
++ 	mlx5_cqwq_update_db_record(&cq->wq);
++ 
++ 	/* ensure cq space is freed before enabling more cqes */
++ 	wmb();
++ 
++ 	sq->cc = sqcc;
++ 	return (i == MLX5E_TX_CQ_POLL_BUDGET);
++ }
++ 
++ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++ 	struct mlx5e_dma_info *di;
++ 	u16 ci;
++ 
++ 	while (sq->cc != sq->pc) {
++ 		ci = sq->cc & sq->wq.sz_m1;
++ 		di = &sq->db.di[ci];
++ 		sq->cc++;
++ 
++ 		mlx5e_page_release(rq, di, false);
++ 	}
++ }
++ 
++ #ifdef CONFIG_MLX5_CORE_IPOIB
++ 
++ #define MLX5_IB_GRH_DGID_OFFSET 24
++ #define MLX5_GID_SIZE           16
++ 
++ static inline void mlx5i_complete_rx_cqe(struct mlx5e_rq *rq,
++ 					 struct mlx5_cqe64 *cqe,
++ 					 u32 cqe_bcnt,
++ 					 struct sk_buff *skb)
++ {
++ 	struct net_device *netdev;
++ 	char *pseudo_header;
++ 	u32 qpn;
++ 	u8 *dgid;
++ 	u8 g;
++ 
++ 	qpn = be32_to_cpu(cqe->sop_drop_qpn) & 0xffffff;
++ 	netdev = mlx5i_pkey_get_netdev(rq->netdev, qpn);
++ 
++ 	/* No mapping present, cannot process SKB. This might happen if a child
++ 	 * interface is going down while having unprocessed CQEs on parent RQ
++ 	 */
++ 	if (unlikely(!netdev)) {
++ 		/* TODO: add drop counters support */
++ 		skb->dev = NULL;
++ 		pr_warn_once("Unable to map QPN %u to dev - dropping skb\n", qpn);
++ 		return;
++ 	}
++ 
++ 	g = (be32_to_cpu(cqe->flags_rqpn) >> 28) & 3;
++ 	dgid = skb->data + MLX5_IB_GRH_DGID_OFFSET;
++ 	if ((!g) || dgid[0] != 0xff)
++ 		skb->pkt_type = PACKET_HOST;
++ 	else if (memcmp(dgid, netdev->broadcast + 4, MLX5_GID_SIZE) == 0)
++ 		skb->pkt_type = PACKET_BROADCAST;
++ 	else
++ 		skb->pkt_type = PACKET_MULTICAST;
++ 
++ 	/* TODO: IB/ipoib: Allow mcast packets from other VFs
++ 	 * 68996a6e760e5c74654723eeb57bf65628ae87f4
++ 	 */
++ 
++ 	skb_pull(skb, MLX5_IB_GRH_BYTES);
++ 
++ 	skb->protocol = *((__be16 *)(skb->data));
++ 
++ 	skb->ip_summed = CHECKSUM_COMPLETE;
++ 	skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
++ 
++ 	if (unlikely(mlx5e_rx_hw_stamp(rq->tstamp)))
++ 		skb_hwtstamps(skb)->hwtstamp =
++ 				mlx5_timecounter_cyc2time(rq->clock, get_cqe_ts(cqe));
++ 
++ 	skb_record_rx_queue(skb, rq->ix);
++ 
++ 	if (likely(netdev->features & NETIF_F_RXHASH))
++ 		mlx5e_skb_set_hash(cqe, skb);
++ 
++ 	/* 20 bytes of ipoib header and 4 for encap existing */
++ 	pseudo_header = skb_push(skb, MLX5_IPOIB_PSEUDO_LEN);
++ 	memset(pseudo_header, 0, MLX5_IPOIB_PSEUDO_LEN);
++ 	skb_reset_mac_header(skb);
++ 	skb_pull(skb, MLX5_IPOIB_HARD_LEN);
++ 
++ 	skb->dev = netdev;
++ 
++ 	rq->stats.csum_complete++;
++ 	rq->stats.packets++;
++ 	rq->stats.bytes += cqe_bcnt;
++ }
++ 
++ void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_wqe_frag_info *wi;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	wi             = &rq->wqe.frag_info[wqe_counter];
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
++ 	if (!skb)
++ 		goto wq_free_wqe;
++ 
++ 	mlx5i_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	if (unlikely(!skb->dev)) {
++ 		dev_kfree_skb_any(skb);
++ 		goto wq_free_wqe;
++ 	}
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ wq_free_wqe:
++ 	mlx5e_free_rx_wqe_reuse(rq, wi);
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_CORE_IPOIB */
++ 
++ #ifdef CONFIG_MLX5_EN_IPSEC
++ 
++ void mlx5e_ipsec_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	struct mlx5e_wqe_frag_info *wi;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	__be16 wqe_counter_be;
++ 	struct sk_buff *skb;
++ 	u16 wqe_counter;
++ 	u32 cqe_bcnt;
++ 
++ 	wqe_counter_be = cqe->wqe_counter;
++ 	wqe_counter    = be16_to_cpu(wqe_counter_be);
++ 	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
++ 	wi             = &rq->wqe.frag_info[wqe_counter];
++ 	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
++ 
++ 	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
++ 	if (unlikely(!skb)) {
++ 		/* a DROP, save the page-reuse checks */
++ 		mlx5e_free_rx_wqe(rq, wi);
++ 		goto wq_ll_pop;
++ 	}
++ 	skb = mlx5e_ipsec_handle_rx_skb(rq->netdev, skb);
++ 	if (unlikely(!skb)) {
++ 		mlx5e_free_rx_wqe(rq, wi);
++ 		goto wq_ll_pop;
++ 	}
++ 
++ 	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
++ 	napi_gro_receive(rq->cq.napi, skb);
++ 
++ 	mlx5e_free_rx_wqe_reuse(rq, wi);
++ wq_ll_pop:
++ 	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
++ 		       &wqe->next.next_wqe_index);
++ }
++ 
++ #endif /* CONFIG_MLX5_EN_IPSEC */
+++>>>>>>> 7e7f4780c340 (net/mlx5e: IPoIB, Use hash-table to map between QPN to child netdev)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+index 89bca182464c,e313f6d90729..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+@@@ -38,9 -38,20 +38,15 @@@
+  
+  #define MLX5I_MAX_NUM_TC 1
+  
+ -extern const struct ethtool_ops mlx5i_ethtool_ops;
+ -
+ -#define MLX5_IB_GRH_BYTES       40
+ -#define MLX5_IPOIB_ENCAP_LEN    4
+ -#define MLX5_IPOIB_PSEUDO_LEN   20
+ -#define MLX5_IPOIB_HARD_LEN     (MLX5_IPOIB_PSEUDO_LEN + MLX5_IPOIB_ENCAP_LEN)
+ -
+  /* ipoib rdma netdev's private data structure */
+  struct mlx5i_priv {
+ -	struct rdma_netdev rn; /* keep this first */
+  	struct mlx5_core_qp qp;
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+++=======
++ 	u32    qkey;
++ 	u16    pkey_index;
++ 	struct mlx5i_pkey_qpn_ht *qpn_htbl;
+++>>>>>>> 7e7f4780c340 (net/mlx5e: IPoIB, Use hash-table to map between QPN to child netdev):drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.h
+  	char  *mlx5e_priv[0];
+  };
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib_vlan.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib_vlan.c
