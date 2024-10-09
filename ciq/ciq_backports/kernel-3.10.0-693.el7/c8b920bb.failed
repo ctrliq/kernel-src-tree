@@ -1,0 +1,330 @@
+xprtrdma: Basic support for Remote Invalidation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit c8b920bb49939a5c6cf1d2d819300f318ea050d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c8b920bb.failed
+
+Have frwr's ro_unmap_sync recognize an invalidated rkey that appears
+as part of a Receive completion. Local invalidation can be skipped
+for that rkey.
+
+Use an out-of-band signaling mechanism to indicate to the server
+that the client is prepared to receive RDMA Send With Invalidate.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit c8b920bb49939a5c6cf1d2d819300f318ea050d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/transport.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index 15d7a6db625a,1ebb09e1ac4f..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -263,19 -269,14 +263,25 @@@ fmr_op_unmap_sync(struct rpcrdma_xprt *
+  	/* ORDER: Invalidate all of the req's MRs first
+  	 *
+  	 * ib_unmap_fmr() is slow, so use a single call instead
+ -	 * of one call per mapped FMR.
+ +	 * of one call per mapped MR.
+  	 */
+++<<<<<<< HEAD
+ +	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+ +		seg = &req->rl_segments[i];
+ +		mw = seg->rl_mw;
+ +
+ +		list_add_tail(&mw->fmr.fmr->list, &unmap_list);
+ +
+ +		i += seg->mr_nsegs;
+ +	}
+++=======
++ 	list_for_each_entry(mw, &req->rl_registered, mw_list)
++ 		list_add_tail(&mw->fmr.fm_mr->list, &unmap_list);
++ 	r_xprt->rx_stats.local_inv_needed++;
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  	rc = ib_unmap_fmr(&unmap_list);
+  	if (rc)
+ -		goto out_reset;
+ +		pr_warn("%s: ib_unmap_fmr failed (%i)\n", __func__, rc);
+  
+  	/* ORDER: Now DMA unmap all of the req's MRs, and return
+  	 * them to the free MW list.
+@@@ -386,10 -325,11 +392,11 @@@ const struct rpcrdma_memreg_ops rpcrdma
+  	.ro_map				= fmr_op_map,
+  	.ro_unmap_sync			= fmr_op_unmap_sync,
+  	.ro_unmap_safe			= fmr_op_unmap_safe,
+ -	.ro_recover_mr			= fmr_op_recover_mr,
+ +	.ro_unmap			= fmr_op_unmap,
+  	.ro_open			= fmr_op_open,
+  	.ro_maxpages			= fmr_op_maxpages,
+ -	.ro_init_mr			= fmr_op_init_mr,
+ -	.ro_release_mr			= fmr_op_release_mr,
+ +	.ro_init			= fmr_op_init,
+ +	.ro_destroy			= fmr_op_destroy,
+  	.ro_displayname			= "fmr",
++ 	.ro_send_w_inv_ok		= 0,
+  };
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 0efe42a52a2b,e82d5cfce8ab..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -516,9 -473,9 +518,10 @@@ static voi
+  frwr_op_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
+  {
+  	struct ib_send_wr *invalidate_wrs, *pos, *prev, *bad_wr;
++ 	struct rpcrdma_rep *rep = req->rl_reply;
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct rpcrdma_mw *mw, *tmp;
+ +	struct rpcrdma_mr_seg *seg;
+ +	unsigned int i, nchunks;
+  	struct rpcrdma_frmr *f;
+  	int rc;
+  
+@@@ -529,22 -486,26 +532,38 @@@
+  	 * Chain the LOCAL_INV Work Requests and post them with
+  	 * a single ib_post_send() call.
+  	 */
+ -	f = NULL;
+  	invalidate_wrs = pos = prev = NULL;
+++<<<<<<< HEAD
+ +	seg = NULL;
+ +	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+ +		seg = &req->rl_segments[i];
+ +
+ +		pos = __frwr_prepare_linv_wr(seg);
+++=======
++ 	list_for_each_entry(mw, &req->rl_registered, mw_list) {
++ 		if ((rep->rr_wc_flags & IB_WC_WITH_INVALIDATE) &&
++ 		    (mw->mw_handle == rep->rr_inv_rkey)) {
++ 			mw->frmr.fr_state = FRMR_IS_INVALID;
++ 			continue;
++ 		}
++ 
++ 		pos = __frwr_prepare_linv_wr(mw);
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  
+  		if (!invalidate_wrs)
+  			invalidate_wrs = pos;
+  		else
+  			prev->next = pos;
+  		prev = pos;
+ -		f = &mw->frmr;
+ +
+ +		i += seg->mr_nsegs;
+  	}
+++<<<<<<< HEAD
+ +	f = &seg->rl_mw->frmr;
+++=======
++ 	if (!f)
++ 		goto unmap;
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  
+  	/* Strong send queue ordering guarantees that when the
+  	 * last WR in the chain completes, all WRs in the chain
+@@@ -559,12 -520,10 +578,13 @@@
+  	 * replaces the QP. The RPC reply handler won't call us
+  	 * unless ri_id->qp is a valid pointer.
+  	 */
++ 	r_xprt->rx_stats.local_inv_needed++;
+  	rc = ib_post_send(ia->ri_id->qp, invalidate_wrs, &bad_wr);
+ -	if (rc)
+ -		goto reset_mrs;
+ +	if (rc) {
+ +		pr_warn("%s: ib_post_send failed %i\n", __func__, rc);
+ +		rdma_disconnect(ia->ri_id);
+ +		goto unmap;
+ +	}
+  
+  	wait_for_completion(&f->fr_linv_done);
+  
+@@@ -672,10 -581,11 +692,11 @@@ const struct rpcrdma_memreg_ops rpcrdma
+  	.ro_map				= frwr_op_map,
+  	.ro_unmap_sync			= frwr_op_unmap_sync,
+  	.ro_unmap_safe			= frwr_op_unmap_safe,
+ -	.ro_recover_mr			= frwr_op_recover_mr,
+ +	.ro_unmap			= frwr_op_unmap,
+  	.ro_open			= frwr_op_open,
+  	.ro_maxpages			= frwr_op_maxpages,
+ -	.ro_init_mr			= frwr_op_init_mr,
+ -	.ro_release_mr			= frwr_op_release_mr,
+ +	.ro_init			= frwr_op_init,
+ +	.ro_destroy			= frwr_op_destroy,
+  	.ro_displayname			= "frwr",
++ 	.ro_send_w_inv_ok		= RPCRDMA_CMP_F_SND_W_INV_OK,
+  };
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 83e624c2ef04,31a434d2f143..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -232,16 -231,17 +232,21 @@@ rpcrdma_convert_kvec(struct kvec *vec, 
+  
+  static int
+  rpcrdma_convert_iovs(struct xdr_buf *xdrbuf, unsigned int pos,
+++<<<<<<< HEAD
+ +	enum rpcrdma_chunktype type, struct rpcrdma_mr_seg *seg, int nsegs)
+++=======
++ 	enum rpcrdma_chunktype type, struct rpcrdma_mr_seg *seg,
++ 	bool reminv_expected)
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  {
+ -	int len, n, p, page_base;
+ +	int len, n = 0, p;
+ +	int page_base;
+  	struct page **ppages;
+  
+ -	n = 0;
+  	if (pos == 0) {
+ -		n = rpcrdma_convert_kvec(&xdrbuf->head[0], seg, n);
+ -		if (n == RPCRDMA_MAX_SEGS)
+ -			goto out_overflow;
+ +		n = rpcrdma_convert_kvec(&xdrbuf->head[0], seg, n, nsegs);
+ +		if (n == nsegs)
+ +			return -EIO;
+  	}
+  
+  	len = xdrbuf->page_len;
+@@@ -475,8 -336,8 +487,13 @@@ rpcrdma_encode_read_list(struct rpcrdma
+  	pos = rqst->rq_snd_buf.head[0].iov_len;
+  	if (rtype == rpcrdma_areadch)
+  		pos = 0;
+++<<<<<<< HEAD
+ +	nsegs = rpcrdma_convert_iovs(&rqst->rq_snd_buf, pos, rtype, seg,
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 	seg = req->rl_segments;
++ 	nsegs = rpcrdma_convert_iovs(&rqst->rq_snd_buf, pos, rtype, seg, false);
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+@@@ -540,7 -401,8 +557,11 @@@ rpcrdma_encode_write_list(struct rpcrdm
+  	nsegs = rpcrdma_convert_iovs(&rqst->rq_rcv_buf,
+  				     rqst->rq_rcv_buf.head[0].iov_len,
+  				     wtype, seg,
+++<<<<<<< HEAD
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 				     r_xprt->rx_ia.ri_reminv_expected);
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+@@@ -604,8 -466,9 +625,14 @@@ rpcrdma_encode_reply_chunk(struct rpcrd
+  		return iptr;
+  	}
+  
+++<<<<<<< HEAD
+ +	nsegs = rpcrdma_convert_iovs(&rqst->rq_rcv_buf, 0, wtype, seg,
+ +				     RPCRDMA_MAX_SEGS - req->rl_nchunks);
+++=======
++ 	seg = req->rl_segments;
++ 	nsegs = rpcrdma_convert_iovs(&rqst->rq_rcv_buf, 0, wtype, seg,
++ 				     r_xprt->rx_ia.ri_reminv_expected);
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  	if (nsegs < 0)
+  		return ERR_PTR(nsegs);
+  
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,7e11d7191208..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -672,6 -730,11 +672,14 @@@ void xprt_rdma_print_stats(struct rpc_x
+  		   r_xprt->rx_stats.failed_marshal_count,
+  		   r_xprt->rx_stats.bad_reply_count,
+  		   r_xprt->rx_stats.nomsg_call_count);
+++<<<<<<< HEAD
+++=======
++ 	seq_printf(seq, "%lu %lu %lu %lu\n",
++ 		   r_xprt->rx_stats.mrs_recovered,
++ 		   r_xprt->rx_stats.mrs_orphaned,
++ 		   r_xprt->rx_stats.mrs_allocated,
++ 		   r_xprt->rx_stats.local_inv_needed);
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  }
+  
+  static int
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6,64b4e2257478..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -377,6 -385,10 +380,13 @@@ struct rpcrdma_stats 
+  	unsigned long		bad_reply_count;
+  	unsigned long		nomsg_call_count;
+  	unsigned long		bcall_count;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long		mrs_recovered;
++ 	unsigned long		mrs_orphaned;
++ 	unsigned long		mrs_allocated;
++ 	unsigned long		local_inv_needed;
+++>>>>>>> c8b920bb4993 (xprtrdma: Basic support for Remote Invalidation)
+  };
+  
+  /*
+@@@ -396,9 -408,11 +406,10 @@@ struct rpcrdma_memreg_ops 
+  				   struct rpcrdma_ep *,
+  				   struct rpcrdma_create_data_internal *);
+  	size_t		(*ro_maxpages)(struct rpcrdma_xprt *);
+ -	int		(*ro_init_mr)(struct rpcrdma_ia *,
+ -				      struct rpcrdma_mw *);
+ -	void		(*ro_release_mr)(struct rpcrdma_mw *);
+ +	int		(*ro_init)(struct rpcrdma_xprt *);
+ +	void		(*ro_destroy)(struct rpcrdma_buffer *);
+  	const char	*ro_displayname;
++ 	const int	ro_send_w_inv_ok;
+  };
+  
+  extern const struct rpcrdma_memreg_ops rpcrdma_fmr_memreg_ops;
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 0e2259140f79..8de3921d1190 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -185,6 +185,9 @@ rpcrdma_receive_wc(struct ib_cq *cq, struct ib_wc *wc)
+ 		__func__, rep, wc->byte_len);
+ 
+ 	rep->rr_len = wc->byte_len;
++	rep->rr_wc_flags = wc->wc_flags;
++	rep->rr_inv_rkey = wc->ex.invalidate_rkey;
++
+ 	ib_dma_sync_single_for_cpu(rep->rr_device,
+ 				   rdmab_addr(rep->rr_rdmabuf),
+ 				   rep->rr_len, DMA_FROM_DEVICE);
+@@ -212,12 +215,15 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
+ 	const struct rpcrdma_connect_private *pmsg = param->private_data;
+ 	unsigned int rsize, wsize;
+ 
++	/* Default settings for RPC-over-RDMA Version One */
++	r_xprt->rx_ia.ri_reminv_expected = false;
+ 	rsize = RPCRDMA_V1_DEF_INLINE_SIZE;
+ 	wsize = RPCRDMA_V1_DEF_INLINE_SIZE;
+ 
+ 	if (pmsg &&
+ 	    pmsg->cp_magic == rpcrdma_cmp_magic &&
+ 	    pmsg->cp_version == RPCRDMA_CMP_VERSION) {
++		r_xprt->rx_ia.ri_reminv_expected = true;
+ 		rsize = rpcrdma_decode_buffer_size(pmsg->cp_send_size);
+ 		wsize = rpcrdma_decode_buffer_size(pmsg->cp_recv_size);
+ 	}
+@@ -588,7 +594,7 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 	/* Prepare RDMA-CM private message */
+ 	pmsg->cp_magic = rpcrdma_cmp_magic;
+ 	pmsg->cp_version = RPCRDMA_CMP_VERSION;
+-	pmsg->cp_flags = 0;
++	pmsg->cp_flags |= ia->ri_ops->ro_send_w_inv_ok;
+ 	pmsg->cp_send_size = rpcrdma_encode_buffer_size(cdata->inline_wsize);
+ 	pmsg->cp_recv_size = rpcrdma_encode_buffer_size(cdata->inline_rsize);
+ 	ep->rep_remote_cma.private_data = pmsg;
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
