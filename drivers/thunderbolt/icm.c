@@ -630,7 +630,7 @@ __icm_driver_ready(struct tb *tb, enum tb_security_level *security_level)
 	struct icm_pkg_driver_ready request = {
 		.hdr.code = ICM_DRIVER_READY,
 	};
-	unsigned int retries = 10;
+	unsigned int retries = 50;
 	int ret;
 
 	memset(&reply, 0, sizeof(reply));
@@ -658,6 +658,7 @@ __icm_driver_ready(struct tb *tb, enum tb_security_level *security_level)
 		msleep(50);
 	} while (--retries);
 
+	tb_err(tb, "failed to read root switch config space, giving up\n");
 	return -ETIMEDOUT;
 }
 
