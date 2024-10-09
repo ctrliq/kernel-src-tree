@@ -1,0 +1,309 @@
+flow_dissector: Jump to exit code in __skb_flow_dissect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit a6e544b0a88b53114bfa5a57e21b7be7a8dfc9d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a6e544b0.failed
+
+Instead of returning immediately (on a parsing failure for instance) we
+jump to cleanup code. This always sets protocol values in key_control
+(even on a failure there is still valid information in the key_tags that
+was set before the problem was hit).
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a6e544b0a88b53114bfa5a57e21b7be7a8dfc9d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index c177964713d3,22f3d768b459..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -116,13 -112,25 +116,24 @@@ EXPORT_SYMBOL(__skb_flow_get_ports)
+   * @nhoff: network header offset, if @data is NULL use skb_network_offset(skb)
+   * @hlen: packet header length, if @data is NULL use skb_headlen(skb)
+   *
+ - * The function will try to retrieve individual keys into target specified
+ - * by flow_dissector from either the skbuff or a raw buffer specified by the
+ - * rest parameters.
+ - *
+ - * Caller must take care of zeroing target container memory.
+ + * The function will try to retrieve the struct flow_keys from either the skbuff
+ + * or a raw buffer specified by the rest parameters
+   */
+ -bool __skb_flow_dissect(const struct sk_buff *skb,
+ -			struct flow_dissector *flow_dissector,
+ -			void *target_container,
+ +bool __skb_flow_dissect(const struct sk_buff *skb, struct flow_keys *flow,
+  			void *data, __be16 proto, int nhoff, int hlen)
+  {
+++<<<<<<< HEAD
+ +	u8 ip_proto;
+++=======
++ 	struct flow_dissector_key_control *key_control;
++ 	struct flow_dissector_key_basic *key_basic;
++ 	struct flow_dissector_key_addrs *key_addrs;
++ 	struct flow_dissector_key_ports *key_ports;
++ 	struct flow_dissector_key_tags *key_tags;
++ 	struct flow_dissector_key_keyid *key_keyid;
++ 	u8 ip_proto = 0;
++ 	bool ret = false;
+++>>>>>>> a6e544b0a88b (flow_dissector: Jump to exit code in __skb_flow_dissect)
+  
+  	if (!data) {
+  		data = skb->data;
+@@@ -157,19 -196,35 +168,19 @@@ ip
+  ipv6:
+  		iph = __skb_header_pointer(skb, nhoff, sizeof(_iph), data, hlen, &_iph);
+  		if (!iph)
+- 			return false;
++ 			goto out_bad;
+  
+  		ip_proto = iph->nexthdr;
+ +		flow->src = (__force __be32)ipv6_addr_hash(&iph->saddr);
+ +		flow->dst = (__force __be32)ipv6_addr_hash(&iph->daddr);
+  		nhoff += sizeof(struct ipv6hdr);
+  
+ -		if (skb_flow_dissector_uses_key(flow_dissector,
+ -						FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
+ -			struct flow_dissector_key_ipv6_addrs *key_ipv6_addrs;
+ -
+ -			key_ipv6_addrs = skb_flow_dissector_target(flow_dissector,
+ -								   FLOW_DISSECTOR_KEY_IPV6_ADDRS,
+ -								   target_container);
+ -
+ -			memcpy(key_ipv6_addrs, &iph->saddr, sizeof(*key_ipv6_addrs));
+ -			key_control->addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+ -		}
+ -
+ -		flow_label = ip6_flowlabel(iph);
+ -		if (flow_label) {
+ -			if (skb_flow_dissector_uses_key(flow_dissector,
+ -				FLOW_DISSECTOR_KEY_FLOW_LABEL)) {
+ -				key_tags = skb_flow_dissector_target(flow_dissector,
+ -								     FLOW_DISSECTOR_KEY_FLOW_LABEL,
+ -								     target_container);
+ -				key_tags->flow_label = ntohl(flow_label);
+ -			}
+ -		}
+ +		/* skip the flow label processing if skb is NULL.  The
+ +		 * assumption here is that if there is no skb we are not
+ +		 * looking for flow info as much as we are length.
+ +		 */
+ +		if (!skb)
+ +			break;
+  
+  		break;
+  	}
+@@@ -180,8 -235,17 +191,8 @@@
+  
+  		vlan = __skb_header_pointer(skb, nhoff, sizeof(_vlan), data, hlen, &_vlan);
+  		if (!vlan)
+- 			return false;
++ 			goto out_bad;
+  
+ -		if (skb_flow_dissector_uses_key(flow_dissector,
+ -						FLOW_DISSECTOR_KEY_VLANID)) {
+ -			key_tags = skb_flow_dissector_target(flow_dissector,
+ -							     FLOW_DISSECTOR_KEY_VLANID,
+ -							     target_container);
+ -
+ -			key_tags->vlan_id = skb_vlan_tag_get_id(skb);
+ -		}
+ -
+  		proto = vlan->h_vlan_encapsulated_proto;
+  		nhoff += sizeof(*vlan);
+  		goto again;
+@@@ -197,12 -261,12 +208,12 @@@
+  		proto = hdr->proto;
+  		nhoff += PPPOE_SES_HLEN;
+  		switch (proto) {
+ -		case htons(PPP_IP):
+ +		case __constant_htons(PPP_IP):
+  			goto ip;
+ -		case htons(PPP_IPV6):
+ +		case __constant_htons(PPP_IPV6):
+  			goto ipv6;
+  		default:
+- 			return false;
++ 			goto out_bad;
+  		}
+  	}
+  	case htons(ETH_P_TIPC): {
+@@@ -212,18 -276,50 +223,60 @@@
+  		} *hdr, _hdr;
+  		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data, hlen, &_hdr);
+  		if (!hdr)
+++<<<<<<< HEAD
+ +			return false;
+ +		flow->src = hdr->srcnode;
+ +		flow->dst = 0;
+ +		flow->n_proto = proto;
+ +		flow->thoff = (u16)nhoff;
+ +		return true;
+ +	}
+++=======
++ 			goto out_bad;
++ 
++ 		if (skb_flow_dissector_uses_key(flow_dissector,
++ 						FLOW_DISSECTOR_KEY_TIPC_ADDRS)) {
++ 			key_addrs = skb_flow_dissector_target(flow_dissector,
++ 							      FLOW_DISSECTOR_KEY_TIPC_ADDRS,
++ 							      target_container);
++ 			key_addrs->tipcaddrs.srcnode = hdr->srcnode;
++ 			key_control->addr_type = FLOW_DISSECTOR_KEY_TIPC_ADDRS;
++ 		}
++ 		goto out_good;
++ 	}
++ 
++ 	case htons(ETH_P_MPLS_UC):
++ 	case htons(ETH_P_MPLS_MC): {
++ 		struct mpls_label *hdr, _hdr[2];
++ mpls:
++ 		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data,
++ 					   hlen, &_hdr);
++ 		if (!hdr)
++ 			goto out_bad;
++ 
++ 		if ((ntohl(hdr[0].entry) & MPLS_LS_LABEL_MASK) >>
++ 		     MPLS_LS_LABEL_SHIFT == MPLS_LABEL_ENTROPY) {
++ 			if (skb_flow_dissector_uses_key(flow_dissector,
++ 							FLOW_DISSECTOR_KEY_MPLS_ENTROPY)) {
++ 				key_keyid = skb_flow_dissector_target(flow_dissector,
++ 								      FLOW_DISSECTOR_KEY_MPLS_ENTROPY,
++ 								      target_container);
++ 				key_keyid->keyid = hdr[1].entry &
++ 					htonl(MPLS_LS_LABEL_MASK);
++ 			}
++ 
++ 			goto out_good;
++ 		}
++ 
++ 		goto out_good;
++ 	}
++ 
+++>>>>>>> a6e544b0a88b (flow_dissector: Jump to exit code in __skb_flow_dissect)
+  	case htons(ETH_P_FCOE):
+ -		key_control->thoff = (u16)(nhoff + FCOE_HEADER_LEN);
+ +		flow->thoff = (u16)(nhoff + FCOE_HEADER_LEN);
+  		/* fall through */
+  	default:
+- 		return false;
++ 		goto out_bad;
+  	}
+  
+  ip_proto_again:
+@@@ -241,30 -337,47 +294,63 @@@
+  		 * Only look inside GRE if version zero and no
+  		 * routing
+  		 */
+ -		if (hdr->flags & (GRE_VERSION | GRE_ROUTING))
+ -			break;
+ -
+ -		proto = hdr->proto;
+ -		nhoff += 4;
+ -		if (hdr->flags & GRE_CSUM)
+ +		if (!(hdr->flags & (GRE_VERSION|GRE_ROUTING))) {
+ +			proto = hdr->proto;
+  			nhoff += 4;
+ -		if (hdr->flags & GRE_KEY) {
+ -			const __be32 *keyid;
+ -			__be32 _keyid;
+ -
+ +			if (hdr->flags & GRE_CSUM)
+ +				nhoff += 4;
+ +			if (hdr->flags & GRE_KEY)
+ +				nhoff += 4;
+ +			if (hdr->flags & GRE_SEQ)
+ +				nhoff += 4;
+ +			if (proto == htons(ETH_P_TEB)) {
+ +				const struct ethhdr *eth;
+ +				struct ethhdr _eth;
+ +
+++<<<<<<< HEAD
+ +				eth = __skb_header_pointer(skb, nhoff,
+ +							   sizeof(_eth),
+ +							   data, hlen, &_eth);
+ +				if (!eth)
+ +					return false;
+ +				proto = eth->h_proto;
+ +				nhoff += sizeof(*eth);
+++=======
++ 			keyid = __skb_header_pointer(skb, nhoff, sizeof(_keyid),
++ 						     data, hlen, &_keyid);
++ 
++ 			if (!keyid)
++ 				goto out_bad;
++ 
++ 			if (skb_flow_dissector_uses_key(flow_dissector,
++ 							FLOW_DISSECTOR_KEY_GRE_KEYID)) {
++ 				key_keyid = skb_flow_dissector_target(flow_dissector,
++ 								      FLOW_DISSECTOR_KEY_GRE_KEYID,
++ 								      target_container);
++ 				key_keyid->keyid = *keyid;
+++>>>>>>> a6e544b0a88b (flow_dissector: Jump to exit code in __skb_flow_dissect)
+  			}
+ -			nhoff += 4;
+ +			goto again;
+  		}
+++<<<<<<< HEAD
+ +		break;
+++=======
++ 		if (hdr->flags & GRE_SEQ)
++ 			nhoff += 4;
++ 		if (proto == htons(ETH_P_TEB)) {
++ 			const struct ethhdr *eth;
++ 			struct ethhdr _eth;
++ 
++ 			eth = __skb_header_pointer(skb, nhoff,
++ 						   sizeof(_eth),
++ 						   data, hlen, &_eth);
++ 			if (!eth)
++ 				goto out_bad;
++ 			proto = eth->h_proto;
++ 			nhoff += sizeof(*eth);
++ 		}
++ 		goto again;
+++>>>>>>> a6e544b0a88b (flow_dissector: Jump to exit code in __skb_flow_dissect)
+  	}
+  	case NEXTHDR_HOP:
+  	case NEXTHDR_ROUTING:
+@@@ -294,12 -410,24 +380,31 @@@
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	flow->n_proto = proto;
+ +	flow->ip_proto = ip_proto;
+ +	flow->ports = __skb_flow_get_ports(skb, nhoff, ip_proto, data, hlen);
+ +	flow->thoff = (u16) nhoff;
+++=======
++ 	if (skb_flow_dissector_uses_key(flow_dissector,
++ 					FLOW_DISSECTOR_KEY_PORTS)) {
++ 		key_ports = skb_flow_dissector_target(flow_dissector,
++ 						      FLOW_DISSECTOR_KEY_PORTS,
++ 						      target_container);
++ 		key_ports->ports = __skb_flow_get_ports(skb, nhoff, ip_proto,
++ 							data, hlen);
++ 	}
+++>>>>>>> a6e544b0a88b (flow_dissector: Jump to exit code in __skb_flow_dissect)
++ 
++ out_good:
++ 	ret = true;
++ 
++ out_bad:
++ 	key_basic->n_proto = proto;
++ 	key_basic->ip_proto = ip_proto;
++ 	key_control->thoff = (u16)nhoff;
+  
+- 	return true;
++ 	return ret;
+  }
+  EXPORT_SYMBOL(__skb_flow_dissect);
+  
+* Unmerged path net/core/flow_dissector.c
