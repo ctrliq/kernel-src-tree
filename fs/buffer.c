@@ -1520,7 +1520,7 @@ void block_invalidatepage_range(struct page *page, unsigned int offset,
 	 * The get_block cached value has been unconditionally invalidated,
 	 * so real IO is not possible anymore.
 	 */
-	if (offset == 0)
+	if (length == PAGE_SIZE)
 		try_to_release_page(page, 0);
 out:
 	return;
